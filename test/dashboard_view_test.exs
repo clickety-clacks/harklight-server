@@ -55,8 +55,18 @@ defmodule AttentionServer.DashboardViewTest do
     assert html =~ ~s(href="/agent-skills/SKILL.md")
     assert html =~ "cargo build --locked --release --manifest-path agent-cli/Cargo.toml"
     assert html =~ ~s(<div class="account">Dana</div>)
-    refute html =~ "http://"
-    refute html =~ "https://"
+
+    assert html =~
+             ~s(<section><h2>App</h2><p>The Harklight app for iPhone is in internal TestFlight testing today and is not publicly available yet. A link to install it will appear here once a public install route exists.</p></section>)
+  end
+
+  test "the components page links the published CLI release and marks Homebrew as not yet available" do
+    html = DashboardView.components("Dana", {:ok, "0.1.0"})
+
+    assert html =~
+             ~s(href="https://github.com/clickety-clacks/harklight-agent/releases/tag/v0.1.1")
+
+    assert html =~ "Homebrew formula is in progress and not available yet"
   end
 
   test "the components page tolerates a skill version lookup failure" do
