@@ -135,9 +135,8 @@ phone displayed a notification, fetched a request or submitted a reply.
 
 ## Build and compatibility
 
-Build on Linux x86_64 using Elixir 1.19.5/OTP 27, Rust 1.89 or newer with Cargo,
-Python 3 and the native prerequisites in
-`SELF_HOST.md`:
+Build on Linux x86_64 using Elixir 1.19.5/OTP 27 and the native prerequisites
+in `SELF_HOST.md`:
 
 ```sh
 ./scripts/build-package.sh

@@ -358,15 +358,14 @@ backups and keys private.
 
 ## Build
 
-On the declared Linux target use Elixir 1.19.5/OTP 27, Rust 1.89 or newer and
-Cargo, Python 3, a C compiler, make, OpenSSL CLI and the pinned Mix/Cargo locks:
+On the declared Linux target use Elixir 1.19.5/OTP 27, a C compiler, make,
+OpenSSL CLI and the pinned Mix lock:
 
     ./scripts/build-package.sh
 
 This production package includes the Mix release/ERTS, server/device CLI,
-Rust conversation CLI, bootstrap, guides and both existing agent skills. It
-preserves dependency notices, including the resolved Cargo dependency notices,
-records BUILD_INFO and writes tarball/SHA256SUMS in dist/. Archive ordering,
+bootstrap, guides and both existing agent skills. It preserves dependency
+notices, records BUILD_INFO and writes tarball/SHA256SUMS in dist/. Archive ordering,
 timestamps, owners and gzip headers are normalized; full toolchain bit-for-bit
 reproducibility is not claimed. Build from the clean intended commit and use
 that same artifact for clean-install evidence and publication.
