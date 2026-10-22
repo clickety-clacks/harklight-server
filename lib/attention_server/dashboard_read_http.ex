@@ -308,15 +308,12 @@ defmodule AttentionServer.DashboardReadHTTP do
     end
   end
 
-  defp route(%{method: "GET", request_path: "/agent-skills"} = conn, opts, _principal) do
-    version_line =
-      case skill_version(opts.skill_path) do
-        {:ok, version} -> "<p>Packaged skill version: #{Plug.HTML.html_escape(version)}</p>"
-        :error -> ""
-      end
+  defp route(%{method: "GET", request_path: "/agent-skills"} = conn, _opts, _principal) do
+    conn |> put_resp_header("location", "/components") |> send_resp(303, "")
+  end
 
-    html =
-      ~s(<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Agent skills · Harklight</title></head><body><main><h1>Connect your agent</h1>#{version_line}<p>Harklight Server ships an agent skill. Copy the packaged <code>skills/harklight-agent</code> folder into your agent harness's configured skills directory, then follow its enrollment and sender-grant steps. Installing the skill alone grants no access.</p><p><a href="/agent-skills/SKILL.md">Read the Harklight agent skill</a></p><p><a href="/devices">Back to devices</a></p></main></body></html>)
+  defp route(%{method: "GET", request_path: "/components"} = conn, opts, principal) do
+    html = DashboardView.components(principal.person_id, skill_version(opts.skill_path))
 
     conn
     |> put_resp_content_type("text/html", "utf-8")

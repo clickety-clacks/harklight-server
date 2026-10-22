@@ -26,7 +26,7 @@ defmodule AttentionServer.DashboardViewTest do
     refute html =~ "<phone>"
   end
 
-  test "empty device list offers one direct invitation action and links to the agent skill" do
+  test "empty device list offers one direct invitation action and links to components" do
     request_id = "123e4567-e89b-42d3-a456-426614174000"
     html = DashboardView.devices("Dana", [], [], request_id)
 
@@ -37,7 +37,7 @@ defmodule AttentionServer.DashboardViewTest do
     assert html =~ ~s(<button class="button" type="submit">Create a new invitation</button>)
     refute html =~ ~s(<form action="/devices/add" method="post">)
     assert html =~ "Another invitation could leave an earlier link active"
-    assert html =~ ~s(href="/agent-skills")
+    assert html =~ ~s(href="/components")
     assert html =~ ~s(<div class="account">Dana</div>)
   end
 
@@ -46,6 +46,23 @@ defmodule AttentionServer.DashboardViewTest do
 
     assert html =~ ~s(<form action="/devices/add" method="post">)
     refute html =~ ~s(<form action="/devices/invitation/new" method="post">)
+  end
+
+  test "the components page shows the packaged skill version and no invented app link" do
+    html = DashboardView.components("Dana", {:ok, "0.1.0"})
+
+    assert html =~ "Packaged skill version: 0.1.0"
+    assert html =~ ~s(href="/agent-skills/SKILL.md")
+    assert html =~ "cargo build --locked --release --manifest-path agent-cli/Cargo.toml"
+    assert html =~ ~s(<div class="account">Dana</div>)
+    refute html =~ "http://"
+    refute html =~ "https://"
+  end
+
+  test "the components page tolerates a skill version lookup failure" do
+    html = DashboardView.components("Dana", :error)
+
+    refute html =~ "Packaged skill version"
   end
 
   test "uncertain invitation failure offers same-request retry without a new invitation action" do

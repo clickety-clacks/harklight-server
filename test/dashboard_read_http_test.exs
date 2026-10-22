@@ -34,7 +34,7 @@ defmodule AttentionServer.DashboardReadHTTPTest do
   end
 
   test "device records and the skill are unavailable before sign-in", %{opts: opts} do
-    for path <- ["/devices", "/agent-skills", "/agent-skills/SKILL.md"] do
+    for path <- ["/devices", "/components", "/agent-skills", "/agent-skills/SKILL.md"] do
       response = path |> secure_get() |> DashboardReadHTTP.call(opts)
       assert response.status == 401
       refute response.resp_body =~ "Mike's iPad"
@@ -51,10 +51,10 @@ defmodule AttentionServer.DashboardReadHTTPTest do
     refute response.resp_body =~ "Connected now"
   end
 
-  test "the signed-in agent skills page serves the packaged skill without granting access", %{
+  test "the signed-in components page serves the packaged skill without granting access", %{
     opts: opts
   } do
-    page = "/agent-skills" |> secure_get("member-session") |> DashboardReadHTTP.call(opts)
+    page = "/components" |> secure_get("member-session") |> DashboardReadHTTP.call(opts)
 
     skill =
       "/agent-skills/SKILL.md" |> secure_get("member-session") |> DashboardReadHTTP.call(opts)
@@ -66,7 +66,7 @@ defmodule AttentionServer.DashboardReadHTTPTest do
     assert skill.resp_body == "---\nname: harklight-agent\nversion: \"0.1.0\"\n---\n\n# Operate Harklight\n"
   end
 
-  test "the agent skills page tolerates a skill file with no version field", %{opts: opts} do
+  test "the components page tolerates a skill file with no version field", %{opts: opts} do
     path =
       Path.join(
         System.tmp_dir!(),
@@ -77,10 +77,26 @@ defmodule AttentionServer.DashboardReadHTTPTest do
     on_exit(fn -> File.rm(path) end)
     opts = %{opts | skill_path: path}
 
-    page = "/agent-skills" |> secure_get("member-session") |> DashboardReadHTTP.call(opts)
+    page = "/components" |> secure_get("member-session") |> DashboardReadHTTP.call(opts)
 
     assert page.status == 200
     refute page.resp_body =~ "Packaged skill version"
+  end
+
+  test "the agent skills page redirects to the components page for a signed-in session", %{
+    opts: opts
+  } do
+    response = "/agent-skills" |> secure_get("member-session") |> DashboardReadHTTP.call(opts)
+
+    assert response.status == 303
+    assert Plug.Conn.get_resp_header(response, "location") == ["/components"]
+  end
+
+  test "the components page requires sign-in and discloses no skill content", %{opts: opts} do
+    response = "/components" |> secure_get("unknown") |> DashboardReadHTTP.call(opts)
+
+    assert response.status == 401
+    refute response.resp_body =~ "0.1.0"
   end
 
   test "an invitation failure is an actionable page and never invents a link", %{opts: opts} do

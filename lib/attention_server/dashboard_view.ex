@@ -45,6 +45,30 @@ defmodule AttentionServer.DashboardView do
     )
   end
 
+  @spec components(String.t(), {:ok, String.t()} | :error, keyword()) :: String.t()
+  def components(person_name, skill_version, chrome \\ []) do
+    version_line =
+      case skill_version do
+        {:ok, version} -> ~s(<p>Packaged skill version: #{escape(version)}</p>)
+        :error -> ""
+      end
+
+    app_section =
+      ~s(<section><h2>App</h2><p>The Harklight app for iPhone is in internal TestFlight testing today and is not publicly available yet. A link to install it will appear here once a public install route exists.</p></section>)
+
+    cli_section =
+      ~s(<section><h2>Command-line agent</h2><p>The Linux x86_64 server package bundles the agent CLI at <code>bin/harklight-agent</code>. Package installation does not start a listener or create a device identity. On macOS, or another platform, build it from source:</p><pre><code>cargo build --locked --release --manifest-path agent-cli/Cargo.toml</code></pre><p>The built executable is <code>agent-cli/target/release/harklight-agent</code>.</p></section>)
+
+    skill_section =
+      ~s(<section><h2>Agent skill</h2>#{version_line}<p>Harklight Server ships an agent skill. Copy the packaged <code>skills/harklight-agent</code> folder into your agent harness's configured skills directory, then follow its enrollment and sender-grant steps. Installing the skill alone grants no access.</p><p><a href="/agent-skills/SKILL.md">Read the Harklight agent skill</a></p></section>)
+
+    body =
+      ~s(<header class="page-head"><div><h1>Components</h1><p>Everything needed to connect an app, the CLI or an agent to this account.</p></div></header>) <>
+        app_section <> cli_section <> skill_section
+
+    layout(person_name, "Components", body, chrome)
+  end
+
   def invitation_failure(person, message, action \\ :retry, new_request_id \\ nil, chrome \\ []) do
     action_form =
       case action do
@@ -147,7 +171,7 @@ defmodule AttentionServer.DashboardView do
           ~s(<form action="/sign-out" method="post"><input type="hidden" name="confirm" value="sign_out"><button class="button" type="submit">Sign out</button></form>),
         else: ""
 
-    ~s(<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>#{escape(title)} · Harklight</title><style>#{css()}</style></head><body><div class="shell"><aside><strong>Harklight</strong><nav><a href="/devices">Devices</a><a href="/agent-skills">Agent skills</a>#{account_link}</nav><div class="account">#{escape(person_name)}#{sign_out}</div></aside><main>#{content}</main></div></body></html>)
+    ~s(<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>#{escape(title)} · Harklight</title><style>#{css()}</style></head><body><div class="shell"><aside><strong>Harklight</strong><nav><a href="/devices">Devices</a><a href="/components">Components</a>#{account_link}</nav><div class="account">#{escape(person_name)}#{sign_out}</div></aside><main>#{content}</main></div></body></html>)
   end
 
   defp css do
