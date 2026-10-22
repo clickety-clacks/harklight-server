@@ -31,6 +31,7 @@ defmodule AttentionServer.DashboardReadHTTP do
     backend = Keyword.fetch!(opts, :backend)
     skill_path = Keyword.fetch!(opts, :skill_path)
     hosted = Keyword.get(opts, :hosted, false) == true
+    skill_path_send_listen = Keyword.fetch!(opts, :skill_path_send_listen)
 
     %{
       backend: backend,
@@ -38,7 +39,8 @@ defmodule AttentionServer.DashboardReadHTTP do
       expected_origin: Keyword.get(opts, :expected_origin),
       hosted: hosted,
       hosted_addresses:
-        if(hosted, do: hosted_addresses(Keyword.get(opts, :hosted_addresses)), else: %{})
+        if(hosted, do: hosted_addresses(Keyword.get(opts, :hosted_addresses)), else: %{}),
+      skill_path_send_listen: skill_path_send_listen
     }
   end
 
@@ -90,6 +92,13 @@ defmodule AttentionServer.DashboardReadHTTP do
 
       conn.method == "POST" and conn.request_path == "/join/resolve" ->
         resolve_join(conn, opts)
+
+      conn.method == "GET" and conn.request_path == "/agent-skills/SKILL.md" ->
+        serve_skill_file(conn, opts.skill_path)
+
+      conn.method == "GET" and
+          conn.request_path == "/agent-skills/harklight-agent-send-listen/SKILL.md" ->
+        serve_skill_file(conn, opts.skill_path_send_listen)
 
       conn.method not in ["GET", "POST"] ->
         send_resp(conn, 405, "Method not allowed")
@@ -313,18 +322,26 @@ defmodule AttentionServer.DashboardReadHTTP do
   end
 
   defp route(%{method: "GET", request_path: "/components"} = conn, opts, principal) do
-    html = DashboardView.components(principal.person_id, skill_version(opts.skill_path))
+    html =
+      DashboardView.components(
+        principal.person_id,
+        skill_version(opts.skill_path),
+        skill_version(opts.skill_path_send_listen),
+        chrome(opts)
+      )
 
     conn
     |> put_resp_content_type("text/html", "utf-8")
     |> send_resp(200, html)
   end
 
-  defp route(%{method: "GET", request_path: "/agent-skills/SKILL.md"} = conn, opts, _principal) do
+  defp route(conn, _opts, _principal), do: send_resp(conn, 404, "Not found")
+
+  defp serve_skill_file(conn, skill_path) do
     case Diagnostics.result(
            :dashboard_http,
            :request_read,
-           File.read(opts.skill_path),
+           File.read(skill_path),
            :unavailable
          ) do
       {:ok, skill} ->
@@ -336,8 +353,6 @@ defmodule AttentionServer.DashboardReadHTTP do
         send_resp(conn, 503, "Skill unavailable")
     end
   end
-
-  defp route(conn, _opts, _principal), do: send_resp(conn, 404, "Not found")
 
   defp skill_version(skill_path) do
     with {:ok, contents} <- File.read(skill_path),

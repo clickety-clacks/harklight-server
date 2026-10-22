@@ -28,18 +28,62 @@ defmodule AttentionServer.DashboardReadHTTPTest do
         "harklight-dashboard-skill-#{System.unique_integer([:positive])}.md"
       )
 
-    File.write!(path, "---\nname: harklight-agent\nversion: \"0.1.0\"\n---\n\n# Operate Harklight\n")
+    File.write!(
+      path,
+      "---\nname: harklight-agent\nversion: \"0.1.0\"\n---\n\n# Operate Harklight\n"
+    )
+
     on_exit(fn -> File.rm(path) end)
-    %{opts: DashboardReadHTTP.init(backend: Backend, skill_path: path)}
+
+    path_send_listen =
+      Path.join(
+        System.tmp_dir!(),
+        "harklight-dashboard-skill-send-listen-#{System.unique_integer([:positive])}.md"
+      )
+
+    File.write!(
+      path_send_listen,
+      "---\nname: harklight-agent-send-listen\nversion: \"0.2.0\"\n---\n\n# Send and listen\n"
+    )
+
+    on_exit(fn -> File.rm(path_send_listen) end)
+
+    %{
+      opts:
+        DashboardReadHTTP.init(
+          backend: Backend,
+          skill_path: path,
+          skill_path_send_listen: path_send_listen
+        )
+    }
   end
 
-  test "device records and the skill are unavailable before sign-in", %{opts: opts} do
-    for path <- ["/devices", "/components", "/agent-skills", "/agent-skills/SKILL.md"] do
+  test "device records are unavailable before sign-in", %{opts: opts} do
+    for path <- ["/devices", "/components", "/agent-skills"] do
       response = path |> secure_get() |> DashboardReadHTTP.call(opts)
       assert response.status == 401
       refute response.resp_body =~ "Mike's iPad"
       assert Plug.Conn.get_resp_header(response, "cache-control") == ["no-store"]
     end
+  end
+
+  test "both skill files are served without a dashboard session", %{opts: opts} do
+    skill = "/agent-skills/SKILL.md" |> secure_get() |> DashboardReadHTTP.call(opts)
+
+    assert skill.status == 200
+
+    assert skill.resp_body ==
+             "---\nname: harklight-agent\nversion: \"0.1.0\"\n---\n\n# Operate Harklight\n"
+
+    skill_send_listen =
+      "/agent-skills/harklight-agent-send-listen/SKILL.md"
+      |> secure_get()
+      |> DashboardReadHTTP.call(opts)
+
+    assert skill_send_listen.status == 200
+
+    assert skill_send_listen.resp_body ==
+             "---\nname: harklight-agent-send-listen\nversion: \"0.2.0\"\n---\n\n# Send and listen\n"
   end
 
   test "a resolved person sees only backend-authorized device records", %{opts: opts} do
@@ -63,7 +107,9 @@ defmodule AttentionServer.DashboardReadHTTPTest do
     assert page.resp_body =~ "Installing the skill alone grants no access"
     assert page.resp_body =~ "Packaged skill version: 0.1.0"
     assert skill.status == 200
-    assert skill.resp_body == "---\nname: harklight-agent\nversion: \"0.1.0\"\n---\n\n# Operate Harklight\n"
+
+    assert skill.resp_body ==
+             "---\nname: harklight-agent\nversion: \"0.1.0\"\n---\n\n# Operate Harklight\n"
   end
 
   test "the components page tolerates a skill file with no version field", %{opts: opts} do
@@ -80,7 +126,8 @@ defmodule AttentionServer.DashboardReadHTTPTest do
     page = "/components" |> secure_get("member-session") |> DashboardReadHTTP.call(opts)
 
     assert page.status == 200
-    refute page.resp_body =~ "Packaged skill version"
+    refute page.resp_body =~ "Packaged skill version: 0.1.0"
+    assert page.resp_body =~ "Packaged skill version: 0.2.0"
   end
 
   test "the agent skills page redirects to the components page for a signed-in session", %{

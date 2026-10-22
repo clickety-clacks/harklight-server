@@ -52,7 +52,13 @@ defmodule AttentionServer.DashboardBackendTest do
     skill = Path.join(System.tmp_dir!(), "dashboard-skill-#{System.unique_integer([:positive])}")
     File.write!(skill, "# Harklight")
     on_exit(fn -> File.rm(skill) end)
-    opts = DashboardReadHTTP.init(backend: {DashboardBackend, backend}, skill_path: skill)
+
+    opts =
+      DashboardReadHTTP.init(
+        backend: {DashboardBackend, backend},
+        skill_path: skill,
+        skill_path_send_listen: skill
+      )
 
     owner = request(cookie_a) |> DashboardReadHTTP.call(opts)
     other = request(cookie_b) |> DashboardReadHTTP.call(opts)
@@ -88,7 +94,14 @@ defmodule AttentionServer.DashboardBackendTest do
     skill = Path.join(System.tmp_dir!(), "dashboard-skill-#{System.unique_integer([:positive])}")
     File.write!(skill, "# Harklight")
     on_exit(fn -> File.rm(skill) end)
-    opts = DashboardReadHTTP.init(backend: {DashboardBackend, backend}, skill_path: skill)
+
+    opts =
+      DashboardReadHTTP.init(
+        backend: {DashboardBackend, backend},
+        skill_path: skill,
+        skill_path_send_listen: skill
+      )
+
     {:ok, credential} = Relay.owner_browser_sign_in_create(relay, person, key)
     token = credential["sign_in_token"]
 
@@ -135,7 +148,14 @@ defmodule AttentionServer.DashboardBackendTest do
       configured_owner_person: person,
       origin: "https://relay.test:18447"
     }
-    opts = DashboardReadHTTP.init(backend: {DashboardBackend, backend}, skill_path: "/unused")
+
+    opts =
+      DashboardReadHTTP.init(
+        backend: {DashboardBackend, backend},
+        skill_path: "/unused",
+        skill_path_send_listen: "/unused"
+      )
+
     {:ok, credential} = Relay.owner_browser_sign_in_create(relay, person, owner_key)
 
     sign_in =
@@ -148,7 +168,9 @@ defmodule AttentionServer.DashboardBackendTest do
     devices = request(cookie) |> DashboardReadHTTP.call(opts)
     assert Plug.Conn.get_resp_header(devices, "set-cookie") == []
     [_, invite_request_id] = Regex.run(~r/name="request_id" value="([^"]+)"/, devices.resp_body)
-    new_body = URI.encode_query(%{"confirm" => "new_invitation", "request_id" => invite_request_id})
+
+    new_body =
+      URI.encode_query(%{"confirm" => "new_invitation", "request_id" => invite_request_id})
 
     missing_request =
       owner_post("/devices/add", "confirm=invite", cookie)

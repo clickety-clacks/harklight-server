@@ -55,7 +55,8 @@ defmodule AttentionServer.DashboardHTTPSTest do
         ip: {127, 0, 0, 1},
         certfile: Path.join(certs, "server.pem"),
         keyfile: Path.join(certs, "server.key"),
-        skill_path: skill_path
+        skill_path: skill_path,
+        skill_path_send_listen: skill_path
       )
 
     Process.unlink(listener)
@@ -472,7 +473,8 @@ defmodule AttentionServer.DashboardHTTPSTest do
         ip: {127, 0, 0, 1},
         certfile: Path.join(certs, "server.pem"),
         keyfile: Path.join(certs, "server.key"),
-        skill_path: skill_path
+        skill_path: skill_path,
+        skill_path_send_listen: skill_path
       )
 
     Process.unlink(restarted_listener)
@@ -558,7 +560,8 @@ defmodule AttentionServer.DashboardHTTPSTest do
           owner_person: person,
           certfile: Path.join(certs, "server.pem"),
           keyfile: Path.join(certs, "server.key"),
-          skill_path: skill
+          skill_path: skill,
+          skill_path_send_listen: skill
         ]
       )
 

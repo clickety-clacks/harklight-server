@@ -49,7 +49,7 @@ defmodule AttentionServer.DashboardViewTest do
   end
 
   test "the components page shows the packaged skill version and no invented app link" do
-    html = DashboardView.components("Dana", {:ok, "0.1.0"})
+    html = DashboardView.components("Dana", {:ok, "0.1.0"}, {:ok, "0.2.0"})
 
     assert html =~ "Packaged skill version: 0.1.0"
     assert html =~ ~s(href="/agent-skills/SKILL.md")
@@ -61,7 +61,7 @@ defmodule AttentionServer.DashboardViewTest do
   end
 
   test "the components page links the published CLI release and marks Homebrew as not yet available" do
-    html = DashboardView.components("Dana", {:ok, "0.1.0"})
+    html = DashboardView.components("Dana", {:ok, "0.1.0"}, {:ok, "0.2.0"})
 
     assert html =~
              ~s(href="https://github.com/clickety-clacks/harklight-agent/releases/tag/v0.1.1")
@@ -69,8 +69,33 @@ defmodule AttentionServer.DashboardViewTest do
     assert html =~ "Homebrew formula is in progress and not available yet"
   end
 
-  test "the components page tolerates a skill version lookup failure" do
-    html = DashboardView.components("Dana", :error)
+  test "the components page documents both shipped skills with their own version and link" do
+    html = DashboardView.components("Dana", {:ok, "0.1.0"}, {:ok, "0.2.0"})
+
+    assert html =~ "Agent skill: harklight-agent</h2>"
+    assert html =~ "Packaged skill version: 0.1.0"
+    assert html =~ ~s(href="/agent-skills/SKILL.md")
+
+    assert html =~ "Agent skill: harklight-agent-send-listen</h2>"
+    assert html =~ "Packaged skill version: 0.2.0"
+    assert html =~ ~s(href="/agent-skills/harklight-agent-send-listen/SKILL.md")
+    assert html =~ "keep its originating agent session listening for request-bound turns"
+  end
+
+  test "the components page tolerates a skill version lookup failure for either skill independently" do
+    html = DashboardView.components("Dana", :error, {:ok, "0.2.0"})
+
+    refute html =~ "Packaged skill version: 0.1.0"
+    assert html =~ "Packaged skill version: 0.2.0"
+
+    html = DashboardView.components("Dana", {:ok, "0.1.0"}, :error)
+
+    assert html =~ "Packaged skill version: 0.1.0"
+    refute html =~ "Packaged skill version: 0.2.0"
+  end
+
+  test "the components page tolerates both skill version lookups failing" do
+    html = DashboardView.components("Dana", :error, :error)
 
     refute html =~ "Packaged skill version"
   end

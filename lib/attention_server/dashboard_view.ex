@@ -45,14 +45,13 @@ defmodule AttentionServer.DashboardView do
     )
   end
 
-  @spec components(String.t(), {:ok, String.t()} | :error, keyword()) :: String.t()
-  def components(person_name, skill_version, chrome \\ []) do
-    version_line =
-      case skill_version do
-        {:ok, version} -> ~s(<p>Packaged skill version: #{escape(version)}</p>)
-        :error -> ""
-      end
-
+  @spec components(
+          String.t(),
+          {:ok, String.t()} | :error,
+          {:ok, String.t()} | :error,
+          keyword()
+        ) :: String.t()
+  def components(person_name, skill_version, skill_version_send_listen, chrome \\ []) do
     app_section =
       ~s(<section><h2>App</h2><p>The Harklight app for iPhone is in internal TestFlight testing today and is not publicly available yet. A link to install it will appear here once a public install route exists.</p></section>)
 
@@ -60,13 +59,36 @@ defmodule AttentionServer.DashboardView do
       ~s(<section><h2>Command-line agent</h2><p>The Linux x86_64 server package bundles the agent CLI at <code>bin/harklight-agent</code>. Package installation does not start a listener or create a device identity.</p><p>Prebuilt macOS \(arm64 and Intel\) and Linux \(x86_64 and arm64\) builds are published on the <a href="https://github.com/clickety-clacks/harklight-agent/releases/tag/v0.1.1">harklight-agent releases page</a>, each checked against the published SHA256SUMS file. A Homebrew formula is in progress and not available yet. Until then, or on another platform, build from source:</p><pre><code>cargo build --locked --release --manifest-path agent-cli/Cargo.toml</code></pre><p>The built executable is <code>agent-cli/target/release/harklight-agent</code>.</p></section>)
 
     skill_section =
-      ~s(<section><h2>Agent skill</h2>#{version_line}<p>Harklight Server ships an agent skill. Copy the packaged <code>skills/harklight-agent</code> folder into your agent harness's configured skills directory, then follow its enrollment and sender-grant steps. Installing the skill alone grants no access.</p><p><a href="/agent-skills/SKILL.md">Read the Harklight agent skill</a></p></section>)
+      skill_section(
+        "harklight-agent",
+        skill_version,
+        "/agent-skills/SKILL.md",
+        "Operate a self-hosted Harklight server from an agent or script: enroll a sender device, send a message, read its reply, or use separately granted agent search and response tools."
+      )
+
+    skill_section_send_listen =
+      skill_section(
+        "harklight-agent-send-listen",
+        skill_version_send_listen,
+        "/agent-skills/harklight-agent-send-listen/SKILL.md",
+        "Send a request through an existing Harklight sender grant and keep its originating agent session listening for request-bound turns."
+      )
 
     body =
       ~s(<header class="page-head"><div><h1>Components</h1><p>Everything needed to connect an app, the CLI or an agent to this account.</p></div></header>) <>
-        app_section <> cli_section <> skill_section
+        app_section <> cli_section <> skill_section <> skill_section_send_listen
 
     layout(person_name, "Components", body, chrome)
+  end
+
+  defp skill_section(name, skill_version, path, description) do
+    version_line =
+      case skill_version do
+        {:ok, version} -> ~s(<p>Packaged skill version: #{escape(version)}</p>)
+        :error -> ""
+      end
+
+    ~s(<section><h2>Agent skill: #{escape(name)}</h2>#{version_line}<p>#{escape(description)}</p><p>Copy the packaged <code>skills/#{escape(name)}</code> folder into your agent harness's configured skills directory, then follow its enrollment and sender-grant steps. Installing the skill alone grants no access.</p><p><a href="#{escape(path)}">Read the #{escape(name)} skill</a></p></section>)
   end
 
   def invitation_failure(person, message, action \\ :retry, new_request_id \\ nil, chrome \\ []) do
