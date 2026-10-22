@@ -35,13 +35,9 @@ upgrade. Keep a stopped, complete private backup before upgrading if you may
 need to recover to an older version; restoring a stale backup may discard newer
 accepted writes.
 
-The archive also contains the Rust conversation listener at
-`$PACKAGE/bin/harklight-agent` (CLI version 0.1.0). The existing release installer
-places it under `$HOME/.local/share/harklight-server/releases/v0.1.11/bin/`
-and the selected `current/bin/` path, without a global PATH entry or a new
-service. See [the CLI guide](agent-cli/README.md), shipped as `AGENT_CLI.md`,
-for existing enrollment, origin HTTPS configuration, commands and limits.
-The server/device CLI remains `$PACKAGE/bin/harklight`.
+The archive does not contain the `harklight-agent` conversation CLI; install
+it separately as described under [Get the agent CLI](#get-the-agent-cli).
+The server/device CLI is `$PACKAGE/bin/harklight`.
 
 ## Send a request and read its reply
 

@@ -1,21 +1,21 @@
 ---
 name: harklight-agent-send-listen
-version: "0.1.0"
+version: "0.1.1"
 description: Send a request through an existing Harklight sender grant and keep its originating agent session listening for request-bound turns.
 ---
 
 # Send and listen with Harklight
 
 Use the `harklight-agent` host CLI and the existing enrolled device identity.
-The Linux x86_64 server package bundles this executable at `bin/harklight-agent`;
-it is also released separately for other platforms, see the project README
-for the install routes. The CLI does not enroll devices, request sender
-grants, add trust roots, or start a replacement agent. Ask the operator for
-the existing identity directory, CA file and origin HTTPS port when those
-values are not already configured. The sender ID must already be granted to this device. See
-`AGENT_CLI.md`, installed alongside this skill in the server package, for file
-attachments, retries, the disposable integration fixture and the full command
-reference.
+The CLI is released from <https://github.com/clickety-clacks/harklight-agent>;
+install it with `brew install clickety-clacks/tap/harklight-agent` or from that
+repository's release tarballs. The server package does not bundle it. The CLI
+does not enroll devices, request sender grants, add trust roots, or start a
+replacement agent. Ask the operator for the existing identity directory, CA
+file and origin HTTPS port when those values are not already configured. The
+sender ID must already be granted to this device. See the CLI's README in that
+repository for file attachments, retries, the disposable integration fixture
+and the full command reference.
 
 The CLI uses the configured origin HTTPS endpoint. Its port is distinct from
 the relay port and is never inferred from it. Set `--origin-port` or
@@ -201,8 +201,8 @@ A harness that is neither Claude Code nor Codex can declare its own continuous
 listener by minting the handle with `--route other --controller` on `send` and
 arming it with `listen --follow --controller`. Declaring `--controller` is that
 harness's own statement that it runs and supervises the `--follow` process;
-it is not a stronger delivery guarantee than Claude Code or Codex get. See
-`AGENT_CLI.md` in the package for the exact flag requirements.
+it is not a stronger delivery guarantee than Claude Code or Codex get. The CLI
+refuses `--controller` without those companion flags before any network call.
 
 Use `--file` with `send`, `reply` or `revise` only when the origin reports file
 limits. The CLI uses the published decoded inline allowance and uploads any
