@@ -39,6 +39,15 @@ defmodule AttentionServer.Placement do
     end
   end
 
+  def entry(%{identity: {sender, id}, message: message}) do
+    entry = %{"sender_id" => sender, "message_id" => id}
+
+    case Map.get(message, "by_when") do
+      due_at when is_integer(due_at) -> Map.put(entry, "due_at", due_at)
+      _ -> entry
+    end
+  end
+
   def choice(%Engine{} = engine, person),
     do: Map.get(engine.algorithm_choices, person, "baseline")
 
@@ -84,18 +93,7 @@ defmodule AttentionServer.Placement.Baseline do
   def place(items, _previous, _result) do
     items
     |> ordered_items()
-    |> Enum.map(fn item ->
-      {sender, id} = item.identity
-      entry = %{"sender_id" => sender, "message_id" => id}
-
-      case Map.get(item.message, "by_when") do
-        deadline when is_integer(deadline) ->
-          Map.put(entry, "due_at", deadline)
-
-        _ ->
-          Map.put(entry, "reason", "No deadline; newest first")
-      end
-    end)
+    |> Enum.map(&AttentionServer.Placement.entry/1)
   end
 
   def ordered_items(items) when is_list(items) do
@@ -127,16 +125,7 @@ defmodule AttentionServer.Placement.JevSet do
     items_by_identity = Map.new(items, &{&1.identity, &1})
 
     identities
-    |> Enum.map(fn identity ->
-      _item = Map.fetch!(items_by_identity, identity)
-      {sender, id} = identity
-
-      %{
-        "sender_id" => sender,
-        "message_id" => id,
-        "reason" => "Ranked by how soon it needs handling"
-      }
-    end)
+    |> Enum.map(fn identity -> Map.fetch!(items_by_identity, identity) |> Placement.entry() end)
   end
 
   def place(items, previous, _result) do
@@ -149,7 +138,7 @@ defmodule AttentionServer.Placement.JevSet do
         identity = Placement.identity(entry)
 
         if Map.has_key?(items_by_identity, identity),
-          do: [Map.fetch!(previous_by_identity, identity)],
+          do: [Placement.entry(Map.fetch!(items_by_identity, identity))],
           else: []
       end)
 
