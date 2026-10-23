@@ -56,7 +56,7 @@ defmodule AttentionServer.DashboardView do
       ~s(<section><h2>App</h2><p class="status">Not available yet</p></section>)
 
     cli_section =
-      ~s(<section><h2>Command-line agent</h2><pre><code>brew install clickety-clacks/tap/harklight-agent</code></pre><p><a href="https://github.com/clickety-clacks/harklight-agent/releases/latest">Prebuilt releases</a></p></section>)
+      ~s(<section><h2>Command-line agent</h2><div class="install-command"><pre id="install-command"><code>brew install clickety-clacks/tap/harklight-agent</code></pre><button class="button" id="copy-install-command" type="button" aria-controls="install-command">Copy install command</button><p class="copy-status" id="install-copy-status" role="status" aria-live="polite"></p></div><p><a href="https://github.com/clickety-clacks/harklight-agent/releases/latest">Prebuilt releases</a></p></section>)
 
     skill_section =
       skill_section("harklight-agent", skill_version, "/agent-skills/SKILL.md")
@@ -70,7 +70,11 @@ defmodule AttentionServer.DashboardView do
 
     body =
       ~s(<header class="page-head"><div><h1>Components</h1></div></header>) <>
-        app_section <> cli_section <> skill_section <> skill_section_send_listen
+        app_section <>
+        cli_section <>
+        skill_section <>
+        skill_section_send_listen <>
+        ~s(<script src="/components.js" defer></script>)
 
     layout(person_name, "Components", body, chrome)
   end
@@ -78,7 +82,7 @@ defmodule AttentionServer.DashboardView do
   defp skill_section(name, skill_version, path) do
     version_line =
       case skill_version do
-        {:ok, version} -> ~s(<p class="status">v#{escape(version)}</p>)
+        {:ok, version} -> ~s(<p class="status version">v#{escape(version)}</p>)
         :error -> ""
       end
 
@@ -191,6 +195,17 @@ defmodule AttentionServer.DashboardView do
   end
 
   defp css do
+    base_css() <>
+      "main{box-sizing:border-box;max-width:100%;min-width:0}" <>
+      ".status.version{text-transform:none;letter-spacing:normal}" <>
+      ".install-command{display:grid;grid-template-columns:minmax(0,1fr);gap:8px}" <>
+      ".install-command pre{box-sizing:border-box;width:100%;max-width:100%;white-space:pre-wrap;overflow-wrap:anywhere;background:#f5f6f8;border:1px solid #dce1e7;border-radius:8px;padding:14px;margin:0}" <>
+      ".install-command code{font:14px ui-monospace,SFMono-Regular,monospace}" <>
+      ".install-command .button{justify-self:start;margin:0}" <>
+      ".copy-status{min-height:1.25em;color:#5f6874;font-size:14px;margin:0}"
+  end
+
+  defp base_css do
     "body{margin:0;background:#f5f6f8;color:#202632;font:16px system-ui,-apple-system,sans-serif}.shell{display:flex;min-height:100vh}aside{width:210px;background:white;border-right:1px solid #dce1e7;padding:28px;display:flex;flex-direction:column;gap:32px}nav{display:grid;gap:12px}a{color:#1265b0;text-decoration:none}.account{margin-top:auto;color:#5f6874;font-size:14px}main{width:min(100%,900px);padding:40px}.page-head{display:flex;justify-content:space-between;align-items:center;gap:20px}h1{margin:0}h2{font-size:18px}.page-head p,.note{color:#5f6874}.status{display:inline-block;color:#5f6874;font-size:14px;text-transform:uppercase;letter-spacing:.04em;margin:0}.button{background:#1465b5;color:white;border:0;border-radius:20px;padding:10px 18px;white-space:nowrap;font:inherit;cursor:pointer}section{background:white;border:1px solid #dce1e7;border-radius:14px;padding:20px;margin-top:24px}.empty{max-width:480px}.waiting{list-style:none;padding:0}.waiting li{display:flex;gap:20px;justify-content:space-between;border-top:1px solid #e7e9ed;padding:12px 0}table{width:100%;border-collapse:collapse;text-align:left}th,td{padding:12px;border-bottom:1px solid #e7e9ed}th{color:#5f6874;font-size:14px}@media(max-width:680px){.shell{display:block}aside{width:auto;gap:12px;padding:16px}nav{display:flex;gap:20px}.account{margin:0}main{padding:20px}.page-head,.waiting li{display:block}.button{display:inline-block;margin-top:10px}}"
   end
 

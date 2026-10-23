@@ -346,6 +346,25 @@ defmodule AttentionServer.DashboardHTTPSTest do
 
     assert unsigned_script =~ "HTTP/1.1 401"
 
+    components_script =
+      send_https(certs, port, [
+        "GET /components.js HTTP/1.1\r\nHost: relay.test:#{port}\r\n",
+        "Cookie: __Host-harklight=#{cookie}\r\nConnection: close\r\n\r\n"
+      ])
+
+    assert components_script =~ "HTTP/1.1 200"
+    assert components_script =~ "navigator.clipboard.writeText(command)"
+    assert components_script =~ "Command copied."
+
+    unsigned_components_script =
+      send_https(
+        certs,
+        port,
+        "GET /components.js HTTP/1.1\r\nHost: relay.test:#{port}\r\nConnection: close\r\n\r\n"
+      )
+
+    assert unsigned_components_script =~ "HTTP/1.1 401"
+
     # The Create response and its request cookie can both be lost. A later
     # Devices visit must not silently prepare another ordinary Create request.
     without_request_cookie =

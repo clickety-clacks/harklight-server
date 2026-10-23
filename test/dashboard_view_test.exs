@@ -52,10 +52,25 @@ defmodule AttentionServer.DashboardViewTest do
     html = DashboardView.components("Dana", {:ok, "0.1.0"}, {:ok, "0.2.0"})
 
     assert html =~ "v0.1.0"
+    assert html =~ ~s(<p class="status version">v0.1.0</p>)
+    assert html =~ ".status.version{text-transform:none;letter-spacing:normal"
+
     assert html =~ ~s(href="/agent-skills/SKILL.md")
     assert html =~ ~s(<div class="account">Dana</div>)
 
     assert html =~ ~s(<section><h2>App</h2><p class="status">Not available yet</p></section>)
+  end
+
+  test "the components page presents a wrapped, copyable install command" do
+    html = DashboardView.components("Dana", {:ok, "0.1.0"}, {:ok, "0.2.0"})
+
+    assert html =~
+             ~s(<pre id="install-command"><code>brew install clickety-clacks/tap/harklight-agent</code></pre>)
+
+    assert html =~
+             ~s(<button class="button" id="copy-install-command" type="button" aria-controls="install-command">Copy install command</button>)
+
+    assert html =~ ~s(<script src="/components.js" defer></script>)
   end
 
   test "the components page shows the live Homebrew install command and the published CLI release" do

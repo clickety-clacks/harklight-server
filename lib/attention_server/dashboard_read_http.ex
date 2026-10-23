@@ -213,6 +213,12 @@ defmodule AttentionServer.DashboardReadHTTP do
     |> send_resp(200, invitation_share_script())
   end
 
+  defp route(%{method: "GET", request_path: "/components.js"} = conn, _opts, _principal) do
+    conn
+    |> put_resp_content_type("text/javascript", "utf-8")
+    |> send_resp(200, components_script())
+  end
+
   defp route(%{method: "POST", request_path: "/devices/add"} = conn, opts, principal) do
     case form(conn, opts, ~w(confirm)) do
       {:ok, %{"confirm" => "invite"}, conn} ->
@@ -654,6 +660,32 @@ defmodule AttentionServer.DashboardReadHTTP do
           full.focus();
           full.select();
           status.textContent = "Automatic copy is unavailable. The full link is selected.";
+        }
+      });
+    }
+    """
+  end
+
+  defp components_script do
+    ~S"""
+    const code = document.querySelector("#install-command code");
+    const copy = document.getElementById("copy-install-command");
+    const status = document.getElementById("install-copy-status");
+
+    if (code && copy && status) {
+      copy.addEventListener("click", async () => {
+        const command = code.textContent.trim();
+
+        try {
+          await navigator.clipboard.writeText(command);
+          status.textContent = "Command copied.";
+        } catch (_error) {
+          const range = document.createRange();
+          range.selectNodeContents(code);
+          const selection = window.getSelection();
+          selection.removeAllRanges();
+          selection.addRange(range);
+          status.textContent = "Automatic copy is unavailable. The command is selected.";
         }
       });
     }
