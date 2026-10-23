@@ -113,7 +113,7 @@ defmodule AttentionServer.PrioritizationTest do
     assert Placement.reassess(baseline, "person-a", []) == :none
   end
 
-  test "Jev placement retains the last whole-set order and baseline-places new arrivals" do
+  test "selected placement retains the last whole-set order and baseline-places new arrivals" do
     items = [
       item("older", 1),
       item("new-late", 4, 30),
@@ -122,8 +122,16 @@ defmodule AttentionServer.PrioritizationTest do
     ]
 
     previous = [
-      %{"sender_id" => "app:test", "message_id" => "newest", "reason" => "Jev rank 1 of 2"},
-      %{"sender_id" => "app:test", "message_id" => "older", "reason" => "Jev rank 2 of 2"}
+      %{
+        "sender_id" => "app:test",
+        "message_id" => "newest",
+        "reason" => "Current waiting-set position 1 of 2"
+      },
+      %{
+        "sender_id" => "app:test",
+        "message_id" => "older",
+        "reason" => "Current waiting-set position 2 of 2"
+      }
     ]
 
     assert ["newest", "older", "new-early", "new-late"] ==
@@ -134,6 +142,27 @@ defmodule AttentionServer.PrioritizationTest do
     assert {:ok, engine} = Engine.setup_person(Engine.new(), "person-a")
     assert {:ok, engine} = Engine.set_algorithm_choice(engine, "person-a", "jev-set")
     assert Placement.reassess(engine, "person-a", []) == :whole_set
+  end
+
+  test "selected placement explains position without naming the ordering provider" do
+    items = [item("older", 1), item("newest", 2)]
+
+    assert [
+             %{
+               "message_id" => "older",
+               "reason" => "Current waiting-set position 1 of 2"
+             },
+             %{
+               "message_id" => "newest",
+               "reason" => "Current waiting-set position 2 of 2"
+             }
+           ] =
+             Placement.place(
+               "jev-set",
+               items,
+               [],
+               {:ranked, [{"app:test", "older"}, {"app:test", "newest"}]}
+             )
   end
 
   test "Jev composes one typed score question for every item in the same full set" do

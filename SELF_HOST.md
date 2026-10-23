@@ -215,14 +215,16 @@ an old code or deadline cannot approve it. Denial, cancellation and revocation
 remain terminal and never grant sender rights.
 
 The self-hosted dashboard also has a **Prioritization** page. It sets the
-dashboard owner's waiting-item order to the deterministic baseline or Jev's
-whole-set re-ranking. The endpoint and model are server-wide; the algorithm
-choice is per person. SaaS deployments have no such page. To enable Jev, set
+dashboard owner's waiting-item order to the deterministic baseline or a
+model-assisted whole-set ranking. The endpoint and model are server-wide; the
+algorithm choice is per person. SaaS deployments have no such page. To enable
+model-assisted ranking, set
 `ATTENTION_SERVER_JEV_KEY_PATH` in private `server.env` to the absolute path of
 a protected key file. The page reports whether the file is readable; it never
-accepts or displays the path or key. Jev can be selected only after its HTTPS
-endpoint, model and key file are ready. If Jev is unavailable, the server uses
-the baseline order while intake, delivery and push continue normally.
+accepts or displays the path or key. Model-assisted ranking can be selected only
+after its HTTPS endpoint, model and key file are ready. If the ranking is
+unavailable, the server uses the baseline order while intake, delivery and push
+continue normally.
 
 ## Optional APNs notifications
 

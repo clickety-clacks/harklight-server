@@ -145,7 +145,7 @@ defmodule AttentionServer.Placement.JevSet do
       %{
         "sender_id" => sender,
         "message_id" => id,
-        "reason" => "Jev rank #{rank} of #{count}"
+        "reason" => "Current waiting-set position #{rank} of #{count}"
       }
     end)
   end
