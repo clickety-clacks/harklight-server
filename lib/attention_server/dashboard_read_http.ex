@@ -31,7 +31,9 @@ defmodule AttentionServer.DashboardReadHTTP do
     backend = Keyword.fetch!(opts, :backend)
     skill_path = Keyword.fetch!(opts, :skill_path)
     hosted = Keyword.get(opts, :hosted, false) == true
-    skill_path_send_listen = Keyword.fetch!(opts, :skill_path_send_listen)
+
+    skill_path_send_listen =
+      Keyword.get(opts, :skill_path_send_listen) || send_listen_skill_path(skill_path)
 
     %{
       backend: backend,
@@ -42,6 +44,14 @@ defmodule AttentionServer.DashboardReadHTTP do
         if(hosted, do: hosted_addresses(Keyword.get(opts, :hosted_addresses)), else: %{}),
       skill_path_send_listen: skill_path_send_listen
     }
+  end
+
+  defp send_listen_skill_path(skill_path) do
+    Path.join([
+      Path.dirname(Path.dirname(skill_path)),
+      "harklight-agent-send-listen",
+      "SKILL.md"
+    ])
   end
 
   defp hosted_addresses(addresses) when is_map(addresses) do

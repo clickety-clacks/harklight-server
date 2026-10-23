@@ -64,7 +64,7 @@ defmodule AttentionServer.DashboardViewTest do
     assert html =~ "brew install clickety-clacks/tap/harklight-agent"
 
     assert html =~
-             ~s(href="https://github.com/clickety-clacks/harklight-agent/releases/tag/v0.1.1")
+             ~s(href="https://github.com/clickety-clacks/harklight-agent/releases/latest")
 
     refute html =~ "Homebrew formula"
   end

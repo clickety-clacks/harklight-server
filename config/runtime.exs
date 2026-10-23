@@ -152,7 +152,7 @@ if System.get_env("ATTENTION_SERVER_ENABLE") == "1" do
               System.fetch_env!("ATTENTION_SERVER_KEYFILE"),
           skill_path: System.fetch_env!("ATTENTION_SERVER_DASHBOARD_SKILL_PATH"),
           skill_path_send_listen:
-            System.fetch_env!("ATTENTION_SERVER_DASHBOARD_SKILL_PATH_SEND_LISTEN")
+            System.get_env("ATTENTION_SERVER_DASHBOARD_SKILL_PATH_SEND_LISTEN")
         ]
 
         Keyword.put(server_opts, :dashboard, dashboard)

@@ -165,10 +165,10 @@ The dashboard shows device status and agent skill guidance. A signed-in person
 owner can create a one-use invitation, review a pending request, and approve or
 decline its exact device key before the deadline. These actions use that person's
 current owner authority; account-wide metadata visibility grants no
-cross-person approval or sender rights. It is off until the
-operator sets all four values below in the
-private `server.env` and restarts the server. Use the same certificate hostname
-chosen at bootstrap; the browser must trust that server certificate's CA.
+cross-person approval or sender rights. It is off until the operator sets the
+required dashboard values below in the private `server.env` and restarts the
+server. Use the same certificate hostname chosen at bootstrap; the browser must
+trust that server certificate's CA.
 The dashboard has its own HTTPS port and defaults to loopback binding.
 
 - `ATTENTION_SERVER_DASHBOARD_PORT`: a free HTTPS port, for example `18447`.
@@ -177,8 +177,11 @@ The dashboard has its own HTTPS port and defaults to loopback binding.
   metadata across the self-hosted server; other owners stay person-scoped.
 - `ATTENTION_SERVER_DASHBOARD_SKILL_PATH`: the installed package's absolute
   `skills/harklight-agent/SKILL.md` path.
-- `ATTENTION_SERVER_DASHBOARD_SKILL_PATH_SEND_LISTEN`: the installed package's
-  absolute `skills/harklight-agent-send-listen/SKILL.md` path.
+- `ATTENTION_SERVER_DASHBOARD_SKILL_PATH_SEND_LISTEN` (optional): the installed
+  package's absolute `skills/harklight-agent-send-listen/SKILL.md` path. When
+  omitted, the dashboard derives this path from the configured
+  `skills/harklight-agent/SKILL.md` path, so existing `server.env` files remain
+  valid after an upgrade.
 
 Both skill files are served without signing in, at `/agent-skills/SKILL.md`
 and `/agent-skills/harklight-agent-send-listen/SKILL.md`. The signed-in

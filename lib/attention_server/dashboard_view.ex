@@ -56,7 +56,7 @@ defmodule AttentionServer.DashboardView do
       ~s(<section><h2>App</h2><p class="status">Not available yet</p></section>)
 
     cli_section =
-      ~s(<section><h2>Command-line agent</h2><pre><code>brew install clickety-clacks/tap/harklight-agent</code></pre><p><a href="https://github.com/clickety-clacks/harklight-agent/releases/tag/v0.1.1">Prebuilt releases</a></p></section>)
+      ~s(<section><h2>Command-line agent</h2><pre><code>brew install clickety-clacks/tap/harklight-agent</code></pre><p><a href="https://github.com/clickety-clacks/harklight-agent/releases/latest">Prebuilt releases</a></p></section>)
 
     skill_section =
       skill_section("harklight-agent", skill_version, "/agent-skills/SKILL.md")

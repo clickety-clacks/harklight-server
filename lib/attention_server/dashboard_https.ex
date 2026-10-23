@@ -53,7 +53,7 @@ defmodule AttentionServer.DashboardHTTPS do
             expected_origin: Keyword.get(opts, :public_origin),
             hosted: hosted?,
             hosted_addresses: Keyword.get(opts, :hosted_addresses, %{}),
-            skill_path_send_listen: Keyword.fetch!(opts, :skill_path_send_listen)},
+            skill_path_send_listen: Keyword.get(opts, :skill_path_send_listen)},
          scheme: :https,
          ip: Keyword.fetch!(opts, :ip),
          port: Keyword.fetch!(opts, :port),
