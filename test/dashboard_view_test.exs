@@ -51,53 +51,53 @@ defmodule AttentionServer.DashboardViewTest do
   test "the components page shows the packaged skill version and no invented app link" do
     html = DashboardView.components("Dana", {:ok, "0.1.0"}, {:ok, "0.2.0"})
 
-    assert html =~ "Packaged skill version: 0.1.0"
+    assert html =~ "v0.1.0"
     assert html =~ ~s(href="/agent-skills/SKILL.md")
-    assert html =~ "cargo build --locked --release --manifest-path agent-cli/Cargo.toml"
     assert html =~ ~s(<div class="account">Dana</div>)
 
-    assert html =~
-             ~s(<section><h2>App</h2><p>The Harklight app for iPhone is in internal TestFlight testing today and is not publicly available yet. A link to install it will appear here once a public install route exists.</p></section>)
+    assert html =~ ~s(<section><h2>App</h2><p class="status">Not available yet</p></section>)
   end
 
-  test "the components page links the published CLI release and marks Homebrew as not yet available" do
+  test "the components page shows the live Homebrew install command and the published CLI release" do
     html = DashboardView.components("Dana", {:ok, "0.1.0"}, {:ok, "0.2.0"})
+
+    assert html =~ "brew install clickety-clacks/tap/harklight-agent"
 
     assert html =~
              ~s(href="https://github.com/clickety-clacks/harklight-agent/releases/tag/v0.1.1")
 
-    assert html =~ "Homebrew formula is in progress and not available yet"
+    refute html =~ "Homebrew formula"
   end
 
   test "the components page documents both shipped skills with their own version and link" do
     html = DashboardView.components("Dana", {:ok, "0.1.0"}, {:ok, "0.2.0"})
 
     assert html =~ "Agent skill: harklight-agent</h2>"
-    assert html =~ "Packaged skill version: 0.1.0"
+    assert html =~ "v0.1.0"
     assert html =~ ~s(href="/agent-skills/SKILL.md")
 
     assert html =~ "Agent skill: harklight-agent-send-listen</h2>"
-    assert html =~ "Packaged skill version: 0.2.0"
+    assert html =~ "v0.2.0"
     assert html =~ ~s(href="/agent-skills/harklight-agent-send-listen/SKILL.md")
-    assert html =~ "keep its originating agent session listening for request-bound turns"
   end
 
   test "the components page tolerates a skill version lookup failure for either skill independently" do
     html = DashboardView.components("Dana", :error, {:ok, "0.2.0"})
 
-    refute html =~ "Packaged skill version: 0.1.0"
-    assert html =~ "Packaged skill version: 0.2.0"
+    refute html =~ "v0.1.0"
+    assert html =~ "v0.2.0"
 
     html = DashboardView.components("Dana", {:ok, "0.1.0"}, :error)
 
-    assert html =~ "Packaged skill version: 0.1.0"
-    refute html =~ "Packaged skill version: 0.2.0"
+    assert html =~ "v0.1.0"
+    refute html =~ "v0.2.0"
   end
 
   test "the components page tolerates both skill version lookups failing" do
     html = DashboardView.components("Dana", :error, :error)
 
-    refute html =~ "Packaged skill version"
+    refute html =~ ~s(<h2>Agent skill: harklight-agent</h2><p class="status">v)
+    refute html =~ ~s(<h2>Agent skill: harklight-agent-send-listen</h2><p class="status">v)
   end
 
   test "uncertain invitation failure offers same-request retry without a new invitation action" do

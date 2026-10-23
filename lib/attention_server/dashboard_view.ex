@@ -53,42 +53,36 @@ defmodule AttentionServer.DashboardView do
         ) :: String.t()
   def components(person_name, skill_version, skill_version_send_listen, chrome \\ []) do
     app_section =
-      ~s(<section><h2>App</h2><p>The Harklight app for iPhone is in internal TestFlight testing today and is not publicly available yet. A link to install it will appear here once a public install route exists.</p></section>)
+      ~s(<section><h2>App</h2><p class="status">Not available yet</p></section>)
 
     cli_section =
-      ~s(<section><h2>Command-line agent</h2><p>The Linux x86_64 server package bundles the agent CLI at <code>bin/harklight-agent</code>. Package installation does not start a listener or create a device identity.</p><p>Prebuilt macOS \(arm64 and Intel\) and Linux \(x86_64 and arm64\) builds are published on the <a href="https://github.com/clickety-clacks/harklight-agent/releases/tag/v0.1.1">harklight-agent releases page</a>, each checked against the published SHA256SUMS file. A Homebrew formula is in progress and not available yet. Until then, or on another platform, build from source:</p><pre><code>cargo build --locked --release --manifest-path agent-cli/Cargo.toml</code></pre><p>The built executable is <code>agent-cli/target/release/harklight-agent</code>.</p></section>)
+      ~s(<section><h2>Command-line agent</h2><pre><code>brew install clickety-clacks/tap/harklight-agent</code></pre><p><a href="https://github.com/clickety-clacks/harklight-agent/releases/tag/v0.1.1">Prebuilt releases</a></p></section>)
 
     skill_section =
-      skill_section(
-        "harklight-agent",
-        skill_version,
-        "/agent-skills/SKILL.md",
-        "Operate a self-hosted Harklight server from an agent or script: enroll a sender device, send a message, read its reply, or use separately granted agent search and response tools."
-      )
+      skill_section("harklight-agent", skill_version, "/agent-skills/SKILL.md")
 
     skill_section_send_listen =
       skill_section(
         "harklight-agent-send-listen",
         skill_version_send_listen,
-        "/agent-skills/harklight-agent-send-listen/SKILL.md",
-        "Send a request through an existing Harklight sender grant and keep its originating agent session listening for request-bound turns."
+        "/agent-skills/harklight-agent-send-listen/SKILL.md"
       )
 
     body =
-      ~s(<header class="page-head"><div><h1>Components</h1><p>Everything needed to connect an app, the CLI or an agent to this account.</p></div></header>) <>
+      ~s(<header class="page-head"><div><h1>Components</h1></div></header>) <>
         app_section <> cli_section <> skill_section <> skill_section_send_listen
 
     layout(person_name, "Components", body, chrome)
   end
 
-  defp skill_section(name, skill_version, path, description) do
+  defp skill_section(name, skill_version, path) do
     version_line =
       case skill_version do
-        {:ok, version} -> ~s(<p>Packaged skill version: #{escape(version)}</p>)
+        {:ok, version} -> ~s(<p class="status">v#{escape(version)}</p>)
         :error -> ""
       end
 
-    ~s(<section><h2>Agent skill: #{escape(name)}</h2>#{version_line}<p>#{escape(description)}</p><p>Copy the packaged <code>skills/#{escape(name)}</code> folder into your agent harness's configured skills directory, then follow its enrollment and sender-grant steps. Installing the skill alone grants no access.</p><p><a href="#{escape(path)}">Read the #{escape(name)} skill</a></p></section>)
+    ~s(<section><h2>Agent skill: #{escape(name)}</h2>#{version_line}<p><a href="#{escape(path)}">Read the #{escape(name)} skill</a></p></section>)
   end
 
   def invitation_failure(person, message, action \\ :retry, new_request_id \\ nil, chrome \\ []) do
@@ -197,7 +191,7 @@ defmodule AttentionServer.DashboardView do
   end
 
   defp css do
-    "body{margin:0;background:#f5f6f8;color:#202632;font:16px system-ui,-apple-system,sans-serif}.shell{display:flex;min-height:100vh}aside{width:210px;background:white;border-right:1px solid #dce1e7;padding:28px;display:flex;flex-direction:column;gap:32px}nav{display:grid;gap:12px}a{color:#1265b0;text-decoration:none}.account{margin-top:auto;color:#5f6874;font-size:14px}main{width:min(100%,900px);padding:40px}.page-head{display:flex;justify-content:space-between;align-items:center;gap:20px}h1{margin:0}h2{font-size:18px}.page-head p,.note{color:#5f6874}.button{background:#1465b5;color:white;border:0;border-radius:20px;padding:10px 18px;white-space:nowrap;font:inherit;cursor:pointer}section{background:white;border:1px solid #dce1e7;border-radius:14px;padding:20px;margin-top:24px}.empty{max-width:480px}.waiting{list-style:none;padding:0}.waiting li{display:flex;gap:20px;justify-content:space-between;border-top:1px solid #e7e9ed;padding:12px 0}table{width:100%;border-collapse:collapse;text-align:left}th,td{padding:12px;border-bottom:1px solid #e7e9ed}th{color:#5f6874;font-size:14px}@media(max-width:680px){.shell{display:block}aside{width:auto;gap:12px;padding:16px}nav{display:flex;gap:20px}.account{margin:0}main{padding:20px}.page-head,.waiting li{display:block}.button{display:inline-block;margin-top:10px}}"
+    "body{margin:0;background:#f5f6f8;color:#202632;font:16px system-ui,-apple-system,sans-serif}.shell{display:flex;min-height:100vh}aside{width:210px;background:white;border-right:1px solid #dce1e7;padding:28px;display:flex;flex-direction:column;gap:32px}nav{display:grid;gap:12px}a{color:#1265b0;text-decoration:none}.account{margin-top:auto;color:#5f6874;font-size:14px}main{width:min(100%,900px);padding:40px}.page-head{display:flex;justify-content:space-between;align-items:center;gap:20px}h1{margin:0}h2{font-size:18px}.page-head p,.note{color:#5f6874}.status{display:inline-block;color:#5f6874;font-size:14px;text-transform:uppercase;letter-spacing:.04em;margin:0}.button{background:#1465b5;color:white;border:0;border-radius:20px;padding:10px 18px;white-space:nowrap;font:inherit;cursor:pointer}section{background:white;border:1px solid #dce1e7;border-radius:14px;padding:20px;margin-top:24px}.empty{max-width:480px}.waiting{list-style:none;padding:0}.waiting li{display:flex;gap:20px;justify-content:space-between;border-top:1px solid #e7e9ed;padding:12px 0}table{width:100%;border-collapse:collapse;text-align:left}th,td{padding:12px;border-bottom:1px solid #e7e9ed}th{color:#5f6874;font-size:14px}@media(max-width:680px){.shell{display:block}aside{width:auto;gap:12px;padding:16px}nav{display:flex;gap:20px}.account{margin:0}main{padding:20px}.page-head,.waiting li{display:block}.button{display:inline-block;margin-top:10px}}"
   end
 
   defp escape(value) do

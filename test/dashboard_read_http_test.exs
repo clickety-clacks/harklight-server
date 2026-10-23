@@ -104,8 +104,7 @@ defmodule AttentionServer.DashboardReadHTTPTest do
       "/agent-skills/SKILL.md" |> secure_get("member-session") |> DashboardReadHTTP.call(opts)
 
     assert page.status == 200
-    assert page.resp_body =~ "Installing the skill alone grants no access"
-    assert page.resp_body =~ "Packaged skill version: 0.1.0"
+    assert page.resp_body =~ "v0.1.0"
     assert skill.status == 200
 
     assert skill.resp_body ==
@@ -126,8 +125,8 @@ defmodule AttentionServer.DashboardReadHTTPTest do
     page = "/components" |> secure_get("member-session") |> DashboardReadHTTP.call(opts)
 
     assert page.status == 200
-    refute page.resp_body =~ "Packaged skill version: 0.1.0"
-    assert page.resp_body =~ "Packaged skill version: 0.2.0"
+    refute page.resp_body =~ "v0.1.0"
+    assert page.resp_body =~ "v0.2.0"
   end
 
   test "the agent skills page redirects to the components page for a signed-in session", %{
