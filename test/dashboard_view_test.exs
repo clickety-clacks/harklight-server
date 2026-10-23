@@ -65,7 +65,17 @@ defmodule AttentionServer.DashboardViewTest do
     html = DashboardView.components("Dana", {:ok, "0.1.0"}, {:ok, "0.2.0"})
 
     assert html =~
-             ~s(<pre id="install-command"><code>brew install clickety-clacks/tap/harklight-agent</code></pre>)
+             ~s(<pre id="install-command"><code>brew install <span class="brew-namespace">clickety-clacks</span>/<wbr>tap/<wbr>harklight-agent</code></pre>)
+
+    assert [command_markup] =
+             Regex.run(~r{<pre id="install-command"><code>(.*?)</code></pre>}s, html,
+               capture: :all_but_first
+             )
+
+    assert Regex.replace(~r{<[^>]+>}, command_markup, "") ==
+             "brew install clickety-clacks/tap/harklight-agent"
+
+    assert html =~ ".install-command code .brew-namespace{white-space:nowrap}"
 
     assert html =~
              ~s(<button class="button" id="copy-install-command" type="button" aria-controls="install-command">Copy install command</button>)
@@ -73,10 +83,8 @@ defmodule AttentionServer.DashboardViewTest do
     assert html =~ ~s(<script src="/components.js" defer></script>)
   end
 
-  test "the components page shows the live Homebrew install command and the published CLI release" do
+  test "the components page links to the published CLI release" do
     html = DashboardView.components("Dana", {:ok, "0.1.0"}, {:ok, "0.2.0"})
-
-    assert html =~ "brew install clickety-clacks/tap/harklight-agent"
 
     assert html =~
              ~s(href="https://github.com/clickety-clacks/harklight-agent/releases/latest")

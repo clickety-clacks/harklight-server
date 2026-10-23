@@ -56,7 +56,7 @@ defmodule AttentionServer.DashboardView do
       ~s(<section><h2>App</h2><p class="status">Not available yet</p></section>)
 
     cli_section =
-      ~s(<section><h2>Command-line agent</h2><div class="install-command"><pre id="install-command"><code>brew install clickety-clacks/tap/harklight-agent</code></pre><button class="button" id="copy-install-command" type="button" aria-controls="install-command">Copy install command</button><p class="copy-status" id="install-copy-status" role="status" aria-live="polite"></p></div><p><a href="https://github.com/clickety-clacks/harklight-agent/releases/latest">Prebuilt releases</a></p></section>)
+      ~s(<section><h2>Command-line agent</h2><div class="install-command"><pre id="install-command"><code>brew install <span class="brew-namespace">clickety-clacks</span>/<wbr>tap/<wbr>harklight-agent</code></pre><button class="button" id="copy-install-command" type="button" aria-controls="install-command">Copy install command</button><p class="copy-status" id="install-copy-status" role="status" aria-live="polite"></p></div><p><a href="https://github.com/clickety-clacks/harklight-agent/releases/latest">Prebuilt releases</a></p></section>)
 
     skill_section =
       skill_section("harklight-agent", skill_version, "/agent-skills/SKILL.md")
@@ -201,6 +201,7 @@ defmodule AttentionServer.DashboardView do
       ".install-command{display:grid;grid-template-columns:minmax(0,1fr);gap:8px}" <>
       ".install-command pre{box-sizing:border-box;width:100%;max-width:100%;white-space:pre-wrap;overflow-wrap:anywhere;background:#f5f6f8;border:1px solid #dce1e7;border-radius:8px;padding:14px;margin:0}" <>
       ".install-command code{font:14px ui-monospace,SFMono-Regular,monospace}" <>
+      ".install-command code .brew-namespace{white-space:nowrap}" <>
       ".install-command .button{justify-self:start;margin:0}" <>
       ".copy-status{min-height:1.25em;color:#5f6874;font-size:14px;margin:0}"
   end
