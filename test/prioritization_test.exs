@@ -216,6 +216,11 @@ defmodule AttentionServer.PrioritizationTest do
         "sender_id" => "app:test",
         "message_id" => "older",
         "reason" => "Ranked by how soon it needs handling"
+      },
+      %{
+        "sender_id" => "app:test",
+        "message_id" => "new-late",
+        "reason" => "Ranked by how soon it needs handling"
       }
     ]
 
@@ -224,8 +229,8 @@ defmodule AttentionServer.PrioritizationTest do
     assert entries == [
              %{"sender_id" => "app:test", "message_id" => "newest"},
              %{"sender_id" => "app:test", "message_id" => "older"},
-             %{"sender_id" => "app:test", "message_id" => "new-early", "due_at" => 10},
-             %{"sender_id" => "app:test", "message_id" => "new-late", "due_at" => 30}
+             %{"sender_id" => "app:test", "message_id" => "new-late", "due_at" => 30},
+             %{"sender_id" => "app:test", "message_id" => "new-early", "due_at" => 10}
            ]
 
     assert Enum.all?(entries, &(not Map.has_key?(&1, "reason")))
