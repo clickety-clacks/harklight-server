@@ -832,7 +832,7 @@ defmodule AttentionServer.Relay do
     if state.deployment_mode == :self_hosted and person == configured_owner_person and
          match?({:ok, ^person, _revision}, Engine.owner_identity(state.store.engine, key)) do
       state = ensure_priority_view(state, person)
-      {:reply, {:ok, priority_settings(state.store.engine, person)}, state}
+      {:reply, {:ok, priority_settings(state, person)}, state}
     else
       {:reply, {:error, :forbidden}, state}
     end
@@ -3799,13 +3799,17 @@ defmodule AttentionServer.Relay do
     put_priority_view(state, person, fallback_view(items))
   end
 
-  defp priority_settings(engine, person) do
+  defp priority_settings(state, person) do
+    engine = state.store.engine
+    view = Map.get(state.priority_views, person)
+
     %{
       person_id: person,
       algorithm_id: Placement.choice(engine, person),
       endpoint: engine.jev_endpoint || "",
       model: engine.jev_model || "",
-      key_status: JevClient.key_status()
+      key_status: JevClient.key_status(),
+      basis: if(is_map(view), do: Map.get(view, :basis), else: nil)
     }
   end
 
@@ -3864,7 +3868,7 @@ defmodule AttentionServer.Relay do
       if is_nil(next_state) do
         {:error, :storage_unavailable}
       else
-        settings = priority_settings(next_state.store.engine, person)
+        settings = priority_settings(next_state, person)
 
         if refused?,
           do: {:error, :jev_unconfigured, next_state, settings},

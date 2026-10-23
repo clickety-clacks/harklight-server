@@ -24,10 +24,11 @@ defmodule AttentionServer.DashboardReadHTTPTest do
       {:ok,
        %{
          person_id: "mike",
-         algorithm_id: "baseline",
+         algorithm_id: "jev-set",
          endpoint: "https://api.typesafe.ai/v1/systemone",
          model: "jev-latest",
-         key_status: "not readable"
+         key_status: "not readable",
+         basis: "fallback"
        }}
     end
 
@@ -116,14 +117,23 @@ defmodule AttentionServer.DashboardReadHTTPTest do
 
     assert page.status == 200
     assert page.resp_body =~ "Prioritization"
+    assert page.resp_body =~ "Soonest deadline first, then newest"
     assert page.resp_body =~ "Jev re-ranking"
     assert page.resp_body =~ "not readable"
+
+    assert length(
+             Regex.scan(~r/Waiting items are in basic order until Jev answers\./, page.resp_body)
+           ) == 1
+
     assert page.resp_body =~ ~s(name="endpoint")
     assert page.resp_body =~ ~s(name="model")
     refute page.resp_body =~ "ATTENTION_SERVER_JEV_KEY_PATH"
     refute page.resp_body =~ ~s(name="key")
     refute page.resp_body =~ ~s(name="key_path")
     refute page.resp_body =~ "/protected/key/location"
+    refute page.resp_body =~ "Choose how waiting items are ordered on this server."
+    refute page.resp_body =~ "The key is read from the server's configured key file."
+    refute page.resp_body =~ ">Baseline</option>"
     assert page.resp_body =~ ~s(href="/prioritization")
   end
 

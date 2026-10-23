@@ -175,17 +175,29 @@ defmodule AttentionServer.PrioritizationTest do
   test "baseline orders deadlines first and then uses newest acceptance" do
     items = [
       item("newest", 4),
+      Map.update!(item("invalid-deadline", 5), :message, &Map.put(&1, "by_when", "tomorrow")),
       item("later-deadline", 2, 20),
       item("earliest", 1, 10),
       item("older", 3)
     ]
 
+    entries = Placement.place("baseline", items, [], nil)
+
     assert [
-             %{"message_id" => "earliest", "reason" => "Deadline: " <> _},
-             %{"message_id" => "later-deadline", "reason" => "Deadline: " <> _},
+             earliest,
+             later,
+             %{"message_id" => "invalid-deadline", "reason" => "No deadline; newest first"},
              %{"message_id" => "newest", "reason" => "No deadline; newest first"},
              %{"message_id" => "older", "reason" => "No deadline; newest first"}
-           ] = Placement.place("baseline", items, [], nil)
+           ] = entries
+
+    assert earliest["message_id"] == "earliest"
+    assert earliest["due_at"] == 10
+    refute Map.has_key?(earliest, "reason")
+    assert later["message_id"] == "later-deadline"
+    assert later["due_at"] == 20
+    refute Map.has_key?(later, "reason")
+    refute Map.has_key?(Enum.at(entries, 2), "due_at")
 
     assert {:ok, baseline} = Engine.setup_person(Engine.new(), "person-a")
     assert Placement.reassess(baseline, "person-a", []) == :none
@@ -203,12 +215,12 @@ defmodule AttentionServer.PrioritizationTest do
       %{
         "sender_id" => "app:test",
         "message_id" => "newest",
-        "reason" => "Current waiting-set position 1 of 2"
+        "reason" => "Ranked by how soon it needs handling"
       },
       %{
         "sender_id" => "app:test",
         "message_id" => "older",
-        "reason" => "Current waiting-set position 2 of 2"
+        "reason" => "Ranked by how soon it needs handling"
       }
     ]
 
@@ -222,25 +234,29 @@ defmodule AttentionServer.PrioritizationTest do
     assert Placement.reassess(engine, "person-a", []) == :whole_set
   end
 
-  test "selected placement explains position without naming the ordering provider" do
+  test "ranked placement uses the neutral reason from the contract" do
     items = [item("older", 1), item("newest", 2)]
+
+    entries =
+      Placement.place(
+        "jev-set",
+        items,
+        [],
+        {:ranked, [{"app:test", "older"}, {"app:test", "newest"}]}
+      )
 
     assert [
              %{
                "message_id" => "older",
-               "reason" => "Current waiting-set position 1 of 2"
+               "reason" => "Ranked by how soon it needs handling"
              },
              %{
                "message_id" => "newest",
-               "reason" => "Current waiting-set position 2 of 2"
+               "reason" => "Ranked by how soon it needs handling"
              }
-           ] =
-             Placement.place(
-               "jev-set",
-               items,
-               [],
-               {:ranked, [{"app:test", "older"}, {"app:test", "newest"}]}
-             )
+           ] = entries
+
+    assert Enum.all?(entries, &(not Map.has_key?(&1, "due_at")))
   end
 
   test "Jev composes one typed score question for every item in the same full set" do
@@ -399,14 +415,43 @@ defmodule AttentionServer.PrioritizationTest do
     page =
       DashboardView.prioritization(
         "Owner",
-        %{algorithm_id: "jev-set", endpoint: @endpoint, model: @model, key_status: "readable"},
+        %{
+          algorithm_id: "jev-set",
+          endpoint: @endpoint,
+          model: @model,
+          key_status: "readable",
+          basis: "fallback"
+        },
         nil,
         []
       )
 
+    assert page =~ "Soonest deadline first, then newest"
+    assert page =~ "Jev re-ranking"
+    assert page =~ "Jev key:"
+    assert length(Regex.scan(~r/Waiting items are in basic order until Jev answers\./, page)) == 1
+    refute page =~ "<p>Choose how waiting items are ordered on this server.</p>"
+    refute page =~ "The key is read from the server's configured key file."
+    refute page =~ ">Baseline</option>"
     refute page =~ secret
     refute page =~ key_path
     refute page =~ "ATTENTION_SERVER_JEV_KEY_PATH"
+
+    baseline_page =
+      DashboardView.prioritization(
+        "Owner",
+        %{
+          algorithm_id: "baseline",
+          endpoint: @endpoint,
+          model: @model,
+          key_status: "readable",
+          basis: "selected"
+        },
+        nil,
+        []
+      )
+
+    refute baseline_page =~ "Waiting items are in basic order until Jev answers."
 
     assert {:ok, request} =
              JevClient.compose(
@@ -685,7 +730,7 @@ defmodule AttentionServer.PrioritizationTest do
     GenServer.stop(relay)
   end
 
-  test "a completed Jev pass applies the whole-set order and leaves the relay available",
+  test "a completed synthetic Jev pass applies whole-set order and leaves the relay available",
        %{path: path, dir: dir} do
     use_synthetic_jev_key(dir)
     relay = start_relay(path)
@@ -729,7 +774,7 @@ defmodule AttentionServer.PrioritizationTest do
     GenServer.stop(relay)
   end
 
-  test "unavailable and malformed Jev pass results keep baseline fallback and intake working",
+  test "unavailable and malformed synthetic pass results keep baseline fallback and intake working",
        %{dir: dir} do
     use_synthetic_jev_key(dir)
 
@@ -786,6 +831,55 @@ defmodule AttentionServer.PrioritizationTest do
       assert Process.alive?(relay)
       GenServer.stop(relay)
     end
+  end
+
+  test "restart with a saved Jev choice stays up and serves baseline fallback", %{path: path} do
+    previous_key_path = System.get_env("ATTENTION_SERVER_JEV_KEY_PATH")
+    missing_key_path = Path.join(Path.dirname(path), "missing-key-after-restart")
+    System.put_env("ATTENTION_SERVER_JEV_KEY_PATH", missing_key_path)
+
+    on_exit(fn ->
+      if is_binary(previous_key_path),
+        do: System.put_env("ATTENTION_SERVER_JEV_KEY_PATH", previous_key_path),
+        else: System.delete_env("ATTENTION_SERVER_JEV_KEY_PATH")
+    end)
+
+    relay = start_relay(path)
+    setup_person(relay)
+    forward(relay, 1, "later-deadline", 20)
+    forward(relay, 2, "earlier-deadline", 10)
+
+    engine = :sys.get_state(relay).store.engine
+    assert {:ok, engine} = Engine.set_jev_connection(engine, @endpoint, @model)
+    assert {:ok, engine} = Engine.set_algorithm_choice(engine, "person-a", "jev-set")
+    store = :sys.get_state(relay).store
+
+    assert {:ok, saved} =
+             Store.commit(store, engine, %{person: "person-a", actor: "owner", action: "choice"})
+
+    :sys.replace_state(relay, &%{&1 | store: saved})
+    GenServer.stop(relay)
+
+    restarted = start_relay(path)
+    assert Process.alive?(restarted)
+    assert {:ok, session} = Relay.open_websocket_session(restarted, "device-a", nil, nil)
+
+    assert %{
+             "type" => "ok",
+             "algorithm" => "jev-set",
+             "basis" => "fallback",
+             "entries" => [
+               %{"message_id" => "earlier-deadline", "due_at" => 10},
+               %{"message_id" => "later-deadline", "due_at" => 20}
+             ]
+           } =
+             hd(session_request(restarted, session, %{"type" => "view_get", "ref" => "restart"}))
+
+    forward(restarted, 3, "intake-after-restart")
+    assert Process.alive?(restarted)
+    assert {:ok, events, 3} = Relay.events(restarted, "device-a", 0)
+    assert length(events) == 3
+    GenServer.stop(restarted)
   end
 
   test "a process restart gives the same view a new revision", %{path: path} do

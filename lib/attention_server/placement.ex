@@ -86,8 +86,15 @@ defmodule AttentionServer.Placement.Baseline do
     |> ordered_items()
     |> Enum.map(fn item ->
       {sender, id} = item.identity
-      reason = baseline_reason(item)
-      %{"sender_id" => sender, "message_id" => id, "reason" => reason}
+      entry = %{"sender_id" => sender, "message_id" => id}
+
+      case Map.get(item.message, "by_when") do
+        deadline when is_integer(deadline) ->
+          Map.put(entry, "due_at", deadline)
+
+        _ ->
+          Map.put(entry, "reason", "No deadline; newest first")
+      end
     end)
   end
 
@@ -95,8 +102,8 @@ defmodule AttentionServer.Placement.Baseline do
     Enum.sort_by(items, fn item ->
       deadline = Map.get(item.message, "by_when")
 
-      {is_nil(deadline), if(is_integer(deadline), do: deadline, else: 0), -item.accepted_seq,
-       elem(item.identity, 0), elem(item.identity, 1)}
+      {not is_integer(deadline), if(is_integer(deadline), do: deadline, else: 0),
+       -item.accepted_seq, elem(item.identity, 0), elem(item.identity, 1)}
     end)
   end
 
@@ -105,22 +112,6 @@ defmodule AttentionServer.Placement.Baseline do
 
   @impl true
   def compose(_items, _connection), do: {:error, :not_supported}
-
-  defp baseline_reason(item) do
-    case Map.get(item.message, "by_when") do
-      value when is_integer(value) ->
-        deadline =
-          case DateTime.from_unix(value, :millisecond) do
-            {:ok, datetime} -> DateTime.to_iso8601(datetime)
-            _ -> "date unavailable"
-          end
-
-        "Deadline: " <> deadline
-
-      _ ->
-        "No deadline; newest first"
-    end
-  end
 end
 
 defmodule AttentionServer.Placement.JevSet do
@@ -134,18 +125,16 @@ defmodule AttentionServer.Placement.JevSet do
   @impl true
   def place(items, _previous, {:ranked, identities}) do
     items_by_identity = Map.new(items, &{&1.identity, &1})
-    count = length(identities)
 
     identities
-    |> Enum.with_index(1)
-    |> Enum.map(fn {identity, rank} ->
+    |> Enum.map(fn identity ->
       _item = Map.fetch!(items_by_identity, identity)
       {sender, id} = identity
 
       %{
         "sender_id" => sender,
         "message_id" => id,
-        "reason" => "Current waiting-set position #{rank} of #{count}"
+        "reason" => "Ranked by how soon it needs handling"
       }
     end)
   end

@@ -83,20 +83,33 @@ defmodule AttentionServer.DashboardView do
     selected = settings.algorithm_id
 
     algorithm_options =
-      Enum.map_join([{"baseline", "Baseline"}, {"jev-set", "Jev re-ranking"}], fn {id, label} ->
-        selected_attr = if selected == id, do: " selected", else: ""
-        ~s(<option value="#{id}"#{selected_attr}>#{label}</option>)
-      end)
+      Enum.map_join(
+        [
+          {"baseline", "Soonest deadline first, then newest"},
+          {"jev-set", "Jev re-ranking"}
+        ],
+        fn {id, label} ->
+          selected_attr = if selected == id, do: " selected", else: ""
+          ~s(<option value="#{id}"#{selected_attr}>#{label}</option>)
+        end
+      )
 
     notice =
       if is_binary(message),
         do: ~s(<p class="notice" role="status">#{escape(message)}</p>),
         else: ""
 
+    fallback_status =
+      if selected == "jev-set" and Map.get(settings, :basis) == "fallback",
+        do:
+          ~s(<p class="status" role="status">Waiting items are in basic order until Jev answers.</p>),
+        else: ""
+
     body =
-      ~s(<header class="page-head"><div><h1>Prioritization</h1><p>Choose how waiting items are ordered on this server.</p></div></header>) <>
+      ~s(<header class="page-head"><div><h1>Prioritization</h1></div></header>) <>
+        fallback_status <>
         notice <>
-        ~s(<section><p>Jev key file: <strong>#{escape(settings.key_status)}</strong></p><form action="/prioritization" method="post"><label for="algorithm_id">Algorithm</label><select id="algorithm_id" name="algorithm_id">#{algorithm_options}</select><label for="endpoint">Jev endpoint</label><input id="endpoint" name="endpoint" type="url" inputmode="url" value="#{escape(settings.endpoint)}" autocomplete="off"><label for="model">Model</label><input id="model" name="model" type="text" value="#{escape(settings.model)}" autocomplete="off"><p class="note">The key is read from the server's configured key file. This page never accepts or displays the key or its file path.</p><button class="button" type="submit">Save prioritization</button></form></section>)
+        ~s(<section><p>Jev key: <strong>#{escape(settings.key_status)}</strong></p><form action="/prioritization" method="post"><label for="algorithm_id">Ordering</label><select id="algorithm_id" name="algorithm_id">#{algorithm_options}</select><label for="endpoint">Jev endpoint</label><input id="endpoint" name="endpoint" type="url" inputmode="url" value="#{escape(settings.endpoint)}" autocomplete="off"><label for="model">Model</label><input id="model" name="model" type="text" value="#{escape(settings.model)}" autocomplete="off"><button class="button" type="submit">Save prioritization</button></form></section>)
 
     layout(person_name, "Prioritization", body, chrome)
   end
