@@ -3783,15 +3783,14 @@ defmodule AttentionServer.Relay do
       end
 
     case Map.pop(state.priority_queued, person) do
-      {nil, queued} ->
-        queued
+      {nil, _remaining_queued} ->
+        state
 
-      {^generation, queued} when not is_map_key(state.priority_timers, person) ->
-        queued = %{queued | priority_queued: Map.delete(queued.priority_queued, person)}
-        start_priority_pass(queued, person, generation)
+      {^generation, remaining_queued} when not is_map_key(state.priority_timers, person) ->
+        start_priority_pass(%{state | priority_queued: remaining_queued}, person, generation)
 
-      {_stale, queued} ->
-        %{queued | priority_queued: Map.delete(queued.priority_queued, person)}
+      {_stale, remaining_queued} ->
+        %{state | priority_queued: remaining_queued}
     end
   end
 

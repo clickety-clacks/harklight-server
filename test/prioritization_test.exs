@@ -69,6 +69,84 @@ defmodule AttentionServer.PrioritizationTest do
     relay
   end
 
+  defp use_synthetic_jev_key(dir) do
+    previous_key_path = System.get_env("ATTENTION_SERVER_JEV_KEY_PATH")
+    key_path = Path.join(dir, "synthetic-jev-key")
+    key = Base.url_encode64(:crypto.strong_rand_bytes(32), padding: false)
+    File.write!(key_path, key <> "\n")
+    System.put_env("ATTENTION_SERVER_JEV_KEY_PATH", key_path)
+
+    on_exit(fn ->
+      if is_binary(previous_key_path),
+        do: System.put_env("ATTENTION_SERVER_JEV_KEY_PATH", previous_key_path),
+        else: System.delete_env("ATTENTION_SERVER_JEV_KEY_PATH")
+    end)
+  end
+
+  defp configure_jev_choice(relay) do
+    state = :sys.get_state(relay)
+
+    assert {:ok, engine} =
+             Engine.set_jev_connection(
+               state.store.engine,
+               "https://127.0.0.1:1/v1/systemone",
+               @model
+             )
+
+    assert {:ok, engine} = Engine.set_algorithm_choice(engine, "person-a", "jev-set")
+
+    assert {:ok, saved} =
+             Store.commit(state.store, engine, %{
+               person: "person-a",
+               actor: "owner",
+               action: "choice"
+             })
+
+    :sys.replace_state(relay, &%{&1 | store: saved})
+  end
+
+  defp start_synthetic_priority_pass(relay) do
+    test_process = self()
+    relay_pid = relay
+
+    state =
+      :sys.replace_state(relay, fn state ->
+        person = "person-a"
+        sequence = Map.get(state.priority_sequences, person, 0) + 1
+        generation = Map.get(state.priority_generations, person, 0) + 1
+
+        {pid, monitor} =
+          spawn_monitor(fn ->
+            receive do
+              {:complete, result} ->
+                send(relay_pid, {:prioritization_result, person, sequence, generation, result})
+                barrier_result = Relay.events(relay_pid, "device-a", 0)
+                send(test_process, {:priority_result_handled, self(), barrier_result})
+            end
+          end)
+
+        job = %{pid: pid, monitor: monitor, sequence: sequence, generation: generation}
+
+        %{
+          state
+          | priority_generations: Map.put(state.priority_generations, person, generation),
+            priority_sequences: Map.put(state.priority_sequences, person, sequence),
+            priority_jobs: Map.put(state.priority_jobs, person, job),
+            priority_queued: Map.delete(state.priority_queued, person)
+        }
+      end)
+
+    job = state.priority_jobs["person-a"]
+    on_exit(fn -> if Process.alive?(job.pid), do: Process.exit(job.pid, :kill) end)
+    job
+  end
+
+  defp complete_synthetic_priority_pass(job, result) do
+    expected_pid = job.pid
+    send(job.pid, {:complete, result})
+    assert_receive {:priority_result_handled, ^expected_pid, {:ok, _events, _sequence}}
+  end
+
   defp setup_person(relay) do
     assert :ok = Relay.setup_person(relay, "person-a")
     assert :ok = Relay.setup_device(relay, "person-a", "device-a")
@@ -605,6 +683,109 @@ defmodule AttentionServer.PrioritizationTest do
 
     assert Enum.map(entries, & &1["message_id"]) == ["while-unavailable"]
     GenServer.stop(relay)
+  end
+
+  test "a completed Jev pass applies the whole-set order and leaves the relay available",
+       %{path: path, dir: dir} do
+    use_synthetic_jev_key(dir)
+    relay = start_relay(path)
+    setup_person(relay)
+    forward(relay, 1, "older")
+    forward(relay, 2, "newer")
+    assert {:ok, session} = Relay.open_websocket_session(relay, "device-a", nil, nil)
+
+    configure_jev_choice(relay)
+
+    assert %{
+             "type" => "ok",
+             "algorithm" => "jev-set",
+             "basis" => "fallback",
+             "entries" => baseline_entries
+           } = hd(session_request(relay, session, %{"type" => "view_get", "ref" => "before"}))
+
+    assert Enum.map(baseline_entries, & &1["message_id"]) == ["newer", "older"]
+
+    engine = :sys.get_state(relay).store.engine
+    ranked_identities = [{"app:test", "older"}, {"app:test", "newer"}]
+    assert Placement.choice(engine, "person-a") == "jev-set"
+    assert Placement.valid_permutation?(Placement.items(engine, "person-a"), ranked_identities)
+
+    job = start_synthetic_priority_pass(relay)
+
+    complete_synthetic_priority_pass(job, {:ok, ranked_identities})
+
+    assert %{
+             "type" => "ok",
+             "algorithm" => "jev-set",
+             "basis" => "selected",
+             "entries" => selected_entries
+           } = hd(session_request(relay, session, %{"type" => "view_get", "ref" => "after"}))
+
+    assert Enum.map(selected_entries, & &1["message_id"]) == ["older", "newer"]
+    assert Process.alive?(relay)
+    state = :sys.get_state(relay)
+    assert state.priority_jobs == %{}
+    assert state.priority_queued == %{}
+    GenServer.stop(relay)
+  end
+
+  test "unavailable and malformed Jev pass results keep baseline fallback and intake working",
+       %{dir: dir} do
+    use_synthetic_jev_key(dir)
+
+    for {suffix, result} <- [
+          {"unavailable", {:error, :unavailable}},
+          {"malformed", {:ok, [{"app:test", "not-in-the-waiting-set"}]}}
+        ] do
+      relay = start_relay(Path.join(dir, "#{suffix}.sqlite3"))
+      setup_person(relay)
+      forward(relay, 1, "older")
+      forward(relay, 2, "newer")
+      assert {:ok, session} = Relay.open_websocket_session(relay, "device-a", nil, nil)
+
+      configure_jev_choice(relay)
+      job = start_synthetic_priority_pass(relay)
+      complete_synthetic_priority_pass(job, result)
+
+      assert %{
+               "type" => "ok",
+               "algorithm" => "jev-set",
+               "basis" => "fallback",
+               "entries" => fallback_entries
+             } = hd(session_request(relay, session, %{"type" => "view_get", "ref" => "fallback"}))
+
+      assert Enum.map(fallback_entries, & &1["message_id"]) == ["newer", "older"]
+      assert Process.alive?(relay)
+      state = :sys.get_state(relay)
+      assert state.priority_jobs == %{}
+      assert state.priority_queued == %{}
+
+      forward(relay, 3, "arrived-after-pass")
+
+      assert %{
+               "type" => "ok",
+               "algorithm" => "jev-set",
+               "basis" => "fallback",
+               "entries" => updated_entries
+             } =
+               hd(
+                 session_request(relay, session, %{
+                   "type" => "view_get",
+                   "ref" => "after-intake"
+                 })
+               )
+
+      assert Enum.map(updated_entries, & &1["message_id"]) == [
+               "arrived-after-pass",
+               "newer",
+               "older"
+             ]
+
+      assert {:ok, events, 3} = Relay.events(relay, "device-a", 0)
+      assert length(events) == 3
+      assert Process.alive?(relay)
+      GenServer.stop(relay)
+    end
   end
 
   test "a process restart gives the same view a new revision", %{path: path} do
