@@ -155,7 +155,7 @@ defmodule AttentionServer.DashboardReadHTTP do
   defp chrome(%{hosted: true, hosted_addresses: addresses}),
     do: [account_url: addresses.account, sign_out: true]
 
-  defp chrome(_opts), do: []
+  defp chrome(_opts), do: [prioritization: true]
 
   defp route(%{method: "GET", request_path: "/devices"} = conn, opts, principal) do
     case backend_call(opts.backend, :list_devices, principal) do
@@ -179,6 +179,77 @@ defmodule AttentionServer.DashboardReadHTTP do
 
       _ ->
         send_resp(conn, 403, "Devices unavailable")
+    end
+  end
+
+  defp route(
+         %{method: "GET", request_path: "/prioritization"} = conn,
+         %{hosted: false} = opts,
+         principal
+       ) do
+    case backend_call(opts.backend, :prioritization, principal) do
+      {:ok, settings} -> send_prioritization_page(conn, principal, settings, nil, 200, opts)
+      _ -> send_resp(conn, 403, "Prioritization settings unavailable")
+    end
+  end
+
+  defp route(
+         %{method: "POST", request_path: "/prioritization"} = conn,
+         %{hosted: false} = opts,
+         principal
+       ) do
+    case form(conn, opts, ~w(algorithm_id endpoint model), 8_192) do
+      {:ok, %{"algorithm_id" => algorithm, "endpoint" => endpoint, "model" => model}, conn} ->
+        case backend_call(
+               opts.backend,
+               :save_prioritization,
+               {principal, algorithm, endpoint, model}
+             ) do
+          {:ok, _settings} ->
+            conn |> put_resp_header("location", "/prioritization") |> send_resp(303, "")
+
+          {:error, :jev_unconfigured, settings} ->
+            send_prioritization_page(
+              conn,
+              principal,
+              settings,
+              "Jev needs a complete endpoint, model and readable key file before it can be selected.",
+              409,
+              opts
+            )
+
+          {:error, reason, settings} ->
+            send_prioritization_page(
+              conn,
+              principal,
+              settings,
+              prioritization_error(reason),
+              400,
+              opts
+            )
+
+          {:error, reason} ->
+            case backend_call(opts.backend, :prioritization, principal) do
+              {:ok, settings} ->
+                send_prioritization_page(
+                  conn,
+                  principal,
+                  settings,
+                  prioritization_error(reason),
+                  if(reason == :storage_unavailable, do: 503, else: 400),
+                  opts
+                )
+
+              _ ->
+                send_resp(conn, 503, "Prioritization settings unavailable")
+            end
+
+          _ ->
+            send_resp(conn, 503, "Prioritization settings unavailable")
+        end
+
+      {_, _, conn} ->
+        send_resp(conn, 403, "Prioritization settings refused")
     end
   end
 
@@ -353,6 +424,20 @@ defmodule AttentionServer.DashboardReadHTTP do
 
   defp route(conn, _opts, _principal), do: send_resp(conn, 404, "Not found")
 
+  defp send_prioritization_page(conn, principal, settings, message, status, opts) do
+    conn
+    |> put_resp_content_type("text/html", "utf-8")
+    |> send_resp(
+      status,
+      DashboardView.prioritization(display_name(principal), settings, message, chrome(opts))
+    )
+  end
+
+  defp prioritization_error(:invalid_endpoint), do: "Enter a valid HTTPS Jev endpoint."
+  defp prioritization_error(:invalid_model), do: "Enter a model name."
+  defp prioritization_error(:storage_unavailable), do: "The server could not save these settings."
+  defp prioritization_error(_), do: "The server could not update prioritization settings."
+
   defp serve_skill_file(conn, skill_path) do
     case Diagnostics.result(
            :dashboard_http,
@@ -515,11 +600,11 @@ defmodule AttentionServer.DashboardReadHTTP do
     Enum.map_join([p1, p2, p3, p4, p5], "-", &Base.encode16(&1, case: :lower))
   end
 
-  defp form(conn, opts, keys) do
+  defp form(conn, opts, keys, limit \\ 512) do
     with true <- trusted_form_origin?(conn, expected_origin(conn, opts)),
          [content_type] <- get_req_header(conn, "content-type"),
          true <- form_content_type?(content_type) do
-      case read_body(conn, length: 512, read_length: 512) do
+      case read_body(conn, length: limit, read_length: limit) do
         {:ok, body, conn} ->
           try do
             fields = URI.decode_query(body)

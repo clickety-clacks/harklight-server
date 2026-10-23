@@ -79,6 +79,28 @@ defmodule AttentionServer.DashboardView do
     layout(person_name, "Components", body, chrome)
   end
 
+  def prioritization(person_name, settings, message \\ nil, chrome \\ []) do
+    selected = settings.algorithm_id
+
+    algorithm_options =
+      Enum.map_join([{"baseline", "Baseline"}, {"jev-set", "Jev re-ranking"}], fn {id, label} ->
+        selected_attr = if selected == id, do: " selected", else: ""
+        ~s(<option value="#{id}"#{selected_attr}>#{label}</option>)
+      end)
+
+    notice =
+      if is_binary(message),
+        do: ~s(<p class="notice" role="status">#{escape(message)}</p>),
+        else: ""
+
+    body =
+      ~s(<header class="page-head"><div><h1>Prioritization</h1><p>Choose how waiting items are ordered on this server.</p></div></header>) <>
+        notice <>
+        ~s(<section><p>Jev key file: <strong>#{escape(settings.key_status)}</strong></p><form action="/prioritization" method="post"><label for="algorithm_id">Algorithm</label><select id="algorithm_id" name="algorithm_id">#{algorithm_options}</select><label for="endpoint">Jev endpoint</label><input id="endpoint" name="endpoint" type="url" inputmode="url" value="#{escape(settings.endpoint)}" autocomplete="off"><label for="model">Model</label><input id="model" name="model" type="text" value="#{escape(settings.model)}" autocomplete="off"><p class="note">The key is read from the server's configured key file. This page never accepts or displays the key or its file path.</p><button class="button" type="submit">Save prioritization</button></form></section>)
+
+    layout(person_name, "Prioritization", body, chrome)
+  end
+
   defp skill_section(name, skill_version, path) do
     version_line =
       case skill_version do
@@ -191,11 +213,19 @@ defmodule AttentionServer.DashboardView do
           ~s(<form action="/sign-out" method="post"><input type="hidden" name="confirm" value="sign_out"><button class="button" type="submit">Sign out</button></form>),
         else: ""
 
-    ~s(<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>#{escape(title)} · Harklight</title><style>#{css()}</style></head><body><div class="shell"><aside><strong>Harklight</strong><nav><a href="/devices">Devices</a><a href="/components">Components</a>#{account_link}</nav><div class="account">#{escape(person_name)}#{sign_out}</div></aside><main>#{content}</main></div></body></html>)
+    prioritization_link =
+      if Keyword.get(chrome, :prioritization) == true,
+        do: ~s(<a href="/prioritization">Prioritization</a>),
+        else: ""
+
+    ~s(<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>#{escape(title)} · Harklight</title><style>#{css()}</style></head><body><div class="shell"><aside><strong>Harklight</strong><nav><a href="/devices">Devices</a><a href="/components">Components</a>#{prioritization_link}#{account_link}</nav><div class="account">#{escape(person_name)}#{sign_out}</div></aside><main>#{content}</main></div></body></html>)
   end
 
   defp css do
     base_css() <>
+      ".notice{padding:12px;background:#fff3d8;border-radius:8px}" <>
+      "label{display:block;margin-top:18px;font-weight:600}" <>
+      "input,select{box-sizing:border-box;width:100%;max-width:620px;padding:10px;margin-top:6px;font:inherit;border:1px solid #b9c2cd;border-radius:6px}" <>
       "main{box-sizing:border-box;max-width:100%;min-width:0}" <>
       ".status.version{text-transform:none;letter-spacing:normal}" <>
       ".install-command{display:grid;grid-template-columns:minmax(0,1fr);gap:8px}" <>

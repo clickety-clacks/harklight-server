@@ -12,6 +12,7 @@ defmodule AttentionServer.Relay do
   use GenServer
   @agent_upload_idle_ms 60 * 60 * 1_000
   @upload_sweep_ms 60_000
+  @prioritization_debounce_ms 250
   @hosted_test_states ~w(no-devices device-waiting device-enrolled)
   @hosted_test_label "Test account"
   @hosted_test_device "Test device"
@@ -27,6 +28,8 @@ defmodule AttentionServer.Relay do
     InboxPaging,
     JSON,
     Message,
+    JevClient,
+    Placement,
     Store
   }
 
@@ -55,6 +58,29 @@ defmodule AttentionServer.Relay do
   @doc "Read device metadata under current owner authority; only a configured self-host owner can see all persons."
   def dashboard_inventory(server, person, owner_key, configured_owner_person),
     do: GenServer.call(server, {:dashboard_inventory, person, owner_key, configured_owner_person})
+
+  def dashboard_prioritization(server, person, owner_key, configured_owner_person),
+    do:
+      GenServer.call(
+        server,
+        {:dashboard_prioritization, person, owner_key, configured_owner_person}
+      )
+
+  def save_dashboard_prioritization(
+        server,
+        person,
+        owner_key,
+        configured_owner_person,
+        algorithm,
+        endpoint,
+        model
+      ),
+      do:
+        GenServer.call(
+          server,
+          {:save_dashboard_prioritization, person, owner_key, configured_owner_person, algorithm,
+           endpoint, model}
+        )
 
   def owner_identity(server, verified_owner_key),
     do: GenServer.call(server, {:owner_identity, verified_owner_key})
@@ -261,6 +287,9 @@ defmodule AttentionServer.Relay do
   """
   def hosted_sign_in_create(server, person, label),
     do: GenServer.call(server, {:hosted_sign_in_create, person, label})
+
+  def hosted_set_algorithm(server, person, algorithm),
+    do: GenServer.call(server, {:hosted_set_algorithm, person, algorithm})
 
   @doc """
   Put the designated test account's person into a named product state:
@@ -481,6 +510,15 @@ defmodule AttentionServer.Relay do
               origin_listener: nil,
               inbox_builds: %{},
               inbox_build_monitors: %{},
+              priority_views: %{},
+              priority_generations: %{},
+              priority_timers: %{},
+              priority_jobs: %{},
+              priority_queued: %{},
+              priority_sequences: %{},
+              priority_revision_namespace:
+                Base.url_encode64(:crypto.strong_rand_bytes(16), padding: false),
+              priority_revision_counter: 0,
               agent_fixture_mode: Keyword.get(opts, :agent_fixture_mode, false) == true,
               source_fixture_mode: Keyword.get(opts, :source_fixture_mode, false) == true,
               enrollment_fixture_mode: Keyword.get(opts, :enrollment_fixture_mode, false) == true,
@@ -489,8 +527,11 @@ defmodule AttentionServer.Relay do
               join_configuration: Keyword.get(opts, :join_configuration),
               dashboard_origin: Keyword.get(opts, :dashboard_origin),
               hosted_test_account: Keyword.get(opts, :hosted_test_account),
+              deployment_mode: Keyword.get(opts, :deployment_mode, :self_hosted),
               upload_cap: Keyword.get(opts, :upload_cap, :none)
             }
+
+            state = initialize_priority_views(state)
 
             case sweep_agent_uploads(state, System.system_time(:millisecond)) do
               {:ok, next, _count} ->
@@ -781,6 +822,41 @@ defmodule AttentionServer.Relay do
       end
 
     {:reply, result, state}
+  end
+
+  def handle_call(
+        {:dashboard_prioritization, person, key, configured_owner_person},
+        _from,
+        state
+      ) do
+    if state.deployment_mode == :self_hosted and person == configured_owner_person and
+         match?({:ok, ^person, _revision}, Engine.owner_identity(state.store.engine, key)) do
+      state = ensure_priority_view(state, person)
+      {:reply, {:ok, priority_settings(state.store.engine, person)}, state}
+    else
+      {:reply, {:error, :forbidden}, state}
+    end
+  end
+
+  def handle_call(
+        {:save_dashboard_prioritization, person, key, configured_owner_person, algorithm,
+         endpoint, model},
+        _from,
+        state
+      ) do
+    case save_priority_settings(
+           state,
+           person,
+           key,
+           configured_owner_person,
+           algorithm,
+           endpoint,
+           model
+         ) do
+      {:ok, next, result} -> {:reply, {:ok, result}, next}
+      {:error, reason, next, result} -> {:reply, {:error, reason, result}, next}
+      {:error, reason} -> {:reply, {:error, reason}, state}
+    end
   end
 
   def handle_call({:owner_identity, key}, _from, state),
@@ -1420,6 +1496,13 @@ defmodule AttentionServer.Relay do
     end
   end
 
+  def handle_call({:hosted_set_algorithm, person, algorithm}, _from, state) do
+    case set_hosted_algorithm(state, person, algorithm) do
+      {:ok, next} -> {:reply, {:ok, %{person_id: person, algorithm_id: algorithm}}, next}
+      {:error, reason, next} -> {:reply, {:error, reason}, next}
+    end
+  end
+
   def handle_call({:hosted_test_reset, target_state}, _from, state) do
     engine = state.store.engine
 
@@ -1437,7 +1520,14 @@ defmodule AttentionServer.Relay do
              actor: "hosted_component",
              action: "hosted_test_reset"
            }) do
-      fenced = Enum.reduce(removed_keys, %{state | store: store}, &fence_sessions(&2, &1))
+      next = %{state | store: store}
+
+      next =
+        if pending_signature(engine, person) != pending_signature(staged, person),
+          do: pending_set_changed(next, person),
+          else: next
+
+      fenced = Enum.reduce(removed_keys, next, &fence_sessions(&2, &1))
       result = %{state: target_state, person_id: person}
       result = if target_state == "device-waiting", do: Map.put(result, :code, code), else: result
       {:reply, {:ok, result}, fenced}
@@ -2209,7 +2299,11 @@ defmodule AttentionServer.Relay do
           transport: transport,
           sync_mode: nil,
           snapshot_id: nil,
-          replay_attach: nil
+          replay_attach: nil,
+          view_support: false,
+          view_notice: nil,
+          view_notice_due_at: nil,
+          view_last_notice_at: nil
         }
 
         {:reply, {:ok, id}, %{state | sessions: Map.put(state.sessions, id, session)}}
@@ -2279,8 +2373,10 @@ defmodule AttentionServer.Relay do
           conversation_contiguous: conversation_contiguous
       }
 
+      {view_notice, updated} = take_view_notice(updated, System.monotonic_time(:millisecond))
       next = put_session(state, id, updated)
-      {:reply, {:ok, Enum.map(events ++ conversation_events, &line/1)}, next}
+      frames = Enum.map(events ++ conversation_events, &line/1) ++ view_notice
+      {:reply, {:ok, frames}, next}
     else
       false ->
         {:reply, {:error, :resync_required}, state}
@@ -2307,10 +2403,44 @@ defmodule AttentionServer.Relay do
     end
   end
 
+  def handle_info({:prioritization_due, person, generation}, state) do
+    case Map.get(state.priority_timers, person) do
+      %{generation: ^generation} ->
+        next = %{state | priority_timers: Map.delete(state.priority_timers, person)}
+
+        if Map.has_key?(next.priority_jobs, person) do
+          {:noreply, %{next | priority_queued: Map.put(next.priority_queued, person, generation)}}
+        else
+          {:noreply, start_priority_pass(next, person, generation)}
+        end
+
+      _ ->
+        {:noreply, state}
+    end
+  end
+
+  def handle_info({:prioritization_result, person, sequence, generation, result}, state) do
+    case Map.get(state.priority_jobs, person) do
+      %{sequence: ^sequence, generation: ^generation, monitor: monitor} = job ->
+        Process.demonitor(monitor, [:flush])
+        {:noreply, finish_priority_pass(state, person, job, result)}
+
+      _ ->
+        {:noreply, state}
+    end
+  end
+
   def handle_info({:DOWN, monitor, :process, listener, reason}, state) do
     case Map.pop(state.inbox_build_monitors, monitor) do
       {nil, _monitors} ->
+        priority_job =
+          Enum.find(state.priority_jobs, fn {_person, job} -> job.monitor == monitor end)
+
         cond do
+          priority_job ->
+            {person, job} = priority_job
+            {:noreply, finish_priority_pass(state, person, job, {:error, :unavailable})}
+
           active =
               Enum.find(state.active_uploads, fn {_lease, upload} ->
                 upload.monitor == monitor
@@ -2544,6 +2674,52 @@ defmodule AttentionServer.Relay do
     end
   end
 
+  defp view_get(state, id, session, frame) do
+    cond do
+      frame["v"] != 1 or not is_integer(frame["v"]) ->
+        {{:ok, [error_line(frame, "unsupported_version")]}, state}
+
+      not is_binary(frame["ref"]) ->
+        {{:ok, [error_line(frame, "invalid_field", "ref")]}, state}
+
+      Enum.any?(Map.keys(frame), &(&1 not in ~w(v type ref known_view_rev))) ->
+        {{:ok, [error_line(frame, "invalid_field")]}, state}
+
+      Map.has_key?(frame, "known_view_rev") and not is_binary(frame["known_view_rev"]) ->
+        {{:ok, [error_line(frame, "invalid_field", "known_view_rev")]}, state}
+
+      true ->
+        person = person_of(state.store.engine, session.key)
+        state = ensure_priority_view(state, person)
+        view = Map.fetch!(state.priority_views, person)
+        updated = %{session | view_support: true}
+        state = put_session(state, id, updated)
+
+        reply =
+          if frame["known_view_rev"] == view.view_rev do
+            %{
+              "v" => 1,
+              "type" => "ok",
+              "ref" => frame["ref"],
+              "view_rev" => view.view_rev,
+              "unchanged" => true
+            }
+          else
+            %{
+              "v" => 1,
+              "type" => "ok",
+              "ref" => frame["ref"],
+              "view_rev" => view.view_rev,
+              "algorithm" => view.algorithm,
+              "basis" => view.basis,
+              "entries" => view.entries
+            }
+          end
+
+        {{:ok, [line(reply)]}, state}
+    end
+  end
+
   defp session_request(state, id, session, raw) do
     case JSON.decode_line(raw) do
       {:ok, %{"type" => type} = frame}
@@ -2558,7 +2734,7 @@ defmodule AttentionServer.Relay do
         inbox_session_request(state, id, session, frame)
 
       {:ok, %{"type" => type} = frame}
-      when type in ["resync", "ack", "conversation_open", "conversation_ack"] ->
+      when type in ["resync", "ack", "conversation_open", "conversation_ack", "view_get"] ->
         special_request(state, id, session, frame)
 
       _ ->
@@ -2601,6 +2777,9 @@ defmodule AttentionServer.Relay do
 
           "conversation_ack" ->
             conversation_ack(state, session, frame)
+
+          "view_get" ->
+            view_get(state, id, session, frame)
         end
 
       {reason, field} ->
@@ -2637,7 +2816,17 @@ defmodule AttentionServer.Relay do
         {:reply, {:ok, [error_line(frame, "sync_mode_conflict")]}, state}
 
       true ->
-        case InboxPaging.start_plan(state.store, state.store.engine, session.key, frame) do
+        person = person_of(state.store.engine, session.key)
+        state = ensure_priority_view(state, person)
+        view_order = Enum.map(state.priority_views[person].entries, &Placement.identity/1)
+
+        case InboxPaging.start_plan(
+               state.store,
+               state.store.engine,
+               session.key,
+               frame,
+               view_order
+             ) do
           {:ready, _snapshot} ->
             {reply, next} = inbox_start(state, id, session, frame)
             {:reply, reply, next}
@@ -3285,13 +3474,462 @@ defmodule AttentionServer.Relay do
            ) do
         {:ok, store} ->
           next_state = %{state | store: store}
-          {reply, record_origin_feed_change(next_state, state.store.engine, next_engine, target)}
+
+          next_state =
+            record_origin_feed_change(next_state, state.store.engine, next_engine, target)
+
+          next_state =
+            case Engine.authorized_person(state.store.engine, key) do
+              {:ok, person} ->
+                if pending_signature(state.store.engine, person) !=
+                     pending_signature(next_engine, person),
+                   do: pending_set_changed(next_state, person),
+                   else: next_state
+
+              _ ->
+                next_state
+            end
+
+          {reply, next_state}
 
         {:error, _, _} ->
           {{:ok, error_line(raw, "storage_unavailable")}, state}
       end
     end
   end
+
+  defp initialize_priority_views(state) do
+    Enum.reduce(Map.keys(state.store.engine.persons), state, fn person, current ->
+      current = ensure_priority_view(current, person)
+      engine = current.store.engine
+
+      if Placement.reassess(engine, person, nil) == :whole_set and
+           JevClient.connection_ready?(engine.jev_endpoint, engine.jev_model) and
+           Placement.items(engine, person) != [] do
+        schedule_priority_pass(current, person)
+      else
+        current
+      end
+    end)
+  end
+
+  defp ensure_priority_view(state, person) do
+    engine = state.store.engine
+    choice = Placement.choice(engine, person)
+    items = Placement.items(engine, person)
+    previous = Map.get(state.priority_views, person)
+
+    view =
+      cond do
+        choice == "baseline" ->
+          %{
+            algorithm: "baseline",
+            basis: "selected",
+            entries: Placement.place(choice, items, [], nil)
+          }
+
+        not JevClient.connection_ready?(engine.jev_endpoint, engine.jev_model) ->
+          fallback_view(items)
+
+        match?(%{algorithm: "jev-set", basis: "selected"}, previous) ->
+          %{
+            algorithm: "jev-set",
+            basis: "selected",
+            entries: Placement.place(choice, items, previous.entries, nil)
+          }
+
+        true ->
+          fallback_view(items)
+      end
+
+    put_priority_view(state, person, view)
+  end
+
+  defp fallback_view(items),
+    do: %{
+      algorithm: "jev-set",
+      basis: "fallback",
+      entries: Placement.place("baseline", items, [], nil)
+    }
+
+  defp put_priority_view(state, person, view) do
+    previous = Map.get(state.priority_views, person)
+    comparable = Map.take(view, [:algorithm, :basis, :entries])
+
+    if previous && Map.take(previous, [:algorithm, :basis, :entries]) == comparable do
+      state
+    else
+      counter = state.priority_revision_counter + 1
+      view_rev = state.priority_revision_namespace <> ":" <> Integer.to_string(counter)
+      view = Map.put(comparable, :view_rev, view_rev)
+
+      state
+      |> Map.put(:priority_revision_counter, counter)
+      |> Map.put(:priority_views, Map.put(state.priority_views, person, view))
+      |> notify_priority_view_change(person, view_rev)
+    end
+  end
+
+  defp notify_priority_view_change(state, person, view_rev) do
+    now = System.monotonic_time(:millisecond)
+
+    sessions =
+      Map.new(state.sessions, fn {id, session} ->
+        case Engine.authorized_person(state.store.engine, session.key) do
+          {:ok, ^person} when session.view_support and session.ready ->
+            due_at =
+              case session.view_last_notice_at do
+                nil -> now
+                last when now - last >= 1_000 -> now
+                last -> last + 1_000
+              end
+
+            {id, %{session | view_notice: view_rev, view_notice_due_at: due_at}}
+
+          _ ->
+            {id, session}
+        end
+      end)
+
+    %{state | sessions: sessions}
+  end
+
+  defp take_view_notice(%{view_notice: nil} = session, _now), do: {[], session}
+
+  defp take_view_notice(
+         %{view_notice: view_rev, view_notice_due_at: due_at} = session,
+         now
+       )
+       when is_integer(due_at) and due_at <= now do
+    frame = line(%{"v" => 1, "type" => "view_changed", "view_rev" => view_rev})
+    {[frame], %{session | view_notice: nil, view_notice_due_at: nil, view_last_notice_at: now}}
+  end
+
+  defp take_view_notice(session, _now), do: {[], session}
+
+  defp pending_signature(engine, person) do
+    engine
+    |> Placement.items(person)
+    |> Enum.map(&{&1.identity, &1.revision, &1.message})
+    |> Enum.sort_by(&elem(&1, 0))
+  end
+
+  defp pending_set_changed(state, person) do
+    previous = Map.get(state.priority_views, person)
+    state = ensure_priority_view(state, person)
+    engine = state.store.engine
+
+    previous_entries = if is_map(previous), do: previous.entries, else: []
+
+    if Placement.reassess(engine, person, previous_entries) == :whole_set and
+         JevClient.connection_ready?(engine.jev_endpoint, engine.jev_model) and
+         Placement.items(engine, person) != [] do
+      schedule_priority_pass(state, person)
+    else
+      invalidate_priority_work(state, person)
+    end
+  end
+
+  defp priority_settings_changed(state, person) do
+    previous = Map.get(state.priority_views, person)
+    state = ensure_priority_view(state, person)
+    engine = state.store.engine
+
+    previous_entries = if is_map(previous), do: previous.entries, else: []
+
+    if Placement.reassess(engine, person, previous_entries) == :whole_set and
+         JevClient.connection_ready?(engine.jev_endpoint, engine.jev_model) and
+         Placement.items(engine, person) != [] do
+      schedule_priority_pass(state, person)
+    else
+      invalidate_priority_work(state, person)
+    end
+  end
+
+  defp invalidate_priority_work(state, person) do
+    case Map.get(state.priority_timers, person) do
+      %{ref: ref} -> Process.cancel_timer(ref)
+      _ -> :ok
+    end
+
+    generation = Map.get(state.priority_generations, person, 0) + 1
+
+    %{
+      state
+      | priority_generations: Map.put(state.priority_generations, person, generation),
+        priority_timers: Map.delete(state.priority_timers, person),
+        priority_queued: Map.delete(state.priority_queued, person)
+    }
+  end
+
+  defp schedule_priority_pass(state, person) do
+    state = invalidate_priority_work(state, person)
+    generation = Map.fetch!(state.priority_generations, person)
+    engine = state.store.engine
+
+    if Placement.choice(engine, person) == "jev-set" and
+         JevClient.connection_ready?(engine.jev_endpoint, engine.jev_model) and
+         Placement.items(engine, person) != [] do
+      ref =
+        Process.send_after(
+          self(),
+          {:prioritization_due, person, generation},
+          @prioritization_debounce_ms
+        )
+
+      %{
+        state
+        | priority_timers:
+            Map.put(state.priority_timers, person, %{ref: ref, generation: generation})
+      }
+    else
+      state
+    end
+  end
+
+  defp start_priority_pass(state, person, generation) do
+    engine = state.store.engine
+
+    cond do
+      Map.get(state.priority_generations, person, 0) != generation ->
+        state
+
+      Placement.choice(engine, person) != "jev-set" ->
+        state
+
+      Map.has_key?(state.priority_jobs, person) ->
+        %{state | priority_queued: Map.put(state.priority_queued, person, generation)}
+
+      not JevClient.connection_ready?(engine.jev_endpoint, engine.jev_model) ->
+        set_fallback_priority_view(state, person)
+
+      true ->
+        items = Placement.items(engine, person)
+
+        case Placement.compose("jev-set", items, %{
+               endpoint: engine.jev_endpoint,
+               model: engine.jev_model
+             }) do
+          {:ok, request} ->
+            sequence = Map.get(state.priority_sequences, person, 0) + 1
+            parent = self()
+
+            {pid, monitor} =
+              spawn_monitor(fn ->
+                result = JevClient.evaluate(request)
+                send(parent, {:prioritization_result, person, sequence, generation, result})
+              end)
+
+            %{
+              state
+              | priority_sequences: Map.put(state.priority_sequences, person, sequence),
+                priority_jobs:
+                  Map.put(state.priority_jobs, person, %{
+                    pid: pid,
+                    monitor: monitor,
+                    sequence: sequence,
+                    generation: generation
+                  })
+            }
+
+          {:error, _reason} ->
+            set_fallback_priority_view(state, person)
+        end
+    end
+  end
+
+  defp finish_priority_pass(state, person, job, result) do
+    state = %{state | priority_jobs: Map.delete(state.priority_jobs, person)}
+    engine = state.store.engine
+    generation = Map.get(state.priority_generations, person, 0)
+    current? = generation == job.generation and Placement.choice(engine, person) == "jev-set"
+
+    state =
+      if current? do
+        items = Placement.items(engine, person)
+        previous = Map.get(state.priority_views, person)
+
+        case result do
+          {:ok, identities} when is_list(identities) ->
+            if Placement.valid_permutation?(items, identities) do
+              previous_entries =
+                if is_map(previous), do: Map.get(previous, :entries, []), else: []
+
+              entries = Placement.place("jev-set", items, previous_entries, {:ranked, identities})
+
+              put_priority_view(state, person, %{
+                algorithm: "jev-set",
+                basis: "selected",
+                entries: entries
+              })
+            else
+              set_fallback_priority_view(state, person)
+            end
+
+          _ ->
+            set_fallback_priority_view(state, person)
+        end
+      else
+        state
+      end
+
+    case Map.pop(state.priority_queued, person) do
+      {nil, queued} ->
+        queued
+
+      {^generation, queued} when not is_map_key(state.priority_timers, person) ->
+        queued = %{queued | priority_queued: Map.delete(queued.priority_queued, person)}
+        start_priority_pass(queued, person, generation)
+
+      {_stale, queued} ->
+        %{queued | priority_queued: Map.delete(queued.priority_queued, person)}
+    end
+  end
+
+  defp set_fallback_priority_view(state, person) do
+    items = Placement.items(state.store.engine, person)
+    put_priority_view(state, person, fallback_view(items))
+  end
+
+  defp priority_settings(engine, person) do
+    %{
+      person_id: person,
+      algorithm_id: Placement.choice(engine, person),
+      endpoint: engine.jev_endpoint || "",
+      model: engine.jev_model || "",
+      key_status: JevClient.key_status()
+    }
+  end
+
+  defp save_priority_settings(
+         state,
+         person,
+         key,
+         configured_owner_person,
+         algorithm,
+         endpoint,
+         model
+       ) do
+    cond do
+      algorithm not in ["baseline", "jev-set"] ->
+        {:error, :unknown_algorithm}
+
+      state.deployment_mode != :self_hosted or person != configured_owner_person or
+          not match?({:ok, ^person, _}, Engine.owner_identity(state.store.engine, key)) ->
+        {:error, :forbidden}
+
+      true ->
+        with {:ok, endpoint} <- normalize_endpoint(endpoint),
+             {:ok, model} <- normalize_model(model) do
+          save_priority_settings_authorized(state, person, key, algorithm, endpoint, model)
+        else
+          {:error, reason} -> {:error, reason}
+        end
+    end
+  end
+
+  defp save_priority_settings_authorized(state, person, key, requested, endpoint, model) do
+    engine = state.store.engine
+    connection_ready? = JevClient.connection_ready?(endpoint, model)
+    refused? = requested == "jev-set" and not connection_ready?
+
+    with {:ok, configured} <- Engine.set_jev_connection(engine, endpoint, model),
+         {:ok, changed} <-
+           if(refused?,
+             do: {:ok, configured},
+             else: Engine.set_algorithm_choice(configured, person, requested)
+           ) do
+      next_state =
+        if changed == engine do
+          state
+        else
+          case commit(state.store, changed, %{
+                 person: person,
+                 actor: key,
+                 action: "prioritization_settings"
+               }) do
+            {:ok, store} -> priority_settings_changed(%{state | store: store}, person)
+            {:error, _, _} -> nil
+          end
+        end
+
+      if is_nil(next_state) do
+        {:error, :storage_unavailable}
+      else
+        settings = priority_settings(next_state.store.engine, person)
+
+        if refused?,
+          do: {:error, :jev_unconfigured, next_state, settings},
+          else: {:ok, next_state, settings}
+      end
+    end
+  end
+
+  defp set_hosted_algorithm(state, person, algorithm) do
+    engine = state.store.engine
+
+    cond do
+      algorithm not in ["baseline", "jev-set"] ->
+        {:error, :unknown_algorithm, state}
+
+      state.deployment_mode != :saas or is_nil(Engine.hosted_account(engine, person)) ->
+        {:error, :not_hosted, state}
+
+      Placement.choice(engine, person) == algorithm ->
+        {:ok, state}
+
+      algorithm == "jev-set" and
+          (state.deployment_mode == :saas or
+             not JevClient.connection_ready?(engine.jev_endpoint, engine.jev_model)) ->
+        {:error, :jev_unconfigured, state}
+
+      true ->
+        case Engine.set_algorithm_choice(engine, person, algorithm) do
+          {:ok, ^engine} ->
+            {:ok, state}
+
+          {:ok, changed} ->
+            case commit(state.store, changed, %{
+                   person: person,
+                   actor: "hosted_component",
+                   action: "hosted_algorithm"
+                 }) do
+              {:ok, store} -> {:ok, priority_settings_changed(%{state | store: store}, person)}
+              {:error, _, _} -> {:error, :storage_unavailable, state}
+            end
+
+          {:error, :not_found} ->
+            {:error, :not_hosted, state}
+
+          {:error, reason} ->
+            {:error, reason, state}
+        end
+    end
+  end
+
+  defp normalize_endpoint(value) when is_binary(value) do
+    value = String.trim(value)
+
+    cond do
+      value == "" -> {:ok, nil}
+      JevClient.valid_endpoint?(value) -> {:ok, value}
+      true -> {:error, :invalid_endpoint}
+    end
+  end
+
+  defp normalize_endpoint(_), do: {:error, :invalid_endpoint}
+
+  defp normalize_model(value) when is_binary(value) do
+    value = String.trim(value)
+
+    cond do
+      value == "" -> {:ok, nil}
+      JevClient.valid_model?(value) -> {:ok, value}
+      true -> {:error, :invalid_model}
+    end
+  end
+
+  defp normalize_model(_), do: {:error, :invalid_model}
 
   defp with_initial_origin_availability(state, key, next_engine) do
     case Engine.authorized_person(next_engine, key) do

@@ -34,6 +34,31 @@ defmodule AttentionServer.DashboardBackend do
 
   def list_devices(_, _), do: {:error, :forbidden}
 
+  def prioritization(
+        %__MODULE__{relay: relay, configured_owner_person: configured_owner_person},
+        %{person_id: person, owner_key: key}
+      ),
+      do: Relay.dashboard_prioritization(relay, person, key, configured_owner_person)
+
+  def prioritization(_, _), do: {:error, :forbidden}
+
+  def save_prioritization(
+        %__MODULE__{relay: relay, configured_owner_person: configured_owner_person},
+        {%{person_id: person, owner_key: key}, algorithm, endpoint, model}
+      ),
+      do:
+        Relay.save_dashboard_prioritization(
+          relay,
+          person,
+          key,
+          configured_owner_person,
+          algorithm,
+          endpoint,
+          model
+        )
+
+  def save_prioritization(_, _), do: {:error, :forbidden}
+
   # Browser actions use only the signed-in person's current owner authority.
   # Account-wide metadata visibility does not grant cross-person mutations.
   def create_invitation(

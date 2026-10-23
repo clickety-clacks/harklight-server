@@ -11,7 +11,7 @@ defmodule AttentionServer.Store do
   alias AttentionServer.{APNS, BrowserSignIn, Diagnostics, Engine, GuidedJoin}
   alias Exqlite.Sqlite3
 
-  @format_version 22
+  @format_version 23
   @inbox_index_chunk_size 20
   defstruct [:db, :engine, :version, :upload_dir]
 
@@ -1078,7 +1078,8 @@ defmodule AttentionServer.Store do
                      19,
                      20,
                      21,
-                     22
+                     22,
+                     23
                    ] ->
                 original = struct(Engine, Map.from_struct(stored))
 
@@ -1143,6 +1144,13 @@ defmodule AttentionServer.Store do
                   |> then(fn state ->
                     if format < 22, do: Map.put(state, :hosted_accounts, %{}), else: state
                   end)
+                  |> then(fn state ->
+                    if format < 23 do
+                      %{state | algorithm_choices: %{}, jev_endpoint: nil, jev_model: nil}
+                    else
+                      state
+                    end
+                  end)
 
                 cond do
                   not valid_state?(engine) ->
@@ -1175,6 +1183,7 @@ defmodule AttentionServer.Store do
                                  format < 16 -> "resumable_pending_init"
                                  format < 17 -> "push_presentation_init"
                                  format < 18 -> "conversation_feed_init"
+                                 format < 23 -> "prioritization_init"
                                  true -> "state_format"
                                end
                            }
@@ -1875,6 +1884,7 @@ defmodule AttentionServer.Store do
         BrowserSignIn.valid_state?(engine) and
         valid_maintainers?(engine) and
         valid_hosted_accounts?(engine) and
+        valid_prioritization?(engine) and
         valid_push_bindings?(engine) and
         AttentionServer.Conversation.valid_state?(engine) and
         valid_uploads?(engine) and
@@ -1968,6 +1978,16 @@ defmodule AttentionServer.Store do
   end
 
   defp valid_state?(_), do: false
+
+  defp valid_prioritization?(engine) do
+    is_map(engine.algorithm_choices) and
+      Enum.all?(engine.algorithm_choices, fn {person, choice} ->
+        Map.has_key?(engine.persons, person) and choice in ["baseline", "jev-set"]
+      end) and
+      (is_nil(engine.jev_endpoint) or
+         AttentionServer.JevClient.valid_endpoint?(engine.jev_endpoint)) and
+      (is_nil(engine.jev_model) or AttentionServer.JevClient.valid_model?(engine.jev_model))
+  end
 
   defp valid_uploads?(engine) do
     is_map(engine.uploads) and

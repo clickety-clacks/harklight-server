@@ -28,12 +28,12 @@ The package does not install a service, configure the tailnet or expose ports.
 State, owner/device identities, trust roots and sender grants live outside the
 versioned package. Run one server per database. Keep private keys and backups
 private; do not repeat bootstrap over an existing installation.
-This source uses FORMAT22. Startup migrates supported older state, including
-FORMAT17, and persists the new format. The v0.1.10 package accepts formats 1–6
-and 8–21, so it will not start against a FORMAT22 store. Treat this as a one-way
-upgrade. Keep a stopped, complete private backup before upgrading if you may
-need to recover to an older version; restoring a stale backup may discard newer
-accepted writes.
+This source uses FORMAT23 and migrates supported older state on startup. The
+v0.1.11 package uses FORMAT22, while v0.1.10 accepts formats 1–6 and 8–21; those
+packages cannot start against FORMAT23 state. Treat this as a one-way upgrade.
+Before its first start against an existing state directory, stop the old server
+and take a full private backup. Rolling back requires restoring a copy made
+before that first start and loses changes accepted since the copy.
 
 The archive does not contain the `harklight-agent` conversation CLI; install
 it separately as described under [Get the agent CLI](#get-the-agent-cli).

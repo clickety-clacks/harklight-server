@@ -62,6 +62,9 @@ defmodule AttentionServer.Engine do
             subscriptions: %{},
             cursors: %{},
             hosted_accounts: %{},
+            algorithm_choices: %{},
+            jev_endpoint: nil,
+            jev_model: nil,
             push_bindings: %{}
 
   def new do
@@ -665,6 +668,27 @@ defmodule AttentionServer.Engine do
     end
   end
 
+  @doc false
+  def set_algorithm_choice(%__MODULE__{} = engine, person, algorithm)
+      when algorithm in ["baseline", "jev-set"] do
+    if Map.has_key?(engine.persons, person) do
+      if Map.get(engine.algorithm_choices, person, "baseline") == algorithm do
+        {:ok, engine}
+      else
+        {:ok, %{engine | algorithm_choices: Map.put(engine.algorithm_choices, person, algorithm)}}
+      end
+    else
+      {:error, :not_found}
+    end
+  end
+
+  def set_algorithm_choice(%__MODULE__{}, _person, _algorithm), do: {:error, :unknown_algorithm}
+
+  @doc false
+  def set_jev_connection(%__MODULE__{} = engine, endpoint, model) do
+    {:ok, %{engine | jev_endpoint: endpoint, jev_model: model}}
+  end
+
   @doc """
   Return the designated test person to having no devices, pending requests or
   open invitations. Only a person whose account record is durably marked as the
@@ -721,8 +745,7 @@ defmodule AttentionServer.Engine do
                 subscriptions: drop.(engine.subscriptions),
                 cursors: drop.(engine.cursors),
                 conversation_cursors: drop.(engine.conversation_cursors),
-                conversation_opened:
-                  MapSet.filter(engine.conversation_opened, retained?),
+                conversation_opened: MapSet.filter(engine.conversation_opened, retained?),
                 receipts: drop.(engine.receipts),
                 source_report_grants: drop.(engine.source_report_grants),
                 enrollment_read_grants:
@@ -2023,19 +2046,33 @@ defmodule AttentionServer.Engine do
   end
 
   @doc false
-  def inbox_snapshot(%__MODULE__{} = engine, key, since) do
+  def inbox_snapshot(%__MODULE__{} = engine, key, since, view_order \\ []) do
     with {:ok, %{person: person, key: device}} <- principal(engine, key),
          true <- is_integer(since) and since >= 0 and since <= engine.persons[person] do
       high = engine.persons[person]
+      view_ranks = view_order |> Enum.with_index() |> Map.new()
 
       items =
         engine.messages
         |> Enum.filter(fn {{message_person, _sender, _id}, record} ->
           message_person == person and record.accepted_seq <= high
         end)
-        |> Enum.sort_by(fn {_message_key, record} ->
-          resolved? = match?(%{seq: seq} when seq <= high, record.terminal)
-          {if(resolved?, do: 1, else: 0), -record.accepted_seq}
+        |> Enum.split_with(fn {_key, record} ->
+          not match?(%{seq: seq} when seq <= high, record.terminal)
+        end)
+        |> then(fn {waiting, resolved} ->
+          ordered_waiting =
+            Enum.sort_by(waiting, fn {{_person, sender, id}, record} ->
+              {Map.get(view_ranks, {sender, id}, map_size(view_ranks)), -record.accepted_seq,
+               sender, id}
+            end)
+
+          ordered_resolved =
+            Enum.sort_by(resolved, fn {{_person, sender, id}, record} ->
+              {-record.accepted_seq, sender, id}
+            end)
+
+          ordered_waiting ++ ordered_resolved
         end)
         |> Enum.map(fn {{_person, sender, id}, _record} -> {sender, id} end)
 

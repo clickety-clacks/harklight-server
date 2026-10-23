@@ -8,7 +8,7 @@ defmodule AttentionServer.InboxPaging do
   @max_startup_id 128
   @max_batch_id 128
 
-  def start_plan(store, engine, key, frame) do
+  def start_plan(store, engine, key, frame, view_order \\ []) do
     requested_since = frame["since"]
 
     with :ok <- version(frame),
@@ -32,6 +32,7 @@ defmodule AttentionServer.InboxPaging do
                snapshot_id: opaque_id(),
                since: requested_since,
                high_water: high,
+               view_order: view_order,
                cursor_secret: :crypto.strong_rand_bytes(32)
              }}
           else
@@ -53,7 +54,7 @@ defmodule AttentionServer.InboxPaging do
 
   def snapshot_data(engine, key, plan) do
     with {:ok, items, receipts, operation_ids, high} <-
-           Engine.inbox_snapshot(engine, key, plan.since),
+           Engine.inbox_snapshot(engine, key, plan.since, Map.get(plan, :view_order, [])),
          true <- high == plan.high_water,
          {:ok, person} <- Engine.authorized_person(engine, key),
          true <- person == plan.person_id do

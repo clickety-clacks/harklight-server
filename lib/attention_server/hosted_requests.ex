@@ -22,6 +22,7 @@ defmodule AttentionServer.HostedRequests do
 
     case {conn.method, conn.request_path} do
       {"POST", "/accounts"} -> with_request(conn, &create_account(&1, &2, opts))
+      {"POST", "/algorithm"} -> with_request(conn, &set_algorithm(&1, &2, opts))
       {"POST", "/sign-in-links"} -> with_request(conn, &create_sign_in_link(&1, &2, opts))
       {"POST", "/test-reset"} -> with_request(conn, &test_reset(&1, &2, opts))
       {"POST", _} -> send_resp(conn, 404, "")
@@ -53,6 +54,34 @@ defmodule AttentionServer.HostedRequests do
       {:error, :no_public_origin} -> json(conn, 503, %{"error" => "no_public_origin"})
       {:error, :storage_unavailable} -> json(conn, 503, %{"error" => "storage_unavailable"})
       {:error, reason} -> json(conn, 500, %{"error" => to_string(reason)})
+    end
+  end
+
+  defp set_algorithm(conn, request, opts) do
+    person = Map.get(request, "person_id")
+    algorithm = Map.get(request, "algorithm_id")
+
+    case Relay.hosted_set_algorithm(opts.relay, person, algorithm) do
+      {:ok, result} ->
+        json(conn, 200, %{
+          "person_id" => result.person_id,
+          "algorithm_id" => result.algorithm_id
+        })
+
+      {:error, :unknown_algorithm} ->
+        json(conn, 400, %{"error" => "unknown_algorithm"})
+
+      {:error, :not_hosted} ->
+        json(conn, 404, %{"error" => "unknown_person"})
+
+      {:error, :jev_unconfigured} ->
+        json(conn, 409, %{"error" => "jev_unconfigured"})
+
+      {:error, :storage_unavailable} ->
+        json(conn, 503, %{"error" => "storage_unavailable"})
+
+      {:error, _reason} ->
+        json(conn, 503, %{"error" => "storage_unavailable"})
     end
   end
 

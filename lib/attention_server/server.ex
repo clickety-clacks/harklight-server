@@ -116,6 +116,7 @@ defmodule AttentionServer.Server do
         name: relay_name,
         store_path: store_path,
         push_enabled: push_enabled,
+        deployment_mode: deployment_mode,
         upload_cap: upload_cap
       ]
 

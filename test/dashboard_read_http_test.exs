@@ -19,6 +19,20 @@ defmodule AttentionServer.DashboardReadHTTPTest do
     def create_invitation({%{person_id: "mike"}, request_id}) do
       if AttentionServer.Message.uuid_v4?(request_id), do: {:error, :unavailable}
     end
+
+    def prioritization(%{person_id: "mike"}) do
+      {:ok,
+       %{
+         person_id: "mike",
+         algorithm_id: "baseline",
+         endpoint: "https://api.typesafe.ai/v1/systemone",
+         model: "jev-latest",
+         key_status: "not readable"
+       }}
+    end
+
+    def save_prioritization({%{person_id: "mike"}, "baseline", _endpoint, "jev-latest"}),
+      do: {:ok, %{}}
   end
 
   setup do
@@ -93,6 +107,60 @@ defmodule AttentionServer.DashboardReadHTTPTest do
     assert response.resp_body =~ "Mike&#39;s iPad"
     assert response.resp_body =~ "Enrolled</td><td>Unknown"
     refute response.resp_body =~ "Connected now"
+  end
+
+  test "the self-hosted prioritization page shows connection status without key material", %{
+    opts: opts
+  } do
+    page = "/prioritization" |> secure_get("member-session") |> DashboardReadHTTP.call(opts)
+
+    assert page.status == 200
+    assert page.resp_body =~ "Prioritization"
+    assert page.resp_body =~ "Jev re-ranking"
+    assert page.resp_body =~ "not readable"
+    assert page.resp_body =~ ~s(name="endpoint")
+    assert page.resp_body =~ ~s(name="model")
+    refute page.resp_body =~ "ATTENTION_SERVER_JEV_KEY_PATH"
+    refute page.resp_body =~ ~s(name="key")
+    refute page.resp_body =~ ~s(name="key_path")
+    refute page.resp_body =~ "/protected/key/location"
+    assert page.resp_body =~ ~s(href="/prioritization")
+  end
+
+  test "SaaS dashboard does not expose the prioritization page", %{opts: opts} do
+    hosted =
+      DashboardReadHTTP.init(
+        backend: Backend,
+        skill_path: opts.skill_path,
+        skill_path_send_listen: opts.skill_path_send_listen,
+        hosted: true
+      )
+
+    response = "/prioritization" |> secure_get("member-session") |> DashboardReadHTTP.call(hosted)
+    assert response.status == 404
+  end
+
+  test "the prioritization form accepts a full configured endpoint", %{opts: opts} do
+    endpoint = "https://example.test/" <> String.duplicate("a", 1_020)
+
+    body =
+      URI.encode_query(%{
+        "algorithm_id" => "baseline",
+        "endpoint" => endpoint,
+        "model" => "jev-latest"
+      })
+
+    conn = %{Plug.Test.conn(:post, "/prioritization", body) | scheme: :https, port: 443}
+
+    response =
+      conn
+      |> Plug.Conn.put_req_header("cookie", "__Host-harklight=member-session")
+      |> Plug.Conn.put_req_header("origin", "https://www.example.com")
+      |> Plug.Conn.put_req_header("content-type", "application/x-www-form-urlencoded")
+      |> DashboardReadHTTP.call(opts)
+
+    assert response.status == 303
+    assert Plug.Conn.get_resp_header(response, "location") == ["/prioritization"]
   end
 
   test "the signed-in components page serves the packaged skill without granting access", %{
