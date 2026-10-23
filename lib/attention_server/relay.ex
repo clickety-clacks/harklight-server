@@ -2638,13 +2638,22 @@ defmodule AttentionServer.Relay do
                action: "agent_answer"
              }) do
           {:ok, store} ->
+            next_state =
+              record_origin_feed_change(
+                %{state | store: store},
+                state.store.engine,
+                next_engine,
+                target
+              )
+
+            next_state =
+              if pending_signature(state.store.engine, person) !=
+                   pending_signature(next_engine, person),
+                 do: pending_set_changed(next_state, person),
+                 else: next_state
+
             {%{"v" => 1, "type" => "answer_result", "ok" => true} |> Map.merge(fields),
-             record_origin_feed_change(
-               %{state | store: store},
-               state.store.engine,
-               next_engine,
-               target
-             )}
+             next_state}
 
           _ ->
             {%{"v" => 1, "error" => "storage_unavailable"}, state}
