@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+release_dir="$(cd -- "$(dirname -- "$0")/.." && pwd)"
+export HARKLIGHT_CLI_ARGS
+HARKLIGHT_CLI_ARGS="$(printf '%s\0' "$@" | base64 | tr -d '\n')"
+# Tools must not start a second listener from the server's inherited environment.
+export ATTENTION_SERVER_ENABLE=0
+exec "$release_dir/bin/attention_server" eval 'AttentionServer.CLI.main()'

@@ -1,0 +1,13 @@
+[Unit]
+Description=Harklight release CI runner
+[Service]
+Type=simple
+WorkingDirectory=%h/.local/share/harklight-ci-runner
+ExecStart=%h/.local/share/harklight-ci-runner/bin/runsvc.sh
+Restart=always
+RestartSec=5
+TimeoutStopSec=5min
+KillMode=control-group
+
+[Install]
+WantedBy=default.target
