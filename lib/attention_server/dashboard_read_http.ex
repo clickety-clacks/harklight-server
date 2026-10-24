@@ -32,14 +32,26 @@ defmodule AttentionServer.DashboardReadHTTP do
     skill_path = Keyword.fetch!(opts, :skill_path)
     hosted = Keyword.get(opts, :hosted, false) == true
 
+    skill_path_send_listen =
+      Keyword.get(opts, :skill_path_send_listen) || send_listen_skill_path(skill_path)
+
     %{
       backend: backend,
       skill_path: skill_path,
       expected_origin: Keyword.get(opts, :expected_origin),
       hosted: hosted,
       hosted_addresses:
-        if(hosted, do: hosted_addresses(Keyword.get(opts, :hosted_addresses)), else: %{})
+        if(hosted, do: hosted_addresses(Keyword.get(opts, :hosted_addresses)), else: %{}),
+      skill_path_send_listen: skill_path_send_listen
     }
+  end
+
+  defp send_listen_skill_path(skill_path) do
+    Path.join([
+      Path.dirname(Path.dirname(skill_path)),
+      "harklight-agent-send-listen",
+      "SKILL.md"
+    ])
   end
 
   defp hosted_addresses(addresses) when is_map(addresses) do
@@ -90,6 +102,13 @@ defmodule AttentionServer.DashboardReadHTTP do
 
       conn.method == "POST" and conn.request_path == "/join/resolve" ->
         resolve_join(conn, opts)
+
+      conn.method == "GET" and conn.request_path == "/agent-skills/SKILL.md" ->
+        serve_skill_file(conn, opts.skill_path)
+
+      conn.method == "GET" and
+          conn.request_path == "/agent-skills/harklight-agent-send-listen/SKILL.md" ->
+        serve_skill_file(conn, opts.skill_path_send_listen)
 
       conn.method not in ["GET", "POST"] ->
         send_resp(conn, 405, "Method not allowed")
@@ -192,6 +211,12 @@ defmodule AttentionServer.DashboardReadHTTP do
     conn
     |> put_resp_content_type("text/javascript", "utf-8")
     |> send_resp(200, invitation_share_script())
+  end
+
+  defp route(%{method: "GET", request_path: "/components.js"} = conn, _opts, _principal) do
+    conn
+    |> put_resp_content_type("text/javascript", "utf-8")
+    |> send_resp(200, components_script())
   end
 
   defp route(%{method: "POST", request_path: "/devices/add"} = conn, opts, principal) do
@@ -308,26 +333,31 @@ defmodule AttentionServer.DashboardReadHTTP do
     end
   end
 
-  defp route(%{method: "GET", request_path: "/agent-skills"} = conn, opts, _principal) do
-    version_line =
-      case skill_version(opts.skill_path) do
-        {:ok, version} -> "<p>Packaged skill version: #{Plug.HTML.html_escape(version)}</p>"
-        :error -> ""
-      end
+  defp route(%{method: "GET", request_path: "/agent-skills"} = conn, _opts, _principal) do
+    conn |> put_resp_header("location", "/components") |> send_resp(303, "")
+  end
 
+  defp route(%{method: "GET", request_path: "/components"} = conn, opts, principal) do
     html =
-      ~s(<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Agent skills · Harklight</title></head><body><main><h1>Connect your agent</h1>#{version_line}<p>Harklight Server ships an agent skill. Copy the packaged <code>skills/harklight-agent</code> folder into your agent harness's configured skills directory, then follow its enrollment and sender-grant steps. Installing the skill alone grants no access.</p><p><a href="/agent-skills/SKILL.md">Read the Harklight agent skill</a></p><p><a href="/devices">Back to devices</a></p></main></body></html>)
+      DashboardView.components(
+        principal.person_id,
+        skill_version(opts.skill_path),
+        skill_version(opts.skill_path_send_listen),
+        chrome(opts)
+      )
 
     conn
     |> put_resp_content_type("text/html", "utf-8")
     |> send_resp(200, html)
   end
 
-  defp route(%{method: "GET", request_path: "/agent-skills/SKILL.md"} = conn, opts, _principal) do
+  defp route(conn, _opts, _principal), do: send_resp(conn, 404, "Not found")
+
+  defp serve_skill_file(conn, skill_path) do
     case Diagnostics.result(
            :dashboard_http,
            :request_read,
-           File.read(opts.skill_path),
+           File.read(skill_path),
            :unavailable
          ) do
       {:ok, skill} ->
@@ -339,8 +369,6 @@ defmodule AttentionServer.DashboardReadHTTP do
         send_resp(conn, 503, "Skill unavailable")
     end
   end
-
-  defp route(conn, _opts, _principal), do: send_resp(conn, 404, "Not found")
 
   defp skill_version(skill_path) do
     with {:ok, contents} <- File.read(skill_path),
@@ -632,6 +660,32 @@ defmodule AttentionServer.DashboardReadHTTP do
           full.focus();
           full.select();
           status.textContent = "Automatic copy is unavailable. The full link is selected.";
+        }
+      });
+    }
+    """
+  end
+
+  defp components_script do
+    ~S"""
+    const code = document.querySelector("#install-command code");
+    const copy = document.getElementById("copy-install-command");
+    const status = document.getElementById("install-copy-status");
+
+    if (code && copy && status) {
+      copy.addEventListener("click", async () => {
+        const command = code.textContent.trim();
+
+        try {
+          await navigator.clipboard.writeText(command);
+          status.textContent = "Command copied.";
+        } catch (_error) {
+          const range = document.createRange();
+          range.selectNodeContents(code);
+          const selection = window.getSelection();
+          selection.removeAllRanges();
+          selection.addRange(range);
+          status.textContent = "Automatic copy is unavailable. The command is selected.";
         }
       });
     }

@@ -26,7 +26,7 @@ defmodule AttentionServer.DashboardViewTest do
     refute html =~ "<phone>"
   end
 
-  test "empty device list offers one direct invitation action and links to the agent skill" do
+  test "empty device list offers one direct invitation action and links to components" do
     request_id = "123e4567-e89b-42d3-a456-426614174000"
     html = DashboardView.devices("Dana", [], [], request_id)
 
@@ -37,7 +37,7 @@ defmodule AttentionServer.DashboardViewTest do
     assert html =~ ~s(<button class="button" type="submit">Create a new invitation</button>)
     refute html =~ ~s(<form action="/devices/add" method="post">)
     assert html =~ "Another invitation could leave an earlier link active"
-    assert html =~ ~s(href="/agent-skills")
+    assert html =~ ~s(href="/components")
     assert html =~ ~s(<div class="account">Dana</div>)
   end
 
@@ -46,6 +46,81 @@ defmodule AttentionServer.DashboardViewTest do
 
     assert html =~ ~s(<form action="/devices/add" method="post">)
     refute html =~ ~s(<form action="/devices/invitation/new" method="post">)
+  end
+
+  test "the components page shows the packaged skill version and no invented app link" do
+    html = DashboardView.components("Dana", {:ok, "0.1.0"}, {:ok, "0.2.0"})
+
+    assert html =~ "v0.1.0"
+    assert html =~ ~s(<p class="status version">v0.1.0</p>)
+    assert html =~ ".status.version{text-transform:none;letter-spacing:normal"
+
+    assert html =~ ~s(href="/agent-skills/SKILL.md")
+    assert html =~ ~s(<div class="account">Dana</div>)
+
+    assert html =~ ~s(<section><h2>App</h2><p class="status">Not available yet</p></section>)
+  end
+
+  test "the components page presents a wrapped, copyable install command" do
+    html = DashboardView.components("Dana", {:ok, "0.1.0"}, {:ok, "0.2.0"})
+
+    assert html =~
+             ~s(<pre id="install-command"><code>brew install <span class="brew-namespace">clickety-clacks</span>/<wbr>tap/<wbr>harklight-agent</code></pre>)
+
+    assert [command_markup] =
+             Regex.run(~r{<pre id="install-command"><code>(.*?)</code></pre>}s, html,
+               capture: :all_but_first
+             )
+
+    assert Regex.replace(~r{<[^>]+>}, command_markup, "") ==
+             "brew install clickety-clacks/tap/harklight-agent"
+
+    assert html =~ ".install-command code .brew-namespace{white-space:nowrap}"
+
+    assert html =~
+             ~s(<button class="button" id="copy-install-command" type="button" aria-controls="install-command">Copy install command</button>)
+
+    assert html =~ ~s(<script src="/components.js" defer></script>)
+  end
+
+  test "the components page links to the published CLI release" do
+    html = DashboardView.components("Dana", {:ok, "0.1.0"}, {:ok, "0.2.0"})
+
+    assert html =~
+             ~s(href="https://github.com/clickety-clacks/harklight-agent/releases/latest")
+
+    refute html =~ "Homebrew formula"
+  end
+
+  test "the components page documents both shipped skills with their own version and link" do
+    html = DashboardView.components("Dana", {:ok, "0.1.0"}, {:ok, "0.2.0"})
+
+    assert html =~ "Agent skill: harklight-agent</h2>"
+    assert html =~ "v0.1.0"
+    assert html =~ ~s(href="/agent-skills/SKILL.md")
+
+    assert html =~ "Agent skill: harklight-agent-send-listen</h2>"
+    assert html =~ "v0.2.0"
+    assert html =~ ~s(href="/agent-skills/harklight-agent-send-listen/SKILL.md")
+  end
+
+  test "the components page tolerates a skill version lookup failure for either skill independently" do
+    html = DashboardView.components("Dana", :error, {:ok, "0.2.0"})
+
+    refute html =~ "v0.1.0"
+    assert html =~ "v0.2.0"
+
+    html = DashboardView.components("Dana", {:ok, "0.1.0"}, :error)
+
+    assert html =~ "v0.1.0"
+    refute html =~ "v0.2.0"
+  end
+
+  test "the components page tolerates both skill version lookups failing" do
+    html = DashboardView.components("Dana", :error, :error)
+
+    refute html =~ ~s(<h2>Agent skill: harklight-agent</h2><p class="status">v)
+    refute html =~ ~s(<h2>Agent skill: harklight-agent-send-listen</h2><p class="status">v)
   end
 
   test "uncertain invitation failure offers same-request retry without a new invitation action" do

@@ -27,8 +27,24 @@ defmodule AttentionServer.DashboardHTTPSTest do
       File.rm_rf!(dir)
     end)
 
-    skill_path = Path.join(dir, "SKILL.md")
-    File.write!(skill_path, "# Harklight agent")
+    skill_path = Path.join(dir, "skills/harklight-agent/SKILL.md")
+    File.mkdir_p!(Path.dirname(skill_path))
+
+    File.write!(
+      skill_path,
+      "---\nname: harklight-agent\nversion: \"0.1.0\"\n---\n\n# Harklight agent"
+    )
+
+    skill_path_send_listen =
+      Path.join(dir, "skills/harklight-agent-send-listen/SKILL.md")
+
+    File.mkdir_p!(Path.dirname(skill_path_send_listen))
+
+    File.write!(
+      skill_path_send_listen,
+      "---\nname: harklight-agent-send-listen\nversion: \"0.2.0\"\n---\n\n# Send and listen"
+    )
+
     port = available_port()
     store_path = Path.join(dir, "relay.sqlite3")
 
@@ -122,6 +138,28 @@ defmodule AttentionServer.DashboardHTTPSTest do
     refute view =~ ~s(<form action="/devices/add" method="post">)
     assert view =~ "Create a new invitation"
     refute view =~ "Set-Cookie: __Host-harklight-invite="
+
+    components =
+      send_https(certs, port, [
+        "GET /components HTTP/1.1\r\n",
+        "Host: relay.test:#{port}\r\n",
+        "Cookie: __Host-harklight=#{cookie}\r\n",
+        "Connection: close\r\n\r\n"
+      ])
+
+    assert components =~ "HTTP/1.1 200"
+    assert components =~ "Agent skill: harklight-agent-send-listen"
+    assert components =~ "v0.2.0"
+
+    send_listen_skill =
+      send_https(certs, port, [
+        "GET /agent-skills/harklight-agent-send-listen/SKILL.md HTTP/1.1\r\n",
+        "Host: relay.test:#{port}\r\n",
+        "Connection: close\r\n\r\n"
+      ])
+
+    assert send_listen_skill =~ "HTTP/1.1 200"
+    assert send_listen_skill =~ "# Send and listen"
     [_, invite_request_id] = Regex.run(~r/name="request_id" value="([^"]+)"/, view)
     assert AttentionServer.Message.uuid_v4?(invite_request_id)
 
@@ -308,6 +346,25 @@ defmodule AttentionServer.DashboardHTTPSTest do
 
     assert unsigned_script =~ "HTTP/1.1 401"
 
+    components_script =
+      send_https(certs, port, [
+        "GET /components.js HTTP/1.1\r\nHost: relay.test:#{port}\r\n",
+        "Cookie: __Host-harklight=#{cookie}\r\nConnection: close\r\n\r\n"
+      ])
+
+    assert components_script =~ "HTTP/1.1 200"
+    assert components_script =~ "navigator.clipboard.writeText(command)"
+    assert components_script =~ "Command copied."
+
+    unsigned_components_script =
+      send_https(
+        certs,
+        port,
+        "GET /components.js HTTP/1.1\r\nHost: relay.test:#{port}\r\nConnection: close\r\n\r\n"
+      )
+
+    assert unsigned_components_script =~ "HTTP/1.1 401"
+
     # The Create response and its request cookie can both be lost. A later
     # Devices visit must not silently prepare another ordinary Create request.
     without_request_cookie =
@@ -472,7 +529,8 @@ defmodule AttentionServer.DashboardHTTPSTest do
         ip: {127, 0, 0, 1},
         certfile: Path.join(certs, "server.pem"),
         keyfile: Path.join(certs, "server.key"),
-        skill_path: skill_path
+        skill_path: skill_path,
+        skill_path_send_listen: skill_path
       )
 
     Process.unlink(restarted_listener)
@@ -558,7 +616,8 @@ defmodule AttentionServer.DashboardHTTPSTest do
           owner_person: person,
           certfile: Path.join(certs, "server.pem"),
           keyfile: Path.join(certs, "server.key"),
-          skill_path: skill
+          skill_path: skill,
+          skill_path_send_listen: skill
         ]
       )
 
