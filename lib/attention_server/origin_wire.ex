@@ -7,7 +7,7 @@ defmodule AttentionServer.OriginWire do
   alias AttentionServer.{Diagnostics, JSON, Message, Relay}
 
   @selector_fields ~w(person person_id origin origin_key device_id device_key agent_id agent_key)
-  @operation_types ~w(send reply revise withdraw result file_use support)
+  @operation_types ~w(send reply revise withdraw result file_use support attachment_update)
 
   def command(relay, key, request) when is_map(request) and not is_struct(request) do
     ref = Map.get(request, "ref")
@@ -124,6 +124,13 @@ defmodule AttentionServer.OriginWire do
 
   defp run(relay, key, %{"type" => "support"} = request, ref) do
     case Relay.origin_support(relay, key, request) do
+      {:ok, result} -> ok(result, ref)
+      {:error, reason} -> error(Atom.to_string(reason), nil, ref)
+    end
+  end
+
+  defp run(relay, key, %{"type" => "attachment_update"} = request, ref) do
+    case Relay.origin_attachment_update(relay, key, request) do
       {:ok, result} -> ok(result, ref)
       {:error, reason} -> error(Atom.to_string(reason), nil, ref)
     end

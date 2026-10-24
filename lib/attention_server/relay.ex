@@ -83,6 +83,9 @@ defmodule AttentionServer.Relay do
   def origin_support(server, verified_device_key, declaration),
     do: GenServer.call(server, {:origin_support, verified_device_key, declaration})
 
+  def origin_attachment_update(server, verified_device_key, declaration),
+    do: GenServer.call(server, {:origin_attachment_update, verified_device_key, declaration})
+
   @doc "Publish file limits only to a currently enrolled origin device."
   def origin_file_limits(server, verified_device_key),
     do: GenServer.call(server, {:origin_file_limits, verified_device_key})
@@ -825,6 +828,22 @@ defmodule AttentionServer.Relay do
           end
 
         case commit(state.store, next, audit(state.store.engine, key, "origin_support")) do
+          {:ok, store} -> {:reply, {:ok, reply}, %{state | store: store}}
+          _ -> {:reply, {:error, :storage_unavailable}, state}
+        end
+
+      error ->
+        {:reply, error, state}
+    end
+  end
+
+  def handle_call({:origin_attachment_update, key, declaration}, _from, state) do
+    case Engine.origin_attachment_update(state.store.engine, key, declaration) do
+      {:ok, next, reply} when next == state.store.engine ->
+        {:reply, {:ok, reply}, state}
+
+      {:ok, next, reply} ->
+        case commit(state.store, next, audit(state.store.engine, key, "origin_attachment_update")) do
           {:ok, store} -> {:reply, {:ok, reply}, %{state | store: store}}
           _ -> {:reply, {:error, :storage_unavailable}, state}
         end

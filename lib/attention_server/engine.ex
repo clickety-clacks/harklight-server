@@ -2236,6 +2236,49 @@ defmodule AttentionServer.Engine do
     end
   end
 
+  @doc "Update only the current vendor attachment for an existing origin session handle."
+  def origin_attachment_update(%__MODULE__{} = engine, key, frame) do
+    with {:ok, person} <- authorized_person(engine, key),
+         true <- Message.uuid_v4?(frame["op_id"]),
+         true <- Map.has_key?(frame, "vendor_session_id"),
+         true <-
+           Conversation.valid_session?(frame["session_handle"], frame["vendor_session_id"]) do
+      semantic = %{
+        "type" => "attachment_update",
+        "session_handle" => frame["session_handle"],
+        "vendor_session_id" => frame["vendor_session_id"]
+      }
+
+      case receipt(engine, person, key, frame["op_id"], semantic) do
+        {:duplicate, reply} ->
+          {:ok, engine, reply}
+
+        :conflict ->
+          {:error, :operation_conflict}
+
+        :missing ->
+          with {:ok, next, stored} <-
+                 Conversation.update_vendor_session_id(
+                   engine,
+                   person,
+                   key,
+                   frame["session_handle"],
+                   frame["vendor_session_id"]
+                 ) do
+            reply = %{
+              "session_handle" => frame["session_handle"],
+              "vendor_session_id" => stored.vendor_session_id
+            }
+
+            {:ok, save_receipt(next, person, key, frame["op_id"], semantic, reply), reply}
+          end
+      end
+    else
+      false -> {:error, :invalid_field}
+      error -> error
+    end
+  end
+
   def origin_session_gone(%__MODULE__{} = engine, key, handle) do
     with {:ok, person} <- authorized_person(engine, key) do
       Conversation.mark_gone(engine, person, key, handle)

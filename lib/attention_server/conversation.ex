@@ -54,6 +54,20 @@ defmodule AttentionServer.Conversation do
     end
   end
 
+  def update_vendor_session_id(engine, person, origin, handle, vendor_session_id) do
+    key = {person, origin, handle}
+
+    case Map.get(engine.origin_sessions, key) do
+      nil ->
+        {:error, :not_found}
+
+      session ->
+        updated = Map.put(session, :vendor_session_id, vendor_session_id)
+
+        {:ok, %{engine | origin_sessions: Map.put(engine.origin_sessions, key, updated)}, updated}
+    end
+  end
+
   def valid_support_record?(nil), do: true
 
   def valid_support_record?(%{"origin" => origin, "reported_at" => at} = record) do
