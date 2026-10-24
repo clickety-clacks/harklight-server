@@ -7,9 +7,10 @@ listed in BUILD_INFO. This is a single-process self-hosted server cut.
 
 This package includes the scripted sender/reply path, owner-approved guided
 device joining, the optional HTTPS owner dashboard and APNs transport.
-It includes the server/device CLI `bin/harklight` and Rust conversation
-listener `bin/harklight-agent` (CLI version 0.1.0). Install the Harklight
-iOS/iPadOS app separately. No macOS or Windows executable is shipped.
+It includes the server/device CLI `bin/harklight`. The `harklight-agent`
+conversation CLI is released separately; see "Agent conversation CLI" below.
+Install the Harklight iOS/iPadOS app separately. No macOS or Windows executable
+is shipped.
 Provider acceptance does not prove notification display or a person's reply.
 
 ## No comment compatibility
@@ -122,26 +123,24 @@ certificate hostname in --name. Enrollment uses 18444, owner management 18445,
 device relay wss://HOSTNAME:18443/relay and authorized-agent HTTPS 18446.
 An app/server peer must negotiate attention-relay/1 and enroll its exact key.
 
-## Rust conversation listener
+## Agent conversation CLI
 
-After extracting the verified Linux package, the executable is
-`"$PACKAGE/bin/harklight-agent"`. The existing server release installer extracts
-the same binary to
-`$HOME/.local/share/harklight-server/releases/v0.1.11/bin/harklight-agent`;
-use `$HOME/.local/share/harklight-server/current/bin/harklight-agent` to follow
-the selected package. Neither route adds a global PATH entry, starts a listener,
-installs a vendor-session integration or creates an identity. The separate
-`skills/harklight-agent-send-listen` directory may be copied manually into an
-agent harness's configured skill directory; installation does not copy it there.
+The `harklight-agent` conversation CLI is not part of this package. It is
+released from <https://github.com/clickety-clacks/harklight-agent>; install it
+with `brew install clickety-clacks/tap/harklight-agent` or from that repository's
+release tarballs, as its README describes. Installing it does not start a
+listener, install a vendor-session integration or create an identity. The
+separate `skills/harklight-agent-send-listen` directory may be copied manually
+into an agent harness's configured skill directory; installation does not copy
+it there.
 
 The CLI uses an existing separately enrolled device identity and its sender grant,
 not the server owner's private key. Set `HARKLIGHT_IDENTITY_DIR` and
 `HARKLIGHT_CA_FILE` to that device's existing private identity directory and
 trusted public CA. Its local journal is separate from server state; retain it
 for uncertain actions and exact retries. The package does not migrate or reset
-an agent's journal during server installation. See the packaged `AGENT_CLI.md`
-for `send`, `listen`, `retry`, `retract` and file commands. Examples there use
-`harklight-agent` as shorthand for the explicit executable path above.
+an agent's journal during server installation. The CLI's README covers
+`send`, `listen`, `retry`, `retract` and file commands.
 
 Origin HTTPS is opt-in: set `ATTENTION_SERVER_ORIGIN_PORT` to a distinct free
 port and `ATTENTION_SERVER_ORIGIN_BIND` to its permitted bind address in private
@@ -359,15 +358,14 @@ backups and keys private.
 
 ## Build
 
-On the declared Linux target use Elixir 1.19.5/OTP 27, Rust 1.89 or newer and
-Cargo, Python 3, a C compiler, make, OpenSSL CLI and the pinned Mix/Cargo locks:
+On the declared Linux target use Elixir 1.19.5/OTP 27, a C compiler, make,
+OpenSSL CLI and the pinned Mix lock:
 
     ./scripts/build-package.sh
 
 This production package includes the Mix release/ERTS, server/device CLI,
-Rust conversation CLI, bootstrap, guides and both existing agent skills. It
-preserves dependency notices, including the resolved Cargo dependency notices,
-records BUILD_INFO and writes tarball/SHA256SUMS in dist/. Archive ordering,
+bootstrap, guides and both existing agent skills. It preserves dependency
+notices, records BUILD_INFO and writes tarball/SHA256SUMS in dist/. Archive ordering,
 timestamps, owners and gzip headers are normalized; full toolchain bit-for-bit
 reproducibility is not claimed. Build from the clean intended commit and use
 that same artifact for clean-install evidence and publication.
