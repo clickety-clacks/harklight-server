@@ -175,13 +175,14 @@ its connection indicator stays Unknown without a real presence signal.
 
 ## Durable upgrade boundary
 
-This release uses FORMAT22. Supported earlier snapshots, including FORMAT17,
+This release uses FORMAT23. Supported earlier snapshots, including FORMAT17,
 migrate on startup, preserving persons, owners, devices, sender grants and
-pending requests while initializing the hosted-account registry.
+pending requests while initializing the hosted-account registry. The v0.1.11
+package uses FORMAT22, and v0.1.10 accepts formats 1–6 and 8–21; neither can
+start against FORMAT23 state.
 Invitations, consumed bindings and resumable request generations share the
 atomic SQLite snapshot transaction. Keep a protected stopped backup before an
-upgrade. The v0.1.10 package accepts formats 1–6 and 8–21 only, so it will not
-start against FORMAT22. Retain current state and use a compatible forward repair
+upgrade. Retain current state and use a compatible forward repair
 or separately reviewed recovery path rather than overwriting newer accepted work
 with a stale backup. See SELF_HOST.md for upgrade and APNs configuration limits.
 
