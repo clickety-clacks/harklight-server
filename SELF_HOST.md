@@ -1,6 +1,6 @@
 # Harklight Server self-hosted installation
 
-Version: **0.1.11**. Package target: **Linux x86_64, glibc 2.39 or newer**, with OpenSSL 3 shared libraries and libstdc++6 (built on Ubuntu 24.04). The package bundles
+Version: **0.1.12**. Package target: **Linux x86_64, glibc 2.39 or newer**, with OpenSSL 3 shared libraries and libstdc++6 (built on Ubuntu 24.04). The package bundles
 Erlang/OTP and Elixir bytecode; users need no Mix, Hex, source checkout or
 Erlang installation. It needs Bash, OpenSSL CLI, tar and the platform libraries
 listed in BUILD_INFO. This is a single-process self-hosted server cut.
@@ -32,9 +32,10 @@ a live phone test.
 
 ## Download and verify
 
-Download the release from clickety-clacks/harklight-server, tag v0.1.11.
-Get harklight-server-0.1.11-linux-x86_64.tar.gz, SHA256SUMS and SELF_HOST.md
-from that release. Run sha256sum -c SHA256SUMS and extract into an operator-owned
+After publication, download the v0.1.12 release from
+clickety-clacks/harklight-server, tag v0.1.12. Get
+harklight-server-0.1.12-linux-x86_64.tar.gz, SHA256SUMS and SELF_HOST.md from
+that release. Run sha256sum -c SHA256SUMS and extract into an operator-owned
 versioned directory. BUILD_INFO identifies the source commit, build host,
 toolchain, source status and native dependencies.
 
@@ -46,7 +47,7 @@ runtime/dependency notices remain in their shipped distribution files.
 Choose the DNS hostname clients will validate. For a same-machine preview,
 localhost works. Install into a directory you own and run:
 
-    PACKAGE="$PWD/harklight-server-0.1.11-linux-x86_64"
+    PACKAGE="$PWD/harklight-server-0.1.12-linux-x86_64"
     STATE="$HOME/.local/share/harklight-server"
     "$PACKAGE/bin/harklight-bootstrap" "$STATE" localhost
     cat "$STATE/person-id"
@@ -282,10 +283,10 @@ state before upgrading. This source uses store FORMAT23; supported older state,
 including FORMAT17, is normalized and durably committed on startup. The new
 state includes hosted-account records, the separate conversation feed,
 conversation push high water and upload activity accounting while retaining
-existing requests, answers and authority. The v0.1.11 package uses FORMAT22;
-v0.1.10 accepts formats 1–6 and 8–21 only. Those packages cannot start against
-FORMAT23. Preserve the trust root, person and sender grants; do not repeat
-bootstrap. Do not treat an earlier package as a rollback path; use a compatible
+existing requests, answers and authority. The v0.1.12 package uses FORMAT23;
+v0.1.11 uses FORMAT22 and v0.1.10 accepts formats 1–6 and 8–21 only. Those
+earlier packages cannot start against FORMAT23. Preserve the trust root, person
+and sender grants; do not repeat bootstrap. Do not treat an earlier package as a rollback path; use a compatible
 forward repair or a separately reviewed, state-aware recovery plan.
 
 Starting a server with APNs configured can dispatch existing queued work. The

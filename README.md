@@ -7,16 +7,16 @@ Harklight iOS/iPadOS app.
 
 ## Install the server
 
-For the FORMAT22 v0.1.11 server package, use the release page below after it
+For the FORMAT23 v0.1.12 server package, use the release page below after it
 is published to download the Linux x86_64 archive, `SHA256SUMS` and
 `SELF_HOST.md`. Verify the checksum before extraction:
 
-[v0.1.11 release](https://github.com/clickety-clacks/harklight-server/releases/tag/v0.1.11)
+[v0.1.12 release](https://github.com/clickety-clacks/harklight-server/releases/tag/v0.1.12)
 (available only after publication).
 
 ```sh
 sha256sum -c SHA256SUMS
-tar -xzf harklight-server-0.1.11-linux-x86_64.tar.gz
+tar -xzf harklight-server-0.1.12-linux-x86_64.tar.gz
 ```
 
 Follow [SELF_HOST.md](SELF_HOST.md) for a fresh installation, tailnet routing,
@@ -29,8 +29,9 @@ State, owner/device identities, trust roots and sender grants live outside the
 versioned package. Run one server per database. Keep private keys and backups
 private; do not repeat bootstrap over an existing installation.
 This source uses FORMAT23 and migrates supported older state on startup. The
-v0.1.11 package uses FORMAT22, while v0.1.10 accepts formats 1–6 and 8–21; those
-packages cannot start against FORMAT23 state. Treat this as a one-way upgrade.
+v0.1.12 package uses FORMAT23; v0.1.11 uses FORMAT22 and v0.1.10 accepts formats
+1–6 and 8–21. Those earlier packages cannot start against FORMAT23 state. Treat
+this as a one-way upgrade.
 Before its first start against an existing state directory, stop the old server
 and take a full private backup. Rolling back requires restoring a copy made
 before that first start and loses changes accepted since the copy.
@@ -102,6 +103,12 @@ its initial ordering snapshot; relay replay and contiguous ACK stay chronologica
 The existing informational Seen value action and request Reply controls pass
 through unchanged. Receiving-client ordering, styling and controls depend on
 the installed client; upgrading the server alone does not establish those UI changes.
+
+The origin API also supports a receipt-backed attachment update for an existing
+session handle. It stores or clears the provider session identifier on that same
+origin session; it does not transfer a session to another device or server, or
+prove that the provider session remains active. The conversation CLI is released
+separately and is not included in this server package.
 
 ## No comment and client compatibility
 
