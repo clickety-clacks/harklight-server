@@ -44,7 +44,7 @@ defmodule AttentionServer.DashboardInventoryTest do
     assert hd(legacy.devices).label == "Device " <> String.slice(@device_one, 0, 8)
   end
 
-  test "only person-bound pending requests appear in that person's waiting list" do
+  test "person owners see only their pending requests while the account owner also sees CLI requests" do
     engine = seeded_engine()
 
     pending = %{
@@ -55,11 +55,31 @@ defmodule AttentionServer.DashboardInventoryTest do
       expires_at: 10
     }
 
-    engine = %{engine | pending_enrollments: %{"ABCDEFGH23" => pending}}
+    cli_pending = %{
+      key: String.duplicate("f", 64),
+      label: "CLI workstation",
+      state: :pending,
+      person: nil,
+      expires_at: 10
+    }
+
+    engine = %{
+      engine
+      | pending_enrollments: %{"ABCDEFGH23" => pending, "KLMNPQRS34" => cli_pending}
+    }
+
     assert {:ok, own} = DashboardInventory.for_owner(engine, @one, @owner_one, 9)
     assert [%{code: "ABCDEFGH23", label: "New iPad"}] = own.waiting
+
     assert {:ok, other} = DashboardInventory.for_owner(engine, @two, @owner_two, 9)
     assert other.waiting == []
+
+    assert {:ok, account_owner} =
+             DashboardInventory.for_account_owner(engine, @one, @owner_one, 9)
+
+    assert Enum.map(account_owner.waiting, & &1.code) == ["ABCDEFGH23", "KLMNPQRS34"]
+    assert Enum.find(account_owner.waiting, &(&1.code == "KLMNPQRS34")).person_name == nil
+
     assert {:ok, expired} = DashboardInventory.for_owner(engine, @one, @owner_one, 10)
     assert expired.waiting == []
 
