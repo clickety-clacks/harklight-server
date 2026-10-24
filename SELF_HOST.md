@@ -214,6 +214,18 @@ new invitation or key. The owner must review the renewed current request;
 an old code or deadline cannot approve it. Denial, cancellation and revocation
 remain terminal and never grant sender rights.
 
+The self-hosted dashboard also has a **Prioritization** page. It sets the
+dashboard owner's waiting-item order to the deterministic baseline or a
+model-assisted whole-set ranking. The endpoint and model are server-wide; the
+algorithm choice is per person. SaaS deployments have no such page. To enable
+model-assisted ranking, set
+`ATTENTION_SERVER_JEV_KEY_PATH` in private `server.env` to the absolute path of
+a protected key file. The page reports whether the file is readable; it never
+accepts or displays the path or key. Model-assisted ranking can be selected only
+after its HTTPS endpoint, model and key file are ready. If the ranking is
+unavailable, the server uses the baseline order while intake, delivery and push
+continue normally.
+
 ## Optional APNs notifications
 
 APNs is disabled when all five APNs settings below are absent. The Sandbox
@@ -266,15 +278,15 @@ text is restricted to fixed safe reasons in durable status. Retry and status
 survive restart.
 
 For an existing installation, stop the old server and back up the full private
-state before upgrading. This release uses store FORMAT22; supported older state,
+state before upgrading. This source uses store FORMAT23; supported older state,
 including FORMAT17, is normalized and durably committed on startup. The new
 state includes hosted-account records, the separate conversation feed,
 conversation push high water and upload activity accounting while retaining
-existing requests, answers and authority. Preserve the trust root, person and
-sender grants; do not repeat bootstrap. The v0.1.10 package accepts formats 1–6
-and 8–21 only, so it will not start against FORMAT22. Do not treat it as a
-rollback path; use a compatible forward repair or a separately reviewed,
-state-aware recovery plan.
+existing requests, answers and authority. The v0.1.11 package uses FORMAT22;
+v0.1.10 accepts formats 1–6 and 8–21 only. Those packages cannot start against
+FORMAT23. Preserve the trust root, person and sender grants; do not repeat
+bootstrap. Do not treat an earlier package as a rollback path; use a compatible
+forward repair or a separately reviewed, state-aware recovery plan.
 
 Starting a server with APNs configured can dispatch existing queued work. The
 release installer does not inspect, clear, or mark provider work delivered. It
@@ -347,20 +359,22 @@ exact acceptance sequence and intent reference, without source ruling authority.
 
 ## Upgrade or rollback
 
-Stop the old process. Back up the complete state directory including SQLite and
-keys into private operator storage. Verify the new checksum and extract into a
-different versioned directory. Keep the state path, trust root, owner/person and
-configuration. Start with existing server.env; do not rerun bootstrap.
-Startup migrates supported earlier store formats. There is no hot upgrade;
-only one server may own a database.
+Stop the old process. Before the first start of a FORMAT23 build, back up the
+complete state directory including SQLite and keys into private operator
+storage. Verify the new checksum and extract into a different versioned
+directory. Keep the state path, trust root, owner/person and configuration.
+Start with existing server.env; do not rerun bootstrap. Startup migrates
+supported earlier store formats immediately. There is no hot upgrade; only one
+server may own a database.
 
 If the new process fails, stop it and retain the current database and backup.
-Do not run v0.1.10 against FORMAT22 or restore a stale backup over newer accepted
-writes. A failed candidate may already have migrated the store.
-The existing installer retains the selected candidate, prior packages, stopped
-backup and latest state; it does not automatically downgrade or restore a
-database after switching. Use a compatible forward repair or a separately
-reviewed state-aware recovery plan.
+Earlier packages refuse FORMAT23 state. Rollback requires restoring the copy
+made before the first FORMAT23 start and loses every change accepted after that
+copy. Do not restore a stale backup over newer accepted writes. A failed
+candidate may already have migrated the store. The existing installer retains
+the selected candidate, prior packages, stopped backup and latest state; it
+does not automatically downgrade or restore a database after switching. Use a
+compatible forward repair or a separately reviewed state-aware recovery plan.
 The full-root archive is a recovery source for the deployment's private state
 and configuration; it does not justify replacing newer accepted data. Keep
 backups and keys private.

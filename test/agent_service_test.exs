@@ -43,6 +43,72 @@ defmodule AttentionServer.AgentServiceTest do
     %{relay: relay, owner: owner, agent: agent, agent_https: agent_https, path: path}
   end
 
+  test "an agent answer refreshes the waiting view and notifies supporting sessions", context do
+    %{certs: certs, relay: relay, owner: owner, agent: agent} = context
+    {:ok, person} = Relay.operator_bootstrap(relay, TLSFixtures.certificate_der!(certs, "a1"))
+
+    {:ok, device_key} =
+      Relay.setup_device_certificate(relay, person, TLSFixtures.certificate_der!(certs, "a2"))
+
+    assert :ok = Relay.setup_sender(relay, device_key, "app:test")
+
+    assert %{"type" => "ok", "seq" => seq} =
+             forward(relay, device_key, "app:test", "waiting", "request")
+
+    {:ok, agent_key} =
+      DeviceIdentity.from_certificate(TLSFixtures.certificate_der!(certs, "unknown"))
+
+    owner_endpoint = endpoint(certs, OwnerTLS.port(owner))
+    agent_endpoint = endpoint(certs, AgentTLS.port(agent))
+    agent_cert = Path.join(certs, "unknown.pem")
+    agent_private = Path.join(certs, "unknown.key")
+
+    assert %{"ok" => true} =
+             owner_request(owner_endpoint, certs, "a1", person, %{
+               "type" => "agent_register",
+               "agent_id" => @agent_id,
+               "key_fingerprint" => agent_key
+             })
+
+    assert %{"ok" => true} =
+             owner_request(owner_endpoint, certs, "a1", person, %{
+               "type" => "agent_grants_replace",
+               "key_fingerprint" => agent_key,
+               "expected_revision" => 1,
+               "read_grants" => ["app:test"],
+               "respond_grants" => ["app:test"]
+             })
+
+    assert {:ok, supporting} = Relay.open_websocket_session(relay, device_key, nil, nil)
+
+    assert %{"type" => "resynced"} =
+             session_request(relay, supporting, %{"type" => "resync", "since" => 0})
+             |> List.last()
+
+    before = hd(session_request(relay, supporting, %{"type" => "view_get", "ref" => "before"}))
+    assert Enum.map(before["entries"], & &1["message_id"]) == ["waiting"]
+
+    assert %{"type" => "answer_result", "ok" => true} =
+             agent_request(
+               agent_endpoint,
+               agent_cert,
+               agent_private,
+               answer("app:test", "waiting", seq, unique_op(), "answered")
+             )
+
+    after_answer =
+      hd(session_request(relay, supporting, %{"type" => "view_get", "ref" => "after"}))
+
+    assert after_answer["entries"] == []
+    refute after_answer["view_rev"] == before["view_rev"]
+
+    assert [%{"type" => "view_changed", "view_rev" => notice_revision}] =
+             session_drain(relay, supporting)
+             |> Enum.filter(&(&1["type"] == "view_changed"))
+
+    assert notice_revision == after_answer["view_rev"]
+  end
+
   test "owner scopes exact content and response, cursor revision, tenant, and durable null winner",
        context do
     %{certs: certs, relay: relay, owner: owner, agent: agent, path: path} = context
@@ -1281,6 +1347,29 @@ defmodule AttentionServer.AgentServiceTest do
   defp agent_request(endpoint, cert, key, request) do
     {:ok, reply} = HeadlessTLS.agent_request(endpoint, cert, key, request)
     reply
+  end
+
+  defp session_request(relay, session, frame) do
+    assert {:ok, lines} =
+             Relay.session_request_line(
+               relay,
+               session,
+               JSON.encode!(Map.put_new(frame, "v", 1)) <> "\n"
+             )
+
+    Enum.map(lines, fn line ->
+      assert {:ok, reply} = JSON.decode_line(line)
+      reply
+    end)
+  end
+
+  defp session_drain(relay, session) do
+    assert {:ok, lines} = Relay.session_drain(relay, session)
+
+    Enum.map(lines, fn line ->
+      assert {:ok, reply} = JSON.decode_line(line)
+      reply
+    end)
   end
 
   defp forward(relay, key, sender, id, text) do

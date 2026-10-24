@@ -1,0 +1,299 @@
+defmodule AttentionServer.JevClient do
+  @moduledoc false
+
+  alias AttentionServer.JSON
+
+  @key_path_env "ATTENTION_SERVER_JEV_KEY_PATH"
+  @endpoint_timeout 5_000
+  @request_timeout 30_000
+  @response_limit 4 * 1024 * 1024
+  @request_limit 8 * 1024 * 1024
+  @criteria [
+    "Low priority: this can wait while more time-sensitive items are handled.",
+    "Medium priority: this should be handled soon, but other items can reasonably come first.",
+    "High priority: delaying this item has clear near-term consequences; handle it before less urgent items."
+  ]
+
+  def key_status do
+    case read_key() do
+      {:ok, _key} -> "readable"
+      {:error, :not_set} -> "not set"
+      {:error, _} -> "not readable"
+    end
+  end
+
+  def connection_ready?(endpoint, model) do
+    valid_endpoint?(endpoint) and valid_model?(model) and key_status() == "readable"
+  end
+
+  def valid_endpoint?(endpoint) when is_binary(endpoint) and byte_size(endpoint) in 1..2_048 do
+    uri = URI.parse(String.trim(endpoint))
+
+    uri.scheme == "https" and is_binary(uri.host) and uri.host != "" and
+      uri.userinfo == nil and uri.query == nil and uri.fragment == nil and
+      is_integer(uri.port) and uri.port in 1..65_535
+  rescue
+    _ -> false
+  end
+
+  def valid_endpoint?(_), do: false
+
+  def valid_model?(model) when is_binary(model) and byte_size(model) in 1..256 do
+    String.trim(model) == model and String.valid?(model) and
+      not Regex.match?(~r/[\p{Cc}]/u, model)
+  end
+
+  def valid_model?(_), do: false
+
+  def compose(items, endpoint, model)
+      when is_list(items) and is_binary(endpoint) and is_binary(model) do
+    if valid_endpoint?(endpoint) and valid_model?(model) do
+      {questions, question_identities} =
+        items
+        |> Enum.with_index(1)
+        |> Enum.reduce({%{}, %{}}, fn {item, index}, {questions, identities} ->
+          question_id = "candidate_" <> Integer.to_string(index)
+
+          instructions =
+            "Rate candidate #{index} in the supplied whole pending set for how soon it should be handled. " <>
+              "Consider its title, body, stated stake and deadline relative to the other pending items."
+
+          question = %{
+            "type" => "score",
+            "instructions" => instructions,
+            "criteria" => @criteria
+          }
+
+          {Map.put(questions, question_id, question),
+           Map.put(identities, question_id, item.identity)}
+        end)
+
+      state = %{
+        "pending_items" =>
+          items
+          |> Enum.with_index(1)
+          |> Enum.map(fn {item, index} ->
+            message = item.message
+
+            %{
+              "candidate" => index,
+              "sender_id" => elem(item.identity, 0),
+              "message_id" => elem(item.identity, 1),
+              "title" => Map.get(message, "title", ""),
+              "body" => Map.get(message, "body", ""),
+              "stake" => Map.get(message, "stake", ""),
+              "by_when" => Map.get(message, "by_when")
+            }
+          end)
+      }
+
+      request = %{"model" => model, "state" => state, "questions" => questions}
+      body = JSON.encode!(request)
+
+      if byte_size(body) <= @request_limit do
+        with {:ok, uri} <- endpoint_uri(endpoint) do
+          {:ok,
+           %{
+             uri: uri,
+             model: model,
+             body: body,
+             candidates: Enum.map(items, & &1.identity),
+             question_identities: question_identities
+           }}
+        end
+      else
+        {:error, :request_too_large}
+      end
+    else
+      {:error, :jev_unconfigured}
+    end
+  rescue
+    _ -> {:error, :invalid_request}
+  end
+
+  def compose(_, _, _), do: {:error, :jev_unconfigured}
+
+  def evaluate(%{uri: uri, body: body, candidates: candidates, question_identities: identities}) do
+    with {:ok, key} <- read_key(),
+         {:ok, response} <- post(uri, body, key) do
+      rank_response(response, identities, candidates)
+    else
+      _ -> {:error, :unavailable}
+    end
+  end
+
+  def evaluate(_), do: {:error, :unavailable}
+
+  def rank_response(body, question_identities, candidates)
+      when is_list(candidates) and is_map(question_identities) do
+    with {:ok, scores} <- parse_scores(body, question_identities),
+         true <- length(candidates) == map_size(scores) do
+      rank(candidates, scores)
+    else
+      _ -> {:error, :malformed_response}
+    end
+  end
+
+  def rank_response(_, _, _), do: {:error, :malformed_response}
+
+  def parse_scores(body, question_identities)
+      when is_binary(body) and is_map(question_identities) do
+    with {:ok, %{"answers" => answers}} <- JSON.decode_line(body <> "\n", @response_limit),
+         true <-
+           is_map(answers) and
+             MapSet.new(Map.keys(answers)) == MapSet.new(Map.keys(question_identities)) do
+      Enum.reduce_while(question_identities, {:ok, %{}}, fn {question_id, identity},
+                                                            {:ok, scores} ->
+        case Map.get(answers, question_id) do
+          %{"type" => "score", "score" => score} ->
+            case score_value(score) do
+              {:ok, value} -> {:cont, {:ok, Map.put(scores, identity, value)}}
+              :error -> {:halt, {:error, :malformed_response}}
+            end
+
+          _ ->
+            {:halt, {:error, :malformed_response}}
+        end
+      end)
+    else
+      _ -> {:error, :malformed_response}
+    end
+  end
+
+  def parse_scores(_, _), do: {:error, :malformed_response}
+
+  defp score_value(value) when is_integer(value) and value in 0..2, do: {:ok, value * 1.0}
+
+  defp score_value(%JSON.DecimalToken{raw: raw}) do
+    case Float.parse(raw) do
+      {value, ""} when value >= 0 and value <= 2 -> {:ok, value}
+      _ -> :error
+    end
+  end
+
+  defp score_value(_), do: :error
+
+  defp rank(candidates, scores) do
+    if MapSet.new(candidates) == MapSet.new(Map.keys(scores)) and
+         length(candidates) == length(Map.keys(scores)) do
+      baseline_index = candidates |> Enum.with_index() |> Map.new()
+
+      {:ok,
+       candidates
+       |> Enum.sort_by(fn identity ->
+         {-Map.fetch!(scores, identity), Map.fetch!(baseline_index, identity)}
+       end)}
+    else
+      {:error, :malformed_response}
+    end
+  end
+
+  defp read_key do
+    case System.get_env(@key_path_env) do
+      nil ->
+        {:error, :not_set}
+
+      "" ->
+        {:error, :not_set}
+
+      path ->
+        case File.read(path) do
+          {:ok, bytes} when byte_size(bytes) > 0 ->
+            key = String.trim(bytes)
+            if key == "", do: {:error, :not_readable}, else: {:ok, key}
+
+          _ ->
+            {:error, :not_readable}
+        end
+    end
+  end
+
+  defp endpoint_uri(endpoint) do
+    uri = URI.parse(String.trim(endpoint))
+
+    if valid_endpoint?(endpoint) do
+      {:ok, %{uri | path: if(uri.path in [nil, ""], do: "/v1/systemone", else: uri.path)}}
+    else
+      {:error, :invalid_endpoint}
+    end
+  end
+
+  defp post(uri, body, key) do
+    path = if uri.query, do: uri.path <> "?" <> uri.query, else: uri.path
+
+    with {:ok, connection} <-
+           Mint.HTTP2.connect(:https, uri.host, uri.port,
+             hostname: uri.host,
+             timeout: @endpoint_timeout,
+             mode: :passive,
+             transport_opts: [verify: :verify_peer, cacerts: :public_key.cacerts_get()]
+           ),
+         {:ok, connection, request_ref} <-
+           Mint.HTTP2.request(
+             connection,
+             "POST",
+             path,
+             [
+               {"authorization", "Bearer " <> key},
+               {"content-type", "application/json"}
+             ],
+             body
+           ),
+         {:ok, connection, status, response} <- receive_response(connection, request_ref) do
+      _ = Mint.HTTP2.close(connection)
+      if status == 200, do: {:ok, response}, else: {:error, :provider_rejected}
+    else
+      {:error, connection, _reason} ->
+        _ = Mint.HTTP2.close(connection)
+        {:error, :unavailable}
+
+      {:error, _reason} ->
+        {:error, :unavailable}
+    end
+  rescue
+    _ -> {:error, :unavailable}
+  end
+
+  defp receive_response(connection, request_ref) do
+    deadline = System.monotonic_time(:millisecond) + @request_timeout
+    receive_response(connection, request_ref, nil, <<>>, deadline)
+  end
+
+  defp receive_response(connection, request_ref, status, body, deadline) do
+    timeout = max(deadline - System.monotonic_time(:millisecond), 0)
+
+    case Mint.HTTP2.recv(connection, 0, timeout) do
+      {:ok, next, events} ->
+        {status, body, complete?, too_large?} =
+          Enum.reduce(events, {status, body, false, false}, fn
+            {:status, ^request_ref, value}, {_status, current_body, complete?, too_large?} ->
+              {value, current_body, complete?, too_large?}
+
+            {:data, ^request_ref, chunk}, {current_status, current_body, complete?, _too_large?}
+            when byte_size(current_body) + byte_size(chunk) <= @response_limit ->
+              {current_status, current_body <> chunk, complete?, false}
+
+            {:data, ^request_ref, _chunk},
+            {current_status, current_body, complete?, _too_large?} ->
+              {current_status, current_body, complete?, true}
+
+            {:done, ^request_ref}, {current_status, current_body, _complete?, too_large?} ->
+              {current_status, current_body, true, too_large?}
+
+            _event, acc ->
+              acc
+          end)
+
+        cond do
+          too_large? -> {:error, next, :response_too_large}
+          complete? and is_integer(status) -> {:ok, next, status, body}
+          byte_size(body) >= @response_limit -> {:error, next, :response_too_large}
+          System.monotonic_time(:millisecond) >= deadline -> {:error, next, :timeout}
+          true -> receive_response(next, request_ref, status, body, deadline)
+        end
+
+      {:error, next, _error, _responses} ->
+        {:error, next, :unavailable}
+    end
+  end
+end

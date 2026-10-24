@@ -6,7 +6,10 @@ defmodule AttentionServer.HostedAccountTest do
     DeviceIdentity,
     Engine,
     GuidedJoin,
+    HostedRequests,
+    JevClient,
     JSON,
+    Placement,
     Relay,
     Server,
     Store,
@@ -317,6 +320,94 @@ defmodule AttentionServer.HostedAccountTest do
                )
 
       assert {404, _} = post(port, "/other", %{})
+    end
+
+    test "sets a per-account algorithm and treats the current choice as a no-op", %{
+      server: server
+    } do
+      relay = Server.relay(server)
+      assert {:ok, person} = Relay.hosted_account_create(relay, "acct-priority")
+      version = :sys.get_state(relay).store.version
+
+      assert {200, %{"person_id" => ^person, "algorithm_id" => "baseline"}} =
+               hosted_post(relay, "/algorithm", %{
+                 "person_id" => person,
+                 "algorithm_id" => "baseline"
+               })
+
+      assert :sys.get_state(relay).store.version == version
+
+      assert {200, %{"person_id" => ^person, "algorithm_id" => "baseline"}} =
+               hosted_post(relay, "/algorithm", %{
+                 "person_id" => person,
+                 "algorithm_id" => "baseline"
+               })
+
+      assert :sys.get_state(relay).store.version == version
+
+      assert {400, %{"error" => "unknown_algorithm"}} =
+               hosted_post(relay, "/algorithm", %{
+                 "person_id" => person,
+                 "algorithm_id" => "future"
+               })
+
+      assert {404, %{"error" => "unknown_person"}} =
+               hosted_post(relay, "/algorithm", %{
+                 "person_id" => "missing",
+                 "algorithm_id" => "baseline"
+               })
+
+      assert {409, %{"error" => "jev_unconfigured"}} =
+               hosted_post(relay, "/algorithm", %{
+                 "person_id" => person,
+                 "algorithm_id" => "jev-set"
+               })
+    end
+
+    test "does not enable Jev from the hosted account interface even when configured", %{
+      server: server,
+      dir: dir
+    } do
+      relay = Server.relay(server)
+      assert {:ok, person} = Relay.hosted_account_create(relay, "acct-priority-jev")
+      key_path = Path.join(dir, "jev.key")
+      File.write!(key_path, "private-test-key")
+      previous_key_path = System.get_env("ATTENTION_SERVER_JEV_KEY_PATH")
+      System.put_env("ATTENTION_SERVER_JEV_KEY_PATH", key_path)
+
+      on_exit(fn ->
+        if is_binary(previous_key_path),
+          do: System.put_env("ATTENTION_SERVER_JEV_KEY_PATH", previous_key_path),
+          else: System.delete_env("ATTENTION_SERVER_JEV_KEY_PATH")
+      end)
+
+      state = :sys.get_state(relay)
+
+      assert {:ok, engine} =
+               Engine.set_jev_connection(
+                 state.store.engine,
+                 "https://api.typesafe.ai/v1/systemone",
+                 "jev-latest"
+               )
+
+      assert {:ok, store} =
+               Store.commit(state.store, engine, %{
+                 person: person,
+                 actor: "test",
+                 action: "settings"
+               })
+
+      :sys.replace_state(relay, &%{&1 | store: store})
+
+      assert JevClient.key_status() == "readable"
+
+      assert {409, %{"error" => "jev_unconfigured"}} =
+               hosted_post(relay, "/algorithm", %{
+                 "person_id" => person,
+                 "algorithm_id" => "jev-set"
+               })
+
+      assert Placement.choice(:sys.get_state(relay).store.engine, person) == "baseline"
     end
 
     test "the public base address, not the listener's own, is the dashboard origin", %{
@@ -683,6 +774,16 @@ defmodule AttentionServer.HostedAccountTest do
   end
 
   defp post(port, path, body), do: raw_post(port, path, JSON.encode!(body))
+
+  defp hosted_post(relay, path, body) do
+    conn =
+      Plug.Test.conn(:post, path, JSON.encode!(body))
+      |> Plug.Conn.put_req_header("content-type", "application/json")
+      |> HostedRequests.call(HostedRequests.init(relay: relay))
+
+    {:ok, decoded} = JSON.decode_line(conn.resp_body <> "\n")
+    {conn.status, decoded}
+  end
 
   defp raw_post(port, path, body) do
     request(port, [
