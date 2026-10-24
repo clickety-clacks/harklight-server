@@ -855,6 +855,166 @@ defmodule AttentionServer.OriginHTTPSTest do
     :ssl.close(stream)
   end
 
+  test "attachment updates are origin-bound, receipt-backed metadata changes", c do
+    message = %{
+      "sender_id" => "app:test",
+      "message_id" => "attachment-update",
+      "created_at" => 1,
+      "title" => "Continue?"
+    }
+
+    assert {:ok, 200, %{"type" => "ok", "session_handle" => @handle}} =
+             request(c, "a2", %{
+               "v" => 1,
+               "type" => "send",
+               "op_id" => op(70),
+               "session_handle" => @handle,
+               "vendor_session_id" => "old-vendor-session",
+               "message" => message
+             })
+
+    assert {:ok, 200, %{"type" => "ok"}} =
+             request(c, "a2", %{
+               "v" => 1,
+               "type" => "support",
+               "op_id" => op(71),
+               "session_handle" => @handle,
+               "route" => "claude-code",
+               "cli_version" => "test-only",
+               "unsupported_reason" => nil
+             })
+
+    assert {:ok, 200, %{"type" => "ok"} = feed_before} =
+             request(c, "a2", %{"v" => 1, "type" => "feed", "since" => 0})
+
+    assert {:ok, 200, %{"type" => "ok"} = status_before} =
+             request(c, "a2", %{"v" => 1, "type" => "status", "session_handle" => @handle})
+
+    before = :sys.get_state(c.relay).store.engine
+    session_key = {c.person, c.origin, @handle}
+    prior_session = before.origin_sessions[session_key]
+    assert prior_session.vendor_session_id == "old-vendor-session"
+    refute is_nil(prior_session.support)
+
+    update = %{
+      "v" => 1,
+      "type" => "attachment_update",
+      "op_id" => op(72),
+      "session_handle" => @handle,
+      "vendor_session_id" => "new-vendor-session"
+    }
+
+    assert {:ok, 200,
+            %{
+              "type" => "ok",
+              "session_handle" => @handle,
+              "vendor_session_id" => "new-vendor-session"
+            }} = request(c, "a2", update)
+
+    after_update = :sys.get_state(c.relay).store.engine
+    expected_session = Map.put(prior_session, :vendor_session_id, "new-vendor-session")
+
+    assert after_update.origin_sessions ==
+             Map.put(before.origin_sessions, session_key, expected_session)
+
+    assert Map.drop(after_update, [:origin_sessions, :receipts]) ==
+             Map.drop(before, [:origin_sessions, :receipts])
+
+    receipt_key = {c.person, c.origin, op(72)}
+
+    assert Map.drop(after_update.receipts, [receipt_key]) == before.receipts
+
+    assert after_update.receipts[receipt_key].reply == %{
+             "session_handle" => @handle,
+             "vendor_session_id" => "new-vendor-session"
+           }
+
+    assert {:ok, 200,
+            %{
+              "type" => "ok",
+              "duplicate" => true,
+              "session_handle" => @handle,
+              "vendor_session_id" => "new-vendor-session"
+            }} = request(c, "a2", update)
+
+    assert :sys.get_state(c.relay).store.engine == after_update
+
+    assert {:ok, 200, %{"type" => "error", "reason" => "operation_conflict"}} =
+             request(c, "a2", %{update | "vendor_session_id" => "different-vendor-session"})
+
+    assert {:ok, 200, %{"type" => "error", "reason" => "invalid_field"}} =
+             request(c, "a2", %{update | "op_id" => op(73), "session_handle" => "invalid"})
+
+    assert {:ok, 200, %{"type" => "error", "reason" => "invalid_field"}} =
+             request(c, "a2", %{update | "op_id" => op(74), "vendor_session_id" => ""})
+
+    assert {:ok, 200, %{"type" => "error", "reason" => "invalid_field"}} =
+             request(c, "a2", %{update | "op_id" => op(78), "vendor_session_id" => 7})
+
+    assert {:ok, 200, %{"type" => "error", "reason" => "invalid_field"}} =
+             request(c, "a2", Map.delete(%{update | "op_id" => op(75)}, "vendor_session_id"))
+
+    assert {:ok, 200, %{"type" => "error", "reason" => "invalid_field", "field" => "op_id"}} =
+             request(c, "a2", %{update | "op_id" => "invalid"})
+
+    assert {:ok, 200, %{"type" => "error", "reason" => "not_found"}} =
+             request(c, "reader", update)
+
+    assert {:ok, 200, %{"type" => "error", "reason" => "not_found"}} =
+             request(c, "b2", %{update | "op_id" => op(76)})
+
+    clear_update = %{update | "op_id" => op(77), "vendor_session_id" => nil}
+
+    assert {:ok, 200,
+            %{
+              "type" => "ok",
+              "session_handle" => @handle,
+              "vendor_session_id" => nil
+            }} = request(c, "a2", clear_update)
+
+    assert {:ok, 200,
+            %{
+              "type" => "ok",
+              "duplicate" => true,
+              "session_handle" => @handle,
+              "vendor_session_id" => nil
+            }} = request(c, "a2", clear_update)
+
+    after_clear = :sys.get_state(c.relay).store.engine
+
+    cleared_session = Map.put(expected_session, :vendor_session_id, nil)
+
+    assert after_clear.origin_sessions ==
+             Map.put(before.origin_sessions, session_key, cleared_session)
+
+    assert Map.drop(after_clear, [:origin_sessions, :receipts]) ==
+             Map.drop(before, [:origin_sessions, :receipts])
+
+    assert Map.drop(after_clear.receipts, [receipt_key, {c.person, c.origin, op(77)}]) ==
+             before.receipts
+
+    assert {:ok, 200, ^feed_before} =
+             request(c, "a2", %{"v" => 1, "type" => "feed", "since" => 0})
+
+    assert {:ok, 200, ^status_before} =
+             request(c, "a2", %{"v" => 1, "type" => "status", "session_handle" => @handle})
+
+    assert :ok = Supervisor.stop(c.server)
+    assert {:ok, restarted} = Relay.start_link(store_path: c.store_path)
+    Process.unlink(restarted)
+    on_exit(fn -> if Process.alive?(restarted), do: GenServer.stop(restarted) end)
+
+    assert {:ok,
+            %{
+              "duplicate" => true,
+              "session_handle" => @handle,
+              "vendor_session_id" => "new-vendor-session"
+            }} = Relay.origin_attachment_update(restarted, c.origin, Map.drop(update, ["v"]))
+
+    restarted_engine = :sys.get_state(restarted).store.engine
+    assert restarted_engine.origin_sessions[session_key].vendor_session_id == nil
+  end
+
   test "certificate-bound HTTPS send, feed, delivery and result survive response loss", c do
     message = %{
       "sender_id" => "app:test",
