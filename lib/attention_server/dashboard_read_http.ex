@@ -382,14 +382,27 @@ defmodule AttentionServer.DashboardReadHTTP do
        )
        when action in ["approve", "decline"] do
     if valid_code?(code) do
-      case form(conn, opts, ~w(key deadline)) do
-        {:ok, %{"key" => key, "deadline" => deadline}, conn} ->
+      case form(conn, opts, {:one_of, [~w(key deadline), ~w(key deadline senders)]}, 32_768) do
+        {:ok, %{"key" => key, "deadline" => deadline} = fields, conn} ->
           with true <- Regex.match?(~r/\A[0-9a-f]{64}\z/, key),
                {deadline, ""} <- Integer.parse(deadline),
-               {:ok, %{key: ^key, expires_at: ^deadline}} <-
+               {:ok, %{key: ^key, expires_at: ^deadline} = request} <-
                  backend_call(opts.backend, :review_pending, {principal, code}),
+               true <-
+                 not Map.has_key?(fields, "senders") or
+                   (action == "approve" and request[:can_grant_senders] == true),
                operation <- if(action == "approve", do: :approve_pending, else: :decline_pending),
-               result <- backend_call(opts.backend, operation, {principal, code, key, deadline}),
+               senders <-
+                 if(request[:can_grant_senders] == true,
+                   do: String.split(Map.get(fields, "senders", ""), ",", trim: true),
+                   else: []
+                 ),
+               arguments <-
+                 if(action == "approve",
+                   do: {principal, code, key, deadline, senders},
+                   else: {principal, code, key, deadline}
+                 ),
+               result <- backend_call(opts.backend, operation, arguments),
                true <- result == :ok or match?({:ok, _}, result) do
             conn |> put_resp_header("location", "/devices") |> send_resp(303, "")
           else
@@ -609,7 +622,13 @@ defmodule AttentionServer.DashboardReadHTTP do
           try do
             fields = URI.decode_query(body)
 
-            if Enum.sort(Map.keys(fields)) == Enum.sort(keys),
+            accepted_keys =
+              case keys do
+                {:one_of, choices} -> choices
+                keys -> [keys]
+              end
+
+            if Enum.any?(accepted_keys, &(Enum.sort(Map.keys(fields)) == Enum.sort(&1))),
               do: {:ok, fields, conn},
               else: {:error, :invalid_form, conn}
           rescue

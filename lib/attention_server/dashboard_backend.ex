@@ -115,9 +115,9 @@ defmodule AttentionServer.DashboardBackend do
 
   def approve_pending(
         %__MODULE__{relay: relay},
-        {%{person_id: person, owner_key: key}, code, expected_key, deadline}
+        {%{person_id: person, owner_key: key}, code, expected_key, deadline, senders}
       ),
-      do: Relay.owner_pending_approve(relay, person, key, code, expected_key, deadline, [])
+      do: Relay.owner_pending_approve(relay, person, key, code, expected_key, deadline, senders)
 
   def decline_pending(
         %__MODULE__{relay: relay},
