@@ -24,7 +24,16 @@ defmodule AttentionServer.DashboardBackend do
   def list_devices(%__MODULE__{} = backend, %{person_id: person, owner_key: key} = principal) do
     case Relay.dashboard_inventory(backend.relay, person, key, backend.configured_owner_person) do
       {:ok, snapshot} ->
-        waiting = Enum.map(snapshot.waiting, &Map.put(&1, :can_review, &1.person_name == person))
+        waiting =
+          Enum.map(snapshot.waiting, fn item ->
+            can_review = is_nil(item.person_name) or item.person_name == person
+            item = Map.put(item, :can_review, can_review)
+
+            if is_nil(item.person_name),
+              do: %{item | person_name: "Command-line enrollment"},
+              else: item
+          end)
+
         {:ok, present(%{snapshot | waiting: waiting}, person, Map.get(principal, :display_name))}
 
       error ->

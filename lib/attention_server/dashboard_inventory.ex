@@ -75,7 +75,8 @@ defmodule AttentionServer.DashboardInventory do
   end
 
   defp visible_person?({:person, person}, candidate), do: candidate == person
-  defp visible_person?(:all, candidate), do: is_binary(candidate)
+  defp visible_person?(:all, candidate) when is_binary(candidate), do: true
+  defp visible_person?(:all, nil), do: true
 
   defp device_label(%{label: label}, _key) when is_binary(label) and label != "", do: label
   defp device_label(_device, key), do: "Device " <> String.slice(key, 0, 8)
