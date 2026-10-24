@@ -165,15 +165,29 @@ defmodule AttentionServer.DashboardView do
       ~s(<h1>Approve this device?</h1>) <>
         ~s(<section><p>Device: #{label}</p><p>Joins as: #{escape(person)}</p><p>Code on device: <strong>#{escaped_code}</strong></p><p>Closes: #{escape(time(deadline))}</p><details><summary>Exact device key</summary><code>#{escaped_key}</code></details></section>) <>
         ~s(<section>) <>
-        action_form(code, "approve", key, deadline, "Approve this exact device") <>
+        action_form(
+          code,
+          "approve",
+          key,
+          deadline,
+          "Approve this exact device",
+          request[:can_grant_senders] == true
+        ) <>
         action_form(code, "decline", key, deadline, "Decline") <>
         ~s(</section><p><a href="/devices">Back to devices</a></p>)
 
     layout(person, "Review device", body, chrome)
   end
 
-  defp action_form(code, action, key, deadline, label) do
-    ~s(<form action="/devices/waiting/#{escape(code)}/#{action}" method="post"><input type="hidden" name="key" value="#{escape(key)}"><input type="hidden" name="deadline" value="#{escape(deadline)}"><button class="button" type="submit">#{escape(label)}</button></form>)
+  defp action_form(code, action, key, deadline, label, grant_senders? \\ false) do
+    sender_field =
+      if grant_senders? do
+        ~s|<label for="senders">Sender IDs (optional, comma-separated)</label><input id="senders" name="senders" type="text" autocomplete="off" placeholder="app:tightbeam/codex"><p>The approved device may send as these exact IDs.</p>|
+      else
+        ""
+      end
+
+    ~s(<form action="/devices/waiting/#{escape(code)}/#{action}" method="post"><input type="hidden" name="key" value="#{escape(key)}"><input type="hidden" name="deadline" value="#{escape(deadline)}">#{sender_field}<button class="button" type="submit">#{escape(label)}</button></form>)
   end
 
   defp invitation_form(label) do

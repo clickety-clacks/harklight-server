@@ -8,7 +8,7 @@ defmodule AttentionServer.DashboardBackendTest do
     GuidedJoin
   }
 
-  alias AttentionServer.{DeviceIdentity, Relay, TLSFixtures}
+  alias AttentionServer.{DeviceIdentity, JSON, Relay, TLSFixtures}
 
   test "configured self-host owner sees device metadata across persons; another owner sees only their own" do
     certs = TLSFixtures.create!()
@@ -128,7 +128,7 @@ defmodule AttentionServer.DashboardBackendTest do
              401
   end
 
-  test "signed-in owner approves invitation and command-line enrollments without sender rights" do
+  test "signed-in owner preserves invitation approval and grants sender rights during CLI approval" do
     certs = TLSFixtures.create!()
     on_exit(fn -> File.rm_rf!(certs) end)
 
@@ -243,11 +243,24 @@ defmodule AttentionServer.DashboardBackendTest do
     assert review.status == 200
     assert review.resp_body =~ "Ansible"
     assert review.resp_body =~ device_key
+    refute review.resp_body =~ ~s(name="senders")
 
     wrong =
       URI.encode_query(%{"key" => device_key, "deadline" => Integer.to_string(deadline + 1)})
 
     assert (owner_post("/devices/waiting/#{code}/approve", wrong, cookie)
+            |> DashboardReadHTTP.call(opts)).status == 409
+
+    assert :sys.get_state(relay).store.engine.devices[device_key] == nil
+
+    invite_with_senders =
+      URI.encode_query(%{
+        "key" => device_key,
+        "deadline" => Integer.to_string(deadline),
+        "senders" => "app:tightbeam/codex"
+      })
+
+    assert (owner_post("/devices/waiting/#{code}/approve", invite_with_senders, cookie)
             |> DashboardReadHTTP.call(opts)).status == 409
 
     assert :sys.get_state(relay).store.engine.devices[device_key] == nil
@@ -286,11 +299,24 @@ defmodule AttentionServer.DashboardBackendTest do
     assert cli_review.status == 200
     assert cli_review.resp_body =~ "CLI workstation"
     assert cli_review.resp_body =~ "Approve this exact device"
+    assert cli_review.resp_body =~ ~s(name="senders")
+    assert cli_review.resp_body =~ "app:tightbeam/codex"
+    assert cli_review.resp_body =~ "comma-separated"
+
+    sender = "app:tightbeam/codex"
+
+    sender_ids =
+      [sender] ++
+        Enum.map(1..31, fn index ->
+          suffix = Integer.to_string(index)
+          "app:" <> String.duplicate("a", 251 - byte_size(suffix)) <> suffix
+        end)
 
     cli_exact =
       URI.encode_query(%{
         "key" => cli_key,
-        "deadline" => Integer.to_string(cli_deadline)
+        "deadline" => Integer.to_string(cli_deadline),
+        "senders" => Enum.join(sender_ids, ",")
       })
 
     cli_approved =
@@ -307,7 +333,71 @@ defmodule AttentionServer.DashboardBackendTest do
 
     engine = :sys.get_state(relay).store.engine
     assert engine.devices[cli_key].person == person
-    assert Map.get(engine.sender_grants, {person, cli_key}, MapSet.new()) == MapSet.new()
+
+    assert Map.get(engine.sender_grants, {person, cli_key}, MapSet.new()) ==
+             MapSet.new(sender_ids)
+
+    send_frame = %{
+      "v" => 1,
+      "type" => "forward",
+      "op_id" => "00000000-0000-4000-8000-0000000000c1",
+      "message" => %{
+        "sender_id" => sender,
+        "message_id" => "dashboard-approved-send",
+        "created_at" => 1,
+        "title" => "Dashboard approval send",
+        "unknown" => %{"text" => "sent with the approved sender ID"}
+      }
+    }
+
+    {:ok, send_reply} = Relay.request_line(relay, cli_key, JSON.encode!(send_frame) <> "\n")
+    assert {:ok, %{"type" => "ok", "seq" => _}} = JSON.decode_line(send_reply)
+
+    assert :sys.get_state(relay).store.engine.messages[
+             {person, sender, "dashboard-approved-send"}
+           ]
+
+    other_sender_message =
+      send_frame["message"]
+      |> Map.put("sender_id", "app:another-sender")
+      |> Map.put("message_id", "dashboard-ungranted-send")
+
+    other_sender_frame =
+      send_frame
+      |> Map.put("op_id", "00000000-0000-4000-8000-0000000000c2")
+      |> Map.put("message", other_sender_message)
+
+    {:ok, denied_reply} =
+      Relay.request_line(relay, cli_key, JSON.encode!(other_sender_frame) <> "\n")
+
+    assert {:ok, %{"type" => "error", "reason" => "sender_not_authorized"}} =
+             JSON.decode_line(denied_reply)
+
+    no_sender_cert = TLSFixtures.certificate_der!(certs, "b1")
+    {:ok, no_sender_key} = DeviceIdentity.from_certificate(no_sender_cert)
+    {:ok, no_sender_request} = Relay.pending_enroll(relay, no_sender_cert, "CLI without sender")
+
+    no_sender_approval =
+      URI.encode_query(%{
+        "key" => no_sender_key,
+        "deadline" => Integer.to_string(no_sender_request.expires_at)
+      })
+
+    no_sender_result =
+      owner_post(
+        "/devices/waiting/#{no_sender_request.approval_code}/approve",
+        no_sender_approval,
+        cookie
+      )
+      |> DashboardReadHTTP.call(opts)
+
+    assert no_sender_result.status == 303
+
+    assert Map.get(
+             :sys.get_state(relay).store.engine.sender_grants,
+             {person, no_sender_key},
+             MapSet.new()
+           ) == MapSet.new()
   end
 
   defp request(cookie) do

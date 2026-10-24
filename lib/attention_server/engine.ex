@@ -1283,7 +1283,13 @@ defmodule AttentionServer.Engine do
          true <- now_ms < item.status_expires_at do
       case item do
         %{state: :pending, expires_at: deadline} when now_ms < deadline ->
-          {:ok, %{label: item.label, key: item.key, expires_at: deadline}}
+          {:ok,
+           %{
+             label: item.label,
+             key: item.key,
+             expires_at: deadline,
+             can_grant_senders: is_nil(Map.get(item, :person))
+           }}
 
         %{state: :approved, person: ^person, approved_by: ^owner_key} ->
           {:ok, %{label: item.label, key: item.key, expires_at: item.expires_at}}
