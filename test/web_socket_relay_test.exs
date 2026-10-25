@@ -233,7 +233,7 @@ defmodule AttentionServer.WebSocketRelayTest do
     assert upgrade(a1) =~ "101 Switching Protocols"
 
     assert {[
-              %{"type" => "delivery", "message" => ^message},
+              %{"type" => "delivery", "message_id" => "one", "seq" => 1},
               %{"type" => "lifecycle", "message_id" => "one", "answer" => "kept"}
             ], %{"seq" => 2}} = resync(a1)
 
@@ -358,6 +358,7 @@ defmodule AttentionServer.WebSocketRelayTest do
              })
 
     assert %{"type" => "delivery", "seq" => 1} = reply(origin)
+    assert %{"type" => "delivery", "seq" => 1} = reply(reader)
     assert {[%{"type" => "delivery", "seq" => 1}], %{"seq" => 1}} = resync(reader)
     assert :ok = send_request(reader, %{"type" => "ack", "seq" => 1})
     assert %{"type" => "ok", "seq" => 1} = reply(reader)

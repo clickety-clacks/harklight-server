@@ -204,11 +204,15 @@ defmodule AttentionServer.HeadlessDeviceTest do
 
   test "device CLI no longer exposes the agent send or receipt commands" do
     assert_raise Mix.Error, ~r/use read or respond/, fn ->
-      AttentionServer.CLI.Device.run(["send"])
+      AttentionServer.CLI.with_io(Mix.Shell.Process, Mix.Error, fn ->
+        AttentionServer.CLI.Device.run(["send"])
+      end)
     end
 
     assert_raise Mix.Error, ~r/use read or respond/, fn ->
-      AttentionServer.CLI.Device.run(["receipt"])
+      AttentionServer.CLI.with_io(Mix.Shell.Process, Mix.Error, fn ->
+        AttentionServer.CLI.Device.run(["receipt"])
+      end)
     end
 
     refute function_exported?(HeadlessDevice, :send_message, 3)
