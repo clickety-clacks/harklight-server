@@ -7,15 +7,13 @@ description: Send a request through an existing Harklight sender grant and keep 
 # Send and listen with Harklight
 
 Use the `harklight-agent` host CLI and the existing enrolled device identity.
-The CLI is released from <https://github.com/clickety-clacks/harklight-agent>;
-install it with `brew install clickety-clacks/tap/harklight-agent` or from that
-repository's release tarballs. The server package does not bundle it. The CLI
-does not enroll devices, request sender grants, add trust roots, or start a
-replacement agent. Ask the operator for the existing identity directory, CA
-file and origin HTTPS port when those values are not already configured. The
-sender ID must already be granted to this device. See the CLI's README in that
-repository for file attachments, retries, the disposable integration fixture
-and the full command reference.
+The CLI is released separately from <https://github.com/clickety-clacks/harklight-agent>;
+the server package does not bundle it. Installation remains a separately
+authorized operation. Use its current release documentation for packaging.
+The CLI does not enroll devices, request sender grants, add trust roots, or
+start a replacement agent. Resolve the originating host's existing identity directory, CA file and origin
+HTTPS port with the service owner when they are not already configured. Do not
+create another identity, transfer a grant or copy a private key to make it work. The sender ID must already be granted to this device.
 
 The CLI uses the configured origin HTTPS endpoint. Its port is distinct from
 the relay port and is never inferred from it. Set `--origin-port` or
@@ -29,20 +27,22 @@ printed by the CLI:
 
 ```sh
 harklight-agent send --session new --sender-id app:example \
-  --route claude-code \
+  --route "$HARKLIGHT_ROUTE" \
   --title "Choose the next step" --body "Pick one option or write a note."
 ```
 
+Set `HARKLIGHT_ROUTE` to the actual `claude-code`, `codex` or `other` route.
 The route is required when creating the handle and becomes part of that
-handle's server support record. For another request using the same handle,
+handle's server support record. A Hosted Claude SDK session is not
+an interactive Claude Code terminal. Sending does not establish listening. For another request using the same handle,
 omit `--route` so the route record stays attached to that handle.
 
 If the harness exposes its exact session or thread ID through a documented
 interface, it may be supplied as `--vendor-session-id`. Do not infer one from
 a display name or use it as proof that the harness received a turn.
 
-Arm a `listen --next` waiter in the same turn as every successful send. For a
-local interactive Claude Code terminal, run it as a background Bash command so
+For a supported local interactive Claude Code terminal, arm a `listen --next`
+waiter in the same turn as a successful send. Run it as a background Bash command so
 it remains held on the Harklight SSE stream while the session is idle:
 
 ```sh
@@ -55,6 +55,42 @@ harklight-agent listen --next --session "$HARKLIGHT_SESSION" \
 Do not substitute `listen --follow` for this Claude Code waiter pattern. A
 follow process writes continuously, while the blocking mode prints one pending
 entry and exits so the session can handle it and arm the next waiter.
+
+## Unsupported listening
+
+Use the same handle and real session context when checking support. For a hosted
+Claude SDK session, this command records the interactive-session limitation and
+attaches no stream:
+
+```sh
+harklight-agent listen --next --session "$HARKLIGHT_SESSION" --session-context sdk
+```
+
+For a Codex handle, `listen --next --session "$HARKLIGHT_SESSION"` records
+`Codex listening is not supported yet` in the inspected 0.1.1 release. For an
+`other` handle without a controller, it records
+`no controller declared for the other route`. Missing interactive context,
+background tasks or the minimum Claude version also produces its concrete
+`unsupported_reason`. Preserve the returned reason in reporting; there is no
+free-form `--unsupported-reason` flag in that release. Do not supply false
+interactive/background flags to suppress a refusal.
+
+For an `other` route, `send --route other --controller` and
+`listen --follow --controller` declare an existing integration
+that actually delivers events into this originating session. Use those flags
+only when that integration exists. A CLI flag, source
+implementation or installed process alone does not prove that integration. The
+standalone CLI does not supply a managed runtime's wake-on-chat integration. Keep unsupported work
+with its existing task owner; do not add a relay helper, receipt polling,
+replacement sender or fabricated listener. Use the installed integration's
+supported continuation when one exists, and report when none can receive the
+reply automatically. Switch senders only with or after the client's truthful listening-status
+display. Before app compatibility removal, install sender support for `actions/1`
+on every send, then an authorized read-only recount must show no open message
+lacking that schema. No closure or conversion code is built for this cutover;
+any newly found incompatible IDs go to the server/client maintainers. The protocol
+skill describes the only proposed existing-terminal treatment and prohibits every
+conversion, including a one-time client upgrade.
 
 ## Handle each waiter result
 
@@ -167,7 +203,8 @@ and retry that operation with the same key. Do not create a second operation to
 guess whether the first one committed. The CLI reconciles persisted operations
 and feed entries when the listener reconnects.
 
-At the beginning of each later Claude Code turn, check the exact handle:
+At the beginning of each later supported interactive Claude Code turn, check
+the exact handle:
 
 ```sh
 harklight-agent status --session "$HARKLIGHT_SESSION"
@@ -185,7 +222,7 @@ Claude Code's local interactive background Bash commands can continue after a
 final response, but may stop when the session exits, output exceeds 5 GB, or
 macOS/Linux reports critical memory pressure after an idle period. The
 background-completion handoff into the same session remains an unverified
-assumption here: this work has not confirmed it with a real session. Do not claim that a
+assumption here: this work has not confirmed it with a real originating session. Do not claim that a
 running SSE listener or printed line proves Claude Code received a turn. If a
 completion notification is not delivered, treat the turn as queued and use the
 next turn of the same session to rearm; never replace it with timer polling or
@@ -193,16 +230,10 @@ another agent. See the official
 [background command reference](https://code.claude.com/docs/en/tools-reference#background-commands)
 and [interactive mode reference](https://code.claude.com/docs/en/interactive-mode#background-bash-commands).
 
-Codex listening is not supported yet: it needs a confirmed real Codex session
-result first. Do not call `codex queue` or claim that a Codex session received a turn. `status` and
+Codex listening is unsupported in the inspected 0.1.1 release; later support
+requires an installed implementation and real originating-session evidence. Do not
+call `codex queue` or claim that a Codex session received a turn. `status` and
 `listen` report that boundary; sending remains available.
-
-A harness that is neither Claude Code nor Codex can declare its own continuous
-listener by minting the handle with `--route other --controller` on `send` and
-arming it with `listen --follow --controller`. Declaring `--controller` is that
-harness's own statement that it runs and supervises the `--follow` process;
-it is not a stronger delivery guarantee than Claude Code or Codex get. The CLI
-refuses `--controller` without those companion flags before any network call.
 
 Use `--file` with `send`, `reply` or `revise` only when the origin reports file
 limits. The CLI uses the published decoded inline allowance and uploads any
