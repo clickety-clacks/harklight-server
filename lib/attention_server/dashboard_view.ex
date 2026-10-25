@@ -24,7 +24,7 @@ defmodule AttentionServer.DashboardView do
         ~s(<section class="empty"><h2>No devices yet</h2><p>Create a person-bound invitation, then approve the exact request when it appears here.</p></section>)
       else
         ~s(<section><h2>Waiting for approval</h2><ul class="waiting">#{pending}</ul></section>) <>
-          ~s(<section><h2>Devices</h2><table><thead><tr><th>Device</th><th>Person</th><th>Status</th><th>Connection</th></tr></thead><tbody>#{rows}</tbody></table><p class="note">Enrolled means the device's key was approved. It does not say whether the device is reachable. Connection is unknown until the server has a supported presence reading.</p></section>)
+          ~s(<section><h2>Devices</h2><table><thead><tr><th>Device</th><th>Person</th><th>Status</th><th>Connection</th><th>Action</th></tr></thead><tbody>#{rows}</tbody></table><p class="note">Enrolled means the device's key was approved. It does not say whether the device is reachable. Connection is unknown until the server has a supported presence reading.</p></section>)
       end
 
     invitation_action =
@@ -179,6 +179,18 @@ defmodule AttentionServer.DashboardView do
     layout(person, "Review device", body, chrome)
   end
 
+  def remove_device_confirmation(person, device, chrome \\ []) do
+    label = escape(device[:label] || device["label"] || "Unnamed device")
+    device_id = escape(device[:device_id] || device["device_id"] || "")
+
+    body =
+      ~s(<h1>Remove this device?</h1>) <>
+        ~s(<section><p>Device: <strong>#{label}</strong></p><p>Key fingerprint: <code class="fingerprint">#{device_id}</code></p><p class="notice" role="alert">Removal is permanent. To use this device again, you must enroll it again.</p><form action="/devices/remove/#{device_id}" method="post"><input type="hidden" name="confirm" value="remove"><button class="button danger" type="submit">Remove device permanently</button></form></section>) <>
+        ~s(<p><a href="/devices">Cancel and return to devices</a></p>)
+
+    layout(person, "Remove device", body, chrome)
+  end
+
   defp action_form(code, action, key, deadline, label, grant_senders? \\ false) do
     sender_field =
       if grant_senders? do
@@ -201,9 +213,17 @@ defmodule AttentionServer.DashboardView do
   defp device_row(device) do
     label = escape(device[:label] || device["label"] || "Unnamed device")
     person = escape(device[:person_name] || device["person_name"] || "")
+    device_id = device[:device_id] || device["device_id"]
     status = if device[:revoked] || device["revoked"], do: "Revoked", else: "Enrolled"
 
-    ~s(<tr><td>#{label}</td><td>#{person}</td><td>#{status}</td><td>Unknown</td></tr>)
+    action =
+      if device[:can_revoke] == true and is_binary(device_id) do
+        ~s(<a class="button" href="/devices/remove/#{escape(device_id)}" aria-label="Remove #{label}">Remove</a>)
+      else
+        ""
+      end
+
+    ~s(<tr><td>#{label}</td><td>#{person}</td><td>#{status}</td><td>Unknown</td><td>#{action}</td></tr>)
   end
 
   defp waiting_row(item) do
@@ -251,6 +271,9 @@ defmodule AttentionServer.DashboardView do
   defp css do
     base_css() <>
       ".notice{padding:12px;background:#fff3d8;border-radius:8px}" <>
+      ".notice[role=alert]{color:#6b1717;background:#fff0ef}" <>
+      ".button.danger{background:#a12828}" <>
+      ".fingerprint{overflow-wrap:anywhere;word-break:break-word}" <>
       "label{display:block;margin-top:18px;font-weight:600}" <>
       "input,select{box-sizing:border-box;width:100%;max-width:620px;padding:10px;margin-top:6px;font:inherit;border:1px solid #b9c2cd;border-radius:6px}" <>
       "main{box-sizing:border-box;max-width:100%;min-width:0}" <>

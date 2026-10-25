@@ -75,6 +75,21 @@ defmodule AttentionServer.DashboardBackendTest do
     assert other.resp_body =~ person_b
     refute other.resp_body =~ person_a
     assert owner.resp_body =~ "Unknown"
+    assert owner.resp_body =~ ~s(href="/devices/remove/#{device_a}")
+    refute owner.resp_body =~ ~s(href="/devices/remove/#{device_b}")
+    assert other.resp_body =~ ~s(href="/devices/remove/#{device_b}")
+    refute other.resp_body =~ ~s(href="/devices/remove/#{device_a}")
+
+    cross_person_confirmation =
+      %{
+        Plug.Test.conn(:get, "/devices/remove/#{device_b}")
+        | scheme: :https,
+          path_info: ["devices", "remove", device_b]
+      }
+      |> Plug.Conn.put_req_header("cookie", "__Host-harklight=#{cookie_a}")
+      |> DashboardReadHTTP.call(opts)
+
+    assert cross_person_confirmation.status == 404
 
     replacement = TLSFixtures.certificate_der!(certs, "a2")
     :ok = Relay.operator_recover(relay, person_a, replacement)
@@ -126,6 +141,94 @@ defmodule AttentionServer.DashboardBackendTest do
 
     assert (request_post(token, "https://www.example.com") |> DashboardReadHTTP.call(opts)).status ==
              401
+  end
+
+  test "signed-in owner confirms removal, sees revoked state, and the removed device is refused" do
+    certs = TLSFixtures.create!()
+    on_exit(fn -> File.rm_rf!(certs) end)
+    {:ok, relay} = Relay.start_link()
+    owner_cert = TLSFixtures.certificate_der!(certs, "a1")
+    {:ok, person} = Relay.operator_bootstrap(relay, owner_cert)
+    {:ok, owner_key} = DeviceIdentity.from_certificate(owner_cert)
+    device_key = String.duplicate("c", 64)
+    :ok = Relay.setup_device(relay, person, device_key)
+
+    {:ok, sessions} =
+      DashboardBrowserSession.start_link(
+        relay: relay,
+        consume: fn token -> Relay.consume_browser_sign_in(relay, token) end
+      )
+
+    backend = %DashboardBackend{relay: relay, sessions: sessions, configured_owner_person: person}
+    opts = DashboardReadHTTP.init(backend: {DashboardBackend, backend}, skill_path: "/unused")
+    {:ok, credential} = Relay.owner_browser_sign_in_create(relay, person, owner_key)
+
+    sign_in =
+      request_post(credential["sign_in_token"], "https://www.example.com")
+      |> DashboardReadHTTP.call(opts)
+
+    [set_cookie] = Plug.Conn.get_resp_header(sign_in, "set-cookie")
+    [_, cookie] = Regex.run(~r/__Host-harklight=([^;]+)/, set_cookie)
+
+    devices = request(cookie) |> DashboardReadHTTP.call(opts)
+    assert devices.resp_body =~ ~s(href="/devices/remove/#{device_key}")
+    refute :sys.get_state(relay).store.engine.devices[device_key].revoked
+
+    confirmation =
+      %{
+        Plug.Test.conn(:get, "/devices/remove/#{device_key}")
+        | scheme: :https,
+          path_info: ["devices", "remove", device_key]
+      }
+      |> Plug.Conn.put_req_header("cookie", "__Host-harklight=#{cookie}")
+      |> DashboardReadHTTP.call(opts)
+
+    assert confirmation.status == 200
+    assert confirmation.resp_body =~ "Key fingerprint:"
+    assert confirmation.resp_body =~ device_key
+    assert confirmation.resp_body =~ "Removal is permanent."
+    refute :sys.get_state(relay).store.engine.devices[device_key].revoked
+
+    cross_origin_post =
+      owner_post(
+        "/devices/remove/#{device_key}",
+        "confirm=remove",
+        cookie,
+        "https://other.example"
+      )
+      |> DashboardReadHTTP.call(opts)
+
+    assert cross_origin_post.status == 409
+    refute :sys.get_state(relay).store.engine.devices[device_key].revoked
+
+    removed =
+      owner_post("/devices/remove/#{device_key}", "confirm=remove", cookie)
+      |> DashboardReadHTTP.call(opts)
+
+    assert removed.status == 303
+    assert Plug.Conn.get_resp_header(removed, "location") == ["/devices"]
+    assert :sys.get_state(relay).store.engine.devices[device_key].revoked
+
+    refreshed = request(cookie) |> DashboardReadHTTP.call(opts)
+    assert refreshed.status == 200
+    assert refreshed.resp_body =~ "Revoked</td>"
+    refute refreshed.resp_body =~ ~s(href="/devices/remove/#{device_key}")
+
+    forward = %{
+      "v" => 1,
+      "type" => "forward",
+      "op_id" => "00000000-0000-4000-8000-0000000000e1",
+      "message" => %{
+        "sender_id" => "app:test",
+        "message_id" => "revoked-device-send",
+        "created_at" => 1,
+        "title" => "Revoked device",
+        "unknown" => %{"text" => "must be refused"}
+      }
+    }
+
+    assert {:error, :forbidden} =
+             Relay.request_line(relay, device_key, JSON.encode!(forward) <> "\n")
   end
 
   test "signed-in owner preserves invitation approval and grants sender rights during CLI approval" do
