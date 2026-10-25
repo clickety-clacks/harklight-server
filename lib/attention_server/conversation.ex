@@ -132,6 +132,13 @@ defmodule AttentionServer.Conversation do
     end
   end
 
+  def chat_open?(%{terminal: nil}), do: true
+  def chat_open?(%{terminal: %{state: "answered"}}), do: true
+  def chat_open?(_), do: false
+
+  defp channel(%{"kind" => "terminal", "terminal_state" => "answered"}), do: "reply"
+  defp channel(_), do: "chat"
+
   def on_terminal(engine, person, record, {_, sender, message_id}, terminal) do
     if is_nil(Map.get(record, :session_handle)) do
       {engine, nil}
@@ -178,6 +185,7 @@ defmodule AttentionServer.Conversation do
             Enum.map((since + 1)..feed.high, fn seq ->
               entry = Map.fetch!(feed.entries, seq)
               key = {person, origin, seq}
+              entry = Map.put(entry, "channel", channel(entry))
 
               if actionable?(entry) do
                 receipt = Map.get(engine.origin_receipts, key)
@@ -360,6 +368,21 @@ defmodule AttentionServer.Conversation do
           end)
           |> MapSet.size()
 
+        open_chats =
+          feed.entries
+          |> Enum.reduce(MapSet.new(), fn {_seq, entry}, requests ->
+            request_key = {person, entry["sender_id"], entry["message_id"]}
+            record = Map.get(engine.messages, request_key)
+
+            if (entry["session_handle"] == handle and record) && record.origin == origin &&
+                 chat_open?(record) do
+              MapSet.put(requests, request_key)
+            else
+              requests
+            end
+          end)
+          |> MapSet.size()
+
         {undelivered, delivered_unacted} =
           Enum.reduce(feed.entries, {0, 0}, fn {seq, entry}, {queued, waiting} ->
             if entry["session_handle"] == handle and actionable?(entry) do
@@ -414,6 +437,7 @@ defmodule AttentionServer.Conversation do
            "open_requests" => open_requests,
            "pending_undelivered" => undelivered,
            "pending_delivered_unacted" => delivered_unacted,
+           "open_chats" => open_chats,
            "cursor" => feed.high
          }}
     end
@@ -466,7 +490,7 @@ defmodule AttentionServer.Conversation do
 
   defp needs_action?(engine, person, %{"kind" => "discussion"} = entry) do
     case Map.get(engine.messages, {person, entry["sender_id"], entry["message_id"]}) do
-      %{terminal: nil} -> true
+      record when is_map(record) -> chat_open?(record)
       _ -> false
     end
   end
@@ -480,7 +504,12 @@ defmodule AttentionServer.Conversation do
     key = {person, origin}
     feed = Map.get(engine.origin_feeds, key, %{high: 0, entries: %{}})
     seq = feed.high + 1
-    item = Map.merge(entry, %{"feed_seq" => seq, "event_id" => Integer.to_string(seq)})
+
+    item =
+      entry
+      |> Map.put("channel", channel(entry))
+      |> Map.merge(%{"feed_seq" => seq, "event_id" => Integer.to_string(seq)})
+
     updated = %{feed | high: seq, entries: Map.put(feed.entries, seq, item)}
     {%{engine | origin_feeds: Map.put(engine.origin_feeds, key, updated)}, item}
   end
