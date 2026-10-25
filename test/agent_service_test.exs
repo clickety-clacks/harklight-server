@@ -36,8 +36,14 @@ defmodule AttentionServer.AgentServiceTest do
     {:ok, agent} = listener(AgentTLS, relay, certs)
     {:ok, agent_https} = listener(AgentHTTPS, relay, certs)
 
+    processes = [agent_https, agent, owner, relay]
+
+    # The on_exit callback runs outside this setup process. Unlink fixtures so
+    # their explicit shutdown does not race with the test process exiting.
+    Enum.each(processes, &Process.unlink/1)
+
     on_exit(fn ->
-      for pid <- [agent_https, agent, owner, relay], Process.alive?(pid), do: GenServer.stop(pid)
+      for pid <- processes, Process.alive?(pid), do: GenServer.stop(pid)
     end)
 
     %{relay: relay, owner: owner, agent: agent, agent_https: agent_https, path: path}

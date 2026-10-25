@@ -280,8 +280,14 @@ defmodule AttentionServer.WebSocketRelayTest do
 
     assert {[
               %{"type" => "delivery", "message" => ^message},
-              %{"type" => "lifecycle", "message_id" => "one", "answer" => "kept"}
+              %{
+                "type" => "lifecycle",
+                "message_id" => "one",
+                "state" => "answered"
+              } = lifecycle
             ], %{"seq" => 2}} = resync(a2)
+
+    refute Map.has_key?(lifecycle, "answer")
 
     :ssl.close(a1)
     :ssl.close(a2)
