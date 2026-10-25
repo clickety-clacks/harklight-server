@@ -1128,6 +1128,167 @@ defmodule AttentionServer.ConversationFeedTest do
     GenServer.stop(relay)
   end
 
+  test "one origin stream labels reply and chat while chat remains open after answer and no-comment",
+       %{path: path} do
+    assert {:ok, relay} = Relay.start_link(store_path: path)
+    assert :ok = Relay.setup_person(relay, "A")
+    assert :ok = Relay.setup_device(relay, "A", "origin")
+    assert :ok = Relay.setup_device(relay, "A", "reader")
+    assert :ok = Relay.setup_sender(relay, "origin", "app:test")
+
+    for {message_id, title, operation} <- [
+          {"answered-chat", "Answer this?", 801},
+          {"no-comment-chat", "Skip this answer?", 802}
+        ] do
+      assert %{"type" => "ok"} =
+               request(relay, "origin", %{
+                 "type" => "forward",
+                 "op_id" => op(operation),
+                 "session_handle" => @handle,
+                 "message" => %{
+                   "sender_id" => "app:test",
+                   "message_id" => message_id,
+                   "created_at" => operation,
+                   "title" => title
+                 }
+               })
+    end
+
+    assert :ok = Relay.origin_stream_attach(relay, "origin", @handle, self())
+
+    assert %{"type" => "ok", "seq" => 3} =
+             request(relay, "reader", %{
+               "type" => "answer",
+               "op_id" => op(803),
+               "sender_id" => "app:test",
+               "message_id" => "answered-chat",
+               "request_revision" => 1,
+               "answer" => "Yes"
+             })
+
+    assert_receive {:origin_state_changed, 3}
+
+    assert %{"type" => "ok", "seq" => 4, "terminal_kind" => "no_comment"} =
+             no_comment_request(relay, "reader", %{
+               "type" => "answer_no_comment",
+               "request_id" => "no-comment-chat",
+               "request_revision" => 1
+             })
+
+    assert_receive {:origin_state_changed, 4}
+
+    assert {:ok, status} = Relay.origin_status(relay, "origin", @handle)
+    assert status["open_requests"] == 0
+    assert status["open_chats"] == 2
+
+    assert %{"type" => "ok", "event_id" => "5"} =
+             request(relay, "reader", %{
+               "type" => "discussion",
+               "op_id" => op(804),
+               "sender_id" => "app:test",
+               "message_id" => "answered-chat",
+               "request_revision" => 1,
+               "text" => "Can we discuss that answer?"
+             })
+
+    assert_receive {:origin_state_changed, 5}
+
+    assert %{"type" => "ok", "event_id" => "6"} =
+             request(relay, "origin", %{
+               "type" => "conversation_reply",
+               "op_id" => op(805),
+               "sender_id" => "app:test",
+               "message_id" => "answered-chat",
+               "request_revision" => 1,
+               "in_reply_to" => 5,
+               "text" => "Yes, here is more detail."
+             })
+
+    assert_receive {:origin_state_changed, 6}
+
+    assert %{"type" => "ok", "event_id" => "7"} =
+             request(relay, "reader", %{
+               "type" => "discussion",
+               "op_id" => op(806),
+               "sender_id" => "app:test",
+               "message_id" => "no-comment-chat",
+               "request_revision" => 1,
+               "text" => "Can I explain why I chose no comment?"
+             })
+
+    assert_receive {:origin_state_changed, 7}
+
+    assert %{"type" => "ok", "event_id" => "8"} =
+             request(relay, "origin", %{
+               "type" => "conversation_reply",
+               "op_id" => op(807),
+               "sender_id" => "app:test",
+               "message_id" => "no-comment-chat",
+               "request_revision" => 1,
+               "in_reply_to" => 7,
+               "text" => "Of course; what would you like to explain?"
+             })
+
+    assert_receive {:origin_state_changed, 8}
+
+    assert {:ok, %{"cursor" => 8, "entries" => entries}} = Relay.origin_feed(relay, "origin", 0)
+
+    assert Enum.map(entries, & &1["channel"]) == [
+             "reply",
+             "reply",
+             "reply",
+             "reply",
+             "chat",
+             "chat",
+             "chat",
+             "chat"
+           ]
+
+    reply_entries = Enum.filter(entries, &(&1["channel"] == "reply"))
+
+    assert Enum.map(reply_entries, & &1["kind"]) == [
+             "revision",
+             "revision",
+             "terminal",
+             "terminal"
+           ]
+
+    terminal_entries = Enum.filter(reply_entries, &(&1["kind"] == "terminal"))
+
+    assert Enum.all?(terminal_entries, &(&1["terminal_state"] == "answered"))
+
+    assert Enum.find(terminal_entries, &(&1["message_id"] == "answered-chat"))["answer"] ==
+             "Yes"
+
+    no_comment = Enum.find(terminal_entries, &(&1["message_id"] == "no-comment-chat"))
+    assert no_comment["terminal_kind"] == "no_comment"
+    refute Map.has_key?(no_comment, "answer")
+
+    chat_entries = Enum.filter(entries, &(&1["channel"] == "chat"))
+
+    refute Enum.any?(
+             chat_entries,
+             &(&1["kind"] == "terminal" and &1["terminal_state"] == "answered")
+           )
+
+    assert Enum.all?(chat_entries, &(&1["kind"] in ["discussion", "reply"]))
+
+    assert Enum.map(Enum.filter(chat_entries, &(&1["kind"] == "discussion")), & &1["text"]) == [
+             "Can we discuss that answer?",
+             "Can I explain why I chose no comment?"
+           ]
+
+    assert Enum.map(Enum.filter(chat_entries, &(&1["kind"] == "reply")), & &1["text"]) == [
+             "Yes, here is more detail.",
+             "Of course; what would you like to explain?"
+           ]
+
+    assert {:ok, conversation_events, _high} = Relay.conversation_events(relay, "reader", 0)
+    refute Enum.any?(conversation_events, &Map.has_key?(&1, "answer"))
+
+    GenServer.stop(relay)
+  end
+
   test "origin withdrawal acts on a named turn and closes once without a second answer", %{
     path: path
   } do
@@ -1250,6 +1411,7 @@ defmodule AttentionServer.ConversationFeedTest do
 
     assert discussion["acted"] == true
     assert terminal["kind"] == "terminal"
+    assert terminal["channel"] == "reply"
     assert terminal["author"] == "origin"
     assert terminal["terminal_state"] == "retracted"
     assert terminal["retracted_at"] == retracted_at

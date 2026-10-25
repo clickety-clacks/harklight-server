@@ -4001,6 +4001,18 @@ defmodule AttentionServer.Relay do
           "forward" ->
             {person, key}
 
+          "answer_no_comment" ->
+            request_id = Map.get(request, "request_id")
+
+            matches =
+              for {{^person, _sender, ^request_id} = message_key, record} <- engine.messages,
+                  do: {message_key, record}
+
+            case matches do
+              [{{^person, _sender, ^request_id}, %{origin: origin}}] -> {person, origin}
+              _ -> nil
+            end
+
           _ ->
             sender = Map.get(request, "sender_id")
             message_id = Map.get(request, "message_id")
