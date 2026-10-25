@@ -26,6 +26,46 @@ defmodule AttentionServer.DashboardViewTest do
     refute html =~ "<phone>"
   end
 
+  test "only an active device the owner can revoke has a remove action" do
+    owned_key = String.duplicate("a", 64)
+    other_key = String.duplicate("b", 64)
+    revoked_key = String.duplicate("c", 64)
+
+    html =
+      DashboardView.devices(
+        "Mike",
+        [
+          %{device_id: owned_key, can_revoke: true, label: "Mike's tablet", person_name: "Mike"},
+          %{device_id: other_key, can_revoke: false, label: "Other phone", person_name: "Dana"},
+          %{
+            device_id: revoked_key,
+            can_revoke: false,
+            label: "Old phone",
+            person_name: "Mike",
+            revoked: true
+          }
+        ],
+        []
+      )
+
+    assert html =~ ~s(href="/devices/remove/#{owned_key}")
+    refute html =~ ~s(href="/devices/remove/#{other_key}")
+    refute html =~ ~s(href="/devices/remove/#{revoked_key}")
+  end
+
+  test "device removal confirmation names the device, fingerprint and permanent effect" do
+    key = String.duplicate("d", 64)
+
+    html =
+      DashboardView.remove_device_confirmation("Mike", %{device_id: key, label: "Mike's tablet"})
+
+    assert html =~ "Device: <strong>Mike&#39;s tablet</strong>"
+    assert html =~ "Key fingerprint: <code class=\"fingerprint\">#{key}</code>"
+    assert html =~ "Removal is permanent."
+    assert html =~ "you must enroll it again"
+    assert html =~ ~s(<form action="/devices/remove/#{key}" method="post">)
+  end
+
   test "empty device list offers one direct invitation action and links to components" do
     request_id = "123e4567-e89b-42d3-a456-426614174000"
     html = DashboardView.devices("Dana", [], [], request_id)

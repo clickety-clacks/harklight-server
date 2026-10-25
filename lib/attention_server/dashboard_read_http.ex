@@ -183,6 +183,39 @@ defmodule AttentionServer.DashboardReadHTTP do
   end
 
   defp route(
+         %{method: "GET", path_info: ["devices", "remove", device_key]} = conn,
+         opts,
+         principal
+       ) do
+    case removable_device(opts, principal, device_key) do
+      {:ok, device} ->
+        conn
+        |> put_resp_content_type("text/html", "utf-8")
+        |> send_resp(
+          200,
+          DashboardView.remove_device_confirmation(display_name(principal), device, chrome(opts))
+        )
+
+      :error ->
+        send_resp(conn, 404, "Device unavailable")
+    end
+  end
+
+  defp route(
+         %{method: "POST", path_info: ["devices", "remove", device_key]} = conn,
+         opts,
+         principal
+       ) do
+    with {:ok, %{"confirm" => "remove"}, conn} <- form(conn, opts, ~w(confirm)),
+         {:ok, _device} <- removable_device(opts, principal, device_key),
+         :ok <- backend_call(opts.backend, :revoke_device, {principal, device_key}) do
+      conn |> put_resp_header("location", "/devices") |> send_resp(303, "")
+    else
+      _ -> send_resp(conn, 409, "Device changed or unavailable; review it again")
+    end
+  end
+
+  defp route(
          %{method: "GET", request_path: "/prioritization"} = conn,
          %{hosted: false} = opts,
          principal
@@ -436,6 +469,26 @@ defmodule AttentionServer.DashboardReadHTTP do
   end
 
   defp route(conn, _opts, _principal), do: send_resp(conn, 404, "Not found")
+
+  defp removable_device(opts, principal, device_key) do
+    if Regex.match?(~r/\A[0-9a-f]{64}\z/, device_key) do
+      case backend_call(opts.backend, :list_devices, principal) do
+        {:ok, %{devices: devices}} when is_list(devices) ->
+          case Enum.find(devices, fn device ->
+                 Map.get(device, :device_id) == device_key and
+                   Map.get(device, :can_revoke) == true
+               end) do
+            nil -> :error
+            device -> {:ok, device}
+          end
+
+        _ ->
+          :error
+      end
+    else
+      :error
+    end
+  end
 
   defp send_prioritization_page(conn, principal, settings, message, status, opts) do
     conn

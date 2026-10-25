@@ -24,6 +24,15 @@ defmodule AttentionServer.DashboardBackend do
   def list_devices(%__MODULE__{} = backend, %{person_id: person, owner_key: key} = principal) do
     case Relay.dashboard_inventory(backend.relay, person, key, backend.configured_owner_person) do
       {:ok, snapshot} ->
+        devices =
+          Enum.map(snapshot.devices, fn device ->
+            Map.put(
+              device,
+              :can_revoke,
+              device.person_name == person and not device.revoked
+            )
+          end)
+
         waiting =
           Enum.map(snapshot.waiting, fn item ->
             can_review = is_nil(item.person_name) or item.person_name == person
@@ -34,7 +43,12 @@ defmodule AttentionServer.DashboardBackend do
               else: item
           end)
 
-        {:ok, present(%{snapshot | waiting: waiting}, person, Map.get(principal, :display_name))}
+        {:ok,
+         present(
+           %{snapshot | devices: devices, waiting: waiting},
+           person,
+           Map.get(principal, :display_name)
+         )}
 
       error ->
         error
@@ -124,4 +138,10 @@ defmodule AttentionServer.DashboardBackend do
         {%{person_id: person, owner_key: key}, code, expected_key, deadline}
       ),
       do: Relay.owner_pending_decline(relay, person, key, code, expected_key, deadline)
+
+  def revoke_device(
+        %__MODULE__{relay: relay},
+        {%{person_id: person, owner_key: key}, device_key}
+      ),
+      do: Relay.owner_revoke_device(relay, person, key, device_key)
 end
