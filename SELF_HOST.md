@@ -307,48 +307,30 @@ Keep existing provider configuration only when its operation is authorized; a
 setup check with no provider sends must use an isolated state copy and leave
 the APNs variables unset.
 
-## Send and retrieve a real reply from scripts
+## Read and answer a stored message
 
-The packaged `skills/harklight-agent/SKILL.md` gives an agent the supported enrollment, sender-grant, message, receipt and search/response workflow. An agent installing this package can copy its `skills/harklight-agent` folder into its own harness's configured skill directory; the package does not install it there automatically.
+Agents send new messages and listen for replies through the authenticated
+[`harklight-agent` session route](skills/harklight-agent-send-listen/SKILL.md).
+The enrolled-device `read` and `respond` commands remain available for messages
+already stored by the server. They do not create new requests or retrieve an
+origin receipt. Existing messages and their replay events remain in the server
+history; the removed origin-receipt query is no longer available.
 
-Enroll two same-person identities using the commands above: one sender with
-app:reference rights and one receiver. On the receiver machine, use its private
-directory in place of the sender directory in these commands. No Mix is needed.
-Create a real sender document file, for example:
+Use an enrolled device with read/respond access to see its person's stored
+messages:
 
-    printf '%s\n' '{"sender_id":"app:reference","message_id":"request-1","created_at":1,"title":"Choose the next action","body":"Reply with the deliberate answer you want this sender to receive."}' > message.json
+    "$PACKAGE/bin/harklight" device read --directory "$HOME/.local/share/harklight-receiver" --connect "$SERVER_ADDRESS" --name "$SERVER_NAME" --port "$RELAY_PORT" --ca "$CA_PEM"
 
-Send from the enrolled origin:
-
-    "$PACKAGE/bin/harklight" device send --directory "$HOME/.local/share/harklight-sender" --connect 127.0.0.1 --name localhost --port 18443 --ca "$STATE/tls/ca.pem" --message message.json
-
-Read at the receiver with its separate enrolled directory:
-
-    "$PACKAGE/bin/harklight" device read --directory "$HOME/.local/share/harklight-receiver" --connect 127.0.0.1 --name localhost --port 18443 --ca "$STATE/tls/ca.pem"
-
-Supply the deliberate answer as a JSON value, then respond at the receiver:
+To deliberately answer a request already delivered to that device, save one JSON
+value in `answer.json` and provide the exact sender and message ID:
 
     printf '%s\n' '{"choice":"continue","note":null}' > answer.json
-    "$PACKAGE/bin/harklight" device respond --directory "$HOME/.local/share/harklight-receiver" --connect 127.0.0.1 --name localhost --port 18443 --ca "$STATE/tls/ca.pem" --sender app:reference --message-id request-1 --answer answer.json
+    "$PACKAGE/bin/harklight" device respond --directory "$HOME/.local/share/harklight-receiver" --connect "$SERVER_ADDRESS" --name "$SERVER_NAME" --port "$RELAY_PORT" --ca "$CA_PEM" --sender app:example --message-id request-1 --answer answer.json
 
-Retrieve the exact terminal receipt at the origin:
-
-    "$PACKAGE/bin/harklight" device receipt --directory "$HOME/.local/share/harklight-sender" --connect 127.0.0.1 --name localhost --port 18443 --ca "$STATE/tls/ca.pem" --sender app:reference --message-id request-1
-
-Receipt remains pending until a terminal event is committed. Send/respond keep
-their exact operation IDs in the identity directory for retry after a lost reply.
-Read stores replay events before ACK. Keep the private identity/state directory
-intact; do not create fresh operations to conceal uncertainty. These commands
-also remain available to source developers as mix attention.device.
-
-For a tailnet box use its tailnet address and exact certificate hostname in
---connect/--name and copy only the public trust root to each peer. Enrollment,
-sender rights and receiver authority remain independent of tailnet membership.
-
-Pending, relay acceptance, device application and the sender's terminal receipt
-remain distinct. A response does not execute a source action or authorize
-external operations. Use a supported answer UI when sending to the native app;
-the packaged agent skill includes an example. Unknown UI remains unsupported.
+The read command stores replayed events before ACK. A response is deliberate and
+terminal; it does not execute a source action or authorize external operations.
+Use a supported answer UI when reading through the native app. Unknown UI
+remains unsupported.
 
 ## Authorized-agent tools remain available
 

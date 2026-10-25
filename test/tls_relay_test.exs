@@ -85,6 +85,14 @@ defmodule AttentionServer.TLSRelayTest do
 
   defp send_raw_frame(socket, frame), do: :ssl.send(socket, JSON.encode!(frame) <> "\n")
 
+  defp stored_request(relay, key, frame) do
+    assert {:ok, line} =
+             Relay.request_line(relay, key, JSON.encode!(Map.put_new(frame, "v", 1)) <> "\n")
+
+    assert {:ok, response} = JSON.decode_line(line)
+    response
+  end
+
   defp read_frame(socket, timeout \\ 2_000) do
     assert {:ok, line} = :ssl.recv(socket, 0, timeout)
     assert {:ok, frame} = JSON.decode_line(line)
@@ -122,8 +130,9 @@ defmodule AttentionServer.TLSRelayTest do
     }
   end
 
-  test "real TLS 1.3 peers isolate tenants and wait for first resync before push", ctx do
-    %{certs: certs, tls: tls, keys: keys} = ctx
+  test "TLS device sessions reject legacy sender commands and keep stored history readable",
+       ctx do
+    %{certs: certs, tls: tls, relay: relay, keys: keys} = ctx
     assert {:ok, a1} = connect(tls, certs, "a1")
     assert {:ok, a2} = connect(tls, certs, "a2")
     assert {:ok, b1} = connect(tls, certs, "b1")
@@ -134,26 +143,50 @@ defmodule AttentionServer.TLSRelayTest do
     assert :ok =
              send_frame(a1, %{
                "type" => "forward",
+               "op_id" => op(900),
+               "message" => message("not accepted"),
+               "ref" => "legacy-send"
+             })
+
+    assert %{"type" => "error", "reason" => "unknown_type", "ref" => "legacy-send"} =
+             read_frame(a1)
+
+    assert :ok =
+             send_frame(a1, %{
+               "type" => "answer_receipt",
+               "receipt_version" => 1,
+               "sender_id" => "app:test",
+               "message_id" => "same",
+               "terminal_seq" => 1,
+               "ref" => "legacy-receipt"
+             })
+
+    assert %{"type" => "error", "reason" => "unknown_type", "ref" => "legacy-receipt"} =
+             read_frame(a1)
+
+    assert {:ok, [], 0} = Relay.events(relay, keys["a1"], 0)
+
+    assert %{"type" => "ok", "seq" => 1} =
+             stored_request(relay, keys["a1"], %{
+               "type" => "forward",
                "op_id" => op(1),
                "message" => message("A secret"),
                "person_id" => "B",
                "device_id" => keys["b1"]
              })
 
-    assert %{"type" => "ok", "seq" => 1} = read_frame(a1)
     assert %{"type" => "delivery", "seq" => 1, "origin" => origin} = read_frame(a1)
     assert origin == keys["a1"]
     assert {:error, :timeout} = :ssl.recv(a2, 0, 200)
     assert {[%{"message" => %{"title" => "A secret"}}], %{"seq" => 1}} = resync(a2)
 
-    assert :ok =
-             send_frame(b1, %{
+    assert %{"type" => "ok", "seq" => 1} =
+             stored_request(relay, keys["b1"], %{
                "type" => "forward",
                "op_id" => op(1),
                "message" => message("B secret")
              })
 
-    assert %{"type" => "ok", "seq" => 1} = read_frame(b1)
     assert %{"type" => "delivery", "seq" => 1, "origin" => b_origin} = read_frame(b1)
     assert b_origin == keys["b1"]
     assert {:error, :timeout} = :ssl.recv(a2, 0, 200)
@@ -164,7 +197,7 @@ defmodule AttentionServer.TLSRelayTest do
     :ssl.close(b1)
   end
 
-  test "revision-bound No comment finalizes choice and reply-only requests without an answer payload",
+  test "revision-bound No comment finalizes stored choice and reply-only requests without a payload",
        ctx do
     %{certs: certs, tls: tls, relay: relay, keys: keys} = ctx
     assert {:ok, sender} = connect(tls, certs, "a1")
@@ -183,10 +216,13 @@ defmodule AttentionServer.TLSRelayTest do
       |> Map.put("message_id", "choice-request")
       |> Map.put("answer_ui", %{"kind" => "choice", "items" => ["yes", "no"]})
 
-    assert :ok =
-             send_frame(sender, %{"type" => "forward", "op_id" => op(501), "message" => choice})
+    assert %{"type" => "ok", "seq" => 1} =
+             stored_request(relay, keys["a1"], %{
+               "type" => "forward",
+               "op_id" => op(501),
+               "message" => choice
+             })
 
-    assert %{"type" => "ok", "seq" => 1} = read_frame(sender)
     assert %{"type" => "delivery", "message_id" => "choice-request"} = read_frame(sender)
     assert %{"type" => "delivery", "message_id" => "choice-request"} = read_frame(person)
 
@@ -200,17 +236,6 @@ defmodule AttentionServer.TLSRelayTest do
              })
 
     assert %{"type" => "error", "reason" => "invalid_field"} = read_frame(person)
-
-    assert :ok =
-             send_frame(sender, %{
-               "type" => "answer_receipt",
-               "receipt_version" => 1,
-               "sender_id" => "app:test",
-               "message_id" => "choice-request",
-               "terminal_seq" => 2
-             })
-
-    assert %{"type" => "ok", "status" => "pending"} = read_frame(sender)
 
     # The old two-field frame has no revision identity and receives no grace period.
     assert :ok =
@@ -244,21 +269,6 @@ defmodule AttentionServer.TLSRelayTest do
     assert choice_sender_terminal["terminal_kind"] == "no_comment"
     refute Map.has_key?(choice_sender_terminal, "answer")
 
-    receipt = %{
-      "type" => "answer_receipt",
-      "receipt_version" => 1,
-      "sender_id" => "app:test",
-      "message_id" => "choice-request",
-      "terminal_seq" => 2
-    }
-
-    assert :ok = send_frame(sender, receipt)
-    assert %{"type" => "ok", "receipt" => proof} = read_frame(sender)
-    assert proof["state"] == "answered"
-    assert proof["terminal_kind"] == "no_comment"
-    assert proof["has_answer"] == false
-    refute Map.has_key?(proof, "answer")
-
     # Repeating the exact revision-bound action returns the existing final cursor.
     assert :ok =
              send_raw_frame(person, %{
@@ -279,14 +289,13 @@ defmodule AttentionServer.TLSRelayTest do
       |> Map.put("message_id", "reply-only-request")
       |> Map.put("body", "Please write a response")
 
-    assert :ok =
-             send_frame(sender, %{
+    assert %{"type" => "ok", "seq" => 3} =
+             stored_request(relay, keys["a1"], %{
                "type" => "forward",
                "op_id" => op(502),
                "message" => reply_only
              })
 
-    assert %{"type" => "ok", "seq" => 3} = read_frame(sender)
     assert %{"type" => "delivery", "message_id" => "reply-only-request"} = read_frame(sender)
     assert %{"type" => "delivery", "message_id" => "reply-only-request"} = read_frame(person)
 
@@ -452,14 +461,13 @@ defmodule AttentionServer.TLSRelayTest do
     assert {:ok, a2} = connect(tls, certs, "a2")
     assert {[], %{"seq" => 0}} = resync(a1)
 
-    assert :ok =
-             send_frame(a1, %{
+    assert %{"type" => "ok", "seq" => 1} =
+             stored_request(relay, keys["a1"], %{
                "type" => "forward",
                "op_id" => op(99),
                "message" => message("durable")
              })
 
-    assert %{"type" => "ok", "seq" => 1} = read_frame(a1)
     assert %{"type" => "delivery", "seq" => 1} = read_frame(a1)
     assert {:error, :timeout} = :ssl.recv(a2, 0, 200)
     assert :ok = Relay.revoke_device(relay, keys["a2"])
@@ -497,14 +505,13 @@ defmodule AttentionServer.TLSRelayTest do
     assert {[], %{"seq" => 0}} = resync(a1)
     assert {[], %{"seq" => 0}} = resync(a2)
 
-    assert :ok =
-             send_frame(a1, %{
+    assert %{"type" => "ok", "seq" => 1} =
+             stored_request(relay, keys["a1"], %{
                "type" => "forward",
                "op_id" => op(201),
                "message" => message("before stop")
              })
 
-    assert %{"type" => "ok", "seq" => 1} = read_frame(a1)
     assert %{"type" => "delivery", "seq" => 1} = read_frame(a1)
     assert %{"type" => "delivery", "seq" => 1} = read_frame(a2)
 
@@ -537,21 +544,21 @@ defmodule AttentionServer.TLSRelayTest do
     assert is_nil(:sys.get_state(relay).store.engine.messages[{"A", "app:test", "same"}].terminal)
   end
 
-  test "authenticated TLS origin alone obtains winner proof and delegated source reports", ctx do
+  test "stored messages remain answerable without legacy receipts or delegated source reports",
+       ctx do
     %{certs: certs, tls: tls, relay: relay, keys: keys} = ctx
     assert {:ok, a1} = connect(tls, certs, "a1")
     assert {:ok, a2} = connect(tls, certs, "a2")
     assert {[], %{"seq" => 0}} = resync(a1)
     assert {[], %{"seq" => 0}} = resync(a2)
 
-    assert :ok =
-             send_frame(a1, %{
+    assert %{"type" => "ok", "seq" => 1} =
+             stored_request(relay, keys["a1"], %{
                "type" => "forward",
                "op_id" => op(401),
                "message" => message("PRIVATE SOURCE CONTENT")
              })
 
-    assert %{"type" => "ok", "seq" => 1} = read_frame(a1)
     assert %{"type" => "delivery"} = read_frame(a1)
     assert %{"type" => "delivery"} = read_frame(a2)
 
@@ -564,9 +571,9 @@ defmodule AttentionServer.TLSRelayTest do
     }
 
     assert :ok = send_frame(a1, query)
-    assert %{"type" => "ok", "status" => "pending"} = read_frame(a1)
+    assert %{"type" => "error", "reason" => "unknown_type"} = read_frame(a1)
     assert :ok = send_frame(a2, query)
-    assert %{"type" => "error", "reason" => "not_found"} = read_frame(a2)
+    assert %{"type" => "error", "reason" => "unknown_type"} = read_frame(a2)
 
     assert :ok =
              send_frame(a2, %{
@@ -581,20 +588,7 @@ defmodule AttentionServer.TLSRelayTest do
     assert %{"type" => "lifecycle", "seq" => 2} = read_frame(a2)
     assert %{"type" => "lifecycle", "seq" => 2} = read_frame(a1)
     assert :ok = send_frame(a1, query)
-    assert %{"type" => "ok", "receipt" => proof} = read_frame(a1)
-
-    assert proof["actor"] == %{
-             "kind" => "device",
-             "id" => keys["a2"],
-             "key_fingerprint" => keys["a2"]
-           }
-
-    assert proof["terminal_kind"] == "answer"
-
-    assert proof["has_answer"] == true and Map.has_key?(proof, "answer") and
-             is_nil(proof["answer"])
-
-    refute String.contains?(JSON.encode!(proof), "PRIVATE SOURCE CONTENT")
+    assert %{"type" => "error", "reason" => "unknown_type"} = read_frame(a1)
 
     bind = %{
       "type" => "source_bind",

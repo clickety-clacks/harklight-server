@@ -259,7 +259,7 @@ defmodule AttentionServer.EnrollmentReadbackTest do
     assert %{"proof" => %{"state" => "revoked", "enrollment_revision" => 2}} =
              readback(relay, a1, grant, "source-X", exact)
 
-    assert %{"receipt" => receipt} =
+    assert %{"type" => "error", "reason" => "unknown_type"} =
              wire(relay, a1, %{
                "type" => "answer_receipt",
                "receipt_version" => 1,
@@ -268,14 +268,10 @@ defmodule AttentionServer.EnrollmentReadbackTest do
                "terminal_seq" => 2
              })
 
-    assert receipt["actor"] == %{
-             "kind" => "device",
-             "id" => a2,
-             "key_fingerprint" => a2
-           }
-
-    assert receipt["has_answer"] == true and receipt["answer"] == "yes"
-    refute Map.has_key?(receipt, "source_mapping")
+    assert {:ok, [delivery, lifecycle], 2} = Relay.events(relay, a1, 0)
+    assert delivery["message_id"] == "historical"
+    assert lifecycle["message_id"] == "historical"
+    assert lifecycle["answer"] == "yes"
   end
 
   test "owner-management fixture is unavailable on a normal Relay", %{relay: _relay} do

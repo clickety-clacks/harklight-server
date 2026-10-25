@@ -1,16 +1,18 @@
 ---
 name: harklight-agent
 version: "0.1.0"
-description: "Operate a self-hosted Harklight server from an agent or script: enroll a sender device, send a message, read its reply, or use separately granted agent search and response tools."
+description: "Understand Harklight session messages, explicitly authorized enrollment, and separately granted search and response tools."
 ---
 
-# Operate Harklight
+# Harklight identities and session messages
 
-Use the `bin/harklight` shipped with the server package. Ask the Harklight operator for the server address, certificate hostname, public CA certificate, person account and the sender ID you are allowed to use. Verify the CA through the operator's trusted channel; a URL or tailnet connection alone does not establish account trust. Keep identity directories private. The server package's `SELF_HOST.md` covers setup and port exposure; find it alongside `bin/harklight` in that package, even if this skill has been copied into a harness.
+Agent sends use only the `harklight-agent` session CLI. The server package's
+`bin/harklight` is for separately authorized enrollment and administration.
+Do not start enrollment or change grants merely because a send is blocked. Ask the Harklight operator for the server address, certificate hostname, public CA certificate, person account and the sender ID you are allowed to use. Verify the CA through the operator's trusted channel; a URL or tailnet connection alone does not establish account trust. Keep identity directories private. The server package's `SELF_HOST.md` covers setup and port exposure; find it alongside `bin/harklight` in that package, even if this skill has been copied into a harness.
 
 ## Choose the right identity
 
-An enrolled **device identity** can send under an exact sender grant, read its own person inbox and retrieve an origin-only terminal receipt. It does not become an owner or gain every sender ID. The current headless enrollment command creates this identity locally. The authorized person owner approves its displayed code and public-key fingerprint. For a sender, the owner grants the chosen ID during approval with `--senders`, or later with `owner grant-sender --device FINGERPRINT --sender ID`. Omit sender grants for a read/respond-only device.
+An enrolled **device identity** can send under an exact sender grant, read its own person inbox and use the origin session feed for its own sent requests. It does not become an owner or gain every sender ID. The current headless enrollment command creates this identity locally. The authorized person owner approves its displayed code and public-key fingerprint. For a sender, the owner grants the chosen ID during approval with `--senders`, or later with `owner grant-sender --device FINGERPRINT --sender ID`. Omit sender grants for a read/respond-only device.
 
 For example, on the agent's machine, with values supplied by the operator:
 
@@ -20,7 +22,8 @@ For example, on the agent's machine, with values supplied by the operator:
   --ca "$CA_PEM" --label "Script sender"
 ```
 
-Give the approval code to the authenticated owner. The owner checks the intended person, label and key fingerprint before running `bin/harklight owner approve` with `--senders app:example` for this sender. Then check the saved request and prove current relay access:
+Give the approval code to the authenticated owner. The owner checks the intended person, label and key fingerprint before running `bin/harklight owner approve` with `--senders app:example` for this sender. For an explicitly authorized enrollment, check the saved request with the
+installed enrollment command. This does not prove session listener support:
 
 ```sh
 "$PACKAGE/bin/harklight" enroll status --directory "$DEVICE_DIR" \
@@ -32,30 +35,59 @@ Keep the directory if a submission reply is lost. `enroll retry` uses the same l
 
 A separately registered **agent identity** supports `agent search`, `agent get` and `agent respond` over the agent HTTPS endpoint. It cannot send a new message. `agent keygen --directory "$AGENT_DIR"` creates a local identity; the owner registers its exact public key with `owner agent-register`, then sets current read and respond sender scopes with `owner agent-grants-replace`. Enrollment and a sender grant on a device do not substitute for those agent grants.
 
-## Send a document and get its reply
+## Send and receive through the session CLI
 
-Write one JSON message document. The server requires `sender_id`, `message_id`, integer `created_at` and nonempty `title`; `body` is optional. Use a sender ID actually granted to this device, such as `app:example`. Keep `message_id` stable for this request and unique within that sender's messages. This `attention-client.actions/1` document gives the current mainline app an answer control:
+Use the originating host's enrolled device, exact sender grant, trusted CA and
+configured origin HTTPS port with `harklight-agent`. Read the standalone CLI command reference and the
+`harklight-agent-send-listen` skill shipped with the server. The origin port is separate
+from enrollment and relay ports. Preserve the returned session, request,
+revision, event and operation identities; use the same session for listening, one-shot reads,
+ACK, reply, revision, retraction and result. The CLI's durable journal and
+`retry --op-id` recover an uncertain operation without a second send.
+
+For senders that cannot listen, the source candidate implements
+`harklight-agent read --session "$HARKLIGHT_SESSION"`. Use it only after its
+approved release is installed. It fetches the existing origin-identity feed
+once with the journal cursor and prints pending actionable entries filtered
+locally to that handle; the server feed itself is not session-filtered.
+Match the exact sender, message, revision and event within that handle before
+using `entry.answer` from an answered terminal. A discussion or empty read is
+not an answer. Read does not ACK, start listening or change the unsupported
+reason. The send/listen instructions provide the explicit ACK, result and
+repeat-output handling.
+
+The approved full-form sender carries an `answer_ui` object with schema
+`attention-client.actions/1` on every send. A question uses:
 
 ```json
-{"sender_id":"app:example","message_id":"request-1","created_at":1791930000000,"title":"Choose the next step","body":"Pick one option or write a note.","answer_ui":{"schema":"attention-client.actions/1","actions":[{"id":"continue","label":"Continue","kind":"value","value":"continue"},{"id":"note","label":"Write a note","kind":"text"}]}}
+{"schema":"attention-client.actions/1","actions":[{"id":"reply","label":"Reply","kind":"text"}]}
 ```
 
-Save it as `message.json`, then send and check the origin receipt:
+A decision uses one `kind:"value"` action per choice plus text Reply. Each value
+action submits its exact JSON value; text Reply submits the entered JSON string.
+An informational message uses exactly this one action, with no Reply or choices:
 
-```sh
-"$PACKAGE/bin/harklight" device send --directory "$DEVICE_DIR" \
-  --connect "$SERVER_ADDRESS" --name "$SERVER_NAME" --port "$RELAY_PORT" \
-  --ca "$CA_PEM" --message message.json
-"$PACKAGE/bin/harklight" device receipt --directory "$DEVICE_DIR" \
-  --connect "$SERVER_ADDRESS" --name "$SERVER_NAME" --port "$RELAY_PORT" \
-  --ca "$CA_PEM" --sender app:example --message-id request-1
+```json
+{"schema":"attention-client.actions/1","actions":[{"id":"seen","label":"Seen","kind":"value","value":{"acknowledgment":"seen"}}]}
 ```
 
-`send` reports relay acceptance, not human attention or a source action. `receipt` is pending until a terminal event exists; after an answer it gives the committed answer, including the difference between JSON `null` and no answer. Only the original sending device can request that receipt. Another enrolled device can run `device read` to durably journal replayed inbox events before ACK, and `device respond --sender app:example --message-id request-1 --answer answer.json` with a file containing one JSON value. A response is deliberate and terminal; do not infer it from the message text or notification delivery.
+Do not fabricate a descriptor. Invalid descriptors are never permission to guess
+an answer.
 
-In `attention-client.actions/1`, a `value` action submits its exact JSON value and a `text` action submits the person's entered text as a JSON string. Companion app revisions differ when `answer_ui` is absent: a newer native app offers a deliberate text reply, while an earlier app marks the request unsupported for answering. Use the structured action example when the installed client revision is uncertain. The app also recognizes `attention-client.ui/1` sender documents with scenes, illustrations and inputs; validate one against the receiving client before sending it. An unfamiliar or invalid explicit `answer_ui` is shown as unsupported and offers no app reply control; it is not permission to guess an answer. Other accepted JSON members have no guaranteed app rendering or execution behavior.
+After the approved full-form sender is installed, sends and revisions, including
+clearing choices, retain the required valid `actions/1` descriptor. The source
+candidate uses `send --informational` for Seen, mutually exclusive with `--choice`;
+use that flag only after its approved release is installed. Documentation does
+not make a flag or capability exist.
 
-Keep the exact message file and identity directory for retries. `device send` and `device respond` save a UUID operation with the request's exact JSON before network submission and reuse it on identical retries. Changing content under an existing `(sender_id, message_id)` conflicts with the first accepted message. Choose a new message ID for a genuinely new request; do not change an uncertain request merely to make a retry pass. The local journal and cursor survive process restarts if the identity directory survives.
+Answered, retracted and expired messages remain readable. Preserve drafts and
+pending answers. A closed-without-answer terminal is not an answer or
+authorization to perform the requested action.
+
+Session acceptance is not human attention. Opening a message is not Seen.
+Listener attachment or printed output is not an originating-session ACK. Report
+the actual route and the installed CLI's unsupported reason when handoff is not
+available; another host's key or an invented controller cannot supply it.
 
 ## Search or answer older messages as an agent
 

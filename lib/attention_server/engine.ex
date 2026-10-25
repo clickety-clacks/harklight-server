@@ -2649,9 +2649,6 @@ defmodule AttentionServer.Engine do
   defp dispatch(engine, principal, %{"type" => "subscribe_remote"} = frame),
     do: subscribe_remote(engine, principal, frame)
 
-  defp dispatch(engine, principal, %{"type" => "answer_receipt"} = frame),
-    do: answer_receipt(engine, principal, frame)
-
   defp dispatch(engine, principal, %{"type" => "enrollment_readback"} = frame),
     do: enrollment_readback(engine, principal, frame)
 
@@ -2773,73 +2770,6 @@ defmodule AttentionServer.Engine do
       _ ->
         :not_found
     end
-  end
-
-  defp answer_receipt(engine, %{person: person, key: device}, frame) do
-    cond do
-      frame["receipt_version"] != 1 ->
-        failure("unsupported_version")
-
-      valid_no_selectors(frame) != :ok ->
-        failure("invalid_field", "principal")
-
-      valid_global_id(frame) != :ok ->
-        {:error, field} = valid_global_id(frame)
-        failure("invalid_field", field)
-
-      not (is_integer(frame["terminal_seq"]) and frame["terminal_seq"] > 0) ->
-        failure("invalid_field", "terminal_seq")
-
-      true ->
-        key = {person, frame["sender_id"], frame["message_id"]}
-        requested_seq = frame["terminal_seq"]
-
-        case Map.get(engine.messages, key) do
-          %{origin: ^device, terminal: nil} ->
-            {:ok, engine, %{"status" => "pending"}}
-
-          %{origin: ^device, terminal: %{seq: seq}} = record
-          when seq == requested_seq ->
-            {:ok, engine, %{"receipt" => terminal_receipt(engine, person, key, record)}}
-
-          %{origin: ^device} ->
-            failure("stale_target")
-
-          _ ->
-            failure("not_found")
-        end
-    end
-  end
-
-  defp terminal_receipt(engine, person, {_, sender, id}, record) do
-    terminal = record.terminal
-
-    receipt = %{
-      "receipt_version" => 1,
-      "relay_instance_id" => engine.relay_instance_id,
-      "person_id" => person,
-      "sender_id" => sender,
-      "message_id" => id,
-      "acceptance_seq" => record.accepted_seq,
-      "terminal_seq" => terminal.seq,
-      "terminal_kind" => terminal_kind(terminal),
-      "state" => terminal.state,
-      "at" => terminal.at,
-      "has_answer" => terminal.answer_present,
-      "actor" => %{
-        "kind" => Atom.to_string(terminal.actor_kind),
-        "id" => Map.get(terminal, :actor_id, terminal.actor),
-        "key_fingerprint" => terminal.actor
-      },
-      "winning_op_id" => terminal.op_id
-    }
-
-    receipt =
-      if terminal.state == "retracted",
-        do: Map.put(receipt, "retracted_at", terminal.at),
-        else: receipt
-
-    if terminal.answer_present, do: Map.put(receipt, "answer", terminal.answer), else: receipt
   end
 
   defp source_bind(engine, %{person: person, key: device}, frame) do
@@ -4149,10 +4079,6 @@ defmodule AttentionServer.Engine do
         :ok
     end
   end
-
-  defp terminal_kind(%{kind: "no_comment"}), do: "no_comment"
-  defp terminal_kind(%{answer_present: true}), do: "answer"
-  defp terminal_kind(_), do: "lifecycle"
 
   defp terminal_semantic(frame, true) do
     %{
