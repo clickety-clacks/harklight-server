@@ -1,7 +1,7 @@
 ---
 name: harklight-agent-send-listen
 version: "0.1.1"
-description: Send a request through an existing Harklight sender grant and keep its originating agent session listening for request-bound turns.
+description: Send a request through an existing Harklight sender grant and retrieve its answers through the same feed, with listening where supported.
 ---
 
 # Send and listen with Harklight
@@ -84,17 +84,74 @@ standalone CLI does not supply a managed runtime's wake-on-chat integration. Kee
 with its existing task owner; do not add a relay helper, receipt polling,
 replacement sender or fabricated listener. Use the installed integration's
 supported continuation when one exists, and report when none can receive the
-reply automatically. Switch senders only with or after the client's truthful listening-status
-display. Before app compatibility removal, install sender support for `actions/1`
-on every send, then an authorized read-only recount must show no open message
-lacking that schema. No closure or conversion code is built for this cutover;
-any newly found incompatible IDs go to the server/client maintainers. The protocol
-skill describes the only proposed existing-terminal treatment and prohibits every
-conversion, including a one-time client upgrade.
+reply automatically. Switch senders only with or after the client's truthful
+listening-status display.
 
-## Handle each waiter result
+## Retrieve an answer without listening
 
-The waiter writes one JSON line. A change notice is not a conversation entry;
+After an approved release containing the one-shot read command is installed,
+a sender that cannot listen can fetch its pending turns on a later originating
+agent turn. The read command is implemented in the source candidate; the
+inspected 0.1.1 baseline and the earlier private 0.1.3 package do not establish
+that it is available. Check the installed version and help before using it.
+
+Keep the session handle and message ID returned by the original send, its
+exact sender ID, and the original device identity, endpoint and journal.
+Use the full handle, not a title, shortened display ID or vendor thread ID.
+Do not send again to check whether an answer arrived.
+
+```sh
+harklight-agent read --session "$HARKLIGHT_SESSION"
+```
+
+This makes one feed fetch with the saved cursor and exits after printing pending
+actionable entries as JSON lines. It does not wait for a new answer. The server
+feed and cursor cover the enrolled origin identity, not one session handle.
+The CLI journals the returned entries and selects pending output for the exact
+`--session` handle locally. That option does not restrict the server response
+or prevent entries for other handles from being journaled. Keep the existing
+journal: resetting it is not an answer-retrieval procedure.
+
+For the answer to your request, match `session_handle`,
+`request.sender_id` and `request.message_id` to the saved send identities.
+Check `request_revision` and retain `event_id`. An answered terminal carries
+`entry.kind:"terminal"`, `entry.terminal_state:"answered"`, `channel:"reply"`
+and the exact value in `entry.answer`; preserve that JSON value. A discussion
+entry is a conversation turn, not a terminal answer or new authority. Other
+requests can share this handle: do not mistake their replies for this request.
+
+Successful empty output means there is no pending actionable entry to print
+for this handle at that read. It does not prove the request is closed, that an
+answer will never arrive, or that no answer was already handled. A command
+failure is not an empty successful read. Keep the request with its task owner
+and read again when the work resumes in the originating session; do not add a
+receipt-polling loop, timer, helper or replacement sender.
+
+Reading updates local feed/journal state and records emitted output, but does
+not ACK, apply the answer, arm support, open a stream or claim future delivery.
+The local origin-wide cursor advances as entries are journaled; read does not
+advance a server-side read cursor or change server receipts. The real route and
+unsupported listening reason remain unchanged. After matching and receiving an
+event, acknowledge its exact event ID explicitly:
+
+```sh
+harklight-agent ack --session "$HARKLIGHT_SESSION" --event "$HARKLIGHT_EVENT"
+```
+
+Then follow the event handling below. For an answered terminal, perform only
+the authorized work and report `result` against its exact request and event.
+Printing or ACKing an answer is not proof that the work was applied. Pending
+entries can be printed again: check `delivered`, `acted` and the actual earlier
+effect before doing anything twice. A closed-without-answer terminal is not an
+answer or approval; handle its actual terminal state as described below.
+An origin-authored retraction is retained history, not an actionable read result.
+Use `status --session "$HARKLIGHT_SESSION"` when the current request/support
+state is needed; status alone does not retrieve the answer.
+
+## Handle each received event
+
+A waiter writes one JSON line; a one-shot read can print several. A change
+notice is not a conversation entry;
 the CLI fetches the authoritative feed and journals each entry before printing
 it. Read `entry.kind`, `entry.author`, the exact request identity, revision,
 `event_id`, `delivered`, and `acted` fields. Do not classify an entry by its
@@ -233,7 +290,8 @@ and [interactive mode reference](https://code.claude.com/docs/en/interactive-mod
 Codex listening is unsupported in the inspected 0.1.1 release; later support
 requires an installed implementation and real originating-session evidence. Do not
 call `codex queue` or claim that a Codex session received a turn. `status` and
-`listen` report that boundary; sending remains available.
+`listen` report that boundary; sending and an approved one-shot read remain
+separate from listening.
 
 Use `--file` with `send`, `reply` or `revise` only when the origin reports file
 limits. The CLI uses the published decoded inline allowance and uploads any

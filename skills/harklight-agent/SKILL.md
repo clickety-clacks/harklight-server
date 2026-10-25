@@ -37,19 +37,24 @@ A separately registered **agent identity** supports `agent search`, `agent get` 
 
 ## Send and receive through the session CLI
 
-This cutover guidance takes effect at a destination only with or after installation
-of the approved sender release implementing all required `actions/1` forms. Until
-that coordinated apply, existing supported session-route communication continues.
-This is rollout sequencing, not authorization to publish, apply, release, install
-or change live state.
-
 Use the originating host's enrolled device, exact sender grant, trusted CA and
 configured origin HTTPS port with `harklight-agent`. Read the standalone CLI command reference and the
 `harklight-agent-send-listen` skill shipped with the server. The origin port is separate
 from enrollment and relay ports. Preserve the returned session, request,
-revision, event and operation identities; use the same session for listening,
+revision, event and operation identities; use the same session for listening, one-shot reads,
 ACK, reply, revision, retraction and result. The CLI's durable journal and
 `retry --op-id` recover an uncertain operation without a second send.
+
+For senders that cannot listen, the source candidate implements
+`harklight-agent read --session "$HARKLIGHT_SESSION"`. Use it only after its
+approved release is installed. It fetches the existing origin-identity feed
+once with the journal cursor and prints pending actionable entries filtered
+locally to that handle; the server feed itself is not session-filtered.
+Match the exact sender, message, revision and event within that handle before
+using `entry.answer` from an answered terminal. A discussion or empty read is
+not an answer. Read does not ACK, start listening or change the unsupported
+reason. The send/listen instructions provide the explicit ACK, result and
+repeat-output handling.
 
 The approved full-form sender carries an `answer_ui` object with schema
 `attention-client.actions/1` on every send. A question uses:
@@ -66,13 +71,8 @@ An informational message uses exactly this one action, with no Reply or choices:
 {"schema":"attention-client.actions/1","actions":[{"id":"seen","label":"Seen","kind":"value","value":{"acknowledgment":"seen"}}]}
 ```
 
-Before that sender support is installed, continue otherwise-supported sends
-through the installed session CLI with its actual controls. The app compatibility
-form remains during this transition; it is not another agent send route. The
-0.1.1 sender can send plain questions and choices, but plain sends omit `answer_ui`,
-choices omit text Reply, and Seen is unavailable. Report a specific requested form
-it cannot express; do not fabricate a descriptor or suspend other supported sends.
-Invalid descriptors are never permission to guess an answer.
+Do not fabricate a descriptor. Invalid descriptors are never permission to guess
+an answer.
 
 After the approved full-form sender is installed, sends and revisions, including
 clearing choices, retain the required valid `actions/1` descriptor. The source
@@ -80,28 +80,9 @@ candidate uses `send --informational` for Seen, mutually exclusive with `--choic
 use that flag only after its approved release is installed. Documentation does
 not make a flag or capability exist.
 
-The server stores the descriptor as an opaque object. Before removing the app's
-compatibility form, release and install sender support for `actions/1` on every
-send, then obtain an authorized read-only recount showing no open message without
-that schema. Do not build closure or conversion code for this cutover. Recount
-just before removal rather than relying on a past snapshot.
-
-If the recount finds an incompatible open message, bring its exact identity to
-the server and client maintainers. The only proposed treatment is an existing
-ordinary terminal path that appends closure events and leaves the original message,
-receipts, revisions and feed entries byte-identical. Both person and sender see
-closed without an answer, never answered or `no_comment`, and the sender can
-observe the closure. Still-needed work is re-sent as new requests through the one
-route within the applicable authority. This guidance authorizes no live closure
-or resend. If no existing terminal kind fits, bring the exact mismatch to the
-maintainer before proposing a new kind or mechanism.
-
-No conversion of any kind is part of this cutover: no stored rewrite, server/app
-read-time converter or one-time client upgrade. Answered, retracted and expired
-messages remain readable; preserve drafts and pending answers without conversion
-or silent loss. Raise an incompatibility rather than inventing a migration. Live
-changes require their approved release/install route, never a manual data edit.
-Closure is not an answer or authorization to perform the requested action.
+Answered, retracted and expired messages remain readable. Preserve drafts and
+pending answers. A closed-without-answer terminal is not an answer or
+authorization to perform the requested action.
 
 Session acceptance is not human attention. Opening a message is not Seen.
 Listener attachment or printed output is not an originating-session ACK. Report
