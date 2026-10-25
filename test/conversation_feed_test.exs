@@ -1234,8 +1234,8 @@ defmodule AttentionServer.ConversationFeedTest do
     assert {:ok, %{"cursor" => 8, "entries" => entries}} = Relay.origin_feed(relay, "origin", 0)
 
     assert Enum.map(entries, & &1["channel"]) == [
-             "chat",
-             "chat",
+             "reply",
+             "reply",
              "reply",
              "reply",
              "chat",
@@ -1246,13 +1246,21 @@ defmodule AttentionServer.ConversationFeedTest do
 
     reply_entries = Enum.filter(entries, &(&1["channel"] == "reply"))
 
-    assert Enum.all?(reply_entries, fn entry ->
-             entry["kind"] == "terminal" and entry["terminal_state"] == "answered"
-           end)
+    assert Enum.map(reply_entries, & &1["kind"]) == [
+             "revision",
+             "revision",
+             "terminal",
+             "terminal"
+           ]
 
-    assert Enum.find(reply_entries, &(&1["message_id"] == "answered-chat"))["answer"] == "Yes"
+    terminal_entries = Enum.filter(reply_entries, &(&1["kind"] == "terminal"))
 
-    no_comment = Enum.find(reply_entries, &(&1["message_id"] == "no-comment-chat"))
+    assert Enum.all?(terminal_entries, &(&1["terminal_state"] == "answered"))
+
+    assert Enum.find(terminal_entries, &(&1["message_id"] == "answered-chat"))["answer"] ==
+             "Yes"
+
+    no_comment = Enum.find(terminal_entries, &(&1["message_id"] == "no-comment-chat"))
     assert no_comment["terminal_kind"] == "no_comment"
     refute Map.has_key?(no_comment, "answer")
 
@@ -1262,6 +1270,8 @@ defmodule AttentionServer.ConversationFeedTest do
              chat_entries,
              &(&1["kind"] == "terminal" and &1["terminal_state"] == "answered")
            )
+
+    assert Enum.all?(chat_entries, &(&1["kind"] in ["discussion", "reply"]))
 
     assert Enum.map(Enum.filter(chat_entries, &(&1["kind"] == "discussion")), & &1["text"]) == [
              "Can we discuss that answer?",
@@ -1401,6 +1411,7 @@ defmodule AttentionServer.ConversationFeedTest do
 
     assert discussion["acted"] == true
     assert terminal["kind"] == "terminal"
+    assert terminal["channel"] == "reply"
     assert terminal["author"] == "origin"
     assert terminal["terminal_state"] == "retracted"
     assert terminal["retracted_at"] == retracted_at

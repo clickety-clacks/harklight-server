@@ -136,8 +136,10 @@ defmodule AttentionServer.Conversation do
   def chat_open?(%{terminal: %{state: "answered"}}), do: true
   def chat_open?(_), do: false
 
-  defp channel(%{"kind" => "terminal", "terminal_state" => "answered"}), do: "reply"
-  defp channel(_), do: "chat"
+  # Request and lifecycle facts stay on the reply channel; chat contains only side-conversation turns.
+  defp channel(%{"kind" => "discussion"}), do: "chat"
+  defp channel(%{"kind" => "reply", "author" => "origin"}), do: "chat"
+  defp channel(_), do: "reply"
 
   def on_terminal(engine, person, record, {_, sender, message_id}, terminal) do
     if is_nil(Map.get(record, :session_handle)) do
