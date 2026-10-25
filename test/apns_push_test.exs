@@ -16,7 +16,7 @@ defmodule AttentionServer.APNSPushTest do
 
   import ExUnit.CaptureLog
 
-  alias AttentionServer.{APNS, DeviceIdentity, Engine, JSON, Relay, Server, TLSFixtures}
+  alias AttentionServer.{APNS, DeviceIdentity, Engine, JSON, OriginWire, Relay, Server, TLSFixtures}
   alias Exqlite.Sqlite3
 
   @provider_profile "harklight-sandbox"
@@ -427,21 +427,14 @@ defmodule AttentionServer.APNSPushTest do
 
     assert %{"type" => "error", "reason" => "push_address_in_use"} = reply(sender_socket)
 
-    assert :ok =
-             send_request(sender_socket, %{
-               "type" => "forward",
-               "op_id" => op(3),
-               "message" => %{
-                 "sender_id" => "app:test",
-                 "message_id" => "apns-delivery",
-                 "created_at" => 1,
-                 "title" => "private title",
-                 "body" => "  bounded   preview\nfrom sender  "
-               }
-             })
-
-    assert %{"type" => "ok", "seq" => 1} = reply(sender_socket)
-    assert %{"type" => "delivery", "seq" => 1} = reply(sender_socket)
+    accept_test_delivery(
+      relay,
+      a1_key,
+      sender_socket,
+      3,
+      "apns-delivery",
+      %{"body" => "  bounded   preview\nfrom sender  "}
+    )
     refute_receive {:apns_request, _, _, _}, 100
 
     :ok = :ssl.close(sender_socket)
@@ -807,12 +800,12 @@ defmodule AttentionServer.APNSPushTest do
     server = start_apns_server(ctx, store_path)
     assert :ok = Supervisor.terminate_child(server, :push_dispatcher)
     relay = Server.relay(server)
-    {_sender_key, _app_key} = setup_test_devices(relay, certs)
+    {sender_key, _app_key} = setup_test_devices(relay, certs)
     sender_socket = open_test_socket(server, certs, "a1")
     app_socket = open_test_socket(server, certs, "a2")
 
     assert %{"type" => "ok", "revision" => 1} = register_push(app_socket, 21, 1)
-    accept_test_delivery(sender_socket, "reason-redaction")
+    accept_test_delivery(relay, sender_key, sender_socket, 40, "reason-redaction")
     assert %{"type" => "delivery", "seq" => 1} = reply(app_socket)
     send_push_after_window(ctx, relay)
 
@@ -991,12 +984,12 @@ defmodule AttentionServer.APNSPushTest do
     server = start_apns_server(ctx, store_path)
     assert :ok = Supervisor.terminate_child(server, :push_dispatcher)
     relay = Server.relay(server)
-    setup_test_devices(relay, certs)
+    {sender_key, _app_key} = setup_test_devices(relay, certs)
     sender_socket = open_test_socket(server, certs, "a1")
     app_socket = open_test_socket(server, certs, "a2")
 
     assert %{"type" => "ok", "revision" => 1} = register_push(app_socket, 31, 1)
-    accept_test_delivery(sender_socket, "bad-device-token")
+    accept_test_delivery(relay, sender_key, sender_socket, 40, "bad-device-token")
     assert %{"type" => "delivery", "seq" => 1} = reply(app_socket)
     send_push_after_window(ctx, relay)
 
@@ -1193,20 +1186,31 @@ defmodule AttentionServer.APNSPushTest do
     reply
   end
 
-  defp accept_test_delivery(socket, message_id) do
-    assert :ok =
-             send_request(socket, %{
-               "type" => "forward",
-               "op_id" => op(40),
-               "message" => %{
-                 "sender_id" => "app:test",
-                 "message_id" => message_id,
-                 "created_at" => 1,
-                 "title" => "private title"
-               }
+  defp accept_test_delivery(
+         relay,
+         sender_key,
+         socket,
+         operation,
+         message_id,
+         extra_fields \\ %{}
+       ) do
+    message =
+      %{
+        "sender_id" => "app:test",
+        "message_id" => message_id,
+        "created_at" => 1,
+        "title" => "private title"
+      }
+      |> Map.merge(extra_fields)
+
+    assert %{"type" => "ok", "seq" => 1} =
+             OriginWire.command(relay, sender_key, %{
+               "v" => 1,
+               "type" => "send",
+               "op_id" => op(operation),
+               "message" => message
              })
 
-    assert %{"type" => "ok", "seq" => 1} = reply(socket)
     assert %{"type" => "delivery", "seq" => 1} = reply(socket)
   end
 
