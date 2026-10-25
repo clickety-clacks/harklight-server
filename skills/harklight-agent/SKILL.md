@@ -37,6 +37,12 @@ A separately registered **agent identity** supports `agent search`, `agent get` 
 
 ## Send and receive through the session CLI
 
+This cutover guidance takes effect at a destination only with or after installation
+of the approved sender release implementing all required `actions/1` forms. Until
+that coordinated apply, existing supported session-route communication continues.
+This is rollout sequencing, not authorization to publish, apply, release, install
+or change live state.
+
 Use the originating host's enrolled device, exact sender grant, trusted CA and
 configured origin HTTPS port with `harklight-agent`. Read the standalone CLI command reference and the
 `harklight-agent-send-listen` skill shipped with the server. The origin port is separate
@@ -45,8 +51,8 @@ revision, event and operation identities; use the same session for listening,
 ACK, reply, revision, retraction and result. The CLI's durable journal and
 `retry --op-id` recover an uncertain operation without a second send.
 
-Every send carries an `answer_ui` object with schema
-`attention-client.actions/1`. A question uses:
+The approved full-form sender carries an `answer_ui` object with schema
+`attention-client.actions/1` on every send. A question uses:
 
 ```json
 {"schema":"attention-client.actions/1","actions":[{"id":"reply","label":"Reply","kind":"text"}]}
@@ -60,14 +66,19 @@ An informational message uses exactly this one action, with no Reply or choices:
 {"schema":"attention-client.actions/1","actions":[{"id":"seen","label":"Seen","kind":"value","value":{"acknowledgment":"seen"}}]}
 ```
 
-Do not rely on missing `answer_ui`, a legacy choices member or a different schema
-to obtain answer controls. Revisions, including clearing choices, retain a valid
-`actions/1` descriptor. Invalid descriptors are not permission to guess an answer.
-Use a released sender implementing these forms; the earlier 0.1.1 sender does
-not implement them all. The replacement source candidate uses
-`send --informational` for Seen, mutually exclusive with `--choice`; use it only
-after that candidate's approved release is installed. Documentation does not
-make a flag or capability exist.
+Before that sender support is installed, continue otherwise-supported sends
+through the installed session CLI with its actual controls. The app compatibility
+form remains during this transition; it is not another agent send route. The
+0.1.1 sender can send plain questions and choices, but plain sends omit `answer_ui`,
+choices omit text Reply, and Seen is unavailable. Report a specific requested form
+it cannot express; do not fabricate a descriptor or suspend other supported sends.
+Invalid descriptors are never permission to guess an answer.
+
+After the approved full-form sender is installed, sends and revisions, including
+clearing choices, retain the required valid `actions/1` descriptor. The source
+candidate uses `send --informational` for Seen, mutually exclusive with `--choice`;
+use that flag only after its approved release is installed. Documentation does
+not make a flag or capability exist.
 
 The server stores the descriptor as an opaque object. Before removing the app's
 compatibility form, release and install sender support for `actions/1` on every
