@@ -4080,10 +4080,6 @@ defmodule AttentionServer.Engine do
     end
   end
 
-  defp terminal_kind(%{kind: "no_comment"}), do: "no_comment"
-  defp terminal_kind(%{answer_present: true}), do: "answer"
-  defp terminal_kind(_), do: "lifecycle"
-
   defp terminal_semantic(frame, true) do
     %{
       "type" => "answer",
