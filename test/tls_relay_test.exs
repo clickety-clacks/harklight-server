@@ -130,7 +130,8 @@ defmodule AttentionServer.TLSRelayTest do
     }
   end
 
-  test "TLS device sessions reject legacy sender commands and keep stored history readable", ctx do
+  test "TLS device sessions reject legacy sender commands and keep stored history readable",
+       ctx do
     %{certs: certs, tls: tls, relay: relay, keys: keys} = ctx
     assert {:ok, a1} = connect(tls, certs, "a1")
     assert {:ok, a2} = connect(tls, certs, "a2")
@@ -215,7 +216,13 @@ defmodule AttentionServer.TLSRelayTest do
       |> Map.put("message_id", "choice-request")
       |> Map.put("answer_ui", %{"kind" => "choice", "items" => ["yes", "no"]})
 
-    assert %{"type" => "ok", "seq" => 1} = stored_request(relay, keys["a1"], %{"type" => "forward", "op_id" => op(501), "message" => choice})
+    assert %{"type" => "ok", "seq" => 1} =
+             stored_request(relay, keys["a1"], %{
+               "type" => "forward",
+               "op_id" => op(501),
+               "message" => choice
+             })
+
     assert %{"type" => "delivery", "message_id" => "choice-request"} = read_frame(sender)
     assert %{"type" => "delivery", "message_id" => "choice-request"} = read_frame(person)
 
@@ -283,7 +290,12 @@ defmodule AttentionServer.TLSRelayTest do
       |> Map.put("body", "Please write a response")
 
     assert %{"type" => "ok", "seq" => 3} =
-             stored_request(relay, keys["a1"], %{"type" => "forward", "op_id" => op(502), "message" => reply_only})
+             stored_request(relay, keys["a1"], %{
+               "type" => "forward",
+               "op_id" => op(502),
+               "message" => reply_only
+             })
+
     assert %{"type" => "delivery", "message_id" => "reply-only-request"} = read_frame(sender)
     assert %{"type" => "delivery", "message_id" => "reply-only-request"} = read_frame(person)
 
@@ -450,7 +462,12 @@ defmodule AttentionServer.TLSRelayTest do
     assert {[], %{"seq" => 0}} = resync(a1)
 
     assert %{"type" => "ok", "seq" => 1} =
-             stored_request(relay, keys["a1"], %{"type" => "forward", "op_id" => op(99), "message" => message("durable")})
+             stored_request(relay, keys["a1"], %{
+               "type" => "forward",
+               "op_id" => op(99),
+               "message" => message("durable")
+             })
+
     assert %{"type" => "delivery", "seq" => 1} = read_frame(a1)
     assert {:error, :timeout} = :ssl.recv(a2, 0, 200)
     assert :ok = Relay.revoke_device(relay, keys["a2"])
@@ -489,7 +506,12 @@ defmodule AttentionServer.TLSRelayTest do
     assert {[], %{"seq" => 0}} = resync(a2)
 
     assert %{"type" => "ok", "seq" => 1} =
-             stored_request(relay, keys["a1"], %{"type" => "forward", "op_id" => op(201), "message" => message("before stop")})
+             stored_request(relay, keys["a1"], %{
+               "type" => "forward",
+               "op_id" => op(201),
+               "message" => message("before stop")
+             })
+
     assert %{"type" => "delivery", "seq" => 1} = read_frame(a1)
     assert %{"type" => "delivery", "seq" => 1} = read_frame(a2)
 
@@ -522,7 +544,8 @@ defmodule AttentionServer.TLSRelayTest do
     assert is_nil(:sys.get_state(relay).store.engine.messages[{"A", "app:test", "same"}].terminal)
   end
 
-  test "stored messages remain answerable without legacy receipts or delegated source reports", ctx do
+  test "stored messages remain answerable without legacy receipts or delegated source reports",
+       ctx do
     %{certs: certs, tls: tls, relay: relay, keys: keys} = ctx
     assert {:ok, a1} = connect(tls, certs, "a1")
     assert {:ok, a2} = connect(tls, certs, "a2")
@@ -530,7 +553,12 @@ defmodule AttentionServer.TLSRelayTest do
     assert {[], %{"seq" => 0}} = resync(a2)
 
     assert %{"type" => "ok", "seq" => 1} =
-             stored_request(relay, keys["a1"], %{"type" => "forward", "op_id" => op(401), "message" => message("PRIVATE SOURCE CONTENT")})
+             stored_request(relay, keys["a1"], %{
+               "type" => "forward",
+               "op_id" => op(401),
+               "message" => message("PRIVATE SOURCE CONTENT")
+             })
+
     assert %{"type" => "delivery"} = read_frame(a1)
     assert %{"type" => "delivery"} = read_frame(a2)
 

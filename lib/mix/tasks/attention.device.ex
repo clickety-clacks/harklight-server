@@ -17,6 +17,7 @@ defmodule Mix.Tasks.Attention.Device do
   @impl true
   def run(args) do
     Mix.Task.run("app.start")
+
     AttentionServer.CLI.with_io(Mix.shell(), Mix.Error, fn ->
       AttentionServer.CLI.Device.run(args)
     end)

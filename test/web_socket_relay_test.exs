@@ -208,7 +208,12 @@ defmodule AttentionServer.WebSocketRelayTest do
              Relay.request_line(
                relay,
                keys["a1"],
-               JSON.encode!(%{"v" => 1, "type" => "forward", "op_id" => op(1), "message" => message}) <> "\n"
+               JSON.encode!(%{
+                 "v" => 1,
+                 "type" => "forward",
+                 "op_id" => op(1),
+                 "message" => message
+               }) <> "\n"
              )
 
     assert {:ok, %{"type" => "ok", "seq" => 1}} = JSON.decode_line(raw)
@@ -265,7 +270,9 @@ defmodule AttentionServer.WebSocketRelayTest do
                "ref" => "blocked-receipt"
              })
 
-    assert %{"type" => "error", "reason" => "unknown_type", "ref" => "blocked-receipt"} = reply(a1)
+    assert %{"type" => "error", "reason" => "unknown_type", "ref" => "blocked-receipt"} =
+             reply(a1)
+
     assert {:ok, [%{"message_id" => "one"}, _lifecycle], 2} = Relay.events(relay, keys["a1"], 0)
 
     assert {:ok, a2} = connect(web, certs, "a2")
@@ -1139,6 +1146,7 @@ defmodule AttentionServer.WebSocketRelayTest do
     end
 
     assert {:ok, paging_session} = Relay.open_websocket_session(relay, keys["a2"], nil, nil)
+
     start = %{
       "v" => 1,
       "type" => "inbox_start",
@@ -1443,7 +1451,12 @@ defmodule AttentionServer.WebSocketRelayTest do
       })
 
     assert %{"type" => "ok", "seq" => 1} =
-             store_request(relay, keys["a1"], %{"type" => "forward", "op_id" => op(20), "message" => message})
+             store_request(relay, keys["a1"], %{
+               "type" => "forward",
+               "op_id" => op(20),
+               "message" => message
+             })
+
     assert %{"type" => "delivery", "seq" => 1, "origin" => origin} = reply(a1)
     assert origin == keys["a1"]
     assert {:error, :timeout} = :ssl.recv(b1, 2, 200)

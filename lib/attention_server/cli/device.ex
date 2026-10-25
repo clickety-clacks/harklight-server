@@ -11,9 +11,7 @@ defmodule AttentionServer.CLI.Device do
   answer file may contain any JSON value, including `null`.
   """
 
-
   alias AttentionServer.{HeadlessDevice, JSON, ToolEndpoint}
-
 
   def run([command | args]) when command in ["read", "respond"] do
     {options, rest, invalid} =
@@ -31,7 +29,9 @@ defmodule AttentionServer.CLI.Device do
       )
 
     if rest != [] or invalid != [], do: AttentionServer.CLI.error!("unexpected device arguments")
-    directory = Keyword.get(options, :directory) || AttentionServer.CLI.error!("--directory is required")
+
+    directory =
+      Keyword.get(options, :directory) || AttentionServer.CLI.error!("--directory is required")
 
     endpoint =
       case ToolEndpoint.from_options(options) do
@@ -48,14 +48,22 @@ defmodule AttentionServer.CLI.Device do
 
         "respond" ->
           {sender, id} = target!(options)
-          answer = Keyword.get(options, :answer) || AttentionServer.CLI.error!("--answer is required")
+
+          answer =
+            Keyword.get(options, :answer) || AttentionServer.CLI.error!("--answer is required")
+
           HeadlessDevice.respond(directory, endpoint, sender, id, answer)
       end
 
     case result do
-      {:ok, value} -> AttentionServer.CLI.shell().info(JSON.encode!(value))
-      {:error, {:server, response}} -> AttentionServer.CLI.error!(JSON.encode!(response))
-      {:error, reason} -> AttentionServer.CLI.error!("device operation failed: #{inspect(reason)}")
+      {:ok, value} ->
+        AttentionServer.CLI.shell().info(JSON.encode!(value))
+
+      {:error, {:server, response}} ->
+        AttentionServer.CLI.error!(JSON.encode!(response))
+
+      {:error, reason} ->
+        AttentionServer.CLI.error!("device operation failed: #{inspect(reason)}")
     end
   end
 
@@ -63,7 +71,10 @@ defmodule AttentionServer.CLI.Device do
 
   defp target!(options) do
     sender = Keyword.get(options, :sender) || AttentionServer.CLI.error!("--sender is required")
-    id = Keyword.get(options, :message_id) || AttentionServer.CLI.error!("--message-id is required")
+
+    id =
+      Keyword.get(options, :message_id) || AttentionServer.CLI.error!("--message-id is required")
+
     {sender, id}
   end
 end

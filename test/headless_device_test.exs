@@ -1,7 +1,15 @@
 defmodule AttentionServer.HeadlessDeviceTest do
   use ExUnit.Case, async: false
 
-  alias AttentionServer.{HeadlessDevice, HeadlessEnrollment, JSON, OriginWire, Relay, TLSFixtures, WebSocketRelay}
+  alias AttentionServer.{
+    HeadlessDevice,
+    HeadlessEnrollment,
+    JSON,
+    OriginWire,
+    Relay,
+    TLSFixtures,
+    WebSocketRelay
+  }
 
   setup_all do
     certs = TLSFixtures.create!()
@@ -60,7 +68,10 @@ defmodule AttentionServer.HeadlessDeviceTest do
 
         File.write!(
           Path.join(identity, "enrollment.json"),
-          JSON.encode!(%{"person_id" => if(name == "b1", do: "B", else: "A"), "device_id" => keys[name]}) <> "\n"
+          JSON.encode!(%{
+            "person_id" => if(name == "b1", do: "B", else: "A"),
+            "device_id" => keys[name]
+          }) <> "\n"
         )
 
         File.write!(
@@ -69,7 +80,8 @@ defmodule AttentionServer.HeadlessDeviceTest do
             "address" => "127.0.0.1",
             "name" => "relay.test",
             "port" => endpoint.port,
-            "ca_sha256" => :crypto.hash(:sha256, File.read!(endpoint.ca_file)) |> Base.encode16(case: :lower)
+            "ca_sha256" =>
+              :crypto.hash(:sha256, File.read!(endpoint.ca_file)) |> Base.encode16(case: :lower)
           }) <> "\n"
         )
 
@@ -81,11 +93,21 @@ defmodule AttentionServer.HeadlessDeviceTest do
       if Process.alive?(relay), do: GenServer.stop(relay)
     end)
 
-    %{dir: dir, path: path, relay: relay, web: web, endpoint: endpoint, identities: identities, keys: keys, certs: certs}
+    %{
+      dir: dir,
+      path: path,
+      relay: relay,
+      web: web,
+      endpoint: endpoint,
+      identities: identities,
+      keys: keys,
+      certs: certs
+    }
   end
 
   test "previously stored requests stay readable and answerable by enrolled devices", ctx do
     %{relay: relay, endpoint: endpoint, identities: identities, keys: keys, dir: dir} = ctx
+
     message = %{
       "sender_id" => "app:test",
       "message_id" => "existing-request",
@@ -98,7 +120,11 @@ defmodule AttentionServer.HeadlessDeviceTest do
 
     assert %{"type" => "ok", "seq" => 1} = seed_preexisting_message(relay, keys["a1"], message, 1)
 
-    assert {:ok, %{"cursor" => 1, "events" => [%{"type" => "delivery", "message" => ^message} = delivery]}} =
+    assert {:ok,
+            %{
+              "cursor" => 1,
+              "events" => [%{"type" => "delivery", "message" => ^message} = delivery]
+            }} =
              HeadlessDevice.read(identities["a2"], endpoint)
 
     assert delivery["origin"] == keys["a1"]
@@ -108,11 +134,19 @@ defmodule AttentionServer.HeadlessDeviceTest do
     File.write!(answer_file, JSON.encode!(answer) <> "\n")
 
     assert {:ok, %{"type" => "ok", "seq" => 2, "op_id" => op_id}} =
-             HeadlessDevice.respond(identities["a2"], endpoint, "app:test", "existing-request", answer_file)
+             HeadlessDevice.respond(
+               identities["a2"],
+               endpoint,
+               "app:test",
+               "existing-request",
+               answer_file
+             )
 
     assert is_binary(op_id)
+
     assert {:ok, %{"cursor" => 2, "events" => [origin, lifecycle]}} =
              HeadlessDevice.read(identities["a1"], endpoint)
+
     assert origin["type"] == "delivery"
     refute Map.has_key?(origin, "message")
     assert lifecycle["type"] == "lifecycle"
@@ -122,6 +156,7 @@ defmodule AttentionServer.HeadlessDeviceTest do
     GenServer.stop(ctx.web)
     GenServer.stop(relay)
     {:ok, reopened} = Relay.start_link(store_path: ctx.path)
+
     {:ok, reopened_web} =
       WebSocketRelay.start_link(
         relay: reopened,
@@ -129,7 +164,9 @@ defmodule AttentionServer.HeadlessDeviceTest do
         keyfile: Path.join(ctx.certs, "server.key"),
         cacertfile: Path.join(ctx.certs, "ca.pem")
       )
+
     endpoint = %{endpoint | port: WebSocketRelay.port(reopened_web)}
+
     on_exit(fn ->
       if Process.alive?(reopened_web), do: GenServer.stop(reopened_web)
       if Process.alive?(reopened), do: GenServer.stop(reopened)
@@ -137,21 +174,37 @@ defmodule AttentionServer.HeadlessDeviceTest do
 
     assert {:ok, %{"cursor" => 2, "events" => [_, _]}} =
              HeadlessDevice.read(identities["a2"], endpoint)
+
     assert {:ok, %{"cursor" => 2, "events" => [_, _]}} =
              HeadlessDevice.read(identities["a1"], endpoint)
   end
 
   test "stored messages remain scoped to their person", ctx do
     %{relay: relay, endpoint: endpoint, identities: identities, keys: keys, dir: dir} = ctx
-    message = %{"sender_id" => "app:test", "message_id" => "tenant-request", "created_at" => 1, "title" => "Tenant"}
+
+    message = %{
+      "sender_id" => "app:test",
+      "message_id" => "tenant-request",
+      "created_at" => 1,
+      "title" => "Tenant"
+    }
+
     assert %{"type" => "ok", "seq" => 1} = store_existing(relay, keys["a1"], message, 2)
 
-    assert {:ok, %{"cursor" => 0, "events" => []}} = HeadlessDevice.read(identities["b1"], endpoint)
+    assert {:ok, %{"cursor" => 0, "events" => []}} =
+             HeadlessDevice.read(identities["b1"], endpoint)
 
     answer_file = Path.join(dir, "answer.json")
     File.write!(answer_file, "null\n")
+
     assert {:error, :not_in_inbox} =
-             HeadlessDevice.respond(identities["b1"], endpoint, "app:test", "tenant-request", answer_file)
+             HeadlessDevice.respond(
+               identities["b1"],
+               endpoint,
+               "app:test",
+               "tenant-request",
+               answer_file
+             )
 
     assert {:ok, %{"cursor" => 1, "events" => [%{"message" => ^message}]}} =
              HeadlessDevice.read(identities["a2"], endpoint)
@@ -173,6 +226,7 @@ defmodule AttentionServer.HeadlessDeviceTest do
 
   test "a previously stored near-limit message remains readable and answerable", ctx do
     %{relay: relay, endpoint: endpoint, identities: identities, keys: keys, dir: dir} = ctx
+
     message = %{
       "sender_id" => "app:test",
       "message_id" => "large-existing-request",
@@ -223,7 +277,8 @@ defmodule AttentionServer.HeadlessDeviceTest do
     OriginWire.command(relay, key, %{
       "v" => 1,
       "type" => "send",
-      "op_id" => "00000000-0000-4000-8000-#{String.pad_leading(Integer.to_string(operation_number), 12, "0")}",
+      "op_id" =>
+        "00000000-0000-4000-8000-#{String.pad_leading(Integer.to_string(operation_number), 12, "0")}",
       "message" => message
     })
   end
@@ -232,7 +287,8 @@ defmodule AttentionServer.HeadlessDeviceTest do
     frame = %{
       "v" => 1,
       "type" => "forward",
-      "op_id" => "00000000-0000-4000-8000-#{String.pad_leading(Integer.to_string(operation_number), 12, "0")}",
+      "op_id" =>
+        "00000000-0000-4000-8000-#{String.pad_leading(Integer.to_string(operation_number), 12, "0")}",
       "message" => message
     }
 

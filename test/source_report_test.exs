@@ -5,7 +5,12 @@ defmodule AttentionServer.SourceReportTest do
   alias Exqlite.Sqlite3
 
   setup do
-    dir = Path.join(System.tmp_dir!(), "attention-source-report-#{System.unique_integer([:positive])}")
+    dir =
+      Path.join(
+        System.tmp_dir!(),
+        "attention-source-report-#{System.unique_integer([:positive])}"
+      )
+
     File.mkdir_p!(dir)
     on_exit(fn -> File.rm_rf!(dir) end)
     path = Path.join(dir, "relay.sqlite3")
@@ -258,7 +263,8 @@ defmodule AttentionServer.SourceReportTest do
           {"a2", "second", 2, 61},
           {"b1", "other-person", 1, 62}
         ] do
-      assert %{"seq" => ^seq, "type" => "ok"} = send_origin(relay, origin, op(operation), message(id))
+      assert %{"seq" => ^seq, "type" => "ok"} =
+               send_origin(relay, origin, op(operation), message(id))
 
       person = if origin == "b1", do: "B", else: "A"
 
