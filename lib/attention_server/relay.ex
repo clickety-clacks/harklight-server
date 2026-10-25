@@ -2746,6 +2746,9 @@ defmodule AttentionServer.Relay do
       when type in ["resync", "ack", "conversation_open", "conversation_ack", "view_get"] ->
         special_request(state, id, session, frame)
 
+      {:ok, %{"type" => type}} when type in ["forward", "answer_receipt"] ->
+        {{:ok, [error_line(frame, "unknown_type")]}, state}
+
       _ ->
         case session_mutation_state(state, session, raw) do
           {:blocked, reason} ->

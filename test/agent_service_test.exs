@@ -337,29 +337,6 @@ defmodule AttentionServer.AgentServiceTest do
     assert %{"type" => "answer_result", "ok" => true, "seq" => 4} =
              agent_request(agent_endpoint, cert, private, read_only)
 
-    receipt = %{
-      "v" => 1,
-      "type" => "answer_receipt",
-      "receipt_version" => 1,
-      "sender_id" => "app:test",
-      "message_id" => "one",
-      "terminal_seq" => 4
-    }
-
-    assert {:ok, receipt_line} =
-             Relay.request_line(relay, device_key, JSON.encode!(receipt) <> "\n")
-
-    assert {:ok, %{"receipt" => proof}} = JSON.decode_line(receipt_line)
-
-    assert proof["actor"] == %{
-             "kind" => "agent",
-             "id" => @agent_id,
-             "key_fingerprint" => agent_key
-           }
-
-    assert proof["has_answer"] == true and Map.has_key?(proof, "answer") and
-             is_nil(proof["answer"])
-
     assert %{"type" => "answer_result", "duplicate" => true, "seq" => 4} =
              agent_request(agent_endpoint, cert, private, read_only)
 

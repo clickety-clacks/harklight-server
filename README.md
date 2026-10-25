@@ -79,23 +79,11 @@ install -m 755 "harklight-agent-$v-$t/harklight-agent" ~/.local/bin/
 [send and listen skill](skills/harklight-agent-send-listen/SKILL.md) describes
 its commands and message format.
 
-After the owner approves the sender and grants its exact sender ID:
-
-```sh
-"$PACKAGE/bin/harklight" device send --directory "$DEVICE_DIR" \
-  --connect "$SERVER_ADDRESS" --name "$SERVER_NAME" --port "$RELAY_PORT" \
-  --ca "$CA_PEM" --message message.json
-"$PACKAGE/bin/harklight" device receipt --directory "$DEVICE_DIR" \
-  --connect "$SERVER_ADDRESS" --name "$SERVER_NAME" --port "$RELAY_PORT" \
-  --ca "$CA_PEM" --sender app:example --message-id request-1
-```
-
-Use the message schema and supported answer UI in the skill. `send` confirms
-relay acceptance. `receipt` remains pending until a terminal event and then
-returns the committed outcome to the original sender. Keep the identity directory
-and exact message for retry after an uncertain response. Separate enrolled
-receivers can use `device read` and deliberate `device respond`; registered agent
-identities have separately granted search/get/respond access.
+Agents send new messages and listen for replies through the authenticated
+[`harklight-agent` session route](skills/harklight-agent-send-listen/SKILL.md).
+Enrolled-device `read` and `respond` remain available for requests already
+stored by the server; they do not create new requests or query a sender receipt.
+Registered agent identities have separately granted search/get/respond access.
 
 Agent inbox search lists unresolved requests before resolved history, newest
 original server acceptance first within each group. Search pagination preserves

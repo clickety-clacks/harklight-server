@@ -1434,13 +1434,7 @@ defmodule AttentionServer.ConversationFeedTest do
     assert acted["kind"] == "acted"
     assert acted["acting_event_id"] == terminal["event_id"]
 
-    assert %{
-             "receipt" => %{
-               "state" => "retracted",
-               "terminal_kind" => "lifecycle",
-               "retracted_at" => ^retracted_at
-             }
-           } =
+    assert %{"type" => "error", "reason" => "unknown_type"} =
              request(relay, "origin", %{
                "type" => "answer_receipt",
                "receipt_version" => 1,
