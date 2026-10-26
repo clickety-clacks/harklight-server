@@ -418,7 +418,7 @@ defmodule AttentionServer.HostedAccountTest do
   end
 
   describe "server configuration" do
-    test "rejects a hosted listener outside saas mode and a bad public address", %{
+    test "disables hosted routes for invalid hosted settings without refusing server startup", %{
       certs: certs,
       dir: dir
     } do
@@ -429,20 +429,26 @@ defmodule AttentionServer.HostedAccountTest do
         cacertfile: Path.join(certs, "ca.pem")
       ]
 
-      assert_raise ArgumentError, ~r/:saas/, fn ->
-        Server.init(base ++ [hosted_port: 0, deployment_mode: :self_hosted])
-      end
+      assert_optional_child_disabled(
+        base ++ [hosted_port: 0, deployment_mode: :self_hosted],
+        :hosted_http
+      )
 
-      assert_raise ArgumentError, ~r/public_base_url/, fn ->
-        Server.init(base ++ [public_base_url: "http://app.example.test"])
-      end
-
-      assert_raise ArgumentError, ~r/public_base_url/, fn ->
-        Server.init(base ++ [public_base_url: "https://app.example.test/account/"])
-      end
-
-      assert_raise ArgumentError, ~r/public_base_url/, fn ->
-        Server.init(base ++ [public_base_url: "https://user@app.example.test"])
+      for public_base_url <- [
+            "http://app.example.test",
+            "https://app.example.test/account/",
+            "https://user@app.example.test"
+          ] do
+        assert_optional_child_disabled(
+          base ++
+            [
+              deployment_mode: :saas,
+              upload_cap: 1_000,
+              hosted_port: 0,
+              public_base_url: public_base_url
+            ],
+          :hosted_http
+        )
       end
     end
 
@@ -454,24 +460,36 @@ defmodule AttentionServer.HostedAccountTest do
         cacertfile: Path.join(certs, "ca.pem")
       ]
 
-      assert_raise ArgumentError, ~r/:saas/, fn ->
-        Server.init(base ++ [hosted_sign_in_url: "/sign-in"])
-      end
+      assert_optional_child_disabled(base ++ [hosted_sign_in_url: "/sign-in"], :hosted_http)
 
-      saas = base ++ [deployment_mode: :saas, public_base_url: @origin]
+      saas = base ++ [deployment_mode: :saas, upload_cap: 1_000, public_base_url: @origin]
 
-      assert_raise ArgumentError, ~r/hosted address/, fn ->
-        Server.init(saas ++ [hosted_sign_out_url: "http://app.example.test/sign-out"])
-      end
+      assert_optional_child_disabled(
+        saas ++ [hosted_port: 0, hosted_sign_out_url: "http://app.example.test/sign-out"],
+        :hosted_http
+      )
 
-      assert_raise ArgumentError, ~r/hosted address/, fn ->
-        Server.init(saas ++ [hosted_account_url: "account"])
-      end
+      assert_optional_child_disabled(
+        saas ++ [hosted_port: 0, hosted_account_url: "account"],
+        :hosted_http
+      )
 
-      assert_raise ArgumentError, ~r/hosted address/, fn ->
-        Server.init(base ++ [deployment_mode: :saas, hosted_account_url: "/account"])
-      end
+      assert_optional_child_disabled(
+        base ++
+          [
+            deployment_mode: :saas,
+            upload_cap: 1_000,
+            hosted_port: 0,
+            hosted_account_url: "/account"
+          ],
+        :hosted_http
+      )
     end
+  end
+
+  defp assert_optional_child_disabled(opts, id) do
+    assert {:ok, {_flags, children}} = Server.init(opts)
+    refute Enum.any?(children, fn child_spec -> child_spec.id == id end)
   end
 
   defmodule Backend do

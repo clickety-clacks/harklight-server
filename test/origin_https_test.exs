@@ -75,7 +75,7 @@ defmodule AttentionServer.OriginHTTPSTest do
     }
   end
 
-  test "authenticated origin discovers effective file limits and SaaS cannot run without a finite cap",
+  test "authenticated origin reports limits and an invalid SaaS cap only disables hosted routes",
        c do
     assert {:ok, 200,
             %{
@@ -100,13 +100,11 @@ defmodule AttentionServer.OriginHTTPSTest do
       relay_name: :"saas_file_limit_#{System.unique_integer([:positive])}"
     ]
 
-    assert_raise ArgumentError, ~r/ATTENTION_SERVER_UPLOAD_CAP_BYTES/, fn ->
-      Server.init(opts)
-    end
+    assert {:ok, {_, children}} = Server.init(Keyword.put(opts, :hosted_port, 0))
+    refute Enum.any?(children, fn child_spec -> child_spec.id == :hosted_http end)
 
-    assert_raise ArgumentError, ~r/invalid :upload_cap.*ATTENTION_SERVER_UPLOAD_CAP_BYTES/, fn ->
-      Server.init(Keyword.merge(opts, deployment_mode: :self_hosted, upload_cap: 0))
-    end
+    assert {:ok, {_flags, _children}} =
+             Server.init(Keyword.merge(opts, deployment_mode: :self_hosted, upload_cap: 0))
 
     {:ok, server} = Server.start_link(Keyword.put(opts, :upload_cap, 1_024))
     Process.unlink(server)

@@ -11,9 +11,13 @@ defmodule AttentionServer.PushDispatcher do
 
   @impl true
   def init(opts) do
+    relay = Keyword.fetch!(opts, :relay)
+    apns = opts |> Keyword.fetch!(:apns) |> APNS.prepare!()
+    :ok = Relay.enable_push(relay)
+
     state = %{
-      relay: Keyword.fetch!(opts, :relay),
-      apns: opts |> Keyword.fetch!(:apns) |> APNS.prepare!(),
+      relay: relay,
+      apns: apns,
       cached_token: nil
     }
 

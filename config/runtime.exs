@@ -1,4 +1,33 @@
 import Config
+require Logger
+
+optional_warning = fn feature, reason ->
+  Logger.warning(
+    "event=harklight_optional_feature_disabled feature=#{feature} reason=#{reason}"
+  )
+end
+
+parse_optional_port = fn variable ->
+  case System.get_env(variable) do
+    nil ->
+      :not_set
+
+    value ->
+      case Integer.parse(value) do
+        {port, ""} when port in 0..65_535 -> {:ok, port}
+        _ -> {:error, :invalid}
+      end
+  end
+end
+
+parse_optional_bind = fn variable ->
+  value = System.get_env(variable, "127.0.0.1")
+
+  case :inet.parse_address(String.to_charlist(value)) do
+    {:ok, address} -> {:ok, address}
+    _ -> {:error, :invalid}
+  end
+end
 
 # Opt-in operator configuration. Tests and an unconfigured application do not
 # start a listener or create an account. Bind addresses and ports are explicit.
@@ -45,7 +74,41 @@ if System.get_env("ATTENTION_SERVER_ENABLE") == "1" do
         [team_id: team_id, profiles: profiles]
 
       true ->
-        raise "incomplete APNs configuration"
+        optional_warning.("push_notifications", "incomplete_configuration")
+        nil
+    end
+
+  {deployment_mode, deployment_mode_valid?} =
+    case System.get_env("ATTENTION_SERVER_DEPLOYMENT_MODE", "self_hosted") do
+      "self_hosted" -> {:self_hosted, true}
+      "saas" -> {:saas, true}
+      _ ->
+        optional_warning.("hosted_account", "invalid_deployment_mode")
+        {:invalid, false}
+    end
+
+  {upload_cap, upload_cap_valid?} =
+    case System.get_env("ATTENTION_SERVER_UPLOAD_CAP_BYTES", "none") do
+      "none" ->
+        {:none, true}
+
+      value ->
+        case Integer.parse(value) do
+          {cap, ""} when cap > 0 -> {cap, true}
+          _ ->
+            optional_warning.("hosted_account", "invalid_upload_cap")
+            {:none, false}
+        end
+    end
+
+  enrollment =
+    with {:ok, port} <- parse_optional_port.("ATTENTION_SERVER_ENROLL_PORT"),
+         {:ok, ip} <- parse_optional_bind.("ATTENTION_SERVER_ENROLL_BIND") do
+      {:enabled, port, ip}
+    else
+      _ ->
+        optional_warning.("device_enrollment", "invalid_listener_configuration")
+        :disabled
     end
 
   server_opts = [
@@ -55,14 +118,23 @@ if System.get_env("ATTENTION_SERVER_ENABLE") == "1" do
     cacertfile: System.fetch_env!("ATTENTION_SERVER_CACERTFILE"),
     port: System.fetch_env!("ATTENTION_SERVER_PORT") |> String.to_integer(),
     ip: bind.("ATTENTION_SERVER_BIND"),
-    enroll_port: System.fetch_env!("ATTENTION_SERVER_ENROLL_PORT") |> String.to_integer(),
-    enroll_ip: bind.("ATTENTION_SERVER_ENROLL_BIND"),
     owner_port: System.fetch_env!("ATTENTION_SERVER_OWNER_PORT") |> String.to_integer(),
     owner_ip: bind.("ATTENTION_SERVER_OWNER_BIND"),
     agent_port: System.fetch_env!("ATTENTION_SERVER_AGENT_PORT") |> String.to_integer(),
     agent_ip: bind.("ATTENTION_SERVER_AGENT_BIND"),
-    join_name: System.get_env("ATTENTION_SERVER_JOIN_NAME")
+    join_name: System.get_env("ATTENTION_SERVER_JOIN_NAME"),
+    deployment_mode: deployment_mode,
+    upload_cap: upload_cap
   ]
+
+  server_opts =
+    case enrollment do
+      {:enabled, port, ip} ->
+        Keyword.merge(server_opts, enrollment_enabled: true, enroll_port: port, enroll_ip: ip)
+
+      :disabled ->
+        Keyword.put(server_opts, :enrollment_enabled, false)
+    end
 
   server_opts =
     case System.get_env("ATTENTION_SERVER_ORIGIN_PORT") do
@@ -76,87 +148,129 @@ if System.get_env("ATTENTION_SERVER_ENABLE") == "1" do
     end
 
   server_opts =
-    case System.get_env("ATTENTION_SERVER_DEPLOYMENT_MODE", "self_hosted") do
-      "self_hosted" -> Keyword.put(server_opts, :deployment_mode, :self_hosted)
-      "saas" -> Keyword.put(server_opts, :deployment_mode, :saas)
-      _ -> raise "invalid ATTENTION_SERVER_DEPLOYMENT_MODE"
-    end
-
-  server_opts =
     case System.get_env("ATTENTION_SERVER_PUBLIC_BASE_URL") do
       nil -> server_opts
       url -> Keyword.put(server_opts, :public_base_url, url)
     end
 
+  hosted_port = parse_optional_port.("ATTENTION_SERVER_HOSTED_PORT")
+
+  hosted_address_vars = [
+    hosted_sign_in_url: "ATTENTION_SERVER_HOSTED_SIGN_IN_URL",
+    hosted_sign_out_url: "ATTENTION_SERVER_HOSTED_SIGN_OUT_URL",
+    hosted_account_url: "ATTENTION_SERVER_HOSTED_ACCOUNT_URL"
+  ]
+
+  hosted_addresses_requested? =
+    Enum.any?(hosted_address_vars, fn {_key, variable} ->
+      not is_nil(System.get_env(variable))
+    end)
+
+  hosted_test_account = System.get_env("ATTENTION_SERVER_HOSTED_TEST_ACCOUNT")
+
+  hosted_settings_requested? =
+    hosted_port != :not_set or hosted_addresses_requested? or not is_nil(hosted_test_account)
+
+  hosted_settings_available? =
+    deployment_mode_valid? and deployment_mode == :saas and upload_cap_valid? and
+      is_integer(upload_cap) and upload_cap > 0 and hosted_port != {:error, :invalid}
+
   server_opts =
-    Enum.reduce(
-      [
-        hosted_sign_in_url: "ATTENTION_SERVER_HOSTED_SIGN_IN_URL",
-        hosted_sign_out_url: "ATTENTION_SERVER_HOSTED_SIGN_OUT_URL",
-        hosted_account_url: "ATTENTION_SERVER_HOSTED_ACCOUNT_URL"
-      ],
-      server_opts,
-      fn {key, variable}, acc ->
-        case System.get_env(variable) do
-          nil -> acc
-          url -> Keyword.put(acc, key, url)
+    if hosted_settings_requested? and not hosted_settings_available? do
+      reason =
+        cond do
+          not deployment_mode_valid? -> "invalid_deployment_mode"
+          deployment_mode != :saas -> "saas_mode_required"
+          not upload_cap_valid? -> "invalid_upload_cap"
+          hosted_port == {:error, :invalid} -> "invalid_listener_port"
+          true -> "finite_upload_cap_required"
         end
+
+      optional_warning.("hosted_account", reason)
+      server_opts
+    else
+      case hosted_port do
+        {:ok, port} ->
+          server_opts
+          |> Keyword.put(:hosted_port, port)
+          |> Keyword.put(:hosted_test_account, hosted_test_account)
+
+        :not_set ->
+          server_opts
+
+        {:error, :invalid} -> server_opts
       end
-    )
-
-  server_opts =
-    case System.get_env("ATTENTION_SERVER_HOSTED_PORT") do
-      nil ->
-        server_opts
-
-      hosted_port ->
-        server_opts
-        |> Keyword.put(:hosted_port, String.to_integer(hosted_port))
-        |> Keyword.put(
-          :hosted_test_account,
-          System.get_env("ATTENTION_SERVER_HOSTED_TEST_ACCOUNT")
-        )
-    end
-
-  server_opts =
-    case System.get_env("ATTENTION_SERVER_UPLOAD_CAP_BYTES", "none") do
-      "none" ->
-        Keyword.put(server_opts, :upload_cap, :none)
-
-      value ->
-        case Integer.parse(value) do
-          {cap, ""} when cap > 0 -> Keyword.put(server_opts, :upload_cap, cap)
-          _ -> raise "invalid ATTENTION_SERVER_UPLOAD_CAP_BYTES"
+      |> then(fn opts ->
+        if hosted_settings_available? do
+          Enum.reduce(hosted_address_vars, opts, fn {key, variable}, acc ->
+            case System.get_env(variable) do
+              nil -> acc
+              url -> Keyword.put(acc, key, url)
+            end
+          end)
+        else
+          opts
         end
+      end)
+    end
+
+  dashboard_port = parse_optional_port.("ATTENTION_SERVER_DASHBOARD_PORT")
+
+  dashboard =
+    if not deployment_mode_valid? do
+      if dashboard_port != :not_set,
+        do: optional_warning.("dashboard", "invalid_deployment_mode")
+
+      nil
+    else
+      case dashboard_port do
+        :not_set ->
+          nil
+
+        {:ok, port} ->
+          owner_person =
+            if deployment_mode == :saas do
+              {:ok, nil}
+            else
+              case System.get_env("ATTENTION_SERVER_DASHBOARD_OWNER_PERSON") do
+                value when is_binary(value) and value != "" -> {:ok, value}
+                _ -> {:error, :missing_owner}
+              end
+            end
+
+          skill_path = System.get_env("ATTENTION_SERVER_DASHBOARD_SKILL_PATH")
+
+          with {:ok, ip} <- parse_optional_bind.("ATTENTION_SERVER_DASHBOARD_BIND"),
+               {:ok, owner_person} <- owner_person,
+               true <- is_binary(skill_path) and skill_path != "" do
+            [
+              port: port,
+              ip: ip,
+              owner_person: owner_person,
+              certfile:
+                System.get_env("ATTENTION_SERVER_DASHBOARD_CERTFILE") ||
+                  Keyword.fetch!(server_opts, :certfile),
+              keyfile:
+                System.get_env("ATTENTION_SERVER_DASHBOARD_KEYFILE") ||
+                  Keyword.fetch!(server_opts, :keyfile),
+              skill_path: skill_path,
+              skill_path_send_listen:
+                System.get_env("ATTENTION_SERVER_DASHBOARD_SKILL_PATH_SEND_LISTEN")
+            ]
+          else
+            _ ->
+              optional_warning.("dashboard", "invalid_or_incomplete_configuration")
+              nil
+          end
+
+        {:error, :invalid} ->
+          optional_warning.("dashboard", "invalid_listener_port")
+          nil
+      end
     end
 
   server_opts =
-    case System.get_env("ATTENTION_SERVER_DASHBOARD_PORT") do
-      nil ->
-        server_opts
-
-      dashboard_port ->
-        dashboard = [
-          port: String.to_integer(dashboard_port),
-          ip: bind.("ATTENTION_SERVER_DASHBOARD_BIND"),
-          owner_person:
-            if(server_opts[:deployment_mode] == :saas,
-              do: System.get_env("ATTENTION_SERVER_DASHBOARD_OWNER_PERSON"),
-              else: System.fetch_env!("ATTENTION_SERVER_DASHBOARD_OWNER_PERSON")
-            ),
-          certfile:
-            System.get_env("ATTENTION_SERVER_DASHBOARD_CERTFILE") ||
-              System.fetch_env!("ATTENTION_SERVER_CERTFILE"),
-          keyfile:
-            System.get_env("ATTENTION_SERVER_DASHBOARD_KEYFILE") ||
-              System.fetch_env!("ATTENTION_SERVER_KEYFILE"),
-          skill_path: System.fetch_env!("ATTENTION_SERVER_DASHBOARD_SKILL_PATH"),
-          skill_path_send_listen:
-            System.get_env("ATTENTION_SERVER_DASHBOARD_SKILL_PATH_SEND_LISTEN")
-        ]
-
-        Keyword.put(server_opts, :dashboard, dashboard)
-    end
+    if dashboard, do: Keyword.put(server_opts, :dashboard, dashboard), else: server_opts
 
   config :attention_server,
          :server,
