@@ -73,6 +73,58 @@ defmodule AttentionServer.OptionalStartupTest do
     assert is_pid(Server.relay(server))
   end
 
+  test "optional children recover without taking down core listeners", %{certs: certs} do
+    opts = server_opts(certs)
+
+    key_path =
+      Path.join(Path.dirname(Keyword.fetch!(opts, :store_path)), "AuthKey_TESTKEYID1.p8")
+
+    {_output, 0} =
+      System.cmd("openssl", [
+        "genpkey",
+        "-algorithm",
+        "EC",
+        "-pkeyopt",
+        "ec_paramgen_curve:P-256",
+        "-out",
+        key_path
+      ])
+
+    assert :ok = File.chmod(key_path, 0o600)
+
+    apns = [
+      team_id: "TESTTEAMID",
+      profiles: %{
+        "harklight-sandbox" => [key_path: key_path, key_id: "TESTKEYID1"]
+      }
+    ]
+
+    server = start_server(Keyword.put(opts, :apns, apns))
+    core_ids = [:web_socket, :owner_tls, :agent_https, :origin_https]
+    original_core = child_pids(server, core_ids)
+    relay = Server.relay(server)
+    dispatcher = child_pid(server, :push_dispatcher)
+
+    assert is_pid(dispatcher)
+    assert Map.fetch!(:sys.get_state(relay), :push_enabled)
+
+    restarted_dispatcher = kill_and_wait_for_restart(server, :push_dispatcher, dispatcher)
+
+    assert Server.relay(server) == relay
+    assert child_pids(server, core_ids) == original_core
+    assert Map.fetch!(:sys.get_state(relay), :push_enabled)
+
+    _restarted_relay = kill_and_wait_for_restart(server, :relay, relay)
+    _restarted_dispatcher = await_replacement(server, :push_dispatcher, restarted_dispatcher)
+
+    assert Map.fetch!(:sys.get_state(Server.relay(server)), :push_enabled)
+    assert Server.port(server) > 0
+    assert Server.owner_port(server) > 0
+    assert Server.agent_port(server) > 0
+    assert Server.origin_port(server) > 0
+    assert Server.enroll_port(server) > 0
+  end
+
   defp server_opts(certs) do
     dir_name = "harklight-optional-startup-#{System.unique_integer([:positive])}"
     dir = Path.join(System.tmp_dir!(), dir_name)
@@ -113,5 +165,42 @@ defmodule AttentionServer.OptionalStartupTest do
     refute Enum.any?(Supervisor.which_children(server), fn {child_id, pid, _, _} ->
              child_id == id and is_pid(pid)
            end)
+  end
+
+  defp child_pid(server, id) do
+    case Enum.find(Supervisor.which_children(server), fn {child_id, _, _, _} ->
+           child_id == id
+         end) do
+      {^id, pid, _, _} when is_pid(pid) -> pid
+      _ -> nil
+    end
+  end
+
+  defp child_pids(server, ids) do
+    Map.new(ids, fn id -> {id, child_pid(server, id)} end)
+  end
+
+  defp kill_and_wait_for_restart(server, id, pid) do
+    ref = Process.monitor(pid)
+    Process.exit(pid, :kill)
+    assert_receive {:DOWN, ^ref, :process, ^pid, _reason}, 5_000
+    await_replacement(server, id, pid)
+  end
+
+  defp await_replacement(server, id, previous_pid, attempts \\ 100)
+
+  defp await_replacement(_server, id, _previous_pid, 0) do
+    flunk("#{id} child did not restart")
+  end
+
+  defp await_replacement(server, id, previous_pid, attempts) do
+    case child_pid(server, id) do
+      pid when is_pid(pid) and pid != previous_pid ->
+        pid
+
+      _ ->
+        Process.sleep(10)
+        await_replacement(server, id, previous_pid, attempts - 1)
+    end
   end
 end

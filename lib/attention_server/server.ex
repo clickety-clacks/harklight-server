@@ -166,7 +166,19 @@ defmodule AttentionServer.Server do
         ip: Keyword.get(opts, :origin_ip, {127, 0, 0, 1})
       ]
 
-      children = [Supervisor.child_spec({Relay, relay_opts}, id: :relay)]
+      children = [
+        Supervisor.child_spec({Relay, relay_opts}, id: :relay),
+        Supervisor.child_spec({WebSocketRelay, web_opts}, id: :web_socket),
+        Supervisor.child_spec({OwnerTLS, owner_opts}, id: :owner_tls),
+        Supervisor.child_spec({AgentHTTPS, agent_opts}, id: :agent_https)
+      ]
+
+      children =
+        if Keyword.has_key?(opts, :origin_port) do
+          children ++ [Supervisor.child_spec({OriginHTTPS, origin_opts}, id: :origin_https)]
+        else
+          children
+        end
 
       children =
         if apns_opts do
@@ -185,8 +197,6 @@ defmodule AttentionServer.Server do
           children
         end
 
-      children = children ++ [Supervisor.child_spec({WebSocketRelay, web_opts}, id: :web_socket)]
-
       children =
         if Keyword.get(opts, :enrollment_enabled, true) do
           children ++
@@ -200,20 +210,6 @@ defmodule AttentionServer.Server do
                 :worker
               )
             ]
-        else
-          children
-        end
-
-      children =
-        children ++
-          [
-            Supervisor.child_spec({OwnerTLS, owner_opts}, id: :owner_tls),
-            Supervisor.child_spec({AgentHTTPS, agent_opts}, id: :agent_https)
-          ]
-
-      children =
-        if Keyword.has_key?(opts, :origin_port) do
-          children ++ [Supervisor.child_spec({OriginHTTPS, origin_opts}, id: :origin_https)]
         else
           children
         end
@@ -427,7 +423,7 @@ defmodule AttentionServer.Server do
     %{
       id: id,
       start: {__MODULE__, :start_optional_child, [module, opts, operation, phase]},
-      restart: :temporary,
+      restart: :permanent,
       shutdown: 5_000,
       type: type,
       modules: [module]
