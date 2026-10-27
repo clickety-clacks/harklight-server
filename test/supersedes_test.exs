@@ -25,6 +25,16 @@ defmodule AttentionServer.SupersedesTest do
     response
   end
 
+  defp session_request(relay, session, frame) do
+    assert {:ok, lines} =
+             Relay.session_request_line(relay, session, JSON.encode!(Map.put(frame, "v", 1)) <> "\n")
+
+    Enum.map(lines, fn line ->
+      assert {:ok, response} = JSON.decode_line(line)
+      response
+    end)
+  end
+
   defp send_request(relay, device, session, id, operation, extra \\ %{}) do
     request(relay, device, %{
       "type" => "forward",
@@ -74,6 +84,14 @@ defmodule AttentionServer.SupersedesTest do
     assert {:ok, %{"cursor" => first_feed_high}} = Relay.origin_feed(relay, "first", 0)
     assert :ok = Relay.origin_stream_attach(relay, "first", @first_session, self())
 
+    assert {:ok, phone_session} = Relay.open_session(relay, "phone")
+    assert [%{"type" => "ok"} | initial_replay] =
+             session_request(relay, phone_session, %{"type" => "resync", "since" => 0})
+
+    assert %{"type" => "resynced", "seq" => 4} = List.last(initial_replay)
+    assert [%{"type" => "ok", "seq" => 4}] =
+             session_request(relay, phone_session, %{"type" => "ack", "seq" => 4})
+
     listed = ["m1", "m2", "answered", "missing", 7, "m1", "new"]
 
     expected_warnings = [
@@ -87,6 +105,35 @@ defmodule AttentionServer.SupersedesTest do
              send_request(relay, "second", @second_session, "new", 6, %{
                "supersedes" => listed
              })
+
+    assert {:ok, live_lines} = Relay.session_drain(relay, phone_session)
+
+    live =
+      Enum.map(live_lines, fn line ->
+        assert {:ok, event} = JSON.decode_line(line)
+        event
+      end)
+
+    assert Enum.map(live, & &1["seq"]) == [5, 6, 7]
+    assert hd(live)["message"]["supersedes"] == listed
+    assert Enum.map(tl(live), &{&1["message_id"], &1["state"]}) ==
+             [{"m1", "superseded"}, {"m2", "superseded"}]
+
+    assert {:ok, page_session} = Relay.open_websocket_session(relay, "phone", nil, nil)
+
+    assert [page] =
+             session_request(relay, page_session, %{
+               "type" => "inbox_start",
+               "paging_version" => 1,
+               "startup_id" => "supersedes-snapshot",
+               "since" => 0,
+               "ref" => "start"
+             })
+
+    for id <- ["m1", "m2"] do
+      item = Enum.find(page["items"], &(get_in(&1, ["acceptance", "message_id"]) == id))
+      assert item["terminal"]["state"] == "superseded"
+    end
 
     assert_receive {:origin_state_changed, next_feed_high}
     assert next_feed_high == first_feed_high + 1
@@ -152,6 +199,15 @@ defmodule AttentionServer.SupersedesTest do
 
     assert Enum.map(Enum.slice(replayed, 5, 2), &{&1["message_id"], &1["state"]}) ==
              [{"m1", "superseded"}, {"m2", "superseded"}]
+
+    assert {:ok, replay_session} = Relay.open_session(restarted, "phone")
+    assert [%{"type" => "ok"} | catchup] =
+             session_request(restarted, replay_session, %{"type" => "resync", "since" => 4})
+
+    assert Enum.map(Enum.take(catchup, 5), & &1["seq"]) == [5, 6, 7, 8, 9]
+    assert Enum.map(Enum.slice(catchup, 1, 2), &{&1["message_id"], &1["state"]}) ==
+             [{"m1", "superseded"}, {"m2", "superseded"}]
+    assert %{"type" => "resynced", "seq" => 9} = List.last(catchup)
 
     assert {:ok, [_only_other_account_delivery], 1} = Relay.events(restarted, "other", 0)
     GenServer.stop(restarted)
