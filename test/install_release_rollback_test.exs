@@ -27,7 +27,8 @@ defmodule AttentionServer.InstallReleaseRollbackTest do
   end
 
   @tag timeout: 30_000
-  test "failed candidate readiness restores the exact pre-migration store and prior release", context do
+  test "failed candidate readiness restores the exact pre-migration store and prior release",
+       context do
     {output, status} = run_installer("upgrade-failure", context)
 
     assert status == 0, output
@@ -77,6 +78,7 @@ defmodule AttentionServer.InstallReleaseRollbackTest do
     assert :ok = Store.close(initial)
 
     pre_format_22_engine = Map.delete(engine, :hosted_accounts)
+
     pre_format_23_engine =
       pre_format_22_engine
       |> Map.delete(:algorithm_choices)
@@ -90,6 +92,7 @@ defmodule AttentionServer.InstallReleaseRollbackTest do
       )
 
     assert {:ok, db} = Sqlite3.open(path)
+
     assert {:ok, statement} =
              Sqlite3.prepare(db, "UPDATE relay_state SET payload = ?, checksum = ? WHERE id = 1")
 
@@ -106,6 +109,7 @@ defmodule AttentionServer.InstallReleaseRollbackTest do
 
   defp store_format(path) do
     assert {:ok, db} = Sqlite3.open(path)
+
     assert {:ok, statement} =
              Sqlite3.prepare(db, "SELECT payload, checksum FROM relay_state WHERE id = 1")
 
