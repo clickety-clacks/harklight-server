@@ -7,7 +7,7 @@ Harklight iOS/iPadOS app.
 
 ## Install the server
 
-For the FORMAT23 v0.1.13 server package, use the release page below after it
+For the FORMAT24 v0.1.13 server package, use the release page below after it
 is published to download the Linux x86_64 archive, `SHA256SUMS` and
 `SELF_HOST.md`. Verify the checksum before extraction:
 
@@ -28,16 +28,16 @@ The package does not install a service, configure the tailnet or expose ports.
 State, owner/device identities, trust roots and sender grants live outside the
 versioned package. Run one server per database. Keep private keys and backups
 private; do not repeat bootstrap over an existing installation.
-This source uses FORMAT23 and migrates supported older state on startup. The
-v0.1.13 and v0.1.12 packages use FORMAT23; v0.1.11 uses FORMAT22 and v0.1.10
-accepts formats 1–6 and 8–21. Those earlier packages cannot start against
-FORMAT23 state. The
-release installer creates one full private backup before switching releases. If
+This source uses FORMAT24 and migrates supported older state on startup. The
+v0.1.12 package uses FORMAT23, v0.1.11 uses FORMAT22, and v0.1.10 accepts
+formats 1–6 and 8–21. Those earlier packages cannot start against FORMAT24
+state. The release installer creates one full private backup before switching
+releases. If
 the candidate process does not become ready, the installer restores that
 backup, selects and starts the prior release, and reports that writes since the
-backup may have been lost. A successful FORMAT23 upgrade remains one-way for a
-code-only downgrade; restoring the earlier package later requires a compatible
-state or the pre-upgrade backup.
+backup may have been lost. A successful FORMAT24 upgrade remains one-way for a
+code-only downgrade; restoring an earlier package later requires restoring the
+complete pre-upgrade backup.
 
 The archive does not contain the `harklight-agent` conversation CLI; install
 it separately as described under [Get the agent CLI](#get-the-agent-cli).
