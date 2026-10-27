@@ -49,6 +49,7 @@ defmodule AttentionServer.Engine do
             events: %{},
             conversation_highs: %{},
             conversation_events: %{},
+            chat_read_positions: %{},
             conversation_cursors: %{},
             conversation_opened: MapSet.new(),
             receipts: %{},
@@ -2121,6 +2122,30 @@ defmodule AttentionServer.Engine do
     end
   end
 
+  @doc "The account's read positions for conversation catch-up."
+  def chat_read_positions(%__MODULE__{} = engine, key) do
+    with {:ok, %{person: person}} <- principal(engine, key) do
+      positions =
+        engine.chat_read_positions
+        |> Enum.flat_map(fn
+          {{^person, sender, id}, seq} ->
+            [
+              %{
+                "sender_id" => sender,
+                "message_id" => id,
+                "read_through_conversation_seq" => seq
+              }
+            ]
+
+          _ ->
+            []
+        end)
+        |> Enum.sort_by(&{&1["sender_id"], &1["message_id"]})
+
+      {:ok, positions}
+    end
+  end
+
   def open_conversation(%__MODULE__{} = engine, key) do
     with {:ok, %{person: person, key: device}} <- principal(engine, key) do
       {:ok,
@@ -2627,6 +2652,9 @@ defmodule AttentionServer.Engine do
 
   defp dispatch(engine, principal, %{"type" => "discussion"} = frame),
     do: discussion(engine, principal, frame)
+
+  defp dispatch(engine, principal, %{"type" => "conversation_read"} = frame),
+    do: conversation_read(engine, principal, frame)
 
   defp dispatch(engine, principal, %{"type" => "conversation_reply"} = frame),
     do: conversation_reply(engine, principal, frame)
@@ -3470,6 +3498,80 @@ defmodule AttentionServer.Engine do
 
       _ ->
         :ok
+    end
+  end
+
+  defp conversation_read(engine, %{person: person, key: actor}, frame) do
+    with :ok <- valid_op(frame),
+         :ok <- valid_global_id(frame) do
+      semantic = Map.take(frame, ~w(type sender_id message_id read_through_conversation_seq))
+      op = frame["op_id"]
+
+      case receipt(engine, person, actor, op, semantic) do
+        {:duplicate, reply} -> {:ok, engine, reply}
+        :conflict -> failure("operation_conflict")
+        :missing -> commit_conversation_read(engine, person, actor, frame, semantic)
+      end
+    else
+      {:error, field} -> failure("invalid_field", field)
+    end
+  end
+
+  defp commit_conversation_read(engine, person, actor, frame, semantic) do
+    key = {person, frame["sender_id"], frame["message_id"]}
+    position = frame["read_through_conversation_seq"]
+
+    case Map.get(engine.messages, key) do
+      nil ->
+        failure("not_found")
+
+      %{origin: ^actor} ->
+        failure("not_person")
+
+      _record ->
+        case Map.get(engine.conversation_events, {person, position}) do
+          %{key: ^key, payload: %{"kind" => "reply", "author" => "origin"}} ->
+            current = Map.get(engine.chat_read_positions, key, 0)
+
+            if position <= current do
+              fields = %{"read_through_conversation_seq" => current}
+              next = save_receipt(engine, person, actor, frame["op_id"], semantic, fields)
+              {:ok, next, fields}
+            else
+              {next, seq} = next_conversation_seq(engine, person)
+              # Origin-feed IDs are decimal strings; this prefix keeps read events distinct.
+              event_id = "read:" <> Integer.to_string(seq)
+
+              payload = %{
+                "kind" => "read_position",
+                "event_id" => event_id,
+                "read_through_conversation_seq" => position
+              }
+
+              fields = %{
+                "read_through_conversation_seq" => position,
+                "seq" => seq,
+                "event_id" => event_id
+              }
+
+              next =
+                next
+                |> then(fn state ->
+                  %{
+                    state
+                    | chat_read_positions: Map.put(state.chat_read_positions, key, position)
+                  }
+                end)
+                |> put_conversation_event(person, seq, key, payload)
+                |> queue_conversation_hint(person, seq)
+                |> save_receipt(person, actor, frame["op_id"], semantic, fields)
+
+              {:ok, next, fields}
+            end
+
+          _ ->
+            failure("invalid_field", "read_through_conversation_seq")
+        end
     end
   end
 
@@ -4651,16 +4753,22 @@ defmodule AttentionServer.Engine do
       "request_revision" => event.payload["request_revision"]
     }
 
-    if device == record.origin do
-      Map.merge(
-        base,
-        Map.take(
-          event.payload,
-          ~w(author event_id acting_event_id in_reply_to availability last_detached_at session_handle listening_support unsupported_reason delivered acted file_transfers file status reason op_id terminal_seq terminal_state retracted_at)
-        )
-      )
+    if event.payload["kind"] == "read_position" do
+      base
+      |> Map.delete("request_revision")
+      |> Map.merge(Map.take(event.payload, ~w(event_id read_through_conversation_seq)))
     else
-      Map.merge(base, Map.drop(event.payload, ~w(sender_id message_id feed_seq)))
+      if device == record.origin do
+        Map.merge(
+          base,
+          Map.take(
+            event.payload,
+            ~w(author event_id acting_event_id in_reply_to availability last_detached_at session_handle listening_support unsupported_reason delivered acted file_transfers file status reason op_id terminal_seq terminal_state retracted_at)
+          )
+        )
+      else
+        Map.merge(base, Map.drop(event.payload, ~w(sender_id message_id feed_seq)))
+      end
     end
   end
 
@@ -4699,6 +4807,21 @@ defmodule AttentionServer.Engine do
         else: frame
 
     frame = if is_binary(terminal.by), do: Map.put(frame, "by", terminal.by), else: frame
+
+    frame =
+      case {Map.get(terminal, :kind), terminal.by, terminal.answer_present, terminal.answer} do
+        {"no_comment", _, _, _} ->
+          Map.put(frame, "answer_outcome", %{"kind" => "no_comment"})
+
+        {_, "answer", true, nil} ->
+          Map.put(frame, "answer_outcome", %{"kind" => "seen"})
+
+        {_, "answer", true, answer} when is_binary(answer) ->
+          Map.put(frame, "answer_outcome", %{"kind" => "reply", "text" => answer})
+
+        _ ->
+          frame
+      end
 
     if terminal.answer_present and device == record.origin,
       do: Map.put(frame, "answer", terminal.answer),
