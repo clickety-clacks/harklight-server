@@ -2,9 +2,7 @@ import Config
 require Logger
 
 optional_warning = fn feature, reason ->
-  Logger.warning(
-    "event=harklight_optional_feature_disabled feature=#{feature} reason=#{reason}"
-  )
+  Logger.warning("event=harklight_optional_feature_disabled feature=#{feature} reason=#{reason}")
 end
 
 parse_optional_port = fn variable ->
@@ -80,8 +78,12 @@ if System.get_env("ATTENTION_SERVER_ENABLE") == "1" do
 
   {deployment_mode, deployment_mode_valid?} =
     case System.get_env("ATTENTION_SERVER_DEPLOYMENT_MODE", "self_hosted") do
-      "self_hosted" -> {:self_hosted, true}
-      "saas" -> {:saas, true}
+      "self_hosted" ->
+        {:self_hosted, true}
+
+      "saas" ->
+        {:saas, true}
+
       _ ->
         optional_warning.("hosted_account", "invalid_deployment_mode")
         {:invalid, false}
@@ -94,7 +96,9 @@ if System.get_env("ATTENTION_SERVER_ENABLE") == "1" do
 
       value ->
         case Integer.parse(value) do
-          {cap, ""} when cap > 0 -> {cap, true}
+          {cap, ""} when cap > 0 ->
+            {cap, true}
+
           _ ->
             optional_warning.("hosted_account", "invalid_upload_cap")
             {:none, false}
@@ -198,7 +202,8 @@ if System.get_env("ATTENTION_SERVER_ENABLE") == "1" do
         :not_set ->
           server_opts
 
-        {:error, :invalid} -> server_opts
+        {:error, :invalid} ->
+          server_opts
       end
       |> then(fn opts ->
         if hosted_settings_available? do

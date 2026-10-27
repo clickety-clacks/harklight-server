@@ -66,6 +66,7 @@ defmodule AttentionServer.Server do
            ) do
       deployment_mode =
         normalize_deployment_mode(Keyword.get(opts, :deployment_mode, :self_hosted))
+
       upload_cap = normalize_upload_cap(Keyword.get(opts, :upload_cap, :none))
       public_origin = normalize_public_origin(Keyword.get(opts, :public_base_url))
 
@@ -344,11 +345,18 @@ defmodule AttentionServer.Server do
 
       dashboard_origin =
         cond do
-          is_binary(origin) -> origin
-          origin == :invalid -> nil
+          is_binary(origin) ->
+            origin
+
+          origin == :invalid ->
+            nil
+
           valid_join_name?(join_name) and is_integer(dashboard_port) and
-              dashboard_port in 1..65_535 -> "https://#{join_name}:#{dashboard_port}"
-          true -> nil
+              dashboard_port in 1..65_535 ->
+            "https://#{join_name}:#{dashboard_port}"
+
+          true ->
+            nil
         end
 
       configured? =
