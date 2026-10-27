@@ -40,7 +40,7 @@ defmodule AttentionServer.InstallReleaseRollbackTest do
     {output, status} = run_installer("optional-route", context)
 
     assert status == 0, output
-    assert store_format(context.store_path) == 23
+    assert sha256_file(context.store_path) == context.store_sha256
   end
 
   defp run_installer(mode, context) do
