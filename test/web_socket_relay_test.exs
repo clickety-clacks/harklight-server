@@ -268,6 +268,130 @@ defmodule AttentionServer.WebSocketRelayTest do
     :ssl.close(sender)
   end
 
+  test "No comment reconciliation commits once and keeps the frozen checkpoint", ctx do
+    %{certs: certs, web: web} = ctx
+
+    assert {:ok, origin} = connect(web, certs, "a1")
+    assert upgrade(origin) =~ "101 Switching Protocols"
+    assert {[], %{"seq" => 0}} = resync(origin)
+
+    assert {:ok, device} = connect(web, certs, "a2")
+    assert upgrade(device) =~ "101 Switching Protocols"
+
+    assert :ok =
+             send_request(origin, %{
+               "type" => "forward",
+               "op_id" => op(9200),
+               "message" => message("reconcile-no-comment", "No comment request")
+             })
+
+    assert %{"type" => "ok", "seq" => 1} = reply(origin)
+    assert %{"type" => "delivery", "seq" => 1} = reply(origin)
+
+    assert :ok =
+             send_request(device, %{
+               "type" => "inbox_start",
+               "paging_version" => 1,
+               "startup_id" => "no-comment-reconcile",
+               "since" => 0
+             })
+
+    assert %{"type" => "ok", "snapshot_id" => snapshot_id, "high_water" => 1} =
+             reply(device)
+
+    operation = %{
+      "type" => "answer_no_comment",
+      "op_id" => op(9201),
+      "request_id" => "reconcile-no-comment",
+      "request_revision" => 1
+    }
+
+    request = %{
+      "type" => "inbox_reconcile",
+      "paging_version" => 1,
+      "snapshot_id" => snapshot_id,
+      "batch_id" => "no-comment-first",
+      "operations" => [operation]
+    }
+
+    assert :ok = send_request(device, request)
+
+    assert %{"type" => "ok", "high_water" => 1, "results" => [first]} =
+             first_batch = reply(device)
+
+    assert first["op_id"] == op(9201)
+    assert first["status"] == "committed"
+    assert first["result"] == %{
+             "v" => 1,
+             "type" => "ok",
+             "seq" => 2,
+             "terminal_kind" => "no_comment",
+             "duplicate" => false
+           }
+
+    assert %{
+             "type" => "lifecycle",
+             "seq" => 2,
+             "state" => "answered",
+             "by" => "answer_no_comment",
+             "terminal_kind" => "no_comment",
+             "answer_outcome" => %{"kind" => "no_comment"}
+           } = first["terminal"]
+
+    assert %{"type" => "lifecycle", "seq" => 2, "terminal_kind" => "no_comment"} =
+             reply(origin)
+
+    assert :ok = send_request(device, request)
+    assert reply(device) == first_batch
+
+    assert :ok =
+             send_request(device, %{request | "batch_id" => "no-comment-repeat"})
+
+    assert %{"type" => "ok", "high_water" => 1, "results" => [duplicate]} =
+             reply(device)
+
+    assert duplicate["result"]["seq"] == 2
+    assert duplicate["result"]["duplicate"] == true
+    assert duplicate["terminal"] == first["terminal"]
+
+    assert :ok =
+             send_request(device, %{
+               request
+               | "batch_id" => "no-comment-refused",
+                 "operations" => [
+                   %{operation | "op_id" => op(9202)},
+                   %{
+                     "type" => "answer",
+                     "op_id" => op(9203),
+                     "sender_id" => "app:test",
+                     "message_id" => "reconcile-no-comment",
+                     "answer" => "not sent"
+                   }
+                 ]
+             })
+
+    assert %{"type" => "ok", "results" => [refused, other]} = reply(device)
+    assert refused == %{"op_id" => op(9202), "status" => "refused", "reason" => "closed"}
+    assert other["status"] == "not_committed_at_snapshot"
+
+    assert :ok =
+             send_request(device, %{
+               "type" => "inbox_checkpoint_ack",
+               "paging_version" => 1,
+               "snapshot_id" => snapshot_id,
+               "high_water" => 1,
+               "reconciled_batches" =>
+                 ~w(no-comment-first no-comment-repeat no-comment-refused),
+               "pending_manifest_complete" => true
+             })
+
+    assert %{"type" => "ok", "checkpoint_accepted" => true, "high_water" => 1} =
+             reply(device)
+
+    :ssl.close(device)
+    :ssl.close(origin)
+  end
+
   test "TLS WebSocket keeps stored history readable and accepts legacy agent frames", ctx do
     %{certs: certs, web: web, relay: relay, keys: keys} = ctx
     message = message("one", "stored before route removal")
