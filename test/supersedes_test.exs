@@ -7,7 +7,9 @@ defmodule AttentionServer.SupersedesTest do
   @second_session "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
 
   setup do
-    dir = Path.join(System.tmp_dir!(), "harklight-supersedes-#{System.unique_integer([:positive])}")
+    dir =
+      Path.join(System.tmp_dir!(), "harklight-supersedes-#{System.unique_integer([:positive])}")
+
     File.mkdir_p!(dir)
     on_exit(fn -> File.rm_rf!(dir) end)
     %{path: Path.join(dir, "state.sqlite3")}
@@ -96,8 +98,10 @@ defmodule AttentionServer.SupersedesTest do
 
     assert {:ok, events, 7} = Relay.events(relay, "phone", 0)
     assert Enum.at(events, 4)["message"]["supersedes"] == listed
+
     assert Enum.map(Enum.drop(events, 5), &{&1["message_id"], &1["state"]}) ==
              [{"m1", "superseded"}, {"m2", "superseded"}]
+
     refute Enum.any?(Enum.drop(events, 5), &Map.has_key?(&1, "terminal_reason"))
 
     assert {:ok, %{"entries" => first_feed}} = Relay.origin_feed(relay, "first", 0)
@@ -145,8 +149,10 @@ defmodule AttentionServer.SupersedesTest do
     assert {:ok, restarted} = Relay.start_link(store_path: path)
     assert {:ok, replayed, 9} = Relay.events(restarted, "phone", 0)
     assert Enum.at(replayed, 4)["message"]["supersedes"] == listed
+
     assert Enum.map(Enum.slice(replayed, 5, 2), &{&1["message_id"], &1["state"]}) ==
              [{"m1", "superseded"}, {"m2", "superseded"}]
+
     assert {:ok, [_only_other_account_delivery], 1} = Relay.events(restarted, "other", 0)
     GenServer.stop(restarted)
   end

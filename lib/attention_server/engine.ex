@@ -3421,8 +3421,15 @@ defmodule AttentionServer.Engine do
                       {state, [%{"message_id" => id, "reason" => "closed"} | warnings], seen}
 
                     record ->
-                      {supersede_target(state, person, device, op, target_key, record, accepted_at),
-                       warnings, seen}
+                      {supersede_target(
+                         state,
+                         person,
+                         device,
+                         op,
+                         target_key,
+                         record,
+                         accepted_at
+                       ), warnings, seen}
                   end
               end
             end
