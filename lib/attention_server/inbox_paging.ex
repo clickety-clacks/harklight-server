@@ -450,7 +450,7 @@ defmodule AttentionServer.InboxPaging do
   end
 
   defp normalize_operations(operations) do
-    if Enum.all?(operations, &is_map/1) do
+    if Enum.all?(operations, &(is_map(&1) and is_binary(&1["op_id"]))) do
       {:ok, Enum.map(operations, &Map.delete(&1, "ref"))}
     else
       {:error, :invalid_field}
