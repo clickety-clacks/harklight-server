@@ -1,6 +1,6 @@
 # Harklight Server self-hosted installation
 
-Version: **0.1.12**. Package target: **Linux x86_64, glibc 2.39 or newer**, with OpenSSL 3 shared libraries and libstdc++6 (built on Ubuntu 24.04). The package bundles
+Version: **0.1.13**. Package target: **Linux x86_64, glibc 2.39 or newer**, with OpenSSL 3 shared libraries and libstdc++6 (built on Ubuntu 24.04). The package bundles
 Erlang/OTP and Elixir bytecode; users need no Mix, Hex, source checkout or
 Erlang installation. It needs Bash, OpenSSL CLI, tar and the platform libraries
 listed in BUILD_INFO. This is a single-process self-hosted server cut.
@@ -32,9 +32,9 @@ a live phone test.
 
 ## Download and verify
 
-After publication, download the v0.1.12 release from
-clickety-clacks/harklight-server, tag v0.1.12. Get
-harklight-server-0.1.12-linux-x86_64.tar.gz, SHA256SUMS and SELF_HOST.md from
+After publication, download the v0.1.13 release from
+clickety-clacks/harklight-server, tag v0.1.13. Get
+harklight-server-0.1.13-linux-x86_64.tar.gz, SHA256SUMS and SELF_HOST.md from
 that release. Run sha256sum -c SHA256SUMS and extract into an operator-owned
 versioned directory. BUILD_INFO identifies the source commit, build host,
 toolchain, source status and native dependencies.
@@ -47,7 +47,7 @@ runtime/dependency notices remain in their shipped distribution files.
 Choose the DNS hostname clients will validate. For a same-machine preview,
 localhost works. Install into a directory you own and run:
 
-    PACKAGE="$PWD/harklight-server-0.1.12-linux-x86_64"
+    PACKAGE="$PWD/harklight-server-0.1.13-linux-x86_64"
     STATE="$HOME/.local/share/harklight-server"
     "$PACKAGE/bin/harklight-bootstrap" "$STATE" localhost
     cat "$STATE/person-id"
@@ -281,16 +281,17 @@ survive restart.
 For a manual upgrade of an existing installation, stop the old server and back
 up the full private state before upgrading. The release installer makes one
 full mutable-root backup after stopping the service and before switching
-releases. This source uses store FORMAT23; supported older state,
+releases. This source uses store FORMAT24; supported older state,
 including FORMAT17, is normalized and durably committed on startup. The new
 state includes hosted-account records, the separate conversation feed,
 conversation push high water and upload activity accounting while retaining
-existing requests, answers and authority. The v0.1.12 package uses FORMAT23;
-v0.1.11 uses FORMAT22 and v0.1.10 accepts formats 1–6 and 8–21 only. Those
-earlier packages cannot start against FORMAT23. Preserve the trust root, person
-and sender grants; do not repeat bootstrap. After a successful FORMAT23 upgrade,
-an earlier package is not a code-only rollback path; use a compatible forward
-repair or restore the complete pre-upgrade backup.
+existing requests, answers and authority, and adds persisted chat read positions.
+The v0.1.13 package uses FORMAT24; v0.1.12 uses FORMAT23; v0.1.11 uses FORMAT22;
+and v0.1.10 accepts formats 1–6 and 8–21 only. Those earlier packages cannot
+start against FORMAT24. Preserve the trust root, person and sender grants; do
+not repeat bootstrap. After a successful FORMAT24 upgrade, an earlier package
+is not a code-only rollback path; restore the complete pre-upgrade backup to
+return to that state.
 
 Starting a server with APNs configured can dispatch existing queued work. The
 release installer does not inspect, clear, or mark provider work delivered. It
@@ -314,10 +315,11 @@ the APNs variables unset.
 
 Agents send new messages and listen for replies through the authenticated
 [`harklight-agent` session route](skills/harklight-agent-send-listen/SKILL.md).
-The enrolled-device `read` and `respond` commands remain available for messages
-already stored by the server. They do not create new requests or retrieve an
-origin receipt. Existing messages and their replay events remain in the server
-history; the removed origin-receipt query is no longer available.
+The enrolled-device `send` and correlated `receipt` commands retain their
+earlier arguments and output. The `receipt` command retrieves the terminal
+server-side outcome correlated with that device send operation. Device `read`
+and `respond` also remain available for messages already stored by the server.
+Existing messages and their replay events remain in the server history.
 
 Use an enrolled device with read/respond access to see its person's stored
 messages:
@@ -347,7 +349,7 @@ exact acceptance sequence and intent reference, without source ruling authority.
 
 For a manual upgrade, stop the old process and back up the complete private
 state directory, including the database and keys, before the first start of a
-FORMAT23 build. Verify the package checksum and extract into a different
+FORMAT24 build. Verify the package checksum and extract into a different
 versioned directory. Keep the state path, trust root, owner/person and
 configuration. Start with the existing `server.env`; do not rerun bootstrap.
 Startup migrates supported earlier store formats immediately. There is no hot
@@ -374,8 +376,8 @@ trigger a whole-release rollback.
 
 Restoring the pre-install backup discards every write made after its capture,
 including any writes made by the candidate during its failed start. A successful
-FORMAT23 upgrade cannot be rolled back by changing the code link alone because
-earlier releases refuse FORMAT23 state. Keep backups and keys private.
+FORMAT24 upgrade cannot be rolled back by changing the code link alone because
+v0.1.12 and earlier releases refuse FORMAT24 state. Keep backups and keys private.
 
 ## Build
 

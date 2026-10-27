@@ -7,16 +7,16 @@ Harklight iOS/iPadOS app.
 
 ## Install the server
 
-For the FORMAT23 v0.1.12 server package, use the release page below after it
+For the FORMAT24 v0.1.13 server package, use the release page below after it
 is published to download the Linux x86_64 archive, `SHA256SUMS` and
 `SELF_HOST.md`. Verify the checksum before extraction:
 
-[v0.1.12 release](https://github.com/clickety-clacks/harklight-server/releases/tag/v0.1.12)
+[v0.1.13 release](https://github.com/clickety-clacks/harklight-server/releases/tag/v0.1.13)
 (available only after publication).
 
 ```sh
 sha256sum -c SHA256SUMS
-tar -xzf harklight-server-0.1.12-linux-x86_64.tar.gz
+tar -xzf harklight-server-0.1.13-linux-x86_64.tar.gz
 ```
 
 Follow [SELF_HOST.md](SELF_HOST.md) for a fresh installation, tailnet routing,
@@ -28,15 +28,16 @@ The package does not install a service, configure the tailnet or expose ports.
 State, owner/device identities, trust roots and sender grants live outside the
 versioned package. Run one server per database. Keep private keys and backups
 private; do not repeat bootstrap over an existing installation.
-This source uses FORMAT23 and migrates supported older state on startup. The
-v0.1.12 package uses FORMAT23; v0.1.11 uses FORMAT22 and v0.1.10 accepts formats
-1–6 and 8–21. Those earlier packages cannot start against FORMAT23 state. The
-release installer creates one full private backup before switching releases. If
+This source uses FORMAT24 and migrates supported older state on startup. The
+v0.1.12 package uses FORMAT23, v0.1.11 uses FORMAT22, and v0.1.10 accepts
+formats 1–6 and 8–21. Those earlier packages cannot start against FORMAT24
+state. The release installer creates one full private backup before switching
+releases. If
 the candidate process does not become ready, the installer restores that
 backup, selects and starts the prior release, and reports that writes since the
-backup may have been lost. A successful FORMAT23 upgrade remains one-way for a
-code-only downgrade; restoring the earlier package later requires a compatible
-state or the pre-upgrade backup.
+backup may have been lost. A successful FORMAT24 upgrade remains one-way for a
+code-only downgrade; restoring an earlier package later requires restoring the
+complete pre-upgrade backup.
 
 The archive does not contain the `harklight-agent` conversation CLI; install
 it separately as described under [Get the agent CLI](#get-the-agent-cli).
@@ -83,9 +84,10 @@ its commands and message format.
 
 Agents send new messages and listen for replies through the authenticated
 [`harklight-agent` session route](skills/harklight-agent-send-listen/SKILL.md).
-Enrolled-device `read` and `respond` remain available for requests already
-stored by the server; they do not create new requests or query a sender receipt.
-Registered agent identities have separately granted search/get/respond access.
+Enrolled-device `send` and correlated `receipt` commands are available with the
+earlier device interface. `read` and `respond` remain available for requests
+already stored by the server. Registered agent identities have separately
+granted search/get/respond access.
 
 Agent inbox search lists unresolved requests before resolved history, newest
 original server acceptance first within each group. Search pagination preserves

@@ -175,11 +175,11 @@ its connection indicator stays Unknown without a real presence signal.
 
 ## Durable upgrade boundary
 
-This release uses FORMAT23. Supported earlier snapshots, including FORMAT17,
+This release uses FORMAT24. Supported earlier snapshots, including FORMAT17,
 migrate on startup, preserving persons, owners, devices, sender grants and
 pending requests while initializing the hosted-account registry. The v0.1.11
-package uses FORMAT22, and v0.1.10 accepts formats 1–6 and 8–21; neither can
-start against FORMAT23 state.
+package uses FORMAT22, v0.1.12 uses FORMAT23, and v0.1.10 accepts formats 1–6
+and 8–21; those earlier packages cannot start against FORMAT24 state.
 Invitations, consumed bindings and resumable request generations share the
 atomic SQLite snapshot transaction. Keep a protected stopped backup before an
 upgrade. Retain current state and use a compatible forward repair
