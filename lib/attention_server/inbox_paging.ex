@@ -306,7 +306,10 @@ defmodule AttentionServer.InboxPaging do
       if operation["type"] == "answer_no_comment" do
         case Engine.reconcile_no_comment(current, key, operation) do
           {:ok, next, result} ->
-            applied = if next == current, do: applied, else: [operation | applied]
+            applied =
+              if next == current or get_in(result, ["result", "duplicate"]) == true,
+                do: applied,
+                else: [operation | applied]
             {:cont, {:ok, next, [result | results], applied}}
 
           {:error, reason} ->

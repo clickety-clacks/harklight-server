@@ -2481,7 +2481,7 @@ defmodule AttentionServer.Engine do
                 with {:ok, terminal} <-
                        no_comment_terminal(next, person, device, frame["request_id"], reply["seq"]) do
                   next = save_receipt(next, person, device, op_id, semantic, reply)
-                  {:ok, next, no_comment_committed(op_id, reply, terminal, false)}
+                  {:ok, next, no_comment_committed(op_id, reply, terminal, reply["duplicate"] == true)}
                 end
 
               {:error, reason, _field, _terminal} when is_binary(reason) ->
@@ -3546,16 +3546,12 @@ defmodule AttentionServer.Engine do
                   )
 
                 Map.get(record.terminal, :kind) == "no_comment" ->
-                  if is_nil(op_id) do
-                    {:ok, engine,
-                     %{
-                       "seq" => record.terminal.seq,
-                       "terminal_kind" => "no_comment",
-                       "duplicate" => true
-                     }}
-                  else
-                    failure("closed", nil, project_terminal(record, key, actor))
-                  end
+                  {:ok, engine,
+                   %{
+                     "seq" => record.terminal.seq,
+                     "terminal_kind" => "no_comment",
+                     "duplicate" => true
+                   }}
 
                 true ->
                   failure("closed", nil, project_terminal(record, key, actor))
