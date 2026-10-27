@@ -256,21 +256,123 @@ defmodule AttentionServer.HeadlessDeviceTest do
              )
   end
 
-  test "device CLI no longer exposes the agent send or receipt commands" do
-    assert_raise Mix.Error, ~r/use read or respond/, fn ->
-      AttentionServer.CLI.with_io(Mix.Shell.Process, Mix.Error, fn ->
-        AttentionServer.CLI.Device.run(["send"])
-      end)
-    end
+  test "device commands send and retrieve a correlated receipt while read and respond continue",
+       ctx do
+    %{dir: dir, endpoint: endpoint, identities: identities, keys: keys} = ctx
 
-    assert_raise Mix.Error, ~r/use read or respond/, fn ->
-      AttentionServer.CLI.with_io(Mix.Shell.Process, Mix.Error, fn ->
-        AttentionServer.CLI.Device.run(["receipt"])
-      end)
-    end
+    message = %{
+      "sender_id" => "app:test",
+      "message_id" => "compat-request",
+      "created_at" => 1,
+      "title" => "Choose one",
+      "body" => "Device command compatibility",
+      "answer_ui" => %{"kind" => "choice", "items" => ["yes", "no"]}
+    }
 
-    refute function_exported?(HeadlessDevice, :send_message, 3)
-    refute function_exported?(HeadlessDevice, :receipt, 4)
+    message_file = Path.join(dir, "message.json")
+    answer_file = Path.join(dir, "answer.json")
+    answer = %{"choice" => "yes"}
+    File.write!(message_file, JSON.encode!(message) <> "\n")
+    File.write!(answer_file, JSON.encode!(answer) <> "\n")
+
+    old_shell = Mix.shell()
+    Mix.shell(Mix.Shell.Process)
+    on_exit(fn -> Mix.shell(old_shell) end)
+
+    assert :ok = task("send", identities["a1"], endpoint, ["--message", message_file])
+    assert_receive {:mix_shell, :info, [send_line]}
+
+    assert {:ok, %{"type" => "ok", "seq" => 1, "op_id" => send_op}} =
+             JSON.decode_line(send_line <> "\n")
+
+    assert :ok =
+             task("receipt", identities["a1"], endpoint, [
+               "--sender",
+               "app:test",
+               "--message-id",
+               "compat-request"
+             ])
+
+    assert_receive {:mix_shell, :info, [pending_line]}
+
+    assert {:ok, %{"status" => "pending", "acceptance_seq" => 1, "observed_through_seq" => 1}} =
+             JSON.decode_line(pending_line <> "\n")
+
+    assert :ok = task("read", identities["a2"], endpoint, [])
+    assert_receive {:mix_shell, :info, [read_line]}
+
+    assert {:ok, %{"events" => [%{"message" => ^message} = delivery]}} =
+             JSON.decode_line(read_line <> "\n")
+
+    assert delivery["origin"] == keys["a1"]
+
+    assert :ok =
+             task("respond", identities["a2"], endpoint, [
+               "--sender",
+               "app:test",
+               "--message-id",
+               "compat-request",
+               "--answer",
+               answer_file
+             ])
+
+    assert_receive {:mix_shell, :info, [respond_line]}
+
+    assert {:ok, %{"type" => "ok", "seq" => 2, "op_id" => answer_op}} =
+             JSON.decode_line(respond_line <> "\n")
+
+    assert :ok =
+             task("receipt", identities["a1"], endpoint, [
+               "--sender",
+               "app:test",
+               "--message-id",
+               "compat-request"
+             ])
+
+    assert_receive {:mix_shell, :info, [receipt_line]}
+    assert {:ok, %{"receipt" => proof}} = JSON.decode_line(receipt_line <> "\n")
+    assert proof["receipt_version"] == 1
+    assert is_binary(proof["relay_instance_id"])
+    assert proof["person_id"] == "A"
+    assert proof["sender_id"] == "app:test"
+    assert proof["message_id"] == "compat-request"
+    assert proof["acceptance_seq"] == 1
+    assert proof["terminal_seq"] == 2
+    assert proof["terminal_kind"] == "answer"
+    assert proof["state"] == "answered"
+    assert is_integer(proof["at"])
+    assert proof["has_answer"] == true
+    assert proof["answer"] == answer
+    assert proof["winning_op_id"] == answer_op
+
+    assert proof["actor"] == %{
+             "kind" => "device",
+             "id" => keys["a2"],
+             "key_fingerprint" => keys["a2"]
+           }
+
+    assert {:ok, %{"receipt" => ^proof}} =
+             HeadlessDevice.receipt(identities["a1"], endpoint, "app:test", "compat-request")
+
+    assert {:ok, %{"seq" => 1, "duplicate" => true, "op_id" => ^send_op}} =
+             HeadlessDevice.send_message(identities["a1"], endpoint, message_file)
+  end
+
+  defp task(command, directory, endpoint, additional) do
+    Mix.Tasks.Attention.Device.run([
+      command,
+      "--directory",
+      directory,
+      "--connect",
+      "127.0.0.1",
+      "--name",
+      endpoint.name,
+      "--port",
+      Integer.to_string(endpoint.port),
+      "--ca",
+      endpoint.ca_file
+      | additional
+    ])
   end
 
   defp store_existing(relay, key, message, operation_number) do
