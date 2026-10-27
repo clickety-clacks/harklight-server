@@ -256,7 +256,8 @@ defmodule AttentionServer.HeadlessDeviceTest do
              )
   end
 
-  test "device commands send and retrieve a correlated receipt while read and respond continue", ctx do
+  test "device commands send and retrieve a correlated receipt while read and respond continue",
+       ctx do
     %{dir: dir, endpoint: endpoint, identities: identities, keys: keys} = ctx
 
     message = %{
@@ -280,6 +281,7 @@ defmodule AttentionServer.HeadlessDeviceTest do
 
     assert :ok = task("send", identities["a1"], endpoint, ["--message", message_file])
     assert_receive {:mix_shell, :info, [send_line]}
+
     assert {:ok, %{"type" => "ok", "seq" => 1, "op_id" => send_op}} =
              JSON.decode_line(send_line <> "\n")
 
@@ -292,14 +294,16 @@ defmodule AttentionServer.HeadlessDeviceTest do
              ])
 
     assert_receive {:mix_shell, :info, [pending_line]}
-    assert {:ok,
-            %{"status" => "pending", "acceptance_seq" => 1, "observed_through_seq" => 1}} =
+
+    assert {:ok, %{"status" => "pending", "acceptance_seq" => 1, "observed_through_seq" => 1}} =
              JSON.decode_line(pending_line <> "\n")
 
     assert :ok = task("read", identities["a2"], endpoint, [])
     assert_receive {:mix_shell, :info, [read_line]}
+
     assert {:ok, %{"events" => [%{"message" => ^message} = delivery]}} =
              JSON.decode_line(read_line <> "\n")
+
     assert delivery["origin"] == keys["a1"]
 
     assert :ok =
@@ -313,6 +317,7 @@ defmodule AttentionServer.HeadlessDeviceTest do
              ])
 
     assert_receive {:mix_shell, :info, [respond_line]}
+
     assert {:ok, %{"type" => "ok", "seq" => 2, "op_id" => answer_op}} =
              JSON.decode_line(respond_line <> "\n")
 
@@ -339,6 +344,7 @@ defmodule AttentionServer.HeadlessDeviceTest do
     assert proof["has_answer"] == true
     assert proof["answer"] == answer
     assert proof["winning_op_id"] == answer_op
+
     assert proof["actor"] == %{
              "kind" => "device",
              "id" => keys["a2"],
