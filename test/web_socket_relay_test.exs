@@ -200,6 +200,74 @@ defmodule AttentionServer.WebSocketRelayTest do
   defp message(id, title),
     do: %{"sender_id" => "app:test", "message_id" => id, "created_at" => 1, "title" => title}
 
+  test "malformed inbox reconciliation leaves the relay serving later deliveries", ctx do
+    %{certs: certs, web: web, relay: relay} = ctx
+
+    assert {:ok, sender} = connect(web, certs, "a1")
+    assert upgrade(sender) =~ "101 Switching Protocols"
+    assert {[], %{"seq" => 0}} = resync(sender)
+
+    assert {:ok, receiver} = connect(web, certs, "a2")
+    assert upgrade(receiver) =~ "101 Switching Protocols"
+
+    assert :ok =
+             send_request(receiver, %{
+               "type" => "inbox_start",
+               "paging_version" => 1,
+               "startup_id" => "bad-operation-start",
+               "since" => 0
+             })
+
+    assert %{"type" => "ok", "snapshot_id" => snapshot_id, "high_water" => 0} =
+             reply(receiver)
+
+    for {label, operation} <- [
+          {"missing", %{"type" => "answer"}},
+          {"nil", %{"type" => "answer", "op_id" => nil}},
+          {"non-binary", %{"type" => "answer", "op_id" => 1}}
+        ] do
+      assert :ok =
+               send_request(receiver, %{
+                 "type" => "inbox_reconcile",
+                 "paging_version" => 1,
+                 "snapshot_id" => snapshot_id,
+                 "batch_id" => "bad-operation-#{label}",
+                 "operations" => [operation],
+                 "ref" => label
+               })
+
+      assert %{"type" => "error", "reason" => "invalid_field", "ref" => ^label} =
+               reply(receiver)
+    end
+
+    assert :ok =
+             send_request(receiver, %{
+               "type" => "inbox_reconcile",
+               "paging_version" => 1,
+               "snapshot_id" => "bad-snapshot",
+               "batch_id" => "bad-snapshot-batch",
+               "operations" => [%{"type" => "answer", "op_id" => op(9000)}]
+             })
+
+    assert %{"type" => "error", "reason" => "invalid_snapshot"} = reply(receiver)
+    assert Process.alive?(relay)
+
+    assert :ok =
+             send_request(sender, %{
+               "type" => "forward",
+               "op_id" => op(9001),
+               "message" => message("after-bad-operation", "still delivered")
+             })
+
+    assert %{"type" => "ok", "seq" => 1} = reply(sender)
+
+    assert %{"type" => "delivery", "seq" => 1, "message_id" => "after-bad-operation"} =
+             reply(sender)
+
+    :ssl.close(receiver)
+    :ssl.close(sender)
+  end
+
   test "TLS WebSocket keeps stored history readable and accepts legacy agent frames", ctx do
     %{certs: certs, web: web, relay: relay, keys: keys} = ctx
     message = message("one", "stored before route removal")
