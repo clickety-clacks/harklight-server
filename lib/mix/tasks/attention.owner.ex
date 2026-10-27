@@ -31,6 +31,7 @@ defmodule Mix.Tasks.Attention.Owner do
   @impl true
   def run(args) do
     Mix.Task.run("app.start")
+
     AttentionServer.CLI.with_io(Mix.shell(), Mix.Error, fn ->
       AttentionServer.CLI.Owner.run(args)
     end)

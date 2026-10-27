@@ -247,10 +247,14 @@ defmodule AttentionServer.HeadlessEnrollment do
 
   defp read_barrier(socket, count) do
     case read_frame(socket) do
-      {:ok, %{"type" => "resynced"} = barrier} -> {:ok, barrier}
+      {:ok, %{"type" => "resynced"} = barrier} ->
+        {:ok, barrier}
+
       {:ok, %{"type" => type}} when type in ["delivery", "lifecycle"] ->
         read_barrier(socket, count + 1)
-      _ -> {:error, :bad_replay}
+
+      _ ->
+        {:error, :bad_replay}
     end
   end
 

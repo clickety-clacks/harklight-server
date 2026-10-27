@@ -10,9 +10,7 @@ defmodule AttentionServer.CLI.Enroll do
   status secret and private key remain in the local 0700 directory.
   """
 
-
   alias AttentionServer.{HeadlessEnrollment, ToolEndpoint}
-
 
   def run([command | args]) when command in ["start", "retry", "status"] do
     {options, rest, invalid} =
@@ -28,8 +26,11 @@ defmodule AttentionServer.CLI.Enroll do
         ]
       )
 
-    if rest != [] or invalid != [], do: AttentionServer.CLI.error!("unexpected enrollment arguments")
-    directory = Keyword.get(options, :directory) || AttentionServer.CLI.error!("--directory is required")
+    if rest != [] or invalid != [],
+      do: AttentionServer.CLI.error!("unexpected enrollment arguments")
+
+    directory =
+      Keyword.get(options, :directory) || AttentionServer.CLI.error!("--directory is required")
 
     endpoint =
       case ToolEndpoint.from_options(options) do
@@ -41,20 +42,28 @@ defmodule AttentionServer.CLI.Enroll do
 
     if command == "status" and HeadlessEnrollment.certificate_lifecycle(directory) != :ok,
       do:
-        AttentionServer.CLI.shell().info("warning: local device certificate expires within 30 days or is invalid")
+        AttentionServer.CLI.shell().info(
+          "warning: local device certificate expires within 30 days or is invalid"
+        )
 
     result =
       case command do
         "start" ->
-          label = Keyword.get(options, :label) || AttentionServer.CLI.error!("--label is required")
+          label =
+            Keyword.get(options, :label) || AttentionServer.CLI.error!("--label is required")
+
           HeadlessEnrollment.start(directory, endpoint, label)
 
         "retry" ->
-          label = Keyword.get(options, :label) || AttentionServer.CLI.error!("--label is required")
+          label =
+            Keyword.get(options, :label) || AttentionServer.CLI.error!("--label is required")
+
           HeadlessEnrollment.submit_existing(directory, endpoint, label)
 
         "status" ->
-          relay_port = Keyword.get(options, :relay_port) || AttentionServer.CLI.error!("--relay-port is required")
+          relay_port =
+            Keyword.get(options, :relay_port) ||
+              AttentionServer.CLI.error!("--relay-port is required")
 
           case HeadlessEnrollment.status(directory, endpoint) do
             {:ok, %{"state" => "approved"} = approval} ->
@@ -86,7 +95,9 @@ defmodule AttentionServer.CLI.Enroll do
       {:error, reason} ->
         case reason do
           :indeterminate_submission ->
-            AttentionServer.CLI.error!("submission indeterminate; keep this directory and retry the same key")
+            AttentionServer.CLI.error!(
+              "submission indeterminate; keep this directory and retry the same key"
+            )
 
           :key_pending ->
             AttentionServer.CLI.error!(
@@ -104,7 +115,9 @@ defmodule AttentionServer.CLI.Enroll do
             )
 
           :capacity ->
-            AttentionServer.CLI.error!("capacity: no request was created; keep this key and retry later")
+            AttentionServer.CLI.error!(
+              "capacity: no request was created; keep this key and retry later"
+            )
 
           _ ->
             AttentionServer.CLI.error!("enrollment failed: #{inspect(reason)}")
@@ -112,5 +125,6 @@ defmodule AttentionServer.CLI.Enroll do
     end
   end
 
-  def run(_), do: AttentionServer.CLI.error!("use start, retry or status; see mix help attention.enroll")
+  def run(_),
+    do: AttentionServer.CLI.error!("use start, retry or status; see mix help attention.enroll")
 end

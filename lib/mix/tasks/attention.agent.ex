@@ -20,6 +20,7 @@ defmodule Mix.Tasks.Attention.Agent do
   @impl true
   def run(args) do
     Mix.Task.run("app.start")
+
     AttentionServer.CLI.with_io(Mix.shell(), Mix.Error, fn ->
       AttentionServer.CLI.Agent.run(args)
     end)

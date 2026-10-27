@@ -14,6 +14,7 @@ defmodule Mix.Tasks.Attention.Operator do
   @impl true
   def run(args) do
     Mix.Task.run("app.start")
+
     AttentionServer.CLI.with_io(Mix.shell(), Mix.Error, fn ->
       AttentionServer.CLI.Operator.run(args)
     end)
