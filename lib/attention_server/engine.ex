@@ -3557,7 +3557,10 @@ defmodule AttentionServer.Engine do
               next =
                 next
                 |> then(fn state ->
-                  %{state | chat_read_positions: Map.put(state.chat_read_positions, key, position)}
+                  %{
+                    state
+                    | chat_read_positions: Map.put(state.chat_read_positions, key, position)
+                  }
                 end)
                 |> put_conversation_event(person, seq, key, payload)
                 |> queue_conversation_hint(person, seq)
