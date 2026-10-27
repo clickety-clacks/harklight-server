@@ -14,9 +14,7 @@ defmodule AttentionServer.CLI.Agent do
   of an answer reuses the same caller-held operation UUID and JSON value.
   """
 
-
   alias AttentionServer.{HeadlessAgent, JSON, Message, ToolEndpoint}
-
 
   def run(["keygen" | args]) do
     {opts, rest, invalid} = OptionParser.parse(args, strict: [directory: :string])
@@ -82,7 +80,11 @@ defmodule AttentionServer.CLI.Agent do
     end
   end
 
-  def run(_), do: AttentionServer.CLI.error!("use keygen, search, get or respond; see mix help attention.agent")
+  def run(_),
+    do:
+      AttentionServer.CLI.error!(
+        "use keygen, search, get or respond; see mix help attention.agent"
+      )
 
   defp request!("search", opts) do
     if Keyword.has_key?(opts, :text) and Keyword.has_key?(opts, :contains),
@@ -130,7 +132,9 @@ defmodule AttentionServer.CLI.Agent do
     )
 
     if String.trim(
-         AttentionServer.CLI.shell().prompt("Type ANSWER to submit this exact deliberate response: ") || ""
+         AttentionServer.CLI.shell().prompt(
+           "Type ANSWER to submit this exact deliberate response: "
+         ) || ""
        ) != "ANSWER",
        do: AttentionServer.CLI.error!("answer cancelled")
 

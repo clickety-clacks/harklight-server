@@ -433,6 +433,9 @@ defmodule AttentionServer.Relay do
   def claim_push(server, now_ms), do: GenServer.call(server, {:claim_push, now_ms}, 15_000)
 
   @doc false
+  def enable_push(server), do: GenServer.call(server, :enable_push)
+
+  @doc false
   def finish_push(server, claim, outcome, now_ms),
     do: GenServer.call(server, {:finish_push, claim, outcome, now_ms}, 15_000)
 
@@ -761,6 +764,9 @@ defmodule AttentionServer.Relay do
     {reply, next} = request(state, key, raw)
     {:reply, reply, next}
   end
+
+  def handle_call(:enable_push, _from, state),
+    do: {:reply, :ok, %{state | push_enabled: true}}
 
   def handle_call({:claim_push, now_ms}, _from, state) when is_integer(now_ms) do
     case Engine.claim_push(state.store.engine, now_ms) do

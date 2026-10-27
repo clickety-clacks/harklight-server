@@ -28,8 +28,12 @@ defmodule AttentionServer.InvitationHandoff do
       case HeadlessOwner.invite(endpoint, certificate_path, key_path, person, request_id) do
         {:ok, %{"invitation" => invitation} = reply} ->
           ready(invitation, reply["tappable_url"], person, request_id)
-        {:error, reason} -> failure(reason, person, request_id)
-        _ -> failure(:unknown, person, request_id)
+
+        {:error, reason} ->
+          failure(reason, person, request_id)
+
+        _ ->
+          failure(:unknown, person, request_id)
       end
     else
       %__MODULE__{
@@ -77,8 +81,11 @@ defmodule AttentionServer.InvitationHandoff do
        when is_binary(url) do
     case URI.parse(url) do
       %URI{scheme: "https", query: nil, fragment: ^token, path: "/join", host: host}
-      when host == server -> byte_size(url) < 512
-      _ -> false
+      when host == server ->
+        byte_size(url) < 512
+
+      _ ->
+        false
     end
   end
 

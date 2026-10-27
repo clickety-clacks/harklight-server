@@ -278,7 +278,10 @@ defmodule AttentionServer.PushAlertTest do
 
     exact =
       engine_with_deliveries(
-        [{"app:alpha", "one", String.duplicate("x", 150), nil}, {"app:beta", "two", "12345678", nil}],
+        [
+          {"app:alpha", "one", String.duplicate("x", 150), nil},
+          {"app:beta", "two", "12345678", nil}
+        ],
         %{}
       )
 

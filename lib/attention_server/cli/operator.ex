@@ -8,9 +8,7 @@ defmodule AttentionServer.CLI.Operator do
   This command uses local database custody. It never uploads a private key.
   """
 
-
   alias AttentionServer.OperatorTool
-
 
   def run([command | args]) when command in ["bootstrap", "recover"] do
     {options, rest, invalid} =
@@ -21,7 +19,10 @@ defmodule AttentionServer.CLI.Operator do
     end
 
     store = Keyword.get(options, :store) || AttentionServer.CLI.error!("--store is required")
-    certificate = Keyword.get(options, :owner_cert) || AttentionServer.CLI.error!("--owner-cert is required")
+
+    certificate =
+      Keyword.get(options, :owner_cert) || AttentionServer.CLI.error!("--owner-cert is required")
+
     AttentionServer.CLI.start_application!()
 
     result =
@@ -33,7 +34,9 @@ defmodule AttentionServer.CLI.Operator do
           OperatorTool.bootstrap(store, certificate)
 
         "recover" ->
-          person = Keyword.get(options, :person) || AttentionServer.CLI.error!("--person is required")
+          person =
+            Keyword.get(options, :person) || AttentionServer.CLI.error!("--person is required")
+
           OperatorTool.recover(store, person, certificate)
       end
 
@@ -44,5 +47,6 @@ defmodule AttentionServer.CLI.Operator do
     end
   end
 
-  def run(_), do: AttentionServer.CLI.error!("use bootstrap or recover; see mix help attention.operator")
+  def run(_),
+    do: AttentionServer.CLI.error!("use bootstrap or recover; see mix help attention.operator")
 end

@@ -16,7 +16,17 @@ defmodule AttentionServer.APNSPushTest do
 
   import ExUnit.CaptureLog
 
-  alias AttentionServer.{APNS, DeviceIdentity, Engine, JSON, OriginWire, Relay, Server, TLSFixtures}
+  alias AttentionServer.{
+    APNS,
+    DeviceIdentity,
+    Engine,
+    JSON,
+    OriginWire,
+    Relay,
+    Server,
+    TLSFixtures
+  }
+
   alias Exqlite.Sqlite3
 
   @provider_profile "harklight-sandbox"
@@ -262,7 +272,9 @@ defmodule AttentionServer.APNSPushTest do
 
     assert {:ok, %{"seq" => 1}} = JSON.decode_line(forward_reply)
 
-    assert {:ok, engine, claim} = Engine.claim_push(engine, System.system_time(:millisecond) + 300_001)
+    assert {:ok, engine, claim} =
+             Engine.claim_push(engine, System.system_time(:millisecond) + 300_001)
+
     assert claim.binding_id == binding_id
     assert claim.locator["person_id"] == person
     assert claim.locator["device_id"] == device
@@ -435,6 +447,7 @@ defmodule AttentionServer.APNSPushTest do
       "apns-delivery",
       %{"body" => "  bounded   preview\nfrom sender  "}
     )
+
     refute_receive {:apns_request, _, _, _}, 100
 
     :ok = :ssl.close(sender_socket)

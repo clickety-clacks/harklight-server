@@ -17,7 +17,8 @@ defmodule AttentionServer.DashboardBrowserSessionTest do
     consume = fn token ->
       Agent.get_and_update(one_use, fn available ->
         if MapSet.member?(available, token) do
-          {{:ok, %{person_id: person, owner_key: key, owner_revision: revision, scope: :person_owner}},
+          {{:ok,
+            %{person_id: person, owner_key: key, owner_revision: revision, scope: :person_owner}},
            MapSet.delete(available, token)}
         else
           {{:error, :invalid_link}, available}
@@ -80,8 +81,18 @@ defmodule AttentionServer.DashboardBrowserSessionTest do
     {:ok, own_revision} = Relay.owner_revision(c.relay, c.person, c.key)
 
     bindings = %{
-      "first" => %{person_id: c.person, owner_key: c.key, owner_revision: own_revision, scope: :person_owner},
-      "second" => %{person_id: other_person, owner_key: other_key, owner_revision: other_revision, scope: :person_owner}
+      "first" => %{
+        person_id: c.person,
+        owner_key: c.key,
+        owner_revision: own_revision,
+        scope: :person_owner
+      },
+      "second" => %{
+        person_id: other_person,
+        owner_key: other_key,
+        owner_revision: other_revision,
+        scope: :person_owner
+      }
     }
 
     {:ok, tokens} = Agent.start_link(fn -> bindings end)

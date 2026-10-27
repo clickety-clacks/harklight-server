@@ -106,7 +106,8 @@ defmodule AttentionServer.InvitationHandoffTest do
     assert map_size(:sys.get_state(c.relay).store.engine.join_invitations) == 1
   end
 
-  test "authorized agent handoff prefers the tappable route and retains the exact full invitation", c do
+  test "authorized agent handoff prefers the tappable route and retains the exact full invitation",
+       c do
     :sys.replace_state(c.relay, fn state ->
       %{state | dashboard_origin: "https://relay.test:18447"}
     end)
