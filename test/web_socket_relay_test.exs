@@ -260,6 +260,7 @@ defmodule AttentionServer.WebSocketRelayTest do
              })
 
     assert %{"type" => "ok", "seq" => 1} = reply(sender)
+
     assert %{"type" => "delivery", "seq" => 1, "message_id" => "after-bad-operation"} =
              reply(sender)
 
