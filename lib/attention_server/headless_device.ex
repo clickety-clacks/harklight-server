@@ -22,25 +22,12 @@ defmodule AttentionServer.HeadlessDevice do
     with :ok <- existing_private_directory(directory),
          {:ok, message} <- read_document(message_file),
          true <- is_map(message) and not is_struct(message),
-         {:ok, frame} <- saved_operation(directory, %{"type" => "forward", "message" => message}) do
-      case with_session(directory, endpoint, fn socket ->
-             case sync(directory, socket) do
-               {:ok, _} -> {:forward_result, request(socket, frame)}
-               other -> other
-             end
+         {:ok, frame} <- saved_operation(directory, %{"type" => "forward", "message" => message}),
+         {:ok, result} <-
+           with_session(directory, endpoint, fn socket ->
+             with {:ok, _} <- sync(directory, socket), do: request(socket, frame)
            end) do
-        {:forward_result, {:ok, result}} ->
-          {:ok, Map.put(result, "op_id", frame["op_id"])}
-
-        {:forward_result, {:error, :invalid_reply}} ->
-          accepted_send_from_receipt(directory, endpoint, frame)
-
-        {:forward_result, other} ->
-          other
-
-        other ->
-          other
-      end
+      {:ok, Map.put(result, "op_id", frame["op_id"])}
     else
       false -> {:error, :invalid_message}
       other -> other
@@ -107,23 +94,6 @@ defmodule AttentionServer.HeadlessDevice do
         end
       end
     end)
-  end
-
-  defp accepted_send_from_receipt(directory, endpoint, frame) do
-    # The forward may have committed before its reply was lost or malformed.
-    # Check the durable same-ID receipt; never retry the send here.
-    message = frame["message"]
-
-    case receipt(directory, endpoint, message["sender_id"], message["message_id"]) do
-      {:ok, %{"status" => "pending", "acceptance_seq" => seq}} when is_integer(seq) ->
-        {:ok, %{"type" => "ok", "seq" => seq, "op_id" => frame["op_id"]}}
-
-      {:ok, %{"receipt" => %{"acceptance_seq" => seq}}} when is_integer(seq) ->
-        {:ok, %{"type" => "ok", "seq" => seq, "op_id" => frame["op_id"]}}
-
-      _ ->
-        {:error, :invalid_reply}
-    end
   end
 
   defp with_session(directory, endpoint, fun) do

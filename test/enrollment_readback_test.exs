@@ -259,7 +259,7 @@ defmodule AttentionServer.EnrollmentReadbackTest do
     assert %{"proof" => %{"state" => "revoked", "enrollment_revision" => 2}} =
              readback(relay, a1, grant, "source-X", exact)
 
-    assert %{"type" => "error", "reason" => "unknown_type"} =
+    assert %{"receipt" => receipt} =
              wire(relay, a1, %{
                "type" => "answer_receipt",
                "receipt_version" => 1,
@@ -267,6 +267,15 @@ defmodule AttentionServer.EnrollmentReadbackTest do
                "message_id" => "historical",
                "terminal_seq" => 2
              })
+
+    assert receipt["actor"] == %{
+             "kind" => "device",
+             "id" => a2,
+             "key_fingerprint" => a2
+           }
+
+    assert receipt["has_answer"] == true and receipt["answer"] == "yes"
+    refute Map.has_key?(receipt, "source_mapping")
 
     assert {:ok, [delivery, lifecycle], 2} = Relay.events(relay, a1, 0)
     assert delivery["message_id"] == "historical"
