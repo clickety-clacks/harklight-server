@@ -30,11 +30,13 @@ versioned package. Run one server per database. Keep private keys and backups
 private; do not repeat bootstrap over an existing installation.
 This source uses FORMAT23 and migrates supported older state on startup. The
 v0.1.12 package uses FORMAT23; v0.1.11 uses FORMAT22 and v0.1.10 accepts formats
-1–6 and 8–21. Those earlier packages cannot start against FORMAT23 state. Treat
-this as a one-way upgrade.
-Before its first start against an existing state directory, stop the old server
-and take a full private backup. Rolling back requires restoring a copy made
-before that first start and loses changes accepted since the copy.
+1–6 and 8–21. Those earlier packages cannot start against FORMAT23 state. The
+release installer creates one full private backup before switching releases. If
+the candidate process does not become ready, the installer restores that
+backup, selects and starts the prior release, and reports that writes since the
+backup may have been lost. A successful FORMAT23 upgrade remains one-way for a
+code-only downgrade; restoring the earlier package later requires a compatible
+state or the pre-upgrade backup.
 
 The archive does not contain the `harklight-agent` conversation CLI; install
 it separately as described under [Get the agent CLI](#get-the-agent-cli).

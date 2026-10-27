@@ -278,16 +278,19 @@ outcomes. Invalid-address responses clear the matching address; provider-error
 text is restricted to fixed safe reasons in durable status. Retry and status
 survive restart.
 
-For an existing installation, stop the old server and back up the full private
-state before upgrading. This source uses store FORMAT23; supported older state,
+For a manual upgrade of an existing installation, stop the old server and back
+up the full private state before upgrading. The release installer makes one
+full mutable-root backup after stopping the service and before switching
+releases. This source uses store FORMAT23; supported older state,
 including FORMAT17, is normalized and durably committed on startup. The new
 state includes hosted-account records, the separate conversation feed,
 conversation push high water and upload activity accounting while retaining
 existing requests, answers and authority. The v0.1.12 package uses FORMAT23;
 v0.1.11 uses FORMAT22 and v0.1.10 accepts formats 1–6 and 8–21 only. Those
 earlier packages cannot start against FORMAT23. Preserve the trust root, person
-and sender grants; do not repeat bootstrap. Do not treat an earlier package as a rollback path; use a compatible
-forward repair or a separately reviewed, state-aware recovery plan.
+and sender grants; do not repeat bootstrap. After a successful FORMAT23 upgrade,
+an earlier package is not a code-only rollback path; use a compatible forward
+repair or restore the complete pre-upgrade backup.
 
 Starting a server with APNs configured can dispatch existing queued work. The
 release installer does not inspect, clear, or mark provider work delivered. It
@@ -342,25 +345,37 @@ exact acceptance sequence and intent reference, without source ruling authority.
 
 ## Upgrade or rollback
 
-Stop the old process. Before the first start of a FORMAT23 build, back up the
-complete state directory including SQLite and keys into private operator
-storage. Verify the new checksum and extract into a different versioned
-directory. Keep the state path, trust root, owner/person and configuration.
-Start with existing server.env; do not rerun bootstrap. Startup migrates
-supported earlier store formats immediately. There is no hot upgrade; only one
-server may own a database.
+For a manual upgrade, stop the old process and back up the complete private
+state directory, including the database and keys, before the first start of a
+FORMAT23 build. Verify the package checksum and extract into a different
+versioned directory. Keep the state path, trust root, owner/person and
+configuration. Start with the existing `server.env`; do not rerun bootstrap.
+Startup migrates supported earlier store formats immediately. There is no hot
+upgrade; only one server may own a database.
 
-If the new process fails, stop it and retain the current database and backup.
-Earlier packages refuse FORMAT23 state. Rollback requires restoring the copy
-made before the first FORMAT23 start and loses every change accepted after that
-copy. Do not restore a stale backup over newer accepted writes. A failed
-candidate may already have migrated the store. The existing installer retains
-the selected candidate, prior packages, stopped backup and latest state; it
-does not automatically downgrade or restore a database after switching. Use a
-compatible forward repair or a separately reviewed state-aware recovery plan.
-The full-root archive is a recovery source for the deployment's private state
-and configuration; it does not justify replacing newer accepted data. Keep
-backups and keys private.
+The release installer stops the service, creates one full mutable-root backup,
+switches `current`, and starts the selected package. It waits for the selected
+process to become active under that release. If the candidate start or process
+readiness fails, it stops the candidate, restores the pre-install mutable root
+and prior `current` link from that backup, then starts and checks the prior
+release. A successful rollback leaves the prior release serving and reports
+that candidate writes since the backup may have been lost. The failed package
+remains under its versioned release directory but is not selected. The archive
+includes the database and private configuration, and excludes immutable
+versioned releases, prior backups and the installer lock; prior release files
+are preserved. The backup is retained under the private `backups/` directory.
+
+If the backup cannot be restored, or the prior release cannot start and become
+active, the installer reports that recovery did not complete and may leave the
+service stopped. Preserve the backup and state for recovery. The optional
+authenticated owner agent-list readiness probe reports a warning when that
+route is unavailable; that route does not block other server functionality or
+trigger a whole-release rollback.
+
+Restoring the pre-install backup discards every write made after its capture,
+including any writes made by the candidate during its failed start. A successful
+FORMAT23 upgrade cannot be rolled back by changing the code link alone because
+earlier releases refuse FORMAT23 state. Keep backups and keys private.
 
 ## Build
 

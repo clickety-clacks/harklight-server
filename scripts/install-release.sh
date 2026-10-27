@@ -25,7 +25,7 @@ archive_name="harklight-server-$release_version-linux-x86_64.tar.gz"
 archive="$HARKLIGHT_ARCHIVE_PATH"
 sums="$HARKLIGHT_CHECKSUMS_PATH"
 guide="$HARKLIGHT_GUIDE_PATH"
-for command in chmod cmp date flock grep ln mkdir mktemp mv python3 readlink rm sleep systemctl tar; do
+for command in chmod cmp date flock grep ln mkdir mktemp mv python3 readlink rm rmdir sleep systemctl tar; do
   command -v "$command" >/dev/null || fail "required host command is unavailable"
 done
 
@@ -84,13 +84,16 @@ was_active=0
 switched=0
 staging=""
 backup_tmp=""
+restore_tmp=""
 current_link=""
+current_link_target=""
 
 mkdir -p "$releases" "$root/backups"
 exec 9>"$root/.release-install.lock"
 flock 9
 
 current_path="$(readlink -f -- "$root/current")" || fail "current release is unavailable"
+current_link_target="$(readlink -- "$root/current")" || fail "current release link is unavailable"
 case "$current_path" in
   "$releases"/v*) ;;
   *) fail "current release points outside the Harklight releases directory" ;;
@@ -192,11 +195,18 @@ owner_api_ready() {
   )
 }
 
-package_ready() {
+package_process_ready() {
   local path="$1"
   systemctl --user is-active --quiet "$unit" &&
-    process_uses_release "$path" &&
-    owner_api_ready "$path"
+    process_uses_release "$path"
+}
+
+warn_unavailable_owner_route() {
+  local path="$1"
+  if ! owner_api_ready "$path"; then
+    printf 'Warning: the authenticated owner agent-list route is unavailable for %s; continuing with the other server functionality.\n' \
+      "${path##*/}" >&2
+  fi
 }
 
 service_condition() {
@@ -218,7 +228,7 @@ resume_previous() {
   systemctl --user start "$unit" || return 1
   local ready=0
   for _ in {1..30}; do
-    if package_ready "$current_path"; then
+    if package_process_ready "$current_path"; then
       ready=1
       break
     fi
@@ -228,13 +238,97 @@ resume_previous() {
     systemctl --user stop "$unit" && service_is_stopped || return 1
     return 1
   fi
+  warn_unavailable_owner_route "$current_path"
   return 0
+}
+
+restore_preinstall_root() {
+  local path name restore_failed=0 restored_path
+
+  # Stage the existing archive before replacing mutable entries. Keep releases,
+  # prior backups, and the install lock in place during the restore.
+  restore_tmp="$(mktemp -d "$root/backups/.harklight-restore.XXXXXX")" || return 1
+  if ! tar -xf "$backup_final/private-root.tar" -C "$restore_tmp"; then
+    return 1
+  fi
+  [[ -L "$restore_tmp/current" ]] || return 1
+  [[ "$(readlink -- "$restore_tmp/current")" == "$current_link_target" ]] || return 1
+
+  shopt -s dotglob nullglob
+  for path in "$root"/*; do
+    name="${path##*/}"
+    case "$name" in
+      releases|backups|.release-install.lock) continue ;;
+    esac
+    if ! rm -rf -- "$path"; then
+      restore_failed=1
+    fi
+  done
+  shopt -u dotglob nullglob
+  ((restore_failed == 0)) || return 1
+
+  shopt -s dotglob nullglob
+  for path in "$restore_tmp"/*; do
+    name="${path##*/}"
+    case "$name" in
+      releases|backups|.release-install.lock) restore_failed=1; continue ;;
+    esac
+    if ! mv -T -- "$path" "$root/$name"; then
+      restore_failed=1
+    fi
+  done
+  shopt -u dotglob nullglob
+  ((restore_failed == 0)) || return 1
+
+  rmdir -- "$restore_tmp" || return 1
+  restore_tmp=""
+  restored_path="$(readlink -f -- "$root/current")" || return 1
+  [[ "$restored_path" == "$current_path" ]]
+}
+
+rollback_failed_upgrade() {
+  local cause="$1" ready=0
+  previous_resume_attempted=1
+
+  if ! systemctl --user stop "$unit" || ! service_is_stopped; then
+    fail "upgrade failed: $cause; the candidate could not be confirmed stopped, so the pre-install backup at $backup_final was retained and no rollback was started; candidate writes since the backup were not restored and may still be changing; service state: $(service_condition)"
+  fi
+
+  if ! restore_preinstall_root; then
+    fail "upgrade failed: $cause; restoring the pre-install mutable root from $backup_final/private-root.tar did not complete; the prior release was not started and the service remains stopped; the backup is retained, the current root may be partial, and candidate writes since the backup may be retained or partially lost"
+  fi
+
+  if ! systemctl --user start "$unit"; then
+    if ! systemctl --user stop "$unit" || ! service_is_stopped; then
+      fail "upgrade failed: $cause; the pre-install mutable root and prior release $current_tag were restored, but its start failed and the service could not be confirmed stopped; candidate writes since the backup were discarded by restoration; service state: $(service_condition)"
+    fi
+    fail "upgrade failed: $cause; the pre-install mutable root and prior release $current_tag were restored, but the prior release could not be started; candidate writes since the backup were discarded by restoration; service is stopped"
+  fi
+
+  for _ in {1..30}; do
+    if package_process_ready "$current_path"; then
+      ready=1
+      break
+    fi
+    sleep 1
+  done
+  if ((ready == 0)); then
+    if ! systemctl --user stop "$unit" || ! service_is_stopped; then
+      fail "upgrade failed: $cause; the pre-install mutable root and prior release $current_tag were restored, but the prior process did not become active and stop was not confirmed; candidate writes since the backup were discarded by restoration; service state: $(service_condition)"
+    fi
+    fail "upgrade failed: $cause; the pre-install mutable root and prior release $current_tag were restored, but the prior process did not become active; candidate writes since the backup were discarded by restoration; service is stopped"
+  fi
+
+  warn_unavailable_owner_route "$current_path"
+
+  fail "upgrade failed: $cause; restored the pre-install mutable root from $backup_final/private-root.tar and selected prior release $current_tag, which is serving; candidate writes since the backup may have been lost; candidate files remain at $target but are not selected"
 }
 
 cleanup() {
   local result=$?
   if [[ -n "$staging" && -d "$staging" ]]; then rm -rf -- "$staging"; fi
   if [[ -n "$backup_tmp" && -d "$backup_tmp" ]]; then rm -rf -- "$backup_tmp"; fi
+  if [[ -n "$restore_tmp" && -d "$restore_tmp" ]]; then rm -rf -- "$restore_tmp"; fi
   if [[ -n "$current_link" && -L "$current_link" ]]; then rm -f -- "$current_link"; fi
   if ((was_active && !switched && !previous_resume_attempted)) && service_is_stopped; then
     if ! resume_previous; then
@@ -285,13 +379,14 @@ if [[ "$current_tag" == "$HARKLIGHT_RELEASE_TAG" ]] && install_info_matches "$ta
   if systemctl --user is-active --quiet "$unit"; then
     ready=0
     for _ in {1..30}; do
-      if package_ready "$target"; then
+      if package_process_ready "$target"; then
         ready=1
         break
       fi
       sleep 1
     done
-    ((ready == 1)) || fail "selected release application and authenticated owner endpoint did not confirm; no install success was reported"
+    ((ready == 1)) || fail "selected release process did not become active under the selected package; no install success was reported"
+    warn_unavailable_owner_route "$target"
     printf 'Harklight release tuple %s@%s source=%s archive_sha256=%s is already running; no restart performed.\n' \
       'clickety-clacks/harklight-server' "$HARKLIGHT_RELEASE_TAG" "$HARKLIGHT_SOURCE_COMMIT" "$HARKLIGHT_ARCHIVE_SHA256"
     exit 0
@@ -310,18 +405,15 @@ if [[ "$current_tag" == "$HARKLIGHT_RELEASE_TAG" ]] && install_info_matches "$ta
 
   ready=0
   for _ in {1..30}; do
-    if package_ready "$target"; then
+    if package_process_ready "$target"; then
       ready=1
       break
     fi
     sleep 1
   done
-  if ((ready == 0)); then
-    if ! systemctl --user stop "$unit" || ! service_is_stopped; then
-      fail "current release recovery readiness did not confirm and stop was not confirmed; service state: $(service_condition); latest state was retained"
-    fi
-    fail "current release recovery application and authenticated owner endpoint did not confirm; selected package and latest state were retained"
-  fi
+  ((ready == 1)) || fail "current release recovery process did not become active under the selected package; selected package and latest state were retained"
+
+  warn_unavailable_owner_route "$target"
 
   printf 'Harklight release tuple %s@%s source=%s archive_sha256=%s was restarted under the selected package.\n' \
     'clickety-clacks/harklight-server' "$HARKLIGHT_RELEASE_TAG" "$HARKLIGHT_SOURCE_COMMIT" "$HARKLIGHT_ARCHIVE_SHA256"
@@ -372,26 +464,22 @@ current_link=""
 switched=1
 
 if ! systemctl --user start "$unit"; then
-  if ! systemctl --user stop "$unit" || ! service_is_stopped; then
-    fail "candidate start failed and stop was not confirmed; service state: $(service_condition); packages and latest state were retained"
-  fi
-  fail "candidate start failed and candidate is stopped; packages, backup, and latest state were retained"
+  rollback_failed_upgrade "candidate start failed"
 fi
 
 ready=0
 for _ in {1..30}; do
-  if package_ready "$target"; then
+  if package_process_ready "$target"; then
     ready=1
     break
   fi
   sleep 1
 done
 if ((ready == 0)); then
-  if ! systemctl --user stop "$unit" || ! service_is_stopped; then
-    fail "candidate readiness did not confirm and stop was not confirmed; service state: $(service_condition); latest state was retained"
-  fi
-  fail "candidate application and authenticated owner endpoint did not confirm; candidate is stopped and latest state was retained"
+  rollback_failed_upgrade "candidate process did not become active under the selected package within 30 seconds"
 fi
+
+warn_unavailable_owner_route "$target"
 
 printf 'Harklight release tuple %s@%s source=%s archive_sha256=%s is running under the selected package.\n' \
   'clickety-clacks/harklight-server' "$HARKLIGHT_RELEASE_TAG" "$HARKLIGHT_SOURCE_COMMIT" "$HARKLIGHT_ARCHIVE_SHA256"
