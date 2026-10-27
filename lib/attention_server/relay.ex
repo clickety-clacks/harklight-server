@@ -3340,6 +3340,7 @@ defmodule AttentionServer.Relay do
       with {:ok, events, high} <-
              Engine.conversation_events(state.store.engine, session.key, frame["since"]),
            {:ok, cursor} <- Engine.conversation_cursor(state.store.engine, session.key),
+           {:ok, read_positions} <- Engine.chat_read_positions(state.store.engine, session.key),
            {:ok, next_engine} <- Engine.open_conversation(state.store.engine, session.key),
            {:ok, store} <-
              commit(
@@ -3365,7 +3366,14 @@ defmodule AttentionServer.Relay do
         frames =
           [ok_line(frame, endpoint)] ++
             Enum.map(events, &line/1) ++
-            [line(%{"v" => 1, "type" => "conversation_resynced", "conversation_seq" => high})]
+            [
+              line(%{
+                "v" => 1,
+                "type" => "conversation_resynced",
+                "conversation_seq" => high,
+                "chat_read_positions" => read_positions
+              })
+            ]
 
         {{:ok, frames}, put_session(%{state | store: store}, id, updated)}
       else

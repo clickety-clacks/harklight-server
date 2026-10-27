@@ -11,7 +11,7 @@ defmodule AttentionServer.Store do
   alias AttentionServer.{APNS, BrowserSignIn, Diagnostics, Engine, GuidedJoin}
   alias Exqlite.Sqlite3
 
-  @format_version 23
+  @format_version 24
   @inbox_index_chunk_size 20
   defstruct [:db, :engine, :version, :upload_dir]
 
@@ -1079,7 +1079,8 @@ defmodule AttentionServer.Store do
                      20,
                      21,
                      22,
-                     23
+                     23,
+                     24
                    ] ->
                 original = struct(Engine, Map.from_struct(stored))
 
@@ -1151,6 +1152,9 @@ defmodule AttentionServer.Store do
                       state
                     end
                   end)
+                  |> then(fn state ->
+                    if format < 24, do: %{state | chat_read_positions: %{}}, else: state
+                  end)
 
                 cond do
                   not valid_state?(engine) ->
@@ -1184,6 +1188,7 @@ defmodule AttentionServer.Store do
                                  format < 17 -> "push_presentation_init"
                                  format < 18 -> "conversation_feed_init"
                                  format < 23 -> "prioritization_init"
+                                 format < 24 -> "chat_read_positions_init"
                                  true -> "state_format"
                                end
                            }
@@ -1932,6 +1937,15 @@ defmodule AttentionServer.Store do
         end) and
         map_size(engine.conversation_events) ==
           Enum.reduce(engine.conversation_highs, 0, fn {_person, high}, sum -> sum + high end) and
+        is_map(engine.chat_read_positions) and
+        Enum.all?(engine.chat_read_positions, fn {{person, sender, id} = key, position} ->
+          Map.has_key?(engine.persons, person) and Map.has_key?(engine.messages, key) and
+            is_binary(sender) and is_binary(id) and is_integer(position) and position > 0 and
+            match?(
+              %{key: ^key, payload: %{"kind" => "reply", "author" => "origin"}},
+              Map.get(engine.conversation_events, {person, position})
+            )
+        end) and
         is_map(engine.conversation_cursors) and
         Enum.all?(engine.conversation_cursors, fn {{person, key}, seq} ->
           owns?(engine, person, key) and is_integer(seq) and seq >= 0 and
