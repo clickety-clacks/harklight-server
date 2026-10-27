@@ -3512,10 +3512,13 @@ defmodule AttentionServer.Relay do
         _ -> nil
       end
 
-    target =
+    targets =
       case JSON.decode_line(raw) do
-        {:ok, request} when is_map(request) -> origin_feed_target(next_engine, key, request)
-        _ -> nil
+        {:ok, request} when is_map(request) ->
+          origin_feed_targets(state.store.engine, next_engine, key, request)
+
+        _ ->
+          []
       end
 
     if next_engine == state.store.engine do
@@ -3534,7 +3537,9 @@ defmodule AttentionServer.Relay do
           next_state = %{state | store: store}
 
           next_state =
-            record_origin_feed_change(next_state, state.store.engine, next_engine, target)
+            Enum.reduce(targets, next_state, fn target, current ->
+              record_origin_feed_change(current, state.store.engine, next_engine, target)
+            end)
 
           next_state =
             case Engine.authorized_person(state.store.engine, key) do
@@ -4041,6 +4046,42 @@ defmodule AttentionServer.Relay do
   # them. This keeps unrelated commits out of every attached origin stream.
   defp commit(store, next, audit) do
     Store.commit(store, next, audit)
+  end
+
+  defp origin_feed_targets(
+         old_engine,
+         next_engine,
+         key,
+         %{"type" => "forward", "message" => %{"sender_id" => sender, "supersedes" => ids}} =
+           request
+       )
+       when is_list(ids) do
+    case origin_feed_target(next_engine, key, request) do
+      {person, _origin} = own ->
+        target_origins =
+          Enum.flat_map(ids, fn id ->
+            if is_binary(id) do
+              case Map.get(old_engine.messages, {person, sender, id}) do
+                %{origin: origin, terminal: nil} -> [{person, origin}]
+                _ -> []
+              end
+            else
+              []
+            end
+          end)
+
+        Enum.uniq([own | target_origins])
+
+      nil ->
+        []
+    end
+  end
+
+  defp origin_feed_targets(_old_engine, next_engine, key, request) do
+    case origin_feed_target(next_engine, key, request) do
+      nil -> []
+      target -> [target]
+    end
   end
 
   defp origin_feed_target(engine, key, request) do
