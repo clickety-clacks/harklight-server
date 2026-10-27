@@ -33,7 +33,7 @@ archive_stage="$scratch/archive-stage/harklight-server-0.1.12-linux-x86_64"
 archive="$scratch/harklight-server-0.1.12-linux-x86_64.tar.gz"
 sums="$scratch/SHA256SUMS"
 guide="$scratch/SELF_HOST.md"
-mkdir -p "$fake_bin" "$runner_temp" "$root/state/tls" "$root/state/owner" \
+mkdir -p "$fake_bin" "$runner_temp" "$root/bin" "$root/state/tls" "$root/state/owner" \
   "$release_old/erts-15.2.7/bin" "$release_old/bin" \
   "$package_root/bin" "$archive_stage/erts-15.2.7/bin" "$archive_stage/bin"
 
