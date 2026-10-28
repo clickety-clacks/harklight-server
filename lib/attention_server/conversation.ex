@@ -126,8 +126,9 @@ defmodule AttentionServer.Conversation do
   def terminal_author(record, terminal) do
     cond do
       terminal.actor_kind == :agent -> "agent"
+      terminal.state == "superseded" -> "server"
       terminal.actor == record.origin -> "origin"
-      terminal.state in ["expired", "superseded"] -> "server"
+      terminal.state == "expired" -> "server"
       true -> "person"
     end
   end
