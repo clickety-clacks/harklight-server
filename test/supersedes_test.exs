@@ -27,7 +27,11 @@ defmodule AttentionServer.SupersedesTest do
 
   defp session_request(relay, session, frame) do
     assert {:ok, lines} =
-             Relay.session_request_line(relay, session, JSON.encode!(Map.put(frame, "v", 1)) <> "\n")
+             Relay.session_request_line(
+               relay,
+               session,
+               JSON.encode!(Map.put(frame, "v", 1)) <> "\n"
+             )
 
     Enum.map(lines, fn line ->
       assert {:ok, response} = JSON.decode_line(line)
@@ -85,10 +89,12 @@ defmodule AttentionServer.SupersedesTest do
     assert :ok = Relay.origin_stream_attach(relay, "first", @first_session, self())
 
     assert {:ok, phone_session} = Relay.open_session(relay, "phone")
+
     assert [%{"type" => "ok"} | initial_replay] =
              session_request(relay, phone_session, %{"type" => "resync", "since" => 0})
 
     assert %{"type" => "resynced", "seq" => 4} = List.last(initial_replay)
+
     assert [%{"type" => "ok", "seq" => 4}] =
              session_request(relay, phone_session, %{"type" => "ack", "seq" => 4})
 
@@ -116,6 +122,7 @@ defmodule AttentionServer.SupersedesTest do
 
     assert Enum.map(live, & &1["seq"]) == [5, 6, 7]
     assert hd(live)["message"]["supersedes"] == listed
+
     assert Enum.map(tl(live), &{&1["message_id"], &1["state"]}) ==
              [{"m1", "superseded"}, {"m2", "superseded"}]
 
@@ -201,12 +208,15 @@ defmodule AttentionServer.SupersedesTest do
              [{"m1", "superseded"}, {"m2", "superseded"}]
 
     assert {:ok, replay_session} = Relay.open_session(restarted, "phone")
+
     assert [%{"type" => "ok"} | catchup] =
              session_request(restarted, replay_session, %{"type" => "resync", "since" => 4})
 
     assert Enum.map(Enum.take(catchup, 5), & &1["seq"]) == [5, 6, 7, 8, 9]
+
     assert Enum.map(Enum.slice(catchup, 1, 2), &{&1["message_id"], &1["state"]}) ==
              [{"m1", "superseded"}, {"m2", "superseded"}]
+
     assert %{"type" => "resynced", "seq" => 9} = List.last(catchup)
 
     assert {:ok, [_only_other_account_delivery], 1} = Relay.events(restarted, "other", 0)
