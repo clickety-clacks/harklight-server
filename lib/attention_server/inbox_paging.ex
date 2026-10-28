@@ -302,7 +302,7 @@ defmodule AttentionServer.InboxPaging do
 
   defp reconcile_operations(store, engine, key, snapshot, operations) do
     Enum.reduce_while(operations, {:ok, engine, [], []}, fn operation,
-                                                       {:ok, current, results, applied} ->
+                                                            {:ok, current, results, applied} ->
       if operation["type"] == "answer_no_comment" do
         case Engine.reconcile_no_comment(current, key, operation) do
           {:ok, next, result} ->
@@ -310,6 +310,7 @@ defmodule AttentionServer.InboxPaging do
               if next == current or get_in(result, ["result", "duplicate"]) == true,
                 do: applied,
                 else: [operation | applied]
+
             {:cont, {:ok, next, [result | results], applied}}
 
           {:error, reason} ->
@@ -336,7 +337,8 @@ defmodule AttentionServer.InboxPaging do
       {:ok, next, results, applied} ->
         {:ok, next, Enum.reverse(results), Enum.reverse(applied)}
 
-      error -> error
+      error ->
+        error
     end
   end
 

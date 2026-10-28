@@ -3178,9 +3178,10 @@ defmodule AttentionServer.Relay do
 
     case Engine.authorized_person(state.store.engine, key) do
       {:ok, person} ->
-        if pending_signature(state.store.engine, person) != pending_signature(store.engine, person),
-          do: pending_set_changed(next, person),
-          else: next
+        if pending_signature(state.store.engine, person) !=
+             pending_signature(store.engine, person),
+           do: pending_set_changed(next, person),
+           else: next
 
       _ ->
         next

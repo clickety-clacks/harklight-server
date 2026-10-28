@@ -2455,7 +2455,8 @@ defmodule AttentionServer.Engine do
 
   @doc false
   def reconcile_no_comment(%__MODULE__{} = engine, key, %{"type" => "answer_no_comment"} = frame) do
-    with {:ok, %{person: person, key: device, kind: :device} = principal} <- principal(engine, key),
+    with {:ok, %{person: person, key: device, kind: :device} = principal} <-
+           principal(engine, key),
          :ok <- valid_op(frame) do
       op_id = frame["op_id"]
 
@@ -2479,9 +2480,17 @@ defmodule AttentionServer.Engine do
                  ) do
               {:ok, next, reply} ->
                 with {:ok, terminal} <-
-                       no_comment_terminal(next, person, device, frame["request_id"], reply["seq"]) do
+                       no_comment_terminal(
+                         next,
+                         person,
+                         device,
+                         frame["request_id"],
+                         reply["seq"]
+                       ) do
                   next = save_receipt(next, person, device, op_id, semantic, reply)
-                  {:ok, next, no_comment_committed(op_id, reply, terminal, reply["duplicate"] == true)}
+
+                  {:ok, next,
+                   no_comment_committed(op_id, reply, terminal, reply["duplicate"] == true)}
                 end
 
               {:error, reason, _field, _terminal} when is_binary(reason) ->

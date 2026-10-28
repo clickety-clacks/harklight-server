@@ -321,6 +321,7 @@ defmodule AttentionServer.WebSocketRelayTest do
 
     assert first["op_id"] == op(9201)
     assert first["status"] == "committed"
+
     assert first["result"] == %{
              "v" => 1,
              "type" => "ok",
@@ -419,13 +420,19 @@ defmodule AttentionServer.WebSocketRelayTest do
     assert %{"type" => "delivery", "seq" => 1} = reply(origin)
 
     assert :ok =
-             send_request(device, %{
-               "type" => "answer_no_comment",
-               "request_id" => "ordinary-no-comment",
-               "request_revision" => 1
-             })
+             :ssl.send(
+               device,
+               frame(
+                 JSON.encode!(%{
+                   "type" => "answer_no_comment",
+                   "request_id" => "ordinary-no-comment",
+                   "request_revision" => 1
+                 }) <> "\n"
+               )
+             )
 
     assert %{"type" => "ok", "seq" => 2, "terminal_kind" => "no_comment"} = reply(device)
+
     assert %{"type" => "lifecycle", "seq" => 2, "terminal_kind" => "no_comment"} =
              reply(origin)
 
@@ -459,6 +466,7 @@ defmodule AttentionServer.WebSocketRelayTest do
     assert %{"type" => "ok", "results" => [adopted]} = reply(device)
     assert adopted["op_id"] == op(9301)
     assert adopted["status"] == "committed"
+
     assert adopted["result"] == %{
              "v" => 1,
              "type" => "ok",
