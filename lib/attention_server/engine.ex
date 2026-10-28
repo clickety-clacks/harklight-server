@@ -2454,6 +2454,95 @@ defmodule AttentionServer.Engine do
   end
 
   @doc false
+  def reconcile_no_comment(%__MODULE__{} = engine, key, %{"type" => "answer_no_comment"} = frame) do
+    with {:ok, %{person: person, key: device, kind: :device} = principal} <-
+           principal(engine, key),
+         :ok <- valid_op(frame) do
+      op_id = frame["op_id"]
+
+      if Enum.sort(Map.keys(frame)) !=
+           Enum.sort(~w(type request_id request_revision op_id)) or
+           not Message.nonempty?(frame["request_id"]) or
+           not (is_integer(frame["request_revision"]) and frame["request_revision"] > 0) do
+        {:ok, engine, no_comment_refusal(op_id, "invalid_field")}
+      else
+        semantic = Map.take(frame, ~w(type request_id request_revision))
+        semantic_bytes = JSON.canonical(semantic)
+
+        case Map.get(engine.receipts, {person, device, op_id}) do
+          nil ->
+            case answer_no_comment(
+                   engine,
+                   principal,
+                   frame["request_id"],
+                   frame["request_revision"],
+                   op_id
+                 ) do
+              {:ok, next, reply} ->
+                with {:ok, terminal} <-
+                       no_comment_terminal(
+                         next,
+                         person,
+                         device,
+                         frame["request_id"],
+                         reply["seq"]
+                       ) do
+                  next = save_receipt(next, person, device, op_id, semantic, reply)
+
+                  {:ok, next,
+                   no_comment_committed(op_id, reply, terminal, reply["duplicate"] == true)}
+                end
+
+              {:error, reason, _field, _terminal} when is_binary(reason) ->
+                {:ok, engine, no_comment_refusal(op_id, reason)}
+            end
+
+          %{semantic: ^semantic_bytes, reply: %{"seq" => seq} = reply} ->
+            with {:ok, terminal} <-
+                   no_comment_terminal(engine, person, device, frame["request_id"], seq) do
+              {:ok, engine, no_comment_committed(op_id, reply, terminal, true)}
+            end
+
+          _ ->
+            {:ok, engine, %{"op_id" => op_id, "status" => "operation_conflict"}}
+        end
+      end
+    else
+      {:error, "op_id"} -> {:error, :invalid_field}
+      {:error, :forbidden} -> {:error, :forbidden}
+      _ -> {:error, :invalid_field}
+    end
+  end
+
+  def reconcile_no_comment(_engine, _key, _frame), do: {:error, :invalid_field}
+
+  defp no_comment_refusal(op_id, reason),
+    do: %{"op_id" => op_id, "status" => "refused", "reason" => reason}
+
+  defp no_comment_committed(op_id, reply, terminal, duplicate?) do
+    result =
+      %{"v" => 1, "type" => "ok"}
+      |> Map.merge(reply)
+      |> Map.put("duplicate", duplicate?)
+
+    %{"op_id" => op_id, "status" => "committed", "result" => result, "terminal" => terminal}
+  end
+
+  defp no_comment_terminal(engine, person, device, request_id, seq) do
+    matches =
+      for {{^person, _sender, ^request_id} = message_key, record} <- engine.messages,
+          do: {message_key, record}
+
+    case matches do
+      [{message_key, %{terminal: %{seq: ^seq}} = record}] ->
+        {:ok, project_terminal(record, message_key, device)}
+
+      _ ->
+        {:error, :snapshot_unavailable}
+    end
+  end
+
+  @doc false
   def reconcile_operation(%__MODULE__{} = engine, key, frame, high, committed_at_snapshot?)
       when is_map(frame) and is_boolean(committed_at_snapshot?) do
     with {:ok, %{person: person, key: device}} <- principal(engine, key),
@@ -3431,11 +3520,15 @@ defmodule AttentionServer.Engine do
     end
   end
 
+  defp answer_no_comment(engine, principal, request_id, request_revision),
+    do: answer_no_comment(engine, principal, request_id, request_revision, nil)
+
   defp answer_no_comment(
          engine,
          %{person: person, key: actor, kind: :device} = principal,
          request_id,
-         request_revision
+         request_revision,
+         op_id
        ) do
     if Message.nonempty?(request_id) do
       matches =
@@ -3457,7 +3550,8 @@ defmodule AttentionServer.Engine do
                     actor,
                     Map.get(principal, :id, actor),
                     key,
-                    record
+                    record,
+                    op_id
                   )
 
                 Map.get(record.terminal, :kind) == "no_comment" ->
@@ -3481,7 +3575,7 @@ defmodule AttentionServer.Engine do
     end
   end
 
-  defp answer_no_comment(_engine, _principal, _request_id, _request_revision),
+  defp answer_no_comment(_engine, _principal, _request_id, _request_revision, _op_id),
     do: failure("forbidden")
 
   defp valid_no_comment_revision(engine, person, key, record, supplied) do
@@ -3505,7 +3599,7 @@ defmodule AttentionServer.Engine do
     end
   end
 
-  defp commit_no_comment(engine, person, actor, actor_id, key, record) do
+  defp commit_no_comment(engine, person, actor, actor_id, key, record, op_id) do
     {next, seq} = next_seq(engine, person)
 
     terminal = %{
@@ -3518,7 +3612,7 @@ defmodule AttentionServer.Engine do
       actor: actor,
       actor_id: actor_id,
       actor_kind: :device,
-      op_id: nil,
+      op_id: op_id,
       seq: seq
     }
 

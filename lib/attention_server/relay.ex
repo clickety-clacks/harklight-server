@@ -3143,13 +3143,48 @@ defmodule AttentionServer.Relay do
   end
 
   defp inbox_reconcile(state, id, session, frame) do
-    with :ok <- session_snapshot(session, frame),
-         {:ok, reply, _snapshot} <-
-           InboxPaging.reconcile(state.store, state.store.engine, session.key, frame) do
-      updated = %{session | sync_mode: :paging}
-      {{:ok, [line(reply)]}, put_session(state, id, updated)}
+    with :ok <- session_snapshot(session, frame) do
+      case InboxPaging.reconcile(state.store, state.store.engine, session.key, frame) do
+        {:ok, reply, _snapshot, store, applied} ->
+          updated = %{session | sync_mode: :paging}
+          next_state = reconciled_state(state, store, session.key, applied)
+          {{:ok, [line(reply)]}, put_session(next_state, id, updated)}
+
+        {:error, reason, store, applied} ->
+          paging_error(reconciled_state(state, store, session.key, applied), frame, reason)
+
+        {:error, reason} ->
+          paging_error(state, frame, reason)
+      end
     else
       {:error, reason} -> paging_error(state, frame, reason)
+    end
+  end
+
+  # A reconciliation can now commit a No comment terminal. Preserve the same
+  # origin-feed and pending-view notifications as an ordinary device request.
+  defp reconciled_state(state, store, key, applied) do
+    next = %{state | store: store}
+
+    targets =
+      applied
+      |> Enum.map(&origin_feed_target(store.engine, key, &1))
+      |> Enum.uniq()
+
+    next =
+      Enum.reduce(targets, next, fn target, current ->
+        record_origin_feed_change(current, state.store.engine, store.engine, target)
+      end)
+
+    case Engine.authorized_person(state.store.engine, key) do
+      {:ok, person} ->
+        if pending_signature(state.store.engine, person) !=
+             pending_signature(store.engine, person),
+           do: pending_set_changed(next, person),
+           else: next
+
+      _ ->
+        next
     end
   end
 

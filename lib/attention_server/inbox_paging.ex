@@ -157,10 +157,11 @@ defmodule AttentionServer.InboxPaging do
          {:ok, snapshot} <- Store.inbox_snapshot(store, person, key, frame["snapshot_id"]),
          :ok <- usable(snapshot),
          digest <- :crypto.hash(:sha256, JSON.canonical(normalized)),
-         {:ok, result} <-
+         {:ok, result, next_store, applied} <-
            reconcile_batch(store, engine, key, person, snapshot, frame, normalized, digest) do
-      {:ok, put_ref(result, frame), snapshot}
+      {:ok, put_ref(result, frame), snapshot, next_store, applied}
     else
+      {:error, reason, next_store, applied} -> {:error, reason, next_store, applied}
       false -> {:error, :invalid_field}
       {:error, reason} -> {:error, reason}
       _ -> {:error, :invalid_field}
@@ -255,14 +256,20 @@ defmodule AttentionServer.InboxPaging do
     with {:ok, existing} <- Store.inbox_batch(store, person, key, snapshot.snapshot_id, batch_id) do
       case existing do
         %{digest: ^digest, result: result} ->
-          {:ok, result}
+          {:ok, result, store, []}
 
         %{digest: _} ->
           {:error, :checkpoint_conflict}
 
         nil ->
-          with {:ok, results} <-
-                 reconcile_operations(store, engine, key, snapshot, operations) do
+          with {:ok, next_engine, results, applied} <-
+                 reconcile_operations(store, engine, key, snapshot, operations),
+               {:ok, next_store} <-
+                 Store.commit(store, next_engine, %{
+                   person: person,
+                   actor: key,
+                   action: "inbox_reconcile"
+                 }) do
             result =
               ok(frame, %{
                 "paging_version" => 1,
@@ -273,40 +280,65 @@ defmodule AttentionServer.InboxPaging do
               })
               |> Map.delete("ref")
 
-            Store.save_inbox_batch(
-              store,
-              person,
-              key,
-              snapshot.snapshot_id,
-              batch_id,
-              digest,
-              result
-            )
+            case Store.save_inbox_batch(
+                   next_store,
+                   person,
+                   key,
+                   snapshot.snapshot_id,
+                   batch_id,
+                   digest,
+                   result
+                 ) do
+              {:ok, saved} -> {:ok, saved, next_store, applied}
+              {:error, reason} -> {:error, reason, next_store, applied}
+            end
+          else
+            {:error, reason, _store} -> {:error, reason}
+            {:error, reason} -> {:error, reason}
           end
       end
     end
   end
 
   defp reconcile_operations(store, engine, key, snapshot, operations) do
-    Enum.reduce_while(operations, {:ok, []}, fn operation, {:ok, acc} ->
-      with {:ok, committed_at_snapshot?} <-
-             Store.inbox_operation_at_snapshot?(store, snapshot, operation["op_id"]),
-           {:ok, result} <-
-             Engine.reconcile_operation(
-               engine,
-               key,
-               operation,
-               snapshot.high_water,
-               committed_at_snapshot?
-             ) do
-        {:cont, {:ok, [result | acc]}}
+    Enum.reduce_while(operations, {:ok, engine, [], []}, fn operation,
+                                                            {:ok, current, results, applied} ->
+      if operation["type"] == "answer_no_comment" do
+        case Engine.reconcile_no_comment(current, key, operation) do
+          {:ok, next, result} ->
+            applied =
+              if next == current or get_in(result, ["result", "duplicate"]) == true,
+                do: applied,
+                else: [operation | applied]
+
+            {:cont, {:ok, next, [result | results], applied}}
+
+          {:error, reason} ->
+            {:halt, {:error, reason}}
+        end
       else
-        {:error, reason} -> {:halt, {:error, reason}}
+        with {:ok, committed_at_snapshot?} <-
+               Store.inbox_operation_at_snapshot?(store, snapshot, operation["op_id"]),
+             {:ok, result} <-
+               Engine.reconcile_operation(
+                 current,
+                 key,
+                 operation,
+                 snapshot.high_water,
+                 committed_at_snapshot?
+               ) do
+          {:cont, {:ok, current, [result | results], applied}}
+        else
+          {:error, reason} -> {:halt, {:error, reason}}
+        end
       end
     end)
     |> case do
-      {:ok, results} -> {:ok, Enum.reverse(results)}
-      error -> error
+      {:ok, next, results, applied} ->
+        {:ok, next, Enum.reverse(results), Enum.reverse(applied)}
+
+      error ->
+        error
     end
   end
 
