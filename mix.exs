@@ -5,7 +5,7 @@ defmodule AttentionServer.MixProject do
     [
       app: :attention_server,
       description: "Harklight Server",
-      version: "0.1.15",
+      version: "0.1.16",
       elixir: "~> 1.19",
       start_permanent: Mix.env() == :prod,
       deps: deps(),
