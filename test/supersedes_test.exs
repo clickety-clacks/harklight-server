@@ -222,4 +222,42 @@ defmodule AttentionServer.SupersedesTest do
     assert {:ok, [_only_other_account_delivery], 1} = Relay.events(restarted, "other", 0)
     GenServer.stop(restarted)
   end
+
+  test "a different session on the same origin receives a superseded terminal", %{path: path} do
+    assert {:ok, relay} = Relay.start_link(store_path: path)
+    assert :ok = Relay.setup_person(relay, "A")
+    assert :ok = Relay.setup_device(relay, "A", "shared")
+    assert :ok = Relay.setup_sender(relay, "shared", "app:test")
+
+    assert %{"seq" => 1} = send_request(relay, "shared", @first_session, "m1", 1)
+    assert :ok = Relay.origin_stream_attach(relay, "shared", @first_session, self())
+    assert {:ok, %{"cursor" => before}} = Relay.origin_feed(relay, "shared", 0)
+
+    assert %{"seq" => 2} =
+             send_request(relay, "shared", @second_session, "m3", 2, %{
+               "supersedes" => ["m1"]
+             })
+
+    assert_receive {:origin_state_changed, after_seq}
+    assert after_seq > before
+    assert {:ok, %{"entries" => entries}} = Relay.origin_feed(relay, "shared", before)
+
+    assert %{
+             "kind" => "terminal",
+             "author" => "server",
+             "message_id" => "m1",
+             "session_handle" => @first_session,
+             "terminal_state" => "superseded",
+             "delivered" => false,
+             "feed_seq" => terminal_feed_seq
+           } = Enum.find(entries, &(&1["kind"] == "terminal"))
+
+    assert {:ok, %{"open_requests" => 0, "pending_undelivered" => 1}} =
+             Relay.origin_status(relay, "shared", @first_session)
+
+    assert {:ok, %{"status" => "delivered"}} =
+             Relay.origin_ack(relay, "shared", terminal_feed_seq)
+
+    GenServer.stop(relay)
+  end
 end
