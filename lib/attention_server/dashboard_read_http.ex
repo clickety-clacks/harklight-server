@@ -241,16 +241,6 @@ defmodule AttentionServer.DashboardReadHTTP do
           {:ok, _settings} ->
             conn |> put_resp_header("location", "/prioritization") |> send_resp(303, "")
 
-          {:error, :jev_unconfigured, settings} ->
-            send_prioritization_page(
-              conn,
-              principal,
-              settings,
-              "Jev needs a complete endpoint, model and readable key file before it can be selected.",
-              409,
-              opts
-            )
-
           {:error, reason, settings} ->
             send_prioritization_page(
               conn,

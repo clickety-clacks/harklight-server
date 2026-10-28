@@ -63,19 +63,21 @@ defmodule AttentionServer.HostedRequests do
 
     case Relay.hosted_set_algorithm(opts.relay, person, algorithm) do
       {:ok, result} ->
-        json(conn, 200, %{
+        body = %{
           "person_id" => result.person_id,
           "algorithm_id" => result.algorithm_id
-        })
+        }
+
+        body =
+          if Map.has_key?(result, :status), do: Map.put(body, "status", result.status), else: body
+
+        json(conn, 200, body)
 
       {:error, :unknown_algorithm} ->
         json(conn, 400, %{"error" => "unknown_algorithm"})
 
       {:error, :not_hosted} ->
         json(conn, 404, %{"error" => "unknown_person"})
-
-      {:error, :jev_unconfigured} ->
-        json(conn, 409, %{"error" => "jev_unconfigured"})
 
       {:error, :storage_unavailable} ->
         json(conn, 503, %{"error" => "storage_unavailable"})

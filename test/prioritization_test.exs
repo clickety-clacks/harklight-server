@@ -1,7 +1,18 @@
 defmodule AttentionServer.PrioritizationTest do
   use ExUnit.Case, async: false
 
-  alias AttentionServer.{DashboardView, Engine, JSON, JevClient, Placement, Relay, Store}
+  alias AttentionServer.{
+    DashboardView,
+    DeviceIdentity,
+    Engine,
+    JSON,
+    JevClient,
+    Placement,
+    Relay,
+    Store,
+    TLSFixtures
+  }
+
   alias Exqlite.Sqlite3
 
   @endpoint "https://api.typesafe.ai/v1/systemone"
@@ -105,13 +116,12 @@ defmodule AttentionServer.PrioritizationTest do
     :sys.replace_state(relay, &%{&1 | store: saved})
   end
 
-  defp start_synthetic_priority_pass(relay) do
+  defp start_synthetic_priority_pass(relay, person \\ "person-a") do
     test_process = self()
     relay_pid = relay
 
     state =
       :sys.replace_state(relay, fn state ->
-        person = "person-a"
         sequence = Map.get(state.priority_sequences, person, 0) + 1
         generation = Map.get(state.priority_generations, person, 0) + 1
 
@@ -136,7 +146,7 @@ defmodule AttentionServer.PrioritizationTest do
         }
       end)
 
-    job = state.priority_jobs["person-a"]
+    job = state.priority_jobs[person]
     on_exit(fn -> if Process.alive?(job.pid), do: Process.exit(job.pid, :kill) end)
     job
   end
@@ -374,6 +384,144 @@ defmodule AttentionServer.PrioritizationTest do
     refute Map.has_key?(Map.from_struct(reopened.engine), :jev_key_path)
     refute Map.has_key?(Map.from_struct(reopened.engine), :jev_key)
     assert :ok = Store.close(reopened)
+  end
+
+  test "self-hosted choice saves before setup and keeps the effective view in basic order", %{
+    path: path,
+    dir: dir
+  } do
+    previous_key_path = System.get_env("ATTENTION_SERVER_JEV_KEY_PATH")
+    System.delete_env("ATTENTION_SERVER_JEV_KEY_PATH")
+
+    on_exit(fn ->
+      if is_binary(previous_key_path),
+        do: System.put_env("ATTENTION_SERVER_JEV_KEY_PATH", previous_key_path),
+        else: System.delete_env("ATTENTION_SERVER_JEV_KEY_PATH")
+    end)
+
+    certs = TLSFixtures.create!()
+    on_exit(fn -> File.rm_rf!(certs) end)
+    relay = start_relay(path)
+    owner_cert = TLSFixtures.certificate_der!(certs, "a1")
+    assert {:ok, person} = Relay.operator_bootstrap(relay, owner_cert)
+    assert {:ok, owner_key} = DeviceIdentity.from_certificate(owner_cert)
+    assert :ok = Relay.setup_device(relay, person, "device-a")
+    assert :ok = Relay.setup_sender(relay, "device-a", "app:test")
+    forward(relay, 1, "later", 200)
+    forward(relay, 2, "earlier", 100)
+
+    initial_endpoint = "https://127.0.0.1:1/v1/systemone"
+
+    assert {:ok, settings} =
+             Relay.save_dashboard_prioritization(
+               relay,
+               person,
+               owner_key,
+               person,
+               "jev-set",
+               "",
+               ""
+             )
+
+    assert %{algorithm_id: "jev-set", endpoint: "", model: "", basis: "fallback"} =
+             settings
+
+    assert DashboardView.prioritization("Owner", settings) =~
+             "Jev setup is incomplete; waiting items are in basic order."
+
+    assert {:ok, session} = Relay.open_websocket_session(relay, "device-a", nil, nil)
+
+    assert [%{"algorithm" => "jev-set", "basis" => "fallback", "entries" => entries}] =
+             session_request(relay, session, %{"type" => "view_get", "ref" => "unconfigured"})
+
+    assert Enum.map(entries, & &1["message_id"]) == ["earlier", "later"]
+
+    assert {:ok, settings} =
+             Relay.save_dashboard_prioritization(
+               relay,
+               person,
+               owner_key,
+               person,
+               "jev-set",
+               initial_endpoint,
+               @model
+             )
+
+    assert %{
+             algorithm_id: "jev-set",
+             endpoint: ^initial_endpoint,
+             model: @model,
+             basis: "fallback"
+           } =
+             settings
+
+    assert DashboardView.prioritization("Owner", settings) =~
+             "Jev setup is incomplete; waiting items are in basic order."
+
+    key_path = Path.join(dir, "synthetic-key")
+    File.write!(key_path, "synthetic-test-key")
+    System.put_env("ATTENTION_SERVER_JEV_KEY_PATH", key_path)
+    assert {:ok, settings} = Relay.dashboard_prioritization(relay, person, owner_key, person)
+
+    assert settings.basis == "fallback"
+
+    assert DashboardView.prioritization("Owner", settings) =~
+             "Waiting items are in basic order until Jev answers."
+
+    job = start_synthetic_priority_pass(relay, person)
+    complete_synthetic_priority_pass(job, {:ok, [{"app:test", "later"}, {"app:test", "earlier"}]})
+
+    assert [%{"basis" => "selected", "entries" => selected_entries}] =
+             session_request(relay, session, %{"type" => "view_get", "ref" => "selected"})
+
+    assert Enum.map(selected_entries, & &1["message_id"]) == ["later", "earlier"]
+
+    changed_endpoint = "https://127.0.0.1:1/v1/another-systemone"
+
+    assert {:ok, settings} =
+             Relay.save_dashboard_prioritization(
+               relay,
+               person,
+               owner_key,
+               person,
+               "jev-set",
+               changed_endpoint,
+               @model
+             )
+
+    assert settings.basis == "fallback"
+
+    assert DashboardView.prioritization("Owner", settings) =~
+             "Waiting items are in basic order until Jev answers."
+
+    assert [%{"basis" => "fallback", "entries" => fallback_entries}] =
+             session_request(relay, session, %{"type" => "view_get", "ref" => "new-connection"})
+
+    assert Enum.map(fallback_entries, & &1["message_id"]) == ["earlier", "later"]
+
+    version = :sys.get_state(relay).store.version
+    view_rev = :sys.get_state(relay).priority_views[person].view_rev
+
+    assert {:ok, _} =
+             Relay.save_dashboard_prioritization(
+               relay,
+               person,
+               owner_key,
+               person,
+               "jev-set",
+               changed_endpoint,
+               @model
+             )
+
+    assert :sys.get_state(relay).store.version == version
+    assert :sys.get_state(relay).priority_views[person].view_rev == view_rev
+
+    GenServer.stop(relay)
+    assert {:ok, persisted} = Store.open(path)
+    assert Placement.choice(persisted.engine, person) == "jev-set"
+    assert persisted.engine.jev_endpoint == changed_endpoint
+    assert persisted.engine.jev_model == @model
+    assert :ok = Store.close(persisted)
   end
 
   test "Jev key bytes and key path stay out of stored state, logs and the config page", %{
