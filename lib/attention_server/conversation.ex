@@ -348,6 +348,22 @@ defmodule AttentionServer.Conversation do
     end
   end
 
+  # Rebuild on open so older snapshots and a rollback that appended without the
+  # index are both safe. Subsequent appends keep this per-handle lookup current.
+  def index_origin_feeds(engine) do
+    feeds =
+      Map.new(engine.origin_feeds, fn {key, feed} ->
+        by_handle =
+          Enum.reduce(feed.entries, %{}, fn {seq, entry}, index ->
+            Map.update(index, entry["session_handle"], MapSet.new([seq]), &MapSet.put(&1, seq))
+          end)
+
+        {key, Map.put(feed, :entry_seqs_by_handle, by_handle)}
+      end)
+
+    %{engine | origin_feeds: feeds}
+  end
+
   def status(engine, person, origin, handle, listening?) do
     case Map.get(engine.origin_sessions, {person, origin, handle}) do
       nil ->
@@ -356,8 +372,14 @@ defmodule AttentionServer.Conversation do
       session ->
         feed = Map.get(engine.origin_feeds, {person, origin}, %{high: 0, entries: %{}})
 
+        entries =
+          feed
+          |> Map.get(:entry_seqs_by_handle, %{})
+          |> Map.get(handle, MapSet.new())
+          |> Stream.map(fn seq -> {seq, Map.fetch!(feed.entries, seq)} end)
+
         open_requests =
-          feed.entries
+          entries
           |> Enum.reduce(MapSet.new(), fn {_seq, entry}, requests ->
             request_key = {person, entry["sender_id"], entry["message_id"]}
             record = Map.get(engine.messages, request_key)
@@ -372,7 +394,7 @@ defmodule AttentionServer.Conversation do
           |> MapSet.size()
 
         open_chats =
-          feed.entries
+          entries
           |> Enum.reduce(MapSet.new(), fn {_seq, entry}, requests ->
             request_key = {person, entry["sender_id"], entry["message_id"]}
             record = Map.get(engine.messages, request_key)
@@ -387,7 +409,7 @@ defmodule AttentionServer.Conversation do
           |> MapSet.size()
 
         {undelivered, delivered_unacted} =
-          Enum.reduce(feed.entries, {0, 0}, fn {seq, entry}, {queued, waiting} ->
+          Enum.reduce(entries, {0, 0}, fn {seq, entry}, {queued, waiting} ->
             if entry["session_handle"] == handle and actionable?(entry) do
               key = {person, origin, seq}
               delivered? = Map.has_key?(engine.origin_receipts, key)
@@ -513,7 +535,18 @@ defmodule AttentionServer.Conversation do
       |> Map.put("channel", channel(entry))
       |> Map.merge(%{"feed_seq" => seq, "event_id" => Integer.to_string(seq)})
 
-    updated = %{feed | high: seq, entries: Map.put(feed.entries, seq, item)}
+    by_handle = Map.get(feed, :entry_seqs_by_handle, %{})
+    handle = item["session_handle"]
+
+    updated =
+      feed
+      |> Map.put(:high, seq)
+      |> Map.put(:entries, Map.put(feed.entries, seq, item))
+      |> Map.put(
+        :entry_seqs_by_handle,
+        Map.update(by_handle, handle, MapSet.new([seq]), &MapSet.put(&1, seq))
+      )
+
     {%{engine | origin_feeds: Map.put(engine.origin_feeds, key, updated)}, item}
   end
 

@@ -8,7 +8,7 @@ defmodule AttentionServer.Store do
   silently replacing committed work. This is not a public database API.
   """
 
-  alias AttentionServer.{APNS, BrowserSignIn, Diagnostics, Engine, GuidedJoin}
+  alias AttentionServer.{APNS, BrowserSignIn, Conversation, Diagnostics, Engine, GuidedJoin}
   alias Exqlite.Sqlite3
 
   @format_version 24
@@ -107,6 +107,8 @@ defmodule AttentionServer.Store do
       {:ok, db} ->
         case initialize(db) do
           {:ok, engine, version} ->
+            engine = Conversation.index_origin_feeds(engine)
+
             with :ok <- File.mkdir_p(upload_dir),
                  :ok <- File.chmod(upload_dir, 0o700),
                  :ok <-
