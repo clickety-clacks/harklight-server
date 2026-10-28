@@ -34,6 +34,9 @@ defmodule AttentionServer.DashboardReadHTTPTest do
 
     def save_prioritization({%{person_id: "mike"}, "baseline", _endpoint, "jev-latest"}),
       do: {:ok, %{}}
+
+    def save_prioritization({%{person_id: "mike"}, "jev-set", "", ""}),
+      do: {:ok, %{}}
   end
 
   setup do
@@ -122,7 +125,10 @@ defmodule AttentionServer.DashboardReadHTTPTest do
     assert page.resp_body =~ "not readable"
 
     assert length(
-             Regex.scan(~r/Waiting items are in basic order until Jev answers\./, page.resp_body)
+             Regex.scan(
+               ~r/Jev setup is incomplete; waiting items are in basic order\./,
+               page.resp_body
+             )
            ) == 1
 
     assert page.resp_body =~ ~s(name="endpoint")
@@ -160,6 +166,21 @@ defmodule AttentionServer.DashboardReadHTTPTest do
         "model" => "jev-latest"
       })
 
+    conn = %{Plug.Test.conn(:post, "/prioritization", body) | scheme: :https, port: 443}
+
+    response =
+      conn
+      |> Plug.Conn.put_req_header("cookie", "__Host-harklight=member-session")
+      |> Plug.Conn.put_req_header("origin", "https://www.example.com")
+      |> Plug.Conn.put_req_header("content-type", "application/x-www-form-urlencoded")
+      |> DashboardReadHTTP.call(opts)
+
+    assert response.status == 303
+    assert Plug.Conn.get_resp_header(response, "location") == ["/prioritization"]
+  end
+
+  test "the prioritization form accepts a saved choice before connection setup", %{opts: opts} do
+    body = URI.encode_query(%{"algorithm_id" => "jev-set", "endpoint" => "", "model" => ""})
     conn = %{Plug.Test.conn(:post, "/prioritization", body) | scheme: :https, port: 443}
 
     response =

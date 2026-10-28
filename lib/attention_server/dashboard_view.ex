@@ -1,4 +1,6 @@
 defmodule AttentionServer.DashboardView do
+  alias AttentionServer.JevClient
+
   @moduledoc """
   Render the person-scoped device page for an already authenticated browser session.
 
@@ -100,10 +102,17 @@ defmodule AttentionServer.DashboardView do
         else: ""
 
     fallback_status =
-      if selected == "jev-set" and Map.get(settings, :basis) == "fallback",
-        do:
-          ~s(<p class="status" role="status">Waiting items are in basic order until Jev answers.</p>),
-        else: ""
+      if selected == "jev-set" and Map.get(settings, :basis) == "fallback" do
+        message =
+          if JevClient.valid_endpoint?(settings.endpoint) and
+               JevClient.valid_model?(settings.model) and settings.key_status == "readable",
+             do: "Waiting items are in basic order until Jev answers.",
+             else: "Jev setup is incomplete; waiting items are in basic order."
+
+        ~s(<p class="status" role="status">#{message}</p>)
+      else
+        ""
+      end
 
     body =
       ~s(<header class="page-head"><div><h1>Prioritization</h1></div></header>) <>

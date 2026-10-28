@@ -357,14 +357,34 @@ defmodule AttentionServer.HostedAccountTest do
                  "algorithm_id" => "baseline"
                })
 
-      assert {409, %{"error" => "jev_unconfigured"}} =
+      assert {200,
+              %{
+                "person_id" => ^person,
+                "algorithm_id" => "jev-set",
+                "status" => "waiting"
+              }} =
                hosted_post(relay, "/algorithm", %{
                  "person_id" => person,
                  "algorithm_id" => "jev-set"
                })
+
+      assert Placement.choice(:sys.get_state(relay).store.engine, person) == "jev-set"
+
+      assert %{algorithm: "jev-set", basis: "fallback", entries: []} =
+               :sys.get_state(relay).priority_views[person]
+
+      saved_version = :sys.get_state(relay).store.version
+
+      assert {200, %{"status" => "waiting"}} =
+               hosted_post(relay, "/algorithm", %{
+                 "person_id" => person,
+                 "algorithm_id" => "jev-set"
+               })
+
+      assert :sys.get_state(relay).store.version == saved_version
     end
 
-    test "does not enable Jev from the hosted account interface even when configured", %{
+    test "saves a hosted plan choice while a configured connection has no response", %{
       server: server,
       dir: dir
     } do
@@ -401,13 +421,21 @@ defmodule AttentionServer.HostedAccountTest do
 
       assert JevClient.key_status() == "readable"
 
-      assert {409, %{"error" => "jev_unconfigured"}} =
+      assert {200,
+              %{
+                "person_id" => ^person,
+                "algorithm_id" => "jev-set",
+                "status" => "waiting"
+              }} =
                hosted_post(relay, "/algorithm", %{
                  "person_id" => person,
                  "algorithm_id" => "jev-set"
                })
 
-      assert Placement.choice(:sys.get_state(relay).store.engine, person) == "baseline"
+      assert Placement.choice(:sys.get_state(relay).store.engine, person) == "jev-set"
+
+      assert %{algorithm: "jev-set", basis: "fallback"} =
+               :sys.get_state(relay).priority_views[person]
     end
 
     test "the public base address, not the listener's own, is the dashboard origin", %{

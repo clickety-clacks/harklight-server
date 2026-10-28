@@ -1504,8 +1504,19 @@ defmodule AttentionServer.Relay do
 
   def handle_call({:hosted_set_algorithm, person, algorithm}, _from, state) do
     case set_hosted_algorithm(state, person, algorithm) do
-      {:ok, next} -> {:reply, {:ok, %{person_id: person, algorithm_id: algorithm}}, next}
-      {:error, reason, next} -> {:reply, {:error, reason}, next}
+      {:ok, next} ->
+        result = %{person_id: person, algorithm_id: algorithm}
+
+        result =
+          if algorithm == "jev-set" and
+               match?(%{basis: "fallback"}, Map.get(next.priority_views, person)),
+             do: Map.put(result, :status, "waiting"),
+             else: result
+
+        {:reply, {:ok, result}, next}
+
+      {:error, reason, next} ->
+        {:reply, {:error, reason}, next}
     end
   end
 
@@ -3896,15 +3907,10 @@ defmodule AttentionServer.Relay do
 
   defp save_priority_settings_authorized(state, person, key, requested, endpoint, model) do
     engine = state.store.engine
-    connection_ready? = JevClient.connection_ready?(endpoint, model)
-    refused? = requested == "jev-set" and not connection_ready?
+    connection_changed? = engine.jev_endpoint != endpoint or engine.jev_model != model
 
     with {:ok, configured} <- Engine.set_jev_connection(engine, endpoint, model),
-         {:ok, changed} <-
-           if(refused?,
-             do: {:ok, configured},
-             else: Engine.set_algorithm_choice(configured, person, requested)
-           ) do
+         {:ok, changed} <- Engine.set_algorithm_choice(configured, person, requested) do
       next_state =
         if changed == engine do
           state
@@ -3914,19 +3920,28 @@ defmodule AttentionServer.Relay do
                  actor: key,
                  action: "prioritization_settings"
                }) do
-            {:ok, store} -> priority_settings_changed(%{state | store: store}, person)
-            {:error, _, _} -> nil
+            {:ok, store} ->
+              next = %{state | store: store}
+
+              next =
+                if connection_changed? and
+                     match?(%{basis: "selected"}, Map.get(next.priority_views, person)) do
+                  %{next | priority_views: Map.delete(next.priority_views, person)}
+                else
+                  next
+                end
+
+              priority_settings_changed(next, person)
+
+            {:error, _, _} ->
+              nil
           end
         end
 
       if is_nil(next_state) do
         {:error, :storage_unavailable}
       else
-        settings = priority_settings(next_state, person)
-
-        if refused?,
-          do: {:error, :jev_unconfigured, next_state, settings},
-          else: {:ok, next_state, settings}
+        {:ok, next_state, priority_settings(next_state, person)}
       end
     end
   end
@@ -3942,12 +3957,7 @@ defmodule AttentionServer.Relay do
         {:error, :not_hosted, state}
 
       Placement.choice(engine, person) == algorithm ->
-        {:ok, state}
-
-      algorithm == "jev-set" and
-          (state.deployment_mode == :saas or
-             not JevClient.connection_ready?(engine.jev_endpoint, engine.jev_model)) ->
-        {:error, :jev_unconfigured, state}
+        {:ok, ensure_priority_view(state, person)}
 
       true ->
         case Engine.set_algorithm_choice(engine, person, algorithm) do
