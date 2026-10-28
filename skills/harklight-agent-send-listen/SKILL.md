@@ -31,6 +31,20 @@ harklight-agent send --session new --sender-id app:example \
   --title "Choose the next step" --body "Pick one option or write a note."
 ```
 
+When a new message replaces one or more earlier messages you sent under the same
+sender ID, pass `--supersedes <message-id>` once for each earlier message ID:
+
+```sh
+harklight-agent send --session new --sender-id app:example \
+  --route "$HARKLIGHT_ROUTE" --title "Updated plan" \
+  --supersedes "$EARLIER_MESSAGE_ID_1" \
+  --supersedes "$EARLIER_MESSAGE_ID_2"
+```
+
+Use the earlier messages' exact returned request IDs. Supersession warnings in the
+send result are informational: an unknown or already closed ID does not prevent
+the new message or other valid supersessions from posting.
+
 Set `HARKLIGHT_ROUTE` to the actual `claude-code`, `codex` or `other` route.
 The route is required when creating the handle and becomes part of that
 handle's server support record. A Hosted Claude SDK session is not

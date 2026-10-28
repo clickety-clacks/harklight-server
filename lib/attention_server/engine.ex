@@ -3306,6 +3306,7 @@ defmodule AttentionServer.Engine do
 
     case Map.get(engine.messages, key) do
       nil ->
+        accepted_at = System.system_time(:millisecond)
         {next, seq} = next_seq(engine, person)
 
         record = %{
@@ -3335,7 +3336,6 @@ defmodule AttentionServer.Engine do
           |> put_message(key, record)
           |> put_event(person, seq, :delivery, key)
           |> queue_push_hint(person, seq)
-          |> save_receipt(person, device, op, semantic, fields)
 
         next =
           if record.session_handle do
@@ -3358,6 +3358,15 @@ defmodule AttentionServer.Engine do
             next
           end
 
+        {next, warnings} =
+          supersede_listed_targets(next, person, device, op, key, message, accepted_at)
+
+        fields =
+          if warnings == [],
+            do: fields,
+            else: Map.put(fields, "supersedes_warnings", warnings)
+
+        next = save_receipt(next, person, device, op, semantic, fields)
         {:ok, next, fields}
 
       record ->
@@ -3381,6 +3390,97 @@ defmodule AttentionServer.Engine do
 
           {:ok, save_receipt(engine, person, device, op, semantic, reply), reply}
         end
+    end
+  end
+
+  defp supersede_listed_targets(engine, person, device, op, new_key, message, accepted_at) do
+    case Map.fetch(message, "supersedes") do
+      :error ->
+        {engine, []}
+
+      {:ok, listed} when is_list(listed) ->
+        {next, warnings, _seen} =
+          Enum.reduce(listed, {engine, [], MapSet.new()}, fn id, {state, warnings, seen} ->
+            if is_binary(id) and MapSet.member?(seen, id) do
+              {state, warnings, seen}
+            else
+              seen = if is_binary(id), do: MapSet.put(seen, id), else: seen
+
+              cond do
+                not is_binary(id) or id == "" or id == elem(new_key, 2) ->
+                  {state, [%{"message_id" => id, "reason" => "invalid"} | warnings], seen}
+
+                true ->
+                  target_key = {person, elem(new_key, 1), id}
+
+                  case Map.get(state.messages, target_key) do
+                    nil ->
+                      {state, [%{"message_id" => id, "reason" => "unknown"} | warnings], seen}
+
+                    %{terminal: terminal} when not is_nil(terminal) ->
+                      {state, [%{"message_id" => id, "reason" => "closed"} | warnings], seen}
+
+                    record ->
+                      {supersede_target(
+                         state,
+                         person,
+                         device,
+                         op,
+                         target_key,
+                         record,
+                         accepted_at
+                       ), warnings, seen}
+                  end
+              end
+            end
+          end)
+
+        {next, Enum.reverse(warnings)}
+
+      {:ok, _other} ->
+        {engine, [%{"reason" => "invalid"}]}
+    end
+  end
+
+  defp supersede_target(engine, person, device, op, key, record, accepted_at) do
+    {next, seq} = next_seq(engine, person)
+
+    terminal = %{
+      state: "superseded",
+      at: accepted_at,
+      by: nil,
+      answer_present: false,
+      answer: nil,
+      actor: device,
+      actor_id: device,
+      actor_kind: :device,
+      op_id: op,
+      seq: seq
+    }
+
+    next =
+      next
+      |> put_message(key, %{record | terminal: terminal})
+      |> put_event(person, seq, :lifecycle, key)
+      |> then(fn state ->
+        if is_binary(Map.get(record, :session_handle)),
+          do: queue_push_hint(state, person, seq),
+          else: state
+      end)
+
+    {next, terminal_entry} = Conversation.on_terminal(next, person, record, key, terminal)
+
+    if terminal_entry do
+      event = next.events[{person, seq}]
+
+      payload = %{
+        "event_id" => terminal_entry["event_id"],
+        "request_revision" => terminal_entry["request_revision"]
+      }
+
+      %{next | events: Map.put(next.events, {person, seq}, Map.put(event, :payload, payload))}
+    else
+      next
     end
   end
 

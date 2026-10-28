@@ -44,6 +44,10 @@ from enrollment and relay ports. Preserve the returned session, request,
 revision, event and operation identities; use the same session for listening, one-shot reads,
 ACK, reply, revision, retraction and result. The CLI's durable journal and
 `retry --op-id` recover an uncertain operation without a second send.
+When a new message replaces earlier messages you sent under the same sender ID,
+pass `--supersedes <message-id>` once per earlier request ID. Warnings about odd
+IDs in the send result are informational; see the send-and-listen skill for the
+full example.
 
 For senders that cannot listen, the source candidate implements
 `harklight-agent read --session "$HARKLIGHT_SESSION"`. Use it only after its
