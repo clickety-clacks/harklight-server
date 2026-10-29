@@ -7,6 +7,7 @@ defmodule AttentionServer.PrioritizationTest do
     Engine,
     JSON,
     JevClient,
+    JevRanking,
     Placement,
     Relay,
     Store,
@@ -164,7 +165,7 @@ defmodule AttentionServer.PrioritizationTest do
     assert :ok = Relay.setup_sender(relay, "device-a", "app:test")
   end
 
-  defp forward(relay, n, id, deadline \\ nil) do
+  defp forward(relay, n, id, deadline \\ nil, body \\ nil) do
     message = %{
       "sender_id" => "app:test",
       "message_id" => id,
@@ -173,6 +174,7 @@ defmodule AttentionServer.PrioritizationTest do
     }
 
     message = if is_integer(deadline), do: Map.put(message, "by_when", deadline), else: message
+    message = if is_binary(body), do: Map.put(message, "body", body), else: message
 
     assert %{"type" => "ok"} =
              request(relay, "device-a", %{
@@ -1330,6 +1332,85 @@ defmodule AttentionServer.PrioritizationTest do
     assert_receive {:ranking_waiting, next_worker}, 2_000
     send(next_worker, :release)
     await_state(relay, &(not Map.has_key?(&1.priority_jobs, "person-a")))
+  end
+
+  test "a mid-pass arrival reuses completed unaffected batches and logs both passes", %{
+    dir: dir,
+    path: path
+  } do
+    use_synthetic_jev_key(dir)
+    parent = self()
+    {:ok, gate} = Agent.start_link(fn -> true end)
+    {:ok, calls} = Agent.start_link(fn -> 0 end)
+    on_exit(fn -> if Process.alive?(gate), do: Agent.stop(gate) end)
+    on_exit(fn -> if Process.alive?(calls), do: Agent.stop(calls) end)
+
+    evaluator = fn request ->
+      Agent.update(calls, &(&1 + 1))
+      send(parent, {:provider_request, self(), request.candidates})
+
+      if Agent.get(gate, & &1) do
+        receive do
+          :release -> :ok
+        end
+      end
+
+      {:ok, Map.new(request.candidates, &{&1, 1.0})}
+    end
+
+    relay = start_relay(path, priority_evaluator: evaluator)
+    setup_person(relay)
+    body = String.duplicate("x", 650)
+
+    for n <- 1..100, do: forward(relay, n, "seed-#{n}", nil, body)
+    configure_jev_choice(relay)
+
+    logs =
+      ExUnit.CaptureLog.capture_log(fn ->
+        forward(relay, 101, "initial-trigger", nil, body)
+        engine = :sys.get_state(relay).store.engine
+
+        expected_batches =
+          JevRanking.run(
+            Placement.items(engine, "person-a"),
+            %{},
+            engine.jev_endpoint,
+            engine.jev_model,
+            System.system_time(:millisecond),
+            fn request -> {:ok, Map.new(request.candidates, &{&1, 1.0})} end
+          )
+          |> then(&length(&1.cache.batches))
+
+        assert expected_batches > 1
+
+        workers =
+          for _ <- 1..expected_batches do
+            assert_receive {:provider_request, pid, _candidates}, 2_000
+            pid
+          end
+
+        forward(relay, 102, "mid-pass", nil, body)
+        Agent.update(gate, fn _ -> false end)
+        Enum.each(workers, &send(&1, :release))
+
+        assert_receive {:provider_request, _next_pid, next_candidates}, 2_000
+        assert {"app:test", "mid-pass"} in next_candidates
+
+        await_state(relay, fn state ->
+          cache = state.priority_caches["person-a"]
+
+          is_map(cache) and not Map.has_key?(state.priority_jobs, "person-a") and
+            Enum.any?(cache.batches, fn batch ->
+              {"app:test", "mid-pass"} in batch.members and is_map(batch.scores)
+            end)
+        end)
+
+        assert Agent.get(calls, & &1) == expected_batches + 1
+        refute_receive {:provider_request, _pid, _candidates}, 0
+      end)
+
+    assert length(Regex.scan(~r/event=harklight_priority_pass /, logs)) == 2
+    assert logs =~ "requests=1 finals=0"
   end
 
   defp await_state(relay, predicate, attempts \\ 100)

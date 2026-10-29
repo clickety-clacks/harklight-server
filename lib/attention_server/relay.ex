@@ -529,6 +529,7 @@ defmodule AttentionServer.Relay do
               priority_sequences: %{},
               priority_evaluator: Keyword.get(opts, :priority_evaluator, &JevClient.evaluate/1),
               priority_caches: %{},
+              priority_cache_epochs: %{},
               priority_failures: %{},
               priority_retry_timers: %{},
               priority_deadline_timers: %{},
@@ -3908,6 +3909,7 @@ defmodule AttentionServer.Relay do
         sequence = Map.get(state.priority_sequences, person, 0) + 1
         parent = self()
         cache = Map.get(state.priority_caches, person, %{})
+        cache_epoch = Map.get(state.priority_cache_epochs, person, 0)
         now = state.clock.()
         evaluator = state.priority_evaluator
 
@@ -3927,7 +3929,10 @@ defmodule AttentionServer.Relay do
                 pid: pid,
                 monitor: monitor,
                 sequence: sequence,
-                generation: generation
+                generation: generation,
+                cache_epoch: cache_epoch,
+                endpoint: engine.jev_endpoint,
+                model: engine.jev_model
               })
         }
     end
@@ -3935,12 +3940,21 @@ defmodule AttentionServer.Relay do
 
   defp finish_priority_pass(state, person, job, result) do
     state = %{state | priority_jobs: Map.delete(state.priority_jobs, person)}
+    state = if is_map(result), do: log_priority_pass(state, result), else: state
     engine = state.store.engine
     generation = Map.get(state.priority_generations, person, 0)
 
-    current? =
-      generation == job.generation and Placement.choice(engine, person) == "jev-set" and
-        JevClient.connection_ready?(engine.jev_endpoint, engine.jev_model)
+    same_connection? =
+      Placement.choice(engine, person) == "jev-set" and
+        Map.get(job, :endpoint, engine.jev_endpoint) == engine.jev_endpoint and
+        Map.get(job, :model, engine.jev_model) == engine.jev_model and
+        Map.get(job, :cache_epoch, Map.get(state.priority_cache_epochs, person, 0)) ==
+          Map.get(state.priority_cache_epochs, person, 0)
+
+    ready? =
+      same_connection? and JevClient.connection_ready?(engine.jev_endpoint, engine.jev_model)
+
+    current? = generation == job.generation and ready?
 
     state =
       if current? do
@@ -3966,7 +3980,6 @@ defmodule AttentionServer.Relay do
 
             state =
               state
-              |> log_priority_pass(pass)
               |> schedule_priority_retry(person, pass.failed)
               |> schedule_priority_deadline(person, pass.considered)
 
@@ -3995,10 +4008,17 @@ defmodule AttentionServer.Relay do
             |> schedule_priority_retry(person, 1)
         end
       else
-        if generation == job.generation and Placement.choice(engine, person) == "jev-set" and
-             not JevClient.connection_ready?(engine.jev_endpoint, engine.jev_model),
-           do: state |> clear_priority_cache(person) |> set_fallback_priority_view(person),
-           else: state
+        cond do
+          ready? and is_map(result) and Map.has_key?(result, :cache) ->
+            %{state | priority_caches: Map.put(state.priority_caches, person, result.cache)}
+
+          generation == job.generation and Placement.choice(engine, person) == "jev-set" and
+              not JevClient.connection_ready?(engine.jev_endpoint, engine.jev_model) ->
+            state |> clear_priority_cache(person) |> set_fallback_priority_view(person)
+
+          true ->
+            state
+        end
       end
 
     case Map.pop(state.priority_queued, person) do
@@ -4027,6 +4047,7 @@ defmodule AttentionServer.Relay do
     %{
       state
       | priority_caches: Map.delete(state.priority_caches, person),
+        priority_cache_epochs: Map.update(state.priority_cache_epochs, person, 1, &(&1 + 1)),
         priority_failures: Map.delete(state.priority_failures, person),
         priority_retry_timers: Map.delete(state.priority_retry_timers, person),
         priority_deadline_timers: Map.delete(state.priority_deadline_timers, person)
