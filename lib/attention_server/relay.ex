@@ -4183,15 +4183,33 @@ defmodule AttentionServer.Relay do
             {:ok, store} ->
               next = %{state | store: store}
 
-              next =
-                if connection_changed? and
-                     match?(%{basis: "selected"}, Map.get(next.priority_views, person)) do
-                  %{next | priority_views: Map.delete(next.priority_views, person)}
+              affected_people =
+                if connection_changed? do
+                  changed.persons
+                  |> Map.keys()
+                  |> Enum.filter(&(Placement.choice(changed, &1) == "jev-set"))
+                  |> then(&Enum.uniq([person | &1]))
                 else
-                  next
+                  [person]
                 end
 
-              priority_settings_changed(next, person)
+              Enum.reduce(affected_people, next, fn affected_person, current ->
+                current =
+                  if connection_changed? and
+                       match?(
+                         %{basis: "selected"},
+                         Map.get(current.priority_views, affected_person)
+                       ) do
+                    %{
+                      current
+                      | priority_views: Map.delete(current.priority_views, affected_person)
+                    }
+                  else
+                    current
+                  end
+
+                priority_settings_changed(current, affected_person)
+              end)
 
             {:error, _, _} ->
               nil

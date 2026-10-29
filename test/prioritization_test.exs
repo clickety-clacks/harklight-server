@@ -615,6 +615,152 @@ defmodule AttentionServer.PrioritizationTest do
     assert :ok = Store.close(persisted)
   end
 
+  test "shared connection changes invalidate every Jev person's cache and pending result", %{
+    dir: dir,
+    path: path
+  } do
+    use_synthetic_jev_key(dir)
+    certs = TLSFixtures.create!()
+    on_exit(fn -> File.rm_rf!(certs) end)
+    old_endpoint = "https://127.0.0.1:1/v1/old-systemone"
+    new_endpoint = "https://127.0.0.1:1/v1/new-systemone"
+    new_model = "jev-next"
+    parent = self()
+    {:ok, block_old_b} = Agent.start_link(fn -> false end)
+    {:ok, calls} = Agent.start_link(fn -> [] end)
+    on_exit(fn -> if Process.alive?(block_old_b), do: Agent.stop(block_old_b) end)
+    on_exit(fn -> if Process.alive?(calls), do: Agent.stop(calls) end)
+
+    evaluator = fn request ->
+      sender = request.candidates |> hd() |> elem(0)
+      Agent.update(calls, &[{sender, request.uri.path, request.model, request.candidates} | &1])
+
+      if sender == "app:b" and request.uri.path == "/v1/old-systemone" and
+           Agent.get(block_old_b, & &1) do
+        send(parent, {:old_b_pending, self()})
+
+        receive do
+          :release -> :ok
+        end
+      end
+
+      {:ok, Map.new(request.candidates, &{&1, 2.0})}
+    end
+
+    relay = start_relay(path, priority_evaluator: evaluator)
+    owner_cert = TLSFixtures.certificate_der!(certs, "a1")
+    assert {:ok, owner_person} = Relay.operator_bootstrap(relay, owner_cert)
+    assert {:ok, owner_key} = DeviceIdentity.from_certificate(owner_cert)
+    assert :ok = Relay.setup_person(relay, "person-b")
+    assert :ok = Relay.setup_person(relay, "person-c")
+
+    for {person, device, sender} <- [
+          {owner_person, "device-a", "app:a"},
+          {"person-b", "device-b", "app:b"},
+          {"person-c", "device-c", "app:c"}
+        ] do
+      assert :ok = Relay.setup_device(relay, person, device)
+      assert :ok = Relay.setup_sender(relay, device, sender)
+    end
+
+    assert {:ok, _} =
+             Relay.save_dashboard_prioritization(
+               relay,
+               owner_person,
+               owner_key,
+               owner_person,
+               "jev-set",
+               old_endpoint,
+               @model
+             )
+
+    state = :sys.get_state(relay)
+    assert {:ok, engine} = Engine.set_algorithm_choice(state.store.engine, "person-b", "jev-set")
+
+    assert {:ok, saved} =
+             Store.commit(state.store, engine, %{
+               person: "person-b",
+               actor: "owner",
+               action: "choice"
+             })
+
+    :sys.replace_state(relay, &%{&1 | store: saved})
+
+    forward_as = fn device, sender, n, id ->
+      assert %{"type" => "ok"} =
+               request(relay, device, %{
+                 "type" => "forward",
+                 "op_id" => op(n),
+                 "message" => %{
+                   "sender_id" => sender,
+                   "message_id" => id,
+                   "created_at" => n,
+                   "title" => id
+                 }
+               })
+    end
+
+    forward_as.("device-a", "app:a", 1001, "a1")
+    forward_as.("device-b", "app:b", 1002, "b1")
+    forward_as.("device-c", "app:c", 1003, "c1")
+
+    state =
+      await_state(relay, fn state ->
+        is_map(state.priority_caches[owner_person]) and
+          is_map(state.priority_caches["person-b"]) and
+          state.priority_views[owner_person].basis == "selected" and
+          state.priority_views["person-b"].basis == "selected"
+      end)
+
+    assert Placement.choice(state.store.engine, "person-c") == "baseline"
+    assert state.priority_views["person-c"].algorithm == "baseline"
+    old_epochs = state.priority_cache_epochs
+
+    Agent.update(block_old_b, fn _ -> true end)
+    forward_as.("device-b", "app:b", 1004, "b2")
+    assert_receive {:old_b_pending, pending_worker}, 2_000
+
+    assert {:ok, _} =
+             Relay.save_dashboard_prioritization(
+               relay,
+               owner_person,
+               owner_key,
+               owner_person,
+               "jev-set",
+               new_endpoint,
+               new_model
+             )
+
+    changed = :sys.get_state(relay)
+    assert changed.priority_cache_epochs[owner_person] > Map.get(old_epochs, owner_person, 0)
+    assert changed.priority_cache_epochs["person-b"] > Map.get(old_epochs, "person-b", 0)
+    refute Map.has_key?(changed.priority_caches, owner_person)
+    refute Map.has_key?(changed.priority_caches, "person-b")
+    assert changed.priority_views["person-b"].basis == "fallback"
+    assert Placement.choice(changed.store.engine, "person-b") == "jev-set"
+    assert Placement.choice(changed.store.engine, "person-c") == "baseline"
+
+    Agent.update(block_old_b, fn _ -> false end)
+    send(pending_worker, :release)
+
+    await_state(relay, fn state ->
+      is_map(state.priority_caches["person-b"]) and
+        state.priority_views["person-b"].basis == "selected" and
+        not Map.has_key?(state.priority_jobs, "person-b")
+    end)
+
+    observed = Agent.get(calls, & &1)
+
+    assert Enum.any?(observed, fn {sender, path, model, _} ->
+             sender == "app:a" and path == "/v1/new-systemone" and model == new_model
+           end)
+
+    assert Enum.any?(observed, fn {sender, path, model, candidates} ->
+             sender == "app:b" and path == "/v1/new-systemone" and model == new_model and
+               Enum.sort(candidates) == Enum.sort([{"app:b", "b1"}, {"app:b", "b2"}])
+           end)
+  end
+
   test "Jev key bytes and key path stay out of stored state, logs and the config page", %{
     path: path,
     dir: dir
