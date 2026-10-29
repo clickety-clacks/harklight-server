@@ -506,6 +506,7 @@ defmodule AttentionServer.Relay do
 
             state = %{
               store: store,
+              clock: Keyword.get(opts, :clock, fn -> System.system_time(:millisecond) end),
               default_index: Engine.default_index(store.engine),
               default_timer: nil,
               default_timer_generation: 0,
@@ -2433,7 +2434,7 @@ defmodule AttentionServer.Relay do
   def handle_info({:default_sweep, generation}, %{default_timer_generation: generation} = state) do
     state = %{state | default_timer: nil}
     old_engine = state.store.engine
-    now_ms = System.system_time(:millisecond)
+    now_ms = state.clock.()
 
     due_index =
       state.default_index
@@ -3576,7 +3577,7 @@ defmodule AttentionServer.Relay do
   end
 
   defp perform_request(state, key, raw) do
-    {next_engine, reply} = Engine.request_line(state.store.engine, key, raw)
+    {next_engine, reply} = Engine.request_line(state.store.engine, key, raw, state.clock.())
     next_engine = with_initial_origin_availability(state, key, next_engine)
 
     operation_id =
@@ -4147,7 +4148,7 @@ defmodule AttentionServer.Relay do
 
     case Enum.min(index |> Map.values(), &<=/2, fn -> nil end) do
       at when is_integer(at) ->
-        delay = min(max(at - System.system_time(:millisecond), 0), @max_timer_delay_ms)
+        delay = min(max(at - state.clock.(), 0), @max_timer_delay_ms)
         timer = Process.send_after(self(), {:default_sweep, generation}, delay)
         %{state | default_timer: timer}
 

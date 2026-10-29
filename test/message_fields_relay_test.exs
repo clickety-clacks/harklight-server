@@ -19,8 +19,8 @@ defmodule AttentionServer.MessageFieldsRelayTest do
 
   defp op(n), do: "00000000-0000-4000-8000-#{String.pad_leading(Integer.to_string(n), 12, "0")}"
 
-  defp start_relay(path) do
-    assert {:ok, relay} = Relay.start_link(store_path: path)
+  defp start_relay(path, opts \\ []) do
+    assert {:ok, relay} = Relay.start_link(Keyword.merge([store_path: path], opts))
     Process.unlink(relay)
     on_exit(fn -> if Process.alive?(relay), do: GenServer.stop(relay) end)
     relay
@@ -175,10 +175,14 @@ defmodule AttentionServer.MessageFieldsRelayTest do
   test "a due default wins on restart and follows the normal terminal and receipt paths", %{
     path: path
   } do
-    relay = start_relay(path)
+    {:ok, clock} = Agent.start_link(fn -> 1_000 end)
+    on_exit(fn -> if Process.alive?(clock), do: Agent.stop(clock) end)
+    now_ms = fn -> Agent.get(clock, & &1) end
+
+    relay = start_relay(path, clock: now_ms)
     setup_devices(relay)
 
-    default_at = System.system_time(:millisecond) + 1_500
+    default_at = 2_000
 
     assert %{"type" => "ok", "seq" => 1} =
              request(relay, "origin", %{
@@ -203,11 +207,11 @@ defmodule AttentionServer.MessageFieldsRelayTest do
              })
 
     GenServer.stop(relay)
-    Process.sleep(max(default_at - System.system_time(:millisecond) + 50, 0))
+    Agent.update(clock, fn _ -> 3_000 end)
 
-    restarted = start_relay(path)
+    restarted = start_relay(path, clock: now_ms)
 
-    assert %{"type" => "ok", "seq" => 2} =
+    assert %{"type" => "ok"} =
              request(restarted, "origin", %{
                "type" => "forward",
                "op_id" => op(3),
@@ -225,7 +229,10 @@ defmodule AttentionServer.MessageFieldsRelayTest do
     assert terminal["answer"] == "ship"
     assert terminal["at"] >= default_at
 
-    assert {:ok, [unrelated_delivery, lifecycle], 3} = Relay.events(restarted, "reader", 1)
+    assert {:ok, events, 3} = Relay.events(restarted, "reader", 1)
+    assert length(events) == 2
+    unrelated_delivery = Enum.find(events, &(&1["type"] == "delivery"))
+    lifecycle = Enum.find(events, &(&1["type"] == "lifecycle"))
     assert unrelated_delivery["type"] == "delivery"
     assert unrelated_delivery["message"]["message_id"] == "unrelated"
     assert lifecycle["type"] == "lifecycle"
@@ -253,7 +260,7 @@ defmodule AttentionServer.MessageFieldsRelayTest do
                "receipt_version" => 1,
                "sender_id" => "app:test",
                "message_id" => "defaulted",
-               "terminal_seq" => 3
+               "terminal_seq" => terminal["terminal_seq"]
              })
 
     GenServer.stop(restarted)

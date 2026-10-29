@@ -1981,9 +1981,11 @@ defmodule AttentionServer.Engine do
   Inactive/unknown keys are refused before parsing, as TLS admission would do.
   """
   def request_line(%__MODULE__{} = engine, key, raw) do
-    with {:ok, principal} <- principal(engine, key) do
-      request_at = System.system_time(:millisecond)
+    request_line(engine, key, raw, System.system_time(:millisecond))
+  end
 
+  def request_line(%__MODULE__{} = engine, key, raw, request_at) when is_integer(request_at) do
+    with {:ok, principal} <- principal(engine, key) do
       {next, frame} =
         case JSON.decode_line(raw) do
           {:ok, value} ->
