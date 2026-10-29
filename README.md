@@ -7,16 +7,16 @@ Harklight iOS/iPadOS app.
 
 ## Install the server
 
-For the FORMAT24 v0.1.18 server package, use the release page below after it
+For the FORMAT24 v0.1.19 server package, use the release page below after it
 is published to download the Linux x86_64 archive, `SHA256SUMS` and
 `SELF_HOST.md`. Verify the checksum before extraction:
 
-[v0.1.18 release](https://github.com/clickety-clacks/harklight-server/releases/tag/v0.1.18)
+[v0.1.19 release](https://github.com/clickety-clacks/harklight-server/releases/tag/v0.1.19)
 (available only after publication).
 
 ```sh
 sha256sum -c SHA256SUMS
-tar -xzf harklight-server-0.1.18-linux-x86_64.tar.gz
+tar -xzf harklight-server-0.1.19-linux-x86_64.tar.gz
 ```
 
 Follow [SELF_HOST.md](SELF_HOST.md) for a fresh installation, tailnet routing,
@@ -28,7 +28,7 @@ The package does not install a service, configure the tailnet or expose ports.
 State, owner/device identities, trust roots and sender grants live outside the
 versioned package. Run one server per database. Keep private keys and backups
 private; do not repeat bootstrap over an existing installation.
-This source, v0.1.17, v0.1.16, v0.1.15, v0.1.14 and v0.1.13 use FORMAT24 and migrate supported older state on startup.
+This source, v0.1.18, v0.1.17, v0.1.16, v0.1.15, v0.1.14 and v0.1.13 use FORMAT24 and migrate supported older state on startup.
 The v0.1.12 package uses FORMAT23, v0.1.11 uses FORMAT22, and v0.1.10 accepts
 formats 1–6 and 8–21. Those pre-FORMAT24 packages cannot start against FORMAT24
 state. The release installer creates one full private backup before switching

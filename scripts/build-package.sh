@@ -6,7 +6,7 @@ if [[ "$(uname -s)" != Linux || "$(uname -m)" != x86_64 ]]; then
   echo "This package supports Linux x86_64; build on the declared target." >&2
   exit 2
 fi
-version=0.1.18
+version=0.1.19
 dist_dir="$repo_dir/dist"
 if [[ $# -gt 0 ]]; then dist_dir=$1; fi
 mkdir -p "$dist_dir"
