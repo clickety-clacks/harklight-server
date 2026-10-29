@@ -151,5 +151,10 @@ namespace `AttentionServer`, `ATTENTION_SERVER_*` variables, `mix attention.*`,
 messages and operation receipts preserve first acceptance and exact retry
 semantics across restart. Tailnet access alone grants no person or sender rights.
 
+Top-level choice styling remains held by default across all send routes. An
+operator may set `ATTENTION_SERVER_CHOICE_STYLES_HELD=false` only after verifying
+that the installed client versions preserve usable answer controls when that
+member is present.
+
 This project is licensed under the MIT license (see `LICENSE`). Third-party
 dependency notices remain in their shipped distribution files.

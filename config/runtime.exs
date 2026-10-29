@@ -1,6 +1,11 @@
 import Config
 require Logger
 
+# Keep styles withheld from every delivery route until operators verify that
+# the installed clients tolerate the top-level choice_styles member.
+config :attention_server,
+  choice_styles_held: System.get_env("ATTENTION_SERVER_CHOICE_STYLES_HELD", "true") != "false"
+
 optional_warning = fn feature, reason ->
   Logger.warning("event=harklight_optional_feature_disabled feature=#{feature} reason=#{reason}")
 end

@@ -87,7 +87,7 @@ defmodule AttentionServer.DashboardView do
     algorithm_options =
       Enum.map_join(
         [
-          {"baseline", "Soonest deadline first, then newest"},
+          {"baseline", "Most urgent first, then soonest deadline, then newest"},
           {"jev-set", "Jev re-ranking"}
         ],
         fn {id, label} ->

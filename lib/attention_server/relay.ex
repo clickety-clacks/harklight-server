@@ -12,6 +12,8 @@ defmodule AttentionServer.Relay do
   use GenServer
   @agent_upload_idle_ms 60 * 60 * 1_000
   @upload_sweep_ms 60_000
+  @default_sweep_retry_ms 1_000
+  @max_timer_delay_ms 4_294_967_295
   @prioritization_debounce_ms 250
   @hosted_test_states ~w(no-devices device-waiting device-enrolled)
   @hosted_test_label "Test account"
@@ -504,6 +506,10 @@ defmodule AttentionServer.Relay do
 
             state = %{
               store: store,
+              clock: Keyword.get(opts, :clock, fn -> System.system_time(:millisecond) end),
+              default_index: Engine.default_index(store.engine),
+              default_timer: nil,
+              default_timer_generation: 0,
               upload_index: build_upload_index(store.engine),
               active_uploads: %{},
               sessions: %{},
@@ -535,6 +541,7 @@ defmodule AttentionServer.Relay do
             }
 
             state = initialize_priority_views(state)
+            state = reschedule_default_sweep(state, state.default_index)
 
             case sweep_agent_uploads(state, System.system_time(:millisecond)) do
               {:ok, next, _count} ->
@@ -2420,6 +2427,62 @@ defmodule AttentionServer.Relay do
     end
   end
 
+  def handle_info(:refresh_default_sweep_index, state) do
+    {:noreply, reschedule_default_sweep(state, Engine.default_index(state.store.engine))}
+  end
+
+  def handle_info({:default_sweep, generation}, %{default_timer_generation: generation} = state) do
+    state = %{state | default_timer: nil}
+    old_engine = state.store.engine
+    now_ms = state.clock.()
+
+    due_index =
+      state.default_index
+      |> Enum.filter(fn {_key, at} -> is_integer(at) and at <= now_ms end)
+      |> Map.new()
+
+    next_engine = Engine.sweep_due_defaults(old_engine, now_ms, due_index)
+
+    if next_engine == old_engine do
+      if map_size(due_index) == 0,
+        do: {:noreply, reschedule_default_sweep(state, state.default_index)},
+        else: {:noreply, schedule_default_retry(state)}
+    else
+      case commit(state.store, next_engine, %{
+             person: "system",
+             actor: "default_answer",
+             action: "default_answer_sweep"
+           }) do
+        {:ok, store} ->
+          next_state = %{state | store: store}
+
+          next_state =
+            next_engine.origin_feeds
+            |> Map.keys()
+            |> Enum.reduce(next_state, fn target, current ->
+              record_origin_feed_change(current, old_engine, next_engine, target)
+            end)
+
+          people = Map.keys(next_engine.persons)
+
+          next_state =
+            Enum.reduce(people, next_state, fn person, current ->
+              if pending_signature(old_engine, person) != pending_signature(next_engine, person),
+                do: pending_set_changed(current, person),
+                else: current
+            end)
+
+          {:noreply, next_state}
+
+        {:error, reason, next_store} ->
+          Diagnostics.failure(:message_default, :default_sweep, reason, :unavailable)
+          {:noreply, schedule_default_retry(%{state | store: next_store})}
+      end
+    end
+  end
+
+  def handle_info({:default_sweep, _stale_generation}, state), do: {:noreply, state}
+
   def handle_info({:prioritization_due, person, generation}, state) do
     case Map.get(state.priority_timers, person) do
       %{generation: ^generation} ->
@@ -3514,7 +3577,7 @@ defmodule AttentionServer.Relay do
   end
 
   defp perform_request(state, key, raw) do
-    {next_engine, reply} = Engine.request_line(state.store.engine, key, raw)
+    {next_engine, reply} = Engine.request_line(state.store.engine, key, raw, state.clock.())
     next_engine = with_initial_origin_availability(state, key, next_engine)
 
     operation_id =
@@ -3609,7 +3672,13 @@ defmodule AttentionServer.Relay do
           %{
             algorithm: "jev-set",
             basis: "selected",
-            entries: Placement.place(choice, items, previous.entries, nil)
+            entries:
+              Placement.place(
+                choice,
+                items,
+                Map.get(previous, :engine_entries, previous.entries),
+                nil
+              )
           }
 
         true ->
@@ -3628,14 +3697,29 @@ defmodule AttentionServer.Relay do
 
   defp put_priority_view(state, person, view) do
     previous = Map.get(state.priority_views, person)
-    comparable = Map.take(view, [:algorithm, :basis, :entries])
+    engine_entries = Map.get(view, :engine_entries, Map.get(view, :entries, []))
 
-    if previous && Map.take(previous, [:algorithm, :basis, :entries]) == comparable do
-      state
+    shown =
+      view
+      |> Map.take([:algorithm, :basis, :reason])
+      |> Map.put(:entries, Placement.grouped(engine_entries))
+
+    comparable = Map.take(shown, [:algorithm, :basis, :reason, :entries])
+
+    if previous && Map.take(previous, [:algorithm, :basis, :reason, :entries]) == comparable do
+      Map.put(
+        state,
+        :priority_views,
+        Map.put(state.priority_views, person, Map.put(previous, :engine_entries, engine_entries))
+      )
     else
       counter = state.priority_revision_counter + 1
       view_rev = state.priority_revision_namespace <> ":" <> Integer.to_string(counter)
-      view = Map.put(comparable, :view_rev, view_rev)
+
+      view =
+        comparable
+        |> Map.put(:engine_entries, engine_entries)
+        |> Map.put(:view_rev, view_rev)
 
       state
       |> Map.put(:priority_revision_counter, counter)
@@ -3693,7 +3777,8 @@ defmodule AttentionServer.Relay do
     state = ensure_priority_view(state, person)
     engine = state.store.engine
 
-    previous_entries = if is_map(previous), do: previous.entries, else: []
+    previous_entries =
+      if is_map(previous), do: Map.get(previous, :engine_entries, previous.entries), else: []
 
     if Placement.reassess(engine, person, previous_entries) == :whole_set and
          JevClient.connection_ready?(engine.jev_endpoint, engine.jev_model) and
@@ -3709,7 +3794,8 @@ defmodule AttentionServer.Relay do
     state = ensure_priority_view(state, person)
     engine = state.store.engine
 
-    previous_entries = if is_map(previous), do: previous.entries, else: []
+    previous_entries =
+      if is_map(previous), do: Map.get(previous, :engine_entries, previous.entries), else: []
 
     if Placement.reassess(engine, person, previous_entries) == :whole_set and
          JevClient.connection_ready?(engine.jev_endpoint, engine.jev_model) and
@@ -3824,21 +3910,17 @@ defmodule AttentionServer.Relay do
         previous = Map.get(state.priority_views, person)
 
         case result do
-          {:ok, identities} when is_list(identities) ->
-            if Placement.valid_permutation?(items, identities) do
-              previous_entries =
-                if is_map(previous), do: Map.get(previous, :entries, []), else: []
+          {:ok, scores} when is_map(scores) and map_size(scores) > 0 ->
+            previous_entries =
+              if is_map(previous), do: Map.get(previous, :engine_entries, []), else: []
 
-              entries = Placement.place("jev-set", items, previous_entries, {:ranked, identities})
+            entries = Placement.place("jev-set", items, previous_entries, {:scored, scores})
 
-              put_priority_view(state, person, %{
-                algorithm: "jev-set",
-                basis: "selected",
-                entries: entries
-              })
-            else
-              set_fallback_priority_view(state, person)
-            end
+            put_priority_view(state, person, %{
+              algorithm: "jev-set",
+              basis: "selected",
+              engine_entries: entries
+            })
 
           _ ->
             set_fallback_priority_view(state, person)
@@ -4052,10 +4134,45 @@ defmodule AttentionServer.Relay do
   defp setup(state, {:error, reason}, _person, _actor, _action),
     do: {:reply, {:error, reason}, state}
 
+  defp reschedule_default_sweep(state, index) do
+    if is_reference(state.default_timer), do: Process.cancel_timer(state.default_timer)
+
+    generation = state.default_timer_generation + 1
+
+    state = %{
+      state
+      | default_index: index,
+        default_timer: nil,
+        default_timer_generation: generation
+    }
+
+    case Enum.min(index |> Map.values(), &<=/2, fn -> nil end) do
+      at when is_integer(at) ->
+        delay = min(max(at - state.clock.(), 0), @max_timer_delay_ms)
+        timer = Process.send_after(self(), {:default_sweep, generation}, delay)
+        %{state | default_timer: timer}
+
+      _ ->
+        state
+    end
+  end
+
+  defp schedule_default_retry(state) do
+    generation = state.default_timer_generation + 1
+    timer = Process.send_after(self(), {:default_sweep, generation}, @default_sweep_retry_ms)
+    %{state | default_timer: timer, default_timer_generation: generation}
+  end
+
   # Origin-feed changes are announced only by the request paths that append
   # them. This keeps unrelated commits out of every attached origin stream.
   defp commit(store, next, audit) do
-    Store.commit(store, next, audit)
+    result = Store.commit(store, next, audit)
+
+    if match?({:ok, _}, result) and store.engine.messages != next.messages do
+      send(self(), :refresh_default_sweep_index)
+    end
+
+    result
   end
 
   defp origin_feed_targets(

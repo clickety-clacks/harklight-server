@@ -125,6 +125,7 @@ defmodule AttentionServer.Conversation do
 
   def terminal_author(record, terminal) do
     cond do
+      terminal.actor_kind == :server -> "server"
       terminal.actor_kind == :agent -> "agent"
       terminal.state == "superseded" -> "server"
       terminal.actor == record.origin -> "origin"
@@ -157,6 +158,8 @@ defmodule AttentionServer.Conversation do
         "terminal_seq" => terminal.seq,
         "has_answer" => terminal.answer_present
       }
+
+      entry = if terminal.by == "default", do: Map.put(entry, "by", "default"), else: entry
 
       entry =
         if terminal.state == "retracted",
