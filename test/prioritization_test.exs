@@ -416,6 +416,7 @@ defmodule AttentionServer.PrioritizationTest do
       |> Map.delete(:algorithm_choices)
       |> Map.delete(:jev_endpoint)
       |> Map.delete(:jev_model)
+      |> Map.delete(:open_default_index)
 
     payload = :erlang.term_to_binary({:attention_relay_state, 22, old_engine}, [{:compressed, 6}])
     assert {:ok, db} = Sqlite3.open(path)
@@ -438,8 +439,10 @@ defmodule AttentionServer.PrioritizationTest do
     assert :ok = Sqlite3.release(db, select)
     assert :ok = Sqlite3.close(db)
 
-    assert {:attention_relay_state, 24, _saved_engine} =
+    assert {:attention_relay_state, 24, saved_engine} =
              :erlang.binary_to_term(saved_payload, [:safe])
+
+    refute Map.has_key?(saved_engine, :open_default_index)
   end
 
   test "choice and Jev connection persist without storing a key path or bytes", %{path: path} do

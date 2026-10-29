@@ -12,7 +12,8 @@ defmodule AttentionServer.Relay do
   use GenServer
   @agent_upload_idle_ms 60 * 60 * 1_000
   @upload_sweep_ms 60_000
-  @default_sweep_ms 1_000
+  @default_sweep_retry_ms 1_000
+  @max_timer_delay_ms 4_294_967_295
   @prioritization_debounce_ms 250
   @hosted_test_states ~w(no-devices device-waiting device-enrolled)
   @hosted_test_label "Test account"
@@ -502,10 +503,12 @@ defmodule AttentionServer.Relay do
         case Store.discard_building_inbox_snapshots(store) do
           :ok ->
             Process.send_after(self(), :upload_sweep, @upload_sweep_ms)
-            Process.send_after(self(), :default_sweep, @default_sweep_ms)
 
             state = %{
               store: store,
+              default_index: Engine.default_index(store.engine),
+              default_timer: nil,
+              default_timer_generation: 0,
               upload_index: build_upload_index(store.engine),
               active_uploads: %{},
               sessions: %{},
@@ -537,6 +540,7 @@ defmodule AttentionServer.Relay do
             }
 
             state = initialize_priority_views(state)
+            state = reschedule_default_sweep(state, state.default_index)
 
             case sweep_agent_uploads(state, System.system_time(:millisecond)) do
               {:ok, next, _count} ->
@@ -2422,13 +2426,26 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  def handle_info(:default_sweep, state) do
-    Process.send_after(self(), :default_sweep, @default_sweep_ms)
+  def handle_info(:refresh_default_sweep_index, state) do
+    {:noreply, reschedule_default_sweep(state, Engine.default_index(state.store.engine))}
+  end
+
+  def handle_info({:default_sweep, generation}, %{default_timer_generation: generation} = state) do
+    state = %{state | default_timer: nil}
     old_engine = state.store.engine
-    next_engine = Engine.sweep_due_defaults(old_engine, System.system_time(:millisecond))
+    now_ms = System.system_time(:millisecond)
+
+    due_index =
+      state.default_index
+      |> Enum.filter(fn {_key, at} -> is_integer(at) and at <= now_ms end)
+      |> Map.new()
+
+    next_engine = Engine.sweep_due_defaults(old_engine, now_ms, due_index)
 
     if next_engine == old_engine do
-      {:noreply, state}
+      if map_size(due_index) == 0,
+        do: {:noreply, reschedule_default_sweep(state, state.default_index)},
+        else: {:noreply, schedule_default_retry(state)}
     else
       case commit(state.store, next_engine, %{
              person: "system",
@@ -2458,10 +2475,12 @@ defmodule AttentionServer.Relay do
 
         {:error, reason, next_store} ->
           Diagnostics.failure(:message_default, :default_sweep, reason, :unavailable)
-          {:noreply, %{state | store: next_store}}
+          {:noreply, schedule_default_retry(%{state | store: next_store})}
       end
     end
   end
+
+  def handle_info({:default_sweep, _stale_generation}, state), do: {:noreply, state}
 
   def handle_info({:prioritization_due, person, generation}, state) do
     case Map.get(state.priority_timers, person) do
@@ -4114,10 +4133,45 @@ defmodule AttentionServer.Relay do
   defp setup(state, {:error, reason}, _person, _actor, _action),
     do: {:reply, {:error, reason}, state}
 
+  defp reschedule_default_sweep(state, index) do
+    if is_reference(state.default_timer), do: Process.cancel_timer(state.default_timer)
+
+    generation = state.default_timer_generation + 1
+
+    state = %{
+      state
+      | default_index: index,
+        default_timer: nil,
+        default_timer_generation: generation
+    }
+
+    case Enum.min(index |> Map.values(), &<=/2, fn -> nil end) do
+      at when is_integer(at) ->
+        delay = min(max(at - System.system_time(:millisecond), 0), @max_timer_delay_ms)
+        timer = Process.send_after(self(), {:default_sweep, generation}, delay)
+        %{state | default_timer: timer}
+
+      _ ->
+        state
+    end
+  end
+
+  defp schedule_default_retry(state) do
+    generation = state.default_timer_generation + 1
+    timer = Process.send_after(self(), {:default_sweep, generation}, @default_sweep_retry_ms)
+    %{state | default_timer: timer, default_timer_generation: generation}
+  end
+
   # Origin-feed changes are announced only by the request paths that append
   # them. This keeps unrelated commits out of every attached origin stream.
   defp commit(store, next, audit) do
-    Store.commit(store, next, audit)
+    result = Store.commit(store, next, audit)
+
+    if match?({:ok, _}, result) and store.engine.messages != next.messages do
+      send(self(), :refresh_default_sweep_index)
+    end
+
+    result
   end
 
   defp origin_feed_targets(

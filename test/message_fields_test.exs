@@ -114,6 +114,36 @@ defmodule AttentionServer.MessageFieldsTest do
     assert {^raw, []} = Message.normalize_optional_fields(raw, 100, false)
   end
 
+  test "default sweep index contains only valid open message defaults" do
+    defaulted =
+      message()
+      |> Map.put("default", %{"value" => %{"n" => 2}, "at" => 200})
+
+    active = %{message: defaulted, terminal: nil, accepted_at: 100}
+    terminal = %{active | terminal: %{state: "answered"}}
+
+    invalid = %{
+      active
+      | message: Map.put(defaulted, "default", %{"value" => %{"n" => 2}, "at" => 100})
+    }
+
+    no_default = %{active | message: message()}
+
+    engine =
+      %{
+        Engine.new()
+        | messages: %{
+            {"person", "app:test", "active"} => active,
+            {"person", "app:test", "terminal"} => terminal,
+            {"person", "app:test", "invalid"} => invalid,
+            {"person", "app:test", "none"} => no_default
+          }
+      }
+      |> Engine.rebuild_default_index()
+
+    assert Engine.default_index(engine) == %{{"person", "app:test", "active"} => 200}
+  end
+
   test "the style hold can be disabled and invalid style entries produce one field warning" do
     raw =
       message()

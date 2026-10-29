@@ -46,6 +46,7 @@ defmodule AttentionServer.Engine do
             agents: %{},
             sender_grants: %{},
             messages: %{},
+            open_default_index: %{},
             events: %{},
             conversation_highs: %{},
             conversation_events: %{},
@@ -2001,10 +2002,34 @@ defmodule AttentionServer.Engine do
 
   @doc "Commits every due open default using the supplied server time."
   def sweep_due_defaults(%__MODULE__{} = engine, now_ms) when is_integer(now_ms) do
+    sweep_due_defaults(engine, now_ms, engine.open_default_index)
+  end
+
+  def sweep_due_defaults(%__MODULE__{} = engine, _), do: engine
+
+  @doc false
+  def default_index(%__MODULE__{} = engine), do: engine.open_default_index
+
+  @doc false
+  def rebuild_default_index(%__MODULE__{} = engine) do
+    index =
+      Enum.reduce(engine.messages, %{}, fn {key, record}, current ->
+        case default_due_at(record) do
+          at when is_integer(at) -> Map.put(current, key, at)
+          _ -> current
+        end
+      end)
+
+    %{engine | open_default_index: index}
+  end
+
+  @doc false
+  def sweep_due_defaults(%__MODULE__{} = engine, now_ms, index)
+      when is_integer(now_ms) and is_map(index) do
     due_keys =
-      engine.messages
-      |> Enum.flat_map(fn {key, record} ->
-        if due_default?(record, now_ms), do: [key], else: []
+      index
+      |> Enum.flat_map(fn {key, at} ->
+        if is_integer(at) and at <= now_ms, do: [key], else: []
       end)
       |> Enum.sort_by(fn {person, _sender, _id} = key ->
         {person, Map.get(engine.messages[key], :accepted_seq, 0), key}
@@ -2013,8 +2038,6 @@ defmodule AttentionServer.Engine do
     {next, _changed} = commit_due_defaults(engine, due_keys, now_ms)
     next
   end
-
-  def sweep_due_defaults(%__MODULE__{} = engine, _), do: engine
 
   defp sweep_request_defaults(engine, person, frame, now_ms) when is_map(frame) do
     keys =
@@ -4986,7 +5009,29 @@ defmodule AttentionServer.Engine do
   end
 
   defp put_message(engine, key, record),
-    do: %{engine | messages: Map.put(engine.messages, key, record)}
+    do:
+      engine
+      |> then(fn current ->
+        case default_due_at(record) do
+          at when is_integer(at) ->
+            %{current | open_default_index: Map.put(current.open_default_index, key, at)}
+
+          _ ->
+            %{current | open_default_index: Map.delete(current.open_default_index, key)}
+        end
+      end)
+      |> then(fn current -> %{current | messages: Map.put(current.messages, key, record)} end)
+
+  defp default_due_at(record) do
+    if Map.get(record, :terminal) == nil do
+      accepted_at = Map.get(record, :revision_accepted_at, Map.get(record, :accepted_at))
+
+      case Message.default_answer(Map.get(record, :message), accepted_at) do
+        %{at: at} when is_integer(at) -> at
+        _ -> nil
+      end
+    end
+  end
 
   defp put_event(engine, person, seq, kind, key),
     do: %{engine | events: Map.put(engine.events, {person, seq}, %{kind: kind, key: key})}

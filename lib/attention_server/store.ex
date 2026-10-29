@@ -107,7 +107,10 @@ defmodule AttentionServer.Store do
       {:ok, db} ->
         case initialize(db) do
           {:ok, engine, version} ->
-            engine = Conversation.index_origin_feeds(engine)
+            engine =
+              engine
+              |> Engine.rebuild_default_index()
+              |> Conversation.index_origin_feeds()
 
             with :ok <- File.mkdir_p(upload_dir),
                  :ok <- File.chmod(upload_dir, 0o700),
@@ -1684,7 +1687,15 @@ defmodule AttentionServer.Store do
   defp encode_term(value), do: :erlang.term_to_binary(value, [{:compressed, 6}])
 
   defp encode_state(engine) do
-    :erlang.term_to_binary({:attention_relay_state, @format_version, engine}, [{:compressed, 6}])
+    persisted =
+      engine
+      |> Map.from_struct()
+      |> Map.delete(:open_default_index)
+      |> Map.put(:__struct__, Engine)
+
+    :erlang.term_to_binary({:attention_relay_state, @format_version, persisted}, [
+      {:compressed, 6}
+    ])
   end
 
   defp normalize_enrollments(engine) do
@@ -1880,6 +1891,10 @@ defmodule AttentionServer.Store do
     try do
       valid_instance?(engine.relay_instance_id) and
         is_binary(engine.agent_cursor_key) and byte_size(engine.agent_cursor_key) == 32 and
+        is_map(engine.open_default_index) and
+        Enum.all?(engine.open_default_index, fn {key, at} ->
+          is_tuple(key) and tuple_size(key) == 3 and is_integer(at)
+        end) and
         is_integer(engine.pending_clock_high_water) and engine.pending_clock_high_water >= 0 and
         Enum.all?(engine.persons, fn {person, high} ->
           is_binary(person) and is_integer(high) and high >= 0
