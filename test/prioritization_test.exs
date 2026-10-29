@@ -7,6 +7,7 @@ defmodule AttentionServer.PrioritizationTest do
     Engine,
     JSON,
     JevClient,
+    JevRanking,
     Placement,
     Relay,
     Store,
@@ -73,8 +74,8 @@ defmodule AttentionServer.PrioritizationTest do
     end)
   end
 
-  defp start_relay(path) do
-    assert {:ok, relay} = Relay.start_link(store_path: path)
+  defp start_relay(path, opts \\ []) do
+    assert {:ok, relay} = Relay.start_link(Keyword.put(opts, :store_path, path))
     Process.unlink(relay)
     on_exit(fn -> if Process.alive?(relay), do: GenServer.stop(relay) end)
     relay
@@ -164,7 +165,7 @@ defmodule AttentionServer.PrioritizationTest do
     assert :ok = Relay.setup_sender(relay, "device-a", "app:test")
   end
 
-  defp forward(relay, n, id, deadline \\ nil) do
+  defp forward(relay, n, id, deadline \\ nil, body \\ nil) do
     message = %{
       "sender_id" => "app:test",
       "message_id" => id,
@@ -173,6 +174,7 @@ defmodule AttentionServer.PrioritizationTest do
     }
 
     message = if is_integer(deadline), do: Map.put(message, "by_when", deadline), else: message
+    message = if is_binary(body), do: Map.put(message, "body", body), else: message
 
     assert %{"type" => "ok"} =
              request(relay, "device-a", %{
@@ -336,7 +338,11 @@ defmodule AttentionServer.PrioritizationTest do
       |> Map.update!(:message, &Map.put(&1, "urgency", "low"))
 
     assert {:ok, request} =
-             Placement.compose("jev-set", [urgent, due], %{endpoint: @endpoint, model: @model})
+             Placement.compose("jev-set", [urgent, due], %{
+               endpoint: @endpoint,
+               model: @model,
+               now: 0
+             })
 
     assert {:ok,
             %{
@@ -348,11 +354,13 @@ defmodule AttentionServer.PrioritizationTest do
     assert urgent_item["stake"] == ""
     refute Map.has_key?(urgent_item, "by_when")
     assert due_item["urgency"] == "low"
-    assert due_item["by_when"] == 100
+    assert due_item["by_when"] == "1970-01-01T00:00:00Z"
+    assert due_item["due_in_minutes"] == 0
 
     assert questions["candidate_1"]["instructions"] ==
-             "Rate candidate 1 in the supplied whole pending set for how soon it should be handled. " <>
-               "Consider its title, body, stated stake, deadline and the sender's stated urgency relative to the other pending items."
+             "Rate candidate 1 in the supplied pending set for how soon it should be handled. " <>
+               "Consider its title, body, stated stake, deadline and the sender's stated urgency relative to the other pending items. " <>
+               "The current time is now; due_in_minutes is the time left before the deadline, negative once it has passed."
 
     assert questions["candidate_1"]["criteria"] == [
              "Low priority: this can wait while more time-sensitive items are handled.",
@@ -605,6 +613,152 @@ defmodule AttentionServer.PrioritizationTest do
     assert persisted.engine.jev_endpoint == changed_endpoint
     assert persisted.engine.jev_model == @model
     assert :ok = Store.close(persisted)
+  end
+
+  test "shared connection changes invalidate every Jev person's cache and pending result", %{
+    dir: dir,
+    path: path
+  } do
+    use_synthetic_jev_key(dir)
+    certs = TLSFixtures.create!()
+    on_exit(fn -> File.rm_rf!(certs) end)
+    old_endpoint = "https://127.0.0.1:1/v1/old-systemone"
+    new_endpoint = "https://127.0.0.1:1/v1/new-systemone"
+    new_model = "jev-next"
+    parent = self()
+    {:ok, block_old_b} = Agent.start_link(fn -> false end)
+    {:ok, calls} = Agent.start_link(fn -> [] end)
+    on_exit(fn -> if Process.alive?(block_old_b), do: Agent.stop(block_old_b) end)
+    on_exit(fn -> if Process.alive?(calls), do: Agent.stop(calls) end)
+
+    evaluator = fn request ->
+      sender = request.candidates |> hd() |> elem(0)
+      Agent.update(calls, &[{sender, request.uri.path, request.model, request.candidates} | &1])
+
+      if sender == "app:b" and request.uri.path == "/v1/old-systemone" and
+           Agent.get(block_old_b, & &1) do
+        send(parent, {:old_b_pending, self()})
+
+        receive do
+          :release -> :ok
+        end
+      end
+
+      {:ok, Map.new(request.candidates, &{&1, 2.0})}
+    end
+
+    relay = start_relay(path, priority_evaluator: evaluator)
+    owner_cert = TLSFixtures.certificate_der!(certs, "a1")
+    assert {:ok, owner_person} = Relay.operator_bootstrap(relay, owner_cert)
+    assert {:ok, owner_key} = DeviceIdentity.from_certificate(owner_cert)
+    assert :ok = Relay.setup_person(relay, "person-b")
+    assert :ok = Relay.setup_person(relay, "person-c")
+
+    for {person, device, sender} <- [
+          {owner_person, "device-a", "app:a"},
+          {"person-b", "device-b", "app:b"},
+          {"person-c", "device-c", "app:c"}
+        ] do
+      assert :ok = Relay.setup_device(relay, person, device)
+      assert :ok = Relay.setup_sender(relay, device, sender)
+    end
+
+    assert {:ok, _} =
+             Relay.save_dashboard_prioritization(
+               relay,
+               owner_person,
+               owner_key,
+               owner_person,
+               "jev-set",
+               old_endpoint,
+               @model
+             )
+
+    state = :sys.get_state(relay)
+    assert {:ok, engine} = Engine.set_algorithm_choice(state.store.engine, "person-b", "jev-set")
+
+    assert {:ok, saved} =
+             Store.commit(state.store, engine, %{
+               person: "person-b",
+               actor: "owner",
+               action: "choice"
+             })
+
+    :sys.replace_state(relay, &%{&1 | store: saved})
+
+    forward_as = fn device, sender, n, id ->
+      assert %{"type" => "ok"} =
+               request(relay, device, %{
+                 "type" => "forward",
+                 "op_id" => op(n),
+                 "message" => %{
+                   "sender_id" => sender,
+                   "message_id" => id,
+                   "created_at" => n,
+                   "title" => id
+                 }
+               })
+    end
+
+    forward_as.("device-a", "app:a", 1001, "a1")
+    forward_as.("device-b", "app:b", 1002, "b1")
+    forward_as.("device-c", "app:c", 1003, "c1")
+
+    state =
+      await_state(relay, fn state ->
+        is_map(state.priority_caches[owner_person]) and
+          is_map(state.priority_caches["person-b"]) and
+          state.priority_views[owner_person].basis == "selected" and
+          state.priority_views["person-b"].basis == "selected"
+      end)
+
+    assert Placement.choice(state.store.engine, "person-c") == "baseline"
+    assert state.priority_views["person-c"].algorithm == "baseline"
+    old_epochs = state.priority_cache_epochs
+
+    Agent.update(block_old_b, fn _ -> true end)
+    forward_as.("device-b", "app:b", 1004, "b2")
+    assert_receive {:old_b_pending, pending_worker}, 2_000
+
+    assert {:ok, _} =
+             Relay.save_dashboard_prioritization(
+               relay,
+               owner_person,
+               owner_key,
+               owner_person,
+               "jev-set",
+               new_endpoint,
+               new_model
+             )
+
+    changed = :sys.get_state(relay)
+    assert changed.priority_cache_epochs[owner_person] > Map.get(old_epochs, owner_person, 0)
+    assert changed.priority_cache_epochs["person-b"] > Map.get(old_epochs, "person-b", 0)
+    refute Map.has_key?(changed.priority_caches, owner_person)
+    refute Map.has_key?(changed.priority_caches, "person-b")
+    assert changed.priority_views["person-b"].basis == "fallback"
+    assert Placement.choice(changed.store.engine, "person-b") == "jev-set"
+    assert Placement.choice(changed.store.engine, "person-c") == "baseline"
+
+    Agent.update(block_old_b, fn _ -> false end)
+    send(pending_worker, :release)
+
+    await_state(relay, fn state ->
+      is_map(state.priority_caches["person-b"]) and
+        state.priority_views["person-b"].basis == "selected" and
+        not Map.has_key?(state.priority_jobs, "person-b")
+    end)
+
+    observed = Agent.get(calls, & &1)
+
+    assert Enum.any?(observed, fn {sender, path, model, _} ->
+             sender == "app:a" and path == "/v1/new-systemone" and model == new_model
+           end)
+
+    assert Enum.any?(observed, fn {sender, path, model, candidates} ->
+             sender == "app:b" and path == "/v1/new-systemone" and model == new_model and
+               Enum.sort(candidates) == Enum.sort([{"app:b", "b1"}, {"app:b", "b2"}])
+           end)
   end
 
   test "Jev key bytes and key path stay out of stored state, logs and the config page", %{
@@ -1207,5 +1361,215 @@ defmodule AttentionServer.PrioritizationTest do
     assert first["entries"] == second["entries"]
     refute first["view_rev"] == second["view_rev"]
     GenServer.stop(restarted)
+  end
+
+  test "a failed stand-in call schedules retry, recovers, and logs only pass metrics", %{
+    dir: dir,
+    path: path
+  } do
+    use_synthetic_jev_key(dir)
+    {:ok, attempts} = Agent.start_link(fn -> 0 end)
+    on_exit(fn -> if Process.alive?(attempts), do: Agent.stop(attempts) end)
+
+    evaluator = fn request ->
+      attempt = Agent.get_and_update(attempts, fn count -> {count, count + 1} end)
+
+      if attempt == 0,
+        do: {:error, :unavailable},
+        else: {:ok, Map.new(request.candidates, &{&1, 2.7})}
+    end
+
+    relay = start_relay(path, priority_evaluator: evaluator)
+    setup_person(relay)
+    configure_jev_choice(relay)
+
+    logs =
+      ExUnit.CaptureLog.capture_log(fn ->
+        forward(relay, 1, "private-title")
+        await_state(relay, &(&1.priority_failures["person-a"] == 1))
+
+        state = :sys.get_state(relay)
+        retry = state.priority_retry_timers["person-a"]
+        assert retry
+        assert Process.read_timer(retry.ref) in 8_000..10_000
+        assert state.priority_views["person-a"].basis == "fallback"
+
+        send(relay, {:priority_retry, "person-a", retry.generation})
+        await_state(relay, &(&1.priority_views["person-a"].basis == "selected"))
+      end)
+
+    assert Agent.get(attempts, & &1) == 2
+    refute Map.has_key?(:sys.get_state(relay).priority_failures, "person-a")
+
+    assert logs =~
+             "event=harklight_priority_pass outcome=failed requests=1 finals=0 considered=1 clipped=0"
+
+    assert logs =~
+             "event=harklight_priority_pass outcome=ok requests=1 finals=0 considered=1 clipped=0"
+
+    refute logs =~ "private-title"
+    refute logs =~ "app:test"
+
+    assert :sys.get_state(relay).priority_views["person-a"].entries
+           |> hd()
+           |> Map.fetch!("priority") == "now"
+  end
+
+  test "a quiet inbox re-ranks when the deadline enters the next class", %{dir: dir, path: path} do
+    use_synthetic_jev_key(dir)
+    now = 1_793_290_000_000
+    due = now + 3_600_000 + 2_000
+    {:ok, clock} = Agent.start_link(fn -> now end)
+    on_exit(fn -> if Process.alive?(clock), do: Agent.stop(clock) end)
+
+    evaluator = fn request ->
+      {:ok, %{"state" => %{"pending_items" => [pending]}}} =
+        JSON.decode_line(request.body <> "\n")
+
+      score = if pending["due_in_minutes"] < 60, do: 2.7, else: 1.0
+      {:ok, Map.new(request.candidates, &{&1, score})}
+    end
+
+    relay =
+      start_relay(path,
+        clock: fn -> Agent.get(clock, & &1) end,
+        priority_evaluator: evaluator
+      )
+
+    setup_person(relay)
+    configure_jev_choice(relay)
+    forward(relay, 1, "deadline-only", due)
+    state = await_state(relay, &Map.has_key?(&1.priority_deadline_timers, "person-a"))
+    assert state.priority_views["person-a"].entries |> hd() |> Map.fetch!("priority") == "normal"
+    assert state.priority_deadline_timers["person-a"].due == now + 2_000
+
+    Agent.update(clock, fn _ -> now + 3_000 end)
+    send(relay, {:priority_deadline, "person-a", now + 2_000})
+
+    state =
+      await_state(relay, fn state ->
+        state.priority_views["person-a"].entries |> hd() |> Map.fetch!("priority") == "now"
+      end)
+
+    assert state.priority_views["person-a"].basis == "selected"
+  end
+
+  test "intake proceeds while a stand-in ranking request is waiting", %{dir: dir, path: path} do
+    use_synthetic_jev_key(dir)
+    parent = self()
+
+    evaluator = fn request ->
+      send(parent, {:ranking_waiting, self()})
+
+      receive do
+        :release -> {:ok, Map.new(request.candidates, &{&1, 1.0})}
+      end
+    end
+
+    relay = start_relay(path, priority_evaluator: evaluator)
+    setup_person(relay)
+    configure_jev_choice(relay)
+    forward(relay, 1, "first")
+    assert_receive {:ranking_waiting, worker}, 2_000
+    forward(relay, 2, "accepted-while-ranking")
+    assert {:ok, events, 2} = Relay.events(relay, "device-a", 0)
+    assert length(events) == 2
+    send(worker, :release)
+    assert_receive {:ranking_waiting, next_worker}, 2_000
+    send(next_worker, :release)
+    await_state(relay, &(not Map.has_key?(&1.priority_jobs, "person-a")))
+  end
+
+  test "a mid-pass arrival reuses completed unaffected batches and logs both passes", %{
+    dir: dir,
+    path: path
+  } do
+    use_synthetic_jev_key(dir)
+    parent = self()
+    {:ok, gate} = Agent.start_link(fn -> true end)
+    {:ok, calls} = Agent.start_link(fn -> 0 end)
+    on_exit(fn -> if Process.alive?(gate), do: Agent.stop(gate) end)
+    on_exit(fn -> if Process.alive?(calls), do: Agent.stop(calls) end)
+
+    evaluator = fn request ->
+      Agent.update(calls, &(&1 + 1))
+      send(parent, {:provider_request, self(), request.candidates})
+
+      if Agent.get(gate, & &1) do
+        receive do
+          :release -> :ok
+        end
+      end
+
+      {:ok, Map.new(request.candidates, &{&1, 1.0})}
+    end
+
+    relay = start_relay(path, priority_evaluator: evaluator)
+    setup_person(relay)
+    body = String.duplicate("x", 650)
+
+    for n <- 1..100, do: forward(relay, n, "seed-#{n}", nil, body)
+    configure_jev_choice(relay)
+
+    logs =
+      ExUnit.CaptureLog.capture_log(fn ->
+        forward(relay, 101, "initial-trigger", nil, body)
+        engine = :sys.get_state(relay).store.engine
+
+        expected_batches =
+          JevRanking.run(
+            Placement.items(engine, "person-a"),
+            %{},
+            engine.jev_endpoint,
+            engine.jev_model,
+            System.system_time(:millisecond),
+            fn request -> {:ok, Map.new(request.candidates, &{&1, 1.0})} end
+          )
+          |> then(&length(&1.cache.batches))
+
+        assert expected_batches > 1
+
+        workers =
+          for _ <- 1..expected_batches do
+            assert_receive {:provider_request, pid, _candidates}, 2_000
+            pid
+          end
+
+        forward(relay, 102, "mid-pass", nil, body)
+        Agent.update(gate, fn _ -> false end)
+        Enum.each(workers, &send(&1, :release))
+
+        assert_receive {:provider_request, _next_pid, next_candidates}, 2_000
+        assert {"app:test", "mid-pass"} in next_candidates
+
+        await_state(relay, fn state ->
+          cache = state.priority_caches["person-a"]
+
+          is_map(cache) and not Map.has_key?(state.priority_jobs, "person-a") and
+            Enum.any?(cache.batches, fn batch ->
+              {"app:test", "mid-pass"} in batch.members and is_map(batch.scores)
+            end)
+        end)
+
+        assert Agent.get(calls, & &1) == expected_batches + 1
+        refute_receive {:provider_request, _pid, _candidates}, 0
+      end)
+
+    assert length(Regex.scan(~r/event=harklight_priority_pass /, logs)) == 2
+    assert logs =~ "requests=1 finals=0"
+  end
+
+  defp await_state(relay, predicate, attempts \\ 100)
+  defp await_state(_relay, _predicate, 0), do: flunk("priority pass did not finish")
+
+  defp await_state(relay, predicate, attempts) do
+    state = :sys.get_state(relay)
+
+    if predicate.(state) do
+      state
+    else
+      Process.sleep(20)
+      await_state(relay, predicate, attempts - 1)
+    end
   end
 end

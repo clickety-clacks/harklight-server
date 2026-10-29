@@ -222,9 +222,20 @@ defmodule AttentionServer.Placement.JevSet do
   alias AttentionServer.Placement
   alias AttentionServer.Placement.Baseline
   alias AttentionServer.JevClient
+  alias AttentionServer.JevRanking
 
   @impl true
   def place(items, _previous, {:scored, scores}) do
+    scored_place(items, scores, MapSet.new())
+  end
+
+  def place(items, _previous, {:ranked, scores, overflow}) do
+    scored_place(items, scores, overflow)
+  end
+
+  def place(items, previous, _result), do: retained_place(items, previous)
+
+  defp scored_place(items, scores, overflow) do
     items_by_identity = Map.new(items, &{&1.identity, &1})
     baseline = Baseline.ordered_items(items)
 
@@ -234,26 +245,34 @@ defmodule AttentionServer.Placement.JevSet do
       score = Map.get(scores, item.identity)
 
       priority =
-        if valid_score?(score),
-          do: score_priority(score),
-          else: Message.effective_urgency(item.message)
+        cond do
+          MapSet.member?(overflow, item.identity) -> "normal"
+          valid_score?(score) -> score_priority(score)
+          true -> Message.effective_urgency(item.message)
+        end
 
       sort_score =
-        if valid_score?(score),
-          do: score,
-          else: urgency_score(Message.effective_urgency(item.message))
+        cond do
+          MapSet.member?(overflow, item.identity) -> 1.0
+          valid_score?(score) -> score
+          true -> urgency_score(Message.effective_urgency(item.message))
+        end
 
       {sort_score, index, Map.fetch!(items_by_identity, item.identity), priority}
     end)
     |> Enum.sort_by(fn {score, index, _item, _priority} -> {-score, index} end)
-    |> Enum.map(fn {_score, _index, item, priority} ->
+    |> Enum.map_reduce(0, fn {_score, _index, item, priority}, top_count ->
+      {priority, top_count} = cap_priority(priority, top_count)
+
       item
       |> Map.put(:priority, priority)
       |> Placement.entry()
+      |> then(&{&1, top_count})
     end)
+    |> elem(0)
   end
 
-  def place(items, previous, _result) do
+  defp retained_place(items, previous) do
     items_by_identity = Map.new(items, &{&1.identity, &1})
     baseline = Placement.place("baseline", items, [], nil)
 
@@ -292,8 +311,19 @@ defmodule AttentionServer.Placement.JevSet do
     new_entries =
       Enum.filter(baseline, &(not MapSet.member?(placed, Placement.identity(&1))))
 
-    retained ++ new_entries
+    (retained ++ new_entries)
+    |> Enum.map_reduce(0, fn entry, count ->
+      {priority, next_count} = cap_priority(entry["priority"], count)
+      {Map.put(entry, "priority", priority), next_count}
+    end)
+    |> elem(0)
   end
+
+  defp cap_priority(priority, count) when priority in ["high", "now"] do
+    if count < JevRanking.top_tier_cap(), do: {priority, count + 1}, else: {"normal", count}
+  end
+
+  defp cap_priority(priority, count), do: {priority, count}
 
   defp valid_priority(value, _fallback) when value in ["low", "normal", "high", "now"],
     do: value
@@ -321,6 +351,7 @@ defmodule AttentionServer.Placement.JevSet do
       JevClient.compose(
         Baseline.ordered_items(items),
         connection.endpoint,
-        connection.model
+        connection.model,
+        Map.get(connection, :now, System.system_time(:millisecond))
       )
 end
