@@ -1976,8 +1976,7 @@ defmodule AttentionServer.Store do
             valid_seq?(engine, person, record.accepted_seq) and
             valid_conversation_record?(record) and valid_origin_result?(record) and
             (is_nil(record.terminal) or
-               (actor_owns?(engine, person, record.terminal.actor) and
-                  actor_kind?(engine, person, record.terminal) and
+               (valid_terminal_actor?(engine, person, record.terminal) and
                   valid_seq?(engine, person, record.terminal.seq))) and
             valid_source_record?(record)
         end) and
@@ -2429,6 +2428,17 @@ defmodule AttentionServer.Store do
         false
     end
   end
+
+  defp valid_terminal_actor?(_engine, _person, %{actor_kind: :server} = terminal) do
+    is_nil(terminal.actor) and is_nil(Map.get(terminal, :actor_id)) and
+      terminal.state == "answered" and terminal.by == "default" and
+      terminal.answer_present == true
+  end
+
+  defp valid_terminal_actor?(engine, person, terminal),
+    do:
+      actor_owns?(engine, person, terminal.actor) and
+        actor_kind?(engine, person, terminal)
 
   defp valid_seq?(engine, person, seq),
     do: is_integer(seq) and seq > 0 and seq <= Map.get(engine.persons, person, 0)

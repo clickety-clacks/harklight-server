@@ -1981,10 +1981,13 @@ defmodule AttentionServer.Engine do
   """
   def request_line(%__MODULE__{} = engine, key, raw) do
     with {:ok, principal} <- principal(engine, key) do
+      request_at = System.system_time(:millisecond)
+
       {next, frame} =
         case JSON.decode_line(raw) do
           {:ok, value} ->
-            handle_frame(engine, principal, value)
+            swept = sweep_request_defaults(engine, principal.person, value, request_at)
+            handle_frame(swept, Map.put(principal, :request_at, request_at), value)
 
           {:error, :bad_frame} ->
             {engine, %{"v" => 1, "type" => "error", "reason" => "bad_frame"}}
@@ -1993,6 +1996,122 @@ defmodule AttentionServer.Engine do
       {next, {:ok, JSON.encode!(frame) <> "\n"}}
     else
       _ -> {engine, {:error, :forbidden}}
+    end
+  end
+
+  @doc "Commits every due open default using the supplied server time."
+  def sweep_due_defaults(%__MODULE__{} = engine, now_ms) when is_integer(now_ms) do
+    due_keys =
+      engine.messages
+      |> Enum.flat_map(fn {key, record} ->
+        if due_default?(record, now_ms), do: [key], else: []
+      end)
+      |> Enum.sort_by(fn {person, _sender, _id} = key ->
+        {person, Map.get(engine.messages[key], :accepted_seq, 0), key}
+      end)
+
+    {next, _changed} = commit_due_defaults(engine, due_keys, now_ms)
+    next
+  end
+
+  def sweep_due_defaults(%__MODULE__{} = engine, _), do: engine
+
+  defp sweep_request_defaults(engine, person, frame, now_ms) when is_map(frame) do
+    keys =
+      case frame do
+        %{"type" => "answer_no_comment", "request_id" => id} when is_binary(id) ->
+          matches = for {{^person, _sender, ^id} = key, _record} <- engine.messages, do: key
+
+          case matches do
+            [key] -> [key]
+            _ -> []
+          end
+
+        %{"type" => "forward", "message" => %{"sender_id" => sender, "supersedes" => ids}}
+        when is_binary(sender) and is_list(ids) ->
+          Enum.flat_map(ids, fn
+            id when is_binary(id) -> [{person, sender, id}]
+            _ -> []
+          end)
+
+        %{"sender_id" => sender, "message_id" => id} when is_binary(sender) and is_binary(id) ->
+          [{person, sender, id}]
+
+        _ ->
+          []
+      end
+
+    {next, _changed} = commit_due_defaults(engine, Enum.uniq(keys), now_ms)
+    next
+  end
+
+  defp sweep_request_defaults(engine, _person, _frame, _now_ms), do: engine
+
+  defp commit_due_defaults(engine, keys, now_ms) do
+    Enum.reduce(keys, {engine, []}, fn key, {current, changed} ->
+      case Map.get(current.messages, key) do
+        %{terminal: nil} = record ->
+          if due_default?(record, now_ms) do
+            next = commit_default_answer(current, key, record, now_ms)
+            {next, [key | changed]}
+          else
+            {current, changed}
+          end
+
+        _ ->
+          {current, changed}
+      end
+    end)
+  end
+
+  defp due_default?(%{terminal: nil} = record, now_ms) do
+    accepted_at = Map.get(record, :revision_accepted_at, Map.get(record, :accepted_at))
+
+    case Message.default_answer(record.message, accepted_at) do
+      %{at: at} when is_integer(at) -> at <= now_ms
+      _ -> false
+    end
+  end
+
+  defp due_default?(_, _), do: false
+
+  defp commit_default_answer(engine, {person, _sender, _id} = key, record, now_ms) do
+    accepted_at = Map.get(record, :revision_accepted_at, Map.get(record, :accepted_at))
+    default = Message.default_answer(record.message, accepted_at)
+    {next, seq} = next_seq(engine, person)
+
+    terminal = %{
+      state: "answered",
+      by: "default",
+      answer_present: true,
+      answer: default.value,
+      actor: nil,
+      actor_id: nil,
+      actor_kind: :server,
+      op_id: nil,
+      seq: seq,
+      at: now_ms
+    }
+
+    next =
+      next
+      |> put_message(key, %{record | terminal: terminal})
+      |> put_event(person, seq, :lifecycle, key)
+      |> queue_push_hint(person, seq)
+
+    {next, terminal_entry} = Conversation.on_terminal(next, person, record, key, terminal)
+
+    if terminal_entry do
+      event = next.events[{person, seq}]
+
+      payload = %{
+        "event_id" => terminal_entry["event_id"],
+        "request_revision" => terminal_entry["request_revision"]
+      }
+
+      %{next | events: Map.put(next.events, {person, seq}, Map.put(event, :payload, payload))}
+    else
+      next
     end
   end
 
@@ -2942,11 +3061,7 @@ defmodule AttentionServer.Engine do
       "state" => terminal.state,
       "at" => terminal.at,
       "has_answer" => terminal.answer_present,
-      "actor" => %{
-        "kind" => Atom.to_string(terminal.actor_kind),
-        "id" => Map.get(terminal, :actor_id, terminal.actor),
-        "key_fingerprint" => terminal.actor
-      },
+      "actor" => terminal_receipt_actor(terminal),
       "winning_op_id" => terminal.op_id
     }
 
@@ -2955,7 +3070,19 @@ defmodule AttentionServer.Engine do
         do: Map.put(receipt, "retracted_at", terminal.at),
         else: receipt
 
+    receipt = if terminal.by == "default", do: Map.put(receipt, "by", "default"), else: receipt
+
     if terminal.answer_present, do: Map.put(receipt, "answer", terminal.answer), else: receipt
+  end
+
+  defp terminal_receipt_actor(%{actor_kind: :server}), do: %{"kind" => "server"}
+
+  defp terminal_receipt_actor(terminal) do
+    %{
+      "kind" => Atom.to_string(terminal.actor_kind),
+      "id" => Map.get(terminal, :actor_id, terminal.actor),
+      "key_fingerprint" => terminal.actor
+    }
   end
 
   defp terminal_kind(%{kind: "no_comment"}), do: "no_comment"
@@ -3263,10 +3390,10 @@ defmodule AttentionServer.Engine do
 
   defp valid_sender_ids(_), do: {:error, "sender_ids"}
 
-  defp forward(engine, %{person: person, key: device}, frame) do
-    message = Map.get(frame, "message")
+  defp forward(engine, %{person: person, key: device} = principal, frame) do
+    original_message = Map.get(frame, "message")
 
-    with :ok <- valid_message(message),
+    with :ok <- valid_message(original_message),
          :ok <- valid_op(frame),
          :ok <- valid_conversation_send_fields(frame),
          {:ok, support} <- Conversation.support_from_frame(frame),
@@ -3276,9 +3403,12 @@ defmodule AttentionServer.Engine do
              do: :ok,
              else: {:error, "files"}
            ),
-         true <- sender_allowed?(engine, person, device, message["sender_id"]) do
+         true <- sender_allowed?(engine, person, device, original_message["sender_id"]) do
+      accepted_at = Map.get(principal, :request_at, System.system_time(:millisecond))
+      {message, field_warnings} = Message.normalize_optional_fields(original_message, accepted_at)
+
       semantic =
-        %{"type" => "forward", "message" => message}
+        %{"type" => "forward", "message" => original_message}
         |> Map.merge(Map.take(frame, ~w(session_handle vendor_session_id)))
         |> Map.put("files", files)
         |> then(fn value -> if support, do: Map.put(value, "support", support), else: value end)
@@ -3293,7 +3423,19 @@ defmodule AttentionServer.Engine do
           failure("operation_conflict")
 
         :missing ->
-          commit_forward(engine, person, device, op, semantic, message, frame, files, support)
+          commit_forward(
+            engine,
+            person,
+            device,
+            op,
+            semantic,
+            message,
+            frame,
+            files,
+            support,
+            accepted_at,
+            field_warnings
+          )
       end
     else
       {:error, field} -> failure("invalid_field", field)
@@ -3301,28 +3443,65 @@ defmodule AttentionServer.Engine do
     end
   end
 
-  defp commit_forward(engine, person, device, op, semantic, message, frame, files, support) do
+  defp commit_forward(
+         engine,
+         person,
+         device,
+         op,
+         semantic,
+         message,
+         frame,
+         files,
+         support,
+         accepted_at,
+         field_warnings
+       ) do
     key = {person, message["sender_id"], message["message_id"]}
 
     case Map.get(engine.messages, key) do
       nil ->
-        accepted_at = System.system_time(:millisecond)
         {next, seq} = next_seq(engine, person)
+
+        origin_target =
+          first_open_supersede_target(
+            engine,
+            person,
+            {message["sender_id"], message["message_id"]},
+            message
+          )
+
+        {placement_seq, group_thread, placement_origin_target} =
+          case origin_target do
+            {target_key, target} ->
+              original = Map.get(target, :revisions, %{}) |> Map.get(1, target.message)
+
+              {Map.get(target, :placement_seq, target.accepted_seq),
+               Map.get(target, :group_thread, Message.valid_thread(original)), target_key}
+
+            nil ->
+              {seq, Message.valid_thread(message), nil}
+          end
 
         record = %{
           message: message,
           origin: device,
           accepted_seq: seq,
+          accepted_at: accepted_at,
+          placement_seq: placement_seq,
+          group_thread: group_thread,
+          placement_origin_target: placement_origin_target,
           terminal: nil,
           source_binding: nil,
           source_result: nil,
           origin_result: nil,
           send_op_id: op,
+          field_warnings: field_warnings,
           session_handle: Map.get(frame, "session_handle"),
           vendor_session_id: Map.get(frame, "vendor_session_id"),
           support: support,
           revision: 1,
           revisions: %{1 => message},
+          revision_accepted_at: accepted_at,
           files_by_revision: %{1 => files}
         }
 
@@ -3366,6 +3545,8 @@ defmodule AttentionServer.Engine do
             do: fields,
             else: Map.put(fields, "supersedes_warnings", warnings)
 
+        fields = put_field_warnings(fields, field_warnings)
+
         next = save_receipt(next, person, device, op, semantic, fields)
         {:ok, next, fields}
 
@@ -3388,6 +3569,7 @@ defmodule AttentionServer.Engine do
               },
               else: %{"seq" => record.accepted_seq, "duplicate" => true}
 
+          reply = put_field_warnings(reply, Map.get(record, :field_warnings, field_warnings))
           {:ok, save_receipt(engine, person, device, op, semantic, reply), reply}
         end
     end
@@ -3441,6 +3623,40 @@ defmodule AttentionServer.Engine do
         {engine, [%{"reason" => "invalid"}]}
     end
   end
+
+  defp first_open_supersede_target(engine, person, {sender, new_id}, message) do
+    case Map.get(message, "supersedes") do
+      listed when is_list(listed) ->
+        listed
+        |> Enum.reduce_while(MapSet.new(), fn id, seen ->
+          cond do
+            not is_binary(id) or id == "" or id == new_id or MapSet.member?(seen, id) ->
+              {:cont, seen}
+
+            true ->
+              key = {person, sender, id}
+              seen = MapSet.put(seen, id)
+
+              case Map.get(engine.messages, key) do
+                %{terminal: nil} = record -> {:halt, {:target, key, record}}
+                _ -> {:cont, seen}
+              end
+          end
+        end)
+        |> case do
+          {:target, key, record} -> {key, record}
+          _ -> nil
+        end
+
+      _ ->
+        nil
+    end
+  end
+
+  defp put_field_warnings(fields, []), do: fields
+
+  defp put_field_warnings(fields, warnings),
+    do: Map.put(fields, "field_warnings", warnings)
 
   defp supersede_target(engine, person, device, op, key, record, accepted_at) do
     {next, seq} = next_seq(engine, person)
@@ -3517,7 +3733,8 @@ defmodule AttentionServer.Engine do
                 op,
                 semantic,
                 frame,
-                answer?
+                answer?,
+                Map.get(principal, :request_at, System.system_time(:millisecond))
               )
 
             {:error, current} ->
@@ -3529,7 +3746,18 @@ defmodule AttentionServer.Engine do
     end
   end
 
-  defp commit_terminal(engine, person, actor, actor_id, kind, op, semantic, frame, answer?) do
+  defp commit_terminal(
+         engine,
+         person,
+         actor,
+         actor_id,
+         kind,
+         op,
+         semantic,
+         frame,
+         answer?,
+         committed_at
+       ) do
     key = {person, frame["sender_id"], frame["message_id"]}
 
     case Map.get(engine.messages, key) do
@@ -3550,7 +3778,7 @@ defmodule AttentionServer.Engine do
 
         terminal = %{
           state: if(answer?, do: "answered", else: frame["state"]),
-          at: if(answer?, do: System.system_time(:millisecond), else: frame["at"]),
+          at: if(answer?, do: committed_at, else: frame["at"]),
           by: if(answer?, do: "answer", else: Map.get(frame, "by")),
           answer_present: answer?,
           answer: if(answer?, do: frame["answer"], else: nil),
@@ -3651,7 +3879,8 @@ defmodule AttentionServer.Engine do
                     Map.get(principal, :id, actor),
                     key,
                     record,
-                    op_id
+                    op_id,
+                    Map.get(principal, :request_at, System.system_time(:millisecond))
                   )
 
                 Map.get(record.terminal, :kind) == "no_comment" ->
@@ -3699,13 +3928,13 @@ defmodule AttentionServer.Engine do
     end
   end
 
-  defp commit_no_comment(engine, person, actor, actor_id, key, record, op_id) do
+  defp commit_no_comment(engine, person, actor, actor_id, key, record, op_id, committed_at) do
     {next, seq} = next_seq(engine, person)
 
     terminal = %{
       state: "answered",
       kind: "no_comment",
-      at: System.system_time(:millisecond),
+      at: committed_at,
       by: "answer_no_comment",
       answer_present: false,
       answer: nil,
@@ -4017,7 +4246,7 @@ defmodule AttentionServer.Engine do
 
   defp valid_conversation_text(_), do: {:error, "text"}
 
-  defp conversation_revise(engine, %{person: person, key: actor}, frame) do
+  defp conversation_revise(engine, %{person: person, key: actor} = principal, frame) do
     with :ok <- valid_op(frame),
          :ok <- valid_global_id(frame),
          :ok <- valid_message(frame["message"]),
@@ -4032,9 +4261,22 @@ defmodule AttentionServer.Engine do
         |> Map.put("files", files)
 
       case receipt(engine, person, actor, frame["op_id"], semantic) do
-        {:duplicate, reply} -> {:ok, engine, reply}
-        :conflict -> failure("operation_conflict")
-        :missing -> commit_conversation_revise(engine, person, actor, frame, semantic, files)
+        {:duplicate, reply} ->
+          {:ok, engine, reply}
+
+        :conflict ->
+          failure("operation_conflict")
+
+        :missing ->
+          commit_conversation_revise(
+            engine,
+            person,
+            actor,
+            frame,
+            semantic,
+            files,
+            Map.get(principal, :request_at, System.system_time(:millisecond))
+          )
       end
     else
       {:error, field} -> failure("invalid_field", field)
@@ -4042,7 +4284,7 @@ defmodule AttentionServer.Engine do
     end
   end
 
-  defp commit_conversation_revise(engine, person, actor, frame, semantic, files) do
+  defp commit_conversation_revise(engine, person, actor, frame, semantic, files, accepted_at) do
     key = {person, frame["sender_id"], frame["message_id"]}
 
     case Map.get(engine.messages, key) do
@@ -4056,11 +4298,16 @@ defmodule AttentionServer.Engine do
             revision = record.revision + 1
             revisions = Map.get(record, :revisions, %{1 => record.message})
 
+            {message, field_warnings} =
+              Message.normalize_optional_fields(frame["message"], accepted_at)
+
             updated =
               Map.merge(record, %{
-                message: frame["message"],
+                message: message,
                 revision: revision,
-                revisions: Map.put(revisions, revision, frame["message"]),
+                revisions: Map.put(revisions, revision, message),
+                revision_accepted_at: accepted_at,
+                field_warnings: field_warnings,
                 files_by_revision:
                   Map.put(Map.get(record, :files_by_revision, %{}), revision, files)
               })
@@ -4074,7 +4321,7 @@ defmodule AttentionServer.Engine do
                 "session_handle" => handle,
                 "request_revision" => revision,
                 "op_id" => frame["op_id"],
-                "message" => frame["message"]
+                "message" => message
               }
               |> then(fn entry ->
                 if is_integer(frame["in_reply_to"]),
@@ -4084,7 +4331,10 @@ defmodule AttentionServer.Engine do
               |> ConversationFiles.put_entry(files)
 
             {next, feed_entry} = Conversation.append_entry(next, person, actor, entry)
-            fields = %{"seq" => seq, "event_id" => feed_entry["event_id"], "revision" => revision}
+
+            fields =
+              %{"seq" => seq, "event_id" => feed_entry["event_id"], "revision" => revision}
+              |> put_field_warnings(field_warnings)
 
             next =
               next
@@ -4148,22 +4398,35 @@ defmodule AttentionServer.Engine do
     end
   end
 
-  defp conversation_withdraw(engine, %{person: person, key: actor, kind: kind}, frame) do
+  defp conversation_withdraw(engine, %{person: person, key: actor, kind: kind} = principal, frame) do
     with :ok <- valid_op(frame),
          :ok <- valid_global_id(frame) do
       semantic = Map.take(frame, ~w(type sender_id message_id in_reply_to))
 
       case receipt(engine, person, actor, frame["op_id"], semantic) do
-        {:duplicate, reply} -> {:ok, engine, reply}
-        :conflict -> failure("operation_conflict")
-        :missing -> commit_conversation_withdraw(engine, person, actor, kind, frame, semantic)
+        {:duplicate, reply} ->
+          {:ok, engine, reply}
+
+        :conflict ->
+          failure("operation_conflict")
+
+        :missing ->
+          commit_conversation_withdraw(
+            engine,
+            person,
+            actor,
+            kind,
+            frame,
+            semantic,
+            Map.get(principal, :request_at, System.system_time(:millisecond))
+          )
       end
     else
       {:error, field} -> failure("invalid_field", field)
     end
   end
 
-  defp commit_conversation_withdraw(engine, person, actor, kind, frame, semantic) do
+  defp commit_conversation_withdraw(engine, person, actor, kind, frame, semantic, request_at) do
     key = {person, frame["sender_id"], frame["message_id"]}
 
     case Map.get(engine.messages, key) do
@@ -4173,7 +4436,7 @@ defmodule AttentionServer.Engine do
           terminal_frame =
             frame
             |> Map.put("state", "retracted")
-            |> Map.put("at", System.system_time(:millisecond))
+            |> Map.put("at", request_at)
             |> Map.put("by", "origin_withdrawal")
 
           case commit_terminal(
@@ -4185,7 +4448,8 @@ defmodule AttentionServer.Engine do
                  frame["op_id"],
                  semantic,
                  terminal_frame,
-                 false
+                 false,
+                 request_at
                ) do
             {:ok, next, fields} ->
               if is_integer(frame["in_reply_to"]) do
@@ -5079,6 +5343,17 @@ defmodule AttentionServer.Engine do
       case {Map.get(terminal, :kind), terminal.by, terminal.answer_present, terminal.answer} do
         {"no_comment", _, _, _} ->
           Map.put(frame, "answer_outcome", %{"kind" => "no_comment"})
+
+        {_, "default", true, answer} ->
+          accepted_at = Map.get(record, :revision_accepted_at, Map.get(record, :accepted_at))
+          default = Message.default_answer(record.message, accepted_at)
+          text = if default, do: default.text, else: nil
+
+          Map.put(
+            frame,
+            "answer_outcome",
+            %{"kind" => "default", "value" => answer, "text" => text}
+          )
 
         {_, "answer", true, nil} ->
           Map.put(frame, "answer_outcome", %{"kind" => "seen"})

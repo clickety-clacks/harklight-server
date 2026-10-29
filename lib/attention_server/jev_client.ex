@@ -10,8 +10,9 @@ defmodule AttentionServer.JevClient do
   @request_limit 8 * 1024 * 1024
   @criteria [
     "Low priority: this can wait while more time-sensitive items are handled.",
-    "Medium priority: this should be handled soon, but other items can reasonably come first.",
-    "High priority: delaying this item has clear near-term consequences; handle it before less urgent items."
+    "Normal priority: this should be handled soon, but other items can reasonably come first.",
+    "High priority: delaying this item has clear near-term consequences; handle it before less urgent items.",
+    "Now: this needs the person's attention right away, ahead of everything else."
   ]
 
   def key_status do
@@ -56,7 +57,7 @@ defmodule AttentionServer.JevClient do
 
           instructions =
             "Rate candidate #{index} in the supplied whole pending set for how soon it should be handled. " <>
-              "Consider its title, body, stated stake and deadline relative to the other pending items."
+              "Consider its title, body, stated stake, deadline and the sender's stated urgency relative to the other pending items."
 
           question = %{
             "type" => "score",
@@ -75,15 +76,20 @@ defmodule AttentionServer.JevClient do
           |> Enum.map(fn {item, index} ->
             message = item.message
 
-            %{
+            pending = %{
               "candidate" => index,
               "sender_id" => elem(item.identity, 0),
               "message_id" => elem(item.identity, 1),
               "title" => Map.get(message, "title", ""),
               "body" => Map.get(message, "body", ""),
-              "stake" => Map.get(message, "stake", ""),
-              "by_when" => Map.get(message, "by_when")
+              "stake" => AttentionServer.Message.effective_stake(message),
+              "urgency" => AttentionServer.Message.effective_urgency(message)
             }
+
+            case AttentionServer.Message.effective_by_when(message) do
+              by_when when is_integer(by_when) -> Map.put(pending, "by_when", by_when)
+              _ -> pending
+            end
           end)
       }
 
@@ -126,9 +132,11 @@ defmodule AttentionServer.JevClient do
 
   def rank_response(body, question_identities, candidates)
       when is_list(candidates) and is_map(question_identities) do
-    with {:ok, scores} <- parse_scores(body, question_identities),
-         true <- length(candidates) == map_size(scores) do
-      rank(candidates, scores)
+    candidate_questions =
+      Map.filter(question_identities, fn {_question_id, identity} -> identity in candidates end)
+
+    with {:ok, scores} <- parse_scores(body, candidate_questions) do
+      {:ok, Map.take(scores, candidates)}
     else
       _ -> {:error, :malformed_response}
     end
@@ -139,20 +147,18 @@ defmodule AttentionServer.JevClient do
   def parse_scores(body, question_identities)
       when is_binary(body) and is_map(question_identities) do
     with {:ok, %{"answers" => answers}} <- JSON.decode_line(body <> "\n", @response_limit),
-         true <-
-           is_map(answers) and
-             MapSet.new(Map.keys(answers)) == MapSet.new(Map.keys(question_identities)) do
+         true <- is_map(answers) do
       Enum.reduce_while(question_identities, {:ok, %{}}, fn {question_id, identity},
                                                             {:ok, scores} ->
         case Map.get(answers, question_id) do
           %{"type" => "score", "score" => score} ->
             case score_value(score) do
               {:ok, value} -> {:cont, {:ok, Map.put(scores, identity, value)}}
-              :error -> {:halt, {:error, :malformed_response}}
+              :error -> {:cont, {:ok, scores}}
             end
 
           _ ->
-            {:halt, {:error, :malformed_response}}
+            {:cont, {:ok, scores}}
         end
       end)
     else
@@ -162,31 +168,18 @@ defmodule AttentionServer.JevClient do
 
   def parse_scores(_, _), do: {:error, :malformed_response}
 
-  defp score_value(value) when is_integer(value) and value in 0..2, do: {:ok, value * 1.0}
+  defp score_value(value) when is_integer(value) and value in 0..3, do: {:ok, value * 1.0}
 
   defp score_value(%JSON.DecimalToken{raw: raw}) do
     case Float.parse(raw) do
-      {value, ""} when value >= 0 and value <= 2 -> {:ok, value}
+      {value, ""} when value >= 0 and value <= 3 -> {:ok, value}
       _ -> :error
     end
   end
 
+  defp score_value(value) when is_float(value) and value >= 0 and value <= 3, do: {:ok, value}
+
   defp score_value(_), do: :error
-
-  defp rank(candidates, scores) do
-    if MapSet.new(candidates) == MapSet.new(Map.keys(scores)) and
-         length(candidates) == length(Map.keys(scores)) do
-      baseline_index = candidates |> Enum.with_index() |> Map.new()
-
-      {:ok,
-       candidates
-       |> Enum.sort_by(fn identity ->
-         {-Map.fetch!(scores, identity), Map.fetch!(baseline_index, identity)}
-       end)}
-    else
-      {:error, :malformed_response}
-    end
-  end
 
   defp read_key do
     case System.get_env(@key_path_env) do

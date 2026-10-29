@@ -12,6 +12,7 @@ defmodule AttentionServer.Relay do
   use GenServer
   @agent_upload_idle_ms 60 * 60 * 1_000
   @upload_sweep_ms 60_000
+  @default_sweep_ms 1_000
   @prioritization_debounce_ms 250
   @hosted_test_states ~w(no-devices device-waiting device-enrolled)
   @hosted_test_label "Test account"
@@ -501,6 +502,7 @@ defmodule AttentionServer.Relay do
         case Store.discard_building_inbox_snapshots(store) do
           :ok ->
             Process.send_after(self(), :upload_sweep, @upload_sweep_ms)
+            Process.send_after(self(), :default_sweep, @default_sweep_ms)
 
             state = %{
               store: store,
@@ -2420,6 +2422,47 @@ defmodule AttentionServer.Relay do
     end
   end
 
+  def handle_info(:default_sweep, state) do
+    Process.send_after(self(), :default_sweep, @default_sweep_ms)
+    old_engine = state.store.engine
+    next_engine = Engine.sweep_due_defaults(old_engine, System.system_time(:millisecond))
+
+    if next_engine == old_engine do
+      {:noreply, state}
+    else
+      case commit(state.store, next_engine, %{
+             person: "system",
+             actor: "default_answer",
+             action: "default_answer_sweep"
+           }) do
+        {:ok, store} ->
+          next_state = %{state | store: store}
+
+          next_state =
+            next_engine.origin_feeds
+            |> Map.keys()
+            |> Enum.reduce(next_state, fn target, current ->
+              record_origin_feed_change(current, old_engine, next_engine, target)
+            end)
+
+          people = Map.keys(next_engine.persons)
+
+          next_state =
+            Enum.reduce(people, next_state, fn person, current ->
+              if pending_signature(old_engine, person) != pending_signature(next_engine, person),
+                do: pending_set_changed(current, person),
+                else: current
+            end)
+
+          {:noreply, next_state}
+
+        {:error, reason, next_store} ->
+          Diagnostics.failure(:message_default, :default_sweep, reason, :unavailable)
+          {:noreply, %{state | store: next_store}}
+      end
+    end
+  end
+
   def handle_info({:prioritization_due, person, generation}, state) do
     case Map.get(state.priority_timers, person) do
       %{generation: ^generation} ->
@@ -3609,7 +3652,13 @@ defmodule AttentionServer.Relay do
           %{
             algorithm: "jev-set",
             basis: "selected",
-            entries: Placement.place(choice, items, previous.entries, nil)
+            entries:
+              Placement.place(
+                choice,
+                items,
+                Map.get(previous, :engine_entries, previous.entries),
+                nil
+              )
           }
 
         true ->
@@ -3628,14 +3677,29 @@ defmodule AttentionServer.Relay do
 
   defp put_priority_view(state, person, view) do
     previous = Map.get(state.priority_views, person)
-    comparable = Map.take(view, [:algorithm, :basis, :entries])
+    engine_entries = Map.get(view, :engine_entries, Map.get(view, :entries, []))
 
-    if previous && Map.take(previous, [:algorithm, :basis, :entries]) == comparable do
-      state
+    shown =
+      view
+      |> Map.take([:algorithm, :basis, :reason])
+      |> Map.put(:entries, Placement.grouped(engine_entries))
+
+    comparable = Map.take(shown, [:algorithm, :basis, :reason, :entries])
+
+    if previous && Map.take(previous, [:algorithm, :basis, :reason, :entries]) == comparable do
+      Map.put(
+        state,
+        :priority_views,
+        Map.put(state.priority_views, person, Map.put(previous, :engine_entries, engine_entries))
+      )
     else
       counter = state.priority_revision_counter + 1
       view_rev = state.priority_revision_namespace <> ":" <> Integer.to_string(counter)
-      view = Map.put(comparable, :view_rev, view_rev)
+
+      view =
+        comparable
+        |> Map.put(:engine_entries, engine_entries)
+        |> Map.put(:view_rev, view_rev)
 
       state
       |> Map.put(:priority_revision_counter, counter)
@@ -3693,7 +3757,8 @@ defmodule AttentionServer.Relay do
     state = ensure_priority_view(state, person)
     engine = state.store.engine
 
-    previous_entries = if is_map(previous), do: previous.entries, else: []
+    previous_entries =
+      if is_map(previous), do: Map.get(previous, :engine_entries, previous.entries), else: []
 
     if Placement.reassess(engine, person, previous_entries) == :whole_set and
          JevClient.connection_ready?(engine.jev_endpoint, engine.jev_model) and
@@ -3709,7 +3774,8 @@ defmodule AttentionServer.Relay do
     state = ensure_priority_view(state, person)
     engine = state.store.engine
 
-    previous_entries = if is_map(previous), do: previous.entries, else: []
+    previous_entries =
+      if is_map(previous), do: Map.get(previous, :engine_entries, previous.entries), else: []
 
     if Placement.reassess(engine, person, previous_entries) == :whole_set and
          JevClient.connection_ready?(engine.jev_endpoint, engine.jev_model) and
@@ -3824,21 +3890,17 @@ defmodule AttentionServer.Relay do
         previous = Map.get(state.priority_views, person)
 
         case result do
-          {:ok, identities} when is_list(identities) ->
-            if Placement.valid_permutation?(items, identities) do
-              previous_entries =
-                if is_map(previous), do: Map.get(previous, :entries, []), else: []
+          {:ok, scores} when is_map(scores) and map_size(scores) > 0 ->
+            previous_entries =
+              if is_map(previous), do: Map.get(previous, :engine_entries, []), else: []
 
-              entries = Placement.place("jev-set", items, previous_entries, {:ranked, identities})
+            entries = Placement.place("jev-set", items, previous_entries, {:scored, scores})
 
-              put_priority_view(state, person, %{
-                algorithm: "jev-set",
-                basis: "selected",
-                entries: entries
-              })
-            else
-              set_fallback_priority_view(state, person)
-            end
+            put_priority_view(state, person, %{
+              algorithm: "jev-set",
+              basis: "selected",
+              engine_entries: entries
+            })
 
           _ ->
             set_fallback_priority_view(state, person)
