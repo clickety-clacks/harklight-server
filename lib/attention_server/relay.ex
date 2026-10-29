@@ -10,6 +10,7 @@ defmodule AttentionServer.Relay do
   """
 
   use GenServer
+  require Logger
   @agent_upload_idle_ms 60 * 60 * 1_000
   @upload_sweep_ms 60_000
   @default_sweep_retry_ms 1_000
@@ -31,6 +32,7 @@ defmodule AttentionServer.Relay do
     JSON,
     Message,
     JevClient,
+    JevRanking,
     Placement,
     Store
   }
@@ -525,6 +527,11 @@ defmodule AttentionServer.Relay do
               priority_jobs: %{},
               priority_queued: %{},
               priority_sequences: %{},
+              priority_evaluator: Keyword.get(opts, :priority_evaluator, &JevClient.evaluate/1),
+              priority_caches: %{},
+              priority_failures: %{},
+              priority_retry_timers: %{},
+              priority_deadline_timers: %{},
               priority_revision_namespace:
                 Base.url_encode64(:crypto.strong_rand_bytes(16), padding: false),
               priority_revision_counter: 0,
@@ -2499,6 +2506,32 @@ defmodule AttentionServer.Relay do
     end
   end
 
+  def handle_info({:priority_retry, person, generation}, state) do
+    case Map.get(state.priority_retry_timers, person) do
+      %{generation: ^generation} ->
+        state = %{state | priority_retry_timers: Map.delete(state.priority_retry_timers, person)}
+        {:noreply, schedule_priority_pass(state, person)}
+
+      _ ->
+        {:noreply, state}
+    end
+  end
+
+  def handle_info({:priority_deadline, person, due}, state) do
+    case Map.get(state.priority_deadline_timers, person) do
+      %{due: ^due} ->
+        state = %{
+          state
+          | priority_deadline_timers: Map.delete(state.priority_deadline_timers, person)
+        }
+
+        {:noreply, schedule_priority_pass(state, person)}
+
+      _ ->
+        {:noreply, state}
+    end
+  end
+
   def handle_info({:prioritization_result, person, sequence, generation, result}, state) do
     case Map.get(state.priority_jobs, person) do
       %{sequence: ^sequence, generation: ^generation, monitor: monitor} = job ->
@@ -3785,11 +3818,12 @@ defmodule AttentionServer.Relay do
          Placement.items(engine, person) != [] do
       schedule_priority_pass(state, person)
     else
-      invalidate_priority_work(state, person)
+      state |> clear_priority_cache(person) |> invalidate_priority_work(person)
     end
   end
 
   defp priority_settings_changed(state, person) do
+    state = clear_priority_cache(state, person)
     previous = Map.get(state.priority_views, person)
     state = ensure_priority_view(state, person)
     engine = state.store.engine
@@ -3814,10 +3848,16 @@ defmodule AttentionServer.Relay do
 
     generation = Map.get(state.priority_generations, person, 0) + 1
 
+    case Map.get(state.priority_retry_timers, person) do
+      %{ref: ref} -> Process.cancel_timer(ref)
+      _ -> :ok
+    end
+
     %{
       state
       | priority_generations: Map.put(state.priority_generations, person, generation),
         priority_timers: Map.delete(state.priority_timers, person),
+        priority_retry_timers: Map.delete(state.priority_retry_timers, person),
         priority_queued: Map.delete(state.priority_queued, person)
     }
   end
@@ -3861,40 +3901,35 @@ defmodule AttentionServer.Relay do
         %{state | priority_queued: Map.put(state.priority_queued, person, generation)}
 
       not JevClient.connection_ready?(engine.jev_endpoint, engine.jev_model) ->
-        set_fallback_priority_view(state, person)
+        state |> clear_priority_cache(person) |> set_fallback_priority_view(person)
 
       true ->
         items = Placement.items(engine, person)
+        sequence = Map.get(state.priority_sequences, person, 0) + 1
+        parent = self()
+        cache = Map.get(state.priority_caches, person, %{})
+        now = state.clock.()
+        evaluator = state.priority_evaluator
 
-        case Placement.compose("jev-set", items, %{
-               endpoint: engine.jev_endpoint,
-               model: engine.jev_model
-             }) do
-          {:ok, request} ->
-            sequence = Map.get(state.priority_sequences, person, 0) + 1
-            parent = self()
+        {pid, monitor} =
+          spawn_monitor(fn ->
+            result =
+              JevRanking.run(items, cache, engine.jev_endpoint, engine.jev_model, now, evaluator)
 
-            {pid, monitor} =
-              spawn_monitor(fn ->
-                result = JevClient.evaluate(request)
-                send(parent, {:prioritization_result, person, sequence, generation, result})
-              end)
+            send(parent, {:prioritization_result, person, sequence, generation, result})
+          end)
 
-            %{
-              state
-              | priority_sequences: Map.put(state.priority_sequences, person, sequence),
-                priority_jobs:
-                  Map.put(state.priority_jobs, person, %{
-                    pid: pid,
-                    monitor: monitor,
-                    sequence: sequence,
-                    generation: generation
-                  })
-            }
-
-          {:error, _reason} ->
-            set_fallback_priority_view(state, person)
-        end
+        %{
+          state
+          | priority_sequences: Map.put(state.priority_sequences, person, sequence),
+            priority_jobs:
+              Map.put(state.priority_jobs, person, %{
+                pid: pid,
+                monitor: monitor,
+                sequence: sequence,
+                generation: generation
+              })
+        }
     end
   end
 
@@ -3902,7 +3937,10 @@ defmodule AttentionServer.Relay do
     state = %{state | priority_jobs: Map.delete(state.priority_jobs, person)}
     engine = state.store.engine
     generation = Map.get(state.priority_generations, person, 0)
-    current? = generation == job.generation and Placement.choice(engine, person) == "jev-set"
+
+    current? =
+      generation == job.generation and Placement.choice(engine, person) == "jev-set" and
+        JevClient.connection_ready?(engine.jev_endpoint, engine.jev_model)
 
     state =
       if current? do
@@ -3910,6 +3948,35 @@ defmodule AttentionServer.Relay do
         previous = Map.get(state.priority_views, person)
 
         case result do
+          %{cache: cache, scores: scores, overflow: overflow} = pass ->
+            state = %{state | priority_caches: Map.put(state.priority_caches, person, cache)}
+
+            state =
+              if map_size(scores) > 0 do
+                entries = Placement.place("jev-set", items, [], {:ranked, scores, overflow})
+
+                put_priority_view(state, person, %{
+                  algorithm: "jev-set",
+                  basis: "selected",
+                  engine_entries: entries
+                })
+              else
+                set_fallback_priority_view(state, person)
+              end
+
+            state =
+              state
+              |> log_priority_pass(pass)
+              |> schedule_priority_retry(person, pass.failed)
+              |> schedule_priority_deadline(person, pass.considered)
+
+            if Enum.any?(pass.considered, fn item ->
+                 JevRanking.deadline_class(item, pass.now) !=
+                   JevRanking.deadline_class(item, state.clock.())
+               end),
+               do: schedule_priority_pass(state, person),
+               else: state
+
           {:ok, scores} when is_map(scores) and map_size(scores) > 0 ->
             previous_entries =
               if is_map(previous), do: Map.get(previous, :engine_entries, []), else: []
@@ -3923,10 +3990,15 @@ defmodule AttentionServer.Relay do
             })
 
           _ ->
-            set_fallback_priority_view(state, person)
+            state
+            |> set_fallback_priority_view(person)
+            |> schedule_priority_retry(person, 1)
         end
       else
-        state
+        if generation == job.generation and Placement.choice(engine, person) == "jev-set" and
+             not JevClient.connection_ready?(engine.jev_endpoint, engine.jev_model),
+           do: state |> clear_priority_cache(person) |> set_fallback_priority_view(person),
+           else: state
       end
 
     case Map.pop(state.priority_queued, person) do
@@ -3944,6 +4016,91 @@ defmodule AttentionServer.Relay do
   defp set_fallback_priority_view(state, person) do
     items = Placement.items(state.store.engine, person)
     put_priority_view(state, person, fallback_view(items))
+  end
+
+  defp clear_priority_cache(state, person) do
+    for timers <- [state.priority_deadline_timers, state.priority_retry_timers],
+        %{ref: ref} <- [Map.get(timers, person)] do
+      Process.cancel_timer(ref)
+    end
+
+    %{
+      state
+      | priority_caches: Map.delete(state.priority_caches, person),
+        priority_failures: Map.delete(state.priority_failures, person),
+        priority_retry_timers: Map.delete(state.priority_retry_timers, person),
+        priority_deadline_timers: Map.delete(state.priority_deadline_timers, person)
+    }
+  end
+
+  defp log_priority_pass(state, %{sent: sent} = pass) when sent > 0 do
+    outcome =
+      cond do
+        pass.failed == 0 -> "ok"
+        pass.failed == sent -> "failed"
+        true -> "partial"
+      end
+
+    Logger.info(
+      "event=harklight_priority_pass outcome=#{outcome} requests=#{sent - if(pass.finals_sent, do: 1, else: 0)} " <>
+        "finals=#{if(pass.finals_sent, do: 1, else: 0)} considered=#{length(pass.considered)} " <>
+        "clipped=#{length(pass.clipped)} bytes=#{pass.bytes} elapsed_ms=#{pass.elapsed_ms}"
+    )
+
+    state
+  end
+
+  defp log_priority_pass(state, _pass), do: state
+
+  defp schedule_priority_retry(state, person, failed) do
+    if failed > 0 do
+      count = Map.get(state.priority_failures, person, 0) + 1
+      delay = Enum.at([10_000, 30_000, 60_000, 120_000], count - 1, 300_000)
+      generation = Map.get(state.priority_generations, person, 0)
+      ref = Process.send_after(self(), {:priority_retry, person, generation}, delay)
+
+      %{
+        state
+        | priority_failures: Map.put(state.priority_failures, person, count),
+          priority_retry_timers:
+            Map.put(state.priority_retry_timers, person, %{ref: ref, generation: generation})
+      }
+    else
+      %{state | priority_failures: Map.delete(state.priority_failures, person)}
+    end
+  end
+
+  defp schedule_priority_deadline(state, person, considered) do
+    case Map.get(state.priority_deadline_timers, person) do
+      %{ref: ref} -> Process.cancel_timer(ref)
+      _ -> :ok
+    end
+
+    state = %{
+      state
+      | priority_deadline_timers: Map.delete(state.priority_deadline_timers, person)
+    }
+
+    now = state.clock.()
+
+    case JevRanking.next_deadline(considered, now) do
+      nil ->
+        state
+
+      due ->
+        ref =
+          Process.send_after(
+            self(),
+            {:priority_deadline, person, due},
+            min(max(due - now + 1, 1), @max_timer_delay_ms)
+          )
+
+        %{
+          state
+          | priority_deadline_timers:
+              Map.put(state.priority_deadline_timers, person, %{ref: ref, due: due})
+        }
+    end
   end
 
   defp priority_settings(state, person) do

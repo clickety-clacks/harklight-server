@@ -8,6 +8,8 @@ defmodule AttentionServer.JevClient do
   @request_timeout 30_000
   @response_limit 4 * 1024 * 1024
   @request_limit 8 * 1024 * 1024
+  @request_budget 48_000
+  @question_budget 24_000
   @criteria [
     "Low priority: this can wait while more time-sensitive items are handled.",
     "Normal priority: this should be handled soon, but other items can reasonably come first.",
@@ -46,7 +48,9 @@ defmodule AttentionServer.JevClient do
 
   def valid_model?(_), do: false
 
-  def compose(items, endpoint, model)
+  def compose(items, endpoint, model, now \\ System.system_time(:millisecond))
+
+  def compose(items, endpoint, model, now)
       when is_list(items) and is_binary(endpoint) and is_binary(model) do
     if valid_endpoint?(endpoint) and valid_model?(model) do
       {questions, question_identities} =
@@ -56,8 +60,9 @@ defmodule AttentionServer.JevClient do
           question_id = "candidate_" <> Integer.to_string(index)
 
           instructions =
-            "Rate candidate #{index} in the supplied whole pending set for how soon it should be handled. " <>
-              "Consider its title, body, stated stake, deadline and the sender's stated urgency relative to the other pending items."
+            "Rate candidate #{index} in the supplied pending set for how soon it should be handled. " <>
+              "Consider its title, body, stated stake, deadline and the sender's stated urgency relative to the other pending items. " <>
+              "The current time is now; due_in_minutes is the time left before the deadline, negative once it has passed."
 
           question = %{
             "type" => "score",
@@ -70,6 +75,7 @@ defmodule AttentionServer.JevClient do
         end)
 
       state = %{
+        "now" => timestamp(now),
         "pending_items" =>
           items
           |> Enum.with_index(1)
@@ -87,22 +93,37 @@ defmodule AttentionServer.JevClient do
             }
 
             case AttentionServer.Message.effective_by_when(message) do
-              by_when when is_integer(by_when) -> Map.put(pending, "by_when", by_when)
-              _ -> pending
+              by_when when is_integer(by_when) ->
+                pending
+                |> Map.put("by_when", timestamp(by_when))
+                |> Map.put("due_in_minutes", Integer.floor_div(by_when - now, 60_000))
+
+              _ ->
+                pending
             end
           end)
       }
 
       request = %{"model" => model, "state" => state, "questions" => questions}
       body = JSON.encode!(request)
+      state_size = byte_size(JSON.encode!(state))
 
-      if byte_size(body) <= @request_limit do
+      largest_question =
+        questions
+        |> Map.values()
+        |> Enum.map(&byte_size(JSON.encode!(&1)))
+        |> Enum.max(fn -> 0 end)
+
+      if byte_size(body) <= min(@request_limit, @request_budget) and
+           state_size + largest_question <= @question_budget do
         with {:ok, uri} <- endpoint_uri(endpoint) do
           {:ok,
            %{
              uri: uri,
              model: model,
              body: body,
+             state_bytes: state_size,
+             largest_question_bytes: largest_question,
              candidates: Enum.map(items, & &1.identity),
              question_identities: question_identities
            }}
@@ -117,7 +138,27 @@ defmodule AttentionServer.JevClient do
     _ -> {:error, :invalid_request}
   end
 
-  def compose(_, _, _), do: {:error, :jev_unconfigured}
+  def compose(_, _, _, _), do: {:error, :jev_unconfigured}
+
+  def item_cost(item, endpoint, model, now) do
+    case compose([item], endpoint, model, now) do
+      {:ok, request} ->
+        empty_state_bytes =
+          byte_size(JSON.encode!(%{"now" => timestamp(now), "pending_items" => []}))
+
+        {:ok, request.state_bytes - empty_state_bytes + request.largest_question_bytes + 1}
+
+      error ->
+        error
+    end
+  end
+
+  defp timestamp(milliseconds) do
+    milliseconds
+    |> DateTime.from_unix!(:millisecond)
+    |> DateTime.truncate(:second)
+    |> DateTime.to_iso8601()
+  end
 
   def evaluate(%{uri: uri, body: body, candidates: candidates, question_identities: identities}) do
     with {:ok, key} <- read_key(),
