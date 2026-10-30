@@ -256,6 +256,19 @@ respecting the actual terminal state.
 
 ## Revise, retract or replace deliberately
 
+Proactively keep messages current as work changes. Keeping outstanding
+requests aligned with the work is part of the task, so the person is not left
+answering stale questions. Revise an open request when its details need
+correction, supersede it when a replacement request takes its place, and
+retract an outstanding request that is obsolete, canceled or no longer needs
+an answer. Use these operations within the task's existing authority.
+
+Preserve useful history and already received answers. Retraction withdraws a
+request; it does not undo an action already taken. Do not use a replacement to
+bypass a terminal refusal. Read the actual operation result and follow the
+operation's recovery rules before claiming that a request was updated,
+withdrawn or replaced. An uncertain outcome is not confirmed cleanup.
+
 An in-place revision keeps the request identity and advances its revision:
 
 ```sh
