@@ -6,7 +6,8 @@ defmodule Mix.Tasks.Attention.Owner do
 
   The command displays the stored label with unsafe bytes visibly escaped and the device-key fingerprint and
   requires typing `APPROVE` before a one-use approval. Optional `--senders`
-  accepts comma-separated exact sender IDs; absent means no sender grant.
+  accepts comma-separated sender grants: a grant ending in `/` matches sender IDs
+  with that literal prefix; every other grant matches exactly. Absent means no sender grant.
   With the same `--connect`, `--name`, `--port`, `--ca`, `--cert`, `--key` and
   `--person` options, additional commands are:
 
