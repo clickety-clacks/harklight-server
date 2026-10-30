@@ -1,6 +1,6 @@
 ---
 name: harklight-agent-saas
-version: "0.2.0"
+version: "0.2.1"
 description: "Send Harklight messages and receive their replies through a hosted account using its enrolled device and sender grants; use registered-agent tools only when separately provided and granted."
 ---
 

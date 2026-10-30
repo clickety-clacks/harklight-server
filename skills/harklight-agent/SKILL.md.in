@@ -1,6 +1,6 @@
 ---
 name: harklight-agent
-version: "0.2.0"
+version: "0.2.1"
 description: "Send and receive Harklight conversations on a self-hosted server, enroll a device when authorized, or use separately granted agent search and response tools."
 ---
 

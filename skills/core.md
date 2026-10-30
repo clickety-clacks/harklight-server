@@ -146,13 +146,19 @@ terminal: use its actual `--session-context sdk`, which records the limitation
 without attaching a stream. Preserve any concrete `unsupported_reason`; never
 supply false context or background flags to suppress it.
 
-In client 0.1.5, Codex listening is unsupported; do not invent a `codex queue`
-route. An `other` route is unsupported unless an existing controller actually
+In client 0.1.5, the native Codex listen route is rejected before opening the
+stream. Interactive mode, a background process, a vendor session ID or
+Claude-specific flags do not enable it; do not invent a `codex queue` route.
+An `other` route is unsupported unless an existing controller actually
 supervises the stream and delivers entries into the originating session. Such
 an integration declares `send --session new --route other --controller` and
 `listen --follow --controller --session "$HARKLIGHT_SESSION"`. These flags
 record the controller's declaration, not independent delivery evidence.
 The standalone CLI does not provide a managed runtime's wake integration.
+An existing runtime may own that integration and deliver entries into its
+originating agent session. Follow that runtime's supported send/receive procedure
+without adding a competing standalone listener. Its delivery evidence does not
+change the native Codex listener's support or establish support in other contexts.
 
 Keep unsupported work with its current task owner, report the actual limitation
 and use a supported continuation or a later one-shot read. Do not fabricate a
@@ -182,7 +188,9 @@ that read. It does not prove closure, absence of an already handled answer or
 that no answer will arrive. A failure is not an empty successful read. Read
 again when the originating work resumes; do not send again or add a polling
 timer. `status` shows availability and pending counts but does not retrieve an
-answer.
+answer. For an already valid handle, `attach` is not a prerequisite for this
+one-shot read. `result` reports what happened to a retrieved answer; it does not
+retrieve one or subscribe to future replies.
 
 ## Handle events and outcomes
 
@@ -213,7 +221,11 @@ harklight-agent reply --session "$HARKLIGHT_SESSION" \
   --body "Here is the requested detail."
 ```
 
-Discussion is not a terminal answer or an expansion of task authority. For a
+Discussion is not a terminal answer or an expansion of task authority. A chat
+entry can arrive after the request has ended, but client 0.1.5 refuses `reply`
+once a closing terminal is in its journal. Receiving or acknowledging that
+entry does not reopen the request or establish that replying is allowed.
+Preserve the refusal rather than sending a replacement to bypass closure. For a
 payload-bearing answered terminal, retain the exact JSON `entry.answer`, including
 the distinction between JSON `null` and an absent answer. Apply only the
 authorized outcome, at most once, and report it against the terminal event:
@@ -319,8 +331,10 @@ This facility does not create a listener or a delivery integration.
 
 After a restart on the same host with the same enrollment and journal,
 `attach --session HANDLE --vendor-session-id ID --route ROUTE` updates the
-existing handle's vendor ID and support record. Use `none` to clear the vendor
-ID. It requires the committed creating send in the journal, preserves history,
+existing handle's vendor ID and support record. A successful attach can report
+`ready_for_listen:false`; it does not enable an unsupported listener or prove
+same-session delivery. Use `none` to clear the vendor ID. It requires the
+committed creating send in the journal, preserves history,
 and does not migrate an origin to another device. Wait for both operations to
 be confirmed before listening; recover an uncertain printed operation, then
 repeat attach with unchanged inputs to resume. Use `session end --session HANDLE --gone` only when deliberately reporting that the originating session is gone;
