@@ -129,7 +129,7 @@ defmodule AttentionServer.DashboardReadHTTPTest do
 
     assert page.status == 200
     assert page.resp_body =~ "Prioritization"
-    assert page.resp_body =~ "Soonest deadline first, then newest"
+    assert page.resp_body =~ "Most urgent first, then soonest deadline, then newest"
     assert page.resp_body =~ "Jev re-ranking"
     assert page.resp_body =~ "not readable"
 
