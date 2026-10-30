@@ -121,14 +121,27 @@ defmodule AttentionServer.HeadlessToolTest do
     refute File.exists?(pending_path)
     assert :ok = File.rename(backup_path, pending_path)
 
-    assert {:error, :wrong_server} =
-             HeadlessEnrollment.status(identity_dir, %{enrollment_endpoint | name: "other.test"})
+    server_path = Path.join(identity_dir, "server.json")
+    assert {:ok, saved_server} = server_path |> File.read!() |> JSON.decode_line()
+    File.write!(server_path, JSON.encode!(Map.put(saved_server, "origin_port", 18_446)) <> "\n")
+    server_with_metadata = File.read!(server_path)
+
+    for mismatched <- [
+          %{enrollment_endpoint | address: {127, 0, 0, 2}},
+          %{enrollment_endpoint | name: "other.test"},
+          %{enrollment_endpoint | port: enrollment_endpoint.port + 1},
+          %{enrollment_endpoint | ca_file: Path.join(certs, "server.pem")}
+        ] do
+      assert {:error, :wrong_server} = HeadlessEnrollment.status(identity_dir, mismatched)
+    end
 
     assert {:error, :existing_identity} =
              HeadlessEnrollment.start(identity_dir, enrollment_endpoint, "overwrite")
 
     assert {:ok, %{"state" => "pending"}} =
              HeadlessEnrollment.status(identity_dir, enrollment_endpoint)
+
+    assert File.read!(server_path) == server_with_metadata
 
     assert {:ok, key_stat} = File.stat(Path.join(identity_dir, "identity.key"))
     assert {:ok, dir_stat} = File.stat(identity_dir)

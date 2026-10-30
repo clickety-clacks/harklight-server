@@ -360,9 +360,9 @@ defmodule AttentionServer.HeadlessEnrollment do
   end
 
   defp verify_server(directory, endpoint) do
-    with {:ok, expected} <- read_json(Path.join(directory, @server_file)),
+    with {:ok, %{} = expected} <- read_json(Path.join(directory, @server_file)),
          {:ok, actual} <- server_identity(endpoint),
-         true <- expected == actual do
+         true <- Map.take(expected, ["address", "name", "port", "ca_sha256"]) == actual do
       :ok
     else
       _ -> {:error, :wrong_server}
