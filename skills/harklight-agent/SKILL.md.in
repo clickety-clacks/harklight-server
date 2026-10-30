@@ -1,0 +1,71 @@
+---
+name: harklight-agent
+version: "0.2.0"
+description: "Send and receive Harklight conversations on a self-hosted server, enroll a device when authorized, or use separately granted agent search and response tools."
+---
+
+# Harklight for self-hosted agents
+
+Use this skill with a self-hosted Harklight Server. Ask its operator for the
+server address, certificate hostname, public CA certificate, person account,
+existing enrolled device directory and allowed sender ID. Verify the CA through
+the operator's trusted channel; network reachability alone establishes no
+account trust. Resolve missing configuration with that operator rather than
+copying private keys, inventing endpoint ports or changing grants to make a
+send succeed. Installing this skill grants no credentials or messaging authority.
+
+Agent conversations use the separately released `harklight-agent` CLI described
+below. The server package does not bundle that executable. For enrollment and
+registered-agent tools, set `PACKAGE` to the extracted package directory and
+`HARKLIGHT_SERVER_CLI` to its `bin/harklight`; these tools do not start a second server. The package's
+`SELF_HOST.md` explains server setup and port exposure. A self-hosted origin may
+publish `none` as its file upload cap; use its published limits.
+
+## Explicitly authorized enrollment
+
+Use an existing enrollment for ordinary sends. If asked to enroll a new device,
+the server package's headless CLI creates its identity locally. The person owner
+approves the displayed code and public-key fingerprint for the intended person
+and label. The owner can grant a sender pattern during approval with `--senders`
+or later with `owner grant-sender --device FINGERPRINT --sender PATTERN`.
+Omit sender grants for a read/respond-only device. Approval does not make the
+device an owner. Sender-pattern matching is defined in the shared core below.
+
+For example, on the agent's machine, with values supplied by the operator:
+
+```sh
+"$PACKAGE/bin/harklight" enroll start --directory "$DEVICE_DIR" \
+  --connect "$SERVER_ADDRESS" --name "$SERVER_NAME" --port "$ENROLL_PORT" \
+  --ca "$CA_PEM" --label "Script sender"
+```
+
+Give the approval code to the authenticated owner. The owner checks the
+intended person, label and key fingerprint before running `bin/harklight owner
+approve` with `--senders app:example` for this sender. For an explicitly
+authorized enrollment, check the saved request with the installed enrollment
+command. This does not prove session listener support:
+
+```sh
+"$PACKAGE/bin/harklight" enroll status --directory "$DEVICE_DIR" \
+  --connect "$SERVER_ADDRESS" --name "$SERVER_NAME" --port "$ENROLL_PORT" \
+  --relay-port "$RELAY_PORT" --ca "$CA_PEM"
+```
+
+Keep the directory if a submission reply is lost. `enroll retry` uses the same
+local key; a `key_pending` result does not recover the old code or prove
+enrollment. Follow the command's expiry guidance, and treat `key_in_use` or an
+unknown status handle as unresolved until the owner reconciles it. This
+headless enrollment procedure is distinct from the native app's guided device
+joining.
+
+The server's earlier device interface remains available for existing device
+workflows: `device read` journals replayed inbox entries before ACK;
+`device respond --sender ID --message-id ID --answer answer.json` deliberately
+submits one JSON answer. `device receipt --sender ID --message-id ID` is available
+only to the original sending device and stays pending until a terminal exists.
+Supply the same device directory, trusted CA and relay endpoint as enrollment
+status. These are distinct from the origin conversation feed and registered-agent
+search below; use the session CLI for new agent messages. Preserve the exact
+identity, request and journal for uncertain device operations; identical retries
+reuse their saved operation. A different payload under an accepted message ID
+conflicts rather than revising it.

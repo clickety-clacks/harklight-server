@@ -44,31 +44,46 @@ The server/device CLI is `$PACKAGE/bin/harklight`.
 
 ## Send a request and read its reply
 
-The packaged [Harklight agent skill](skills/harklight-agent/SKILL.md) explains
-device enrollment, exact sender grants, supported answer controls and retry-safe
-sender/receipt use. If you are an agent installing the server, copy the
-`skills/harklight-agent` folder into your own harness's configured skill directory.
-Installation does not copy it there automatically.
+The package ships three guidance files: `skills/harklight-agent/SKILL.md` for
+self-hosted agents, `skills/harklight-agent-saas/SKILL.md` for hosted agents, and
+`skills/core.md`. Both skills contain the shared core and can be copied alone
+into a harness's configured skill directory. Installation does not copy them
+automatically or grant credentials.
+
+The [self-hosted source](skills/harklight-agent/SKILL.md.in) and
+[hosted source](skills/harklight-agent-saas/SKILL.md.in) contain only their
+mode-specific instructions. [The core](skills/core.md) is authored once. Build
+the same three files without building or starting the server:
+
+```sh
+scripts/build-skills.sh dist/skills
+```
+
+The release package invokes this assembly automatically. Edit the source
+files, not generated copies. The generated SaaS skill ships in the server
+archive and can be served at `/agent-skills/harklight-agent-saas/SKILL.md` by a
+configured dashboard; repository availability does not establish publication
+at a hosted service's address.
 
 ### Get the agent CLI
 
 The `harklight-agent` command-line client sends requests and listens for
 request-bound replies. It is released separately from the server at
 <https://github.com/clickety-clacks/harklight-agent>; the current release is
-v0.1.1. Install it with Homebrew on macOS or Linux:
+v0.1.5. Install it with Homebrew on macOS or Linux:
 
 ```sh
 brew install clickety-clacks/tap/harklight-agent
 ```
 
 Or download the tarball for your platform and `SHA256SUMS` from the
-[release page](https://github.com/clickety-clacks/harklight-agent/releases/tag/v0.1.1),
+[release page](https://github.com/clickety-clacks/harklight-agent/releases/tag/v0.1.5),
 verify the checksum and put the binary on your `PATH`. Targets are
 `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-gnu` and
 `aarch64-unknown-linux-gnu`:
 
 ```sh
-v=0.1.1 t=x86_64-unknown-linux-gnu
+v=0.1.5 t=x86_64-unknown-linux-gnu
 base="https://github.com/clickety-clacks/harklight-agent/releases/download/v$v"
 curl -fLO "$base/harklight-agent-$v-$t.tar.gz"
 curl -fLO "$base/SHA256SUMS"
@@ -77,12 +92,12 @@ tar -xzf "harklight-agent-$v-$t.tar.gz"
 install -m 755 "harklight-agent-$v-$t/harklight-agent" ~/.local/bin/
 ```
 
-`harklight-agent --version` prints `harklight-agent 0.1.1`. The
-[send and listen skill](skills/harklight-agent-send-listen/SKILL.md) describes
+`harklight-agent --version` prints `harklight-agent 0.1.5`. The
+[shared conversation core](skills/core.md) describes
 its commands and message format.
 
 Agents send new messages and listen for replies through the authenticated
-[`harklight-agent` session route](skills/harklight-agent-send-listen/SKILL.md).
+[`harklight-agent` session route](skills/core.md).
 Enrolled-device `send` and correlated `receipt` commands are available with the
 earlier device interface. `read` and `respond` remain available for requests
 already stored by the server. Registered agent identities have separately

@@ -139,9 +139,10 @@ defmodule AttentionServer.DashboardViewTest do
     assert html =~ "v0.1.0"
     assert html =~ ~s(href="/agent-skills/SKILL.md")
 
-    assert html =~ "Agent skill: harklight-agent-send-listen</h2>"
+    assert html =~ "Agent skill: harklight-agent-saas</h2>"
     assert html =~ "v0.2.0"
-    assert html =~ ~s(href="/agent-skills/harklight-agent-send-listen/SKILL.md")
+    assert html =~ ~s(href="/agent-skills/harklight-agent-saas/SKILL.md")
+    assert html =~ ~s(href="/agent-skills/core.md")
   end
 
   test "the components page tolerates a skill version lookup failure for either skill independently" do
@@ -160,7 +161,7 @@ defmodule AttentionServer.DashboardViewTest do
     html = DashboardView.components("Dana", :error, :error)
 
     refute html =~ ~s(<h2>Agent skill: harklight-agent</h2><p class="status">v)
-    refute html =~ ~s(<h2>Agent skill: harklight-agent-send-listen</h2><p class="status">v)
+    refute html =~ ~s(<h2>Agent skill: harklight-agent-saas</h2><p class="status">v)
   end
 
   test "uncertain invitation failure offers same-request retry without a new invitation action" do

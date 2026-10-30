@@ -32,8 +32,8 @@ defmodule AttentionServer.DashboardReadHTTP do
     skill_path = Keyword.fetch!(opts, :skill_path)
     hosted = Keyword.get(opts, :hosted, false) == true
 
-    skill_path_send_listen =
-      Keyword.get(opts, :skill_path_send_listen) || send_listen_skill_path(skill_path)
+    skill_path_saas =
+      Keyword.get(opts, :skill_path_saas) || saas_skill_path(skill_path)
 
     %{
       backend: backend,
@@ -42,14 +42,17 @@ defmodule AttentionServer.DashboardReadHTTP do
       hosted: hosted,
       hosted_addresses:
         if(hosted, do: hosted_addresses(Keyword.get(opts, :hosted_addresses)), else: %{}),
-      skill_path_send_listen: skill_path_send_listen
+      skill_path_saas: skill_path_saas,
+      skill_path_core:
+        Keyword.get(opts, :skill_path_core) ||
+          Path.join(Path.dirname(Path.dirname(skill_path)), "core.md")
     }
   end
 
-  defp send_listen_skill_path(skill_path) do
+  defp saas_skill_path(skill_path) do
     Path.join([
       Path.dirname(Path.dirname(skill_path)),
-      "harklight-agent-send-listen",
+      "harklight-agent-saas",
       "SKILL.md"
     ])
   end
@@ -107,8 +110,11 @@ defmodule AttentionServer.DashboardReadHTTP do
         serve_skill_file(conn, opts.skill_path)
 
       conn.method == "GET" and
-          conn.request_path == "/agent-skills/harklight-agent-send-listen/SKILL.md" ->
-        serve_skill_file(conn, opts.skill_path_send_listen)
+          conn.request_path == "/agent-skills/harklight-agent-saas/SKILL.md" ->
+        serve_skill_file(conn, opts.skill_path_saas)
+
+      conn.method == "GET" and conn.request_path == "/agent-skills/core.md" ->
+        serve_skill_file(conn, opts.skill_path_core)
 
       conn.method not in ["GET", "POST"] ->
         send_resp(conn, 405, "Method not allowed")
@@ -449,7 +455,7 @@ defmodule AttentionServer.DashboardReadHTTP do
       DashboardView.components(
         principal.person_id,
         skill_version(opts.skill_path),
-        skill_version(opts.skill_path_send_listen),
+        skill_version(opts.skill_path_saas),
         chrome(opts)
       )
 

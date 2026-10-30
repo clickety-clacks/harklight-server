@@ -264,8 +264,7 @@ if System.get_env("ATTENTION_SERVER_ENABLE") == "1" do
                 System.get_env("ATTENTION_SERVER_DASHBOARD_KEYFILE") ||
                   Keyword.fetch!(server_opts, :keyfile),
               skill_path: skill_path,
-              skill_path_send_listen:
-                System.get_env("ATTENTION_SERVER_DASHBOARD_SKILL_PATH_SEND_LISTEN")
+              skill_path_saas: System.get_env("ATTENTION_SERVER_DASHBOARD_SKILL_PATH_SAAS")
             ]
           else
             _ ->

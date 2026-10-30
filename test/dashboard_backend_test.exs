@@ -63,7 +63,7 @@ defmodule AttentionServer.DashboardBackendTest do
       DashboardReadHTTP.init(
         backend: {DashboardBackend, backend},
         skill_path: skill,
-        skill_path_send_listen: skill
+        skill_path_saas: skill
       )
 
     owner = request(cookie_a) |> DashboardReadHTTP.call(opts)
@@ -120,7 +120,7 @@ defmodule AttentionServer.DashboardBackendTest do
       DashboardReadHTTP.init(
         backend: {DashboardBackend, backend},
         skill_path: skill,
-        skill_path_send_listen: skill
+        skill_path_saas: skill
       )
 
     {:ok, credential} = Relay.owner_browser_sign_in_create(relay, person, key)
@@ -262,7 +262,7 @@ defmodule AttentionServer.DashboardBackendTest do
       DashboardReadHTTP.init(
         backend: {DashboardBackend, backend},
         skill_path: "/unused",
-        skill_path_send_listen: "/unused"
+        skill_path_saas: "/unused"
       )
 
     {:ok, credential} = Relay.owner_browser_sign_in_create(relay, person, owner_key)
