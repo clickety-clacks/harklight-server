@@ -131,7 +131,7 @@ released from <https://github.com/clickety-clacks/harklight-agent>; install it
 with `brew install clickety-clacks/tap/harklight-agent` or from that repository's
 release tarballs, as its README describes. Installing it does not start a
 listener, install a vendor-session integration or create an identity. The
-separate `skills/harklight-agent-send-listen` directory may be copied manually
+assembled `skills/harklight-agent` directory may be copied manually
 into an agent harness's configured skill directory; installation does not copy
 it there.
 
@@ -178,15 +178,21 @@ The dashboard has its own HTTPS port and defaults to loopback binding.
   metadata across the self-hosted server; other owners stay person-scoped.
 - `ATTENTION_SERVER_DASHBOARD_SKILL_PATH`: the installed package's absolute
   `skills/harklight-agent/SKILL.md` path.
-- `ATTENTION_SERVER_DASHBOARD_SKILL_PATH_SEND_LISTEN` (optional): the installed
-  package's absolute `skills/harklight-agent-send-listen/SKILL.md` path. When
+- `ATTENTION_SERVER_DASHBOARD_SKILL_PATH_SAAS` (optional): the installed
+  package's absolute `skills/harklight-agent-saas/SKILL.md` path. When
   omitted, the dashboard derives this path from the configured
   `skills/harklight-agent/SKILL.md` path, so existing `server.env` files remain
   valid after an upgrade.
 
-Both skill files are served without signing in, at `/agent-skills/SKILL.md`
-and `/agent-skills/harklight-agent-send-listen/SKILL.md`. The signed-in
-Components page links both and shows each one's packaged version.
+Both self-contained skills are served without signing in, at
+`/agent-skills/SKILL.md` (self-hosted) and
+`/agent-skills/harklight-agent-saas/SKILL.md` (hosted). The shared core is served
+at `/agent-skills/core.md`, derived from the same package's `skills/core.md`.
+The signed-in Components page links all three and shows each skill's version.
+The old send-and-listen file is replaced by the core copied into both skills at
+build time. The former `ATTENTION_SERVER_DASHBOARD_SKILL_PATH_SEND_LISTEN`
+setting is no longer used; the optional SaaS path defaults from the primary
+skill path without requiring an environment change.
 
 For access from another machine, set `ATTENTION_SERVER_DASHBOARD_BIND` to the
 server's permitted interface and arrange routing. Optional
@@ -315,7 +321,7 @@ the APNs variables unset.
 ## Read and answer a stored message
 
 Agents send new messages and listen for replies through the authenticated
-[`harklight-agent` session route](skills/harklight-agent-send-listen/SKILL.md).
+[`harklight-agent` session route](skills/core.md).
 The enrolled-device `send` and correlated `receipt` commands retain their
 earlier arguments and output. The `receipt` command retrieves the terminal
 server-side outcome correlated with that device send operation. Device `read`
@@ -388,8 +394,8 @@ OpenSSL CLI and the pinned Mix lock:
     ./scripts/build-package.sh
 
 This production package includes the Mix release/ERTS, server/device CLI,
-bootstrap, guides and both existing agent skills. It preserves dependency
-notices, records BUILD_INFO and writes tarball/SHA256SUMS in dist/. Archive ordering,
+bootstrap, guides, both assembled agent skills and their single-source core.
+It preserves dependency notices, records BUILD_INFO and writes tarball/SHA256SUMS in dist/. Archive ordering,
 timestamps, owners and gzip headers are normalized; full toolchain bit-for-bit
 reproducibility is not claimed. Build from the clean intended commit and use
 that same artifact for clean-install evidence and publication.

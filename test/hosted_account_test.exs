@@ -567,7 +567,7 @@ defmodule AttentionServer.HostedAccountTest do
           DashboardReadHTTP.init(
             backend: Backend,
             skill_path: skill,
-            skill_path_send_listen: skill,
+            skill_path_saas: skill,
             hosted: true,
             expected_origin: @origin
           ),
@@ -575,7 +575,7 @@ defmodule AttentionServer.HostedAccountTest do
           DashboardReadHTTP.init(
             backend: Backend,
             skill_path: skill,
-            skill_path_send_listen: skill,
+            skill_path_saas: skill,
             hosted: true,
             expected_origin: @origin,
             hosted_addresses: %{
@@ -588,7 +588,7 @@ defmodule AttentionServer.HostedAccountTest do
           DashboardReadHTTP.init(
             backend: Backend,
             skill_path: skill,
-            skill_path_send_listen: skill
+            skill_path_saas: skill
           )
       }
     end
@@ -628,7 +628,7 @@ defmodule AttentionServer.HostedAccountTest do
         DashboardReadHTTP.init(
           backend: Backend,
           skill_path: addressed.skill_path,
-          skill_path_send_listen: addressed.skill_path_send_listen,
+          skill_path_saas: addressed.skill_path_saas,
           hosted: true,
           expected_origin: @origin,
           hosted_addresses: %{sign_in: @origin <> "/sign-in"}
@@ -673,7 +673,7 @@ defmodule AttentionServer.HostedAccountTest do
         DashboardReadHTTP.init(
           backend: Backend,
           skill_path: addressed.skill_path,
-          skill_path_send_listen: addressed.skill_path_send_listen,
+          skill_path_saas: addressed.skill_path_saas,
           hosted_addresses: %{sign_in: @origin <> "/sign-in", account: @origin <> "/account"}
         )
 

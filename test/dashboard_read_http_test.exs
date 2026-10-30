@@ -53,25 +53,30 @@ defmodule AttentionServer.DashboardReadHTTPTest do
 
     on_exit(fn -> File.rm(path) end)
 
-    path_send_listen =
+    path_saas =
       Path.join(
         System.tmp_dir!(),
-        "harklight-dashboard-skill-send-listen-#{System.unique_integer([:positive])}.md"
+        "harklight-dashboard-skill-saas-#{System.unique_integer([:positive])}.md"
       )
 
     File.write!(
-      path_send_listen,
-      "---\nname: harklight-agent-send-listen\nversion: \"0.2.0\"\n---\n\n# Send and listen\n"
+      path_saas,
+      "---\nname: harklight-agent-saas\nversion: \"0.2.0\"\n---\n\n# Harklight for hosted agents\n"
     )
 
-    on_exit(fn -> File.rm(path_send_listen) end)
+    on_exit(fn -> File.rm(path_saas) end)
+
+    core_path = path <> ".core.md"
+    File.write!(core_path, "# Shared core\n")
+    on_exit(fn -> File.rm(core_path) end)
 
     %{
       opts:
         DashboardReadHTTP.init(
           backend: Backend,
           skill_path: path,
-          skill_path_send_listen: path_send_listen
+          skill_path_saas: path_saas,
+          skill_path_core: core_path
         )
     }
   end
@@ -85,7 +90,7 @@ defmodule AttentionServer.DashboardReadHTTPTest do
     end
   end
 
-  test "both skill files are served without a dashboard session", %{opts: opts} do
+  test "all three guidance files are served without a dashboard session", %{opts: opts} do
     skill = "/agent-skills/SKILL.md" |> secure_get() |> DashboardReadHTTP.call(opts)
 
     assert skill.status == 200
@@ -93,15 +98,19 @@ defmodule AttentionServer.DashboardReadHTTPTest do
     assert skill.resp_body ==
              "---\nname: harklight-agent\nversion: \"0.1.0\"\n---\n\n# Operate Harklight\n"
 
-    skill_send_listen =
-      "/agent-skills/harklight-agent-send-listen/SKILL.md"
+    skill_saas =
+      "/agent-skills/harklight-agent-saas/SKILL.md"
       |> secure_get()
       |> DashboardReadHTTP.call(opts)
 
-    assert skill_send_listen.status == 200
+    core = "/agent-skills/core.md" |> secure_get() |> DashboardReadHTTP.call(opts)
+    assert core.status == 200
+    assert core.resp_body == "# Shared core\n"
 
-    assert skill_send_listen.resp_body ==
-             "---\nname: harklight-agent-send-listen\nversion: \"0.2.0\"\n---\n\n# Send and listen\n"
+    assert skill_saas.status == 200
+
+    assert skill_saas.resp_body ==
+             "---\nname: harklight-agent-saas\nversion: \"0.2.0\"\n---\n\n# Harklight for hosted agents\n"
   end
 
   test "a resolved person sees only backend-authorized device records", %{opts: opts} do
@@ -148,7 +157,7 @@ defmodule AttentionServer.DashboardReadHTTPTest do
       DashboardReadHTTP.init(
         backend: Backend,
         skill_path: opts.skill_path,
-        skill_path_send_listen: opts.skill_path_send_listen,
+        skill_path_saas: opts.skill_path_saas,
         hosted: true
       )
 

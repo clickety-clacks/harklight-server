@@ -35,15 +35,17 @@ defmodule AttentionServer.DashboardHTTPSTest do
       "---\nname: harklight-agent\nversion: \"0.1.0\"\n---\n\n# Harklight agent"
     )
 
-    skill_path_send_listen =
-      Path.join(dir, "skills/harklight-agent-send-listen/SKILL.md")
+    skill_path_saas =
+      Path.join(dir, "skills/harklight-agent-saas/SKILL.md")
 
-    File.mkdir_p!(Path.dirname(skill_path_send_listen))
+    File.mkdir_p!(Path.dirname(skill_path_saas))
 
     File.write!(
-      skill_path_send_listen,
-      "---\nname: harklight-agent-send-listen\nversion: \"0.2.0\"\n---\n\n# Send and listen"
+      skill_path_saas,
+      "---\nname: harklight-agent-saas\nversion: \"0.2.0\"\n---\n\n# Harklight for hosted agents"
     )
+
+    File.write!(Path.join(dir, "skills/core.md"), "# Shared core")
 
     port = available_port()
     store_path = Path.join(dir, "relay.sqlite3")
@@ -148,18 +150,28 @@ defmodule AttentionServer.DashboardHTTPSTest do
       ])
 
     assert components =~ "HTTP/1.1 200"
-    assert components =~ "Agent skill: harklight-agent-send-listen"
+    assert components =~ "Agent skill: harklight-agent-saas"
     assert components =~ "v0.2.0"
 
-    send_listen_skill =
+    saas_skill =
       send_https(certs, port, [
-        "GET /agent-skills/harklight-agent-send-listen/SKILL.md HTTP/1.1\r\n",
+        "GET /agent-skills/harklight-agent-saas/SKILL.md HTTP/1.1\r\n",
         "Host: relay.test:#{port}\r\n",
         "Connection: close\r\n\r\n"
       ])
 
-    assert send_listen_skill =~ "HTTP/1.1 200"
-    assert send_listen_skill =~ "# Send and listen"
+    assert saas_skill =~ "HTTP/1.1 200"
+    assert saas_skill =~ "# Harklight for hosted agents"
+
+    core =
+      send_https(certs, port, [
+        "GET /agent-skills/core.md HTTP/1.1\r\n",
+        "Host: relay.test:#{port}\r\n",
+        "Connection: close\r\n\r\n"
+      ])
+
+    assert core =~ "HTTP/1.1 200"
+    assert core =~ "# Shared core"
     [_, invite_request_id] = Regex.run(~r/name="request_id" value="([^"]+)"/, view)
     assert AttentionServer.Message.uuid_v4?(invite_request_id)
 
@@ -530,7 +542,7 @@ defmodule AttentionServer.DashboardHTTPSTest do
         certfile: Path.join(certs, "server.pem"),
         keyfile: Path.join(certs, "server.key"),
         skill_path: skill_path,
-        skill_path_send_listen: skill_path
+        skill_path_saas: skill_path
       )
 
     Process.unlink(restarted_listener)
@@ -617,7 +629,7 @@ defmodule AttentionServer.DashboardHTTPSTest do
           certfile: Path.join(certs, "server.pem"),
           keyfile: Path.join(certs, "server.key"),
           skill_path: skill,
-          skill_path_send_listen: skill
+          skill_path_saas: skill
         ]
       )
 

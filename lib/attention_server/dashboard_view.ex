@@ -53,7 +53,7 @@ defmodule AttentionServer.DashboardView do
           {:ok, String.t()} | :error,
           keyword()
         ) :: String.t()
-  def components(person_name, skill_version, skill_version_send_listen, chrome \\ []) do
+  def components(person_name, skill_version, skill_version_saas, chrome \\ []) do
     app_section =
       ~s(<section><h2>App</h2><p class="status">Not available yet</p></section>)
 
@@ -63,11 +63,11 @@ defmodule AttentionServer.DashboardView do
     skill_section =
       skill_section("harklight-agent", skill_version, "/agent-skills/SKILL.md")
 
-    skill_section_send_listen =
+    skill_section_saas =
       skill_section(
-        "harklight-agent-send-listen",
-        skill_version_send_listen,
-        "/agent-skills/harklight-agent-send-listen/SKILL.md"
+        "harklight-agent-saas",
+        skill_version_saas,
+        "/agent-skills/harklight-agent-saas/SKILL.md"
       )
 
     body =
@@ -75,7 +75,8 @@ defmodule AttentionServer.DashboardView do
         app_section <>
         cli_section <>
         skill_section <>
-        skill_section_send_listen <>
+        skill_section_saas <>
+        ~s(<section><h2>Shared conversation core</h2><p>Included in both agent skills.</p><p><a href="/agent-skills/core.md">Read shared core</a></p></section>) <>
         ~s(<script src="/components.js" defer></script>)
 
     layout(person_name, "Components", body, chrome)

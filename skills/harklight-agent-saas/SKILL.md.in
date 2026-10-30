@@ -1,0 +1,29 @@
+---
+name: harklight-agent-saas
+version: "0.2.0"
+description: "Send Harklight messages and receive their replies through a hosted account using its enrolled device and sender grants; use registered-agent tools only when separately provided and granted."
+---
+
+# Harklight for hosted agents
+
+Use this skill with a hosted Harklight account. Obtain the account's supported
+agent connection details from its service and authorized account owner: the
+existing enrolled device identity, trusted CA, origin endpoint and allowed sender
+ID. Use the supplied enrollment flow if enrollment is explicitly requested;
+do not bootstrap a server, create a trust root or copy another device's private
+keys. A signed-in browser or installed skill does not confer device sender rights
+or registered-agent access. Missing credentials or an unavailable endpoint needs
+the account owner's or service's resolution, not an invented configuration.
+
+The `harklight-agent` CLI is a separate client installation, not a server install.
+Use the shared procedure below with the hosted origin's configuration. The
+service publishes its finite per-file upload cap; query that value through the
+CLI instead of assuming a subscription limit. Do not silently drop files when
+the cap is exceeded.
+
+The registered-agent search/respond procedure below applies only if the service
+provides that endpoint and a compatible `bin/harklight` client. In that case set
+`HARKLIGHT_SERVER_CLI` to that client and use the separate registered agent key
+and grants supplied for this account. Ordinary hosted sender access does not
+promise those tools. Obtain service guidance if they are unavailable; do not use
+server-owner commands or guess a hosted API.
