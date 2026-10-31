@@ -16,6 +16,7 @@ defmodule AttentionServer.PushAlertTest do
         "message_id" => "latest",
         "created_at" => 1,
         "title" => "Actual title",
+        "display_name" => "  Agent\nλ / name  ",
         "body" => "new work"
       },
       origin: device,
@@ -60,7 +61,8 @@ defmodule AttentionServer.PushAlertTest do
     assert {:ok, _claimed, claim} = Engine.claim_push(engine, now)
     assert claim.presentation == :alert
     assert claim.high == high
-    assert claim.alert["title"] == "app:test"
+    assert claim.alert["title"] == "  Agent\nλ / name  "
+    assert claim.preserve_alert_title
     assert claim.alert["body"] == "new work"
     assert claim.locator["message_id"] == "latest"
     assert claim.locator["acceptance_seq"] == high - 1
@@ -238,6 +240,26 @@ defmodule AttentionServer.PushAlertTest do
     assert claim.badge == 3
   end
 
+  test "grouped pushes carry exact agent display names separately from sender IDs" do
+    engine =
+      engine_with_deliveries(
+        [
+          {"app:alpha", "one", nil, nil},
+          {"app:beta", "two", nil, nil}
+        ],
+        %{}
+      )
+
+    messages =
+      Map.new(engine.messages, fn {key, record} ->
+        display_name = if elem(key, 1) == "app:alpha", do: "  Alpha\nAgent  ", else: "βeta"
+        {key, %{record | message: Map.put(record.message, "display_name", display_name)}}
+      end)
+
+    assert {:ok, _claimed, claim} = Engine.claim_push(%{engine | messages: messages}, 1_000)
+    assert claim.alert == %{"title" => "2 new requests", "body" => "  Alpha\nAgent  , βeta"}
+  end
+
   test "the grouped count covers only requests gathered since the last push" do
     engine =
       engine_with_deliveries(
@@ -255,38 +277,28 @@ defmodule AttentionServer.PushAlertTest do
     assert claim.badge == 4
   end
 
-  test "sender names are left out of a grouped push when they do not fit the preview" do
-    long = String.duplicate("名", 90)
+  test "grouped push retains every full exact display name above 160 graphemes" do
+    first_name = String.duplicate("名", 90) <> "A"
+    second_name = String.duplicate("界", 90) <> "B"
 
     engine =
-      engine_with_deliveries(
-        [{"app:alpha", "one", long <> "A", nil}, {"app:beta", "two", long <> "B", nil}],
-        %{}
-      )
+      engine_with_deliveries([{"app:alpha", "one", nil, nil}, {"app:beta", "two", nil, nil}], %{})
 
-    assert {:ok, _claimed, claim} = Engine.claim_push(engine, 1_000)
-    assert claim.alert == %{"title" => "2 new requests"}
+    messages =
+      Map.new(engine.messages, fn {key, record} ->
+        display_name = if elem(key, 1) == "app:alpha", do: first_name, else: second_name
+        {key, %{record | message: Map.put(record.message, "display_name", display_name)}}
+      end)
 
-    fitting =
-      engine_with_deliveries(
-        [{"app:alpha", "one", String.duplicate("x", 158), nil}, {"app:beta", "two", nil, nil}],
-        %{}
-      )
+    assert {:ok, _claimed, claim} = Engine.claim_push(%{engine | messages: messages}, 1_000)
 
-    assert {:ok, _claimed, fitting_claim} = Engine.claim_push(fitting, 1_000)
-    assert fitting_claim.alert == %{"title" => "2 new requests"}
+    assert claim.alert == %{
+             "title" => "2 new requests",
+             "body" => first_name <> ", " <> second_name
+           }
 
-    exact =
-      engine_with_deliveries(
-        [
-          {"app:alpha", "one", String.duplicate("x", 150), nil},
-          {"app:beta", "two", "12345678", nil}
-        ],
-        %{}
-      )
-
-    assert {:ok, _claimed, exact_claim} = Engine.claim_push(exact, 1_000)
-    assert exact_claim.alert["body"] == String.duplicate("x", 150) <> ", 12345678"
+    assert claim.grouped_alert_names == [first_name, second_name]
+    assert claim.preserve_alert_body
   end
 
   test "the badge is the server-side Inbox count: answered and retracted items are resolved" do

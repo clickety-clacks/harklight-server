@@ -22,9 +22,10 @@ cannot send a new message. A device enrollment and sender grant do not substitut
 for agent registration or those scopes; an agent key does not substitute for
 the enrolled origin identity used by `harklight-agent`.
 
-Sender patterns use the same rule for device sending and registered-agent
-read/respond grants: a pattern ending in `/` matches every sender ID beginning
-with that literal prefix; every other pattern matches exactly. For example,
+Sender patterns use the same rule for origin-session sends from an enrolled
+device and registered-agent read/respond grants: a pattern ending in `/`
+matches every sender ID beginning with that literal prefix; every other
+pattern matches exactly. For example,
 `app:reports/` covers `app:reports/daily` and `app:reports/team/weekly`, but not
 `app:reports` or `app:reports-old/daily`. `app:reports` covers only that exact
 sender ID. This is not wildcard or regular-expression matching. Current grants
@@ -73,9 +74,15 @@ Set `HARKLIGHT_ROUTE` to the actual `claude-code`, `codex` or `other` route:
 
 ```sh
 harklight-agent send --session new --sender-id app:example \
+  --display-name "Agent's chosen display name" \
   --route "$HARKLIGHT_ROUTE" --title "Choose the next step" \
   --body "Select an option or write a note." --choice "Proceed" --choice "Defer"
 ```
+
+The optional display name is carried separately from `sender_id` as the
+message's `display_name` string. The server retains it in feed/history and uses
+it unchanged as the APNs sender text. `sender_id` continues to identify and
+authorize the sender.
 
 Omit `--choice` for an open question. Use `--informational` for a Seen-only
 notice; it cannot be combined with `--choice`. Repeated choices submit their

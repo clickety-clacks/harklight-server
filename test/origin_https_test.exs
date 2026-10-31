@@ -1019,6 +1019,7 @@ defmodule AttentionServer.OriginHTTPSTest do
       "message_id" => "one",
       "created_at" => 1,
       "title" => "Proceed?",
+      "display_name" => "  Agent\nλ / name  ",
       "detail" => %{"amount" => %JSON.DecimalToken{raw: "1.234567890123456789"}, "answer" => nil}
     }
 
@@ -1048,6 +1049,21 @@ defmodule AttentionServer.OriginHTTPSTest do
 
     assert {:ok, 200, %{"type" => "ok", "seq" => 1, "duplicate" => true}} =
              request(c, "a2", send_request)
+
+    unauthorized_message =
+      message
+      |> Map.put("sender_id", "app:ungranted")
+      |> Map.put("display_name", "app:test")
+
+    assert {:ok, 200, %{"type" => "error", "reason" => "sender_not_authorized"}} =
+             request(
+               c,
+               "a2",
+               Map.merge(send_request, %{
+                 "op_id" => op(6),
+                 "message" => unauthorized_message
+               })
+             )
 
     assert {:ok, 200,
             %{"type" => "ok", "entries" => [%{"kind" => "revision", "message" => ^message}]}} =

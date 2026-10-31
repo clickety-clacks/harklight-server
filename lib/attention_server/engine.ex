@@ -148,7 +148,10 @@ defmodule AttentionServer.Engine do
               claim
 
             [selected] ->
-              claim = Map.put(claim, :alert, push_alert(selected))
+              claim =
+                claim
+                |> Map.put(:alert, push_alert(selected))
+                |> Map.put(:preserve_alert_title, true)
 
               case push_locator(selected, person, device, binding.binding_id) do
                 nil -> claim
@@ -156,7 +159,12 @@ defmodule AttentionServer.Engine do
               end
 
             many ->
-              Map.put(claim, :alert, grouped_push_alert(many))
+              {alert, names} = grouped_push_alert(many)
+
+              claim
+              |> Map.put(:alert, alert)
+              |> Map.put(:grouped_alert_names, names)
+              |> Map.put(:preserve_alert_body, true)
           end
 
         claimed = %{
@@ -2910,9 +2918,6 @@ defmodule AttentionServer.Engine do
   defp dispatch(engine, principal, %{"type" => "subscribe_remote"} = frame),
     do: subscribe_remote(engine, principal, frame)
 
-  defp dispatch(engine, principal, %{"type" => "answer_receipt"} = frame),
-    do: answer_receipt(engine, principal, frame)
-
   defp dispatch(engine, principal, %{"type" => "enrollment_readback"} = frame),
     do: enrollment_readback(engine, principal, frame)
 
@@ -3035,84 +3040,6 @@ defmodule AttentionServer.Engine do
         :not_found
     end
   end
-
-  defp answer_receipt(engine, %{person: person, key: device}, frame) do
-    cond do
-      frame["receipt_version"] != 1 ->
-        failure("unsupported_version")
-
-      valid_no_selectors(frame) != :ok ->
-        failure("invalid_field", "principal")
-
-      valid_global_id(frame) != :ok ->
-        {:error, field} = valid_global_id(frame)
-        failure("invalid_field", field)
-
-      not (is_integer(frame["terminal_seq"]) and frame["terminal_seq"] > 0) ->
-        failure("invalid_field", "terminal_seq")
-
-      true ->
-        key = {person, frame["sender_id"], frame["message_id"]}
-        requested_seq = frame["terminal_seq"]
-
-        case Map.get(engine.messages, key) do
-          %{origin: ^device, terminal: nil} ->
-            {:ok, engine, %{"status" => "pending"}}
-
-          %{origin: ^device, terminal: %{seq: seq}} = record when seq == requested_seq ->
-            {:ok, engine, %{"receipt" => terminal_receipt(engine, person, key, record)}}
-
-          %{origin: ^device} ->
-            failure("stale_target")
-
-          _ ->
-            failure("not_found")
-        end
-    end
-  end
-
-  defp terminal_receipt(engine, person, {_, sender, id}, record) do
-    terminal = record.terminal
-
-    receipt = %{
-      "receipt_version" => 1,
-      "relay_instance_id" => engine.relay_instance_id,
-      "person_id" => person,
-      "sender_id" => sender,
-      "message_id" => id,
-      "acceptance_seq" => record.accepted_seq,
-      "terminal_seq" => terminal.seq,
-      "terminal_kind" => terminal_kind(terminal),
-      "state" => terminal.state,
-      "at" => terminal.at,
-      "has_answer" => terminal.answer_present,
-      "actor" => terminal_receipt_actor(terminal),
-      "winning_op_id" => terminal.op_id
-    }
-
-    receipt =
-      if terminal.state == "retracted",
-        do: Map.put(receipt, "retracted_at", terminal.at),
-        else: receipt
-
-    receipt = if terminal.by == "default", do: Map.put(receipt, "by", "default"), else: receipt
-
-    if terminal.answer_present, do: Map.put(receipt, "answer", terminal.answer), else: receipt
-  end
-
-  defp terminal_receipt_actor(%{actor_kind: :server}), do: %{"kind" => "server"}
-
-  defp terminal_receipt_actor(terminal) do
-    %{
-      "kind" => Atom.to_string(terminal.actor_kind),
-      "id" => Map.get(terminal, :actor_id, terminal.actor),
-      "key_fingerprint" => terminal.actor
-    }
-  end
-
-  defp terminal_kind(%{kind: "no_comment"}), do: "no_comment"
-  defp terminal_kind(%{answer_present: true}), do: "answer"
-  defp terminal_kind(_), do: "lifecycle"
 
   defp source_bind(engine, %{person: person, key: device}, frame) do
     with :ok <- valid_op(frame),
@@ -5175,23 +5102,21 @@ defmodule AttentionServer.Engine do
       gathered
       |> Enum.reverse()
       |> Enum.map(fn {{_, sender, _}, record} ->
-        case SenderNames.committed(record, sender) do
-          %{"name" => name} -> name |> String.split() |> Enum.join(" ")
-          nil -> sender
+        case Map.get(record.message, "display_name") do
+          name when is_binary(name) ->
+            name
+
+          _ ->
+            case SenderNames.committed(record, sender) do
+              %{"name" => name} -> name |> String.split() |> Enum.join(" ")
+              nil -> sender
+            end
         end
       end)
       |> Enum.uniq()
-      |> Enum.join(", ")
 
     alert = %{"title" => "#{length(gathered)} new requests"}
-
-    {graphemes, remaining} = take_graphemes(names, 160, [])
-
-    if remaining == "" and length(graphemes) <= 160 do
-      Map.put(alert, "body", names)
-    else
-      alert
-    end
+    {Map.put(alert, "body", Enum.join(names, ", ")), names}
   end
 
   defp push_alert({{_, sender, _}, record}) do
@@ -5215,7 +5140,13 @@ defmodule AttentionServer.Engine do
         {Enum.join(graphemes), false}
       end
 
-    %{"title" => sender, "body" => bounded_preview, "body_truncated" => truncated?}
+    display_name =
+      case Map.get(message, "display_name") do
+        name when is_binary(name) -> name
+        _ -> sender
+      end
+
+    %{"title" => display_name, "body" => bounded_preview, "body_truncated" => truncated?}
   end
 
   defp push_locator({{_, sender, message_id}, record}, person, device, binding_id) do

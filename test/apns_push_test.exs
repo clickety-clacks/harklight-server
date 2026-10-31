@@ -214,6 +214,111 @@ defmodule AttentionServer.APNSPushTest do
            }
   end
 
+  test "grouped names stay exact and oversized groups report the remaining count", ctx do
+    %{certs: certs, key_path: key_path, provider_port: provider_port} = ctx
+    now = System.system_time(:millisecond)
+
+    config =
+      APNS.prepare!(
+        key_path: key_path,
+        key_id: "TESTKEYID1",
+        team_id: "TESTTEAMID",
+        endpoint: %{
+          address: {127, 0, 0, 1},
+          hostname: "relay.test",
+          port: provider_port,
+          cacerts: [ca_der(certs)]
+        }
+      )
+
+    exact_names = String.duplicate("名", 90) <> "A, " <> String.duplicate("界", 90) <> "B"
+
+    claim = %{
+      claim_id: op(92),
+      profile_id: @provider_profile,
+      address: @device_token,
+      deadline_at: now + 60_000,
+      registered_at: now,
+      presentation: :alert,
+      alert: %{"title" => "2 new requests", "body" => exact_names},
+      preserve_alert_body: true
+    }
+
+    {outcome, _cached_token} = APNS.send(config, claim, nil)
+    assert outcome.state == "provider_accepted"
+    assert_receive {:apns_request, "POST", _path, _headers, body}, 12_000
+    assert byte_size(body) <= 4_096
+
+    assert {:ok, %{"aps" => %{"alert" => %{"body" => ^exact_names}}}} =
+             JSON.decode_line(body <> "\n")
+
+    first_name = String.duplicate("first-name-", 200)
+    second_name = String.duplicate("second-name-", 240)
+    third_name = "Third name"
+    oversized_names = Enum.join([first_name, second_name, third_name], ", ")
+
+    oversized_claim =
+      Map.merge(claim, %{
+        claim_id: op(91),
+        alert: %{"title" => "3 new requests", "body" => oversized_names},
+        grouped_alert_names: [first_name, second_name, third_name]
+      })
+
+    {oversized_outcome, _cached_token} = APNS.send(config, oversized_claim, nil)
+    assert oversized_outcome.state == "provider_accepted"
+    assert_receive {:apns_request, "POST", _path, _headers, oversized_body}, 12_000
+    assert byte_size(oversized_body) <= 4_096
+
+    assert {:ok, %{"aps" => %{"alert" => %{"body" => oversized_alert_body}}}} =
+             JSON.decode_line(oversized_body <> "\n")
+
+    assert oversized_alert_body == first_name <> ", and 2 more"
+    refute oversized_alert_body =~ second_name
+    refute oversized_alert_body =~ third_name
+  end
+
+  test "a single oversized display name uses a neutral sender label", ctx do
+    %{certs: certs, key_path: key_path, provider_port: provider_port} = ctx
+
+    config =
+      APNS.prepare!(
+        key_path: key_path,
+        key_id: "TESTKEYID1",
+        team_id: "TESTTEAMID",
+        endpoint: %{
+          address: {127, 0, 0, 1},
+          hostname: "relay.test",
+          port: provider_port,
+          cacerts: [ca_der(certs)]
+        }
+      )
+
+    oversized_name = String.duplicate("private-name-", 400)
+    now = System.system_time(:millisecond)
+
+    claim = %{
+      claim_id: op(90),
+      profile_id: @provider_profile,
+      address: @device_token,
+      deadline_at: now + 60_000,
+      registered_at: now,
+      presentation: :alert,
+      alert: %{"title" => oversized_name, "body" => "New attention is ready."},
+      preserve_alert_title: true
+    }
+
+    {outcome, _cached_token} = APNS.send(config, claim, nil)
+    assert outcome.state == "provider_accepted"
+    assert_receive {:apns_request, "POST", _path, _headers, body}, 12_000
+    assert byte_size(body) <= 4_096
+
+    assert {:ok, %{"aps" => %{"alert" => %{"title" => "Sender", "body" => preview}}}} =
+             JSON.decode_line(body <> "\n")
+
+    assert preview == "New attention is ready."
+    refute body =~ oversized_name
+  end
+
   test "an oversized locator is omitted whole and reported without changing push status", ctx do
     %{certs: certs, key_path: key_path, provider_port: provider_port} = ctx
 
@@ -445,7 +550,10 @@ defmodule AttentionServer.APNSPushTest do
       sender_socket,
       3,
       "apns-delivery",
-      %{"body" => "  bounded   preview\nfrom sender  "}
+      %{
+        "body" => "  bounded   preview\nfrom sender  ",
+        "display_name" => "  Agent\nλ / name  "
+      }
     )
 
     refute_receive {:apns_request, _, _, _}, 100
@@ -472,7 +580,10 @@ defmodule AttentionServer.APNSPushTest do
 
     assert payload == %{
              "aps" => %{
-               "alert" => %{"title" => "app:test", "body" => "bounded preview from sender"},
+               "alert" => %{
+                 "title" => "  Agent\nλ / name  ",
+                 "body" => "bounded preview from sender"
+               },
                "badge" => 1,
                "content-available" => 1
              },

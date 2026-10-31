@@ -58,14 +58,9 @@ unknown status handle as unresolved until the owner reconciles it. This
 headless enrollment procedure is distinct from the native app's guided device
 joining.
 
-The server's earlier device interface remains available for existing device
-workflows: `device read` journals replayed inbox entries before ACK;
+The enrolled-device interface remains available for existing inbox work:
+`device read` journals replayed entries before ACK, and
 `device respond --sender ID --message-id ID --answer answer.json` deliberately
-submits one JSON answer. `device receipt --sender ID --message-id ID` is available
-only to the original sending device and stays pending until a terminal exists.
-Supply the same device directory, trusted CA and relay endpoint as enrollment
-status. These are distinct from the origin conversation feed and registered-agent
-search below; use the session CLI for new agent messages. Preserve the exact
-identity, request and journal for uncertain device operations; identical retries
-reuse their saved operation. A different payload under an accepted message ID
-conflicts rather than revising it.
+submits a JSON answer to a message already stored by the server. These commands
+do not create new messages or retrieve an origin receipt. Use the session CLI
+for new agent messages and replies.

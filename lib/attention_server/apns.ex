@@ -28,6 +28,7 @@ defmodule AttentionServer.APNS do
     "attention" => %{"v" => 1, "type" => "sync"}
   }
   @max_payload_bytes 4_096
+  @neutral_sender_label "Sender"
   @response_limit 16_384
   @connect_timeout 5_000
   @request_timeout 10_000
@@ -281,21 +282,63 @@ defmodule AttentionServer.APNS do
   defp request_payload(%{presentation: :background} = claim),
     do: put_badge(@background_payload, Map.get(claim, :badge))
 
+  defp request_payload(
+         %{
+           presentation: :alert,
+           alert: %{"title" => title},
+           grouped_alert_names: names
+         } = claim
+       )
+       when is_list(names) do
+    locator = Map.get(claim, :locator)
+    locator = if valid_locator?(locator), do: locator, else: nil
+
+    case fit_grouped_alert_payload(title, names, locator, Map.get(claim, :badge)) do
+      {:ok, payload} ->
+        payload
+
+      :error ->
+        raise ArgumentError, "APNs grouped alert could not fit the payload limit"
+    end
+  end
+
   defp request_payload(%{presentation: :alert, alert: %{"title" => title} = alert} = claim) do
     body = Map.get(alert, "body")
     preview_truncated? = Map.get(alert, "body_truncated", false)
+    preserve_title? = Map.get(claim, :preserve_alert_title, false)
+    preserve_body? = Map.get(claim, :preserve_alert_body, false)
     locator = Map.get(claim, :locator)
     locator = if valid_locator?(locator), do: locator, else: nil
     badge = Map.get(claim, :badge)
 
-    case fit_alert_payload(title, body, preview_truncated?, locator, badge) do
+    case fit_alert_with_optional_locator(
+           title,
+           body,
+           preview_truncated?,
+           locator,
+           badge,
+           preserve_title?,
+           preserve_body?
+         ) do
       {:ok, payload} ->
         payload
 
-      :error when not is_nil(locator) ->
-        Logger.warning("event=harklight_apns_tap_locator outcome=omitted_payload_limit")
-        {:ok, payload} = fit_alert_payload(title, body, preview_truncated?, nil, badge)
-        payload
+      :error when preserve_title? ->
+        case fit_alert_with_optional_locator(
+               @neutral_sender_label,
+               body,
+               preview_truncated?,
+               locator,
+               badge,
+               false,
+               false
+             ) do
+          {:ok, payload} ->
+            payload
+
+          :error ->
+            raise ArgumentError, "APNs alert text could not fit the payload limit"
+        end
 
       :error ->
         raise ArgumentError, "APNs alert text could not fit the payload limit"
@@ -304,14 +347,135 @@ defmodule AttentionServer.APNS do
 
   defp request_payload(claim), do: put_badge(@alert_payload, Map.get(claim, :badge))
 
-  defp fit_alert_payload(title, body, preview_truncated?, locator, badge) do
+  defp fit_alert_with_optional_locator(
+         title,
+         body,
+         preview_truncated?,
+         locator,
+         badge,
+         preserve_title?,
+         preserve_body?
+       ) do
+    case fit_alert_payload(
+           title,
+           body,
+           preview_truncated?,
+           locator,
+           badge,
+           preserve_title?,
+           preserve_body?
+         ) do
+      {:ok, payload} ->
+        {:ok, payload}
+
+      :error when not is_nil(locator) ->
+        Logger.warning("event=harklight_apns_tap_locator outcome=omitted_payload_limit")
+
+        fit_alert_payload(
+          title,
+          body,
+          preview_truncated?,
+          nil,
+          badge,
+          preserve_title?,
+          preserve_body?
+        )
+
+      :error ->
+        :error
+    end
+  end
+
+  defp fit_grouped_alert_payload(title, names, locator, badge) do
+    candidates =
+      [
+        {fit_grouped_names(title, names, locator, badge), not is_nil(locator)},
+        {fit_grouped_names(title, names, nil, badge), false}
+      ]
+      |> Enum.uniq_by(fn {result, has_locator?} -> {result, has_locator?} end)
+      |> Enum.filter(fn {result, _has_locator?} -> match?({:ok, _, _}, result) end)
+
+    case Enum.max_by(
+           candidates,
+           fn {{:ok, _payload, shown_count}, has_locator?} ->
+             {shown_count, has_locator?}
+           end,
+           fn -> nil end
+         ) do
+      {{:ok, payload, _shown_count}, has_locator?} ->
+        if not is_nil(locator) and not has_locator? do
+          Logger.warning("event=harklight_apns_tap_locator outcome=omitted_payload_limit")
+        end
+
+        {:ok, payload}
+
+      nil ->
+        case fit_grouped_names("Harklight", names, nil, badge) do
+          {:ok, payload, _shown_count} -> {:ok, payload}
+          :error -> :error
+        end
+    end
+  end
+
+  defp fit_grouped_names(title, names, locator, badge) do
+    total_names = length(names)
+    initial_body = grouped_alert_body([], total_names)
+    initial_payload = alert_payload(title, initial_body, locator, badge)
+
+    if payload_size(initial_payload) > @max_payload_bytes do
+      :error
+    else
+      {shown_reversed, payload} =
+        Enum.reduce_while(names, {[], initial_payload}, fn name, {shown_reversed, _payload} ->
+          shown = Enum.reverse([name | shown_reversed])
+          remaining = total_names - length(shown)
+          body = grouped_alert_body(shown, remaining)
+          candidate = alert_payload(title, body, locator, badge)
+
+          if payload_size(candidate) <= @max_payload_bytes do
+            {:cont, {[name | shown_reversed], candidate}}
+          else
+            {:halt,
+             {shown_reversed,
+              alert_payload(
+                title,
+                grouped_alert_body(
+                  Enum.reverse(shown_reversed),
+                  total_names - length(shown_reversed)
+                ),
+                locator,
+                badge
+              )}}
+          end
+        end)
+
+      {:ok, payload, length(shown_reversed)}
+    end
+  end
+
+  defp grouped_alert_body([], remaining), do: "#{remaining} senders"
+  defp grouped_alert_body(names, 0), do: Enum.join(names, ", ")
+
+  defp grouped_alert_body(names, remaining) do
+    Enum.join(names, ", ") <> ", and #{remaining} more"
+  end
+
+  defp fit_alert_payload(
+         title,
+         body,
+         preview_truncated?,
+         locator,
+         badge,
+         preserve_title?,
+         preserve_body?
+       ) do
     payload = alert_payload(title, body, locator, badge)
 
     if payload_size(payload) <= @max_payload_bytes do
       {:ok, payload}
     else
       body_fit =
-        if is_binary(body),
+        if is_binary(body) and not preserve_body?,
           do: fit_body(title, body, preview_truncated?, locator, badge),
           else: :error
 
@@ -320,14 +484,23 @@ defmodule AttentionServer.APNS do
           {:ok, alert_payload(title, bounded_body, locator, badge)}
 
         :error ->
-          case fit_title(title, body, locator, badge) do
+          title_fit =
+            if preserve_title?, do: :error, else: fit_title(title, body, locator, badge)
+
+          case title_fit do
             {:ok, bounded_title} ->
               {:ok, alert_payload(bounded_title, body, locator, badge)}
 
             :error ->
-              fallback_body = if is_binary(body), do: "…", else: nil
+              fallback_body =
+                if is_binary(body) and not preserve_body?, do: "…", else: body
 
-              case fit_title(title, fallback_body, locator, badge) do
+              fallback_title_fit =
+                if preserve_title?,
+                  do: :error,
+                  else: fit_title(title, fallback_body, locator, badge)
+
+              case fallback_title_fit do
                 {:ok, bounded_title} ->
                   payload = alert_payload(bounded_title, fallback_body, locator, badge)
                   if payload_size(payload) <= @max_payload_bytes, do: {:ok, payload}, else: :error
