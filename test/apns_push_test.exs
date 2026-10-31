@@ -248,11 +248,17 @@ defmodule AttentionServer.APNSPushTest do
     assert outcome.state == "provider_accepted"
     assert_receive {:apns_request, "POST", _path, _headers, body}, 12_000
     assert byte_size(body) <= 4_096
+
     assert {:ok, %{"aps" => %{"alert" => %{"body" => ^exact_names}}}} =
              JSON.decode_line(body <> "\n")
 
     oversized_names = String.duplicate("untruncated-name-", 260)
-    oversized_claim = %{claim | claim_id: op(91), alert: %{"title" => "2 new requests", "body" => oversized_names}}
+
+    oversized_claim = %{
+      claim
+      | claim_id: op(91),
+        alert: %{"title" => "2 new requests", "body" => oversized_names}
+    }
 
     log =
       capture_log(fn ->

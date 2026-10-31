@@ -281,7 +281,8 @@ defmodule AttentionServer.PushAlertTest do
     first_name = String.duplicate("名", 90) <> "A"
     second_name = String.duplicate("界", 90) <> "B"
 
-    engine = engine_with_deliveries([{"app:alpha", "one", nil, nil}, {"app:beta", "two", nil, nil}], %{})
+    engine =
+      engine_with_deliveries([{"app:alpha", "one", nil, nil}, {"app:beta", "two", nil, nil}], %{})
 
     messages =
       Map.new(engine.messages, fn {key, record} ->
@@ -295,6 +296,7 @@ defmodule AttentionServer.PushAlertTest do
              "title" => "2 new requests",
              "body" => first_name <> ", " <> second_name
            }
+
     assert claim.preserve_alert_body
   end
 
