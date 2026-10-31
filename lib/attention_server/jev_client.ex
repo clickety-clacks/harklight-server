@@ -258,9 +258,12 @@ defmodule AttentionServer.JevClient do
     with {:ok, connection} <-
            Mint.HTTP2.connect(:https, uri.host, uri.port,
              hostname: uri.host,
-             timeout: @endpoint_timeout,
              mode: :passive,
-             transport_opts: [verify: :verify_peer, cacerts: :public_key.cacerts_get()]
+             transport_opts: [
+               timeout: @endpoint_timeout,
+               verify: :verify_peer,
+               cacerts: :public_key.cacerts_get()
+             ]
            ),
          {:ok, connection, request_ref} <-
            Mint.HTTP2.request(
