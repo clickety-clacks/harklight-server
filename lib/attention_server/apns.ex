@@ -284,17 +284,38 @@ defmodule AttentionServer.APNS do
   defp request_payload(%{presentation: :alert, alert: %{"title" => title} = alert} = claim) do
     body = Map.get(alert, "body")
     preview_truncated? = Map.get(alert, "body_truncated", false)
+    preserve_title? = Map.get(claim, :preserve_alert_title, false)
+    preserve_body? = Map.get(claim, :preserve_alert_body, false)
     locator = Map.get(claim, :locator)
     locator = if valid_locator?(locator), do: locator, else: nil
     badge = Map.get(claim, :badge)
 
-    case fit_alert_payload(title, body, preview_truncated?, locator, badge) do
+    case fit_alert_payload(
+           title,
+           body,
+           preview_truncated?,
+           locator,
+           badge,
+           preserve_title?,
+           preserve_body?
+         ) do
       {:ok, payload} ->
         payload
 
       :error when not is_nil(locator) ->
         Logger.warning("event=harklight_apns_tap_locator outcome=omitted_payload_limit")
-        {:ok, payload} = fit_alert_payload(title, body, preview_truncated?, nil, badge)
+
+        {:ok, payload} =
+          fit_alert_payload(
+            title,
+            body,
+            preview_truncated?,
+            nil,
+            badge,
+            preserve_title?,
+            preserve_body?
+          )
+
         payload
 
       :error ->
@@ -304,14 +325,22 @@ defmodule AttentionServer.APNS do
 
   defp request_payload(claim), do: put_badge(@alert_payload, Map.get(claim, :badge))
 
-  defp fit_alert_payload(title, body, preview_truncated?, locator, badge) do
+  defp fit_alert_payload(
+         title,
+         body,
+         preview_truncated?,
+         locator,
+         badge,
+         preserve_title?,
+         preserve_body?
+       ) do
     payload = alert_payload(title, body, locator, badge)
 
     if payload_size(payload) <= @max_payload_bytes do
       {:ok, payload}
     else
       body_fit =
-        if is_binary(body),
+        if is_binary(body) and not preserve_body?,
           do: fit_body(title, body, preview_truncated?, locator, badge),
           else: :error
 
@@ -320,14 +349,23 @@ defmodule AttentionServer.APNS do
           {:ok, alert_payload(title, bounded_body, locator, badge)}
 
         :error ->
-          case fit_title(title, body, locator, badge) do
+          title_fit =
+            if preserve_title?, do: :error, else: fit_title(title, body, locator, badge)
+
+          case title_fit do
             {:ok, bounded_title} ->
               {:ok, alert_payload(bounded_title, body, locator, badge)}
 
             :error ->
-              fallback_body = if is_binary(body), do: "…", else: nil
+              fallback_body =
+                if is_binary(body) and not preserve_body?, do: "…", else: body
 
-              case fit_title(title, fallback_body, locator, badge) do
+              fallback_title_fit =
+                if preserve_title?,
+                  do: :error,
+                  else: fit_title(title, fallback_body, locator, badge)
+
+              case fallback_title_fit do
                 {:ok, bounded_title} ->
                   payload = alert_payload(bounded_title, fallback_body, locator, badge)
                   if payload_size(payload) <= @max_payload_bytes, do: {:ok, payload}, else: :error

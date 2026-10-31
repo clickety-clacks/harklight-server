@@ -148,7 +148,10 @@ defmodule AttentionServer.Engine do
               claim
 
             [selected] ->
-              claim = Map.put(claim, :alert, push_alert(selected))
+              claim =
+                claim
+                |> Map.put(:alert, push_alert(selected))
+                |> Map.put(:preserve_alert_title, true)
 
               case push_locator(selected, person, device, binding.binding_id) do
                 nil -> claim
@@ -156,7 +159,9 @@ defmodule AttentionServer.Engine do
               end
 
             many ->
-              Map.put(claim, :alert, grouped_push_alert(many))
+              claim
+              |> Map.put(:alert, grouped_push_alert(many))
+              |> Map.put(:preserve_alert_body, true)
           end
 
         claimed = %{
@@ -5109,14 +5114,7 @@ defmodule AttentionServer.Engine do
       |> Enum.join(", ")
 
     alert = %{"title" => "#{length(gathered)} new requests"}
-
-    {graphemes, remaining} = take_graphemes(names, 160, [])
-
-    if remaining == "" and length(graphemes) <= 160 do
-      Map.put(alert, "body", names)
-    else
-      alert
-    end
+    Map.put(alert, "body", names)
   end
 
   defp push_alert({{_, sender, _}, record}) do

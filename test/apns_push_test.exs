@@ -214,6 +214,57 @@ defmodule AttentionServer.APNSPushTest do
            }
   end
 
+  test "exact grouped names stay intact in APNs and oversized names are not truncated", ctx do
+    %{certs: certs, key_path: key_path, provider_port: provider_port} = ctx
+    now = System.system_time(:millisecond)
+
+    config =
+      APNS.prepare!(
+        key_path: key_path,
+        key_id: "TESTKEYID1",
+        team_id: "TESTTEAMID",
+        endpoint: %{
+          address: {127, 0, 0, 1},
+          hostname: "relay.test",
+          port: provider_port,
+          cacerts: [ca_der(certs)]
+        }
+      )
+
+    exact_names = String.duplicate("名", 90) <> "A, " <> String.duplicate("界", 90) <> "B"
+
+    claim = %{
+      claim_id: op(92),
+      profile_id: @provider_profile,
+      address: @device_token,
+      deadline_at: now + 60_000,
+      registered_at: now,
+      presentation: :alert,
+      alert: %{"title" => "2 new requests", "body" => exact_names},
+      preserve_alert_body: true
+    }
+
+    {outcome, _cached_token} = APNS.send(config, claim, nil)
+    assert outcome.state == "provider_accepted"
+    assert_receive {:apns_request, "POST", _path, _headers, body}, 12_000
+    assert byte_size(body) <= 4_096
+    assert {:ok, %{"aps" => %{"alert" => %{"body" => ^exact_names}}}} =
+             JSON.decode_line(body <> "\n")
+
+    oversized_names = String.duplicate("untruncated-name-", 260)
+    oversized_claim = %{claim | claim_id: op(91), alert: %{"title" => "2 new requests", "body" => oversized_names}}
+
+    log =
+      capture_log(fn ->
+        {oversized_outcome, _cached_token} = APNS.send(config, oversized_claim, nil)
+        send(self(), {:oversized_outcome, oversized_outcome.state})
+      end)
+
+    assert_receive {:oversized_outcome, "blocked_configuration"}
+    refute_receive {:apns_request, "POST", _, _, _}, 100
+    refute log =~ "untruncated-name-"
+  end
+
   test "an oversized locator is omitted whole and reported without changing push status", ctx do
     %{certs: certs, key_path: key_path, provider_port: provider_port} = ctx
 
