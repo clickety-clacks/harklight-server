@@ -445,7 +445,10 @@ defmodule AttentionServer.APNSPushTest do
       sender_socket,
       3,
       "apns-delivery",
-      %{"body" => "  bounded   preview\nfrom sender  "}
+      %{
+        "body" => "  bounded   preview\nfrom sender  ",
+        "display_name" => "  Agent\nλ / name  "
+      }
     )
 
     refute_receive {:apns_request, _, _, _}, 100
@@ -472,7 +475,10 @@ defmodule AttentionServer.APNSPushTest do
 
     assert payload == %{
              "aps" => %{
-               "alert" => %{"title" => "app:test", "body" => "bounded preview from sender"},
+               "alert" => %{
+                 "title" => "  Agent\nλ / name  ",
+                 "body" => "bounded preview from sender"
+               },
                "badge" => 1,
                "content-available" => 1
              },

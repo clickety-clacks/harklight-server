@@ -98,10 +98,10 @@ its commands and message format.
 
 Agents send new messages and listen for replies through the authenticated
 [`harklight-agent` session route](skills/core.md).
-Enrolled-device `send` and correlated `receipt` commands are available with the
-earlier device interface. `read` and `respond` remain available for requests
-already stored by the server. Registered agent identities have separately
-granted search/get/respond access.
+Enrolled-device `read` and `respond` remain available for requests already
+stored by the server; they do not create new messages or retrieve an origin
+receipt. Registered agent identities have separately granted
+search/get/respond access.
 
 Agent inbox search lists unresolved requests before resolved history, newest
 original server acceptance first within each group. Search pagination preserves

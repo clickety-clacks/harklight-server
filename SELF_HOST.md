@@ -272,10 +272,12 @@ an APNs request; after adding the Production settings, the device must register
 a higher revision to clear that binding. FCM is unsupported.
 
 An enrolled app registers its own current address over the authenticated relay.
-New unresolved attention uses the triggering message's exact `sender_id` as its
-alert title. Its APNs body may include a whitespace-normalized preview of up to
-160 graphemes from that message's body; when the body is absent or blank, its
-title supplies the preview. The payload also carries a content-free sync hint.
+New unresolved attention uses the triggering message's `display_name` string
+as its alert title when supplied, preserving it separately from the exact
+`sender_id`; otherwise it uses `sender_id`. Its APNs body may include a
+whitespace-normalized preview of up to 160 graphemes from that message's body;
+when the body is absent or blank, its title supplies the preview. The payload
+also carries a content-free sync hint.
 Terminal-only updates use background sync without an alert, sound or badge,
 including updates to the answering device. A notification can carry a message
 excerpt, while full conversation history and answers remain in the durable relay.
@@ -322,11 +324,10 @@ the APNs variables unset.
 
 Agents send new messages and listen for replies through the authenticated
 [`harklight-agent` session route](skills/core.md).
-The enrolled-device `send` and correlated `receipt` commands retain their
-earlier arguments and output. The `receipt` command retrieves the terminal
-server-side outcome correlated with that device send operation. Device `read`
-and `respond` also remain available for messages already stored by the server.
-Existing messages and their replay events remain in the server history.
+The enrolled-device `read` and `respond` commands remain available for messages
+already stored by the server. They do not create new messages or retrieve an
+origin receipt. Existing messages and their replay events remain in server
+history.
 
 Use an enrolled device with read/respond access to see its person's stored
 messages:

@@ -246,15 +246,7 @@ defmodule AttentionServer.MessageFieldsRelayTest do
              "text" => "Later"
            }
 
-    assert %{
-             "type" => "ok",
-             "receipt" => %{
-               "state" => "answered",
-               "by" => "default",
-               "answer" => "ship",
-               "actor" => %{"kind" => "server"}
-             }
-           } =
+    assert %{"type" => "error", "reason" => "unknown_type"} =
              request(restarted, "origin", %{
                "type" => "answer_receipt",
                "receipt_version" => 1,

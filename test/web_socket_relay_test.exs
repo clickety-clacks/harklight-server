@@ -252,14 +252,12 @@ defmodule AttentionServer.WebSocketRelayTest do
     assert %{"type" => "error", "reason" => "invalid_snapshot"} = reply(receiver)
     assert Process.alive?(relay)
 
-    assert :ok =
-             send_request(sender, %{
+    assert %{"type" => "ok", "seq" => 1} =
+             store_request(relay, ctx.keys["a1"], %{
                "type" => "forward",
                "op_id" => op(9001),
                "message" => message("after-bad-operation", "still delivered")
              })
-
-    assert %{"type" => "ok", "seq" => 1} = reply(sender)
 
     assert %{"type" => "delivery", "seq" => 1, "message_id" => "after-bad-operation"} =
              reply(sender)
@@ -269,7 +267,7 @@ defmodule AttentionServer.WebSocketRelayTest do
   end
 
   test "No comment reconciliation commits once and keeps the frozen checkpoint", ctx do
-    %{certs: certs, web: web} = ctx
+    %{certs: certs, web: web, relay: relay, keys: keys} = ctx
 
     assert {:ok, origin} = connect(web, certs, "a1")
     assert upgrade(origin) =~ "101 Switching Protocols"
@@ -278,14 +276,13 @@ defmodule AttentionServer.WebSocketRelayTest do
     assert {:ok, device} = connect(web, certs, "a2")
     assert upgrade(device) =~ "101 Switching Protocols"
 
-    assert :ok =
-             send_request(origin, %{
+    assert %{"type" => "ok", "seq" => 1} =
+             store_request(relay, keys["a1"], %{
                "type" => "forward",
                "op_id" => op(9200),
                "message" => message("reconcile-no-comment", "No comment request")
              })
 
-    assert %{"type" => "ok", "seq" => 1} = reply(origin)
     assert %{"type" => "delivery", "seq" => 1} = reply(origin)
 
     assert :ok =
@@ -400,7 +397,7 @@ defmodule AttentionServer.WebSocketRelayTest do
   end
 
   test "No comment reconciliation adopts an ordinary answer without reapplying it", ctx do
-    %{certs: certs, web: web} = ctx
+    %{certs: certs, web: web, relay: relay, keys: keys} = ctx
 
     assert {:ok, origin} = connect(web, certs, "a1")
     assert upgrade(origin) =~ "101 Switching Protocols"
@@ -409,14 +406,13 @@ defmodule AttentionServer.WebSocketRelayTest do
     assert {:ok, device} = connect(web, certs, "a2")
     assert upgrade(device) =~ "101 Switching Protocols"
 
-    assert :ok =
-             send_request(origin, %{
+    assert %{"type" => "ok", "seq" => 1} =
+             store_request(relay, keys["a1"], %{
                "type" => "forward",
                "op_id" => op(9300),
                "message" => message("ordinary-no-comment", "Already answered")
              })
 
-    assert %{"type" => "ok", "seq" => 1} = reply(origin)
     assert %{"type" => "delivery", "seq" => 1} = reply(origin)
 
     assert :ok =
@@ -478,21 +474,20 @@ defmodule AttentionServer.WebSocketRelayTest do
     assert %{"type" => "lifecycle", "seq" => 2, "terminal_kind" => "no_comment"} =
              adopted["terminal"]
 
-    assert :ok =
-             send_request(origin, %{
+    assert %{"type" => "ok", "seq" => 3} =
+             store_request(relay, keys["a1"], %{
                "type" => "forward",
                "op_id" => op(9302),
                "message" => message("after-ordinary-adoption", "No duplicate terminal")
              })
 
-    assert %{"type" => "ok", "seq" => 3} = reply(origin)
     assert %{"type" => "delivery", "seq" => 3} = reply(origin)
 
     :ssl.close(device)
     :ssl.close(origin)
   end
 
-  test "TLS WebSocket keeps stored history readable and accepts legacy agent frames", ctx do
+  test "TLS WebSocket keeps stored history readable and rejects legacy agent frames", ctx do
     %{certs: certs, web: web, relay: relay, keys: keys} = ctx
     message = message("one", "stored before route removal")
 
@@ -546,12 +541,12 @@ defmodule AttentionServer.WebSocketRelayTest do
              send_request(a1, %{
                "type" => "forward",
                "op_id" => op(3),
-               "message" => message("two", "accepted over WebSocket"),
+               "message" => message("two", "must not be accepted"),
                "ref" => "legacy-send"
              })
 
-    assert %{"type" => "ok", "seq" => 3, "ref" => "legacy-send"} = reply(a1)
-    assert %{"type" => "delivery", "seq" => 3, "message_id" => "two"} = reply(a1)
+    assert %{"type" => "error", "reason" => "unknown_type", "ref" => "legacy-send"} =
+             reply(a1)
 
     assert :ok =
              send_request(a1, %{
@@ -563,11 +558,10 @@ defmodule AttentionServer.WebSocketRelayTest do
                "ref" => "legacy-receipt"
              })
 
-    assert %{"type" => "ok", "ref" => "legacy-receipt", "receipt" => receipt} = reply(a1)
-    assert receipt["terminal_kind"] == "answer"
-    assert receipt["answer"] == "kept"
+    assert %{"type" => "error", "reason" => "unknown_type", "ref" => "legacy-receipt"} =
+             reply(a1)
 
-    assert {:ok, [%{"message_id" => "one"}, _lifecycle, %{"message_id" => "two"}], 3} =
+    assert {:ok, [%{"message_id" => "one"}, _lifecycle], 2} =
              Relay.events(relay, keys["a1"], 0)
 
     assert {:ok, a2} = connect(web, certs, "a2")
@@ -579,9 +573,8 @@ defmodule AttentionServer.WebSocketRelayTest do
                 "type" => "lifecycle",
                 "message_id" => "one",
                 "state" => "answered"
-              } = lifecycle,
-              %{"type" => "delivery", "message_id" => "two", "seq" => 3}
-            ], %{"seq" => 3}} = resync(a2)
+              } = lifecycle
+            ], %{"seq" => 2}} = resync(a2)
 
     refute Map.has_key?(lifecycle, "answer")
 
@@ -1080,14 +1073,10 @@ defmodule AttentionServer.WebSocketRelayTest do
     }
 
     assert :ok = :ssl.send(socket, [frame(first_line), frame(JSON.encode!(second) <> "\n")])
-    assert %{"type" => "ok", "seq" => 1} = reply(socket)
-    assert %{"type" => "delivery", "seq" => 1, "message_id" => "near-limit"} = reply(socket)
+    assert %{"type" => "error", "reason" => "unknown_type"} = reply(socket)
+    assert %{"type" => "error", "reason" => "unknown_type"} = reply(socket)
 
-    assert %{"type" => "ok", "seq" => 2} = reply(socket)
-    assert %{"type" => "delivery", "seq" => 2, "message_id" => "after-limit"} = reply(socket)
-
-    assert {:ok, events, 2} = Relay.events(relay, keys["a1"], 0)
-    assert length(events) == 2
+    assert {:ok, [], 0} = Relay.events(relay, keys["a1"], 0)
     :ssl.close(socket)
   end
 

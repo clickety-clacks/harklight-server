@@ -16,6 +16,7 @@ defmodule AttentionServer.PushAlertTest do
         "message_id" => "latest",
         "created_at" => 1,
         "title" => "Actual title",
+        "display_name" => "  Agent\nλ / name  ",
         "body" => "new work"
       },
       origin: device,
@@ -60,7 +61,7 @@ defmodule AttentionServer.PushAlertTest do
     assert {:ok, _claimed, claim} = Engine.claim_push(engine, now)
     assert claim.presentation == :alert
     assert claim.high == high
-    assert claim.alert["title"] == "app:test"
+    assert claim.alert["title"] == "  Agent\nλ / name  "
     assert claim.alert["body"] == "new work"
     assert claim.locator["message_id"] == "latest"
     assert claim.locator["acceptance_seq"] == high - 1
@@ -236,6 +237,26 @@ defmodule AttentionServer.PushAlertTest do
     assert claim.alert == %{"title" => "3 new requests", "body" => "Alice, app:beta"}
     refute Map.has_key?(claim, :locator)
     assert claim.badge == 3
+  end
+
+  test "grouped pushes carry exact agent display names separately from sender IDs" do
+    engine =
+      engine_with_deliveries(
+        [
+          {"app:alpha", "one", nil, nil},
+          {"app:beta", "two", nil, nil}
+        ],
+        %{}
+      )
+
+    messages =
+      Map.new(engine.messages, fn {key, record} ->
+        display_name = if elem(key, 1) == "app:alpha", do: "  Alpha\nAgent  ", else: "βeta"
+        {key, %{record | message: Map.put(record.message, "display_name", display_name)}}
+      end)
+
+    assert {:ok, _claimed, claim} = Engine.claim_push(%{engine | messages: messages}, 1_000)
+    assert claim.alert == %{"title" => "2 new requests", "body" => "  Alpha\nAgent  , βeta"}
   end
 
   test "the grouped count covers only requests gathered since the last push" do

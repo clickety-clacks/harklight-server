@@ -18,22 +18,6 @@ defmodule AttentionServer.HeadlessDevice do
   @max_server_frame 2 * @max_frame + 16_384
   @timeout 5_000
 
-  def send_message(directory, endpoint, message_file) do
-    with :ok <- existing_private_directory(directory),
-         {:ok, message} <- read_document(message_file),
-         true <- is_map(message) and not is_struct(message),
-         {:ok, frame} <- saved_operation(directory, %{"type" => "forward", "message" => message}),
-         {:ok, result} <-
-           with_session(directory, endpoint, fn socket ->
-             with {:ok, _} <- sync(directory, socket), do: request(socket, frame)
-           end) do
-      {:ok, Map.put(result, "op_id", frame["op_id"])}
-    else
-      false -> {:error, :invalid_message}
-      other -> other
-    end
-  end
-
   def read(directory, endpoint) do
     with_session(directory, endpoint, fn socket ->
       with {:ok, high} <- sync(directory, socket),
@@ -66,34 +50,6 @@ defmodule AttentionServer.HeadlessDevice do
            end) do
       {:ok, Map.put(result, "op_id", frame["op_id"])}
     end
-  end
-
-  def receipt(directory, endpoint, sender, message_id) do
-    with_session(directory, endpoint, fn socket ->
-      with {:ok, high} <- sync(directory, socket),
-           {:ok, events} <- stored_events(directory),
-           {:ok, acceptance} <-
-             origin_acceptance(events, sender, message_id, device_id(directory)) do
-        case terminal_seq(events, sender, message_id) do
-          nil ->
-            {:ok,
-             %{
-               "status" => "pending",
-               "acceptance_seq" => acceptance,
-               "observed_through_seq" => high
-             }}
-
-          seq ->
-            request(socket, %{
-              "type" => "answer_receipt",
-              "receipt_version" => 1,
-              "sender_id" => sender,
-              "message_id" => message_id,
-              "terminal_seq" => seq
-            })
-        end
-      end
-    end)
   end
 
   defp with_session(directory, endpoint, fun) do
@@ -316,26 +272,6 @@ defmodule AttentionServer.HeadlessDevice do
         event["message_id"] == id and event["origin"] != device and
         Map.has_key?(event, "message")
     end)
-  end
-
-  defp origin_acceptance(events, sender, id, device) do
-    case Enum.find(events, fn event ->
-           event["type"] == "delivery" and event["sender_id"] == sender and
-             event["message_id"] == id and event["origin"] == device
-         end) do
-      %{"seq" => seq} -> {:ok, seq}
-      _ -> {:error, :not_origin_message}
-    end
-  end
-
-  defp terminal_seq(events, sender, id) do
-    case Enum.find(events, fn event ->
-           event["type"] == "lifecycle" and event["sender_id"] == sender and
-             event["message_id"] == id
-         end) do
-      %{"seq" => seq} -> seq
-      _ -> nil
-    end
   end
 
   defp request(socket, frame) do
