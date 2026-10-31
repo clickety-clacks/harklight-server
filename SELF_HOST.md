@@ -1,6 +1,6 @@
 # Harklight Server self-hosted installation
 
-Version: **0.1.21**. Package target: **Linux x86_64, glibc 2.39 or newer**, with OpenSSL 3 shared libraries and libstdc++6 (built on Ubuntu 24.04). The package bundles
+Version: **0.1.22**. Package target: **Linux x86_64, glibc 2.39 or newer**, with OpenSSL 3 shared libraries and libstdc++6 (built on Ubuntu 24.04). The package bundles
 Erlang/OTP and Elixir bytecode; users need no Mix, Hex, source checkout or
 Erlang installation. It needs Bash, OpenSSL CLI, tar and the platform libraries
 listed in BUILD_INFO. This is a single-process self-hosted server cut.
@@ -32,9 +32,9 @@ a live phone test.
 
 ## Download and verify
 
-After publication, download the v0.1.21 release from
-clickety-clacks/harklight-server, tag v0.1.21. Get
-harklight-server-0.1.21-linux-x86_64.tar.gz, SHA256SUMS and SELF_HOST.md from
+After publication, download the v0.1.22 release from
+clickety-clacks/harklight-server, tag v0.1.22. Get
+harklight-server-0.1.22-linux-x86_64.tar.gz, SHA256SUMS and SELF_HOST.md from
 that release. Run sha256sum -c SHA256SUMS and extract into an operator-owned
 versioned directory. BUILD_INFO identifies the source commit, build host,
 toolchain, source status and native dependencies.
@@ -47,7 +47,7 @@ runtime/dependency notices remain in their shipped distribution files.
 Choose the DNS hostname clients will validate. For a same-machine preview,
 localhost works. Install into a directory you own and run:
 
-    PACKAGE="$PWD/harklight-server-0.1.21-linux-x86_64"
+    PACKAGE="$PWD/harklight-server-0.1.22-linux-x86_64"
     STATE="$HOME/.local/share/harklight-server"
     "$PACKAGE/bin/harklight-bootstrap" "$STATE" localhost
     cat "$STATE/person-id"
@@ -293,7 +293,7 @@ including FORMAT17, is normalized and durably committed on startup. The new
 state includes hosted-account records, the separate conversation feed,
 conversation push high water and upload activity accounting while retaining
 existing requests, answers and authority, and adds persisted chat read positions.
-v0.1.21, v0.1.20, v0.1.19, v0.1.18, v0.1.17, v0.1.16, v0.1.15, v0.1.14 and v0.1.13 use FORMAT24; v0.1.12 uses FORMAT23; v0.1.11 uses
+v0.1.22, v0.1.21, v0.1.20, v0.1.19, v0.1.18, v0.1.17, v0.1.16, v0.1.15, v0.1.14 and v0.1.13 use FORMAT24; v0.1.12 uses FORMAT23; v0.1.11 uses
 FORMAT22; and v0.1.10 accepts formats 1–6 and 8–21 only. Those earlier packages cannot
 start against FORMAT24. Preserve the trust root, person and sender grants; do
 not repeat bootstrap. After a successful FORMAT24 upgrade, v0.1.12 or earlier
