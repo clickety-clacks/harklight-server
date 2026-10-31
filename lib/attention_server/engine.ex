@@ -159,8 +159,11 @@ defmodule AttentionServer.Engine do
               end
 
             many ->
+              {alert, names} = grouped_push_alert(many)
+
               claim
-              |> Map.put(:alert, grouped_push_alert(many))
+              |> Map.put(:alert, alert)
+              |> Map.put(:grouped_alert_names, names)
               |> Map.put(:preserve_alert_body, true)
           end
 
@@ -5111,10 +5114,9 @@ defmodule AttentionServer.Engine do
         end
       end)
       |> Enum.uniq()
-      |> Enum.join(", ")
 
     alert = %{"title" => "#{length(gathered)} new requests"}
-    Map.put(alert, "body", names)
+    {Map.put(alert, "body", Enum.join(names, ", ")), names}
   end
 
   defp push_alert({{_, sender, _}, record}) do

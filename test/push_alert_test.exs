@@ -297,6 +297,7 @@ defmodule AttentionServer.PushAlertTest do
              "body" => first_name <> ", " <> second_name
            }
 
+    assert claim.grouped_alert_names == [first_name, second_name]
     assert claim.preserve_alert_body
   end
 
