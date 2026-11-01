@@ -228,8 +228,8 @@ defmodule AttentionServer.OriginHTTPS do
                 operation_id
               )
 
-          {:ok, {:stream, handle}} ->
-            stream(tls, relay, key, handle)
+          {:ok, {:stream, handle, reconnect}} ->
+            stream(tls, relay, key, handle, reconnect)
 
           {:ok, {:upload, attrs, size, remainder}} ->
             upload(tls, relay, key, attrs, size, remainder)
@@ -649,8 +649,8 @@ defmodule AttentionServer.OriginHTTPS do
     end
   end
 
-  defp stream(socket, relay, key, handle) do
-    case Relay.origin_stream_attach(relay, key, handle, self()) do
+  defp stream(socket, relay, key, handle, reconnect) do
+    case Relay.origin_stream_attach(relay, key, handle, self(), reconnect) do
       :ok ->
         try do
           with {:ok, %{"cursor" => cursor}} <-
@@ -713,6 +713,9 @@ defmodule AttentionServer.OriginHTTPS do
 
   defp stream_receive(socket, cursor) do
     receive do
+      :origin_stream_replaced ->
+        :ok
+
       {:origin_state_changed, next} when is_integer(next) and next > cursor ->
         case stream_send(socket, change_notice(next), :stream_write) do
           :ok ->
@@ -772,8 +775,10 @@ defmodule AttentionServer.OriginHTTPS do
             _ -> {:error, :invalid_json}
           end
 
-        {:stream, handle} ->
-          if remainder == <<>>, do: {:ok, {:stream, handle}}, else: {:error, :bad_frame}
+        {:stream, handle, reconnect} ->
+          if remainder == <<>>,
+            do: {:ok, {:stream, handle, reconnect}},
+            else: {:error, :bad_frame}
 
         {:upload, attrs, size} ->
           {:ok, {:upload, attrs, size, remainder}}
@@ -910,9 +915,11 @@ defmodule AttentionServer.OriginHTTPS do
     with {:ok, headers} <- headers(fields, %{}),
          false <- Map.has_key?(headers, "transfer-encoding"),
          false <- Map.has_key?(headers, "content-length"),
-         ["/origin/v1/stream?session", handle] <- String.split(path, "="),
+         "/origin/v1/stream?session=" <> query <- path,
+         [handle | options] <- String.split(query, "&"),
+         true <- options in [[], ["reconnect=1"]],
          true <- Message.uuid_v4?(handle) do
-      {:ok, {:stream, handle}}
+      {:ok, {:stream, handle, options == ["reconnect=1"]}}
     else
       _ -> {:error, :not_found}
     end

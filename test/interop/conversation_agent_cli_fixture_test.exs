@@ -25,6 +25,187 @@ defmodule AttentionServer.ConversationAgentCLIFixtureTest do
 
   @sender_id "app:rust-cli-fixture"
 
+  @tag :reconnect
+  test "explicit reconnect resumes gap entries and delivered obligations without replaying actions" do
+    root =
+      Path.join(System.tmp_dir!(), "harklight-reconnect-#{System.unique_integer([:positive])}")
+
+    fixture = start_file_fixture!(root, :none)
+    agent_bin = System.fetch_env!("HARKLIGHT_AGENT_BIN")
+
+    request =
+      cli_json!(
+        agent_bin,
+        [
+          "send",
+          "--session",
+          "new",
+          "--sender-id",
+          @sender_id,
+          "--route",
+          "other",
+          "--controller",
+          "--title",
+          "Reconnect fixture",
+          "--type",
+          "request",
+          "--reply"
+        ],
+        fixture.env
+      )
+
+    session = request["session"]
+
+    first =
+      launch_reconnect(
+        agent_bin,
+        ["--session", session, "--vendor-session-id", "none", "--route", "other", "--controller"],
+        fixture.env
+      )
+
+    assert %{"kind" => "reconnected", "session_handle" => ^session, "feed_cursor" => 1} =
+             receive_json!(first)
+
+    initial =
+      submit_discussion!(fixture.relay, fixture.reader, request["request"], 910, "Before gap")
+
+    initial_event = receive_event!(first)
+    assert initial_event["event_id"] == initial["event_id"]
+
+    cli_json!(
+      agent_bin,
+      ["ack", "--session", session, "--event", initial["event_id"]],
+      fixture.env
+    )
+
+    terminate_listener!(first)
+    wait_availability!(fixture.relay, fixture.origin, session, "not_listening")
+    gap = submit_discussion!(fixture.relay, fixture.reader, request["request"], 911, "During gap")
+
+    # An owned old TLS transport still exists when the explicit worker replaces it.
+    assert {:ok, old_stream} =
+             HeadlessTLS.connect(
+               fixture.endpoint,
+               {Path.join(fixture.certs, "a2.pem"), Path.join(fixture.certs, "a2.key")}
+             )
+
+    :ok =
+      :ssl.send(
+        old_stream,
+        "GET /origin/v1/stream?session=#{session} HTTP/1.1\r\nHost: relay.test\r\n\r\n"
+      )
+
+    assert {:ok, _} = :ssl.recv(old_stream, 0, 5_000)
+    wait_availability!(fixture.relay, fixture.origin, session, "listening")
+
+    second = launch_reconnect(agent_bin, ["--session", session], fixture.env)
+    ready = receive_json!(second)
+    assert ready["kind"] == "reconnected"
+    assert ready["feed_cursor"] == String.to_integer(gap["event_id"])
+    assert {:ok, _old_bytes} = read_all(old_stream, <<>>)
+    pending = receive_event!(second)
+    assert pending["event_id"] == initial["event_id"]
+    assert pending["delivered"] == true
+    assert pending["acted"] == false
+    resumed = receive_event!(second)
+    assert resumed["event_id"] == gap["event_id"]
+    assert resumed["session_handle"] == session
+    assert resumed["entry"]["text"] == "During gap"
+    assert resumed["acted"] == false
+    refute_receive {^second, {:data, _}}, 100
+
+    # Real listener shutdown ends this one-attempt worker with a safe reason.
+    :ok = Supervisor.terminate_child(fixture.server, :origin_https)
+    failure = receive_json!(second)
+    assert failure["kind"] == "connection_error"
+    assert failure["stage"] == "stream"
+    assert failure["reason_code"] in ["stream_ended", "stream_io"]
+    refute Map.has_key?(failure, "op_id")
+    assert {:ok, 1} = await_exit(second, 10_000)
+    {:ok, %{"entries" => entries}} = Relay.origin_feed(fixture.relay, fixture.origin, 0)
+    assert Enum.count(entries, &(&1["event_id"] == gap["event_id"])) == 1
+    assert Enum.count(entries, &(&1["kind"] == "discussion" and &1["author"] == "origin")) == 0
+  end
+
+  @tag :reconnect
+  test "reconnect refusal reports the actual safe reason and keeps uncertain attachment keys" do
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "harklight-reconnect-refusal-#{System.unique_integer([:positive])}"
+      )
+
+    fixture = start_file_fixture!(root, :none)
+    agent_bin = System.fetch_env!("HARKLIGHT_AGENT_BIN")
+
+    request =
+      cli_json!(
+        agent_bin,
+        [
+          "send",
+          "--session",
+          "new",
+          "--sender-id",
+          @sender_id,
+          "--route",
+          "other",
+          "--controller",
+          "--title",
+          "Refusal fixture",
+          "--type",
+          "request",
+          "--reply"
+        ],
+        fixture.env
+      )
+
+    args = [
+      "reconnect",
+      "--session",
+      request["session"],
+      "--vendor-session-id",
+      "none",
+      "--route",
+      "other",
+      "--controller"
+    ]
+
+    {port, task} =
+      start_refusal_proxy!(fixture, %{
+        "v" => 1,
+        "type" => "error",
+        "reason" => "storage_unavailable",
+        "private" => "private diagnostic must not escape"
+      })
+
+    env =
+      List.keyreplace(
+        fixture.env,
+        "HARKLIGHT_ORIGIN_PORT",
+        0,
+        {"HARKLIGHT_ORIGIN_PORT", Integer.to_string(port)}
+      )
+
+    {output, 7} = System.cmd(agent_bin, args, env: env, stderr_to_stdout: true)
+    failure = decode_first_line!(output)
+    assert failure["kind"] == "outcome_unknown"
+    assert failure["stage"] == "attachment"
+    assert failure["reason_code"] == "storage_unavailable"
+    assert failure["reason_source"] == "server"
+    refute output =~ "private diagnostic"
+    recorded = Task.await(task, 10_000)
+    assert failure["op_id"] == recorded.request["op_id"]
+
+    # Recover the exact saved operation against the real server before changing
+    # anything; startup must not allocate a new ID for the uncertain update.
+    start_origin_command_trace!()
+    on_exit(&stop_origin_command_trace/0)
+    reconnect = launch_reconnect(agent_bin, tl(args), fixture.env)
+    assert receive_json!(reconnect)["kind"] == "reconnected"
+    assert await_origin_command_call!("attachment_update", 10_000) == recorded.request
+    terminate_listener!(reconnect)
+  end
+
   test "the Rust listener reports NoComment as a distinct final terminal for choice and reply-only requests" do
     root =
       Path.join(
@@ -302,6 +483,7 @@ defmodule AttentionServer.ConversationAgentCLIFixtureTest do
     refute Enum.any?(entries, &(&1["op_id"] == op_id))
   end
 
+  @tag :reconnect_regression
   test "controller support is limited to an other-route follow listener" do
     root =
       Path.join(
@@ -552,6 +734,7 @@ defmodule AttentionServer.ConversationAgentCLIFixtureTest do
     terminate_listener!(listener)
   end
 
+  @tag :reconnect_regression
   test "same-handle listen replays pending work until an action commits" do
     root =
       Path.join(
@@ -833,6 +1016,8 @@ defmodule AttentionServer.ConversationAgentCLIFixtureTest do
     assert final_status["availability"] == "gone"
   end
 
+  @tag :reconnect_regression
+  @tag :reconnect
   test "CLI recovers a lost answered-result response without claiming an unknown action applied" do
     root =
       Path.join(
@@ -944,8 +1129,38 @@ defmodule AttentionServer.ConversationAgentCLIFixtureTest do
     acted_terminal = Enum.find(after_received, &(&1["event_id"] == terminal["event_id"]))
     assert acted_terminal["acted"] == true
 
-    idle = cli_next!(agent_bin, request["session"], fixture.env)
-    assert idle == %{"kind" => "idle", "open_requests" => 0}
+    status = cli_json!(agent_bin, ["status", "--session", request["session"]], fixture.env)
+    assert status["open_requests"] == 0
+    assert status["open_chats"] == 1
+    assert status["pending_delivered_unacted"] == 0
+
+    # Acting on an answer settles that obligation, not the still-open chat.
+    # Explicit reconnect must retain that chat and avoid re-offering the acted answer.
+    listener =
+      launch_reconnect(
+        agent_bin,
+        [
+          "--session",
+          request["session"],
+          "--vendor-session-id",
+          "none",
+          "--route",
+          "other",
+          "--controller"
+        ],
+        fixture.env
+      )
+
+    assert receive_json!(listener)["kind"] == "reconnected"
+
+    discussion =
+      submit_discussion!(fixture.relay, fixture.reader, request["request"], 912, "After answer")
+
+    event = receive_event!(listener)
+    assert event["event_id"] == discussion["event_id"]
+    assert event["entry"]["text"] == "After answer"
+    assert event["request"]["message_id"] == request["request"]
+    terminate_listener!(listener)
   end
 
   @tag :long_idle
@@ -1181,6 +1396,7 @@ defmodule AttentionServer.ConversationAgentCLIFixtureTest do
     assert Enum.count(entries, &(&1["op_id"] == unknown["op_id"])) == 1
   end
 
+  @tag :reconnect_regression
   test "CLI converges on feed order after duplicate and reordered high-water notices" do
     root =
       Path.join(
@@ -1269,6 +1485,7 @@ defmodule AttentionServer.ConversationAgentCLIFixtureTest do
     terminate_listener!(listener)
   end
 
+  @tag :reconnect_regression
   test "startup fetch includes a turn committed after its stream opens" do
     root =
       Path.join(
@@ -1325,6 +1542,7 @@ defmodule AttentionServer.ConversationAgentCLIFixtureTest do
     refute_receive {^listener, {:data, _line}}, 300
   end
 
+  @tag :reconnect_regression
   test "CLI migrates populated legacy cursor, pending acknowledgement, and committed operation" do
     root =
       Path.join(
@@ -2930,7 +3148,8 @@ defmodule AttentionServer.ConversationAgentCLIFixtureTest do
   end
 
   defp cli_json!(agent_bin, args, env) do
-    {output, 0} = System.cmd(agent_bin, args, env: env, stderr_to_stdout: true)
+    # Successful commands emit NDJSON on stdout; warnings belong to stderr.
+    {output, 0} = System.cmd(agent_bin, args, env: env)
     decode_first_line!(output)
   end
 
@@ -2973,6 +3192,34 @@ defmodule AttentionServer.ConversationAgentCLIFixtureTest do
 
     on_exit(fn -> terminate_if_running(port) end)
     port
+  end
+
+  defp launch_reconnect(agent_bin, args, env) do
+    port =
+      Port.open({:spawn_executable, String.to_charlist(agent_bin)}, [
+        :binary,
+        :exit_status,
+        :use_stdio,
+        {:line, 1_048_576},
+        {:args, Enum.map(["reconnect" | args], &String.to_charlist/1)},
+        {:env, Enum.map(env, fn {k, v} -> {String.to_charlist(k), String.to_charlist(v)} end)}
+      ])
+
+    on_exit(fn -> terminate_if_running(port) end)
+    port
+  end
+
+  defp receive_json!(port) do
+    receive do
+      {^port, {:data, {:eol, line}}} ->
+        {:ok, value} = JSON.decode_line(line <> "\n")
+        value
+
+      {^port, {:exit_status, status}} ->
+        flunk("CLI exited before JSON with status #{status}")
+    after
+      15_000 -> flunk("CLI did not emit the expected JSON")
+    end
   end
 
   defp receive_event!(port) do

@@ -192,8 +192,12 @@ defmodule AttentionServer.Relay do
     do: GenServer.call(server, {:origin_session_gone, verified_device_key, handle})
 
   @doc "Attach one authenticated origin SSE worker to a session handle."
-  def origin_stream_attach(server, verified_device_key, handle, worker),
-    do: GenServer.call(server, {:origin_stream_attach, verified_device_key, handle, worker})
+  def origin_stream_attach(server, verified_device_key, handle, worker, reconnect \\ false),
+    do:
+      GenServer.call(
+        server,
+        {:origin_stream_attach, verified_device_key, handle, worker, reconnect}
+      )
 
   def origin_stream_detach(server, verified_device_key, handle, worker),
     do: GenServer.call(server, {:origin_stream_detach, verified_device_key, handle, worker})
@@ -1253,13 +1257,13 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  def handle_call({:origin_stream_attach, key, handle, worker}, _from, state)
-      when is_pid(worker) do
+  def handle_call({:origin_stream_attach, key, handle, worker, reconnect}, _from, state)
+      when is_pid(worker) and is_boolean(reconnect) do
     engine = state.store.engine
 
     with {:ok, person} <- Engine.authorized_person(engine, key),
          {:ok, _} <- Engine.origin_status(engine, key, handle, false),
-         false <- Map.has_key?(state.origin_streams, {person, key, handle}),
+         false <- not reconnect and Map.has_key?(state.origin_streams, {person, key, handle}),
          {:ok, attached} <- Conversation.mark_attached(engine, person, key, handle),
          {:ok, current} <- Engine.origin_status(attached, key, handle, true),
          attached <-
@@ -1272,8 +1276,15 @@ defmodule AttentionServer.Relay do
              current["last_detached_at"]
            ),
          {:ok, store} <- commit(state.store, attached, audit(engine, key, "origin_attach")) do
-      monitor = Process.monitor(worker)
       stream_key = {person, key, handle}
+      # Replace only after the attachment commit succeeds. The old worker's
+      # eventual detach/DOWN must not remove this connection's registration.
+      if previous = Map.get(state.origin_streams, stream_key) do
+        Process.demonitor(previous.monitor, [:flush])
+        if previous.worker != worker, do: send(previous.worker, :origin_stream_replaced)
+      end
+
+      monitor = Process.monitor(worker)
       streams = Map.put(state.origin_streams, stream_key, %{worker: worker, monitor: monitor})
 
       streams_by_identity =
