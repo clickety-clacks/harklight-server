@@ -61,7 +61,8 @@ defmodule AttentionServer.JevClient do
 
           instructions =
             "Rate candidate #{index} in the supplied pending set for how soon it should be handled. " <>
-              "Consider its title, body, stated stake, deadline and the sender's stated urgency relative to the other pending items. " <>
+              "Consider its title, body, stated stake, deadline, the sender's stated urgency, message type and message kind relative to the other pending items. " <>
+              "Do not apply a fixed priority order or preference based on message type or kind. " <>
               "The current time is now; due_in_minutes is the time left before the deadline, negative once it has passed."
 
           question = %{
@@ -89,7 +90,17 @@ defmodule AttentionServer.JevClient do
               "title" => Map.get(message, "title", ""),
               "body" => Map.get(message, "body", ""),
               "stake" => AttentionServer.Message.effective_stake(message),
-              "urgency" => AttentionServer.Message.effective_urgency(message)
+              "urgency" => AttentionServer.Message.effective_urgency(message),
+              "message_type" =>
+                if(AttentionServer.Message.valid_message_type?(Map.get(message, "message_type")),
+                  do: message["message_type"],
+                  else: nil
+                ),
+              "message_kind" =>
+                if(AttentionServer.Message.valid_message_kind?(Map.get(message, "message_kind")),
+                  do: message["message_kind"],
+                  else: nil
+                )
             }
 
             case AttentionServer.Message.effective_by_when(message) do

@@ -328,17 +328,27 @@ defmodule AttentionServer.PrioritizationTest do
   test "Jev receives effective urgency and omits an invalid deadline" do
     urgent =
       item("urgent", 1)
-      |> Map.update!(
-        :message,
-        &(&1 |> Map.put("urgency", "now") |> Map.put("by_when", "tomorrow"))
-      )
+      |> Map.update!(:message, fn message ->
+        message
+        |> Map.put("urgency", "now")
+        |> Map.put("by_when", "tomorrow")
+        |> Map.put("message_type", "request")
+        |> Map.put("message_kind", "blocker")
+      end)
 
     due =
       item("due", 2, 100)
-      |> Map.update!(:message, &Map.put(&1, "urgency", "low"))
+      |> Map.update!(:message, fn message ->
+        message
+        |> Map.put("urgency", "low")
+        |> Map.put("message_type", "fyi")
+        |> Map.put("message_kind", "success")
+      end)
+
+    untyped = item("untyped", 3)
 
     assert {:ok, request} =
-             Placement.compose("jev-set", [urgent, due], %{
+             Placement.compose("jev-set", [urgent, due, untyped], %{
                endpoint: @endpoint,
                model: @model,
                now: 0
@@ -346,20 +356,27 @@ defmodule AttentionServer.PrioritizationTest do
 
     assert {:ok,
             %{
-              "state" => %{"pending_items" => [urgent_item, due_item]},
+              "state" => %{"pending_items" => [urgent_item, untyped_item, due_item]},
               "questions" => questions
             }} = JSON.decode_line(request.body <> "\n")
 
     assert urgent_item["urgency"] == "now"
     assert urgent_item["stake"] == ""
+    assert urgent_item["message_type"] == "request"
+    assert urgent_item["message_kind"] == "blocker"
     refute Map.has_key?(urgent_item, "by_when")
+    assert untyped_item["message_type"] == nil
+    assert untyped_item["message_kind"] == nil
     assert due_item["urgency"] == "low"
+    assert due_item["message_type"] == "fyi"
+    assert due_item["message_kind"] == "success"
     assert due_item["by_when"] == "1970-01-01T00:00:00Z"
     assert due_item["due_in_minutes"] == 0
 
     assert questions["candidate_1"]["instructions"] ==
              "Rate candidate 1 in the supplied pending set for how soon it should be handled. " <>
-               "Consider its title, body, stated stake, deadline and the sender's stated urgency relative to the other pending items. " <>
+               "Consider its title, body, stated stake, deadline, the sender's stated urgency, message type and message kind relative to the other pending items. " <>
+               "Do not apply a fixed priority order or preference based on message type or kind. " <>
                "The current time is now; due_in_minutes is the time left before the deadline, negative once it has passed."
 
     assert questions["candidate_1"]["criteria"] == [

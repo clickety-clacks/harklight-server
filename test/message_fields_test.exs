@@ -17,6 +17,18 @@ defmodule AttentionServer.MessageFieldsTest do
     ]
   }
 
+  @seen_answer_ui %{
+    "schema" => "attention-client.actions/1",
+    "actions" => [
+      %{
+        "id" => "seen",
+        "label" => "Seen",
+        "kind" => "value",
+        "value" => %{"acknowledgment" => "seen"}
+      }
+    ]
+  }
+
   defp message do
     %{
       "sender_id" => "app:test",
@@ -25,6 +37,185 @@ defmodule AttentionServer.MessageFieldsTest do
       "title" => "A request",
       "answer_ui" => @answer_ui
     }
+  end
+
+  defp typed_error(message) do
+    assert {:error, {:typed_message, code, reason}} = Message.validate_typed_message(message)
+    {code, reason}
+  end
+
+  test "typed messages require the exact type-specific answer controls" do
+    fyi =
+      message()
+      |> Map.put("message_type", "fyi")
+      |> Map.put("answer_ui", @seen_answer_ui)
+
+    request = Map.put(message(), "message_type", "request")
+
+    assert :ok = Message.validate(fyi)
+    assert :ok = Message.validate_typed_message(fyi)
+    assert :ok = Message.validate(request)
+    assert :ok = Message.validate_typed_message(request)
+
+    assert {:error,
+            {:typed_message, "message_type_invalid",
+             ~s(message_type must be "fyi" or "request"; got "notice")}} =
+             Message.validate_present_message_type(Map.put(request, "message_type", "notice"))
+
+    assert {:error, {:typed_message, "message_type_invalid", reason}} =
+             Message.validate_present_message_type(Map.put(request, "message_type", nil))
+
+    assert reason == ~s(message_type must be "fyi" or "request"; got null)
+
+    for invalid_type <- ["FYI", "", 7, false, []] do
+      assert {:error, {:typed_message, "message_type_invalid", _}} =
+               Message.validate_present_message_type(
+                 Map.put(request, "message_type", invalid_type)
+               )
+    end
+
+    assert {"fyi_has_answer_controls", fyi_reason} =
+             typed_error(Map.put(fyi, "answer_ui", @answer_ui))
+
+    assert fyi_reason =~ "set answer_ui to the Seen descriptor"
+
+    assert {"fyi_has_answer_controls", _} =
+             typed_error(Map.delete(fyi, "answer_ui"))
+
+    no_controls = request |> Map.delete("answer_ui")
+    assert {"request_needs_answer_controls", needs_reason} = typed_error(no_controls)
+    assert needs_reason =~ "add a \"value\" choice"
+
+    unsupported =
+      request
+      |> Map.put("answer_ui", %{"schema" => "attention-client.ui/1", "document" => %{}})
+
+    assert {"request_answer_ui_unsupported", unsupported_reason} = typed_error(unsupported)
+    assert unsupported_reason =~ "got schema \"attention-client.ui/1\""
+
+    empty =
+      Map.put(request, "answer_ui", %{"schema" => "attention-client.actions/1", "actions" => []})
+
+    assert {"request_needs_answer_controls", _} = typed_error(empty)
+
+    malformed =
+      Map.put(request, "answer_ui", %{
+        "schema" => "attention-client.actions/1",
+        "actions" => [%{"id" => "reply", "kind" => "text"}]
+      })
+
+    assert {"request_answer_ui_invalid", malformed_reason} = typed_error(malformed)
+    assert malformed_reason =~ "action 1 (\"reply\")"
+    assert malformed_reason =~ "non-empty string \"label\""
+
+    duplicate_id =
+      Map.put(request, "answer_ui", %{
+        "schema" => "attention-client.actions/1",
+        "actions" => [
+          %{"id" => "reply", "label" => "Reply", "kind" => "text"},
+          %{"id" => "reply", "label" => "Again", "kind" => "text"}
+        ]
+      })
+
+    assert {"request_answer_ui_invalid", duplicate_reason} = typed_error(duplicate_id)
+    assert duplicate_reason =~ "action 2 (\"reply\")"
+    assert duplicate_reason =~ "unique non-empty string id"
+
+    extra_member =
+      Map.put(request, "answer_ui", %{
+        "schema" => "attention-client.actions/1",
+        "actions" => [%{"id" => "reply", "label" => "Reply", "kind" => "text", "extra" => true}]
+      })
+
+    assert {"request_answer_ui_invalid", extra_reason} = typed_error(extra_member)
+    assert extra_reason =~ "action 1 (\"reply\")"
+    assert extra_reason =~ "unsupported member \"extra\""
+
+    invalid_descriptors = [
+      {%{"schema" => "attention-client.actions/1"}, "missing member \"actions\""},
+      {%{"schema" => "attention-client.actions/1", "actions" => "reply"},
+       "member \"actions\" must be a non-empty array"},
+      {%{"schema" => "attention-client.actions/1", "actions" => [nil]},
+       "action 1 must be an object"},
+      {%{
+         "schema" => "attention-client.actions/1",
+         "actions" => [%{"label" => "Reply", "kind" => "text"}]
+       }, "needs a non-empty string \"id\""},
+      {%{
+         "schema" => "attention-client.actions/1",
+         "actions" => [%{"id" => "", "label" => "Reply", "kind" => "text"}]
+       }, "needs a non-empty string \"id\""},
+      {%{
+         "schema" => "attention-client.actions/1",
+         "actions" => [%{"id" => 7, "label" => "Reply", "kind" => "text"}]
+       }, "needs a non-empty string \"id\""},
+      {%{
+         "schema" => "attention-client.actions/1",
+         "actions" => [%{"id" => "reply", "label" => "", "kind" => "text"}]
+       }, "needs a non-empty string \"label\""},
+      {%{
+         "schema" => "attention-client.actions/1",
+         "actions" => [%{"id" => "reply", "label" => 7, "kind" => "text"}]
+       }, "needs a non-empty string \"label\""},
+      {%{
+         "schema" => "attention-client.actions/1",
+         "actions" => [%{"id" => "reply", "label" => "Reply", "kind" => "date"}]
+       }, "needs \"kind\" \"value\" or \"text\""},
+      {%{
+         "schema" => "attention-client.actions/1",
+         "actions" => [%{"id" => "pick", "label" => "Pick", "kind" => "value"}]
+       }, "needs member \"value\""},
+      {%{
+         "schema" => "attention-client.actions/1",
+         "actions" => [%{"id" => "reply", "label" => "Reply", "kind" => "text"}],
+         "extra" => true
+       }, "has unsupported member \"extra\""}
+    ]
+
+    for {answer_ui, expected_reason} <- invalid_descriptors do
+      assert {"request_answer_ui_invalid", reason} =
+               typed_error(Map.put(request, "answer_ui", answer_ui))
+
+      assert reason =~ expected_reason
+    end
+
+    assert :ok =
+             Message.validate_typed_message(
+               Map.put(request, "answer_ui", %{
+                 "schema" => "attention-client.actions/1",
+                 "actions" => [
+                   %{"id" => "choice", "label" => "Choice", "kind" => "value", "value" => nil}
+                 ]
+               })
+             )
+
+    seen_only = Map.put(request, "answer_ui", @seen_answer_ui)
+    assert {"request_needs_answer_controls", _} = typed_error(seen_only)
+
+    seen_with_reply =
+      Map.put(request, "answer_ui", %{
+        "schema" => "attention-client.actions/1",
+        "actions" =>
+          @seen_answer_ui["actions"] ++ [%{"id" => "reply", "label" => "Reply", "kind" => "text"}]
+      })
+
+    assert {"request_has_seen", seen_reason} = typed_error(seen_with_reply)
+    assert seen_reason =~ "remove the action with id \"seen\""
+  end
+
+  test "raw invalid message kinds are dropped with a warning while valid kinds pass unchanged" do
+    valid = Map.put(message(), "message_kind", "success")
+    assert {^valid, []} = Message.normalize_optional_fields(valid, 1, false)
+
+    for invalid <- ["update", nil, 7] do
+      raw = Map.put(message(), "message_kind", invalid)
+
+      assert {normalized, [%{"field" => "message_kind", "reason" => "invalid"}]} =
+               Message.normalize_optional_fields(raw, 1, false)
+
+      refute Map.has_key?(normalized, "message_kind")
+      assert normalized["title"] == raw["title"]
+    end
   end
 
   test "invalid optional fields do not reject or rewrite a message and warnings follow contract order" do
