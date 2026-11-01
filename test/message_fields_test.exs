@@ -29,6 +29,11 @@ defmodule AttentionServer.MessageFieldsTest do
     ]
   }
 
+  @ui1_answer_ui %{
+    "schema" => "attention-client.ui/1",
+    "document" => %{"inputs" => [%{"kind" => "text", "id" => "reply", "label" => "Reply"}]}
+  }
+
   defp message do
     %{
       "sender_id" => "app:test",
@@ -88,10 +93,29 @@ defmodule AttentionServer.MessageFieldsTest do
 
     unsupported =
       request
-      |> Map.put("answer_ui", %{"schema" => "attention-client.ui/1", "document" => %{}})
+      |> Map.put("answer_ui", %{"schema" => "attention-client.forms/2"})
 
     assert {"request_answer_ui_unsupported", unsupported_reason} = typed_error(unsupported)
-    assert unsupported_reason =~ "got schema \"attention-client.ui/1\""
+    assert unsupported_reason =~ "attention-client.actions/1"
+    assert unsupported_reason =~ "attention-client.ui/1"
+    assert unsupported_reason =~ "got schema \"attention-client.forms/2\""
+
+    ui1_request = Map.put(request, "answer_ui", @ui1_answer_ui)
+    assert :ok = Message.validate_typed_message(ui1_request)
+    assert :ok = Message.validate_ui1_controls(ui1_request)
+
+    ui1_without_inputs =
+      Map.put(request, "answer_ui", %{
+        "schema" => "attention-client.ui/1",
+        "document" => %{"inputs" => []}
+      })
+
+    assert :ok = Message.validate_typed_message(ui1_without_inputs)
+
+    assert {:error,
+            {:typed_message, "request_needs_answer_controls",
+             ~s(message_type "request" with attention-client.ui/1 answer_ui needs at least one input in "inputs")}} =
+             Message.validate_ui1_controls(ui1_without_inputs)
 
     empty =
       Map.put(request, "answer_ui", %{"schema" => "attention-client.actions/1", "actions" => []})

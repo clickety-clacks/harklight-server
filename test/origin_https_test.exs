@@ -1721,6 +1721,24 @@ defmodule AttentionServer.OriginHTTPSTest do
              request(c, "a2", %{"v" => 1, "type" => "status", "session_handle" => @handle})
   end
 
+  test "origin HTTPS reports duplicate UI/1 document members as an actionable send error", c do
+    body =
+      ~s|{"v":1,"type":"send","op_id":"#{op(36)}","session_handle":"#{@handle}","message":{"sender_id":"app:test","message_id":"duplicate-ui1-http","created_at":1,"title":"Choose","message_type":"request","answer_ui":{"schema":"attention-client.ui/1","document":{"schema":"attention-client.ui/1","schema":"attention-client.ui/1"}}}}|
+
+    assert {:ok, 200,
+            %{
+              "type" => "error",
+              "code" => "request_answer_ui_invalid",
+              "reason" => reason
+            }} = raw_request(c, "a2", http("POST", "/origin/v1", body))
+
+    assert reason =~ "schema"
+    assert reason =~ "member names must be unique"
+
+    assert {:ok, 200, %{"type" => "ok", "entries" => []}} =
+             request(c, "a2", %{"v" => 1, "type" => "feed", "since" => 0})
+  end
+
   defp op(n), do: "00000000-0000-4000-8000-#{String.pad_leading(Integer.to_string(n), 12, "0")}"
 
   defp relay_request(relay, key, frame) do

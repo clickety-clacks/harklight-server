@@ -1994,20 +1994,33 @@ defmodule AttentionServer.Engine do
 
   def request_line(%__MODULE__{} = engine, key, raw, request_at) when is_integer(request_at) do
     with {:ok, principal} <- principal(engine, key) do
-      {next, frame} =
-        case JSON.decode_line(raw) do
-          {:ok, value} ->
-            swept = sweep_request_defaults(engine, principal.person, value, request_at)
-            handle_frame(swept, Map.put(principal, :request_at, request_at), value)
+      case JSON.decode_line_for_ui1_admission(raw) do
+        {:ok, value} ->
+          request_value(engine, principal, value, request_at)
 
-          {:error, :bad_frame} ->
-            {engine, %{"v" => 1, "type" => "error", "reason" => "bad_frame"}}
-        end
-
-      {next, {:ok, JSON.encode!(frame) <> "\n"}}
+        {:error, :bad_frame} ->
+          {engine,
+           {:ok, JSON.encode!(%{"v" => 1, "type" => "error", "reason" => "bad_frame"}) <> "\n"}}
+      end
     else
       _ -> {engine, {:error, :forbidden}}
     end
+  end
+
+  @doc false
+  def request_frame(%__MODULE__{} = engine, key, value, request_at)
+      when is_integer(request_at) do
+    with {:ok, principal} <- principal(engine, key) do
+      request_value(engine, principal, value, request_at)
+    else
+      _ -> {engine, {:error, :forbidden}}
+    end
+  end
+
+  defp request_value(engine, principal, value, request_at) do
+    swept = sweep_request_defaults(engine, principal.person, value, request_at)
+    {next, frame} = handle_frame(swept, Map.put(principal, :request_at, request_at), value)
+    {next, {:ok, JSON.encode!(frame) <> "\n"}}
   end
 
   @doc "Commits every due open default using the supplied server time."
@@ -3383,19 +3396,25 @@ defmodule AttentionServer.Engine do
           failure("operation_conflict")
 
         :missing ->
-          commit_forward(
-            engine,
-            person,
-            device,
-            op,
-            semantic,
-            message,
-            frame,
-            files,
-            support,
-            accepted_at,
-            field_warnings
-          )
+          case Message.validate_ui1_admission(message, Enum.map(files, & &1["name"])) do
+            :ok ->
+              commit_forward(
+                engine,
+                person,
+                device,
+                op,
+                semantic,
+                message,
+                frame,
+                files,
+                support,
+                accepted_at,
+                field_warnings
+              )
+
+            {:error, {:typed_message, code, reason}} ->
+              failure({:typed_message, code, reason})
+          end
       end
     else
       {:error, {:typed_message, code, reason}} -> failure({:typed_message, code, reason})
@@ -4256,7 +4275,18 @@ defmodule AttentionServer.Engine do
         revised_message = effective_revised_message(record.message, frame["message"])
 
         with :ok <- valid_message(revised_message),
-             :ok <- Message.validate_typed_message(revised_message) do
+             :ok <- Message.validate_typed_message(revised_message),
+             :ok <-
+               if(Map.has_key?(frame["message"], "answer_ui"),
+                 do:
+                   Message.validate_ui1_admission(
+                     revised_message,
+                     record.files_by_revision
+                     |> Map.get(1, [])
+                     |> Enum.map(& &1["name"])
+                   ),
+                 else: :ok
+               ) do
           if record.revision != frame["base_revision"] do
             failure("stale_revision", "base_revision", %{"current_revision" => record.revision})
           else

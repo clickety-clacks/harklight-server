@@ -152,7 +152,7 @@ defmodule AttentionServer.OriginWire do
   defp run(relay, key, %{"type" => type} = request, ref)
        when type in ["send", "reply", "revise", "withdraw", "result"] do
     with {:ok, frame} <- operation_frame(request),
-         {:ok, raw} <- Relay.request_line(relay, key, JSON.encode!(frame) <> "\n"),
+         {:ok, raw} <- dispatch_operation(relay, key, frame),
          {:ok, reply} <- JSON.decode_line(raw) do
       maybe_ref(reply, ref)
     else
@@ -186,6 +186,14 @@ defmodule AttentionServer.OriginWire do
       end
     else
       {:ok, frame}
+    end
+  end
+
+  defp dispatch_operation(relay, key, frame) do
+    if JSON.ui1_duplicate_request?(frame) do
+      Relay.request_frame(relay, key, frame)
+    else
+      Relay.request_line(relay, key, JSON.encode!(frame) <> "\n")
     end
   end
 

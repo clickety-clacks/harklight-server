@@ -1,7 +1,7 @@
 defmodule AttentionServer.JSONTest do
   use ExUnit.Case, async: true
 
-  alias AttentionServer.{JSON, Message}
+  alias AttentionServer.{JSON, Message, UI1}
   alias AttentionServer.JSON.DecimalToken
 
   test "large integers, precise decimals, unknown values and array order survive JSON roundtrip" do
@@ -27,6 +27,26 @@ defmodule AttentionServer.JSONTest do
     assert {:error, :bad_frame} = JSON.decode_line("{}\n" <> :binary.copy("x", 2_097_152))
     assert {:error, :bad_frame} = JSON.decode_line(<<0xFF, ?\n>>)
     assert_raise ArgumentError, fn -> JSON.encode!(%DecimalToken{raw: "1,\"unsafe\":2"}) end
+  end
+
+  test "only duplicate members inside a UI/1 send document reach actionable admission" do
+    raw =
+      ~s|{"v":1,"type":"send","op_id":"00000000-0000-4000-8000-000000000001","message":{"sender_id":"app:test","message_id":"duplicate-ui1","created_at":1,"title":"Choose","message_type":"request","answer_ui":{"schema":"attention-client.ui/1","document":{"schema":"attention-client.ui/1","schema":"attention-client.ui/1"}}}}| <>
+        "\n"
+
+    assert {:error, :bad_frame} = JSON.decode_line(raw)
+    assert {:ok, frame} = JSON.decode_line_for_ui1_admission(raw)
+    assert JSON.ui1_duplicate_request?(frame)
+
+    assert {:error, "schema", reason} =
+             UI1.validate(frame["message"]["answer_ui"]["document"], [])
+
+    assert reason =~ "member names must be unique"
+
+    duplicate_envelope =
+      String.replace(raw, "\"type\":\"send\"", "\"type\":\"send\",\"type\":\"send\"")
+
+    assert {:error, :bad_frame} = JSON.decode_line_for_ui1_admission(duplicate_envelope)
   end
 
   test "a wrapped local-size message fits while the input bound is explicit" do
