@@ -1017,6 +1017,7 @@ defmodule AttentionServer.ConversationAgentCLIFixtureTest do
   end
 
   @tag :reconnect_regression
+  @tag :reconnect
   test "CLI recovers a lost answered-result response without claiming an unknown action applied" do
     root =
       Path.join(
