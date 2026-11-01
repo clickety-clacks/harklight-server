@@ -1287,6 +1287,84 @@ defmodule AttentionServer.OriginHTTPSTest do
     :ssl.close(stream_again)
   end
 
+  test "explicit reconnect attaches when absent and replaces only the owned stream", c do
+    assert {:ok, 200, %{"type" => "ok"}} =
+             request(c, "a2", %{
+               "v" => 1,
+               "type" => "send",
+               "op_id" => op(810),
+               "session_handle" => @handle,
+               "message" => %{
+                 "sender_id" => "app:test",
+                 "message_id" => "reconnect",
+                 "created_at" => 1,
+                 "title" => "Question"
+               }
+             })
+
+    open_stream = fn ->
+      {:ok, stream} = socket(c, "a2")
+
+      :ok =
+        :ssl.send(
+          stream,
+          "GET /origin/v1/stream?session=#{@handle}&reconnect=1 HTTP/1.1\r\nHost: relay.test\r\n\r\n"
+        )
+
+      assert {:ok, initial} = recv_until(stream, "\n\n", <<>>, 20)
+      assert initial =~ "HTTP/1.1 200 OK"
+      assert initial =~ "event: change\ndata: {\"cursor\":1}"
+      stream
+    end
+
+    # No worker exists: the replacement route also performs ordinary attachment.
+    first = open_stream.()
+    stream_key = {c.person, c.origin, @handle}
+    old = :sys.get_state(c.relay).origin_streams[stream_key]
+
+    assert {:ok, 200, %{"type" => "error", "reason" => "already_listening"}} =
+             stream_request(c, "a2", @handle)
+
+    assert {:ok, 200, %{"type" => "error", "reason" => "not_found"}} =
+             raw_request(
+               c,
+               "reader",
+               "GET /origin/v1/stream?session=#{@handle}&reconnect=1 HTTP/1.1\r\nHost: relay.test\r\n\r\n"
+             )
+
+    assert :sys.get_state(c.relay).origin_streams[stream_key].worker == old.worker
+    second = open_stream.()
+    assert {:error, :closed} = :ssl.recv(first, 0, 5_000)
+    replacement = :sys.get_state(c.relay).origin_streams[stream_key]
+    refute replacement.worker == old.worker
+
+    # Both late cleanup paths must leave the new registration intact.
+    :ok = Relay.origin_stream_detach(c.relay, c.origin, @handle, old.worker)
+    send(c.relay, {:DOWN, old.monitor, :process, old.worker, :normal})
+    assert :sys.get_state(c.relay).origin_streams[stream_key] == replacement
+
+    assert %{"type" => "ok", "event_id" => "2"} =
+             relay_request(c.relay, c.reader, %{
+               "type" => "discussion",
+               "op_id" => op(811),
+               "sender_id" => "app:test",
+               "message_id" => "reconnect",
+               "request_revision" => 1,
+               "text" => "Still the same conversation"
+             })
+
+    assert {:ok, _} = recv_until(second, "data: {\"cursor\":2}\n\n", <<>>, 20)
+
+    assert {:ok, 200, %{"entries" => [%{"event_id" => "2", "session_handle" => @handle}]}} =
+             request(c, "a2", %{"v" => 1, "type" => "feed", "since" => 1})
+
+    assert {:ok, 200, %{"availability" => "listening"}} =
+             request(c, "a2", %{"v" => 1, "type" => "status", "session_handle" => @handle})
+
+    :ssl.close(second)
+    assert :ok = await_availability(c, "not_listening", 100)
+  end
+
   test "an origin feed change wakes only that same-person origin identity's streams", c do
     reader_handle = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
     second_origin_handle = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
@@ -1773,3 +1851,4 @@ defmodule AttentionServer.OriginHTTPSTest do
       body
     ]
 end
+
