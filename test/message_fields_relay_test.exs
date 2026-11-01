@@ -1,7 +1,7 @@
 defmodule AttentionServer.MessageFieldsRelayTest do
   use ExUnit.Case, async: false
 
-  alias AttentionServer.{JSON, Placement, Relay}
+  alias AttentionServer.{JSON, OriginWire, Placement, Relay}
 
   @handle "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 
@@ -202,6 +202,289 @@ defmodule AttentionServer.MessageFieldsRelayTest do
     GenServer.stop(relay)
   end
 
+  test "UI/1 image files are checked by delivered name at send admission", %{path: path} do
+    relay = start_relay(path)
+    setup_devices(relay)
+
+    image_document = fn file_name ->
+      %{
+        "schema" => "attention-client.ui/1",
+        "requires" => ["scene/1", "result/1", "illustration/1", "response/1", "image/1"],
+        "illustrations" => [
+          %{
+            "id" => "cover",
+            "label" => "Cover",
+            "width" => 100,
+            "height" => 100,
+            "primitives" => [
+              %{
+                "kind" => "image",
+                "x" => 0,
+                "y" => 0,
+                "width" => 100,
+                "height" => 100,
+                "file" => file_name
+              }
+            ]
+          }
+        ],
+        "inputs" => [
+          %{
+            "kind" => "response",
+            "id" => "cover-choice",
+            "label" => "Choose a cover",
+            "actions" => [
+              %{
+                "id" => "blue",
+                "label" => "Blue cover",
+                "kind" => "value",
+                "value" => "blue",
+                "illustration" => "cover"
+              }
+            ]
+          }
+        ],
+        "open" => %{"kind" => "input", "id" => "cover-choice", "layout" => "cards"},
+        "resolved" => %{"kind" => "text", "text" => "Recorded", "style" => "body"},
+        "submission" => %{
+          "label" => "Send answer",
+          "result" => %{"kind" => "input", "id" => "cover-choice"}
+        }
+      }
+    end
+
+    attached_file = %{"name" => "cover.png", "data_base64" => Base.encode64("not image bytes")}
+
+    invalid_message = %{
+      "sender_id" => "app:test",
+      "message_id" => "image-choice",
+      "created_at" => 1,
+      "title" => "Choose a cover",
+      "message_type" => "request",
+      "answer_ui" => %{
+        "schema" => "attention-client.ui/1",
+        "document" => image_document.("missing.png")
+      }
+    }
+
+    assert %{
+             "type" => "error",
+             "code" => "request_answer_ui_invalid",
+             "reason" => reason
+           } =
+             request(relay, "origin", %{
+               "type" => "forward",
+               "op_id" => op(30),
+               "session_handle" => @handle,
+               "message" => invalid_message,
+               "files" => [attached_file]
+             })
+
+    assert reason =~ "illustrations[0].primitives[0].file"
+    assert reason =~ "missing.png"
+    assert reason =~ "cover.png"
+    assert {:ok, [], 0} = Relay.events(relay, "reader", 0)
+
+    valid_message =
+      put_in(invalid_message, ["answer_ui", "document"], image_document.("cover.png"))
+
+    assert %{"type" => "ok"} =
+             request(relay, "origin", %{
+               "type" => "forward",
+               "op_id" => op(30),
+               "session_handle" => @handle,
+               "message" => valid_message,
+               "files" => [attached_file]
+             })
+
+    assert {:ok, [delivery], 1} = Relay.events(relay, "reader", 0)
+    assert delivery["message"] == valid_message
+    GenServer.stop(relay)
+  end
+
+  test "duplicate UI/1 members get the actionable refusal on the origin send route", %{
+    path: path
+  } do
+    relay = start_relay(path)
+    setup_devices(relay)
+
+    raw =
+      ~s|{"v":1,"type":"send","op_id":"#{op(31)}","message":{"sender_id":"app:test","message_id":"duplicate-ui1","created_at":1,"title":"Choose","message_type":"request","answer_ui":{"schema":"attention-client.ui/1","document":{"schema":"attention-client.ui/1","schema":"attention-client.ui/1"}}}}| <>
+        "\n"
+
+    assert {:error, :bad_frame} = JSON.decode_line(raw)
+    assert {:ok, request} = JSON.decode_line_for_ui1_admission(raw)
+
+    assert %{
+             "type" => "error",
+             "code" => "request_answer_ui_invalid",
+             "reason" => reason
+           } = OriginWire.command(relay, "origin", request)
+
+    assert reason =~ "schema"
+    assert reason =~ "member names must be unique"
+    assert {:ok, %{"entries" => []}} = Relay.origin_feed(relay, "origin", 0)
+    GenServer.stop(relay)
+  end
+
+  test "untyped UI/1 send checks the server-reencoded document at the size boundary", %{
+    path: path
+  } do
+    relay = start_relay(path)
+    setup_devices(relay)
+
+    document = %{
+      "schema" => "attention-client.ui/1",
+      "requires" => ["scene/1", "result/1", "illustration/1"],
+      "illustrations" => [
+        %{
+          "id" => "poster",
+          "label" => "Poster",
+          "width" => 100,
+          "height" => 100,
+          "primitives" => [
+            %{
+              "kind" => "rect",
+              "x" => 0,
+              "y" => 0,
+              "width" => 100,
+              "height" => 100,
+              "fill" => "#FFFFFF"
+            }
+          ]
+        }
+      ],
+      "inputs" => [],
+      "open" => %{"kind" => "illustration", "id" => "poster"},
+      "resolved" => %{"kind" => "text", "text" => "Done", "style" => "body"},
+      "submission" => %{
+        "label" => "Send",
+        "result" => %{"kind" => "literal", "value" => true}
+      }
+    }
+
+    base_size = byte_size(JSON.encode!(document))
+    padding = 65_536 - base_size
+    document = put_in(document, ["resolved", "text"], String.duplicate("x", 4 + padding))
+    delivered_json = JSON.encode!(document)
+    sent_json = String.replace(delivered_json, "\"x\":0", "\"x\":-0", global: false)
+
+    assert byte_size(delivered_json) == 65_536
+    assert byte_size(sent_json) == 65_537
+
+    raw =
+      ~s|{"v":1,"type":"forward","op_id":"#{op(35)}","message":{"sender_id":"app:test","message_id":"minus-zero-boundary","created_at":1,"title":"Poster","answer_ui":{"schema":"attention-client.ui/1","document":| <>
+        sent_json <>
+        "}}}\n"
+
+    assert {:ok, response} = Relay.request_line(relay, "origin", raw)
+    assert {:ok, %{"type" => "ok"}} = JSON.decode_line(response)
+    assert {:ok, [delivery], 1} = Relay.events(relay, "reader", 0)
+    delivered_document = delivery["message"]["answer_ui"]["document"]
+    assert byte_size(JSON.encode!(delivered_document)) == 65_536
+    assert :ok = AttentionServer.UI1.validate(delivered_document, [])
+    GenServer.stop(relay)
+  end
+
+  test "UI/1 request controls and invalid replacements are refused before storage", %{
+    path: path
+  } do
+    relay = start_relay(path)
+    setup_devices(relay)
+
+    no_inputs = %{
+      "schema" => "attention-client.ui/1",
+      "requires" => ["scene/1", "result/1"],
+      "illustrations" => [],
+      "inputs" => [],
+      "open" => %{"kind" => "text", "text" => "Open", "style" => "body"},
+      "resolved" => %{"kind" => "text", "text" => "Done", "style" => "body"},
+      "submission" => %{"label" => "Send", "result" => %{"kind" => "literal", "value" => true}}
+    }
+
+    no_input_message = %{
+      "sender_id" => "app:test",
+      "message_id" => "ui1-no-inputs",
+      "created_at" => 1,
+      "title" => "No inputs",
+      "message_type" => "request",
+      "answer_ui" => %{"schema" => "attention-client.ui/1", "document" => no_inputs}
+    }
+
+    assert %{
+             "type" => "error",
+             "code" => "request_needs_answer_controls",
+             "reason" => reason
+           } =
+             request(relay, "origin", %{
+               "type" => "forward",
+               "op_id" => op(32),
+               "session_handle" => @handle,
+               "message" => no_input_message
+             })
+
+    assert reason =~ "attention-client.ui/1"
+    assert reason =~ "at least one input"
+    assert {:ok, [], 0} = Relay.events(relay, "reader", 0)
+    assert {:ok, %{"entries" => []}} = Relay.origin_feed(relay, "origin", 0)
+
+    valid_document = %{
+      "schema" => "attention-client.ui/1",
+      "requires" => ["scene/1", "result/1", "text/1"],
+      "illustrations" => [],
+      "inputs" => [%{"kind" => "text", "id" => "reply", "label" => "Reply"}],
+      "open" => %{"kind" => "input", "id" => "reply", "layout" => "editor"},
+      "resolved" => %{"kind" => "text", "text" => "Done", "style" => "body"},
+      "submission" => %{
+        "label" => "Send",
+        "result" => %{"kind" => "input", "id" => "reply"}
+      }
+    }
+
+    valid_message = %{
+      "sender_id" => "app:test",
+      "message_id" => "ui1-invalid-revision",
+      "created_at" => 2,
+      "title" => "Valid UI/1",
+      "message_type" => "request",
+      "answer_ui" => %{"schema" => "attention-client.ui/1", "document" => valid_document}
+    }
+
+    assert %{"type" => "ok", "seq" => 1} =
+             request(relay, "origin", %{
+               "type" => "forward",
+               "op_id" => op(33),
+               "session_handle" => @handle,
+               "message" => valid_message
+             })
+
+    invalid_replacement =
+      put_in(valid_message, ["answer_ui", "document", "requires"], ["scene/1"])
+
+    assert %{
+             "type" => "error",
+             "code" => "request_answer_ui_invalid",
+             "reason" => reason
+           } =
+             request(relay, "origin", %{
+               "type" => "conversation_revise",
+               "op_id" => op(34),
+               "sender_id" => "app:test",
+               "message_id" => "ui1-invalid-revision",
+               "base_revision" => 1,
+               "message" => invalid_replacement
+             })
+
+    assert reason =~ "requires"
+
+    assert {:ok, %{"entries" => [entry]}} = Relay.origin_feed(relay, "origin", 0)
+    assert entry["message"] == valid_message
+    assert {:ok, [delivery], 1} = Relay.events(relay, "reader", 0)
+    assert delivery["message"] == valid_message
+
+    GenServer.stop(relay)
+  end
+
   test "typed revision carries omitted type and controls and refuses an invalid replacement atomically",
        %{
          path: path
@@ -289,6 +572,72 @@ defmodule AttentionServer.MessageFieldsRelayTest do
     assert revision_entry["message"]["message_type"] == "request"
     assert revision_entry["message"]["answer_ui"] == answer_ui
     assert revision_entry["message"]["title"] == "Revised request"
+
+    GenServer.stop(relay)
+  end
+
+  test "a revise adding request type validates controls from the stored UI/1 document", %{
+    path: path
+  } do
+    relay = start_relay(path)
+    setup_devices(relay)
+
+    document = %{
+      "schema" => "attention-client.ui/1",
+      "requires" => ["scene/1", "result/1"],
+      "illustrations" => [],
+      "inputs" => [],
+      "open" => %{"kind" => "text", "text" => "Open", "style" => "body"},
+      "resolved" => %{"kind" => "text", "text" => "Done", "style" => "body"},
+      "submission" => %{
+        "label" => "Send",
+        "result" => %{"kind" => "literal", "value" => true}
+      }
+    }
+
+    original = %{
+      "sender_id" => "app:test",
+      "message_id" => "ui1-controls-on-revise",
+      "created_at" => 1,
+      "title" => "Untyped UI/1",
+      "answer_ui" => %{"schema" => "attention-client.ui/1", "document" => document}
+    }
+
+    assert %{"type" => "ok", "seq" => 1} =
+             request(relay, "origin", %{
+               "type" => "forward",
+               "op_id" => op(35),
+               "session_handle" => @handle,
+               "message" => original
+             })
+
+    assert %{
+             "type" => "error",
+             "code" => "request_needs_answer_controls",
+             "reason" => reason
+           } =
+             request(relay, "origin", %{
+               "type" => "conversation_revise",
+               "op_id" => op(36),
+               "sender_id" => "app:test",
+               "message_id" => "ui1-controls-on-revise",
+               "base_revision" => 1,
+               "message" => %{
+                 "sender_id" => "app:test",
+                 "message_id" => "ui1-controls-on-revise",
+                 "created_at" => 2,
+                 "title" => "Typed request without controls",
+                 "message_type" => "request"
+               }
+             })
+
+    assert reason =~ "attention-client.ui/1"
+    assert reason =~ "at least one input"
+
+    assert {:ok, %{"entries" => [entry]}} = Relay.origin_feed(relay, "origin", 0)
+    assert entry["message"] == original
+    assert {:ok, [delivery], 1} = Relay.events(relay, "reader", 0)
+    assert delivery["message"] == original
 
     GenServer.stop(relay)
   end

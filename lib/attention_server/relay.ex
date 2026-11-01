@@ -438,6 +438,10 @@ defmodule AttentionServer.Relay do
     do: GenServer.call(server, {:request_line, verified_key, line})
 
   @doc false
+  def request_frame(server, verified_key, frame),
+    do: GenServer.call(server, {:request_frame, verified_key, frame})
+
+  @doc false
   def claim_push(server, now_ms), do: GenServer.call(server, {:claim_push, now_ms}, 15_000)
 
   @doc false
@@ -782,6 +786,24 @@ defmodule AttentionServer.Relay do
   def handle_call({:request_line, key, raw}, _from, state) do
     {reply, next} = request(state, key, raw)
     {:reply, reply, next}
+  end
+
+  def handle_call({:request_frame, key, frame}, _from, state) do
+    case Engine.authorized_person(state.store.engine, key) do
+      {:ok, _person} when is_map(frame) ->
+        if JSON.ui1_duplicate_request?(frame) do
+          {reply, next} = perform_request_frame(state, key, frame)
+          {:reply, reply, next}
+        else
+          {:reply, {:ok, error_line(frame, "bad_frame")}, state}
+        end
+
+      {:ok, _person} ->
+        {:reply, {:ok, error_line(%{}, "bad_frame")}, state}
+
+      _ ->
+        {:reply, {:error, :forbidden}, state}
+    end
   end
 
   def handle_call(:enable_push, _from, state),
@@ -3643,6 +3665,37 @@ defmodule AttentionServer.Relay do
           []
       end
 
+    finish_request(
+      state,
+      key,
+      next_engine,
+      reply,
+      operation_id,
+      targets,
+      request_action(raw),
+      raw
+    )
+  end
+
+  defp perform_request_frame(state, key, frame) do
+    {next_engine, reply} = Engine.request_frame(state.store.engine, key, frame, state.clock.())
+    next_engine = with_initial_origin_availability(state, key, next_engine)
+    operation_id = Diagnostics.operation_id(frame)
+    targets = origin_feed_targets(state.store.engine, next_engine, key, frame)
+
+    finish_request(
+      state,
+      key,
+      next_engine,
+      reply,
+      operation_id,
+      targets,
+      frame["type"] || "relay_request",
+      frame
+    )
+  end
+
+  defp finish_request(state, key, next_engine, reply, operation_id, targets, action, original) do
     if next_engine == state.store.engine do
       {reply, state}
     else
@@ -3650,7 +3703,7 @@ defmodule AttentionServer.Relay do
              state.store,
              next_engine,
              Map.put(
-               audit(state.store.engine, key, request_action(raw)),
+               audit(state.store.engine, key, action),
                :operation_id,
                operation_id
              )
@@ -3678,7 +3731,7 @@ defmodule AttentionServer.Relay do
           {reply, next_state}
 
         {:error, _, _} ->
-          {{:ok, error_line(raw, "storage_unavailable")}, state}
+          {{:ok, error_line(original, "storage_unavailable")}, state}
       end
     end
   end

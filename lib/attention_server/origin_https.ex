@@ -768,7 +768,7 @@ defmodule AttentionServer.OriginHTTPS do
         {:post, size} ->
           with {:ok, body} <- read_body(socket, remainder, size),
                true <- String.valid?(body),
-               {:ok, request} <- JSON.decode_line(body <> "\n", @max_body + 1),
+               {:ok, request} <- JSON.decode_line_for_ui1_admission(body <> "\n", @max_body + 1),
                true <- is_map(request) and not is_struct(request) do
             {:ok, {:post, request}}
           else

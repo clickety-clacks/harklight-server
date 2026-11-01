@@ -19,7 +19,9 @@ defmodule AttentionServer.Message do
     ]
   }
   @actions_schema "attention-client.actions/1"
+  @ui_schema "attention-client.ui/1"
   @request_needs_controls_reason ~s(message_type "request" needs at least one choice or a reply action in answer_ui; add a "value" choice or {"id":"reply","label":"Reply","kind":"text"}, or set message_type "fyi" with the Seen descriptor)
+  @request_needs_ui1_controls_reason ~s(message_type "request" with attention-client.ui/1 answer_ui needs at least one input in "inputs")
   @request_has_seen_reason ~s(message_type "request" cannot carry the Seen action: remove the action with id "seen", or send as message_type "fyi" with only the Seen descriptor)
 
   def sender_id?(value) when is_binary(value) do
@@ -135,6 +137,11 @@ defmodule AttentionServer.Message do
       not plain_object?(answer_ui) ->
         request_unsupported_schema(answer_ui)
 
+      Map.get(answer_ui, "schema") == @ui_schema ->
+        # UI/1's grammar and file references are checked by the single send-time
+        # admission path after duplicate receipt handling.
+        :ok
+
       Map.get(answer_ui, "schema") != @actions_schema ->
         request_unsupported_schema(answer_ui)
 
@@ -145,6 +152,53 @@ defmodule AttentionServer.Message do
         validate_request_actions(answer_ui)
     end
   end
+
+  @doc false
+  def validate_ui1_controls(message) when is_map(message) and not is_struct(message) do
+    case {Map.get(message, "message_type"), Map.get(message, "answer_ui")} do
+      {"request", %{"schema" => @ui_schema, "document" => document}}
+      when is_map(document) and not is_struct(document) ->
+        case Map.get(document, "inputs") do
+          inputs when is_list(inputs) and inputs != [] ->
+            :ok
+
+          _ ->
+            {:error,
+             typed_error("request_needs_answer_controls", @request_needs_ui1_controls_reason)}
+        end
+
+      _ ->
+        :ok
+    end
+  end
+
+  def validate_ui1_controls(_), do: :ok
+
+  @doc false
+  def validate_ui1_admission(message, delivered_file_names)
+      when is_map(message) and not is_struct(message) and is_list(delivered_file_names) do
+    case get_in(message, ["answer_ui", "schema"]) do
+      @ui_schema ->
+        document = get_in(message, ["answer_ui", "document"])
+
+        case AttentionServer.UI1.validate(document, delivered_file_names) do
+          :ok ->
+            validate_ui1_controls(message)
+
+          {:error, path, reason} ->
+            {:error,
+             typed_error(
+               "request_answer_ui_invalid",
+               "answer_ui (#{@ui_schema}) at #{path}: #{reason}"
+             )}
+        end
+
+      _ ->
+        :ok
+    end
+  end
+
+  def validate_ui1_admission(_message, _delivered_file_names), do: :ok
 
   defp request_unsupported_schema(answer_ui) do
     schema =
@@ -161,7 +215,7 @@ defmodule AttentionServer.Message do
     {:error,
      typed_error(
        "request_answer_ui_unsupported",
-       ~s(message_type "request" supports answer_ui schema "#{@actions_schema}" with at least one choice or reply action; #{schema})
+       ~s(message_type "request" supports answer_ui schema "#{@actions_schema}" or "#{@ui_schema}"; #{schema})
      )}
   end
 
