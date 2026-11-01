@@ -2882,8 +2882,14 @@ defmodule AttentionServer.Engine do
 
       true ->
         case dispatch(engine, principal, frame) do
-          {:ok, next, fields} -> {next, Map.merge(base("ok", ref), fields)}
-          {:error, reason, field, terminal} -> {engine, error(reason, ref, field, terminal)}
+          {:ok, next, fields} ->
+            {next, Map.merge(base("ok", ref), fields)}
+
+          {:error, {:typed_message, code, reason}, field, terminal} ->
+            {engine, error(reason, ref, field, terminal) |> Map.put("code", code)}
+
+          {:error, reason, field, terminal} ->
+            {engine, error(reason, ref, field, terminal)}
         end
     end
   end
@@ -3345,7 +3351,9 @@ defmodule AttentionServer.Engine do
   defp forward(engine, %{person: person, key: device} = principal, frame) do
     original_message = Map.get(frame, "message")
 
-    with :ok <- valid_message(original_message),
+    with :ok <- Message.validate_present_message_type(original_message),
+         :ok <- valid_message(original_message),
+         :ok <- Message.validate_typed_message(original_message),
          :ok <- valid_op(frame),
          :ok <- valid_conversation_send_fields(frame),
          {:ok, support} <- Conversation.support_from_frame(frame),
@@ -3390,6 +3398,7 @@ defmodule AttentionServer.Engine do
           )
       end
     else
+      {:error, {:typed_message, code, reason}} -> failure({:typed_message, code, reason})
       {:error, field} -> failure("invalid_field", field)
       false -> failure("sender_not_authorized")
     end
@@ -4199,9 +4208,10 @@ defmodule AttentionServer.Engine do
   defp valid_conversation_text(_), do: {:error, "text"}
 
   defp conversation_revise(engine, %{person: person, key: actor} = principal, frame) do
-    with :ok <- valid_op(frame),
+    with :ok <- Message.validate_present_message_type(frame["message"]),
+         :ok <- valid_op(frame),
          :ok <- valid_global_id(frame),
-         :ok <- valid_message(frame["message"]),
+         :ok <- valid_revision_message(engine, person, frame["message"]),
          {:ok, files} <- ConversationFiles.normalize(frame, engine, person, actor),
          true <- is_integer(frame["base_revision"]) and frame["base_revision"] > 0,
          true <-
@@ -4231,6 +4241,7 @@ defmodule AttentionServer.Engine do
           )
       end
     else
+      {:error, {:typed_message, code, reason}} -> failure({:typed_message, code, reason})
       {:error, field} -> failure("invalid_field", field)
       false -> failure("invalid_field", "base_revision")
     end
@@ -4242,83 +4253,97 @@ defmodule AttentionServer.Engine do
     case Map.get(engine.messages, key) do
       %{origin: ^actor, session_handle: handle, terminal: nil} = record
       when is_binary(handle) ->
-        if record.revision != frame["base_revision"] do
-          failure("stale_revision", "base_revision", %{"current_revision" => record.revision})
-        else
-          with {:ok, acted} <- maybe_act_person_entry(engine, person, actor, key, frame) do
-            {next, seq} = next_conversation_seq(acted, person)
-            revision = record.revision + 1
-            revisions = Map.get(record, :revisions, %{1 => record.message})
+        revised_message = effective_revised_message(record.message, frame["message"])
 
-            {message, field_warnings} =
-              Message.normalize_optional_fields(frame["message"], accepted_at)
-
-            updated =
-              Map.merge(record, %{
-                message: message,
-                revision: revision,
-                revisions: Map.put(revisions, revision, message),
-                revision_accepted_at: accepted_at,
-                field_warnings: field_warnings,
-                files_by_revision:
-                  Map.put(Map.get(record, :files_by_revision, %{}), revision, files)
-              })
-
-            entry =
-              %{
-                "kind" => "revision",
-                "author" => "origin",
-                "sender_id" => frame["sender_id"],
-                "message_id" => frame["message_id"],
-                "session_handle" => handle,
-                "request_revision" => revision,
-                "op_id" => frame["op_id"],
-                "message" => message
-              }
-              |> then(fn entry ->
-                if is_integer(frame["in_reply_to"]),
-                  do: Map.put(entry, "in_reply_to", Integer.to_string(frame["in_reply_to"])),
-                  else: entry
-              end)
-              |> ConversationFiles.put_entry(files)
-
-            {next, feed_entry} = Conversation.append_entry(next, person, actor, entry)
-
-            fields =
-              %{"seq" => seq, "event_id" => feed_entry["event_id"], "revision" => revision}
-              |> put_field_warnings(field_warnings)
-
-            next =
-              next
-              |> put_message(key, updated)
-              |> put_conversation_event(person, seq, key, feed_entry)
-              |> queue_conversation_hint(person, seq)
-              |> save_receipt(person, actor, frame["op_id"], semantic, fields)
-
-            next =
-              if is_integer(frame["in_reply_to"]) do
-                acted_turn = engine.origin_feeds[{person, actor}].entries[frame["in_reply_to"]]
-
-                {state, _acted_seq} =
-                  append_acted_fact(
-                    next,
-                    person,
-                    key,
-                    acted_turn["event_id"],
-                    feed_entry["event_id"],
-                    revision,
-                    handle
-                  )
-
-                state
-              else
-                next
-              end
-
-            {:ok, next, fields}
+        with :ok <- valid_message(revised_message),
+             :ok <- Message.validate_typed_message(revised_message) do
+          if record.revision != frame["base_revision"] do
+            failure("stale_revision", "base_revision", %{"current_revision" => record.revision})
           else
-            {:error, reason} -> failure(Atom.to_string(reason))
+            case maybe_act_person_entry(engine, person, actor, key, frame) do
+              {:ok, acted} ->
+                {next, seq} = next_conversation_seq(acted, person)
+                revision = record.revision + 1
+                revisions = Map.get(record, :revisions, %{1 => record.message})
+
+                {message, field_warnings} =
+                  Message.normalize_optional_fields(revised_message, accepted_at)
+
+                updated =
+                  Map.merge(record, %{
+                    message: message,
+                    revision: revision,
+                    revisions: Map.put(revisions, revision, message),
+                    revision_accepted_at: accepted_at,
+                    field_warnings: field_warnings,
+                    files_by_revision:
+                      Map.put(Map.get(record, :files_by_revision, %{}), revision, files)
+                  })
+
+                entry =
+                  %{
+                    "kind" => "revision",
+                    "author" => "origin",
+                    "sender_id" => frame["sender_id"],
+                    "message_id" => frame["message_id"],
+                    "session_handle" => handle,
+                    "request_revision" => revision,
+                    "op_id" => frame["op_id"],
+                    "message" => message
+                  }
+                  |> then(fn entry ->
+                    if is_integer(frame["in_reply_to"]),
+                      do: Map.put(entry, "in_reply_to", Integer.to_string(frame["in_reply_to"])),
+                      else: entry
+                  end)
+                  |> ConversationFiles.put_entry(files)
+
+                {next, feed_entry} = Conversation.append_entry(next, person, actor, entry)
+
+                fields =
+                  %{"seq" => seq, "event_id" => feed_entry["event_id"], "revision" => revision}
+                  |> put_field_warnings(field_warnings)
+
+                next =
+                  next
+                  |> put_message(key, updated)
+                  |> put_conversation_event(person, seq, key, feed_entry)
+                  |> queue_conversation_hint(person, seq)
+                  |> save_receipt(person, actor, frame["op_id"], semantic, fields)
+
+                next =
+                  if is_integer(frame["in_reply_to"]) do
+                    acted_turn =
+                      engine.origin_feeds[{person, actor}].entries[frame["in_reply_to"]]
+
+                    {state, _acted_seq} =
+                      append_acted_fact(
+                        next,
+                        person,
+                        key,
+                        acted_turn["event_id"],
+                        feed_entry["event_id"],
+                        revision,
+                        handle
+                      )
+
+                    state
+                  else
+                    next
+                  end
+
+                {:ok, next, fields}
+
+              {:error, reason} ->
+                failure(Atom.to_string(reason))
+            end
           end
+        else
+          {:error, {:typed_message, code, reason}} ->
+            failure({:typed_message, code, reason})
+
+          {:error, field} ->
+            failure("invalid_field", field)
         end
 
       %{terminal: terminal} when not is_nil(terminal) ->
@@ -4331,6 +4356,44 @@ defmodule AttentionServer.Engine do
         failure("not_found")
     end
   end
+
+  defp effective_revised_message(stored, revised) do
+    revised =
+      if not Map.has_key?(revised, "message_type") and Map.has_key?(stored, "message_type"),
+        do: Map.put(revised, "message_type", stored["message_type"]),
+        else: revised
+
+    if Map.has_key?(revised, "message_type") and not Map.has_key?(revised, "answer_ui") and
+         Map.has_key?(stored, "answer_ui"),
+       do: Map.put(revised, "answer_ui", stored["answer_ui"]),
+       else: revised
+  end
+
+  defp valid_revision_message(engine, person, message)
+       when is_map(message) and not is_struct(message) do
+    key = {person, Map.get(message, "sender_id"), Map.get(message, "message_id")}
+
+    case Map.get(engine.messages, key) do
+      %{message: stored} when is_map(stored) ->
+        if Map.has_key?(message, "message_type") or Map.has_key?(stored, "message_type") do
+          with :ok <- Message.validate_revision_base(message),
+               revised <- effective_revised_message(stored, message),
+               :ok <- Message.validate_typed_message(revised) do
+            :ok
+          end
+        else
+          valid_message(message)
+        end
+
+      _ ->
+        with :ok <- valid_message(message),
+             :ok <- Message.validate_typed_message(message) do
+          :ok
+        end
+    end
+  end
+
+  defp valid_revision_message(_engine, _person, message), do: valid_message(message)
 
   defp maybe_act_person_entry(engine, _person, _origin, _key, %{"in_reply_to" => nil}),
     do: {:ok, engine}

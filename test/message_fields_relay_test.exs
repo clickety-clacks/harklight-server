@@ -103,6 +103,304 @@ defmodule AttentionServer.MessageFieldsRelayTest do
     GenServer.stop(relay)
   end
 
+  test "typed sends are stored and delivered, with coded refusals and raw kind warnings", %{
+    path: path
+  } do
+    relay = start_relay(path)
+    setup_devices(relay)
+
+    answer_ui = %{
+      "schema" => "attention-client.actions/1",
+      "actions" => [
+        %{"id" => "hold", "label" => "Hold", "kind" => "value", "value" => "hold"},
+        %{"id" => "reply", "label" => "Reply", "kind" => "text"}
+      ]
+    }
+
+    typed = %{
+      "sender_id" => "app:test",
+      "message_id" => "typed-request",
+      "created_at" => 1,
+      "title" => "Choose",
+      "answer_ui" => answer_ui,
+      "message_type" => "request",
+      "message_kind" => "blocker"
+    }
+
+    assert %{"type" => "ok"} =
+             request(relay, "origin", %{
+               "type" => "forward",
+               "op_id" => op(20),
+               "session_handle" => @handle,
+               "message" => typed
+             })
+
+    assert {:ok, [delivery], 1} = Relay.events(relay, "reader", 0)
+    assert delivery["message"] == typed
+
+    assert {:ok, %{"entries" => [feed_entry]}} = Relay.origin_feed(relay, "origin", 0)
+    assert feed_entry["message"] == typed
+
+    invalid_type = Map.put(%{typed | "message_id" => "bad-type"}, "message_type", "notice")
+
+    assert %{
+             "type" => "error",
+             "code" => "message_type_invalid",
+             "reason" => ~s(message_type must be "fyi" or "request"; got "notice")
+           } =
+             request(relay, "origin", %{
+               "type" => "forward",
+               "op_id" => op(21),
+               "message" => invalid_type
+             })
+
+    invalid_controls =
+      typed
+      |> Map.put("message_id", "bad-controls")
+      |> Map.put("message_type", "fyi")
+
+    assert %{
+             "type" => "error",
+             "code" => "fyi_has_answer_controls",
+             "reason" => reason
+           } =
+             request(relay, "origin", %{
+               "type" => "forward",
+               "op_id" => op(22),
+               "message" => invalid_controls
+             })
+
+    assert reason =~ "Seen descriptor"
+
+    invalid_kind =
+      typed
+      |> Map.put("message_id", "bad-kind")
+      |> Map.put("message_kind", "update")
+
+    assert %{
+             "type" => "ok",
+             "field_warnings" => [%{"field" => "message_kind", "reason" => "invalid"}]
+           } =
+             request(relay, "origin", %{
+               "type" => "forward",
+               "op_id" => op(23),
+               "session_handle" => @handle,
+               "message" => invalid_kind
+             })
+
+    assert {:ok, events, 2} = Relay.events(relay, "reader", 1)
+    dropped_kind_delivery = Enum.find(events, &(&1["message"]["message_id"] == "bad-kind"))
+    refute Map.has_key?(dropped_kind_delivery["message"], "message_kind")
+
+    assert {:ok, %{"entries" => entries}} = Relay.origin_feed(relay, "origin", 0)
+
+    assert Enum.map(entries, &get_in(&1, ["message", "message_id"])) == [
+             "typed-request",
+             "bad-kind"
+           ]
+
+    GenServer.stop(relay)
+  end
+
+  test "typed revision carries omitted type and controls and refuses an invalid replacement atomically",
+       %{
+         path: path
+       } do
+    relay = start_relay(path)
+    setup_devices(relay)
+
+    answer_ui = %{
+      "schema" => "attention-client.actions/1",
+      "actions" => [%{"id" => "reply", "label" => "Reply", "kind" => "text"}]
+    }
+
+    original = %{
+      "sender_id" => "app:test",
+      "message_id" => "typed-revision",
+      "created_at" => 1,
+      "title" => "Original request",
+      "answer_ui" => answer_ui,
+      "message_type" => "request"
+    }
+
+    assert %{"type" => "ok"} =
+             request(relay, "origin", %{
+               "type" => "forward",
+               "op_id" => op(24),
+               "session_handle" => @handle,
+               "message" => original
+             })
+
+    revision = %{
+      "sender_id" => "app:test",
+      "message_id" => "typed-revision",
+      "created_at" => 2,
+      "title" => "Revised request"
+    }
+
+    assert %{"type" => "ok", "revision" => 2} =
+             request(relay, "origin", %{
+               "type" => "conversation_revise",
+               "op_id" => op(25),
+               "sender_id" => "app:test",
+               "message_id" => "typed-revision",
+               "base_revision" => 1,
+               "message" => revision
+             })
+
+    assert %{
+             "type" => "error",
+             "code" => "fyi_has_answer_controls",
+             "reason" => reason
+           } =
+             request(relay, "origin", %{
+               "type" => "conversation_revise",
+               "op_id" => op(26),
+               "sender_id" => "app:test",
+               "message_id" => "typed-revision",
+               "base_revision" => 2,
+               "message" =>
+                 revision
+                 |> Map.put("created_at", 3)
+                 |> Map.put("title", "Invalid FYI")
+                 |> Map.put("message_type", "fyi")
+                 |> Map.put("answer_ui", answer_ui)
+             })
+
+    assert reason =~ "Seen descriptor"
+
+    assert %{
+             "type" => "error",
+             "code" => "message_type_invalid",
+             "reason" => ~s(message_type must be "fyi" or "request"; got "notice")
+           } =
+             request(relay, "origin", %{
+               "type" => "conversation_revise",
+               "op_id" => op(27),
+               "sender_id" => "app:test",
+               "message_id" => "typed-revision",
+               "base_revision" => 2,
+               "message" => revision |> Map.put("message_type", "notice")
+             })
+
+    assert {:ok, %{"entries" => [_original_entry, revision_entry]}} =
+             Relay.origin_feed(relay, "origin", 0)
+
+    assert revision_entry["message"]["message_type"] == "request"
+    assert revision_entry["message"]["answer_ui"] == answer_ui
+    assert revision_entry["message"]["title"] == "Revised request"
+
+    GenServer.stop(relay)
+  end
+
+  test "an invalid type on a revise leaves a stored untyped message unchanged", %{path: path} do
+    relay = start_relay(path)
+    setup_devices(relay)
+
+    original = %{
+      "sender_id" => "app:test",
+      "message_id" => "untyped-revision",
+      "created_at" => 1,
+      "title" => "Legacy request",
+      "answer_ui" => %{"kind" => "choice", "items" => ["yes", "no"]}
+    }
+
+    assert %{"type" => "ok", "seq" => 1} =
+             request(relay, "origin", %{
+               "type" => "forward",
+               "op_id" => op(28),
+               "session_handle" => @handle,
+               "message" => original
+             })
+
+    assert %{
+             "type" => "error",
+             "code" => "message_type_invalid",
+             "reason" => ~s(message_type must be "fyi" or "request"; got "notice")
+           } =
+             request(relay, "origin", %{
+               "type" => "conversation_revise",
+               "op_id" => op(29),
+               "sender_id" => "app:test",
+               "message_id" => "untyped-revision",
+               "base_revision" => 1,
+               "message" => Map.put(original, "message_type", "notice")
+             })
+
+    assert {:ok, %{"entries" => [entry]}} = Relay.origin_feed(relay, "origin", 0)
+    assert entry["message"] == original
+    refute Map.has_key?(entry["message"], "message_type")
+
+    assert {:ok, [delivery], 1} = Relay.events(relay, "reader", 0)
+    assert delivery["message"] == original
+
+    GenServer.stop(relay)
+  end
+
+  test "a typed revision can change the effective message type with matching controls", %{
+    path: path
+  } do
+    relay = start_relay(path)
+    setup_devices(relay)
+
+    seen = %{
+      "schema" => "attention-client.actions/1",
+      "actions" => [
+        %{
+          "id" => "seen",
+          "label" => "Seen",
+          "kind" => "value",
+          "value" => %{"acknowledgment" => "seen"}
+        }
+      ]
+    }
+
+    original = %{
+      "sender_id" => "app:test",
+      "message_id" => "typed-type-change",
+      "created_at" => 1,
+      "title" => "Notice",
+      "answer_ui" => seen,
+      "message_type" => "fyi"
+    }
+
+    assert %{"type" => "ok", "seq" => 1} =
+             request(relay, "origin", %{
+               "type" => "forward",
+               "op_id" => op(30),
+               "session_handle" => @handle,
+               "message" => original
+             })
+
+    revised =
+      original
+      |> Map.put("created_at", 2)
+      |> Map.put("title", "Question")
+      |> Map.put("message_type", "request")
+      |> Map.put("answer_ui", %{
+        "schema" => "attention-client.actions/1",
+        "actions" => [%{"id" => "reply", "label" => "Reply", "kind" => "text"}]
+      })
+
+    assert %{"type" => "ok", "revision" => 2} =
+             request(relay, "origin", %{
+               "type" => "conversation_revise",
+               "op_id" => op(31),
+               "sender_id" => "app:test",
+               "message_id" => "typed-type-change",
+               "base_revision" => 1,
+               "message" => revised
+             })
+
+    assert {:ok, %{"entries" => [_initial, revised_entry]}} =
+             Relay.origin_feed(relay, "origin", 0)
+
+    assert revised_entry["message"]["message_type"] == "request"
+    assert revised_entry["message"]["answer_ui"] == revised["answer_ui"]
+
+    GenServer.stop(relay)
+  end
+
   test "revisions tolerate invalid optional fields and keep the original message group", %{
     path: path
   } do
@@ -134,6 +432,7 @@ defmodule AttentionServer.MessageFieldsRelayTest do
       "thread" => "new-thread",
       "choice_styles" => %{"unknown-action" => "primary"},
       "stake" => 7,
+      "message_kind" => "update",
       "future_member" => %{"kept" => true}
     }
 
@@ -144,7 +443,8 @@ defmodule AttentionServer.MessageFieldsRelayTest do
                %{"field" => "urgency", "reason" => "invalid"},
                %{"field" => "by_when", "reason" => "invalid"},
                %{"field" => "choice_styles", "reason" => "held"},
-               %{"field" => "stake", "reason" => "invalid"}
+               %{"field" => "stake", "reason" => "invalid"},
+               %{"field" => "message_kind", "reason" => "invalid"}
              ]
            } =
              request(relay, "origin", %{
@@ -158,7 +458,9 @@ defmodule AttentionServer.MessageFieldsRelayTest do
 
     assert {:ok, %{"entries" => [_, revision]}} = Relay.origin_feed(relay, "origin", 0)
     assert revision["kind"] == "revision"
-    assert revision["message"] == Map.delete(revised_message, "choice_styles")
+
+    assert revision["message"] ==
+             revised_message |> Map.delete("choice_styles") |> Map.delete("message_kind")
 
     [view_entry] =
       relay
