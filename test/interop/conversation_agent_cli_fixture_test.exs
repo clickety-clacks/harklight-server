@@ -3282,4 +3282,3 @@ defmodule AttentionServer.ConversationAgentCLIFixtureTest do
 
   defp op(n), do: "00000000-0000-4000-8000-#{String.pad_leading(Integer.to_string(n), 12, "0")}"
 end
-

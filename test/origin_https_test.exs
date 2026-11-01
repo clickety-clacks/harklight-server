@@ -1871,4 +1871,3 @@ defmodule AttentionServer.OriginHTTPSTest do
       body
     ]
 end
-

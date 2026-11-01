@@ -968,4 +968,3 @@ defmodule AttentionServer.OriginHTTPS do
     end
   end
 end
-
