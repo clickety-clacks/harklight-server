@@ -46,7 +46,9 @@ defmodule AttentionServer.ConversationAgentCLIFixtureTest do
           "other",
           "--controller",
           "--title",
-          "Reconnect fixture"
+          "Reconnect fixture",
+          "--type",
+          "request"
         ],
         fixture.env
       )
@@ -148,7 +150,9 @@ defmodule AttentionServer.ConversationAgentCLIFixtureTest do
           "other",
           "--controller",
           "--title",
-          "Refusal fixture"
+          "Refusal fixture",
+          "--type",
+          "request"
         ],
         fixture.env
       )
@@ -477,6 +481,7 @@ defmodule AttentionServer.ConversationAgentCLIFixtureTest do
     refute Enum.any?(entries, &(&1["op_id"] == op_id))
   end
 
+  @tag :reconnect_regression
   test "controller support is limited to an other-route follow listener" do
     root =
       Path.join(
@@ -727,6 +732,7 @@ defmodule AttentionServer.ConversationAgentCLIFixtureTest do
     terminate_listener!(listener)
   end
 
+  @tag :reconnect_regression
   test "same-handle listen replays pending work until an action commits" do
     root =
       Path.join(
@@ -1008,6 +1014,7 @@ defmodule AttentionServer.ConversationAgentCLIFixtureTest do
     assert final_status["availability"] == "gone"
   end
 
+  @tag :reconnect_regression
   test "CLI recovers a lost answered-result response without claiming an unknown action applied" do
     root =
       Path.join(
@@ -1356,6 +1363,7 @@ defmodule AttentionServer.ConversationAgentCLIFixtureTest do
     assert Enum.count(entries, &(&1["op_id"] == unknown["op_id"])) == 1
   end
 
+  @tag :reconnect_regression
   test "CLI converges on feed order after duplicate and reordered high-water notices" do
     root =
       Path.join(
@@ -1444,6 +1452,7 @@ defmodule AttentionServer.ConversationAgentCLIFixtureTest do
     terminate_listener!(listener)
   end
 
+  @tag :reconnect_regression
   test "startup fetch includes a turn committed after its stream opens" do
     root =
       Path.join(
@@ -1500,6 +1509,7 @@ defmodule AttentionServer.ConversationAgentCLIFixtureTest do
     refute_receive {^listener, {:data, _line}}, 300
   end
 
+  @tag :reconnect_regression
   test "CLI migrates populated legacy cursor, pending acknowledgement, and committed operation" do
     root =
       Path.join(
@@ -3105,7 +3115,8 @@ defmodule AttentionServer.ConversationAgentCLIFixtureTest do
   end
 
   defp cli_json!(agent_bin, args, env) do
-    {output, 0} = System.cmd(agent_bin, args, env: env, stderr_to_stdout: true)
+    # Successful commands emit NDJSON on stdout; warnings belong to stderr.
+    {output, 0} = System.cmd(agent_bin, args, env: env)
     decode_first_line!(output)
   end
 
