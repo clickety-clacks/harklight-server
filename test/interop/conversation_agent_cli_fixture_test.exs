@@ -1128,8 +1128,38 @@ defmodule AttentionServer.ConversationAgentCLIFixtureTest do
     acted_terminal = Enum.find(after_received, &(&1["event_id"] == terminal["event_id"]))
     assert acted_terminal["acted"] == true
 
-    idle = cli_next!(agent_bin, request["session"], fixture.env)
-    assert idle == %{"kind" => "idle", "open_requests" => 0}
+    status = cli_json!(agent_bin, ["status", "--session", request["session"]], fixture.env)
+    assert status["open_requests"] == 0
+    assert status["open_chats"] == 1
+    assert status["pending_delivered_unacted"] == 0
+
+    # Acting on an answer settles that obligation, not the still-open chat.
+    # Explicit reconnect must retain that chat and avoid re-offering the acted answer.
+    listener =
+      launch_reconnect(
+        agent_bin,
+        [
+          "--session",
+          request["session"],
+          "--vendor-session-id",
+          "none",
+          "--route",
+          "other",
+          "--controller"
+        ],
+        fixture.env
+      )
+
+    assert receive_json!(listener)["kind"] == "reconnected"
+
+    discussion =
+      submit_discussion!(fixture.relay, fixture.reader, request["request"], 912, "After answer")
+
+    event = receive_event!(listener)
+    assert event["event_id"] == discussion["event_id"]
+    assert event["entry"]["text"] == "After answer"
+    assert event["request"]["message_id"] == request["request"]
+    terminate_listener!(listener)
   end
 
   @tag :long_idle
