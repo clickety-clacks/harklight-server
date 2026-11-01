@@ -576,6 +576,72 @@ defmodule AttentionServer.MessageFieldsRelayTest do
     GenServer.stop(relay)
   end
 
+  test "a revise adding request type validates controls from the stored UI/1 document", %{
+    path: path
+  } do
+    relay = start_relay(path)
+    setup_devices(relay)
+
+    document = %{
+      "schema" => "attention-client.ui/1",
+      "requires" => ["scene/1", "result/1"],
+      "illustrations" => [],
+      "inputs" => [],
+      "open" => %{"kind" => "text", "text" => "Open", "style" => "body"},
+      "resolved" => %{"kind" => "text", "text" => "Done", "style" => "body"},
+      "submission" => %{
+        "label" => "Send",
+        "result" => %{"kind" => "literal", "value" => true}
+      }
+    }
+
+    original = %{
+      "sender_id" => "app:test",
+      "message_id" => "ui1-controls-on-revise",
+      "created_at" => 1,
+      "title" => "Untyped UI/1",
+      "answer_ui" => %{"schema" => "attention-client.ui/1", "document" => document}
+    }
+
+    assert %{"type" => "ok", "seq" => 1} =
+             request(relay, "origin", %{
+               "type" => "forward",
+               "op_id" => op(35),
+               "session_handle" => @handle,
+               "message" => original
+             })
+
+    assert %{
+             "type" => "error",
+             "code" => "request_needs_answer_controls",
+             "reason" => reason
+           } =
+             request(relay, "origin", %{
+               "type" => "conversation_revise",
+               "op_id" => op(36),
+               "sender_id" => "app:test",
+               "message_id" => "ui1-controls-on-revise",
+               "base_revision" => 1,
+               "message" => %{
+                 "sender_id" => "app:test",
+                 "message_id" => "ui1-controls-on-revise",
+                 "created_at" => 2,
+                 "title" => "Typed request without controls",
+                 "message_type" => "request"
+               }
+             })
+
+    assert reason =~ "attention-client.ui/1"
+    assert reason =~ "at least one input"
+
+    assert {:ok, %{"entries" => [entry]}} = Relay.origin_feed(relay, "origin", 0)
+    assert entry["message"] == original
+    assert {:ok, [delivery], 1} = Relay.events(relay, "reader", 0)
+    assert delivery["message"] == original
+
+    GenServer.stop(relay)
+  end
+
   test "an invalid type on a revise leaves a stored untyped message unchanged", %{path: path} do
     relay = start_relay(path)
     setup_devices(relay)

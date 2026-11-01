@@ -4285,7 +4285,7 @@ defmodule AttentionServer.Engine do
                      |> Map.get(1, [])
                      |> Enum.map(& &1["name"])
                    ),
-                 else: :ok
+                 else: Message.validate_ui1_controls(revised_message)
                ) do
           if record.revision != frame["base_revision"] do
             failure("stale_revision", "base_revision", %{"current_revision" => record.revision})

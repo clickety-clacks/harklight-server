@@ -5,9 +5,11 @@ defmodule AttentionServer.UI1ConformanceTest do
 
   @corpus_path Path.join(__DIR__, "fixtures/attention-client-ui1-conformance-v3.json")
   @corpus_sha256 "c616ceac8904ae4d12d66894a31971eeab8111d7d91bbe771489b49e6566f040"
+  @app_corpus_source_revision "b45fca200a7c219e8d316dc7e299c5a24050b258"
   @app_grammar_revision "f936fa378381f33f6a53e20c81c95ff8e0b7e420"
   @duplicates_key :__attention_server_duplicate_keys__
-  @moduletag app_grammar_revision: @app_grammar_revision
+  @moduletag app_corpus_source_revision: @app_corpus_source_revision,
+             app_grammar_revision: @app_grammar_revision
 
   defp decode_corpus!(raw) do
     options =
