@@ -1294,6 +1294,9 @@ defmodule AttentionServer.OriginHTTPSTest do
                "type" => "send",
                "op_id" => op(810),
                "session_handle" => @handle,
+               "route" => "other",
+               "cli_version" => "test-only",
+               "unsupported_reason" => nil,
                "message" => %{
                  "sender_id" => "app:test",
                  "message_id" => "reconnect",
@@ -1333,6 +1336,23 @@ defmodule AttentionServer.OriginHTTPSTest do
              )
 
     assert :sys.get_state(c.relay).origin_streams[stream_key].worker == old.worker
+
+    db = :sys.get_state(c.relay).store.db
+    :ok = Sqlite3.execute(db, "PRAGMA query_only=ON")
+
+    try do
+      assert {:ok, 200, %{"type" => "error", "reason" => "storage_unavailable"}} =
+               raw_request(
+                 c,
+                 "a2",
+                 "GET /origin/v1/stream?session=#{@handle}&reconnect=1 HTTP/1.1\r\nHost: relay.test\r\n\r\n"
+               )
+
+      assert :sys.get_state(c.relay).origin_streams[stream_key] == old
+    after
+      :ok = Sqlite3.execute(db, "PRAGMA query_only=OFF")
+    end
+
     second = open_stream.()
     assert {:error, :closed} = :ssl.recv(first, 0, 5_000)
     replacement = :sys.get_state(c.relay).origin_streams[stream_key]

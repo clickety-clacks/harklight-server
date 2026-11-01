@@ -25,6 +25,7 @@ defmodule AttentionServer.ConversationAgentCLIFixtureTest do
 
   @sender_id "app:rust-cli-fixture"
 
+  @tag :reconnect
   test "explicit reconnect resumes gap entries and delivered obligations without replaying actions" do
     root =
       Path.join(System.tmp_dir!(), "harklight-reconnect-#{System.unique_integer([:positive])}")
@@ -123,6 +124,7 @@ defmodule AttentionServer.ConversationAgentCLIFixtureTest do
     assert Enum.count(entries, &(&1["kind"] == "discussion" and &1["author"] == "origin")) == 0
   end
 
+  @tag :reconnect
   test "reconnect refusal reports the actual safe reason and keeps uncertain attachment keys" do
     root =
       Path.join(
