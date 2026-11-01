@@ -48,7 +48,8 @@ defmodule AttentionServer.ConversationAgentCLIFixtureTest do
           "--title",
           "Reconnect fixture",
           "--type",
-          "request"
+          "request",
+          "--reply"
         ],
         fixture.env
       )
@@ -152,7 +153,8 @@ defmodule AttentionServer.ConversationAgentCLIFixtureTest do
           "--title",
           "Refusal fixture",
           "--type",
-          "request"
+          "request",
+          "--reply"
         ],
         fixture.env
       )
