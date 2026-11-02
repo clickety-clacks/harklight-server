@@ -25,7 +25,7 @@ defmodule AttentionServer.PagingTerminalIdentityTest do
   end
 
   for kind <- ~w(answer answer_no_comment lifecycle) do
-    test "paged #{kind} terminal keeps the turn referenced by a real origin receipt", ctx do
+    test "paged #{kind} terminal preserves turn identity and origin receipt eligibility", ctx do
       kind = unquote(kind)
       send = send_frame("terminal")
       assert %{"type" => "ok", "seq" => 1} = request(ctx.relay, "origin", send)
@@ -42,9 +42,16 @@ defmodule AttentionServer.PagingTerminalIdentityTest do
                })
 
       terminal_operation = terminal_operation(kind)
+      terminal_actor = if kind == "lifecycle", do: "origin", else: "reader"
+      terminal_author = if kind == "lifecycle", do: "origin", else: "person"
+
+      if kind == "lifecycle" do
+        assert %{"type" => "error", "reason" => "not_origin"} =
+                 request(ctx.relay, "reader", terminal_operation)
+      end
 
       assert %{"type" => "ok", "seq" => 2} =
-               request(ctx.relay, "reader", terminal_operation)
+               request(ctx.relay, terminal_actor, terminal_operation)
 
       assert {:ok, %{"entries" => [initial, revised, terminal]}} =
                Relay.origin_feed(ctx.relay, "origin", 0)
@@ -53,26 +60,38 @@ defmodule AttentionServer.PagingTerminalIdentityTest do
       assert revised["request_revision"] == 2
       assert terminal["kind"] == "terminal"
       assert terminal["request_revision"] == 2
-      assert terminal["author"] == "person"
+      assert terminal["author"] == terminal_author
       refute initial["event_id"] == terminal["event_id"]
       assert {:error, :not_found} = Relay.origin_ack(ctx.relay, "outsider", 3)
-      assert {:ok, %{"status" => "delivered"}} = Relay.origin_ack(ctx.relay, "origin", 3)
 
-      for device <- ~w(origin reader second-reader) do
-        assert {:ok, [revision, receipt], 2} =
-                 Relay.conversation_events(ctx.relay, device, 0)
+      if kind == "lifecycle" do
+        # An origin-authored terminal is not an actionable receipt target.
+        assert {:error, :not_found} = Relay.origin_ack(ctx.relay, "origin", 3)
 
-        assert revision["kind"] == "revision"
-        assert revision["request_revision"] == 2
-        assert receipt["kind"] == "receipt"
-        assert receipt["event_id"] == terminal["event_id"]
-        assert receipt["request_revision"] == 2
-        assert receipt["session_handle"] == @handle
-        assert receipt["sender_id"] == "app:test"
-        assert receipt["message_id"] == "terminal"
-        assert receipt["origin"] == "origin"
-        assert receipt["delivered"] == true
-        refute Map.has_key?(receipt, "answer")
+        for device <- ~w(origin reader second-reader) do
+          assert {:ok, [revision], 1} = Relay.conversation_events(ctx.relay, device, 0)
+          assert revision["kind"] == "revision"
+          assert revision["request_revision"] == 2
+        end
+      else
+        assert {:ok, %{"status" => "delivered"}} = Relay.origin_ack(ctx.relay, "origin", 3)
+
+        for device <- ~w(origin reader second-reader) do
+          assert {:ok, [revision, receipt], 2} =
+                   Relay.conversation_events(ctx.relay, device, 0)
+
+          assert revision["kind"] == "revision"
+          assert revision["request_revision"] == 2
+          assert receipt["kind"] == "receipt"
+          assert receipt["event_id"] == terminal["event_id"]
+          assert receipt["request_revision"] == 2
+          assert receipt["session_handle"] == @handle
+          assert receipt["sender_id"] == "app:test"
+          assert receipt["message_id"] == "terminal"
+          assert receipt["origin"] == "origin"
+          assert receipt["delivered"] == true
+          refute Map.has_key?(receipt, "answer")
+        end
       end
 
       assert {:ok, [reader_terminal], 2} = Relay.events(ctx.relay, "reader", 1)
@@ -112,11 +131,13 @@ defmodule AttentionServer.PagingTerminalIdentityTest do
         assert {:ok, _, %{"status" => "committed", "terminal" => ^reader_terminal}} =
                  Engine.reconcile_no_comment(engine, "reader", reconcile)
       else
-        assert {:ok, %{"status" => "committed", "terminal" => ^reader_terminal}} =
-                 Engine.reconcile_operation(engine, "reader", terminal_operation, 2, true)
+        expected = if terminal_actor == "origin", do: origin_terminal, else: reader_terminal
+
+        assert {:ok, %{"status" => "committed", "terminal" => ^expected}} =
+                 Engine.reconcile_operation(engine, terminal_actor, terminal_operation, 2, true)
 
         assert {:error, :snapshot_unavailable} =
-                 Engine.reconcile_operation(engine, "reader", terminal_operation, 1, true)
+                 Engine.reconcile_operation(engine, terminal_actor, terminal_operation, 1, true)
       end
     end
   end
