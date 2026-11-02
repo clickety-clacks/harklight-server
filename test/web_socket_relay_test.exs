@@ -784,8 +784,16 @@ defmodule AttentionServer.WebSocketRelayTest do
     assert %{"type" => "ok", "seq" => 22, "state" => "retracted", "retracted_at" => retracted_at} =
              reply(origin)
 
-    assert %{"type" => "lifecycle", "seq" => 22, "retracted_at" => ^retracted_at} =
+    assert %{
+             "type" => "lifecycle",
+             "seq" => 22,
+             "retracted_at" => ^retracted_at,
+             "event_id" => terminal_event_id,
+             "request_revision" => 1
+           } =
              reply(origin)
+
+    assert is_binary(terminal_event_id) and terminal_event_id != ""
 
     second_page = %{
       "type" => "inbox_page",
@@ -910,8 +918,10 @@ defmodule AttentionServer.WebSocketRelayTest do
            } =
              after_terminal = after_item["terminal"]
 
-    refute Map.has_key?(after_terminal, "request_revision")
-    refute Map.has_key?(after_terminal, "event_id")
+    assert after_terminal["request_revision"] == 1
+    assert after_terminal["event_id"] == terminal_event_id
+    assert after_terminal["author"] == "origin"
+    assert after_terminal["origin"] == keys["a1"]
 
     pending_after = %{pending_before | "op_id" => op(8102)}
 
@@ -971,8 +981,9 @@ defmodule AttentionServer.WebSocketRelayTest do
     assert committed["terminal"]["at"] == retracted_at
     assert committed["terminal"]["retracted_at"] == retracted_at
     assert committed["terminal"]["author"] == "origin"
-    refute Map.has_key?(committed["terminal"], "request_revision")
-    refute Map.has_key?(committed["terminal"], "event_id")
+    assert committed["terminal"]["request_revision"] == 1
+    assert committed["terminal"]["event_id"] == terminal_event_id
+    assert committed["terminal"]["origin"] == keys["a1"]
 
     :ssl.close(origin_page)
     :ssl.close(origin)
