@@ -42,6 +42,7 @@ defmodule AttentionServer.PagingTerminalIdentityTest do
                })
 
       terminal_operation = terminal_operation(kind)
+
       assert %{"type" => "ok", "seq" => 2} =
                request(ctx.relay, "reader", terminal_operation)
 
@@ -107,6 +108,7 @@ defmodule AttentionServer.PagingTerminalIdentityTest do
         # The direct operation has no wire op_id. Paging has its own correlation.
         refute Map.has_key?(terminal_operation, "op_id")
         reconcile = Map.put(terminal_operation, "op_id", op(4))
+
         assert {:ok, _, %{"status" => "committed", "terminal" => ^reader_terminal}} =
                  Engine.reconcile_no_comment(engine, "reader", reconcile)
       else
@@ -165,6 +167,7 @@ defmodule AttentionServer.PagingTerminalIdentityTest do
   test "unbound terminal paging does not invent conversation identity", ctx do
     send = Map.delete(send_frame("legacy"), "session_handle")
     assert %{"type" => "ok"} = request(ctx.relay, "origin", send)
+
     assert %{"type" => "ok"} =
              request(ctx.relay, "reader", %{
                "type" => "answer",
@@ -176,6 +179,7 @@ defmodule AttentionServer.PagingTerminalIdentityTest do
 
     assert {:ok, [terminal], 2} = Relay.events(ctx.relay, "reader", 1)
     engine = stored_engine(ctx)
+
     assert {:ok, %{"terminal" => ^terminal}} =
              Engine.inbox_item(engine, "reader", {"app:test", "legacy"}, 2)
 

@@ -2597,7 +2597,8 @@ defmodule AttentionServer.Engine do
           %{seq: seq} when seq <= high ->
             project_paging_terminal(engine, record, {person, sender, id}, device)
 
-          _ -> nil
+          _ ->
+            nil
         end
 
       item = %{"acceptance" => acceptance}
