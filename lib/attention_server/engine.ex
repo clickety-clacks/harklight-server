@@ -2594,7 +2594,9 @@ defmodule AttentionServer.Engine do
 
       terminal =
         case Map.get(record, :terminal) do
-          %{seq: seq} when seq <= high -> project_terminal(record, {person, sender, id}, device)
+          %{seq: seq} when seq <= high ->
+            project_paging_terminal(engine, record, {person, sender, id}, device)
+
           _ -> nil
         end
 
@@ -2612,7 +2614,7 @@ defmodule AttentionServer.Engine do
          %{kind: :lifecycle, key: {^person, _sender, _id} = message_key} <-
            Map.get(engine.events, {person, seq}),
          %{origin: ^device} = record <- Map.get(engine.messages, message_key) do
-      {:ok, project_terminal(record, message_key, device)}
+      {:ok, project_paging_terminal(engine, record, message_key, device)}
     else
       _ -> {:error, :snapshot_unavailable}
     end
@@ -2700,7 +2702,7 @@ defmodule AttentionServer.Engine do
 
     case matches do
       [{message_key, %{terminal: %{seq: ^seq}} = record}] ->
-        {:ok, project_terminal(record, message_key, device)}
+        {:ok, project_paging_terminal(engine, record, message_key, device)}
 
       _ ->
         {:error, :snapshot_unavailable}
@@ -4967,7 +4969,13 @@ defmodule AttentionServer.Engine do
   defp exact_terminal_projection(engine, person, device, frame, seq, high) do
     case Map.get(engine.messages, {person, frame["sender_id"], frame["message_id"]}) do
       %{terminal: %{seq: ^seq}} = record when is_integer(seq) and seq <= high ->
-        {:ok, project_terminal(record, {person, frame["sender_id"], frame["message_id"]}, device)}
+        {:ok,
+         project_paging_terminal(
+           engine,
+           record,
+           {person, frame["sender_id"], frame["message_id"]},
+           device
+         )}
 
       _ ->
         {:error, :snapshot_unavailable}
@@ -4993,7 +5001,7 @@ defmodule AttentionServer.Engine do
        ) do
     case Map.get(engine.messages, {person, sender, message_id}) do
       %{terminal: %{seq: seq}} = record when seq <= high ->
-        {:ok, project_terminal(record, {person, sender, message_id}, device)}
+        {:ok, project_paging_terminal(engine, record, {person, sender, message_id}, device)}
 
       nil ->
         {:ok, nil}
@@ -5372,6 +5380,21 @@ defmodule AttentionServer.Engine do
         Map.merge(base, Map.drop(event.payload, ~w(sender_id message_id feed_seq)))
       end
     end
+  end
+
+  defp project_paging_terminal(engine, record, {person, _, _} = key, device) do
+    # Receipt facts reference the terminal turn, not the initial delivery turn.
+    # Recover its identity from the same lifecycle event used by ordinary replay.
+    identity =
+      case Map.get(engine.events, {person, record.terminal.seq}) do
+        %{kind: :lifecycle, key: ^key, payload: payload} ->
+          Map.take(payload, ~w(event_id request_revision))
+
+        _ ->
+          %{}
+      end
+
+    Map.merge(project_terminal(record, key, device), identity)
   end
 
   defp project_terminal(record, {_, sender, id}, device) do
