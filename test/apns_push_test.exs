@@ -214,6 +214,97 @@ defmodule AttentionServer.APNSPushTest do
            }
   end
 
+  test "chat alerts preserve their target through fitting and use a separate collapse id", ctx do
+    config = chat_provider_config(ctx)
+    claim = chat_claim()
+    {outcome, _} = APNS.send(config, claim, nil)
+    assert outcome.state == "provider_accepted"
+    assert_receive {:apns_request, "POST", _path, headers, body}, 12_000
+    assert {"apns-collapse-id", "attention-chat-sync"} in headers
+    assert byte_size(body) <= 4_096
+    assert {:ok, payload} = JSON.decode_line(body <> "\n")
+    assert payload["attention"]["locator"] == claim.locator
+    assert payload["aps"]["content-available"] == 1
+    assert payload["aps"]["badge"] == 2
+    assert String.ends_with?(payload["aps"]["alert"]["title"], "…")
+
+    ordinary = %{claim | locator: Map.delete(claim.locator, "target")}
+    {outcome, _} = APNS.send(config, ordinary, nil)
+    assert outcome.state == "provider_accepted"
+    assert_receive {:apns_request, "POST", _path, headers, body}, 12_000
+    assert {"apns-collapse-id", "attention-sync"} in headers
+    assert {:ok, payload} = JSON.decode_line(body <> "\n")
+    assert payload["attention"]["locator"] == ordinary.locator
+  end
+
+  test "a chat locator that cannot fit or fails identity validation is never sent without its target",
+       ctx do
+    config = chat_provider_config(ctx)
+    claim = chat_claim()
+
+    for locator <- [
+          Map.put(claim.locator, "message_id", String.duplicate("x", 5_000)),
+          Map.put(claim.locator, "binding_id", "invalid"),
+          Map.put(claim.locator, "extra", "invalid")
+        ] do
+      {outcome, _} = APNS.send(config, %{claim | locator: locator}, nil)
+      assert outcome.state == "blocked_configuration"
+      refute_receive {:apns_request, _, _, _, _}
+    end
+  end
+
+  test "chat preview is shortened before dropping any destination field", ctx do
+    claim = chat_claim()
+    claim = %{claim | alert: %{"title" => "Agent", "body" => String.duplicate("名", 5_000)}}
+    {outcome, _} = APNS.send(chat_provider_config(ctx), claim, nil)
+    assert outcome.state == "provider_accepted"
+    assert_receive {:apns_request, "POST", _, _, body}, 12_000
+    assert byte_size(body) <= 4_096
+    assert {:ok, payload} = JSON.decode_line(body <> "\n")
+    assert payload["attention"]["locator"] == claim.locator
+    assert payload["aps"]["alert"]["title"] == "Agent"
+    assert String.ends_with?(payload["aps"]["alert"]["body"], "…")
+  end
+
+  defp chat_provider_config(ctx) do
+    APNS.prepare!(
+      key_path: ctx.key_path,
+      key_id: "TESTKEYID1",
+      team_id: "TESTTEAMID",
+      endpoint: %{
+        address: {127, 0, 0, 1},
+        hostname: "relay.test",
+        port: ctx.provider_port,
+        cacerts: [ca_der(ctx.certs)]
+      }
+    )
+  end
+
+  defp chat_claim do
+    now = System.system_time(:millisecond)
+
+    %{
+      claim_id: op(96),
+      profile_id: @provider_profile,
+      address: @device_token,
+      deadline_at: now + 60_000,
+      registered_at: now,
+      presentation: :alert,
+      badge: 2,
+      alert: %{"title" => String.duplicate("名", 5_000), "body" => "Reply preview"},
+      locator: %{
+        "v" => 1,
+        "binding_id" => op(95),
+        "person_id" => "person-a",
+        "device_id" => String.duplicate("a", 64),
+        "sender_id" => "app:test",
+        "message_id" => "chat-target",
+        "acceptance_seq" => 7,
+        "target" => "chat"
+      }
+    }
+  end
+
   test "grouped names stay exact and oversized groups report the remaining count", ctx do
     %{certs: certs, key_path: key_path, provider_port: provider_port} = ctx
     now = System.system_time(:millisecond)

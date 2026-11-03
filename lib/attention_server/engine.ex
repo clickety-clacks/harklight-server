@@ -123,8 +123,25 @@ defmodule AttentionServer.Engine do
 
       {{person, device} = key, binding} ->
         claim_id = uuid_v4()
-        gathered = push_gathered_records(next, person, device, binding)
-        presentation = if gathered == [], do: :background, else: :alert
+        stream = if binding.pending_high > 0, do: :request, else: :conversation
+
+        gathered =
+          if stream == :request,
+            do: push_gathered_records(next, person, device, binding),
+            else: []
+
+        chat =
+          if stream == :conversation,
+            do: push_chat_reply(next, person, device, binding),
+            else: nil
+
+        presentation = if gathered == [] and is_nil(chat), do: :background, else: :alert
+        high = if stream == :request, do: binding.pending_high, else: binding.accepted_high
+
+        conversation_high =
+          if stream == :conversation,
+            do: binding.pending_conversation_high,
+            else: binding.accepted_conversation_high
 
         claim = %{
           person: person,
@@ -133,8 +150,14 @@ defmodule AttentionServer.Engine do
           binding_id: binding.binding_id,
           profile_id: binding.profile_id,
           address: binding.address,
-          high: binding.pending_high,
-          conversation_high: binding.pending_conversation_high,
+          high: high,
+          conversation_high: conversation_high,
+          stream: stream,
+          remainder_due:
+            if(stream == :request,
+              do: binding.pending_conversation_high > 0,
+              else: binding.pending_high > 0
+            ),
           presentation: presentation,
           badge: inbox_badge(next, person),
           deadline_at: binding.deadline_at,
@@ -167,14 +190,33 @@ defmodule AttentionServer.Engine do
               |> Map.put(:preserve_alert_body, true)
           end
 
+        claim =
+          case chat do
+            {key, record, payload} ->
+              alert = push_alert({key, record})
+              {preview, truncated?} = push_preview(payload["text"])
+              alert = %{alert | "body" => preview, "body_truncated" => truncated?}
+
+              claim
+              |> Map.put(:alert, alert)
+              |> Map.put(
+                :locator,
+                push_locator({key, record}, person, device, binding.binding_id)
+                |> Map.put("target", "chat")
+              )
+
+            nil ->
+              claim
+          end
+
         claimed = %{
           binding
           | state: "sending",
             attempt_count: binding.attempt_count + 1,
             last_attempt_at: now_ms,
             claim_id: claim_id,
-            claim_high: binding.pending_high,
-            claim_conversation_high: binding.pending_conversation_high,
+            claim_high: high,
+            claim_conversation_high: conversation_high,
             claim_at: now_ms,
             next_at: nil
         }
@@ -254,6 +296,8 @@ defmodule AttentionServer.Engine do
         conversation_high = Map.get(engine.conversation_highs, person, 0)
         conversation_cursor = Map.get(engine.conversation_cursors, key, 0)
 
+        # A new endpoint starts prospectively for chat alerts. Existing
+        # conversation catch-up remains a background hint below this baseline.
         pending_conversation_high =
           if MapSet.member?(engine.conversation_opened, key) and
                conversation_high > conversation_cursor,
@@ -275,7 +319,7 @@ defmodule AttentionServer.Engine do
           pending_high: pending_high,
           accepted_high: 0,
           pending_conversation_high: pending_conversation_high,
-          accepted_conversation_high: 0,
+          accepted_conversation_high: conversation_high,
           deadline_at: if(pending?, do: now_ms + @push_hint_lifetime_ms, else: nil),
           next_at: if(pending?, do: open_window_at || now_ms + @push_window_ms, else: nil),
           attempt_count: 0,
@@ -286,6 +330,25 @@ defmodule AttentionServer.Engine do
           claim_conversation_high: nil,
           claim_at: nil
         }
+
+        binding =
+          if old && old.active && old.address == address &&
+               old.profile_id == frame["profile_id"] do
+            # Same authorized endpoint: a registration refresh is not a read
+            # or provider acceptance, and must not discard either stream.
+            pending? = old.pending_high > 0 or old.pending_conversation_high > 0
+
+            old
+            |> clear_push_claim()
+            |> Map.merge(%{
+              revision: revision,
+              registered_at: now_ms,
+              state: if(pending?, do: "queued", else: "ready"),
+              next_at: if(pending?, do: old.next_at || now_ms, else: nil)
+            })
+          else
+            binding
+          end
 
         reply = %{
           "revision" => revision,
@@ -454,20 +517,36 @@ defmodule AttentionServer.Engine do
 
     case state do
       "provider_accepted" ->
+        request? = claim.stream == :request
+
         base = %{
           base
-          | accepted_high: max(binding.accepted_high, claim.high),
+          | accepted_high:
+              if(request?,
+                do: max(binding.accepted_high, claim.high),
+                else: binding.accepted_high
+              ),
             accepted_conversation_high:
-              max(binding.accepted_conversation_high, claim.conversation_high)
+              if(request?,
+                do: binding.accepted_conversation_high,
+                else: max(binding.accepted_conversation_high, claim.conversation_high)
+              ),
+            pending_high:
+              if(request? and binding.pending_high <= claim.high,
+                do: 0,
+                else: binding.pending_high
+              ),
+            pending_conversation_high:
+              if(not request? and binding.pending_conversation_high <= claim.conversation_high,
+                do: 0,
+                else: binding.pending_conversation_high
+              )
         }
 
-        if binding.pending_high <= claim.high and
-             binding.pending_conversation_high <= claim.conversation_high do
+        if base.pending_high == 0 and base.pending_conversation_high == 0 do
           clear_push_claim(%{
             base
             | state: "ready",
-              pending_high: 0,
-              pending_conversation_high: 0,
               deadline_at: nil,
               next_at: nil
           })
@@ -475,7 +554,11 @@ defmodule AttentionServer.Engine do
           clear_push_claim(%{
             base
             | state: "queued",
-              next_at: binding.next_at || now_ms + @push_window_ms
+              next_at:
+                if(claim.remainder_due,
+                  do: now_ms,
+                  else: binding.next_at || now_ms + @push_window_ms
+                )
           })
         end
 
@@ -5075,8 +5158,8 @@ defmodule AttentionServer.Engine do
         {{^person, _device} = key, %{active: true} = binding} ->
           if high > Map.get(engine.cursors, key, 0) do
             fresh =
-              binding.pending_high == 0 or not is_integer(binding.deadline_at) or
-                binding.deadline_at <= now_ms
+              (binding.pending_high == 0 and binding.pending_conversation_high == 0) or
+                not is_integer(binding.deadline_at) or binding.deadline_at <= now_ms
 
             # The first unsent request opens a window; a request arriving while
             # the previous batch is still being sent opens the next one.
@@ -5122,8 +5205,18 @@ defmodule AttentionServer.Engine do
     bindings =
       Map.new(engine.push_bindings, fn
         {{^person, _device} = key, %{active: true} = binding} ->
-          if MapSet.member?(engine.conversation_opened, key) and
-               high > Map.get(engine.conversation_cursors, key, 0) do
+          reply? =
+            case Map.get(engine.conversation_events, {person, high}) do
+              %{key: message_key, payload: %{"kind" => "reply", "author" => "origin"}} ->
+                engine.messages[message_key].origin != elem(key, 1)
+
+              _ ->
+                false
+            end
+
+          if (reply? and high > binding.accepted_conversation_high) or
+               (MapSet.member?(engine.conversation_opened, key) and
+                  high > Map.get(engine.conversation_cursors, key, 0)) do
             fresh =
               (binding.pending_high == 0 and binding.pending_conversation_high == 0) or
                 not is_integer(binding.deadline_at) or binding.deadline_at <= now_ms
@@ -5190,6 +5283,28 @@ defmodule AttentionServer.Engine do
     end
   end
 
+  defp push_chat_reply(engine, person, device, binding) do
+    engine.conversation_events
+    |> Enum.filter(fn
+      {{^person, seq}, %{payload: %{"kind" => "reply", "author" => "origin"}}} ->
+        seq > binding.accepted_conversation_high and seq <= binding.pending_conversation_high
+
+      _ ->
+        false
+    end)
+    |> Enum.sort_by(fn {{_, seq}, _} -> seq end, :desc)
+    |> Enum.find_value(fn {_, %{key: key, payload: payload}} ->
+      case Map.get(engine.messages, key) do
+        %{origin: origin} = record when origin != device ->
+          if push_locator({key, record}, person, device, binding.binding_id),
+            do: {key, record, payload}
+
+        _ ->
+          nil
+      end
+    end)
+  end
+
   # The recipient's Inbox count as the server sees it: accepted requests with
   # no explicit action yet. Retracted and answered items are resolved.
   defp inbox_badge(engine, person) do
@@ -5232,15 +5347,7 @@ defmodule AttentionServer.Engine do
         message["title"]
       end
 
-    normalized = preview |> String.split() |> Enum.join(" ")
-    {graphemes, _remaining} = take_graphemes(normalized, 161, [])
-
-    {bounded_preview, truncated?} =
-      if length(graphemes) > 160 do
-        {(Enum.take(graphemes, 159) ++ ["…"]) |> Enum.join(), true}
-      else
-        {Enum.join(graphemes), false}
-      end
+    {bounded_preview, truncated?} = push_preview(preview)
 
     display_name =
       case Map.get(message, "display_name") do
@@ -5249,6 +5356,17 @@ defmodule AttentionServer.Engine do
       end
 
     %{"title" => display_name, "body" => bounded_preview, "body_truncated" => truncated?}
+  end
+
+  defp push_preview(preview) do
+    normalized = preview |> String.split() |> Enum.join(" ")
+    {graphemes, _remaining} = take_graphemes(normalized, 161, [])
+
+    if length(graphemes) > 160 do
+      {(Enum.take(graphemes, 159) ++ ["…"]) |> Enum.join(), true}
+    else
+      {Enum.join(graphemes), false}
+    end
   end
 
   defp push_locator({{_, sender, message_id}, record}, person, device, binding_id) do

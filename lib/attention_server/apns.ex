@@ -239,9 +239,19 @@ defmodule AttentionServer.APNS do
     # with no alert text goes as a silent alert-type push.
     {push_type, priority, collapse_id} =
       case {claim.presentation, is_integer(Map.get(claim, :badge))} do
-        {:alert, _} -> {"alert", "10", "attention-sync"}
-        {:background, true} -> {"alert", "10", "attention-terminal-sync"}
-        {:background, false} -> {"background", "5", "attention-terminal-sync"}
+        {:alert, _} ->
+          collapse =
+            if get_in(claim, [:locator, "target"]) == "chat",
+              do: "attention-chat-sync",
+              else: "attention-sync"
+
+          {"alert", "10", collapse}
+
+        {:background, true} ->
+          {"alert", "10", "attention-terminal-sync"}
+
+        {:background, false} ->
+          {"background", "5", "attention-terminal-sync"}
       end
 
     headers = [
@@ -281,6 +291,24 @@ defmodule AttentionServer.APNS do
 
   defp request_payload(%{presentation: :background} = claim),
     do: put_badge(@background_payload, Map.get(claim, :badge))
+
+  defp request_payload(%{presentation: :alert, locator: %{"target" => "chat"} = locator} = claim) do
+    unless valid_locator?(locator), do: raise(ArgumentError, "invalid chat locator")
+    alert = claim.alert
+
+    case fit_alert_payload(
+           alert["title"],
+           alert["body"],
+           Map.get(alert, "body_truncated", false),
+           locator,
+           Map.get(claim, :badge),
+           false,
+           false
+         ) do
+      {:ok, payload} -> payload
+      :error -> raise ArgumentError, "APNs chat target could not fit the payload limit"
+    end
+  end
 
   defp request_payload(
          %{
@@ -605,7 +633,10 @@ defmodule AttentionServer.APNS do
            "acceptance_seq" => acceptance_seq
          } = locator
        ) do
-    map_size(locator) == 7 and AttentionServer.Message.uuid_v4?(binding_id) and
+    valid_shape? =
+      map_size(locator) == 7 or (map_size(locator) == 8 and locator["target"] == "chat")
+
+    valid_shape? and AttentionServer.Message.uuid_v4?(binding_id) and
       Enum.all?([person_id, device_id, sender_id, message_id], &valid_locator_id?/1) and
       is_integer(acceptance_seq) and acceptance_seq > 0
   end
