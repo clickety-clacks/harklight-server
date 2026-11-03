@@ -729,7 +729,7 @@ defmodule AttentionServer.WebSocketRelayTest do
     %{certs: certs, web: web, relay: relay, keys: keys} = ctx
     assert :ok = Relay.setup_sender(relay, keys["a2"], "app:test")
 
-    assert {:ok, origin} = connect(web, certs, "a1")
+    assert {:ok, origin} = connect_with_listener_diagnostics(web, certs, "a1")
     assert upgrade(origin) =~ "101 Switching Protocols"
     assert {[], %{"seq" => 0}} = resync(origin)
 
@@ -784,8 +784,16 @@ defmodule AttentionServer.WebSocketRelayTest do
     assert %{"type" => "ok", "seq" => 22, "state" => "retracted", "retracted_at" => retracted_at} =
              reply(origin)
 
-    assert %{"type" => "lifecycle", "seq" => 22, "retracted_at" => ^retracted_at} =
+    assert %{
+             "type" => "lifecycle",
+             "seq" => 22,
+             "retracted_at" => ^retracted_at,
+             "event_id" => terminal_event_id,
+             "request_revision" => 1
+           } =
              reply(origin)
+
+    assert is_binary(terminal_event_id) and terminal_event_id != ""
 
     second_page = %{
       "type" => "inbox_page",
@@ -910,8 +918,10 @@ defmodule AttentionServer.WebSocketRelayTest do
            } =
              after_terminal = after_item["terminal"]
 
-    refute Map.has_key?(after_terminal, "request_revision")
-    refute Map.has_key?(after_terminal, "event_id")
+    assert after_terminal["request_revision"] == 1
+    assert after_terminal["event_id"] == terminal_event_id
+    assert after_terminal["author"] == "origin"
+    assert after_terminal["origin"] == keys["a1"]
 
     pending_after = %{pending_before | "op_id" => op(8102)}
 
@@ -971,8 +981,9 @@ defmodule AttentionServer.WebSocketRelayTest do
     assert committed["terminal"]["at"] == retracted_at
     assert committed["terminal"]["retracted_at"] == retracted_at
     assert committed["terminal"]["author"] == "origin"
-    refute Map.has_key?(committed["terminal"], "request_revision")
-    refute Map.has_key?(committed["terminal"], "event_id")
+    assert committed["terminal"]["request_revision"] == 1
+    assert committed["terminal"]["event_id"] == terminal_event_id
+    assert committed["terminal"]["origin"] == keys["a1"]
 
     :ssl.close(origin_page)
     :ssl.close(origin)
@@ -1773,5 +1784,62 @@ defmodule AttentionServer.WebSocketRelayTest do
     :ssl.close(a1)
     :ssl.close(a2)
     :ssl.close(b1)
+  end
+
+  defp connect_with_listener_diagnostics(web, certs, name) do
+    port = WebSocketRelay.port(web)
+    ports = linked_ports(web)
+    before = listener_observation(web, ports)
+    result = connect(web, certs, name)
+
+    if result == {:error, :econnrefused} do
+      after_ports = Enum.uniq(ports ++ linked_ports(web))
+
+      # Only endpoint/process/socket metadata: never inspect application state or TLS material.
+      IO.puts(
+        "listener_connect_refused " <>
+          inspect(%{
+            endpoint: {{127, 0, 0, 1}, port},
+            before: before,
+            after: listener_observation(web, after_ports)
+          })
+      )
+    end
+
+    result
+  end
+
+  defp linked_ports(web) do
+    case Process.info(web, :links) do
+      {:links, links} -> Enum.filter(links, &is_port/1)
+      nil -> []
+    end
+  end
+
+  defp listener_observation(web, ports) do
+    %{
+      process_alive: Process.alive?(web),
+      linked_ports: Enum.map(ports, &listener_port_observation(&1, web))
+    }
+  end
+
+  defp listener_port_observation(port, web) do
+    info = :inet.info(port)
+
+    endpoint =
+      case :inet.sockname(port) do
+        {:ok, {ip, number}} when is_tuple(ip) and is_integer(number) -> {ip, number}
+        {:error, reason} when is_atom(reason) -> {:error, reason}
+        _ -> :unavailable
+      end
+
+    %{
+      port: port,
+      endpoint: endpoint,
+      owner_is_listener: Map.get(info, :owner) == web,
+      states: Map.get(info, :states, :unavailable)
+    }
+  catch
+    kind, _ -> %{port: port, observation_failed: kind}
   end
 end
