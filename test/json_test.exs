@@ -85,4 +85,13 @@ defmodule AttentionServer.JSONTest do
 
     assert {:error, "message"} = Message.validate(nil)
   end
+
+  test "computed score floats round-trip without reducing precision" do
+    for score <- [0.0, 1.0, 0.1, 1 / 3, 0.12345678901234567] do
+      assert {:ok, %{"score" => %DecimalToken{raw: raw}}} =
+               JSON.decode_line(JSON.encode!(%{"score" => score}) <> "\n")
+
+      assert {^score, ""} = Float.parse(raw)
+    end
+  end
 end

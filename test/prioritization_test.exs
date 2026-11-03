@@ -184,7 +184,7 @@ defmodule AttentionServer.PrioritizationTest do
              })
   end
 
-  test "baseline returns urgency priority and orders urgency, deadline, then newest" do
+  test "baseline omits scores and bands and orders urgency, deadline, then newest" do
     items = [
       item("newest", 4),
       Map.update!(item("invalid-deadline", 5), :message, &Map.put(&1, "by_when", "tomorrow")),
@@ -199,22 +199,19 @@ defmodule AttentionServer.PrioritizationTest do
              %{
                "sender_id" => "app:test",
                "message_id" => "earliest",
-               "priority" => "normal",
                "due_at" => 10
              },
              %{
                "sender_id" => "app:test",
                "message_id" => "later-deadline",
-               "priority" => "normal",
                "due_at" => 20
              },
              %{
                "sender_id" => "app:test",
-               "message_id" => "invalid-deadline",
-               "priority" => "normal"
+               "message_id" => "invalid-deadline"
              },
-             %{"sender_id" => "app:test", "message_id" => "newest", "priority" => "normal"},
-             %{"sender_id" => "app:test", "message_id" => "older", "priority" => "normal"}
+             %{"sender_id" => "app:test", "message_id" => "newest"},
+             %{"sender_id" => "app:test", "message_id" => "older"}
            ]
 
     assert Enum.all?(entries, &(not Map.has_key?(&1, "reason")))
@@ -236,19 +233,19 @@ defmodule AttentionServer.PrioritizationTest do
       %{
         "sender_id" => "app:test",
         "message_id" => "newest",
-        "priority" => "now",
+        "score" => 0.9,
         "reason" => "Ranked by how soon it needs handling"
       },
       %{
         "sender_id" => "app:test",
         "message_id" => "older",
-        "priority" => "low",
+        "score" => 0.1,
         "reason" => "Ranked by how soon it needs handling"
       },
       %{
         "sender_id" => "app:test",
         "message_id" => "new-late",
-        "priority" => "high",
+        "score" => 0.7,
         "reason" => "Ranked by how soon it needs handling"
       }
     ]
@@ -256,18 +253,17 @@ defmodule AttentionServer.PrioritizationTest do
     entries = Placement.place("jev-set", items, previous, nil)
 
     assert entries == [
-             %{"sender_id" => "app:test", "message_id" => "newest", "priority" => "now"},
-             %{"sender_id" => "app:test", "message_id" => "older", "priority" => "low"},
+             %{"sender_id" => "app:test", "message_id" => "newest", "score" => 0.9},
+             %{"sender_id" => "app:test", "message_id" => "older", "score" => 0.1},
              %{
                "sender_id" => "app:test",
                "message_id" => "new-late",
-               "priority" => "high",
+               "score" => 0.7,
                "due_at" => 30
              },
              %{
                "sender_id" => "app:test",
                "message_id" => "new-early",
-               "priority" => "normal",
                "due_at" => 10
              }
            ]
@@ -279,7 +275,7 @@ defmodule AttentionServer.PrioritizationTest do
     assert Placement.reassess(engine, "person-a", []) == :whole_set
   end
 
-  test "scored placement carries deadlines, post-priority, and omits reasons" do
+  test "scored placement carries deadlines, numeric scores, and omits reasons" do
     items = [item("older", 1, 100), item("newest", 2)]
 
     entries =
@@ -287,17 +283,17 @@ defmodule AttentionServer.PrioritizationTest do
         "jev-set",
         items,
         [],
-        {:scored, %{{"app:test", "older"} => 2.5, {"app:test", "newest"} => 1.0}}
+        {:scored, %{{"app:test", "older"} => 0.9, {"app:test", "newest"} => 0.3}}
       )
 
     assert entries == [
              %{
                "sender_id" => "app:test",
                "message_id" => "older",
-               "priority" => "now",
+               "score" => 0.9,
                "due_at" => 100
              },
-             %{"sender_id" => "app:test", "message_id" => "newest", "priority" => "normal"}
+             %{"sender_id" => "app:test", "message_id" => "newest", "score" => 0.3}
            ]
 
     assert Enum.all?(entries, &(not Map.has_key?(&1, "reason")))
@@ -373,53 +369,35 @@ defmodule AttentionServer.PrioritizationTest do
     assert due_item["by_when"] == "1970-01-01T00:00:00Z"
     assert due_item["due_in_minutes"] == 0
 
-    assert questions["candidate_1"]["instructions"] ==
-             "Rate candidate 1 in the supplied pending set for how soon it should be handled. " <>
-               "Consider its title, body, stated stake, deadline, the sender's stated urgency, message type and message kind relative to the other pending items. " <>
-               "Do not apply a fixed priority order or preference based on message type or kind. " <>
-               "The current time is now; due_in_minutes is the time left before the deadline, negative once it has passed."
-
-    assert questions["candidate_1"]["criteria"] == [
-             "Low priority: this can wait while more time-sensitive items are handled.",
-             "Normal priority: this should be handled soon, but other items can reasonably come first.",
-             "High priority: delaying this item has clear near-term consequences; handle it before less urgent items.",
-             "Now: this needs the person's attention right away, ahead of everything else."
-           ]
+    instruction = questions["candidate_1"]["instructions"]
+    assert instruction =~ "absolute importance"
+    assert instruction =~ "Do not compare"
+    assert instruction =~ "message type and message kind"
+    assert instruction =~ "Sender urgency is evidence, not the answer"
+    refute instruction =~ "relative to the other"
+    assert length(questions["candidate_1"]["criteria"]) == 5
   end
 
-  test "Jev returns valid candidate scores and ignores missing and unknown questions" do
-    candidates = [{"app:test", "first"}, {"app:test", "second"}, {"app:test", "third"}]
+  test "Jev maps the absolute rubric once and ignores invalid or missing answers" do
+    ids = Map.new(1..10, &{"candidate_#{&1}", {"app:test", "#{&1}"}})
 
-    questions = %{
-      "candidate_1" => hd(candidates),
-      "candidate_2" => Enum.at(candidates, 1),
-      "candidate_3" => List.last(candidates)
-    }
+    answers =
+      Map.new(
+        Enum.with_index([0, 0.4, 0.6, 3.8, 4, -1, 4.2, "3", true, nil], 1),
+        fn {value, i} -> {"candidate_#{i}", %{"type" => "score", "score" => value}} end
+      )
 
-    response =
-      ~s({"model":"jev-latest","answers":{"candidate_1":{"type":"score","score":1.5},"candidate_2":{"type":"score","score":2},"candidate_3":{"type":"score","score":2}}})
+    assert {:ok, scores} = JevClient.parse_scores(JSON.encode!(%{"answers" => answers}), ids)
 
-    assert {:ok,
-            %{
-              {"app:test", "first"} => 1.5,
-              {"app:test", "second"} => 2.0,
-              {"app:test", "third"} => 2.0
-            }} =
-             JevClient.rank_response(response, questions, candidates)
+    assert scores == %{
+             {"app:test", "1"} => 0.0,
+             {"app:test", "2"} => 0.1,
+             {"app:test", "3"} => 0.15,
+             {"app:test", "4"} => 0.95,
+             {"app:test", "5"} => 1.0
+           }
 
-    assert {:ok, %{{"app:test", "first"} => 1.0}} =
-             JevClient.rank_response(
-               ~s({"answers":{"candidate_1":{"type":"score","score":1},"candidate_2":{"type":"score","score":4},"unknown":{"type":"score","score":3}}}),
-               questions,
-               candidates
-             )
-
-    assert {:ok, %{}} =
-             JevClient.rank_response(
-               ~s({"answers":{"candidate_1":{"type":"score","score":4},"candidate_3":{"type":"score","score":3}}}),
-               questions,
-               candidates
-             )
+    assert {:ok, %{}} = JevClient.parse_scores("{\"answers\":{}}", ids)
   end
 
   test "algorithm choices are per person and setting the current choice is a no-op" do
@@ -576,7 +554,7 @@ defmodule AttentionServer.PrioritizationTest do
 
     complete_synthetic_priority_pass(
       job,
-      {:ok, %{{"app:test", "later"} => 3.0, {"app:test", "earlier"} => 0.0}}
+      {:ok, %{{"app:test", "later"} => 1.0, {"app:test", "earlier"} => 0.0}}
     )
 
     assert [%{"basis" => "selected", "entries" => selected_entries}] =
@@ -661,7 +639,7 @@ defmodule AttentionServer.PrioritizationTest do
         end
       end
 
-      {:ok, Map.new(request.candidates, &{&1, 2.0})}
+      {:ok, Map.new(request.candidates, &{&1, 0.7})}
     end
 
     relay = start_relay(path, priority_evaluator: evaluator)
@@ -902,10 +880,9 @@ defmodule AttentionServer.PrioritizationTest do
              %{
                "sender_id" => "app:test",
                "message_id" => "newer",
-               "priority" => "normal",
                "due_at" => 200
              },
-             %{"sender_id" => "app:test", "message_id" => "older", "priority" => "normal"}
+             %{"sender_id" => "app:test", "message_id" => "older"}
            ]
 
     view_rev = :sys.get_state(relay).priority_views["person-a"].view_rev
@@ -1164,16 +1141,14 @@ defmodule AttentionServer.PrioritizationTest do
              %{
                "sender_id" => "app:test",
                "message_id" => "newer",
-               "priority" => "normal",
                "due_at" => 100
              },
              %{
                "sender_id" => "app:test",
                "message_id" => "older",
-               "priority" => "normal",
                "due_at" => 200
              },
-             %{"sender_id" => "app:test", "message_id" => "undated", "priority" => "normal"}
+             %{"sender_id" => "app:test", "message_id" => "undated"}
            ]
 
     assert Enum.all?(baseline_entries, &(not Map.has_key?(&1, "reason")))
@@ -1181,9 +1156,9 @@ defmodule AttentionServer.PrioritizationTest do
     engine = :sys.get_state(relay).store.engine
 
     scores = %{
-      {"app:test", "older"} => 0.2,
-      {"app:test", "undated"} => 1.2,
-      {"app:test", "newer"} => 2.2
+      {"app:test", "older"} => 0.1,
+      {"app:test", "undated"} => 0.3,
+      {"app:test", "newer"} => 0.7
     }
 
     assert Placement.choice(engine, "person-a") == "jev-set"
@@ -1204,14 +1179,18 @@ defmodule AttentionServer.PrioritizationTest do
              %{
                "sender_id" => "app:test",
                "message_id" => "newer",
-               "priority" => "high",
+               "score" => %JSON.DecimalToken{raw: "0.7"},
                "due_at" => 100
              },
-             %{"sender_id" => "app:test", "message_id" => "undated", "priority" => "normal"},
+             %{
+               "sender_id" => "app:test",
+               "message_id" => "undated",
+               "score" => %JSON.DecimalToken{raw: "0.3"}
+             },
              %{
                "sender_id" => "app:test",
                "message_id" => "older",
-               "priority" => "low",
+               "score" => %JSON.DecimalToken{raw: "0.1"},
                "due_at" => 200
              }
            ]
@@ -1221,6 +1200,47 @@ defmodule AttentionServer.PrioritizationTest do
     state = :sys.get_state(relay)
     assert state.priority_jobs == %{}
     assert state.priority_queued == %{}
+    GenServer.stop(relay)
+  end
+
+  test "a score-only change advances the view revision and returns the new number", %{
+    path: path,
+    dir: dir
+  } do
+    use_synthetic_jev_key(dir)
+    relay = start_relay(path)
+    setup_person(relay)
+    forward(relay, 1, "same-item")
+    configure_jev_choice(relay)
+    assert {:ok, session} = Relay.open_websocket_session(relay, "device-a", nil, nil)
+
+    job = start_synthetic_priority_pass(relay)
+    complete_synthetic_priority_pass(job, {:ok, %{{"app:test", "same-item"} => 0.71}})
+    first = hd(session_request(relay, session, %{"type" => "view_get", "ref" => "first"}))
+    assert first["basis"] == "selected"
+
+    job = start_synthetic_priority_pass(relay)
+    complete_synthetic_priority_pass(job, {:ok, %{{"app:test", "same-item"} => 0.72}})
+
+    second =
+      hd(
+        session_request(relay, session, %{
+          "type" => "view_get",
+          "ref" => "second",
+          "known_view_rev" => first["view_rev"]
+        })
+      )
+
+    assert second["basis"] == "selected"
+    refute second["unchanged"]
+    refute second["view_rev"] == first["view_rev"]
+
+    assert Enum.map(second["entries"], &Placement.identity/1) ==
+             Enum.map(first["entries"], &Placement.identity/1)
+
+    assert hd(first["entries"])["score"] == %JSON.DecimalToken{raw: "0.71"}
+    assert hd(second["entries"])["score"] == %JSON.DecimalToken{raw: "0.72"}
+    refute Map.has_key?(hd(second["entries"]), "priority")
     GenServer.stop(relay)
   end
 
@@ -1250,8 +1270,8 @@ defmodule AttentionServer.PrioritizationTest do
              } = hd(session_request(relay, session, %{"type" => "view_get", "ref" => "fallback"}))
 
       assert fallback_entries == [
-               %{"sender_id" => "app:test", "message_id" => "newer", "priority" => "normal"},
-               %{"sender_id" => "app:test", "message_id" => "older", "priority" => "normal"}
+               %{"sender_id" => "app:test", "message_id" => "newer"},
+               %{"sender_id" => "app:test", "message_id" => "older"}
              ]
 
       assert Enum.all?(fallback_entries, &(not Map.has_key?(&1, "reason")))
@@ -1278,11 +1298,10 @@ defmodule AttentionServer.PrioritizationTest do
       assert updated_entries == [
                %{
                  "sender_id" => "app:test",
-                 "message_id" => "arrived-after-pass",
-                 "priority" => "normal"
+                 "message_id" => "arrived-after-pass"
                },
-               %{"sender_id" => "app:test", "message_id" => "newer", "priority" => "normal"},
-               %{"sender_id" => "app:test", "message_id" => "older", "priority" => "normal"}
+               %{"sender_id" => "app:test", "message_id" => "newer"},
+               %{"sender_id" => "app:test", "message_id" => "older"}
              ]
 
       assert Enum.all?(updated_entries, &(not Map.has_key?(&1, "reason")))
@@ -1338,16 +1357,14 @@ defmodule AttentionServer.PrioritizationTest do
              %{
                "sender_id" => "app:test",
                "message_id" => "earlier-deadline",
-               "priority" => "normal",
                "due_at" => 10
              },
              %{
                "sender_id" => "app:test",
                "message_id" => "later-deadline",
-               "priority" => "normal",
                "due_at" => 20
              },
-             %{"sender_id" => "app:test", "message_id" => "undated", "priority" => "normal"}
+             %{"sender_id" => "app:test", "message_id" => "undated"}
            ]
 
     assert Enum.all?(entries, &(not Map.has_key?(&1, "reason")))
@@ -1393,7 +1410,7 @@ defmodule AttentionServer.PrioritizationTest do
 
       if attempt == 0,
         do: {:error, :unavailable},
-        else: {:ok, Map.new(request.candidates, &{&1, 2.7})}
+        else: {:ok, Map.new(request.candidates, &{&1, 0.9})}
     end
 
     relay = start_relay(path, priority_evaluator: evaluator)
@@ -1429,7 +1446,7 @@ defmodule AttentionServer.PrioritizationTest do
 
     assert :sys.get_state(relay).priority_views["person-a"].entries
            |> hd()
-           |> Map.fetch!("priority") == "now"
+           |> Map.fetch!("score") == 0.9
   end
 
   test "a quiet inbox re-ranks when the deadline enters the next class", %{dir: dir, path: path} do
@@ -1443,7 +1460,7 @@ defmodule AttentionServer.PrioritizationTest do
       {:ok, %{"state" => %{"pending_items" => [pending]}}} =
         JSON.decode_line(request.body <> "\n")
 
-      score = if pending["due_in_minutes"] < 60, do: 2.7, else: 1.0
+      score = if pending["due_in_minutes"] < 60, do: 0.9, else: 0.3
       {:ok, Map.new(request.candidates, &{&1, score})}
     end
 
@@ -1457,7 +1474,7 @@ defmodule AttentionServer.PrioritizationTest do
     configure_jev_choice(relay)
     forward(relay, 1, "deadline-only", due)
     state = await_state(relay, &Map.has_key?(&1.priority_deadline_timers, "person-a"))
-    assert state.priority_views["person-a"].entries |> hd() |> Map.fetch!("priority") == "normal"
+    assert state.priority_views["person-a"].entries |> hd() |> Map.fetch!("score") == 0.3
     assert state.priority_deadline_timers["person-a"].due == now + 2_000
 
     Agent.update(clock, fn _ -> now + 3_000 end)
@@ -1465,7 +1482,7 @@ defmodule AttentionServer.PrioritizationTest do
 
     state =
       await_state(relay, fn state ->
-        state.priority_views["person-a"].entries |> hd() |> Map.fetch!("priority") == "now"
+        state.priority_views["person-a"].entries |> hd() |> Map.fetch!("score") == 0.9
       end)
 
     assert state.priority_views["person-a"].basis == "selected"
@@ -1518,7 +1535,7 @@ defmodule AttentionServer.PrioritizationTest do
         end
       end
 
-      {:ok, Map.new(request.candidates, &{&1, 1.0})}
+      {:ok, Map.new(request.candidates, &{&1, 0.3})}
     end
 
     relay = start_relay(path, priority_evaluator: evaluator)
@@ -1540,7 +1557,7 @@ defmodule AttentionServer.PrioritizationTest do
             engine.jev_endpoint,
             engine.jev_model,
             System.system_time(:millisecond),
-            fn request -> {:ok, Map.new(request.candidates, &{&1, 1.0})} end
+            fn request -> {:ok, Map.new(request.candidates, &{&1, 0.3})} end
           )
           |> then(&length(&1.cache.batches))
 
