@@ -78,8 +78,8 @@ defmodule AttentionServer.ChatPushTest do
     })
   end
 
-  defp binding(engine), do: engine.push_bindings[{@person, @reader}]
-  defp due(engine), do: binding(engine).next_at
+  defp push_binding(engine), do: engine.push_bindings[{@person, @reader}]
+  defp due(engine), do: push_binding(engine).next_at
 
   defp assert_round_trip(engine) do
     dir = Path.join(System.tmp_dir!(), "chat-push-#{System.unique_integer([:positive])}")
@@ -87,7 +87,10 @@ defmodule AttentionServer.ChatPushTest do
     on_exit(fn -> File.rm_rf!(dir) end)
     path = Path.join(dir, "state.sqlite3")
     {:ok, store} = Store.open(path)
-    assert {:ok, store} = Store.commit(store, engine, %{person: @person, actor: @reader, action: "test"})
+
+    assert {:ok, store} =
+             Store.commit(store, engine, %{person: @person, actor: @reader, action: "test"})
+
     :ok = Store.close(store)
     assert {:ok, reopened} = Store.open(path)
     assert reopened.engine.push_bindings == engine.push_bindings
@@ -112,10 +115,10 @@ defmodule AttentionServer.ChatPushTest do
     assert request_claim.conversation_high == 0
     assert request_claim.alert["title"] == "2 new requests"
     {:ok, engine} = Engine.finish_push(engine, request_claim, @accepted, now + 1)
-    assert binding(engine).pending_high == 0
-    assert binding(engine).accepted_high == 2
-    assert binding(engine).accepted_conversation_high == 0
-    assert binding(engine).pending_conversation_high > 0
+    assert push_binding(engine).pending_high == 0
+    assert push_binding(engine).accepted_high == 2
+    assert push_binding(engine).accepted_conversation_high == 0
+    assert push_binding(engine).pending_conversation_high > 0
     assert due(engine) == now + 1
 
     {:ok, engine, chat} = Engine.claim_push(engine, now + 1)
@@ -128,9 +131,9 @@ defmodule AttentionServer.ChatPushTest do
     assert chat.locator["acceptance_seq"] == 2
     assert map_size(chat.locator) == 8
     {:ok, engine} = Engine.finish_push(engine, chat, @accepted, now + 2)
-    assert binding(engine).accepted_conversation_high == chat.conversation_high
-    assert binding(engine).pending_conversation_high == 0
-    assert binding(engine).state == "ready"
+    assert push_binding(engine).accepted_conversation_high == chat.conversation_high
+    assert push_binding(engine).pending_conversation_high == 0
+    assert push_binding(engine).state == "ready"
     assert engine.chat_read_positions == %{}
     assert_round_trip(engine)
   end
@@ -142,21 +145,21 @@ defmodule AttentionServer.ChatPushTest do
     now = due(engine)
     {:ok, engine, claim} = Engine.claim_push(engine, now)
     {:ok, engine} = Engine.finish_push(engine, claim, %{state: "retry"}, now + 1)
-    assert binding(engine).accepted_high == 0
-    assert binding(engine).accepted_conversation_high == 0
-    assert binding(engine).pending_high == 1
-    assert binding(engine).pending_conversation_high > 0
+    assert push_binding(engine).accepted_high == 0
+    assert push_binding(engine).accepted_conversation_high == 0
+    assert push_binding(engine).pending_high == 1
+    assert push_binding(engine).pending_conversation_high > 0
     {:ok, engine, claim} = Engine.claim_push(engine, due(engine))
     {:ok, engine} = Engine.finish_push(engine, claim, @accepted, now + 2_000)
     {:ok, engine, chat} = Engine.claim_push(engine, due(engine))
     {engine, _} = forward(engine, "two")
     {engine, _} = reply(engine, "two", "Newer")
-    pending_chat = binding(engine).pending_conversation_high
+    pending_chat = push_binding(engine).pending_conversation_high
     {:ok, engine} = Engine.finish_push(engine, chat, @accepted, now + 2_001)
-    assert binding(engine).accepted_high == 1
-    assert binding(engine).pending_high == 2
-    assert binding(engine).accepted_conversation_high == chat.conversation_high
-    assert binding(engine).pending_conversation_high == pending_chat
+    assert push_binding(engine).accepted_high == 1
+    assert push_binding(engine).pending_high == 2
+    assert push_binding(engine).accepted_conversation_high == chat.conversation_high
+    assert push_binding(engine).pending_conversation_high == pending_chat
     assert pending_chat > chat.conversation_high
 
     {:ok, engine, next_request} = Engine.claim_push(engine, due(engine))
@@ -189,10 +192,16 @@ defmodule AttentionServer.ChatPushTest do
     {engine, _} = forward(engine, "one")
     {:ok, engine} = Engine.open_conversation(engine, @reader)
     {engine, _} = discussion(engine, "one")
-    {engine, _} = request(engine, @reader, %{
-      "type" => "answer", "sender_id" => "app:test", "message_id" => "one",
-      "request_revision" => 1, "answer" => "yes"
-    })
+
+    {engine, _} =
+      request(engine, @reader, %{
+        "type" => "answer",
+        "sender_id" => "app:test",
+        "message_id" => "one",
+        "request_revision" => 1,
+        "answer" => "yes"
+      })
+
     now = due(engine)
     {:ok, engine, ordinary} = Engine.claim_push(engine, now)
     assert ordinary.presentation == :background
@@ -204,27 +213,36 @@ defmodule AttentionServer.ChatPushTest do
     assert conversation.presentation == :background
     refute Map.has_key?(conversation, :locator)
     {:ok, engine} = Engine.finish_push(engine, conversation, @accepted, now + 2)
-    assert binding(engine).state == "ready"
+    assert push_binding(engine).state == "ready"
   end
 
   test "answered request replies alert without opened marker and origin never receives its own preview" do
     {engine, _} = register(setup_engine(), 1)
     {engine, _} = register(engine, 1, String.duplicate("cd", 32), @origin)
     {engine, _} = forward(engine, "one")
-    {engine, _} = request(engine, @reader, %{
-      "type" => "answer", "sender_id" => "app:test", "message_id" => "one",
-      "request_revision" => 1, "answer" => "yes"
-    })
+
+    {engine, _} =
+      request(engine, @reader, %{
+        "type" => "answer",
+        "sender_id" => "app:test",
+        "message_id" => "one",
+        "request_revision" => 1,
+        "answer" => "yes"
+      })
+
     {engine, _} = reply(engine, "one", "After answer")
     assert engine.messages[{@person, "app:test", "one"}].terminal != nil
     assert engine.push_bindings[{@person, @origin}].pending_conversation_high == 0
     now = due(engine)
-    {engine, claims} = Enum.reduce(1..3, {engine, []}, fn _, {engine, claims} ->
-      {:ok, engine, claim} = Engine.claim_push(engine, now + 10)
-      assert claim != nil
-      {:ok, engine} = Engine.finish_push(engine, claim, @accepted, now + 10)
-      {engine, [claim | claims]}
-    end)
+
+    {engine, claims} =
+      Enum.reduce(1..3, {engine, []}, fn _, {engine, claims} ->
+        {:ok, engine, claim} = Engine.claim_push(engine, now + 10)
+        assert claim != nil
+        {:ok, engine} = Engine.finish_push(engine, claim, @accepted, now + 10)
+        {engine, [claim | claims]}
+      end)
+
     alerts = Enum.filter(claims, &(&1.presentation == :alert))
     assert [%{device: @reader, alert: %{"body" => "After answer"}}] = alerts
     assert engine.chat_read_positions == %{}
@@ -236,23 +254,23 @@ defmodule AttentionServer.ChatPushTest do
     {engine, _} = reply(engine, "one", "Before registration")
     baseline = engine.conversation_highs[@person]
     {engine, registered} = register(engine, 1)
-    assert binding(engine).accepted_conversation_high == baseline
-    assert binding(engine).pending_conversation_high == 0
+    assert push_binding(engine).accepted_conversation_high == baseline
+    assert push_binding(engine).pending_conversation_high == 0
     {engine, _} = reply(engine, "one", "Pending")
-    before = binding(engine)
+    before = push_binding(engine)
     high = engine.conversation_highs[@person]
     {:ok, engine, _} = Engine.acknowledge_conversation(engine, @reader, high, high)
     {engine, refreshed} = register(engine, 2)
     assert refreshed["binding_id"] == registered["binding_id"]
-    assert binding(engine).accepted_high == before.accepted_high
-    assert binding(engine).accepted_conversation_high == baseline
-    assert binding(engine).pending_high == before.pending_high
-    assert binding(engine).pending_conversation_high == before.pending_conversation_high
-    assert binding(engine).next_at == before.next_at
+    assert push_binding(engine).accepted_high == before.accepted_high
+    assert push_binding(engine).accepted_conversation_high == baseline
+    assert push_binding(engine).pending_high == before.pending_high
+    assert push_binding(engine).pending_conversation_high == before.pending_conversation_high
+    assert push_binding(engine).next_at == before.next_at
     {engine, replaced} = register(engine, 3, String.duplicate("ef", 32))
     refute replaced["binding_id"] == refreshed["binding_id"]
-    assert binding(engine).accepted_conversation_high == high
-    assert binding(engine).pending_conversation_high == 0
+    assert push_binding(engine).accepted_conversation_high == high
+    assert push_binding(engine).pending_conversation_high == 0
   end
 
   test "same endpoint registration invalidates an in-flight claim without dropping pending work" do
@@ -260,11 +278,11 @@ defmodule AttentionServer.ChatPushTest do
     {engine, _} = forward(engine, "one")
     {engine, _} = reply(engine, "one", "Pending")
     {:ok, engine, old_claim} = Engine.claim_push(engine, due(engine))
-    before = binding(engine)
+    before = push_binding(engine)
     assert_round_trip(engine)
     {engine, _} = register(engine, 2)
-    assert binding(engine).pending_high == before.pending_high
-    assert binding(engine).pending_conversation_high == before.pending_conversation_high
+    assert push_binding(engine).pending_high == before.pending_high
+    assert push_binding(engine).pending_conversation_high == before.pending_conversation_high
     assert {:ok, ^engine} = Engine.finish_push(engine, old_claim, @accepted, due(engine))
   end
 
@@ -278,9 +296,9 @@ defmodule AttentionServer.ChatPushTest do
       {:ok, engine} = Engine.finish_push(engine, ordinary, @accepted, now + 1)
       {:ok, engine, chat} = Engine.claim_push(engine, now + 1)
       {:ok, engine} = Engine.finish_push(engine, chat, outcome, now + 2)
-      assert binding(engine).accepted_high == ordinary.high
-      assert binding(engine).accepted_conversation_high == 0
-      assert binding(engine).state == outcome.state
+      assert push_binding(engine).accepted_high == ordinary.high
+      assert push_binding(engine).accepted_conversation_high == 0
+      assert push_binding(engine).state == outcome.state
     end
   end
 end

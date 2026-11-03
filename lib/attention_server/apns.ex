@@ -246,8 +246,12 @@ defmodule AttentionServer.APNS do
               else: "attention-sync"
 
           {"alert", "10", collapse}
-        {:background, true} -> {"alert", "10", "attention-terminal-sync"}
-        {:background, false} -> {"background", "5", "attention-terminal-sync"}
+
+        {:background, true} ->
+          {"alert", "10", "attention-terminal-sync"}
+
+        {:background, false} ->
+          {"background", "5", "attention-terminal-sync"}
       end
 
     headers = [

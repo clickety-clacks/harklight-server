@@ -521,11 +521,21 @@ defmodule AttentionServer.Engine do
 
         base = %{
           base
-          | accepted_high: if(request?, do: max(binding.accepted_high, claim.high), else: binding.accepted_high),
+          | accepted_high:
+              if(request?,
+                do: max(binding.accepted_high, claim.high),
+                else: binding.accepted_high
+              ),
             accepted_conversation_high:
-              if(request?, do: binding.accepted_conversation_high, else: max(binding.accepted_conversation_high, claim.conversation_high)),
+              if(request?,
+                do: binding.accepted_conversation_high,
+                else: max(binding.accepted_conversation_high, claim.conversation_high)
+              ),
             pending_high:
-              if(request? and binding.pending_high <= claim.high, do: 0, else: binding.pending_high),
+              if(request? and binding.pending_high <= claim.high,
+                do: 0,
+                else: binding.pending_high
+              ),
             pending_conversation_high:
               if(not request? and binding.pending_conversation_high <= claim.conversation_high,
                 do: 0,

@@ -237,7 +237,8 @@ defmodule AttentionServer.APNSPushTest do
     assert payload["attention"]["locator"] == ordinary.locator
   end
 
-  test "a chat locator that cannot fit or fails identity validation is never sent without its target", ctx do
+  test "a chat locator that cannot fit or fails identity validation is never sent without its target",
+       ctx do
     config = chat_provider_config(ctx)
     claim = chat_claim()
 
@@ -292,9 +293,14 @@ defmodule AttentionServer.APNSPushTest do
       badge: 2,
       alert: %{"title" => String.duplicate("名", 5_000), "body" => "Reply preview"},
       locator: %{
-        "v" => 1, "binding_id" => op(95), "person_id" => "person-a",
-        "device_id" => String.duplicate("a", 64), "sender_id" => "app:test",
-        "message_id" => "chat-target", "acceptance_seq" => 7, "target" => "chat"
+        "v" => 1,
+        "binding_id" => op(95),
+        "person_id" => "person-a",
+        "device_id" => String.duplicate("a", 64),
+        "sender_id" => "app:test",
+        "message_id" => "chat-target",
+        "acceptance_seq" => 7,
+        "target" => "chat"
       }
     }
   end
