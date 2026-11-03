@@ -11,11 +11,13 @@ defmodule AttentionServer.JevClient do
   @request_budget 48_000
   @question_budget 24_000
   @criteria [
-    "Low priority: this can wait while more time-sensitive items are handled.",
-    "Normal priority: this should be handled soon, but other items can reasonably come first.",
-    "High priority: delaying this item has clear near-term consequences; handle it before less urgent items.",
-    "Now: this needs the person's attention right away, ahead of everything else."
+    "Trivial: an informational note with no meaningful consequence and no action needed soon.",
+    "Minor: a useful but nonessential action with limited consequences if delayed.",
+    "Important: a meaningful action with concrete stakes, but no immediate serious consequence.",
+    "Time-sensitive: prompt attention is needed to avoid significant near-term consequences.",
+    "Emergency: immediate attention is needed to prevent serious harm, a production outage, or an imminent consequential deadline."
   ]
+  @maximum_score length(@criteria) - 1
 
   def key_status do
     case read_key() do
@@ -60,9 +62,11 @@ defmodule AttentionServer.JevClient do
           question_id = "candidate_" <> Integer.to_string(index)
 
           instructions =
-            "Rate candidate #{index} in the supplied pending set for how soon it should be handled. " <>
-              "Consider its title, body, stated stake, deadline, the sender's stated urgency, message type and message kind relative to the other pending items. " <>
-              "Do not apply a fixed priority order or preference based on message type or kind. " <>
+            "Rate the absolute importance of candidate #{index} to the person on a fixed ladder from trivial to emergency. " <>
+              "Judge this message on its own using its title, body, stated stake, deadline, the sender's stated urgency, message type and message kind. " <>
+              "Sender urgency is evidence, not the answer. Do not apply a fixed priority order or preference based on message type or kind. " <>
+              "Do not compare with other pending items, rank among them, or spread scores across the ladder. " <>
+              "Any number of trivial messages should stay near the bottom; any number of genuine emergencies should stay near the top. " <>
               "The current time is now; due_in_minutes is the time left before the deadline, negative once it has passed."
 
           question = %{
@@ -220,16 +224,18 @@ defmodule AttentionServer.JevClient do
 
   def parse_scores(_, _), do: {:error, :malformed_response}
 
-  defp score_value(value) when is_integer(value) and value in 0..3, do: {:ok, value * 1.0}
+  defp score_value(value) when is_integer(value) and value in 0..@maximum_score,
+    do: {:ok, value / @maximum_score}
 
   defp score_value(%JSON.DecimalToken{raw: raw}) do
     case Float.parse(raw) do
-      {value, ""} when value >= 0 and value <= 3 -> {:ok, value}
+      {value, ""} when value >= 0 and value <= @maximum_score -> {:ok, value / @maximum_score}
       _ -> :error
     end
   end
 
-  defp score_value(value) when is_float(value) and value >= 0 and value <= 3, do: {:ok, value}
+  defp score_value(value) when is_float(value) and value >= 0 and value <= @maximum_score,
+    do: {:ok, value / @maximum_score}
 
   defp score_value(_), do: :error
 

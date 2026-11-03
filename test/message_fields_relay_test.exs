@@ -817,7 +817,8 @@ defmodule AttentionServer.MessageFieldsRelayTest do
       |> then(&Placement.baseline(&1.store.engine, "person-a"))
 
     assert view_entry["thread"] == "original-thread"
-    assert view_entry["priority"] == "normal"
+    refute Map.has_key?(view_entry, "priority")
+    refute Map.has_key?(view_entry, "score")
     refute Map.has_key?(view_entry, "due_at")
 
     GenServer.stop(relay)

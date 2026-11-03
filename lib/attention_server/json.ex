@@ -133,6 +133,9 @@ defmodule AttentionServer.JSON do
       when is_nil(value) or is_boolean(value) or is_integer(value) or is_binary(value),
       do: JSON.encode!(value)
 
+  # Server-computed scores must round-trip as JSON numbers without bucketing.
+  def encode!(value) when is_float(value), do: :erlang.float_to_binary(value, [:short])
+
   def encode!(value) when is_list(value),
     do: "[" <> Enum.map_join(value, ",", &encode!/1) <> "]"
 

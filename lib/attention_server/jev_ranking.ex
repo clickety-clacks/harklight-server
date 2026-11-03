@@ -6,9 +6,7 @@ defmodule AttentionServer.JevRanking do
   alias AttentionServer.Placement.Baseline
 
   @considered_budget 240_000
-  @top_tier_cap 5
-
-  def top_tier_cap, do: @top_tier_cap
+  @finalist_line 0.5
 
   def deadline_class(item, now) do
     case Message.effective_by_when(item.message) do
@@ -92,7 +90,7 @@ defmodule AttentionServer.JevRanking do
 
     finalists =
       considered
-      |> Enum.filter(&(Map.get(first_scores, &1.identity, -1) >= 1.5))
+      |> Enum.filter(&(Map.get(first_scores, &1.identity, -1) >= @finalist_line))
       |> Enum.sort_by(fn item ->
         {-Map.fetch!(first_scores, item.identity), Map.fetch!(basic_index, item.identity)}
       end)

@@ -471,7 +471,8 @@ defmodule AttentionServer.MessageFieldsTest do
     assert [replacement, other_entry] = Placement.baseline(engine, person)
     assert replacement["message_id"] == "replacement-2"
     assert replacement["thread"] == "original-thread"
-    assert replacement["priority"] == "normal"
+    refute Map.has_key?(replacement, "priority")
+    refute Map.has_key?(replacement, "score")
     assert other_entry["message_id"] == "other"
     refute Map.has_key?(other_entry, "thread")
   end

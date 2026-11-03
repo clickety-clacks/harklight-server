@@ -43,9 +43,17 @@ defmodule AttentionServer.Placement do
   def entry(%{identity: {sender, id}, message: message} = item) do
     entry = %{
       "sender_id" => sender,
-      "message_id" => id,
-      "priority" => Map.get(item, :priority, Message.effective_urgency(message))
+      "message_id" => id
     }
+
+    entry =
+      case Map.get(item, :score) do
+        score when is_number(score) and score >= 0 and score <= 1 ->
+          Map.put(entry, "score", score)
+
+        _ ->
+          entry
+      end
 
     entry =
       case Map.get(message, "thread") do
@@ -182,7 +190,7 @@ defmodule AttentionServer.Placement.Baseline do
   def place(items, _previous, _result) do
     items
     |> ordered_items()
-    |> Enum.map(&with_effective_priority(&1, Message.effective_urgency(&1.message)))
+    |> Enum.map(&(Map.delete(&1, :score) |> AttentionServer.Placement.entry()))
   end
 
   def ordered_items(items) when is_list(items) do
@@ -201,12 +209,6 @@ defmodule AttentionServer.Placement.Baseline do
   defp urgency_rank("normal"), do: 1
   defp urgency_rank("low"), do: 0
 
-  defp with_effective_priority(item, priority) do
-    item
-    |> Map.put(:priority, priority)
-    |> AttentionServer.Placement.entry()
-  end
-
   @impl true
   def reassess(_items, _previous), do: :none
 
@@ -222,54 +224,40 @@ defmodule AttentionServer.Placement.JevSet do
   alias AttentionServer.Placement
   alias AttentionServer.Placement.Baseline
   alias AttentionServer.JevClient
-  alias AttentionServer.JevRanking
 
   @impl true
   def place(items, _previous, {:scored, scores}) do
-    scored_place(items, scores, MapSet.new())
+    scored_place(items, scores)
   end
 
-  def place(items, _previous, {:ranked, scores, overflow}) do
-    scored_place(items, scores, overflow)
+  def place(items, _previous, {:ranked, scores, _overflow}) do
+    scored_place(items, scores)
   end
 
   def place(items, previous, _result), do: retained_place(items, previous)
 
-  defp scored_place(items, scores, overflow) do
-    items_by_identity = Map.new(items, &{&1.identity, &1})
-    baseline = Baseline.ordered_items(items)
-
-    baseline
+  defp scored_place(items, scores) do
+    items
+    |> Baseline.ordered_items()
     |> Enum.with_index()
     |> Enum.map(fn {item, index} ->
       score = Map.get(scores, item.identity)
 
-      priority =
-        cond do
-          MapSet.member?(overflow, item.identity) -> "normal"
-          valid_score?(score) -> score_priority(score)
-          true -> Message.effective_urgency(item.message)
-        end
-
       sort_score =
-        cond do
-          MapSet.member?(overflow, item.identity) -> 1.0
-          valid_score?(score) -> score
-          true -> urgency_score(Message.effective_urgency(item.message))
-        end
+        if valid_score?(score),
+          do: score,
+          else: urgency_score(Message.effective_urgency(item.message))
 
-      {sort_score, index, Map.fetch!(items_by_identity, item.identity), priority}
+      {sort_score, index, with_score(item, score)}
     end)
-    |> Enum.sort_by(fn {score, index, _item, _priority} -> {-score, index} end)
-    |> Enum.map_reduce(0, fn {_score, _index, item, priority}, top_count ->
-      {priority, top_count} = cap_priority(priority, top_count)
+    |> Enum.sort_by(fn {score, index, _entry} -> {-score, index} end)
+    |> Enum.map(fn {_, _, entry} -> entry end)
+  end
 
-      item
-      |> Map.put(:priority, priority)
-      |> Placement.entry()
-      |> then(&{&1, top_count})
-    end)
-    |> elem(0)
+  defp with_score(item, score) do
+    item
+    |> Map.put(:score, score)
+    |> Placement.entry()
   end
 
   defp retained_place(items, previous) do
@@ -291,17 +279,13 @@ defmodule AttentionServer.Placement.JevSet do
         cond do
           Map.has_key?(items_by_identity, identity) ->
             item = Map.fetch!(items_by_identity, identity)
-            priority = valid_priority(entry["priority"], Message.effective_urgency(item.message))
 
-            {retained ++ [item |> Map.put(:priority, priority) |> Placement.entry()],
-             MapSet.put(placed, item.identity)}
+            {retained ++ [with_score(item, entry["score"])], MapSet.put(placed, item.identity)}
 
           Map.has_key?(replacements_by_target, identity) ->
             item = Map.fetch!(replacements_by_target, identity)
-            priority = valid_priority(entry["priority"], Message.effective_urgency(item.message))
 
-            {retained ++ [item |> Map.put(:priority, priority) |> Placement.entry()],
-             MapSet.put(placed, item.identity)}
+            {retained ++ [with_score(item, entry["score"])], MapSet.put(placed, item.identity)}
 
           true ->
             {retained, placed}
@@ -311,36 +295,15 @@ defmodule AttentionServer.Placement.JevSet do
     new_entries =
       Enum.filter(baseline, &(not MapSet.member?(placed, Placement.identity(&1))))
 
-    (retained ++ new_entries)
-    |> Enum.map_reduce(0, fn entry, count ->
-      {priority, next_count} = cap_priority(entry["priority"], count)
-      {Map.put(entry, "priority", priority), next_count}
-    end)
-    |> elem(0)
+    retained ++ new_entries
   end
 
-  defp cap_priority(priority, count) when priority in ["high", "now"] do
-    if count < JevRanking.top_tier_cap(), do: {priority, count + 1}, else: {"normal", count}
-  end
-
-  defp cap_priority(priority, count), do: {priority, count}
-
-  defp valid_priority(value, _fallback) when value in ["low", "normal", "high", "now"],
-    do: value
-
-  defp valid_priority(_, fallback), do: fallback
-
-  defp valid_score?(value), do: is_number(value) and value >= 0 and value <= 3
-
-  defp score_priority(score) when score < 0.5, do: "low"
-  defp score_priority(score) when score < 1.5, do: "normal"
-  defp score_priority(score) when score < 2.5, do: "high"
-  defp score_priority(_), do: "now"
+  defp valid_score?(value), do: is_number(value) and value >= 0 and value <= 1
 
   defp urgency_score("low"), do: 0.0
-  defp urgency_score("normal"), do: 1.0
-  defp urgency_score("high"), do: 2.0
-  defp urgency_score("now"), do: 3.0
+  defp urgency_score("normal"), do: 1 / 3
+  defp urgency_score("high"), do: 2 / 3
+  defp urgency_score("now"), do: 1.0
 
   @impl true
   def reassess(_items, _previous), do: :whole_set
