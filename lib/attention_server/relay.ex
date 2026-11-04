@@ -110,6 +110,9 @@ defmodule AttentionServer.Relay do
   def origin_status(server, verified_device_key, handle),
     do: GenServer.call(server, {:origin_status, verified_device_key, handle})
 
+  def origin_ack2(server, verified_device_key, feed_seq, declaration),
+    do: GenServer.call(server, {:origin_ack2, verified_device_key, feed_seq, declaration})
+
   def origin_support(server, verified_device_key, declaration),
     do: GenServer.call(server, {:origin_support, verified_device_key, declaration})
 
@@ -912,8 +915,18 @@ defmodule AttentionServer.Relay do
   def handle_call({:agent_identity, key}, _from, state),
     do: {:reply, Engine.agent_identity(state.store.engine, key), state}
 
-  def handle_call({:origin_feed, key, since}, _from, state),
-    do: {:reply, Engine.origin_feed(state.store.engine, key, since), state}
+  def handle_call({:origin_feed, key, since}, _from, state) do
+    case Engine.deliver_origin_feed(state.store.engine, key, since) do
+      {:ok, next, reply} ->
+        case commit(state.store, next, audit(state.store.engine, key, "origin_feed")) do
+          {:ok, store} -> {:reply, {:ok, reply}, %{state | store: store}}
+          _ -> {:reply, {:error, :storage_unavailable}, state}
+        end
+
+      error ->
+        {:reply, error, state}
+    end
+  end
 
   def handle_call({:origin_status, key, handle}, _from, state) do
     engine = state.store.engine
@@ -1339,6 +1352,19 @@ defmodule AttentionServer.Relay do
          end) do
       {stream_key, _} -> {:reply, :ok, detach_origin_stream(state, stream_key)}
       nil -> {:reply, :ok, state}
+    end
+  end
+
+  def handle_call({:origin_ack2, key, feed_seq, declaration}, _from, state) do
+    case Engine.origin_ack2(state.store.engine, key, feed_seq, declaration) do
+      {:ok, next, reply} ->
+        case commit(state.store, next, audit(state.store.engine, key, "origin_ack2")) do
+          {:ok, store} -> {:reply, {:ok, reply}, %{state | store: store}}
+          _ -> {:reply, {:error, :storage_unavailable}, state}
+        end
+
+      error ->
+        {:reply, error, state}
     end
   end
 
