@@ -341,7 +341,8 @@ defmodule AttentionServer.DeliveryAcksTest do
   test "device label precedes sender display and server/agent entries never receive ACK1", c do
     discussion(c.relay)
     {:ok, store} = Store.open(c.path)
-    engine = put_in(store.engine.devices["origin"].label, "Automation service")
+    engine = store.engine
+    engine = put_in(engine.devices["origin"].label, "Automation service")
     {:ok, next, _} = Engine.deliver_origin_feed(engine, "origin", 0)
     {:ok, events, _} = Engine.conversation_events(next, "phone", 0)
     ack = Enum.find(events, &(&1["kind"] == "delivery_ack"))
