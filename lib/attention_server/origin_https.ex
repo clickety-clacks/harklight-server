@@ -130,6 +130,8 @@ defmodule AttentionServer.OriginHTTPS do
   defp listen(opts, relay, certfile, keyfile, cacertfile) do
     :ssl.listen(Keyword.get(opts, :port, 0),
       ip: Keyword.get(opts, :ip, {127, 0, 0, 1}),
+      # Preserve queued connections while a fleet reconnect burst is accepted.
+      backlog: 512,
       active: false,
       mode: :binary,
       packet: :raw,
