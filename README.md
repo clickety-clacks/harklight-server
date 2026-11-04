@@ -28,7 +28,7 @@ The package does not install a service, configure the tailnet or expose ports.
 State, owner/device identities, trust roots and sender grants live outside the
 versioned package. Run one server per database. Keep private keys and backups
 private; do not repeat bootstrap over an existing installation.
-This source, v0.1.21, v0.1.20, v0.1.19, v0.1.18, v0.1.17, v0.1.16, v0.1.15, v0.1.14 and v0.1.13 use FORMAT24 and migrate supported older state on startup.
+This source, the v0.1.24 repair line, v0.1.23, v0.1.22, v0.1.21, v0.1.20, v0.1.19, v0.1.18, v0.1.17, v0.1.16, v0.1.15, v0.1.14 and v0.1.13 use FORMAT24 and migrate supported older state on startup.
 The v0.1.12 package uses FORMAT23, v0.1.11 uses FORMAT22, and v0.1.10 accepts
 formats 1–6 and 8–21. Those pre-FORMAT24 packages cannot start against FORMAT24
 state. The release installer creates one full private backup before switching
@@ -37,6 +37,11 @@ the candidate process does not become ready, the installer restores that
 backup, selects and starts the prior release, and reports that writes since the
 backup may have been lost. Returning to v0.1.12 or earlier after a FORMAT24
 upgrade requires restoring the complete pre-upgrade backup.
+Version 0.1.25 also persists delivery acknowledgements (ACK1 and ACK2). Although
+it retains FORMAT24, no safe code-only downgrade to 0.1.24 or earlier has been
+established once new data is written. Agree on recovery before cutover and
+retain the complete private pre-upgrade backup; restoring it discards all writes
+since capture.
 
 The archive does not contain the `harklight-agent` conversation CLI; install
 it separately as described under [Get the agent CLI](#get-the-agent-cli).
