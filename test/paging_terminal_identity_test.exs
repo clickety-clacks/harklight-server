@@ -77,11 +77,14 @@ defmodule AttentionServer.PagingTerminalIdentityTest do
         assert {:ok, %{"status" => "delivered"}} = Relay.origin_ack(ctx.relay, "origin", 3)
 
         for device <- ~w(origin reader second-reader) do
-          assert {:ok, [revision, receipt], 2} =
+          assert {:ok, [revision, delivery_ack, receipt], 3} =
                    Relay.conversation_events(ctx.relay, device, 0)
 
           assert revision["kind"] == "revision"
           assert revision["request_revision"] == 2
+          assert delivery_ack["kind"] == "delivery_ack"
+          assert delivery_ack["stage"] == "ack1"
+          assert delivery_ack["event_id"] == terminal["event_id"]
           assert receipt["kind"] == "receipt"
           assert receipt["event_id"] == terminal["event_id"]
           assert receipt["request_revision"] == 2

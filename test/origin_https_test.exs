@@ -1110,7 +1110,7 @@ defmodule AttentionServer.OriginHTTPSTest do
     assert :ok = await_seq(c.relay, c.origin, 3, 100)
     :ssl.close(socket)
 
-    assert {:ok, 200, %{"type" => "ok", "seq" => 3, "duplicate" => true}} =
+    assert {:ok, 200, %{"type" => "ok", "seq" => 4, "event_id" => "3", "duplicate" => true}} =
              request(c, "a2", reply)
 
     assert %{"type" => "ok", "seq" => 2} =
@@ -1264,7 +1264,12 @@ defmodule AttentionServer.OriginHTTPSTest do
 
     :ssl.close(stream)
     assert :ok = await_availability(c, "not_listening", 100)
-    assert {:ok, [detached], 3} = Relay.conversation_events(c.relay, c.reader, 2)
+    assert {:ok, [ack1, detached], 4} = Relay.conversation_events(c.relay, c.reader, 2)
+    assert ack1["kind"] == "delivery_ack"
+    assert ack1["stage"] == "ack1"
+    assert ack1["event_id"] == "2"
+    assert ack1["op_id"] == op(11)
+    assert ack1["ack2_expected"] == false
     assert detached["availability"] == "not_listening"
     assert is_integer(detached["last_detached_at"])
 
@@ -1277,12 +1282,12 @@ defmodule AttentionServer.OriginHTTPSTest do
       )
 
     assert {:ok, _} = recv_until(stream_again, "\n\n", <<>>, 20)
-    assert {:ok, [reattached], 4} = Relay.conversation_events(c.relay, c.reader, 3)
+    assert {:ok, [reattached], 5} = Relay.conversation_events(c.relay, c.reader, 4)
     assert reattached["availability"] == "listening"
     assert :ok = Supervisor.terminate_child(c.server, :origin_https)
     assert {:error, :closed} = :ssl.recv(stream_again, 0, 5_000)
     assert :ok = await_relay_availability(c, "not_listening", 100)
-    assert {:ok, [listener_stopped], 5} = Relay.conversation_events(c.relay, c.reader, 4)
+    assert {:ok, [listener_stopped], 6} = Relay.conversation_events(c.relay, c.reader, 5)
     assert listener_stopped["availability"] == "not_listening"
     :ssl.close(stream_again)
   end

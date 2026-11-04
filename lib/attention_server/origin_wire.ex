@@ -7,7 +7,7 @@ defmodule AttentionServer.OriginWire do
   alias AttentionServer.{Diagnostics, JSON, Message, Relay}
 
   @selector_fields ~w(person person_id origin origin_key device_id device_key agent_id agent_key)
-  @operation_types ~w(send reply revise withdraw result file_use support attachment_update)
+  @operation_types ~w(send reply revise withdraw result file_use support attachment_update ack2)
 
   def command(relay, key, request) when is_map(request) and not is_struct(request) do
     ref = Map.get(request, "ref")
@@ -77,6 +77,16 @@ defmodule AttentionServer.OriginWire do
   defp run(relay, key, %{"type" => "ack", "event_id" => id} = request, ref) do
     with {:ok, seq} <- event_seq(id),
          {:ok, reply} <- Relay.origin_ack(relay, key, seq, request["file_transfers"]) do
+      ok(reply, ref)
+    else
+      {:error, :invalid_event_id} -> error("invalid_field", "event_id", ref)
+      {:error, reason} -> error(Atom.to_string(reason), nil, ref)
+    end
+  end
+
+  defp run(relay, key, %{"type" => "ack2", "event_id" => id} = request, ref) do
+    with {:ok, seq} <- event_seq(id),
+         {:ok, reply} <- Relay.origin_ack2(relay, key, seq, request) do
       ok(reply, ref)
     else
       {:error, :invalid_event_id} -> error("invalid_field", "event_id", ref)

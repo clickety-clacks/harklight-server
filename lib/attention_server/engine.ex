@@ -2425,6 +2425,167 @@ defmodule AttentionServer.Engine do
     end
   end
 
+  @doc "Record ACK1 with the exact successful feed response, before returning it to the transport."
+  def deliver_origin_feed(%__MODULE__{} = engine, key, since) do
+    with {:ok, person} <- authorized_person(engine, key),
+         {:ok, feed} <- Conversation.fetch(engine, person, key, since) do
+      next =
+        Enum.reduce(feed["entries"], engine, fn entry, current ->
+          if delivery_ack_entry?(entry),
+            do: ensure_delivery_ack1(current, person, key, entry),
+            else: current
+        end)
+
+      {:ok, next, feed}
+    end
+  end
+
+  @doc "System handoff acknowledgment, independent of the agent's Seen receipt."
+  def origin_ack2(%__MODULE__{} = engine, key, feed_seq, frame) do
+    with {:ok, person} <- authorized_person(engine, key),
+         true <- Message.uuid_v4?(frame["op_id"]),
+         true <- valid_delivery_ack2?(frame),
+         entry when not is_nil(entry) <-
+           get_in(engine.origin_feeds, [{person, key}, :entries, feed_seq]),
+         true <- delivery_ack_entry?(entry) do
+      semantic =
+        frame
+        |> Map.take(~w(outcome reason agent rerouted))
+        |> Map.merge(%{"type" => "ack2", "event_id" => entry["event_id"]})
+        |> then(fn value ->
+          if value["outcome"] == "handed", do: Map.put_new(value, "rerouted", false), else: value
+        end)
+
+      case receipt(engine, person, key, frame["op_id"], semantic) do
+        {:duplicate, reply} ->
+          {:ok, engine, Map.put(reply, "duplicate", true)}
+
+        :conflict ->
+          {:error, :operation_conflict}
+
+        :missing ->
+          next = ensure_delivery_ack1(engine, person, key, entry)
+          prior = delivery_ack_fact(next, person, key, entry, :ack2)
+          prior_outcome = if prior, do: prior["outcome"]
+          outcome = semantic["outcome"]
+
+          {next, status, effective} =
+            cond do
+              prior_outcome == outcome ->
+                {next, "already_recorded", prior_outcome}
+
+              prior_outcome == "handed" ->
+                {next, "superseded", prior_outcome}
+
+              true ->
+                fact =
+                  delivery_ack_payload(next, key, entry, "ack2", semantic["agent"])
+                  |> Map.merge(Map.take(semantic, ~w(outcome reason rerouted)))
+
+                {append_delivery_ack(next, person, key, entry, :ack2, fact), "recorded", outcome}
+            end
+
+          reply = %{"status" => status, "stage_outcome" => effective}
+          {:ok, save_receipt(next, person, key, frame["op_id"], semantic, reply), reply}
+      end
+    else
+      false -> {:error, :invalid_field}
+      nil -> {:error, :not_found}
+      error -> error
+    end
+  end
+
+  defp delivery_ack_entry?(%{"kind" => kind, "author" => "person"}),
+    do: kind in ["discussion", "terminal"]
+
+  defp delivery_ack_entry?(_), do: false
+
+  defp valid_delivery_ack2?(frame) do
+    agent_valid = not Map.has_key?(frame, "agent") or delivery_ack_name?(frame["agent"])
+
+    agent_valid and
+      case frame["outcome"] do
+        "handed" ->
+          not Map.has_key?(frame, "reason") and
+            (not Map.has_key?(frame, "rerouted") or is_boolean(frame["rerouted"]))
+
+        "not_handed" ->
+          not Map.has_key?(frame, "rerouted") and delivery_ack_name?(frame["reason"])
+
+        _ ->
+          false
+      end
+  end
+
+  defp delivery_ack_name?(value),
+    do: is_binary(value) and String.valid?(value) and String.trim(value) != ""
+
+  defp ensure_delivery_ack1(engine, person, origin, entry) do
+    if delivery_ack_fact(engine, person, origin, entry, :ack1) do
+      engine
+    else
+      session = Map.fetch!(engine.origin_sessions, {person, origin, entry["session_handle"]})
+      support = Map.get(session, :support) || %{}
+
+      fact =
+        delivery_ack_payload(engine, origin, entry, "ack1", nil)
+        |> Map.put("ack2_expected", support["ack2"] == true)
+
+      append_delivery_ack(engine, person, origin, entry, :ack1, fact)
+    end
+  end
+
+  # The feed stores journal pointers, separate from the immutable turn and Seen state.
+  # Store.commit persists both the pointer and fact in the same SQLite transaction.
+  defp delivery_ack_fact(engine, person, origin, entry, stage) do
+    feed = Map.fetch!(engine.origin_feeds, {person, origin})
+    stages = Map.get(Map.get(feed, :delivery_acks, %{}), entry["feed_seq"], %{})
+
+    case Map.get(stages, stage) do
+      nil -> nil
+      seq -> Map.fetch!(engine.conversation_events, {person, seq}).payload
+    end
+  end
+
+  defp append_delivery_ack(engine, person, origin, entry, stage, fact) do
+    key = {person, entry["sender_id"], entry["message_id"]}
+    {next, seq} = append_conversation_fact(engine, person, key, fact)
+    feed_key = {person, origin}
+    feed = Map.fetch!(next.origin_feeds, feed_key)
+    acks = Map.get(feed, :delivery_acks, %{})
+    stages = Map.put(Map.get(acks, entry["feed_seq"], %{}), stage, seq)
+    feed = Map.put(feed, :delivery_acks, Map.put(acks, entry["feed_seq"], stages))
+    %{next | origin_feeds: Map.put(next.origin_feeds, feed_key, feed)}
+  end
+
+  defp delivery_ack_payload(engine, origin, entry, stage, agent) do
+    person = engine.devices[origin].person
+    record = engine.messages[{person, entry["sender_id"], entry["message_id"]}]
+    sender_display = SenderNames.committed(record, entry["sender_id"])
+
+    system =
+      Enum.find(
+        [
+          Map.get(engine.devices[origin], :label),
+          record.message["display_name"],
+          if(sender_display, do: sender_display["name"])
+        ],
+        &delivery_ack_name?/1
+      )
+
+    acknowledger = if system, do: %{"system" => system}, else: %{}
+    acknowledger = if agent, do: Map.put(acknowledger, "agent", agent), else: acknowledger
+
+    entry
+    |> Map.take(~w(event_id op_id terminal_seq session_handle request_revision))
+    |> Map.merge(%{
+      "kind" => "delivery_ack",
+      "stage" => stage,
+      "at_ms" => System.system_time(:millisecond),
+      "acknowledger" => acknowledger
+    })
+  end
+
   @doc "One delivered receipt for a person-authored actionable feed entry."
   def origin_ack(%__MODULE__{} = engine, key, feed_seq, reports \\ nil) do
     with {:ok, person} <- authorized_person(engine, key) do
@@ -4175,6 +4336,7 @@ defmodule AttentionServer.Engine do
               %{
                 "kind" => "discussion",
                 "author" => "person",
+                "delivery_acks" => true,
                 "sender_id" => frame["sender_id"],
                 "message_id" => frame["message_id"],
                 "session_handle" => handle,
@@ -5492,7 +5654,7 @@ defmodule AttentionServer.Engine do
           base,
           Map.take(
             event.payload,
-            ~w(author event_id acting_event_id in_reply_to availability last_detached_at session_handle listening_support unsupported_reason delivered acted file_transfers file status reason op_id terminal_seq terminal_state retracted_at)
+            ~w(author event_id acting_event_id in_reply_to availability last_detached_at session_handle listening_support unsupported_reason delivered acted file_transfers file status reason op_id terminal_seq terminal_state retracted_at delivery_acks stage at_ms acknowledger ack2_expected outcome rerouted)
           )
         )
       else

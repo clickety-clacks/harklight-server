@@ -12,7 +12,7 @@ defmodule AttentionServer.Conversation do
          (is_binary(vendor_id) and vendor_id != "" and String.valid?(vendor_id)))
   end
 
-  @support_fields ~w(route cli_version unsupported_reason)
+  @support_fields ~w(route cli_version unsupported_reason ack2)
 
   def support_from_frame(frame) do
     if Enum.any?(@support_fields, &Map.has_key?(frame, &1)) do
@@ -22,7 +22,8 @@ defmodule AttentionServer.Conversation do
 
       if route in ~w(claude-code codex other) and is_binary(version) and version != "" and
            String.valid?(version) and Map.has_key?(frame, "unsupported_reason") and
-           (is_nil(reason) or (is_binary(reason) and reason != "" and String.valid?(reason))) do
+           (is_nil(reason) or (is_binary(reason) and reason != "" and String.valid?(reason))) and
+           (not Map.has_key?(frame, "ack2") or is_boolean(frame["ack2"])) do
         {:ok, Map.take(frame, @support_fields)}
       else
         {:error, "listening_support"}
@@ -72,7 +73,7 @@ defmodule AttentionServer.Conversation do
 
   def valid_support_record?(%{"origin" => origin, "reported_at" => at} = record) do
     is_binary(origin) and origin != "" and is_integer(at) and at > 0 and
-      Map.keys(record) |> Enum.sort() ==
+      Map.keys(Map.delete(record, "ack2")) |> Enum.sort() ==
         ~w(cli_version origin reported_at route unsupported_reason) and
       match?({:ok, _}, support_from_frame(record))
   end
@@ -553,11 +554,34 @@ defmodule AttentionServer.Conversation do
     {%{engine | origin_feeds: Map.put(engine.origin_feeds, key, updated)}, item}
   end
 
+  defp valid_delivery_acks?(engine, person, origin, feed) do
+    Enum.all?(Map.get(feed, :delivery_acks, %{}), fn {feed_seq, stages} ->
+      entry = Map.fetch!(feed.entries, feed_seq)
+
+      entry["author"] == "person" and entry["kind"] in ~w(discussion terminal) and
+        Map.has_key?(stages, :ack1) and
+        Enum.all?(stages, fn {stage, seq} ->
+          fact = Map.fetch!(engine.conversation_events, {person, seq})
+          payload = fact.payload
+
+          stage in [:ack1, :ack2] and
+            fact.key == {person, entry["sender_id"], entry["message_id"]} and
+            engine.messages[fact.key].origin == origin and
+            payload["kind"] == "delivery_ack" and payload["stage"] == Atom.to_string(stage) and
+            payload["event_id"] == entry["event_id"] and
+            payload["request_revision"] == entry["request_revision"] and
+            payload["session_handle"] == entry["session_handle"] and
+            (stage == :ack1 or seq > stages.ack1)
+        end)
+    end)
+  end
+
   def valid_state?(engine) do
     Enum.all?(engine.origin_feeds, fn {{person, origin}, feed} ->
       get_in(engine.devices, [origin, :person]) == person and
         is_integer(feed.high) and feed.high >= 0 and
         map_size(feed.entries) == feed.high and
+        valid_delivery_acks?(engine, person, origin, feed) and
         Enum.all?(feed.entries, fn {seq, entry} ->
           is_integer(seq) and seq > 0 and seq <= feed.high and
             entry["feed_seq"] == seq and entry["event_id"] == Integer.to_string(seq) and
