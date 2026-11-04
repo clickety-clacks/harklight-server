@@ -2565,8 +2565,11 @@ defmodule AttentionServer.Engine do
 
     system =
       Enum.find(
-        [Map.get(engine.devices[origin], :label), record.message["display_name"],
-         if(sender_display, do: sender_display["name"])],
+        [
+          Map.get(engine.devices[origin], :label),
+          record.message["display_name"],
+          if(sender_display, do: sender_display["name"])
+        ],
         &delivery_ack_name?/1
       )
 

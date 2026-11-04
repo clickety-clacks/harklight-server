@@ -30,38 +30,78 @@ defmodule AttentionServer.DeliveryAcksTest do
   end
 
   defp request(relay, key, frame) do
-    {:ok, line} = Relay.request_line(relay, key, JSON.encode!(if(frame["type"] == "answer_no_comment", do: frame, else: Map.put(frame, "v", 1))) <> "\n")
+    {:ok, line} =
+      Relay.request_line(
+        relay,
+        key,
+        JSON.encode!(
+          if(frame["type"] == "answer_no_comment", do: frame, else: Map.put(frame, "v", 1))
+        ) <> "\n"
+      )
+
     {:ok, reply} = JSON.decode_line(line)
     reply
   end
 
   defp send_request(relay, origin \\ "origin") do
-    assert %{"type" => "ok"} = request(relay, origin, %{
-      "type" => "forward", "op_id" => op(1), "session_handle" => @handle,
-      "message" => %{"sender_id" => "app:test", "message_id" => "question",
-        "display_name" => "Build helper", "created_at" => 1, "title" => "Check this"}
-    })
+    assert %{"type" => "ok"} =
+             request(relay, origin, %{
+               "type" => "forward",
+               "op_id" => op(1),
+               "session_handle" => @handle,
+               "message" => %{
+                 "sender_id" => "app:test",
+                 "message_id" => "question",
+                 "display_name" => "Build helper",
+                 "created_at" => 1,
+                 "title" => "Check this"
+               }
+             })
   end
 
   defp discussion(relay, reader \\ "phone", n \\ 2) do
-    assert %{"type" => "ok"} = reply = request(relay, reader, %{
-      "type" => "discussion", "op_id" => op(n), "sender_id" => "app:test",
-      "message_id" => "question", "request_revision" => 1, "text" => "Please check"
-    })
+    assert %{"type" => "ok"} =
+             reply =
+             request(relay, reader, %{
+               "type" => "discussion",
+               "op_id" => op(n),
+               "sender_id" => "app:test",
+               "message_id" => "question",
+               "request_revision" => 1,
+               "text" => "Please check"
+             })
+
     reply["event_id"]
   end
 
   defp support(relay, capable, n \\ 3) do
     OriginWire.command(relay, "origin", %{
-      "v" => 1, "type" => "support", "op_id" => op(n), "session_handle" => @handle,
-      "route" => "codex", "cli_version" => "fixture", "unsupported_reason" => nil, "ack2" => capable
+      "v" => 1,
+      "type" => "support",
+      "op_id" => op(n),
+      "session_handle" => @handle,
+      "route" => "codex",
+      "cli_version" => "fixture",
+      "unsupported_reason" => nil,
+      "ack2" => capable
     })
   end
 
   defp ack2(relay, id, outcome, n, extra \\ %{}) do
-    OriginWire.command(relay, "origin", Map.merge(%{
-      "v" => 1, "type" => "ack2", "op_id" => op(n), "event_id" => id, "outcome" => outcome
-    }, extra))
+    OriginWire.command(
+      relay,
+      "origin",
+      Map.merge(
+        %{
+          "v" => 1,
+          "type" => "ack2",
+          "op_id" => op(n),
+          "event_id" => id,
+          "outcome" => outcome
+        },
+        extra
+      )
+    )
   end
 
   defp facts(relay, key \\ "phone") do
@@ -121,50 +161,78 @@ defmodule AttentionServer.DeliveryAcksTest do
     id = discussion(c.relay)
     assert %{"type" => "ok"} = support(c.relay, true)
     failed = %{"reason" => "No session is available", "agent" => "Reviewer"}
+
     assert %{"status" => "recorded", "stage_outcome" => "not_handed"} =
-      ack2(c.relay, id, "not_handed", 4, failed)
+             ack2(c.relay, id, "not_handed", 4, failed)
+
     assert [first, second] = delivery_facts(c.relay)
     assert first["stage"] == "ack1"
     assert second["stage"] == "ack2"
     assert second["conversation_seq"] == first["conversation_seq"] + 1
     assert second["acknowledger"]["agent"] == "Reviewer"
     refute Map.has_key?(second, "rerouted")
-    assert %{"duplicate" => true, "status" => "recorded"} = ack2(c.relay, id, "not_handed", 4, failed)
-    assert %{"status" => "already_recorded"} = ack2(c.relay, id, "not_handed", 5, %{"reason" => "Later reason"})
+
+    assert %{"duplicate" => true, "status" => "recorded"} =
+             ack2(c.relay, id, "not_handed", 4, failed)
+
+    assert %{"status" => "already_recorded"} =
+             ack2(c.relay, id, "not_handed", 5, %{"reason" => "Later reason"})
+
     assert delivery_facts(c.relay) == [first, second]
 
     assert %{"status" => "recorded", "stage_outcome" => "handed"} =
-      ack2(c.relay, id, "handed", 6, %{"agent" => "Alternate reviewer", "rerouted" => true})
+             ack2(c.relay, id, "handed", 6, %{"agent" => "Alternate reviewer", "rerouted" => true})
+
     assert [^first, ^second, handed] = delivery_facts(c.relay)
     assert handed["rerouted"] == true
     assert handed["acknowledger"]["agent"] == "Alternate reviewer"
     refute Map.has_key?(handed, "reason")
-    assert %{"status" => "already_recorded"} = ack2(c.relay, id, "handed", 7, %{"agent" => "Different", "rerouted" => false})
-    assert %{"status" => "superseded", "stage_outcome" => "handed"} = ack2(c.relay, id, "not_handed", 8, failed)
+
+    assert %{"status" => "already_recorded"} =
+             ack2(c.relay, id, "handed", 7, %{"agent" => "Different", "rerouted" => false})
+
+    assert %{"status" => "superseded", "stage_outcome" => "handed"} =
+             ack2(c.relay, id, "not_handed", 8, failed)
+
     assert delivery_facts(c.relay) == [first, second, handed]
     # Same operation retains its original result even after a newer outcome wins.
-    assert %{"duplicate" => true, "stage_outcome" => "not_handed"} = ack2(c.relay, id, "not_handed", 4, failed)
+    assert %{"duplicate" => true, "stage_outcome" => "not_handed"} =
+             ack2(c.relay, id, "not_handed", 4, failed)
+
     assert %{"type" => "error", "reason" => "operation_conflict"} = ack2(c.relay, id, "handed", 4)
     assert Enum.all?(facts(c.relay), &(&1["kind"] != "receipt"))
   end
 
   test "malformed ACK2 and wrong origin cannot create a delivery fact", c do
     id = discussion(c.relay)
+
     for {outcome, extra} <- [
-      {"invalid", %{}}, {"handed", %{"agent" => " "}}, {"handed", %{"rerouted" => "true"}},
-      {"handed", %{"reason" => "not permitted"}}, {"not_handed", %{}},
-      {"not_handed", %{"reason" => ""}}, {"not_handed", %{"reason" => "No route", "rerouted" => false}}
-    ] do
+          {"invalid", %{}},
+          {"handed", %{"agent" => " "}},
+          {"handed", %{"rerouted" => "true"}},
+          {"handed", %{"reason" => "not permitted"}},
+          {"not_handed", %{}},
+          {"not_handed", %{"reason" => ""}},
+          {"not_handed", %{"reason" => "No route", "rerouted" => false}}
+        ] do
       assert %{"type" => "error"} = ack2(c.relay, id, outcome, 4, extra)
     end
+
     for bad_id <- ["1", "999", "02", 2] do
       assert %{"type" => "error"} = ack2(c.relay, bad_id, "handed", 4)
     end
+
     for key <- ["phone", "stranger", "unknown"] do
-      assert %{"type" => "error"} = OriginWire.command(c.relay, key, %{
-        "v" => 1, "type" => "ack2", "op_id" => op(4), "event_id" => id, "outcome" => "handed"
-      })
+      assert %{"type" => "error"} =
+               OriginWire.command(c.relay, key, %{
+                 "v" => 1,
+                 "type" => "ack2",
+                 "op_id" => op(4),
+                 "event_id" => id,
+                 "outcome" => "handed"
+               })
     end
+
     assert %{"type" => "error"} = ack2(c.relay, id, "handed", 4, %{"op_id" => "not-a-uuid"})
     assert delivery_facts(c.relay) == []
     assert %{"type" => "error"} = support(c.relay, "true")
@@ -173,20 +241,41 @@ defmodule AttentionServer.DeliveryAcksTest do
   test "answer and No comment ACKs retain exact terminal identity", c do
     for {kind, n} <- [{"answer", 10}, {"answer_no_comment", 20}] do
       id = "terminal-#{kind}"
-      assert %{"type" => "ok"} = request(c.relay, "origin", %{
-        "type" => "forward", "op_id" => op(n), "session_handle" => @handle,
-        "message" => %{"sender_id" => "app:test", "message_id" => id, "created_at" => 1,
-          "display_name" => "Build helper", "title" => "Check"}
-      })
-      frame = %{"type" => kind, "op_id" => op(n+1), "sender_id" => "app:test", "message_id" => id}
-      frame = if kind == "answer", do: Map.put(frame, "answer", nil), else: %{ "type" => kind, "request_id" => id, "request_revision" => 1 }
+
+      assert %{"type" => "ok"} =
+               request(c.relay, "origin", %{
+                 "type" => "forward",
+                 "op_id" => op(n),
+                 "session_handle" => @handle,
+                 "message" => %{
+                   "sender_id" => "app:test",
+                   "message_id" => id,
+                   "created_at" => 1,
+                   "display_name" => "Build helper",
+                   "title" => "Check"
+                 }
+               })
+
+      frame = %{
+        "type" => kind,
+        "op_id" => op(n + 1),
+        "sender_id" => "app:test",
+        "message_id" => id
+      }
+
+      frame =
+        if kind == "answer",
+          do: Map.put(frame, "answer", nil),
+          else: %{"type" => kind, "request_id" => id, "request_revision" => 1}
+
       assert %{"type" => "ok", "seq" => terminal_seq} = request(c.relay, "phone", frame)
       assert {:ok, %{"entries" => entries}} = Relay.origin_feed(c.relay, "origin", 0)
       terminal = Enum.find(entries, &(&1["message_id"] == id and &1["kind"] == "terminal"))
       assert terminal["author"] == "person"
-      assert %{"status" => "recorded"} = ack2(c.relay, terminal["event_id"], "handed", n+2)
+      assert %{"status" => "recorded"} = ack2(c.relay, terminal["event_id"], "handed", n + 2)
       acks = Enum.filter(delivery_facts(c.relay), &(&1["message_id"] == id))
       assert length(acks) == 2
+
       for ack <- acks do
         assert ack["terminal_seq"] == terminal_seq
         assert ack["event_id"] == terminal["event_id"]
@@ -199,9 +288,18 @@ defmodule AttentionServer.DeliveryAcksTest do
   test "feed and ACK2 facts roll back with failed durable commit, then survive restart", c do
     id = discussion(c.relay)
     {:ok, db} = Sqlite3.open(c.path)
-    :ok = Sqlite3.execute(db, "CREATE TRIGGER block_ack BEFORE UPDATE ON relay_state BEGIN SELECT RAISE(ABORT, 'fixture'); END")
+
+    :ok =
+      Sqlite3.execute(
+        db,
+        "CREATE TRIGGER block_ack BEFORE UPDATE ON relay_state BEGIN SELECT RAISE(ABORT, 'fixture'); END"
+      )
+
     assert {:error, :storage_unavailable} = Relay.origin_feed(c.relay, "origin", 1)
-    assert %{"type" => "error", "reason" => "storage_unavailable"} = ack2(c.relay, id, "handed", 4)
+
+    assert %{"type" => "error", "reason" => "storage_unavailable"} =
+             ack2(c.relay, id, "handed", 4)
+
     assert delivery_facts(c.relay) == []
     :ok = Sqlite3.execute(db, "DROP TRIGGER block_ack")
     :ok = Sqlite3.close(db)
@@ -219,10 +317,19 @@ defmodule AttentionServer.DeliveryAcksTest do
     discussion(c.relay)
     stop_supervised!(Relay)
     {:ok, store} = Store.open(c.path)
-    events = Map.new(store.engine.conversation_events, fn {key, event} ->
-      {key, %{event | payload: Map.delete(event.payload, "delivery_acks")}}
-    end)
-    {:ok, store} = Store.commit(store, %{store.engine | conversation_events: events}, %{person: "person", actor: "phone", action: "fixture"})
+
+    events =
+      Map.new(store.engine.conversation_events, fn {key, event} ->
+        {key, %{event | payload: Map.delete(event.payload, "delivery_acks")}}
+      end)
+
+    {:ok, store} =
+      Store.commit(store, %{store.engine | conversation_events: events}, %{
+        person: "person",
+        actor: "phone",
+        action: "fixture"
+      })
+
     :ok = Store.close(store)
     restarted = start_supervised!({Relay, store_path: c.path})
     assert [old] = facts(restarted)
@@ -230,6 +337,7 @@ defmodule AttentionServer.DeliveryAcksTest do
     discussion(restarted, "phone", 5)
     assert [^old, %{"delivery_acks" => true}] = facts(restarted)
   end
+
   test "device label precedes sender display and server/agent entries never receive ACK1", c do
     discussion(c.relay)
     {:ok, store} = Store.open(c.path)
@@ -243,14 +351,19 @@ defmodule AttentionServer.DeliveryAcksTest do
     for author <- ["server", "agent", "origin"] do
       changed = put_in(engine.origin_feeds[{"person", "origin"}].entries[2]["author"], author)
       assert {:ok, ^changed, _} = Engine.deliver_origin_feed(changed, "origin", 0)
-      assert {:error, _} = Engine.origin_ack2(changed, "origin", 2, %{
-        "op_id" => op(9), "outcome" => "handed"
-      })
+
+      assert {:error, _} =
+               Engine.origin_ack2(changed, "origin", 2, %{
+                 "op_id" => op(9),
+                 "outcome" => "handed"
+               })
     end
+
     Store.close(store)
   end
 
-  test "missing human names omit system without suppressing delivery; committed name is last fallback", c do
+  test "missing human names omit system without suppressing delivery; committed name is last fallback",
+       c do
     discussion(c.relay)
     {:ok, store} = Store.open(c.path)
     key = {"person", "app:test", "question"}
@@ -261,11 +374,25 @@ defmodule AttentionServer.DeliveryAcksTest do
     assert length(entries) == 1
     {:ok, [_, ack], _} = Engine.conversation_events(next, "phone", 0)
     assert ack["acknowledger"] == %{}
-    {:ok, next, _} = Engine.origin_ack2(next, "origin", 2, %{"op_id" => op(9), "outcome" => "handed", "agent" => "Reviewer"})
+
+    {:ok, next, _} =
+      Engine.origin_ack2(next, "origin", 2, %{
+        "op_id" => op(9),
+        "outcome" => "handed",
+        "agent" => "Reviewer"
+      })
+
     {:ok, [_, _, handed], _} = Engine.conversation_events(next, "phone", 0)
     assert handed["acknowledger"] == %{"agent" => "Reviewer"}
 
-    record = Map.put(record, "sender_display", %{"v" => 1, "sender_id" => "app:test", "origin" => "origin", "name" => "Committed name"})
+    record =
+      Map.put(record, "sender_display", %{
+        "v" => 1,
+        "sender_id" => "app:test",
+        "origin" => "origin",
+        "name" => "Committed name"
+      })
+
     engine = %{engine | messages: Map.put(engine.messages, key, record)}
     {:ok, next, _} = Engine.deliver_origin_feed(engine, "origin", 1)
     {:ok, [_, ack], _} = Engine.conversation_events(next, "phone", 0)
@@ -275,68 +402,178 @@ defmodule AttentionServer.DeliveryAcksTest do
 
   test "authenticated HTTP feed and ACK2 produce live and catch-up facts for both clients", c do
     path = Path.join(Path.dirname(c.path), "transport.sqlite3")
-    server = start_supervised!({Server,
-      store_path: path, certfile: Path.join(c.certs, "server.pem"),
-      keyfile: Path.join(c.certs, "server.key"), cacertfile: Path.join(c.certs, "ca.pem"),
-      origin_port: 0, relay_name: :"two_ack_#{System.unique_integer([:positive])}"})
+
+    server =
+      start_supervised!(
+        {Server,
+         store_path: path,
+         certfile: Path.join(c.certs, "server.pem"),
+         keyfile: Path.join(c.certs, "server.key"),
+         cacertfile: Path.join(c.certs, "ca.pem"),
+         origin_port: 0,
+         relay_name: :"two_ack_#{System.unique_integer([:positive])}"}
+      )
+
     relay = Server.relay(server)
     {:ok, person} = Relay.operator_bootstrap(relay, TLSFixtures.certificate_der!(c.certs, "a1"))
-    {:ok, origin} = Relay.setup_device_certificate(relay, person, TLSFixtures.certificate_der!(c.certs, "a2"))
-    {:ok, phone} = Relay.setup_device_certificate(relay, person, TLSFixtures.certificate_der!(c.certs, "reader"))
-    {:ok, tablet} = Relay.setup_device_certificate(relay, person, TLSFixtures.certificate_der!(c.certs, "b1"))
+
+    {:ok, origin} =
+      Relay.setup_device_certificate(relay, person, TLSFixtures.certificate_der!(c.certs, "a2"))
+
+    {:ok, phone} =
+      Relay.setup_device_certificate(
+        relay,
+        person,
+        TLSFixtures.certificate_der!(c.certs, "reader")
+      )
+
+    {:ok, tablet} =
+      Relay.setup_device_certificate(relay, person, TLSFixtures.certificate_der!(c.certs, "b1"))
+
     :ok = Relay.setup_sender(relay, origin, "app:test")
-    endpoint = %{address: {127,0,0,1}, name: "relay.test", ca_file: Path.join(c.certs, "ca.pem"), port: Server.origin_port(server)}
+
+    endpoint = %{
+      address: {127, 0, 0, 1},
+      name: "relay.test",
+      ca_file: Path.join(c.certs, "ca.pem"),
+      port: Server.origin_port(server)
+    }
+
     http = fn frame ->
       https_request(endpoint, c.certs, Map.put(frame, "v", 1))
     end
+
     send_request(relay, origin)
-    sessions = for device <- [phone, tablet] do
-      {:ok, session} = Relay.open_session(relay, device)
-      {:ok, _} = Relay.session_request_line(relay, session, JSON.encode!(%{"v" => 1, "type" => "resync", "since" => 0}) <> "\n")
-      {:ok, _} = Relay.session_request_line(relay, session, JSON.encode!(%{"v" => 1, "type" => "conversation_open", "since" => 0}) <> "\n")
-      session
-    end
+
+    sessions =
+      for device <- [phone, tablet] do
+        {:ok, session} = Relay.open_session(relay, device)
+
+        {:ok, _} =
+          Relay.session_request_line(
+            relay,
+            session,
+            JSON.encode!(%{"v" => 1, "type" => "resync", "since" => 0}) <> "\n"
+          )
+
+        {:ok, _} =
+          Relay.session_request_line(
+            relay,
+            session,
+            JSON.encode!(%{"v" => 1, "type" => "conversation_open", "since" => 0}) <> "\n"
+          )
+
+        session
+      end
+
     id = discussion(relay, phone)
-    assert {:ok, 200, %{"type" => "ok", "listening_support" => %{"ack2" => true}}} = http.(%{
-      "type" => "support", "op_id" => op(3), "session_handle" => @handle, "route" => "codex",
-      "cli_version" => "fixture", "unsupported_reason" => nil, "ack2" => true
-    })
-    {:ok, stream} = HeadlessTLS.connect(endpoint, {Path.join(c.certs, "a2.pem"), Path.join(c.certs, "a2.key")})
+
+    assert {:ok, 200, %{"type" => "ok", "listening_support" => %{"ack2" => true}}} =
+             http.(%{
+               "type" => "support",
+               "op_id" => op(3),
+               "session_handle" => @handle,
+               "route" => "codex",
+               "cli_version" => "fixture",
+               "unsupported_reason" => nil,
+               "ack2" => true
+             })
+
+    {:ok, stream} =
+      HeadlessTLS.connect(endpoint, {Path.join(c.certs, "a2.pem"), Path.join(c.certs, "a2.key")})
+
     on_exit(fn -> :ssl.close(stream) end)
-    :ok = :ssl.send(stream, "GET /origin/v1/stream?session=#{@handle} HTTP/1.1\r\nHost: relay.test\r\n\r\n")
+
+    :ok =
+      :ssl.send(
+        stream,
+        "GET /origin/v1/stream?session=#{@handle} HTTP/1.1\r\nHost: relay.test\r\n\r\n"
+      )
+
     notice = read_notice(stream, <<>>, 16)
     assert notice =~ "HTTP/1.1 200 OK"
     assert notice =~ "data: {\"cursor\":2}"
     assert delivery_facts(relay, phone) == []
-    assert {:ok, 200, %{"type" => "ok", "entries" => [entry]}} = http.(%{"type" => "feed", "since" => 1})
+
+    assert {:ok, 200, %{"type" => "ok", "entries" => [entry]}} =
+             http.(%{"type" => "feed", "since" => 1})
+
     assert entry["event_id"] == id
     assert entry["delivered"] == false
-    assert {:ok, 200, %{"type" => "ok", "status" => "recorded", "stage_outcome" => "handed"}} = http.(%{
-      "type" => "ack2", "op_id" => op(4), "event_id" => id, "outcome" => "handed", "agent" => "Reviewer"
-    })
+
+    assert {:ok, 200, %{"type" => "ok", "status" => "recorded", "stage_outcome" => "handed"}} =
+             http.(%{
+               "type" => "ack2",
+               "op_id" => op(4),
+               "event_id" => id,
+               "outcome" => "handed",
+               "agent" => "Reviewer"
+             })
+
     expected = delivery_facts(relay, phone)
-    assert [%{"stage" => "ack1", "ack2_expected" => true}, %{"stage" => "ack2", "rerouted" => false}] = expected
+
+    assert [
+             %{"stage" => "ack1", "ack2_expected" => true},
+             %{"stage" => "ack2", "rerouted" => false}
+           ] = expected
+
     for session <- sessions do
       {:ok, lines} = Relay.session_drain(relay, session)
-      live = Enum.map(lines, fn line -> {:ok, frame} = JSON.decode_line(line); frame end)
+
+      live =
+        Enum.map(lines, fn line ->
+          {:ok, frame} = JSON.decode_line(line)
+          frame
+        end)
+
       assert Enum.filter(live, &(&1["kind"] == "delivery_ack")) == expected
     end
+
     # Explicit catch-up uses the same authoritative journal and does not touch Seen.
     {:ok, catching_up} = Relay.open_session(relay, tablet)
-    {:ok, _} = Relay.session_request_line(relay, catching_up, JSON.encode!(%{"v" => 1, "type" => "resync", "since" => 0}) <> "\n")
-    {:ok, lines} = Relay.session_request_line(relay, catching_up, JSON.encode!(%{"v" => 1, "type" => "conversation_open", "since" => 0}) <> "\n")
-    replay = Enum.map(lines, fn line -> {:ok, frame} = JSON.decode_line(line); frame end)
+
+    {:ok, _} =
+      Relay.session_request_line(
+        relay,
+        catching_up,
+        JSON.encode!(%{"v" => 1, "type" => "resync", "since" => 0}) <> "\n"
+      )
+
+    {:ok, lines} =
+      Relay.session_request_line(
+        relay,
+        catching_up,
+        JSON.encode!(%{"v" => 1, "type" => "conversation_open", "since" => 0}) <> "\n"
+      )
+
+    replay =
+      Enum.map(lines, fn line ->
+        {:ok, frame} = JSON.decode_line(line)
+        frame
+      end)
+
     assert Enum.filter(replay, &(&1["kind"] == "delivery_ack")) == expected
-    assert {:ok, 200, %{"entries" => [%{"delivered" => false, "acted" => false}]}} = http.(%{"type" => "feed", "since" => 1})
+
+    assert {:ok, 200, %{"entries" => [%{"delivered" => false, "acted" => false}]}} =
+             http.(%{"type" => "feed", "since" => 1})
+
     assert {:ok, 200, %{"status" => "delivered"}} = http.(%{"type" => "ack", "event_id" => id})
     assert Enum.count(facts(relay, phone), &(&1["kind"] == "receipt")) == 1
   end
 
   defp https_request(endpoint, certs, frame) do
-    {:ok, socket} = HeadlessTLS.connect(endpoint, {Path.join(certs, "a2.pem"), Path.join(certs, "a2.key")})
+    {:ok, socket} =
+      HeadlessTLS.connect(endpoint, {Path.join(certs, "a2.pem"), Path.join(certs, "a2.key")})
+
     try do
       body = JSON.encode!(frame)
-      :ok = :ssl.send(socket, ["POST /origin/v1 HTTP/1.1\r\nHost: relay.test\r\nContent-Type: application/json\r\nContent-Length: #{byte_size(body)}\r\nConnection: close\r\n\r\n", body])
+
+      :ok =
+        :ssl.send(socket, [
+          "POST /origin/v1 HTTP/1.1\r\nHost: relay.test\r\nContent-Type: application/json\r\nContent-Length: #{byte_size(body)}\r\nConnection: close\r\n\r\n",
+          body
+        ])
+
       response = read_http(socket, <<>>)
       [head, body] = :binary.split(response, "\r\n\r\n")
       ["HTTP/1.1", status | _] = String.split(head)
@@ -356,6 +593,7 @@ defmodule AttentionServer.DeliveryAcksTest do
   end
 
   defp read_notice(_socket, _bytes, 0), do: flunk("no complete SSE notice")
+
   defp read_notice(socket, bytes, remaining) do
     if String.contains?(bytes, "data: {\"cursor\":2}\n\n") do
       bytes
@@ -364,5 +602,4 @@ defmodule AttentionServer.DeliveryAcksTest do
       read_notice(socket, bytes <> chunk, remaining - 1)
     end
   end
-
 end

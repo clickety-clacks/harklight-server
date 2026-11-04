@@ -687,7 +687,10 @@ defmodule AttentionServer.ConversationFeedTest do
              Relay.origin_ack(relay, "origin", 2)
 
     assert {:ok, [], 2} = Relay.events(relay, "reader", 2)
-    assert {:ok, [delivery_ack, receipt_change], 2} = Relay.conversation_events(relay, "reader", 0)
+
+    assert {:ok, [delivery_ack, receipt_change], 2} =
+             Relay.conversation_events(relay, "reader", 0)
+
     assert delivery_ack["kind"] == "delivery_ack"
     assert delivery_ack["stage"] == "ack1"
     assert delivery_ack["event_id"] == terminal["event_id"]
@@ -699,7 +702,9 @@ defmodule AttentionServer.ConversationFeedTest do
     refute Map.has_key?(receipt_change, "acted")
     refute Map.has_key?(receipt_change, "answer")
 
-    assert {:ok, [^delivery_ack, origin_receipt], 2} = Relay.conversation_events(relay, "origin", 0)
+    assert {:ok, [^delivery_ack, origin_receipt], 2} =
+             Relay.conversation_events(relay, "origin", 0)
+
     assert origin_receipt["delivered"] == true
     refute Map.has_key?(origin_receipt, "acted")
     refute Map.has_key?(origin_receipt, "answer")
@@ -1008,8 +1013,15 @@ defmodule AttentionServer.ConversationFeedTest do
     assert {:ok, [_, revised, acted, _, old_ack, new_ack], 6} =
              Relay.conversation_events(restarted, "reader", 0)
 
-    assert Enum.map([old_ack, new_ack], & &1["event_id"]) == [old_discussion["event_id"], newer_discussion["event_id"]]
-    assert Enum.all?([old_ack, new_ack], &(&1["kind"] == "delivery_ack" and &1["stage"] == "ack1"))
+    assert Enum.map([old_ack, new_ack], & &1["event_id"]) == [
+             old_discussion["event_id"],
+             newer_discussion["event_id"]
+           ]
+
+    assert Enum.all?(
+             [old_ack, new_ack],
+             &(&1["kind"] == "delivery_ack" and &1["stage"] == "ack1")
+           )
 
     assert initial["type"] == "delivery"
     assert initial["request_revision"] == 1
@@ -1434,7 +1446,10 @@ defmodule AttentionServer.ConversationFeedTest do
     assert lifecycle["terminal_reason"] == "retracted"
     assert lifecycle["at"] == retracted_at
     assert lifecycle["retracted_at"] == retracted_at
-    assert {:ok, [_, retraction, acted, delivery_ack], 4} = Relay.conversation_events(relay, "reader", 0)
+
+    assert {:ok, [_, retraction, acted, delivery_ack], 4} =
+             Relay.conversation_events(relay, "reader", 0)
+
     assert delivery_ack["kind"] == "delivery_ack"
     assert delivery_ack["event_id"] == discussion["event_id"]
     assert retraction["kind"] == "retraction"
