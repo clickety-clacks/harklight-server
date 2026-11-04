@@ -7,16 +7,16 @@ Harklight iOS/iPadOS app.
 
 ## Install the server
 
-For the FORMAT24 v0.1.23 server package, use the release page below after it
+For the FORMAT24 v0.1.24 server package, use the release page below after it
 is published to download the Linux x86_64 archive, `SHA256SUMS` and
 `SELF_HOST.md`. Verify the checksum before extraction:
 
-[v0.1.23 release](https://github.com/clickety-clacks/harklight-server/releases/tag/v0.1.23)
+[v0.1.24 release](https://github.com/clickety-clacks/harklight-server/releases/tag/v0.1.24)
 (available only after publication).
 
 ```sh
 sha256sum -c SHA256SUMS
-tar -xzf harklight-server-0.1.23-linux-x86_64.tar.gz
+tar -xzf harklight-server-0.1.24-linux-x86_64.tar.gz
 ```
 
 Follow [SELF_HOST.md](SELF_HOST.md) for a fresh installation, tailnet routing,
