@@ -34,10 +34,9 @@ defmodule AttentionServer.PushDispatcher do
 
   def handle_info({:EXIT, child, reason}, %{child: child} = state) do
     cancel_timer(state.stable_timer)
-    Diagnostics.failure(:apns_dispatch, :child_exit, reason, :retry)
 
     state = %{state | child: nil, stable_timer: nil}
-    {:noreply, schedule_retry(state)}
+    {:noreply, schedule_retry(state, {:worker_exit, reason})}
   end
 
   def handle_info({:reset_retry_attempt, child}, %{child: child} = state) do
@@ -82,7 +81,7 @@ defmodule AttentionServer.PushDispatcher do
   end
 
   defp schedule_retry(state, reason \\ :start_failed) do
-    Diagnostics.failure(:apns_dispatch, :child_start, reason, :retry)
+    Diagnostics.failure(:apns_dispatch, :configuration, reason, :retry)
     delay = retry_interval(state.retry_attempt)
     timer = Process.send_after(self(), :start_dispatcher, delay)
 

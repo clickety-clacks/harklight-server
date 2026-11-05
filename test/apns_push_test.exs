@@ -192,6 +192,7 @@ defmodule AttentionServer.APNSPushTest do
     dispatcher = start_dispatcher(relay, ctx)
 
     assert_receive {:apns_relay_enable, {:error, :not_ready}, first_attempt}, 1_000
+    assert Process.alive?(dispatcher)
     assert_receive {:apns_relay_enable, :ok, recovered_attempt}, 3_000
     assert recovered_attempt - first_attempt >= 200
 
