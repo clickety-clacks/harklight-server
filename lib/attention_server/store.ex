@@ -1245,7 +1245,8 @@ defmodule AttentionServer.Store do
   end
 
   defp decode_state_overlay_rows(rows) do
-    {:module, ^Engine} = Code.ensure_loaded(Engine)
+    engine_module = Engine
+    {:module, ^engine_module} = Code.ensure_loaded(engine_module)
 
     Enum.reduce_while(rows, {:ok, []}, fn [_version, payload, checksum], {:ok, patches} ->
       case decode_checked_term(payload, checksum) do
