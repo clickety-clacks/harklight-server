@@ -1803,6 +1803,12 @@ defmodule AttentionServer.ConversationFeedTest do
     assert {:ok, [listening], 1} = Relay.conversation_events(relay, "reader", 0)
     assert listening["availability"] == "listening"
 
+    assert :ok = Relay.setup_person(relay, "B")
+    {folded_version, folded_payload, folded_checksum, 0} = state_snapshot(path)
+    assert folded_version == after_version + 1
+    assert folded_payload != before_payload
+    assert :crypto.hash(:sha256, folded_payload) == folded_checksum
+
     GenServer.stop(relay)
     assert {:ok, restarted} = Relay.start_link(store_path: path)
 
@@ -1813,6 +1819,8 @@ defmodule AttentionServer.ConversationFeedTest do
 
     assert {:ok, %{"availability" => "not_listening"}} =
              Relay.origin_status(restarted, "origin", @handle)
+
+    assert {:error, :person_exists} = Relay.setup_person(restarted, "B")
 
     {_version, restored_payload, restored_checksum, 0} = state_snapshot(path)
     assert :crypto.hash(:sha256, restored_payload) == restored_checksum
