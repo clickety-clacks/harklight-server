@@ -1634,6 +1634,19 @@ defmodule AttentionServer.OriginHTTPSTest do
              request(c, "a2", %{"v" => 1, "type" => "feed", "since" => 0})
   end
 
+  test "a revoked device receives a revoked refusal instead of a silent close", c do
+    assert {:ok, 200, %{"type" => "ok"}} =
+             request(c, "a2", %{"v" => 1, "type" => "file_limits"})
+
+    assert :ok = Relay.revoke_device(c.relay, c.origin)
+
+    assert {:ok, 403, %{"v" => 1, "type" => "error", "reason" => "revoked"}} =
+             request(c, "a2", %{"v" => 1, "type" => "file_limits"})
+
+    assert {:ok, 403, %{"v" => 1, "type" => "error", "reason" => "revoked"}} =
+             stream_request(c, "a2", @handle)
+  end
+
   test "revision and withdrawal stay with the sending device and session goes only on declaration",
        c do
     original = %{

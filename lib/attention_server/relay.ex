@@ -467,6 +467,9 @@ defmodule AttentionServer.Relay do
   def acknowledged_cursor(server, verified_key),
     do: GenServer.call(server, {:cursor, verified_key})
 
+  def device_revoked?(server, verified_key),
+    do: GenServer.call(server, {:device_revoked?, verified_key})
+
   def open_session(server, verified_key),
     do: GenServer.call(server, {:open_session, verified_key, nil, nil, nil, :raw})
 
@@ -864,6 +867,9 @@ defmodule AttentionServer.Relay do
 
   def handle_call({:cursor, key}, _from, state),
     do: {:reply, Engine.acknowledged_cursor(state.store.engine, key), state}
+
+  def handle_call({:device_revoked?, key}, _from, state),
+    do: {:reply, Engine.device_revoked?(state.store.engine, key), state}
 
   def handle_call({:owner_revision, person, key}, _from, state),
     do: {:reply, Engine.owner_revision(state.store.engine, person, key), state}
