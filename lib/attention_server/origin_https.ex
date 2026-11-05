@@ -207,13 +207,7 @@ defmodule AttentionServer.OriginHTTPS do
                DeviceIdentity.from_certificate(certificate),
                :closed
              ),
-           {:ok, _cursor} <-
-             Diagnostics.result(
-               :origin_https,
-               :authentication,
-               Relay.acknowledged_cursor(relay, key),
-               :closed
-             ) do
+           {:ok, _cursor} <- authenticate(tls, relay, key) do
         case read_request(tls) do
           {:ok, {:post, request}} ->
             operation_id = Diagnostics.operation_id(request)
@@ -262,6 +256,37 @@ defmodule AttentionServer.OriginHTTPS do
         :ok
     after
       :ssl.close(socket)
+    end
+  end
+
+  # A revoked device receives an honest HTTP refusal before the socket closes;
+  # any other authentication failure keeps the existing silent close.
+  defp authenticate(tls, relay, key) do
+    case Relay.acknowledged_cursor(relay, key) do
+      {:ok, cursor} ->
+        {:ok, cursor}
+
+      {:error, :forbidden} = error ->
+        if Relay.device_revoked?(relay, key) do
+          Diagnostics.failure(:origin_https, :authentication, :revoked, :rejected)
+
+          _ =
+            Diagnostics.result(
+              :origin_https,
+              :response_write,
+              :ssl.send(tls, OriginWire.http_response(403, OriginWire.error("revoked"))),
+              :closed
+            )
+
+          {:error, :revoked}
+        else
+          Diagnostics.failure(:origin_https, :authentication, :forbidden, :closed)
+          error
+        end
+
+      {:error, reason} = error ->
+        Diagnostics.failure(:origin_https, :authentication, reason, :closed)
+        error
     end
   end
 

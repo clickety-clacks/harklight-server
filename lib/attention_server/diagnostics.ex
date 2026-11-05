@@ -64,6 +64,7 @@ defmodule AttentionServer.Diagnostics do
     missing_configuration: "missing_configuration",
     process_unavailable: "process_unavailable",
     forbidden: "forbidden",
+    revoked: "revoked",
     not_found: "not_found",
     expired: "expired",
     used: "used",
