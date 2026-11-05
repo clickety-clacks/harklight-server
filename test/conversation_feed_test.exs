@@ -1780,6 +1780,9 @@ defmodule AttentionServer.ConversationFeedTest do
                "type" => "forward",
                "op_id" => op(81),
                "session_handle" => @handle,
+               "route" => "other",
+               "cli_version" => "test-only",
+               "unsupported_reason" => nil,
                "message" => %{
                  "sender_id" => "app:test",
                  "message_id" => "overlay-replay",
