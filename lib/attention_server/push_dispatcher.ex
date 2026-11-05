@@ -3,6 +3,111 @@ defmodule AttentionServer.PushDispatcher do
 
   use GenServer
 
+  alias AttentionServer.Diagnostics
+
+  @initial_retry_interval 250
+  @maximum_retry_interval 30_000
+  @maximum_backoff_exponent 7
+  @stable_interval 30_000
+
+  def start_link(opts), do: GenServer.start_link(__MODULE__, opts)
+
+  @impl true
+  def init(opts) do
+    Process.flag(:trap_exit, true)
+
+    state = %{
+      opts: opts,
+      child: nil,
+      retry_timer: nil,
+      retry_attempt: 0,
+      stable_timer: nil
+    }
+
+    {:ok, start_dispatcher(state)}
+  end
+
+  @impl true
+  def handle_info(:start_dispatcher, %{child: nil} = state) do
+    {:noreply, start_dispatcher(%{state | retry_timer: nil})}
+  end
+
+  def handle_info({:EXIT, child, reason}, %{child: child} = state) do
+    cancel_timer(state.stable_timer)
+    Diagnostics.failure(:apns_dispatch, :child_exit, reason, :retry)
+
+    state = %{state | child: nil, stable_timer: nil}
+    {:noreply, schedule_retry(state)}
+  end
+
+  def handle_info({:reset_retry_attempt, child}, %{child: child} = state) do
+    {:noreply, %{state | retry_attempt: 0, stable_timer: nil}}
+  end
+
+  def handle_info(_message, state), do: {:noreply, state}
+
+  @impl true
+  def terminate(_reason, %{child: child}) when is_pid(child) do
+    if Process.alive?(child), do: Process.exit(child, :shutdown)
+    :ok
+  end
+
+  def terminate(_reason, _state), do: :ok
+
+  defp start_dispatcher(state) do
+    case safe_start_worker(state.opts) do
+      {:ok, child} when is_pid(child) ->
+        stable_timer = Process.send_after(self(), {:reset_retry_attempt, child}, @stable_interval)
+        %{state | child: child, retry_timer: nil, stable_timer: stable_timer}
+
+      {:error, reason} ->
+        schedule_retry(state, reason)
+
+      :ignore ->
+        schedule_retry(state, :ignored)
+
+      other ->
+        schedule_retry(state, {:invalid_start_result, other})
+    end
+  end
+
+  defp safe_start_worker(opts) do
+    AttentionServer.PushDispatcher.Worker.start_link(opts)
+  rescue
+    error ->
+      {:error, error}
+  catch
+    kind, reason ->
+      {:error, {kind, reason}}
+  end
+
+  defp schedule_retry(state, reason \\ :start_failed) do
+    Diagnostics.failure(:apns_dispatch, :child_start, reason, :retry)
+    delay = retry_interval(state.retry_attempt)
+    timer = Process.send_after(self(), :start_dispatcher, delay)
+
+    %{
+      state
+      | retry_timer: timer,
+        retry_attempt: state.retry_attempt + 1,
+        stable_timer: nil
+    }
+  end
+
+  defp retry_interval(attempt) do
+    exponent = min(attempt, @maximum_backoff_exponent)
+    min(@initial_retry_interval * Integer.pow(2, exponent), @maximum_retry_interval)
+  end
+
+  defp cancel_timer(nil), do: :ok
+  defp cancel_timer(timer), do: Process.cancel_timer(timer)
+end
+
+defmodule AttentionServer.PushDispatcher.Worker do
+  @moduledoc false
+
+  use GenServer
+
   alias AttentionServer.{APNS, Diagnostics, Relay}
 
   @idle_interval 1_000
