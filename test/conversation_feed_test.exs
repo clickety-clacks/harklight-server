@@ -8,11 +8,16 @@ defmodule AttentionServer.ConversationFeedTest do
 
   defp state_snapshot(path) do
     assert {:ok, db} = Sqlite3.open(path)
+
     assert {:ok, state_stmt} =
-             Sqlite3.prepare(db, "SELECT version, payload, checksum FROM relay_state WHERE id = 1")
+             Sqlite3.prepare(
+               db,
+               "SELECT version, payload, checksum FROM relay_state WHERE id = 1"
+             )
 
     assert {:row, [version, payload, checksum]} = Sqlite3.step(db, state_stmt)
     assert :ok = Sqlite3.release(db, state_stmt)
+
     assert {:ok, overlay_stmt} =
              Sqlite3.prepare(db, "SELECT count(*) FROM relay_state_overlay_events")
 
@@ -1802,6 +1807,7 @@ defmodule AttentionServer.ConversationFeedTest do
     assert initial["availability"] == "not_listening"
     assert {:ok, [replayed], 1} = Relay.conversation_events(restarted, "reader", 0)
     assert replayed["availability"] == "listening"
+
     assert {:ok, %{"availability" => "not_listening"}} =
              Relay.origin_status(restarted, "origin", @handle)
 

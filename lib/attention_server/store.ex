@@ -992,7 +992,7 @@ defmodule AttentionServer.Store do
         _audit
       )
       when old == next,
-    do: {:ok, store}
+      do: {:ok, store}
 
   def commit_transient_origin_availability(
         %__MODULE__{engine: old} = store,
@@ -1035,7 +1035,11 @@ defmodule AttentionServer.Store do
            {:ok, [current_checksum]} <-
              one(db, "SELECT checksum FROM relay_state WHERE id = 1 AND version = ?", [version]),
            {:ok, overlay} <-
-             one(db, "SELECT base_version, base_checksum FROM relay_state_overlay WHERE id = 1", []),
+             one(
+               db,
+               "SELECT base_version, base_checksum FROM relay_state_overlay WHERE id = 1",
+               []
+             ),
            {:ok, state_checksum} <- transient_state_checksum(current_checksum, overlay, version),
            :ok <- ensure_overlay_base(db, overlay, version, current_checksum),
            :ok <-
@@ -1062,6 +1066,7 @@ defmodule AttentionServer.Store do
 
       error ->
         _ = Sqlite3.execute(db, "ROLLBACK")
+
         Diagnostics.failure(
           :server_storage,
           :state_commit,
@@ -1108,7 +1113,8 @@ defmodule AttentionServer.Store do
   end
 
   defp validate_transient_audit(%{person: person, actor: actor, action: action})
-       when is_binary(person) and is_binary(actor) and action in ["origin_attach", "origin_detach"],
+       when is_binary(person) and is_binary(actor) and
+              action in ["origin_attach", "origin_detach"],
        do: :ok
 
   defp validate_transient_audit(_), do: {:error, :invalid_audit}
@@ -1170,7 +1176,7 @@ defmodule AttentionServer.Store do
         event_person == person and seq > old_high and seq <= next_high and
           event.kind == :conversation and elem(event.key, 0) == person and
           Map.has_key?(old.messages, event.key) and
-          get_in(event, [:payload, "kind"]) == "availability"
+            get_in(event, [:payload, "kind"]) == "availability"
       end) ->
         {:error, :invalid_availability_event}
 
@@ -1349,176 +1355,176 @@ defmodule AttentionServer.Store do
         case load_state_overlay(db, version, checksum) do
           {:ok, base_checksum, overlay_patches} when is_binary(base_checksum) ->
             if :crypto.hash(:sha256, payload) == base_checksum do
-          try do
-            # Safe decoding accepts only atoms already loaded by this VM.
-            # Load the modules that define persisted record fields before a
-            # cold release reads snapshots containing invitations, browser
-            # sign-ins, JSON decimal values or provider state.
-            for module <- [
-                  Engine,
-                  GuidedJoin,
-                  BrowserSignIn,
-                  AttentionServer.JSON.DecimalToken,
-                  APNS,
-                  AttentionServer.AgentAccess,
-                  AttentionServer.Message
-                ] do
-              {:module, ^module} = Code.ensure_loaded(module)
-            end
-
-            case :erlang.binary_to_term(payload, [:safe]) do
-              {:attention_relay_state, format, %Engine{} = stored}
-              when format in [
-                     1,
-                     2,
-                     3,
-                     4,
-                     5,
-                     6,
-                     8,
-                     9,
-                     10,
-                     11,
-                     12,
-                     13,
-                     14,
-                     15,
-                     16,
-                     17,
-                     18,
-                     19,
-                     20,
-                     21,
-                     22,
-                     23,
-                     24
-                   ] ->
-                original = struct(Engine, Map.from_struct(stored))
-
-                engine =
-                  original
-                  |> then(fn state ->
-                    if format < 3, do: normalize_enrollments(state), else: state
-                  end)
-                  |> then(fn state ->
-                    if format < 8, do: normalize_pending_v8(state), else: state
-                  end)
-                  |> then(fn state ->
-                    if format < 9, do: normalize_agents_v9(state), else: state
-                  end)
-                  |> then(fn state ->
-                    if format < 10, do: normalize_push_v10(state), else: state
-                  end)
-                  |> then(fn state ->
-                    if format < 11, do: normalize_push_reasons_v11(state), else: state
-                  end)
-                  |> then(fn state ->
-                    if format < 13, do: normalize_device_metadata(state), else: state
-                  end)
-                  |> then(fn state ->
-                    if format < 15 do
-                      invitations =
-                        Map.new(state.join_invitations, fn {hash, item} ->
-                          {hash, Map.put_new(item, :request_id, nil)}
-                        end)
-
-                      %{state | join_invitations: invitations}
-                    else
-                      state
-                    end
-                  end)
-                  |> then(fn state ->
-                    if format < 16, do: normalize_resumable_pending(state), else: state
-                  end)
-                  |> then(fn state ->
-                    if format < 17, do: normalize_push_presentation(state), else: state
-                  end)
-                  |> then(fn state ->
-                    if format < 19, do: normalize_conversation_push(state), else: state
-                  end)
-                  |> then(fn state ->
-                    if format < 20, do: Map.put(state, :uploads, %{}), else: state
-                  end)
-                  |> then(fn state ->
-                    if format < 21 do
-                      now = System.system_time(:millisecond)
-
-                      uploads =
-                        Map.new(state.uploads, fn {id, upload} ->
-                          {id, Map.put_new(upload, :last_activity_ms, now)}
-                        end)
-
-                      %{state | uploads: uploads}
-                    else
-                      state
-                    end
-                  end)
-                  |> then(fn state ->
-                    if format < 22, do: Map.put(state, :hosted_accounts, %{}), else: state
-                  end)
-                  |> then(fn state ->
-                    if format < 23 do
-                      %{state | algorithm_choices: %{}, jev_endpoint: nil, jev_model: nil}
-                    else
-                      state
-                    end
-                  end)
-                  |> then(fn state ->
-                    if format < 24, do: %{state | chat_read_positions: %{}}, else: state
-                  end)
-
-                engine = apply_state_overlays(engine, overlay_patches)
-
-                cond do
-                  not valid_state?(engine) ->
-                    {:error, :invalid_state}
-
-                  format == @format_version and engine == original ->
-                    {:ok, engine, version}
-
-                  true ->
-                    case commit_durable(
-                           %__MODULE__{db: db, engine: original, version: version},
-                           engine,
-                           %{
-                             person: "system",
-                             actor: "schema_migration",
-                             action:
-                               cond do
-                                 format < 3 -> "enrollment_revision_init"
-                                 format < 4 -> "owner_state_init"
-                                 format < 5 -> "pending_state_init"
-                                 format < 6 -> "maintainer_state_init"
-                                 format < 7 -> "pending_v8_readback_init"
-                                 format < 9 -> "agent_authority_init"
-                                 format < 10 -> "push_state_init"
-                                 format < 11 -> "push_reason_sanitize"
-                                 format < 12 -> "join_invitation_init"
-                                 format < 13 -> "device_metadata_init"
-                                 format < 14 -> "browser_sign_in_init"
-                                 format < 15 -> "invitation_request_init"
-                                 format < 16 -> "resumable_pending_init"
-                                 format < 17 -> "push_presentation_init"
-                                 format < 18 -> "conversation_feed_init"
-                                 format < 23 -> "prioritization_init"
-                                 format < 24 -> "chat_read_positions_init"
-                                 true -> "state_format"
-                               end
-                           }
-                         ) do
-                      {:ok, migrated} -> {:ok, migrated.engine, migrated.version}
-                      _ -> {:error, :migration_failed}
-                    end
+              try do
+                # Safe decoding accepts only atoms already loaded by this VM.
+                # Load the modules that define persisted record fields before a
+                # cold release reads snapshots containing invitations, browser
+                # sign-ins, JSON decimal values or provider state.
+                for module <- [
+                      Engine,
+                      GuidedJoin,
+                      BrowserSignIn,
+                      AttentionServer.JSON.DecimalToken,
+                      APNS,
+                      AttentionServer.AgentAccess,
+                      AttentionServer.Message
+                    ] do
+                  {:module, ^module} = Code.ensure_loaded(module)
                 end
 
-              _ ->
-                {:error, :invalid_state}
-            end
-          rescue
-            error ->
-              Diagnostics.failure(:server_storage, :store_open, error, :unavailable)
-              {:error, :invalid_state}
-          end
+                case :erlang.binary_to_term(payload, [:safe]) do
+                  {:attention_relay_state, format, %Engine{} = stored}
+                  when format in [
+                         1,
+                         2,
+                         3,
+                         4,
+                         5,
+                         6,
+                         8,
+                         9,
+                         10,
+                         11,
+                         12,
+                         13,
+                         14,
+                         15,
+                         16,
+                         17,
+                         18,
+                         19,
+                         20,
+                         21,
+                         22,
+                         23,
+                         24
+                       ] ->
+                    original = struct(Engine, Map.from_struct(stored))
+
+                    engine =
+                      original
+                      |> then(fn state ->
+                        if format < 3, do: normalize_enrollments(state), else: state
+                      end)
+                      |> then(fn state ->
+                        if format < 8, do: normalize_pending_v8(state), else: state
+                      end)
+                      |> then(fn state ->
+                        if format < 9, do: normalize_agents_v9(state), else: state
+                      end)
+                      |> then(fn state ->
+                        if format < 10, do: normalize_push_v10(state), else: state
+                      end)
+                      |> then(fn state ->
+                        if format < 11, do: normalize_push_reasons_v11(state), else: state
+                      end)
+                      |> then(fn state ->
+                        if format < 13, do: normalize_device_metadata(state), else: state
+                      end)
+                      |> then(fn state ->
+                        if format < 15 do
+                          invitations =
+                            Map.new(state.join_invitations, fn {hash, item} ->
+                              {hash, Map.put_new(item, :request_id, nil)}
+                            end)
+
+                          %{state | join_invitations: invitations}
+                        else
+                          state
+                        end
+                      end)
+                      |> then(fn state ->
+                        if format < 16, do: normalize_resumable_pending(state), else: state
+                      end)
+                      |> then(fn state ->
+                        if format < 17, do: normalize_push_presentation(state), else: state
+                      end)
+                      |> then(fn state ->
+                        if format < 19, do: normalize_conversation_push(state), else: state
+                      end)
+                      |> then(fn state ->
+                        if format < 20, do: Map.put(state, :uploads, %{}), else: state
+                      end)
+                      |> then(fn state ->
+                        if format < 21 do
+                          now = System.system_time(:millisecond)
+
+                          uploads =
+                            Map.new(state.uploads, fn {id, upload} ->
+                              {id, Map.put_new(upload, :last_activity_ms, now)}
+                            end)
+
+                          %{state | uploads: uploads}
+                        else
+                          state
+                        end
+                      end)
+                      |> then(fn state ->
+                        if format < 22, do: Map.put(state, :hosted_accounts, %{}), else: state
+                      end)
+                      |> then(fn state ->
+                        if format < 23 do
+                          %{state | algorithm_choices: %{}, jev_endpoint: nil, jev_model: nil}
+                        else
+                          state
+                        end
+                      end)
+                      |> then(fn state ->
+                        if format < 24, do: %{state | chat_read_positions: %{}}, else: state
+                      end)
+
+                    engine = apply_state_overlays(engine, overlay_patches)
+
+                    cond do
+                      not valid_state?(engine) ->
+                        {:error, :invalid_state}
+
+                      format == @format_version and engine == original ->
+                        {:ok, engine, version}
+
+                      true ->
+                        case commit_durable(
+                               %__MODULE__{db: db, engine: original, version: version},
+                               engine,
+                               %{
+                                 person: "system",
+                                 actor: "schema_migration",
+                                 action:
+                                   cond do
+                                     format < 3 -> "enrollment_revision_init"
+                                     format < 4 -> "owner_state_init"
+                                     format < 5 -> "pending_state_init"
+                                     format < 6 -> "maintainer_state_init"
+                                     format < 7 -> "pending_v8_readback_init"
+                                     format < 9 -> "agent_authority_init"
+                                     format < 10 -> "push_state_init"
+                                     format < 11 -> "push_reason_sanitize"
+                                     format < 12 -> "join_invitation_init"
+                                     format < 13 -> "device_metadata_init"
+                                     format < 14 -> "browser_sign_in_init"
+                                     format < 15 -> "invitation_request_init"
+                                     format < 16 -> "resumable_pending_init"
+                                     format < 17 -> "push_presentation_init"
+                                     format < 18 -> "conversation_feed_init"
+                                     format < 23 -> "prioritization_init"
+                                     format < 24 -> "chat_read_positions_init"
+                                     true -> "state_format"
+                                   end
+                               }
+                             ) do
+                          {:ok, migrated} -> {:ok, migrated.engine, migrated.version}
+                          _ -> {:error, :migration_failed}
+                        end
+                    end
+
+                  _ ->
+                    {:error, :invalid_state}
+                end
+              rescue
+                error ->
+                  Diagnostics.failure(:server_storage, :store_open, error, :unavailable)
+                  {:error, :invalid_state}
+              end
             else
               {:error, :invalid_checksum}
             end
