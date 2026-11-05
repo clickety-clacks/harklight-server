@@ -50,14 +50,20 @@ defmodule AttentionServer.APNSRuntimeConfigTest do
   end
 
   test "optional score record path reaches the self-hosted relay", %{certs: certs} do
-    with_env(Map.put(@server_env, "ATTENTION_SERVER_JEV_SCORE_RECORD_PATH", "/unused/scores.jsonl"), fn ->
-      opts = runtime_server_opts(certs)
-      assert opts[:jev_score_record_path] == "/unused/scores.jsonl"
-      server = start_server(opts)
-      {_, relay, _, _} = Enum.find(Supervisor.which_children(server), fn {id, _, _, _} -> id == :relay end)
-      writer = :sys.get_state(relay).applied_score_record
-      assert :sys.get_state(writer).path == "/unused/scores.jsonl"
-    end)
+    with_env(
+      Map.put(@server_env, "ATTENTION_SERVER_JEV_SCORE_RECORD_PATH", "/unused/scores.jsonl"),
+      fn ->
+        opts = runtime_server_opts(certs)
+        assert opts[:jev_score_record_path] == "/unused/scores.jsonl"
+        server = start_server(opts)
+
+        {_, relay, _, _} =
+          Enum.find(Supervisor.which_children(server), fn {id, _, _, _} -> id == :relay end)
+
+        writer = :sys.get_state(relay).applied_score_record
+        assert :sys.get_state(writer).path == "/unused/scores.jsonl"
+      end
+    )
   end
 
   test "runtime config keeps production and sandbox key settings separate" do
