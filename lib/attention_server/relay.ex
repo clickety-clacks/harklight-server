@@ -539,6 +539,7 @@ defmodule AttentionServer.Relay do
                   Keyword.get(opts, :jev_score_record_path)
                 ),
               priority_views: %{},
+              priority_recorded_scores: %{},
               priority_generations: %{},
               priority_timers: %{},
               priority_jobs: %{},
@@ -4140,9 +4141,17 @@ defmodule AttentionServer.Relay do
   defp record_applied_scores(state, person, items, entries) do
     items = Map.new(items, &{&1.identity, &1})
     now = state.clock.()
+    model = state.store.engine.jev_model
+    previous = Map.get(state.priority_recorded_scores, person, %{})
+    current =
+      Map.new(for %{"score" => score} = entry <- entries,
+        do: {Placement.identity(entry), {score, model}})
 
+    # Ranking passes merge reused cache entries with new results. Rebuilding a
+    # view must not give an unchanged score a new record or timestamp.
     rows =
-      for %{"score" => score} = entry <- entries do
+      for %{"score" => score} = entry <- entries,
+          Map.get(previous, Placement.identity(entry)) != {score, model} do
         item = Map.fetch!(items, Placement.identity(entry))
 
         %{
@@ -4152,12 +4161,12 @@ defmodule AttentionServer.Relay do
           "message_id" => entry["message_id"],
           "title" => item.message["title"],
           "score" => score,
-          "model" => state.store.engine.jev_model
+          "model" => model
         }
       end
 
     AppliedScoreRecord.record(state.applied_score_record, rows)
-    state
+    %{state | priority_recorded_scores: Map.put(state.priority_recorded_scores, person, current)}
   end
 
   defp set_fallback_priority_view(state, person) do

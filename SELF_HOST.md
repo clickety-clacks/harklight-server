@@ -242,7 +242,8 @@ Jev score appends one JSON line containing `time` (Unix milliseconds), `person`,
 0600; it contains no endpoint or key. Writes run separately from delivery and
 ranking; a write failure is ignored and logged once per server process. There
 is no rotation or retention job. It records existing applied scores only and
-never triggers scoring.
+never triggers scoring. Reused scores with unchanged values and model are not
+appended again while they remain in the applied set during the same server run.
 
 ## Optional APNs notifications
 

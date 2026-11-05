@@ -1520,6 +1520,66 @@ defmodule AttentionServer.PrioritizationTest do
     assert length(String.split(File.read!(record_path), "\n", trim: true)) == 2
   end
 
+  test "later arrivals and cache-only passes do not re-record unchanged scores", %{dir: dir, path: path} do
+    use_synthetic_jev_key(dir)
+    parent = self()
+    record_path = Path.join(dir, "scores.jsonl")
+    evaluator = fn request ->
+      send(parent, {:score_request, request.candidates})
+      {:ok, Map.new(request.candidates, &{&1, 0.7})}
+    end
+    relay = start_relay(path, jev_score_record_path: record_path, priority_evaluator: evaluator)
+    setup_person(relay)
+    configure_jev_choice(relay)
+    forward(relay, 1, "first")
+    assert_receive {:score_request, _}, 2_000
+    state = await_state(relay, &(&1.priority_views["person-a"].basis == "selected"))
+    writer = state.applied_score_record
+    :sys.get_state(writer)
+    first_line = File.read!(record_path)
+
+    forward(relay, 2, "second")
+    assert_receive {:score_request, _}, 2_000
+    state = await_state(relay, fn state ->
+      entries = state.priority_views["person-a"].engine_entries
+      length(entries) == 2 and Enum.all?(entries, &(&1["score"] == 0.7))
+    end)
+    :sys.get_state(writer)
+    lines = String.split(File.read!(record_path), "\n", trim: true)
+    assert length(lines) == 2
+    assert hd(lines) <> "\n" == first_line
+    assert {:ok, %{"message_id" => "second"}} = JSON.decode_line(List.last(lines) <> "\n")
+
+    pass = JevRanking.run(Placement.items(state.store.engine, "person-a"),
+      state.priority_caches["person-a"], state.store.engine.jev_endpoint,
+      state.store.engine.jev_model, state.clock.(), fn _ -> flunk("cached pass called scorer") end)
+    assert pass.sent == 0
+    job = start_synthetic_priority_pass(relay)
+    complete_synthetic_priority_pass(job, pass)
+    :sys.get_state(writer)
+    assert String.split(File.read!(record_path), "\n", trim: true) == lines
+    refute_received {:score_request, _}
+
+    scores = %{{"app:test", "first"} => 0.8, {"app:test", "second"} => 0.7}
+    job = start_synthetic_priority_pass(relay)
+    complete_synthetic_priority_pass(job, {:ok, scores})
+    :sys.get_state(writer)
+    assert length(String.split(File.read!(record_path), "\n", trim: true)) == 3
+
+    :sys.replace_state(relay, fn state ->
+      %{state | store: %{state.store | engine: %{state.store.engine | jev_model: "jev-other"}}}
+    end)
+    job = start_synthetic_priority_pass(relay)
+    complete_synthetic_priority_pass(job, {:ok, scores})
+    :sys.get_state(writer)
+    rows = for line <- String.split(File.read!(record_path), "\n", trim: true) do
+      {:ok, row} = JSON.decode_line(line <> "\n")
+      row
+    end
+    assert length(rows) == 5
+    assert Enum.map(Enum.take(rows, -2), & &1["model"]) == ["jev-other", "jev-other"]
+  end
+
   test "unset path and hosted deployment never start or write a score record", %{dir: dir} do
     use_synthetic_jev_key(dir)
 
