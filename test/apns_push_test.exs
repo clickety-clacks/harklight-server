@@ -196,8 +196,7 @@ defmodule AttentionServer.APNSPushTest do
     assert_receive {:apns_relay_enable, :ok, recovered_attempt}, 3_000
     assert recovered_attempt - first_attempt >= 200
 
-    assert_receive {:apns_request, "POST", path, _headers, _body}, 12_000
-    assert path == "/3/device/" <> claim.address
+    assert_receive {:fake_apns_sink, ^claim}, 1_000
     assert_receive {:apns_relay_finish, %{state: "provider_accepted"}}, 1_000
   end
 
@@ -218,8 +217,7 @@ defmodule AttentionServer.APNSPushTest do
     assert_receive {:apns_relay_enable, :ok, recovered_restart}, 3_000
     assert recovered_restart - failed_restart >= 400
 
-    assert_receive {:apns_request, "POST", path, _headers, _body}, 12_000
-    assert path == "/3/device/" <> claim.address
+    assert_receive {:fake_apns_sink, ^claim}, 1_000
     assert_receive {:apns_relay_finish, %{state: "provider_accepted"}}, 1_000
   end
 
@@ -1428,8 +1426,19 @@ defmodule AttentionServer.APNSPushTest do
   end
 
   defp start_dispatcher(relay, ctx) do
+    owner = self()
+
+    apns_send = fn _config, claim, cached_token ->
+      send(owner, {:fake_apns_sink, claim})
+      {%{state: "provider_accepted", status: 200, reason: nil}, cached_token}
+    end
+
     {:ok, dispatcher} =
-      AttentionServer.PushDispatcher.start_link(relay: relay, apns: apns_options(ctx))
+      AttentionServer.PushDispatcher.start_link(
+        relay: relay,
+        apns: apns_options(ctx),
+        apns_send: apns_send
+      )
 
     Process.unlink(dispatcher)
     on_exit(fn -> if Process.alive?(dispatcher), do: GenServer.stop(dispatcher) end)

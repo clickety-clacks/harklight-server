@@ -80,7 +80,7 @@ defmodule AttentionServer.PushDispatcher do
       {:error, {kind, reason}}
   end
 
-  defp schedule_retry(state, reason \\ :start_failed) do
+  defp schedule_retry(state, reason) do
     Diagnostics.failure(:apns_dispatch, :configuration, reason, :retry)
     delay = retry_interval(state.retry_attempt)
     timer = Process.send_after(self(), :start_dispatcher, delay)
@@ -122,6 +122,7 @@ defmodule AttentionServer.PushDispatcher.Worker do
     state = %{
       relay: relay,
       apns: apns,
+      apns_send: Keyword.get(opts, :apns_send, &APNS.send/3),
       cached_token: nil
     }
 
@@ -142,7 +143,7 @@ defmodule AttentionServer.PushDispatcher.Worker do
         schedule(@idle_interval, state)
 
       {:ok, claim} ->
-        {outcome, cached_token} = APNS.send(state.apns, claim, state.cached_token)
+        {outcome, cached_token} = state.apns_send.(state.apns, claim, state.cached_token)
 
         case relay_call(:push_finish, claim.claim_id, fn ->
                Relay.finish_push(state.relay, claim, outcome, System.system_time(:millisecond))
