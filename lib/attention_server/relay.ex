@@ -4143,9 +4143,12 @@ defmodule AttentionServer.Relay do
     now = state.clock.()
     model = state.store.engine.jev_model
     previous = Map.get(state.priority_recorded_scores, person, %{})
+
     current =
-      Map.new(for %{"score" => score} = entry <- entries,
-        do: {Placement.identity(entry), {score, model}})
+      Map.new(
+        for %{"score" => score} = entry <- entries,
+            do: {Placement.identity(entry), {score, model}}
+      )
 
     # Ranking passes merge reused cache entries with new results. Rebuilding a
     # view must not give an unchanged score a new record or timestamp.
