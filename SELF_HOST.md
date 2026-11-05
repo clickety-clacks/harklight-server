@@ -1,6 +1,6 @@
 # Harklight Server self-hosted installation
 
-Version: **0.1.25**. Package target: **Linux x86_64, glibc 2.39 or newer**, with OpenSSL 3 shared libraries and libstdc++6 (built on Ubuntu 24.04). The package bundles
+Version: **0.1.26**. Package target: **Linux x86_64, glibc 2.39 or newer**, with OpenSSL 3 shared libraries and libstdc++6 (built on Ubuntu 24.04). The package bundles
 Erlang/OTP and Elixir bytecode; users need no Mix, Hex, source checkout or
 Erlang installation. It needs Bash, OpenSSL CLI, tar and the platform libraries
 listed in BUILD_INFO. This is a single-process self-hosted server cut.
@@ -32,9 +32,9 @@ a live phone test.
 
 ## Download and verify
 
-After publication, download the v0.1.25 release from
-clickety-clacks/harklight-server, tag v0.1.25. Get
-harklight-server-0.1.25-linux-x86_64.tar.gz, SHA256SUMS and SELF_HOST.md from
+After publication, download the v0.1.26 release from
+clickety-clacks/harklight-server, tag v0.1.26. Get
+harklight-server-0.1.26-linux-x86_64.tar.gz, SHA256SUMS and SELF_HOST.md from
 that release. Run sha256sum -c SHA256SUMS and extract into an operator-owned
 versioned directory. BUILD_INFO identifies the source commit, build host,
 toolchain, source status and native dependencies.
@@ -47,7 +47,7 @@ runtime/dependency notices remain in their shipped distribution files.
 Choose the DNS hostname clients will validate. For a same-machine preview,
 localhost works. Install into a directory you own and run:
 
-    PACKAGE="$PWD/harklight-server-0.1.25-linux-x86_64"
+    PACKAGE="$PWD/harklight-server-0.1.26-linux-x86_64"
     STATE="$HOME/.local/share/harklight-server"
     "$PACKAGE/bin/harklight-bootstrap" "$STATE" localhost
     cat "$STATE/person-id"
@@ -306,16 +306,16 @@ including FORMAT17, is normalized and durably committed on startup. The new
 state includes hosted-account records, the separate conversation feed,
 conversation push high water and upload activity accounting while retaining
 existing requests, answers and authority, and adds persisted chat read positions.
-v0.1.25, the v0.1.24 repair line, v0.1.23, v0.1.22, v0.1.21, v0.1.20, v0.1.19, v0.1.18, v0.1.17, v0.1.16, v0.1.15, v0.1.14 and v0.1.13 use FORMAT24; v0.1.12 uses FORMAT23; v0.1.11 uses
+v0.1.26, v0.1.25, the v0.1.24 repair line, v0.1.23, v0.1.22, v0.1.21, v0.1.20, v0.1.19, v0.1.18, v0.1.17, v0.1.16, v0.1.15, v0.1.14 and v0.1.13 use FORMAT24; v0.1.12 uses FORMAT23; v0.1.11 uses
 FORMAT22; and v0.1.10 accepts formats 1–6 and 8–21 only. Those earlier packages cannot
 start against FORMAT24. Preserve the trust root, person and sender grants; do
 not repeat bootstrap. After a successful FORMAT24 upgrade, v0.1.12 or earlier
 is not a code-only rollback path; restore the complete pre-upgrade backup to
 return to that earlier state.
 
-Version 0.1.25 also persists delivery acknowledgements (ACK1 and ACK2). Sharing
+Version 0.1.25 and later persist delivery acknowledgements (ACK1 and ACK2). Sharing
 FORMAT24 with an older release does not establish downgrade compatibility.
-Once 0.1.25 writes new data, no safe code-only downgrade to 0.1.24 or earlier
+Once 0.1.25 or later writes new data, no safe code-only downgrade to 0.1.24 or earlier
 has been established. Before cutover, retain the complete private pre-upgrade
 backup and agree on recovery with the release owner. Restoring that backup
 returns to its captured state and discards all later writes.
@@ -404,7 +404,7 @@ Restoring the pre-install backup discards every write made after its capture,
 including any writes made by the candidate during its failed start. A successful
 FORMAT24 upgrade cannot be rolled back to v0.1.12 or earlier by changing the
 code link alone; those releases refuse FORMAT24 state. The same format number
-does not make a 0.1.25 downgrade safe: after ACK2 data has been written, do not
+does not make a downgrade from 0.1.25 or later safe: after ACK2 data has been written, do not
 switch to 0.1.24 or earlier against the current state. Follow the release owner's
 recovery disposition; restoring the complete pre-upgrade backup loses all writes
 since capture. Keep backups and keys private.
