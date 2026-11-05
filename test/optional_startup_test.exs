@@ -28,7 +28,8 @@ defmodule AttentionServer.OptionalStartupTest do
     assert_core_listeners(server)
   end
 
-  test "an unreadable APNs key disables push without stopping core listeners", %{certs: certs} do
+  test "an unreadable configured APNs key keeps retry ownership without stopping core listeners",
+       %{certs: certs} do
     key_path =
       Path.join(
         System.tmp_dir!(),
@@ -49,7 +50,7 @@ defmodule AttentionServer.OptionalStartupTest do
 
     server = start_server(Keyword.put(server_opts(certs), :apns, apns))
 
-    refute_child(server, :push_dispatcher)
+    assert is_pid(child_pid(server, :push_dispatcher))
     refute Map.fetch!(:sys.get_state(Server.relay(server)), :push_enabled)
     assert_core_listeners(server)
   end

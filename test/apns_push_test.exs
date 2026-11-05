@@ -11,6 +11,54 @@ defmodule AttentionServer.APNSPushTest.Provider do
   end
 end
 
+defmodule AttentionServer.APNSPushTest.Relay do
+  @moduledoc false
+
+  use GenServer
+
+  def start_link(owner, enable_responses, claim_responses) do
+    GenServer.start_link(__MODULE__, {owner, enable_responses, claim_responses})
+  end
+
+  @impl true
+  def init({owner, enable_responses, claim_responses}) do
+    {:ok,
+     %{
+       owner: owner,
+       enable_responses: enable_responses,
+       claim_responses: claim_responses
+     }}
+  end
+
+  @impl true
+  def handle_call(:enable_push, _from, state) do
+    {response, responses} = take_response(state.enable_responses, :ok)
+    send(state.owner, {:apns_relay_enable, response, System.monotonic_time(:millisecond)})
+    {:reply, response, %{state | enable_responses: responses}}
+  end
+
+  def handle_call({:claim_push, _now_ms}, _from, state) do
+    {claim_response, responses} = take_response(state.claim_responses, :empty)
+    send(state.owner, {:apns_relay_claim, claim_response})
+
+    reply =
+      case claim_response do
+        :empty -> {:ok, nil}
+        claim -> {:ok, claim}
+      end
+
+    {:reply, reply, %{state | claim_responses: responses}}
+  end
+
+  def handle_call({:finish_push, _claim, outcome, _now_ms}, _from, state) do
+    send(state.owner, {:apns_relay_finish, outcome})
+    {:reply, :ok, state}
+  end
+
+  defp take_response([response | rest], _default), do: {response, rest}
+  defp take_response([], default), do: {default, []}
+end
+
 defmodule AttentionServer.APNSPushTest do
   use ExUnit.Case, async: false
 
@@ -136,6 +184,41 @@ defmodule AttentionServer.APNSPushTest do
     assert log =~ "operation_id=#{claim_id}"
     refute log =~ @device_token
     refute log =~ "AuthKey_TESTKEYID1"
+  end
+
+  test "a configured dispatcher recovers after its initial start fails with backoff", ctx do
+    claim = dispatcher_claim()
+    relay = start_dispatcher_test_relay(self(), [{:error, :not_ready}, :ok], [claim])
+    dispatcher = start_dispatcher(relay, ctx)
+
+    assert_receive {:apns_relay_enable, {:error, :not_ready}, first_attempt}, 1_000
+    assert Process.alive?(dispatcher)
+    assert_receive {:apns_relay_enable, :ok, recovered_attempt}, 3_000
+    assert recovered_attempt - first_attempt >= 200
+
+    assert_receive {:fake_apns_sink, ^claim}, 1_000
+    assert_receive {:apns_relay_finish, %{state: "provider_accepted"}}, 1_000
+  end
+
+  test "a configured dispatcher retries a failed restart and sends through the fake APNs sink",
+       ctx do
+    claim = dispatcher_claim()
+    relay = start_dispatcher_test_relay(self(), [:ok, {:error, :not_ready}, :ok], [:empty, claim])
+    dispatcher = start_dispatcher(relay, ctx)
+
+    assert_receive {:apns_relay_enable, :ok, first_attempt}, 1_000
+    assert_receive {:apns_relay_claim, :empty}, 1_000
+    worker = :sys.get_state(dispatcher).child
+    assert is_pid(worker)
+    Process.exit(worker, :kill)
+
+    assert_receive {:apns_relay_enable, {:error, :not_ready}, failed_restart}, 3_000
+    assert failed_restart - first_attempt >= 200
+    assert_receive {:apns_relay_enable, :ok, recovered_restart}, 3_000
+    assert recovered_restart - failed_restart >= 400
+
+    assert_receive {:fake_apns_sink, ^claim}, 1_000
+    assert_receive {:apns_relay_finish, %{state: "provider_accepted"}}, 1_000
   end
 
   test "alert payload fitting respects APNs byte limits for long alert titles", ctx do
@@ -1331,6 +1414,49 @@ defmodule AttentionServer.APNSPushTest do
       team_id: "TESTTEAMID",
       endpoint: endpoint
     ]
+  end
+
+  defp start_dispatcher_test_relay(owner, enable_responses, claim_responses) do
+    {:ok, relay} =
+      AttentionServer.APNSPushTest.Relay.start_link(owner, enable_responses, claim_responses)
+
+    Process.unlink(relay)
+    on_exit(fn -> if Process.alive?(relay), do: GenServer.stop(relay) end)
+    relay
+  end
+
+  defp start_dispatcher(relay, ctx) do
+    owner = self()
+
+    apns_send = fn _config, claim, cached_token ->
+      send(owner, {:fake_apns_sink, claim})
+      {%{state: "provider_accepted", status: 200, reason: nil}, cached_token}
+    end
+
+    {:ok, dispatcher} =
+      AttentionServer.PushDispatcher.start_link(
+        relay: relay,
+        apns: apns_options(ctx),
+        apns_send: apns_send
+      )
+
+    Process.unlink(dispatcher)
+    on_exit(fn -> if Process.alive?(dispatcher), do: GenServer.stop(dispatcher) end)
+    dispatcher
+  end
+
+  defp dispatcher_claim do
+    now = System.system_time(:millisecond)
+
+    %{
+      claim_id: op(70),
+      profile_id: @provider_profile,
+      address: @device_token,
+      deadline_at: now + 60_000,
+      registered_at: now,
+      presentation: :alert,
+      alert: %{"title" => "Harklight", "body" => "New attention is ready."}
+    }
   end
 
   defp jwt_key_id(headers) do
