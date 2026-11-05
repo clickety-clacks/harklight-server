@@ -6,6 +6,22 @@ defmodule AttentionServer.ConversationFeedTest do
 
   @handle "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 
+  defp state_snapshot(path) do
+    assert {:ok, db} = Sqlite3.open(path)
+    assert {:ok, state_stmt} =
+             Sqlite3.prepare(db, "SELECT version, payload, checksum FROM relay_state WHERE id = 1")
+
+    assert {:row, [version, payload, checksum]} = Sqlite3.step(db, state_stmt)
+    assert :ok = Sqlite3.release(db, state_stmt)
+    assert {:ok, overlay_stmt} =
+             Sqlite3.prepare(db, "SELECT count(*) FROM relay_state_overlay_events")
+
+    assert {:row, [overlay_count]} = Sqlite3.step(db, overlay_stmt)
+    assert :ok = Sqlite3.release(db, overlay_stmt)
+    assert :ok = Sqlite3.close(db)
+    {version, payload, checksum, overlay_count}
+  end
+
   setup do
     dir =
       Path.join(System.tmp_dir!(), "harklight-conversation-#{System.unique_integer([:positive])}")
@@ -1741,6 +1757,56 @@ defmodule AttentionServer.ConversationFeedTest do
 
     assert {:ok, %{"availability" => "gone"}} =
              Relay.origin_status(restarted, "origin", @handle)
+
+    GenServer.stop(restarted)
+  end
+
+  test "transient availability persists as an overlay and replays after process restart", %{
+    path: path
+  } do
+    assert {:ok, relay} = Relay.start_link(store_path: path)
+    assert :ok = Relay.setup_person(relay, "A")
+    assert :ok = Relay.setup_device(relay, "A", "origin")
+    assert :ok = Relay.setup_device(relay, "A", "reader")
+    assert :ok = Relay.setup_sender(relay, "origin", "app:test")
+
+    assert %{"type" => "ok", "seq" => 1} =
+             request(relay, "origin", %{
+               "type" => "forward",
+               "op_id" => op(81),
+               "session_handle" => @handle,
+               "message" => %{
+                 "sender_id" => "app:test",
+                 "message_id" => "overlay-replay",
+                 "created_at" => 1,
+                 "title" => "Availability survives restart"
+               }
+             })
+
+    {before_version, before_payload, before_checksum, 0} = state_snapshot(path)
+    assert :crypto.hash(:sha256, before_payload) == before_checksum
+
+    assert :ok = Relay.origin_stream_attach(relay, "origin", @handle, self())
+    {after_version, after_payload, after_checksum, 1} = state_snapshot(path)
+
+    assert after_version == before_version + 1
+    assert after_payload == before_payload
+    assert after_checksum != :crypto.hash(:sha256, after_payload)
+    assert {:ok, [listening], 1} = Relay.conversation_events(relay, "reader", 0)
+    assert listening["availability"] == "listening"
+
+    GenServer.stop(relay)
+    assert {:ok, restarted} = Relay.start_link(store_path: path)
+
+    assert {:ok, [initial], 1} = Relay.events(restarted, "reader", 0)
+    assert initial["availability"] == "not_listening"
+    assert {:ok, [replayed], 1} = Relay.conversation_events(restarted, "reader", 0)
+    assert replayed["availability"] == "listening"
+    assert {:ok, %{"availability" => "not_listening"}} =
+             Relay.origin_status(restarted, "origin", @handle)
+
+    {_version, restored_payload, restored_checksum, 0} = state_snapshot(path)
+    assert :crypto.hash(:sha256, restored_payload) == restored_checksum
 
     GenServer.stop(restarted)
   end

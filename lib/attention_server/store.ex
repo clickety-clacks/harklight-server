@@ -1,6 +1,8 @@
 defmodule AttentionServer.Store do
   @moduledoc """
-  A single-row transactional SQLite snapshot for the bounded relay core.
+  A transactional SQLite snapshot for the bounded relay core. Transient origin
+  availability updates are stored as checksummed overlays and folded into the
+  snapshot before the next full-state commit or after restart.
 
   The server serializes decisions in one process. SQLite commits the complete
   new decision state and a content-free audit row before any success reply.
@@ -19,6 +21,16 @@ defmodule AttentionServer.Store do
   CREATE TABLE IF NOT EXISTS relay_state (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     version INTEGER NOT NULL,
+    payload BLOB NOT NULL,
+    checksum BLOB NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS relay_state_overlay (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    base_version INTEGER NOT NULL,
+    base_checksum BLOB NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS relay_state_overlay_events (
+    version INTEGER PRIMARY KEY,
     payload BLOB NOT NULL,
     checksum BLOB NOT NULL
   );
@@ -973,6 +985,297 @@ defmodule AttentionServer.Store do
     end
   end
 
+  def commit_transient_origin_availability(
+        %__MODULE__{engine: old} = store,
+        next,
+        _session,
+        _audit
+      )
+      when old == next,
+    do: {:ok, store}
+
+  def commit_transient_origin_availability(
+        %__MODULE__{engine: old} = store,
+        next,
+        {person, _origin, _handle} = session_key,
+        audit
+      ) do
+    with {:ok, patch} <- origin_availability_patch(old, next, session_key, person),
+         :ok <- validate_transient_audit(audit) do
+      commit_transient_overlay(store, next, patch, audit)
+    else
+      _ ->
+        Diagnostics.failure(
+          :server_storage,
+          :state_commit,
+          :invalid_transient_state,
+          :unavailable,
+          operation_id(audit)
+        )
+
+        {:error, :storage_unavailable, store}
+    end
+  end
+
+  defp commit_transient_overlay(%__MODULE__{db: nil} = store, next, _patch, _audit),
+    do: {:ok, %{store | engine: next}}
+
+  defp commit_transient_overlay(
+         %__MODULE__{db: db, version: version} = store,
+         next,
+         patch,
+         audit
+       ) do
+    payload = encode_overlay_patch(patch)
+    patch_checksum = :crypto.hash(:sha256, payload)
+    next_version = version + 1
+
+    result =
+      with :ok <- Sqlite3.execute(db, "BEGIN IMMEDIATE"),
+           {:ok, [current_checksum]} <-
+             one(db, "SELECT checksum FROM relay_state WHERE id = 1 AND version = ?", [version]),
+           {:ok, overlay} <-
+             one(db, "SELECT base_version, base_checksum FROM relay_state_overlay WHERE id = 1", []),
+           {:ok, state_checksum} <- transient_state_checksum(current_checksum, overlay, version),
+           :ok <- ensure_overlay_base(db, overlay, version, current_checksum),
+           :ok <-
+             run(
+               db,
+               "UPDATE relay_state SET version = version + 1, checksum = ? WHERE id = 1 AND version = ?",
+               [{:blob, state_checksum}, version]
+             ),
+           {:ok, 1} <- Sqlite3.changes(db),
+           :ok <-
+             run(
+               db,
+               "INSERT INTO relay_state_overlay_events (version, payload, checksum) VALUES (?, ?, ?)",
+               [next_version, {:blob, payload}, {:blob, patch_checksum}]
+             ),
+           :ok <- insert_audit(db, audit),
+           :ok <- Sqlite3.execute(db, "COMMIT") do
+        :ok
+      end
+
+    case result do
+      :ok ->
+        {:ok, %{store | engine: next, version: next_version}}
+
+      error ->
+        _ = Sqlite3.execute(db, "ROLLBACK")
+        Diagnostics.failure(
+          :server_storage,
+          :state_commit,
+          error,
+          :outcome_unknown,
+          operation_id(audit)
+        )
+
+        {:error, :storage_unavailable, store}
+    end
+  end
+
+  defp transient_state_checksum(current_checksum, nil, _version)
+       when is_binary(current_checksum) and byte_size(current_checksum) == 32,
+       do: {:ok, invalidate_checksum(current_checksum)}
+
+  defp transient_state_checksum(current_checksum, [base_version, base_checksum], version)
+       when is_integer(base_version) and is_binary(base_checksum) and
+              byte_size(base_checksum) == 32 and base_version < version do
+    if current_checksum == invalidate_checksum(base_checksum),
+      do: {:ok, current_checksum},
+      else: {:error, :overlay_checksum_mismatch}
+  end
+
+  defp transient_state_checksum(_, _, _), do: {:error, :overlay_unavailable}
+
+  defp ensure_overlay_base(_db, [_base_version, _base_checksum], _version, _current_checksum),
+    do: :ok
+
+  defp ensure_overlay_base(db, nil, version, current_checksum) do
+    run(
+      db,
+      "INSERT INTO relay_state_overlay (id, base_version, base_checksum) VALUES (1, ?, ?)",
+      [version, {:blob, current_checksum}]
+    )
+  end
+
+  defp insert_audit(db, audit) do
+    run(
+      db,
+      "INSERT INTO relay_audit (person_id, actor_id, action, at_ms) VALUES (?, ?, ?, ?)",
+      [audit.person, audit.actor, audit.action, System.system_time(:millisecond)]
+    )
+  end
+
+  defp validate_transient_audit(%{person: person, actor: actor, action: action})
+       when is_binary(person) and is_binary(actor) and action in ["origin_attach", "origin_detach"],
+       do: :ok
+
+  defp validate_transient_audit(_), do: {:error, :invalid_audit}
+
+  defp origin_availability_patch(
+         old,
+         %Engine{} = next,
+         {person, _origin, _handle} = session_key,
+         patch_person
+       )
+       when person == patch_person do
+    changed_fields = [:origin_sessions, :conversation_events, :conversation_highs, :push_bindings]
+
+    unchanged =
+      Map.keys(Map.from_struct(old))
+      |> Enum.reject(&(&1 in changed_fields))
+      |> Enum.all?(fn field -> Map.fetch!(old, field) === Map.fetch!(next, field) end)
+
+    old_session = Map.get(old.origin_sessions, session_key)
+    next_session = Map.get(next.origin_sessions, session_key)
+    old_high = Map.get(old.conversation_highs, person, 0)
+    next_high = Map.get(next.conversation_highs, person, 0)
+
+    events =
+      if is_integer(old_high) and is_integer(next_high) and next_high >= old_high do
+        if next_high == old_high do
+          %{}
+        else
+          Enum.reduce((old_high + 1)..next_high, %{}, fn seq, acc ->
+            event_key = {person, seq}
+            Map.put(acc, event_key, Map.fetch!(next.conversation_events, event_key))
+          end)
+        end
+      else
+        :invalid
+      end
+
+    bindings =
+      next.push_bindings
+      |> Enum.filter(fn {key, value} ->
+        match?({^person, _}, key) and Map.get(old.push_bindings, key) != value
+      end)
+      |> Map.new()
+
+    cond do
+      not unchanged ->
+        {:error, :unexpected_engine_change}
+
+      not is_map(old_session) or not is_map(next_session) ->
+        {:error, :missing_origin_session}
+
+      is_nil(events) or events == :invalid ->
+        {:error, :invalid_conversation_events}
+
+      map_size(events) != next_high - old_high ->
+        {:error, :conversation_high_mismatch}
+
+      not Enum.all?(events, fn {{event_person, seq}, event} ->
+        event_person == person and seq > old_high and seq <= next_high and
+          event.kind == :conversation and elem(event.key, 0) == person and
+          Map.has_key?(old.messages, event.key) and
+          get_in(event, [:payload, "kind"]) == "availability"
+      end) ->
+        {:error, :invalid_availability_event}
+
+      true ->
+        {:ok,
+         %{
+           origin_sessions: %{session_key => next_session},
+           conversation_events: events,
+           conversation_highs: if(next_high > old_high, do: %{person => next_high}, else: %{}),
+           push_bindings: bindings
+         }}
+    end
+  rescue
+    _ -> {:error, :invalid_transient_state}
+  end
+
+  defp origin_availability_patch(_, _, _, _), do: {:error, :invalid_engine}
+
+  defp encode_overlay_patch(patch),
+    do: :erlang.term_to_binary({:attention_relay_state_overlay, 1, patch}, [{:compressed, 6}])
+
+  defp invalidate_checksum(<<first, rest::binary>>),
+    do: <<if(first == 0, do: 1, else: 0), rest::binary>>
+
+  defp clear_state_overlay(db) do
+    with :ok <- Sqlite3.execute(db, "DELETE FROM relay_state_overlay_events"),
+         :ok <- Sqlite3.execute(db, "DELETE FROM relay_state_overlay") do
+      :ok
+    end
+  end
+
+  defp load_state_overlay(db, version, state_checksum) do
+    with {:ok, overlay} <-
+           one(db, "SELECT base_version, base_checksum FROM relay_state_overlay WHERE id = 1", []),
+         {:ok, rows} <-
+           all(
+             db,
+             "SELECT version, payload, checksum FROM relay_state_overlay_events ORDER BY version",
+             []
+           ) do
+      case overlay do
+        nil ->
+          if rows == [], do: {:ok, state_checksum, []}, else: {:error, :invalid_overlay}
+
+        [base_version, base_checksum]
+        when is_integer(base_version) and base_version >= 0 and is_binary(base_checksum) and
+               byte_size(base_checksum) == 32 and version > base_version ->
+          expected_versions = Enum.to_list((base_version + 1)..version)
+          row_versions = Enum.map(rows, fn [row_version, _payload, _checksum] -> row_version end)
+
+          if state_checksum == invalidate_checksum(base_checksum) and
+               row_versions == expected_versions do
+            with {:ok, patches} <- decode_state_overlay_rows(rows) do
+              {:ok, base_checksum, patches}
+            end
+          else
+            {:error, :invalid_overlay}
+          end
+
+        _ ->
+          {:error, :invalid_overlay}
+      end
+    end
+  rescue
+    _ -> {:error, :invalid_overlay}
+  end
+
+  defp decode_state_overlay_rows(rows) do
+    {:module, ^Engine} = Code.ensure_loaded(Engine)
+
+    Enum.reduce_while(rows, {:ok, []}, fn [_version, payload, checksum], {:ok, patches} ->
+      case decode_checked_term(payload, checksum) do
+        {:ok, {:attention_relay_state_overlay, 1, patch}} when is_map(patch) ->
+          if valid_state_overlay_patch?(patch),
+            do: {:cont, {:ok, [patch | patches]}},
+            else: {:halt, {:error, :invalid_overlay}}
+
+        _ ->
+          {:halt, {:error, :invalid_overlay}}
+      end
+    end)
+    |> case do
+      {:ok, patches} -> {:ok, Enum.reverse(patches)}
+      error -> error
+    end
+  end
+
+  defp valid_state_overlay_patch?(patch) do
+    Map.keys(patch) |> Enum.sort() ==
+      Enum.sort([:origin_sessions, :conversation_events, :conversation_highs, :push_bindings]) and
+      Enum.all?(Map.values(patch), &is_map/1)
+  end
+
+  defp apply_state_overlays(engine, patches) do
+    Enum.reduce(patches, engine, fn patch, current ->
+      %{
+        current
+        | origin_sessions: Map.merge(current.origin_sessions, patch.origin_sessions),
+          conversation_events: Map.merge(current.conversation_events, patch.conversation_events),
+          conversation_highs: Map.merge(current.conversation_highs, patch.conversation_highs),
+          push_bindings: Map.merge(current.push_bindings, patch.push_bindings)
+      }
+    end)
+  end
+
   defp commit_durable(%__MODULE__{db: db, version: version} = store, next, audit) do
     payload = encode_state(next)
     checksum = :crypto.hash(:sha256, payload)
@@ -990,6 +1293,7 @@ defmodule AttentionServer.Store do
                ]
              ),
            {:ok, 1} <- Sqlite3.changes(db),
+           :ok <- clear_state_overlay(db),
            :ok <-
              run(
                db,
@@ -1042,7 +1346,9 @@ defmodule AttentionServer.Store do
         end
 
       {:ok, [version, payload, checksum]} when is_integer(version) and is_binary(payload) ->
-        if :crypto.hash(:sha256, payload) == checksum do
+        case load_state_overlay(db, version, checksum) do
+          {:ok, base_checksum, overlay_patches} when is_binary(base_checksum) ->
+            if :crypto.hash(:sha256, payload) == base_checksum do
           try do
             # Safe decoding accepts only atoms already loaded by this VM.
             # Load the modules that define persisted record fields before a
@@ -1161,6 +1467,8 @@ defmodule AttentionServer.Store do
                     if format < 24, do: %{state | chat_read_positions: %{}}, else: state
                   end)
 
+                engine = apply_state_overlays(engine, overlay_patches)
+
                 cond do
                   not valid_state?(engine) ->
                     {:error, :invalid_state}
@@ -1211,8 +1519,12 @@ defmodule AttentionServer.Store do
               Diagnostics.failure(:server_storage, :store_open, error, :unavailable)
               {:error, :invalid_state}
           end
-        else
-          {:error, :invalid_checksum}
+            else
+              {:error, :invalid_checksum}
+            end
+
+          {:error, reason} ->
+            {:error, reason}
         end
 
       error ->
@@ -1643,6 +1955,7 @@ defmodule AttentionServer.Store do
              [{:blob, payload}, {:blob, checksum}, version]
            ),
          {:ok, 1} <- Sqlite3.changes(db),
+         :ok <- clear_state_overlay(db),
          :ok <-
            run(
              db,
