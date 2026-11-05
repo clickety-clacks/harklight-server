@@ -80,6 +80,7 @@ defmodule AttentionServer.Server do
         store_path: store_path,
         push_enabled: false,
         deployment_mode: deployment_mode,
+        jev_score_record_path: Keyword.get(opts, :jev_score_record_path),
         upload_cap: upload_cap
       ]
 

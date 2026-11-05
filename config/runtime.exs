@@ -133,6 +133,7 @@ if System.get_env("ATTENTION_SERVER_ENABLE") == "1" do
     agent_ip: bind.("ATTENTION_SERVER_AGENT_BIND"),
     join_name: System.get_env("ATTENTION_SERVER_JOIN_NAME"),
     deployment_mode: deployment_mode,
+    jev_score_record_path: System.get_env("ATTENTION_SERVER_JEV_SCORE_RECORD_PATH"),
     upload_cap: upload_cap
   ]
 

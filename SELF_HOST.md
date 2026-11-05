@@ -234,6 +234,17 @@ remain in basic order until setup is complete and an ordering response arrives;
 the page shows whether setup is incomplete or the server is waiting for an
 answer. Intake, delivery and push continue normally.
 
+Optional private applied-score record: set `ATTENTION_SERVER_JEV_SCORE_RECORD_PATH`
+in private `server.env` to a file in an existing private directory writable by
+the server account. It is off when unset; hosted mode ignores it. Each applied
+Jev score appends one JSON line containing `time` (Unix milliseconds), `person`,
+`sender_id`, `message_id`, `title`, `score` (0–1), and `model`. The file is mode
+0600; it contains no endpoint or key. Writes run separately from delivery and
+ranking; a write failure is ignored and logged once per server process. There
+is no rotation or retention job. It records existing applied scores only and
+never triggers scoring. Reused scores with unchanged values and model are not
+appended again while they remain in the applied set during the same server run.
+
 ## Optional APNs notifications
 
 APNs is disabled when all five APNs settings below are absent. The Sandbox
