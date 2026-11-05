@@ -1850,6 +1850,243 @@ defmodule AttentionServer.PrioritizationTest do
     assert logs =~ "requests=1 finals=0"
   end
 
+  test "reply arrival schedules mixed ranking without a second push", %{dir: dir, path: path} do
+    use_synthetic_jev_key(dir)
+    parent = self()
+
+    evaluator = fn request ->
+      send(parent, {:reply_batch, request.candidates})
+      {:ok, Map.new(request.candidates, &{&1, 0.1})}
+    end
+
+    relay = start_relay(path, priority_evaluator: evaluator, push_enabled: true)
+    setup_person(relay)
+
+    assert %{"type" => "ok"} =
+             request(relay, "device-b", %{
+               "type" => "push_register",
+               "op_id" => op(799),
+               "revision" => 1,
+               "profile_id" => "harklight-sandbox",
+               "address_kind" => "apns_token",
+               "address" => String.duplicate("ab", 32)
+             })
+
+    assert %{"type" => "ok"} =
+             request(relay, "device-a", %{
+               "type" => "forward",
+               "op_id" => op(800),
+               "session_handle" => op(801),
+               "message" => %{
+                 "sender_id" => "app:test",
+                 "message_id" => "chat",
+                 "created_at" => 1,
+                 "title" => "Chat parent",
+                 "body" => "Context"
+               }
+             })
+
+    {:ok, session} = Relay.open_session(relay, "device-b")
+    session_request(relay, session, %{"type" => "resync", "since" => 0})
+    session_request(relay, session, %{"type" => "view_get", "ref" => "before"})
+    configure_jev_choice(relay)
+
+    discussion =
+      request(relay, "device-b", %{
+        "type" => "discussion",
+        "op_id" => op(802),
+        "sender_id" => "app:test",
+        "message_id" => "chat",
+        "request_revision" => 1,
+        "text" => "Question"
+      })
+
+    reply =
+      request(relay, "device-a", %{
+        "type" => "conversation_reply",
+        "op_id" => op(803),
+        "sender_id" => "app:test",
+        "message_id" => "chat",
+        "request_revision" => 1,
+        "in_reply_to" => String.to_integer(discussion["event_id"]),
+        "text" => "Low importance reply"
+      })
+
+    seq = reply["seq"]
+    bindings = :sys.get_state(relay).store.engine.push_bindings
+    assert_receive {:reply_batch, candidates}, 2000
+    assert MapSet.new(candidates) == MapSet.new([{"app:test", "chat"}, {"app:test", "chat", seq}])
+
+    state =
+      await_state(relay, fn state ->
+        match?([%{"score" => 0.1}], state.priority_views["person-a"].replies)
+      end)
+
+    assert state.store.engine.push_bindings == bindings
+    assert Enum.any?(drain(relay, session), &(&1["type"] == "view_changed"))
+    assert [%{"message_id" => "chat"}] = state.priority_views["person-a"].entries
+    engine = state.store.engine
+    now = engine.push_bindings[{"person-a", "device-b"}].next_at
+    assert {:ok, engine, first} = Engine.claim_push(engine, now)
+    assert first.stream == :request
+
+    assert {:ok, engine} =
+             Engine.finish_push(
+               engine,
+               first,
+               %{state: "provider_accepted", http_status: 200},
+               now + 1
+             )
+
+    assert {:ok, engine, chat} = Engine.claim_push(engine, now + 1)
+    assert chat.stream == :conversation
+    assert chat.alert["body"] == "Low importance reply"
+
+    assert {:ok, engine} =
+             Engine.finish_push(
+               engine,
+               chat,
+               %{state: "provider_accepted", http_status: 200},
+               now + 2
+             )
+
+    assert engine.push_bindings[{"person-a", "device-b"}].pending_conversation_high == 0
+  end
+
+  test "unseen origin replies are revisioned separately, scored on resolved parents, and removed on read",
+       %{dir: dir, path: path} do
+    use_synthetic_jev_key(dir)
+    record_path = Path.join(dir, "reply-scores.jsonl")
+
+    relay =
+      start_relay(path,
+        jev_score_record_path: record_path,
+        priority_evaluator: fn _ -> {:error, :unavailable} end
+      )
+
+    setup_person(relay)
+    assert {:ok, session} = Relay.open_session(relay, "device-b")
+
+    view = fn ->
+      session_request(relay, session, %{"type" => "view_get", "ref" => "reply-view"})
+      |> Enum.find(&(&1["ref"] == "reply-view"))
+    end
+
+    assert %{"type" => "ok"} =
+             request(relay, "device-a", %{
+               "type" => "forward",
+               "op_id" => op(700),
+               "session_handle" => op(701),
+               "message" => %{
+                 "sender_id" => "app:test",
+                 "message_id" => "parent",
+                 "created_at" => 1,
+                 "title" => "Parent title",
+                 "body" => "Parent context",
+                 "urgency" => "high"
+               }
+             })
+
+    initial = view.()
+    assert initial["replies"] == []
+
+    discussion =
+      request(relay, "device-b", %{
+        "type" => "discussion",
+        "op_id" => op(702),
+        "sender_id" => "app:test",
+        "message_id" => "parent",
+        "request_revision" => 1,
+        "text" => "Explain"
+      })
+
+    assert discussion["type"] == "ok"
+    assert view.()["view_rev"] == initial["view_rev"]
+
+    reply_frame = %{
+      "type" => "conversation_reply",
+      "op_id" => op(703),
+      "sender_id" => "app:test",
+      "message_id" => "parent",
+      "request_revision" => 1,
+      "in_reply_to" => String.to_integer(discussion["event_id"]),
+      "text" => "Agent explanation"
+    }
+
+    reply = request(relay, "device-a", reply_frame)
+    assert reply["type"] == "ok"
+    seq = reply["seq"]
+    expected = %{"sender_id" => "app:test", "message_id" => "parent", "conversation_seq" => seq}
+    baseline = view.()
+    assert baseline["replies"] == [expected]
+    assert baseline["entries"] == initial["entries"]
+    refute baseline["view_rev"] == initial["view_rev"]
+    assert Map.delete(request(relay, "device-a", reply_frame), "duplicate") == reply
+    assert view.()["view_rev"] == baseline["view_rev"]
+
+    assert {:ok, terminal_line} =
+             Relay.request_line(
+               relay,
+               "device-b",
+               JSON.encode!(%{
+                 "type" => "answer_no_comment",
+                 "request_id" => "parent",
+                 "request_revision" => 1
+               }) <> "\n"
+             )
+
+    assert {:ok, %{"type" => "ok"}} = JSON.decode_line(terminal_line)
+    assert view.()["entries"] == []
+    assert view.()["replies"] == [expected]
+    engine = :sys.get_state(relay).store.engine
+    [item] = Placement.ranking_items(engine, "person-a")
+    assert item.identity == {"app:test", "parent", seq}
+    assert {:ok, composed} = JevClient.compose([item], @endpoint, @model, 1000)
+    assert {:ok, payload} = JSON.decode_line(composed.body <> "\n")
+    [pending] = payload["state"]["pending_items"]
+    assert pending["kind"] == "reply"
+    assert pending["parent_body"] == "Parent context"
+    assert pending["body"] == "Agent explanation"
+    assert pending["urgency"] == "high"
+    configure_jev_choice(relay)
+    before_score = view.()
+    assert before_score["replies"] == [expected]
+    job = start_synthetic_priority_pass(relay)
+    complete_synthetic_priority_pass(job, {:ok, %{item.identity => 0.1}})
+    scored = view.()
+    assert [scored_reply] = scored["replies"]
+    assert scored_reply["score"] == %JSON.DecimalToken{raw: "0.1"}
+    assert scored["entries"] == []
+    refute scored["view_rev"] == before_score["view_rev"]
+    writer = :sys.get_state(relay).applied_score_record
+    :sys.get_state(writer)
+    assert {:ok, row} = JSON.decode_line(File.read!(record_path))
+    assert row["kind"] == "reply"
+    assert row["conversation_seq"] == seq
+    assert row["title"] == "Parent title"
+    assert row["score"] == %JSON.DecimalToken{raw: "0.1"}
+    job = start_synthetic_priority_pass(relay)
+    complete_synthetic_priority_pass(job, {:error, :unavailable})
+    assert view.()["replies"] == [expected]
+    before_read = :sys.get_state(relay).store.engine.messages[{"person-a", "app:test", "parent"}]
+
+    assert %{"type" => "ok"} =
+             request(relay, "device-b", %{
+               "type" => "conversation_read",
+               "op_id" => op(705),
+               "sender_id" => "app:test",
+               "message_id" => "parent",
+               "read_through_conversation_seq" => seq
+             })
+
+    after_read = view.()
+    assert after_read["replies"] == []
+    refute after_read["view_rev"] == scored["view_rev"]
+    engine = :sys.get_state(relay).store.engine
+    assert engine.messages[{"person-a", "app:test", "parent"}] == before_read
+    assert Placement.ranking_items(engine, "person-a") == []
+  end
+
   defp await_state(relay, predicate, attempts \\ 100)
   defp await_state(_relay, _predicate, 0), do: flunk("priority pass did not finish")
 

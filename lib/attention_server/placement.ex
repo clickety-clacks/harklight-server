@@ -40,6 +40,15 @@ defmodule AttentionServer.Placement do
     end
   end
 
+  def entry(%{identity: {sender, id, seq}} = item) do
+    entry = %{"sender_id" => sender, "message_id" => id, "conversation_seq" => seq}
+
+    case Map.get(item, :score) do
+      score when is_number(score) and score >= 0 and score <= 1 -> Map.put(entry, "score", score)
+      _ -> entry
+    end
+  end
+
   def entry(%{identity: {sender, id}, message: message} = item) do
     entry = %{
       "sender_id" => sender,
@@ -135,6 +144,42 @@ defmodule AttentionServer.Placement do
     end)
   end
 
+  # Replies share the ranking budget, but never enter the message list or its groups.
+  def ranking_items(%Engine{} = engine, person),
+    do: items(engine, person) ++ reply_items(engine, person)
+
+  def reply_items(%Engine{} = engine, person) do
+    engine.conversation_events
+    |> Enum.flat_map(fn
+      {{^person, seq}, %{key: key, payload: %{"kind" => "reply", "author" => "origin"} = reply}} ->
+        case Map.get(engine.messages, key) do
+          %{message: parent} = record ->
+            if seq > Map.get(engine.chat_read_positions, key, 0) do
+              {_, sender, id} = key
+
+              [
+                %{
+                  identity: {sender, id, seq},
+                  message: Map.put(parent, "body", reply["text"]),
+                  accepted_seq: record.accepted_seq,
+                  revision: {record.revision, seq},
+                  reply: %{conversation_seq: seq, parent_body: parent["body"]}
+                }
+              ]
+            else
+              []
+            end
+
+          _ ->
+            []
+        end
+
+      _ ->
+        []
+    end)
+    |> Enum.sort_by(& &1.identity)
+  end
+
   def baseline(%Engine{} = engine, person), do: Baseline.place(items(engine, person), [], nil)
 
   defp inherited_placement(engine, key, record),
@@ -165,6 +210,9 @@ defmodule AttentionServer.Placement do
       end
     end
   end
+
+  def identity(%{"sender_id" => sender, "message_id" => id, "conversation_seq" => seq}),
+    do: {sender, id, seq}
 
   def identity(%{"sender_id" => sender, "message_id" => id}), do: {sender, id}
   def identity(%{identity: identity}), do: identity
