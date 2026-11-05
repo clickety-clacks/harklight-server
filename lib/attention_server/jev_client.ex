@@ -69,6 +69,13 @@ defmodule AttentionServer.JevClient do
               "Any number of trivial messages should stay near the bottom; any number of genuine emergencies should stay near the top. " <>
               "The current time is now; due_in_minutes is the time left before the deadline, negative once it has passed."
 
+          instructions =
+            if Map.has_key?(item, :reply),
+              do:
+                instructions <>
+                  " This candidate is the agent's chat reply on the identified parent message. Judge the reply; the parent supplies context and urgency evidence.",
+              else: instructions
+
           question = %{
             "type" => "score",
             "instructions" => instructions,
@@ -106,6 +113,20 @@ defmodule AttentionServer.JevClient do
                   else: nil
                 )
             }
+
+            pending =
+              case Map.get(item, :reply) do
+                %{conversation_seq: seq, parent_body: body} ->
+                  Map.merge(pending, %{
+                    "kind" => "reply",
+                    "author" => "origin",
+                    "conversation_seq" => seq,
+                    "parent_body" => body
+                  })
+
+                _ ->
+                  pending
+              end
 
             case AttentionServer.Message.effective_by_when(message) do
               by_when when is_integer(by_when) ->
