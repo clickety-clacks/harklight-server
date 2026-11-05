@@ -1449,6 +1449,143 @@ defmodule AttentionServer.PrioritizationTest do
            |> Map.fetch!("score") == 0.9
   end
 
+  test "private record appends only applied item scores without extra scoring or view changes", %{
+    dir: dir,
+    path: path
+  } do
+    use_synthetic_jev_key(dir)
+    parent = self()
+    record_path = Path.join(dir, "scores.jsonl")
+    now = 1_793_290_000_000
+
+    evaluator = fn request ->
+      send(parent, {:scored_candidates, request.candidates})
+      {:ok, %{{"app:test", "scored"} => 0.7, {"app:test", "invalid"} => 2,
+               {"app:test", "absent"} => 0.9}}
+    end
+
+    relay = start_relay(path, jev_score_record_path: record_path,
+      priority_evaluator: evaluator, clock: fn -> now end)
+    setup_person(relay)
+    forward(relay, 1, "scored")
+    configure_jev_choice(relay)
+    forward(relay, 2, "invalid")
+    assert_receive {:scored_candidates, candidates}, 2_000
+    assert MapSet.new(candidates) == MapSet.new([{"app:test", "scored"}, {"app:test", "invalid"}])
+    state = await_state(relay, &(&1.priority_views["person-a"].basis == "selected"))
+    :sys.get_state(state.applied_score_record)
+    {:ok, row} = JSON.decode_line(File.read!(record_path))
+    assert row == %{"time" => now, "person" => "person-a", "sender_id" => "app:test",
+      "message_id" => "scored", "title" => "Request scored",
+      "score" => %JSON.DecimalToken{raw: "0.7"}, "model" => "jev-latest"}
+    assert Bitwise.band(File.stat!(record_path).mode, 0o777) == 0o600
+    expected = Placement.place("jev-set", Placement.items(state.store.engine, "person-a"), [],
+      {:ranked, %{{"app:test", "scored"} => 0.7, {"app:test", "invalid"} => 2}, []})
+    assert state.priority_views["person-a"].engine_entries == expected
+
+    assert {:ok, session} = Relay.open_session(relay, "device-a")
+    session_request(relay, session, %{"type" => "view_get", "ref" => "read-only"})
+    :sys.get_state(state.applied_score_record)
+    assert File.read!(record_path) == JSON.encode!(%{row | "score" => 0.7}) <> "\n"
+    refute_received {:scored_candidates, _}
+
+    job = start_synthetic_priority_pass(relay)
+    complete_synthetic_priority_pass(job, {:ok, %{{"app:test", "scored"} => 0.8}})
+    :sys.get_state(state.applied_score_record)
+    assert length(String.split(File.read!(record_path), "\n", trim: true)) == 2
+  end
+
+  test "unset path and hosted deployment never start or write a score record", %{dir: dir} do
+    use_synthetic_jev_key(dir)
+
+    for {mode, record_path} <- [{:self_hosted, nil}, {:saas, Path.join(dir, "hosted.jsonl")}] do
+      relay = start_relay(Path.join(dir, "#{mode}.sqlite3"),
+        deployment_mode: mode, jev_score_record_path: record_path)
+      setup_person(relay)
+      forward(relay, 1, "entry")
+      configure_jev_choice(relay)
+      job = start_synthetic_priority_pass(relay)
+      complete_synthetic_priority_pass(job, {:ok, %{{"app:test", "entry"} => 0.7}})
+      state = :sys.get_state(relay)
+      assert state.applied_score_record == nil
+      assert state.priority_views["person-a"].basis == "selected"
+    end
+
+    refute File.exists?(Path.join(dir, "hosted.jsonl"))
+  end
+
+  test "discarded scoring results do not produce records", %{dir: dir, path: path} do
+    use_synthetic_jev_key(dir)
+    record_path = Path.join(dir, "scores.jsonl")
+    relay = start_relay(path, jev_score_record_path: record_path)
+    setup_person(relay)
+    forward(relay, 1, "entry")
+    configure_jev_choice(relay)
+    job = start_synthetic_priority_pass(relay)
+    :sys.replace_state(relay, fn state ->
+      %{state | priority_generations: Map.put(state.priority_generations, "person-a", job.generation + 1)}
+    end)
+    complete_synthetic_priority_pass(job, {:ok, %{{"app:test", "entry"} => 0.7}})
+    :sys.get_state(:sys.get_state(relay).applied_score_record)
+    refute File.exists?(record_path)
+  end
+
+  test "record failure logs once without content and leaves ranking and delivery working", %{
+    dir: dir, path: path
+  } do
+    use_synthetic_jev_key(dir)
+    relay = start_relay(path, jev_score_record_path: Path.join(dir, "missing/scores.jsonl"))
+    setup_person(relay)
+    forward(relay, 1, "private-entry")
+    configure_jev_choice(relay)
+    writer = :sys.get_state(relay).applied_score_record
+
+    logs = ExUnit.CaptureLog.capture_log(fn ->
+      for score <- [0.7, 0.8] do
+        job = start_synthetic_priority_pass(relay)
+        complete_synthetic_priority_pass(job, {:ok, %{{"app:test", "private-entry"} => score}})
+        :sys.get_state(writer)
+        assert hd(:sys.get_state(relay).priority_views["person-a"].entries)["score"] == score
+      end
+      forward(relay, 2, "still-delivered")
+      assert {:ok, events, 2} = Relay.events(relay, "device-a", 0)
+      assert length(events) == 2
+    end)
+
+    assert length(Regex.scan(~r/event=harklight_applied_score_record outcome=write_failed/, logs)) == 1
+    refute logs =~ "private-entry"
+    refute logs =~ "missing"
+    refute logs =~ "app:test"
+  end
+
+  test "waiting record writer does not block applied ranking or delivery and exits with relay", %{
+    dir: dir, path: path
+  } do
+    use_synthetic_jev_key(dir)
+    relay = start_relay(path, jev_score_record_path: Path.join(dir, "scores.jsonl"))
+    setup_person(relay)
+    forward(relay, 1, "entry")
+    configure_jev_choice(relay)
+    writer = :sys.get_state(relay).applied_score_record
+    :sys.suspend(writer)
+
+    try do
+      job = start_synthetic_priority_pass(relay)
+      complete_synthetic_priority_pass(job, {:ok, %{{"app:test", "entry"} => 0.7}})
+      assert :sys.get_state(relay).priority_views["person-a"].basis == "selected"
+      forward(relay, 2, "not-blocked")
+      assert {:ok, events, 2} = Relay.events(relay, "device-a", 0)
+      assert length(events) == 2
+    after
+      :sys.resume(writer)
+    end
+
+    :sys.get_state(writer)
+    monitor = Process.monitor(writer)
+    GenServer.stop(relay)
+    assert_receive {:DOWN, ^monitor, :process, ^writer, :normal}
+  end
+
   test "a quiet inbox re-ranks when the deadline enters the next class", %{dir: dir, path: path} do
     use_synthetic_jev_key(dir)
     now = 1_793_290_000_000

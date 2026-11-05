@@ -6,6 +6,7 @@ defmodule AttentionServer.APNSRuntimeConfigTest do
   @config Path.expand("../config/runtime.exs", __DIR__)
   @server_env %{
     "ATTENTION_SERVER_ENABLE" => "1",
+    "ATTENTION_SERVER_JEV_SCORE_RECORD_PATH" => nil,
     "ATTENTION_SERVER_STORE_PATH" => "/tmp/harklight-config-test/relay.sqlite3",
     "ATTENTION_SERVER_CERTFILE" => "/tmp/harklight-config-test/server.pem",
     "ATTENTION_SERVER_KEYFILE" => "/tmp/harklight-config-test/server.key",
@@ -46,6 +47,17 @@ defmodule AttentionServer.APNSRuntimeConfigTest do
     certs = TLSFixtures.create!()
     on_exit(fn -> File.rm_rf!(certs) end)
     %{certs: certs}
+  end
+
+  test "optional score record path reaches the self-hosted relay", %{certs: certs} do
+    with_env(Map.put(@server_env, "ATTENTION_SERVER_JEV_SCORE_RECORD_PATH", "/unused/scores.jsonl"), fn ->
+      opts = runtime_server_opts(certs)
+      assert opts[:jev_score_record_path] == "/unused/scores.jsonl"
+      server = start_server(opts)
+      {_, relay, _, _} = Enum.find(Supervisor.which_children(server), fn {id, _, _, _} -> id == :relay end)
+      writer = :sys.get_state(relay).applied_score_record
+      assert :sys.get_state(writer).path == "/unused/scores.jsonl"
+    end)
   end
 
   test "runtime config keeps production and sandbox key settings separate" do

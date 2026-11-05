@@ -22,6 +22,7 @@ defmodule AttentionServer.Relay do
 
   alias AttentionServer.{
     AgentWire,
+    AppliedScoreRecord,
     Conversation,
     ConversationFiles,
     DashboardInventory,
@@ -532,6 +533,11 @@ defmodule AttentionServer.Relay do
               origin_listener: nil,
               inbox_builds: %{},
               inbox_build_monitors: %{},
+              applied_score_record:
+                AppliedScoreRecord.start(
+                  Keyword.get(opts, :deployment_mode, :self_hosted),
+                  Keyword.get(opts, :jev_score_record_path)
+                ),
               priority_views: %{},
               priority_generations: %{},
               priority_timers: %{},
@@ -4067,6 +4073,7 @@ defmodule AttentionServer.Relay do
                   basis: "selected",
                   engine_entries: entries
                 })
+                |> record_applied_scores(person, items, entries)
               else
                 set_fallback_priority_view(state, person)
               end
@@ -4094,6 +4101,7 @@ defmodule AttentionServer.Relay do
               basis: "selected",
               engine_entries: entries
             })
+            |> record_applied_scores(person, items, entries)
 
           _ ->
             state
@@ -4124,6 +4132,32 @@ defmodule AttentionServer.Relay do
       {_stale, remaining_queued} ->
         %{state | priority_queued: remaining_queued}
     end
+  end
+
+  defp record_applied_scores(%{applied_score_record: nil} = state, _person, _items, _entries),
+    do: state
+
+  defp record_applied_scores(state, person, items, entries) do
+    items = Map.new(items, &{&1.identity, &1})
+    now = state.clock.()
+
+    rows =
+      for %{"score" => score} = entry <- entries do
+        item = Map.fetch!(items, Placement.identity(entry))
+
+        %{
+          "time" => now,
+          "person" => person,
+          "sender_id" => entry["sender_id"],
+          "message_id" => entry["message_id"],
+          "title" => item.message["title"],
+          "score" => score,
+          "model" => state.store.engine.jev_model
+        }
+      end
+
+    AppliedScoreRecord.record(state.applied_score_record, rows)
+    state
   end
 
   defp set_fallback_priority_view(state, person) do
