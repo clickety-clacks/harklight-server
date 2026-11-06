@@ -169,7 +169,10 @@ defmodule AttentionServer.PrioritizationTest do
     assert {:ok, db} = Sqlite3.open(path)
 
     assert {:ok, state_stmt} =
-             Sqlite3.prepare(db, "SELECT version, payload, checksum FROM relay_state WHERE id = 1")
+             Sqlite3.prepare(
+               db,
+               "SELECT version, payload, checksum FROM relay_state WHERE id = 1"
+             )
 
     assert {:row, [version, payload, checksum]} = Sqlite3.step(db, state_stmt)
     assert :ok = Sqlite3.release(db, state_stmt)
@@ -2315,6 +2318,7 @@ defmodule AttentionServer.PrioritizationTest do
     assert :crypto.hash(:sha256, folded_payload) == folded_checksum
 
     read_reply(relay, "overlay-history", reply_seq, 2712)
+
     [historical] =
       view_for(relay, session)["list_items"]
       |> Enum.filter(&(&1["kind"] == "reply"))
@@ -2353,6 +2357,7 @@ defmodule AttentionServer.PrioritizationTest do
     assert reactivated["unseen_count"] == 1
     refute Map.has_key?(reactivated, "score")
     refute Map.has_key?(reactivated, "score_kind")
+
     assert :sys.get_state(restarted).store.engine.reply_group_history[
              {"person-a", "app:test", "overlay-history"}
            ].score == 0.9
