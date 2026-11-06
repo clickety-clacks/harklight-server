@@ -51,6 +51,7 @@ defmodule AttentionServer.Engine do
             conversation_highs: %{},
             conversation_events: %{},
             chat_read_positions: %{},
+            reply_group_history: %{},
             conversation_cursors: %{},
             conversation_opened: MapSet.new(),
             receipts: %{},
@@ -4244,6 +4245,60 @@ defmodule AttentionServer.Engine do
     end
   end
 
+  # Current per-reply values let a partial read update the retained maximum in
+  # the very same durable transition as its read position. An empty aggregate
+  # leaves the last valid group score intact, including on the final read.
+  def retain_reply_scores(engine, person, entries) do
+    scores =
+      Enum.reduce(entries, %{}, fn
+        %{"sender_id" => sender, "message_id" => id, "conversation_seq" => seq, "score" => score},
+        acc
+        when is_number(score) and score >= 0 and score <= 1 ->
+          Map.update(acc, {person, sender, id}, %{seq => score}, &Map.put(&1, seq, score))
+
+        _, acc ->
+          acc
+      end)
+
+    keys =
+      Enum.uniq(
+        Map.keys(scores) ++
+          Enum.filter(
+            Map.keys(engine.reply_group_history),
+            &(elem(&1, 0) == person)
+          )
+      )
+
+    history =
+      Enum.reduce(keys, engine.reply_group_history, fn key, history ->
+        current = Map.get(scores, key, %{})
+        prior = Map.get(history, key, %{scores: %{}})
+        Map.put(history, key, update_reply_aggregate(prior, current))
+      end)
+
+    %{engine | reply_group_history: history}
+  end
+
+  defp retain_read_group_score(engine, key, position) do
+    case Map.fetch(engine.reply_group_history, key) do
+      {:ok, prior} ->
+        remaining = Map.reject(prior.scores, fn {seq, _} -> seq <= position end)
+
+        history =
+          Map.put(engine.reply_group_history, key, update_reply_aggregate(prior, remaining))
+
+        %{engine | reply_group_history: history}
+
+      :error ->
+        engine
+    end
+  end
+
+  defp update_reply_aggregate(prior, scores) do
+    next = Map.put(prior, :scores, scores)
+    if map_size(scores) == 0, do: next, else: Map.put(next, :score, Enum.max(Map.values(scores)))
+  end
+
   defp commit_conversation_read(engine, person, actor, frame, semantic) do
     key = {person, frame["sender_id"], frame["message_id"]}
     position = frame["read_through_conversation_seq"]
@@ -4289,6 +4344,7 @@ defmodule AttentionServer.Engine do
                     | chat_read_positions: Map.put(state.chat_read_positions, key, position)
                   }
                 end)
+                |> retain_read_group_score(key, position)
                 |> put_conversation_event(person, seq, key, payload)
                 |> queue_conversation_hint(person, seq)
                 |> save_receipt(person, actor, frame["op_id"], semantic, fields)
