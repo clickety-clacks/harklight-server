@@ -144,40 +144,186 @@ defmodule AttentionServer.Placement do
     end)
   end
 
-  # Replies share the ranking budget, but never enter the message list or its groups.
+  # Ranking and normal rows share one traversal of retained conversation events.
+  # The summary is ephemeral; complete history remains in the existing engine.
+  def ranking_projection(%Engine{} = engine, person) do
+    {replies, groups} = reply_projection(engine, person)
+    {items(engine, person) ++ replies, groups}
+  end
+
   def ranking_items(%Engine{} = engine, person),
-    do: items(engine, person) ++ reply_items(engine, person)
+    do: elem(ranking_projection(engine, person), 0)
 
-  def reply_items(%Engine{} = engine, person) do
-    engine.conversation_events
-    |> Enum.flat_map(fn
-      {{^person, seq}, %{key: key, payload: %{"kind" => "reply", "author" => "origin"} = reply}} ->
-        case Map.get(engine.messages, key) do
-          %{message: parent} = record ->
-            if seq > Map.get(engine.chat_read_positions, key, 0) do
-              {_, sender, id} = key
+  def reply_items(%Engine{} = engine, person),
+    do: elem(reply_projection(engine, person), 0)
 
-              [
-                %{
-                  identity: {sender, id, seq},
-                  message: Map.put(parent, "body", reply["text"]),
-                  accepted_seq: record.accepted_seq,
-                  revision: {record.revision, seq},
-                  reply: %{conversation_seq: seq, parent_body: parent["body"]}
-                }
-              ]
+  defp reply_projection(engine, person) do
+    {items, groups} =
+      Enum.reduce(engine.conversation_events, {[], %{}}, fn
+        {{^person, seq}, %{key: key, payload: %{"kind" => "reply", "author" => "origin"} = reply}},
+        {items, groups} ->
+          {_, sender, id} = key
+          unseen? = seq > Map.get(engine.chat_read_positions, key, 0)
+          group_key = {sender, id}
+
+          group =
+            Map.get(groups, group_key, %{
+              newest: seq,
+              unseen_count: 0,
+              first_unseen: nil,
+              newest_unseen: nil
+            })
+
+          group = %{group | newest: max(group.newest, seq)}
+
+          group =
+            if unseen? do
+              %{
+                group
+                | unseen_count: group.unseen_count + 1,
+                  first_unseen:
+                    if(group.first_unseen, do: min(group.first_unseen, seq), else: seq),
+                  newest_unseen: max(group.newest_unseen || seq, seq)
+              }
             else
-              []
+              group
             end
 
-          _ ->
-            []
+          items =
+            case Map.get(engine.messages, key) do
+              %{message: parent} = record when unseen? ->
+                [
+                  %{
+                    identity: {sender, id, seq},
+                    message: Map.put(parent, "body", reply["text"]),
+                    accepted_seq: record.accepted_seq,
+                    revision: {record.revision, seq},
+                    reply: %{conversation_seq: seq, parent_body: parent["body"]}
+                  }
+                  | items
+                ]
+
+              _ ->
+                items
+            end
+
+          {items, Map.put(groups, group_key, group)}
+
+        _, acc ->
+          acc
+      end)
+
+    {Enum.sort_by(items, & &1.identity), groups}
+  end
+
+  # The engine's mixed order supplies group positions; choose the highest
+  # scored unseen member, then collapse the chat and group message threads.
+  # Reply references carry no thread, so they cannot split a message block.
+  def list_items(engine, person, engine_entries, reply_summary) do
+    groups = reply_groups(engine, person, engine_entries, reply_summary)
+    active = Map.new(Enum.filter(groups, fn {_key, group} -> group["unseen_count"] > 0 end))
+
+    # Index anchors once across the ranked entries, rather than rescanning the
+    # entire ranking for each chat. Equal scores keep the first engine position.
+    anchors =
+      engine_entries
+      |> Enum.reduce(%{}, fn
+        %{"conversation_seq" => _} = entry, anchors ->
+          key = {entry["sender_id"], entry["message_id"]}
+
+          if Map.has_key?(active, key) do
+            Map.update(anchors, key, entry, fn previous ->
+              if Map.get(entry, "score", -1) > Map.get(previous, "score", -1),
+                do: entry,
+                else: previous
+            end)
+          else
+            anchors
+          end
+
+        _, anchors ->
+          anchors
+      end)
+      |> Map.new(fn {key, entry} -> {key, identity(entry)} end)
+
+    current =
+      engine_entries
+      |> Enum.flat_map(fn entry ->
+        key = {entry["sender_id"], entry["message_id"]}
+
+        if Map.has_key?(entry, "conversation_seq") do
+          if Map.get(anchors, key) == identity(entry), do: [Map.fetch!(active, key)], else: []
+        else
+          [Map.put(entry, "kind", "message")]
+        end
+      end)
+      |> grouped()
+      |> Enum.map(fn
+        %{"kind" => "message"} = entry -> Map.take(entry, ~w(kind sender_id message_id))
+        entry -> entry
+      end)
+
+    # Resolved message chronology remains unchanged. Historical chats follow
+    # it, newest reply first; read time never participates in this ordering.
+    resolved =
+      engine.messages
+      |> Enum.filter(fn {{p, _, _}, record} -> p == person and record.terminal != nil end)
+      |> Enum.sort_by(fn {{_, sender, id}, record} -> {-record.accepted_seq, sender, id} end)
+      |> Enum.map(fn {{_, sender, id}, _} ->
+        %{"kind" => "message", "sender_id" => sender, "message_id" => id}
+      end)
+
+    historical =
+      groups
+      |> Map.values()
+      |> Enum.filter(&(&1["unseen_count"] == 0))
+      |> Enum.sort_by(&{-&1["conversation_seq"], &1["sender_id"], &1["message_id"]})
+
+    current ++ resolved ++ historical
+  end
+
+  defp reply_groups(engine, person, entries, reply_summary) do
+    scores =
+      Enum.reduce(entries, %{}, fn
+        %{"sender_id" => sender, "message_id" => id, "conversation_seq" => _, "score" => score},
+        acc
+        when is_number(score) and score >= 0 and score <= 1 ->
+          Map.update(acc, {sender, id}, score, &max(&1, score))
+
+        _, acc ->
+          acc
+      end)
+
+    Map.new(reply_summary, fn {{sender, id} = key, group} ->
+      active? = group.unseen_count > 0
+
+      score =
+        if active? do
+          Map.get(scores, key)
+        else
+          Map.get(Map.get(engine.reply_group_history, {person, sender, id}, %{}), :score)
         end
 
-      _ ->
-        []
+      row = %{
+        "kind" => "reply",
+        "sender_id" => sender,
+        "message_id" => id,
+        "conversation_seq" => if(active?, do: group.newest_unseen, else: group.newest),
+        "open_at_conversation_seq" => if(active?, do: group.first_unseen, else: group.newest),
+        "unseen_count" => group.unseen_count
+      }
+
+      row =
+        if is_number(score),
+          do:
+            Map.merge(row, %{
+              "score" => score,
+              "score_kind" => if(active?, do: "current", else: "historical")
+            }),
+          else: row
+
+      {key, row}
     end)
-    |> Enum.sort_by(& &1.identity)
   end
 
   def baseline(%Engine{} = engine, person), do: Baseline.place(items(engine, person), [], nil)
