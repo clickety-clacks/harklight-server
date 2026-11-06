@@ -2923,7 +2923,8 @@ defmodule AttentionServer.Relay do
               "algorithm" => view.algorithm,
               "basis" => view.basis,
               "entries" => view.entries,
-              "replies" => view.replies
+              "replies" => view.replies,
+              "list_items" => view.list_items
             }
           end
 
@@ -3855,6 +3856,22 @@ defmodule AttentionServer.Relay do
     previous = Map.get(state.priority_views, person)
     engine_entries = Map.get(view, :engine_entries, Map.get(view, :entries, []))
 
+    next = Engine.retain_reply_scores(state.store.engine, person, engine_entries)
+
+    case commit(state.store, next, %{
+           person: person,
+           actor: "server",
+           action: "reply_group_scores"
+         }) do
+      {:ok, store} ->
+        publish_priority_view(%{state | store: store}, person, view, previous, engine_entries)
+
+      {:error, _, _} ->
+        state
+    end
+  end
+
+  defp publish_priority_view(state, person, view, previous, engine_entries) do
     {replies, messages} = Enum.split_with(engine_entries, &Map.has_key?(&1, "conversation_seq"))
 
     shown =
@@ -3862,11 +3879,13 @@ defmodule AttentionServer.Relay do
       |> Map.take([:algorithm, :basis, :reason])
       |> Map.put(:entries, Placement.grouped(messages))
       |> Map.put(:replies, Enum.sort_by(replies, & &1["conversation_seq"]))
+      |> Map.put(:list_items, Placement.list_items(state.store.engine, person, engine_entries))
 
-    comparable = Map.take(shown, [:algorithm, :basis, :reason, :entries, :replies])
+    comparable = Map.take(shown, [:algorithm, :basis, :reason, :entries, :replies, :list_items])
 
     if previous &&
-         Map.take(previous, [:algorithm, :basis, :reason, :entries, :replies]) == comparable do
+         Map.take(previous, [:algorithm, :basis, :reason, :entries, :replies, :list_items]) ==
+           comparable do
       Map.put(
         state,
         :priority_views,
@@ -4165,6 +4184,14 @@ defmodule AttentionServer.Relay do
     do: state
 
   defp record_applied_scores(state, person, items, entries) do
+    # A failed durable history commit must not be logged as an applied score.
+    case Map.get(state.priority_views, person) do
+      %{engine_entries: ^entries} -> append_applied_scores(state, person, items, entries)
+      _ -> state
+    end
+  end
+
+  defp append_applied_scores(state, person, items, entries) do
     items = Map.new(items, &{&1.identity, &1})
     now = state.clock.()
     model = state.store.engine.jev_model
