@@ -165,6 +165,24 @@ defmodule AttentionServer.PrioritizationTest do
     assert :ok = Relay.setup_sender(relay, "device-a", "app:test")
   end
 
+  defp persisted_overlay_snapshot(path) do
+    assert {:ok, db} = Sqlite3.open(path)
+
+    assert {:ok, state_stmt} =
+             Sqlite3.prepare(db, "SELECT version, payload, checksum FROM relay_state WHERE id = 1")
+
+    assert {:row, [version, payload, checksum]} = Sqlite3.step(db, state_stmt)
+    assert :ok = Sqlite3.release(db, state_stmt)
+
+    assert {:ok, overlay_stmt} =
+             Sqlite3.prepare(db, "SELECT count(*) FROM relay_state_overlay_events")
+
+    assert {:row, [overlay_count]} = Sqlite3.step(db, overlay_stmt)
+    assert :ok = Sqlite3.release(db, overlay_stmt)
+    assert :ok = Sqlite3.close(db)
+    {version, payload, checksum, overlay_count}
+  end
+
   defp forward(relay, n, id, deadline \\ nil, body \\ nil) do
     message = %{
       "sender_id" => "app:test",
@@ -2240,6 +2258,104 @@ defmodule AttentionServer.PrioritizationTest do
                  & &1.identity
                )
     end
+  end
+
+  test "reply-history commits fold and preserve sparse support overlays", %{dir: dir, path: path} do
+    use_synthetic_jev_key(dir)
+
+    relay =
+      start_relay(path, priority_evaluator: fn _ -> {:error, :unavailable} end)
+
+    setup_person(relay)
+    {:ok, session} = Relay.open_session(relay, "device-b")
+    assert view_for(relay, session)["list_items"] == []
+
+    forward_chat(relay, "overlay-history", 2700)
+    reply_seq = add_reply(relay, "overlay-history", 2702)
+    configure_jev_choice(relay)
+
+    support = %{
+      "type" => "support",
+      "op_id" => op(2710),
+      "session_handle" => op(2701),
+      "route" => "claude-code",
+      "cli_version" => "test-only",
+      "unsupported_reason" => nil
+    }
+
+    assert {:ok, %{"listening_support" => declared}} =
+             Relay.origin_support(relay, "device-a", support)
+
+    assert :ok = Relay.origin_stream_attach(relay, "device-a", op(2701), self())
+
+    {overlay_version, overlay_payload, overlay_checksum, 2} =
+      persisted_overlay_snapshot(path)
+
+    assert :crypto.hash(:sha256, overlay_payload) != overlay_checksum
+
+    job = start_synthetic_priority_pass(relay)
+
+    complete_synthetic_priority_pass(
+      job,
+      {:ok, %{{"app:test", "overlay-history", reply_seq} => 0.9}}
+    )
+
+    [active] =
+      view_for(relay, session)["list_items"]
+      |> Enum.filter(&(&1["kind"] == "reply"))
+
+    assert active["score"] == %JSON.DecimalToken{raw: "0.9"}
+    assert active["score_kind"] == "current"
+
+    {folded_version, folded_payload, folded_checksum, 0} =
+      persisted_overlay_snapshot(path)
+
+    assert folded_version == overlay_version + 1
+    assert folded_payload != overlay_payload
+    assert :crypto.hash(:sha256, folded_payload) == folded_checksum
+
+    read_reply(relay, "overlay-history", reply_seq, 2712)
+    [historical] =
+      view_for(relay, session)["list_items"]
+      |> Enum.filter(&(&1["kind"] == "reply"))
+
+    assert historical["unseen_count"] == 0
+    assert historical["score"] == %JSON.DecimalToken{raw: "0.9"}
+    assert historical["score_kind"] == "historical"
+
+    GenServer.stop(relay)
+    restarted = start_relay(path, priority_evaluator: fn _ -> {:error, :unavailable} end)
+    {:ok, resumed_session} = Relay.open_session(restarted, "device-b")
+    restored = view_for(restarted, resumed_session)
+    assert List.last(restored["list_items"]) == historical
+
+    assert {:ok, %{"listening_support" => ^declared, "availability" => "not_listening"}} =
+             Relay.origin_status(restarted, "device-a", op(2701))
+
+    assert {:ok, feed, _high} = Relay.conversation_events(restarted, "device-b", 0)
+    assert Enum.any?(feed, &(&1["listening_support"] == declared))
+    assert Enum.any?(feed, &(&1["availability"] == "listening"))
+
+    duplicate_state = persisted_overlay_snapshot(path)
+
+    assert {:ok, %{"duplicate" => true, "listening_support" => ^declared}} =
+             Relay.origin_support(restarted, "device-a", support)
+
+    assert persisted_overlay_snapshot(path) == duplicate_state
+
+    next_reply_seq = add_reply(restarted, "overlay-history", 2714)
+
+    [reactivated] =
+      view_for(restarted, resumed_session)["list_items"]
+      |> Enum.filter(&(&1["kind"] == "reply"))
+
+    assert reactivated["conversation_seq"] == next_reply_seq
+    assert reactivated["unseen_count"] == 1
+    refute Map.has_key?(reactivated, "score")
+    refute Map.has_key?(reactivated, "score_kind")
+    assert :sys.get_state(restarted).store.engine.reply_group_history[
+             {"person-a", "app:test", "overlay-history"}
+           ].score == 0.9
   end
 
   test "never-scored history stays unscored and a person's turn does not reactivate it", %{
