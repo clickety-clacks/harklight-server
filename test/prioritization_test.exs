@@ -2391,6 +2391,53 @@ defmodule AttentionServer.PrioritizationTest do
     assert Placement.list_items(engine, "other", []) == []
   end
 
+  test "many reply groups retain highest-score anchors and first-position ties" do
+    ids = Enum.map(1..200, &Integer.to_string/1)
+    key = fn id -> {"person", "sender", id} end
+
+    events =
+      for {id, index} <- Enum.with_index(ids), offset <- 1..3, into: %{} do
+        seq = index * 3 + offset
+        {{"person", seq}, %{key: key.(id), payload: %{"kind" => "reply", "author" => "origin"}}}
+      end
+
+    engine = %Engine{conversation_events: events}
+
+    entry = fn id, index, offset, score ->
+      %{
+        "sender_id" => "sender",
+        "message_id" => id,
+        "conversation_seq" => index * 3 + offset,
+        "score" => score
+      }
+    end
+
+    low = for {id, index} <- Enum.with_index(ids), do: entry.(id, index, 1, 0.4)
+    high = for {id, index} <- Enum.reverse(Enum.with_index(ids)), do: entry.(id, index, 2, 0.9)
+    tied = for {id, index} <- Enum.with_index(ids), do: entry.(id, index, 3, 0.9)
+    separator = %{"sender_id" => "sender", "message_id" => "separator"}
+
+    rows = Placement.list_items(engine, "person", low ++ high ++ [separator] ++ tied)
+    {groups, [message]} = Enum.split(rows, 200)
+    assert message == Map.put(separator, "kind", "message")
+    assert Enum.map(groups, & &1["message_id"]) == Enum.reverse(ids)
+    assert Enum.all?(groups, &(&1["score"] == 0.9 and &1["unseen_count"] == 3))
+    assert Enum.map(groups, & &1["conversation_seq"]) == Enum.to_list(600..3//-3)
+    assert Enum.map(groups, & &1["open_at_conversation_seq"]) == Enum.to_list(598..1//-3)
+
+    # Without scores, the first engine entry still anchors each chat; no score
+    # or score-kind is manufactured to choose a position.
+    unscored = Enum.map(low ++ [separator] ++ high ++ tied, &Map.delete(&1, "score"))
+    rows = Placement.list_items(engine, "person", unscored)
+    assert Enum.map(Enum.take(rows, 200), & &1["message_id"]) == ids
+    assert List.last(rows) == Map.put(separator, "kind", "message")
+
+    assert Enum.all?(
+             rows,
+             &(not Map.has_key?(&1, "score") and not Map.has_key?(&1, "score_kind"))
+           )
+  end
+
   defp view_for(relay, session) do
     session_request(relay, session, %{"type" => "view_get", "ref" => "groups"})
     |> Enum.find(&(&1["ref"] == "groups"))
