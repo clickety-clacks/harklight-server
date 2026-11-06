@@ -2926,6 +2926,11 @@ defmodule AttentionServer.Relay do
               "replies" => view.replies,
               "list_items" => view.list_items
             }
+            |> then(fn reply ->
+              if Map.has_key?(view, :free_order_version),
+                do: Map.put(reply, "free_order_version", view.free_order_version),
+                else: reply
+            end)
           end
 
         {{:ok, [line(reply)]}, state}
@@ -3891,10 +3896,46 @@ defmodule AttentionServer.Relay do
         Placement.list_items(state.store.engine, person, engine_entries, reply_summary)
       )
 
-    comparable = Map.take(shown, [:algorithm, :basis, :reason, :entries, :replies, :list_items])
+    shown =
+      if Placement.choice(state.store.engine, person) == "baseline" do
+        entries_by_id = Map.new(messages, &{Placement.identity(&1), &1})
+
+        ordered_messages =
+          shown.list_items
+          |> Enum.filter(&(&1["kind"] == "message"))
+          |> Enum.flat_map(fn row ->
+            case Map.get(entries_by_id, Placement.identity(row)) do
+              nil -> []
+              entry -> [entry]
+            end
+          end)
+
+        shown |> Map.put(:entries, ordered_messages) |> Map.put(:free_order_version, 1)
+      else
+        shown
+      end
+
+    comparable =
+      Map.take(shown, [
+        :algorithm,
+        :basis,
+        :reason,
+        :entries,
+        :replies,
+        :list_items,
+        :free_order_version
+      ])
 
     if previous &&
-         Map.take(previous, [:algorithm, :basis, :reason, :entries, :replies, :list_items]) ==
+         Map.take(previous, [
+           :algorithm,
+           :basis,
+           :reason,
+           :entries,
+           :replies,
+           :list_items,
+           :free_order_version
+         ]) ==
            comparable do
       Map.put(
         state,

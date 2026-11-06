@@ -48,6 +48,7 @@ defmodule AttentionServer.Engine do
             messages: %{},
             open_default_index: %{},
             events: %{},
+            free_order_highs: %{},
             conversation_highs: %{},
             conversation_events: %{},
             chat_read_positions: %{},
@@ -3693,6 +3694,7 @@ defmodule AttentionServer.Engine do
     case Map.get(engine.messages, key) do
       nil ->
         {next, seq} = next_seq(engine, person)
+        {next, arrival} = next_free_order(next, person)
 
         origin_target =
           first_open_supersede_target(
@@ -3718,6 +3720,7 @@ defmodule AttentionServer.Engine do
           message: message,
           origin: device,
           accepted_seq: seq,
+          free_order: arrival,
           accepted_at: accepted_at,
           placement_seq: placement_seq,
           group_thread: group_thread,
@@ -4472,6 +4475,7 @@ defmodule AttentionServer.Engine do
                {:ok, acted} <-
                  Conversation.act(engine, person, actor, frame["in_reply_to"], frame["op_id"]) do
             {next, seq} = next_conversation_seq(acted, person)
+            {next, arrival} = next_free_order(next, person)
 
             entry =
               %{
@@ -4493,6 +4497,7 @@ defmodule AttentionServer.Engine do
             next =
               next
               |> put_conversation_event(person, seq, key, feed_entry)
+              |> put_reply_free_order(person, seq, arrival)
               |> queue_conversation_hint(person, seq)
               |> save_receipt(person, actor, frame["op_id"], semantic, fields)
 
@@ -4983,6 +4988,17 @@ defmodule AttentionServer.Engine do
 
   defp terminal_entry_relay_seq(engine, person, origin, feed_seq) do
     engine.origin_feeds[{person, origin}].entries[feed_seq]["terminal_seq"]
+  end
+
+  # Only first acceptance calls this allocator; migration and replay never do.
+  # The counter and arrival are part of the same committed Engine snapshot.
+  defp next_free_order(engine, person) do
+    order = Map.get(engine.free_order_highs, person, 0) + 1
+    {%{engine | free_order_highs: Map.put(engine.free_order_highs, person, order)}, order}
+  end
+
+  defp put_reply_free_order(engine, person, seq, order) do
+    update_in(engine.conversation_events[{person, seq}], &Map.put(&1, :free_order, order))
   end
 
   defp put_conversation_event(engine, person, seq, key, payload) do
