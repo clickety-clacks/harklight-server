@@ -2348,7 +2348,8 @@ defmodule AttentionServer.PrioritizationTest do
             {"old", 4, %{seq: 5}}
           ],
           into: %{} do
-        {{"person", "sender", id}, %{accepted_seq: seq, terminal: terminal}}
+        {{"person", "sender", id},
+         %{accepted_seq: seq, terminal: terminal, message: %{}, revision: 1}}
       end
 
     events =
@@ -2371,7 +2372,7 @@ defmodule AttentionServer.PrioritizationTest do
       %{"sender_id" => "sender", "message_id" => "p", "conversation_seq" => 20, "score" => 0.4}
     ]
 
-    rows = Placement.list_items(engine, "person", entries)
+    rows = project_list(engine, "person", entries)
 
     assert Enum.map(rows, &{&1["kind"], &1["message_id"]}) ==
              [
@@ -2388,7 +2389,7 @@ defmodule AttentionServer.PrioritizationTest do
     assert Enum.at(rows, 2)["open_at_conversation_seq"] == 10
     assert Enum.all?(rows, &(not Map.has_key?(&1, "body")))
     # A second account's retained chats cannot enter this projection.
-    assert Placement.list_items(engine, "other", []) == []
+    assert project_list(engine, "other", []) == []
   end
 
   test "many reply groups retain highest-score anchors and first-position ties" do
@@ -2417,7 +2418,7 @@ defmodule AttentionServer.PrioritizationTest do
     tied = for {id, index} <- Enum.with_index(ids), do: entry.(id, index, 3, 0.9)
     separator = %{"sender_id" => "sender", "message_id" => "separator"}
 
-    rows = Placement.list_items(engine, "person", low ++ high ++ [separator] ++ tied)
+    rows = project_list(engine, "person", low ++ high ++ [separator] ++ tied)
     {groups, [message]} = Enum.split(rows, 200)
     assert message == Map.put(separator, "kind", "message")
     assert Enum.map(groups, & &1["message_id"]) == Enum.reverse(ids)
@@ -2428,7 +2429,7 @@ defmodule AttentionServer.PrioritizationTest do
     # Without scores, the first engine entry still anchors each chat; no score
     # or score-kind is manufactured to choose a position.
     unscored = Enum.map(low ++ [separator] ++ high ++ tied, &Map.delete(&1, "score"))
-    rows = Placement.list_items(engine, "person", unscored)
+    rows = project_list(engine, "person", unscored)
     assert Enum.map(Enum.take(rows, 200), & &1["message_id"]) == ids
     assert List.last(rows) == Map.put(separator, "kind", "message")
 
@@ -2436,6 +2437,83 @@ defmodule AttentionServer.PrioritizationTest do
              rows,
              &(not Map.has_key?(&1, "score") and not Map.has_key?(&1, "score_kind"))
            )
+  end
+
+  test "one shared reply projection retains long seen history and reactivates only new replies" do
+    key = {"person", "sender", "chat"}
+
+    events =
+      for seq <- 1..2000, into: %{} do
+        payload =
+          if seq <= 1000 do
+            %{"kind" => "reply", "author" => "origin", "text" => "Retained reply"}
+          else
+            %{"kind" => "discussion", "author" => "person", "text" => "Retained discussion"}
+          end
+
+        {{"person", seq}, %{key: key, payload: payload}}
+      end
+
+    engine = %Engine{
+      conversation_events: events,
+      messages: %{
+        key => %{
+          message: %{"title" => "Parent", "body" => "Context"},
+          accepted_seq: 1,
+          revision: 1,
+          terminal: %{seq: 2}
+        }
+      },
+      chat_read_positions: %{key => 1000},
+      reply_group_history: %{key => %{score: 0.8, scores: %{}}}
+    }
+
+    {items, summary} = Placement.ranking_projection(engine, "person")
+    assert items == []
+    assert map_size(summary) == 1
+    rows = Placement.list_items(engine, "person", [], summary)
+
+    assert [
+             %{"kind" => "message"},
+             %{
+               "kind" => "reply",
+               "conversation_seq" => 1000,
+               "open_at_conversation_seq" => 1000,
+               "unseen_count" => 0,
+               "score" => 0.8,
+               "score_kind" => "historical"
+             }
+           ] = rows
+
+    assert map_size(engine.conversation_events) == 2000
+
+    event = %{
+      key: key,
+      payload: %{"kind" => "reply", "author" => "origin", "text" => "New reply"}
+    }
+
+    next = %{engine | conversation_events: Map.put(events, {"person", 2001}, event)}
+    {[item], summary} = Placement.ranking_projection(next, "person")
+    assert item.identity == {"sender", "chat", 2001}
+    assert item.message["body"] == "New reply"
+    entries = Placement.place("baseline", [item], [], nil)
+
+    assert [%{"kind" => "reply"} = active, %{"kind" => "message"}] =
+             Placement.list_items(next, "person", entries, summary)
+
+    assert active["conversation_seq"] == 2001
+    assert active["open_at_conversation_seq"] == 2001
+    assert active["unseen_count"] == 1
+    refute Map.has_key?(active, "score")
+    refute Map.has_key?(active, "score_kind")
+    assert map_size(next.conversation_events) == 2001
+    assert next.messages == engine.messages
+    assert next.chat_read_positions == engine.chat_read_positions
+  end
+
+  defp project_list(engine, person, entries) do
+    {_, reply_summary} = Placement.ranking_projection(engine, person)
+    Placement.list_items(engine, person, entries, reply_summary)
   end
 
   defp view_for(relay, session) do

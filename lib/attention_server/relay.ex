@@ -3795,7 +3795,7 @@ defmodule AttentionServer.Relay do
   defp ensure_priority_view(state, person) do
     engine = state.store.engine
     choice = Placement.choice(engine, person)
-    items = Placement.ranking_items(engine, person)
+    {items, reply_summary} = Placement.ranking_projection(engine, person)
     previous = Map.get(state.priority_views, person)
 
     view =
@@ -3827,7 +3827,7 @@ defmodule AttentionServer.Relay do
           fallback_view(items)
       end
 
-    put_priority_view(state, person, view)
+    put_priority_view(state, person, view, reply_summary)
   end
 
   defp fallback_view(items),
@@ -3837,7 +3837,7 @@ defmodule AttentionServer.Relay do
       entries: Placement.place("baseline", items, [], nil)
     }
 
-  defp put_priority_view(state, person, view) do
+  defp put_priority_view(state, person, view, reply_summary) do
     previous = Map.get(state.priority_views, person)
     engine_entries = Map.get(view, :engine_entries, Map.get(view, :entries, []))
 
@@ -3849,14 +3849,21 @@ defmodule AttentionServer.Relay do
            action: "reply_group_scores"
          }) do
       {:ok, store} ->
-        publish_priority_view(%{state | store: store}, person, view, previous, engine_entries)
+        publish_priority_view(
+          %{state | store: store},
+          person,
+          view,
+          previous,
+          engine_entries,
+          reply_summary
+        )
 
       {:error, _, _} ->
         state
     end
   end
 
-  defp publish_priority_view(state, person, view, previous, engine_entries) do
+  defp publish_priority_view(state, person, view, previous, engine_entries, reply_summary) do
     {replies, messages} = Enum.split_with(engine_entries, &Map.has_key?(&1, "conversation_seq"))
 
     shown =
@@ -3864,7 +3871,10 @@ defmodule AttentionServer.Relay do
       |> Map.take([:algorithm, :basis, :reason])
       |> Map.put(:entries, Placement.grouped(messages))
       |> Map.put(:replies, Enum.sort_by(replies, & &1["conversation_seq"]))
-      |> Map.put(:list_items, Placement.list_items(state.store.engine, person, engine_entries))
+      |> Map.put(
+        :list_items,
+        Placement.list_items(state.store.engine, person, engine_entries, reply_summary)
+      )
 
     comparable = Map.take(shown, [:algorithm, :basis, :reason, :entries, :replies, :list_items])
 
@@ -4088,7 +4098,7 @@ defmodule AttentionServer.Relay do
 
     state =
       if current? do
-        items = Placement.ranking_items(engine, person)
+        {items, reply_summary} = Placement.ranking_projection(engine, person)
         previous = Map.get(state.priority_views, person)
 
         case result do
@@ -4099,14 +4109,19 @@ defmodule AttentionServer.Relay do
               if map_size(scores) > 0 do
                 entries = Placement.place("jev-set", items, [], {:ranked, scores, overflow})
 
-                put_priority_view(state, person, %{
-                  algorithm: "jev-set",
-                  basis: "selected",
-                  engine_entries: entries
-                })
+                put_priority_view(
+                  state,
+                  person,
+                  %{
+                    algorithm: "jev-set",
+                    basis: "selected",
+                    engine_entries: entries
+                  },
+                  reply_summary
+                )
                 |> record_applied_scores(person, items, entries)
               else
-                set_fallback_priority_view(state, person)
+                put_priority_view(state, person, fallback_view(items), reply_summary)
               end
 
             state =
@@ -4127,16 +4142,21 @@ defmodule AttentionServer.Relay do
 
             entries = Placement.place("jev-set", items, previous_entries, {:scored, scores})
 
-            put_priority_view(state, person, %{
-              algorithm: "jev-set",
-              basis: "selected",
-              engine_entries: entries
-            })
+            put_priority_view(
+              state,
+              person,
+              %{
+                algorithm: "jev-set",
+                basis: "selected",
+                engine_entries: entries
+              },
+              reply_summary
+            )
             |> record_applied_scores(person, items, entries)
 
           _ ->
             state
-            |> set_fallback_priority_view(person)
+            |> put_priority_view(person, fallback_view(items), reply_summary)
             |> schedule_priority_retry(person, 1)
         end
       else
@@ -4220,8 +4240,8 @@ defmodule AttentionServer.Relay do
   end
 
   defp set_fallback_priority_view(state, person) do
-    items = Placement.ranking_items(state.store.engine, person)
-    put_priority_view(state, person, fallback_view(items))
+    {items, reply_summary} = Placement.ranking_projection(state.store.engine, person)
+    put_priority_view(state, person, fallback_view(items), reply_summary)
   end
 
   defp clear_priority_cache(state, person) do
