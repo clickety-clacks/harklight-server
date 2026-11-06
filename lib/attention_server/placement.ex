@@ -187,17 +187,28 @@ defmodule AttentionServer.Placement do
     groups = reply_groups(engine, person, engine_entries)
     active = Map.new(Enum.filter(groups, fn {_key, group} -> group["unseen_count"] > 0 end))
 
+    # Index anchors once across the ranked entries, rather than rescanning the
+    # entire ranking for each chat. Equal scores keep the first engine position.
     anchors =
-      Map.new(active, fn {key, _} ->
-        members =
-          Enum.filter(engine_entries, fn entry ->
-            Map.has_key?(entry, "conversation_seq") and
-              {entry["sender_id"], entry["message_id"]} == key
-          end)
+      engine_entries
+      |> Enum.reduce(%{}, fn
+        %{"conversation_seq" => _} = entry, anchors ->
+          key = {entry["sender_id"], entry["message_id"]}
 
-        anchor = Enum.max_by(members, &Map.get(&1, "score", -1), fn -> nil end)
-        {key, if(anchor, do: identity(anchor))}
+          if Map.has_key?(active, key) do
+            Map.update(anchors, key, entry, fn previous ->
+              if Map.get(entry, "score", -1) > Map.get(previous, "score", -1),
+                do: entry,
+                else: previous
+            end)
+          else
+            anchors
+          end
+
+        _, anchors ->
+          anchors
       end)
+      |> Map.new(fn {key, entry} -> {key, identity(entry)} end)
 
     current =
       engine_entries
