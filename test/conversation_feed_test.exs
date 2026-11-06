@@ -66,6 +66,28 @@ defmodule AttentionServer.ConversationFeedTest do
     end)
   end
 
+  defp cold_overlay_reopen(path) do
+    {output, status} =
+      System.cmd(
+        "mix",
+        ["run", "--no-start", "--no-compile", "test/support/cold_overlay_reopen.exs"],
+        cd: Path.expand("..", __DIR__),
+        env: [
+          {"MIX_ENV", "test"},
+          {"COLD_STORE_PATH", path},
+          {"COLD_PARENT_OS_PID", System.pid()},
+          {"COLD_PERSON", "A"},
+          {"COLD_ORIGIN", "origin"},
+          {"COLD_HANDLE", @handle},
+          {"COLD_SUPPORT_OP", op(92)}
+        ],
+        stderr_to_stdout: true
+      )
+
+    assert status == 0, "cold-reopen process failed (exit #{status}):\n#{output}"
+    assert output =~ "COLD_OVERLAY_REOPEN_AND_USE_OK"
+  end
+
   test "authorized agent answer keeps its author through terminal replay and restart", %{
     path: path
   } do
@@ -1828,6 +1850,7 @@ defmodule AttentionServer.ConversationFeedTest do
     GenServer.stop(restarted)
   end
 
+  @tag :cold_overlay
   test "support writes persist their receipt and replay through the sparse overlay", %{
     path: path
   } do
@@ -1882,6 +1905,7 @@ defmodule AttentionServer.ConversationFeedTest do
     assert attach_payload == before_payload
 
     GenServer.stop(relay)
+    cold_overlay_reopen(path)
     assert {:ok, restarted} = Relay.start_link(store_path: path)
 
     assert {:ok, %{"listening_support" => ^declared}} =
