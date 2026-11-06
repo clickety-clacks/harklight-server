@@ -950,27 +950,35 @@ defmodule AttentionServer.Relay do
 
   def handle_call({:origin_support, key, declaration}, _from, state) do
     case Engine.origin_support(state.store.engine, key, declaration) do
+      {:ok, next, reply} when next == state.store.engine ->
+        {:reply, {:ok, reply}, state}
+
       {:ok, next, reply} ->
+        {:ok, person} = Engine.authorized_person(next, key)
+        handle = declaration["session_handle"]
+        listening? = Map.has_key?(state.origin_streams, {person, key, handle})
+        {:ok, current} = Engine.origin_status(next, key, handle, listening?)
+
         next =
-          if next == state.store.engine do
-            next
-          else
-            {:ok, person} = Engine.authorized_person(next, key)
-            handle = declaration["session_handle"]
-            listening? = Map.has_key?(state.origin_streams, {person, key, handle})
-            {:ok, current} = Engine.origin_status(next, key, handle, listening?)
+          Engine.origin_availability(
+            next,
+            person,
+            key,
+            handle,
+            current["availability"],
+            current["last_detached_at"]
+          )
 
-            Engine.origin_availability(
-              next,
-              person,
-              key,
-              handle,
-              current["availability"],
-              current["last_detached_at"]
-            )
-          end
+        session_key = {person, key, handle}
+        receipt_key = {person, key, declaration["op_id"]}
 
-        case commit(state.store, next, audit(state.store.engine, key, "origin_support")) do
+        case Store.commit_transient_origin_support(
+               state.store,
+               next,
+               session_key,
+               receipt_key,
+               audit(state.store.engine, key, "origin_support")
+             ) do
           {:ok, store} -> {:reply, {:ok, reply}, %{state | store: store}}
           _ -> {:reply, {:error, :storage_unavailable}, state}
         end

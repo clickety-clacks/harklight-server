@@ -1017,6 +1017,30 @@ defmodule AttentionServer.Store do
     end
   end
 
+  def commit_transient_origin_support(
+        %__MODULE__{engine: old} = store,
+        next,
+        {person, _origin, _handle} = session_key,
+        receipt_key,
+        audit
+      ) do
+    with {:ok, patch} <- origin_support_patch(old, next, session_key, receipt_key, person),
+         :ok <- validate_transient_audit(audit) do
+      commit_transient_overlay(store, next, patch, audit)
+    else
+      _ ->
+        Diagnostics.failure(
+          :server_storage,
+          :state_commit,
+          :invalid_transient_state,
+          :unavailable,
+          operation_id(audit)
+        )
+
+        {:error, :storage_unavailable, store}
+    end
+  end
+
   defp commit_transient_overlay(%__MODULE__{db: nil} = store, next, _patch, _audit),
     do: {:ok, %{store | engine: next}}
 
@@ -1114,7 +1138,7 @@ defmodule AttentionServer.Store do
 
   defp validate_transient_audit(%{person: person, actor: actor, action: action})
        when is_binary(person) and is_binary(actor) and
-              action in ["origin_attach", "origin_detach"],
+              action in ["origin_attach", "origin_detach", "origin_support"],
        do: :ok
 
   defp validate_transient_audit(_), do: {:error, :invalid_audit}
@@ -1126,7 +1150,28 @@ defmodule AttentionServer.Store do
          patch_person
        )
        when person == patch_person do
-    changed_fields = [:origin_sessions, :conversation_events, :conversation_highs, :push_bindings]
+    origin_state_patch(old, next, session_key, person, nil)
+  end
+
+  defp origin_availability_patch(_, _, _, _), do: {:error, :invalid_engine}
+
+  defp origin_support_patch(
+         old,
+         %Engine{} = next,
+         {person, origin, _handle} = session_key,
+         {receipt_person, receipt_origin, _op_id} = receipt_key,
+         patch_person
+       )
+       when person == patch_person and person == receipt_person and origin == receipt_origin do
+    origin_state_patch(old, next, session_key, person, receipt_key)
+  end
+
+  defp origin_support_patch(_, _, _, _, _), do: {:error, :invalid_receipt_key}
+
+  defp origin_state_patch(old, %Engine{} = next, session_key, person, receipt_key) do
+    changed_fields =
+      [:origin_sessions, :conversation_events, :conversation_highs, :push_bindings] ++
+        if(is_nil(receipt_key), do: [], else: [:receipts])
 
     unchanged =
       Map.keys(Map.from_struct(old))
@@ -1159,6 +1204,24 @@ defmodule AttentionServer.Store do
       end)
       |> Map.new()
 
+    receipt_patch =
+      case receipt_key do
+        nil ->
+          %{}
+
+        {^person, origin, op_id} = key when is_binary(op_id) ->
+          receipt = Map.get(next.receipts, key)
+
+          if origin == elem(session_key, 1) and is_map(receipt) and
+               is_binary(Map.get(receipt, :semantic)) and is_map(Map.get(receipt, :reply)) and
+               not Map.has_key?(old.receipts, key) and
+               Map.drop(next.receipts, [key]) == old.receipts do
+            %{key => receipt}
+          else
+            :invalid
+          end
+      end
+
     cond do
       not unchanged ->
         {:error, :unexpected_engine_change}
@@ -1180,20 +1243,29 @@ defmodule AttentionServer.Store do
       end) ->
         {:error, :invalid_availability_event}
 
+      receipt_patch == :invalid ->
+        {:error, :invalid_support_receipt}
+
       true ->
-        {:ok,
-         %{
-           origin_sessions: %{session_key => next_session},
-           conversation_events: events,
-           conversation_highs: if(next_high > old_high, do: %{person => next_high}, else: %{}),
-           push_bindings: bindings
-         }}
+        patch = %{
+          origin_sessions: %{session_key => next_session},
+          conversation_events: events,
+          conversation_highs: if(next_high > old_high, do: %{person => next_high}, else: %{}),
+          push_bindings: bindings
+        }
+
+        if map_size(receipt_patch) == 0,
+          do: {:ok, patch},
+          else: {:ok, Map.put(patch, :receipts, receipt_patch)}
     end
   rescue
     _ -> {:error, :invalid_transient_state}
   end
 
-  defp origin_availability_patch(_, _, _, _), do: {:error, :invalid_engine}
+  defp origin_state_patch(_, _, _, _, _), do: {:error, :invalid_engine}
+
+  defp encode_overlay_patch(%{receipts: _} = patch),
+    do: :erlang.term_to_binary({:attention_relay_state_overlay, 2, patch}, [{:compressed, 6}])
 
   defp encode_overlay_patch(patch),
     do: :erlang.term_to_binary({:attention_relay_state_overlay, 1, patch}, [{:compressed, 6}])
@@ -1250,8 +1322,9 @@ defmodule AttentionServer.Store do
 
     Enum.reduce_while(rows, {:ok, []}, fn [_version, payload, checksum], {:ok, patches} ->
       case decode_checked_term(payload, checksum) do
-        {:ok, {:attention_relay_state_overlay, 1, patch}} when is_map(patch) ->
-          if valid_state_overlay_patch?(patch),
+        {:ok, {:attention_relay_state_overlay, format, patch}}
+        when format in [1, 2] and is_map(patch) ->
+          if valid_state_overlay_patch?(format, patch),
             do: {:cont, {:ok, [patch | patches]}},
             else: {:halt, {:error, :invalid_overlay}}
 
@@ -1265,11 +1338,25 @@ defmodule AttentionServer.Store do
     end
   end
 
-  defp valid_state_overlay_patch?(patch) do
+  defp valid_state_overlay_patch?(1, patch) do
     Map.keys(patch) |> Enum.sort() ==
       Enum.sort([:origin_sessions, :conversation_events, :conversation_highs, :push_bindings]) and
       Enum.all?(Map.values(patch), &is_map/1)
   end
+
+  defp valid_state_overlay_patch?(2, patch) do
+    Map.keys(patch) |> Enum.sort() ==
+      Enum.sort([
+        :origin_sessions,
+        :conversation_events,
+        :conversation_highs,
+        :push_bindings,
+        :receipts
+      ]) and
+      Enum.all?(Map.values(patch), &is_map/1)
+  end
+
+  defp valid_state_overlay_patch?(_, _), do: false
 
   defp apply_state_overlays(engine, patches) do
     Enum.reduce(patches, engine, fn patch, current ->
@@ -1278,7 +1365,8 @@ defmodule AttentionServer.Store do
         | origin_sessions: Map.merge(current.origin_sessions, patch.origin_sessions),
           conversation_events: Map.merge(current.conversation_events, patch.conversation_events),
           conversation_highs: Map.merge(current.conversation_highs, patch.conversation_highs),
-          push_bindings: Map.merge(current.push_bindings, patch.push_bindings)
+          push_bindings: Map.merge(current.push_bindings, patch.push_bindings),
+          receipts: Map.merge(current.receipts, Map.get(patch, :receipts, %{}))
       }
     end)
   end

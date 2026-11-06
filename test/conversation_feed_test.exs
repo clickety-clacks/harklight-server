@@ -1827,4 +1827,98 @@ defmodule AttentionServer.ConversationFeedTest do
 
     GenServer.stop(restarted)
   end
+
+  test "support writes persist their receipt and replay through the sparse overlay", %{
+    path: path
+  } do
+    assert {:ok, relay} = Relay.start_link(store_path: path)
+    assert :ok = Relay.setup_person(relay, "A")
+    assert :ok = Relay.setup_device(relay, "A", "origin")
+    assert :ok = Relay.setup_device(relay, "A", "reader")
+    assert :ok = Relay.setup_sender(relay, "origin", "app:test")
+
+    assert %{"type" => "ok", "seq" => 1} =
+             request(relay, "origin", %{
+               "type" => "forward",
+               "op_id" => op(91),
+               "session_handle" => @handle,
+               "message" => %{
+                 "sender_id" => "app:test",
+                 "message_id" => "support-overlay",
+                 "created_at" => 1,
+                 "title" => "Support survives restart"
+               }
+             })
+
+    support = %{
+      "type" => "support",
+      "op_id" => op(92),
+      "session_handle" => @handle,
+      "route" => "claude-code",
+      "cli_version" => "test-only",
+      "unsupported_reason" => nil
+    }
+
+    {before_version, before_payload, before_checksum, 0} = state_snapshot(path)
+    assert :crypto.hash(:sha256, before_payload) == before_checksum
+
+    assert {:error, :not_found} = Relay.origin_support(relay, "reader", support)
+
+    assert state_snapshot(path) == {before_version, before_payload, before_checksum, 0}
+
+    assert {:ok, %{"listening_support" => %{"route" => "claude-code"} = declared}} =
+             Relay.origin_support(relay, "origin", support)
+
+    assert is_integer(declared["reported_at"])
+    {support_version, support_payload, support_checksum, 1} = state_snapshot(path)
+    assert support_version == before_version + 1
+    assert support_payload == before_payload
+    assert support_checksum != :crypto.hash(:sha256, support_payload)
+
+    assert :ok = Relay.origin_stream_attach(relay, "origin", @handle, self())
+    {attach_version, attach_payload, _attach_checksum, 2} = state_snapshot(path)
+    assert attach_version == support_version + 1
+    assert attach_payload == before_payload
+
+    GenServer.stop(relay)
+    assert {:ok, restarted} = Relay.start_link(store_path: path)
+
+    assert {:ok, %{"listening_support" => ^declared}} =
+             Relay.origin_status(restarted, "origin", @handle)
+
+    assert {:ok, [supported, listening], 2} =
+             Relay.conversation_events(restarted, "reader", 0)
+
+    assert supported["kind"] == "availability"
+    assert supported["listening_support"] == declared
+    assert listening["availability"] == "listening"
+    assert listening["listening_support"] == declared
+
+    duplicate_state = state_snapshot(path)
+
+    assert {:ok, %{"duplicate" => true, "listening_support" => ^declared}} =
+             Relay.origin_support(restarted, "origin", support)
+
+    assert state_snapshot(path) == duplicate_state
+
+    assert {:error, :operation_conflict} =
+             Relay.origin_support(restarted, "origin", %{support | "route" => "codex"})
+
+    assert :ok = Relay.setup_person(restarted, "B")
+    {folded_version, folded_payload, folded_checksum, 0} = state_snapshot(path)
+    assert folded_version > attach_version
+    assert folded_payload != before_payload
+    assert :crypto.hash(:sha256, folded_payload) == folded_checksum
+
+    GenServer.stop(restarted)
+    assert {:ok, folded_restart} = Relay.start_link(store_path: path)
+
+    assert {:ok, %{"duplicate" => true, "listening_support" => ^declared}} =
+             Relay.origin_support(folded_restart, "origin", support)
+
+    assert {:ok, %{"listening_support" => ^declared}} =
+             Relay.origin_status(folded_restart, "origin", @handle)
+
+    GenServer.stop(folded_restart)
+  end
 end
