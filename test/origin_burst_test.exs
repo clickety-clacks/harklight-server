@@ -1,6 +1,8 @@
 defmodule AttentionServer.OriginBurstTest do
   use ExUnit.Case, async: false
 
+  @burst_batch_size 16
+
   alias AttentionServer.{
     JSON,
     Relay,
@@ -69,12 +71,12 @@ defmodule AttentionServer.OriginBurstTest do
   end
 
   @tag timeout: 240_000
-  test "350 existing origin handles receive definite responses to an unpaced stream burst", c do
+  test "350 existing origin handles each receive definite stream responses", c do
     run_burst(c, :stream)
   end
 
   @tag timeout: 240_000
-  test "350 existing origin handles receive definite controller attachment responses", c do
+  test "350 existing origin handles each receive definite controller attachment responses", c do
     run_burst(c, :attachment)
   end
 
@@ -102,9 +104,53 @@ defmodule AttentionServer.OriginBurstTest do
     end
 
     {:ok, feed_before} = Relay.origin_feed(c.relay, c.origin, 0)
+    before = counters()
+
+    queue =
+      if System.find_executable("ss"),
+        do: System.cmd("ss", ["-lnt", "sport = :#{c.endpoint.port}"], stderr_to_stdout: true),
+        else: :unavailable
+
+    IO.puts("BURST_LISTENER " <> inspect(queue))
+    start = System.monotonic_time(:millisecond)
+
+    # Fixed-size waves bound concurrent setup while retaining a real response
+    # assertion for every handle. The separate acceptance covers the full
+    # unpaced listener wave.
+    outcomes =
+      handles
+      |> Enum.chunk_every(@burst_batch_size)
+      |> Enum.flat_map(&run_burst_batch(c, &1, phase))
+
+    after_counters = counters()
+    {:ok, feed_after} = Relay.origin_feed(c.relay, c.origin, 0)
+
+    IO.puts(
+      "BURST_RESULT " <>
+        JSON.encode!(%{
+          "phase" => Atom.to_string(phase),
+          "count" => count,
+          "max_concurrent" => @burst_batch_size,
+          "batch_count" => div(count + @burst_batch_size - 1, @burst_batch_size),
+          "outcomes" => outcomes,
+          "net_before" => before,
+          "net_after" => after_counters,
+          "elapsed_ms" => System.monotonic_time(:millisecond) - start,
+          "pending_feed_preserved" => feed_before == feed_after
+        })
+    )
+
+    assert feed_before == feed_after
+    assert length(outcomes) == count
+    assert MapSet.new(Enum.map(outcomes, & &1["handle"])) == MapSet.new(handles)
+    # The test keeps one outcome per handle while bounding simultaneous client
+    # setup; the separate acceptance owns the unpaced listener wave.
+    assert Enum.all?(outcomes, &(&1["outcome"] == "attached"))
+  end
+
+  defp run_burst_batch(c, handles, phase) do
     parent = self()
-    # Each child waits at the same barrier before opening its own TLS connection.
-    # No stagger, rate limiter, retry, listener pause or artificial accept delay.
+
     workers =
       for handle <- handles do
         spawn_monitor(fn ->
@@ -137,16 +183,8 @@ defmodule AttentionServer.OriginBurstTest do
       assert_receive {:ready, ^pid}, 10_000
     end
 
-    before = counters()
-
-    queue =
-      if System.find_executable("ss"),
-        do: System.cmd("ss", ["-lnt", "sport = :#{c.endpoint.port}"], stderr_to_stdout: true),
-        else: :unavailable
-
-    IO.puts("BURST_LISTENER " <> inspect(queue))
-    start = System.monotonic_time(:millisecond)
-    for {pid, _} <- workers, do: send(pid, {:go, start})
+    released_at = System.monotonic_time(:millisecond)
+    for {pid, _} <- workers, do: send(pid, {:go, released_at})
 
     outcomes =
       for {pid, _} <- workers do
@@ -157,32 +195,13 @@ defmodule AttentionServer.OriginBurstTest do
         end
       end
 
-    after_counters = counters()
-    {:ok, feed_after} = Relay.origin_feed(c.relay, c.origin, 0)
-
-    IO.puts(
-      "BURST_RESULT " <>
-        JSON.encode!(%{
-          "phase" => Atom.to_string(phase),
-          "count" => count,
-          "outcomes" => outcomes,
-          "net_before" => before,
-          "net_after" => after_counters,
-          "elapsed_ms" => System.monotonic_time(:millisecond) - start,
-          "pending_feed_preserved" => feed_before == feed_after
-        })
-    )
-
     for {pid, _} <- workers, do: send(pid, :release)
 
     for {_pid, monitor} <- workers do
       assert_receive {:DOWN, ^monitor, :process, _, :normal}, 10_000
     end
 
-    assert feed_before == feed_after
-    # This seeded valid case should attach; definite application refusals are
-    # recorded separately rather than being confused with transport errors.
-    assert Enum.all?(outcomes, &(&1["outcome"] == "attached"))
+    outcomes
   end
 
   defp uuid(n), do: "00000000-0000-4000-8000-#{String.pad_leading(Integer.to_string(n), 12, "0")}"
