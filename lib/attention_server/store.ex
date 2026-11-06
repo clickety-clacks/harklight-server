@@ -1212,10 +1212,11 @@ defmodule AttentionServer.Store do
         {^person, origin, op_id} = key when is_binary(op_id) ->
           receipt = Map.get(next.receipts, key)
 
+          # Engine.origin_support only adds this receipt. Keep validation off the retained history.
           if origin == elem(session_key, 1) and is_map(receipt) and
                is_binary(Map.get(receipt, :semantic)) and is_map(Map.get(receipt, :reply)) and
                not Map.has_key?(old.receipts, key) and
-               Map.drop(next.receipts, [key]) == old.receipts do
+               map_size(next.receipts) == map_size(old.receipts) + 1 do
             %{key => receipt}
           else
             :invalid

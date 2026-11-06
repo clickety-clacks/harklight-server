@@ -1837,18 +1837,19 @@ defmodule AttentionServer.ConversationFeedTest do
     assert :ok = Relay.setup_device(relay, "A", "reader")
     assert :ok = Relay.setup_sender(relay, "origin", "app:test")
 
-    assert %{"type" => "ok", "seq" => 1} =
-             request(relay, "origin", %{
-               "type" => "forward",
-               "op_id" => op(91),
-               "session_handle" => @handle,
-               "message" => %{
-                 "sender_id" => "app:test",
-                 "message_id" => "support-overlay",
-                 "created_at" => 1,
-                 "title" => "Support survives restart"
-               }
-             })
+    forward = %{
+      "type" => "forward",
+      "op_id" => op(91),
+      "session_handle" => @handle,
+      "message" => %{
+        "sender_id" => "app:test",
+        "message_id" => "support-overlay",
+        "created_at" => 1,
+        "title" => "Support survives restart"
+      }
+    }
+
+    assert %{"type" => "ok", "seq" => 1} = request(relay, "origin", forward)
 
     support = %{
       "type" => "support",
@@ -1895,6 +1896,11 @@ defmodule AttentionServer.ConversationFeedTest do
     assert listening["listening_support"] == declared
 
     duplicate_state = state_snapshot(path)
+
+    assert %{"type" => "ok", "seq" => 1, "duplicate" => true} =
+             request(restarted, "origin", forward)
+
+    assert state_snapshot(path) == duplicate_state
 
     assert {:ok, %{"duplicate" => true, "listening_support" => ^declared}} =
              Relay.origin_support(restarted, "origin", support)
