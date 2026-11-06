@@ -430,7 +430,7 @@ defmodule AttentionServer.PrioritizationTest do
     assert {:ok, ^selected} = Engine.set_algorithm_choice(selected, "person-a", "jev-set")
   end
 
-  test "format 22 migrates with baseline defaults and persists as format 24", %{path: path} do
+  test "format 22 migrates with baseline defaults and persists as format 25", %{path: path} do
     assert {:ok, initial} = Store.open(path)
     assert {:ok, engine} = Engine.setup_person(initial.engine, "person-a")
     assert :ok = Store.close(initial)
@@ -463,7 +463,7 @@ defmodule AttentionServer.PrioritizationTest do
     assert :ok = Sqlite3.release(db, select)
     assert :ok = Sqlite3.close(db)
 
-    assert {:attention_relay_state, 24, saved_engine} =
+    assert {:attention_relay_state, 25, saved_engine} =
              :erlang.binary_to_term(saved_payload, [:safe])
 
     refute Map.has_key?(saved_engine, :open_default_index)
@@ -1054,7 +1054,7 @@ defmodule AttentionServer.PrioritizationTest do
         1..28,
         &("item-#{String.pad_leading(Integer.to_string(&1), 2, "0")}" in resolved_ids)
       )
-      |> Enum.sort_by(fn n -> if n <= 25, do: {0, (30 - n) * 1_000, -n}, else: {1, 0, -n} end)
+      |> Enum.sort(:desc)
       |> Enum.map(&"item-#{String.pad_leading(Integer.to_string(&1), 2, "0")}")
 
     assert waiting_ids == expected_waiting
@@ -1071,7 +1071,8 @@ defmodule AttentionServer.PrioritizationTest do
              &Map.has_key?(&1, "terminal")
            )
 
-    assert hd(ids) == "item-25"
+    # Free ignores deadline rank and keeps the original newest acceptance first.
+    assert hd(ids) == "item-28"
 
     engine = :sys.get_state(relay).store.engine
 
@@ -2440,7 +2441,24 @@ defmodule AttentionServer.PrioritizationTest do
     forward_chat(relay, "legacy", 930)
     seq = add_reply(relay, "legacy", 932)
     read_reply(relay, "legacy", seq, 934)
-    old_engine = :sys.get_state(relay).store.engine |> Map.delete(:reply_group_history)
+
+    old_engine =
+      :sys.get_state(relay).store.engine
+      |> Map.delete(:reply_group_history)
+      |> Map.delete(:free_order_highs)
+      |> Map.update!(
+        :messages,
+        &Map.new(&1, fn {key, record} ->
+          {key, Map.delete(record, :free_order)}
+        end)
+      )
+      |> Map.update!(
+        :conversation_events,
+        &Map.new(&1, fn {key, event} ->
+          {key, Map.delete(event, :free_order)}
+        end)
+      )
+
     GenServer.stop(relay)
     payload = :erlang.term_to_binary({:attention_relay_state, 24, old_engine}, [{:compressed, 6}])
     assert {:ok, db} = Sqlite3.open(path)
@@ -2457,7 +2475,20 @@ defmodule AttentionServer.PrioritizationTest do
 
     refute Map.has_key?(group, "score")
     assert group["conversation_seq"] == seq
-    assert :sys.get_state(restarted).store.engine.reply_group_history == %{}
+    engine = :sys.get_state(restarted).store.engine
+    assert engine.reply_group_history == %{}
+    assert engine.free_order_highs == %{}
+    assert group["free_section"] == %{"state" => "history", "group" => "earlier_chat_replies"}
+    refute Map.has_key?(engine.messages[{"person-a", "app:test", "legacy"}], :free_order)
+    GenServer.stop(restarted)
+    again = start_relay(path)
+    assert :sys.get_state(again).store.engine.free_order_highs == %{}
+    {:ok, session} = Relay.open_session(again, "device-b")
+    add_reply(again, "legacy", 940)
+    [reply, parent] = view_for(again, session)["list_items"]
+    assert reply["free_section"] == %{"state" => "active", "group" => "common"}
+    assert parent["free_section"] == %{"state" => "active", "group" => "earlier_messages"}
+    assert :sys.get_state(again).store.engine.free_order_highs == %{"person-a" => 1}
   end
 
   test "mixed projection keeps message threads intact and historical reply chronology stable" do
@@ -2480,6 +2511,7 @@ defmodule AttentionServer.PrioritizationTest do
       end
 
     engine = %Engine{
+      algorithm_choices: %{"person" => "jev-set"},
       messages: messages,
       conversation_events: events,
       chat_read_positions: %{{"person", "sender", "old"} => 30}
@@ -2523,7 +2555,7 @@ defmodule AttentionServer.PrioritizationTest do
         {{"person", seq}, %{key: key.(id), payload: %{"kind" => "reply", "author" => "origin"}}}
       end
 
-    engine = %Engine{conversation_events: events}
+    engine = %Engine{conversation_events: events, algorithm_choices: %{"person" => "jev-set"}}
 
     entry = fn id, index, offset, score ->
       %{
@@ -2630,6 +2662,156 @@ defmodule AttentionServer.PrioritizationTest do
     assert map_size(next.conversation_events) == 2001
     assert next.messages == engine.messages
     assert next.chat_read_positions == engine.chat_read_positions
+  end
+
+  test "failed durable acceptance publishes neither a parent nor a common key", %{path: path} do
+    relay = start_relay(path)
+    setup_person(relay)
+    state = :sys.get_state(relay)
+
+    assert :ok =
+             Sqlite3.execute(
+               state.store.db,
+               "CREATE TRIGGER reject_arrival BEFORE UPDATE ON relay_state BEGIN SELECT RAISE(ABORT, 'synthetic storage failure'); END"
+             )
+
+    frame = %{
+      "type" => "forward",
+      "op_id" => op(3100),
+      "message" => %{
+        "sender_id" => "app:test",
+        "message_id" => "atomic",
+        "created_at" => 1,
+        "title" => "Atomic arrival"
+      }
+    }
+
+    assert request(relay, "device-a", frame)["type"] == "error"
+    engine = :sys.get_state(relay).store.engine
+    assert engine.messages == %{}
+    assert engine.free_order_highs == %{}
+    assert :ok = Sqlite3.execute(state.store.db, "DROP TRIGGER reject_arrival")
+    assert request(relay, "device-a", frame)["type"] == "ok"
+
+    assert :sys.get_state(relay).store.engine.messages[{"person-a", "app:test", "atomic"}].free_order ==
+             1
+  end
+
+  test "Free acceptance interleaves streams durably without rekeying replay or Seen", %{
+    path: path
+  } do
+    relay = start_relay(path)
+    setup_person(relay)
+    forward_chat(relay, "older", 3000)
+    seq = add_reply(relay, "older", 3002)
+    forward_chat(relay, "newer", 3004)
+    {:ok, session} = Relay.open_session(relay, "device-b")
+    view = view_for(relay, session)
+    assert view["free_order_version"] == 1
+
+    assert Enum.map(view["list_items"], &{&1["kind"], &1["message_id"]}) ==
+             [{"message", "newer"}, {"reply", "older"}, {"message", "older"}]
+
+    engine = :sys.get_state(relay).store.engine
+    assert engine.free_order_highs == %{"person-a" => 3}
+    assert engine.messages[{"person-a", "app:test", "older"}].free_order == 1
+    assert engine.conversation_events[{"person-a", seq}].free_order == 2
+    forward_chat(relay, "older", 3000)
+    assert view_for(relay, session)["view_rev"] == view["view_rev"]
+    read_reply(relay, "older", seq, 3006)
+    seen = view_for(relay, session)
+
+    assert List.last(seen["list_items"])["free_section"] ==
+             %{"state" => "history", "group" => "common"}
+
+    refute seen["view_rev"] == view["view_rev"]
+    assert :sys.get_state(relay).store.engine.free_order_highs == engine.free_order_highs
+    GenServer.stop(relay)
+    restarted = start_relay(path)
+    {:ok, session} = Relay.open_session(restarted, "device-b")
+    assert view_for(restarted, session)["list_items"] == seen["list_items"]
+    assert :sys.get_state(restarted).store.engine.free_order_highs == engine.free_order_highs
+    add_reply(restarted, "older", 3008)
+    assert hd(view_for(restarted, session)["list_items"])["kind"] == "reply"
+    assert :sys.get_state(restarted).store.engine.free_order_highs == %{"person-a" => 4}
+  end
+
+  test "Free mixed-age threads return to Earlier messages when their common anchor resolves" do
+    record = fn seq, order, thread ->
+      %{
+        accepted_seq: seq,
+        free_order: order,
+        terminal: nil,
+        revision: 1,
+        message: %{"thread" => thread}
+      }
+    end
+
+    engine = %Engine{
+      messages: %{
+        {"p", "s", "a"} => record.(30, nil, "T"),
+        {"p", "s", "b"} => record.(10, nil, "T"),
+        {"p", "s", "c"} => record.(40, 2, "T"),
+        {"p", "s", "u"} => record.(20, 1, "U")
+      }
+    }
+
+    rows = project_list(engine, "p", [])
+    assert Enum.map(rows, & &1["message_id"]) == ["c", "a", "b", "u"]
+    assert Enum.all?(rows, &(&1["free_section"]["group"] == "common"))
+    next = put_in(engine.messages[{"p", "s", "c"}].terminal, %{seq: 50})
+    rows = project_list(next, "p", [])
+    assert Enum.map(rows, & &1["message_id"]) == ["u", "a", "b", "c"]
+
+    assert Enum.map(rows, & &1["free_section"]) == [
+             %{"state" => "active", "group" => "common"},
+             %{"state" => "active", "group" => "earlier_messages"},
+             %{"state" => "active", "group" => "earlier_messages"},
+             %{"state" => "history", "group" => "common"}
+           ]
+
+    assert next.messages[{"p", "s", "a"}].free_order == nil
+  end
+
+  test "Free common ties use kind then identity and legacy domains stay separate" do
+    parent = fn n, k, terminal ->
+      %{message: %{}, accepted_seq: n, free_order: k, terminal: terminal, revision: 1}
+    end
+
+    engine = %Engine{
+      messages: %{
+        {"p", "s", "a"} => parent.(30, 4, nil),
+        {"p", "s", "b"} => parent.(20, 4, nil),
+        {"p", "s", "old"} => parent.(900, nil, nil),
+        {"p", "s", "done"} => parent.(1000, nil, %{seq: 1001})
+      },
+      conversation_events: %{
+        {"p", 2} => %{
+          key: {"p", "s", "a"},
+          free_order: 4,
+          payload: %{"kind" => "reply", "author" => "origin"}
+        },
+        {"p", 800} => %{
+          key: {"p", "s", "old"},
+          payload: %{"kind" => "reply", "author" => "origin"}
+        }
+      }
+    }
+
+    rows = project_list(engine, "p", [])
+
+    assert Enum.map(rows, &{&1["kind"], &1["message_id"]}) ==
+             [
+               {"message", "a"},
+               {"message", "b"},
+               {"reply", "a"},
+               {"message", "old"},
+               {"reply", "old"},
+               {"message", "done"}
+             ]
+
+    assert Enum.at(rows, 4)["free_section"]["group"] == "earlier_chat_replies"
+    assert List.last(rows)["free_section"]["state"] == "history"
   end
 
   defp project_list(engine, person, entries) do

@@ -221,6 +221,15 @@ defmodule AttentionServer.Placement do
   # Reply references carry no thread, so they cannot split a message block.
   def list_items(engine, person, engine_entries, reply_summary) do
     groups = reply_groups(engine, person, engine_entries, reply_summary)
+
+    if choice(engine, person) == "baseline" do
+      AttentionServer.FreeOrder.list_items(engine, person, groups, reply_summary)
+    else
+      ranked_list_items(engine, person, engine_entries, groups)
+    end
+  end
+
+  defp ranked_list_items(engine, person, engine_entries, groups) do
     active = Map.new(Enum.filter(groups, fn {_key, group} -> group["unseen_count"] > 0 end))
 
     # Index anchors once across the ranked entries, rather than rescanning the

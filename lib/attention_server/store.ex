@@ -13,7 +13,7 @@ defmodule AttentionServer.Store do
   alias AttentionServer.{APNS, BrowserSignIn, Conversation, Diagnostics, Engine, GuidedJoin}
   alias Exqlite.Sqlite3
 
-  @format_version 24
+  @format_version 25
   @inbox_index_chunk_size 20
   defstruct [:db, :engine, :version, :upload_dir]
 
@@ -1489,7 +1489,8 @@ defmodule AttentionServer.Store do
                          21,
                          22,
                          23,
-                         24
+                         24,
+                         25
                        ] ->
                     original = struct(Engine, Map.from_struct(stored))
 
@@ -2097,6 +2098,26 @@ defmodule AttentionServer.Store do
 
   defp encode_term(value), do: :erlang.term_to_binary(value, [{:compressed, 6}])
 
+  defp valid_free_order?(engine) do
+    is_map(engine.free_order_highs) and
+      Enum.all?(engine.free_order_highs, fn {person, high} ->
+        Map.has_key?(engine.persons, person) and is_integer(high) and high >= 0
+      end) and
+      Enum.all?(engine.messages, fn {{person, _, _}, record} ->
+        valid_arrival?(record, Map.get(engine.free_order_highs, person, 0))
+      end) and
+      Enum.all?(engine.conversation_events, fn {{person, _}, event} ->
+        valid_arrival?(event, Map.get(engine.free_order_highs, person, 0))
+      end)
+  end
+
+  defp valid_arrival?(record, high) do
+    case Map.get(record, :free_order) do
+      nil -> true
+      order -> is_integer(order) and order > 0 and order <= high
+    end
+  end
+
   defp encode_state(engine) do
     persisted =
       engine
@@ -2353,6 +2374,7 @@ defmodule AttentionServer.Store do
           owns?(engine, person, key) and is_integer(seq) and seq >= 0 and
             seq <= engine.persons[person]
         end) and
+        valid_free_order?(engine) and
         is_map(engine.conversation_highs) and
         Enum.all?(engine.conversation_highs, fn {person, high} ->
           Map.has_key?(engine.persons, person) and is_integer(high) and high >= 0
