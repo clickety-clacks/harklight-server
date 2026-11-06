@@ -1963,6 +1963,19 @@ defmodule AttentionServer.Store do
               Map.get(engine.conversation_events, {person, position})
             )
         end) and
+        is_map(engine.reply_group_history) and
+        Enum.all?(engine.reply_group_history, fn {key = {person, _, _}, history} ->
+          Map.has_key?(engine.messages, key) and is_map(history.scores) and
+            is_number(history.score) and history.score >= 0 and history.score <= 1 and
+            Enum.all?(history.scores, fn {seq, score} ->
+              is_number(score) and score >= 0 and score <= 1 and
+                seq > Map.get(engine.chat_read_positions, key, 0) and
+                match?(
+                  %{key: ^key, payload: %{"kind" => "reply", "author" => "origin"}},
+                  Map.get(engine.conversation_events, {person, seq})
+                )
+            end)
+        end) and
         is_map(engine.conversation_cursors) and
         Enum.all?(engine.conversation_cursors, fn {{person, key}, seq} ->
           owns?(engine, person, key) and is_integer(seq) and seq >= 0 and

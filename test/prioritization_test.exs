@@ -2085,6 +2085,370 @@ defmodule AttentionServer.PrioritizationTest do
     engine = :sys.get_state(relay).store.engine
     assert engine.messages[{"person-a", "app:test", "parent"}] == before_read
     assert Placement.ranking_items(engine, "person-a") == []
+
+    assert [
+             %{"kind" => "message"},
+             %{
+               "kind" => "reply",
+               "unseen_count" => 0,
+               "score_kind" => "historical",
+               "score" => %JSON.DecimalToken{raw: "0.1"}
+             }
+           ] = after_read["list_items"]
+
+    :sys.get_state(writer)
+    assert File.read!(record_path) |> String.split("\n", trim: true) |> length() == 1
+    GenServer.stop(relay)
+    test_process = self()
+
+    restarted =
+      start_relay(path,
+        jev_score_record_path: record_path,
+        priority_evaluator: fn _ ->
+          send(test_process, :unexpected_history_scoring)
+          {:error, :unavailable}
+        end
+      )
+
+    {:ok, session} = Relay.open_session(restarted, "device-b")
+    assert view_for(restarted, session)["list_items"] == after_read["list_items"]
+    assert :sys.get_state(restarted).priority_jobs == %{}
+    assert :sys.get_state(restarted).priority_timers == %{}
+    refute_received :unexpected_history_scoring
+    :sys.get_state(:sys.get_state(restarted).applied_score_record)
+    assert File.read!(record_path) |> String.split("\n", trim: true) |> length() == 1
+  end
+
+  for partial_read <- [false, true] do
+    @partial_read partial_read
+    test "group history survives restart and reactivates (partial read: #{partial_read})", %{
+      dir: dir,
+      path: path
+    } do
+      use_synthetic_jev_key(dir)
+      relay = start_relay(path, priority_evaluator: fn _ -> {:error, :unavailable} end)
+      setup_person(relay)
+      {:ok, session} = Relay.open_session(relay, "device-b")
+      assert view_for(relay, session)["list_items"] == []
+      forward_chat(relay, "history", 900)
+      first = add_reply(relay, "history", 902)
+      second = add_reply(relay, "history", 904)
+      baseline = view_for(relay, session)
+      assert [group] = Enum.filter(baseline["list_items"], &(&1["kind"] == "reply"))
+      assert group["unseen_count"] == 2
+      assert group["conversation_seq"] == second
+      assert group["open_at_conversation_seq"] == first
+      refute Map.has_key?(group, "score")
+      refute Map.has_key?(group, "score_kind")
+      configure_jev_choice(relay)
+      assert Enum.all?(view_for(relay, session)["replies"], &(not Map.has_key?(&1, "score")))
+      job = start_synthetic_priority_pass(relay)
+
+      complete_synthetic_priority_pass(
+        job,
+        {:ok,
+         %{
+           {"app:test", "history"} => 0.5,
+           {"app:test", "history", first} => 0.9,
+           {"app:test", "history", second} => 0.4
+         }}
+      )
+
+      scored = view_for(relay, session)
+      assert [%{"kind" => "reply"} = group, %{"kind" => "message"}] = scored["list_items"]
+      assert group["score"] == %JSON.DecimalToken{raw: "0.9"}
+      assert group["score_kind"] == "current"
+      assert group["conversation_seq"] == second
+      assert group["open_at_conversation_seq"] == first
+      assert Enum.map(scored["replies"], & &1["conversation_seq"]) == [first, second]
+      assert [%{"message_id" => "history"}] = scored["entries"]
+
+      assert [%{"unchanged" => true} = unchanged] =
+               session_request(relay, session, %{
+                 "type" => "view_get",
+                 "ref" => "same",
+                 "known_view_rev" => scored["view_rev"]
+               })
+
+      refute Map.has_key?(unchanged, "list_items")
+      parent = :sys.get_state(relay).store.engine.messages[{"person-a", "app:test", "history"}]
+
+      if @partial_read do
+        read_reply(relay, "history", first, 906)
+        partial = view_for(relay, session)
+        [row] = Enum.filter(partial["list_items"], &(&1["kind"] == "reply"))
+        assert row["unseen_count"] == 1
+        assert row["open_at_conversation_seq"] == second
+        assert row["score"] == %JSON.DecimalToken{raw: "0.4"}
+        refute partial["view_rev"] == scored["view_rev"]
+      end
+
+      read_reply(relay, "history", second, 907)
+      seen = view_for(relay, session)
+      expected_score = if @partial_read, do: "0.4", else: "0.9"
+      assert [%{"kind" => "message"}, %{"kind" => "reply"} = history] = seen["list_items"]
+      assert history["unseen_count"] == 0
+      assert history["score"] == %JSON.DecimalToken{raw: expected_score}
+      assert history["score_kind"] == "historical"
+      assert history["conversation_seq"] == second
+      assert history["open_at_conversation_seq"] == second
+      assert seen["replies"] == []
+      engine = :sys.get_state(relay).store.engine
+      assert engine.messages[{"person-a", "app:test", "history"}] == parent
+      assert Placement.reply_items(engine, "person-a") == []
+      # The score-record writer is disabled: it is not the persistence source.
+      assert :sys.get_state(relay).applied_score_record == nil
+      GenServer.stop(relay)
+      restarted = start_relay(path, priority_evaluator: fn _ -> {:error, :unavailable} end)
+      {:ok, other_device} = Relay.open_session(restarted, "device-a")
+      restored = view_for(restarted, other_device)
+      assert List.last(restored["list_items"]) == history
+      assert restored["replies"] == []
+      refute restored["view_rev"] == seen["view_rev"]
+
+      assert :sys.get_state(restarted).store.engine.chat_read_positions[
+               {"person-a", "app:test", "history"}
+             ] == second
+
+      third = add_reply(restarted, "history", 908)
+      active = view_for(restarted, other_device)
+      [row] = Enum.filter(active["list_items"], &(&1["kind"] == "reply"))
+      assert row["unseen_count"] == 1
+      assert row["conversation_seq"] == third
+      refute Map.has_key?(row, "score")
+      refute Map.has_key?(row, "score_kind")
+      # A real parent transition cannot move the independently active chat to history.
+      assert {:ok, terminal} =
+               Relay.request_line(
+                 restarted,
+                 "device-b",
+                 JSON.encode!(%{
+                   "type" => "answer_no_comment",
+                   "request_id" => "history",
+                   "request_revision" => 1
+                 }) <> "\n"
+               )
+
+      assert {:ok, %{"type" => "ok"}} = JSON.decode_line(terminal)
+
+      assert [%{"kind" => "reply", "unseen_count" => 1}, %{"kind" => "message"}] =
+               view_for(restarted, other_device)["list_items"]
+
+      assert [{"app:test", "history", ^third}] =
+               Enum.map(
+                 Placement.ranking_items(:sys.get_state(restarted).store.engine, "person-a"),
+                 & &1.identity
+               )
+    end
+  end
+
+  test "never-scored history stays unscored and a person's turn does not reactivate it", %{
+    path: path
+  } do
+    relay = start_relay(path)
+    setup_person(relay)
+    {:ok, session} = Relay.open_session(relay, "device-b")
+    forward_chat(relay, "plain", 920)
+    seq = add_reply(relay, "plain", 922)
+    read_reply(relay, "plain", seq, 924)
+    before = view_for(relay, session)
+
+    assert [%{"kind" => "message"}, %{"kind" => "reply", "unseen_count" => 0} = group] =
+             before["list_items"]
+
+    refute Map.has_key?(group, "score")
+    refute Map.has_key?(group, "score_kind")
+
+    assert %{"type" => "ok"} =
+             request(relay, "device-b", %{
+               "type" => "discussion",
+               "op_id" => op(925),
+               "sender_id" => "app:test",
+               "message_id" => "plain",
+               "request_revision" => 1,
+               "text" => "Another question"
+             })
+
+    assert view_for(relay, session)["view_rev"] == before["view_rev"]
+    GenServer.stop(relay)
+    restarted = start_relay(path)
+    {:ok, session} = Relay.open_session(restarted, "device-b")
+    assert view_for(restarted, session)["list_items"] == before["list_items"]
+    assert :sys.get_state(restarted).priority_jobs == %{}
+  end
+
+  test "a failed history commit neither publishes nor records the new score", %{
+    dir: dir,
+    path: path
+  } do
+    use_synthetic_jev_key(dir)
+    record_path = Path.join(dir, "history-failure.jsonl")
+
+    relay =
+      start_relay(path,
+        jev_score_record_path: record_path,
+        priority_evaluator: fn _ -> {:error, :unavailable} end
+      )
+
+    setup_person(relay)
+    forward_chat(relay, "failure", 940)
+    seq = add_reply(relay, "failure", 942)
+    configure_jev_choice(relay)
+    {:ok, session} = Relay.open_session(relay, "device-b")
+    before = view_for(relay, session)
+    state = :sys.get_state(relay)
+
+    assert :ok =
+             Sqlite3.execute(
+               state.store.db,
+               "CREATE TRIGGER reject_history BEFORE UPDATE ON relay_state BEGIN SELECT RAISE(ABORT, 'synthetic storage failure'); END"
+             )
+
+    job = start_synthetic_priority_pass(relay)
+    complete_synthetic_priority_pass(job, {:ok, %{{"app:test", "failure", seq} => 0.9}})
+    assert view_for(relay, session)["list_items"] == before["list_items"]
+    assert :sys.get_state(relay).store.engine.reply_group_history == %{}
+    :sys.get_state(state.applied_score_record)
+    assert not File.exists?(record_path) or File.read!(record_path) == ""
+    assert :ok = Sqlite3.execute(state.store.db, "DROP TRIGGER reject_history")
+  end
+
+  test "pre-history format 24 restores existing chats without inventing scores", %{path: path} do
+    relay = start_relay(path)
+    setup_person(relay)
+    forward_chat(relay, "legacy", 930)
+    seq = add_reply(relay, "legacy", 932)
+    read_reply(relay, "legacy", seq, 934)
+    old_engine = :sys.get_state(relay).store.engine |> Map.delete(:reply_group_history)
+    GenServer.stop(relay)
+    payload = :erlang.term_to_binary({:attention_relay_state, 24, old_engine}, [{:compressed, 6}])
+    assert {:ok, db} = Sqlite3.open(path)
+    assert {:ok, stmt} = Sqlite3.prepare(db, "UPDATE relay_state SET payload = ?, checksum = ?")
+    assert :ok = Sqlite3.bind(stmt, [{:blob, payload}, {:blob, :crypto.hash(:sha256, payload)}])
+    assert :done = Sqlite3.step(db, stmt)
+    assert :ok = Sqlite3.release(db, stmt)
+    assert :ok = Sqlite3.close(db)
+    restarted = start_relay(path)
+    {:ok, session} = Relay.open_session(restarted, "device-b")
+
+    assert [%{"kind" => "message"}, %{"kind" => "reply", "unseen_count" => 0} = group] =
+             view_for(restarted, session)["list_items"]
+
+    refute Map.has_key?(group, "score")
+    assert group["conversation_seq"] == seq
+    assert :sys.get_state(restarted).store.engine.reply_group_history == %{}
+  end
+
+  test "mixed projection keeps message threads intact and historical reply chronology stable" do
+    messages =
+      for {id, seq, terminal} <- [
+            {"a", 1, nil},
+            {"b", 2, nil},
+            {"p", 3, nil},
+            {"old", 4, %{seq: 5}}
+          ],
+          into: %{} do
+        {{"person", "sender", id}, %{accepted_seq: seq, terminal: terminal}}
+      end
+
+    events =
+      for {id, seq} <- [{"p", 10}, {"p", 20}, {"old", 30}], into: %{} do
+        {{"person", seq},
+         %{key: {"person", "sender", id}, payload: %{"kind" => "reply", "author" => "origin"}}}
+      end
+
+    engine = %Engine{
+      messages: messages,
+      conversation_events: events,
+      chat_read_positions: %{{"person", "sender", "old"} => 30}
+    }
+
+    entries = [
+      %{"sender_id" => "sender", "message_id" => "a", "thread" => "thread", "score" => 0.95},
+      %{"sender_id" => "sender", "message_id" => "p", "conversation_seq" => 10, "score" => 0.9},
+      %{"sender_id" => "sender", "message_id" => "b", "thread" => "thread", "score" => 0.7},
+      %{"sender_id" => "sender", "message_id" => "p", "score" => 0.5},
+      %{"sender_id" => "sender", "message_id" => "p", "conversation_seq" => 20, "score" => 0.4}
+    ]
+
+    rows = Placement.list_items(engine, "person", entries)
+
+    assert Enum.map(rows, &{&1["kind"], &1["message_id"]}) ==
+             [
+               {"message", "a"},
+               {"message", "b"},
+               {"reply", "p"},
+               {"message", "p"},
+               {"message", "old"},
+               {"reply", "old"}
+             ]
+
+    assert Enum.at(rows, 2)["score"] == 0.9
+    assert Enum.at(rows, 2)["conversation_seq"] == 20
+    assert Enum.at(rows, 2)["open_at_conversation_seq"] == 10
+    assert Enum.all?(rows, &(not Map.has_key?(&1, "body")))
+    # A second account's retained chats cannot enter this projection.
+    assert Placement.list_items(engine, "other", []) == []
+  end
+
+  defp view_for(relay, session) do
+    session_request(relay, session, %{"type" => "view_get", "ref" => "groups"})
+    |> Enum.find(&(&1["ref"] == "groups"))
+  end
+
+  defp forward_chat(relay, id, n) do
+    assert %{"type" => "ok"} =
+             request(relay, "device-a", %{
+               "type" => "forward",
+               "op_id" => op(n),
+               "session_handle" => op(n + 1),
+               "message" => %{
+                 "sender_id" => "app:test",
+                 "message_id" => id,
+                 "created_at" => 1,
+                 "title" => "Parent",
+                 "body" => "Context"
+               }
+             })
+  end
+
+  defp add_reply(relay, id, n) do
+    discussion =
+      request(relay, "device-b", %{
+        "type" => "discussion",
+        "op_id" => op(n),
+        "sender_id" => "app:test",
+        "message_id" => id,
+        "request_revision" => 1,
+        "text" => "Question"
+      })
+
+    assert discussion["type"] == "ok"
+
+    reply =
+      request(relay, "device-a", %{
+        "type" => "conversation_reply",
+        "op_id" => op(n + 1),
+        "sender_id" => "app:test",
+        "message_id" => id,
+        "request_revision" => 1,
+        "in_reply_to" => String.to_integer(discussion["event_id"]),
+        "text" => "Reply"
+      })
+
+    assert reply["type"] == "ok"
+    reply["seq"]
+  end
+
+  defp read_reply(relay, id, seq, n) do
+    assert %{"type" => "ok"} =
+             request(relay, "device-b", %{
+               "type" => "conversation_read",
+               "op_id" => op(n),
+               "sender_id" => "app:test",
+               "message_id" => id,
+               "read_through_conversation_seq" => seq
+             })
   end
 
   defp await_state(relay, predicate, attempts \\ 100)

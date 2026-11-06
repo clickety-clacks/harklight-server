@@ -180,6 +180,120 @@ defmodule AttentionServer.Placement do
     |> Enum.sort_by(& &1.identity)
   end
 
+  # The engine's mixed order supplies group positions; choose the highest
+  # scored unseen member, then collapse the chat and group message threads.
+  # Reply references carry no thread, so they cannot split a message block.
+  def list_items(engine, person, engine_entries) do
+    groups = reply_groups(engine, person, engine_entries)
+    active = Map.new(Enum.filter(groups, fn {_key, group} -> group["unseen_count"] > 0 end))
+
+    anchors =
+      Map.new(active, fn {key, _} ->
+        members =
+          Enum.filter(engine_entries, fn entry ->
+            Map.has_key?(entry, "conversation_seq") and
+              {entry["sender_id"], entry["message_id"]} == key
+          end)
+
+        anchor = Enum.max_by(members, &Map.get(&1, "score", -1), fn -> nil end)
+        {key, if(anchor, do: identity(anchor))}
+      end)
+
+    current =
+      engine_entries
+      |> Enum.flat_map(fn entry ->
+        key = {entry["sender_id"], entry["message_id"]}
+
+        if Map.has_key?(entry, "conversation_seq") do
+          if Map.get(anchors, key) == identity(entry), do: [Map.fetch!(active, key)], else: []
+        else
+          [Map.put(entry, "kind", "message")]
+        end
+      end)
+      |> grouped()
+      |> Enum.map(fn
+        %{"kind" => "message"} = entry -> Map.take(entry, ~w(kind sender_id message_id))
+        entry -> entry
+      end)
+
+    # Resolved message chronology remains unchanged. Historical chats follow
+    # it, newest reply first; read time never participates in this ordering.
+    resolved =
+      engine.messages
+      |> Enum.filter(fn {{p, _, _}, record} -> p == person and record.terminal != nil end)
+      |> Enum.sort_by(fn {{_, sender, id}, record} -> {-record.accepted_seq, sender, id} end)
+      |> Enum.map(fn {{_, sender, id}, _} ->
+        %{"kind" => "message", "sender_id" => sender, "message_id" => id}
+      end)
+
+    historical =
+      groups
+      |> Map.values()
+      |> Enum.filter(&(&1["unseen_count"] == 0))
+      |> Enum.sort_by(&{-&1["conversation_seq"], &1["sender_id"], &1["message_id"]})
+
+    current ++ resolved ++ historical
+  end
+
+  defp reply_groups(engine, person, entries) do
+    scores = Map.new(entries, &{identity(&1), Map.get(&1, "score")})
+
+    engine.conversation_events
+    |> Enum.flat_map(fn
+      {{^person, seq},
+       %{key: {^person, sender, id}, payload: %{"kind" => "reply", "author" => "origin"}}} ->
+        [{{sender, id}, seq}]
+
+      _ ->
+        []
+    end)
+    |> Enum.group_by(&elem(&1, 0), &elem(&1, 1))
+    |> Map.new(fn {{sender, id} = key, sequences} ->
+      unseen =
+        Enum.filter(
+          sequences,
+          &(&1 > Map.get(engine.chat_read_positions, {person, sender, id}, 0))
+        )
+
+      active? = unseen != []
+      represented = if active?, do: unseen, else: sequences
+
+      current_scores =
+        for seq <- unseen,
+            score = scores[{sender, id, seq}],
+            is_number(score) and score >= 0 and score <= 1,
+            do: score
+
+      score =
+        if active? do
+          Enum.max(current_scores, fn -> nil end)
+        else
+          Map.get(Map.get(engine.reply_group_history, {person, sender, id}, %{}), :score)
+        end
+
+      row = %{
+        "kind" => "reply",
+        "sender_id" => sender,
+        "message_id" => id,
+        "conversation_seq" => Enum.max(represented),
+        "open_at_conversation_seq" =>
+          if(active?, do: Enum.min(unseen), else: Enum.max(sequences)),
+        "unseen_count" => length(unseen)
+      }
+
+      row =
+        if is_number(score),
+          do:
+            Map.merge(row, %{
+              "score" => score,
+              "score_kind" => if(active?, do: "current", else: "historical")
+            }),
+          else: row
+
+      {key, row}
+    end)
+  end
+
   def baseline(%Engine{} = engine, person), do: Baseline.place(items(engine, person), [], nil)
 
   defp inherited_placement(engine, key, record),
