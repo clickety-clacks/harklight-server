@@ -3018,6 +3018,10 @@ defmodule AttentionServer.Engine do
     end
   end
 
+  @doc "Whether this key names a retained revoked device record."
+  def device_revoked?(%__MODULE__{} = engine, key),
+    do: match?(%{revoked: true}, Map.get(engine.devices, key))
+
   @doc "The current person for one enrolled, unrevoked device key."
   def authorized_person(%__MODULE__{} = engine, key) do
     case principal(engine, key) do

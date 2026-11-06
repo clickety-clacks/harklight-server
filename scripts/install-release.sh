@@ -291,11 +291,11 @@ rollback_failed_upgrade() {
   previous_resume_attempted=1
 
   if ! systemctl --user stop "$unit" || ! service_is_stopped; then
-    fail "upgrade failed: $cause; the candidate could not be confirmed stopped, so the pre-install backup at $backup_final was retained and no rollback was started; candidate writes since the backup were not restored and may still be changing; service state: $(service_condition)"
+    fail "upgrade failed: $cause; the candidate could not be confirmed stopped, so the pre-install backup was retained and no rollback was started; candidate writes since the backup were not restored and may still be changing; service state: $(service_condition)"
   fi
 
   if ! restore_preinstall_root; then
-    fail "upgrade failed: $cause; restoring the pre-install mutable root from $backup_final/private-root.tar did not complete; the prior release was not started and the service remains stopped; the backup is retained, the current root may be partial, and candidate writes since the backup may be retained or partially lost"
+    fail "upgrade failed: $cause; restoring the pre-install mutable root from the retained backup did not complete; the prior release was not started and the service remains stopped; the current root may be partial, and candidate writes since the backup may be retained or partially lost"
   fi
 
   if ! systemctl --user start "$unit"; then
@@ -321,7 +321,7 @@ rollback_failed_upgrade() {
 
   warn_unavailable_owner_route "$current_path"
 
-  fail "upgrade failed: $cause; restored the pre-install mutable root from $backup_final/private-root.tar and selected prior release $current_tag, which is serving; candidate writes since the backup may have been lost; candidate files remain at $target but are not selected"
+  fail "upgrade failed: $cause; restored the pre-install mutable root from the retained backup and selected prior release $current_tag, which is serving; candidate writes since the backup may have been lost; the candidate files remain unselected"
 }
 
 cleanup() {
@@ -483,4 +483,4 @@ warn_unavailable_owner_route "$target"
 
 printf 'Harklight release tuple %s@%s source=%s archive_sha256=%s is running under the selected package.\n' \
   'clickety-clacks/harklight-server' "$HARKLIGHT_RELEASE_TAG" "$HARKLIGHT_SOURCE_COMMIT" "$HARKLIGHT_ARCHIVE_SHA256"
-printf 'State backup retained at %s\n' "$backup_final"
+printf 'State backup retained.\n'
