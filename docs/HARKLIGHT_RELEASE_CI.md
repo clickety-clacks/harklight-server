@@ -94,24 +94,43 @@ the server's existing claim, retry, and expiry behavior after startup. The
 installer does not inspect, clear, or mark that work delivered. A provider may
 accept a push before the server commits its local completion; restart cannot
 establish exactly-once delivery. A repeated tuple that is already installed
-and running is a no-op only after the package process matches the selected
-release and a read-only authenticated owner `agent-list` request succeeds over
-the existing TLS listener. That request is served by the normal Relay/Store
-runtime; it creates no message and its response is discarded. If the selected
-tuple is already current but its service is stopped, retry cancels any pending
-restart, starts that same package, and waits for the same readiness readback.
-Installations are serialized by a per-root lock.
-Failure retains current data, the backup, and both release identities; recovery
-never restores a stale database or automatically switches to an older package.
-The actual package and service result, not the workflow's exit alone, determine
-whether installation succeeded.
+and running is a no-op after the package process matches the selected release.
+The installer attempts a read-only authenticated owner `agent-list` request
+over the existing TLS listener; if that route is unavailable, it warns and
+continues with the already-running package. That request creates no message and
+its response is discarded. If the selected tuple is already current but its
+service is stopped, retry cancels any pending restart, starts that same package,
+and waits for the same process-readiness check. Installations are serialized by
+a per-root lock.
 
-The workflow reads back the selected package process and a successful
-authenticated owner TLS request, which establishes that the server application
-and its existing store can answer. It does not verify the external push
-notification ingress or native notification display; a separate observation
-step owns those checks and reports an ingress-only failure as
-degraded availability.
+If creating the full backup fails after the prior service was stopped, the
+selector has not changed. The installer may attempt to start the prior release
+and wait up to 30 seconds for its process to become ready. If that attempt
+fails, the service may remain stopped.
+
+If the candidate fails to start, or its process does not become ready under the
+selected package within 30 seconds, the installer attempts to stop the
+candidate. It proceeds with recovery only after confirming that the candidate
+is stopped. It then attempts to restore the stopped full mutable-root backup
+and prior selector, start the prior release, and wait up to 30 seconds for its
+process to become ready. The restore path is untested. Stopping, restoring,
+switching the selector, or starting and checking the prior release can fail,
+leaving partial state or the service stopped. Restoring loses writes made after
+the backup snapshot and cannot undo external effects.
+
+After the candidate process becomes ready, the authenticated owner
+`agent-list` check is warning-only. Its failure does not fail installation and
+does not trigger rollback. There is no automatic rollback after process
+readiness. The actual package and service result, not the workflow's exit alone,
+determine whether installation succeeded.
+
+The installer reads back that the selected package process is active, then
+attempts an authenticated owner TLS request. Failure of the owner route emits a
+warning and does not undo readiness or trigger rollback. A successful response
+establishes that the server application and its existing store can answer; the
+readiness check does not verify external push-notification ingress or native
+notification display. A separate observation step owns those checks and
+reports an ingress-only failure as degraded availability.
 
 This workflow is not a test runner. It has no branch, pull-request, schedule,
 or tag-created installation trigger, and it does not run checkout tests or

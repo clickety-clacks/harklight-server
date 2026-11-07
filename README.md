@@ -7,16 +7,16 @@ Harklight iOS/iPadOS app.
 
 ## Install the server
 
-For the FORMAT24 v0.1.26 server package, use the release page below after it
+For the FORMAT25 v0.1.28 server package, use the release page below after it
 is published to download the Linux x86_64 archive, `SHA256SUMS` and
 `SELF_HOST.md`. Verify the checksum before extraction:
 
-[v0.1.26 release](https://github.com/clickety-clacks/harklight-server/releases/tag/v0.1.26)
+[v0.1.28 release](https://github.com/clickety-clacks/harklight-server/releases/tag/v0.1.28)
 (available only after publication).
 
 ```sh
 sha256sum -c SHA256SUMS
-tar -xzf harklight-server-0.1.26-linux-x86_64.tar.gz
+tar -xzf harklight-server-0.1.28-linux-x86_64.tar.gz
 ```
 
 Follow [SELF_HOST.md](SELF_HOST.md) for a fresh installation, tailnet routing,
@@ -28,20 +28,31 @@ The package does not install a service, configure the tailnet or expose ports.
 State, owner/device identities, trust roots and sender grants live outside the
 versioned package. Run one server per database. Keep private keys and backups
 private; do not repeat bootstrap over an existing installation.
-This source, v0.1.25, the v0.1.24 repair line, v0.1.23, v0.1.22, v0.1.21, v0.1.20, v0.1.19, v0.1.18, v0.1.17, v0.1.16, v0.1.15, v0.1.14 and v0.1.13 use FORMAT24 and migrate supported older state on startup.
+This source, v0.1.28, uses FORMAT25 and migrates supported older state on
+startup. Versions v0.1.27, v0.1.26, v0.1.25, the v0.1.24 repair line,
+v0.1.23, v0.1.22, v0.1.21, v0.1.20, v0.1.19, v0.1.18, v0.1.17, v0.1.16,
+v0.1.15, v0.1.14 and v0.1.13 use FORMAT24 and migrate supported older state
+on startup.
 The v0.1.12 package uses FORMAT23, v0.1.11 uses FORMAT22, and v0.1.10 accepts
 formats 1–6 and 8–21. Those pre-FORMAT24 packages cannot start against FORMAT24
-state. The release installer creates one full private backup before switching
-releases. If
-the candidate process does not become ready, the installer restores that
-backup, selects and starts the prior release, and reports that writes since the
-backup may have been lost. Returning to v0.1.12 or earlier after a FORMAT24
-upgrade requires restoring the complete pre-upgrade backup.
-Version 0.1.25 and later persist delivery acknowledgements (ACK1 and ACK2). Although
-it retains FORMAT24, no safe code-only downgrade to 0.1.24 or earlier has been
-established once new data is written. Agree on recovery before cutover and
-retain the complete private pre-upgrade backup; restoring it discards all writes
-since capture.
+state. The release installer takes one full private-root backup while the
+service is stopped and before switching releases. It attempts to restore this
+snapshot if the candidate does not become ready, but the restore path has not
+been exercised in preparation of this package. Restore or prior-release startup
+can fail and leave the service stopped. Restoring the snapshot discards every
+write made after capture.
+
+After v0.1.28 writes FORMAT25, v0.1.27 and v0.1.26 cannot start against that
+state; changing only the selected code or release link cannot return to either
+version. A return requires restoring the complete private backup captured
+before FORMAT25 was written. Restore has not been tested here, is not guaranteed
+to succeed, and loses all writes made since its capture.
+
+Version 0.1.25 and later persist delivery acknowledgements (ACK1 and ACK2).
+No safe code-only downgrade to 0.1.24 or earlier has been established once
+0.1.25 or later writes new data. Agree on recovery before cutover and retain the
+complete private pre-upgrade backup; restoring it discards all writes since
+capture.
 
 The archive does not contain the `harklight-agent` conversation CLI; install
 it separately as described under [Get the agent CLI](#get-the-agent-cli).
