@@ -5,6 +5,14 @@ defmodule AttentionServer.DashboardReadHTTPTest do
 
   defmodule Backend do
     def resolve_session("member-session"), do: {:ok, %{person_id: "mike"}}
+
+    def resolve_session("labeled-session"),
+      do:
+        {:ok, %{person_id: "00000000-0000-4000-8000-000000000001", display_name: "Test account"}}
+
+    def resolve_session("fallback-session"),
+      do: {:ok, %{person_id: "self-hosted-owner"}}
+
     def resolve_session(_), do: {:error, :invalid_session}
 
     def list_devices(%{person_id: "mike"}) do
@@ -217,6 +225,38 @@ defmodule AttentionServer.DashboardReadHTTPTest do
 
     assert skill.resp_body ==
              "---\nname: harklight-agent\nversion: \"0.1.0\"\n---\n\n# Operate Harklight\n"
+  end
+
+  test "hosted components show the existing display label instead of the person UUID", %{
+    opts: opts
+  } do
+    hosted =
+      DashboardReadHTTP.init(
+        backend: Backend,
+        skill_path: opts.skill_path,
+        skill_path_saas: opts.skill_path_saas,
+        hosted: true
+      )
+
+    page =
+      "/components"
+      |> secure_get("labeled-session")
+      |> DashboardReadHTTP.call(hosted)
+
+    assert page.status == 200
+    assert page.resp_body =~ ~s(<div class="account">Test account)
+    refute page.resp_body =~ "00000000-0000-4000-8000-000000000001"
+    assert page.resp_body =~ ~s(href="/devices")
+  end
+
+  test "self-hosted components retain the person identifier when no display label exists", %{
+    opts: opts
+  } do
+    page = "/components" |> secure_get("fallback-session") |> DashboardReadHTTP.call(opts)
+
+    assert page.status == 200
+    assert page.resp_body =~ ~s(<div class="account">self-hosted-owner)
+    assert page.resp_body =~ ~s(href="/devices")
   end
 
   test "the components page tolerates a skill file with no version field", %{opts: opts} do
