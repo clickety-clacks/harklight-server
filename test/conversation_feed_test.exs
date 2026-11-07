@@ -18,13 +18,8 @@ defmodule AttentionServer.ConversationFeedTest do
     assert {:row, [version, payload, checksum]} = Sqlite3.step(db, state_stmt)
     assert :ok = Sqlite3.release(db, state_stmt)
 
-    assert {:ok, overlay_stmt} =
-             Sqlite3.prepare(db, "SELECT count(*) FROM relay_state_overlay_events")
-
-    assert {:row, [overlay_count]} = Sqlite3.step(db, overlay_stmt)
-    assert :ok = Sqlite3.release(db, overlay_stmt)
     assert :ok = Sqlite3.close(db)
-    {version, payload, checksum, overlay_count}
+    {version, payload, checksum}
   end
 
   setup do
@@ -66,11 +61,11 @@ defmodule AttentionServer.ConversationFeedTest do
     end)
   end
 
-  defp cold_overlay_reopen(path) do
+  defp cold_store_reopen(path) do
     {output, status} =
       System.cmd(
         "mix",
-        ["run", "--no-start", "--no-compile", "test/support/cold_overlay_reopen.exs"],
+        ["run", "--no-start", "--no-compile", "test/support/cold_store_reopen.exs"],
         cd: Path.expand("..", __DIR__),
         env: [
           {"MIX_ENV", "test"},
@@ -85,7 +80,7 @@ defmodule AttentionServer.ConversationFeedTest do
       )
 
     assert status == 0, "cold-reopen process failed (exit #{status}):\n#{output}"
-    assert output =~ "COLD_OVERLAY_REOPEN_AND_USE_OK"
+    assert output =~ "COLD_STORE_REOPEN_AND_USE_OK"
   end
 
   test "authorized agent answer keeps its author through terminal replay and restart", %{
@@ -2054,7 +2049,7 @@ defmodule AttentionServer.ConversationFeedTest do
     GenServer.stop(restarted)
   end
 
-  test "transient availability persists as an overlay and replays after process restart", %{
+  test "availability snapshots persist and replay after process restart", %{
     path: path
   } do
     assert {:ok, relay} = Relay.start_link(store_path: path)
@@ -2073,29 +2068,29 @@ defmodule AttentionServer.ConversationFeedTest do
                "unsupported_reason" => nil,
                "message" => %{
                  "sender_id" => "app:test",
-                 "message_id" => "overlay-replay",
+                 "message_id" => "availability-replay",
                  "created_at" => 1,
                  "title" => "Availability survives restart"
                }
              })
 
-    {before_version, before_payload, before_checksum, 0} = state_snapshot(path)
+    {before_version, before_payload, before_checksum} = state_snapshot(path)
     assert :crypto.hash(:sha256, before_payload) == before_checksum
 
     assert :ok = Relay.origin_stream_attach(relay, "origin", @handle, self())
-    {after_version, after_payload, after_checksum, 1} = state_snapshot(path)
+    {after_version, after_payload, after_checksum} = state_snapshot(path)
 
     assert after_version == before_version + 1
-    assert after_payload == before_payload
-    assert after_checksum != :crypto.hash(:sha256, after_payload)
+    assert after_payload != before_payload
+    assert :crypto.hash(:sha256, after_payload) == after_checksum
     assert {:ok, [listening], 1} = Relay.conversation_events(relay, "reader", 0)
     assert listening["availability"] == "listening"
 
     assert :ok = Relay.setup_person(relay, "B")
-    {folded_version, folded_payload, folded_checksum, 0} = state_snapshot(path)
-    assert folded_version == after_version + 1
-    assert folded_payload != before_payload
-    assert :crypto.hash(:sha256, folded_payload) == folded_checksum
+    {next_version, next_payload, next_checksum} = state_snapshot(path)
+    assert next_version == after_version + 1
+    assert next_payload != after_payload
+    assert :crypto.hash(:sha256, next_payload) == next_checksum
 
     GenServer.stop(relay)
     assert {:ok, restarted} = Relay.start_link(store_path: path)
@@ -2110,14 +2105,13 @@ defmodule AttentionServer.ConversationFeedTest do
 
     assert {:error, :person_exists} = Relay.setup_person(restarted, "B")
 
-    {_version, restored_payload, restored_checksum, 0} = state_snapshot(path)
+    {_version, restored_payload, restored_checksum} = state_snapshot(path)
     assert :crypto.hash(:sha256, restored_payload) == restored_checksum
 
     GenServer.stop(restarted)
   end
 
-  @tag :cold_overlay
-  test "support writes persist their receipt and replay through the sparse overlay", %{
+  test "support writes persist their receipt and replay after a cold reopen", %{
     path: path
   } do
     assert {:ok, relay} = Relay.start_link(store_path: path)
@@ -2132,7 +2126,7 @@ defmodule AttentionServer.ConversationFeedTest do
       "session_handle" => @handle,
       "message" => %{
         "sender_id" => "app:test",
-        "message_id" => "support-overlay",
+        "message_id" => "support-receipt",
         "created_at" => 1,
         "title" => "Support survives restart"
       }
@@ -2149,29 +2143,30 @@ defmodule AttentionServer.ConversationFeedTest do
       "unsupported_reason" => nil
     }
 
-    {before_version, before_payload, before_checksum, 0} = state_snapshot(path)
+    {before_version, before_payload, before_checksum} = state_snapshot(path)
     assert :crypto.hash(:sha256, before_payload) == before_checksum
 
     assert {:error, :not_found} = Relay.origin_support(relay, "reader", support)
 
-    assert state_snapshot(path) == {before_version, before_payload, before_checksum, 0}
+    assert state_snapshot(path) == {before_version, before_payload, before_checksum}
 
     assert {:ok, %{"listening_support" => %{"route" => "claude-code"} = declared}} =
              Relay.origin_support(relay, "origin", support)
 
     assert is_integer(declared["reported_at"])
-    {support_version, support_payload, support_checksum, 1} = state_snapshot(path)
+    {support_version, support_payload, support_checksum} = state_snapshot(path)
     assert support_version == before_version + 1
-    assert support_payload == before_payload
-    assert support_checksum != :crypto.hash(:sha256, support_payload)
+    assert support_payload != before_payload
+    assert :crypto.hash(:sha256, support_payload) == support_checksum
 
     assert :ok = Relay.origin_stream_attach(relay, "origin", @handle, self())
-    {attach_version, attach_payload, _attach_checksum, 2} = state_snapshot(path)
+    {attach_version, attach_payload, attach_checksum} = state_snapshot(path)
     assert attach_version == support_version + 1
-    assert attach_payload == before_payload
+    assert attach_payload != support_payload
+    assert :crypto.hash(:sha256, attach_payload) == attach_checksum
 
     GenServer.stop(relay)
-    cold_overlay_reopen(path)
+    cold_store_reopen(path)
     assert {:ok, restarted} = Relay.start_link(store_path: path)
 
     assert {:ok, %{"listening_support" => ^declared}} =
@@ -2201,9 +2196,9 @@ defmodule AttentionServer.ConversationFeedTest do
              Relay.origin_support(restarted, "origin", %{support | "route" => "codex"})
 
     assert :ok = Relay.setup_person(restarted, "B")
-    {folded_version, folded_payload, folded_checksum, 0} = state_snapshot(path)
+    {folded_version, folded_payload, folded_checksum} = state_snapshot(path)
     assert folded_version > attach_version
-    assert folded_payload != before_payload
+    assert folded_payload != attach_payload
     assert :crypto.hash(:sha256, folded_payload) == folded_checksum
 
     GenServer.stop(restarted)

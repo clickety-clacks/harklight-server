@@ -45,7 +45,7 @@ support_record =
     support_record = Map.fetch!(session, support_key)
     "claude-code" = support_record["route"]
 
-    IO.puts("COLD_OVERLAY_STORE_OPEN_OK")
+    IO.puts("COLD_STORE_OPEN_OK")
     support_record
   after
     :ok = AttentionServer.Store.close(store)
@@ -69,7 +69,7 @@ try do
   {:ok, %{"duplicate" => true, "listening_support" => ^support_record}} =
     AttentionServer.Relay.origin_support(relay, origin, support)
 
-  IO.puts("COLD_OVERLAY_REOPEN_AND_USE_OK")
+  IO.puts("COLD_STORE_REOPEN_AND_USE_OK")
 after
   GenServer.stop(relay)
 end
