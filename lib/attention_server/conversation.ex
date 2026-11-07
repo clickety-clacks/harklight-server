@@ -139,6 +139,9 @@ defmodule AttentionServer.Conversation do
   def chat_open?(%{terminal: %{state: "answered"}}), do: true
   def chat_open?(_), do: false
 
+  def new_chat_open?(%{terminal: %{state: "answered"}}), do: false
+  def new_chat_open?(record), do: chat_open?(record)
+
   # Request and lifecycle facts stay on the reply channel; chat contains only side-conversation turns.
   defp channel(%{"kind" => "discussion"}), do: "chat"
   defp channel(%{"kind" => "reply", "author" => "origin"}), do: "chat"
