@@ -1429,12 +1429,7 @@ defmodule AttentionServer.Relay do
              current["last_detached_at"]
            ),
          {:ok, store} <-
-           Store.commit_transient_origin_availability(
-             state.store,
-             attached,
-             {person, key, handle},
-             audit(engine, key, "origin_attach")
-           ) do
+           Store.commit(state.store, attached, audit(engine, key, "origin_attach")) do
       stream_key = {person, key, handle}
       # Replace only after the attachment commit succeeds. The old worker's
       # eventual detach/DOWN must not remove this connection's registration.
@@ -2918,10 +2913,9 @@ defmodule AttentionServer.Relay do
             current["last_detached_at"]
           )
 
-        case Store.commit_transient_origin_availability(
+        case Store.commit(
                state.store,
                next,
-               {person, origin, handle},
                audit(state.store.engine, origin, "origin_detach")
              ) do
           {:ok, store} ->
