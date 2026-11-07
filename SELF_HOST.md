@@ -283,12 +283,25 @@ an APNs request; after adding the Production settings, the device must register
 a higher revision to clear that binding. FCM is unsupported.
 
 An enrolled app registers its own current address over the authenticated relay.
-New unresolved attention uses the triggering message's `display_name` string
-as its alert title when supplied, preserving it separately from the exact
-`sender_id`; otherwise it uses `sender_id`. Its APNs body may include a
-whitespace-normalized preview of up to 160 graphemes from that message's body;
-when the body is absent or blank, its title supplies the preview. The payload
-also carries a content-free sync hint.
+For an APNs alert about a single pending request, the alert title is the supplied
+`display_name`; when absent, it is the message's exact `sender_id`. An explicitly
+supplied empty string stays empty. The name is carried whole when it fits with
+the required metadata. If it cannot fit, the notification is still sent with a
+neutral sender label. An alert grouping several pending requests uses a count
+title and carries as many whole deduplicated names as fit, in their existing
+order, followed by a count of the remaining names. No name in a payload is
+altered, truncated or ellipsized; the fitter may shorten other text. The phone
+may clip its display. There is no name-input cap or validation, name rejection,
+or silent notification drop because a name does not fit. The full original
+name remains unchanged in the message, history and origin feed.
+The independent `sender_id` and message ID remain the identities used for
+authentication, grants and navigation.
+This requires the server release implementing the display-name field and
+whole-name payload fitting; sender CLI support alone does not establish
+notification or app presentation. The APNs body
+may include a whitespace-normalized preview of up to
+160 graphemes from that message's body; when the body is absent or blank, its
+title supplies the preview. The payload also carries a content-free sync hint.
 Terminal-only updates use background sync without an alert, sound or badge,
 including updates to the answering device. A notification can carry a message
 excerpt, while full conversation history and answers remain in the durable relay.
@@ -345,8 +358,13 @@ the APNs variables unset.
 
 ## Read and answer a stored message
 
-Agents send new messages and listen for replies through the authenticated
-[`harklight-agent` session route](skills/core.md).
+Agents send new messages through the authenticated
+[`harklight-agent` session route](skills/core.md). Replies use that same origin
+identity, session and journal. A sender whose route cannot listen can use
+`harklight-agent read --session HANDLE` when its work resumes. The feed fetch is
+origin-wide; the CLI selects pending output for that handle locally. Read does
+not acknowledge an event, enable listening or promise future delivery. Follow
+the shared core for matching the request, explicit ACK and reporting an outcome.
 The enrolled-device `read` and `respond` commands remain available for messages
 already stored by the server. They do not create new messages or retrieve an
 origin receipt. Existing messages and their replay events remain in server

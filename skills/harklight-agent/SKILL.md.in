@@ -58,6 +58,13 @@ unknown status handle as unresolved until the owner reconciles it. This
 headless enrollment procedure is distinct from the native app's guided device
 joining.
 
+Use the `harklight-agent` session route for agent messages and their replies,
+with the originating enrolled identity and journal. There is no device-send or
+receipt fallback. If the actual route cannot listen, preserve its unsupported
+reason and use the one-shot `read --session HANDLE` procedure in the shared core
+when the originating work resumes. Reading does not claim listener support or
+acknowledge an event.
+
 The enrolled-device interface remains available for existing inbox work:
 `device read` journals replayed entries before ACK, and
 `device respond --sender ID --message-id ID --answer answer.json` deliberately
