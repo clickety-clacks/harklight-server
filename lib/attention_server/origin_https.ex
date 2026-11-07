@@ -224,8 +224,8 @@ defmodule AttentionServer.OriginHTTPS do
                 operation_id
               )
 
-          {:ok, {:stream, handle, reconnect}} ->
-            stream(tls, relay, key, handle, reconnect)
+          {:ok, {:stream, handle, reconnect, advisory_v1}} ->
+            stream(tls, relay, key, handle, reconnect, advisory_v1)
 
           {:ok, {:upload, attrs, size, remainder}} ->
             upload(tls, relay, key, attrs, size, remainder)
@@ -676,8 +676,8 @@ defmodule AttentionServer.OriginHTTPS do
     end
   end
 
-  defp stream(socket, relay, key, handle, reconnect) do
-    case Relay.origin_stream_attach(relay, key, handle, self(), reconnect) do
+  defp stream(socket, relay, key, handle, reconnect, advisory_v1) do
+    case Relay.origin_stream_attach(relay, key, handle, self(), reconnect, advisory_v1) do
       :ok ->
         try do
           with {:ok, %{"cursor" => cursor}} <-
@@ -689,7 +689,7 @@ defmodule AttentionServer.OriginHTTPS do
                  ),
                :ok <- stream_send(socket, stream_headers(), :response_write),
                :ok <- stream_send(socket, change_notice(cursor), :stream_write) do
-            stream_loop(socket, cursor)
+            stream_loop(socket, cursor, 0)
           else
             {:error, reason} ->
               {:error, reason}
@@ -723,10 +723,10 @@ defmodule AttentionServer.OriginHTTPS do
   defp stream_send(socket, bytes, phase),
     do: Diagnostics.result(:origin_https, phase, :ssl.send(socket, bytes), :closed)
 
-  defp stream_loop(socket, cursor) do
+  defp stream_loop(socket, cursor, advisory_cursor) do
     case :ssl.setopts(socket, active: :once) do
       :ok ->
-        stream_receive(socket, cursor)
+        stream_receive(socket, cursor, advisory_cursor)
 
       {:error, reason} ->
         Diagnostics.failure(:origin_https, :stream_read, reason, :closed)
@@ -738,7 +738,7 @@ defmodule AttentionServer.OriginHTTPS do
     end
   end
 
-  defp stream_receive(socket, cursor) do
+  defp stream_receive(socket, cursor, advisory_cursor) do
     receive do
       :origin_stream_replaced ->
         :ok
@@ -746,11 +746,21 @@ defmodule AttentionServer.OriginHTTPS do
       {:origin_state_changed, next} when is_integer(next) and next > cursor ->
         case stream_send(socket, change_notice(next), :stream_write) do
           :ok ->
-            stream_loop(socket, next)
+            stream_loop(socket, next, advisory_cursor)
 
           _ ->
             :ok
         end
+
+      {:origin_advisory_changed, handle, next}
+      when is_binary(handle) and is_integer(next) and next > advisory_cursor ->
+        case stream_send(socket, advisory_change_notice(handle, next), :stream_write) do
+          :ok -> stream_loop(socket, cursor, next)
+          _ -> :ok
+        end
+
+      {:origin_advisory_changed, _handle, _next} ->
+        stream_loop(socket, cursor, advisory_cursor)
 
       {:ssl, ^socket, _bytes} ->
         Diagnostics.failure(:origin_https, :stream_read, :bad_frame, :closed)
@@ -765,7 +775,7 @@ defmodule AttentionServer.OriginHTTPS do
     after
       @keepalive_ms ->
         case stream_send(socket, ": keepalive\n\n", :stream_write) do
-          :ok -> stream_loop(socket, cursor)
+          :ok -> stream_loop(socket, cursor, advisory_cursor)
           _ -> :ok
         end
     end
@@ -782,6 +792,14 @@ defmodule AttentionServer.OriginHTTPS do
 
   defp change_notice(cursor),
     do: ["event: change\n", "data: ", JSON.encode!(%{"cursor" => cursor}), "\n\n"]
+
+  defp advisory_change_notice(handle, cursor),
+    do: [
+      "event: advisory_change\n",
+      "data: ",
+      JSON.encode!(%{"session_handle" => handle, "advisory_cursor" => cursor}),
+      "\n\n"
+    ]
 
   defp transport_error(:method_not_allowed), do: {405, "method_not_allowed"}
   defp transport_error(:not_found), do: {404, "not_found"}
@@ -944,9 +962,10 @@ defmodule AttentionServer.OriginHTTPS do
          false <- Map.has_key?(headers, "content-length"),
          "/origin/v1/stream?session=" <> query <- path,
          [handle | options] <- String.split(query, "&"),
-         true <- options in [[], ["reconnect=1"]],
+         true <- Enum.all?(options, &(&1 in ["reconnect=1", "advisory_v1=1"])),
+         true <- length(options) == length(Enum.uniq(options)),
          true <- Message.uuid_v4?(handle) do
-      {:ok, {:stream, handle, options == ["reconnect=1"]}}
+      {:ok, {:stream, handle, "reconnect=1" in options, "advisory_v1=1" in options}}
     else
       _ -> {:error, :not_found}
     end

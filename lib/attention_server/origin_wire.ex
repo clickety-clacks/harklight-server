@@ -74,6 +74,48 @@ defmodule AttentionServer.OriginWire do
     end
   end
 
+  defp run(relay, key, %{"type" => "advisory_feed"} = request, ref) do
+    cond do
+      not Message.uuid_v4?(request["session_handle"]) ->
+        error("invalid_field", "session_handle", ref)
+
+      not (is_integer(request["since"]) and request["since"] >= 0) ->
+        error("invalid_field", "since", ref)
+
+      true ->
+        case Relay.origin_advisory_feed(
+               relay,
+               key,
+               request["session_handle"],
+               request["since"]
+             ) do
+          {:ok, feed} -> ok(feed, ref)
+          {:error, reason} -> error(Atom.to_string(reason), nil, ref)
+        end
+    end
+  end
+
+  defp run(relay, key, %{"type" => "advisory_ack"} = request, ref) do
+    cond do
+      not Message.uuid_v4?(request["session_handle"]) ->
+        error("invalid_field", "session_handle", ref)
+
+      not Message.uuid_v4?(request["advisory_id"]) ->
+        error("invalid_field", "advisory_id", ref)
+
+      true ->
+        case Relay.origin_advisory_ack(
+               relay,
+               key,
+               request["session_handle"],
+               request["advisory_id"]
+             ) do
+          {:ok, result} -> ok(result, ref)
+          {:error, reason} -> error(Atom.to_string(reason), nil, ref)
+        end
+    end
+  end
+
   defp run(relay, key, %{"type" => "ack", "event_id" => id} = request, ref) do
     with {:ok, seq} <- event_seq(id),
          {:ok, reply} <- Relay.origin_ack(relay, key, seq, request["file_transfers"]) do

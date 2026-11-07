@@ -10,6 +10,63 @@ defmodule AttentionServer.DashboardBackendTest do
 
   alias AttentionServer.{DeviceIdentity, JSON, Relay, TLSFixtures}
 
+  test "priority levels are owner-scoped, default off, durable, and whole-table saves are idempotent" do
+    certs = TLSFixtures.create!()
+    on_exit(fn -> File.rm_rf!(certs) end)
+    dir = Path.join(System.tmp_dir!(), "harklight-levels-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(dir)
+    on_exit(fn -> File.rm_rf!(dir) end)
+    path = Path.join(dir, "relay.sqlite3")
+
+    {:ok, relay} = Relay.start_link(store_path: path)
+    on_exit(fn -> if Process.alive?(relay), do: GenServer.stop(relay) end)
+
+    owner_a = TLSFixtures.certificate_der!(certs, "a1")
+    owner_b = TLSFixtures.certificate_der!(certs, "b1")
+    {:ok, person_a} = Relay.operator_bootstrap(relay, owner_a)
+    {:ok, person_b} = Relay.operator_bootstrap(relay, owner_b)
+    {:ok, key_a} = DeviceIdentity.from_certificate(owner_a)
+    {:ok, key_b} = DeviceIdentity.from_certificate(owner_b)
+    device_a = String.duplicate("c", 64)
+    :ok = Relay.setup_device(relay, person_a, device_a)
+
+    assert {:ok, %{"levels" => []}} = Relay.dashboard_levels(relay, person_a, key_a)
+    assert {:ok, %{"levels" => []}} = Relay.dashboard_levels(relay, person_b, key_b)
+    assert {:error, :forbidden} = Relay.dashboard_levels(relay, person_a, device_a)
+
+    rows = [
+      %{"name" => "Routine", "lower_bound" => 0, "bounce_after_days" => nil},
+      %{"name" => "Follow up", "lower_bound" => 0.6, "bounce_after_days" => 1.5}
+    ]
+
+    assert {:ok, %{"levels" => ^rows}} =
+             Relay.save_dashboard_levels(relay, person_a, key_a, rows)
+
+    config_before = :sys.get_state(relay).store.engine.bounce_levels[person_a]
+    assert config_before.after_delivery_seq == 0
+    assert config_before.after_conversation_seq == 0
+
+    assert {:ok, %{"levels" => ^rows}} =
+             Relay.save_dashboard_levels(relay, person_a, key_a, rows)
+
+    assert :sys.get_state(relay).store.engine.bounce_levels[person_a] == config_before
+
+    invalid = [hd(rows), %{List.last(rows) | "lower_bound" => 1.1}]
+
+    assert {:error, :invalid_levels} =
+             Relay.save_dashboard_levels(relay, person_a, key_a, invalid)
+
+    assert {:ok, %{"levels" => ^rows}} = Relay.dashboard_levels(relay, person_a, key_a)
+    assert {:ok, %{"levels" => []}} = Relay.dashboard_levels(relay, person_b, key_b)
+
+    GenServer.stop(relay)
+    assert {:ok, restarted} = Relay.start_link(store_path: path)
+    on_exit(fn -> if Process.alive?(restarted), do: GenServer.stop(restarted) end)
+    assert {:ok, %{"levels" => ^rows}} = Relay.dashboard_levels(restarted, person_a, key_a)
+    assert {:ok, %{"levels" => []}} = Relay.dashboard_levels(restarted, person_b, key_b)
+    GenServer.stop(restarted)
+  end
+
   test "configured self-host owner sees device metadata across persons; another owner sees only their own" do
     certs = TLSFixtures.create!()
     on_exit(fn -> File.rm_rf!(certs) end)

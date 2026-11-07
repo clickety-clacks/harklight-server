@@ -9,10 +9,19 @@ defmodule AttentionServer.Store do
   silently replacing committed work. This is not a public database API.
   """
 
-  alias AttentionServer.{APNS, BrowserSignIn, Conversation, Diagnostics, Engine, GuidedJoin}
+  alias AttentionServer.{
+    APNS,
+    BounceDecision,
+    BrowserSignIn,
+    Conversation,
+    Diagnostics,
+    Engine,
+    GuidedJoin
+  }
+
   alias Exqlite.Sqlite3
 
-  @format_version 25
+  @format_version 27
   @inbox_index_chunk_size 20
   defstruct [:db, :engine, :version, :upload_dir]
 
@@ -259,7 +268,7 @@ defmodule AttentionServer.Store do
   def put_published_upload(%__MODULE__{} = store, metadata) do
     next = %{store.engine | uploads: Map.put(store.engine.uploads, metadata.id, metadata)}
 
-    if valid_state?(next) do
+    if valid_state?(next, :incremental) do
       case commit(store, next, %{
              person: metadata.person,
              actor: metadata.uploader,
@@ -959,7 +968,7 @@ defmodule AttentionServer.Store do
     do: {:ok, %{store | engine: next}}
 
   def commit(%__MODULE__{} = store, next, audit) do
-    if valid_state?(next) do
+    if valid_state?(next, :incremental) do
       commit_durable(store, next, audit)
     else
       Diagnostics.failure(
@@ -1051,6 +1060,7 @@ defmodule AttentionServer.Store do
             # sign-ins, JSON decimal values or provider state.
             for module <- [
                   Engine,
+                  BounceDecision,
                   Conversation,
                   GuidedJoin,
                   BrowserSignIn,
@@ -1088,7 +1098,9 @@ defmodule AttentionServer.Store do
                      22,
                      23,
                      24,
-                     25
+                     25,
+                     26,
+                     27
                    ] ->
                 original = struct(Engine, Map.from_struct(stored))
 
@@ -1163,12 +1175,28 @@ defmodule AttentionServer.Store do
                   |> then(fn state ->
                     if format < 24, do: %{state | chat_read_positions: %{}}, else: state
                   end)
+                  |> then(fn state ->
+                    if format < 26 do
+                      %{
+                        state
+                        | bounce_levels: %{},
+                          bounce_revisions: %{},
+                          opened_revisions: MapSet.new(),
+                          advisory_feeds: %{}
+                      }
+                    else
+                      state
+                    end
+                  end)
+
+                engine = BounceDecision.rebuild_indexes(engine)
 
                 cond do
                   not valid_state?(engine) ->
                     {:error, :invalid_state}
 
-                  format == @format_version and engine == original ->
+                  format == @format_version and
+                      same_state_except_bounce_indexes?(engine, original) ->
                     {:ok, engine, version}
 
                   true ->
@@ -1197,6 +1225,8 @@ defmodule AttentionServer.Store do
                                  format < 18 -> "conversation_feed_init"
                                  format < 23 -> "prioritization_init"
                                  format < 24 -> "chat_read_positions_init"
+                                 format < 26 -> "bounce_state_init"
+                                 format < 27 -> "bounce_schedule_index_init"
                                  true -> "state_format"
                                end
                            }
@@ -1714,6 +1744,7 @@ defmodule AttentionServer.Store do
       engine
       |> Map.from_struct()
       |> Map.delete(:open_default_index)
+      |> Map.delete(:advisory_id_index)
       |> Map.put(:__struct__, Engine)
 
     :erlang.term_to_binary({:attention_relay_state, @format_version, persisted}, [
@@ -1908,9 +1939,11 @@ defmodule AttentionServer.Store do
     %{engine | pending_enrollments: pending, pending_history: history}
   end
 
-  # There are no cross-person relational references in the single state row.
-  # Validate every stored edge before accepting or loading a snapshot instead.
-  defp valid_state?(%Engine{} = engine) do
+  # The durable hot path checks bounce index containers without rescanning their
+  # retained rows. Store open performs the full cross-map bounce validation.
+  defp valid_state?(%Engine{} = engine), do: valid_state?(engine, :full)
+
+  defp valid_state?(%Engine{} = engine, bounce_validation) do
     try do
       valid_instance?(engine.relay_instance_id) and
         is_binary(engine.agent_cursor_key) and byte_size(engine.agent_cursor_key) == 32 and
@@ -1932,6 +1965,7 @@ defmodule AttentionServer.Store do
         valid_prioritization?(engine) and
         valid_push_bindings?(engine) and
         AttentionServer.Conversation.valid_state?(engine) and
+        BounceDecision.valid_state?(engine, bounce_validation) and
         valid_uploads?(engine) and
         valid_upload_references?(engine) and
         Enum.all?(engine.devices, fn {_key, device} ->
@@ -2044,7 +2078,19 @@ defmodule AttentionServer.Store do
     end
   end
 
+  defp valid_state?(_, _), do: false
   defp valid_state?(_), do: false
+
+  defp same_state_except_bounce_indexes?(loaded, stored) do
+    %{
+      loaded
+      | bounce_deadline_index: stored.bounce_deadline_index,
+        bounce_waiting_routes: stored.bounce_waiting_routes,
+        bounce_discussed_messages: stored.bounce_discussed_messages,
+        bounce_origin_entries: stored.bounce_origin_entries,
+        advisory_id_index: stored.advisory_id_index
+    } == stored
+  end
 
   defp valid_prioritization?(engine) do
     is_map(engine.algorithm_choices) and
