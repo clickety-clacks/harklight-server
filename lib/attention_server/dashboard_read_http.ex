@@ -222,6 +222,53 @@ defmodule AttentionServer.DashboardReadHTTP do
   end
 
   defp route(
+         %{method: "GET", request_path: "/levels"} = conn,
+         opts,
+         principal
+       ) do
+    case backend_call(opts.backend, :levels, principal) do
+      {:ok, result} ->
+        send_levels_json(conn, result, 200)
+
+      {:error, :storage_unavailable} ->
+        send_resp(conn, 503, "Priority levels are unavailable.")
+
+      _ ->
+        send_resp(conn, 403, "Priority levels are unavailable.")
+    end
+  end
+
+  defp route(
+         %{method: "POST", request_path: "/levels"} = conn,
+         opts,
+         principal
+       ) do
+    case json_body(conn, opts, 1_048_576) do
+      {:ok, %{"levels" => rows} = body, conn}
+      when map_size(body) == 1 and is_list(rows) ->
+        case backend_call(opts.backend, :save_levels, {principal, rows}) do
+          {:ok, result} ->
+            send_levels_json(conn, result, 200)
+
+          {:error, :invalid_levels} ->
+            send_resp(conn, 400, "The level table is invalid.")
+
+          {:error, :storage_unavailable} ->
+            send_resp(conn, 503, "The server could not save these levels.")
+
+          {:error, :forbidden} ->
+            send_resp(conn, 403, "Priority levels were refused.")
+
+          _ ->
+            send_resp(conn, 400, "The level table is invalid.")
+        end
+
+      {_, _, conn} ->
+        send_resp(conn, 400, "The level table is invalid.")
+    end
+  end
+
+  defp route(
          %{method: "GET", request_path: "/prioritization"} = conn,
          %{hosted: false} = opts,
          principal
@@ -704,6 +751,55 @@ defmodule AttentionServer.DashboardReadHTTP do
     error ->
       Diagnostics.failure(:dashboard_http, :request_read, error, :rejected)
       {:error, :invalid_form, conn}
+  end
+
+  defp json_body(conn, opts, limit) do
+    with true <- trusted_form_origin?(conn, expected_origin(conn, opts)),
+         [content_type] <- get_req_header(conn, "content-type"),
+         true <- json_content_type?(content_type) do
+      case read_body(conn, length: limit, read_length: limit) do
+        {:ok, body, conn} ->
+          case JSON.decode_line(body <> "\n", limit + 1) do
+            {:ok, value} when is_map(value) and not is_struct(value) -> {:ok, value, conn}
+            _ -> {:error, conn}
+          end
+
+        {:more, _, conn} ->
+          {:error, conn}
+
+        {:error, _reason} ->
+          {:error, conn}
+
+        _ ->
+          {:error, conn}
+      end
+    else
+      _ -> {:error, conn}
+    end
+  rescue
+    _ -> {:error, conn}
+  end
+
+  defp json_content_type?(value) when is_binary(value) do
+    case String.split(value, ";", trim: true) |> Enum.map(&String.trim/1) do
+      [type] ->
+        String.downcase(type) == "application/json"
+
+      [type, charset] ->
+        String.downcase(type) == "application/json" and
+          String.downcase(charset) == "charset=utf-8"
+
+      _ ->
+        false
+    end
+  end
+
+  defp json_content_type?(_), do: false
+
+  defp send_levels_json(conn, body, status) do
+    conn
+    |> put_resp_content_type("application/json", "utf-8")
+    |> send_resp(status, JSON.encode!(body))
   end
 
   defp trusted_form_origin?(conn, expected_origin) do

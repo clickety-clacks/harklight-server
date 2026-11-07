@@ -23,6 +23,8 @@ defmodule AttentionServer.Relay do
   alias AttentionServer.{
     AgentWire,
     AppliedScoreRecord,
+    BounceDecision,
+    BouncePolicy,
     Conversation,
     ConversationFiles,
     DashboardInventory,
@@ -71,6 +73,12 @@ defmodule AttentionServer.Relay do
         {:dashboard_prioritization, person, owner_key, configured_owner_person}
       )
 
+  def dashboard_levels(server, person, owner_key),
+    do: GenServer.call(server, {:dashboard_levels, person, owner_key})
+
+  def save_dashboard_levels(server, person, owner_key, levels),
+    do: GenServer.call(server, {:save_dashboard_levels, person, owner_key, levels})
+
   def save_dashboard_prioritization(
         server,
         person,
@@ -96,6 +104,12 @@ defmodule AttentionServer.Relay do
   @doc "Read the current device origin's conversation feed without advancing its cursor."
   def origin_feed(server, verified_device_key, since),
     do: GenServer.call(server, {:origin_feed, verified_device_key, since})
+
+  def origin_advisory_feed(server, verified_device_key, handle, since),
+    do: GenServer.call(server, {:origin_advisory_feed, verified_device_key, handle, since})
+
+  def origin_advisory_ack(server, verified_device_key, handle, advisory_id),
+    do: GenServer.call(server, {:origin_advisory_ack, verified_device_key, handle, advisory_id})
 
   @doc "Record one originating-session delivery receipt, separately from relay ACK."
   def origin_ack(server, verified_device_key, feed_seq, reports \\ nil),
@@ -200,7 +214,14 @@ defmodule AttentionServer.Relay do
     do:
       GenServer.call(
         server,
-        {:origin_stream_attach, verified_device_key, handle, worker, reconnect}
+        {:origin_stream_attach, verified_device_key, handle, worker, reconnect, false}
+      )
+
+  def origin_stream_attach(server, verified_device_key, handle, worker, reconnect, advisory_v1),
+    do:
+      GenServer.call(
+        server,
+        {:origin_stream_attach, verified_device_key, handle, worker, reconnect, advisory_v1}
       )
 
   def origin_stream_detach(server, verified_device_key, handle, worker),
@@ -527,6 +548,8 @@ defmodule AttentionServer.Relay do
               default_index: Engine.default_index(store.engine),
               default_timer: nil,
               default_timer_generation: 0,
+              bounce_deadline_timer: nil,
+              bounce_deadline_generation: 0,
               upload_index: build_upload_index(store.engine),
               active_uploads: %{},
               sessions: %{},
@@ -571,6 +594,7 @@ defmodule AttentionServer.Relay do
 
             state = initialize_priority_views(state)
             state = reschedule_default_sweep(state, state.default_index)
+            state = reschedule_bounce_sweep(state)
 
             case sweep_agent_uploads(state, System.system_time(:millisecond)) do
               {:ok, next, _count} ->
@@ -901,6 +925,43 @@ defmodule AttentionServer.Relay do
     end
   end
 
+  def handle_call({:dashboard_levels, person, key}, _from, state) do
+    case Engine.owner_identity(state.store.engine, key) do
+      {:ok, ^person, _revision} ->
+        {:reply, {:ok, %{"levels" => BounceDecision.levels(state.store.engine, person)}}, state}
+
+      _ ->
+        {:reply, {:error, :forbidden}, state}
+    end
+  end
+
+  def handle_call({:save_dashboard_levels, person, key, rows}, _from, state) do
+    with {:ok, ^person, _revision} <- Engine.owner_identity(state.store.engine, key),
+         {:ok, levels} <- BouncePolicy.normalize_levels(rows),
+         {:ok, next, config} <-
+           BounceDecision.configure_levels(state.store.engine, person, levels, state.clock.()) do
+      if next == state.store.engine do
+        {:reply, {:ok, %{"levels" => BouncePolicy.public_levels(config.levels)}}, state}
+      else
+        case commit(
+               state.store,
+               next,
+               %{person: person, actor: key, action: "dashboard_levels"}
+             ) do
+          {:ok, store} ->
+            {:reply, {:ok, %{"levels" => BouncePolicy.public_levels(config.levels)}},
+             %{state | store: store}}
+
+          _ ->
+            {:reply, {:error, :storage_unavailable}, state}
+        end
+      end
+    else
+      {:error, :invalid_levels} -> {:reply, {:error, :invalid_levels}, state}
+      _ -> {:reply, {:error, :forbidden}, state}
+    end
+  end
+
   def handle_call(
         {:save_dashboard_prioritization, person, key, configured_owner_person, algorithm,
          endpoint, model},
@@ -941,6 +1002,26 @@ defmodule AttentionServer.Relay do
     end
   end
 
+  def handle_call({:origin_advisory_feed, key, handle, since}, _from, state) do
+    {:reply, BounceDecision.advisory_feed(state.store.engine, key, handle, since), state}
+  end
+
+  def handle_call({:origin_advisory_ack, key, handle, advisory_id}, _from, state) do
+    case BounceDecision.advisory_ack(state.store.engine, key, handle, advisory_id) do
+      {:ok, next, reply} when next == state.store.engine ->
+        {:reply, {:ok, reply}, state}
+
+      {:ok, next, reply} ->
+        case commit(state.store, next, audit(state.store.engine, key, "origin_advisory_ack")) do
+          {:ok, store} -> {:reply, {:ok, reply}, %{state | store: store}}
+          _ -> {:reply, {:error, :storage_unavailable}, state}
+        end
+
+      error ->
+        {:reply, error, state}
+    end
+  end
+
   def handle_call({:origin_status, key, handle}, _from, state) do
     engine = state.store.engine
 
@@ -960,6 +1041,7 @@ defmodule AttentionServer.Relay do
         {:reply, {:ok, reply}, state}
 
       {:ok, next, reply} ->
+        old_engine = state.store.engine
         {:ok, person} = Engine.authorized_person(next, key)
         handle = declaration["session_handle"]
         listening? = Map.has_key?(state.origin_streams, {person, key, handle})
@@ -983,10 +1065,19 @@ defmodule AttentionServer.Relay do
                next,
                session_key,
                receipt_key,
-               audit(state.store.engine, key, "origin_support")
+               audit(old_engine, key, "origin_support")
              ) do
-          {:ok, store} -> {:reply, {:ok, reply}, %{state | store: store}}
-          _ -> {:reply, {:error, :storage_unavailable}, state}
+          {:ok, store} ->
+            next_state =
+              %{state | store: store}
+              |> refresh_stream_advisory_support({person, key, handle})
+              |> record_advisory_feed_change(old_engine, next)
+              |> reschedule_bounce_sweep()
+
+            {:reply, {:ok, reply}, next_state}
+
+          _ ->
+            {:reply, {:error, :storage_unavailable}, state}
         end
 
       error ->
@@ -1313,8 +1404,12 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  def handle_call({:origin_stream_attach, key, handle, worker, reconnect}, _from, state)
-      when is_pid(worker) and is_boolean(reconnect) do
+  def handle_call(
+        {:origin_stream_attach, key, handle, worker, reconnect, advisory_requested},
+        _from,
+        state
+      )
+      when is_pid(worker) and is_boolean(reconnect) and is_boolean(advisory_requested) do
     engine = state.store.engine
 
     with {:ok, person} <- Engine.authorized_person(engine, key),
@@ -1347,7 +1442,16 @@ defmodule AttentionServer.Relay do
       end
 
       monitor = Process.monitor(worker)
-      streams = Map.put(state.origin_streams, stream_key, %{worker: worker, monitor: monitor})
+
+      streams =
+        Map.put(state.origin_streams, stream_key, %{
+          worker: worker,
+          monitor: monitor,
+          advisory_requested: advisory_requested,
+          advisory_v1:
+            advisory_requested and
+              BounceDecision.advisory_supported?(attached, person, key, handle)
+        })
 
       streams_by_identity =
         Map.update(
@@ -1357,13 +1461,18 @@ defmodule AttentionServer.Relay do
           &MapSet.put(&1, stream_key)
         )
 
-      {:reply, :ok,
-       %{
-         state
-         | store: store,
-           origin_streams: streams,
-           origin_streams_by_identity: streams_by_identity
-       }}
+      next_state = %{
+        state
+        | store: store,
+          origin_streams: streams,
+          origin_streams_by_identity: streams_by_identity
+      }
+
+      next_state =
+        next_state
+        |> reschedule_bounce_sweep()
+
+      {:reply, :ok, next_state}
     else
       true -> {:reply, {:error, :already_listening}, state}
       {:error, :not_found} = error -> {:reply, error, state}
@@ -2523,6 +2632,41 @@ defmodule AttentionServer.Relay do
 
   def handle_info(:refresh_default_sweep_index, state) do
     {:noreply, reschedule_default_sweep(state, Engine.default_index(state.store.engine))}
+  end
+
+  def handle_info(
+        {:bounce_due, generation},
+        %{bounce_deadline_generation: generation} = state
+      ) do
+    state = %{state | bounce_deadline_timer: nil}
+    old_engine = state.store.engine
+    now_ms = state.clock.()
+    next_engine = BounceDecision.evaluate_due(old_engine, now_ms)
+
+    if next_engine == old_engine do
+      {:noreply, reschedule_bounce_sweep(state)}
+    else
+      case commit(state.store, next_engine, %{
+             person: "system",
+             actor: "bounce_decision",
+             action: "bounce_due"
+           }) do
+        {:ok, store} ->
+          next_state = %{state | store: store}
+
+          next_state = record_advisory_feed_change(next_state, old_engine, next_engine)
+
+          {:noreply, reschedule_bounce_sweep(next_state)}
+
+        {:error, reason, _store} ->
+          Diagnostics.failure(:bounce_schedule, :decision_commit, reason, :unavailable)
+          {:noreply, schedule_bounce_retry(state)}
+
+        other ->
+          Diagnostics.failure(:bounce_schedule, :decision_commit, other, :unavailable)
+          {:noreply, schedule_bounce_retry(state)}
+      end
+    end
   end
 
   def handle_info({:default_sweep, generation}, %{default_timer_generation: generation} = state) do
@@ -4161,28 +4305,21 @@ defmodule AttentionServer.Relay do
           %{cache: cache, scores: scores, overflow: overflow} = pass ->
             state = %{state | priority_caches: Map.put(state.priority_caches, person, cache)}
 
-            state =
+            {state, score_commit_failed?} =
               if map_size(scores) > 0 do
                 entries = Placement.place("jev-set", items, [], {:ranked, scores, overflow})
 
-                put_priority_view(
-                  state,
-                  person,
-                  %{
-                    algorithm: "jev-set",
-                    basis: "selected",
-                    engine_entries: entries
-                  },
-                  reply_summary
-                )
-                |> record_applied_scores(person, items, entries)
+                put_scored_priority_view(state, person, items, entries, reply_summary)
               else
-                put_priority_view(state, person, fallback_view(items), reply_summary)
+                {put_priority_view(state, person, fallback_view(items), reply_summary), false}
               end
 
             state =
               state
-              |> schedule_priority_retry(person, pass.failed)
+              |> schedule_priority_retry(
+                person,
+                if(score_commit_failed?, do: 1, else: pass.failed)
+              )
               |> schedule_priority_deadline(person, pass.considered)
 
             if Enum.any?(pass.considered, fn item ->
@@ -4198,17 +4335,12 @@ defmodule AttentionServer.Relay do
 
             entries = Placement.place("jev-set", items, previous_entries, {:scored, scores})
 
-            put_priority_view(
-              state,
-              person,
-              %{
-                algorithm: "jev-set",
-                basis: "selected",
-                engine_entries: entries
-              },
-              reply_summary
-            )
-            |> record_applied_scores(person, items, entries)
+            {scored_state, score_commit_failed?} =
+              put_scored_priority_view(state, person, items, entries, reply_summary)
+
+            if score_commit_failed?,
+              do: schedule_priority_retry(scored_state, person, 1),
+              else: scored_state
 
           _ ->
             state
@@ -4238,6 +4370,60 @@ defmodule AttentionServer.Relay do
 
       {_stale, remaining_queued} ->
         %{state | priority_queued: remaining_queued}
+    end
+  end
+
+  defp put_scored_priority_view(state, person, items, entries, reply_summary) do
+    old_engine = state.store.engine
+    next_engine = BounceDecision.record_scores(old_engine, person, entries, state.clock.())
+
+    case persist_bounce_decision(state, old_engine, next_engine, "bounce_score_selection") do
+      {:ok, next_state} ->
+        next_state =
+          put_priority_view(
+            next_state,
+            person,
+            %{
+              algorithm: "jev-set",
+              basis: "selected",
+              engine_entries: entries
+            },
+            reply_summary
+          )
+          |> record_applied_scores(person, items, entries)
+
+        {next_state, false}
+
+      {:error, reason} ->
+        Diagnostics.failure(:bounce_schedule, :score_selection_commit, reason, :unavailable)
+
+        {put_priority_view(state, person, fallback_view(items), reply_summary), true}
+    end
+  end
+
+  defp persist_bounce_decision(state, old_engine, next_engine, _action)
+       when old_engine == next_engine,
+       do: {:ok, state}
+
+  defp persist_bounce_decision(state, old_engine, next_engine, action) do
+    audit = %{person: "system", actor: "bounce_decision", action: action}
+
+    case commit(state.store, next_engine, audit) do
+      {:ok, store} ->
+        next_state = %{state | store: store}
+
+        next_state =
+          next_state
+          |> record_advisory_feed_change(old_engine, next_engine)
+          |> reschedule_bounce_sweep()
+
+        {:ok, next_state}
+
+      {:error, reason, _store} ->
+        {:error, reason}
+
+      error ->
+        {:error, error}
     end
   end
 
@@ -4619,6 +4805,76 @@ defmodule AttentionServer.Relay do
     generation = state.default_timer_generation + 1
     timer = Process.send_after(self(), {:default_sweep, generation}, @default_sweep_retry_ms)
     %{state | default_timer: timer, default_timer_generation: generation}
+  end
+
+  defp reschedule_bounce_sweep(state) do
+    if is_reference(state.bounce_deadline_timer),
+      do: Process.cancel_timer(state.bounce_deadline_timer)
+
+    generation = state.bounce_deadline_generation + 1
+
+    state = %{
+      state
+      | bounce_deadline_timer: nil,
+        bounce_deadline_generation: generation
+    }
+
+    case BounceDecision.next_deadline(state.store.engine) do
+      due_at when is_integer(due_at) ->
+        delay = min(max(due_at - state.clock.(), 0), @max_timer_delay_ms)
+        timer = Process.send_after(self(), {:bounce_due, generation}, delay)
+        %{state | bounce_deadline_timer: timer}
+
+      _ ->
+        state
+    end
+  end
+
+  defp schedule_bounce_retry(state) do
+    if is_reference(state.bounce_deadline_timer),
+      do: Process.cancel_timer(state.bounce_deadline_timer)
+
+    generation = state.bounce_deadline_generation + 1
+    timer = Process.send_after(self(), {:bounce_due, generation}, @default_sweep_retry_ms)
+
+    %{state | bounce_deadline_timer: timer, bounce_deadline_generation: generation}
+  end
+
+  defp refresh_stream_advisory_support(state, {person, origin, handle} = stream_key) do
+    case Map.get(state.origin_streams, stream_key) do
+      %{advisory_requested: requested} = stream ->
+        enabled =
+          requested and
+            BounceDecision.advisory_supported?(state.store.engine, person, origin, handle)
+
+        %{
+          state
+          | origin_streams:
+              Map.put(state.origin_streams, stream_key, %{stream | advisory_v1: enabled})
+        }
+
+      _ ->
+        state
+    end
+  end
+
+  defp record_advisory_feed_change(state, old_engine, next_engine) do
+    Enum.reduce(next_engine.advisory_feeds, state, fn {{_person, _origin, handle} = key, feed},
+                                                      current ->
+      old_feed = Map.get(old_engine.advisory_feeds, key, %{high: 0, entries: %{}})
+
+      if feed.high > old_feed.high do
+        case Map.get(current.origin_streams, key) do
+          %{worker: worker, advisory_v1: true} ->
+            send(worker, {:origin_advisory_changed, handle, feed.high})
+
+          _ ->
+            :ok
+        end
+      end
+
+      current
+    end)
   end
 
   # Origin-feed changes are announced only by the request paths that append

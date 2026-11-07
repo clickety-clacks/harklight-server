@@ -15,6 +15,7 @@ defmodule AttentionServer.Engine do
   alias AttentionServer.{
     APNS,
     AgentAccess,
+    BounceDecision,
     Conversation,
     ConversationFiles,
     DeviceIdentity,
@@ -69,7 +70,11 @@ defmodule AttentionServer.Engine do
             algorithm_choices: %{},
             jev_endpoint: nil,
             jev_model: nil,
-            push_bindings: %{}
+            push_bindings: %{},
+            bounce_levels: %{},
+            bounce_revisions: %{},
+            opened_revisions: MapSet.new(),
+            advisory_feeds: %{}
 
   def new do
     %__MODULE__{
@@ -3163,6 +3168,9 @@ defmodule AttentionServer.Engine do
   defp dispatch(engine, principal, %{"type" => "forward"} = frame),
     do: forward(engine, principal, frame)
 
+  defp dispatch(engine, principal, %{"type" => "message_open"} = frame),
+    do: message_open(engine, principal, frame)
+
   defp dispatch(engine, principal, %{"type" => "discussion"} = frame),
     do: discussion(engine, principal, frame)
 
@@ -3748,6 +3756,7 @@ defmodule AttentionServer.Engine do
         next =
           next
           |> put_message(key, record)
+          |> BounceDecision.record_initial(key, record)
           |> put_event(person, seq, :delivery, key)
           |> queue_push_hint(person, seq)
 
@@ -4232,6 +4241,71 @@ defmodule AttentionServer.Engine do
     end
   end
 
+  defp message_open(engine, %{person: person, key: device, kind: :device}, frame) do
+    with :ok <- valid_op(frame),
+         :ok <- valid_global_id(frame),
+         :ok <- valid_no_selectors(frame),
+         true <- is_integer(frame["request_revision"]) and frame["request_revision"] > 0 do
+      semantic = %{
+        "type" => "message_open",
+        "sender_id" => frame["sender_id"],
+        "message_id" => frame["message_id"],
+        "request_revision" => frame["request_revision"]
+      }
+
+      case receipt(engine, person, device, frame["op_id"], semantic) do
+        {:duplicate, reply} ->
+          {:ok, engine, reply}
+
+        :conflict ->
+          failure("operation_conflict")
+
+        :missing ->
+          key = {person, frame["sender_id"], frame["message_id"]}
+
+          case Map.get(engine.messages, key) do
+            nil ->
+              failure("not_found")
+
+            record ->
+              if Map.has_key?(
+                   Map.get(record, :revisions, %{1 => record.message}),
+                   frame["request_revision"]
+                 ) do
+                case AttentionServer.BounceDecision.record_open(
+                       engine,
+                       key,
+                       record,
+                       frame["request_revision"]
+                     ) do
+                  {:ok, next, _substantive_revision} ->
+                    reply = %{
+                      "op_id" => frame["op_id"],
+                      "sender_id" => frame["sender_id"],
+                      "message_id" => frame["message_id"],
+                      "request_revision" => frame["request_revision"],
+                      "opened" => true
+                    }
+
+                    {:ok, save_receipt(next, person, device, frame["op_id"], semantic, reply),
+                     reply}
+
+                  {:error, :invalid_revision} ->
+                    failure("invalid_field", "request_revision")
+                end
+              else
+                failure("invalid_field", "request_revision")
+              end
+          end
+      end
+    else
+      false -> failure("invalid_field", "request_revision")
+      {:error, field} -> failure("invalid_field", field)
+    end
+  end
+
+  defp message_open(_engine, _principal, _frame), do: failure("forbidden")
+
   defp conversation_read(engine, %{person: person, key: actor}, frame) do
     with :ok <- valid_op(frame),
          :ok <- valid_global_id(frame) do
@@ -4667,6 +4741,18 @@ defmodule AttentionServer.Engine do
                 fields =
                   %{"seq" => seq, "event_id" => feed_entry["event_id"], "revision" => revision}
                   |> put_field_warnings(field_warnings)
+
+                {next, _substantive_revision, _changed?} =
+                  BounceDecision.record_revision(
+                    next,
+                    key,
+                    record,
+                    revision,
+                    message,
+                    files,
+                    accepted_at,
+                    seq
+                  )
 
                 next =
                   next

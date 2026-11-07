@@ -82,6 +82,22 @@ defmodule AttentionServer.DashboardBackend do
 
   def save_prioritization(_, _), do: {:error, :forbidden}
 
+  def levels(
+        %__MODULE__{relay: relay},
+        %{person_id: person, owner_key: key}
+      ),
+      do: Relay.dashboard_levels(relay, person, key)
+
+  def levels(_, _), do: {:error, :forbidden}
+
+  def save_levels(
+        %__MODULE__{relay: relay},
+        {%{person_id: person, owner_key: key}, rows}
+      ),
+      do: Relay.save_dashboard_levels(relay, person, key, rows)
+
+  def save_levels(_, _), do: {:error, :forbidden}
+
   # Browser actions use only the signed-in person's current owner authority.
   # Account-wide metadata visibility does not grant cross-person mutations.
   def create_invitation(

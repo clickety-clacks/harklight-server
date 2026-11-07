@@ -1,7 +1,7 @@
 defmodule AttentionServer.ConversationFeedTest do
   use ExUnit.Case, async: false
 
-  alias AttentionServer.{Engine, JSON, OriginWire, Relay, Store}
+  alias AttentionServer.{BounceDecision, BouncePolicy, Engine, JSON, OriginWire, Relay, Store}
   alias Exqlite.Sqlite3
 
   @handle "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
@@ -86,6 +86,213 @@ defmodule AttentionServer.ConversationFeedTest do
 
     assert status == 0, "cold-reopen process failed (exit #{status}):\n#{output}"
     assert output =~ "COLD_OVERLAY_REOPEN_AND_USE_OK"
+  end
+
+  test "message_open stores one account-wide revision fact without changing feed or lifecycle cursors",
+       %{
+         path: path
+       } do
+    assert {:ok, relay} = Relay.start_link(store_path: path)
+    assert :ok = Relay.setup_person(relay, "A")
+    assert :ok = Relay.setup_device(relay, "A", "origin")
+    assert :ok = Relay.setup_device(relay, "A", "reader")
+    assert :ok = Relay.setup_sender(relay, "origin", "app:test")
+
+    forward = %{
+      "type" => "forward",
+      "op_id" => op(980),
+      "session_handle" => @handle,
+      "message" => %{
+        "sender_id" => "app:test",
+        "message_id" => "opened-on-any-device",
+        "created_at" => 1,
+        "title" => "Open this message"
+      }
+    }
+
+    assert %{"type" => "ok", "seq" => 1} = request(relay, "origin", forward)
+    lifecycle_before = Relay.events(relay, "reader", 0)
+    origin_before = Relay.origin_feed(relay, "origin", 0)
+    conversation_before = Relay.conversation_events(relay, "reader", 0)
+    state_before = :sys.get_state(relay).store.engine
+
+    open_op_id = op(981)
+
+    opened = %{
+      "type" => "message_open",
+      "op_id" => open_op_id,
+      "sender_id" => "app:test",
+      "message_id" => "opened-on-any-device",
+      "request_revision" => 1
+    }
+
+    assert %{
+             "type" => "ok",
+             "op_id" => ^open_op_id,
+             "sender_id" => "app:test",
+             "message_id" => "opened-on-any-device",
+             "request_revision" => 1,
+             "opened" => true
+           } = request(relay, "reader", opened)
+
+    state_after = :sys.get_state(relay).store.engine
+
+    assert state_after.opened_revisions ==
+             MapSet.new([{"A", "app:test", "opened-on-any-device", 1}])
+
+    assert state_after.events == state_before.events
+    assert state_after.conversation_events == state_before.conversation_events
+    assert state_after.origin_feeds == state_before.origin_feeds
+    assert state_after.cursors == state_before.cursors
+    assert Relay.events(relay, "reader", 0) == lifecycle_before
+    assert Relay.origin_feed(relay, "origin", 0) == origin_before
+    assert Relay.conversation_events(relay, "reader", 0) == conversation_before
+
+    assert request(relay, "reader", opened)["type"] == "ok"
+
+    assert %{"type" => "ok", "opened" => true} =
+             request(relay, "origin", %{opened | "op_id" => op(982)})
+
+    assert MapSet.size(:sys.get_state(relay).store.engine.opened_revisions) == 1
+
+    assert %{"type" => "error", "reason" => "invalid_field", "field" => "request_revision"} =
+             request(relay, "reader", %{opened | "op_id" => op(983), "request_revision" => 2})
+
+    GenServer.stop(relay)
+    assert {:ok, restarted} = Relay.start_link(store_path: path)
+
+    assert MapSet.size(:sys.get_state(restarted).store.engine.opened_revisions) == 1
+    assert request(restarted, "reader", opened)["type"] == "ok"
+    assert Relay.events(restarted, "reader", 0) == lifecycle_before
+    assert Relay.origin_feed(restarted, "origin", 0) == origin_before
+    GenServer.stop(restarted)
+  end
+
+  test "due advisory is durable on its original cursor and never advances the ordinary feed", %{
+    path: path
+  } do
+    clock = :atomics.new(1, [])
+    :atomics.put(clock, 1, System.system_time(:millisecond))
+    clock_fn = fn -> :atomics.get(clock, 1) end
+    assert {:ok, relay} = Relay.start_link(store_path: path, clock: clock_fn)
+    assert :ok = Relay.setup_person(relay, "A")
+    assert :ok = Relay.setup_device(relay, "A", "origin")
+    assert :ok = Relay.setup_device(relay, "A", "reader")
+    assert :ok = Relay.setup_sender(relay, "origin", "app:test")
+
+    {:ok, levels} =
+      BouncePolicy.normalize_levels([
+        %{"name" => "Follow up", "lower_bound" => 0, "bounce_after_days" => 1}
+      ])
+
+    state = :sys.get_state(relay)
+
+    {:ok, engine, _config} =
+      BounceDecision.configure_levels(state.store.engine, "A", levels, clock_fn.())
+
+    {:ok, configured_store} =
+      Store.commit(state.store, engine, %{person: "A", actor: "owner", action: "test_levels"})
+
+    :sys.replace_state(relay, &%{&1 | store: configured_store})
+
+    assert %{"type" => "ok", "seq" => 1} =
+             request(relay, "origin", %{
+               "type" => "forward",
+               "op_id" => op(970),
+               "session_handle" => @handle,
+               "message" => %{
+                 "sender_id" => "app:test",
+                 "message_id" => "durable-advisory",
+                 "created_at" => 1,
+                 "title" => "Original request",
+                 "answer_ui" => %{
+                   "schema" => "attention-client.actions/1",
+                   "actions" => [
+                     %{
+                       "id" => "seen",
+                       "label" => "Seen",
+                       "kind" => "value",
+                       "value" => %{"acknowledgment" => "seen"}
+                     }
+                   ]
+                 },
+                 "message_type" => "fyi"
+               }
+             })
+
+    assert {:ok, %{"listening_support" => %{"advisory_v1" => true}}} =
+             Relay.origin_support(relay, "origin", %{
+               "type" => "support",
+               "op_id" => op(971),
+               "session_handle" => @handle,
+               "route" => "claude-code",
+               "cli_version" => "test-only",
+               "unsupported_reason" => nil,
+               "advisory_v1" => true
+             })
+
+    assert :ok = Relay.origin_stream_attach(relay, "origin", @handle, self(), false, true)
+    assert {:ok, ordinary_before} = Relay.origin_feed(relay, "origin", 0)
+    state = :sys.get_state(relay)
+    record = state.store.engine.messages[{"A", "app:test", "durable-advisory"}]
+    due_at = record.accepted_at + 86_400_000
+
+    selected =
+      BounceDecision.record_scores(
+        state.store.engine,
+        "A",
+        [%{"sender_id" => "app:test", "message_id" => "durable-advisory", "score" => 0.9}],
+        record.accepted_at
+      )
+
+    {:ok, selected_store} =
+      Store.commit(state.store, selected, %{
+        person: "system",
+        actor: "bounce_decision",
+        action: "test_score_selection"
+      })
+
+    :sys.replace_state(relay, &%{&1 | store: selected_store})
+    :atomics.put(clock, 1, due_at + 25)
+    generation = :sys.get_state(relay).bounce_deadline_generation
+    send(relay, {:bounce_due, generation})
+    assert_receive {:origin_advisory_changed, @handle, 1}, 2_000
+
+    assert {:ok, first_fetch} = Relay.origin_advisory_feed(relay, "origin", @handle, 0)
+    assert first_fetch["cursor"] == 1
+    assert [advisory] = first_fetch["entries"]
+    assert advisory["delivered"] == false
+    assert advisory["origin_cursor_at_decision"] == ordinary_before["cursor"]
+    assert {:ok, ordinary_after} = Relay.origin_feed(relay, "origin", 0)
+    assert ordinary_after == ordinary_before
+
+    assert :sys.get_state(relay).store.engine.messages[{"A", "app:test", "durable-advisory"}].terminal ==
+             nil
+
+    assert {:ok, first_ack} =
+             Relay.origin_advisory_ack(relay, "origin", @handle, advisory["advisory_id"])
+
+    assert first_ack["delivered"] and not first_ack["already_delivered"]
+    assert {:ok, fetched_after_ack} = Relay.origin_advisory_feed(relay, "origin", @handle, 0)
+    assert hd(fetched_after_ack["entries"])["delivered"]
+    assert {:ok, ordinary_after_ack} = Relay.origin_feed(relay, "origin", 0)
+    assert ordinary_after_ack == ordinary_before
+
+    GenServer.stop(relay)
+    assert {:ok, restarted} = Relay.start_link(store_path: path, clock: clock_fn)
+
+    assert {:ok, replayed} = Relay.origin_advisory_feed(restarted, "origin", @handle, 0)
+    assert replayed["cursor"] == 1
+    assert hd(replayed["entries"])["advisory_id"] == advisory["advisory_id"]
+    assert hd(replayed["entries"])["delivered"]
+    assert {:ok, ordinary_after_restart} = Relay.origin_feed(restarted, "origin", 0)
+    assert ordinary_after_restart == ordinary_before
+
+    assert {:ok, duplicate_ack} =
+             Relay.origin_advisory_ack(restarted, "origin", @handle, advisory["advisory_id"])
+
+    assert duplicate_ack["delivered"] and duplicate_ack["already_delivered"]
+    GenServer.stop(restarted)
   end
 
   test "authorized agent answer keeps its author through terminal replay and restart", %{

@@ -1,7 +1,7 @@
 defmodule AttentionServer.DashboardReadHTTPTest do
   use ExUnit.Case, async: true
 
-  alias AttentionServer.DashboardReadHTTP
+  alias AttentionServer.{DashboardReadHTTP, JSON}
 
   defmodule Backend do
     def resolve_session("member-session"), do: {:ok, %{person_id: "mike"}}
@@ -45,6 +45,11 @@ defmodule AttentionServer.DashboardReadHTTPTest do
 
     def save_prioritization({%{person_id: "mike"}, "jev-set", "", ""}),
       do: {:ok, %{}}
+
+    def levels(%{person_id: "mike"}), do: {:ok, %{"levels" => []}}
+
+    def save_levels({%{person_id: "mike"}, rows}),
+      do: {:ok, %{"levels" => rows}}
   end
 
   setup do
@@ -90,12 +95,39 @@ defmodule AttentionServer.DashboardReadHTTPTest do
   end
 
   test "device records are unavailable before sign-in", %{opts: opts} do
-    for path <- ["/devices", "/components", "/agent-skills"] do
+    for path <- ["/devices", "/components", "/agent-skills", "/levels"] do
       response = path |> secure_get() |> DashboardReadHTTP.call(opts)
       assert response.status == 401
       refute response.resp_body =~ "Mike's iPad"
       assert Plug.Conn.get_resp_header(response, "cache-control") == ["no-store"]
     end
+  end
+
+  test "levels JSON endpoints require the owner session and submit a complete table", %{
+    opts: opts
+  } do
+    get = "/levels" |> secure_get("member-session") |> DashboardReadHTTP.call(opts)
+    assert get.status == 200
+    assert Plug.Conn.get_resp_header(get, "content-type") == ["application/json; charset=utf-8"]
+    assert {:ok, %{"levels" => []}} = JSON.decode_line(get.resp_body <> "\n")
+
+    rows = [
+      %{"name" => "Routine", "lower_bound" => 0, "bounce_after_days" => nil},
+      %{"name" => "Follow up", "lower_bound" => 0.6, "bounce_after_days" => 1.5}
+    ]
+
+    response = json_post("/levels", %{"levels" => rows}, "member-session")
+    response = DashboardReadHTTP.call(response, opts)
+    assert response.status == 200
+    assert {:ok, %{"levels" => returned}} = JSON.decode_line(response.resp_body <> "\n")
+
+    assert Enum.map(returned, & &1["name"]) == ["Routine", "Follow up"]
+    assert Enum.at(returned, 0)["bounce_after_days"] == nil
+    assert Enum.at(returned, 1)["bounce_after_days"] == %JSON.DecimalToken{raw: "1.5"}
+
+    invalid = json_post("/levels", %{"level" => rows}, "member-session")
+    invalid = DashboardReadHTTP.call(invalid, opts)
+    assert invalid.status == 400
   end
 
   test "all three guidance files are served without a dashboard session", %{opts: opts} do
@@ -337,5 +369,14 @@ defmodule AttentionServer.DashboardReadHTTPTest do
     else
       conn
     end
+  end
+
+  defp json_post(path, body, session) do
+    conn = %{Plug.Test.conn(:post, path, JSON.encode!(body)) | scheme: :https, port: 443}
+
+    conn
+    |> Plug.Conn.put_req_header("cookie", "__Host-harklight=#{session}")
+    |> Plug.Conn.put_req_header("origin", "https://www.example.com")
+    |> Plug.Conn.put_req_header("content-type", "application/json")
   end
 end

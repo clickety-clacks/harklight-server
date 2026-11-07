@@ -2,6 +2,8 @@ defmodule AttentionServer.PrioritizationTest do
   use ExUnit.Case, async: false
 
   alias AttentionServer.{
+    BounceDecision,
+    BouncePolicy,
     DashboardView,
     DeviceIdentity,
     Engine,
@@ -430,7 +432,7 @@ defmodule AttentionServer.PrioritizationTest do
     assert {:ok, ^selected} = Engine.set_algorithm_choice(selected, "person-a", "jev-set")
   end
 
-  test "format 22 migrates with baseline defaults and persists as format 25", %{path: path} do
+  test "format 22 migrates with baseline defaults and persists as format 26", %{path: path} do
     assert {:ok, initial} = Store.open(path)
     assert {:ok, engine} = Engine.setup_person(initial.engine, "person-a")
     assert :ok = Store.close(initial)
@@ -441,6 +443,10 @@ defmodule AttentionServer.PrioritizationTest do
       |> Map.delete(:jev_endpoint)
       |> Map.delete(:jev_model)
       |> Map.delete(:open_default_index)
+      |> Map.delete(:bounce_levels)
+      |> Map.delete(:bounce_revisions)
+      |> Map.delete(:opened_revisions)
+      |> Map.delete(:advisory_feeds)
 
     payload = :erlang.term_to_binary({:attention_relay_state, 22, old_engine}, [{:compressed, 6}])
     assert {:ok, db} = Sqlite3.open(path)
@@ -455,6 +461,10 @@ defmodule AttentionServer.PrioritizationTest do
     assert migrated.engine.jev_endpoint == nil
     assert migrated.engine.jev_model == nil
     assert Placement.choice(migrated.engine, "person-a") == "baseline"
+    assert migrated.engine.bounce_levels == %{}
+    assert migrated.engine.bounce_revisions == %{}
+    assert migrated.engine.opened_revisions == MapSet.new()
+    assert migrated.engine.advisory_feeds == %{}
     assert :ok = Store.close(migrated)
 
     assert {:ok, db} = Sqlite3.open(path)
@@ -463,7 +473,7 @@ defmodule AttentionServer.PrioritizationTest do
     assert :ok = Sqlite3.release(db, select)
     assert :ok = Sqlite3.close(db)
 
-    assert {:attention_relay_state, 25, saved_engine} =
+    assert {:attention_relay_state, 26, saved_engine} =
              :erlang.binary_to_term(saved_payload, [:safe])
 
     refute Map.has_key?(saved_engine, :open_default_index)
@@ -1540,6 +1550,120 @@ defmodule AttentionServer.PrioritizationTest do
     complete_synthetic_priority_pass(job, {:ok, %{{"app:test", "scored"} => 0.8}})
     :sys.get_state(state.applied_score_record)
     assert length(String.split(File.read!(record_path), "\n", trim: true)) == 2
+  end
+
+  test "the applied score commit fixes its bounce interval before publishing the scored view", %{
+    dir: dir,
+    path: path
+  } do
+    use_synthetic_jev_key(dir)
+    relay = start_relay(path, priority_evaluator: fn _ -> {:error, :unavailable} end)
+    setup_person(relay)
+
+    levels = [
+      %{"name" => "Routine", "lower_bound" => 0, "bounce_after_days" => nil},
+      %{"name" => "Follow up", "lower_bound" => 0.5, "bounce_after_days" => 1.5},
+      %{"name" => "Urgent", "lower_bound" => 0.8, "bounce_after_days" => 4}
+    ]
+
+    {:ok, normalized} = BouncePolicy.normalize_levels(levels)
+    state = :sys.get_state(relay)
+
+    {:ok, engine, _config} =
+      BounceDecision.configure_levels(
+        state.store.engine,
+        "person-a",
+        normalized,
+        state.clock.()
+      )
+
+    {:ok, store} =
+      Store.commit(state.store, engine, %{
+        person: "person-a",
+        actor: "owner",
+        action: "test_levels"
+      })
+
+    :sys.replace_state(relay, &%{&1 | store: store})
+
+    assert %{"type" => "ok", "seq" => 1} =
+             request(relay, "device-a", %{
+               "type" => "forward",
+               "op_id" => op(915),
+               "session_handle" => "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+               "message" => %{
+                 "sender_id" => "app:test",
+                 "message_id" => "fixed-bounce-selection",
+                 "created_at" => 1,
+                 "title" => "Scored request",
+                 "answer_ui" => %{
+                   "schema" => "attention-client.actions/1",
+                   "actions" => [
+                     %{
+                       "id" => "seen",
+                       "label" => "Seen",
+                       "kind" => "value",
+                       "value" => %{"acknowledgment" => "seen"}
+                     }
+                   ]
+                 },
+                 "message_type" => "fyi"
+               }
+             })
+
+    configure_jev_choice(relay)
+    first = start_synthetic_priority_pass(relay)
+
+    complete_synthetic_priority_pass(
+      first,
+      {:ok, %{{"app:test", "fixed-bounce-selection"} => 0.7}}
+    )
+
+    state = await_state(relay, &(&1.priority_views["person-a"].basis == "selected"))
+    record = state.store.engine.messages[{"person-a", "app:test", "fixed-bounce-selection"}]
+
+    bounce_state =
+      Map.fetch!(state.store.engine.bounce_revisions, {
+        "person-a",
+        "app:test",
+        "fixed-bounce-selection"
+      })
+
+    selection = bounce_state.revisions[1].selection
+
+    assert hd(state.priority_views["person-a"].entries)["score"] == 0.7
+    assert selection["level_name"] == "Follow up"
+    assert selection["bounce_after_days"] == 1.5
+    assert selection["due_at_ms"] == record.accepted_at + 129_600_000
+
+    second = start_synthetic_priority_pass(relay)
+
+    complete_synthetic_priority_pass(
+      second,
+      {:ok, %{{"app:test", "fixed-bounce-selection"} => 0.9}}
+    )
+
+    persisted = :sys.get_state(relay).store.engine
+
+    persisted_bounce =
+      Map.fetch!(persisted.bounce_revisions, {
+        "person-a",
+        "app:test",
+        "fixed-bounce-selection"
+      })
+
+    assert persisted_bounce.revisions[1].selection == selection
+
+    GenServer.stop(relay)
+    restarted = start_relay(path, priority_evaluator: fn _ -> {:error, :unavailable} end)
+
+    restarted_bounce =
+      Map.fetch!(
+        :sys.get_state(restarted).store.engine.bounce_revisions,
+        {"person-a", "app:test", "fixed-bounce-selection"}
+      )
+
+    assert restarted_bounce.revisions[1].selection == selection
   end
 
   test "later arrivals and cache-only passes do not re-record unchanged scores", %{
