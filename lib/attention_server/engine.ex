@@ -4391,7 +4391,7 @@ defmodule AttentionServer.Engine do
     case Map.get(engine.messages, key) do
       %{session_handle: handle, origin: origin} = record
       when is_binary(handle) and actor != origin ->
-        if Conversation.chat_open?(record) do
+        if Conversation.new_chat_open?(record) do
           if frame["request_revision"] <= record.revision do
             {next, seq} = next_conversation_seq(engine, person)
 
@@ -4423,7 +4423,12 @@ defmodule AttentionServer.Engine do
             failure("invalid_field", "request_revision")
           end
         else
-          failure("closed")
+          if match?(%{terminal: %{state: "answered"}}, record) and
+               frame["request_revision"] > record.revision do
+            failure("invalid_field", "request_revision")
+          else
+            failure("closed")
+          end
         end
 
       %{terminal: terminal} when not is_nil(terminal) ->
@@ -4468,7 +4473,7 @@ defmodule AttentionServer.Engine do
         failure("not_origin")
 
       %{origin: ^actor, session_handle: handle} = record when is_binary(handle) ->
-        if Conversation.chat_open?(record) do
+        if Conversation.new_chat_open?(record) do
           with {:ok, %{"kind" => "discussion", "request_revision" => revision} = acted_turn} <-
                  Conversation.person_entry(engine, person, actor, frame["in_reply_to"], key),
                true <- revision == frame["request_revision"],
@@ -4519,7 +4524,23 @@ defmodule AttentionServer.Engine do
             _ -> failure("not_found")
           end
         else
-          failure("closed")
+          case record do
+            %{terminal: %{state: "answered"}} ->
+              with {:ok, %{"kind" => "discussion", "request_revision" => revision}} <-
+                     Conversation.person_entry(engine, person, actor, frame["in_reply_to"], key),
+                   true <- revision == frame["request_revision"] do
+                case Conversation.act(engine, person, actor, frame["in_reply_to"], frame["op_id"]) do
+                  {:ok, _unchanged_after_refusal} -> failure("closed")
+                  {:error, :already_acted} -> failure("already_acted")
+                end
+              else
+                false -> failure("stale_revision")
+                _ -> failure("not_found")
+              end
+
+            _ ->
+              failure("closed")
+          end
         end
 
       %{origin: ^actor, terminal: terminal} when not is_nil(terminal) ->

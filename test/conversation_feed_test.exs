@@ -1,7 +1,7 @@
 defmodule AttentionServer.ConversationFeedTest do
   use ExUnit.Case, async: false
 
-  alias AttentionServer.{Engine, JSON, Relay, Store}
+  alias AttentionServer.{Engine, JSON, OriginWire, Relay, Store}
   alias Exqlite.Sqlite3
 
   @handle "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
@@ -1193,7 +1193,7 @@ defmodule AttentionServer.ConversationFeedTest do
     GenServer.stop(relay)
   end
 
-  test "one origin stream labels reply and chat while chat remains open after answer and no-comment",
+  test "answered requests keep chat availability but refuse new chat from either side",
        %{path: path} do
     assert {:ok, relay} = Relay.start_link(store_path: path)
     assert :ok = Relay.setup_person(relay, "A")
@@ -1219,94 +1219,250 @@ defmodule AttentionServer.ConversationFeedTest do
                })
     end
 
+    prior_discussions =
+      for {message_id, operation, text} <- [
+            {"answered-chat", 810, "Before the answer"},
+            {"no-comment-chat", 811, "Before No comment"}
+          ],
+          into: %{} do
+        frame = %{
+          "type" => "discussion",
+          "op_id" => op(operation),
+          "sender_id" => "app:test",
+          "message_id" => message_id,
+          "request_revision" => 1,
+          "text" => text
+        }
+
+        assert %{"type" => "ok"} = discussion = request(relay, "reader", frame)
+
+        reply_frame = %{
+          "v" => 1,
+          "type" => "reply",
+          "op_id" => op(operation + 1),
+          "sender_id" => "app:test",
+          "message_id" => message_id,
+          "request_revision" => 1,
+          "in_reply_to" => discussion["event_id"],
+          "text" => "Already sent before answer",
+          "ref" => "existing-reply-#{message_id}"
+        }
+
+        assert %{"type" => "ok"} = reply = OriginWire.command(relay, "origin", reply_frame)
+
+        pending_frame = %{
+          frame
+          | "op_id" => op(operation + 2),
+            "text" => "Pending before answer"
+        }
+
+        assert %{"type" => "ok"} = pending = request(relay, "reader", pending_frame)
+
+        {message_id,
+         %{
+           frame: frame,
+           event: discussion,
+           reply_frame: reply_frame,
+           reply: reply,
+           pending: pending
+         }}
+      end
+
     assert :ok = Relay.origin_stream_attach(relay, "origin", @handle, self())
 
-    assert %{"type" => "ok", "seq" => 3} =
-             request(relay, "reader", %{
-               "type" => "answer",
-               "op_id" => op(803),
-               "sender_id" => "app:test",
-               "message_id" => "answered-chat",
-               "request_revision" => 1,
-               "answer" => "Yes"
-             })
+    answer =
+      request(relay, "reader", %{
+        "type" => "answer",
+        "op_id" => op(803),
+        "sender_id" => "app:test",
+        "message_id" => "answered-chat",
+        "request_revision" => 1,
+        "answer" => "Yes"
+      })
 
-    assert_receive {:origin_state_changed, 3}
+    assert answer["type"] == "ok"
 
-    assert %{"type" => "ok", "seq" => 4, "terminal_kind" => "no_comment"} =
-             no_comment_request(relay, "reader", %{
-               "type" => "answer_no_comment",
-               "request_id" => "no-comment-chat",
-               "request_revision" => 1
-             })
+    assert_receive {:origin_state_changed, answer_seq}
+    assert is_integer(answer_seq)
 
-    assert_receive {:origin_state_changed, 4}
+    no_comment =
+      no_comment_request(relay, "reader", %{
+        "type" => "answer_no_comment",
+        "request_id" => "no-comment-chat",
+        "request_revision" => 1
+      })
+
+    assert no_comment["type"] == "ok"
+    assert no_comment["terminal_kind"] == "no_comment"
+
+    assert_receive {:origin_state_changed, no_comment_seq}
+    assert no_comment_seq > answer_seq
 
     assert {:ok, status} = Relay.origin_status(relay, "origin", @handle)
     assert status["open_requests"] == 0
     assert status["open_chats"] == 2
 
-    assert %{"type" => "ok", "event_id" => "5"} =
+    feed_before_refusals = Relay.origin_feed(relay, "origin", 0)
+
+    assert %{
+             "v" => 1,
+             "type" => "error",
+             "reason" => "closed",
+             "ref" => "person-answer-ref"
+           } =
              request(relay, "reader", %{
                "type" => "discussion",
                "op_id" => op(804),
+               "ref" => "person-answer-ref",
                "sender_id" => "app:test",
                "message_id" => "answered-chat",
                "request_revision" => 1,
                "text" => "Can we discuss that answer?"
              })
 
-    assert_receive {:origin_state_changed, 5}
-
-    assert %{"type" => "ok", "event_id" => "6"} =
-             request(relay, "origin", %{
-               "type" => "conversation_reply",
+    assert %{
+             "v" => 1,
+             "type" => "error",
+             "reason" => "closed",
+             "ref" => "agent-answer-ref"
+           } =
+             OriginWire.command(relay, "origin", %{
+               "v" => 1,
+               "type" => "reply",
                "op_id" => op(805),
+               "ref" => "agent-answer-ref",
                "sender_id" => "app:test",
                "message_id" => "answered-chat",
                "request_revision" => 1,
-               "in_reply_to" => 5,
+               "in_reply_to" => prior_discussions["answered-chat"].pending["event_id"],
                "text" => "Yes, here is more detail."
              })
 
-    assert_receive {:origin_state_changed, 6}
-
-    assert %{"type" => "ok", "event_id" => "7"} =
+    assert %{
+             "v" => 1,
+             "type" => "error",
+             "reason" => "closed",
+             "ref" => "person-no-comment-ref"
+           } =
              request(relay, "reader", %{
                "type" => "discussion",
                "op_id" => op(806),
+               "ref" => "person-no-comment-ref",
                "sender_id" => "app:test",
                "message_id" => "no-comment-chat",
                "request_revision" => 1,
                "text" => "Can I explain why I chose no comment?"
              })
 
-    assert_receive {:origin_state_changed, 7}
-
-    assert %{"type" => "ok", "event_id" => "8"} =
-             request(relay, "origin", %{
-               "type" => "conversation_reply",
+    assert %{
+             "v" => 1,
+             "type" => "error",
+             "reason" => "closed",
+             "ref" => "agent-no-comment-ref"
+           } =
+             OriginWire.command(relay, "origin", %{
+               "v" => 1,
+               "type" => "reply",
                "op_id" => op(807),
+               "ref" => "agent-no-comment-ref",
                "sender_id" => "app:test",
                "message_id" => "no-comment-chat",
                "request_revision" => 1,
-               "in_reply_to" => 7,
+               "in_reply_to" => prior_discussions["no-comment-chat"].pending["event_id"],
                "text" => "Of course; what would you like to explain?"
              })
 
-    assert_receive {:origin_state_changed, 8}
+    assert %{
+             "v" => 1,
+             "type" => "error",
+             "reason" => "invalid_field",
+             "field" => "request_revision",
+             "ref" => "stale-revision-ref"
+           } =
+             request(relay, "reader", %{
+               "type" => "discussion",
+               "op_id" => op(816),
+               "ref" => "stale-revision-ref",
+               "sender_id" => "app:test",
+               "message_id" => "answered-chat",
+               "request_revision" => 2,
+               "text" => "This revision is invalid"
+             })
 
-    assert {:ok, %{"cursor" => 8, "entries" => entries}} = Relay.origin_feed(relay, "origin", 0)
+    assert %{
+             "v" => 1,
+             "type" => "error",
+             "reason" => "not_found",
+             "ref" => "missing-discussion-ref"
+           } =
+             OriginWire.command(relay, "origin", %{
+               "v" => 1,
+               "type" => "reply",
+               "op_id" => op(817),
+               "ref" => "missing-discussion-ref",
+               "sender_id" => "app:test",
+               "message_id" => "no-comment-chat",
+               "request_revision" => 1,
+               "in_reply_to" => "9999",
+               "text" => "This discussion does not exist"
+             })
+
+    assert Relay.origin_feed(relay, "origin", 0) == feed_before_refusals
+
+    for {_message_id, %{reply_frame: frame, reply: reply}} <- prior_discussions do
+      assert %{"type" => "ok", "duplicate" => true, "event_id" => event_id} =
+               OriginWire.command(relay, "origin", frame)
+
+      assert event_id == reply["event_id"]
+    end
+
+    assert Relay.origin_feed(relay, "origin", 0) == feed_before_refusals
+
+    {:ok, %{"entries" => answered_feed}} = feed_before_refusals
+
+    for {message_id, operation} <- [{"answered-chat", 830}, {"no-comment-chat", 831}] do
+      terminal_entry =
+        Enum.find(answered_feed, fn entry ->
+          entry["kind"] == "terminal" and entry["message_id"] == message_id
+        end)
+
+      assert terminal_entry
+
+      assert %{
+               "v" => 1,
+               "type" => "ok",
+               "status" => "received",
+               "ref" => ref
+             } =
+               OriginWire.command(relay, "origin", %{
+                 "v" => 1,
+                 "type" => "result",
+                 "op_id" => op(operation),
+                 "ref" => "result-#{message_id}",
+                 "sender_id" => "app:test",
+                 "message_id" => message_id,
+                 "in_reply_to" => terminal_entry["event_id"],
+                 "status" => "received"
+               })
+
+      assert ref == "result-#{message_id}"
+    end
+
+    assert {:ok, %{"entries" => entries}} = Relay.origin_feed(relay, "origin", 0)
 
     assert Enum.map(entries, & &1["channel"]) == [
              "reply",
              "reply",
+             "chat",
+             "chat",
+             "chat",
+             "chat",
+             "chat",
+             "chat",
              "reply",
              "reply",
-             "chat",
-             "chat",
-             "chat",
-             "chat"
+             "reply",
+             "reply"
            ]
 
     reply_entries = Enum.filter(entries, &(&1["channel"] == "reply"))
@@ -1315,7 +1471,9 @@ defmodule AttentionServer.ConversationFeedTest do
              "revision",
              "revision",
              "terminal",
-             "terminal"
+             "terminal",
+             "result",
+             "result"
            ]
 
     terminal_entries = Enum.filter(reply_entries, &(&1["kind"] == "terminal"))
@@ -1339,17 +1497,125 @@ defmodule AttentionServer.ConversationFeedTest do
     assert Enum.all?(chat_entries, &(&1["kind"] in ["discussion", "reply"]))
 
     assert Enum.map(Enum.filter(chat_entries, &(&1["kind"] == "discussion")), & &1["text"]) == [
-             "Can we discuss that answer?",
-             "Can I explain why I chose no comment?"
+             "Before the answer",
+             "Pending before answer",
+             "Before No comment",
+             "Pending before answer"
            ]
 
     assert Enum.map(Enum.filter(chat_entries, &(&1["kind"] == "reply")), & &1["text"]) == [
-             "Yes, here is more detail.",
-             "Of course; what would you like to explain?"
+             "Already sent before answer",
+             "Already sent before answer"
            ]
 
     assert {:ok, conversation_events, _high} = Relay.conversation_events(relay, "reader", 0)
     refute Enum.any?(conversation_events, &Map.has_key?(&1, "answer"))
+
+    for {_message_id, %{frame: frame, event: event}} <- prior_discussions do
+      assert event["type"] == "ok"
+
+      assert %{"type" => "ok", "duplicate" => true, "event_id" => event_id} =
+               request(relay, "reader", frame)
+
+      assert event_id == event["event_id"]
+
+      assert Enum.any?(conversation_events, fn entry ->
+               entry["event_id"] == event_id and entry["text"] == frame["text"]
+             end)
+    end
+
+    for {_message_id, %{reply: reply, reply_frame: frame}} <- prior_discussions do
+      assert Enum.any?(conversation_events, fn entry ->
+               entry["event_id"] == reply["event_id"] and entry["text"] == frame["text"]
+             end)
+    end
+
+    GenServer.stop(relay)
+  end
+
+  test "answer closes only its request while an unanswered sibling stays chat-ready", %{
+    path: path
+  } do
+    assert {:ok, relay} = Relay.start_link(store_path: path)
+    assert :ok = Relay.setup_person(relay, "A")
+    assert :ok = Relay.setup_device(relay, "A", "origin")
+    assert :ok = Relay.setup_device(relay, "A", "reader")
+    assert :ok = Relay.setup_sender(relay, "origin", "app:test")
+
+    for {message_id, operation} <- [{"answered", 840}, {"sibling", 841}] do
+      assert %{"type" => "ok"} =
+               request(relay, "origin", %{
+                 "type" => "forward",
+                 "op_id" => op(operation),
+                 "session_handle" => @handle,
+                 "message" => %{
+                   "sender_id" => "app:test",
+                   "message_id" => message_id,
+                   "created_at" => operation,
+                   "title" => "Request #{message_id}"
+                 }
+               })
+    end
+
+    assert %{"type" => "ok"} =
+             request(relay, "reader", %{
+               "type" => "answer",
+               "op_id" => op(842),
+               "sender_id" => "app:test",
+               "message_id" => "answered",
+               "request_revision" => 1,
+               "answer" => "Done"
+             })
+
+    sibling_discussion_frame = %{
+      "type" => "discussion",
+      "op_id" => op(843),
+      "sender_id" => "app:test",
+      "message_id" => "sibling",
+      "request_revision" => 1,
+      "text" => "This sibling is still open"
+    }
+
+    assert %{"type" => "ok"} =
+             sibling_discussion =
+             request(relay, "reader", sibling_discussion_frame)
+
+    assert %{"type" => "ok", "ref" => "sibling-reply-ref"} =
+             OriginWire.command(relay, "origin", %{
+               "v" => 1,
+               "type" => "reply",
+               "op_id" => op(844),
+               "ref" => "sibling-reply-ref",
+               "sender_id" => "app:test",
+               "message_id" => "sibling",
+               "request_revision" => 1,
+               "in_reply_to" => sibling_discussion["event_id"],
+               "text" => "The sibling reply is still open"
+             })
+
+    assert %{
+             "v" => 1,
+             "type" => "error",
+             "reason" => "closed",
+             "ref" => "answered-ref"
+           } =
+             request(relay, "reader", %{
+               "type" => "discussion",
+               "op_id" => op(845),
+               "ref" => "answered-ref",
+               "sender_id" => "app:test",
+               "message_id" => "answered",
+               "request_revision" => 1,
+               "text" => "This request is answered"
+             })
+
+    assert {:ok, status} = Relay.origin_status(relay, "origin", @handle)
+    assert status["open_requests"] == 1
+    assert status["open_chats"] == 2
+
+    assert {:ok, history, _high} = Relay.conversation_events(relay, "reader", 0)
+    assert Enum.any?(history, &(&1["text"] == "This sibling is still open"))
+    assert Enum.any?(history, &(&1["text"] == "The sibling reply is still open"))
 
     GenServer.stop(relay)
   end
