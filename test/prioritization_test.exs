@@ -165,7 +165,7 @@ defmodule AttentionServer.PrioritizationTest do
     assert :ok = Relay.setup_sender(relay, "device-a", "app:test")
   end
 
-  defp persisted_overlay_snapshot(path) do
+  defp persisted_snapshot(path) do
     assert {:ok, db} = Sqlite3.open(path)
 
     assert {:ok, state_stmt} =
@@ -177,13 +177,8 @@ defmodule AttentionServer.PrioritizationTest do
     assert {:row, [version, payload, checksum]} = Sqlite3.step(db, state_stmt)
     assert :ok = Sqlite3.release(db, state_stmt)
 
-    assert {:ok, overlay_stmt} =
-             Sqlite3.prepare(db, "SELECT count(*) FROM relay_state_overlay_events")
-
-    assert {:row, [overlay_count]} = Sqlite3.step(db, overlay_stmt)
-    assert :ok = Sqlite3.release(db, overlay_stmt)
     assert :ok = Sqlite3.close(db)
-    {version, payload, checksum, overlay_count}
+    {version, payload, checksum}
   end
 
   defp forward(relay, n, id, deadline \\ nil, body \\ nil) do
@@ -2264,7 +2259,7 @@ defmodule AttentionServer.PrioritizationTest do
     end
   end
 
-  test "reply-history commits fold and preserve sparse support overlays", %{dir: dir, path: path} do
+  test "reply-history commits preserve support receipts across restart", %{dir: dir, path: path} do
     use_synthetic_jev_key(dir)
 
     relay =
@@ -2274,8 +2269,8 @@ defmodule AttentionServer.PrioritizationTest do
     {:ok, session} = Relay.open_session(relay, "device-b")
     assert view_for(relay, session)["list_items"] == []
 
-    forward_chat(relay, "overlay-history", 2700)
-    reply_seq = add_reply(relay, "overlay-history", 2702)
+    forward_chat(relay, "reply-history", 2700)
+    reply_seq = add_reply(relay, "reply-history", 2702)
     configure_jev_choice(relay)
 
     support = %{
@@ -2292,16 +2287,14 @@ defmodule AttentionServer.PrioritizationTest do
 
     assert :ok = Relay.origin_stream_attach(relay, "device-a", op(2701), self())
 
-    {overlay_version, overlay_payload, overlay_checksum, 2} =
-      persisted_overlay_snapshot(path)
-
-    assert :crypto.hash(:sha256, overlay_payload) != overlay_checksum
+    {support_version, support_payload, support_checksum} = persisted_snapshot(path)
+    assert :crypto.hash(:sha256, support_payload) == support_checksum
 
     job = start_synthetic_priority_pass(relay)
 
     complete_synthetic_priority_pass(
       job,
-      {:ok, %{{"app:test", "overlay-history", reply_seq} => 0.9}}
+      {:ok, %{{"app:test", "reply-history", reply_seq} => 0.9}}
     )
 
     [active] =
@@ -2311,14 +2304,13 @@ defmodule AttentionServer.PrioritizationTest do
     assert active["score"] == %JSON.DecimalToken{raw: "0.9"}
     assert active["score_kind"] == "current"
 
-    {folded_version, folded_payload, folded_checksum, 0} =
-      persisted_overlay_snapshot(path)
+    {reply_version, reply_payload, reply_checksum} = persisted_snapshot(path)
 
-    assert folded_version == overlay_version + 1
-    assert folded_payload != overlay_payload
-    assert :crypto.hash(:sha256, folded_payload) == folded_checksum
+    assert reply_version == support_version + 1
+    assert reply_payload != support_payload
+    assert :crypto.hash(:sha256, reply_payload) == reply_checksum
 
-    read_reply(relay, "overlay-history", reply_seq, 2712)
+    read_reply(relay, "reply-history", reply_seq, 2712)
 
     [historical] =
       view_for(relay, session)["list_items"]
@@ -2341,14 +2333,14 @@ defmodule AttentionServer.PrioritizationTest do
     assert Enum.any?(feed, &(&1["listening_support"] == declared))
     assert Enum.any?(feed, &(&1["availability"] == "listening"))
 
-    duplicate_state = persisted_overlay_snapshot(path)
+    duplicate_state = persisted_snapshot(path)
 
     assert {:ok, %{"duplicate" => true, "listening_support" => ^declared}} =
              Relay.origin_support(restarted, "device-a", support)
 
-    assert persisted_overlay_snapshot(path) == duplicate_state
+    assert persisted_snapshot(path) == duplicate_state
 
-    next_reply_seq = add_reply(restarted, "overlay-history", 2714)
+    next_reply_seq = add_reply(restarted, "reply-history", 2714)
 
     [reactivated] =
       view_for(restarted, resumed_session)["list_items"]
@@ -2360,7 +2352,7 @@ defmodule AttentionServer.PrioritizationTest do
     refute Map.has_key?(reactivated, "score_kind")
 
     assert :sys.get_state(restarted).store.engine.reply_group_history[
-             {"person-a", "app:test", "overlay-history"}
+             {"person-a", "app:test", "reply-history"}
            ].score == 0.9
   end
 
