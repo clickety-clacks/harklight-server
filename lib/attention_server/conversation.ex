@@ -12,7 +12,7 @@ defmodule AttentionServer.Conversation do
          (is_binary(vendor_id) and vendor_id != "" and String.valid?(vendor_id)))
   end
 
-  @support_fields ~w(route cli_version unsupported_reason ack2 advisory_v1)
+  @support_fields ~w(route cli_version unsupported_reason ack2 advisory_v1 origin_listener)
 
   def support_from_frame(frame) do
     if Enum.any?(@support_fields, &Map.has_key?(frame, &1)) do
@@ -24,7 +24,9 @@ defmodule AttentionServer.Conversation do
            String.valid?(version) and Map.has_key?(frame, "unsupported_reason") and
            (is_nil(reason) or (is_binary(reason) and reason != "" and String.valid?(reason))) and
            (not Map.has_key?(frame, "ack2") or is_boolean(frame["ack2"])) and
-           (not Map.has_key?(frame, "advisory_v1") or is_boolean(frame["advisory_v1"])) do
+           (not Map.has_key?(frame, "advisory_v1") or is_boolean(frame["advisory_v1"])) and
+           (not Map.has_key?(frame, "origin_listener") or is_boolean(frame["origin_listener"])) and
+           (frame["origin_listener"] != true or route == "other") do
         {:ok, Map.take(frame, @support_fields)}
       else
         {:error, "listening_support"}
@@ -74,7 +76,7 @@ defmodule AttentionServer.Conversation do
 
   def valid_support_record?(%{"origin" => origin, "reported_at" => at} = record) do
     is_binary(origin) and origin != "" and is_integer(at) and at > 0 and
-      Map.keys(Map.drop(record, ["ack2", "advisory_v1"])) |> Enum.sort() ==
+      Map.keys(Map.drop(record, ["ack2", "advisory_v1", "origin_listener"])) |> Enum.sort() ==
         ~w(cli_version origin reported_at route unsupported_reason) and
       match?({:ok, _}, support_from_frame(record))
   end

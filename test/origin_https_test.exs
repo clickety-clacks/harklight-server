@@ -1200,6 +1200,83 @@ defmodule AttentionServer.OriginHTTPSTest do
              request(c, "a2", %{"v" => 1, "type" => "feed", "since" => 1})
   end
 
+  test "origin stream covers explicitly declared handles and replaces independently", c do
+    {:ok, stream} = socket(c, "a2")
+
+    :ok =
+      :ssl.send(
+        stream,
+        "GET /origin/v1/stream?scope=origin&reconnect=1 HTTP/1.1\r\nHost: relay.test\r\n\r\n"
+      )
+
+    assert {:ok, initial} = recv_until(stream, "data: {\"cursor\":0}\n\n", <<>>, 20)
+    assert initial =~ "event: change"
+
+    assert {:ok, 200, %{"session_handles" => []}} =
+             request(c, "a2", %{"v" => 1, "type" => "coverage"})
+
+    assert {:ok, 200, %{"type" => "ok", "listening_support" => %{"origin_listener" => true}}} =
+             request(c, "a2", %{
+               "v" => 1,
+               "type" => "send",
+               "op_id" => op(910),
+               "session_handle" => @handle,
+               "route" => "other",
+               "cli_version" => "test",
+               "unsupported_reason" => nil,
+               "origin_listener" => true,
+               "message" => %{
+                 "sender_id" => "app:test",
+                 "message_id" => "aggregate",
+                 "created_at" => 1,
+                 "title" => "Question"
+               }
+             })
+
+    assert {:ok, notice} = recv_until(stream, "data: {\"cursor\":1}\n\n", <<>>, 20)
+    assert notice =~ "event: coverage\ndata: {}"
+    refute notice =~ @handle
+
+    assert {:ok, 200, %{"session_handles" => [@handle]}} =
+             request(c, "a2", %{"v" => 1, "type" => "coverage"})
+
+    assert {:ok, 200, %{"session_handles" => []}} =
+             request(c, "b2", %{"v" => 1, "type" => "coverage"})
+
+    assert {:ok, 200, %{"availability" => "listening"}} =
+             request(c, "a2", %{"v" => 1, "type" => "status", "session_handle" => @handle})
+
+    # Whole-record replacement withdraws coverage without adding a feed entry.
+    assert {:ok, 200, %{"type" => "ok"}} =
+             request(c, "a2", %{
+               "v" => 1,
+               "type" => "support",
+               "op_id" => op(911),
+               "session_handle" => @handle,
+               "route" => "other",
+               "cli_version" => "test",
+               "unsupported_reason" => nil
+             })
+
+    assert {:ok, "event: coverage\ndata: {}\n\n"} = recv_until(stream, "\n\n", <<>>, 20)
+
+    assert {:ok, 200, %{"availability" => "not_listening", "cursor" => 1}} =
+             request(c, "a2", %{"v" => 1, "type" => "status", "session_handle" => @handle})
+
+    {:ok, replacement} = socket(c, "a2")
+
+    :ok =
+      :ssl.send(
+        replacement,
+        "GET /origin/v1/stream?scope=origin&reconnect=1 HTTP/1.1\r\nHost: relay.test\r\n\r\n"
+      )
+
+    assert {:ok, _} = recv_until(replacement, "data: {\"cursor\":1}\n\n", <<>>, 20)
+    assert {:ok, "event: replaced\ndata: {}\n\n"} = :ssl.recv(stream, 0, 5000)
+    assert {:error, :closed} = :ssl.recv(stream, 0, 5000)
+    :ssl.close(replacement)
+  end
+
   test "SSE notices contain only cursors; authoritative fetch and session availability remain separate",
        c do
     assert {:ok, 200, %{"type" => "ok"}} =

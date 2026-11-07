@@ -66,6 +66,13 @@ defmodule AttentionServer.OriginWire do
   defp diagnostic_cause("invalid_upload"), do: :invalid_request
   defp diagnostic_cause(_), do: :unknown
 
+  defp run(relay, key, %{"type" => "coverage"}, ref) do
+    case Relay.origin_coverage(relay, key) do
+      {:ok, handles} -> ok(%{"session_handles" => handles}, ref)
+      {:error, reason} -> error(Atom.to_string(reason), nil, ref)
+    end
+  end
+
   defp run(relay, key, %{"type" => "feed", "since" => since}, ref)
        when is_integer(since) and since >= 0 do
     case Relay.origin_feed(relay, key, since) do
