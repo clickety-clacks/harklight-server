@@ -301,6 +301,11 @@ defmodule AttentionServer.BounceDecisionTest do
     assert entry["text"] =~
              "Please decide whether this message is still valid and worth resending"
 
+    assert bounced.advisory_id_index[{advisory_feed_key(), entry["advisory_id"]}] == 1
+    rebuilt = BounceDecision.rebuild_indexes(%{bounced | advisory_id_index: %{}})
+
+    assert rebuilt.advisory_id_index[{advisory_feed_key(), entry["advisory_id"]}] == 1
+
     assert {:error, :invalid_cursor} = BounceDecision.advisory_feed(bounced, @origin, @handle, 2)
 
     assert {:error, :not_found} =
@@ -312,7 +317,7 @@ defmodule AttentionServer.BounceDecisionTest do
              )
 
     assert {:ok, acked, first_ack} =
-             BounceDecision.advisory_ack(bounced, @origin, @handle, entry["advisory_id"])
+             BounceDecision.advisory_ack(rebuilt, @origin, @handle, entry["advisory_id"])
 
     assert first_ack["delivered"] and not first_ack["already_delivered"]
 
@@ -325,6 +330,16 @@ defmodule AttentionServer.BounceDecisionTest do
     assert {:ok, fetched_after_ack} = BounceDecision.advisory_feed(acked, @origin, @handle, 0)
     assert hd(fetched_after_ack["entries"])["delivered"]
     assert BounceDecision.valid_state?(acked)
+  end
+
+  test "advisory feed change keys include only the originating sessions of changed messages" do
+    {engine, _record} = fixture()
+    other_key = {@person, @sender, "other-bounce-message"}
+    other_record = %{origin: "other-origin", session_handle: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"}
+    engine = %{engine | messages: Map.put(engine.messages, other_key, other_record)}
+
+    assert BounceDecision.advisory_feed_keys_for_changes(engine, [key(), key(), {"missing", "s", "m"}]) ==
+             [advisory_feed_key()]
   end
 
   test "deadline and suppression indexes stay narrow across large retained history" do

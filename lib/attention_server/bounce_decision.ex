@@ -152,6 +152,15 @@ defmodule AttentionServer.BounceDecision do
 
   def record_scores(%Engine{} = engine, person, entries, now_ms)
       when is_binary(person) and is_list(entries) and is_integer(now_ms) do
+    {next, _keys} = record_scores_with_changes(engine, person, entries, now_ms)
+    next
+  end
+
+  def record_scores(%Engine{} = engine, _person, _entries, _now_ms), do: engine
+
+  @doc false
+  def record_scores_with_changes(%Engine{} = engine, person, entries, now_ms)
+      when is_binary(person) and is_list(entries) and is_integer(now_ms) do
     {engine, keys} =
       Enum.reduce(entries, {engine, []}, fn
         %{"score" => score} = entry, {current, keys}
@@ -163,16 +172,48 @@ defmodule AttentionServer.BounceDecision do
           acc
       end)
 
-    evaluate_due_for_keys(engine, Enum.uniq(keys), now_ms)
+    keys = Enum.uniq(keys)
+    {evaluate_due_for_keys(engine, keys, now_ms), keys}
   end
 
-  def record_scores(%Engine{} = engine, _person, _entries, _now_ms), do: engine
+  def record_scores_with_changes(%Engine{} = engine, _person, _entries, _now_ms),
+    do: {engine, []}
 
   def evaluate_due(%Engine{} = engine, now_ms) when is_integer(now_ms) do
-    evaluate_due_from_index(engine, now_ms)
+    {next, _keys} = evaluate_due_with_changes(engine, now_ms)
+    next
   end
 
   def evaluate_due(%Engine{} = engine, _now_ms), do: engine
+
+  @doc false
+  def evaluate_due_with_changes(%Engine{} = engine, now_ms) when is_integer(now_ms) do
+    evaluate_due_from_index(engine, now_ms, [])
+  end
+
+  def evaluate_due_with_changes(%Engine{} = engine, _now_ms), do: {engine, []}
+
+  @doc false
+  def advisory_feed_keys_for_changes(%Engine{} = engine, keys) when is_list(keys) do
+    keys
+    |> Enum.reduce(MapSet.new(), fn
+      {person, _sender, _message_id} = key, changed ->
+        case Map.get(engine.messages, key) do
+          %{origin: origin, session_handle: handle}
+          when is_binary(origin) and is_binary(handle) ->
+            MapSet.put(changed, {person, origin, handle})
+
+          _ ->
+            changed
+        end
+
+      _, changed ->
+        changed
+    end)
+    |> MapSet.to_list()
+  end
+
+  def advisory_feed_keys_for_changes(%Engine{}, _keys), do: []
 
   def next_deadline(%Engine{} = engine) do
     case :gb_trees.is_empty(engine.bounce_deadline_index) do
@@ -222,7 +263,8 @@ defmodule AttentionServer.BounceDecision do
       | bounce_deadline_index: :gb_trees.empty(),
         bounce_waiting_routes: %{},
         bounce_discussed_messages: discussed_message_index(engine),
-        bounce_origin_entries: origin_entry_index(engine)
+        bounce_origin_entries: origin_entry_index(engine),
+        advisory_id_index: build_advisory_id_index(engine.advisory_feeds)
     }
 
     Enum.reduce(engine.bounce_revisions, engine, fn {key, state}, current ->
@@ -288,11 +330,11 @@ defmodule AttentionServer.BounceDecision do
       feed_key = {person, key, handle}
       feed = Map.get(engine.advisory_feeds, feed_key, empty_advisory_feed())
 
-      case Enum.find(feed.entries, fn {_seq, entry} -> entry["advisory_id"] == advisory_id end) do
-        nil ->
+      case Map.fetch(engine.advisory_id_index, {feed_key, advisory_id}) do
+        :error ->
           {:error, :not_found}
 
-        {_seq, _entry} ->
+        {:ok, _sequence} ->
           if MapSet.member?(feed.receipts, advisory_id) do
             {:ok, engine,
              %{
@@ -325,6 +367,7 @@ defmodule AttentionServer.BounceDecision do
       is_struct(engine.opened_revisions, MapSet) and
       is_struct(engine.bounce_discussed_messages, MapSet) and
       is_struct(engine.bounce_origin_entries, MapSet) and is_map(engine.bounce_waiting_routes) and
+      is_map(engine.advisory_id_index) and
       valid_deadline_tree?(engine.bounce_deadline_index)
   rescue
     _ -> false
@@ -385,10 +428,10 @@ defmodule AttentionServer.BounceDecision do
 
   defp record_score(engine, _key, _score), do: engine
 
-  defp evaluate_due_from_index(engine, now_ms) do
+  defp evaluate_due_from_index(engine, now_ms, changed_keys) do
     case :gb_trees.is_empty(engine.bounce_deadline_index) do
       true ->
-        engine
+        {engine, Enum.reverse(changed_keys)}
 
       false ->
         {{due_at, key, sub_revision}, _value} = :gb_trees.smallest(engine.bounce_deadline_index)
@@ -397,9 +440,9 @@ defmodule AttentionServer.BounceDecision do
           engine
           |> remove_deadline(due_at, key, sub_revision)
           |> evaluate_message(key, sub_revision, now_ms)
-          |> evaluate_due_from_index(now_ms)
+          |> then(&evaluate_due_from_index(&1, now_ms, [key | changed_keys]))
         else
-          engine
+          {engine, Enum.reverse(changed_keys)}
         end
     end
   end
@@ -606,7 +649,13 @@ defmodule AttentionServer.BounceDecision do
         entries: Map.put(feed.entries, sequence, entry)
     }
 
-    engine = %{engine | advisory_feeds: Map.put(engine.advisory_feeds, feed_key, updated_feed)}
+    engine = %{
+      engine
+      | advisory_feeds: Map.put(engine.advisory_feeds, feed_key, updated_feed),
+        advisory_id_index:
+          Map.put(engine.advisory_id_index, {feed_key, advisory_id}, sequence)
+    }
+
     update_selection(engine, key, state, sub_revision, selection, "bounced", nil, advisory_id)
   end
 
@@ -807,7 +856,8 @@ defmodule AttentionServer.BounceDecision do
       MapSet.size(waiting) + MapSet.size(queued_ids) == map_size(pending) and
       MapSet.equal?(queued_ids, expected_queued) and
       MapSet.equal?(engine.bounce_discussed_messages, discussed_message_index(engine)) and
-      MapSet.equal?(engine.bounce_origin_entries, origin_entry_index(engine))
+      MapSet.equal?(engine.bounce_origin_entries, origin_entry_index(engine)) and
+      engine.advisory_id_index == build_advisory_id_index(engine.advisory_feeds)
   end
 
   defp pending_revisions(engine) do
@@ -900,6 +950,22 @@ defmodule AttentionServer.BounceDecision do
     do: %{engine | bounce_levels: Map.put(engine.bounce_levels, person, config)}
 
   defp empty_advisory_feed, do: %{high: 0, entries: %{}, receipts: MapSet.new()}
+
+  defp build_advisory_id_index(advisory_feeds) do
+    Enum.reduce(advisory_feeds, %{}, fn
+      {feed_key, %{entries: entries}}, index when is_map(entries) ->
+        Enum.reduce(entries, index, fn
+          {sequence, %{"advisory_id" => advisory_id}}, current ->
+            Map.put(current, {feed_key, advisory_id}, sequence)
+
+          _, current ->
+            current
+        end)
+
+      _, index ->
+        index
+    end)
+  end
 
   defp uuid_v4 do
     <<a::binary-size(6), b::8, c::8, d::8, e::binary-size(7)>> = :crypto.strong_rand_bytes(16)

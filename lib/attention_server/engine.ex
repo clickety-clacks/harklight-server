@@ -78,6 +78,7 @@ defmodule AttentionServer.Engine do
             bounce_waiting_routes: %{},
             bounce_discussed_messages: MapSet.new(),
             bounce_origin_entries: MapSet.new(),
+            advisory_id_index: %{},
             advisory_feeds: %{}
 
   def new do

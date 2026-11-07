@@ -1744,6 +1744,7 @@ defmodule AttentionServer.Store do
       engine
       |> Map.from_struct()
       |> Map.delete(:open_default_index)
+      |> Map.delete(:advisory_id_index)
       |> Map.put(:__struct__, Engine)
 
     :erlang.term_to_binary({:attention_relay_state, @format_version, persisted}, [
@@ -2086,7 +2087,8 @@ defmodule AttentionServer.Store do
       | bounce_deadline_index: stored.bounce_deadline_index,
         bounce_waiting_routes: stored.bounce_waiting_routes,
         bounce_discussed_messages: stored.bounce_discussed_messages,
-        bounce_origin_entries: stored.bounce_origin_entries
+        bounce_origin_entries: stored.bounce_origin_entries,
+        advisory_id_index: stored.advisory_id_index
     } == stored
   end
 

@@ -1073,7 +1073,6 @@ defmodule AttentionServer.Relay do
             next_state =
               %{state | store: store}
               |> refresh_stream_advisory_support({person, key, handle})
-              |> record_advisory_feed_change(old_engine, next)
               |> reschedule_bounce_sweep()
 
             {:reply, {:ok, reply}, next_state}
@@ -2643,9 +2642,9 @@ defmodule AttentionServer.Relay do
     state = %{state | bounce_deadline_timer: nil}
     old_engine = state.store.engine
     now_ms = state.clock.()
-    next_engine = BounceDecision.evaluate_due(old_engine, now_ms)
+    {next_engine, changed_keys} = BounceDecision.evaluate_due_with_changes(old_engine, now_ms)
 
-    if next_engine == old_engine do
+    if changed_keys == [] do
       {:noreply, reschedule_bounce_sweep(state)}
     else
       case commit(state.store, next_engine, %{
@@ -2656,7 +2655,8 @@ defmodule AttentionServer.Relay do
         {:ok, store} ->
           next_state = %{state | store: store}
 
-          next_state = record_advisory_feed_change(next_state, old_engine, next_engine)
+          next_state =
+            record_advisory_feed_change(next_state, old_engine, next_engine, changed_keys)
 
           {:noreply, reschedule_bounce_sweep(next_state)}
 
@@ -4376,9 +4376,16 @@ defmodule AttentionServer.Relay do
 
   defp put_scored_priority_view(state, person, items, entries, reply_summary) do
     old_engine = state.store.engine
-    next_engine = BounceDecision.record_scores(old_engine, person, entries, state.clock.())
+    {next_engine, changed_keys} =
+      BounceDecision.record_scores_with_changes(old_engine, person, entries, state.clock.())
 
-    case persist_bounce_decision(state, old_engine, next_engine, "bounce_score_selection") do
+    case persist_bounce_decision(
+           state,
+           old_engine,
+           next_engine,
+           changed_keys,
+           "bounce_score_selection"
+         ) do
       {:ok, next_state} ->
         next_state =
           put_priority_view(
@@ -4402,11 +4409,11 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  defp persist_bounce_decision(state, old_engine, next_engine, _action)
+  defp persist_bounce_decision(state, old_engine, next_engine, _changed_keys, _action)
        when old_engine == next_engine,
        do: {:ok, state}
 
-  defp persist_bounce_decision(state, old_engine, next_engine, action) do
+  defp persist_bounce_decision(state, old_engine, next_engine, changed_keys, action) do
     audit = %{person: "system", actor: "bounce_decision", action: action}
 
     case commit(state.store, next_engine, audit) do
@@ -4415,7 +4422,7 @@ defmodule AttentionServer.Relay do
 
         next_state =
           next_state
-          |> record_advisory_feed_change(old_engine, next_engine)
+          |> record_advisory_feed_change(old_engine, next_engine, changed_keys)
           |> reschedule_bounce_sweep()
 
         {:ok, next_state}
@@ -4859,19 +4866,23 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  defp record_advisory_feed_change(state, old_engine, next_engine) do
-    Enum.reduce(next_engine.advisory_feeds, state, fn {{_person, _origin, handle} = key, feed},
-                                                      current ->
-      old_feed = Map.get(old_engine.advisory_feeds, key, %{high: 0, entries: %{}})
+  defp record_advisory_feed_change(state, old_engine, next_engine, changed_keys) do
+    BounceDecision.advisory_feed_keys_for_changes(next_engine, changed_keys)
+    |> Enum.reduce(state, fn {_person, _origin, handle} = key, current ->
+      old_high = get_in(old_engine.advisory_feeds, [key, :high]) || 0
 
-      if feed.high > old_feed.high do
-        case Map.get(current.origin_streams, key) do
-          %{worker: worker, advisory_v1: true} ->
-            send(worker, {:origin_advisory_changed, handle, feed.high})
+      case Map.get(next_engine.advisory_feeds, key) do
+        %{high: high} when high > old_high ->
+          case Map.get(current.origin_streams, key) do
+            %{worker: worker, advisory_v1: true} ->
+              send(worker, {:origin_advisory_changed, handle, high})
 
-          _ ->
-            :ok
-        end
+            _ ->
+              :ok
+          end
+
+        _ ->
+          :ok
       end
 
       current
