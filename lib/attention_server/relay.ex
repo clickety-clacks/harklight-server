@@ -4902,13 +4902,21 @@ defmodule AttentionServer.Relay do
               engine
             end
 
+          {:ok, current} =
+            Engine.origin_status(
+              engine,
+              origin,
+              handle,
+              origin_listening?(after_state, engine, key)
+            )
+
           Engine.origin_availability(
             engine,
             person,
             origin,
             handle,
             current["availability"],
-            engine.origin_sessions[key].last_detached_at
+            current["last_detached_at"]
           )
         end
 
