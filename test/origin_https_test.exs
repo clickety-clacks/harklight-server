@@ -1200,6 +1200,283 @@ defmodule AttentionServer.OriginHTTPSTest do
              request(c, "a2", %{"v" => 1, "type" => "feed", "since" => 1})
   end
 
+  if binary = System.get_env("HARKLIGHT_AGENT_BIN") do
+    @agent_binary binary
+    @tag timeout: 120_000
+    test "real CLI serves three own conversations on one origin connection", c do
+      root = Path.join(Path.dirname(c.store_path), "agent-fixture")
+      ca = Path.join(c.certs, "ca.pem")
+
+      make_identity = fn name, key ->
+        dir = Path.join(root, name)
+        File.mkdir_p!(dir)
+        File.chmod!(dir, 0o700)
+        File.cp!(Path.join(c.certs, name <> ".pem"), Path.join(dir, "identity.pem"))
+        File.cp!(Path.join(c.certs, name <> ".key"), Path.join(dir, "identity.key"))
+        File.chmod!(Path.join(dir, "identity.key"), 0o600)
+        File.write!(Path.join(dir, "enrollment.json"), JSON.encode!(%{"device_id" => key}))
+
+        File.write!(
+          Path.join(dir, "server.json"),
+          JSON.encode!(%{
+            "address" => "127.0.0.1",
+            "name" => "relay.test",
+            "port" => Server.origin_port(c.server),
+            "origin_port" => Server.origin_port(c.server),
+            "ca_sha256" => Base.encode16(:crypto.hash(:sha256, File.read!(ca)), case: :lower)
+          })
+        )
+
+        ["--identity-dir", dir, "--ca-file", ca, "--state-dir", Path.join(dir, "state")]
+      end
+
+      args = make_identity.("a2", c.origin)
+      other_args = make_identity.("reader", c.reader)
+      :ok = Relay.setup_sender(c.relay, c.reader, "app:test")
+
+      run = fn base, command ->
+        {output, code} = System.cmd(@agent_binary, base ++ command, stderr_to_stdout: true)
+        assert code == 0, output
+
+        output
+        |> String.split("\n", trim: true)
+        |> List.last()
+        |> then(&JSON.decode_line(&1 <> "\n"))
+        |> elem(1)
+      end
+
+      send_args = [
+        "send",
+        "--session",
+        "new",
+        "--route",
+        "other",
+        "--controller",
+        "--origin-listener",
+        "--sender-id",
+        "app:test",
+        "--title",
+        "Fixture question",
+        "--type",
+        "request",
+        "--reply"
+      ]
+
+      own = for _ <- 1..3, do: run.(args, send_args)
+      other = run.(other_args, send_args)
+
+      listener =
+        Port.open({:spawn_executable, @agent_binary}, [
+          :binary,
+          :exit_status,
+          {:line, 1_000_000},
+          {:args, args ++ ["listen", "--origin", "--follow"]}
+        ])
+
+      {:os_pid, listener_pid} = Port.info(listener, :os_pid)
+
+      on_exit(fn ->
+        System.cmd("kill", ["-TERM", Integer.to_string(listener_pid)], stderr_to_stdout: true)
+      end)
+
+      # Receiving an event establishes that the attach completed; no timing guess.
+      Enum.each(own, fn item ->
+        assert %{"type" => "ok"} =
+                 relay_request(c.relay, c.reader, %{
+                   "type" => "discussion",
+                   "op_id" => op(950 + Enum.find_index(own, &(&1 == item))),
+                   "sender_id" => "app:test",
+                   "message_id" => item["request"],
+                   "request_revision" => 1,
+                   "text" => "Fixture reply"
+                 })
+      end)
+
+      assert %{"type" => "ok"} =
+               relay_request(c.relay, c.origin, %{
+                 "type" => "discussion",
+                 "op_id" => op(959),
+                 "sender_id" => "app:test",
+                 "message_id" => other["request"],
+                 "request_revision" => 1,
+                 "text" => "Other system"
+               })
+
+      events =
+        for _ <- 1..3 do
+          receive do
+            {^listener, {:data, {:eol, line}}} ->
+              assert {:ok, %{"kind" => "event"} = event} = JSON.decode_line(line <> "\n")
+              event
+
+            {^listener, {:exit_status, code}} ->
+              flunk("listener exited #{code}")
+          after
+            15_000 -> flunk("missing own event")
+          end
+        end
+
+      assert Enum.sort(Enum.map(events, & &1["session_handle"])) ==
+               Enum.sort(Enum.map(own, & &1["session"]))
+
+      for item <- own do
+        assert {:ok, %{"availability" => "listening"}} =
+                 Relay.origin_status(c.relay, c.origin, item["session"])
+      end
+
+      state = :sys.get_state(c.relay)
+      assert map_size(state.origin_streams) == 1
+      assert Map.has_key?(state.origin_streams, {c.person, c.origin, :origin})
+
+      for event <- Enum.take(events, 1) do
+        run.(args, ["ack", "--session", event["session_handle"], "--event", event["event_id"]])
+
+        run.(args, [
+          "reply",
+          "--session",
+          event["session_handle"],
+          "--in-reply-to",
+          event["event_id"],
+          "--request",
+          event["request"]["message_id"],
+          "--body",
+          "Handled"
+        ])
+      end
+
+      # Stop the process, then resume its durable journal. Only unacted turns replay.
+      {_, 0} = System.cmd("kill", ["-TERM", Integer.to_string(listener_pid)])
+
+      receive do
+        {^listener, {:exit_status, _}} -> :ok
+      after
+        5_000 -> flunk("listener did not stop")
+      end
+
+      restarted =
+        Port.open({:spawn_executable, @agent_binary}, [
+          :binary,
+          :exit_status,
+          {:line, 1_000_000},
+          {:args, args ++ ["listen", "--origin", "--follow"]}
+        ])
+
+      {:os_pid, restarted_pid} = Port.info(restarted, :os_pid)
+
+      on_exit(fn ->
+        System.cmd("kill", ["-TERM", Integer.to_string(restarted_pid)], stderr_to_stdout: true)
+      end)
+
+      replay =
+        for _ <- 1..2 do
+          receive do
+            {^restarted, {:data, {:eol, line}}} ->
+              assert {:ok, %{"kind" => "event"} = event} = JSON.decode_line(line <> "\n")
+              event["event_id"]
+          after
+            15_000 -> flunk("missing replay")
+          end
+        end
+
+      assert Enum.sort(replay) ==
+               events |> Enum.drop(1) |> Enum.map(& &1["event_id"]) |> Enum.sort()
+
+      assert {:ok, handles} = Relay.origin_coverage(c.relay, c.origin)
+      assert length(handles) == 3
+
+      # A legacy listener journals an uncovered turn before cover announces it.
+      legacy = run.(args, Enum.reject(send_args, &(&1 == "--origin-listener")))
+
+      old_listener =
+        Port.open({:spawn_executable, @agent_binary}, [
+          :binary,
+          :exit_status,
+          {:line, 1_000_000},
+          {:args, args ++ ["listen", "--session", legacy["session"], "--controller", "--follow"]}
+        ])
+
+      {:os_pid, old_pid} = Port.info(old_listener, :os_pid)
+
+      on_exit(fn ->
+        System.cmd("kill", ["-TERM", Integer.to_string(old_pid)], stderr_to_stdout: true)
+      end)
+
+      assert %{"type" => "ok"} =
+               relay_request(c.relay, c.reader, %{
+                 "type" => "discussion",
+                 "op_id" => op(960),
+                 "sender_id" => "app:test",
+                 "message_id" => legacy["request"],
+                 "request_revision" => 1,
+                 "text" => "Migrate pending turn"
+               })
+
+      legacy_event =
+        receive do
+          {^old_listener, {:data, {:eol, line}}} ->
+            assert {:ok, %{"kind" => "event"} = event} = JSON.decode_line(line <> "\n")
+            event
+        after
+          15_000 -> flunk("legacy listener missing turn")
+        end
+
+      assert {:ok, %{"availability" => "listening"}} =
+               Relay.origin_status(c.relay, c.origin, legacy["session"])
+
+      assert %{"kind" => "covered"} = run.(args, ["cover", "--session", legacy["session"]])
+
+      receive do
+        {^restarted, {:data, {:eol, line}}} ->
+          assert {:ok, %{"kind" => "event"} = migrated} = JSON.decode_line(line <> "\n")
+          assert migrated["event_id"] == legacy_event["event_id"]
+          assert migrated["session_handle"] == legacy["session"]
+      after
+        15_000 -> flunk("coverage did not offer already-journaled turn")
+      end
+
+      {_, 0} = System.cmd("kill", ["-TERM", Integer.to_string(old_pid)])
+
+      receive do
+        {^old_listener, {:exit_status, _}} -> :ok
+      after
+        5_000 -> flunk("legacy listener did not stop")
+      end
+
+      assert {:ok, %{"availability" => "listening"}} =
+               Relay.origin_status(c.relay, c.origin, legacy["session"])
+
+      # The second enrollment's feed remains disjoint even though both have the same sender grant.
+      assert {:ok, feed} = Relay.origin_feed(c.relay, c.origin, 0)
+      refute Enum.any?(feed["entries"], &(&1["session_handle"] == other["session"]))
+      {:ok, takeover} = socket(c, "a2")
+
+      :ok =
+        :ssl.send(
+          takeover,
+          "GET /origin/v1/stream?scope=origin&reconnect=1 HTTP/1.1\r\nHost: relay.test\r\n\r\n"
+        )
+
+      assert {:ok, _} = recv_until(takeover, "\n\n", <<>>, 20)
+
+      receive do
+        {^restarted, {:exit_status, 6}} -> :ok
+      after
+        5_000 -> flunk("displaced origin listener did not exit with listener-active")
+      end
+
+      :ssl.close(takeover)
+      Supervisor.stop(c.server)
+      assert {:ok, durable} = Store.open(c.store_path)
+
+      assert durable.engine.origin_sessions[{c.person, c.origin, legacy["session"]}].support[
+               "origin_listener"
+             ] == true
+
+      assert durable.engine.origin_feeds[{c.person, c.origin}].high == feed["cursor"]
+      Store.close(durable)
+    end
+  end
+
   test "origin stream covers explicitly declared handles and replaces independently", c do
     {:ok, stream} = socket(c, "a2")
 
@@ -1211,6 +1488,22 @@ defmodule AttentionServer.OriginHTTPSTest do
 
     assert {:ok, initial} = recv_until(stream, "data: {\"cursor\":0}\n\n", <<>>, 20)
     assert initial =~ "event: change"
+
+    assert {:ok, 200, %{"reason" => "already_listening"}} =
+             raw_request(
+               c,
+               "a2",
+               "GET /origin/v1/stream?scope=origin HTTP/1.1\r\nHost: relay.test\r\n\r\n"
+             )
+
+    for option <- ["session=" <> @handle, "advisory_v1=1", "sender=app:test", "reconnect=0"] do
+      assert {:ok, 400, %{"reason" => "invalid_field"}} =
+               raw_request(
+                 c,
+                 "a2",
+                 "GET /origin/v1/stream?scope=origin&#{option} HTTP/1.1\r\nHost: relay.test\r\n\r\n"
+               )
+    end
 
     assert {:ok, 200, %{"session_handles" => []}} =
              request(c, "a2", %{"v" => 1, "type" => "coverage"})
@@ -1838,7 +2131,7 @@ defmodule AttentionServer.OriginHTTPSTest do
 
   defp relay_request(relay, key, frame) do
     {:ok, line} = Relay.request_line(relay, key, JSON.encode!(Map.put(frame, "v", 1)) <> "\n")
-    {:ok, reply} = JSON.decode_line(line)
+    {:ok, reply} = JSON.decode_line(line <> "\n")
     reply
   end
 

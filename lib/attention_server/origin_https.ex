@@ -720,7 +720,7 @@ defmodule AttentionServer.OriginHTTPS do
     end
   end
 
-  defp stream_status(relay, key, :origin), do: Relay.origin_feed(relay, key, 0)
+  defp stream_status(relay, key, :origin), do: Relay.origin_status(relay, key, :origin)
   defp stream_status(relay, key, handle), do: Relay.origin_status(relay, key, handle)
 
   defp stream_send(socket, bytes, phase),

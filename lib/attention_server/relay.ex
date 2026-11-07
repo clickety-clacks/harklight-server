@@ -1031,6 +1031,17 @@ defmodule AttentionServer.Relay do
     end
   end
 
+  def handle_call({:origin_status, key, :origin}, _from, state) do
+    case Engine.authorized_person(state.store.engine, key) do
+      {:ok, person} ->
+        high = Map.get(state.store.engine.origin_feeds, {person, key}, %{high: 0}).high
+        {:reply, {:ok, %{"cursor" => high}}, state}
+
+      error ->
+        {:reply, error, state}
+    end
+  end
+
   def handle_call({:origin_status, key, handle}, _from, state) do
     engine = state.store.engine
 
@@ -4906,6 +4917,9 @@ defmodule AttentionServer.Relay do
     end)
   end
 
+  defp with_coverage_availability(state, _key, next)
+       when state.store.engine.origin_sessions == next.origin_sessions, do: next
+
   defp with_coverage_availability(state, key, next) do
     case Engine.authorized_person(next, key) do
       {:ok, person} ->
@@ -4941,9 +4955,11 @@ defmodule AttentionServer.Relay do
         %{worker: worker} -> send(worker, :origin_coverage_changed)
         _ -> :ok
       end
-    end
 
-    state
+      requeue_covered(state, person, origin)
+    else
+      state
+    end
   end
 
   defp with_initial_origin_availability(state, key, next_engine) do
