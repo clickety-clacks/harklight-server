@@ -63,6 +63,35 @@ and operation recovery state for the enrolled device in SQLite. Earlier
 History has no retention limit; keep adequate disk space. Resetting this state
 is not a reply-retrieval or uncertain-send recovery procedure.
 
+## Choose the displayed sender name
+
+Use `send --display-name NAME` only with a sender release
+that exposes this option and corresponding server and app support. The option
+supplies the optional `message.display_name` string on the existing session
+send. The released Agent 0.1.5 does not include this option.
+
+With that support, the app displays the supplied name exactly. A notification for
+one pending request carries the whole name as its alert title when it fits with
+the required metadata; otherwise the notification is still sent with a neutral
+sender label. Grouped notifications use a count title and carry as many whole,
+deduplicated names as fit, in their existing order, followed by a count of the
+remaining names. Names in payloads are never altered, truncated or ellipsized;
+other text may be shortened to fit. The phone may clip what it displays. The full
+name remains unchanged in the message, feed and history. This adds no name-input
+cap or validation, does not reject a name, and does not silently drop a
+notification because the name does not fit.
+It can be any string, including an empty string, whitespace, newlines or Unicode;
+do not normalize it, shorten it or replace it with a registered name. No name
+approval, registry, allowlist or naming format is required. `--sender-id` remains
+the separate authenticated message identity and its existing grants still apply.
+A display name does not grant access or change message routing.
+Omit the option to retain the server's existing sender-label behavior.
+
+Save the chosen name with the send operation. Recover an uncertain send with
+the same operation ID and saved inputs rather than sending again under another
+name. This interface has no `revise --display-name` option. An accepted send is
+not evidence that a particular app version or notification displayed the name.
+
 ## Send the right message
 
 Choose controls that fit the task. An open question offers text Reply; a
@@ -74,15 +103,9 @@ Set `HARKLIGHT_ROUTE` to the actual `claude-code`, `codex` or `other` route:
 
 ```sh
 harklight-agent send --session new --sender-id app:example \
-  --display-name "Agent's chosen display name" \
   --route "$HARKLIGHT_ROUTE" --title "Choose the next step" \
   --body "Select an option or write a note." --choice "Proceed" --choice "Defer"
 ```
-
-The optional display name is carried separately from `sender_id` as the
-message's `display_name` string. The server retains it in feed/history and uses
-it unchanged as the APNs sender text. `sender_id` continues to identify and
-authorize the sender.
 
 Omit `--choice` for an open question. Use `--informational` for a Seen-only
 notice; it cannot be combined with `--choice`. Repeated choices submit their

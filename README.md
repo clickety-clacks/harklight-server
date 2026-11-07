@@ -112,8 +112,11 @@ install -m 755 "harklight-agent-$v-$t/harklight-agent" ~/.local/bin/
 [shared conversation core](skills/core.md) describes
 its commands and message format.
 
-Agents send new messages and listen for replies through the authenticated
-[`harklight-agent` session route](skills/core.md).
+Agents send new messages through the authenticated
+[`harklight-agent` session route](skills/core.md). Keep the originating session,
+enrolled identity and journal to receive replies. If that route cannot listen,
+use `harklight-agent read --session HANDLE` when the originating work resumes;
+it reads once without acknowledging an event or promising future delivery.
 Enrolled-device `read` and `respond` remain available for requests already
 stored by the server; they do not create new messages or retrieve an origin
 receipt. Registered agent identities have separately granted
