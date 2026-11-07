@@ -453,7 +453,7 @@ defmodule AttentionServer.DashboardReadHTTP do
   defp route(%{method: "GET", request_path: "/components"} = conn, opts, principal) do
     html =
       DashboardView.components(
-        principal.person_id,
+        display_name(principal),
         skill_version(opts.skill_path),
         skill_version(opts.skill_path_saas),
         chrome(opts)
