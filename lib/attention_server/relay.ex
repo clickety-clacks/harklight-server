@@ -1068,6 +1068,11 @@ defmodule AttentionServer.Relay do
                audit(old_engine, key, "origin_support")
              ) do
           {:ok, store} ->
+            store = %{
+              store
+              | engine: BounceDecision.requeue_supported_session(store.engine, session_key)
+            }
+
             next_state =
               %{state | store: store}
               |> refresh_stream_advisory_support({person, key, handle})
@@ -1460,6 +1465,11 @@ defmodule AttentionServer.Relay do
           MapSet.new([stream_key]),
           &MapSet.put(&1, stream_key)
         )
+
+      store = %{
+        store
+        | engine: BounceDecision.requeue_supported_session(store.engine, stream_key)
+      }
 
       next_state = %{
         state

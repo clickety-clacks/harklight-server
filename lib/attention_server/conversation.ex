@@ -555,7 +555,23 @@ defmodule AttentionServer.Conversation do
         Map.update(by_handle, handle, MapSet.new([seq]), &MapSet.put(&1, seq))
       )
 
-    {%{engine | origin_feeds: Map.put(engine.origin_feeds, key, updated)}, item}
+    origin_entries =
+      if item["kind"] == "revision" and item["author"] == "origin" and
+           is_binary(item["session_handle"]) and is_binary(item["sender_id"]) and
+           is_binary(item["message_id"]) do
+        MapSet.put(
+          engine.bounce_origin_entries,
+          {person, origin, item["session_handle"], item["sender_id"], item["message_id"]}
+        )
+      else
+        engine.bounce_origin_entries
+      end
+
+    {%{
+       engine
+       | origin_feeds: Map.put(engine.origin_feeds, key, updated),
+         bounce_origin_entries: origin_entries
+     }, item}
   end
 
   defp valid_delivery_acks?(engine, person, origin, feed) do

@@ -152,43 +152,95 @@ defmodule AttentionServer.BounceDecision do
 
   def record_scores(%Engine{} = engine, person, entries, now_ms)
       when is_binary(person) and is_list(entries) and is_integer(now_ms) do
-    engine =
-      Enum.reduce(entries, engine, fn
-        %{"score" => score} = entry, current when not is_map_key(entry, "conversation_seq") ->
+    {engine, keys} =
+      Enum.reduce(entries, {engine, []}, fn
+        %{"score" => score} = entry, {current, keys}
+        when not is_map_key(entry, "conversation_seq") ->
           key = {person, entry["sender_id"], entry["message_id"]}
-          record_score(current, key, score)
+          {record_score(current, key, score), [key | keys]}
 
-        _, current ->
-          current
+        _, acc ->
+          acc
       end)
 
-    evaluate_due(engine, now_ms)
+    evaluate_due_for_keys(engine, Enum.uniq(keys), now_ms)
   end
 
   def record_scores(%Engine{} = engine, _person, _entries, _now_ms), do: engine
 
   def evaluate_due(%Engine{} = engine, now_ms) when is_integer(now_ms) do
-    engine.bounce_revisions
-    |> Map.keys()
-    |> Enum.reduce(engine, fn key, current -> evaluate_message(current, key, now_ms) end)
+    evaluate_due_from_index(engine, now_ms)
   end
 
   def evaluate_due(%Engine{} = engine, _now_ms), do: engine
 
   def next_deadline(%Engine{} = engine) do
-    for {key, state} <- engine.bounce_revisions,
-        {sub_revision, revision} <- state.revisions,
-        sub_revision == state.current_substantive_revision,
-        %{
-          "decision" => "pending",
-          "due_at_ms" => due_at
-        } <- [revision.selection],
-        is_integer(due_at),
-        record when not is_nil(record) <- [Map.get(engine.messages, key)],
-        route_status(engine, key, record) == :supported do
-      due_at
+    case :gb_trees.is_empty(engine.bounce_deadline_index) do
+      true ->
+        nil
+
+      false ->
+        {{due_at, _key, _sub_revision}, _value} = :gb_trees.smallest(engine.bounce_deadline_index)
+        due_at
     end
-    |> Enum.min(&<=/2, fn -> nil end)
+  end
+
+  def requeue_supported_session(%Engine{} = engine, session_key) do
+    waiting = Map.get(engine.bounce_waiting_routes, session_key, MapSet.new())
+
+    {engine, still_waiting} =
+      Enum.reduce(waiting, {engine, MapSet.new()}, fn {key, sub_revision} = item,
+                                                      {current, retained} ->
+        case current_pending(current, key, sub_revision) do
+          {due_at, record} when is_integer(due_at) ->
+            if route_status(current, key, record) == :supported do
+              {put_deadline(current, due_at, key, sub_revision), retained}
+            else
+              {current, MapSet.put(retained, item)}
+            end
+
+          _ ->
+            {current, retained}
+        end
+      end)
+
+    waiting_routes =
+      if MapSet.size(still_waiting) == 0 do
+        Map.delete(engine.bounce_waiting_routes, session_key)
+      else
+        Map.put(engine.bounce_waiting_routes, session_key, still_waiting)
+      end
+
+    %{engine | bounce_waiting_routes: waiting_routes}
+  end
+
+  def rebuild_indexes(%Engine{} = engine) do
+    old_waiting = flatten_waiting(engine.bounce_waiting_routes)
+
+    engine = %{
+      engine
+      | bounce_deadline_index: :gb_trees.empty(),
+        bounce_waiting_routes: %{},
+        bounce_discussed_messages: discussed_message_index(engine),
+        bounce_origin_entries: origin_entry_index(engine)
+    }
+
+    Enum.reduce(engine.bounce_revisions, engine, fn {key, state}, current ->
+      case current_pending(current, key, state.current_substantive_revision) do
+        {due_at, record} when is_integer(due_at) ->
+          item = {key, state.current_substantive_revision}
+
+          if MapSet.member?(old_waiting, item) and
+               route_status(current, key, record) != :supported do
+            defer_pending(current, key, state.current_substantive_revision)
+          else
+            put_deadline(current, due_at, key, state.current_substantive_revision)
+          end
+
+        _ ->
+          current
+      end
+    end)
   end
 
   def advisory_feed(%Engine{} = engine, key, handle, since) do
@@ -268,13 +320,27 @@ defmodule AttentionServer.BounceDecision do
     end
   end
 
-  def valid_state?(%Engine{} = engine) do
-    valid_configurations?(engine) and valid_revision_states?(engine) and
-      valid_opened_revisions?(engine) and valid_advisory_feeds?(engine)
+  def valid_state?(%Engine{} = engine, :incremental) do
+    is_map(engine.bounce_levels) and is_map(engine.bounce_revisions) and
+      is_struct(engine.opened_revisions, MapSet) and
+      is_struct(engine.bounce_discussed_messages, MapSet) and
+      is_struct(engine.bounce_origin_entries, MapSet) and is_map(engine.bounce_waiting_routes) and
+      valid_deadline_tree?(engine.bounce_deadline_index)
   rescue
     _ -> false
   end
 
+  def valid_state?(%Engine{} = engine, :full) do
+    valid_configurations?(engine) and valid_revision_states?(engine) and
+      valid_opened_revisions?(engine) and valid_advisory_feeds?(engine) and
+      valid_indexes?(engine)
+  rescue
+    _ -> false
+  end
+
+  def valid_state?(%Engine{} = engine), do: valid_state?(engine, :full)
+
+  def valid_state?(_, _), do: false
   def valid_state?(_), do: false
 
   def advisory_text(revision, evaluated_at_ms)
@@ -319,15 +385,68 @@ defmodule AttentionServer.BounceDecision do
 
   defp record_score(engine, _key, _score), do: engine
 
-  defp evaluate_message(engine, key, now_ms) do
+  defp evaluate_due_from_index(engine, now_ms) do
+    case :gb_trees.is_empty(engine.bounce_deadline_index) do
+      true ->
+        engine
+
+      false ->
+        {{due_at, key, sub_revision}, _value} = :gb_trees.smallest(engine.bounce_deadline_index)
+
+        if due_at <= now_ms do
+          engine
+          |> remove_deadline(due_at, key, sub_revision)
+          |> evaluate_message(key, sub_revision, now_ms)
+          |> evaluate_due_from_index(now_ms)
+        else
+          engine
+        end
+    end
+  end
+
+  defp evaluate_due_for_keys(engine, keys, now_ms) do
+    Enum.reduce(keys, engine, fn key, current ->
+      case current_pending(current, key, current_substantive(current, key)) do
+        {due_at, _record} when due_at <= now_ms ->
+          current
+          |> remove_deadline(due_at, key, current_substantive(current, key))
+          |> evaluate_message(key, current_substantive(current, key), now_ms)
+
+        _ ->
+          current
+      end
+    end)
+  end
+
+  defp current_substantive(engine, key) do
+    case Map.get(engine.bounce_revisions, key) do
+      %{current_substantive_revision: sub_revision} -> sub_revision
+      _ -> nil
+    end
+  end
+
+  defp current_pending(engine, key, sub_revision) when is_integer(sub_revision) do
+    with %{current_substantive_revision: ^sub_revision} = state <-
+           Map.get(engine.bounce_revisions, key),
+         %{selection: %{"decision" => "pending", "due_at_ms" => due_at}}
+         when is_integer(due_at) <- Map.get(state.revisions, sub_revision),
+         record when is_map(record) <- Map.get(engine.messages, key) do
+      {due_at, record}
+    else
+      _ -> nil
+    end
+  end
+
+  defp current_pending(_engine, _key, _sub_revision), do: nil
+
+  defp evaluate_message(engine, key, sub_revision, now_ms) do
     state = Map.get(engine.bounce_revisions, key)
     record = Map.get(engine.messages, key)
 
     if is_map(state) and is_map(record) do
-      sub_revision = state.current_substantive_revision
-
-      case Map.get(state.revisions, sub_revision) do
-        %{selection: %{"decision" => "pending", "due_at_ms" => due_at} = selection} = revision
+      case {state.current_substantive_revision, Map.get(state.revisions, sub_revision)} do
+        {^sub_revision,
+         %{selection: %{"decision" => "pending", "due_at_ms" => due_at} = selection} = revision}
         when is_integer(due_at) and due_at <= now_ms ->
           evaluate_selection(
             engine,
@@ -361,7 +480,7 @@ defmodule AttentionServer.BounceDecision do
             append_advisory(engine, key, state, sub_revision, revision, selection, now_ms)
 
           _ ->
-            engine
+            defer_pending(engine, key, sub_revision)
         end
     end
   end
@@ -406,12 +525,8 @@ defmodule AttentionServer.BounceDecision do
     end
   end
 
-  defp person_discussed?(engine, key) do
-    Enum.any?(engine.conversation_events, fn {_event_key, event} ->
-      event.key == key and event.payload["author"] == "person" and
-        event.payload["kind"] == "discussion"
-    end)
-  end
+  defp person_discussed?(engine, key),
+    do: MapSet.member?(engine.bounce_discussed_messages, key)
 
   defp route_status(engine, {person, _sender, _message_id} = key, record) do
     origin = Map.get(record, :origin)
@@ -425,7 +540,10 @@ defmodule AttentionServer.BounceDecision do
       not match?(%{person: ^person, revoked: false}, device) ->
         :unroutable
 
-      not original_session_entry?(engine, person, origin, handle, key) ->
+      not MapSet.member?(
+        engine.bounce_origin_entries,
+        {person, origin, handle, elem(key, 1), elem(key, 2)}
+      ) ->
         :unroutable
 
       true ->
@@ -436,20 +554,6 @@ defmodule AttentionServer.BounceDecision do
           _ ->
             :unsupported
         end
-    end
-  end
-
-  defp original_session_entry?(engine, person, origin, handle, {_, sender, message_id}) do
-    case Map.get(engine.origin_feeds, {person, origin}) do
-      %{entries: entries} ->
-        Enum.any?(entries, fn {_seq, entry} ->
-          entry["kind"] == "revision" and entry["author"] == "origin" and
-            entry["session_handle"] == handle and entry["sender_id"] == sender and
-            entry["message_id"] == message_id
-        end)
-
-      _ ->
-        false
     end
   end
 
@@ -533,6 +637,198 @@ defmodule AttentionServer.BounceDecision do
     put_revision_state(engine, key, updated_state)
   end
 
+  defp pending_revision(state) when is_map(state) do
+    sub_revision = Map.get(state, :current_substantive_revision)
+
+    case get_in(state, [:revisions, sub_revision, :selection]) do
+      %{"decision" => "pending", "due_at_ms" => due_at} when is_integer(due_at) ->
+        {sub_revision, due_at}
+
+      _ ->
+        nil
+    end
+  end
+
+  defp pending_revision(_), do: nil
+
+  defp put_revision_state(engine, key, state) do
+    old_state = Map.get(engine.bounce_revisions, key)
+    engine = remove_revision_index(engine, key, old_state)
+    engine = %{engine | bounce_revisions: Map.put(engine.bounce_revisions, key, state)}
+    add_revision_index(engine, key, state)
+  end
+
+  defp remove_revision_index(engine, key, state) do
+    case pending_revision(state) do
+      {sub_revision, due_at} ->
+        engine
+        |> remove_deadline(due_at, key, sub_revision)
+        |> remove_waiting_route(key, sub_revision)
+
+      nil ->
+        engine
+    end
+  end
+
+  defp add_revision_index(engine, key, state) do
+    case pending_revision(state) do
+      {sub_revision, due_at} -> put_deadline(engine, due_at, key, sub_revision)
+      nil -> engine
+    end
+  end
+
+  defp put_deadline(engine, due_at, key, sub_revision) do
+    index_key = {due_at, key, sub_revision}
+
+    %{
+      engine
+      | bounce_deadline_index: :gb_trees.enter(index_key, true, engine.bounce_deadline_index)
+    }
+  end
+
+  defp remove_deadline(engine, due_at, key, sub_revision) do
+    index_key = {due_at, key, sub_revision}
+    tree = engine.bounce_deadline_index
+
+    if :gb_trees.is_defined(index_key, tree),
+      do: %{engine | bounce_deadline_index: :gb_trees.delete(index_key, tree)},
+      else: engine
+  end
+
+  defp defer_pending(engine, key, sub_revision) do
+    case current_pending(engine, key, sub_revision) do
+      {due_at, record} ->
+        {person, _sender, _message_id} = key
+        session_key = {person, Map.get(record, :origin), Map.get(record, :session_handle)}
+        item = {key, sub_revision}
+
+        engine
+        |> remove_deadline(due_at, key, sub_revision)
+        |> then(fn current ->
+          waiting = Map.get(current.bounce_waiting_routes, session_key, MapSet.new())
+
+          %{
+            current
+            | bounce_waiting_routes:
+                Map.put(current.bounce_waiting_routes, session_key, MapSet.put(waiting, item))
+          }
+        end)
+
+      _ ->
+        engine
+    end
+  end
+
+  defp remove_waiting_route(engine, key, sub_revision) do
+    {person, _sender, _message_id} = key
+
+    session_key =
+      case Map.get(engine.messages, key) do
+        record when is_map(record) ->
+          {person, Map.get(record, :origin), Map.get(record, :session_handle)}
+
+        _ ->
+          nil
+      end
+
+    case Map.get(engine.bounce_waiting_routes, session_key) do
+      %MapSet{} = waiting ->
+        remaining = MapSet.delete(waiting, {key, sub_revision})
+
+        waiting_routes =
+          if MapSet.size(remaining) == 0,
+            do: Map.delete(engine.bounce_waiting_routes, session_key),
+            else: Map.put(engine.bounce_waiting_routes, session_key, remaining)
+
+        %{engine | bounce_waiting_routes: waiting_routes}
+
+      _ ->
+        engine
+    end
+  end
+
+  defp flatten_waiting(waiting_routes) do
+    Enum.reduce(waiting_routes, MapSet.new(), fn {_session_key, entries}, acc ->
+      MapSet.union(acc, entries)
+    end)
+  end
+
+  defp discussed_message_index(engine) do
+    Enum.reduce(engine.conversation_events, MapSet.new(), fn {_event_key, event}, acc ->
+      if event.payload["kind"] == "discussion" and event.payload["author"] == "person",
+        do: MapSet.put(acc, event.key),
+        else: acc
+    end)
+  end
+
+  defp origin_entry_index(engine) do
+    Enum.reduce(engine.origin_feeds, MapSet.new(), fn {{person, origin}, feed}, acc ->
+      Enum.reduce(feed.entries, acc, fn {_sequence, entry}, index ->
+        if entry["kind"] == "revision" and entry["author"] == "origin" and
+             is_binary(entry["session_handle"]) and is_binary(entry["sender_id"]) and
+             is_binary(entry["message_id"]) do
+          MapSet.put(
+            index,
+            {person, origin, entry["session_handle"], entry["sender_id"], entry["message_id"]}
+          )
+        else
+          index
+        end
+      end)
+    end)
+  end
+
+  defp valid_indexes?(engine) do
+    pending = pending_revisions(engine)
+    waiting = flatten_waiting(engine.bounce_waiting_routes)
+    queued = :gb_trees.to_list(engine.bounce_deadline_index)
+
+    queued_ids =
+      Enum.reduce(queued, MapSet.new(), fn {{due_at, key, sub_revision}, true}, acc ->
+        if Map.get(pending, {key, sub_revision}) == due_at,
+          do: MapSet.put(acc, {key, sub_revision}),
+          else: acc
+      end)
+
+    expected_queued = MapSet.difference(Map.keys(pending) |> MapSet.new(), waiting)
+
+    Enum.all?(engine.bounce_waiting_routes, fn {session_key, entries} ->
+      is_tuple(session_key) and tuple_size(session_key) == 3 and is_struct(entries, MapSet) and
+        Enum.all?(entries, fn {key, sub_revision} = item ->
+          case {Map.get(pending, item), Map.get(engine.messages, key)} do
+            {due_at, record} when is_integer(due_at) and is_map(record) ->
+              session_key == bounce_session_key(key, record)
+
+            _ ->
+              false
+          end
+        end)
+    end) and
+      MapSet.size(waiting) + MapSet.size(queued_ids) == map_size(pending) and
+      MapSet.equal?(queued_ids, expected_queued) and
+      MapSet.equal?(engine.bounce_discussed_messages, discussed_message_index(engine)) and
+      MapSet.equal?(engine.bounce_origin_entries, origin_entry_index(engine))
+  end
+
+  defp pending_revisions(engine) do
+    Enum.reduce(engine.bounce_revisions, %{}, fn {key, state}, acc ->
+      case pending_revision(state) do
+        {sub_revision, due_at} -> Map.put(acc, {key, sub_revision}, due_at)
+        nil -> acc
+      end
+    end)
+  end
+
+  defp bounce_session_key({person, _sender, _message_id}, record),
+    do: {person, Map.get(record, :origin), Map.get(record, :session_handle)}
+
+  defp valid_deadline_tree?(tree) do
+    is_tuple(tree) and tuple_size(tree) == 2 and is_integer(elem(tree, 0)) and
+      elem(tree, 0) >= 0 and :gb_trees.size(tree) == elem(tree, 0)
+  rescue
+    _ -> false
+  end
+
   defp supersede_pending(%{selection: %{"decision" => "pending"} = selection} = revision) do
     %{
       revision
@@ -602,9 +898,6 @@ defmodule AttentionServer.BounceDecision do
 
   defp put_configuration(engine, person, config),
     do: %{engine | bounce_levels: Map.put(engine.bounce_levels, person, config)}
-
-  defp put_revision_state(engine, key, state),
-    do: %{engine | bounce_revisions: Map.put(engine.bounce_revisions, key, state)}
 
   defp empty_advisory_feed, do: %{high: 0, entries: %{}, receipts: MapSet.new()}
 

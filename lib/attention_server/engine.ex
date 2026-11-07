@@ -74,6 +74,10 @@ defmodule AttentionServer.Engine do
             bounce_levels: %{},
             bounce_revisions: %{},
             opened_revisions: MapSet.new(),
+            bounce_deadline_index: :gb_trees.empty(),
+            bounce_waiting_routes: %{},
+            bounce_discussed_messages: MapSet.new(),
+            bounce_origin_entries: MapSet.new(),
             advisory_feeds: %{}
 
   def new do
@@ -5110,7 +5114,17 @@ defmodule AttentionServer.Engine do
 
   defp put_conversation_event(engine, person, seq, key, payload) do
     event = %{kind: :conversation, key: key, payload: payload}
-    %{engine | conversation_events: Map.put(engine.conversation_events, {person, seq}, event)}
+
+    discussed =
+      if payload["kind"] == "discussion" and payload["author"] == "person",
+        do: MapSet.put(engine.bounce_discussed_messages, key),
+        else: engine.bounce_discussed_messages
+
+    %{
+      engine
+      | conversation_events: Map.put(engine.conversation_events, {person, seq}, event),
+        bounce_discussed_messages: discussed
+    }
   end
 
   defp append_conversation_fact(engine, person, key, payload) do

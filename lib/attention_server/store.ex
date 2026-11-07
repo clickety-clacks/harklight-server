@@ -22,7 +22,7 @@ defmodule AttentionServer.Store do
 
   alias Exqlite.Sqlite3
 
-  @format_version 26
+  @format_version 27
   @inbox_index_chunk_size 20
   defstruct [:db, :engine, :version, :upload_dir]
 
@@ -279,7 +279,7 @@ defmodule AttentionServer.Store do
   def put_published_upload(%__MODULE__{} = store, metadata) do
     next = %{store.engine | uploads: Map.put(store.engine.uploads, metadata.id, metadata)}
 
-    if valid_state?(next) do
+    if valid_state?(next, :incremental) do
       case commit(store, next, %{
              person: metadata.person,
              actor: metadata.uploader,
@@ -979,7 +979,7 @@ defmodule AttentionServer.Store do
     do: {:ok, %{store | engine: next}}
 
   def commit(%__MODULE__{} = store, next, audit) do
-    if valid_state?(next) do
+    if valid_state?(next, :incremental) do
       commit_durable(store, next, audit)
     else
       Diagnostics.failure(
@@ -1501,7 +1501,8 @@ defmodule AttentionServer.Store do
                          23,
                          24,
                          25,
-                         26
+                         26,
+                         27
                        ] ->
                     original = struct(Engine, Map.from_struct(stored))
 
@@ -1590,13 +1591,17 @@ defmodule AttentionServer.Store do
                         end
                       end)
 
-                    engine = apply_state_overlays(engine, overlay_patches)
+                    engine =
+                      engine
+                      |> apply_state_overlays(overlay_patches)
+                      |> BounceDecision.rebuild_indexes()
 
                     cond do
                       not valid_state?(engine) ->
                         {:error, :invalid_state}
 
-                      format == @format_version and engine == original ->
+                      format == @format_version and
+                          same_state_except_bounce_indexes?(engine, original) ->
                         {:ok, engine, version}
 
                       true ->
@@ -1626,6 +1631,7 @@ defmodule AttentionServer.Store do
                                      format < 23 -> "prioritization_init"
                                      format < 24 -> "chat_read_positions_init"
                                      format < 26 -> "bounce_state_init"
+                                     format < 27 -> "bounce_schedule_index_init"
                                      true -> "state_format"
                                    end
                                }
@@ -2342,9 +2348,11 @@ defmodule AttentionServer.Store do
     %{engine | pending_enrollments: pending, pending_history: history}
   end
 
-  # There are no cross-person relational references in the single state row.
-  # Validate every stored edge before accepting or loading a snapshot instead.
-  defp valid_state?(%Engine{} = engine) do
+  # The durable hot path checks bounce index containers without rescanning their
+  # retained rows. Store open performs the full cross-map bounce validation.
+  defp valid_state?(%Engine{} = engine), do: valid_state?(engine, :full)
+
+  defp valid_state?(%Engine{} = engine, bounce_validation) do
     try do
       valid_instance?(engine.relay_instance_id) and
         is_binary(engine.agent_cursor_key) and byte_size(engine.agent_cursor_key) == 32 and
@@ -2366,7 +2374,7 @@ defmodule AttentionServer.Store do
         valid_prioritization?(engine) and
         valid_push_bindings?(engine) and
         AttentionServer.Conversation.valid_state?(engine) and
-        BounceDecision.valid_state?(engine) and
+        BounceDecision.valid_state?(engine, bounce_validation) and
         valid_uploads?(engine) and
         valid_upload_references?(engine) and
         Enum.all?(engine.devices, fn {_key, device} ->
@@ -2479,7 +2487,18 @@ defmodule AttentionServer.Store do
     end
   end
 
+  defp valid_state?(_, _), do: false
   defp valid_state?(_), do: false
+
+  defp same_state_except_bounce_indexes?(loaded, stored) do
+    %{
+      loaded
+      | bounce_deadline_index: stored.bounce_deadline_index,
+        bounce_waiting_routes: stored.bounce_waiting_routes,
+        bounce_discussed_messages: stored.bounce_discussed_messages,
+        bounce_origin_entries: stored.bounce_origin_entries
+    } == stored
+  end
 
   defp valid_prioritization?(engine) do
     is_map(engine.algorithm_choices) and

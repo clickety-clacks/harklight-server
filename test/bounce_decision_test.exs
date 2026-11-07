@@ -111,6 +111,7 @@ defmodule AttentionServer.BounceDecisionTest do
           })
     }
 
+    engine = BounceDecision.rebuild_indexes(engine)
     {BounceDecision.record_initial(engine, key(), record), record}
   end
 
@@ -254,6 +255,7 @@ defmodule AttentionServer.BounceDecisionTest do
         }
     }
 
+    discussed = BounceDecision.rebuild_indexes(discussed)
     discussed_at_due = BounceDecision.evaluate_due(discussed, due_at)
     assert selection(discussed_at_due)["reason"] == "person_discussion"
 
@@ -271,10 +273,13 @@ defmodule AttentionServer.BounceDecisionTest do
 
     assert selection(pending)["decision"] == "pending"
     assert BounceDecision.advisory_cursor(pending, @person, @origin, @handle) == 0
+    assert BounceDecision.next_deadline(pending) == nil
 
     session = pending.origin_sessions[advisory_feed_key()]
     supported = put_in(session.support["advisory_v1"], true)
     pending = put_in(pending.origin_sessions[advisory_feed_key()], supported)
+    pending = BounceDecision.requeue_supported_session(pending, advisory_feed_key())
+    assert BounceDecision.next_deadline(pending) == due_at
     bounced = BounceDecision.evaluate_due(pending, due_at + 50)
 
     assert selection(bounced)["decision"] == "bounced"
@@ -320,5 +325,86 @@ defmodule AttentionServer.BounceDecisionTest do
     assert {:ok, fetched_after_ack} = BounceDecision.advisory_feed(acked, @origin, @handle, 0)
     assert hd(fetched_after_ack["entries"])["delivered"]
     assert BounceDecision.valid_state?(acked)
+  end
+
+  test "deadline and suppression indexes stay narrow across large retained history" do
+    {engine, _record} = fixture()
+    selected = score(engine, 0.8, 1_050)
+    due_at = selection(selected)["due_at_ms"]
+    unrelated_count = 5_000
+
+    unrelated =
+      Map.new(1..unrelated_count, fn number ->
+        id = "retained-#{number}"
+        key = {@person, @sender, id}
+
+        revision = %{
+          raw_revision: 1,
+          accepted_at_ms: 1,
+          qualified: false,
+          selection: nil
+        }
+
+        state = %{
+          current_substantive_revision: 1,
+          raw_to_substantive: %{1 => 1},
+          revisions: %{1 => revision}
+        }
+
+        {key, {state, %{message: %{}, origin: @origin, session_handle: @handle, revision: 1}}}
+      end)
+
+    {revisions, messages} =
+      Enum.reduce(unrelated, {selected.bounce_revisions, selected.messages}, fn
+        {key, {state, record}}, {all_revisions, all_messages} ->
+          {Map.put(all_revisions, key, state), Map.put(all_messages, key, record)}
+      end)
+
+    other_origin_entries =
+      Map.new(2..(unrelated_count + 1), fn sequence ->
+        {sequence,
+         %{
+           "kind" => "revision",
+           "author" => "origin",
+           "session_handle" => @handle,
+           "sender_id" => @sender,
+           "message_id" => "retained-#{sequence - 1}"
+         }}
+      end)
+
+    feed = selected.origin_feeds[origin_feed_key()]
+
+    feed = %{
+      feed
+      | high: unrelated_count + 1,
+        entries: Map.merge(feed.entries, other_origin_entries)
+    }
+
+    discussion_events =
+      Map.new(1..unrelated_count, fn sequence ->
+        key = {@person, @sender, "chat-#{sequence}"}
+
+        {sequence,
+         %{kind: :conversation, key: key, payload: %{"kind" => "reply", "author" => "origin"}}}
+      end)
+
+    large = %{
+      selected
+      | bounce_revisions: revisions,
+        messages: messages,
+        origin_feeds: Map.put(selected.origin_feeds, origin_feed_key(), feed),
+        conversation_events: discussion_events
+    }
+
+    indexed = BounceDecision.rebuild_indexes(large)
+
+    assert :gb_trees.size(indexed.bounce_deadline_index) == 1
+    assert MapSet.size(indexed.bounce_origin_entries) == unrelated_count + 1
+    assert MapSet.size(indexed.bounce_discussed_messages) == 0
+    assert BounceDecision.next_deadline(indexed) == due_at
+
+    due = BounceDecision.evaluate_due(indexed, due_at)
+    assert selection(due)["decision"] == "bounced"
+    assert BounceDecision.advisory_cursor(due, @person, @origin, @handle) == 1
   end
 end
