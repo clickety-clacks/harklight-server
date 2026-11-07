@@ -335,11 +335,18 @@ defmodule AttentionServer.BounceDecisionTest do
   test "advisory feed change keys include only the originating sessions of changed messages" do
     {engine, _record} = fixture()
     other_key = {@person, @sender, "other-bounce-message"}
-    other_record = %{origin: "other-origin", session_handle: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"}
+
+    other_record = %{
+      origin: "other-origin",
+      session_handle: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+    }
+
     engine = %{engine | messages: Map.put(engine.messages, other_key, other_record)}
 
-    assert BounceDecision.advisory_feed_keys_for_changes(engine, [key(), key(), {"missing", "s", "m"}]) ==
-             [advisory_feed_key()]
+    assert BounceDecision.advisory_feed_keys_for_changes(
+             engine,
+             [key(), key(), {"missing", "s", "m"}]
+           ) == [advisory_feed_key()]
   end
 
   test "deadline and suppression indexes stay narrow across large retained history" do

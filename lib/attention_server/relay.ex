@@ -4376,6 +4376,7 @@ defmodule AttentionServer.Relay do
 
   defp put_scored_priority_view(state, person, items, entries, reply_summary) do
     old_engine = state.store.engine
+
     {next_engine, changed_keys} =
       BounceDecision.record_scores_with_changes(old_engine, person, entries, state.clock.())
 

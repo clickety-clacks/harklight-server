@@ -652,8 +652,7 @@ defmodule AttentionServer.BounceDecision do
     engine = %{
       engine
       | advisory_feeds: Map.put(engine.advisory_feeds, feed_key, updated_feed),
-        advisory_id_index:
-          Map.put(engine.advisory_id_index, {feed_key, advisory_id}, sequence)
+        advisory_id_index: Map.put(engine.advisory_id_index, {feed_key, advisory_id}, sequence)
     }
 
     update_selection(engine, key, state, sub_revision, selection, "bounced", nil, advisory_id)
