@@ -1058,13 +1058,10 @@ defmodule AttentionServer.Relay do
           )
 
         session_key = {person, key, handle}
-        receipt_key = {person, key, declaration["op_id"]}
 
-        case Store.commit_transient_origin_support(
+        case Store.commit(
                state.store,
                next,
-               session_key,
-               receipt_key,
                audit(old_engine, key, "origin_support")
              ) do
           {:ok, store} ->

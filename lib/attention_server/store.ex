@@ -1,8 +1,7 @@
 defmodule AttentionServer.Store do
   @moduledoc """
-  A transactional SQLite snapshot for the bounded relay core. Transient origin
-  availability updates are stored as checksummed overlays and folded into the
-  snapshot before the next full-state commit or after restart.
+  A transactional SQLite snapshot for the bounded relay core. Origin availability
+  and support updates are committed with the complete state before success replies.
 
   The server serializes decisions in one process. SQLite commits the complete
   new decision state and a content-free audit row before any success reply.
@@ -30,16 +29,6 @@ defmodule AttentionServer.Store do
   CREATE TABLE IF NOT EXISTS relay_state (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     version INTEGER NOT NULL,
-    payload BLOB NOT NULL,
-    checksum BLOB NOT NULL
-  );
-  CREATE TABLE IF NOT EXISTS relay_state_overlay (
-    id INTEGER PRIMARY KEY CHECK (id = 1),
-    base_version INTEGER NOT NULL,
-    base_checksum BLOB NOT NULL
-  );
-  CREATE TABLE IF NOT EXISTS relay_state_overlay_events (
-    version INTEGER PRIMARY KEY,
     payload BLOB NOT NULL,
     checksum BLOB NOT NULL
   );
@@ -994,395 +983,6 @@ defmodule AttentionServer.Store do
     end
   end
 
-  def commit_transient_origin_availability(
-        %__MODULE__{engine: old} = store,
-        next,
-        _session,
-        _audit
-      )
-      when old == next,
-      do: {:ok, store}
-
-  def commit_transient_origin_availability(
-        %__MODULE__{engine: old} = store,
-        next,
-        {person, _origin, _handle} = session_key,
-        audit
-      ) do
-    with {:ok, patch} <- origin_availability_patch(old, next, session_key, person),
-         :ok <- validate_transient_audit(audit) do
-      commit_transient_overlay(store, next, patch, audit)
-    else
-      _ ->
-        Diagnostics.failure(
-          :server_storage,
-          :state_commit,
-          :invalid_transient_state,
-          :unavailable,
-          operation_id(audit)
-        )
-
-        {:error, :storage_unavailable, store}
-    end
-  end
-
-  def commit_transient_origin_support(
-        %__MODULE__{engine: old} = store,
-        next,
-        {person, _origin, _handle} = session_key,
-        receipt_key,
-        audit
-      ) do
-    with {:ok, patch} <- origin_support_patch(old, next, session_key, receipt_key, person),
-         :ok <- validate_transient_audit(audit) do
-      commit_transient_overlay(store, next, patch, audit)
-    else
-      _ ->
-        Diagnostics.failure(
-          :server_storage,
-          :state_commit,
-          :invalid_transient_state,
-          :unavailable,
-          operation_id(audit)
-        )
-
-        {:error, :storage_unavailable, store}
-    end
-  end
-
-  defp commit_transient_overlay(%__MODULE__{db: nil} = store, next, _patch, _audit),
-    do: {:ok, %{store | engine: next}}
-
-  defp commit_transient_overlay(
-         %__MODULE__{db: db, version: version} = store,
-         next,
-         patch,
-         audit
-       ) do
-    payload = encode_overlay_patch(patch)
-    patch_checksum = :crypto.hash(:sha256, payload)
-    next_version = version + 1
-
-    result =
-      with :ok <- Sqlite3.execute(db, "BEGIN IMMEDIATE"),
-           {:ok, [current_checksum]} <-
-             one(db, "SELECT checksum FROM relay_state WHERE id = 1 AND version = ?", [version]),
-           {:ok, overlay} <-
-             one(
-               db,
-               "SELECT base_version, base_checksum FROM relay_state_overlay WHERE id = 1",
-               []
-             ),
-           {:ok, state_checksum} <- transient_state_checksum(current_checksum, overlay, version),
-           :ok <- ensure_overlay_base(db, overlay, version, current_checksum),
-           :ok <-
-             run(
-               db,
-               "UPDATE relay_state SET version = version + 1, checksum = ? WHERE id = 1 AND version = ?",
-               [{:blob, state_checksum}, version]
-             ),
-           {:ok, 1} <- Sqlite3.changes(db),
-           :ok <-
-             run(
-               db,
-               "INSERT INTO relay_state_overlay_events (version, payload, checksum) VALUES (?, ?, ?)",
-               [next_version, {:blob, payload}, {:blob, patch_checksum}]
-             ),
-           :ok <- insert_audit(db, audit),
-           :ok <- Sqlite3.execute(db, "COMMIT") do
-        :ok
-      end
-
-    case result do
-      :ok ->
-        {:ok, %{store | engine: next, version: next_version}}
-
-      error ->
-        _ = Sqlite3.execute(db, "ROLLBACK")
-
-        Diagnostics.failure(
-          :server_storage,
-          :state_commit,
-          error,
-          :outcome_unknown,
-          operation_id(audit)
-        )
-
-        {:error, :storage_unavailable, store}
-    end
-  end
-
-  defp transient_state_checksum(current_checksum, nil, _version)
-       when is_binary(current_checksum) and byte_size(current_checksum) == 32,
-       do: {:ok, invalidate_checksum(current_checksum)}
-
-  defp transient_state_checksum(current_checksum, [base_version, base_checksum], version)
-       when is_integer(base_version) and is_binary(base_checksum) and
-              byte_size(base_checksum) == 32 and base_version < version do
-    if current_checksum == invalidate_checksum(base_checksum),
-      do: {:ok, current_checksum},
-      else: {:error, :overlay_checksum_mismatch}
-  end
-
-  defp transient_state_checksum(_, _, _), do: {:error, :overlay_unavailable}
-
-  defp ensure_overlay_base(_db, [_base_version, _base_checksum], _version, _current_checksum),
-    do: :ok
-
-  defp ensure_overlay_base(db, nil, version, current_checksum) do
-    run(
-      db,
-      "INSERT INTO relay_state_overlay (id, base_version, base_checksum) VALUES (1, ?, ?)",
-      [version, {:blob, current_checksum}]
-    )
-  end
-
-  defp insert_audit(db, audit) do
-    run(
-      db,
-      "INSERT INTO relay_audit (person_id, actor_id, action, at_ms) VALUES (?, ?, ?, ?)",
-      [audit.person, audit.actor, audit.action, System.system_time(:millisecond)]
-    )
-  end
-
-  defp validate_transient_audit(%{person: person, actor: actor, action: action})
-       when is_binary(person) and is_binary(actor) and
-              action in ["origin_attach", "origin_detach", "origin_support"],
-       do: :ok
-
-  defp validate_transient_audit(_), do: {:error, :invalid_audit}
-
-  defp origin_availability_patch(
-         old,
-         %Engine{} = next,
-         {person, _origin, _handle} = session_key,
-         patch_person
-       )
-       when person == patch_person do
-    origin_state_patch(old, next, session_key, person, nil)
-  end
-
-  defp origin_availability_patch(_, _, _, _), do: {:error, :invalid_engine}
-
-  defp origin_support_patch(
-         old,
-         %Engine{} = next,
-         {person, origin, _handle} = session_key,
-         {receipt_person, receipt_origin, _op_id} = receipt_key,
-         patch_person
-       )
-       when person == patch_person and person == receipt_person and origin == receipt_origin do
-    origin_state_patch(old, next, session_key, person, receipt_key)
-  end
-
-  defp origin_support_patch(_, _, _, _, _), do: {:error, :invalid_receipt_key}
-
-  defp origin_state_patch(old, %Engine{} = next, session_key, person, receipt_key) do
-    changed_fields =
-      [:origin_sessions, :conversation_events, :conversation_highs, :push_bindings] ++
-        if(is_nil(receipt_key), do: [], else: [:receipts])
-
-    unchanged =
-      Map.keys(Map.from_struct(old))
-      |> Enum.reject(&(&1 in changed_fields))
-      |> Enum.all?(fn field -> Map.fetch!(old, field) === Map.fetch!(next, field) end)
-
-    old_session = Map.get(old.origin_sessions, session_key)
-    next_session = Map.get(next.origin_sessions, session_key)
-    old_high = Map.get(old.conversation_highs, person, 0)
-    next_high = Map.get(next.conversation_highs, person, 0)
-
-    events =
-      if is_integer(old_high) and is_integer(next_high) and next_high >= old_high do
-        if next_high == old_high do
-          %{}
-        else
-          Enum.reduce((old_high + 1)..next_high, %{}, fn seq, acc ->
-            event_key = {person, seq}
-            Map.put(acc, event_key, Map.fetch!(next.conversation_events, event_key))
-          end)
-        end
-      else
-        :invalid
-      end
-
-    bindings =
-      next.push_bindings
-      |> Enum.filter(fn {key, value} ->
-        match?({^person, _}, key) and Map.get(old.push_bindings, key) != value
-      end)
-      |> Map.new()
-
-    receipt_patch =
-      case receipt_key do
-        nil ->
-          %{}
-
-        {^person, origin, op_id} = key when is_binary(op_id) ->
-          receipt = Map.get(next.receipts, key)
-
-          # Engine.origin_support only adds this receipt. Keep validation off the retained history.
-          if origin == elem(session_key, 1) and is_map(receipt) and
-               is_binary(Map.get(receipt, :semantic)) and is_map(Map.get(receipt, :reply)) and
-               not Map.has_key?(old.receipts, key) and
-               map_size(next.receipts) == map_size(old.receipts) + 1 do
-            %{key => receipt}
-          else
-            :invalid
-          end
-      end
-
-    cond do
-      not unchanged ->
-        {:error, :unexpected_engine_change}
-
-      not is_map(old_session) or not is_map(next_session) ->
-        {:error, :missing_origin_session}
-
-      is_nil(events) or events == :invalid ->
-        {:error, :invalid_conversation_events}
-
-      map_size(events) != next_high - old_high ->
-        {:error, :conversation_high_mismatch}
-
-      not Enum.all?(events, fn {{event_person, seq}, event} ->
-        event_person == person and seq > old_high and seq <= next_high and
-          event.kind == :conversation and elem(event.key, 0) == person and
-          Map.has_key?(old.messages, event.key) and
-            get_in(event, [:payload, "kind"]) == "availability"
-      end) ->
-        {:error, :invalid_availability_event}
-
-      receipt_patch == :invalid ->
-        {:error, :invalid_support_receipt}
-
-      true ->
-        patch = %{
-          origin_sessions: %{session_key => next_session},
-          conversation_events: events,
-          conversation_highs: if(next_high > old_high, do: %{person => next_high}, else: %{}),
-          push_bindings: bindings
-        }
-
-        if map_size(receipt_patch) == 0,
-          do: {:ok, patch},
-          else: {:ok, Map.put(patch, :receipts, receipt_patch)}
-    end
-  rescue
-    _ -> {:error, :invalid_transient_state}
-  end
-
-  defp origin_state_patch(_, _, _, _, _), do: {:error, :invalid_engine}
-
-  defp encode_overlay_patch(%{receipts: _} = patch),
-    do: :erlang.term_to_binary({:attention_relay_state_overlay, 2, patch}, [{:compressed, 6}])
-
-  defp encode_overlay_patch(patch),
-    do: :erlang.term_to_binary({:attention_relay_state_overlay, 1, patch}, [{:compressed, 6}])
-
-  defp invalidate_checksum(<<first, rest::binary>>),
-    do: <<if(first == 0, do: 1, else: 0), rest::binary>>
-
-  defp clear_state_overlay(db) do
-    with :ok <- Sqlite3.execute(db, "DELETE FROM relay_state_overlay_events"),
-         :ok <- Sqlite3.execute(db, "DELETE FROM relay_state_overlay") do
-      :ok
-    end
-  end
-
-  defp load_state_overlay(db, version, state_checksum) do
-    with {:ok, overlay} <-
-           one(db, "SELECT base_version, base_checksum FROM relay_state_overlay WHERE id = 1", []),
-         {:ok, rows} <-
-           all(
-             db,
-             "SELECT version, payload, checksum FROM relay_state_overlay_events ORDER BY version",
-             []
-           ) do
-      case overlay do
-        nil ->
-          if rows == [], do: {:ok, state_checksum, []}, else: {:error, :invalid_overlay}
-
-        [base_version, base_checksum]
-        when is_integer(base_version) and base_version >= 0 and is_binary(base_checksum) and
-               byte_size(base_checksum) == 32 and version > base_version ->
-          expected_versions = Enum.to_list((base_version + 1)..version)
-          row_versions = Enum.map(rows, fn [row_version, _payload, _checksum] -> row_version end)
-
-          if state_checksum == invalidate_checksum(base_checksum) and
-               row_versions == expected_versions do
-            with {:ok, patches} <- decode_state_overlay_rows(rows) do
-              {:ok, base_checksum, patches}
-            end
-          else
-            {:error, :invalid_overlay}
-          end
-
-        _ ->
-          {:error, :invalid_overlay}
-      end
-    end
-  rescue
-    _ -> {:error, :invalid_overlay}
-  end
-
-  defp decode_state_overlay_rows(rows) do
-    engine_module = Engine
-    {:module, ^engine_module} = Code.ensure_loaded(engine_module)
-    conversation_module = Conversation
-    {:module, ^conversation_module} = Code.ensure_loaded(conversation_module)
-
-    Enum.reduce_while(rows, {:ok, []}, fn [_version, payload, checksum], {:ok, patches} ->
-      case decode_checked_term(payload, checksum) do
-        {:ok, {:attention_relay_state_overlay, format, patch}}
-        when format in [1, 2] and is_map(patch) ->
-          if valid_state_overlay_patch?(format, patch),
-            do: {:cont, {:ok, [patch | patches]}},
-            else: {:halt, {:error, :invalid_overlay}}
-
-        _ ->
-          {:halt, {:error, :invalid_overlay}}
-      end
-    end)
-    |> case do
-      {:ok, patches} -> {:ok, Enum.reverse(patches)}
-      error -> error
-    end
-  end
-
-  defp valid_state_overlay_patch?(1, patch) do
-    Map.keys(patch) |> Enum.sort() ==
-      Enum.sort([:origin_sessions, :conversation_events, :conversation_highs, :push_bindings]) and
-      Enum.all?(Map.values(patch), &is_map/1)
-  end
-
-  defp valid_state_overlay_patch?(2, patch) do
-    Map.keys(patch) |> Enum.sort() ==
-      Enum.sort([
-        :origin_sessions,
-        :conversation_events,
-        :conversation_highs,
-        :push_bindings,
-        :receipts
-      ]) and
-      Enum.all?(Map.values(patch), &is_map/1)
-  end
-
-  defp valid_state_overlay_patch?(_, _), do: false
-
-  defp apply_state_overlays(engine, patches) do
-    Enum.reduce(patches, engine, fn patch, current ->
-      %{
-        current
-        | origin_sessions: Map.merge(current.origin_sessions, patch.origin_sessions),
-          conversation_events: Map.merge(current.conversation_events, patch.conversation_events),
-          conversation_highs: Map.merge(current.conversation_highs, patch.conversation_highs),
-          push_bindings: Map.merge(current.push_bindings, patch.push_bindings),
-          receipts: Map.merge(current.receipts, Map.get(patch, :receipts, %{}))
-      }
-    end)
-  end
-
   defp commit_durable(%__MODULE__{db: db, version: version} = store, next, audit) do
     payload = encode_state(next)
     checksum = :crypto.hash(:sha256, payload)
@@ -1400,7 +1000,6 @@ defmodule AttentionServer.Store do
                ]
              ),
            {:ok, 1} <- Sqlite3.changes(db),
-           :ok <- clear_state_overlay(db),
            :ok <-
              run(
                db,
@@ -1453,208 +1052,200 @@ defmodule AttentionServer.Store do
         end
 
       {:ok, [version, payload, checksum]} when is_integer(version) and is_binary(payload) ->
-        case load_state_overlay(db, version, checksum) do
-          {:ok, base_checksum, overlay_patches} when is_binary(base_checksum) ->
-            if :crypto.hash(:sha256, payload) == base_checksum do
-              try do
-                # Safe decoding accepts only atoms already loaded by this VM.
-                # Load the modules that define persisted record fields before a
-                # cold release reads snapshots containing invitations, browser
-                # sign-ins, JSON decimal values or provider state.
-                for module <- [
-                      Engine,
-                      BounceDecision,
-                      GuidedJoin,
-                      BrowserSignIn,
-                      AttentionServer.JSON.DecimalToken,
-                      APNS,
-                      AttentionServer.AgentAccess,
-                      AttentionServer.Message
-                    ] do
-                  {:module, ^module} = Code.ensure_loaded(module)
-                end
-
-                case :erlang.binary_to_term(payload, [:safe]) do
-                  {:attention_relay_state, format, %Engine{} = stored}
-                  when format in [
-                         1,
-                         2,
-                         3,
-                         4,
-                         5,
-                         6,
-                         8,
-                         9,
-                         10,
-                         11,
-                         12,
-                         13,
-                         14,
-                         15,
-                         16,
-                         17,
-                         18,
-                         19,
-                         20,
-                         21,
-                         22,
-                         23,
-                         24,
-                         25,
-                         26,
-                         27
-                       ] ->
-                    original = struct(Engine, Map.from_struct(stored))
-
-                    engine =
-                      original
-                      |> then(fn state ->
-                        if format < 3, do: normalize_enrollments(state), else: state
-                      end)
-                      |> then(fn state ->
-                        if format < 8, do: normalize_pending_v8(state), else: state
-                      end)
-                      |> then(fn state ->
-                        if format < 9, do: normalize_agents_v9(state), else: state
-                      end)
-                      |> then(fn state ->
-                        if format < 10, do: normalize_push_v10(state), else: state
-                      end)
-                      |> then(fn state ->
-                        if format < 11, do: normalize_push_reasons_v11(state), else: state
-                      end)
-                      |> then(fn state ->
-                        if format < 13, do: normalize_device_metadata(state), else: state
-                      end)
-                      |> then(fn state ->
-                        if format < 15 do
-                          invitations =
-                            Map.new(state.join_invitations, fn {hash, item} ->
-                              {hash, Map.put_new(item, :request_id, nil)}
-                            end)
-
-                          %{state | join_invitations: invitations}
-                        else
-                          state
-                        end
-                      end)
-                      |> then(fn state ->
-                        if format < 16, do: normalize_resumable_pending(state), else: state
-                      end)
-                      |> then(fn state ->
-                        if format < 17, do: normalize_push_presentation(state), else: state
-                      end)
-                      |> then(fn state ->
-                        if format < 19, do: normalize_conversation_push(state), else: state
-                      end)
-                      |> then(fn state ->
-                        if format < 20, do: Map.put(state, :uploads, %{}), else: state
-                      end)
-                      |> then(fn state ->
-                        if format < 21 do
-                          now = System.system_time(:millisecond)
-
-                          uploads =
-                            Map.new(state.uploads, fn {id, upload} ->
-                              {id, Map.put_new(upload, :last_activity_ms, now)}
-                            end)
-
-                          %{state | uploads: uploads}
-                        else
-                          state
-                        end
-                      end)
-                      |> then(fn state ->
-                        if format < 22, do: Map.put(state, :hosted_accounts, %{}), else: state
-                      end)
-                      |> then(fn state ->
-                        if format < 23 do
-                          %{state | algorithm_choices: %{}, jev_endpoint: nil, jev_model: nil}
-                        else
-                          state
-                        end
-                      end)
-                      |> then(fn state ->
-                        if format < 24, do: %{state | chat_read_positions: %{}}, else: state
-                      end)
-                      |> then(fn state ->
-                        if format < 26 do
-                          %{
-                            state
-                            | bounce_levels: %{},
-                              bounce_revisions: %{},
-                              opened_revisions: MapSet.new(),
-                              advisory_feeds: %{}
-                          }
-                        else
-                          state
-                        end
-                      end)
-
-                    engine =
-                      engine
-                      |> apply_state_overlays(overlay_patches)
-                      |> BounceDecision.rebuild_indexes()
-
-                    cond do
-                      not valid_state?(engine) ->
-                        {:error, :invalid_state}
-
-                      format == @format_version and
-                          same_state_except_bounce_indexes?(engine, original) ->
-                        {:ok, engine, version}
-
-                      true ->
-                        case commit_durable(
-                               %__MODULE__{db: db, engine: original, version: version},
-                               engine,
-                               %{
-                                 person: "system",
-                                 actor: "schema_migration",
-                                 action:
-                                   cond do
-                                     format < 3 -> "enrollment_revision_init"
-                                     format < 4 -> "owner_state_init"
-                                     format < 5 -> "pending_state_init"
-                                     format < 6 -> "maintainer_state_init"
-                                     format < 7 -> "pending_v8_readback_init"
-                                     format < 9 -> "agent_authority_init"
-                                     format < 10 -> "push_state_init"
-                                     format < 11 -> "push_reason_sanitize"
-                                     format < 12 -> "join_invitation_init"
-                                     format < 13 -> "device_metadata_init"
-                                     format < 14 -> "browser_sign_in_init"
-                                     format < 15 -> "invitation_request_init"
-                                     format < 16 -> "resumable_pending_init"
-                                     format < 17 -> "push_presentation_init"
-                                     format < 18 -> "conversation_feed_init"
-                                     format < 23 -> "prioritization_init"
-                                     format < 24 -> "chat_read_positions_init"
-                                     format < 26 -> "bounce_state_init"
-                                     format < 27 -> "bounce_schedule_index_init"
-                                     true -> "state_format"
-                                   end
-                               }
-                             ) do
-                          {:ok, migrated} -> {:ok, migrated.engine, migrated.version}
-                          _ -> {:error, :migration_failed}
-                        end
-                    end
-
-                  _ ->
-                    {:error, :invalid_state}
-                end
-              rescue
-                error ->
-                  Diagnostics.failure(:server_storage, :store_open, error, :unavailable)
-                  {:error, :invalid_state}
-              end
-            else
-              {:error, :invalid_checksum}
+        if :crypto.hash(:sha256, payload) == checksum do
+          try do
+            # Safe decoding accepts only atoms already loaded by this VM.
+            # Load the modules that define persisted record fields before a
+            # cold release reads snapshots containing invitations, browser
+            # sign-ins, JSON decimal values or provider state.
+            for module <- [
+                  Engine,
+                  BounceDecision,
+                  Conversation,
+                  GuidedJoin,
+                  BrowserSignIn,
+                  AttentionServer.JSON.DecimalToken,
+                  APNS,
+                  AttentionServer.AgentAccess,
+                  AttentionServer.Message
+                ] do
+              {:module, ^module} = Code.ensure_loaded(module)
             end
 
-          {:error, reason} ->
-            {:error, reason}
+            case :erlang.binary_to_term(payload, [:safe]) do
+              {:attention_relay_state, format, %Engine{} = stored}
+              when format in [
+                     1,
+                     2,
+                     3,
+                     4,
+                     5,
+                     6,
+                     8,
+                     9,
+                     10,
+                     11,
+                     12,
+                     13,
+                     14,
+                     15,
+                     16,
+                     17,
+                     18,
+                     19,
+                     20,
+                     21,
+                     22,
+                     23,
+                     24,
+                     25,
+                     26,
+                     27
+                   ] ->
+                original = struct(Engine, Map.from_struct(stored))
+
+                engine =
+                  original
+                  |> then(fn state ->
+                    if format < 3, do: normalize_enrollments(state), else: state
+                  end)
+                  |> then(fn state ->
+                    if format < 8, do: normalize_pending_v8(state), else: state
+                  end)
+                  |> then(fn state ->
+                    if format < 9, do: normalize_agents_v9(state), else: state
+                  end)
+                  |> then(fn state ->
+                    if format < 10, do: normalize_push_v10(state), else: state
+                  end)
+                  |> then(fn state ->
+                    if format < 11, do: normalize_push_reasons_v11(state), else: state
+                  end)
+                  |> then(fn state ->
+                    if format < 13, do: normalize_device_metadata(state), else: state
+                  end)
+                  |> then(fn state ->
+                    if format < 15 do
+                      invitations =
+                        Map.new(state.join_invitations, fn {hash, item} ->
+                          {hash, Map.put_new(item, :request_id, nil)}
+                        end)
+
+                      %{state | join_invitations: invitations}
+                    else
+                      state
+                    end
+                  end)
+                  |> then(fn state ->
+                    if format < 16, do: normalize_resumable_pending(state), else: state
+                  end)
+                  |> then(fn state ->
+                    if format < 17, do: normalize_push_presentation(state), else: state
+                  end)
+                  |> then(fn state ->
+                    if format < 19, do: normalize_conversation_push(state), else: state
+                  end)
+                  |> then(fn state ->
+                    if format < 20, do: Map.put(state, :uploads, %{}), else: state
+                  end)
+                  |> then(fn state ->
+                    if format < 21 do
+                      now = System.system_time(:millisecond)
+
+                      uploads =
+                        Map.new(state.uploads, fn {id, upload} ->
+                          {id, Map.put_new(upload, :last_activity_ms, now)}
+                        end)
+
+                      %{state | uploads: uploads}
+                    else
+                      state
+                    end
+                  end)
+                  |> then(fn state ->
+                    if format < 22, do: Map.put(state, :hosted_accounts, %{}), else: state
+                  end)
+                  |> then(fn state ->
+                    if format < 23 do
+                      %{state | algorithm_choices: %{}, jev_endpoint: nil, jev_model: nil}
+                    else
+                      state
+                    end
+                  end)
+                  |> then(fn state ->
+                    if format < 24, do: %{state | chat_read_positions: %{}}, else: state
+                  end)
+                  |> then(fn state ->
+                    if format < 26 do
+                      %{
+                        state
+                        | bounce_levels: %{},
+                          bounce_revisions: %{},
+                          opened_revisions: MapSet.new(),
+                          advisory_feeds: %{}
+                      }
+                    else
+                      state
+                    end
+                  end)
+
+                engine = BounceDecision.rebuild_indexes(engine)
+
+                cond do
+                  not valid_state?(engine) ->
+                    {:error, :invalid_state}
+
+                  format == @format_version and
+                      same_state_except_bounce_indexes?(engine, original) ->
+                    {:ok, engine, version}
+
+                  true ->
+                    case commit_durable(
+                           %__MODULE__{db: db, engine: original, version: version},
+                           engine,
+                           %{
+                             person: "system",
+                             actor: "schema_migration",
+                             action:
+                               cond do
+                                 format < 3 -> "enrollment_revision_init"
+                                 format < 4 -> "owner_state_init"
+                                 format < 5 -> "pending_state_init"
+                                 format < 6 -> "maintainer_state_init"
+                                 format < 7 -> "pending_v8_readback_init"
+                                 format < 9 -> "agent_authority_init"
+                                 format < 10 -> "push_state_init"
+                                 format < 11 -> "push_reason_sanitize"
+                                 format < 12 -> "join_invitation_init"
+                                 format < 13 -> "device_metadata_init"
+                                 format < 14 -> "browser_sign_in_init"
+                                 format < 15 -> "invitation_request_init"
+                                 format < 16 -> "resumable_pending_init"
+                                 format < 17 -> "push_presentation_init"
+                                 format < 18 -> "conversation_feed_init"
+                                 format < 23 -> "prioritization_init"
+                                 format < 24 -> "chat_read_positions_init"
+                                 format < 26 -> "bounce_state_init"
+                                 format < 27 -> "bounce_schedule_index_init"
+                                 true -> "state_format"
+                               end
+                           }
+                         ) do
+                      {:ok, migrated} -> {:ok, migrated.engine, migrated.version}
+                      _ -> {:error, :migration_failed}
+                    end
+                end
+
+              _ ->
+                {:error, :invalid_state}
+            end
+          rescue
+            error ->
+              Diagnostics.failure(:server_storage, :store_open, error, :unavailable)
+              {:error, :invalid_state}
+          end
+        else
+          {:error, :invalid_checksum}
         end
 
       error ->
@@ -2085,7 +1676,6 @@ defmodule AttentionServer.Store do
              [{:blob, payload}, {:blob, checksum}, version]
            ),
          {:ok, 1} <- Sqlite3.changes(db),
-         :ok <- clear_state_overlay(db),
          :ok <-
            run(
              db,
