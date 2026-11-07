@@ -684,7 +684,7 @@ defmodule AttentionServer.OriginHTTPS do
                  Diagnostics.result(
                    :origin_https,
                    :stream_status,
-                   Relay.origin_status(relay, key, handle),
+                   stream_status(relay, key, handle),
                    :closed
                  ),
                :ok <- stream_send(socket, stream_headers(), :response_write),
@@ -720,6 +720,9 @@ defmodule AttentionServer.OriginHTTPS do
     end
   end
 
+  defp stream_status(relay, key, :origin), do: Relay.origin_status(relay, key, :origin)
+  defp stream_status(relay, key, handle), do: Relay.origin_status(relay, key, handle)
+
   defp stream_send(socket, bytes, phase),
     do: Diagnostics.result(:origin_https, phase, :ssl.send(socket, bytes), :closed)
 
@@ -742,6 +745,15 @@ defmodule AttentionServer.OriginHTTPS do
     receive do
       :origin_stream_replaced ->
         :ok
+
+      :origin_scope_replaced ->
+        stream_send(socket, "event: replaced\ndata: {}\n\n", :stream_write)
+
+      :origin_coverage_changed ->
+        case stream_send(socket, "event: coverage\ndata: {}\n\n", :stream_write) do
+          :ok -> stream_loop(socket, cursor, advisory_cursor)
+          _ -> :ok
+        end
 
       {:origin_state_changed, next} when is_integer(next) and next > cursor ->
         case stream_send(socket, change_notice(next), :stream_write) do
@@ -803,6 +815,7 @@ defmodule AttentionServer.OriginHTTPS do
 
   defp transport_error(:method_not_allowed), do: {405, "method_not_allowed"}
   defp transport_error(:not_found), do: {404, "not_found"}
+  defp transport_error(:invalid_field), do: {400, "invalid_field"}
   defp transport_error(:invalid_json), do: {400, "invalid_json"}
   defp transport_error(_), do: {400, "bad_frame"}
 
@@ -820,9 +833,9 @@ defmodule AttentionServer.OriginHTTPS do
             _ -> {:error, :invalid_json}
           end
 
-        {:stream, handle, reconnect} ->
+        {:stream, handle, reconnect, advisory} ->
           if remainder == <<>>,
-            do: {:ok, {:stream, handle, reconnect}},
+            do: {:ok, {:stream, handle, reconnect, advisory}},
             else: {:error, :bad_frame}
 
         {:upload, attrs, size} ->
@@ -956,7 +969,27 @@ defmodule AttentionServer.OriginHTTPS do
       else: {:error, :bad_frame}
   end
 
-  defp parse_stream_headers(path, fields) do
+  defp parse_stream_headers("/origin/v1/stream?" <> query = path, fields) do
+    options = String.split(query, "&")
+
+    if "scope=origin" in options do
+      with {:ok, headers} <- headers(fields, %{}),
+           false <- Map.has_key?(headers, "transfer-encoding"),
+           false <- Map.has_key?(headers, "content-length"),
+           true <- Enum.all?(options, &(&1 in ["scope=origin", "reconnect=1"])),
+           true <- length(options) == length(Enum.uniq(options)) do
+        {:ok, {:stream, :origin, "reconnect=1" in options, false}}
+      else
+        _ -> {:error, :invalid_field}
+      end
+    else
+      parse_handle_stream_headers(path, fields)
+    end
+  end
+
+  defp parse_stream_headers(_, _), do: {:error, :not_found}
+
+  defp parse_handle_stream_headers(path, fields) do
     with {:ok, headers} <- headers(fields, %{}),
          false <- Map.has_key?(headers, "transfer-encoding"),
          false <- Map.has_key?(headers, "content-length"),

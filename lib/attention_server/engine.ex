@@ -2731,12 +2731,15 @@ defmodule AttentionServer.Engine do
          true <- Message.uuid_v4?(frame["op_id"]),
          true <- Map.has_key?(frame, "vendor_session_id"),
          true <-
-           Conversation.valid_session?(frame["session_handle"], frame["vendor_session_id"]) do
+           Conversation.valid_session?(frame["session_handle"], frame["vendor_session_id"]),
+         {:ok, support} <- Conversation.support_from_frame(frame) do
       semantic = %{
         "type" => "attachment_update",
         "session_handle" => frame["session_handle"],
         "vendor_session_id" => frame["vendor_session_id"]
       }
+
+      semantic = if support, do: Map.put(semantic, "support", support), else: semantic
 
       case receipt(engine, person, key, frame["op_id"], semantic) do
         {:duplicate, reply} ->
@@ -2759,11 +2762,22 @@ defmodule AttentionServer.Engine do
               "vendor_session_id" => stored.vendor_session_id
             }
 
+            {next, reply} =
+              if support do
+                {:ok, next, record} =
+                  Conversation.store_support(next, person, key, frame["session_handle"], support)
+
+                {next, Map.put(reply, "listening_support", record)}
+              else
+                {next, reply}
+              end
+
             {:ok, save_receipt(next, person, key, frame["op_id"], semantic, reply), reply}
           end
       end
     else
       false -> {:error, :invalid_field}
+      {:error, field} when is_binary(field) -> {:error, :invalid_field}
       error -> error
     end
   end
@@ -3795,6 +3809,17 @@ defmodule AttentionServer.Engine do
             else: Map.put(fields, "supersedes_warnings", warnings)
 
         fields = put_field_warnings(fields, field_warnings)
+
+        fields =
+          if is_map(support) and Map.has_key?(support, "origin_listener") do
+            Map.put(
+              fields,
+              "listening_support",
+              get_in(next.origin_sessions, [{person, device, record.session_handle}, :support])
+            )
+          else
+            fields
+          end
 
         next = save_receipt(next, person, device, op, semantic, fields)
         {:ok, next, fields}

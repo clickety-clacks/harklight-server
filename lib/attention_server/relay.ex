@@ -128,6 +128,8 @@ defmodule AttentionServer.Relay do
   def origin_ack2(server, verified_device_key, feed_seq, declaration),
     do: GenServer.call(server, {:origin_ack2, verified_device_key, feed_seq, declaration})
 
+  def origin_coverage(server, key), do: GenServer.call(server, {:origin_coverage, key})
+
   def origin_support(server, verified_device_key, declaration),
     do: GenServer.call(server, {:origin_support, verified_device_key, declaration})
 
@@ -1022,12 +1024,30 @@ defmodule AttentionServer.Relay do
     end
   end
 
+  def handle_call({:origin_coverage, key}, _from, state) do
+    case Engine.authorized_person(state.store.engine, key) do
+      {:ok, person} -> {:reply, {:ok, covered_handles(state.store.engine, person, key)}, state}
+      error -> {:reply, error, state}
+    end
+  end
+
+  def handle_call({:origin_status, key, :origin}, _from, state) do
+    case Engine.authorized_person(state.store.engine, key) do
+      {:ok, person} ->
+        high = Map.get(state.store.engine.origin_feeds, {person, key}, %{high: 0}).high
+        {:reply, {:ok, %{"cursor" => high}}, state}
+
+      error ->
+        {:reply, error, state}
+    end
+  end
+
   def handle_call({:origin_status, key, handle}, _from, state) do
     engine = state.store.engine
 
     case Engine.authorized_person(engine, key) do
       {:ok, person} ->
-        listening? = Map.has_key?(state.origin_streams, {person, key, handle})
+        listening? = origin_listening?(state, engine, {person, key, handle})
         {:reply, Engine.origin_status(engine, key, handle, listening?), state}
 
       error ->
@@ -1044,7 +1064,7 @@ defmodule AttentionServer.Relay do
         old_engine = state.store.engine
         {:ok, person} = Engine.authorized_person(next, key)
         handle = declaration["session_handle"]
-        listening? = Map.has_key?(state.origin_streams, {person, key, handle})
+        listening? = origin_listening?(state, next, {person, key, handle})
         {:ok, current} = Engine.origin_status(next, key, handle, listening?)
 
         next =
@@ -1072,6 +1092,7 @@ defmodule AttentionServer.Relay do
 
             next_state =
               %{state | store: store}
+              |> notify_coverage_change(old_engine, person, key)
               |> refresh_stream_advisory_support({person, key, handle})
               |> reschedule_bounce_sweep()
 
@@ -1092,9 +1113,21 @@ defmodule AttentionServer.Relay do
         {:reply, {:ok, reply}, state}
 
       {:ok, next, reply} ->
+        {:ok, person} = Engine.authorized_person(next, key)
+        proposed = %{state | store: %{state.store | engine: next}}
+        next = origin_availability_changes(state, proposed, person, key)
+
         case commit(state.store, next, audit(state.store.engine, key, "origin_attachment_update")) do
-          {:ok, store} -> {:reply, {:ok, reply}, %{state | store: store}}
-          _ -> {:reply, {:error, :storage_unavailable}, state}
+          {:ok, store} ->
+            updated =
+              %{state | store: store}
+              |> notify_coverage_change(state.store.engine, person, key)
+              |> requeue_covered(person, key)
+
+            {:reply, {:ok, reply}, updated}
+
+          _ ->
+            {:reply, {:error, :storage_unavailable}, state}
         end
 
       error ->
@@ -1373,7 +1406,7 @@ defmodule AttentionServer.Relay do
     case Engine.origin_session_gone(state.store.engine, key, handle) do
       {:ok, next} ->
         {:ok, person} = Engine.authorized_person(next, key)
-        listening? = Map.has_key?(state.origin_streams, {person, key, handle})
+        listening? = origin_listening?(state, next, {person, key, handle})
         {:ok, previous} = Engine.origin_status(state.store.engine, key, handle, listening?)
         {:ok, current} = Engine.origin_status(next, key, handle, listening?)
 
@@ -1402,6 +1435,46 @@ defmodule AttentionServer.Relay do
 
       error ->
         {:reply, error, state}
+    end
+  end
+
+  def handle_call({:origin_stream_attach, key, :origin, worker, reconnect, false}, _from, state) do
+    with {:ok, person} <- Engine.authorized_person(state.store.engine, key),
+         stream_key = {person, key, :origin},
+         false <- not reconnect and Map.has_key?(state.origin_streams, stream_key) do
+      proposed = put_in(state.origin_streams[stream_key], %{worker: worker})
+      next = origin_availability_changes(state, proposed, person, key)
+
+      case Store.commit(state.store, next, audit(state.store.engine, key, "origin_attach")) do
+        {:ok, store} ->
+          if previous = state.origin_streams[stream_key] do
+            Process.demonitor(previous.monitor, [:flush])
+            if previous.worker != worker, do: send(previous.worker, :origin_scope_replaced)
+          end
+
+          stream = %{worker: worker, monitor: Process.monitor(worker), advisory_v1: false}
+
+          next_state = %{
+            proposed
+            | store: store,
+              origin_streams: Map.put(proposed.origin_streams, stream_key, stream),
+              origin_streams_by_identity:
+                Map.update(
+                  state.origin_streams_by_identity,
+                  {person, key},
+                  MapSet.new([stream_key]),
+                  &MapSet.put(&1, stream_key)
+                )
+          }
+
+          {:reply, :ok, requeue_covered(next_state, person, key)}
+
+        _ ->
+          {:reply, {:error, :storage_unavailable}, state}
+      end
+    else
+      true -> {:reply, {:error, :already_listening}, state}
+      error -> {:reply, error, state}
     end
   end
 
@@ -2886,6 +2959,29 @@ defmodule AttentionServer.Relay do
     end
   end
 
+  defp detach_origin_stream(state, {person, origin, :origin} = key) do
+    {stream, streams} = Map.pop(state.origin_streams, key)
+    if stream, do: Process.demonitor(stream.monitor, [:flush])
+
+    proposed = %{
+      state
+      | origin_streams: streams,
+        origin_streams_by_identity:
+          remove_origin_stream_index(state.origin_streams_by_identity, {person, origin}, key)
+    }
+
+    next = origin_availability_changes(state, proposed, person, origin)
+
+    case Store.commit(state.store, next, audit(state.store.engine, origin, "origin_detach")) do
+      {:ok, store} ->
+        %{proposed | store: store}
+
+      error ->
+        Diagnostics.failure(:origin_https, :stream_detach, error, :unavailable)
+        proposed
+    end
+  end
+
   defp detach_origin_stream(state, {person, origin, handle} = key) do
     {stream, streams} = Map.pop(state.origin_streams, key)
     if stream, do: Process.demonitor(stream.monitor, [:flush])
@@ -2899,7 +2995,12 @@ defmodule AttentionServer.Relay do
           Diagnostics.result(
             :origin_https,
             :stream_status,
-            Engine.origin_status(next, origin, handle, false),
+            Engine.origin_status(
+              next,
+              origin,
+              handle,
+              origin_listening?(%{state | origin_streams: streams}, next, key)
+            ),
             :unavailable
           )
 
@@ -3854,6 +3955,7 @@ defmodule AttentionServer.Relay do
 
   defp perform_request(state, key, raw) do
     {next_engine, reply} = Engine.request_line(state.store.engine, key, raw, state.clock.())
+    next_engine = with_coverage_availability(state, key, next_engine)
     next_engine = with_initial_origin_availability(state, key, next_engine)
 
     operation_id =
@@ -3885,6 +3987,7 @@ defmodule AttentionServer.Relay do
 
   defp perform_request_frame(state, key, frame) do
     {next_engine, reply} = Engine.request_frame(state.store.engine, key, frame, state.clock.())
+    next_engine = with_coverage_availability(state, key, next_engine)
     next_engine = with_initial_origin_availability(state, key, next_engine)
     operation_id = Diagnostics.operation_id(frame)
     targets = origin_feed_targets(state.store.engine, next_engine, key, frame)
@@ -3916,6 +4019,12 @@ defmodule AttentionServer.Relay do
            ) do
         {:ok, store} ->
           next_state = %{state | store: store}
+
+          next_state =
+            case Engine.authorized_person(next_engine, key) do
+              {:ok, person} -> notify_coverage_change(next_state, state.store.engine, person, key)
+              _ -> next_state
+            end
 
           next_state =
             Enum.reduce(targets, next_state, fn target, current ->
@@ -4742,6 +4851,125 @@ defmodule AttentionServer.Relay do
 
   defp normalize_model(_), do: {:error, :invalid_model}
 
+  defp covered_handles(engine, person, origin) do
+    handles =
+      for {{^person, ^origin, handle}, session} <- engine.origin_sessions,
+          get_in(session, [:support, "origin_listener"]) == true,
+          do: handle
+
+    Enum.sort(handles)
+  end
+
+  defp origin_listening?(state, engine, {person, origin, _handle} = key) do
+    Map.has_key?(state.origin_streams, key) or
+      (Map.has_key?(state.origin_streams, {person, origin, :origin}) and
+         get_in(engine.origin_sessions, [key, :support, "origin_listener"]) == true)
+  end
+
+  defp origin_availability_changes(before, after_state, person, origin) do
+    Enum.reduce(after_state.store.engine.origin_sessions, after_state.store.engine, fn
+      {{^person, ^origin, handle} = key, _}, engine ->
+        old =
+          Engine.origin_status(
+            before.store.engine,
+            origin,
+            handle,
+            origin_listening?(before, before.store.engine, key)
+          )
+
+        {:ok, current} =
+          Engine.origin_status(
+            engine,
+            origin,
+            handle,
+            origin_listening?(after_state, engine, key)
+          )
+
+        previous =
+          case old do
+            {:ok, status} -> status["availability"]
+            _ -> nil
+          end
+
+        if is_nil(previous) or previous == current["availability"] do
+          engine
+        else
+          engine =
+            if current["availability"] == "not_listening" do
+              {:ok, detached} = Conversation.mark_detached(engine, person, origin, handle)
+              detached
+            else
+              engine
+            end
+
+          {:ok, current} =
+            Engine.origin_status(
+              engine,
+              origin,
+              handle,
+              origin_listening?(after_state, engine, key)
+            )
+
+          Engine.origin_availability(
+            engine,
+            person,
+            origin,
+            handle,
+            current["availability"],
+            current["last_detached_at"]
+          )
+        end
+
+      _, engine ->
+        engine
+    end)
+  end
+
+  defp with_coverage_availability(state, _key, next)
+       when state.store.engine.origin_sessions == next.origin_sessions, do: next
+
+  defp with_coverage_availability(state, key, next) do
+    case Engine.authorized_person(next, key) do
+      {:ok, person} ->
+        origin_availability_changes(
+          state,
+          %{state | store: %{state.store | engine: next}},
+          person,
+          key
+        )
+
+      _ ->
+        next
+    end
+  end
+
+  defp requeue_covered(state, person, origin) do
+    engine =
+      Enum.reduce(
+        covered_handles(state.store.engine, person, origin),
+        state.store.engine,
+        fn handle, engine ->
+          BounceDecision.requeue_supported_session(engine, {person, origin, handle})
+        end
+      )
+
+    %{state | store: %{state.store | engine: engine}} |> reschedule_bounce_sweep()
+  end
+
+  defp notify_coverage_change(state, old_engine, person, origin) do
+    if covered_handles(old_engine, person, origin) !=
+         covered_handles(state.store.engine, person, origin) do
+      case state.origin_streams[{person, origin, :origin}] do
+        %{worker: worker} -> send(worker, :origin_coverage_changed)
+        _ -> :ok
+      end
+
+      requeue_covered(state, person, origin)
+    else
+      state
+    end
+  end
+
   defp with_initial_origin_availability(state, key, next_engine) do
     case Engine.authorized_person(next_engine, key) do
       {:ok, person} ->
@@ -4754,7 +4982,7 @@ defmodule AttentionServer.Relay do
 
             if is_binary(Map.get(record, :session_handle)) do
               handle = record.session_handle
-              listening? = Map.has_key?(state.origin_streams, {person, key, handle})
+              listening? = origin_listening?(state, next_engine, {person, key, handle})
               {:ok, current} = Engine.origin_status(next_engine, key, handle, listening?)
 
               Engine.origin_delivery_availability(
