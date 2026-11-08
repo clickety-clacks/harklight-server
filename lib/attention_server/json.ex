@@ -43,16 +43,15 @@ defmodule AttentionServer.JSON do
     type = Map.get(frame, "type")
     message = Map.get(frame, "message")
     answer_ui = if is_map(message), do: Map.get(message, "answer_ui"), else: nil
-    document = if is_map(answer_ui), do: Map.get(answer_ui, "document"), else: nil
 
     with true <- type in ["send", "revise", "forward", "conversation_revise"],
          %{"schema" => @ui1_schema} <- answer_ui,
-         true <- has_marked_duplicates?(document) do
-      without_document =
+         true <- has_marked_duplicates?(answer_ui) do
+      without_answer_ui =
         frame
-        |> Map.put("message", Map.put(message, "answer_ui", Map.put(answer_ui, "document", nil)))
+        |> Map.put("message", Map.put(message, "answer_ui", nil))
 
-      not has_marked_duplicates?(without_document)
+      not has_marked_duplicates?(without_answer_ui)
     else
       _ -> false
     end

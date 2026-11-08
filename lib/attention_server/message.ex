@@ -156,9 +156,8 @@ defmodule AttentionServer.Message do
   @doc false
   def validate_ui1_controls(message) when is_map(message) and not is_struct(message) do
     case {Map.get(message, "message_type"), Map.get(message, "answer_ui")} do
-      {"request", %{"schema" => @ui_schema, "document" => document}}
-      when is_map(document) and not is_struct(document) ->
-        case Map.get(document, "inputs") do
+      {"request", %{"schema" => @ui_schema} = answer_ui} ->
+        case Map.get(answer_ui, "inputs") do
           inputs when is_list(inputs) and inputs != [] ->
             :ok
 
@@ -179,9 +178,9 @@ defmodule AttentionServer.Message do
       when is_map(message) and not is_struct(message) and is_list(delivered_file_names) do
     case get_in(message, ["answer_ui", "schema"]) do
       @ui_schema ->
-        document = get_in(message, ["answer_ui", "document"])
+        answer_ui = Map.get(message, "answer_ui")
 
-        case AttentionServer.UI1.validate(document, delivered_file_names) do
+        case AttentionServer.UI1.validate(answer_ui, delivered_file_names) do
           :ok ->
             validate_ui1_controls(message)
 

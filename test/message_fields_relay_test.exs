@@ -261,10 +261,7 @@ defmodule AttentionServer.MessageFieldsRelayTest do
       "created_at" => 1,
       "title" => "Choose a cover",
       "message_type" => "request",
-      "answer_ui" => %{
-        "schema" => "attention-client.ui/1",
-        "document" => image_document.("missing.png")
-      }
+      "answer_ui" => image_document.("missing.png")
     }
 
     assert %{
@@ -285,8 +282,29 @@ defmodule AttentionServer.MessageFieldsRelayTest do
     assert reason =~ "cover.png"
     assert {:ok, [], 0} = Relay.events(relay, "reader", 0)
 
-    valid_message =
-      put_in(invalid_message, ["answer_ui", "document"], image_document.("cover.png"))
+    wrapped_message =
+      Map.put(invalid_message, "answer_ui", %{
+        "schema" => "attention-client.ui/1",
+        "document" => image_document.("cover.png")
+      })
+
+    assert %{
+             "type" => "error",
+             "code" => "request_answer_ui_invalid",
+             "reason" => wrapped_reason
+           } =
+             request(relay, "origin", %{
+               "type" => "forward",
+               "op_id" => op(29),
+               "session_handle" => @handle,
+               "message" => wrapped_message,
+               "files" => [attached_file]
+             })
+
+    assert wrapped_reason =~ "answer_ui (attention-client.ui/1) at "
+    assert {:ok, [], 0} = Relay.events(relay, "reader", 0)
+
+    valid_message = Map.put(invalid_message, "answer_ui", image_document.("cover.png"))
 
     assert %{"type" => "ok"} =
              request(relay, "origin", %{
@@ -309,7 +327,7 @@ defmodule AttentionServer.MessageFieldsRelayTest do
     setup_devices(relay)
 
     raw =
-      ~s|{"v":1,"type":"send","op_id":"#{op(31)}","message":{"sender_id":"app:test","message_id":"duplicate-ui1","created_at":1,"title":"Choose","message_type":"request","answer_ui":{"schema":"attention-client.ui/1","document":{"schema":"attention-client.ui/1","schema":"attention-client.ui/1"}}}}| <>
+      ~s|{"v":1,"type":"send","op_id":"#{op(31)}","message":{"sender_id":"app:test","message_id":"duplicate-ui1","created_at":1,"title":"Choose","message_type":"request","answer_ui":{"schema":"attention-client.ui/1","schema":"attention-client.ui/1"}}}| <>
         "\n"
 
     assert {:error, :bad_frame} = JSON.decode_line(raw)
@@ -373,14 +391,14 @@ defmodule AttentionServer.MessageFieldsRelayTest do
     assert byte_size(sent_json) == 65_537
 
     raw =
-      ~s|{"v":1,"type":"forward","op_id":"#{op(35)}","message":{"sender_id":"app:test","message_id":"minus-zero-boundary","created_at":1,"title":"Poster","answer_ui":{"schema":"attention-client.ui/1","document":| <>
+      ~s|{"v":1,"type":"forward","op_id":"#{op(35)}","message":{"sender_id":"app:test","message_id":"minus-zero-boundary","created_at":1,"title":"Poster","answer_ui":| <>
         sent_json <>
-        "}}}\n"
+        "}}\n"
 
     assert {:ok, response} = Relay.request_line(relay, "origin", raw)
     assert {:ok, %{"type" => "ok"}} = JSON.decode_line(response)
     assert {:ok, [delivery], 1} = Relay.events(relay, "reader", 0)
-    delivered_document = delivery["message"]["answer_ui"]["document"]
+    delivered_document = delivery["message"]["answer_ui"]
     assert byte_size(JSON.encode!(delivered_document)) == 65_536
     assert :ok = AttentionServer.UI1.validate(delivered_document, [])
     GenServer.stop(relay)
@@ -408,7 +426,7 @@ defmodule AttentionServer.MessageFieldsRelayTest do
       "created_at" => 1,
       "title" => "No inputs",
       "message_type" => "request",
-      "answer_ui" => %{"schema" => "attention-client.ui/1", "document" => no_inputs}
+      "answer_ui" => no_inputs
     }
 
     assert %{
@@ -447,7 +465,7 @@ defmodule AttentionServer.MessageFieldsRelayTest do
       "created_at" => 2,
       "title" => "Valid UI/1",
       "message_type" => "request",
-      "answer_ui" => %{"schema" => "attention-client.ui/1", "document" => valid_document}
+      "answer_ui" => valid_document
     }
 
     assert %{"type" => "ok", "seq" => 1} =
@@ -459,7 +477,7 @@ defmodule AttentionServer.MessageFieldsRelayTest do
              })
 
     invalid_replacement =
-      put_in(valid_message, ["answer_ui", "document", "requires"], ["scene/1"])
+      put_in(valid_message, ["answer_ui", "requires"], ["scene/1"])
 
     assert %{
              "type" => "error",
@@ -600,7 +618,7 @@ defmodule AttentionServer.MessageFieldsRelayTest do
       "message_id" => "ui1-controls-on-revise",
       "created_at" => 1,
       "title" => "Untyped UI/1",
-      "answer_ui" => %{"schema" => "attention-client.ui/1", "document" => document}
+      "answer_ui" => document
     }
 
     assert %{"type" => "ok", "seq" => 1} =

@@ -31,7 +31,7 @@ defmodule AttentionServer.MessageFieldsTest do
 
   @ui1_answer_ui %{
     "schema" => "attention-client.ui/1",
-    "document" => %{"inputs" => [%{"kind" => "text", "id" => "reply", "label" => "Reply"}]}
+    "inputs" => [%{"kind" => "text", "id" => "reply", "label" => "Reply"}]
   }
 
   defp message do
@@ -105,10 +105,7 @@ defmodule AttentionServer.MessageFieldsTest do
     assert :ok = Message.validate_ui1_controls(ui1_request)
 
     ui1_without_inputs =
-      Map.put(request, "answer_ui", %{
-        "schema" => "attention-client.ui/1",
-        "document" => %{"inputs" => []}
-      })
+      Map.put(request, "answer_ui", %{"schema" => "attention-client.ui/1", "inputs" => []})
 
     assert :ok = Message.validate_typed_message(ui1_without_inputs)
 

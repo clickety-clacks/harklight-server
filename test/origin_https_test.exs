@@ -2111,7 +2111,7 @@ defmodule AttentionServer.OriginHTTPSTest do
 
   test "origin HTTPS reports duplicate UI/1 document members as an actionable send error", c do
     body =
-      ~s|{"v":1,"type":"send","op_id":"#{op(36)}","session_handle":"#{@handle}","message":{"sender_id":"app:test","message_id":"duplicate-ui1-http","created_at":1,"title":"Choose","message_type":"request","answer_ui":{"schema":"attention-client.ui/1","document":{"schema":"attention-client.ui/1","schema":"attention-client.ui/1"}}}}|
+      ~s|{"v":1,"type":"send","op_id":"#{op(36)}","session_handle":"#{@handle}","message":{"sender_id":"app:test","message_id":"duplicate-ui1-http","created_at":1,"title":"Choose","message_type":"request","answer_ui":{"schema":"attention-client.ui/1","schema":"attention-client.ui/1"}}}|
 
     assert {:ok, 200,
             %{

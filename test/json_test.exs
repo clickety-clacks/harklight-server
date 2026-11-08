@@ -31,7 +31,7 @@ defmodule AttentionServer.JSONTest do
 
   test "only duplicate members inside a UI/1 send document reach actionable admission" do
     raw =
-      ~s|{"v":1,"type":"send","op_id":"00000000-0000-4000-8000-000000000001","message":{"sender_id":"app:test","message_id":"duplicate-ui1","created_at":1,"title":"Choose","message_type":"request","answer_ui":{"schema":"attention-client.ui/1","document":{"schema":"attention-client.ui/1","schema":"attention-client.ui/1"}}}}| <>
+      ~s|{"v":1,"type":"send","op_id":"00000000-0000-4000-8000-000000000001","message":{"sender_id":"app:test","message_id":"duplicate-ui1","created_at":1,"title":"Choose","message_type":"request","answer_ui":{"schema":"attention-client.ui/1","schema":"attention-client.ui/1"}}}| <>
         "\n"
 
     assert {:error, :bad_frame} = JSON.decode_line(raw)
@@ -39,7 +39,7 @@ defmodule AttentionServer.JSONTest do
     assert JSON.ui1_duplicate_request?(frame)
 
     assert {:error, "schema", reason} =
-             UI1.validate(frame["message"]["answer_ui"]["document"], [])
+             UI1.validate(frame["message"]["answer_ui"], [])
 
     assert reason =~ "member names must be unique"
 
