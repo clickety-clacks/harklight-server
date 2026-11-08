@@ -2082,6 +2082,8 @@ defmodule AttentionServer.Relay do
   def handle_call({:device_remove, key}, _from, state) do
     case Engine.device_remove(state.store.engine, key) do
       {:ok, next, reply} ->
+        next = revoke_origin_sessions(state, next, reply["person_id"], key)
+
         case commit(state.store, next, %{
                person: reply["person_id"],
                actor: key,
@@ -2224,6 +2226,8 @@ defmodule AttentionServer.Relay do
   def handle_call({:owner_revoke_device, person, owner_key, device_key}, _from, state) do
     case Engine.owner_revoke_device(state.store.engine, person, owner_key, device_key) do
       {:ok, next_engine} ->
+        next_engine = revoke_origin_sessions(state, next_engine, person, device_key)
+
         case commit(state.store, next_engine, %{
                person: person,
                actor: owner_key,
@@ -2532,6 +2536,8 @@ defmodule AttentionServer.Relay do
 
     case Engine.revoke_device(state.store.engine, key) do
       {:ok, next_engine} ->
+        next_engine = revoke_origin_sessions(state, next_engine, person, key)
+
         case commit(state.store, next_engine, %{
                person: person,
                actor: "local_setup",
@@ -2989,30 +2995,34 @@ defmodule AttentionServer.Relay do
     streams_by_identity =
       remove_origin_stream_index(state.origin_streams_by_identity, {person, origin}, key)
 
+    proposed =
+      %{state | origin_streams: streams, origin_streams_by_identity: streams_by_identity}
+
     case Conversation.mark_detached(state.store.engine, person, origin, handle) do
       {:ok, next} ->
-        {:ok, current} =
-          Diagnostics.result(
-            :origin_https,
-            :stream_status,
-            Engine.origin_status(
-              next,
-              origin,
-              handle,
-              origin_listening?(%{state | origin_streams: streams}, next, key)
-            ),
-            :unavailable
-          )
+        proposed = %{proposed | store: %{state.store | engine: next}}
+
+        previous = origin_session_status(state, state.store.engine, key)
+        current = origin_session_status(proposed, next, key)
 
         next =
-          Engine.origin_availability(
-            next,
-            person,
-            origin,
-            handle,
-            current["availability"],
-            current["last_detached_at"]
-          )
+          case {previous, current} do
+            {{:ok, %{"availability" => "gone"}}, {:ok, %{"availability" => "gone"}}} ->
+              next
+
+            {_, {:ok, status}} ->
+              Engine.origin_availability(
+                next,
+                person,
+                origin,
+                handle,
+                status["availability"],
+                status["last_detached_at"]
+              )
+
+            _ ->
+              next
+          end
 
         case Store.commit(
                state.store,
@@ -4866,24 +4876,70 @@ defmodule AttentionServer.Relay do
          get_in(engine.origin_sessions, [key, :support, "origin_listener"]) == true)
   end
 
+  defp origin_session_status(state, engine, {person, origin, handle} = key) do
+    Conversation.status(engine, person, origin, handle, origin_listening?(state, engine, key))
+  end
+
+  defp append_origin_availability_if_changed(engine, person, origin, handle, previous, current) do
+    case current do
+      {:ok, status} ->
+        previous_availability =
+          case previous do
+            {:ok, prior} -> prior["availability"]
+            _ -> nil
+          end
+
+        if previous_availability == status["availability"] do
+          engine
+        else
+          Engine.origin_availability(
+            engine,
+            person,
+            origin,
+            handle,
+            status["availability"],
+            status["last_detached_at"]
+          )
+        end
+
+      _ ->
+        engine
+    end
+  end
+
+  defp revoke_origin_sessions(state, engine, person, origin) do
+    engine.origin_sessions
+    |> Enum.filter(fn {{session_person, session_origin, _handle}, _session} ->
+      session_person == person and session_origin == origin
+    end)
+    |> Enum.sort_by(fn {{_session_person, _session_origin, handle}, _session} -> handle end)
+    |> Enum.reduce(engine, fn {{^person, ^origin, handle} = key, _session}, current ->
+      previous = origin_session_status(state, state.store.engine, key)
+
+      case Conversation.mark_gone(current, person, origin, handle) do
+        {:ok, gone} ->
+          current_status = origin_session_status(state, gone, key)
+
+          append_origin_availability_if_changed(
+            gone,
+            person,
+            origin,
+            handle,
+            previous,
+            current_status
+          )
+
+        _ ->
+          current
+      end
+    end)
+  end
+
   defp origin_availability_changes(before, after_state, person, origin) do
     Enum.reduce(after_state.store.engine.origin_sessions, after_state.store.engine, fn
       {{^person, ^origin, handle} = key, _}, engine ->
-        old =
-          Engine.origin_status(
-            before.store.engine,
-            origin,
-            handle,
-            origin_listening?(before, before.store.engine, key)
-          )
-
-        {:ok, current} =
-          Engine.origin_status(
-            engine,
-            origin,
-            handle,
-            origin_listening?(after_state, engine, key)
-          )
+        old = origin_session_status(before, before.store.engine, key)
+        current = origin_session_status(after_state, engine, key)
 
         previous =
           case old do
@@ -4891,33 +4947,37 @@ defmodule AttentionServer.Relay do
             _ -> nil
           end
 
-        if is_nil(previous) or previous == current["availability"] do
-          engine
-        else
-          engine =
-            if current["availability"] == "not_listening" do
-              {:ok, detached} = Conversation.mark_detached(engine, person, origin, handle)
-              detached
-            else
+        case current do
+          {:ok, status} ->
+            if is_nil(previous) or previous == status["availability"] do
               engine
+            else
+              engine =
+                if status["availability"] == "not_listening" do
+                  {:ok, detached} = Conversation.mark_detached(engine, person, origin, handle)
+                  detached
+                else
+                  engine
+                end
+
+              case origin_session_status(after_state, engine, key) do
+                {:ok, updated} ->
+                  append_origin_availability_if_changed(
+                    engine,
+                    person,
+                    origin,
+                    handle,
+                    old,
+                    {:ok, updated}
+                  )
+
+                _ ->
+                  engine
+              end
             end
 
-          {:ok, current} =
-            Engine.origin_status(
-              engine,
-              origin,
-              handle,
-              origin_listening?(after_state, engine, key)
-            )
-
-          Engine.origin_availability(
-            engine,
-            person,
-            origin,
-            handle,
-            current["availability"],
-            current["last_detached_at"]
-          )
+          _ ->
+            engine
         end
 
       _, engine ->
