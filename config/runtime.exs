@@ -250,6 +250,15 @@ if System.get_env("ATTENTION_SERVER_ENABLE") == "1" do
             end
 
           skill_path = System.get_env("ATTENTION_SERVER_DASHBOARD_SKILL_PATH")
+          # There is no default URL or build. Leave unset while closed; set it
+          # only after the Client hold is lifted, the selected external build
+          # is eligible and passes the no-crash check, Apple's first external
+          # review passes, the tester limit is set and the product owner opens
+          # the beta.
+          hosted_testflight_url =
+            if deployment_mode == :saas do
+              System.get_env("ATTENTION_SERVER_HOSTED_TESTFLIGHT_URL")
+            end
 
           with {:ok, ip} <- parse_optional_bind.("ATTENTION_SERVER_DASHBOARD_BIND"),
                {:ok, owner_person} <- owner_person,
@@ -265,7 +274,8 @@ if System.get_env("ATTENTION_SERVER_ENABLE") == "1" do
                 System.get_env("ATTENTION_SERVER_DASHBOARD_KEYFILE") ||
                   Keyword.fetch!(server_opts, :keyfile),
               skill_path: skill_path,
-              skill_path_saas: System.get_env("ATTENTION_SERVER_DASHBOARD_SKILL_PATH_SAAS")
+              skill_path_saas: System.get_env("ATTENTION_SERVER_DASHBOARD_SKILL_PATH_SAAS"),
+              hosted_testflight_url: hosted_testflight_url
             ]
           else
             _ ->

@@ -8,6 +8,8 @@ defmodule AttentionServer.DashboardView do
   does not decide account access or infer presence from enrollment.
   """
 
+  @hosted_agent_ca_sha256 "f9ddbf66433932d93f0947c9ec92db231b79d3d7b0e8a783e048b32790c5477d"
+
   @spec devices(String.t(), list(map()), list(map()), String.t() | nil, keyword()) :: String.t()
   def devices(person_name, devices, waiting, new_request_id \\ nil, chrome \\ [])
       when is_list(devices) and is_list(waiting) do
@@ -54,8 +56,10 @@ defmodule AttentionServer.DashboardView do
           keyword()
         ) :: String.t()
   def components(person_name, skill_version, skill_version_saas, chrome \\ []) do
-    app_section =
-      ~s(<section><h2>App</h2><p class="status">Not available yet</p></section>)
+    app_section = app_section(Keyword.get(chrome, :testflight_url))
+
+    hosted_connection_section =
+      if Keyword.get(chrome, :hosted) == true, do: hosted_connection_section(), else: ""
 
     cli_section =
       ~s(<section><h2>Command-line agent</h2><div class="install-command"><pre id="install-command"><code>brew install <span class="brew-namespace">clickety-clacks</span>/<wbr>tap/<wbr>harklight-agent</code></pre><button class="button" id="copy-install-command" type="button" aria-controls="install-command">Copy install command</button><p class="copy-status" id="install-copy-status" role="status" aria-live="polite"></p></div><p><a href="https://github.com/clickety-clacks/harklight-agent/releases/latest">Prebuilt releases</a></p></section>)
@@ -73,6 +77,7 @@ defmodule AttentionServer.DashboardView do
     body =
       ~s(<header class="page-head"><div><h1>Components</h1></div></header>) <>
         app_section <>
+        hosted_connection_section <>
         cli_section <>
         skill_section <>
         skill_section_saas <>
@@ -80,6 +85,32 @@ defmodule AttentionServer.DashboardView do
         ~s(<script src="/components.js" defer></script>)
 
     layout(person_name, "Components", body, chrome)
+  end
+
+  defp app_section(nil),
+    do: ~s(<section><h2>App</h2><p class="status">Not available yet</p></section>)
+
+  defp app_section(url) when is_binary(url) do
+    ~s(<section><h2>App</h2><p><a href="#{escape(url)}">Install Harklight for iPhone with TestFlight</a></p></section>)
+  end
+
+  defp hosted_connection_section do
+    path = Application.app_dir(:attention_server, "priv/harklight-production-agent-ca.pem")
+
+    with {:ok, pem} <- File.read(path),
+         true <- sha256_hex(pem) == @hosted_agent_ca_sha256 do
+      download =
+        "data:application/x-pem-file;base64," <> Base.encode64(pem)
+
+      ~s(<section><h2>Hosted Agent connection</h2><p>Service / DNS name: <code>app.harklight.net</code></p><p>TLS name: <code>app.harklight.net</code></p><p>Enrollment TCP port: <code>18444</code></p><p>Origin HTTPS port: <code>18450</code></p><p><a href="#{escape(download)}" download="harklight-agent-ca.pem">Download the public CA certificate</a></p><p>The released cross-platform Agent enrollment command is not available yet. These connection and trust details do not start enrollment, approve a device, or grant sender access.</p></section>)
+    else
+      _ ->
+        ~s(<section><h2>Hosted Agent connection</h2><p class="status">Not available yet</p></section>)
+    end
+  end
+
+  defp sha256_hex(bytes) do
+    Base.encode16(:crypto.hash(:sha256, bytes), case: :lower)
   end
 
   def prioritization(person_name, settings, message \\ nil, chrome \\ []) do

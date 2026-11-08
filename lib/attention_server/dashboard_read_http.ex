@@ -42,6 +42,12 @@ defmodule AttentionServer.DashboardReadHTTP do
       hosted: hosted,
       hosted_addresses:
         if(hosted, do: hosted_addresses(Keyword.get(opts, :hosted_addresses)), else: %{}),
+      hosted_testflight_url:
+        if(
+          hosted,
+          do: hosted_testflight_url(Keyword.get(opts, :hosted_testflight_url)),
+          else: nil
+        ),
       skill_path_saas: skill_path_saas,
       skill_path_core:
         Keyword.get(opts, :skill_path_core) ||
@@ -68,6 +74,21 @@ defmodule AttentionServer.DashboardReadHTTP do
   end
 
   defp hosted_addresses(_), do: %{sign_in: nil, sign_out: nil, account: nil}
+
+  defp hosted_testflight_url(url) when is_binary(url) do
+    uri = URI.parse(url)
+
+    if uri.scheme == "https" and uri.host == "testflight.apple.com" and
+         uri.port in [nil, 443] and
+         is_nil(uri.userinfo) and is_binary(uri.path) and
+         String.starts_with?(uri.path, "/join/") and byte_size(uri.path) > byte_size("/join/"),
+       do: url,
+       else: nil
+  rescue
+    ArgumentError -> nil
+  end
+
+  defp hosted_testflight_url(_), do: nil
 
   defp address(url) when is_binary(url) and url != "", do: url
   defp address(_), do: nil
@@ -158,8 +179,13 @@ defmodule AttentionServer.DashboardReadHTTP do
   defp no_session(conn, _opts), do: send_resp(conn, 401, "Sign in to view your devices")
 
   # Hosted-only page chrome: the Account link and the Sign out control.
-  defp chrome(%{hosted: true, hosted_addresses: addresses}),
-    do: [account_url: addresses.account, sign_out: true]
+  defp chrome(%{hosted: true, hosted_addresses: addresses} = opts),
+    do: [
+      hosted: true,
+      account_url: addresses.account,
+      sign_out: true,
+      testflight_url: opts.hosted_testflight_url
+    ]
 
   defp chrome(_opts), do: [prioritization: true]
 

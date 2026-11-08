@@ -53,6 +53,7 @@ defmodule AttentionServer.DashboardHTTPS do
             expected_origin: Keyword.get(opts, :public_origin),
             hosted: hosted?,
             hosted_addresses: Keyword.get(opts, :hosted_addresses, %{}),
+            hosted_testflight_url: Keyword.get(opts, :hosted_testflight_url),
             skill_path_saas: Keyword.get(opts, :skill_path_saas),
             skill_path_core: Keyword.get(opts, :skill_path_core)},
          scheme: :https,
