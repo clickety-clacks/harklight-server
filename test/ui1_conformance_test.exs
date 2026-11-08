@@ -39,7 +39,7 @@ defmodule AttentionServer.UI1ConformanceTest do
     end
   end
 
-  test "Server UI/1 validator matches all app-authored corpus verdicts and reject paths" do
+  test "Server UI/1 admission matches app-authored corpus verdicts and reject paths" do
     raw = File.read!(@corpus_path)
     assert :crypto.hash(:sha256, raw) |> Base.encode16(case: :lower) == @corpus_sha256
 
@@ -61,24 +61,60 @@ defmodule AttentionServer.UI1ConformanceTest do
             error -> {:raised, Exception.format(:error, error, __STACKTRACE__)}
           end
 
-        case {test_case["verdict"], validation} do
-          {"accept", :ok} ->
+        validator_mismatches =
+          case {test_case["verdict"], validation} do
+            {"accept", :ok} ->
+              []
+
+            {"accept", other} ->
+              ["#{test_case["id"]}: accepted by app but Server returned #{inspect(other)}"]
+
+            {"reject", {:error, path, reason}} ->
+              expected_path = test_case["fault"]["location"]
+              detail = "#{path}: #{reason}"
+
+              if String.contains?(detail, expected_path),
+                do: [],
+                else: ["#{test_case["id"]}: fault at #{expected_path} not named in #{detail}"]
+
+            {"reject", other} ->
+              ["#{test_case["id"]}: rejected by app but Server returned #{inspect(other)}"]
+          end
+
+        admission_mismatches =
+          if is_map(document) and not is_struct(document) and
+               Map.get(document, "schema") == "attention-client.ui/1" do
+            admission =
+              try do
+                Message.validate_ui1_admission(%{"answer_ui" => document}, files)
+              rescue
+                error -> {:raised, Exception.format(:error, error, __STACKTRACE__)}
+              end
+
+            case {test_case["verdict"], admission} do
+              {"accept", :ok} ->
+                []
+
+              {"accept", other} ->
+                ["#{test_case["id"]}: direct Server admission returned #{inspect(other)}"]
+
+              {"reject", {:error, {:typed_message, "request_answer_ui_invalid", reason}}} ->
+                expected_path = test_case["fault"]["location"]
+
+                if String.contains?(reason, expected_path),
+                  do: [],
+                  else: [
+                    "#{test_case["id"]}: direct admission did not name #{expected_path} in #{reason}"
+                  ]
+
+              {"reject", other} ->
+                ["#{test_case["id"]}: direct Server admission returned #{inspect(other)}"]
+            end
+          else
             []
+          end
 
-          {"accept", other} ->
-            ["#{test_case["id"]}: accepted by app but Server returned #{inspect(other)}"]
-
-          {"reject", {:error, path, reason}} ->
-            expected_path = test_case["fault"]["location"]
-            detail = "#{path}: #{reason}"
-
-            if String.contains?(detail, expected_path),
-              do: [],
-              else: ["#{test_case["id"]}: fault at #{expected_path} not named in #{detail}"]
-
-          {"reject", other} ->
-            ["#{test_case["id"]}: rejected by app but Server returned #{inspect(other)}"]
-        end
+        validator_mismatches ++ admission_mismatches
       end)
 
     assert mismatches == [], Enum.join(mismatches, "\n")
@@ -97,7 +133,7 @@ defmodule AttentionServer.UI1ConformanceTest do
 
     no_input_message = %{
       "message_type" => "request",
-      "answer_ui" => %{"schema" => "attention-client.ui/1", "document" => valid_without_inputs}
+      "answer_ui" => valid_without_inputs
     }
 
     assert {:error, {:typed_message, "request_needs_answer_controls", reason}} =

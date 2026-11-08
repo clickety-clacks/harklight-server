@@ -25,6 +25,79 @@ defmodule AttentionServer.ConversationAgentCLIFixtureTest do
 
   @sender_id "app:rust-cli-fixture"
 
+  @tag :answer_ui
+  test "raw Agent --answer-ui sends the direct corpus object through Server admission and delivery" do
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "harklight-agent-cli-answer-ui-#{System.unique_integer([:positive])}"
+      )
+
+    fixture = start_file_fixture!(root, :none)
+    agent_bin = System.fetch_env!("HARKLIGHT_AGENT_BIN")
+
+    corpus_path = Path.expand("../fixtures/attention-client-ui1-conformance-v3.json", __DIR__)
+    cases = decode_corpus!(File.read!(corpus_path))["cases"]
+
+    assert %{
+             "document" => answer_ui,
+             "delivered_file_names" => file_names,
+             "verdict" => "accept"
+           } =
+             Enum.find(
+               cases,
+               &(&1["id"] == "accept-all-primitives-inputs-scenes-constructors-and-optionals")
+             )
+
+    answer_ui_path = write_file!(root, "answer-ui.json", JSON.encode!(answer_ui) <> "\n")
+
+    file_args =
+      Enum.flat_map(file_names, fn name ->
+        path = write_file!(root, name, "generated image bytes for #{name}")
+        ["--file", path]
+      end)
+
+    isolated_env = [
+      {"HOME", root},
+      {"XDG_CONFIG_HOME", Path.join(root, "xdg-config")},
+      {"XDG_STATE_HOME", Path.join(root, "xdg-state")},
+      {"XDG_CACHE_HOME", Path.join(root, "xdg-cache")}
+      | fixture.env
+    ]
+
+    send_result =
+      cli_json!(
+        agent_bin,
+        [
+          "send",
+          "--session",
+          "new",
+          "--sender-id",
+          @sender_id,
+          "--route",
+          "claude-code",
+          "--title",
+          "Choose the cover",
+          "--type",
+          "request",
+          "--answer-ui",
+          answer_ui_path
+        ] ++ file_args,
+        isolated_env
+      )
+
+    assert is_binary(send_result["request"])
+    stored = origin_entry!(fixture.relay, fixture.origin, send_result["request"])
+    assert stored["message"]["answer_ui"] == answer_ui
+    refute Map.has_key?(stored["message"]["answer_ui"], "document")
+
+    assert {:ok, [delivery], 1} = Relay.events(fixture.relay, fixture.reader, 0)
+    assert delivery["message"]["message_id"] == send_result["request"]
+    assert delivery["message"]["answer_ui"] == answer_ui
+    refute Map.has_key?(delivery["message"]["answer_ui"], "document")
+    assert MapSet.new(Enum.map(delivery["files"], & &1["name"])) == MapSet.new(file_names)
+  end
+
   @tag :reconnect
   test "explicit reconnect resumes gap entries and delivered obligations without replaying actions" do
     root =
@@ -2380,6 +2453,26 @@ defmodule AttentionServer.ConversationAgentCLIFixtureTest do
   end
 
   defp write_json!(path, value), do: File.write!(path, JSON.encode!(value) <> "\n")
+
+  defp decode_corpus!(raw) do
+    options =
+      Map.new(
+        float: fn token -> %JSON.DecimalToken{raw: token} end,
+        null: nil,
+        object_start: fn _ -> %{} end,
+        object_push: fn key, value, object -> Map.put(object, key, value) end,
+        object_finish: fn object, old_acc -> {object, old_acc} end
+      )
+
+    case :json.decode(raw, nil, options) do
+      {value, nil, rest} when is_binary(rest) ->
+        assert String.trim(rest) == ""
+        value
+
+      other ->
+        flunk("could not decode app UI/1 corpus: #{inspect(other)}")
+    end
+  end
 
   defp legacy_entry(raw, ack_pending) do
     %{
