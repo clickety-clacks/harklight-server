@@ -118,6 +118,13 @@ defmodule AttentionServer.Server do
           |> Keyword.put(:deployment_mode, deployment_mode)
           |> Keyword.put(:public_origin, public_origin)
           |> Keyword.put(:hosted_addresses, hosted_addresses)
+          |> Keyword.put(
+            :hosted_testflight_url,
+            if(deployment_mode == :saas,
+              do: Keyword.get(dashboard_opts, :hosted_testflight_url),
+              else: nil
+            )
+          )
         end
 
       relay_opts =
