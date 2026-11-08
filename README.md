@@ -7,16 +7,16 @@ Harklight iOS/iPadOS app.
 
 ## Install the server
 
-For the FORMAT25 v0.1.28 server package, use the release page below after it
+For the FORMAT27 v0.1.29 server package, use the release page below after it
 is published to download the Linux x86_64 archive, `SHA256SUMS` and
 `SELF_HOST.md`. Verify the checksum before extraction:
 
-[v0.1.28 release](https://github.com/clickety-clacks/harklight-server/releases/tag/v0.1.28)
+[v0.1.29 release](https://github.com/clickety-clacks/harklight-server/releases/tag/v0.1.29)
 (available only after publication).
 
 ```sh
 sha256sum -c SHA256SUMS
-tar -xzf harklight-server-0.1.28-linux-x86_64.tar.gz
+tar -xzf harklight-server-0.1.29-linux-x86_64.tar.gz
 ```
 
 Follow [SELF_HOST.md](SELF_HOST.md) for a fresh installation, tailnet routing,
@@ -28,11 +28,13 @@ The package does not install a service, configure the tailnet or expose ports.
 State, owner/device identities, trust roots and sender grants live outside the
 versioned package. Run one server per database. Keep private keys and backups
 private; do not repeat bootstrap over an existing installation.
-This source, v0.1.28, uses FORMAT25 and migrates supported older state on
-startup. Versions v0.1.27, v0.1.26, v0.1.25, the v0.1.24 repair line,
-v0.1.23, v0.1.22, v0.1.21, v0.1.20, v0.1.19, v0.1.18, v0.1.17, v0.1.16,
-v0.1.15, v0.1.14 and v0.1.13 use FORMAT24 and migrate supported older state
-on startup.
+This source, v0.1.29, writes FORMAT27. Its first start durably migrates
+supported FORMAT25 state, written by v0.1.28, to FORMAT27. The v0.1.28 package
+cannot read that resulting state. The v0.1.27 and v0.1.26 packages use
+FORMAT24 and cannot read FORMAT25 state written by v0.1.28. The v0.1.25
+package, the v0.1.24 repair line, v0.1.23, v0.1.22, v0.1.21, v0.1.20,
+v0.1.19, v0.1.18, v0.1.17, v0.1.16, v0.1.15, v0.1.14 and v0.1.13 also use
+FORMAT24 and migrate supported older state on startup.
 The v0.1.12 package uses FORMAT23, v0.1.11 uses FORMAT22, and v0.1.10 accepts
 formats 1–6 and 8–21. Those pre-FORMAT24 packages cannot start against FORMAT24
 state. The release installer takes one full private-root backup while the
@@ -40,13 +42,25 @@ service is stopped and before switching releases. It attempts to restore this
 snapshot if the candidate does not become ready, but the restore path has not
 been exercised in preparation of this package. Restore or prior-release startup
 can fail and leave the service stopped. Restoring the snapshot discards every
-write made after capture.
+write made after capture. Restore success for this release is unproved and has
+not been tested.
 
-After v0.1.28 writes FORMAT25, v0.1.27 and v0.1.26 cannot start against that
-state; changing only the selected code or release link cannot return to either
-version. A return requires restoring the complete private backup captured
-before FORMAT25 was written. Restore has not been tested here, is not guaranteed
-to succeed, and loses all writes made since its capture.
+Before the first v0.1.29 start, stop the server and take a complete private-state
+backup. After any v0.1.29 write, returning to v0.1.28 requires stopping the
+server, restoring that pre-start backup and then running v0.1.28; changing only
+the selected code or release link cannot make FORMAT27 readable. This restore
+loses every write made since the backup and cannot undo external notifications,
+bounces or agent deliveries. Restore success is unproved and has not been
+tested; no recovery success is guaranteed.
+
+v0.1.29 adds configurable score-based priority levels and unseen-message
+advisories. When a request reaches its configured unseen interval, the server
+adds an advisory to the originating agent session asking whether the request is
+still valid and worth resending and whether its importance should be raised. It
+does not automatically resend the request or change its priority. After a
+Reply or No comment, new chat on that request is closed and earlier messages
+remain readable. Agents without the matching Agent C1 behavior receive the
+existing generic closed refusal.
 
 Version 0.1.25 and later persist delivery acknowledgements (ACK1 and ACK2).
 No safe code-only downgrade to 0.1.24 or earlier has been established once
