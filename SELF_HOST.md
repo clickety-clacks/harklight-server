@@ -1,6 +1,6 @@
 # Harklight Server self-hosted installation
 
-Version: **0.1.28**. Package target: **Linux x86_64, glibc 2.39 or newer**, with OpenSSL 3 shared libraries and libstdc++6 (built on Ubuntu 24.04). The package bundles
+Version: **0.1.29**. Package target: **Linux x86_64, glibc 2.39 or newer**, with OpenSSL 3 shared libraries and libstdc++6 (built on Ubuntu 24.04). The package bundles
 Erlang/OTP and Elixir bytecode; users need no Mix, Hex, source checkout or
 Erlang installation. It needs Bash, OpenSSL CLI, tar and the platform libraries
 listed in BUILD_INFO. This is a single-process self-hosted server cut.
@@ -32,9 +32,9 @@ a live phone test.
 
 ## Download and verify
 
-After publication, download the v0.1.28 release from
-clickety-clacks/harklight-server, tag v0.1.28. Get
-harklight-server-0.1.28-linux-x86_64.tar.gz, SHA256SUMS and SELF_HOST.md from
+After publication, download the v0.1.29 release from
+clickety-clacks/harklight-server, tag v0.1.29. Get
+harklight-server-0.1.29-linux-x86_64.tar.gz, SHA256SUMS and SELF_HOST.md from
 that release. Run sha256sum -c SHA256SUMS and extract into an operator-owned
 versioned directory. BUILD_INFO identifies the source commit, build host,
 toolchain, source status and native dependencies.
@@ -47,7 +47,7 @@ runtime/dependency notices remain in their shipped distribution files.
 Choose the DNS hostname clients will validate. For a same-machine preview,
 localhost works. Install into a directory you own and run:
 
-    PACKAGE="$PWD/harklight-server-0.1.28-linux-x86_64"
+    PACKAGE="$PWD/harklight-server-0.1.29-linux-x86_64"
     STATE="$HOME/.local/share/harklight-server"
     "$PACKAGE/bin/harklight-bootstrap" "$STATE" localhost
     cat "$STATE/person-id"
@@ -314,22 +314,26 @@ survive restart.
 For a manual upgrade of an existing installation, stop the old server and back
 up the full private state before upgrading. The release installer makes one
 full mutable-root backup after stopping the service and before switching
-releases. This source, v0.1.28, uses store FORMAT25; supported older state,
-including FORMAT24 and FORMAT17, is normalized and durably committed on first
-startup. The new
-state includes hosted-account records, the separate conversation feed,
-conversation push high water and upload activity accounting while retaining
-existing requests, answers and authority, and adds persisted chat read positions.
-v0.1.27, v0.1.26, v0.1.25, the v0.1.24 repair line, v0.1.23, v0.1.22,
+releases. This source, v0.1.29, writes store FORMAT27. Its first start
+durably migrates supported FORMAT25 state, used by v0.1.28, to FORMAT27. The
+v0.1.28 package cannot start against the resulting FORMAT27 state; changing
+only the code or release link cannot restore compatibility. The FORMAT25 state
+introduced by v0.1.28 includes hosted-account records, the separate
+conversation feed, conversation push high water and upload activity accounting
+while retaining existing requests, answers and authority, and persisted chat
+read positions. v0.1.28 uses FORMAT25; v0.1.27, v0.1.26, v0.1.25, the v0.1.24 repair line, v0.1.23, v0.1.22,
 v0.1.21, v0.1.20, v0.1.19, v0.1.18, v0.1.17, v0.1.16, v0.1.15, v0.1.14
 and v0.1.13 use FORMAT24; v0.1.12 uses FORMAT23; v0.1.11 uses
 FORMAT22; and v0.1.10 accepts formats 1–6 and 8–21 only. Those earlier packages cannot
 start against FORMAT24. Preserve the trust root, person and sender grants; do
-not repeat bootstrap. After v0.1.28 writes FORMAT25, v0.1.27 and v0.1.26
-cannot start against that state. There is no code-only return to either version;
-changing only the code or release link does not restore compatible data. A
-return requires the complete private backup captured before FORMAT25 was
-written.
+not repeat bootstrap. The v0.1.27 and v0.1.26 packages use FORMAT24 and cannot
+read FORMAT25 state written by v0.1.28.
+
+v0.1.29 adds configurable score-based priority levels and unseen-message
+advisories. When a request reaches its configured unseen interval, the server
+adds an advisory to the originating agent session asking whether the request is
+still valid and worth resending and whether its importance should be raised. It
+does not automatically resend the request or change its priority.
 
 Version 0.1.25 and later persist delivery acknowledgements (ACK1 and ACK2). Sharing
 FORMAT24 with an older release does not establish downgrade compatibility.
@@ -398,11 +402,11 @@ exact acceptance sequence and intent reference, without source ruling authority.
 
 For a manual upgrade, stop the old process and back up the complete private
 state directory, including the database and keys, before the first start of a
-v0.1.28 package. Verify the package checksum and extract into a different
+v0.1.29 package. Verify the package checksum and extract into a different
 versioned directory. Keep the state path, trust root, owner/person and
 configuration. Start with the existing `server.env`; do not rerun bootstrap.
-Startup migrates supported earlier store formats to FORMAT25 immediately. There is no hot
-upgrade; only one server may own a database.
+The first start durably migrates supported FORMAT25 state to FORMAT27. There is
+no hot upgrade; only one server may own a database.
 
 The release installer stops the service and confirms the process has stopped,
 creates one full mutable-root backup, switches `current`, and starts the
@@ -432,13 +436,22 @@ Although it captures a full mutable-root backup while the service is stopped,
 restoration or prior-release startup can fail; do not assume recovery or a
 recovery time.
 
-After v0.1.28 writes FORMAT25, v0.1.27 and v0.1.26 refuse that state. There is
-no code-only return to either version. The only documented return is restoring
-the complete private backup captured before FORMAT25 was written. That restore
-is untested here and loses all writes made since the snapshot. The same format
-number does not make a downgrade from v0.1.25 or later safe: after ACK2 data has
-been written, do not switch to v0.1.24 or earlier against the current state.
-Follow the release owner's recovery disposition. Keep backups and keys private.
+The installer attempts backup restoration only when candidate start or
+process-readiness fails. After readiness, it does not automatically roll back;
+the optional owner agent-list probe is warning-only.
+
+Before the first v0.1.29 start, stop the server and take a complete private
+state backup, including the database and keys. After any v0.1.29 write,
+returning to v0.1.28 requires stopping the server, restoring that pre-start
+backup and then running v0.1.28. v0.1.28 cannot read the resulting FORMAT27
+state, and changing only the code or release link does not restore
+compatibility. Restoring the backup loses every write since it was taken and
+cannot undo external notifications, bounces or agent deliveries. Restore
+success is unproved and has not been tested; it may fail, so no recovery success
+or time is guaranteed. Preserve the backup and current state if restoration
+does not succeed. The same format number does not make a downgrade from
+v0.1.25 or later safe: after ACK2 data has been written, do not switch to
+v0.1.24 or earlier against the current state. Keep backups and keys private.
 
 ## Build
 

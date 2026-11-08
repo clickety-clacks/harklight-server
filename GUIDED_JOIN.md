@@ -175,19 +175,35 @@ its connection indicator stays Unknown without a real presence signal.
 
 ## Durable upgrade boundary
 
-This release uses FORMAT25. Supported earlier snapshots, including FORMAT17,
-migrate on startup, preserving persons, owners, devices, sender grants and
-pending requests while initializing the hosted-account registry. The v0.1.27
-and v0.1.26 packages use FORMAT24 and cannot start after this release writes
-FORMAT25 state; changing the code back alone does not make that state readable.
-The v0.1.11 package uses FORMAT22, v0.1.12 uses FORMAT23, and v0.1.10 accepts
-formats 1–6 and 8–21; those earlier packages also cannot start against FORMAT25
-state. See SELF_HOST.md for the stopped-backup and restore limits.
+This release, v0.1.29, writes FORMAT27. On first start it durably migrates
+supported FORMAT25 state, used by v0.1.28, to FORMAT27 while preserving persons,
+owners, devices, sender grants and pending requests. The v0.1.28 package cannot
+read the resulting state; changing the code back alone does not restore
+compatibility. The v0.1.27 and v0.1.26 packages use FORMAT24 and cannot read
+FORMAT25 state written by v0.1.28. The v0.1.11 package uses FORMAT22, v0.1.12
+uses FORMAT23, and v0.1.10 accepts formats 1–6 and 8–21; those earlier packages
+also cannot start against FORMAT25 state.
+
+Before the first v0.1.29 start, stop the server and take a complete private-state
+backup. After any v0.1.29 write, returning to v0.1.28 requires stopping the
+server, restoring that pre-start backup and then running v0.1.28. This loses
+every write made since the backup and cannot undo external notifications,
+bounces or agent deliveries. Restore success is unproved and has not been
+tested; see SELF_HOST.md for the recovery limits.
+
+Score-based priority levels can set an unseen interval for each level. When
+that interval elapses, the server adds an advisory to the originating agent
+session asking whether the request is still valid and worth resending and
+whether its importance should be raised. It does not automatically resend the
+request or change its priority. After a Reply or No comment, new chat on that
+request is closed and earlier messages remain readable; agents without the
+matching Agent C1 behavior receive the existing generic closed refusal.
+
 Invitations, consumed bindings and resumable request generations share the
-atomic SQLite snapshot transaction. Keep a protected stopped backup before an
-upgrade. Retain current state and use a compatible forward repair
-or separately reviewed recovery path rather than overwriting newer accepted work
-with a stale backup. See SELF_HOST.md for upgrade and APNs configuration limits.
+atomic SQLite snapshot transaction. Keep current state and use a compatible
+forward repair or separately reviewed recovery path rather than overwriting
+newer accepted work with a stale backup. See SELF_HOST.md for upgrade and APNs
+configuration limits.
 
 ## Separate browser sign-in foundation
 
