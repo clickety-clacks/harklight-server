@@ -248,11 +248,11 @@ defmodule AttentionServer.OriginHTTPS do
       end
     rescue
       error ->
-        Diagnostics.failure(:origin_https, :relay_boundary, error, :outcome_unknown)
+        Diagnostics.failure(:origin_https, :relay_boundary, error, :outcome_unknown, nil, relay)
         :ok
     catch
       :exit, reason ->
-        Diagnostics.failure(:origin_https, :relay_boundary, reason, :outcome_unknown)
+        Diagnostics.failure(:origin_https, :relay_boundary, reason, :outcome_unknown, nil, relay)
         :ok
     after
       :ssl.close(socket)
