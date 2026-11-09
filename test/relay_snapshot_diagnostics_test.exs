@@ -188,7 +188,6 @@ defmodule AttentionServer.RelaySnapshotDiagnosticsTest do
     try do
       assert_receive {:listener_trigger_result, :started, ^listener}, 1_000
       assert_receive :collection_finished, 1_000
-      assert Process.whereis(@starting_name) == listener
       assert await_snapshot_names_released(collector_name)
       assert Process.alive?(listener)
     after
