@@ -1,9 +1,11 @@
 # Harklight release installation
 
 The `Harklight release installation` workflow installs only an exact, stable,
-published `vX.Y.Z` release from this repository. It runs for the `published`
-release event and supports a fresh `workflow_dispatch` at an existing tag for
-recovery after an older workflow run can no longer be rerun. The dispatch has
+published `vX.Y.Z` release from this repository. Publishing a release does not
+trigger an installation. Installation is separate and requires explicit
+authorization. Only a manually dispatched run can install, and it must be
+started at an existing stable tag; a fresh `workflow_dispatch` also supports
+recovery when an older workflow run can no longer be rerun. The dispatch has
 no version, branch, or URL inputs; select the exact tag ref with:
 
 ```sh
