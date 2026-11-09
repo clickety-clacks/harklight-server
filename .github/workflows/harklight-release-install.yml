@@ -1,8 +1,6 @@
 name: Harklight release installation
 
 on:
-  release:
-    types: [published]
   workflow_dispatch:
 
 permissions:
@@ -10,12 +8,7 @@ permissions:
 
 jobs:
   install:
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'release' &&
-       github.event.action == 'published' &&
-       github.event.release.draft == false &&
-       github.event.release.prerelease == false)
+    if: github.event_name == 'workflow_dispatch'
     runs-on: [self-hosted, linux, x64, harklight-release-install]
     steps:
       - name: Resolve one published stable release tuple
