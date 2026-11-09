@@ -184,13 +184,11 @@ defmodule AttentionServer.LevelsDeviceAccessTest do
 
     assert get_levels(restarted, restarted_a1, "retry-does-not-overwrite") == saved_b
 
-    assert [
-             %{
-               "type" => "error",
-               "ref" => "reused-operation",
-               "reason" => "operation_conflict"
-             }
-           ] = set_levels(restarted, restarted_a1, "reused-operation", op_a, @rows_b)
+    assert %{
+             "type" => "error",
+             "ref" => "reused-operation",
+             "reason" => "operation_conflict"
+           } = set_levels(restarted, restarted_a1, "reused-operation", op_a, @rows_b)
 
     assert %{"type" => "ok", "op_id" => ^op_c, "levels" => ^saved_b} =
              set_levels(restarted, restarted_a1, "same-table-new-operation", op_c, @rows_b)
@@ -205,8 +203,8 @@ defmodule AttentionServer.LevelsDeviceAccessTest do
     on_exit(fn -> File.rm_rf!(certs) end)
     relay = start_relay(path)
 
-    owner_a_cert = TLSFixtures.certificate_der!(certs, "owner-a")
-    owner_b_cert = TLSFixtures.certificate_der!(certs, "owner-b")
+    owner_a_cert = TLSFixtures.certificate_der!(certs, "a1")
+    owner_b_cert = TLSFixtures.certificate_der!(certs, "b1")
     assert {:ok, person_a} = Relay.operator_bootstrap(relay, owner_a_cert)
     assert {:ok, person_b} = Relay.operator_bootstrap(relay, owner_b_cert)
     assert {:ok, owner_a} = DeviceIdentity.from_certificate(owner_a_cert)
