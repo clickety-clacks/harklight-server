@@ -48,6 +48,75 @@ defmodule AttentionServer.RelaySnapshotDiagnosticsTest do
     refute message =~ "line="
   end
 
+  test "concurrent triggers admit only one collector spawn before registration" do
+    parent = self()
+    collector_name = :relay_snapshot_concurrent_test_collector
+    trigger_count = 32
+
+    collect_fun = fn _target ->
+      send(parent, {:collector_entered, self()})
+
+      receive do
+        :release -> :ok
+      end
+    end
+
+    spawn_fun = fn collector_fun ->
+      send(parent, {:collector_spawn_attempt, self()})
+
+      receive do
+        :spawn -> spawn(collector_fun)
+      end
+    end
+
+    callers =
+      for _ <- 1..trigger_count do
+        spawn(fn ->
+          send(parent, {:trigger_ready, self()})
+
+          receive do
+            :trigger ->
+              result =
+                Diagnostics.start_relay_snapshot(
+                  nil,
+                  collector_name,
+                  @cooldown_ms,
+                  collect_fun,
+                  spawn_fun
+                )
+
+              send(parent, {:trigger_result, result})
+          end
+        end)
+      end
+
+    try do
+      Enum.each(callers, fn caller ->
+        assert_receive {:trigger_ready, ^caller}, 1_000
+      end)
+
+      Enum.each(callers, &send(&1, :trigger))
+
+      assert_receive {:collector_spawn_attempt, _winner}, 1_000
+
+      for _ <- 1..(trigger_count - 1) do
+        assert_receive {:trigger_result, :skipped}, 1_000
+      end
+
+      refute_receive {:collector_spawn_attempt, _caller}, 20
+
+      Enum.each(callers, &send(&1, :spawn))
+      assert_receive {:trigger_result, :started}, 1_000
+      assert_receive {:collector_entered, collector}, 1_000
+      assert Process.whereis(collector_name) == collector
+    after
+      Enum.each(callers, &send(&1, :trigger))
+      Enum.each(callers, &send(&1, :spawn))
+      Process.sleep(10)
+      stop_collector(collector_name)
+    end
+  end
+
   test "a second trigger is skipped while collection is active and during the 60-second cooldown" do
     parent = self()
     collector_name = :relay_snapshot_active_test_collector

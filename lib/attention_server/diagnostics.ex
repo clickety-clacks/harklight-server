@@ -154,6 +154,7 @@ defmodule AttentionServer.Diagnostics do
   end
 
   @relay_snapshot_collector AttentionServer.Diagnostics.RelaySnapshotCollector
+  @relay_snapshot_starting AttentionServer.Diagnostics.RelaySnapshotStarting
   @relay_snapshot_interval_ms 60_000
   @relay_snapshot_items [
     :status,
@@ -181,14 +182,33 @@ defmodule AttentionServer.Diagnostics do
   def start_relay_snapshot(relay_server, collector_name, interval_ms, collect_fun)
       when is_atom(collector_name) and is_integer(interval_ms) and interval_ms >= 0 and
              is_function(collect_fun, 1) do
-    if Process.whereis(collector_name) == nil do
-      spawn(fn ->
-        run_relay_snapshot_collector(relay_server, collector_name, interval_ms, collect_fun)
-      end)
+    start_relay_snapshot(relay_server, collector_name, interval_ms, collect_fun, &spawn/1)
+  end
 
-      :started
-    else
-      :skipped
+  @doc false
+  def start_relay_snapshot(relay_server, collector_name, interval_ms, collect_fun, spawn_fun)
+      when is_atom(collector_name) and is_integer(interval_ms) and interval_ms >= 0 and
+             is_function(collect_fun, 1) and is_function(spawn_fun, 1) do
+    try do
+      Process.register(self(), @relay_snapshot_starting)
+
+      try do
+        if Process.whereis(collector_name) == nil do
+          start_registered_relay_snapshot(
+            relay_server,
+            collector_name,
+            interval_ms,
+            collect_fun,
+            spawn_fun
+          )
+        else
+          :skipped
+        end
+      after
+        Process.unregister(@relay_snapshot_starting)
+      end
+    rescue
+      ArgumentError -> :skipped
     end
   end
 
@@ -213,29 +233,64 @@ defmodule AttentionServer.Diagnostics do
     {snapshot, format_relay_snapshot(snapshot)}
   end
 
-  defp run_relay_snapshot_collector(relay_server, collector_name, interval_ms, collect_fun) do
-    registered =
+  defp start_registered_relay_snapshot(
+         relay_server,
+         collector_name,
+         interval_ms,
+         collect_fun,
+         spawn_fun
+       ) do
+    owner = self()
+
+    collector =
+      spawn_fun.(fn ->
+        await_relay_snapshot_start(owner, relay_server, interval_ms, collect_fun)
+      end)
+
+    if is_pid(collector) and register_relay_snapshot_collector(collector, collector_name) do
+      send(collector, :start)
+      :started
+    else
+      if is_pid(collector), do: Process.exit(collector, :kill)
+      :skipped
+    end
+  end
+
+  defp register_relay_snapshot_collector(collector, collector_name) do
+    try do
+      Process.register(collector, collector_name)
+    rescue
+      ArgumentError -> false
+    end
+  end
+
+  defp await_relay_snapshot_start(owner, relay_server, interval_ms, collect_fun) do
+    owner_monitor = Process.monitor(owner)
+
+    receive do
+      :start ->
+        Process.demonitor(owner_monitor, [:flush])
+        run_relay_snapshot_collector(relay_server, interval_ms, collect_fun)
+
+      {:DOWN, ^owner_monitor, :process, ^owner, _reason} ->
+        :ok
+    end
+  end
+
+  defp run_relay_snapshot_collector(relay_server, interval_ms, collect_fun) do
+    started_at = System.monotonic_time(:millisecond)
+
+    try do
       try do
-        Process.register(self(), collector_name)
+        collect_fun.(relay_server)
       rescue
-        ArgumentError -> false
+        _ -> :ok
+      catch
+        _, _ -> :ok
       end
-
-    if registered do
-      started_at = System.monotonic_time(:millisecond)
-
-      try do
-        try do
-          collect_fun.(relay_server)
-        rescue
-          _ -> :ok
-        catch
-          _, _ -> :ok
-        end
-      after
-        remaining_ms = max(interval_ms - (System.monotonic_time(:millisecond) - started_at), 0)
-        if remaining_ms > 0, do: Process.sleep(remaining_ms)
-      end
+    after
+      remaining_ms = max(interval_ms - (System.monotonic_time(:millisecond) - started_at), 0)
+      if remaining_ms > 0, do: Process.sleep(remaining_ms)
     end
   end
 
