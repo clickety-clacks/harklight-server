@@ -16,6 +16,7 @@ defmodule AttentionServer.Engine do
     APNS,
     AgentAccess,
     BounceDecision,
+    BouncePolicy,
     Conversation,
     ConversationFiles,
     DeviceIdentity,
@@ -3190,6 +3191,12 @@ defmodule AttentionServer.Engine do
   defp dispatch(engine, principal, %{"type" => "message_open"} = frame),
     do: message_open(engine, principal, frame)
 
+  defp dispatch(engine, principal, %{"type" => "levels_get"} = frame),
+    do: levels_get(engine, principal, frame)
+
+  defp dispatch(engine, principal, %{"type" => "levels_set"} = frame),
+    do: levels_set(engine, principal, frame)
+
   defp dispatch(engine, principal, %{"type" => "discussion"} = frame),
     do: discussion(engine, principal, frame)
 
@@ -3239,6 +3246,83 @@ defmodule AttentionServer.Engine do
     do: failure("not_supported")
 
   defp dispatch(_engine, _principal, _frame), do: failure("unknown_type")
+
+  defp levels_get(engine, %{person: person}, frame) do
+    with :ok <- valid_levels_fields(frame, ~w(v type ref)) do
+      {:ok, engine, %{"levels" => BounceDecision.levels(engine, person)}}
+    else
+      {:error, field} -> failure("invalid_field", field)
+    end
+  end
+
+  defp levels_set(engine, %{person: person, key: device, request_at: now_ms}, frame) do
+    with :ok <- valid_levels_fields(frame, ~w(v type ref op_id levels)),
+         :ok <- valid_op(frame),
+         {:ok, levels} <- BouncePolicy.normalize_levels(frame["levels"]) do
+      semantic = levels_semantic(levels)
+
+      case receipt(engine, person, device, frame["op_id"], semantic) do
+        {:duplicate, reply} ->
+          {:ok, engine, reply}
+
+        :conflict ->
+          failure("operation_conflict")
+
+        :missing ->
+          case BounceDecision.configure_levels(engine, person, levels, now_ms) do
+            {:ok, next, config} ->
+              reply = %{
+                "op_id" => frame["op_id"],
+                "levels" => BouncePolicy.public_levels(config.levels)
+              }
+
+              next = save_receipt(next, person, device, frame["op_id"], semantic, reply)
+              {:ok, next, reply}
+
+            _ ->
+              failure("storage_unavailable")
+          end
+      end
+    else
+      {:error, :invalid_levels} -> failure("invalid_field", "levels")
+      {:error, field} -> failure("invalid_field", field)
+      _ -> failure("invalid_field", "levels")
+    end
+  end
+
+  defp valid_levels_fields(frame, expected) do
+    selectors = ~w(person_id device_id agent_id principal_id origin actor account_id)
+
+    with nil <- Enum.find(selectors, &Map.has_key?(frame, &1)),
+         nil <- Enum.find(Map.keys(frame), &(&1 not in expected)),
+         nil <- Enum.find(expected, &(not Map.has_key?(frame, &1))) do
+      :ok
+    else
+      field when is_binary(field) -> {:error, field}
+      _ -> {:error, "field"}
+    end
+  end
+
+  defp levels_semantic(levels) do
+    %{
+      "type" => "levels_set",
+      "levels" =>
+        Enum.map(levels, fn level ->
+          %{
+            "name" => level["name"],
+            "lower_bound_ratio" => Tuple.to_list(level["lower_ratio"]),
+            "bounce_after_days_ratio" => ratio_list(level["bounce_after_days"])
+          }
+        end)
+    }
+  end
+
+  defp ratio_list(nil), do: nil
+
+  defp ratio_list(value) do
+    {:ok, ratio} = BouncePolicy.number_ratio(value)
+    Tuple.to_list(ratio)
+  end
 
   defp enrollment_readback(engine, %{person: person, key: connector}, frame) do
     grant_id = frame["grant_id"]
