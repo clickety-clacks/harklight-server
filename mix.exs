@@ -5,7 +5,7 @@ defmodule AttentionServer.MixProject do
     [
       app: :attention_server,
       description: "Harklight Server",
-      version: "0.1.29",
+      version: "0.1.30",
       elixir: "~> 1.19",
       start_permanent: Mix.env() == :prod,
       deps: deps(),
@@ -27,7 +27,7 @@ defmodule AttentionServer.MixProject do
       {:exqlite, "0.39.0"},
       {:mint, "~> 1.11.0"},
       {:plug, "~> 1.20.0"},
-      {:bandit, "~> 1.13.0"}
+      {:bandit, "~> 1.14.0"}
     ]
   end
 end

@@ -1,3 +1,24 @@
+# Harklight Server v0.1.30
+
+## Changes
+
+- Updates the Bandit HTTP server dependency from 1.13.0 to 1.14.0 to address
+  CVE-2026-114216.
+- Makes no Harklight application or store-migration code change. FORMAT27
+  remains the store layout, and first start still migrates supported FORMAT25
+  state from v0.1.28 to FORMAT27.
+
+## Upgrade and recovery
+
+Before the first v0.1.30 start, stop the server and take a complete private
+state backup. v0.1.28 cannot read the resulting FORMAT27 state. After any
+v0.1.30 write, returning to v0.1.28 requires stopping the server and restoring
+that pre-start backup before starting v0.1.28. Restoring loses every later
+write and cannot undo external notifications, bounces or agent deliveries.
+The installer backup-readability and restore path remain untested; restore
+success is unproved and no recovery success is guaranteed. See `SELF_HOST.md`
+for installer behavior and the recovery limits.
+
 # Harklight Server v0.1.29
 
 ## Changes
