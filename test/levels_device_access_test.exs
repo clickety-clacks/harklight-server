@@ -2,6 +2,7 @@ defmodule AttentionServer.LevelsDeviceAccessTest do
   use ExUnit.Case, async: false
 
   alias AttentionServer.{DeviceIdentity, JSON, Relay, TLSFixtures}
+  alias Exqlite.Sqlite3
 
   @rows_a [
     %{"name" => "Routine", "lower_bound" => 0, "bounce_after_days" => nil}
@@ -106,7 +107,6 @@ defmodule AttentionServer.LevelsDeviceAccessTest do
     a2 = connected_session(relay, "a2")
     b1 = connected_session(relay, "b1")
     op_a = op(1)
-    op_invalid = op(2)
     op_b = op(3)
     op_c = op(4)
 
@@ -138,25 +138,49 @@ defmodule AttentionServer.LevelsDeviceAccessTest do
                "account_id" => "B"
              })
 
+    invalid_tables = [
+      [],
+      [%{"name" => "Routine", "lower_bound" => 0}],
+      [%{"name" => "Routine", "lower_bound" => 0, "bounce_after_days" => nil, "extra" => true}],
+      [%{"name" => "  ", "lower_bound" => 0, "bounce_after_days" => nil}],
+      [%{"name" => "Misconfigured", "lower_bound" => 0.2, "bounce_after_days" => nil}],
+      [%{"name" => "Routine", "lower_bound" => 0, "bounce_after_days" => 0}],
+      [%{"name" => "Routine", "lower_bound" => 0, "bounce_after_days" => -1}],
+      [
+        %{"name" => "Routine", "lower_bound" => 0, "bounce_after_days" => nil},
+        %{"name" => "High", "lower_bound" => 1.1, "bounce_after_days" => 1}
+      ],
+      [
+        %{"name" => "High", "lower_bound" => 0.2, "bounce_after_days" => 1},
+        %{"name" => "Routine", "lower_bound" => 0, "bounce_after_days" => nil}
+      ]
+    ]
+
+    for {invalid_levels, index} <- Enum.with_index(invalid_tables) do
+      ref = "invalid-table-#{index}"
+
+      assert %{
+               "type" => "error",
+               "ref" => ^ref,
+               "reason" => "invalid_field",
+               "field" => "levels"
+             } = set_levels(relay, a1, ref, op(index + 100), invalid_levels)
+    end
+
     assert [
              %{
                "type" => "error",
-               "ref" => "invalid-table",
+               "ref" => "save-cross-account",
                "reason" => "invalid_field",
-               "field" => "levels"
+               "field" => "account_id"
              }
            ] =
              session_request(relay, a1, %{
                "type" => "levels_set",
-               "ref" => "invalid-table",
-               "op_id" => op_invalid,
-               "levels" => [
-                 %{
-                   "name" => "Misconfigured",
-                   "lower_bound" => 0.2,
-                   "bounce_after_days" => nil
-                 }
-               ]
+               "ref" => "save-cross-account",
+               "op_id" => op(200),
+               "account_id" => "B",
+               "levels" => @rows_b
              })
 
     assert get_levels(relay, a1, "prior-table-intact") == saved_a
@@ -195,6 +219,37 @@ defmodule AttentionServer.LevelsDeviceAccessTest do
 
     assert :sys.get_state(restarted).store.engine.bounce_levels["A"] == config_b
     assert [] = get_levels(restarted, restarted_b1, "b-remains-default")
+    assert [] = session_drain(restarted, restarted_a1)
+  end
+
+  test "failed level commit leaves the table and operation receipt unchanged", %{path: path} do
+    relay = start_relay(path)
+    assert :ok = Relay.setup_person(relay, "A")
+    assert :ok = Relay.setup_device(relay, "A", "a1")
+    session = connected_session(relay, "a1")
+    operation = op(300)
+    db = :sys.get_state(relay).store.db
+
+    assert :ok =
+             Sqlite3.execute(
+               db,
+               "CREATE TRIGGER refuse_levels BEFORE UPDATE ON relay_state BEGIN SELECT RAISE(ABORT, 'blocked'); END"
+             )
+
+    assert %{
+             "type" => "error",
+             "ref" => "commit-fails",
+             "reason" => "storage_unavailable"
+           } = set_levels(relay, session, "commit-fails", operation, @rows_b)
+
+    assert [] = get_levels(relay, session, "failed-save-kept-default")
+
+    assert :ok = Sqlite3.execute(db, "DROP TRIGGER refuse_levels")
+
+    assert %{"type" => "ok", "op_id" => ^operation, "levels" => levels} =
+             set_levels(relay, session, "retry-after-failure", operation, @rows_b)
+
+    assert levels == wire_rows(@rows_b)
   end
 
   test "dashboard and device changes send coalesced hints only to same-account sessions that used levels",
@@ -258,6 +313,17 @@ defmodule AttentionServer.LevelsDeviceAccessTest do
     assert %{"type" => "ok", "levels" => _} =
              set_levels(relay, a1, "device-change", op(10), rows_b)
 
+    assert [%{"v" => 1, "type" => "levels_changed"}] = session_drain(relay, a1)
+    assert [%{"v" => 1, "type" => "levels_changed"}] = session_drain(relay, a2)
+    assert [] = session_drain(relay, legacy)
+    assert [] = session_drain(relay, b1)
+
+    assert %{"type" => "ok", "op_id" => _, "levels" => _} =
+             set_levels(relay, a1, "device-noop", op(11), rows_b)
+
+    assert [] = session_drain(relay, a1)
+    assert [] = session_drain(relay, a2)
+
     assert {:ok, %{"levels" => ^rows_c}} =
              Relay.save_dashboard_levels(relay, person_a, owner_a, rows_c)
 
@@ -299,6 +365,18 @@ defmodule AttentionServer.LevelsDeviceAccessTest do
 
     assert {:error, :forbidden} =
              Relay.request_line(relay, "a1", raw(%{"type" => "levels_get", "ref" => "direct"}))
+
+    assert {:error, :forbidden} =
+             Relay.request_line(
+               relay,
+               "a1",
+               raw(%{
+                 "type" => "levels_set",
+                 "ref" => "direct-save",
+                 "op_id" => op(400),
+                 "levels" => @rows_a
+               })
+             )
 
     assert {:error, :forbidden} = Relay.open_session(relay, "a1")
   end
