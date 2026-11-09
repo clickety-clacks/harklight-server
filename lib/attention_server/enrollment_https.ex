@@ -215,11 +215,27 @@ defmodule AttentionServer.EnrollmentHTTPS do
       end
     rescue
       error ->
-        Diagnostics.failure(:enrollment_https, :relay_boundary, error, :outcome_unknown)
+        Diagnostics.failure(
+          :enrollment_https,
+          :relay_boundary,
+          error,
+          :outcome_unknown,
+          nil,
+          relay
+        )
+
         :ok
     catch
       :exit, reason ->
-        Diagnostics.failure(:enrollment_https, :relay_boundary, reason, :outcome_unknown)
+        Diagnostics.failure(
+          :enrollment_https,
+          :relay_boundary,
+          reason,
+          :outcome_unknown,
+          nil,
+          relay
+        )
+
         :ok
     after
       :ssl.close(socket)

@@ -231,11 +231,11 @@ defmodule AttentionServer.OwnerTLS do
       end
     rescue
       error ->
-        Diagnostics.failure(:owner_tls, :relay_boundary, error, :outcome_unknown)
+        Diagnostics.failure(:owner_tls, :relay_boundary, error, :outcome_unknown, nil, relay)
         :ok
     catch
       :exit, reason ->
-        Diagnostics.failure(:owner_tls, :relay_boundary, reason, :outcome_unknown)
+        Diagnostics.failure(:owner_tls, :relay_boundary, reason, :outcome_unknown, nil, relay)
         :ok
     after
       :ssl.close(socket)
