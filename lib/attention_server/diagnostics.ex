@@ -192,21 +192,13 @@ defmodule AttentionServer.Diagnostics do
     try do
       Process.register(self(), @relay_snapshot_starting)
 
-      try do
-        if Process.whereis(collector_name) == nil do
-          start_registered_relay_snapshot(
-            relay_server,
-            collector_name,
-            interval_ms,
-            collect_fun,
-            spawn_fun
-          )
-        else
-          :skipped
-        end
-      after
-        Process.unregister(@relay_snapshot_starting)
-      end
+      start_with_relay_snapshot_slot(
+        relay_server,
+        collector_name,
+        interval_ms,
+        collect_fun,
+        spawn_fun
+      )
     rescue
       ArgumentError -> :skipped
     end
@@ -252,8 +244,38 @@ defmodule AttentionServer.Diagnostics do
       :started
     else
       if is_pid(collector), do: Process.exit(collector, :kill)
+      release_relay_snapshot_starting()
       :skipped
     end
+  end
+
+  defp start_with_relay_snapshot_slot(
+         relay_server,
+         collector_name,
+         interval_ms,
+         collect_fun,
+         spawn_fun
+       ) do
+    if Process.whereis(collector_name) == nil do
+      start_registered_relay_snapshot(
+        relay_server,
+        collector_name,
+        interval_ms,
+        collect_fun,
+        spawn_fun
+      )
+    else
+      release_relay_snapshot_starting()
+      :skipped
+    end
+  rescue
+    _ ->
+      release_relay_snapshot_starting()
+      :skipped
+  catch
+    _, _ ->
+      release_relay_snapshot_starting()
+      :skipped
   end
 
   defp register_relay_snapshot_collector(collector, collector_name) do
@@ -291,6 +313,15 @@ defmodule AttentionServer.Diagnostics do
     after
       remaining_ms = max(interval_ms - (System.monotonic_time(:millisecond) - started_at), 0)
       if remaining_ms > 0, do: Process.sleep(remaining_ms)
+      release_relay_snapshot_starting()
+    end
+  end
+
+  defp release_relay_snapshot_starting do
+    try do
+      Process.unregister(@relay_snapshot_starting)
+    rescue
+      ArgumentError -> :ok
     end
   end
 
