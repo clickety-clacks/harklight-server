@@ -951,8 +951,9 @@ defmodule AttentionServer.Relay do
                %{person: person, actor: key, action: "dashboard_levels"}
              ) do
           {:ok, store} ->
-            {:reply, {:ok, %{"levels" => BouncePolicy.public_levels(config.levels)}},
-             %{state | store: store}}
+            next_state = %{state | store: store} |> notify_levels_changed(person)
+
+            {:reply, {:ok, %{"levels" => BouncePolicy.public_levels(config.levels)}}, next_state}
 
           _ ->
             {:reply, {:error, :storage_unavailable}, state}
@@ -2610,7 +2611,9 @@ defmodule AttentionServer.Relay do
           view_support: false,
           view_notice: nil,
           view_notice_due_at: nil,
-          view_last_notice_at: nil
+          view_last_notice_at: nil,
+          levels_support: false,
+          levels_notice: false
         }
 
         {:reply, {:ok, id}, %{state | sessions: Map.put(state.sessions, id, session)}}
@@ -2681,12 +2684,23 @@ defmodule AttentionServer.Relay do
       }
 
       {view_notice, updated} = take_view_notice(updated, System.monotonic_time(:millisecond))
+      {levels_notice, updated} = take_levels_notice(updated)
       next = put_session(state, id, updated)
-      frames = Enum.map(events ++ conversation_events, &line/1) ++ view_notice
+
+      frames =
+        Enum.map(events ++ conversation_events, &line/1) ++ view_notice ++ levels_notice
+
       {:reply, {:ok, frames}, next}
     else
       false ->
-        {:reply, {:error, :resync_required}, state}
+        case Map.get(state.sessions, id) do
+          %{levels_notice: true} = session ->
+            {notice, updated} = take_levels_notice(session)
+            {:reply, {:ok, notice}, put_session(state, id, updated)}
+
+          _ ->
+            {:reply, {:error, :resync_required}, state}
+        end
 
       {:error, :forbidden} ->
         {:reply, {:error, :forbidden}, %{state | sessions: Map.delete(state.sessions, id)}}
@@ -3210,6 +3224,9 @@ defmodule AttentionServer.Relay do
       when type in ["resync", "ack", "conversation_open", "conversation_ack", "view_get"] ->
         special_request(state, id, session, frame)
 
+      {:ok, %{"type" => type}} when type in ["levels_get", "levels_set"] ->
+        levels_session_request(state, id, session, raw)
+
       {:ok, %{"type" => type} = frame} when type in ["forward", "answer_receipt"] ->
         {{:ok, [error_line(frame, "unknown_type")]}, state}
 
@@ -3222,6 +3239,20 @@ defmodule AttentionServer.Relay do
             {reply, next} = request(state, session.key, raw)
             {wrap_line(reply), next}
         end
+    end
+  end
+
+  defp levels_session_request(state, id, session, raw) do
+    session = %{session | levels_support: true}
+    state = put_session(state, id, session)
+
+    case session_mutation_state(state, session, raw) do
+      {:blocked, reason} ->
+        {{:ok, [error_line(raw, reason)]}, state}
+
+      :allowed ->
+        {reply, next} = request(state, session.key, raw)
+        {wrap_line(reply), next}
     end
   end
 
@@ -4053,6 +4084,12 @@ defmodule AttentionServer.Relay do
                 next_state
             end
 
+          next_state =
+            case changed_levels_person(state.store.engine, next_engine, key) do
+              {:ok, person} -> notify_levels_changed(next_state, person)
+              :unchanged -> next_state
+            end
+
           {reply, next_state}
 
         {:error, _, _} ->
@@ -4246,6 +4283,31 @@ defmodule AttentionServer.Relay do
     %{state | sessions: sessions}
   end
 
+  defp changed_levels_person(old_engine, next_engine, key) do
+    with {:ok, person} <- Engine.authorized_person(old_engine, key),
+         {:ok, ^person} <- Engine.authorized_person(next_engine, key),
+         true <-
+           Map.get(old_engine.bounce_levels, person) != Map.get(next_engine.bounce_levels, person) do
+      {:ok, person}
+    else
+      _ -> :unchanged
+    end
+  end
+
+  defp notify_levels_changed(state, person) do
+    sessions =
+      Map.new(state.sessions, fn {id, session} ->
+        if session.levels_support and
+             Engine.authorized_person(state.store.engine, session.key) == {:ok, person} do
+          {id, %{session | levels_notice: true}}
+        else
+          {id, session}
+        end
+      end)
+
+    %{state | sessions: sessions}
+  end
+
   defp take_view_notice(%{view_notice: nil} = session, _now), do: {[], session}
 
   defp take_view_notice(
@@ -4258,6 +4320,12 @@ defmodule AttentionServer.Relay do
   end
 
   defp take_view_notice(session, _now), do: {[], session}
+
+  defp take_levels_notice(%{levels_notice: true} = session) do
+    {[line(%{"v" => 1, "type" => "levels_changed"})], %{session | levels_notice: false}}
+  end
+
+  defp take_levels_notice(session), do: {[], session}
 
   defp pending_signature(engine, person) do
     engine
