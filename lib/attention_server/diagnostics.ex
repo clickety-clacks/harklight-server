@@ -189,6 +189,30 @@ defmodule AttentionServer.Diagnostics do
   def start_relay_snapshot(relay_server, collector_name, interval_ms, collect_fun, spawn_fun)
       when is_atom(collector_name) and is_integer(interval_ms) and interval_ms >= 0 and
              is_function(collect_fun, 1) and is_function(spawn_fun, 1) do
+    start_relay_snapshot(
+      relay_server,
+      collector_name,
+      interval_ms,
+      collect_fun,
+      spawn_fun,
+      fn -> System.monotonic_time(:millisecond) end,
+      &Process.sleep/1
+    )
+  end
+
+  @doc false
+  def start_relay_snapshot(
+        relay_server,
+        collector_name,
+        interval_ms,
+        collect_fun,
+        spawn_fun,
+        monotonic_time_fun,
+        sleep_fun
+      )
+      when is_atom(collector_name) and is_integer(interval_ms) and interval_ms >= 0 and
+             is_function(collect_fun, 1) and is_function(spawn_fun, 1) and
+             is_function(monotonic_time_fun, 0) and is_function(sleep_fun, 1) do
     try do
       Process.register(self(), @relay_snapshot_starting)
 
@@ -197,7 +221,9 @@ defmodule AttentionServer.Diagnostics do
         collector_name,
         interval_ms,
         collect_fun,
-        spawn_fun
+        spawn_fun,
+        monotonic_time_fun,
+        sleep_fun
       )
     rescue
       ArgumentError -> :skipped
@@ -230,13 +256,22 @@ defmodule AttentionServer.Diagnostics do
          collector_name,
          interval_ms,
          collect_fun,
-         spawn_fun
+         spawn_fun,
+         monotonic_time_fun,
+         sleep_fun
        ) do
     owner = self()
 
     collector =
       spawn_fun.(fn ->
-        await_relay_snapshot_start(owner, relay_server, interval_ms, collect_fun)
+        await_relay_snapshot_start(
+          owner,
+          relay_server,
+          interval_ms,
+          collect_fun,
+          monotonic_time_fun,
+          sleep_fun
+        )
       end)
 
     if is_pid(collector) and register_relay_snapshot_collector(collector, collector_name) do
@@ -254,7 +289,9 @@ defmodule AttentionServer.Diagnostics do
          collector_name,
          interval_ms,
          collect_fun,
-         spawn_fun
+         spawn_fun,
+         monotonic_time_fun,
+         sleep_fun
        ) do
     if Process.whereis(collector_name) == nil do
       start_registered_relay_snapshot(
@@ -262,7 +299,9 @@ defmodule AttentionServer.Diagnostics do
         collector_name,
         interval_ms,
         collect_fun,
-        spawn_fun
+        spawn_fun,
+        monotonic_time_fun,
+        sleep_fun
       )
     else
       release_relay_snapshot_starting()
@@ -286,21 +325,41 @@ defmodule AttentionServer.Diagnostics do
     end
   end
 
-  defp await_relay_snapshot_start(owner, relay_server, interval_ms, collect_fun) do
+  defp await_relay_snapshot_start(
+         owner,
+         relay_server,
+         interval_ms,
+         collect_fun,
+         monotonic_time_fun,
+         sleep_fun
+       ) do
     owner_monitor = Process.monitor(owner)
 
     receive do
       :start ->
         Process.demonitor(owner_monitor, [:flush])
-        run_relay_snapshot_collector(relay_server, interval_ms, collect_fun)
+
+        run_relay_snapshot_collector(
+          relay_server,
+          interval_ms,
+          collect_fun,
+          monotonic_time_fun,
+          sleep_fun
+        )
 
       {:DOWN, ^owner_monitor, :process, ^owner, _reason} ->
         :ok
     end
   end
 
-  defp run_relay_snapshot_collector(relay_server, interval_ms, collect_fun) do
-    started_at = System.monotonic_time(:millisecond)
+  defp run_relay_snapshot_collector(
+         relay_server,
+         interval_ms,
+         collect_fun,
+         monotonic_time_fun,
+         sleep_fun
+       ) do
+    started_at = monotonic_time_fun.()
 
     try do
       try do
@@ -311,8 +370,8 @@ defmodule AttentionServer.Diagnostics do
         _, _ -> :ok
       end
     after
-      remaining_ms = max(interval_ms - (System.monotonic_time(:millisecond) - started_at), 0)
-      if remaining_ms > 0, do: Process.sleep(remaining_ms)
+      remaining_ms = max(interval_ms - (monotonic_time_fun.() - started_at), 0)
+      if remaining_ms > 0, do: sleep_fun.(remaining_ms)
       release_relay_snapshot_starting()
     end
   end

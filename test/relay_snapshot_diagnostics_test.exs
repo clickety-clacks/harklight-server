@@ -164,17 +164,41 @@ defmodule AttentionServer.RelaySnapshotDiagnosticsTest do
     end
   end
 
-  test "collector releases the cooldown slot after its interval while the listener stays alive" do
+  test "collector suppresses a start through the exact cooldown and reopens admission at the boundary" do
     parent = self()
     collector_name = :relay_snapshot_expiry_test_collector
-    interval_ms = 40
+    interval_ms = @cooldown_ms
+    started_at_ms = 1_000
+    clock = :atomics.new(1, signed: true)
+    :atomics.put(clock, 1, started_at_ms)
 
-    collect_fun = fn _target -> send(parent, :collection_finished) end
+    monotonic_time_fun = fn -> :atomics.get(clock, 1) end
+
+    collect_fun = fn _target ->
+      :atomics.put(clock, 1, started_at_ms + 250)
+      send(parent, :collection_finished)
+    end
+
+    sleep_fun = fn remaining_ms ->
+      send(parent, {:cooldown_wait, remaining_ms, self()})
+
+      receive do
+        :release_cooldown -> :ok
+      end
+    end
 
     listener =
       spawn(fn ->
         result =
-          Diagnostics.start_relay_snapshot(nil, collector_name, interval_ms, collect_fun)
+          Diagnostics.start_relay_snapshot(
+            nil,
+            collector_name,
+            interval_ms,
+            collect_fun,
+            &spawn/1,
+            monotonic_time_fun,
+            sleep_fun
+          )
 
         send(parent, {:listener_trigger_result, result, self()})
 
@@ -188,8 +212,58 @@ defmodule AttentionServer.RelaySnapshotDiagnosticsTest do
     try do
       assert_receive {:listener_trigger_result, :started, ^listener}, 1_000
       assert_receive :collection_finished, 1_000
+      assert_receive {:cooldown_wait, 59_750, collector}, 1_000
+      assert Process.whereis(@starting_name) == listener
+      assert Process.whereis(collector_name) == collector
+      assert Process.alive?(listener)
+
+      :atomics.put(clock, 1, started_at_ms + interval_ms - 1)
+
+      assert :skipped =
+               Diagnostics.start_relay_snapshot(
+                 nil,
+                 collector_name,
+                 interval_ms,
+                 fn _ -> send(parent, :duplicate_collection) end,
+                 fn collector_fun ->
+                   send(parent, :unexpected_cooldown_spawn)
+                   spawn(collector_fun)
+                 end,
+                 monotonic_time_fun,
+                 sleep_fun
+               )
+
+      refute_receive :duplicate_collection
+      refute_receive :unexpected_cooldown_spawn
+      assert Process.whereis(collector_name) == collector
+
+      :atomics.put(clock, 1, started_at_ms + interval_ms)
+      send(collector, :release_cooldown)
+
       assert await_snapshot_names_released(collector_name)
       assert Process.alive?(listener)
+
+      second_collect_fun = fn _target ->
+        :atomics.put(clock, 1, started_at_ms + interval_ms + 250)
+        send(parent, :second_collection_finished)
+      end
+
+      assert :started =
+               Diagnostics.start_relay_snapshot(
+                 nil,
+                 collector_name,
+                 interval_ms,
+                 second_collect_fun,
+                 &spawn/1,
+                 monotonic_time_fun,
+                 sleep_fun
+               )
+
+      assert_receive :second_collection_finished, 1_000
+      assert_receive {:cooldown_wait, 59_750, second_collector}, 1_000
+      send(second_collector, :release_cooldown)
+
+      assert await_snapshot_names_released(collector_name)
     after
       send(listener, :stop)
       Process.exit(listener, :kill)
