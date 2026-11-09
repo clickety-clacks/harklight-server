@@ -20,6 +20,7 @@ defmodule AttentionServer.LevelsDeviceAccessTest do
         System.tmp_dir!(),
         "harklight-levels-device-#{System.unique_integer([:positive])}"
       )
+
     File.mkdir_p!(dir)
     on_exit(fn -> File.rm_rf!(dir) end)
     %{path: Path.join(dir, "relay.sqlite3")}
@@ -297,6 +298,7 @@ defmodule AttentionServer.LevelsDeviceAccessTest do
              )
 
     assert session_error in [:unknown_session, :forbidden]
+
     assert {:error, :forbidden} =
              Relay.request_line(relay, "a1", raw(%{"type" => "levels_get", "ref" => "direct"}))
 

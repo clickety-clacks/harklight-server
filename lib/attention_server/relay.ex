@@ -953,8 +953,7 @@ defmodule AttentionServer.Relay do
           {:ok, store} ->
             next_state = %{state | store: store} |> notify_levels_changed(person)
 
-            {:reply, {:ok, %{"levels" => BouncePolicy.public_levels(config.levels)}},
-             next_state}
+            {:reply, {:ok, %{"levels" => BouncePolicy.public_levels(config.levels)}}, next_state}
 
           _ ->
             {:reply, {:error, :storage_unavailable}, state}
@@ -2687,8 +2686,10 @@ defmodule AttentionServer.Relay do
       {view_notice, updated} = take_view_notice(updated, System.monotonic_time(:millisecond))
       {levels_notice, updated} = take_levels_notice(updated)
       next = put_session(state, id, updated)
+
       frames =
         Enum.map(events ++ conversation_events, &line/1) ++ view_notice ++ levels_notice
+
       {:reply, {:ok, frames}, next}
     else
       false ->
