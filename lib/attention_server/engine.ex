@@ -2438,6 +2438,134 @@ defmodule AttentionServer.Engine do
     end
   end
 
+  @doc "Read one retained message owned by the current origin without changing engine state."
+  def origin_message_get(%__MODULE__{} = engine, key, sender_id, message_id, request_revision) do
+    with {:ok, person} <- authorized_person(engine, key) do
+      case Map.get(engine.messages, {person, sender_id, message_id}) do
+        %{origin: ^key} = record ->
+          project_origin_message(record, sender_id, message_id, request_revision)
+
+        _ ->
+          {:error, :not_found}
+      end
+    end
+  end
+
+  defp project_origin_message(record, sender_id, message_id, request_revision) do
+    with {:ok, current_revision} <- current_message_revision(record),
+         message when is_map(message) <- Map.get(record, :message),
+         {:ok, selected_revision, selected_message} <-
+           selected_message_revision(record, current_revision, message, request_revision),
+         {:ok, files} <- message_revision_files(record, selected_revision),
+         {:ok, current_state, current_terminal} <-
+           message_read_terminal(Map.get(record, :terminal)) do
+      item = %{
+        "sender_id" => sender_id,
+        "message_id" => message_id,
+        "request_revision" => selected_revision,
+        "current_revision" => current_revision,
+        "message" => selected_message,
+        "current_state" => current_state,
+        "current_terminal" => current_terminal
+      }
+
+      {:ok, ConversationFiles.put_entry(item, files)}
+    else
+      {:error, _reason} = error -> error
+      _ -> {:error, :storage_unavailable}
+    end
+  end
+
+  defp current_message_revision(record) do
+    case Map.get(record, :revision, 1) do
+      revision when is_integer(revision) and revision > 0 -> {:ok, revision}
+      _ -> {:error, :storage_unavailable}
+    end
+  end
+
+  defp selected_message_revision(_record, current_revision, message, nil),
+    do: {:ok, current_revision, message}
+
+  defp selected_message_revision(record, current_revision, message, requested_revision)
+       when is_integer(requested_revision) and requested_revision > 0 do
+    cond do
+      requested_revision == current_revision ->
+        {:ok, current_revision, message}
+
+      requested_revision > current_revision ->
+        {:error, :revision_unavailable}
+
+      true ->
+        case Map.fetch(record, :revisions) do
+          {:ok, revisions} when is_map(revisions) ->
+            case Map.fetch(revisions, requested_revision) do
+              {:ok, snapshot} when is_map(snapshot) -> {:ok, requested_revision, snapshot}
+              {:ok, _} -> {:error, :storage_unavailable}
+              :error -> {:error, :revision_unavailable}
+            end
+
+          :error ->
+            {:error, :revision_unavailable}
+
+          {:ok, _} ->
+            {:error, :storage_unavailable}
+        end
+    end
+  end
+
+  defp selected_message_revision(_record, _current_revision, _message, _requested_revision),
+    do: {:error, :storage_unavailable}
+
+  defp message_revision_files(record, revision) do
+    case Map.get(record, :files_by_revision, %{}) do
+      files_by_revision when is_map(files_by_revision) ->
+        files = Map.get(files_by_revision, revision, [])
+
+        if ConversationFiles.valid_stored?(files),
+          do: {:ok, files},
+          else: {:error, :storage_unavailable}
+
+      _ ->
+        {:error, :storage_unavailable}
+    end
+  end
+
+  defp message_read_terminal(nil), do: {:ok, "open", nil}
+
+  defp message_read_terminal(%{} = terminal) do
+    state = Map.get(terminal, :state)
+    at = Map.get(terminal, :at)
+    seq = Map.get(terminal, :seq)
+    answer_present = Map.get(terminal, :answer_present)
+    kind = Map.get(terminal, :kind)
+
+    if is_binary(state) and state != "" and is_integer(at) and is_integer(seq) and seq > 0 and
+         is_boolean(answer_present) and (is_nil(kind) or (is_binary(kind) and kind != "")) do
+      terminal_kind = kind || if(answer_present, do: "answer", else: "lifecycle")
+
+      projected = %{
+        "state" => state,
+        "at" => at,
+        "seq" => seq,
+        "kind" => terminal_kind,
+        "answer_present" => answer_present
+      }
+
+      if answer_present do
+        case Map.fetch(terminal, :answer) do
+          {:ok, answer} -> {:ok, state, Map.put(projected, "answer", answer)}
+          :error -> {:error, :storage_unavailable}
+        end
+      else
+        {:ok, state, projected}
+      end
+    else
+      {:error, :storage_unavailable}
+    end
+  end
+
+  defp message_read_terminal(_), do: {:error, :storage_unavailable}
+
   @doc "Record ACK1 with the exact successful feed response, before returning it to the transport."
   def deliver_origin_feed(%__MODULE__{} = engine, key, since) do
     with {:ok, person} <- authorized_person(engine, key),

@@ -8,6 +8,7 @@ defmodule AttentionServer.OriginWire do
 
   @selector_fields ~w(person person_id origin origin_key device_id device_key agent_id agent_key)
   @operation_types ~w(send reply revise withdraw result file_use support attachment_update ack2)
+  @message_get_fields ~w(v type sender_id message_id request_revision ref)
 
   def command(relay, key, request) when is_map(request) and not is_struct(request) do
     ref = Map.get(request, "ref")
@@ -78,6 +79,16 @@ defmodule AttentionServer.OriginWire do
     case Relay.origin_feed(relay, key, since) do
       {:ok, feed} -> ok(feed, ref)
       {:error, reason} -> error(Atom.to_string(reason), nil, ref)
+    end
+  end
+
+  defp run(relay, key, %{"type" => "message_get"} = request, ref) do
+    case Enum.find(Map.keys(request), &(&1 not in @message_get_fields)) do
+      field when is_binary(field) ->
+        error("invalid_field", field, ref)
+
+      nil ->
+        message_get(relay, key, request, ref)
     end
   end
 
@@ -222,6 +233,34 @@ defmodule AttentionServer.OriginWire do
   end
 
   defp run(_, _, _, ref), do: error("invalid_field", "type", ref)
+
+  defp message_get(relay, key, request, ref) do
+    revision = Map.get(request, "request_revision")
+
+    cond do
+      not Message.sender_id?(request["sender_id"]) ->
+        error("invalid_field", "sender_id", ref)
+
+      not Message.nonempty?(request["message_id"]) ->
+        error("invalid_field", "message_id", ref)
+
+      Map.has_key?(request, "request_revision") and
+          not (is_integer(revision) and revision > 0) ->
+        error("invalid_field", "request_revision", ref)
+
+      true ->
+        case Relay.origin_message_get(
+               relay,
+               key,
+               request["sender_id"],
+               request["message_id"],
+               revision
+             ) do
+          {:ok, item} -> ok(%{"item" => item}, ref)
+          {:error, reason} -> error(Atom.to_string(reason), nil, ref)
+        end
+    end
+  end
 
   defp operation_frame(%{"type" => "send"} = request),
     do: {:ok, request |> Map.put("type", "forward") |> Map.drop(~w(ref))}
