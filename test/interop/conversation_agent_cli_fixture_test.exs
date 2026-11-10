@@ -25,6 +25,208 @@ defmodule AttentionServer.ConversationAgentCLIFixtureTest do
 
   @sender_id "app:rust-cli-fixture"
 
+  @tag :message_get
+  test "message-get reads latest and exact retained snapshots without local or server side effects" do
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "harklight-message-get-#{System.unique_integer([:positive])}"
+      )
+
+    fixture = start_file_fixture!(root, :none)
+    agent_bin = System.fetch_env!("HARKLIGHT_AGENT_BIN")
+    state_dir = Path.join(root, "message-get-state")
+
+    read_env =
+      [{"HOME", root}, {"HARKLIGHT_AGENT_STATE_DIR", state_dir} | fixture.env]
+      |> Enum.uniq_by(&elem(&1, 0))
+
+    handle = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    message_id = "message-get-example"
+
+    initial = %{
+      "sender_id" => @sender_id,
+      "message_id" => message_id,
+      "created_at" => 1,
+      "title" => "Read the committed message",
+      "progress" => %{
+        "percent" => 10,
+        "history" => [%{"step" => "initial", "value" => 18_446_744_073_709_551_617}],
+        "nullable" => nil
+      }
+    }
+
+    initial_files = [%{"name" => "initial.txt", "data_base64" => Base.encode64("initial bytes")}]
+
+    initial_stored_files = [
+      %{
+        "name" => "initial.txt",
+        "tier" => "inline",
+        "size" => byte_size("initial bytes"),
+        "sha256" => Base.encode16(:crypto.hash(:sha256, "initial bytes"), case: :lower),
+        "data_base64" => Base.encode64("initial bytes")
+      }
+    ]
+
+    assert %{"type" => "ok", "revision" => 1} =
+             OriginWire.command(fixture.relay, fixture.origin, %{
+               "v" => 1,
+               "type" => "send",
+               "op_id" => op(1201),
+               "session_handle" => handle,
+               "message" => initial,
+               "files" => initial_files
+             })
+
+    latest_message =
+      Map.put(initial, "progress", %{
+        "percent" => 40,
+        "history" => [
+          %{"step" => "initial", "value" => 18_446_744_073_709_551_617},
+          %{"step" => "latest", "values" => [nil, true, "kept"]}
+        ],
+        "nullable" => nil,
+        "future_member" => %{"deep" => [%{"kept" => true}]}
+      })
+
+    latest_files = [%{"name" => "latest.txt", "data_base64" => Base.encode64("latest bytes")}]
+
+    latest_stored_files = [
+      %{
+        "name" => "latest.txt",
+        "tier" => "inline",
+        "size" => byte_size("latest bytes"),
+        "sha256" => Base.encode16(:crypto.hash(:sha256, "latest bytes"), case: :lower),
+        "data_base64" => Base.encode64("latest bytes")
+      }
+    ]
+
+    assert %{"type" => "ok", "revision" => 2} =
+             OriginWire.command(fixture.relay, fixture.origin, %{
+               "v" => 1,
+               "type" => "revise",
+               "op_id" => op(1202),
+               "session_handle" => handle,
+               "sender_id" => @sender_id,
+               "message_id" => message_id,
+               "base_revision" => 1,
+               "message" => latest_message,
+               "files" => latest_files
+             })
+
+    assert %{"type" => "ok", "state" => "retracted"} =
+             OriginWire.command(fixture.relay, fixture.origin, %{
+               "v" => 1,
+               "type" => "withdraw",
+               "op_id" => op(1203),
+               "sender_id" => @sender_id,
+               "message_id" => message_id
+             })
+
+    engine_before = :sys.get_state(fixture.relay).store.engine
+    audit_count_before = audit_count!(fixture.store_path)
+    refute File.exists?(state_dir)
+
+    message_get_request = %{
+      "v" => 1,
+      "type" => "message_get",
+      "sender_id" => @sender_id,
+      "message_id" => message_id
+    }
+
+    assert %{"v" => 1, "type" => "ok", "ref" => "inspect", "item" => _} =
+             OriginWire.command(
+               fixture.relay,
+               fixture.origin,
+               Map.put(message_get_request, "ref", "inspect")
+             )
+
+    assert %{
+             "type" => "error",
+             "reason" => "invalid_field",
+             "field" => "request_revision"
+           } =
+             OriginWire.command(
+               fixture.relay,
+               fixture.origin,
+               Map.put(message_get_request, "request_revision", 1.0)
+             )
+
+    assert %{"type" => "error", "reason" => "invalid_field", "field" => "base_revision"} =
+             OriginWire.command(
+               fixture.relay,
+               fixture.origin,
+               Map.put(message_get_request, "base_revision", 1)
+             )
+
+    assert %{"type" => "error", "reason" => "not_found"} =
+             OriginWire.command(fixture.relay, fixture.reader, message_get_request)
+
+    {latest_output, 0} =
+      System.cmd(
+        agent_bin,
+        ["message-get", "--sender-id", @sender_id, "--message-id", message_id],
+        env: read_env,
+        stderr_to_stdout: true
+      )
+
+    latest = decode_first_line!(latest_output)
+    assert latest["type"] == "ok"
+    assert latest["item"]["request_revision"] == 2
+    assert latest["item"]["current_revision"] == 2
+    assert latest["item"]["message"] == latest_message
+    assert latest["item"]["files"] == latest_stored_files
+    assert latest["item"]["current_state"] == "retracted"
+    assert latest["item"]["current_terminal"]["state"] == "retracted"
+    assert latest["item"]["current_terminal"]["answer_present"] == false
+
+    {historical_output, 0} =
+      System.cmd(
+        agent_bin,
+        [
+          "message-get",
+          "--sender-id",
+          @sender_id,
+          "--message-id",
+          message_id,
+          "--revision",
+          "1"
+        ],
+        env: read_env,
+        stderr_to_stdout: true
+      )
+
+    historical = decode_first_line!(historical_output)
+    assert historical["item"]["request_revision"] == 1
+    assert historical["item"]["current_revision"] == 2
+    assert historical["item"]["message"] == initial
+    assert historical["item"]["files"] == initial_stored_files
+    assert historical["item"]["current_state"] == "retracted"
+    assert historical["item"]["current_terminal"]["state"] == "retracted"
+
+    {missing_output, 2} =
+      System.cmd(
+        agent_bin,
+        [
+          "message-get",
+          "--sender-id",
+          @sender_id,
+          "--message-id",
+          message_id,
+          "--revision",
+          "3"
+        ],
+        env: read_env,
+        stderr_to_stdout: true
+      )
+
+    refute missing_output =~ "\"type\":\"ok\""
+    assert missing_output =~ "revision_unavailable"
+    assert :sys.get_state(fixture.relay).store.engine == engine_before
+    assert audit_count!(fixture.store_path) == audit_count_before
+    refute File.exists?(state_dir)
+  end
+
   @tag :answer_ui
   test "raw Agent --answer-ui sends the direct corpus object through Server admission and delivery" do
     root =
@@ -3244,6 +3446,15 @@ defmodule AttentionServer.ConversationAgentCLIFixtureTest do
     # Successful commands emit NDJSON on stdout; warnings belong to stderr.
     {output, 0} = System.cmd(agent_bin, args, env: env)
     decode_first_line!(output)
+  end
+
+  defp audit_count!(database) do
+    assert {:ok, db} = Sqlite3.open(database)
+    assert {:ok, statement} = Sqlite3.prepare(db, "SELECT count(*) FROM relay_audit")
+    assert {:ok, [[count]]} = Sqlite3.fetch_all(db, statement)
+    assert :ok = Sqlite3.release(db, statement)
+    assert :ok = Sqlite3.close(db)
+    count
   end
 
   defp decode_first_line!(output) do

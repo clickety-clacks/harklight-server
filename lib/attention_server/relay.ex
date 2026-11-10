@@ -105,6 +105,14 @@ defmodule AttentionServer.Relay do
   def origin_feed(server, verified_device_key, since),
     do: GenServer.call(server, {:origin_feed, verified_device_key, since})
 
+  @doc "Read one current-origin message without recording delivery, acknowledgment, or operation state."
+  def origin_message_get(server, verified_device_key, sender_id, message_id, request_revision),
+    do:
+      GenServer.call(
+        server,
+        {:origin_message_get, verified_device_key, sender_id, message_id, request_revision}
+      )
+
   def origin_advisory_feed(server, verified_device_key, handle, since),
     do: GenServer.call(server, {:origin_advisory_feed, verified_device_key, handle, since})
 
@@ -1003,6 +1011,16 @@ defmodule AttentionServer.Relay do
       error ->
         {:reply, error, state}
     end
+  end
+
+  def handle_call(
+        {:origin_message_get, key, sender_id, message_id, request_revision},
+        _from,
+        state
+      ) do
+    {:reply,
+     Engine.origin_message_get(state.store.engine, key, sender_id, message_id, request_revision),
+     state}
   end
 
   def handle_call({:origin_advisory_feed, key, handle, since}, _from, state) do
