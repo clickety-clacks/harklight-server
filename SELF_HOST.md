@@ -1,6 +1,6 @@
 # Harklight Server self-hosted installation
 
-Version: **0.1.31**. Package target: **Linux x86_64, glibc 2.39 or newer**, with OpenSSL 3 shared libraries and libstdc++6 (built on Ubuntu 24.04). The package bundles
+Version: **0.1.32**. Package target: **Linux x86_64, glibc 2.39 or newer**, with OpenSSL 3 shared libraries and libstdc++6 (built on Ubuntu 24.04). The package bundles
 Erlang/OTP and Elixir bytecode; users need no Mix, Hex, source checkout or
 Erlang installation. It needs Bash, OpenSSL CLI, tar and the platform libraries
 listed in BUILD_INFO. This is a single-process self-hosted server cut.
@@ -32,9 +32,9 @@ a live phone test.
 
 ## Download and verify
 
-After publication, download the v0.1.31 release from
-clickety-clacks/harklight-server, tag v0.1.31. Get
-harklight-server-0.1.31-linux-x86_64.tar.gz, SHA256SUMS and SELF_HOST.md from
+After publication, download the v0.1.32 release from
+clickety-clacks/harklight-server, tag v0.1.32. Get
+harklight-server-0.1.32-linux-x86_64.tar.gz, SHA256SUMS and SELF_HOST.md from
 that release. Run sha256sum -c SHA256SUMS and extract into an operator-owned
 versioned directory. BUILD_INFO identifies the source commit, build host,
 toolchain, source status and native dependencies.
@@ -47,7 +47,7 @@ runtime/dependency notices remain in their shipped distribution files.
 Choose the DNS hostname clients will validate. For a same-machine preview,
 localhost works. Install into a directory you own and run:
 
-    PACKAGE="$PWD/harklight-server-0.1.31-linux-x86_64"
+    PACKAGE="$PWD/harklight-server-0.1.32-linux-x86_64"
     STATE="$HOME/.local/share/harklight-server"
     "$PACKAGE/bin/harklight-bootstrap" "$STATE" localhost
     cat "$STATE/person-id"
@@ -314,7 +314,7 @@ survive restart.
 For a manual upgrade of an existing installation, stop the old server and back
 up the full private state before upgrading. The release installer makes one
 full mutable-root backup after stopping the service and before switching
-releases. This source, v0.1.31, writes store FORMAT27. Its first start
+releases. This source, v0.1.32, writes store FORMAT27. Its first start
 durably migrates supported FORMAT25 state, used by v0.1.28, to FORMAT27. The
 v0.1.28 package cannot start against the resulting FORMAT27 state; changing
 only the code or release link cannot restore compatibility. The FORMAT25 state
@@ -329,7 +329,7 @@ start against FORMAT24. Preserve the trust root, person and sender grants; do
 not repeat bootstrap. The v0.1.27 and v0.1.26 packages use FORMAT24 and cannot
 read FORMAT25 state written by v0.1.28.
 
-v0.1.31 includes configurable score-based priority levels and unseen-message
+v0.1.32 includes configurable score-based priority levels and unseen-message
 advisories. When a request reaches its configured unseen interval, the server
 adds an advisory to the originating agent session asking whether the request is
 still valid and worth resending and whether its importance should be raised. It
@@ -407,7 +407,7 @@ exact acceptance sequence and intent reference, without source ruling authority.
 
 For a manual upgrade, stop the old process and back up the complete private
 state directory, including the database and keys, before the first start of a
-v0.1.31 package. Verify the package checksum and extract into a different
+v0.1.32 package. Verify the package checksum and extract into a different
 versioned directory. Keep the state path, trust root, owner/person and
 configuration. Start with the existing `server.env`; do not rerun bootstrap.
 The first start durably migrates supported FORMAT25 state to FORMAT27. There is
@@ -445,8 +445,8 @@ The installer attempts backup restoration only when candidate start or
 process-readiness fails. After readiness, it does not automatically roll back;
 the optional owner agent-list probe is warning-only.
 
-Before the first v0.1.31 start, stop the server and take a complete private
-state backup, including the database and keys. After any v0.1.31 write,
+Before the first v0.1.32 start, stop the server and take a complete private
+state backup, including the database and keys. After any v0.1.32 write,
 returning to v0.1.28 requires stopping the server, restoring that pre-start
 backup and then running v0.1.28. v0.1.28 cannot read the resulting FORMAT27
 state, and changing only the code or release link does not restore
