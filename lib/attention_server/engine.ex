@@ -6351,7 +6351,8 @@ defmodule AttentionServer.Engine do
     end
   end
 
-  defp route_b_row(engine, person, device, {^person, sender, id} = key, view_entry) do
+  defp route_b_row(engine, person, device, {row_person, sender, id} = key, view_entry)
+       when row_person == person do
     record = Map.fetch!(engine.messages, key)
     summary = Map.get(engine.route_b_index.conversation_summary_by_item, key, %{})
     delivery = Map.get(engine.events, {person, record.accepted_seq}, %{})
