@@ -5,6 +5,12 @@ the person's deliberate reply. This repository contains the self-hosted Elixir
 server, packaged sender tools and optional APNs transport for the
 Harklight iOS/iPadOS app.
 
+For Tightbeam organizations using the engineering-kungfu bundle, the
+[Harklight for Tightbeam pack](https://github.com/clickety-clacks/harklight-tightbeam-pack)
+adds the Harklight Agent skill, elects it for the roles used by the reference
+installation, and includes a marked guidance section for reaching the operator
+through Harklight.
+
 ## Install the server
 
 For the FORMAT27 v0.1.32 server package, use the release page below to download
