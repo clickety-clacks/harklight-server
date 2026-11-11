@@ -1,7 +1,7 @@
 defmodule AttentionServer.RouteBBoundedReplayTest do
   use ExUnit.Case, async: false
 
-  alias AttentionServer.{JSON, Relay}
+  alias AttentionServer.{Engine, JSON, Relay}
 
   @handle "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 
@@ -33,6 +33,183 @@ defmodule AttentionServer.RouteBBoundedReplayTest do
     Enum.map(lines, fn line ->
       assert {:ok, decoded} = JSON.decode_line(line)
       decoded
+    end)
+  end
+
+  defp route_b_response(relay, session, frame, logical_frames) do
+    raw = JSON.encode!(Map.put(frame, "v", 1)) <> "\n"
+    {dispatch_us, result} =
+      :timer.tc(fn -> Relay.session_request_line(relay, session, raw) end)
+    assert {:ok, lines} = result
+
+    decoded =
+      Enum.map(lines, fn line ->
+        assert {:ok, response} = JSON.decode_line(line)
+        response
+      end)
+
+    %{
+      dispatch_us: dispatch_us,
+      wire_frames: length(lines),
+      logical_frames: logical_frames.(decoded),
+      bytes: Enum.reduce(lines, 0, &(byte_size(&1) + &2)),
+      normalized_bytes:
+        decoded
+        |> Enum.map(&normalize_route_b_sequences/1)
+        |> Enum.reduce(0, &(byte_size(JSON.encode!(&1)) + 1 + &2)),
+      decoded: decoded
+    }
+  end
+
+  defp normalize_route_b_sequences(value) when is_list(value),
+    do: Enum.map(value, &normalize_route_b_sequences/1)
+
+  defp normalize_route_b_sequences(value) when is_map(value) do
+    Map.new(value, fn {key, nested} ->
+      if key in ["seq", "conversation_seq", "latest_origin_reply_seq"] and
+           is_integer(nested) do
+        {key, 0}
+      else
+        {key, normalize_route_b_sequences(nested)}
+      end
+    end)
+  end
+
+  defp normalize_route_b_sequences(value), do: value
+
+  defp median_request(relay, session, frame, logical_frames) do
+    samples =
+      Enum.map(1..7, fn _ -> route_b_response(relay, session, frame, logical_frames) end)
+    first = hd(samples)
+
+    assert Enum.all?(samples, fn sample ->
+             Map.take(sample, [:wire_frames, :logical_frames, :bytes, :normalized_bytes]) ==
+               Map.take(first, [:wire_frames, :logical_frames, :bytes, :normalized_bytes])
+           end)
+
+    median_dispatch_us = samples |> Enum.map(& &1.dispatch_us) |> Enum.sort() |> Enum.at(3)
+    %{first | dispatch_us: median_dispatch_us}
+  end
+
+  defp scale_metric(metric) do
+    %{
+      "median_dispatch_us" => metric.dispatch_us,
+      "wire_frames" => metric.wire_frames,
+      "logical_frames" => metric.logical_frames,
+      "payload_rows" =>
+        Enum.reduce(metric.decoded, 0, &(length(Map.get(&1, "rows", [])) + &2)),
+      "conversation_frames" =>
+        Enum.reduce(metric.decoded, 0, &(length(Map.get(&1, "frames", [])) + &2)),
+      "bytes" => metric.bytes,
+      "normalized_bytes" => metric.normalized_bytes
+    }
+  end
+
+  defp synthetic_history_specs(history_frames, old_keys, visible_key) do
+    old_event_count = history_frames - 50
+    old_count_per_key = div(old_event_count, length(old_keys))
+    extra_old_keys = rem(old_event_count, length(old_keys))
+
+    old_specs =
+      old_keys
+      |> Enum.with_index()
+      |> Enum.flat_map(fn {key, index} ->
+        count = old_count_per_key + if(index < extra_old_keys, do: 1, else: 0)
+
+        kinds =
+          [:discussion, :reply, :availability, :read_position] ++
+            Enum.take(Stream.cycle([:discussion, :reply]), count - 4)
+
+        Enum.map(kinds, &{key, &1})
+      end)
+
+    visible_specs =
+      Enum.map(0..49, fn index ->
+        kind = if rem(index, 2) == 0, do: :discussion, else: :reply
+        {visible_key, kind}
+      end)
+
+    old_specs ++ visible_specs
+  end
+
+  defp seed_synthetic_history(relay, history_frames, old_keys, visible_key) do
+    :sys.replace_state(relay, fn state ->
+      engine = state.store.engine
+      specs = synthetic_history_specs(history_frames, old_keys, visible_key)
+
+      {events, read_positions, discussed_messages, first_replies} =
+        specs
+        |> Enum.with_index(1)
+        |> Enum.reduce({%{}, %{}, engine.bounce_discussed_messages, %{}}, fn
+          {{key, kind}, seq}, {events, read_positions, discussed, first_replies} ->
+            event_id =
+              "00000000-0000-4000-8000-" <>
+                String.pad_leading(Integer.to_string(seq), 12, "0")
+
+            payload =
+              case kind do
+                :discussion ->
+                  %{
+                    "kind" => "discussion",
+                    "author" => "person",
+                    "event_id" => event_id,
+                    "request_revision" => 1,
+                    "text" => "Synthetic discussion"
+                  }
+
+                :reply ->
+                  %{
+                    "kind" => "reply",
+                    "author" => "origin",
+                    "event_id" => event_id,
+                    "request_revision" => 1,
+                    "text" => "Synthetic reply"
+                  }
+
+                :availability ->
+                  %{
+                    "kind" => "availability",
+                    "availability" => "available",
+                    "last_detached_at" => nil,
+                    "listening_support" => nil,
+                    "unsupported_reason" => nil
+                  }
+
+                :read_position ->
+                  reply_seq = Map.fetch!(first_replies, key)
+
+                  %{
+                    "kind" => "read_position",
+                    "event_id" => "read:" <> event_id,
+                    "read_through_conversation_seq" => reply_seq
+                  }
+              end
+
+            first_replies =
+              if kind == :reply, do: Map.put_new(first_replies, key, seq), else: first_replies
+
+            read_positions =
+              if kind == :read_position,
+                do: Map.put(read_positions, key, Map.fetch!(first_replies, key)),
+                else: read_positions
+
+            discussed = if kind == :discussion, do: MapSet.put(discussed, key), else: discussed
+            event = %{kind: :conversation, key: key, payload: payload}
+
+            {Map.put(events, {"A", seq}, event), read_positions, discussed, first_replies}
+        end)
+
+      engine =
+        %{
+          engine
+          | conversation_highs: Map.put(engine.conversation_highs, "A", history_frames),
+            conversation_events: events,
+            chat_read_positions: read_positions,
+            bounce_discussed_messages: discussed_messages
+        }
+        |> Engine.rebuild_route_b_index()
+
+      %{state | store: %{state.store | engine: engine}}
     end)
   end
 
@@ -196,6 +373,162 @@ defmodule AttentionServer.RouteBBoundedReplayTest do
     GenServer.stop(restarted)
   end
 
+  @tag timeout: 300_000
+  test "Route B request output stays bounded across synthetic history sizes", %{path: path} do
+    runs =
+      for history_frames <- [1_000, 10_000, 50_000] do
+        store_path = path <> ".#{history_frames}"
+        assert {:ok, relay} = Relay.start_link(store_path: store_path)
+        setup_people(relay)
+
+        old_ids = Enum.map(1..5, &"old-#{&1}")
+
+        for {message_id, operation} <- Enum.zip(old_ids, 2..6) do
+          create_message(relay, message_id, operation)
+        end
+
+        for {message_id, operation} <- Enum.zip(old_ids, 7..11) do
+          assert %{"type" => "ok"} =
+                   request(relay, "reader", %{
+                     "type" => "answer",
+                     "op_id" => op(operation),
+                     "sender_id" => "app:test",
+                     "message_id" => message_id,
+                     "answer" => nil
+                   })
+        end
+
+        current_ids = Enum.map(1..19, &"current-#{&1}") ++ ["visible-chat"]
+
+        for {message_id, operation} <- Enum.zip(current_ids, 12..31) do
+          create_message(relay, message_id, operation)
+        end
+
+        old_keys = Enum.map(old_ids, &{"A", "app:test", &1})
+        visible_key = {"A", "app:test", "visible-chat"}
+        seed_synthetic_history(relay, history_frames, old_keys, visible_key)
+
+        seeded_engine = :sys.get_state(relay).store.engine
+
+        assert Enum.all?(old_keys, fn key ->
+                 summary = seeded_engine.route_b_index.conversation_summary_by_item[key]
+
+                 not is_nil(seeded_engine.messages[key].terminal) and summary.chat_started and
+                   summary.latest_origin_reply_seq > 0 and
+                   summary.availability.payload["availability"] == "available" and
+                   Map.get(seeded_engine.chat_read_positions, key, 0) > 0
+               end)
+
+        assert {:ok, session} = Relay.open_session(relay, "reader")
+
+        list_metric =
+          median_request(relay, session, %{"type" => "inbox_list", "limit" => 20}, fn [reply] ->
+            1 + length(reply["rows"])
+          end)
+
+        list_reply = hd(list_metric.decoded)
+        assert list_reply["type"] == "ok"
+        assert length(list_reply["rows"]) == 20
+        assert list_reply["unresolved_count"] == 20
+        assert list_reply["conversation_seq"] == history_frames
+        assert Enum.all?(list_reply["rows"], &(&1["message_id"] not in old_ids))
+
+        page_metric =
+          median_request(
+            relay,
+            session,
+            %{
+              "type" => "conversation_page",
+              "sender_id" => "app:test",
+              "message_id" => "visible-chat",
+              "limit" => 50
+            },
+            fn [reply] -> 2 + length(reply["frames"]) end
+          )
+
+        page_reply = hd(page_metric.decoded)
+        assert page_reply["type"] == "ok"
+        assert length(page_reply["frames"]) == 50
+        assert page_reply["conversation_seq"] == history_frames
+        assert page_reply["row"]["chat_read_position"] == 0
+
+        resync_metric =
+          route_b_response(
+            relay,
+            session,
+            %{"type" => "resync", "since" => list_reply["seq"]},
+            fn replies -> length(replies) end
+          )
+
+        assert Enum.map(resync_metric.decoded, & &1["type"]) == ["ok", "resynced"]
+
+        first_subscribe_metric =
+          route_b_response(
+            relay,
+            session,
+            %{"type" => "conversation_open", "since" => history_frames, "bounded" => true},
+            &length/1
+          )
+
+        assert Enum.map(first_subscribe_metric.decoded, & &1["type"]) == [
+                 "ok",
+                 "conversation_resynced"
+               ]
+
+        conversation_resynced = List.last(first_subscribe_metric.decoded)
+        refute Map.has_key?(conversation_resynced, "chat_read_positions")
+
+        assert :ok = Relay.close_session(relay, session)
+        assert {:ok, reconnect_session} = Relay.open_session(relay, "reader")
+
+        assert [%{"type" => "ok"}, %{"type" => "resynced"}] =
+                 session_request(
+                   relay,
+                   reconnect_session,
+                   %{"type" => "resync", "since" => list_reply["seq"]}
+                 )
+
+        reconnect_subscribe_metric =
+          route_b_response(
+            relay,
+            reconnect_session,
+            %{"type" => "conversation_open", "since" => history_frames, "bounded" => true},
+            &length/1
+          )
+
+        assert Enum.map(reconnect_subscribe_metric.decoded, & &1["type"]) == [
+                 "ok",
+                 "conversation_resynced"
+               ]
+
+        metric = %{
+          "history_frames" => history_frames,
+          "inbox_list" => scale_metric(list_metric),
+          "conversation_page" => scale_metric(page_metric),
+          "resync" => scale_metric(resync_metric),
+          "first_subscribe_commit_and_reply" => scale_metric(first_subscribe_metric),
+          "reconnect_subscribe" => scale_metric(reconnect_subscribe_metric)
+        }
+
+        IO.puts("ROUTE_B_SCALE " <> JSON.encode!(metric))
+        GenServer.stop(relay)
+        metric
+      end
+
+    for field <- [
+          "inbox_list",
+          "conversation_page",
+          "resync",
+          "first_subscribe_commit_and_reply",
+          "reconnect_subscribe"
+        ] do
+      logical_frames = Enum.map(runs, &get_in(&1, [field, "logical_frames"]))
+      normalized_bytes = Enum.map(runs, &get_in(&1, [field, "normalized_bytes"]))
+      assert length(Enum.uniq(logical_frames)) == 1
+      assert length(Enum.uniq(normalized_bytes)) == 1
+    end
+  end
+
   test "conversation_page returns current row and bounded frames for one item", %{path: path} do
     assert {:ok, relay} = Relay.start_link(store_path: path, agent_fixture_mode: true)
     setup_people(relay)
@@ -272,7 +605,7 @@ defmodule AttentionServer.RouteBBoundedReplayTest do
     assert row["chat_started"]
     assert row["chat_read_position"] == reply_seq
     assert row["latest_origin_reply_seq"] == reply_seq
-    assert row["conversation_seq"] == page["frames"][0]["conversation_seq"]
+    assert row["conversation_seq"] == hd(page["frames"])["conversation_seq"]
     assert is_map(row["availability"])
     assert is_map(row["priority_view"])
 
@@ -281,7 +614,7 @@ defmodule AttentionServer.RouteBBoundedReplayTest do
                "type" => "conversation_page",
                "sender_id" => "app:test",
                "message_id" => "chat",
-               "before" => page["frames"][0]["conversation_seq"],
+               "before" => hd(page["frames"])["conversation_seq"],
                "limit" => 100
              })
 
