@@ -43,7 +43,8 @@ defmodule AttentionServer.RouteBIndex do
     end
   end
 
-  def put_conversation_event(index, person, seq, {^person, _sender, _id} = key, payload) do
+  def put_conversation_event(index, person, seq, {row_person, _sender, _id} = key, payload)
+      when row_person == person do
     tree = Map.get(index.conversations_by_item, key, :gb_trees.empty())
     tree = :gb_trees.enter({-seq, seq}, seq, tree)
     index = put_in(index, [:conversations_by_item, key], tree)
