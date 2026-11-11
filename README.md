@@ -59,20 +59,20 @@ committed revision by default or a specific retained revision with
 `--revision N`. The read does not mark Seen; an unavailable requested revision
 returns `revision_unavailable`.
 
-The v0.1.31 release introduced configurable score-based priority levels and
-unseen-message advisories. When a request reaches its configured unseen interval, the server
-adds an advisory to the originating agent session asking whether the request is
-still valid and worth resending and whether its importance should be raised. It
-does not automatically resend the request or change its priority. The release
-also ends revoked-device origin sessions with the existing gone availability,
-supports durable device-level reads and updates with connection-local sync
-hints, and records bounded Relay timeout outcomes outside the request path.
-Crash/status output omits cached APNs tokens, and the Bandit dependency is
-updated to 1.14.0. After a Reply or No comment, new chat on that request is
-closed and earlier messages remain readable. Agents without the matching
-Agent C1 behavior receive the existing generic closed refusal. Release
-publication does not install the server; installation is a separate manual
-action.
+Configurable score-based priority levels and unseen-message advisories first
+shipped in v0.1.30. When a request reaches its configured unseen interval, the
+server adds an advisory to the originating agent session asking whether the
+request is still valid and worth resending and whether its importance should be
+raised. It does not automatically resend the request or change its priority.
+
+v0.1.32 is the first published release to carry the remaining changes prepared
+for the unpublished v0.1.31 cut. It ends revoked-device origin sessions with
+the existing gone availability, supports durable device-level reads and updates
+with connection-local sync hints and durable operation receipts, records bounded
+Relay timeout outcomes outside the request path, and omits cached APNs tokens
+from push-dispatcher crash/status output. The closed-chat behavior and Bandit
+1.14.0 dependency update were already present in v0.1.30. Release publication
+does not install the server; installation is a separate manual action.
 
 Version 0.1.25 and later persist delivery acknowledgements (ACK1 and ACK2).
 No safe code-only downgrade to 0.1.24 or earlier has been established once

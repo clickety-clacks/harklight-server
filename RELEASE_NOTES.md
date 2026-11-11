@@ -7,6 +7,9 @@
   committed revision by default or a specific retained revision with
   `--revision N`. Reading does not mark Seen; an unavailable requested revision
   returns `revision_unavailable`.
+- This is the first published release of the remaining device-revocation,
+  access-level synchronization, bounded Relay-timeout, and cached-token
+  crash/status changes prepared for the unpublished v0.1.31 cut.
 
 ## Upgrade and recovery
 
@@ -24,7 +27,12 @@ installer behavior and recovery limits.
 
 ---
 
-# Harklight Server v0.1.31 (historical)
+# Proposed Harklight Server v0.1.31 release notes (not published)
+
+No v0.1.31 tag or release was published. The changes in this draft that were
+not already present in v0.1.30 are first released in v0.1.32. Configurable
+priority levels, unseen-message advisories, closed-chat behavior, and Bandit
+1.14.0 were already included in v0.1.30.
 
 ## Changes
 
