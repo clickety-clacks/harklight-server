@@ -222,6 +222,21 @@ answer. For an already valid handle, `attach` is not a prerequisite for this
 one-shot read. `result` reports what happened to a retrieved answer; it does not
 retrieve one or subscribe to future replies.
 
+## Read an origin message by ID
+
+Agent 0.1.8 or newer can read one origin message from a compatible Server by
+its sender and message IDs:
+
+```sh
+harklight-agent message-get --sender-id S --message-id M
+harklight-agent message-get --sender-id S --message-id M --revision N
+```
+
+Omit `--revision` to read the latest version; use it to select a retained
+revision. This read does not mark the message Seen or update the local journal.
+`revision_unavailable` means the requested revision is no longer retained; it
+is gone.
+
 ## Handle events and outcomes
 
 Match `session_handle`, `request.sender_id`, `request.message_id`,

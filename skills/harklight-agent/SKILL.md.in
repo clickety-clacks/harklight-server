@@ -65,6 +65,12 @@ reason and use the one-shot `read --session HANDLE` procedure in the shared core
 when the originating work resumes. Reading does not claim listener support or
 acknowledge an event.
 
+For a direct origin-message lookup, Agent 0.1.8 or newer supports
+`harklight-agent message-get --sender-id S --message-id M [--revision N]` with
+a compatible Server. It reads the latest version by default or the selected
+retained revision; it does not mark Seen. `revision_unavailable` means the
+requested revision is gone. The shared core below gives the command examples.
+
 The enrolled-device interface remains available for existing inbox work:
 `device read` journals replayed entries before ACK, and
 `device respond --sender ID --message-id ID --answer answer.json` deliberately
