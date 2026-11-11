@@ -2,14 +2,15 @@
 
 ## Changes
 
-- The origin API supports reading a message by sender ID and message ID. Agent
-  0.1.9 or newer provides `harklight-agent message-get`, which returns the latest
-  committed revision by default or a specific retained revision with
+- The origin API supports reading a message by sender ID and message ID. The
+  matching `harklight-agent message-get` interface is defined in Agent 0.1.9
+  source, but Agent 0.1.9 has not yet been published. The command returns the
+  latest committed revision by default or a specific retained revision with
   `--revision N`. Reading does not mark Seen; an unavailable requested revision
   returns `revision_unavailable`.
-- This is the first published release of the remaining device-revocation,
-  access-level synchronization, bounded Relay-timeout, and cached-token
-  crash/status changes prepared for the unpublished v0.1.31 cut.
+- Stable v0.1.31 was published on 2026-11-11 before v0.1.32 and already included
+  the device-revocation, access-level synchronization, bounded Relay-timeout,
+  and cached-token crash/status changes described below.
 
 ## Upgrade and recovery
 
@@ -27,12 +28,11 @@ installer behavior and recovery limits.
 
 ---
 
-# Proposed Harklight Server v0.1.31 release notes (not published)
+## Harklight Server v0.1.31 (published 2026-11-11)
 
-No v0.1.31 tag or release was published. The changes in this draft that were
-not already present in v0.1.30 are first released in v0.1.32. Configurable
-priority levels, unseen-message advisories, closed-chat behavior, and Bandit
-1.14.0 were already included in v0.1.30.
+Stable v0.1.31 was published before v0.1.32. Configurable priority levels,
+unseen-message advisories, closed-chat behavior, and Bandit 1.14.0 were already
+present in v0.1.30 and remain available.
 
 ## Changes
 
@@ -43,7 +43,6 @@ priority levels, unseen-message advisories, closed-chat behavior, and Bandit
 - Relay timeout and outcome-unknown snapshots are bounded and recorded outside
   the request path.
 - Push-dispatcher crash/status output omits cached APNs tokens.
-- The Bandit dependency is updated to 1.14.0.
 - Release publication does not trigger installation. Installation is available
   only through an explicitly authorized manual workflow dispatch.
 - Configurable score-based priority levels, unseen-message advisories, and
