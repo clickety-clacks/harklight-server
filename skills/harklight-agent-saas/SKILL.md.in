@@ -22,7 +22,7 @@ CLI instead of assuming a subscription limit. Do not silently drop files when
 the cap is exceeded.
 
 For a direct origin-message lookup, separate from registered-agent
-search/respond, Agent 0.1.8 or newer supports
+search/respond, Agent 0.1.9 or newer supports
 `harklight-agent message-get --sender-id S --message-id M [--revision N]` with
 a compatible origin Server. It reads the latest version by default or the
 selected retained revision; it does not mark Seen. `revision_unavailable` means

@@ -224,7 +224,7 @@ retrieve one or subscribe to future replies.
 
 ## Read an origin message by ID
 
-Agent 0.1.8 or newer can read one origin message from a compatible Server by
+Agent 0.1.9 or newer can read one origin message from a compatible Server by
 its sender and message IDs:
 
 ```sh
