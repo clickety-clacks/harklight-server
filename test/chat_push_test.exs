@@ -216,10 +216,11 @@ defmodule AttentionServer.ChatPushTest do
     assert push_binding(engine).state == "ready"
   end
 
-  test "answered request replies alert without opened marker and origin never receives its own preview" do
+  test "a pre-answer reply still alerts without opened marker and origin never gets its own preview" do
     {engine, _} = register(setup_engine(), 1)
     {engine, _} = register(engine, 1, String.duplicate("cd", 32), @origin)
     {engine, _} = forward(engine, "one")
+    {engine, _} = reply(engine, "one", "Before answer")
 
     {engine, _} =
       request(engine, @reader, %{
@@ -230,7 +231,6 @@ defmodule AttentionServer.ChatPushTest do
         "answer" => "yes"
       })
 
-    {engine, _} = reply(engine, "one", "After answer")
     assert engine.messages[{@person, "app:test", "one"}].terminal != nil
     assert engine.push_bindings[{@person, @origin}].pending_conversation_high == 0
     now = due(engine)
@@ -244,7 +244,7 @@ defmodule AttentionServer.ChatPushTest do
       end)
 
     alerts = Enum.filter(claims, &(&1.presentation == :alert))
-    assert [%{device: @reader, alert: %{"body" => "After answer"}}] = alerts
+    assert [%{device: @reader, alert: %{"body" => "Before answer"}}] = alerts
     assert engine.chat_read_positions == %{}
   end
 
