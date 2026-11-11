@@ -80,7 +80,13 @@ defmodule AttentionServer.Engine do
             bounce_discussed_messages: MapSet.new(),
             bounce_origin_entries: MapSet.new(),
             advisory_id_index: %{},
-            advisory_feeds: %{}
+            advisory_feeds: %{},
+            route_b_index: %{
+              messages_by_person: %{},
+              conversations_by_item: %{},
+              conversation_summary_by_item: %{},
+              unresolved_count_by_person: %{}
+            }
 
   def new do
     %__MODULE__{
@@ -2316,6 +2322,109 @@ defmodule AttentionServer.Engine do
       _ -> {:error, :invalid_cursor}
     end
   end
+
+  @doc false
+  def route_b_inbox_page(%__MODULE__{} = engine, key, view_order, view_entries, limit, cursor)
+      when is_list(view_order) and is_map(view_entries) and is_integer(limit) and limit > 0 do
+    with {:ok, %{person: person, key: device}} <- principal(engine, key),
+         {:ok, unresolved_after, resolved_cursor} <-
+           route_b_cursor_position(engine, person, view_order, cursor) do
+      current_high = Map.get(engine.persons, person, 0)
+      candidate_limit = limit + 1
+      unresolved = Enum.take(unresolved_after, candidate_limit)
+
+      resolved =
+        if length(unresolved) < candidate_limit do
+          route_b_resolved_keys(
+            engine,
+            person,
+            resolved_cursor,
+            candidate_limit - length(unresolved)
+          )
+        else
+          []
+        end
+
+      candidates = unresolved ++ resolved
+      page_keys = Enum.take(candidates, limit)
+      more? = length(candidates) > limit
+
+      rows =
+        Enum.map(page_keys, fn {sender, id} = identity ->
+          route_b_row(
+            engine,
+            person,
+            device,
+            {person, sender, id},
+            Map.get(view_entries, identity)
+          )
+        end)
+
+      reply = %{
+        "rows" => rows,
+        "seq" => current_high,
+        "conversation_seq" => Map.get(engine.conversation_highs, person, 0),
+        "unresolved_count" =>
+          Map.get(engine.route_b_index.unresolved_count_by_person, person, 0)
+      }
+
+      reply =
+        if more?,
+          do: Map.put(reply, "next_cursor", encode_route_b_cursor(List.last(page_keys))),
+          else: reply
+
+      {:ok, reply}
+    else
+      {:error, :forbidden} -> {:error, :forbidden}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @doc false
+  def route_b_conversation_page(
+        %__MODULE__{} = engine,
+        key,
+        {sender, id},
+        before,
+        limit,
+        view_entry
+      )
+      when is_binary(sender) and is_binary(id) and is_integer(limit) and limit >= 0 and
+             (is_nil(before) or (is_integer(before) and before >= 0)) do
+    with {:ok, %{person: person, key: device}} <- principal(engine, key),
+         %{accepted_seq: _accepted_seq} <- Map.get(engine.messages, {person, sender, id}) do
+      {newest_first, older?} =
+        route_b_conversation_seqs(
+          engine.route_b_index,
+          {person, sender, id},
+          before,
+          limit
+        )
+
+      frames =
+        newest_first
+        |> Enum.reverse()
+        |> Enum.map(&project_conversation_event(engine, person, device, &1))
+
+      row = route_b_row(engine, person, device, {person, sender, id}, view_entry)
+
+      {:ok,
+       %{
+         "row" => row,
+         "frames" => frames,
+         "older" => older?,
+         "seq" => Map.get(engine.persons, person, 0),
+         "conversation_seq" => Map.get(engine.conversation_highs, person, 0)
+       }}
+    else
+      {:error, :forbidden} -> {:error, :forbidden}
+      nil -> {:error, :not_found}
+    end
+  end
+
+  @doc false
+  def rebuild_route_b_index(%__MODULE__{} = engine),
+    do: %{engine | route_b_index: AttentionServer.RouteBIndex.rebuild(engine)}
 
   @doc false
   def inbox_snapshot(%__MODULE__{} = engine, key, since, view_order \\ []) do
@@ -5357,6 +5466,15 @@ defmodule AttentionServer.Engine do
   defp put_conversation_event(engine, person, seq, key, payload) do
     event = %{kind: :conversation, key: key, payload: payload}
 
+    route_b_index =
+      AttentionServer.RouteBIndex.put_conversation_event(
+        engine.route_b_index,
+        person,
+        seq,
+        key,
+        payload
+      )
+
     discussed =
       if payload["kind"] == "discussion" and payload["author"] == "person",
         do: MapSet.put(engine.bounce_discussed_messages, key),
@@ -5365,6 +5483,7 @@ defmodule AttentionServer.Engine do
     %{
       engine
       | conversation_events: Map.put(engine.conversation_events, {person, seq}, event),
+        route_b_index: route_b_index,
         bounce_discussed_messages: discussed
     }
   end
@@ -5723,19 +5842,25 @@ defmodule AttentionServer.Engine do
     {%{engine | conversation_highs: Map.put(engine.conversation_highs, person, seq)}, seq}
   end
 
-  defp put_message(engine, key, record),
-    do:
-      engine
-      |> then(fn current ->
-        case default_due_at(record) do
-          at when is_integer(at) ->
-            %{current | open_default_index: Map.put(current.open_default_index, key, at)}
+  defp put_message(engine, key, record) do
+    previous = Map.get(engine.messages, key)
 
-          _ ->
-            %{current | open_default_index: Map.delete(current.open_default_index, key)}
-        end
-      end)
-      |> then(fn current -> %{current | messages: Map.put(current.messages, key, record)} end)
+    open_default_index =
+      case default_due_at(record) do
+        at when is_integer(at) -> Map.put(engine.open_default_index, key, at)
+        _ -> Map.delete(engine.open_default_index, key)
+      end
+
+    route_b_index =
+      AttentionServer.RouteBIndex.put_message(engine.route_b_index, key, previous, record)
+
+    %{
+      engine
+      | open_default_index: open_default_index,
+        messages: Map.put(engine.messages, key, record),
+        route_b_index: route_b_index
+    }
+  end
 
   defp default_due_at(record) do
     if Map.get(record, :terminal) == nil do
@@ -6101,6 +6226,229 @@ defmodule AttentionServer.Engine do
       end
     end
   end
+
+  defp route_b_cursor_position(_engine, _person, view_order, nil),
+    do: {:ok, view_order, nil}
+
+  defp route_b_cursor_position(engine, person, view_order, {sender, id} = identity)
+       when is_binary(sender) and is_binary(id) do
+    case Map.get(engine.messages, {person, sender, id}) do
+      nil ->
+        {:error, :invalid_cursor}
+
+      %{terminal: nil} ->
+        case Enum.split_while(view_order, &(&1 != identity)) do
+          {_before, [^identity | remaining]} -> {:ok, remaining, nil}
+          _ -> {:error, :invalid_cursor}
+        end
+
+      _resolved ->
+        {:ok, [], identity}
+    end
+  end
+
+  defp route_b_cursor_position(_engine, _person, _view_order, _cursor),
+    do: {:error, :invalid_cursor}
+
+  defp route_b_resolved_keys(_engine, _person, _after_identity, 0), do: []
+
+  defp route_b_resolved_keys(engine, person, after_identity, limit) do
+    tree = Map.get(engine.route_b_index.messages_by_person, person, :gb_trees.empty())
+
+    with {:ok, iterator} <- route_b_message_iterator(engine, person, tree, after_identity) do
+      route_b_take_resolved(engine, person, iterator, limit, [], after_identity)
+    else
+      _ -> []
+    end
+  end
+
+  defp route_b_message_iterator(_engine, _person, tree, nil),
+    do: {:ok, :gb_trees.iterator(tree)}
+
+  defp route_b_message_iterator(engine, person, tree, {sender, id}) do
+    key = {person, sender, id}
+
+    case Map.get(engine.messages, key) do
+      %{accepted_seq: accepted_seq} ->
+        order_key = {-accepted_seq, sender, id}
+
+        case :gb_trees.lookup(order_key, tree) do
+          {:value, ^key} -> {:ok, :gb_trees.iterator_from(order_key, tree)}
+          _ -> {:error, :invalid_cursor}
+        end
+
+      _ ->
+        {:error, :invalid_cursor}
+    end
+  end
+
+  defp route_b_take_resolved(_engine, _person, _iterator, 0, reversed, _skip_identity),
+    do: Enum.reverse(reversed)
+
+  defp route_b_take_resolved(engine, person, iterator, remaining, reversed, skip_identity) do
+    case :gb_trees.next(iterator) do
+      :none ->
+        Enum.reverse(reversed)
+
+      {_order_key, {^person, _sender, _id} = key, next_iterator} ->
+        if key_identity(key) == skip_identity do
+          route_b_take_resolved(engine, person, next_iterator, remaining, reversed, nil)
+        else
+          case Map.get(engine.messages, key) do
+            %{terminal: terminal, accepted_seq: accepted_seq} when not is_nil(terminal) ->
+              if accepted_seq <= Map.get(engine.persons, person, 0) do
+                route_b_take_resolved(
+                  engine,
+                  person,
+                  next_iterator,
+                  remaining - 1,
+                  [key_identity(key) | reversed],
+                  skip_identity
+                )
+              else
+                route_b_take_resolved(
+                  engine,
+                  person,
+                  next_iterator,
+                  remaining,
+                  reversed,
+                  skip_identity
+                )
+              end
+
+            _ ->
+              route_b_take_resolved(engine, person, next_iterator, remaining, reversed, skip_identity)
+          end
+        end
+    end
+  end
+
+  defp route_b_conversation_seqs(index, key, before, limit) do
+    tree = Map.get(index.conversations_by_item, key, :gb_trees.empty())
+
+    iterator =
+      if is_integer(before),
+        do: :gb_trees.iterator_from({-before, 0}, tree),
+        else: :gb_trees.iterator(tree)
+
+    candidates = route_b_take_conversation_seqs(iterator, before, limit + 1, [])
+    {Enum.take(candidates, limit), length(candidates) > limit}
+  end
+
+  defp route_b_take_conversation_seqs(_iterator, _before, 0, reversed),
+    do: Enum.reverse(reversed)
+
+  defp route_b_take_conversation_seqs(iterator, before, remaining, reversed) do
+    case :gb_trees.next(iterator) do
+      :none ->
+        Enum.reverse(reversed)
+
+      {_order_key, seq, next_iterator} when is_nil(before) or seq < before ->
+        route_b_take_conversation_seqs(next_iterator, before, remaining - 1, [seq | reversed])
+
+      {_order_key, _seq, next_iterator} ->
+        route_b_take_conversation_seqs(next_iterator, before, remaining, reversed)
+    end
+  end
+
+  defp route_b_row(engine, person, device, {^person, sender, id} = key, view_entry) do
+    record = Map.fetch!(engine.messages, key)
+    summary = Map.get(engine.route_b_index.conversation_summary_by_item, key, %{})
+    delivery = Map.get(engine.events, {person, record.accepted_seq}, %{})
+    availability_event = Map.get(summary, :availability)
+    availability = if availability_event, do: availability_event.payload, else: Map.get(delivery, :payload, %{})
+    files = Map.get(record, :files_by_revision, %{}) |> Map.get(record.revision, [])
+
+    row = %{
+      "sender_id" => sender,
+      "message_id" => id,
+      "origin" => record.origin,
+      "accepted_seq" => record.accepted_seq,
+      "request_revision" => record.revision,
+      "message" => record.message,
+      "files" => files,
+      "opened" => route_b_opened?(engine, key, record),
+      "chat_started" => Map.get(summary, :chat_started, false),
+      "chat_read_position" => Map.get(engine.chat_read_positions, key, 0),
+      "latest_origin_reply_seq" => Map.get(summary, :latest_origin_reply_seq),
+      "conversation_seq" => Map.get(summary, :latest_seq, 0)
+    }
+
+    row =
+      if is_binary(Map.get(record, :session_handle)) do
+        row
+        |> Map.put("session_handle", record.session_handle)
+        |> Map.put(
+          "availability",
+          Map.take(availability, ~w(availability last_detached_at listening_support unsupported_reason))
+        )
+      else
+        row
+      end
+
+    row =
+      if device == record.origin do
+        row
+      else
+        subscription = Map.get(engine.subscriptions, {person, device})
+
+        mode =
+          if subscription && MapSet.member?(subscription.senders, sender),
+            do: "message",
+            else: "knock"
+
+        Map.put(row, "as", mode)
+      end
+
+    row =
+      case record.terminal do
+        nil -> Map.put(row, "terminal", nil)
+        _terminal -> Map.put(row, "terminal", project_terminal(record, key, device))
+      end
+
+    row =
+      case Map.get(record, :origin_result) do
+        %{status: status, result_ref: result_ref, revision: revision} ->
+          Map.put(row, "origin_result", %{
+            "status" => status,
+            "result_ref" => result_ref,
+            "result_revision" => revision
+          })
+
+        _ ->
+          row
+      end
+
+    case view_entry do
+      %{} = entry -> Map.put(row, "priority_view", Map.take(entry, ~w(score due_at)))
+      _ -> row
+    end
+  end
+
+  defp route_b_opened?(engine, {person, sender, id} = key, record) do
+    substantive_revision =
+      case Map.get(engine.bounce_revisions, key) do
+        %{raw_to_substantive: raw_to_substantive} = state ->
+          Map.get(
+            raw_to_substantive,
+            record.revision,
+            Map.get(state, :current_substantive_revision, record.revision)
+          )
+
+        _ ->
+          record.revision
+      end
+
+    MapSet.member?(engine.opened_revisions, {person, sender, id, substantive_revision})
+  end
+
+  defp encode_route_b_cursor({sender, id}) do
+    %{"sender_id" => sender, "message_id" => id}
+    |> JSON.encode!()
+    |> Base.url_encode64(padding: false)
+  end
+
+  defp key_identity({_person, sender, id}), do: {sender, id}
 
   defp project_paging_terminal(engine, record, {person, _, _} = key, device) do
     # Receipt facts reference the terminal turn, not the initial delivery turn.

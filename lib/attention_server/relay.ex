@@ -16,6 +16,8 @@ defmodule AttentionServer.Relay do
   @default_sweep_retry_ms 1_000
   @max_timer_delay_ms 4_294_967_295
   @prioritization_debounce_ms 250
+  @route_b_default_limit 20
+  @route_b_max_limit 100
   @hosted_test_states ~w(no-devices device-waiting device-enrolled)
   @hosted_test_label "Test account"
   @hosted_test_device "Test device"
@@ -3239,7 +3241,15 @@ defmodule AttentionServer.Relay do
         inbox_session_request(state, id, session, frame)
 
       {:ok, %{"type" => type} = frame}
-      when type in ["resync", "ack", "conversation_open", "conversation_ack", "view_get"] ->
+      when type in [
+             "resync",
+             "ack",
+             "conversation_open",
+             "conversation_ack",
+             "view_get",
+             "inbox_list",
+             "conversation_page"
+           ] ->
         special_request(state, id, session, frame)
 
       {:ok, %{"type" => type}} when type in ["levels_get", "levels_set"] ->
@@ -3298,13 +3308,26 @@ defmodule AttentionServer.Relay do
             end
 
           "conversation_open" ->
-            conversation_open(state, id, session, frame)
+            case frame["bounded"] do
+              true -> conversation_open_bounded(state, id, session, frame)
+              value when is_nil(value) or is_boolean(value) ->
+                conversation_open(state, id, session, frame)
+
+              _ ->
+                {{:ok, [error_line(frame, "invalid_field", "bounded")]}, state}
+            end
 
           "conversation_ack" ->
             conversation_ack(state, session, frame)
 
           "view_get" ->
             view_get(state, id, session, frame)
+
+          "inbox_list" ->
+            inbox_list(state, session, frame)
+
+          "conversation_page" ->
+            conversation_page(state, session, frame)
         end
 
       {reason, field} ->
@@ -3930,6 +3953,189 @@ defmodule AttentionServer.Relay do
     end
   end
 
+  defp conversation_open_bounded(state, id, session, frame) do
+    if session.ready and session.sync_mode == :legacy do
+      with {:ok, events, high} <-
+             Engine.conversation_events(state.store.engine, session.key, frame["since"]),
+           {:ok, cursor} <- Engine.conversation_cursor(state.store.engine, session.key),
+           {:ok, next_engine} <- Engine.open_conversation(state.store.engine, session.key),
+           {:ok, person} <- Engine.authorized_person(next_engine, session.key),
+           %{view_rev: view_rev} <- Map.get(state.priority_views, person),
+           {:ok, store} <-
+             commit(
+               state.store,
+               next_engine,
+               audit(state.store.engine, session.key, "conversation_open")
+             ) do
+        contiguous = if frame["since"] <= cursor, do: high, else: cursor
+
+        updated = %{
+          session
+          | conversation_ready: true,
+            conversation_seq: high,
+            conversation_contiguous: contiguous,
+            view_support: true
+        }
+
+        endpoint =
+          case state.origin_listener do
+            %{port: port} -> %{"origin_https_port" => port}
+            nil -> %{}
+          end
+
+        frames =
+          [ok_line(frame, endpoint)] ++
+            Enum.map(events, &line/1) ++
+            [
+              line(%{
+                "v" => 1,
+                "type" => "conversation_resynced",
+                "conversation_seq" => high,
+                "view_rev" => view_rev
+              })
+            ]
+
+        {{:ok, frames}, put_session(%{state | store: store}, id, updated)}
+      else
+        {:error, :storage_unavailable, _} ->
+          {{:ok, [error_line(frame, "storage_unavailable")]}, state}
+
+        {:error, reason} ->
+          {{:ok, [error_line(frame, Atom.to_string(reason))]}, state}
+
+        nil ->
+          {{:ok, [error_line(frame, "view_unavailable")]}, state}
+
+        _ ->
+          {{:ok, [error_line(frame, "view_unavailable")]}, state}
+      end
+    else
+      {{:ok, [error_line(frame, "resync_required")]}, state}
+    end
+  end
+
+  defp inbox_list(state, session, frame) do
+    with :ok <- route_b_fields(frame, ~w(v type ref limit cursor)),
+         {:ok, limit} <- route_b_limit(frame, false),
+         {:ok, cursor} <- route_b_cursor(frame),
+         {:ok, person} <- Engine.authorized_person(state.store.engine, session.key),
+         %{view_rev: view_rev, message_order: order, message_entries_by_identity: entries} <-
+           Map.get(state.priority_views, person),
+         {:ok, reply} <-
+           Engine.route_b_inbox_page(
+             state.store.engine,
+             session.key,
+             order,
+             entries,
+             limit,
+             cursor
+           ) do
+      {{:ok, [ok_line(frame, Map.put(reply, "view_rev", view_rev))]}, state}
+    else
+      {:error, :invalid_cursor} -> {{:ok, [error_line(frame, "invalid_cursor")]}, state}
+      {:error, :forbidden} -> {{:ok, [error_line(frame, "forbidden")]}, state}
+      {:error, {:invalid_field, field}} ->
+        {{:ok, [error_line(frame, "invalid_field", field)]}, state}
+
+      {:error, reason} ->
+        {{:ok, [error_line(frame, Atom.to_string(reason))]}, state}
+
+      nil ->
+        {{:ok, [error_line(frame, "view_unavailable")]}, state}
+
+      _ ->
+        {{:ok, [error_line(frame, "view_unavailable")]}, state}
+    end
+  end
+
+  defp conversation_page(state, session, frame) do
+    with :ok <- route_b_fields(frame, ~w(v type ref sender_id message_id before limit)),
+         :ok <- route_b_identity_fields(frame),
+         {:ok, limit} <- route_b_limit(frame, true),
+         {:ok, before} <- route_b_before(frame),
+         {:ok, person} <- Engine.authorized_person(state.store.engine, session.key),
+         %{view_rev: view_rev, message_entries_by_identity: entries} <-
+           Map.get(state.priority_views, person),
+         identity = {frame["sender_id"], frame["message_id"]},
+         {:ok, reply} <-
+           Engine.route_b_conversation_page(
+             state.store.engine,
+             session.key,
+             identity,
+             before,
+             limit,
+             Map.get(entries, identity)
+           ) do
+      {{:ok, [ok_line(frame, Map.put(reply, "view_rev", view_rev))]}, state}
+    else
+      {:error, :not_found} -> {{:ok, [error_line(frame, "not_found")]}, state}
+      {:error, :forbidden} -> {{:ok, [error_line(frame, "forbidden")]}, state}
+      {:error, {:invalid_field, field}} ->
+        {{:ok, [error_line(frame, "invalid_field", field)]}, state}
+
+      {:error, reason} ->
+        {{:ok, [error_line(frame, Atom.to_string(reason))]}, state}
+
+      nil ->
+        {{:ok, [error_line(frame, "view_unavailable")]}, state}
+
+      _ ->
+        {{:ok, [error_line(frame, "view_unavailable")]}, state}
+    end
+  end
+
+  defp route_b_fields(frame, allowed) do
+    case Enum.find(Map.keys(frame), &(&1 not in allowed)) do
+      nil -> :ok
+      field -> {:error, {:invalid_field, field}}
+    end
+  end
+
+  defp route_b_identity_fields(frame) do
+    if is_binary(frame["sender_id"]) and is_binary(frame["message_id"]),
+      do: :ok,
+      else: {:error, {:invalid_field, if(is_binary(frame["sender_id"]), do: "message_id", else: "sender_id")}}
+  end
+
+  defp route_b_limit(frame, allow_zero?) do
+    default = @route_b_default_limit
+    minimum = if allow_zero?, do: 0, else: 1
+
+    case Map.get(frame, "limit", default) do
+      limit when is_integer(limit) and limit >= minimum ->
+        {:ok, min(limit, @route_b_max_limit)}
+
+      _ ->
+        {:error, {:invalid_field, "limit"}}
+    end
+  end
+
+  defp route_b_before(frame) do
+    case Map.fetch(frame, "before") do
+      :error -> {:ok, nil}
+      {:ok, before} when is_integer(before) and before >= 0 -> {:ok, before}
+      _ -> {:error, {:invalid_field, "before"}}
+    end
+  end
+
+  defp route_b_cursor(frame) do
+    case Map.fetch(frame, "cursor") do
+      :error -> {:ok, nil}
+      {:ok, cursor} when is_binary(cursor) -> decode_route_b_cursor(cursor)
+      _ -> {:error, :invalid_cursor}
+    end
+  end
+
+  defp decode_route_b_cursor(cursor) do
+    with {:ok, json} <- Base.url_decode64(cursor, padding: false),
+         {:ok, %{"sender_id" => sender, "message_id" => id}} <- JSON.decode_line(json <> "\n"),
+         true <- is_binary(sender) and is_binary(id) do
+      {:ok, {sender, id}}
+    else
+      _ -> {:error, :invalid_cursor}
+    end
+  end
+
   defp conversation_ack(state, session, frame) do
     if session.conversation_ready do
       case Engine.acknowledge_conversation(
@@ -4234,6 +4440,14 @@ defmodule AttentionServer.Relay do
         shown
       end
 
+    shown =
+      shown
+      |> Map.put(:message_order, Enum.map(shown.entries, &Placement.identity/1))
+      |> Map.put(
+        :message_entries_by_identity,
+        Map.new(shown.entries, &{Placement.identity(&1), &1})
+      )
+
     comparable =
       Map.take(shown, [
         :algorithm,
@@ -4244,6 +4458,9 @@ defmodule AttentionServer.Relay do
         :list_items,
         :free_order_version
       ])
+
+    message_order = shown.message_order
+    message_entries_by_identity = shown.message_entries_by_identity
 
     if previous &&
          Map.take(previous, [
@@ -4259,7 +4476,14 @@ defmodule AttentionServer.Relay do
       Map.put(
         state,
         :priority_views,
-        Map.put(state.priority_views, person, Map.put(previous, :engine_entries, engine_entries))
+        Map.put(
+          state.priority_views,
+          person,
+          previous
+          |> Map.put(:engine_entries, engine_entries)
+          |> Map.put(:message_order, message_order)
+          |> Map.put(:message_entries_by_identity, message_entries_by_identity)
+        )
       )
     else
       counter = state.priority_revision_counter + 1
@@ -4268,6 +4492,8 @@ defmodule AttentionServer.Relay do
       view =
         comparable
         |> Map.put(:engine_entries, engine_entries)
+        |> Map.put(:message_order, message_order)
+        |> Map.put(:message_entries_by_identity, message_entries_by_identity)
         |> Map.put(:view_rev, view_rev)
 
       state
@@ -5153,7 +5379,11 @@ defmodule AttentionServer.Relay do
 
   defp setup(state, {:ok, next_engine}, person, actor, action) do
     case commit(state.store, next_engine, %{person: person, actor: actor, action: action}) do
-      {:ok, store} -> {:reply, :ok, %{state | store: store}}
+      {:ok, store} ->
+        state = %{state | store: store}
+        state = if Map.has_key?(state.priority_views, person), do: state, else: ensure_priority_view(state, person)
+        {:reply, :ok, state}
+
       {:error, _, _} -> {:reply, {:error, :storage_unavailable}, state}
     end
   end
