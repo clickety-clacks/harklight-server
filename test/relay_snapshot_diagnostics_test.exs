@@ -334,6 +334,10 @@ defmodule AttentionServer.RelaySnapshotDiagnosticsTest do
   test "Relay-boundary request returns while the named collector is blocked" do
     parent = self()
 
+    # A prior relay-boundary failure may leave the process-wide collector in cooldown.
+    stop_collector(@collector_name)
+    assert await_snapshot_names_released(@collector_name, 1_000)
+
     blocked_target =
       spawn(fn ->
         receive do
