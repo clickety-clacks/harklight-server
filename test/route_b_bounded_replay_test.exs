@@ -218,7 +218,7 @@ defmodule AttentionServer.RouteBBoundedReplayTest do
                "sender_id" => "app:test",
                "message_id" => "chat",
                "request_revision" => 1,
-               "in_reply_to" => discussion_id,
+               "in_reply_to" => String.to_integer(discussion_id),
                "text" => "Here is more detail"
              })
 

@@ -4499,6 +4499,7 @@ defmodule AttentionServer.Relay do
           |> Map.put(:engine_entries, engine_entries)
           |> Map.put(:message_order, message_order)
           |> Map.put(:message_entries_by_identity, message_entries_by_identity)
+          |> Map.put(:message_order_suffixes, message_order_suffixes)
         )
       )
     else
@@ -4510,6 +4511,7 @@ defmodule AttentionServer.Relay do
         |> Map.put(:engine_entries, engine_entries)
         |> Map.put(:message_order, message_order)
         |> Map.put(:message_entries_by_identity, message_entries_by_identity)
+        |> Map.put(:message_order_suffixes, message_order_suffixes)
         |> Map.put(:view_rev, view_rev)
 
       state
