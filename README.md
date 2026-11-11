@@ -7,12 +7,11 @@ Harklight iOS/iPadOS app.
 
 ## Install the server
 
-For the FORMAT27 v0.1.32 server package, use the release page below after it
-is published to download the Linux x86_64 archive, `SHA256SUMS` and
-`SELF_HOST.md`. Verify the checksum before extraction:
+For the FORMAT27 v0.1.32 server package, use the release page below to download
+the Linux x86_64 archive, `SHA256SUMS` and `SELF_HOST.md`. Verify the checksum
+before extraction:
 
 [v0.1.32 release](https://github.com/clickety-clacks/harklight-server/releases/tag/v0.1.32)
-(available only after publication).
 
 ```sh
 sha256sum -c SHA256SUMS
@@ -54,7 +53,8 @@ bounces or agent deliveries. Restore success is unproved and has not been
 tested; no recovery success is guaranteed.
 
 v0.1.32 adds a side-effect-free origin-message read by sender ID and message ID.
-With Agent 0.1.9 or newer, `harklight-agent message-get` reads the latest
+The matching `harklight-agent message-get` interface is present in Agent 0.1.9
+source, but Agent 0.1.9 has not yet been published. The command reads the latest
 committed revision by default or a specific retained revision with
 `--revision N`. The read does not mark Seen; an unavailable requested revision
 returns `revision_unavailable`.
@@ -65,14 +65,14 @@ server adds an advisory to the originating agent session asking whether the
 request is still valid and worth resending and whether its importance should be
 raised. It does not automatically resend the request or change its priority.
 
-v0.1.32 is the first published release to carry the remaining changes prepared
-for the unpublished v0.1.31 cut. It ends revoked-device origin sessions with
-the existing gone availability, supports durable device-level reads and updates
-with connection-local sync hints and durable operation receipts, records bounded
-Relay timeout outcomes outside the request path, and omits cached APNs tokens
-from push-dispatcher crash/status output. The closed-chat behavior and Bandit
-1.14.0 dependency update were already present in v0.1.30. Release publication
-does not install the server; installation is a separate manual action.
+Stable v0.1.31 was published on 2026-11-11 before v0.1.32. It includes the
+device-revocation origin-session gone behavior, durable device-level access reads
+and updates with connection-local sync hints and durable operation receipts,
+bounded Relay timeout outcomes recorded outside the request path, and omission
+of cached APNs tokens from push-dispatcher crash/status output. Configurable
+priority levels, unseen-message advisories, closed-chat behavior and Bandit
+1.14.0 were already present in v0.1.30. Release publication does not install the
+server; installation is a separate manual action.
 
 Version 0.1.25 and later persist delivery acknowledgements (ACK1 and ACK2).
 No safe code-only downgrade to 0.1.24 or earlier has been established once
