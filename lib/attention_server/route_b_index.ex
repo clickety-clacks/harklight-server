@@ -3,7 +3,7 @@ defmodule AttentionServer.RouteBIndex do
 
   def new do
     %{
-      messages_by_person: %{},
+      resolved_messages_by_person: %{},
       conversations_by_item: %{},
       conversation_summary_by_item: %{},
       unresolved_count_by_person: %{}
@@ -22,14 +22,25 @@ defmodule AttentionServer.RouteBIndex do
   end
 
   def put_message(index, {person, sender, id} = key, previous, record) do
+    previous_resolved? = match?(%{terminal: terminal} when not is_nil(terminal), previous)
+    current_resolved? = not is_nil(record.terminal)
+
     index =
-      if is_nil(previous) do
-        order = Map.get(index.messages_by_person, person, :gb_trees.empty())
-        order_key = {-record.accepted_seq, sender, id}
-        order = :gb_trees.enter(order_key, key, order)
-        put_in(index, [:messages_by_person, person], order)
-      else
-        index
+      case {previous_resolved?, current_resolved?} do
+        {false, true} ->
+          order = Map.get(index.resolved_messages_by_person, person, :gb_trees.empty())
+          order_key = {-record.accepted_seq, sender, id}
+          order = :gb_trees.enter(order_key, key, order)
+          put_in(index, [:resolved_messages_by_person, person], order)
+
+        {true, false} ->
+          order = Map.get(index.resolved_messages_by_person, person, :gb_trees.empty())
+          order_key = {-record.accepted_seq, sender, id}
+          order = :gb_trees.delete_any(order_key, order)
+          put_in(index, [:resolved_messages_by_person, person], order)
+
+        _ ->
+          index
       end
 
     delta = unresolved_delta(previous, record)

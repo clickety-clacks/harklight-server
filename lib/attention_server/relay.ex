@@ -4019,13 +4019,18 @@ defmodule AttentionServer.Relay do
          {:ok, limit} <- route_b_limit(frame, false),
          {:ok, cursor} <- route_b_cursor(frame),
          {:ok, person} <- Engine.authorized_person(state.store.engine, session.key),
-         %{view_rev: view_rev, message_order: order, message_entries_by_identity: entries} <-
-           Map.get(state.priority_views, person),
+         %{
+           view_rev: view_rev,
+           message_order: order,
+           message_order_suffixes: order_suffixes,
+           message_entries_by_identity: entries
+         } <- Map.get(state.priority_views, person),
          {:ok, reply} <-
            Engine.route_b_inbox_page(
              state.store.engine,
              session.key,
              order,
+             order_suffixes,
              entries,
              limit,
              cursor
@@ -4440,13 +4445,24 @@ defmodule AttentionServer.Relay do
         shown
       end
 
+    {message_order, message_entries_by_identity, message_order_suffixes} =
+      Enum.reduce(Enum.reverse(shown.entries), {[], %{}, %{}}, fn entry,
+                                                                {order, entries, suffixes} ->
+        identity = Placement.identity(entry)
+        next_order = [identity | order]
+
+        {
+          next_order,
+          Map.put(entries, identity, entry),
+          Map.put(suffixes, identity, next_order)
+        }
+      end)
+
     shown =
       shown
-      |> Map.put(:message_order, Enum.map(shown.entries, &Placement.identity/1))
-      |> Map.put(
-        :message_entries_by_identity,
-        Map.new(shown.entries, &{Placement.identity(&1), &1})
-      )
+      |> Map.put(:message_order, message_order)
+      |> Map.put(:message_entries_by_identity, message_entries_by_identity)
+      |> Map.put(:message_order_suffixes, message_order_suffixes)
 
     comparable =
       Map.take(shown, [

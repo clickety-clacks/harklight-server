@@ -82,7 +82,7 @@ defmodule AttentionServer.Engine do
             advisory_id_index: %{},
             advisory_feeds: %{},
             route_b_index: %{
-              messages_by_person: %{},
+              resolved_messages_by_person: %{},
               conversations_by_item: %{},
               conversation_summary_by_item: %{},
               unresolved_count_by_person: %{}
@@ -2324,11 +2324,20 @@ defmodule AttentionServer.Engine do
   end
 
   @doc false
-  def route_b_inbox_page(%__MODULE__{} = engine, key, view_order, view_entries, limit, cursor)
-      when is_list(view_order) and is_map(view_entries) and is_integer(limit) and limit > 0 do
+  def route_b_inbox_page(
+        %__MODULE__{} = engine,
+        key,
+        view_order,
+        view_order_suffixes,
+        view_entries,
+        limit,
+        cursor
+      )
+      when is_list(view_order) and is_map(view_order_suffixes) and is_map(view_entries) and
+             is_integer(limit) and limit > 0 do
     with {:ok, %{person: person, key: device}} <- principal(engine, key),
          {:ok, unresolved_after, resolved_cursor} <-
-           route_b_cursor_position(engine, person, view_order, cursor) do
+           route_b_cursor_position(engine, person, view_order, view_order_suffixes, cursor) do
       current_high = Map.get(engine.persons, person, 0)
       candidate_limit = limit + 1
       unresolved = Enum.take(unresolved_after, candidate_limit)
@@ -6227,18 +6236,24 @@ defmodule AttentionServer.Engine do
     end
   end
 
-  defp route_b_cursor_position(_engine, _person, view_order, nil),
+  defp route_b_cursor_position(_engine, _person, view_order, _view_order_suffixes, nil),
     do: {:ok, view_order, nil}
 
-  defp route_b_cursor_position(engine, person, view_order, {sender, id} = identity)
+  defp route_b_cursor_position(
+         engine,
+         person,
+         _view_order,
+         view_order_suffixes,
+         {sender, id} = identity
+       )
        when is_binary(sender) and is_binary(id) do
     case Map.get(engine.messages, {person, sender, id}) do
       nil ->
         {:error, :invalid_cursor}
 
       %{terminal: nil} ->
-        case Enum.split_while(view_order, &(&1 != identity)) do
-          {_before, [^identity | remaining]} -> {:ok, remaining, nil}
+        case Map.get(view_order_suffixes, identity) do
+          [^identity | remaining] -> {:ok, remaining, nil}
           _ -> {:error, :invalid_cursor}
         end
 
@@ -6247,16 +6262,17 @@ defmodule AttentionServer.Engine do
     end
   end
 
-  defp route_b_cursor_position(_engine, _person, _view_order, _cursor),
+  defp route_b_cursor_position(_engine, _person, _view_order, _view_order_suffixes, _cursor),
     do: {:error, :invalid_cursor}
 
   defp route_b_resolved_keys(_engine, _person, _after_identity, 0), do: []
 
   defp route_b_resolved_keys(engine, person, after_identity, limit) do
-    tree = Map.get(engine.route_b_index.messages_by_person, person, :gb_trees.empty())
+    tree =
+      Map.get(engine.route_b_index.resolved_messages_by_person, person, :gb_trees.empty())
 
     with {:ok, iterator} <- route_b_message_iterator(engine, person, tree, after_identity) do
-      route_b_take_resolved(engine, person, iterator, limit, [], after_identity)
+      route_b_take_resolved(iterator, limit, [], after_identity)
     else
       _ -> []
     end
@@ -6282,43 +6298,24 @@ defmodule AttentionServer.Engine do
     end
   end
 
-  defp route_b_take_resolved(_engine, _person, _iterator, 0, reversed, _skip_identity),
+  defp route_b_take_resolved(_iterator, 0, reversed, _skip_identity),
     do: Enum.reverse(reversed)
 
-  defp route_b_take_resolved(engine, person, iterator, remaining, reversed, skip_identity) do
+  defp route_b_take_resolved(iterator, remaining, reversed, skip_identity) do
     case :gb_trees.next(iterator) do
       :none ->
         Enum.reverse(reversed)
 
-      {_order_key, {^person, _sender, _id} = key, next_iterator} ->
+      {_order_key, {_person, _sender, _id} = key, next_iterator} ->
         if key_identity(key) == skip_identity do
-          route_b_take_resolved(engine, person, next_iterator, remaining, reversed, nil)
+          route_b_take_resolved(next_iterator, remaining, reversed, nil)
         else
-          case Map.get(engine.messages, key) do
-            %{terminal: terminal, accepted_seq: accepted_seq} when not is_nil(terminal) ->
-              if accepted_seq <= Map.get(engine.persons, person, 0) do
-                route_b_take_resolved(
-                  engine,
-                  person,
-                  next_iterator,
-                  remaining - 1,
-                  [key_identity(key) | reversed],
-                  skip_identity
-                )
-              else
-                route_b_take_resolved(
-                  engine,
-                  person,
-                  next_iterator,
-                  remaining,
-                  reversed,
-                  skip_identity
-                )
-              end
-
-            _ ->
-              route_b_take_resolved(engine, person, next_iterator, remaining, reversed, skip_identity)
-          end
+          route_b_take_resolved(
+            next_iterator,
+            remaining - 1,
+            [key_identity(key) | reversed],
+            skip_identity
+          )
         end
     end
   end

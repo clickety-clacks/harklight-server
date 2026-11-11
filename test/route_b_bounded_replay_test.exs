@@ -105,12 +105,12 @@ defmodule AttentionServer.RouteBBoundedReplayTest do
              session_request(relay, session, %{
                "type" => "inbox_list",
                "ref" => "first-page",
-               "limit" => 2
+             "limit" => 1
              })
 
     assert first["type"] == "ok"
     assert first["ref"] == "first-page"
-    assert Enum.map(first["rows"], &{&1["sender_id"], &1["message_id"]}) == Enum.take(expected, 2)
+    assert Enum.map(first["rows"], &{&1["sender_id"], &1["message_id"]}) == Enum.take(expected, 1)
 
     badge_count =
       Enum.count(engine.messages, fn {{person, _, _}, record} ->
@@ -136,9 +136,8 @@ defmodule AttentionServer.RouteBBoundedReplayTest do
                "cursor" => first["next_cursor"]
              })
 
-    assert Enum.map(second["rows"], &{&1["sender_id"], &1["message_id"]}) == [Enum.at(expected, 2)]
+    assert Enum.map(second["rows"], &{&1["sender_id"], &1["message_id"]}) == [Enum.at(expected, 1)]
     assert is_binary(second["next_cursor"])
-    assert %{"terminal" => %{"state" => "answered"}} = hd(second["rows"])
     assert second["unresolved_count"] == first["unresolved_count"]
     assert :sys.get_state(relay).store.engine == engine
 
@@ -149,8 +148,19 @@ defmodule AttentionServer.RouteBBoundedReplayTest do
                "cursor" => second["next_cursor"]
              })
 
-    assert Enum.map(third["rows"], &{&1["sender_id"], &1["message_id"]}) == [Enum.at(expected, 3)]
-    refute Map.has_key?(third, "next_cursor")
+    assert Enum.map(third["rows"], &{&1["sender_id"], &1["message_id"]}) == [Enum.at(expected, 2)]
+    assert is_binary(third["next_cursor"])
+    assert %{"terminal" => %{"state" => "answered"}} = hd(third["rows"])
+
+    assert [fourth] =
+             session_request(relay, session, %{
+               "type" => "inbox_list",
+               "limit" => 1,
+               "cursor" => third["next_cursor"]
+             })
+
+    assert Enum.map(fourth["rows"], &{&1["sender_id"], &1["message_id"]}) == [Enum.at(expected, 3)]
+    refute Map.has_key?(fourth, "next_cursor")
 
     assert [%{"type" => "ok", "rows" => all_rows}] =
              session_request(relay, session, %{"type" => "inbox_list", "limit" => 500})
