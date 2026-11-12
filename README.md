@@ -7,16 +7,16 @@ Harklight iOS/iPadOS app.
 
 ## Install the server
 
-For the FORMAT27 v0.1.35 server package, use the release page below after it
+For the FORMAT27 v0.1.36 server package, use the release page below after it
 is published to download the Linux x86_64 archive, `SHA256SUMS` and
 `SELF_HOST.md`. Verify the checksum before extraction:
 
-[v0.1.35 release](https://github.com/clickety-clacks/harklight-server/releases/tag/v0.1.35)
+[v0.1.36 release](https://github.com/clickety-clacks/harklight-server/releases/tag/v0.1.36)
 (available only after publication).
 
 ```sh
 sha256sum -c SHA256SUMS
-tar -xzf harklight-server-0.1.35-linux-x86_64.tar.gz
+tar -xzf harklight-server-0.1.36-linux-x86_64.tar.gz
 ```
 
 Follow [SELF_HOST.md](SELF_HOST.md) for a fresh installation, tailnet routing,
@@ -28,8 +28,8 @@ The package does not install a service, configure the tailnet or expose ports.
 State, owner/device identities, trust roots and sender grants live outside the
 versioned package. Run one server per database. Keep private keys and backups
 private; do not repeat bootstrap over an existing installation.
-This source, v0.1.35, writes FORMAT27 and introduces no schema or store-format
-migration over published v0.1.33. It retains v0.1.33's startup support for
+This source, v0.1.36, writes FORMAT27 and introduces no schema or store-format
+migration over published v0.1.35. It retains v0.1.33's startup support for
 migrating supported FORMAT25 state, written by v0.1.28, to FORMAT27. The
 v0.1.28 package cannot read that resulting state. The v0.1.27 and v0.1.26
 packages use FORMAT24 and cannot read FORMAT25 state written by v0.1.28. The v0.1.25
@@ -46,15 +46,21 @@ can fail and leave the service stopped. Restoring the snapshot discards every
 write made after capture. Restore success for this release is unproved and has
 not been tested.
 
-Before the first v0.1.35 start, stop the server and take a complete
-private-state backup. After any v0.1.35 write, returning to v0.1.28 requires stopping the
+Before the first v0.1.36 start, stop the server and take a complete
+private-state backup. After any v0.1.36 write, returning to v0.1.28 requires stopping the
 server, restoring that pre-start backup and then running v0.1.28; changing only
 the selected code or release link cannot make FORMAT27 readable. Published
-v0.1.33 uses the same FORMAT27 store format, so reverting this relay-close repair
-to v0.1.33 requires no data migration rollback. This restore loses every write
+v0.1.35 and v0.1.36 use the same FORMAT27 store format and Server runtime, so
+reverting the guide-only package change to v0.1.35 requires no data migration
+rollback. This restore loses every write
 made since the backup and cannot undo external notifications,
 bounces or agent deliveries. Restore success is unproved and has not been
 tested; no recovery success is guaranteed.
+
+v0.1.36 bundles the reviewed hosted Agent customer guide v7 in the SaaS skill
+file and preserves those guide bytes through the existing package assembly.
+This guide-only source change adds no Server runtime, protocol, authorization,
+schema or store-format change.
 
 v0.1.35 fixes a shared Relay stall during TLS session cleanup. The Relay still
 removes and fences the session in its serialized call; physical socket closure

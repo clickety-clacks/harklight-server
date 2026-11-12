@@ -1,3 +1,25 @@
+# Harklight Server v0.1.36
+
+## Changes
+
+- Bundles the reviewed hosted Agent customer guide v7 in the SaaS skill file.
+  The package assembly preserves the guide bytes without appending the shared
+  core. The existing dashboard file route serves the packaged file unchanged.
+- This guide-only change adds no Server runtime, protocol, authorization,
+  schema or store-format change. It retains FORMAT27 and the v0.1.35 Relay
+  close repair.
+
+## Upgrade and recovery
+
+The package writes FORMAT27 and adds no schema or store-format migration over
+v0.1.35. Returning to v0.1.35 needs no data migration rollback. Before an
+upgrade, stop the server and take a complete private-state backup. The
+installer restore path is untested and can fail; restoring loses later writes
+and cannot undo external effects. No installation or recovery result is
+claimed by these package notes.
+
+---
+
 # Harklight Server v0.1.35
 
 ## Changes
