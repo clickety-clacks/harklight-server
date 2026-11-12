@@ -68,6 +68,7 @@ defmodule AttentionServer.Engine do
             subscriptions: %{},
             cursors: %{},
             hosted_accounts: %{},
+            delivery_states: %{},
             algorithm_choices: %{},
             jev_endpoint: nil,
             jev_model: nil,
@@ -126,8 +127,9 @@ defmodule AttentionServer.Engine do
 
     candidate =
       next.push_bindings
-      |> Enum.filter(fn {_key, binding} ->
-        binding.active and (binding.pending_high > 0 or binding.pending_conversation_high > 0) and
+      |> Enum.filter(fn {{person, _device}, binding} ->
+        not delivery_stopped?(next, person) and binding.active and
+          (binding.pending_high > 0 or binding.pending_conversation_high > 0) and
           binding.state in ["queued", "waiting_retry"] and
           is_integer(binding.next_at) and binding.next_at <= now_ms
       end)
@@ -771,6 +773,28 @@ defmodule AttentionServer.Engine do
       if record.person == person, do: Map.put(record, :account_ref, ref)
     end)
   end
+
+  @doc false
+  def set_hosted_delivery_state(%__MODULE__{} = engine, person, target_state)
+      when target_state in ["STOPPED", "RESTORED"] do
+    if hosted_account(engine, person) do
+      if Map.get(engine.delivery_states, person) == target_state do
+        {:ok, engine, target_state}
+      else
+        next = %{engine | delivery_states: Map.put(engine.delivery_states, person, target_state)}
+        {:ok, next, target_state}
+      end
+    else
+      {:error, :unknown_person}
+    end
+  end
+
+  def set_hosted_delivery_state(%__MODULE__{}, _person, _target_state),
+    do: {:error, :invalid_state}
+
+  @doc false
+  def delivery_stopped?(%__MODULE__{} = engine, person),
+    do: Map.get(engine.delivery_states, person) == "STOPPED"
 
   @doc "The server-held owner key a hosted account acts under; nil for any other person."
   def hosted_owner_key(%__MODULE__{} = engine, person) do
@@ -4039,19 +4063,23 @@ defmodule AttentionServer.Engine do
         :missing ->
           case Message.validate_ui1_admission(message, Enum.map(files, & &1["name"])) do
             :ok ->
-              commit_forward(
-                engine,
-                person,
-                device,
-                op,
-                semantic,
-                message,
-                frame,
-                files,
-                support,
-                accepted_at,
-                field_warnings
-              )
+              if delivery_stopped?(engine, person) do
+                failure("inactive_account")
+              else
+                commit_forward(
+                  engine,
+                  person,
+                  device,
+                  op,
+                  semantic,
+                  message,
+                  frame,
+                  files,
+                  support,
+                  accepted_at,
+                  field_warnings
+                )
+              end
 
             {:error, {:typed_message, code, reason}} ->
               failure({:typed_message, code, reason})
@@ -4943,7 +4971,13 @@ defmodule AttentionServer.Engine do
                  Conversation.person_entry(engine, person, actor, frame["in_reply_to"], key),
                true <- revision == frame["request_revision"],
                {:ok, acted} <-
-                 Conversation.act(engine, person, actor, frame["in_reply_to"], frame["op_id"]) do
+                 conversation_act_for_delivery(
+                   engine,
+                   person,
+                   actor,
+                   frame["in_reply_to"],
+                   frame["op_id"]
+                 ) do
             {next, seq} = next_conversation_seq(acted, person)
             {next, arrival} = next_free_order(next, person)
 
@@ -4986,6 +5020,7 @@ defmodule AttentionServer.Engine do
           else
             false -> failure("stale_revision")
             {:error, :already_acted} -> failure("already_acted")
+            {:error, :inactive_account} -> failure("inactive_account")
             _ -> failure("not_found")
           end
         else
@@ -5089,7 +5124,7 @@ defmodule AttentionServer.Engine do
           if record.revision != frame["base_revision"] do
             failure("stale_revision", "base_revision", %{"current_revision" => record.revision})
           else
-            case maybe_act_person_entry(engine, person, actor, key, frame) do
+            case maybe_act_person_entry_for_delivery(engine, person, actor, key, frame) do
               {:ok, acted} ->
                 {next, seq} = next_conversation_seq(acted, person)
                 revision = record.revision + 1
@@ -5235,6 +5270,24 @@ defmodule AttentionServer.Engine do
   end
 
   defp valid_revision_message(_engine, _person, message), do: valid_message(message)
+
+  defp conversation_act_for_delivery(engine, person, actor, event_id, op_id) do
+    with {:ok, acted} <- Conversation.act(engine, person, actor, event_id, op_id),
+         :ok <- delivery_allowed(engine, person) do
+      {:ok, acted}
+    end
+  end
+
+  defp maybe_act_person_entry_for_delivery(engine, person, origin, key, frame) do
+    with {:ok, acted} <- maybe_act_person_entry(engine, person, origin, key, frame),
+         :ok <- delivery_allowed(engine, person) do
+      {:ok, acted}
+    end
+  end
+
+  defp delivery_allowed(engine, person) do
+    if delivery_stopped?(engine, person), do: {:error, :inactive_account}, else: :ok
+  end
 
   defp maybe_act_person_entry(engine, _person, _origin, _key, %{"in_reply_to" => nil}),
     do: {:ok, engine}

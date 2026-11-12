@@ -24,6 +24,7 @@ defmodule AttentionServer.HostedRequests do
       {"POST", "/accounts"} -> with_request(conn, &create_account(&1, &2, opts))
       {"POST", "/algorithm"} -> with_request(conn, &set_algorithm(&1, &2, opts))
       {"POST", "/sign-in-links"} -> with_request(conn, &create_sign_in_link(&1, &2, opts))
+      {"POST", "/delivery-state"} -> with_request(conn, &set_delivery_state(&1, &2, opts))
       {"POST", "/test-reset"} -> with_request(conn, &test_reset(&1, &2, opts))
       {"POST", _} -> send_resp(conn, 404, "")
       _ -> send_resp(conn, 405, "")
@@ -83,6 +84,25 @@ defmodule AttentionServer.HostedRequests do
         json(conn, 503, %{"error" => "storage_unavailable"})
 
       {:error, _reason} ->
+        json(conn, 503, %{"error" => "storage_unavailable"})
+    end
+  end
+
+  defp set_delivery_state(conn, request, opts) do
+    person = Map.get(request, "person_id")
+    target_state = Map.get(request, "state")
+
+    case Relay.hosted_delivery_state(opts.relay, person, target_state) do
+      {:ok, result} ->
+        json(conn, 200, %{"person_id" => result.person_id, "state" => result.state})
+
+      {:error, :invalid_state} ->
+        json(conn, 400, %{"error" => "invalid_state"})
+
+      {:error, :unknown_person} ->
+        json(conn, 404, %{"error" => "unknown_person"})
+
+      {:error, :storage_unavailable} ->
         json(conn, 503, %{"error" => "storage_unavailable"})
     end
   end

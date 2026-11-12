@@ -21,7 +21,7 @@ defmodule AttentionServer.Store do
 
   alias Exqlite.Sqlite3
 
-  @format_version 28
+  @format_version 29
   @inbox_index_chunk_size 20
   defstruct [:db, :engine, :version, :upload_dir]
 
@@ -1101,7 +1101,8 @@ defmodule AttentionServer.Store do
                      25,
                      26,
                      27,
-                     28
+                     28,
+                     29
                    ] ->
                 original = struct(Engine, Map.from_struct(stored))
 
@@ -1192,6 +1193,9 @@ defmodule AttentionServer.Store do
                   |> then(fn state ->
                     if format < 28, do: normalize_device_focus_permissions(state), else: state
                   end)
+                  |> then(fn state ->
+                    if format < 29, do: Map.put(state, :delivery_states, %{}), else: state
+                  end)
 
                 engine =
                   engine
@@ -1235,6 +1239,7 @@ defmodule AttentionServer.Store do
                                  format < 26 -> "bounce_state_init"
                                  format < 27 -> "bounce_schedule_index_init"
                                  format < 28 -> "device_focus_permissions_init"
+                                 format < 29 -> "hosted_delivery_state_init"
                                  true -> "state_format"
                                end
                            }
@@ -1980,6 +1985,7 @@ defmodule AttentionServer.Store do
         BrowserSignIn.valid_state?(engine) and
         valid_maintainers?(engine) and
         valid_hosted_accounts?(engine) and
+        valid_delivery_states?(engine) and
         valid_prioritization?(engine) and
         valid_push_bindings?(engine) and
         AttentionServer.Conversation.valid_state?(engine) and
@@ -2520,6 +2526,14 @@ defmodule AttentionServer.Store do
       end) and
       accounts |> Map.values() |> Enum.map(& &1.person) |> Enum.uniq() |> length() ==
         map_size(accounts)
+  end
+
+  defp valid_delivery_states?(engine) do
+    is_map(engine.delivery_states) and
+      Enum.all?(engine.delivery_states, fn {person, state} ->
+        is_binary(person) and Map.has_key?(engine.persons, person) and
+          state in ["STOPPED", "RESTORED"]
+      end)
   end
 
   defp valid_instance?(id),
