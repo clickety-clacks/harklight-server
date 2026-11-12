@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Assemble exactly three guidance files; the shared core has one authored source.
+# Assemble three downloads; the reviewed SaaS guide is a complete document.
 set -euo pipefail
 repo_dir="$(cd -- "$(dirname -- "$0")/.." && pwd)"
 if [[ $# -ne 1 ]]; then
@@ -12,8 +12,10 @@ for skill in harklight-agent harklight-agent-saas; do
   mkdir -p "$output_dir/$skill"
   {
     cat "$repo_dir/skills/$skill/SKILL.md.in"
-    printf "\n"
-    cat "$repo_dir/skills/core.md"
+    if [[ "$skill" == harklight-agent ]]; then
+      printf "\n"
+      cat "$repo_dir/skills/core.md"
+    fi
   } > "$output_dir/$skill/SKILL.md"
 done
 install -m 644 "$repo_dir/skills/core.md" "$output_dir/core.md"
