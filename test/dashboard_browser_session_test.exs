@@ -46,6 +46,85 @@ defmodule AttentionServer.DashboardBrowserSessionTest do
     }
   end
 
+  defmodule SignOutBackend do
+    def resolve_session(browser, cookie), do: DashboardBrowserSession.resolve(browser, cookie)
+    def end_session(browser, cookie), do: DashboardBrowserSession.end_session(browser, cookie)
+  end
+
+  for state <- [:valid, :missing, :expired] do
+    @tag sign_out_state: state
+    test "hosted sign-out with #{state} cookie checks the form and completes logout",
+         c do
+      assert {:ok, cookie, deadline} = DashboardBrowserSession.redeem(c.browser, "hbs1_approved")
+      state = c.sign_out_state
+      if state == :expired, do: Agent.update(c.clock, fn _ -> deadline end)
+      supplied_cookie = if state == :missing, do: nil, else: cookie
+      origin = "https://account.example.test"
+
+      opts =
+        AttentionServer.DashboardReadHTTP.init(
+          backend: {SignOutBackend, c.browser},
+          skill_path: __ENV__.file,
+          hosted: true,
+          expected_origin: origin,
+          hosted_addresses: %{
+            sign_in: origin <> "/account/sign-in",
+            sign_out: origin <> "/account/sign-out"
+          }
+        )
+
+      post = fn opts, body, request_origin, content_type ->
+        conn = %{Plug.Test.conn(:post, "/sign-out", body) | scheme: :https, port: 443}
+
+        conn =
+          if supplied_cookie,
+            do: Plug.Conn.put_req_header(conn, "cookie", "__Host-harklight=#{supplied_cookie}"),
+            else: conn
+
+        conn
+        |> Plug.Conn.put_req_header("origin", request_origin)
+        |> Plug.Conn.put_req_header("content-type", content_type)
+        |> AttentionServer.DashboardReadHTTP.call(opts)
+      end
+
+      form_type = "application/x-www-form-urlencoded"
+
+      for {body, request_origin, content_type} <- [
+            {"confirm=wrong", origin, form_type},
+            {"", origin, form_type},
+            {"confirm=sign_out&extra=value", origin, form_type},
+            {"confirm=sign_out", "https://other.example.test", form_type},
+            {"confirm=sign_out", origin, "application/json"}
+          ] do
+        refused = post.(opts, body, request_origin, content_type)
+        assert refused.status == 403
+        assert Plug.Conn.get_resp_header(refused, "location") == []
+        refute Map.has_key?(refused.resp_cookies, "__Host-harklight")
+      end
+
+      if state == :valid,
+        do: assert({:ok, _} = DashboardBrowserSession.resolve(c.browser, cookie))
+
+      plain = post.(%{opts | hosted: false}, "confirm=sign_out", origin, form_type)
+      assert plain.status == if(state == :valid, do: 404, else: 401)
+      assert Plug.Conn.get_resp_header(plain, "location") == []
+
+      response = post.(opts, "confirm=sign_out", origin, form_type)
+      assert response.status == 303
+      assert Plug.Conn.get_resp_header(response, "location") == [origin <> "/account/sign-out"]
+
+      assert %{"__Host-harklight" => %{max_age: 0, secure: true, http_only: true}} =
+               response.resp_cookies
+
+      if state == :missing do
+        # A request without a cookie cannot revoke some other browser's session.
+        assert {:ok, _} = DashboardBrowserSession.resolve(c.browser, cookie)
+      else
+        assert {:error, :invalid_session} = DashboardBrowserSession.resolve(c.browser, cookie)
+      end
+    end
+  end
+
   test "a committed one-use owner principal becomes a cookie, not a reusable link", c do
     assert {:ok, cookie, _} = DashboardBrowserSession.redeem(c.browser, "hbs1_approved")
     assert {:error, :invalid_link} = DashboardBrowserSession.redeem(c.browser, "hbs1_approved")

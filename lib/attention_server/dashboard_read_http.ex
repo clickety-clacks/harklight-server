@@ -166,9 +166,30 @@ defmodule AttentionServer.DashboardReadHTTP do
     end
   end
 
+  defp sign_out(conn, opts, session) do
+    case form(conn, opts, ~w(confirm)) do
+      {:ok, %{"confirm" => "sign_out"}, conn} ->
+        if session, do: backend_call(opts.backend, :end_session, session)
+
+        conn
+        |> delete_resp_cookie(@cookie, secure: true, http_only: true, same_site: "Lax", path: "/")
+        |> put_resp_header("location", opts.hosted_addresses.sign_out || "/devices")
+        |> send_resp(303, "")
+
+      {_, _, conn} ->
+        send_resp(conn, 403, "Sign out refused")
+    end
+  end
+
+  # Sign-out still completes the hosted half when the Server cookie is absent or expired.
+  defp no_session(
+         %{method: "POST", request_path: "/sign-out"} = conn,
+         %{hosted: true} = opts
+       ),
+       do: sign_out(conn, opts, nil)
+
   # A hosted deployment sends a browser with no usable dashboard session to its
-  # sign-in page, so the hosted session ends with the dashboard one. Self-hosted
-  # keeps the plain refusal.
+  # sign-in page for other requests. Self-hosted keeps the plain refusal.
   defp no_session(conn, %{hosted: true, hosted_addresses: %{sign_in: url}}) when is_binary(url) do
     conn
     |> delete_resp_cookie(@cookie, secure: true, http_only: true, same_site: "Lax", path: "/")
@@ -383,18 +404,7 @@ defmodule AttentionServer.DashboardReadHTTP do
          %{hosted: true} = opts,
          _principal
        ) do
-    case form(conn, opts, ~w(confirm)) do
-      {:ok, %{"confirm" => "sign_out"}, conn} ->
-        backend_call(opts.backend, :end_session, Map.get(conn.req_cookies, @cookie))
-
-        conn
-        |> delete_resp_cookie(@cookie, secure: true, http_only: true, same_site: "Lax", path: "/")
-        |> put_resp_header("location", opts.hosted_addresses.sign_out || "/devices")
-        |> send_resp(303, "")
-
-      {_, _, conn} ->
-        send_resp(conn, 403, "Sign out refused")
-    end
+    sign_out(conn, opts, Map.get(conn.req_cookies, @cookie))
   end
 
   defp route(%{method: "GET", request_path: "/devices/add"} = conn, _opts, _principal) do
