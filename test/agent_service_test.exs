@@ -812,23 +812,25 @@ defmodule AttentionServer.AgentServiceTest do
                  "message" => message
                })
 
-      assert %{"type" => "ok", "revision" => 2} =
-               device_request(relay, device_key, %{
-                 "v" => 1,
-                 "type" => "conversation_revise",
-                 "op_id" => unique_op(),
-                 "sender_id" => message["sender_id"],
-                 "message_id" => id,
-                 "base_revision" => 1,
-                 "message" => %{message | "title" => "Revised"}
-               })
+      for revision <- 2..3 do
+        assert %{"type" => "ok", "revision" => ^revision} =
+                 device_request(relay, device_key, %{
+                   "v" => 1,
+                   "type" => "conversation_revise",
+                   "op_id" => unique_op(),
+                   "sender_id" => message["sender_id"],
+                   "message_id" => id,
+                   "base_revision" => revision - 1,
+                   "message" => %{message | "title" => "Revised #{revision}"}
+                 })
+      end
 
       https = endpoint(certs, AgentHTTPS.port(agent_https))
       get = %{"type" => "get", "sender_id" => message["sender_id"], "message_id" => id}
       assert {:ok, %{"item" => item}} = HeadlessAgent.request(directory, https, get)
       assert item["acceptance_seq"] == acceptance
-      assert item["message"]["title"] == "Revised"
-      assert item["request_revision"] == 2
+      assert item["message"]["title"] == "Revised 3"
+      assert item["request_revision"] == 3
 
       assert {:ok, %{"items" => [^item]}} =
                HeadlessAgent.request(directory, https, %{get | "type" => "search"})
@@ -837,7 +839,7 @@ defmodule AttentionServer.AgentServiceTest do
         answer(message["sender_id"], id, acceptance, unique_op(), value)
         |> Map.put("type", "respond")
 
-      for revision <- [nil, 1] do
+      for revision <- [nil, 1, 2] do
         stale = if revision, do: Map.put(response, "request_revision", revision), else: response
 
         assert {:error, {:application, "stale_revision", _}} =
@@ -875,7 +877,7 @@ defmodule AttentionServer.AgentServiceTest do
       assert :ok = Mix.Tasks.Attention.Agent.run(revised_args)
 
       assert {:ok,
-              %{"item" => %{"state" => "answered", "answer" => ^value, "request_revision" => 2}}} =
+              %{"item" => %{"state" => "answered", "answer" => ^value, "request_revision" => 3}}} =
                HeadlessAgent.request(directory, https, get)
     end
   end
