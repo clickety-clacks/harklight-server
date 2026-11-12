@@ -8,7 +8,7 @@ defmodule AttentionServer.AgentWire do
 
   @selectors ~w(person person_id principal principal_id principal_kind agent_id device_id owner_id origin actor key_fingerprint)
   @search_fields ~w(sender_id message_id state limit cursor)
-  @respond_fields ~w(sender_id message_id acceptance_seq deliberate intent_ref op_id answer)
+  @respond_fields ~w(sender_id message_id request_revision acceptance_seq deliberate intent_ref op_id answer)
 
   def normalize(request) when is_map(request) and not is_struct(request) do
     ref = Map.get(request, "ref")
