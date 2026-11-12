@@ -427,7 +427,7 @@ defmodule AttentionServer.PrioritizationTest do
     assert {:ok, ^selected} = Engine.set_algorithm_choice(selected, "person-a", "jev-set")
   end
 
-  test "format 22 migrates with baseline defaults and persists as format 28", %{path: path} do
+  test "format 22 migrates with baseline defaults and persists as format 29", %{path: path} do
     assert {:ok, initial} = Store.open(path)
     assert {:ok, engine} = Engine.setup_person(initial.engine, "person-a")
     assert :ok = Store.close(initial)
@@ -442,6 +442,7 @@ defmodule AttentionServer.PrioritizationTest do
       |> Map.delete(:bounce_revisions)
       |> Map.delete(:opened_revisions)
       |> Map.delete(:advisory_feeds)
+      |> Map.delete(:delivery_states)
 
     payload = :erlang.term_to_binary({:attention_relay_state, 22, old_engine}, [{:compressed, 6}])
     assert {:ok, db} = Sqlite3.open(path)
@@ -468,7 +469,7 @@ defmodule AttentionServer.PrioritizationTest do
     assert :ok = Sqlite3.release(db, select)
     assert :ok = Sqlite3.close(db)
 
-    assert {:attention_relay_state, 28, saved_engine} =
+    assert {:attention_relay_state, 29, saved_engine} =
              :erlang.binary_to_term(saved_payload, [:safe])
 
     refute Map.has_key?(saved_engine, :open_default_index)

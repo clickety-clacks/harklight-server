@@ -245,6 +245,17 @@ defmodule AttentionServer.HostedAccountTest do
 
   defp relay_engine(relay), do: :sys.get_state(relay).store.engine
 
+  defp relay_op(n),
+    do:
+      "00000000-0000-4000-8000-#{String.pad_leading(Integer.to_string(n), 12, "0")}"
+
+  defp relay_request(relay, key, frame) do
+    request_line = JSON.encode!(Map.put(frame, "v", 1)) <> "\n"
+    assert {:ok, response_line} = Relay.request_line(relay, key, request_line)
+    assert {:ok, reply} = JSON.decode_line(response_line)
+    reply
+  end
+
   describe "store format" do
     test "earlier state gains an empty hosted account table", %{dir: dir} do
       path = Path.join(dir, "relay.sqlite3")
@@ -268,6 +279,302 @@ defmodule AttentionServer.HostedAccountTest do
       assert migrated.engine.hosted_accounts == %{}
       assert migrated.engine.persons == %{"A" => 0}
       assert :ok = Store.close(migrated)
+    end
+
+    test "format 28 hosted state defaults to restored after migration", %{
+      certs: certs,
+      dir: dir
+    } do
+      path = Path.join(dir, "relay.sqlite3")
+      relay = start_relay(certs, dir, dashboard_origin: @origin)
+      assert {:ok, person} = Relay.hosted_account_create(relay, "acct-format-28")
+      GenServer.stop(relay)
+
+      {:ok, current} = Store.open(path)
+      old_engine = Map.delete(current.engine, :delivery_states)
+      assert :ok = Store.close(current)
+
+      payload =
+        :erlang.term_to_binary({:attention_relay_state, 28, old_engine}, [{:compressed, 6}])
+
+      assert {:ok, db} = Sqlite3.open(path)
+      assert {:ok, stmt} = Sqlite3.prepare(db, "UPDATE relay_state SET payload = ?, checksum = ?")
+      assert :ok = Sqlite3.bind(stmt, [{:blob, payload}, {:blob, :crypto.hash(:sha256, payload)}])
+      assert :done = Sqlite3.step(db, stmt)
+      assert :ok = Sqlite3.release(db, stmt)
+      assert :ok = Sqlite3.close(db)
+
+      assert {:ok, migrated} = Store.open(path)
+      assert migrated.engine.delivery_states == %{}
+      refute Engine.delivery_stopped?(migrated.engine, person)
+      assert :ok = Store.close(migrated)
+    end
+  end
+
+  describe "hosted delivery state" do
+    test "validates hosted scope, is idempotent, preserves sign-in, and survives restart", %{
+      certs: certs,
+      dir: dir
+    } do
+      relay = start_relay(certs, dir, dashboard_origin: @origin)
+      assert :ok = Relay.setup_person(relay, "self-hosted")
+      assert {:ok, alice} = Relay.hosted_account_create(relay, "acct-delivery-alice")
+      assert {:ok, bob} = Relay.hosted_account_create(relay, "acct-delivery-bob")
+
+      assert {400, %{"error" => "invalid_state"}} =
+               hosted_post(relay, "/delivery-state", %{"person_id" => alice})
+
+      assert {400, %{"error" => "invalid_state"}} =
+               hosted_post(relay, "/delivery-state", %{"person_id" => alice, "state" => "paused"})
+
+      assert {404, %{"error" => "unknown_person"}} =
+               hosted_post(relay, "/delivery-state", %{
+                 "person_id" => "self-hosted",
+                 "state" => "STOPPED"
+               })
+
+      assert {404, %{"error" => "unknown_person"}} =
+               hosted_post(relay, "/delivery-state", %{
+                 "person_id" => "not-hosted",
+                 "state" => "STOPPED"
+               })
+
+      assert {200, %{"person_id" => ^alice, "state" => "STOPPED"}} =
+               hosted_post(relay, "/delivery-state", %{
+                 "person_id" => alice,
+                 "state" => "STOPPED"
+               })
+
+      assert {200, %{"person_id" => ^bob, "state" => "RESTORED"}} =
+               hosted_post(relay, "/delivery-state", %{
+                 "person_id" => bob,
+                 "state" => "RESTORED"
+               })
+
+      version = :sys.get_state(relay).store.version
+
+      assert {200, %{"person_id" => ^alice, "state" => "STOPPED"}} =
+               hosted_post(relay, "/delivery-state", %{
+                 "person_id" => alice,
+                 "state" => "STOPPED"
+               })
+
+      assert :sys.get_state(relay).store.version == version
+      assert relay_engine(relay).delivery_states == %{alice => "STOPPED", bob => "RESTORED"}
+
+      assert {200, %{"sign_in_url" => sign_in_url}} =
+               hosted_post(relay, "/sign-in-links", %{"person_id" => alice, "label" => "Alice"})
+
+      token = sign_in_url |> String.split("#", parts: 2) |> List.last()
+      assert {:ok, %{person_id: ^alice}} = Relay.consume_browser_sign_in(relay, token)
+
+      GenServer.stop(relay)
+      relay = start_relay(certs, dir, dashboard_origin: @origin)
+      assert relay_engine(relay).delivery_states == %{alice => "STOPPED", bob => "RESTORED"}
+
+      assert {200, %{"person_id" => ^alice, "state" => "RESTORED"}} =
+               hosted_post(relay, "/delivery-state", %{
+                 "person_id" => alice,
+                 "state" => "RESTORED"
+               })
+
+      GenServer.stop(relay)
+      relay = start_relay(certs, dir, dashboard_origin: @origin)
+      assert relay_engine(relay).delivery_states == %{alice => "RESTORED", bob => "RESTORED"}
+      GenServer.stop(relay)
+    end
+
+    test "reports storage failure without applying the stop", %{certs: certs, dir: dir} do
+      relay = start_relay(certs, dir, dashboard_origin: @origin)
+      assert {:ok, person} = Relay.hosted_account_create(relay, "acct-delivery-storage")
+
+      assert {:ok, db} = Sqlite3.open(Path.join(dir, "relay.sqlite3"))
+
+      assert :ok =
+               Sqlite3.execute(
+                 db,
+                 "CREATE TRIGGER reject_delivery_state BEFORE UPDATE OF payload ON relay_state " <>
+                   "BEGIN SELECT RAISE(ABORT, 'forced storage failure'); END;"
+               )
+
+      assert :ok = Sqlite3.close(db)
+
+      assert {503, %{"error" => "storage_unavailable"}} =
+               hosted_post(relay, "/delivery-state", %{
+                 "person_id" => person,
+                 "state" => "STOPPED"
+               })
+
+      assert relay_engine(relay).delivery_states == %{}
+      GenServer.stop(relay)
+    end
+
+    test "refuses new content without mutation, suppresses push, and preserves person answers", %{
+      certs: certs,
+      dir: dir
+    } do
+      relay = start_relay(certs, dir, dashboard_origin: @origin)
+      assert {:ok, alice} = Relay.hosted_account_create(relay, "acct-delivery-gate")
+      assert {:ok, bob} = Relay.hosted_account_create(relay, "acct-delivery-other")
+
+      for {person, origin, reader} <- [
+            {alice, "alice-origin", "alice-reader"},
+            {bob, "bob-origin", "bob-reader"}
+          ] do
+        assert :ok = Relay.setup_device(relay, person, origin)
+        assert :ok = Relay.setup_device(relay, person, reader)
+        assert :ok = Relay.setup_sender(relay, origin, "app:test")
+      end
+
+      assert %{"type" => "ok"} =
+               relay_request(relay, "alice-reader", %{
+                 "type" => "push_register",
+                 "op_id" => relay_op(201),
+                 "revision" => 1,
+                 "profile_id" => "harklight-sandbox",
+                 "address_kind" => "apns_token",
+                 "address" => String.duplicate("ab", 32)
+               })
+
+      original = %{
+        "type" => "forward",
+        "op_id" => relay_op(202),
+        "session_handle" => "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        "message" => %{
+          "sender_id" => "app:test",
+          "message_id" => "accepted-before-stop",
+          "created_at" => 1,
+          "title" => "Accepted before stop"
+        }
+      }
+
+      assert %{"type" => "ok", "seq" => 1} = relay_request(relay, "alice-origin", original)
+
+      assert %{"type" => "ok", "event_id" => discussion_event_id} =
+               relay_request(relay, "alice-reader", %{
+                 "type" => "discussion",
+                 "op_id" => relay_op(203),
+                 "sender_id" => "app:test",
+                 "message_id" => "accepted-before-stop",
+                 "request_revision" => 1,
+                 "text" => "Please explain"
+               })
+
+      assert {:ok, %{person_id: ^alice, state: "STOPPED"}} =
+               Relay.hosted_delivery_state(relay, alice, "STOPPED")
+
+      stopped_engine = relay_engine(relay)
+
+      assert %{"type" => "ok", "duplicate" => true} =
+               relay_request(relay, "alice-origin", original)
+
+      assert %{"type" => "error", "reason" => "inactive_account"} =
+               relay_request(relay, "alice-origin", %{
+                 "type" => "forward",
+                 "op_id" => relay_op(204),
+                 "message" => %{
+                   "sender_id" => "app:test",
+                   "message_id" => "refused-while-stopped",
+                   "created_at" => 2,
+                   "title" => "Refused while stopped"
+                 }
+               })
+
+      assert %{"type" => "error", "reason" => "inactive_account"} =
+               relay_request(relay, "alice-origin", %{
+                 "type" => "conversation_revise",
+                 "op_id" => relay_op(205),
+                 "sender_id" => "app:test",
+                 "message_id" => "accepted-before-stop",
+                 "base_revision" => 1,
+                 "in_reply_to" => String.to_integer(discussion_event_id),
+                 "message" => %{
+                   "sender_id" => "app:test",
+                   "message_id" => "accepted-before-stop",
+                   "created_at" => 2,
+                   "title" => "Refused revision"
+                 }
+               })
+
+      assert %{"type" => "error", "reason" => "inactive_account"} =
+               relay_request(relay, "alice-origin", %{
+                 "type" => "conversation_reply",
+                 "op_id" => relay_op(206),
+                 "sender_id" => "app:test",
+                 "message_id" => "accepted-before-stop",
+                 "request_revision" => 1,
+                 "in_reply_to" => String.to_integer(discussion_event_id),
+                 "text" => "Refused reply"
+               })
+
+      assert relay_engine(relay) == stopped_engine
+      assert {:ok, nil} = Relay.claim_push(relay, System.system_time(:millisecond) + 300_001)
+      assert {:ok, [delivery], 1} = Relay.events(relay, "alice-reader", 0)
+      assert delivery["message"]["message_id"] == "accepted-before-stop"
+      assert {:ok, conversation_events, _high} =
+               Relay.conversation_events(relay, "alice-reader", 0)
+      assert Enum.any?(conversation_events, &(&1["kind"] == "discussion"))
+      refute Enum.any?(conversation_events, &(&1["kind"] in ["reply", "acted"]))
+
+      assert %{"type" => "ok", "seq" => 2} =
+               relay_request(relay, "alice-reader", %{
+                 "type" => "answer",
+                 "op_id" => relay_op(207),
+                 "sender_id" => "app:test",
+                 "message_id" => "accepted-before-stop",
+                 "answer" => "Answered while stopped"
+               })
+
+      assert %{"type" => "ok", "seq" => 1} =
+               relay_request(relay, "bob-origin", %{
+                 "type" => "forward",
+                 "op_id" => relay_op(208),
+                 "message" => %{
+                   "sender_id" => "app:test",
+                   "message_id" => "other-person-still-active",
+                   "created_at" => 1,
+                   "title" => "Other hosted person"
+                 }
+               })
+
+      GenServer.stop(relay)
+      relay = start_relay(certs, dir, dashboard_origin: @origin)
+      assert relay_engine(relay).delivery_states[alice] == "STOPPED"
+
+      assert %{"type" => "error", "reason" => "inactive_account"} =
+               relay_request(relay, "alice-origin", %{
+                 "type" => "forward",
+                 "op_id" => relay_op(209),
+                 "message" => %{
+                   "sender_id" => "app:test",
+                   "message_id" => "still-refused-after-restart",
+                   "created_at" => 3,
+                   "title" => "Still stopped"
+                 }
+               })
+
+      assert {:ok, %{state: "RESTORED"}} =
+               Relay.hosted_delivery_state(relay, alice, "RESTORED")
+
+      assert %{"type" => "ok", "seq" => 2} =
+               relay_request(relay, "alice-origin", %{
+                 "type" => "forward",
+                 "op_id" => relay_op(210),
+                 "message" => %{
+                   "sender_id" => "app:test",
+                   "message_id" => "fresh-after-restore",
+                   "created_at" => 4,
+                   "title" => "Fresh after restore"
+                 }
+               })
+
+      messages = relay_engine(relay).messages
+      assert Map.has_key?(messages, {alice, "app:test", "accepted-before-stop"})
+      assert Map.has_key?(messages, {alice, "app:test", "fresh-after-restore"})
+      refute Map.has_key?(messages, {alice, "app:test", "refused-while-stopped"})
+      refute Map.has_key?(messages, {alice, "app:test", "still-refused-after-restart"})
+      assert Map.has_key?(messages, {bob, "app:test", "other-person-still-active"})
+      GenServer.stop(relay)
     end
   end
 
@@ -304,6 +611,9 @@ defmodule AttentionServer.HostedAccountTest do
 
       assert {400, %{"error" => "invalid_account_ref"}} = post(port, "/accounts", %{})
       assert {400, %{"error" => "invalid_json"}} = raw_post(port, "/accounts", "not json")
+
+      assert {200, %{"person_id" => ^alice, "state" => "STOPPED"}} =
+               post(port, "/delivery-state", %{"person_id" => alice, "state" => "STOPPED"})
 
       assert {200, %{"sign_in_url" => url}} =
                post(port, "/sign-in-links", %{"person_id" => alice, "label" => "Alice"})

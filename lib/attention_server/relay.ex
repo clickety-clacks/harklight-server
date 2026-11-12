@@ -356,6 +356,9 @@ defmodule AttentionServer.Relay do
   def hosted_set_algorithm(server, person, algorithm),
     do: GenServer.call(server, {:hosted_set_algorithm, person, algorithm})
 
+  def hosted_delivery_state(server, person, target_state),
+    do: GenServer.call(server, {:hosted_delivery_state, person, target_state})
+
   @doc """
   Put the designated test account's person into a named product state:
   `no-devices`, `device-waiting` or `device-enrolled`. Acts on no other person.
@@ -1956,6 +1959,32 @@ defmodule AttentionServer.Relay do
 
       {:error, reason, next} ->
         {:reply, {:error, reason}, next}
+    end
+  end
+
+  def handle_call({:hosted_delivery_state, person, target_state}, _from, state) do
+    case Engine.set_hosted_delivery_state(state.store.engine, person, target_state) do
+      {:ok, next_engine, committed_state} ->
+        result = %{person_id: person, state: committed_state}
+
+        if next_engine == state.store.engine do
+          {:reply, {:ok, result}, state}
+        else
+          case commit(state.store, next_engine, %{
+                 person: person,
+                 actor: "hosted_component",
+                 action: "hosted_delivery_state"
+               }) do
+            {:ok, store} ->
+              {:reply, {:ok, result}, %{state | store: store}}
+
+            {:error, _, _} ->
+              {:reply, {:error, :storage_unavailable}, state}
+          end
+        end
+
+      {:error, reason} ->
+        {:reply, {:error, reason}, state}
     end
   end
 
