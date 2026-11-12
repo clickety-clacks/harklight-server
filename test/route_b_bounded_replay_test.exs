@@ -137,7 +137,7 @@ defmodule AttentionServer.RouteBBoundedReplayTest do
       engine = state.store.engine
       specs = synthetic_history_specs(history_frames, old_keys, visible_key)
 
-      {events, read_positions, discussed_messages, first_replies} =
+      {events, read_positions, discussed_messages, _first_replies} =
         specs
         |> Enum.with_index(1)
         |> Enum.reduce({%{}, %{}, engine.bounce_discussed_messages, %{}}, fn
@@ -646,6 +646,10 @@ defmodule AttentionServer.RouteBBoundedReplayTest do
                "since" => page["seq"]
              })
 
+    state_before_final_page = :sys.get_state(relay)
+    assert state_before_final_page.sessions[session].sync_mode == :legacy
+    assert state_before_final_page.sessions[session].ready
+
     assert [%{"type" => "ok", "row" => legacy_row}] =
              session_request(relay, session, %{
                "type" => "conversation_page",
@@ -659,8 +663,7 @@ defmodule AttentionServer.RouteBBoundedReplayTest do
 
     state_after = :sys.get_state(relay)
     assert state_after.store.engine == engine_before
-    assert state_after.sessions[session].sync_mode == :legacy
-    refute state_after.sessions[session].ready
+    assert state_after.sessions[session] == state_before_final_page.sessions[session]
     GenServer.stop(relay)
   end
 
