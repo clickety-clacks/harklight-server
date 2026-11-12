@@ -47,6 +47,25 @@ defmodule AttentionServer.HostedAccountTest do
   end
 
   describe "hosted accounts in the relay" do
+    test "a newly created hosted owner has an empty Route B inbox", %{certs: certs, dir: dir} do
+      relay = start_relay(certs, dir, dashboard_origin: @origin)
+      assert {:ok, person} = Relay.hosted_account_create(relay, "acct-route-b-empty")
+
+      # Check the real hosted-account path before the local device fixture seam.
+      assert Map.has_key?(:sys.get_state(relay).priority_views, person)
+      assert :ok = Relay.setup_device(relay, person, "route-b-device")
+      assert {:ok, session} = Relay.open_session(relay, "route-b-device")
+      before = :sys.get_state(relay)
+
+      request = JSON.encode!(%{"v" => 1, "type" => "inbox_list"}) <> "\n"
+      assert {:ok, [response_line]} = Relay.session_request_line(relay, session, request)
+      assert {:ok, %{"type" => "ok", "rows" => [], "unresolved_count" => 0}} =
+               JSON.decode_line(response_line)
+
+      assert :sys.get_state(relay).store.engine == before.store.engine
+      GenServer.stop(relay)
+    end
+
     test "an account maps to one person whose server-held owner key reaches only that person",
          %{certs: certs, dir: dir} do
       relay = start_relay(certs, dir, dashboard_origin: @origin)
