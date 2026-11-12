@@ -414,7 +414,7 @@ defmodule AttentionServer.HostedAccountTest do
       certs: certs,
       dir: dir
     } do
-      relay = start_relay(certs, dir, dashboard_origin: @origin)
+      relay = start_relay(certs, dir, dashboard_origin: @origin, push_enabled: true)
       assert {:ok, alice} = Relay.hosted_account_create(relay, "acct-delivery-gate")
       assert {:ok, bob} = Relay.hosted_account_create(relay, "acct-delivery-other")
 

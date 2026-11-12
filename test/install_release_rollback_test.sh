@@ -130,7 +130,7 @@ case "$action" in
         # Exercise the real store opener after the installer backup exists.
         ERL_LIBS="$HARKLIGHT_TEST_ERL_LIBS" elixir \
           -pa "$HARKLIGHT_TEST_APP_EBIN" "$HARKLIGHT_TEST_MIGRATOR"
-        grep -qx 'format=28' "$HARKLIGHT_TEST_MIGRATION_LOG"
+        grep -qx 'format=29' "$HARKLIGHT_TEST_MIGRATION_LOG"
         printf 'candidate-only\n' > "$HARKLIGHT_TEST_ROOT/state/candidate-write.txt"
         printf 'start:v0.1.12\n' >> "$HARKLIGHT_TEST_ACTIONS"
         if [[ "$HARKLIGHT_TEST_MODE" == upgrade-failure ]]; then
@@ -234,7 +234,7 @@ if [[ "$mode" == upgrade-failure ]]; then
   tar -tf "${backups[0]}/private-root.tar" | grep -Fqx './state/relay.sqlite3'
   backup_store_sha="$(tar -xOf "${backups[0]}/private-root.tar" ./state/relay.sqlite3 | sha256sum | cut -d ' ' -f 1)"
   [[ "$backup_store_sha" == "$expected_store_sha" ]]
-  grep -Fqx 'format=28' "$HARKLIGHT_TEST_MIGRATION_LOG"
+  grep -Fqx 'format=29' "$HARKLIGHT_TEST_MIGRATION_LOG"
   grep -Fqx 'start:v0.1.12' "$HARKLIGHT_TEST_ACTIONS"
   grep -Fqx 'start:v0.1.10' "$HARKLIGHT_TEST_ACTIONS"
   grep -Fq "|$home|$runner_temp" "$HARKLIGHT_TEST_LOG"
@@ -250,7 +250,7 @@ else
   [[ "$output" == *'is running under the selected package'* ]]
   [[ "$("$real_readlink" -f -- "$root/current")" == "$root/releases/v0.1.12" ]]
   [[ "$(< "$scratch/service-state")" == active ]]
-  grep -Fqx 'format=28' "$HARKLIGHT_TEST_MIGRATION_LOG"
+  grep -Fqx 'format=29' "$HARKLIGHT_TEST_MIGRATION_LOG"
   [[ -d "$root/state/relay.sqlite3.uploads" ]]
   migrated_store_sha="$(sha256sum "$root/state/relay.sqlite3" | cut -d ' ' -f 1)"
   [[ "$migrated_store_sha" != "$expected_store_sha" ]]
