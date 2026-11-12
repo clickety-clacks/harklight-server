@@ -1132,7 +1132,7 @@ defmodule AttentionServer.Engine do
               not AgentAccess.allowed?(agent.respond_grants, sender) ->
             failure("forbidden")
 
-          Enum.sort(Map.keys(frame)) !=
+          Enum.sort(Map.keys(Map.delete(frame, "request_revision"))) !=
             ~w(acceptance_seq answer deliberate intent_ref message_id op_id sender_id type v) or
               frame["v"] != 1 ->
             failure("invalid_field", "request")
@@ -1140,6 +1140,10 @@ defmodule AttentionServer.Engine do
           frame["type"] != "answer" or frame["deliberate"] != true or
               not bounded_text?(frame["intent_ref"]) ->
             failure("invalid_field", "intent_ref")
+
+          Map.has_key?(frame, "request_revision") and
+              not (is_integer(frame["request_revision"]) and frame["request_revision"] > 0) ->
+            failure("invalid_field", "request_revision")
 
           not (is_integer(frame["acceptance_seq"]) and frame["acceptance_seq"] > 0) ->
             failure("invalid_field", "acceptance_seq")
