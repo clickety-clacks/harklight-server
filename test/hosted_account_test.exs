@@ -568,7 +568,7 @@ defmodule AttentionServer.HostedAccountTest do
       assert {:ok, %{state: "RESTORED"}} =
                Relay.hosted_delivery_state(relay, alice, "RESTORED")
 
-      assert %{"type" => "ok", "seq" => 2} =
+      assert %{"type" => "ok", "seq" => 3} =
                relay_request(relay, "alice-origin", %{
                  "type" => "forward",
                  "op_id" => relay_op(210),
