@@ -21,7 +21,7 @@ defmodule AttentionServer.Store do
 
   alias Exqlite.Sqlite3
 
-  @format_version 27
+  @format_version 28
   @inbox_index_chunk_size 20
   defstruct [:db, :engine, :version, :upload_dir]
 
@@ -1100,7 +1100,8 @@ defmodule AttentionServer.Store do
                      24,
                      25,
                      26,
-                     27
+                     27,
+                     28
                    ] ->
                 original = struct(Engine, Map.from_struct(stored))
 
@@ -1188,6 +1189,9 @@ defmodule AttentionServer.Store do
                       state
                     end
                   end)
+                  |> then(fn state ->
+                    if format < 28, do: normalize_device_focus_permissions(state), else: state
+                  end)
 
                 engine =
                   engine
@@ -1230,6 +1234,7 @@ defmodule AttentionServer.Store do
                                  format < 24 -> "chat_read_positions_init"
                                  format < 26 -> "bounce_state_init"
                                  format < 27 -> "bounce_schedule_index_init"
+                                 format < 28 -> "device_focus_permissions_init"
                                  true -> "state_format"
                                end
                            }
@@ -1774,6 +1779,15 @@ defmodule AttentionServer.Store do
     devices =
       Map.new(engine.devices, fn {key, record} ->
         {key, record |> Map.put_new(:label, nil) |> Map.put_new(:enrolled_at, nil)}
+      end)
+
+    %{engine | devices: devices}
+  end
+
+  defp normalize_device_focus_permissions(engine) do
+    devices =
+      Map.new(engine.devices, fn {key, record} ->
+        {key, record |> Map.put_new(:see_focus, false) |> Map.put_new(:push_view, false)}
       end)
 
     %{engine | devices: devices}

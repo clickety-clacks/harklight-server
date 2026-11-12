@@ -55,6 +55,8 @@ defmodule AttentionServer.DashboardInventory do
           label: device_label(device, key),
           person_name: device.person,
           revoked: device.revoked,
+          see_focus: Map.get(device, :see_focus, false),
+          push_view: Map.get(device, :push_view, false),
           connection: :unknown
         }
       end)

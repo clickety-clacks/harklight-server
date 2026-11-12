@@ -227,6 +227,9 @@ defmodule AttentionServer.OriginHTTPS do
           {:ok, {:stream, handle, reconnect, advisory_v1}} ->
             stream(tls, relay, key, handle, reconnect, advisory_v1)
 
+          {:ok, {:focus_stream}} ->
+            focus_stream(tls, relay, key)
+
           {:ok, {:upload, attrs, size, remainder}} ->
             upload(tls, relay, key, attrs, size, remainder)
 
@@ -720,6 +723,83 @@ defmodule AttentionServer.OriginHTTPS do
     end
   end
 
+  defp focus_stream(socket, relay, key) do
+    case Relay.focus_stream_attach(relay, key, self()) do
+      {:ok, clients} ->
+        try do
+          with :ok <- stream_send(socket, stream_headers(), :response_write),
+               :ok <-
+                 stream_send(socket, focus_change_notice(%{"clients" => clients}), :stream_write) do
+            focus_stream_loop(socket)
+          end
+        after
+          _ =
+            Diagnostics.result(
+              :origin_https,
+              :focus_stream_detach,
+              Relay.focus_stream_detach(relay, key, self()),
+              :unavailable
+            )
+        end
+
+      {:error, reason} ->
+        _ =
+          stream_send(
+            socket,
+            OriginWire.http_response(200, OriginWire.error(Atom.to_string(reason))),
+            :response_write
+          )
+    end
+  end
+
+  defp focus_stream_loop(socket) do
+    case :ssl.setopts(socket, active: :once) do
+      :ok ->
+        focus_stream_receive(socket)
+
+      {:error, reason} ->
+        Diagnostics.failure(:origin_https, :focus_stream_read, reason, :closed)
+        :ok
+
+      other ->
+        Diagnostics.failure(:origin_https, :focus_stream_read, other, :closed)
+        :ok
+    end
+  end
+
+  defp focus_stream_receive(socket) do
+    receive do
+      {:focus_change, %{"clients" => _clients} = data} ->
+        case stream_send(socket, focus_change_notice(data), :stream_write) do
+          :ok -> focus_stream_loop(socket)
+          _ -> :ok
+        end
+
+      :focus_forbidden ->
+        :ok
+
+      {:ssl, ^socket, _bytes} ->
+        Diagnostics.failure(:origin_https, :focus_stream_read, :bad_frame, :closed)
+        :ok
+
+      {:ssl_closed, ^socket} ->
+        :ok
+
+      {:ssl_error, ^socket, reason} ->
+        Diagnostics.failure(:origin_https, :focus_stream_read, reason, :closed)
+        :ok
+    after
+      @keepalive_ms ->
+        case stream_send(socket, ": keepalive\n\n", :stream_write) do
+          :ok -> focus_stream_loop(socket)
+          _ -> :ok
+        end
+    end
+  end
+
+  defp focus_change_notice(data),
+    do: ["event: focus_change\n", "data: ", JSON.encode!(data), "\n\n"]
+
   defp stream_status(relay, key, :origin), do: Relay.origin_status(relay, key, :origin)
   defp stream_status(relay, key, handle), do: Relay.origin_status(relay, key, handle)
 
@@ -837,6 +917,9 @@ defmodule AttentionServer.OriginHTTPS do
           if remainder == <<>>,
             do: {:ok, {:stream, handle, reconnect, advisory}},
             else: {:error, :bad_frame}
+
+        {:focus_stream} ->
+          if remainder == <<>>, do: {:ok, {:focus_stream}}, else: {:error, :bad_frame}
 
         {:upload, attrs, size} ->
           {:ok, {:upload, attrs, size, remainder}}
@@ -972,18 +1055,29 @@ defmodule AttentionServer.OriginHTTPS do
   defp parse_stream_headers("/origin/v1/stream?" <> query = path, fields) do
     options = String.split(query, "&")
 
-    if "scope=origin" in options do
+    if "scope=focus" in options do
       with {:ok, headers} <- headers(fields, %{}),
            false <- Map.has_key?(headers, "transfer-encoding"),
            false <- Map.has_key?(headers, "content-length"),
-           true <- Enum.all?(options, &(&1 in ["scope=origin", "reconnect=1"])),
-           true <- length(options) == length(Enum.uniq(options)) do
-        {:ok, {:stream, :origin, "reconnect=1" in options, false}}
+           true <- options == ["scope=focus"] do
+        {:ok, {:focus_stream}}
       else
         _ -> {:error, :invalid_field}
       end
     else
-      parse_handle_stream_headers(path, fields)
+      if "scope=origin" in options do
+        with {:ok, headers} <- headers(fields, %{}),
+             false <- Map.has_key?(headers, "transfer-encoding"),
+             false <- Map.has_key?(headers, "content-length"),
+             true <- Enum.all?(options, &(&1 in ["scope=origin", "reconnect=1"])),
+             true <- length(options) == length(Enum.uniq(options)) do
+          {:ok, {:stream, :origin, "reconnect=1" in options, false}}
+        else
+          _ -> {:error, :invalid_field}
+        end
+      else
+        parse_handle_stream_headers(path, fields)
+      end
     end
   end
 

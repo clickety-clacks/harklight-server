@@ -28,7 +28,7 @@ defmodule AttentionServer.DashboardView do
         ~s(<section class="empty"><h2>No devices yet</h2><p>Create a person-bound invitation, then approve the exact request when it appears here.</p></section>)
       else
         ~s(<section><h2>Waiting for approval</h2><ul class="waiting">#{pending}</ul></section>) <>
-          ~s(<section><h2>Devices</h2><table><thead><tr><th>Device</th><th>Person</th><th>Status</th><th>Connection</th><th>Action</th></tr></thead><tbody>#{rows}</tbody></table><p class="note">Enrolled means the device's key was approved. It does not say whether the device is reachable. Connection is unknown until the server has a supported presence reading.</p></section>)
+          ~s(<section><h2>Devices</h2><table><thead><tr><th>Device</th><th>Person</th><th>Status</th><th>Connection</th><th>See what you're looking at</th><th>Open things on your screen</th><th>Action</th></tr></thead><tbody>#{rows}</tbody></table><p class="note">Enrolled means the device's key was approved. It does not say whether the device is reachable. Connection is unknown until the server has a supported presence reading.</p></section>)
       end
 
     invitation_action =
@@ -271,8 +271,28 @@ harklight-agent --identity-dir ./harklight-agent-identity \
         ""
       end
 
-    ~s(<tr><td>#{label}</td><td>#{person}</td><td>#{status}</td><td>Unknown</td><td>#{action}</td></tr>)
+    see_switch = focus_switch(device, device_id, :see_focus, "see", "See what you're looking at")
+
+    push_switch =
+      focus_switch(device, device_id, :push_view, "push", "Open things on your screen")
+
+    ~s(<tr><td>#{label}</td><td>#{person}</td><td>#{status}</td><td>Unknown</td><td>#{see_switch}</td><td>#{push_switch}</td><td>#{action}</td></tr>)
   end
+
+  defp focus_switch(device, device_id, field, route, label)
+       when is_binary(device_id) do
+    checked = if Map.get(device, field, false), do: " checked", else: ""
+
+    if device[:can_manage_focus] == true do
+      ~s|<form action="/devices/focus/#{escape(device_id)}/#{route}" method="post"><label><input type="checkbox" name="enabled" value="on"#{checked} aria-label="#{label}" onchange="this.form.requestSubmit()">#{label}</label></form>|
+    else
+      disabled = " disabled"
+
+      ~s(<label><input type="checkbox"#{checked}#{disabled} aria-label="#{label}">#{label}</label>)
+    end
+  end
+
+  defp focus_switch(_device, _device_id, _field, _route, _label), do: ""
 
   defp waiting_row(item) do
     label = escape(item[:label] || item["label"] || "Unnamed device")

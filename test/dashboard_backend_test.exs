@@ -67,6 +67,113 @@ defmodule AttentionServer.DashboardBackendTest do
     GenServer.stop(restarted)
   end
 
+  test "focus permissions default off, are independent and survive a restart" do
+    certs = TLSFixtures.create!()
+    on_exit(fn -> File.rm_rf!(certs) end)
+
+    dir =
+      Path.join(
+        System.tmp_dir!(),
+        "harklight-focus-permissions-#{System.unique_integer([:positive])}"
+      )
+
+    File.mkdir_p!(dir)
+    on_exit(fn -> File.rm_rf!(dir) end)
+    path = Path.join(dir, "relay.sqlite3")
+
+    {:ok, relay} = Relay.start_link(store_path: path)
+    on_exit(fn -> if Process.alive?(relay), do: GenServer.stop(relay) end)
+
+    owner_certificate = TLSFixtures.certificate_der!(certs, "a1")
+    {:ok, person} = Relay.operator_bootstrap(relay, owner_certificate)
+    {:ok, owner_key} = DeviceIdentity.from_certificate(owner_certificate)
+    device_key = String.duplicate("c", 64)
+    :ok = Relay.setup_device(relay, person, device_key)
+
+    {:ok, sessions} =
+      DashboardBrowserSession.start_link(
+        relay: relay,
+        consume: fn token -> Relay.consume_browser_sign_in(relay, token) end
+      )
+
+    on_exit(fn -> if Process.alive?(sessions), do: GenServer.stop(sessions) end)
+    backend = %DashboardBackend{relay: relay, sessions: sessions, configured_owner_person: person}
+    skill = Path.join(System.tmp_dir!(), "dashboard-skill-#{System.unique_integer([:positive])}")
+    File.write!(skill, "# Harklight")
+    on_exit(fn -> File.rm(skill) end)
+
+    opts =
+      DashboardReadHTTP.init(
+        backend: {DashboardBackend, backend},
+        skill_path: skill,
+        skill_path_saas: skill
+      )
+
+    {:ok, credential} = Relay.owner_browser_sign_in_create(relay, person, owner_key)
+
+    sign_in =
+      request_post(credential["sign_in_token"], "https://www.example.com")
+      |> DashboardReadHTTP.call(opts)
+
+    assert sign_in.status == 204
+    [set_cookie] = Plug.Conn.get_resp_header(sign_in, "set-cookie")
+    [_, cookie] = Regex.run(~r/__Host-harklight=([^;]+)/, set_cookie)
+
+    page = request(cookie) |> DashboardReadHTTP.call(opts)
+    assert page.status == 200
+    assert page.resp_body =~ "See what you're looking at"
+    assert page.resp_body =~ "Open things on your screen"
+    refute page.resp_body =~ " checked"
+    assert page.resp_body =~ ~s(action="/devices/focus/#{device_key}/see" method="post")
+    assert page.resp_body =~ ~s(action="/devices/focus/#{device_key}/push" method="post")
+
+    assert %{see_focus: false, push_view: false} =
+             :sys.get_state(relay).store.engine.devices[device_key]
+
+    see_on = owner_post("/devices/focus/#{device_key}/see", "enabled=on", cookie)
+    assert DashboardReadHTTP.call(see_on, opts).status == 303
+
+    assert %{see_focus: true, push_view: false} =
+             :sys.get_state(relay).store.engine.devices[device_key]
+
+    assert {:ok, %{"clients" => []}} = Relay.focus_get(relay, device_key)
+
+    assert {:error, :forbidden} =
+             Relay.view_show(relay, device_key, %{
+               "sender_id" => "app:test",
+               "message_id" => "missing",
+               "target" => "message"
+             })
+
+    push_on = owner_post("/devices/focus/#{device_key}/push", "enabled=on", cookie)
+    assert DashboardReadHTTP.call(push_on, opts).status == 303
+
+    assert %{see_focus: true, push_view: true} =
+             :sys.get_state(relay).store.engine.devices[device_key]
+
+    see_off = owner_post("/devices/focus/#{device_key}/see", "", cookie)
+    assert DashboardReadHTTP.call(see_off, opts).status == 303
+
+    assert %{see_focus: false, push_view: true} =
+             :sys.get_state(relay).store.engine.devices[device_key]
+
+    GenServer.stop(relay)
+    {:ok, restarted} = Relay.start_link(store_path: path)
+    on_exit(fn -> if Process.alive?(restarted), do: GenServer.stop(restarted) end)
+
+    assert %{see_focus: false, push_view: true} =
+             :sys.get_state(restarted).store.engine.devices[device_key]
+
+    assert {:error, :forbidden} = Relay.focus_get(restarted, device_key)
+
+    assert {:error, {:not_found, "message_id"}} =
+             Relay.view_show(restarted, device_key, %{
+               "sender_id" => "app:test",
+               "message_id" => "missing",
+               "target" => "message"
+             })
+  end
+
   test "configured self-host owner sees device metadata across persons; another owner sees only their own" do
     certs = TLSFixtures.create!()
     on_exit(fn -> File.rm_rf!(certs) end)

@@ -75,6 +75,302 @@ defmodule AttentionServer.OriginHTTPSTest do
     }
   end
 
+  test "focus reports are shape-only, nonterminal, and gated by the see switch", c do
+    {:ok, owner_key} =
+      DeviceIdentity.from_certificate(TLSFixtures.certificate_der!(c.certs, "a1"))
+
+    assert {:ok, 200, %{"type" => "error", "reason" => "forbidden"}} =
+             request(c, "reader", %{"v" => 1, "type" => "focus_get"})
+
+    # Permission is checked before request fields for pushes.
+    assert {:ok, 200, %{"type" => "error", "reason" => "forbidden"}} =
+             request(c, "reader", %{"v" => 1, "type" => "view_show"})
+
+    :ok =
+      Relay.save_dashboard_focus_permission(c.relay, c.person, owner_key, c.reader, :see, true)
+
+    {:ok, session} = Relay.open_session(c.relay, c.origin)
+
+    malformed = %{
+      "v" => 1,
+      "type" => "focus_report",
+      "ref" => "bad-screen",
+      "screen" => "unknown"
+    }
+
+    assert {:ok, [line]} =
+             Relay.session_request_line(c.relay, session, JSON.encode!(malformed) <> "\n")
+
+    assert {:ok,
+            %{
+              "type" => "error",
+              "reason" => "invalid_field",
+              "field" => "screen",
+              "ref" => "bad-screen"
+            }} = JSON.decode_line(line)
+
+    report = %{
+      "v" => 1,
+      "type" => "focus_report",
+      "ref" => "focus-1",
+      "screen" => "chat",
+      "sender_id" => "app:unknown",
+      "message_id" => "message-not-stored",
+      "visible_event_id" => "4182"
+    }
+
+    assert {:ok, [line]} =
+             Relay.session_request_line(c.relay, session, JSON.encode!(report) <> "\n")
+
+    assert {:ok, %{"type" => "ok", "ref" => "focus-1"}} = JSON.decode_line(line)
+
+    assert {:ok, 200,
+            %{
+              "type" => "ok",
+              "clients" => [
+                %{
+                  "client_id" => client_id,
+                  "device_name" => device_name,
+                  "screen" => "chat",
+                  "sender_id" => "app:unknown",
+                  "message_id" => "message-not-stored",
+                  "visible_event_id" => "4182",
+                  "in_front" => true,
+                  "connected" => true,
+                  "reported_at" => reported_at
+                }
+              ]
+            }} = request(c, "reader", %{"v" => 1, "type" => "focus_get"})
+
+    assert client_id == c.origin
+    assert device_name == "Device " <> String.slice(c.origin, 0, 8)
+    assert is_integer(reported_at)
+
+    assert {:ok, 200, %{"type" => "error", "reason" => "forbidden"}} =
+             request(c, "reader", %{"v" => 1, "type" => "view_show"})
+
+    :ok = Relay.close_session(c.relay, session)
+  end
+
+  test "focus SSE is independent, supports multiple streams, and closes when see is disabled",
+       c do
+    {:ok, owner_key} =
+      DeviceIdentity.from_certificate(TLSFixtures.certificate_der!(c.certs, "a1"))
+
+    :ok =
+      Relay.save_dashboard_focus_permission(c.relay, c.person, owner_key, c.reader, :see, true)
+
+    :ok = Relay.origin_stream_attach(c.relay, c.reader, :origin, self(), true)
+    on_exit(fn -> Relay.origin_stream_detach(c.relay, c.reader, :origin, self()) end)
+
+    assert {:ok, first, first_event} = focus_stream_request(c, "reader")
+    assert first_event =~ "event: focus_change\n"
+    assert first_event =~ "data: {\"clients\":[]}"
+
+    assert {:ok, second, second_event} = focus_stream_request(c, "reader")
+    assert second_event =~ "data: {\"clients\":[]}"
+
+    on_exit(fn ->
+      :ssl.close(first)
+      :ssl.close(second)
+    end)
+
+    {:ok, session} = Relay.open_session(c.relay, c.origin)
+
+    report = %{
+      "v" => 1,
+      "type" => "focus_report",
+      "ref" => "stream-report",
+      "screen" => "inbox"
+    }
+
+    assert {:ok, [_]} =
+             Relay.session_request_line(c.relay, session, JSON.encode!(report) <> "\n")
+
+    assert {:ok, first_update} = recv_until(first, "\n\n", <<>>, 20)
+    assert first_update =~ "event: focus_change\n"
+    assert first_update =~ c.origin
+
+    assert {:ok, second_update} = recv_until(second, "\n\n", <<>>, 20)
+    assert second_update =~ "event: focus_change\n"
+    assert second_update =~ c.origin
+
+    refute_receive :origin_scope_replaced, 20
+
+    :ok =
+      Relay.save_dashboard_focus_permission(c.relay, c.person, owner_key, c.reader, :see, false)
+
+    assert {:error, :closed} = :ssl.recv(first, 0, 5_000)
+    assert {:error, :closed} = :ssl.recv(second, 0, 5_000)
+
+    assert {:ok, 200, %{"type" => "error", "reason" => "forbidden"}} =
+             request(c, "reader", %{"v" => 1, "type" => "focus_get"})
+
+    :ok = Relay.close_session(c.relay, session)
+  end
+
+  test "view_show is account-scoped, selects by device name, and delivers only the latest held show",
+       c do
+    {:ok, owner_key} =
+      DeviceIdentity.from_certificate(TLSFixtures.certificate_der!(c.certs, "a1"))
+
+    assert %{"type" => "ok"} =
+             relay_request(c.relay, c.origin, %{
+               "type" => "forward",
+               "op_id" => op(951),
+               "message" => %{
+                 "sender_id" => "app:test",
+                 "message_id" => "first",
+                 "created_at" => 1,
+                 "title" => "First"
+               }
+             })
+
+    assert %{"type" => "ok"} =
+             relay_request(c.relay, c.origin, %{
+               "type" => "forward",
+               "op_id" => op(952),
+               "message" => %{
+                 "sender_id" => "app:test",
+                 "message_id" => "second",
+                 "created_at" => 2,
+                 "title" => "Second"
+               }
+             })
+
+    assert %{"type" => "ok"} =
+             relay_request(c.relay, c.other_origin, %{
+               "type" => "forward",
+               "op_id" => op(953),
+               "message" => %{
+                 "sender_id" => "app:other",
+                 "message_id" => "other-only",
+                 "created_at" => 3,
+                 "title" => "Other account"
+               }
+             })
+
+    :ok =
+      Relay.save_dashboard_focus_permission(c.relay, c.person, owner_key, c.reader, :push, true)
+
+    :ok =
+      Relay.save_dashboard_focus_permission(c.relay, c.person, owner_key, c.reader, :see, true)
+
+    assert {:ok, session} = Relay.open_session(c.relay, c.origin)
+
+    report = %{
+      "v" => 1,
+      "type" => "focus_report",
+      "ref" => "show-report",
+      "screen" => "message",
+      "sender_id" => "app:test",
+      "message_id" => "first"
+    }
+
+    assert {:ok, [_]} =
+             Relay.session_request_line(c.relay, session, JSON.encode!(report) <> "\n")
+
+    device_name = "dEvIcE " <> String.upcase(String.slice(c.origin, 0, 8))
+    expected_device_name = "Device " <> String.slice(c.origin, 0, 8)
+
+    assert {:ok, 200,
+            %{
+              "type" => "ok",
+              "client_id" => client_id,
+              "device_name" => ^expected_device_name,
+              "delivery" => "held"
+            }} =
+             request(c, "reader", %{
+               "v" => 1,
+               "type" => "view_show",
+               "ref" => "show-1",
+               "sender_id" => "app:test",
+               "message_id" => "first",
+               "target" => "message",
+               "target_device_name" => device_name
+             })
+
+    assert client_id == c.origin
+
+    origin_key = c.origin
+
+    assert {:ok, 200, %{"type" => "ok", "client_id" => ^origin_key, "delivery" => "held"}} =
+             request(c, "reader", %{
+               "v" => 1,
+               "type" => "view_show",
+               "ref" => "show-2",
+               "sender_id" => "app:test",
+               "message_id" => "second",
+               "target" => "chat",
+               "target_client" => c.origin
+             })
+
+    assert {:ok, 200, %{"type" => "error", "reason" => "not_found", "field" => "message_id"}} =
+             request(c, "reader", %{
+               "v" => 1,
+               "type" => "view_show",
+               "sender_id" => "app:other",
+               "message_id" => "other-only",
+               "target" => "message",
+               "target_client" => c.origin
+             })
+
+    assert {:ok, 200, %{"type" => "error", "reason" => "not_found", "field" => "target_client"}} =
+             request(c, "reader", %{
+               "v" => 1,
+               "type" => "view_show",
+               "sender_id" => "app:test",
+               "message_id" => "first",
+               "target" => "message",
+               "target_client" => c.other_origin
+             })
+
+    :ok =
+      Relay.save_dashboard_focus_permission(c.relay, c.person, owner_key, c.reader, :push, false)
+
+    assert {:ok, 200, %{"type" => "error", "reason" => "forbidden"}} =
+             request(c, "reader", %{
+               "v" => 1,
+               "type" => "view_show",
+               "sender_id" => "app:test",
+               "message_id" => "first",
+               "target" => "message"
+             })
+
+    delivered = %{report | "ref" => "show-report-2", "screen" => "chat", "message_id" => "second"}
+
+    assert {:ok, lines} =
+             Relay.session_request_line(c.relay, session, JSON.encode!(delivered) <> "\n")
+
+    assert [
+             %{"type" => "ok", "ref" => "show-report-2"},
+             %{
+               "v" => 1,
+               "type" => "view_show",
+               "sender_id" => "app:test",
+               "message_id" => "second",
+               "target" => "chat",
+               "held_ms" => held_ms
+             }
+           ] =
+             Enum.map(lines, fn line ->
+               {:ok, frame} = JSON.decode_line(line)
+               frame
+             end)
+
+    assert held_ms >= 0
+
+    assert {:ok, 200,
+            %{
+              "type" => "ok",
+              "clients" => [
+                %{"client_id" => ^origin_key, "screen" => "chat", "message_id" => "second"}
+              ]
+            }} = request(c, "reader", %{"v" => 1, "type" => "focus_get"})
+
+    :ok = Relay.close_session(c.relay, session)
+  end
+
   test "authenticated origin reports limits and an invalid SaaS cap only disables hosted routes",
        c do
     assert {:ok, 200,
@@ -2179,6 +2475,22 @@ defmodule AttentionServer.OriginHTTPSTest do
         name,
         "GET /origin/v1/stream?session=#{handle} HTTP/1.1\r\nHost: relay.test\r\n\r\n"
       )
+
+  defp focus_stream_request(c, name) do
+    with {:ok, socket} <- socket(c, name),
+         :ok <-
+           :ssl.send(
+             socket,
+             "GET /origin/v1/stream?scope=focus HTTP/1.1\r\nHost: relay.test\r\n\r\n"
+           ),
+         {:ok, response} <- recv_until(socket, "\r\n\r\n", <<>>, 20),
+         [_headers, body] <- :binary.split(response, "\r\n\r\n"),
+         {:ok, event} <- recv_until(socket, "\n\n", body, 20) do
+      {:ok, socket, event}
+    else
+      error -> error
+    end
+  end
 
   defp socket(c, name),
     do:
