@@ -7,7 +7,11 @@ defmodule Mix.Tasks.Attention.Agent do
       mix attention.agent keygen --directory ./agent
       mix attention.agent search --directory ./agent --connect 127.0.0.1 --name relay.test --port 8446 --ca ca.pem --sender app:one
       mix attention.agent get --directory ./agent --connect 127.0.0.1 --name relay.test --port 8446 --ca ca.pem --sender app:one --message ITEM
-      mix attention.agent respond --directory ./agent --connect 127.0.0.1 --name relay.test --port 8446 --ca ca.pem --sender app:one --message ITEM --acceptance SEQ --op UUID --intent-ref REF --answer-file answer.json
+      mix attention.agent respond --directory ./agent --connect 127.0.0.1 --name relay.test --port 8446 --ca ca.pem --sender app:one --message ITEM --acceptance SEQ --request-revision REVISION --op UUID --intent-ref REF --answer-file answer.json
+
+  Use acceptance_seq and request_revision from the same get/search item for
+  SEQ and REVISION. The acceptance sequence stays unchanged after a revision;
+  request_revision identifies the content being answered.
 
   The owner must first register the generated public certificate fingerprint
   and assign explicit read/respond scopes with `mix attention.owner`. A retry
