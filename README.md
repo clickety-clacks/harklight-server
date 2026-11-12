@@ -7,16 +7,16 @@ Harklight iOS/iPadOS app.
 
 ## Install the server
 
-For the FORMAT27 v0.1.32 server package, use the release page below after it
+For the FORMAT27 v0.1.33 server package, use the release page below after it
 is published to download the Linux x86_64 archive, `SHA256SUMS` and
 `SELF_HOST.md`. Verify the checksum before extraction:
 
-[v0.1.32 release](https://github.com/clickety-clacks/harklight-server/releases/tag/v0.1.32)
+[v0.1.33 release](https://github.com/clickety-clacks/harklight-server/releases/tag/v0.1.33)
 (available only after publication).
 
 ```sh
 sha256sum -c SHA256SUMS
-tar -xzf harklight-server-0.1.32-linux-x86_64.tar.gz
+tar -xzf harklight-server-0.1.33-linux-x86_64.tar.gz
 ```
 
 Follow [SELF_HOST.md](SELF_HOST.md) for a fresh installation, tailnet routing,
@@ -28,7 +28,7 @@ The package does not install a service, configure the tailnet or expose ports.
 State, owner/device identities, trust roots and sender grants live outside the
 versioned package. Run one server per database. Keep private keys and backups
 private; do not repeat bootstrap over an existing installation.
-This source, v0.1.32, writes FORMAT27. Its first start durably migrates
+This source, v0.1.33, writes FORMAT27. Its first start durably migrates
 supported FORMAT25 state, written by v0.1.28, to FORMAT27. The v0.1.28 package
 cannot read that resulting state. The v0.1.27 and v0.1.26 packages use
 FORMAT24 and cannot read FORMAT25 state written by v0.1.28. The v0.1.25
@@ -45,8 +45,8 @@ can fail and leave the service stopped. Restoring the snapshot discards every
 write made after capture. Restore success for this release is unproved and has
 not been tested.
 
-Before the first v0.1.32 start, stop the server and take a complete private-state
-backup. After any v0.1.32 write, returning to v0.1.28 requires stopping the
+Before the first v0.1.33 start, stop the server and take a complete private-state
+backup. After any v0.1.33 write, returning to v0.1.28 requires stopping the
 server, restoring that pre-start backup and then running v0.1.28; changing only
 the selected code or release link cannot make FORMAT27 readable. This restore
 loses every write made since the backup and cannot undo external notifications,
@@ -58,6 +58,14 @@ With Agent 0.1.9 or newer, `harklight-agent message-get` reads the latest
 committed revision by default or a specific retained revision with
 `--revision N`. The read does not mark Seen; an unavailable requested revision
 returns `revision_unavailable`.
+
+v0.1.33 fixes authorized agent replies and Seen actions for revised messages.
+Use the `request_revision` returned beside `acceptance_seq` by the same get or
+search result; the bundled `bin/harklight agent respond` command carries it with
+`--request-revision`. Omitting the revision keeps the legacy revision-1
+behavior. Stale-target, stale-revision, authorization and receipt checks remain
+in force. The separate `harklight-agent` conversation CLI is not part of this
+server package.
 
 Configurable score-based priority levels and unseen-message advisories first
 shipped in v0.1.30. When a request reaches its configured unseen interval, the

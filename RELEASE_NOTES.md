@@ -1,3 +1,27 @@
+# Harklight Server v0.1.33
+
+## Changes
+
+- Authorized agents can now reply to or mark Seen a revised message by sending
+  its current `request_revision` alongside the stable `acceptance_seq` returned
+  by get or search. The bundled `bin/harklight agent respond` accepts
+  `--request-revision`. Omitting it retains legacy revision-1 behavior; stale
+  target, stale revision, authorization and operation-receipt checks remain.
+- This release continues to write FORMAT27 and introduces no database schema
+  or store-format migration.
+
+## Upgrade and recovery
+
+Before the first v0.1.33 start, stop the server and take a complete private
+state backup. After any v0.1.33 write, returning to v0.1.28 requires stopping
+the server, restoring that pre-start backup and then running v0.1.28. This loses
+every write made since the backup and cannot undo external notifications,
+bounces or agent deliveries. Restore success is unproved and has not been
+tested; no recovery success is guaranteed. See `SELF_HOST.md` for the detailed
+installer behavior and recovery limits.
+
+---
+
 # Harklight Server v0.1.32
 
 ## Changes
