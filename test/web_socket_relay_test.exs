@@ -14,7 +14,12 @@ defmodule AttentionServer.WebSocketRelayTest do
     File.mkdir_p!(dir)
     on_exit(fn -> File.rm_rf!(dir) end)
     path = Path.join(dir, "relay.sqlite3")
-    {:ok, relay} = Relay.start_link(store_path: path, enrollment_fixture_mode: true)
+
+    relay =
+      start_link_supervised!({Relay, store_path: path, enrollment_fixture_mode: true},
+        restart: :temporary
+      )
+
     assert :ok = Relay.setup_person(relay, "A")
     assert :ok = Relay.setup_person(relay, "B")
 
@@ -35,18 +40,15 @@ defmodule AttentionServer.WebSocketRelayTest do
     assert :ok = Relay.setup_sender(relay, keys["a1"], "app:test")
     assert :ok = Relay.setup_sender(relay, keys["b1"], "app:test")
 
-    {:ok, web} =
-      WebSocketRelay.start_link(
-        relay: relay,
-        certfile: Path.join(certs, "server.pem"),
-        keyfile: Path.join(certs, "server.key"),
-        cacertfile: Path.join(certs, "ca.pem")
+    web =
+      start_link_supervised!(
+        {WebSocketRelay,
+         relay: relay,
+         certfile: Path.join(certs, "server.pem"),
+         keyfile: Path.join(certs, "server.key"),
+         cacertfile: Path.join(certs, "ca.pem")},
+        restart: :temporary
       )
-
-    on_exit(fn ->
-      if Process.alive?(web), do: GenServer.stop(web)
-      if Process.alive?(relay), do: GenServer.stop(relay)
-    end)
 
     %{relay: relay, web: web, path: path, keys: keys}
   end
