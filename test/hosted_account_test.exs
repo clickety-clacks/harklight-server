@@ -9,6 +9,7 @@ defmodule AttentionServer.HostedAccountTest do
     HostedRequests,
     JevClient,
     JSON,
+    OriginWire,
     Placement,
     Relay,
     Server,
@@ -468,10 +469,17 @@ defmodule AttentionServer.HostedAccountTest do
       assert %{"type" => "ok", "duplicate" => true} =
                relay_request(relay, "alice-origin", original)
 
-      assert %{"type" => "error", "reason" => "inactive_account"} =
-               relay_request(relay, "alice-origin", %{
-                 "type" => "forward",
+      assert %{
+               "type" => "error",
+               "reason" => "inactive_account",
+               "ref" => "stopped-send"
+             } =
+               OriginWire.command(relay, "alice-origin", %{
+                 "v" => 1,
+                 "type" => "send",
                  "op_id" => relay_op(204),
+                 "session_handle" => "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                 "ref" => "stopped-send",
                  "message" => %{
                    "sender_id" => "app:test",
                    "message_id" => "refused-while-stopped",
@@ -481,13 +489,15 @@ defmodule AttentionServer.HostedAccountTest do
                })
 
       assert %{"type" => "error", "reason" => "inactive_account"} =
-               relay_request(relay, "alice-origin", %{
-                 "type" => "conversation_revise",
+               OriginWire.command(relay, "alice-origin", %{
+                 "v" => 1,
+                 "type" => "revise",
                  "op_id" => relay_op(205),
+                 "ref" => "stopped-revise",
                  "sender_id" => "app:test",
                  "message_id" => "accepted-before-stop",
                  "base_revision" => 1,
-                 "in_reply_to" => String.to_integer(discussion_event_id),
+                 "in_reply_to" => discussion_event_id,
                  "message" => %{
                    "sender_id" => "app:test",
                    "message_id" => "accepted-before-stop",
@@ -497,13 +507,15 @@ defmodule AttentionServer.HostedAccountTest do
                })
 
       assert %{"type" => "error", "reason" => "inactive_account"} =
-               relay_request(relay, "alice-origin", %{
-                 "type" => "conversation_reply",
+               OriginWire.command(relay, "alice-origin", %{
+                 "v" => 1,
+                 "type" => "reply",
                  "op_id" => relay_op(206),
+                 "ref" => "stopped-reply",
                  "sender_id" => "app:test",
                  "message_id" => "accepted-before-stop",
                  "request_revision" => 1,
-                 "in_reply_to" => String.to_integer(discussion_event_id),
+                 "in_reply_to" => discussion_event_id,
                  "text" => "Refused reply"
                })
 
