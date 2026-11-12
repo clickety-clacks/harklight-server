@@ -1718,6 +1718,54 @@ defmodule AttentionServer.WebSocketRelayTest do
     :ssl.close(current)
   end
 
+  test "reconnecting while TLS close is stalled does not stall the shared relay", ctx do
+    %{certs: certs, web: web, relay: relay, keys: keys} = ctx
+    assert {:ok, old_socket} = connect(web, certs, "a1")
+    assert upgrade(old_socket) =~ "101 Switching Protocols"
+    assert {[], %{"seq" => 0}} = resync(old_socket)
+    [{old_session, session}] = Map.to_list(:sys.get_state(relay).sessions)
+
+    # Pause only this fixture's TLS connection process to make close block
+    # deterministically. The shared Relay must still fence this session and
+    # serve the replacement and another device while transport cleanup waits.
+    {:sslsocket, _, [peer | _]} = session.socket
+    :ok = :sys.suspend(peer)
+
+    try do
+      assert {:ok, replacement} = connect(web, certs, "a1")
+      assert upgrade(replacement) =~ "101 Switching Protocols"
+      assert :ok = send_request(replacement, %{"type" => "resync", "since" => 0})
+
+      other_device = Task.async(fn -> Relay.events(relay, keys["b1"], 0) end)
+
+      try do
+        assert {:ok, {:ok, [], 0}} = Task.yield(other_device, 1_000)
+        assert %{"type" => "ok"} = reply(replacement)
+        assert %{"type" => "resynced", "seq" => 0} = reply(replacement)
+        assert {:error, :unknown_session} = Relay.session_drain(relay, old_session)
+        :sys.resume(peer)
+        assert {:error, :closed} = :ssl.recv(old_socket, 0, 2_000)
+      after
+        try do
+          :sys.resume(peer)
+        catch
+          :exit, _ -> :ok
+        end
+
+        Task.shutdown(other_device, :brutal_kill)
+        :ssl.close(replacement)
+      end
+    after
+      try do
+        :sys.resume(peer)
+      catch
+        :exit, _ -> :ok
+      end
+
+      :ssl.close(old_socket)
+    end
+  end
+
   test "listener-only shutdown fences WebSocket workers before returning", ctx do
     %{certs: certs, web: web, relay: relay, keys: keys} = ctx
     assert {:ok, socket} = connect(web, certs, "a1")
