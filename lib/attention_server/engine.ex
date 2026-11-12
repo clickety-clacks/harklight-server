@@ -1734,6 +1734,31 @@ defmodule AttentionServer.Engine do
     end
   end
 
+  def owner_set_focus_permissions(
+        %__MODULE__{} = engine,
+        person,
+        owner_key,
+        device_key,
+        see_focus,
+        push_view
+      )
+      when is_boolean(see_focus) and is_boolean(push_view) do
+    with {:ok, _revision} <- owner_revision(engine, person, owner_key),
+         %{person: ^person, revoked: false} = device <- Map.get(engine.devices, device_key) do
+      updated =
+        device
+        |> Map.put(:see_focus, see_focus)
+        |> Map.put(:push_view, push_view)
+
+      {:ok, %{engine | devices: Map.put(engine.devices, device_key, updated)}}
+    else
+      {:error, :forbidden} -> {:error, :forbidden}
+      _ -> {:error, :not_found}
+    end
+  end
+
+  def owner_set_focus_permissions(_, _, _, _, _, _), do: {:error, :invalid_field}
+
   def owner_grant_sender(%__MODULE__{} = engine, person, owner_key, device_key, pattern) do
     with {:ok, _revision} <- owner_revision(engine, person, owner_key),
          %{person: ^person, revoked: false} <- Map.get(engine.devices, device_key),
@@ -1811,7 +1836,9 @@ defmodule AttentionServer.Engine do
                  revoked: false,
                  enrollment_revision: 1,
                  label: nil,
-                 enrolled_at: nil
+                 enrolled_at: nil,
+                 see_focus: false,
+                 push_view: false
                }),
              subscriptions:
                Map.put(engine.subscriptions, {person, key}, %{revision: 0, senders: MapSet.new()}),

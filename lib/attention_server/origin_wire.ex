@@ -67,6 +67,22 @@ defmodule AttentionServer.OriginWire do
   defp diagnostic_cause("invalid_upload"), do: :invalid_request
   defp diagnostic_cause(_), do: :unknown
 
+  defp run(relay, key, %{"type" => "focus_get"}, ref) do
+    case Relay.focus_get(relay, key) do
+      {:ok, result} -> ok(result, ref)
+      {:error, reason} -> error(Atom.to_string(reason), nil, ref)
+    end
+  end
+
+  defp run(relay, key, %{"type" => "view_show"} = request, ref) do
+    case Relay.view_show(relay, key, request) do
+      {:ok, result} -> ok(result, ref)
+      {:error, {:invalid_field, field}} -> error("invalid_field", field, ref)
+      {:error, {:not_found, field}} -> error("not_found", field, ref)
+      {:error, reason} -> error(Atom.to_string(reason), nil, ref)
+    end
+  end
+
   defp run(relay, key, %{"type" => "coverage"}, ref) do
     case Relay.origin_coverage(relay, key) do
       {:ok, handles} -> ok(%{"session_handles" => handles}, ref)

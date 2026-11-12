@@ -215,6 +215,27 @@ defmodule AttentionServer.DashboardReadHTTP do
   end
 
   defp route(
+         %{method: "POST", path_info: ["devices", "focus", device_key, permission]} = conn,
+         opts,
+         principal
+       )
+       when permission in ["see", "push"] do
+    with {:ok, fields, conn} <- form(conn, opts, {:one_of, [[], ~w(enabled)]}),
+         {:ok, _device} <- manageable_focus_device(opts, principal, device_key),
+         {:ok, permission} <- focus_permission(permission),
+         :ok <-
+           backend_call(
+             opts.backend,
+             :save_focus_permission,
+             {principal, device_key, permission, fields["enabled"] == "on"}
+           ) do
+      conn |> put_resp_header("location", "/devices") |> send_resp(303, "")
+    else
+      _ -> send_resp(conn, 409, "Device changed or unavailable; review it again")
+    end
+  end
+
+  defp route(
          %{method: "GET", path_info: ["devices", "remove", device_key]} = conn,
          opts,
          principal
@@ -538,6 +559,29 @@ defmodule AttentionServer.DashboardReadHTTP do
   end
 
   defp route(conn, _opts, _principal), do: send_resp(conn, 404, "Not found")
+
+  defp manageable_focus_device(opts, principal, device_key) do
+    if Regex.match?(~r/\A[0-9a-f]{64}\z/, device_key) do
+      case backend_call(opts.backend, :list_devices, principal) do
+        {:ok, %{devices: devices}} when is_list(devices) ->
+          case Enum.find(devices, fn device ->
+                 Map.get(device, :device_id) == device_key and
+                   Map.get(device, :can_manage_focus) == true
+               end) do
+            nil -> :error
+            device -> {:ok, device}
+          end
+
+        _ ->
+          :error
+      end
+    else
+      :error
+    end
+  end
+
+  defp focus_permission("see"), do: {:ok, :see}
+  defp focus_permission("push"), do: {:ok, :push}
 
   defp removable_device(opts, principal, device_key) do
     if Regex.match?(~r/\A[0-9a-f]{64}\z/, device_key) do

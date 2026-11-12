@@ -61,6 +61,51 @@ defmodule AttentionServer.AgentMigrationTest do
     assert :ok = Store.close(again)
   end
 
+  test "format-27 upgrade gives existing devices two disabled focus permissions" do
+    dir =
+      Path.join(
+        System.tmp_dir!(),
+        "attention-focus-migrate-#{System.unique_integer([:positive])}"
+      )
+
+    File.mkdir_p!(dir)
+    on_exit(fn -> File.rm_rf!(dir) end)
+    path = Path.join(dir, "relay.sqlite3")
+    {:ok, current} = Store.open(path)
+
+    key = String.duplicate("a", 64)
+    {:ok, engine} = Engine.setup_person(current.engine, "Owner")
+    {:ok, engine} = Engine.setup_device(engine, "Owner", key)
+
+    legacy_devices =
+      Map.new(engine.devices, fn {device_key, device} ->
+        {device_key, Map.drop(device, [:see_focus, :push_view])}
+      end)
+
+    legacy_engine = %{engine | devices: legacy_devices}
+    assert :ok = Store.close(current)
+
+    payload =
+      :erlang.term_to_binary({:attention_relay_state, 27, legacy_engine}, [{:compressed, 6}])
+
+    assert {:ok, db} = Sqlite3.open(path)
+    assert {:ok, stmt} = Sqlite3.prepare(db, "UPDATE relay_state SET payload = ?, checksum = ?")
+
+    assert :ok =
+             Sqlite3.bind(stmt, [
+               {:blob, payload},
+               {:blob, :crypto.hash(:sha256, payload)}
+             ])
+
+    assert :done = Sqlite3.step(db, stmt)
+    assert :ok = Sqlite3.release(db, stmt)
+    assert :ok = Sqlite3.close(db)
+
+    assert {:ok, migrated} = Store.open(path)
+    assert %{see_focus: false, push_view: false} = migrated.engine.devices[key]
+    assert :ok = Store.close(migrated)
+  end
+
   test "format-17 state migrates without losing an existing inbox startup" do
     dir =
       Path.join(

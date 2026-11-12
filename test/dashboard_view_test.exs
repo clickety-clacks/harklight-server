@@ -12,6 +12,54 @@ defmodule AttentionServer.DashboardViewTest do
     refute html =~ "Last seen"
   end
 
+  test "focus switches are separate, default off, and unavailable for another owner" do
+    owned_key = String.duplicate("a", 64)
+    other_key = String.duplicate("b", 64)
+
+    html =
+      DashboardView.devices(
+        "Owner",
+        [
+          %{
+            device_id: owned_key,
+            can_manage_focus: true,
+            see_focus: false,
+            push_view: false,
+            label: "Owned tablet",
+            person_name: "Owner",
+            revoked: false
+          },
+          %{
+            device_id: other_key,
+            can_manage_focus: false,
+            see_focus: false,
+            push_view: false,
+            label: "Other tablet",
+            person_name: "Other",
+            revoked: false
+          }
+        ],
+        []
+      )
+
+    assert html =~ "See what you're looking at"
+    assert html =~ "Open things on your screen"
+
+    [owned_row] = Regex.run(~r/<tr><td>Owned tablet<\/td>.*?<\/tr>/s, html)
+    assert owned_row =~ ~s(action="/devices/focus/#{owned_key}/see" method="post")
+    assert owned_row =~ ~s(action="/devices/focus/#{owned_key}/push" method="post")
+    refute owned_row =~ "checked"
+
+    assert length(Regex.scan(~r/<button class="button" type="submit">Save<\/button>/, owned_row)) ==
+             2
+
+    refute owned_row =~ "onchange="
+
+    refute html =~ ~s(action="/devices/focus/#{other_key}/see")
+    refute html =~ ~s(action="/devices/focus/#{other_key}/push")
+    assert html =~ ~s(<input type="checkbox" disabled aria-label="See what you're looking at">)
+  end
+
   test "revoked devices and pending requests stay distinct and untrusted labels are escaped" do
     html =
       DashboardView.devices(

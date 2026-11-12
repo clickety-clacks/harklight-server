@@ -31,6 +31,10 @@ defmodule AttentionServer.DashboardBackend do
               :can_revoke,
               device.person_name == person and not device.revoked
             )
+            |> Map.put(
+              :can_manage_focus,
+              device.person_name == person and not device.revoked
+            )
           end)
 
         waiting =
@@ -89,6 +93,16 @@ defmodule AttentionServer.DashboardBackend do
       do: Relay.dashboard_levels(relay, person, key)
 
   def levels(_, _), do: {:error, :forbidden}
+
+  def save_focus_permission(
+        %__MODULE__{relay: relay},
+        {%{person_id: person, owner_key: key}, device_key, permission, enabled}
+      )
+      when permission in [:see, :push] and is_boolean(enabled),
+      do:
+        Relay.save_dashboard_focus_permission(relay, person, key, device_key, permission, enabled)
+
+  def save_focus_permission(_, _), do: {:error, :forbidden}
 
   def save_levels(
         %__MODULE__{relay: relay},
