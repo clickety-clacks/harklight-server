@@ -659,7 +659,7 @@ defmodule AttentionServer.RouteBBoundedReplayTest do
 
     state_after = :sys.get_state(relay)
     assert state_after.store.engine == engine_before
-    assert state_after.sessions[session].sync_mode == nil
+    assert state_after.sessions[session].sync_mode == :legacy
     refute state_after.sessions[session].ready
     GenServer.stop(relay)
   end
