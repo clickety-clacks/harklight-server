@@ -7,16 +7,16 @@ Harklight iOS/iPadOS app.
 
 ## Install the server
 
-For the FORMAT27 v0.1.33 server package, use the release page below after it
+For the FORMAT27 v0.1.35 server package, use the release page below after it
 is published to download the Linux x86_64 archive, `SHA256SUMS` and
 `SELF_HOST.md`. Verify the checksum before extraction:
 
-[v0.1.33 release](https://github.com/clickety-clacks/harklight-server/releases/tag/v0.1.33)
+[v0.1.35 release](https://github.com/clickety-clacks/harklight-server/releases/tag/v0.1.35)
 (available only after publication).
 
 ```sh
 sha256sum -c SHA256SUMS
-tar -xzf harklight-server-0.1.33-linux-x86_64.tar.gz
+tar -xzf harklight-server-0.1.35-linux-x86_64.tar.gz
 ```
 
 Follow [SELF_HOST.md](SELF_HOST.md) for a fresh installation, tailnet routing,
@@ -28,10 +28,11 @@ The package does not install a service, configure the tailnet or expose ports.
 State, owner/device identities, trust roots and sender grants live outside the
 versioned package. Run one server per database. Keep private keys and backups
 private; do not repeat bootstrap over an existing installation.
-This source, v0.1.33, writes FORMAT27. Its first start durably migrates
-supported FORMAT25 state, written by v0.1.28, to FORMAT27. The v0.1.28 package
-cannot read that resulting state. The v0.1.27 and v0.1.26 packages use
-FORMAT24 and cannot read FORMAT25 state written by v0.1.28. The v0.1.25
+This source, v0.1.35, writes FORMAT27 and introduces no schema or store-format
+migration over published v0.1.33. It retains v0.1.33's startup support for
+migrating supported FORMAT25 state, written by v0.1.28, to FORMAT27. The
+v0.1.28 package cannot read that resulting state. The v0.1.27 and v0.1.26
+packages use FORMAT24 and cannot read FORMAT25 state written by v0.1.28. The v0.1.25
 package, the v0.1.24 repair line, v0.1.23, v0.1.22, v0.1.21, v0.1.20,
 v0.1.19, v0.1.18, v0.1.17, v0.1.16, v0.1.15, v0.1.14 and v0.1.13 also use
 FORMAT24 and migrate supported older state on startup.
@@ -45,13 +46,20 @@ can fail and leave the service stopped. Restoring the snapshot discards every
 write made after capture. Restore success for this release is unproved and has
 not been tested.
 
-Before the first v0.1.33 start, stop the server and take a complete private-state
-backup. After any v0.1.33 write, returning to v0.1.28 requires stopping the
+Before the first v0.1.35 start, stop the server and take a complete
+private-state backup. After any v0.1.35 write, returning to v0.1.28 requires stopping the
 server, restoring that pre-start backup and then running v0.1.28; changing only
-the selected code or release link cannot make FORMAT27 readable. This restore
-loses every write made since the backup and cannot undo external notifications,
+the selected code or release link cannot make FORMAT27 readable. Published
+v0.1.33 uses the same FORMAT27 store format, so reverting this relay-close repair
+to v0.1.33 requires no data migration rollback. This restore loses every write
+made since the backup and cannot undo external notifications,
 bounces or agent deliveries. Restore success is unproved and has not been
 tested; no recovery success is guaranteed.
+
+v0.1.35 fixes a shared Relay stall during TLS session cleanup. The Relay still
+removes and fences the session in its serialized call; physical socket closure
+runs outside the shared Relay loop. The repair adds no schema, store-format,
+wire, authorization or grant change and retains FORMAT27.
 
 v0.1.32 adds a side-effect-free origin-message read by sender ID and message ID.
 With Agent 0.1.9 or newer, `harklight-agent message-get` reads the latest

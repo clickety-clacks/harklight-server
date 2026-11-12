@@ -1,3 +1,29 @@
+# Harklight Server v0.1.35
+
+## Changes
+
+- Fixes a shared Relay stall when a dropped TLS session is closed. Session
+  removal and fencing remain serialized; physical socket closure no longer
+  blocks other devices' Relay work.
+- Retains the FORMAT27 store format from v0.1.33. This repair adds no database
+  schema/store-format migration, wire change, authorization change or grant
+  change.
+
+## Upgrade and recovery
+
+Before upgrading, stop the server and take a complete private-state backup.
+The installer stops the service, creates a full mutable-root backup, switches
+the release selector and starts the candidate. The installer restore path has
+not been exercised; stop, restore, selector switching or prior-release startup
+can fail and leave the service stopped. Restoring loses writes made after the
+backup and cannot undo external effects. Published v0.1.33 uses the same
+FORMAT27 store format, so reverting this repair to .33 requires no data
+migration rollback. Returning to .1.28 or earlier still requires restoring a
+compatible pre-upgrade backup; .28 cannot read FORMAT27. No installation or
+recovery result is claimed by these package notes.
+
+---
+
 # Harklight Server v0.1.33
 
 ## Changes
