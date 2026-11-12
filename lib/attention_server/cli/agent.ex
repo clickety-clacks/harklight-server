@@ -7,7 +7,11 @@ defmodule AttentionServer.CLI.Agent do
       mix attention.agent keygen --directory ./agent
       mix attention.agent search --directory ./agent --connect 127.0.0.1 --name relay.test --port 8446 --ca ca.pem --sender app:one
       mix attention.agent get --directory ./agent --connect 127.0.0.1 --name relay.test --port 8446 --ca ca.pem --sender app:one --message ITEM
-      mix attention.agent respond --directory ./agent --connect 127.0.0.1 --name relay.test --port 8446 --ca ca.pem --sender app:one --message ITEM --acceptance SEQ --op UUID --intent-ref REF --answer-file answer.json
+      mix attention.agent respond --directory ./agent --connect 127.0.0.1 --name relay.test --port 8446 --ca ca.pem --sender app:one --message ITEM --acceptance SEQ --request-revision REVISION --op UUID --intent-ref REF --answer-file answer.json
+
+  Use acceptance_seq and request_revision from the same get/search item for
+  SEQ and REVISION. The acceptance sequence stays unchanged after a revision;
+  request_revision identifies the content being answered.
 
   The owner must first register the generated public certificate fingerprint
   and assign explicit read/respond scopes with `mix attention.owner`. A retry
@@ -50,6 +54,7 @@ defmodule AttentionServer.CLI.Agent do
           limit: :integer,
           cursor: :string,
           acceptance: :integer,
+          request_revision: :integer,
           op: :string,
           intent_ref: :string,
           answer_file: :string
@@ -119,6 +124,11 @@ defmodule AttentionServer.CLI.Agent do
              acceptance > 0,
            do: AttentionServer.CLI.error!("invalid exact answer target or operation ID")
 
+    revision = Keyword.get(opts, :request_revision)
+
+    if revision != nil and not (is_integer(revision) and revision > 0),
+      do: AttentionServer.CLI.error!("--request-revision must be a positive integer")
+
     answer =
       with {:ok, raw} <- File.read(answer_file),
            {:ok, value} <- JSON.decode_line(String.trim_trailing(raw, "\n") <> "\n") do
@@ -128,7 +138,7 @@ defmodule AttentionServer.CLI.Agent do
       end
 
     AttentionServer.CLI.shell().info(
-      "Answer target #{visible(sender)} / #{visible(message)}, acceptance #{acceptance}, operation #{op}, intent #{visible(intent)}"
+      "Answer target #{visible(sender)} / #{visible(message)}, acceptance #{acceptance}, revision #{revision || 1}, operation #{op}, intent #{visible(intent)}"
     )
 
     if String.trim(
@@ -148,6 +158,7 @@ defmodule AttentionServer.CLI.Agent do
       "deliberate" => true,
       "answer" => answer
     }
+    |> optional(opts, :request_revision, "request_revision")
   end
 
   defp request!("respond", opts), do: request!("answer", opts)

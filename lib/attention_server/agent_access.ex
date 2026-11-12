@@ -243,6 +243,7 @@ defmodule AttentionServer.AgentAccess do
       "sender_id" => message["sender_id"],
       "message_id" => message["message_id"],
       "acceptance_seq" => record.accepted_seq,
+      "request_revision" => Map.get(record, :revision, 1),
       "observation_high_water" => observed,
       "message" => message,
       "state" => if(record.terminal, do: record.terminal.state, else: "open")

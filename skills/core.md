@@ -421,14 +421,17 @@ With connection details and the registered identity supplied for this purpose:
 
 Search also accepts `--state`, `--limit` and its returned `--cursor`. Get returns
 the exact message visible under current read scope. To answer an open message,
-use the acceptance sequence returned by get, a caller-held UUIDv4 operation ID,
-an intent reference meaningful to the task and a file containing one JSON value:
+use `acceptance_seq` and `request_revision` from the same get/search item, a
+caller-held UUIDv4 operation ID, an intent reference meaningful to the task and
+a file containing one JSON value. The acceptance sequence stays unchanged after
+a revision; `request_revision` identifies the content being answered. Set
+`ACCEPTANCE_SEQ` and `REQUEST_REVISION` from those returned fields:
 
 ```sh
 "$HARKLIGHT_SERVER_CLI" agent respond --directory "$AGENT_DIR" \
   --connect "$SERVER_ADDRESS" --name "$SERVER_NAME" --port "$AGENT_PORT" \
   --ca "$CA_PEM" --sender app:example --message request-1 \
-  --acceptance "$ACCEPTANCE_SEQ" --op "$OP_ID" --intent-ref "$INTENT_REF" \
+  --acceptance "$ACCEPTANCE_SEQ" --request-revision "$REQUEST_REVISION" --op "$OP_ID" --intent-ref "$INTENT_REF" \
   --answer-file answer.json
 ```
 

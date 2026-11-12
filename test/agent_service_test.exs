@@ -792,6 +792,92 @@ defmodule AttentionServer.AgentServiceTest do
                  "message_id" => hostile_id
                }
              )
+
+    # Both a text reply and Seen (JSON null) must target the revision read by
+    # the agent, while acceptance_seq continues to identify the original message.
+    for {id, value} <- [{"revised-reply", "Confirmed"}, {"revised-seen", nil}] do
+      message = %{
+        "sender_id" => "app:ops/questions",
+        "message_id" => id,
+        "created_at" => 1,
+        "title" => "Original"
+      }
+
+      assert %{"type" => "ok", "seq" => acceptance} =
+               device_request(relay, device_key, %{
+                 "v" => 1,
+                 "type" => "forward",
+                 "op_id" => unique_op(),
+                 "session_handle" => @handle,
+                 "message" => message
+               })
+
+      assert %{"type" => "ok", "revision" => 2} =
+               device_request(relay, device_key, %{
+                 "v" => 1,
+                 "type" => "conversation_revise",
+                 "op_id" => unique_op(),
+                 "sender_id" => message["sender_id"],
+                 "message_id" => id,
+                 "base_revision" => 1,
+                 "message" => %{message | "title" => "Revised"}
+               })
+
+      https = endpoint(certs, AgentHTTPS.port(agent_https))
+      get = %{"type" => "get", "sender_id" => message["sender_id"], "message_id" => id}
+      assert {:ok, %{"item" => item}} = HeadlessAgent.request(directory, https, get)
+      assert item["acceptance_seq"] == acceptance
+      assert item["message"]["title"] == "Revised"
+      assert item["request_revision"] == 2
+
+      assert {:ok, %{"items" => [^item]}} =
+               HeadlessAgent.request(directory, https, %{get | "type" => "search"})
+
+      response =
+        answer(message["sender_id"], id, acceptance, unique_op(), value)
+        |> Map.put("type", "respond")
+
+      for revision <- [nil, 1] do
+        stale = if revision, do: Map.put(response, "request_revision", revision), else: response
+
+        assert {:error, {:application, "stale_revision", _}} =
+                 HeadlessAgent.request(directory, https, stale)
+      end
+
+      assert {:error, {:application, "stale_target", _}} =
+               HeadlessAgent.request(
+                 directory,
+                 https,
+                 response
+                 |> Map.put("acceptance_seq", acceptance + 1000)
+                 |> Map.put("request_revision", item["request_revision"])
+               )
+
+      File.write!(answer_file, JSON.encode!(value) <> "\n")
+
+      revised_args =
+        Enum.map(answer_args, fn
+          ^hostile_id -> id
+          @op1 -> unique_op()
+          other -> other
+        end)
+
+      # Replace only the acceptance argument, not unrelated numeric options.
+      index = Enum.find_index(revised_args, &(&1 == "--acceptance")) + 1
+
+      revised_args =
+        List.replace_at(revised_args, index, Integer.to_string(item["acceptance_seq"])) ++
+          ["--request-revision", Integer.to_string(item["request_revision"])]
+
+      send(self(), {:mix_shell_input, :prompt, "ANSWER"})
+      assert :ok = Mix.Tasks.Attention.Agent.run(revised_args)
+      send(self(), {:mix_shell_input, :prompt, "ANSWER"})
+      assert :ok = Mix.Tasks.Attention.Agent.run(revised_args)
+
+      assert {:ok,
+              %{"item" => %{"state" => "answered", "answer" => ^value, "request_revision" => 2}}} =
+               HeadlessAgent.request(directory, https, get)
+    end
   end
 
   test "literal content search visits JSON string values but not nested decimal or integer tokens",
