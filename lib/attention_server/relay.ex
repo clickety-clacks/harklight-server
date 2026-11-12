@@ -5570,7 +5570,10 @@ defmodule AttentionServer.Relay do
 
       {session, sessions} ->
         if session.owner, do: send(session.owner, {:attention_fenced, id})
-        if session.socket, do: :ssl.close(session.socket)
+
+        # Removing the session fences all serialized requests and writes.
+        # TLS close can wait on the peer; keep that wait out of the shared Relay.
+        if session.socket, do: spawn(fn -> :ssl.close(session.socket) end)
         %{state | sessions: sessions}
     end
   end
