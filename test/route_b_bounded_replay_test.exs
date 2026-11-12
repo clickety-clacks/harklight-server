@@ -1,9 +1,25 @@
 defmodule AttentionServer.RouteBBoundedReplayTest do
   use ExUnit.Case, async: false
 
-  alias AttentionServer.{Engine, JSON, Relay}
+  alias AttentionServer.{Engine, JSON, Relay, TLSFixtures}
 
   @handle "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+  @availability_fields ~w(availability last_detached_at listening_support unsupported_reason)
+  @terminal_fields ~w(
+    v type seq sender_id message_id origin state at terminal_reason retracted_at terminal_kind
+    author by answer_outcome answer
+  )
+  @route_a_row_fields ~w(
+    sender_id message_id origin accepted_seq request_revision message files as session_handle
+    terminal origin_result availability chat_started chat_read_position latest_origin_reply_seq
+    conversation_seq
+  )
+
+  setup_all do
+    certs = TLSFixtures.create!()
+    on_exit(fn -> File.rm_rf!(certs) end)
+    %{certs: certs}
+  end
 
   setup do
     dir =
@@ -244,6 +260,231 @@ defmodule AttentionServer.RouteBBoundedReplayTest do
              })
   end
 
+  defp route_a_reduced_rows(relay, reader_key) do
+    assert {:ok, session} = Relay.open_session(relay, reader_key)
+
+    feed_frames = session_request(relay, session, %{"type" => "resync", "since" => 0})
+    assert hd(feed_frames)["type"] == "ok"
+    assert List.last(feed_frames)["type"] == "resynced"
+
+    assert [%{"type" => "ok", "entries" => view_entries}] =
+             session_request(relay, session, %{"type" => "view_get", "ref" => "route-a-view"})
+
+    conversation_frames =
+      session_request(relay, session, %{"type" => "conversation_open", "since" => 0})
+
+    assert hd(conversation_frames)["type"] == "ok"
+    assert List.last(conversation_frames)["type"] == "conversation_resynced"
+
+    rows =
+      feed_frames
+      |> Enum.reduce(%{}, &reduce_route_a_feed_frame/2)
+      |> then(fn rows ->
+        Enum.reduce(conversation_frames, rows, &reduce_route_a_conversation_frame/2)
+      end)
+
+    view_by_identity =
+      Map.new(view_entries, fn entry ->
+        {{entry["sender_id"], entry["message_id"]}, Map.take(entry, ~w(score due_at))}
+      end)
+
+    rows =
+      Map.new(rows, fn {identity, row} ->
+        case Map.fetch(view_by_identity, identity) do
+          {:ok, entry} -> {identity, Map.put(row, "priority_view", entry)}
+          :error -> {identity, row}
+        end
+      end)
+
+    engine = :sys.get_state(relay).store.engine
+    {rows, view_by_identity, engine}
+  end
+
+  defp reduce_route_a_feed_frame(%{"type" => "delivery"} = frame, rows) do
+    identity = {frame["sender_id"], frame["message_id"]}
+
+    row = %{
+      "sender_id" => frame["sender_id"],
+      "message_id" => frame["message_id"],
+      "origin" => frame["origin"],
+      "accepted_seq" => frame["seq"],
+      "request_revision" => Map.get(frame, "request_revision", 1),
+      "message" => frame["message"],
+      "files" => Map.get(frame, "files", []),
+      "terminal" => nil,
+      "chat_started" => false,
+      "chat_read_position" => 0,
+      "latest_origin_reply_seq" => nil,
+      "conversation_seq" => 0
+    }
+
+    row =
+      Enum.reduce(~w(as session_handle), row, fn field, current ->
+        if Map.has_key?(frame, field), do: Map.put(current, field, frame[field]), else: current
+      end)
+
+    row =
+      if is_binary(frame["session_handle"]),
+        do: Map.put(row, "availability", Map.take(frame, @availability_fields)),
+        else: row
+
+    Map.put(rows, identity, row)
+  end
+
+  defp reduce_route_a_feed_frame(%{"type" => "lifecycle"} = frame, rows) do
+    identity = {frame["sender_id"], frame["message_id"]}
+    row = Map.fetch!(rows, identity)
+    Map.put(rows, identity, Map.put(row, "terminal", Map.take(frame, @terminal_fields)))
+  end
+
+  defp reduce_route_a_feed_frame(_frame, rows), do: rows
+
+  defp reduce_route_a_conversation_frame(%{"type" => "conversation"} = frame, rows) do
+    identity = {frame["sender_id"], frame["message_id"]}
+    row = Map.fetch!(rows, identity)
+
+    row =
+      case frame["kind"] do
+        "revision" ->
+          row
+          |> Map.put("request_revision", frame["request_revision"])
+          |> Map.put("message", frame["message"])
+          |> Map.put("files", Map.get(frame, "files", []))
+
+        "availability" ->
+          Map.put(row, "availability", Map.take(frame, @availability_fields))
+
+        "read_position" ->
+          Map.put(row, "chat_read_position", frame["read_through_conversation_seq"])
+
+        _ ->
+          row
+      end
+
+    row =
+      if frame["kind"] in ["discussion", "reply"],
+        do: Map.put(row, "chat_started", true),
+        else: row
+
+    row =
+      if frame["kind"] == "reply" and frame["author"] == "origin",
+        do: Map.put(row, "latest_origin_reply_seq", frame["conversation_seq"]),
+        else: row
+
+    row =
+      Map.put(
+        row,
+        "conversation_seq",
+        max(row["conversation_seq"], frame["conversation_seq"])
+      )
+
+    Map.put(rows, identity, row)
+  end
+
+  defp reduce_route_a_conversation_frame(_frame, rows), do: rows
+
+  defp assert_route_b_row_matches_route_a(row, legacy, view_by_identity, engine, person) do
+    identity = {row["sender_id"], row["message_id"]}
+    assert Map.take(row, @route_a_row_fields) == Map.take(legacy, @route_a_row_fields)
+
+    record = Map.fetch!(engine.messages, {person, elem(identity, 0), elem(identity, 1)})
+
+    opened =
+      Enum.any?(engine.opened_revisions, fn
+        {^person, sender, id, _revision} -> {sender, id} == identity
+        _ -> false
+      end)
+
+    assert row["opened"] == opened
+
+    case Map.fetch(view_by_identity, identity) do
+      {:ok, view_entry} -> assert row["priority_view"] == view_entry
+      :error -> refute Map.has_key?(row, "priority_view")
+    end
+
+    assert record.revision == row["request_revision"]
+  end
+
+  test "operator-created person has an empty first Route B inbox", %{certs: certs, path: path} do
+    assert {:ok, relay} = Relay.start_link(store_path: path)
+    owner_certificate = TLSFixtures.certificate_der!(certs, "a1")
+    assert {:ok, person} = Relay.operator_bootstrap(relay, owner_certificate)
+
+    # This checks the real person-creation path before the test device setup
+    # seam can initialize the view on its behalf.
+    assert Map.has_key?(:sys.get_state(relay).priority_views, person)
+    assert :ok = Relay.setup_device(relay, person, "first-device")
+    assert {:ok, session} = Relay.open_session(relay, "first-device")
+
+    before = :sys.get_state(relay)
+
+    assert [%{"type" => "ok", "rows" => [], "unresolved_count" => 0, "view_rev" => view_rev}] =
+             session_request(relay, session, %{"type" => "inbox_list"})
+
+    after_request = :sys.get_state(relay)
+    assert after_request.store.engine == before.store.engine
+    assert after_request.priority_views[person].view_rev == view_rev
+    assert after_request.sessions[session] == before.sessions[session]
+    GenServer.stop(relay)
+  end
+
+  test "bounded subscription reports view-only changes and preserves an unchanged revision",
+       %{path: path} do
+    assert {:ok, relay} = Relay.start_link(store_path: path)
+    setup_people(relay)
+    create_message(relay, "first", 2)
+    create_message(relay, "second", 3)
+    assert {:ok, session} = Relay.open_session(relay, "reader")
+
+    assert [
+             %{
+               "type" => "ok",
+               "seq" => listed_seq,
+               "conversation_seq" => listed_conversation_seq,
+               "view_rev" => listed_view_rev
+             }
+           ] =
+             session_request(relay, session, %{"type" => "inbox_list", "limit" => 20})
+
+    create_message(relay, "new-top-item", 4)
+    after_arrival = :sys.get_state(relay)
+    assert Map.get(after_arrival.store.engine.conversation_highs, "A", 0) ==
+             listed_conversation_seq
+    refute after_arrival.priority_views["A"].view_rev == listed_view_rev
+
+    resync_frames =
+      session_request(relay, session, %{"type" => "resync", "since" => listed_seq})
+
+    assert hd(resync_frames)["type"] == "ok"
+    assert List.last(resync_frames)["type"] == "resynced"
+    delivery_frames = Enum.slice(resync_frames, 1, length(resync_frames) - 2)
+
+    assert Enum.any?(delivery_frames, &(&1["type"] == "delivery"))
+
+    assert [open_ok, conversation_resynced] =
+             session_request(relay, session, %{
+               "type" => "conversation_open",
+               "since" => listed_conversation_seq,
+               "bounded" => true
+             })
+
+    assert open_ok["type"] == "ok"
+    assert conversation_resynced["type"] == "conversation_resynced"
+    assert conversation_resynced["view_rev"] != listed_view_rev
+
+    assert [repeat_ok, unchanged] =
+             session_request(relay, session, %{
+               "type" => "conversation_open",
+               "since" => listed_conversation_seq,
+               "bounded" => true
+             })
+
+    assert repeat_ok["type"] == "ok"
+    assert unchanged["type"] == "conversation_resynced"
+    assert unchanged["view_rev"] == conversation_resynced["view_rev"]
+    GenServer.stop(relay)
+  end
+
   test "inbox_list pages current server order without changing sync or cursors", %{path: path} do
     assert {:ok, relay} = Relay.start_link(store_path: path)
     setup_people(relay)
@@ -404,6 +645,15 @@ defmodule AttentionServer.RouteBBoundedReplayTest do
           create_message(relay, message_id, operation)
         end
 
+        assert %{"type" => "ok", "opened" => true} =
+                 request(relay, "reader", %{
+                   "type" => "message_open",
+                   "op_id" => op(32),
+                   "sender_id" => "app:test",
+                   "message_id" => "current-1",
+                   "request_revision" => 1
+                 })
+
         old_keys = Enum.map(old_ids, &{"A", "app:test", &1})
         visible_key = {"A", "app:test", "visible-chat"}
         seed_synthetic_history(relay, history_frames, old_keys, visible_key)
@@ -500,6 +750,40 @@ defmodule AttentionServer.RouteBBoundedReplayTest do
                  "ok",
                  "conversation_resynced"
                ]
+
+        assert [%{"type" => "ok", "rows" => all_rows}] =
+                 session_request(relay, reconnect_session, %{
+                   "type" => "inbox_list",
+                   "limit" => 100
+                 })
+
+        assert length(all_rows) == 25
+
+        {legacy_rows, legacy_view_by_identity, legacy_engine} =
+          route_a_reduced_rows(relay, "reader")
+
+        assert MapSet.new(Map.keys(legacy_rows)) ==
+                 MapSet.new(Enum.map(all_rows, &{&1["sender_id"], &1["message_id"]}))
+
+        for row <- all_rows do
+          legacy = Map.fetch!(legacy_rows, {row["sender_id"], row["message_id"]})
+
+          assert_route_b_row_matches_route_a(
+            row,
+            legacy,
+            legacy_view_by_identity,
+            legacy_engine,
+            "A"
+          )
+        end
+
+        assert_route_b_row_matches_route_a(
+          page_reply["row"],
+          Map.fetch!(legacy_rows, {"app:test", "visible-chat"}),
+          legacy_view_by_identity,
+          legacy_engine,
+          "A"
+        )
 
         metric = %{
           "history_frames" => history_frames,

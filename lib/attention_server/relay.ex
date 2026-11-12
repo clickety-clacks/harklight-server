@@ -1781,7 +1781,9 @@ defmodule AttentionServer.Relay do
                actor: "hosted_component",
                action: "hosted_account_create"
              }) do
-          {:ok, store} -> {:reply, {:ok, record.person}, %{state | store: store}}
+          {:ok, store} ->
+            next_state = ensure_priority_view_if_missing(%{state | store: store}, record.person)
+            {:reply, {:ok, record.person}, next_state}
           _ -> {:reply, {:error, :storage_unavailable}, state}
         end
       end
@@ -2231,7 +2233,9 @@ defmodule AttentionServer.Relay do
                    actor: key,
                    action: "owner_device_approve"
                  }) do
-              {:ok, store} -> {:reply, {:ok, device_key}, %{fenced | store: store}}
+              {:ok, store} ->
+                next_state = ensure_priority_view_if_missing(%{fenced | store: store}, person)
+                {:reply, {:ok, device_key}, next_state}
               {:error, _, _} -> {:reply, {:error, :storage_unavailable}, fenced}
             end
 
@@ -2366,7 +2370,9 @@ defmodule AttentionServer.Relay do
                actor: "local_operator",
                action: "owner_bootstrap"
              }) do
-          {:ok, store} -> {:reply, {:ok, person}, %{state | store: store}}
+          {:ok, store} ->
+            next_state = ensure_priority_view_if_missing(%{state | store: store}, person)
+            {:reply, {:ok, person}, next_state}
           {:error, _, _} -> {:reply, {:error, :storage_unavailable}, state}
         end
 
@@ -4380,6 +4386,12 @@ defmodule AttentionServer.Relay do
     put_priority_view(state, person, view, reply_summary)
   end
 
+  defp ensure_priority_view_if_missing(state, person) do
+    if Map.has_key?(state.priority_views, person),
+      do: state,
+      else: ensure_priority_view(state, person)
+  end
+
   defp fallback_view(items),
     do: %{
       algorithm: "jev-set",
@@ -5399,7 +5411,7 @@ defmodule AttentionServer.Relay do
     case commit(state.store, next_engine, %{person: person, actor: actor, action: action}) do
       {:ok, store} ->
         state = %{state | store: store}
-        state = if Map.has_key?(state.priority_views, person), do: state, else: ensure_priority_view(state, person)
+        state = ensure_priority_view_if_missing(state, person)
         {:reply, :ok, state}
 
       {:error, _, _} -> {:reply, {:error, :storage_unavailable}, state}
