@@ -81,7 +81,7 @@ defmodule AttentionServer.DashboardView do
         cli_section <>
         skill_section <>
         skill_section_saas <>
-        ~s(<section><h2>Shared conversation core</h2><p>Included in both agent skills.</p><p><a href="/agent-skills/core.md">Read shared core</a></p></section>) <>
+        ~s(<section><h2>Shared conversation core</h2><p>The self-hosted agent skill includes this core; the hosted guide is complete on its own.</p><p><a href="/agent-skills/core.md">Read shared core</a></p></section>) <>
         ~s(<script src="/components.js" defer></script>)
 
     layout(person_name, "Components", body, chrome)
@@ -102,14 +102,14 @@ defmodule AttentionServer.DashboardView do
       download =
         "data:application/x-pem-file;base64," <> Base.encode64(pem)
 
-      ~s(<section><h2>Hosted Agent enrollment</h2><p>The 2026-11-10 enrollment result used verified TLS for <code>app.harklight.net</code> at <code>app.harklight.net:18444</code>. This dated result does not confirm current service settings.</p><p><a href="#{escape(download)}" download="harklight-agent-ca.pem">Download the public CA certificate</a> and save it as <code>harklight-agent-ca.pem</code> beside the commands below. This link downloads the PEM file directly; do not decode a data URI.</p><ol><li>Run <code>enroll start</code> with a new private identity directory and the downloaded CA file. The Agent creates its device identity locally and displays an approval code.</li><li>In the owner dashboard, open <a href="/devices">Devices</a>, select the waiting device with the matching code, and approve it. To grant the designated test sender, enter <code>app:r18-enroll-test</code> in Sender IDs. Enrollment alone grants no sender access.</li><li>Run <code>enroll status</code> once with the same identity directory and CA file to confirm approval.</li></ol><pre><code>harklight-agent --identity-dir ./harklight-agent-identity \
+      ~s(<section><h2>Hosted Agent enrollment</h2><p>Use the Harklight Agent CLI to connect an agent to your hosted account. Each agent should have its own identity directory and an exact sender ID.</p><p><a href="#{escape(download)}" download="harklight-agent-ca.pem">Download the public CA certificate</a> and save it as <code>harklight-agent-ca.pem</code> beside the commands below. This link downloads the PEM file directly; do not decode a data URI.</p><ol><li>Run <code>enroll start</code> with a new private identity directory and the downloaded CA file. The Agent creates its device identity locally and displays an approval code.</li><li>In the owner dashboard, open <a href="/devices">Devices</a>, select the waiting device with the matching code, and approve it. To grant this agent sender access, enter <code>app:my-agent</code> in Sender IDs. Enrollment alone grants no sender access.</li><li>Run <code>enroll status</code> once with the same identity directory and CA file to confirm approval.</li></ol><pre><code>harklight-agent --identity-dir ./harklight-agent-identity \
   --ca-file ./harklight-agent-ca.pem \
   enroll start --connect app.harklight.net --name app.harklight.net \
   --port 18444 --label "Work laptop" --origin-port 18450
 
 harklight-agent --identity-dir ./harklight-agent-identity \
   --ca-file ./harklight-agent-ca.pem \
-  enroll status --connect app.harklight.net --name app.harklight.net --port 18444</code></pre><p>Relay port <code>18443</code> was only recorded and was not exercised in that enrollment. Origin port <code>18450</code> was written to <code>server.json</code>, but no Origin connection or message send was exercised. Use of the granted sender beyond enrollment is unproved.</p></section>)
+  enroll status --connect app.harklight.net --name app.harklight.net --port 18444</code></pre><p>Port <code>18444</code> is used for enrollment; port <code>18450</code> is used for origin messaging.</p></section>)
     else
       _ ->
         ~s(<section><h2>Hosted Agent connection</h2><p class="status">Not available yet</p></section>)
