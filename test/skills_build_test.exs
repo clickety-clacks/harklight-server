@@ -1,7 +1,7 @@
 defmodule AttentionServer.SkillsBuildTest do
   use ExUnit.Case, async: true
 
-  test "the package assembles two self-contained skills and one shared core" do
+  test "the package preserves the reviewed hosted guide independently of the shared core" do
     root = Path.expand("..", __DIR__)
 
     scratch =
@@ -31,12 +31,30 @@ defmodule AttentionServer.SkillsBuildTest do
 
       assert File.read!(Path.join(output, "core.md")) == core
 
-      for skill <- ["harklight-agent", "harklight-agent-saas"] do
-        assembled = File.read!(Path.join(output, "#{skill}/SKILL.md"))
-        assert String.starts_with?(assembled, "---\nname: #{skill}\n")
-        assert String.ends_with?(assembled, core)
-        assert length(:binary.matches(assembled, core)) == 1
-      end
+      assembled = File.read!(Path.join(output, "harklight-agent/SKILL.md"))
+      assert String.starts_with?(assembled, "---\nname: harklight-agent\n")
+      assert String.ends_with?(assembled, core)
+      assert length(:binary.matches(assembled, core)) == 1
+
+      hosted = File.read!(Path.join(output, "harklight-agent-saas/SKILL.md"))
+      assert Base.encode16(:crypto.hash(:sha256, hosted), case: :lower) ==
+               "b0fd1c441198b3b302e680693c15781d9eebd3c636b236e782cd98c25decd5f9"
+
+      opts =
+        AttentionServer.DashboardReadHTTP.init(
+          backend: __MODULE__,
+          skill_path: Path.join(output, "harklight-agent/SKILL.md")
+        )
+
+      response =
+        Plug.Test.conn(:get, "/agent-skills/harklight-agent-saas/SKILL.md")
+        |> Map.put(:scheme, :https)
+        |> AttentionServer.DashboardReadHTTP.call(opts)
+
+      assert response.status == 200
+      assert response.resp_body == hosted
+      assert Plug.Conn.get_resp_header(response, "content-type") ==
+               ["text/plain; charset=utf-8"]
     end
   end
 end
