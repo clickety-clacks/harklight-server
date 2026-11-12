@@ -209,6 +209,29 @@ defmodule AttentionServer.OriginHTTPSTest do
     :ok = Relay.close_session(c.relay, session)
   end
 
+  test "owner revocation closes every open focus stream for that agent", c do
+    {:ok, owner_key} =
+      DeviceIdentity.from_certificate(TLSFixtures.certificate_der!(c.certs, "a1"))
+
+    :ok =
+      Relay.save_dashboard_focus_permission(c.relay, c.person, owner_key, c.reader, :see, true)
+
+    assert {:ok, first, _event} = focus_stream_request(c, "reader")
+    assert {:ok, second, _event} = focus_stream_request(c, "reader")
+
+    on_exit(fn ->
+      :ssl.close(first)
+      :ssl.close(second)
+    end)
+
+    :ok = Relay.owner_revoke_device(c.relay, c.person, owner_key, c.reader)
+
+    assert {:error, :closed} = :ssl.recv(first, 0, 5_000)
+    assert {:error, :closed} = :ssl.recv(second, 0, 5_000)
+
+    assert {:error, :forbidden} = Relay.focus_get(c.relay, c.reader)
+  end
+
   test "view_show is account-scoped, selects by device name, and delivers only the latest held show",
        c do
     {:ok, owner_key} =

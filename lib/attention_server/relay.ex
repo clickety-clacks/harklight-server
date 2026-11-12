@@ -588,8 +588,10 @@ defmodule AttentionServer.Relay do
               origin_streams: %{},
               origin_streams_by_identity: %{},
               focus_clients: %{},
+              focus_clients_by_person: %{},
               held_shows: %{},
               focus_streams: %{},
+              focus_streams_by_person: %{},
               focus_expiry_timers: %{},
               focus_expiry_generations: %{},
               tls_listeners: %{},
@@ -1570,7 +1572,7 @@ defmodule AttentionServer.Relay do
       {:ok, person} ->
         monitor = Process.monitor(worker)
         stream = %{key: key, person: person, monitor: monitor}
-        next = %{state | focus_streams: Map.put(state.focus_streams, worker, stream)}
+        next = put_focus_stream(state, worker, stream)
         {:reply, {:ok, focus_list(next, person)}, next}
 
       error ->
@@ -1582,7 +1584,7 @@ defmodule AttentionServer.Relay do
     case Map.get(state.focus_streams, worker) do
       %{key: ^key, monitor: monitor} ->
         Process.demonitor(monitor, [:flush])
-        {:reply, :ok, %{state | focus_streams: Map.delete(state.focus_streams, worker)}}
+        {:reply, :ok, delete_focus_stream(state, worker)}
 
       _ ->
         {:reply, :ok, state}
@@ -2242,8 +2244,12 @@ defmodule AttentionServer.Relay do
                actor: key,
                action: "device_self_remove"
              }) do
-          {:ok, store} -> {:reply, {:ok, reply}, fence_sessions(%{state | store: store}, key)}
-          _ -> {:reply, {:error, :storage_unavailable}, state}
+          {:ok, store} ->
+            next = %{state | store: store} |> remove_focus_device(key, reply["person_id"])
+            {:reply, {:ok, reply}, fence_sessions(next, key)}
+
+          _ ->
+            {:reply, {:error, :storage_unavailable}, state}
         end
 
       error ->
@@ -2389,7 +2395,7 @@ defmodule AttentionServer.Relay do
                action: "owner_device_revoke"
              }) do
           {:ok, store} ->
-            next = %{state | store: store} |> remove_focus_device(device_key)
+            next = %{state | store: store} |> remove_focus_device(device_key, person)
             {:reply, :ok, fence_sessions(next, device_key)}
 
           {:error, _, _} ->
@@ -2702,7 +2708,8 @@ defmodule AttentionServer.Relay do
                action: "device_revoke"
              }) do
           {:ok, store} ->
-            {:reply, :ok, fence_sessions(%{state | store: store}, key)}
+            next = %{state | store: store} |> remove_focus_device(key, person)
+            {:reply, :ok, fence_sessions(next, key)}
 
           {:error, _, _} ->
             {:reply, {:error, :storage_unavailable}, state}
@@ -3041,11 +3048,14 @@ defmodule AttentionServer.Relay do
         state = %{state | focus_expiry_timers: Map.delete(state.focus_expiry_timers, device_key)}
 
         case Map.get(state.focus_clients, device_key) do
-          %{connected: false, last_disconnected_at: disconnected_at}
+          %{connected: false, last_disconnected_at: disconnected_at} = focus
           when is_integer(disconnected_at) ->
             if state.clock.() - disconnected_at >= @focus_recent_ms do
-              next = %{state | focus_clients: Map.delete(state.focus_clients, device_key)}
-              {:noreply, notify_focus_for_device(next, device_key)}
+              person =
+                Map.get(focus, :person) || person_for_device(state.store.engine, device_key)
+
+              next = delete_focus_client(state, device_key)
+              {:noreply, if(person, do: notify_focus_streams(next, person), else: next)}
             else
               {:noreply, state}
             end
@@ -3094,12 +3104,8 @@ defmodule AttentionServer.Relay do
             Diagnostics.failure(:device_relay, :server_terminate, reason, :unavailable)
             {:noreply, unregister_listener(state, listener)}
 
-          focus_stream =
-              Enum.find(state.focus_streams, fn {worker, stream} ->
-                worker == listener and stream.monitor == monitor
-              end) ->
-            {worker, _stream} = focus_stream
-            {:noreply, %{state | focus_streams: Map.delete(state.focus_streams, worker)}}
+          match?(%{monitor: ^monitor}, Map.get(state.focus_streams, listener)) ->
+            {:noreply, delete_focus_stream(state, listener)}
 
           true ->
             case Enum.find(state.origin_streams, fn {_, stream} ->
@@ -6007,8 +6013,19 @@ defmodule AttentionServer.Relay do
   defp focus_permission_field(:see), do: :see_focus
   defp focus_permission_field(:push), do: :push_view
 
-  defp focus_list(state, person),
-    do: focus_list(state.store.engine, state.focus_clients, person, state.clock.())
+  defp focus_list(state, person) do
+    client_keys =
+      state.focus_clients_by_person
+      |> Map.get(person, MapSet.new())
+      |> MapSet.to_list()
+
+    focus_list(
+      state.store.engine,
+      Map.take(state.focus_clients, client_keys),
+      person,
+      state.clock.()
+    )
+  end
 
   defp focus_list(engine, focus_clients, person, now) do
     focus_clients
@@ -6064,18 +6081,16 @@ defmodule AttentionServer.Relay do
   defp notify_focus_streams(state, person) do
     data = %{"clients" => focus_list(state, person)}
 
-    Enum.each(state.focus_streams, fn {worker, stream} ->
-      if stream.person == person, do: send(worker, {:focus_change, data})
+    state.focus_streams_by_person
+    |> Map.get(person, MapSet.new())
+    |> Enum.each(fn worker ->
+      case Map.get(state.focus_streams, worker) do
+        nil -> :ok
+        _stream -> send(worker, {:focus_change, data})
+      end
     end)
 
     state
-  end
-
-  defp notify_focus_for_device(state, device_key) do
-    case Map.get(state.store.engine.devices, device_key) do
-      %{person: person} -> notify_focus_streams(state, person)
-      _ -> state
-    end
   end
 
   defp set_focus_connected(state, device_key, true) do
@@ -6089,10 +6104,10 @@ defmodule AttentionServer.Relay do
           |> cancel_focus_expiry(device_key)
           |> then(fn current ->
             updated = %{focus | connected: true}
-            %{current | focus_clients: Map.put(current.focus_clients, device_key, updated)}
+            put_focus_client(current, device_key, updated)
           end)
 
-        person = person_for_device(state.store.engine, device_key)
+        person = Map.get(focus, :person) || person_for_device(state.store.engine, device_key)
         if person, do: notify_focus_change(state, next, person), else: next
     end
   end
@@ -6110,10 +6125,10 @@ defmodule AttentionServer.Relay do
         updated = %{focus | connected: false, last_disconnected_at: disconnected_at}
 
         next =
-          %{state | focus_clients: Map.put(state.focus_clients, device_key, updated)}
+          put_focus_client(state, device_key, updated)
           |> schedule_focus_expiry(device_key, disconnected_at)
 
-        person = person_for_device(state.store.engine, device_key)
+        person = Map.get(focus, :person) || person_for_device(state.store.engine, device_key)
         if person, do: notify_focus_change(state, next, person), else: next
     end
   end
@@ -6150,27 +6165,114 @@ defmodule AttentionServer.Relay do
   end
 
   defp close_focus_streams(state, agent_key) do
-    {close, keep} =
-      Enum.split_with(state.focus_streams, fn {_worker, stream} -> stream.key == agent_key end)
-
-    Enum.each(close, fn {worker, stream} ->
+    state.focus_streams
+    |> Enum.filter(fn {_worker, stream} -> stream.key == agent_key end)
+    |> Enum.reduce(state, fn {worker, stream}, current ->
       Process.demonitor(stream.monitor, [:flush])
       send(worker, :focus_forbidden)
+      delete_focus_stream(current, worker)
     end)
-
-    %{state | focus_streams: Map.new(keep)}
   end
 
-  defp remove_focus_device(state, device_key) do
-    state = cancel_focus_expiry(state, device_key)
+  defp put_focus_client(state, key, focus) do
+    old_person =
+      case Map.get(state.focus_clients, key) do
+        %{person: person} -> person
+        _ -> nil
+      end
 
-    next = %{
+    new_person = Map.get(focus, :person)
+
+    index =
+      state.focus_clients_by_person
+      |> remove_person_index(old_person, key)
+      |> add_person_index(new_person, key)
+
+    %{
       state
-      | focus_clients: Map.delete(state.focus_clients, device_key),
-        held_shows: Map.delete(state.held_shows, device_key)
+      | focus_clients: Map.put(state.focus_clients, key, focus),
+        focus_clients_by_person: index
     }
+  end
 
-    notify_focus_for_device(next, device_key)
+  defp delete_focus_client(state, key) do
+    case Map.pop(state.focus_clients, key) do
+      {nil, _clients} ->
+        state
+
+      {focus, clients} ->
+        index = remove_person_index(state.focus_clients_by_person, Map.get(focus, :person), key)
+        %{state | focus_clients: clients, focus_clients_by_person: index}
+    end
+  end
+
+  defp put_focus_stream(state, worker, stream) do
+    old_person =
+      case Map.get(state.focus_streams, worker) do
+        %{person: person} -> person
+        _ -> nil
+      end
+
+    index =
+      state.focus_streams_by_person
+      |> remove_person_index(old_person, worker)
+      |> add_person_index(stream.person, worker)
+
+    %{
+      state
+      | focus_streams: Map.put(state.focus_streams, worker, stream),
+        focus_streams_by_person: index
+    }
+  end
+
+  defp delete_focus_stream(state, worker) do
+    case Map.pop(state.focus_streams, worker) do
+      {nil, _streams} ->
+        state
+
+      {stream, streams} ->
+        index = remove_person_index(state.focus_streams_by_person, stream.person, worker)
+        %{state | focus_streams: streams, focus_streams_by_person: index}
+    end
+  end
+
+  defp add_person_index(index, nil, _key), do: index
+
+  defp add_person_index(index, person, key),
+    do: Map.update(index, person, MapSet.new([key]), &MapSet.put(&1, key))
+
+  defp remove_person_index(index, nil, _key), do: index
+
+  defp remove_person_index(index, person, key) do
+    case Map.get(index, person) do
+      nil ->
+        index
+
+      keys ->
+        remaining = MapSet.delete(keys, key)
+
+        if MapSet.size(remaining) == 0,
+          do: Map.delete(index, person),
+          else: Map.put(index, person, remaining)
+    end
+  end
+
+  defp remove_focus_device(state, device_key, person) do
+    focus = Map.get(state.focus_clients, device_key)
+
+    person =
+      person ||
+        case focus do
+          %{person: focus_person} -> focus_person
+          _ -> person_for_device(state.store.engine, device_key)
+        end
+
+    state = cancel_focus_expiry(state, device_key)
+    next = state |> delete_focus_client(device_key)
+    next = %{next | held_shows: Map.delete(next.held_shows, device_key)}
+    next = close_focus_streams(next, device_key)
+
+    if person, do: notify_focus_streams(next, person), else: next
   end
 
   defp focus_report_request(state, id, session, frame) do
@@ -6181,6 +6283,7 @@ defmodule AttentionServer.Relay do
       nil ->
         now = state.clock.()
         key = session.key
+        person = person_for_device(state.store.engine, key)
         reported = Map.take(frame, ~w(screen sender_id message_id visible_event_id))
         existing = Map.get(state.focus_clients, key)
         changed = is_nil(existing) or focus_fields(existing) != reported
@@ -6200,14 +6303,15 @@ defmodule AttentionServer.Relay do
             :last_disconnected_at,
             Map.get(existing || %{}, :last_disconnected_at)
           )
+          |> Map.put(:person, person)
           |> Map.put(:connected, true)
 
         next =
-          %{state | focus_clients: Map.put(state.focus_clients, key, focus)}
+          state
+          |> put_focus_client(key, focus)
           |> put_session(id, %{session | focus_opted_in: true})
           |> cancel_focus_expiry(key)
 
-        person = person_for_device(next.store.engine, key)
         next = if person, do: notify_focus_change(state, next, person), else: next
 
         ack = ok_line(frame, %{})

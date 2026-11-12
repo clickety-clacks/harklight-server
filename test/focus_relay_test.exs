@@ -232,6 +232,103 @@ defmodule AttentionServer.FocusRelayTest do
     assert {:ok, %{"clients" => []}} = Relay.focus_get(relay, agent)
   end
 
+  test "self-removal and local revocation clear held focus and notify subscribers" do
+    for action <- [:remove, :revoke] do
+      {relay, person, client, agent} = focus_cleanup_case(Atom.to_string(action))
+
+      assert {:ok, [%{"client_id" => ^client}]} = Relay.focus_stream_attach(relay, agent, self())
+
+      assert {:ok, %{"client_id" => ^client, "delivery" => "held"}} =
+               Relay.view_show(relay, agent, %{
+                 "sender_id" => "app:test",
+                 "message_id" => "cleanup-item",
+                 "target" => "message",
+                 "target_client" => client
+               })
+
+      before = :sys.get_state(relay)
+      assert Map.has_key?(before.held_shows, client)
+      assert Map.has_key?(before.focus_expiry_timers, client)
+      assert MapSet.member?(before.focus_clients_by_person[person], client)
+      assert MapSet.member?(before.focus_streams_by_person[person], self())
+
+      case action do
+        :remove -> assert {:ok, _reply} = Relay.device_remove(relay, client)
+        :revoke -> assert :ok = Relay.revoke_device(relay, client)
+      end
+
+      assert_receive {:focus_change, %{"clients" => []}}, 1_000
+
+      after_cleanup = :sys.get_state(relay)
+      refute Map.has_key?(after_cleanup.focus_clients, client)
+      refute Map.has_key?(after_cleanup.held_shows, client)
+      refute Map.has_key?(after_cleanup.focus_expiry_timers, client)
+      refute Map.has_key?(after_cleanup.focus_clients_by_person, person)
+      assert MapSet.member?(after_cleanup.focus_streams_by_person[person], self())
+
+      :ok = Relay.focus_stream_detach(relay, agent, self())
+    end
+  end
+
+  defp focus_cleanup_case(suffix) do
+    certs = TLSFixtures.create!()
+    on_exit(fn -> File.rm_rf!(certs) end)
+
+    dir =
+      Path.join(
+        System.tmp_dir!(),
+        "harklight-focus-cleanup-#{suffix}-#{System.unique_integer([:positive])}"
+      )
+
+    File.mkdir_p!(dir)
+    on_exit(fn -> File.rm_rf!(dir) end)
+
+    {:ok, relay} = Relay.start_link(store_path: Path.join(dir, "relay.sqlite3"))
+    on_exit(fn -> if Process.alive?(relay), do: GenServer.stop(relay) end)
+
+    owner_certificate = TLSFixtures.certificate_der!(certs, "a1")
+    {:ok, person} = Relay.operator_bootstrap(relay, owner_certificate)
+    {:ok, owner_key} = DeviceIdentity.from_certificate(owner_certificate)
+
+    client_certificate = TLSFixtures.certificate_der!(certs, "a2")
+    {:ok, client} = Relay.setup_device_certificate(relay, person, client_certificate)
+    agent = String.duplicate("f", 64)
+    :ok = Relay.setup_device(relay, person, agent)
+    :ok = Relay.setup_sender(relay, client, "app:test")
+    :ok = Relay.save_dashboard_focus_permission(relay, person, owner_key, agent, :see, true)
+    :ok = Relay.save_dashboard_focus_permission(relay, person, owner_key, agent, :push, true)
+
+    assert {:ok, message_line} =
+             Relay.request_line(
+               relay,
+               client,
+               JSON.encode!(%{
+                 "v" => 1,
+                 "type" => "forward",
+                 "op_id" => "00000000-0000-4000-8000-000000000971",
+                 "message" => %{
+                   "sender_id" => "app:test",
+                   "message_id" => "cleanup-item",
+                   "created_at" => 1,
+                   "title" => "Cleanup item"
+                 }
+               }) <> "\n"
+             )
+
+    assert {:ok, %{"type" => "ok"}} = JSON.decode_line(message_line <> "\n")
+
+    {:ok, session} = Relay.open_session(relay, client)
+
+    report(relay, session, "cleanup-#{suffix}", "message", %{
+      "sender_id" => "app:test",
+      "message_id" => "cleanup-item"
+    })
+
+    :ok = Relay.close_session(relay, session)
+
+    {relay, person, client, agent}
+  end
+
   defp report(relay, session, ref, screen, fields \\ %{}) do
     frame =
       Map.merge(

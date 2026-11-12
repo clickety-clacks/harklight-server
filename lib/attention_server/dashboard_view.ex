@@ -284,7 +284,7 @@ harklight-agent --identity-dir ./harklight-agent-identity \
     checked = if Map.get(device, field, false), do: " checked", else: ""
 
     if device[:can_manage_focus] == true do
-      ~s|<form action="/devices/focus/#{escape(device_id)}/#{route}" method="post"><label><input type="checkbox" name="enabled" value="on"#{checked} aria-label="#{label}" onchange="this.form.requestSubmit()">#{label}</label></form>|
+      ~s|<form action="/devices/focus/#{escape(device_id)}/#{route}" method="post"><label><input type="checkbox" name="enabled" value="on"#{checked} aria-label="#{label}">#{label}</label><button class="button" type="submit">Save</button></form>|
     else
       disabled = " disabled"
 
