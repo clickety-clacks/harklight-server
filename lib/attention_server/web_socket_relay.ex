@@ -10,7 +10,7 @@ defmodule AttentionServer.WebSocketRelay do
 
   alias AttentionServer.{DeviceIdentity, Diagnostics, EnrolledLeafVerify, JSON, Relay}
 
-  @handshake_timeout 3_000
+  @handshake_timeout :infinity
   @poll_ms 100
   @max_header 16 * 1024
   @max_message 2 * 1024 * 1024
@@ -110,8 +110,6 @@ defmodule AttentionServer.WebSocketRelay do
       active: false,
       mode: :binary,
       packet: :raw,
-      send_timeout: 1_000,
-      send_timeout_close: true,
       reuseaddr: true,
       versions: [:"tlsv1.3"],
       verify: :verify_peer,
