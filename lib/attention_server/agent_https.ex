@@ -9,7 +9,7 @@ defmodule AttentionServer.AgentHTTPS do
 
   alias AttentionServer.{AgentWire, DeviceIdentity, Diagnostics, EnrolledLeafVerify, JSON, Relay}
 
-  @timeout 5_000
+  @timeout :infinity
   @max_header 16 * 1024
   @max_body 2 * 1024 * 1024
 
@@ -103,8 +103,6 @@ defmodule AttentionServer.AgentHTTPS do
       active: false,
       mode: :binary,
       packet: :raw,
-      send_timeout: 1_000,
-      send_timeout_close: true,
       reuseaddr: true,
       versions: [:"tlsv1.3"],
       certfile: String.to_charlist(certfile),

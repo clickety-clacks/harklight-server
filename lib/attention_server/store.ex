@@ -23,9 +23,18 @@ defmodule AttentionServer.Store do
 
   @format_version 27
   @inbox_index_chunk_size 20
-  defstruct [:db, :engine, :version, :upload_dir]
+  defstruct [:db, :engine, :version, :upload_dir, progress_version: 0]
+
+  @progress_fields [:cursors, :conversation_cursors, :conversation_opened]
 
   @schema """
+  CREATE TABLE IF NOT EXISTS relay_device_progress (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    snapshot_version INTEGER NOT NULL,
+    version INTEGER NOT NULL,
+    payload BLOB NOT NULL,
+    checksum BLOB NOT NULL
+  );
   CREATE TABLE IF NOT EXISTS relay_state (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     version INTEGER NOT NULL,
@@ -130,8 +139,15 @@ defmodule AttentionServer.Store do
                      engine: engine,
                      version: version,
                      upload_dir: upload_dir
+                   }),
+                 {:ok, store} <-
+                   load_progress(%__MODULE__{
+                     db: db,
+                     engine: engine,
+                     version: version,
+                     upload_dir: upload_dir
                    }) do
-              {:ok, %__MODULE__{db: db, engine: engine, version: version, upload_dir: upload_dir}}
+              {:ok, store}
             else
               {:error, reason} ->
                 Diagnostics.failure(:server_storage, :store_open, reason, :unavailable)
@@ -922,8 +938,9 @@ defmodule AttentionServer.Store do
         audit
       ) do
     with {:ok, next_engine} <- Engine.checkpoint_cursor(engine, device, high),
-         %__MODULE__{db: db, version: version} <- store,
+         %__MODULE__{db: db} <- store,
          :ok <- Sqlite3.execute(db, "BEGIN IMMEDIATE"),
+         :ok <- check_progress_version(store),
          {:ok, row} <-
            one(
              db,
@@ -935,11 +952,13 @@ defmodule AttentionServer.Store do
          :ok <-
            if(duplicate?,
              do: :ok,
-             else: checkpoint_commit(db, version, next_engine, person, device, snapshot_id, audit)
+             else: checkpoint_commit(store, next_engine, person, device, snapshot_id, audit)
            ),
          :ok <- Sqlite3.execute(db, "COMMIT") do
       next_store =
-        if duplicate?, do: store, else: %{store | engine: next_engine, version: version + 1}
+        if duplicate?,
+          do: store,
+          else: %{store | engine: next_engine, progress_version: store.progress_version + 1}
 
       {:ok, next_store, duplicate?}
     else
@@ -968,18 +987,23 @@ defmodule AttentionServer.Store do
     do: {:ok, %{store | engine: next}}
 
   def commit(%__MODULE__{} = store, next, audit) do
-    if valid_state?(next, :incremental) do
-      commit_durable(store, next, audit)
-    else
-      Diagnostics.failure(
-        :server_storage,
-        :state_commit,
-        :invalid_state,
-        :unavailable,
-        operation_id(audit)
-      )
+    cond do
+      progress_only?(store.engine, next) and valid_progress?(next) ->
+        commit_progress(store, next, audit)
 
-      {:error, :storage_unavailable, store}
+      valid_state?(next, :incremental) ->
+        commit_durable(store, next, audit)
+
+      true ->
+        Diagnostics.failure(
+          :server_storage,
+          :state_commit,
+          :invalid_state,
+          :unavailable,
+          operation_id(audit)
+        )
+
+        {:error, :storage_unavailable, store}
     end
   end
 
@@ -989,6 +1013,7 @@ defmodule AttentionServer.Store do
 
     result =
       with :ok <- Sqlite3.execute(db, "BEGIN IMMEDIATE"),
+           :ok <- check_progress_version(store),
            :ok <-
              run(
                db,
@@ -1000,6 +1025,7 @@ defmodule AttentionServer.Store do
                ]
              ),
            {:ok, 1} <- Sqlite3.changes(db),
+           :ok <- Sqlite3.execute(db, "DELETE FROM relay_device_progress"),
            :ok <-
              run(
                db,
@@ -1017,7 +1043,7 @@ defmodule AttentionServer.Store do
 
     case result do
       :ok ->
-        {:ok, %{store | engine: next, version: version + 1}}
+        {:ok, %{store | engine: next, version: version + 1, progress_version: 0}}
 
       error ->
         Diagnostics.failure(
@@ -1029,6 +1055,125 @@ defmodule AttentionServer.Store do
         )
 
         _ = Sqlite3.execute(db, "ROLLBACK")
+        {:error, :storage_unavailable, store}
+    end
+  end
+
+  # ACKs must be durable before their replies, but do not change retained history.
+  # The overlay is tied to the snapshot generation. Older releases ignore it;
+  # if they write a newer snapshot, its progress supersedes the old overlay.
+  defp progress_only?(old, next) do
+    Map.merge(next, Map.take(old, @progress_fields)) === old
+  end
+
+  defp valid_progress?(engine) do
+    is_map(engine.cursors) and
+      Enum.all?(engine.cursors, fn {{person, key}, seq} ->
+        owns?(engine, person, key) and is_integer(seq) and seq >= 0 and
+          seq <= engine.persons[person]
+      end) and
+      is_map(engine.conversation_cursors) and
+      Enum.all?(engine.conversation_cursors, fn {{person, key}, seq} ->
+        owns?(engine, person, key) and is_integer(seq) and seq >= 0 and
+          seq <= Map.get(engine.conversation_highs, person, 0)
+      end) and
+      is_struct(engine.conversation_opened, MapSet) and
+      Enum.all?(engine.conversation_opened, fn {person, key} -> owns?(engine, person, key) end)
+  rescue
+    _ -> false
+  end
+
+  defp load_progress(store) do
+    case one(
+           store.db,
+           "SELECT version, payload, checksum FROM relay_device_progress WHERE id = 1 AND snapshot_version = ?",
+           [store.version]
+         ) do
+      {:ok, nil} ->
+        {:ok, store}
+
+      {:ok, [version, payload, checksum]} ->
+        with {:ok, progress} <- decode_checked_term(payload, checksum),
+             true <-
+               is_map(progress) and Enum.sort(Map.keys(progress)) == Enum.sort(@progress_fields),
+             engine = Map.merge(store.engine, progress),
+             true <- valid_progress?(engine) do
+          {:ok, %{store | engine: engine, progress_version: version}}
+        else
+          _ -> {:error, :storage_unavailable}
+        end
+
+      _ ->
+        {:error, :storage_unavailable}
+    end
+  end
+
+  defp check_progress_version(store) do
+    with {:ok, [snapshot_version]} <-
+           one(store.db, "SELECT version FROM relay_state WHERE id = 1", []),
+         true <- snapshot_version == store.version,
+         {:ok, row} <-
+           one(
+             store.db,
+             "SELECT version FROM relay_device_progress WHERE id = 1 AND snapshot_version = ?",
+             [store.version]
+           ),
+         true <-
+           (case row do
+              nil -> 0
+              [version] -> version
+            end) == store.progress_version do
+      :ok
+    else
+      _ -> {:error, :storage_unavailable}
+    end
+  end
+
+  defp write_progress(store, next) do
+    payload = encode_term(Map.take(next, @progress_fields))
+
+    with :ok <- check_progress_version(store) do
+      run(
+        store.db,
+        "INSERT OR REPLACE INTO relay_device_progress (id, snapshot_version, version, payload, checksum) VALUES (1, ?, ?, ?, ?)",
+        [
+          store.version,
+          store.progress_version + 1,
+          {:blob, payload},
+          {:blob, :crypto.hash(:sha256, payload)}
+        ]
+      )
+    end
+  end
+
+  defp commit_progress(store, next, audit) do
+    result =
+      with :ok <- Sqlite3.execute(store.db, "BEGIN IMMEDIATE"),
+           :ok <- write_progress(store, next),
+           :ok <-
+             run(
+               store.db,
+               "INSERT INTO relay_audit (person_id, actor_id, action, at_ms) VALUES (?, ?, ?, ?)",
+               [audit.person, audit.actor, audit.action, System.system_time(:millisecond)]
+             ),
+           :ok <- Sqlite3.execute(store.db, "COMMIT") do
+        {:ok, %{store | engine: next, progress_version: store.progress_version + 1}}
+      end
+
+    case result do
+      {:ok, _} ->
+        result
+
+      error ->
+        Diagnostics.failure(
+          :server_storage,
+          :state_commit,
+          error,
+          :outcome_unknown,
+          operation_id(audit)
+        )
+
+        _ = Sqlite3.execute(store.db, "ROLLBACK")
         {:error, :storage_unavailable, store}
     end
   end
@@ -1665,17 +1810,10 @@ defmodule AttentionServer.Store do
        ),
        do: {:error, :checkpoint_conflict}
 
-  defp checkpoint_commit(db, version, next_engine, person, device, snapshot_id, audit) do
-    payload = encode_state(next_engine)
-    checksum = :crypto.hash(:sha256, payload)
+  defp checkpoint_commit(store, next_engine, person, device, snapshot_id, audit) do
+    db = store.db
 
-    with :ok <-
-           run(
-             db,
-             "UPDATE relay_state SET version = version + 1, payload = ?, checksum = ? WHERE id = 1 AND version = ?",
-             [{:blob, payload}, {:blob, checksum}, version]
-           ),
-         {:ok, 1} <- Sqlite3.changes(db),
+    with :ok <- write_progress(store, next_engine),
          :ok <-
            run(
              db,

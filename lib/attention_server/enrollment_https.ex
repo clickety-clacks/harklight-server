@@ -12,7 +12,7 @@ defmodule AttentionServer.EnrollmentHTTPS do
 
   alias AttentionServer.{DeviceIdentity, Diagnostics, EnrolledLeafVerify, JSON, Relay}
 
-  @timeout 3_000
+  @timeout :infinity
   @max_header 8 * 1024
   @max_body 32 * 1024
   @max_certificate 16 * 1024
@@ -119,8 +119,6 @@ defmodule AttentionServer.EnrollmentHTTPS do
           active: false,
           mode: :binary,
           packet: :raw,
-          send_timeout: 1_000,
-          send_timeout_close: true,
           reuseaddr: true,
           versions: [:"tlsv1.3"],
           certfile: String.to_charlist(certfile),

@@ -1,3 +1,45 @@
+# Harklight Server v0.1.38
+
+## Changes
+
+This is the v0.1.35 line plus the durable-ACK and timeout fixes below. It
+retains FORMAT27 and excludes the focus and FORMAT29 work from v0.1.37.
+It is not an upgrade path from an existing FORMAT28 or FORMAT29 store.
+
+- Persist device ACKs, conversation read progress and inbox checkpoints without
+  repeatedly encoding the entire store during cold replay. Progress commits
+  remain synchronous and durable, with ordering and idempotency preserved.
+- Remove the one-second listener send deadline and close-on-timeout setting,
+  five-second device-session call deadlines, fifteen-second agent, push,
+  claim-push and relay-boundary call deadlines, and three-to-five-second
+  handshake/read caps. No replacement deadline or retry layer is added.
+- Add the SQLite `relay_device_progress` table without rewriting existing
+  FORMAT27 snapshot content or migrating its format. Content mutations still
+  use the existing full snapshot commit.
+
+## Upgrade and recovery
+
+Stop the server and take a complete private-state backup before upgrading from
+v0.1.35. Published v0.1.35 can open and serve a store containing the additive
+table, but ignores its newer progress. Rollback therefore restores the
+install-time backup and the prior binary; switching only the binary does not
+preserve all ACK state. Restoration discards writes after the backup and cannot
+undo external deliveries.
+
+An isolated rehearsal using the same product code served seeded data on the
+published v0.1.35 binary, upgraded to the patch, persisted additional data and
+ACKs, then restored the install-procedure backup and prior binary. The restored
+database and original message content matched. This exercised the manual
+upgrade route and shipped restore function, not the complete systemd installer,
+power loss or corrupted backups. Recovery can fail and leave the service stopped.
+
+The tested main FORMAT27-to-28-to-29 migrations tolerate the additional table
+and preserve conversation history. Unmodified main ignores the table's newer
+ACK cursors, so acknowledged events may replay. This is migration-tolerance
+evidence, not a claim that a future v0.1.39 package has been tested or published.
+
+---
+
 # Harklight Server v0.1.35
 
 ## Changes
