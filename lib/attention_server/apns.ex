@@ -783,7 +783,7 @@ defmodule AttentionServer.APNS do
          end) do
       value when is_binary(value) ->
         case Integer.parse(value) do
-          {seconds, ""} when seconds >= 0 and seconds <= 86_400 -> seconds * 1_000
+          {seconds, ""} when seconds >= 0 -> seconds * 1_000
           _ -> 0
         end
 

@@ -190,7 +190,7 @@ harklight-agent --identity-dir ./harklight-agent-identity \
   def invitation(person, invitation, new_request_id, chrome \\ []) do
     link = escape(invitation["join_url"] || "")
     tappable = escape(invitation["tappable_url"] || "")
-    deadline = escape(time(invitation["expires_at"]))
+    deadline = escape(expiry(invitation["expires_at"]))
     server = escape(invitation["server_name"] || "unknown server")
     enrollment = escape(invitation["enrollment_url"] || "unknown enrollment endpoint")
 
@@ -306,6 +306,9 @@ harklight-agent --identity-dir ./harklight-agent-identity \
 
     ~s(<li><span>#{label} · #{person}</span><span>Code on device: #{code}</span><span>#{review}</span></li>)
   end
+
+  defp expiry(nil), do: "No expiry"
+  defp expiry(ms), do: time(ms)
 
   defp time(ms) when is_integer(ms),
     do: ms |> DateTime.from_unix!(:millisecond) |> DateTime.to_iso8601()

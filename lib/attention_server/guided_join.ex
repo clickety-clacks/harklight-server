@@ -8,8 +8,6 @@ defmodule AttentionServer.GuidedJoin do
   alias AttentionServer.{DeviceIdentity, Diagnostics, Engine}
 
   @invite_ms 30 * 60 * 1_000
-  @retention_ms 24 * 60 * 60 * 1_000
-  @limit 1_024
 
   def configuration(name, enroll_port, relay_port, ca_pem) do
     with true <- is_binary(name) and Regex.match?(~r/\A[a-zA-Z0-9][a-zA-Z0-9.-]{0,252}\z/, name),
@@ -49,9 +47,6 @@ defmodule AttentionServer.GuidedJoin do
       engine = compact(engine, now)
 
       cond do
-        map_size(engine.join_invitations) >= @limit ->
-          {:error, :capacity}
-
         Map.has_key?(engine.join_invitations, token_hash) ->
           {:error, :collision}
 
@@ -62,7 +57,7 @@ defmodule AttentionServer.GuidedJoin do
             owner_revision: revision,
             configuration: configuration,
             expires_at: now + @invite_ms,
-            retain_until: now + @invite_ms + @retention_ms,
+            retain_until: now + @invite_ms,
             code: nil,
             key: nil,
             secret_hash: nil,
@@ -88,6 +83,8 @@ defmodule AttentionServer.GuidedJoin do
          true <- AttentionServer.Message.uuid_v4?(request_id),
          true <- valid_configuration?(configuration),
          true <- is_integer(now) and now >= engine.pending_clock_high_water do
+      engine = compact(engine, now)
+
       existing =
         Enum.find_value(engine.join_invitations, fn {_, item} ->
           if item.person == person and item.owner_key == owner and
@@ -278,10 +275,18 @@ defmodule AttentionServer.GuidedJoin do
         engine
 
       %{code: nil, expires_at: deadline} when now >= deadline ->
-        %{engine | pending_clock_high_water: max(engine.pending_clock_high_water, deadline)}
+        %{
+          engine
+          | join_invitations: Map.delete(engine.join_invitations, hash),
+            pending_clock_high_water: max(engine.pending_clock_high_water, deadline)
+        }
 
-      %{code: code} when is_binary(code) ->
-        Engine.pending_observe_time(engine, {:code, code}, now)
+      %{code: code, retain_until: deadline} when is_binary(code) ->
+        observed = Engine.pending_observe_time(engine, {:code, code}, now)
+
+        if now >= deadline,
+          do: %{observed | join_invitations: Map.delete(observed.join_invitations, hash)},
+          else: observed
 
       _ ->
         engine
@@ -292,8 +297,17 @@ defmodule AttentionServer.GuidedJoin do
     do: %{
       engine
       | join_invitations:
-          Map.reject(engine.join_invitations, fn {_, i} ->
-            i.retain_until <= now
+          Map.reject(engine.join_invitations, fn {_, invite} ->
+            expired? =
+              if is_nil(Map.get(invite, :code)),
+                do: invite.expires_at <= now,
+                else: invite.retain_until <= now
+
+            superseded? =
+              Engine.owner_revision(engine, invite.person, invite.owner_key) !=
+                {:ok, invite.owner_revision}
+
+            expired? or superseded?
           end)
     }
 
@@ -322,14 +336,21 @@ defmodule AttentionServer.GuidedJoin do
   def valid_configuration?(_), do: false
 
   def valid_state?(engine) do
-    is_map(engine.join_invitations) and map_size(engine.join_invitations) <= @limit and
-      Enum.all?(engine.join_invitations, fn {hash, i} ->
-        hash?(hash) and map_size(i) == 10 and Map.has_key?(engine.persons, i.person) and
-          key?(i.owner_key) and is_integer(i.owner_revision) and i.owner_revision > 0 and
-          valid_configuration?(i.configuration) and is_integer(i.expires_at) and i.expires_at > 0 and
-          is_integer(i.retain_until) and i.retain_until > i.expires_at and
-          (is_nil(i.request_id) or AttentionServer.Message.uuid_v4?(i.request_id)) and
-          valid_binding?(engine, i)
+    is_map(engine.join_invitations) and
+      Enum.all?(engine.join_invitations, fn {hash, invite} ->
+        retain_until_valid? =
+          is_integer(invite.retain_until) and
+            if(is_nil(invite.code),
+              do: invite.retain_until >= invite.expires_at,
+              else: invite.retain_until > invite.expires_at
+            )
+
+        hash?(hash) and map_size(invite) == 10 and Map.has_key?(engine.persons, invite.person) and
+          key?(invite.owner_key) and is_integer(invite.owner_revision) and
+          invite.owner_revision > 0 and valid_configuration?(invite.configuration) and
+          is_integer(invite.expires_at) and invite.expires_at > 0 and retain_until_valid? and
+          (is_nil(invite.request_id) or AttentionServer.Message.uuid_v4?(invite.request_id)) and
+          valid_binding?(engine, invite)
       end)
   end
 

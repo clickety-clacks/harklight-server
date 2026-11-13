@@ -139,7 +139,6 @@ defmodule AttentionServer.PushAlertTest do
     assert bounded.alert["body_truncated"]
   end
 
-  @window_ms 300_000
   @person "person-a"
   @device String.duplicate("a", 64)
   @origin String.duplicate("b", 64)
@@ -158,7 +157,7 @@ defmodule AttentionServer.PushAlertTest do
         accepted_high: 0,
         pending_conversation_high: 0,
         accepted_conversation_high: 0,
-        deadline_at: 1_000 + 3_600_000,
+        deadline_at: 1_000,
         next_at: 1_000,
         attempt_count: 0,
         last_attempt_at: nil,
@@ -339,7 +338,21 @@ defmodule AttentionServer.PushAlertTest do
     assert binding.next_at == 1_001 + 1_000
   end
 
-  test "the first unsent request opens a five-minute window that later requests ride on" do
+  test "pending push remains claimable after the former hint deadline" do
+    now = 3_600_001
+
+    engine =
+      engine_with_deliveries(
+        [{"app:test", "past-deadline", nil, nil}],
+        %{deadline_at: now - 1, next_at: now - 1}
+      )
+
+    assert {:ok, claimed, claim} = Engine.claim_push(engine, now)
+    assert claim.high == 1
+    assert claimed.push_bindings[{@person, @device}].state == "sending"
+  end
+
+  test "a new request is eligible immediately and pending highs coalesce at claim time" do
     {:ok, engine} = Engine.setup_person(Engine.new(), @person)
     {:ok, engine} = Engine.setup_device(engine, @person, @device)
     {:ok, engine} = Engine.setup_device(engine, @person, @origin)
@@ -383,13 +396,13 @@ defmodule AttentionServer.PushAlertTest do
 
     opened = binding.(engine)
     assert opened.state == "queued"
-    assert opened.next_at in (before + @window_ms)..(after_first + @window_ms)
-    assert opened.deadline_at == opened.next_at - @window_ms + 3_600_000
+    assert opened.next_at in before..after_first
+    assert is_integer(opened.deadline_at)
 
-    # Nothing goes out before the window closes.
+    # A claim before the queued event is not due.
     assert {:ok, _engine, nil} = Engine.claim_push(engine, opened.next_at - 1)
 
-    # A second request inside the window does not move the send time.
+    # A second request joins the queued high before the dispatcher claims it.
     {engine, 2} = forward.(engine, "two", "02")
     assert binding.(engine).next_at == opened.next_at
     assert binding.(engine).pending_high == 2
@@ -401,13 +414,13 @@ defmodule AttentionServer.PushAlertTest do
     assert binding.(engine).state == "sending"
     assert binding.(engine).next_at == nil
 
-    # A request that arrives while that push is in flight opens the next window.
+    # A request arriving in flight queues the next event for the dispatcher.
     before_third = System.system_time(:millisecond)
     {engine, 3} = forward.(engine, "three", "03")
     after_third = System.system_time(:millisecond)
     in_flight = binding.(engine)
     assert in_flight.state == "sending"
-    assert in_flight.next_at in (before_third + @window_ms)..(after_third + @window_ms)
+    assert in_flight.next_at in before_third..after_third
 
     accepted = %{state: "provider_accepted", http_status: 200}
     assert {:ok, engine} = Engine.finish_push(engine, claim, accepted, opened.next_at + 1)

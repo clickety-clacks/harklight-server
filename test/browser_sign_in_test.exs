@@ -60,7 +60,8 @@ defmodule AttentionServer.BrowserSignInTest do
              scope: :person_owner
            }
 
-    assert {:error, :used} = BrowserSignIn.consume(consumed, c.hash, 102)
+    refute Map.has_key?(consumed.browser_sign_ins, c.hash)
+    assert {:error, :invalid_sign_in} = BrowserSignIn.consume(consumed, c.hash, 102)
 
     assert {:error, :invalid_sign_in} =
              BrowserSignIn.consume(consumed, :crypto.hash(:sha256, "unknown"), 102)
@@ -84,23 +85,29 @@ defmodule AttentionServer.BrowserSignInTest do
     {:ok, issued, record} = BrowserSignIn.issue(c.engine, @person, @owner, c.hash, 100)
     assert {:error, :expired} = BrowserSignIn.consume(issued, c.hash, record.expires_at)
     observed = BrowserSignIn.observe_time(issued, c.hash, record.expires_at)
-    assert {:error, :expired} = BrowserSignIn.consume(observed, c.hash, 101)
+    assert {:error, :invalid_sign_in} = BrowserSignIn.consume(observed, c.hash, 101)
+    assert observed.browser_sign_in_clock_high_water == record.expires_at
     assert observed.pending_clock_high_water == c.engine.pending_clock_high_water
+    refute Map.has_key?(observed.browser_sign_ins, c.hash)
     other_hash = :crypto.hash(:sha256, "fresh-login")
 
     assert {:error, :clock_unavailable} =
              BrowserSignIn.issue(observed, @person, @owner, other_hash, 101)
 
     assert {:ok, cleaned, _} =
-             BrowserSignIn.issue(observed, @person, @owner, other_hash, record.retain_until)
+             BrowserSignIn.issue(observed, @person, @owner, other_hash, record.expires_at)
 
     refute Map.has_key?(cleaned.browser_sign_ins, c.hash)
   end
 
   test "owner recovery invalidates an old issuer without delegating browser authority", c do
     {:ok, issued, _} = BrowserSignIn.issue(c.engine, @person, @owner, c.hash, 100)
-    {:ok, recovered} = Engine.operator_recover(issued, @person, @device)
-    assert {:error, :invalid_sign_in} = BrowserSignIn.consume(recovered, c.hash, 101)
+    other_hash = :crypto.hash(:sha256, "other-person-sign-in")
+    {:ok, with_other, _} = BrowserSignIn.issue(issued, @other, @other_owner, other_hash, 101)
+    {:ok, recovered} = Engine.operator_recover(with_other, @person, @device)
+    assert map_size(recovered.browser_sign_ins) == 1
+    assert Map.has_key?(recovered.browser_sign_ins, other_hash)
+    assert {:error, :invalid_sign_in} = BrowserSignIn.consume(recovered, c.hash, 102)
     assert {:error, :forbidden} = BrowserSignIn.issue(recovered, @person, @owner, c.hash, 101)
     new_hash = :crypto.hash(:sha256, "new-current-owner")
     {:ok, fresh, _} = BrowserSignIn.issue(recovered, @person, @device, new_hash, 101)
@@ -128,7 +135,7 @@ defmodule AttentionServer.BrowserSignInTest do
     assert Enum.count(replies, &match?({:ok, %{person_id: ^person, scope: :person_owner}}, &1)) ==
              1
 
-    assert Enum.count(replies, &(&1 == {:error, :used})) == 3
+    assert Enum.count(replies, &(&1 == {:error, :invalid_sign_in})) == 3
     {:ok, _fresh} = Relay.owner_browser_sign_in_create(relay, person, owner_key)
     assert {:error, :invalid_sign_in} = Relay.consume_browser_sign_in(relay, token)
     stop_supervised(Relay)
@@ -153,46 +160,37 @@ defmodule AttentionServer.BrowserSignInTest do
     on_exit(fn -> if Process.alive?(stale), do: GenServer.stop(stale) end)
     assert {:ok, %{person_id: ^person}} = Relay.consume_browser_sign_in(restarted, token)
     assert {:error, :storage_unavailable} = Relay.consume_browser_sign_in(stale, token)
-    assert {:error, :used} = Relay.consume_browser_sign_in(restarted, token)
+    assert {:error, :invalid_sign_in} = Relay.consume_browser_sign_in(restarted, token)
 
     assert {:error, :invalid_sign_in} =
              Relay.consume_browser_sign_in(restarted, String.duplicate("a", 64))
   end
 
-  test "fresh login survives a full store of expired, spent or retired-issuer credentials",
-       c do
-    full =
-      Enum.reduce(1..1024, c.engine, fn index, engine ->
-        hash = :crypto.hash(:sha256, "retired-issuer-#{index}")
-        {:ok, next, _} = BrowserSignIn.issue(engine, @person, @owner, hash, 100)
-        next
+  test "sign-in state accepts more than the former fixed record cap", c do
+    record = %{
+      person: @person,
+      owner_key: @owner,
+      owner_revision: 1,
+      issued_at: 100,
+      expires_at: 600_100
+    }
+
+    tokens =
+      Map.new(1..1_025, fn index ->
+        {:crypto.hash(:sha256, "login-#{index}"), record}
       end)
 
-    assert {:error, :capacity} = BrowserSignIn.issue(full, @person, @owner, c.hash, 101)
-    assert {:ok, _, _} = BrowserSignIn.issue(full, @person, @owner, c.hash, 600_100)
+    full = %{c.engine | browser_sign_ins: tokens, browser_sign_in_clock_high_water: 100}
+    assert BrowserSignIn.valid_state?(full)
 
-    spent =
-      Enum.reduce(Map.keys(full.browser_sign_ins), full, fn hash, engine ->
-        {:ok, next, _} = BrowserSignIn.consume(engine, hash, 101)
-        next
-      end)
+    fresh_hash = :crypto.hash(:sha256, "login-after-former-cap")
+    assert {:ok, issued, _} = BrowserSignIn.issue(full, @person, @owner, fresh_hash, 101)
+    assert map_size(issued.browser_sign_ins) == 1_026
 
-    assert {:ok, fresh_after_spent, _} = BrowserSignIn.issue(spent, @person, @owner, c.hash, 102)
-    assert {:ok, _, %{person_id: @person}} = BrowserSignIn.consume(fresh_after_spent, c.hash, 103)
-    {:ok, recovered} = Engine.operator_recover(full, @person, @device)
-    assert {:ok, fresh, _} = BrowserSignIn.issue(recovered, @person, @device, c.hash, 101)
+    assert {:ok, consumed, %{person_id: @person}} =
+             BrowserSignIn.consume(issued, fresh_hash, 102)
 
-    assert {:ok, _, %{person_id: @person, owner_key: @device, owner_revision: 2}} =
-             BrowserSignIn.consume(fresh, c.hash, 102)
-
-    other_hash = :crypto.hash(:sha256, "other-person-login")
-    assert {:ok, other, _} = BrowserSignIn.issue(recovered, @other, @other_owner, other_hash, 101)
-
-    assert {:ok, _, %{person_id: @other, owner_key: @other_owner, owner_revision: 1}} =
-             BrowserSignIn.consume(other, other_hash, 102)
-
-    assert fresh.devices == recovered.devices
-    assert other.sender_grants == recovered.sender_grants
+    refute Map.has_key?(consumed.browser_sign_ins, fresh_hash)
   end
 
   test "owner TLS issues only a same-person credential and refuses caller-supplied identity or lifetime",

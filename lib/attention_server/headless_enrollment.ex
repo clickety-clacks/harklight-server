@@ -75,19 +75,9 @@ defmodule AttentionServer.HeadlessEnrollment do
           submit_existing(directory, endpoint, label)
         end
 
-      {:error, :not_found} = result ->
-        case read_json(Path.join(directory, @pending_file)) do
-          {:ok, %{"expires_at" => deadline}} when is_integer(deadline) ->
-            if deadline <= System.system_time(:millisecond) do
-              with :ok <- archive_pending(directory) do
-                submit_existing(directory, endpoint, label)
-              end
-            else
-              result
-            end
-
-          _ ->
-            result
+      {:error, :not_found} ->
+        with :ok <- archive_pending(directory) do
+          submit_existing(directory, endpoint, label)
         end
 
       other ->
@@ -348,9 +338,17 @@ defmodule AttentionServer.HeadlessEnrollment do
   defp valid_response?(code, secret, deadline, status_deadline) do
     is_binary(code) and Regex.match?(~r/\A[A-Z2-7]{10}\z/, code) and
       is_binary(secret) and Regex.match?(~r/\A[0-9a-f]{64}\z/, secret) and
-      is_integer(deadline) and deadline > System.system_time(:millisecond) and
-      is_integer(status_deadline) and status_deadline == deadline + 86_400_000
+      valid_expiry_pair?(deadline, status_deadline)
   end
+
+  defp valid_expiry_pair?(nil, nil), do: true
+
+  defp valid_expiry_pair?(deadline, status_deadline)
+       when is_integer(deadline) and is_integer(status_deadline) do
+    deadline > System.system_time(:millisecond) and status_deadline == deadline + 86_400_000
+  end
+
+  defp valid_expiry_pair?(_deadline, _status_deadline), do: false
 
   defp save_server(directory, endpoint) do
     with {:ok, identity} <- server_identity(endpoint),

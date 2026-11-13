@@ -79,7 +79,8 @@ defmodule AttentionServer.CLI.Enroll do
 
     case result do
       {:ok, %{approval_code: code, expires_at: deadline}} ->
-        AttentionServer.CLI.shell().info("approval code: #{code}; expires_at: #{deadline}")
+        expiry = if is_integer(deadline), do: "expires_at: #{deadline}", else: "no expiry"
+        AttentionServer.CLI.shell().info("approval code: #{code}; #{expiry}")
 
       {:ok, %{"state" => "approved"}} when command == "retry" ->
         AttentionServer.CLI.shell().info(

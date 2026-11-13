@@ -1,6 +1,6 @@
 defmodule AttentionServer.DashboardBrowserSession do
   @moduledoc """
-  Short-lived browser cookies after Relay consumes a durable one-use sign-in token.
+  In-memory browser cookies after Relay consumes a durable one-use sign-in token.
 
   The injected consumer returns only a committed owner principal and issuer
   revision. This process never issues, stores, or reuses sign-in links. Every

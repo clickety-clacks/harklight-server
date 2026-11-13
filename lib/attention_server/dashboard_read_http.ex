@@ -1067,7 +1067,10 @@ defmodule AttentionServer.DashboardReadHTTP do
             throw new Error("invalid invitation");
           }
           const account = typeof invitation.account_label === "string" ? invitation.account_label : "The account";
-          details.textContent = `${account} on ${invitation.server_name}; expires ${new Date(invitation.expires_at).toLocaleString()}.`;
+          const expiry = invitation.expires_at == null
+            ? "No expiry"
+            : "expires " + new Date(invitation.expires_at).toLocaleString();
+          details.textContent = account + " on " + invitation.server_name + "; " + expiry + ".";
           open.href = invitation.join_url;
           open.hidden = false;
           status.textContent = "Invitation ready.";
@@ -1111,7 +1114,10 @@ defmodule AttentionServer.DashboardReadHTTP do
           if (typeof invitation.join_url !== "string" || !invitation.join_url.startsWith("harklight://join#")) {
             throw new Error("invalid invitation");
           }
-          details.textContent = `Account ${invitation.person_id} on ${invitation.server_name}; expires ${new Date(invitation.expires_at).toLocaleString()}.`;
+          const expiry = invitation.expires_at == null
+            ? "No expiry"
+            : "expires " + new Date(invitation.expires_at).toLocaleString();
+          details.textContent = "Account " + invitation.person_id + " on " + invitation.server_name + "; " + expiry + ".";
           open.href = invitation.join_url;
           open.hidden = false;
           status.textContent = "Invitation ready. Open it in Harklight, then review the account and trust details before joining.";
