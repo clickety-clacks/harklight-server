@@ -1,6 +1,6 @@
 # Harklight Server self-hosted installation
 
-Version: **0.1.35**. Package target: **Linux x86_64, glibc 2.39 or newer**, with OpenSSL 3 shared libraries and libstdc++6 (built on Ubuntu 24.04). The package bundles
+Version: **0.1.38**. Package target: **Linux x86_64, glibc 2.39 or newer**, with OpenSSL 3 shared libraries and libstdc++6 (built on Ubuntu 24.04). The package bundles
 Erlang/OTP and Elixir bytecode; users need no Mix, Hex, source checkout or
 Erlang installation. It needs Bash, OpenSSL CLI, tar and the platform libraries
 listed in BUILD_INFO. This is a single-process self-hosted server cut.
@@ -32,9 +32,9 @@ a live phone test.
 
 ## Download and verify
 
-After publication, download the v0.1.35 release from
-clickety-clacks/harklight-server, tag v0.1.35. Get
-harklight-server-0.1.35-linux-x86_64.tar.gz, SHA256SUMS and SELF_HOST.md from
+After publication, download the v0.1.38 release from
+clickety-clacks/harklight-server, tag v0.1.38. Get
+harklight-server-0.1.38-linux-x86_64.tar.gz, SHA256SUMS and SELF_HOST.md from
 that release. Run sha256sum -c SHA256SUMS and extract into an operator-owned
 versioned directory. BUILD_INFO identifies the source commit, build host,
 toolchain, source status and native dependencies.
@@ -47,7 +47,7 @@ runtime/dependency notices remain in their shipped distribution files.
 Choose the DNS hostname clients will validate. For a same-machine preview,
 localhost works. Install into a directory you own and run:
 
-    PACKAGE="$PWD/harklight-server-0.1.35-linux-x86_64"
+    PACKAGE="$PWD/harklight-server-0.1.38-linux-x86_64"
     STATE="$HOME/.local/share/harklight-server"
     "$PACKAGE/bin/harklight-bootstrap" "$STATE" localhost
     cat "$STATE/person-id"
@@ -314,8 +314,11 @@ survive restart.
 For a manual upgrade of an existing installation, stop the old server and back
 up the full private state before upgrading. The release installer makes one
 full mutable-root backup after stopping the service and before switching
-releases. This source, v0.1.35, writes store FORMAT27 and adds no schema or
-store-format migration over published v0.1.33. It retains the supported
+releases. This source, v0.1.38, is based on v0.1.35 with durable-ACK and timeout
+fixes; it excludes the focus and FORMAT29 work from v0.1.37. It writes FORMAT27
+and adds a SQLite progress table without rewriting the existing snapshot or
+migrating its format. It cannot open an existing FORMAT28 or FORMAT29 store.
+It retains the supported
 FORMAT25-to-FORMAT27 migration already present in v0.1.33. The v0.1.28 package
 cannot start against the resulting FORMAT27 state; changing
 only the code or release link cannot restore compatibility. The FORMAT25 state
@@ -408,22 +411,27 @@ exact acceptance sequence and intent reference, without source ruling authority.
 
 For a manual upgrade, stop the old process and back up the complete private
 state directory, including the database and keys, before the first start of a
-v0.1.35 package. Verify the package checksum and extract into a different
+v0.1.38 package. Verify the package checksum and extract into a different
 versioned directory. Keep the state path, trust root, owner/person and
 configuration. Start with the existing `server.env`; do not rerun bootstrap.
 The first start durably migrates supported FORMAT25 state to FORMAT27. The
-v0.1.35 relay-close repair itself adds no migration. Published v0.1.33 writes
-the same FORMAT27 store format, so reverting to .33 needs no data migration
-rollback. There is no hot upgrade; only one server may own a database.
+v0.1.38 repair itself retains FORMAT27 and adds a progress table. Published
+v0.1.35 opens and serves that store but ignores the new table's ACK progress.
+Rollback requires restoring the install-time backup and the prior binary,
+even though the snapshot format number is unchanged. There is no hot upgrade;
+only one server may own a database.
 
 The release installer stops the service and confirms the process has stopped,
 creates one full mutable-root backup, switches `current`, and starts the
 selected package. It waits for the selected process to become active under that
 release. If the candidate start or process readiness fails, it attempts to
 stop the candidate, restore the pre-install mutable root and prior `current`
-link from that backup, then start and check the prior release. The restore path
-has not been exercised in preparation of this package; this description is not
-evidence of tested recovery. The restore or prior-release startup/readiness can
+link from that backup, then start and check the prior release. An isolated
+manual upgrade/restore with the same product code exercised this archive
+operation and the unchanged shipped restore function, using real packaged
+servers and seeded data; the restored database and message content matched.
+It did not exercise the complete systemd installer or failure recovery cases.
+The restore or prior-release startup/readiness can
 fail and leave the service stopped. The failed package remains under its
 versioned release directory but is not selected. The archive includes the
 database and private configuration, and excludes immutable versioned releases,
@@ -439,7 +447,7 @@ trigger a whole-release rollback.
 
 Restoring the pre-install backup discards every write made after its capture,
 including any writes made by the candidate during its failed start. The
-installer's restore path has not been exercised in preparation of this package.
+full systemd installer was not exercised by the isolated manual rehearsal.
 Although it captures a full mutable-root backup while the service is stopped,
 restoration or prior-release startup can fail; do not assume recovery or a
 recovery time.
@@ -448,15 +456,15 @@ The installer attempts backup restoration only when candidate start or
 process-readiness fails. After readiness, it does not automatically roll back;
 the optional owner agent-list probe is warning-only.
 
-Before the first v0.1.35 start, stop the server and take a complete private
-state backup, including the database and keys. After any v0.1.35 write,
+Before the first v0.1.38 start, stop the server and take a complete private
+state backup, including the database and keys. After any v0.1.38 write,
 returning to v0.1.28 requires stopping the server, restoring that pre-start
 backup and then running v0.1.28. v0.1.28 cannot read the resulting FORMAT27
 state, and changing only the code or release link does not restore
 compatibility. Restoring the backup loses every write since it was taken and
 cannot undo external notifications, bounces or agent deliveries. Restore
-success is unproved and has not been tested; it may fail, so no recovery success
-or time is guaranteed. Preserve the backup and current state if restoration
+on this older-format downgrade path is unproved; it may fail, so no recovery
+success or time is guaranteed. Preserve the backup and current state if restoration
 does not succeed. The same format number does not make a downgrade from
 v0.1.25 or later safe: after ACK2 data has been written, do not switch to
 v0.1.24 or earlier against the current state. Keep backups and keys private.
