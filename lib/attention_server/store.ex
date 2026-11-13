@@ -23,9 +23,18 @@ defmodule AttentionServer.Store do
 
   @format_version 29
   @inbox_index_chunk_size 20
-  defstruct [:db, :engine, :version, :upload_dir]
+  defstruct [:db, :engine, :version, :upload_dir, progress_version: 0]
+
+  @progress_fields [:cursors, :conversation_cursors, :conversation_opened]
 
   @schema """
+  CREATE TABLE IF NOT EXISTS relay_device_progress (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    snapshot_version INTEGER NOT NULL,
+    version INTEGER NOT NULL,
+    payload BLOB NOT NULL,
+    checksum BLOB NOT NULL
+  );
   CREATE TABLE IF NOT EXISTS relay_state (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     version INTEGER NOT NULL,
@@ -130,8 +139,15 @@ defmodule AttentionServer.Store do
                      engine: engine,
                      version: version,
                      upload_dir: upload_dir
+                   }),
+                 {:ok, store} <-
+                   load_progress(%__MODULE__{
+                     db: db,
+                     engine: engine,
+                     version: version,
+                     upload_dir: upload_dir
                    }) do
-              {:ok, %__MODULE__{db: db, engine: engine, version: version, upload_dir: upload_dir}}
+              {:ok, store}
             else
               {:error, reason} ->
                 Diagnostics.failure(:server_storage, :store_open, reason, :unavailable)
@@ -922,8 +938,9 @@ defmodule AttentionServer.Store do
         audit
       ) do
     with {:ok, next_engine} <- Engine.checkpoint_cursor(engine, device, high),
-         %__MODULE__{db: db, version: version} <- store,
+         %__MODULE__{db: db} <- store,
          :ok <- Sqlite3.execute(db, "BEGIN IMMEDIATE"),
+         :ok <- check_progress_version(store),
          {:ok, row} <-
            one(
              db,
@@ -935,11 +952,13 @@ defmodule AttentionServer.Store do
          :ok <-
            if(duplicate?,
              do: :ok,
-             else: checkpoint_commit(db, version, next_engine, person, device, snapshot_id, audit)
+             else: checkpoint_commit(store, next_engine, person, device, snapshot_id, audit)
            ),
          :ok <- Sqlite3.execute(db, "COMMIT") do
       next_store =
-        if duplicate?, do: store, else: %{store | engine: next_engine, version: version + 1}
+        if duplicate?,
+          do: store,
+          else: %{store | engine: next_engine, progress_version: store.progress_version + 1}
 
       {:ok, next_store, duplicate?}
     else
@@ -968,18 +987,23 @@ defmodule AttentionServer.Store do
     do: {:ok, %{store | engine: next}}
 
   def commit(%__MODULE__{} = store, next, audit) do
-    if valid_state?(next, :incremental) do
-      commit_durable(store, next, audit)
-    else
-      Diagnostics.failure(
-        :server_storage,
-        :state_commit,
-        :invalid_state,
-        :unavailable,
-        operation_id(audit)
-      )
+    cond do
+      progress_only?(store.engine, next) and valid_progress?(next) ->
+        commit_progress(store, next, audit)
 
-      {:error, :storage_unavailable, store}
+      valid_state?(next, :incremental) ->
+        commit_durable(store, next, audit)
+
+      true ->
+        Diagnostics.failure(
+          :server_storage,
+          :state_commit,
+          :invalid_state,
+          :unavailable,
+          operation_id(audit)
+        )
+
+        {:error, :storage_unavailable, store}
     end
   end
 
@@ -989,6 +1013,7 @@ defmodule AttentionServer.Store do
 
     result =
       with :ok <- Sqlite3.execute(db, "BEGIN IMMEDIATE"),
+           :ok <- check_progress_version(store),
            :ok <-
              run(
                db,
@@ -1000,6 +1025,7 @@ defmodule AttentionServer.Store do
                ]
              ),
            {:ok, 1} <- Sqlite3.changes(db),
+           :ok <- Sqlite3.execute(db, "DELETE FROM relay_device_progress"),
            :ok <-
              run(
                db,
@@ -1017,7 +1043,7 @@ defmodule AttentionServer.Store do
 
     case result do
       :ok ->
-        {:ok, %{store | engine: next, version: version + 1}}
+        {:ok, %{store | engine: next, version: version + 1, progress_version: 0}}
 
       error ->
         Diagnostics.failure(
@@ -1029,6 +1055,125 @@ defmodule AttentionServer.Store do
         )
 
         _ = Sqlite3.execute(db, "ROLLBACK")
+        {:error, :storage_unavailable, store}
+    end
+  end
+
+  # ACKs must be durable before their replies, but do not change retained history.
+  # The overlay is tied to the snapshot generation. Older releases ignore it;
+  # if they write a newer snapshot, its progress supersedes the old overlay.
+  defp progress_only?(old, next) do
+    Map.merge(next, Map.take(old, @progress_fields)) === old
+  end
+
+  defp valid_progress?(engine) do
+    is_map(engine.cursors) and
+      Enum.all?(engine.cursors, fn {{person, key}, seq} ->
+        owns?(engine, person, key) and is_integer(seq) and seq >= 0 and
+          seq <= engine.persons[person]
+      end) and
+      is_map(engine.conversation_cursors) and
+      Enum.all?(engine.conversation_cursors, fn {{person, key}, seq} ->
+        owns?(engine, person, key) and is_integer(seq) and seq >= 0 and
+          seq <= Map.get(engine.conversation_highs, person, 0)
+      end) and
+      is_struct(engine.conversation_opened, MapSet) and
+      Enum.all?(engine.conversation_opened, fn {person, key} -> owns?(engine, person, key) end)
+  rescue
+    _ -> false
+  end
+
+  defp load_progress(store) do
+    case one(
+           store.db,
+           "SELECT version, payload, checksum FROM relay_device_progress WHERE id = 1 AND snapshot_version = ?",
+           [store.version]
+         ) do
+      {:ok, nil} ->
+        {:ok, store}
+
+      {:ok, [version, payload, checksum]} ->
+        with {:ok, progress} <- decode_checked_term(payload, checksum),
+             true <-
+               is_map(progress) and Enum.sort(Map.keys(progress)) == Enum.sort(@progress_fields),
+             engine = Map.merge(store.engine, progress),
+             true <- valid_progress?(engine) do
+          {:ok, %{store | engine: engine, progress_version: version}}
+        else
+          _ -> {:error, :storage_unavailable}
+        end
+
+      _ ->
+        {:error, :storage_unavailable}
+    end
+  end
+
+  defp check_progress_version(store) do
+    with {:ok, [snapshot_version]} <-
+           one(store.db, "SELECT version FROM relay_state WHERE id = 1", []),
+         true <- snapshot_version == store.version,
+         {:ok, row} <-
+           one(
+             store.db,
+             "SELECT version FROM relay_device_progress WHERE id = 1 AND snapshot_version = ?",
+             [store.version]
+           ),
+         true <-
+           (case row do
+              nil -> 0
+              [version] -> version
+            end) == store.progress_version do
+      :ok
+    else
+      _ -> {:error, :storage_unavailable}
+    end
+  end
+
+  defp write_progress(store, next) do
+    payload = encode_term(Map.take(next, @progress_fields))
+
+    with :ok <- check_progress_version(store) do
+      run(
+        store.db,
+        "INSERT OR REPLACE INTO relay_device_progress (id, snapshot_version, version, payload, checksum) VALUES (1, ?, ?, ?, ?)",
+        [
+          store.version,
+          store.progress_version + 1,
+          {:blob, payload},
+          {:blob, :crypto.hash(:sha256, payload)}
+        ]
+      )
+    end
+  end
+
+  defp commit_progress(store, next, audit) do
+    result =
+      with :ok <- Sqlite3.execute(store.db, "BEGIN IMMEDIATE"),
+           :ok <- write_progress(store, next),
+           :ok <-
+             run(
+               store.db,
+               "INSERT INTO relay_audit (person_id, actor_id, action, at_ms) VALUES (?, ?, ?, ?)",
+               [audit.person, audit.actor, audit.action, System.system_time(:millisecond)]
+             ),
+           :ok <- Sqlite3.execute(store.db, "COMMIT") do
+        {:ok, %{store | engine: next, progress_version: store.progress_version + 1}}
+      end
+
+    case result do
+      {:ok, _} ->
+        result
+
+      error ->
+        Diagnostics.failure(
+          :server_storage,
+          :state_commit,
+          error,
+          :outcome_unknown,
+          operation_id(audit)
+        )
+
+        _ = Sqlite3.execute(store.db, "ROLLBACK")
         {:error, :storage_unavailable, store}
     end
   end
@@ -1106,147 +1251,155 @@ defmodule AttentionServer.Store do
                    ] ->
                 original = struct(Engine, Map.from_struct(stored))
 
-                engine =
-                  original
-                  |> then(fn state ->
-                    if format < 3, do: normalize_enrollments(state), else: state
-                  end)
-                  |> then(fn state ->
-                    if format < 8, do: normalize_pending_v8(state), else: state
-                  end)
-                  |> then(fn state ->
-                    if format < 9, do: normalize_agents_v9(state), else: state
-                  end)
-                  |> then(fn state ->
-                    if format < 10, do: normalize_push_v10(state), else: state
-                  end)
-                  |> then(fn state ->
-                    if format < 11, do: normalize_push_reasons_v11(state), else: state
-                  end)
-                  |> then(fn state ->
-                    if format < 13, do: normalize_device_metadata(state), else: state
-                  end)
-                  |> then(fn state ->
-                    if format < 15 do
-                      invitations =
-                        Map.new(state.join_invitations, fn {hash, item} ->
-                          {hash, Map.put_new(item, :request_id, nil)}
-                        end)
+                # A FORMAT27 store can have newer durable ACKs in the progress
+                # table. Load them before normalization advances the snapshot
+                # generation, and fold them into that same migration transaction.
+                with {:ok, original_store} <-
+                       load_progress(%__MODULE__{db: db, engine: original, version: version}) do
+                  original = original_store.engine
 
-                      %{state | join_invitations: invitations}
-                    else
-                      state
-                    end
-                  end)
-                  |> then(fn state ->
-                    if format < 16, do: normalize_resumable_pending(state), else: state
-                  end)
-                  |> then(fn state ->
-                    if format < 17, do: normalize_push_presentation(state), else: state
-                  end)
-                  |> then(fn state ->
-                    if format < 19, do: normalize_conversation_push(state), else: state
-                  end)
-                  |> then(fn state ->
-                    if format < 20, do: Map.put(state, :uploads, %{}), else: state
-                  end)
-                  |> then(fn state ->
-                    if format < 21 do
-                      now = System.system_time(:millisecond)
+                  engine =
+                    original
+                    |> then(fn state ->
+                      if format < 3, do: normalize_enrollments(state), else: state
+                    end)
+                    |> then(fn state ->
+                      if format < 8, do: normalize_pending_v8(state), else: state
+                    end)
+                    |> then(fn state ->
+                      if format < 9, do: normalize_agents_v9(state), else: state
+                    end)
+                    |> then(fn state ->
+                      if format < 10, do: normalize_push_v10(state), else: state
+                    end)
+                    |> then(fn state ->
+                      if format < 11, do: normalize_push_reasons_v11(state), else: state
+                    end)
+                    |> then(fn state ->
+                      if format < 13, do: normalize_device_metadata(state), else: state
+                    end)
+                    |> then(fn state ->
+                      if format < 15 do
+                        invitations =
+                          Map.new(state.join_invitations, fn {hash, item} ->
+                            {hash, Map.put_new(item, :request_id, nil)}
+                          end)
 
-                      uploads =
-                        Map.new(state.uploads, fn {id, upload} ->
-                          {id, Map.put_new(upload, :last_activity_ms, now)}
-                        end)
-
-                      %{state | uploads: uploads}
-                    else
-                      state
-                    end
-                  end)
-                  |> then(fn state ->
-                    if format < 22, do: Map.put(state, :hosted_accounts, %{}), else: state
-                  end)
-                  |> then(fn state ->
-                    if format < 23 do
-                      %{state | algorithm_choices: %{}, jev_endpoint: nil, jev_model: nil}
-                    else
-                      state
-                    end
-                  end)
-                  |> then(fn state ->
-                    if format < 24, do: %{state | chat_read_positions: %{}}, else: state
-                  end)
-                  |> then(fn state ->
-                    if format < 26 do
-                      %{
+                        %{state | join_invitations: invitations}
+                      else
                         state
-                        | bounce_levels: %{},
-                          bounce_revisions: %{},
-                          opened_revisions: MapSet.new(),
-                          advisory_feeds: %{}
-                      }
-                    else
-                      state
-                    end
-                  end)
-                  |> then(fn state ->
-                    if format < 28, do: normalize_device_focus_permissions(state), else: state
-                  end)
-                  |> then(fn state ->
-                    if format < 29, do: Map.put(state, :delivery_states, %{}), else: state
-                  end)
+                      end
+                    end)
+                    |> then(fn state ->
+                      if format < 16, do: normalize_resumable_pending(state), else: state
+                    end)
+                    |> then(fn state ->
+                      if format < 17, do: normalize_push_presentation(state), else: state
+                    end)
+                    |> then(fn state ->
+                      if format < 19, do: normalize_conversation_push(state), else: state
+                    end)
+                    |> then(fn state ->
+                      if format < 20, do: Map.put(state, :uploads, %{}), else: state
+                    end)
+                    |> then(fn state ->
+                      if format < 21 do
+                        now = System.system_time(:millisecond)
 
-                engine =
-                  engine
-                  |> BounceDecision.rebuild_indexes()
-                  |> Engine.rebuild_route_b_index()
+                        uploads =
+                          Map.new(state.uploads, fn {id, upload} ->
+                            {id, Map.put_new(upload, :last_activity_ms, now)}
+                          end)
 
-                cond do
-                  not valid_state?(engine) ->
-                    {:error, :invalid_state}
+                        %{state | uploads: uploads}
+                      else
+                        state
+                      end
+                    end)
+                    |> then(fn state ->
+                      if format < 22, do: Map.put(state, :hosted_accounts, %{}), else: state
+                    end)
+                    |> then(fn state ->
+                      if format < 23 do
+                        %{state | algorithm_choices: %{}, jev_endpoint: nil, jev_model: nil}
+                      else
+                        state
+                      end
+                    end)
+                    |> then(fn state ->
+                      if format < 24, do: %{state | chat_read_positions: %{}}, else: state
+                    end)
+                    |> then(fn state ->
+                      if format < 26 do
+                        %{
+                          state
+                          | bounce_levels: %{},
+                            bounce_revisions: %{},
+                            opened_revisions: MapSet.new(),
+                            advisory_feeds: %{}
+                        }
+                      else
+                        state
+                      end
+                    end)
+                    |> then(fn state ->
+                      if format < 28, do: normalize_device_focus_permissions(state), else: state
+                    end)
+                    |> then(fn state ->
+                      if format < 29, do: Map.put(state, :delivery_states, %{}), else: state
+                    end)
 
-                  format == @format_version and
-                      same_state_except_bounce_indexes?(engine, original) ->
-                    {:ok, engine, version}
+                  engine =
+                    engine
+                    |> BounceDecision.rebuild_indexes()
+                    |> Engine.rebuild_route_b_index()
 
-                  true ->
-                    case commit_durable(
-                           %__MODULE__{db: db, engine: original, version: version},
-                           engine,
-                           %{
-                             person: "system",
-                             actor: "schema_migration",
-                             action:
-                               cond do
-                                 format < 3 -> "enrollment_revision_init"
-                                 format < 4 -> "owner_state_init"
-                                 format < 5 -> "pending_state_init"
-                                 format < 6 -> "maintainer_state_init"
-                                 format < 7 -> "pending_v8_readback_init"
-                                 format < 9 -> "agent_authority_init"
-                                 format < 10 -> "push_state_init"
-                                 format < 11 -> "push_reason_sanitize"
-                                 format < 12 -> "join_invitation_init"
-                                 format < 13 -> "device_metadata_init"
-                                 format < 14 -> "browser_sign_in_init"
-                                 format < 15 -> "invitation_request_init"
-                                 format < 16 -> "resumable_pending_init"
-                                 format < 17 -> "push_presentation_init"
-                                 format < 18 -> "conversation_feed_init"
-                                 format < 23 -> "prioritization_init"
-                                 format < 24 -> "chat_read_positions_init"
-                                 format < 26 -> "bounce_state_init"
-                                 format < 27 -> "bounce_schedule_index_init"
-                                 format < 28 -> "device_focus_permissions_init"
-                                 format < 29 -> "hosted_delivery_state_init"
-                                 true -> "state_format"
-                               end
-                           }
-                         ) do
-                      {:ok, migrated} -> {:ok, migrated.engine, migrated.version}
-                      _ -> {:error, :migration_failed}
-                    end
+                  cond do
+                    not valid_state?(engine) ->
+                      {:error, :invalid_state}
+
+                    format == @format_version and
+                        same_state_except_bounce_indexes?(engine, original) ->
+                      {:ok, engine, version}
+
+                    true ->
+                      case commit_durable(
+                             original_store,
+                             engine,
+                             %{
+                               person: "system",
+                               actor: "schema_migration",
+                               action:
+                                 cond do
+                                   format < 3 -> "enrollment_revision_init"
+                                   format < 4 -> "owner_state_init"
+                                   format < 5 -> "pending_state_init"
+                                   format < 6 -> "maintainer_state_init"
+                                   format < 7 -> "pending_v8_readback_init"
+                                   format < 9 -> "agent_authority_init"
+                                   format < 10 -> "push_state_init"
+                                   format < 11 -> "push_reason_sanitize"
+                                   format < 12 -> "join_invitation_init"
+                                   format < 13 -> "device_metadata_init"
+                                   format < 14 -> "browser_sign_in_init"
+                                   format < 15 -> "invitation_request_init"
+                                   format < 16 -> "resumable_pending_init"
+                                   format < 17 -> "push_presentation_init"
+                                   format < 18 -> "conversation_feed_init"
+                                   format < 23 -> "prioritization_init"
+                                   format < 24 -> "chat_read_positions_init"
+                                   format < 26 -> "bounce_state_init"
+                                   format < 27 -> "bounce_schedule_index_init"
+                                   format < 28 -> "device_focus_permissions_init"
+                                   format < 29 -> "hosted_delivery_state_init"
+                                   true -> "state_format"
+                                 end
+                             }
+                           ) do
+                        {:ok, migrated} -> {:ok, migrated.engine, migrated.version}
+                        _ -> {:error, :migration_failed}
+                      end
+                  end
                 end
 
               _ ->
@@ -1678,17 +1831,10 @@ defmodule AttentionServer.Store do
        ),
        do: {:error, :checkpoint_conflict}
 
-  defp checkpoint_commit(db, version, next_engine, person, device, snapshot_id, audit) do
-    payload = encode_state(next_engine)
-    checksum = :crypto.hash(:sha256, payload)
+  defp checkpoint_commit(store, next_engine, person, device, snapshot_id, audit) do
+    db = store.db
 
-    with :ok <-
-           run(
-             db,
-             "UPDATE relay_state SET version = version + 1, payload = ?, checksum = ? WHERE id = 1 AND version = ?",
-             [{:blob, payload}, {:blob, checksum}, version]
-           ),
-         {:ok, 1} <- Sqlite3.changes(db),
+    with :ok <- write_progress(store, next_engine),
          :ok <-
            run(
              db,

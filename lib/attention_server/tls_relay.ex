@@ -13,7 +13,7 @@ defmodule AttentionServer.TLSRelay do
 
   alias AttentionServer.{DeviceIdentity, EnrolledLeafVerify, Relay}
 
-  @handshake_timeout 3_000
+  @handshake_timeout :infinity
   @poll_ms 100
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts)
@@ -91,8 +91,6 @@ defmodule AttentionServer.TLSRelay do
       mode: :binary,
       packet: :line,
       packet_size: 2 * 1024 * 1024,
-      send_timeout: 1_000,
-      send_timeout_close: true,
       reuseaddr: true,
       versions: [:"tlsv1.3"],
       verify: :verify_peer,

@@ -13,7 +13,7 @@ defmodule AttentionServer.OwnerTLS do
 
   alias AttentionServer.{DeviceIdentity, Diagnostics, EnrolledLeafVerify, GuidedJoin, JSON, Relay}
 
-  @timeout 3_000
+  @timeout :infinity
   @max_line 32 * 1024
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts)
@@ -107,8 +107,6 @@ defmodule AttentionServer.OwnerTLS do
       mode: :binary,
       packet: :line,
       packet_size: @max_line,
-      send_timeout: 1_000,
-      send_timeout_close: true,
       reuseaddr: true,
       versions: [:"tlsv1.3"],
       certfile: String.to_charlist(certfile),

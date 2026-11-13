@@ -17,7 +17,7 @@ defmodule AttentionServer.OriginHTTPS do
     Relay
   }
 
-  @timeout 5_000
+  @timeout :infinity
   @max_header 16 * 1024
   @max_body 2 * 1024 * 1024
   @keepalive_ms 15_000
@@ -135,8 +135,6 @@ defmodule AttentionServer.OriginHTTPS do
       active: false,
       mode: :binary,
       packet: :raw,
-      send_timeout: 1_000,
-      send_timeout_close: true,
       reuseaddr: true,
       versions: [:"tlsv1.3"],
       certfile: String.to_charlist(certfile),
