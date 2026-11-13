@@ -2519,7 +2519,6 @@ defmodule AttentionServer.Store do
     pending = engine.pending_enrollments
 
     is_map(pending) and is_map(engine.pending_history) and
-      map_size(pending) + map_size(engine.pending_history) <= 1_024 and
       Enum.all?(pending, fn {code, item} ->
         is_binary(code) and Regex.match?(~r/\A[A-Z2-7]{10}\z/, code) and
           hex_key?(item.key) and

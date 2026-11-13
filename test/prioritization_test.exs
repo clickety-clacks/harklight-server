@@ -1887,7 +1887,10 @@ defmodule AttentionServer.PrioritizationTest do
     assert state.priority_views["person-a"].basis == "selected"
   end
 
-  test "intake proceeds while a stand-in ranking request is waiting", %{dir: dir, path: path} do
+  test "new input cancels a superseded ranking request while intake proceeds", %{
+    dir: dir,
+    path: path
+  } do
     use_synthetic_jev_key(dir)
     parent = self()
 
@@ -1903,12 +1906,15 @@ defmodule AttentionServer.PrioritizationTest do
     setup_person(relay)
     configure_jev_choice(relay)
     forward(relay, 1, "first")
-    assert_receive {:ranking_waiting, worker}, 2_000
+    assert_receive {:ranking_waiting, first_worker}, 2_000
+
     forward(relay, 2, "accepted-while-ranking")
     assert {:ok, events, 2} = Relay.events(relay, "device-a", 0)
     assert length(events) == 2
-    send(worker, :release)
+
     assert_receive {:ranking_waiting, next_worker}, 2_000
+    refute Process.alive?(first_worker)
+    assert Process.alive?(next_worker)
     send(next_worker, :release)
     await_state(relay, &(not Map.has_key?(&1.priority_jobs, "person-a")))
   end

@@ -1148,7 +1148,6 @@ defmodule AttentionServer.Engine do
     end
   end
 
-  @pending_limit 1_024
   @pending_lifetime_ms 24 * 60 * 60 * 1_000
   @status_lifetime_ms 24 * 60 * 60 * 1_000
 
@@ -1182,10 +1181,6 @@ defmodule AttentionServer.Engine do
           item.key == key and item.state == :pending
         end) ->
           {:error, :key_pending}
-
-        map_size(compacted.pending_enrollments) + map_size(compacted.pending_history) >=
-            @pending_limit ->
-          {:error, :capacity}
 
         Map.has_key?(compacted.pending_enrollments, code) or
           Map.has_key?(compacted.pending_history, code) or

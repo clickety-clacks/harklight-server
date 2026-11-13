@@ -512,7 +512,7 @@ defmodule AttentionServer.GuidedJoinTest do
     Store.close(reloaded)
   end
 
-  test "a full retained-request set still renews the existing joined attempt and permits owner decline",
+  test "a full retained-request set renews the existing joined attempt and admits another request",
        c do
     {:ok, engine, _} = create(c)
     {:ok, pending, reply} = redeem(c, engine, c.config, 1)
@@ -527,7 +527,7 @@ defmodule AttentionServer.GuidedJoinTest do
            key: c.other_key,
            secret_hash: :crypto.hash(:sha256, <<index::32>>),
            expires_at: reply["expires_at"] + 1,
-           status_expires_at: reply["expires_at"] + 86_400_001
+           status_expires_at: reply["expires_at"] + 86_400_000
          }}
       end)
 
@@ -545,7 +545,7 @@ defmodule AttentionServer.GuidedJoinTest do
 
     assert map_size(renewed.pending_enrollments) + map_size(renewed.pending_history) == 1_024
 
-    assert {:error, :capacity} =
+    assert {:ok, over_limit} =
              Engine.pending_enroll(
                renewed,
                TLSFixtures.certificate_der!(c.certs, "unknown"),
@@ -554,6 +554,9 @@ defmodule AttentionServer.GuidedJoinTest do
                :crypto.hash(:sha256, "new request"),
                reply["expires_at"] + 1
              )
+
+    assert map_size(over_limit.pending_enrollments) + map_size(over_limit.pending_history) ==
+             1_025
 
     assert {:ok, declined} =
              Engine.pending_decline(

@@ -4867,6 +4867,11 @@ defmodule AttentionServer.Relay do
       _ -> :ok
     end
 
+    case Map.get(state.priority_jobs, person) do
+      %{pid: pid} -> Process.exit(pid, :kill)
+      _ -> :ok
+    end
+
     %{
       state
       | priority_generations: Map.put(state.priority_generations, person, generation),

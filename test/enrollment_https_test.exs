@@ -196,7 +196,7 @@ defmodule AttentionServer.EnrollmentHTTPSTest do
     assert :sys.get_state(relay).store.engine.pending_enrollments == %{}
   end
 
-  test "real TLS capacity refusal discloses no request handle and preserves retained status", %{
+  test "real TLS enrollment remains available above the former retained-record cap", %{
     certs: certs,
     listener: listener,
     relay: relay
@@ -230,15 +230,27 @@ defmodule AttentionServer.EnrollmentHTTPSTest do
     :sys.replace_state(relay, fn current -> %{current | store: stored} end)
     pem = File.read!(Path.join(certs, "b1.pem"))
 
-    assert {503, %{"error" => "capacity"}} =
+    assert {200,
+            %{
+              "approval_code" => approval_code,
+              "status_secret" => status_secret,
+              "expires_at" => expires_at,
+              "status_expires_at" => status_expires_at
+            }} =
              post(listener, certs, "/enroll", %{"public_certificate" => pem, "label" => "new"})
+
+    assert is_binary(approval_code)
+    assert is_binary(status_secret)
+    assert status_expires_at == expires_at + 86_400_000
 
     assert {200, %{"state" => "expired"}} =
              post(listener, certs, "/enroll/status", %{
                "status_secret" => <<0::256>> |> Base.encode16(case: :lower)
              })
 
-    assert map_size(:sys.get_state(relay).store.engine.pending_history) == 1_024
+    committed_engine = :sys.get_state(relay).store.engine
+    assert map_size(committed_engine.pending_history) == 1_024
+    assert map_size(committed_engine.pending_enrollments) == 1
   end
 
   test "dropped first TLS reply leaves an opaque same-key retry without secret recovery", %{
