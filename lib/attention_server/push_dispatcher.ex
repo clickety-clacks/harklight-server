@@ -183,7 +183,7 @@ defmodule AttentionServer.PushDispatcher.Worker do
 
   @impl true
   def format_status(status) do
-    Map.update!(status, :state, &Map.delete(&1, :cached_token))
+    Map.update!(status, :state, &Map.drop(&1, [:cached_token, :apns]))
   end
 
   defp schedule(delay, state) do
