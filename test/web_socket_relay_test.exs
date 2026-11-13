@@ -14,7 +14,12 @@ defmodule AttentionServer.WebSocketRelayTest do
     File.mkdir_p!(dir)
     on_exit(fn -> File.rm_rf!(dir) end)
     path = Path.join(dir, "relay.sqlite3")
-    {:ok, relay} = Relay.start_link(store_path: path, enrollment_fixture_mode: true)
+
+    relay =
+      start_link_supervised!({Relay, store_path: path, enrollment_fixture_mode: true},
+        restart: :temporary
+      )
+
     assert :ok = Relay.setup_person(relay, "A")
     assert :ok = Relay.setup_person(relay, "B")
 
@@ -35,18 +40,15 @@ defmodule AttentionServer.WebSocketRelayTest do
     assert :ok = Relay.setup_sender(relay, keys["a1"], "app:test")
     assert :ok = Relay.setup_sender(relay, keys["b1"], "app:test")
 
-    {:ok, web} =
-      WebSocketRelay.start_link(
-        relay: relay,
-        certfile: Path.join(certs, "server.pem"),
-        keyfile: Path.join(certs, "server.key"),
-        cacertfile: Path.join(certs, "ca.pem")
+    web =
+      start_link_supervised!(
+        {WebSocketRelay,
+         relay: relay,
+         certfile: Path.join(certs, "server.pem"),
+         keyfile: Path.join(certs, "server.key"),
+         cacertfile: Path.join(certs, "ca.pem")},
+        restart: :temporary
       )
-
-    on_exit(fn ->
-      if Process.alive?(web), do: GenServer.stop(web)
-      if Process.alive?(relay), do: GenServer.stop(relay)
-    end)
 
     %{relay: relay, web: web, path: path, keys: keys}
   end
@@ -161,31 +163,29 @@ defmodule AttentionServer.WebSocketRelayTest do
   end
 
   defp start_websocket(relay, certs) do
-    {:ok, web} =
-      WebSocketRelay.start_link(
-        relay: relay,
-        certfile: Path.join(certs, "server.pem"),
-        keyfile: Path.join(certs, "server.key"),
-        cacertfile: Path.join(certs, "ca.pem")
-      )
-
-    web
+    start_link_supervised!(
+      {WebSocketRelay,
+       relay: relay,
+       certfile: Path.join(certs, "server.pem"),
+       keyfile: Path.join(certs, "server.key"),
+       cacertfile: Path.join(certs, "ca.pem")},
+      id: make_ref(),
+      restart: :temporary
+    )
   end
 
   defp restart_runtime(ctx, certs) do
     if Process.alive?(ctx.web), do: GenServer.stop(ctx.web)
     if Process.alive?(ctx.relay), do: GenServer.stop(ctx.relay)
 
-    {:ok, relay} = Relay.start_link(store_path: ctx.path, enrollment_fixture_mode: true)
+    relay =
+      start_link_supervised!({Relay, store_path: ctx.path, enrollment_fixture_mode: true},
+        id: make_ref(),
+        restart: :temporary
+      )
+
     web = start_websocket(relay, certs)
-    runtime = %{relay: relay, web: web, path: ctx.path}
-
-    on_exit(fn ->
-      if Process.alive?(runtime.web), do: GenServer.stop(runtime.web)
-      if Process.alive?(runtime.relay), do: GenServer.stop(runtime.relay)
-    end)
-
-    runtime
+    %{relay: relay, web: web, path: ctx.path}
   end
 
   defp drain_barrier(socket, events) do
@@ -1694,20 +1694,10 @@ defmodule AttentionServer.WebSocketRelayTest do
     GenServer.stop(reopened_web)
     GenServer.stop(reopened)
 
-    {:ok, after_ack} = Relay.start_link(store_path: path)
+    after_ack =
+      start_link_supervised!({Relay, store_path: path}, id: make_ref(), restart: :temporary)
 
-    {:ok, after_ack_web} =
-      WebSocketRelay.start_link(
-        relay: after_ack,
-        certfile: Path.join(certs, "server.pem"),
-        keyfile: Path.join(certs, "server.key"),
-        cacertfile: Path.join(certs, "ca.pem")
-      )
-
-    on_exit(fn ->
-      if Process.alive?(after_ack_web), do: GenServer.stop(after_ack_web)
-      if Process.alive?(after_ack), do: GenServer.stop(after_ack)
-    end)
+    after_ack_web = start_websocket(after_ack, certs)
 
     assert {:ok, 1} = Relay.acknowledged_cursor(after_ack, keys["a1"])
     assert {:ok, current} = connect(after_ack_web, certs, "a1")
