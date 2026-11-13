@@ -1,0 +1,27 @@
+name: Server CI
+
+on:
+  pull_request:
+    branches: [fix/durable-ack-035, ci/baseline-035]
+  push:
+    branches: [fix/durable-ack-035, ci/baseline-035]
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: Build and test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: '27.3.3'
+          elixir-version: '1.19.5'
+          version-type: strict
+
+      - run: mix deps.get
+      - run: MIX_ENV=prod mix compile
+      - run: mix test
