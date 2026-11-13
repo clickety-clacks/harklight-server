@@ -4,8 +4,8 @@
 
 Work directly on `main`, the integration line; do not make feature branches.
 Keep increments small, reviewable and releasable. Long features also land
-incrementally with incomplete behavior disabled. Preserve independent review
-and CI; if a required repository route prevents direct-main integration,
+incrementally with incomplete behavior disabled. Preserve CI;
+if a required repository route prevents direct-main integration,
 report the exact conflict to the delivery owner rather than bypassing or
 changing protections. Do not delay a focused fix for unrelated unfinished work
 unless there is a real dependency. CI builds and tests pull requests to `main`
