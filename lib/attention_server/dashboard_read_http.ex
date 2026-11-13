@@ -1176,8 +1176,7 @@ defmodule AttentionServer.DashboardReadHTTP do
                 secure: true,
                 http_only: true,
                 same_site: "Lax",
-                path: "/",
-                max_age: 12 * 60 * 60
+                path: "/"
               )
               |> send_resp(204, "")
 
