@@ -4,8 +4,6 @@ defmodule AttentionServer.JevClient do
   alias AttentionServer.JSON
 
   @key_path_env "ATTENTION_SERVER_JEV_KEY_PATH"
-  @endpoint_timeout 5_000
-  @request_timeout 30_000
   @response_limit 4 * 1024 * 1024
   @request_limit 8 * 1024 * 1024
   @request_budget 48_000
@@ -298,7 +296,8 @@ defmodule AttentionServer.JevClient do
              hostname: uri.host,
              mode: :passive,
              transport_opts: [
-               timeout: @endpoint_timeout,
+               timeout: :infinity,
+               keepalive: true,
                verify: :verify_peer,
                cacerts: :public_key.cacerts_get()
              ]
@@ -330,14 +329,11 @@ defmodule AttentionServer.JevClient do
   end
 
   defp receive_response(connection, request_ref) do
-    deadline = System.monotonic_time(:millisecond) + @request_timeout
-    receive_response(connection, request_ref, nil, <<>>, deadline)
+    receive_response(connection, request_ref, nil, <<>>)
   end
 
-  defp receive_response(connection, request_ref, status, body, deadline) do
-    timeout = max(deadline - System.monotonic_time(:millisecond), 0)
-
-    case Mint.HTTP2.recv(connection, 0, timeout) do
+  defp receive_response(connection, request_ref, status, body) do
+    case Mint.HTTP2.recv(connection, 0, :infinity) do
       {:ok, next, events} ->
         {status, body, complete?, too_large?} =
           Enum.reduce(events, {status, body, false, false}, fn
@@ -363,8 +359,7 @@ defmodule AttentionServer.JevClient do
           too_large? -> {:error, next, :response_too_large}
           complete? and is_integer(status) -> {:ok, next, status, body}
           byte_size(body) >= @response_limit -> {:error, next, :response_too_large}
-          System.monotonic_time(:millisecond) >= deadline -> {:error, next, :timeout}
-          true -> receive_response(next, request_ref, status, body, deadline)
+          true -> receive_response(next, request_ref, status, body)
         end
 
       {:error, next, _error, _responses} ->

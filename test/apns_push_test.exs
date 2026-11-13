@@ -163,7 +163,6 @@ defmodule AttentionServer.APNSPushTest do
       claim_id: claim_id,
       profile_id: @provider_profile,
       address: @device_token,
-      deadline_at: now + 60_000,
       registered_at: now,
       presentation: :alert
     }
@@ -318,6 +317,24 @@ defmodule AttentionServer.APNSPushTest do
     assert {"apns-collapse-id", "attention-sync"} in headers
     assert {:ok, payload} = JSON.decode_line(body <> "\n")
     assert payload["attention"]["locator"] == ordinary.locator
+  end
+
+  test "APNs requests leave expiration to provider policy when a push has no deadline", ctx do
+    now = System.system_time(:millisecond)
+
+    claim = %{
+      claim_id: op(91),
+      profile_id: @provider_profile,
+      address: @device_token,
+      registered_at: now,
+      presentation: :alert
+    }
+
+    {outcome, _cached_token} = APNS.send(apns_options(ctx), claim, nil)
+
+    assert outcome.state == "provider_accepted"
+    assert_receive {:apns_request, "POST", _path, headers, _body}, 12_000
+    refute Enum.any?(headers, fn {name, _value} -> String.downcase(name) == "apns-expiration" end)
   end
 
   test "a chat locator that cannot fit or fails identity validation is never sent without its target",
