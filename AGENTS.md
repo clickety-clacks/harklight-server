@@ -24,9 +24,9 @@ release assets and source identity, then invokes the package installer. Keep
 ordinary CI away from dispatching that workflow or installing a release.
 
 Run the relevant tests and the smoke check or other validation you judge
-appropriate. After they pass and independent review and CI are satisfied, ship
-through the normal live release route without another user approval. Treat
-later defects as bug reports to fix. Deploy passing builds independently of
+appropriate. After they pass, ship through the normal live release route without
+another user approval. Treat later defects as bug reports to fix. This is the
+intended way this project works. Deploy passing builds independently of
 feature enablement; keep unfinished behavior off until ready.
 
 For the hosted web dashboard and sign-in surface, publishing a Server release
