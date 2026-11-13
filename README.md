@@ -13,15 +13,15 @@ through Harklight.
 
 ## Install the server
 
-For the FORMAT27 v0.1.32 server package, use the release page below to download
-the Linux x86_64 archive, `SHA256SUMS` and `SELF_HOST.md`. Verify the checksum
-before extraction:
+For the FORMAT29 v0.1.37 server package, use the release page below after
+publication to download the Linux x86_64 archive, `SHA256SUMS` and
+`SELF_HOST.md`. Verify the checksum before extraction:
 
-[v0.1.32 release](https://github.com/clickety-clacks/harklight-server/releases/tag/v0.1.32)
+[v0.1.37 release](https://github.com/clickety-clacks/harklight-server/releases/tag/v0.1.37)
 
 ```sh
 sha256sum -c SHA256SUMS
-tar -xzf harklight-server-0.1.32-linux-x86_64.tar.gz
+tar -xzf harklight-server-0.1.37-linux-x86_64.tar.gz
 ```
 
 Follow [SELF_HOST.md](SELF_HOST.md) for a fresh installation, tailnet routing,
@@ -33,34 +33,36 @@ The package does not install a service, configure the tailnet or expose ports.
 State, owner/device identities, trust roots and sender grants live outside the
 versioned package. Run one server per database. Keep private keys and backups
 private; do not repeat bootstrap over an existing installation.
-This source, v0.1.32, writes FORMAT27. Its first start durably migrates
-supported FORMAT25 state, written by v0.1.28, to FORMAT27. The v0.1.28 package
-cannot read that resulting state. The v0.1.27 and v0.1.26 packages use
-FORMAT24 and cannot read FORMAT25 state written by v0.1.28. The v0.1.25
-package, the v0.1.24 repair line, v0.1.23, v0.1.22, v0.1.21, v0.1.20,
-v0.1.19, v0.1.18, v0.1.17, v0.1.16, v0.1.15, v0.1.14 and v0.1.13 also use
-FORMAT24 and migrate supported older state on startup.
-The v0.1.12 package uses FORMAT23, v0.1.11 uses FORMAT22, and v0.1.10 accepts
-formats 1–6 and 8–21. Those pre-FORMAT24 packages cannot start against FORMAT24
-state. The release installer takes one full private-root backup while the
-service is stopped and before switching releases. It attempts to restore this
-snapshot if the candidate does not become ready, but the restore path has not
-been exercised in preparation of this package. Restore or prior-release startup
-can fail and leave the service stopped. Restoring the snapshot discards every
-write made after capture. Restore success for this release is unproved and has
-not been tested.
+This source, v0.1.37, writes FORMAT29. From supported FORMAT27 state such as
+the one written by v0.1.36, startup applies two ordered steps: first it adds
+`see_focus: false` and `push_view: false` only where device records lack those
+values, preserving existing values; then it initializes the hosted
+`delivery_states` map to empty. The final migrated store is FORMAT29; the source
+does not establish a separately persisted intermediate FORMAT28 state. The
+published v0.1.35 and v0.1.36 packages write FORMAT27 and cannot read resulting
+FORMAT29 state. Changing only the selected code or release link is not a safe
+downgrade. Earlier v0.1.28 writes FORMAT25, while v0.1.27 and v0.1.26 write
+FORMAT24; see `SELF_HOST.md` for earlier package-format details.
 
-Before the first v0.1.32 start, stop the server and take a complete private-state
-backup. After any v0.1.32 write, returning to v0.1.28 requires stopping the
-server, restoring that pre-start backup and then running v0.1.28; changing only
-the selected code or release link cannot make FORMAT27 readable. This restore
-loses every write made since the backup and cannot undo external notifications,
-bounces or agent deliveries. Restore success is unproved and has not been
-tested; no recovery success is guaranteed.
+The release installer takes one full private-root backup while the service is
+stopped and before switching releases. It attempts to restore this snapshot if
+the candidate does not become ready, but the restore path has not been
+exercised in preparation of this package. Restore or prior-release startup can
+fail and leave the service stopped. Restoring the snapshot discards every write
+made after capture and cannot undo external notifications, bounces or agent
+deliveries. No recovery success or time is guaranteed.
+
+Before the first v0.1.37 start, stop the server and take a complete private-state
+backup. After any v0.1.37 write, returning to v0.1.36 requires stopping the
+server, restoring that pre-start backup and selecting v0.1.36; changing only
+the code or release link cannot make FORMAT29 readable. This restore loses every
+write made since the backup and cannot undo external notifications, bounces or
+agent deliveries. Restore success is unproved and has not been tested; no
+recovery success is guaranteed.
 
 v0.1.32 adds a side-effect-free origin-message read by sender ID and message ID.
-The matching `harklight-agent message-get` interface is present in Agent 0.1.9
-source, but Agent 0.1.9 has not yet been published. The command reads the latest
+The matching `harklight-agent message-get` interface shipped in Agent 0.1.9.
+That Agent release was published on 2026-11-11. The command reads the latest
 committed revision by default or a specific retained revision with
 `--revision N`. The read does not mark Seen; an unavailable requested revision
 returns `revision_unavailable`.
@@ -117,21 +119,21 @@ at a hosted service's address.
 
 The `harklight-agent` command-line client sends requests and listens for
 request-bound replies. It is released separately from the server at
-<https://github.com/clickety-clacks/harklight-agent>; the current release is
-v0.1.5. Install it with Homebrew on macOS or Linux:
+<https://github.com/clickety-clacks/harklight-agent>; the latest published
+release as of 2026-11-13 is v0.1.11. Install it with Homebrew on macOS or Linux:
 
 ```sh
 brew install clickety-clacks/tap/harklight-agent
 ```
 
 Or download the tarball for your platform and `SHA256SUMS` from the
-[release page](https://github.com/clickety-clacks/harklight-agent/releases/tag/v0.1.5),
+[release page](https://github.com/clickety-clacks/harklight-agent/releases/tag/v0.1.11),
 verify the checksum and put the binary on your `PATH`. Targets are
 `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-gnu` and
 `aarch64-unknown-linux-gnu`:
 
 ```sh
-v=0.1.5 t=x86_64-unknown-linux-gnu
+v=0.1.11 t=x86_64-unknown-linux-gnu
 base="https://github.com/clickety-clacks/harklight-agent/releases/download/v$v"
 curl -fLO "$base/harklight-agent-$v-$t.tar.gz"
 curl -fLO "$base/SHA256SUMS"
@@ -140,7 +142,7 @@ tar -xzf "harklight-agent-$v-$t.tar.gz"
 install -m 755 "harklight-agent-$v-$t/harklight-agent" ~/.local/bin/
 ```
 
-`harklight-agent --version` prints `harklight-agent 0.1.5`. The
+`harklight-agent --version` prints `harklight-agent 0.1.11`. The
 [shared conversation core](skills/core.md) describes
 its commands and message format.
 
