@@ -243,7 +243,7 @@ defmodule AttentionServer.Relay do
       GenServer.call(
         server,
         {:agent_send_request, verified_agent_key, revision, request, socket},
-        15_000
+        :infinity
       )
 
   @doc "Release a G6 HTTP reply in the same serialized agent-authority boundary."
@@ -252,7 +252,7 @@ defmodule AttentionServer.Relay do
       GenServer.call(
         server,
         {:agent_send_https, verified_agent_key, revision, request, socket},
-        15_000
+        :infinity
       )
 
   def owner_register_agent(server, person, owner_key, id, agent_key),
@@ -470,39 +470,39 @@ defmodule AttentionServer.Relay do
     do: GenServer.call(server, {:revoke_enrollment_read_fixture, person, grant_id})
 
   def request_line(server, verified_key, line),
-    do: GenServer.call(server, {:request_line, verified_key, line})
+    do: GenServer.call(server, {:request_line, verified_key, line}, :infinity)
 
   @doc false
   def request_frame(server, verified_key, frame),
-    do: GenServer.call(server, {:request_frame, verified_key, frame})
+    do: GenServer.call(server, {:request_frame, verified_key, frame}, :infinity)
 
   @doc false
-  def claim_push(server, now_ms), do: GenServer.call(server, {:claim_push, now_ms}, 15_000)
+  def claim_push(server, now_ms), do: GenServer.call(server, {:claim_push, now_ms}, :infinity)
 
   @doc false
   def enable_push(server), do: GenServer.call(server, :enable_push)
 
   @doc false
   def finish_push(server, claim, outcome, now_ms),
-    do: GenServer.call(server, {:finish_push, claim, outcome, now_ms}, 15_000)
+    do: GenServer.call(server, {:finish_push, claim, outcome, now_ms}, :infinity)
 
   def events(server, verified_key, since),
-    do: GenServer.call(server, {:events, verified_key, since})
+    do: GenServer.call(server, {:events, verified_key, since}, :infinity)
 
   def conversation_events(server, verified_key, since),
-    do: GenServer.call(server, {:conversation_events, verified_key, since})
+    do: GenServer.call(server, {:conversation_events, verified_key, since}, :infinity)
 
   def conversation_cursor(server, verified_key),
-    do: GenServer.call(server, {:conversation_cursor, verified_key})
+    do: GenServer.call(server, {:conversation_cursor, verified_key}, :infinity)
 
   def acknowledged_cursor(server, verified_key),
-    do: GenServer.call(server, {:cursor, verified_key})
+    do: GenServer.call(server, {:cursor, verified_key}, :infinity)
 
   def device_revoked?(server, verified_key),
-    do: GenServer.call(server, {:device_revoked?, verified_key})
+    do: GenServer.call(server, {:device_revoked?, verified_key}, :infinity)
 
   def open_session(server, verified_key),
-    do: GenServer.call(server, {:open_session, verified_key, nil, nil, nil, :raw})
+    do: GenServer.call(server, {:open_session, verified_key, nil, nil, nil, :raw}, :infinity)
 
   def register_tls_listener(server, listener),
     do: GenServer.call(server, {:register_tls_listener, listener})
@@ -519,30 +519,35 @@ defmodule AttentionServer.Relay do
 
   @doc "Opens a socket-backed session after a successful client-certificate handshake."
   def open_tls_session(server, verified_key, socket, listener),
-    do: GenServer.call(server, {:open_session, verified_key, self(), socket, listener, :raw})
+    do:
+      GenServer.call(
+        server,
+        {:open_session, verified_key, self(), socket, listener, :raw},
+        :infinity
+      )
 
   @doc "Opens a device session only after its authenticated WebSocket negotiation."
   def open_websocket_session(server, verified_key, socket, listener),
     do:
-      GenServer.call(server, {:open_session, verified_key, self(), socket, listener, :websocket})
+      GenServer.call(
+        server,
+        {:open_session, verified_key, self(), socket, listener, :websocket},
+        :infinity
+      )
 
   def session_request_line(server, session_id, line) do
-    timeout =
-      case JSON.decode_line(line) do
-        {:ok, %{"type" => "inbox_start"}} -> :infinity
-        _ -> 5_000
-      end
-
-    GenServer.call(server, {:session_request_line, session_id, line}, timeout)
+    GenServer.call(server, {:session_request_line, session_id, line}, :infinity)
   end
 
-  def session_drain(server, session_id), do: GenServer.call(server, {:session_drain, session_id})
+  def session_drain(server, session_id),
+    do: GenServer.call(server, {:session_drain, session_id}, :infinity)
 
   @doc "Serializes socket output with session replacement and revocation."
   def session_send(server, session_id, frames),
-    do: GenServer.call(server, {:session_send, session_id, frames})
+    do: GenServer.call(server, {:session_send, session_id, frames}, :infinity)
 
-  def close_session(server, session_id), do: GenServer.call(server, {:close_session, session_id})
+  def close_session(server, session_id),
+    do: GenServer.call(server, {:close_session, session_id}, :infinity)
 
   @impl true
   def init(opts) do

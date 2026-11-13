@@ -10,7 +10,7 @@ defmodule AttentionServer.AgentTLS do
 
   alias AttentionServer.{DeviceIdentity, Diagnostics, EnrolledLeafVerify, JSON, Relay}
 
-  @timeout 5_000
+  @timeout :infinity
   @max_line 2_400_000
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts)
@@ -104,8 +104,6 @@ defmodule AttentionServer.AgentTLS do
       mode: :binary,
       packet: :line,
       packet_size: @max_line,
-      send_timeout: 1_000,
-      send_timeout_close: true,
       reuseaddr: true,
       versions: [:"tlsv1.3"],
       certfile: String.to_charlist(certfile),
