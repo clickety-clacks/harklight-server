@@ -2,9 +2,9 @@ name: Server CI
 
 on:
   pull_request:
-    branches: [fix/durable-ack-035]
+    branches: [fix/durable-ack-035, ci/baseline-035]
   push:
-    branches: [fix/durable-ack-035]
+    branches: [fix/durable-ack-035, ci/baseline-035]
 
 permissions:
   contents: read
