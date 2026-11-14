@@ -20,10 +20,11 @@ defmodule AttentionServer.Store do
   }
 
   alias Exqlite.Sqlite3
+  alias AttentionServer.Store.{Persistence, SnapshotEncoding}
 
   @format_version 27
   @inbox_index_chunk_size 20
-  defstruct [:db, :engine, :version, :upload_dir, progress_version: 0]
+  defstruct [:db, :engine, :version, :upload_dir, progress_version: 0, encoding_cache: %{}]
 
   @progress_fields [:cursors, :conversation_cursors, :conversation_opened]
 
@@ -147,7 +148,12 @@ defmodule AttentionServer.Store do
                      version: version,
                      upload_dir: upload_dir
                    }) do
-              {:ok, store}
+              engine = store.engine
+
+              {_payload, cache} =
+                Persistence.run(fn -> SnapshotEncoding.encode(engine, @format_version) end)
+
+              {:ok, %{store | encoding_cache: cache}}
             else
               {:error, reason} ->
                 Diagnostics.failure(:server_storage, :store_open, reason, :unavailable)
@@ -980,13 +986,24 @@ defmodule AttentionServer.Store do
     end
   end
 
-  def commit(%__MODULE__{engine: old} = store, next, _audit) when old == next,
+  def commit(store, next, audit) do
+    case do_commit(store, next, audit) do
+      {:ok, committed} = result ->
+        Persistence.committed(committed)
+        result
+
+      other ->
+        other
+    end
+  end
+
+  defp do_commit(%__MODULE__{engine: old} = store, next, _audit) when old == next,
     do: {:ok, store}
 
-  def commit(%__MODULE__{db: nil} = store, next, _audit),
+  defp do_commit(%__MODULE__{db: nil} = store, next, _audit),
     do: {:ok, %{store | engine: next}}
 
-  def commit(%__MODULE__{} = store, next, audit) do
+  defp do_commit(%__MODULE__{} = store, next, audit) do
     cond do
       progress_only?(store.engine, next) and valid_progress?(next) ->
         commit_progress(store, next, audit)
@@ -1008,7 +1025,33 @@ defmodule AttentionServer.Store do
   end
 
   defp commit_durable(%__MODULE__{db: db, version: version} = store, next, audit) do
-    payload = encode_state(next)
+    # The worker needs the generation and connection, not a second copy of the
+    # old engine. The caller keeps its committed snapshot until this returns.
+    generation = %{store | engine: nil}
+
+    result = Persistence.run(fn -> persist_snapshot(generation, next, audit) end)
+
+    case result do
+      {:ok, cache} ->
+        {:ok,
+         %{store | engine: next, version: version + 1, progress_version: 0, encoding_cache: cache}}
+
+      error ->
+        Diagnostics.failure(
+          :server_storage,
+          :state_commit,
+          error,
+          :outcome_unknown,
+          operation_id(audit)
+        )
+
+        _ = Sqlite3.execute(db, "ROLLBACK")
+        {:error, :storage_unavailable, store}
+    end
+  end
+
+  defp persist_snapshot(%{db: db, version: version} = store, next, audit) do
+    {payload, cache} = SnapshotEncoding.encode(next, @format_version, store.encoding_cache)
     checksum = :crypto.hash(:sha256, payload)
 
     result =
@@ -1038,25 +1081,10 @@ defmodule AttentionServer.Store do
                ]
              ),
            :ok <- Sqlite3.execute(db, "COMMIT") do
-        :ok
+        {:ok, cache}
       end
 
-    case result do
-      :ok ->
-        {:ok, %{store | engine: next, version: version + 1, progress_version: 0}}
-
-      error ->
-        Diagnostics.failure(
-          :server_storage,
-          :state_commit,
-          error,
-          :outcome_unknown,
-          operation_id(audit)
-        )
-
-        _ = Sqlite3.execute(db, "ROLLBACK")
-        {:error, :storage_unavailable, store}
-    end
+    result
   end
 
   # ACKs must be durable before their replies, but do not change retained history.
@@ -1182,7 +1210,7 @@ defmodule AttentionServer.Store do
     case one(db, "SELECT version, payload, checksum FROM relay_state WHERE id = 1", []) do
       {:ok, nil} ->
         engine = Engine.new()
-        payload = encode_state(engine)
+        payload = Persistence.run(fn -> encode_state(engine) end)
 
         with :ok <-
                run(
