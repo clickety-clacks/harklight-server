@@ -15,6 +15,7 @@ defmodule AttentionServer.Engine do
   alias AttentionServer.{
     APNS,
     AgentAccess,
+    BrowserRecipient,
     BounceDecision,
     BouncePolicy,
     Conversation,
@@ -3145,8 +3146,9 @@ defmodule AttentionServer.Engine do
 
   @doc false
   def reconcile_no_comment(%__MODULE__{} = engine, key, %{"type" => "answer_no_comment"} = frame) do
-    with {:ok, %{person: person, key: device, kind: :device} = principal} <-
+    with {:ok, %{person: person, key: device, kind: kind} = principal} <-
            principal(engine, key),
+         true <- kind in [:device, :browser],
          :ok <- valid_op(frame) do
       op_id = frame["op_id"]
 
@@ -3291,8 +3293,17 @@ defmodule AttentionServer.Engine do
 
   defp principal(engine, key) do
     case Map.get(engine.devices, key) do
-      %{person: person, revoked: false} -> {:ok, %{person: person, key: key, kind: :device}}
-      _ -> {:error, :forbidden}
+      %{person: person, revoked: false} ->
+        {:ok, %{person: person, key: key, kind: :device}}
+
+      _ ->
+        case BrowserRecipient.person(key) do
+          {:ok, person} when is_map_key(engine.persons, person) ->
+            {:ok, %{person: person, key: key, kind: :browser}}
+
+          _ ->
+            {:error, :forbidden}
+        end
     end
   end
 
@@ -4466,12 +4477,12 @@ defmodule AttentionServer.Engine do
 
   defp answer_no_comment(
          engine,
-         %{person: person, key: actor, kind: :device} = principal,
+         %{person: person, key: actor, kind: kind} = principal,
          request_id,
          request_revision,
          op_id
        ) do
-    if Message.nonempty?(request_id) do
+    if kind in [:device, :browser] and Message.nonempty?(request_id) do
       matches =
         for {{^person, _sender, ^request_id} = key, record} <- engine.messages,
             do: {key, record}
@@ -4490,6 +4501,7 @@ defmodule AttentionServer.Engine do
                     person,
                     actor,
                     Map.get(principal, :id, actor),
+                    kind,
                     key,
                     record,
                     op_id,
@@ -4541,7 +4553,7 @@ defmodule AttentionServer.Engine do
     end
   end
 
-  defp commit_no_comment(engine, person, actor, actor_id, key, record, op_id, committed_at) do
+  defp commit_no_comment(engine, person, actor, actor_id, kind, key, record, op_id, committed_at) do
     {next, seq} = next_seq(engine, person)
 
     terminal = %{
@@ -4553,7 +4565,7 @@ defmodule AttentionServer.Engine do
       answer: nil,
       actor: actor,
       actor_id: actor_id,
-      actor_kind: :device,
+      actor_kind: kind,
       op_id: op_id,
       seq: seq
     }
@@ -4610,7 +4622,8 @@ defmodule AttentionServer.Engine do
     end
   end
 
-  defp message_open(engine, %{person: person, key: device, kind: :device}, frame) do
+  defp message_open(engine, %{person: person, key: device, kind: kind}, frame)
+       when kind in [:device, :browser] do
     with :ok <- valid_op(frame),
          :ok <- valid_global_id(frame),
          :ok <- valid_no_selectors(frame),

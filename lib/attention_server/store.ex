@@ -11,6 +11,7 @@ defmodule AttentionServer.Store do
 
   alias AttentionServer.{
     APNS,
+    BrowserRecipient,
     BounceDecision,
     BrowserSignIn,
     Conversation,
@@ -750,6 +751,18 @@ defmodule AttentionServer.Store do
     end
   end
 
+  def discard_browser_inbox_snapshots(%__MODULE__{db: nil}), do: :ok
+
+  def discard_browser_inbox_snapshots(%__MODULE__{db: db}) do
+    discard_inbox_snapshots_matching(db, "device_id LIKE 'browser:%'", [])
+  end
+
+  def discard_inbox_snapshots_for_device(%__MODULE__{db: nil}, _person, _device), do: :ok
+
+  def discard_inbox_snapshots_for_device(%__MODULE__{db: db}, person, device) do
+    discard_inbox_snapshots_matching(db, "person_id = ? AND device_id = ?", [person, device])
+  end
+
   def discard_inbox_snapshot(%__MODULE__{db: nil}, _snapshot), do: :ok
 
   def discard_inbox_snapshot(%__MODULE__{db: db}, snapshot) do
@@ -1069,16 +1082,18 @@ defmodule AttentionServer.Store do
   defp valid_progress?(engine) do
     is_map(engine.cursors) and
       Enum.all?(engine.cursors, fn {{person, key}, seq} ->
-        owns?(engine, person, key) and is_integer(seq) and seq >= 0 and
+        owns_or_browser?(engine, person, key) and is_integer(seq) and seq >= 0 and
           seq <= engine.persons[person]
       end) and
       is_map(engine.conversation_cursors) and
       Enum.all?(engine.conversation_cursors, fn {{person, key}, seq} ->
-        owns?(engine, person, key) and is_integer(seq) and seq >= 0 and
+        owns_or_browser?(engine, person, key) and is_integer(seq) and seq >= 0 and
           seq <= Map.get(engine.conversation_highs, person, 0)
       end) and
       is_struct(engine.conversation_opened, MapSet) and
-      Enum.all?(engine.conversation_opened, fn {person, key} -> owns?(engine, person, key) end)
+      Enum.all?(engine.conversation_opened, fn {person, key} ->
+        owns_or_browser?(engine, person, key)
+      end)
   rescue
     _ -> false
   end
@@ -1540,6 +1555,37 @@ defmodule AttentionServer.Store do
       "DELETE FROM #{table} WHERE snapshot_id IN (SELECT snapshot_id FROM relay_inbox_snapshots WHERE status = 'building')",
       []
     )
+  end
+
+  defp discard_inbox_snapshots_matching(db, where, params) do
+    tables = [
+      "relay_inbox_receipt_pages",
+      "relay_inbox_batches",
+      "relay_inbox_operation_receipts",
+      "relay_inbox_receipt_sequences",
+      "relay_inbox_item_pages"
+    ]
+
+    with :ok <- Sqlite3.execute(db, "BEGIN IMMEDIATE"),
+         :ok <-
+           Enum.reduce_while(tables, :ok, fn table, :ok ->
+             result =
+               run(
+                 db,
+                 "DELETE FROM #{table} WHERE EXISTS (SELECT 1 FROM relay_inbox_snapshots s WHERE s.person_id = #{table}.person_id AND s.device_id = #{table}.device_id AND s.snapshot_id = #{table}.snapshot_id AND #{where})",
+                 params
+               )
+
+             if result == :ok, do: {:cont, :ok}, else: {:halt, result}
+           end),
+         :ok <- run(db, "DELETE FROM relay_inbox_snapshots WHERE #{where}", params),
+         :ok <- Sqlite3.execute(db, "COMMIT") do
+      :ok
+    else
+      error ->
+        _ = Sqlite3.execute(db, "ROLLBACK")
+        error
+    end
   end
 
   defp delete_snapshot_rows(db, snapshot_id) do
@@ -2166,7 +2212,7 @@ defmodule AttentionServer.Store do
         Enum.all?(engine.sender_grants, fn {{person, key}, _} -> owns?(engine, person, key) end) and
         Enum.all?(engine.subscriptions, fn {{person, key}, _} -> owns?(engine, person, key) end) and
         Enum.all?(engine.cursors, fn {{person, key}, seq} ->
-          owns?(engine, person, key) and is_integer(seq) and seq >= 0 and
+          owns_or_browser?(engine, person, key) and is_integer(seq) and seq >= 0 and
             seq <= engine.persons[person]
         end) and
         valid_free_order?(engine) and
@@ -2206,11 +2252,13 @@ defmodule AttentionServer.Store do
         end) and
         is_map(engine.conversation_cursors) and
         Enum.all?(engine.conversation_cursors, fn {{person, key}, seq} ->
-          owns?(engine, person, key) and is_integer(seq) and seq >= 0 and
+          owns_or_browser?(engine, person, key) and is_integer(seq) and seq >= 0 and
             seq <= Map.get(engine.conversation_highs, person, 0)
         end) and
         is_struct(engine.conversation_opened, MapSet) and
-        Enum.all?(engine.conversation_opened, fn {person, key} -> owns?(engine, person, key) end) and
+        Enum.all?(engine.conversation_opened, fn {person, key} ->
+          owns_or_browser?(engine, person, key)
+        end) and
         Enum.all?(engine.receipts, fn {{person, key, _op}, _} ->
           actor_owns?(engine, person, key)
         end) and
@@ -2278,7 +2326,7 @@ defmodule AttentionServer.Store do
       Enum.all?(engine.uploads, fn {id, upload} ->
         AttentionServer.Message.uuid_v4?(id) and upload.id == id and
           Map.has_key?(engine.persons, upload.person) and
-          owns?(engine, upload.person, upload.uploader) and
+          owns_or_browser?(engine, upload.person, upload.uploader) and
           AttentionServer.Message.uuid_v4?(upload.op_id) and
           AttentionServer.Message.sender_id?(upload.sender_id) and
           is_binary(upload.message_id) and upload.message_id != "" and
@@ -2687,8 +2735,15 @@ defmodule AttentionServer.Store do
   defp owns?(engine, person, key),
     do: get_in(engine.devices, [key, :person]) == person and Map.has_key?(engine.persons, person)
 
+  defp owns_or_browser?(engine, person, key),
+    do:
+      owns?(engine, person, key) or
+        (Map.has_key?(engine.persons, person) and BrowserRecipient.valid_for?(key, person))
+
   defp actor_owns?(engine, person, key),
-    do: owns?(engine, person, key) or get_in(engine.agents, [key, :person]) == person
+    do:
+      owns_or_browser?(engine, person, key) or
+        get_in(engine.agents, [key, :person]) == person
 
   defp actor_kind?(engine, person, terminal) do
     case terminal.actor_kind do
@@ -2699,6 +2754,10 @@ defmodule AttentionServer.Store do
       :agent ->
         get_in(engine.agents, [terminal.actor, :person]) == person and
           get_in(engine.agents, [terminal.actor, :id]) == terminal.actor_id
+
+      :browser ->
+        BrowserRecipient.valid_for?(terminal.actor, person) and
+          Map.get(terminal, :actor_id, terminal.actor) == terminal.actor
 
       _ ->
         false

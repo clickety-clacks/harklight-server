@@ -36,6 +36,59 @@ defmodule AttentionServer.OriginWire do
 
   def command(_, _, request), do: diagnose(error("invalid_request"), request)
 
+  def browser_command(relay, browser_session_id, recipient, request)
+      when is_map(request) and not is_struct(request) do
+    ref = Map.get(request, "ref")
+
+    cond do
+      request["v"] != 1 ->
+        {:ok, error("unsupported_version", nil, ref)}
+
+      Map.has_key?(request, "ref") and not valid_ref?(ref) ->
+        {:ok, error("invalid_field", "ref")}
+
+      selector = Enum.find(@selector_fields, &Map.has_key?(request, &1)) ->
+        {:ok, error("invalid_field", selector, ref)}
+
+      true ->
+        browser_file_command(relay, browser_session_id, recipient, request, ref)
+    end
+  end
+
+  def browser_command(_relay, _browser_session_id, _recipient, _request),
+    do: {:ok, error("invalid_request")}
+
+  defp browser_file_command(relay, browser_session_id, recipient, %{"type" => "file_limits"}, ref) do
+    case Relay.browser_file_limits(relay, browser_session_id, recipient) do
+      {:ok, result} -> {:ok, ok(result, ref)}
+      {:error, reason} -> browser_file_error(reason, ref)
+    end
+  end
+
+  defp browser_file_command(
+         relay,
+         browser_session_id,
+         recipient,
+         %{"type" => "discard_uploads"} = request,
+         ref
+       ) do
+    attributes = Map.take(request, ~w(op_id sender_id message_id revision))
+
+    case Relay.browser_discard_uploads(relay, browser_session_id, recipient, attributes) do
+      {:ok, result} -> {:ok, ok(result, ref)}
+      {:error, reason} -> browser_file_error(reason, ref)
+    end
+  end
+
+  defp browser_file_command(_relay, _browser_session_id, _recipient, _request, ref),
+    do: {:ok, error("invalid_field", "type", ref)}
+
+  defp browser_file_error(reason, _ref)
+       when reason in [:forbidden, :session_ended, :storage_unavailable],
+       do: {:error, reason}
+
+  defp browser_file_error(reason, ref), do: {:ok, error(Atom.to_string(reason), nil, ref)}
+
   defp diagnose(%{"type" => "error", "reason" => reason} = result, request) do
     cause = diagnostic_cause(reason)
     outcome = if cause == :storage_unavailable, do: :outcome_unknown, else: :rejected

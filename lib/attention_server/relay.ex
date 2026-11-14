@@ -26,6 +26,7 @@ defmodule AttentionServer.Relay do
   alias AttentionServer.{
     AgentWire,
     AppliedScoreRecord,
+    BrowserRecipient,
     BounceDecision,
     BouncePolicy,
     Conversation,
@@ -42,6 +43,13 @@ defmodule AttentionServer.Relay do
     Placement,
     Store
   }
+
+  @browser_frame_types ~w(
+                          inbox_start inbox_page inbox_reconcile inbox_receipts
+                          inbox_checkpoint_ack inbox_attach conversation_open conversation_ack
+                          message_open answer answer_no_comment discussion conversation_read
+                          view_get
+                        )
 
   def start_link(opts \\ []) do
     GenServer.start_link(__MODULE__, opts, Keyword.take(opts, [:name]))
@@ -193,20 +201,38 @@ defmodule AttentionServer.Relay do
       )
 
   def fetch_file(server, verified_device_key, upload_id) do
-    case GenServer.call(server, {:fetch_file, verified_device_key, upload_id}) do
-      {:ok, upload, path} ->
-        case Store.verify_upload(path, upload) do
-          :ok -> {:ok, upload, path}
-          error -> error
-        end
+    GenServer.call(server, {:fetch_file, verified_device_key, upload_id})
+    |> verify_fetched_file()
+  end
 
-      error ->
-        error
+  def browser_fetch_file(server, person, owner_key, owner_revision, upload_id) do
+    GenServer.call(server, {:browser_fetch_file, person, owner_key, owner_revision, upload_id})
+    |> verify_fetched_file()
+  end
+
+  defp verify_fetched_file({:ok, upload, path}) do
+    case Store.verify_upload(path, upload) do
+      :ok -> {:ok, upload, path}
+      error -> error
     end
   end
 
-  defp upload_file_outside_relay(server, key, attrs, path, size, hash, lease) do
-    case GenServer.call(server, {:upload_prepare, key, attrs, size, hash, lease}) do
+  defp verify_fetched_file(error), do: error
+
+  defp upload_file_outside_relay(server, key, attrs, path, size, hash, lease),
+    do: upload_file_outside_relay(server, key, attrs, path, size, hash, lease, :device)
+
+  defp upload_file_outside_relay(server, key, attrs, path, size, hash, lease, context) do
+    prepare =
+      case context do
+        :device ->
+          {:upload_prepare, key, attrs, size, hash, lease}
+
+        {:browser, browser_session_id, recipient} ->
+          {:browser_upload_prepare, browser_session_id, recipient, attrs, size, hash, lease}
+      end
+
+    case GenServer.call(server, prepare) do
       {:ok, :duplicate, reply} ->
         {:ok, reply}
 
@@ -216,9 +242,19 @@ defmodule AttentionServer.Relay do
             try do
               case Store.publish_staged_upload(upload_dir, upload, staged) do
                 {:ok, published} ->
+                  commit =
+                    case context do
+                      :device ->
+                        {:upload_commit, key, upload, published, lease}
+
+                      {:browser, browser_session_id, recipient} ->
+                        {:browser_upload_commit, browser_session_id, recipient, upload, published,
+                         lease}
+                    end
+
                   GenServer.call(
                     server,
-                    {:upload_commit, key, upload, published, lease},
+                    commit,
                     :infinity
                   )
 
@@ -560,6 +596,89 @@ defmodule AttentionServer.Relay do
         :infinity
       )
 
+  def open_browser_recipient(
+        server,
+        person,
+        owner_key,
+        owner_revision,
+        browser_session_id,
+        recipient,
+        worker
+      ),
+      do:
+        GenServer.call(
+          server,
+          {:open_browser_recipient, person, owner_key, owner_revision, browser_session_id,
+           recipient, worker},
+          :infinity
+        )
+
+  def end_browser_session(server, browser_session_id),
+    do: GenServer.call(server, {:end_browser_session, browser_session_id}, :infinity)
+
+  def browser_session_request_line(server, browser_session_id, session_id, line),
+    do:
+      GenServer.call(
+        server,
+        {:browser_session_request_line, browser_session_id, session_id, line},
+        :infinity
+      )
+
+  def browser_session_drain(server, browser_session_id, session_id),
+    do:
+      GenServer.call(
+        server,
+        {:browser_session_drain, browser_session_id, session_id},
+        :infinity
+      )
+
+  def close_browser_connection(server, browser_session_id, session_id),
+    do:
+      GenServer.call(
+        server,
+        {:close_browser_connection, browser_session_id, session_id},
+        :infinity
+      )
+
+  def browser_file_limits(server, browser_session_id, recipient),
+    do: GenServer.call(server, {:browser_file_limits, browser_session_id, recipient})
+
+  def browser_discard_uploads(server, browser_session_id, recipient, attributes),
+    do:
+      GenServer.call(
+        server,
+        {:browser_discard_uploads, browser_session_id, recipient, attributes}
+      )
+
+  def browser_upload_begin(server, browser_session_id, recipient, attributes, size, worker),
+    do:
+      GenServer.call(
+        server,
+        {:browser_upload_begin, browser_session_id, recipient, attributes, size, worker}
+      )
+
+  def browser_upload_file(
+        server,
+        browser_session_id,
+        recipient,
+        attributes,
+        path,
+        size,
+        sha256,
+        lease
+      ),
+      do:
+        upload_file_outside_relay(
+          server,
+          nil,
+          attributes,
+          path,
+          size,
+          sha256,
+          lease,
+          {:browser, browser_session_id, recipient}
+        )
+
   def session_request_line(server, session_id, line) do
     GenServer.call(server, {:session_request_line, session_id, line}, :infinity)
   end
@@ -578,8 +697,8 @@ defmodule AttentionServer.Relay do
   def init(opts) do
     case Store.open(Keyword.get(opts, :store_path)) do
       {:ok, store} ->
-        case Store.discard_building_inbox_snapshots(store) do
-          :ok ->
+        case startup_cleanup(store) do
+          {:ok, store} ->
             Process.send_after(self(), :upload_sweep, @upload_sweep_ms)
 
             state = %{
@@ -593,6 +712,7 @@ defmodule AttentionServer.Relay do
               upload_index: build_upload_index(store.engine),
               active_uploads: %{},
               sessions: %{},
+              browser_recipients: %{},
               origin_streams: %{},
               origin_streams_by_identity: %{},
               focus_clients: %{},
@@ -659,6 +779,32 @@ defmodule AttentionServer.Relay do
 
       {:error, reason} ->
         {:stop, reason}
+    end
+  end
+
+  defp startup_cleanup(store) do
+    actor_keys = browser_actor_keys(store.engine)
+    engine = discard_browser_actor_state(store.engine, actor_keys)
+
+    with :ok <- Store.discard_building_inbox_snapshots(store),
+         {:ok, store} <- commit_browser_cleanup(store, engine),
+         :ok <- Store.discard_browser_inbox_snapshots(store) do
+      {:ok, store}
+    else
+      {:error, reason, _store} -> {:error, reason}
+      error -> error
+    end
+  end
+
+  defp commit_browser_cleanup(store, engine) do
+    if engine == store.engine do
+      {:ok, store}
+    else
+      commit(store, engine, %{
+        person: "system",
+        actor: "browser_session",
+        action: "browser_session_restart"
+      })
     end
   end
 
@@ -1258,19 +1404,55 @@ defmodule AttentionServer.Relay do
   end
 
   def handle_call({:origin_file_limits, key}, _from, state) do
-    case Engine.authorized_person(state.store.engine, key) do
-      {:ok, _person} ->
-        cap = if state.upload_cap == :none, do: "none", else: state.upload_cap
+    file_limits_reply(state, key)
+  end
 
-        {:reply,
-         {:ok,
-          %{
-            "inline_decoded_bytes_per_entry" => ConversationFiles.inline_limit(),
-            "upload_cap_bytes_per_file" => cap
-          }}, state}
+  def handle_call({:browser_file_limits, browser_session_id, recipient}, _from, state) do
+    case browser_recipient_session(state, browser_session_id, recipient) do
+      {:ok, session} -> file_limits_reply(state, session.key)
+      {:error, reason} -> {:reply, {:error, reason}, state}
+    end
+  end
+
+  def handle_call({:discard_uploads, key, attrs}, _from, state) do
+    discard_uploads_call(state, key, attrs)
+  end
+
+  def handle_call(
+        {:browser_discard_uploads, browser_session_id, recipient, attrs},
+        _from,
+        state
+      ) do
+    case browser_recipient_session(state, browser_session_id, recipient) do
+      {:ok, session} -> discard_uploads_call(state, session.key, attrs)
+      {:error, reason} -> {:reply, {:error, reason}, state}
+    end
+  end
+
+  def handle_call(
+        {:browser_upload_begin, browser_session_id, recipient, attrs, size, worker},
+        _from,
+        state
+      ) do
+    with {:ok, session} <- browser_recipient_session(state, browser_session_id, recipient),
+         {:ok, person} <- Engine.authorized_person(state.store.engine, session.key),
+         true <- is_pid(worker),
+         true <- valid_upload_attributes?(attrs),
+         true <- is_integer(size) and size >= 0,
+         true <- state.upload_cap == :none or size <= state.upload_cap do
+      case begin_upload(state, person, session.key, attrs, size, worker, browser_session_id) do
+        {:ok, lease, next} -> {:reply, {:ok, lease}, next}
+        {:error, reason} -> {:reply, {:error, reason}, state}
+      end
+    else
+      {:error, reason} ->
+        {:reply, {:error, reason}, state}
+
+      false when is_integer(size) and is_integer(state.upload_cap) and size > state.upload_cap ->
+        {:reply, {:error, :upload_cap_exceeded}, state}
 
       _ ->
-        {:reply, {:error, :forbidden}, state}
+        {:reply, {:error, :invalid_upload}, state}
     end
   end
 
@@ -1278,40 +1460,20 @@ defmodule AttentionServer.Relay do
     with {:ok, person} <- Engine.authorized_person(state.store.engine, key),
          true <- valid_upload_attributes?(attrs),
          true <- is_integer(size) and size >= 0,
-         true <- state.upload_cap == :none or size <= state.upload_cap,
-         {:ok, store} <-
-           touch_upload_group(
-             state.store,
-             state.upload_index,
-             upload_group(person, key, attrs)
-           ) do
-      lease = make_ref()
-      group = upload_group(person, key, attrs)
-
-      uploader_kind =
-        Engine.upload_source(
-          state.store.engine,
-          person,
-          key,
-          attrs["sender_id"],
-          attrs["message_id"]
-        )
-        |> Atom.to_string()
-
-      monitor = Process.monitor(worker)
-
-      active =
-        Map.put(state.active_uploads, lease, %{
-          group: group,
-          uploader_kind: uploader_kind,
-          canceled: false,
-          monitor: monitor
-        })
-
-      {:reply, {:ok, lease}, %{state | store: store, active_uploads: active}}
+         true <- state.upload_cap == :none or size <= state.upload_cap do
+      case begin_upload(state, person, key, attrs, size, worker, nil) do
+        {:ok, lease, next} -> {:reply, {:ok, lease}, next}
+        {:error, reason} -> {:reply, {:error, reason}, state}
+      end
     else
-      {:error, reason} -> {:reply, {:error, reason}, state}
-      _ -> {:reply, {:error, :invalid_upload}, state}
+      {:error, reason} ->
+        {:reply, {:error, reason}, state}
+
+      false when is_integer(size) and is_integer(state.upload_cap) and size > state.upload_cap ->
+        {:reply, {:error, :upload_cap_exceeded}, state}
+
+      _ ->
+        {:reply, {:error, :invalid_upload}, state}
     end
   end
 
@@ -1322,59 +1484,6 @@ defmodule AttentionServer.Relay do
     {:reply, :ok, %{state | active_uploads: Map.delete(state.active_uploads, lease)}}
   end
 
-  def handle_call({:discard_uploads, key, attrs}, _from, state) do
-    with {:ok, person} <- Engine.authorized_person(state.store.engine, key),
-         true <- valid_discard_attributes?(attrs) do
-      scope = upload_request_scope(person, key, attrs)
-      engine = state.store.engine
-      references = Map.get(state.upload_index.references_by_person, person, MapSet.new())
-      scoped_ids = Map.get(state.upload_index.ids_by_request_scope, scope, MapSet.new())
-
-      ids =
-        for id <- scoped_ids,
-            not MapSet.member?(references, id),
-            do: id
-
-      committed? =
-        Enum.any?(scoped_ids, &MapSet.member?(references, &1))
-
-      active =
-        Map.new(state.active_uploads, fn {lease, active} ->
-          {lease,
-           %{active | canceled: active.canceled or upload_request_scope(active.group) == scope}}
-        end)
-
-      case Store.delete_uploads(state.store, ids, %{
-             person: person,
-             actor: key,
-             action: "upload_discard",
-             operation_id: Diagnostics.operation_id(attrs)
-           }) do
-        {:ok, store} ->
-          result = %{
-            "state" => if(committed?, do: "committed", else: "discarded"),
-            "discarded" => length(ids)
-          }
-
-          removed = removed_upload_ids(engine, store.engine, ids)
-          index = remove_uploads_from_index(state.upload_index, engine, removed)
-
-          {:reply, {:ok, result},
-           %{state | store: store, upload_index: index, active_uploads: active}}
-
-        {:error, reason, store} ->
-          removed = removed_upload_ids(engine, store.engine, ids)
-          index = remove_uploads_from_index(state.upload_index, engine, removed)
-
-          {:reply, {:error, reason},
-           %{state | store: store, upload_index: index, active_uploads: active}}
-      end
-    else
-      {:error, reason} -> {:reply, {:error, reason}, state}
-      _ -> {:reply, {:error, :invalid_upload}, state}
-    end
-  end
-
   def handle_call({:sweep_uploads, now_ms}, _from, state)
       when is_integer(now_ms) and now_ms >= 0 do
     case sweep_agent_uploads(state, now_ms) do
@@ -1383,144 +1492,77 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  def handle_call({:upload_prepare, key, attrs, size, hash, lease}, _from, state) do
-    with {:ok, person} <- Engine.authorized_person(state.store.engine, key),
-         true <- is_integer(size) and size >= 0,
-         true <- state.upload_cap == :none or size <= state.upload_cap,
-         true <- valid_upload_attributes?(attrs),
-         :ok <- upload_lease_status(state, lease, upload_group(person, key, attrs)),
-         true <- is_binary(hash) and Regex.match?(~r/\A[0-9a-f]{64}\z/, hash) do
-      base = %{
-        person: person,
-        uploader: key,
-        uploader_kind: upload_source(state, person, key, attrs, lease),
-        op_id: attrs["op_id"],
-        sender_id: attrs["sender_id"],
-        message_id: attrs["message_id"],
-        revision: attrs["revision"],
-        name: attrs["name"],
-        size: size,
-        sha256: hash,
-        last_activity_ms: System.system_time(:millisecond)
-      }
+  def handle_call({:upload_prepare, key, attrs, size, hash, lease}, _from, state),
+    do: upload_prepare_call(state, key, attrs, size, hash, lease, :device)
 
-      previous =
-        state.upload_index.ids_by_group
-        |> Map.get(upload_group(person, key, attrs), MapSet.new())
-        |> Enum.find_value(fn id ->
-          case Map.get(state.store.engine.uploads, id) do
-            %{person: ^person, uploader: ^key, op_id: op_id, name: name} = upload
-            when op_id == base.op_id and name == base.name ->
-              {id, upload}
-
-            _ ->
-              nil
-          end
-        end)
-
-      case previous do
-        {_id, upload} ->
-          if Map.drop(upload, [:id, :last_activity_ms, :uploader_kind]) ==
-               Map.drop(base, [:last_activity_ms, :uploader_kind]) do
-            {:reply, {:ok, :duplicate, upload_reply(upload, true)}, state}
-          else
-            {:reply, {:error, :upload_conflict}, state}
-          end
-
-        nil ->
-          upload = Map.put(base, :id, ConversationFiles.new_upload_id())
-
-          {:reply, {:ok, upload, state.store.upload_dir}, state}
-      end
-    else
-      {:error, :upload_discarded} ->
-        {:reply, {:error, :upload_discarded}, state}
+  def handle_call(
+        {:browser_upload_prepare, browser_session_id, recipient, attrs, size, hash, lease},
+        _from,
+        state
+      ) do
+    case browser_recipient_session(state, browser_session_id, recipient) do
+      {:ok, session} ->
+        upload_prepare_call(
+          state,
+          session.key,
+          attrs,
+          size,
+          hash,
+          lease,
+          {:browser, browser_session_id, recipient}
+        )
 
       {:error, reason} ->
         {:reply, {:error, reason}, state}
-
-      false
-      when is_integer(size) and is_integer(state.upload_cap) and
-             size > state.upload_cap ->
-        {:reply, {:error, :upload_cap_exceeded}, state}
-
-      _ ->
-        {:reply, {:error, :invalid_upload}, state}
     end
   end
 
-  def handle_call({:upload_commit, key, upload, published, lease}, _from, state) do
-    result =
-      with {:ok, person} <- Engine.authorized_person(state.store.engine, key),
-           true <- person == upload.person and key == upload.uploader,
-           :ok <- upload_lease_status(state, lease, upload_group(upload)),
-           true <- state.upload_cap == :none or upload.size <= state.upload_cap do
-        previous =
-          state.upload_index.ids_by_group
-          |> Map.get(upload_group(upload), MapSet.new())
-          |> Enum.find_value(fn id ->
-            case Map.get(state.store.engine.uploads, id) do
-              %{person: ^person, uploader: ^key, op_id: op_id, name: name} = stored
-              when op_id == upload.op_id and name == upload.name ->
-                {id, stored}
+  def handle_call({:upload_commit, key, upload, published, lease}, _from, state),
+    do: upload_commit_call(state, key, upload, published, lease, :device)
 
-              _ ->
-                nil
-            end
-          end)
+  def handle_call(
+        {:browser_upload_commit, browser_session_id, recipient, upload, published, lease},
+        _from,
+        state
+      ) do
+    case browser_recipient_session(state, browser_session_id, recipient) do
+      {:ok, session} ->
+        upload_commit_call(
+          state,
+          session.key,
+          upload,
+          published,
+          lease,
+          {:browser, browser_session_id, recipient}
+        )
 
-        case previous do
-          {_id, stored} ->
-            if Map.drop(stored, [:id, :last_activity_ms, :uploader_kind]) ==
-                 Map.drop(upload, [:id, :last_activity_ms, :uploader_kind]) do
-              {:reply, {:ok, upload_reply(stored, true)}, state}
-            else
-              {:reply, {:error, :upload_conflict}, state}
-            end
-
-          nil ->
-            upload = %{upload | last_activity_ms: System.system_time(:millisecond)}
-
-            case Store.put_published_upload(state.store, upload) do
-              {:ok, store} ->
-                index = add_upload_to_index(state.upload_index, upload)
-
-                {:reply, {:ok, upload_reply(upload, false)},
-                 %{state | store: store, upload_index: index}}
-
-              {:error, reason} ->
-                {:reply, {:error, reason}, state}
-            end
-        end
-      else
-        {:error, reason} -> {:reply, {:error, reason}, state}
-        _ -> {:reply, {:error, :invalid_upload}, state}
-      end
-
-    # A canceled lease, competing duplicate, or failed metadata commit must not
-    # leave newly published bytes addressable. The large rename ran in the
-    # connection process; this unlink only removes an uncommitted target.
-    case result do
-      {:reply, {:ok, %{"duplicate" => false}}, _} ->
-        result
-
-      _ ->
+      {:error, reason} ->
         _ = File.rm(published)
-        result
+        {:reply, {:error, reason}, state}
     end
   end
 
   def handle_call({:fetch_file, key, id}, _from, state) do
-    engine = state.store.engine
+    case Engine.authorized_person(state.store.engine, key) do
+      {:ok, person} ->
+        {:reply, fetched_file_for_person(state, person, id), state}
 
-    with {:ok, person} <- Engine.authorized_person(engine, key),
-         %{person: ^person} = upload <- Map.get(engine.uploads, id),
-         true <- referenced_upload?(state.upload_index, person, id),
-         {:ok, path} <- Store.get_upload(state.store, id) do
-      {:reply, {:ok, upload, path}, state}
-    else
-      {:error, :storage_unavailable} -> {:reply, {:error, :storage_unavailable}, state}
-      _ -> {:reply, {:error, :not_found}, state}
+      _ ->
+        {:reply, {:error, :not_found}, state}
+    end
+  end
+
+  def handle_call(
+        {:browser_fetch_file, person, owner_key, owner_revision, id},
+        _from,
+        state
+      ) do
+    case Engine.owner_revision(state.store.engine, person, owner_key) do
+      {:ok, ^owner_revision} ->
+        {:reply, fetched_file_for_person(state, person, id), state}
+
+      _ ->
+        {:reply, {:error, :session_ended}, state}
     end
   end
 
@@ -2826,6 +2868,108 @@ defmodule AttentionServer.Relay do
     end
   end
 
+  def handle_call(
+        {:open_browser_recipient, person, owner_key, owner_revision, browser_session_id,
+         recipient, worker},
+        _from,
+        state
+      ) do
+    key = BrowserRecipient.key(person, browser_session_id, recipient)
+    recipient_ref = {browser_session_id, recipient}
+
+    with true <- is_pid(worker),
+         true <- Message.uuid_v4?(recipient),
+         true <- BrowserRecipient.valid_for?(key, person),
+         {:ok, ^owner_revision} <-
+           Engine.owner_revision(state.store.engine, person, owner_key) do
+      state =
+        case Map.get(state.browser_recipients, recipient_ref) do
+          %{connection_id: old_id} when not is_nil(old_id) ->
+            drop_browser_connection(state, old_id, :replaced)
+
+          _ ->
+            state
+        end
+
+      id = make_ref()
+
+      session =
+        case Map.get(state.browser_recipients, recipient_ref) do
+          %{session: saved} -> saved
+          _ -> empty_browser_session(key)
+        end
+        |> Map.merge(%{
+          key: key,
+          person: person,
+          owner_key: owner_key,
+          owner_revision: owner_revision,
+          browser_session_id: browser_session_id,
+          recipient: recipient,
+          owner: worker,
+          socket: nil,
+          listener: nil,
+          transport: :browser
+        })
+
+      recipients =
+        Map.put(state.browser_recipients, recipient_ref, %{connection_id: id, session: session})
+
+      {:reply, {:ok, id},
+       %{state | sessions: Map.put(state.sessions, id, session), browser_recipients: recipients}}
+    else
+      _ -> {:reply, {:error, :forbidden}, state}
+    end
+  end
+
+  def handle_call({:end_browser_session, browser_session_id}, _from, state) do
+    state =
+      state.sessions
+      |> Enum.filter(fn {_id, session} ->
+        session.transport == :browser and session.browser_session_id == browser_session_id
+      end)
+      |> Enum.reduce(state, fn {id, _session}, acc -> drop_session(acc, id) end)
+
+    actor_keys =
+      state.browser_recipients
+      |> Enum.flat_map(fn
+        {{^browser_session_id, _recipient}, %{session: %{key: key}}} -> [key]
+        _ -> []
+      end)
+
+    actor_key_set = MapSet.new(actor_keys)
+
+    active_uploads =
+      Map.new(state.active_uploads, fn {lease, active} ->
+        {_person, actor, _op_id, _sender, _message, _revision} = active.group
+
+        {lease,
+         %{
+           active
+           | canceled: active.canceled or MapSet.member?(actor_key_set, actor)
+         }}
+      end)
+
+    state = %{state | active_uploads: active_uploads}
+
+    case cleanup_browser_recipient_state(state, actor_keys) do
+      {:ok, next} ->
+        recipients =
+          Map.reject(next.browser_recipients, fn {{session_id, _recipient}, _} ->
+            session_id == browser_session_id
+          end)
+
+        {:reply, :ok, %{next | browser_recipients: recipients}}
+
+      {:error, reason, next} ->
+        recipients =
+          Map.reject(next.browser_recipients, fn {{session_id, _recipient}, _} ->
+            session_id == browser_session_id
+          end)
+
+        {:reply, {:error, reason}, %{next | browser_recipients: recipients}}
+    end
+  end
+
   def handle_call({:session_send, id, frames}, _from, state) do
     with {:ok, %{socket: socket, key: key, transport: transport}} <- active_session(state, id),
          true <- not is_nil(socket) and is_list(frames),
@@ -2845,30 +2989,43 @@ defmodule AttentionServer.Relay do
   def handle_call({:close_session, id}, _from, state),
     do: {:reply, :ok, drop_session(state, id)}
 
-  def handle_call({:session_request_line, id, raw}, from, state) do
-    with {:ok, session} <- active_session(state, id) do
-      case JSON.decode_line(raw) do
-        {:ok, %{"type" => "inbox_start"} = frame} when session.transport == :websocket ->
-          inbox_start_call(state, id, session, frame, from)
+  def handle_call({:session_request_line, id, raw}, from, state),
+    do: session_request_line_call(state, id, raw, from)
 
-        {:ok, %{"type" => "focus_report"} = frame} ->
-          {reply, next} = focus_report_request(state, id, session, frame)
-          {:reply, reply, next}
-
-        _ ->
-          {reply, next} = session_request(state, id, session, raw)
-          {:reply, reply, next}
-      end
-    else
-      {:error, :forbidden} ->
-        {:reply, {:error, :forbidden}, %{state | sessions: Map.delete(state.sessions, id)}}
-
-      error ->
-        {:reply, error, state}
+  def handle_call(
+        {:browser_session_request_line, browser_session_id, id, raw},
+        from,
+        state
+      ) do
+    case browser_connection(state, browser_session_id, id) do
+      {:ok, _session} -> session_request_line_call(state, id, raw, from)
+      {:error, :forbidden} -> {:reply, {:error, :session_ended}, drop_session(state, id)}
+      {:error, reason} -> {:reply, {:error, reason}, state}
     end
   end
 
-  def handle_call({:session_drain, id}, _from, state) do
+  def handle_call({:session_drain, id}, _from, state),
+    do: session_drain_call(state, id)
+
+  def handle_call({:browser_session_drain, browser_session_id, id}, _from, state) do
+    case browser_connection(state, browser_session_id, id) do
+      {:ok, _session} -> session_drain_call(state, id)
+      {:error, :forbidden} -> {:reply, {:error, :session_ended}, drop_session(state, id)}
+      {:error, reason} -> {:reply, {:error, reason}, state}
+    end
+  end
+
+  def handle_call({:close_browser_connection, browser_session_id, id}, _from, state) do
+    case Map.get(state.sessions, id) do
+      %{transport: :browser, browser_session_id: ^browser_session_id} ->
+        {:reply, :ok, drop_session(state, id)}
+
+      _ ->
+        {:reply, :ok, state}
+    end
+  end
+
+  defp session_drain_call(state, id) do
     with {:ok, session} <- active_session(state, id),
          true <- session.ready,
          {:ok, events, high} <- Engine.events(state.store.engine, session.key, session.stream_seq),
@@ -2910,7 +3067,220 @@ defmodule AttentionServer.Relay do
         end
 
       {:error, :forbidden} ->
-        {:reply, {:error, :forbidden}, %{state | sessions: Map.delete(state.sessions, id)}}
+        {:reply, {:error, :forbidden}, drop_session(state, id)}
+
+      error ->
+        {:reply, error, state}
+    end
+  end
+
+  defp discard_uploads_call(state, key, attrs) do
+    with {:ok, person} <- Engine.authorized_person(state.store.engine, key),
+         true <- valid_discard_attributes?(attrs) do
+      scope = upload_request_scope(person, key, attrs)
+      engine = state.store.engine
+      references = Map.get(state.upload_index.references_by_person, person, MapSet.new())
+      scoped_ids = Map.get(state.upload_index.ids_by_request_scope, scope, MapSet.new())
+
+      ids =
+        for id <- scoped_ids,
+            not MapSet.member?(references, id),
+            do: id
+
+      committed? =
+        Enum.any?(scoped_ids, &MapSet.member?(references, &1))
+
+      active =
+        Map.new(state.active_uploads, fn {lease, active} ->
+          {lease,
+           %{active | canceled: active.canceled or upload_request_scope(active.group) == scope}}
+        end)
+
+      case Store.delete_uploads(state.store, ids, %{
+             person: person,
+             actor: key,
+             action: "upload_discard",
+             operation_id: Diagnostics.operation_id(attrs)
+           }) do
+        {:ok, store} ->
+          result = %{
+            "state" => if(committed?, do: "committed", else: "discarded"),
+            "discarded" => length(ids)
+          }
+
+          removed = removed_upload_ids(engine, store.engine, ids)
+          index = remove_uploads_from_index(state.upload_index, engine, removed)
+
+          {:reply, {:ok, result},
+           %{state | store: store, upload_index: index, active_uploads: active}}
+
+        {:error, reason, store} ->
+          removed = removed_upload_ids(engine, store.engine, ids)
+          index = remove_uploads_from_index(state.upload_index, engine, removed)
+
+          {:reply, {:error, reason},
+           %{state | store: store, upload_index: index, active_uploads: active}}
+      end
+    else
+      {:error, reason} -> {:reply, {:error, reason}, state}
+      _ -> {:reply, {:error, :invalid_upload}, state}
+    end
+  end
+
+  defp upload_prepare_call(state, key, attrs, size, hash, lease, context) do
+    with {:ok, person} <- upload_authorized_person(state, key, context),
+         true <- is_integer(size) and size >= 0,
+         true <- state.upload_cap == :none or size <= state.upload_cap,
+         true <- valid_upload_attributes?(attrs),
+         :ok <- upload_lease_status(state, lease, upload_group(person, key, attrs)),
+         true <- is_binary(hash) and Regex.match?(~r/\A[0-9a-f]{64}\z/, hash) do
+      base = %{
+        person: person,
+        uploader: key,
+        uploader_kind: upload_source(state, person, key, attrs, lease),
+        op_id: attrs["op_id"],
+        sender_id: attrs["sender_id"],
+        message_id: attrs["message_id"],
+        revision: attrs["revision"],
+        name: attrs["name"],
+        size: size,
+        sha256: hash,
+        last_activity_ms: System.system_time(:millisecond)
+      }
+
+      previous =
+        state.upload_index.ids_by_group
+        |> Map.get(upload_group(person, key, attrs), MapSet.new())
+        |> Enum.find_value(fn id ->
+          case Map.get(state.store.engine.uploads, id) do
+            %{person: ^person, uploader: ^key, op_id: op_id, name: name} = upload
+            when op_id == base.op_id and name == base.name ->
+              {id, upload}
+
+            _ ->
+              nil
+          end
+        end)
+
+      case previous do
+        {_id, upload} ->
+          if Map.drop(upload, [:id, :last_activity_ms, :uploader_kind]) ==
+               Map.drop(base, [:last_activity_ms, :uploader_kind]) do
+            {:reply, {:ok, :duplicate, upload_reply(upload, true)}, state}
+          else
+            {:reply, {:error, :upload_conflict}, state}
+          end
+
+        nil ->
+          upload = Map.put(base, :id, ConversationFiles.new_upload_id())
+
+          {:reply, {:ok, upload, state.store.upload_dir}, state}
+      end
+    else
+      {:error, :upload_discarded} ->
+        {:reply, {:error, :upload_discarded}, state}
+
+      {:error, reason} ->
+        {:reply, {:error, reason}, state}
+
+      false
+      when is_integer(size) and is_integer(state.upload_cap) and
+             size > state.upload_cap ->
+        {:reply, {:error, :upload_cap_exceeded}, state}
+
+      _ ->
+        {:reply, {:error, :invalid_upload}, state}
+    end
+  end
+
+  defp upload_commit_call(state, key, upload, published, lease, context) do
+    result =
+      with {:ok, person} <- upload_authorized_person(state, key, context),
+           true <- person == upload.person and key == upload.uploader,
+           :ok <- upload_lease_status(state, lease, upload_group(upload)),
+           true <- state.upload_cap == :none or upload.size <= state.upload_cap do
+        previous =
+          state.upload_index.ids_by_group
+          |> Map.get(upload_group(upload), MapSet.new())
+          |> Enum.find_value(fn id ->
+            case Map.get(state.store.engine.uploads, id) do
+              %{person: ^person, uploader: ^key, op_id: op_id, name: name} = stored
+              when op_id == upload.op_id and name == upload.name ->
+                {id, stored}
+
+              _ ->
+                nil
+            end
+          end)
+
+        case previous do
+          {_id, stored} ->
+            if Map.drop(stored, [:id, :last_activity_ms, :uploader_kind]) ==
+                 Map.drop(upload, [:id, :last_activity_ms, :uploader_kind]) do
+              {:reply, {:ok, upload_reply(stored, true)}, state}
+            else
+              {:reply, {:error, :upload_conflict}, state}
+            end
+
+          nil ->
+            upload = %{upload | last_activity_ms: System.system_time(:millisecond)}
+
+            case Store.put_published_upload(state.store, upload) do
+              {:ok, store} ->
+                index = add_upload_to_index(state.upload_index, upload)
+
+                {:reply, {:ok, upload_reply(upload, false)},
+                 %{state | store: store, upload_index: index}}
+
+              {:error, reason} ->
+                {:reply, {:error, reason}, state}
+            end
+        end
+      else
+        {:error, reason} -> {:reply, {:error, reason}, state}
+        _ -> {:reply, {:error, :invalid_upload}, state}
+      end
+
+    # A canceled lease, competing duplicate, or failed metadata commit must not
+    # leave newly published bytes addressable. The large rename ran in the
+    # connection process; this unlink only removes an uncommitted target.
+    case result do
+      {:reply, {:ok, %{"duplicate" => false}}, _} ->
+        result
+
+      _ ->
+        _ = File.rm(published)
+        result
+    end
+  end
+
+  defp session_request_line_call(state, id, raw, from) do
+    with {:ok, session} <- active_session(state, id) do
+      browser_type = browser_frame_type(raw)
+
+      cond do
+        session.transport == :browser and is_binary(browser_type) and
+            browser_type not in @browser_frame_types ->
+          {:reply, {:ok, [error_line(raw, "unknown_type")]}, state}
+
+        true ->
+          case JSON.decode_line(raw) do
+            {:ok, %{"type" => "inbox_start"} = frame}
+            when session.transport in [:websocket, :browser] ->
+              inbox_start_call(state, id, session, frame, from)
+
+            {:ok, %{"type" => "focus_report"} = frame} ->
+              {reply, next} = focus_report_request(state, id, session, frame)
+              {:reply, reply, next}
+
+            _ ->
+              {reply, next} = session_request(state, id, session, raw)
+              {:reply, reply, next}
+          end
+      end
+    else
+      {:error, :forbidden} ->
+        {:reply, {:error, :forbidden}, drop_session(state, id)}
 
       error ->
         {:reply, error, state}
@@ -3383,11 +3753,119 @@ defmodule AttentionServer.Relay do
       nil ->
         {:error, :unknown_session}
 
+      %{transport: :browser} = session ->
+        with true <- BrowserRecipient.valid_for?(session.key, session.person),
+             {:ok, revision} <-
+               Engine.owner_revision(
+                 state.store.engine,
+                 session.person,
+                 session.owner_key
+               ),
+             true <- revision == session.owner_revision do
+          {:ok, session}
+        else
+          _ -> {:error, :forbidden}
+        end
+
       session ->
         case Engine.authorized_person(state.store.engine, session.key) do
           {:ok, _} -> {:ok, session}
           error -> error
         end
+    end
+  end
+
+  defp browser_connection(state, browser_session_id, id) do
+    case Map.get(state.sessions, id) do
+      %{transport: :browser, browser_session_id: ^browser_session_id} ->
+        active_session(state, id)
+
+      nil ->
+        {:error, :unknown_session}
+
+      _ ->
+        {:error, :forbidden}
+    end
+  end
+
+  defp browser_recipient_session(state, browser_session_id, recipient) do
+    case Map.get(state.browser_recipients, {browser_session_id, recipient}) do
+      %{session: %{transport: :browser} = session} ->
+        with true <-
+               session.key == BrowserRecipient.key(session.person, browser_session_id, recipient),
+             true <- BrowserRecipient.valid_for?(session.key, session.person),
+             {:ok, revision} <-
+               Engine.owner_revision(state.store.engine, session.person, session.owner_key),
+             true <- revision == session.owner_revision do
+          {:ok, session}
+        else
+          _ -> {:error, :session_ended}
+        end
+
+      _ ->
+        {:error, :forbidden}
+    end
+  end
+
+  defp file_limits_reply(state, key) do
+    case Engine.authorized_person(state.store.engine, key) do
+      {:ok, _person} ->
+        cap = if state.upload_cap == :none, do: "none", else: state.upload_cap
+
+        {:reply,
+         {:ok,
+          %{
+            "inline_decoded_bytes_per_entry" => ConversationFiles.inline_limit(),
+            "upload_cap_bytes_per_file" => cap
+          }}, state}
+
+      _ ->
+        {:reply, {:error, :forbidden}, state}
+    end
+  end
+
+  defp begin_upload(state, person, key, attrs, _size, worker, browser_session_id) do
+    with {:ok, store} <-
+           touch_upload_group(
+             state.store,
+             state.upload_index,
+             upload_group(person, key, attrs)
+           ) do
+      lease = make_ref()
+
+      uploader_kind =
+        Engine.upload_source(
+          state.store.engine,
+          person,
+          key,
+          attrs["sender_id"],
+          attrs["message_id"]
+        )
+        |> Atom.to_string()
+
+      monitor = Process.monitor(worker)
+
+      active =
+        Map.put(state.active_uploads, lease, %{
+          group: upload_group(person, key, attrs),
+          uploader_kind: uploader_kind,
+          browser_session_id: browser_session_id,
+          canceled: false,
+          monitor: monitor
+        })
+
+      {:ok, lease, %{state | store: store, active_uploads: active}}
+    end
+  end
+
+  defp upload_authorized_person(state, key, :device),
+    do: Engine.authorized_person(state.store.engine, key)
+
+  defp upload_authorized_person(state, key, {:browser, browser_session_id, recipient}) do
+    case browser_recipient_session(state, browser_session_id, recipient) do
+      {:ok, %{key: ^key, person: person}} -> {:ok, person}
+      {:ok, _other} -> {:error, :forbidden}
+      {:error, reason} -> {:error, reason}
     end
   end
 
@@ -3487,6 +3965,39 @@ defmodule AttentionServer.Relay do
     end
   end
 
+  defp browser_frame_type(raw) do
+    case JSON.decode_line(raw) do
+      {:ok, %{"type" => type}} when is_binary(type) -> type
+      _ -> nil
+    end
+  end
+
+  defp empty_browser_session(key) do
+    %{
+      key: key,
+      focus_opted_in: false,
+      contiguous: 0,
+      stream_seq: nil,
+      ready: false,
+      conversation_seq: nil,
+      conversation_contiguous: nil,
+      conversation_ready: false,
+      owner: nil,
+      socket: nil,
+      listener: nil,
+      transport: :browser,
+      sync_mode: nil,
+      snapshot_id: nil,
+      replay_attach: nil,
+      view_support: false,
+      view_notice: nil,
+      view_notice_due_at: nil,
+      view_last_notice_at: nil,
+      levels_support: false,
+      levels_notice: false
+    }
+  end
+
   defp levels_session_request(state, id, session, raw) do
     session = %{session | levels_support: true}
     state = put_session(state, id, session)
@@ -3554,7 +4065,7 @@ defmodule AttentionServer.Relay do
 
   defp inbox_session_request(state, id, session, frame) do
     cond do
-      session.transport != :websocket ->
+      session.transport not in [:websocket, :browser] ->
         {{:ok, [error_line(frame, "unknown_type")]}, state}
 
       session.sync_mode == :legacy ->
@@ -5886,7 +6397,18 @@ defmodule AttentionServer.Relay do
   defp audit(engine, key, action),
     do: %{person: person_of(engine, key), actor: key, action: action}
 
-  defp person_of(engine, key), do: get_in(engine.devices, [key, :person])
+  defp person_of(engine, key) do
+    case get_in(engine.devices, [key, :person]) do
+      nil ->
+        case BrowserRecipient.person(key) do
+          {:ok, person} -> if(Map.has_key?(engine.persons, person), do: person, else: nil)
+          _ -> nil
+        end
+
+      person ->
+        person
+    end
+  end
 
   defp random_uuid_v4 do
     <<a::binary-size(6), b::8, c::8, d::8, e::binary-size(7)>> = :crypto.strong_rand_bytes(16)
@@ -5959,8 +6481,21 @@ defmodule AttentionServer.Relay do
 
   defp line(frame), do: JSON.encode!(frame) <> "\n"
 
-  defp put_session(state, id, session),
-    do: %{state | sessions: Map.put(state.sessions, id, session)}
+  defp put_session(state, id, session) do
+    state = %{state | sessions: Map.put(state.sessions, id, session)}
+
+    if session.transport == :browser do
+      recipient_ref = {session.browser_session_id, session.recipient}
+      recipient = %{connection_id: id, session: session}
+
+      %{
+        state
+        | browser_recipients: Map.put(state.browser_recipients, recipient_ref, recipient)
+      }
+    else
+      state
+    end
+  end
 
   defp send_frames(socket, frames, transport) do
     Enum.reduce_while(frames, :ok, fn frame, _ ->
@@ -6559,9 +7094,111 @@ defmodule AttentionServer.Relay do
         # TLS close can wait on the peer; keep that wait out of the shared Relay.
         if session.socket, do: spawn(fn -> :ssl.close(session.socket) end)
 
-        %{state | sessions: sessions}
-        |> set_focus_connected(session.key, false)
+        state = %{state | sessions: sessions}
+
+        if session.transport == :browser do
+          recipient_ref = {session.browser_session_id, session.recipient}
+          saved = %{connection_id: nil, session: %{session | owner: nil}}
+          %{state | browser_recipients: Map.put(state.browser_recipients, recipient_ref, saved)}
+        else
+          set_focus_connected(state, session.key, false)
+        end
     end
+  end
+
+  defp drop_browser_connection(state, id, :replaced) do
+    case Map.pop(state.sessions, id) do
+      {nil, _} ->
+        state
+
+      {session, sessions} ->
+        if session.owner, do: send(session.owner, {:browser_connection_replaced, id})
+        recipient_ref = {session.browser_session_id, session.recipient}
+        saved = %{connection_id: nil, session: %{session | owner: nil}}
+
+        %{
+          state
+          | sessions: sessions,
+            browser_recipients: Map.put(state.browser_recipients, recipient_ref, saved)
+        }
+    end
+  end
+
+  defp cleanup_browser_recipient_state(state, actor_keys) do
+    actor_keys = MapSet.new(actor_keys)
+
+    state =
+      state.inbox_builds
+      |> Enum.filter(fn {_key, build} ->
+        MapSet.member?(actor_keys, build.snapshot.device_id)
+      end)
+      |> Enum.reduce(state, fn {key, _build}, acc ->
+        fail_inbox_build(acc, key, :forbidden, true)
+      end)
+
+    engine = discard_browser_actor_state(state.store.engine, actor_keys)
+
+    case commit(state.store, engine, %{
+           person: "system",
+           actor: "browser_session",
+           action: "browser_session_end"
+         }) do
+      {:ok, store} ->
+        next = %{state | store: store}
+
+        Enum.reduce_while(actor_keys, {:ok, next}, fn key, {:ok, acc} ->
+          case BrowserRecipient.person(key) do
+            {:ok, person} ->
+              case Store.discard_inbox_snapshots_for_device(acc.store, person, key) do
+                :ok -> {:cont, {:ok, acc}}
+                {:error, reason} -> {:halt, {:error, reason, acc}}
+              end
+
+            _ ->
+              {:cont, {:ok, acc}}
+          end
+        end)
+
+      {:error, reason, store} ->
+        {:error, reason, %{state | store: store}}
+    end
+  end
+
+  defp browser_actor_keys(engine) do
+    keys =
+      Enum.map(engine.cursors, fn {{_person, key}, _seq} -> key end) ++
+        Enum.map(engine.conversation_cursors, fn {{_person, key}, _seq} -> key end) ++
+        Enum.map(engine.conversation_opened, fn {_person, key} -> key end) ++
+        Enum.map(engine.receipts, fn {{_person, key, _op_id}, _receipt} -> key end) ++
+        Enum.map(engine.uploads, fn {_id, upload} -> upload.uploader end)
+
+    keys
+    |> Enum.uniq()
+    |> Enum.filter(&(BrowserRecipient.person(&1) != :error))
+  end
+
+  defp discard_browser_actor_state(engine, actor_keys) do
+    actor_keys = MapSet.new(actor_keys)
+
+    %{
+      engine
+      | cursors:
+          Map.reject(engine.cursors, fn {{_person, actor}, _seq} ->
+            MapSet.member?(actor_keys, actor)
+          end),
+        conversation_cursors:
+          Map.reject(engine.conversation_cursors, fn {{_person, actor}, _seq} ->
+            MapSet.member?(actor_keys, actor)
+          end),
+        conversation_opened:
+          MapSet.filter(engine.conversation_opened, fn {_person, actor} ->
+            not MapSet.member?(actor_keys, actor)
+          end),
+        receipts:
+          Map.reject(engine.receipts, fn {{_person, actor, _op_id}, _receipt} ->
+            MapSet.member?(actor_keys, actor)
+          end)
+    }
   end
 
   defp wrap_line({:ok, line}), do: {:ok, [line]}
@@ -6731,6 +7368,19 @@ defmodule AttentionServer.Relay do
     upload_index.references_by_person
     |> Map.get(person, MapSet.new())
     |> MapSet.member?(id)
+  end
+
+  defp fetched_file_for_person(state, person, id) do
+    engine = state.store.engine
+
+    with %{person: ^person} = upload <- Map.get(engine.uploads, id),
+         true <- referenced_upload?(state.upload_index, person, id),
+         {:ok, path} <- Store.get_upload(state.store, id) do
+      {:ok, upload, path}
+    else
+      {:error, :storage_unavailable} -> {:error, :storage_unavailable}
+      _ -> {:error, :not_found}
+    end
   end
 
   defp upload_source(state, person, key, attrs, lease) do
