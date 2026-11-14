@@ -835,12 +835,28 @@ defmodule AttentionServer.Relay do
   end
 
   @impl true
-  def handle_call({:request_line, key, raw}, _from, state) do
+  def handle_call(request, from, state) do
+    with_persistence_reads(state, fn -> dispatch_call(request, from, state) end)
+  end
+
+  defp with_persistence_reads(state, fun) do
+    reader = fn committed_store, request, from ->
+      committed_state = %{state | store: committed_store}
+      # The persistence read set consists exclusively of callbacks that return
+      # their input state unchanged. Reuse their authorization/projection logic.
+      {:reply, reply, ^committed_state} = dispatch_call(request, from, committed_state)
+      reply
+    end
+
+    AttentionServer.Store.Persistence.with_reads(state.store, reader, fun)
+  end
+
+  defp dispatch_call({:request_line, key, raw}, _from, state) do
     {reply, next} = request(state, key, raw)
     {:reply, reply, next}
   end
 
-  def handle_call({:request_frame, key, frame}, _from, state) do
+  defp dispatch_call({:request_frame, key, frame}, _from, state) do
     case Engine.authorized_person(state.store.engine, key) do
       {:ok, _person} when is_map(frame) ->
         if JSON.ui1_duplicate_request?(frame) do
@@ -858,10 +874,10 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  def handle_call(:enable_push, _from, state),
+  defp dispatch_call(:enable_push, _from, state),
     do: {:reply, :ok, %{state | push_enabled: true}}
 
-  def handle_call({:claim_push, now_ms}, _from, state) when is_integer(now_ms) do
+  defp dispatch_call({:claim_push, now_ms}, _from, state) when is_integer(now_ms) do
     case Engine.claim_push(state.store.engine, now_ms) do
       {:ok, next_engine, claim} when next_engine == state.store.engine ->
         {:reply, {:ok, claim}, state}
@@ -878,7 +894,8 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  def handle_call({:finish_push, claim, outcome, now_ms}, _from, state) when is_integer(now_ms) do
+  defp dispatch_call({:finish_push, claim, outcome, now_ms}, _from, state)
+       when is_integer(now_ms) do
     case Engine.finish_push(state.store.engine, claim, outcome, now_ms) do
       {:ok, next_engine} when next_engine == state.store.engine ->
         {:reply, :ok, state}
@@ -895,25 +912,25 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  def handle_call({:events, key, since}, _from, state),
+  defp dispatch_call({:events, key, since}, _from, state),
     do: {:reply, Engine.events(state.store.engine, key, since), state}
 
-  def handle_call({:conversation_events, key, since}, _from, state),
+  defp dispatch_call({:conversation_events, key, since}, _from, state),
     do: {:reply, Engine.conversation_events(state.store.engine, key, since), state}
 
-  def handle_call({:conversation_cursor, key}, _from, state),
+  defp dispatch_call({:conversation_cursor, key}, _from, state),
     do: {:reply, Engine.conversation_cursor(state.store.engine, key), state}
 
-  def handle_call({:cursor, key}, _from, state),
+  defp dispatch_call({:cursor, key}, _from, state),
     do: {:reply, Engine.acknowledged_cursor(state.store.engine, key), state}
 
-  def handle_call({:device_revoked?, key}, _from, state),
+  defp dispatch_call({:device_revoked?, key}, _from, state),
     do: {:reply, Engine.device_revoked?(state.store.engine, key), state}
 
-  def handle_call({:owner_revision, person, key}, _from, state),
+  defp dispatch_call({:owner_revision, person, key}, _from, state),
     do: {:reply, Engine.owner_revision(state.store.engine, person, key), state}
 
-  def handle_call({:dashboard_inventory, person, key, configured_owner_person}, _from, state) do
+  defp dispatch_call({:dashboard_inventory, person, key, configured_owner_person}, _from, state) do
     engine = state.store.engine
 
     result =
@@ -926,11 +943,11 @@ defmodule AttentionServer.Relay do
     {:reply, result, state}
   end
 
-  def handle_call(
-        {:dashboard_prioritization, person, key, configured_owner_person},
-        _from,
-        state
-      ) do
+  defp dispatch_call(
+         {:dashboard_prioritization, person, key, configured_owner_person},
+         _from,
+         state
+       ) do
     if state.deployment_mode == :self_hosted and person == configured_owner_person and
          match?({:ok, ^person, _revision}, Engine.owner_identity(state.store.engine, key)) do
       state = ensure_priority_view(state, person)
@@ -940,7 +957,7 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  def handle_call({:dashboard_levels, person, key}, _from, state) do
+  defp dispatch_call({:dashboard_levels, person, key}, _from, state) do
     case Engine.owner_identity(state.store.engine, key) do
       {:ok, ^person, _revision} ->
         {:reply, {:ok, %{"levels" => BounceDecision.levels(state.store.engine, person)}}, state}
@@ -950,7 +967,7 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  def handle_call({:save_dashboard_levels, person, key, rows}, _from, state) do
+  defp dispatch_call({:save_dashboard_levels, person, key, rows}, _from, state) do
     with {:ok, ^person, _revision} <- Engine.owner_identity(state.store.engine, key),
          {:ok, levels} <- BouncePolicy.normalize_levels(rows),
          {:ok, next, config} <-
@@ -978,12 +995,12 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  def handle_call(
-        {:save_dashboard_prioritization, person, key, configured_owner_person, algorithm,
-         endpoint, model},
-        _from,
-        state
-      ) do
+  defp dispatch_call(
+         {:save_dashboard_prioritization, person, key, configured_owner_person, algorithm,
+          endpoint, model},
+         _from,
+         state
+       ) do
     case save_priority_settings(
            state,
            person,
@@ -999,13 +1016,13 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  def handle_call({:owner_identity, key}, _from, state),
+  defp dispatch_call({:owner_identity, key}, _from, state),
     do: {:reply, Engine.owner_identity(state.store.engine, key), state}
 
-  def handle_call({:agent_identity, key}, _from, state),
+  defp dispatch_call({:agent_identity, key}, _from, state),
     do: {:reply, Engine.agent_identity(state.store.engine, key), state}
 
-  def handle_call({:origin_feed, key, since}, _from, state) do
+  defp dispatch_call({:origin_feed, key, since}, _from, state) do
     case Engine.deliver_origin_feed(state.store.engine, key, since) do
       {:ok, next, reply} ->
         case commit(state.store, next, audit(state.store.engine, key, "origin_feed")) do
@@ -1018,21 +1035,21 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  def handle_call(
-        {:origin_message_get, key, sender_id, message_id, request_revision},
-        _from,
-        state
-      ) do
+  defp dispatch_call(
+         {:origin_message_get, key, sender_id, message_id, request_revision},
+         _from,
+         state
+       ) do
     {:reply,
      Engine.origin_message_get(state.store.engine, key, sender_id, message_id, request_revision),
      state}
   end
 
-  def handle_call({:origin_advisory_feed, key, handle, since}, _from, state) do
+  defp dispatch_call({:origin_advisory_feed, key, handle, since}, _from, state) do
     {:reply, BounceDecision.advisory_feed(state.store.engine, key, handle, since), state}
   end
 
-  def handle_call({:origin_advisory_ack, key, handle, advisory_id}, _from, state) do
+  defp dispatch_call({:origin_advisory_ack, key, handle, advisory_id}, _from, state) do
     case BounceDecision.advisory_ack(state.store.engine, key, handle, advisory_id) do
       {:ok, next, reply} when next == state.store.engine ->
         {:reply, {:ok, reply}, state}
@@ -1048,14 +1065,14 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  def handle_call({:origin_coverage, key}, _from, state) do
+  defp dispatch_call({:origin_coverage, key}, _from, state) do
     case Engine.authorized_person(state.store.engine, key) do
       {:ok, person} -> {:reply, {:ok, covered_handles(state.store.engine, person, key)}, state}
       error -> {:reply, error, state}
     end
   end
 
-  def handle_call({:origin_status, key, :origin}, _from, state) do
+  defp dispatch_call({:origin_status, key, :origin}, _from, state) do
     case Engine.authorized_person(state.store.engine, key) do
       {:ok, person} ->
         high = Map.get(state.store.engine.origin_feeds, {person, key}, %{high: 0}).high
@@ -1066,7 +1083,7 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  def handle_call({:origin_status, key, handle}, _from, state) do
+  defp dispatch_call({:origin_status, key, handle}, _from, state) do
     engine = state.store.engine
 
     case Engine.authorized_person(engine, key) do
@@ -1079,7 +1096,7 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  def handle_call({:origin_support, key, declaration}, _from, state) do
+  defp dispatch_call({:origin_support, key, declaration}, _from, state) do
     case Engine.origin_support(state.store.engine, key, declaration) do
       {:ok, next, reply} when next == state.store.engine ->
         {:reply, {:ok, reply}, state}
@@ -1131,7 +1148,7 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  def handle_call({:origin_attachment_update, key, declaration}, _from, state) do
+  defp dispatch_call({:origin_attachment_update, key, declaration}, _from, state) do
     case Engine.origin_attachment_update(state.store.engine, key, declaration) do
       {:ok, next, reply} when next == state.store.engine ->
         {:reply, {:ok, reply}, state}
@@ -1159,7 +1176,7 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  def handle_call({:origin_file_limits, key}, _from, state) do
+  defp dispatch_call({:origin_file_limits, key}, _from, state) do
     case Engine.authorized_person(state.store.engine, key) do
       {:ok, _person} ->
         cap = if state.upload_cap == :none, do: "none", else: state.upload_cap
@@ -1176,7 +1193,7 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  def handle_call({:upload_begin, key, attrs, size}, {worker, _}, state) do
+  defp dispatch_call({:upload_begin, key, attrs, size}, {worker, _}, state) do
     with {:ok, person} <- Engine.authorized_person(state.store.engine, key),
          true <- valid_upload_attributes?(attrs),
          true <- is_integer(size) and size >= 0,
@@ -1217,14 +1234,14 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  def handle_call({:upload_end, lease}, _from, state) do
+  defp dispatch_call({:upload_end, lease}, _from, state) do
     if active = Map.get(state.active_uploads, lease),
       do: Process.demonitor(active.monitor, [:flush])
 
     {:reply, :ok, %{state | active_uploads: Map.delete(state.active_uploads, lease)}}
   end
 
-  def handle_call({:discard_uploads, key, attrs}, _from, state) do
+  defp dispatch_call({:discard_uploads, key, attrs}, _from, state) do
     with {:ok, person} <- Engine.authorized_person(state.store.engine, key),
          true <- valid_discard_attributes?(attrs) do
       scope = upload_request_scope(person, key, attrs)
@@ -1277,15 +1294,15 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  def handle_call({:sweep_uploads, now_ms}, _from, state)
-      when is_integer(now_ms) and now_ms >= 0 do
+  defp dispatch_call({:sweep_uploads, now_ms}, _from, state)
+       when is_integer(now_ms) and now_ms >= 0 do
     case sweep_agent_uploads(state, now_ms) do
       {:ok, next, count} -> {:reply, {:ok, count}, next}
       {:error, reason, next} -> {:reply, {:error, reason}, next}
     end
   end
 
-  def handle_call({:upload_prepare, key, attrs, size, hash, lease}, _from, state) do
+  defp dispatch_call({:upload_prepare, key, attrs, size, hash, lease}, _from, state) do
     with {:ok, person} <- Engine.authorized_person(state.store.engine, key),
          true <- is_integer(size) and size >= 0,
          true <- state.upload_cap == :none or size <= state.upload_cap,
@@ -1351,7 +1368,7 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  def handle_call({:upload_commit, key, upload, published, lease}, _from, state) do
+  defp dispatch_call({:upload_commit, key, upload, published, lease}, _from, state) do
     result =
       with {:ok, person} <- Engine.authorized_person(state.store.engine, key),
            true <- person == upload.person and key == upload.uploader,
@@ -1412,7 +1429,7 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  def handle_call({:fetch_file, key, id}, _from, state) do
+  defp dispatch_call({:fetch_file, key, id}, _from, state) do
     engine = state.store.engine
 
     with {:ok, person} <- Engine.authorized_person(engine, key),
@@ -1426,7 +1443,7 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  def handle_call({:origin_session_gone, key, handle}, _from, state) do
+  defp dispatch_call({:origin_session_gone, key, handle}, _from, state) do
     case Engine.origin_session_gone(state.store.engine, key, handle) do
       {:ok, next} ->
         {:ok, person} = Engine.authorized_person(next, key)
@@ -1462,7 +1479,11 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  def handle_call({:origin_stream_attach, key, :origin, worker, reconnect, false}, _from, state) do
+  defp dispatch_call(
+         {:origin_stream_attach, key, :origin, worker, reconnect, false},
+         _from,
+         state
+       ) do
     with {:ok, person} <- Engine.authorized_person(state.store.engine, key),
          stream_key = {person, key, :origin},
          false <- not reconnect and Map.has_key?(state.origin_streams, stream_key) do
@@ -1502,12 +1523,12 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  def handle_call(
-        {:origin_stream_attach, key, handle, worker, reconnect, advisory_requested},
-        _from,
-        state
-      )
-      when is_pid(worker) and is_boolean(reconnect) and is_boolean(advisory_requested) do
+  defp dispatch_call(
+         {:origin_stream_attach, key, handle, worker, reconnect, advisory_requested},
+         _from,
+         state
+       )
+       when is_pid(worker) and is_boolean(reconnect) and is_boolean(advisory_requested) do
     engine = state.store.engine
 
     with {:ok, person} <- Engine.authorized_person(engine, key),
@@ -1579,7 +1600,7 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  def handle_call({:origin_stream_detach, key, handle, worker}, _from, state) do
+  defp dispatch_call({:origin_stream_detach, key, handle, worker}, _from, state) do
     case Enum.find(state.origin_streams, fn
            {{_person, ^key, ^handle}, %{worker: ^worker}} -> true
            _ -> false
@@ -1589,7 +1610,7 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  def handle_call({:origin_ack2, key, feed_seq, declaration}, _from, state) do
+  defp dispatch_call({:origin_ack2, key, feed_seq, declaration}, _from, state) do
     case Engine.origin_ack2(state.store.engine, key, feed_seq, declaration) do
       {:ok, next, reply} ->
         case commit(state.store, next, audit(state.store.engine, key, "origin_ack2")) do
@@ -1602,7 +1623,7 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  def handle_call({:origin_ack, key, feed_seq, reports}, _from, state) do
+  defp dispatch_call({:origin_ack, key, feed_seq, reports}, _from, state) do
     case Engine.origin_ack(state.store.engine, key, feed_seq, reports) do
       {:ok, next, reply} ->
         case commit(state.store, next, audit(state.store.engine, key, "origin_ack")) do
@@ -1615,7 +1636,7 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  def handle_call({:origin_file_use, key, feed_seq, name, outcome, op_id}, _from, state) do
+  defp dispatch_call({:origin_file_use, key, feed_seq, name, outcome, op_id}, _from, state) do
     case Engine.origin_file_use(state.store.engine, key, feed_seq, name, outcome, op_id) do
       {:ok, next, reply} ->
         case commit(state.store, next, audit(state.store.engine, key, "origin_file_use")) do
@@ -1628,7 +1649,7 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  def handle_call({:agent_send_request, key, revision, request, socket}, _from, state) do
+  defp dispatch_call({:agent_send_request, key, revision, request, socket}, _from, state) do
     case Engine.agent_identity(state.store.engine, key) do
       {:ok, person, _id, ^revision} ->
         {reply, next_state} = agent_request(state, person, key, request)
@@ -1648,7 +1669,7 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  def handle_call({:agent_send_https, key, revision, request, socket}, _from, state) do
+  defp dispatch_call({:agent_send_https, key, revision, request, socket}, _from, state) do
     case Engine.agent_identity(state.store.engine, key) do
       {:ok, person, _id, ^revision} ->
         {reply, next_state} =
@@ -1676,7 +1697,7 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  def handle_call({:owner_register_agent, person, owner_key, id, agent_key}, _from, state),
+  defp dispatch_call({:owner_register_agent, person, owner_key, id, agent_key}, _from, state),
     do:
       setup(
         state,
@@ -1686,29 +1707,29 @@ defmodule AttentionServer.Relay do
         "owner_agent_register"
       )
 
-  def handle_call(
-        {:owner_replace_agent_grants, person, owner_key, agent_key, revision, read, respond},
-        _from,
-        state
-      ),
-      do:
-        setup(
-          state,
-          Engine.owner_replace_agent_grants(
-            state.store.engine,
-            person,
-            owner_key,
-            agent_key,
-            revision,
-            read,
-            respond
-          ),
-          person,
-          owner_key,
-          "owner_agent_grants_replace"
-        )
+  defp dispatch_call(
+         {:owner_replace_agent_grants, person, owner_key, agent_key, revision, read, respond},
+         _from,
+         state
+       ),
+       do:
+         setup(
+           state,
+           Engine.owner_replace_agent_grants(
+             state.store.engine,
+             person,
+             owner_key,
+             agent_key,
+             revision,
+             read,
+             respond
+           ),
+           person,
+           owner_key,
+           "owner_agent_grants_replace"
+         )
 
-  def handle_call({:owner_revoke_agent, person, owner_key, agent_key}, _from, state),
+  defp dispatch_call({:owner_revoke_agent, person, owner_key, agent_key}, _from, state),
     do:
       setup(
         state,
@@ -1718,10 +1739,10 @@ defmodule AttentionServer.Relay do
         "owner_agent_revoke"
       )
 
-  def handle_call({:owner_list_agents, person, owner_key}, _from, state),
+  defp dispatch_call({:owner_list_agents, person, owner_key}, _from, state),
     do: {:reply, Engine.owner_list_agents(state.store.engine, person, owner_key), state}
 
-  def handle_call({:owner_send_line, person, key, revision, socket, line}, _from, state) do
+  defp dispatch_call({:owner_send_line, person, key, revision, socket, line}, _from, state) do
     result =
       case Engine.owner_revision(state.store.engine, person, key) do
         {:ok, ^revision} -> :ssl.send(socket, line)
@@ -1731,7 +1752,7 @@ defmodule AttentionServer.Relay do
     {:reply, result, state}
   end
 
-  def handle_call({:pending_enroll, certificate_der, label}, _from, state) do
+  defp dispatch_call({:pending_enroll, certificate_der, label}, _from, state) do
     now = System.system_time(:millisecond)
 
     case generate_pending(state.store.engine, certificate_der, label, now, 8) do
@@ -1760,14 +1781,14 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  def handle_call({:owner_browser_sign_in_create, person, owner}, _from, state) do
+  defp dispatch_call({:owner_browser_sign_in_create, person, owner}, _from, state) do
     case issue_browser_sign_in(state, state.store.engine, person, owner, owner) do
       {:ok, response, next} -> {:reply, {:ok, response}, next}
       {:error, reason} -> {:reply, {:error, reason}, state}
     end
   end
 
-  def handle_call({:hosted_account_create, account_ref}, _from, state) do
+  defp dispatch_call({:hosted_account_create, account_ref}, _from, state) do
     engine = state.store.engine
     test? = is_binary(state.hosted_test_account) and account_ref == state.hosted_test_account
     person = random_uuid_v4()
@@ -1793,7 +1814,7 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  def handle_call({:hosted_sign_in_create, person, label}, _from, state) do
+  defp dispatch_call({:hosted_sign_in_create, person, label}, _from, state) do
     engine = state.store.engine
 
     with {:ok, record} <- hosted_record(engine, person),
@@ -1810,7 +1831,7 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  def handle_call({:hosted_set_algorithm, person, algorithm}, _from, state) do
+  defp dispatch_call({:hosted_set_algorithm, person, algorithm}, _from, state) do
     case set_hosted_algorithm(state, person, algorithm) do
       {:ok, next} ->
         result = %{person_id: person, algorithm_id: algorithm}
@@ -1828,7 +1849,7 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  def handle_call({:hosted_test_reset, target_state}, _from, state) do
+  defp dispatch_call({:hosted_test_reset, target_state}, _from, state) do
     engine = state.store.engine
 
     with true <- target_state in @hosted_test_states || {:error, :unknown_state},
@@ -1863,7 +1884,7 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  def handle_call({:consume_browser_sign_in, token}, _from, state) do
+  defp dispatch_call({:consume_browser_sign_in, token}, _from, state) do
     with {:ok, hash} <- AttentionServer.BrowserSignIn.token_hash(token) do
       now = System.system_time(:millisecond)
       observed = AttentionServer.BrowserSignIn.observe_time(state.store.engine, hash, now)
@@ -1903,7 +1924,7 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  def handle_call({:owner_invite_create, person, owner}, _from, state) do
+  defp dispatch_call({:owner_invite_create, person, owner}, _from, state) do
     token = :crypto.strong_rand_bytes(32)
     hash = :crypto.hash(:sha256, token)
     now = System.system_time(:millisecond)
@@ -1935,10 +1956,10 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  def handle_call(:dashboard_origin, _from, state),
+  defp dispatch_call(:dashboard_origin, _from, state),
     do: {:reply, state.dashboard_origin, state}
 
-  def handle_call({:invitation_resolve, token}, _from, state) do
+  defp dispatch_call({:invitation_resolve, token}, _from, state) do
     with {:ok, hash} <- secret_hash(token) do
       now = System.system_time(:millisecond)
       engine = state.store.engine
@@ -1979,7 +2000,7 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  def handle_call({:owner_invite_create, person, owner, request_id}, _from, state) do
+  defp dispatch_call({:owner_invite_create, person, owner, request_id}, _from, state) do
     now = System.system_time(:millisecond)
 
     result =
@@ -2023,7 +2044,7 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  def handle_call({:invited_enroll, token, certificate, label, status_secret}, _from, state) do
+  defp dispatch_call({:invited_enroll, token, certificate, label, status_secret}, _from, state) do
     with {:ok, hash} <- secret_hash(token), {:ok, status_hash} <- secret_hash(status_secret) do
       now = System.system_time(:millisecond)
       observed = AttentionServer.GuidedJoin.observe_time(state.store.engine, hash, now)
@@ -2068,7 +2089,7 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  def handle_call({:pending_cancel, secret, code, key, deadline}, _from, state) do
+  defp dispatch_call({:pending_cancel, secret, code, key, deadline}, _from, state) do
     now = System.system_time(:millisecond)
 
     with {:ok, hash} <- secret_hash(secret),
@@ -2093,7 +2114,7 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  def handle_call({:removal_identity, key}, _from, state) do
+  defp dispatch_call({:removal_identity, key}, _from, state) do
     reply =
       case Map.get(state.store.engine.devices, key) do
         %{person: person} -> {:ok, person}
@@ -2103,7 +2124,7 @@ defmodule AttentionServer.Relay do
     {:reply, reply, state}
   end
 
-  def handle_call({:device_remove, key}, _from, state) do
+  defp dispatch_call({:device_remove, key}, _from, state) do
     case Engine.device_remove(state.store.engine, key) do
       {:ok, next, reply} ->
         next = revoke_origin_sessions(state, next, reply["person_id"], key)
@@ -2122,7 +2143,7 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  def handle_call({:owner_pending_decline, person, owner, code, key, deadline}, _from, state) do
+  defp dispatch_call({:owner_pending_decline, person, owner, code, key, deadline}, _from, state) do
     now = System.system_time(:millisecond)
 
     case fence_pending_time(state, {:code, code}, now) do
@@ -2147,7 +2168,7 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  def handle_call({:pending_status, secret_hex}, _from, state) when is_binary(secret_hex) do
+  defp dispatch_call({:pending_status, secret_hex}, _from, state) when is_binary(secret_hex) do
     with {:ok, secret} <- Base.decode16(secret_hex, case: :lower),
          true <- byte_size(secret) == 32 do
       hash = :crypto.hash(:sha256, secret)
@@ -2165,10 +2186,10 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  def handle_call({:pending_status, _}, _from, state),
+  defp dispatch_call({:pending_status, _}, _from, state),
     do: {:reply, {:error, :not_found}, state}
 
-  def handle_call({:pending_resume, secret_hex, cert_der}, _from, state) do
+  defp dispatch_call({:pending_resume, secret_hex, cert_der}, _from, state) do
     with {:ok, hash} <- secret_hash(secret_hex) do
       now_ms = System.system_time(:millisecond)
 
@@ -2197,7 +2218,7 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  def handle_call({:owner_pending_lookup, person, key, code}, _from, state) do
+  defp dispatch_call({:owner_pending_lookup, person, key, code}, _from, state) do
     now_ms = System.system_time(:millisecond)
 
     case fence_pending_time(state, {:code, code}, now_ms) do
@@ -2209,11 +2230,11 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  def handle_call(
-        {:owner_pending_approve, person, key, code, expected_key, expected_expires_at, senders},
-        _from,
-        state
-      ) do
+  defp dispatch_call(
+         {:owner_pending_approve, person, key, code, expected_key, expected_expires_at, senders},
+         _from,
+         state
+       ) do
     now_ms = System.system_time(:millisecond)
 
     case fence_pending_time(state, {:code, code}, now_ms) do
@@ -2247,7 +2268,7 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  def handle_call({:owner_revoke_device, person, owner_key, device_key}, _from, state) do
+  defp dispatch_call({:owner_revoke_device, person, owner_key, device_key}, _from, state) do
     case Engine.owner_revoke_device(state.store.engine, person, owner_key, device_key) do
       {:ok, next_engine} ->
         next_engine = revoke_origin_sessions(state, next_engine, person, device_key)
@@ -2269,7 +2290,7 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  def handle_call({:owner_grant_sender, person, key, device, pattern}, _from, state),
+  defp dispatch_call({:owner_grant_sender, person, key, device, pattern}, _from, state),
     do:
       setup(
         state,
@@ -2279,7 +2300,7 @@ defmodule AttentionServer.Relay do
         "owner_sender_grant"
       )
 
-  def handle_call({:owner_revoke_sender, person, key, device, pattern}, _from, state),
+  defp dispatch_call({:owner_revoke_sender, person, key, device, pattern}, _from, state),
     do:
       setup(
         state,
@@ -2289,29 +2310,29 @@ defmodule AttentionServer.Relay do
         "owner_sender_revoke"
       )
 
-  def handle_call(
-        {:owner_grant_enrollment_read, person, key, connector, grant_id, source, target},
-        _from,
-        state
-      ),
-      do:
-        setup(
-          state,
-          Engine.owner_grant_enrollment_read(
-            state.store.engine,
-            person,
-            key,
-            connector,
-            grant_id,
-            source,
-            target
-          ),
-          person,
-          key,
-          "owner_enrollment_read_grant"
-        )
+  defp dispatch_call(
+         {:owner_grant_enrollment_read, person, key, connector, grant_id, source, target},
+         _from,
+         state
+       ),
+       do:
+         setup(
+           state,
+           Engine.owner_grant_enrollment_read(
+             state.store.engine,
+             person,
+             key,
+             connector,
+             grant_id,
+             source,
+             target
+           ),
+           person,
+           key,
+           "owner_enrollment_read_grant"
+         )
 
-  def handle_call({:owner_revoke_enrollment_read, person, key, grant_id}, _from, state),
+  defp dispatch_call({:owner_revoke_enrollment_read, person, key, grant_id}, _from, state),
     do:
       setup(
         state,
@@ -2321,29 +2342,29 @@ defmodule AttentionServer.Relay do
         "owner_enrollment_read_revoke"
       )
 
-  def handle_call(
-        {:owner_grant_maintainer, person, key, grant_id, grantee, scopes},
-        _from,
-        state
-      ),
-      do:
-        setup(
-          state,
-          Engine.owner_grant_maintainer(
-            state.store.engine,
-            person,
-            key,
-            grant_id,
-            grantee,
-            scopes,
-            System.system_time(:millisecond)
-          ),
-          person,
-          key,
-          "owner_maintainer_grant"
-        )
+  defp dispatch_call(
+         {:owner_grant_maintainer, person, key, grant_id, grantee, scopes},
+         _from,
+         state
+       ),
+       do:
+         setup(
+           state,
+           Engine.owner_grant_maintainer(
+             state.store.engine,
+             person,
+             key,
+             grant_id,
+             grantee,
+             scopes,
+             System.system_time(:millisecond)
+           ),
+           person,
+           key,
+           "owner_maintainer_grant"
+         )
 
-  def handle_call({:owner_revoke_maintainer, person, key, grant_id}, _from, state),
+  defp dispatch_call({:owner_revoke_maintainer, person, key, grant_id}, _from, state),
     do:
       setup(
         state,
@@ -2359,7 +2380,7 @@ defmodule AttentionServer.Relay do
         "owner_maintainer_revoke"
       )
 
-  def handle_call({:operator_bootstrap, key}, _from, state) do
+  defp dispatch_call({:operator_bootstrap, key}, _from, state) do
     person = random_uuid_v4()
 
     case Engine.operator_bootstrap(state.store.engine, person, key) do
@@ -2378,7 +2399,7 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  def handle_call({:operator_recover, person, key}, _from, state),
+  defp dispatch_call({:operator_recover, person, key}, _from, state),
     do:
       setup(
         state,
@@ -2388,7 +2409,7 @@ defmodule AttentionServer.Relay do
         "owner_recovery"
       )
 
-  def handle_call({:setup_person, person}, _from, state),
+  defp dispatch_call({:setup_person, person}, _from, state),
     do:
       setup(
         state,
@@ -2398,7 +2419,7 @@ defmodule AttentionServer.Relay do
         "person_setup"
       )
 
-  def handle_call({:setup_device, person, key}, _from, state),
+  defp dispatch_call({:setup_device, person, key}, _from, state),
     do:
       setup(
         state,
@@ -2408,24 +2429,24 @@ defmodule AttentionServer.Relay do
         "device_setup"
       )
 
-  def handle_call(
-        {:setup_agent_fixture, person, id, key, senders},
-        _from,
-        %{agent_fixture_mode: true} = state
-      ),
-      do:
-        setup(
-          state,
-          Engine.setup_agent_fixture(state.store.engine, person, id, key, senders),
-          person,
-          "local_fixture",
-          "agent_fixture_setup"
-        )
+  defp dispatch_call(
+         {:setup_agent_fixture, person, id, key, senders},
+         _from,
+         %{agent_fixture_mode: true} = state
+       ),
+       do:
+         setup(
+           state,
+           Engine.setup_agent_fixture(state.store.engine, person, id, key, senders),
+           person,
+           "local_fixture",
+           "agent_fixture_setup"
+         )
 
-  def handle_call({:setup_agent_fixture, _, _, _, _}, _from, state),
+  defp dispatch_call({:setup_agent_fixture, _, _, _, _}, _from, state),
     do: {:reply, {:error, :not_supported}, state}
 
-  def handle_call({:revoke_agent_fixture, key}, _from, %{agent_fixture_mode: true} = state),
+  defp dispatch_call({:revoke_agent_fixture, key}, _from, %{agent_fixture_mode: true} = state),
     do:
       setup(
         state,
@@ -2435,10 +2456,14 @@ defmodule AttentionServer.Relay do
         "agent_fixture_revoke"
       )
 
-  def handle_call({:revoke_agent_fixture, _}, _from, state),
+  defp dispatch_call({:revoke_agent_fixture, _}, _from, state),
     do: {:reply, {:error, :not_supported}, state}
 
-  def handle_call({:fixture_agent_answer, key, frame}, _from, %{agent_fixture_mode: true} = state) do
+  defp dispatch_call(
+         {:fixture_agent_answer, key, frame},
+         _from,
+         %{agent_fixture_mode: true} = state
+       ) do
     case Engine.fixture_agent_answer(state.store.engine, key, frame) do
       {:ok, next_engine, fields} ->
         person = get_in(state.store.engine.agents, [key, :person])
@@ -2457,10 +2482,10 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  def handle_call({:fixture_agent_answer, _, _}, _from, state),
+  defp dispatch_call({:fixture_agent_answer, _, _}, _from, state),
     do: {:reply, {:error, :not_supported}, state}
 
-  def handle_call({:setup_sender, key, pattern}, _from, state) do
+  defp dispatch_call({:setup_sender, key, pattern}, _from, state) do
     person = person_of(state.store.engine, key)
 
     setup(
@@ -2472,11 +2497,11 @@ defmodule AttentionServer.Relay do
     )
   end
 
-  def handle_call(
-        {:grant_source_report, person, key, source, senders, delegation_ref},
-        _from,
-        %{source_fixture_mode: true} = state
-      ) do
+  defp dispatch_call(
+         {:grant_source_report, person, key, source, senders, delegation_ref},
+         _from,
+         %{source_fixture_mode: true} = state
+       ) do
     setup(
       state,
       Engine.grant_source_report(
@@ -2493,14 +2518,14 @@ defmodule AttentionServer.Relay do
     )
   end
 
-  def handle_call({:grant_source_report, _, _, _, _, _}, _from, state),
+  defp dispatch_call({:grant_source_report, _, _, _, _, _}, _from, state),
     do: {:reply, {:error, :not_supported}, state}
 
-  def handle_call(
-        {:revoke_source_report, person, key, source},
-        _from,
-        %{source_fixture_mode: true} = state
-      ) do
+  defp dispatch_call(
+         {:revoke_source_report, person, key, source},
+         _from,
+         %{source_fixture_mode: true} = state
+       ) do
     setup(
       state,
       Engine.revoke_source_report(state.store.engine, person, key, source),
@@ -2510,52 +2535,52 @@ defmodule AttentionServer.Relay do
     )
   end
 
-  def handle_call({:revoke_source_report, _, _, _}, _from, state),
+  defp dispatch_call({:revoke_source_report, _, _, _}, _from, state),
     do: {:reply, {:error, :not_supported}, state}
 
-  def handle_call(
-        {:grant_enrollment_read_fixture, person, connector, grant_id, source, target, issuer},
-        _from,
-        %{enrollment_fixture_mode: true} = state
-      ),
-      do:
-        setup(
-          state,
-          Engine.grant_enrollment_read(
-            state.store.engine,
-            person,
-            connector,
-            grant_id,
-            source,
-            target,
-            issuer
-          ),
-          person,
-          "local_owner_fixture",
-          "enrollment_read_grant"
-        )
+  defp dispatch_call(
+         {:grant_enrollment_read_fixture, person, connector, grant_id, source, target, issuer},
+         _from,
+         %{enrollment_fixture_mode: true} = state
+       ),
+       do:
+         setup(
+           state,
+           Engine.grant_enrollment_read(
+             state.store.engine,
+             person,
+             connector,
+             grant_id,
+             source,
+             target,
+             issuer
+           ),
+           person,
+           "local_owner_fixture",
+           "enrollment_read_grant"
+         )
 
-  def handle_call({:grant_enrollment_read_fixture, _, _, _, _, _, _}, _from, state),
+  defp dispatch_call({:grant_enrollment_read_fixture, _, _, _, _, _, _}, _from, state),
     do: {:reply, {:error, :not_supported}, state}
 
-  def handle_call(
-        {:revoke_enrollment_read_fixture, person, grant_id},
-        _from,
-        %{enrollment_fixture_mode: true} = state
-      ),
-      do:
-        setup(
-          state,
-          Engine.revoke_enrollment_read(state.store.engine, person, grant_id),
-          person,
-          "local_owner_fixture",
-          "enrollment_read_revoke"
-        )
+  defp dispatch_call(
+         {:revoke_enrollment_read_fixture, person, grant_id},
+         _from,
+         %{enrollment_fixture_mode: true} = state
+       ),
+       do:
+         setup(
+           state,
+           Engine.revoke_enrollment_read(state.store.engine, person, grant_id),
+           person,
+           "local_owner_fixture",
+           "enrollment_read_revoke"
+         )
 
-  def handle_call({:revoke_enrollment_read_fixture, _, _}, _from, state),
+  defp dispatch_call({:revoke_enrollment_read_fixture, _, _}, _from, state),
     do: {:reply, {:error, :not_supported}, state}
 
-  def handle_call({:revoke_device, key}, _from, state) do
+  defp dispatch_call({:revoke_device, key}, _from, state) do
     person = person_of(state.store.engine, key)
 
     case Engine.revoke_device(state.store.engine, key) do
@@ -2579,7 +2604,7 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  def handle_call({:register_tls_listener, listener}, _from, state) when is_pid(listener) do
+  defp dispatch_call({:register_tls_listener, listener}, _from, state) when is_pid(listener) do
     if Map.has_key?(state.tls_listeners, listener) do
       {:reply, {:error, :already_registered}, state}
     else
@@ -2588,11 +2613,11 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  def handle_call({:unregister_tls_listener, listener}, _from, state),
+  defp dispatch_call({:unregister_tls_listener, listener}, _from, state),
     do: {:reply, :ok, unregister_listener(state, listener)}
 
-  def handle_call({:register_origin_listener, listener, port}, _from, state)
-      when is_pid(listener) and is_integer(port) and port in 1..65_535 do
+  defp dispatch_call({:register_origin_listener, listener, port}, _from, state)
+       when is_pid(listener) and is_integer(port) and port in 1..65_535 do
     if state.origin_listener do
       {:reply, {:error, :already_registered}, state}
     else
@@ -2601,11 +2626,11 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  def handle_call({:unregister_origin_listener, listener}, _from, state) do
+  defp dispatch_call({:unregister_origin_listener, listener}, _from, state) do
     {:reply, :ok, unregister_origin_listener_state(state, listener)}
   end
 
-  def handle_call({:open_session, key, owner, socket, listener, transport}, _from, state) do
+  defp dispatch_call({:open_session, key, owner, socket, listener, transport}, _from, state) do
     admission =
       if is_nil(listener) or Map.has_key?(state.tls_listeners, listener),
         do: Engine.acknowledged_cursor(state.store.engine, key),
@@ -2646,7 +2671,7 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  def handle_call({:session_send, id, frames}, _from, state) do
+  defp dispatch_call({:session_send, id, frames}, _from, state) do
     with {:ok, %{socket: socket, key: key, transport: transport}} <- active_session(state, id),
          true <- not is_nil(socket) and is_list(frames),
          :ok <-
@@ -2662,10 +2687,10 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  def handle_call({:close_session, id}, _from, state),
+  defp dispatch_call({:close_session, id}, _from, state),
     do: {:reply, :ok, drop_session(state, id)}
 
-  def handle_call({:session_request_line, id, raw}, from, state) do
+  defp dispatch_call({:session_request_line, id, raw}, from, state) do
     with {:ok, session} <- active_session(state, id) do
       case JSON.decode_line(raw) do
         {:ok, %{"type" => "inbox_start"} = frame} when session.transport == :websocket ->
@@ -2684,7 +2709,7 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  def handle_call({:session_drain, id}, _from, state) do
+  defp dispatch_call({:session_drain, id}, _from, state) do
     with {:ok, session} <- active_session(state, id),
          true <- session.ready,
          {:ok, events, high} <- Engine.events(state.store.engine, session.key, session.stream_seq),
@@ -2734,7 +2759,11 @@ defmodule AttentionServer.Relay do
   end
 
   @impl true
-  def handle_info(:upload_sweep, state) do
+  def handle_info(message, state) do
+    with_persistence_reads(state, fn -> dispatch_info(message, state) end)
+  end
+
+  defp dispatch_info(:upload_sweep, state) do
     Process.send_after(self(), :upload_sweep, @upload_sweep_ms)
 
     case sweep_agent_uploads(state, System.system_time(:millisecond)) do
@@ -2747,14 +2776,14 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  def handle_info(:refresh_default_sweep_index, state) do
+  defp dispatch_info(:refresh_default_sweep_index, state) do
     {:noreply, reschedule_default_sweep(state, Engine.default_index(state.store.engine))}
   end
 
-  def handle_info(
-        {:bounce_due, generation},
-        %{bounce_deadline_generation: generation} = state
-      ) do
+  defp dispatch_info(
+         {:bounce_due, generation},
+         %{bounce_deadline_generation: generation} = state
+       ) do
     state = %{state | bounce_deadline_timer: nil}
     old_engine = state.store.engine
     now_ms = state.clock.()
@@ -2787,7 +2816,10 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  def handle_info({:default_sweep, generation}, %{default_timer_generation: generation} = state) do
+  defp dispatch_info(
+         {:default_sweep, generation},
+         %{default_timer_generation: generation} = state
+       ) do
     state = %{state | default_timer: nil}
     old_engine = state.store.engine
     now_ms = state.clock.()
@@ -2837,9 +2869,9 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  def handle_info({:default_sweep, _stale_generation}, state), do: {:noreply, state}
+  defp dispatch_info({:default_sweep, _stale_generation}, state), do: {:noreply, state}
 
-  def handle_info({:prioritization_due, person, generation}, state) do
+  defp dispatch_info({:prioritization_due, person, generation}, state) do
     case Map.get(state.priority_timers, person) do
       %{generation: ^generation} ->
         next = %{state | priority_timers: Map.delete(state.priority_timers, person)}
@@ -2855,7 +2887,7 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  def handle_info({:priority_retry, person, generation}, state) do
+  defp dispatch_info({:priority_retry, person, generation}, state) do
     case Map.get(state.priority_retry_timers, person) do
       %{generation: ^generation} ->
         state = %{state | priority_retry_timers: Map.delete(state.priority_retry_timers, person)}
@@ -2866,7 +2898,7 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  def handle_info({:priority_deadline, person, due}, state) do
+  defp dispatch_info({:priority_deadline, person, due}, state) do
     case Map.get(state.priority_deadline_timers, person) do
       %{due: ^due} ->
         state = %{
@@ -2881,7 +2913,7 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  def handle_info({:prioritization_result, person, sequence, generation, result}, state) do
+  defp dispatch_info({:prioritization_result, person, sequence, generation, result}, state) do
     case Map.get(state.priority_jobs, person) do
       %{sequence: ^sequence, generation: ^generation, monitor: monitor} = job ->
         Process.demonitor(monitor, [:flush])
@@ -2892,7 +2924,7 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  def handle_info({:DOWN, monitor, :process, listener, reason}, state) do
+  defp dispatch_info({:DOWN, monitor, :process, listener, reason}, state) do
     case Map.pop(state.inbox_build_monitors, monitor) do
       {nil, _monitors} ->
         priority_job =
@@ -2946,7 +2978,7 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  def handle_info({:inbox_snapshot_data, token, {:ok, counts}}, state) do
+  defp dispatch_info({:inbox_snapshot_data, token, {:ok, counts}}, state) do
     case inbox_build_by_token(state, token) do
       {build_key, %{pid: pid} = build} ->
         send(pid, {:inbox_snapshot_continue, token})
@@ -2958,7 +2990,7 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  def handle_info({:inbox_snapshot_data, token, {:error, reason}}, state) do
+  defp dispatch_info({:inbox_snapshot_data, token, {:error, reason}}, state) do
     case inbox_build_by_token(state, token) do
       {build_key, _build} ->
         {:noreply, fail_inbox_build(state, build_key, reason, true)}
@@ -2968,7 +3000,7 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  def handle_info({:inbox_snapshot_chunk, token, kind, offset, values}, state) do
+  defp dispatch_info({:inbox_snapshot_chunk, token, kind, offset, values}, state) do
     case inbox_build_by_token(state, token) do
       {build_key, %{pid: pid, snapshot: snapshot}} ->
         case Store.save_inbox_snapshot_chunk(state.store, snapshot, kind, offset, values) do
@@ -2986,7 +3018,7 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  def handle_info({:inbox_snapshot_done, token}, state) do
+  defp dispatch_info({:inbox_snapshot_done, token}, state) do
     case inbox_build_by_token(state, token) do
       {build_key, build} ->
         case Store.finish_inbox_snapshot(state.store, build.snapshot, build.counts) do
