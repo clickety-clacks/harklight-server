@@ -1,7 +1,14 @@
 defmodule AttentionServer.DashboardBrowserSessionTest do
   use ExUnit.Case, async: false
 
-  alias AttentionServer.{DashboardBrowserSession, DeviceIdentity, Relay, TLSFixtures}
+  alias AttentionServer.{
+    DashboardBrowserSession,
+    DashboardReadHTTP,
+    DeviceIdentity,
+    JSON,
+    Relay,
+    TLSFixtures
+  }
 
   setup do
     certs = TLSFixtures.create!()
@@ -143,6 +150,34 @@ defmodule AttentionServer.DashboardBrowserSessionTest do
 
     assert {:error, :invalid_session} =
              DashboardBrowserSession.resolve(c.browser, "hbs1_approved")
+  end
+
+  test "self-hosted profile returns an empty label for a signed-in principal without one", c do
+    assert {:ok, cookie, nil} = DashboardBrowserSession.redeem(c.browser, "hbs1_approved")
+    assert {:ok, principal} = DashboardBrowserSession.resolve(c.browser, cookie)
+    assert principal.person_id == c.person
+    refute Map.has_key?(principal, :display_name)
+
+    opts =
+      DashboardReadHTTP.init(
+        backend: {SignOutBackend, c.browser},
+        skill_path: __ENV__.file
+      )
+
+    response =
+      Plug.Test.conn(:get, "/api/profile")
+      |> Plug.Conn.put_req_header("cookie", "__Host-harklight=#{cookie}")
+      |> Map.put(:scheme, :https)
+      |> Map.put(:port, 443)
+      |> DashboardReadHTTP.call(opts)
+
+    assert response.status == 200
+
+    assert Plug.Conn.get_resp_header(response, "content-type") == [
+             "application/json; charset=utf-8"
+           ]
+
+    assert {:ok, %{"display_name" => ""}} = JSON.decode_line(response.resp_body <> "\n")
   end
 
   test "owner recovery fences an existing browser cookie", c do
