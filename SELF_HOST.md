@@ -326,7 +326,7 @@ it is registered to, regardless of sender. Sender filters select search results
 only; they do not limit access. Existing respond-grant values and response
 checks are unchanged. New registrations need no per-sender read grant for
 reads; answering still requires both a matching read grant and a matching
-respond grant. The v0.1.35, v0.1.36, v0.1.38, and planned v0.1.39 packages
+respond grant. The v0.1.35, v0.1.36, v0.1.38, and published v0.1.39 packages
 write FORMAT27 and
 cannot read FORMAT29; changing only the code or release link is not a safe
 downgrade. The
