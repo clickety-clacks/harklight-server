@@ -1919,7 +1919,7 @@ defmodule AttentionServer.PrioritizationTest do
     await_state(relay, &(not Map.has_key?(&1.priority_jobs, "person-a")))
   end
 
-  test "a mid-pass arrival reuses completed unaffected batches and logs both passes", %{
+  test "a mid-pass arrival cancels the old pass and ignores its stale result", %{
     dir: dir,
     path: path
   } do
@@ -1929,6 +1929,8 @@ defmodule AttentionServer.PrioritizationTest do
     {:ok, calls} = Agent.start_link(fn -> 0 end)
     on_exit(fn -> if Process.alive?(gate), do: Agent.stop(gate) end)
     on_exit(fn -> if Process.alive?(calls), do: Agent.stop(calls) end)
+
+    score_for = fn request -> {:ok, Map.new(request.candidates, &{&1, 0.3})} end
 
     evaluator = fn request ->
       Agent.update(calls, &(&1 + 1))
@@ -1940,7 +1942,7 @@ defmodule AttentionServer.PrioritizationTest do
         end
       end
 
-      {:ok, Map.new(request.candidates, &{&1, 0.3})}
+      score_for.(request)
     end
 
     relay = start_relay(path, priority_evaluator: evaluator)
@@ -1950,23 +1952,53 @@ defmodule AttentionServer.PrioritizationTest do
     for n <- 1..100, do: forward(relay, n, "seed-#{n}", nil, body)
     configure_jev_choice(relay)
 
+    seed_state = :sys.get_state(relay)
+
+    seed_result =
+      JevRanking.run(
+        Placement.items(seed_state.store.engine, "person-a"),
+        %{},
+        seed_state.store.engine.jev_endpoint,
+        seed_state.store.engine.jev_model,
+        System.system_time(:millisecond),
+        score_for
+      )
+
+    assert length(seed_result.cache.batches) > 1
+
+    partial_cache = %{
+      seed_result.cache
+      | batches:
+          List.update_at(seed_result.cache.batches, 0, &%{&1 | scores: nil, request: nil})
+    }
+
+    :sys.replace_state(relay, fn state ->
+      %{state | priority_caches: Map.put(state.priority_caches, "person-a", partial_cache)}
+    end)
+
+    calls_before_first = Agent.get(calls, & &1)
+
     logs =
       ExUnit.CaptureLog.capture_log(fn ->
         forward(relay, 101, "initial-trigger", nil, body)
-        engine = :sys.get_state(relay).store.engine
+        initial_state = :sys.get_state(relay)
+        engine = initial_state.store.engine
+        initial_cache = Map.get(initial_state.priority_caches, "person-a", %{})
 
-        expected_batches =
+        initial_result =
           JevRanking.run(
             Placement.items(engine, "person-a"),
-            %{},
+            initial_cache,
             engine.jev_endpoint,
             engine.jev_model,
             System.system_time(:millisecond),
-            fn request -> {:ok, Map.new(request.candidates, &{&1, 0.3})} end
+            score_for
           )
-          |> then(&length(&1.cache.batches))
 
-        assert expected_batches > 1
+        expected_batches = initial_result.sent
+
+        assert expected_batches > 0
+        assert expected_batches < length(initial_result.cache.batches)
 
         workers =
           for _ <- 1..expected_batches do
@@ -1974,27 +2006,86 @@ defmodule AttentionServer.PrioritizationTest do
             pid
           end
 
-        forward(relay, 102, "mid-pass", nil, body)
-        Agent.update(gate, fn _ -> false end)
-        Enum.each(workers, &send(&1, :release))
+        first_job = :sys.get_state(relay).priority_jobs["person-a"]
+        assert is_map(first_job)
+        assert Agent.get(calls, & &1) - calls_before_first == expected_batches
 
-        assert_receive {:provider_request, _next_pid, next_candidates}, 2_000
-        assert {"app:test", "mid-pass"} in next_candidates
+        calls_before_next = Agent.get(calls, & &1)
+        forward(relay, 102, "mid-pass", nil, body)
+
+        canceled_state =
+          await_state(relay, fn state ->
+            Map.get(state.priority_generations, "person-a", 0) > first_job.generation and
+              not Map.has_key?(state.priority_jobs, "person-a") and
+              Enum.all?(workers, &(not Process.alive?(&1)))
+          end)
+
+        canceled_engine = canceled_state.store.engine
+        canceled_cache = Map.get(canceled_state.priority_caches, "person-a", %{})
+
+        next_result =
+          JevRanking.run(
+            Placement.items(canceled_engine, "person-a"),
+            canceled_cache,
+            canceled_engine.jev_endpoint,
+            canceled_engine.jev_model,
+            System.system_time(:millisecond),
+            score_for
+          )
+
+        next_batches = next_result.sent
+        assert next_batches > 0
+        assert next_batches < length(next_result.cache.batches)
+
+        next_requests =
+          for _ <- 1..next_batches do
+            assert_receive {:provider_request, pid, candidates}, 2_000
+            {pid, candidates}
+          end
+
+        assert Enum.any?(next_requests, fn {_pid, candidates} ->
+                 {"app:test", "mid-pass"} in candidates
+               end)
+
+        next_job = :sys.get_state(relay).priority_jobs["person-a"]
+        assert next_job.sequence > first_job.sequence
+        assert next_job.generation > first_job.generation
+
+        before_stale_result = :sys.get_state(relay)
+        send(
+          relay,
+          {:prioritization_result, "person-a", first_job.sequence, first_job.generation,
+           initial_result}
+        )
+
+        # A synchronous request from this process is ordered after the injected
+        # stale result, so the following state read observes its handling.
+        assert {:ok, _events, _high_water} = Relay.events(relay, "device-a", 0)
+        after_stale_result = :sys.get_state(relay)
+
+        assert after_stale_result.priority_jobs["person-a"] == next_job
+        assert after_stale_result.priority_views == before_stale_result.priority_views
+        assert after_stale_result.priority_caches == before_stale_result.priority_caches
+
+        Agent.update(gate, fn _ -> false end)
+        Enum.each(next_requests, fn {pid, _candidates} -> send(pid, :release) end)
 
         await_state(relay, fn state ->
-          cache = state.priority_caches["person-a"]
+          current_cache = state.priority_caches["person-a"]
 
-          is_map(cache) and not Map.has_key?(state.priority_jobs, "person-a") and
-            Enum.any?(cache.batches, fn batch ->
-              {"app:test", "mid-pass"} in batch.members and is_map(batch.scores)
+          is_map(current_cache) and not Map.has_key?(state.priority_jobs, "person-a") and
+            Enum.any?(current_cache.batches, fn batch ->
+              {"app:test", "mid-pass"} in batch.members and
+                Map.get(batch.scores, {"app:test", "mid-pass"}) == 0.3
             end)
         end)
 
-        assert Agent.get(calls, & &1) == expected_batches + 1
+        assert Agent.get(calls, & &1) - calls_before_first == expected_batches + next_batches
+        assert Agent.get(calls, & &1) - calls_before_next == next_batches
         refute_receive {:provider_request, _pid, _candidates}, 0
       end)
 
-    assert length(Regex.scan(~r/event=harklight_priority_pass /, logs)) == 2
+    assert length(Regex.scan(~r/event=harklight_priority_pass /, logs)) == 1
     assert logs =~ "requests=1 finals=0"
   end
 
