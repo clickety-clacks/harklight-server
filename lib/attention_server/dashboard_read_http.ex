@@ -9,11 +9,11 @@ defmodule AttentionServer.DashboardReadHTTP do
   Options: `:expected_origin` fixes the origin that form posts, join checks and
   sign-in must come from (default: the request's own host and port, so a server
   behind a public front end names its public address here); `:hosted` selects
-  the hosted wording, which never tells a person to ask an owner;
+  the hosted wording, which never tells a person to ask an owner. Self-hosted
+  mode serves the pinned web client with its local sign-in help;
   `:hosted_addresses` (hosted only) names where a browser goes without a usable
   Server session (`:sign_in`), after Sign out (`:sign_out`, defaulting to
-  `:sign_in`) and for the Account link (`:account`). Self-hosted output is
-  unchanged by every default.
+  `:sign_in`) and for the Account link (`:account`).
   """
 
   @behaviour Plug
@@ -25,6 +25,15 @@ defmodule AttentionServer.DashboardReadHTTP do
   @cookie "__Host-harklight"
   @invite_cookie "__Host-harklight-invite"
   @invite_cookie_age 30 * 24 * 60 * 60
+  @dashboard_csp "default-src 'none'; script-src 'self'; connect-src 'self'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'"
+  @web_content_types %{
+    ".html" => "text/html",
+    ".js" => "text/javascript",
+    ".css" => "text/css",
+    ".woff2" => "font/woff2",
+    ".woff" => "font/woff",
+    ".map" => "application/json"
+  }
 
   @impl Plug
   def init(opts) do
@@ -47,6 +56,15 @@ defmodule AttentionServer.DashboardReadHTTP do
           hosted,
           do: hosted_testflight_url(Keyword.get(opts, :hosted_testflight_url)),
           else: nil
+        ),
+      web_static:
+        Plug.Static.init(
+          at: "/app",
+          from: {:attention_server, "priv/static/app"},
+          only: ~w(index.html assets),
+          content_types: web_asset_content_types(),
+          cache_control_for_vsn_requests: "no-store",
+          cache_control_for_etags: "no-store"
         ),
       skill_path_saas: skill_path_saas,
       skill_path_core:
@@ -98,10 +116,7 @@ defmodule AttentionServer.DashboardReadHTTP do
     conn =
       conn
       |> put_resp_header("cache-control", "no-store")
-      |> put_resp_header(
-        "content-security-policy",
-        "default-src 'none'; script-src 'self'; connect-src 'self'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'"
-      )
+      |> put_resp_header("content-security-policy", content_security_policy(conn, opts))
       |> put_resp_header("referrer-policy", "no-referrer")
       |> put_resp_header("x-content-type-options", "nosniff")
 
@@ -127,7 +142,7 @@ defmodule AttentionServer.DashboardReadHTTP do
       conn.method == "POST" and conn.request_path == "/join/resolve" ->
         resolve_join(conn, opts)
 
-      conn.method == "GET" and conn.request_path == "/browser/relay" and opts.hosted ->
+      conn.method == "GET" and conn.request_path == "/browser/relay" ->
         AttentionServer.DashboardBrowserHTTP.upgrade(conn, opts)
 
       conn.method == "GET" and conn.request_path == "/agent-skills/SKILL.md" ->
@@ -174,9 +189,12 @@ defmodule AttentionServer.DashboardReadHTTP do
       {:ok, %{"confirm" => "sign_out"}, conn} ->
         if session, do: backend_call(opts.backend, :end_session, session)
 
+        location =
+          if opts.hosted, do: opts.hosted_addresses.sign_out || "/devices", else: "/sign-in"
+
         conn
         |> delete_resp_cookie(@cookie, secure: true, http_only: true, same_site: "Lax", path: "/")
-        |> put_resp_header("location", opts.hosted_addresses.sign_out || "/devices")
+        |> put_resp_header("location", location)
         |> send_resp(303, "")
 
       {_, _, conn} ->
@@ -191,8 +209,11 @@ defmodule AttentionServer.DashboardReadHTTP do
        ),
        do: sign_out(conn, opts, nil)
 
+  defp no_session(%{method: "POST", request_path: "/sign-out"} = conn, opts),
+    do: sign_out(conn, opts, nil)
+
   # A hosted deployment sends a browser with no usable dashboard session to its
-  # sign-in page for other requests. Self-hosted keeps the plain refusal.
+  # sign-in page for other requests.
   defp no_session(conn, %{hosted: true, hosted_addresses: %{sign_in: url}}) when is_binary(url) do
     conn
     |> delete_resp_cookie(@cookie, secure: true, http_only: true, same_site: "Lax", path: "/")
@@ -200,7 +221,75 @@ defmodule AttentionServer.DashboardReadHTTP do
     |> send_resp(303, "")
   end
 
+  defp no_session(conn, %{hosted: false}) do
+    if self_hosted_page_request?(conn.request_path) do
+      conn
+      |> put_resp_content_type("text/html", "utf-8")
+      |> send_resp(401, self_hosted_sign_in_help_page())
+    else
+      send_resp(conn, 401, "Sign in to view your devices")
+    end
+  end
+
   defp no_session(conn, _opts), do: send_resp(conn, 401, "Sign in to view your devices")
+
+  defp self_hosted_page_request?(path) do
+    path in ["/devices", "/components", "/prioritization", "/inbox", "/settings"] or
+      String.starts_with?(path, "/app/")
+  end
+
+  defp self_hosted_sign_in_help_page do
+    ~s(<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Sign in · Harklight</title></head><body><main><h1>Sign in to Harklight</h1>#{self_hosted_sign_in_help_copy()}<p><a href="/sign-in">Open a sign-in link</a></p></main></body></html>)
+  end
+
+  defp self_hosted_sign_in_help_copy do
+    ~s(<p>To get a new one-use sign-in link, ask the server owner to run <code>bin/harklight owner browser-sign-in</code>.</p>)
+  end
+
+  defp content_security_policy(conn, %{hosted: false} = opts) do
+    if web_client_response?(conn.request_path) do
+      origin = expected_origin(conn, opts) |> URI.parse()
+
+      websocket_origin =
+        URI.to_string(%{
+          origin
+          | scheme: "wss",
+            userinfo: nil,
+            path: nil,
+            query: nil,
+            fragment: nil
+        })
+
+      "default-src 'none'; script-src 'self'; connect-src 'self' #{websocket_origin}; " <>
+        "style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' blob: data:; " <>
+        "base-uri 'none'; frame-ancestors 'none'"
+    else
+      @dashboard_csp
+    end
+  end
+
+  defp content_security_policy(_conn, _opts), do: @dashboard_csp
+
+  defp web_client_response?(path),
+    do: path in ["/inbox", "/settings"] or String.starts_with?(path, "/app/")
+
+  defp web_asset_content_types do
+    case :code.priv_dir(:attention_server) do
+      priv_dir when is_list(priv_dir) ->
+        priv_dir
+        |> List.to_string()
+        |> Path.join("static/app/**/*")
+        |> Path.wildcard()
+        |> Enum.filter(&File.regular?/1)
+        |> Map.new(fn path ->
+          {Path.basename(path),
+           Map.get(@web_content_types, Path.extname(path), MIME.from_path(path))}
+        end)
+
+      _ ->
+        %{}
+    end
+  end
 
   # Hosted-only page chrome: the Account link and the Sign out control.
   defp chrome(%{hosted: true, hosted_addresses: addresses} = opts),
@@ -215,7 +304,7 @@ defmodule AttentionServer.DashboardReadHTTP do
 
   defp route(
          %{method: "GET", request_path: "/api/profile"} = conn,
-         %{hosted: true},
+         _opts,
          %{display_name: display_name}
        )
        when is_binary(display_name) do
@@ -226,31 +315,70 @@ defmodule AttentionServer.DashboardReadHTTP do
 
   defp route(
          %{method: "GET", request_path: "/api/profile"} = conn,
-         %{hosted: true},
+         _opts,
          _principal
        ),
        do: send_resp(conn, 503, "Profile unavailable")
 
   defp route(
          %{method: "POST", request_path: "/browser/v1"} = conn,
-         %{hosted: true} = opts,
+         opts,
          _principal
        ),
        do: AttentionServer.DashboardBrowserHTTP.command(conn, opts)
 
   defp route(
          %{method: "POST", request_path: "/browser/v1/upload"} = conn,
-         %{hosted: true} = opts,
+         opts,
          _principal
        ),
        do: AttentionServer.DashboardBrowserHTTP.upload(conn, opts)
 
   defp route(
          %{method: "GET", path_info: ["browser", "v1", "files", upload_id]} = conn,
-         %{hosted: true} = opts,
+         opts,
          _principal
        ),
        do: AttentionServer.DashboardBrowserHTTP.fetch_file(conn, opts, upload_id)
+
+  defp route(
+         %{method: "GET", request_path: "/app/config.json"} = conn,
+         %{hosted: false},
+         _principal
+       ) do
+    config = %{
+      "accountUrl" => "",
+      "sessionEndedPath" => "/sign-in",
+      "flags" => %{"webClient" => true, "attachments" => true, "answerForms" => true}
+    }
+
+    conn
+    |> put_resp_content_type("application/json", "utf-8")
+    |> send_resp(200, JSON.encode!(config))
+  end
+
+  defp route(
+         %{method: "GET", request_path: path} = conn,
+         %{hosted: false} = opts,
+         _principal
+       )
+       when path in ["/inbox", "/settings"] do
+    serve_web_index(conn, opts)
+  end
+
+  defp route(
+         %{method: "GET", request_path: "/app/"} = conn,
+         %{hosted: false} = opts,
+         _principal
+       ),
+       do: serve_web_index(conn, opts)
+
+  defp route(
+         %{method: "GET", path_info: ["app" | _]} = conn,
+         %{hosted: false} = opts,
+         _principal
+       ),
+       do: serve_web_static(conn, opts)
 
   defp route(%{method: "GET", request_path: "/devices"} = conn, opts, principal) do
     case backend_call(opts.backend, :list_devices, principal) do
@@ -439,11 +567,11 @@ defmodule AttentionServer.DashboardReadHTTP do
     end
   end
 
-  # Hosted only: end this browser's dashboard session and send it to the hosted
-  # sign-out address. Self-hosted has no such route and falls through to 404.
+  # End this browser's dashboard session. Hosted mode completes its account
+  # sign-out through the configured address; self-hosted returns to local help.
   defp route(
          %{method: "POST", request_path: "/sign-out"} = conn,
-         %{hosted: true} = opts,
+         opts,
          _principal
        ) do
     sign_out(conn, opts, Map.get(conn.req_cookies, @cookie))
@@ -611,6 +739,19 @@ defmodule AttentionServer.DashboardReadHTTP do
   end
 
   defp route(conn, _opts, _principal), do: send_resp(conn, 404, "Not found")
+
+  defp serve_web_index(conn, opts) do
+    conn
+    |> Map.put(:path_info, ["app", "index.html"])
+    |> serve_web_static(opts)
+  end
+
+  defp serve_web_static(conn, opts) do
+    case Plug.Static.call(conn, opts.web_static) do
+      %{halted: true} = conn -> conn
+      conn -> send_resp(conn, 404, "Not found")
+    end
+  end
 
   defp manageable_focus_device(opts, principal, device_key) do
     if Regex.match?(~r/\A[0-9a-f]{64}\z/, device_key) do
@@ -967,8 +1108,10 @@ defmodule AttentionServer.DashboardReadHTTP do
           ""
       end
 
+    self_hosted_help = if opts.hosted, do: "", else: self_hosted_sign_in_help_copy()
+
     html =
-      ~s(<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Sign in · Harklight</title></head><body><main><h1>Sign in to Harklight</h1><p id="status">Checking your one-use link…</p>#{again}</main><script src="/sign-in.js" defer></script></body></html>)
+      ~s(<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Sign in · Harklight</title></head><body><main><h1>Sign in to Harklight</h1><p id="status">Checking your one-use link…</p>#{again}#{self_hosted_help}</main><script src="/sign-in.js" defer></script></body></html>)
 
     conn |> put_resp_content_type("text/html", "utf-8") |> send_resp(200, html)
   end
@@ -982,7 +1125,7 @@ defmodule AttentionServer.DashboardReadHTTP do
 
   defp sign_in_script(conn, _opts) do
     script =
-      ~S|const status=document.getElementById("status");const token=location.hash.slice(1);history.replaceState(null,"",location.pathname);if(!/^hbs1_[0-9a-f]{64}$/.test(token)){status.textContent="This sign-in link is invalid. Ask the owner for a new one."}else{fetch("/sign-in",{method:"POST",headers:{"content-type":"text/plain"},credentials:"same-origin",body:token}).then(r=>{if(r.status===204){location.replace("/devices")}else{status.textContent="This sign-in link is expired or already used. Ask the owner for a new one."}}).catch(()=>{status.textContent="The server could not be reached. Ask the owner for a new link if this one was used."})}|
+      ~S|const status=document.getElementById("status");const token=location.hash.slice(1);history.replaceState(null,"",location.pathname);if(!/^hbs1_[0-9a-f]{64}$/.test(token)){status.textContent="This sign-in link is invalid. Ask the owner for a new one."}else{fetch("/sign-in",{method:"POST",headers:{"content-type":"text/plain"},credentials:"same-origin",body:token}).then(r=>{if(r.status===204){location.replace("/inbox")}else{status.textContent="This sign-in link is expired or already used. Ask the owner for a new one."}}).catch(()=>{status.textContent="The server could not be reached. Ask the owner for a new link if this one was used."})}|
 
     conn |> put_resp_content_type("text/javascript", "utf-8") |> send_resp(200, script)
   end

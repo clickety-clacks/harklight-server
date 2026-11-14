@@ -469,7 +469,7 @@ defmodule AttentionServer.DashboardBrowserHTTP do
   defp status(_), do: 400
 
   defp session_redirect(conn, opts) do
-    location = opts.hosted_addresses.sign_in || "/sign-in"
+    location = if opts.hosted, do: opts.hosted_addresses.sign_in || "/sign-in", else: "/sign-in"
 
     conn
     |> delete_resp_cookie(@cookie,

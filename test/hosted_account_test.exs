@@ -1000,14 +1000,16 @@ defmodule AttentionServer.HostedAccountTest do
       refute page.resp_body =~ "Account</a>"
       assert page.resp_body =~ "Sign out"
 
-      # Self-hosted: no redirect, no sign-out route, no hosted chrome.
+      # Self-hosted: no hosted redirect or chrome, and sign-out returns to local help.
       assert ("/devices" |> secure_get() |> DashboardReadHTTP.call(plain)).status == 401
       own = "/devices" |> secure_get("plain-session") |> DashboardReadHTTP.call(plain)
       assert own.status == 200
       refute own.resp_body =~ "Sign out"
       refute own.resp_body =~ "Account</a>"
       refute own.resp_body =~ "/sign-out"
-      assert sign_out_post(plain, "https://www.example.com", "plain-session").status == 404
+      sign_out = sign_out_post(plain, "https://www.example.com", "plain-session")
+      assert sign_out.status == 303
+      assert Plug.Conn.get_resp_header(sign_out, "location") == ["/sign-in"]
 
       # Hosted addresses given to a self-hosted listener change nothing.
       ignored =
