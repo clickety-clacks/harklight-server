@@ -1061,7 +1061,10 @@ defmodule AttentionServer.AgentServiceTest do
     assert %{"items" => [%{"message" => %{"unknown" => %{"text" => "A only"}}}]} =
              agent_request(agent_endpoint, cert_a, private_a, %{"v" => 1, "type" => "search"})
 
-    assert %{"items" => [], "initial_high_water" => 0} =
+    assert %{
+             "items" => [%{"message" => %{"unknown" => %{"text" => "B only"}}}],
+             "initial_high_water" => 1
+           } =
              agent_request(agent_endpoint, cert_b, private_b, %{"v" => 1, "type" => "search"})
 
     assert %{"ok" => true} =
