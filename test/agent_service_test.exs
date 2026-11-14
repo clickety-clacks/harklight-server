@@ -115,7 +115,7 @@ defmodule AttentionServer.AgentServiceTest do
     assert notice_revision == after_answer["view_rev"]
   end
 
-  test "owner scopes exact content and response, cursor revision, tenant, and durable null winner",
+  test "authorized agents read every sender while responses remain scoped and cursors stay durable",
        context do
     %{certs: certs, relay: relay, owner: owner, agent: agent, path: path} = context
     {:ok, person} = Relay.operator_bootstrap(relay, TLSFixtures.certificate_der!(certs, "a1"))
@@ -171,18 +171,41 @@ defmodule AttentionServer.AgentServiceTest do
            } =
              owner_request(owner_endpoint, certs, "a1", person, %{"type" => "agent_list"})
 
-    assert {:ok, %{"items" => [], "next_cursor" => nil, "initial_high_water" => 0}} =
+    assert {:ok,
+            %{
+              "items" => [
+                %{"sender_id" => "app:sub/x", "message_id" => "three"},
+                %{"sender_id" => "app:private", "message_id" => "hidden"},
+                %{"sender_id" => "app:test", "message_id" => "one"}
+              ],
+              "next_cursor" => nil,
+              "initial_high_water" => 3
+            }} =
              HeadlessTLS.agent_request(agent_endpoint, cert, private, %{
                "v" => 1,
                "type" => "search"
              })
 
-    assert %{"error" => "not_found"} =
+    assert %{"item" => %{"message_id" => "one", "sender_id" => "app:test"}} =
              agent_request(agent_endpoint, cert, private, %{
                "v" => 1,
                "type" => "get",
                "sender_id" => "app:test",
                "message_id" => "one"
+             })
+
+    assert %{
+             "initial_high_water" => 3,
+             "items" => [
+               %{"sender_id" => "app:sub/x", "message_id" => "three"},
+               %{"sender_id" => "app:private", "message_id" => "hidden"},
+               %{"sender_id" => "app:test", "message_id" => "one"}
+             ],
+             "next_cursor" => nil
+           } =
+             agent_request(agent_endpoint, cert, private, %{
+               "v" => 1,
+               "type" => "search"
              })
 
     assert %{"ok" => true} =
@@ -222,23 +245,28 @@ defmodule AttentionServer.AgentServiceTest do
       })
 
     assert %{
-             "items" => [
-               %{
-                 "sender_id" => "app:test",
-                 "message" => %{"unknown" => %{"text" => "printer jam"}}
-               }
-             ],
-             "next_cursor" => nil
+             "items" => [%{"sender_id" => "app:private", "message_id" => "hidden"}],
+             "next_cursor" => next_cursor
            } = second
 
-    assert %{"items" => [%{"message_id" => "one"}]} =
+    third =
+      agent_request(agent_endpoint, cert, private, %{
+        "v" => 1,
+        "type" => "search",
+        "limit" => 1,
+        "cursor" => next_cursor
+      })
+
+    assert %{"items" => [%{"message_id" => "one"}], "next_cursor" => nil} = third
+
+    assert %{"items" => [%{"message_id" => "hidden"}, %{"message_id" => "one"}]} =
              agent_request(agent_endpoint, cert, private, %{
                "v" => 1,
                "type" => "search",
                "contains" => "printer jam"
              })
 
-    assert %{"error" => "not_found"} =
+    assert %{"item" => %{"message_id" => "hidden", "sender_id" => "app:private"}} =
              agent_request(agent_endpoint, cert, private, %{
                "v" => 1,
                "type" => "get",
@@ -246,7 +274,7 @@ defmodule AttentionServer.AgentServiceTest do
                "message_id" => "hidden"
              })
 
-    assert %{"error" => "not_found"} =
+    assert %{"items" => [%{"message_id" => "hidden", "sender_id" => "app:private"}]} =
              agent_request(agent_endpoint, cert, private, %{
                "v" => 1,
                "type" => "search",
@@ -300,7 +328,8 @@ defmodule AttentionServer.AgentServiceTest do
              )
 
     assert {:ok, staged_reply} = :ssl.recv(staged, 0, 3_000)
-    assert {:ok, %{"error" => "not_found"}} = JSON.decode_line(staged_reply)
+    assert {:ok, %{"item" => %{"message_id" => "three", "sender_id" => "app:sub/x"}}} =
+             JSON.decode_line(staged_reply)
     :ssl.close(staged)
 
     {:ok, owner_key} =
