@@ -36,7 +36,6 @@ defmodule AttentionServer.AgentAccess do
     with true <- Enum.sort(Map.keys(request)) == ~w(message_id sender_id type v),
          {:ok, agent} <- current_agent(engine, key),
          true <- Message.sender_id?(sender) and Message.nonempty?(id),
-         true <- allowed?(agent.read_grants, sender),
          record when not is_nil(record) <- Map.get(engine.messages, {agent.person, sender, id}) do
       observed = visible_high_water(engine, agent)
 
@@ -68,7 +67,6 @@ defmodule AttentionServer.AgentAccess do
         |> Enum.filter(fn {{person, sender, id}, record} ->
           person == agent.person and record.accepted_seq <= high and
             (is_nil(before) or record.accepted_seq < before) and
-            allowed?(agent.read_grants, sender) and
             (is_nil(filters["sender_id"]) or sender == filters["sender_id"]) and
             (is_nil(filters["message_id"]) or id == filters["message_id"]) and
             state_matches?(record, filters["state"]) and
@@ -119,8 +117,7 @@ defmodule AttentionServer.AgentAccess do
 
   defp current_agent(engine, key) do
     case Map.get(engine.agents, key) do
-      %{revoked: false, read_grants: grants} = agent when is_struct(grants, MapSet) ->
-        {:ok, agent}
+      %{revoked: false} = agent -> {:ok, agent}
 
       _ ->
         {:error, "forbidden"}
@@ -196,9 +193,9 @@ defmodule AttentionServer.AgentAccess do
 
   defp visible_high_water(engine, agent) do
     Enum.reduce(engine.events, 0, fn
-      {{person, seq}, %{key: {event_person, sender, _}}}, high
+      {{person, seq}, %{key: {event_person, _sender, _}}}, high
       when person == agent.person and event_person == person ->
-        if allowed?(agent.read_grants, sender), do: max(seq, high), else: high
+        max(seq, high)
 
       _, high ->
         high
