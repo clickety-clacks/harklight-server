@@ -155,10 +155,11 @@ origin endpoint or establish actual agent listening.
 
 `ATTENTION_SERVER_DEPLOYMENT_MODE` defaults to `self_hosted`.
 `ATTENTION_SERVER_UPLOAD_CAP_BYTES` defaults to `none` for self-hosting or may be
-a positive integer. `saas` requires a finite configured upload cap and refuses
-startup without it; the package elects no production SaaS cap. These settings
-and an origin endpoint change need deliberate configuration; installation leaves
-the protected environment unchanged.
+a positive integer. The cap is optional in `saas` mode too: without it, the
+server starts uncapped and logs one startup notice; with it, uploads over the
+configured value are refused individually. The package elects no production
+SaaS cap. These settings and an origin endpoint change need deliberate
+configuration; installation leaves the protected environment unchanged.
 
 ## Optional self-hosted device dashboard
 

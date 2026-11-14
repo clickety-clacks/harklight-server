@@ -947,8 +947,10 @@ defmodule AttentionServer.OriginHTTPS do
         {:error, :bad_frame}
 
       :nomatch ->
-        case :ssl.recv(socket, 0, @timeout) do
-          {:ok, chunk} when byte_size(buffer) + byte_size(chunk) <= @max_header + @max_body + 4 ->
+        # Read only the header here. Upload bodies can be larger than the JSON
+        # request tier and are streamed to disk after the header is parsed.
+        case :ssl.recv(socket, 1, @timeout) do
+          {:ok, chunk} ->
             read_header(socket, buffer <> chunk)
 
           {:error, reason} ->

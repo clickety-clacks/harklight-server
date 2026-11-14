@@ -310,13 +310,11 @@ defmodule AttentionServer.Server do
       not is_nil(hosted_port) or not is_nil(hosted_test_account) or
         Enum.any?(hosted_addresses, fn {_key, value} -> not is_nil(value) end)
 
-    finite_cap? = is_integer(upload_cap) and upload_cap > 0
+    if deployment_mode == :saas and upload_cap == :none do
+      Logger.notice("event=harklight_upload_cap_unconfigured feature=hosted_account")
+    end
 
     cond do
-      deployment_mode == :saas and not finite_cap? ->
-        optional_warning("hosted_account", "finite_upload_cap_required")
-        {nil, %{}, nil}
-
       deployment_mode == :invalid ->
         {nil, %{}, nil}
 

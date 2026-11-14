@@ -1,5 +1,6 @@
 defmodule AttentionServer.OptionalStartupTest do
   use ExUnit.Case, async: false
+  import ExUnit.CaptureLog
 
   alias AttentionServer.{Server, TLSFixtures}
 
@@ -11,7 +12,7 @@ defmodule AttentionServer.OptionalStartupTest do
     %{certs: certs}
   end
 
-  test "hosted routes stay off when SaaS has no finite upload cap", %{certs: certs} do
+  test "SaaS hosted routes run uncapped and emit one startup notice", %{certs: certs} do
     opts =
       server_opts(certs)
       |> Keyword.merge(
@@ -22,10 +23,15 @@ defmodule AttentionServer.OptionalStartupTest do
         hosted_account_url: "/account"
       )
 
-    server = start_server(opts)
+    log =
+      capture_log(fn ->
+        server = start_server(opts)
 
-    refute_child(server, :hosted_http)
-    assert_core_listeners(server)
+        assert_child(server, :hosted_http)
+        assert_core_listeners(server)
+      end)
+
+    assert length(String.split(log, "event=harklight_upload_cap_unconfigured")) == 2
   end
 
   test "an unreadable configured APNs key keeps retry ownership without stopping core listeners",
@@ -164,6 +170,12 @@ defmodule AttentionServer.OptionalStartupTest do
 
   defp refute_child(server, id) do
     refute Enum.any?(Supervisor.which_children(server), fn {child_id, pid, _, _} ->
+             child_id == id and is_pid(pid)
+           end)
+  end
+
+  defp assert_child(server, id) do
+    assert Enum.any?(Supervisor.which_children(server), fn {child_id, pid, _, _} ->
              child_id == id and is_pid(pid)
            end)
   end

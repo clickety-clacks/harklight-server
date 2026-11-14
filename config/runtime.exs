@@ -183,7 +183,7 @@ if System.get_env("ATTENTION_SERVER_ENABLE") == "1" do
 
   hosted_settings_available? =
     deployment_mode_valid? and deployment_mode == :saas and upload_cap_valid? and
-      is_integer(upload_cap) and upload_cap > 0 and hosted_port != {:error, :invalid}
+      hosted_port != {:error, :invalid}
 
   server_opts =
     if hosted_settings_requested? and not hosted_settings_available? do
@@ -193,7 +193,7 @@ if System.get_env("ATTENTION_SERVER_ENABLE") == "1" do
           deployment_mode != :saas -> "saas_mode_required"
           not upload_cap_valid? -> "invalid_upload_cap"
           hosted_port == {:error, :invalid} -> "invalid_listener_port"
-          true -> "finite_upload_cap_required"
+          true -> "invalid_hosted_settings"
         end
 
       optional_warning.("hosted_account", reason)

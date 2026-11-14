@@ -14,6 +14,7 @@ defmodule AttentionServer.OriginHTTPSTest do
   alias Exqlite.Sqlite3
 
   @handle "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+  @origin "https://app.example.test"
 
   setup_all do
     certs = TLSFixtures.create!()
@@ -394,7 +395,7 @@ defmodule AttentionServer.OriginHTTPSTest do
     :ok = Relay.close_session(c.relay, session)
   end
 
-  test "authenticated origin reports limits and an invalid SaaS cap only disables hosted routes",
+  test "authenticated origin reports limits and SaaS upload cap stays optional",
        c do
     assert {:ok, 200,
             %{
@@ -419,13 +420,93 @@ defmodule AttentionServer.OriginHTTPSTest do
       relay_name: :"saas_file_limit_#{System.unique_integer([:positive])}"
     ]
 
-    assert {:ok, {_, children}} = Server.init(Keyword.put(opts, :hosted_port, 0))
-    refute Enum.any?(children, fn child_spec -> child_spec.id == :hosted_http end)
+    hosted_opts =
+      Keyword.merge(opts,
+        hosted_port: 0,
+        public_base_url: @origin,
+        hosted_account_url: "/account"
+      )
+
+    assert {:ok, {_, children}} = Server.init(hosted_opts)
+    assert Enum.any?(children, fn child_spec -> child_spec.id == :hosted_http end)
 
     assert {:ok, {_flags, _children}} =
              Server.init(Keyword.merge(opts, deployment_mode: :self_hosted, upload_cap: 0))
 
-    {:ok, server} = Server.start_link(Keyword.put(opts, :upload_cap, 1_024))
+    uncapped_store_path =
+      Path.join(
+        System.tmp_dir!(),
+        "saas-file-limit-uncapped-#{System.unique_integer([:positive])}.sqlite3"
+      )
+
+    {:ok, uncapped_server} =
+      Server.start_link(
+        Keyword.merge(hosted_opts,
+          store_path: uncapped_store_path,
+          upload_cap: :none,
+          relay_name: :"saas_uncapped_#{System.unique_integer([:positive])}"
+        )
+      )
+
+    Process.unlink(uncapped_server)
+    on_exit(fn -> if Process.alive?(uncapped_server), do: Supervisor.stop(uncapped_server) end)
+
+    {:ok, person} =
+      Server.relay(uncapped_server)
+      |> Relay.operator_bootstrap(TLSFixtures.certificate_der!(c.certs, "a1"))
+
+    {:ok, _origin} =
+      Relay.setup_device_certificate(
+        Server.relay(uncapped_server),
+        person,
+        TLSFixtures.certificate_der!(c.certs, "a2")
+      )
+
+    uncapped_endpoint = %{c.endpoint | port: Server.origin_port(uncapped_server)}
+
+    assert {:ok, 200,
+            %{
+              "type" => "ok",
+              "inline_decoded_bytes_per_entry" => 262_144,
+              "upload_cap_bytes_per_file" => "none"
+            }} =
+             request(
+               %{c | endpoint: uncapped_endpoint},
+               "a2",
+               %{"v" => 1, "type" => "file_limits"}
+             )
+
+    large_bytes = :binary.copy(<<1>>, 2 * 1024 * 1024 + 1)
+
+    assert {:ok, 200, %{"upload_id" => _id, "duplicate" => false}} =
+             upload_request(
+               %{c | endpoint: uncapped_endpoint},
+               "a2",
+               %{
+                 op_id: op(699),
+                 sender_id: "app:test",
+                 message_id: "uncapped-large-upload",
+                 revision: 1,
+                 name: "large.bin"
+               },
+               large_bytes
+             )
+
+    capped_store_path =
+      Path.join(
+        System.tmp_dir!(),
+        "saas-capped-#{System.unique_integer([:positive])}.sqlite3"
+      )
+
+    {:ok, server} =
+      Server.start_link(
+        Keyword.merge(opts,
+          store_path: capped_store_path,
+          upload_cap: 1_024,
+          relay_name: :"saas_capped_#{System.unique_integer([:positive])}"
+        )
+      )
+
     Process.unlink(server)
     on_exit(fn -> if Process.alive?(server), do: Supervisor.stop(server) end)
 
