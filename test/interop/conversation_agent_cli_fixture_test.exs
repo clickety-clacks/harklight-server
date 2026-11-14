@@ -2063,81 +2063,6 @@ defmodule AttentionServer.ConversationAgentCLIFixtureTest do
     assert after_storage_refusal == []
   end
 
-  test "agent upload inactivity is per group and active groups are fenced" do
-    root =
-      Path.join(
-        System.tmp_dir!(),
-        "harklight-agent-cli-upload-groups-#{System.unique_integer([:positive])}"
-      )
-
-    fixture = start_file_fixture!(root, :none)
-    first_bytes = <<1, 3, 5, 7>>
-    first_op = op(904)
-
-    first =
-      upload_person_file!(fixture, first_op, "agent-request-a", "first.bin", first_bytes, "a2")
-
-    first_path = Path.join(fixture.store_path <> ".uploads", first["upload_id"])
-    first_activity = upload_activity!(fixture.store_path, first["upload_id"])
-
-    other_op = op(905)
-
-    other =
-      upload_person_file!(
-        fixture,
-        other_op,
-        "agent-request-b",
-        "other-group.bin",
-        <<2, 4, 6>>,
-        "a2"
-      )
-
-    other_path = Path.join(fixture.store_path <> ".uploads", other["upload_id"])
-
-    incomplete_attrs = %{
-      "op_id" => other_op,
-      "sender_id" => @sender_id,
-      "message_id" => "agent-request-b",
-      "revision" => 1,
-      "name" => "incomplete.bin"
-    }
-
-    assert {:ok, incomplete_lease} =
-             Relay.upload_begin(
-               fixture.relay,
-               fixture.origin,
-               incomplete_attrs,
-               byte_size(first_bytes)
-             )
-
-    active_activity = upload_activity!(fixture.store_path, other["upload_id"])
-
-    # A different active group must not extend the first group's retention.
-    # Use each group's persisted millisecond timestamp as its own clock base;
-    # wall-clock timestamps from separate operations need not be strictly ordered.
-    sweep_now = max(first_activity, active_activity) + 60 * 60_000
-    assert {:ok, 1} = Relay.sweep_uploads(fixture.relay, sweep_now)
-    refute File.exists?(first_path)
-    assert File.exists?(other_path)
-
-    # Ending an incomplete upload stores no ready file. The remaining upload
-    # expires at one hour from its group's latest persisted activity.
-    assert :ok = Relay.upload_end(fixture.relay, incomplete_lease)
-    assert {:ok, store} = Store.open(fixture.store_path)
-    assert Map.keys(store.engine.uploads) == [other["upload_id"]]
-    assert :ok = Store.close(store)
-
-    final_activity = upload_activity!(fixture.store_path, other["upload_id"])
-    assert {:ok, 0} = Relay.sweep_uploads(fixture.relay, final_activity + 60 * 60_000 - 1)
-    assert File.exists?(other_path)
-
-    assert {:ok, 1} = Relay.sweep_uploads(fixture.relay, final_activity + 60 * 60_000)
-    refute File.exists?(other_path)
-
-    assert {:error, :not_found} =
-             Relay.fetch_file(fixture.relay, fixture.origin, other["upload_id"])
-  end
-
   test "CLI verifies received upload bytes before transfer ACK and reports use separately" do
     root =
       Path.join(
@@ -3375,14 +3300,6 @@ defmodule AttentionServer.ConversationAgentCLIFixtureTest do
     after
       :ssl.close(socket)
     end
-  end
-
-  defp upload_activity!(store_path, upload_id) do
-    assert {:ok, store} = Store.open(store_path)
-    activity = store.engine.uploads[upload_id].last_activity_ms
-    assert is_integer(activity)
-    assert :ok = Store.close(store)
-    activity
   end
 
   defp upload_ref(upload, name, bytes) do

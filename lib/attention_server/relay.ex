@@ -11,8 +11,6 @@ defmodule AttentionServer.Relay do
 
   use GenServer
   require Logger
-  @agent_upload_idle_ms 60 * 60 * 1_000
-  @upload_sweep_ms 60_000
   @default_sweep_retry_ms 1_000
   @max_timer_delay_ms 4_294_967_295
   @prioritization_debounce_ms 250
@@ -185,8 +183,6 @@ defmodule AttentionServer.Relay do
 
   def discard_uploads(server, verified_device_key, attributes),
     do: GenServer.call(server, {:discard_uploads, verified_device_key, attributes})
-
-  def sweep_uploads(server, now_ms), do: GenServer.call(server, {:sweep_uploads, now_ms})
 
   def upload_file(server, verified_device_key, attributes, path, size, sha256, lease \\ nil),
     do:
@@ -699,8 +695,6 @@ defmodule AttentionServer.Relay do
       {:ok, store} ->
         case startup_cleanup(store) do
           {:ok, store} ->
-            Process.send_after(self(), :upload_sweep, @upload_sweep_ms)
-
             state = %{
               store: store,
               clock: Keyword.get(opts, :clock, fn -> System.system_time(:millisecond) end),
@@ -763,14 +757,7 @@ defmodule AttentionServer.Relay do
             state = reschedule_default_sweep(state, state.default_index)
             state = reschedule_bounce_sweep(state)
 
-            case sweep_agent_uploads(state, System.system_time(:millisecond)) do
-              {:ok, next, _count} ->
-                {:ok, next}
-
-              {:error, reason, next} ->
-                Diagnostics.failure(:upload_cleanup, :startup_cleanup, reason, :unavailable)
-                {:ok, next}
-            end
+            {:ok, state}
 
           error ->
             Store.close(store)
@@ -1482,14 +1469,6 @@ defmodule AttentionServer.Relay do
       do: Process.demonitor(active.monitor, [:flush])
 
     {:reply, :ok, %{state | active_uploads: Map.delete(state.active_uploads, lease)}}
-  end
-
-  def handle_call({:sweep_uploads, now_ms}, _from, state)
-      when is_integer(now_ms) and now_ms >= 0 do
-    case sweep_agent_uploads(state, now_ms) do
-      {:ok, next, count} -> {:reply, {:ok, count}, next}
-      {:error, reason, next} -> {:reply, {:error, reason}, next}
-    end
   end
 
   def handle_call({:upload_prepare, key, attrs, size, hash, lease}, _from, state),
@@ -2315,16 +2294,23 @@ defmodule AttentionServer.Relay do
       {:ok, next, reply} ->
         next = revoke_origin_sessions(state, next, reply["person_id"], key)
 
-        case commit(state.store, next, %{
-               person: reply["person_id"],
-               actor: key,
-               action: "device_self_remove"
-             }) do
-          {:ok, store} ->
-            next = %{state | store: store} |> remove_focus_device(key, reply["person_id"])
+        case commit_device_removal(
+               state,
+               next,
+               reply["person_id"],
+               key,
+               key,
+               "device_self_remove"
+             ) do
+          {:ok, next} ->
+            next = remove_focus_device(next, key, reply["person_id"])
             {:reply, {:ok, reply}, fence_sessions(next, key)}
 
-          _ ->
+          {:error, _, next, :committed} ->
+            next = remove_focus_device(next, key, reply["person_id"])
+            {:reply, {:error, :storage_unavailable}, fence_sessions(next, key)}
+
+          {:error, _, _, :not_committed} ->
             {:reply, {:error, :storage_unavailable}, state}
         end
 
@@ -2465,16 +2451,23 @@ defmodule AttentionServer.Relay do
       {:ok, next_engine} ->
         next_engine = revoke_origin_sessions(state, next_engine, person, device_key)
 
-        case commit(state.store, next_engine, %{
-               person: person,
-               actor: owner_key,
-               action: "owner_device_revoke"
-             }) do
-          {:ok, store} ->
-            next = %{state | store: store} |> remove_focus_device(device_key, person)
+        case commit_device_removal(
+               state,
+               next_engine,
+               person,
+               device_key,
+               owner_key,
+               "owner_device_revoke"
+             ) do
+          {:ok, next} ->
+            next = remove_focus_device(next, device_key, person)
             {:reply, :ok, fence_sessions(next, device_key)}
 
-          {:error, _, _} ->
+          {:error, _, next, :committed} ->
+            next = remove_focus_device(next, device_key, person)
+            {:reply, {:error, :storage_unavailable}, fence_sessions(next, device_key)}
+
+          {:error, _, _, :not_committed} ->
             {:reply, {:error, :storage_unavailable}, state}
         end
 
@@ -2778,16 +2771,23 @@ defmodule AttentionServer.Relay do
       {:ok, next_engine} ->
         next_engine = revoke_origin_sessions(state, next_engine, person, key)
 
-        case commit(state.store, next_engine, %{
-               person: person,
-               actor: "local_setup",
-               action: "device_revoke"
-             }) do
-          {:ok, store} ->
-            next = %{state | store: store} |> remove_focus_device(key, person)
+        case commit_device_removal(
+               state,
+               next_engine,
+               person,
+               key,
+               "local_setup",
+               "device_revoke"
+             ) do
+          {:ok, next} ->
+            next = remove_focus_device(next, key, person)
             {:reply, :ok, fence_sessions(next, key)}
 
-          {:error, _, _} ->
+          {:error, _, next, :committed} ->
+            next = remove_focus_device(next, key, person)
+            {:reply, {:error, :storage_unavailable}, fence_sessions(next, key)}
+
+          {:error, _, _, :not_committed} ->
             {:reply, {:error, :storage_unavailable}, state}
         end
 
@@ -3288,19 +3288,6 @@ defmodule AttentionServer.Relay do
   end
 
   @impl true
-  def handle_info(:upload_sweep, state) do
-    Process.send_after(self(), :upload_sweep, @upload_sweep_ms)
-
-    case sweep_agent_uploads(state, System.system_time(:millisecond)) do
-      {:ok, next, _count} ->
-        {:noreply, next}
-
-      {:error, reason, next} ->
-        Diagnostics.failure(:upload_cleanup, :periodic_cleanup, reason, :unavailable)
-        {:noreply, next}
-    end
-  end
-
   def handle_info(:refresh_default_sweep_index, state) do
     {:noreply, reschedule_default_sweep(state, Engine.default_index(state.store.engine))}
   end
@@ -3825,37 +3812,30 @@ defmodule AttentionServer.Relay do
   end
 
   defp begin_upload(state, person, key, attrs, _size, worker, browser_session_id) do
-    with {:ok, store} <-
-           touch_upload_group(
-             state.store,
-             state.upload_index,
-             upload_group(person, key, attrs)
-           ) do
-      lease = make_ref()
+    lease = make_ref()
 
-      uploader_kind =
-        Engine.upload_source(
-          state.store.engine,
-          person,
-          key,
-          attrs["sender_id"],
-          attrs["message_id"]
-        )
-        |> Atom.to_string()
+    uploader_kind =
+      Engine.upload_source(
+        state.store.engine,
+        person,
+        key,
+        attrs["sender_id"],
+        attrs["message_id"]
+      )
+      |> Atom.to_string()
 
-      monitor = Process.monitor(worker)
+    monitor = Process.monitor(worker)
 
-      active =
-        Map.put(state.active_uploads, lease, %{
-          group: upload_group(person, key, attrs),
-          uploader_kind: uploader_kind,
-          browser_session_id: browser_session_id,
-          canceled: false,
-          monitor: monitor
-        })
+    active =
+      Map.put(state.active_uploads, lease, %{
+        group: upload_group(person, key, attrs),
+        uploader_kind: uploader_kind,
+        browser_session_id: browser_session_id,
+        canceled: false,
+        monitor: monitor
+      })
 
-      {:ok, lease, %{state | store: store, active_uploads: active}}
-    end
+    {:ok, lease, %{state | active_uploads: active}}
   end
 
   defp upload_authorized_person(state, key, :device),
@@ -5976,6 +5956,49 @@ defmodule AttentionServer.Relay do
     end
   end
 
+  defp commit_device_removal(state, next_engine, person, key, actor, action) do
+    engine = state.store.engine
+    references = Map.get(state.upload_index.references_by_person, person, MapSet.new())
+
+    abandoned_ids =
+      for {id, %{person: ^person, uploader: ^key}} <- engine.uploads,
+          not MapSet.member?(references, id),
+          do: id
+
+    next_engine = %{next_engine | uploads: Map.drop(next_engine.uploads, abandoned_ids)}
+    audit = %{person: person, actor: actor, action: action}
+
+    case commit(state.store, next_engine, audit) do
+      {:ok, store} ->
+        removed = removed_upload_ids(engine, store.engine, abandoned_ids)
+        upload_index = remove_uploads_from_index(state.upload_index, engine, removed)
+
+        active_uploads =
+          Map.new(state.active_uploads, fn {lease, upload} ->
+            case upload.group do
+              {^person, ^key, _op_id, _sender, _message, _revision} ->
+                {lease, %{upload | canceled: true}}
+
+              _ ->
+                {lease, upload}
+            end
+          end)
+
+        next = %{state | store: store, upload_index: upload_index, active_uploads: active_uploads}
+
+        case Store.delete_uploads(store, removed, audit) do
+          {:ok, store} ->
+            {:ok, %{next | store: store}}
+
+          {:error, reason, store} ->
+            {:error, reason, %{next | store: store}, :committed}
+        end
+
+      {:error, reason, _store} ->
+        {:error, reason, state, :not_committed}
+    end
+  end
+
   defp revoke_origin_sessions(state, engine, person, origin) do
     engine.origin_sessions
     |> Enum.filter(fn {{session_person, session_origin, _handle}, _session} ->
@@ -7264,35 +7287,6 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  defp touch_upload_group(store, upload_index, group) do
-    engine = store.engine
-    now_ms = System.system_time(:millisecond)
-    ids = Map.get(upload_index.ids_by_group, group, MapSet.new())
-
-    uploads =
-      Enum.reduce(ids, engine.uploads, fn id, acc ->
-        case Map.get(acc, id) do
-          %{last_activity_ms: _} = upload
-          when is_map(upload) ->
-            if MapSet.member?(upload_index.unsubmitted_agent_upload_ids, id),
-              do: Map.put(acc, id, %{upload | last_activity_ms: now_ms}),
-              else: acc
-
-          _ ->
-            acc
-        end
-      end)
-
-    case commit(store, %{engine | uploads: uploads}, %{
-           person: elem(group, 0),
-           actor: elem(group, 1),
-           action: "upload_progress"
-         }) do
-      {:ok, updated} -> {:ok, updated}
-      {:error, reason, _} -> {:error, reason}
-    end
-  end
-
   defp agent_upload?(engine, upload) do
     case Map.get(upload, :uploader_kind) do
       "agent" ->
@@ -7309,58 +7303,6 @@ defmodule AttentionServer.Relay do
           upload.sender_id,
           upload.message_id
         ) == :agent
-    end
-  end
-
-  defp sweep_agent_uploads(state, now_ms) do
-    engine = state.store.engine
-
-    active_groups =
-      state.active_uploads
-      |> Map.values()
-      |> Enum.map(& &1.group)
-      |> MapSet.new()
-
-    groups =
-      Enum.reduce(state.upload_index.unsubmitted_agent_upload_ids, %{}, fn id, groups ->
-        case Map.get(engine.uploads, id) do
-          %{last_activity_ms: last_activity_ms} = upload ->
-            group = upload_group(upload)
-
-            Map.update(groups, group, {[id], last_activity_ms}, fn {ids, latest} ->
-              {[id | ids], max(latest, last_activity_ms)}
-            end)
-
-          _ ->
-            groups
-        end
-      end)
-
-    expired =
-      for {group, {ids, latest}} <- groups,
-          not MapSet.member?(active_groups, group),
-          now_ms - latest >= @agent_upload_idle_ms,
-          id <- ids,
-          do: id
-
-    if expired == [] do
-      {:ok, state, 0}
-    else
-      case Store.delete_uploads(state.store, expired, %{
-             person: "system",
-             actor: "system",
-             action: "upload_sweep"
-           }) do
-        {:ok, store} ->
-          removed = removed_upload_ids(engine, store.engine, expired)
-          index = remove_uploads_from_index(state.upload_index, engine, removed)
-          {:ok, %{state | store: store, upload_index: index}, length(expired)}
-
-        {:error, reason, store} ->
-          removed = removed_upload_ids(engine, store.engine, expired)
-          index = remove_uploads_from_index(state.upload_index, engine, removed)
-          {:error, reason, %{state | store: store, upload_index: index}}
-      end
     end
   end
 

@@ -760,7 +760,7 @@ defmodule AttentionServer.OriginHTTPSTest do
              request(restored, "a2", %{"v" => 1, "type" => "feed", "since" => 0})
   end
 
-  test "an unsubmitted agent upload expires after one idle hour and needs real re-upload", c do
+  test "an unattached upload survives reconnects and restart before it is referenced", c do
     bytes = <<0, 255, 42>>
     hash = Base.encode16(:crypto.hash(:sha256, bytes), case: :lower)
 
@@ -772,46 +772,65 @@ defmodule AttentionServer.OriginHTTPSTest do
       name: "a.bin"
     }
 
-    assert {:ok, 200, %{"upload_id" => old_id, "duplicate" => false}} =
+    assert {:ok, 200, %{"upload_id" => id, "duplicate" => false}} =
              upload_request(c, "a2", attrs, bytes)
 
-    old_path = Path.join(c.store_path <> ".uploads", old_id)
-    assert File.read!(old_path) == bytes
-    now = System.system_time(:millisecond)
+    path = Path.join(c.store_path <> ".uploads", id)
+    assert File.read!(path) == bytes
 
-    assert {:ok, 0} = Relay.sweep_uploads(c.relay, now + 59 * 60_000)
-    assert File.exists?(old_path)
-    Process.sleep(10)
+    # Each request opens and closes a fresh origin connection. Reconnects and
+    # an exact duplicate retry preserve the unattached upload.
+    for _ <- 1..3 do
+      assert {:ok, 200, %{"upload_id" => ^id, "duplicate" => true}} =
+               upload_request(c, "a2", attrs, bytes)
+    end
 
-    active_attrs = %{
-      "op_id" => attrs.op_id,
-      "sender_id" => attrs.sender_id,
-      "message_id" => attrs.message_id,
-      "revision" => attrs.revision,
-      "name" => "later.bin"
+    assert {:ok, stored} = Store.open(c.store_path)
+
+    old_uploads = Map.update!(stored.engine.uploads, id, &Map.put(&1, :last_activity_ms, 0))
+
+    assert {:ok, stored} =
+             Store.commit(stored, %{stored.engine | uploads: old_uploads}, %{
+               person: "test",
+               actor: "test",
+               action: "fixture_old_upload_activity"
+             })
+
+    assert :ok = Store.close(stored)
+
+    Supervisor.stop(c.server)
+
+    {:ok, restarted} =
+      Server.start_link(
+        store_path: c.store_path,
+        certfile: Path.join(c.certs, "server.pem"),
+        keyfile: Path.join(c.certs, "server.key"),
+        cacertfile: Path.join(c.certs, "ca.pem"),
+        origin_port: 0,
+        relay_name: :"upload_restart_#{System.unique_integer([:positive])}"
+      )
+
+    Process.unlink(restarted)
+    on_exit(fn -> if Process.alive?(restarted), do: Supervisor.stop(restarted) end)
+
+    restored = %{
+      c
+      | server: restarted,
+        relay: Server.relay(restarted),
+        endpoint: %{c.endpoint | port: Server.origin_port(restarted)}
     }
 
-    assert {:ok, lease} = Relay.upload_begin(c.relay, c.origin, active_attrs, byte_size(bytes))
-    assert {:ok, 0} = Relay.sweep_uploads(c.relay, now + 60 * 60_000 + 1)
-    assert File.exists?(old_path)
-    assert :ok = Relay.upload_end(c.relay, lease)
-    assert {:ok, observed} = Store.open(c.store_path)
-    activity = observed.engine.uploads[old_id].last_activity_ms
-    assert activity > now
-    assert :ok = Store.close(observed)
-    assert {:ok, 0} = Relay.sweep_uploads(c.relay, activity + 60 * 60_000 - 1)
-    assert {:ok, 1} = Relay.sweep_uploads(c.relay, activity + 60 * 60_000)
-    refute File.exists?(old_path)
+    assert File.read!(path) == bytes
 
-    old_ref = %{
+    upload_ref = %{
       "name" => "a.bin",
-      "upload_id" => old_id,
+      "upload_id" => id,
       "size" => byte_size(bytes),
       "sha256" => hash
     }
 
-    assert {:ok, 200, %{"type" => "error", "field" => "files"}} =
-             request(c, "a2", %{
+    assert {:ok, 200, %{"type" => "ok", "seq" => 1}} =
+             request(restored, "a2", %{
                "v" => 1,
                "type" => "send",
                "op_id" => attrs.op_id,
@@ -822,13 +841,114 @@ defmodule AttentionServer.OriginHTTPSTest do
                  "created_at" => 1,
                  "title" => "Needs the file"
                },
-               "files" => [old_ref]
+               "files" => [upload_ref]
              })
 
-    assert {:ok, 200, %{"upload_id" => new_id, "duplicate" => false}} =
+    assert {:ok, 200, ^bytes} = fetch_bytes(restored, "reader", id)
+  end
+
+  test "revoking the uploading device removes its unattached upload", c do
+    bytes = <<0, 255, 42>>
+
+    attrs = %{
+      op_id: op(729),
+      sender_id: "app:test",
+      message_id: "revoked-upload",
+      revision: 1,
+      name: "a.bin"
+    }
+
+    assert {:ok, 200, %{"upload_id" => id, "duplicate" => false}} =
              upload_request(c, "a2", attrs, bytes)
 
-    refute new_id == old_id
+    path = Path.join(c.store_path <> ".uploads", id)
+    assert File.read!(path) == bytes
+
+    assert :ok = Relay.revoke_device(c.relay, c.origin)
+
+    refute File.exists?(path)
+    assert {:ok, 404, %{"reason" => "not_found"}} = fetch_json(c, "reader", id)
+    assert {:ok, stored} = Store.open(c.store_path)
+    refute Map.has_key?(stored.engine.uploads, id)
+    assert :ok = Store.close(stored)
+  end
+
+  test "removing the uploading device removes its unattached upload", c do
+    bytes = <<0, 255, 43>>
+
+    attrs = %{
+      op_id: op(732),
+      sender_id: "app:test",
+      message_id: "removed-upload",
+      revision: 1,
+      name: "a.bin"
+    }
+
+    assert {:ok, 200, %{"upload_id" => id, "duplicate" => false}} =
+             upload_request(c, "a2", attrs, bytes)
+
+    path = Path.join(c.store_path <> ".uploads", id)
+    assert File.read!(path) == bytes
+
+    assert {:ok, %{"state" => "removed"}} = Relay.device_remove(c.relay, c.origin)
+
+    refute File.exists?(path)
+    assert {:ok, 404, %{"reason" => "not_found"}} = fetch_json(c, "reader", id)
+    assert {:ok, stored} = Store.open(c.store_path)
+    refute Map.has_key?(stored.engine.uploads, id)
+    assert :ok = Store.close(stored)
+  end
+
+  test "revoking a device fences an active upload and leaves no attachment", c do
+    bytes = <<0, 255, 42>>
+    hash = Base.encode16(:crypto.hash(:sha256, bytes), case: :lower)
+
+    attrs = %{
+      "op_id" => op(730),
+      "sender_id" => "app:test",
+      "message_id" => "active-revoked-upload",
+      "revision" => 1,
+      "name" => "a.bin"
+    }
+
+    assert {:ok, lease} = Relay.upload_begin(c.relay, c.origin, attrs, byte_size(bytes))
+    assert :ok = Relay.revoke_device(c.relay, c.origin)
+
+    source_path = Path.join(Path.dirname(c.store_path), "active-upload.bin")
+    File.write!(source_path, bytes)
+
+    assert {:error, reason} =
+             Relay.upload_file(
+               c.relay,
+               c.origin,
+               attrs,
+               source_path,
+               byte_size(bytes),
+               hash,
+               lease
+             )
+
+    assert reason in [:upload_discarded, :forbidden]
+    assert :ok = Relay.upload_end(c.relay, lease)
+    assert {:ok, stored} = Store.open(c.store_path)
+    assert map_size(stored.engine.uploads) == 0
+    assert :ok = Store.close(stored)
+  end
+
+  test "revoking the uploader preserves an upload already attached to a message", c do
+    bytes = <<0, 255, 42>>
+    hash = Base.encode16(:crypto.hash(:sha256, bytes), case: :lower)
+
+    attrs = %{
+      op_id: op(731),
+      sender_id: "app:test",
+      message_id: "referenced-upload",
+      revision: 1,
+      name: "a.bin"
+    }
+
+    assert {:ok, 200, %{"upload_id" => id, "duplicate" => false}} =
+             upload_request(c, "a2", attrs, bytes)
 
     assert {:ok, 200, %{"type" => "ok", "seq" => 1}} =
              request(c, "a2", %{
@@ -840,13 +960,23 @@ defmodule AttentionServer.OriginHTTPSTest do
                  "sender_id" => attrs.sender_id,
                  "message_id" => attrs.message_id,
                  "created_at" => 1,
-                 "title" => "Needs the file"
+                 "title" => "Attached file"
                },
-               "files" => [%{old_ref | "upload_id" => new_id}]
+               "files" => [
+                 %{
+                   "name" => attrs.name,
+                   "upload_id" => id,
+                   "size" => byte_size(bytes),
+                   "sha256" => hash
+                 }
+               ]
              })
 
-    assert {:ok, 0} = Relay.sweep_uploads(c.relay, now + 2 * 60 * 60_000)
-    assert File.read!(Path.join(c.store_path <> ".uploads", new_id)) == bytes
+    assert :ok = Relay.revoke_device(c.relay, c.origin)
+
+    path = Path.join(c.store_path <> ".uploads", id)
+    assert File.read!(path) == bytes
+    assert {:ok, 200, ^bytes} = fetch_bytes(c, "reader", id)
   end
 
   test "a client upload before its first message waits for explicit navigation cleanup", c do
@@ -868,9 +998,6 @@ defmodule AttentionServer.OriginHTTPSTest do
     path = Path.join(c.store_path <> ".uploads", id)
     assert File.read!(path) == bytes
 
-    assert {:ok, 0} =
-             Relay.sweep_uploads(c.relay, System.system_time(:millisecond) + 2 * 60 * 60_000)
-
     assert File.exists?(path)
 
     assert {:ok, 200, %{"type" => "ok", "state" => "discarded", "discarded" => 1}} =
@@ -883,64 +1010,6 @@ defmodule AttentionServer.OriginHTTPSTest do
                "revision" => attrs.revision
              })
 
-    refute File.exists?(path)
-  end
-
-  test "upgrade preserves a legacy unsubmitted upload before its new idle deadline", c do
-    attrs = %{
-      op_id: op(723),
-      sender_id: "app:test",
-      message_id: "legacy-upload",
-      revision: 1,
-      name: "old.bin"
-    }
-
-    bytes = <<1, 2, 3>>
-    assert {:ok, 200, %{"upload_id" => id}} = upload_request(c, "a2", attrs, bytes)
-    path = Path.join(c.store_path <> ".uploads", id)
-    Supervisor.stop(c.server)
-
-    assert {:ok, before} = Store.open(c.store_path)
-    prior_version = before.version
-
-    legacy_uploads =
-      Map.new(before.engine.uploads, fn {key, upload} ->
-        {key, Map.delete(upload, :last_activity_ms)}
-      end)
-
-    legacy = %{before.engine | uploads: legacy_uploads}
-    assert :ok = Store.close(before)
-
-    payload = :erlang.term_to_binary({:attention_relay_state, 20, legacy}, [{:compressed, 6}])
-    assert {:ok, db} = Sqlite3.open(c.store_path)
-    assert {:ok, stmt} = Sqlite3.prepare(db, "UPDATE relay_state SET payload = ?, checksum = ?")
-    assert :ok = Sqlite3.bind(stmt, [{:blob, payload}, {:blob, :crypto.hash(:sha256, payload)}])
-    assert :done = Sqlite3.step(db, stmt)
-    assert :ok = Sqlite3.release(db, stmt)
-    assert :ok = Sqlite3.close(db)
-
-    {:ok, restarted} =
-      Server.start_link(
-        store_path: c.store_path,
-        certfile: Path.join(c.certs, "server.pem"),
-        keyfile: Path.join(c.certs, "server.key"),
-        cacertfile: Path.join(c.certs, "ca.pem"),
-        origin_port: 0,
-        relay_name: :"upload_upgrade_#{System.unique_integer([:positive])}"
-      )
-
-    Process.unlink(restarted)
-    on_exit(fn -> if Process.alive?(restarted), do: Supervisor.stop(restarted) end)
-
-    assert File.read!(path) == bytes
-    assert {:ok, migrated} = Store.open(c.store_path)
-    assert migrated.version == prior_version + 1
-    migrated_at = migrated.engine.uploads[id].last_activity_ms
-    assert is_integer(migrated_at)
-    assert :ok = Store.close(migrated)
-    assert {:ok, 0} = Relay.sweep_uploads(Server.relay(restarted), migrated_at + 60 * 60_000 - 1)
-    assert File.read!(path) == bytes
-    assert {:ok, 1} = Relay.sweep_uploads(Server.relay(restarted), migrated_at + 60 * 60_000)
     refute File.exists?(path)
   end
 
@@ -981,10 +1050,6 @@ defmodule AttentionServer.OriginHTTPSTest do
 
     other_path = Path.join(c.store_path <> ".uploads", other_id)
     assert File.exists?(other_path)
-
-    # The agent's inactivity sweep does not stand in for a person's navigation.
-    assert {:ok, 0} =
-             Relay.sweep_uploads(c.relay, System.system_time(:millisecond) + 2 * 60 * 60_000)
 
     assert File.exists?(old_path)
 
