@@ -99,27 +99,22 @@ defmodule AttentionServer.APNS do
   def send(%{profiles: profiles} = config, claim, cached_tokens) do
     now_ms = System.system_time(:millisecond)
 
-    if claim.deadline_at <= now_ms do
-      Diagnostics.failure(:apns_dispatch, :push_request, :expired, :closed, claim.claim_id)
-      {outcome("expired", nil, nil, nil, 0, nil), cached_tokens}
-    else
-      profile_id = Map.get(claim, :profile_id)
+    profile_id = Map.get(claim, :profile_id)
 
-      case Map.fetch(profiles, profile_id) do
-        {:ok, profile_config} ->
-          send_with_profile(config, profile_config, profile_id, claim, cached_tokens, now_ms)
+    case Map.fetch(profiles, profile_id) do
+      {:ok, profile_config} ->
+        send_with_profile(config, profile_config, profile_id, claim, cached_tokens, now_ms)
 
-        :error ->
-          Diagnostics.failure(
-            :apns_dispatch,
-            :configuration,
-            :invalid_configuration,
-            :unavailable,
-            claim.claim_id
-          )
+      :error ->
+        Diagnostics.failure(
+          :apns_dispatch,
+          :configuration,
+          :invalid_configuration,
+          :unavailable,
+          claim.claim_id
+        )
 
-          {outcome("blocked_configuration", nil, nil, nil, 0, nil), cached_tokens}
-      end
+        {outcome("blocked_configuration", nil, nil, nil, 0, nil), cached_tokens}
     end
   rescue
     error ->
@@ -261,8 +256,7 @@ defmodule AttentionServer.APNS do
       {"apns-push-type", push_type},
       {"apns-priority", priority},
       {"apns-collapse-id", collapse_id},
-      {"apns-id", request_id},
-      {"apns-expiration", Integer.to_string(div(claim.deadline_at, 1_000))}
+      {"apns-id", request_id}
     ]
 
     with {:ok, conn} <-
@@ -789,7 +783,7 @@ defmodule AttentionServer.APNS do
          end) do
       value when is_binary(value) ->
         case Integer.parse(value) do
-          {seconds, ""} when seconds >= 0 and seconds <= 86_400 -> seconds * 1_000
+          {seconds, ""} when seconds >= 0 -> seconds * 1_000
           _ -> 0
         end
 

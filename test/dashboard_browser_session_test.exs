@@ -11,7 +11,6 @@ defmodule AttentionServer.DashboardBrowserSessionTest do
     {:ok, person} = Relay.operator_bootstrap(relay, owner_cert)
     {:ok, key} = DeviceIdentity.from_certificate(owner_cert)
     {:ok, revision} = Relay.owner_revision(relay, person, key)
-    {:ok, clock} = Agent.start_link(fn -> 1_000 end)
     {:ok, one_use} = Agent.start_link(fn -> MapSet.new(["hbs1_approved"]) end)
 
     consume = fn token ->
@@ -29,8 +28,7 @@ defmodule AttentionServer.DashboardBrowserSessionTest do
     {:ok, browser} =
       DashboardBrowserSession.start_link(
         relay: relay,
-        consume: consume,
-        now: fn -> Agent.get(clock, & &1) end
+        consume: consume
       )
 
     on_exit(fn -> File.rm_rf!(certs) end)
@@ -39,7 +37,6 @@ defmodule AttentionServer.DashboardBrowserSessionTest do
       relay: relay,
       browser: browser,
       certs: certs,
-      clock: clock,
       person: person,
       key: key,
       replacement: replacement
@@ -51,13 +48,16 @@ defmodule AttentionServer.DashboardBrowserSessionTest do
     def end_session(browser, cookie), do: DashboardBrowserSession.end_session(browser, cookie)
   end
 
-  for state <- [:valid, :missing, :expired] do
+  for state <- [:valid, :missing, :revoked] do
     @tag sign_out_state: state
     test "hosted sign-out with #{state} cookie checks the form and completes logout",
          c do
-      assert {:ok, cookie, deadline} = DashboardBrowserSession.redeem(c.browser, "hbs1_approved")
+      assert {:ok, cookie, nil} = DashboardBrowserSession.redeem(c.browser, "hbs1_approved")
       state = c.sign_out_state
-      if state == :expired, do: Agent.update(c.clock, fn _ -> deadline end)
+
+      if state == :revoked,
+        do: assert(:ok = Relay.operator_recover(c.relay, c.person, c.replacement))
+
       supplied_cookie = if state == :missing, do: nil, else: cookie
       origin = "https://account.example.test"
 
@@ -144,15 +144,17 @@ defmodule AttentionServer.DashboardBrowserSessionTest do
     assert {:error, :invalid_session} = DashboardBrowserSession.resolve(c.browser, cookie)
   end
 
-  test "expired cookie stays expired after clock rollback", c do
-    assert {:ok, cookie, deadline} = DashboardBrowserSession.redeem(c.browser, "hbs1_approved")
-    Agent.update(c.clock, fn _ -> deadline end)
+  test "owner recovery removes the old session when its authority changes", c do
+    assert {:ok, cookie, nil} = DashboardBrowserSession.redeem(c.browser, "hbs1_approved")
+    assert {:ok, _} = DashboardBrowserSession.resolve(c.browser, cookie)
+    assert map_size(:sys.get_state(c.browser).sessions) == 1
+
+    assert :ok = Relay.operator_recover(c.relay, c.person, c.replacement)
     assert {:error, :invalid_session} = DashboardBrowserSession.resolve(c.browser, cookie)
-    Agent.update(c.clock, fn _ -> 1_000 end)
-    assert {:error, :invalid_session} = DashboardBrowserSession.resolve(c.browser, cookie)
+    assert map_size(:sys.get_state(c.browser).sessions) == 0
   end
 
-  test "recovered owner's stale cookie cannot exhaust another person's session capacity", c do
+  test "stale owner session is removed without limiting another person's session", c do
     other_cert = TLSFixtures.certificate_der!(c.certs, "b1")
     {:ok, other_person} = Relay.operator_bootstrap(c.relay, other_cert)
     {:ok, other_key} = DeviceIdentity.from_certificate(other_cert)

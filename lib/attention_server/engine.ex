@@ -27,9 +27,8 @@ defmodule AttentionServer.Engine do
 
   @terminal_states ~w(answered cleared expired superseded)
   @pending_types ~w(resync ack push_register push_remove push_status)
-  @push_hint_lifetime_ms 3_600_000
-  @push_window_ms 300_000
   @push_claim_timeout_ms 30_000
+  @push_window_ms 300_000
   @maintainer_scopes MapSet.new(~w(devices senders view_items configure))
 
   defstruct relay_instance_id: nil,
@@ -101,19 +100,6 @@ defmodule AttentionServer.Engine do
     bindings =
       Map.new(engine.push_bindings, fn {key, binding} ->
         cond do
-          binding.active and (binding.pending_high > 0 or binding.pending_conversation_high > 0) and
-            is_integer(binding.deadline_at) and
-              binding.deadline_at <= now_ms ->
-            {key,
-             clear_push_claim(%{
-               binding
-               | state: "expired",
-                 pending_high: 0,
-                 pending_conversation_high: 0,
-                 deadline_at: nil,
-                 next_at: nil
-             })}
-
           binding.state == "sending" and is_integer(binding.claim_at) and
               binding.claim_at + @push_claim_timeout_ms <= now_ms ->
             {key, clear_push_claim(%{binding | state: "waiting_retry", next_at: now_ms})}
@@ -181,7 +167,6 @@ defmodule AttentionServer.Engine do
             ),
           presentation: presentation,
           badge: inbox_badge(next, person),
-          deadline_at: binding.deadline_at,
           registered_at: binding.registered_at,
           claim_id: claim_id
         }
@@ -341,7 +326,9 @@ defmodule AttentionServer.Engine do
           accepted_high: 0,
           pending_conversation_high: pending_conversation_high,
           accepted_conversation_high: conversation_high,
-          deadline_at: if(pending?, do: now_ms + @push_hint_lifetime_ms, else: nil),
+          # The current store validator requires an integer while work is pending.
+          # Keep the event timestamp in this legacy field; it is no longer a deadline.
+          deadline_at: if(pending?, do: now_ms, else: nil),
           next_at: if(pending?, do: open_window_at || now_ms + @push_window_ms, else: nil),
           attempt_count: 0,
           last_attempt_at: last_attempt_at,
@@ -451,7 +438,6 @@ defmodule AttentionServer.Engine do
 
             status = put_status_time(status, "last_attempt_at", binding.last_attempt_at)
             status = put_status_time(status, "next_attempt_at", binding.next_at)
-            status = put_status_time(status, "deadline_at", binding.deadline_at)
 
             status =
               if binding.last_outcome,
@@ -620,51 +606,13 @@ defmodule AttentionServer.Engine do
   end
 
   defp retry_push(binding, now_ms, retry_after_ms) do
-    cond do
-      not is_integer(binding.deadline_at) or binding.deadline_at <= now_ms ->
-        clear_push_claim(%{
-          binding
-          | state: "expired",
-            pending_high: 0,
-            pending_conversation_high: 0,
-            deadline_at: nil,
-            next_at: nil
-        })
-
-      true ->
-        backoff = min(1_200_000, 1_000 * trunc(:math.pow(2, min(binding.attempt_count - 1, 10))))
-
-        next_at = now_ms + max(0, retry_after_ms) + backoff
-
-        if next_at >= binding.deadline_at do
-          clear_push_claim(%{
-            binding
-            | state: "expired",
-              pending_high: 0,
-              pending_conversation_high: 0,
-              deadline_at: nil,
-              next_at: nil
-          })
-        else
-          clear_push_claim(%{binding | state: "waiting_retry", next_at: next_at})
-        end
-    end
+    backoff = min(1_200_000, 1_000 * trunc(:math.pow(2, min(binding.attempt_count - 1, 10))))
+    next_at = now_ms + max(0, retry_after_ms) + backoff
+    clear_push_claim(%{binding | state: "waiting_retry", next_at: next_at})
   end
 
-  defp blocked_push(binding, now_ms) do
-    if not is_integer(binding.deadline_at) or binding.deadline_at <= now_ms do
-      clear_push_claim(%{
-        binding
-        | state: "expired",
-          pending_high: 0,
-          pending_conversation_high: 0,
-          deadline_at: nil,
-          next_at: nil
-      })
-    else
-      clear_push_claim(%{binding | state: "blocked_configuration", next_at: nil})
-    end
-  end
+  defp blocked_push(binding, _now_ms),
+    do: clear_push_claim(%{binding | state: "blocked_configuration", next_at: nil})
 
   defp maybe_put(map, _key, nil), do: map
   defp maybe_put(map, key, value), do: Map.put(map, key, value)
@@ -918,7 +866,15 @@ defmodule AttentionServer.Engine do
              engine
              | owners:
                  Map.put(engine.owners, person, %{owner | key: new_key, revision: revision + 1}),
-               retired_owner_keys: MapSet.put(engine.retired_owner_keys, old_key)
+               retired_owner_keys: MapSet.put(engine.retired_owner_keys, old_key),
+               browser_sign_ins:
+                 Map.reject(engine.browser_sign_ins, fn {_, sign_in} ->
+                   Map.get(sign_in, :person) == person
+                 end),
+               join_invitations:
+                 Map.reject(engine.join_invitations, fn {_, invitation} ->
+                   Map.get(invitation, :person) == person
+                 end)
            }}
         else
           {:error, :key_in_use}
@@ -1194,7 +1150,6 @@ defmodule AttentionServer.Engine do
     end
   end
 
-  @pending_limit 1_024
   @pending_lifetime_ms 24 * 60 * 60 * 1_000
   @status_lifetime_ms 24 * 60 * 60 * 1_000
 
@@ -1228,10 +1183,6 @@ defmodule AttentionServer.Engine do
           item.key == key and item.state == :pending
         end) ->
           {:error, :key_pending}
-
-        map_size(compacted.pending_enrollments) + map_size(compacted.pending_history) >=
-            @pending_limit ->
-          {:error, :capacity}
 
         Map.has_key?(compacted.pending_enrollments, code) or
           Map.has_key?(compacted.pending_history, code) or
@@ -2424,8 +2375,7 @@ defmodule AttentionServer.Engine do
         "rows" => rows,
         "seq" => current_high,
         "conversation_seq" => Map.get(engine.conversation_highs, person, 0),
-        "unresolved_count" =>
-          Map.get(engine.route_b_index.unresolved_count_by_person, person, 0)
+        "unresolved_count" => Map.get(engine.route_b_index.unresolved_count_by_person, person, 0)
       }
 
       reply =
@@ -5973,18 +5923,16 @@ defmodule AttentionServer.Engine do
         {{^person, _device} = key, %{active: true} = binding} ->
           if high > Map.get(engine.cursors, key, 0) do
             fresh =
-              (binding.pending_high == 0 and binding.pending_conversation_high == 0) or
-                not is_integer(binding.deadline_at) or binding.deadline_at <= now_ms
+              binding.pending_high == 0 and binding.pending_conversation_high == 0
 
-            # The first unsent request opens a window; a request arriving while
-            # the previous batch is still being sent opens the next one.
+            # Preserve the established five-minute notification pacing. A new
+            # high during an in-flight push opens the next window.
             opens_window? =
               fresh or
                 (binding.state == "sending" and high > binding.pending_high and
                    is_nil(binding.next_at))
 
-            deadline_at =
-              if opens_window?, do: now_ms + @push_hint_lifetime_ms, else: binding.deadline_at
+            deadline_at = if opens_window?, do: now_ms, else: binding.deadline_at
 
             next_at = if opens_window?, do: now_ms + @push_window_ms, else: binding.next_at
 
@@ -6033,16 +5981,14 @@ defmodule AttentionServer.Engine do
                (MapSet.member?(engine.conversation_opened, key) and
                   high > Map.get(engine.conversation_cursors, key, 0)) do
             fresh =
-              (binding.pending_high == 0 and binding.pending_conversation_high == 0) or
-                not is_integer(binding.deadline_at) or binding.deadline_at <= now_ms
+              binding.pending_high == 0 and binding.pending_conversation_high == 0
 
             opens_window? =
               fresh or
                 (binding.state == "sending" and high > binding.pending_conversation_high and
                    is_nil(binding.next_at))
 
-            deadline_at =
-              if opens_window?, do: now_ms + @push_hint_lifetime_ms, else: binding.deadline_at
+            deadline_at = if opens_window?, do: now_ms, else: binding.deadline_at
 
             next_at = if opens_window?, do: now_ms + @push_window_ms, else: binding.next_at
 
@@ -6434,7 +6380,12 @@ defmodule AttentionServer.Engine do
     summary = Map.get(engine.route_b_index.conversation_summary_by_item, key, %{})
     delivery = Map.get(engine.events, {person, record.accepted_seq}, %{})
     availability_event = Map.get(summary, :availability)
-    availability = if availability_event, do: availability_event.payload, else: Map.get(delivery, :payload, %{})
+
+    availability =
+      if availability_event,
+        do: availability_event.payload,
+        else: Map.get(delivery, :payload, %{})
+
     files = Map.get(record, :files_by_revision, %{}) |> Map.get(record.revision, [])
 
     row = %{
@@ -6458,7 +6409,10 @@ defmodule AttentionServer.Engine do
         |> Map.put("session_handle", record.session_handle)
         |> Map.put(
           "availability",
-          Map.take(availability, ~w(availability last_detached_at listening_support unsupported_reason))
+          Map.take(
+            availability,
+            ~w(availability last_detached_at listening_support unsupported_reason)
+          )
         )
       else
         row

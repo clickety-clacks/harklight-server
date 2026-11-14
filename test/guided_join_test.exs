@@ -52,6 +52,7 @@ defmodule AttentionServer.GuidedJoinTest do
     assert engine.sender_grants == %{}
     assert {:error, :refused} = redeem(c, engine, %{c.config | "server_name" => "other.test"}, 1)
     {:ok, recovered} = Engine.operator_recover(engine, @person, c.device_key)
+    assert recovered.join_invitations == %{}
     assert {:error, :refused} = redeem(c, recovered, c.config, 1)
     assert {:error, :expired} = redeem(c, engine, c.config, 1_800_000)
     observed = GuidedJoin.observe_time(engine, c.token_hash, 1_800_000)
@@ -115,6 +116,66 @@ defmodule AttentionServer.GuidedJoinTest do
     assert reply["expires_at"] == 88_140_000
     assert {:ok, ^pending, ^reply} = redeem(c, pending, c.config, 1_800_001)
     assert {:error, :expired} = redeem(c, pending, c.config, 88_140_000)
+  end
+
+  test "unused invitations expire by their own deadline and are not capped by count", c do
+    invite = %{
+      person: @person,
+      owner_key: c.owner_key,
+      owner_revision: 1,
+      configuration: c.config,
+      expires_at: 1_800_000,
+      retain_until: 1_800_000,
+      code: nil,
+      key: nil,
+      secret_hash: nil,
+      request_id: nil
+    }
+
+    invitations =
+      Map.new(1..1_024, fn index ->
+        {:crypto.hash(:sha256, "invite-#{index}"), invite}
+      end)
+
+    full = %{c.engine | join_invitations: invitations}
+    assert GuidedJoin.valid_state?(full)
+
+    overflow_hash = :crypto.hash(:sha256, "invite-1025")
+
+    assert {:ok, over_limit, _} =
+             GuidedJoin.create(full, @person, c.owner_key, overflow_hash, c.config, 1)
+
+    assert map_size(over_limit.join_invitations) == 1_025
+    assert GuidedJoin.valid_state?(over_limit)
+
+    after_expiry_hash = :crypto.hash(:sha256, "invite-after-expiry")
+
+    assert {:ok, compacted, _} =
+             GuidedJoin.create(
+               over_limit,
+               @person,
+               c.owner_key,
+               after_expiry_hash,
+               c.config,
+               1_800_001
+             )
+
+    assert map_size(compacted.join_invitations) == 1
+    assert Map.has_key?(compacted.join_invitations, after_expiry_hash)
+  end
+
+  test "owner recovery removes invitations superseded with the old owner", c do
+    {:ok, engine, _person_invite} = create(c)
+    other_hash = :crypto.hash(:sha256, "other-person-invite")
+
+    {:ok, with_other, _} =
+      GuidedJoin.create(engine, @other, c.other_key, other_hash, c.config, 1)
+
+    {:ok, recovered} = Engine.operator_recover(with_other, @person, c.device_key)
+
+    assert map_size(recovered.join_invitations) == 1
+    assert recovered.join_invitations[other_hash].person == @other
+    assert Enum.all?(recovered.join_invitations, fn {_, item} -> item.person != @person end)
   end
 
   test "approval requires current intended owner, exact key/deadline and empty sender grants",
@@ -451,7 +512,7 @@ defmodule AttentionServer.GuidedJoinTest do
     Store.close(reloaded)
   end
 
-  test "a full retained-request set still renews the existing joined attempt and permits owner decline",
+  test "a full retained-request set renews the existing joined attempt and admits another request",
        c do
     {:ok, engine, _} = create(c)
     {:ok, pending, reply} = redeem(c, engine, c.config, 1)
@@ -466,7 +527,7 @@ defmodule AttentionServer.GuidedJoinTest do
            key: c.other_key,
            secret_hash: :crypto.hash(:sha256, <<index::32>>),
            expires_at: reply["expires_at"] + 1,
-           status_expires_at: reply["expires_at"] + 86_400_001
+           status_expires_at: reply["expires_at"] + 86_400_000
          }}
       end)
 
@@ -484,7 +545,7 @@ defmodule AttentionServer.GuidedJoinTest do
 
     assert map_size(renewed.pending_enrollments) + map_size(renewed.pending_history) == 1_024
 
-    assert {:error, :capacity} =
+    assert {:ok, over_limit} =
              Engine.pending_enroll(
                renewed,
                TLSFixtures.certificate_der!(c.certs, "unknown"),
@@ -493,6 +554,9 @@ defmodule AttentionServer.GuidedJoinTest do
                :crypto.hash(:sha256, "new request"),
                reply["expires_at"] + 1
              )
+
+    assert map_size(over_limit.pending_enrollments) + map_size(over_limit.pending_history) ==
+             1_025
 
     assert {:ok, declined} =
              Engine.pending_decline(

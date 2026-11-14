@@ -6,8 +6,19 @@ defmodule AttentionServer.APNSPushTest.Provider do
   def call(conn, {test_pid, response_agent}) do
     {:ok, body, conn} = Plug.Conn.read_body(conn)
     send(test_pid, {:apns_request, conn.method, conn.request_path, conn.req_headers, body})
-    {status, response_body} = Agent.get(response_agent, & &1)
-    Plug.Conn.send_resp(conn, status, response_body)
+
+    case Agent.get(response_agent, & &1) do
+      {status, response_body} ->
+        Plug.Conn.send_resp(conn, status, response_body)
+
+      {status, response_headers, response_body} ->
+        conn =
+          Enum.reduce(response_headers, conn, fn {name, value}, conn ->
+            Plug.Conn.put_resp_header(conn, name, value)
+          end)
+
+        Plug.Conn.send_resp(conn, status, response_body)
+    end
   end
 end
 
@@ -163,7 +174,6 @@ defmodule AttentionServer.APNSPushTest do
       claim_id: claim_id,
       profile_id: @provider_profile,
       address: @device_token,
-      deadline_at: now + 60_000,
       registered_at: now,
       presentation: :alert
     }
@@ -184,6 +194,52 @@ defmodule AttentionServer.APNSPushTest do
     assert log =~ "operation_id=#{claim_id}"
     refute log =~ @device_token
     refute log =~ "AuthKey_TESTKEYID1"
+  end
+
+  test "APNs honors a Retry-After value beyond one day", ctx do
+    Agent.update(ctx.provider_response, fn _ ->
+      {503, [{"retry-after", "86401"}], ""}
+    end)
+
+    claim = %{
+      claim_id: op(97),
+      profile_id: @provider_profile,
+      address: @device_token,
+      registered_at: System.system_time(:millisecond),
+      presentation: :background
+    }
+
+    {outcome, _cached_token} = APNS.send(APNS.prepare!(apns_options(ctx)), claim, nil)
+
+    assert outcome.state == "retry"
+    assert outcome.retry_after_ms == 86_401_000
+  end
+
+  test "APNs Unregistered 410 invalidates the registered endpoint", ctx do
+    registered_at = System.system_time(:millisecond)
+
+    Agent.update(ctx.provider_response, fn _ ->
+      {410,
+       JSON.encode!(%{
+         "reason" => "Unregistered",
+         "timestamp" => registered_at
+       })}
+    end)
+
+    claim = %{
+      claim_id: op(98),
+      profile_id: @provider_profile,
+      address: @device_token,
+      registered_at: registered_at,
+      presentation: :background
+    }
+
+    {outcome, _token_cache} = APNS.send(APNS.prepare!(apns_options(ctx)), claim, nil)
+
+    assert outcome.state == "endpoint_invalid"
+    assert outcome.http_status == 410
+    assert outcome.reason == "Unregistered"
+    assert outcome.invalidated_at_ms == registered_at
   end
 
   test "a configured dispatcher recovers after its initial start fails with backoff", ctx do
@@ -318,6 +374,24 @@ defmodule AttentionServer.APNSPushTest do
     assert {"apns-collapse-id", "attention-sync"} in headers
     assert {:ok, payload} = JSON.decode_line(body <> "\n")
     assert payload["attention"]["locator"] == ordinary.locator
+  end
+
+  test "APNs requests leave expiration to provider policy when a push has no deadline", ctx do
+    now = System.system_time(:millisecond)
+
+    claim = %{
+      claim_id: op(91),
+      profile_id: @provider_profile,
+      address: @device_token,
+      registered_at: now,
+      presentation: :alert
+    }
+
+    {outcome, _cached_token} = APNS.send(APNS.prepare!(apns_options(ctx)), claim, nil)
+
+    assert outcome.state == "provider_accepted"
+    assert_receive {:apns_request, "POST", _path, headers, _body}, 12_000
+    refute Enum.any?(headers, fn {name, _value} -> String.downcase(name) == "apns-expiration" end)
   end
 
   test "a chat locator that cannot fit or fails identity validation is never sent without its target",
@@ -1105,7 +1179,7 @@ defmodule AttentionServer.APNSPushTest do
     assert %{"type" => "ok", "revision" => 1} = register_push(app_socket, 21, 1)
     accept_test_delivery(relay, sender_key, sender_socket, 40, "reason-redaction")
     assert %{"type" => "delivery", "seq" => 1} = reply(app_socket)
-    send_push_after_window(ctx, relay)
+    send_queued_push(ctx, relay)
 
     assert_receive {:apns_request, "POST", _path, _headers, _body}, 12_000
     assert_push_state(app_socket, "blocked_configuration")
@@ -1289,7 +1363,7 @@ defmodule AttentionServer.APNSPushTest do
     assert %{"type" => "ok", "revision" => 1} = register_push(app_socket, 31, 1)
     accept_test_delivery(relay, sender_key, sender_socket, 40, "bad-device-token")
     assert %{"type" => "delivery", "seq" => 1} = reply(app_socket)
-    send_push_after_window(ctx, relay)
+    send_queued_push(ctx, relay)
 
     assert_receive {:apns_request, "POST", _path, _headers, _body}, 12_000
     assert_push_state(app_socket, "endpoint_invalid")
@@ -1560,9 +1634,8 @@ defmodule AttentionServer.APNSPushTest do
     reply(socket)
   end
 
-  # Drives one push by hand at the end of the batching window, the way the
-  # dispatcher would, without waiting five minutes of wall-clock time.
-  defp send_push_after_window(ctx, relay) do
+  # Drives one already-eligible push the way the dispatcher would.
+  defp send_queued_push(ctx, relay) do
     send_at = System.system_time(:millisecond) + 300_001
     assert {:ok, claim} = Relay.claim_push(relay, send_at)
     {outcome, _token} = APNS.send(APNS.prepare!(apns_options(ctx)), claim, nil)
@@ -1610,7 +1683,7 @@ defmodule AttentionServer.APNSPushTest do
 
   # Rewrites the persisted engine as a format-16 payload (no accepted_high) and
   # moves the binding's send time into the past, as if the server had been down
-  # for longer than the batching window.
+  # until the queued push was eligible.
   defp seed_legacy_push_format16_past_window(path) do
     assert {:ok, db} = Sqlite3.open(path)
     assert {:ok, select} = Sqlite3.prepare(db, "SELECT payload FROM relay_state WHERE id = 1")

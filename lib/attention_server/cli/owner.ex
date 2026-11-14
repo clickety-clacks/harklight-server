@@ -97,9 +97,13 @@ defmodule AttentionServer.CLI.Owner do
                   {:ok, %{"invitation" => invitation}} ->
                     :ok = IO.binwrite(io, AttentionServer.JSON.encode!(invitation) <> "\n")
 
-                    AttentionServer.CLI.shell().info(
-                      "Invitation saved to #{path}; expires #{invitation["expires_at"]}"
-                    )
+                    expiry =
+                      case invitation["expires_at"] do
+                        nil -> "no expiry"
+                        deadline -> "expires #{deadline}"
+                      end
+
+                    AttentionServer.CLI.shell().info("Invitation saved to #{path}; #{expiry}")
 
                   _ ->
                     AttentionServer.CLI.error!("invitation request failed")

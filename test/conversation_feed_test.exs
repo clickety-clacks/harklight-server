@@ -557,7 +557,7 @@ defmodule AttentionServer.ConversationFeedTest do
                }
              })
 
-    # Both devices open a window on the new request; each gets the alert,
+    # Both devices become eligible on the new request; each gets the alert,
     # including the one whose silent conversation wake just went out.
     assert {:ok, first_alert} = Relay.claim_push(relay, now_ms + 300_001)
     assert first_alert.high == 2

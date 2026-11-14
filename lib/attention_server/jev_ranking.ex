@@ -54,8 +54,7 @@ defmodule AttentionServer.JevRanking do
       pending
       |> Task.async_stream(fn batch -> {batch.id, safe_evaluate(evaluator, batch.request)} end,
         max_concurrency: max(length(pending), 1),
-        timeout: 40_000,
-        on_timeout: :kill_task
+        timeout: :infinity
       )
       |> Enum.map(fn
         {:ok, answer} -> answer

@@ -129,7 +129,7 @@ defmodule AttentionServer.PendingEnrollmentDeadlinesTest do
              )
   end
 
-  test "mixed retained capacity survives restart and first admission prunes without erasing authority",
+  test "retained enrollment status survives restart and admissions exceed the former count cap",
        %{certs: certs} do
     old = TLSFixtures.certificate_der!(certs, "a2")
     fresh = TLSFixtures.certificate_der!(certs, "b1")
@@ -166,15 +166,35 @@ defmodule AttentionServer.PendingEnrollmentDeadlinesTest do
     assert :ok = Store.close(stored)
     assert {:ok, restarted} = Store.open(path)
 
-    assert {:error, :capacity} =
+    assert {:ok, admitted} =
              Engine.pending_enroll(
                restarted.engine,
                fresh,
                "new",
-               "ZZZZZZZZZZ",
+               code(1_024),
                :crypto.hash(:sha256, "new"),
                @status_deadline - 1
              )
+
+    assert map_size(admitted.pending_enrollments) + map_size(admitted.pending_history) == 1_025
+
+    over_limit_path = temp_path("over_limit")
+    {:ok, over_limit_store} = Store.open(over_limit_path)
+
+    assert {:ok, over_limit_saved} =
+             Store.commit(over_limit_store, admitted, %{
+               person: "unassigned",
+               actor: "test",
+               action: "pending_enrollment"
+             })
+
+    assert :ok = Store.close(over_limit_saved)
+    assert {:ok, over_limit_reloaded} = Store.open(over_limit_path)
+
+    assert map_size(over_limit_reloaded.engine.pending_enrollments) +
+             map_size(over_limit_reloaded.engine.pending_history) == 1_025
+
+    assert :ok = Store.close(over_limit_reloaded)
 
     assert {:ok, %{"state" => "expired"}} =
              Engine.pending_status(

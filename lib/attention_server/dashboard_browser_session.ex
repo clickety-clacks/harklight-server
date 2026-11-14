@@ -1,6 +1,6 @@
 defmodule AttentionServer.DashboardBrowserSession do
   @moduledoc """
-  Short-lived browser cookies after Relay consumes a durable one-use sign-in token.
+  In-memory browser cookies after Relay consumes a durable one-use sign-in token.
 
   The injected consumer returns only a committed owner principal and issuer
   revision. This process never issues, stores, or reuses sign-in links. Every
@@ -8,9 +8,6 @@ defmodule AttentionServer.DashboardBrowserSession do
   """
 
   use GenServer
-
-  @session_ms 12 * 60 * 60 * 1_000
-  @limit 1_024
 
   alias AttentionServer.Diagnostics
 
@@ -25,28 +22,19 @@ defmodule AttentionServer.DashboardBrowserSession do
      %{
        relay: Keyword.fetch!(opts, :relay),
        consume: Keyword.fetch!(opts, :consume),
-       sessions: %{},
-       session_limit: Keyword.get(opts, :session_limit, @limit),
-       high_water: 0,
-       now: Keyword.get(opts, :now, fn -> System.system_time(:millisecond) end)
+       sessions: %{}
      }}
   end
 
   @impl true
   def handle_call({:redeem, token}, _from, state) do
-    state = state |> compact() |> prune_stale_at_capacity()
-
-    if map_size(state.sessions) >= state.session_limit do
-      {:reply, {:error, :capacity}, state}
-    else
-      consume_and_mint(state, token)
-    end
+    consume_and_mint(state, token)
   end
 
   def handle_call({:resolve, cookie}, _from, state) do
-    state = compact(state)
+    session_hash = digest(cookie)
 
-    case Map.get(state.sessions, digest(cookie)) do
+    case Map.get(state.sessions, session_hash) do
       %{person: person, key: key, revision: revision} = session ->
         case Diagnostics.result(
                :dashboard_http,
@@ -64,6 +52,12 @@ defmodule AttentionServer.DashboardBrowserSession do
               end
 
             {:reply, {:ok, principal}, state}
+
+          {:ok, _new_revision} ->
+            invalidate_session(state, session_hash)
+
+          {:error, :forbidden} ->
+            invalidate_session(state, session_hash)
 
           _ ->
             {:reply, {:error, :invalid_session}, state}
@@ -96,8 +90,7 @@ defmodule AttentionServer.DashboardBrowserSession do
              ) do
           {:ok, ^revision} ->
             cookie = :crypto.strong_rand_bytes(32) |> Base.url_encode64(padding: false)
-            expires_at = state.high_water + @session_ms
-            session = %{person: person, key: key, revision: revision, expires_at: expires_at}
+            session = %{person: person, key: key, revision: revision}
 
             session =
               case Map.get(principal, :display_name) do
@@ -105,7 +98,7 @@ defmodule AttentionServer.DashboardBrowserSession do
                 _ -> session
               end
 
-            {:reply, {:ok, cookie, expires_at}, put_in(state.sessions[digest(cookie)], session)}
+            {:reply, {:ok, cookie, nil}, put_in(state.sessions[digest(cookie)], session)}
 
           _ ->
             {:reply, {:error, :invalid_link}, state}
@@ -116,32 +109,9 @@ defmodule AttentionServer.DashboardBrowserSession do
     end
   end
 
-  defp compact(state) do
-    now = max(state.now.(), state.high_water)
-
-    %{
-      state
-      | high_water: now,
-        sessions: Map.reject(state.sessions, fn {_, session} -> session.expires_at <= now end)
-    }
-  end
-
-  defp prune_stale_at_capacity(state) do
-    if map_size(state.sessions) < state.session_limit do
-      state
-    else
-      sessions =
-        Map.filter(state.sessions, fn {_hash, %{person: person, key: key, revision: revision}} ->
-          Diagnostics.result(
-            :dashboard_http,
-            :authentication,
-            AttentionServer.Relay.owner_revision(state.relay, person, key),
-            :rejected
-          ) == {:ok, revision}
-        end)
-
-      %{state | sessions: sessions}
-    end
+  defp invalidate_session(state, session_hash) do
+    {:reply, {:error, :invalid_session},
+     %{state | sessions: Map.delete(state.sessions, session_hash)}}
   end
 
   defp digest(value) when is_binary(value), do: :crypto.hash(:sha256, value)

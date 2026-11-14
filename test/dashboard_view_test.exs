@@ -212,6 +212,24 @@ defmodule AttentionServer.DashboardViewTest do
     refute html =~ ~s(<h2>Agent skill: harklight-agent-saas</h2><p class="status">v)
   end
 
+  test "a non-expiring invitation is labeled clearly" do
+    html =
+      DashboardView.invitation(
+        "Account",
+        %{
+          "join_url" => "harklight://join#token",
+          "tappable_url" => "harklight://join#token",
+          "server_name" => "relay.test",
+          "enrollment_url" => "https://relay.test/enroll",
+          "expires_at" => nil
+        },
+        "request-id"
+      )
+
+    assert html =~ "No expiry"
+    refute html =~ "unknown time"
+  end
+
   test "uncertain invitation failure offers same-request retry without a new invitation action" do
     html = DashboardView.invitation_failure("Dana", "The server could not create an invitation")
 

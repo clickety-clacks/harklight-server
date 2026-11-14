@@ -139,7 +139,6 @@ defmodule AttentionServer.PushAlertTest do
     assert bounded.alert["body_truncated"]
   end
 
-  @window_ms 300_000
   @person "person-a"
   @device String.duplicate("a", 64)
   @origin String.duplicate("b", 64)
@@ -158,7 +157,7 @@ defmodule AttentionServer.PushAlertTest do
         accepted_high: 0,
         pending_conversation_high: 0,
         accepted_conversation_high: 0,
-        deadline_at: 1_000 + 3_600_000,
+        deadline_at: 1_000,
         next_at: 1_000,
         attempt_count: 0,
         last_attempt_at: nil,
@@ -339,7 +338,60 @@ defmodule AttentionServer.PushAlertTest do
     assert binding.next_at == 1_001 + 1_000
   end
 
-  test "the first unsent request opens a five-minute window that later requests ride on" do
+  test "pending push remains claimable after the former hint deadline" do
+    now = 3_600_001
+
+    engine =
+      engine_with_deliveries(
+        [{"app:test", "past-deadline", nil, nil}],
+        %{deadline_at: now - 1, next_at: now - 1}
+      )
+
+    assert {:ok, claimed, claim} = Engine.claim_push(engine, now)
+    assert claim.high == 1
+    assert claimed.push_bindings[{@person, @device}].state == "sending"
+  end
+
+  test "same-endpoint re-registration immediately queues blocked pending work" do
+    engine = engine_with_deliveries([{"app:test", "blocked", nil, nil}], %{next_at: 1_000})
+    {:ok, engine} = Engine.setup_device(engine, @person, @device)
+
+    assert {:ok, sending, claim} = Engine.claim_push(engine, 1_000)
+    assert sending.push_bindings[{@person, @device}].state == "sending"
+
+    assert {:ok, blocked} =
+             Engine.finish_push(
+               sending,
+               claim,
+               %{state: "blocked_configuration"},
+               1_001
+             )
+
+    blocked_binding = blocked.push_bindings[{@person, @device}]
+    assert blocked_binding.state == "blocked_configuration"
+    assert blocked_binding.pending_high == 1
+    assert blocked_binding.next_at == nil
+
+    register_again = %{
+      "v" => 1,
+      "type" => "push_register",
+      "op_id" => "00000000-0000-4000-8000-000000000103",
+      "revision" => 2,
+      "profile_id" => "harklight-sandbox",
+      "address_kind" => "apns_token",
+      "address" => String.duplicate("ab", 32)
+    }
+
+    {registered, {:ok, _reply}} =
+      Engine.request_line(blocked, @device, JSON.encode!(register_again) <> "\n")
+
+    registered_binding = registered.push_bindings[{@person, @device}]
+    assert registered_binding.state == "queued"
+    assert registered_binding.pending_high == 1
+    assert registered_binding.next_at == registered_binding.registered_at
+  end
+
+  test "new requests keep the five-minute window and pending highs coalesce at claim time" do
     {:ok, engine} = Engine.setup_person(Engine.new(), @person)
     {:ok, engine} = Engine.setup_device(engine, @person, @device)
     {:ok, engine} = Engine.setup_device(engine, @person, @origin)
@@ -383,16 +435,29 @@ defmodule AttentionServer.PushAlertTest do
 
     opened = binding.(engine)
     assert opened.state == "queued"
-    assert opened.next_at in (before + @window_ms)..(after_first + @window_ms)
-    assert opened.deadline_at == opened.next_at - @window_ms + 3_600_000
+    assert opened.next_at in (before + 300_000)..(after_first + 300_000)
+    assert is_integer(opened.deadline_at)
 
-    # Nothing goes out before the window closes.
+    # A claim before the queued event is not due.
     assert {:ok, _engine, nil} = Engine.claim_push(engine, opened.next_at - 1)
 
-    # A second request inside the window does not move the send time.
+    # A second request joins the queued high before the dispatcher claims it.
     {engine, 2} = forward.(engine, "two", "02")
     assert binding.(engine).next_at == opened.next_at
     assert binding.(engine).pending_high == 2
+
+    # Re-registering a token does not shorten the open push window.
+    register_again = %{
+      register
+      | "op_id" => "00000000-0000-4000-8000-000000000102",
+        "revision" => 2,
+        "address" => String.duplicate("cd", 32)
+    }
+
+    {engine, {:ok, _reply}} =
+      Engine.request_line(engine, @device, JSON.encode!(register_again) <> "\n")
+
+    assert binding.(engine).next_at == opened.next_at
 
     assert {:ok, engine, claim} = Engine.claim_push(engine, opened.next_at)
     assert claim.high == 2
@@ -401,13 +466,13 @@ defmodule AttentionServer.PushAlertTest do
     assert binding.(engine).state == "sending"
     assert binding.(engine).next_at == nil
 
-    # A request that arrives while that push is in flight opens the next window.
+    # A request arriving in flight queues the next event for the dispatcher.
     before_third = System.system_time(:millisecond)
     {engine, 3} = forward.(engine, "three", "03")
     after_third = System.system_time(:millisecond)
     in_flight = binding.(engine)
     assert in_flight.state == "sending"
-    assert in_flight.next_at in (before_third + @window_ms)..(after_third + @window_ms)
+    assert in_flight.next_at in (before_third + 300_000)..(after_third + 300_000)
 
     accepted = %{state: "provider_accepted", http_status: 200}
     assert {:ok, engine} = Engine.finish_push(engine, claim, accepted, opened.next_at + 1)
