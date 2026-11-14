@@ -178,7 +178,12 @@ defmodule AttentionServer.DashboardBrowserHTTP do
     end
   end
 
-  defp upload_reply(conn, _opts, {:ok, reply}) when is_map(reply), do: wire_reply(conn, reply)
+  defp upload_reply(conn, _opts, {:ok, reply}) when is_map(reply) do
+    reply
+    |> Map.merge(%{"v" => 1, "type" => "ok"})
+    |> then(&wire_reply(conn, &1))
+  end
+
   defp upload_reply(conn, opts, {:error, :session_ended}), do: session_redirect(conn, opts)
 
   defp upload_reply(conn, _opts, {:error, reason}),
