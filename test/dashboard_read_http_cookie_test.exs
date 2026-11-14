@@ -34,7 +34,9 @@ defmodule AttentionServer.DashboardReadHTTPCookieTest do
 
     assert response.status == 204
 
-    assert %{max_age: nil, secure: true, http_only: true, same_site: "Lax"} =
-             response.resp_cookies["__Host-harklight"]
+    assert %{secure: true, http_only: true, same_site: "Lax"} =
+             cookie = response.resp_cookies["__Host-harklight"]
+
+    refute Map.has_key?(cookie, :max_age)
   end
 end

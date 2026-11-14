@@ -83,8 +83,6 @@ defmodule AttentionServer.GuidedJoin do
          true <- AttentionServer.Message.uuid_v4?(request_id),
          true <- valid_configuration?(configuration),
          true <- is_integer(now) and now >= engine.pending_clock_high_water do
-      engine = compact(engine, now)
-
       existing =
         Enum.find_value(engine.join_invitations, fn {_, item} ->
           if item.person == person and item.owner_key == owner and
@@ -112,6 +110,8 @@ defmodule AttentionServer.GuidedJoin do
           {:ok, engine, existing, request_token(engine, existing, request_id)}
 
         true ->
+          engine = compact(engine, now)
+
           binding = %{
             person: person,
             owner_key: owner,
@@ -275,11 +275,7 @@ defmodule AttentionServer.GuidedJoin do
         engine
 
       %{code: nil, expires_at: deadline} when now >= deadline ->
-        %{
-          engine
-          | join_invitations: Map.delete(engine.join_invitations, hash),
-            pending_clock_high_water: max(engine.pending_clock_high_water, deadline)
-        }
+        %{engine | pending_clock_high_water: max(engine.pending_clock_high_water, deadline)}
 
       %{code: code, retain_until: deadline} when is_binary(code) ->
         observed = Engine.pending_observe_time(engine, {:code, code}, now)

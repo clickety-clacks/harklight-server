@@ -157,7 +157,7 @@ defmodule AttentionServer.GuidedJoinTest do
                c.owner_key,
                after_expiry_hash,
                c.config,
-               1_800_000
+               1_800_001
              )
 
     assert map_size(compacted.join_invitations) == 1
