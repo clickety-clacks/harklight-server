@@ -315,7 +315,17 @@ defmodule AttentionServer.DashboardReadHTTP do
 
   defp route(
          %{method: "GET", request_path: "/api/profile"} = conn,
-         _opts,
+         %{hosted: false},
+         _principal
+       ),
+       do:
+         conn
+         |> put_resp_content_type("application/json", "utf-8")
+         |> send_resp(200, JSON.encode!(%{"display_name" => ""}))
+
+  defp route(
+         %{method: "GET", request_path: "/api/profile"} = conn,
+         %{hosted: true},
          _principal
        ),
        do: send_resp(conn, 503, "Profile unavailable")
