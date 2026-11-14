@@ -216,22 +216,12 @@ defmodule AttentionServer.ChatPushTest do
     assert push_binding(engine).state == "ready"
   end
 
-  test "answered request replies alert without opened marker and origin never receives its own preview" do
+  test "open request replies alert without opened marker and origin never receives its own preview" do
     {engine, _} = register(setup_engine(), 1)
     {engine, _} = register(engine, 1, String.duplicate("cd", 32), @origin)
     {engine, _} = forward(engine, "one")
-
-    {engine, _} =
-      request(engine, @reader, %{
-        "type" => "answer",
-        "sender_id" => "app:test",
-        "message_id" => "one",
-        "request_revision" => 1,
-        "answer" => "yes"
-      })
-
-    {engine, _} = reply(engine, "one", "After answer")
-    assert engine.messages[{@person, "app:test", "one"}].terminal != nil
+    {engine, _} = reply(engine, "one", "Open reply")
+    assert engine.messages[{@person, "app:test", "one"}].terminal == nil
     assert engine.push_bindings[{@person, @origin}].pending_conversation_high == 0
     now = due(engine)
 
@@ -243,9 +233,47 @@ defmodule AttentionServer.ChatPushTest do
         {engine, [claim | claims]}
       end)
 
-    alerts = Enum.filter(claims, &(&1.presentation == :alert))
-    assert [%{device: @reader, alert: %{"body" => "After answer"}}] = alerts
+    conversation_claims = Enum.filter(claims, &(&1.stream == :conversation))
+
+    assert [%{device: @reader, presentation: :alert, alert: %{"body" => "Open reply"}}] =
+             conversation_claims
+
     assert engine.chat_read_positions == %{}
+  end
+
+  test "reply to an answered request is closed and queues no conversation push" do
+    {engine, _} = register(setup_engine(), 1)
+    {engine, _} = register(engine, 1, String.duplicate("cd", 32), @origin)
+    {engine, _} = forward(engine, "one")
+    {engine, discussion} = discussion(engine, "one")
+
+    {engine, _} =
+      request(engine, @reader, %{
+        "type" => "answer",
+        "sender_id" => "app:test",
+        "message_id" => "one",
+        "request_revision" => 1,
+        "answer" => "yes"
+      })
+
+    frame =
+      %{
+        "v" => 1,
+        "op_id" => op(),
+        "type" => "conversation_reply",
+        "sender_id" => "app:test",
+        "message_id" => "one",
+        "request_revision" => 1,
+        "in_reply_to" => String.to_integer(discussion["event_id"]),
+        "text" => "After answer"
+      }
+
+    {after_reply, {:ok, line}} =
+      Engine.request_line(engine, @origin, JSON.encode!(frame) <> "\n")
+
+    assert {:ok, %{"type" => "error", "reason" => "closed"}} = JSON.decode_line(line)
+    assert after_reply.push_bindings == engine.push_bindings
+    assert after_reply.conversation_highs == engine.conversation_highs
   end
 
   test "new and replacement registration are prospective; same active endpoint preserves work and identity" do

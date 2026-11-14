@@ -26,6 +26,15 @@ defmodule AttentionServer.PersistenceReadBarrierTest do
   defp read(store, {:device_revoked?, key}, _from),
     do: Engine.device_revoked?(store.engine, key)
 
+  # Setup includes opening and seeding SQLite. Wait for its actual ready event;
+  # the ExUnit test timeout still bounds a stalled setup.
+  defp await_writer(owner, monitor) do
+    receive do
+      {:writing, writer} -> writer
+      {:DOWN, ^monitor, :process, ^owner, reason} -> flunk("setup failed: #{inspect(reason)}")
+    end
+  end
+
   test "reads see only committed state; ordered mutations and success wait for persistence", %{
     path: path
   } do
@@ -65,7 +74,7 @@ defmodule AttentionServer.PersistenceReadBarrierTest do
         end
       end)
 
-    assert_receive {:writing, writer}
+    writer = await_writer(owner, monitor)
     queued = Task.async(fn -> GenServer.call(owner, {:setup_device, "second"}) end)
     refute GenServer.call(owner, {:device_revoked?, "device"})
     refute_received :first_committed
@@ -104,7 +113,7 @@ defmodule AttentionServer.PersistenceReadBarrierTest do
         end)
       end)
 
-    assert_receive {:writing, writer}
+    writer = await_writer(owner, monitor)
     refute GenServer.call(owner, {:device_revoked?, "device"})
     send(writer, :fail)
     assert_receive {:DOWN, ^monitor, :process, ^owner, :persistence_failed}
