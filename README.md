@@ -42,8 +42,10 @@ does not establish a separately persisted intermediate FORMAT28 state.
 Every registered, non-revoked agent can read all messages on the account it
 is registered to, regardless of sender. Sender filters select search results
 only; they do not limit access. Existing respond-grant values and response
-checks are unchanged. New registrations need no per-sender read grant. The
-v0.1.35, v0.1.36, v0.1.38, and planned v0.1.39 packages write FORMAT27 and
+checks are unchanged. New registrations need no per-sender read grant for
+reads; answering still requires both a matching read grant and a matching
+respond grant. The v0.1.35, v0.1.36, v0.1.38, and planned v0.1.39 packages
+write FORMAT27 and
 cannot read resulting FORMAT29 state. Changing only the selected code or
 release link is not a safe downgrade. Earlier v0.1.28 writes FORMAT25, while
 v0.1.27 and v0.1.26 write

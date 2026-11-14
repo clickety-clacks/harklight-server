@@ -5,7 +5,8 @@
 - Every registered, non-revoked agent can read all messages on the account it
   is registered to, regardless of sender. Sender filters select search results
   only; they do not limit access. New registrations need no per-sender read
-  grant. Existing respond-grant values and response checks are unchanged.
+  grant for reads. Answering still requires both a matching read grant and a
+  matching respond grant; response behavior is unchanged.
 - Continues to write FORMAT29; no store-format or migration code changes are
   included in this candidate.
 
