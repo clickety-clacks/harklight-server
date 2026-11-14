@@ -1,3 +1,24 @@
+# Harklight Server v0.1.39
+
+## Changes
+
+- Every registered, non-revoked agent can read all messages on the account it
+  is registered to, regardless of sender. Sender filters select search results
+  only; they do not limit access. New registrations need no per-sender read
+  grant for reads. Answering still requires both a matching read grant and a
+  matching respond grant; response behavior is unchanged.
+- Continues to write FORMAT27 and introduces no schema or store-format change.
+
+## Upgrade and recovery
+
+This package continues the v0.1.38 FORMAT27 repair line. Returning to v0.1.35
+still requires the stopped full-root backup and prior selector because v0.1.35
+ignores later durable progress. Restore can fail, loses writes made after the
+backup, and cannot undo external effects. See SELF_HOST.md for the exact
+installer behavior and recovery limits.
+
+---
+
 # Harklight Server v0.1.38
 
 ## Changes
