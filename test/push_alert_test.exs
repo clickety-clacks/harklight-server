@@ -352,6 +352,45 @@ defmodule AttentionServer.PushAlertTest do
     assert claimed.push_bindings[{@person, @device}].state == "sending"
   end
 
+  test "same-endpoint re-registration immediately queues blocked pending work" do
+    engine = engine_with_deliveries([{"app:test", "blocked", nil, nil}], %{next_at: 1_000})
+    {:ok, engine} = Engine.setup_device(engine, @person, @device)
+
+    assert {:ok, sending, claim} = Engine.claim_push(engine, 1_000)
+    assert sending.push_bindings[{@person, @device}].state == "sending"
+
+    assert {:ok, blocked} =
+             Engine.finish_push(
+               sending,
+               claim,
+               %{state: "blocked_configuration"},
+               1_001
+             )
+
+    blocked_binding = blocked.push_bindings[{@person, @device}]
+    assert blocked_binding.state == "blocked_configuration"
+    assert blocked_binding.pending_high == 1
+    assert blocked_binding.next_at == nil
+
+    register_again = %{
+      "v" => 1,
+      "type" => "push_register",
+      "op_id" => "00000000-0000-4000-8000-000000000103",
+      "revision" => 2,
+      "profile_id" => "harklight-sandbox",
+      "address_kind" => "apns_token",
+      "address" => String.duplicate("ab", 32)
+    }
+
+    {registered, {:ok, _reply}} =
+      Engine.request_line(blocked, @device, JSON.encode!(register_again) <> "\n")
+
+    registered_binding = registered.push_bindings[{@person, @device}]
+    assert registered_binding.state == "queued"
+    assert registered_binding.pending_high == 1
+    assert registered_binding.next_at == registered_binding.registered_at
+  end
+
   test "new requests keep the five-minute window and pending highs coalesce at claim time" do
     {:ok, engine} = Engine.setup_person(Engine.new(), @person)
     {:ok, engine} = Engine.setup_device(engine, @person, @device)

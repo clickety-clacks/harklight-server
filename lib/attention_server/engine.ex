@@ -352,7 +352,7 @@ defmodule AttentionServer.Engine do
               revision: revision,
               registered_at: now_ms,
               state: if(pending?, do: "queued", else: "ready"),
-              next_at: if(pending?, do: old.next_at || now_ms + @push_window_ms, else: nil)
+              next_at: if(pending?, do: old.next_at || now_ms, else: nil)
             })
           else
             binding
