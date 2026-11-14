@@ -205,6 +205,53 @@ defmodule AttentionServer.DashboardReadHTTPTest do
     assert response.status == 404
   end
 
+  test "hosted profile returns only the signed-in account display name", %{opts: opts} do
+    hosted =
+      DashboardReadHTTP.init(
+        backend: Backend,
+        skill_path: opts.skill_path,
+        skill_path_saas: opts.skill_path_saas,
+        hosted: true,
+        hosted_addresses: %{sign_in: "https://account.example/sign-in"}
+      )
+
+    profile = "/api/profile" |> secure_get("labeled-session") |> DashboardReadHTTP.call(hosted)
+
+    assert profile.status == 200
+
+    assert Plug.Conn.get_resp_header(profile, "content-type") == [
+             "application/json; charset=utf-8"
+           ]
+
+    assert {:ok, %{"display_name" => "Test account"} = body} =
+             JSON.decode_line(profile.resp_body <> "\n")
+
+    assert map_size(body) == 1
+
+    missing_session = "/api/profile" |> secure_get() |> DashboardReadHTTP.call(hosted)
+    assert missing_session.status == 303
+
+    assert Plug.Conn.get_resp_header(missing_session, "location") == [
+             "https://account.example/sign-in"
+           ]
+  end
+
+  test "hosted sign-in lands on the web client inbox", %{opts: opts} do
+    hosted =
+      DashboardReadHTTP.init(
+        backend: Backend,
+        skill_path: opts.skill_path,
+        skill_path_saas: opts.skill_path_saas,
+        hosted: true
+      )
+
+    script = "/sign-in.js" |> secure_get() |> DashboardReadHTTP.call(hosted)
+
+    assert script.status == 200
+    assert script.resp_body =~ ~s|location.replace("/inbox")|
+    refute script.resp_body =~ ~s|location.replace("/devices")|
+  end
+
   test "the prioritization form accepts a full configured endpoint", %{opts: opts} do
     endpoint = "https://example.test/" <> String.duplicate("a", 1_020)
 

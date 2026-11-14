@@ -10,8 +10,8 @@ defmodule AttentionServer.DashboardReadHTTP do
   sign-in must come from (default: the request's own host and port, so a server
   behind a public front end names its public address here); `:hosted` selects
   the hosted wording, which never tells a person to ask an owner;
-  `:hosted_addresses` (hosted only) names where a browser goes with no session
-  or an expired one (`:sign_in`), after Sign out (`:sign_out`, defaulting to
+  `:hosted_addresses` (hosted only) names where a browser goes without a usable
+  Server session (`:sign_in`), after Sign out (`:sign_out`, defaulting to
   `:sign_in`) and for the Account link (`:account`). Self-hosted output is
   unchanged by every default.
   """
@@ -127,6 +127,9 @@ defmodule AttentionServer.DashboardReadHTTP do
       conn.method == "POST" and conn.request_path == "/join/resolve" ->
         resolve_join(conn, opts)
 
+      conn.method == "GET" and conn.request_path == "/browser/relay" and opts.hosted ->
+        AttentionServer.DashboardBrowserHTTP.upgrade(conn, opts)
+
       conn.method == "GET" and conn.request_path == "/agent-skills/SKILL.md" ->
         serve_skill_file(conn, opts.skill_path)
 
@@ -209,6 +212,45 @@ defmodule AttentionServer.DashboardReadHTTP do
     ]
 
   defp chrome(_opts), do: [prioritization: true]
+
+  defp route(
+         %{method: "GET", request_path: "/api/profile"} = conn,
+         %{hosted: true},
+         %{display_name: display_name}
+       )
+       when is_binary(display_name) do
+    conn
+    |> put_resp_content_type("application/json", "utf-8")
+    |> send_resp(200, JSON.encode!(%{"display_name" => display_name}))
+  end
+
+  defp route(
+         %{method: "GET", request_path: "/api/profile"} = conn,
+         %{hosted: true},
+         _principal
+       ),
+       do: send_resp(conn, 503, "Profile unavailable")
+
+  defp route(
+         %{method: "POST", request_path: "/browser/v1"} = conn,
+         %{hosted: true} = opts,
+         _principal
+       ),
+       do: AttentionServer.DashboardBrowserHTTP.command(conn, opts)
+
+  defp route(
+         %{method: "POST", request_path: "/browser/v1/upload"} = conn,
+         %{hosted: true} = opts,
+         _principal
+       ),
+       do: AttentionServer.DashboardBrowserHTTP.upload(conn, opts)
+
+  defp route(
+         %{method: "GET", path_info: ["browser", "v1", "files", upload_id]} = conn,
+         %{hosted: true} = opts,
+         _principal
+       ),
+       do: AttentionServer.DashboardBrowserHTTP.fetch_file(conn, opts, upload_id)
 
   defp route(%{method: "GET", request_path: "/devices"} = conn, opts, principal) do
     case backend_call(opts.backend, :list_devices, principal) do
@@ -933,7 +975,7 @@ defmodule AttentionServer.DashboardReadHTTP do
 
   defp sign_in_script(conn, %{hosted: true}) do
     script =
-      ~S|const status=document.getElementById("status");const again=document.getElementById("sign-in-again");const fail=message=>{status.textContent=message;if(again){again.hidden=false}};const token=location.hash.slice(1);history.replaceState(null,"",location.pathname);if(!/^hbs1_[0-9a-f]{64}$/.test(token)){fail("This sign-in link is invalid.")}else{fetch("/sign-in",{method:"POST",headers:{"content-type":"text/plain"},credentials:"same-origin",body:token}).then(r=>{if(r.status===204){location.replace("/devices")}else{fail("This sign-in link is expired or already used.")}}).catch(()=>{fail("The server could not be reached.")})}|
+      ~S|const status=document.getElementById("status");const again=document.getElementById("sign-in-again");const fail=message=>{status.textContent=message;if(again){again.hidden=false}};const token=location.hash.slice(1);history.replaceState(null,"",location.pathname);if(!/^hbs1_[0-9a-f]{64}$/.test(token)){fail("This sign-in link is invalid.")}else{fetch("/sign-in",{method:"POST",headers:{"content-type":"text/plain"},credentials:"same-origin",body:token}).then(r=>{if(r.status===204){location.replace("/inbox")}else{fail("This sign-in link is expired or already used.")}}).catch(()=>{fail("The server could not be reached.")})}|
 
     conn |> put_resp_content_type("text/javascript", "utf-8") |> send_resp(200, script)
   end

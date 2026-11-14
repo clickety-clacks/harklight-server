@@ -21,6 +21,92 @@ defmodule AttentionServer.DashboardBackend do
   def end_session(%__MODULE__{sessions: sessions}, cookie),
     do: DashboardBrowserSession.end_session(sessions, cookie)
 
+  def open_browser_connection(%__MODULE__{sessions: sessions}, {cookie, recipient, worker}),
+    do:
+      apply(DashboardBrowserSession, :open_browser_connection, [
+        sessions,
+        cookie,
+        recipient,
+        worker
+      ])
+
+  def browser_session_request_line(
+        %__MODULE__{sessions: sessions},
+        {cookie, browser_session_id, session_id, raw}
+      ),
+      do:
+        apply(DashboardBrowserSession, :browser_session_request_line, [
+          sessions,
+          cookie,
+          browser_session_id,
+          session_id,
+          raw
+        ])
+
+  def browser_session_drain(
+        %__MODULE__{sessions: sessions},
+        {cookie, browser_session_id, session_id}
+      ),
+      do:
+        apply(DashboardBrowserSession, :browser_session_drain, [
+          sessions,
+          cookie,
+          browser_session_id,
+          session_id
+        ])
+
+  def close_browser_connection(%__MODULE__{sessions: sessions}, {cookie, session_id}),
+    do: apply(DashboardBrowserSession, :close_browser_connection, [sessions, cookie, session_id])
+
+  def browser_file_command(%__MODULE__{sessions: sessions}, {cookie, recipient, request}),
+    do:
+      apply(DashboardBrowserSession, :browser_file_command, [sessions, cookie, recipient, request])
+
+  def browser_file_limits(%__MODULE__{sessions: sessions}, {cookie, recipient}),
+    do: apply(DashboardBrowserSession, :browser_file_limits, [sessions, cookie, recipient])
+
+  def browser_upload_begin(
+        %__MODULE__{sessions: sessions},
+        {cookie, recipient, attrs, size, worker}
+      ),
+      do:
+        apply(DashboardBrowserSession, :browser_upload_begin, [
+          sessions,
+          cookie,
+          recipient,
+          attrs,
+          size,
+          worker
+        ])
+
+  def browser_upload_file(
+        %__MODULE__{sessions: sessions},
+        {cookie, recipient, attrs, path, size, sha256, lease}
+      ),
+      do:
+        apply(DashboardBrowserSession, :browser_upload_file, [
+          sessions,
+          cookie,
+          recipient,
+          attrs,
+          path,
+          size,
+          sha256,
+          lease
+        ])
+
+  def browser_upload_end(%__MODULE__{sessions: sessions}, {cookie, recipient, lease}),
+    do:
+      apply(DashboardBrowserSession, :browser_upload_end, [
+        sessions,
+        cookie,
+        recipient,
+        lease
+      ])
+
+  def browser_fetch_file(%__MODULE__{sessions: sessions}, {cookie, upload_id}),
+    do: apply(DashboardBrowserSession, :browser_fetch_file, [sessions, cookie, upload_id])
+
   def list_devices(%__MODULE__{} = backend, %{person_id: person, owner_key: key} = principal) do
     case Relay.dashboard_inventory(backend.relay, person, key, backend.configured_owner_person) do
       {:ok, snapshot} ->

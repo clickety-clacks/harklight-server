@@ -144,6 +144,33 @@ defmodule AttentionServer.DashboardBrowserSessionTest do
     assert {:error, :invalid_session} = DashboardBrowserSession.resolve(c.browser, cookie)
   end
 
+  test "sign-out ends every connection under that browser session", c do
+    assert {:ok, cookie, nil} = DashboardBrowserSession.redeem(c.browser, "hbs1_approved")
+
+    assert {:ok, first} =
+             DashboardBrowserSession.open_browser_connection(
+               c.browser,
+               cookie,
+               "00000000-0000-4000-8000-000000000101",
+               self()
+             )
+
+    assert {:ok, second} =
+             DashboardBrowserSession.open_browser_connection(
+               c.browser,
+               cookie,
+               "00000000-0000-4000-8000-000000000102",
+               self()
+             )
+
+    assert :ok = DashboardBrowserSession.end_session(c.browser, cookie)
+
+    assert_receive {:attention_fenced, first_id}
+    assert_receive {:attention_fenced, second_id}
+    assert MapSet.new([first.session_id, second.session_id]) == MapSet.new([first_id, second_id])
+    assert {:error, :invalid_session} = DashboardBrowserSession.resolve(c.browser, cookie)
+  end
+
   test "owner recovery removes the old session when its authority changes", c do
     assert {:ok, cookie, nil} = DashboardBrowserSession.redeem(c.browser, "hbs1_approved")
     assert {:ok, _} = DashboardBrowserSession.resolve(c.browser, cookie)
