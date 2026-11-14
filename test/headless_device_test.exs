@@ -256,6 +256,44 @@ defmodule AttentionServer.HeadlessDeviceTest do
              )
   end
 
+  test "large WebSocket answer is not refused by the client", ctx do
+    %{relay: relay, endpoint: endpoint, identities: identities, keys: keys, dir: dir} = ctx
+
+    message = %{
+      "sender_id" => "app:test",
+      "message_id" => "oversized-answer",
+      "created_at" => 1,
+      "title" => "T",
+      "body" => "short"
+    }
+
+    assert %{"type" => "ok", "seq" => 1} = store_existing(relay, keys["a1"], message, 4)
+    assert {:ok, %{"cursor" => 1}} = HeadlessDevice.read(identities["a2"], endpoint)
+
+    answer_file = Path.join(dir, "oversized-answer.json")
+    File.write!(answer_file, JSON.encode!(%{"text" => String.duplicate("x", 2 * 1024 * 1024)}))
+
+    case HeadlessDevice.respond(
+           identities["a2"],
+           endpoint,
+           "app:test",
+           "oversized-answer",
+           answer_file
+         ) do
+      {:ok, %{"type" => "ok"}} ->
+        :ok
+
+      {:error, :invalid_reply} ->
+        :ok
+
+      {:error, {:server, %{"type" => "error"}}} ->
+        :ok
+
+      other ->
+        flunk("expected a server response to the large answer, got: #{inspect(other)}")
+    end
+  end
+
   test "device CLI no longer exposes the agent send or receipt commands" do
     Code.ensure_loaded!(HeadlessDevice)
 

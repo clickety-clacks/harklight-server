@@ -128,27 +128,23 @@ defmodule AttentionServer.HeadlessTLS do
   def agent_https_request(endpoint, certificate, key, request) do
     body = JSON.encode!(request)
 
-    if byte_size(body) > 2 * 1024 * 1024 do
-      {:error, :request_too_large}
-    else
-      with {:ok, socket} <- connect(endpoint, {certificate, key}) do
-        try do
-          with :ok <-
-                 :ssl.send(socket, [
-                   "POST /agent/v1 HTTP/1.1\r\n",
-                   "Host: #{endpoint.name}\r\n",
-                   "Content-Type: application/json; charset=utf-8\r\n",
-                   "Content-Length: #{byte_size(body)}\r\n",
-                   "Connection: close\r\n\r\n",
-                   body
-                 ]),
-               {:ok, response} <- read_http(socket, <<>>, @max_agent_http),
-               {:ok, status, value} <- decode_http(response, @max_agent_http) do
-            {:ok, status, value}
-          end
-        after
-          :ssl.close(socket)
+    with {:ok, socket} <- connect(endpoint, {certificate, key}) do
+      try do
+        with :ok <-
+               :ssl.send(socket, [
+                 "POST /agent/v1 HTTP/1.1\r\n",
+                 "Host: #{endpoint.name}\r\n",
+                 "Content-Type: application/json; charset=utf-8\r\n",
+                 "Content-Length: #{byte_size(body)}\r\n",
+                 "Connection: close\r\n\r\n",
+                 body
+               ]),
+             {:ok, response} <- read_http(socket, <<>>, @max_agent_http),
+             {:ok, status, value} <- decode_http(response, @max_agent_http) do
+          {:ok, status, value}
         end
+      after
+        :ssl.close(socket)
       end
     end
   end

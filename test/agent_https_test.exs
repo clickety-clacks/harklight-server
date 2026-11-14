@@ -123,6 +123,29 @@ defmodule AttentionServer.AgentHTTPSTest do
              )
   end
 
+  test "large client request reaches Agent HTTPS without a local size refusal", context do
+    %{certs: certs, server: server, relay: relay} = context
+    person = bootstrap(relay, certs, "a1")
+
+    {:ok, agent_key} =
+      DeviceIdentity.from_certificate(TLSFixtures.certificate_der!(certs, "unknown"))
+
+    register(server, certs, "a1", person, agent_key)
+    endpoint = endpoint(certs, Server.agent_port(server))
+
+    request = %{
+      "v" => 1,
+      "type" => "search",
+      "text" => String.duplicate("x", 2 * 1024 * 1024)
+    }
+
+    assert {:ok, status, %{"type" => type}} =
+             agent_https(endpoint, certs, "unknown", request)
+
+    assert status in 200..499
+    assert type in ["ok", "error"]
+  end
+
   test "non-object JSON roots return 400 without restarting Relay or mutating SQLite", context do
     %{certs: certs, server: server, relay: relay} = context
     person = bootstrap(relay, certs, "a1")

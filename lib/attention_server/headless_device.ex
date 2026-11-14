@@ -11,11 +11,11 @@ defmodule AttentionServer.HeadlessDevice do
 
   alias AttentionServer.{DeviceIdentity, HeadlessTLS, JSON}
 
-  @max_frame 2 * 1024 * 1024
+  @max_server_request_frame 2 * 1024 * 1024
   # A server projection can repeat sender/message IDs outside the accepted M,
-  # or pair a terminal answer with those IDs. Both pieces originate in bounded
-  # client requests, so allow two request frames plus projection metadata.
-  @max_server_frame 2 * @max_frame + 16_384
+  # or pair a terminal answer with those IDs. Both pieces originate in requests
+  # accepted by the server, so allow two protocol-sized requests plus metadata.
+  @max_server_frame 2 * @max_server_request_frame + 16_384
   @timeout 5_000
 
   def read(directory, endpoint) do
@@ -304,23 +304,18 @@ defmodule AttentionServer.HeadlessDevice do
   defp send_frame(socket, frame) do
     payload = JSON.encode!(Map.put_new(frame, "v", 1)) <> "\n"
     size = byte_size(payload)
+    mask = :crypto.strong_rand_bytes(4)
+    repeated = :binary.copy(mask, div(size + 3, 4))
+    encoded = :crypto.exor(payload, binary_part(repeated, 0, size))
 
-    if size > @max_frame do
-      {:error, :request_too_large}
-    else
-      mask = :crypto.strong_rand_bytes(4)
-      repeated = :binary.copy(mask, div(size + 3, 4))
-      encoded = :crypto.exor(payload, binary_part(repeated, 0, size))
+    header =
+      cond do
+        size < 126 -> <<1::1, 0::3, 1::4, 1::1, size::7>>
+        size < 65_536 -> <<1::1, 0::3, 1::4, 1::1, 126::7, size::16>>
+        true -> <<1::1, 0::3, 1::4, 1::1, 127::7, size::64>>
+      end
 
-      header =
-        cond do
-          size < 126 -> <<1::1, 0::3, 1::4, 1::1, size::7>>
-          size < 65_536 -> <<1::1, 0::3, 1::4, 1::1, 126::7, size::16>>
-          true -> <<1::1, 0::3, 1::4, 1::1, 127::7, size::64>>
-        end
-
-      :ssl.send(socket, [header, mask, encoded])
-    end
+    :ssl.send(socket, [header, mask, encoded])
   end
 
   defp read_frame(socket) do
@@ -457,8 +452,7 @@ defmodule AttentionServer.HeadlessDevice do
 
   defp read_document(path) do
     with {:ok, contents} <- File.read(path),
-         true <- byte_size(contents) + 1 <= @max_frame,
-         {:ok, value} <- JSON.decode_line(contents <> "\n") do
+         {:ok, value} <- JSON.decode_line(contents <> "\n", byte_size(contents) + 1) do
       {:ok, value}
     else
       _ -> {:error, :invalid_document}
