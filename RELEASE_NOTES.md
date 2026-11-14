@@ -1,3 +1,34 @@
+# Harklight Server v0.1.41
+
+## Changes
+
+- Continues the v0.1.35 maintenance line with durable ACK progress, timeout
+  fixes, and account-wide agent reads. Answering still requires both a matching
+  read grant and respond grant; response behavior is unchanged.
+- Moves snapshot encoding, hashing and SQLite persistence to a linked worker.
+  Supported pure reads can use the last committed in-memory snapshot while
+  persistence is in progress. Mutations remain ordered, and success still waits
+  for durable commit. The format remains FORMAT27; there is no schema or store
+  format migration.
+- Bundles Erlang/OTP 27.3.4.18 with ERTS 15.2.7.13, matching the v0.1.35
+  maintenance runtime patch level.
+- Bandit 1.14.0 is unchanged from v0.1.39. Advisory applicability was not
+  reassessed for this release; no affected-or-unaffected claim is made.
+
+## Upgrade and recovery
+
+This package is for the v0.1.35 FORMAT27 maintenance line and is not an upgrade
+path from a FORMAT28 or FORMAT29 store. Before its first start, stop the server
+and take a complete private-state backup. Returning to v0.1.35 after the new
+package writes requires restoring that backup and selecting the prior binary,
+because v0.1.35 ignores later durable progress. Restore can fail, loses writes
+made after capture, and cannot undo external effects. An isolated
+backup/upgrade/restore rehearsal does not establish the full systemd installer's
+failure-recovery behavior. See SELF_HOST.md for the installer behavior and
+recovery limits.
+
+---
+
 # Harklight Server v0.1.39
 
 ## Changes
