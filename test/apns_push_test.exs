@@ -1636,7 +1636,7 @@ defmodule AttentionServer.APNSPushTest do
 
   # Drives one already-eligible push the way the dispatcher would.
   defp send_queued_push(ctx, relay) do
-    send_at = System.system_time(:millisecond) + 1
+    send_at = System.system_time(:millisecond) + 300_001
     assert {:ok, claim} = Relay.claim_push(relay, send_at)
     {outcome, _token} = APNS.send(APNS.prepare!(apns_options(ctx)), claim, nil)
     assert :ok = Relay.finish_push(relay, claim, outcome, send_at + 1)

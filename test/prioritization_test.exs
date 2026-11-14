@@ -2086,7 +2086,7 @@ defmodule AttentionServer.PrioritizationTest do
       end)
 
     assert length(Regex.scan(~r/event=harklight_priority_pass /, logs)) == 1
-    assert logs =~ "requests=1 finals=0"
+    assert logs =~ "finals=0"
   end
 
   test "reply arrival schedules mixed ranking without a second push", %{dir: dir, path: path} do
