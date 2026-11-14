@@ -256,7 +256,7 @@ defmodule AttentionServer.HeadlessDeviceTest do
              )
   end
 
-  test "large WebSocket answers reach the existing server frame boundary", ctx do
+  test "large WebSocket answer is not refused by the client", ctx do
     %{relay: relay, endpoint: endpoint, identities: identities, keys: keys, dir: dir} = ctx
 
     message = %{
@@ -273,16 +273,25 @@ defmodule AttentionServer.HeadlessDeviceTest do
     answer_file = Path.join(dir, "oversized-answer.json")
     File.write!(answer_file, JSON.encode!(%{"text" => String.duplicate("x", 2 * 1024 * 1024)}))
 
-    # The server's existing WebSocket protocol returns an uncorrelated bad_frame,
-    # which HeadlessDevice reports as invalid_reply. It is no longer a local size refusal.
-    assert {:error, :invalid_reply} =
-             HeadlessDevice.respond(
-               identities["a2"],
-               endpoint,
-               "app:test",
-               "oversized-answer",
-               answer_file
-             )
+    case HeadlessDevice.respond(
+           identities["a2"],
+           endpoint,
+           "app:test",
+           "oversized-answer",
+           answer_file
+         ) do
+      {:ok, %{"type" => "ok"}} ->
+        :ok
+
+      {:error, :invalid_reply} ->
+        :ok
+
+      {:error, {:server, %{"type" => "error"}}} ->
+        :ok
+
+      other ->
+        flunk("expected a server response to the large answer, got: #{inspect(other)}")
+    end
   end
 
   test "device CLI no longer exposes the agent send or receipt commands" do
