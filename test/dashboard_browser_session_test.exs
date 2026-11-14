@@ -105,9 +105,16 @@ defmodule AttentionServer.DashboardBrowserSessionTest do
       if state == :valid,
         do: assert({:ok, _} = DashboardBrowserSession.resolve(c.browser, cookie))
 
-      plain = post.(%{opts | hosted: false}, "confirm=sign_out", origin, form_type)
-      assert plain.status == if(state == :valid, do: 404, else: 401)
-      assert Plug.Conn.get_resp_header(plain, "location") == []
+      plain =
+        Plug.Test.conn(:post, "/sign-out", "confirm=sign_out")
+        |> Plug.Conn.put_req_header("origin", origin)
+        |> Plug.Conn.put_req_header("content-type", form_type)
+        |> Map.put(:scheme, :https)
+        |> Map.put(:port, 443)
+        |> AttentionServer.DashboardReadHTTP.call(%{opts | hosted: false})
+
+      assert plain.status == 303
+      assert Plug.Conn.get_resp_header(plain, "location") == ["/sign-in"]
 
       response = post.(opts, "confirm=sign_out", origin, form_type)
       assert response.status == 303
