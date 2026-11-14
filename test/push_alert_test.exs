@@ -407,6 +407,19 @@ defmodule AttentionServer.PushAlertTest do
     assert binding.(engine).next_at == opened.next_at
     assert binding.(engine).pending_high == 2
 
+    # Re-registering a token does not shorten the open push window.
+    register_again = %{
+      register
+      | "op_id" => "00000000-0000-4000-8000-000000000102",
+        "revision" => 2,
+        "address" => String.duplicate("cd", 32)
+    }
+
+    {engine, {:ok, _reply}} =
+      Engine.request_line(engine, @device, JSON.encode!(register_again) <> "\n")
+
+    assert binding.(engine).next_at == opened.next_at
+
     assert {:ok, engine, claim} = Engine.claim_push(engine, opened.next_at)
     assert claim.high == 2
     assert claim.alert == %{"title" => "2 new requests", "body" => "app:test"}

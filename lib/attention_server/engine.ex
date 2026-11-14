@@ -312,6 +312,7 @@ defmodule AttentionServer.Engine do
 
         pending? = pending_high > 0 or pending_conversation_high > 0
         last_attempt_at = if old, do: old.last_attempt_at, else: nil
+        open_window_at = if old && is_integer(old.next_at), do: old.next_at, else: nil
 
         binding = %{
           revision: revision,
@@ -328,7 +329,7 @@ defmodule AttentionServer.Engine do
           # The current store validator requires an integer while work is pending.
           # Keep the event timestamp in this legacy field; it is no longer a deadline.
           deadline_at: if(pending?, do: now_ms, else: nil),
-          next_at: if(pending?, do: now_ms, else: nil),
+          next_at: if(pending?, do: open_window_at || now_ms + @push_window_ms, else: nil),
           attempt_count: 0,
           last_attempt_at: last_attempt_at,
           last_outcome: nil,
@@ -351,7 +352,7 @@ defmodule AttentionServer.Engine do
               revision: revision,
               registered_at: now_ms,
               state: if(pending?, do: "queued", else: "ready"),
-              next_at: if(pending?, do: now_ms, else: nil)
+              next_at: if(pending?, do: old.next_at || now_ms + @push_window_ms, else: nil)
             })
           else
             binding
@@ -563,7 +564,7 @@ defmodule AttentionServer.Engine do
               next_at:
                 if(claim.remainder_due,
                   do: now_ms,
-                  else: binding.next_at || now_ms
+                  else: binding.next_at || now_ms + @push_window_ms
                 )
           })
         end
