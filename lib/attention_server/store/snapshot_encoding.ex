@@ -19,7 +19,11 @@ defmodule AttentionServer.Store.SnapshotEncoding do
 
     {parts, cache} =
       Enum.map_reduce(Map.to_list(fields), %{}, fn {key, value}, cache ->
-        entry = field(key, value, Map.get(previous, key))
+        # An origin feed contains its entire retained entry history. Cache those
+        # entries individually so a delivery receipt or append does not compress
+        # the whole origin again. Other engine maps already contain records.
+        depth = if key == :origin_feeds, do: 3, else: 1
+        entry = field(key, value, Map.get(previous, key), depth)
         {elem(entry, 1), Map.put(cache, key, entry)}
       end)
 
@@ -32,10 +36,10 @@ defmodule AttentionServer.Store.SnapshotEncoding do
     {payload, cache}
   end
 
-  defp field(_key, value, {old, _part, _children} = previous) when value === old,
+  defp field(_key, value, {old, _part, _children} = previous, _depth) when value === old,
     do: previous
 
-  defp field(key, value, previous) when is_map(value) do
+  defp field(key, value, previous, depth) when is_map(value) and depth > 0 do
     old_children =
       case previous do
         {_, _, children} when is_map(children) -> children
@@ -46,11 +50,7 @@ defmodule AttentionServer.Store.SnapshotEncoding do
 
     {parts, children} =
       Enum.map_reduce(Map.to_list(value), %{}, fn {record_key, record}, children ->
-        entry =
-          case Map.get(old_children, record_key) do
-            {old, _part} = cached when old === record -> cached
-            _ -> {record, block([term(record_key), term(record)])}
-          end
+        entry = field(record_key, record, Map.get(old_children, record_key), depth - 1)
 
         {elem(entry, 1), Map.put(children, record_key, entry)}
       end)
@@ -58,7 +58,7 @@ defmodule AttentionServer.Store.SnapshotEncoding do
     {value, join([header | parts]), children}
   end
 
-  defp field(key, value, _previous), do: {value, block([term(key), term(value)]), nil}
+  defp field(key, value, _previous, _depth), do: {value, block([term(key), term(value)]), nil}
 
   defp term(value) do
     <<131, body::binary>> = :erlang.term_to_binary(value)

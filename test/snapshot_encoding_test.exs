@@ -40,4 +40,24 @@ defmodule AttentionServer.Store.SnapshotEncodingTest do
     {payload, _cache} = SnapshotEncoding.encode(next, 27, cache)
     assert :erlang.binary_to_term(payload) == expected(next)
   end
+
+  test "origin history remains readable across entry append, delivery update and removal" do
+    key = {"person", "origin"}
+    entry = %{"text" => :crypto.strong_rand_bytes(100_000), "delivered" => false}
+    engine = %{Engine.new() | origin_feeds: %{key => %{high: 1, entries: %{1 => entry}}}}
+    {payload, cache} = SnapshotEncoding.encode(engine, 27)
+    assert :erlang.binary_to_term(payload) == expected(engine)
+
+    next = put_in(engine.origin_feeds[key], %{high: 2, entries: %{1 => entry, 2 => entry}})
+    {payload, cache} = SnapshotEncoding.encode(next, 27, cache)
+    assert :erlang.binary_to_term(payload) == expected(next)
+
+    next = put_in(next.origin_feeds[key].entries[1]["delivered"], true)
+    {payload, cache} = SnapshotEncoding.encode(next, 27, cache)
+    assert :erlang.binary_to_term(payload) == expected(next)
+
+    next = %{next | origin_feeds: %{}}
+    {payload, _} = SnapshotEncoding.encode(next, 27, cache)
+    assert :erlang.binary_to_term(payload) == expected(next)
+  end
 end
