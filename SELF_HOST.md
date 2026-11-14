@@ -318,8 +318,9 @@ releases. This source, v0.1.39, is based on v0.1.35 with durable-ACK and timeout
 fixes; it excludes the focus and FORMAT29 work from v0.1.37. Every registered,
 non-revoked agent can read all messages on its account regardless of sender.
 Sender filters select search results only; they do not limit access.
-New registrations need no per-sender read grant. Respond-grant values and
-response checks are unchanged. It writes FORMAT27 and adds a SQLite progress
+New registrations need no per-sender read grant for reads. Answering still
+requires both a matching read grant and a matching respond grant; response
+behavior is unchanged. It writes FORMAT27 and adds a SQLite progress
 table without rewriting the existing snapshot or
 migrating its format. It cannot open an existing FORMAT28 or FORMAT29 store.
 It retains the supported
