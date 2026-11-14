@@ -123,6 +123,26 @@ defmodule AttentionServer.AgentHTTPSTest do
              )
   end
 
+  test "large client request reaches the existing Agent HTTPS body boundary", context do
+    %{certs: certs, server: server, relay: relay} = context
+    person = bootstrap(relay, certs, "a1")
+
+    {:ok, agent_key} =
+      DeviceIdentity.from_certificate(TLSFixtures.certificate_der!(certs, "unknown"))
+
+    register(server, certs, "a1", person, agent_key)
+    endpoint = endpoint(certs, Server.agent_port(server))
+
+    request = %{
+      "v" => 1,
+      "type" => "search",
+      "text" => String.duplicate("x", 2 * 1024 * 1024)
+    }
+
+    assert {:ok, 400, %{"type" => "error", "reason" => "bad_frame"}} =
+             agent_https(endpoint, certs, "unknown", request)
+  end
+
   test "non-object JSON roots return 400 without restarting Relay or mutating SQLite", context do
     %{certs: certs, server: server, relay: relay} = context
     person = bootstrap(relay, certs, "a1")
