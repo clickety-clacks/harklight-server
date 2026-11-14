@@ -352,7 +352,7 @@ defmodule AttentionServer.PushAlertTest do
     assert claimed.push_bindings[{@person, @device}].state == "sending"
   end
 
-  test "a new request is eligible immediately and pending highs coalesce at claim time" do
+  test "new requests keep the five-minute window and pending highs coalesce at claim time" do
     {:ok, engine} = Engine.setup_person(Engine.new(), @person)
     {:ok, engine} = Engine.setup_device(engine, @person, @device)
     {:ok, engine} = Engine.setup_device(engine, @person, @origin)
@@ -396,7 +396,7 @@ defmodule AttentionServer.PushAlertTest do
 
     opened = binding.(engine)
     assert opened.state == "queued"
-    assert opened.next_at in before..after_first
+    assert opened.next_at in (before + 300_000)..(after_first + 300_000)
     assert is_integer(opened.deadline_at)
 
     # A claim before the queued event is not due.
@@ -420,7 +420,7 @@ defmodule AttentionServer.PushAlertTest do
     after_third = System.system_time(:millisecond)
     in_flight = binding.(engine)
     assert in_flight.state == "sending"
-    assert in_flight.next_at in before_third..after_third
+    assert in_flight.next_at in (before_third + 300_000)..(after_third + 300_000)
 
     accepted = %{state: "provider_accepted", http_status: 200}
     assert {:ok, engine} = Engine.finish_push(engine, claim, accepted, opened.next_at + 1)

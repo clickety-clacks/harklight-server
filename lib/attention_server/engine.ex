@@ -28,6 +28,7 @@ defmodule AttentionServer.Engine do
   @terminal_states ~w(answered cleared expired superseded)
   @pending_types ~w(resync ack push_register push_remove push_status)
   @push_claim_timeout_ms 30_000
+  @push_window_ms 300_000
   @maintainer_scopes MapSet.new(~w(devices senders view_items configure))
 
   defstruct relay_instance_id: nil,
@@ -5923,8 +5924,8 @@ defmodule AttentionServer.Engine do
             fresh =
               binding.pending_high == 0 and binding.pending_conversation_high == 0
 
-            # New work becomes eligible immediately; pending highs still coalesce
-            # when the dispatcher claims them after the committing event.
+            # Preserve the established five-minute notification pacing. A new
+            # high during an in-flight push opens the next window.
             opens_window? =
               fresh or
                 (binding.state == "sending" and high > binding.pending_high and
@@ -5932,7 +5933,7 @@ defmodule AttentionServer.Engine do
 
             deadline_at = if opens_window?, do: now_ms, else: binding.deadline_at
 
-            next_at = if opens_window?, do: now_ms, else: binding.next_at
+            next_at = if opens_window?, do: now_ms + @push_window_ms, else: binding.next_at
 
             state =
               cond do
@@ -5988,7 +5989,7 @@ defmodule AttentionServer.Engine do
 
             deadline_at = if opens_window?, do: now_ms, else: binding.deadline_at
 
-            next_at = if opens_window?, do: now_ms, else: binding.next_at
+            next_at = if opens_window?, do: now_ms + @push_window_ms, else: binding.next_at
 
             state =
               cond do

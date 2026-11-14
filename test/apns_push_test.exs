@@ -209,7 +209,7 @@ defmodule AttentionServer.APNSPushTest do
       presentation: :background
     }
 
-    {outcome, _cached_token} = APNS.send(apns_options(ctx), claim, nil)
+    {outcome, _cached_token} = APNS.send(APNS.prepare!(apns_options(ctx)), claim, nil)
 
     assert outcome.state == "retry"
     assert outcome.retry_after_ms == 86_401_000
@@ -234,7 +234,7 @@ defmodule AttentionServer.APNSPushTest do
       presentation: :background
     }
 
-    {outcome, _token_cache} = APNS.send(apns_options(ctx), claim, nil)
+    {outcome, _token_cache} = APNS.send(APNS.prepare!(apns_options(ctx)), claim, nil)
 
     assert outcome.state == "endpoint_invalid"
     assert outcome.http_status == 410
@@ -387,7 +387,7 @@ defmodule AttentionServer.APNSPushTest do
       presentation: :alert
     }
 
-    {outcome, _cached_token} = APNS.send(apns_options(ctx), claim, nil)
+    {outcome, _cached_token} = APNS.send(APNS.prepare!(apns_options(ctx)), claim, nil)
 
     assert outcome.state == "provider_accepted"
     assert_receive {:apns_request, "POST", _path, headers, _body}, 12_000
