@@ -175,18 +175,23 @@ its connection indicator stays Unknown without a real presence signal.
 
 ## Durable upgrade boundary
 
-This release, v0.1.37, writes FORMAT29. From supported FORMAT27 state such as
+This release, v0.1.40, writes FORMAT29. From supported FORMAT27 state such as
 that written by v0.1.36, first start applies two ordered steps: it adds
 `see_focus: false` and `push_view: false` only where device records lack those
 values, preserving existing values, then initializes the hosted
 `delivery_states` map to empty. The final migrated store is FORMAT29; a
-separately persisted intermediate FORMAT28 state is not established. The
-v0.1.35 and v0.1.36 packages write FORMAT27 and cannot read FORMAT29; changing
-the code back alone does not restore compatibility.
+separately persisted intermediate FORMAT28 state is not established.
+Every registered, non-revoked agent can read all messages on its account,
+regardless of sender. Sender filters select search results only; they do not
+limit access. New registrations need no per-sender read grant for reads.
+Answering still requires both a matching read grant and a matching respond
+grant; response behavior is unchanged. The v0.1.35, v0.1.36,
+v0.1.38, and planned v0.1.39 packages write FORMAT27 and cannot read FORMAT29;
+changing the code back alone does not restore compatibility.
 
-Before the first v0.1.37 start, stop the server and take a complete private-state
-backup. After any v0.1.37 write, returning to v0.1.36 requires stopping the
-server, restoring that pre-start backup and selecting v0.1.36. This loses every
+Before the first v0.1.40 start, stop the server and take a complete private-state
+backup. After any v0.1.40 write, returning to v0.1.39 requires stopping the
+server, restoring that pre-start backup and selecting v0.1.39. This loses every
 write made since the backup and cannot undo external notifications, bounces or
 agent deliveries. Restore success is unproved and has not been tested; see
 SELF_HOST.md for the recovery limits. Older package formats are summarized in
