@@ -1572,7 +1572,7 @@ defmodule AttentionServer.Store do
              result =
                run(
                  db,
-                 "DELETE FROM #{table} WHERE EXISTS (SELECT 1 FROM relay_inbox_snapshots s WHERE s.person_id = #{table}.person_id AND s.device_id = #{table}.device_id AND s.snapshot_id = #{table}.snapshot_id AND #{where})",
+                 "DELETE FROM #{table} WHERE #{where}",
                  params
                )
 
