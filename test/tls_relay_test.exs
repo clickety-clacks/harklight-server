@@ -225,15 +225,14 @@ defmodule AttentionServer.TLSRelayTest do
   end
 
   @tag :writer_isolation
-  test "healthy traffic does not reauthorize other stalled peers", ctx do
+  test "healthy traffic does not scan other stalled writers", ctx do
     stalled = Enum.map(~w(a1 a2), &blocked_session(ctx, &1))
     {:ok, healthy} = connect(ctx.tls, ctx.certs, "b1")
     assert {[], %{"seq" => 0}} = resync(healthy)
 
-    # Trace only the two stalled identities in the shared Relay. This observes
-    # cross-session authorization work without a machine-speed timing threshold.
-    pattern = Enum.map(~w(a1 a2), fn name -> {[:_, ctx.keys[name]], [], [true]} end)
-    :erlang.trace_pattern({AttentionServer.Engine, :authorized_person, 2}, pattern, [:local])
+    # Observe pending-write authority checks during real traffic, without a
+    # machine-speed threshold or counting unrelated delivery authorization.
+    :erlang.trace_pattern({Relay, :socket_authorized?, 2}, true, [:local])
     :erlang.trace(ctx.relay, true, [:call, :arity])
 
     try do
@@ -248,11 +247,11 @@ defmodule AttentionServer.TLSRelayTest do
       assert {:ok, _} = Relay.acknowledged_cursor(ctx.relay, ctx.keys["b1"])
       ref = :erlang.trace_delivered(ctx.relay)
       assert_receive {:trace_delivered, _, ^ref}
-      refute_received {:trace, _, :call, {AttentionServer.Engine, :authorized_person, 2}}
+      refute_received {:trace, _, :call, {Relay, :socket_authorized?, 2}}
       Enum.each(stalled, fn {_, _, _, task, _} -> assert Task.yield(task, 0) == nil end)
     after
       :erlang.trace(ctx.relay, false, [:call])
-      :erlang.trace_pattern({AttentionServer.Engine, :authorized_person, 2}, false, [:local])
+      :erlang.trace_pattern({Relay, :socket_authorized?, 2}, false, [:local])
 
       Enum.each(stalled, fn {peer, id, _, task, _} ->
         Relay.close_session(ctx.relay, id)
