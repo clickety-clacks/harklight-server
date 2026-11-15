@@ -357,7 +357,7 @@ defmodule AttentionServer.OriginWire do
   end
 
   defp dispatch_operation(relay, key, frame) do
-    if JSON.ui1_duplicate_request?(frame) do
+    if JSON.ui1_duplicate_request?(frame) or AttentionServer.LargeData.contains_ref?(frame) do
       Relay.request_frame(relay, key, frame)
     else
       Relay.request_line(relay, key, JSON.encode!(frame) <> "\n")
@@ -390,6 +390,23 @@ defmodule AttentionServer.OriginWire do
   def http_response(status, value) do
     body = JSON.encode!(value)
 
+    response(response_status(status, value), body, byte_size(body))
+  end
+
+  @doc false
+  def send_http_response(socket, status, value) do
+    size = JSON.encoded_size(value)
+    header = response(response_status(status, value), nil, size)
+
+    with :ok <- :ssl.send(socket, header) do
+      JSON.send_stream(socket, value)
+    end
+  end
+
+  defp response_status(200, %{"type" => "error", "reason" => "storage_unavailable"}), do: 503
+  defp response_status(status, _value), do: status
+
+  defp response(status, body, size) do
     reason =
       case status do
         200 -> "OK"
@@ -405,10 +422,10 @@ defmodule AttentionServer.OriginWire do
     [
       "HTTP/1.1 #{status} #{reason}\r\n",
       "Content-Type: application/json; charset=utf-8\r\n",
-      "Content-Length: #{byte_size(body)}\r\n",
+      "Content-Length: #{size}\r\n",
       "Cache-Control: no-store\r\n",
       "Connection: close\r\n\r\n",
-      body
+      body || []
     ]
   end
 

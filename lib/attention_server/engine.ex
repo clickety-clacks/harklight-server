@@ -22,6 +22,7 @@ defmodule AttentionServer.Engine do
     ConversationFiles,
     DeviceIdentity,
     JSON,
+    LargeData,
     Message,
     SenderNames
   }
@@ -2130,7 +2131,7 @@ defmodule AttentionServer.Engine do
   defp request_value(engine, principal, value, request_at) do
     swept = sweep_request_defaults(engine, principal.person, value, request_at)
     {next, frame} = handle_frame(swept, Map.put(principal, :request_at, request_at), value)
-    {next, {:ok, JSON.encode!(frame) <> "\n"}}
+    {next, {:ok, JSON.encode_line(frame)}}
   end
 
   @doc "Commits every due open default using the supplied server time."
@@ -6116,10 +6117,11 @@ defmodule AttentionServer.Engine do
     body = Map.get(message, "body")
 
     preview =
-      if is_binary(body) and String.trim(body) != "" do
-        body
-      else
-        message["title"]
+      cond do
+        is_binary(body) and String.trim(body) != "" -> body
+        LargeData.ref?(body) -> LargeData.preview(body, 161)
+        LargeData.ref?(message["title"]) -> LargeData.preview(message["title"], 161)
+        true -> message["title"]
       end
 
     {bounded_preview, truncated?} = push_preview(preview)
@@ -6567,6 +6569,9 @@ defmodule AttentionServer.Engine do
           Map.put(frame, "answer_outcome", %{"kind" => "seen"})
 
         {_, "answer", true, answer} when is_binary(answer) ->
+          Map.put(frame, "answer_outcome", %{"kind" => "reply", "text" => answer})
+
+        {_, "answer", true, %AttentionServer.LargeData.Ref{} = answer} ->
           Map.put(frame, "answer_outcome", %{"kind" => "reply", "text" => answer})
 
         _ ->

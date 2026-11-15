@@ -1,7 +1,7 @@
 defmodule AttentionServer.JevRankingTest do
   use ExUnit.Case, async: true
 
-  alias AttentionServer.{JSON, JevClient, JevRanking, Placement}
+  alias AttentionServer.{JSON, JevClient, JevRanking, LargeData, Placement}
 
   @endpoint "https://example.com/v1/systemone"
   @model "jev-latest"
@@ -15,7 +15,7 @@ defmodule AttentionServer.JevRankingTest do
       origin_target: Map.get(options, :origin_target),
       message:
         %{
-          "title" => "Item #{n}",
+          "title" => Map.get(options, :title, "Item #{n}"),
           "body" => body,
           "urgency" => Map.get(options, :urgency, "normal")
         }
@@ -96,6 +96,24 @@ defmodule AttentionServer.JevRankingTest do
 
     assert length(entries) == length(items) + 1
     assert Enum.any?(entries, &(&1["message_id"] == "211"))
+  end
+
+  test "disk-backed title stays clipped by the existing ranking budget without materializing it" do
+    title = String.duplicate("t", 2 * 1024 * 1024 + 1)
+
+    path =
+      Path.join(
+        System.tmp_dir!(),
+        "attention-ranking-large-title-#{System.unique_integer([:positive])}"
+      )
+
+    File.write!(path, title)
+    on_exit(fn -> File.rm(path) end)
+    hash = Base.encode16(:crypto.hash(:sha256, title), case: :lower)
+    ref = %LargeData.Ref{id: hash, size: byte_size(title), sha256: hash, path: path}
+
+    assert {:error, :request_too_large} =
+             JevClient.compose([item(1, "", %{title: ref})], @endpoint, @model, @now)
   end
 
   test "unchanged batches are reused, a revision or departure re-scores only its batch" do

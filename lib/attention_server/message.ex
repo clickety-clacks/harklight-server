@@ -57,11 +57,11 @@ defmodule AttentionServer.Message do
       {"sender_id", &sender_id?/1},
       {"message_id", &nonempty?/1},
       {"created_at", &is_integer/1},
-      {"title", &nonempty?/1}
+      {"title", &(nonempty?(&1) or AttentionServer.LargeData.ref?(&1))}
     ]
 
     optional = [
-      {"body", &is_binary/1},
+      {"body", &(is_binary(&1) or AttentionServer.LargeData.ref?(&1))},
       {"answer_ui", &plain_object?/1},
       {"callback", &plain_object?/1},
       {"open", &valid_open?/1}
