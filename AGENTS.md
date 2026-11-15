@@ -12,9 +12,12 @@ commits, with the temporary maintenance exception below.
 - Work on a short-lived branch from current `main` and merge through a pull
   request within a day or two. Split larger work into reviewed slices behind a
   default-off feature flag instead of keeping a long-running branch.
-- Keep `main` releasable. Merge when Server CI passes and an independent reviewer
-  who did not write the change has reviewed it clean. Keep the branch current
-  with `main` and delete it after its work has merged.
+- Keep `main` releasable. Merge a PR to `main`, or to maintenance for an emergency
+  fix, once checks show no failure the base does not already have. Independent
+  review runs alongside; fix findings in follow-up PRs. Do not hold a green PR
+  for review. Compare failures with the base rather than waiving checks, and
+  respect repository protections. Keep the branch current with `main` and delete
+  it after its work has merged.
 - Do not create release, candidate or notes branches. Release notes and package
   metadata change through ordinary PRs to `main`.
 - If `main` breaks, restoring it takes priority; revert when that is the quickest
@@ -75,8 +78,8 @@ same artifact for clean-install evidence and publication. The package bundles
 ERTS, native dependencies, CLIs, guides and assembled skills; source CI alone
 does not prove these work together.
 
-Treat FORMAT migration and upgrade rehearsals as release acceptance evidence.
-Exercise the packaged release with isolated representative state from supported
+Before publishing a store-upgrading release, complete isolated FORMAT migration
+and upgrade rehearsals as release acceptance evidence. Exercise the packaged release with isolated representative state from supported
 prior formats, checking retained data and authority, migration, restart and
 recovery behavior. Follow the compatibility and backup limits in `SELF_HOST.md`:
 one writer per database, no repeated bootstrap, and no assumption that switching
@@ -87,8 +90,10 @@ test state isolated from live state and external provider sends.
 
 ## Releases and installation
 
-Tag reviewed `main` commits as `vMAJOR.MINOR.PATCH` and publish the verified
-package, checksum and guide through the available release route. Tagging and
+Before tagging a release, every change it includes must have a clean independent
+review by a reviewer who did not author it. Tag the resulting `main` commit as
+`vMAJOR.MINOR.PATCH` and publish the verified package, checksum and guide through
+the available release route. Tagging and
 publishing need no additional human approval. Fix a bad release on `main` and
 ship a new release; do not patch a deployment by hand.
 
