@@ -152,6 +152,7 @@ defmodule AttentionServer.Engine do
             else: binding.accepted_conversation_high
 
         claim = %{
+          server: engine.relay_instance_id,
           person: person,
           device: device,
           revision: binding.revision,

@@ -697,6 +697,8 @@ defmodule AttentionServer.Relay do
           {:ok, store} ->
             state = %{
               store: store,
+              feature_flags_path: Keyword.get(opts, :feature_flags_path),
+              feature_flags_warned: false,
               clock: Keyword.get(opts, :clock, fn -> System.system_time(:millisecond) end),
               default_index: Engine.default_index(store.engine),
               default_timer: nil,
@@ -4509,10 +4511,12 @@ defmodule AttentionServer.Relay do
       true ->
         case InboxPaging.attach(state.store, state.store.engine, session.key, frame) do
           {:ok, %{reply: reply, events: events, barrier: barrier, since: since}, snapshot} ->
+            {resynced, state} = resynced_frame(state, barrier)
+
             frames =
               [line(reply)] ++
                 Enum.map(events, &line/1) ++
-                [line(%{"v" => 1, "type" => "resynced", "seq" => barrier})]
+                [line(resynced)]
 
             updated = %{
               session
@@ -4624,6 +4628,21 @@ defmodule AttentionServer.Relay do
   defp wire_reason({:invalid_field, _}), do: "invalid_field"
   defp wire_reason(_), do: "storage_unavailable"
 
+  defp resynced_frame(state, high) do
+    {flags, warned} =
+      AttentionServer.FeatureFlags.read(state.feature_flags_path, state.feature_flags_warned)
+
+    frame = %{
+      "v" => 1,
+      "type" => "resynced",
+      "seq" => high,
+      "server" => state.store.engine.relay_instance_id,
+      "feature_flags" => flags
+    }
+
+    {frame, %{state | feature_flags_warned: warned}}
+  end
+
   defp resync(state, id, session, frame) do
     case Engine.events(state.store.engine, session.key, frame["since"]) do
       {:ok, events, high} ->
@@ -4637,9 +4656,10 @@ defmodule AttentionServer.Relay do
             sync_mode: :legacy
         }
 
+        {resynced, state} = resynced_frame(state, high)
+
         frames =
-          [ok_line(frame, %{})] ++
-            Enum.map(events, &line/1) ++ [line(%{"v" => 1, "type" => "resynced", "seq" => high})]
+          [ok_line(frame, %{})] ++ Enum.map(events, &line/1) ++ [line(resynced)]
 
         {{:ok, frames}, put_session(state, id, updated)}
 

@@ -28,6 +28,8 @@ defmodule AttentionServer.APNS do
     "attention" => %{"v" => 1, "type" => "sync"}
   }
   @max_payload_bytes 4_096
+  # Reserve the mandatory persisted 32-hex identity while fitting alert text.
+  @server_field_bytes byte_size(~s(,"server":"00000000000000000000000000000000"))
   @neutral_sender_label "Sender"
   @response_limit 16_384
   @connect_timeout 5_000
@@ -283,10 +285,18 @@ defmodule AttentionServer.APNS do
     error -> {:error, error}
   end
 
-  defp request_payload(%{presentation: :background} = claim),
+  defp request_payload(claim) do
+    claim
+    |> presentation_payload()
+    |> put_in(["attention", "server"], Map.fetch!(claim, :server))
+  end
+
+  defp presentation_payload(%{presentation: :background} = claim),
     do: put_badge(@background_payload, Map.get(claim, :badge))
 
-  defp request_payload(%{presentation: :alert, locator: %{"target" => "chat"} = locator} = claim) do
+  defp presentation_payload(
+         %{presentation: :alert, locator: %{"target" => "chat"} = locator} = claim
+       ) do
     unless valid_locator?(locator), do: raise(ArgumentError, "invalid chat locator")
     alert = claim.alert
 
@@ -304,7 +314,7 @@ defmodule AttentionServer.APNS do
     end
   end
 
-  defp request_payload(
+  defp presentation_payload(
          %{
            presentation: :alert,
            alert: %{"title" => title},
@@ -324,7 +334,7 @@ defmodule AttentionServer.APNS do
     end
   end
 
-  defp request_payload(%{presentation: :alert, alert: %{"title" => title} = alert} = claim) do
+  defp presentation_payload(%{presentation: :alert, alert: %{"title" => title} = alert} = claim) do
     body = Map.get(alert, "body")
     preview_truncated? = Map.get(alert, "body_truncated", false)
     preserve_title? = Map.get(claim, :preserve_alert_title, false)
@@ -367,7 +377,7 @@ defmodule AttentionServer.APNS do
     end
   end
 
-  defp request_payload(claim), do: put_badge(@alert_payload, Map.get(claim, :badge))
+  defp presentation_payload(claim), do: put_badge(@alert_payload, Map.get(claim, :badge))
 
   defp fit_alert_with_optional_locator(
          title,
@@ -614,7 +624,7 @@ defmodule AttentionServer.APNS do
     end
   end
 
-  defp payload_size(payload), do: payload |> JSON.encode!() |> byte_size()
+  defp payload_size(payload), do: byte_size(JSON.encode!(payload)) + @server_field_bytes
 
   defp valid_locator?(
          %{

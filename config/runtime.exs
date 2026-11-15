@@ -134,6 +134,7 @@ if System.get_env("ATTENTION_SERVER_ENABLE") == "1" do
     join_name: System.get_env("ATTENTION_SERVER_JOIN_NAME"),
     deployment_mode: deployment_mode,
     jev_score_record_path: System.get_env("ATTENTION_SERVER_JEV_SCORE_RECORD_PATH"),
+    feature_flags_path: System.get_env("ATTENTION_SERVER_FEATURE_FLAGS_PATH"),
     upload_cap: upload_cap
   ]
 

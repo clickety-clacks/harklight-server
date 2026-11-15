@@ -486,3 +486,16 @@ It preserves dependency notices, records BUILD_INFO and writes tarball/SHA256SUM
 timestamps, owners and gzip headers are normalized; full toolchain bit-for-bit
 reproducibility is not claimed. Build from the clean intended commit and use
 that same artifact for clean-install evidence and publication.
+
+### Client feature flags
+
+Optionally set `ATTENTION_SERVER_FEATURE_FLAGS_PATH` to a small nonsecret JSON
+object file containing names and boolean values. The Server includes those
+booleans in `resynced.feature_flags`, alongside its persisted identity in
+`resynced.server`. It reads the file at each new resynced construction, so file
+changes reach the next connection without restarting. No flags or defaults
+are hardcoded on the Server; omitted names use the app's built-in defaults.
+Nonboolean entries are ignored. An unset path yields `{}`. A missing, unreadable
+or malformed configured file also yields `{}` and logs one warning per Relay
+lifetime without preventing startup or sync. APNs `attention.server` carries
+the same persisted identity.

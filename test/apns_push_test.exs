@@ -91,6 +91,7 @@ defmodule AttentionServer.APNSPushTest do
   @provider_profile "harklight-sandbox"
   @production_profile "harklight-production"
   @device_token String.duplicate("ab", 32)
+  @test_server String.duplicate("a1", 16)
 
   setup_all do
     certs = TLSFixtures.create!()
@@ -171,6 +172,7 @@ defmodule AttentionServer.APNSPushTest do
       )
 
     claim = %{
+      server: @test_server,
       claim_id: claim_id,
       profile_id: @provider_profile,
       address: @device_token,
@@ -202,6 +204,7 @@ defmodule AttentionServer.APNSPushTest do
     end)
 
     claim = %{
+      server: @test_server,
       claim_id: op(97),
       profile_id: @provider_profile,
       address: @device_token,
@@ -227,6 +230,7 @@ defmodule AttentionServer.APNSPushTest do
     end)
 
     claim = %{
+      server: @test_server,
       claim_id: op(98),
       profile_id: @provider_profile,
       address: @device_token,
@@ -307,6 +311,7 @@ defmodule AttentionServer.APNSPushTest do
     body_preview = String.duplicate("名", 160)
 
     claim = %{
+      server: @test_server,
       claim_id: op(97),
       profile_id: @provider_profile,
       address: @device_token,
@@ -330,6 +335,7 @@ defmodule AttentionServer.APNSPushTest do
              JSON.decode_line(body <> "\n")
 
     assert String.ends_with?(title, "…")
+    assert payload["attention"]["server"] == @test_server
     assert payload["attention"]["locator"] == locator
 
     legacy_claim =
@@ -349,7 +355,7 @@ defmodule AttentionServer.APNSPushTest do
                "alert" => %{"title" => "Legacy sender", "body" => "Legacy preview"},
                "content-available" => 1
              },
-             "attention" => %{"v" => 1, "type" => "sync"}
+             "attention" => %{"v" => 1, "type" => "sync", "server" => @test_server}
            }
   end
 
@@ -362,6 +368,7 @@ defmodule AttentionServer.APNSPushTest do
     assert {"apns-collapse-id", "attention-chat-sync"} in headers
     assert byte_size(body) <= 4_096
     assert {:ok, payload} = JSON.decode_line(body <> "\n")
+    assert payload["attention"]["server"] == @test_server
     assert payload["attention"]["locator"] == claim.locator
     assert payload["aps"]["content-available"] == 1
     assert payload["aps"]["badge"] == 2
@@ -373,6 +380,7 @@ defmodule AttentionServer.APNSPushTest do
     assert_receive {:apns_request, "POST", _path, headers, body}, 12_000
     assert {"apns-collapse-id", "attention-sync"} in headers
     assert {:ok, payload} = JSON.decode_line(body <> "\n")
+    assert payload["attention"]["server"] == @test_server
     assert payload["attention"]["locator"] == ordinary.locator
   end
 
@@ -380,6 +388,7 @@ defmodule AttentionServer.APNSPushTest do
     now = System.system_time(:millisecond)
 
     claim = %{
+      server: @test_server,
       claim_id: op(91),
       profile_id: @provider_profile,
       address: @device_token,
@@ -418,6 +427,7 @@ defmodule AttentionServer.APNSPushTest do
     assert_receive {:apns_request, "POST", _, _, body}, 12_000
     assert byte_size(body) <= 4_096
     assert {:ok, payload} = JSON.decode_line(body <> "\n")
+    assert payload["attention"]["server"] == @test_server
     assert payload["attention"]["locator"] == claim.locator
     assert payload["aps"]["alert"]["title"] == "Agent"
     assert String.ends_with?(payload["aps"]["alert"]["body"], "…")
@@ -441,6 +451,7 @@ defmodule AttentionServer.APNSPushTest do
     now = System.system_time(:millisecond)
 
     %{
+      server: @test_server,
       claim_id: op(96),
       profile_id: @provider_profile,
       address: @device_token,
@@ -482,6 +493,7 @@ defmodule AttentionServer.APNSPushTest do
     exact_names = String.duplicate("名", 90) <> "A, " <> String.duplicate("界", 90) <> "B"
 
     claim = %{
+      server: @test_server,
       claim_id: op(92),
       profile_id: @provider_profile,
       address: @device_token,
@@ -545,6 +557,7 @@ defmodule AttentionServer.APNSPushTest do
     now = System.system_time(:millisecond)
 
     claim = %{
+      server: @test_server,
       claim_id: op(90),
       profile_id: @provider_profile,
       address: @device_token,
@@ -653,7 +666,13 @@ defmodule AttentionServer.APNSPushTest do
     assert {:ok, payload} = JSON.decode_line(body <> "\n")
     assert payload["aps"]["alert"]["body"] == "Long identity fixture"
     assert payload["aps"]["badge"] == 1
-    assert payload["attention"] == %{"v" => 1, "type" => "sync"}
+
+    assert payload["attention"] == %{
+             "v" => 1,
+             "type" => "sync",
+             "server" => engine.relay_instance_id
+           }
+
     refute Map.has_key?(payload["attention"], "locator")
 
     assert {:ok, engine} =
@@ -714,6 +733,8 @@ defmodule AttentionServer.APNSPushTest do
              )
 
     assert :ok = Relay.setup_sender(relay, a1_key, "app:test")
+    persisted_server = :sys.get_state(relay).store.engine.relay_instance_id
+    assert persisted_server =~ ~r/\A[0-9a-f]{32}\z/
 
     assert {:ok, unknown_key} =
              DeviceIdentity.from_certificate(TLSFixtures.certificate_der!(certs, "unknown"))
@@ -739,7 +760,9 @@ defmodule AttentionServer.APNSPushTest do
 
     {:ok, app_socket} = connect(first_server, certs, "a2")
     assert upgrade(app_socket) =~ "101 Switching Protocols"
-    assert {[], %{"seq" => 0}} = resync(app_socket)
+
+    assert {[], %{"seq" => 0, "server" => ^persisted_server, "feature_flags" => %{}}} =
+             resync(app_socket)
 
     assert :ok =
              send_request(app_socket, %{
@@ -826,7 +849,10 @@ defmodule AttentionServer.APNSPushTest do
     assert String.starts_with?(headers["authorization"], "bearer ")
     assert {:ok, payload} = JSON.decode_line(body <> "\n")
 
-    assert payload == %{
+    assert payload["attention"]["server"] == persisted_server
+    assert :sys.get_state(Server.relay(server)).store.engine.relay_instance_id == persisted_server
+
+    assert put_in(payload, ["attention"], Map.delete(payload["attention"], "server")) == %{
              "aps" => %{
                "alert" => %{
                  "title" => "  Agent\nλ / name  ",
@@ -870,7 +896,9 @@ defmodule AttentionServer.APNSPushTest do
     relay = Server.relay(server)
     assert {:ok, app_socket} = connect(server, certs, "a2")
     assert upgrade(app_socket) =~ "101 Switching Protocols"
-    assert {[%{"type" => "delivery", "seq" => 1}], %{"seq" => 1}} = resync(app_socket)
+
+    assert {[%{"type" => "delivery", "seq" => 1}], %{"seq" => 1, "server" => ^persisted_server}} =
+             resync(app_socket)
 
     assert_push_state(app_socket, "ready")
 
@@ -938,7 +966,7 @@ defmodule AttentionServer.APNSPushTest do
 
     assert quiet_payload == %{
              "aps" => %{"badge" => 0, "content-available" => 1},
-             "attention" => %{"v" => 1, "type" => "sync"}
+             "attention" => %{"v" => 1, "type" => "sync", "server" => persisted_server}
            }
 
     assert :ok =
@@ -1148,6 +1176,7 @@ defmodule AttentionServer.APNSPushTest do
     now = System.system_time(:millisecond)
 
     claim = %{
+      server: @test_server,
       claim_id: op(85),
       profile_id: @production_profile,
       address: String.duplicate("cd", 32),
@@ -1523,6 +1552,7 @@ defmodule AttentionServer.APNSPushTest do
     now = System.system_time(:millisecond)
 
     %{
+      server: @test_server,
       claim_id: op(70),
       profile_id: @provider_profile,
       address: @device_token,
@@ -1767,7 +1797,7 @@ defmodule AttentionServer.APNSPushTest do
 
   defp drain_resync(socket, events) do
     case reply(socket) do
-      %{"type" => "resynced", "seq" => high} -> {Enum.reverse(events), %{"seq" => high}}
+      %{"type" => "resynced"} = frame -> {Enum.reverse(events), frame}
       event -> drain_resync(socket, [event | events])
     end
   end

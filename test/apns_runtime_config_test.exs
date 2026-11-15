@@ -7,6 +7,7 @@ defmodule AttentionServer.APNSRuntimeConfigTest do
   @server_env %{
     "ATTENTION_SERVER_ENABLE" => "1",
     "ATTENTION_SERVER_JEV_SCORE_RECORD_PATH" => nil,
+    "ATTENTION_SERVER_FEATURE_FLAGS_PATH" => nil,
     "ATTENTION_SERVER_STORE_PATH" => "/tmp/harklight-config-test/relay.sqlite3",
     "ATTENTION_SERVER_CERTFILE" => "/tmp/harklight-config-test/server.pem",
     "ATTENTION_SERVER_KEYFILE" => "/tmp/harklight-config-test/server.key",
@@ -62,6 +63,22 @@ defmodule AttentionServer.APNSRuntimeConfigTest do
 
         writer = :sys.get_state(relay).applied_score_record
         assert :sys.get_state(writer).path == "/unused/scores.jsonl"
+      end
+    )
+  end
+
+  test "optional feature flag path reaches the relay without reading it at startup", %{
+    certs: certs
+  } do
+    with_env(
+      Map.put(@server_env, "ATTENTION_SERVER_FEATURE_FLAGS_PATH", "/unused/test-flags.json"),
+      fn ->
+        opts = runtime_server_opts(certs)
+        assert opts[:feature_flags_path] == "/unused/test-flags.json"
+        server = start_server(opts)
+
+        assert :sys.get_state(Server.relay(server)).feature_flags_path ==
+                 "/unused/test-flags.json"
       end
     )
   end
