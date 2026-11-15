@@ -232,7 +232,7 @@ defmodule AttentionServer.AgentHTTPS do
         Diagnostics.failure(:agent_https, :relay_boundary, reason, :outcome_unknown, nil, relay)
         :ok
     after
-      :ssl.close(socket)
+      AttentionServer.SessionWriter.close(socket)
     end
   end
 

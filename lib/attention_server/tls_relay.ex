@@ -153,7 +153,7 @@ defmodule AttentionServer.TLSRelay do
       # A stopped Relay ends its socket workers during shutdown/restart.
       :exit, _ -> :ok
     after
-      :ssl.close(socket)
+      AttentionServer.SessionWriter.close(socket)
     end
   end
 

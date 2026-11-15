@@ -263,7 +263,7 @@ defmodule AttentionServer.WebSocketRelay do
         :ok
     after
       cleanup_fragment_file()
-      :ssl.close(socket)
+      AttentionServer.SessionWriter.close(socket)
     end
   end
 
@@ -388,7 +388,7 @@ defmodule AttentionServer.WebSocketRelay do
             loop(socket, relay, session, rest, next_fragment)
 
           {:error, :storage_unavailable} ->
-            send_storage_unavailable(socket, relay)
+            send_storage_unavailable(relay, session)
 
           _ ->
             :ok
@@ -403,7 +403,7 @@ defmodule AttentionServer.WebSocketRelay do
 
               {:error, :storage_unavailable} ->
                 _ = File.rm(path)
-                send_storage_unavailable(socket, relay)
+                send_storage_unavailable(relay, session)
 
               _ ->
                 :ok
@@ -411,7 +411,7 @@ defmodule AttentionServer.WebSocketRelay do
 
           {:error, reason} ->
             Diagnostics.failure(:device_relay, :request_read, reason, :closed)
-            if reason == :storage_unavailable, do: send_storage_unavailable(socket, relay)
+            if reason == :storage_unavailable, do: send_storage_unavailable(relay, session)
             :ok
         end
 
@@ -603,29 +603,29 @@ defmodule AttentionServer.WebSocketRelay do
     end
   end
 
-  defp send_storage_unavailable(socket, _relay) do
+  defp send_storage_unavailable(relay, session) do
     Diagnostics.failure(:device_relay, :request_read, :storage_unavailable, :rejected)
-    _ = :ssl.send(socket, encode_frame(1, @storage_unavailable))
+    _ = Relay.session_send(relay, session, [@storage_unavailable])
     :ok
   end
 
-  defp handle_frame(socket, _relay, _session, true, 8, payload, _fragment) do
+  defp handle_frame(_socket, relay, session, true, 8, payload, _fragment) do
     _ =
       Diagnostics.result(
         :device_relay,
         :response_write,
-        :ssl.send(socket, encode_frame(8, payload)),
+        Relay.session_send_control(relay, session, encode_frame(8, payload)),
         :closed
       )
 
     :closed
   end
 
-  defp handle_frame(socket, _relay, _session, true, 9, payload, fragment) do
+  defp handle_frame(_socket, relay, session, true, 9, payload, fragment) do
     case Diagnostics.result(
            :device_relay,
            :response_write,
-           :ssl.send(socket, encode_frame(10, payload)),
+           Relay.session_send_control(relay, session, encode_frame(10, payload)),
            :closed
          ) do
       :ok -> {:ok, fragment}
