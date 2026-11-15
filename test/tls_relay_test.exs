@@ -130,6 +130,189 @@ defmodule AttentionServer.TLSRelayTest do
     }
   end
 
+  # Observe the actual SSL send wait, rather than infer pressure from a delay.
+  defp await_socket_send(relay, socket, attempts \\ 500)
+  defp await_socket_send(_relay, _socket, 0), do: flunk("writer never entered SSL send")
+
+  defp await_socket_send(relay, socket, attempts) do
+    write = :sys.get_state(relay).socket_writes[socket]
+    stack = if write, do: Process.info(write.pid, :current_stacktrace), else: nil
+
+    case stack do
+      {:current_stacktrace, frames} ->
+        if Enum.any?(frames, fn {module, _, _, _} -> module == :gen_statem end) do
+          write.pid
+        else
+          Process.sleep(10)
+          await_socket_send(relay, socket, attempts - 1)
+        end
+
+      _ ->
+        Process.sleep(10)
+        await_socket_send(relay, socket, attempts - 1)
+    end
+  end
+
+  defp blocked_session(ctx) do
+    {:ok, peer} = connect(ctx.tls, ctx.certs, "a2")
+    assert {[], %{"seq" => 0}} = resync(peer)
+
+    {id, session} =
+      Enum.find(
+        :sys.get_state(ctx.relay).sessions,
+        fn {_, session} -> session.key == ctx.keys["a2"] end
+      )
+
+    :ok = :ssl.setopts(peer, packet: :raw)
+    # A passive OTP TLS client can still buffer incoming data internally.
+    # Pause its TLS receiver to model a peer that stops reading the transport.
+    {:sslsocket, _, [receiver | _]} = peer
+    :ok = :sys.suspend(receiver)
+    on_exit(fn -> if Process.alive?(receiver), do: :sys.resume(receiver) end)
+    :ok = :ssl.setopts(session.socket, sndbuf: 65_536)
+    data = List.duplicate(String.duplicate("x", 64 * 1024), 512)
+    task = Task.async(fn -> Relay.session_send(ctx.relay, id, data) end)
+    writer = await_socket_send(ctx.relay, session.socket)
+    {peer, id, session.socket, task, writer}
+  end
+
+  defp resume_peer({:sslsocket, _, [receiver | _]}) do
+    if Process.alive?(receiver), do: :sys.resume(receiver)
+  end
+
+  @tag :writer_isolation
+  test "a non-reading TLS peer does not delay another device or agent traffic", ctx do
+    {peer, id, _socket, blocked, _writer} = blocked_session(ctx)
+    {:ok, healthy} = connect(ctx.tls, ctx.certs, "b1")
+    assert {[], %{"seq" => 0}} = resync(healthy)
+
+    {:ok, agent_key} =
+      DeviceIdentity.from_certificate(TLSFixtures.certificate_der!(ctx.certs, "unknown"))
+
+    assert :ok = Relay.setup_agent_fixture(ctx.relay, "B", op(703), agent_key, ["app:test"])
+    assert {:ok, "B", agent_id, _revision} = Relay.agent_identity(ctx.relay, agent_key)
+
+    {:ok, agent} =
+      AttentionServer.AgentTLS.start_link(
+        relay: ctx.relay,
+        certfile: Path.join(ctx.certs, "server.pem"),
+        keyfile: Path.join(ctx.certs, "server.key"),
+        cacertfile: Path.join(ctx.certs, "ca.pem")
+      )
+
+    on_exit(fn -> if Process.alive?(agent), do: GenServer.stop(agent) end)
+    {:ok, agent_peer} = connect(agent, ctx.certs, "unknown")
+    assert :ok = send_frame(agent_peer, %{"type" => "search"})
+    assert %{"type" => "search_result", "items" => []} = read_frame(agent_peer)
+    :ssl.close(agent_peer)
+
+    assert agent_id == op(703)
+
+    assert %{"type" => "ok", "seq" => 1} =
+             stored_request(ctx.relay, ctx.keys["b1"], %{
+               "type" => "forward",
+               "op_id" => op(701),
+               "message" => message("healthy")
+             })
+
+    assert %{"type" => "delivery", "seq" => 1} = read_frame(healthy)
+    assert Task.yield(blocked, 0) == nil
+    assert :ok = Relay.close_session(ctx.relay, id)
+    resume_peer(peer)
+    :ssl.close(peer)
+    assert {:error, :fenced} = Task.await(blocked, 5_000)
+    :ssl.close(healthy)
+  end
+
+  @tag :writer_isolation
+  test "one connection preserves queued frame ordering after a blocked write", ctx do
+    {peer, id, socket, blocked, _writer} = blocked_session(ctx)
+    following = Task.async(fn -> Relay.session_send(ctx.relay, id, ["second", "third"]) end)
+    # Receiving the first batch releases backpressure without changing its order.
+    resume_peer(peer)
+    assert {:ok, bytes} = :ssl.recv(peer, 32 * 1024 * 1024, 10_000)
+    assert bytes == String.duplicate("x", 32 * 1024 * 1024)
+    assert :ok = Task.await(blocked, 5_000)
+    assert {:ok, "secondthird"} = :ssl.recv(peer, 11, 5_000)
+    assert :ok = Task.await(following, 5_000)
+    assert :ssl.getopts(socket, [:send_timeout]) == {:ok, [send_timeout: :infinity]}
+    resume_peer(peer)
+    :ssl.close(peer)
+  end
+
+  @tag :writer_isolation
+  test "revocation and replacement fence a blocked session and its queued writes", ctx do
+    {peer, id, socket, blocked, writer} = blocked_session(ctx)
+    {:sslsocket, _, [connection | _]} = socket
+    connection_monitor = Process.monitor(connection)
+    queued = Task.async(fn -> Relay.session_send(ctx.relay, id, ["must-not-escape"]) end)
+    monitor = Process.monitor(writer)
+    assert :ok = Relay.revoke_device(ctx.relay, ctx.keys["a2"])
+    assert_receive {:DOWN, ^monitor, :process, ^writer, _}, 2_000
+    assert_receive {:DOWN, ^connection_monitor, :process, ^connection, _}, 7_000
+    assert {:error, :fenced} = Task.await(blocked, 2_000)
+    assert {:error, :fenced} = Task.await(queued, 2_000)
+    refute Map.has_key?(:sys.get_state(ctx.relay).sessions, id)
+    resume_peer(peer)
+    :ssl.close(peer)
+
+    # Replacement independently fences the same blocked-write state.
+    other = %{ctx | keys: Map.put(ctx.keys, "a2", ctx.keys["a1"])}
+    {:ok, old} = connect(ctx.tls, ctx.certs, "a1")
+    assert {[], %{"seq" => 0}} = resync(old)
+
+    {old_id, session} =
+      Enum.find(
+        :sys.get_state(ctx.relay).sessions,
+        fn {_, session} -> session.key == other.keys["a2"] end
+      )
+
+    :ok = :ssl.setopts(session.socket, sndbuf: 65_536)
+
+    pending =
+      Task.async(fn ->
+        Relay.session_send(
+          ctx.relay,
+          old_id,
+          List.duplicate(String.duplicate("y", 64 * 1024), 512)
+        )
+      end)
+
+    await_socket_send(ctx.relay, session.socket)
+    {:ok, replacement} = connect(ctx.tls, ctx.certs, "a1")
+    assert {[], %{"seq" => 0}} = resync(replacement)
+    assert {:error, :fenced} = Task.await(pending, 2_000)
+    resume_peer(old)
+    :ssl.close(old)
+    :ssl.close(replacement)
+  end
+
+  @tag :writer_isolation
+  test "durable success survives a blocked recipient and replays after restart", ctx do
+    {peer, id, _socket, blocked, _writer} = blocked_session(ctx)
+    request = %{"type" => "forward", "op_id" => op(702), "message" => message("committed")}
+    assert %{"type" => "ok", "seq" => 1} = stored_request(ctx.relay, ctx.keys["a1"], request)
+    assert :ok = Relay.close_session(ctx.relay, id)
+    resume_peer(peer)
+    :ssl.close(peer)
+    assert {:error, :fenced} = Task.await(blocked, 5_000)
+    GenServer.stop(ctx.tls)
+    GenServer.stop(ctx.relay)
+    {:ok, relay} = Relay.start_link(store_path: ctx.path, source_fixture_mode: true)
+    {:ok, tls} = start_tls(relay, ctx.certs)
+    {:ok, reader} = connect(tls, ctx.certs, "a2")
+
+    assert {[%{"type" => "delivery", "seq" => 1, "message" => %{"title" => "committed"}}],
+            %{"seq" => 1}} = resync(reader)
+
+    assert :ok = send_frame(reader, %{"type" => "ack", "seq" => 1})
+    assert %{"type" => "ok", "seq" => 1} = read_frame(reader)
+    assert %{"type" => "ok", "seq" => 1} = stored_request(relay, ctx.keys["a1"], request)
+    :ssl.close(reader)
+    GenServer.stop(tls)
+    GenServer.stop(relay)
+  end
+
   test "TLS device sessions reject legacy sender commands and keep stored history readable",
        ctx do
     %{certs: certs, tls: tls, relay: relay, keys: keys} = ctx

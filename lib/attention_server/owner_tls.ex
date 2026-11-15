@@ -236,7 +236,7 @@ defmodule AttentionServer.OwnerTLS do
         Diagnostics.failure(:owner_tls, :relay_boundary, reason, :outcome_unknown, nil, relay)
         :ok
     after
-      :ssl.close(socket)
+      AttentionServer.SessionWriter.close(socket)
     end
   end
 
