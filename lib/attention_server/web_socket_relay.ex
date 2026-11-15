@@ -239,7 +239,7 @@ defmodule AttentionServer.WebSocketRelay do
         Diagnostics.failure(:device_relay, :relay_boundary, reason, :outcome_unknown, nil, relay)
         :ok
     after
-      :ssl.close(socket)
+      AttentionServer.SessionWriter.close(socket)
     end
   end
 
@@ -429,23 +429,23 @@ defmodule AttentionServer.WebSocketRelay do
     end
   end
 
-  defp handle_frame(socket, _relay, _session, true, 8, payload, _fragment) do
+  defp handle_frame(_socket, relay, session, true, 8, payload, _fragment) do
     _ =
       Diagnostics.result(
         :device_relay,
         :response_write,
-        :ssl.send(socket, encode_frame(8, payload)),
+        Relay.session_send_control(relay, session, encode_frame(8, payload)),
         :closed
       )
 
     :closed
   end
 
-  defp handle_frame(socket, _relay, _session, true, 9, payload, fragment) do
+  defp handle_frame(_socket, relay, session, true, 9, payload, fragment) do
     case Diagnostics.result(
            :device_relay,
            :response_write,
-           :ssl.send(socket, encode_frame(10, payload)),
+           Relay.session_send_control(relay, session, encode_frame(10, payload)),
            :closed
          ) do
       :ok -> {:ok, fragment}

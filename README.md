@@ -7,16 +7,16 @@ Harklight iOS/iPadOS app.
 
 ## Install the server
 
-For the FORMAT27 v0.1.42 server package, use the release page below after it
+For the FORMAT27 v0.1.43 server package, use the release page below after it
 is published to download the Linux x86_64 archive, `SHA256SUMS` and
 `SELF_HOST.md`. Verify the checksum before extraction:
 
-[v0.1.42 release](https://github.com/clickety-clacks/harklight-server/releases/tag/v0.1.42)
+[v0.1.43 release](https://github.com/clickety-clacks/harklight-server/releases/tag/v0.1.43)
 (available only after publication).
 
 ```sh
 sha256sum -c SHA256SUMS
-tar -xzf harklight-server-0.1.42-linux-x86_64.tar.gz
+tar -xzf harklight-server-0.1.43-linux-x86_64.tar.gz
 ```
 
 Follow [SELF_HOST.md](SELF_HOST.md) for a fresh installation, tailnet routing,
@@ -28,7 +28,9 @@ The package does not install a service, configure the tailnet or expose ports.
 State, owner/device identities, trust roots and sender grants live outside the
 versioned package. Run one server per database. Keep private keys and backups
 private; do not repeat bootstrap over an existing installation.
-This source, v0.1.42, continues the v0.1.35 maintenance line with durable-ACK,
+Version 0.1.43 isolates socket writes per connection so a non-reading peer does not stall the shared relay. It adds no send timeout or queue limit.
+
+This source, v0.1.43, continues the v0.1.35 maintenance line with durable-ACK,
 timeout, and account-wide agent reads. It also moves snapshot encoding, hashing
 and SQLite persistence to a linked worker, allowing the explicitly supported
 read operations to use the last committed in-memory snapshot while persistence
@@ -55,12 +57,12 @@ FORMAT24 and migrate supported older state on startup.
 The v0.1.12 package uses FORMAT23, v0.1.11 uses FORMAT22, and v0.1.10 accepts
 formats 1–6 and 8–21. Those pre-FORMAT24 packages cannot start against FORMAT24
 state. The release installer takes one full private-root backup while the
-service is stopped and before switching releases. Returning from v0.1.42 to
+service is stopped and before switching releases. Returning from v0.1.43 to
 v0.1.35 requires restoring that backup and the prior binary: v0.1.35 ignores the
 newer ACK progress in the additive table. Restore discards writes after capture
 and cannot undo external deliveries. The isolated v0.1.41 manual
 upgrade/restore rehearsal served the original seeded data after restoration;
-that result does not establish a rehearsal result for v0.1.42. The complete
+that result does not establish a rehearsal result for v0.1.43. The complete
 systemd installer and failure recovery cases were not exercised.
 Restore or prior-release startup can fail and leave the service stopped.
 
