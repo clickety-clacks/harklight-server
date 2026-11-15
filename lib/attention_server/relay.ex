@@ -686,6 +686,9 @@ defmodule AttentionServer.Relay do
   def session_send(server, session_id, frames),
     do: GenServer.call(server, {:session_send, session_id, frames}, :infinity)
 
+  def session_send_control(server, session_id, bytes),
+    do: GenServer.call(server, {:session_send_control, session_id, bytes}, :infinity)
+
   def close_session(server, session_id),
     do: GenServer.call(server, {:close_session, session_id}, :infinity)
 
@@ -708,6 +711,7 @@ defmodule AttentionServer.Relay do
               upload_index: build_upload_index(store.engine),
               active_uploads: %{},
               sessions: %{},
+              socket_writes: %{},
               browser_recipients: %{},
               origin_streams: %{},
               origin_streams_by_identity: %{},
@@ -1003,7 +1007,18 @@ defmodule AttentionServer.Relay do
 
   @impl true
   def handle_call(request, from, state) do
-    with_persistence_reads(state, fn -> dispatch_call(request, from, state) end)
+    with_persistence_reads(state, fn ->
+      case dispatch_call(request, from, state) do
+        {:reply, {:socket_write, socket, authority, frames, completion}, next} ->
+          {:noreply, enqueue_socket_write(next, socket, authority, frames, completion, from)}
+
+        {:reply, reply, next} ->
+          {:reply, reply, fence_socket_writes(next)}
+
+        {:noreply, next} ->
+          {:noreply, fence_socket_writes(next)}
+      end
+    end)
   end
 
   defp with_persistence_reads(state, fun) do
@@ -1821,7 +1836,10 @@ defmodule AttentionServer.Relay do
           Diagnostics.operation_id(request)
         )
 
-        result = :ssl.send(socket, AttentionServer.JSON.encode!(reply) <> "\n")
+        result =
+          {:socket_write, socket, {:agent, key, revision},
+           [AttentionServer.JSON.encode!(reply) <> "\n"], :result}
+
         {:reply, result, next_state}
 
       _ ->
@@ -1849,7 +1867,10 @@ defmodule AttentionServer.Relay do
           Diagnostics.operation_id(request)
         )
 
-        result = :ssl.send(socket, AgentWire.http_response(200, reply))
+        result =
+          {:socket_write, socket, {:agent, key, revision}, [AgentWire.http_response(200, reply)],
+           :result}
+
         {:reply, result, next_state}
 
       _ ->
@@ -1905,8 +1926,11 @@ defmodule AttentionServer.Relay do
   defp dispatch_call({:owner_send_line, person, key, revision, socket, line}, _from, state) do
     result =
       case Engine.owner_revision(state.store.engine, person, key) do
-        {:ok, ^revision} -> :ssl.send(socket, line)
-        _ -> {:error, :forbidden}
+        {:ok, ^revision} ->
+          {:socket_write, socket, {:owner, person, key, revision}, [line], :result}
+
+        _ ->
+          {:error, :forbidden}
       end
 
     {:reply, result, state}
@@ -3004,18 +3028,35 @@ defmodule AttentionServer.Relay do
   end
 
   defp dispatch_call({:session_send, id, frames}, _from, state) do
-    with {:ok, %{socket: socket, key: key, transport: transport}} <- active_session(state, id),
-         true <- not is_nil(socket) and is_list(frames),
-         :ok <-
-           send_frames(
-             socket,
-             refresh_enrollment_frames(state.store.engine, key, frames),
-             transport
-           ) do
-      {:reply, :ok, state}
+    with {:ok, %{socket: socket}} <- active_session(state, id),
+         true <- not is_nil(socket) and is_list(frames) do
+      {:reply, {:socket_write, socket, {:session, id}, frames, :session}, state}
     else
+      _ -> {:reply, {:error, :fenced}, drop_session(state, id)}
+    end
+  end
+
+  defp dispatch_call({:session_send_control, id, bytes}, _from, state) do
+    with {:ok, %{socket: socket}} <- active_session(state, id),
+         true <- not is_nil(socket) do
+      {:reply, {:socket_write, socket, {:session_control, id}, [bytes], :session}, state}
+    else
+      _ -> {:reply, {:error, :fenced}, drop_session(state, id)}
+    end
+  end
+
+  # Each frame is released under current authority. A released write belongs
+  # to that connection; its completion never occupies the shared core.
+  defp dispatch_call({:socket_write_frame, socket, token, frame}, _from, state) do
+    case Map.get(state.socket_writes, socket) do
+      %{token: ^token, job: job} ->
+        case authorize_socket_write(state, job.authority, frame) do
+          {:ok, bytes} -> {:reply, {:ok, bytes}, state}
+          error -> {:reply, error, state}
+        end
+
       _ ->
-        {:reply, {:error, :fenced}, drop_session(state, id)}
+        {:reply, {:error, :fenced}, state}
     end
   end
 
@@ -3322,7 +3363,29 @@ defmodule AttentionServer.Relay do
 
   @impl true
   def handle_info(message, state) do
-    with_persistence_reads(state, fn -> dispatch_info(message, state) end)
+    with_persistence_reads(state, fn ->
+      {:noreply, next} = dispatch_info(message, state)
+      {:noreply, fence_socket_writes(next)}
+    end)
+  end
+
+  defp dispatch_info({:socket_write_done, socket, token, result}, state) do
+    case Map.get(state.socket_writes, socket) do
+      %{token: ^token} = write ->
+        Process.demonitor(write.monitor, [:flush])
+        state = %{state | socket_writes: Map.delete(state.socket_writes, socket)}
+        {reply, state} = finish_socket_write(state, write.job, result)
+        GenServer.reply(write.job.from, reply)
+
+        if result == :ok do
+          {:noreply, start_queued_write(state, socket, write.queue)}
+        else
+          {:noreply, fail_queued_writes(state, write.queue, result)}
+        end
+
+      _ ->
+        {:noreply, state}
+    end
   end
 
   defp dispatch_info(:refresh_default_sweep_index, state) do
@@ -3507,6 +3570,10 @@ defmodule AttentionServer.Relay do
           Enum.find(state.priority_jobs, fn {_person, job} -> job.monitor == monitor end)
 
         cond do
+          write = Enum.find(state.socket_writes, fn {_, write} -> write.monitor == monitor end) ->
+            {socket, _} = write
+            {:noreply, cancel_socket_write(state, socket, {:error, :closed})}
+
           priority_job ->
             {person, job} = priority_job
             {:noreply, finish_priority_pass(state, person, job, {:error, :unavailable})}
@@ -6591,23 +6658,8 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  defp send_frames(socket, frames, transport) do
-    Enum.reduce_while(frames, :ok, fn frame, _ ->
-      bytes =
-        if transport == :websocket,
-          do: AttentionServer.WebSocketRelay.encode_text(frame),
-          else: frame
-
-      case :ssl.send(socket, bytes) do
-        :ok -> {:cont, :ok}
-        _ -> {:halt, {:error, :send_failed}}
-      end
-    end)
-  end
-
-  # TLS writes occur inside this GenServer. Re-evaluate each successful G8
-  # observation immediately before its serialized send, so a queued target or
-  # grant revocation wins when it committed before response release.
+  # Enrollment proofs are refreshed at frame release, after any queued
+  # authority mutations, rather than when the response first enters the queue.
   defp refresh_enrollment_frames(engine, key, frames) do
     Enum.map(frames, fn line ->
       case JSON.decode_line(line) do
@@ -6993,14 +7045,8 @@ defmodule AttentionServer.Relay do
             frames = [ack, line(show)]
 
             if session.socket do
-              case send_frames(session.socket, frames, session.transport) do
-                :ok ->
-                  next = %{next | held_shows: Map.delete(next.held_shows, key)}
-                  {{:ok, []}, next}
-
-                _ ->
-                  {{:error, :send_failed}, drop_session(next, id)}
-              end
+              {{:socket_write, session.socket, {:session, id}, frames, {:held_show, key, held}},
+               next}
             else
               {{:ok, frames}, %{next | held_shows: Map.delete(next.held_shows, key)}}
             end
@@ -7138,20 +7184,9 @@ defmodule AttentionServer.Relay do
       end)
 
     case live_session do
-      {id, %{socket: socket, transport: transport}} when not is_nil(socket) ->
-        case send_frames(socket, [line(show)], transport) do
-          :ok ->
-            {{:ok,
-              %{
-                "client_id" => client["client_id"],
-                "device_name" => client["device_name"],
-                "delivery" => "sent"
-              }}, state}
-
-          _ ->
-            next = drop_session(state, id)
-            hold_show(next, agent_key, client, show)
-        end
+      {id, %{socket: socket}} when not is_nil(socket) ->
+        {{:socket_write, socket, {:session, id}, [line(show)],
+          {:view_show, agent_key, client, show}}, state}
 
       _ ->
         hold_show(state, agent_key, client, show)
@@ -7186,9 +7221,11 @@ defmodule AttentionServer.Relay do
 
         # Removing the session fences all serialized requests and writes.
         # TLS close can wait on the peer; keep that wait out of the shared Relay.
-        if session.socket, do: spawn(fn -> :ssl.close(session.socket) end)
+        if session.socket,
+          do: spawn(fn -> AttentionServer.SessionWriter.close(session.socket) end)
 
         state = %{state | sessions: sessions}
+        state = cancel_socket_write(state, session.socket, {:error, :fenced})
 
         if session.transport == :browser do
           recipient_ref = {session.browser_session_id, session.recipient}
@@ -7509,6 +7546,159 @@ defmodule AttentionServer.Relay do
         if MapSet.size(remaining) == 0,
           do: Map.delete(index, key),
           else: Map.put(index, key, remaining)
+    end
+  end
+
+  defp enqueue_socket_write(state, socket, authority, frames, completion, from) do
+    job = %{authority: authority, frames: frames, completion: completion, from: from}
+
+    case Map.get(state.socket_writes, socket) do
+      nil ->
+        start_socket_write(state, socket, job, :queue.new())
+
+      write ->
+        put_in(state.socket_writes[socket], %{write | queue: :queue.in(job, write.queue)})
+    end
+    |> fence_socket_writes()
+  end
+
+  defp start_socket_write(state, socket, job, queue) do
+    token = make_ref()
+
+    owner =
+      case job.authority do
+        {kind, id} when kind in [:session, :session_control] ->
+          case Map.get(state.sessions, id) do
+            %{owner: owner} when is_pid(owner) -> owner
+            _ -> elem(job.from, 0)
+          end
+
+        _ ->
+          elem(job.from, 0)
+      end
+
+    {pid, monitor} =
+      AttentionServer.SessionWriter.start(self(), owner, socket, token, job.frames)
+
+    write = %{pid: pid, monitor: monitor, token: token, job: job, queue: queue}
+    put_in(state.socket_writes[socket], write)
+  end
+
+  defp start_queued_write(state, socket, queue) do
+    case :queue.out(queue) do
+      {{:value, job}, rest} -> start_socket_write(state, socket, job, rest)
+      {:empty, _} -> state
+    end
+  end
+
+  defp authorize_socket_write(state, {:session, id}, frame) do
+    with {:ok, session} <- active_session(state, id) do
+      [frame] = refresh_enrollment_frames(state.store.engine, session.key, [frame])
+
+      bytes =
+        if session.transport == :websocket,
+          do: AttentionServer.WebSocketRelay.encode_text(frame),
+          else: frame
+
+      {:ok, bytes}
+    end
+  end
+
+  defp authorize_socket_write(state, {:session_control, id}, frame) do
+    with {:ok, _session} <- active_session(state, id), do: {:ok, frame}
+  end
+
+  defp authorize_socket_write(state, {:agent, key, revision}, frame) do
+    case Engine.agent_identity(state.store.engine, key) do
+      {:ok, _, _, ^revision} -> {:ok, frame}
+      _ -> {:error, :forbidden}
+    end
+  end
+
+  defp authorize_socket_write(state, {:owner, person, key, revision}, frame) do
+    case Engine.owner_revision(state.store.engine, person, key) do
+      {:ok, ^revision} -> {:ok, frame}
+      _ -> {:error, :forbidden}
+    end
+  end
+
+  defp socket_authorized?(state, {:session, id}),
+    do: match?({:ok, _}, active_session(state, id))
+
+  defp socket_authorized?(state, authority),
+    do: match?({:ok, _}, authorize_socket_write(state, authority, ""))
+
+  defp fence_socket_writes(state) do
+    Enum.reduce(state.socket_writes, state, fn {socket, write}, acc ->
+      if socket_authorized?(acc, write.job.authority),
+        do: acc,
+        else: cancel_socket_write(acc, socket, {:error, :forbidden})
+    end)
+  end
+
+  defp cancel_socket_write(state, nil, _result), do: state
+
+  defp cancel_socket_write(state, socket, result) do
+    case Map.pop(state.socket_writes, socket) do
+      {nil, _} ->
+        state
+
+      {write, writes} ->
+        Process.demonitor(write.monitor, [:flush])
+        Process.exit(write.pid, :kill)
+        state = %{state | socket_writes: writes}
+        {reply, state} = finish_socket_write(state, write.job, result)
+        GenServer.reply(write.job.from, reply)
+        fail_queued_writes(state, write.queue, result)
+    end
+  end
+
+  defp fail_queued_writes(state, queue, result) do
+    Enum.reduce(:queue.to_list(queue), state, fn job, acc ->
+      {reply, acc} = finish_socket_write(acc, job, result)
+      GenServer.reply(job.from, reply)
+      acc
+    end)
+  end
+
+  defp finish_socket_write(state, job, result) do
+    state =
+      case {result, job.authority} do
+        {:ok, _} -> state
+        {_, {kind, id}} when kind in [:session, :session_control] -> drop_session(state, id)
+        _ -> state
+      end
+
+    case job.completion do
+      :result ->
+        {result, state}
+
+      :session ->
+        {if(result == :ok, do: :ok, else: {:error, :fenced}), state}
+
+      {:held_show, key, held} ->
+        if result == :ok do
+          shows =
+            if Map.get(state.held_shows, key) == held,
+              do: Map.delete(state.held_shows, key),
+              else: state.held_shows
+
+          {{:ok, []}, %{state | held_shows: shows}}
+        else
+          {{:error, :send_failed}, state}
+        end
+
+      {:view_show, agent_key, client, show} ->
+        if result == :ok do
+          {{:ok,
+            %{
+              "client_id" => client["client_id"],
+              "device_name" => client["device_name"],
+              "delivery" => "sent"
+            }}, state}
+        else
+          hold_show(state, agent_key, client, show)
+        end
     end
   end
 end
