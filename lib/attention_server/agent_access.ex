@@ -5,7 +5,7 @@ defmodule AttentionServer.AgentAccess do
   boundary ends. Device replay never uses this projection.
   """
 
-  alias AttentionServer.{JSON, Message}
+  alias AttentionServer.{JSON, LargeData, Message}
 
   @terminal_states ~w(answered cleared expired superseded retracted)
   @query_fields ~w(v type sender_id message_id state contains limit cursor)
@@ -206,7 +206,7 @@ defmodule AttentionServer.AgentAccess do
     {reversed, _size, has_more} =
       Enum.reduce_while(matched, {[], 0, false}, fn entry, {selected, size, _} ->
         {_, record} = entry
-        bytes = record |> project(observed) |> JSON.encode!() |> byte_size()
+        bytes = record |> project(observed) |> JSON.encoded_size()
 
         if length(selected) >= limit or (selected != [] and size + bytes > @max_page_bytes) do
           {:halt, {selected, size, true}}
@@ -225,6 +225,7 @@ defmodule AttentionServer.AgentAccess do
 
   defp contains?(_value, nil), do: true
   defp contains?(value, needle) when is_binary(value), do: String.contains?(value, needle)
+  defp contains?(%LargeData.Ref{} = ref, needle), do: LargeData.contains?(ref, needle)
   defp contains?(%JSON.DecimalToken{}, _needle), do: false
 
   defp contains?(value, needle) when is_map(value),

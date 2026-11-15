@@ -12,6 +12,7 @@ defmodule AttentionServer.OriginHTTPS do
     Diagnostics,
     EnrolledLeafVerify,
     JSON,
+    LargeData,
     Message,
     OriginWire,
     Relay
@@ -19,7 +20,7 @@ defmodule AttentionServer.OriginHTTPS do
 
   @timeout :infinity
   @max_header 16 * 1024
-  @max_body 2 * 1024 * 1024
+  @body_chunk_size 64 * 1024
   @keepalive_ms 15_000
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts)
@@ -210,17 +211,19 @@ defmodule AttentionServer.OriginHTTPS do
           {:ok, {:post, request}} ->
             operation_id = Diagnostics.operation_id(request)
 
-            _ =
-              Diagnostics.result(
-                :origin_https,
-                :response_write,
-                :ssl.send(
-                  tls,
-                  OriginWire.http_response(200, OriginWire.command(relay, key, request))
-                ),
-                :outcome_unknown,
-                operation_id
-              )
+            try do
+              _ =
+                Diagnostics.result(
+                  :origin_https,
+                  :response_write,
+                  OriginWire.command(relay, key, request)
+                  |> then(&OriginWire.send_http_response(tls, 200, &1)),
+                  :outcome_unknown,
+                  operation_id
+                )
+            after
+              LargeData.cleanup_transient_refs(request)
+            end
 
           {:ok, {:stream, handle, reconnect, advisory_v1}} ->
             stream(tls, relay, key, handle, reconnect, advisory_v1)
@@ -895,6 +898,7 @@ defmodule AttentionServer.OriginHTTPS do
   defp transport_error(:not_found), do: {404, "not_found"}
   defp transport_error(:invalid_field), do: {400, "invalid_field"}
   defp transport_error(:invalid_json), do: {400, "invalid_json"}
+  defp transport_error(:storage_unavailable), do: {503, "storage_unavailable"}
   defp transport_error(_), do: {400, "bad_frame"}
 
   defp read_request(socket) do
@@ -902,13 +906,21 @@ defmodule AttentionServer.OriginHTTPS do
          {:ok, target} <- parse_header(header) do
       case target do
         {:post, size} ->
-          with {:ok, body} <- read_body(socket, remainder, size),
-               true <- String.valid?(body),
-               {:ok, request} <- JSON.decode_line_for_ui1_admission(body <> "\n", @max_body + 1),
-               true <- is_map(request) and not is_struct(request) do
-            {:ok, {:post, request}}
-          else
-            _ -> {:error, :invalid_json}
+          with {:ok, path} <- read_body_file(socket, remainder, size) do
+            try do
+              case JSON.decode_line_file_for_ui1_admission(path) do
+                {:ok, request} when is_map(request) and not is_struct(request) ->
+                  {:ok, {:post, request}}
+
+                {:error, :storage_unavailable} ->
+                  {:error, :storage_unavailable}
+
+                _ ->
+                  {:error, :invalid_json}
+              end
+            after
+              _ = File.rm(path)
+            end
           end
 
         {:stream, handle, reconnect, advisory} ->
@@ -1120,9 +1132,9 @@ defmodule AttentionServer.OriginHTTPS do
   defp json_content_type?(_), do: false
 
   defp content_length(value) when is_binary(value) do
-    if Regex.match?(~r/\A[1-9][0-9]{0,6}\z/, value) do
+    if Regex.match?(~r/\A[1-9][0-9]*\z/, value) do
       size = String.to_integer(value)
-      if size <= @max_body, do: {:ok, size}, else: {:error, :bad_frame}
+      {:ok, size}
     else
       {:error, :bad_frame}
     end
@@ -1130,14 +1142,62 @@ defmodule AttentionServer.OriginHTTPS do
 
   defp content_length(_), do: {:error, :bad_frame}
 
-  defp read_body(_socket, buffer, size) when byte_size(buffer) == size, do: {:ok, buffer}
-  defp read_body(_socket, buffer, size) when byte_size(buffer) > size, do: {:error, :bad_frame}
+  defp read_body_file(socket, remainder, size) when byte_size(remainder) <= size do
+    path =
+      Path.join(
+        System.tmp_dir!(),
+        "attention-origin-request-#{System.unique_integer([:positive, :monotonic])}.json"
+      )
 
-  defp read_body(socket, buffer, size) do
-    case :ssl.recv(socket, size - byte_size(buffer), @timeout) do
-      {:ok, chunk} -> read_body(socket, buffer <> chunk, size)
-      {:error, reason} -> {:error, reason}
-      other -> {:error, other}
+    case File.open(path, [:write, :binary, :exclusive]) do
+      {:ok, file} ->
+        result =
+          case IO.binwrite(file, remainder) do
+            :ok -> read_body_chunks(socket, file, size - byte_size(remainder))
+            _ -> {:error, :storage_unavailable}
+          end
+
+        close_result = File.close(file)
+
+        case {result, close_result} do
+          {:ok, :ok} ->
+            {:ok, path}
+
+          {{:error, :storage_unavailable}, _} ->
+            _ = File.rm(path)
+            {:error, :storage_unavailable}
+
+          {:ok, {:error, _}} ->
+            _ = File.rm(path)
+            {:error, :storage_unavailable}
+
+          _ ->
+            _ = File.rm(path)
+            {:error, :bad_frame}
+        end
+
+      _ ->
+        {:error, :storage_unavailable}
+    end
+  end
+
+  defp read_body_file(_socket, _remainder, _size), do: {:error, :bad_frame}
+
+  defp read_body_chunks(_socket, _file, 0), do: :ok
+
+  defp read_body_chunks(socket, file, remaining) do
+    case :ssl.recv(socket, min(remaining, @body_chunk_size), @timeout) do
+      {:ok, chunk} when byte_size(chunk) > 0 and byte_size(chunk) <= remaining ->
+        case IO.binwrite(file, chunk) do
+          :ok -> read_body_chunks(socket, file, remaining - byte_size(chunk))
+          _ -> {:error, :storage_unavailable}
+        end
+
+      {:error, _reason} ->
+        {:error, :bad_frame}
+
+      _ ->
+        {:error, :bad_frame}
     end
   end
 end

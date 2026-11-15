@@ -679,6 +679,11 @@ defmodule AttentionServer.Relay do
     GenServer.call(server, {:session_request_line, session_id, line}, :infinity)
   end
 
+  @doc false
+  def session_request_file(server, session_id, path) do
+    GenServer.call(server, {:session_request_file, session_id, path}, :infinity)
+  end
+
   def session_drain(server, session_id),
     do: GenServer.call(server, {:session_drain, session_id}, :infinity)
 
@@ -1026,7 +1031,7 @@ defmodule AttentionServer.Relay do
   defp dispatch_call({:request_frame, key, frame}, _from, state) do
     case Engine.authorized_person(state.store.engine, key) do
       {:ok, _person} when is_map(frame) ->
-        if JSON.ui1_duplicate_request?(frame) do
+        if JSON.ui1_duplicate_request?(frame) or AttentionServer.LargeData.contains_ref?(frame) do
           {reply, next} = perform_request_frame(state, key, frame)
           {:reply, reply, next}
         else
@@ -1821,7 +1826,11 @@ defmodule AttentionServer.Relay do
           Diagnostics.operation_id(request)
         )
 
-        result = :ssl.send(socket, AttentionServer.JSON.encode!(reply) <> "\n")
+        result =
+          case AttentionServer.JSON.encode_line(reply) do
+            %AttentionServer.JSON.StreamedLine{} = line -> AttentionServer.JSON.send_stream(socket, line)
+            bytes -> :ssl.send(socket, bytes)
+          end
         {:reply, result, next_state}
 
       _ ->
@@ -1849,7 +1858,7 @@ defmodule AttentionServer.Relay do
           Diagnostics.operation_id(request)
         )
 
-        result = :ssl.send(socket, AgentWire.http_response(200, reply))
+        result = AgentWire.send_http_response(socket, 200, reply)
         {:reply, result, next_state}
 
       _ ->
@@ -3025,11 +3034,31 @@ defmodule AttentionServer.Relay do
   defp dispatch_call({:session_request_line, id, raw}, from, state),
     do: session_request_line_call(state, id, raw, from)
 
+  defp dispatch_call({:session_request_file, id, path}, from, state) do
+    with {:ok, session} <- active_session(state, id),
+         {:ok, frame} <- JSON.decode_line_file(path),
+         true <- is_map(frame) and not is_struct(frame) do
+      try do
+        case session_request_frame_call(state, id, session, frame, from) do
+          {:reply, _reply, _next} = callback -> callback
+          {:noreply, _next} = callback -> callback
+          {reply, next} -> {:reply, reply, next}
+        end
+      after
+        AttentionServer.LargeData.cleanup_transient_refs(frame)
+      end
+    else
+      {:error, :forbidden} -> {:reply, {:error, :forbidden}, drop_session(state, id)}
+      {:error, :storage_unavailable} -> {:reply, {:ok, [error_line(%{}, "storage_unavailable")]}, state}
+      _ -> {:reply, {:ok, [error_line(%{}, "bad_frame")]}, state}
+    end
+  end
+
   defp dispatch_call(
-         {:browser_session_request_line, browser_session_id, id, raw},
-         from,
-         state
-       ) do
+        {:browser_session_request_line, browser_session_id, id, raw},
+        from,
+        state
+      ) do
     case browser_connection(state, browser_session_id, id) do
       {:ok, _session} -> session_request_line_call(state, id, raw, from)
       {:error, :forbidden} -> {:reply, {:error, :session_ended}, drop_session(state, id)}
@@ -3317,6 +3346,67 @@ defmodule AttentionServer.Relay do
 
       error ->
         {:reply, error, state}
+    end
+  end
+
+  defp session_request_frame_call(state, id, session, frame, from) do
+    type = frame["type"]
+
+    cond do
+      session.transport == :browser and is_binary(type) and type not in @browser_frame_types ->
+        {{:ok, [error_line(frame, "unknown_type")]}, state}
+
+      type == "inbox_start" and session.transport in [:websocket, :browser] ->
+        inbox_start_call(state, id, session, frame, from)
+
+      type == "focus_report" ->
+        focus_report_request(state, id, session, frame)
+
+      type in ["inbox_page", "inbox_reconcile", "inbox_receipts", "inbox_checkpoint_ack", "inbox_attach"] ->
+        inbox_session_request(state, id, session, frame)
+
+      type in ["resync", "ack", "conversation_open", "conversation_ack", "view_get", "inbox_list", "conversation_page"] ->
+        special_request(state, id, session, frame)
+
+      type in ["levels_get", "levels_set"] ->
+        levels_session_request_frame(state, id, session, frame)
+
+      type in ["forward", "answer_receipt"] ->
+        {{:ok, [error_line(frame, "unknown_type")]}, state}
+
+      session_mutation_state_value(state, session, frame) == :allowed and
+          not (not state.push_enabled and type in ["push_register", "push_remove", "push_status"]) and
+          not (not state.source_fixture_mode and type in ["source_bind", "source_result"]) ->
+        perform_request_frame(state, session.key, frame)
+        |> then(fn {reply, next} -> {wrap_line(reply), next} end)
+
+      true ->
+        case session_mutation_state_value(state, session, frame) do
+          {:blocked, reason} -> {{:ok, [error_line(frame, reason)]}, state}
+          _ when not state.push_enabled and type in ["push_register", "push_remove", "push_status"] ->
+            {{:ok, [error_line(frame, "forbidden")]}, state}
+
+          _ when not state.source_fixture_mode and type in ["source_bind", "source_result"] ->
+            {{:ok, [error_line(frame, "not_supported")]}, state}
+
+          _ ->
+            perform_request_frame(state, session.key, frame)
+            |> then(fn {reply, next} -> {wrap_line(reply), next} end)
+        end
+    end
+  end
+
+  defp levels_session_request_frame(state, id, session, frame) do
+    session = %{session | levels_support: true}
+    state = put_session(state, id, session)
+
+    case session_mutation_state_value(state, session, frame) do
+      {:blocked, reason} ->
+        {{:ok, [error_line(frame, reason)]}, state}
+
+      :allowed ->
+        perform_request_frame(state, session.key, frame)
+        |> then(fn {reply, next} -> {wrap_line(reply), next} end)
     end
   end
 
@@ -4587,17 +4677,20 @@ defmodule AttentionServer.Relay do
 
   defp session_mutation_state(state, session, raw) do
     case JSON.decode_line(raw) do
-      {:ok, %{"type" => type}} when is_binary(type) ->
-        if type in InboxPaging.mutation_types() do
-          pending_mutation_state(state, session)
-        else
-          :allowed
-        end
+      {:ok, frame} when is_map(frame) -> session_mutation_state_value(state, session, frame)
 
       _ ->
         :allowed
     end
   end
+
+  defp session_mutation_state_value(state, session, %{"type" => type}) when is_binary(type) do
+    if type in InboxPaging.mutation_types(),
+      do: pending_mutation_state(state, session),
+      else: :allowed
+  end
+
+  defp session_mutation_state_value(_state, _session, _frame), do: :allowed
 
   defp pending_mutation_state(state, session) do
     if session.sync_mode == :paging and is_binary(session.snapshot_id) do
@@ -5002,6 +5095,17 @@ defmodule AttentionServer.Relay do
   end
 
   defp perform_request(state, key, raw) do
+    case JSON.decode_line(raw) do
+      {:ok, %{"type" => type, "files" => _} = frame}
+      when type in ["forward", "conversation_revise", "discussion", "conversation_reply"] ->
+        perform_request_frame(state, key, frame)
+
+      _ ->
+        perform_request_line(state, key, raw)
+    end
+  end
+
+  defp perform_request_line(state, key, raw) do
     {next_engine, reply} = Engine.request_line(state.store.engine, key, raw, state.clock.())
     next_engine = with_coverage_availability(state, key, next_engine)
     next_engine = with_initial_origin_availability(state, key, next_engine)
@@ -5034,23 +5138,356 @@ defmodule AttentionServer.Relay do
   end
 
   defp perform_request_frame(state, key, frame) do
-    {next_engine, reply} = Engine.request_frame(state.store.engine, key, frame, state.clock.())
-    next_engine = with_coverage_availability(state, key, next_engine)
-    next_engine = with_initial_origin_availability(state, key, next_engine)
-    operation_id = Diagnostics.operation_id(frame)
-    targets = origin_feed_targets(state.store.engine, next_engine, key, frame)
+    case prepare_inline_overflow_uploads(state, key, frame) do
+      {:error, reason} ->
+        {{:ok, error_line(frame, reason)}, state}
 
-    finish_request(
-      state,
-      key,
-      next_engine,
-      reply,
-      operation_id,
-      targets,
-      frame["type"] || "relay_request",
-      frame
-    )
+      {:ok, request_engine, request_frame, created_ids, created_paths} ->
+        {next_engine, reply} = Engine.request_frame(request_engine, key, request_frame, state.clock.())
+
+        {next_engine, created_ids, created_paths} =
+          if request_success?(reply) do
+            {next_engine, created_ids, created_paths}
+          else
+            AttentionServer.LargeData.cleanup_created(created_paths)
+            {drop_upload_ids(next_engine, created_ids), [], []}
+          end
+
+        next_engine = with_coverage_availability(state, key, next_engine)
+        next_engine = with_initial_origin_availability(state, key, next_engine)
+        operation_id = Diagnostics.operation_id(frame)
+        targets = origin_feed_targets(state.store.engine, next_engine, key, request_frame)
+
+        {reply, next_state} =
+          finish_request(
+            state,
+            key,
+            next_engine,
+            reply,
+            operation_id,
+            targets,
+            frame["type"] || "relay_request",
+            frame
+          )
+
+        if created_ids != [] and request_success?(reply) and
+             Enum.all?(created_ids, &Map.has_key?(next_state.store.engine.uploads, &1)) do
+          {reply, %{next_state | upload_index: build_upload_index(next_state.store.engine)}}
+        else
+          {reply, next_state}
+        end
+    end
   end
+
+  defp prepare_inline_overflow_uploads(state, key, frame) do
+    case Map.get(frame, "files") do
+      files when is_list(files) ->
+        with {:ok, person} <- Engine.authorized_person(state.store.engine, key),
+             {:ok, target} <- inline_upload_target(frame) do
+          process_inline_files(state, key, person, frame, target, files)
+        else
+          _ -> {:ok, state.store.engine, frame, [], []}
+        end
+
+      _ ->
+        {:ok, state.store.engine, frame, [], []}
+    end
+  end
+
+  defp inline_upload_target(%{"type" => "forward", "message" => message} = frame)
+       when is_map(message) do
+    inline_target(frame, {message["sender_id"], message["message_id"], 1})
+  end
+
+  defp inline_upload_target(%{"type" => "conversation_revise", "base_revision" => revision} = frame)
+       when is_integer(revision) and revision > 0 do
+    inline_target(frame, {frame["sender_id"], frame["message_id"], revision + 1})
+  end
+
+  defp inline_upload_target(
+         %{"sender_id" => sender, "message_id" => message, "request_revision" => revision} = frame
+       )
+       when is_integer(revision) and revision > 0 do
+    inline_target(frame, {sender, message, revision})
+  end
+
+  defp inline_upload_target(_), do: {:error, :invalid_upload}
+
+  defp inline_target(frame, {sender, message, revision}) do
+    attrs = %{
+      "op_id" => frame["op_id"],
+      "sender_id" => sender,
+      "message_id" => message,
+      "revision" => revision
+    }
+
+    if Message.uuid_v4?(attrs["op_id"]) and Message.sender_id?(sender) and
+         Message.nonempty?(message) do
+      {:ok, attrs}
+    else
+      {:error, :invalid_upload}
+    end
+  end
+
+  defp process_inline_files(state, key, person, frame, target, files) do
+    result =
+      Enum.reduce_while(files, {:ok, [], 0, MapSet.new(), state.store.engine, [], []}, fn file,
+                                                                                         {:ok, reversed,
+                                                                                          inline_total,
+                                                                                          names,
+                                                                                          engine,
+                                                                                          created_ids,
+                                                                                          created_paths} ->
+        case prepare_inline_file(
+               state,
+               key,
+               person,
+               target,
+               file,
+               inline_total,
+               names,
+               engine,
+               created_ids,
+               created_paths
+             ) do
+          {:ok, next_file, next_total, next_names, next_engine, next_ids, next_paths} ->
+            {:cont,
+             {:ok, [next_file | reversed], next_total, next_names, next_engine, next_ids,
+              next_paths}}
+
+          {:error, reason, _ids, paths} ->
+            AttentionServer.LargeData.cleanup_created(paths)
+            {:halt, {:error, reason}}
+        end
+      end)
+
+    case result do
+      {:ok, reversed, _total, _names, engine, ids, paths} ->
+        {:ok, engine, Map.put(frame, "files", Enum.reverse(reversed)), ids, paths}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp prepare_inline_file(
+         _state,
+         _key,
+         _person,
+         _target,
+         %{"upload_id" => _id} = file,
+         total,
+         names,
+         engine,
+         ids,
+         paths
+       ) do
+    name = file["name"]
+
+    if ConversationFiles.valid_name?(name) and not MapSet.member?(names, name),
+      do: {:ok, file, total, MapSet.put(names, name), engine, ids, paths},
+      else: {:error, "files", ids, paths}
+  end
+
+  defp prepare_inline_file(
+         state,
+         key,
+         person,
+         target,
+         %{"name" => name, "data_base64" => data} = file,
+         total,
+         names,
+         engine,
+         ids,
+         paths
+       )
+       when map_size(file) == 2 do
+    cond do
+      not ConversationFiles.valid_name?(name) or MapSet.member?(names, name) ->
+        {:error, "files", ids, paths}
+
+      true ->
+        with {:ok, size, hash, source} <- inline_file_source(data) do
+          if total + size <= ConversationFiles.inline_limit() do
+            inline_value =
+              case data do
+                %AttentionServer.LargeData.Ref{} = ref ->
+                  Base.encode64(AttentionServer.LargeData.read!(ref))
+
+                value ->
+                  value
+              end
+
+            next_file = Map.put(file, "data_base64", inline_value)
+
+            {:ok, next_file, total + size, MapSet.put(names, name), engine, ids, paths}
+          else
+            attrs = Map.put(target, "name", name)
+
+            case stage_inline_upload(state, key, person, attrs, size, hash, source, engine) do
+              {:ok, upload, next_engine, new_path} ->
+                next_file = %{
+                  "name" => name,
+                  "upload_id" => upload.id,
+                  "size" => size,
+                  "sha256" => hash
+                }
+
+                next_ids = if is_nil(new_path), do: ids, else: [upload.id | ids]
+                next_paths = if is_nil(new_path), do: paths, else: [new_path | paths]
+
+                {:ok, next_file, total, MapSet.put(names, name), next_engine, next_ids,
+                 next_paths}
+
+              {:error, reason} ->
+                {:error, reason, ids, paths}
+            end
+          end
+        else
+          {:error, reason} -> {:error, reason, ids, paths}
+        end
+    end
+  end
+
+  defp prepare_inline_file(_state, _key, _person, _target, _file, _total, _names, _engine, ids, paths),
+    do: {:error, "files", ids, paths}
+
+  defp inline_file_source(%AttentionServer.LargeData.Ref{} = ref) do
+    case AttentionServer.LargeData.verify(ref) do
+      :ok -> {:ok, ref.size, ref.sha256, {:path, ref.path}}
+      _ -> {:error, "storage_unavailable"}
+    end
+  end
+
+  defp inline_file_source(data) when is_binary(data) do
+    case Base.decode64(data) do
+      {:ok, bytes} ->
+        if Base.encode64(bytes) == data do
+          {:ok, byte_size(bytes), Base.encode16(:crypto.hash(:sha256, bytes), case: :lower),
+           {:bytes, bytes}}
+        else
+          {:error, "files"}
+        end
+
+      _ ->
+        {:error, "files"}
+    end
+  end
+
+  defp inline_file_source(_), do: {:error, "files"}
+
+  defp stage_inline_upload(state, key, person, attrs, size, hash, source, engine) do
+    cond do
+      is_integer(state.upload_cap) and size > state.upload_cap ->
+        {:error, "upload_cap_exceeded"}
+
+      true ->
+        base = %{
+          person: person,
+          uploader: key,
+          uploader_kind:
+            engine
+            |> Engine.upload_source(person, key, attrs["sender_id"], attrs["message_id"])
+            |> Atom.to_string(),
+          op_id: attrs["op_id"],
+          sender_id: attrs["sender_id"],
+          message_id: attrs["message_id"],
+          revision: attrs["revision"],
+          name: attrs["name"],
+          size: size,
+          sha256: hash,
+          last_activity_ms: System.system_time(:millisecond)
+        }
+
+        existing =
+          state.upload_index.ids_by_group
+          |> Map.get(upload_group(person, key, attrs), MapSet.new())
+          |> Enum.find_value(fn id ->
+            case Map.get(state.store.engine.uploads, id) do
+              %{person: ^person, uploader: ^key, op_id: op_id, name: name} = upload
+              when op_id == base.op_id and name == base.name -> upload
+
+              _ -> nil
+            end
+          end)
+
+        case existing do
+          upload when is_map(upload) ->
+            if Map.drop(upload, [:id, :last_activity_ms, :uploader_kind]) ==
+                 Map.drop(base, [:last_activity_ms, :uploader_kind]) do
+              with {:ok, path} <- Store.get_upload(state.store, upload.id),
+                   :ok <- Store.verify_upload(path, upload) do
+                {:ok, upload, engine, nil}
+              else
+                _ -> {:error, "storage_unavailable"}
+              end
+            else
+              {:error, "upload_conflict"}
+            end
+
+          nil ->
+            upload = Map.put(base, :id, ConversationFiles.new_upload_id())
+
+            case inline_source_path(source) do
+              {:ok, source_path, temporary?} ->
+                try do
+                  case Store.stage_upload(state.store.upload_dir, upload, source_path) do
+                    {:ok, staged} ->
+                      try do
+                        case Store.publish_staged_upload(state.store.upload_dir, upload, staged) do
+                          {:ok, published} ->
+                            {:ok, upload, %{engine | uploads: Map.put(engine.uploads, upload.id, upload)}, published}
+
+                          _ ->
+                            {:error, "storage_unavailable"}
+                        end
+                      after
+                        _ = File.rm(staged)
+                      end
+
+                    _ ->
+                      {:error, "storage_unavailable"}
+                  end
+                after
+                  if temporary?, do: File.rm(source_path)
+                end
+
+              _ ->
+                {:error, "storage_unavailable"}
+            end
+        end
+    end
+  end
+
+  defp inline_source_path({:path, path}), do: {:ok, path, false}
+
+  defp inline_source_path({:bytes, bytes}) do
+    path =
+      Path.join(System.tmp_dir!(), "attention-inline-file-#{System.unique_integer([:positive, :monotonic])}")
+
+    case File.write(path, bytes, [:binary, :exclusive]) do
+      :ok -> {:ok, path, true}
+      _ ->
+        _ = File.rm(path)
+        {:error, :storage_unavailable}
+    end
+  end
+
+  defp drop_upload_ids(engine, []), do: engine
+
+  defp drop_upload_ids(engine, ids),
+    do: %{engine | uploads: Map.drop(engine.uploads, ids)}
+
+  defp request_success?({:ok, %JSON.StreamedLine{value: %{"type" => "ok"}}}), do: true
+
+  defp request_success?({:ok, line}) when is_binary(line) do
+    case JSON.decode_line(line) do
+      {:ok, %{"type" => "ok"}} -> true
+      _ -> false
+    end
+  end
+
+  defp request_success?(_), do: false
 
   defp finish_request(state, key, next_engine, reply, operation_id, targets, action, original) do
     if next_engine == state.store.engine do
@@ -6573,7 +7010,7 @@ defmodule AttentionServer.Relay do
     if is_binary(Map.get(frame, "ref")), do: Map.put(result, "ref", frame["ref"]), else: result
   end
 
-  defp line(frame), do: JSON.encode!(frame) <> "\n"
+  defp line(frame), do: JSON.encode_line(frame)
 
   defp put_session(state, id, session) do
     state = %{state | sessions: Map.put(state.sessions, id, session)}
@@ -6593,12 +7030,22 @@ defmodule AttentionServer.Relay do
 
   defp send_frames(socket, frames, transport) do
     Enum.reduce_while(frames, :ok, fn frame, _ ->
-      bytes =
-        if transport == :websocket,
-          do: AttentionServer.WebSocketRelay.encode_text(frame),
-          else: frame
+      result =
+        case frame do
+          %JSON.StreamedLine{} = streamed when transport == :websocket ->
+            AttentionServer.WebSocketRelay.send_text_stream(socket, streamed)
 
-      case :ssl.send(socket, bytes) do
+          %JSON.StreamedLine{} = streamed ->
+            JSON.send_stream(socket, streamed)
+
+          bytes when transport == :websocket ->
+            :ssl.send(socket, AttentionServer.WebSocketRelay.encode_text(bytes))
+
+          bytes ->
+            :ssl.send(socket, bytes)
+        end
+
+      case result do
         :ok -> {:cont, :ok}
         _ -> {:halt, {:error, :send_failed}}
       end

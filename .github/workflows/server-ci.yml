@@ -24,4 +24,21 @@ jobs:
 
       - run: mix deps.get
       - run: MIX_ENV=prod mix compile
+
+      - name: Prepare scratch filesystem for storage exhaustion regression
+        run: |
+          root="$RUNNER_TEMP/harklight-scratch"
+          mkdir -p "$root"
+          sudo mount -t tmpfs -o size=64m,mode=1777 tmpfs "$root"
+          echo "HARKLIGHT_SCRATCH_FS_ROOT=$root" >> "$GITHUB_ENV"
+
       - run: mix test
+
+      - name: Remove scratch filesystem
+        if: always()
+        run: |
+          root="$RUNNER_TEMP/harklight-scratch"
+          if [ -d "$root" ]; then
+            if mountpoint -q "$root"; then sudo umount "$root"; fi
+            rm -rf "$root"
+          fi

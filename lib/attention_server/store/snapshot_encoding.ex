@@ -1,8 +1,7 @@
 defmodule AttentionServer.Store.SnapshotEncoding do
   @moduledoc false
 
-  # This is still one standard compressed Erlang external term, readable by
-  # binary_to_term in the old release. Full-flush DEFLATE blocks have no shared
+  # This is one standard compressed Erlang external term. Full-flush DEFLATE blocks have no shared
   # dictionary, so unchanged records can reuse their compressed bytes. The cache
   # is ephemeral; SQLite still gets a complete, checksummed snapshot per commit.
   def encode(engine, format, previous \\ %{}) do

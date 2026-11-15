@@ -1,7 +1,7 @@
 defmodule AttentionServer.JevClient do
   @moduledoc false
 
-  alias AttentionServer.JSON
+  alias AttentionServer.{JSON, LargeData}
 
   @key_path_env "ATTENTION_SERVER_JEV_KEY_PATH"
   @response_limit 4 * 1024 * 1024
@@ -52,7 +52,17 @@ defmodule AttentionServer.JevClient do
 
   def compose(items, endpoint, model, now)
       when is_list(items) and is_binary(endpoint) and is_binary(model) do
-    if valid_endpoint?(endpoint) and valid_model?(model) do
+    cond do
+      not valid_endpoint?(endpoint) or not valid_model?(model) ->
+        {:error, :jev_unconfigured}
+
+      LargeData.contains_ref?(items) ->
+        # A disk-backed field is larger than the existing ranking budgets.
+        # Keep the established clipped-item result without reading it into a
+        # request body just to discover that it cannot be sent.
+        {:error, :request_too_large}
+
+      true ->
       {questions, question_identities} =
         items
         |> Enum.with_index(1)
@@ -165,8 +175,6 @@ defmodule AttentionServer.JevClient do
       else
         {:error, :request_too_large}
       end
-    else
-      {:error, :jev_unconfigured}
     end
   rescue
     _ -> {:error, :invalid_request}

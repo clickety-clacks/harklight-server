@@ -17,13 +17,14 @@ defmodule AttentionServer.Store do
     Conversation,
     Diagnostics,
     Engine,
-    GuidedJoin
+    GuidedJoin,
+    LargeData
   }
 
   alias Exqlite.Sqlite3
   alias AttentionServer.Store.{Persistence, SnapshotEncoding}
 
-  @format_version 29
+  @format_version 30
   @inbox_index_chunk_size 20
   defstruct [:db, :engine, :version, :upload_dir, progress_version: 0, encoding_cache: %{}]
 
@@ -126,7 +127,7 @@ defmodule AttentionServer.Store do
 
     case Sqlite3.open(path) do
       {:ok, db} ->
-        case initialize(db) do
+        case initialize(db, upload_dir) do
           {:ok, engine, version} ->
             engine =
               engine
@@ -135,6 +136,8 @@ defmodule AttentionServer.Store do
 
             with :ok <- File.mkdir_p(upload_dir),
                  :ok <- File.chmod(upload_dir, 0o700),
+                 engine <- LargeData.attach_paths(engine, upload_dir),
+                 :ok <- LargeData.verify_all(engine),
                  :ok <-
                    prune_untracked_uploads(%__MODULE__{
                      db: db,
@@ -142,6 +145,7 @@ defmodule AttentionServer.Store do
                      version: version,
                      upload_dir: upload_dir
                    }),
+                 :ok <- LargeData.prune(upload_dir, engine),
                  {:ok, store} <-
                    load_progress(%__MODULE__{
                      db: db,
@@ -152,7 +156,9 @@ defmodule AttentionServer.Store do
               engine = store.engine
 
               {_payload, cache} =
-                Persistence.run(fn -> SnapshotEncoding.encode(engine, @format_version) end)
+                Persistence.run(fn ->
+                  SnapshotEncoding.encode(LargeData.persist_refs(engine), @format_version)
+                end)
 
               {:ok, %{store | encoding_cache: cache}}
             else
@@ -991,10 +997,10 @@ defmodule AttentionServer.Store do
     end
   end
 
-  defp initialize(db) do
+  defp initialize(db, upload_dir) do
     with :ok <- Sqlite3.execute(db, "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;"),
          :ok <- Sqlite3.execute(db, @schema),
-         result <- load_or_create(db) do
+         result <- load_or_create(db, upload_dir) do
       result
     end
   end
@@ -1041,13 +1047,20 @@ defmodule AttentionServer.Store do
     # The worker needs the generation and connection, not a second copy of the
     # old engine. The caller keeps its committed snapshot until this returns.
     generation = %{store | engine: nil}
+    old_refs = LargeData.refs(store.engine)
 
-    result = Persistence.run(fn -> persist_snapshot(generation, next, audit) end)
+    result = Persistence.run(fn -> persist_snapshot(generation, next, audit, old_refs) end)
 
     case result do
-      {:ok, cache} ->
+      {:ok, cache, durable_next} ->
         {:ok,
-         %{store | engine: next, version: version + 1, progress_version: 0, encoding_cache: cache}}
+         %{
+           store
+           | engine: durable_next,
+             version: version + 1,
+             progress_version: 0,
+             encoding_cache: cache
+         }}
 
       error ->
         Diagnostics.failure(
@@ -1063,41 +1076,46 @@ defmodule AttentionServer.Store do
     end
   end
 
-  defp persist_snapshot(%{db: db, version: version} = store, next, audit) do
-    {payload, cache} = SnapshotEncoding.encode(next, @format_version, store.encoding_cache)
-    checksum = :crypto.hash(:sha256, payload)
-
-    result =
-      with :ok <- Sqlite3.execute(db, "BEGIN IMMEDIATE"),
-           :ok <- check_progress_version(store),
-           :ok <-
-             run(
-               db,
-               "UPDATE relay_state SET version = version + 1, payload = ?, checksum = ? WHERE id = 1 AND version = ?",
-               [
-                 {:blob, payload},
-                 {:blob, checksum},
-                 version
-               ]
-             ),
-           {:ok, 1} <- Sqlite3.changes(db),
-           :ok <- Sqlite3.execute(db, "DELETE FROM relay_device_progress"),
-           :ok <-
-             run(
-               db,
-               "INSERT INTO relay_audit (person_id, actor_id, action, at_ms) VALUES (?, ?, ?, ?)",
-               [
-                 audit.person,
-                 audit.actor,
-                 audit.action,
-                 System.system_time(:millisecond)
-               ]
-             ),
-           :ok <- Sqlite3.execute(db, "COMMIT") do
-        {:ok, cache}
+  defp persist_snapshot(
+         %{db: db, version: version, upload_dir: upload_dir} = store,
+         next,
+         audit,
+         old_refs
+       ) do
+    with {:ok, durable_next, _created} <- LargeData.externalize(next, upload_dir),
+         true <- LargeData.valid_refs?(durable_next),
+         persisted = LargeData.persist_refs(durable_next),
+         {payload, cache} <- SnapshotEncoding.encode(persisted, @format_version, store.encoding_cache),
+         checksum = :crypto.hash(:sha256, payload),
+         :ok <- Sqlite3.execute(db, "BEGIN IMMEDIATE"),
+         :ok <- check_progress_version(store),
+         :ok <-
+           run(
+             db,
+             "UPDATE relay_state SET version = version + 1, payload = ?, checksum = ? WHERE id = 1 AND version = ?",
+             [{:blob, payload}, {:blob, checksum}, version]
+           ),
+         {:ok, 1} <- Sqlite3.changes(db),
+         :ok <- Sqlite3.execute(db, "DELETE FROM relay_device_progress"),
+         :ok <-
+           run(
+             db,
+             "INSERT INTO relay_audit (person_id, actor_id, action, at_ms) VALUES (?, ?, ?, ?)",
+             [audit.person, audit.actor, audit.action, System.system_time(:millisecond)]
+           ),
+         :ok <- Sqlite3.execute(db, "COMMIT") do
+      if is_binary(upload_dir) do
+        case LargeData.delete_unreferenced(upload_dir, old_refs, durable_next) do
+          :ok -> :ok
+          error -> Diagnostics.failure(:server_storage, :large_data_delete, error, :unavailable, operation_id(audit))
+        end
       end
 
-    result
+      {:ok, cache, durable_next}
+    else
+      false -> {:error, :invalid_large_data}
+      error -> error
+    end
   end
 
   # ACKs must be durable before their replies, but do not change retained history.
@@ -1221,7 +1239,7 @@ defmodule AttentionServer.Store do
     end
   end
 
-  defp load_or_create(db) do
+  defp load_or_create(db, upload_dir) do
     case one(db, "SELECT version, payload, checksum FROM relay_state WHERE id = 1", []) do
       {:ok, nil} ->
         engine = Engine.new()
@@ -1236,7 +1254,7 @@ defmodule AttentionServer.Store do
                    {:blob, :crypto.hash(:sha256, payload)}
                  ]
                ) do
-          load_or_create(db)
+          load_or_create(db, upload_dir)
         end
 
       {:ok, [version, payload, checksum]} when is_integer(version) and is_binary(payload) ->
@@ -1255,7 +1273,8 @@ defmodule AttentionServer.Store do
                   AttentionServer.JSON.DecimalToken,
                   APNS,
                   AttentionServer.AgentAccess,
-                  AttentionServer.Message
+                  AttentionServer.Message,
+                  AttentionServer.LargeData.Ref
                 ] do
               {:module, ^module} = Code.ensure_loaded(module)
             end
@@ -1290,7 +1309,8 @@ defmodule AttentionServer.Store do
                      26,
                      27,
                      28,
-                     29
+                     29,
+                     30
                    ] ->
                 original = struct(Engine, Map.from_struct(stored))
 
@@ -1298,7 +1318,12 @@ defmodule AttentionServer.Store do
                 # table. Load them before normalization advances the snapshot
                 # generation, and fold them into that same migration transaction.
                 with {:ok, original_store} <-
-                       load_progress(%__MODULE__{db: db, engine: original, version: version}) do
+                       load_progress(%__MODULE__{
+                         db: db,
+                         engine: original,
+                         version: version,
+                         upload_dir: upload_dir
+                       }) do
                   original = original_store.engine
 
                   engine =
@@ -1435,6 +1460,7 @@ defmodule AttentionServer.Store do
                                    format < 27 -> "bounce_schedule_index_init"
                                    format < 28 -> "device_focus_permissions_init"
                                    format < 29 -> "hosted_delivery_state_init"
+                                   format < 30 -> "large_data_reference_storage"
                                    true -> "state_format"
                                  end
                              }
@@ -2212,6 +2238,7 @@ defmodule AttentionServer.Store do
         BounceDecision.valid_state?(engine, bounce_validation) and
         valid_uploads?(engine) and
         valid_upload_references?(engine) and
+        LargeData.valid_refs?(engine) and
         Enum.all?(engine.devices, fn {_key, device} ->
           Map.has_key?(engine.persons, device.person) and
             is_integer(device.enrollment_revision) and device.enrollment_revision > 0 and

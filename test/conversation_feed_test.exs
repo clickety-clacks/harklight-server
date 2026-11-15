@@ -1,8 +1,18 @@
 defmodule AttentionServer.ConversationFeedTest do
   use ExUnit.Case, async: false
 
-  alias AttentionServer.{BounceDecision, BouncePolicy, Engine, JSON, OriginWire, Relay, Store}
+  alias AttentionServer.{
+    BounceDecision,
+    BouncePolicy,
+    Engine,
+    JSON,
+    LargeData,
+    OriginWire,
+    Relay,
+    Store
+  }
   alias Exqlite.Sqlite3
+  alias AttentionServer.Store.SnapshotEncoding
 
   @handle "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 
@@ -81,6 +91,27 @@ defmodule AttentionServer.ConversationFeedTest do
 
     assert status == 0, "cold-reopen process failed (exit #{status}):\n#{output}"
     assert output =~ "COLD_STORE_REOPEN_AND_USE_OK"
+  end
+
+  defp wait_for_large_data_file(directory, port, deadline) do
+    case File.ls!(directory)
+         |> Enum.find(&Regex.match?(~r/\A[0-9a-f]{64}\z/, &1)) do
+      nil ->
+        cond do
+          is_nil(Port.info(port)) ->
+            {:error, :child_exited}
+
+          System.monotonic_time(:millisecond) >= deadline ->
+            {:error, :timeout}
+
+          true ->
+            Process.sleep(10)
+            wait_for_large_data_file(directory, port, deadline)
+        end
+
+      name ->
+        {:ok, name}
+    end
   end
 
   test "message_open stores one account-wide revision fact without changing feed or lifecycle cursors",
@@ -579,9 +610,7 @@ defmodule AttentionServer.ConversationFeedTest do
     GenServer.stop(relay)
   end
 
-  test "inline file bytes replay exactly and an over-limit turn changes no request state", %{
-    path: path
-  } do
+  test "aggregate inline attachments above the threshold use the upload tier", %{path: path} do
     assert {:ok, relay} = Relay.start_link(store_path: path)
     assert :ok = Relay.setup_person(relay, "A")
     assert :ok = Relay.setup_device(relay, "A", "origin")
@@ -623,9 +652,13 @@ defmodule AttentionServer.ConversationFeedTest do
     assert stored["size"] == byte_size(bytes)
     assert stored["sha256"] == Base.encode16(:crypto.hash(:sha256, bytes), case: :lower)
 
-    oversized = %{"name" => "oversized.bin", "data_base64" => Base.encode64(<<0>> <> bytes)}
+    inline_bytes = :binary.copy(<<11, 0, 255, 29>>, 38_400)
+    overflow_bytes = :binary.copy(<<4, 3, 2, 1>>, 30_000)
+    assert byte_size(inline_bytes) < 262_144
+    assert byte_size(overflow_bytes) < 262_144
+    assert byte_size(inline_bytes) + byte_size(overflow_bytes) > 262_144
 
-    assert %{"type" => "error", "reason" => "invalid_field", "field" => "files"} =
+    assert %{"type" => "ok"} =
              request(relay, "reader", %{
                "type" => "discussion",
                "op_id" => op(502),
@@ -633,28 +666,28 @@ defmodule AttentionServer.ConversationFeedTest do
                "message_id" => "file-request",
                "request_revision" => 1,
                "text" => "Please clarify",
-               "files" => [oversized]
+               "files" => [
+                 %{"name" => "inline.bin", "data_base64" => Base.encode64(inline_bytes)},
+                 %{"name" => "overflow.bin", "data_base64" => Base.encode64(overflow_bytes)}
+               ]
              })
 
-    assert {:ok, %{"cursor" => 1, "entries" => [_]}} =
-             Relay.origin_feed(relay, "origin", 0)
+    assert {:ok, %{"entries" => [_, pending]}} = Relay.origin_feed(relay, "origin", 0)
+    assert pending["delivered"] == false
+    assert [inline, uploaded] = pending["files"]
+    assert inline["tier"] == "inline"
+    assert Base.decode64!(inline["data_base64"]) == inline_bytes
+    assert inline["sha256"] == Base.encode16(:crypto.hash(:sha256, inline_bytes), case: :lower)
+    assert uploaded["tier"] == "upload"
+    assert uploaded["name"] == "overflow.bin"
+    assert uploaded["size"] == byte_size(overflow_bytes)
+    assert uploaded["sha256"] == Base.encode16(:crypto.hash(:sha256, overflow_bytes), case: :lower)
 
-    revised_message = Map.put(message, "title", "Updated question")
+    assert {:ok, _upload, fetched_path} = Relay.fetch_file(relay, "origin", uploaded["upload_id"])
+    assert File.read!(fetched_path) == overflow_bytes
 
-    assert %{"type" => "error", "reason" => "invalid_field", "field" => "files"} =
-             request(relay, "origin", %{
-               "type" => "conversation_revise",
-               "op_id" => op(503),
-               "sender_id" => "app:test",
-               "message_id" => "file-request",
-               "base_revision" => 1,
-               "message" => revised_message,
-               "files" => [oversized]
-             })
-
-    assert {:ok, [unchanged], 1} = Relay.events(relay, "reader", 0)
-    assert unchanged["message"] == message
-    assert unchanged["files"] == recipient_delivery["files"]
+    assert {:ok, %{"inline_decoded_bytes_per_entry" => 262_144}} =
+             Relay.origin_file_limits(relay, "origin")
 
     GenServer.stop(relay)
     assert {:ok, restarted} = Relay.start_link(store_path: path)
@@ -664,6 +697,227 @@ defmodule AttentionServer.ConversationFeedTest do
     assert %{"type" => "ok", "seq" => 1, "duplicate" => true} =
              request(restarted, "origin", send)
 
+    GenServer.stop(restarted)
+  end
+
+  test "large message titles stay in the content store and survive a restart", %{path: path} do
+    assert {:ok, relay} = Relay.start_link(store_path: path)
+    assert :ok = Relay.setup_person(relay, "A")
+    assert :ok = Relay.setup_device(relay, "A", "origin")
+    assert :ok = Relay.setup_sender(relay, "origin", "app:test")
+
+    title = Base.encode64(:crypto.strong_rand_bytes(1_572_870))
+    assert byte_size(title) > 2 * 1024 * 1024
+    title_hash = Base.encode16(:crypto.hash(:sha256, title), case: :lower)
+    {_, before_payload, _} = state_snapshot(path)
+
+    assert %{"type" => "ok", "seq" => 1} =
+             request(relay, "origin", %{
+               "type" => "forward",
+               "op_id" => op(503),
+               "session_handle" => @handle,
+               "message" => %{
+                 "sender_id" => "app:test",
+                 "message_id" => "large-title",
+                 "created_at" => 1,
+                 "title" => title
+               }
+             })
+
+    {_, committed_payload, _} = state_snapshot(path)
+    assert byte_size(committed_payload) - byte_size(before_payload) < 65_536
+
+    state = :sys.get_state(relay)
+    record = state.store.engine.messages[{"A", "app:test", "large-title"}]
+    assert %AttentionServer.LargeData.Ref{} = ref = record.message["title"]
+    assert ref.size == byte_size(title)
+    assert ref.sha256 == title_hash
+    assert Base.encode16(:crypto.hash(:sha256, File.read!(ref.path)), case: :lower) == title_hash
+
+    GenServer.stop(relay)
+    assert {:ok, restarted} = Relay.start_link(store_path: path)
+
+    assert {:ok, %{"message" => %{"title" => restored_ref}}} =
+             Relay.origin_message_get(restarted, "origin", "app:test", "large-title", 1)
+
+    assert %AttentionServer.LargeData.Ref{} = restored_ref
+    assert AttentionServer.LargeData.read!(restored_ref) == title
+    GenServer.stop(restarted)
+  end
+
+  test "FORMAT29 migration externalizes retained large title and body", %{path: path} do
+    {:ok, relay} = Relay.start_link(store_path: nil)
+    assert :ok = Relay.setup_person(relay, "A")
+    assert :ok = Relay.setup_device(relay, "A", "origin")
+    assert :ok = Relay.setup_sender(relay, "origin", "app:test")
+
+    title = Base.encode64(:crypto.strong_rand_bytes(1_572_870))
+    body = Base.encode64(:crypto.strong_rand_bytes(1_572_870))
+
+    assert %{"type" => "ok", "seq" => 1} =
+             request(relay, "origin", %{
+               "type" => "forward",
+               "op_id" => op(505),
+               "session_handle" => @handle,
+               "message" => %{
+                 "sender_id" => "app:test",
+                 "message_id" => "format29-large-data",
+                 "created_at" => 1,
+                 "title" => title,
+                 "body" => body
+               }
+             })
+
+    legacy_engine = :sys.get_state(relay).store.engine
+    GenServer.stop(relay)
+
+    {legacy_payload, _cache} = SnapshotEncoding.encode(legacy_engine, 29)
+    assert byte_size(legacy_payload) > 2 * 1024 * 1024
+
+    assert {:ok, empty} = Store.open(path)
+    assert :ok = Store.close(empty)
+
+    assert {:ok, db} = Sqlite3.open(path)
+    assert {:ok, stmt} =
+             Sqlite3.prepare(
+               db,
+               "UPDATE relay_state SET version = 0, payload = ?, checksum = ? WHERE id = 1"
+             )
+
+    assert :ok =
+             Sqlite3.bind(stmt, [
+               {:blob, legacy_payload},
+               {:blob, :crypto.hash(:sha256, legacy_payload)}
+             ])
+
+    assert :done = Sqlite3.step(db, stmt)
+    assert :ok = Sqlite3.release(db, stmt)
+    assert :ok = Sqlite3.close(db)
+
+    assert {:ok, migrated} = Store.open(path)
+    assert migrated.version == 1
+
+    record = migrated.engine.messages[{"A", "app:test", "format29-large-data"}]
+    assert %LargeData.Ref{} = title_ref = record.message["title"]
+    assert %LargeData.Ref{} = body_ref = record.message["body"]
+    assert LargeData.read!(title_ref) == title
+    assert LargeData.read!(body_ref) == body
+
+    {version, payload, _checksum} = state_snapshot(path)
+    assert version == 1
+    assert byte_size(payload) < 65_536
+    assert {:attention_relay_state, 30, persisted} = :erlang.binary_to_term(payload, [:safe])
+    persisted_record = persisted.messages[{"A", "app:test", "format29-large-data"}]
+    assert %LargeData.Ref{path: nil} = persisted_record.message["title"]
+    assert %LargeData.Ref{path: nil} = persisted_record.message["body"]
+    assert :ok = Store.close(migrated)
+  end
+
+  test "a failed large-data commit leaves no dangling reference and prunes its complete orphan",
+       %{path: path} do
+    assert {:ok, relay} = Relay.start_link(store_path: path)
+    assert :ok = Relay.setup_person(relay, "A")
+    assert :ok = Relay.setup_device(relay, "A", "origin")
+    assert :ok = Relay.setup_sender(relay, "origin", "app:test")
+
+    {:ok, db} = Sqlite3.open(path)
+
+    :ok =
+      Sqlite3.execute(
+        db,
+        "CREATE TRIGGER reject_large_commit BEFORE UPDATE ON relay_state BEGIN SELECT RAISE(ABORT, 'simulated commit boundary'); END"
+      )
+
+    :ok = Sqlite3.close(db)
+    body = Base.encode64(:crypto.strong_rand_bytes(2_097_152))
+
+    assert %{"type" => "error", "reason" => "storage_unavailable"} =
+             request(relay, "origin", %{
+               "type" => "forward",
+               "op_id" => op(504),
+               "session_handle" => @handle,
+               "message" => %{
+                 "sender_id" => "app:test",
+                 "message_id" => "commit-boundary",
+                 "created_at" => 1,
+                 "title" => "Commit boundary",
+                 "body" => body
+               }
+             })
+
+    assert :sys.get_state(relay).store.engine.messages == %{}
+    data_dir = Path.expand(path) <> ".uploads"
+    assert [orphan] = File.ls!(data_dir)
+    assert Regex.match?(~r/\A[0-9a-f]{64}\z/, orphan)
+    GenServer.stop(relay)
+
+    {:ok, db} = Sqlite3.open(path)
+    :ok = Sqlite3.execute(db, "DROP TRIGGER reject_large_commit")
+    :ok = Sqlite3.close(db)
+
+    assert {:ok, restarted} = Relay.start_link(store_path: path)
+    assert :sys.get_state(restarted).store.engine.messages == %{}
+    assert File.ls!(data_dir) == []
+    GenServer.stop(restarted)
+  end
+
+  test "a process crash after large data is synced but before its reference commits leaves no dangling state",
+       %{path: path} do
+    assert {:ok, relay} = Relay.start_link(store_path: path)
+    assert :ok = Relay.setup_person(relay, "A")
+    assert :ok = Relay.setup_device(relay, "A", "origin")
+    assert :ok = Relay.setup_sender(relay, "origin", "app:test")
+    GenServer.stop(relay)
+
+    data_dir = Path.expand(path) <> ".uploads"
+    assert {:ok, lock_db} = Sqlite3.open(path)
+    assert :ok = Sqlite3.execute(lock_db, "BEGIN IMMEDIATE")
+
+    mix = System.find_executable("mix")
+    assert is_binary(mix)
+
+    child =
+      Port.open({:spawn_executable, String.to_charlist(mix)}, [
+        :binary,
+        :exit_status,
+        :stderr_to_stdout,
+        :use_stdio,
+        {:args,
+         Enum.map(
+           ["run", "--no-start", "--no-compile", "test/support/large_data_commit_child.exs"],
+           &String.to_charlist/1
+         )},
+        {:cd, String.to_charlist(Path.expand("..", __DIR__))},
+        {:env,
+         [
+           {~c"MIX_ENV", ~c"test"},
+           {~c"WI2F2_STORE_PATH", String.to_charlist(path)}
+         ]}
+      ])
+
+    try do
+      {:os_pid, child_pid} = Port.info(child, :os_pid)
+      deadline = System.monotonic_time(:millisecond) + 30_000
+      assert {:ok, _blob_name} = wait_for_large_data_file(data_dir, child, deadline)
+
+      {_, 0} = System.cmd("kill", ["-KILL", Integer.to_string(child_pid)])
+      assert_receive {^child, {:exit_status, status}} when status != 0, 10_000
+    after
+      case Port.info(child, :os_pid) do
+        {:os_pid, running_pid} ->
+          _ = System.cmd("kill", ["-KILL", Integer.to_string(running_pid)])
+
+        _ ->
+          :ok
+      end
+
+      _ = Sqlite3.execute(lock_db, "ROLLBACK")
+      _ = Sqlite3.close(lock_db)
+    end
+
+    assert {:ok, restarted} = Relay.start_link(store_path: path)
+    assert :sys.get_state(restarted).store.engine.messages == %{}
+    assert File.ls!(data_dir) == []
     GenServer.stop(restarted)
   end
 
