@@ -7,16 +7,16 @@ Harklight iOS/iPadOS app.
 
 ## Install the server
 
-For the FORMAT27 v0.1.41 server package, use the release page below after it
+For the FORMAT27 v0.1.42 server package, use the release page below after it
 is published to download the Linux x86_64 archive, `SHA256SUMS` and
 `SELF_HOST.md`. Verify the checksum before extraction:
 
-[v0.1.41 release](https://github.com/clickety-clacks/harklight-server/releases/tag/v0.1.41)
+[v0.1.42 release](https://github.com/clickety-clacks/harklight-server/releases/tag/v0.1.42)
 (available only after publication).
 
 ```sh
 sha256sum -c SHA256SUMS
-tar -xzf harklight-server-0.1.41-linux-x86_64.tar.gz
+tar -xzf harklight-server-0.1.42-linux-x86_64.tar.gz
 ```
 
 Follow [SELF_HOST.md](SELF_HOST.md) for a fresh installation, tailnet routing,
@@ -28,7 +28,7 @@ The package does not install a service, configure the tailnet or expose ports.
 State, owner/device identities, trust roots and sender grants live outside the
 versioned package. Run one server per database. Keep private keys and backups
 private; do not repeat bootstrap over an existing installation.
-This source, v0.1.41, continues the v0.1.35 maintenance line with durable-ACK,
+This source, v0.1.42, continues the v0.1.35 maintenance line with durable-ACK,
 timeout, and account-wide agent reads. It also moves snapshot encoding, hashing
 and SQLite persistence to a linked worker, allowing the explicitly supported
 read operations to use the last committed in-memory snapshot while persistence
@@ -37,7 +37,12 @@ durable commit. Every registered, non-revoked agent can read all
 messages on its account regardless of sender. Sender filters select search
 results only; they do not limit access. New registrations need no per-sender
 read grant for reads. Answering still requires both a matching read grant and
-a matching respond grant; response behavior is unchanged.
+a matching respond grant; response behavior is unchanged. ACK recovery is
+monotonic: a repeated or earlier ACK returns the current durable cursor, an
+impossible stored cursor above the stream high-water is clamped on conversation
+open or ACK, and an older pending inbox checkpoint does not overwrite newer
+durable ACK progress. Checkpoint responses continue to report the high-water
+mark of the checkpoint snapshot.
 It excludes the focus and FORMAT29 work from v0.1.37 and cannot open an existing
 FORMAT28 or FORMAT29 store. It retains FORMAT27 and the additive SQLite progress
 table without rewriting existing snapshot content. It retains startup support for
@@ -50,12 +55,13 @@ FORMAT24 and migrate supported older state on startup.
 The v0.1.12 package uses FORMAT23, v0.1.11 uses FORMAT22, and v0.1.10 accepts
 formats 1–6 and 8–21. Those pre-FORMAT24 packages cannot start against FORMAT24
 state. The release installer takes one full private-root backup while the
-service is stopped and before switching releases. Returning from v0.1.41 to
+service is stopped and before switching releases. Returning from v0.1.42 to
 v0.1.35 requires restoring that backup and the prior binary: v0.1.35 ignores the
 newer ACK progress in the additive table. Restore discards writes after capture
-and cannot undo external deliveries. An isolated manual upgrade/restore using
-the same product code served the original seeded data after restoration; the
-complete systemd installer and failure recovery cases were not exercised.
+and cannot undo external deliveries. The isolated v0.1.41 manual
+upgrade/restore rehearsal served the original seeded data after restoration;
+that result does not establish a rehearsal result for v0.1.42. The complete
+systemd installer and failure recovery cases were not exercised.
 Restore or prior-release startup can fail and leave the service stopped.
 
 v0.1.41 persists ACK and replay progress without repeatedly encoding the whole

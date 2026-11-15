@@ -1,6 +1,6 @@
 # Harklight Server self-hosted installation
 
-Version: **0.1.41**. Package target: **Linux x86_64, glibc 2.39 or newer**, with OpenSSL 3 shared libraries and libstdc++6 (built on Ubuntu 24.04). The package bundles
+Version: **0.1.42**. Package target: **Linux x86_64, glibc 2.39 or newer**, with OpenSSL 3 shared libraries and libstdc++6 (built on Ubuntu 24.04). The package bundles
 Erlang/OTP and Elixir bytecode; users need no Mix, Hex, source checkout or
 Erlang installation. It needs Bash, OpenSSL CLI, tar and the platform libraries
 listed in BUILD_INFO. This is a single-process self-hosted server cut.
@@ -32,9 +32,9 @@ a live phone test.
 
 ## Download and verify
 
-After publication, download the v0.1.41 release from
-clickety-clacks/harklight-server, tag v0.1.41. Get
-harklight-server-0.1.41-linux-x86_64.tar.gz, SHA256SUMS and SELF_HOST.md from
+After publication, download the v0.1.42 release from
+clickety-clacks/harklight-server, tag v0.1.42. Get
+harklight-server-0.1.42-linux-x86_64.tar.gz, SHA256SUMS and SELF_HOST.md from
 that release. Run sha256sum -c SHA256SUMS and extract into an operator-owned
 versioned directory. BUILD_INFO identifies the source commit, build host,
 toolchain, source status and native dependencies.
@@ -47,7 +47,7 @@ runtime/dependency notices remain in their shipped distribution files.
 Choose the DNS hostname clients will validate. For a same-machine preview,
 localhost works. Install into a directory you own and run:
 
-    PACKAGE="$PWD/harklight-server-0.1.41-linux-x86_64"
+    PACKAGE="$PWD/harklight-server-0.1.42-linux-x86_64"
     STATE="$HOME/.local/share/harklight-server"
     "$PACKAGE/bin/harklight-bootstrap" "$STATE" localhost
     cat "$STATE/person-id"
@@ -314,18 +314,23 @@ survive restart.
 For a manual upgrade of an existing installation, stop the old server and back
 up the full private state before upgrading. The release installer makes one
 full mutable-root backup after stopping the service and before switching
-releases. This source, v0.1.41, continues the v0.1.35 line with durable-ACK and timeout
-fixes and account-wide agent reads; it excludes the focus and FORMAT29 work from
-v0.1.37. Snapshot encoding, hashing and SQLite persistence run in a linked
-worker. The explicitly supported pure reads can use the last committed
+releases. This source, v0.1.42, continues the v0.1.35 line with durable-ACK
+and timeout fixes and account-wide agent reads; it excludes the focus and
+FORMAT29 work from v0.1.37. Snapshot encoding, hashing and SQLite persistence
+run in a linked worker. The explicitly supported pure reads can use the last committed
 in-memory snapshot while persistence is in progress; mutations remain ordered
 and their success waits for the durable commit. Every registered,
 non-revoked agent can read all messages on its account regardless of sender.
 Sender filters select search results only; they do not limit access.
 New registrations need no per-sender read grant for reads. Answering still
 requires both a matching read grant and a matching respond grant; response
-behavior is unchanged. It writes FORMAT27 and adds a SQLite progress
-table without rewriting the existing snapshot or migrating its format. It
+behavior is unchanged. ACK recovery is monotonic: a repeated or earlier ACK
+returns the current durable cursor, an impossible stored cursor above the
+stream high-water is clamped on conversation open or ACK, and an older pending
+inbox checkpoint does not overwrite newer durable ACK progress. Checkpoint
+responses continue to report the high-water mark of the checkpoint snapshot.
+It retains FORMAT27 and the additive SQLite progress table without rewriting
+the existing snapshot or migrating its format. It
 cannot open an existing FORMAT28 or FORMAT29 store.
 It retains the supported
 FORMAT25-to-FORMAT27 migration already present in v0.1.33. The v0.1.28 package
@@ -420,11 +425,11 @@ exact acceptance sequence and intent reference, without source ruling authority.
 
 For a manual upgrade, stop the old process and back up the complete private
 state directory, including the database and keys, before the first start of a
-v0.1.41 package. Verify the package checksum and extract into a different
+v0.1.42 package. Verify the package checksum and extract into a different
 versioned directory. Keep the state path, trust root, owner/person and
 configuration. Start with the existing `server.env`; do not rerun bootstrap.
 The first start durably migrates supported FORMAT25 state to FORMAT27. The
-v0.1.41 retains FORMAT27 and the additive progress table. Snapshot encoding,
+v0.1.42 retains FORMAT27 and the additive progress table. Snapshot encoding,
 hashing and SQLite persistence run in a linked worker; no schema migration is
 introduced. Published
 v0.1.35 opens and serves that store but ignores the new table's ACK progress.
@@ -437,11 +442,11 @@ creates one full mutable-root backup, switches `current`, and starts the
 selected package. It waits for the selected process to become active under that
 release. If the candidate start or process readiness fails, it attempts to
 stop the candidate, restore the pre-install mutable root and prior `current`
-link from that backup, then start and check the prior release. An isolated
-manual upgrade/restore with the same product code exercised this archive
-operation and the unchanged shipped restore function, using real packaged
-servers and seeded data; the restored database and message content matched.
-It did not exercise the complete systemd installer or failure recovery cases.
+link from that backup, then start and check the prior release. The isolated
+v0.1.41 manual upgrade/restore rehearsal used its exact archive and seeded
+data; the restored database and message content matched. That result does not
+establish a rehearsal result for v0.1.42. The rehearsal did not exercise the
+complete systemd installer or its failure-recovery cases.
 The restore or prior-release startup/readiness can
 fail and leave the service stopped. The failed package remains under its
 versioned release directory but is not selected. The archive includes the
@@ -467,8 +472,8 @@ The installer attempts backup restoration only when candidate start or
 process-readiness fails. After readiness, it does not automatically roll back;
 the optional owner agent-list probe is warning-only.
 
-Before the first v0.1.41 start, stop the server and take a complete private
-state backup, including the database and keys. After any v0.1.41 write,
+Before the first v0.1.42 start, stop the server and take a complete private
+state backup, including the database and keys. After any v0.1.42 write,
 returning to v0.1.28 requires stopping the server, restoring that pre-start
 backup and then running v0.1.28. v0.1.28 cannot read the resulting FORMAT27
 state, and changing only the code or release link does not restore
