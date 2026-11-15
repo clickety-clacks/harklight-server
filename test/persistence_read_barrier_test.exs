@@ -26,12 +26,22 @@ defmodule AttentionServer.PersistenceReadBarrierTest do
   defp read(store, {:device_revoked?, key}, _from),
     do: Engine.device_revoked?(store.engine, key)
 
-  # Setup includes opening and seeding SQLite. Wait for its actual ready event;
-  # the ExUnit test timeout still bounds a stalled setup.
-  defp await_writer(owner, monitor) do
+  # Disk work and worker scheduling are not subject to a 100 ms contract.
+  # Observe each barrier event (or owner failure); the unchanged ExUnit test
+  # timeout still bounds a stalled test.
+  defp await_event(owner, monitor, event) do
     receive do
-      {:writing, writer} -> writer
-      {:DOWN, ^monitor, :process, ^owner, reason} -> flunk("setup failed: #{inspect(reason)}")
+      {^event, value} ->
+        value
+
+      {:DOWN, ^monitor, :process, ^owner, reason} ->
+        flunk("owner exited before #{event}: #{inspect(reason)}")
+    end
+  end
+
+  defp await_exit(owner, monitor) do
+    receive do
+      {:DOWN, ^monitor, :process, ^owner, reason} -> reason
     end
   end
 
@@ -55,7 +65,7 @@ defmodule AttentionServer.PersistenceReadBarrierTest do
 
             {:ok, committed} = result
             Persistence.committed(committed)
-            send(parent, :first_committed)
+            send(parent, {:first_committed, self()})
 
             # A second commit in the same Relay callback must read the first
             # committed generation, not the callback-entry snapshot.
@@ -74,21 +84,21 @@ defmodule AttentionServer.PersistenceReadBarrierTest do
         end
       end)
 
-    writer = await_writer(owner, monitor)
+    writer = await_event(owner, monitor, :writing)
     queued = Task.async(fn -> GenServer.call(owner, {:setup_device, "second"}) end)
     refute GenServer.call(owner, {:device_revoked?, "device"})
-    refute_received :first_committed
+    refute_received {:first_committed, _}
     queued_ref = queued.ref
     refute_received {^queued_ref, _}
     send(writer, :allow_commit)
-    assert_receive :first_committed
-    assert_receive {:second_write, second_writer}
+    assert await_event(owner, monitor, :first_committed) == owner
+    second_writer = await_event(owner, monitor, :second_write)
     assert GenServer.call(owner, {:device_revoked?, "device"})
     queued_ref = queued.ref
     refute_received {^queued_ref, _}
     send(second_writer, :finish)
     assert Task.await(queued) == :ok
-    assert_receive {:DOWN, ^monitor, :process, ^owner, :normal}
+    assert await_exit(owner, monitor) == :normal
 
     {:ok, reopened} = Store.open(path)
     assert Engine.device_revoked?(reopened.engine, "device")
@@ -113,10 +123,10 @@ defmodule AttentionServer.PersistenceReadBarrierTest do
         end)
       end)
 
-    writer = await_writer(owner, monitor)
+    writer = await_event(owner, monitor, :writing)
     refute GenServer.call(owner, {:device_revoked?, "device"})
     send(writer, :fail)
-    assert_receive {:DOWN, ^monitor, :process, ^owner, :persistence_failed}
+    assert await_exit(owner, monitor) == :persistence_failed
     refute_received :unexpected_success
     {:ok, reopened} = Store.open(path)
     refute Engine.device_revoked?(reopened.engine, "device")
