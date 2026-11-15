@@ -2413,25 +2413,28 @@ defmodule AttentionServer.Engine do
 
   def open_conversation(%__MODULE__{} = engine, key) do
     with {:ok, %{person: person, key: device}} <- principal(engine, key) do
-      {:ok,
-       %{engine | conversation_opened: MapSet.put(engine.conversation_opened, {person, device})}}
+      high = Map.get(engine.conversation_highs, person, 0)
+      current = Map.get(engine.conversation_cursors, {person, device}, 0)
+
+      next =
+        put_cursor(engine, :conversation_cursors, {person, device}, current, min(current, high))
+
+      {:ok, %{next | conversation_opened: MapSet.put(next.conversation_opened, {person, device})}}
     end
   end
 
   def acknowledge_conversation(%__MODULE__{} = engine, key, seq, highest_sent) do
-    with {:ok, %{person: person, key: device}} <- principal(engine, key) do
-      current = Map.get(engine.conversation_cursors, {person, device}, 0)
-
-      if is_integer(seq) and seq >= current and seq <= highest_sent do
-        next = %{
-          engine
-          | conversation_cursors: Map.put(engine.conversation_cursors, {person, device}, seq)
-        }
-
-        {:ok, next, %{"conversation_seq" => seq}}
-      else
-        {:error, :invalid_cursor}
-      end
+    with {:ok, %{person: person, key: device}} <- principal(engine, key),
+         {:ok, next, cursor} <-
+           acknowledge_cursor(
+             engine,
+             :conversation_cursors,
+             {person, device},
+             seq,
+             highest_sent,
+             Map.get(engine.conversation_highs, person, 0)
+           ) do
+      {:ok, next, %{"conversation_seq" => cursor}}
     end
   end
 
@@ -3163,7 +3166,10 @@ defmodule AttentionServer.Engine do
   def checkpoint_cursor(%__MODULE__{} = engine, key, high) do
     with {:ok, %{person: person}} <- principal(engine, key),
          true <- is_integer(high) and high >= 0 and high <= engine.persons[person] do
-      {:ok, %{engine | cursors: Map.put(engine.cursors, {person, key}, high)}}
+      current = Map.get(engine.cursors, {person, key}, 0)
+      # The checkpoint certifies its saved snapshot, not a rewind of newer ACKs.
+      cursor = max(high, min(current, engine.persons[person]))
+      {:ok, put_cursor(engine, :cursors, {person, key}, current, cursor)}
     else
       {:error, :forbidden} -> {:error, :forbidden}
       false -> {:error, :invalid_cursor}
@@ -3245,19 +3251,47 @@ defmodule AttentionServer.Engine do
     end
   end
 
-  @doc "Accepts only a cursor actually sent contiguously on this session."
+  @doc "Acknowledges retries idempotently; advances only through contiguous events sent on this session."
   def acknowledge(%__MODULE__{} = engine, key, seq, highest_sent) do
-    with {:ok, person} <- authorized_person(engine, key) do
-      current = Map.get(engine.cursors, {person, key}, 0)
-
-      if is_integer(seq) and seq >= current and seq <= highest_sent do
-        next = %{engine | cursors: Map.put(engine.cursors, {person, key}, seq)}
-        {:ok, next, %{"seq" => seq}}
-      else
-        {:error, :invalid_cursor}
-      end
+    with {:ok, person} <- authorized_person(engine, key),
+         {:ok, next, cursor} <-
+           acknowledge_cursor(
+             engine,
+             :cursors,
+             {person, key},
+             seq,
+             highest_sent,
+             engine.persons[person]
+           ) do
+      {:ok, next, %{"seq" => cursor}}
     end
   end
+
+  defp acknowledge_cursor(engine, field, device, seq, highest_sent, high) do
+    current = Map.get(Map.fetch!(engine, field), device, 0)
+
+    cond do
+      not is_integer(seq) or seq < 0 ->
+        {:error, :invalid_cursor}
+
+      seq <= current ->
+        # A retry may predate this connection. Only an impossible stored cursor
+        # is reduced, and only to the stream high, never to a connection's progress.
+        cursor = min(current, high)
+        {:ok, put_cursor(engine, field, device, current, cursor), cursor}
+
+      seq <= highest_sent and seq <= high ->
+        {:ok, put_cursor(engine, field, device, current, seq), seq}
+
+      true ->
+        {:error, :invalid_cursor}
+    end
+  end
+
+  defp put_cursor(engine, _field, _device, current, current), do: engine
+
+  defp put_cursor(engine, field, device, _current, cursor),
+    do: Map.update!(engine, field, &Map.put(&1, device, cursor))
 
   defp handle_frame(engine, _principal, value) when not is_map(value) or is_struct(value),
     do: {engine, %{"v" => 1, "type" => "error", "reason" => "bad_frame"}}

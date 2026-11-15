@@ -77,7 +77,17 @@ defmodule AttentionServer.DeviceProgressTest do
 
     assert :sys.get_state(relay).store.progress_version == version
 
-    for n <- [7, 9] do
+    for n <- [0, 7, 8] do
+      assert [%{"type" => "ok", "conversation_seq" => 8}] =
+               request(relay, session, %{"type" => "conversation_ack", "conversation_seq" => n})
+
+      assert [%{"type" => "ok", "seq" => 8}] =
+               request(relay, session, %{"type" => "ack", "seq" => n})
+    end
+
+    assert :sys.get_state(relay).store.progress_version == version
+
+    for n <- [-1, 9, nil, "7"] do
       assert [%{"type" => "error", "reason" => "invalid_cursor"}] =
                request(relay, session, %{"type" => "conversation_ack", "conversation_seq" => n})
     end
@@ -184,6 +194,197 @@ defmodule AttentionServer.DeviceProgressTest do
     {:ok, reopened} = Store.open(path)
     assert Map.get(reopened.engine.conversation_cursors, {"A", "reader"}, 0) == 0
     Store.close(reopened)
+  end
+
+  test "ACK recovery clamps to the stream high, not connection progress", %{path: path} do
+    {:ok, store} = Store.open(path)
+
+    for {field, ack, reply_field} <- [
+          {:cursors, &Engine.acknowledge/4, "seq"},
+          {:conversation_cursors, &Engine.acknowledge_conversation/4, "conversation_seq"}
+        ] do
+      engine = Map.update!(store.engine, field, &Map.put(&1, {"A", "reader"}, 4))
+      # An earlier connection already acknowledged 4, even if this one sent 0.
+      assert {:ok, ^engine, %{^reply_field => 4}} = ack.(engine, "reader", 2, 0)
+      assert {:ok, ^engine, %{^reply_field => 4}} = ack.(engine, "reader", 4, 0)
+      assert {:error, :invalid_cursor} = ack.(engine, "reader", 5, 0)
+      assert {:ok, next, %{^reply_field => 5}} = ack.(engine, "reader", 5, 5)
+      assert Map.fetch!(next, field)[{"A", "reader"}] == 5
+
+      assert Map.fetch!(next, field)[{"A", "origin"}] ==
+               Map.fetch!(engine, field)[{"A", "origin"}]
+
+      # Synthetic inconsistent in-memory state exercises the recovery rule;
+      # it does not claim that normal Store.open admits an invalid snapshot.
+      ahead = Map.update!(engine, field, &Map.put(&1, {"A", "reader"}, 100))
+
+      for seq <- [0, 8, 100] do
+        assert {:ok, recovered, %{^reply_field => 8}} = ack.(ahead, "reader", seq, 0)
+        assert Map.fetch!(recovered, field)[{"A", "reader"}] == 8
+      end
+
+      for seq <- [-1, nil, "4", 101] do
+        assert {:error, :invalid_cursor} = ack.(ahead, "reader", seq, 101)
+      end
+
+      assert {:error, :forbidden} = ack.(engine, "missing", 0, 0)
+    end
+
+    Store.close(store)
+  end
+
+  test "conversation open and ordinary ACK durably recover cursors above replay high", %{
+    path: path
+  } do
+    before = snapshot(path)
+    {:ok, relay} = Relay.start_link(store_path: path)
+    {:ok, session} = Relay.open_session(relay, "reader")
+    request(relay, session, %{"type" => "resync", "since" => 0})
+    inject_cursor(relay, :conversation_cursors, 100)
+
+    assert %{"type" => "conversation_resynced", "conversation_seq" => 8} =
+             request(relay, session, %{"type" => "conversation_open", "since" => 0})
+             |> List.last()
+
+    assert {:ok, 8} = Relay.conversation_cursor(relay, "reader")
+
+    assert [%{"type" => "ok", "conversation_seq" => 8}] =
+             request(relay, session, %{"type" => "conversation_ack", "conversation_seq" => 1})
+
+    inject_cursor(relay, :cursors, 100)
+
+    assert [%{"type" => "ok", "seq" => 8}] =
+             request(relay, session, %{"type" => "ack", "seq" => 1})
+
+    GenServer.stop(relay)
+    assert snapshot(path) == before
+    {:ok, restarted} = Relay.start_link(store_path: path)
+    assert {:ok, 8} = Relay.conversation_cursor(restarted, "reader")
+    assert {:ok, 8} = Relay.acknowledged_cursor(restarted, "reader")
+    {:ok, session} = Relay.open_session(restarted, "reader")
+
+    assert [%{"type" => "ok", "seq" => 8}] =
+             request(restarted, session, %{"type" => "ack", "seq" => 0})
+
+    GenServer.stop(restarted)
+  end
+
+  test "failed clamp commit does not report recovery", %{path: path} do
+    {:ok, relay} = Relay.start_link(store_path: path)
+    {:ok, session} = Relay.open_session(relay, "reader")
+    request(relay, session, %{"type" => "resync", "since" => 0})
+    request(relay, session, %{"type" => "conversation_open", "since" => 0})
+    inject_cursor(relay, :conversation_cursors, 100)
+
+    :ok =
+      Sqlite3.execute(
+        :sys.get_state(relay).store.db,
+        "CREATE TRIGGER reject_clamp BEFORE INSERT ON relay_device_progress BEGIN SELECT RAISE(ABORT, 'test failure'); END"
+      )
+
+    assert [%{"type" => "error", "reason" => "storage_unavailable"}] =
+             request(relay, session, %{"type" => "conversation_ack", "conversation_seq" => 8})
+
+    assert {:ok, 100} = Relay.conversation_cursor(relay, "reader")
+    :ok = Sqlite3.execute(:sys.get_state(relay).store.db, "DROP TRIGGER reject_clamp")
+
+    assert [%{"type" => "ok", "conversation_seq" => 8}] =
+             request(relay, session, %{"type" => "conversation_ack", "conversation_seq" => 8})
+
+    GenServer.stop(relay)
+    {:ok, reopened} = Store.open(path)
+    assert reopened.engine.conversation_cursors[{"A", "reader"}] == 8
+    Store.close(reopened)
+  end
+
+  test "older pending checkpoint preserves a newer device ACK across modes and restart", %{
+    path: path
+  } do
+    {:ok, relay} = Relay.start_link(store_path: path)
+    {:ok, paging} = Relay.open_websocket_session(relay, "reader", nil, nil)
+
+    start = %{
+      "type" => "inbox_start",
+      "paging_version" => 1,
+      "startup_id" => "retained",
+      "since" => 0
+    }
+
+    assert [%{"snapshot_id" => id, "high_water" => 8}] = request(relay, paging, start)
+
+    frame = %{
+      "v" => 1,
+      "type" => "forward",
+      "op_id" => op(999),
+      "message" => %{
+        "sender_id" => "app:test",
+        "message_id" => "later",
+        "created_at" => 2,
+        "title" => "Later"
+      }
+    }
+
+    assert {:ok, line} = Relay.request_line(relay, "origin", JSON.encode!(frame) <> "\n")
+    assert {:ok, %{"type" => "ok", "seq" => 9}} = JSON.decode_line(line)
+
+    # Opening a fresh session fences the paging connection but retains its snapshot.
+    {:ok, legacy} = Relay.open_session(relay, "reader")
+    request(relay, legacy, %{"type" => "resync", "since" => 0})
+
+    assert [%{"type" => "ok", "seq" => 9}] =
+             request(relay, legacy, %{"type" => "ack", "seq" => 9})
+
+    {:ok, resumed} = Relay.open_websocket_session(relay, "reader", nil, nil)
+    assert [%{"snapshot_id" => ^id, "high_water" => 8}] = request(relay, resumed, start)
+
+    checkpoint = %{
+      "type" => "inbox_checkpoint_ack",
+      "paging_version" => 1,
+      "snapshot_id" => id,
+      "high_water" => 8,
+      "reconciled_batches" => [],
+      "pending_manifest_complete" => true
+    }
+
+    assert [%{"checkpoint_accepted" => true, "high_water" => 8} = reply] =
+             request(relay, resumed, checkpoint)
+
+    refute Map.has_key?(reply, "duplicate")
+    assert {:ok, 9} = Relay.acknowledged_cursor(relay, "reader")
+
+    assert [%{"checkpoint_accepted" => true, "high_water" => 8, "duplicate" => true}] =
+             request(relay, resumed, checkpoint)
+
+    assert {:ok, 9} = Relay.acknowledged_cursor(relay, "reader")
+    GenServer.stop(relay)
+
+    {:ok, restarted} = Relay.start_link(store_path: path)
+    assert {:ok, 9} = Relay.acknowledged_cursor(restarted, "reader")
+    {:ok, resumed} = Relay.open_websocket_session(restarted, "reader", nil, nil)
+    assert [%{"snapshot_id" => ^id}] = request(restarted, resumed, start)
+
+    assert [%{"checkpoint_accepted" => true, "high_water" => 8, "duplicate" => true}] =
+             request(restarted, resumed, checkpoint)
+
+    request(restarted, resumed, %{
+      "type" => "inbox_attach",
+      "paging_version" => 1,
+      "snapshot_id" => id,
+      "mode" => "replay",
+      "since" => 8
+    })
+
+    assert [%{"type" => "ok", "seq" => 9}] =
+             request(restarted, resumed, %{"type" => "ack", "seq" => 8})
+
+    GenServer.stop(restarted)
+  end
+
+  defp inject_cursor(relay, field, value) do
+    :sys.replace_state(relay, fn state ->
+      engine = Map.update!(state.store.engine, field, &Map.put(&1, {"A", "reader"}, value))
+      %{state | store: %{state.store | engine: engine}}
+    end)
   end
 
   defp snapshot(path) do
