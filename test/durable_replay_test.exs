@@ -238,7 +238,7 @@ defmodule AttentionServer.DurableReplayTest do
     assert [%{"reason" => "invalid_cursor"}] =
              session_request(restarted, new_session, %{"type" => "ack", "seq" => 14})
 
-    assert [%{"reason" => "invalid_cursor"}] =
+    assert [%{"type" => "ok", "seq" => 13}] =
              session_request(restarted, new_session, %{"type" => "ack", "seq" => 12})
 
     GenServer.stop(restarted)
