@@ -843,13 +843,21 @@ defmodule AttentionServer.Relay do
     with_persistence_reads(state, fn ->
       case dispatch_call(request, from, state) do
         {:reply, {:socket_write, socket, authority, frames, completion}, next} ->
-          {:noreply, enqueue_socket_write(next, socket, authority, frames, completion, from)}
+          {:noreply,
+           enqueue_socket_write(
+             fence_changed_authority(state, next),
+             socket,
+             authority,
+             frames,
+             completion,
+             from
+           )}
 
         {:reply, reply, next} ->
-          {:reply, reply, fence_socket_writes(next)}
+          {:reply, reply, fence_changed_authority(state, next)}
 
         {:noreply, next} ->
-          {:noreply, fence_socket_writes(next)}
+          {:noreply, fence_changed_authority(state, next)}
       end
     end)
   end
@@ -2743,7 +2751,7 @@ defmodule AttentionServer.Relay do
       end
     else
       {:error, :forbidden} ->
-        {:reply, {:error, :forbidden}, %{state | sessions: Map.delete(state.sessions, id)}}
+        {:reply, {:error, :forbidden}, drop_session(state, id)}
 
       error ->
         {:reply, error, state}
@@ -2792,7 +2800,7 @@ defmodule AttentionServer.Relay do
         end
 
       {:error, :forbidden} ->
-        {:reply, {:error, :forbidden}, %{state | sessions: Map.delete(state.sessions, id)}}
+        {:reply, {:error, :forbidden}, drop_session(state, id)}
 
       error ->
         {:reply, error, state}
@@ -2803,7 +2811,7 @@ defmodule AttentionServer.Relay do
   def handle_info(message, state) do
     with_persistence_reads(state, fn ->
       {:noreply, next} = dispatch_info(message, state)
-      {:noreply, fence_socket_writes(next)}
+      {:noreply, fence_changed_authority(state, next)}
     end)
   end
 
@@ -5965,7 +5973,6 @@ defmodule AttentionServer.Relay do
       write ->
         put_in(state.socket_writes[socket], %{write | queue: :queue.in(job, write.queue)})
     end
-    |> fence_socket_writes()
   end
 
   defp start_socket_write(state, socket, job, queue) do
@@ -6033,6 +6040,22 @@ defmodule AttentionServer.Relay do
 
   defp socket_authorized?(state, authority),
     do: match?({:ok, _}, authorize_socket_write(state, authority, ""))
+
+  # Ordinary traffic retains these immutable authority maps. A blocked peer
+  # must not add authorization work to unrelated calls, write frames or infos.
+  # Revocation/rotation changes one of the maps and fences active writes before
+  # the mutation replies; each writer still rechecks authority before every frame.
+  defp fence_changed_authority(previous, next) do
+    before = previous.store.engine
+    after_engine = next.store.engine
+
+    if before.devices == after_engine.devices and before.agents == after_engine.agents and
+         before.owners == after_engine.owners do
+      next
+    else
+      fence_socket_writes(next)
+    end
+  end
 
   defp fence_socket_writes(state) do
     Enum.reduce(state.socket_writes, state, fn {socket, write}, acc ->
