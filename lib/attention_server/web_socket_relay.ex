@@ -13,17 +13,40 @@ defmodule AttentionServer.WebSocketRelay do
   @handshake_timeout :infinity
   @poll_ms 100
   @max_header 16 * 1024
-  @max_message 2 * 1024 * 1024
-  @max_recoverable_oversize 4 * 1024 * 1024
+  @read_chunk 64 * 1024
+  @spool_threshold 64 * 1024
   @protocol "attention-relay/1"
   @guid "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
   @bad_frame ~s({"v":1,"type":"error","reason":"bad_frame"}\n)
+  @storage_unavailable ~s({"v":1,"type":"error","reason":"storage_unavailable"}\n)
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts)
   def port(server), do: GenServer.call(server, :port)
 
   @doc "Encode one server-to-client text message without masking."
   def encode_text(payload) when is_binary(payload), do: encode_frame(1, payload)
+
+  @doc false
+  def send_text_stream(socket, %JSON.StreamedLine{} = line) do
+    {result, pending, opcode} =
+      JSON.encode_stream(line)
+      |> Stream.flat_map(&split_stream_chunk(&1, @read_chunk))
+      |> Enum.reduce_while({:ok, nil, 1}, fn
+        chunk, {:ok, nil, opcode} ->
+          {:cont, {:ok, chunk, opcode}}
+
+        chunk, {:ok, pending, opcode} ->
+          case :ssl.send(socket, encode_frame(false, opcode, pending)) do
+            :ok -> {:cont, {:ok, chunk, 0}}
+            error -> {:halt, {error, nil, 0}}
+          end
+      end)
+
+    case result do
+      :ok when is_binary(pending) -> :ssl.send(socket, encode_frame(true, opcode, pending))
+      other -> other
+    end
+  end
 
   @impl true
   def init(opts) do
@@ -239,6 +262,7 @@ defmodule AttentionServer.WebSocketRelay do
         Diagnostics.failure(:device_relay, :relay_boundary, reason, :outcome_unknown, nil, relay)
         :ok
     after
+      cleanup_fragment_file()
       AttentionServer.SessionWriter.close(socket)
     end
   end
@@ -359,67 +383,72 @@ defmodule AttentionServer.WebSocketRelay do
   defp loop(socket, relay, session, buffer, fragment) do
     case decode_frame(buffer) do
       {:ok, {fin, opcode, payload}, rest} ->
-        case handle_frame(socket, relay, session, fin, opcode, payload, fragment) do
-          {:ok, next_fragment} -> loop(socket, relay, session, rest, next_fragment)
-          _ -> :ok
+        case consume_frame(socket, relay, session, fin, opcode, payload, fragment) do
+          {:ok, next_fragment} ->
+            loop(socket, relay, session, rest, next_fragment)
+
+          {:error, :storage_unavailable} ->
+            send_storage_unavailable(relay, session)
+
+          _ ->
+            :ok
+        end
+
+      {:stream_payload, fin, opcode, length, mask, data} ->
+        case receive_payload_file(socket, length, mask, data) do
+          {:ok, path, rest} ->
+            case consume_file_frame(socket, relay, session, fin, opcode, path, fragment) do
+              {:ok, next_fragment} ->
+                loop(socket, relay, session, rest, next_fragment)
+
+              {:error, :storage_unavailable} ->
+                _ = File.rm(path)
+                send_storage_unavailable(relay, session)
+
+              _ ->
+                :ok
+            end
+
+          {:error, reason} ->
+            Diagnostics.failure(:device_relay, :request_read, reason, :closed)
+            if reason == :storage_unavailable, do: send_storage_unavailable(relay, session)
+            :ok
         end
 
       :more ->
-        # Bound only an incomplete frame. A single TLS read can contain the
-        # end of this frame and following valid frames; parse the first frame
-        # before deciding whether the remaining buffer is oversized.
-        if byte_size(buffer) > @max_message + 14 do
-          _ = protocol_error(relay, session)
-          :ok
-        else
-          case :ssl.recv(socket, 0, @poll_ms) do
-            {:ok, chunk} ->
-              loop(socket, relay, session, buffer <> chunk, fragment)
+        case :ssl.recv(socket, next_read_size(buffer), @poll_ms) do
+          {:ok, chunk} ->
+            loop(socket, relay, session, buffer <> chunk, fragment)
 
-            {:error, :timeout} ->
-              case Relay.session_drain(relay, session) do
-                {:ok, frames} ->
-                  case Relay.session_send(relay, session, frames) do
-                    :ok ->
-                      loop(socket, relay, session, buffer, fragment)
+          {:error, :timeout} ->
+            case Relay.session_drain(relay, session) do
+              {:ok, frames} ->
+                case Relay.session_send(relay, session, frames) do
+                  :ok ->
+                    loop(socket, relay, session, buffer, fragment)
 
-                    {:error, reason} ->
-                      Diagnostics.failure(:device_relay, :response_write, reason, :closed)
+                  {:error, reason} ->
+                    Diagnostics.failure(:device_relay, :response_write, reason, :closed)
 
-                    other ->
-                      Diagnostics.failure(:device_relay, :response_write, other, :closed)
-                  end
+                  other ->
+                    Diagnostics.failure(:device_relay, :response_write, other, :closed)
+                end
 
-                {:error, :resync_required} ->
-                  loop(socket, relay, session, buffer, fragment)
+              {:error, :resync_required} ->
+                loop(socket, relay, session, buffer, fragment)
 
-                {:error, reason} ->
-                  Diagnostics.failure(:device_relay, :response_drain, reason, :closed)
+              {:error, reason} ->
+                Diagnostics.failure(:device_relay, :response_drain, reason, :closed)
 
-                other ->
-                  Diagnostics.failure(:device_relay, :response_drain, other, :closed)
-              end
+              other ->
+                Diagnostics.failure(:device_relay, :response_drain, other, :closed)
+            end
 
-            {:error, reason} ->
-              Diagnostics.failure(:device_relay, :request_read, reason, :closed)
-
-            other ->
-              Diagnostics.failure(:device_relay, :request_read, other, :closed)
-          end
-        end
-
-      {:oversize, bytes, data} ->
-        with :ok <- protocol_error(relay, session),
-             {:ok, rest} <- discard_payload(socket, bytes, data) do
-          loop(socket, relay, session, rest, nil)
-        else
           {:error, reason} ->
             Diagnostics.failure(:device_relay, :request_read, reason, :closed)
-            :ok
 
           other ->
             Diagnostics.failure(:device_relay, :request_read, other, :closed)
-            :ok
         end
 
       {:error, reason} ->
@@ -427,6 +456,157 @@ defmodule AttentionServer.WebSocketRelay do
         _ = Relay.session_send(relay, session, [@bad_frame])
         :ok
     end
+  end
+
+  defp consume_frame(_socket, _relay, _session, false, 1, payload, nil) do
+    case new_fragment_file(payload) do
+      {:ok, path} ->
+        Process.put(:attention_websocket_fragment_path, path)
+        {:ok, {:file, path}}
+
+      error ->
+        error
+    end
+  end
+
+  defp consume_frame(_socket, relay, session, fin, 0, payload, {:file, path}) do
+    case append_fragment_bytes(path, payload) do
+      :ok when fin ->
+        Process.delete(:attention_websocket_fragment_path)
+        result = process_text_file(relay, session, path)
+        _ = File.rm(path)
+        result
+
+      :ok ->
+        {:ok, {:file, path}}
+
+      error ->
+        cleanup_fragment_file()
+        error
+    end
+  end
+
+  defp consume_frame(socket, relay, session, fin, opcode, payload, fragment),
+    do: handle_frame(socket, relay, session, fin, opcode, payload, fragment)
+
+  defp consume_file_frame(_socket, relay, session, true, 1, path, nil) do
+    result = process_text_file(relay, session, path)
+    _ = File.rm(path)
+    result
+  end
+
+  defp consume_file_frame(_socket, _relay, _session, false, 1, path, nil) do
+    Process.put(:attention_websocket_fragment_path, path)
+    {:ok, {:file, path}}
+  end
+
+  defp consume_file_frame(_socket, relay, session, fin, 0, path, {:file, fragment_path}) do
+    case append_fragment_file(fragment_path, path) do
+      :ok when fin ->
+        Process.delete(:attention_websocket_fragment_path)
+        result = process_text_file(relay, session, fragment_path)
+        _ = File.rm(fragment_path)
+        _ = File.rm(path)
+        result
+
+      :ok ->
+        _ = File.rm(path)
+        {:ok, {:file, fragment_path}}
+
+      error ->
+        _ = File.rm(fragment_path)
+        _ = File.rm(path)
+        Process.delete(:attention_websocket_fragment_path)
+        error
+    end
+  end
+
+  defp consume_file_frame(_socket, relay, session, _fin, _opcode, path, _fragment) do
+    _ = File.rm(path)
+    cleanup_fragment_file()
+    _ = protocol_error(relay, session)
+    {:ok, nil}
+  end
+
+  defp new_fragment_file(payload) do
+    path =
+      Path.join(
+        System.tmp_dir!(),
+        "attention-websocket-fragment-#{System.unique_integer([:positive, :monotonic])}.json"
+      )
+
+    case File.open(path, [:write, :binary, :exclusive]) do
+      {:ok, file} ->
+        result = IO.binwrite(file, payload)
+        close_result = File.close(file)
+
+        case {result, close_result} do
+          {:ok, :ok} ->
+            {:ok, path}
+
+          _ ->
+            _ = File.rm(path)
+            {:error, :storage_unavailable}
+        end
+
+      _ ->
+        {:error, :storage_unavailable}
+    end
+  end
+
+  defp append_fragment_bytes(path, payload) do
+    case File.open(path, [:append, :binary]) do
+      {:ok, file} ->
+        result = IO.binwrite(file, payload)
+        close_result = File.close(file)
+        if result == :ok and close_result == :ok, do: :ok, else: {:error, :storage_unavailable}
+
+      _ ->
+        {:error, :storage_unavailable}
+    end
+  end
+
+  defp append_fragment_file(target, source) do
+    with {:ok, input} <- File.open(source, [:read, :binary]),
+         {:ok, output} <- File.open(target, [:append, :binary]) do
+      try do
+        copy_fragment_chunks(input, output)
+      after
+        _ = File.close(input)
+        _ = File.close(output)
+      end
+    else
+      _ -> {:error, :storage_unavailable}
+    end
+  end
+
+  defp copy_fragment_chunks(input, output) do
+    case IO.binread(input, @read_chunk) do
+      bytes when is_binary(bytes) ->
+        case IO.binwrite(output, bytes) do
+          :ok -> copy_fragment_chunks(input, output)
+          _ -> {:error, :storage_unavailable}
+        end
+
+      :eof ->
+        :ok
+
+      _ ->
+        {:error, :storage_unavailable}
+    end
+  end
+
+  defp cleanup_fragment_file do
+    case Process.delete(:attention_websocket_fragment_path) do
+      path when is_binary(path) -> _ = File.rm(path)
+      _ -> :ok
+    end
+  end
+
+  defp send_storage_unavailable(relay, session) do
+    Diagnostics.failure(:device_relay, :request_read, :storage_unavailable, :rejected)
+    _ = Relay.session_send(relay, session, [@storage_unavailable])
+    :ok
   end
 
   defp handle_frame(_socket, relay, session, true, 8, payload, _fragment) do
@@ -466,17 +646,7 @@ defmodule AttentionServer.WebSocketRelay do
        when is_binary(fragment) do
     message = fragment <> payload
 
-    cond do
-      byte_size(message) > @max_message ->
-        _ = protocol_error(relay, session)
-        :closed
-
-      fin ->
-        process_text(relay, session, message)
-
-      true ->
-        {:ok, message}
-    end
+    if fin, do: process_text(relay, session, message), else: {:ok, message}
   end
 
   defp handle_frame(_socket, relay, session, _fin, _opcode, _payload, _fragment) do
@@ -488,7 +658,7 @@ defmodule AttentionServer.WebSocketRelay do
     operation_id = request_operation_id(payload)
 
     frames =
-      if String.valid?(payload) and byte_size(payload) <= @max_message do
+      if String.valid?(payload) do
         case Relay.session_request_line(relay, session, payload) do
           {:ok, reply} ->
             report_wire_errors(reply, operation_id)
@@ -528,6 +698,25 @@ defmodule AttentionServer.WebSocketRelay do
         [@bad_frame]
       end
 
+    deliver_frames(relay, session, frames, operation_id)
+  end
+
+  defp process_text_file(relay, session, path) do
+    case Relay.session_request_file(relay, session, path) do
+      {:ok, frames} ->
+        deliver_frames(relay, session, frames, nil)
+
+      {:error, reason} ->
+        Diagnostics.failure(:device_relay, :request_dispatch, reason, :outcome_unknown)
+        :closed
+
+      other ->
+        Diagnostics.failure(:device_relay, :request_dispatch, other, :outcome_unknown)
+        :closed
+    end
+  end
+
+  defp deliver_frames(relay, session, frames, operation_id) do
     case frames do
       :fenced ->
         :closed
@@ -626,6 +815,25 @@ defmodule AttentionServer.WebSocketRelay do
 
   defp decode_frame(buffer) when byte_size(buffer) < 2, do: :more
 
+  defp next_read_size(buffer) when byte_size(buffer) < 2, do: 2 - byte_size(buffer)
+
+  defp next_read_size(<<_fin::1, _rsv::3, _opcode::4, _masked::1, length::7, rest::binary>>) do
+    extended = if length == 126, do: 2, else: if(length == 127, do: 8, else: 0)
+
+    if byte_size(rest) < extended do
+      extended - byte_size(rest)
+    else
+      {payload_length, payload_data} =
+        case {length, rest} do
+          {126, <<value::16, data::binary>>} -> {value, data}
+          {127, <<value::64, data::binary>>} -> {value, data}
+          {value, data} -> {value, data}
+        end
+
+      min(@read_chunk, max(1, 4 + payload_length - byte_size(payload_data)))
+    end
+  end
+
   defp decode_frame(<<fin::1, rsv::3, opcode::4, masked::1, length::7, rest::binary>>) do
     cond do
       rsv != 0 or masked != 1 -> {:error, :protocol}
@@ -648,11 +856,12 @@ defmodule AttentionServer.WebSocketRelay do
   defp decode_length(fin, opcode, length, rest), do: decode_payload(fin, opcode, length, rest)
 
   defp decode_payload(_fin, _opcode, length, rest)
-       when length > @max_message and length <= @max_recoverable_oversize,
-       do: {:oversize, length + 4, rest}
+       when length > @spool_threshold and byte_size(rest) < 4,
+       do: :more
 
-  defp decode_payload(_fin, _opcode, length, _rest) when length > @max_recoverable_oversize,
-    do: {:error, :too_large}
+  defp decode_payload(fin, opcode, length, <<mask::binary-size(4), data::binary>>)
+       when length > @spool_threshold,
+       do: {:stream_payload, fin, opcode, length, mask, data}
 
   defp decode_payload(_fin, _opcode, length, rest) when byte_size(rest) < length + 4,
     do: :more
@@ -664,32 +873,112 @@ defmodule AttentionServer.WebSocketRelay do
     {:ok, {fin, opcode, :crypto.exor(payload, key)}, rest}
   end
 
-  defp discard_payload(_socket, bytes, data) when byte_size(data) >= bytes do
-    {:ok, binary_part(data, bytes, byte_size(data) - bytes)}
-  end
+  defp receive_payload_file(socket, length, mask, data) do
+    path =
+      Path.join(
+        System.tmp_dir!(),
+        "attention-websocket-request-#{System.unique_integer([:positive, :monotonic])}.json"
+      )
 
-  defp discard_payload(socket, bytes, data),
-    do: discard_remaining(socket, bytes - byte_size(data))
+    case File.open(path, [:write, :binary, :exclusive]) do
+      {:ok, file} ->
+        initial_size = min(length, byte_size(data))
+        <<initial::binary-size(initial_size), rest::binary>> = data
 
-  defp discard_remaining(_socket, 0), do: {:ok, <<>>}
+        result =
+          with :ok <- write_masked(file, initial, mask, 0),
+               :ok <- read_masked_payload(socket, file, length - initial_size, mask, initial_size) do
+            :ok
+          end
 
-  defp discard_remaining(socket, bytes) do
-    step = min(bytes, 8192)
+        close_result = File.close(file)
 
-    case :ssl.recv(socket, step, @handshake_timeout) do
-      {:ok, _discarded} -> discard_remaining(socket, bytes - step)
-      error -> error
+        case {result, close_result} do
+          {:ok, :ok} ->
+            {:ok, path, rest}
+
+          {{:error, :storage_unavailable}, _} ->
+            _ = File.rm(path)
+            {:error, :storage_unavailable}
+
+          {{:error, _reason}, _} ->
+            _ = File.rm(path)
+            {:error, :bad_frame}
+
+          {:ok, {:error, _reason}} ->
+            _ = File.rm(path)
+            {:error, :storage_unavailable}
+
+          _ ->
+            _ = File.rm(path)
+            {:error, :bad_frame}
+        end
+
+      _ ->
+        {:error, :storage_unavailable}
     end
   end
 
-  defp encode_frame(opcode, payload) do
+  defp read_masked_payload(_socket, _file, 0, _mask, _offset), do: :ok
+
+  defp read_masked_payload(socket, file, remaining, mask, offset) do
+    case :ssl.recv(socket, min(remaining, @read_chunk), @handshake_timeout) do
+      {:ok, chunk} when byte_size(chunk) > 0 and byte_size(chunk) <= remaining ->
+        case write_masked(file, chunk, mask, offset) do
+          :ok ->
+            read_masked_payload(
+              socket,
+              file,
+              remaining - byte_size(chunk),
+              mask,
+              offset + byte_size(chunk)
+            )
+
+          _ ->
+            {:error, :storage_unavailable}
+        end
+
+      {:error, _reason} ->
+        {:error, :bad_frame}
+
+      _ ->
+        {:error, :bad_frame}
+    end
+  end
+
+  defp write_masked(_file, <<>>, _mask, _offset), do: :ok
+
+  defp write_masked(file, payload, mask, offset) do
+    key =
+      for index <- 0..(byte_size(payload) - 1), into: <<>> do
+        <<:binary.at(mask, rem(offset + index, 4))>>
+      end
+
+    case IO.binwrite(file, :crypto.exor(payload, key)) do
+      :ok -> :ok
+      _ -> {:error, :storage_unavailable}
+    end
+  end
+
+  defp split_stream_chunk(<<>>, _limit), do: []
+  defp split_stream_chunk(bytes, limit) when byte_size(bytes) <= limit, do: [bytes]
+
+  defp split_stream_chunk(bytes, limit) do
+    <<chunk::binary-size(limit), rest::binary>> = bytes
+    [chunk | split_stream_chunk(rest, limit)]
+  end
+
+  defp encode_frame(opcode, payload), do: encode_frame(true, opcode, payload)
+
+  defp encode_frame(fin, opcode, payload) do
     length = byte_size(payload)
+    fin_bit = if fin, do: 1, else: 0
 
     header =
       cond do
-        length < 126 -> <<1::1, 0::3, opcode::4, 0::1, length::7>>
-        length < 65_536 -> <<1::1, 0::3, opcode::4, 0::1, 126::7, length::16>>
-        true -> <<1::1, 0::3, opcode::4, 0::1, 127::7, length::64>>
+        length < 126 -> <<fin_bit::1, 0::3, opcode::4, 0::1, length::7>>
+        length < 65_536 -> <<fin_bit::1, 0::3, opcode::4, 0::1, 126::7, length::16>>
+        true -> <<fin_bit::1, 0::3, opcode::4, 0::1, 127::7, length::64>>
       end
 
     [header, payload]

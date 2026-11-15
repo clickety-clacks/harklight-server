@@ -18,6 +18,22 @@ defmodule AttentionServer.JSONTest do
     assert String.contains?(JSON.encode!(value), "0.123456789012345678901234567890")
   end
 
+  test "streamed JSON maps flatten nested members and report their encoded size" do
+    value = %{
+      "future" => %{
+        "items" => ["plain", 7, %{"decimal" => %DecimalToken{raw: "1.2345"}}],
+        "ok" => true
+      },
+      "message" => %{"title" => "Question", "body" => "Reply"}
+    }
+
+    expected = JSON.encode!(value)
+    streamed = value |> JSON.encode_stream() |> Enum.join()
+
+    assert streamed == expected
+    assert JSON.encoded_size(value) == byte_size(expected)
+  end
+
   test "malformed, duplicate-key, trailing, non-newline and over-bound frames fail closed" do
     assert {:error, :bad_frame} = JSON.decode_line("{oops}\n")
     assert {:error, :bad_frame} = JSON.decode_line("{\"a\":1,\"a\":2}\n")
@@ -52,6 +68,44 @@ defmodule AttentionServer.JSONTest do
   test "a wrapped local-size message fits while the input bound is explicit" do
     value = %{"v" => 1, "type" => "forward", "message" => %{"body" => :binary.copy("x", 65_536)}}
     assert {:ok, ^value} = JSON.decode_line(JSON.encode!(value) <> "\n")
+  end
+
+  test "file-backed decoding streams large message bodies and threshold-overflow file data" do
+    body = String.duplicate("x", 2_097_153)
+    file_bytes = :binary.copy(<<0, 255, 42>>, 87_382)
+    file_data = Base.encode64(file_bytes)
+    assert byte_size(file_data) < 2_097_152
+
+    value = %{
+      "type" => "forward",
+      "message" => %{"body" => body},
+      "files" => [%{"name" => "overflow.bin", "data_base64" => file_data}]
+    }
+
+    path =
+      Path.join(
+        System.tmp_dir!(),
+        "attention-json-large-data-#{System.unique_integer([:positive, :monotonic])}.json"
+      )
+
+    on_exit(fn -> File.rm(path) end)
+    File.write!(path, JSON.encode!(value) <> "\n")
+
+    assert {:ok, decoded} = JSON.decode_line_file(path)
+
+    try do
+      assert %AttentionServer.LargeData.Ref{} = body_ref = get_in(decoded, ["message", "body"])
+      assert body_ref.size == byte_size(body)
+      assert AttentionServer.LargeData.read!(body_ref) == body
+
+      assert %AttentionServer.LargeData.Ref{} =
+               file_ref = get_in(decoded, ["files", Access.at(0), "data_base64"])
+
+      assert file_ref.size == byte_size(file_bytes)
+      assert AttentionServer.LargeData.read!(file_ref) == file_bytes
+    after
+      AttentionServer.LargeData.cleanup_transient_refs(decoded)
+    end
   end
 
   test "sender identity and message schema retain valid unknown fields but reject bad authority identifiers" do

@@ -543,6 +543,20 @@ defmodule AttentionServer.OriginHTTPSTest do
                },
                :binary.copy(<<1>>, 1_025)
              )
+
+    assert {:ok, 200, %{"type" => "ok", "upload_id" => _id, "duplicate" => false}} =
+             upload_request(
+               %{c | endpoint: endpoint},
+               "a2",
+               %{
+                 op_id: op(701),
+                 sender_id: "app:test",
+                 message_id: "small-after-over-cap",
+                 revision: 1,
+                 name: "small.bin"
+               },
+               "small"
+             )
   end
 
   test "a large exact upload is invisible until its bound request commits and remains fetchable after restart",
@@ -629,6 +643,58 @@ defmodule AttentionServer.OriginHTTPSTest do
     }
 
     assert {:ok, 200, ^bytes} = fetch_bytes(restored, "reader", id)
+  end
+
+  test "origin HTTPS accepts a large message body and delivers it intact to a connected device",
+       c do
+    # The body is only eight bytes above the old 2 MiB request cap.
+    body = Base.encode64(:crypto.strong_rand_bytes(1_572_870))
+    assert byte_size(body) > 2 * 1024 * 1024
+
+    message_id = "large-origin-body"
+    hash = :crypto.hash(:sha256, body)
+    before_payload_size = persisted_payload_size(c.store_path)
+
+    socket = websocket_connect(c, "reader")
+    on_exit(fn -> :ssl.close(socket) end)
+    assert {[], _barrier} = websocket_resync(socket)
+
+    assert {:ok, 200, %{"type" => "ok", "seq" => 1}} =
+             request(c, "a2", %{
+               "v" => 1,
+               "type" => "send",
+               "op_id" => op(704),
+               "session_handle" => @handle,
+               "message" => %{
+                 "sender_id" => "app:test",
+                 "message_id" => message_id,
+                 "created_at" => 1,
+                 "title" => "Large body",
+                 "body" => body
+               }
+             })
+
+    {events, _barrier} = websocket_resync(socket)
+
+    delivery =
+      Enum.find(events, fn event ->
+        event["type"] == "delivery" and get_in(event, ["message", "message_id"]) == message_id
+      end)
+
+    assert %{"message" => %{"body" => delivered_body}} = delivery
+
+    assert :crypto.hash(:sha256, delivered_body) == hash
+
+    assert {:ok, 200, %{"type" => "ok", "item" => %{"message" => %{"body" => fetched_body}}}} =
+             request(c, "a2", %{
+               "v" => 1,
+               "type" => "message_get",
+               "sender_id" => "app:test",
+               "message_id" => message_id
+             })
+
+    assert :crypto.hash(:sha256, fetched_body) == hash
+    assert persisted_payload_size(c.store_path) - before_payload_size < 65_536
   end
 
   test "committed attachments remain readable across same-person origin grants", c do
@@ -2181,7 +2247,7 @@ defmodule AttentionServer.OriginHTTPSTest do
     :ok = Sqlite3.execute(db, "PRAGMA query_only=ON")
 
     try do
-      assert {:ok, 200, %{"type" => "error", "reason" => "storage_unavailable"}} =
+      assert {:ok, 503, %{"type" => "error", "reason" => "storage_unavailable"}} =
                raw_request(
                  c,
                  "a2",
@@ -2602,6 +2668,125 @@ defmodule AttentionServer.OriginHTTPSTest do
 
   defp request(c, name, body),
     do: raw_request(c, name, http("POST", "/origin/v1", JSON.encode!(body)))
+
+  defp websocket_connect(c, name) do
+    endpoint = %{c.endpoint | port: Server.port(c.server)}
+
+    {:ok, socket} =
+      HeadlessTLS.connect(
+        endpoint,
+        {Path.join(c.certs, "#{name}.pem"), Path.join(c.certs, "#{name}.key")}
+      )
+
+    request =
+      "GET /relay HTTP/1.1\r\n" <>
+        "Host: relay.test\r\n" <>
+        "Upgrade: websocket\r\n" <>
+        "Connection: Upgrade\r\n" <>
+        "Sec-WebSocket-Version: 13\r\n" <>
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" <>
+        "Sec-WebSocket-Protocol: attention-relay/1\r\n\r\n"
+
+    assert :ok = :ssl.send(socket, request)
+    assert websocket_handshake(socket, <<>>) =~ "101 Switching Protocols"
+    socket
+  end
+
+  defp websocket_handshake(_socket, bytes) when byte_size(bytes) > 16_384,
+    do: flunk("WebSocket handshake exceeded the HTTP header limit")
+
+  defp websocket_handshake(socket, bytes) do
+    if String.ends_with?(bytes, "\r\n\r\n") do
+      bytes
+    else
+      assert {:ok, chunk} = :ssl.recv(socket, 1, 5_000)
+      websocket_handshake(socket, bytes <> chunk)
+    end
+  end
+
+  defp websocket_request(socket, request) do
+    payload = JSON.encode!(Map.put_new(request, "v", 1)) <> "\n"
+    :ssl.send(socket, masked_websocket_frame(payload))
+  end
+
+  defp masked_websocket_frame(payload) do
+    mask = :crypto.strong_rand_bytes(4)
+    length = byte_size(payload)
+
+    header =
+      cond do
+        length < 126 -> <<1::1, 0::3, 1::4, 1::1, length::7>>
+        length < 65_536 -> <<1::1, 0::3, 1::4, 1::1, 126::7, length::16>>
+        true -> <<1::1, 0::3, 1::4, 1::1, 127::7, length::64>>
+      end
+
+    repeated_mask = :binary.copy(mask, div(length + 3, 4))
+    masked = :crypto.exor(payload, binary_part(repeated_mask, 0, length))
+    [header, mask, masked]
+  end
+
+  defp websocket_resync(socket) do
+    assert :ok = websocket_request(socket, %{"type" => "resync", "since" => 0})
+    websocket_resync_events(socket, [], false)
+  end
+
+  defp websocket_resync_events(socket, events, acknowledged?) do
+    case websocket_reply(socket) do
+      %{"type" => "ok"} ->
+        websocket_resync_events(socket, events, true)
+
+      %{"type" => "resynced"} = barrier when acknowledged? ->
+        {Enum.reverse(events), barrier}
+
+      %{"type" => "resynced"} ->
+        flunk("WebSocket resync barrier arrived without its acknowledgement")
+
+      event ->
+        websocket_resync_events(socket, [event | events], acknowledged?)
+    end
+  end
+
+  defp websocket_reply(socket) do
+    case JSON.decode_line(websocket_message(socket, <<>>)) do
+      {:ok, value} -> value
+      error -> flunk("invalid WebSocket JSON message: #{inspect(error)}")
+    end
+  end
+
+  defp websocket_message(socket, accumulated) do
+    assert {:ok, <<fin::1, 0::3, opcode::4, 0::1, length::7>>} = :ssl.recv(socket, 2, 10_000)
+    assert opcode in [0, 1]
+
+    length =
+      case length do
+        126 ->
+          assert {:ok, <<size::16>>} = :ssl.recv(socket, 2, 10_000)
+          size
+
+        127 ->
+          assert {:ok, <<size::64>>} = :ssl.recv(socket, 8, 10_000)
+          size
+
+        size ->
+          size
+      end
+
+    assert {:ok, payload} = :ssl.recv(socket, length, 10_000)
+    next = accumulated <> payload
+    if fin == 1, do: next, else: websocket_message(socket, next)
+  end
+
+  defp persisted_payload_size(path) do
+    assert {:ok, db} = Sqlite3.open(path)
+
+    assert {:ok, stmt} =
+             Sqlite3.prepare(db, "SELECT length(payload) FROM relay_state WHERE id = 1")
+
+    assert {:row, [size]} = Sqlite3.step(db, stmt)
+    assert :ok = Sqlite3.release(db, stmt)
+    assert :ok = Sqlite3.close(db)
+    size
+  end
 
   defp upload_request(c, cert, attrs, bytes) do
     name = Base.url_encode64(attrs.name, padding: false)

@@ -427,7 +427,7 @@ defmodule AttentionServer.PrioritizationTest do
     assert {:ok, ^selected} = Engine.set_algorithm_choice(selected, "person-a", "jev-set")
   end
 
-  test "format 22 migrates with baseline defaults and persists as format 29", %{path: path} do
+  test "format 22 migrates with baseline defaults and persists as format 30", %{path: path} do
     assert {:ok, initial} = Store.open(path)
     assert {:ok, engine} = Engine.setup_person(initial.engine, "person-a")
     assert :ok = Store.close(initial)
@@ -1968,8 +1968,7 @@ defmodule AttentionServer.PrioritizationTest do
 
     partial_cache = %{
       seed_result.cache
-      | batches:
-          List.update_at(seed_result.cache.batches, 0, &%{&1 | scores: nil, request: nil})
+      | batches: List.update_at(seed_result.cache.batches, 0, &%{&1 | scores: nil, request: nil})
     }
 
     :sys.replace_state(relay, fn state ->
@@ -2052,6 +2051,7 @@ defmodule AttentionServer.PrioritizationTest do
         assert next_job.generation > first_job.generation
 
         before_stale_result = :sys.get_state(relay)
+
         send(
           relay,
           {:prioritization_result, "person-a", first_job.sequence, first_job.generation,

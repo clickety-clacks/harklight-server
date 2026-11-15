@@ -1,7 +1,7 @@
 defmodule AttentionServer.JevClient do
   @moduledoc false
 
-  alias AttentionServer.JSON
+  alias AttentionServer.{JSON, LargeData}
 
   @key_path_env "ATTENTION_SERVER_JEV_KEY_PATH"
   @response_limit 4 * 1024 * 1024
@@ -52,121 +52,131 @@ defmodule AttentionServer.JevClient do
 
   def compose(items, endpoint, model, now)
       when is_list(items) and is_binary(endpoint) and is_binary(model) do
-    if valid_endpoint?(endpoint) and valid_model?(model) do
-      {questions, question_identities} =
-        items
-        |> Enum.with_index(1)
-        |> Enum.reduce({%{}, %{}}, fn {item, index}, {questions, identities} ->
-          question_id = "candidate_" <> Integer.to_string(index)
+    cond do
+      not valid_endpoint?(endpoint) or not valid_model?(model) ->
+        {:error, :jev_unconfigured}
 
-          instructions =
-            "Rate the absolute importance of candidate #{index} to the person on a fixed ladder from trivial to emergency. " <>
-              "Judge this message on its own using its title, body, stated stake, deadline, the sender's stated urgency, message type and message kind. " <>
-              "Sender urgency is evidence, not the answer. Do not apply a fixed priority order or preference based on message type or kind. " <>
-              "Do not compare with other pending items, rank among them, or spread scores across the ladder. " <>
-              "Any number of trivial messages should stay near the bottom; any number of genuine emergencies should stay near the top. " <>
-              "The current time is now; due_in_minutes is the time left before the deadline, negative once it has passed."
+      LargeData.contains_ref?(items) ->
+        # A disk-backed field is larger than the existing ranking budgets.
+        # Keep the established clipped-item result without reading it into a
+        # request body just to discover that it cannot be sent.
+        {:error, :request_too_large}
 
-          instructions =
-            if Map.has_key?(item, :reply),
-              do:
-                instructions <>
-                  " This candidate is the agent's chat reply on the identified parent message. Judge the reply; the parent supplies context and urgency evidence.",
-              else: instructions
-
-          question = %{
-            "type" => "score",
-            "instructions" => instructions,
-            "criteria" => @criteria
-          }
-
-          {Map.put(questions, question_id, question),
-           Map.put(identities, question_id, item.identity)}
-        end)
-
-      state = %{
-        "now" => timestamp(now),
-        "pending_items" =>
+      true ->
+        {questions, question_identities} =
           items
           |> Enum.with_index(1)
-          |> Enum.map(fn {item, index} ->
-            message = item.message
+          |> Enum.reduce({%{}, %{}}, fn {item, index}, {questions, identities} ->
+            question_id = "candidate_" <> Integer.to_string(index)
 
-            pending = %{
-              "candidate" => index,
-              "sender_id" => elem(item.identity, 0),
-              "message_id" => elem(item.identity, 1),
-              "title" => Map.get(message, "title", ""),
-              "body" => Map.get(message, "body", ""),
-              "stake" => AttentionServer.Message.effective_stake(message),
-              "urgency" => AttentionServer.Message.effective_urgency(message),
-              "message_type" =>
-                if(AttentionServer.Message.valid_message_type?(Map.get(message, "message_type")),
-                  do: message["message_type"],
-                  else: nil
-                ),
-              "message_kind" =>
-                if(AttentionServer.Message.valid_message_kind?(Map.get(message, "message_kind")),
-                  do: message["message_kind"],
-                  else: nil
-                )
+            instructions =
+              "Rate the absolute importance of candidate #{index} to the person on a fixed ladder from trivial to emergency. " <>
+                "Judge this message on its own using its title, body, stated stake, deadline, the sender's stated urgency, message type and message kind. " <>
+                "Sender urgency is evidence, not the answer. Do not apply a fixed priority order or preference based on message type or kind. " <>
+                "Do not compare with other pending items, rank among them, or spread scores across the ladder. " <>
+                "Any number of trivial messages should stay near the bottom; any number of genuine emergencies should stay near the top. " <>
+                "The current time is now; due_in_minutes is the time left before the deadline, negative once it has passed."
+
+            instructions =
+              if Map.has_key?(item, :reply),
+                do:
+                  instructions <>
+                    " This candidate is the agent's chat reply on the identified parent message. Judge the reply; the parent supplies context and urgency evidence.",
+                else: instructions
+
+            question = %{
+              "type" => "score",
+              "instructions" => instructions,
+              "criteria" => @criteria
             }
 
-            pending =
-              case Map.get(item, :reply) do
-                %{conversation_seq: seq, parent_body: body} ->
-                  Map.merge(pending, %{
-                    "kind" => "reply",
-                    "author" => "origin",
-                    "conversation_seq" => seq,
-                    "parent_body" => body
-                  })
+            {Map.put(questions, question_id, question),
+             Map.put(identities, question_id, item.identity)}
+          end)
+
+        state = %{
+          "now" => timestamp(now),
+          "pending_items" =>
+            items
+            |> Enum.with_index(1)
+            |> Enum.map(fn {item, index} ->
+              message = item.message
+
+              pending = %{
+                "candidate" => index,
+                "sender_id" => elem(item.identity, 0),
+                "message_id" => elem(item.identity, 1),
+                "title" => Map.get(message, "title", ""),
+                "body" => Map.get(message, "body", ""),
+                "stake" => AttentionServer.Message.effective_stake(message),
+                "urgency" => AttentionServer.Message.effective_urgency(message),
+                "message_type" =>
+                  if(
+                    AttentionServer.Message.valid_message_type?(Map.get(message, "message_type")),
+                    do: message["message_type"],
+                    else: nil
+                  ),
+                "message_kind" =>
+                  if(
+                    AttentionServer.Message.valid_message_kind?(Map.get(message, "message_kind")),
+                    do: message["message_kind"],
+                    else: nil
+                  )
+              }
+
+              pending =
+                case Map.get(item, :reply) do
+                  %{conversation_seq: seq, parent_body: body} ->
+                    Map.merge(pending, %{
+                      "kind" => "reply",
+                      "author" => "origin",
+                      "conversation_seq" => seq,
+                      "parent_body" => body
+                    })
+
+                  _ ->
+                    pending
+                end
+
+              case AttentionServer.Message.effective_by_when(message) do
+                by_when when is_integer(by_when) ->
+                  pending
+                  |> Map.put("by_when", timestamp(by_when))
+                  |> Map.put("due_in_minutes", Integer.floor_div(by_when - now, 60_000))
 
                 _ ->
                   pending
               end
+            end)
+        }
 
-            case AttentionServer.Message.effective_by_when(message) do
-              by_when when is_integer(by_when) ->
-                pending
-                |> Map.put("by_when", timestamp(by_when))
-                |> Map.put("due_in_minutes", Integer.floor_div(by_when - now, 60_000))
+        request = %{"model" => model, "state" => state, "questions" => questions}
+        body = JSON.encode!(request)
+        state_size = byte_size(JSON.encode!(state))
 
-              _ ->
-                pending
-            end
-          end)
-      }
+        largest_question =
+          questions
+          |> Map.values()
+          |> Enum.map(&byte_size(JSON.encode!(&1)))
+          |> Enum.max(fn -> 0 end)
 
-      request = %{"model" => model, "state" => state, "questions" => questions}
-      body = JSON.encode!(request)
-      state_size = byte_size(JSON.encode!(state))
-
-      largest_question =
-        questions
-        |> Map.values()
-        |> Enum.map(&byte_size(JSON.encode!(&1)))
-        |> Enum.max(fn -> 0 end)
-
-      if byte_size(body) <= min(@request_limit, @request_budget) and
-           state_size + largest_question <= @question_budget do
-        with {:ok, uri} <- endpoint_uri(endpoint) do
-          {:ok,
-           %{
-             uri: uri,
-             model: model,
-             body: body,
-             state_bytes: state_size,
-             largest_question_bytes: largest_question,
-             candidates: Enum.map(items, & &1.identity),
-             question_identities: question_identities
-           }}
+        if byte_size(body) <= min(@request_limit, @request_budget) and
+             state_size + largest_question <= @question_budget do
+          with {:ok, uri} <- endpoint_uri(endpoint) do
+            {:ok,
+             %{
+               uri: uri,
+               model: model,
+               body: body,
+               state_bytes: state_size,
+               largest_question_bytes: largest_question,
+               candidates: Enum.map(items, & &1.identity),
+               question_identities: question_identities
+             }}
+          end
+        else
+          {:error, :request_too_large}
         end
-      else
-        {:error, :request_too_large}
-      end
-    else
-      {:error, :jev_unconfigured}
     end
   rescue
     _ -> {:error, :invalid_request}

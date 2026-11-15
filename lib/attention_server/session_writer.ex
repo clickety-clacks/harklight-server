@@ -14,9 +14,9 @@ defmodule AttentionServer.SessionWriter do
 
       result =
         Enum.reduce_while(frames, :ok, fn frame, _ ->
-          with {:ok, bytes} <-
+          with {:ok, output} <-
                  GenServer.call(relay, {:socket_write_frame, socket, token, frame}, :infinity),
-               :ok <- :ssl.send(socket, bytes) do
+               :ok <- write(socket, output) do
             {:cont, :ok}
           else
             error -> {:halt, error}
@@ -27,6 +27,20 @@ defmodule AttentionServer.SessionWriter do
       send(relay, {:socket_write_done, socket, token, result})
     end)
   end
+
+  defp write(socket, {:raw, {:http, status, reply}}),
+    do: AttentionServer.AgentWire.send_http_response(socket, status, reply)
+
+  defp write(socket, {:websocket, %AttentionServer.JSON.StreamedLine{} = line}),
+    do: AttentionServer.WebSocketRelay.send_text_stream(socket, line)
+
+  defp write(socket, {_transport, %AttentionServer.JSON.StreamedLine{} = line}),
+    do: AttentionServer.JSON.send_stream(socket, line)
+
+  defp write(socket, {:websocket, bytes}),
+    do: :ssl.send(socket, AttentionServer.WebSocketRelay.encode_text(bytes))
+
+  defp write(socket, {_transport, bytes}), do: :ssl.send(socket, bytes)
 
   def close(socket) do
     # A TLS close alert can wait behind the blocked sender. Read shutdown
