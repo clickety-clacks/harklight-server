@@ -902,7 +902,12 @@ defmodule AttentionServer.ConversationFeedTest do
     try do
       {:os_pid, child_pid} = Port.info(child, :os_pid)
       deadline = System.monotonic_time(:millisecond) + 30_000
-      assert {:ok, _blob_name} = wait_for_large_data_file(data_dir, child, deadline)
+      assert {:ok, blob_name} = wait_for_large_data_file(data_dir, child, deadline)
+
+      assert Base.encode16(
+               :crypto.hash(:sha256, File.read!(Path.join(data_dir, blob_name))),
+               case: :lower
+             ) == blob_name
 
       {_, 0} = System.cmd("kill", ["-KILL", Integer.to_string(child_pid)])
       assert_receive {^child, {:exit_status, status}} when status != 0, 10_000
