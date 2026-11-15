@@ -207,7 +207,14 @@ defmodule AttentionServer.DurableReplayTest do
     frames = session_request(relay, session, %{"type" => "resync", "since" => 0})
     assert length(frames) == 14
     assert Enum.map(Enum.slice(frames, 1, 12), & &1["seq"]) == Enum.to_list(1..12)
-    assert List.last(frames) == %{"v" => 1, "type" => "resynced", "seq" => 12}
+
+    assert List.last(frames) == %{
+             "v" => 1,
+             "type" => "resynced",
+             "seq" => 12,
+             "server" => :sys.get_state(relay).store.engine.relay_instance_id,
+             "feature_flags" => %{}
+           }
 
     assert [%{"type" => "ok", "seq" => 12}] =
              session_request(relay, session, %{"type" => "ack", "seq" => 12})
