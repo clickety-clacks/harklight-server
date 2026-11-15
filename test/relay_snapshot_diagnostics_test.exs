@@ -334,6 +334,14 @@ defmodule AttentionServer.RelaySnapshotDiagnosticsTest do
   test "Relay-boundary request returns while the named collector is blocked" do
     parent = self()
 
+    # A prior test may leave a detached collector and its admission owner.
+    # Synchronize with their exits, not a polling interval. Do not unregister a
+    # live owner's slot; the unchanged test timeout exposes leaked owners.
+    stop_collector(@collector_name)
+    await_previous_snapshot_owner()
+    assert Process.whereis(@collector_name) == nil
+    assert Process.whereis(@starting_name) == nil
+
     blocked_target =
       spawn(fn ->
         receive do
@@ -412,6 +420,20 @@ defmodule AttentionServer.RelaySnapshotDiagnosticsTest do
 
   defp await_snapshot_names_released(_collector_name, _attempts), do: false
 
+  defp await_previous_snapshot_owner do
+    case Process.whereis(@starting_name) do
+      nil ->
+        :ok
+
+      owner ->
+        monitor = Process.monitor(owner)
+
+        receive do
+          {:DOWN, ^monitor, :process, ^owner, _reason} -> :ok
+        end
+    end
+  end
+
   defp stop_collector(name) do
     case Process.whereis(name) do
       pid when is_pid(pid) ->
@@ -420,8 +442,6 @@ defmodule AttentionServer.RelaySnapshotDiagnosticsTest do
 
         receive do
           {:DOWN, ^monitor, :process, ^pid, _reason} -> :ok
-        after
-          1_000 -> Process.demonitor(monitor, [:flush])
         end
 
       _ ->
