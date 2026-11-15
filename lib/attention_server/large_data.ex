@@ -19,7 +19,10 @@ defmodule AttentionServer.LargeData do
   def contains_ref?(%Ref{}), do: true
   def contains_ref?(value) when is_map(value), do: Enum.any?(Map.values(value), &contains_ref?/1)
   def contains_ref?(value) when is_list(value), do: Enum.any?(value, &contains_ref?/1)
-  def contains_ref?(value) when is_tuple(value), do: value |> Tuple.to_list() |> Enum.any?(&contains_ref?/1)
+
+  def contains_ref?(value) when is_tuple(value),
+    do: value |> Tuple.to_list() |> Enum.any?(&contains_ref?/1)
+
   def contains_ref?(_), do: false
 
   @doc false
@@ -29,12 +32,15 @@ defmodule AttentionServer.LargeData do
     with :ok <- File.mkdir_p(directory),
          :ok <- File.chmod(directory, 0o700) do
       case transform(term, directory, []) do
-        {:ok, next, created} -> {:ok, next, Enum.uniq(created)}
+        {:ok, next, created} ->
+          {:ok, next, Enum.uniq(created)}
+
         {:error, reason, created} ->
           cleanup_created(created)
           {:error, reason}
 
-        error -> error
+        error ->
+          error
       end
     else
       _ -> {:error, :storage_unavailable}
@@ -147,7 +153,10 @@ defmodule AttentionServer.LargeData do
     |> refs()
     |> Enum.each(fn {_id, ref} ->
       if is_binary(ref.path) and
-           String.starts_with?(Path.basename(ref.path), ["attention-json-body-", "attention-json-base64-"]) do
+           String.starts_with?(Path.basename(ref.path), [
+             "attention-json-body-",
+             "attention-json-base64-"
+           ]) do
         _ = File.rm(ref.path)
       end
     end)
@@ -163,7 +172,12 @@ defmodule AttentionServer.LargeData do
           case File.open(target, [:write, :binary, :exclusive]) do
             {:ok, output} ->
               try do
-                state = %{mode: :normal, utf8_tail: <<>>, hash: :crypto.hash_init(:sha256), size: 0}
+                state = %{
+                  mode: :normal,
+                  utf8_tail: <<>>,
+                  hash: :crypto.hash_init(:sha256),
+                  size: 0
+                }
 
                 result =
                   case decode_json_string_chunks(input, output, state) do
@@ -176,12 +190,11 @@ defmodule AttentionServer.LargeData do
                     {:ok, _incomplete} ->
                       {:error, :bad_json_string}
 
-                  {:error, :bad_json_string} ->
-                    {:error, :bad_json_string}
+                    {:error, :bad_json_string} ->
+                      {:error, :bad_json_string}
 
-                  _ ->
-                    {:error, :storage_unavailable}
-
+                    _ ->
+                      {:error, :storage_unavailable}
                   end
 
                 if match?({:error, _}, result), do: File.rm(target)
@@ -398,7 +411,8 @@ defmodule AttentionServer.LargeData do
   defp transform_map(map, directory, created) do
     Enum.reduce_while(map, {:ok, %{}, created}, fn {key, value}, {:ok, mapped, files} ->
       result =
-        if key in ["body", "answer", "title"] and is_binary(value) and byte_size(value) > @inline_limit do
+        if key in ["body", "answer", "title"] and is_binary(value) and
+             byte_size(value) > @inline_limit do
           persist(value, directory, files)
         else
           transform(value, directory, files)
@@ -459,7 +473,9 @@ defmodule AttentionServer.LargeData do
                :ok <- sync_file(staged),
                :ok <- File.rename(staged, path) do
             case sync_directory(directory) do
-              :ok -> {:ok, ref, [path | created]}
+              :ok ->
+                {:ok, ref, [path | created]}
+
               _ ->
                 _ = File.rm(path)
                 {:error, :storage_unavailable}
@@ -467,7 +483,9 @@ defmodule AttentionServer.LargeData do
           end
 
         case result do
-          {:ok, _, _} = success -> success
+          {:ok, _, _} = success ->
+            success
+
           _ ->
             _ = File.rm(staged)
             {:error, :storage_unavailable}
@@ -493,7 +511,9 @@ defmodule AttentionServer.LargeData do
                     with :ok <- :file.sync(output),
                          :ok <- File.rename(staged, target.path) do
                       case sync_directory(directory) do
-                        :ok -> :ok
+                        :ok ->
+                          :ok
+
                         _ ->
                           _ = File.rm(target.path)
                           {:error, :storage_unavailable}
@@ -643,20 +663,30 @@ defmodule AttentionServer.LargeData do
   end
 
   defp decode_json_byte(34, %{mode: :escape} = state), do: {:ok, <<34>>, %{state | mode: :normal}}
-  defp decode_json_byte(?\\, %{mode: :escape} = state), do: {:ok, <<?\\>>, %{state | mode: :normal}}
+
+  defp decode_json_byte(?\\, %{mode: :escape} = state),
+    do: {:ok, <<?\\>>, %{state | mode: :normal}}
+
   defp decode_json_byte(?/, %{mode: :escape} = state), do: {:ok, <<?/>>, %{state | mode: :normal}}
   defp decode_json_byte(?b, %{mode: :escape} = state), do: {:ok, <<8>>, %{state | mode: :normal}}
   defp decode_json_byte(?f, %{mode: :escape} = state), do: {:ok, <<12>>, %{state | mode: :normal}}
   defp decode_json_byte(?n, %{mode: :escape} = state), do: {:ok, <<10>>, %{state | mode: :normal}}
   defp decode_json_byte(?r, %{mode: :escape} = state), do: {:ok, <<13>>, %{state | mode: :normal}}
   defp decode_json_byte(?t, %{mode: :escape} = state), do: {:ok, <<9>>, %{state | mode: :normal}}
-  defp decode_json_byte(?u, %{mode: :escape} = state), do: {:ok, nil, %{state | mode: {:unicode, 0, 4}}}
+
+  defp decode_json_byte(?u, %{mode: :escape} = state),
+    do: {:ok, nil, %{state | mode: {:unicode, 0, 4}}}
+
   defp decode_json_byte(_byte, %{mode: :escape}), do: {:error, :bad_json_string}
 
   defp decode_json_byte(byte, %{mode: {:unicode, value, remaining}} = state) do
     case hex_digit(byte) do
-      nil -> {:error, :bad_json_string}
-      digit when remaining > 1 -> {:ok, nil, %{state | mode: {:unicode, value * 16 + digit, remaining - 1}}}
+      nil ->
+        {:error, :bad_json_string}
+
+      digit when remaining > 1 ->
+        {:ok, nil, %{state | mode: {:unicode, value * 16 + digit, remaining - 1}}}
+
       digit ->
         codepoint = value * 16 + digit
 
@@ -676,7 +706,9 @@ defmodule AttentionServer.LargeData do
 
   defp decode_json_byte(byte, %{mode: {:low_unicode, high, value, remaining}} = state) do
     case hex_digit(byte) do
-      nil -> {:error, :bad_json_string}
+      nil ->
+        {:error, :bad_json_string}
+
       digit when remaining > 1 ->
         {:ok, nil, %{state | mode: {:low_unicode, high, value * 16 + digit, remaining - 1}}}
 
@@ -782,6 +814,7 @@ defmodule AttentionServer.LargeData do
         found? = found? or :binary.match(window, needle) != :nomatch
         keep = min(max(byte_size(needle) - 1, 0), byte_size(window))
         suffix = if keep == 0, do: <<>>, else: binary_part(window, byte_size(window) - keep, keep)
+
         contains_file?(
           file,
           ref,
@@ -829,7 +862,11 @@ defmodule AttentionServer.LargeData do
         if String.trim(grapheme) == "" do
           preview_text(rest, normalized, count, normalized != "", limit)
         else
-          prefix = if space? and normalized != "", do: normalized <> " " <> grapheme, else: normalized <> grapheme
+          prefix =
+            if space? and normalized != "",
+              do: normalized <> " " <> grapheme,
+              else: normalized <> grapheme
+
           next_count = count + 1
 
           if next_count >= limit,
@@ -844,7 +881,9 @@ defmodule AttentionServer.LargeData do
 
   defp valid_prefix(binary) do
     case String.valid?(binary) do
-      true -> {binary, <<>>}
+      true ->
+        {binary, <<>>}
+
       false ->
         max_tail = min(byte_size(binary), 4)
 
@@ -863,13 +902,18 @@ defmodule AttentionServer.LargeData do
   defp walk_refs(%Ref{} = ref, fun), do: fun.(ref)
 
   defp walk_refs(value, fun) when is_map(value) do
-    {module, map} = if is_struct(value), do: {value.__struct__, Map.from_struct(value)}, else: {nil, value}
+    {module, map} =
+      if is_struct(value), do: {value.__struct__, Map.from_struct(value)}, else: {nil, value}
+
     result = Map.new(map, fn {key, child} -> {key, walk_refs(child, fun)} end)
     if module, do: struct(module, result), else: result
   end
 
   defp walk_refs(value, fun) when is_list(value), do: Enum.map(value, &walk_refs(&1, fun))
-  defp walk_refs(value, fun) when is_tuple(value), do: value |> Tuple.to_list() |> Enum.map(&walk_refs(&1, fun)) |> List.to_tuple()
+
+  defp walk_refs(value, fun) when is_tuple(value),
+    do: value |> Tuple.to_list() |> Enum.map(&walk_refs(&1, fun)) |> List.to_tuple()
+
   defp walk_refs(value, _fun), do: value
 
   defp collect_refs(%Ref{} = ref, acc), do: Map.put(acc, ref.id, ref)
@@ -881,7 +925,10 @@ defmodule AttentionServer.LargeData do
   end
 
   defp collect_refs(value, acc) when is_list(value), do: Enum.reduce(value, acc, &collect_refs/2)
-  defp collect_refs(value, acc) when is_tuple(value), do: value |> Tuple.to_list() |> Enum.reduce(acc, &collect_refs/2)
+
+  defp collect_refs(value, acc) when is_tuple(value),
+    do: value |> Tuple.to_list() |> Enum.reduce(acc, &collect_refs/2)
+
   defp collect_refs(_value, acc), do: acc
 
   defp valid_ref?(%Ref{id: id, size: size, sha256: hash, path: path}) do
@@ -901,18 +948,33 @@ defmodule AttentionServer.LargeData do
     bytes
     |> :binary.bin_to_list()
     |> Enum.map(fn
-      0x22 -> "\\\""
-      0x5C -> "\\\\"
-      0x08 -> "\\b"
-      0x0C -> "\\f"
-      0x0A -> "\\n"
-      0x0D -> "\\r"
-      0x09 -> "\\t"
+      0x22 ->
+        "\\\""
+
+      0x5C ->
+        "\\\\"
+
+      0x08 ->
+        "\\b"
+
+      0x0C ->
+        "\\f"
+
+      0x0A ->
+        "\\n"
+
+      0x0D ->
+        "\\r"
+
+      0x09 ->
+        "\\t"
+
       control when control < 0x20 ->
         hex = control |> Integer.to_string(16) |> String.pad_leading(2, "0")
         "\\u00" <> hex
 
-      byte -> <<byte>>
+      byte ->
+        <<byte>>
     end)
     |> IO.iodata_to_binary()
   end

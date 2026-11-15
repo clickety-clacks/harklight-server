@@ -407,7 +407,6 @@ defmodule AttentionServer.OriginWire do
   defp response_status(status, _value), do: status
 
   defp response(status, body, size) do
-
     reason =
       case status do
         200 -> "OK"

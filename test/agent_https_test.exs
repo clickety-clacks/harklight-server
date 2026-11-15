@@ -209,7 +209,8 @@ defmodule AttentionServer.AgentHTTPSTest do
     end
   end
 
-  test "WebSocket frames above four MiB reach a connected device and later Agent HTTPS read", context do
+  test "WebSocket frames above four MiB reach a connected device and later Agent HTTPS read",
+       context do
     %{certs: certs, server: server, relay: relay, path: path} = context
     person = bootstrap(relay, certs, "a1")
 
@@ -291,7 +292,9 @@ defmodule AttentionServer.AgentHTTPSTest do
     assert :ok = Relay.setup_sender(relay, device_key, "app:test")
     register(server, certs, "a1", person, agent_key)
     grant(server, certs, "a1", person, agent_key, ["app:test"], ["app:test"])
-    assert %{"type" => "ok", "seq" => 1} = forward(relay, device_key, message("scratch", "question"))
+
+    assert %{"type" => "ok", "seq" => 1} =
+             forward(relay, device_key, message("scratch", "question"))
 
     operation_id = unique_op()
     large_answer = Base.encode64(:crypto.strong_rand_bytes(2_097_152))
@@ -314,10 +317,12 @@ defmodule AttentionServer.AgentHTTPSTest do
     leave_scratch_space(filler, filled_size - 2 * 1024 * 1024)
 
     data_dir = path <> ".uploads"
+
     assert {:ok, 503, %{"type" => "error", "reason" => "storage_unavailable"}} =
              agent_https(endpoint(certs, Server.agent_port(server)), certs, "unknown", request)
 
     assert Process.alive?(relay)
+
     assert :sys.get_state(relay).store.engine.messages[{person, "app:test", "scratch"}].terminal ==
              nil
 
@@ -891,7 +896,10 @@ defmodule AttentionServer.AgentHTTPSTest do
 
   defp persisted_payload_size(path) do
     assert {:ok, db} = Sqlite3.open(path)
-    assert {:ok, stmt} = Sqlite3.prepare(db, "SELECT length(payload) FROM relay_state WHERE id = 1")
+
+    assert {:ok, stmt} =
+             Sqlite3.prepare(db, "SELECT length(payload) FROM relay_state WHERE id = 1")
+
     assert {:row, [size]} = Sqlite3.step(db, stmt)
     assert :ok = Sqlite3.release(db, stmt)
     assert :ok = Sqlite3.close(db)

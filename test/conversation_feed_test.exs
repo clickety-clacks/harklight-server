@@ -11,6 +11,7 @@ defmodule AttentionServer.ConversationFeedTest do
     Relay,
     Store
   }
+
   alias Exqlite.Sqlite3
   alias AttentionServer.Store.SnapshotEncoding
 
@@ -681,7 +682,9 @@ defmodule AttentionServer.ConversationFeedTest do
     assert uploaded["tier"] == "upload"
     assert uploaded["name"] == "overflow.bin"
     assert uploaded["size"] == byte_size(overflow_bytes)
-    assert uploaded["sha256"] == Base.encode16(:crypto.hash(:sha256, overflow_bytes), case: :lower)
+
+    assert uploaded["sha256"] ==
+             Base.encode16(:crypto.hash(:sha256, overflow_bytes), case: :lower)
 
     assert {:ok, _upload, fetched_path} = Relay.fetch_file(relay, "origin", uploaded["upload_id"])
     assert File.read!(fetched_path) == overflow_bytes
@@ -778,6 +781,7 @@ defmodule AttentionServer.ConversationFeedTest do
     assert :ok = Store.close(empty)
 
     assert {:ok, db} = Sqlite3.open(path)
+
     assert {:ok, stmt} =
              Sqlite3.prepare(
                db,

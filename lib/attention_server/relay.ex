@@ -1828,9 +1828,13 @@ defmodule AttentionServer.Relay do
 
         result =
           case AttentionServer.JSON.encode_line(reply) do
-            %AttentionServer.JSON.StreamedLine{} = line -> AttentionServer.JSON.send_stream(socket, line)
-            bytes -> :ssl.send(socket, bytes)
+            %AttentionServer.JSON.StreamedLine{} = line ->
+              AttentionServer.JSON.send_stream(socket, line)
+
+            bytes ->
+              :ssl.send(socket, bytes)
           end
+
         {:reply, result, next_state}
 
       _ ->
@@ -3048,17 +3052,22 @@ defmodule AttentionServer.Relay do
         AttentionServer.LargeData.cleanup_transient_refs(frame)
       end
     else
-      {:error, :forbidden} -> {:reply, {:error, :forbidden}, drop_session(state, id)}
-      {:error, :storage_unavailable} -> {:reply, {:ok, [error_line(%{}, "storage_unavailable")]}, state}
-      _ -> {:reply, {:ok, [error_line(%{}, "bad_frame")]}, state}
+      {:error, :forbidden} ->
+        {:reply, {:error, :forbidden}, drop_session(state, id)}
+
+      {:error, :storage_unavailable} ->
+        {:reply, {:ok, [error_line(%{}, "storage_unavailable")]}, state}
+
+      _ ->
+        {:reply, {:ok, [error_line(%{}, "bad_frame")]}, state}
     end
   end
 
   defp dispatch_call(
-        {:browser_session_request_line, browser_session_id, id, raw},
-        from,
-        state
-      ) do
+         {:browser_session_request_line, browser_session_id, id, raw},
+         from,
+         state
+       ) do
     case browser_connection(state, browser_session_id, id) do
       {:ok, _session} -> session_request_line_call(state, id, raw, from)
       {:error, :forbidden} -> {:reply, {:error, :session_ended}, drop_session(state, id)}
@@ -3362,10 +3371,24 @@ defmodule AttentionServer.Relay do
       type == "focus_report" ->
         focus_report_request(state, id, session, frame)
 
-      type in ["inbox_page", "inbox_reconcile", "inbox_receipts", "inbox_checkpoint_ack", "inbox_attach"] ->
+      type in [
+        "inbox_page",
+        "inbox_reconcile",
+        "inbox_receipts",
+        "inbox_checkpoint_ack",
+        "inbox_attach"
+      ] ->
         inbox_session_request(state, id, session, frame)
 
-      type in ["resync", "ack", "conversation_open", "conversation_ack", "view_get", "inbox_list", "conversation_page"] ->
+      type in [
+        "resync",
+        "ack",
+        "conversation_open",
+        "conversation_ack",
+        "view_get",
+        "inbox_list",
+        "conversation_page"
+      ] ->
         special_request(state, id, session, frame)
 
       type in ["levels_get", "levels_set"] ->
@@ -3375,15 +3398,18 @@ defmodule AttentionServer.Relay do
         {{:ok, [error_line(frame, "unknown_type")]}, state}
 
       session_mutation_state_value(state, session, frame) == :allowed and
-          not (not state.push_enabled and type in ["push_register", "push_remove", "push_status"]) and
+        not (not state.push_enabled and type in ["push_register", "push_remove", "push_status"]) and
           not (not state.source_fixture_mode and type in ["source_bind", "source_result"]) ->
         perform_request_frame(state, session.key, frame)
         |> then(fn {reply, next} -> {wrap_line(reply), next} end)
 
       true ->
         case session_mutation_state_value(state, session, frame) do
-          {:blocked, reason} -> {{:ok, [error_line(frame, reason)]}, state}
-          _ when not state.push_enabled and type in ["push_register", "push_remove", "push_status"] ->
+          {:blocked, reason} ->
+            {{:ok, [error_line(frame, reason)]}, state}
+
+          _
+          when not state.push_enabled and type in ["push_register", "push_remove", "push_status"] ->
             {{:ok, [error_line(frame, "forbidden")]}, state}
 
           _ when not state.source_fixture_mode and type in ["source_bind", "source_result"] ->
@@ -4677,7 +4703,8 @@ defmodule AttentionServer.Relay do
 
   defp session_mutation_state(state, session, raw) do
     case JSON.decode_line(raw) do
-      {:ok, frame} when is_map(frame) -> session_mutation_state_value(state, session, frame)
+      {:ok, frame} when is_map(frame) ->
+        session_mutation_state_value(state, session, frame)
 
       _ ->
         :allowed
@@ -5143,7 +5170,8 @@ defmodule AttentionServer.Relay do
         {{:ok, error_line(frame, reason)}, state}
 
       {:ok, request_engine, request_frame, created_ids, created_paths} ->
-        {next_engine, reply} = Engine.request_frame(request_engine, key, request_frame, state.clock.())
+        {next_engine, reply} =
+          Engine.request_frame(request_engine, key, request_frame, state.clock.())
 
         {next_engine, created_ids, created_paths} =
           if request_success?(reply) do
@@ -5199,7 +5227,9 @@ defmodule AttentionServer.Relay do
     inline_target(frame, {message["sender_id"], message["message_id"], 1})
   end
 
-  defp inline_upload_target(%{"type" => "conversation_revise", "base_revision" => revision} = frame)
+  defp inline_upload_target(
+         %{"type" => "conversation_revise", "base_revision" => revision} = frame
+       )
        when is_integer(revision) and revision > 0 do
     inline_target(frame, {frame["sender_id"], frame["message_id"], revision + 1})
   end
@@ -5232,12 +5262,13 @@ defmodule AttentionServer.Relay do
   defp process_inline_files(state, key, person, frame, target, files) do
     result =
       Enum.reduce_while(files, {:ok, [], 0, MapSet.new(), state.store.engine, [], []}, fn file,
-                                                                                         {:ok, reversed,
-                                                                                          inline_total,
-                                                                                          names,
-                                                                                          engine,
-                                                                                          created_ids,
-                                                                                          created_paths} ->
+                                                                                          {:ok,
+                                                                                           reversed,
+                                                                                           inline_total,
+                                                                                           names,
+                                                                                           engine,
+                                                                                           created_ids,
+                                                                                           created_paths} ->
         case prepare_inline_file(
                state,
                key,
@@ -5349,8 +5380,19 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  defp prepare_inline_file(_state, _key, _person, _target, _file, _total, _names, _engine, ids, paths),
-    do: {:error, "files", ids, paths}
+  defp prepare_inline_file(
+         _state,
+         _key,
+         _person,
+         _target,
+         _file,
+         _total,
+         _names,
+         _engine,
+         ids,
+         paths
+       ),
+       do: {:error, "files", ids, paths}
 
   defp inline_file_source(%AttentionServer.LargeData.Ref{} = ref) do
     case AttentionServer.LargeData.verify(ref) do
@@ -5405,9 +5447,11 @@ defmodule AttentionServer.Relay do
           |> Enum.find_value(fn id ->
             case Map.get(state.store.engine.uploads, id) do
               %{person: ^person, uploader: ^key, op_id: op_id, name: name} = upload
-              when op_id == base.op_id and name == base.name -> upload
+              when op_id == base.op_id and name == base.name ->
+                upload
 
-              _ -> nil
+              _ ->
+                nil
             end
           end)
 
@@ -5436,7 +5480,9 @@ defmodule AttentionServer.Relay do
                       try do
                         case Store.publish_staged_upload(state.store.upload_dir, upload, staged) do
                           {:ok, published} ->
-                            {:ok, upload, %{engine | uploads: Map.put(engine.uploads, upload.id, upload)}, published}
+                            {:ok, upload,
+                             %{engine | uploads: Map.put(engine.uploads, upload.id, upload)},
+                             published}
 
                           _ ->
                             {:error, "storage_unavailable"}
@@ -5463,10 +5509,15 @@ defmodule AttentionServer.Relay do
 
   defp inline_source_path({:bytes, bytes}) do
     path =
-      Path.join(System.tmp_dir!(), "attention-inline-file-#{System.unique_integer([:positive, :monotonic])}")
+      Path.join(
+        System.tmp_dir!(),
+        "attention-inline-file-#{System.unique_integer([:positive, :monotonic])}"
+      )
 
     case File.write(path, bytes, [:binary, :exclusive]) do
-      :ok -> {:ok, path, true}
+      :ok ->
+        {:ok, path, true}
+
       _ ->
         _ = File.rm(path)
         {:error, :storage_unavailable}

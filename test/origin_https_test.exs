@@ -671,8 +671,7 @@ defmodule AttentionServer.OriginHTTPSTest do
 
     assert :crypto.hash(:sha256, delivered_body) == hash
 
-    assert {:ok, 200,
-            %{"type" => "ok", "item" => %{"message" => %{"body" => fetched_body}}}} =
+    assert {:ok, 200, %{"type" => "ok", "item" => %{"message" => %{"body" => fetched_body}}}} =
              request(c, "a2", %{
                "v" => 1,
                "type" => "message_get",
@@ -2719,12 +2718,17 @@ defmodule AttentionServer.OriginHTTPSTest do
 
   defp websocket_resync_events(socket, events, acknowledged?) do
     case websocket_reply(socket) do
-      %{"type" => "ok"} -> websocket_resync_events(socket, events, true)
-      %{"type" => "resynced"} = barrier when acknowledged? -> {Enum.reverse(events), barrier}
+      %{"type" => "ok"} ->
+        websocket_resync_events(socket, events, true)
+
+      %{"type" => "resynced"} = barrier when acknowledged? ->
+        {Enum.reverse(events), barrier}
+
       %{"type" => "resynced"} ->
         flunk("WebSocket resync barrier arrived without its acknowledgement")
 
-      event -> websocket_resync_events(socket, [event | events], acknowledged?)
+      event ->
+        websocket_resync_events(socket, [event | events], acknowledged?)
     end
   end
 
@@ -2760,7 +2764,10 @@ defmodule AttentionServer.OriginHTTPSTest do
 
   defp persisted_payload_size(path) do
     assert {:ok, db} = Sqlite3.open(path)
-    assert {:ok, stmt} = Sqlite3.prepare(db, "SELECT length(payload) FROM relay_state WHERE id = 1")
+
+    assert {:ok, stmt} =
+             Sqlite3.prepare(db, "SELECT length(payload) FROM relay_state WHERE id = 1")
+
     assert {:row, [size]} = Sqlite3.step(db, stmt)
     assert :ok = Sqlite3.release(db, stmt)
     assert :ok = Sqlite3.close(db)

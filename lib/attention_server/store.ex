@@ -1085,7 +1085,8 @@ defmodule AttentionServer.Store do
     with {:ok, durable_next, _created} <- LargeData.externalize(next, upload_dir),
          true <- LargeData.valid_refs?(durable_next),
          persisted = LargeData.persist_refs(durable_next),
-         {payload, cache} <- SnapshotEncoding.encode(persisted, @format_version, store.encoding_cache),
+         {payload, cache} <-
+           SnapshotEncoding.encode(persisted, @format_version, store.encoding_cache),
          checksum = :crypto.hash(:sha256, payload),
          :ok <- Sqlite3.execute(db, "BEGIN IMMEDIATE"),
          :ok <- check_progress_version(store),
@@ -1106,8 +1107,17 @@ defmodule AttentionServer.Store do
          :ok <- Sqlite3.execute(db, "COMMIT") do
       if is_binary(upload_dir) do
         case LargeData.delete_unreferenced(upload_dir, old_refs, durable_next) do
-          :ok -> :ok
-          error -> Diagnostics.failure(:server_storage, :large_data_delete, error, :unavailable, operation_id(audit))
+          :ok ->
+            :ok
+
+          error ->
+            Diagnostics.failure(
+              :server_storage,
+              :large_data_delete,
+              error,
+              :unavailable,
+              operation_id(audit)
+            )
         end
       end
 

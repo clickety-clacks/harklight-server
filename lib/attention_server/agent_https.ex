@@ -7,7 +7,15 @@ defmodule AttentionServer.AgentHTTPS do
 
   use GenServer
 
-  alias AttentionServer.{AgentWire, DeviceIdentity, Diagnostics, EnrolledLeafVerify, JSON, LargeData, Relay}
+  alias AttentionServer.{
+    AgentWire,
+    DeviceIdentity,
+    Diagnostics,
+    EnrolledLeafVerify,
+    JSON,
+    LargeData,
+    Relay
+  }
 
   @timeout :infinity
   @max_header 16 * 1024

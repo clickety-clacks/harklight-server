@@ -82,7 +82,9 @@ defmodule AttentionServer.JSON do
       |> Enum.each(&File.rm/1)
 
       if match?({:error, _}, result) and result != {:error, :storage_unavailable} do
-        AttentionServer.LargeData.cleanup_transient_refs(Process.get(:attention_json_markers, %{}))
+        AttentionServer.LargeData.cleanup_transient_refs(
+          Process.get(:attention_json_markers, %{})
+        )
       end
 
       result
@@ -122,6 +124,7 @@ defmodule AttentionServer.JSON do
             case File.sync(output) do
               :ok ->
                 Process.put(:attention_json_markers, state.markers)
+
                 Process.put(
                   :attention_json_keep_paths,
                   state.markers
@@ -180,7 +183,13 @@ defmodule AttentionServer.JSON do
     end
   end
 
-  defp scan_json_bytes(<<byte, rest::binary>>, output, %{mode: :normal} = state, output_bytes, body_bytes) do
+  defp scan_json_bytes(
+         <<byte, rest::binary>>,
+         output,
+         %{mode: :normal} = state,
+         output_bytes,
+         body_bytes
+       ) do
     cond do
       state.expect_files_value and byte in [9, 10, 13, 32] ->
         scan_json_bytes(rest, output, state, [byte | output_bytes], body_bytes)
@@ -271,7 +280,13 @@ defmodule AttentionServer.JSON do
         )
 
       byte in [9, 10, 13, 32] ->
-        scan_json_bytes(rest, output, %{state | last_body_key: false}, [byte | output_bytes], body_bytes)
+        scan_json_bytes(
+          rest,
+          output,
+          %{state | last_body_key: false},
+          [byte | output_bytes],
+          body_bytes
+        )
 
       byte == ?{ or byte == ?[ ->
         scan_json_bytes(
@@ -283,7 +298,10 @@ defmodule AttentionServer.JSON do
         )
 
       byte == ?} or byte == ?] ->
-        files_array_depth = if byte == ?] and state.files_array_depth == state.depth, do: nil, else: state.files_array_depth
+        files_array_depth =
+          if byte == ?] and state.files_array_depth == state.depth,
+            do: nil,
+            else: state.files_array_depth
 
         scan_json_bytes(
           rest,
@@ -299,11 +317,23 @@ defmodule AttentionServer.JSON do
         )
 
       true ->
-        scan_json_bytes(rest, output, %{state | last_body_key: false}, [byte | output_bytes], body_bytes)
+        scan_json_bytes(
+          rest,
+          output,
+          %{state | last_body_key: false},
+          [byte | output_bytes],
+          body_bytes
+        )
     end
   end
 
-  defp scan_json_bytes(<<byte, rest::binary>>, output, %{mode: :string} = state, output_bytes, body_bytes) do
+  defp scan_json_bytes(
+         <<byte, rest::binary>>,
+         output,
+         %{mode: :string} = state,
+         output_bytes,
+         body_bytes
+       ) do
     closing? = byte == ?" and not state.escaped
 
     next =
@@ -321,13 +351,25 @@ defmodule AttentionServer.JSON do
             else: state.key_buffer <> <<byte>>
 
         overflow? = state.key_buffer_overflow or byte_size(state.key_buffer) >= 32
-        %{state | escaped: byte == ?\\ and not state.escaped, key_buffer: key_buffer, key_buffer_overflow: overflow?}
+
+        %{
+          state
+          | escaped: byte == ?\\ and not state.escaped,
+            key_buffer: key_buffer,
+            key_buffer_overflow: overflow?
+        }
       end
 
     scan_json_bytes(rest, output, next, [byte | output_bytes], body_bytes)
   end
 
-  defp scan_json_bytes(<<byte, rest::binary>>, output, %{mode: :body_string} = state, output_bytes, body_bytes) do
+  defp scan_json_bytes(
+         <<byte, rest::binary>>,
+         output,
+         %{mode: :body_string} = state,
+         output_bytes,
+         body_bytes
+       ) do
     closing? = byte == ?" and not state.escaped
 
     if closing? do
@@ -348,10 +390,18 @@ defmodule AttentionServer.JSON do
 
   defp decoded_stream_key(raw, state) do
     case decode_line("\"" <> raw <> "\"\n") do
-      {:ok, key} when key in ["body", "answer", "title"] -> key
-      {:ok, "files"} when state.depth == 1 -> "files"
-      {:ok, "data_base64"} when is_integer(state.files_array_depth) and state.depth == state.files_array_depth + 1 -> "data_base64"
-      _ -> nil
+      {:ok, key} when key in ["body", "answer", "title"] ->
+        key
+
+      {:ok, "files"} when state.depth == 1 ->
+        "files"
+
+      {:ok, "data_base64"}
+      when is_integer(state.files_array_depth) and state.depth == state.files_array_depth + 1 ->
+        "data_base64"
+
+      _ ->
+        nil
     end
   end
 
@@ -368,12 +418,16 @@ defmodule AttentionServer.JSON do
   end
 
   defp finish_base64_token(state) do
-    marker = "__attention_large_text_" <> Base.encode16(:crypto.strong_rand_bytes(16), case: :lower) <> "__"
+    marker =
+      "__attention_large_text_" <>
+        Base.encode16(:crypto.strong_rand_bytes(16), case: :lower) <> "__"
+
     target = temp_path("attention-json-base64-")
     track_temp(target)
 
     case AttentionServer.LargeData.decode_json_base64_string_file(state.body_path, target) do
-      {:ok, ref} -> finish_ref_token(state, marker, ref)
+      {:ok, ref} ->
+        finish_ref_token(state, marker, ref)
 
       {:error, :bad_json_string} ->
         _ = File.rm(target)
@@ -391,12 +445,17 @@ defmodule AttentionServer.JSON do
   end
 
   defp finish_large_text_token(state) do
-    marker = "__attention_large_text_" <> Base.encode16(:crypto.strong_rand_bytes(16), case: :lower) <> "__"
+    marker =
+      "__attention_large_text_" <>
+        Base.encode16(:crypto.strong_rand_bytes(16), case: :lower) <> "__"
+
     target = temp_path("attention-json-body-")
     track_temp(target)
 
     case AttentionServer.LargeData.decode_json_string_file(state.body_path, target) do
-      {:ok, ref} -> finish_ref_token(state, marker, ref)
+      {:ok, ref} ->
+        finish_ref_token(state, marker, ref)
+
       {:error, :bad_json_string} ->
         _ = File.rm(target)
         {:error, :bad_frame}
@@ -441,7 +500,8 @@ defmodule AttentionServer.JSON do
 
   defp replace_nested_markers(%{} = map, markers) when not is_struct(map) do
     Map.new(map, fn
-      {key, marker} when key in ["body", "answer", "title", "data_base64"] and is_binary(marker) ->
+      {key, marker}
+      when key in ["body", "answer", "title", "data_base64"] and is_binary(marker) ->
         {key, Map.get(markers, marker, marker)}
 
       {key, value} ->
@@ -480,15 +540,21 @@ defmodule AttentionServer.JSON do
         track_temp(path)
         {:ok, path, file}
 
-      error -> error
+      error ->
+        error
     end
   end
 
   defp temp_path(prefix),
-    do: Path.join(System.tmp_dir!(), prefix <> Integer.to_string(System.unique_integer([:positive, :monotonic])))
+    do:
+      Path.join(
+        System.tmp_dir!(),
+        prefix <> Integer.to_string(System.unique_integer([:positive, :monotonic]))
+      )
 
   defp track_temp(path),
-    do: Process.put(:attention_json_temp_paths, [path | Process.get(:attention_json_temp_paths, [])])
+    do:
+      Process.put(:attention_json_temp_paths, [path | Process.get(:attention_json_temp_paths, [])])
 
   defp cleanup_json_temp_files(state) do
     Enum.each(state.token_paths, &File.rm/1)
@@ -657,11 +723,15 @@ defmodule AttentionServer.JSON do
   end
 
   defp encode_value_stream(%DecimalToken{} = value), do: once(encode!(value))
-  defp encode_value_stream(value) when is_nil(value) or is_boolean(value) or is_number(value) or is_binary(value),
-    do: once(encode!(value))
+
+  defp encode_value_stream(value)
+       when is_nil(value) or is_boolean(value) or is_number(value) or is_binary(value),
+       do: once(encode!(value))
 
   defp encode_value_stream(values) when is_list(values) do
-    parts = [once("[")] ++ interleave(Enum.map(values, &encode_value_stream/1), ",") ++ [once("]")]
+    parts =
+      [once("[")] ++ interleave(Enum.map(values, &encode_value_stream/1), ",") ++ [once("]")]
+
     Stream.concat(parts)
   end
 
@@ -683,7 +753,10 @@ defmodule AttentionServer.JSON do
   defp encode_value_stream(_), do: raise(ArgumentError, "not a JSON value")
 
   defp interleave([], _separator), do: []
-  defp interleave([first | rest], separator), do: [first | Enum.flat_map(rest, &[once(separator), &1])]
+
+  defp interleave([first | rest], separator),
+    do: [first | Enum.flat_map(rest, &[once(separator), &1])]
+
   defp once(value), do: Stream.map([value], & &1)
 
   @spec canonical(term()) :: binary()
@@ -699,11 +772,15 @@ defmodule AttentionServer.JSON do
         {key, canonical_large_bodies(ref)}
 
       {key, body}
-      when key in ["body", "answer", "title"] and is_binary(body) and byte_size(body) > 2 * 1024 * 1024 ->
-        {key, %{"__attention_server_large_text__" => %{
-          "size" => byte_size(body),
-          "sha256" => Base.encode16(:crypto.hash(:sha256, body), case: :lower)
-        }}}
+      when key in ["body", "answer", "title"] and is_binary(body) and
+             byte_size(body) > 2 * 1024 * 1024 ->
+        {key,
+         %{
+           "__attention_server_large_text__" => %{
+             "size" => byte_size(body),
+             "sha256" => Base.encode16(:crypto.hash(:sha256, body), case: :lower)
+           }
+         }}
 
       {key, child} ->
         {key, canonical_large_bodies(child)}

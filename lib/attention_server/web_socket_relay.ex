@@ -384,23 +384,29 @@ defmodule AttentionServer.WebSocketRelay do
     case decode_frame(buffer) do
       {:ok, {fin, opcode, payload}, rest} ->
         case consume_frame(socket, relay, session, fin, opcode, payload, fragment) do
-          {:ok, next_fragment} -> loop(socket, relay, session, rest, next_fragment)
+          {:ok, next_fragment} ->
+            loop(socket, relay, session, rest, next_fragment)
+
           {:error, :storage_unavailable} ->
             send_storage_unavailable(socket, relay)
 
-          _ -> :ok
+          _ ->
+            :ok
         end
 
       {:stream_payload, fin, opcode, length, mask, data} ->
         case receive_payload_file(socket, length, mask, data) do
           {:ok, path, rest} ->
             case consume_file_frame(socket, relay, session, fin, opcode, path, fragment) do
-              {:ok, next_fragment} -> loop(socket, relay, session, rest, next_fragment)
+              {:ok, next_fragment} ->
+                loop(socket, relay, session, rest, next_fragment)
+
               {:error, :storage_unavailable} ->
                 _ = File.rm(path)
                 send_storage_unavailable(socket, relay)
 
-              _ -> :ok
+              _ ->
+                :ok
             end
 
           {:error, reason} ->
@@ -410,40 +416,40 @@ defmodule AttentionServer.WebSocketRelay do
         end
 
       :more ->
-          case :ssl.recv(socket, next_read_size(buffer), @poll_ms) do
-            {:ok, chunk} ->
-              loop(socket, relay, session, buffer <> chunk, fragment)
+        case :ssl.recv(socket, next_read_size(buffer), @poll_ms) do
+          {:ok, chunk} ->
+            loop(socket, relay, session, buffer <> chunk, fragment)
 
-            {:error, :timeout} ->
-              case Relay.session_drain(relay, session) do
-                {:ok, frames} ->
-                  case Relay.session_send(relay, session, frames) do
-                    :ok ->
-                      loop(socket, relay, session, buffer, fragment)
+          {:error, :timeout} ->
+            case Relay.session_drain(relay, session) do
+              {:ok, frames} ->
+                case Relay.session_send(relay, session, frames) do
+                  :ok ->
+                    loop(socket, relay, session, buffer, fragment)
 
-                    {:error, reason} ->
-                      Diagnostics.failure(:device_relay, :response_write, reason, :closed)
+                  {:error, reason} ->
+                    Diagnostics.failure(:device_relay, :response_write, reason, :closed)
 
-                    other ->
-                      Diagnostics.failure(:device_relay, :response_write, other, :closed)
-                  end
+                  other ->
+                    Diagnostics.failure(:device_relay, :response_write, other, :closed)
+                end
 
-                {:error, :resync_required} ->
-                  loop(socket, relay, session, buffer, fragment)
+              {:error, :resync_required} ->
+                loop(socket, relay, session, buffer, fragment)
 
-                {:error, reason} ->
-                  Diagnostics.failure(:device_relay, :response_drain, reason, :closed)
+              {:error, reason} ->
+                Diagnostics.failure(:device_relay, :response_drain, reason, :closed)
 
-                other ->
-                  Diagnostics.failure(:device_relay, :response_drain, other, :closed)
-              end
+              other ->
+                Diagnostics.failure(:device_relay, :response_drain, other, :closed)
+            end
 
-            {:error, reason} ->
-              Diagnostics.failure(:device_relay, :request_read, reason, :closed)
+          {:error, reason} ->
+            Diagnostics.failure(:device_relay, :request_read, reason, :closed)
 
-            other ->
-              Diagnostics.failure(:device_relay, :request_read, other, :closed)
-          end
+          other ->
+            Diagnostics.failure(:device_relay, :request_read, other, :closed)
+        end
 
       {:error, reason} ->
         Diagnostics.failure(:device_relay, :request_read, reason, :closed)
@@ -535,7 +541,9 @@ defmodule AttentionServer.WebSocketRelay do
         close_result = File.close(file)
 
         case {result, close_result} do
-          {:ok, :ok} -> {:ok, path}
+          {:ok, :ok} ->
+            {:ok, path}
+
           _ ->
             _ = File.rm(path)
             {:error, :storage_unavailable}
@@ -695,7 +703,8 @@ defmodule AttentionServer.WebSocketRelay do
 
   defp process_text_file(relay, session, path) do
     case Relay.session_request_file(relay, session, path) do
-      {:ok, frames} -> deliver_frames(relay, session, frames, nil)
+      {:ok, frames} ->
+        deliver_frames(relay, session, frames, nil)
 
       {:error, reason} ->
         Diagnostics.failure(:device_relay, :request_dispatch, reason, :outcome_unknown)
@@ -885,7 +894,8 @@ defmodule AttentionServer.WebSocketRelay do
         close_result = File.close(file)
 
         case {result, close_result} do
-          {:ok, :ok} -> {:ok, path, rest}
+          {:ok, :ok} ->
+            {:ok, path, rest}
 
           {{:error, :storage_unavailable}, _} ->
             _ = File.rm(path)

@@ -117,7 +117,8 @@ defmodule AttentionServer.AgentAccess do
 
   defp current_agent(engine, key) do
     case Map.get(engine.agents, key) do
-      %{revoked: false} = agent -> {:ok, agent}
+      %{revoked: false} = agent ->
+        {:ok, agent}
 
       _ ->
         {:error, "forbidden"}

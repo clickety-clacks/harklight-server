@@ -100,7 +100,13 @@ defmodule AttentionServer.JevRankingTest do
 
   test "disk-backed title stays clipped by the existing ranking budget without materializing it" do
     title = String.duplicate("t", 2 * 1024 * 1024 + 1)
-    path = Path.join(System.tmp_dir!(), "attention-ranking-large-title-#{System.unique_integer([:positive])}")
+
+    path =
+      Path.join(
+        System.tmp_dir!(),
+        "attention-ranking-large-title-#{System.unique_integer([:positive])}"
+      )
+
     File.write!(path, title)
     on_exit(fn -> File.rm(path) end)
     hash = Base.encode16(:crypto.hash(:sha256, title), case: :lower)

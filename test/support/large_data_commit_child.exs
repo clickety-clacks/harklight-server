@@ -16,7 +16,12 @@ request = %{
   }
 }
 
-_ = AttentionServer.Relay.request_line(relay, "origin", AttentionServer.JSON.encode!(request) <> "\n")
+_ =
+  AttentionServer.Relay.request_line(
+    relay,
+    "origin",
+    AttentionServer.JSON.encode!(request) <> "\n"
+  )
 
 receive do
   :stop -> GenServer.stop(relay)
