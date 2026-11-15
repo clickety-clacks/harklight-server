@@ -516,39 +516,48 @@ defmodule AttentionServer.LargeData do
     staged = target.path <> ".#{System.unique_integer([:positive])}.staged"
 
     result =
-      with :ok <- verify(source),
-           {:ok, input} <- File.open(source.path, [:read, :binary]) do
-        try do
-          case File.open(staged, [:write, :binary, :exclusive]) do
-            {:ok, output} ->
-              try do
-                case copy_chunks(input, output, :crypto.hash_init(:sha256), 0) do
-                  {:ok, hash, size} when size == source.size and hash == source.sha256 ->
-                    with :ok <- :file.sync(output),
-                         :ok <- File.rename(staged, target.path) do
-                      case sync_directory(directory) do
-                        :ok ->
-                          :ok
+      try do
+        with :ok <- verify(source),
+             {:ok, input} <- File.open(source.path, [:read, :binary]) do
+          try do
+            case File.open(staged, [:write, :binary, :exclusive]) do
+              {:ok, output} ->
+                try do
+                  case copy_chunks(input, output, :crypto.hash_init(:sha256), 0) do
+                    {:ok, hash, size} when size == source.size and hash == source.sha256 ->
+                      with :ok <- :file.sync(output),
+                           :ok <- File.rename(staged, target.path) do
+                        case sync_directory(directory) do
+                          :ok ->
+                            :ok
 
-                        _ ->
-                          _ = File.rm(target.path)
-                          {:error, :storage_unavailable}
+                          _ ->
+                            _ = File.rm(target.path)
+                            {:error, :storage_unavailable}
+                        end
                       end
-                    end
 
-                  _ ->
-                    {:error, :storage_unavailable}
+                    _ ->
+                      {:error, :storage_unavailable}
+                  end
+                after
+                  _ = File.close(output)
                 end
-              after
-                _ = File.close(output)
-              end
 
-            _ ->
-              {:error, :storage_unavailable}
+              _ ->
+                {:error, :storage_unavailable}
+            end
+          after
+            _ = File.close(input)
           end
-        after
-          _ = File.close(input)
         end
+      rescue
+        # IO.binwrite/2 raises on a full filesystem instead of returning an
+        # error tuple. Keep only that storage failure inside the persistence boundary.
+        error in ErlangError ->
+          if error.original == :enospc,
+            do: {:error, :storage_unavailable},
+            else: reraise(error, __STACKTRACE__)
       end
 
     if result != :ok, do: File.rm(staged)
