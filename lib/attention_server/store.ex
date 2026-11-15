@@ -24,7 +24,7 @@ defmodule AttentionServer.Store do
   alias Exqlite.Sqlite3
   alias AttentionServer.Store.{Persistence, SnapshotEncoding}
 
-  @format_version 30
+  @format_version 29
   @inbox_index_chunk_size 20
   defstruct [:db, :engine, :version, :upload_dir, progress_version: 0, encoding_cache: %{}]
 
@@ -43,6 +43,13 @@ defmodule AttentionServer.Store do
     version INTEGER NOT NULL,
     payload BLOB NOT NULL,
     checksum BLOB NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS relay_large_data_refs (
+    path BLOB PRIMARY KEY NOT NULL,
+    marker TEXT NOT NULL,
+    id TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    sha256 TEXT NOT NULL
   );
   CREATE TABLE IF NOT EXISTS relay_audit (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -134,9 +141,10 @@ defmodule AttentionServer.Store do
               |> Engine.rebuild_default_index()
               |> Conversation.index_origin_feeds()
 
-            with :ok <- File.mkdir_p(upload_dir),
+            with {:ok, reference_rows} <- load_large_data_references(db),
+                 :ok <- File.mkdir_p(upload_dir),
                  :ok <- File.chmod(upload_dir, 0o700),
-                 engine <- LargeData.attach_paths(engine, upload_dir),
+                 {:ok, engine} <- LargeData.attach_paths(engine, upload_dir, reference_rows),
                  :ok <- LargeData.verify_all(engine),
                  :ok <-
                    prune_untracked_uploads(%__MODULE__{
@@ -146,6 +154,8 @@ defmodule AttentionServer.Store do
                      upload_dir: upload_dir
                    }),
                  :ok <- LargeData.prune(upload_dir, engine),
+                 :ok <-
+                   sync_large_data_references(db, LargeData.persisted_references(engine)),
                  {:ok, store} <-
                    load_progress(%__MODULE__{
                      db: db,
@@ -1085,11 +1095,13 @@ defmodule AttentionServer.Store do
     with {:ok, durable_next, _created} <- LargeData.externalize(next, upload_dir),
          true <- LargeData.valid_refs?(durable_next),
          persisted = LargeData.persist_refs(durable_next),
+         reference_rows = LargeData.persisted_references(durable_next),
          {payload, cache} <-
            SnapshotEncoding.encode(persisted, @format_version, store.encoding_cache),
          checksum = :crypto.hash(:sha256, payload),
          :ok <- Sqlite3.execute(db, "BEGIN IMMEDIATE"),
          :ok <- check_progress_version(store),
+         :ok <- write_large_data_references(db, reference_rows),
          :ok <-
            run(
              db,
@@ -1283,8 +1295,7 @@ defmodule AttentionServer.Store do
                   AttentionServer.JSON.DecimalToken,
                   APNS,
                   AttentionServer.AgentAccess,
-                  AttentionServer.Message,
-                  AttentionServer.LargeData.Ref
+                  AttentionServer.Message
                 ] do
               {:module, ^module} = Code.ensure_loaded(module)
             end
@@ -1319,8 +1330,7 @@ defmodule AttentionServer.Store do
                      26,
                      27,
                      28,
-                     29,
-                     30
+                     29
                    ] ->
                 original = struct(Engine, Map.from_struct(stored))
 
@@ -1470,7 +1480,6 @@ defmodule AttentionServer.Store do
                                    format < 27 -> "bounce_schedule_index_init"
                                    format < 28 -> "device_focus_permissions_init"
                                    format < 29 -> "hosted_delivery_state_init"
-                                   format < 30 -> "large_data_reference_storage"
                                    true -> "state_format"
                                  end
                              }
@@ -1510,6 +1519,45 @@ defmodule AttentionServer.Store do
 
   defp all(db, sql, params) do
     statement(db, sql, params, fn stmt -> collect_rows(db, stmt, []) end)
+  end
+
+  defp load_large_data_references(db) do
+    all(
+      db,
+      "SELECT path, marker, id, size, sha256 FROM relay_large_data_refs ORDER BY path",
+      []
+    )
+  end
+
+  defp sync_large_data_references(db, rows) do
+    result =
+      with :ok <- Sqlite3.execute(db, "BEGIN IMMEDIATE"),
+           :ok <- write_large_data_references(db, rows),
+           :ok <- Sqlite3.execute(db, "COMMIT") do
+        :ok
+      end
+
+    if result != :ok, do: Sqlite3.execute(db, "ROLLBACK")
+    result
+  end
+
+  defp write_large_data_references(db, rows) do
+    with :ok <- Sqlite3.execute(db, "DELETE FROM relay_large_data_refs") do
+      Enum.reduce_while(rows, :ok, fn
+        [path, marker, id, size, sha256], :ok ->
+          case run(
+                 db,
+                 "INSERT INTO relay_large_data_refs (path, marker, id, size, sha256) VALUES (?, ?, ?, ?, ?)",
+                 [{:blob, path}, marker, id, size, sha256]
+               ) do
+            :ok -> {:cont, :ok}
+            error -> {:halt, error}
+          end
+
+        _row, :ok ->
+          {:halt, {:error, :invalid_large_data_reference}}
+      end)
+    end
   end
 
   defp collect_rows(db, stmt, acc) do

@@ -18,6 +18,22 @@ defmodule AttentionServer.JSONTest do
     assert String.contains?(JSON.encode!(value), "0.123456789012345678901234567890")
   end
 
+  test "streamed JSON maps flatten nested members and report their encoded size" do
+    value = %{
+      "future" => %{
+        "items" => ["plain", 7, %{"decimal" => %DecimalToken{raw: "1.2345"}}],
+        "ok" => true
+      },
+      "message" => %{"title" => "Question", "body" => "Reply"}
+    }
+
+    expected = JSON.encode!(value)
+    streamed = value |> JSON.encode_stream() |> Enum.join()
+
+    assert streamed == expected
+    assert JSON.encoded_size(value) == byte_size(expected)
+  end
+
   test "malformed, duplicate-key, trailing, non-newline and over-bound frames fail closed" do
     assert {:error, :bad_frame} = JSON.decode_line("{oops}\n")
     assert {:error, :bad_frame} = JSON.decode_line("{\"a\":1,\"a\":2}\n")

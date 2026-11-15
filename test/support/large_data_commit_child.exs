@@ -1,6 +1,20 @@
 path = System.fetch_env!("WI2F2_STORE_PATH")
+ready_path = System.fetch_env!("WI2F2_READY_PATH")
+go_path = System.fetch_env!("WI2F2_GO_PATH")
 
 {:ok, relay} = AttentionServer.Relay.start_link(store_path: path)
+File.write!(ready_path, "ready")
+
+wait_for_go = fn wait ->
+  if File.exists?(go_path) do
+    :ok
+  else
+    Process.sleep(10)
+    wait.(wait)
+  end
+end
+
+:ok = wait_for_go.(wait_for_go)
 
 request = %{
   "v" => 1,

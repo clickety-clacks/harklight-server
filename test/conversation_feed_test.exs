@@ -33,6 +33,52 @@ defmodule AttentionServer.ConversationFeedTest do
     {version, payload, checksum}
   end
 
+  defp large_data_reference_rows(path) do
+    assert {:ok, db} = Sqlite3.open(path)
+
+    assert {:ok, stmt} =
+             Sqlite3.prepare(
+               db,
+               "SELECT path, marker, id, size, sha256 FROM relay_large_data_refs ORDER BY path"
+             )
+
+    rows = collect_large_data_reference_rows(db, stmt, [])
+    assert :ok = Sqlite3.release(db, stmt)
+    assert :ok = Sqlite3.close(db)
+    rows
+  end
+
+  defp collect_large_data_reference_rows(db, stmt, rows) do
+    case Sqlite3.step(db, stmt) do
+      {:row, row} -> collect_large_data_reference_rows(db, stmt, [row | rows])
+      :done -> Enum.reverse(rows)
+      error -> flunk("failed to read large-data reference rows: #{inspect(error)}")
+    end
+  end
+
+  defp write_legacy_snapshot(path, engine) do
+    {payload, _cache} = SnapshotEncoding.encode(engine, 29)
+    {version, _old_payload, _checksum} = state_snapshot(path)
+    assert {:ok, db} = Sqlite3.open(path)
+
+    assert {:ok, stmt} =
+             Sqlite3.prepare(
+               db,
+               "UPDATE relay_state SET version = ?, payload = ?, checksum = ? WHERE id = 1"
+             )
+
+    assert :ok =
+             Sqlite3.bind(stmt, [
+               version + 1,
+               {:blob, payload},
+               {:blob, :crypto.hash(:sha256, payload)}
+             ])
+
+    assert :done = Sqlite3.step(db, stmt)
+    assert :ok = Sqlite3.release(db, stmt)
+    assert :ok = Sqlite3.close(db)
+  end
+
   setup do
     dir =
       Path.join(System.tmp_dir!(), "harklight-conversation-#{System.unique_integer([:positive])}")
@@ -100,7 +146,7 @@ defmodule AttentionServer.ConversationFeedTest do
       nil ->
         cond do
           is_nil(Port.info(port)) ->
-            {:error, :child_exited}
+            child_exited_result(port)
 
           System.monotonic_time(:millisecond) >= deadline ->
             {:error, :timeout}
@@ -112,6 +158,48 @@ defmodule AttentionServer.ConversationFeedTest do
 
       name ->
         {:ok, name}
+    end
+  end
+
+  defp wait_for_child_file(path, port, deadline) do
+    cond do
+      File.regular?(path) ->
+        :ok
+
+      is_nil(Port.info(port)) ->
+        child_exited_result(port)
+
+      System.monotonic_time(:millisecond) >= deadline ->
+        {:error, :timeout}
+
+      true ->
+        Process.sleep(10)
+        wait_for_child_file(path, port, deadline)
+    end
+  end
+
+  defp child_exited_result(port) do
+    exit_status =
+      receive do
+        {^port, {:exit_status, status}} -> status
+      after
+        1_000 -> :unknown
+      end
+
+    {:error, {:child_exited, exit_status}, collect_child_output(port, [])}
+  end
+
+  defp collect_child_output(port, output) do
+    receive do
+      {^port, {:data, bytes}} ->
+        collect_child_output(port, [bytes | output])
+    after
+      0 ->
+        binary = output |> Enum.reverse() |> IO.iodata_to_binary()
+
+        if byte_size(binary) > 8_192,
+          do: binary_part(binary, byte_size(binary) - 8_192, 8_192),
+          else: binary
     end
   end
 
@@ -730,6 +818,20 @@ defmodule AttentionServer.ConversationFeedTest do
     {_, committed_payload, _} = state_snapshot(path)
     assert byte_size(committed_payload) - byte_size(before_payload) < 65_536
 
+    assert {:attention_relay_state, 29, persisted} =
+             :erlang.binary_to_term(committed_payload, [:safe])
+
+    persisted_record = persisted.messages[{"A", "app:test", "large-title"}]
+    persisted_title = persisted_record.message["title"]
+    assert is_binary(persisted_title)
+    assert persisted_title =~ "Full content requires a newer Harklight Server"
+
+    assert Enum.any?(large_data_reference_rows(path), fn
+             [path_key, marker, id, size, sha256] ->
+               is_binary(path_key) and marker == persisted_title and id == title_hash and
+                 size == byte_size(title) and sha256 == title_hash
+           end)
+
     state = :sys.get_state(relay)
     record = state.store.engine.messages[{"A", "app:test", "large-title"}]
     assert %AttentionServer.LargeData.Ref{} = ref = record.message["title"]
@@ -748,7 +850,146 @@ defmodule AttentionServer.ConversationFeedTest do
     GenServer.stop(restarted)
   end
 
-  test "FORMAT29 migration externalizes retained large title and body", %{path: path} do
+  test "a legacy FORMAT29 reader sees an honest marker, serves unrelated records, and re-upgrade restores full content",
+       %{path: path} do
+    assert {:ok, relay} = Relay.start_link(store_path: path)
+    assert :ok = Relay.setup_person(relay, "A")
+    assert :ok = Relay.setup_device(relay, "A", "origin")
+    assert :ok = Relay.setup_sender(relay, "origin", "app:test")
+
+    large_text = Base.encode64(:crypto.strong_rand_bytes(1_572_870))
+    assert byte_size(large_text) > 2 * 1024 * 1024
+
+    assert %{"type" => "ok", "seq" => 1} =
+             request(relay, "origin", %{
+               "type" => "forward",
+               "op_id" => op(506),
+               "session_handle" => @handle,
+               "message" => %{
+                 "sender_id" => "app:test",
+                 "message_id" => "rollback-large",
+                 "created_at" => 1,
+                 "title" => large_text,
+                 "body" => large_text
+               }
+             })
+
+    reference_rows = large_data_reference_rows(path)
+    assert length(reference_rows) >= 2
+
+    assert Enum.all?(reference_rows, fn [_path, marker, id, size, sha256] ->
+             marker =~ "Full content requires a newer Harklight Server" and
+               id == Base.encode16(:crypto.hash(:sha256, large_text), case: :lower) and
+               size == byte_size(large_text) and sha256 == id
+           end)
+
+    [rollback_marker | _] =
+      Enum.map(reference_rows, fn [_path, marker, _id, _size, _sha] -> marker end)
+
+    assert %{"type" => "ok", "seq" => 2} =
+             request(relay, "origin", %{
+               "type" => "forward",
+               "op_id" => op(507),
+               "session_handle" => @handle,
+               "message" => %{
+                 "sender_id" => "app:test",
+                 "message_id" => "rollback-small",
+                 "created_at" => 2,
+                 "title" => "Unrelated record",
+                 "body" => rollback_marker
+               }
+             })
+
+    GenServer.stop(relay)
+
+    {_, payload, _} = state_snapshot(path)
+    assert {:attention_relay_state, 29, persisted} = :erlang.binary_to_term(payload, [:safe])
+    large_record = persisted.messages[{"A", "app:test", "rollback-large"}]
+    title_marker = large_record.message["title"]
+    body_marker = large_record.message["body"]
+    assert is_binary(title_marker)
+    assert is_binary(body_marker)
+    assert title_marker =~ "Full content requires a newer Harklight Server"
+    assert body_marker =~ "Full content requires a newer Harklight Server"
+
+    data_dir = Path.expand(path) <> ".uploads"
+
+    saved_files =
+      Map.new(reference_rows, fn [_path_key, _marker, id, _size, _sha256] ->
+        {id, File.read!(Path.join(data_dir, id))}
+      end)
+
+    assert Enum.all?(saved_files, fn {_id, bytes} -> bytes == large_text end)
+
+    # The previous FORMAT29 reader loads these ordinary message strings directly.
+    # Relay and Engine's message-read path is unchanged by this PR.
+    assert {:ok, legacy_relay} = Relay.start_link(store_path: nil)
+    legacy_engine = persisted
+
+    :sys.replace_state(legacy_relay, fn state ->
+      %{state | store: %{state.store | engine: legacy_engine}}
+    end)
+
+    assert {:ok, %{"message" => %{"title" => ^title_marker, "body" => ^body_marker}}} =
+             Relay.origin_message_get(
+               legacy_relay,
+               "origin",
+               "app:test",
+               "rollback-large",
+               1
+             )
+
+    assert {:ok, %{"message" => %{"title" => "Unrelated record", "body" => small_body}}} =
+             Relay.origin_message_get(
+               legacy_relay,
+               "origin",
+               "app:test",
+               "rollback-small",
+               1
+             )
+
+    assert small_body == rollback_marker
+
+    assert :ok =
+             Store.prune_untracked_uploads(%Store{
+               db: nil,
+               engine: legacy_engine,
+               version: 0,
+               upload_dir: data_dir
+             })
+
+    write_legacy_snapshot(path, legacy_engine)
+    GenServer.stop(legacy_relay)
+
+    assert large_data_reference_rows(path) == reference_rows
+
+    assert Map.new(reference_rows, fn [_path_key, _marker, id, _size, _sha256] ->
+             {id, File.read!(Path.join(data_dir, id))}
+           end) == saved_files
+
+    assert {:ok, upgraded} = Relay.start_link(store_path: path)
+
+    assert {:ok, %{"message" => %{"title" => title_ref, "body" => body_ref}}} =
+             Relay.origin_message_get(upgraded, "origin", "app:test", "rollback-large", 1)
+
+    assert LargeData.read!(title_ref) == large_text
+    assert LargeData.read!(body_ref) == large_text
+
+    assert {:ok, %{"message" => %{"title" => "Unrelated record", "body" => ^rollback_marker}}} =
+             Relay.origin_message_get(
+               upgraded,
+               "origin",
+               "app:test",
+               "rollback-small",
+               1
+             )
+
+    GenServer.stop(upgraded)
+  end
+
+  test "FORMAT29 inline large title and body remain readable without a format migration", %{
+    path: path
+  } do
     {:ok, relay} = Relay.start_link(store_path: nil)
     assert :ok = Relay.setup_person(relay, "A")
     assert :ok = Relay.setup_device(relay, "A", "origin")
@@ -798,23 +1039,15 @@ defmodule AttentionServer.ConversationFeedTest do
     assert :ok = Sqlite3.release(db, stmt)
     assert :ok = Sqlite3.close(db)
 
-    assert {:ok, migrated} = Store.open(path)
-    assert migrated.version == 1
+    before = state_snapshot(path)
+    assert {:ok, reopened} = Store.open(path)
+    assert reopened.version == 0
 
-    record = migrated.engine.messages[{"A", "app:test", "format29-large-data"}]
-    assert %LargeData.Ref{} = title_ref = record.message["title"]
-    assert %LargeData.Ref{} = body_ref = record.message["body"]
-    assert LargeData.read!(title_ref) == title
-    assert LargeData.read!(body_ref) == body
-
-    {version, payload, _checksum} = state_snapshot(path)
-    assert version == 1
-    assert byte_size(payload) < 65_536
-    assert {:attention_relay_state, 30, persisted} = :erlang.binary_to_term(payload, [:safe])
-    persisted_record = persisted.messages[{"A", "app:test", "format29-large-data"}]
-    assert %LargeData.Ref{path: nil} = persisted_record.message["title"]
-    assert %LargeData.Ref{path: nil} = persisted_record.message["body"]
-    assert :ok = Store.close(migrated)
+    record = reopened.engine.messages[{"A", "app:test", "format29-large-data"}]
+    assert record.message["title"] == title
+    assert record.message["body"] == body
+    assert state_snapshot(path) == before
+    assert :ok = Store.close(reopened)
   end
 
   test "a failed large-data commit leaves no dangling reference and prunes its complete orphan",
@@ -850,6 +1083,7 @@ defmodule AttentionServer.ConversationFeedTest do
              })
 
     assert :sys.get_state(relay).store.engine.messages == %{}
+    assert large_data_reference_rows(path) == []
     data_dir = Path.expand(path) <> ".uploads"
     assert [orphan] = File.ls!(data_dir)
     assert Regex.match?(~r/\A[0-9a-f]{64}\z/, orphan)
@@ -861,6 +1095,7 @@ defmodule AttentionServer.ConversationFeedTest do
 
     assert {:ok, restarted} = Relay.start_link(store_path: path)
     assert :sys.get_state(restarted).store.engine.messages == %{}
+    assert large_data_reference_rows(path) == []
     assert File.ls!(data_dir) == []
     GenServer.stop(restarted)
   end
@@ -874,8 +1109,8 @@ defmodule AttentionServer.ConversationFeedTest do
     GenServer.stop(relay)
 
     data_dir = Path.expand(path) <> ".uploads"
-    assert {:ok, lock_db} = Sqlite3.open(path)
-    assert :ok = Sqlite3.execute(lock_db, "BEGIN IMMEDIATE")
+    ready_path = path <> ".large-data-ready"
+    go_path = path <> ".large-data-go"
 
     mix = System.find_executable("mix")
     assert is_binary(mix)
@@ -895,22 +1130,39 @@ defmodule AttentionServer.ConversationFeedTest do
         {:env,
          [
            {~c"MIX_ENV", ~c"test"},
-           {~c"WI2F2_STORE_PATH", String.to_charlist(path)}
+           {~c"WI2F2_STORE_PATH", String.to_charlist(path)},
+           {~c"WI2F2_READY_PATH", String.to_charlist(ready_path)},
+           {~c"WI2F2_GO_PATH", String.to_charlist(go_path)}
          ]}
       ])
 
     try do
       {:os_pid, child_pid} = Port.info(child, :os_pid)
       deadline = System.monotonic_time(:millisecond) + 30_000
-      assert {:ok, blob_name} = wait_for_large_data_file(data_dir, child, deadline)
 
-      assert Base.encode16(
-               :crypto.hash(:sha256, File.read!(Path.join(data_dir, blob_name))),
-               case: :lower
-             ) == blob_name
+      assert :ok = wait_for_child_file(ready_path, child, deadline)
+      assert {:ok, lock_db} = Sqlite3.open(path)
 
-      {_, 0} = System.cmd("kill", ["-KILL", Integer.to_string(child_pid)])
-      assert_receive {^child, {:exit_status, status}} when status != 0, 10_000
+      try do
+        assert :ok = Sqlite3.execute(lock_db, "BEGIN IMMEDIATE")
+        File.write!(go_path, "go")
+
+        result = wait_for_large_data_file(data_dir, child, deadline)
+
+        assert {:ok, blob_name} = result,
+               "large-data child did not produce a content file: #{inspect(result)}"
+
+        assert Base.encode16(
+                 :crypto.hash(:sha256, File.read!(Path.join(data_dir, blob_name))),
+                 case: :lower
+               ) == blob_name
+
+        {_, 0} = System.cmd("kill", ["-KILL", Integer.to_string(child_pid)])
+        assert_receive {^child, {:exit_status, status}} when status != 0, 10_000
+      after
+        _ = Sqlite3.execute(lock_db, "ROLLBACK")
+        _ = Sqlite3.close(lock_db)
+      end
     after
       case Port.info(child, :os_pid) do
         {:os_pid, running_pid} ->
@@ -919,9 +1171,6 @@ defmodule AttentionServer.ConversationFeedTest do
         _ ->
           :ok
       end
-
-      _ = Sqlite3.execute(lock_db, "ROLLBACK")
-      _ = Sqlite3.close(lock_db)
     end
 
     assert {:ok, restarted} = Relay.start_link(store_path: path)

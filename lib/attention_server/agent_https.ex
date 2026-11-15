@@ -281,9 +281,7 @@ defmodule AttentionServer.AgentHTTPS do
         {:error, :bad_frame}
 
       :nomatch ->
-        amount = min(@body_chunk_size, @max_header + 4 - byte_size(buffer))
-
-        case :ssl.recv(socket, amount, @timeout) do
+        case :ssl.recv(socket, 0, @timeout) do
           {:ok, chunk} ->
             read_header(socket, buffer <> chunk)
 

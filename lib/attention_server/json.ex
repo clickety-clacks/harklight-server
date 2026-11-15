@@ -67,6 +67,7 @@ defmodule AttentionServer.JSON do
           {:ok, replaced}
         else
           {:error, :storage_unavailable} = error -> error
+          {:error, :bad_frame} = error -> error
           {:error, _reason} -> {:error, :storage_unavailable}
           _ -> {:error, :bad_frame}
         end
@@ -121,7 +122,7 @@ defmodule AttentionServer.JSON do
       try do
         case scan_json_file(input, output, state) do
           {:ok, state} ->
-            case File.sync(output) do
+            case :file.sync(output) do
               :ok ->
                 Process.put(:attention_json_markers, state.markers)
 
@@ -662,6 +663,30 @@ defmodule AttentionServer.JSON do
   def encode!(%AttentionServer.LargeData.Ref{} = ref),
     do: encode!(AttentionServer.LargeData.read!(ref))
 
+  def encode!(value)
+      when is_nil(value) or is_boolean(value) or is_integer(value) or is_binary(value),
+      do: JSON.encode!(value)
+
+  # Server-computed scores must round-trip as JSON numbers without bucketing.
+  def encode!(value) when is_float(value), do: :erlang.float_to_binary(value, [:short])
+
+  def encode!(value) when is_list(value),
+    do: "[" <> Enum.map_join(value, ",", &encode!/1) <> "]"
+
+  def encode!(value) when is_map(value) do
+    if not Enum.all?(Map.keys(value), &is_binary/1),
+      do: raise(ArgumentError, "non-string JSON key")
+
+    members =
+      value
+      |> Enum.sort_by(fn {key, _} -> key end)
+      |> Enum.map_join(",", fn {key, item} -> JSON.encode!(key) <> ":" <> encode!(item) end)
+
+    "{" <> members <> "}"
+  end
+
+  def encode!(_), do: raise(ArgumentError, "not a JSON value")
+
   @doc false
   def encode_line(value) do
     if AttentionServer.LargeData.contains_ref?(value),
@@ -694,30 +719,6 @@ defmodule AttentionServer.JSON do
     end)
   end
 
-  def encode!(value)
-      when is_nil(value) or is_boolean(value) or is_integer(value) or is_binary(value),
-      do: JSON.encode!(value)
-
-  # Server-computed scores must round-trip as JSON numbers without bucketing.
-  def encode!(value) when is_float(value), do: :erlang.float_to_binary(value, [:short])
-
-  def encode!(value) when is_list(value),
-    do: "[" <> Enum.map_join(value, ",", &encode!/1) <> "]"
-
-  def encode!(value) when is_map(value) do
-    if not Enum.all?(Map.keys(value), &is_binary/1),
-      do: raise(ArgumentError, "non-string JSON key")
-
-    members =
-      value
-      |> Enum.sort_by(fn {key, _} -> key end)
-      |> Enum.map_join(",", fn {key, item} -> JSON.encode!(key) <> ":" <> encode!(item) end)
-
-    "{" <> members <> "}"
-  end
-
-  def encode!(_), do: raise(ArgumentError, "not a JSON value")
-
   defp encode_value_stream(%AttentionServer.LargeData.Ref{} = ref) do
     Stream.concat([once("\""), AttentionServer.LargeData.escaped_stream(ref), once("\"")])
   end
@@ -747,7 +748,7 @@ defmodule AttentionServer.JSON do
       end)
       |> interleave(",")
 
-    Stream.concat([once("{"), parts, once("}")])
+    Stream.concat([once("{")] ++ parts ++ [once("}")])
   end
 
   defp encode_value_stream(_), do: raise(ArgumentError, "not a JSON value")
@@ -766,7 +767,7 @@ defmodule AttentionServer.JSON do
     %{"__attention_server_large_text__" => %{"size" => size, "sha256" => hash}}
   end
 
-  defp canonical_large_bodies(value) when is_map(value) do
+  defp canonical_large_bodies(value) when is_map(value) and not is_struct(value) do
     Map.new(value, fn
       {key, %AttentionServer.LargeData.Ref{} = ref} when key in ["body", "answer", "title"] ->
         {key, canonical_large_bodies(ref)}

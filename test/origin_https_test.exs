@@ -543,6 +543,20 @@ defmodule AttentionServer.OriginHTTPSTest do
                },
                :binary.copy(<<1>>, 1_025)
              )
+
+    assert {:ok, 200, %{"type" => "ok", "upload_id" => _id, "duplicate" => false}} =
+             upload_request(
+               %{c | endpoint: endpoint},
+               "a2",
+               %{
+                 op_id: op(701),
+                 sender_id: "app:test",
+                 message_id: "small-after-over-cap",
+                 revision: 1,
+                 name: "small.bin"
+               },
+               "small"
+             )
   end
 
   test "a large exact upload is invisible until its bound request commits and remains fetchable after restart",
@@ -2233,7 +2247,7 @@ defmodule AttentionServer.OriginHTTPSTest do
     :ok = Sqlite3.execute(db, "PRAGMA query_only=ON")
 
     try do
-      assert {:ok, 200, %{"type" => "error", "reason" => "storage_unavailable"}} =
+      assert {:ok, 503, %{"type" => "error", "reason" => "storage_unavailable"}} =
                raw_request(
                  c,
                  "a2",

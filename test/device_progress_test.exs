@@ -44,7 +44,7 @@ defmodule AttentionServer.DeviceProgressTest do
     %{path: path}
   end
 
-  test "cold replay and every ACK preserve the FORMAT30 snapshot and survive restart", %{
+  test "cold replay and every ACK preserve the FORMAT29 snapshot and survive restart", %{
     path: path
   } do
     before = snapshot(path)
@@ -201,7 +201,7 @@ defmodule AttentionServer.DeviceProgressTest do
     assert migrated.engine.delivery_states == %{}
     Store.close(migrated)
     [_, payload, _] = snapshot(path)
-    assert {:attention_relay_state, 30, _} = :erlang.binary_to_term(payload)
+    assert {:attention_relay_state, 29, _} = :erlang.binary_to_term(payload)
     {:ok, restarted} = Relay.start_link(store_path: path)
     assert {:ok, 6} = Relay.conversation_cursor(restarted, "reader")
     {:ok, session} = Relay.open_session(restarted, "reader")
@@ -246,7 +246,7 @@ defmodule AttentionServer.DeviceProgressTest do
 
   defp as_format27(path) do
     [_, payload, _] = snapshot(path)
-    {:attention_relay_state, 30, engine} = :erlang.binary_to_term(payload)
+    {:attention_relay_state, 29, engine} = :erlang.binary_to_term(payload)
     # Fields introduced by main must be supplied by its existing normalizations.
     engine = Map.delete(engine, :delivery_states)
     payload = :erlang.term_to_binary({:attention_relay_state, 27, engine}, [:compressed])

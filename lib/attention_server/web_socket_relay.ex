@@ -316,7 +316,7 @@ defmodule AttentionServer.WebSocketRelay do
         {:ok, header, rest}
 
       :nomatch ->
-        case :ssl.recv(socket, @read_chunk, @handshake_timeout) do
+        case :ssl.recv(socket, 0, @handshake_timeout) do
           {:ok, chunk} -> read_headers(socket, buffer <> chunk)
           error -> error
         end
@@ -521,7 +521,7 @@ defmodule AttentionServer.WebSocketRelay do
     end
   end
 
-  defp consume_file_frame(_socket, relay, session, _fin, _opcode, path, fragment) do
+  defp consume_file_frame(_socket, relay, session, _fin, _opcode, path, _fragment) do
     _ = File.rm(path)
     cleanup_fragment_file()
     _ = protocol_error(relay, session)

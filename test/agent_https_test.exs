@@ -147,6 +147,38 @@ defmodule AttentionServer.AgentHTTPSTest do
     assert type in ["ok", "error"]
   end
 
+  test "Agent HTTPS accepts a body after a header at the existing size limit", context do
+    %{certs: certs, server: server, relay: relay} = context
+    person = bootstrap(relay, certs, "a1")
+
+    {:ok, agent_key} =
+      DeviceIdentity.from_certificate(TLSFixtures.certificate_der!(certs, "unknown"))
+
+    register(server, certs, "a1", person, agent_key)
+    body = JSON.encode!(%{"v" => 1, "type" => "search"})
+
+    header_prefix =
+      "POST /agent/v1 HTTP/1.1\r\n" <>
+        "Host: relay.test\r\n" <>
+        "Content-Type: application/json\r\n" <>
+        "Content-Length: #{byte_size(body)}\r\n" <>
+        "X-Pad: "
+
+    header_padding = 16 * 1024 - byte_size(header_prefix)
+    assert header_padding >= 0
+    header = header_prefix <> String.duplicate("x", header_padding) <> "\r\n\r\n"
+
+    assert byte_size(header) == 16 * 1024 + 4
+
+    assert {200, %{"type" => "ok", "items" => []}} =
+             raw_http(
+               endpoint(certs, Server.agent_port(server)),
+               certs,
+               "unknown",
+               header <> body
+             )
+  end
+
   test "large Agent HTTPS answers stream to a connected device and read back intact", context do
     %{certs: certs, server: server, relay: relay, path: path} = context
     person = bootstrap(relay, certs, "a1")
@@ -182,7 +214,7 @@ defmodule AttentionServer.AgentHTTPSTest do
                "answer" => answer
              })
 
-    device = websocket_connect(server, certs, "a1")
+    device = websocket_connect(server, certs, "a2")
 
     try do
       assert {[
@@ -209,7 +241,7 @@ defmodule AttentionServer.AgentHTTPSTest do
     end
   end
 
-  test "WebSocket frames above four MiB reach a connected device and later Agent HTTPS read",
+  test "device WebSocket answers above four MiB reach Agent HTTPS intact",
        context do
     %{certs: certs, server: server, relay: relay, path: path} = context
     person = bootstrap(relay, certs, "a1")
@@ -224,45 +256,58 @@ defmodule AttentionServer.AgentHTTPSTest do
     register(server, certs, "a1", person, agent_key)
     grant(server, certs, "a1", person, agent_key, ["app:test"], [])
 
-    receiver = websocket_connect(server, certs, "a1")
-    sender = websocket_connect(server, certs, "a2")
+    assert %{"type" => "ok", "seq" => 1} =
+             forward(relay, sender_key, message("large-frame", "Large WebSocket answer"))
+
+    payload_before = persisted_payload_size(path)
+    answer = Base.encode64(:crypto.strong_rand_bytes(3_145_729))
+    assert byte_size(answer) > 4 * 1024 * 1024
+    answer_hash = Base.encode16(:crypto.hash(:sha256, answer), case: :lower)
+    device = websocket_connect(server, certs, "a2")
 
     try do
-      assert {[], %{"seq" => 0}} = websocket_resync(receiver)
-      assert {[], %{"seq" => 0}} = websocket_resync(sender)
-
-      body = Base.encode64(:crypto.strong_rand_bytes(3_145_729))
-      assert byte_size(body) > 4 * 1024 * 1024
-      body_hash = Base.encode16(:crypto.hash(:sha256, body), case: :lower)
-      message = Map.put(message("large-frame", "Large WebSocket frame"), "body", body)
-      payload_before = persisted_payload_size(path)
+      assert {[%{"type" => "delivery", "message_id" => "large-frame"}], %{"seq" => 1}} =
+               websocket_resync(device)
 
       assert :ok =
-               websocket_request(sender, %{
-                 "type" => "forward",
+               websocket_request(device, %{
+                 "type" => "answer",
                  "op_id" => unique_op(),
-                 "message" => message
-               })
-
-      assert %{"type" => "ok", "seq" => 1} = websocket_reply(sender)
-      assert %{"type" => "delivery", "message" => delivered} = websocket_reply(receiver)
-      assert delivered == message
-      assert Base.encode16(:crypto.hash(:sha256, delivered["body"]), case: :lower) == body_hash
-
-      assert {:ok, 200, %{"type" => "ok", "item" => %{"message" => read_message}}} =
-               agent_https(endpoint(certs, Server.agent_port(server)), certs, "unknown", %{
-                 "v" => 1,
-                 "type" => "get",
                  "sender_id" => "app:test",
-                 "message_id" => "large-frame"
+                 "message_id" => "large-frame",
+                 "answer" => answer
                })
 
-      assert read_message == message
-      assert Base.encode16(:crypto.hash(:sha256, read_message["body"]), case: :lower) == body_hash
+      assert %{"type" => "ok", "seq" => 2} = websocket_reply(device)
+
+      assert %{"type" => "lifecycle", "seq" => 2, "answer" => delivered_answer} =
+               websocket_reply(device)
+
+      assert delivered_answer == answer
+      assert Base.encode16(:crypto.hash(:sha256, delivered_answer), case: :lower) == answer_hash
+
+      assert {200, %{"type" => "ok", "item" => %{"answer" => read_answer}}} =
+               raw_http(
+                 endpoint(certs, Server.agent_port(server)),
+                 certs,
+                 "unknown",
+                 http(
+                   "POST",
+                   "/agent/v1",
+                   JSON.encode!(%{
+                     "v" => 1,
+                     "type" => "get",
+                     "sender_id" => "app:test",
+                     "message_id" => "large-frame"
+                   })
+                 )
+               )
+
+      assert read_answer == answer
+      assert Base.encode16(:crypto.hash(:sha256, read_answer), case: :lower) == answer_hash
       assert persisted_payload_size(path) - payload_before < 65_536
     after
-      :ssl.close(receiver)
-      :ssl.close(sender)
+      :ssl.close(device)
     end
   end
 

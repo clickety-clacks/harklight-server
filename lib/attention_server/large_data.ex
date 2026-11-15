@@ -11,6 +11,7 @@ defmodule AttentionServer.LargeData do
 
   @inline_limit 2 * 1024 * 1024
   @chunk_size 64 * 1024
+  @persisted_ref_prefix "[Full content requires a newer Harklight Server. sha256="
 
   def inline_limit, do: @inline_limit
   def ref?(%Ref{}), do: true
@@ -48,11 +49,26 @@ defmodule AttentionServer.LargeData do
   end
 
   @doc false
-  def persist_refs(term), do: walk_refs(term, &%{&1 | path: nil})
+  def persist_refs(term), do: walk_refs(term, &reference_marker/1)
 
   @doc false
-  def attach_paths(term, directory) when is_binary(directory) do
-    walk_refs(term, &%{&1 | path: Path.join(directory, &1.id)})
+  def persisted_references(term) do
+    term
+    |> collect_reference_rows([], %{})
+    |> Map.values()
+    |> Enum.sort_by(&hd/1)
+  end
+
+  @doc false
+  def attach_paths(term, directory, rows) when is_binary(directory) and is_list(rows) do
+    with {:ok, references} <- references_by_path(rows, directory) do
+      engine =
+        term
+        |> attach_reference_markers([], references)
+        |> walk_refs(&%{&1 | path: Path.join(directory, &1.id)})
+
+      {:ok, engine}
+    end
   end
 
   @doc false
@@ -184,7 +200,7 @@ defmodule AttentionServer.LargeData do
                     {:ok, %{mode: :normal, utf8_tail: <<>>, hash: hash, size: size}} ->
                       digest = hash |> :crypto.hash_final() |> Base.encode16(case: :lower)
 
-                      with :ok <- File.sync(output),
+                      with :ok <- :file.sync(output),
                            do: {:ok, %Ref{id: digest, size: size, sha256: digest, path: target}}
 
                     {:ok, _incomplete} ->
@@ -239,7 +255,7 @@ defmodule AttentionServer.LargeData do
                   {:ok, %{hash: hash, size: size}} ->
                     digest = hash |> :crypto.hash_final() |> Base.encode16(case: :lower)
 
-                    case File.sync(output) do
+                    case :file.sync(output) do
                       :ok -> {:ok, %Ref{id: digest, size: size, sha256: digest, path: target}}
                       _ -> {:error, :storage_unavailable}
                     end
@@ -428,7 +444,7 @@ defmodule AttentionServer.LargeData do
         {:error, reason} ->
           {:halt, {:error, reason, files}}
 
-        error ->
+        _error ->
           {:halt, {:error, :storage_unavailable, files}}
       end
     end)
@@ -915,6 +931,102 @@ defmodule AttentionServer.LargeData do
     do: value |> Tuple.to_list() |> Enum.map(&walk_refs(&1, fun)) |> List.to_tuple()
 
   defp walk_refs(value, _fun), do: value
+
+  defp reference_marker(%Ref{id: id, size: size}),
+    do: @persisted_ref_prefix <> id <> "; bytes=" <> Integer.to_string(size) <> "]"
+
+  defp attach_reference_markers(%Ref{} = ref, _path, _references), do: ref
+
+  defp attach_reference_markers(value, path, references) when is_binary(value) do
+    case Map.get(references, path_key(path)) do
+      {^value, ref} -> ref
+      _ -> value
+    end
+  end
+
+  defp attach_reference_markers(value, path, references) when is_map(value) do
+    {module, fields} =
+      if is_struct(value), do: {value.__struct__, Map.from_struct(value)}, else: {nil, value}
+
+    mapped =
+      Map.new(fields, fn {key, child} ->
+        {key, attach_reference_markers(child, [{:map, key} | path], references)}
+      end)
+
+    if module, do: struct(module, mapped), else: mapped
+  end
+
+  defp attach_reference_markers(value, path, references) when is_list(value) do
+    value
+    |> Enum.with_index()
+    |> Enum.map(fn {child, index} ->
+      attach_reference_markers(child, [{:list, index} | path], references)
+    end)
+  end
+
+  defp attach_reference_markers(value, path, references) when is_tuple(value) do
+    value
+    |> Tuple.to_list()
+    |> Enum.with_index()
+    |> Enum.map(fn {child, index} ->
+      attach_reference_markers(child, [{:tuple, index} | path], references)
+    end)
+    |> List.to_tuple()
+  end
+
+  defp attach_reference_markers(value, _path, _references), do: value
+
+  defp references_by_path(rows, directory) do
+    Enum.reduce_while(rows, {:ok, %{}}, fn
+      [path, marker, id, size, sha256], {:ok, references}
+      when is_binary(path) and is_binary(marker) and is_binary(id) and is_integer(size) and
+             is_binary(sha256) ->
+        ref = %Ref{id: id, size: size, sha256: sha256, path: Path.join(directory, id)}
+
+        if valid_ref_metadata?(ref) and marker == reference_marker(ref) do
+          {:cont, {:ok, Map.put(references, path, {marker, ref})}}
+        else
+          {:halt, {:error, :storage_unavailable}}
+        end
+
+      _row, _acc ->
+        {:halt, {:error, :storage_unavailable}}
+    end)
+  end
+
+  defp collect_reference_rows(%Ref{} = ref, path, rows) do
+    key = path_key(path)
+    Map.put(rows, key, [key, reference_marker(ref), ref.id, ref.size, ref.sha256])
+  end
+
+  defp collect_reference_rows(value, path, rows) when is_map(value) do
+    fields = if is_struct(value), do: Map.from_struct(value), else: value
+
+    Enum.reduce(fields, rows, fn {key, child}, acc ->
+      collect_reference_rows(child, [{:map, key} | path], acc)
+    end)
+  end
+
+  defp collect_reference_rows(value, path, rows) when is_list(value) do
+    value
+    |> Enum.with_index()
+    |> Enum.reduce(rows, fn {child, index}, acc ->
+      collect_reference_rows(child, [{:list, index} | path], acc)
+    end)
+  end
+
+  defp collect_reference_rows(value, path, rows) when is_tuple(value) do
+    value
+    |> Tuple.to_list()
+    |> Enum.with_index()
+    |> Enum.reduce(rows, fn {child, index}, acc ->
+      collect_reference_rows(child, [{:tuple, index} | path], acc)
+    end)
+  end
+
+  defp collect_reference_rows(_value, _path, rows), do: rows
+
+  defp path_key(path), do: path |> Enum.reverse() |> :erlang.term_to_binary([:deterministic])
 
   defp collect_refs(%Ref{} = ref, acc), do: Map.put(acc, ref.id, ref)
 
