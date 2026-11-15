@@ -905,7 +905,7 @@ defmodule AttentionServer.ConversationFeedTest do
       assert committed_store.engine.messages[message_key].message["title"] == ref
 
       delivered = :erlang.trace_delivered(:all)
-      assert_receive {:trace_delivered, ^delivered}, 1_000
+      assert_receive {:trace_delivered, :all, ^delivered}, 1_000
 
       assert_receive_large_data_verifications([]) == []
     after
