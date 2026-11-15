@@ -1,3 +1,29 @@
+# Harklight Server v0.1.42
+
+## Changes
+
+- Continues the v0.1.35 maintenance line on FORMAT27 without a schema or
+  store-format change.
+- Recovers durable ACK cursors monotonically. Repeated or earlier ACKs return
+  the current cursor; an impossible stored cursor above the stream high-water
+  is clamped on conversation open or ACK. An older pending inbox checkpoint
+  no longer overwrites a newer durable ACK. Checkpoint responses retain the
+  high-water value of the checkpoint snapshot.
+
+## Upgrade and recovery
+
+Before the first v0.1.42 start, stop the server and take a complete private
+state backup. Returning to v0.1.35 after newer progress has been written
+requires restoring that backup and selecting the prior release, because
+v0.1.35 ignores later durable progress. Restore can fail, loses writes made
+after capture, and cannot undo external effects. The full systemd installer's
+failure-recovery behavior remains unproved; see SELF_HOST.md for the installer
+behavior and recovery limits. v0.1.42 retains FORMAT27 and startup support for
+migrating supported FORMAT25 state; v0.1.28 cannot read the resulting state.
+v0.1.42 cannot open FORMAT28 or FORMAT29 stores.
+
+---
+
 # Harklight Server v0.1.41
 
 ## Changes
