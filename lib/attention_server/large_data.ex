@@ -378,7 +378,7 @@ defmodule AttentionServer.LargeData do
     prepared = %{ref | path: target}
 
     cond do
-      ref.path == target and verify(prepared) == :ok ->
+      durable_target_present?(ref, target) ->
         {:ok, prepared, created}
 
       File.exists?(target) and verify(prepared) == :ok ->
@@ -394,6 +394,21 @@ defmodule AttentionServer.LargeData do
         {:error, :storage_unavailable, created}
     end
   end
+
+  defp durable_target_present?(%Ref{path: path} = ref, target) when path == target do
+    # References reaching this branch were verified when created or loaded at
+    # startup. Keep checking that the durable target still exists at the
+    # expected size, but do not hash all retained content on every commit.
+    with true <- valid_ref?(ref),
+         {:ok, %{type: :regular, size: size}} <- File.stat(target),
+         true <- size == ref.size do
+      true
+    else
+      _ -> false
+    end
+  end
+
+  defp durable_target_present?(_ref, _target), do: false
 
   defp transform(value, directory, created) when is_map(value) do
     if is_struct(value) do

@@ -850,6 +850,82 @@ defmodule AttentionServer.ConversationFeedTest do
     GenServer.stop(restarted)
   end
 
+  test "a later state commit does not re-read an existing large-data reference", %{path: path} do
+    assert {:ok, relay} = Relay.start_link(store_path: path)
+    assert :ok = Relay.setup_person(relay, "A")
+    assert :ok = Relay.setup_device(relay, "A", "origin")
+    assert :ok = Relay.setup_sender(relay, "origin", "app:test")
+
+    title = String.duplicate("large-title-", div(LargeData.inline_limit(), 12) + 1)
+    assert byte_size(title) > LargeData.inline_limit()
+
+    assert %{"type" => "ok", "seq" => 1} =
+             request(relay, "origin", %{
+               "type" => "forward",
+               "op_id" => op(504),
+               "session_handle" => @handle,
+               "message" => %{
+                 "sender_id" => "app:test",
+                 "message_id" => "large-title-no-reread",
+                 "created_at" => 1,
+                 "title" => title
+               }
+             })
+
+    state = :sys.get_state(relay)
+    message_key = {"A", "app:test", "large-title-no-reread"}
+    assert %LargeData.Ref{} = ref = state.store.engine.messages[message_key].message["title"]
+    assert File.regular?(ref.path)
+
+    {:ok, levels} =
+      BouncePolicy.normalize_levels([
+        %{"name" => "Follow up", "lower_bound" => 0, "bounce_after_days" => 1}
+      ])
+
+    {:ok, engine, _config} =
+      BounceDecision.configure_levels(
+        state.store.engine,
+        "A",
+        levels,
+        System.system_time(:millisecond)
+      )
+
+    verify_pattern = {LargeData, :verify, 1}
+    :erlang.trace_pattern(verify_pattern, true, [:local])
+    :erlang.trace(self(), true, [:call, :set_on_spawn, {:tracer, self()}])
+
+    try do
+      assert {:ok, committed_store} =
+               Store.commit(state.store, engine, %{
+                 person: "A",
+                 actor: "owner",
+                 action: "test_large_data_reference_reuse"
+               })
+
+      assert committed_store.engine.messages[message_key].message["title"] == ref
+
+      delivered = :erlang.trace_delivered(:all)
+      assert_receive {:trace_delivered, :all, ^delivered}, 1_000
+
+      assert_receive_large_data_verifications([]) == []
+    after
+      :erlang.trace(self(), false, [:call, :set_on_spawn])
+      :erlang.trace_pattern(verify_pattern, false, [:local])
+    end
+
+    assert LargeData.read!(ref) == title
+    GenServer.stop(relay)
+  end
+
+  defp assert_receive_large_data_verifications(calls) do
+    receive do
+      {:trace, _pid, :call, {LargeData, :verify, [ref]}} ->
+        assert_receive_large_data_verifications([ref | calls])
+    after
+      0 -> Enum.reverse(calls)
+    end
+  end
+
   test "a legacy FORMAT29 reader sees an honest marker, serves unrelated records, and re-upgrade restores full content",
        %{path: path} do
     assert {:ok, relay} = Relay.start_link(store_path: path)
