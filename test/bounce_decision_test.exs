@@ -128,19 +128,119 @@ defmodule AttentionServer.BounceDecisionTest do
     engine.bounce_revisions[key()].revisions[revision].selection
   end
 
-  test "unconfigured and pre-configuration messages remain unselected" do
+  test "defaults are read without storing a table and leave unscored messages inert" do
     {engine, _record} = fixture(configured?: false)
     refute Map.has_key?(engine.bounce_levels, @person)
-    assert [] == BounceDecision.levels(engine, @person)
+    assert BounceDecision.levels(engine, @person) ==
+             BouncePolicy.public_levels(BouncePolicy.default_levels())
+    assert selection(engine) == nil
+    assert BounceDecision.next_deadline(engine) == nil
 
-    {:ok, levels} = BouncePolicy.normalize_levels(@levels)
-    {:ok, configured, _} = BounceDecision.configure_levels(engine, @person, levels, 2_000)
+    still_unscored = BounceDecision.evaluate_due(engine, @accepted_at + 14 * 86_400_000)
+    assert selection(still_unscored) == nil
+    assert BounceDecision.advisory_cursor(still_unscored, @person, @origin, @handle) == 0
 
-    assert selection(score(configured, 0.9, 10_000)) == nil
+    selected = score(engine, %AttentionServer.JSON.DecimalToken{raw: "0.8"}, @accepted_at + 1)
+
+    assert selection(selected)["level_name"] == "Urgent"
+    assert selection(selected)["bounce_after_days"] == 0.5
+    assert selection(selected)["due_at_ms"] == @accepted_at + 43_200_000
+
+    due = BounceDecision.evaluate_due(selected, @accepted_at + 43_200_000)
+    assert selection(due)["decision"] == "bounced"
+    assert BounceDecision.advisory_cursor(due, @person, @origin, @handle) == 1
+
+    repeated = BounceDecision.evaluate_due(due, @accepted_at + 86_400_000)
+    assert BounceDecision.advisory_cursor(repeated, @person, @origin, @handle) == 1
+    refute Map.has_key?(repeated.bounce_levels, @person)
+  end
+
+  test "owner table replaces defaults for an unscored eligible revision" do
+    {engine, _record} = fixture(configured?: false)
+
+    assert {:ok, owner_levels} =
+             BouncePolicy.normalize_levels([
+               %{"name" => "Client label", "lower_bound" => 0, "bounce_after_days" => 2}
+             ])
+
+    assert {:ok, configured, _config} =
+             BounceDecision.configure_levels(engine, @person, owner_levels, @accepted_at + 1)
+
+    assert BounceDecision.levels(configured, @person) ==
+             BouncePolicy.public_levels(owner_levels)
+
+    selected = score(configured, 0.9, @accepted_at + 2)
+    assert selection(selected)["level_name"] == "Client label"
+    assert selection(selected)["bounce_after_days"] == 2
+    assert selection(selected)["due_at_ms"] == @accepted_at + 172_800_000
+  end
+
+  test "pre-default retained messages stay ineligible while later revisions qualify" do
+    {engine, record} = fixture(configured?: false)
+    state = engine.bounce_revisions[key()]
+    revision = %{state.revisions[1] | qualified: false}
+    retained_state = %{state | revisions: Map.put(state.revisions, 1, revision)}
+    retained = %{
+      engine
+      | bounce_revisions: Map.put(engine.bounce_revisions, key(), retained_state)
+    }
+
+    assert BounceDecision.levels(retained, @person) ==
+             BouncePolicy.public_levels(BouncePolicy.default_levels())
+
+    assert selection(score(retained, 0.9, @accepted_at + 43_200_000)) == nil
+
+    revised_message = message("Changed after defaults") |> Map.put("urgency", "high")
+    revised_files = [attachment("upload-2", "def")]
+    revised_at = @accepted_at + 10
+
+    {revised, 2, true} =
+      BounceDecision.record_revision(
+        retained,
+        key(),
+        record,
+        2,
+        revised_message,
+        revised_files,
+        revised_at,
+        1
+      )
+
+    revised_record = %{
+      record
+      | message: revised_message,
+        revision: 2,
+        revision_accepted_at: revised_at,
+        revisions: Map.put(record.revisions, 2, revised_message),
+        files_by_revision: Map.put(record.files_by_revision, 2, revised_files)
+    }
+
+    revised = %{
+      revised
+      | messages: Map.put(revised.messages, key(), revised_record),
+        conversation_highs: Map.put(revised.conversation_highs, @person, 1)
+    }
+
+    selected_revision = score(revised, 0.8, revised_at + 1)
+    assert selection(selected_revision, 1) == nil
+    assert selection(selected_revision, 2)["level_name"] == "Urgent"
+    assert selection(selected_revision, 2)["due_at_ms"] == revised_at + 43_200_000
+
+    rebuilt = BounceDecision.rebuild_indexes(retained)
+    assert selection(score(rebuilt, 0.9, @accepted_at + 43_200_000)) == nil
+
+    legacy = %{retained | bounce_revisions: Map.delete(retained.bounce_revisions, key())}
+    assert selection(score(legacy, 0.9, @accepted_at + 43_200_000)) == nil
+    assert BounceDecision.next_deadline(legacy) == nil
+    refute Map.has_key?(legacy.bounce_levels, @person)
   end
 
   test "first applied score fixes an inclusive level and acceptance-based deadline" do
     {engine, _record} = fixture()
+
+    assert BounceDecision.levels(engine, @person) ==
+             BouncePolicy.public_levels(engine.bounce_levels[@person].levels)
+
     selected = score(engine, %AttentionServer.JSON.DecimalToken{raw: "0.8"}, 1_050)
 
     assert selection(selected)["level_name"] == "Urgent"
