@@ -1,0 +1,160 @@
+name: Harklight release publishing
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: harklight-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Build and publish a stable tag
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate tag, main ancestry, and release metadata
+        id: source
+        run: |
+          set -euo pipefail
+          commit="$(git rev-parse "${GITHUB_REF}^{commit}")"
+          python3 .github/scripts/harklight_release_publish.py validate-source \
+            --tag "$GITHUB_REF_NAME" \
+            --commit "$commit"
+
+      - name: Read existing release state
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.source.outputs.tag }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/harklight_release_publish.py classify \
+            --tag "$RELEASE_TAG"
+
+      - name: Prepare an isolated package directory
+        run: |
+          set -euo pipefail
+          dist_dir="$RUNNER_TEMP/harklight-release-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          mkdir -m 700 -p "$dist_dir"
+          printf 'DIST_DIR=%s\n' "$dist_dir" >> "$GITHUB_ENV"
+
+      - name: Read Server CI toolchain pins
+        id: pins
+        if: steps.release.outputs.mode == 'build'
+        run: python3 .github/scripts/harklight_release_publish.py toolchain
+
+      - uses: erlef/setup-beam@v1
+        if: steps.release.outputs.mode == 'build'
+        with:
+          otp-version: ${{ steps.pins.outputs.otp }}
+          elixir-version: ${{ steps.pins.outputs.elixir }}
+          version-type: strict
+
+      - name: Build the tagged release package
+        if: steps.release.outputs.mode == 'build'
+        env:
+          RELEASE_VERSION: ${{ steps.source.outputs.version }}
+        run: |
+          set -euo pipefail
+          scripts/build-package.sh "$DIST_DIR"
+          install -m 644 SELF_HOST.md "$DIST_DIR/SELF_HOST.md"
+
+      - name: Verify the package before publication
+        id: built
+        if: steps.release.outputs.mode == 'build'
+        env:
+          RELEASE_TAG: ${{ steps.source.outputs.tag }}
+          RELEASE_VERSION: ${{ steps.source.outputs.version }}
+          RELEASE_COMMIT: ${{ steps.source.outputs.commit }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/harklight_release_publish.py verify-package \
+            --dist-dir "$DIST_DIR" \
+            --tag "$RELEASE_TAG" \
+            --version "$RELEASE_VERSION" \
+            --commit "$RELEASE_COMMIT"
+
+      - name: Verify an existing published release without rebuilding
+        id: existing
+        if: steps.release.outputs.mode == 'readback'
+        env:
+          RELEASE_TAG: ${{ steps.source.outputs.tag }}
+          RELEASE_VERSION: ${{ steps.source.outputs.version }}
+          RELEASE_COMMIT: ${{ steps.source.outputs.commit }}
+          RELEASE_ID: ${{ steps.release.outputs.release_id }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/harklight_release_publish.py verify-existing \
+            --dist-dir "$DIST_DIR" \
+            --tag "$RELEASE_TAG" \
+            --version "$RELEASE_VERSION" \
+            --commit "$RELEASE_COMMIT" \
+            --release-id "$RELEASE_ID"
+
+      - name: Replace an earlier failed workflow draft
+        if: steps.release.outputs.mode == 'build' && steps.release.outputs.release_id != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.source.outputs.tag }}
+          RELEASE_COMMIT: ${{ steps.source.outputs.commit }}
+          RELEASE_ID: ${{ steps.release.outputs.release_id }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/harklight_release_publish.py delete-draft \
+            --tag "$RELEASE_TAG" \
+            --commit "$RELEASE_COMMIT" \
+            --release-id "$RELEASE_ID"
+
+      - name: Upload the verified files and publish without approval
+        if: steps.release.outputs.mode == 'build'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.source.outputs.tag }}
+          RELEASE_VERSION: ${{ steps.source.outputs.version }}
+          RELEASE_COMMIT: ${{ steps.source.outputs.commit }}
+        run: |
+          set -euo pipefail
+          archive="$DIST_DIR/harklight-server-$RELEASE_VERSION-linux-x86_64.tar.gz"
+          gh release create "$RELEASE_TAG" \
+            --draft \
+            --verify-tag \
+            --target "$RELEASE_COMMIT" \
+            --title "Harklight Server $RELEASE_TAG" \
+            --notes-file RELEASE_NOTES.md
+          gh release upload "$RELEASE_TAG" \
+            "$archive" \
+            "$DIST_DIR/SHA256SUMS" \
+            "$DIST_DIR/SELF_HOST.md"
+          python3 .github/scripts/harklight_release_publish.py assert-draft \
+            --tag "$RELEASE_TAG" \
+            --commit "$RELEASE_COMMIT" \
+            --version "$RELEASE_VERSION" \
+            --dist-dir "$DIST_DIR"
+          gh release edit "$RELEASE_TAG" --draft=false --verify-tag
+
+      - name: Read the public release back and compare every file
+        env:
+          EXPECTED_HASHES: ${{ steps.built.outputs.hashes || steps.existing.outputs.hashes }}
+          RELEASE_TAG: ${{ steps.source.outputs.tag }}
+          RELEASE_VERSION: ${{ steps.source.outputs.version }}
+          RELEASE_COMMIT: ${{ steps.source.outputs.commit }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/harklight_release_publish.py public-readback \
+            --tag "$RELEASE_TAG" \
+            --version "$RELEASE_VERSION" \
+            --commit "$RELEASE_COMMIT" \
+            --expected-hashes "$EXPECTED_HASHES"
