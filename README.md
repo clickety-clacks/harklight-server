@@ -13,15 +13,15 @@ through Harklight.
 
 ## Install the server
 
-For the FORMAT29 v0.1.40 server package, use the release page below after
+For the FORMAT29 v0.1.43 server package, use the release page below after
 publication to download the Linux x86_64 archive, `SHA256SUMS` and
 `SELF_HOST.md`. Verify the checksum before extraction:
 
-[v0.1.40 release](https://github.com/clickety-clacks/harklight-server/releases/tag/v0.1.40)
+[v0.1.43 release](https://github.com/clickety-clacks/harklight-server/releases/tag/v0.1.43)
 
 ```sh
 sha256sum -c SHA256SUMS
-tar -xzf harklight-server-0.1.40-linux-x86_64.tar.gz
+tar -xzf harklight-server-0.1.43-linux-x86_64.tar.gz
 ```
 
 Follow [SELF_HOST.md](SELF_HOST.md) for a fresh installation, tailnet routing,
@@ -33,39 +33,47 @@ The package does not install a service, configure the tailnet or expose ports.
 State, owner/device identities, trust roots and sender grants live outside the
 versioned package. Run one server per database. Keep private keys and backups
 private; do not repeat bootstrap over an existing installation.
-This source, v0.1.40, writes FORMAT29. From supported FORMAT27 state such as
-the one written by v0.1.36, startup applies two ordered steps: first it adds
-`see_focus: false` and `push_view: false` only where device records lack those
-values, preserving existing values; then it initializes the hosted
-`delivery_states` map to empty. The final migrated store is FORMAT29; the source
-does not establish a separately persisted intermediate FORMAT28 state.
+This source, v0.1.43, writes FORMAT29. From supported FORMAT27 state, including
+the state written by the published v0.1.42 package, startup applies the FORMAT28
+device-focus defaults and FORMAT29 hosted-delivery-state initialization in
+order, preserving existing values and filling only missing values. The final
+migrated store is FORMAT29; the source does not establish a separately persisted
+intermediate FORMAT28 state. FORMAT29 large message data is stored in private
+files with durable database references. An older compatible FORMAT29 release
+that does not understand those references displays an explicit newer-server
+marker for that content, continues to serve other data, and preserves the
+referenced files; upgrading again restores full reads.
 Every registered, non-revoked agent can read all messages on the account it
 is registered to, regardless of sender. Sender filters select search results
 only; they do not limit access. Existing respond-grant values and response
 checks are unchanged. New registrations need no per-sender read grant for
 reads; answering still requires both a matching read grant and a matching
-respond grant. The v0.1.35, v0.1.36, v0.1.38, and planned v0.1.39 packages
-write FORMAT27 and
+respond grant. The published v0.1.42 package writes FORMAT27 and
 cannot read resulting FORMAT29 state. Changing only the selected code or
 release link is not a safe downgrade. Earlier v0.1.28 writes FORMAT25, while
 v0.1.27 and v0.1.26 write
 FORMAT24; see `SELF_HOST.md` for earlier package-format details.
 
-The release installer takes one full private-root backup while the service is
-stopped and before switching releases. It attempts to restore this snapshot if
-the candidate does not become ready, but the restore path has not been
-exercised in preparation of this package. Restore or prior-release startup can
-fail and leave the service stopped. Restoring the snapshot discards every write
-made after capture and cannot undo external notifications, bounces or agent
-deliveries. No recovery success or time is guaranteed.
+Before the first v0.1.43 start, stop the server and retain a complete private
+state backup. The release installer also takes one full private-root backup
+while the service is stopped and before switching releases. It attempts to
+restore this snapshot if the candidate start or process-readiness check fails.
+The optional owner agent-list check is warning-only and does not trigger a
+rollback; there is no automatic rollback after readiness. Recovery can fail
+and leave the service stopped. A successful isolated rehearsal is evidence for
+the tested archive and sequence, not a guarantee of recovery in every
+installation.
 
-Before the first v0.1.40 start, stop the server and take a complete private-state
-backup. After any v0.1.40 write, returning to v0.1.39 requires stopping the
-server, restoring that pre-start backup and selecting v0.1.39; changing only
-the code or release link cannot make FORMAT29 readable. This restore loses every
-write made since the backup and cannot undo external notifications, bounces or
-agent deliveries. Restore success is unproved and has not been tested; no
-recovery success is guaranteed.
+After any v0.1.43 write, returning to the published v0.1.42 FORMAT27 release
+requires stopping the server, restoring the pre-start FORMAT27 backup and
+selecting v0.1.42; changing only the code or release link cannot make FORMAT29
+readable. This restore loses every write made since the backup and cannot undo
+external notifications, bounces or agent deliveries. Do not assume recovery
+success or a recovery time.
+
+After a Reply or No comment, new chat on that request is closed and earlier
+messages remain readable. Agents without the matching Agent C1 behavior receive
+the existing generic closed refusal.
 
 v0.1.32 adds a side-effect-free origin-message read by sender ID and message ID.
 The matching `harklight-agent message-get` interface shipped in Agent 0.1.9.
