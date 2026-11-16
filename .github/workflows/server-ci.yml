@@ -34,6 +34,9 @@ jobs:
 
       - run: mix test
 
+      - name: Test release workflow helper
+        run: python3 -m unittest discover -s .github/scripts -p 'test_*.py'
+
       - name: Remove scratch filesystem
         if: always()
         run: |
