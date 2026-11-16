@@ -1,7 +1,7 @@
 ---
 name: harklight-agent
-version: "0.2.2"
-description: "Send and receive Harklight conversations on a self-hosted server, enroll a device when authorized, or use separately granted agent search and response tools."
+version: "0.2.3"
+description: "Send and receive Harklight conversations on a self-hosted server, enroll a device when authorized, use separately granted agent search and response tools, or construct supported web-client entry links."
 ---
 
 # Harklight for self-hosted agents
@@ -20,6 +20,61 @@ registered-agent tools, set `PACKAGE` to the extracted package directory and
 `HARKLIGHT_SERVER_CLI` to its `bin/harklight`; these tools do not start a second server. The package's
 `SELF_HOST.md` explains server setup and port exposure. A self-hosted origin may
 publish `none` as its file upload cap; use its published limits.
+
+## Links to the web client
+
+Obtain the verified browser origin, environment (self-hosted, hosted production
+or preview), installed web-client version, availability and sign-in prerequisites
+from the operator's existing deployment information. For self-hosted setup, use
+the package's `SELF_HOST.md`. No portable web-base or availability discovery
+interface has been verified for agents; report missing information rather than
+inventing a configuration field or discovery endpoint. The messaging origin port
+and device enrollment do not supply a browser address or browser session. Do not
+derive availability from a hostname or source merge. Keep instance values in
+existing deployment configuration, not in this portable skill.
+
+For a compatible self-hosted package, the supported entry points are `/inbox`
+and `/settings` at that browser origin. Use `/inbox` as the ordinary fallback
+when no supported link to a particular item exists. `/app/` serves the bundled
+client, but is not a message or conversation route. Server routes are rooted at
+`/`; a reverse-proxy subpath is not established by this contract. Use the exact
+paths without a trailing slash rather than assuming the server accepts the
+client parser's looser spelling.
+
+For example, given the synthetic browser origin `https://inbox.example.test:9443`,
+the entry links are `https://inbox.example.test:9443/inbox` and
+`https://inbox.example.test:9443/settings`. Construct these with a URL resolver
+using the verified origin and fixed path, preserving its scheme, host and port.
+These routes take no message, sender, person, recipient or session identifiers.
+Do not append an identifier as a path segment, query parameter or fragment: the
+bundled client's selected message and chat state live in browser history state,
+not a shareable URL. Query parameters are ignored; there is no return-to parameter. A sender/message pair such as `app:example` and `request-1`
+can identify an item in an accompanying explanation, but cannot select it through
+these entry links.
+
+There is no identifier escaping recipe for an unsupported deep link. Leave query
+and fragment empty for ordinary entry links, and escape the complete URL for its
+output context if embedding it in HTML. Do not carry credentials, invitation or
+sign-in tokens into a constructed link. Do not add tester-only preview controls
+to agent links.
+
+A self-hosted browser without a valid session gets sign-in help (HTTP 401) at
+these pages; `/sign-in` explains the existing owner-issued sign-in-link route.
+Use that authorized sign-in procedure rather than constructing a token. The
+sign-in exchange returns to `/inbox`, not a selected message. Device credentials
+and an agent's send permission do not sign the human into the browser.
+
+These rules describe the Server-bundled client, not every hosted deployment or
+future Web revision. A working hosted account/sign-in page does not establish
+that its Web client is enabled; a coming-soon page means it is not available to
+customers. Use the hosted operator's verified sign-in route, not the self-hosted
+`/sign-in` path. Check the instance's recorded release/configuration before using
+the entry links: merged source, a published package, an installed package and an
+available hosted web client are distinct states. A missing or disabled web client
+is not repaired by changing the URL. Preserve the supported conversation CLI
+route below when web navigation is unavailable; a link or opened page proves
+neither delivery, receipt nor a human reply and does not transfer conversation
+custody or start a listener.
 
 ## Explicitly authorized enrollment
 
