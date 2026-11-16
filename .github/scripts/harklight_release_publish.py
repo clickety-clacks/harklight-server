@@ -315,21 +315,26 @@ def toolchain_identity(lines: list[str], label: str) -> tuple[str, str, str]:
 
 
 def tag_annotation(tag: str) -> str:
-    tag_ref = f"refs/tags/{tag}"
+    encoded_tag = urllib.parse.quote(tag, safe="")
     try:
-        object_type = subprocess.check_output(["git", "cat-file", "-t", tag_ref], text=True).strip()
-    except (OSError, subprocess.CalledProcessError):
-        fail("could not read the pushed version tag")
-    if object_type != "tag":
+        reference = request_json(api_url(f"git/ref/tags/{encoded_tag}"))
+    except SystemExit as error:
+        fail(f"could not read the pushed tag rehearsal record; expected the documented fields ({error})")
+    if not isinstance(reference, dict):
+        fail("could not read the pushed tag rehearsal record; expected the documented fields")
+    target = reference.get("object") or {}
+    if not isinstance(target, dict) or target.get("type") != "tag":
         fail("pushed version tag is lightweight; an annotated tag with rehearsal fields is required")
+    tag_sha = str(target.get("sha", "")).lower()
+    if not re.fullmatch(r"[0-9a-f]{40}", tag_sha):
+        fail("could not read the pushed tag rehearsal record; expected the documented fields")
     try:
-        message = subprocess.check_output(["git", "for-each-ref", "--format=%(contents)", tag_ref])
-    except (OSError, subprocess.CalledProcessError):
-        fail("could not read the annotated tag message")
-    try:
-        return message.decode("utf-8")
-    except UnicodeDecodeError:
-        fail("annotated tag message is not valid UTF-8; expected the documented rehearsal fields")
+        tag_object = request_json(api_url(f"git/tags/{tag_sha}"))
+    except SystemExit as error:
+        fail(f"could not read the annotated tag message; expected the documented fields ({error})")
+    if not isinstance(tag_object, dict) or not isinstance(tag_object.get("message"), str):
+        fail("could not read the annotated tag message; expected the documented rehearsal fields")
+    return tag_object["message"]
 
 
 def parse_rehearsal_record(message: str) -> tuple[str, dict[str, str], list[str]]:
