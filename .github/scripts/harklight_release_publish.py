@@ -323,11 +323,13 @@ def tag_annotation(tag: str) -> str:
     if object_type != "tag":
         fail("pushed version tag is lightweight; an annotated tag with rehearsal fields is required")
     try:
-        return subprocess.check_output(
-            ["git", "for-each-ref", "--format=%(contents)", tag_ref], text=True
-        )
+        message = subprocess.check_output(["git", "for-each-ref", "--format=%(contents)", tag_ref])
     except (OSError, subprocess.CalledProcessError):
         fail("could not read the annotated tag message")
+    try:
+        return message.decode("utf-8")
+    except UnicodeDecodeError:
+        fail("annotated tag message is not valid UTF-8; expected the documented rehearsal fields")
 
 
 def parse_rehearsal_record(message: str) -> tuple[str, dict[str, str], list[str]]:
