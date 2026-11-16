@@ -351,14 +351,18 @@ def parse_rehearsal_record(message: str) -> tuple[str, dict[str, str], list[str]
         if not (line.startswith("rehearsal:") or line.startswith("rehearsal-") or line.startswith("rehearsal ")):
             continue
         key, separator, value = line.partition(":")
-        if not separator or key not in allowed_fields or not value.startswith(" "):
+        if not separator or key not in allowed_fields:
             fail("malformed rehearsal record; expected the documented key: value fields")
-        value = value[1:]
         if key == "rehearsal-toolchain":
-            if not value:
-                fail("rehearsal-toolchain fields must contain a version-output line")
+            if value.startswith(" "):
+                value = value[1:]
+            elif value:
+                fail("malformed rehearsal record; expected the documented key: value fields")
             toolchain_lines.append(value)
         else:
+            if not value.startswith(" "):
+                fail("malformed rehearsal record; expected the documented key: value fields")
+            value = value[1:]
             if not value or key in fields:
                 fail("malformed rehearsal record; fields must be nonempty and unique")
             fields[key] = value

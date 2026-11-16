@@ -1,0 +1,78 @@
+from __future__ import annotations
+
+import importlib.util
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+
+
+HELPER_PATH = Path(__file__).with_name("harklight_release_publish.py")
+HELPER_SPEC = importlib.util.spec_from_file_location("harklight_release_publish", HELPER_PATH)
+assert HELPER_SPEC and HELPER_SPEC.loader
+HELPER = importlib.util.module_from_spec(HELPER_SPEC)
+HELPER_SPEC.loader.exec_module(HELPER)
+
+
+class RehearsalRecordTests(unittest.TestCase):
+    def test_real_mix_version_record_round_trips_through_annotated_tag(self):
+        # These are the three real lines from the published v0.1.42 BUILD_INFO.
+        mix_version_lines = [
+            "Erlang/OTP 27 [erts-15.2.7.13] [source] [64-bit] "
+            "[smp:32:32] [ds:32:32:10] [async-threads:1] [jit:ns]",
+            "",
+            "Mix 1.19.5 (compiled with Erlang/OTP 27)",
+        ]
+        record_lines = [
+            "rehearsal-archive-sha256: " + "a" * 64,
+            "rehearsal-source-commit: " + "b" * 40,
+            "rehearsal-build-script-sha256: " + "c" * 64,
+            *[
+                f"rehearsal-toolchain: {line}" if line else "rehearsal-toolchain:"
+                for line in mix_version_lines
+            ],
+        ]
+        annotation = "\n".join(record_lines)
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            subprocess.run(["git", "init", "--quiet"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.name", "Test User"], cwd=repo, check=True)
+            subprocess.run(
+                ["git", "config", "user.email", "test@example.invalid"], cwd=repo, check=True
+            )
+            subprocess.run(["git", "config", "tag.gpgSign", "false"], cwd=repo, check=True)
+            (repo / "README.md").write_text("test\n", encoding="utf-8")
+            subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "--quiet", "-m", "test"], cwd=repo, check=True)
+            subprocess.run(
+                ["git", "tag", "-a", "test-rehearsal-annotation", "-F", "-"],
+                cwd=repo,
+                input=annotation,
+                text=True,
+                check=True,
+            )
+            stored_annotation = subprocess.check_output(
+                [
+                    "git",
+                    "for-each-ref",
+                    "--format=%(contents)",
+                    "refs/tags/test-rehearsal-annotation",
+                ],
+                cwd=repo,
+                text=True,
+            )
+
+        self.assertIn("rehearsal-toolchain:\nrehearsal-toolchain: Mix 1.19.5", stored_annotation)
+        form, fields, stored_toolchain_lines = HELPER.parse_rehearsal_record(stored_annotation)
+        self.assertEqual(form, "recorded")
+        self.assertEqual(fields["rehearsal-source-commit"], "b" * 40)
+        self.assertEqual(stored_toolchain_lines, mix_version_lines)
+        self.assertEqual(
+            HELPER.toolchain_identity(stored_toolchain_lines, "stored annotation"),
+            HELPER.toolchain_identity(mix_version_lines, "real Mix version output"),
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
