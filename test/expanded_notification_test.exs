@@ -120,6 +120,14 @@ defmodule AttentionServer.ExpandedNotificationTest do
     assert Expansion.add(legacy(), %{presentation: :alert}) == legacy()
   end
 
+  test "an expansion encoding failure returns the complete legacy payload" do
+    actual = Expansion.add(legacy(), batch(["valid first title", <<255>>]))
+    assert actual == legacy()
+    assert JSON.encode!(actual) == JSON.encode!(legacy())
+    refute Map.has_key?(actual["aps"], "category")
+    refute Map.has_key?(actual["attention"], "expanded")
+  end
+
   test "an oversized reference remains undisplayed without substituting a preview" do
     ref = %LargeData.Ref{id: "synthetic", sha256: "synthetic", size: 3_000_000, path: nil}
     actual = Expansion.add(legacy(), batch([ref, "later title"]))

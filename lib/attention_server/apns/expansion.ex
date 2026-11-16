@@ -9,15 +9,23 @@ defmodule AttentionServer.APNS.Expansion do
 
   # Run only after legacy fitting and server insertion. Nothing here may refit
   # the collapsed alert or remove any of its routing fields to make space.
-  def add(payload, %{presentation: :alert, expanded: :single}) do
+  def add(payload, claim) do
+    expand(payload, claim)
+  rescue
+    # Expansion is optional. A content/encoding failure must not turn an
+    # otherwise valid legacy notification into a failed provider request.
+    _ -> payload
+  end
+
+  defp expand(payload, %{presentation: :alert, expanded: :single}) do
     candidate = put_in(payload, ["aps", "category"], @single)
     if fits?(candidate), do: candidate, else: payload
   end
 
-  def add(payload, %{
-        presentation: :alert,
-        expanded: %{titles: titles, total_count: total}
-      }) do
+  defp expand(payload, %{
+         presentation: :alert,
+         expanded: %{titles: titles, total_count: total}
+       }) do
     candidate =
       payload
       |> put_in(["aps", "category"], @batch)
@@ -48,7 +56,7 @@ defmodule AttentionServer.APNS.Expansion do
     end
   end
 
-  def add(payload, _claim), do: payload
+  defp expand(payload, _claim), do: payload
 
   defp fits?(payload), do: byte_size(JSON.encode!(payload)) <= @limit
 
