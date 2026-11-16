@@ -175,35 +175,41 @@ its connection indicator stays Unknown without a real presence signal.
 
 ## Durable upgrade boundary
 
-This release, v0.1.40, writes FORMAT29. From supported FORMAT27 state such as
-that written by v0.1.36, first start applies two ordered steps: it adds
-`see_focus: false` and `push_view: false` only where device records lack those
-values, preserving existing values, then initializes the hosted
-`delivery_states` map to empty. The final migrated store is FORMAT29; a
-separately persisted intermediate FORMAT28 state is not established.
+This release, v0.1.44, writes FORMAT29. From supported FORMAT27 state,
+including state written by the published v0.1.42 package, first start applies
+the FORMAT28 device-focus defaults and FORMAT29 hosted-delivery-state
+initialization in order, preserving existing values and filling only missing
+values. The final migrated store is FORMAT29; a separately persisted
+intermediate FORMAT28 state is not established. Large message data is held in
+private files with durable database references. An older compatible FORMAT29
+release that does not understand a reference shows an explicit newer-server
+marker for that content, continues to serve other data and preserves the
+referenced files; a compatible upgrade restores full reads.
+
 Every registered, non-revoked agent can read all messages on its account,
 regardless of sender. Sender filters select search results only; they do not
 limit access. New registrations need no per-sender read grant for reads.
 Answering still requires both a matching read grant and a matching respond
-grant; response behavior is unchanged. The v0.1.35, v0.1.36,
-v0.1.38, and planned v0.1.39 packages write FORMAT27 and cannot read FORMAT29;
-changing the code back alone does not restore compatibility.
+grant; response behavior is unchanged. After a Reply or No comment, new chat on
+that request is closed and earlier messages remain readable. Agents without
+the matching Agent C1 behavior receive the existing generic closed refusal.
+The published v0.1.42 package writes FORMAT27 and cannot read FORMAT29; changing
+the code back alone does not restore compatibility.
 
-Before the first v0.1.40 start, stop the server and take a complete private-state
-backup. After any v0.1.40 write, returning to v0.1.39 requires stopping the
-server, restoring that pre-start backup and selecting v0.1.39. This loses every
-write made since the backup and cannot undo external notifications, bounces or
-agent deliveries. Restore success is unproved and has not been tested; see
-SELF_HOST.md for the recovery limits. Older package formats are summarized in
-SELF_HOST.md.
+Before the first v0.1.44 start, stop the server and take a complete private-state
+backup. After any v0.1.44 write, returning to the published v0.1.42 package
+requires stopping the server, restoring that pre-start backup and selecting
+v0.1.42. This loses every write made since the backup and cannot undo external
+notifications, bounces or agent deliveries. The installer behavior and recovery
+limits are in SELF_HOST.md; consult the exact archive's rehearsal record, and do
+not assume recovery success or a recovery time. Older package formats are
+summarized in SELF_HOST.md.
 
 Score-based priority levels can set an unseen interval for each level. When
 that interval elapses, the server adds an advisory to the originating agent
 session asking whether the request is still valid and worth resending and
 whether its importance should be raised. It does not automatically resend the
-request or change its priority. After a Reply or No comment, new chat on that
-request is closed and earlier messages remain readable; agents without the
-matching Agent C1 behavior receive the existing generic closed refusal.
+request or change its priority.
 
 Invitations, consumed bindings and resumable request generations share the
 atomic SQLite snapshot transaction. Keep current state and use a compatible

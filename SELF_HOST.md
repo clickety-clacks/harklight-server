@@ -1,6 +1,6 @@
 # Harklight Server self-hosted installation
 
-Version: **0.1.40**. Package target: **Linux x86_64, glibc 2.39 or newer**, with OpenSSL 3 shared libraries and libstdc++6 (built on Ubuntu 24.04). The package bundles
+Version: **0.1.44**. Package target: **Linux x86_64, glibc 2.39 or newer**, with OpenSSL 3 shared libraries and libstdc++6 (built on Ubuntu 24.04). The package bundles
 Erlang/OTP and Elixir bytecode; users need no Mix, Hex, source checkout or
 Erlang installation. It needs Bash, OpenSSL CLI, tar and the platform libraries
 listed in BUILD_INFO. This is a single-process self-hosted server cut.
@@ -32,9 +32,9 @@ a live phone test.
 
 ## Download and verify
 
-After publication, download the v0.1.40 release from
-clickety-clacks/harklight-server, tag v0.1.40. Get
-harklight-server-0.1.40-linux-x86_64.tar.gz, SHA256SUMS and SELF_HOST.md from
+After publication, download the v0.1.44 release from
+clickety-clacks/harklight-server, tag v0.1.44. Get
+harklight-server-0.1.44-linux-x86_64.tar.gz, SHA256SUMS and SELF_HOST.md from
 that release. Run sha256sum -c SHA256SUMS and extract into an operator-owned
 versioned directory. BUILD_INFO identifies the source commit, build host,
 toolchain, source status and native dependencies.
@@ -47,7 +47,7 @@ runtime/dependency notices remain in their shipped distribution files.
 Choose the DNS hostname clients will validate. For a same-machine preview,
 localhost works. Install into a directory you own and run:
 
-    PACKAGE="$PWD/harklight-server-0.1.40-linux-x86_64"
+    PACKAGE="$PWD/harklight-server-0.1.44-linux-x86_64"
     STATE="$HOME/.local/share/harklight-server"
     "$PACKAGE/bin/harklight-bootstrap" "$STATE" localhost
     cat "$STATE/person-id"
@@ -315,19 +315,22 @@ survive restart.
 For a manual upgrade of an existing installation, stop the old server and back
 up the full private state before upgrading. The release installer makes one
 full mutable-root backup after stopping the service and before switching
-releases. This source, v0.1.40, writes store FORMAT29. From a supported FORMAT27
-store such as the one written by v0.1.36, startup applies two ordered steps:
-first it adds `see_focus: false` and `push_view: false` only where device
-records lack those values, preserving existing values; then it initializes the
-hosted `delivery_states` map to empty. The final migrated store is FORMAT29;
-the source does not establish a separately persisted intermediate FORMAT28
-state. Every registered, non-revoked agent can read all messages on the account
+releases. This source, v0.1.44, writes store FORMAT29. From supported FORMAT27
+state, including state written by the published v0.1.42 package, startup applies
+the FORMAT28 device-focus defaults and FORMAT29 hosted-delivery-state
+initialization in order, preserving existing values and filling only missing
+values. The final migrated store is FORMAT29; the source does not establish a
+separately persisted intermediate FORMAT28 state. FORMAT29 large message data
+is kept in private files with durable database references. An older compatible
+FORMAT29 release that does not understand those references displays an explicit
+newer-server marker for that content, continues to serve other data and
+preserves the referenced files; upgrading again restores full reads.
+Every registered, non-revoked agent can read all messages on the account
 it is registered to, regardless of sender. Sender filters select search results
 only; they do not limit access. Existing respond-grant values and response
 checks are unchanged. New registrations need no per-sender read grant for
 reads; answering still requires both a matching read grant and a matching
-respond grant. The v0.1.35, v0.1.36, v0.1.38, and published v0.1.39 packages
-write FORMAT27 and
+respond grant. The published v0.1.42 package writes FORMAT27 and
 cannot read FORMAT29; changing only the code or release link is not a safe
 downgrade. The
 FORMAT25 state
@@ -420,23 +423,28 @@ exact acceptance sequence and intent reference, without source ruling authority.
 
 For a manual upgrade, stop the old process and back up the complete private
 state directory, including the database and keys, before the first start of a
-v0.1.40 package. Verify the package checksum and extract into a different
+v0.1.44 package. Verify the package checksum and extract into a different
 versioned directory. Keep the state path, trust root, owner/person and
 configuration. Start with the existing `server.env`; do not rerun bootstrap.
-From supported FORMAT27 state, first start applies the FORMAT28 focus-default
-step and then the FORMAT29 hosted-delivery-state initialization in order. The
-resulting store is FORMAT29. There is no hot upgrade; only one server may own a
-database.
+From supported FORMAT27 state, first start applies the FORMAT28 device-focus
+defaults and FORMAT29 hosted-delivery-state initialization in order. The
+resulting store is FORMAT29. Large message data references are preserved in the
+database side table; an older compatible FORMAT29 release that does not
+understand them shows an explicit newer-server marker while continuing to serve
+other data, and a compatible upgrade restores full reads. There is no hot
+upgrade; only one server may own a database.
 
 The release installer stops the service and confirms the process has stopped,
-creates one full mutable-root backup, switches `current`, and starts the
-selected package. It waits for the selected process to become active under that
-release. If the candidate start or process readiness fails, it attempts to
+then creates one full mutable-root backup before switching `current`. If backup
+creation fails, it attempts to resume the prior service and does not switch the
+release. If that restart cannot be confirmed, it reports the failure. After a
+successful backup it switches `current` and starts the selected package. It waits
+for the selected process to become active under that release. If the candidate start or process readiness fails, it attempts to
 stop the candidate, restore the pre-install mutable root and prior `current`
-link from that backup, then start and check the prior release. The restore path
-has not been exercised in preparation of this package; this description is not
-evidence of tested recovery. The restore or prior-release startup/readiness can
-fail and leave the service stopped. The failed package remains under its
+link from that backup, then start and check the prior release. This description
+does not itself establish tested recovery; consult the exact archive's recorded
+rehearsal result. The restore or prior-release startup/readiness can fail and
+leave the service stopped. The failed package remains under its
 versioned release directory but is not selected. The archive includes the
 database and private configuration, and excludes immutable versioned releases,
 prior backups and the installer lock; prior release files are preserved. The
@@ -450,26 +458,25 @@ route is unavailable; that route does not block other server functionality or
 trigger a whole-release rollback.
 
 Restoring the pre-install backup discards every write made after its capture,
-including any writes made by the candidate during its failed start. The
-installer's restore path has not been exercised in preparation of this package.
-Although it captures a full mutable-root backup while the service is stopped,
-restoration or prior-release startup can fail; do not assume recovery or a
-recovery time.
+including any writes made by the candidate during its failed start. The backup's
+readability is not validated by the installer. Although it captures a full
+mutable-root backup while the service is stopped, restoration or prior-release
+startup can fail; do not assume recovery or a recovery time.
 
 The installer attempts backup restoration only when candidate start or
 process-readiness fails. After readiness, it does not automatically roll back;
 the optional owner agent-list probe is warning-only.
 
-Before the first v0.1.40 start, stop the server and take a complete private
-state backup, including the database and keys. After any v0.1.40 write,
-returning to v0.1.39 requires stopping the server, restoring that pre-start
-backup and selecting v0.1.39. The v0.1.39 package cannot read the resulting
-FORMAT29 state, and changing only the code or release link does not restore
-compatibility. Restoring the backup loses every write since it was taken and
-cannot undo external notifications, bounces or agent deliveries. Restore
-success is unproved and has not been tested; it may fail, so no recovery success
-or time is guaranteed. Preserve the backup and current state if restoration
-does not succeed. The same format number does not make a downgrade from
+Before the first v0.1.44 start, stop the server and take a complete private
+state backup, including the database and keys. After any v0.1.44 write,
+returning to the published v0.1.42 FORMAT27 release requires stopping the
+server, restoring that pre-start backup and selecting v0.1.42. The v0.1.42
+package cannot read the resulting FORMAT29 state, and changing only the code or
+release link does not restore compatibility. Restoring the backup loses every
+write since it was taken and cannot undo external notifications, bounces or
+agent deliveries. Preserve the backup and current state if restoration does
+not succeed. Do not assume recovery success or a recovery time. The same
+format number does not make a downgrade from
 v0.1.25 or later safe: after ACK2 data has been written, do not switch to
 v0.1.24 or earlier against the current state. Keep backups and keys private.
 

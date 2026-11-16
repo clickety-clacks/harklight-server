@@ -1,3 +1,50 @@
+# Harklight Server v0.1.44
+
+## Changes
+
+- Includes the reviewed self-hosted web bundle. It is packaged with the Server;
+  installation does not fetch it from the web project.
+- Authorized agents can read every message on their account regardless of
+  sender. Sender filters affect search results only. Answering still requires
+  both a matching read grant and a matching respond grant. After Reply or No
+  comment, new chat on that request is closed and earlier messages remain
+  readable; Agents without Agent C1, including ACK2-only Agent 0.1.7, receive
+  the existing generic closed refusal rather than the C1 wording.
+- Invalid or unregistered APNs endpoints stop retrying. The one-hour push-hint
+  expiry was removed; the existing five-minute notification pacing and retry
+  backoff caps remain.
+- Superseded ranking work is cancelled, and the fixed ranking request and kill
+  deadlines were removed.
+- Invitation and session records are cleaned up on use, supersession or
+  revocation. Browser sign-in grants retain their existing per-grant expiry.
+- Uploads survive disconnect, reconnect and restart. Attached upload lifetime
+  follows its message. Unattached uploads remain until the uploader device or
+  origin is revoked/removed or the owner explicitly discards them; there is no
+  time-based cleanup or retention cap.
+- Large message data can use private disk-backed files with checksummed durable
+  references rather than being rejected at the former 2 MiB request limit.
+  Optional upload caps remain operator-configurable; existing inline handling
+  limits still apply. Older compatible FORMAT29 releases that do not
+  understand a large-data reference show an explicit newer-server marker for
+  that content, continue serving other data and preserve the referenced files;
+  a compatible upgrade restores full reads.
+
+## Upgrade and recovery
+
+The server writes FORMAT29. From supported FORMAT27 state, including the state
+written by the published v0.1.42 package, first start applies the device-focus
+defaults and hosted-delivery-state initialization in order. There is no
+separately established persisted FORMAT28 state. The v0.1.42 FORMAT27 package
+cannot read the resulting FORMAT29 state; switching code alone is not a safe
+rollback. Before first start, stop the server and take a complete private-state
+backup. After any v0.1.44 write, returning to v0.1.42 requires stopping the
+server and restoring that pre-start backup before starting v0.1.42. This loses
+every write made since the backup and cannot undo external notifications,
+bounces or agent deliveries. Recovery can fail; do not assume success or a
+recovery time.
+
+---
+
 # Harklight Server v0.1.40
 
 ## Changes
