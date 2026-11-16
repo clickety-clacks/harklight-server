@@ -281,6 +281,146 @@ def build_info_values(data: bytes) -> dict[str, str]:
     return values
 
 
+def build_toolchain_lines(data: bytes) -> list[str]:
+    try:
+        lines = data.decode("utf-8").splitlines()
+    except UnicodeDecodeError:
+        fail("packaged BUILD_INFO is not UTF-8")
+    version_lines = [index for index, line in enumerate(lines) if line.startswith("Erlang/OTP ")]
+    dependency_markers = [index for index, line in enumerate(lines) if line == "native_dependencies"]
+    if len(version_lines) != 1 or len(dependency_markers) != 1 or version_lines[0] >= dependency_markers[0]:
+        fail("packaged BUILD_INFO does not contain one complete mix --version record")
+    toolchain_lines = lines[version_lines[0] : dependency_markers[0]]
+    toolchain_identity(toolchain_lines, "packaged BUILD_INFO")
+    return toolchain_lines
+
+
+def toolchain_identity(lines: list[str], label: str) -> tuple[str, str, str]:
+    # Mix may separate its two version lines with an empty line. Preserve all
+    # lines in BUILD_INFO and the tag record, but compare only the defined
+    # OTP release, ERTS version, and Mix version line.
+    nonempty_lines = [line for line in lines if line]
+    if len(nonempty_lines) != 2:
+        fail(f"{label} does not contain exactly the two expected mix --version lines")
+    otp_matches = re.findall(r"^Erlang/OTP\s+(\S+)", nonempty_lines[0])
+    erts_matches = re.findall(r"\berts-([^\]\s]+)", nonempty_lines[0])
+    mix_line = nonempty_lines[1]
+    if (
+        len(otp_matches) != 1
+        or len(erts_matches) != 1
+        or not re.fullmatch(r"Mix\s+\S+\s+\(compiled with Erlang/OTP\s+[^)]+\)", mix_line)
+    ):
+        fail(f"{label} has malformed mix --version lines")
+    return otp_matches[0], erts_matches[0], mix_line
+
+
+def tag_annotation(tag: str) -> str:
+    tag_ref = f"refs/tags/{tag}"
+    try:
+        object_type = subprocess.check_output(["git", "cat-file", "-t", tag_ref], text=True).strip()
+    except (OSError, subprocess.CalledProcessError):
+        fail("could not read the pushed version tag")
+    if object_type != "tag":
+        fail("pushed version tag is lightweight; an annotated tag with rehearsal fields is required")
+    try:
+        return subprocess.check_output(
+            ["git", "for-each-ref", "--format=%(contents)", tag_ref], text=True
+        )
+    except (OSError, subprocess.CalledProcessError):
+        fail("could not read the annotated tag message")
+
+
+def parse_rehearsal_record(message: str) -> tuple[str, dict[str, str], list[str]]:
+    fields: dict[str, str] = {}
+    toolchain_lines: list[str] = []
+    allowed_fields = {
+        "rehearsal",
+        "rehearsal-archive-sha256",
+        "rehearsal-source-commit",
+        "rehearsal-build-script-sha256",
+        "rehearsal-toolchain",
+    }
+    for line in message.splitlines():
+        if not (line.startswith("rehearsal:") or line.startswith("rehearsal-") or line.startswith("rehearsal ")):
+            continue
+        key, separator, value = line.partition(":")
+        if not separator or key not in allowed_fields or not value.startswith(" "):
+            fail("malformed rehearsal record; expected the documented key: value fields")
+        value = value[1:]
+        if key == "rehearsal-toolchain":
+            if not value:
+                fail("rehearsal-toolchain fields must contain a version-output line")
+            toolchain_lines.append(value)
+        else:
+            if not value or key in fields:
+                fail("malformed rehearsal record; fields must be nonempty and unique")
+            fields[key] = value
+
+    expected = {
+        "rehearsal-archive-sha256",
+        "rehearsal-source-commit",
+        "rehearsal-build-script-sha256",
+    }
+    if fields.get("rehearsal") == "not-required":
+        if set(fields) != {"rehearsal"} or toolchain_lines:
+            fail("malformed rehearsal record; rehearsal: not-required must be the only rehearsal field")
+        return "not-required", fields, toolchain_lines
+    if "rehearsal" in fields or set(fields) != expected or not toolchain_lines:
+        fail(
+            "annotated tag is missing or has a malformed rehearsal record; expected rehearsal: not-required, "
+            "or rehearsal-archive-sha256, rehearsal-source-commit, rehearsal-build-script-sha256 and "
+            "rehearsal-toolchain fields"
+        )
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", fields["rehearsal-archive-sha256"]):
+        fail("rehearsal-archive-sha256 must be a 64-character SHA-256 digest")
+    if not re.fullmatch(r"[0-9a-fA-F]{40}", fields["rehearsal-source-commit"]):
+        fail("rehearsal-source-commit must be a full commit SHA")
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", fields["rehearsal-build-script-sha256"]):
+        fail("rehearsal-build-script-sha256 must be a 64-character SHA-256 digest")
+    fields["rehearsal-archive-sha256"] = fields["rehearsal-archive-sha256"].lower()
+    fields["rehearsal-source-commit"] = fields["rehearsal-source-commit"].lower()
+    fields["rehearsal-build-script-sha256"] = fields["rehearsal-build-script-sha256"].lower()
+    return "recorded", fields, toolchain_lines
+
+
+def cmd_validate_rehearsal(args) -> None:
+    version = tag_version(args.tag)
+    message = tag_annotation(args.tag)
+    form, fields, recorded_toolchain = parse_rehearsal_record(message)
+    if form == "not-required":
+        write_outputs({"result": "not_required"})
+        print("The tag records that FORMAT rehearsal is not required; no package comparison is needed")
+        return
+
+    if fields["rehearsal-source-commit"] != args.commit.lower():
+        fail("rehearsal-source-commit differs from the tagged commit; the rehearsal does not count")
+
+    dist_dir = Path(args.dist_dir)
+    archive = dist_dir / f"harklight-server-{version}-linux-x86_64.tar.gz"
+    build_info_path = dist_dir / "BUILD_INFO"
+    if not archive.is_file() or not build_info_path.is_file():
+        fail("verified CI package or packaged BUILD_INFO is unavailable for rehearsal comparison")
+    package_toolchain = build_toolchain_lines(build_info_path.read_bytes())
+    toolchain_identity(recorded_toolchain, "annotated tag rehearsal record")
+
+    digest_a = fields["rehearsal-archive-sha256"]
+    digest_b = digest_file(archive)
+    build_script_digest = digest_file(Path(args.build_script))
+    if fields["rehearsal-build-script-sha256"] != build_script_digest:
+        write_outputs({"result": "mismatch", "reason": "build-script-mismatch"})
+        print("The CI package must be rehearsed before publication because the build script differs")
+    elif toolchain_identity(recorded_toolchain, "annotated tag rehearsal record") != toolchain_identity(
+        package_toolchain, "packaged BUILD_INFO"
+    ):
+        write_outputs({"result": "mismatch", "reason": "toolchain-identity-mismatch"})
+        print("The CI package must be rehearsed before publication because the toolchain identity differs")
+    else:
+        write_outputs({"result": "match"})
+        print("The rehearsal build script and toolchain identity match the verified CI package")
+    print(f"Rehearsal archive SHA-256 (A): {digest_a}")
+    print(f"CI package archive SHA-256 (B): {digest_b}")
+
+
 def verify_package_files(dist_dir: Path, tag: str, commit: str, version: str, guide_path: Path) -> dict[str, str]:
     if tag_version(tag) != version:
         fail("release tag version differs from the expected package version")
@@ -315,6 +455,7 @@ def verify_package_files(dist_dir: Path, tag: str, commit: str, version: str, gu
         fail("packaged BUILD_INFO source commit differs from the tag")
     if values.get("source_status") != "":
         fail("packaged BUILD_INFO records a dirty source tree")
+    (dist_dir / "BUILD_INFO").write_bytes(build_info)
     try:
         source_guide = guide_path.read_bytes()
         asset_guide = guide.read_bytes()
@@ -523,6 +664,13 @@ def main() -> None:
     package = commands.add_parser("verify-package")
     add_package_args(package)
     package.set_defaults(function=cmd_verify_package)
+
+    rehearsal = commands.add_parser("validate-rehearsal")
+    rehearsal.add_argument("--dist-dir", required=True)
+    rehearsal.add_argument("--tag", required=True)
+    rehearsal.add_argument("--commit", required=True)
+    rehearsal.add_argument("--build-script", default="scripts/build-package.sh")
+    rehearsal.set_defaults(function=cmd_validate_rehearsal)
 
     existing = commands.add_parser("verify-existing")
     add_package_args(existing)
