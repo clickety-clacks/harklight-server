@@ -1,4 +1,4 @@
-# Harklight Server v0.1.44
+# Harklight Server v0.1.43
 
 ## Changes
 
@@ -37,7 +37,7 @@ defaults and hosted-delivery-state initialization in order. There is no
 separately established persisted FORMAT28 state. The v0.1.42 FORMAT27 package
 cannot read the resulting FORMAT29 state; switching code alone is not a safe
 rollback. Before first start, stop the server and take a complete private-state
-backup. After any v0.1.44 write, returning to v0.1.42 requires stopping the
+backup. After any v0.1.43 write, returning to v0.1.42 requires stopping the
 server and restoring that pre-start backup before starting v0.1.42. This loses
 every write made since the backup and cannot undo external notifications,
 bounces or agent deliveries. Recovery can fail; do not assume success or a
