@@ -48,7 +48,8 @@ jobs:
         run: |
           set -euo pipefail
           dist_dir="$RUNNER_TEMP/harklight-release-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
-          mkdir -m 700 -p "$dist_dir"
+          mkdir -p "$dist_dir"
+          chmod 700 "$dist_dir"
           printf 'DIST_DIR=%s\n' "$dist_dir" >> "$GITHUB_ENV"
 
       - name: Read Server CI toolchain pins
@@ -86,6 +87,40 @@ jobs:
             --tag "$RELEASE_TAG" \
             --version "$RELEASE_VERSION" \
             --commit "$RELEASE_COMMIT"
+
+      - name: Compare package with the annotated-tag rehearsal record
+        id: rehearsal
+        if: steps.release.outputs.mode == 'build'
+        env:
+          RELEASE_TAG: ${{ steps.source.outputs.tag }}
+          RELEASE_COMMIT: ${{ steps.source.outputs.commit }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/harklight_release_publish.py validate-rehearsal \
+            --dist-dir "$DIST_DIR" \
+            --tag "$RELEASE_TAG" \
+            --commit "$RELEASE_COMMIT"
+
+      - name: Retain mismatched package as a workflow-run artifact
+        if: steps.rehearsal.outputs.result == 'mismatch'
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-package-rehearsal-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/harklight-release-${{ github.run_id }}-${{ github.run_attempt }}/*
+          if-no-files-found: error
+
+      - name: Stop before release publication until the CI package is rehearsed
+        if: steps.rehearsal.outputs.result == 'mismatch'
+        env:
+          REHEARSAL_REASON: ${{ steps.rehearsal.outputs.reason }}
+        run: |
+          set -euo pipefail
+          if [[ "$REHEARSAL_REASON" == "build-script-mismatch" ]]; then
+            echo "::error::Rehearse the retained CI package before publication because its build script differs from the tag record."
+          else
+            echo "::error::Rehearse the retained CI package before publication because its toolchain identity differs from the tag record."
+          fi
+          exit 1
 
       - name: Verify an existing published release without rebuilding
         id: existing
