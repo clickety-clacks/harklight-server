@@ -29,7 +29,8 @@ defmodule AttentionServer.Placement do
   def reassess(%Engine{} = engine, person, previous) do
     case algorithm(choice(engine, person)) do
       nil -> :none
-      implementation -> implementation.reassess(items(engine, person), previous || [])
+      implementation ->
+        implementation.reassess(ranking_message_items(engine, person), previous || [])
     end
   end
 
@@ -148,7 +149,7 @@ defmodule AttentionServer.Placement do
   # The summary is ephemeral; complete history remains in the existing engine.
   def ranking_projection(%Engine{} = engine, person) do
     {replies, groups} = reply_projection(engine, person)
-    {items(engine, person) ++ replies, groups}
+    {ranking_message_items(engine, person) ++ replies, groups}
   end
 
   def ranking_items(%Engine{} = engine, person),
@@ -335,7 +336,14 @@ defmodule AttentionServer.Placement do
     end)
   end
 
-  def baseline(%Engine{} = engine, person), do: Baseline.place(items(engine, person), [], nil)
+  def baseline(%Engine{} = engine, person),
+    do: Baseline.place(ranking_message_items(engine, person), [], nil)
+
+  defp ranking_message_items(engine, person) do
+    engine
+    |> items(person)
+    |> Enum.reject(&Message.progress_message?(&1.message))
+  end
 
   defp inherited_placement(engine, key, record),
     do: inherited_placement(engine, key, record, MapSet.new())

@@ -10,6 +10,7 @@ defmodule AttentionServer.PrioritizationTest do
     JSON,
     JevClient,
     JevRanking,
+    Message,
     Placement,
     Relay,
     Store,
@@ -237,6 +238,75 @@ defmodule AttentionServer.PrioritizationTest do
 
     assert {:ok, baseline} = Engine.setup_person(Engine.new(), "person-a")
     assert Placement.reassess(baseline, "person-a", []) == :none
+  end
+
+  test "Progress stays stored but is excluded before baseline and JEV ranking", %{
+    dir: dir,
+    path: path
+  } do
+    use_synthetic_jev_key(dir)
+    parent = self()
+
+    evaluator = fn request ->
+      send(parent, {:progress_candidates, request.candidates})
+      {:ok, Map.new(request.candidates, &{&1, 0.7})}
+    end
+
+    relay = start_relay(path, priority_evaluator: evaluator)
+    setup_person(relay)
+    forward(relay, 1, "ordinary-first", 20)
+
+    seen = %{
+      "schema" => "attention-client.actions/1",
+      "actions" => [
+        %{
+          "id" => "seen",
+          "label" => "Seen",
+          "kind" => "value",
+          "value" => %{"acknowledgment" => "seen"}
+        }
+      ]
+    }
+
+    progress = %{
+      "sender_id" => "app:test",
+      "message_id" => "progress-urgent",
+      "created_at" => 2,
+      "title" => "Build the inbox update",
+      "message_type" => "fyi",
+      "answer_ui" => seen,
+      "urgency" => "urgent",
+      "by_when" => 1,
+      "progress" => %{"percent" => 100, "stage" => "done", "segments" => []}
+    }
+
+    assert %{"type" => "ok"} =
+             request(relay, "device-a", %{
+               "type" => "forward",
+               "op_id" => op(2),
+               "message" => progress
+             })
+
+    configure_jev_choice(relay)
+    forward(relay, 3, "ordinary-second", 10)
+
+    engine = :sys.get_state(relay).store.engine
+    all_items = Placement.items(engine, "person-a")
+    [progress_item] = Enum.filter(all_items, &Message.progress_message?(&1.message))
+    assert progress_item.identity == {"app:test", "progress-urgent"}
+
+    ordinary_items = Enum.reject(all_items, &Message.progress_message?(&1.message))
+
+    assert MapSet.new(Enum.map(Placement.ranking_items(engine, "person-a"), & &1.identity)) ==
+             MapSet.new(Enum.map(ordinary_items, & &1.identity))
+
+    assert Placement.baseline(engine, "person-a") ==
+             Placement.place("baseline", ordinary_items, [], nil)
+
+    assert_receive {:progress_candidates, candidates}, 2_000
+
+    assert MapSet.new(candidates) ==
+             MapSet.new([{"app:test", "ordinary-first"}, {"app:test", "ordinary-second"}])
   end
 
   test "selected placement retains the last whole-set order and baseline-places new arrivals" do

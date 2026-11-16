@@ -1374,6 +1374,100 @@ defmodule AttentionServer.APNSPushTest do
     assert terminal.badge == 1
   end
 
+  test "Progress is omitted from the existing APNs badge but ordinary progress fields count",
+       ctx do
+    server = start_apns_server(ctx, Path.join(ctx.dir, "progress-badge.sqlite3"))
+    assert :ok = Supervisor.terminate_child(server, :push_dispatcher)
+    relay = Server.relay(server)
+    {sender, recipient} = setup_test_devices(relay, ctx.certs)
+
+    assert %{"type" => "ok"} =
+             request_frame(relay, recipient, %{
+               "type" => "push_register",
+               "op_id" => op(4_100),
+               "revision" => 1,
+               "profile_id" => @provider_profile,
+               "address_kind" => "apns_token",
+               "address" => @device_token
+             })
+
+    seen = %{
+      "schema" => "attention-client.actions/1",
+      "actions" => [
+        %{
+          "id" => "seen",
+          "label" => "Seen",
+          "kind" => "value",
+          "value" => %{"acknowledgment" => "seen"}
+        }
+      ]
+    }
+
+    progress_message = fn id, progress ->
+      %{
+        "sender_id" => "app:test",
+        "message_id" => id,
+        "created_at" => 1,
+        "title" => "Build the inbox update",
+        "answer_ui" => seen,
+        "message_type" => "fyi",
+        "progress" => progress
+      }
+    end
+
+    for {id, progress, operation} <- [
+          {"progress-complete", %{"percent" => 100, "segments" => []}, 4_101},
+          {"progress-malformed", nil, 4_102}
+        ] do
+      assert %{"type" => "ok"} =
+               request_frame(relay, sender, %{
+                 "type" => "forward",
+                 "op_id" => op(operation),
+                 "message" => progress_message.(id, progress)
+               })
+    end
+
+    request_with_progress = %{
+      "sender_id" => "app:test",
+      "message_id" => "ordinary-request",
+      "created_at" => 1,
+      "title" => "Review the change",
+      "message_type" => "request",
+      "progress" => %{"percent" => 50},
+      "answer_ui" => %{
+        "schema" => "attention-client.actions/1",
+        "actions" => [
+          %{
+            "id" => "later",
+            "label" => "Later",
+            "kind" => "value",
+            "value" => %{"choice" => "later"}
+          }
+        ]
+      }
+    }
+
+    assert %{"type" => "ok", "seq" => 3} =
+             request_frame(relay, sender, %{
+               "type" => "forward",
+               "op_id" => op(4_103),
+               "message" => request_with_progress
+             })
+
+    send_at = System.system_time(:millisecond) + 300_001
+    assert {:ok, claim} = Relay.claim_push(relay, send_at)
+    assert claim.high == 3
+    assert claim.badge == 1
+
+    {outcome, _cached_token} = APNS.send(APNS.prepare!(apns_options(ctx)), claim, nil)
+    assert outcome.state == "provider_accepted"
+    assert_receive {:apns_request, "POST", _path, _headers, body}, 12_000
+    assert {:ok, payload} = JSON.decode_line(body <> "\n")
+    assert payload["aps"]["badge"] == 1
+
+    assert :ok = Relay.finish_push(relay, claim, outcome, send_at + 1)
+  end
+
   test "BadDeviceToken clears the durable binding, stops retrying, and releases its address",
        ctx do
     %{certs: certs, dir: dir, provider_response: response_agent} = ctx

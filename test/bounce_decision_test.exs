@@ -161,6 +161,26 @@ defmodule AttentionServer.BounceDecisionTest do
     assert BounceDecision.next_deadline(rescored) == @accepted_at + 194_400_000
   end
 
+  test "Progress gets no score deadline and a later marker suppresses a pending advisory" do
+    {engine, record} = fixture()
+    progress_message = Map.put(record.message, "progress", nil)
+    progress_record = %{record | message: progress_message, revisions: %{1 => progress_message}}
+    marked = %{engine | messages: Map.put(engine.messages, key(), progress_record)}
+
+    scored_marked = score(marked, 0.9, 1_050)
+    assert selection(scored_marked) == nil
+    assert BounceDecision.next_deadline(scored_marked) == nil
+
+    pending = score(engine, 0.9, 1_050)
+    due_at = selection(pending)["due_at_ms"]
+    pending_marked = %{pending | messages: Map.put(pending.messages, key(), progress_record)}
+    evaluated = BounceDecision.evaluate_due(pending_marked, due_at + 1)
+
+    assert selection(evaluated)["decision"] == "suppressed"
+    assert selection(evaluated)["reason"] == "ineligible_message"
+    assert BounceDecision.advisory_cursor(evaluated, @person, @origin, @handle) == 0
+  end
+
   test "substantive revisions get their own timing; identical replay preserves it" do
     {engine, record} = fixture()
     first = score(engine, 0.75, 1_050)
