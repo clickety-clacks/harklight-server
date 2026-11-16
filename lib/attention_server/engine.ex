@@ -184,6 +184,7 @@ defmodule AttentionServer.Engine do
                 claim
                 |> Map.put(:alert, push_alert(selected))
                 |> Map.put(:preserve_alert_title, true)
+                |> Map.put(:expanded, :single)
 
               case push_locator(selected, person, device, binding.binding_id) do
                 nil -> claim
@@ -197,6 +198,11 @@ defmodule AttentionServer.Engine do
               |> Map.put(:alert, alert)
               |> Map.put(:grouped_alert_names, names)
               |> Map.put(:preserve_alert_body, true)
+              |> Map.put(:expanded, %{
+                titles:
+                  Enum.map(Enum.reverse(many), fn {_key, record} -> record.message["title"] end),
+                total_count: length(many)
+              })
           end
 
         claim =
@@ -208,6 +214,7 @@ defmodule AttentionServer.Engine do
 
               claim
               |> Map.put(:alert, alert)
+              |> Map.put(:expanded, :single)
               |> Map.put(
                 :locator,
                 push_locator({key, record}, person, device, binding.binding_id)
