@@ -285,10 +285,12 @@ defmodule AttentionServer.APNS do
     error -> {:error, error}
   end
 
-  defp request_payload(claim) do
+  @doc false
+  def request_payload(claim) do
     claim
     |> presentation_payload()
     |> put_in(["attention", "server"], Map.fetch!(claim, :server))
+    |> AttentionServer.APNS.Expansion.add(claim)
   end
 
   defp presentation_payload(%{presentation: :background} = claim),

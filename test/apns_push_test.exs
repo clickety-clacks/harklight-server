@@ -858,6 +858,7 @@ defmodule AttentionServer.APNSPushTest do
                  "title" => "  Agent\nλ / name  ",
                  "body" => "bounded preview from sender"
                },
+               "category" => "harklight.expanded.single.v1",
                "badge" => 1,
                "content-available" => 1
              },
