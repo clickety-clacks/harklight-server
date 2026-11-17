@@ -224,6 +224,24 @@ defmodule AttentionServer.MessageFieldsTest do
     assert seen_reason =~ "remove the action with id \"seen\""
   end
 
+  test "Progress is identified only by a present progress member on a typed FYI" do
+    fyi =
+      message()
+      |> Map.put("message_type", "fyi")
+      |> Map.put("answer_ui", @seen_answer_ui)
+
+    assert Message.progress_message?(Map.put(fyi, "progress", %{"percent" => 100}))
+    assert Message.progress_message?(Map.put(fyi, "progress", nil))
+    refute Message.progress_message?(fyi)
+
+    request_with_progress =
+      message()
+      |> Map.put("message_type", "request")
+      |> Map.put("progress", %{"percent" => 50})
+
+    refute Message.progress_message?(request_with_progress)
+  end
+
   test "raw invalid message kinds are dropped with a warning while valid kinds pass unchanged" do
     valid = Map.put(message(), "message_kind", "success")
     assert {^valid, []} = Message.normalize_optional_fields(valid, 1, false)

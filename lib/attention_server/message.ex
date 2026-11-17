@@ -115,6 +115,12 @@ defmodule AttentionServer.Message do
   def valid_message_kind?(value), do: value in @message_kinds
   def valid_message_type?(value), do: value in @message_types
 
+  @doc false
+  def progress_message?(%{"message_type" => "fyi"} = message),
+    do: Map.has_key?(message, "progress")
+
+  def progress_message?(_), do: false
+
   defp validate_fyi(message) do
     if Map.get(message, "answer_ui") == @seen_descriptor do
       :ok

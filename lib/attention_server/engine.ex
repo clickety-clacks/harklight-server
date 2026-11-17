@@ -6092,7 +6092,9 @@ defmodule AttentionServer.Engine do
   # no explicit action yet. Retracted and answered items are resolved.
   defp inbox_badge(engine, person) do
     Enum.count(engine.messages, fn
-      {{^person, _sender, _id}, %{terminal: nil}} -> true
+      {{^person, _sender, _id}, %{terminal: nil, message: message}} ->
+        not Message.progress_message?(message)
+
       _ -> false
     end)
   end

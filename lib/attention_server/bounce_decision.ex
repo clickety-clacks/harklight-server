@@ -397,6 +397,7 @@ defmodule AttentionServer.BounceDecision do
        when is_binary(sender) and is_binary(message_id) do
     with %{message: message} = record <- Map.get(engine.messages, key),
          true <- Message.valid_message_type?(message["message_type"]),
+         false <- Message.progress_message?(message),
          levels when is_list(levels) <- effective_levels(engine, person),
          state <- Map.get(engine.bounce_revisions, key) || legacy_revision_state(record),
          sub_revision when is_integer(sub_revision) <- state.current_substantive_revision,
@@ -541,7 +542,8 @@ defmodule AttentionServer.BounceDecision do
       default_answer_due?(record, now_ms) ->
         "default_answered"
 
-      not Message.valid_message_type?(record.message["message_type"]) ->
+      not Message.valid_message_type?(record.message["message_type"]) or
+          Message.progress_message?(record.message) ->
         "ineligible_message"
 
       person_discussed?(engine, key) ->

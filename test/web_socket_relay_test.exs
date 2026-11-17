@@ -200,6 +200,103 @@ defmodule AttentionServer.WebSocketRelayTest do
   defp message(id, title),
     do: %{"sender_id" => "app:test", "message_id" => id, "created_at" => 1, "title" => title}
 
+  defp seed_revised_progress(relay, key) do
+    handle = op(4_100)
+
+    initial_progress = %{
+      "updated_at" => "2026-11-11T10:00:00Z",
+      "percent" => 10,
+      "stage" => "spec_writing",
+      "note" => "Scope is clear",
+      "segments" => [
+        %{
+          "stage" => "spec_writing",
+          "width" => 10,
+          "note" => "Scope is clear",
+          "visit_at" => "2026-11-11T10:00:00Z",
+          "reported_percent" => 10,
+          "delta" => 10
+        }
+      ]
+    }
+
+    message = %{
+      "sender_id" => "app:test",
+      "message_id" => "progress-example",
+      "created_at" => 1,
+      "title" => "Ship the inbox update",
+      "answer_ui" => %{
+        "schema" => "attention-client.actions/1",
+        "actions" => [
+          %{
+            "id" => "seen",
+            "label" => "Seen",
+            "kind" => "value",
+            "value" => %{"acknowledgment" => "seen"}
+          }
+        ]
+      },
+      "message_type" => "fyi",
+      "progress" => initial_progress
+    }
+
+    assert %{"type" => "ok", "seq" => 1} =
+             store_request(relay, key, %{
+               "type" => "forward",
+               "op_id" => op(4_101),
+               "session_handle" => handle,
+               "message" => message
+             })
+
+    latest_progress = %{
+      "updated_at" => "2026-11-11T10:02:00Z",
+      "percent" => 45,
+      "stage" => "testing",
+      "note" => "Relay and paging are covered",
+      "segments" => [
+        %{
+          "stage" => "spec_writing",
+          "width" => 10,
+          "note" => "Scope is clear",
+          "visit_at" => "2026-11-11T10:00:00Z",
+          "reported_percent" => 10,
+          "delta" => 10
+        },
+        %{
+          "stage" => "coding",
+          "width" => 30,
+          "note" => "Implementation is ready",
+          "visit_at" => "2026-11-11T10:01:00Z",
+          "reported_percent" => 40,
+          "delta" => 30
+        },
+        %{
+          "stage" => "testing",
+          "width" => 5,
+          "note" => "Relay and paging are covered",
+          "visit_at" => "2026-11-11T10:02:00Z",
+          "reported_percent" => 45,
+          "delta" => 5
+        }
+      ],
+      "future_member" => %{"retained" => [true, nil, "opaque"]}
+    }
+
+    revised = Map.put(message, "progress", latest_progress)
+
+    assert %{"type" => "ok", "revision" => 2} =
+             store_request(relay, key, %{
+               "type" => "conversation_revise",
+               "op_id" => op(4_102),
+               "sender_id" => "app:test",
+               "message_id" => "progress-example",
+               "base_revision" => 1,
+               "message" => revised
+             })
+
+    {message, revised}
+  end
+
   test "malformed inbox reconciliation leaves the relay serving later deliveries", ctx do
     %{certs: certs, web: web, relay: relay} = ctx
 
@@ -1089,6 +1186,47 @@ defmodule AttentionServer.WebSocketRelayTest do
 
     assert {:ok, [], 0} = Relay.events(relay, keys["a1"], 0)
     :ssl.close(socket)
+  end
+
+  test "cold inbox paging preserves acceptance identity for a non-origin reader", ctx do
+    %{certs: certs, web: web, relay: relay, keys: keys} = ctx
+    {message, _revised} = seed_revised_progress(relay, keys["a1"])
+
+    assert {:ok, reader} = connect(web, certs, "a2")
+    assert upgrade(reader) =~ "101 Switching Protocols"
+    assert :ok =
+             send_request(reader, %{
+               "type" => "inbox_start",
+               "paging_version" => 1,
+               "startup_id" => "progress-cold-reader",
+               "since" => 0
+             })
+
+    assert %{"type" => "ok", "high_water" => 1, "items" => [item]} = reply(reader)
+    assert item["acceptance"]["request_revision"] == 1
+    assert item["acceptance"]["message"] == message
+    :ssl.close(reader)
+  end
+
+  test "cold resync delivers the latest full Progress through conversation revision events",
+       ctx do
+    %{certs: certs, web: web, relay: relay, keys: keys} = ctx
+    {_message, revised} = seed_revised_progress(relay, keys["a1"])
+
+    assert {:ok, reader} = connect(web, certs, "a2")
+    assert upgrade(reader) =~ "101 Switching Protocols"
+    assert {[%{"type" => "delivery", "seq" => 1}], %{"seq" => 1}} = resync(reader)
+
+    assert :ok = send_request(reader, %{"type" => "conversation_open", "since" => 0})
+    assert %{"type" => "ok"} = reply(reader)
+    assert %{
+             "type" => "conversation",
+             "request_revision" => 2,
+             "message" => ^revised
+           } = reply(reader)
+
+    assert %{"type" => "conversation_resynced", "conversation_seq" => 1} = reply(reader)
+    :ssl.close(reader)
   end
 
   test "bounded inbox pages reconcile receipts, checkpoint atomically, and survive restart",
