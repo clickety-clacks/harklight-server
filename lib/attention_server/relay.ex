@@ -813,7 +813,13 @@ defmodule AttentionServer.Relay do
   end
 
   @impl true
-  def terminate(_reason, %{store: store}), do: Store.close(store)
+  def terminate(_reason, %{store: store} = state) do
+    Enum.each(Map.get(state, :contradiction_checks, %{}), fn {_, job} ->
+      Process.exit(job.pid, :shutdown)
+    end)
+
+    Store.close(store)
+  end
 
   # Issue a one-use browser sign-in for a person under its verified or server-held
   # owner key. The URL is present only when a dashboard origin is configured.
@@ -1079,7 +1085,7 @@ defmodule AttentionServer.Relay do
 
   defp start_contradiction(state, receipt_key, {person, _, _} = posted_key, from, reply) do
     engine = state.store.engine
-    items = AttentionServer.Contradictions.items(engine, person, posted_key)
+    items = AttentionServer.Contradictions.items(engine, person, posted_key, state.sender_names)
     size = state.contradiction_batch_size
 
     if items == [] or not (is_integer(size) and size > 0) do
@@ -1102,7 +1108,10 @@ defmodule AttentionServer.Relay do
               items,
               engine.jev_endpoint,
               engine.jev_model,
-              size, evaluator: evaluator, deadline: deadline)
+              size,
+              evaluator: evaluator,
+              deadline: deadline
+            )
 
           send(parent, {:contradiction_done, receipt_key, token, check})
         end)

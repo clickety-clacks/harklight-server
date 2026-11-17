@@ -4,7 +4,7 @@ defmodule AttentionServer.ContradictionsRelayTest do
 
   defp op(n), do: "00000000-0000-4000-8000-" <> String.pad_leading(Integer.to_string(n), 12, "0")
 
-  defp start(opts \\ []) do
+  defp start(opts) do
     path =
       Path.join(System.tmp_dir!(), "contradictions-#{System.unique_integer([:positive])}.sqlite3")
 
@@ -85,12 +85,13 @@ defmodule AttentionServer.ContradictionsRelayTest do
     end
 
     {relay, path} = start(contradiction_batch_size: 1, contradiction_evaluator: evaluator)
-    request(relay, frame(1))
+    request(relay, frame(1, %{"display_name" => "First sender"}))
     jev(relay)
     result = request(relay, frame(2))
     check = result["possible_contradictions"]
     assert check["status"] == "checked"
     assert hd(check["messages"])["message_id"] == "m1"
+    assert hd(check["messages"])["sender_name"] == "First sender"
     assert_receive {:evaluated, [{"app:test", "m1"}]}
     assert request(relay, frame(2))["possible_contradictions"] == check
 
@@ -209,5 +210,70 @@ defmodule AttentionServer.ContradictionsRelayTest do
              "reason" => "timeout",
              "unchecked" => 1
            }
+  end
+
+  test "empty Jev checked set, revision, and unavailable checks preserve delivery" do
+    parent = self()
+
+    {relay, _} =
+      start(
+        contradiction_batch_size: 8,
+        contradiction_evaluator: fn req ->
+          send(parent, {:evaluated, req.candidates})
+          {:error, :unavailable}
+        end
+      )
+
+    jev(relay)
+    original = Map.put(frame(1), "session_handle", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+    refute Map.has_key?(request(relay, original), "possible_contradictions")
+
+    revised = %{
+      "v" => 1,
+      "type" => "conversation_revise",
+      "op_id" => op(30),
+      "sender_id" => "app:test",
+      "message_id" => "m1",
+      "base_revision" => 1,
+      "message" => Map.put(original["message"], "title", "Revised title")
+    }
+
+    assert request(relay, revised)["type"] == "ok"
+    refute_receive {:evaluated, _}
+    check = request(relay, frame(2))["possible_contradictions"]
+    assert check == %{"status" => "incomplete", "reason" => "unavailable", "unchecked" => 1}
+    assert_receive {:evaluated, [{"app:test", "m1"}]}
+    assert {:ok, events, _} = Relay.events(relay, "reader", 0)
+    assert Enum.any?(events, &(&1["message_id"] == "m2"))
+  end
+
+  test "size exclusion is incomplete, while fitting comparisons still produce matches" do
+    parent = self()
+
+    {relay, _} =
+      start(
+        contradiction_batch_size: 8,
+        contradiction_evaluator: fn req ->
+          send(parent, {:evaluated, req.candidates})
+          {:ok, Map.new(req.candidates, &{&1, 1})}
+        end
+      )
+
+    request(relay, frame(1, %{"body" => String.duplicate("x", 25_000)}))
+    request(relay, frame(2))
+    jev(relay)
+    check = request(relay, frame(3))["possible_contradictions"]
+    assert check["reason"] == "unavailable"
+    assert check["unchecked"] == 1
+    assert hd(check["messages"])["message_id"] == "m2"
+    assert_receive {:evaluated, [{"app:test", "m2"}]}
+
+    check =
+      request(relay, frame(4, %{"body" => String.duplicate("x", 25_000)}))[
+        "possible_contradictions"
+      ]
+
+    assert check == %{"status" => "incomplete", "reason" => "unavailable", "unchecked" => 3}
+    refute_receive {:evaluated, _}
   end
 end

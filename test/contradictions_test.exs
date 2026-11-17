@@ -124,7 +124,7 @@ defmodule AttentionServer.ContradictionsTest do
     check =
       Contradictions.run(@posted, [a, b], @endpoint, @model, 1,
         evaluator: evaluator,
-        deadline: System.monotonic_time(:millisecond) + 100
+        deadline: System.monotonic_time(:millisecond) + 1_000
       )
 
     assert check["reason"] == "timeout"
@@ -177,7 +177,7 @@ defmodule AttentionServer.ContradictionsTest do
     check =
       Contradictions.run(@posted, [a, b], @endpoint, @model, 1,
         evaluator: evaluator,
-        deadline: System.monotonic_time(:millisecond) + 100
+        deadline: System.monotonic_time(:millisecond) + 1_000
       )
 
     assert check == %{"status" => "incomplete", "reason" => "timeout", "unchecked" => 2}
