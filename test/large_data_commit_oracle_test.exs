@@ -352,4 +352,88 @@ defmodule AttentionServer.LargeDataCommitOracleTest do
     assert_body(relay, "big", replacement)
     assert record(relay, "big").message["title"] == "Big, replaced"
   end
+
+  test "Store.commit's own failure return keeps the cache when the proposal changes references",
+       %{relay: relay, key: key, path: path} do
+    assert %{"type" => "ok"} =
+             request(relay, key, %{
+               "type" => "forward",
+               "op_id" => op(1),
+               "session_handle" => op(9_002),
+               "message" => fyi("big", "Big", large(11))
+             })
+
+    _ = drain_commits([])
+    replacement = large(12)
+
+    # Capture the Relay's own proposal for a revision to new large content; the
+    # held write lock makes that request fail, so the Relay keeps its old state.
+    {:ok, blocker} = Exqlite.Sqlite3.open(path)
+    :ok = Exqlite.Sqlite3.execute(blocker, "BEGIN IMMEDIATE")
+
+    rejected =
+      request(relay, key, %{
+        "type" => "conversation_revise",
+        "op_id" => op(2),
+        "sender_id" => "app:test",
+        "message_id" => "big",
+        "base_revision" => 1,
+        "message" => fyi("big", "Big, replaced", replacement)
+      })
+
+    refute rejected["type"] == "ok"
+    :ok = Exqlite.Sqlite3.execute(blocker, "ROLLBACK")
+    [{_before, captured} | _] = drain_commits([])
+    GenServer.stop(relay)
+
+    audit = %{person: @person, actor: "test", action: "oracle"}
+
+    # The first snapshot commit after open takes the full path and seeds the cache.
+    {:ok, opened} = Store.open(path)
+    clock = opened.engine.pending_clock_high_water + 1
+    first = %{opened.engine | pending_clock_high_water: clock}
+    {:ok, seeded} = Store.commit(opened, first, audit)
+    assert seeded.large_base != nil
+    proposed = %{captured | pending_clock_high_water: clock}
+
+    assert {:ok, _durable, _persisted, candidate_index, _created} =
+             LargeData.commit_incremental(
+               proposed,
+               seeded.large_base,
+               seeded.large_persisted,
+               seeded.large_index,
+               seeded.upload_dir
+             )
+
+    assert candidate_index != seeded.large_index
+
+    :ok = Exqlite.Sqlite3.execute(blocker, "BEGIN IMMEDIATE")
+    assert {:error, :storage_unavailable, failed} = Store.commit(seeded, proposed, audit)
+    :ok = Exqlite.Sqlite3.execute(blocker, "ROLLBACK")
+    :ok = Exqlite.Sqlite3.close(blocker)
+
+    assert failed.large_index === seeded.large_index
+    assert failed.large_base === seeded.large_base
+    assert failed.large_persisted === seeded.large_persisted
+    assert failed.engine === seeded.engine
+    assert failed.version == seeded.version
+    assert failed.encoding_cache === seeded.encoding_cache
+
+    # Retry through the store that the failure returned; success also shows the
+    # proposal is valid, so the earlier failure came from the held lock.
+    assert {:ok, retried} = Store.commit(failed, proposed, audit)
+    {full_durable, full_persisted, full_rows} = full(proposed, retried.upload_dir)
+    assert retried.version == seeded.version + 1
+    assert retried.large_base == full_durable
+    assert retried.large_persisted == full_persisted
+    assert LargeData.reference_index_rows(retried.large_index) == full_rows
+    assert retried.large_index != seeded.large_index
+    assert db_rows(path) == full_rows
+    :ok = Store.close(retried)
+
+    {:ok, reopened} = Store.open(path)
+    message_key = {@person, "app:test", "big"}
+    assert body_bytes(reopened.engine.messages[message_key].message["body"]) == replacement
+    :ok = Store.close(reopened)
+  end
 end
