@@ -13,15 +13,15 @@ through Harklight.
 
 ## Install the server
 
-For the FORMAT29 v0.1.43 server package, use the release page below after
+For the FORMAT29 v0.1.44 server package, use the release page below after
 publication to download the Linux x86_64 archive, `SHA256SUMS` and
 `SELF_HOST.md`. Verify the checksum before extraction:
 
-[v0.1.43 release](https://github.com/clickety-clacks/harklight-server/releases/tag/v0.1.43)
+[v0.1.44 release](https://github.com/clickety-clacks/harklight-server/releases/tag/v0.1.44)
 
 ```sh
 sha256sum -c SHA256SUMS
-tar -xzf harklight-server-0.1.43-linux-x86_64.tar.gz
+tar -xzf harklight-server-0.1.44-linux-x86_64.tar.gz
 ```
 
 Follow [SELF_HOST.md](SELF_HOST.md) for a fresh installation, tailnet routing,
@@ -33,8 +33,9 @@ The package does not install a service, configure the tailnet or expose ports.
 State, owner/device identities, trust roots and sender grants live outside the
 versioned package. Run one server per database. Keep private keys and backups
 private; do not repeat bootstrap over an existing installation.
-This source, v0.1.43, writes FORMAT29. From supported FORMAT27 state, including
-the state written by the published v0.1.42 package, startup applies the FORMAT28
+This source, v0.1.44, writes FORMAT29. From supported FORMAT27 state, including
+state written by the published v0.1.35 through v0.1.42 maintenance packages
+(for example v0.1.38), startup applies the FORMAT28
 device-focus defaults and FORMAT29 hosted-delivery-state initialization in
 order, preserving existing values and filling only missing values. The final
 migrated store is FORMAT29; the source does not establish a separately persisted
@@ -48,13 +49,16 @@ is registered to, regardless of sender. Sender filters select search results
 only; they do not limit access. Existing respond-grant values and response
 checks are unchanged. New registrations need no per-sender read grant for
 reads; answering still requires both a matching read grant and a matching
-respond grant. The published v0.1.42 package writes FORMAT27 and
-cannot read resulting FORMAT29 state. Changing only the selected code or
+respond grant. The published FORMAT27 packages, including v0.1.38 and v0.1.42,
+cannot read resulting FORMAT29 state. From FORMAT29 state written by v0.1.43,
+v0.1.44 runs no migration. Do not install v0.1.43: revising a message whose
+body is stored as large message data stops its relay process; v0.1.44 fixes
+this. Changing only the selected code or
 release link is not a safe downgrade. Earlier v0.1.28 writes FORMAT25, while
 v0.1.27 and v0.1.26 write
 FORMAT24; see `SELF_HOST.md` for earlier package-format details.
 
-Before the first v0.1.43 start, stop the server and retain a complete private
+Before the first v0.1.44 start, stop the server and retain a complete private
 state backup. The release installer also takes one full private-root backup
 while the service is stopped and before switching releases. It attempts to
 restore this snapshot if the candidate start or process-readiness check fails.
@@ -64,9 +68,9 @@ and leave the service stopped. A successful isolated rehearsal is evidence for
 the tested archive and sequence, not a guarantee of recovery in every
 installation.
 
-After any v0.1.43 write, returning to the published v0.1.42 FORMAT27 release
-requires stopping the server, restoring the pre-start FORMAT27 backup and
-selecting v0.1.42; changing only the code or release link cannot make FORMAT29
+After any v0.1.44 write, returning to a published FORMAT27 release such as
+v0.1.38 or v0.1.42 requires stopping the server, restoring the pre-start
+FORMAT27 backup and selecting that release; changing only the code or release link cannot make FORMAT29
 readable. This restore loses every write made since the backup and cannot undo
 external notifications, bounces or agent deliveries. Do not assume recovery
 success or a recovery time.
