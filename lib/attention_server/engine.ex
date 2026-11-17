@@ -4498,7 +4498,7 @@ defmodule AttentionServer.Engine do
 
       case matches do
         [{key, record}] ->
-          case valid_no_comment_revision(engine, person, key, record, request_revision) do
+          case valid_no_comment_revision(record, request_revision) do
             {:error, current} ->
               failure("stale_revision", "request_revision", %{"current_revision" => current})
 
@@ -4517,7 +4517,8 @@ defmodule AttentionServer.Engine do
                     Map.get(principal, :request_at, System.system_time(:millisecond))
                   )
 
-                Map.get(record.terminal, :kind) == "no_comment" ->
+                Map.get(record.terminal, :kind) == "no_comment" and
+                    not distinct_no_comment_operation?(record.terminal, actor, kind, op_id) ->
                   {:ok, engine,
                    %{
                      "seq" => record.terminal.seq,
@@ -4541,26 +4542,35 @@ defmodule AttentionServer.Engine do
   defp answer_no_comment(_engine, _principal, _request_id, _request_revision, _op_id),
     do: failure("forbidden")
 
-  defp valid_no_comment_revision(engine, person, key, record, supplied) do
+  defp valid_no_comment_revision(record, supplied) do
     if is_nil(record.terminal) do
-      frame = %{
-        "sender_id" => elem(key, 1),
-        "message_id" => elem(key, 2),
-        "request_revision" => supplied
-      }
-
-      case valid_answer_revision(engine, person, frame, true) do
-        :ok ->
-          current = Map.get(record, :revision, 1)
-          if supplied == current, do: :ok, else: {:error, current}
-
-        {:error, current} ->
-          {:error, current}
-      end
+      current = Map.get(record, :revision, 1)
+      # Revisions start at one and advance contiguously for this bound message.
+      # No comment may arrive after a revision without changing its authored bytes.
+      if is_integer(supplied) and supplied > 0 and supplied <= current,
+        do: :ok,
+        else: {:error, current}
     else
       :ok
     end
   end
+
+  defp distinct_no_comment_operation?(
+         %{actor: committed_actor, actor_kind: :device},
+         actor,
+         :device,
+         _op_id
+       )
+       when is_binary(committed_actor) and committed_actor != actor,
+       do: true
+
+  defp distinct_no_comment_operation?(%{actor: actor, op_id: committed_op}, actor, _kind, op_id)
+       when not is_nil(committed_op) and not is_nil(op_id),
+       do: committed_op != op_id
+
+  # Browser session changes and absent IDs do not prove a new operation.
+  # Keep compatible recovery, including a direct retry after reconciliation.
+  defp distinct_no_comment_operation?(_terminal, _actor, _kind, _op_id), do: false
 
   defp commit_no_comment(engine, person, actor, actor_id, kind, key, record, op_id, committed_at) do
     {next, seq} = next_seq(engine, person)
