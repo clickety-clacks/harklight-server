@@ -1,3 +1,42 @@
+# Harklight Server v0.1.44
+
+**Install this instead of v0.1.43.** In v0.1.43, revising a message whose body
+is stored as large message data crashes the server's relay process. v0.1.44
+fixes that and the slower sends v0.1.43 showed on large servers.
+
+## Changes
+
+- Sends and other state changes on large servers are back to v0.1.42 speed.
+  v0.1.43 re-examined the whole stored state for large message data on every
+  change, roughly doubling send time on a server holding a few gigabytes; the
+  server now examines only what changed since the previous commit. The first
+  change after each start still examines everything once.
+- Revising a message whose body, answer or title is stored as large message
+  data no longer crashes the relay. Revisions compare large content by its
+  SHA-256 and size.
+- The owner, agent and device command-line tools wait for the server's answer
+  (or a real connection error) instead of giving up after 3 or 5 seconds, so a
+  slow but successful call is no longer reported as a failure. A peer that
+  accepts a connection but never answers now waits until the connection ends or
+  the command is interrupted.
+- The package carries only the pinned self-hosted web bundle.
+
+## Upgrade and recovery
+
+v0.1.44 writes FORMAT29, like v0.1.43. From FORMAT29 state written by v0.1.43,
+no migration runs. From supported FORMAT27 state, including state written by
+the published v0.1.35 through v0.1.42 maintenance packages such as v0.1.38,
+first start applies the FORMAT28 device-focus defaults and FORMAT29
+hosted-delivery-state initialization in order; FORMAT27 packages cannot read
+the result. Before first start, stop the server and take a complete
+private-state backup (the release installer takes one). Returning to a FORMAT27
+release requires stopping the server, restoring that backup and selecting the
+earlier release. This loses every write made since the backup and cannot undo
+external notifications, bounces or agent deliveries. Recovery can fail; do not
+assume success or a recovery time.
+
+---
+
 # Harklight Server v0.1.43
 
 ## Changes

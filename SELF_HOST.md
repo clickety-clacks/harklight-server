@@ -1,6 +1,6 @@
 # Harklight Server self-hosted installation
 
-Version: **0.1.43**. Package target: **Linux x86_64, glibc 2.39 or newer**, with OpenSSL 3 shared libraries and libstdc++6 (built on Ubuntu 24.04). The package bundles
+Version: **0.1.44**. Package target: **Linux x86_64, glibc 2.39 or newer**, with OpenSSL 3 shared libraries and libstdc++6 (built on Ubuntu 24.04). The package bundles
 Erlang/OTP and Elixir bytecode; users need no Mix, Hex, source checkout or
 Erlang installation. It needs Bash, OpenSSL CLI, tar and the platform libraries
 listed in BUILD_INFO. This is a single-process self-hosted server cut.
@@ -32,9 +32,9 @@ a live phone test.
 
 ## Download and verify
 
-After publication, download the v0.1.43 release from
-clickety-clacks/harklight-server, tag v0.1.43. Get
-harklight-server-0.1.43-linux-x86_64.tar.gz, SHA256SUMS and SELF_HOST.md from
+After publication, download the v0.1.44 release from
+clickety-clacks/harklight-server, tag v0.1.44. Get
+harklight-server-0.1.44-linux-x86_64.tar.gz, SHA256SUMS and SELF_HOST.md from
 that release. Run sha256sum -c SHA256SUMS and extract into an operator-owned
 versioned directory. BUILD_INFO identifies the source commit, build host,
 toolchain, source status and native dependencies.
@@ -47,7 +47,7 @@ runtime/dependency notices remain in their shipped distribution files.
 Choose the DNS hostname clients will validate. For a same-machine preview,
 localhost works. Install into a directory you own and run:
 
-    PACKAGE="$PWD/harklight-server-0.1.43-linux-x86_64"
+    PACKAGE="$PWD/harklight-server-0.1.44-linux-x86_64"
     STATE="$HOME/.local/share/harklight-server"
     "$PACKAGE/bin/harklight-bootstrap" "$STATE" localhost
     cat "$STATE/person-id"
@@ -315,8 +315,9 @@ survive restart.
 For a manual upgrade of an existing installation, stop the old server and back
 up the full private state before upgrading. The release installer makes one
 full mutable-root backup after stopping the service and before switching
-releases. This source, v0.1.43, writes store FORMAT29. From supported FORMAT27
-state, including state written by the published v0.1.42 package, startup applies
+releases. This source, v0.1.44, writes store FORMAT29. From supported FORMAT27
+state, including state written by the published v0.1.35 through v0.1.42
+maintenance packages (for example v0.1.38), startup applies
 the FORMAT28 device-focus defaults and FORMAT29 hosted-delivery-state
 initialization in order, preserving existing values and filling only missing
 values. The final migrated store is FORMAT29; the source does not establish a
@@ -330,9 +331,11 @@ it is registered to, regardless of sender. Sender filters select search results
 only; they do not limit access. Existing respond-grant values and response
 checks are unchanged. New registrations need no per-sender read grant for
 reads; answering still requires both a matching read grant and a matching
-respond grant. The published v0.1.42 package writes FORMAT27 and
+respond grant. The published FORMAT27 packages, including v0.1.38 and v0.1.42,
 cannot read FORMAT29; changing only the code or release link is not a safe
-downgrade. The
+downgrade. From FORMAT29 state written by v0.1.43, v0.1.44 runs no migration.
+Do not install v0.1.43: revising a message whose body is stored as large
+message data stops its relay process; v0.1.44 fixes this. The
 FORMAT25 state
 introduced by v0.1.28 includes hosted-account records, the separate
 conversation feed, conversation push high water and upload activity accounting
@@ -423,7 +426,7 @@ exact acceptance sequence and intent reference, without source ruling authority.
 
 For a manual upgrade, stop the old process and back up the complete private
 state directory, including the database and keys, before the first start of a
-v0.1.43 package. Verify the package checksum and extract into a different
+v0.1.44 package. Verify the package checksum and extract into a different
 versioned directory. Keep the state path, trust root, owner/person and
 configuration. Start with the existing `server.env`; do not rerun bootstrap.
 From supported FORMAT27 state, first start applies the FORMAT28 device-focus
@@ -467,11 +470,11 @@ The installer attempts backup restoration only when candidate start or
 process-readiness fails. After readiness, it does not automatically roll back;
 the optional owner agent-list probe is warning-only.
 
-Before the first v0.1.43 start, stop the server and take a complete private
-state backup, including the database and keys. After any v0.1.43 write,
-returning to the published v0.1.42 FORMAT27 release requires stopping the
-server, restoring that pre-start backup and selecting v0.1.42. The v0.1.42
-package cannot read the resulting FORMAT29 state, and changing only the code or
+Before the first v0.1.44 start, stop the server and take a complete private
+state backup, including the database and keys. After any v0.1.44 write,
+returning to a published FORMAT27 release such as v0.1.38 or v0.1.42 requires
+stopping the server, restoring that pre-start backup and selecting that
+release. FORMAT27 packages cannot read the resulting FORMAT29 state, and changing only the code or
 release link does not restore compatibility. Restoring the backup loses every
 write since it was taken and cannot undo external notifications, bounces or
 agent deliveries. Preserve the backup and current state if restoration does
