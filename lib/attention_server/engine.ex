@@ -3110,7 +3110,6 @@ defmodule AttentionServer.Engine do
       # A frozen page may only show retraction state when its terminal was
       # included at the page's captured high water.
       acceptance = project_event(engine, person, device, accepted, :snapshot)
-      acceptance = latest_inbox_revision(acceptance, record)
 
       acceptance =
         case Map.get(record, :terminal) do
@@ -6185,26 +6184,6 @@ defmodule AttentionServer.Engine do
       {grapheme, tail} -> take_graphemes(tail, remaining - 1, [grapheme | acc])
     end
   end
-
-  defp latest_inbox_revision(acceptance, %{revision: revision, message: message} = record)
-       when is_integer(revision) and revision > 1 do
-    if Map.has_key?(acceptance, "message") do
-      files =
-        record
-        |> Map.get(:files_by_revision, %{})
-        |> Map.get(revision, [])
-
-      acceptance
-      |> Map.delete("files")
-      |> Map.put("request_revision", revision)
-      |> Map.put("message", message)
-      |> ConversationFiles.put_entry(files)
-    else
-      acceptance
-    end
-  end
-
-  defp latest_inbox_revision(acceptance, _record), do: acceptance
 
   defp project_event(engine, person, device, seq, projection) do
     %{kind: kind, key: key} = event = engine.events[{person, seq}]

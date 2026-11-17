@@ -1091,7 +1091,8 @@ defmodule AttentionServer.WebSocketRelayTest do
     :ssl.close(socket)
   end
 
-  test "cold inbox paging returns the latest full Progress revision", ctx do
+  test "cold inbox paging preserves acceptance identity and the revision feed carries Progress",
+       ctx do
     %{certs: certs, web: web, relay: relay, keys: keys} = ctx
 
     handle = op(4_100)
@@ -1197,8 +1198,18 @@ defmodule AttentionServer.WebSocketRelayTest do
              })
 
     assert %{"type" => "ok", "high_water" => 1, "items" => [item]} = reply(reader)
-    assert item["acceptance"]["request_revision"] == 2
-    assert item["acceptance"]["message"] == revised
+    assert item["acceptance"]["request_revision"] == 1
+    assert item["acceptance"]["message"] == message
+
+    assert :ok = send_request(reader, %{"type" => "conversation_open", "since" => 0})
+    assert %{"type" => "ok"} = reply(reader)
+    assert %{
+             "type" => "conversation",
+             "request_revision" => 2,
+             "message" => ^revised
+           } = reply(reader)
+
+    assert %{"type" => "conversation_resynced", "conversation_seq" => 1} = reply(reader)
   end
 
   test "bounded inbox pages reconcile receipts, checkpoint atomically, and survive restart",
