@@ -26,7 +26,7 @@ defmodule AttentionServer.Store do
 
   @format_version 29
   @inbox_index_chunk_size 20
-  # `large_base` is the durable engine of the last snapshot commit (or open),
+  # `large_base` is the durable engine of the last snapshot commit,
   # `large_persisted` its persisted form and `large_index` its large-data
   # reference rows. A commit reuses them for every unchanged subterm.
   defstruct [
@@ -182,14 +182,10 @@ defmodule AttentionServer.Store do
               {_payload, cache} =
                 Persistence.run(fn -> SnapshotEncoding.encode(persisted, @format_version) end)
 
-              {:ok,
-               %{
-                 store
-                 | encoding_cache: cache,
-                   large_base: engine,
-                   large_persisted: persisted,
-                   large_index: LargeData.reference_index(engine)
-               }}
+              # The base is seeded by the first snapshot commit, which takes
+              # the full path: a loaded state is externalized exactly as
+              # before, including any oversized inline string it may hold.
+              {:ok, %{store | encoding_cache: cache}}
             else
               {:error, reason} ->
                 Diagnostics.failure(:server_storage, :store_open, reason, :unavailable)
