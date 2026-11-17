@@ -28,6 +28,30 @@
   understand a large-data reference show an explicit newer-server marker for
   that content, continue serving other data and preserve the referenced files;
   a compatible upgrade restores full reads.
+- Each connection's output is written by its own ordered writer, so a device or
+  agent that stops reading no longer holds up other devices, agents or the
+  owner. Authority is rechecked before each frame and revocation cancels queued
+  output. No send timeout, queue cap or retry deadline is added.
+- Progress messages: a typed FYI marked as Progress is revised in place under
+  the same message ID. Progress is left out of ranking, bounce scores and
+  deadlines, and the app badge count. Readers receive the latest full revision.
+- Accounts without an owner-configured bounce table use default Low, Normal,
+  High and Urgent levels for newly accepted deliveries and substantive
+  revisions. An owner-configured table still takes precedence.
+- A device's focus ends when its session closes or is replaced, its listener
+  disconnects, it signs out or it is removed; a reconnecting device sends a
+  fresh focus report. The former 24-hour focus retention was removed.
+- Notifications can expand to show the delivered message or chat preview, or
+  the ordered titles of a batch of requests. The collapsed alert is unchanged,
+  and a payload that cannot fit falls back to the existing alert.
+- Pushes and device sync identify the originating Server. Operators can expose
+  boolean client feature flags through `ATTENTION_SERVER_FEATURE_FLAGS_PATH`;
+  unset or unreadable configuration yields no flags.
+- A No comment action authored before a request revision closes that request
+  when it arrives later. A retry of the original action recovers its result; an
+  action proven to be a different new operation is refused as closed.
+- The packaged agent skill documents the supported web entry links, `/inbox`
+  and `/settings`.
 
 ## Upgrade and recovery
 
