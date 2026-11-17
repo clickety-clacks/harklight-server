@@ -145,4 +145,19 @@ defmodule AttentionServer.BouncePolicyTest do
 
     refute BouncePolicy.same_substance?(message, [], %{message | "body" => "small"}, [])
   end
+
+  test "inline and referenced forms of the same large content are the same substance" do
+    bytes = :binary.copy("x", 2 * 1024 * 1024 + 1)
+    hash = Base.encode16(:crypto.hash(:sha256, bytes), case: :lower)
+    ref = %Ref{id: hash, sha256: hash, size: byte_size(bytes), path: "/state/uploads/" <> hash}
+    inline = %{"title" => "Large", "message_type" => "fyi", "body" => bytes}
+    stored = %{inline | "body" => ref}
+
+    assert BouncePolicy.same_substance?(stored, [], inline, [])
+    assert BouncePolicy.same_substance?(inline, [], stored, [])
+
+    changed = :binary.copy("y", byte_size(bytes))
+    refute BouncePolicy.same_substance?(stored, [], %{inline | "body" => changed}, [])
+    refute BouncePolicy.same_substance?(%{inline | "body" => changed}, [], stored, [])
+  end
 end

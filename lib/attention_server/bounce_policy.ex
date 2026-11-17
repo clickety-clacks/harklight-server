@@ -3,6 +3,8 @@ defmodule AttentionServer.BouncePolicy do
 
   alias AttentionServer.JSON.DecimalToken
 
+  @large_inline_limit AttentionServer.LargeData.inline_limit()
+
   @milliseconds_per_day 86_400_000
   @level_fields ["name", "lower_bound", "bounce_after_days"]
   @default_level_rows [
@@ -103,10 +105,18 @@ defmodule AttentionServer.BouncePolicy do
     substantive_content(old_message, old_files) == substantive_content(new_message, new_files)
   end
 
-  # Large message data compares by content: the same bytes can be held at a
-  # transient path in a request and at a durable path in the store.
+  # Large message data compares by content: the same bytes can be a durable
+  # reference in the store, a transient reference in a request, or an inline
+  # binary (a line request, or a legacy stored message). All three forms of the
+  # same bytes canonicalize to the same identity.
   defp canonical_value(%AttentionServer.LargeData.Ref{sha256: sha256, size: size}),
     do: {:large_data, sha256, size}
+
+  defp canonical_value(value)
+       when is_binary(value) and byte_size(value) > @large_inline_limit,
+       do:
+         {:large_data, Base.encode16(:crypto.hash(:sha256, value), case: :lower),
+          byte_size(value)}
 
   defp canonical_value(%DecimalToken{} = value) do
     case number_ratio(value) do
