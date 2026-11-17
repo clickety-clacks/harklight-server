@@ -24,7 +24,7 @@ defmodule AttentionServer.OriginHTTPS do
   @keepalive_ms 15_000
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts)
-  def port(server), do: GenServer.call(server, :port)
+  def port(server), do: GenServer.call(server, :port, :infinity)
 
   @impl true
   def init(opts) do
