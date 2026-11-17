@@ -74,5 +74,27 @@ class RehearsalRecordTests(unittest.TestCase):
         )
 
 
+class ReleaseLookupTests(unittest.TestCase):
+    # GitHub's GET /releases/tags/{tag} returns only published releases, so the
+    # workflow's own draft must be found in the authenticated release list.
+    def test_published_release_from_tag_lookup_is_used(self):
+        published = {"id": 1, "tag_name": "v1.2.3", "draft": False}
+        self.assertIs(HELPER.select_release_for_tag("v1.2.3", published, []), published)
+
+    def test_draft_is_found_in_release_list_when_tag_lookup_has_none(self):
+        draft = {"id": 7, "tag_name": "v1.2.3", "draft": True}
+        listed = [{"id": 6, "tag_name": "v1.2.2", "draft": False}, draft]
+        self.assertIs(HELPER.select_release_for_tag("v1.2.3", None, listed), draft)
+
+    def test_no_release_for_tag(self):
+        listed = [{"id": 6, "tag_name": "v1.2.2", "draft": False}]
+        self.assertIsNone(HELPER.select_release_for_tag("v1.2.3", None, listed))
+
+    def test_two_releases_for_one_tag_are_refused(self):
+        listed = [{"id": 7, "tag_name": "v1.2.3", "draft": True}, {"id": 8, "tag_name": "v1.2.3", "draft": True}]
+        with self.assertRaises(SystemExit):
+            HELPER.select_release_for_tag("v1.2.3", None, listed)
+
+
 if __name__ == "__main__":
     unittest.main()
