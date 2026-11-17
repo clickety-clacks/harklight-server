@@ -114,6 +114,10 @@ defmodule AttentionServer.DashboardSelfHostedWebTest do
 
     assert sha256(archive) == @web_archive_sha256
 
+    # The package carries only the pinned bundle and its manifest.
+    assert Enum.sort(File.ls!(Path.join(priv, "harklight-web"))) ==
+             [@web_archive, "manifest.json"]
+
     manifest =
       archive_path
       |> Path.dirname()
