@@ -6,11 +6,15 @@ fixes that and the slower sends v0.1.43 showed on large servers.
 
 ## Changes
 
-- Sends and other state changes on large servers are back to v0.1.42 speed.
-  v0.1.43 re-examined the whole stored state for large message data on every
-  change, roughly doubling send time on a server holding a few gigabytes; the
-  server now examines only what changed since the previous commit. The first
-  change after each start still examines everything once.
+- Sends and other state changes are faster on large servers. v0.1.43
+  re-examined the whole stored state for large message data on every change;
+  the server now examines only what changed since the previous commit (the
+  first change after each start still examines everything once). Measured on
+  the same 3 GB synthetic server (about 3,950 messages and 2,940 uploads),
+  alternating one send at a time between releases, 30 sends each:
+  v0.1.44 median 1.0 s (worst 2.4 s) against v0.1.43 median 1.45 s (worst
+  2.9 s), and v0.1.44 median 1.0 s (worst 1.7 s) against v0.1.38 median 2.6 s
+  (worst 2.8 s).
 - Revising a message whose body, answer or title is stored as large message
   data no longer crashes the relay. Revisions compare large content by its
   SHA-256 and size.
