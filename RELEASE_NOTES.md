@@ -1,3 +1,30 @@
+# Harklight Server v0.1.45
+
+**Install this instead of v0.1.43 or v0.1.44 when the server is busy.** It
+contains everything in v0.1.44, below, plus one fix.
+
+## Changes
+
+- A connection no longer gives up on a busy server after five seconds. Most
+  calls from device, origin, agent and owner connections into the server's
+  relay waited at most five seconds (a library default) for an answer. When the
+  relay was busy longer, the connection closed without answering, so agents
+  reported "error sending request", while the request usually still ran and the
+  client's retry repeated it. Every such call now waits for the relay's real
+  answer. No timer or retry is added.
+
+## Upgrade and recovery
+
+v0.1.45 writes FORMAT29, like v0.1.43 and v0.1.44. From FORMAT29 state written
+by v0.1.43 or v0.1.44, no migration runs, and switching back to the earlier
+FORMAT29 release keeps every write. From supported FORMAT27 state (the
+v0.1.35 through v0.1.42 maintenance packages), first start migrates to FORMAT29
+as described for v0.1.44, and returning to FORMAT27 requires restoring the
+pre-start backup, which loses every later write. Recovery can fail; do not
+assume success or a recovery time.
+
+---
+
 # Harklight Server v0.1.44
 
 **Install this instead of v0.1.43.** In v0.1.43, revising a message whose body

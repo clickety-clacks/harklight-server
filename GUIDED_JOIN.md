@@ -175,7 +175,7 @@ its connection indicator stays Unknown without a real presence signal.
 
 ## Durable upgrade boundary
 
-This release, v0.1.44, writes FORMAT29. From supported FORMAT27 state,
+This release, v0.1.45, writes FORMAT29. From supported FORMAT27 state,
 including state written by the published v0.1.35 through v0.1.42 maintenance
 packages (for example v0.1.38), first start applies
 the FORMAT28 device-focus defaults and FORMAT29 hosted-delivery-state
@@ -196,12 +196,12 @@ that request is closed and earlier messages remain readable. Agents without
 the matching Agent C1 behavior receive the existing generic closed refusal.
 Published FORMAT27 packages, including v0.1.38 and v0.1.42, cannot read
 FORMAT29; changing the code back alone does not restore compatibility. From
-FORMAT29 state written by v0.1.43, v0.1.44 runs no migration. Do not install
-v0.1.43: revising a message whose body is stored as large message data stops
-its relay process; v0.1.44 fixes this.
+FORMAT29 state written by v0.1.43 or v0.1.44, v0.1.45 runs no migration. Do not
+install v0.1.43: revising a message whose body is stored as large message data stops
+its relay process; v0.1.44 and later fix this.
 
-Before the first v0.1.44 start, stop the server and take a complete private-state
-backup. After any v0.1.44 write, returning to a published FORMAT27 package such
+Before the first v0.1.45 start, stop the server and take a complete private-state
+backup. After any v0.1.45 write, returning to a published FORMAT27 package such
 as v0.1.38 or v0.1.42 requires stopping the server, restoring that pre-start
 backup and selecting that package. This loses every write made since the backup and cannot undo external
 notifications, bounces or agent deliveries. The installer behavior and recovery
