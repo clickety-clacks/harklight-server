@@ -25,3 +25,4 @@ attention_server-*.tar
 
 # Built self-hosted preview packages.
 /dist/
+__pycache__/

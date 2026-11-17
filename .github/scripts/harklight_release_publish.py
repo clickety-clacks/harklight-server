@@ -157,11 +157,41 @@ def release_for_tag(tag: str, token: str | None = None, allow_404: bool = False)
     return request_json(api_url(f"releases/tags/{encoded}"), token=token, allow_404=allow_404)
 
 
+def select_release_for_tag(tag: str, published, listed: list) -> dict | None:
+    """Pick the one release for a tag. GitHub's tag lookup returns only published releases,
+    so a draft is found by listing releases with repository credentials."""
+    if published is not None:
+        return published
+    matches = [release for release in listed if isinstance(release, dict) and release.get("tag_name") == tag]
+    if len(matches) > 1:
+        fail("more than one release names this tag; leaving them unchanged")
+    return matches[0] if matches else None
+
+
+def any_release_for_tag(tag: str, token: str, allow_404: bool = False):
+    published = release_for_tag(tag, token=token, allow_404=True)
+    listed: list = []
+    if published is None:
+        page = 1
+        while True:
+            batch = request_json(api_url(f"releases?per_page=100&page={page}"), token=token)
+            if not isinstance(batch, list):
+                fail("release list response is invalid")
+            listed.extend(batch)
+            if len(batch) < 100:
+                break
+            page += 1
+    release = select_release_for_tag(tag, published, listed)
+    if release is None and not allow_404:
+        fail("no release exists for this tag")
+    return release
+
+
 def cmd_classify(args) -> None:
     token = os.environ.get("GH_TOKEN")
     if not token:
         fail("repository release read token is unavailable")
-    release = release_for_tag(args.tag, token=token, allow_404=True)
+    release = any_release_for_tag(args.tag, token=token, allow_404=True)
     if release is None:
         write_outputs({"mode": "build", "release_id": ""})
         print("No release exists for this tag; the package will be built")
@@ -524,7 +554,7 @@ def cmd_delete_draft(args) -> None:
     token = os.environ.get("GH_TOKEN")
     if not token:
         fail("repository release write token is unavailable")
-    release = release_for_tag(args.tag, token=token)
+    release = any_release_for_tag(args.tag, token=token)
     if (
         not release
         or release.get("id") != args.release_id
@@ -558,7 +588,7 @@ def cmd_assert_draft(args) -> None:
     token = os.environ.get("GH_TOKEN")
     if not token:
         fail("repository release read token is unavailable")
-    release = release_for_tag(args.tag, token=token)
+    release = any_release_for_tag(args.tag, token=token)
     if (
         not release
         or release.get("tag_name") != args.tag
