@@ -92,7 +92,7 @@ defmodule AttentionServer.ContradictionsRelayTest do
     assert check["status"] == "checked"
     assert hd(check["messages"])["message_id"] == "m1"
     assert hd(check["messages"])["sender_name"] == "First sender"
-    assert_receive {:evaluated, [{"app:test", "m1"}]}
+    assert_receive {:evaluated, [{"app:test", "m1"}]}, 2_000
     assert request(relay, frame(2))["possible_contradictions"] == check
 
     refute Map.has_key?(
@@ -127,15 +127,36 @@ defmodule AttentionServer.ContradictionsRelayTest do
     end
 
     {relay, _} = start(contradiction_batch_size: 8, contradiction_evaluator: evaluator)
+    :ok = Relay.enable_push(relay)
+
+    assert request(
+             relay,
+             %{
+               "v" => 1,
+               "type" => "push_register",
+               "op_id" => op(99),
+               "revision" => 1,
+               "profile_id" => "harklight-sandbox",
+               "address_kind" => "apns_token",
+               "address" => String.duplicate("ab", 32)
+             },
+             "reader"
+           )["type"] == "ok"
+
     request(relay, frame(1))
     jev(relay)
     sending = Task.async(fn -> request(relay, frame(2)) end)
-    assert_receive {:checking, worker, [{"app:test", "m1"}]}
+    assert_receive {:checking, worker, [{"app:test", "m1"}]}, 2_000
     assert {:ok, events, _} = Relay.events(relay, "reader", 0)
     assert Enum.any?(events, &(&1["message_id"] == "m2"))
+    assert {:ok, claim} = Relay.claim_push(relay, System.system_time(:millisecond) + 300_001)
+
+    assert claim.high ==
+             :sys.get_state(relay).store.engine.messages[{"person", "app:test", "m2"}].accepted_seq
+
     replay = Task.async(fn -> request(relay, frame(2)) end)
     next = Task.async(fn -> request(relay, frame(3)) end)
-    assert_receive {:checking, second, _}
+    assert_receive {:checking, second, _}, 2_000
     assert {:ok, events, _} = Relay.events(relay, "reader", 0)
     assert Enum.any?(events, &(&1["message_id"] == "m3"))
     assert Task.yield(sending, 0) == nil
@@ -180,7 +201,7 @@ defmodule AttentionServer.ContradictionsRelayTest do
              "possible_contradictions"
            )
 
-    assert_receive {:evaluated, [{"app:test", "m2"}]}
+    assert_receive {:evaluated, [{"app:test", "m2"}]}, 2_000
   end
 
   test "slow check returns timeout within the contract bound after delivery" do
@@ -201,7 +222,7 @@ defmodule AttentionServer.ContradictionsRelayTest do
     request(relay, frame(1))
     jev(relay)
     sending = Task.async(fn -> request(relay, frame(2)) end)
-    assert_receive :waiting
+    assert_receive :waiting, 2_000
     assert {:ok, events, _} = Relay.events(relay, "reader", 0)
     assert Enum.any?(events, &(&1["message_id"] == "m2"))
 
@@ -242,7 +263,7 @@ defmodule AttentionServer.ContradictionsRelayTest do
     refute_receive {:evaluated, _}
     check = request(relay, frame(2))["possible_contradictions"]
     assert check == %{"status" => "incomplete", "reason" => "unavailable", "unchecked" => 1}
-    assert_receive {:evaluated, [{"app:test", "m1"}]}
+    assert_receive {:evaluated, [{"app:test", "m1"}]}, 2_000
     assert {:ok, events, _} = Relay.events(relay, "reader", 0)
     assert Enum.any?(events, &(&1["message_id"] == "m2"))
   end
@@ -266,7 +287,7 @@ defmodule AttentionServer.ContradictionsRelayTest do
     assert check["reason"] == "unavailable"
     assert check["unchecked"] == 1
     assert hd(check["messages"])["message_id"] == "m2"
-    assert_receive {:evaluated, [{"app:test", "m2"}]}
+    assert_receive {:evaluated, [{"app:test", "m2"}]}, 2_000
 
     check =
       request(relay, frame(4, %{"body" => String.duplicate("x", 25_000)}))[
@@ -275,5 +296,27 @@ defmodule AttentionServer.ContradictionsRelayTest do
 
     assert check == %{"status" => "incomplete", "reason" => "unavailable", "unchecked" => 3}
     refute_receive {:evaluated, _}
+  end
+
+  test "origin send mapping carries the advisory object unchanged" do
+    {relay, _} =
+      start(
+        contradiction_batch_size: 8,
+        contradiction_evaluator: fn req ->
+          {:ok, Map.new(req.candidates, &{&1, 1})}
+        end
+      )
+
+    request(relay, frame(1))
+    jev(relay)
+    posted = frame(2) |> Map.put("type", "send") |> Map.put("ref", "caller-ref")
+    result = AttentionServer.OriginWire.command(relay, "origin", posted)
+    assert result["type"] == "ok"
+    assert result["ref"] == "caller-ref"
+    assert result["possible_contradictions"]["status"] == "checked"
+    assert hd(result["possible_contradictions"]["messages"])["message_id"] == "m1"
+
+    assert AttentionServer.OriginWire.command(relay, "origin", posted)["possible_contradictions"] ==
+             result["possible_contradictions"]
   end
 end
