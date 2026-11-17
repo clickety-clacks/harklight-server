@@ -8,7 +8,6 @@ defmodule AttentionServer.HeadlessTLS do
 
   alias AttentionServer.JSON
 
-  @timeout 3_000
   @max_http 64 * 1024
   @max_agent_http 6 * 1024 * 1024
 
@@ -47,7 +46,9 @@ defmodule AttentionServer.HeadlessTLS do
           options
       end
 
-    :ssl.connect(address, port, options, @timeout)
+    # No client-side deadline: wait for the server's answer or a real
+    # connection end/error from the network stack.
+    :ssl.connect(address, port, options, :infinity)
   end
 
   def connect(_, _), do: {:error, :invalid_endpoint}
@@ -102,7 +103,7 @@ defmodule AttentionServer.HeadlessTLS do
         {:error, :invalid_response}
 
       :nomatch ->
-        case :ssl.recv(socket, 0, @timeout) do
+        case :ssl.recv(socket, 0, :infinity) do
           {:ok, chunk} -> read_owner_line(socket, bytes <> chunk)
           error -> error
         end
@@ -161,7 +162,7 @@ defmodule AttentionServer.HeadlessTLS do
         {:error, :invalid_response}
 
       :nomatch ->
-        case :ssl.recv(socket, 0, @timeout) do
+        case :ssl.recv(socket, 0, :infinity) do
           {:ok, chunk} -> read_agent_line(socket, bytes <> chunk)
           error -> error
         end
@@ -174,7 +175,7 @@ defmodule AttentionServer.HeadlessTLS do
     do: {:error, :response_too_large}
 
   defp read_http(socket, buffer, max) do
-    case :ssl.recv(socket, 0, @timeout) do
+    case :ssl.recv(socket, 0, :infinity) do
       {:ok, chunk} -> read_http(socket, buffer <> chunk, max)
       {:error, :closed} -> {:ok, buffer}
       error -> error
