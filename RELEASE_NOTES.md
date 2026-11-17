@@ -1,10 +1,22 @@
 # Harklight Server v0.1.45
 
 **Install this instead of v0.1.43 or v0.1.44 when the server is busy.** It
-contains everything in v0.1.44, below, plus one fix.
+contains everything in v0.1.44, below, plus two fixes.
 
 ## Changes
 
+- Agents' repeated, unchanged declarations no longer rewrite the whole server
+  state. Agents re-declare the same listening support and attachment many times
+  a minute (on one busy server, 85% of all saves). A declaration that would
+  change nothing is now answered from current state without saving, without a
+  new operation receipt and without another availability entry on every open
+  request; a changed declaration is saved exactly as before. Measured on a
+  3 GB synthetic server replaying that mix (22 and 44 unchanged support
+  declarations a minute, plus attachment updates, status polls and about one
+  message a minute): saves fell from 22 and 42 a minute to 1 (the messages);
+  server CPU median from 46% and 81% to 19% and 20%; support answers from
+  1.0–1.2 s to 0.05 s median; message sends from 3.2–3.3 s to 0.7–0.9 s
+  median; no failed calls in either release.
 - A connection no longer gives up on a busy server after five seconds. Most
   calls from device, origin, agent and owner connections into the server's
   relay waited at most five seconds (a library default) for an answer. When the
