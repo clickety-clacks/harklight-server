@@ -10,7 +10,14 @@ defmodule AttentionServer.DashboardBackendTest do
 
   alias AttentionServer.{DeviceIdentity, JSON, Relay, TLSFixtures}
 
-  test "priority levels are owner-scoped, default off, durable, and whole-table saves are idempotent" do
+  @default_levels [
+    %{"name" => "Low", "lower_bound" => 0, "bounce_after_days" => 7},
+    %{"name" => "Normal", "lower_bound" => 0.3, "bounce_after_days" => 3},
+    %{"name" => "High", "lower_bound" => 0.6, "bounce_after_days" => 1},
+    %{"name" => "Urgent", "lower_bound" => 0.8, "bounce_after_days" => 0.5}
+  ]
+
+  test "priority levels default per owner when unset and whole-table saves are idempotent" do
     certs = TLSFixtures.create!()
     on_exit(fn -> File.rm_rf!(certs) end)
     dir = Path.join(System.tmp_dir!(), "harklight-levels-#{System.unique_integer([:positive])}")
@@ -30,8 +37,16 @@ defmodule AttentionServer.DashboardBackendTest do
     device_a = String.duplicate("c", 64)
     :ok = Relay.setup_device(relay, person_a, device_a)
 
-    assert {:ok, %{"levels" => []}} = Relay.dashboard_levels(relay, person_a, key_a)
-    assert {:ok, %{"levels" => []}} = Relay.dashboard_levels(relay, person_b, key_b)
+    assert {:ok, %{"levels" => default_levels_a}} =
+             Relay.dashboard_levels(relay, person_a, key_a)
+
+    assert default_levels_a == @default_levels
+
+    assert {:ok, %{"levels" => default_levels_b}} =
+             Relay.dashboard_levels(relay, person_b, key_b)
+
+    assert default_levels_b == @default_levels
+    assert :sys.get_state(relay).store.engine.bounce_levels == %{}
     assert {:error, :forbidden} = Relay.dashboard_levels(relay, person_a, device_a)
 
     rows = [
@@ -57,13 +72,21 @@ defmodule AttentionServer.DashboardBackendTest do
              Relay.save_dashboard_levels(relay, person_a, key_a, invalid)
 
     assert {:ok, %{"levels" => ^rows}} = Relay.dashboard_levels(relay, person_a, key_a)
-    assert {:ok, %{"levels" => []}} = Relay.dashboard_levels(relay, person_b, key_b)
+
+    assert {:ok, %{"levels" => default_levels_b_after_save}} =
+             Relay.dashboard_levels(relay, person_b, key_b)
+
+    assert default_levels_b_after_save == @default_levels
 
     GenServer.stop(relay)
     assert {:ok, restarted} = Relay.start_link(store_path: path)
     on_exit(fn -> if Process.alive?(restarted), do: GenServer.stop(restarted) end)
     assert {:ok, %{"levels" => ^rows}} = Relay.dashboard_levels(restarted, person_a, key_a)
-    assert {:ok, %{"levels" => []}} = Relay.dashboard_levels(restarted, person_b, key_b)
+
+    assert {:ok, %{"levels" => default_levels_b_after_restart}} =
+             Relay.dashboard_levels(restarted, person_b, key_b)
+
+    assert default_levels_b_after_restart == @default_levels
     GenServer.stop(restarted)
   end
 

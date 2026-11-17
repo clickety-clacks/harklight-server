@@ -7,10 +7,9 @@ defmodule AttentionServer.BounceDecision do
   @advisory_fields ~w(advisory_id advisory_seq accepted_at_ms author bounce_after_days due_at_ms evaluated_at_ms kind level_name message_id origin_cursor_at_decision request_revision sender_id session_handle text advisory_type)
 
   def levels(%Engine{} = engine, person) do
-    case Map.get(engine.bounce_levels, person) do
-      nil -> []
-      config -> BouncePolicy.public_levels(config.levels)
-    end
+    engine
+    |> effective_levels(person)
+    |> BouncePolicy.public_levels()
   end
 
   def configure_levels(%Engine{} = engine, person, levels, now_ms)
@@ -49,7 +48,7 @@ defmodule AttentionServer.BounceDecision do
     revision = %{
       raw_revision: 1,
       accepted_at_ms: accepted_at,
-      qualified: is_map(config) and accepted_seq > config.after_delivery_seq,
+      qualified: qualifies_initial_delivery?(config, accepted_seq),
       selection: nil
     }
 
@@ -96,7 +95,7 @@ defmodule AttentionServer.BounceDecision do
       current = %{
         raw_revision: raw_revision,
         accepted_at_ms: accepted_at,
-        qualified: is_map(config) and conversation_seq > config.after_conversation_seq,
+        qualified: qualifies_revision?(config, conversation_seq),
         selection: nil
       }
 
@@ -398,7 +397,7 @@ defmodule AttentionServer.BounceDecision do
        when is_binary(sender) and is_binary(message_id) do
     with %{message: message} = record <- Map.get(engine.messages, key),
          true <- Message.valid_message_type?(message["message_type"]),
-         %{levels: levels} = _config <- Map.get(engine.bounce_levels, person),
+         levels when is_list(levels) <- effective_levels(engine, person),
          state <- Map.get(engine.bounce_revisions, key) || legacy_revision_state(record),
          sub_revision when is_integer(sub_revision) <- state.current_substantive_revision,
          %{qualified: true, selection: nil} = revision <- Map.get(state.revisions, sub_revision),
@@ -947,6 +946,29 @@ defmodule AttentionServer.BounceDecision do
 
   defp put_configuration(engine, person, config),
     do: %{engine | bounce_levels: Map.put(engine.bounce_levels, person, config)}
+
+  # Defaults apply to newly accepted deliveries and revisions. Existing stored
+  # qualification flags (including legacy false values) remain unchanged, so
+  # reading defaults never backfills retained messages.
+  defp effective_levels(engine, person) do
+    case Map.get(engine.bounce_levels, person) do
+      nil -> BouncePolicy.default_levels()
+      %{levels: levels} -> levels
+      _ -> nil
+    end
+  end
+
+  defp qualifies_initial_delivery?(nil, accepted_seq),
+    do: is_integer(accepted_seq) and accepted_seq > 0
+
+  defp qualifies_initial_delivery?(%{after_delivery_seq: after_seq}, accepted_seq),
+    do: is_integer(accepted_seq) and accepted_seq > after_seq
+
+  defp qualifies_revision?(nil, conversation_seq),
+    do: is_integer(conversation_seq) and conversation_seq > 0
+
+  defp qualifies_revision?(%{after_conversation_seq: after_seq}, conversation_seq),
+    do: is_integer(conversation_seq) and conversation_seq > after_seq
 
   defp empty_advisory_feed, do: %{high: 0, entries: %{}, receipts: MapSet.new()}
 

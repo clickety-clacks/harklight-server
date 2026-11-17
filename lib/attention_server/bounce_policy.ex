@@ -5,6 +5,17 @@ defmodule AttentionServer.BouncePolicy do
 
   @milliseconds_per_day 86_400_000
   @level_fields ["name", "lower_bound", "bounce_after_days"]
+  @default_level_rows [
+    %{"name" => "Low", "lower_bound" => 0, "bounce_after_days" => 7},
+    %{"name" => "Normal", "lower_bound" => 0.3, "bounce_after_days" => 3},
+    %{"name" => "High", "lower_bound" => 0.6, "bounce_after_days" => 1},
+    %{"name" => "Urgent", "lower_bound" => 0.8, "bounce_after_days" => 0.5}
+  ]
+
+  def default_levels do
+    {:ok, levels} = normalize_levels(@default_level_rows)
+    levels
+  end
 
   def normalize_levels(levels) when is_list(levels) and levels != [] do
     with {:ok, normalized} <- normalize_rows(levels),
