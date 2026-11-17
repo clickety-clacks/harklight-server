@@ -125,7 +125,10 @@ defmodule AttentionServer.BounceDecisionTest do
   end
 
   defp selection(engine, revision \\ 1) do
-    engine.bounce_revisions[key()].revisions[revision].selection
+    case Map.get(engine.bounce_revisions, key()) do
+      %{revisions: revisions} -> get_in(revisions, [revision, :selection])
+      _ -> nil
+    end
   end
 
   test "defaults are read without storing a table and leave unscored messages inert" do
