@@ -733,6 +733,15 @@ defmodule AttentionServer.Relay do
                   Keyword.get(opts, :deployment_mode, :self_hosted),
                   Keyword.get(opts, :jev_score_record_path)
                 ),
+              contradiction_checks: %{},
+              contradiction_batch_size:
+                Keyword.get(
+                  opts,
+                  :contradiction_batch_size,
+                  Application.get_env(:attention_server, :contradiction_batch_size)
+                ),
+              contradiction_evaluator:
+                Keyword.get(opts, :contradiction_evaluator, &JevClient.evaluate/1),
               priority_views: %{},
               priority_recorded_scores: %{},
               priority_generations: %{},
@@ -1015,13 +1024,155 @@ defmodule AttentionServer.Relay do
           {:noreply, enqueue_socket_write(next, socket, authority, frames, completion, from)}
 
         {:reply, reply, next} ->
-          {:reply, reply, fence_socket_writes(next)}
+          contradiction_reply(request, from, reply, state, fence_socket_writes(next))
 
         {:noreply, next} ->
           {:noreply, fence_socket_writes(next)}
       end
     end)
   end
+
+  defp contradiction_reply({:request_line, key, raw}, from, reply, old, next) do
+    case JSON.decode_line(raw) do
+      {:ok, frame} -> contradiction_reply({:request_frame, key, frame}, from, reply, old, next)
+      _ -> {:reply, reply, next}
+    end
+  end
+
+  defp contradiction_reply(
+         {:request_frame, key, %{"type" => "forward", "message" => message} = frame},
+         from,
+         reply,
+         old,
+         next
+       ) do
+    with true <- request_success?(reply),
+         {:ok, person} <- Engine.authorized_person(next.store.engine, key) do
+      receipt_key = {person, key, frame["op_id"]}
+      posted_key = {person, message["sender_id"], message["message_id"]}
+
+      case Map.get(next.contradiction_checks, receipt_key) do
+        nil ->
+          if not Map.has_key?(old.store.engine.messages, posted_key) and
+               Map.has_key?(next.store.engine.messages, posted_key) and
+               Placement.choice(next.store.engine, person) == "jev-set" do
+            start_contradiction(next, receipt_key, posted_key, from, reply)
+          else
+            {:reply, reply, next}
+          end
+
+        job ->
+          jobs =
+            Map.put(next.contradiction_checks, receipt_key, %{
+              job
+              | waiters: [{from, reply} | job.waiters]
+            })
+
+          {:noreply, %{next | contradiction_checks: jobs}}
+      end
+    else
+      _ -> {:reply, reply, next}
+    end
+  end
+
+  defp contradiction_reply(_request, _from, reply, _old, next), do: {:reply, reply, next}
+
+  defp start_contradiction(state, receipt_key, {person, _, _} = posted_key, from, reply) do
+    engine = state.store.engine
+    items = AttentionServer.Contradictions.items(engine, person, posted_key)
+    size = state.contradiction_batch_size
+
+    if items == [] or not (is_integer(size) and size > 0) do
+      {:reply, reply, state}
+    else
+      parent = self()
+      token = make_ref()
+
+      deadline =
+        Map.get(state, :last_delivery_commit_at, System.monotonic_time(:millisecond)) + 5_000
+
+      evaluator = state.contradiction_evaluator
+      posted = engine.messages[posted_key].message
+
+      {pid, monitor} =
+        spawn_monitor(fn ->
+          check =
+            AttentionServer.Contradictions.run(
+              posted,
+              items,
+              engine.jev_endpoint,
+              engine.jev_model,
+              size, evaluator: evaluator, deadline: deadline)
+
+          send(parent, {:contradiction_done, receipt_key, token, check})
+        end)
+
+      job = %{token: token, monitor: monitor, pid: pid, waiters: [{from, reply}]}
+
+      {:noreply,
+       %{state | contradiction_checks: Map.put(state.contradiction_checks, receipt_key, job)}}
+    end
+  end
+
+  defp finish_contradiction(state, receipt_key, job, check) do
+    Process.demonitor(job.monitor, [:flush])
+    engine = state.store.engine
+    receipt = engine.receipts[receipt_key]
+
+    check =
+      if is_map(check) and is_list(check["messages"]) do
+        messages =
+          Enum.map(check["messages"], fn message ->
+            case engine.messages[
+                   {elem(receipt_key, 0), message["sender_id"], message["message_id"]}
+                 ] do
+              %{message: current} -> Map.put(message, "title", current["title"])
+              _ -> message
+            end
+          end)
+
+        Map.put(check, "messages", messages)
+      else
+        check
+      end
+
+    fields = put_contradiction(receipt.reply, check)
+
+    changed = %{
+      engine
+      | receipts: Map.put(engine.receipts, receipt_key, %{receipt | reply: fields})
+    }
+
+    {check, state} =
+      case commit(state.store, changed, %{
+             person: elem(receipt_key, 0),
+             actor: elem(receipt_key, 1),
+             action: "contradiction_result",
+             operation_id: elem(receipt_key, 2)
+           }) do
+        {:ok, store} -> {check, %{state | store: store}}
+        _ -> {receipt.reply["possible_contradictions"], state}
+      end
+
+    Enum.each(job.waiters, fn {from, {:ok, line}} ->
+      value =
+        case line do
+          %JSON.StreamedLine{value: value} ->
+            value
+
+          _ ->
+            {:ok, value} = JSON.decode_line(line)
+            value
+        end
+
+      GenServer.reply(from, {:ok, JSON.encode_line(put_contradiction(value, check))})
+    end)
+
+    %{state | contradiction_checks: Map.delete(state.contradiction_checks, receipt_key)}
+  end
+
+  defp put_contradiction(fields, nil), do: Map.delete(fields, "possible_contradictions")
+  defp put_contradiction(fields, check), do: Map.put(fields, "possible_contradictions", check)
 
   defp with_persistence_reads(state, fun) do
     reader = fn committed_store, request, from ->
@@ -3471,6 +3622,13 @@ defmodule AttentionServer.Relay do
     end)
   end
 
+  defp dispatch_info({:contradiction_done, receipt_key, token, check}, state) do
+    case Map.get(state.contradiction_checks, receipt_key) do
+      %{token: ^token} = job -> {:noreply, finish_contradiction(state, receipt_key, job, check)}
+      _ -> {:noreply, state}
+    end
+  end
+
   defp dispatch_info({:socket_write_done, socket, token, result}, state) do
     case Map.get(state.socket_writes, socket) do
       %{token: ^token} = write ->
@@ -3645,6 +3803,11 @@ defmodule AttentionServer.Relay do
           Enum.find(state.priority_jobs, fn {_person, job} -> job.monitor == monitor end)
 
         cond do
+          check = Enum.find(state.contradiction_checks, fn {_, job} -> job.monitor == monitor end) ->
+            {receipt_key, job} = check
+            fallback = state.store.engine.receipts[receipt_key].reply["possible_contradictions"]
+            {:noreply, finish_contradiction(state, receipt_key, job, fallback)}
+
           write = Enum.find(state.socket_writes, fn {_, write} -> write.monitor == monitor end) ->
             {socket, _} = write
             {:noreply, cancel_socket_write(state, socket, {:error, :closed})}
@@ -5580,7 +5743,10 @@ defmodule AttentionServer.Relay do
              )
            ) do
         {:ok, store} ->
-          next_state = %{state | store: store}
+          next_state =
+            state
+            |> Map.put(:store, store)
+            |> Map.put(:last_delivery_commit_at, System.monotonic_time(:millisecond))
 
           next_state =
             case Engine.authorized_person(next_engine, key) do

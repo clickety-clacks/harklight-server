@@ -12,6 +12,27 @@ defmodule AttentionServer.Contradictions do
     "Clear contradiction: the messages require mutually exclusive actions or make directly opposing claims."
   ]
 
+  def items(engine, person, posted_key) do
+    engine.messages
+    |> Enum.flat_map(fn
+      {{^person, sender, message} = key, %{terminal: nil} = record} when key != posted_key ->
+        display = AttentionServer.SenderNames.committed(record, sender)
+
+        [
+          %{
+            identity: {sender, message},
+            message: record.message,
+            accepted_seq: record.accepted_seq,
+            sender_name: if(display, do: display["name"])
+          }
+        ]
+
+      _ ->
+        []
+    end)
+    |> Enum.sort_by(& &1.accepted_seq)
+  end
+
   # No text clipping: a single comparison that cannot fit remains unchecked.
   def compose(posted, items, endpoint, model) do
     cond do
