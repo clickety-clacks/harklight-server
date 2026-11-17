@@ -14,6 +14,12 @@ defmodule AttentionServer.LevelsDeviceAccessTest do
   @rows_c [
     %{"name" => "Later", "lower_bound" => 0, "bounce_after_days" => 3}
   ]
+  @default_rows [
+    %{"name" => "Low", "lower_bound" => 0, "bounce_after_days" => 7},
+    %{"name" => "Normal", "lower_bound" => 0.3, "bounce_after_days" => 3},
+    %{"name" => "High", "lower_bound" => 0.6, "bounce_after_days" => 1},
+    %{"name" => "Urgent", "lower_bound" => 0.8, "bounce_after_days" => 0.5}
+  ]
 
   setup do
     dir =
@@ -94,6 +100,8 @@ defmodule AttentionServer.LevelsDeviceAccessTest do
     decoded
   end
 
+  defp default_levels, do: wire_rows(@default_rows)
+
   test "device reads and whole-table saves are account-scoped, validated and recover receipts after restart",
        %{path: path} do
     relay = start_relay(path)
@@ -109,9 +117,11 @@ defmodule AttentionServer.LevelsDeviceAccessTest do
     op_a = op(1)
     op_b = op(3)
     op_c = op(4)
+    defaults = default_levels()
 
-    assert [] = get_levels(relay, a1, "get-default")
-    assert [] = get_levels(relay, b1, "get-b-default")
+    assert defaults == get_levels(relay, a1, "get-default")
+    assert defaults == get_levels(relay, b1, "get-b-default")
+    assert :sys.get_state(relay).store.engine.bounce_levels == %{}
 
     assert %{
              "type" => "ok",
@@ -122,7 +132,7 @@ defmodule AttentionServer.LevelsDeviceAccessTest do
 
     assert saved_a == wire_rows(@rows_a)
     assert get_levels(relay, a2, "get-a-from-second-device") == saved_a
-    assert [] = get_levels(relay, b1, "get-b-isolated")
+    assert defaults == get_levels(relay, b1, "get-b-isolated")
 
     assert [
              %{
@@ -191,7 +201,7 @@ defmodule AttentionServer.LevelsDeviceAccessTest do
     assert saved_b == wire_rows(@rows_b)
     config_b = :sys.get_state(relay).store.engine.bounce_levels["A"]
     assert get_levels(relay, a1, "latest-table") == saved_b
-    assert [] = get_levels(relay, b1, "other-account-still-default")
+    assert defaults == get_levels(relay, b1, "other-account-still-default")
 
     GenServer.stop(relay)
     restarted = start_relay(path)
@@ -218,7 +228,7 @@ defmodule AttentionServer.LevelsDeviceAccessTest do
              set_levels(restarted, restarted_a1, "same-table-new-operation", op_c, @rows_b)
 
     assert :sys.get_state(restarted).store.engine.bounce_levels["A"] == config_b
-    assert [] = get_levels(restarted, restarted_b1, "b-remains-default")
+    assert defaults == get_levels(restarted, restarted_b1, "b-remains-default")
     assert [] = session_drain(restarted, restarted_a1)
   end
 
@@ -242,7 +252,7 @@ defmodule AttentionServer.LevelsDeviceAccessTest do
              "reason" => "storage_unavailable"
            } = set_levels(relay, session, "commit-fails", operation, @rows_b)
 
-    assert [] = get_levels(relay, session, "failed-save-kept-default")
+    assert default_levels() == get_levels(relay, session, "failed-save-kept-default")
 
     assert :ok = Sqlite3.execute(db, "DROP TRIGGER refuse_levels")
 
@@ -281,9 +291,10 @@ defmodule AttentionServer.LevelsDeviceAccessTest do
     legacy = connected_session(relay, "legacy")
     b1 = connected_session(relay, "b1")
 
-    assert [] = get_levels(relay, a1, "a1-initial")
-    assert [] = get_levels(relay, a2, "a2-initial")
-    assert [] = get_levels(relay, b1, "b1-initial")
+    defaults = default_levels()
+    assert defaults == get_levels(relay, a1, "a1-initial")
+    assert defaults == get_levels(relay, a2, "a2-initial")
+    assert defaults == get_levels(relay, b1, "b1-initial")
     assert {:error, :forbidden} = Relay.dashboard_levels(relay, person_a, "a1")
     assert {:error, :forbidden} = Relay.save_dashboard_levels(relay, person_a, "a1", @rows_a)
 
@@ -350,7 +361,7 @@ defmodule AttentionServer.LevelsDeviceAccessTest do
     assert :ok = Relay.setup_person(relay, "A")
     assert :ok = Relay.setup_device(relay, "A", "a1")
     session = connected_session(relay, "a1")
-    assert [] = get_levels(relay, session, "before-revocation")
+    assert default_levels() == get_levels(relay, session, "before-revocation")
 
     assert :ok = Relay.revoke_device(relay, "a1")
 

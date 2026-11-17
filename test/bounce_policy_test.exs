@@ -25,6 +25,29 @@ defmodule AttentionServer.BouncePolicyTest do
     assert last["name"] == "Urgent"
   end
 
+  test "approved defaults preserve the continuous score ranges and bounce delays" do
+    levels = BouncePolicy.default_levels()
+
+    assert BouncePolicy.public_levels(levels) == [
+             %{"name" => "Low", "lower_bound" => 0, "bounce_after_days" => 7},
+             %{"name" => "Normal", "lower_bound" => 0.3, "bounce_after_days" => 3},
+             %{"name" => "High", "lower_bound" => 0.6, "bounce_after_days" => 1},
+             %{"name" => "Urgent", "lower_bound" => 0.8, "bounce_after_days" => 0.5}
+           ]
+
+    assert {:ok, low} = BouncePolicy.select_level(levels, %DecimalToken{raw: "0.299"})
+    assert low["interval_ms"] == 604_800_000
+
+    assert {:ok, normal} = BouncePolicy.select_level(levels, %DecimalToken{raw: "0.3"})
+    assert normal["interval_ms"] == 259_200_000
+
+    assert {:ok, high} = BouncePolicy.select_level(levels, %DecimalToken{raw: "0.6"})
+    assert high["interval_ms"] == 86_400_000
+
+    assert {:ok, urgent} = BouncePolicy.select_level(levels, %DecimalToken{raw: "0.8"})
+    assert urgent["interval_ms"] == 43_200_000
+  end
+
   test "empty, incomplete, repeated, unordered and out-of-range tables are rejected" do
     base = [
       %{"name" => "Routine", "lower_bound" => 0, "bounce_after_days" => nil},
