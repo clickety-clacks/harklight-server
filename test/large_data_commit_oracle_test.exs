@@ -1,11 +1,16 @@
 defmodule AttentionServer.LargeDataCommitOracleTest do
-  # Real Relay operations (forward, revision, Progress same-ID revision,
-  # withdrawal, large bodies) must leave the store's cached commit base equal
-  # to what the full large-data path computes from the committed engine, and a
-  # failed snapshot write must not advance that cache.
+  # Differential check of the incremental large-data commit path on real Relay
+  # operations: every state the Relay proposes to the store is captured before
+  # any large-data transformation, and the incremental result for that exact
+  # proposed state must equal the full path's result for it. Requested content,
+  # revisions and withdrawal are verified independently of both paths, and a
+  # failed snapshot write that would have changed the reference index must not
+  # advance the cache.
   use ExUnit.Case, async: false
 
   alias AttentionServer.{JSON, LargeData, Relay, Store, TLSFixtures}
+
+  @person "A"
 
   setup_all do
     certs = TLSFixtures.create!()
@@ -17,20 +22,30 @@ defmodule AttentionServer.LargeDataCommitOracleTest do
     dir = Path.join(System.tmp_dir!(), "large-oracle-#{System.unique_integer([:positive])}")
     File.mkdir_p!(dir)
     on_exit(fn -> File.rm_rf!(dir) end)
-    %{path: Path.join(dir, "relay.sqlite3"), certs: certs}
+    path = Path.join(dir, "relay.sqlite3")
+    {relay, key} = start_relay(path, certs)
+
+    :erlang.trace(relay, true, [:call, {:tracer, self()}])
+    :erlang.trace_pattern({Store, :commit, 3}, true, [])
+
+    on_exit(fn -> :erlang.trace_pattern({Store, :commit, 3}, false, []) end)
+    %{path: path, certs: certs, relay: relay, key: key}
+  end
+
+  defp start_existing(path) do
+    start_link_supervised!({Relay, store_path: path, enrollment_fixture_mode: true},
+      id: make_ref(),
+      restart: :temporary
+    )
   end
 
   defp start_relay(path, certs) do
-    relay =
-      start_link_supervised!({Relay, store_path: path, enrollment_fixture_mode: true},
-        id: make_ref(),
-        restart: :temporary
-      )
+    relay = start_existing(path)
 
-    :ok = Relay.setup_person(relay, "A")
+    :ok = Relay.setup_person(relay, @person)
 
     {:ok, key} =
-      Relay.setup_device_certificate(relay, "A", TLSFixtures.certificate_der!(certs, "a1"))
+      Relay.setup_device_certificate(relay, @person, TLSFixtures.certificate_der!(certs, "a1"))
 
     :ok = Relay.setup_sender(relay, key, "app:test")
     {relay, key}
@@ -45,19 +60,6 @@ defmodule AttentionServer.LargeDataCommitOracleTest do
     response
   end
 
-  defp seen,
-    do: %{
-      "schema" => "attention-client.actions/1",
-      "actions" => [
-        %{
-          "id" => "seen",
-          "label" => "Seen",
-          "kind" => "value",
-          "value" => %{"acknowledgment" => "seen"}
-        }
-      ]
-    }
-
   defp fyi(id, title, body, extra \\ %{}) do
     Map.merge(
       %{
@@ -67,7 +69,17 @@ defmodule AttentionServer.LargeDataCommitOracleTest do
         "title" => title,
         "body" => body,
         "message_type" => "fyi",
-        "answer_ui" => seen()
+        "answer_ui" => %{
+          "schema" => "attention-client.actions/1",
+          "actions" => [
+            %{
+              "id" => "seen",
+              "label" => "Seen",
+              "kind" => "value",
+              "value" => %{"acknowledgment" => "seen"}
+            }
+          ]
+        }
       },
       extra
     )
@@ -77,7 +89,7 @@ defmodule AttentionServer.LargeDataCommitOracleTest do
 
   defp progress(percent),
     do: %{
-      "updated_at" => "2026-11-11T10:0#{div(percent, 20)}:00Z",
+      "updated_at" => "2026-11-11T10:00:00Z",
       "percent" => percent,
       "stage" => "coding",
       "note" => "step #{percent}",
@@ -93,24 +105,86 @@ defmodule AttentionServer.LargeDataCommitOracleTest do
       ]
     }
 
-  # The cache must equal the full path applied to the committed engine.
-  defp assert_oracle(relay) do
-    store = :sys.get_state(relay).store
-    assert %Store{large_base: base} = store
-    assert base != nil
-    assert store.engine == base or store.progress_version > 0
-    assert {:ok, durable, []} = LargeData.externalize(base, store.upload_dir)
-    assert durable == base
-    assert store.large_persisted == LargeData.persist_refs(base)
-    assert LargeData.reference_index_rows(store.large_index) ==
-             LargeData.persisted_references(base)
-    assert LargeData.reference_index_ids(store.large_index) == LargeData.refs(base)
-    store
+  defp full(proposed, dir) do
+    {:ok, durable, _created} = LargeData.externalize(proposed, dir)
+    true = LargeData.valid_refs?(durable)
+    {durable, LargeData.persist_refs(durable), LargeData.persisted_references(durable)}
   end
 
-  test "forward, revision, Progress revision, large bodies and withdrawal keep the cache exact",
-       %{path: path, certs: certs} do
-    {relay, key} = start_relay(path, certs)
+  # Every commit proposed since the last call: the incremental result for the
+  # exact proposed state must equal the full path for it.
+  defp assert_commits_equivalent(relay) do
+    committed = :sys.get_state(relay).store
+    calls = drain_commits([])
+    assert calls != []
+
+    for {before, proposed} <- calls, before.db != nil do
+      {full_durable, full_persisted, full_rows} = full(proposed, before.upload_dir)
+
+      if before.large_base do
+        assert {:ok, durable, persisted, index, _created} =
+                 LargeData.commit_incremental(
+                   proposed,
+                   before.large_base,
+                   before.large_persisted,
+                   before.large_index,
+                   before.upload_dir
+                 )
+
+        assert durable == full_durable
+        assert persisted == full_persisted
+        assert LargeData.reference_index_rows(index) == full_rows
+        assert LargeData.reference_index_ids(index) == LargeData.refs(full_durable)
+      end
+    end
+
+    if committed.large_base do
+      {_before, last} = List.last(calls)
+      {full_durable, full_persisted, full_rows} = full(last, committed.upload_dir)
+      assert committed.large_base == full_durable
+      assert committed.large_persisted == full_persisted
+      assert LargeData.reference_index_rows(committed.large_index) == full_rows
+    end
+
+    committed
+  end
+
+  defp drain_commits(acc) do
+    receive do
+      {:trace, _pid, :call, {Store, :commit, [before, proposed, _audit]}} ->
+        drain_commits([{before, proposed} | acc])
+    after
+      0 -> Enum.reverse(acc)
+    end
+  end
+
+  defp record(relay, id),
+    do: Map.fetch!(:sys.get_state(relay).store.engine.messages, {@person, "app:test", id})
+
+  defp body_bytes(%LargeData.Ref{} = ref), do: LargeData.read!(ref)
+  defp body_bytes(body) when is_binary(body), do: body
+
+  defp assert_body(relay, id, expected) do
+    assert body_bytes(record(relay, id).message["body"]) == expected
+  end
+
+  defp db_rows(path) do
+    {:ok, db} = Exqlite.Sqlite3.open(path)
+
+    {:ok, stmt} =
+      Exqlite.Sqlite3.prepare(
+        db,
+        "SELECT path, marker, id, size, sha256 FROM relay_large_data_refs ORDER BY path"
+      )
+
+    {:ok, rows} = Exqlite.Sqlite3.fetch_all(db, stmt)
+    :ok = Exqlite.Sqlite3.release(db, stmt)
+    :ok = Exqlite.Sqlite3.close(db)
+    rows
+  end
+
+  test "real operations: incremental equals the full path on each proposed state",
+       %{relay: relay, key: key} do
     handle = op(9_000)
 
     assert %{"type" => "ok"} =
@@ -121,18 +195,25 @@ defmodule AttentionServer.LargeDataCommitOracleTest do
                "message" => fyi("plain", "Plain", "small body")
              })
 
-    assert_oracle(relay)
+    assert_commits_equivalent(relay)
+    assert_body(relay, "plain", "small body")
+
+    big1 = large(1)
 
     assert %{"type" => "ok"} =
              request(relay, key, %{
                "type" => "forward",
                "op_id" => op(2),
                "session_handle" => handle,
-               "message" => fyi("big", "Big", large(1))
+               "message" => fyi("big", "Big", big1)
              })
 
-    store = assert_oracle(relay)
+    store = assert_commits_equivalent(relay)
     assert map_size(store.large_index) > 0
+    assert_body(relay, "big", big1)
+    assert %LargeData.Ref{} = record(relay, "big").message["body"]
+
+    big2 = large(2)
 
     assert %{"type" => "ok", "revision" => 2} =
              request(relay, key, %{
@@ -141,10 +222,12 @@ defmodule AttentionServer.LargeDataCommitOracleTest do
                "sender_id" => "app:test",
                "message_id" => "big",
                "base_revision" => 1,
-               "message" => fyi("big", "Big, revised", large(2))
+               "message" => fyi("big", "Big, revised", big2)
              })
 
-    assert_oracle(relay)
+    assert_commits_equivalent(relay)
+    assert_body(relay, "big", big2)
+    assert record(relay, "big").message["title"] == "Big, revised"
 
     assert %{"type" => "ok"} =
              request(relay, key, %{
@@ -154,10 +237,12 @@ defmodule AttentionServer.LargeDataCommitOracleTest do
                "message" => fyi("progress", "Progress", large(3), %{"progress" => progress(20)})
              })
 
-    assert_oracle(relay)
+    assert_commits_equivalent(relay)
 
     for {percent, n} <- [{40, 5}, {60, 6}, {80, 7}] do
-      assert %{"type" => "ok"} =
+      body = large(n)
+
+      assert %{"type" => "ok", "revision" => revision} =
                request(relay, key, %{
                  "type" => "conversation_revise",
                  "op_id" => op(n),
@@ -165,10 +250,13 @@ defmodule AttentionServer.LargeDataCommitOracleTest do
                  "message_id" => "progress",
                  "base_revision" => n - 4,
                  "message" =>
-                   fyi("progress", "Progress", large(n), %{"progress" => progress(percent)})
+                   fyi("progress", "Progress", body, %{"progress" => progress(percent)})
                })
 
-      assert_oracle(relay)
+      assert revision == n - 3
+      assert_commits_equivalent(relay)
+      assert_body(relay, "progress", body)
+      assert record(relay, "progress").message["progress"]["percent"] == percent
     end
 
     assert %{"type" => "ok"} =
@@ -179,67 +267,89 @@ defmodule AttentionServer.LargeDataCommitOracleTest do
                "message_id" => "big"
              })
 
-    store = assert_oracle(relay)
-    ids = store.large_index |> LargeData.reference_index_ids() |> Map.keys() |> MapSet.new()
+    store = assert_commits_equivalent(relay)
+    assert %{state: "retracted"} = record(relay, "big").terminal
 
-    on_disk =
-      store.upload_dir
-      |> File.ls!()
-      |> Enum.filter(&Regex.match?(~r/\A[0-9a-f]{64}\z/, &1))
-      |> MapSet.new()
-
-    assert MapSet.subset?(ids, on_disk)
+    for {_id, ref} <- LargeData.reference_index_ids(store.large_index) do
+      assert File.exists?(Path.join(store.upload_dir, ref.id))
+    end
   end
 
-  test "a failed snapshot write leaves the cached base unchanged and a retry commits",
-       %{path: path, certs: certs} do
-    {relay, key} = start_relay(path, certs)
+  test "a failed write that would change the index leaves the cache; a retry commits",
+       %{relay: relay, key: key, path: path} do
+    original = large(9)
 
     assert %{"type" => "ok"} =
              request(relay, key, %{
                "type" => "forward",
                "op_id" => op(1),
                "session_handle" => op(9_001),
-               "message" => fyi("big", "Big", large(9))
+               "message" => fyi("big", "Big", original)
              })
 
-    assert_oracle(relay)
-    GenServer.stop(relay)
+    before = assert_commits_equivalent(relay)
+    assert map_size(before.large_index) > 0
+    {_path, {_row, old_ref}} = Enum.at(Enum.to_list(before.large_index), 0)
+    old_file = Path.join(before.upload_dir, old_ref.id)
+    assert File.exists?(old_file)
 
-    assert {:ok, store} = Store.open(path)
-    # The first commit after open takes the full path and seeds the base.
-    assert store.large_base == nil
-    audit = %{person: "A", actor: "test", action: "oracle"}
-    first = %{store.engine | pending_clock_high_water: store.engine.pending_clock_high_water + 1}
-    assert {:ok, store} = Store.commit(store, first, audit)
-    assert store.large_base == store.engine
-    assert map_size(store.large_index) > 0
+    replacement = large(10)
 
-    # Hold the write lock from another connection so the snapshot write fails.
+    revise = %{
+      "type" => "conversation_revise",
+      "op_id" => op(2),
+      "sender_id" => "app:test",
+      "message_id" => "big",
+      "base_revision" => 1,
+      "message" => fyi("big", "Big, replaced", replacement)
+    }
+
     {:ok, blocker} = Exqlite.Sqlite3.open(path)
     :ok = Exqlite.Sqlite3.execute(blocker, "BEGIN IMMEDIATE")
-    next = %{store.engine | pending_clock_high_water: store.engine.pending_clock_high_water + 1}
 
-    assert {:error, :storage_unavailable, failed} = Store.commit(store, next, audit)
-    assert failed.large_base === store.large_base
-    assert failed.large_persisted === store.large_persisted
-    assert failed.large_index === store.large_index
-    assert failed.engine === store.engine
-    assert failed.version == store.version
+    failed = request(relay, key, revise)
+    refute failed["type"] == "ok"
+
+    # The rejected proposal would have replaced the reference.
+    [{store_before, proposed} | _] = drain_commits([])
+
+    assert {:ok, _durable, _persisted, candidate_index, _created} =
+             LargeData.commit_incremental(
+               proposed,
+               store_before.large_base,
+               store_before.large_persisted,
+               store_before.large_index,
+               store_before.upload_dir
+             )
+
+    assert candidate_index != before.large_index
+
+    after_failure = :sys.get_state(relay).store
+    assert after_failure.large_base === before.large_base
+    assert after_failure.large_persisted === before.large_persisted
+    assert after_failure.large_index === before.large_index
+    assert after_failure.engine === before.engine
+    assert after_failure.version == before.version
+    assert File.exists?(old_file)
+    assert_body(relay, "big", original)
 
     :ok = Exqlite.Sqlite3.execute(blocker, "ROLLBACK")
     :ok = Exqlite.Sqlite3.close(blocker)
 
-    assert {:ok, retried} = Store.commit(failed, next, audit)
-    assert retried.version == store.version + 1
-    assert retried.large_base == next
-    assert retried.large_persisted == LargeData.persist_refs(next)
-    assert LargeData.reference_index_rows(retried.large_index) ==
-             LargeData.persisted_references(next)
-    :ok = Store.close(retried)
+    assert %{"type" => "ok", "revision" => 2} = request(relay, key, revise)
+    retried = assert_commits_equivalent(relay)
+    assert retried.version == before.version + 1
+    assert retried.large_index != before.large_index
+    assert_body(relay, "big", replacement)
 
-    assert {:ok, reopened} = Store.open(path)
-    assert reopened.engine.pending_clock_high_water == next.pending_clock_high_water
-    :ok = Store.close(reopened)
+    assert db_rows(path) == LargeData.reference_index_rows(retried.large_index)
+    retained_ids = LargeData.reference_index_ids(retried.large_index)
+    still_referenced = Map.has_key?(retained_ids, old_ref.id)
+    assert File.exists?(old_file) == still_referenced
+
+    GenServer.stop(relay)
+    relay = start_existing(path)
+    assert_body(relay, "big", replacement)
+    assert record(relay, "big").message["title"] == "Big, replaced"
   end
 end
