@@ -21,7 +21,7 @@ defmodule AttentionServer.WebSocketRelay do
   @storage_unavailable ~s({"v":1,"type":"error","reason":"storage_unavailable"}\n)
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts)
-  def port(server), do: GenServer.call(server, :port)
+  def port(server), do: GenServer.call(server, :port, :infinity)
 
   @doc "Encode one server-to-client text message without masking."
   def encode_text(payload) when is_binary(payload), do: encode_frame(1, payload)

@@ -12,9 +12,9 @@ defmodule AttentionServer.DashboardBrowserSession do
   alias AttentionServer.{Diagnostics, OriginWire, Relay}
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, Keyword.take(opts, [:name]))
-  def redeem(server, token), do: GenServer.call(server, {:redeem, token})
-  def resolve(server, cookie), do: GenServer.call(server, {:resolve, cookie})
-  def end_session(server, cookie), do: GenServer.call(server, {:end_session, cookie})
+  def redeem(server, token), do: GenServer.call(server, {:redeem, token}, :infinity)
+  def resolve(server, cookie), do: GenServer.call(server, {:resolve, cookie}, :infinity)
+  def end_session(server, cookie), do: GenServer.call(server, {:end_session, cookie}, :infinity)
 
   def open_browser_connection(server, cookie, recipient, worker),
     do:
@@ -44,7 +44,7 @@ defmodule AttentionServer.DashboardBrowserSession do
     do: GenServer.call(server, {:close_browser_connection, cookie, session_id}, :infinity)
 
   def browser_file_command(server, cookie, recipient, request) do
-    case GenServer.call(server, {:browser_context, cookie}) do
+    case GenServer.call(server, {:browser_context, cookie}, :infinity) do
       {:ok, %{relay: relay, browser_session_id: browser_session_id}} ->
         OriginWire.browser_command(relay, browser_session_id, recipient, request)
 
@@ -65,7 +65,7 @@ defmodule AttentionServer.DashboardBrowserSession do
       )
 
   def browser_upload_file(server, cookie, recipient, attrs, path, size, sha256, lease) do
-    case GenServer.call(server, {:browser_context, cookie}) do
+    case GenServer.call(server, {:browser_context, cookie}, :infinity) do
       {:ok, %{relay: relay, browser_session_id: browser_session_id}} ->
         Relay.browser_upload_file(
           relay,
@@ -87,7 +87,7 @@ defmodule AttentionServer.DashboardBrowserSession do
     do: GenServer.call(server, {:browser_upload_end, lease}, :infinity)
 
   def browser_fetch_file(server, cookie, upload_id) do
-    case GenServer.call(server, {:browser_context, cookie}) do
+    case GenServer.call(server, {:browser_context, cookie}, :infinity) do
       {:ok,
        %{
          relay: relay,
