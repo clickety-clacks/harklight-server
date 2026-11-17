@@ -452,7 +452,7 @@ defmodule AttentionServer.WebSocketRelayTest do
     assert :ok =
              send_request(device, %{
                request
-               | "batch_id" => "no-comment-adopt-and-refuse",
+               | "batch_id" => "no-comment-new-and-missing",
                  "operations" => [
                    %{operation | "op_id" => op(9202)},
                    %{operation | "op_id" => op(9204), "request_id" => "not-found"},
@@ -466,12 +466,13 @@ defmodule AttentionServer.WebSocketRelayTest do
                  ]
              })
 
-    assert %{"type" => "ok", "results" => [adopted, refused, other]} = reply(device)
-    assert adopted["op_id"] == op(9202)
-    assert adopted["status"] == "committed"
-    assert adopted["result"]["seq"] == 2
-    assert adopted["result"]["duplicate"] == true
-    assert adopted["terminal"] == first["terminal"]
+    assert %{"type" => "ok", "high_water" => 1, "results" => [new_operation, refused, other]} =
+             reply(device)
+
+    # The same principal already committed op(9201); op(9202) is a proven new
+    # operation, not a retry to adopt. The frozen checkpoint remains unchanged.
+    assert new_operation == %{"op_id" => op(9202), "status" => "refused", "reason" => "closed"}
+    refute Map.has_key?(:sys.get_state(relay).store.engine.receipts, {"A", keys["a2"], op(9202)})
     assert refused == %{"op_id" => op(9204), "status" => "refused", "reason" => "not_found"}
     assert other["status"] == "not_committed_at_snapshot"
 
@@ -482,7 +483,7 @@ defmodule AttentionServer.WebSocketRelayTest do
                "snapshot_id" => snapshot_id,
                "high_water" => 1,
                "reconciled_batches" =>
-                 ~w(no-comment-first no-comment-repeat no-comment-adopt-and-refuse),
+                 ~w(no-comment-first no-comment-repeat no-comment-new-and-missing),
                "pending_manifest_complete" => true
              })
 

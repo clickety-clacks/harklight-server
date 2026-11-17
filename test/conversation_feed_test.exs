@@ -1890,9 +1890,10 @@ defmodule AttentionServer.ConversationFeedTest do
     GenServer.stop(restarted)
   end
 
-  test "No comment refuses missing and stale revisions, then accepts the current revision", %{
-    path: path
-  } do
+  test "No comment refuses invalid and future revisions, then accepts an authored older revision",
+       %{
+         path: path
+       } do
     assert {:ok, relay} = Relay.start_link(store_path: path)
     assert :ok = Relay.setup_person(relay, "A")
     assert :ok = Relay.setup_device(relay, "A", "origin")
@@ -1959,7 +1960,7 @@ defmodule AttentionServer.ConversationFeedTest do
              no_comment_request(relay, "reader", %{
                "type" => "answer_no_comment",
                "request_id" => "no-comment-revision",
-               "request_revision" => 1
+               "request_revision" => 3
              })
 
     assert {:ok, %{"entries" => before_terminal}} = Relay.origin_feed(relay, "origin", 0)
@@ -1969,7 +1970,7 @@ defmodule AttentionServer.ConversationFeedTest do
              no_comment_request(relay, "reader", %{
                "type" => "answer_no_comment",
                "request_id" => "no-comment-revision",
-               "request_revision" => 2
+               "request_revision" => 1
              })
 
     assert {:ok, %{"entries" => entries}} = Relay.origin_feed(relay, "origin", 0)
