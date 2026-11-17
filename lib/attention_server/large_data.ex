@@ -60,6 +60,193 @@ defmodule AttentionServer.LargeData do
   end
 
   @doc false
+  # Reference rows of a durable term keyed by their reversed path, each with its
+  # reference: the state `commit_incremental/5` carries between commits.
+  def reference_index(term), do: index_rows(term, [], %{})
+
+  @doc false
+  def reference_index_rows(index) do
+    index
+    |> Map.values()
+    |> Enum.map(fn {row, _ref} -> row end)
+    |> Enum.sort_by(&hd/1)
+  end
+
+  @doc false
+  def reference_index_ids(index), do: Map.new(index, fn {_path, {_row, ref}} -> {ref.id, ref} end)
+
+  @doc """
+  Incremental `externalize/2`, `persist_refs/1` and `persisted_references/1` for
+  `next`, a state derived from `base`, the durable state of the previous commit.
+  `base_persisted` is `persist_refs(base)` and `base_index` is
+  `reference_index(base)`.
+
+  A subterm identical to the corresponding subterm of `base` is already durable,
+  so it is reused with its persisted form and reference rows without walking
+  it. Every other subterm takes the full path. Every retained reference is still
+  checked to be present at its durable size, as the full path does. The result
+  equals the full path's result for the same `next`.
+  """
+  def commit_incremental(next, base, base_persisted, base_index, directory)
+      when is_binary(directory) do
+    case diff(next, base, base_persisted, nil, [], {base_index, []}, directory) do
+      {:ok, durable, persisted, {index, created}} ->
+        if Enum.all?(index, fn {_path, {_row, ref}} ->
+             valid_ref_metadata?(ref) and
+               durable_target_present?(ref, Path.join(directory, ref.id))
+           end) do
+          {:ok, durable, persisted, index, Enum.uniq(created)}
+        else
+          cleanup_created(created)
+          {:error, :storage_unavailable}
+        end
+
+      {:error, reason, created} ->
+        cleanup_created(created)
+        {:error, reason}
+    end
+  end
+
+  defp diff(next, base, base_persisted, _key, _path, acc, _directory) when next === base,
+    do: {:ok, base, base_persisted, acc}
+
+  defp diff(%Ref{} = next, _base, _base_persisted, key, path, acc, directory),
+    do: rewalk(next, key, path, acc, directory)
+
+  defp diff(next, %Ref{}, _base_persisted, key, path, acc, directory),
+    do: rewalk(next, key, path, acc, directory)
+
+  defp diff(next, base, base_persisted, key, path, acc, directory)
+       when is_map(next) and is_map(base) and is_map(base_persisted) do
+    if Map.get(next, :__struct__) == Map.get(base, :__struct__) and
+         Map.get(base, :__struct__) == Map.get(base_persisted, :__struct__) do
+      diff_map(next, base, base_persisted, path, acc, directory)
+    else
+      rewalk(next, key, path, acc, directory)
+    end
+  end
+
+  defp diff(next, _base, _base_persisted, key, path, acc, directory),
+    do: rewalk(next, key, path, acc, directory)
+
+  defp diff_map(next, base, base_persisted, path, acc, directory) do
+    result =
+      next
+      |> Map.to_list()
+      |> Enum.reduce_while({:ok, next, base_persisted, acc}, fn
+        {:__struct__, _module}, ok ->
+          {:cont, ok}
+
+        {key, child}, {:ok, durable, persisted, acc} ->
+          child_path = [{:map, key} | path]
+
+          result =
+            with {:ok, base_child} <- Map.fetch(base, key),
+                 {:ok, persisted_child} <- Map.fetch(base_persisted, key) do
+              diff(child, base_child, persisted_child, key, child_path, acc, directory)
+            else
+              :error -> rewalk(child, key, child_path, acc, directory)
+            end
+
+          case result do
+            {:ok, durable_child, persisted_child, acc} ->
+              durable =
+                if durable_child === child,
+                  do: durable,
+                  else: Map.put(durable, key, durable_child)
+
+              persisted =
+                case Map.fetch(base_persisted, key) do
+                  {:ok, previous} when previous === persisted_child -> persisted
+                  _ -> Map.put(persisted, key, persisted_child)
+                end
+
+              {:cont, {:ok, durable, persisted, acc}}
+
+            error ->
+              {:halt, error}
+          end
+      end)
+
+    with {:ok, durable, persisted, {index, created}} <- result do
+      {persisted, index} =
+        base
+        |> Map.keys()
+        |> Enum.reduce({persisted, index}, fn key, {persisted, index} ->
+          if key != :__struct__ and not Map.has_key?(next, key),
+            do: {Map.delete(persisted, key), drop_index(index, [{:map, key} | path])},
+            else: {persisted, index}
+        end)
+
+      {:ok, durable, persisted, {index, created}}
+    end
+  end
+
+  # Full path for one changed subterm: externalize, persist and index it.
+  defp rewalk(value, key, path, {index, created}, directory) do
+    result =
+      if key in ["body", "answer", "title"] and is_binary(value) and
+           byte_size(value) > @inline_limit do
+        persist(value, directory, created)
+      else
+        transform(value, directory, created)
+      end
+
+    case result do
+      {:ok, durable, created} ->
+        index = index |> drop_index(path) |> then(&index_rows(durable, path, &1))
+        {:ok, durable, walk_refs(durable, &reference_marker/1), {index, created}}
+
+      {:error, reason, created} ->
+        {:error, reason, created}
+
+      {:error, reason} ->
+        {:error, reason, created}
+    end
+  end
+
+  # Remove the rows at or below a reversed path.
+  defp drop_index(index, path) do
+    depth = length(path)
+
+    Map.reject(index, fn {row_path, _row} ->
+      length(row_path) >= depth and Enum.take(row_path, -depth) == path
+    end)
+  end
+
+  defp index_rows(%Ref{} = ref, path, index) do
+    key = path_key(path)
+    Map.put(index, path, {[key, reference_marker(ref), ref.id, ref.size, ref.sha256], ref})
+  end
+
+  defp index_rows(value, path, index) when is_map(value) do
+    fields = if is_struct(value), do: Map.from_struct(value), else: value
+
+    Enum.reduce(fields, index, fn {key, child}, acc ->
+      index_rows(child, [{:map, key} | path], acc)
+    end)
+  end
+
+  defp index_rows(value, path, index) when is_list(value) do
+    value
+    |> Enum.with_index()
+    |> Enum.reduce(index, fn {child, position}, acc ->
+      index_rows(child, [{:list, position} | path], acc)
+    end)
+  end
+
+  defp index_rows(value, path, index) when is_tuple(value) do
+    value
+    |> Tuple.to_list()
+    |> Enum.with_index()
+    |> Enum.reduce(index, fn {child, position}, acc ->
+      index_rows(child, [{:tuple, position} | path], acc)
+    end)
+  end
+
+  defp index_rows(_value, _path, index), do: index
+
+  @doc false
   def attach_paths(term, directory, rows) when is_binary(directory) and is_list(rows) do
     with {:ok, references} <- references_by_path(rows, directory) do
       engine =
@@ -415,7 +602,9 @@ defmodule AttentionServer.LargeData do
       {module, fields} = {value.__struct__, Map.from_struct(value)}
 
       with {:ok, mapped, created} <- transform_map(fields, directory, created) do
-        {:ok, struct(module, mapped), created}
+        if mapped === fields,
+          do: {:ok, value, created},
+          else: {:ok, struct(module, mapped), created}
       else
         {:error, reason, created} -> {:error, reason, created}
         {:error, reason} -> {:error, reason, created}
@@ -425,12 +614,18 @@ defmodule AttentionServer.LargeData do
     end
   end
 
-  defp transform(value, directory, created) when is_list(value),
-    do: transform_list(value, directory, created, [])
+  defp transform(value, directory, created) when is_list(value) do
+    case transform_list(value, directory, created, []) do
+      {:ok, mapped, created} when mapped === value -> {:ok, value, created}
+      other -> other
+    end
+  end
 
   defp transform(value, directory, created) when is_tuple(value) do
-    with {:ok, values, created} <- transform(Tuple.to_list(value), directory, created) do
-      {:ok, List.to_tuple(values), created}
+    list = Tuple.to_list(value)
+
+    with {:ok, values, created} <- transform(list, directory, created) do
+      if values === list, do: {:ok, value, created}, else: {:ok, List.to_tuple(values), created}
     else
       {:error, reason, created} -> {:error, reason, created}
       {:error, reason} -> {:error, reason, created}
@@ -440,7 +635,7 @@ defmodule AttentionServer.LargeData do
   defp transform(value, _directory, created), do: {:ok, value, created}
 
   defp transform_map(map, directory, created) do
-    Enum.reduce_while(map, {:ok, %{}, created}, fn {key, value}, {:ok, mapped, files} ->
+    Enum.reduce_while(map, {:ok, map, created}, fn {key, value}, {:ok, mapped, files} ->
       result =
         if key in ["body", "answer", "title"] and is_binary(value) and
              byte_size(value) > @inline_limit do
@@ -450,6 +645,9 @@ defmodule AttentionServer.LargeData do
         end
 
       case result do
+        {:ok, transformed, next_files} when transformed === value ->
+          {:cont, {:ok, mapped, next_files}}
+
         {:ok, transformed, next_files} ->
           {:cont, {:ok, Map.put(mapped, key, transformed), next_files}}
 
@@ -941,18 +1139,28 @@ defmodule AttentionServer.LargeData do
 
   defp walk_refs(%Ref{} = ref, fun), do: fun.(ref)
 
+  # Copy-on-change: a subterm without references is returned as the same term,
+  # so the result keeps sharing with its input.
   defp walk_refs(value, fun) when is_map(value) do
-    {module, map} =
-      if is_struct(value), do: {value.__struct__, Map.from_struct(value)}, else: {nil, value}
-
-    result = Map.new(map, fn {key, child} -> {key, walk_refs(child, fun)} end)
-    if module, do: struct(module, result), else: result
+    :maps.fold(
+      fn key, child, acc ->
+        mapped = walk_refs(child, fun)
+        if mapped === child, do: acc, else: Map.put(acc, key, mapped)
+      end,
+      value,
+      value
+    )
   end
 
-  defp walk_refs(value, fun) when is_list(value), do: Enum.map(value, &walk_refs(&1, fun))
+  defp walk_refs(value, fun) when is_list(value) do
+    mapped = Enum.map(value, &walk_refs(&1, fun))
+    if mapped === value, do: value, else: mapped
+  end
 
-  defp walk_refs(value, fun) when is_tuple(value),
-    do: value |> Tuple.to_list() |> Enum.map(&walk_refs(&1, fun)) |> List.to_tuple()
+  defp walk_refs(value, fun) when is_tuple(value) do
+    mapped = value |> Tuple.to_list() |> Enum.map(&walk_refs(&1, fun)) |> List.to_tuple()
+    if mapped === value, do: value, else: mapped
+  end
 
   defp walk_refs(value, _fun), do: value
 

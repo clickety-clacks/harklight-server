@@ -26,7 +26,20 @@ defmodule AttentionServer.Store do
 
   @format_version 29
   @inbox_index_chunk_size 20
-  defstruct [:db, :engine, :version, :upload_dir, progress_version: 0, encoding_cache: %{}]
+  # `large_base` is the durable engine of the last snapshot commit (or open),
+  # `large_persisted` its persisted form and `large_index` its large-data
+  # reference rows. A commit reuses them for every unchanged subterm.
+  defstruct [
+    :db,
+    :engine,
+    :version,
+    :upload_dir,
+    :large_base,
+    :large_persisted,
+    :large_index,
+    progress_version: 0,
+    encoding_cache: %{}
+  ]
 
   @progress_fields [:cursors, :conversation_cursors, :conversation_opened]
 
@@ -164,13 +177,19 @@ defmodule AttentionServer.Store do
                      upload_dir: upload_dir
                    }) do
               engine = store.engine
+              persisted = LargeData.persist_refs(engine)
 
               {_payload, cache} =
-                Persistence.run(fn ->
-                  SnapshotEncoding.encode(LargeData.persist_refs(engine), @format_version)
-                end)
+                Persistence.run(fn -> SnapshotEncoding.encode(persisted, @format_version) end)
 
-              {:ok, %{store | encoding_cache: cache}}
+              {:ok,
+               %{
+                 store
+                 | encoding_cache: cache,
+                   large_base: engine,
+                   large_persisted: persisted,
+                   large_index: LargeData.reference_index(engine)
+               }}
             else
               {:error, reason} ->
                 Diagnostics.failure(:server_storage, :store_open, reason, :unavailable)
@@ -1054,22 +1073,49 @@ defmodule AttentionServer.Store do
   end
 
   defp commit_durable(%__MODULE__{db: db, version: version} = store, next, audit) do
-    # The worker needs the generation and connection, not a second copy of the
-    # old engine. The caller keeps its committed snapshot until this returns.
-    generation = %{store | engine: nil}
-    old_refs = LargeData.refs(store.engine)
+    # Large-data preparation runs here, against the previous durable base this
+    # process already holds, so only changed subterms are walked and nothing
+    # large is copied to or from the worker. The worker needs the generation and
+    # connection, not a second copy of the old engine. The caller keeps its
+    # committed snapshot until this returns.
+    generation = %{
+      store
+      | engine: nil,
+        large_base: nil,
+        large_persisted: nil,
+        large_index: nil
+    }
 
-    result = Persistence.run(fn -> persist_snapshot(generation, next, audit, old_refs) end)
+    result =
+      with {:ok, durable_next, persisted, index} <- prepare_large_data(store, next) do
+        old_ids =
+          if store.large_index,
+            do: LargeData.reference_index_ids(store.large_index),
+            else: LargeData.refs(store.engine)
+
+        next_ids = LargeData.reference_index_ids(index)
+        rows = LargeData.reference_index_rows(index)
+
+        case Persistence.run(fn ->
+               persist_snapshot(generation, persisted, rows, audit, old_ids, next_ids)
+             end) do
+          {:ok, cache} -> {:ok, cache, durable_next, persisted, index}
+          error -> error
+        end
+      end
 
     case result do
-      {:ok, cache, durable_next} ->
+      {:ok, cache, durable_next, persisted, index} ->
         {:ok,
          %{
            store
            | engine: durable_next,
              version: version + 1,
              progress_version: 0,
-             encoding_cache: cache
+             encoding_cache: cache,
+             large_base: durable_next,
+             large_persisted: persisted,
+             large_index: index
          }}
 
       error ->
@@ -1086,17 +1132,40 @@ defmodule AttentionServer.Store do
     end
   end
 
+  defp prepare_large_data(%__MODULE__{upload_dir: upload_dir, large_base: base} = store, next)
+       when is_binary(upload_dir) and not is_nil(base) do
+    case LargeData.commit_incremental(
+           next,
+           base,
+           store.large_persisted,
+           store.large_index,
+           upload_dir
+         ) do
+      {:ok, durable_next, persisted, index, _created} -> {:ok, durable_next, persisted, index}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp prepare_large_data(%__MODULE__{upload_dir: upload_dir}, next) do
+    with {:ok, durable_next, _created} <- LargeData.externalize(next, upload_dir),
+         true <- LargeData.valid_refs?(durable_next) do
+      {:ok, durable_next, LargeData.persist_refs(durable_next),
+       LargeData.reference_index(durable_next)}
+    else
+      false -> {:error, :invalid_large_data}
+      error -> error
+    end
+  end
+
   defp persist_snapshot(
          %{db: db, version: version, upload_dir: upload_dir} = store,
-         next,
+         persisted,
+         reference_rows,
          audit,
-         old_refs
+         old_ids,
+         next_ids
        ) do
-    with {:ok, durable_next, _created} <- LargeData.externalize(next, upload_dir),
-         true <- LargeData.valid_refs?(durable_next),
-         persisted = LargeData.persist_refs(durable_next),
-         reference_rows = LargeData.persisted_references(durable_next),
-         {payload, cache} <-
+    with {payload, cache} <-
            SnapshotEncoding.encode(persisted, @format_version, store.encoding_cache),
          checksum = :crypto.hash(:sha256, payload),
          :ok <- Sqlite3.execute(db, "BEGIN IMMEDIATE"),
@@ -1118,7 +1187,7 @@ defmodule AttentionServer.Store do
            ),
          :ok <- Sqlite3.execute(db, "COMMIT") do
       if is_binary(upload_dir) do
-        case LargeData.delete_unreferenced(upload_dir, old_refs, durable_next) do
+        case LargeData.delete_unreferenced(upload_dir, old_ids, next_ids) do
           :ok ->
             :ok
 
@@ -1133,10 +1202,7 @@ defmodule AttentionServer.Store do
         end
       end
 
-      {:ok, cache, durable_next}
-    else
-      false -> {:error, :invalid_large_data}
-      error -> error
+      {:ok, cache}
     end
   end
 
