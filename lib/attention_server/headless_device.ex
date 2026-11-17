@@ -16,7 +16,6 @@ defmodule AttentionServer.HeadlessDevice do
   # or pair a terminal answer with those IDs. Both pieces originate in requests
   # accepted by the server, so allow two protocol-sized requests plus metadata.
   @max_server_frame 2 * @max_server_request_frame + 16_384
-  @timeout 5_000
 
   def read(directory, endpoint) do
     with_session(directory, endpoint, fn socket ->
@@ -136,7 +135,7 @@ defmodule AttentionServer.HeadlessDevice do
     if String.ends_with?(bytes, "\r\n\r\n") do
       {:ok, bytes}
     else
-      case :ssl.recv(socket, 1, @timeout) do
+      case :ssl.recv(socket, 1, :infinity) do
         {:ok, byte} -> read_headers(socket, bytes <> byte)
         other -> other
       end
@@ -319,10 +318,10 @@ defmodule AttentionServer.HeadlessDevice do
   end
 
   defp read_frame(socket) do
-    with {:ok, <<1::1, 0::3, 1::4, 0::1, length::7>>} <- :ssl.recv(socket, 2, @timeout),
+    with {:ok, <<1::1, 0::3, 1::4, 0::1, length::7>>} <- :ssl.recv(socket, 2, :infinity),
          {:ok, size} <- frame_size(socket, length),
          true <- size in 1..@max_server_frame,
-         {:ok, payload} <- :ssl.recv(socket, size, @timeout),
+         {:ok, payload} <- :ssl.recv(socket, size, :infinity),
          {:ok, value} <- JSON.decode_line(payload, @max_server_frame) do
       {:ok, value}
     else
@@ -333,11 +332,11 @@ defmodule AttentionServer.HeadlessDevice do
   defp frame_size(_socket, size) when size < 126, do: {:ok, size}
 
   defp frame_size(socket, 126) do
-    with {:ok, <<size::16>>} <- :ssl.recv(socket, 2, @timeout), do: {:ok, size}
+    with {:ok, <<size::16>>} <- :ssl.recv(socket, 2, :infinity), do: {:ok, size}
   end
 
   defp frame_size(socket, 127) do
-    with {:ok, <<size::64>>} <- :ssl.recv(socket, 8, @timeout), do: {:ok, size}
+    with {:ok, <<size::64>>} <- :ssl.recv(socket, 8, :infinity), do: {:ok, size}
   end
 
   defp saved_operation(directory, semantic) do
