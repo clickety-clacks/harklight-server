@@ -16,7 +16,6 @@ defmodule AttentionServer.Relay do
   @prioritization_debounce_ms 250
   @route_b_default_limit 20
   @route_b_max_limit 100
-  @focus_recent_ms 24 * 60 * 60 * 1_000
   @hosted_test_states ~w(no-devices device-waiting device-enrolled)
   @hosted_test_label "Test account"
   @hosted_test_device "Test device"
@@ -725,8 +724,6 @@ defmodule AttentionServer.Relay do
               held_shows: %{},
               focus_streams: %{},
               focus_streams_by_person: %{},
-              focus_expiry_timers: %{},
-              focus_expiry_generations: %{},
               tls_listeners: %{},
               origin_listener: nil,
               inbox_builds: %{},
@@ -2918,9 +2915,7 @@ defmodule AttentionServer.Relay do
           levels_notice: false
         }
 
-        next =
-          %{state | sessions: Map.put(state.sessions, id, session)}
-          |> set_focus_connected(key, true)
+        next = %{state | sessions: Map.put(state.sessions, id, session)}
 
         {:reply, {:ok, id}, next}
 
@@ -3637,33 +3632,6 @@ defmodule AttentionServer.Relay do
       %{sequence: ^sequence, generation: ^generation, monitor: monitor} = job ->
         Process.demonitor(monitor, [:flush])
         {:noreply, finish_priority_pass(state, person, job, result)}
-
-      _ ->
-        {:noreply, state}
-    end
-  end
-
-  defp dispatch_info({:focus_expire, device_key, generation}, state) do
-    case Map.get(state.focus_expiry_generations, device_key) do
-      ^generation ->
-        state = %{state | focus_expiry_timers: Map.delete(state.focus_expiry_timers, device_key)}
-
-        case Map.get(state.focus_clients, device_key) do
-          %{connected: false, last_disconnected_at: disconnected_at} = focus
-          when is_integer(disconnected_at) ->
-            if state.clock.() - disconnected_at >= @focus_recent_ms do
-              person =
-                Map.get(focus, :person) || person_for_device(state.store.engine, device_key)
-
-              next = delete_focus_client(state, device_key)
-              {:noreply, if(person, do: notify_focus_streams(next, person), else: next)}
-            else
-              {:noreply, state}
-            end
-
-          _ ->
-            {:noreply, state}
-        end
 
       _ ->
         {:noreply, state}
@@ -7221,19 +7189,16 @@ defmodule AttentionServer.Relay do
     focus_list(
       state.store.engine,
       Map.take(state.focus_clients, client_keys),
-      person,
-      state.clock.()
+      person
     )
   end
 
-  defp focus_list(engine, focus_clients, person, now) do
+  defp focus_list(engine, focus_clients, person) do
     focus_clients
     |> Enum.filter(fn {key, focus} ->
       case Map.get(engine.devices, key) do
         %{person: ^person, revoked: false} ->
-          focus.connected or
-            (is_integer(focus.last_disconnected_at) and
-               now - focus.last_disconnected_at < @focus_recent_ms)
+          focus.connected
 
         _ ->
           false
@@ -7292,74 +7257,16 @@ defmodule AttentionServer.Relay do
     state
   end
 
-  defp set_focus_connected(state, device_key, true) do
-    case Map.get(state.focus_clients, device_key) do
-      nil ->
-        state
-
-      focus ->
-        next =
-          state
-          |> cancel_focus_expiry(device_key)
-          |> then(fn current ->
-            updated = %{focus | connected: true}
-            put_focus_client(current, device_key, updated)
-          end)
-
-        person = Map.get(focus, :person) || person_for_device(state.store.engine, device_key)
-        if person, do: notify_focus_change(state, next, person), else: next
-    end
-  end
-
-  defp set_focus_connected(state, device_key, false) do
-    case Map.get(state.focus_clients, device_key) do
-      nil ->
-        state
-
-      %{connected: false} ->
-        state
-
-      focus ->
-        disconnected_at = state.clock.()
-        updated = %{focus | connected: false, last_disconnected_at: disconnected_at}
-
-        next =
-          put_focus_client(state, device_key, updated)
-          |> schedule_focus_expiry(device_key, disconnected_at)
-
-        person = Map.get(focus, :person) || person_for_device(state.store.engine, device_key)
-        if person, do: notify_focus_change(state, next, person), else: next
-    end
+  defp end_focus(state, device_key) do
+    person = person_for_device(state.store.engine, device_key)
+    next = delete_focus_client(state, device_key)
+    if person, do: notify_focus_change(state, next, person), else: next
   end
 
   defp person_for_device(engine, device_key) do
     case Map.get(engine.devices, device_key) do
       %{person: person} -> person
       _ -> nil
-    end
-  end
-
-  defp schedule_focus_expiry(state, device_key, disconnected_at) do
-    state = cancel_focus_expiry(state, device_key)
-    generation = Map.get(state.focus_expiry_generations, device_key, 0) + 1
-    delay = max(disconnected_at + @focus_recent_ms - state.clock.(), 0)
-    timer = Process.send_after(self(), {:focus_expire, device_key, generation}, delay)
-
-    %{
-      state
-      | focus_expiry_timers: Map.put(state.focus_expiry_timers, device_key, timer),
-        focus_expiry_generations: Map.put(state.focus_expiry_generations, device_key, generation)
-    }
-  end
-
-  defp cancel_focus_expiry(state, device_key) do
-    case Map.pop(state.focus_expiry_timers, device_key) do
-      {nil, _} ->
-        state
-
-      {timer, timers} ->
-        Process.cancel_timer(timer)
-        %{state | focus_expiry_timers: timers}
     end
   end
 
@@ -7466,7 +7373,6 @@ defmodule AttentionServer.Relay do
           _ -> person_for_device(state.store.engine, device_key)
         end
 
-    state = cancel_focus_expiry(state, device_key)
     next = state |> delete_focus_client(device_key)
     next = %{next | held_shows: Map.delete(next.held_shows, device_key)}
     next = close_focus_streams(next, device_key)
@@ -7478,6 +7384,14 @@ defmodule AttentionServer.Relay do
     case envelope_error(frame) || focus_report_error(frame) do
       {reason, field} ->
         {{:ok, [error_line(frame, reason, field)]}, state}
+
+      nil when :erlang.map_get("screen", frame) == "signed_out" ->
+        next =
+          state
+          |> end_focus(session.key)
+          |> put_session(id, %{session | focus_opted_in: false})
+
+        {{:ok, [ok_line(frame, %{})]}, next}
 
       nil ->
         now = state.clock.()
@@ -7498,10 +7412,6 @@ defmodule AttentionServer.Relay do
           reported
           |> Map.new(fn {name, value} -> {String.to_atom(name), value} end)
           |> Map.put(:reported_at, reported_at)
-          |> Map.put(
-            :last_disconnected_at,
-            Map.get(existing || %{}, :last_disconnected_at)
-          )
           |> Map.put(:person, person)
           |> Map.put(:connected, true)
 
@@ -7509,7 +7419,6 @@ defmodule AttentionServer.Relay do
           state
           |> put_focus_client(key, focus)
           |> put_session(id, %{session | focus_opted_in: true})
-          |> cancel_focus_expiry(key)
 
         next = if person, do: notify_focus_change(state, next, person), else: next
 
@@ -7711,7 +7620,7 @@ defmodule AttentionServer.Relay do
           saved = %{connection_id: nil, session: %{session | owner: nil}}
           %{state | browser_recipients: Map.put(state.browser_recipients, recipient_ref, saved)}
         else
-          set_focus_connected(state, session.key, false)
+          end_focus(state, session.key)
         end
     end
   end

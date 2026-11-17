@@ -3,7 +3,7 @@ defmodule AttentionServer.FocusRelayTest do
 
   alias AttentionServer.{DeviceIdentity, JSON, Relay, TLSFixtures}
 
-  test "background and reconnect reports keep the last foreground rank and default target" do
+  test "background reports within a session keep the last foreground rank and default target" do
     certs = TLSFixtures.create!()
     on_exit(fn -> File.rm_rf!(certs) end)
 
@@ -58,9 +58,6 @@ defmodule AttentionServer.FocusRelayTest do
     {:ok, tablet_session} = Relay.open_session(relay, tablet)
     report(relay, tablet_session, "tablet-front", "inbox")
 
-    :atomics.put(clock, 1, 1_100)
-    :ok = Relay.close_session(relay, tablet_session)
-
     :atomics.put(clock, 1, 2_000)
     {:ok, phone_session} = Relay.open_session(relay, phone)
 
@@ -71,8 +68,7 @@ defmodule AttentionServer.FocusRelayTest do
     })
 
     :atomics.put(clock, 1, 3_000)
-    {:ok, tablet_reconnected} = Relay.open_session(relay, tablet)
-    report(relay, tablet_reconnected, "tablet-background", "not_in_front")
+    report(relay, tablet_session, "tablet-background", "not_in_front")
 
     :atomics.put(clock, 1, 4_000)
     report(relay, phone_session, "phone-background", "not_in_front")
@@ -101,140 +97,85 @@ defmodule AttentionServer.FocusRelayTest do
              })
   end
 
-  test "quiet window starts and restarts at each disconnect, even after days connected" do
-    certs = TLSFixtures.create!()
-    on_exit(fn -> File.rm_rf!(certs) end)
-
-    dir =
-      Path.join(System.tmp_dir!(), "harklight-focus-quiet-#{System.unique_integer([:positive])}")
-
-    File.mkdir_p!(dir)
-    on_exit(fn -> File.rm_rf!(dir) end)
-
+  test "focus lasts beyond a day, changes per device, and ends immediately with its session" do
     clock = :atomics.new(1, [])
     :atomics.put(clock, 1, 1_000)
-    clock_fn = fn -> :atomics.get(clock, 1) end
 
-    {:ok, relay} = Relay.start_link(store_path: Path.join(dir, "relay.sqlite3"), clock: clock_fn)
-    on_exit(fn -> if Process.alive?(relay), do: GenServer.stop(relay) end)
+    {relay, person, client, agent, session} =
+      focus_cleanup_case("lifetime", clock: fn -> :atomics.get(clock, 1) end)
 
-    owner_certificate = TLSFixtures.certificate_der!(certs, "a1")
-    {:ok, person} = Relay.operator_bootstrap(relay, owner_certificate)
-    {:ok, owner_key} = DeviceIdentity.from_certificate(owner_certificate)
+    other = String.duplicate("a", 64)
+    :ok = Relay.setup_device(relay, person, other)
+    {:ok, other_session} = Relay.open_session(relay, other)
+    report(relay, other_session, "other-front", "settings")
 
-    client_certificate = TLSFixtures.certificate_der!(certs, "a2")
-    {:ok, client} = Relay.setup_device_certificate(relay, person, client_certificate)
-    agent = String.duplicate("d", 64)
-    :ok = Relay.setup_device(relay, person, agent)
-    :ok = Relay.setup_sender(relay, client, "app:test")
-    :ok = Relay.save_dashboard_focus_permission(relay, person, owner_key, agent, :see, true)
-    :ok = Relay.save_dashboard_focus_permission(relay, person, owner_key, agent, :push, true)
+    :atomics.put(clock, 1, 1_000 + 3 * 24 * 60 * 60 * 1_000)
+    assert {:ok, %{"clients" => clients}} = Relay.focus_get(relay, agent)
+    assert Enum.find(clients, &(&1["client_id"] == client))["screen"] == "message"
+    assert Enum.all?(clients, & &1["connected"])
+    assert Enum.all?(clients, &(&1["reported_at"] == 1_000))
 
-    assert {:ok, message_line} =
-             Relay.request_line(
-               relay,
-               client,
-               JSON.encode!(%{
-                 "v" => 1,
-                 "type" => "forward",
-                 "op_id" => "00000000-0000-4000-8000-000000000961",
-                 "message" => %{
-                   "sender_id" => "app:test",
-                   "message_id" => "quiet-window-item",
-                   "created_at" => 1,
-                   "title" => "Quiet window item"
-                 }
-               }) <> "\n"
-             )
+    report(relay, session, "changed-focus", "inbox")
+    assert {:ok, %{"clients" => clients}} = Relay.focus_get(relay, agent)
+    assert Enum.find(clients, &(&1["client_id"] == client))["screen"] == "inbox"
+    assert Enum.find(clients, &(&1["client_id"] == other))["screen"] == "settings"
 
-    assert {:ok, %{"type" => "ok"}} = JSON.decode_line(message_line <> "\n")
-
-    {:ok, session} = Relay.open_session(relay, client)
-    report(relay, session, "quiet-first", "inbox")
-
-    quiet_window = 24 * 60 * 60 * 1_000
-    three_days = 3 * quiet_window
-    twenty_three_hours = 23 * 60 * 60 * 1_000
-    twenty_five_hours = 25 * 60 * 60 * 1_000
-
-    :atomics.put(clock, 1, 1_000 + three_days)
-    assert {:ok, %{"clients" => [connected]}} = Relay.focus_get(relay, agent)
-    assert connected["client_id"] == client
-    assert connected["connected"]
-    assert connected["reported_at"] == 1_000
-
+    assert {:ok, _} = Relay.focus_stream_attach(relay, agent, self())
     :ok = Relay.close_session(relay, session)
-    first_disconnect = :atomics.get(clock, 1)
+    assert_receive {:focus_change, %{"clients" => [%{"client_id" => ^other}]}}, 1_000
+    assert {:ok, %{"clients" => [%{"client_id" => ^other}]}} = Relay.focus_get(relay, agent)
 
-    :atomics.put(clock, 1, first_disconnect + twenty_three_hours)
-    assert {:ok, %{"clients" => [disconnected]}} = Relay.focus_get(relay, agent)
-    assert disconnected["client_id"] == client
-    refute disconnected["connected"]
-    assert disconnected["reported_at"] == 1_000
-
-    assert {:ok, %{"client_id" => ^client, "delivery" => "held"}} =
+    assert {:error, {:not_found, "target_client"}} =
              Relay.view_show(relay, agent, %{
                "sender_id" => "app:test",
-               "message_id" => "quiet-window-item",
+               "message_id" => "cleanup-item",
                "target" => "message",
                "target_client" => client
              })
 
-    :atomics.put(clock, 1, first_disconnect + twenty_five_hours)
+    {:ok, replacement} = Relay.open_session(relay, client)
+    assert {:ok, %{"clients" => [%{"client_id" => ^other}]}} = Relay.focus_get(relay, agent)
+
+    report(relay, replacement, "new-session-focus", "chat", %{
+      "sender_id" => "app:test",
+      "message_id" => "cleanup-item"
+    })
+
+    assert {:ok, %{"clients" => clients}} = Relay.focus_get(relay, agent)
+    assert Enum.find(clients, &(&1["client_id"] == client))["screen"] == "chat"
+
+    # Replacing the session ends its focus; a late close of the fenced session
+    # must not clear a fresh report from its replacement.
+    {:ok, latest} = Relay.open_session(relay, client)
+    assert {:ok, %{"clients" => [%{"client_id" => ^other}]}} = Relay.focus_get(relay, agent)
+    report(relay, latest, "latest-session", "settings")
+    :ok = Relay.close_session(relay, replacement)
+    assert {:ok, %{"clients" => clients}} = Relay.focus_get(relay, agent)
+    assert Enum.find(clients, &(&1["client_id"] == client))["screen"] == "settings"
+
+    report(relay, latest, "signed-out", "signed_out")
+    assert {:ok, %{"clients" => [%{"client_id" => ^other}]}} = Relay.focus_get(relay, agent)
+    refute :sys.get_state(relay).sessions[latest].focus_opted_in
+    :ok = Relay.focus_stream_detach(relay, agent, self())
+  end
+
+  test "listener disconnect clears only that device focus" do
+    {relay, _person, client, agent, _session} = focus_cleanup_case("disconnect")
+    :ok = Relay.register_tls_listener(relay, self())
+    {:ok, connected} = Relay.open_tls_session(relay, client, nil, self())
+    report(relay, connected, "listener-front", "inbox")
+    assert {:ok, [%{"client_id" => ^client}]} = Relay.focus_stream_attach(relay, agent, self())
+
+    :ok = Relay.unregister_tls_listener(relay, self())
+    assert_receive {:focus_change, %{"clients" => []}}, 1_000
     assert {:ok, %{"clients" => []}} = Relay.focus_get(relay, agent)
-
-    state = :sys.get_state(relay)
-    send(relay, {:focus_expire, client, state.focus_expiry_generations[client]})
-    assert {:ok, %{"clients" => []}} = Relay.focus_get(relay, agent)
-    refute Map.has_key?(:sys.get_state(relay).focus_clients, client)
-
-    {:ok, reconnected} = Relay.open_session(relay, client)
-
-    reconnected_report = %{
-      "v" => 1,
-      "type" => "focus_report",
-      "ref" => "quiet-reconnect",
-      "screen" => "inbox"
-    }
-
-    assert {:ok, lines} =
-             Relay.session_request_line(
-               relay,
-               reconnected,
-               JSON.encode!(reconnected_report) <> "\n"
-             )
-
-    assert [
-             %{"type" => "ok", "ref" => "quiet-reconnect"},
-             %{
-               "type" => "view_show",
-               "message_id" => "quiet-window-item",
-               "held_ms" => held_ms
-             }
-           ] =
-             Enum.map(lines, fn line ->
-               {:ok, frame} = JSON.decode_line(line)
-               frame
-             end)
-
-    assert held_ms == 2 * 60 * 60 * 1_000
-    assert {:ok, %{"clients" => [reconnected_focus]}} = Relay.focus_get(relay, agent)
-    assert reconnected_focus["connected"]
-    assert reconnected_focus["reported_at"] == first_disconnect + twenty_five_hours
-
-    :ok = Relay.close_session(relay, reconnected)
-    second_disconnect = :atomics.get(clock, 1)
-    :atomics.put(clock, 1, second_disconnect + twenty_three_hours)
-    assert {:ok, %{"clients" => [_]}} = Relay.focus_get(relay, agent)
-    :atomics.put(clock, 1, second_disconnect + twenty_five_hours)
-    state = :sys.get_state(relay)
-    send(relay, {:focus_expire, client, state.focus_expiry_generations[client]})
-    assert {:ok, %{"clients" => []}} = Relay.focus_get(relay, agent)
+    assert {:error, :unknown_session} = Relay.session_request_line(relay, connected, "{}\n")
+    :ok = Relay.focus_stream_detach(relay, agent, self())
   end
 
   test "self-removal and local revocation clear held focus and notify subscribers" do
     for action <- [:remove, :revoke] do
-      {relay, person, client, agent} = focus_cleanup_case(Atom.to_string(action))
+      {relay, person, client, agent, _session} = focus_cleanup_case(Atom.to_string(action))
 
       assert {:ok, [%{"client_id" => ^client}]} = Relay.focus_stream_attach(relay, agent, self())
 
@@ -248,7 +189,6 @@ defmodule AttentionServer.FocusRelayTest do
 
       before = :sys.get_state(relay)
       assert Map.has_key?(before.held_shows, client)
-      assert Map.has_key?(before.focus_expiry_timers, client)
       assert MapSet.member?(before.focus_clients_by_person[person], client)
       assert MapSet.member?(before.focus_streams_by_person[person], self())
 
@@ -262,7 +202,6 @@ defmodule AttentionServer.FocusRelayTest do
       after_cleanup = :sys.get_state(relay)
       refute Map.has_key?(after_cleanup.focus_clients, client)
       refute Map.has_key?(after_cleanup.held_shows, client)
-      refute Map.has_key?(after_cleanup.focus_expiry_timers, client)
       refute Map.has_key?(after_cleanup.focus_clients_by_person, person)
       assert MapSet.member?(after_cleanup.focus_streams_by_person[person], self())
 
@@ -270,7 +209,7 @@ defmodule AttentionServer.FocusRelayTest do
     end
   end
 
-  defp focus_cleanup_case(suffix) do
+  defp focus_cleanup_case(suffix, opts \\ []) do
     certs = TLSFixtures.create!()
     on_exit(fn -> File.rm_rf!(certs) end)
 
@@ -283,7 +222,9 @@ defmodule AttentionServer.FocusRelayTest do
     File.mkdir_p!(dir)
     on_exit(fn -> File.rm_rf!(dir) end)
 
-    {:ok, relay} = Relay.start_link(store_path: Path.join(dir, "relay.sqlite3"))
+    {:ok, relay} =
+      Relay.start_link(Keyword.put(opts, :store_path, Path.join(dir, "relay.sqlite3")))
+
     on_exit(fn -> if Process.alive?(relay), do: GenServer.stop(relay) end)
 
     owner_certificate = TLSFixtures.certificate_der!(certs, "a1")
@@ -324,9 +265,7 @@ defmodule AttentionServer.FocusRelayTest do
       "message_id" => "cleanup-item"
     })
 
-    :ok = Relay.close_session(relay, session)
-
-    {relay, person, client, agent}
+    {relay, person, client, agent, session}
   end
 
   defp report(relay, session, ref, screen, fields \\ %{}) do
