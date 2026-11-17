@@ -1426,7 +1426,7 @@ defmodule AttentionServer.Relay do
 
   defp dispatch_call({:origin_support, key, declaration}, _from, state) do
     case Engine.origin_support(state.store.engine, key, declaration) do
-      {:ok, next, reply} when next == state.store.engine ->
+      {:ok, next, %{"duplicate" => true} = reply} when next == state.store.engine ->
         {:reply, {:ok, reply}, state}
 
       {:ok, next, reply} ->
@@ -1436,23 +1436,31 @@ defmodule AttentionServer.Relay do
         listening? = origin_listening?(state, next, {person, key, handle})
         {:ok, current} = Engine.origin_status(next, key, handle, listening?)
 
+        # An unchanged declaration (the engine came back as it was) repeats what
+        # the session's open requests already record: append no availability
+        # event and commit nothing. A changed declaration records it as before.
         next =
-          Engine.origin_availability(
-            next,
-            person,
-            key,
-            handle,
-            current["availability"],
-            current["last_detached_at"]
-          )
+          if next == old_engine,
+            do: next,
+            else:
+              Engine.origin_availability(
+                next,
+                person,
+                key,
+                handle,
+                current["availability"],
+                current["last_detached_at"]
+              )
 
         session_key = {person, key, handle}
 
-        case Store.commit(
-               state.store,
-               next,
-               audit(old_engine, key, "origin_support")
-             ) do
+        # An unchanged declaration leaves the engine as it is: nothing to commit.
+        committed =
+          if next == old_engine,
+            do: {:ok, state.store},
+            else: Store.commit(state.store, next, audit(old_engine, key, "origin_support"))
+
+        case committed do
           {:ok, store} ->
             store = %{
               store
@@ -1478,15 +1486,23 @@ defmodule AttentionServer.Relay do
 
   defp dispatch_call({:origin_attachment_update, key, declaration}, _from, state) do
     case Engine.origin_attachment_update(state.store.engine, key, declaration) do
-      {:ok, next, reply} when next == state.store.engine ->
-        {:reply, {:ok, reply}, state}
-
       {:ok, next, reply} ->
         {:ok, person} = Engine.authorized_person(next, key)
         proposed = %{state | store: %{state.store | engine: next}}
         next = origin_availability_changes(state, proposed, person, key)
 
-        case commit(state.store, next, audit(state.store.engine, key, "origin_attachment_update")) do
+        # A duplicate or unchanged declaration leaves the engine as it is.
+        committed =
+          if next == state.store.engine,
+            do: {:ok, state.store},
+            else:
+              commit(
+                state.store,
+                next,
+                audit(state.store.engine, key, "origin_attachment_update")
+              )
+
+        case committed do
           {:ok, store} ->
             updated =
               %{state | store: store}
