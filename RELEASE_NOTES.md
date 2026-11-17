@@ -1,3 +1,15 @@
+# Unreleased
+
+## Changes
+
+- Jev send results can report possibly contradictory open messages to the
+  posting agent, with sender identities and a reconciliation warning. Delivery
+  and push commit before checking; the result waits at most five seconds and
+  reports incomplete comparisons explicitly. Baseline sends and revisions do
+  not run a check. Batch size remains unset pending synthetic Jev measurement.
+
+---
+
 # Harklight Server v0.1.44
 
 **Install this instead of v0.1.43.** In v0.1.43, revising a message whose body
@@ -40,12 +52,6 @@ assume success or a recovery time.
 # Harklight Server v0.1.43
 
 ## Changes
-
-- Jev send results can report possibly contradictory open messages to the
-  posting agent, with sender identities and a reconciliation warning. Delivery
-  and push commit before checking; the result waits at most five seconds and
-  reports incomplete comparisons explicitly. Baseline sends and revisions do
-  not run a check. Batch size remains unset pending synthetic Jev measurement.
 
 - Includes the reviewed self-hosted web bundle. It is packaged with the Server;
   installation does not fetch it from the web project.
