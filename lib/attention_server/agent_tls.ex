@@ -14,7 +14,7 @@ defmodule AttentionServer.AgentTLS do
   @max_line 2_400_000
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts)
-  def port(server), do: GenServer.call(server, :port)
+  def port(server), do: GenServer.call(server, :port, :infinity)
 
   @impl true
   def init(opts) do

@@ -52,47 +52,56 @@ defmodule AttentionServer.Relay do
     GenServer.start_link(__MODULE__, opts, Keyword.take(opts, [:name]))
   end
 
-  def setup_person(server, person), do: GenServer.call(server, {:setup_person, person})
-  def setup_device(server, person, key), do: GenServer.call(server, {:setup_device, person, key})
+  def setup_person(server, person), do: GenServer.call(server, {:setup_person, person}, :infinity)
+
+  def setup_device(server, person, key),
+    do: GenServer.call(server, {:setup_device, person, key}, :infinity)
 
   @doc "Local-operator bootstrap from a public owner certificate; no network caller uses this API."
   def operator_bootstrap(server, certificate_der) do
     with {:ok, key} <- DeviceIdentity.from_certificate(certificate_der),
-         do: GenServer.call(server, {:operator_bootstrap, key})
+         do: GenServer.call(server, {:operator_bootstrap, key}, :infinity)
   end
 
   @doc "Local-operator owner recovery retains the person and retires the old owner key."
   def operator_recover(server, person, certificate_der) do
     with {:ok, key} <- DeviceIdentity.from_certificate(certificate_der),
-         do: GenServer.call(server, {:operator_recover, person, key})
+         do: GenServer.call(server, {:operator_recover, person, key}, :infinity)
   end
 
   def owner_revision(server, person, verified_owner_key),
-    do: GenServer.call(server, {:owner_revision, person, verified_owner_key})
+    do: GenServer.call(server, {:owner_revision, person, verified_owner_key}, :infinity)
 
   @doc "Read device metadata under current owner authority; only a configured self-host owner can see all persons."
   def dashboard_inventory(server, person, owner_key, configured_owner_person),
-    do: GenServer.call(server, {:dashboard_inventory, person, owner_key, configured_owner_person})
+    do:
+      GenServer.call(
+        server,
+        {:dashboard_inventory, person, owner_key, configured_owner_person},
+        :infinity
+      )
 
   def save_dashboard_focus_permission(server, person, owner_key, device_key, permission, enabled),
     do:
       GenServer.call(
         server,
-        {:save_dashboard_focus_permission, person, owner_key, device_key, permission, enabled}
+        {:save_dashboard_focus_permission, person, owner_key, device_key, permission, enabled},
+        :infinity
       )
 
   def dashboard_prioritization(server, person, owner_key, configured_owner_person),
     do:
       GenServer.call(
         server,
-        {:dashboard_prioritization, person, owner_key, configured_owner_person}
+        {:dashboard_prioritization, person, owner_key, configured_owner_person},
+        :infinity
       )
 
   def dashboard_levels(server, person, owner_key),
-    do: GenServer.call(server, {:dashboard_levels, person, owner_key})
+    do: GenServer.call(server, {:dashboard_levels, person, owner_key}, :infinity)
 
   def save_dashboard_levels(server, person, owner_key, levels),
-    do: GenServer.call(server, {:save_dashboard_levels, person, owner_key, levels})
+    do: GenServer.call(server, {:save_dashboard_levels, person, owner_key, levels}, :infinity)
 
   def save_dashboard_prioritization(
         server,
@@ -107,81 +116,104 @@ defmodule AttentionServer.Relay do
         GenServer.call(
           server,
           {:save_dashboard_prioritization, person, owner_key, configured_owner_person, algorithm,
-           endpoint, model}
+           endpoint, model},
+          :infinity
         )
 
   def owner_identity(server, verified_owner_key),
-    do: GenServer.call(server, {:owner_identity, verified_owner_key})
+    do: GenServer.call(server, {:owner_identity, verified_owner_key}, :infinity)
 
   def agent_identity(server, verified_agent_key),
-    do: GenServer.call(server, {:agent_identity, verified_agent_key})
+    do: GenServer.call(server, {:agent_identity, verified_agent_key}, :infinity)
 
   @doc "Read the current device origin's conversation feed without advancing its cursor."
   def origin_feed(server, verified_device_key, since),
-    do: GenServer.call(server, {:origin_feed, verified_device_key, since})
+    do: GenServer.call(server, {:origin_feed, verified_device_key, since}, :infinity)
 
   @doc "Read one current-origin message without recording delivery, acknowledgment, or operation state."
   def origin_message_get(server, verified_device_key, sender_id, message_id, request_revision),
     do:
       GenServer.call(
         server,
-        {:origin_message_get, verified_device_key, sender_id, message_id, request_revision}
+        {:origin_message_get, verified_device_key, sender_id, message_id, request_revision},
+        :infinity
       )
 
   def focus_get(server, verified_agent_key),
-    do: GenServer.call(server, {:focus_get, verified_agent_key})
+    do: GenServer.call(server, {:focus_get, verified_agent_key}, :infinity)
 
   def view_show(server, verified_agent_key, request),
-    do: GenServer.call(server, {:view_show, verified_agent_key, request})
+    do: GenServer.call(server, {:view_show, verified_agent_key, request}, :infinity)
 
   def focus_stream_attach(server, verified_agent_key, worker),
-    do: GenServer.call(server, {:focus_stream_attach, verified_agent_key, worker})
+    do: GenServer.call(server, {:focus_stream_attach, verified_agent_key, worker}, :infinity)
 
   def focus_stream_detach(server, verified_agent_key, worker),
-    do: GenServer.call(server, {:focus_stream_detach, verified_agent_key, worker})
+    do: GenServer.call(server, {:focus_stream_detach, verified_agent_key, worker}, :infinity)
 
   def origin_advisory_feed(server, verified_device_key, handle, since),
-    do: GenServer.call(server, {:origin_advisory_feed, verified_device_key, handle, since})
+    do:
+      GenServer.call(
+        server,
+        {:origin_advisory_feed, verified_device_key, handle, since},
+        :infinity
+      )
 
   def origin_advisory_ack(server, verified_device_key, handle, advisory_id),
-    do: GenServer.call(server, {:origin_advisory_ack, verified_device_key, handle, advisory_id})
+    do:
+      GenServer.call(
+        server,
+        {:origin_advisory_ack, verified_device_key, handle, advisory_id},
+        :infinity
+      )
 
   @doc "Record one originating-session delivery receipt, separately from relay ACK."
   def origin_ack(server, verified_device_key, feed_seq, reports \\ nil),
-    do: GenServer.call(server, {:origin_ack, verified_device_key, feed_seq, reports})
+    do: GenServer.call(server, {:origin_ack, verified_device_key, feed_seq, reports}, :infinity)
 
   def origin_file_use(server, verified_device_key, feed_seq, name, outcome, op_id),
     do:
       GenServer.call(
         server,
-        {:origin_file_use, verified_device_key, feed_seq, name, outcome, op_id}
+        {:origin_file_use, verified_device_key, feed_seq, name, outcome, op_id},
+        :infinity
       )
 
   def origin_status(server, verified_device_key, handle),
-    do: GenServer.call(server, {:origin_status, verified_device_key, handle})
+    do: GenServer.call(server, {:origin_status, verified_device_key, handle}, :infinity)
 
   def origin_ack2(server, verified_device_key, feed_seq, declaration),
-    do: GenServer.call(server, {:origin_ack2, verified_device_key, feed_seq, declaration})
+    do:
+      GenServer.call(
+        server,
+        {:origin_ack2, verified_device_key, feed_seq, declaration},
+        :infinity
+      )
 
-  def origin_coverage(server, key), do: GenServer.call(server, {:origin_coverage, key})
+  def origin_coverage(server, key), do: GenServer.call(server, {:origin_coverage, key}, :infinity)
 
   def origin_support(server, verified_device_key, declaration),
-    do: GenServer.call(server, {:origin_support, verified_device_key, declaration})
+    do: GenServer.call(server, {:origin_support, verified_device_key, declaration}, :infinity)
 
   def origin_attachment_update(server, verified_device_key, declaration),
-    do: GenServer.call(server, {:origin_attachment_update, verified_device_key, declaration})
+    do:
+      GenServer.call(
+        server,
+        {:origin_attachment_update, verified_device_key, declaration},
+        :infinity
+      )
 
   @doc "Publish file limits only to a currently enrolled origin device."
   def origin_file_limits(server, verified_device_key),
-    do: GenServer.call(server, {:origin_file_limits, verified_device_key})
+    do: GenServer.call(server, {:origin_file_limits, verified_device_key}, :infinity)
 
   def upload_begin(server, verified_device_key, attributes, size),
-    do: GenServer.call(server, {:upload_begin, verified_device_key, attributes, size})
+    do: GenServer.call(server, {:upload_begin, verified_device_key, attributes, size}, :infinity)
 
-  def upload_end(server, lease), do: GenServer.call(server, {:upload_end, lease})
+  def upload_end(server, lease), do: GenServer.call(server, {:upload_end, lease}, :infinity)
 
   def discard_uploads(server, verified_device_key, attributes),
-    do: GenServer.call(server, {:discard_uploads, verified_device_key, attributes})
+    do: GenServer.call(server, {:discard_uploads, verified_device_key, attributes}, :infinity)
 
   def upload_file(server, verified_device_key, attributes, path, size, sha256, lease \\ nil),
     do:
@@ -196,12 +228,16 @@ defmodule AttentionServer.Relay do
       )
 
   def fetch_file(server, verified_device_key, upload_id) do
-    GenServer.call(server, {:fetch_file, verified_device_key, upload_id})
+    GenServer.call(server, {:fetch_file, verified_device_key, upload_id}, :infinity)
     |> verify_fetched_file()
   end
 
   def browser_fetch_file(server, person, owner_key, owner_revision, upload_id) do
-    GenServer.call(server, {:browser_fetch_file, person, owner_key, owner_revision, upload_id})
+    GenServer.call(
+      server,
+      {:browser_fetch_file, person, owner_key, owner_revision, upload_id},
+      :infinity
+    )
     |> verify_fetched_file()
   end
 
@@ -227,7 +263,7 @@ defmodule AttentionServer.Relay do
           {:browser_upload_prepare, browser_session_id, recipient, attrs, size, hash, lease}
       end
 
-    case GenServer.call(server, prepare) do
+    case GenServer.call(server, prepare, :infinity) do
       {:ok, :duplicate, reply} ->
         {:ok, reply}
 
@@ -270,25 +306,32 @@ defmodule AttentionServer.Relay do
   end
 
   def origin_session_gone(server, verified_device_key, handle),
-    do: GenServer.call(server, {:origin_session_gone, verified_device_key, handle})
+    do: GenServer.call(server, {:origin_session_gone, verified_device_key, handle}, :infinity)
 
   @doc "Attach one authenticated origin SSE worker to a session handle."
   def origin_stream_attach(server, verified_device_key, handle, worker, reconnect \\ false),
     do:
       GenServer.call(
         server,
-        {:origin_stream_attach, verified_device_key, handle, worker, reconnect, false}
+        {:origin_stream_attach, verified_device_key, handle, worker, reconnect, false},
+        :infinity
       )
 
   def origin_stream_attach(server, verified_device_key, handle, worker, reconnect, advisory_v1),
     do:
       GenServer.call(
         server,
-        {:origin_stream_attach, verified_device_key, handle, worker, reconnect, advisory_v1}
+        {:origin_stream_attach, verified_device_key, handle, worker, reconnect, advisory_v1},
+        :infinity
       )
 
   def origin_stream_detach(server, verified_device_key, handle, worker),
-    do: GenServer.call(server, {:origin_stream_detach, verified_device_key, handle, worker})
+    do:
+      GenServer.call(
+        server,
+        {:origin_stream_detach, verified_device_key, handle, worker},
+        :infinity
+      )
 
   @doc "Release one agent reply within the same serialized authority boundary."
   def agent_send_request(server, verified_agent_key, revision, request, socket),
@@ -309,64 +352,73 @@ defmodule AttentionServer.Relay do
       )
 
   def owner_register_agent(server, person, owner_key, id, agent_key),
-    do: GenServer.call(server, {:owner_register_agent, person, owner_key, id, agent_key})
+    do:
+      GenServer.call(server, {:owner_register_agent, person, owner_key, id, agent_key}, :infinity)
 
   def owner_replace_agent_grants(server, person, owner_key, agent_key, revision, read, respond),
     do:
       GenServer.call(
         server,
-        {:owner_replace_agent_grants, person, owner_key, agent_key, revision, read, respond}
+        {:owner_replace_agent_grants, person, owner_key, agent_key, revision, read, respond},
+        :infinity
       )
 
   def owner_revoke_agent(server, person, owner_key, agent_key),
-    do: GenServer.call(server, {:owner_revoke_agent, person, owner_key, agent_key})
+    do: GenServer.call(server, {:owner_revoke_agent, person, owner_key, agent_key}, :infinity)
 
   def owner_list_agents(server, person, owner_key),
-    do: GenServer.call(server, {:owner_list_agents, person, owner_key})
+    do: GenServer.call(server, {:owner_list_agents, person, owner_key}, :infinity)
 
   @doc "Release a bounded owner response in mutation order only while its TLS key/revision is current."
   def owner_send_line(server, person, verified_owner_key, revision, socket, line),
     do:
       GenServer.call(
         server,
-        {:owner_send_line, person, verified_owner_key, revision, socket, line}
+        {:owner_send_line, person, verified_owner_key, revision, socket, line},
+        :infinity
       )
 
   @doc "Pending-certificate submission seam for the separate narrow HTTPS listener."
   def pending_enroll(server, certificate_der, label),
-    do: GenServer.call(server, {:pending_enroll, certificate_der, label})
+    do: GenServer.call(server, {:pending_enroll, certificate_der, label}, :infinity)
 
   def pending_status(server, status_secret),
-    do: GenServer.call(server, {:pending_status, status_secret})
+    do: GenServer.call(server, {:pending_status, status_secret}, :infinity)
 
   def pending_resume(server, status_secret, certificate_der),
-    do: GenServer.call(server, {:pending_resume, status_secret, certificate_der})
+    do: GenServer.call(server, {:pending_resume, status_secret, certificate_der}, :infinity)
 
   def pending_cancel(server, secret, code, expected_key, deadline),
-    do: GenServer.call(server, {:pending_cancel, secret, code, expected_key, deadline})
+    do: GenServer.call(server, {:pending_cancel, secret, code, expected_key, deadline}, :infinity)
 
   @doc "Key argument must come from TLS CertificateVerify, never a body-supplied identity."
   def device_remove(server, verified_key),
-    do: GenServer.call(server, {:device_remove, verified_key})
+    do: GenServer.call(server, {:device_remove, verified_key}, :infinity)
 
   # Only cleanup TLS admission uses this retained identity; it grants no relay access.
-  def removal_identity(server, key), do: GenServer.call(server, {:removal_identity, key})
+  def removal_identity(server, key),
+    do: GenServer.call(server, {:removal_identity, key}, :infinity)
 
   @doc "Issue a one-use browser credential under the verified current person's owner."
   def owner_browser_sign_in_create(server, person, verified_owner_key),
-    do: GenServer.call(server, {:owner_browser_sign_in_create, person, verified_owner_key})
+    do:
+      GenServer.call(
+        server,
+        {:owner_browser_sign_in_create, person, verified_owner_key},
+        :infinity
+      )
 
   @doc "Authenticate a bearer once, returning its stored person-owner principal only after commit."
   def consume_browser_sign_in(server, token),
-    do: GenServer.call(server, {:consume_browser_sign_in, token})
+    do: GenServer.call(server, {:consume_browser_sign_in, token}, :infinity)
 
   def owner_invite_create(server, person, owner_key),
-    do: GenServer.call(server, {:owner_invite_create, person, owner_key})
+    do: GenServer.call(server, {:owner_invite_create, person, owner_key}, :infinity)
 
   def owner_invite_create(server, person, owner_key, request_id),
-    do: GenServer.call(server, {:owner_invite_create, person, owner_key, request_id})
+    do: GenServer.call(server, {:owner_invite_create, person, owner_key, request_id}, :infinity)
 
-  def dashboard_origin(server), do: GenServer.call(server, :dashboard_origin)
+  def dashboard_origin(server), do: GenServer.call(server, :dashboard_origin, :infinity)
 
   @doc """
   Create, or return, the one person for a hosted account reference. The person's
@@ -374,7 +426,7 @@ defmodule AttentionServer.Relay do
   the person identifier.
   """
   def hosted_account_create(server, account_ref),
-    do: GenServer.call(server, {:hosted_account_create, account_ref})
+    do: GenServer.call(server, {:hosted_account_create, account_ref}, :infinity)
 
   @doc """
   Issue a one-use browser sign-in for a hosted person under its server-held owner
@@ -382,13 +434,13 @@ defmodule AttentionServer.Relay do
   person that no hosted account owns.
   """
   def hosted_sign_in_create(server, person, label),
-    do: GenServer.call(server, {:hosted_sign_in_create, person, label})
+    do: GenServer.call(server, {:hosted_sign_in_create, person, label}, :infinity)
 
   def hosted_set_algorithm(server, person, algorithm),
-    do: GenServer.call(server, {:hosted_set_algorithm, person, algorithm})
+    do: GenServer.call(server, {:hosted_set_algorithm, person, algorithm}, :infinity)
 
   def hosted_delivery_state(server, person, target_state),
-    do: GenServer.call(server, {:hosted_delivery_state, person, target_state})
+    do: GenServer.call(server, {:hosted_delivery_state, person, target_state}, :infinity)
 
   @doc """
   Put the designated test account's person into a named product state:
@@ -398,25 +450,28 @@ defmodule AttentionServer.Relay do
     do: GenServer.call(server, {:hosted_test_reset, target_state}, 30_000)
 
   def invitation_resolve(server, token),
-    do: GenServer.call(server, {:invitation_resolve, token})
+    do: GenServer.call(server, {:invitation_resolve, token}, :infinity)
 
   def invited_enroll(server, invite_token, certificate_der, label, status_secret),
     do:
       GenServer.call(
         server,
-        {:invited_enroll, invite_token, certificate_der, label, status_secret}
+        {:invited_enroll, invite_token, certificate_der, label, status_secret},
+        :infinity
       )
 
   def owner_pending_decline(server, person, owner_key, code, expected_key, deadline),
     do:
       GenServer.call(
         server,
-        {:owner_pending_decline, person, owner_key, code, expected_key, deadline}
+        {:owner_pending_decline, person, owner_key, code, expected_key, deadline},
+        :infinity
       )
 
   @doc "Owner-key arguments must come from a proved management TLS peer."
   def owner_pending_lookup(server, person, verified_owner_key, code),
-    do: GenServer.call(server, {:owner_pending_lookup, person, verified_owner_key, code})
+    do:
+      GenServer.call(server, {:owner_pending_lookup, person, verified_owner_key, code}, :infinity)
 
   def owner_pending_approve(
         server,
@@ -431,24 +486,32 @@ defmodule AttentionServer.Relay do
         GenServer.call(
           server,
           {:owner_pending_approve, person, verified_owner_key, code, expected_key,
-           expected_expires_at, sender_grants}
+           expected_expires_at, sender_grants},
+          :infinity
         )
 
   def owner_revoke_device(server, person, verified_owner_key, device_key),
-    do: GenServer.call(server, {:owner_revoke_device, person, verified_owner_key, device_key})
+    do:
+      GenServer.call(
+        server,
+        {:owner_revoke_device, person, verified_owner_key, device_key},
+        :infinity
+      )
 
   def owner_grant_sender(server, person, verified_owner_key, device_key, pattern),
     do:
       GenServer.call(
         server,
-        {:owner_grant_sender, person, verified_owner_key, device_key, pattern}
+        {:owner_grant_sender, person, verified_owner_key, device_key, pattern},
+        :infinity
       )
 
   def owner_revoke_sender(server, person, verified_owner_key, device_key, pattern),
     do:
       GenServer.call(
         server,
-        {:owner_revoke_sender, person, verified_owner_key, device_key, pattern}
+        {:owner_revoke_sender, person, verified_owner_key, device_key, pattern},
+        :infinity
       )
 
   def owner_grant_enrollment_read(
@@ -464,35 +527,43 @@ defmodule AttentionServer.Relay do
         GenServer.call(
           server,
           {:owner_grant_enrollment_read, person, verified_owner_key, connector, grant_id, source,
-           target}
+           target},
+          :infinity
         )
 
   def owner_revoke_enrollment_read(server, person, verified_owner_key, grant_id),
     do:
       GenServer.call(
         server,
-        {:owner_revoke_enrollment_read, person, verified_owner_key, grant_id}
+        {:owner_revoke_enrollment_read, person, verified_owner_key, grant_id},
+        :infinity
       )
 
   def owner_grant_maintainer(server, person, verified_owner_key, grant_id, grantee, scopes),
     do:
       GenServer.call(
         server,
-        {:owner_grant_maintainer, person, verified_owner_key, grant_id, grantee, scopes}
+        {:owner_grant_maintainer, person, verified_owner_key, grant_id, grantee, scopes},
+        :infinity
       )
 
   def owner_revoke_maintainer(server, person, verified_owner_key, grant_id),
-    do: GenServer.call(server, {:owner_revoke_maintainer, person, verified_owner_key, grant_id})
+    do:
+      GenServer.call(
+        server,
+        {:owner_revoke_maintainer, person, verified_owner_key, grant_id},
+        :infinity
+      )
 
   @doc "Local projection fixture only; does not expose agent service authority on the wire."
   def setup_agent_fixture(server, person, id, key, sender_ids),
-    do: GenServer.call(server, {:setup_agent_fixture, person, id, key, sender_ids})
+    do: GenServer.call(server, {:setup_agent_fixture, person, id, key, sender_ids}, :infinity)
 
   def fixture_agent_answer(server, key, frame),
-    do: GenServer.call(server, {:fixture_agent_answer, key, frame})
+    do: GenServer.call(server, {:fixture_agent_answer, key, frame}, :infinity)
 
   def revoke_agent_fixture(server, key),
-    do: GenServer.call(server, {:revoke_agent_fixture, key})
+    do: GenServer.call(server, {:revoke_agent_fixture, key}, :infinity)
 
   @doc "Local operator/test provisioning of a certificate's public-key identity."
   def setup_device_certificate(server, person, certificate_der) do
@@ -502,28 +573,33 @@ defmodule AttentionServer.Relay do
   end
 
   def setup_sender(server, key, pattern),
-    do: GenServer.call(server, {:setup_sender, key, pattern})
+    do: GenServer.call(server, {:setup_sender, key, pattern}, :infinity)
 
-  def revoke_device(server, key), do: GenServer.call(server, {:revoke_device, key})
+  def revoke_device(server, key), do: GenServer.call(server, {:revoke_device, key}, :infinity)
 
   @doc "Trusted local fixture seam for an externally recorded source-owner delegation."
   def grant_source_report(server, person, key, source, senders, delegation_ref),
     do:
-      GenServer.call(server, {:grant_source_report, person, key, source, senders, delegation_ref})
+      GenServer.call(
+        server,
+        {:grant_source_report, person, key, source, senders, delegation_ref},
+        :infinity
+      )
 
   def revoke_source_report(server, person, key, source),
-    do: GenServer.call(server, {:revoke_source_report, person, key, source})
+    do: GenServer.call(server, {:revoke_source_report, person, key, source}, :infinity)
 
   @doc "Trusted local owner fixture for one exact enrollment disclosure grant."
   def grant_enrollment_read_fixture(server, person, connector, grant_id, source, target, issuer),
     do:
       GenServer.call(
         server,
-        {:grant_enrollment_read_fixture, person, connector, grant_id, source, target, issuer}
+        {:grant_enrollment_read_fixture, person, connector, grant_id, source, target, issuer},
+        :infinity
       )
 
   def revoke_enrollment_read_fixture(server, person, grant_id),
-    do: GenServer.call(server, {:revoke_enrollment_read_fixture, person, grant_id})
+    do: GenServer.call(server, {:revoke_enrollment_read_fixture, person, grant_id}, :infinity)
 
   def request_line(server, verified_key, line),
     do: GenServer.call(server, {:request_line, verified_key, line}, :infinity)
@@ -536,7 +612,7 @@ defmodule AttentionServer.Relay do
   def claim_push(server, now_ms), do: GenServer.call(server, {:claim_push, now_ms}, :infinity)
 
   @doc false
-  def enable_push(server), do: GenServer.call(server, :enable_push)
+  def enable_push(server), do: GenServer.call(server, :enable_push, :infinity)
 
   @doc false
   def finish_push(server, claim, outcome, now_ms),
@@ -561,17 +637,17 @@ defmodule AttentionServer.Relay do
     do: GenServer.call(server, {:open_session, verified_key, nil, nil, nil, :raw}, :infinity)
 
   def register_tls_listener(server, listener),
-    do: GenServer.call(server, {:register_tls_listener, listener})
+    do: GenServer.call(server, {:register_tls_listener, listener}, :infinity)
 
   def unregister_tls_listener(server, listener),
-    do: GenServer.call(server, {:unregister_tls_listener, listener})
+    do: GenServer.call(server, {:unregister_tls_listener, listener}, :infinity)
 
   @doc "Advertise the bound origin HTTPS listener only while it is running."
   def register_origin_listener(server, listener, port),
-    do: GenServer.call(server, {:register_origin_listener, listener, port})
+    do: GenServer.call(server, {:register_origin_listener, listener, port}, :infinity)
 
   def unregister_origin_listener(server, listener),
-    do: GenServer.call(server, {:unregister_origin_listener, listener})
+    do: GenServer.call(server, {:unregister_origin_listener, listener}, :infinity)
 
   @doc "Opens a socket-backed session after a successful client-certificate handshake."
   def open_tls_session(server, verified_key, socket, listener),
@@ -636,20 +712,22 @@ defmodule AttentionServer.Relay do
       )
 
   def browser_file_limits(server, browser_session_id, recipient),
-    do: GenServer.call(server, {:browser_file_limits, browser_session_id, recipient})
+    do: GenServer.call(server, {:browser_file_limits, browser_session_id, recipient}, :infinity)
 
   def browser_discard_uploads(server, browser_session_id, recipient, attributes),
     do:
       GenServer.call(
         server,
-        {:browser_discard_uploads, browser_session_id, recipient, attributes}
+        {:browser_discard_uploads, browser_session_id, recipient, attributes},
+        :infinity
       )
 
   def browser_upload_begin(server, browser_session_id, recipient, attributes, size, worker),
     do:
       GenServer.call(
         server,
-        {:browser_upload_begin, browser_session_id, recipient, attributes, size, worker}
+        {:browser_upload_begin, browser_session_id, recipient, attributes, size, worker},
+        :infinity
       )
 
   def browser_upload_file(
@@ -1508,7 +1586,7 @@ defmodule AttentionServer.Relay do
 
   defp dispatch_call({:origin_support, key, declaration}, _from, state) do
     case Engine.origin_support(state.store.engine, key, declaration) do
-      {:ok, next, reply} when next == state.store.engine ->
+      {:ok, next, %{"duplicate" => true} = reply} when next == state.store.engine ->
         {:reply, {:ok, reply}, state}
 
       {:ok, next, reply} ->
@@ -1518,23 +1596,31 @@ defmodule AttentionServer.Relay do
         listening? = origin_listening?(state, next, {person, key, handle})
         {:ok, current} = Engine.origin_status(next, key, handle, listening?)
 
+        # An unchanged declaration (the engine came back as it was) repeats what
+        # the session's open requests already record: append no availability
+        # event and commit nothing. A changed declaration records it as before.
         next =
-          Engine.origin_availability(
-            next,
-            person,
-            key,
-            handle,
-            current["availability"],
-            current["last_detached_at"]
-          )
+          if next == old_engine,
+            do: next,
+            else:
+              Engine.origin_availability(
+                next,
+                person,
+                key,
+                handle,
+                current["availability"],
+                current["last_detached_at"]
+              )
 
         session_key = {person, key, handle}
 
-        case Store.commit(
-               state.store,
-               next,
-               audit(old_engine, key, "origin_support")
-             ) do
+        # An unchanged declaration leaves the engine as it is: nothing to commit.
+        committed =
+          if next == old_engine,
+            do: {:ok, state.store},
+            else: Store.commit(state.store, next, audit(old_engine, key, "origin_support"))
+
+        case committed do
           {:ok, store} ->
             store = %{
               store
@@ -1560,15 +1646,23 @@ defmodule AttentionServer.Relay do
 
   defp dispatch_call({:origin_attachment_update, key, declaration}, _from, state) do
     case Engine.origin_attachment_update(state.store.engine, key, declaration) do
-      {:ok, next, reply} when next == state.store.engine ->
-        {:reply, {:ok, reply}, state}
-
       {:ok, next, reply} ->
         {:ok, person} = Engine.authorized_person(next, key)
         proposed = %{state | store: %{state.store | engine: next}}
         next = origin_availability_changes(state, proposed, person, key)
 
-        case commit(state.store, next, audit(state.store.engine, key, "origin_attachment_update")) do
+        # A duplicate or unchanged declaration leaves the engine as it is.
+        committed =
+          if next == state.store.engine,
+            do: {:ok, state.store},
+            else:
+              commit(
+                state.store,
+                next,
+                audit(state.store.engine, key, "origin_attachment_update")
+              )
+
+        case committed do
           {:ok, store} ->
             updated =
               %{state | store: store}

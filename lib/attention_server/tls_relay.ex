@@ -17,7 +17,7 @@ defmodule AttentionServer.TLSRelay do
   @poll_ms 100
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts)
-  def port(server), do: GenServer.call(server, :port)
+  def port(server), do: GenServer.call(server, :port, :infinity)
 
   @impl true
   def init(opts) do

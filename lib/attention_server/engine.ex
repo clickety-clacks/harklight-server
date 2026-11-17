@@ -2967,16 +2967,30 @@ defmodule AttentionServer.Engine do
           {:error, :operation_conflict}
 
         :missing ->
-          with {:ok, next, record} <-
-                 Conversation.store_support(
-                   engine,
-                   person,
-                   key,
-                   frame["session_handle"],
-                   declared
-                 ) do
-            reply = %{"session_handle" => frame["session_handle"], "listening_support" => record}
-            {:ok, save_receipt(next, person, key, frame["op_id"], semantic, reply), reply}
+          case current_support(engine, person, key, frame["session_handle"], declared) do
+            {:unchanged, record} ->
+              # Nothing would change: answer from current state with no commit
+              # and no new receipt. A retry of this op-id is answered the same
+              # way from state.
+              {:ok, engine,
+               %{"session_handle" => frame["session_handle"], "listening_support" => record}}
+
+            :changed ->
+              with {:ok, next, record} <-
+                     Conversation.store_support(
+                       engine,
+                       person,
+                       key,
+                       frame["session_handle"],
+                       declared
+                     ) do
+                reply = %{
+                  "session_handle" => frame["session_handle"],
+                  "listening_support" => record
+                }
+
+                {:ok, save_receipt(next, person, key, frame["op_id"], semantic, reply), reply}
+              end
           end
       end
     else
@@ -3011,36 +3025,78 @@ defmodule AttentionServer.Engine do
           {:error, :operation_conflict}
 
         :missing ->
-          with {:ok, next, stored} <-
-                 Conversation.update_vendor_session_id(
-                   engine,
-                   person,
-                   key,
-                   frame["session_handle"],
-                   frame["vendor_session_id"]
-                 ) do
-            reply = %{
-              "session_handle" => frame["session_handle"],
-              "vendor_session_id" => stored.vendor_session_id
-            }
+          case unchanged_attachment(engine, person, key, frame, support) do
+            {:unchanged, reply} ->
+              {:ok, engine, reply}
 
-            {next, reply} =
-              if support do
-                {:ok, next, record} =
-                  Conversation.store_support(next, person, key, frame["session_handle"], support)
-
-                {next, Map.put(reply, "listening_support", record)}
-              else
-                {next, reply}
-              end
-
-            {:ok, save_receipt(next, person, key, frame["op_id"], semantic, reply), reply}
+            :changed ->
+              changed_attachment(engine, person, key, frame, support, semantic)
           end
       end
     else
       false -> {:error, :invalid_field}
       {:error, field} when is_binary(field) -> {:error, :invalid_field}
       error -> error
+    end
+  end
+
+  defp changed_attachment(engine, person, key, frame, support, semantic) do
+    with {:ok, next, stored} <-
+           Conversation.update_vendor_session_id(
+             engine,
+             person,
+             key,
+             frame["session_handle"],
+             frame["vendor_session_id"]
+           ) do
+      reply = %{
+        "session_handle" => frame["session_handle"],
+        "vendor_session_id" => stored.vendor_session_id
+      }
+
+      {next, reply} =
+        if support do
+          {:ok, next, record} =
+            Conversation.store_support(next, person, key, frame["session_handle"], support)
+
+          {next, Map.put(reply, "listening_support", record)}
+        else
+          {next, reply}
+        end
+
+      {:ok, save_receipt(next, person, key, frame["op_id"], semantic, reply), reply}
+    end
+  end
+
+  # Support stored by store_support/5 is the declaration plus "origin" and
+  # "reported_at"; an identical declaration would change nothing but the time.
+  defp current_support(engine, person, key, handle, declared) do
+    case Map.get(engine.origin_sessions, {person, key, handle}) do
+      %{support: %{} = record} ->
+        if Map.drop(record, ["origin", "reported_at"]) == declared,
+          do: {:unchanged, record},
+          else: :changed
+
+      _ ->
+        :changed
+    end
+  end
+
+  defp unchanged_attachment(engine, person, key, frame, support) do
+    handle = frame["session_handle"]
+
+    with %{vendor_session_id: vendor} = session <-
+           Map.get(engine.origin_sessions, {person, key, handle}),
+         true <- vendor == frame["vendor_session_id"],
+         {:unchanged, record} <-
+           if(support,
+             do: current_support(engine, person, key, handle, support),
+             else: {:unchanged, nil}
+           ) do
+      reply = %{"session_handle" => handle, "vendor_session_id" => session.vendor_session_id}
+      {:unchanged, if(record, do: Map.put(reply, "listening_support", record), else: reply)}
+    else
+      _ -> :changed
     end
   end
 

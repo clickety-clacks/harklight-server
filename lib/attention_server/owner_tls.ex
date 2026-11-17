@@ -17,7 +17,7 @@ defmodule AttentionServer.OwnerTLS do
   @max_line 32 * 1024
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts)
-  def port(server), do: GenServer.call(server, :port)
+  def port(server), do: GenServer.call(server, :port, :infinity)
 
   @impl true
   def init(opts) do

@@ -645,6 +645,21 @@ defmodule AttentionServer.OriginHTTPSTest do
     assert {:ok, 200, ^bytes} = fetch_bytes(restored, "reader", id)
   end
 
+  test "origin calls wait for a Relay that is busy longer than five seconds", c do
+    # Relay calls used GenServer.call's default five seconds: a connection whose
+    # call outlived it exited and closed without an answer, while the queued
+    # request still ran. They now wait for the Relay's real answer.
+    expected = Relay.origin_status(c.relay, c.origin, @handle)
+    :ok = :sys.suspend(c.relay)
+    status = Task.async(fn -> Relay.origin_status(c.relay, c.origin, @handle) end)
+    file_limits = Task.async(fn -> Relay.origin_file_limits(c.relay, c.origin) end)
+    Process.sleep(6_000)
+    :ok = :sys.resume(c.relay)
+
+    assert Task.await(status, 30_000) == expected
+    assert {:ok, _limits} = Task.await(file_limits, 30_000)
+  end
+
   test "origin HTTPS accepts a large message body and delivers it intact to a connected device",
        c do
     # The body is only eight bytes above the old 2 MiB request cap.
