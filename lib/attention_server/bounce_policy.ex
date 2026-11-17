@@ -103,6 +103,11 @@ defmodule AttentionServer.BouncePolicy do
     substantive_content(old_message, old_files) == substantive_content(new_message, new_files)
   end
 
+  # Large message data compares by content: the same bytes can be held at a
+  # transient path in a request and at a durable path in the store.
+  defp canonical_value(%AttentionServer.LargeData.Ref{sha256: sha256, size: size}),
+    do: {:large_data, sha256, size}
+
   defp canonical_value(%DecimalToken{} = value) do
     case number_ratio(value) do
       {:ok, ratio} -> {:number, ratio}

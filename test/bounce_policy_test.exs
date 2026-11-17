@@ -3,6 +3,7 @@ defmodule AttentionServer.BouncePolicyTest do
 
   alias AttentionServer.BouncePolicy
   alias AttentionServer.JSON.DecimalToken
+  alias AttentionServer.LargeData.Ref
 
   test "configured ranges form an ordered inclusive partition from zero through one" do
     assert {:ok, levels} =
@@ -124,5 +125,24 @@ defmodule AttentionServer.BouncePolicyTest do
            ])
 
     refute BouncePolicy.same_substance?(message, [file], message, [%{file | "sha256" => "def"}])
+  end
+
+  test "large message data compares by content, wherever its bytes are held" do
+    hash = String.duplicate("a", 64)
+    durable = %Ref{id: hash, sha256: hash, size: 3_000_000, path: "/state/uploads/" <> hash}
+    transient = %Ref{durable | path: "/tmp/attention-json-body-1"}
+    other = String.duplicate("b", 64)
+    message = %{"title" => "Large", "message_type" => "fyi", "body" => durable}
+
+    assert BouncePolicy.same_substance?(message, [], %{message | "body" => transient}, [])
+
+    refute BouncePolicy.same_substance?(
+             message,
+             [],
+             %{message | "body" => %Ref{id: other, sha256: other, size: 3_000_000, path: nil}},
+             []
+           )
+
+    refute BouncePolicy.same_substance?(message, [], %{message | "body" => "small"}, [])
   end
 end
