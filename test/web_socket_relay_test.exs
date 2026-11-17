@@ -1187,19 +1187,23 @@ defmodule AttentionServer.WebSocketRelayTest do
                "message" => revised
              })
 
-    assert {:ok, reader} = connect(web, certs, "a2")
-    assert upgrade(reader) =~ "101 Switching Protocols"
+    assert {:ok, paging_reader} = connect(web, certs, "a1")
+    assert upgrade(paging_reader) =~ "101 Switching Protocols"
     assert :ok =
-             send_request(reader, %{
+             send_request(paging_reader, %{
                "type" => "inbox_start",
                "paging_version" => 1,
                "startup_id" => "progress-cold-reader",
                "since" => 0
              })
 
-    assert %{"type" => "ok", "high_water" => 1, "items" => [item]} = reply(reader)
+    assert %{"type" => "ok", "high_water" => 1, "items" => [item]} = reply(paging_reader)
     assert item["acceptance"]["request_revision"] == 1
     assert item["acceptance"]["message"] == message
+
+    assert {:ok, reader} = connect(web, certs, "a2")
+    assert upgrade(reader) =~ "101 Switching Protocols"
+    assert {[%{"type" => "delivery", "seq" => 1}], %{"seq" => 1}} = resync(reader)
 
     assert :ok = send_request(reader, %{"type" => "conversation_open", "since" => 0})
     assert %{"type" => "ok"} = reply(reader)
