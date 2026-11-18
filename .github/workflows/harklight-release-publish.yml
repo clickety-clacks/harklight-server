@@ -16,6 +16,8 @@ jobs:
   publish:
     name: Build and publish a stable tag
     runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
     defaults:
       run:
         shell: bash
