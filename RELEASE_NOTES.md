@@ -1,3 +1,14 @@
+# Unreleased
+
+## Changes
+
+- Baseline and Jev fallback views include a display-only `priority` equal to each item's
+  effective urgency (`low`, `normal`, `high`, or `now`). These entries remain
+  unscored and do not gain bounce schedules. Jev selected views
+  retain their existing score-only behavior.
+
+---
+
 # Harklight Server v0.1.45
 
 **Install this instead of v0.1.43 or v0.1.44 when the server is busy.** It
