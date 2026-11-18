@@ -92,7 +92,8 @@ defmodule AttentionServer.Contradictions do
   # The caller commits delivery before entering this worker. One shared
   # deadline covers composition and all parallel batches, not one per batch.
   def run(posted, items, endpoint, model, size, opts \\ []) do
-    deadline = Keyword.get(opts, :deadline, System.monotonic_time(:millisecond) + 5_000)
+    clock = Keyword.get(opts, :clock, fn -> System.monotonic_time(:millisecond) end)
+    deadline = Keyword.get_lazy(opts, :deadline, fn -> clock.() + 5_000 end)
     evaluator = Keyword.get(opts, :evaluator, &JevClient.evaluate/1)
     requests = batches(posted, items, endpoint, model, size)
 
@@ -115,26 +116,26 @@ defmodule AttentionServer.Contradictions do
           {task.ref, {task, request.candidates}}
         end)
 
-      {scores, timed_out?} = collect(tasks, %{}, deadline)
+      {scores, timed_out?} = collect(tasks, %{}, deadline, clock)
       result(items, scores, timed_out?)
     after
       Supervisor.stop(supervisor)
     end
   end
 
-  defp collect(tasks, scores, _deadline) when map_size(tasks) == 0, do: {scores, false}
+  defp collect(tasks, scores, _deadline, _clock) when map_size(tasks) == 0, do: {scores, false}
 
-  defp collect(tasks, scores, deadline) do
-    remaining = deadline - System.monotonic_time(:millisecond)
+  defp collect(tasks, scores, deadline, clock) do
+    remaining = deadline - clock.()
 
     if remaining <= 0 do
       stop_pending(tasks, scores)
     else
-      await(tasks, scores, deadline, remaining)
+      await(tasks, scores, deadline, remaining, clock)
     end
   end
 
-  defp await(tasks, scores, deadline, remaining) do
+  defp await(tasks, scores, deadline, remaining, clock) do
     receive do
       {ref, answer} when is_map_key(tasks, ref) ->
         {{_task, identities}, rest} = Map.pop(tasks, ref)
@@ -146,10 +147,10 @@ defmodule AttentionServer.Contradictions do
             _ -> %{}
           end
 
-        collect(rest, Map.merge(scores, usable), deadline)
+        collect(rest, Map.merge(scores, usable), deadline, clock)
 
       {:DOWN, ref, :process, _pid, _reason} when is_map_key(tasks, ref) ->
-        collect(Map.delete(tasks, ref), scores, deadline)
+        collect(Map.delete(tasks, ref), scores, deadline, clock)
     after
       remaining ->
         stop_pending(tasks, scores)

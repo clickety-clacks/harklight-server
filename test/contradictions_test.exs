@@ -17,6 +17,39 @@ defmodule AttentionServer.ContradictionsTest do
     }
   end
 
+  # Each clock read happens at a collector iteration. The second read proves
+  # the first batch result was consumed, so expiry never races that result.
+  defp expire_after_first_result(items, evaluator) do
+    parent = self()
+
+    clock = fn ->
+      send(parent, {:clock_read, self()})
+
+      receive do
+        {:clock_time, now} -> now
+      end
+    end
+
+    running =
+      Task.async(fn ->
+        Contradictions.run(@posted, items, @endpoint, @model, 1,
+          evaluator: evaluator,
+          clock: clock,
+          deadline: 60_000
+        )
+      end)
+
+    assert_receive {:pending, worker}, 2_000
+    monitor = Process.monitor(worker)
+    assert_receive {:clock_read, collector}, 2_000
+    send(collector, {:clock_time, 0})
+    assert_receive {:clock_read, ^collector}, 2_000
+    send(collector, {:clock_time, 60_000})
+    check = Task.await(running)
+    assert_receive {:DOWN, ^monitor, :process, ^worker, :killed}, 2_000
+    {check, worker}
+  end
+
   test "complete matches are oldest first and expose only identifying fields" do
     first = item(1)
     second = item(2)
@@ -121,18 +154,13 @@ defmodule AttentionServer.ContradictionsTest do
       end
     end
 
-    check =
-      Contradictions.run(@posted, [a, b], @endpoint, @model, 1,
-        evaluator: evaluator,
-        deadline: System.monotonic_time(:millisecond) + 100
-      )
+    {check, worker} = expire_after_first_result([a, b], evaluator)
 
     assert check["reason"] == "timeout"
     assert check["unchecked"] == 1
     assert hd(check["messages"])["message_id"] == "message-1"
-    assert_receive {:pending, worker}
     refute Process.alive?(worker)
-    refute_receive {_, {:ok, _}}
+    refute_receive {_, {:ok, _}}, 0
   end
 
   test "unconfigured Jev reports incomplete without calling the evaluator" do
@@ -163,22 +191,21 @@ defmodule AttentionServer.ContradictionsTest do
 
   test "timeout takes precedence over a failed comparison" do
     [a, b] = Enum.map(1..2, &item/1)
+    parent = self()
 
     evaluator = fn request ->
       if request.candidates == [a.identity] do
         {:error, :unavailable}
       else
+        send(parent, {:pending, self()})
+
         receive do
           :finish -> {:ok, %{b.identity => 0}}
         end
       end
     end
 
-    check =
-      Contradictions.run(@posted, [a, b], @endpoint, @model, 1,
-        evaluator: evaluator,
-        deadline: System.monotonic_time(:millisecond) + 100
-      )
+    {check, _worker} = expire_after_first_result([a, b], evaluator)
 
     assert check == %{"status" => "incomplete", "reason" => "timeout", "unchecked" => 2}
   end
