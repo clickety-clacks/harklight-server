@@ -203,6 +203,127 @@ defmodule AttentionServer.PrioritizationTest do
              })
   end
 
+  test "baseline display priority passes effective urgency through without scoring or bounce", %{
+    path: path
+  } do
+    relay = start_relay(path)
+    setup_person(relay)
+
+    for {id, urgency, n} <- [
+          {"A", "low", 1},
+          {"B", "normal", 2},
+          {"C", "now", 3},
+          {"default", nil, 4}
+        ] do
+      message = %{
+        "sender_id" => "app:test",
+        "message_id" => id,
+        "created_at" => n,
+        "title" => id,
+        "message_type" => "fyi",
+        "answer_ui" => %{
+          "schema" => "attention-client.actions/1",
+          "actions" => [
+            %{
+              "id" => "seen",
+              "label" => "Seen",
+              "kind" => "value",
+              "value" => %{"acknowledgment" => "seen"}
+            }
+          ]
+        }
+      }
+
+      message = if urgency, do: Map.put(message, "urgency", urgency), else: message
+
+      assert request(relay, "device-a", %{
+               "type" => "forward",
+               "op_id" => op(n),
+               "session_handle" => op(100 + n),
+               "message" => message
+             })["type"] == "ok"
+    end
+
+    assert {:ok, session} = Relay.open_session(relay, "device-b")
+    [view] = session_request(relay, session, %{"type" => "view_get", "ref" => "a1-view"})
+    assert view["algorithm"] == "baseline"
+    entries = view["entries"]
+
+    assert Enum.map(
+             Enum.reject(entries, &(&1["message_id"] == "default")),
+             &{&1["message_id"], &1["priority"]}
+           ) == [{"C", "now"}, {"B", "normal"}, {"A", "low"}]
+
+    assert Enum.find(entries, &(&1["message_id"] == "default"))["priority"] == "normal"
+    refute Enum.any?(entries, &Map.has_key?(&1, "score"))
+    state = :sys.get_state(relay)
+
+    refute Enum.any?(
+             state.priority_views["person-a"].engine_entries,
+             &Map.has_key?(&1, "priority")
+           )
+
+    engine = state.store.engine
+    refute Map.has_key?(engine.bounce_levels, "person-a")
+    assert engine.bounce_revisions[{"person-a", "app:test", "C"}].revisions[1].qualified
+    unscored = BounceDecision.record_scores(engine, "person-a", entries, 1_000)
+    assert BounceDecision.next_deadline(unscored) == nil
+
+    after_time =
+      BounceDecision.evaluate_due(unscored, System.system_time(:millisecond) + 30 * 86_400_000)
+
+    assert BounceDecision.next_deadline(after_time) == nil
+    assert after_time.advisory_feeds == engine.advisory_feeds
+    # Positive control: the same eligible item receives a bounce interval only
+    # when it receives an actual score, not the display priority above.
+    scored =
+      BounceDecision.record_scores(
+        engine,
+        "person-a",
+        [%{"sender_id" => "app:test", "message_id" => "C", "score" => 0.9}],
+        1_000
+      )
+
+    assert is_integer(BounceDecision.next_deadline(scored))
+  end
+
+  test "Jev selected and fallback views never acquire baseline display priority", %{
+    path: path,
+    dir: dir
+  } do
+    use_synthetic_jev_key(dir)
+    relay = start_relay(path, priority_evaluator: fn _ -> {:error, :unavailable} end)
+    setup_person(relay)
+    forward(relay, 1, "A")
+    forward(relay, 2, "B")
+    assert {:ok, session} = Relay.open_session(relay, "device-b")
+    configure_jev_choice(relay)
+    [fallback] = session_request(relay, session, %{"type" => "view_get", "ref" => "a1-view"})
+    assert fallback["basis"] == "fallback"
+
+    refute Enum.any?(
+             fallback["entries"],
+             &(Map.has_key?(&1, "priority") or Map.has_key?(&1, "score"))
+           )
+
+    job = start_synthetic_priority_pass(relay)
+
+    complete_synthetic_priority_pass(
+      job,
+      {:ok, %{{"app:test", "A"} => 0.9, {"app:test", "B"} => 0.1}}
+    )
+
+    [selected] = session_request(relay, session, %{"type" => "view_get", "ref" => "a1-view"})
+    assert selected["basis"] == "selected"
+
+    assert Enum.map(selected["entries"], & &1["score"]) == [
+             %JSON.DecimalToken{raw: "0.9"},
+             %JSON.DecimalToken{raw: "0.1"}
+           ]
+
+    refute Enum.any?(selected["entries"], &Map.has_key?(&1, "priority"))
+  end
+
   test "baseline omits scores and bands and orders urgency, deadline, then newest" do
     items = [
       item("newest", 4),
@@ -977,9 +1098,10 @@ defmodule AttentionServer.PrioritizationTest do
              %{
                "sender_id" => "app:test",
                "message_id" => "newer",
+               "priority" => "normal",
                "due_at" => 200
              },
-             %{"sender_id" => "app:test", "message_id" => "older"}
+             %{"sender_id" => "app:test", "message_id" => "older", "priority" => "normal"}
            ]
 
     view_rev = :sys.get_state(relay).priority_views["person-a"].view_rev
@@ -2327,7 +2449,7 @@ defmodule AttentionServer.PrioritizationTest do
     seq = reply["seq"]
     expected = %{"sender_id" => "app:test", "message_id" => "parent", "conversation_seq" => seq}
     baseline = view.()
-    assert baseline["replies"] == [expected]
+    assert baseline["replies"] == [Map.put(expected, "priority", "high")]
     assert baseline["entries"] == initial["entries"]
     refute baseline["view_rev"] == initial["view_rev"]
     assert Map.delete(request(relay, "device-a", reply_frame), "duplicate") == reply
@@ -2346,7 +2468,7 @@ defmodule AttentionServer.PrioritizationTest do
 
     assert {:ok, %{"type" => "ok"}} = JSON.decode_line(terminal_line)
     assert view.()["entries"] == []
-    assert view.()["replies"] == [expected]
+    assert view.()["replies"] == [Map.put(expected, "priority", "high")]
     engine = :sys.get_state(relay).store.engine
     [item] = Placement.ranking_items(engine, "person-a")
     assert item.identity == {"app:test", "parent", seq}

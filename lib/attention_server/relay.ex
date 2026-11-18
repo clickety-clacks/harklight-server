@@ -5805,6 +5805,13 @@ defmodule AttentionServer.Relay do
     end
   end
 
+  # Display metadata is added only to public baseline entries. Internal
+  # engine_entries and every score/bounce path remain unscored.
+  defp baseline_display_priority(entry, engine, person) do
+    record = Map.fetch!(engine.messages, {person, entry["sender_id"], entry["message_id"]})
+    Map.put(entry, "priority", Message.effective_urgency(record.message))
+  end
+
   defp publish_priority_view(state, person, view, previous, engine_entries, reply_summary) do
     {replies, messages} = Enum.split_with(engine_entries, &Map.has_key?(&1, "conversation_seq"))
 
@@ -5828,11 +5835,19 @@ defmodule AttentionServer.Relay do
           |> Enum.flat_map(fn row ->
             case Map.get(entries_by_id, Placement.identity(row)) do
               nil -> []
-              entry -> [entry]
+              entry -> [baseline_display_priority(entry, state.store.engine, person)]
             end
           end)
 
-        shown |> Map.put(:entries, ordered_messages) |> Map.put(:free_order_version, 1)
+        shown
+        |> Map.put(:entries, ordered_messages)
+        |> Map.update!(
+          :replies,
+          &Enum.map(&1, fn entry ->
+            baseline_display_priority(entry, state.store.engine, person)
+          end)
+        )
+        |> Map.put(:free_order_version, 1)
       else
         shown
       end
