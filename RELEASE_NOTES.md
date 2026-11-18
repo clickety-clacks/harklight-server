@@ -1,3 +1,21 @@
+# Harklight Server v0.1.49
+
+## Changes
+
+- Persisted Agent device metadata is accepted with or without a final newline.
+  This restores interoperability with the current Agent metadata file format.
+  The existing file-size and identity checks remain in force; network wire
+  framing is unchanged. The Agent binary is unchanged.
+
+## Upgrade and recovery
+
+v0.1.49 writes FORMAT29, like the published v0.1.48 release. Upgrading from
+v0.1.48 runs no store migration. Supported FORMAT27 state migrates on first
+start; returning to FORMAT27 then requires the pre-start backup and loses
+later writes. Recovery can fail.
+
+---
+
 # Harklight Server v0.1.48
 
 ## Changes
