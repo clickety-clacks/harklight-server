@@ -460,6 +460,13 @@ defmodule AttentionServer.HeadlessDevice do
 
   defp read_json(path) do
     with {:ok, contents} <- File.read(path),
-         do: JSON.decode_line(contents, @max_server_frame)
+         true <- byte_size(contents) <= @max_server_frame do
+      # Stored documents need no line terminator. The added LF is decoder
+      # framing only; keep the limit on the original file bytes.
+      JSON.decode_line(contents <> "\n", @max_server_frame + 1)
+    else
+      false -> {:error, :bad_frame}
+      error -> error
+    end
   end
 end
