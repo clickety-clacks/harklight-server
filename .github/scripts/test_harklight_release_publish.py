@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import importlib.util
+import io
+import os
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 HELPER_PATH = Path(__file__).with_name("harklight_release_publish.py")
@@ -15,6 +18,11 @@ HELPER_SPEC.loader.exec_module(HELPER)
 
 
 class RehearsalRecordTests(unittest.TestCase):
+    def test_prose_does_not_add_a_rehearsal_field(self):
+        annotation = "Release notes\nrehearsal is not needed for this format\nrehearsal: not-required\n"
+        form, _, _ = HELPER.parse_rehearsal_record(annotation)
+        self.assertEqual(form, "not-required")
+
     def test_real_mix_version_record_round_trips_through_annotated_tag(self):
         # These are the three real lines from the published v0.1.42 BUILD_INFO.
         mix_version_lines = [
@@ -75,6 +83,13 @@ class RehearsalRecordTests(unittest.TestCase):
 
 
 class ReleaseLookupTests(unittest.TestCase):
+    def test_api_reads_use_workflow_token(self):
+        with mock.patch.dict(os.environ, {"GH_TOKEN": "test-token"}):
+            with mock.patch.object(HELPER.urllib.request, "urlopen", return_value=io.BytesIO(b"{}")) as urlopen:
+                self.assertEqual(HELPER.request_json("https://api.github.com/example"), {})
+        request = urlopen.call_args.args[0]
+        self.assertEqual(request.get_header("Authorization"), "Bearer test-token")
+
     # GitHub's GET /releases/tags/{tag} returns only published releases, so the
     # workflow's own draft must be found in the authenticated release list.
     def test_published_release_from_tag_lookup_is_used(self):
