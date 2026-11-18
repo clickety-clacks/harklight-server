@@ -1,4 +1,4 @@
-# Harklight Server v0.1.46
+# Harklight Server v0.1.47
 
 ## Changes
 
@@ -12,7 +12,7 @@
 
 ## Upgrade and recovery
 
-v0.1.46 writes FORMAT29, like v0.1.43 through v0.1.45. Upgrading from a
+v0.1.47 writes FORMAT29, like v0.1.43 through v0.1.45. Upgrading from a
 FORMAT29 release runs no store migration. Supported FORMAT27 state migrates to
 FORMAT29 on first start; returning to FORMAT27 then requires the pre-start
 backup and loses later writes. Recovery can fail.
