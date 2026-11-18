@@ -2,9 +2,9 @@
 
 ## Changes
 
-- Baseline views include a display-only `priority` equal to each item's
-  effective urgency (`low`, `normal`, `high`, or `now`). Baseline entries remain
-  unscored and do not gain bounce schedules. Jev selected and fallback views
+- Baseline and Jev fallback views include a display-only `priority` equal to each item's
+  effective urgency (`low`, `normal`, `high`, or `now`). These entries remain
+  unscored and do not gain bounce schedules. Jev selected views
   retain their existing score-only behavior.
 
 ---

@@ -5805,11 +5805,16 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  # Display metadata is added only to public baseline entries. Internal
+  # Display metadata is added only to public baseline/fallback entries. Internal
   # engine_entries and every score/bounce path remain unscored.
-  defp baseline_display_priority(entry, engine, person) do
-    record = Map.fetch!(engine.messages, {person, entry["sender_id"], entry["message_id"]})
-    Map.put(entry, "priority", Message.effective_urgency(record.message))
+  defp urgency_display_priority(entry, engine, person) do
+    message =
+      case Map.get(engine.messages, {person, entry["sender_id"], entry["message_id"]}) do
+        %{message: message} -> message
+        _ -> nil
+      end
+
+    Map.put(entry, "priority", Message.effective_urgency(message))
   end
 
   defp publish_priority_view(state, person, view, previous, engine_entries, reply_summary) do
@@ -5835,19 +5840,24 @@ defmodule AttentionServer.Relay do
           |> Enum.flat_map(fn row ->
             case Map.get(entries_by_id, Placement.identity(row)) do
               nil -> []
-              entry -> [baseline_display_priority(entry, state.store.engine, person)]
+              entry -> [entry]
             end
           end)
 
         shown
         |> Map.put(:entries, ordered_messages)
-        |> Map.update!(
-          :replies,
-          &Enum.map(&1, fn entry ->
-            baseline_display_priority(entry, state.store.engine, person)
-          end)
-        )
         |> Map.put(:free_order_version, 1)
+      else
+        shown
+      end
+
+    shown =
+      if view.algorithm == "baseline" or view.basis == "fallback" do
+        decorate = fn entries ->
+          Enum.map(entries, &urgency_display_priority(&1, state.store.engine, person))
+        end
+
+        shown |> Map.update!(:entries, decorate) |> Map.update!(:replies, decorate)
       else
         shown
       end
