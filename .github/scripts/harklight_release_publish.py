@@ -43,6 +43,7 @@ def api_url(path: str) -> str:
 
 
 def request_json(url: str, token: str | None = None, allow_404: bool = False):
+    token = token or os.environ.get("GH_TOKEN")
     headers = {
         "Accept": "application/vnd.github+json",
         "User-Agent": "HarklightReleaseWorkflow",
@@ -378,7 +379,7 @@ def parse_rehearsal_record(message: str) -> tuple[str, dict[str, str], list[str]
         "rehearsal-toolchain",
     }
     for line in message.splitlines():
-        if not (line.startswith("rehearsal:") or line.startswith("rehearsal-") or line.startswith("rehearsal ")):
+        if not (line.startswith("rehearsal:") or line.startswith("rehearsal-")):
             continue
         key, separator, value = line.partition(":")
         if not separator or key not in allowed_fields:

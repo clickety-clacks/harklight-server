@@ -8,10 +8,44 @@
   reports incomplete comparisons explicitly. Baseline sends and revisions do
   not run a check. Batch size remains unset pending synthetic Jev measurement.
 
-- Baseline and Jev fallback views include a display-only `priority` equal to each item's
-  effective urgency (`low`, `normal`, `high`, or `now`). These entries remain
-  unscored and do not gain bounce schedules. Jev selected views
-  retain their existing score-only behavior.
+---
+
+# Harklight Server v0.1.49
+
+## Changes
+
+- Persisted Agent device metadata is accepted with or without a final newline.
+  This restores interoperability with the current Agent metadata file format.
+  The existing file-size and identity checks remain in force; network wire
+  framing is unchanged. The Agent binary is unchanged.
+
+## Upgrade and recovery
+
+v0.1.49 writes FORMAT29, like the published v0.1.48 release. Upgrading from
+v0.1.48 runs no store migration. Supported FORMAT27 state migrates on first
+start; returning to FORMAT27 then requires the pre-start backup and loses
+later writes. Recovery can fail.
+
+---
+
+# Harklight Server v0.1.48
+
+## Changes
+
+- Baseline and Jev fallback views now show a display-only `priority` from each
+  item's effective urgency (`low`, `normal`, `high`, or `now`). Free baseline
+  views still use arrival order; fallback views keep their urgency and deadline
+  order. These entries remain unscored and gain no bounce schedules. Jev
+  selected views retain their score-only behavior.
+- Contradiction timeout tests now control their timing explicitly, avoiding
+  intermittent failures without changing server behavior.
+
+## Upgrade and recovery
+
+v0.1.48 writes FORMAT29, like v0.1.43 through v0.1.45. Upgrading from a
+FORMAT29 release runs no store migration. Supported FORMAT27 state migrates to
+FORMAT29 on first start; returning to FORMAT27 then requires the pre-start
+backup and loses later writes. Recovery can fail.
 
 ---
 

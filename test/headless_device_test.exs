@@ -179,6 +179,128 @@ defmodule AttentionServer.HeadlessDeviceTest do
              HeadlessDevice.read(identities["a1"], endpoint)
   end
 
+  for {format, ending} <- [{"Agent compact JSON", ""}, {"LF-terminated JSON", "\n"}] do
+    test "#{format} metadata supports read, persisted replay and operation retry", ctx do
+      %{relay: relay, endpoint: endpoint, identities: identities, keys: keys, dir: dir} = ctx
+      identity = identities["a2"]
+      metadata = agent_metadata(ctx)
+
+      for {name, bytes} <- metadata do
+        File.write!(Path.join(identity, name), bytes <> unquote(ending))
+      end
+
+      message = %{
+        "sender_id" => "app:test",
+        "message_id" => "agent-metadata",
+        "created_at" => 1,
+        "title" => "Read and answer"
+      }
+
+      assert %{"type" => "ok", "seq" => 1} = store_existing(relay, keys["a1"], message, 5)
+
+      assert {:ok, %{"cursor" => 1, "events" => [%{"message" => ^message}]}} =
+               HeadlessDevice.read(identity, endpoint)
+
+      assert {:ok, 1} = Relay.acknowledged_cursor(relay, keys["a2"])
+      answer_file = Path.join(dir, "answer.json")
+      File.write!(answer_file, ~s|{"text":"continue"}|)
+
+      assert {:ok, %{"type" => "ok", "seq" => 2, "op_id" => op_id}} =
+               HeadlessDevice.respond(
+                 identity,
+                 endpoint,
+                 "app:test",
+                 "agent-metadata",
+                 answer_file
+               )
+
+      # Exercise the same file reader for the persisted cursor, events and
+      # operation record, using both document endings on the next invocation.
+      for path <- Path.wildcard(Path.join(identity, "**/*.json")),
+          Path.basename(path) not in ["server.json", "enrollment.json"] do
+        File.write!(path, String.trim_trailing(File.read!(path), "\n") <> unquote(ending))
+      end
+
+      [operation] = Path.wildcard(Path.join(identity, "operations/*.json"))
+      operation_bytes = File.read!(operation)
+
+      assert {:ok, %{"type" => "ok", "seq" => 2, "op_id" => ^op_id}} =
+               HeadlessDevice.respond(
+                 identity,
+                 endpoint,
+                 "app:test",
+                 "agent-metadata",
+                 answer_file
+               )
+
+      assert File.read!(operation) == operation_bytes
+      assert Path.wildcard(Path.join(identity, "operations/*.json")) == [operation]
+
+      assert {:ok,
+              %{"cursor" => 2, "events" => [_, %{"type" => "lifecycle", "state" => "answered"}]}} =
+               HeadlessDevice.read(identity, endpoint)
+
+      assert {:ok, 2} = Relay.acknowledged_cursor(relay, keys["a2"])
+
+      for {name, bytes} <- metadata do
+        assert File.read!(Path.join(identity, name)) == bytes <> unquote(ending)
+      end
+    end
+  end
+
+  test "stored metadata keeps its byte limit with and without LF", ctx do
+    identity = ctx.identities["a2"]
+    max_bytes = 2 * (2 * 1024 * 1024) + 16_384
+
+    for ending <- ["", "\n"], {name, bytes} <- agent_metadata(ctx) do
+      path = Path.join(identity, name)
+      padded = bytes <> String.duplicate(" ", max_bytes - byte_size(bytes) - byte_size(ending))
+      File.write!(path, padded <> ending)
+      assert {:ok, %{"cursor" => 0, "events" => []}} = HeadlessDevice.read(identity, ctx.endpoint)
+      File.write!(path, padded <> " " <> ending)
+      assert {:error, :identity_or_server_mismatch} = HeadlessDevice.read(identity, ctx.endpoint)
+      File.write!(path, bytes)
+    end
+  end
+
+  test "stored metadata still rejects malformed JSON, trailing data and mismatched identity",
+       ctx do
+    identity = ctx.identities["a2"]
+
+    for {name, bytes} <- agent_metadata(ctx) do
+      path = Path.join(identity, name)
+
+      for invalid <- ["{oops}", bytes <> "{}", bytes <> "\ntrue\n", "{\"x\":1,\"x\":2}"] do
+        File.write!(path, invalid)
+
+        assert {:error, :identity_or_server_mismatch} =
+                 HeadlessDevice.read(identity, ctx.endpoint)
+      end
+
+      File.write!(path, bytes)
+    end
+
+    for {field, value} <- [
+          {"address", "127.0.0.2"},
+          {"name", "other.test"},
+          {"ca_sha256", "wrong"}
+        ] do
+      server = agent_metadata(ctx)["server.json"]
+      assert {:ok, saved} = JSON.decode_line(server <> "\n")
+      File.write!(Path.join(identity, "server.json"), JSON.encode!(Map.put(saved, field, value)))
+      assert {:error, :identity_or_server_mismatch} = HeadlessDevice.read(identity, ctx.endpoint)
+    end
+
+    File.write!(Path.join(identity, "server.json"), agent_metadata(ctx)["server.json"])
+
+    File.write!(
+      Path.join(identity, "enrollment.json"),
+      ~s|{"person_id":"A","device_id":"#{ctx.keys["a1"]}"}|
+    )
+
+    assert {:error, :identity_or_server_mismatch} = HeadlessDevice.read(identity, ctx.endpoint)
+  end
+
   test "stored messages remain scoped to their person", ctx do
     %{relay: relay, endpoint: endpoint, identities: identities, keys: keys, dir: dir} = ctx
 
@@ -311,6 +433,19 @@ defmodule AttentionServer.HeadlessDeviceTest do
 
     refute function_exported?(HeadlessDevice, :send_message, 3)
     refute function_exported?(HeadlessDevice, :receipt, 4)
+  end
+
+  # Match ServerFile/EnrollmentFile field order and compact serde_json::to_vec
+  # output from the Agent, including its optional origin-port metadata.
+  defp agent_metadata(ctx) do
+    ca_hash =
+      :crypto.hash(:sha256, File.read!(ctx.endpoint.ca_file)) |> Base.encode16(case: :lower)
+
+    %{
+      "server.json" =>
+        ~s|{"address":"127.0.0.1","name":"relay.test","port":#{ctx.endpoint.port},"ca_sha256":"#{ca_hash}","origin_port":18446}|,
+      "enrollment.json" => ~s|{"person_id":"A","device_id":"#{ctx.keys["a2"]}"}|
+    }
   end
 
   defp store_existing(relay, key, message, operation_number) do
