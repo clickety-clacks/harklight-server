@@ -32,11 +32,15 @@ defmodule AttentionServer.ContradictionsTest do
 
     running =
       Task.async(fn ->
-        Contradictions.run(@posted, items, @endpoint, @model, 1,
-          evaluator: evaluator,
-          clock: clock,
-          deadline: 60_000
-        )
+        check =
+          Contradictions.run(@posted, items, @endpoint, @model, 1,
+            evaluator: evaluator,
+            clock: clock,
+            deadline: 60_000
+          )
+
+        # Inspect the actual run caller's mailbox after all batch tasks stop.
+        {check, Process.info(self(), :messages)}
       end)
 
     assert_receive {:pending, worker}, 2_000
@@ -45,7 +49,8 @@ defmodule AttentionServer.ContradictionsTest do
     send(collector, {:clock_time, 0})
     assert_receive {:clock_read, ^collector}, 2_000
     send(collector, {:clock_time, 60_000})
-    check = Task.await(running)
+    {check, {:messages, messages}} = Task.await(running)
+    refute Enum.any?(messages, &match?({_, {:ok, _}}, &1))
     assert_receive {:DOWN, ^monitor, :process, ^worker, :killed}, 2_000
     {check, worker}
   end
@@ -160,7 +165,6 @@ defmodule AttentionServer.ContradictionsTest do
     assert check["unchecked"] == 1
     assert hd(check["messages"])["message_id"] == "message-1"
     refute Process.alive?(worker)
-    refute_receive {_, {:ok, _}}, 0
   end
 
   test "unconfigured Jev reports incomplete without calling the evaluator" do
