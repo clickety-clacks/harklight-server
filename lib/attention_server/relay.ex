@@ -633,6 +633,10 @@ defmodule AttentionServer.Relay do
   def device_revoked?(server, verified_key),
     do: GenServer.call(server, {:device_revoked?, verified_key}, :infinity)
 
+  @doc "The current person for an enrolled, unrevoked device key (client API principal)."
+  def device_person(server, verified_key),
+    do: GenServer.call(server, {:device_person, verified_key}, :infinity)
+
   def open_session(server, verified_key),
     do: GenServer.call(server, {:open_session, verified_key, nil, nil, nil, :raw}, :infinity)
 
@@ -1185,6 +1189,9 @@ defmodule AttentionServer.Relay do
 
   defp dispatch_call({:device_revoked?, key}, _from, state),
     do: {:reply, Engine.device_revoked?(state.store.engine, key), state}
+
+  defp dispatch_call({:device_person, key}, _from, state),
+    do: {:reply, Engine.authorized_person(state.store.engine, key), state}
 
   defp dispatch_call({:owner_revision, person, key}, _from, state),
     do: {:reply, Engine.owner_revision(state.store.engine, person, key), state}

@@ -16,6 +16,10 @@ defmodule AttentionServer.DashboardBrowserSession do
   def resolve(server, cookie), do: GenServer.call(server, {:resolve, cookie}, :infinity)
   def end_session(server, cookie), do: GenServer.call(server, {:end_session, cookie}, :infinity)
 
+  @doc false
+  # The checked session behind a cookie, for the client API's browser principal.
+  def context(server, cookie), do: GenServer.call(server, {:browser_context, cookie}, :infinity)
+
   def open_browser_connection(server, cookie, recipient, worker),
     do:
       GenServer.call(

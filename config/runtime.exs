@@ -135,7 +135,9 @@ if System.get_env("ATTENTION_SERVER_ENABLE") == "1" do
     deployment_mode: deployment_mode,
     jev_score_record_path: System.get_env("ATTENTION_SERVER_JEV_SCORE_RECORD_PATH"),
     feature_flags_path: System.get_env("ATTENTION_SERVER_FEATURE_FLAGS_PATH"),
-    upload_cap: upload_cap
+    upload_cap: upload_cap,
+    # Temporary flag client_api_v2 (docs/feature-flags.md), read once at startup.
+    client_api_v2: System.get_env("ATTENTION_SERVER_CLIENT_API_V2") == "1"
   ]
 
   server_opts =
