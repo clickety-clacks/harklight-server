@@ -1,8 +1,9 @@
 # Harklight client API v2: field-level contract
 
 Status: **accepted field contract.** It includes the delivery owner's rulings
-1 to 10 and the product owner's go amendment on chat. It turns the client API r2
-specification (work item wi_e41bc552-9279-41d0-b015-07174b692dec, r2.4) into
+1 to 10, the contract rulings of rounds 2 to 4, and the product owner's chat
+and answer rules. It turns the client API r2 specification (work item
+wi_e41bc552-9279-41d0-b015-07174b692dec, r2.5) into
 exact JSON shapes and is the binding field-level contract. The behavior rules
 are the specification's: authentication, the version rule, gap-freedom,
 retention and retries. This file fixes names, types and the closed token list.
@@ -80,15 +81,16 @@ Schemas use JSON Schema 2020-12. `$ref`s point into the `$defs` below.
     "Item": {
       "type": "object",
       "required": ["item_id", "rev", "sender", "request_revision", "message", "files",
-                   "seen", "chat", "rank"],
+                   "seen", "chat", "rank", "created_at_ms"],
       "properties": {
         "item_id": { "$ref": "#/$defs/OpaqueId" },
         "rev": { "$ref": "#/$defs/Rev" },
         "sender": { "type": "string", "description": "The sending app, today's sender_id" },
         "request_revision": { "type": "integer", "minimum": 1 },
         "message": { "type": "object", "description": "Current message content, passed through unchanged" },
-        "files": { "type": "array", "items": { "$ref": "#/$defs/FileRef" } },
+        "files": { "type": "array", "items": { "$ref": "#/$defs/FileRef" }, "description": "Every file the item offers: the current revision's files plus any earlier revision's files that the current answer_ui references by name. Answer forms validate against this list alone." },
         "seen": { "type": "boolean", "description": "Mark Seen for the current substantive revision (today's opened)" },
+        "created_at_ms": { "$ref": "#/$defs/TimeMs", "description": "When the item first reached the person; orders the new-messages area" },
         "as": { "enum": ["message", "knock"], "description": "Present only when this client is a recipient, not the item's origin" },
         "chat": { "$ref": "#/$defs/Chat" },
         "availability": { "$ref": "#/$defs/Availability" },
@@ -105,7 +107,8 @@ Schemas use JSON Schema 2020-12. `$ref`s point into the `$defs` below.
         "available": { "type": "boolean", "description": "Informational only: the item came from an agent conversation. Never a gate on replies." },
         "started": { "type": "boolean" },
         "read_position": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/OpaqueId" }], "description": "entry_id read through" },
-        "last_origin_reply": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/OpaqueId" }], "description": "entry_id of the newest origin reply" }
+        "last_origin_reply": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/OpaqueId" }], "description": "entry_id of the newest origin reply" },
+        "unread_replies": { "type": "integer", "minimum": 0, "description": "Agent replies after the person's read position, computed by the server" }
       }
     },
 
@@ -124,8 +127,19 @@ Schemas use JSON Schema 2020-12. `$ref`s point into the `$defs` below.
       "properties": {
         "state": { "enum": ["answered", "cleared", "expired", "superseded", "retracted"] },
         "at_ms": { "$ref": "#/$defs/TimeMs" },
-        "no_comment": { "type": "boolean", "description": "Answered as no comment" },
-        "by_this_person": { "type": "boolean" }
+        "answer": { "$ref": "#/$defs/AnswerOutcome" },
+        "by_this_person": { "type": "boolean", "description": "Settled by any client of this person, not only this device" }
+      }
+    },
+
+    "AnswerOutcome": {
+      "type": "object",
+      "description": "Today's person-facing answer_outcome, unchanged in shape. Never the origin-only raw answer. Seen by every principal that can see the item.",
+      "required": ["kind"],
+      "properties": {
+        "kind": { "enum": ["seen", "reply", "default", "no_comment"] },
+        "text": { "type": "string" },
+        "value": { "description": "Only for kind default: the default answer's value" }
       }
     },
 
@@ -141,9 +155,10 @@ Schemas use JSON Schema 2020-12. `$ref`s point into the `$defs` below.
 
     "Rank": {
       "type": "object",
-      "required": ["key"],
+      "required": ["key", "section"],
       "properties": {
-        "key": { "type": "string", "description": "Sort ascending, byte-wise, to get the server's inbox order" },
+        "key": { "type": "string", "description": "Sort ascending, byte-wise, to get the server's inbox order across and within sections" },
+        "section": { "enum": ["current", "resolved"], "description": "Draw a heading where it changes (closed list, §4)" },
         "score": { "type": "number" },
         "due_at_ms": { "$ref": "#/$defs/TimeMs" }
       }
@@ -151,25 +166,24 @@ Schemas use JSON Schema 2020-12. `$ref`s point into the `$defs` below.
 
     "Entry": {
       "type": "object",
-      "required": ["entry_id", "item_id", "rev", "position", "kind", "author", "at_ms", "request_revision"],
+      "required": ["entry_id", "item_id", "rev", "position", "kind", "author", "request_revision"],
       "properties": {
         "entry_id": { "$ref": "#/$defs/OpaqueId" },
         "item_id": { "$ref": "#/$defs/OpaqueId" },
         "rev": { "$ref": "#/$defs/Rev" },
         "position": { "type": "integer", "minimum": 1, "description": "Creation order within the item; unique per item and never changes" },
-        "kind": { "enum": ["reply", "answer", "lifecycle", "revision", "availability", "receipt"], "description": "lifecycle entries record the origin's terminal actions; clients read them but cannot send them" },
+        "kind": { "enum": ["reply", "lifecycle", "revision", "availability"], "description": "lifecycle is only the origin's retraction fact; a revision entry (request revision 2 and later) marks that a revision happened. The answer outcome is Item.terminal, not an entry." },
         "author": { "enum": ["person", "origin", "server"] },
-        "at_ms": { "$ref": "#/$defs/TimeMs" },
+        "at_ms": { "$ref": "#/$defs/TimeMs", "description": "Absent on entries from before the cut-over; every entry created by 0.2 carries it" },
         "request_revision": { "type": "integer", "minimum": 1 },
         "text": { "type": "string" },
         "files": { "type": "array", "items": { "$ref": "#/$defs/FileRef" } },
         "in_reply_to": { "$ref": "#/$defs/OpaqueId" },
         "state": { "enum": ["active", "withdrawn", "retracted"], "description": "A withdrawal or retraction is an upsert of this member; entries are never removed" },
-        "terminal": { "$ref": "#/$defs/Terminal" },
         "availability": { "$ref": "#/$defs/Availability" },
         "delivery": {
           "type": "object",
-          "description": "Receipts for a person-authored entry",
+          "description": "Receipts for a person-authored entry, folded in from today's receipt facts",
           "properties": {
             "delivered": { "type": "boolean" },
             "acted": { "type": "boolean" }
@@ -199,7 +213,7 @@ Schemas use JSON Schema 2020-12. `$ref`s point into the `$defs` below.
           "description": "This device's push binding. Browsers get state unconfigured.",
           "required": ["state", "revision"],
           "properties": {
-            "state": { "enum": ["unconfigured", "ready", "queued", "sending", "waiting_retry", "endpoint_invalid", "blocked_configuration", "canceled"] },
+            "state": { "enum": ["unconfigured", "ready", "queued", "sending", "waiting_retry", "endpoint_invalid", "blocked_configuration", "canceled", "expired"] },
             "revision": { "type": "integer", "minimum": 0 },
             "environment": { "enum": ["production", "sandbox"] },
             "last_attempt_at_ms": { "$ref": "#/$defs/TimeMs" },
@@ -213,6 +227,37 @@ Schemas use JSON Schema 2020-12. `$ref`s point into the `$defs` below.
       "type": "object",
       "required": ["unresolved"],
       "properties": { "unresolved": { "type": "integer", "minimum": 0 } }
+    },
+
+    "Me": {
+      "type": "object",
+      "required": ["account", "limits", "answer_ui_limits", "retention_days", "features"],
+      "properties": {
+        "account": {
+          "type": "object",
+          "required": ["state"],
+          "properties": { "state": { "enum": ["active", "paused"] } }
+        },
+        "limits": {
+          "type": "object",
+          "required": ["upload_cap_bytes_per_file", "inline_decoded_bytes_per_entry"],
+          "properties": {
+            "upload_cap_bytes_per_file": { "oneOf": [{ "type": "integer", "minimum": 0 }, { "const": "none" }] },
+            "inline_decoded_bytes_per_entry": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "answer_ui_limits": {
+          "type": "object",
+          "description": "The one published UI/1 cap set (today's answer_ui_limits). Every 0.2 client renders up to it.",
+          "additionalProperties": { "type": "integer", "minimum": 0 }
+        },
+        "retention_days": { "type": "integer", "minimum": 1 },
+        "features": {
+          "type": "object",
+          "description": "Server-controlled client features still behind a flag at 0.2 (§4)",
+          "additionalProperties": { "type": "boolean" }
+        }
+      }
     }
   }
 }
@@ -225,8 +270,10 @@ Schemas use JSON Schema 2020-12. `$ref`s point into the `$defs` below.
 | `GET /v2/inbox?limit=&page=` | `InboxPage` |
 | `GET /v2/items/{item_id}` | `ItemResponse` |
 | `GET /v2/items/{item_id}/entries?before=&limit=` | `EntriesPage` |
+| `GET /v2/items/{item_id}/revisions/{n}` | `RevisionResponse`, for any request revision `n` from 1 to the current one |
 | `GET /v2/settings` | `SettingsResponse` |
 | `GET /v2/files/{file_id}` | The file bytes, with `Content-Type`, `Content-Length` and `ETag` |
+| `GET /v2/me` | `Me`. Answerable while the account is paused. |
 
 ```json
 {
@@ -258,6 +305,22 @@ Schemas use JSON Schema 2020-12. `$ref`s point into the `$defs` below.
         "item": { "$ref": "#/$defs/Item" }
       }
     },
+    "RevisionResponse": {
+      "type": "object",
+      "required": ["rev", "revision"],
+      "properties": {
+        "rev": { "$ref": "#/$defs/Position" },
+        "revision": {
+          "type": "object",
+          "required": ["request_revision", "message", "files"],
+          "properties": {
+            "request_revision": { "type": "integer", "minimum": 1 },
+            "message": { "type": "object", "description": "Passed through unchanged" },
+            "files": { "type": "array", "items": { "$ref": "#/$defs/FileRef" } }
+          }
+        }
+      }
+    },
     "SettingsResponse": {
       "type": "object",
       "required": ["rev", "settings"],
@@ -281,6 +344,24 @@ Schemas use JSON Schema 2020-12. `$ref`s point into the `$defs` below.
   version-gate them by `rev`.
 - The inbox pages through every item the person can see, terminal ones
   included, in rank order. `next_page` is absent on the last page.
+- **Sections** are a closed list taken from today's inbox order:
+  - `current`: items still waiting on the person, in today's ranked or free
+    order;
+  - `resolved`: settled items, newest first.
+
+  `rank.key` orders items across and within sections. Today's unread-reply
+  rows are a client rendering of `Chat.unread_replies` and
+  `Chat.last_origin_reply`.
+- **Files.** A file uploaded through `POST /v2/files` is served with the
+  `Content-Type` it was sent with. Files attached inline before the cut-over
+  are served as `application/octet-stream`.
+- **`GET /v2/me` features.** It carries only the server-controlled client
+  features still behind a flag at 0.2. Today's three app flags are
+  classified as follows:
+  - `progress_inbox`: on for everyone, so it is retired and not carried;
+  - `server_matched_push_routing`: carried; off unless the operator turns it
+    on;
+  - `priority_level_editing`: carried; off unless the operator turns it on.
 
 ## 5. Writes
 
@@ -297,7 +378,7 @@ Every write that succeeds answers `200`, or `201` for `POST /v2/files`, with a
 | `PUT /v2/devices/me/push` | `{"token": string, "environment": "production" \| "sandbox", "revision": int}` |
 | `DELETE /v2/devices/me/push` | none |
 | `PUT /v2/devices/me/focus` | `{"item_id"?: OpaqueId, "ttl_s": int 1..3600}` |
-| `POST /v2/files` | Raw bytes with `Content-Type` and `Content-Length` |
+| `POST /v2/files` | Raw bytes with `Content-Type`, `Content-Length` and `Content-Disposition: attachment; filename*=UTF-8''<percent-encoded name>` |
 
 ```json
 {
@@ -330,9 +411,10 @@ Every write that succeeds answers `200`, or `201` for `POST /v2/files`, with a
     },
     "FileCreated": {
       "type": "object",
-      "required": ["file_id", "sha256", "size"],
+      "required": ["file_id", "name", "sha256", "size"],
       "properties": {
         "file_id": { "$ref": "#/$defs/OpaqueId" },
+        "name": { "type": "string", "minLength": 1 },
         "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
         "size": { "type": "integer", "minimum": 0 }
       }
@@ -342,28 +424,37 @@ Every write that succeeds answers `200`, or `201` for `POST /v2/files`, with a
 ```
 
 - **Answer.** The body carries at most one of `choice`, `comment` and
-  `result`, which keeps today's single stored answer value:
+  `result`, which keeps today's single stored answer value. The first answer
+  settles a request, and a second gets `409 already_answered`.
   - `choice` is the `id` of one `value` action in the item's
     `attention-client.actions/1` `answer_ui`. The server stores that action's
     `value`. An `id` that names no such action is `400 invalid_field`, with
     `field: "choice"`.
-  - `comment` is the typed reply of the item's `text` action, stored as the
-    answer text. An item with no `text` action gets `400 invalid_field`, with
-    `field: "comment"`.
+  - `comment` is a plain-text answer. It is accepted on **any answerable
+    item**: an item with an open request, with or without an `answer_ui`,
+    including one that carries an answer screen.
   - `result` is the structured result of an `attention-client.ui/1`
     `answer_ui`, stored as today's answer value. On an item with any other
     `answer_ui`, it is `400 invalid_field`, with `field: "result"`.
   - With none of them, the answer is "no comment", today's
     `answer_no_comment`.
   - More than one of them is `400 invalid_field`.
+  - An item with no open request, such as an FYI, is not answerable: an answer
+    there is `409 already_answered` if it was answered, otherwise
+    `400 invalid_field`. Chat uses `/replies`.
+- **File name.** `POST /v2/files` requires the name in
+  `Content-Disposition: attachment; filename*=UTF-8''<percent-encoded name>`
+  (RFC 6266, RFC 5987). A missing or empty name is `400 invalid_field`, with
+  `field: "name"`. Replies keep `file_ids`, because the name belongs to the
+  file.
 - **Replies** are accepted in every item state: open, answered, terminal,
   retracted but still visible, and while the agent is not listening. A reply
   to an agent that is not listening is stored and delivered when the agent
   next reads. The API encodes no chat-closing rule, and availability is
   informational.
 - **Lifecycle** is not part of the client API. Terminal actions stay on the
-  origin API, and their results are readable as `Item.terminal` and as
-  `lifecycle` entries.
+  origin API. Their results are readable as `Item.terminal`, and a retraction
+  also as a `lifecycle` entry.
 - **Read position** takes an `entry_id`, and the server compares entries by
   `position`, max-wins. Sending an entry at or below the current position
   answers `200` with the unchanged item.
@@ -415,7 +506,7 @@ Every write that succeeds answers `200`, or `201` for `POST /v2/files`, with a
     "Closing": {
       "type": "object",
       "required": ["reason"],
-      "properties": { "reason": { "enum": ["revoked", "server_shutdown"] } }
+      "properties": { "reason": { "enum": ["revoked", "server_shutdown", "account_paused"] } }
     }
   }
 }
@@ -432,15 +523,51 @@ Every write that succeeds answers `200`, or `201` for `POST /v2/files`, with a
 - **SSE** (`Accept: text/event-stream`):
   - Each change is one event: `id: <rev>`, `event: <kind>`, and
     `data: <data as one line of JSON>`.
-  - The server writes `: heartbeat` at least every 25 s and never ends a feed
-    for idleness.
+  - The server writes `event: heartbeat` with `data: {}` and **no `id:`
+    line** at least every 25 s, and never ends a feed for idleness. A heartbeat
+    never moves the cursor and never appears in a JSON batch. Clients use it
+    only for the 60 s liveness rule.
   - Before a server-initiated end, it sends `event: closing` with
     `data: Closing`. That event has **no `id:` line**, because it is not a log
     change and must not move `Last-Event-ID`.
 - **`after` older than retention:** `410` with an `Error` body whose `error` is
   `cursor_expired`, in both forms.
 - **Feed ID:** the feed's `Request-Id` is its ID. The server logs it at open,
-  and at close with `revoked`, `server_shutdown` or `client_closed`.
+  and at close with `revoked`, `server_shutdown`, `account_paused` or
+  `client_closed`.
+
+## 6.1 Push payload
+
+A 0.2 push keeps today's APNs alert, badge and background form, and today's
+visible text. Its `attention` member changes:
+
+```json
+{
+  "attention": {
+    "v": 2,
+    "type": "sync",
+    "server": "<32 hex characters, today's server identity>",
+    "locator": {
+      "v": 2,
+      "binding_id": "<uuid>",
+      "person_id": "<person>",
+      "device_id": "<device>",
+      "item_id": "<item_id>",
+      "rev": 42,
+      "target": "chat"
+    }
+  }
+}
+```
+
+- `server` is unchanged, because a device can be enrolled with several
+  Servers.
+- `item_id` and `rev` name the change that caused the push.
+- `sender_id`, `message_id` and `acceptance_seq` are dropped.
+- `target` is present only for a chat push, as today.
+- The app routes by `server` and `item_id`. If its cursor is already at or
+  past `rev`, there is nothing to fetch; otherwise it fetches a JSON batch
+  from its cursor.
 
 ## 7. Errors
 
@@ -454,7 +581,8 @@ Every write that succeeds answers `200`, or `201` for `POST /v2/files`, with a
         "error": { "enum": ["not_found", "invalid_field", "stale_request", "already_answered",
                             "already_retracted", "idempotency_conflict", "precondition_failed",
                             "cursor_expired", "unauthorized", "forbidden", "retry_later",
-                            "storage_unavailable", "payload_too_large", "unsupported"] },
+                            "storage_unavailable", "payload_too_large", "unsupported",
+                            "account_paused"] },
         "field": { "type": "string" },
         "retryable": { "type": "boolean" },
         "request_id": { "$ref": "#/$defs/OpaqueId" }
@@ -467,11 +595,12 @@ Every write that succeeds answers `200`, or `201` for `POST /v2/files`, with a
 | `error` | Status | `retryable` | When (today's engine reason, where one exists) |
 |---|---|---|---|
 | `invalid_field` | 400 | false | Malformed body, unknown member or bad value (`invalid_field`, `bad_frame`) |
-| `unauthorized` | 401 | false | Browser session missing or expired. Devices fail at TLS instead. |
+| `unauthorized` | 401 | false | Browser session missing or expired. A device revoked while its connection is open (each request re-checks enrollment; HTTP/1.1 also gets `Connection: close`). New device connections fail at TLS instead. |
 | `forbidden` | 403 | false | The principal may not do this (`forbidden`, `not_person`, `not_origin`) |
+| `account_paused` | 403 | false | The account is paused (`inactive_account`). Every `/v2` request except `GET /v2/me` gets it; open feeds get `closing` with `account_paused`. |
 | `not_found` | 404 | false | Unknown or invisible item, entry or file (`unknown_message`, `not_found`) |
 | `stale_request` | 409 | false | `request_revision` is behind the item (`stale_revision`) |
-| `already_answered` | 409 | false | Only on `/answer`: the item is already answered (`closed`) |
+| `already_answered` | 409 | false | Only on `/answer`: the item is already answered, or has no open request and was answered (`closed`) |
 | `already_retracted` | 409 | false | The origin retracted the item (`retracted`) |
 | `idempotency_conflict` | 409 | false | Same key, different request (`operation_conflict`) |
 | `precondition_failed` | 412 | false | `If-Match` does not match. Also a superseded push `revision` (`stale_push_binding`). |
@@ -491,8 +620,12 @@ content, tokens or identities.
     `chat_started`/`chat_read_position` become `chat`, `origin_result` becomes
     `result`, and `priority_view` becomes `rank`;
   - terminal state, availability, files and `as`;
-  - conversation entries for replies, answers, lifecycle facts, request
-    revisions, availability changes and delivery receipts;
+  - conversation entries for replies, retractions, request revisions and
+    availability changes, with delivery receipts folded into
+    `Entry.delivery`;
+  - the answer outcome, as `Terminal.answer`;
+  - today's inbox sections and unread-reply counts, as `Rank.section` and
+    `Chat.unread_replies`;
   - priority levels and push status.
 - **Dropped from client resources:**
   - `seq`, `conversation_seq`, `accepted_seq`, `latest_origin_reply_seq`,
@@ -538,5 +671,30 @@ The delivery owner's rulings on this draft are applied above:
 9. **Structured answers:** an optional `result` object, accepted only for
    `attention-client.ui/1` items (see ruling 1 above).
 10. **Answer members are mutually exclusive** (see ruling 1 above).
+
+Rounds 2 to 4 of the contract rulings, and the chat and answer rules, are
+applied as well. Round 4 wins where rounds conflict:
+
+- **Answer outcome:** `Terminal.answer` is today's `answer_outcome`. There are
+  no answer entries, and `Terminal.no_comment` is replaced by
+  `answer.kind: "no_comment"`.
+- **Entries:** a `lifecycle` entry is a retraction only, receipts fold into
+  `Entry.delivery`, and `Entry.at_ms` is optional before the cut-over.
+- **Earlier revisions** are read through
+  `GET /v2/items/{item_id}/revisions/{n}`. Revision entries are markers.
+- **Files:** `Item.files` includes earlier files the current screen
+  references. Upload names travel in `Content-Disposition`, and content types
+  are kept.
+- **Answers:** `comment` is accepted on any answerable item.
+- **Chat** never closes.
+- **Feed:**
+  - the heartbeat is an id-less `heartbeat` event;
+  - paused accounts get `account_paused`;
+  - a device revoked while its connection is open gets `401`.
+- **Inbox:** `Rank.section`, `Chat.unread_replies`, `Item.created_at_ms` and
+  push state `expired`.
+- **`GET /v2/me`:** account state, file limits, the one published UI/1 cap
+  set, retention and live features.
+- **Push payload:** §6.1.
 
 No questions are open.
