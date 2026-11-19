@@ -14,7 +14,7 @@ defmodule AttentionServer.PendingEnrollmentTest do
     %{certs: certs}
   end
 
-  test "pending identity is immutable; secret, owner and expiry are separate authorities", %{
+  test "pending identity is immutable; secret and owner are separate authorities", %{
     certs: certs
   } do
     owner_a = TLSFixtures.certificate_der!(certs, "a1")
@@ -30,58 +30,34 @@ defmodule AttentionServer.PendingEnrollmentTest do
     assert {:ok, engine} = Engine.operator_bootstrap(engine, @person_a, owner_a_key)
     assert {:ok, engine} = Engine.operator_bootstrap(engine, @person_b, owner_b_key)
 
-    assert {:ok, engine} =
-             Engine.pending_enroll(engine, device, "A second device", @code_a, secret, 0)
+    assert {:ok, engine} = Engine.pending_enroll(engine, device, "A second device", @code_a, secret)
 
-    assert {:ok, %{"state" => "pending"}} = Engine.pending_status(engine, secret, 86_399_999)
-    assert {:ok, %{"state" => "expired"}} = Engine.pending_status(engine, secret, 86_400_000)
-    assert {:ok, %{"state" => "expired"}} = Engine.pending_status(engine, secret, 100_000_000)
-    assert {:error, :not_found} = Engine.pending_status(engine, secret, 172_800_000)
-    assert {:error, :not_found} = Engine.pending_status(engine, other_secret, 1)
+    assert {:error, :key_pending} =
+             Engine.pending_enroll(engine, device, "again", @code_b, other_secret)
 
-    assert {:error, :not_found} =
-             Engine.pending_lookup(engine, @person_b, owner_a_key, @code_a, 1)
+    assert {:ok, %{"state" => "pending"}} = Engine.pending_status(engine, secret)
+    assert {:error, :not_found} = Engine.pending_status(engine, other_secret)
 
-    assert {:ok, %{label: "A second device", key: ^device_key}} =
-             Engine.pending_lookup(engine, @person_a, owner_a_key, @code_a, 1)
+    assert {:error, :not_found} = Engine.pending_lookup(engine, @person_b, owner_a_key, @code_a)
 
-    assert {:error, :forbidden} =
-             engine_approve(engine, @person_b, owner_a_key, @code_a, [], 1)
+    assert {:ok, %{label: "A second device", key: ^device_key, expires_at: nil}} =
+             Engine.pending_lookup(engine, @person_a, owner_a_key, @code_a)
 
-    assert {:error, :expired} =
-             engine_approve(engine, @person_a, owner_a_key, @code_a, [], 86_400_000)
-
-    assert {:ok, engine} =
-             Engine.pending_enroll(
-               engine,
-               device,
-               "A second device",
-               @code_b,
-               other_secret,
-               86_400_001
-             )
+    assert {:error, :forbidden} = engine_approve(engine, @person_b, owner_a_key, @code_a, [], 1)
 
     assert {:ok, approved, ^device_key} =
-             engine_approve(
-               engine,
-               @person_a,
-               owner_a_key,
-               @code_b,
-               ["app:test"],
-               86_400_002
-             )
+             engine_approve(engine, @person_a, owner_a_key, @code_a, ["app:test"], 2)
 
     assert approved.devices[device_key].person == @person_a
     assert MapSet.member?(approved.sender_grants[{@person_a, device_key}], "app:test")
 
     assert {:ok, %{"state" => "approved", "person_id" => @person_a, "device_id" => ^device_key}} =
-             Engine.pending_status(approved, other_secret, 86_400_003)
+             Engine.pending_status(approved, secret)
 
     assert {:ok, ^approved, ^device_key} =
-             engine_approve(approved, @person_a, owner_a_key, @code_b, [], 86_400_003)
+             engine_approve(approved, @person_a, owner_a_key, @code_a, [], 3)
 
-    assert {:error, :not_found} =
-             engine_approve(approved, @person_b, owner_b_key, @code_b, [], 86_400_003)
+    assert {:error, :not_found} = engine_approve(approved, @person_b, owner_b_key, @code_a, [], 3)
 
     assert {:error, :key_in_use} =
              Engine.pending_enroll(
@@ -89,12 +65,100 @@ defmodule AttentionServer.PendingEnrollmentTest do
                device,
                "reuse",
                "WXYZ234567",
-               :crypto.hash(:sha256, "C"),
-               86_400_003
+               :crypto.hash(:sha256, "C")
              )
 
     assert {:error, :key_in_use} = Engine.operator_recover(approved, @person_b, device_key)
     assert {:error, :key_in_use} = Engine.operator_recover(approved, @person_a, owner_b_key)
+  end
+
+  test "a waiting request never expires and approves with no deadline binding", %{certs: certs} do
+    owner = TLSFixtures.certificate_der!(certs, "a1")
+    device = TLSFixtures.certificate_der!(certs, "a2")
+    {:ok, owner_key} = DeviceIdentity.from_certificate(owner)
+    {:ok, device_key} = DeviceIdentity.from_certificate(device)
+    secret = :crypto.hash(:sha256, "secret-A")
+
+    {:ok, engine} = Engine.operator_bootstrap(Engine.new(), @person_a, owner_key)
+    {:ok, engine} = Engine.pending_enroll(engine, device, "waiting", @code_a, secret)
+
+    item = engine.pending_enrollments[@code_a]
+    assert item.expires_at == nil and item.status_expires_at == nil
+    assert {:ok, %{"state" => "pending"}} = Engine.pending_status(engine, secret)
+
+    # Approval a very long time later, with the owner binding the null deadline.
+    far_future = System.system_time(:millisecond) + 10 * 365 * 86_400_000
+
+    assert {:ok, approved, ^device_key} =
+             Engine.pending_approve(
+               engine,
+               @person_a,
+               owner_key,
+               @code_a,
+               device_key,
+               nil,
+               [],
+               far_future
+             )
+
+    assert approved.devices[device_key].person == @person_a
+  end
+
+  test "starting again with the same key returns the same request and code with a new status secret",
+       %{certs: certs} do
+    owner = TLSFixtures.certificate_der!(certs, "a1")
+    device = TLSFixtures.certificate_der!(certs, "a2")
+    {:ok, owner_key} = DeviceIdentity.from_certificate(owner)
+    first_secret = :crypto.hash(:sha256, "secret-A")
+    second_secret = :crypto.hash(:sha256, "secret-B")
+
+    {:ok, engine} = Engine.operator_bootstrap(Engine.new(), @person_a, owner_key)
+    {:ok, engine} = Engine.pending_enroll(engine, device, "first label", @code_a, first_secret)
+
+    assert {:ok, restarted, @code_a} =
+             Engine.pending_restart(engine, device, "second label", second_secret)
+
+    assert map_size(restarted.pending_enrollments) == 1
+    assert restarted.pending_enrollments[@code_a].label == "second label"
+    assert {:ok, %{"state" => "pending"}} = Engine.pending_status(restarted, second_secret)
+    assert {:error, :not_found} = Engine.pending_status(restarted, first_secret)
+
+    other_device = TLSFixtures.certificate_der!(certs, "unknown")
+    assert :none = Engine.pending_restart(restarted, other_device, "other", first_secret)
+
+    # A secret already held by any request is never reused.
+    assert :none = Engine.pending_restart(restarted, device, "third label", second_secret)
+
+    # A request bound to a person by an invitation and an approved request
+    # are not restarted.
+    {:ok, key} = DeviceIdentity.from_certificate(device)
+    joined = put_in(restarted.pending_enrollments[@code_a].person, @person_a)
+    assert :none = Engine.pending_restart(joined, device, "joined", first_secret)
+
+    approved =
+      update_in(restarted.pending_enrollments[@code_a], &Map.put(&1, :state, :approved))
+
+    assert key == approved.pending_enrollments[@code_a].key
+    assert :none = Engine.pending_restart(approved, device, "approved", first_secret)
+  end
+
+  test "a repeated enroll start through the relay returns the same approval code", %{
+    certs: certs
+  } do
+    owner = TLSFixtures.certificate_der!(certs, "a1")
+    device = TLSFixtures.certificate_der!(certs, "a2")
+    {:ok, relay} = Relay.start_link([])
+    assert {:ok, _person} = Relay.operator_bootstrap(relay, owner)
+
+    assert {:ok, first} = Relay.pending_enroll(relay, device, "waiting")
+    assert {:ok, second} = Relay.pending_enroll(relay, device, "waiting again")
+
+    assert second.approval_code == first.approval_code
+    assert second.status_secret != first.status_secret
+    assert second.expires_at == nil
+    assert {:ok, %{"state" => "pending"}} = Relay.pending_status(relay, second.status_secret)
+    assert {:error, :not_found} = Relay.pending_status(relay, first.status_secret)
+    GenServer.stop(relay)
   end
 
   test "pending status and approval survive SQLite restart without exposing code as status authority",

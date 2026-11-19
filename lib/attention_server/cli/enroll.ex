@@ -102,7 +102,7 @@ defmodule AttentionServer.CLI.Enroll do
 
           :key_pending ->
             AttentionServer.CLI.error!(
-              "key_pending: no old code or secret is recoverable; keep this key, wait ten minutes after this response, then explicitly retry; this is not enrollment success"
+              "key_pending: this key already has a waiting invitation request; keep this key and use status or retry with the saved secret; this is not enrollment success"
             )
 
           :key_in_use ->

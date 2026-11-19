@@ -17,7 +17,7 @@ person and returns `{:ok, credential}` with JSON string keys:
 - `person_id`: the stored person
 - `sign_in_token`: `hbs1_` followed by 64 lowercase hex characters encoding 32
   random bytes
-- `expires_at`: Unix milliseconds, exactly ten minutes after issuance
+- `expires_at`: `null`; a sign-in link does not expire, it works once
 - `sign_in_url`: present only when the opt-in dashboard host and port are
   configured; `https://HOST:PORT/sign-in#hbs1_...` keeps the bearer out of the
   HTTP request path and query
@@ -33,13 +33,10 @@ out of logs and generic status metadata; share it only with the intended
 owner. No public token-issuance endpoint or resolver is constructed here.
 
 Only a purpose-separated SHA-256 hash is persisted, alongside person, issuer
-key/revision, issuance/expiry, bounded retention and consumption time. At most
-1024 token records are retained. At the next issuance, spent or expired records
-and records from a retired owner key/revision are reclaimed before considering
-capacity, so unusable historical credentials cannot prevent a fresh login.
+key/revision, issuance time and consumption. At the next issuance, spent
+records and records from a retired owner key/revision are reclaimed.
 Reclaimed tokens return `invalid_sign_in` and cannot authenticate again; a
-retained spent token returns `used`. The capacity refusal applies to the bounded
-set of still usable, unconsumed links. Issuance refuses stale/currently invalid
+retained spent token returns `used`. Issuance refuses stale/currently invalid
 owner authority and cannot change device, invitation, sender or person grants.
 
 ## Authentication and consume
@@ -55,12 +52,9 @@ cannot receive it twice; a stale database writer returns storage failure
 instead of an authenticated principal.
 
 Refusals are `{:error, :invalid_sign_in}` for malformed, unknown or retired-issuer
-tokens, `{:error, :expired}` for a live token past expiry, and
-`{:error, :used}` for an already consumed token whose issuer remains current.
+tokens, and `{:error, :used}` for an already consumed token whose issuer remains current.
 No refusal discloses person/device metadata. Database failure returns
-`{:error, :storage_unavailable}`. An observed crossed expiry is durably fenced
-against clock rollback. Issuance during a rollback returns `clock_unavailable`
-until the clock catches up. This clock is independent of enrollment deadlines.
+`{:error, :storage_unavailable}`.
 
 The `hbs1_` format and hash purpose are distinct from invitation and enrollment
 status credentials; those credentials cannot authenticate a browser. There is

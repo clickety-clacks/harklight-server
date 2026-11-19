@@ -2751,9 +2751,7 @@ defmodule AttentionServer.Store do
                 not is_nil(item.person))) and
           is_binary(item.label) and byte_size(item.label) >= 1 and
           is_binary(item.secret_hash) and byte_size(item.secret_hash) == 32 and
-          is_integer(item.expires_at) and item.expires_at > 0 and
-          is_integer(item.status_expires_at) and
-          item.status_expires_at == item.expires_at + 86_400_000 and
+          valid_pending_deadlines?(item.expires_at, item.status_expires_at) and
           is_integer(item.request_generation) and item.request_generation > 0 and
           Map.get(item, :joined, false) in [true, false] and
           case item do
@@ -2776,6 +2774,15 @@ defmodule AttentionServer.Store do
         map_size(pending)
   end
 
+  # Current requests carry no deadlines; requests stored earlier keep theirs,
+  # which are no longer enforced.
+  defp valid_pending_deadlines?(nil, nil), do: true
+
+  defp valid_pending_deadlines?(expires_at, status_expires_at),
+    do:
+      is_integer(expires_at) and expires_at > 0 and
+        status_expires_at == expires_at + 86_400_000
+
   defp valid_pending_history?(engine) do
     history = engine.pending_history
 
@@ -2795,8 +2802,7 @@ defmodule AttentionServer.Store do
               status_expires_at: status_expires_at
             } = exact ->
               map_size(exact) == 5 and is_binary(hash) and byte_size(hash) == 32 and
-                hex_key?(key) and is_integer(expires_at) and expires_at > 0 and
-                status_expires_at == expires_at + 86_400_000
+                hex_key?(key) and valid_pending_deadlines?(expires_at, status_expires_at)
 
             %{
               state: :cancelled,
@@ -2811,8 +2817,7 @@ defmodule AttentionServer.Store do
                 is_binary(hash) and byte_size(hash) == 32 and
                 (is_nil(person) or Map.has_key?(engine.persons, person)) and hex_key?(key) and
                 is_binary(label) and byte_size(label) >= 1 and
-                is_integer(expires_at) and expires_at > 0 and
-                status_expires_at == expires_at + 86_400_000
+                valid_pending_deadlines?(expires_at, status_expires_at)
 
             %{
               state: :declined,
@@ -2828,8 +2833,7 @@ defmodule AttentionServer.Store do
                 is_binary(hash) and byte_size(hash) == 32 and
                 Map.has_key?(engine.persons, person) and hex_key?(key) and hex_key?(owner) and
                 is_binary(label) and byte_size(label) >= 1 and
-                is_integer(expires_at) and expires_at > 0 and
-                status_expires_at == expires_at + 86_400_000
+                valid_pending_deadlines?(expires_at, status_expires_at)
 
             %{
               state: :approved,
@@ -2848,8 +2852,7 @@ defmodule AttentionServer.Store do
                 is_binary(hash) and byte_size(hash) == 32 and
                 Map.has_key?(engine.persons, person) and hex_key?(key) and
                 is_binary(label) and byte_size(label) >= 1 and
-                is_integer(expires_at) and expires_at > 0 and
-                status_expires_at == expires_at + 86_400_000 and
+                valid_pending_deadlines?(expires_at, status_expires_at) and
                 (is_nil(approved_by) or hex_key?(approved_by)) and
                 get_in(engine.devices, [key, :person]) == person
 

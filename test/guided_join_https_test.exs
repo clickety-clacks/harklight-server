@@ -107,7 +107,8 @@ defmodule AttentionServer.GuidedJoinHTTPSTest do
     assert original.person == c.person
     assert {200, reply} = post(c, "/enroll", request)
     assert reply["approval_code"] == code
-    assert reply["expires_at"] == original.expires_at
+    assert reply["expires_at"] == nil
+    assert original.expires_at == nil
     assert {200, ^reply} = post(c, "/enroll", Map.put(request, "label", "retry label"))
 
     assert {409, %{"error" => "used"}} =
@@ -135,7 +136,7 @@ defmodule AttentionServer.GuidedJoinHTTPSTest do
     }
 
     assert %{"error" => "not_found"} =
-             owner(c, "a1", %{approval | "expected_expires_at" => original.expires_at + 1})
+             owner(c, "a1", %{approval | "expected_expires_at" => 1})
 
     assert %{"ok" => true, "device_id" => device} =
              owner(c, "a1", %{approval | "sender_grants" => []})
@@ -149,41 +150,6 @@ defmodule AttentionServer.GuidedJoinHTTPSTest do
     assert :sys.get_state(c.relay).store.engine.sender_grants == %{}
     assert {:ok, _cursor} = Relay.acknowledged_cursor(c.relay, device)
 
-    # A long-offline phone can read its approved result after the old status
-    # horizon; a historical status query still ends at that horizon.
-    state = :sys.get_state(c.relay)
-    receipt = state.store.engine.pending_history[code]
-    old_deadline = System.system_time(:millisecond) - 2 * 86_400_000
-
-    aged = %{
-      state.store.engine
-      | pending_history:
-          Map.put(state.store.engine.pending_history, code, %{
-            receipt
-            | expires_at: old_deadline,
-              status_expires_at: old_deadline + 86_400_000
-          })
-    }
-
-    {:ok, committed} =
-      Store.commit(state.store, aged, %{
-        person: c.person,
-        actor: "fixture",
-        action: "approval_result_past_status_horizon"
-      })
-
-    :sys.replace_state(c.relay, fn s -> %{s | store: committed} end)
-
-    assert {404, %{"error" => "not_found"}} =
-             post(c, "/enroll/status", %{"status_secret" => secret})
-
-    assert {:ok, _other_request} =
-             Relay.pending_enroll(
-               c.relay,
-               TLSFixtures.certificate_der!(c.certs, "unknown"),
-               "other"
-             )
-
     assert {200,
             %{
               "state" => "approved",
@@ -191,7 +157,7 @@ defmodule AttentionServer.GuidedJoinHTTPSTest do
               "device_id" => ^device,
               "approval_code" => ^code,
               "request_generation" => 1,
-              "expires_at" => ^old_deadline
+              "expires_at" => nil
             }} =
              post(c, "/enroll/resume", %{
                "status_secret" => secret,
@@ -214,7 +180,7 @@ defmodule AttentionServer.GuidedJoinHTTPSTest do
              })
   end
 
-  test "invitation refuses caller-chosen trust and honest declined/expired states remain durable",
+  test "invitation refuses caller-chosen trust and honest declined state remains durable",
        c do
     assert %{"error" => "invalid_request"} =
              owner(c, "a1", %{
@@ -258,39 +224,9 @@ defmodule AttentionServer.GuidedJoinHTTPSTest do
     {:ok, raw_secret} = Base.decode16(secret, case: :lower)
 
     assert {:ok, %{"state" => "declined"}} =
-             Engine.pending_status(
-               stored.engine,
-               :crypto.hash(:sha256, raw_secret),
-               System.system_time(:millisecond)
-             )
+             Engine.pending_status(stored.engine, :crypto.hash(:sha256, raw_secret))
 
     Store.close(stored)
-    assert %{"ok" => true, "invitation" => expired} = owner(c, "a1", %{"type" => "invite_create"})
-    {:ok, token} = Base.decode16(expired["invite_token"], case: :lower)
-    hash = :crypto.hash(:sha256, token)
-    state = :sys.get_state(c.relay)
-    invite = state.store.engine.join_invitations[hash]
-
-    engine = %{
-      state.store.engine
-      | join_invitations:
-          Map.put(state.store.engine.join_invitations, hash, %{
-            invite
-            | expires_at: System.system_time(:millisecond) - 1
-          })
-    }
-
-    {:ok, updated} =
-      Store.commit(state.store, engine, %{
-        person: c.person,
-        actor: "fixture",
-        action: "expire_invite"
-      })
-
-    :sys.replace_state(c.relay, fn s -> %{s | store: updated} end)
-
-    assert {410, %{"error" => "expired"}} =
-             post(c, "/enroll", %{request | "invite_token" => expired["invite_token"]})
 
     assert {404, %{"error" => "refused"}} =
              post(c, "/enroll", %{request | "invite_token" => "not-an-invite"})
@@ -324,7 +260,7 @@ defmodule AttentionServer.GuidedJoinHTTPSTest do
              post(c, "/enroll/cancel", %{cancel | "status_secret" => String.duplicate("e", 64)})
 
     assert {409, %{"error" => "stale_request", "current" => %{"approval_code" => ^code}}} =
-             post(c, "/enroll/cancel", %{cancel | "expected_expires_at" => deadline + 1})
+             post(c, "/enroll/cancel", %{cancel | "expected_expires_at" => 1})
 
     assert {200, %{"state" => "cancelled"}} = post(c, "/enroll/cancel", cancel)
     assert {200, %{"state" => "cancelled"}} = post(c, "/enroll/cancel", cancel)
@@ -351,278 +287,7 @@ defmodule AttentionServer.GuidedJoinHTTPSTest do
              Relay.owner_pending_approve(restarted, c.person, owner_key, code, key, deadline, [])
   end
 
-  test "expired guided request resumes once under the original person and key, then exact owner approval",
-       c do
-    {:ok, owner_key} =
-      DeviceIdentity.from_certificate(TLSFixtures.certificate_der!(c.certs, "a1"))
-
-    cert = TLSFixtures.certificate_der!(c.certs, "a2")
-    pem = File.read!(Path.join(c.certs, "a2.pem"))
-    {:ok, device_key} = DeviceIdentity.from_certificate(cert)
-    {:ok, invitation} = Relay.owner_invite_create(c.relay, c.person, owner_key)
-    secret = String.duplicate("7", 64)
-
-    assert {200, %{"approval_code" => old_code, "expires_at" => original_deadline}} =
-             post(c, "/enroll", %{
-               "invite_token" => invitation["invite_token"],
-               "status_secret" => secret,
-               "public_certificate" => pem
-             })
-
-    assert original_deadline - System.system_time(:millisecond) > 86_390_000
-
-    state = :sys.get_state(c.relay)
-    old = state.store.engine.pending_enrollments[old_code]
-    expired_at = System.system_time(:millisecond) - 2 * 86_400_000
-
-    changed = %{
-      state.store.engine
-      | pending_enrollments:
-          Map.put(state.store.engine.pending_enrollments, old_code, %{
-            old
-            | expires_at: expired_at,
-              status_expires_at: expired_at + 86_400_000
-          })
-    }
-
-    {:ok, committed} =
-      Store.commit(state.store, changed, %{
-        person: c.person,
-        actor: "fixture",
-        action: "past_ordinary_approval_deadline"
-      })
-
-    :sys.replace_state(c.relay, fn s -> %{s | store: committed} end)
-
-    assert {404, %{"error" => "not_found"}} =
-             post(c, "/enroll/status", %{"status_secret" => secret})
-
-    request = %{"status_secret" => secret, "public_certificate" => pem}
-
-    assert {404, %{"error" => "not_found"}} =
-             post(c, "/enroll/resume", %{
-               request
-               | "public_certificate" => File.read!(Path.join(c.certs, "b1.pem"))
-             })
-
-    assert :ok = post(c, "/enroll/resume", request, :drop)
-    wait_generation(c.relay, 2, System.monotonic_time(:millisecond) + 3_000)
-    assert {200, resumed} = post(c, "/enroll/resume", request)
-    assert resumed["state"] == "pending"
-    assert resumed["person_id"] == c.person
-    assert resumed["device_id"] == device_key
-    assert resumed["request_generation"] == 2
-    assert resumed["approval_code"] != old_code
-    assert resumed["expires_at"] - System.system_time(:millisecond) > 86_390_000
-    assert {200, ^resumed} = post(c, "/enroll/resume", request)
-
-    assert {200, ^resumed} =
-             post(c, "/enroll/resume", Map.put(request, "label", "not an authoritative rename"))
-
-    assert {400, %{"error" => "invalid_request"}} =
-             post(c, "/enroll/resume", Map.put(request, "person_id", c.other))
-
-    assert {400, %{"error" => "invalid_request"}} =
-             post(c, "/enroll/resume", %{request | "public_certificate" => "not a certificate"})
-
-    assert map_size(:sys.get_state(c.relay).store.engine.pending_enrollments) == 1
-
-    assert {409,
-            %{
-              "error" => "stale_request",
-              "current" => %{"approval_code" => current_code, "request_generation" => 2}
-            }} =
-             post(c, "/enroll/cancel", %{
-               "status_secret" => secret,
-               "approval_code" => old_code,
-               "expected_device_id" => device_key,
-               "expected_expires_at" => expired_at
-             })
-
-    assert current_code == resumed["approval_code"]
-
-    assert {:error, :not_found} =
-             Relay.owner_pending_approve(
-               c.relay,
-               c.person,
-               owner_key,
-               old_code,
-               device_key,
-               expired_at,
-               []
-             )
-
-    {:ok, saved} = Store.open(c.path)
-    assert saved.engine.pending_enrollments[resumed["approval_code"]].person == c.person
-    Store.close(saved)
-
-    assert %{"ok" => true, "device_id" => ^device_key} =
-             owner(c, "a1", %{
-               "type" => "pending_approve",
-               "approval_code" => resumed["approval_code"],
-               "expected_device_id" => device_key,
-               "expected_expires_at" => resumed["expires_at"],
-               "sender_grants" => []
-             })
-
-    assert :sys.get_state(c.relay).store.engine.sender_grants == %{}
-  end
-
-  test "saved cancellation without the first reply reconciles the exact tuple after expiry and renewal",
-       c do
-    {:ok, owner_key} =
-      DeviceIdentity.from_certificate(TLSFixtures.certificate_der!(c.certs, "a1"))
-
-    cert = TLSFixtures.certificate_der!(c.certs, "a2")
-    pem = File.read!(Path.join(c.certs, "a2.pem"))
-    {:ok, device_key} = DeviceIdentity.from_certificate(cert)
-    {:ok, invitation} = Relay.owner_invite_create(c.relay, c.person, owner_key)
-    secret = String.duplicate("6", 64)
-
-    assert {200, %{"approval_code" => old_code}} =
-             post(c, "/enroll", %{
-               "invite_token" => invitation["invite_token"],
-               "status_secret" => secret,
-               "public_certificate" => pem
-             })
-
-    state = :sys.get_state(c.relay)
-    old = state.store.engine.pending_enrollments[old_code]
-    expired_at = System.system_time(:millisecond) - 2 * 86_400_000
-
-    aged = %{
-      state.store.engine
-      | pending_enrollments:
-          Map.put(state.store.engine.pending_enrollments, old_code, %{
-            old
-            | expires_at: expired_at,
-              status_expires_at: expired_at + 86_400_000
-          })
-    }
-
-    {:ok, committed} =
-      Store.commit(state.store, aged, %{
-        person: c.person,
-        actor: "fixture",
-        action: "cancellation_after_lost_first_reply"
-      })
-
-    :sys.replace_state(c.relay, fn s -> %{s | store: committed} end)
-
-    assert {404, %{"error" => "not_found"}} =
-             post(c, "/enroll/status", %{"status_secret" => secret})
-
-    placeholder = %{
-      "status_secret" => secret,
-      "approval_code" => "AAAAAAAAAA",
-      "expected_device_id" => device_key,
-      "expected_expires_at" => 1
-    }
-
-    assert {409,
-            %{
-              "error" => "stale_request",
-              "current" => %{
-                "state" => "expired",
-                "person_id" => person,
-                "device_id" => ^device_key,
-                "approval_code" => ^old_code,
-                "expires_at" => ^expired_at,
-                "request_generation" => 1
-              }
-            }} = post(c, "/enroll/cancel", placeholder)
-
-    assert person == c.person
-    assert :sys.get_state(c.relay).store.engine.pending_enrollments[old_code].state == :pending
-    assert :sys.get_state(c.relay).store.engine.devices == %{}
-
-    assert {200, %{"state" => "pending", "request_generation" => 2} = renewed} =
-             post(c, "/enroll/resume", %{
-               "status_secret" => secret,
-               "public_certificate" => pem
-             })
-
-    assert {200, ^renewed} = post(c, "/enroll/status", %{"status_secret" => secret})
-
-    assert {409, %{"error" => "stale_request", "current" => ^renewed}} =
-             post(c, "/enroll/cancel", placeholder)
-
-    assert {200, %{"state" => "cancelled"}} =
-             post(c, "/enroll/cancel", %{
-               placeholder
-               | "approval_code" => renewed["approval_code"],
-                 "expected_expires_at" => renewed["expires_at"]
-             })
-
-    assert {200, %{"state" => "cancelled"}} =
-             post(c, "/enroll/resume", %{
-               "status_secret" => secret,
-               "public_certificate" => pem
-             })
-
-    assert {200, %{"state" => "cancelled"}} =
-             post(c, "/enroll/status", %{"status_secret" => secret})
-
-    assert {:error, :cancelled} =
-             Relay.owner_pending_approve(
-               c.relay,
-               c.person,
-               owner_key,
-               renewed["approval_code"],
-               device_key,
-               renewed["expires_at"],
-               []
-             )
-
-    {:ok, persisted} = Store.open(c.path)
-    assert persisted.engine.devices == %{}
-    assert persisted.engine.pending_history[renewed["approval_code"]].state == :cancelled
-    Store.close(persisted)
-  end
-
-  test "expired request cancellation remains terminal and a stale cancellation cannot target its successor",
-       c do
-    {:ok, owner_key} =
-      DeviceIdentity.from_certificate(TLSFixtures.certificate_der!(c.certs, "a1"))
-
-    cert = TLSFixtures.certificate_der!(c.certs, "a2")
-    {:ok, device_key} = DeviceIdentity.from_certificate(cert)
-    {:ok, invitation} = Relay.owner_invite_create(c.relay, c.person, owner_key)
-    secret = String.duplicate("8", 64)
-
-    {:ok, first} =
-      Relay.invited_enroll(c.relay, invitation["invite_token"], cert, "phone", secret)
-
-    old_code = first["approval_code"]
-    state = :sys.get_state(c.relay)
-    item = state.store.engine.pending_enrollments[old_code]
-    expired_at = System.system_time(:millisecond) - 1
-
-    {:ok, committed} =
-      Store.commit(
-        state.store,
-        %{
-          state.store.engine
-          | pending_enrollments:
-              Map.put(state.store.engine.pending_enrollments, old_code, %{
-                item
-                | expires_at: expired_at,
-                  status_expires_at: expired_at + 86_400_000
-              })
-        },
-        %{person: c.person, actor: "fixture", action: "past_approval_deadline"}
-      )
-
-    :sys.replace_state(c.relay, fn s -> %{s | store: committed} end)
-
-    assert {:ok, %{"state" => "cancelled"}} =
-             Relay.pending_cancel(c.relay, secret, old_code, device_key, expired_at)
-
-    assert {:ok, %{"state" => "cancelled"}} = Relay.pending_resume(c.relay, secret, cert)
-    assert :sys.get_state(c.relay).store.engine.devices == %{}
-  end
-
-  test "format-15 expired history resumes only when its consumed invitation proves the original person",
+  test "format-15 expired history is recovered as a waiting request only when its consumed invitation proves the original person",
        c do
     {:ok, owner_key} =
       DeviceIdentity.from_certificate(TLSFixtures.certificate_der!(c.certs, "a1"))
@@ -680,7 +345,7 @@ defmodule AttentionServer.GuidedJoinHTTPSTest do
     {:ok, resumed_relay} = Relay.start_link(store_path: c.path, join_configuration: c.config)
     on_exit(fn -> if Process.alive?(resumed_relay), do: GenServer.stop(resumed_relay) end)
 
-    assert {:ok, %{"state" => "pending", "person_id" => person, "request_generation" => 2}} =
+    assert {:ok, %{"state" => "pending", "person_id" => person, "request_generation" => 1}} =
              Relay.pending_resume(resumed_relay, secret, cert)
 
     assert person == c.person
@@ -725,8 +390,7 @@ defmodule AttentionServer.GuidedJoinHTTPSTest do
     assert {:ok, status} =
              Engine.pending_status(
                saved.engine,
-               :crypto.hash(:sha256, Base.decode16!(secret, case: :lower)),
-               System.system_time(:millisecond)
+               :crypto.hash(:sha256, Base.decode16!(secret, case: :lower))
              )
 
     assert status == elem(result, 1)
@@ -894,22 +558,5 @@ defmodule AttentionServer.GuidedJoinHTTPSTest do
     else
       :ok
     end
-  end
-
-  defp wait_generation(relay, generation, deadline) do
-    reached =
-      Enum.any?(:sys.get_state(relay).store.engine.pending_enrollments, fn {_code, item} ->
-        item.request_generation == generation
-      end)
-
-    unless reached do
-      if System.monotonic_time(:millisecond) >= deadline,
-        do: flunk("resume did not commit before lost reply")
-
-      Process.sleep(10)
-      wait_generation(relay, generation, deadline)
-    end
-
-    :ok
   end
 end

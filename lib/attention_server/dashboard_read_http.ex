@@ -698,7 +698,7 @@ defmodule AttentionServer.DashboardReadHTTP do
       case form(conn, opts, {:one_of, [~w(key deadline), ~w(key deadline senders)]}, 32_768) do
         {:ok, %{"key" => key, "deadline" => deadline} = fields, conn} ->
           with true <- Regex.match?(~r/\A[0-9a-f]{64}\z/, key),
-               {deadline, ""} <- Integer.parse(deadline),
+               {:ok, deadline} <- parse_deadline(deadline),
                {:ok, %{key: ^key, expires_at: ^deadline}} <-
                  backend_call(opts.backend, :review_pending, {principal, code}),
                true <- not Map.has_key?(fields, "senders") or action == "approve",
@@ -836,6 +836,16 @@ defmodule AttentionServer.DashboardReadHTTP do
          [_, version] <- Regex.run(~r/^version:\s*"([^"]+)"/m, contents) do
       {:ok, version}
     else
+      _ -> :error
+    end
+  end
+
+  # A waiting request created now has no deadline; the form carries "".
+  defp parse_deadline(""), do: {:ok, nil}
+
+  defp parse_deadline(value) do
+    case Integer.parse(value) do
+      {deadline, ""} -> {:ok, deadline}
       _ -> :error
     end
   end

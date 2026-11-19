@@ -968,7 +968,7 @@ defmodule AttentionServer.Relay do
     config = state.join_configuration
 
     with {:ok, invited, _invite} <-
-           AttentionServer.GuidedJoin.create(engine, person, owner, hash, config, now),
+           AttentionServer.GuidedJoin.create(engine, person, owner, hash, config),
          {:ok, waiting, %{"approval_code" => code}} <-
            guided_pending(
              invited,
@@ -977,7 +977,6 @@ defmodule AttentionServer.Relay do
              @hosted_test_device,
              status_hash,
              config,
-             now,
              8
            ) do
       case target do
@@ -1013,14 +1012,14 @@ defmodule AttentionServer.Relay do
     )
   end
 
-  defp guided_pending(_, _, _, _, _, _, _, 0), do: {:error, :refused}
+  defp guided_pending(_, _, _, _, _, _, 0), do: {:error, :refused}
 
-  defp guided_pending(engine, hash, cert, label, secret, config, now, attempts) do
+  defp guided_pending(engine, hash, cert, label, secret, config, attempts) do
     code = :crypto.strong_rand_bytes(7) |> Base.encode32(padding: false) |> binary_part(0, 10)
 
-    case AttentionServer.GuidedJoin.redeem(engine, hash, cert, label, secret, code, config, now) do
+    case AttentionServer.GuidedJoin.redeem(engine, hash, cert, label, secret, code, config) do
       {:error, :collision} ->
-        guided_pending(engine, hash, cert, label, secret, config, now, attempts - 1)
+        guided_pending(engine, hash, cert, label, secret, config, attempts - 1)
 
       result ->
         result
@@ -1036,52 +1035,27 @@ defmodule AttentionServer.Relay do
 
   defp secret_hash(_), do: {:error, :invalid_secret}
 
-  defp generate_pending(_engine, _certificate, _label, _now, 0),
+  defp generate_pending(_engine, _certificate, _label, 0),
     do: {:error, :storage_unavailable}
 
-  defp generate_pending(engine, certificate, label, now, attempts) do
+  defp generate_pending(engine, certificate, label, attempts) do
     secret = :crypto.strong_rand_bytes(32)
-    code = :crypto.strong_rand_bytes(7) |> Base.encode32(padding: false) |> binary_part(0, 10)
+    secret_hash = :crypto.hash(:sha256, secret)
 
-    case Engine.pending_enroll(
-           engine,
-           certificate,
-           label,
-           code,
-           :crypto.hash(:sha256, secret),
-           now
-         ) do
-      {:ok, next} -> {:ok, next, code, secret}
-      {:error, :collision} -> generate_pending(engine, certificate, label, now, attempts - 1)
-      error -> error
-    end
-  end
+    # A key that already has a waiting plain request gets that same request and
+    # approval code back; only its status secret changes.
+    case Engine.pending_restart(engine, certificate, label, secret_hash) do
+      {:ok, next, code} ->
+        {:ok, next, code, secret}
 
-  defp generate_resume(_engine, _hash, _cert, _now, 0), do: {:error, :storage_unavailable}
+      :none ->
+        code = :crypto.strong_rand_bytes(7) |> Base.encode32(padding: false) |> binary_part(0, 10)
 
-  defp generate_resume(engine, hash, cert, now, attempts) do
-    code = :crypto.strong_rand_bytes(7) |> Base.encode32(padding: false) |> binary_part(0, 10)
-
-    case Engine.pending_resume(engine, hash, cert, code, now) do
-      {:error, :collision} -> generate_resume(engine, hash, cert, now, attempts - 1)
-      result -> result
-    end
-  end
-
-  defp fence_pending_time(state, identity, now_ms) do
-    next = Engine.pending_observe_time(state.store.engine, identity, now_ms)
-
-    if next == state.store.engine do
-      {:ok, state}
-    else
-      case commit(state.store, next, %{
-             person: "system",
-             actor: "pending_deadline",
-             action: "pending_clock_fence"
-           }) do
-        {:ok, store} -> {:ok, %{state | store: store}}
-        {:error, _, _} -> {:error, :storage_unavailable}
-      end
+        case Engine.pending_enroll(engine, certificate, label, code, secret_hash) do
+          {:ok, next} -> {:ok, next, code, secret}
+          {:error, :collision} -> generate_pending(engine, certificate, label, attempts - 1)
+          error -> error
+        end
     end
   end
 
@@ -2032,9 +2006,7 @@ defmodule AttentionServer.Relay do
   end
 
   defp dispatch_call({:pending_enroll, certificate_der, label}, _from, state) do
-    now = System.system_time(:millisecond)
-
-    case generate_pending(state.store.engine, certificate_der, label, now, 8) do
+    case generate_pending(state.store.engine, certificate_der, label, 8) do
       {:ok, next_engine, code, secret} ->
         case commit(state.store, next_engine, %{
                person: "unassigned",
@@ -2195,38 +2167,23 @@ defmodule AttentionServer.Relay do
 
   defp dispatch_call({:consume_browser_sign_in, token}, _from, state) do
     with {:ok, hash} <- AttentionServer.BrowserSignIn.token_hash(token) do
-      now = System.system_time(:millisecond)
-      observed = AttentionServer.BrowserSignIn.observe_time(state.store.engine, hash, now)
+      case AttentionServer.BrowserSignIn.consume(state.store.engine, hash) do
+        {:ok, next, principal} ->
+          case commit(state.store, next, %{
+                 person: principal.person_id,
+                 actor: principal.owner_key,
+                 action: "browser_sign_in_consume"
+               }) do
+            {:ok, committed} ->
+              principal = with_hosted_label(principal, :display_name, next)
+              {:reply, {:ok, principal}, %{state | store: committed}}
 
-      case commit(state.store, observed, %{
-             person: "system",
-             actor: "browser_sign_in_deadline",
-             action: "browser_sign_in_clock_fence"
-           }) do
-        {:ok, store} ->
-          fenced = %{state | store: store}
-
-          case AttentionServer.BrowserSignIn.consume(store.engine, hash, now) do
-            {:ok, next, principal} ->
-              case commit(store, next, %{
-                     person: principal.person_id,
-                     actor: principal.owner_key,
-                     action: "browser_sign_in_consume"
-                   }) do
-                {:ok, committed} ->
-                  principal = with_hosted_label(principal, :display_name, next)
-                  {:reply, {:ok, principal}, %{fenced | store: committed}}
-
-                _ ->
-                  {:reply, {:error, :storage_unavailable}, fenced}
-              end
-
-            error ->
-              {:reply, error, fenced}
+            _ ->
+              {:reply, {:error, :storage_unavailable}, state}
           end
 
-        _ ->
-          {:reply, {:error, :storage_unavailable}, state}
+        error ->
+          {:reply, error, state}
       end
     else
       _ -> {:reply, {:error, :invalid_sign_in}, state}
@@ -2236,15 +2193,12 @@ defmodule AttentionServer.Relay do
   defp dispatch_call({:owner_invite_create, person, owner}, _from, state) do
     token = :crypto.strong_rand_bytes(32)
     hash = :crypto.hash(:sha256, token)
-    now = System.system_time(:millisecond)
-
     case AttentionServer.GuidedJoin.create(
            state.store.engine,
            person,
            owner,
            hash,
-           state.join_configuration,
-           now
+           state.join_configuration
          ) do
       {:ok, next, invite} ->
         case commit(state.store, next, %{
@@ -2269,57 +2223,34 @@ defmodule AttentionServer.Relay do
     do: {:reply, state.dashboard_origin, state}
 
   defp dispatch_call({:invitation_resolve, token}, _from, state) do
-    with {:ok, hash} <- secret_hash(token) do
-      now = System.system_time(:millisecond)
-      engine = state.store.engine
+    with {:ok, _hash} <- secret_hash(token) do
+      result =
+        case AttentionServer.GuidedJoin.resolve(
+               state.store.engine,
+               token,
+               state.join_configuration
+             ) do
+          {:ok, %{"person_id" => person} = response} ->
+            {:ok, with_hosted_label(response, "account_label", state.store.engine, person)}
 
-      observed =
-        case Map.get(engine.join_invitations, hash) do
-          %{code: nil} -> AttentionServer.GuidedJoin.observe_time(engine, hash, now)
-          _ -> engine
+          other ->
+            other
         end
 
-      case commit(state.store, observed, %{
-             person: "system",
-             actor: "join_deadline",
-             action: "join_clock_fence"
-           }) do
-        {:ok, store} ->
-          result =
-            case AttentionServer.GuidedJoin.resolve(
-                   store.engine,
-                   token,
-                   state.join_configuration,
-                   now
-                 ) do
-              {:ok, %{"person_id" => person} = response} ->
-                {:ok, with_hosted_label(response, "account_label", store.engine, person)}
-
-              other ->
-                other
-            end
-
-          {:reply, result, %{state | store: store}}
-
-        _ ->
-          {:reply, {:error, :storage_unavailable}, state}
-      end
+      {:reply, result, state}
     else
       _ -> {:reply, {:error, :unavailable}, state}
     end
   end
 
   defp dispatch_call({:owner_invite_create, person, owner, request_id}, _from, state) do
-    now = System.system_time(:millisecond)
-
     result =
       AttentionServer.GuidedJoin.create_for_request(
         state.store.engine,
         person,
         owner,
         request_id,
-        state.join_configuration,
-        now
+        state.join_configuration
       )
 
     case result do
@@ -2338,16 +2269,6 @@ defmodule AttentionServer.Relay do
             {:reply, {:error, :storage_unavailable}, state}
         end
 
-      {:error, reason, observed} ->
-        case commit(state.store, observed, %{
-               person: person,
-               actor: owner,
-               action: "invite_request_expired"
-             }) do
-          {:ok, store} -> {:reply, {:error, reason}, %{state | store: store}}
-          _ -> {:reply, {:error, :storage_unavailable}, state}
-        end
-
       error ->
         {:reply, error, state}
     end
@@ -2355,43 +2276,27 @@ defmodule AttentionServer.Relay do
 
   defp dispatch_call({:invited_enroll, token, certificate, label, status_secret}, _from, state) do
     with {:ok, hash} <- secret_hash(token), {:ok, status_hash} <- secret_hash(status_secret) do
-      now = System.system_time(:millisecond)
-      observed = AttentionServer.GuidedJoin.observe_time(state.store.engine, hash, now)
-
-      case commit(state.store, observed, %{
-             person: "system",
-             actor: "join_deadline",
-             action: "join_clock_fence"
-           }) do
-        {:ok, store} ->
-          fenced = %{state | store: store}
-
-          case guided_pending(
-                 store.engine,
-                 hash,
-                 certificate,
-                 label,
-                 status_hash,
-                 state.join_configuration,
-                 now,
-                 8
-               ) do
-            {:ok, next, response} ->
-              case commit(store, next, %{
-                     person: next.join_invitations[hash].person,
-                     actor: "invited_submitter",
-                     action: "invited_pending_enrollment"
-                   }) do
-                {:ok, committed} -> {:reply, {:ok, response}, %{state | store: committed}}
-                _ -> {:reply, {:error, :storage_unavailable}, fenced}
-              end
-
-            error ->
-              {:reply, error, fenced}
+      case guided_pending(
+             state.store.engine,
+             hash,
+             certificate,
+             label,
+             status_hash,
+             state.join_configuration,
+             8
+           ) do
+        {:ok, next, response} ->
+          case commit(state.store, next, %{
+                 person: next.join_invitations[hash].person,
+                 actor: "invited_submitter",
+                 action: "invited_pending_enrollment"
+               }) do
+            {:ok, committed} -> {:reply, {:ok, response}, %{state | store: committed}}
+            _ -> {:reply, {:error, :storage_unavailable}, state}
           end
 
-        _ ->
-          {:reply, {:error, :storage_unavailable}, state}
+        error ->
+          {:reply, error, state}
       end
     else
       _ -> {:reply, {:error, :refused}, state}
@@ -2399,26 +2304,22 @@ defmodule AttentionServer.Relay do
   end
 
   defp dispatch_call({:pending_cancel, secret, code, key, deadline}, _from, state) do
-    now = System.system_time(:millisecond)
-
-    with {:ok, hash} <- secret_hash(secret),
-         {:ok, fenced} <- fence_pending_time(state, {:secret, hash}, now) do
-      case Engine.pending_cancel(fenced.store.engine, hash, code, key, deadline, now) do
+    with {:ok, hash} <- secret_hash(secret) do
+      case Engine.pending_cancel(state.store.engine, hash, code, key, deadline) do
         {:ok, next, reply} ->
-          case commit(fenced.store, next, %{
+          case commit(state.store, next, %{
                  person: "requester",
                  actor: "pending_submitter",
                  action: "pending_cancel"
                }) do
-            {:ok, store} -> {:reply, {:ok, reply}, %{fenced | store: store}}
-            _ -> {:reply, {:error, :storage_unavailable}, fenced}
+            {:ok, store} -> {:reply, {:ok, reply}, %{state | store: store}}
+            _ -> {:reply, {:error, :storage_unavailable}, state}
           end
 
         error ->
-          {:reply, error, fenced}
+          {:reply, error, state}
       end
     else
-      {:error, :storage_unavailable} -> {:reply, {:error, :storage_unavailable}, state}
       _ -> {:reply, {:error, :not_found}, state}
     end
   end
@@ -2464,23 +2365,15 @@ defmodule AttentionServer.Relay do
   end
 
   defp dispatch_call({:owner_pending_decline, person, owner, code, key, deadline}, _from, state) do
-    now = System.system_time(:millisecond)
-
-    case fence_pending_time(state, {:code, code}, now) do
-      {:ok, fenced} ->
-        case Engine.pending_decline(fenced.store.engine, person, owner, code, key, deadline, now) do
-          {:ok, next} ->
-            case commit(fenced.store, next, %{
-                   person: person,
-                   actor: owner,
-                   action: "owner_device_decline"
-                 }) do
-              {:ok, store} -> {:reply, :ok, %{fenced | store: store}}
-              _ -> {:reply, {:error, :storage_unavailable}, fenced}
-            end
-
-          error ->
-            {:reply, error, fenced}
+    case Engine.pending_decline(state.store.engine, person, owner, code, key, deadline) do
+      {:ok, next} ->
+        case commit(state.store, next, %{
+               person: person,
+               actor: owner,
+               action: "owner_device_decline"
+             }) do
+          {:ok, store} -> {:reply, :ok, %{state | store: store}}
+          _ -> {:reply, {:error, :storage_unavailable}, state}
         end
 
       error ->
@@ -2492,15 +2385,7 @@ defmodule AttentionServer.Relay do
     with {:ok, secret} <- Base.decode16(secret_hex, case: :lower),
          true <- byte_size(secret) == 32 do
       hash = :crypto.hash(:sha256, secret)
-      now_ms = System.system_time(:millisecond)
-
-      case fence_pending_time(state, {:secret, hash}, now_ms) do
-        {:ok, fenced} ->
-          {:reply, Engine.pending_status(fenced.store.engine, hash, now_ms), fenced}
-
-        {:error, reason} ->
-          {:reply, {:error, reason}, state}
-      end
+      {:reply, Engine.pending_status(state.store.engine, hash), state}
     else
       _ -> {:reply, {:error, :not_found}, state}
     end
@@ -2511,44 +2396,17 @@ defmodule AttentionServer.Relay do
 
   defp dispatch_call({:pending_resume, secret_hex, cert_der}, _from, state) do
     with {:ok, hash} <- secret_hash(secret_hex) do
-      now_ms = System.system_time(:millisecond)
-
-      case fence_pending_time(state, {:secret, hash}, now_ms) do
-        {:ok, fenced} ->
-          case generate_resume(fenced.store.engine, hash, cert_der, now_ms, 8) do
-            {:ok, next, reply} ->
-              case commit(fenced.store, next, %{
-                     person: Map.get(reply, "person_id", "requester"),
-                     actor: "pending_submitter",
-                     action: "pending_resume"
-                   }) do
-                {:ok, store} -> {:reply, {:ok, reply}, %{fenced | store: store}}
-                _ -> {:reply, {:error, :storage_unavailable}, fenced}
-              end
-
-            error ->
-              {:reply, error, fenced}
-          end
-
-        {:error, reason} ->
-          {:reply, {:error, reason}, state}
+      case Engine.pending_resume(state.store.engine, hash, cert_der) do
+        {:ok, _engine, reply} -> {:reply, {:ok, reply}, state}
+        error -> {:reply, error, state}
       end
     else
       _ -> {:reply, {:error, :not_found}, state}
     end
   end
 
-  defp dispatch_call({:owner_pending_lookup, person, key, code}, _from, state) do
-    now_ms = System.system_time(:millisecond)
-
-    case fence_pending_time(state, {:code, code}, now_ms) do
-      {:ok, fenced} ->
-        {:reply, Engine.pending_lookup(fenced.store.engine, person, key, code, now_ms), fenced}
-
-      {:error, reason} ->
-        {:reply, {:error, reason}, state}
-    end
-  end
+  defp dispatch_call({:owner_pending_lookup, person, key, code}, _from, state),
+    do: {:reply, Engine.pending_lookup(state.store.engine, person, key, code), state}
 
   defp dispatch_call(
          {:owner_pending_approve, person, key, code, expected_key, expected_expires_at, senders},
@@ -2557,34 +2415,28 @@ defmodule AttentionServer.Relay do
        ) do
     now_ms = System.system_time(:millisecond)
 
-    case fence_pending_time(state, {:code, code}, now_ms) do
-      {:ok, fenced} ->
-        case Engine.pending_approve(
-               fenced.store.engine,
-               person,
-               key,
-               code,
-               expected_key,
-               expected_expires_at,
-               senders,
-               now_ms
-             ) do
-          {:ok, next_engine, device_key} ->
-            case commit(fenced.store, next_engine, %{
-                   person: person,
-                   actor: key,
-                   action: "owner_device_approve"
-                 }) do
-              {:ok, store} ->
-                next_state = ensure_priority_view_if_missing(%{fenced | store: store}, person)
-                {:reply, {:ok, device_key}, next_state}
+    case Engine.pending_approve(
+           state.store.engine,
+           person,
+           key,
+           code,
+           expected_key,
+           expected_expires_at,
+           senders,
+           now_ms
+         ) do
+      {:ok, next_engine, device_key} ->
+        case commit(state.store, next_engine, %{
+               person: person,
+               actor: key,
+               action: "owner_device_approve"
+             }) do
+          {:ok, store} ->
+            next_state = ensure_priority_view_if_missing(%{state | store: store}, person)
+            {:reply, {:ok, device_key}, next_state}
 
-              {:error, _, _} ->
-                {:reply, {:error, :storage_unavailable}, fenced}
-            end
-
-          {:error, reason} ->
-            {:reply, {:error, reason}, fenced}
+          {:error, _, _} ->
+            {:reply, {:error, :storage_unavailable}, state}
         end
 
       {:error, reason} ->
