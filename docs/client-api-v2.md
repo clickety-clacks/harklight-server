@@ -1,7 +1,7 @@
 # Harklight client API v2: field-level contract
 
-Status: **draft for the delivery owner's acceptance.** Nothing in this file is
-implemented. It turns the client API r2 specification (work item
+Status: **draft for the delivery owner's acceptance, with the first rulings
+applied.** Nothing in this file is implemented. It turns the client API r2 specification (work item
 wi_e41bc552-9279-41d0-b015-07174b692dec, r2.4; §5.1 is unchanged from r2.3)
 into exact JSON shapes. Once it is accepted, this file is the binding
 field-level contract. The behavior rules — authentication, the version rule,
@@ -17,8 +17,20 @@ and becomes the only client protocol in Server 0.2.x.
 - Every body is a UTF-8 JSON object. Unknown members must be ignored by
   clients. Servers refuse unknown members in request bodies with
   `400 invalid_field`.
-- `rev` is a positive integer: the person's change-log position. It starts at 1
-  per person and only increases.
+- **Two kinds of number.**
+  - A resource `rev` (on Item, Entry, Settings and each Change) is an integer
+    of at least 1: the change that last wrote that resource.
+  - A **position** is the `rev` member of a read, write or batch response
+    (`InboxPage`, `EntriesPage`, `ItemResponse`, `SettingsResponse`,
+    `WriteResult`, `ChangeBatch`). It is an integer of at least 0 and means
+    "reflects every change up to and including this one". An account with no
+    changes reports position 0, so its first change, rev 1, is not skipped.
+- **Cut-over seed.**
+  - For a person who already has data when the server moves to this API,
+    every existing resource is stamped `rev` 1 and the person's position
+    starts at 1. Their log starts at rev 2, and the seed is never a change
+    row.
+  - A person with no data starts at position 0.
 - `item_id`, `entry_id`, `file_id`, `page` and `Request-Id` are opaque strings
   of at most 128 characters. Clients compare them only for equality and never
   parse them.
@@ -50,7 +62,8 @@ Schemas use JSON Schema 2020-12. `$ref`s point into the `$defs` below.
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "harklight-client-api-v2",
   "$defs": {
-    "Rev": { "type": "integer", "minimum": 1 },
+    "Rev": { "type": "integer", "minimum": 1, "description": "Version of one resource or change" },
+    "Position": { "type": "integer", "minimum": 0, "description": "Reflects every change <= this rev" },
     "OpaqueId": { "type": "string", "minLength": 1, "maxLength": 128 },
     "TimeMs": { "type": "integer", "minimum": 0 },
 
@@ -140,12 +153,13 @@ Schemas use JSON Schema 2020-12. `$ref`s point into the `$defs` below.
 
     "Entry": {
       "type": "object",
-      "required": ["entry_id", "item_id", "rev", "kind", "author", "at_ms", "request_revision"],
+      "required": ["entry_id", "item_id", "rev", "position", "kind", "author", "at_ms", "request_revision"],
       "properties": {
         "entry_id": { "$ref": "#/$defs/OpaqueId" },
         "item_id": { "$ref": "#/$defs/OpaqueId" },
         "rev": { "$ref": "#/$defs/Rev" },
-        "kind": { "enum": ["reply", "answer", "lifecycle", "revision", "availability", "receipt"] },
+        "position": { "type": "integer", "minimum": 1, "description": "Creation order within the item; unique per item and never changes" },
+        "kind": { "enum": ["reply", "answer", "lifecycle", "revision", "availability", "receipt"], "description": "lifecycle entries record the origin's terminal actions; clients read them but cannot send them" },
         "author": { "enum": ["person", "origin", "server"] },
         "at_ms": { "$ref": "#/$defs/TimeMs" },
         "request_revision": { "type": "integer", "minimum": 1 },
@@ -211,9 +225,9 @@ Schemas use JSON Schema 2020-12. `$ref`s point into the `$defs` below.
 | Request | Response body |
 |---|---|
 | `GET /v2/inbox?limit=&page=` | `InboxPage` |
-| `GET /v2/items/{item_id}` | `{rev, item: Item}` |
+| `GET /v2/items/{item_id}` | `ItemResponse` |
 | `GET /v2/items/{item_id}/entries?before=&limit=` | `EntriesPage` |
-| `GET /v2/settings` | `{rev, settings: Settings}` |
+| `GET /v2/settings` | `SettingsResponse` |
 | `GET /v2/files/{file_id}` | The file bytes, with `Content-Type`, `Content-Length` and `ETag` |
 
 ```json
@@ -223,7 +237,7 @@ Schemas use JSON Schema 2020-12. `$ref`s point into the `$defs` below.
       "type": "object",
       "required": ["rev", "items", "counts"],
       "properties": {
-        "rev": { "$ref": "#/$defs/Rev" },
+        "rev": { "$ref": "#/$defs/Position" },
         "items": { "type": "array", "items": { "$ref": "#/$defs/Item" } },
         "counts": { "$ref": "#/$defs/Counts" },
         "next_page": { "$ref": "#/$defs/OpaqueId" }
@@ -233,9 +247,25 @@ Schemas use JSON Schema 2020-12. `$ref`s point into the `$defs` below.
       "type": "object",
       "required": ["rev", "entries", "older"],
       "properties": {
-        "rev": { "$ref": "#/$defs/Rev" },
+        "rev": { "$ref": "#/$defs/Position" },
         "entries": { "type": "array", "items": { "$ref": "#/$defs/Entry" } },
         "older": { "type": "boolean" }
+      }
+    },
+    "ItemResponse": {
+      "type": "object",
+      "required": ["rev", "item"],
+      "properties": {
+        "rev": { "$ref": "#/$defs/Position" },
+        "item": { "$ref": "#/$defs/Item" }
+      }
+    },
+    "SettingsResponse": {
+      "type": "object",
+      "required": ["rev", "settings"],
+      "properties": {
+        "rev": { "$ref": "#/$defs/Position" },
+        "settings": { "$ref": "#/$defs/Settings" }
       }
     }
   }
@@ -246,12 +276,13 @@ Schemas use JSON Schema 2020-12. `$ref`s point into the `$defs` below.
   defaults to 50, with a maximum of 200. A larger value is served as the
   maximum. A non-positive or non-integer value is `400 invalid_field` with
   `field: "limit"`.
-- `before` is an `entry_id`. Entries come in ascending order: the newest page
-  when `before` is absent, otherwise the page just older than `before`.
+- Entries are ordered by `position`, ascending: the newest page when `before`
+  is absent, otherwise the entries whose `position` is below that of the
+  `before` entry. `before` is an `entry_id`. An upsert raises an entry's `rev`
+  but never changes its `position`. Clients sort entries by `position` and
+  version-gate them by `rev`.
 - The inbox pages through every item the person can see, terminal ones
   included, in rank order. `next_page` is absent on the last page.
-- Before any `rev` has been assigned, a fresh person's first read reports
-  `rev: 1` (see question 7).
 
 ## 5. Writes
 
@@ -264,7 +295,6 @@ Every write that succeeds answers `200`, or `201` for `POST /v2/files`, with a
 | `PUT /v2/items/{item_id}/read-position` | `{"entry_id": OpaqueId}` |
 | `POST /v2/items/{item_id}/replies` | `{"text": string, "file_ids"?: [OpaqueId]}` |
 | `POST /v2/items/{item_id}/answer` | `{"request_revision": int, "choice"?: string, "comment"?: string}` |
-| `POST /v2/items/{item_id}/lifecycle` | `{"request_revision": int, "action": "clear"}` (see question 2) |
 | `PUT /v2/settings/priority-levels` | `{"levels": [PriorityLevel]}` with `If-Match` |
 | `PUT /v2/devices/me/push` | `{"token": string, "environment": "production" \| "sandbox", "revision": int}` |
 | `DELETE /v2/devices/me/push` | none |
@@ -278,7 +308,7 @@ Every write that succeeds answers `200`, or `201` for `POST /v2/files`, with a
       "type": "object",
       "required": ["rev"],
       "properties": {
-        "rev": { "$ref": "#/$defs/Rev" },
+        "rev": { "$ref": "#/$defs/Position" },
         "item": { "$ref": "#/$defs/Item" },
         "entry": { "$ref": "#/$defs/Entry" },
         "settings": { "$ref": "#/$defs/Settings" }
@@ -299,11 +329,21 @@ Every write that succeeds answers `200`, or `201` for `POST /v2/files`, with a
 
 - **Answer.**
   - `choice` is the `id` of one action in the item's `message.answer_ui.actions`.
-  - `comment` is free text the person adds.
-  - With neither member, the answer is "no comment", today's `answer_no_comment`.
-  - A `choice` that names no action is `400 invalid_field` with `field: "choice"`.
-- **Read position** never moves backward. Sending an older `entry_id` answers
-  `200` with the unchanged item.
+    The server stores that action's `value`.
+  - `comment` is free text, stored beside the choice.
+  - With neither member, the answer is "no comment", today's
+    `answer_no_comment`.
+  - A `comment` with no `choice` is an answer only when the item's `answer_ui`
+    accepts free text today (a `text` action). Otherwise it is
+    `400 invalid_field` with `field: "comment"`.
+  - A `choice` that names no action is `400 invalid_field` with
+    `field: "choice"`.
+- **Lifecycle** is not part of the client API. Terminal actions stay on the
+  origin API, and their results are readable as `Item.terminal` and as
+  `lifecycle` entries.
+- **Read position** takes an `entry_id`, and the server compares entries by
+  `position`, max-wins. Sending an entry at or below the current position
+  answers `200` with the unchanged item.
 - **Idempotency** is keyed by person and `Idempotency-Key`. It holds for at
   least the 30-day change-log retention window.
 - **`DELETE /v2/devices/me/push`** answers `200` with `WriteResult` carrying
@@ -345,7 +385,7 @@ Every write that succeeds answers `200`, or `201` for `POST /v2/files`, with a
       "required": ["changes", "rev", "more"],
       "properties": {
         "changes": { "type": "array", "items": { "$ref": "#/$defs/Change" } },
-        "rev": { "type": "integer", "minimum": 0, "description": "rev of the last change, or the request's after when changes is empty" },
+        "rev": { "$ref": "#/$defs/Position", "description": "rev of the last change, or the request's after when changes is empty" },
         "more": { "type": "boolean" }
       }
     },
@@ -362,8 +402,10 @@ Every write that succeeds answers `200`, or `201` for `POST /v2/files`, with a
   - The body is a `ChangeBatch`.
   - `limit` defaults to 500, with a maximum of 500.
   - `changes` are in increasing `rev` order and gap-free.
-  - When `after` is 0 or absent, the batch starts at the beginning of the
-    retained log.
+  - `after=0`, or no `after`, means "from the start". It is served only if
+    the person's log is retained from rev 1. Otherwise, including every person
+    seeded at cut-over, it is `410 cursor_expired`, and the client reads a
+    snapshot first.
 - **SSE** (`Accept: text/event-stream`):
   - Each change is one event: `id: <rev>`, `event: <kind>`, and
     `data: <data as one line of JSON>`.
@@ -442,39 +484,45 @@ content, tokens or identities.
     `seen`, `delivery_ack` as separate entries; their effect shows up as
     `Entry.delivery`).
 
-## 9. Open questions for the delivery owner
+## 9. Rulings applied
 
-1. **Answer shape.** Today's `answer` frame carries one opaque `answer` value,
-   usually an action's `value` from `answer_ui`. The specification's
-   `{choice?, comment?}` needs a mapping. This file proposes: `choice` is the
-   action `id`, the server stores that action's `value`, and `comment` is
-   stored beside it. Is a comment with no choice an answer, or "no comment"
-   with text? This file treats it as an answer.
-2. **Lifecycle from a client.** Today only the item's origin device may send
-   `lifecycle`, and a person's client gets `not_origin`. The states are
-   `answered`, `cleared`, `expired` and `superseded`, with a caller-supplied
-   `at`. Which `action`s may a person's client take? This file lists only
-   `clear`.
-3. **Rank as a sort key.** Today's inbox order is the server's priority view
-   order, not a sortable value on each row. The specification says clients sort
-   locally by rank. That needs a total-order `key` per item, and moving one
-   item must not rewrite every other item's key. The server would use
-   fractional or lexicographic keys. Please confirm, or keep the order as
-   inbox page position.
-4. **Push environment.** Today's binding names a provider `profile_id` and an
-   `address_kind`. This file maps `environment` to the server's configured
-   production or sandbox profile, with `apns_token` implied. Does the web
-   client need a non-APNs kind? The specification also keeps today's
-   `stale_push_binding` check without naming a token; this file answers it
-   `412 precondition_failed`. The push `state` values are today's binding
-   states, exposed unchanged.
-5. **`forbidden` token.** The specification's closed list has no token for
-   `403`. This file adds `forbidden`.
-6. **`closing` and the cursor.** This file sends `closing` without an SSE `id`
-   and never in a JSON batch, so it cannot move the cursor. Please confirm.
-7. **First `rev`.** Should a person with no changes yet report `rev: 1` or
-   `rev: 0`? This file says `1`, as the specification's §9 says, and allows
-   `after=0` to mean "from the start".
-8. **Read position by entry.** Today's position is a conversation sequence.
-   Moving to `entry_id` needs entries to be ordered by `rev` within an item.
-   Under the version rule they are.
+The delivery owner's first rulings on this draft are applied above:
+
+1. **Answer** is `choice` (action `id`, server stores its `value`) plus an
+   optional `comment`. A comment alone is accepted only where free text is
+   accepted today.
+2. **Lifecycle** is removed from the client API. No person-side clear or
+   dismiss frame exists today: the only terminal write a person's device can
+   make is `answer`, including its Seen choice and `answer_no_comment`. So
+   there is nothing to map instead.
+3. **Rank.** `rank.key` is a total-order key, sorted ascending bytewise, and
+   the server emits every move:
+   - moving one item rewrites only that item's key and emits one `item` event;
+   - a full re-rank, such as after a priority-levels change, may rewrite many
+     keys;
+   - time-driven moves (due dates, bounce) are `item` events at the moment they
+     take effect.
+4. **Push** is APNs only. `stale_push_binding` answers `412`, and browsers get
+   `403` on `/v2/devices/me/*`.
+5. **`forbidden`** is a 403 and is not retryable.
+6. **`closing`** has no `id:` line, never appears in a JSON batch and never
+   moves the cursor.
+7. **Positions** start at 0, and resource `rev`s at 1 (§1).
+8. **Entry `position`** is immutable creation order. Paging, `before` and the
+   read position compare by it.
+
+## 10. Open questions for the delivery owner
+
+9. **Structured answers.** Items whose `answer_ui` uses the
+   `attention-client.ui/1` schema (inputs of kind `response`, `text` or
+   `point`) are answered today with a structured result object, not with an
+   action `id`. `{choice, comment}` cannot carry that. Proposal: an optional
+   `result` object, accepted only for `attention-client.ui/1` items and
+   stored as today's answer value; `choice` and `comment` stay for
+   `attention-client.actions/1`.
+10. **Choice plus comment.** For `attention-client.actions/1` items, today's
+    answer is one value: either the chosen action's `value` or, for a `text`
+    action, the typed text. No stored answer holds both a choice and a
+    comment. Storing a comment beside a choice is therefore new answer
+    behavior. Should `choice` and `comment` be mutually exclusive instead
+    (`comment` meaning the `text` action's reply)?
