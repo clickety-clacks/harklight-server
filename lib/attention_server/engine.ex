@@ -297,13 +297,6 @@ defmodule AttentionServer.Engine do
       old && revision <= old.revision ->
         failure("stale_push_binding")
 
-      Enum.any?(engine.push_bindings, fn
-        {{^person, ^device}, _binding} -> false
-        {_key, %{active: true, address: ^address}} -> true
-        _ -> false
-      end) ->
-        failure("push_address_in_use")
-
       true ->
         now_ms = System.system_time(:millisecond)
         high = Map.fetch!(engine.persons, person)
@@ -339,7 +332,11 @@ defmodule AttentionServer.Engine do
           # The current store validator requires an integer while work is pending.
           # Keep the event timestamp in this legacy field; it is no longer a deadline.
           deadline_at: if(pending?, do: now_ms, else: nil),
-          next_at: if(pending?, do: open_window_at || now_ms + @push_window_ms, else: nil),
+          next_at:
+            if(pending?,
+              do: open_window_at || push_open_at(%{last_attempt_at: last_attempt_at}, now_ms),
+              else: nil
+            ),
           attempt_count: 0,
           last_attempt_at: last_attempt_at,
           last_outcome: nil,
@@ -376,11 +373,26 @@ defmodule AttentionServer.Engine do
 
         next =
           engine
-          |> Map.put(:push_bindings, Map.put(engine.push_bindings, key, binding))
+          |> Map.put(
+            :push_bindings,
+            engine.push_bindings |> release_push_address(key, address) |> Map.put(key, binding)
+          )
           |> save_receipt(person, device, frame["op_id"], semantic, reply)
 
         {:ok, next, reply}
     end
+  end
+
+  # The newest registration of an address owns it: any other device's active
+  # binding for the same address is canceled and keeps its own revision.
+  defp release_push_address(bindings, key, address) do
+    Map.new(bindings, fn
+      {other, %{active: true, address: ^address} = old} when other != key ->
+        {other, canceled_push_binding(old.revision)}
+
+      entry ->
+        entry
+    end)
   end
 
   defp push_remove(engine, %{person: person, key: device}, frame) do
@@ -1119,6 +1131,10 @@ defmodule AttentionServer.Engine do
   def agent_get(engine, key, request), do: AgentAccess.get(engine, key, request)
 
   def agent_answer(engine, key, frame) do
+    # `deliberate` and `intent_ref` are no longer required; senders that still
+    # include them are accepted and the values are ignored.
+    frame = Map.drop(frame, ~w(deliberate intent_ref))
+
     case Map.get(engine.agents, key) do
       %{person: person, id: id, revoked: false} = agent ->
         sender = frame["sender_id"]
@@ -1129,13 +1145,12 @@ defmodule AttentionServer.Engine do
             failure("forbidden")
 
           Enum.sort(Map.keys(Map.delete(frame, "request_revision"))) !=
-            ~w(acceptance_seq answer deliberate intent_ref message_id op_id sender_id type v) or
+            ~w(acceptance_seq answer message_id op_id sender_id type v) or
               frame["v"] != 1 ->
             failure("invalid_field", "request")
 
-          frame["type"] != "answer" or frame["deliberate"] != true or
-              not bounded_text?(frame["intent_ref"]) ->
-            failure("invalid_field", "intent_ref")
+          frame["type"] != "answer" ->
+            failure("invalid_field", "type")
 
           Map.has_key?(frame, "request_revision") and
               not (is_integer(frame["request_revision"]) and frame["request_revision"] > 0) ->
@@ -1714,6 +1729,8 @@ defmodule AttentionServer.Engine do
   end
 
   def fixture_agent_answer(%__MODULE__{} = engine, key, frame) do
+    frame = Map.drop(frame, ~w(deliberate intent_ref))
+
     case Map.get(engine.agents, key) do
       %{person: person, id: id, senders: senders, revoked: false} ->
         target = {person, frame["sender_id"], frame["message_id"]}
@@ -1724,9 +1741,6 @@ defmodule AttentionServer.Engine do
 
           not MapSet.member?(senders, frame["sender_id"]) ->
             failure("forbidden")
-
-          frame["deliberate"] != true or not bounded_text?(frame["intent_ref"]) ->
-            failure("invalid_field", "intent_ref")
 
           not (is_integer(frame["acceptance_seq"]) and frame["acceptance_seq"] > 0) ->
             failure("invalid_field", "acceptance_seq")
@@ -4236,7 +4250,7 @@ defmodule AttentionServer.Engine do
         terminal_semantic(frame, answer?)
         |> then(fn value ->
           if kind == :agent,
-            do: Map.merge(value, Map.take(frame, ~w(acceptance_seq deliberate intent_ref))),
+            do: Map.merge(value, Map.take(frame, ~w(acceptance_seq))),
             else: value
         end)
 
@@ -5848,6 +5862,14 @@ defmodule AttentionServer.Engine do
   defp put_event(engine, person, seq, kind, key),
     do: %{engine | events: Map.put(engine.events, {person, seq}, %{kind: kind, key: key})}
 
+  # When a push for this binding may next go out: now, unless a push started
+  # less than one window ago, in which case at the end of that window.
+  defp push_open_at(%{last_attempt_at: last}, now_ms)
+       when is_integer(last) and now_ms < last + @push_window_ms,
+       do: last + @push_window_ms
+
+  defp push_open_at(_binding, now_ms), do: now_ms
+
   defp queue_push_hint(engine, person, high) do
     now_ms = System.system_time(:millisecond)
 
@@ -5858,8 +5880,9 @@ defmodule AttentionServer.Engine do
             fresh =
               binding.pending_high == 0 and binding.pending_conversation_high == 0
 
-            # Preserve the established five-minute notification pacing. A new
-            # high during an in-flight push opens the next window.
+            # The first unsent item is eligible at once. Items arriving within
+            # five minutes of the last push, or during an in-flight push, wait
+            # for the end of that window and go out as one push.
             opens_window? =
               fresh or
                 (binding.state == "sending" and high > binding.pending_high and
@@ -5867,7 +5890,7 @@ defmodule AttentionServer.Engine do
 
             deadline_at = if opens_window?, do: now_ms, else: binding.deadline_at
 
-            next_at = if opens_window?, do: now_ms + @push_window_ms, else: binding.next_at
+            next_at = if opens_window?, do: push_open_at(binding, now_ms), else: binding.next_at
 
             state =
               cond do
@@ -5923,7 +5946,7 @@ defmodule AttentionServer.Engine do
 
             deadline_at = if opens_window?, do: now_ms, else: binding.deadline_at
 
-            next_at = if opens_window?, do: now_ms + @push_window_ms, else: binding.next_at
+            next_at = if opens_window?, do: push_open_at(binding, now_ms), else: binding.next_at
 
             state =
               cond do

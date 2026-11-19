@@ -803,18 +803,6 @@ defmodule AttentionServer.APNSPushTest do
 
     refute Map.has_key?(status_reply["push"], "address")
 
-    assert :ok =
-             send_request(sender_socket, %{
-               "type" => "push_register",
-               "op_id" => op(2),
-               "revision" => 1,
-               "profile_id" => @provider_profile,
-               "address_kind" => "apns_token",
-               "address" => @device_token
-             })
-
-    assert %{"type" => "error", "reason" => "push_address_in_use"} = reply(sender_socket)
-
     accept_test_delivery(
       relay,
       a1_key,
