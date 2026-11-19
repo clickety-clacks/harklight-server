@@ -1023,7 +1023,7 @@ defmodule AttentionServer.OriginHTTPS do
          {:ok, size} <- upload_content_length(headers["content-length"]),
          {:ok, name} <- Base.url_decode64(headers["x-harklight-file-name"], padding: false),
          true <- ConversationFiles.valid_name?(name),
-         true <- Message.uuid_v4?(headers["x-harklight-op-id"]),
+         true <- Message.uuid?(headers["x-harklight-op-id"]),
          true <- Message.sender_id?(headers["x-harklight-sender-id"]),
          true <- Message.nonempty?(headers["x-harklight-message-id"]),
          {:ok, revision} <- positive_int(headers["x-harklight-request-revision"]) do

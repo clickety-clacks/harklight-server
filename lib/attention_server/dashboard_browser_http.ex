@@ -6,7 +6,9 @@ defmodule AttentionServer.DashboardBrowserHTTP do
   alias AttentionServer.{ConversationFiles, Diagnostics, JSON, Message}
 
   @cookie "__Host-harklight"
-  @max_command_body 2 * 1024 * 1024
+  # Large enough that a pasted body past the 2 MiB inline-data threshold (which
+  # the server stores externally) is still reachable from the browser.
+  @max_command_body 32 * 1024 * 1024
   @upload_read_chunk 65_536
   @file_command_types ~w(file_limits discard_uploads)
 
@@ -236,7 +238,7 @@ defmodule AttentionServer.DashboardBrowserHTTP do
          {:ok, name} <- Base.url_decode64(encoded_name, padding: false),
          true <- ConversationFiles.valid_name?(name),
          [op_id] <- headers["op_id"],
-         true <- Message.uuid_v4?(op_id),
+         true <- Message.uuid?(op_id),
          [sender_id] <- headers["sender_id"],
          true <- Message.sender_id?(sender_id),
          [message_id] <- headers["message_id"],

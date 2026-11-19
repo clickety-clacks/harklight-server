@@ -3,6 +3,15 @@ defmodule AttentionServer.MessageFieldsTest do
 
   alias AttentionServer.{Engine, Message, Placement}
 
+  test "operation ids accept any well-formed UUID, not only version 4" do
+    assert Message.uuid?("123e4567-e89b-12d3-a456-426614174000")
+    assert Message.uuid?("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
+    assert Message.uuid?("0194f3a0-7c11-7d2e-9a3b-5f6e1d2c3b4a")
+    refute Message.uuid?("not-a-uuid")
+    refute Message.uuid?("123e4567e89b12d3a456426614174000")
+    refute Message.uuid?(nil)
+  end
+
   @answer_ui %{
     "schema" => "attention-client.actions/1",
     "actions" => [

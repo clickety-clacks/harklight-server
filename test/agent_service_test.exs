@@ -266,6 +266,15 @@ defmodule AttentionServer.AgentServiceTest do
                "contains" => "printer jam"
              })
 
+    # A limit above the page maximum is clamped, not refused.
+    assert %{"items" => [%{"message_id" => "hidden"}, %{"message_id" => "one"}]} =
+             agent_request(agent_endpoint, cert, private, %{
+               "v" => 1,
+               "type" => "search",
+               "contains" => "printer jam",
+               "limit" => 500
+             })
+
     assert %{"item" => %{"message_id" => "hidden", "sender_id" => "app:private"}} =
              agent_request(agent_endpoint, cert, private, %{
                "v" => 1,

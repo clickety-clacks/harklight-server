@@ -3,6 +3,7 @@ defmodule AttentionServer.Message do
 
   @namespace ~r/\A[a-z][a-z0-9+.\-]*\z/
   @forbidden_rest ~r/[\s\p{Cc}]/u
+  @uuid ~r/\A[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\z/
   @uuid_v4 ~r/\A[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\z/
   @urgencies ~w(low normal high now)
   @message_types ~w(fyi request)
@@ -38,6 +39,8 @@ defmodule AttentionServer.Message do
   def sender_id?(_), do: false
 
   def nonempty?(value), do: is_binary(value) and value != ""
+  @doc "Any well-formed UUID; operation ids need uniqueness, not a particular version."
+  def uuid?(value), do: is_binary(value) and Regex.match?(@uuid, value)
   def uuid_v4?(value), do: is_binary(value) and Regex.match?(@uuid_v4, value)
 
   def validate(message) when is_map(message) and not is_struct(message) do
