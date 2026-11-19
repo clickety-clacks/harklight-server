@@ -4761,48 +4761,36 @@ defmodule AttentionServer.Engine do
     case Map.get(engine.messages, key) do
       %{session_handle: handle, origin: origin} = record
       when is_binary(handle) and actor != origin ->
-        if Conversation.new_chat_open?(record) do
-          if frame["request_revision"] <= record.revision do
-            {next, seq} = next_conversation_seq(engine, person)
+        if frame["request_revision"] <= record.revision do
+          {next, seq} = next_conversation_seq(engine, person)
 
-            entry =
-              %{
-                "kind" => "discussion",
-                "author" => "person",
-                "delivery_acks" => true,
-                "sender_id" => frame["sender_id"],
-                "message_id" => frame["message_id"],
-                "session_handle" => handle,
-                "request_revision" => frame["request_revision"],
-                "op_id" => frame["op_id"],
-                "text" => frame["text"]
-              }
-              |> ConversationFiles.put_entry(files)
+          entry =
+            %{
+              "kind" => "discussion",
+              "author" => "person",
+              "delivery_acks" => true,
+              "sender_id" => frame["sender_id"],
+              "message_id" => frame["message_id"],
+              "session_handle" => handle,
+              "request_revision" => frame["request_revision"],
+              "op_id" => frame["op_id"],
+              "text" => frame["text"]
+            }
+            |> ConversationFiles.put_entry(files)
 
-            {next, feed_entry} = Conversation.append_entry(next, person, origin, entry)
-            fields = %{"seq" => seq, "event_id" => feed_entry["event_id"]}
+          {next, feed_entry} = Conversation.append_entry(next, person, origin, entry)
+          fields = %{"seq" => seq, "event_id" => feed_entry["event_id"]}
 
-            next =
-              next
-              |> put_conversation_event(person, seq, key, feed_entry)
-              |> queue_conversation_hint(person, seq)
-              |> save_receipt(person, actor, frame["op_id"], semantic, fields)
+          next =
+            next
+            |> put_conversation_event(person, seq, key, feed_entry)
+            |> queue_conversation_hint(person, seq)
+            |> save_receipt(person, actor, frame["op_id"], semantic, fields)
 
-            {:ok, next, fields}
-          else
-            failure("invalid_field", "request_revision")
-          end
+          {:ok, next, fields}
         else
-          if match?(%{terminal: %{state: "answered"}}, record) and
-               frame["request_revision"] > record.revision do
-            failure("invalid_field", "request_revision")
-          else
-            failure("closed")
-          end
+          failure("invalid_field", "request_revision")
         end
-
-      %{terminal: terminal} when not is_nil(terminal) ->
-        failure("closed")
 
       %{origin: ^actor} ->
         failure("not_person")
@@ -4842,86 +4830,71 @@ defmodule AttentionServer.Engine do
       %{origin: origin} when origin != actor ->
         failure("not_origin")
 
-      %{origin: ^actor, session_handle: handle} = record when is_binary(handle) ->
-        if Conversation.new_chat_open?(record) do
-          with {:ok, %{"kind" => "discussion", "request_revision" => revision} = acted_turn} <-
-                 Conversation.person_entry(engine, person, actor, frame["in_reply_to"], key),
-               true <- revision == frame["request_revision"],
-               {:ok, acted} <-
-                 conversation_act_for_delivery(
-                   engine,
-                   person,
-                   actor,
-                   frame["in_reply_to"],
-                   frame["op_id"]
-                 ) do
-            {next, seq} = next_conversation_seq(acted, person)
-            {next, arrival} = next_free_order(next, person)
+      %{origin: ^actor, session_handle: handle} when is_binary(handle) ->
+        with {:ok, %{"kind" => "discussion", "request_revision" => revision} = acted_turn} <-
+               Conversation.person_entry(engine, person, actor, frame["in_reply_to"], key),
+             true <- revision == frame["request_revision"],
+             {:ok, acted, first_reply?} <-
+               conversation_act_for_reply(
+                 engine,
+                 person,
+                 actor,
+                 frame["in_reply_to"],
+                 frame["op_id"]
+               ) do
+          {next, seq} = next_conversation_seq(acted, person)
+          {next, arrival} = next_free_order(next, person)
 
-            entry =
-              %{
-                "kind" => "reply",
-                "author" => "origin",
-                "sender_id" => frame["sender_id"],
-                "message_id" => frame["message_id"],
-                "session_handle" => handle,
-                "request_revision" => revision,
-                "in_reply_to" => Integer.to_string(frame["in_reply_to"]),
-                "op_id" => frame["op_id"],
-                "text" => frame["text"]
-              }
-              |> ConversationFiles.put_entry(files)
+          entry =
+            %{
+              "kind" => "reply",
+              "author" => "origin",
+              "sender_id" => frame["sender_id"],
+              "message_id" => frame["message_id"],
+              "session_handle" => handle,
+              "request_revision" => revision,
+              "in_reply_to" => Integer.to_string(frame["in_reply_to"]),
+              "op_id" => frame["op_id"],
+              "text" => frame["text"]
+            }
+            |> ConversationFiles.put_entry(files)
 
-            {next, feed_entry} = Conversation.append_entry(next, person, actor, entry)
-            fields = %{"seq" => seq, "event_id" => feed_entry["event_id"]}
+          {next, feed_entry} = Conversation.append_entry(next, person, actor, entry)
+          fields = %{"seq" => seq, "event_id" => feed_entry["event_id"]}
 
-            next =
+          next =
+            next
+            |> put_conversation_event(person, seq, key, feed_entry)
+            |> put_reply_free_order(person, seq, arrival)
+            |> queue_conversation_hint(person, seq)
+            |> save_receipt(person, actor, frame["op_id"], semantic, fields)
+
+          # Further replies to the same person event are accepted; only the
+          # first one records the event as acted on.
+          next =
+            if first_reply? do
+              {next, _acted_seq} =
+                append_acted_fact(
+                  next,
+                  person,
+                  key,
+                  acted_turn["event_id"],
+                  feed_entry["event_id"],
+                  revision,
+                  handle
+                )
+
               next
-              |> put_conversation_event(person, seq, key, feed_entry)
-              |> put_reply_free_order(person, seq, arrival)
-              |> queue_conversation_hint(person, seq)
-              |> save_receipt(person, actor, frame["op_id"], semantic, fields)
+            else
+              next
+            end
 
-            {next, _acted_seq} =
-              append_acted_fact(
-                next,
-                person,
-                key,
-                acted_turn["event_id"],
-                feed_entry["event_id"],
-                revision,
-                handle
-              )
-
-            {:ok, next, fields}
-          else
-            false -> failure("stale_revision")
-            {:error, :already_acted} -> failure("already_acted")
-            {:error, :inactive_account} -> failure("inactive_account")
-            _ -> failure("not_found")
-          end
+          {:ok, next, fields}
         else
-          case record do
-            %{terminal: %{state: "answered"}} ->
-              with {:ok, %{"kind" => "discussion", "request_revision" => revision}} <-
-                     Conversation.person_entry(engine, person, actor, frame["in_reply_to"], key),
-                   true <- revision == frame["request_revision"] do
-                case Conversation.act(engine, person, actor, frame["in_reply_to"], frame["op_id"]) do
-                  {:ok, _unchanged_after_refusal} -> failure("closed")
-                  {:error, :already_acted} -> failure("already_acted")
-                end
-              else
-                false -> failure("stale_revision")
-                _ -> failure("not_found")
-              end
-
-            _ ->
-              failure("closed")
-          end
+          false -> failure("stale_revision")
+          {:error, :inactive_account} -> failure("inactive_account")
+          _ -> failure("not_found")
         end
-
-      %{origin: ^actor, terminal: terminal} when not is_nil(terminal) ->
-        failure("closed")
 
       %{origin: _} ->
         failure("not_origin")
@@ -5153,6 +5126,18 @@ defmodule AttentionServer.Engine do
   end
 
   defp valid_revision_message(_engine, _person, message), do: valid_message(message)
+
+  # Replies to one person event are not limited to one: a later reply leaves the
+  # event's acted record as it is. Duplicate operations are caught earlier by
+  # their receipt.
+  defp conversation_act_for_reply(engine, person, actor, event_id, op_id) do
+    if Map.has_key?(engine.origin_actions, {person, actor, event_id}) do
+      with :ok <- delivery_allowed(engine, person), do: {:ok, engine, false}
+    else
+      with {:ok, acted} <- conversation_act_for_delivery(engine, person, actor, event_id, op_id),
+           do: {:ok, acted, true}
+    end
+  end
 
   defp conversation_act_for_delivery(engine, person, actor, event_id, op_id) do
     with {:ok, acted} <- Conversation.act(engine, person, actor, event_id, op_id),

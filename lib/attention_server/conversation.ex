@@ -138,12 +138,9 @@ defmodule AttentionServer.Conversation do
     end
   end
 
-  def chat_open?(%{terminal: nil}), do: true
-  def chat_open?(%{terminal: %{state: "answered"}}), do: true
-  def chat_open?(_), do: false
-
-  def new_chat_open?(%{terminal: %{state: "answered"}}), do: false
-  def new_chat_open?(record), do: chat_open?(record)
+  # The first answer settles a request, but the conversation about it stays open
+  # after every terminal outcome: the person can keep writing and the agent can
+  # keep replying. Chat has no open/closed state of its own.
 
   # Request and lifecycle facts stay on the reply channel; chat contains only side-conversation turns.
   defp channel(%{"kind" => "discussion"}), do: "chat"
@@ -409,8 +406,7 @@ defmodule AttentionServer.Conversation do
             request_key = {person, entry["sender_id"], entry["message_id"]}
             record = Map.get(engine.messages, request_key)
 
-            if (entry["session_handle"] == handle and record) && record.origin == origin &&
-                 chat_open?(record) do
+            if (entry["session_handle"] == handle and record) && record.origin == origin do
               MapSet.put(requests, request_key)
             else
               requests
@@ -525,7 +521,7 @@ defmodule AttentionServer.Conversation do
 
   defp needs_action?(engine, person, %{"kind" => "discussion"} = entry) do
     case Map.get(engine.messages, {person, entry["sender_id"], entry["message_id"]}) do
-      record when is_map(record) -> chat_open?(record)
+      record when is_map(record) -> true
       _ -> false
     end
   end
