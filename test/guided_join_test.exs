@@ -221,18 +221,6 @@ defmodule AttentionServer.GuidedJoinTest do
                2
              )
 
-    assert {:error, :invalid_senders} =
-             Engine.pending_approve(
-               pending,
-               @person,
-               c.owner_key,
-               @code,
-               c.device_key,
-               deadline,
-               ["app:unrequested"],
-               2
-             )
-
     assert {:ok, approved, key} =
              Engine.pending_approve(
                pending,
@@ -249,6 +237,27 @@ defmodule AttentionServer.GuidedJoinTest do
     assert approved.devices[key].person == @person
     assert MapSet.size(Map.get(approved.sender_grants, {@person, key}, MapSet.new())) == 0
     assert {:ok, %{"state" => "approved"}} = Engine.pending_status(approved, c.secret_hash, 3)
+  end
+
+  test "owner may name sender grants when approving a guided request", c do
+    {:ok, engine, _} = create(c)
+    {:ok, pending, reply} = redeem(c, engine, c.config, 1)
+
+    assert {:ok, approved, key} =
+             Engine.pending_approve(
+               pending,
+               @person,
+               c.owner_key,
+               @code,
+               c.device_key,
+               reply["expires_at"],
+               ["app:chosen-by-owner"],
+               2
+             )
+
+    assert MapSet.to_list(Map.fetch!(approved.sender_grants, {@person, key})) == [
+             "app:chosen-by-owner"
+           ]
   end
 
   test "exact owner decline is terminal and truthfully visible without enrolling a device", c do

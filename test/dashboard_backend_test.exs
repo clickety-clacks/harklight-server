@@ -533,24 +533,12 @@ defmodule AttentionServer.DashboardBackendTest do
     assert review.status == 200
     assert review.resp_body =~ "Ansible"
     assert review.resp_body =~ device_key
-    refute review.resp_body =~ ~s(name="senders")
+    assert review.resp_body =~ ~s(name="senders")
 
     wrong =
       URI.encode_query(%{"key" => device_key, "deadline" => Integer.to_string(deadline + 1)})
 
     assert (owner_post("/devices/waiting/#{code}/approve", wrong, cookie)
-            |> DashboardReadHTTP.call(opts)).status == 409
-
-    assert :sys.get_state(relay).store.engine.devices[device_key] == nil
-
-    invite_with_senders =
-      URI.encode_query(%{
-        "key" => device_key,
-        "deadline" => Integer.to_string(deadline),
-        "senders" => "app:tightbeam/codex"
-      })
-
-    assert (owner_post("/devices/waiting/#{code}/approve", invite_with_senders, cookie)
             |> DashboardReadHTTP.call(opts)).status == 409
 
     assert :sys.get_state(relay).store.engine.devices[device_key] == nil

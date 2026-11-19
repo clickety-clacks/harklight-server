@@ -14,7 +14,7 @@ defmodule AttentionServer.HeadlessEnrollment do
   @max_server_frame 2 * (2 * 1024 * 1024) + 16_384
 
   def start(directory, endpoint, label) when is_binary(directory) and is_binary(label) do
-    with true <- byte_size(label) in 1..256,
+    with true <- byte_size(label) >= 1,
          :ok <- create_directory(directory),
          :ok <- save_server(directory, endpoint),
          :ok <- generate_identity(directory),

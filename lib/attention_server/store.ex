@@ -2363,7 +2363,7 @@ defmodule AttentionServer.Store do
           Map.has_key?(engine.persons, device.person) and
             is_integer(device.enrollment_revision) and device.enrollment_revision > 0 and
             (is_nil(device.label) or
-               (is_binary(device.label) and byte_size(device.label) in 1..256)) and
+               (is_binary(device.label) and byte_size(device.label) >= 1)) and
             (is_nil(device.enrolled_at) or
                (is_integer(device.enrolled_at) and device.enrolled_at >= 0))
         end) and
@@ -2502,7 +2502,7 @@ defmodule AttentionServer.Store do
         AttentionServer.Message.uuid_v4?(id) and upload.id == id and
           Map.has_key?(engine.persons, upload.person) and
           owns_or_browser?(engine, upload.person, upload.uploader) and
-          AttentionServer.Message.uuid_v4?(upload.op_id) and
+          AttentionServer.Message.uuid?(upload.op_id) and
           AttentionServer.Message.sender_id?(upload.sender_id) and
           is_binary(upload.message_id) and upload.message_id != "" and
           is_integer(upload.revision) and upload.revision > 0 and
@@ -2749,7 +2749,7 @@ defmodule AttentionServer.Store do
               AttentionServer.DeviceIdentity.from_certificate(item.certificate) == {:ok, item.key}) or
              (is_nil(item.certificate) and Map.get(item, :legacy_recovery) == true and
                 not is_nil(item.person))) and
-          is_binary(item.label) and byte_size(item.label) in 1..256 and
+          is_binary(item.label) and byte_size(item.label) >= 1 and
           is_binary(item.secret_hash) and byte_size(item.secret_hash) == 32 and
           is_integer(item.expires_at) and item.expires_at > 0 and
           is_integer(item.status_expires_at) and
@@ -2810,7 +2810,7 @@ defmodule AttentionServer.Store do
               map_size(exact) in [7, 8] and Map.get(exact, :joined, false) in [true, false] and
                 is_binary(hash) and byte_size(hash) == 32 and
                 (is_nil(person) or Map.has_key?(engine.persons, person)) and hex_key?(key) and
-                is_binary(label) and byte_size(label) in 1..256 and
+                is_binary(label) and byte_size(label) >= 1 and
                 is_integer(expires_at) and expires_at > 0 and
                 status_expires_at == expires_at + 86_400_000
 
@@ -2827,7 +2827,7 @@ defmodule AttentionServer.Store do
               map_size(exact) in [8, 9] and Map.get(exact, :joined, false) in [true, false] and
                 is_binary(hash) and byte_size(hash) == 32 and
                 Map.has_key?(engine.persons, person) and hex_key?(key) and hex_key?(owner) and
-                is_binary(label) and byte_size(label) in 1..256 and
+                is_binary(label) and byte_size(label) >= 1 and
                 is_integer(expires_at) and expires_at > 0 and
                 status_expires_at == expires_at + 86_400_000
 
@@ -2847,7 +2847,7 @@ defmodule AttentionServer.Store do
                 Map.get(exact, :request_generation, 1) > 0 and
                 is_binary(hash) and byte_size(hash) == 32 and
                 Map.has_key?(engine.persons, person) and hex_key?(key) and
-                is_binary(label) and byte_size(label) in 1..256 and
+                is_binary(label) and byte_size(label) >= 1 and
                 is_integer(expires_at) and expires_at > 0 and
                 status_expires_at == expires_at + 86_400_000 and
                 (is_nil(approved_by) or hex_key?(approved_by)) and
@@ -2885,11 +2885,11 @@ defmodule AttentionServer.Store do
 
     is_map(accounts) and
       Enum.all?(accounts, fn {ref, record} ->
-        is_binary(ref) and byte_size(ref) in 1..256 and map_size(record) == 3 and
+        is_binary(ref) and byte_size(ref) >= 1 and map_size(record) == 3 and
           Map.has_key?(engine.persons, record.person) and
           Map.has_key?(engine.owners, record.person) and
           (is_nil(record.label) or
-             (is_binary(record.label) and byte_size(record.label) in 1..256)) and
+             (is_binary(record.label) and byte_size(record.label) >= 1)) and
           is_boolean(record.test)
       end) and
       accounts |> Map.values() |> Enum.map(& &1.person) |> Enum.uniq() |> length() ==
@@ -3014,11 +3014,11 @@ defmodule AttentionServer.Store do
   defp nonempty?(value), do: is_binary(value) and value != ""
 
   defp operation_id(%{op_id: value}) do
-    if AttentionServer.Message.uuid_v4?(value), do: value
+    if AttentionServer.Message.uuid?(value), do: value
   end
 
   defp operation_id(%{operation_id: value}) do
-    if AttentionServer.Message.uuid_v4?(value), do: value
+    if AttentionServer.Message.uuid?(value), do: value
   end
 
   defp operation_id(_), do: nil
