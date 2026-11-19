@@ -2250,12 +2250,39 @@ defmodule AttentionServer.OriginHTTPSTest do
       stream
     end
 
+    # A refused first attachment (store unavailable) registers nothing.
+    db = :sys.get_state(c.relay).store.db
+    :ok = Sqlite3.execute(db, "PRAGMA query_only=ON")
+
+    try do
+      assert {:ok, 503, %{"type" => "error", "reason" => "storage_unavailable"}} =
+               raw_request(
+                 c,
+                 "a2",
+                 "GET /origin/v1/stream?session=#{@handle}&reconnect=1 HTTP/1.1\r\nHost: relay.test\r\n\r\n"
+               )
+
+      refute Map.has_key?(:sys.get_state(c.relay).origin_streams, {c.person, c.origin, @handle})
+    after
+      :ok = Sqlite3.execute(db, "PRAGMA query_only=OFF")
+    end
+
     first = open_stream.()
     stream_key = {c.person, c.origin, @handle}
     assert [%{worker: first_worker}] = :sys.get_state(c.relay).origin_streams[stream_key]
 
-    # A second stream of the same session is attached next to the first.
+    availability_events = fn ->
+      :sys.get_state(c.relay).store.engine.conversation_events
+      |> Enum.count(fn {_key, event} -> match?(%{payload: %{"kind" => "availability"}}, event) end)
+    end
+
+    announced = availability_events.()
+    assert announced >= 1
+
+    # A second stream of the same session is attached next to the first and
+    # does not announce availability again.
     second = open_stream.()
+    assert availability_events.() == announced
     streams = :sys.get_state(c.relay).origin_streams[stream_key]
     assert length(streams) == 2
     assert first_worker in Enum.map(streams, & &1.worker)
@@ -2268,23 +2295,6 @@ defmodule AttentionServer.OriginHTTPSTest do
              )
 
     assert length(:sys.get_state(c.relay).origin_streams[stream_key]) == 2
-
-    # A refused attachment (store unavailable) registers nothing.
-    db = :sys.get_state(c.relay).store.db
-    :ok = Sqlite3.execute(db, "PRAGMA query_only=ON")
-
-    try do
-      assert {:ok, 503, %{"type" => "error", "reason" => "storage_unavailable"}} =
-               raw_request(
-                 c,
-                 "a2",
-                 "GET /origin/v1/stream?session=#{@handle}&reconnect=1 HTTP/1.1\r\nHost: relay.test\r\n\r\n"
-               )
-
-      assert length(:sys.get_state(c.relay).origin_streams[stream_key]) == 2
-    after
-      :ok = Sqlite3.execute(db, "PRAGMA query_only=OFF")
-    end
 
     assert %{"type" => "ok", "event_id" => "2"} =
              relay_request(c.relay, c.reader, %{
