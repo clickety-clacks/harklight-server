@@ -1776,13 +1776,19 @@ defmodule AttentionServer.Relay do
          {:ok, attached} <- Conversation.mark_attached(engine, person, key, handle),
          {:ok, current} <- Engine.origin_status(attached, key, handle, true),
          attached <-
-           Engine.origin_availability(
-             attached,
-             person,
-             key,
-             handle,
-             current["availability"],
-             current["last_detached_at"]
+           if(Map.has_key?(state.origin_streams, {person, key, handle}),
+             # Another stream already makes this session listening; announce
+             # availability only when the first one attaches.
+             do: attached,
+             else:
+               Engine.origin_availability(
+                 attached,
+                 person,
+                 key,
+                 handle,
+                 current["availability"],
+                 current["last_detached_at"]
+               )
            ),
          {:ok, store} <-
            Store.commit(state.store, attached, audit(engine, key, "origin_attach")) do
