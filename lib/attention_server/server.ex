@@ -2,9 +2,10 @@ defmodule AttentionServer.Server do
   @moduledoc """
   Opt-in supervised Relay, `/relay` WebSocket and separate owner/agent TLS listeners.
 
-  With the temporary `client_api_v2` flag on (read once at startup), the device
-  port serves client API v2 (`/v2`) through `ClientAPI.Listener` instead of the
-  `/relay` WebSocket. The two never run together.
+  With the temporary `client_api_v2` flag on (read once at startup from the
+  feature-flags file, see docs/feature-flags.md), the device port serves client
+  API v2 (`/v2`) through `ClientAPI.Listener` instead of the `/relay` WebSocket.
+  The two never run together.
 
   Certificate paths and a durable store path are explicit operator config.
   Production deployment remains separate work.
@@ -89,7 +90,7 @@ defmodule AttentionServer.Server do
         hosted_configuration(opts, deployment_mode, upload_cap, public_origin)
 
       apns_opts = Keyword.get(opts, :apns)
-      client_api_v2 = Keyword.get(opts, :client_api_v2, false) == true
+      client_api_v2 = client_api_v2_flag(Keyword.get(opts, :feature_flags_path))
 
       relay_opts = [
         name: relay_name,
@@ -98,8 +99,7 @@ defmodule AttentionServer.Server do
         deployment_mode: deployment_mode,
         jev_score_record_path: Keyword.get(opts, :jev_score_record_path),
         feature_flags_path: Keyword.get(opts, :feature_flags_path),
-        upload_cap: upload_cap,
-        client_api_v2: client_api_v2
+        upload_cap: upload_cap
       ]
 
       relay_opts =
@@ -298,6 +298,11 @@ defmodule AttentionServer.Server do
     kind, reason ->
       Diagnostics.failure(:server_startup, :configuration, {kind, reason}, :unavailable)
       :erlang.raise(kind, reason, __STACKTRACE__)
+  end
+
+  defp client_api_v2_flag(feature_flags_path) do
+    {flags, _warned} = AttentionServer.FeatureFlags.read(feature_flags_path, true)
+    Map.get(flags, "client_api_v2") == true
   end
 
   defp normalize_deployment_mode(mode) when mode in [:self_hosted, :saas], do: mode

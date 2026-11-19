@@ -379,7 +379,11 @@ defmodule AttentionServer.ClientAPIListenerTest do
     end
 
     test "the server starts today's /relay WebSocket and no /v2 listener", ctx do
-      server = start_supervised!({Server, server_opts(ctx)})
+      flags = Path.join(ctx.dir, "flags.json")
+      File.write!(flags, ~s({"client_api_v2":false}))
+
+      server =
+        start_supervised!({Server, Keyword.put(server_opts(ctx), :feature_flags_path, flags)})
 
       refute Server.client_api_v2?(server)
       assert child?(server, :web_socket)
@@ -412,7 +416,11 @@ defmodule AttentionServer.ClientAPIListenerTest do
   end
 
   test "flag on: the device port serves /v2 only, with no /relay WebSocket", ctx do
-    server = start_supervised!({Server, Keyword.put(server_opts(ctx), :client_api_v2, true)})
+    flags = Path.join(ctx.dir, "flags.json")
+    File.write!(flags, ~s({"client_api_v2":true}))
+
+    server =
+      start_supervised!({Server, Keyword.put(server_opts(ctx), :feature_flags_path, flags)})
 
     assert Server.client_api_v2?(server)
     assert child?(server, :client_api)
