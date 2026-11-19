@@ -136,7 +136,7 @@ defmodule AttentionServer.GuidedJoinHTTPSTest do
     }
 
     assert %{"error" => "not_found"} =
-             owner(c, "a1", %{approval | "expected_expires_at" => original.expires_at + 1})
+             owner(c, "a1", %{approval | "expected_expires_at" => 1})
 
     assert %{"ok" => true, "device_id" => device} =
              owner(c, "a1", %{approval | "sender_grants" => []})

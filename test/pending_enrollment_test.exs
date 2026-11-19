@@ -125,6 +125,21 @@ defmodule AttentionServer.PendingEnrollmentTest do
 
     other_device = TLSFixtures.certificate_der!(certs, "unknown")
     assert :none = Engine.pending_restart(restarted, other_device, "other", first_secret)
+
+    # A secret already held by any request is never reused.
+    assert :none = Engine.pending_restart(restarted, device, "third label", second_secret)
+
+    # A request bound to a person by an invitation and an approved request
+    # are not restarted.
+    {:ok, key} = DeviceIdentity.from_certificate(device)
+    joined = put_in(restarted.pending_enrollments[@code_a].person, @person_a)
+    assert :none = Engine.pending_restart(joined, device, "joined", first_secret)
+
+    approved =
+      update_in(restarted.pending_enrollments[@code_a], &Map.put(&1, :state, :approved))
+
+    assert key == approved.pending_enrollments[@code_a].key
+    assert :none = Engine.pending_restart(approved, device, "approved", first_secret)
   end
 
   test "a repeated enroll start through the relay returns the same approval code", %{
