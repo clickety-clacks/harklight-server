@@ -824,12 +824,6 @@ defmodule AttentionServer.OriginHTTPS do
 
   defp stream_receive(socket, cursor, advisory_cursor) do
     receive do
-      :origin_stream_replaced ->
-        :ok
-
-      :origin_scope_replaced ->
-        stream_send(socket, "event: replaced\ndata: {}\n\n", :stream_write)
-
       :origin_coverage_changed ->
         case stream_send(socket, "event: coverage\ndata: {}\n\n", :stream_write) do
           :ok -> stream_loop(socket, cursor, advisory_cursor)

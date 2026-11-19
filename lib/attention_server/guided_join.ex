@@ -7,8 +7,6 @@ defmodule AttentionServer.GuidedJoin do
 
   alias AttentionServer.{DeviceIdentity, Diagnostics, Engine}
 
-  @invite_ms 30 * 60 * 1_000
-
   def configuration(name, enroll_port, relay_port, ca_pem) do
     with true <- is_binary(name) and Regex.match?(~r/\A[a-zA-Z0-9][a-zA-Z0-9.-]{0,252}\z/, name),
          true <- is_integer(enroll_port) and enroll_port in 1..65_535,
@@ -39,12 +37,11 @@ defmodule AttentionServer.GuidedJoin do
       Base.url_encode64(AttentionServer.JSON.encode!(invitation), padding: false)
   end
 
-  def create(engine, person, owner, token_hash, configuration, now) do
+  def create(engine, person, owner, token_hash, configuration) do
     with {:ok, revision} <- Engine.owner_revision(engine, person, owner),
          true <- valid_configuration?(configuration),
-         true <- hash?(token_hash),
-         true <- is_integer(now) and now >= engine.pending_clock_high_water do
-      engine = compact(engine, now)
+         true <- hash?(token_hash) do
+      engine = compact(engine)
 
       cond do
         Map.has_key?(engine.join_invitations, token_hash) ->
@@ -56,8 +53,8 @@ defmodule AttentionServer.GuidedJoin do
             owner_key: owner,
             owner_revision: revision,
             configuration: configuration,
-            expires_at: now + @invite_ms,
-            retain_until: now + @invite_ms,
+            expires_at: nil,
+            retain_until: nil,
             code: nil,
             key: nil,
             secret_hash: nil,
@@ -67,8 +64,7 @@ defmodule AttentionServer.GuidedJoin do
           {:ok,
            %{
              engine
-             | join_invitations: Map.put(engine.join_invitations, token_hash, invite),
-               pending_clock_high_water: now
+             | join_invitations: Map.put(engine.join_invitations, token_hash, invite)
            }, invite}
       end
     else
@@ -78,11 +74,10 @@ defmodule AttentionServer.GuidedJoin do
   end
 
   @doc "Recover one owner action after a lost response without another active invitation."
-  def create_for_request(engine, person, owner, request_id, configuration, now) do
+  def create_for_request(engine, person, owner, request_id, configuration) do
     with {:ok, revision} <- Engine.owner_revision(engine, person, owner),
          true <- AttentionServer.Message.uuid_v4?(request_id),
-         true <- valid_configuration?(configuration),
-         true <- is_integer(now) and now >= engine.pending_clock_high_water do
+         true <- valid_configuration?(configuration) do
       existing =
         Enum.find_value(engine.join_invitations, fn {_, item} ->
           if item.person == person and item.owner_key == owner and
@@ -98,31 +93,23 @@ defmodule AttentionServer.GuidedJoin do
         existing && not is_nil(existing.code) ->
           {:error, :used}
 
-        existing && now >= existing.expires_at ->
-          observed = %{
-            engine
-            | pending_clock_high_water: max(engine.pending_clock_high_water, existing.expires_at)
-          }
-
-          {:error, :expired, observed}
-
         existing ->
           {:ok, engine, existing, request_token(engine, existing, request_id)}
 
         true ->
-          engine = compact(engine, now)
+          engine = compact(engine)
 
           binding = %{
             person: person,
             owner_key: owner,
             owner_revision: revision,
-            expires_at: now + @invite_ms
+            expires_at: nil
           }
 
           token = request_token(engine, binding, request_id)
           hash = :crypto.hash(:sha256, token)
 
-          with {:ok, next, invitation} <- create(engine, person, owner, hash, configuration, now) do
+          with {:ok, next, invitation} <- create(engine, person, owner, hash, configuration) do
             invitation = %{invitation | request_id: request_id}
             next = %{next | join_invitations: Map.put(next.join_invitations, hash, invitation)}
             {:ok, next, invitation, token}
@@ -136,8 +123,9 @@ defmodule AttentionServer.GuidedJoin do
 
   # The existing durable random server key is domain-separated from its cursor
   # purpose. Only an authenticated owner operation can recover the bearer.
-  # Including the original deadline prevents a reclaimed request ID from ever
-  # reactivating an older shared link.
+  # The stored invitation's own expiry field (nil on current invitations, a
+  # deadline on older stored ones) stays in the binding so an existing request
+  # keeps recovering the same link.
   defp request_token(engine, item, request_id) do
     binding =
       :erlang.term_to_binary(
@@ -170,97 +158,78 @@ defmodule AttentionServer.GuidedJoin do
   end
 
   @doc "Resolve an existing bearer for the joining person without issuing or using it."
-  def resolve(engine, token, configuration, now) do
+  def resolve(engine, token, configuration) do
     with true <- is_binary(token) and Regex.match?(~r/\A[0-9a-f]{64}\z/, token),
          {:ok, raw} <- Base.decode16(token, case: :lower),
          invite when is_map(invite) <-
            Map.get(engine.join_invitations, :crypto.hash(:sha256, raw)),
          true <- invite.configuration == configuration,
          {:ok, revision} <- Engine.owner_revision(engine, invite.person, invite.owner_key),
-         true <- revision == invite.owner_revision,
-         true <- is_integer(now) and now >= engine.pending_clock_high_water do
-      cond do
-        not is_nil(invite.code) -> {:error, :used}
-        now >= invite.expires_at -> {:error, :expired}
-        true -> {:ok, invitation_response(invite, raw)}
-      end
+         true <- revision == invite.owner_revision do
+      if is_nil(invite.code),
+        do: {:ok, invitation_response(invite, raw)},
+        else: {:error, :used}
     else
       _ -> {:error, :unavailable}
     end
   end
 
-  def redeem(engine, hash, certificate, label, secret_hash, code, configuration, now) do
+  def redeem(engine, hash, certificate, label, secret_hash, code, configuration) do
     with true <- hash?(hash) and hash?(secret_hash),
          {:ok, key} <- DeviceIdentity.from_certificate(certificate),
          invite when is_map(invite) <- Map.get(engine.join_invitations, hash),
          true <- invite.configuration == configuration,
          {:ok, revision} <- Engine.owner_revision(engine, invite.person, invite.owner_key),
-         true <- revision == invite.owner_revision,
-         true <- is_integer(now) and now >= engine.pending_clock_high_water do
+         true <- revision == invite.owner_revision do
       if is_nil(invite.code) do
-        consume(engine, hash, invite, certificate, label, secret_hash, code, now)
+        consume(engine, hash, invite, certificate, label, secret_hash, code)
       else
-        retry(engine, invite, key, secret_hash, now)
+        retry(engine, invite, key, secret_hash)
       end
     else
       _ -> {:error, :refused}
     end
   end
 
-  defp consume(engine, hash, invite, certificate, label, secret_hash, code, now) do
-    if now >= invite.expires_at do
-      {:error, :expired}
-    else
-      with {:ok, pending} <-
-             Engine.pending_enroll(engine, certificate, label, code, secret_hash, now) do
-        item = Map.fetch!(pending.pending_enrollments, code)
-        bound = item |> Map.put(:person, invite.person) |> Map.put(:joined, true)
+  defp consume(engine, hash, invite, certificate, label, secret_hash, code) do
+    with {:ok, pending} <- Engine.pending_enroll(engine, certificate, label, code, secret_hash) do
+      item = Map.fetch!(pending.pending_enrollments, code)
+      bound = item |> Map.put(:person, invite.person) |> Map.put(:joined, true)
 
-        consumed = %{
-          invite
-          | code: code,
-            key: item.key,
-            secret_hash: secret_hash,
-            retain_until: item.status_expires_at
-        }
+      consumed = %{
+        invite
+        | code: code,
+          key: item.key,
+          secret_hash: secret_hash,
+          retain_until: nil
+      }
 
-        next = %{
-          pending
-          | pending_enrollments: Map.put(pending.pending_enrollments, code, bound),
-            join_invitations: Map.put(pending.join_invitations, hash, consumed)
-        }
+      next = %{
+        pending
+        | pending_enrollments: Map.put(pending.pending_enrollments, code, bound),
+          join_invitations: Map.put(pending.join_invitations, hash, consumed)
+      }
 
-        {:ok, next, response(next, code, item)}
-      end
+      {:ok, next, response(next, code, item)}
     end
   end
 
-  defp retry(engine, invite, key, secret_hash, now) do
-    cond do
-      invite.key != key or invite.secret_hash != secret_hash ->
-        {:error, :used}
+  defp retry(engine, invite, key, secret_hash) do
+    if invite.key != key or invite.secret_hash != secret_hash do
+      {:error, :used}
+    else
+      item =
+        Map.get(engine.pending_enrollments, invite.code) ||
+          Map.get(engine.pending_history, invite.code)
 
-      true ->
-        item =
-          Map.get(engine.pending_enrollments, invite.code) ||
-            Map.get(engine.pending_history, invite.code)
-
-        cond do
-          is_nil(item) or now >= item.status_expires_at ->
-            {:error, :expired}
-
-          item.state == :expired or (item.state == :pending and now >= item.expires_at) ->
-            {:error, :expired}
-
-          true ->
-            {:ok, engine, response(engine, invite.code, item)}
-        end
+      if is_nil(item) or item.state == :expired,
+        do: {:error, :expired},
+        else: {:ok, engine, response(engine, invite.code, item)}
     end
   end
 
   defp response(engine, code, item) do
-    {:ok, status} =
-      Engine.pending_status(engine, item.secret_hash, engine.pending_clock_high_water)
+    {:ok, status} = Engine.pending_status(engine, item.secret_hash)
 
     Map.merge(status, %{
       "approval_code" => code,
@@ -269,41 +238,14 @@ defmodule AttentionServer.GuidedJoin do
     })
   end
 
-  def observe_time(engine, hash, now) do
-    case Map.get(engine.join_invitations, hash) do
-      nil ->
-        engine
-
-      %{code: nil, expires_at: deadline} when now >= deadline ->
-        %{engine | pending_clock_high_water: max(engine.pending_clock_high_water, deadline)}
-
-      %{code: code, retain_until: deadline} when is_binary(code) ->
-        observed = Engine.pending_observe_time(engine, {:code, code}, now)
-
-        if now >= deadline,
-          do: %{observed | join_invitations: Map.delete(observed.join_invitations, hash)},
-          else: observed
-
-      _ ->
-        engine
-    end
-  end
-
-  def compact(engine, now),
+  @doc "Drop invitations whose owner authority has since changed."
+  def compact(engine),
     do: %{
       engine
       | join_invitations:
           Map.reject(engine.join_invitations, fn {_, invite} ->
-            expired? =
-              if is_nil(Map.get(invite, :code)),
-                do: invite.expires_at <= now,
-                else: invite.retain_until <= now
-
-            superseded? =
-              Engine.owner_revision(engine, invite.person, invite.owner_key) !=
-                {:ok, invite.owner_revision}
-
-            expired? or superseded?
+            Engine.owner_revision(engine, invite.person, invite.owner_key) !=
+              {:ok, invite.owner_revision}
           end)
     }
 
@@ -334,17 +276,11 @@ defmodule AttentionServer.GuidedJoin do
   def valid_state?(engine) do
     is_map(engine.join_invitations) and
       Enum.all?(engine.join_invitations, fn {hash, invite} ->
-        retain_until_valid? =
-          is_integer(invite.retain_until) and
-            if(is_nil(invite.code),
-              do: invite.retain_until >= invite.expires_at,
-              else: invite.retain_until > invite.expires_at
-            )
-
         hash?(hash) and map_size(invite) == 10 and Map.has_key?(engine.persons, invite.person) and
           key?(invite.owner_key) and is_integer(invite.owner_revision) and
           invite.owner_revision > 0 and valid_configuration?(invite.configuration) and
-          is_integer(invite.expires_at) and invite.expires_at > 0 and retain_until_valid? and
+          (is_nil(invite.expires_at) or (is_integer(invite.expires_at) and invite.expires_at > 0)) and
+          (is_nil(invite.retain_until) or is_integer(invite.retain_until)) and
           (is_nil(invite.request_id) or AttentionServer.Message.uuid_v4?(invite.request_id)) and
           valid_binding?(engine, invite)
       end)

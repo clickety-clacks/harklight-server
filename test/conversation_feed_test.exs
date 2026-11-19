@@ -1638,7 +1638,7 @@ defmodule AttentionServer.ConversationFeedTest do
     GenServer.stop(again)
   end
 
-  test "person discussion reaches the original feed, reply is one acted turn, and relay hides person text from origin",
+  test "person discussion reaches the original feed, replies act on it, and relay hides person text from origin",
        %{
          path: path
        } do
@@ -1706,9 +1706,6 @@ defmodule AttentionServer.ConversationFeedTest do
     assert %{"type" => "ok", "seq" => 2, "duplicate" => true} =
              request(relay, "origin", reply)
 
-    assert %{"type" => "error", "reason" => "already_acted"} =
-             request(relay, "origin", %{reply | "op_id" => op(15)})
-
     assert {:ok, [discussion_fact, reply_fact, acted_fact], 3} =
              Relay.conversation_events(relay, "reader", 0)
 
@@ -1737,6 +1734,20 @@ defmodule AttentionServer.ConversationFeedTest do
 
     assert {:ok, %{"entries" => [%{"acted" => true, "delivered" => true}, _]}} =
              Relay.origin_feed(restarted, "origin", 1)
+
+    # Replies to one person event are not limited to one.
+    assert %{"type" => "ok"} =
+             request(restarted, "origin", %{
+               reply
+               | "op_id" => op(15),
+                 "text" => "And the rollback plan is ready"
+             })
+
+    assert {:ok, %{"entries" => [%{"acted" => true}, _, second_reply]}} =
+             Relay.origin_feed(restarted, "origin", 1)
+
+    assert second_reply["in_reply_to"] == "2"
+    assert second_reply["text"] == "And the rollback plan is ready"
 
     GenServer.stop(restarted)
   end
@@ -1984,7 +1995,7 @@ defmodule AttentionServer.ConversationFeedTest do
     GenServer.stop(relay)
   end
 
-  test "answered requests keep chat availability but refuse new chat from either side",
+  test "answered and no-comment requests keep chat open for both sides",
        %{path: path} do
     assert {:ok, relay} = Relay.start_link(store_path: path)
     assert :ok = Relay.setup_person(relay, "A")
@@ -2093,75 +2104,58 @@ defmodule AttentionServer.ConversationFeedTest do
     assert status["open_requests"] == 0
     assert status["open_chats"] == 2
 
+    # The first answer settled each request, but chat stays open both ways.
+    for {message_id, ref, person_op, agent_op, person_text, agent_text} <- [
+          {"answered-chat", "answer", 804, 805, "Can we discuss that answer?",
+           "Yes, here is more detail."},
+          {"no-comment-chat", "no-comment", 806, 807, "Can I explain why I chose no comment?",
+           "Of course; what would you like to explain?"}
+        ] do
+      assert %{"v" => 1, "type" => "ok", "ref" => ref_back, "event_id" => event_id} =
+               request(relay, "reader", %{
+                 "type" => "discussion",
+                 "op_id" => op(person_op),
+                 "ref" => "person-#{ref}-ref",
+                 "sender_id" => "app:test",
+                 "message_id" => message_id,
+                 "request_revision" => 1,
+                 "text" => person_text
+               })
+
+      assert ref_back == "person-#{ref}-ref"
+
+      assert %{"v" => 1, "type" => "ok"} =
+               OriginWire.command(relay, "origin", %{
+                 "v" => 1,
+                 "type" => "reply",
+                 "op_id" => op(agent_op),
+                 "ref" => "agent-#{ref}-ref",
+                 "sender_id" => "app:test",
+                 "message_id" => message_id,
+                 "request_revision" => 1,
+                 "in_reply_to" => prior_discussions[message_id].pending["event_id"],
+                 "text" => agent_text
+               })
+
+      # The agent may answer the same chat message again; the terminal result
+      # of the request is untouched.
+      assert %{"v" => 1, "type" => "ok"} =
+               OriginWire.command(relay, "origin", %{
+                 "v" => 1,
+                 "type" => "reply",
+                 "op_id" => op(agent_op + 100),
+                 "sender_id" => "app:test",
+                 "message_id" => message_id,
+                 "request_revision" => 1,
+                 "in_reply_to" => event_id,
+                 "text" => "A second reply to the same chat message"
+               })
+    end
+
+    assert {:ok, still_answered} = Relay.origin_status(relay, "origin", @handle)
+    assert still_answered["open_requests"] == 0
+
     feed_before_refusals = Relay.origin_feed(relay, "origin", 0)
-
-    assert %{
-             "v" => 1,
-             "type" => "error",
-             "reason" => "closed",
-             "ref" => "person-answer-ref"
-           } =
-             request(relay, "reader", %{
-               "type" => "discussion",
-               "op_id" => op(804),
-               "ref" => "person-answer-ref",
-               "sender_id" => "app:test",
-               "message_id" => "answered-chat",
-               "request_revision" => 1,
-               "text" => "Can we discuss that answer?"
-             })
-
-    assert %{
-             "v" => 1,
-             "type" => "error",
-             "reason" => "closed",
-             "ref" => "agent-answer-ref"
-           } =
-             OriginWire.command(relay, "origin", %{
-               "v" => 1,
-               "type" => "reply",
-               "op_id" => op(805),
-               "ref" => "agent-answer-ref",
-               "sender_id" => "app:test",
-               "message_id" => "answered-chat",
-               "request_revision" => 1,
-               "in_reply_to" => prior_discussions["answered-chat"].pending["event_id"],
-               "text" => "Yes, here is more detail."
-             })
-
-    assert %{
-             "v" => 1,
-             "type" => "error",
-             "reason" => "closed",
-             "ref" => "person-no-comment-ref"
-           } =
-             request(relay, "reader", %{
-               "type" => "discussion",
-               "op_id" => op(806),
-               "ref" => "person-no-comment-ref",
-               "sender_id" => "app:test",
-               "message_id" => "no-comment-chat",
-               "request_revision" => 1,
-               "text" => "Can I explain why I chose no comment?"
-             })
-
-    assert %{
-             "v" => 1,
-             "type" => "error",
-             "reason" => "closed",
-             "ref" => "agent-no-comment-ref"
-           } =
-             OriginWire.command(relay, "origin", %{
-               "v" => 1,
-               "type" => "reply",
-               "op_id" => op(807),
-               "ref" => "agent-no-comment-ref",
-               "sender_id" => "app:test",
-               "message_id" => "no-comment-chat",
-               "request_revision" => 1,
-               "in_reply_to" => prior_discussions["no-comment-chat"].pending["event_id"],
-               "text" => "Of course; what would you like to explain?"
-             })
 
     assert %{
              "v" => 1,
@@ -2252,6 +2246,12 @@ defmodule AttentionServer.ConversationFeedTest do
              "chat",
              "reply",
              "reply",
+             "chat",
+             "chat",
+             "chat",
+             "chat",
+             "chat",
+             "chat",
              "reply",
              "reply"
            ]
@@ -2291,12 +2291,18 @@ defmodule AttentionServer.ConversationFeedTest do
              "Before the answer",
              "Pending before answer",
              "Before No comment",
-             "Pending before answer"
+             "Pending before answer",
+             "Can we discuss that answer?",
+             "Can I explain why I chose no comment?"
            ]
 
     assert Enum.map(Enum.filter(chat_entries, &(&1["kind"] == "reply")), & &1["text"]) == [
              "Already sent before answer",
-             "Already sent before answer"
+             "Already sent before answer",
+             "Yes, here is more detail.",
+             "A second reply to the same chat message",
+             "Of course; what would you like to explain?",
+             "A second reply to the same chat message"
            ]
 
     assert {:ok, conversation_events, _high} = Relay.conversation_events(relay, "reader", 0)
@@ -2324,7 +2330,7 @@ defmodule AttentionServer.ConversationFeedTest do
     GenServer.stop(relay)
   end
 
-  test "answer closes only its request while an unanswered sibling stays chat-ready", %{
+  test "answering one request leaves the chat of it and of its sibling open", %{
     path: path
   } do
     assert {:ok, relay} = Relay.start_link(store_path: path)
@@ -2384,12 +2390,7 @@ defmodule AttentionServer.ConversationFeedTest do
                "text" => "The sibling reply is still open"
              })
 
-    assert %{
-             "v" => 1,
-             "type" => "error",
-             "reason" => "closed",
-             "ref" => "answered-ref"
-           } =
+    assert %{"v" => 1, "type" => "ok", "ref" => "answered-ref"} =
              request(relay, "reader", %{
                "type" => "discussion",
                "op_id" => op(845),
@@ -2497,16 +2498,6 @@ defmodule AttentionServer.ConversationFeedTest do
 
     assert %{"type" => "error", "reason" => "not_found"} =
              request(relay, "origin", %{withdraw | "op_id" => op(41), "message_id" => "missing"})
-
-    assert %{"type" => "error", "reason" => "closed"} =
-             request(relay, "reader", %{
-               "type" => "discussion",
-               "op_id" => op(35),
-               "sender_id" => "app:test",
-               "message_id" => "withdrawn",
-               "request_revision" => 1,
-               "text" => "A late response"
-             })
 
     assert %{"type" => "ok", "seq" => 1, "duplicate" => true} =
              request(relay, "reader", discussion)
@@ -2653,6 +2644,18 @@ defmodule AttentionServer.ConversationFeedTest do
     assert ordinary_clear["state"] == "cleared"
     refute Map.has_key?(ordinary_clear, "terminal_reason")
     refute Map.has_key?(ordinary_clear, "retracted_at")
+
+    # A withdrawn request still takes chat from the person.
+    assert %{"type" => "ok"} =
+             request(restarted, "reader", %{
+               "type" => "discussion",
+               "op_id" => op(35),
+               "sender_id" => "app:test",
+               "message_id" => "withdrawn",
+               "request_revision" => 1,
+               "text" => "A late response"
+             })
+
     GenServer.stop(restarted)
   end
 
@@ -2713,12 +2716,21 @@ defmodule AttentionServer.ConversationFeedTest do
     assert %{"type" => "ok", "seq" => 2, "duplicate" => true} =
              request(relay, "origin", reply)
 
-    assert %{"type" => "error", "reason" => "closed"} =
-             request(relay, "origin", %{reply | "op_id" => op(54), "text" => "A late reply"})
-
     assert {:ok, %{"entries" => entries}} = Relay.origin_feed(relay, "origin", 0)
     assert Enum.map(entries, & &1["kind"]) == ["revision", "discussion", "reply", "terminal"]
     assert List.last(entries)["terminal_state"] == "retracted"
+
+    # After the withdrawal the agent may still reply, and the person may still
+    # write; the retraction stays as it was.
+    assert %{"type" => "ok"} =
+             request(relay, "origin", %{reply | "op_id" => op(54), "text" => "A late reply"})
+
+    assert %{"type" => "ok"} =
+             request(relay, "reader", %{discussion | "op_id" => op(55), "text" => "Thanks"})
+
+    assert {:ok, %{"entries" => later}} = Relay.origin_feed(relay, "origin", 0)
+    assert Enum.at(later, 3)["terminal_state"] == "retracted"
+    assert Enum.count(later, &(&1["kind"] == "terminal")) == 1
 
     GenServer.stop(relay)
   end

@@ -139,7 +139,7 @@ defmodule AttentionServer.OwnerTLSTest do
              )
 
     assert %{"error" => "not_found"} =
-             request(listener, certs, "a1", %{approve | "expected_expires_at" => deadline + 1})
+             request(listener, certs, "a1", %{approve | "expected_expires_at" => 1})
 
     refute Map.has_key?(:sys.get_state(relay).store.engine.devices, device_key)
 

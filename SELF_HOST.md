@@ -202,10 +202,10 @@ select a separate browser-trusted TLS certificate; otherwise the server's
 existing certificate and key are used. Opening the page does not grant sender
 or device authority.
 
-After the server is running, the current owner can issue a ten-minute sign-in
+After the server is running, the current owner can issue a one-use sign-in
 link over its authenticated owner TLS channel. The command saves the bearer
 link in a new private file; share it only with the intended owner and remove
-the file when no longer needed. A used or expired link needs a fresh one.
+the file when no longer needed. A used link needs a fresh one.
 
     "$PACKAGE/bin/harklight" owner browser-sign-in --connect 127.0.0.1 --name localhost --port 18445 --ca "$STATE/tls/ca.pem" --cert "$STATE/owner/identity.pem" --key "$STATE/owner/identity.key" --person "$(cat "$STATE/person-id")" --output "$STATE/owner/sign-in-link.txt"
 
@@ -216,11 +216,10 @@ rows show approved or revoked state and **Unknown** connection until the
 server has a real presence signal; enrollment does not imply online status.
 The signed-in owner opens **Add a device** to create the full invitation link,
 then **Waiting for approval** to compare the current code and exact key with
-the joining device. The approval window lasts 24 hours by default. The app retains its
-waiting request and can renew the same device after ordinary expiry without a
-new invitation or key. The owner must review the renewed current request;
-an old code or deadline cannot approve it. Denial, cancellation and revocation
-remain terminal and never grant sender rights.
+the joining device. The waiting request does not expire; the app keeps its
+key and can start again with it to get the same request and code. Denial,
+cancellation and revocation remain terminal. The owner may name sender grants
+when approving.
 
 The self-hosted dashboard also has a **Prioritization** page. It sets the
 dashboard owner's waiting-item order to the deterministic baseline or a
@@ -421,7 +420,7 @@ bin/harklight agent exposes existing keygen/search/get/respond tools.
 Owner agent-register, agent-grants-replace, agent-list and agent-revoke remain
 available. Register the exact public key and grant read/respond separately.
 Responses retain deliberate ANSWER confirmation, caller-held operation UUID,
-exact acceptance sequence and intent reference, without source ruling authority.
+exact acceptance sequence, without source ruling authority.
 
 ## Upgrade or rollback
 

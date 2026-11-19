@@ -172,7 +172,8 @@ defmodule AttentionServer.SupersedesTest do
                "answer" => "too late"
              })
 
-    assert %{"type" => "error", "reason" => "closed"} =
+    # A superseded request still takes chat.
+    assert %{"type" => "ok"} =
              request(relay, "phone", %{
                "type" => "discussion",
                "op_id" => op(8),

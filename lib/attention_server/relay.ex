@@ -776,7 +776,8 @@ defmodule AttentionServer.Relay do
 
   @impl true
   def init(opts) do
-    case Store.open(Keyword.get(opts, :store_path)) do
+    case Store.open(Keyword.get(opts, :store_path))
+         |> client_api_v2_store(Keyword.get(opts, :feature_flags_path)) do
       {:ok, store} ->
         case startup_cleanup(store) do
           {:ok, store} ->
@@ -863,6 +864,28 @@ defmodule AttentionServer.Relay do
         {:stop, reason}
     end
   end
+
+  # With the client_api_v2 flag on at startup, the store writes the change log
+  # in every commit. The flag is read once, here, before any startup commit.
+  defp client_api_v2_store({:ok, store}, feature_flags_path) do
+    {flags, _warned} = AttentionServer.FeatureFlags.read(feature_flags_path, true)
+
+    if Map.get(flags, "client_api_v2") == true do
+      case Store.enable_change_log(store) do
+        {:ok, store} ->
+          {:ok, store}
+
+        {:error, reason} ->
+          Diagnostics.failure(:server_startup, :configuration, reason, :unavailable)
+          Store.close(store)
+          {:error, {:storage_unavailable, reason}}
+      end
+    else
+      {:ok, store}
+    end
+  end
+
+  defp client_api_v2_store(error, _feature_flags_path), do: error
 
   defp startup_cleanup(store) do
     actor_keys = browser_actor_keys(store.engine)
@@ -983,7 +1006,7 @@ defmodule AttentionServer.Relay do
     config = state.join_configuration
 
     with {:ok, invited, _invite} <-
-           AttentionServer.GuidedJoin.create(engine, person, owner, hash, config, now),
+           AttentionServer.GuidedJoin.create(engine, person, owner, hash, config),
          {:ok, waiting, %{"approval_code" => code}} <-
            guided_pending(
              invited,
@@ -992,7 +1015,6 @@ defmodule AttentionServer.Relay do
              @hosted_test_device,
              status_hash,
              config,
-             now,
              8
            ) do
       case target do
@@ -1028,14 +1050,14 @@ defmodule AttentionServer.Relay do
     )
   end
 
-  defp guided_pending(_, _, _, _, _, _, _, 0), do: {:error, :refused}
+  defp guided_pending(_, _, _, _, _, _, 0), do: {:error, :refused}
 
-  defp guided_pending(engine, hash, cert, label, secret, config, now, attempts) do
+  defp guided_pending(engine, hash, cert, label, secret, config, attempts) do
     code = :crypto.strong_rand_bytes(7) |> Base.encode32(padding: false) |> binary_part(0, 10)
 
-    case AttentionServer.GuidedJoin.redeem(engine, hash, cert, label, secret, code, config, now) do
+    case AttentionServer.GuidedJoin.redeem(engine, hash, cert, label, secret, code, config) do
       {:error, :collision} ->
-        guided_pending(engine, hash, cert, label, secret, config, now, attempts - 1)
+        guided_pending(engine, hash, cert, label, secret, config, attempts - 1)
 
       result ->
         result
@@ -1051,52 +1073,27 @@ defmodule AttentionServer.Relay do
 
   defp secret_hash(_), do: {:error, :invalid_secret}
 
-  defp generate_pending(_engine, _certificate, _label, _now, 0),
+  defp generate_pending(_engine, _certificate, _label, 0),
     do: {:error, :storage_unavailable}
 
-  defp generate_pending(engine, certificate, label, now, attempts) do
+  defp generate_pending(engine, certificate, label, attempts) do
     secret = :crypto.strong_rand_bytes(32)
-    code = :crypto.strong_rand_bytes(7) |> Base.encode32(padding: false) |> binary_part(0, 10)
+    secret_hash = :crypto.hash(:sha256, secret)
 
-    case Engine.pending_enroll(
-           engine,
-           certificate,
-           label,
-           code,
-           :crypto.hash(:sha256, secret),
-           now
-         ) do
-      {:ok, next} -> {:ok, next, code, secret}
-      {:error, :collision} -> generate_pending(engine, certificate, label, now, attempts - 1)
-      error -> error
-    end
-  end
+    # A key that already has a waiting plain request gets that same request and
+    # approval code back; only its status secret changes.
+    case Engine.pending_restart(engine, certificate, label, secret_hash) do
+      {:ok, next, code} ->
+        {:ok, next, code, secret}
 
-  defp generate_resume(_engine, _hash, _cert, _now, 0), do: {:error, :storage_unavailable}
+      :none ->
+        code = :crypto.strong_rand_bytes(7) |> Base.encode32(padding: false) |> binary_part(0, 10)
 
-  defp generate_resume(engine, hash, cert, now, attempts) do
-    code = :crypto.strong_rand_bytes(7) |> Base.encode32(padding: false) |> binary_part(0, 10)
-
-    case Engine.pending_resume(engine, hash, cert, code, now) do
-      {:error, :collision} -> generate_resume(engine, hash, cert, now, attempts - 1)
-      result -> result
-    end
-  end
-
-  defp fence_pending_time(state, identity, now_ms) do
-    next = Engine.pending_observe_time(state.store.engine, identity, now_ms)
-
-    if next == state.store.engine do
-      {:ok, state}
-    else
-      case commit(state.store, next, %{
-             person: "system",
-             actor: "pending_deadline",
-             action: "pending_clock_fence"
-           }) do
-        {:ok, store} -> {:ok, %{state | store: store}}
-        {:error, _, _} -> {:error, :storage_unavailable}
-      end
+        case Engine.pending_enroll(engine, certificate, label, code, secret_hash) do
+          {:ok, next} -> {:ok, next, code, secret}
+          {:error, :collision} -> generate_pending(engine, certificate, label, attempts - 1)
+          error -> error
+        end
     end
   end
 
@@ -1907,29 +1904,25 @@ defmodule AttentionServer.Relay do
   end
 
   defp dispatch_call(
-         {:origin_stream_attach, key, :origin, worker, reconnect, false},
+         {:origin_stream_attach, key, :origin, worker, _reconnect, false},
          _from,
          state
        ) do
-    with {:ok, person} <- Engine.authorized_person(state.store.engine, key),
-         stream_key = {person, key, :origin},
-         false <- not reconnect and Map.has_key?(state.origin_streams, stream_key) do
-      proposed = put_in(state.origin_streams[stream_key], %{worker: worker})
+    with {:ok, person} <- Engine.authorized_person(state.store.engine, key) do
+      stream_key = {person, key, :origin}
+      proposed_streams = put_origin_stream(state.origin_streams, stream_key, %{worker: worker})
+      proposed = %{state | origin_streams: proposed_streams}
       next = origin_availability_changes(state, proposed, person, key)
 
       case Store.commit(state.store, next, audit(state.store.engine, key, "origin_attach")) do
         {:ok, store} ->
-          if previous = state.origin_streams[stream_key] do
-            Process.demonitor(previous.monitor, [:flush])
-            if previous.worker != worker, do: send(previous.worker, :origin_scope_replaced)
-          end
-
+          demonitor_origin_worker(state, stream_key, worker)
           stream = %{worker: worker, monitor: Process.monitor(worker), advisory_v1: false}
 
           next_state = %{
             proposed
             | store: store,
-              origin_streams: Map.put(proposed.origin_streams, stream_key, stream),
+              origin_streams: put_origin_stream(state.origin_streams, stream_key, stream),
               origin_streams_by_identity:
                 Map.update(
                   state.origin_streams_by_identity,
@@ -1945,7 +1938,6 @@ defmodule AttentionServer.Relay do
           {:reply, {:error, :storage_unavailable}, state}
       end
     else
-      true -> {:reply, {:error, :already_listening}, state}
       error -> {:reply, error, state}
     end
   end
@@ -1960,32 +1952,34 @@ defmodule AttentionServer.Relay do
 
     with {:ok, person} <- Engine.authorized_person(engine, key),
          {:ok, _} <- Engine.origin_status(engine, key, handle, false),
-         false <- not reconnect and Map.has_key?(state.origin_streams, {person, key, handle}),
          {:ok, attached} <- Conversation.mark_attached(engine, person, key, handle),
          {:ok, current} <- Engine.origin_status(attached, key, handle, true),
          attached <-
-           Engine.origin_availability(
-             attached,
-             person,
-             key,
-             handle,
-             current["availability"],
-             current["last_detached_at"]
+           if(Map.has_key?(state.origin_streams, {person, key, handle}),
+             # Another stream already makes this session listening; announce
+             # availability only when the first one attaches.
+             do: attached,
+             else:
+               Engine.origin_availability(
+                 attached,
+                 person,
+                 key,
+                 handle,
+                 current["availability"],
+                 current["last_detached_at"]
+               )
            ),
          {:ok, store} <-
            Store.commit(state.store, attached, audit(engine, key, "origin_attach")) do
       stream_key = {person, key, handle}
-      # Replace only after the attachment commit succeeds. The old worker's
-      # eventual detach/DOWN must not remove this connection's registration.
-      if previous = Map.get(state.origin_streams, stream_key) do
-        Process.demonitor(previous.monitor, [:flush])
-        if previous.worker != worker, do: send(previous.worker, :origin_stream_replaced)
-      end
-
+      # Register only after the attachment commit succeeds. Other streams of
+      # this session stay attached; only this worker's own earlier entry is
+      # replaced.
+      demonitor_origin_worker(state, stream_key, worker)
       monitor = Process.monitor(worker)
 
       streams =
-        Map.put(state.origin_streams, stream_key, %{
+        put_origin_stream(state.origin_streams, stream_key, %{
           worker: worker,
           monitor: monitor,
           advisory_requested: advisory_requested,
@@ -2020,7 +2014,6 @@ defmodule AttentionServer.Relay do
 
       {:reply, :ok, next_state}
     else
-      true -> {:reply, {:error, :already_listening}, state}
       {:error, :not_found} = error -> {:reply, error, state}
       {:error, :forbidden} = error -> {:reply, error, state}
       _ -> {:reply, {:error, :storage_unavailable}, state}
@@ -2029,10 +2022,10 @@ defmodule AttentionServer.Relay do
 
   defp dispatch_call({:origin_stream_detach, key, handle, worker}, _from, state) do
     case Enum.find(state.origin_streams, fn
-           {{_person, ^key, ^handle}, %{worker: ^worker}} -> true
+           {{_person, ^key, ^handle}, streams} -> Enum.any?(streams, &(&1.worker == worker))
            _ -> false
          end) do
-      {stream_key, _} -> {:reply, :ok, detach_origin_stream(state, stream_key)}
+      {stream_key, _} -> {:reply, :ok, detach_origin_stream(state, stream_key, worker)}
       nil -> {:reply, :ok, state}
     end
   end
@@ -2188,9 +2181,7 @@ defmodule AttentionServer.Relay do
   end
 
   defp dispatch_call({:pending_enroll, certificate_der, label}, _from, state) do
-    now = System.system_time(:millisecond)
-
-    case generate_pending(state.store.engine, certificate_der, label, now, 8) do
+    case generate_pending(state.store.engine, certificate_der, label, 8) do
       {:ok, next_engine, code, secret} ->
         case commit(state.store, next_engine, %{
                person: "unassigned",
@@ -2351,38 +2342,23 @@ defmodule AttentionServer.Relay do
 
   defp dispatch_call({:consume_browser_sign_in, token}, _from, state) do
     with {:ok, hash} <- AttentionServer.BrowserSignIn.token_hash(token) do
-      now = System.system_time(:millisecond)
-      observed = AttentionServer.BrowserSignIn.observe_time(state.store.engine, hash, now)
+      case AttentionServer.BrowserSignIn.consume(state.store.engine, hash) do
+        {:ok, next, principal} ->
+          case commit(state.store, next, %{
+                 person: principal.person_id,
+                 actor: principal.owner_key,
+                 action: "browser_sign_in_consume"
+               }) do
+            {:ok, committed} ->
+              principal = with_hosted_label(principal, :display_name, next)
+              {:reply, {:ok, principal}, %{state | store: committed}}
 
-      case commit(state.store, observed, %{
-             person: "system",
-             actor: "browser_sign_in_deadline",
-             action: "browser_sign_in_clock_fence"
-           }) do
-        {:ok, store} ->
-          fenced = %{state | store: store}
-
-          case AttentionServer.BrowserSignIn.consume(store.engine, hash, now) do
-            {:ok, next, principal} ->
-              case commit(store, next, %{
-                     person: principal.person_id,
-                     actor: principal.owner_key,
-                     action: "browser_sign_in_consume"
-                   }) do
-                {:ok, committed} ->
-                  principal = with_hosted_label(principal, :display_name, next)
-                  {:reply, {:ok, principal}, %{fenced | store: committed}}
-
-                _ ->
-                  {:reply, {:error, :storage_unavailable}, fenced}
-              end
-
-            error ->
-              {:reply, error, fenced}
+            _ ->
+              {:reply, {:error, :storage_unavailable}, state}
           end
 
-        _ ->
-          {:reply, {:error, :storage_unavailable}, state}
+        error ->
+          {:reply, error, state}
       end
     else
       _ -> {:reply, {:error, :invalid_sign_in}, state}
@@ -2392,15 +2368,12 @@ defmodule AttentionServer.Relay do
   defp dispatch_call({:owner_invite_create, person, owner}, _from, state) do
     token = :crypto.strong_rand_bytes(32)
     hash = :crypto.hash(:sha256, token)
-    now = System.system_time(:millisecond)
-
     case AttentionServer.GuidedJoin.create(
            state.store.engine,
            person,
            owner,
            hash,
-           state.join_configuration,
-           now
+           state.join_configuration
          ) do
       {:ok, next, invite} ->
         case commit(state.store, next, %{
@@ -2425,57 +2398,34 @@ defmodule AttentionServer.Relay do
     do: {:reply, state.dashboard_origin, state}
 
   defp dispatch_call({:invitation_resolve, token}, _from, state) do
-    with {:ok, hash} <- secret_hash(token) do
-      now = System.system_time(:millisecond)
-      engine = state.store.engine
+    with {:ok, _hash} <- secret_hash(token) do
+      result =
+        case AttentionServer.GuidedJoin.resolve(
+               state.store.engine,
+               token,
+               state.join_configuration
+             ) do
+          {:ok, %{"person_id" => person} = response} ->
+            {:ok, with_hosted_label(response, "account_label", state.store.engine, person)}
 
-      observed =
-        case Map.get(engine.join_invitations, hash) do
-          %{code: nil} -> AttentionServer.GuidedJoin.observe_time(engine, hash, now)
-          _ -> engine
+          other ->
+            other
         end
 
-      case commit(state.store, observed, %{
-             person: "system",
-             actor: "join_deadline",
-             action: "join_clock_fence"
-           }) do
-        {:ok, store} ->
-          result =
-            case AttentionServer.GuidedJoin.resolve(
-                   store.engine,
-                   token,
-                   state.join_configuration,
-                   now
-                 ) do
-              {:ok, %{"person_id" => person} = response} ->
-                {:ok, with_hosted_label(response, "account_label", store.engine, person)}
-
-              other ->
-                other
-            end
-
-          {:reply, result, %{state | store: store}}
-
-        _ ->
-          {:reply, {:error, :storage_unavailable}, state}
-      end
+      {:reply, result, state}
     else
       _ -> {:reply, {:error, :unavailable}, state}
     end
   end
 
   defp dispatch_call({:owner_invite_create, person, owner, request_id}, _from, state) do
-    now = System.system_time(:millisecond)
-
     result =
       AttentionServer.GuidedJoin.create_for_request(
         state.store.engine,
         person,
         owner,
         request_id,
-        state.join_configuration,
-        now
+        state.join_configuration
       )
 
     case result do
@@ -2494,16 +2444,6 @@ defmodule AttentionServer.Relay do
             {:reply, {:error, :storage_unavailable}, state}
         end
 
-      {:error, reason, observed} ->
-        case commit(state.store, observed, %{
-               person: person,
-               actor: owner,
-               action: "invite_request_expired"
-             }) do
-          {:ok, store} -> {:reply, {:error, reason}, %{state | store: store}}
-          _ -> {:reply, {:error, :storage_unavailable}, state}
-        end
-
       error ->
         {:reply, error, state}
     end
@@ -2511,43 +2451,27 @@ defmodule AttentionServer.Relay do
 
   defp dispatch_call({:invited_enroll, token, certificate, label, status_secret}, _from, state) do
     with {:ok, hash} <- secret_hash(token), {:ok, status_hash} <- secret_hash(status_secret) do
-      now = System.system_time(:millisecond)
-      observed = AttentionServer.GuidedJoin.observe_time(state.store.engine, hash, now)
-
-      case commit(state.store, observed, %{
-             person: "system",
-             actor: "join_deadline",
-             action: "join_clock_fence"
-           }) do
-        {:ok, store} ->
-          fenced = %{state | store: store}
-
-          case guided_pending(
-                 store.engine,
-                 hash,
-                 certificate,
-                 label,
-                 status_hash,
-                 state.join_configuration,
-                 now,
-                 8
-               ) do
-            {:ok, next, response} ->
-              case commit(store, next, %{
-                     person: next.join_invitations[hash].person,
-                     actor: "invited_submitter",
-                     action: "invited_pending_enrollment"
-                   }) do
-                {:ok, committed} -> {:reply, {:ok, response}, %{state | store: committed}}
-                _ -> {:reply, {:error, :storage_unavailable}, fenced}
-              end
-
-            error ->
-              {:reply, error, fenced}
+      case guided_pending(
+             state.store.engine,
+             hash,
+             certificate,
+             label,
+             status_hash,
+             state.join_configuration,
+             8
+           ) do
+        {:ok, next, response} ->
+          case commit(state.store, next, %{
+                 person: next.join_invitations[hash].person,
+                 actor: "invited_submitter",
+                 action: "invited_pending_enrollment"
+               }) do
+            {:ok, committed} -> {:reply, {:ok, response}, %{state | store: committed}}
+            _ -> {:reply, {:error, :storage_unavailable}, state}
           end
 
-        _ ->
-          {:reply, {:error, :storage_unavailable}, state}
+        error ->
+          {:reply, error, state}
       end
     else
       _ -> {:reply, {:error, :refused}, state}
@@ -2555,26 +2479,22 @@ defmodule AttentionServer.Relay do
   end
 
   defp dispatch_call({:pending_cancel, secret, code, key, deadline}, _from, state) do
-    now = System.system_time(:millisecond)
-
-    with {:ok, hash} <- secret_hash(secret),
-         {:ok, fenced} <- fence_pending_time(state, {:secret, hash}, now) do
-      case Engine.pending_cancel(fenced.store.engine, hash, code, key, deadline, now) do
+    with {:ok, hash} <- secret_hash(secret) do
+      case Engine.pending_cancel(state.store.engine, hash, code, key, deadline) do
         {:ok, next, reply} ->
-          case commit(fenced.store, next, %{
+          case commit(state.store, next, %{
                  person: "requester",
                  actor: "pending_submitter",
                  action: "pending_cancel"
                }) do
-            {:ok, store} -> {:reply, {:ok, reply}, %{fenced | store: store}}
-            _ -> {:reply, {:error, :storage_unavailable}, fenced}
+            {:ok, store} -> {:reply, {:ok, reply}, %{state | store: store}}
+            _ -> {:reply, {:error, :storage_unavailable}, state}
           end
 
         error ->
-          {:reply, error, fenced}
+          {:reply, error, state}
       end
     else
-      {:error, :storage_unavailable} -> {:reply, {:error, :storage_unavailable}, state}
       _ -> {:reply, {:error, :not_found}, state}
     end
   end
@@ -2620,23 +2540,15 @@ defmodule AttentionServer.Relay do
   end
 
   defp dispatch_call({:owner_pending_decline, person, owner, code, key, deadline}, _from, state) do
-    now = System.system_time(:millisecond)
-
-    case fence_pending_time(state, {:code, code}, now) do
-      {:ok, fenced} ->
-        case Engine.pending_decline(fenced.store.engine, person, owner, code, key, deadline, now) do
-          {:ok, next} ->
-            case commit(fenced.store, next, %{
-                   person: person,
-                   actor: owner,
-                   action: "owner_device_decline"
-                 }) do
-              {:ok, store} -> {:reply, :ok, %{fenced | store: store}}
-              _ -> {:reply, {:error, :storage_unavailable}, fenced}
-            end
-
-          error ->
-            {:reply, error, fenced}
+    case Engine.pending_decline(state.store.engine, person, owner, code, key, deadline) do
+      {:ok, next} ->
+        case commit(state.store, next, %{
+               person: person,
+               actor: owner,
+               action: "owner_device_decline"
+             }) do
+          {:ok, store} -> {:reply, :ok, %{state | store: store}}
+          _ -> {:reply, {:error, :storage_unavailable}, state}
         end
 
       error ->
@@ -2648,15 +2560,7 @@ defmodule AttentionServer.Relay do
     with {:ok, secret} <- Base.decode16(secret_hex, case: :lower),
          true <- byte_size(secret) == 32 do
       hash = :crypto.hash(:sha256, secret)
-      now_ms = System.system_time(:millisecond)
-
-      case fence_pending_time(state, {:secret, hash}, now_ms) do
-        {:ok, fenced} ->
-          {:reply, Engine.pending_status(fenced.store.engine, hash, now_ms), fenced}
-
-        {:error, reason} ->
-          {:reply, {:error, reason}, state}
-      end
+      {:reply, Engine.pending_status(state.store.engine, hash), state}
     else
       _ -> {:reply, {:error, :not_found}, state}
     end
@@ -2667,44 +2571,17 @@ defmodule AttentionServer.Relay do
 
   defp dispatch_call({:pending_resume, secret_hex, cert_der}, _from, state) do
     with {:ok, hash} <- secret_hash(secret_hex) do
-      now_ms = System.system_time(:millisecond)
-
-      case fence_pending_time(state, {:secret, hash}, now_ms) do
-        {:ok, fenced} ->
-          case generate_resume(fenced.store.engine, hash, cert_der, now_ms, 8) do
-            {:ok, next, reply} ->
-              case commit(fenced.store, next, %{
-                     person: Map.get(reply, "person_id", "requester"),
-                     actor: "pending_submitter",
-                     action: "pending_resume"
-                   }) do
-                {:ok, store} -> {:reply, {:ok, reply}, %{fenced | store: store}}
-                _ -> {:reply, {:error, :storage_unavailable}, fenced}
-              end
-
-            error ->
-              {:reply, error, fenced}
-          end
-
-        {:error, reason} ->
-          {:reply, {:error, reason}, state}
+      case Engine.pending_resume(state.store.engine, hash, cert_der) do
+        {:ok, _engine, reply} -> {:reply, {:ok, reply}, state}
+        error -> {:reply, error, state}
       end
     else
       _ -> {:reply, {:error, :not_found}, state}
     end
   end
 
-  defp dispatch_call({:owner_pending_lookup, person, key, code}, _from, state) do
-    now_ms = System.system_time(:millisecond)
-
-    case fence_pending_time(state, {:code, code}, now_ms) do
-      {:ok, fenced} ->
-        {:reply, Engine.pending_lookup(fenced.store.engine, person, key, code, now_ms), fenced}
-
-      {:error, reason} ->
-        {:reply, {:error, reason}, state}
-    end
-  end
+  defp dispatch_call({:owner_pending_lookup, person, key, code}, _from, state),
+    do: {:reply, Engine.pending_lookup(state.store.engine, person, key, code), state}
 
   defp dispatch_call(
          {:owner_pending_approve, person, key, code, expected_key, expected_expires_at, senders},
@@ -2713,34 +2590,28 @@ defmodule AttentionServer.Relay do
        ) do
     now_ms = System.system_time(:millisecond)
 
-    case fence_pending_time(state, {:code, code}, now_ms) do
-      {:ok, fenced} ->
-        case Engine.pending_approve(
-               fenced.store.engine,
-               person,
-               key,
-               code,
-               expected_key,
-               expected_expires_at,
-               senders,
-               now_ms
-             ) do
-          {:ok, next_engine, device_key} ->
-            case commit(fenced.store, next_engine, %{
-                   person: person,
-                   actor: key,
-                   action: "owner_device_approve"
-                 }) do
-              {:ok, store} ->
-                next_state = ensure_priority_view_if_missing(%{fenced | store: store}, person)
-                {:reply, {:ok, device_key}, next_state}
+    case Engine.pending_approve(
+           state.store.engine,
+           person,
+           key,
+           code,
+           expected_key,
+           expected_expires_at,
+           senders,
+           now_ms
+         ) do
+      {:ok, next_engine, device_key} ->
+        case commit(state.store, next_engine, %{
+               person: person,
+               actor: key,
+               action: "owner_device_approve"
+             }) do
+          {:ok, store} ->
+            next_state = ensure_priority_view_if_missing(%{state | store: store}, person)
+            {:reply, {:ok, device_key}, next_state}
 
-              {:error, _, _} ->
-                {:reply, {:error, :storage_unavailable}, fenced}
-            end
-
-          {:error, reason} ->
-            {:reply, {:error, reason}, fenced}
+          {:error, _, _} ->
+            {:reply, {:error, :storage_unavailable}, state}
         end
 
       {:error, reason} ->
@@ -3943,12 +3814,12 @@ defmodule AttentionServer.Relay do
             {:noreply, delete_focus_stream(state, listener)}
 
           true ->
-            case Enum.find(state.origin_streams, fn {_, stream} ->
-                   stream.worker == listener and stream.monitor == monitor
+            case Enum.find(state.origin_streams, fn {_, streams} ->
+                   Enum.any?(streams, &(&1.worker == listener and &1.monitor == monitor))
                  end) do
               {stream_key, _} ->
                 Diagnostics.failure(:origin_https, :stream_detach, reason, :closed)
-                {:noreply, detach_origin_stream(state, stream_key)}
+                {:noreply, detach_origin_stream(state, stream_key, listener)}
 
               nil ->
                 {:noreply, state}
@@ -4017,33 +3888,43 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  defp detach_origin_stream(state, {person, origin, :origin} = key) do
-    {stream, streams} = Map.pop(state.origin_streams, key)
-    if stream, do: Process.demonitor(stream.monitor, [:flush])
+  defp detach_origin_stream(state, {person, origin, :origin} = key, worker) do
+    {streams, remaining?} = remove_origin_worker(state.origin_streams, key, worker)
 
-    proposed = %{
-      state
-      | origin_streams: streams,
-        origin_streams_by_identity:
-          remove_origin_stream_index(state.origin_streams_by_identity, {person, origin}, key)
-    }
+    if remaining? do
+      %{state | origin_streams: streams}
+    else
+      proposed = %{
+        state
+        | origin_streams: streams,
+          origin_streams_by_identity:
+            remove_origin_stream_index(state.origin_streams_by_identity, {person, origin}, key)
+      }
 
-    next = origin_availability_changes(state, proposed, person, origin)
+      next = origin_availability_changes(state, proposed, person, origin)
 
-    case Store.commit(state.store, next, audit(state.store.engine, origin, "origin_detach")) do
-      {:ok, store} ->
-        %{proposed | store: store}
+      case Store.commit(state.store, next, audit(state.store.engine, origin, "origin_detach")) do
+        {:ok, store} ->
+          %{proposed | store: store}
 
-      error ->
-        Diagnostics.failure(:origin_https, :stream_detach, error, :unavailable)
-        proposed
+        error ->
+          Diagnostics.failure(:origin_https, :stream_detach, error, :unavailable)
+          proposed
+      end
     end
   end
 
-  defp detach_origin_stream(state, {person, origin, handle} = key) do
-    {stream, streams} = Map.pop(state.origin_streams, key)
-    if stream, do: Process.demonitor(stream.monitor, [:flush])
+  defp detach_origin_stream(state, {person, origin, handle} = key, worker) do
+    {streams, remaining?} = remove_origin_worker(state.origin_streams, key, worker)
 
+    if remaining? do
+      %{state | origin_streams: streams}
+    else
+      detach_last_origin_stream(state, key, streams, person, origin, handle)
+    end
+  end
+
+  defp detach_last_origin_stream(state, key, streams, person, origin, handle) do
     streams_by_identity =
       remove_origin_stream_index(state.origin_streams_by_identity, {person, origin}, key)
 
@@ -4106,6 +3987,33 @@ defmodule AttentionServer.Relay do
         Diagnostics.failure(:origin_https, :stream_detach, other, :unavailable)
         %{state | origin_streams: streams, origin_streams_by_identity: streams_by_identity}
     end
+  end
+
+  defp put_origin_stream(streams, key, %{worker: worker} = stream) do
+    Map.update(streams, key, [stream], fn existing ->
+      [stream | Enum.reject(existing, &(&1.worker == worker))]
+    end)
+  end
+
+  defp demonitor_origin_worker(state, key, worker) do
+    state.origin_streams
+    |> Map.get(key, [])
+    |> Enum.each(fn stream ->
+      if stream.worker == worker and Map.has_key?(stream, :monitor),
+        do: Process.demonitor(stream.monitor, [:flush])
+    end)
+  end
+
+  # Removes one worker's stream; the key disappears when its last stream goes.
+  defp remove_origin_worker(streams, key, worker) do
+    {removed, kept} =
+      streams |> Map.get(key, []) |> Enum.split_with(&(&1.worker == worker))
+
+    Enum.each(removed, fn stream ->
+      if Map.has_key?(stream, :monitor), do: Process.demonitor(stream.monitor, [:flush])
+    end)
+
+    if kept == [], do: {Map.delete(streams, key), false}, else: {Map.put(streams, key, kept), true}
   end
 
   defp remove_origin_stream_index(index, identity, stream_key) do
@@ -4247,7 +4155,8 @@ defmodule AttentionServer.Relay do
          {:ok,
           %{
             "inline_decoded_bytes_per_entry" => ConversationFiles.inline_limit(),
-            "upload_cap_bytes_per_file" => cap
+            "upload_cap_bytes_per_file" => cap,
+            "answer_ui_limits" => AttentionServer.UI1.published_limits()
           }}, state}
 
       _ ->
@@ -6982,10 +6891,9 @@ defmodule AttentionServer.Relay do
   defp notify_coverage_change(state, old_engine, person, origin) do
     if covered_handles(old_engine, person, origin) !=
          covered_handles(state.store.engine, person, origin) do
-      case state.origin_streams[{person, origin, :origin}] do
-        %{worker: worker} -> send(worker, :origin_coverage_changed)
-        _ -> :ok
-      end
+      state.origin_streams
+      |> Map.get({person, origin, :origin}, [])
+      |> Enum.each(&send(&1.worker, :origin_coverage_changed))
 
       requeue_covered(state, person, origin)
     else
@@ -7107,16 +7015,19 @@ defmodule AttentionServer.Relay do
 
   defp refresh_stream_advisory_support(state, {person, origin, handle} = stream_key) do
     case Map.get(state.origin_streams, stream_key) do
-      %{advisory_requested: requested} = stream ->
-        enabled =
-          requested and
-            BounceDecision.advisory_supported?(state.store.engine, person, origin, handle)
+      streams when is_list(streams) ->
+        supported = BounceDecision.advisory_supported?(state.store.engine, person, origin, handle)
 
-        %{
-          state
-          | origin_streams:
-              Map.put(state.origin_streams, stream_key, %{stream | advisory_v1: enabled})
-        }
+        updated =
+          Enum.map(streams, fn
+            %{advisory_requested: requested} = stream ->
+              %{stream | advisory_v1: requested and supported}
+
+            stream ->
+              stream
+          end)
+
+        %{state | origin_streams: Map.put(state.origin_streams, stream_key, updated)}
 
       _ ->
         state
@@ -7130,13 +7041,15 @@ defmodule AttentionServer.Relay do
 
       case Map.get(next_engine.advisory_feeds, key) do
         %{high: high} when high > old_high ->
-          case Map.get(current.origin_streams, key) do
+          current.origin_streams
+          |> Map.get(key, [])
+          |> Enum.each(fn
             %{worker: worker, advisory_v1: true} ->
               send(worker, {:origin_advisory_changed, handle, high})
 
             _ ->
               :ok
-          end
+          end)
 
         _ ->
           :ok
@@ -7260,10 +7173,9 @@ defmodule AttentionServer.Relay do
       state.origin_streams_by_identity
       |> Map.get(key, MapSet.new())
       |> Enum.each(fn stream_key ->
-        case Map.get(state.origin_streams, stream_key) do
-          %{worker: worker} -> send(worker, {:origin_state_changed, next_feed.high})
-          _ -> :ok
-        end
+        state.origin_streams
+        |> Map.get(stream_key, [])
+        |> Enum.each(&send(&1.worker, {:origin_state_changed, next_feed.high}))
       end)
 
       %{state | upload_index: upload_index}

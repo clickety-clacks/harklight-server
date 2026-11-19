@@ -211,7 +211,7 @@ harklight-agent --identity-dir ./harklight-agent-identity \
 
     body =
       ~s(<h1>Approve this device?</h1>) <>
-        ~s(<section><p>Device: #{label}</p><p>Joins as: #{escape(person)}</p><p>Code on device: <strong>#{escaped_code}</strong></p><p>Closes: #{escape(time(deadline))}</p><details><summary>Exact device key</summary><code>#{escaped_key}</code></details></section>) <>
+        ~s(<section><p>Device: #{label}</p><p>Joins as: #{escape(person)}</p><p>Code on device: <strong>#{escaped_code}</strong></p>#{closes(deadline)}<details><summary>Exact device key</summary><code>#{escaped_key}</code></details></section>) <>
         ~s(<section>) <>
         action_form(
           code,
@@ -306,6 +306,9 @@ harklight-agent --identity-dir ./harklight-agent-identity \
 
     ~s(<li><span>#{label} · #{person}</span><span>Code on device: #{code}</span><span>#{review}</span></li>)
   end
+
+  defp closes(deadline) when is_integer(deadline), do: ~s(<p>Closes: #{escape(time(deadline))}</p>)
+  defp closes(_), do: ""
 
   defp expiry(nil), do: "No expiry"
   defp expiry(ms), do: time(ms)

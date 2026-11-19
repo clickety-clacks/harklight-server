@@ -11,7 +11,6 @@ defmodule AttentionServer.HeadlessToolTest do
     OperatorTool,
     OwnerTLS,
     Relay,
-    Store,
     TLSFixtures,
     WebSocketRelay
   }
@@ -90,36 +89,15 @@ defmodule AttentionServer.HeadlessToolTest do
     assert Bitwise.band(server_stat.mode, 0o777) == 0o600
     assert Bitwise.band(pending_stat.mode, 0o777) == 0o600
 
+    # Starting again with the same key after losing the saved handle returns the
+    # same waiting request and approval code.
     pending_path = Path.join(identity_dir, "pending.json")
-    backup_path = Path.join(identity_dir, "pending.saved")
-    assert :ok = File.rename(pending_path, backup_path)
+    assert :ok = File.rm(pending_path)
 
-    assert {:error, :key_pending} =
+    assert {:ok, %{approval_code: ^code}} =
              HeadlessEnrollment.submit_existing(identity_dir, enrollment_endpoint, "fresh laptop")
 
-    error =
-      assert_raise Mix.Error, fn ->
-        Mix.Tasks.Attention.Enroll.run([
-          "retry",
-          "--directory",
-          identity_dir,
-          "--connect",
-          "127.0.0.1",
-          "--name",
-          "relay.test",
-          "--port",
-          Integer.to_string(EnrollmentHTTPS.port(enrollment)),
-          "--ca",
-          Path.join(certs, "ca.pem"),
-          "--label",
-          "fresh laptop"
-        ])
-      end
-
-    assert Exception.message(error) =~ "no old code or secret is recoverable"
-
-    refute File.exists?(pending_path)
-    assert :ok = File.rename(backup_path, pending_path)
+    assert File.exists?(pending_path)
 
     server_path = Path.join(identity_dir, "server.json")
     assert {:ok, saved_server} = server_path |> File.read!() |> JSON.decode_line()
@@ -355,101 +333,8 @@ defmodule AttentionServer.HeadlessToolTest do
 
     File.chmod!(identity_dir, 0o700)
 
-    assert {:error, :key_pending} =
+    assert {:ok, %{approval_code: ^code}} =
              HeadlessEnrollment.submit_existing(identity_dir, endpoint, "save failure")
-  end
-
-  test "retry archives an expired status handle and submits the same private key", %{certs: certs} do
-    dir =
-      Path.join(
-        System.tmp_dir!(),
-        "attention-expired-retry-#{System.unique_integer([:positive])}"
-      )
-
-    File.mkdir_p!(dir)
-    on_exit(fn -> File.rm_rf!(dir) end)
-    identity_dir = Path.join(dir, "device")
-    {:ok, relay} = Relay.start_link(store_path: Path.join(dir, "relay.sqlite3"))
-
-    {:ok, listener} =
-      EnrollmentHTTPS.start_link(
-        relay: relay,
-        certfile: Path.join(certs, "server.pem"),
-        keyfile: Path.join(certs, "server.key")
-      )
-
-    on_exit(fn ->
-      if Process.alive?(listener), do: GenServer.stop(listener)
-      if Process.alive?(relay), do: GenServer.stop(relay)
-    end)
-
-    endpoint = endpoint(certs, EnrollmentHTTPS.port(listener))
-
-    assert {:ok, %{approval_code: old_code}} =
-             HeadlessEnrollment.start(identity_dir, endpoint, "retry")
-
-    old_key = File.read!(Path.join(identity_dir, "identity.key"))
-    old_pending = File.read!(Path.join(identity_dir, "pending.json"))
-    {:ok, %{"status_secret" => old_secret}} = AttentionServer.JSON.decode_line(old_pending)
-    state = :sys.get_state(relay)
-    item = state.store.engine.pending_enrollments[old_code]
-    expired_at = System.system_time(:millisecond) - 1
-
-    engine = %{
-      state.store.engine
-      | pending_enrollments:
-          Map.put(state.store.engine.pending_enrollments, old_code, %{
-            item
-            | expires_at: expired_at,
-              status_expires_at: expired_at + 86_400_000
-          })
-    }
-
-    assert {:ok, stored} =
-             Store.commit(state.store, engine, %{
-               person: "unassigned",
-               actor: "test_fixture",
-               action: "expire_saved_request"
-             })
-
-    :sys.replace_state(relay, fn current -> %{current | store: stored} end)
-    old_shell = Mix.shell()
-    Mix.shell(Mix.Shell.Process)
-    on_exit(fn -> Mix.shell(old_shell) end)
-
-    assert :ok =
-             Mix.Tasks.Attention.Enroll.run([
-               "retry",
-               "--directory",
-               identity_dir,
-               "--connect",
-               "127.0.0.1",
-               "--name",
-               endpoint.name,
-               "--port",
-               Integer.to_string(endpoint.port),
-               "--ca",
-               endpoint.ca_file,
-               "--label",
-               "retry"
-             ])
-
-    assert_receive {:mix_shell, :info, ["approval code: " <> display]}
-    assert File.read!(Path.join(identity_dir, "identity.key")) == old_key
-    assert File.read!(Path.join(identity_dir, "pending-#{old_code}.json")) == old_pending
-
-    {:ok, %{"approval_code" => new_code}} =
-      AttentionServer.JSON.decode_line(File.read!(Path.join(identity_dir, "pending.json")))
-
-    assert new_code != old_code
-    assert display =~ new_code
-
-    assert {:ok, 200, %{"state" => "expired"}} =
-             HeadlessTLS.post_json(endpoint, "/enroll/status", %{"status_secret" => old_secret})
-
-    assert {:ok, %{"state" => "pending"}} = HeadlessEnrollment.status(identity_dir, endpoint)
-    assert map_size(:sys.get_state(relay).store.engine.pending_history) == 1
-    assert map_size(:sys.get_state(relay).store.engine.pending_enrollments) == 1
   end
 
   test "owner approval prompt visibly escapes attacker label and keeps account and key legible",
@@ -495,7 +380,7 @@ defmodule AttentionServer.HeadlessToolTest do
 
     owner_endpoint = endpoint(certs, OwnerTLS.port(owner))
 
-    assert {:ok, %{"label" => ^label, "device_id" => device, "expires_at" => deadline}} =
+    assert {:ok, %{"label" => ^label, "device_id" => device, "expires_at" => nil}} =
              HeadlessOwner.lookup(
                owner_endpoint,
                Path.join(certs, "a1.pem"),
@@ -533,12 +418,11 @@ defmodule AttentionServer.HeadlessToolTest do
     assert_receive {:mix_shell, :info, [<<"Account: ", _::binary>> = display]}
 
     assert display ==
-             "Account: #{person}\nDevice label (unsafe bytes escaped): laptop\\x1B[8m\\x0D\\x1B[2Kfake\\x0APublic-key fingerprint: deadbeef\\x5C\\xE2\\x80\\xAE\nPublic-key fingerprint: #{device}\nExpires: " <>
-               Integer.to_string(deadline)
+             "Account: #{person}\nDevice label (unsafe bytes escaped): laptop\\x1B[8m\\x0D\\x1B[2Kfake\\x0APublic-key fingerprint: deadbeef\\x5C\\xE2\\x80\\xAE\nPublic-key fingerprint: #{device}"
 
     assert :binary.match(display, <<27>>) == :nomatch
     assert :binary.match(display, <<13>>) == :nomatch
-    assert length(String.split(display, "\n")) == 4
+    assert length(String.split(display, "\n")) == 3
     refute Map.has_key?(:sys.get_state(relay).store.engine.devices, device)
 
     send(self(), {:mix_shell_input, :prompt, "APPROVE"})

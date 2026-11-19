@@ -372,17 +372,21 @@ defmodule AttentionServer.AgentServiceTest do
                "cursor" => cursor
              })
 
-    assert %{"error" => "invalid_field"} =
-             agent_request(agent_endpoint, cert, private, %{read_only | "deliberate" => false})
-
     assert %{"error" => "stale_target"} =
              agent_request(agent_endpoint, cert, private, %{read_only | "acceptance_seq" => 999})
 
+    # An answer needs no `deliberate` or `intent_ref`; a retry that still
+    # carries them is the same operation.
+    without_intent = Map.drop(read_only, ["deliberate", "intent_ref"])
+
     assert %{"type" => "answer_result", "ok" => true, "seq" => 4} =
-             agent_request(agent_endpoint, cert, private, read_only)
+             agent_request(agent_endpoint, cert, private, without_intent)
 
     assert %{"type" => "answer_result", "duplicate" => true, "seq" => 4} =
              agent_request(agent_endpoint, cert, private, read_only)
+
+    assert %{"type" => "answer_result", "duplicate" => true, "seq" => 4} =
+             agent_request(agent_endpoint, cert, private, without_intent)
 
     assert %{"error" => "closed"} =
              agent_request(

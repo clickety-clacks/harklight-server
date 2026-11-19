@@ -292,8 +292,8 @@ defmodule AttentionServer.DashboardHTTPSTest do
     assert byte_size("https://relay.test:#{port}/join##{payload["invite_token"]}") < 512
     assert invitation =~ payload["enrollment_url"]
 
-    assert invitation =~
-             DateTime.to_iso8601(DateTime.from_unix!(payload["expires_at"], :millisecond))
+    assert payload["expires_at"] == nil
+    assert invitation =~ "No expiry"
 
     assert map_size(:sys.get_state(relay).store.engine.join_invitations) == 1
     assert :sys.get_state(relay).store.engine.sender_grants == %{}
@@ -454,7 +454,7 @@ defmodule AttentionServer.DashboardHTTPSTest do
 
     approval_code = pending_reply["approval_code"]
     assert {:ok, pending} = Relay.owner_pending_lookup(relay, person, key, approval_code)
-    stale_approval = "key=#{pending.key}&deadline=#{pending.expires_at - 1}"
+    stale_approval = "key=#{pending.key}&deadline=12345"
 
     refused_approval =
       send_https(certs, port, [

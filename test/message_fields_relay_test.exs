@@ -264,10 +264,13 @@ defmodule AttentionServer.MessageFieldsRelayTest do
       "answer_ui" => image_document.("missing.png")
     }
 
+    # A screen naming a file that was not delivered cannot be shown: the message
+    # is still accepted and delivered with the plain Reply.
     assert %{
-             "type" => "error",
-             "code" => "request_answer_ui_invalid",
-             "reason" => reason
+             "type" => "ok",
+             "field_warnings" => [
+               %{"field" => "answer_ui", "reason" => "unavailable", "detail" => detail}
+             ]
            } =
              request(relay, "origin", %{
                "type" => "forward",
@@ -277,21 +280,30 @@ defmodule AttentionServer.MessageFieldsRelayTest do
                "files" => [attached_file]
              })
 
-    assert reason =~ "illustrations[0].primitives[0].file"
-    assert reason =~ "missing.png"
-    assert reason =~ "cover.png"
-    assert {:ok, [], 0} = Relay.events(relay, "reader", 0)
+    assert detail =~ "illustrations[0].primitives[0].file"
+    assert detail =~ "missing.png"
+    assert detail =~ "cover.png"
+    assert {:ok, [degraded], 1} = Relay.events(relay, "reader", 0)
+
+    assert degraded["message"]["answer_ui"] == %{
+             "schema" => "attention-client.actions/1",
+             "actions" => [%{"id" => "reply", "label" => "Reply", "kind" => "text"}]
+           }
+
+    assert degraded["message"]["answer_ui_unavailable"] == detail
+    assert degraded["message"]["title"] == "Choose a cover"
 
     wrapped_message =
-      Map.put(invalid_message, "answer_ui", %{
+      invalid_message
+      |> Map.put("message_id", "image-choice-wrapped")
+      |> Map.put("answer_ui", %{
         "schema" => "attention-client.ui/1",
         "document" => image_document.("cover.png")
       })
 
     assert %{
-             "type" => "error",
-             "code" => "request_answer_ui_invalid",
-             "reason" => wrapped_reason
+             "type" => "ok",
+             "field_warnings" => [%{"field" => "answer_ui", "detail" => wrapped_detail}]
            } =
              request(relay, "origin", %{
                "type" => "forward",
@@ -301,26 +313,30 @@ defmodule AttentionServer.MessageFieldsRelayTest do
                "files" => [attached_file]
              })
 
-    assert wrapped_reason =~ "answer_ui (attention-client.ui/1) at "
-    assert {:ok, [], 0} = Relay.events(relay, "reader", 0)
+    assert wrapped_detail =~ "answer_ui (attention-client.ui/1) at "
 
-    valid_message = Map.put(invalid_message, "answer_ui", image_document.("cover.png"))
+    valid_message =
+      invalid_message
+      |> Map.put("message_id", "image-choice-valid")
+      |> Map.put("answer_ui", image_document.("cover.png"))
 
     assert %{"type" => "ok"} =
+             reply =
              request(relay, "origin", %{
                "type" => "forward",
-               "op_id" => op(30),
+               "op_id" => op(28),
                "session_handle" => @handle,
                "message" => valid_message,
                "files" => [attached_file]
              })
 
-    assert {:ok, [delivery], 1} = Relay.events(relay, "reader", 0)
+    refute Map.has_key?(reply, "field_warnings")
+    assert {:ok, [_, _, delivery], 3} = Relay.events(relay, "reader", 0)
     assert delivery["message"] == valid_message
     GenServer.stop(relay)
   end
 
-  test "duplicate UI/1 members get the actionable refusal on the origin send route", %{
+  test "duplicate UI/1 members degrade the screen on the origin send route", %{
     path: path
   } do
     relay = start_relay(path)
@@ -334,14 +350,15 @@ defmodule AttentionServer.MessageFieldsRelayTest do
     assert {:ok, request} = JSON.decode_line_for_ui1_admission(raw)
 
     assert %{
-             "type" => "error",
-             "code" => "request_answer_ui_invalid",
-             "reason" => reason
+             "type" => "ok",
+             "field_warnings" => [%{"field" => "answer_ui", "detail" => detail}]
            } = OriginWire.command(relay, "origin", request)
 
-    assert reason =~ "schema"
-    assert reason =~ "member names must be unique"
-    assert {:ok, %{"entries" => []}} = Relay.origin_feed(relay, "origin", 0)
+    assert detail =~ "schema"
+    assert detail =~ "member names must be unique"
+    assert {:ok, [delivery], 1} = Relay.events(relay, "reader", 0)
+    assert delivery["message"]["answer_ui_unavailable"] == detail
+    assert delivery["message"]["answer_ui"]["schema"] == "attention-client.actions/1"
     GenServer.stop(relay)
   end
 
@@ -404,7 +421,7 @@ defmodule AttentionServer.MessageFieldsRelayTest do
     GenServer.stop(relay)
   end
 
-  test "UI/1 request controls and invalid replacements are refused before storage", %{
+  test "UI/1 request without inputs and invalid replacements degrade to the plain reply", %{
     path: path
   } do
     relay = start_relay(path)
@@ -430,9 +447,8 @@ defmodule AttentionServer.MessageFieldsRelayTest do
     }
 
     assert %{
-             "type" => "error",
-             "code" => "request_needs_answer_controls",
-             "reason" => reason
+             "type" => "ok",
+             "field_warnings" => [%{"field" => "answer_ui", "detail" => detail}]
            } =
              request(relay, "origin", %{
                "type" => "forward",
@@ -441,10 +457,10 @@ defmodule AttentionServer.MessageFieldsRelayTest do
                "message" => no_input_message
              })
 
-    assert reason =~ "attention-client.ui/1"
-    assert reason =~ "at least one input"
-    assert {:ok, [], 0} = Relay.events(relay, "reader", 0)
-    assert {:ok, %{"entries" => []}} = Relay.origin_feed(relay, "origin", 0)
+    assert detail =~ "at least one input"
+    assert {:ok, [no_input_delivery], 1} = Relay.events(relay, "reader", 0)
+    assert no_input_delivery["message"]["answer_ui"]["schema"] == "attention-client.actions/1"
+    assert no_input_delivery["message"]["answer_ui_unavailable"] == detail
 
     valid_document = %{
       "schema" => "attention-client.ui/1",
@@ -468,7 +484,7 @@ defmodule AttentionServer.MessageFieldsRelayTest do
       "answer_ui" => valid_document
     }
 
-    assert %{"type" => "ok", "seq" => 1} =
+    assert %{"type" => "ok"} =
              request(relay, "origin", %{
                "type" => "forward",
                "op_id" => op(33),
@@ -480,9 +496,9 @@ defmodule AttentionServer.MessageFieldsRelayTest do
       put_in(valid_message, ["answer_ui", "requires"], ["scene/1"])
 
     assert %{
-             "type" => "error",
-             "code" => "request_answer_ui_invalid",
-             "reason" => reason
+             "type" => "ok",
+             "revision" => 2,
+             "field_warnings" => [%{"field" => "answer_ui", "detail" => detail}]
            } =
              request(relay, "origin", %{
                "type" => "conversation_revise",
@@ -493,12 +509,13 @@ defmodule AttentionServer.MessageFieldsRelayTest do
                "message" => invalid_replacement
              })
 
-    assert reason =~ "requires"
+    assert detail =~ "requires"
 
-    assert {:ok, %{"entries" => [entry]}} = Relay.origin_feed(relay, "origin", 0)
-    assert entry["message"] == valid_message
-    assert {:ok, [delivery], 1} = Relay.events(relay, "reader", 0)
-    assert delivery["message"] == valid_message
+    assert {:ok, %{"entries" => entries}} = Relay.origin_feed(relay, "origin", 0)
+    revised = List.last(entries)["message"]
+    assert revised["title"] == "Valid UI/1"
+    assert revised["answer_ui"]["schema"] == "attention-client.actions/1"
+    assert revised["answer_ui_unavailable"] == detail
 
     GenServer.stop(relay)
   end
@@ -594,7 +611,61 @@ defmodule AttentionServer.MessageFieldsRelayTest do
     GenServer.stop(relay)
   end
 
-  test "a revise adding request type validates controls from the stored UI/1 document", %{
+  test "a plain text answer settles a message that carries a custom answer screen", %{
+    path: path
+  } do
+    relay = start_relay(path)
+    setup_devices(relay)
+
+    screen = %{
+      "schema" => "attention-client.ui/1",
+      "requires" => ["scene/1", "result/1", "response/1"],
+      "illustrations" => [],
+      "inputs" => [
+        %{
+          "kind" => "response",
+          "id" => "pick",
+          "label" => "Pick",
+          "actions" => [%{"id" => "a", "label" => "A", "kind" => "value", "value" => "a"}]
+        }
+      ],
+      "open" => %{"kind" => "input", "id" => "pick", "layout" => "cards"},
+      "resolved" => %{"kind" => "text", "text" => "Done", "style" => "body"},
+      "submission" => %{"label" => "Send", "result" => %{"kind" => "input", "id" => "pick"}}
+    }
+
+    message = %{
+      "sender_id" => "app:test",
+      "message_id" => "screen-plain-answer",
+      "created_at" => 1,
+      "title" => "Pick one",
+      "message_type" => "request",
+      "answer_ui" => screen
+    }
+
+    assert %{"type" => "ok"} =
+             request(relay, "origin", %{
+               "type" => "forward",
+               "op_id" => op(40),
+               "session_handle" => @handle,
+               "message" => message
+             })
+
+    assert %{"type" => "ok", "seq" => _} =
+             request(relay, "reader", %{
+               "type" => "answer",
+               "op_id" => op(41),
+               "sender_id" => "app:test",
+               "message_id" => "screen-plain-answer",
+               "answer" => "None of these; do something else"
+             })
+
+    assert {:ok, [_, terminal], 2} = Relay.events(relay, "origin", 0)
+    assert terminal["answer"] == "None of these; do something else"
+    GenServer.stop(relay)
+  end
+
+  test "a revise adding request type degrades a stored UI/1 document that has no input", %{
     path: path
   } do
     relay = start_relay(path)
@@ -630,9 +701,9 @@ defmodule AttentionServer.MessageFieldsRelayTest do
              })
 
     assert %{
-             "type" => "error",
-             "code" => "request_needs_answer_controls",
-             "reason" => reason
+             "type" => "ok",
+             "revision" => 2,
+             "field_warnings" => [%{"field" => "answer_ui", "detail" => detail}]
            } =
              request(relay, "origin", %{
                "type" => "conversation_revise",
@@ -649,13 +720,14 @@ defmodule AttentionServer.MessageFieldsRelayTest do
                }
              })
 
-    assert reason =~ "attention-client.ui/1"
-    assert reason =~ "at least one input"
+    assert detail =~ "attention-client.ui/1"
+    assert detail =~ "at least one input"
 
-    assert {:ok, %{"entries" => [entry]}} = Relay.origin_feed(relay, "origin", 0)
-    assert entry["message"] == original
-    assert {:ok, [delivery], 1} = Relay.events(relay, "reader", 0)
-    assert delivery["message"] == original
+    assert {:ok, %{"entries" => entries}} = Relay.origin_feed(relay, "origin", 0)
+    revised = List.last(entries)["message"]
+    assert revised["message_type"] == "request"
+    assert revised["answer_ui"]["schema"] == "attention-client.actions/1"
+    assert revised["answer_ui_unavailable"] == detail
 
     GenServer.stop(relay)
   end

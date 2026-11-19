@@ -7,10 +7,13 @@ defmodule AttentionServer.Application do
 
   @impl true
   def start(_type, _args) do
+    # Change-log subscribers (client API v2 feeds) register here per person.
+    registry = {Registry, keys: :duplicate, name: AttentionServer.ChangeLog.Registry}
+
     children =
       case Application.get_env(:attention_server, :server) do
-        nil -> []
-        opts when is_list(opts) -> [{AttentionServer.Server, opts}]
+        nil -> [registry]
+        opts when is_list(opts) -> [registry, {AttentionServer.Server, opts}]
       end
 
     # See https://hexdocs.pm/elixir/Supervisor.html

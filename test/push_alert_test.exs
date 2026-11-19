@@ -391,7 +391,7 @@ defmodule AttentionServer.PushAlertTest do
     assert registered_binding.next_at == registered_binding.registered_at
   end
 
-  test "new requests keep the five-minute window and pending highs coalesce at claim time" do
+  test "the first request is pushed at once and follow-ups within five minutes go out as one push" do
     {:ok, engine} = Engine.setup_person(Engine.new(), @person)
     {:ok, engine} = Engine.setup_device(engine, @person, @device)
     {:ok, engine} = Engine.setup_device(engine, @person, @origin)
@@ -429,68 +429,113 @@ defmodule AttentionServer.PushAlertTest do
 
     binding = fn engine -> engine.push_bindings[{@person, @device}] end
 
+    # The first unsent request is eligible immediately.
     before = System.system_time(:millisecond)
     {engine, 1} = forward.(engine, "one", "01")
     after_first = System.system_time(:millisecond)
 
     opened = binding.(engine)
     assert opened.state == "queued"
-    assert opened.next_at in (before + 300_000)..(after_first + 300_000)
-    assert is_integer(opened.deadline_at)
+    assert opened.next_at in before..after_first
 
-    # A claim before the queued event is not due.
-    assert {:ok, _engine, nil} = Engine.claim_push(engine, opened.next_at - 1)
-
-    # A second request joins the queued high before the dispatcher claims it.
-    {engine, 2} = forward.(engine, "two", "02")
-    assert binding.(engine).next_at == opened.next_at
-    assert binding.(engine).pending_high == 2
-
-    # Re-registering a token does not shorten the open push window.
-    register_again = %{
-      register
-      | "op_id" => "00000000-0000-4000-8000-000000000102",
-        "revision" => 2,
-        "address" => String.duplicate("cd", 32)
-    }
-
-    {engine, {:ok, _reply}} =
-      Engine.request_line(engine, @device, JSON.encode!(register_again) <> "\n")
-
-    assert binding.(engine).next_at == opened.next_at
-
-    assert {:ok, engine, claim} = Engine.claim_push(engine, opened.next_at)
-    assert claim.high == 2
-    assert claim.alert == %{"title" => "2 new requests", "body" => "app:test"}
-    assert claim.badge == 2
+    claimed_at = System.system_time(:millisecond)
+    assert {:ok, engine, first} = Engine.claim_push(engine, claimed_at)
+    assert first.high == 1
+    assert first.alert["body"] == "Request one"
     assert binding.(engine).state == "sending"
     assert binding.(engine).next_at == nil
 
-    # A request arriving in flight queues the next event for the dispatcher.
-    before_third = System.system_time(:millisecond)
-    {engine, 3} = forward.(engine, "three", "03")
-    after_third = System.system_time(:millisecond)
+    # Requests arriving while it is in flight wait for the end of the window
+    # that started with that push and join one push.
+    {engine, 2} = forward.(engine, "two", "02")
+    window_end = claimed_at + 300_000
     in_flight = binding.(engine)
     assert in_flight.state == "sending"
-    assert in_flight.next_at in (before_third + 300_000)..(after_third + 300_000)
+    assert in_flight.next_at == window_end
+
+    {engine, 3} = forward.(engine, "three", "03")
+    assert binding.(engine).next_at == window_end
+    assert binding.(engine).pending_high == 3
 
     accepted = %{state: "provider_accepted", http_status: 200}
-    assert {:ok, engine} = Engine.finish_push(engine, claim, accepted, opened.next_at + 1)
+    assert {:ok, engine} = Engine.finish_push(engine, first, accepted, claimed_at + 1)
     queued = binding.(engine)
     assert queued.state == "queued"
-    assert queued.next_at == in_flight.next_at
-    assert queued.accepted_high == 2
+    assert queued.next_at == window_end
+    assert queued.accepted_high == 1
 
-    assert {:ok, _engine, nil} = Engine.claim_push(engine, queued.next_at - 1)
-    assert {:ok, engine, second} = Engine.claim_push(engine, queued.next_at)
+    assert {:ok, _engine, nil} = Engine.claim_push(engine, window_end - 1)
+    assert {:ok, engine, second} = Engine.claim_push(engine, window_end)
     assert second.high == 3
-    assert second.alert["title"] == "app:test"
-    assert second.alert["body"] == "Request three"
-    assert second.locator["message_id"] == "three"
+    assert second.alert == %{"title" => "2 new requests", "body" => "app:test"}
     assert second.badge == 3
 
-    assert {:ok, engine} = Engine.finish_push(engine, second, accepted, queued.next_at + 1)
+    assert {:ok, engine} = Engine.finish_push(engine, second, accepted, window_end + 1)
     assert binding.(engine).state == "ready"
     assert binding.(engine).next_at == nil
+  end
+
+  describe "push address takeover" do
+    @other_person "00000000-0000-4000-8000-000000000009"
+    @other_device "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb1"
+
+    defp register_frame(op, revision, address) do
+      %{
+        "v" => 1,
+        "type" => "push_register",
+        "op_id" => "00000000-0000-4000-8000-0000000003" <> op,
+        "revision" => revision,
+        "profile_id" => "harklight-sandbox",
+        "address_kind" => "apns_token",
+        "address" => address
+      }
+    end
+
+    test "the newest registration of an address takes it from another device of the same person" do
+      {:ok, engine} = Engine.setup_person(Engine.new(), @person)
+      {:ok, engine} = Engine.setup_device(engine, @person, @device)
+      {:ok, engine} = Engine.setup_device(engine, @person, @origin)
+      address = String.duplicate("ab", 32)
+
+      {engine, {:ok, _}} =
+        Engine.request_line(engine, @device, JSON.encode!(register_frame("01", 1, address)) <> "\n")
+
+      {engine, {:ok, reply}} =
+        Engine.request_line(engine, @origin, JSON.encode!(register_frame("02", 1, address)) <> "\n")
+
+      assert {:ok, %{"revision" => 1}} = JSON.decode_line(reply)
+      refute engine.push_bindings[{@person, @device}].active
+      assert engine.push_bindings[{@person, @device}].address == nil
+      assert engine.push_bindings[{@person, @origin}].active
+      assert engine.push_bindings[{@person, @origin}].address == address
+
+      # The device that lost the address can register again with a newer revision.
+      {engine, {:ok, _}} =
+        Engine.request_line(engine, @device, JSON.encode!(register_frame("03", 2, address)) <> "\n")
+
+      assert engine.push_bindings[{@person, @device}].active
+      refute engine.push_bindings[{@person, @origin}].active
+    end
+
+    test "the newest registration takes an address from a device of another person" do
+      {:ok, engine} = Engine.setup_person(Engine.new(), @person)
+      {:ok, engine} = Engine.setup_person(engine, @other_person)
+      {:ok, engine} = Engine.setup_device(engine, @person, @device)
+      {:ok, engine} = Engine.setup_device(engine, @other_person, @other_device)
+      address = String.duplicate("cd", 32)
+
+      {engine, {:ok, _}} =
+        Engine.request_line(engine, @device, JSON.encode!(register_frame("11", 1, address)) <> "\n")
+
+      {engine, {:ok, _}} =
+        Engine.request_line(
+          engine,
+          @other_device,
+          JSON.encode!(register_frame("12", 1, address)) <> "\n"
+        )
+
+      refute engine.push_bindings[{@person, @device}].active
+      assert engine.push_bindings[{@other_person, @other_device}].active
+    end
   end
 end

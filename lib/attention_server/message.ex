@@ -146,13 +146,13 @@ defmodule AttentionServer.Message do
       not plain_object?(answer_ui) ->
         request_unsupported_schema(answer_ui)
 
-      Map.get(answer_ui, "schema") == @ui_schema ->
-        # UI/1's grammar and file references are checked by the single send-time
-        # admission path after duplicate receipt handling.
-        :ok
-
       Map.get(answer_ui, "schema") != @actions_schema ->
-        request_unsupported_schema(answer_ui)
+        # A custom screen (UI/1, or a version this Server does not know) never
+        # refuses the message. UI/1 is checked by the single send-time
+        # admission path after duplicate receipt handling (admit_answer_ui/2);
+        # an unknown version is delivered for the client to show or to offer
+        # the plain reply instead.
+        :ok
 
       Map.get(answer_ui, "actions") == [] ->
         request_needs_controls()
@@ -182,31 +182,84 @@ defmodule AttentionServer.Message do
 
   def validate_ui1_controls(_), do: :ok
 
-  @doc false
-  def validate_ui1_admission(message, delivered_file_names)
+  @reply_descriptor %{
+    "schema" => @actions_schema,
+    "actions" => [%{"id" => "reply", "label" => "Reply", "kind" => "text"}]
+  }
+
+  @doc """
+  Admits a message's custom answer screen at send time. A screen that cannot
+  be shown (over a limit, malformed, bad file reference, or a request
+  screen with no input) never refuses the message: the screen is
+  replaced by the plain Reply that a message with no screen gets, and the
+  delivered message carries `answer_ui_unavailable` with the reason so
+  clients can say the custom screen is not shown. Returns the message and any
+  field warnings for the sender.
+  """
+  def admit_answer_ui(message, delivered_file_names, limits \\ AttentionServer.UI1.limits())
+
+  def admit_answer_ui(message, delivered_file_names, limits)
       when is_map(message) and not is_struct(message) and is_list(delivered_file_names) do
-    case get_in(message, ["answer_ui", "schema"]) do
-      @ui_schema ->
-        answer_ui = Map.get(message, "answer_ui")
-
-        case AttentionServer.UI1.validate(answer_ui, delivered_file_names) do
-          :ok ->
-            validate_ui1_controls(message)
-
-          {:error, path, reason} ->
-            {:error,
-             typed_error(
-               "request_answer_ui_invalid",
-               "answer_ui (#{@ui_schema}) at #{path}: #{reason}"
-             )}
+    case Map.get(message, "answer_ui") do
+      %{"schema" => @ui_schema} = answer_ui ->
+        case ui1_problem(message, answer_ui, delivered_file_names, limits) do
+          nil -> {Map.delete(message, "answer_ui_unavailable"), []}
+          detail -> degrade_answer_ui(message, detail)
         end
 
       _ ->
-        :ok
+        # The actions descriptor is validated with the message type; a version
+        # this Server does not know is passed through for the client to show or
+        # offer the plain reply.
+        {message, []}
     end
   end
 
-  def validate_ui1_admission(_message, _delivered_file_names), do: :ok
+  def admit_answer_ui(message, _delivered_file_names, _limits), do: {message, []}
+
+  @duplicate_keys :__attention_server_duplicate_keys__
+
+  @doc """
+  Removes the decoder's duplicate-member markers from a frame's message. A
+  document with duplicate members cannot be shown, so its screen is replaced
+  (admit_answer_ui/3); the marker must not reach the stored receipt.
+  """
+  def without_duplicate_markers(%{} = map) when not is_struct(map) do
+    map
+    |> Map.delete(@duplicate_keys)
+    |> Map.new(fn {key, value} -> {key, without_duplicate_markers(value)} end)
+  end
+
+  def without_duplicate_markers(list) when is_list(list),
+    do: Enum.map(list, &without_duplicate_markers/1)
+
+  def without_duplicate_markers(other), do: other
+
+  defp ui1_problem(message, answer_ui, delivered_file_names, limits) do
+    case AttentionServer.UI1.validate(answer_ui, delivered_file_names, limits) do
+      :ok ->
+        case validate_ui1_controls(message) do
+          :ok ->
+            nil
+
+          {:error, {:typed_message, _code, _reason}} ->
+            "answer_ui (#{@ui_schema}): a request needs at least one input"
+        end
+
+      {:error, path, reason} ->
+        "answer_ui (#{@ui_schema}) at #{path}: #{reason}"
+    end
+  end
+
+  defp degrade_answer_ui(message, detail) do
+    degraded =
+      if Map.get(message, "message_type") == "request",
+        do: Map.put(message, "answer_ui", @reply_descriptor),
+        else: Map.delete(message, "answer_ui")
+
+    {Map.put(degraded, "answer_ui_unavailable", detail),
+     [%{"field" => "answer_ui", "reason" => "unavailable", "detail" => detail}]}
+  end
 
   defp request_unsupported_schema(answer_ui) do
     schema =

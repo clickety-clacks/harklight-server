@@ -38,7 +38,8 @@ defmodule AttentionServer.Store do
     :large_persisted,
     :large_index,
     progress_version: 0,
-    encoding_cache: %{}
+    encoding_cache: %{},
+    change_log: false
   ]
 
   @progress_fields [:cursors, :conversation_cursors, :conversation_opened]
@@ -136,6 +137,20 @@ defmodule AttentionServer.Store do
   """
 
   def open(nil), do: {:ok, %__MODULE__{db: nil, engine: Engine.new(), version: 0}}
+
+  @doc """
+  Turns on the client API v2 change log for this durable store: creates its
+  tables, reconciles it with the snapshot, and from then on writes its rows in
+  every commit's transaction. A store that is never enabled is unchanged.
+  """
+  def enable_change_log(%__MODULE__{db: nil}), do: {:error, :not_durable}
+
+  def enable_change_log(%__MODULE__{db: db, version: version} = store) do
+    case AttentionServer.ChangeLog.enable(db, version) do
+      :ok -> {:ok, %{store | change_log: true}}
+      _ -> {:error, :storage_unavailable}
+    end
+  end
 
   def open(":memory:") do
     Diagnostics.failure(:server_storage, :store_open, :invalid_store_path, :unavailable)
@@ -1082,6 +1097,20 @@ defmodule AttentionServer.Store do
         large_index: nil
     }
 
+    # The change log's rows are found here, against the engine this process
+    # already holds, and written in the snapshot's transaction.
+    log =
+      if store.change_log do
+        pending = AttentionServer.ChangeLog.changes(store.engine, next)
+
+        seeded =
+          Map.new(pending, fn {person, _} ->
+            {person, AttentionServer.ChangeLog.seeded?(store.engine, person)}
+          end)
+
+        {pending, seeded}
+      end
+
     result =
       with {:ok, durable_next, persisted, index} <- prepare_large_data(store, next) do
         old_ids =
@@ -1093,15 +1122,17 @@ defmodule AttentionServer.Store do
         rows = LargeData.reference_index_rows(index)
 
         case Persistence.run(fn ->
-               persist_snapshot(generation, persisted, rows, audit, old_ids, next_ids)
+               persist_snapshot(generation, persisted, rows, audit, old_ids, next_ids, log)
              end) do
-          {:ok, cache} -> {:ok, cache, durable_next, persisted, index}
+          {:ok, cache, heads} -> {:ok, cache, heads, durable_next, persisted, index}
           error -> error
         end
       end
 
     case result do
-      {:ok, cache, durable_next, persisted, index} ->
+      {:ok, cache, heads, durable_next, persisted, index} ->
+        AttentionServer.ChangeLog.notify(heads)
+
         {:ok,
          %{
            store
@@ -1159,7 +1190,8 @@ defmodule AttentionServer.Store do
          reference_rows,
          audit,
          old_ids,
-         next_ids
+         next_ids,
+         log
        ) do
     with {payload, cache} <-
            SnapshotEncoding.encode(persisted, @format_version, store.encoding_cache),
@@ -1181,6 +1213,7 @@ defmodule AttentionServer.Store do
              "INSERT INTO relay_audit (person_id, actor_id, action, at_ms) VALUES (?, ?, ?, ?)",
              [audit.person, audit.actor, audit.action, System.system_time(:millisecond)]
            ),
+         {:ok, heads} <- append_change_log(db, log, version + 1),
          :ok <- Sqlite3.execute(db, "COMMIT") do
       if is_binary(upload_dir) do
         case LargeData.delete_unreferenced(upload_dir, old_ids, next_ids) do
@@ -1198,9 +1231,14 @@ defmodule AttentionServer.Store do
         end
       end
 
-      {:ok, cache}
+      {:ok, cache, heads}
     end
   end
+
+  defp append_change_log(_db, nil, _version), do: {:ok, %{}}
+
+  defp append_change_log(db, {pending, seeded}, version),
+    do: AttentionServer.ChangeLog.append(db, pending, seeded, version)
 
   # ACKs must be durable before their replies, but do not change retained history.
   # The overlay is tied to the snapshot generation. Older releases ignore it;
@@ -2751,9 +2789,7 @@ defmodule AttentionServer.Store do
                 not is_nil(item.person))) and
           is_binary(item.label) and byte_size(item.label) >= 1 and
           is_binary(item.secret_hash) and byte_size(item.secret_hash) == 32 and
-          is_integer(item.expires_at) and item.expires_at > 0 and
-          is_integer(item.status_expires_at) and
-          item.status_expires_at == item.expires_at + 86_400_000 and
+          valid_pending_deadlines?(item.expires_at, item.status_expires_at) and
           is_integer(item.request_generation) and item.request_generation > 0 and
           Map.get(item, :joined, false) in [true, false] and
           case item do
@@ -2776,6 +2812,15 @@ defmodule AttentionServer.Store do
         map_size(pending)
   end
 
+  # Current requests carry no deadlines; requests stored earlier keep theirs,
+  # which are no longer enforced.
+  defp valid_pending_deadlines?(nil, nil), do: true
+
+  defp valid_pending_deadlines?(expires_at, status_expires_at),
+    do:
+      is_integer(expires_at) and expires_at > 0 and
+        status_expires_at == expires_at + 86_400_000
+
   defp valid_pending_history?(engine) do
     history = engine.pending_history
 
@@ -2795,8 +2840,7 @@ defmodule AttentionServer.Store do
               status_expires_at: status_expires_at
             } = exact ->
               map_size(exact) == 5 and is_binary(hash) and byte_size(hash) == 32 and
-                hex_key?(key) and is_integer(expires_at) and expires_at > 0 and
-                status_expires_at == expires_at + 86_400_000
+                hex_key?(key) and valid_pending_deadlines?(expires_at, status_expires_at)
 
             %{
               state: :cancelled,
@@ -2811,8 +2855,7 @@ defmodule AttentionServer.Store do
                 is_binary(hash) and byte_size(hash) == 32 and
                 (is_nil(person) or Map.has_key?(engine.persons, person)) and hex_key?(key) and
                 is_binary(label) and byte_size(label) >= 1 and
-                is_integer(expires_at) and expires_at > 0 and
-                status_expires_at == expires_at + 86_400_000
+                valid_pending_deadlines?(expires_at, status_expires_at)
 
             %{
               state: :declined,
@@ -2828,8 +2871,7 @@ defmodule AttentionServer.Store do
                 is_binary(hash) and byte_size(hash) == 32 and
                 Map.has_key?(engine.persons, person) and hex_key?(key) and hex_key?(owner) and
                 is_binary(label) and byte_size(label) >= 1 and
-                is_integer(expires_at) and expires_at > 0 and
-                status_expires_at == expires_at + 86_400_000
+                valid_pending_deadlines?(expires_at, status_expires_at)
 
             %{
               state: :approved,
@@ -2848,8 +2890,7 @@ defmodule AttentionServer.Store do
                 is_binary(hash) and byte_size(hash) == 32 and
                 Map.has_key?(engine.persons, person) and hex_key?(key) and
                 is_binary(label) and byte_size(label) >= 1 and
-                is_integer(expires_at) and expires_at > 0 and
-                status_expires_at == expires_at + 86_400_000 and
+                valid_pending_deadlines?(expires_at, status_expires_at) and
                 (is_nil(approved_by) or hex_key?(approved_by)) and
                 get_in(engine.devices, [key, :person]) == person
 

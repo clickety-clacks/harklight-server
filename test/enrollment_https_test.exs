@@ -1,7 +1,7 @@
 defmodule AttentionServer.EnrollmentHTTPSTest do
   use ExUnit.Case, async: false
 
-  alias AttentionServer.{DeviceIdentity, EnrollmentHTTPS, JSON, Relay, Store, TLSFixtures}
+  alias AttentionServer.{DeviceIdentity, EnrollmentHTTPS, JSON, Relay, TLSFixtures}
 
   setup_all do
     certs = TLSFixtures.create!()
@@ -56,17 +56,29 @@ defmodule AttentionServer.EnrollmentHTTPSTest do
 
     assert Regex.match?(~r/\A[A-Z2-7]{10}\z/, code)
     assert byte_size(secret) == 64
-    assert deadline > System.system_time(:millisecond)
-    assert status_deadline == deadline + 86_400_000
+    assert deadline == nil
+    assert status_deadline == nil
 
     assert {200, %{"state" => "pending"}} =
              post(listener, certs, "/enroll/status", %{"status_secret" => secret})
 
-    assert {409, %{"error" => "key_pending"}} =
+    # Starting again with the same key returns the same request and code; only
+    # the status secret is replaced.
+    assert {200, %{"approval_code" => ^code, "status_secret" => new_secret}} =
              post(listener, certs, "/enroll", %{
                "public_certificate" => pem,
                "label" => "laptop"
              })
+
+    assert new_secret != secret
+
+    assert {404, %{"error" => "not_found"}} =
+             post(listener, certs, "/enroll/status", %{"status_secret" => secret})
+
+    secret = new_secret
+
+    assert {200, %{"state" => "pending"}} =
+             post(listener, certs, "/enroll/status", %{"status_secret" => secret})
 
     assert {404, %{"error" => "not_found"}} =
              post(listener, certs, "/enroll/status", %{})
@@ -107,70 +119,6 @@ defmodule AttentionServer.EnrollmentHTTPSTest do
     assert :sys.get_state(restarted).store.engine.devices[device].revoked
   end
 
-  test "public status only commits a durable fence when a deadline first crosses", %{
-    certs: certs,
-    listener: listener,
-    relay: relay
-  } do
-    initial_version = :sys.get_state(relay).store.version
-
-    assert {404, %{"error" => "not_found"}} =
-             post(listener, certs, "/enroll/status", %{
-               "status_secret" => String.duplicate("0", 64)
-             })
-
-    assert :sys.get_state(relay).store.version == initial_version
-
-    pem = File.read!(Path.join(certs, "a2.pem"))
-
-    assert {200, %{"approval_code" => code, "status_secret" => secret}} =
-             post(listener, certs, "/enroll", %{
-               "public_certificate" => pem,
-               "label" => "deadline fence"
-             })
-
-    version = :sys.get_state(relay).store.version
-
-    assert {200, %{"state" => "pending"}} =
-             post(listener, certs, "/enroll/status", %{"status_secret" => secret})
-
-    assert :sys.get_state(relay).store.version == version
-
-    state = :sys.get_state(relay)
-    item = state.store.engine.pending_enrollments[code]
-    expired_at = System.system_time(:millisecond) - 1
-
-    engine = %{
-      state.store.engine
-      | pending_enrollments:
-          Map.put(state.store.engine.pending_enrollments, code, %{
-            item
-            | expires_at: expired_at,
-              status_expires_at: expired_at + 86_400_000
-          })
-    }
-
-    assert {:ok, stored} =
-             Store.commit(state.store, engine, %{
-               person: "unassigned",
-               actor: "test_fixture",
-               action: "cross_pending_deadline"
-             })
-
-    :sys.replace_state(relay, fn current -> %{current | store: stored} end)
-    version = stored.version
-
-    assert {200, %{"state" => "expired"}} =
-             post(listener, certs, "/enroll/status", %{"status_secret" => secret})
-
-    assert :sys.get_state(relay).store.version == version + 1
-
-    assert {200, %{"state" => "expired"}} =
-             post(listener, certs, "/enroll/status", %{"status_secret" => secret})
-
-    assert :sys.get_state(relay).store.version == version + 1
-  end
-
   test "HTTP surface rejects wrong path, extra authority fields, and invalid certificates", %{
     certs: certs,
     listener: listener,
@@ -196,64 +144,7 @@ defmodule AttentionServer.EnrollmentHTTPSTest do
     assert :sys.get_state(relay).store.engine.pending_enrollments == %{}
   end
 
-  test "real TLS enrollment remains available above the former retained-record cap", %{
-    certs: certs,
-    listener: listener,
-    relay: relay
-  } do
-    now_ms = System.system_time(:millisecond)
-    {:ok, key} = DeviceIdentity.from_certificate(TLSFixtures.certificate_der!(certs, "a2"))
-
-    history =
-      Map.new(0..1_023, fn index ->
-        secret = <<index::256>>
-
-        {Base.encode32(<<index::40>>, padding: false) <> "AA",
-         %{
-           state: :expired,
-           secret_hash: :crypto.hash(:sha256, secret),
-           key: key,
-           expires_at: now_ms - 1,
-           status_expires_at: now_ms - 1 + 86_400_000
-         }}
-      end)
-
-    state = :sys.get_state(relay)
-
-    assert {:ok, stored} =
-             Store.commit(state.store, %{state.store.engine | pending_history: history}, %{
-               person: "unassigned",
-               actor: "test_fixture",
-               action: "fill_pending"
-             })
-
-    :sys.replace_state(relay, fn current -> %{current | store: stored} end)
-    pem = File.read!(Path.join(certs, "b1.pem"))
-
-    assert {200,
-            %{
-              "approval_code" => approval_code,
-              "status_secret" => status_secret,
-              "expires_at" => expires_at,
-              "status_expires_at" => status_expires_at
-            }} =
-             post(listener, certs, "/enroll", %{"public_certificate" => pem, "label" => "new"})
-
-    assert is_binary(approval_code)
-    assert is_binary(status_secret)
-    assert status_expires_at == expires_at + 86_400_000
-
-    assert {200, %{"state" => "expired"}} =
-             post(listener, certs, "/enroll/status", %{
-               "status_secret" => <<0::256>> |> Base.encode16(case: :lower)
-             })
-
-    committed_engine = :sys.get_state(relay).store.engine
-    assert map_size(committed_engine.pending_history) == 1_024
-    assert map_size(committed_engine.pending_enrollments) == 1
-  end
-
-  test "dropped first TLS reply leaves an opaque same-key retry without secret recovery", %{
+  test "dropped first TLS reply is recovered by starting again with the same key", %{
     certs: certs,
     listener: listener,
     relay: relay
@@ -266,11 +157,15 @@ defmodule AttentionServer.EnrollmentHTTPSTest do
     [{code, pending}] = Map.to_list(:sys.get_state(relay).store.engine.pending_enrollments)
     assert pending.label == "lost first reply"
 
-    assert {409, %{"error" => "key_pending"}} =
+    assert {200, %{"approval_code" => ^code, "status_secret" => secret}} =
              post(listener, certs, "/enroll", request)
 
     [{^code, same}] = Map.to_list(:sys.get_state(relay).store.engine.pending_enrollments)
-    assert same == pending
+    assert same.key == pending.key
+    assert same.secret_hash == :crypto.hash(:sha256, Base.decode16!(secret, case: :lower))
+
+    assert {200, %{"state" => "pending"}} =
+             post(listener, certs, "/enroll/status", %{"status_secret" => secret})
 
     assert {404, %{"error" => "not_found"}} =
              post(listener, certs, "/enroll/status", %{

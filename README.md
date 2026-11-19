@@ -76,9 +76,11 @@ readable. This restore loses every write made since the backup and cannot undo
 external notifications, bounces or agent deliveries. Do not assume recovery
 success or a recovery time.
 
-After a Reply or No comment, new chat on that request is closed and earlier
-messages remain readable. Agents without the matching Agent C1 behavior receive
-the existing generic closed refusal.
+The first answer settles a request, and a second answer is refused. Chat on the
+request stays open after any outcome (answered, No comment, cleared, expired,
+withdrawn or superseded): the person can keep writing and the agent can keep
+replying, more than once to the same chat message. A chat message to an agent
+that is not listening is accepted and delivered when the agent next listens.
 
 v0.1.32 adds a side-effect-free origin-message read by sender ID and message ID.
 The matching `harklight-agent message-get` interface shipped in Agent 0.1.9.
@@ -203,9 +205,9 @@ protocol. See [SELF_HOST.md](SELF_HOST.md) for the compatibility evidence limits
 
 The optional HTTPS owner dashboard creates person-bound one-use invitations,
 reviews the current code/key/deadline and approves devices without sender rights.
-The app keeps its own private key. Default pending approval lasts 24 hours;
-ordinary expiry can renew the same retained device request without a new scan or
-key, while denial, cancellation and revocation remain terminal. See
+The app keeps its own private key. A pending approval does not expire, and
+starting again with the same key returns the same waiting request and code;
+denial, cancellation and revocation remain terminal. See
 [GUIDED_JOIN.md](GUIDED_JOIN.md) for the server interface.
 
 APNs is opt-in and requires protected signing-key configuration for the

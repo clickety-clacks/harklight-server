@@ -117,10 +117,9 @@ defmodule AttentionServer.CLI.Agent do
     message = required!(opts, :message)
     acceptance = required!(opts, :acceptance)
     op = required!(opts, :op)
-    intent = required!(opts, :intent_ref)
     answer_file = required!(opts, :answer_file)
 
-    unless Message.sender_id?(sender) and Message.uuid_v4?(op) and is_integer(acceptance) and
+    unless Message.sender_id?(sender) and Message.uuid?(op) and is_integer(acceptance) and
              acceptance > 0,
            do: AttentionServer.CLI.error!("invalid exact answer target or operation ID")
 
@@ -138,7 +137,7 @@ defmodule AttentionServer.CLI.Agent do
       end
 
     AttentionServer.CLI.shell().info(
-      "Answer target #{visible(sender)} / #{visible(message)}, acceptance #{acceptance}, revision #{revision || 1}, operation #{op}, intent #{visible(intent)}"
+      "Answer target #{visible(sender)} / #{visible(message)}, acceptance #{acceptance}, revision #{revision || 1}, operation #{op}"
     )
 
     if String.trim(
@@ -154,8 +153,6 @@ defmodule AttentionServer.CLI.Agent do
       "message_id" => message,
       "acceptance_seq" => acceptance,
       "op_id" => op,
-      "intent_ref" => intent,
-      "deliberate" => true,
       "answer" => answer
     }
     |> optional(opts, :request_revision, "request_revision")

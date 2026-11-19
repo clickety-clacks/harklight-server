@@ -297,13 +297,6 @@ defmodule AttentionServer.Engine do
       old && revision <= old.revision ->
         failure("stale_push_binding")
 
-      Enum.any?(engine.push_bindings, fn
-        {{^person, ^device}, _binding} -> false
-        {_key, %{active: true, address: ^address}} -> true
-        _ -> false
-      end) ->
-        failure("push_address_in_use")
-
       true ->
         now_ms = System.system_time(:millisecond)
         high = Map.fetch!(engine.persons, person)
@@ -339,7 +332,11 @@ defmodule AttentionServer.Engine do
           # The current store validator requires an integer while work is pending.
           # Keep the event timestamp in this legacy field; it is no longer a deadline.
           deadline_at: if(pending?, do: now_ms, else: nil),
-          next_at: if(pending?, do: open_window_at || now_ms + @push_window_ms, else: nil),
+          next_at:
+            if(pending?,
+              do: open_window_at || push_open_at(%{last_attempt_at: last_attempt_at}, now_ms),
+              else: nil
+            ),
           attempt_count: 0,
           last_attempt_at: last_attempt_at,
           last_outcome: nil,
@@ -376,11 +373,26 @@ defmodule AttentionServer.Engine do
 
         next =
           engine
-          |> Map.put(:push_bindings, Map.put(engine.push_bindings, key, binding))
+          |> Map.put(
+            :push_bindings,
+            engine.push_bindings |> release_push_address(key, address) |> Map.put(key, binding)
+          )
           |> save_receipt(person, device, frame["op_id"], semantic, reply)
 
         {:ok, next, reply}
     end
+  end
+
+  # The newest registration of an address owns it: any other device's active
+  # binding for the same address is canceled and keeps its own revision.
+  defp release_push_address(bindings, key, address) do
+    Map.new(bindings, fn
+      {other, %{active: true, address: ^address} = old} when other != key ->
+        {other, canceled_push_binding(old.revision)}
+
+      entry ->
+        entry
+    end)
   end
 
   defp push_remove(engine, %{person: person, key: device}, frame) do
@@ -1119,6 +1131,10 @@ defmodule AttentionServer.Engine do
   def agent_get(engine, key, request), do: AgentAccess.get(engine, key, request)
 
   def agent_answer(engine, key, frame) do
+    # `deliberate` and `intent_ref` are no longer required; senders that still
+    # include them are accepted and the values are ignored.
+    frame = Map.drop(frame, ~w(deliberate intent_ref))
+
     case Map.get(engine.agents, key) do
       %{person: person, id: id, revoked: false} = agent ->
         sender = frame["sender_id"]
@@ -1129,13 +1145,12 @@ defmodule AttentionServer.Engine do
             failure("forbidden")
 
           Enum.sort(Map.keys(Map.delete(frame, "request_revision"))) !=
-            ~w(acceptance_seq answer deliberate intent_ref message_id op_id sender_id type v) or
+            ~w(acceptance_seq answer message_id op_id sender_id type v) or
               frame["v"] != 1 ->
             failure("invalid_field", "request")
 
-          frame["type"] != "answer" or frame["deliberate"] != true or
-              not bounded_text?(frame["intent_ref"]) ->
-            failure("invalid_field", "intent_ref")
+          frame["type"] != "answer" ->
+            failure("invalid_field", "type")
 
           Map.has_key?(frame, "request_revision") and
               not (is_integer(frame["request_revision"]) and frame["request_revision"] > 0) ->
@@ -1160,84 +1175,77 @@ defmodule AttentionServer.Engine do
     end
   end
 
-  @pending_lifetime_ms 24 * 60 * 60 * 1_000
-  @status_lifetime_ms 24 * 60 * 60 * 1_000
-
-  @doc "Create a content-free pending request; only the secret hash is persisted."
-  def pending_enroll(
-        %__MODULE__{pending_clock_high_water: floor},
-        _cert,
-        _label,
-        _code,
-        _hash,
-        now_ms
-      )
-      when is_integer(now_ms) and now_ms < floor,
-      do: {:error, :clock_unavailable}
-
-  def pending_enroll(%__MODULE__{} = engine, cert_der, label, code, secret_hash, now_ms)
-      when is_integer(now_ms) and now_ms >= 0 do
+  @doc "Create a content-free pending request; only the secret hash is persisted. A waiting request does not expire."
+  def pending_enroll(%__MODULE__{} = engine, cert_der, label, code, secret_hash) do
     with {:ok, key} <- DeviceIdentity.from_certificate(cert_der) do
-      compacted = compact_pending(engine, now_ms)
-
       cond do
         not bounded_text?(label) or not valid_code?(code) or
-          not (is_binary(secret_hash) and byte_size(secret_hash) == 32) or
-            not (is_integer(now_ms) and now_ms >= 0) ->
+            not (is_binary(secret_hash) and byte_size(secret_hash) == 32) ->
           {:error, :invalid_request}
 
-        principal_key_used?(compacted, key) ->
+        principal_key_used?(engine, key) ->
           {:error, :key_in_use}
 
-        Enum.any?(compacted.pending_enrollments, fn {_code, item} ->
+        Enum.any?(engine.pending_enrollments, fn {_code, item} ->
           item.key == key and item.state == :pending
         end) ->
           {:error, :key_pending}
 
-        Map.has_key?(compacted.pending_enrollments, code) or
-          Map.has_key?(compacted.pending_history, code) or
-          Enum.any?(compacted.pending_enrollments, fn {_code, item} ->
-            item.secret_hash == secret_hash
-          end) or
-            Enum.any?(compacted.pending_history, fn {_code, item} ->
-              item.secret_hash == secret_hash
-            end) ->
+        Map.has_key?(engine.pending_enrollments, code) or
+          Map.has_key?(engine.pending_history, code) or pending_secret_used?(engine, secret_hash) ->
           {:error, :collision}
 
         true ->
-          expires_at = now_ms + @pending_lifetime_ms
-
           item = %{
             key: key,
             certificate: cert_der,
             label: label,
             secret_hash: secret_hash,
-            expires_at: expires_at,
-            status_expires_at: expires_at + @status_lifetime_ms,
+            expires_at: nil,
+            status_expires_at: nil,
             state: :pending,
             person: nil,
             request_generation: 1
           }
 
-          {:ok,
-           %{
-             compacted
-             | pending_enrollments: Map.put(compacted.pending_enrollments, code, item),
-               pending_clock_high_water: now_ms
-           }}
+          {:ok, %{engine | pending_enrollments: Map.put(engine.pending_enrollments, code, item)}}
       end
+    else
+      _ -> {:error, :invalid_request}
     end
   end
 
-  def pending_enroll(_, _, _, _, _, _), do: {:error, :invalid_request}
+  @doc """
+  Start again for a key that already has a waiting plain request: the same
+  request and approval code are kept, the label is refreshed and the status
+  secret is replaced with the new one so the caller can read the request.
+  Returns `:none` when the key has no waiting plain request.
+  """
+  def pending_restart(%__MODULE__{} = engine, cert_der, label, secret_hash) do
+    with {:ok, key} <- DeviceIdentity.from_certificate(cert_der),
+         true <- bounded_text?(label),
+         true <- is_binary(secret_hash) and byte_size(secret_hash) == 32,
+         false <- pending_secret_used?(engine, secret_hash),
+         {code, item} <-
+           Enum.find(engine.pending_enrollments, fn {_code, item} ->
+             item.key == key and item.state == :pending and is_nil(item.person)
+           end) do
+      renewed = %{item | secret_hash: secret_hash, label: label}
 
-  def pending_status(%__MODULE__{} = engine, secret_hash, now_ms) do
-    now_ms = max(now_ms, engine.pending_clock_high_water)
+      {:ok, %{engine | pending_enrollments: Map.put(engine.pending_enrollments, code, renewed)},
+       code}
+    else
+      _ -> :none
+    end
+  end
 
+  defp pending_secret_used?(engine, secret_hash) do
+    Enum.any?(engine.pending_enrollments, fn {_code, item} -> item.secret_hash == secret_hash end) or
+      Enum.any?(engine.pending_history, fn {_code, item} -> item.secret_hash == secret_hash end)
+  end
+
+  def pending_status(%__MODULE__{} = engine, secret_hash) do
     case find_pending_secret(engine, secret_hash) do
-      {_, %{status_expires_at: deadline}} when now_ms >= deadline ->
-        {:error, :not_found}
-
       {code, %{state: :approved, person: person, key: key} = item} ->
         if get_in(engine.devices, [key, :revoked]) == false do
           if Map.get(item, :joined, false) do
@@ -1260,13 +1268,6 @@ defmodule AttentionServer.Engine do
 
       {_, %{state: state}} when state in [:declined, :cancelled] ->
         {:ok, %{"state" => Atom.to_string(state)}}
-
-      {code, %{state: :pending, expires_at: deadline, person: person} = item}
-      when now_ms >= deadline and not is_nil(person) ->
-        {:ok, pending_response(Map.put(item, :code, code), "expired")}
-
-      {_, %{state: :pending, expires_at: deadline}} when now_ms >= deadline ->
-        {:ok, %{"state" => "expired"}}
 
       {code, %{state: :pending} = item} ->
         if is_nil(item.person),
@@ -1291,104 +1292,58 @@ defmodule AttentionServer.Engine do
     if item.person, do: Map.put(base, "person_id", item.person), else: base
   end
 
-  @doc "Resume one original secret-bound waiting request; only its approval epoch changes."
-  def pending_resume(engine, secret_hash, cert_der, fresh_code, now_ms) do
-    cond do
-      not is_integer(now_ms) or now_ms < engine.pending_clock_high_water ->
-        {:error, :clock_unavailable}
+  @doc "Read one original secret-bound guided request again with the same certificate."
+  def pending_resume(engine, secret_hash, cert_der) do
+    with {:ok, key} <- DeviceIdentity.from_certificate(cert_der),
+         {code, item} <- find_pending_secret(engine, secret_hash),
+         true <- item.key == key do
+      cond do
+        Map.get(item, :joined, false) != true or is_nil(item.person) ->
+          {:error, :not_found}
 
-      true ->
-        with {:ok, key} <- DeviceIdentity.from_certificate(cert_der),
-             {old_code, item} <- find_pending_secret(engine, secret_hash),
-             true <- item.key == key do
-          cond do
-            Map.get(item, :joined, false) != true or is_nil(item.person) ->
+        item.state == :expired ->
+          {:error, :not_found}
+
+        item.state != :pending ->
+          case item.state do
+            :approved ->
+              if get_in(engine.devices, [key, :revoked]) == false,
+                do: {:ok, engine, pending_response(Map.put(item, :code, code), "approved")},
+                else: {:ok, engine, %{"state" => "revoked"}}
+
+            state when state in [:cancelled, :declined] ->
+              {:ok, engine, %{"state" => Atom.to_string(state)}}
+
+            _ ->
               {:error, :not_found}
-
-            item.state == :expired ->
-              {:error, :not_found}
-
-            item.state != :pending ->
-              case item.state do
-                :approved ->
-                  if get_in(engine.devices, [key, :revoked]) == false,
-                    do:
-                      {:ok, engine, pending_response(Map.put(item, :code, old_code), "approved")},
-                    else: {:ok, engine, %{"state" => "revoked"}}
-
-                state when state in [:cancelled, :declined] ->
-                  {:ok, engine, %{"state" => Atom.to_string(state)}}
-
-                _ ->
-                  {:error, :not_found}
-              end
-
-            is_nil(item.person) or not Map.has_key?(engine.persons, item.person) ->
-              {:error, :not_found}
-
-            principal_key_used?(engine, key) ->
-              {:error, :conflict}
-
-            now_ms < item.expires_at ->
-              {:ok, engine, pending_response(Map.put(item, :code, old_code), "pending")}
-
-            not valid_code?(fresh_code) or Map.has_key?(engine.pending_enrollments, fresh_code) or
-                Map.has_key?(engine.pending_history, fresh_code) ->
-              {:error, :collision}
-
-            true ->
-              renewed =
-                item
-                |> Map.put(:certificate, cert_der)
-                |> Map.put(:legacy_recovery, false)
-                |> Map.put(:expires_at, now_ms + @pending_lifetime_ms)
-                |> Map.put(
-                  :status_expires_at,
-                  now_ms + @pending_lifetime_ms + @status_lifetime_ms
-                )
-                |> Map.put(:request_generation, item.request_generation + 1)
-
-              invitations =
-                Map.new(engine.join_invitations, fn {hash, invite} ->
-                  if invite.code == old_code and invite.key == key and
-                       invite.secret_hash == secret_hash and invite.person == item.person,
-                     do: {hash, %{invite | code: fresh_code}},
-                     else: {hash, invite}
-                end)
-
-              next = %{
-                engine
-                | pending_enrollments:
-                    engine.pending_enrollments
-                    |> Map.delete(old_code)
-                    |> Map.put(fresh_code, renewed),
-                  join_invitations: invitations,
-                  pending_clock_high_water: now_ms
-              }
-
-              {:ok, next, pending_response(Map.put(renewed, :code, fresh_code), "pending")}
           end
-        else
-          _ -> {:error, :not_found}
-        end
+
+        not Map.has_key?(engine.persons, item.person) ->
+          {:error, :not_found}
+
+        principal_key_used?(engine, key) ->
+          {:error, :conflict}
+
+        true ->
+          {:ok, engine, pending_response(Map.put(item, :code, code), "pending")}
+      end
+    else
+      _ -> {:error, :not_found}
     end
   end
 
-  def pending_lookup(%__MODULE__{} = engine, person, owner_key, code, now_ms) do
-    now_ms = max(now_ms, engine.pending_clock_high_water)
-
+  def pending_lookup(%__MODULE__{} = engine, person, owner_key, code) do
     with {:ok, _revision} <- owner_revision(engine, person, owner_key),
          item when not is_nil(item) <-
            Map.get(engine.pending_enrollments, code) || Map.get(engine.pending_history, code),
-         true <- is_nil(Map.get(item, :person)) or item.person == person,
-         true <- now_ms < item.status_expires_at do
+         true <- is_nil(Map.get(item, :person)) or item.person == person do
       case item do
-        %{state: :pending, expires_at: deadline} when now_ms < deadline ->
+        %{state: :pending} ->
           {:ok,
            %{
              label: item.label,
              key: item.key,
-             expires_at: deadline
+             expires_at: item.expires_at
            }}
 
         %{state: :approved, person: ^person, approved_by: ^owner_key} ->
@@ -1412,11 +1367,11 @@ defmodule AttentionServer.Engine do
         senders,
         now_ms
       ) do
-    now_ms = max(now_ms, engine.pending_clock_high_water)
-
     with {:ok, _revision} <- owner_revision(engine, person, owner_key),
          {:ok, :expected} <-
-           if(hex_key?(expected_key) and is_integer(expected_expires_at),
+           if(
+             hex_key?(expected_key) and
+               (is_nil(expected_expires_at) or is_integer(expected_expires_at)),
              do: {:ok, :expected},
              else: {:error, :invalid_expected_binding}
            ),
@@ -1434,10 +1389,6 @@ defmodule AttentionServer.Engine do
         item.key != expected_key or item.expires_at != expected_expires_at ->
           {:error, :not_found}
 
-        now_ms >= item.status_expires_at and
-            not (item.state == :approved and Map.get(item, :joined, false)) ->
-          {:error, :not_found}
-
         item.state == :approved and get_in(engine.devices, [item.key, :revoked]) == true ->
           {:error, :revoked}
 
@@ -1453,9 +1404,6 @@ defmodule AttentionServer.Engine do
 
         item.state in [:declined, :cancelled] ->
           {:error, item.state}
-
-        now_ms >= item.expires_at ->
-          {:error, :expired}
 
         principal_key_used?(engine, item.key) ->
           {:error, :key_in_use}
@@ -1481,8 +1429,7 @@ defmodule AttentionServer.Engine do
              %{
                granted
                | pending_enrollments: Map.delete(granted.pending_enrollments, code),
-                 pending_history: Map.put(granted.pending_history, code, receipt),
-                 pending_clock_high_water: now_ms
+                 pending_history: Map.put(granted.pending_history, code, receipt)
              }, item.key}
           end
       end
@@ -1499,87 +1446,7 @@ defmodule AttentionServer.Engine do
       Enum.find(engine.pending_history, fn {_code, item} -> item.secret_hash == secret_hash end)
   end
 
-  @doc "Persist a crossed pending deadline before releasing an observation."
-  def pending_observe_time(%__MODULE__{} = engine, {:secret, hash}, now_ms) do
-    observe_pending_deadline(engine, find_pending_secret(engine, hash), now_ms)
-  end
-
-  def pending_observe_time(%__MODULE__{} = engine, {:code, code}, now_ms) do
-    item = Map.get(engine.pending_enrollments, code) || Map.get(engine.pending_history, code)
-    observe_pending_deadline(engine, if(item, do: {code, item}, else: nil), now_ms)
-  end
-
-  defp observe_pending_deadline(engine, {_, item}, now_ms) do
-    crossed =
-      cond do
-        now_ms >= item.status_expires_at -> item.status_expires_at
-        now_ms >= item.expires_at -> item.expires_at
-        true -> engine.pending_clock_high_water
-      end
-
-    if crossed > engine.pending_clock_high_water,
-      do: %{engine | pending_clock_high_water: crossed},
-      else: engine
-  end
-
-  defp observe_pending_deadline(engine, _item, _now_ms), do: engine
-
-  defp compact_pending(engine, now_ms) do
-    retained_history =
-      Map.reject(engine.pending_history, fn {_code, receipt} ->
-        receipt.status_expires_at <= now_ms and
-          not (receipt.state == :approved and Map.get(receipt, :joined, false))
-      end)
-
-    {active, history} =
-      Enum.reduce(engine.pending_enrollments, {%{}, retained_history}, fn {code, item},
-                                                                          {active, history} ->
-        cond do
-          item.state == :approved ->
-            receipt = %{
-              state: :approved,
-              secret_hash: item.secret_hash,
-              person: item.person,
-              key: item.key,
-              label: item.label,
-              expires_at: item.expires_at,
-              status_expires_at: item.status_expires_at,
-              approved_by: Map.get(item, :approved_by),
-              request_generation: Map.get(item, :request_generation, 1),
-              joined: Map.get(item, :joined, false)
-            }
-
-            if now_ms < item.status_expires_at or receipt.joined,
-              do: {active, Map.put(history, code, receipt)},
-              else: {active, history}
-
-          item.expires_at <= now_ms and is_nil(item.person) ->
-            if now_ms < item.status_expires_at do
-              receipt = %{
-                state: :expired,
-                secret_hash: item.secret_hash,
-                key: item.key,
-                expires_at: item.expires_at,
-                status_expires_at: item.status_expires_at
-              }
-
-              {active, Map.put(history, code, receipt)}
-            else
-              {active, history}
-            end
-
-          true ->
-            {Map.put(active, code, item), history}
-        end
-      end)
-
-    %{engine | pending_enrollments: active, pending_history: history}
-    |> AttentionServer.GuidedJoin.compact(now_ms)
-  end
-
-  def pending_decline(engine, person, owner_key, code, expected_key, expected_deadline, now) do
-    now = max(now, engine.pending_clock_high_water)
-
+  def pending_decline(engine, person, owner_key, code, expected_key, expected_deadline) do
     with {:ok, _} <- owner_revision(engine, person, owner_key),
          %{state: :pending, person: ^person} = item <- Map.get(engine.pending_enrollments, code),
          true <- item.key == expected_key and item.expires_at == expected_deadline do
@@ -1599,8 +1466,7 @@ defmodule AttentionServer.Engine do
        %{
          engine
          | pending_enrollments: Map.delete(engine.pending_enrollments, code),
-           pending_history: Map.put(engine.pending_history, code, receipt),
-           pending_clock_high_water: now
+           pending_history: Map.put(engine.pending_history, code, receipt)
        }}
     else
       {:error, :forbidden} -> {:error, :forbidden}
@@ -1609,19 +1475,14 @@ defmodule AttentionServer.Engine do
   end
 
   @doc "Cancel only the exact secret-bound pending request; an already committed approval wins."
-  def pending_cancel(engine, secret_hash, code, expected_key, expected_deadline, now) do
-    now = max(now, engine.pending_clock_high_water)
-
+  def pending_cancel(engine, secret_hash, code, expected_key, expected_deadline) do
     with {current_code, item} <- find_pending_secret(engine, secret_hash),
          true <- item.key == expected_key do
       cond do
         item.state == :pending and
             (code != current_code or expected_deadline != item.expires_at) ->
           {:error, :stale_request,
-           pending_response(
-             Map.put(item, :code, current_code),
-             if(now >= item.expires_at, do: "expired", else: "pending")
-           )}
+           pending_response(Map.put(item, :code, current_code), "pending")}
 
         item.state != :pending ->
           cond do
@@ -1636,7 +1497,7 @@ defmodule AttentionServer.Engine do
               {:ok, engine, %{"state" => Atom.to_string(item.state)}}
 
             true ->
-              with {:ok, status} <- pending_status(engine, secret_hash, now),
+              with {:ok, status} <- pending_status(engine, secret_hash),
                    do: {:ok, engine, status}
           end
 
@@ -1657,8 +1518,7 @@ defmodule AttentionServer.Engine do
           next = %{
             engine
             | pending_enrollments: Map.delete(engine.pending_enrollments, code),
-              pending_history: Map.put(engine.pending_history, code, receipt),
-              pending_clock_high_water: now
+              pending_history: Map.put(engine.pending_history, code, receipt)
           }
 
           {:ok, next, %{"state" => "cancelled"}}
@@ -1871,6 +1731,8 @@ defmodule AttentionServer.Engine do
   end
 
   def fixture_agent_answer(%__MODULE__{} = engine, key, frame) do
+    frame = Map.drop(frame, ~w(deliberate intent_ref))
+
     case Map.get(engine.agents, key) do
       %{person: person, id: id, senders: senders, revoked: false} ->
         target = {person, frame["sender_id"], frame["message_id"]}
@@ -1881,9 +1743,6 @@ defmodule AttentionServer.Engine do
 
           not MapSet.member?(senders, frame["sender_id"]) ->
             failure("forbidden")
-
-          frame["deliberate"] != true or not bounded_text?(frame["intent_ref"]) ->
-            failure("invalid_field", "intent_ref")
 
           not (is_integer(frame["acceptance_seq"]) and frame["acceptance_seq"] > 0) ->
             failure("invalid_field", "acceptance_seq")
@@ -4068,7 +3927,7 @@ defmodule AttentionServer.Engine do
       {message, field_warnings} = Message.normalize_optional_fields(original_message, accepted_at)
 
       semantic =
-        %{"type" => "forward", "message" => original_message}
+        %{"type" => "forward", "message" => Message.without_duplicate_markers(original_message)}
         |> Map.merge(Map.take(frame, ~w(session_handle vendor_session_id)))
         |> Map.put("files", files)
         |> then(fn value -> if support, do: Map.put(value, "support", support), else: value end)
@@ -4083,28 +3942,25 @@ defmodule AttentionServer.Engine do
           failure("operation_conflict")
 
         :missing ->
-          case Message.validate_ui1_admission(message, Enum.map(files, & &1["name"])) do
-            :ok ->
-              if delivery_stopped?(engine, person) do
-                failure("inactive_account")
-              else
-                commit_forward(
-                  engine,
-                  person,
-                  device,
-                  op,
-                  semantic,
-                  message,
-                  frame,
-                  files,
-                  support,
-                  accepted_at,
-                  field_warnings
-                )
-              end
+          if delivery_stopped?(engine, person) do
+            failure("inactive_account")
+          else
+            {message, screen_warnings} =
+              Message.admit_answer_ui(message, Enum.map(files, & &1["name"]))
 
-            {:error, {:typed_message, code, reason}} ->
-              failure({:typed_message, code, reason})
+            commit_forward(
+              engine,
+              person,
+              device,
+              op,
+              semantic,
+              message,
+              frame,
+              files,
+              support,
+              accepted_at,
+              field_warnings ++ screen_warnings
+            )
           end
       end
     else
@@ -4407,7 +4263,7 @@ defmodule AttentionServer.Engine do
         terminal_semantic(frame, answer?)
         |> then(fn value ->
           if kind == :agent,
-            do: Map.merge(value, Map.take(frame, ~w(acceptance_seq deliberate intent_ref))),
+            do: Map.merge(value, Map.take(frame, ~w(acceptance_seq))),
             else: value
         end)
 
@@ -4932,48 +4788,36 @@ defmodule AttentionServer.Engine do
     case Map.get(engine.messages, key) do
       %{session_handle: handle, origin: origin} = record
       when is_binary(handle) and actor != origin ->
-        if Conversation.new_chat_open?(record) do
-          if frame["request_revision"] <= record.revision do
-            {next, seq} = next_conversation_seq(engine, person)
+        if frame["request_revision"] <= record.revision do
+          {next, seq} = next_conversation_seq(engine, person)
 
-            entry =
-              %{
-                "kind" => "discussion",
-                "author" => "person",
-                "delivery_acks" => true,
-                "sender_id" => frame["sender_id"],
-                "message_id" => frame["message_id"],
-                "session_handle" => handle,
-                "request_revision" => frame["request_revision"],
-                "op_id" => frame["op_id"],
-                "text" => frame["text"]
-              }
-              |> ConversationFiles.put_entry(files)
+          entry =
+            %{
+              "kind" => "discussion",
+              "author" => "person",
+              "delivery_acks" => true,
+              "sender_id" => frame["sender_id"],
+              "message_id" => frame["message_id"],
+              "session_handle" => handle,
+              "request_revision" => frame["request_revision"],
+              "op_id" => frame["op_id"],
+              "text" => frame["text"]
+            }
+            |> ConversationFiles.put_entry(files)
 
-            {next, feed_entry} = Conversation.append_entry(next, person, origin, entry)
-            fields = %{"seq" => seq, "event_id" => feed_entry["event_id"]}
+          {next, feed_entry} = Conversation.append_entry(next, person, origin, entry)
+          fields = %{"seq" => seq, "event_id" => feed_entry["event_id"]}
 
-            next =
-              next
-              |> put_conversation_event(person, seq, key, feed_entry)
-              |> queue_conversation_hint(person, seq)
-              |> save_receipt(person, actor, frame["op_id"], semantic, fields)
+          next =
+            next
+            |> put_conversation_event(person, seq, key, feed_entry)
+            |> queue_conversation_hint(person, seq)
+            |> save_receipt(person, actor, frame["op_id"], semantic, fields)
 
-            {:ok, next, fields}
-          else
-            failure("invalid_field", "request_revision")
-          end
+          {:ok, next, fields}
         else
-          if match?(%{terminal: %{state: "answered"}}, record) and
-               frame["request_revision"] > record.revision do
-            failure("invalid_field", "request_revision")
-          else
-            failure("closed")
-          end
+          failure("invalid_field", "request_revision")
         end
-
-      %{terminal: terminal} when not is_nil(terminal) ->
-        failure("closed")
 
       %{origin: ^actor} ->
         failure("not_person")
@@ -5013,86 +4857,71 @@ defmodule AttentionServer.Engine do
       %{origin: origin} when origin != actor ->
         failure("not_origin")
 
-      %{origin: ^actor, session_handle: handle} = record when is_binary(handle) ->
-        if Conversation.new_chat_open?(record) do
-          with {:ok, %{"kind" => "discussion", "request_revision" => revision} = acted_turn} <-
-                 Conversation.person_entry(engine, person, actor, frame["in_reply_to"], key),
-               true <- revision == frame["request_revision"],
-               {:ok, acted} <-
-                 conversation_act_for_delivery(
-                   engine,
-                   person,
-                   actor,
-                   frame["in_reply_to"],
-                   frame["op_id"]
-                 ) do
-            {next, seq} = next_conversation_seq(acted, person)
-            {next, arrival} = next_free_order(next, person)
+      %{origin: ^actor, session_handle: handle} when is_binary(handle) ->
+        with {:ok, %{"kind" => "discussion", "request_revision" => revision} = acted_turn} <-
+               Conversation.person_entry(engine, person, actor, frame["in_reply_to"], key),
+             true <- revision == frame["request_revision"],
+             {:ok, acted, first_reply?} <-
+               conversation_act_for_reply(
+                 engine,
+                 person,
+                 actor,
+                 frame["in_reply_to"],
+                 frame["op_id"]
+               ) do
+          {next, seq} = next_conversation_seq(acted, person)
+          {next, arrival} = next_free_order(next, person)
 
-            entry =
-              %{
-                "kind" => "reply",
-                "author" => "origin",
-                "sender_id" => frame["sender_id"],
-                "message_id" => frame["message_id"],
-                "session_handle" => handle,
-                "request_revision" => revision,
-                "in_reply_to" => Integer.to_string(frame["in_reply_to"]),
-                "op_id" => frame["op_id"],
-                "text" => frame["text"]
-              }
-              |> ConversationFiles.put_entry(files)
+          entry =
+            %{
+              "kind" => "reply",
+              "author" => "origin",
+              "sender_id" => frame["sender_id"],
+              "message_id" => frame["message_id"],
+              "session_handle" => handle,
+              "request_revision" => revision,
+              "in_reply_to" => Integer.to_string(frame["in_reply_to"]),
+              "op_id" => frame["op_id"],
+              "text" => frame["text"]
+            }
+            |> ConversationFiles.put_entry(files)
 
-            {next, feed_entry} = Conversation.append_entry(next, person, actor, entry)
-            fields = %{"seq" => seq, "event_id" => feed_entry["event_id"]}
+          {next, feed_entry} = Conversation.append_entry(next, person, actor, entry)
+          fields = %{"seq" => seq, "event_id" => feed_entry["event_id"]}
 
-            next =
+          next =
+            next
+            |> put_conversation_event(person, seq, key, feed_entry)
+            |> put_reply_free_order(person, seq, arrival)
+            |> queue_conversation_hint(person, seq)
+            |> save_receipt(person, actor, frame["op_id"], semantic, fields)
+
+          # Further replies to the same person event are accepted; only the
+          # first one records the event as acted on.
+          next =
+            if first_reply? do
+              {next, _acted_seq} =
+                append_acted_fact(
+                  next,
+                  person,
+                  key,
+                  acted_turn["event_id"],
+                  feed_entry["event_id"],
+                  revision,
+                  handle
+                )
+
               next
-              |> put_conversation_event(person, seq, key, feed_entry)
-              |> put_reply_free_order(person, seq, arrival)
-              |> queue_conversation_hint(person, seq)
-              |> save_receipt(person, actor, frame["op_id"], semantic, fields)
+            else
+              next
+            end
 
-            {next, _acted_seq} =
-              append_acted_fact(
-                next,
-                person,
-                key,
-                acted_turn["event_id"],
-                feed_entry["event_id"],
-                revision,
-                handle
-              )
-
-            {:ok, next, fields}
-          else
-            false -> failure("stale_revision")
-            {:error, :already_acted} -> failure("already_acted")
-            {:error, :inactive_account} -> failure("inactive_account")
-            _ -> failure("not_found")
-          end
+          {:ok, next, fields}
         else
-          case record do
-            %{terminal: %{state: "answered"}} ->
-              with {:ok, %{"kind" => "discussion", "request_revision" => revision}} <-
-                     Conversation.person_entry(engine, person, actor, frame["in_reply_to"], key),
-                   true <- revision == frame["request_revision"] do
-                case Conversation.act(engine, person, actor, frame["in_reply_to"], frame["op_id"]) do
-                  {:ok, _unchanged_after_refusal} -> failure("closed")
-                  {:error, :already_acted} -> failure("already_acted")
-                end
-              else
-                false -> failure("stale_revision")
-                _ -> failure("not_found")
-              end
-
-            _ ->
-              failure("closed")
-          end
+          false -> failure("stale_revision")
+          {:error, :inactive_account} -> failure("inactive_account")
+          _ -> failure("not_found")
         end
-
-      %{origin: ^actor, terminal: terminal} when not is_nil(terminal) ->
-        failure("closed")
 
       %{origin: _} ->
         failure("not_origin")
@@ -5127,6 +4956,7 @@ defmodule AttentionServer.Engine do
       semantic =
         frame
         |> Map.take(~w(type sender_id message_id base_revision in_reply_to message))
+        |> Map.update("message", nil, &Message.without_duplicate_markers/1)
         |> Map.put("files", files)
 
       case receipt(engine, person, actor, frame["op_id"], semantic) do
@@ -5163,18 +4993,13 @@ defmodule AttentionServer.Engine do
         revised_message = effective_revised_message(record.message, frame["message"])
 
         with :ok <- valid_message(revised_message),
-             :ok <- Message.validate_typed_message(revised_message),
-             :ok <-
-               if(Map.has_key?(frame["message"], "answer_ui"),
-                 do:
-                   Message.validate_ui1_admission(
-                     revised_message,
-                     record.files_by_revision
-                     |> Map.get(1, [])
-                     |> Enum.map(& &1["name"])
-                   ),
-                 else: Message.validate_ui1_controls(revised_message)
-               ) do
+             :ok <- Message.validate_typed_message(revised_message) do
+          {revised_message, screen_warnings} =
+            Message.admit_answer_ui(
+              revised_message,
+              record.files_by_revision |> Map.get(1, []) |> Enum.map(& &1["name"])
+            )
+
           if record.revision != frame["base_revision"] do
             failure("stale_revision", "base_revision", %{"current_revision" => record.revision})
           else
@@ -5184,8 +5009,10 @@ defmodule AttentionServer.Engine do
                 revision = record.revision + 1
                 revisions = Map.get(record, :revisions, %{1 => record.message})
 
-                {message, field_warnings} =
+                {message, normalized_warnings} =
                   Message.normalize_optional_fields(revised_message, accepted_at)
+
+                field_warnings = normalized_warnings ++ screen_warnings
 
                 updated =
                   Map.merge(record, %{
@@ -5295,7 +5122,14 @@ defmodule AttentionServer.Engine do
 
     if Map.has_key?(revised, "message_type") and not Map.has_key?(revised, "answer_ui") and
          Map.has_key?(stored, "answer_ui"),
-       do: Map.put(revised, "answer_ui", stored["answer_ui"]),
+       do:
+         revised
+         |> Map.put("answer_ui", stored["answer_ui"])
+         |> then(fn carried ->
+           if Map.has_key?(stored, "answer_ui_unavailable"),
+             do: Map.put(carried, "answer_ui_unavailable", stored["answer_ui_unavailable"]),
+             else: carried
+         end),
        else: revised
   end
 
@@ -5324,6 +5158,18 @@ defmodule AttentionServer.Engine do
   end
 
   defp valid_revision_message(_engine, _person, message), do: valid_message(message)
+
+  # Replies to one person event are not limited to one: a later reply leaves the
+  # event's acted record as it is. Duplicate operations are caught earlier by
+  # their receipt.
+  defp conversation_act_for_reply(engine, person, actor, event_id, op_id) do
+    if Map.has_key?(engine.origin_actions, {person, actor, event_id}) do
+      with :ok <- delivery_allowed(engine, person), do: {:ok, engine, false}
+    else
+      with {:ok, acted} <- conversation_act_for_delivery(engine, person, actor, event_id, op_id),
+           do: {:ok, acted, true}
+    end
+  end
 
   defp conversation_act_for_delivery(engine, person, actor, event_id, op_id) do
     with {:ok, acted} <- Conversation.act(engine, person, actor, event_id, op_id),
@@ -6019,6 +5865,14 @@ defmodule AttentionServer.Engine do
   defp put_event(engine, person, seq, kind, key),
     do: %{engine | events: Map.put(engine.events, {person, seq}, %{kind: kind, key: key})}
 
+  # When a push for this binding may next go out: now, unless a push started
+  # less than one window ago, in which case at the end of that window.
+  defp push_open_at(%{last_attempt_at: last}, now_ms)
+       when is_integer(last) and now_ms < last + @push_window_ms,
+       do: last + @push_window_ms
+
+  defp push_open_at(_binding, now_ms), do: now_ms
+
   defp queue_push_hint(engine, person, high) do
     now_ms = System.system_time(:millisecond)
 
@@ -6029,8 +5883,9 @@ defmodule AttentionServer.Engine do
             fresh =
               binding.pending_high == 0 and binding.pending_conversation_high == 0
 
-            # Preserve the established five-minute notification pacing. A new
-            # high during an in-flight push opens the next window.
+            # The first unsent item is eligible at once. Items arriving within
+            # five minutes of the last push, or during an in-flight push, wait
+            # for the end of that window and go out as one push.
             opens_window? =
               fresh or
                 (binding.state == "sending" and high > binding.pending_high and
@@ -6038,7 +5893,7 @@ defmodule AttentionServer.Engine do
 
             deadline_at = if opens_window?, do: now_ms, else: binding.deadline_at
 
-            next_at = if opens_window?, do: now_ms + @push_window_ms, else: binding.next_at
+            next_at = if opens_window?, do: push_open_at(binding, now_ms), else: binding.next_at
 
             state =
               cond do
@@ -6094,7 +5949,7 @@ defmodule AttentionServer.Engine do
 
             deadline_at = if opens_window?, do: now_ms, else: binding.deadline_at
 
-            next_at = if opens_window?, do: now_ms + @push_window_ms, else: binding.next_at
+            next_at = if opens_window?, do: push_open_at(binding, now_ms), else: binding.next_at
 
             state =
               cond do

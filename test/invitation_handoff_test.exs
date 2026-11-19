@@ -75,13 +75,13 @@ defmodule AttentionServer.InvitationHandoffTest do
     }
   end
 
-  test "one owner-agent action directly returns a shareable destination/account/expiry and usable join",
+  test "one owner-agent action directly returns a shareable destination/account and usable join",
        c do
     result = create(c)
     assert result.state == "ready"
     assert result.account == c.person
     assert result.destination["enrollment_url"] == c.config["enrollment_url"]
-    assert result.expires_at > System.system_time(:millisecond)
+    assert result.expires_at == nil
     refute inspect(result) =~ "harklight://join#"
     {:ok, rendered} = JSON.decode_line(InvitationHandoff.encode_result(result) <> "\n")
     assert rendered["share_url"] == result.share_url
@@ -251,51 +251,41 @@ defmodule AttentionServer.InvitationHandoffTest do
     assert :sys.get_state(c.relay).store.engine.join_invitations == %{}
   end
 
-  test "request expiry cannot extend or resurrect a shared link and a changed destination refuses",
+  test "a repeated request returns the same link, a changed destination refuses and a consumed request is used",
        c do
     {:ok, engine} = Engine.operator_bootstrap(Engine.new(), @person, @owner)
 
     {:ok, issued, invite, token} =
-      GuidedJoin.create_for_request(engine, @person, @owner, @request, c.config, 100)
+      GuidedJoin.create_for_request(engine, @person, @owner, @request, c.config)
+
+    assert invite.expires_at == nil
 
     assert {:ok, ^issued, ^invite, ^token} =
-             GuidedJoin.create_for_request(issued, @person, @owner, @request, c.config, 101)
+             GuidedJoin.create_for_request(issued, @person, @owner, @request, c.config)
 
     {:ok, changed} = GuidedJoin.configuration("other.test", 18444, 18443, c.config["ca_pem"])
 
     assert {:error, :request_conflict} =
-             GuidedJoin.create_for_request(issued, @person, @owner, @request, changed, 102)
+             GuidedJoin.create_for_request(issued, @person, @owner, @request, changed)
 
-    assert {:error, :expired, observed} =
-             GuidedJoin.create_for_request(
-               issued,
-               @person,
-               @owner,
-               @request,
-               c.config,
-               invite.expires_at
-             )
+    {:ok, joined, _reply} =
+      GuidedJoin.redeem(
+        issued,
+        :crypto.hash(:sha256, token),
+        TLSFixtures.certificate_der!(c.certs, "a2"),
+        "phone",
+        :crypto.hash(:sha256, "status"),
+        "ABCDEFGH23",
+        c.config
+      )
 
-    assert {:error, _} =
-             GuidedJoin.create_for_request(observed, @person, @owner, @request, c.config, 101)
+    assert {:error, :used} =
+             GuidedJoin.create_for_request(joined, @person, @owner, @request, c.config)
 
-    reclaimed = GuidedJoin.compact(observed, invite.retain_until)
-
-    assert {:ok, _, _, replacement} =
-             GuidedJoin.create_for_request(
-               reclaimed,
-               @person,
-               @owner,
-               @request,
-               c.config,
-               invite.retain_until
-             )
-
-    refute token == replacement
     {:ok, recovered} = Engine.operator_recover(issued, @person, String.duplicate("c", 64))
 
     assert {:error, :forbidden} =
-             GuidedJoin.create_for_request(recovered, @person, @owner, @request, c.config, 102)
+             GuidedJoin.create_for_request(recovered, @person, @owner, @request, c.config)
   end
 
   test "stale SQLite writer cannot return an issued handoff", c do
@@ -321,7 +311,7 @@ defmodule AttentionServer.InvitationHandoffTest do
     {:ok, engine} = Engine.operator_bootstrap(Engine.new(), @person, @owner)
     token = :crypto.strong_rand_bytes(32)
     hash = :crypto.hash(:sha256, token)
-    {:ok, engine, invitation} = GuidedJoin.create(engine, @person, @owner, hash, c.config, 100)
+    {:ok, engine, invitation} = GuidedJoin.create(engine, @person, @owner, hash, c.config)
     legacy_invitation = Map.delete(invitation, :request_id)
     legacy = %{engine | join_invitations: %{hash => legacy_invitation}}
     payload = :erlang.term_to_binary({:attention_relay_state, 14, legacy}, [{:compressed, 6}])
@@ -347,8 +337,7 @@ defmodule AttentionServer.InvitationHandoffTest do
                "legacy joining device",
                :crypto.hash(:sha256, "legacy-status"),
                "ABCDEFGH23",
-               c.config,
-               101
+               c.config
              )
 
     assert pending.pending_enrollments["ABCDEFGH23"].person == @person

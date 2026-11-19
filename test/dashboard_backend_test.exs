@@ -527,7 +527,8 @@ defmodule AttentionServer.DashboardBackendTest do
       Relay.invited_enroll(relay, payload["invite_token"], device_cert, "Ansible", secret)
 
     code = pending["approval_code"]
-    deadline = pending["expires_at"]
+    assert pending["expires_at"] == nil
+    deadline = ""
     review = request(cookie) |> Map.put(:request_path, "/devices/waiting/#{code}")
     review = %{review | path_info: ["devices", "waiting", code]} |> DashboardReadHTTP.call(opts)
     assert review.status == 200
@@ -536,14 +537,14 @@ defmodule AttentionServer.DashboardBackendTest do
     assert review.resp_body =~ ~s(name="senders")
 
     wrong =
-      URI.encode_query(%{"key" => device_key, "deadline" => Integer.to_string(deadline + 1)})
+      URI.encode_query(%{"key" => device_key, "deadline" => "12345"})
 
     assert (owner_post("/devices/waiting/#{code}/approve", wrong, cookie)
             |> DashboardReadHTTP.call(opts)).status == 409
 
     assert :sys.get_state(relay).store.engine.devices[device_key] == nil
 
-    exact = URI.encode_query(%{"key" => device_key, "deadline" => Integer.to_string(deadline)})
+    exact = URI.encode_query(%{"key" => device_key, "deadline" => deadline})
 
     approved =
       owner_post("/devices/waiting/#{code}/approve", exact, cookie, "null")
@@ -560,7 +561,8 @@ defmodule AttentionServer.DashboardBackendTest do
     {:ok, cli_key} = DeviceIdentity.from_certificate(cli_cert)
     {:ok, cli_request} = Relay.pending_enroll(relay, cli_cert, "CLI workstation")
     cli_code = cli_request.approval_code
-    cli_deadline = cli_request.expires_at
+    assert cli_request.expires_at == nil
+    cli_deadline = ""
 
     cli_queue = request(cookie) |> DashboardReadHTTP.call(opts)
     assert cli_queue.status == 200
@@ -593,7 +595,7 @@ defmodule AttentionServer.DashboardBackendTest do
     cli_exact =
       URI.encode_query(%{
         "key" => cli_key,
-        "deadline" => Integer.to_string(cli_deadline),
+        "deadline" => cli_deadline,
         "senders" => Enum.join(sender_ids, ",")
       })
 
@@ -658,7 +660,7 @@ defmodule AttentionServer.DashboardBackendTest do
     no_sender_approval =
       URI.encode_query(%{
         "key" => no_sender_key,
-        "deadline" => Integer.to_string(no_sender_request.expires_at)
+        "deadline" => ""
       })
 
     no_sender_result =
