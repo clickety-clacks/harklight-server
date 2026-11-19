@@ -8,7 +8,7 @@ machine names and user identifiers out of this register.
 
 | Flag | Purpose | Owner | Work item | Default | Remove when |
 | --- | --- | --- | --- | --- | --- |
-| _none yet_ | | | | | |
+| `client_api_v2` | Client API v2: the per-person change log now, then the `/v2` device and browser API ([contract](client-api-v2.md)). Read once at startup from the `ATTENTION_SERVER_FEATURE_FLAGS_PATH` file. | Harklight Server delivery owner | wi_e41bc552-9279-41d0-b015-07174b692dec | Off | Server 0.2.0 turns it on and removes the old client paths; the flag is deleted after that release |
 
 The whole-server `ATTENTION_SERVER_ENABLE` startup switch and permanent operator
 configuration are not temporary feature flags. This register does not declare
