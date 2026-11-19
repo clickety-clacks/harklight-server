@@ -3958,7 +3958,8 @@ defmodule AttentionServer.Relay do
          {:ok,
           %{
             "inline_decoded_bytes_per_entry" => ConversationFiles.inline_limit(),
-            "upload_cap_bytes_per_file" => cap
+            "upload_cap_bytes_per_file" => cap,
+            "answer_ui_limits" => AttentionServer.UI1.published_limits()
           }}, state}
 
       _ ->

@@ -1193,8 +1193,7 @@ defmodule AttentionServer.Engine do
             request_generation: 1
           }
 
-          {:ok,
-           %{engine | pending_enrollments: Map.put(engine.pending_enrollments, code, item)}}
+          {:ok, %{engine | pending_enrollments: Map.put(engine.pending_enrollments, code, item)}}
       end
     else
       _ -> {:error, :invalid_request}
@@ -1355,7 +1354,9 @@ defmodule AttentionServer.Engine do
       ) do
     with {:ok, _revision} <- owner_revision(engine, person, owner_key),
          {:ok, :expected} <-
-           if(hex_key?(expected_key) and (is_nil(expected_expires_at) or is_integer(expected_expires_at)),
+           if(
+             hex_key?(expected_key) and
+               (is_nil(expected_expires_at) or is_integer(expected_expires_at)),
              do: {:ok, :expected},
              else: {:error, :invalid_expected_binding}
            ),
@@ -1465,7 +1466,8 @@ defmodule AttentionServer.Engine do
       cond do
         item.state == :pending and
             (code != current_code or expected_deadline != item.expires_at) ->
-          {:error, :stale_request, pending_response(Map.put(item, :code, current_code), "pending")}
+          {:error, :stale_request,
+           pending_response(Map.put(item, :code, current_code), "pending")}
 
         item.state != :pending ->
           cond do
@@ -3911,7 +3913,7 @@ defmodule AttentionServer.Engine do
       {message, field_warnings} = Message.normalize_optional_fields(original_message, accepted_at)
 
       semantic =
-        %{"type" => "forward", "message" => original_message}
+        %{"type" => "forward", "message" => Message.without_duplicate_markers(original_message)}
         |> Map.merge(Map.take(frame, ~w(session_handle vendor_session_id)))
         |> Map.put("files", files)
         |> then(fn value -> if support, do: Map.put(value, "support", support), else: value end)
@@ -3926,28 +3928,25 @@ defmodule AttentionServer.Engine do
           failure("operation_conflict")
 
         :missing ->
-          case Message.validate_ui1_admission(message, Enum.map(files, & &1["name"])) do
-            :ok ->
-              if delivery_stopped?(engine, person) do
-                failure("inactive_account")
-              else
-                commit_forward(
-                  engine,
-                  person,
-                  device,
-                  op,
-                  semantic,
-                  message,
-                  frame,
-                  files,
-                  support,
-                  accepted_at,
-                  field_warnings
-                )
-              end
+          if delivery_stopped?(engine, person) do
+            failure("inactive_account")
+          else
+            {message, screen_warnings} =
+              Message.admit_answer_ui(message, Enum.map(files, & &1["name"]))
 
-            {:error, {:typed_message, code, reason}} ->
-              failure({:typed_message, code, reason})
+            commit_forward(
+              engine,
+              person,
+              device,
+              op,
+              semantic,
+              message,
+              frame,
+              files,
+              support,
+              accepted_at,
+              field_warnings ++ screen_warnings
+            )
           end
       end
     else
@@ -4956,6 +4955,7 @@ defmodule AttentionServer.Engine do
       semantic =
         frame
         |> Map.take(~w(type sender_id message_id base_revision in_reply_to message))
+        |> Map.update("message", nil, &Message.without_duplicate_markers/1)
         |> Map.put("files", files)
 
       case receipt(engine, person, actor, frame["op_id"], semantic) do
@@ -4992,18 +4992,13 @@ defmodule AttentionServer.Engine do
         revised_message = effective_revised_message(record.message, frame["message"])
 
         with :ok <- valid_message(revised_message),
-             :ok <- Message.validate_typed_message(revised_message),
-             :ok <-
-               if(Map.has_key?(frame["message"], "answer_ui"),
-                 do:
-                   Message.validate_ui1_admission(
-                     revised_message,
-                     record.files_by_revision
-                     |> Map.get(1, [])
-                     |> Enum.map(& &1["name"])
-                   ),
-                 else: Message.validate_ui1_controls(revised_message)
-               ) do
+             :ok <- Message.validate_typed_message(revised_message) do
+          {revised_message, screen_warnings} =
+            Message.admit_answer_ui(
+              revised_message,
+              record.files_by_revision |> Map.get(1, []) |> Enum.map(& &1["name"])
+            )
+
           if record.revision != frame["base_revision"] do
             failure("stale_revision", "base_revision", %{"current_revision" => record.revision})
           else
@@ -5013,8 +5008,10 @@ defmodule AttentionServer.Engine do
                 revision = record.revision + 1
                 revisions = Map.get(record, :revisions, %{1 => record.message})
 
-                {message, field_warnings} =
+                {message, normalized_warnings} =
                   Message.normalize_optional_fields(revised_message, accepted_at)
+
+                field_warnings = normalized_warnings ++ screen_warnings
 
                 updated =
                   Map.merge(record, %{
@@ -5124,7 +5121,14 @@ defmodule AttentionServer.Engine do
 
     if Map.has_key?(revised, "message_type") and not Map.has_key?(revised, "answer_ui") and
          Map.has_key?(stored, "answer_ui"),
-       do: Map.put(revised, "answer_ui", stored["answer_ui"]),
+       do:
+         revised
+         |> Map.put("answer_ui", stored["answer_ui"])
+         |> then(fn carried ->
+           if Map.has_key?(stored, "answer_ui_unavailable"),
+             do: Map.put(carried, "answer_ui_unavailable", stored["answer_ui_unavailable"]),
+             else: carried
+         end),
        else: revised
   end
 
