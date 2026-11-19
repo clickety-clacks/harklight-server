@@ -420,7 +420,7 @@ bin/harklight agent exposes existing keygen/search/get/respond tools.
 Owner agent-register, agent-grants-replace, agent-list and agent-revoke remain
 available. Register the exact public key and grant read/respond separately.
 Responses retain deliberate ANSWER confirmation, caller-held operation UUID,
-exact acceptance sequence and intent reference, without source ruling authority.
+exact acceptance sequence, without source ruling authority.
 
 ## Upgrade or rollback
 
