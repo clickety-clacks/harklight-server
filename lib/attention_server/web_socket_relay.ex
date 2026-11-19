@@ -5,17 +5,19 @@ defmodule AttentionServer.WebSocketRelay do
   The authenticated device session is opened only after the exact WebSocket
   subprotocol is negotiated. Relay owns application-frame sends and fencing.
 
-  A client may declare a connection role in the upgrade request,
-  `GET /relay?role=stream` or `GET /relay?role=request`. A declared role gets a
-  `connection_admitted` frame carrying its connection ID first, and a close
-  frame with a reason token before every server-initiated close. A request
-  without a role is a legacy stream and its wire bytes are unchanged.
+  Every device WebSocket is the device's change stream. Its upgrade response
+  carries a `Harklight-Connection-Id` header, and every server-initiated close
+  sends a close frame with a reason token first.
+
+  While the `client_api` feature flag is on, the same listener also serves
+  `POST /client/v1`: one device frame per HTTPS request, answered without a
+  session and never closing another connection.
   """
 
   use GenServer
 
   alias AttentionServer.{
-    ConnectionRole,
+    DeviceConnection,
     DeviceIdentity,
     Diagnostics,
     EnrolledLeafVerify,
@@ -32,6 +34,9 @@ defmodule AttentionServer.WebSocketRelay do
   @guid "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
   @bad_frame ~s({"v":1,"type":"error","reason":"bad_frame"}\n)
   @storage_unavailable ~s({"v":1,"type":"error","reason":"storage_unavailable"}\n)
+  # The browser command route's existing body limit.
+  @max_client_body 2 * 1024 * 1024
+  @client_body_timeout 30_000
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts)
   def port(server), do: GenServer.call(server, :port, :infinity)
@@ -259,15 +264,15 @@ defmodule AttentionServer.WebSocketRelay do
                Relay.acknowledged_cursor(relay, key),
                :closed
              ),
-           {:ok, buffer, role} <- upgrade(tls_socket),
-           {:ok, session, connection_id} <-
+           connection_id = DeviceConnection.new_connection_id(),
+           {:ok, buffer} <- upgrade(tls_socket, relay, key, connection_id),
+           {:ok, session} <-
              Diagnostics.result(
                :device_relay,
                :session_setup,
-               Relay.open_websocket_session(relay, key, tls_socket, listener_id, role),
+               Relay.open_websocket_session(relay, key, tls_socket, listener_id, connection_id),
                :closed
-             ),
-           :ok <- admit(relay, session, connection_id, role) do
+             ) do
         loop(tls_socket, relay, session, buffer, nil)
         Relay.close_session(relay, session)
       end
@@ -285,23 +290,10 @@ defmodule AttentionServer.WebSocketRelay do
     end
   end
 
-  # A declared role learns its connection ID before any other frame.
-  defp admit(_relay, _session, _connection_id, :legacy), do: :ok
-
-  defp admit(relay, session, connection_id, role) do
-    Process.put(:attention_connection_role, role)
-
-    Diagnostics.result(
-      :device_relay,
-      :response_write,
-      Relay.session_send(relay, session, [ConnectionRole.admitted_frame(connection_id, role)]),
-      :closed
-    )
-  end
-
-  defp upgrade(socket) do
+  defp upgrade(socket, relay, device_key, connection_id) do
     with {:ok, headers, buffer} <- read_headers(socket, <<>>),
-         {:ok, key, role} <- validate_upgrade(headers),
+         :upgrade <- client_route(socket, relay, device_key, headers, buffer),
+         {:ok, key} <- validate_upgrade(headers),
          accept <- Base.encode64(:crypto.hash(:sha, key <> @guid)),
          :ok <-
            :ssl.send(socket, [
@@ -312,10 +304,15 @@ defmodule AttentionServer.WebSocketRelay do
              accept,
              "\r\nSec-WebSocket-Protocol: ",
              @protocol,
+             "\r\nHarklight-Connection-Id: ",
+             connection_id,
              "\r\n\r\n"
            ]) do
-      {:ok, buffer, role}
+      {:ok, buffer}
     else
+      :client_served ->
+        {:error, :client_served}
+
       {:error, reason} ->
         Diagnostics.failure(:device_relay, :websocket_upgrade, reason, :closed)
 
@@ -359,16 +356,15 @@ defmodule AttentionServer.WebSocketRelay do
 
   defp validate_upgrade(headers) do
     case String.split(headers, "\r\n") do
-      [request_line | lines] ->
-        with {:ok, role} <- relay_target(request_line),
-             {:ok, fields} <- parse_headers(lines, %{}),
+      ["GET /relay HTTP/1.1" | lines] ->
+        with {:ok, fields} <- parse_headers(lines, %{}),
              true <- token_ci?(fields["connection"], "upgrade"),
              true <- String.downcase(fields["upgrade"] || "") == "websocket",
              true <- fields["sec-websocket-version"] == "13",
              true <- token?(fields["sec-websocket-protocol"], @protocol),
              {:ok, key} <- valid_key(fields["sec-websocket-key"]),
              true <- is_binary(fields["host"]) and fields["host"] != "" do
-          {:ok, key, role}
+          {:ok, key}
         else
           _ -> {:error, :bad_upgrade}
         end
@@ -377,11 +373,6 @@ defmodule AttentionServer.WebSocketRelay do
         {:error, :bad_upgrade}
     end
   end
-
-  defp relay_target("GET /relay HTTP/1.1"), do: {:ok, :legacy}
-  defp relay_target("GET /relay?role=stream HTTP/1.1"), do: {:ok, :stream}
-  defp relay_target("GET /relay?role=request HTTP/1.1"), do: {:ok, :request}
-  defp relay_target(_), do: {:error, :bad_upgrade}
 
   defp parse_headers([], fields), do: {:ok, fields}
 
@@ -492,23 +483,16 @@ defmodule AttentionServer.WebSocketRelay do
       {:error, reason} ->
         Diagnostics.failure(:device_relay, :request_read, reason, :closed)
         _ = Relay.session_send(relay, session, [@bad_frame])
-        close_with_reason(relay, session, :protocol_error)
+
+        _ =
+          Relay.session_send_control(
+            relay,
+            session,
+            encode_close(DeviceConnection.close_code(:protocol_error), :protocol_error)
+          )
+
         :ok
     end
-  end
-
-  # Only a declared role receives close frames; legacy bytes stay unchanged.
-  defp close_with_reason(relay, session, reason) do
-    if ConnectionRole.explicit?(Process.get(:attention_connection_role)) do
-      _ =
-        Relay.session_send_control(
-          relay,
-          session,
-          IO.iodata_to_binary(encode_close(ConnectionRole.close_code(reason), reason))
-        )
-    end
-
-    :ok
   end
 
   defp consume_frame(_socket, _relay, _session, false, 1, payload, nil) do
@@ -1036,4 +1020,144 @@ defmodule AttentionServer.WebSocketRelay do
 
     [header, payload]
   end
+
+  # -- POST /client/v1 -------------------------------------------------------
+
+  # Anything addressed to /client/v1 is a client API request; everything else
+  # keeps today's upgrade handling.
+  defp client_route(socket, relay, device_key, headers, buffer) do
+    [request_line | lines] = String.split(headers, "\r\n")
+
+    case String.split(request_line, " ") do
+      [method, "/client/v1" <> _ = path, "HTTP/1.1"] ->
+        serve_client(socket, relay, device_key, method, path, lines, buffer)
+        :client_served
+
+      _ ->
+        :upgrade
+    end
+  end
+
+  defp serve_client(socket, relay, device_key, method, path, lines, buffer) do
+    started = System.monotonic_time(:millisecond)
+    request_id = DeviceConnection.new_request_id()
+
+    {status, body, type, reason} =
+      cond do
+        not Relay.client_api_enabled?(relay) or path != "/client/v1" ->
+          {404, error_body(%{}, "not_found"), nil, "not_found"}
+
+        method != "POST" ->
+          {405, error_body(%{}, "method_not_allowed"), nil, "method_not_allowed"}
+
+        true ->
+          client_command(socket, relay, device_key, lines, buffer)
+      end
+
+    retry_after = if status == 503, do: ["Retry-After: 1\r\n"], else: []
+
+    _ =
+      :ssl.send(socket, [
+        "HTTP/1.1 ",
+        Integer.to_string(status),
+        " ",
+        status_text(status),
+        "\r\nContent-Type: application/json\r\nContent-Length: ",
+        Integer.to_string(IO.iodata_length(body)),
+        "\r\nHarklight-Request-Id: ",
+        request_id,
+        "\r\n",
+        retry_after,
+        "Connection: close\r\n\r\n",
+        body
+      ])
+
+    DeviceConnection.log_request(
+      request_id,
+      type,
+      status,
+      reason,
+      System.monotonic_time(:millisecond) - started
+    )
+
+    :ok
+  end
+
+  defp client_command(socket, relay, device_key, lines, buffer) do
+    with {:ok, fields} <- parse_headers(lines, %{}),
+         {:ok, length} <- content_length(fields),
+         {:ok, payload} <- read_body(socket, buffer, length),
+         {:ok, %{"v" => _, "type" => type} = frame} when is_binary(type) <-
+           JSON.decode_line(payload <> "\n") do
+      logged_type = if type in DeviceConnection.client_types(), do: type, else: "other"
+
+      case Relay.client_request(relay, device_key, payload <> "\n") do
+        {:ok, [reply]} ->
+          reason = reply_reason(reply)
+          status = if reason in ["storage_unavailable", "retry_later"], do: 503, else: 200
+          {status, encode_reply(reply), logged_type, reason}
+
+        {:error, :not_found} ->
+          {404, error_body(frame, "not_found"), logged_type, "not_found"}
+
+        _ ->
+          {403, error_body(frame, "forbidden"), logged_type, "forbidden"}
+      end
+    else
+      {:error, :too_large} -> {413, error_body(%{}, "too_large"), nil, "too_large"}
+      _ -> {400, error_body(%{}, "bad_frame"), nil, "bad_frame"}
+    end
+  end
+
+  defp content_length(%{"transfer-encoding" => _}), do: {:error, :bad_request}
+
+  defp content_length(%{"content-length" => value}) do
+    case Integer.parse(value) do
+      {length, ""} when length > @max_client_body -> {:error, :too_large}
+      {length, ""} when length >= 0 -> {:ok, length}
+      _ -> {:error, :bad_request}
+    end
+  end
+
+  defp content_length(_), do: {:error, :bad_request}
+
+  defp read_body(_socket, buffer, length) when byte_size(buffer) >= length,
+    do: {:ok, binary_part(buffer, 0, length)}
+
+  defp read_body(socket, buffer, length) do
+    case :ssl.recv(socket, length - byte_size(buffer), @client_body_timeout) do
+      {:ok, chunk} -> read_body(socket, buffer <> chunk, length)
+      error -> error
+    end
+  end
+
+  defp reply_reason(%JSON.StreamedLine{}), do: nil
+
+  defp reply_reason(line) do
+    case JSON.decode_line(line) do
+      {:ok, %{"type" => "error", "reason" => reason}} when is_binary(reason) -> reason
+      _ -> nil
+    end
+  end
+
+  defp encode_reply(%JSON.StreamedLine{} = line), do: Enum.to_list(JSON.encode_stream(line))
+  defp encode_reply(line), do: line
+
+  defp error_body(frame, reason) do
+    reply = %{"v" => 1, "type" => "error", "reason" => reason}
+
+    reply =
+      if is_binary(Map.get(frame, "ref")), do: Map.put(reply, "ref", frame["ref"]), else: reply
+
+    JSON.encode_line(reply)
+  end
+
+  defp status_text(200), do: "OK"
+  defp status_text(400), do: "Bad Request"
+  defp status_text(403), do: "Forbidden"
+  defp status_text(404), do: "Not Found"
+  defp status_text(405), do: "Method Not Allowed"
+  defp status_text(413), do: "Payload Too Large"
+  defp status_text(503), do: "Service Unavailable"
+
 end

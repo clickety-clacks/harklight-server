@@ -95,57 +95,65 @@ then this request from its `conversation_seq`; it does not send `view_get`.
 Older servers answer `inbox_list` with `unknown_type` and do not change sync
 mode, so a client can fall back to legacy replay on the same connection.
 
-## Connection roles
+## Client API requests
 
-A device WebSocket may declare a role in its upgrade request, so one stream
-connection can sync while separate request connections read and mutate without
-waiting on it or closing it:
+While the `client_api` feature flag is on (see
+[feature-flags.md](feature-flags.md)), the device WebSocket listener also
+serves plain HTTPS requests, authorized by the same enrolled device
+certificate:
 
 ```text
-GET /relay?role=stream HTTP/1.1
-GET /relay?role=request HTTP/1.1
+POST /client/v1 HTTP/1.1
+Content-Type: application/json
+Content-Length: <n>
+
+{"v":1,"type":"inbox_list","ref":"list-1"}
 ```
 
-A connection that declares no role (`GET /relay`) is a legacy stream: its frame
-set, replies, displacement and close behavior are unchanged. Any other target is
-refused with `400 Bad Request`, which is how an older server answers a declared
-role; a client can fall back to one legacy connection on that answer. Roles
-apply to the device WebSocket only. The raw TLS transport is always legacy.
+The body is one device frame, exactly as it would be sent on the socket, and
+the response body is the reply the socket would give. Served types are the
+snapshot reads `inbox_list`, `conversation_page`, `view_get`, `levels_get` and
+the mutations `message_open`, `conversation_read`, `discussion`, `answer`,
+`answer_no_comment`, `lifecycle`, `levels_set`, `push_register`, `push_remove`
+and `push_status`. Every other type is answered `wrong_endpoint`.
 
-A declared role receives this frame before any other:
+A request has no session. It holds no cursor, never enters snapshot paging
+mode, is never refused by a paging checkpoint and closes no connection. Any
+number may run in parallel beside the device's stream. Mutations de-duplicate by
+`op_id` per device, so a retry on another connection or on the socket returns
+the first reply with `"duplicate": true`.
 
-```json
-{"v":1,"type":"connection_admitted","connection_id":"c_...","role":"request"}
-```
+| Status | When |
+|---|---|
+| 200 | The frame was served; the body is `ok` or an `error` reply |
+| 400 | The body is not a JSON frame with `v` and `type`, or has no `Content-Length` |
+| 403 | The device is no longer authorized |
+| 404 | `client_api` is off, or the path is not `/client/v1`. A server without the API also answers this way. |
+| 405 | A method other than `POST` |
+| 413 | The body is larger than 2 MiB |
+| 503 | The reply is `storage_unavailable` or `retry_later`; `Retry-After` is set |
 
-`connection_id` is opaque and safe to log. The server logs it when the
-connection opens, closes or has a frame refused.
+Every response carries `Harklight-Request-Id`, an opaque ID that is safe to log
+on both sides; the server logs it with the type, status, reason and duration.
+The server closes the connection after each response.
 
-| Role | Accepts | Refuses with `wrong_connection_role` |
+## Device stream
+
+Every device WebSocket is the device's change stream. Its `101` upgrade
+response carries `Harklight-Connection-Id`, an opaque ID that the server also
+logs at open and close. Opening a WebSocket closes only the device's earlier
+WebSocket sessions; client API requests are never closed by it. Revoking or
+removing the device closes its stream.
+
+Every server-initiated close of a stream sends a WebSocket close frame first,
+with the reason token as its reason text:
+
+| Code | Reason | When |
 |---|---|---|
-| `stream` | `resync`, `ack`, `conversation_open`, `conversation_ack`, `inbox_start`, `inbox_page`, `inbox_reconcile`, `inbox_receipts`, `inbox_checkpoint_ack`, `inbox_attach`, `focus_report` | every other frame type, including `inbox_list`, `conversation_page`, `view_get` and every mutation |
-| `request` | every other frame type: reads (`inbox_list`, `conversation_page`, `view_get`, `levels_get`) and mutations (`message_open`, `conversation_read`, `answer`, `discussion`, `levels_set`, `push_register` and the rest) | the stream frames above |
+| 4409 | `superseded_by_new_stream` | A newer stream of the same device opened |
+| 4403 | `device_revoked` | The device was revoked or removed |
+| 4408 | `idle_timeout` | Reserved; there is no idle timeout today |
+| 1001 | `server_shutdown` | The device listener stopped |
+| 1002 | `protocol_error` | A frame could not be decoded |
 
-A refusal uses the existing error envelope and echoes `ref`. A request
-connection never enters snapshot paging mode, holds no cursor, receives no
-change notices and leaves the device's focus state alone, so the paging
-checkpoint never refuses its mutations. Replies stay display-only and carry
-`view_rev` as described above. Uploads use the separate upload endpoint and are
-attached by a mutation on a request connection.
-
-Opening a stream, declared or legacy, closes the device's earlier stream
-connections. Opening a request connection closes nothing. Revoking or removing
-the device closes every connection of the device.
-
-Before the server closes a connection that declared a role, it sends a WebSocket
-close frame whose reason is one of these tokens:
-
-| Reason | Status | When |
-|---|---|---|
-| `superseded_by_new_stream` | 4409 | A newer stream of the same device opened |
-| `device_revoked` | 4403 | The device was revoked or removed |
-| `server_shutdown` | 1001 | The device listener stopped |
-| `idle_timeout` | 4408 | Reserved; the server has no idle timeout today |
-| `protocol_error` | 1002 | A frame could not be decoded |
-
-Legacy connections close as before, without a close frame.
+A socket that still sends reads and mutations keeps working as before.

@@ -41,7 +41,7 @@ defmodule AttentionServer.Relay do
     Store
   }
 
-  alias AttentionServer.ConnectionRole
+  alias AttentionServer.DeviceConnection
 
   @browser_frame_types ~w(
                           inbox_start inbox_page inbox_reconcile inbox_receipts
@@ -670,18 +670,29 @@ defmodule AttentionServer.Relay do
       )
 
   @doc """
-  Opens a WebSocket device session with a connection role. `:legacy` behaves
-  exactly as `open_websocket_session/4`. Returns the session and its
-  server-issued connection ID.
+  Opens a WebSocket device session under the connection ID already sent to the
+  client in its upgrade response.
   """
-  def open_websocket_session(server, verified_key, socket, listener, role)
-      when role in [:legacy, :stream, :request],
+  def open_websocket_session(server, verified_key, socket, listener, connection_id)
+      when is_binary(connection_id),
       do:
         GenServer.call(
           server,
-          {:open_session, verified_key, self(), socket, listener, :websocket, role},
+          {:open_session, verified_key, self(), socket, listener, :websocket, connection_id},
           :infinity
         )
+
+  @doc "True while the `client_api` feature flag enables `POST /client/v1`."
+  def client_api_enabled?(server),
+    do: GenServer.call(server, :client_api_enabled?, :infinity)
+
+  @doc """
+  Serves one device frame from `POST /client/v1` without a session: no session
+  entry, cursor, paging mode or checkpoint gate, and no effect on any other
+  connection. Returns the reply lines the device socket would send.
+  """
+  def client_request(server, verified_key, line),
+    do: GenServer.call(server, {:client_request, verified_key, line}, :infinity)
 
   def open_browser_recipient(
         server,
@@ -1154,6 +1165,28 @@ defmodule AttentionServer.Relay do
 
   defp dispatch_call(:enable_push, _from, state),
     do: {:reply, :ok, %{state | push_enabled: true}}
+
+  defp dispatch_call(:client_api_enabled?, _from, state) do
+    {enabled, state} = client_api_enabled(state)
+    {:reply, enabled, state}
+  end
+
+  defp dispatch_call({:client_request, key, raw}, _from, state) do
+    case client_api_enabled(state) do
+      {false, state} ->
+        {:reply, {:error, :not_found}, state}
+
+      {true, state} ->
+        case Engine.authorized_person(state.store.engine, key) do
+          {:ok, _person} ->
+            {reply, next} = serve_client_request(state, key, raw)
+            {:reply, reply, next}
+
+          _ ->
+            {:reply, {:error, :forbidden}, state}
+        end
+    end
+  end
 
   defp dispatch_call({:claim_push, now_ms}, _from, state) when is_integer(now_ms) do
     case Engine.claim_push(state.store.engine, now_ms) do
@@ -2991,17 +3024,15 @@ defmodule AttentionServer.Relay do
   end
 
   defp dispatch_call({:open_session, key, owner, socket, listener, transport}, from, state) do
-    case dispatch_call(
-           {:open_session, key, owner, socket, listener, transport, :legacy},
-           from,
-           state
-         ) do
-      {:reply, {:ok, id, _connection_id}, next} -> {:reply, {:ok, id}, next}
-      other -> other
-    end
+    open = {:open_session, key, owner, socket, listener, transport, nil}
+    dispatch_call(open, from, state)
   end
 
-  defp dispatch_call({:open_session, key, owner, socket, listener, transport, role}, _from, state) do
+  defp dispatch_call(
+         {:open_session, key, owner, socket, listener, transport, connection_id},
+         _from,
+         state
+       ) do
     admission =
       if is_nil(listener) or Map.has_key?(state.tls_listeners, listener),
         do: Engine.acknowledged_cursor(state.store.engine, key),
@@ -3009,15 +3040,12 @@ defmodule AttentionServer.Relay do
 
     case admission do
       {:ok, cursor} ->
-        # A new stream (declared or legacy) supersedes only the device's earlier
-        # streams. A request connection displaces nothing.
-        state =
-          if role == :request,
-            do: state,
-            else: fence_stream_sessions(state, key)
-
+        # Every device session is a stream; a new one supersedes the device's
+        # earlier streams. Client API requests hold no session and are never
+        # fenced here.
+        state = fence_sessions(state, key, :superseded_by_new_stream)
         id = make_ref()
-        connection_id = ConnectionRole.new_connection_id()
+        connection_id = connection_id || DeviceConnection.new_connection_id()
 
         session = %{
           key: key,
@@ -3041,14 +3069,13 @@ defmodule AttentionServer.Relay do
           view_last_notice_at: nil,
           levels_support: false,
           levels_notice: false,
-          role: role,
           connection_id: connection_id
         }
 
         next = %{state | sessions: Map.put(state.sessions, id, session)}
-        ConnectionRole.log(:open, session)
+        DeviceConnection.log_connection(:open, session)
 
-        {:reply, {:ok, id, connection_id}, next}
+        {:reply, {:ok, id}, next}
 
       error ->
         {:reply, error, state}
@@ -3096,8 +3123,7 @@ defmodule AttentionServer.Relay do
           socket: nil,
           listener: nil,
           transport: :browser,
-          role: :legacy,
-          connection_id: ConnectionRole.new_connection_id()
+          connection_id: DeviceConnection.new_connection_id()
         })
 
       recipients =
@@ -3502,9 +3528,6 @@ defmodule AttentionServer.Relay do
             browser_type not in @browser_frame_types ->
           {:reply, {:ok, [error_line(raw, "unknown_type")]}, state}
 
-        reason = role_refusal(session, browser_type) ->
-          {:reply, {:ok, [error_line(raw, reason)]}, state}
-
         true ->
           case JSON.decode_line(raw) do
             {:ok, %{"type" => "inbox_start"} = frame}
@@ -3535,9 +3558,6 @@ defmodule AttentionServer.Relay do
     cond do
       session.transport == :browser and is_binary(type) and type not in @browser_frame_types ->
         {{:ok, [error_line(frame, "unknown_type")]}, state}
-
-      reason = role_refusal(session, type) ->
-        {{:ok, [error_line(frame, reason)]}, state}
 
       type == "inbox_start" and session.transport in [:websocket, :browser] ->
         inbox_start_call(state, id, session, frame, from)
@@ -3596,26 +3616,8 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  # A role refusal is logged with the connection ID; legacy connections are
-  # never refused here.
-  defp role_refusal(session, type) do
-    case ConnectionRole.refusal(Map.get(session, :role, :legacy), type) do
-      nil ->
-        nil
-
-      reason ->
-        ConnectionRole.log(:refused, session, frame_type: type, reason: reason)
-        reason
-    end
-  end
-
-  # Levels change notices belong to the stream. A request connection reads and
-  # sets levels without subscribing to their notices.
-  defp levels_supported(%{role: :request} = session), do: session
-  defp levels_supported(session), do: %{session | levels_support: true}
-
   defp levels_session_request_frame(state, id, session, frame) do
-    session = levels_supported(session)
+    session = %{session | levels_support: true}
     state = put_session(state, id, session)
 
     case session_mutation_state_value(state, session, frame) do
@@ -4322,13 +4324,12 @@ defmodule AttentionServer.Relay do
       view_last_notice_at: nil,
       levels_support: false,
       levels_notice: false,
-      role: :legacy,
       connection_id: nil
     }
   end
 
   defp levels_session_request(state, id, session, raw) do
-    session = levels_supported(session)
+    session = %{session | levels_support: true}
     state = put_session(state, id, session)
 
     case session_mutation_state(state, session, raw) do
@@ -7281,6 +7282,9 @@ defmodule AttentionServer.Relay do
 
   defp line(frame), do: JSON.encode_line(frame)
 
+  # A client API request has no session to store.
+  defp put_session(state, nil, _session), do: state
+
   defp put_session(state, id, session) do
     state = %{state | sessions: Map.put(state.sessions, id, session)}
 
@@ -7328,18 +7332,10 @@ defmodule AttentionServer.Relay do
     end)
   end
 
-  # Device revocation or removal closes every connection of the device.
-  defp fence_sessions(state, key) do
+  # Device revocation or removal closes every stream of the device.
+  defp fence_sessions(state, key, reason \\ :device_revoked) do
     Enum.reduce(state.sessions, state, fn {id, session}, acc ->
-      if session.key == key, do: drop_session(acc, id, :device_revoked), else: acc
-    end)
-  end
-
-  defp fence_stream_sessions(state, key) do
-    Enum.reduce(state.sessions, state, fn {id, session}, acc ->
-      if session.key == key and Map.get(session, :role, :legacy) != :request,
-        do: drop_session(acc, id, :superseded_by_new_stream),
-        else: acc
+      if session.key == key, do: drop_session(acc, id, reason), else: acc
     end)
   end
 
@@ -7806,9 +7802,8 @@ defmodule AttentionServer.Relay do
         state
 
       {session, sessions} ->
-        role = Map.get(session, :role, :legacy)
         if session.owner, do: send(session.owner, {:attention_fenced, id})
-        close_frame? = close_frame?(session, role, reason)
+        close_frame? = close_frame?(session, reason)
 
         # Removing the session fences all serialized requests and writes.
         # TLS close can wait on the peer; keep that wait out of the shared Relay.
@@ -7818,38 +7813,31 @@ defmodule AttentionServer.Relay do
         state = %{state | sessions: sessions}
         state = cancel_socket_write(state, session.socket, {:error, :fenced})
 
-        # A connection that declared a role learns why the server closed it:
-        # the close frame goes out before the transport closes.
+        # A WebSocket learns why the server closed it: the close frame goes out
+        # before the transport closes.
         if close_frame?, do: close_with_reason(session.socket, reason)
+        DeviceConnection.log_connection(:close, session, reason: reason || :connection_ended)
 
-        ConnectionRole.log(:close, session, reason: reason || :connection_ended)
-
-        cond do
-          session.transport == :browser ->
-            recipient_ref = {session.browser_session_id, session.recipient}
-            saved = %{connection_id: nil, session: %{session | owner: nil}}
-            %{state | browser_recipients: Map.put(state.browser_recipients, recipient_ref, saved)}
-
-          # Focus belongs to the device's stream; a request connection ending
-          # leaves it in place.
-          role == :request ->
-            state
-
-          true ->
-            end_focus(state, session.key)
+        if session.transport == :browser do
+          recipient_ref = {session.browser_session_id, session.recipient}
+          saved = %{connection_id: nil, session: %{session | owner: nil}}
+          %{state | browser_recipients: Map.put(state.browser_recipients, recipient_ref, saved)}
+        else
+          end_focus(state, session.key)
         end
     end
   end
 
-  defp close_frame?(session, role, reason) do
+  defp close_frame?(session, reason) do
     not is_nil(session.socket) and session.transport == :websocket and
-      ConnectionRole.explicit?(role) and reason in ConnectionRole.close_reasons()
+      reason in DeviceConnection.close_reasons()
   end
 
   @close_frame_wait_ms 1_000
 
   defp close_with_reason(socket, reason) do
-    bytes = AttentionServer.WebSocketRelay.encode_close(ConnectionRole.close_code(reason), reason)
+    bytes =
+      AttentionServer.WebSocketRelay.encode_close(DeviceConnection.close_code(reason), reason)
 
     spawn(fn ->
       parent = self()
@@ -7868,6 +7856,44 @@ defmodule AttentionServer.Relay do
 
       AttentionServer.SessionWriter.close(socket)
     end)
+  end
+
+  defp client_api_enabled(state) do
+    {flags, warned} =
+      AttentionServer.FeatureFlags.read(state.feature_flags_path, state.feature_flags_warned)
+
+    {Map.get(flags, "client_api") == true, %{state | feature_flags_warned: warned}}
+  end
+
+  # The sessionless context of one client API request. It is never stored, so
+  # it holds no cursor, never enters paging mode and is never gated by a
+  # paging checkpoint.
+  defp client_context(key) do
+    %{
+      empty_browser_session(key)
+      | transport: :client,
+        focus_opted_in: false
+    }
+  end
+
+  defp serve_client_request(state, key, raw) do
+    case JSON.decode_line(raw) do
+      {:ok, %{"type" => type} = frame} when is_binary(type) ->
+        cond do
+          type not in DeviceConnection.client_types() ->
+            {{:ok, [error_line(frame, "wrong_endpoint")]}, state}
+
+          type in ["inbox_list", "conversation_page", "view_get"] ->
+            special_request(state, nil, client_context(key), frame)
+
+          true ->
+            {reply, next} = request(state, key, raw)
+            {wrap_line(reply), next}
+        end
+
+      _ ->
+        {{:ok, [error_line(%{}, "bad_frame")]}, state}
+    end
   end
 
   defp drop_browser_connection(state, id, :replaced) do

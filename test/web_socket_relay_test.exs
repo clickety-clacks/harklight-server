@@ -150,6 +150,25 @@ defmodule AttentionServer.WebSocketRelayTest do
     {opcode, payload}
   end
 
+  # A server-initiated close sends its close frame first. Only a stalled peer
+  # may see it cut short (the send is bounded), so that case accepts a prefix.
+  defp assert_closed_with_reason(socket, code, reason, match \\ :exact) do
+    expected = IO.iodata_to_binary(WebSocketRelay.encode_close(code, String.to_atom(reason)))
+    received = read_until_closed(socket, <<>>)
+
+    case match do
+      :exact -> assert received == expected
+      :prefix -> assert String.starts_with?(expected, received)
+    end
+  end
+
+  defp read_until_closed(socket, buffer) do
+    case :ssl.recv(socket, 0, 2_000) do
+      {:ok, bytes} -> read_until_closed(socket, buffer <> bytes)
+      {:error, :closed} -> buffer
+    end
+  end
+
   defp reply(socket) do
     assert {1, line} = recv_frame(socket)
     assert {:ok, value} = JSON.decode_line(line)
@@ -1873,7 +1892,7 @@ defmodule AttentionServer.WebSocketRelayTest do
         assert %{"type" => "resynced", "seq" => 0} = reply(replacement)
         assert {:error, :unknown_session} = Relay.session_drain(relay, old_session)
         :sys.resume(peer)
-        assert {:error, :closed} = :ssl.recv(old_socket, 0, 2_000)
+        assert_closed_with_reason(old_socket, 4409, "superseded_by_new_stream", :prefix)
       after
         try do
           :sys.resume(peer)
@@ -1903,7 +1922,7 @@ defmodule AttentionServer.WebSocketRelayTest do
     before = :sys.get_state(relay).store.engine
 
     assert :ok = GenServer.stop(web)
-    assert {:error, :closed} = :ssl.recv(socket, 2, 2_000)
+    assert_closed_with_reason(socket, 1001, "server_shutdown")
 
     _ =
       send_request(socket, %{
