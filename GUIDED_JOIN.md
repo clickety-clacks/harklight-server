@@ -6,7 +6,7 @@ commands. See SELF_HOST.md for installation and dashboard setup.
 The authenticated owner creates a person-bound invitation. The app keeps its
 fresh device private key and submits a public certificate. Redemption creates a
 pending request; the current owner separately approves its exact code, SPKI and
-deadline with empty sender grants. Existing enrollment status and current relay
+deadline, optionally naming sender grants. Existing enrollment status and current relay
 TLS proof complete the server side of the flow.
 
 ## Operator configuration and owner commands
@@ -32,7 +32,7 @@ Use a private destination directory. The invitation command creates a new
 private file and displays its path and expiry, keeping its bearer token out of
 terminal output. Approval and decline display the stored label, exact public-key
 fingerprint and deadline and require the deliberate `APPROVE` or `DECLINE` input.
-Guided approval refuses nonempty `--senders`. These commands use the existing
+Guided approval accepts the owner's optional `--senders`, as manual approval does. These commands use the existing
 owner certificate authority boundary. The optional dashboard provides the
 same current-owner review and approval operations; see SELF_HOST.md.
 

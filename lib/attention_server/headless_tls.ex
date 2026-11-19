@@ -9,7 +9,9 @@ defmodule AttentionServer.HeadlessTLS do
   alias AttentionServer.JSON
 
   @max_http 64 * 1024
-  @max_agent_http 6 * 1024 * 1024
+  # Agent replies carry whole messages; the page size stops at 4 MiB only after
+  # its first item, so one large message can exceed any small fixed size.
+  @max_agent_http 64 * 1024 * 1024
 
   def certificate_lifecycle(certificate) do
     case System.cmd("openssl", ["x509", "-checkend", "2592000", "-noout", "-in", certificate],

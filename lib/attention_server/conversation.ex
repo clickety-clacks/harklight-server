@@ -634,7 +634,7 @@ defmodule AttentionServer.Conversation do
       end) and
       Enum.all?(engine.origin_actions, fn {{person, origin, seq}, action} ->
         actionable?(get_in(engine.origin_feeds, [{person, origin}, :entries, seq])) and
-          Message.uuid_v4?(action.op_id) and is_integer(action.at)
+          Message.uuid?(action.op_id) and is_integer(action.at)
       end)
   rescue
     _ -> false

@@ -219,7 +219,7 @@ harklight-agent --identity-dir ./harklight-agent-identity \
           key,
           deadline,
           "Approve this exact device",
-          request[:can_grant_senders] == true
+          true
         ) <>
         action_form(code, "decline", key, deadline, "Decline") <>
         ~s(</section><p><a href="/devices">Back to devices</a></p>)

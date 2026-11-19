@@ -473,7 +473,7 @@ defmodule AttentionServer.EnrollmentHTTPS do
          ~w(label public_certificate status_secret)
        ] and
          ((is_nil(label) and not Map.has_key?(request, "label")) or
-            (is_binary(label) and byte_size(label) in 1..256)) do
+            (is_binary(label) and byte_size(label) >= 1)) do
       with {:ok, der} <- certificate_der(pem),
            {:ok, _key} <- DeviceIdentity.from_certificate(der),
            {:ok, result} <-

@@ -699,17 +699,11 @@ defmodule AttentionServer.DashboardReadHTTP do
         {:ok, %{"key" => key, "deadline" => deadline} = fields, conn} ->
           with true <- Regex.match?(~r/\A[0-9a-f]{64}\z/, key),
                {:ok, deadline} <- parse_deadline(deadline),
-               {:ok, %{key: ^key, expires_at: ^deadline} = request} <-
+               {:ok, %{key: ^key, expires_at: ^deadline}} <-
                  backend_call(opts.backend, :review_pending, {principal, code}),
-               true <-
-                 not Map.has_key?(fields, "senders") or
-                   (action == "approve" and request[:can_grant_senders] == true),
+               true <- not Map.has_key?(fields, "senders") or action == "approve",
                operation <- if(action == "approve", do: :approve_pending, else: :decline_pending),
-               senders <-
-                 if(request[:can_grant_senders] == true,
-                   do: String.split(Map.get(fields, "senders", ""), ",", trim: true),
-                   else: []
-                 ),
+               senders <- String.split(Map.get(fields, "senders", ""), ",", trim: true),
                arguments <-
                  if(action == "approve",
                    do: {principal, code, key, deadline, senders},

@@ -858,12 +858,12 @@ defmodule AttentionServer.Engine do
 
   defp hosted_account_ref?(ref),
     do:
-      is_binary(ref) and byte_size(ref) in 1..256 and String.valid?(ref) and
+      is_binary(ref) and byte_size(ref) >= 1 and String.valid?(ref) and
         not Regex.match?(~r/[\s\p{C}]/u, ref)
 
   defp hosted_label?(label),
     do:
-      is_binary(label) and byte_size(label) in 1..256 and String.valid?(label) and
+      is_binary(label) and byte_size(label) >= 1 and String.valid?(label) and
         String.trim(label) != "" and not Regex.match?(~r/\p{C}/u, label)
 
   @doc "Local-operator recovery preserves person identity and retires the old key forever."
@@ -1329,8 +1329,7 @@ defmodule AttentionServer.Engine do
            %{
              label: item.label,
              key: item.key,
-             expires_at: item.expires_at,
-             can_grant_senders: is_nil(Map.get(item, :person))
+             expires_at: item.expires_at
            }}
 
         %{state: :approved, person: ^person, approved_by: ^owner_key} ->
@@ -1363,16 +1362,13 @@ defmodule AttentionServer.Engine do
          true <-
            is_list(senders) and length(senders) <= 32 and
              Enum.all?(senders, fn sender ->
-               Message.sender_id?(sender) and byte_size(sender) <= 256
+               Message.sender_id?(sender)
              end),
          item when not is_nil(item) <-
            Map.get(engine.pending_enrollments, code) || Map.get(engine.pending_history, code) do
       cond do
         not is_nil(Map.get(item, :person)) and item.person != person ->
           {:error, :not_found}
-
-        not is_nil(Map.get(item, :person)) and item.state == :pending and senders != [] ->
-          {:error, :invalid_senders}
 
         item.key != expected_key or item.expires_at != expected_expires_at ->
           {:error, :not_found}
@@ -1590,7 +1586,7 @@ defmodule AttentionServer.Engine do
   def owner_grant_sender(%__MODULE__{} = engine, person, owner_key, device_key, pattern) do
     with {:ok, _revision} <- owner_revision(engine, person, owner_key),
          %{person: ^person, revoked: false} <- Map.get(engine.devices, device_key),
-         true <- Message.sender_id?(pattern) and byte_size(pattern) <= 256 do
+         true <- Message.sender_id?(pattern) do
       setup_sender(engine, device_key, pattern)
     else
       {:error, :forbidden} -> {:error, :forbidden}
@@ -1602,7 +1598,7 @@ defmodule AttentionServer.Engine do
   def owner_revoke_sender(%__MODULE__{} = engine, person, owner_key, device_key, pattern) do
     with {:ok, _revision} <- owner_revision(engine, person, owner_key),
          %{person: ^person} <- Map.get(engine.devices, device_key),
-         true <- Message.sender_id?(pattern) and byte_size(pattern) <= 256 do
+         true <- Message.sender_id?(pattern) do
       grants = Map.get(engine.sender_grants, {person, device_key}, MapSet.new())
 
       if MapSet.member?(grants, pattern) do
@@ -2560,7 +2556,7 @@ defmodule AttentionServer.Engine do
   @doc "System handoff acknowledgment, independent of the agent's Seen receipt."
   def origin_ack2(%__MODULE__{} = engine, key, feed_seq, frame) do
     with {:ok, person} <- authorized_person(engine, key),
-         true <- Message.uuid_v4?(frame["op_id"]),
+         true <- Message.uuid?(frame["op_id"]),
          true <- valid_delivery_ack2?(frame),
          entry when not is_nil(entry) <-
            get_in(engine.origin_feeds, [{person, key}, :entries, feed_seq]),
@@ -2754,7 +2750,7 @@ defmodule AttentionServer.Engine do
   @doc "One origin-session file-use report after a delivered person turn."
   def origin_file_use(%__MODULE__{} = engine, key, feed_seq, name, outcome, op_id) do
     with {:ok, person} <- authorized_person(engine, key),
-         true <- Message.uuid_v4?(op_id),
+         true <- Message.uuid?(op_id),
          {:ok, next, reply} <- Conversation.file_use(engine, person, key, feed_seq, name, outcome) do
       if next == engine do
         {:ok, next, reply}
@@ -2796,7 +2792,7 @@ defmodule AttentionServer.Engine do
   @doc "Store the origin's explicit route/support statement for its own session handle."
   def origin_support(%__MODULE__{} = engine, key, frame) do
     with {:ok, person} <- authorized_person(engine, key),
-         true <- Message.uuid_v4?(frame["op_id"]),
+         true <- Message.uuid?(frame["op_id"]),
          true <- Message.uuid_v4?(frame["session_handle"]),
          {:ok, declared} when is_map(declared) <- Conversation.support_from_frame(frame) do
       semantic =
@@ -2847,7 +2843,7 @@ defmodule AttentionServer.Engine do
   @doc "Update only the current vendor attachment for an existing origin session handle."
   def origin_attachment_update(%__MODULE__{} = engine, key, frame) do
     with {:ok, person} <- authorized_person(engine, key),
-         true <- Message.uuid_v4?(frame["op_id"]),
+         true <- Message.uuid?(frame["op_id"]),
          true <- Map.has_key?(frame, "vendor_session_id"),
          true <-
            Conversation.valid_session?(frame["session_handle"], frame["vendor_session_id"]),
@@ -3838,7 +3834,7 @@ defmodule AttentionServer.Engine do
        else: :ok
   end
 
-  defp bounded_text?(value), do: is_binary(value) and byte_size(value) in 1..256
+  defp bounded_text?(value), do: is_binary(value) and byte_size(value) >= 1
 
   defp subscribe_remote(engine, %{person: person, key: device}, frame) do
     with :ok <- valid_op(frame),
@@ -4738,8 +4734,8 @@ defmodule AttentionServer.Engine do
   defp discussion(engine, %{person: person, key: actor}, frame) do
     with :ok <- valid_op(frame),
          :ok <- valid_global_id(frame),
-         :ok <- valid_conversation_text(frame),
          {:ok, files} <- ConversationFiles.normalize(frame, engine, person, actor),
+         {:ok, frame} <- conversation_text(frame, files),
          true <- is_integer(frame["request_revision"]) and frame["request_revision"] >= 1 do
       semantic =
         frame
@@ -4819,8 +4815,8 @@ defmodule AttentionServer.Engine do
   defp conversation_reply(engine, %{person: person, key: actor}, frame) do
     with :ok <- valid_op(frame),
          :ok <- valid_global_id(frame),
-         :ok <- valid_conversation_text(frame),
          {:ok, files} <- ConversationFiles.normalize(frame, engine, person, actor),
+         {:ok, frame} <- conversation_text(frame, files),
          true <- is_integer(frame["in_reply_to"]) and frame["in_reply_to"] > 0,
          true <- is_integer(frame["request_revision"]) and frame["request_revision"] > 0 do
       semantic =
@@ -4935,11 +4931,17 @@ defmodule AttentionServer.Engine do
     end
   end
 
-  defp valid_conversation_text(%{"text" => text}) when is_binary(text) do
-    if text != "" and String.valid?(text), do: :ok, else: {:error, "text"}
+  # A turn needs text or files; a turn with files may leave the text empty or absent.
+  defp conversation_text(%{"text" => text} = frame, files) when is_binary(text) do
+    if String.valid?(text) and (text != "" or files != []),
+      do: {:ok, frame},
+      else: {:error, "text"}
   end
 
-  defp valid_conversation_text(_), do: {:error, "text"}
+  defp conversation_text(frame, files) when files != [] and not is_map_key(frame, "text"),
+    do: {:ok, Map.put(frame, "text", "")}
+
+  defp conversation_text(_frame, _files), do: {:error, "text"}
 
   defp conversation_revise(engine, %{person: person, key: actor} = principal, frame) do
     with :ok <- Message.validate_present_message_type(frame["message"]),
@@ -5481,7 +5483,7 @@ defmodule AttentionServer.Engine do
   end
 
   defp valid_op(%{"op_id" => value}) do
-    if Message.uuid_v4?(value), do: :ok, else: {:error, "op_id"}
+    if Message.uuid?(value), do: :ok, else: {:error, "op_id"}
   end
 
   defp valid_op(_), do: {:error, "op_id"}

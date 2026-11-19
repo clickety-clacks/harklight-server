@@ -139,7 +139,7 @@ defmodule AttentionServer.Diagnostics do
       )
       when operation in @operations and phase in @phases and outcome in @outcomes do
     cause = cause_class(reason)
-    op_field = if Message.uuid_v4?(operation_id), do: " operation_id=#{operation_id}", else: ""
+    op_field = if Message.uuid?(operation_id), do: " operation_id=#{operation_id}", else: ""
 
     Logger.warning(
       "event=harklight_failure operation=#{operation} phase=#{phase} cause=#{cause} outcome=#{outcome}#{op_field}"

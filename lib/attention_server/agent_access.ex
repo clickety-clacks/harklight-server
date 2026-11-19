@@ -15,7 +15,7 @@ defmodule AttentionServer.AgentAccess do
     is_list(patterns) and length(patterns) <= 100 and
       length(Enum.uniq(patterns)) == length(patterns) and
       Enum.all?(patterns, fn pattern ->
-        is_binary(pattern) and byte_size(pattern) <= 256 and Message.sender_id?(pattern)
+        is_binary(pattern) and Message.sender_id?(pattern)
       end)
   end
 
@@ -149,7 +149,7 @@ defmodule AttentionServer.AgentAccess do
       not is_nil(contains) and (not is_binary(contains) or byte_size(contains) > 1_024) ->
         {:error, "invalid_request"}
 
-      not is_integer(limit) or limit < 1 or limit > 100 ->
+      not is_integer(limit) or limit < 1 ->
         {:error, "invalid_request"}
 
       not is_nil(cursor) and (not is_binary(cursor) or byte_size(cursor) > 4_096) ->
@@ -158,7 +158,7 @@ defmodule AttentionServer.AgentAccess do
       true ->
         {:ok,
          %{"sender_id" => sender, "message_id" => id, "state" => state, "contains" => contains},
-         limit, cursor}
+         min(limit, 100), cursor}
     end
   end
 

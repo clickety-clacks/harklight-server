@@ -163,18 +163,6 @@ defmodule AttentionServer.GuidedJoinTest do
                2
              )
 
-    assert {:error, :invalid_senders} =
-             Engine.pending_approve(
-               pending,
-               @person,
-               c.owner_key,
-               @code,
-               c.device_key,
-               deadline,
-               ["app:unrequested"],
-               2
-             )
-
     assert {:ok, approved, key} =
              Engine.pending_approve(
                pending,
@@ -191,6 +179,27 @@ defmodule AttentionServer.GuidedJoinTest do
     assert approved.devices[key].person == @person
     assert MapSet.size(Map.get(approved.sender_grants, {@person, key}, MapSet.new())) == 0
     assert {:ok, %{"state" => "approved"}} = Engine.pending_status(approved, c.secret_hash)
+  end
+
+  test "owner may name sender grants when approving a guided request", c do
+    {:ok, engine, _} = create(c)
+    {:ok, pending, reply} = redeem(c, engine, c.config, 1)
+
+    assert {:ok, approved, key} =
+             Engine.pending_approve(
+               pending,
+               @person,
+               c.owner_key,
+               @code,
+               c.device_key,
+               reply["expires_at"],
+               ["app:chosen-by-owner"],
+               2
+             )
+
+    assert MapSet.to_list(Map.fetch!(approved.sender_grants, {@person, key})) == [
+             "app:chosen-by-owner"
+           ]
   end
 
   test "exact owner decline is terminal and truthfully visible without enrolling a device", c do
@@ -472,9 +481,9 @@ defmodule AttentionServer.GuidedJoinTest do
     Store.close(restarted)
   end
 
-  test "device label is bounded on submission and on durable snapshot acceptance", c do
+  test "device metadata is validated on durable snapshot acceptance, with no label length cap", c do
     {:ok, engine, _} = create(c)
-    label = String.duplicate("x", 256)
+    label = String.duplicate("x", 1_024)
 
     {:ok, pending, reply} =
       GuidedJoin.redeem(engine, c.token_hash, c.device, label, c.secret_hash, @code, c.config)
@@ -493,17 +502,6 @@ defmodule AttentionServer.GuidedJoinTest do
 
     assert approved.devices[key].label == label
 
-    assert {:error, :invalid_request} =
-             GuidedJoin.redeem(
-               engine,
-               c.token_hash,
-               c.device,
-               label <> "x",
-               c.secret_hash,
-               @code,
-               c.config
-             )
-
     path = database_path()
     {:ok, store} = Store.open(path)
 
@@ -514,7 +512,7 @@ defmodule AttentionServer.GuidedJoinTest do
         action: "bounded_label"
       })
 
-    for bad <- [%{label: label <> "x"}, %{enrolled_at: -1}, %{enrolled_at: "invented"}] do
+    for bad <- [%{label: ""}, %{enrolled_at: -1}, %{enrolled_at: "invented"}] do
       record = Map.merge(approved.devices[key], bad)
       invalid = %{approved | devices: Map.put(approved.devices, key, record)}
 
