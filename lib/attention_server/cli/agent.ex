@@ -120,7 +120,7 @@ defmodule AttentionServer.CLI.Agent do
     intent = required!(opts, :intent_ref)
     answer_file = required!(opts, :answer_file)
 
-    unless Message.sender_id?(sender) and Message.uuid_v4?(op) and is_integer(acceptance) and
+    unless Message.sender_id?(sender) and Message.uuid?(op) and is_integer(acceptance) and
              acceptance > 0,
            do: AttentionServer.CLI.error!("invalid exact answer target or operation ID")
 

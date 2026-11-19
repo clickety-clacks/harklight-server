@@ -2023,7 +2023,7 @@ defmodule AttentionServer.OriginHTTPSTest do
     end
   end
 
-  test "origin stream covers explicitly declared handles and replaces independently", c do
+  test "origin stream covers explicitly declared handles; concurrent origin streams all get notices", c do
     {:ok, stream} = socket(c, "a2")
 
     :ok =
@@ -2035,12 +2035,17 @@ defmodule AttentionServer.OriginHTTPSTest do
     assert {:ok, initial} = recv_until(stream, "data: {\"cursor\":0}\n\n", <<>>, 20)
     assert initial =~ "event: change"
 
-    assert {:ok, 200, %{"reason" => "already_listening"}} =
-             raw_request(
-               c,
-               "a2",
-               "GET /origin/v1/stream?scope=origin HTTP/1.1\r\nHost: relay.test\r\n\r\n"
-             )
+    # Any number of origin streams may be attached at once; none is refused.
+    {:ok, second} = socket(c, "a2")
+
+    :ok =
+      :ssl.send(
+        second,
+        "GET /origin/v1/stream?scope=origin HTTP/1.1\r\nHost: relay.test\r\n\r\n"
+      )
+
+    assert {:ok, second_initial} = recv_until(second, "data: {\"cursor\":0}\n\n", <<>>, 20)
+    assert second_initial =~ "event: change"
 
     for option <- ["session=" <> @handle, "advisory_v1=1", "sender=app:test", "reconnect=0"] do
       assert {:ok, 400, %{"reason" => "invalid_field"}} =
@@ -2076,6 +2081,9 @@ defmodule AttentionServer.OriginHTTPSTest do
     assert notice =~ "event: coverage\ndata: {}"
     refute notice =~ @handle
 
+    assert {:ok, second_notice} = recv_until(second, "data: {\"cursor\":1}\n\n", <<>>, 20)
+    assert second_notice =~ "event: coverage\ndata: {}"
+
     assert {:ok, 200, %{"session_handles" => [@handle]}} =
              request(c, "a2", %{"v" => 1, "type" => "coverage"})
 
@@ -2098,22 +2106,26 @@ defmodule AttentionServer.OriginHTTPSTest do
              })
 
     assert {:ok, "event: coverage\ndata: {}\n\n"} = recv_until(stream, "\n\n", <<>>, 20)
+    assert {:ok, "event: coverage\ndata: {}\n\n"} = recv_until(second, "\n\n", <<>>, 20)
 
     assert {:ok, 200, %{"availability" => "not_listening", "cursor" => 1}} =
              request(c, "a2", %{"v" => 1, "type" => "status", "session_handle" => @handle})
 
-    {:ok, replacement} = socket(c, "a2")
+    # A third stream, even one that says it reconnects, displaces nothing.
+    {:ok, third} = socket(c, "a2")
 
     :ok =
       :ssl.send(
-        replacement,
+        third,
         "GET /origin/v1/stream?scope=origin&reconnect=1 HTTP/1.1\r\nHost: relay.test\r\n\r\n"
       )
 
-    assert {:ok, _} = recv_until(replacement, "data: {\"cursor\":1}\n\n", <<>>, 20)
-    assert {:ok, "event: replaced\ndata: {}\n\n"} = :ssl.recv(stream, 0, 5000)
-    assert {:error, :closed} = :ssl.recv(stream, 0, 5000)
-    :ssl.close(replacement)
+    assert {:ok, _} = recv_until(third, "data: {\"cursor\":1}\n\n", <<>>, 20)
+    assert {:error, :timeout} = :ssl.recv(stream, 0, 200)
+    assert {:error, :timeout} = :ssl.recv(second, 0, 200)
+    :ssl.close(third)
+    :ssl.close(second)
+    :ssl.close(stream)
   end
 
   test "SSE notices contain only cursors; authoritative fetch and session availability remain separate",
@@ -2158,9 +2170,6 @@ defmodule AttentionServer.OriginHTTPSTest do
     assert {:ok, [attached], 1} = Relay.conversation_events(c.relay, c.reader, 0)
     assert attached["kind"] == "availability"
     assert attached["availability"] == "listening"
-
-    assert {:ok, 200, %{"type" => "error", "reason" => "already_listening"}} =
-             stream_request(c, "a2", @handle)
 
     assert %{"type" => "ok", "event_id" => "2"} =
              relay_request(c.relay, c.reader, %{
@@ -2208,7 +2217,7 @@ defmodule AttentionServer.OriginHTTPSTest do
     :ssl.close(stream_again)
   end
 
-  test "explicit reconnect attaches when absent and replaces only the owned stream", c do
+  test "concurrent session streams all receive notices and detach independently", c do
     assert {:ok, 200, %{"type" => "ok"}} =
              request(c, "a2", %{
                "v" => 1,
@@ -2232,7 +2241,7 @@ defmodule AttentionServer.OriginHTTPSTest do
       :ok =
         :ssl.send(
           stream,
-          "GET /origin/v1/stream?session=#{@handle}&reconnect=1 HTTP/1.1\r\nHost: relay.test\r\n\r\n"
+          "GET /origin/v1/stream?session=#{@handle} HTTP/1.1\r\nHost: relay.test\r\n\r\n"
         )
 
       assert {:ok, initial} = recv_until(stream, "\n\n", <<>>, 20)
@@ -2241,13 +2250,15 @@ defmodule AttentionServer.OriginHTTPSTest do
       stream
     end
 
-    # No worker exists: the replacement route also performs ordinary attachment.
     first = open_stream.()
     stream_key = {c.person, c.origin, @handle}
-    old = :sys.get_state(c.relay).origin_streams[stream_key]
+    assert [%{worker: first_worker}] = :sys.get_state(c.relay).origin_streams[stream_key]
 
-    assert {:ok, 200, %{"type" => "error", "reason" => "already_listening"}} =
-             stream_request(c, "a2", @handle)
+    # A second stream of the same session is attached next to the first.
+    second = open_stream.()
+    streams = :sys.get_state(c.relay).origin_streams[stream_key]
+    assert length(streams) == 2
+    assert first_worker in Enum.map(streams, & &1.worker)
 
     assert {:ok, 200, %{"type" => "error", "reason" => "not_found"}} =
              raw_request(
@@ -2256,8 +2267,9 @@ defmodule AttentionServer.OriginHTTPSTest do
                "GET /origin/v1/stream?session=#{@handle}&reconnect=1 HTTP/1.1\r\nHost: relay.test\r\n\r\n"
              )
 
-    assert :sys.get_state(c.relay).origin_streams[stream_key].worker == old.worker
+    assert length(:sys.get_state(c.relay).origin_streams[stream_key]) == 2
 
+    # A refused attachment (store unavailable) registers nothing.
     db = :sys.get_state(c.relay).store.db
     :ok = Sqlite3.execute(db, "PRAGMA query_only=ON")
 
@@ -2269,20 +2281,10 @@ defmodule AttentionServer.OriginHTTPSTest do
                  "GET /origin/v1/stream?session=#{@handle}&reconnect=1 HTTP/1.1\r\nHost: relay.test\r\n\r\n"
                )
 
-      assert :sys.get_state(c.relay).origin_streams[stream_key] == old
+      assert length(:sys.get_state(c.relay).origin_streams[stream_key]) == 2
     after
       :ok = Sqlite3.execute(db, "PRAGMA query_only=OFF")
     end
-
-    second = open_stream.()
-    assert {:error, :closed} = :ssl.recv(first, 0, 5_000)
-    replacement = :sys.get_state(c.relay).origin_streams[stream_key]
-    refute replacement.worker == old.worker
-
-    # Both late cleanup paths must leave the new registration intact.
-    :ok = Relay.origin_stream_detach(c.relay, c.origin, @handle, old.worker)
-    send(c.relay, {:DOWN, old.monitor, :process, old.worker, :normal})
-    assert :sys.get_state(c.relay).origin_streams[stream_key] == replacement
 
     assert %{"type" => "ok", "event_id" => "2"} =
              relay_request(c.relay, c.reader, %{
@@ -2294,16 +2296,29 @@ defmodule AttentionServer.OriginHTTPSTest do
                "text" => "Still the same conversation"
              })
 
+    # Both streams get the same notice.
+    assert {:ok, _} = recv_until(first, "data: {\"cursor\":2}\n\n", <<>>, 20)
     assert {:ok, _} = recv_until(second, "data: {\"cursor\":2}\n\n", <<>>, 20)
-
-    assert {:ok, 200, %{"entries" => [%{"event_id" => "2", "session_handle" => @handle}]}} =
-             request(c, "a2", %{"v" => 1, "type" => "feed", "since" => 1})
 
     assert {:ok, 200, %{"availability" => "listening"}} =
              request(c, "a2", %{"v" => 1, "type" => "status", "session_handle" => @handle})
 
+    # Closing one leaves the session listening on the other.
+    :ssl.close(first)
+
+    assert :ok = await_stream_count(c, stream_key, 1, 100)
+
+    assert {:ok, 200, %{"availability" => "listening"}} =
+             request(c, "a2", %{"v" => 1, "type" => "status", "session_handle" => @handle})
+
+    # A stale detach or DOWN for a worker that is gone changes nothing.
+    :ok = Relay.origin_stream_detach(c.relay, c.origin, @handle, first_worker)
+    assert length(:sys.get_state(c.relay).origin_streams[stream_key]) == 1
+
+    # The last one detaching makes the session not listening.
     :ssl.close(second)
     assert :ok = await_availability(c, "not_listening", 100)
+    refute Map.has_key?(:sys.get_state(c.relay).origin_streams, stream_key)
   end
 
   test "an origin feed change wakes only that same-person origin identity's streams", c do
@@ -2921,6 +2936,17 @@ defmodule AttentionServer.OriginHTTPSTest do
       _ ->
         Process.sleep(10)
         await_seq(relay, key, seq, left - 1)
+    end
+  end
+
+  defp await_stream_count(_c, _key, _count, 0), do: {:error, :timeout}
+
+  defp await_stream_count(c, key, count, left) do
+    if length(Map.get(:sys.get_state(c.relay).origin_streams, key, [])) == count do
+      :ok
+    else
+      Process.sleep(10)
+      await_stream_count(c, key, count, left - 1)
     end
   end
 

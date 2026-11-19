@@ -277,14 +277,11 @@ defmodule AttentionServer.HeadlessDevice do
     ref = hex(:crypto.strong_rand_bytes(8))
 
     with :ok <- send_frame(socket, Map.put(frame, "ref", ref)) do
-      reply(socket, ref, 0)
+      reply(socket, ref)
     end
   end
 
-  defp reply(_socket, _ref, count) when count >= 1_024,
-    do: {:error, :too_many_live_events}
-
-  defp reply(socket, ref, count) do
+  defp reply(socket, ref) do
     case read_frame(socket) do
       {:ok, %{"ref" => ^ref, "type" => "ok"} = response} ->
         {:ok, response}
@@ -293,7 +290,7 @@ defmodule AttentionServer.HeadlessDevice do
         {:error, {:server, response}}
 
       {:ok, %{"type" => kind}} when kind in ["delivery", "lifecycle"] ->
-        reply(socket, ref, count + 1)
+        reply(socket, ref)
 
       _ ->
         {:error, :invalid_reply}

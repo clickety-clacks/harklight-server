@@ -145,7 +145,7 @@ defmodule AttentionServer.HeadlessEnrollment do
         with :ok <- upgrade(socket, endpoint.name),
              :ok <- send_resync(socket),
              {:ok, %{"type" => "ok"}} <- read_frame(socket),
-             {:ok, %{"type" => "resynced"}} <- read_barrier(socket, 0) do
+             {:ok, %{"type" => "resynced"}} <- read_barrier(socket) do
           :ok
         end
       after
@@ -233,15 +233,13 @@ defmodule AttentionServer.HeadlessEnrollment do
     with {:ok, <<size::64>>} <- :ssl.recv(socket, 8, :infinity), do: {:ok, size}
   end
 
-  defp read_barrier(_socket, count) when count >= 1_024, do: {:error, :too_many_events}
-
-  defp read_barrier(socket, count) do
+  defp read_barrier(socket) do
     case read_frame(socket) do
       {:ok, %{"type" => "resynced"} = barrier} ->
         {:ok, barrier}
 
       {:ok, %{"type" => type}} when type in ["delivery", "lifecycle"] ->
-        read_barrier(socket, count + 1)
+        read_barrier(socket)
 
       _ ->
         {:error, :bad_replay}

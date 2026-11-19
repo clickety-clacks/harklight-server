@@ -1751,29 +1751,25 @@ defmodule AttentionServer.Relay do
   end
 
   defp dispatch_call(
-         {:origin_stream_attach, key, :origin, worker, reconnect, false},
+         {:origin_stream_attach, key, :origin, worker, _reconnect, false},
          _from,
          state
        ) do
-    with {:ok, person} <- Engine.authorized_person(state.store.engine, key),
-         stream_key = {person, key, :origin},
-         false <- not reconnect and Map.has_key?(state.origin_streams, stream_key) do
-      proposed = put_in(state.origin_streams[stream_key], %{worker: worker})
+    with {:ok, person} <- Engine.authorized_person(state.store.engine, key) do
+      stream_key = {person, key, :origin}
+      proposed_streams = put_origin_stream(state.origin_streams, stream_key, %{worker: worker})
+      proposed = %{state | origin_streams: proposed_streams}
       next = origin_availability_changes(state, proposed, person, key)
 
       case Store.commit(state.store, next, audit(state.store.engine, key, "origin_attach")) do
         {:ok, store} ->
-          if previous = state.origin_streams[stream_key] do
-            Process.demonitor(previous.monitor, [:flush])
-            if previous.worker != worker, do: send(previous.worker, :origin_scope_replaced)
-          end
-
+          demonitor_origin_worker(state, stream_key, worker)
           stream = %{worker: worker, monitor: Process.monitor(worker), advisory_v1: false}
 
           next_state = %{
             proposed
             | store: store,
-              origin_streams: Map.put(proposed.origin_streams, stream_key, stream),
+              origin_streams: put_origin_stream(state.origin_streams, stream_key, stream),
               origin_streams_by_identity:
                 Map.update(
                   state.origin_streams_by_identity,
@@ -1789,7 +1785,6 @@ defmodule AttentionServer.Relay do
           {:reply, {:error, :storage_unavailable}, state}
       end
     else
-      true -> {:reply, {:error, :already_listening}, state}
       error -> {:reply, error, state}
     end
   end
@@ -1804,7 +1799,6 @@ defmodule AttentionServer.Relay do
 
     with {:ok, person} <- Engine.authorized_person(engine, key),
          {:ok, _} <- Engine.origin_status(engine, key, handle, false),
-         false <- not reconnect and Map.has_key?(state.origin_streams, {person, key, handle}),
          {:ok, attached} <- Conversation.mark_attached(engine, person, key, handle),
          {:ok, current} <- Engine.origin_status(attached, key, handle, true),
          attached <-
@@ -1819,17 +1813,14 @@ defmodule AttentionServer.Relay do
          {:ok, store} <-
            Store.commit(state.store, attached, audit(engine, key, "origin_attach")) do
       stream_key = {person, key, handle}
-      # Replace only after the attachment commit succeeds. The old worker's
-      # eventual detach/DOWN must not remove this connection's registration.
-      if previous = Map.get(state.origin_streams, stream_key) do
-        Process.demonitor(previous.monitor, [:flush])
-        if previous.worker != worker, do: send(previous.worker, :origin_stream_replaced)
-      end
-
+      # Register only after the attachment commit succeeds. Other streams of
+      # this session stay attached; only this worker's own earlier entry is
+      # replaced.
+      demonitor_origin_worker(state, stream_key, worker)
       monitor = Process.monitor(worker)
 
       streams =
-        Map.put(state.origin_streams, stream_key, %{
+        put_origin_stream(state.origin_streams, stream_key, %{
           worker: worker,
           monitor: monitor,
           advisory_requested: advisory_requested,
@@ -1864,7 +1855,6 @@ defmodule AttentionServer.Relay do
 
       {:reply, :ok, next_state}
     else
-      true -> {:reply, {:error, :already_listening}, state}
       {:error, :not_found} = error -> {:reply, error, state}
       {:error, :forbidden} = error -> {:reply, error, state}
       _ -> {:reply, {:error, :storage_unavailable}, state}
@@ -1873,10 +1863,10 @@ defmodule AttentionServer.Relay do
 
   defp dispatch_call({:origin_stream_detach, key, handle, worker}, _from, state) do
     case Enum.find(state.origin_streams, fn
-           {{_person, ^key, ^handle}, %{worker: ^worker}} -> true
+           {{_person, ^key, ^handle}, streams} -> Enum.any?(streams, &(&1.worker == worker))
            _ -> false
          end) do
-      {stream_key, _} -> {:reply, :ok, detach_origin_stream(state, stream_key)}
+      {stream_key, _} -> {:reply, :ok, detach_origin_stream(state, stream_key, worker)}
       nil -> {:reply, :ok, state}
     end
   end
@@ -3775,12 +3765,12 @@ defmodule AttentionServer.Relay do
             {:noreply, delete_focus_stream(state, listener)}
 
           true ->
-            case Enum.find(state.origin_streams, fn {_, stream} ->
-                   stream.worker == listener and stream.monitor == monitor
+            case Enum.find(state.origin_streams, fn {_, streams} ->
+                   Enum.any?(streams, &(&1.worker == listener and &1.monitor == monitor))
                  end) do
               {stream_key, _} ->
                 Diagnostics.failure(:origin_https, :stream_detach, reason, :closed)
-                {:noreply, detach_origin_stream(state, stream_key)}
+                {:noreply, detach_origin_stream(state, stream_key, listener)}
 
               nil ->
                 {:noreply, state}
@@ -3849,33 +3839,43 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  defp detach_origin_stream(state, {person, origin, :origin} = key) do
-    {stream, streams} = Map.pop(state.origin_streams, key)
-    if stream, do: Process.demonitor(stream.monitor, [:flush])
+  defp detach_origin_stream(state, {person, origin, :origin} = key, worker) do
+    {streams, remaining?} = remove_origin_worker(state.origin_streams, key, worker)
 
-    proposed = %{
-      state
-      | origin_streams: streams,
-        origin_streams_by_identity:
-          remove_origin_stream_index(state.origin_streams_by_identity, {person, origin}, key)
-    }
+    if remaining? do
+      %{state | origin_streams: streams}
+    else
+      proposed = %{
+        state
+        | origin_streams: streams,
+          origin_streams_by_identity:
+            remove_origin_stream_index(state.origin_streams_by_identity, {person, origin}, key)
+      }
 
-    next = origin_availability_changes(state, proposed, person, origin)
+      next = origin_availability_changes(state, proposed, person, origin)
 
-    case Store.commit(state.store, next, audit(state.store.engine, origin, "origin_detach")) do
-      {:ok, store} ->
-        %{proposed | store: store}
+      case Store.commit(state.store, next, audit(state.store.engine, origin, "origin_detach")) do
+        {:ok, store} ->
+          %{proposed | store: store}
 
-      error ->
-        Diagnostics.failure(:origin_https, :stream_detach, error, :unavailable)
-        proposed
+        error ->
+          Diagnostics.failure(:origin_https, :stream_detach, error, :unavailable)
+          proposed
+      end
     end
   end
 
-  defp detach_origin_stream(state, {person, origin, handle} = key) do
-    {stream, streams} = Map.pop(state.origin_streams, key)
-    if stream, do: Process.demonitor(stream.monitor, [:flush])
+  defp detach_origin_stream(state, {person, origin, handle} = key, worker) do
+    {streams, remaining?} = remove_origin_worker(state.origin_streams, key, worker)
 
+    if remaining? do
+      %{state | origin_streams: streams}
+    else
+      detach_last_origin_stream(state, key, streams, person, origin, handle)
+    end
+  end
+
+  defp detach_last_origin_stream(state, key, streams, person, origin, handle) do
     streams_by_identity =
       remove_origin_stream_index(state.origin_streams_by_identity, {person, origin}, key)
 
@@ -3938,6 +3938,33 @@ defmodule AttentionServer.Relay do
         Diagnostics.failure(:origin_https, :stream_detach, other, :unavailable)
         %{state | origin_streams: streams, origin_streams_by_identity: streams_by_identity}
     end
+  end
+
+  defp put_origin_stream(streams, key, %{worker: worker} = stream) do
+    Map.update(streams, key, [stream], fn existing ->
+      [stream | Enum.reject(existing, &(&1.worker == worker))]
+    end)
+  end
+
+  defp demonitor_origin_worker(state, key, worker) do
+    state.origin_streams
+    |> Map.get(key, [])
+    |> Enum.each(fn stream ->
+      if stream.worker == worker and Map.has_key?(stream, :monitor),
+        do: Process.demonitor(stream.monitor, [:flush])
+    end)
+  end
+
+  # Removes one worker's stream; the key disappears when its last stream goes.
+  defp remove_origin_worker(streams, key, worker) do
+    {removed, kept} =
+      streams |> Map.get(key, []) |> Enum.split_with(&(&1.worker == worker))
+
+    Enum.each(removed, fn stream ->
+      if Map.has_key?(stream, :monitor), do: Process.demonitor(stream.monitor, [:flush])
+    end)
+
+    if kept == [], do: {Map.delete(streams, key), false}, else: {Map.put(streams, key, kept), true}
   end
 
   defp remove_origin_stream_index(index, identity, stream_key) do
@@ -6814,10 +6841,9 @@ defmodule AttentionServer.Relay do
   defp notify_coverage_change(state, old_engine, person, origin) do
     if covered_handles(old_engine, person, origin) !=
          covered_handles(state.store.engine, person, origin) do
-      case state.origin_streams[{person, origin, :origin}] do
-        %{worker: worker} -> send(worker, :origin_coverage_changed)
-        _ -> :ok
-      end
+      state.origin_streams
+      |> Map.get({person, origin, :origin}, [])
+      |> Enum.each(&send(&1.worker, :origin_coverage_changed))
 
       requeue_covered(state, person, origin)
     else
@@ -6939,16 +6965,19 @@ defmodule AttentionServer.Relay do
 
   defp refresh_stream_advisory_support(state, {person, origin, handle} = stream_key) do
     case Map.get(state.origin_streams, stream_key) do
-      %{advisory_requested: requested} = stream ->
-        enabled =
-          requested and
-            BounceDecision.advisory_supported?(state.store.engine, person, origin, handle)
+      streams when is_list(streams) ->
+        supported = BounceDecision.advisory_supported?(state.store.engine, person, origin, handle)
 
-        %{
-          state
-          | origin_streams:
-              Map.put(state.origin_streams, stream_key, %{stream | advisory_v1: enabled})
-        }
+        updated =
+          Enum.map(streams, fn
+            %{advisory_requested: requested} = stream ->
+              %{stream | advisory_v1: requested and supported}
+
+            stream ->
+              stream
+          end)
+
+        %{state | origin_streams: Map.put(state.origin_streams, stream_key, updated)}
 
       _ ->
         state
@@ -6962,13 +6991,15 @@ defmodule AttentionServer.Relay do
 
       case Map.get(next_engine.advisory_feeds, key) do
         %{high: high} when high > old_high ->
-          case Map.get(current.origin_streams, key) do
+          current.origin_streams
+          |> Map.get(key, [])
+          |> Enum.each(fn
             %{worker: worker, advisory_v1: true} ->
               send(worker, {:origin_advisory_changed, handle, high})
 
             _ ->
               :ok
-          end
+          end)
 
         _ ->
           :ok
@@ -7092,10 +7123,9 @@ defmodule AttentionServer.Relay do
       state.origin_streams_by_identity
       |> Map.get(key, MapSet.new())
       |> Enum.each(fn stream_key ->
-        case Map.get(state.origin_streams, stream_key) do
-          %{worker: worker} -> send(worker, {:origin_state_changed, next_feed.high})
-          _ -> :ok
-        end
+        state.origin_streams
+        |> Map.get(stream_key, [])
+        |> Enum.each(&send(&1.worker, {:origin_state_changed, next_feed.high}))
       end)
 
       %{state | upload_index: upload_index}
