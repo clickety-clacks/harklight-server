@@ -4238,7 +4238,7 @@ defmodule AttentionServer.Engine do
           if AttentionServer.Placement.choice(next, person) == "jev-set" do
             items = AttentionServer.Contradictions.items(next, person, key)
 
-            case AttentionServer.Contradictions.result(items, %{}, false) do
+            case AttentionServer.Contradictions.result(items, %{}) do
               nil -> fields
               check -> Map.put(fields, "possible_contradictions", check)
             end

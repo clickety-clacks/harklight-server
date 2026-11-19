@@ -114,12 +114,11 @@ defmodule AttentionServer.Contradictions do
     end
   end
 
-  # The caller commits delivery before entering this worker. With no deadline
-  # option the worker waits for every batch; a caller may pass one shared
-  # deadline that covers composition and all parallel batches.
+  # The caller commits delivery before entering this worker. The worker waits
+  # for every batch to answer or fail; there is no deadline. A call that never
+  # answers ends through the transport's own failure (connection loss, server
+  # error, worker exit) and is counted as unchecked.
   def run(posted, items, endpoint, model, size, opts \\ []) do
-    clock = Keyword.get(opts, :clock, fn -> System.monotonic_time(:millisecond) end)
-    deadline = Keyword.get(opts, :deadline, :infinity)
     evaluator = Keyword.get(opts, :evaluator, &JevClient.evaluate/1)
     requests = batches(posted, items, endpoint, model, size)
 
@@ -139,36 +138,21 @@ defmodule AttentionServer.Contradictions do
               end
             end)
 
-          {task.ref, {task, request.candidates}}
+          {task.ref, request.candidates}
         end)
 
-      {scores, timed_out?} = collect(tasks, %{}, deadline, clock)
-      result(items, scores, timed_out?)
+      result(items, collect(tasks, %{}))
     after
       Supervisor.stop(supervisor)
     end
   end
 
-  defp collect(tasks, scores, _deadline, _clock) when map_size(tasks) == 0, do: {scores, false}
+  defp collect(tasks, scores) when map_size(tasks) == 0, do: scores
 
-  defp collect(tasks, scores, :infinity, clock) do
-    await(tasks, scores, :infinity, :infinity, clock)
-  end
-
-  defp collect(tasks, scores, deadline, clock) do
-    remaining = deadline - clock.()
-
-    if remaining <= 0 do
-      stop_pending(tasks, scores)
-    else
-      await(tasks, scores, deadline, remaining, clock)
-    end
-  end
-
-  defp await(tasks, scores, deadline, remaining, clock) do
+  defp collect(tasks, scores) do
     receive do
       {ref, answer} when is_map_key(tasks, ref) ->
-        {{_task, identities}, rest} = Map.pop(tasks, ref)
+        {identities, rest} = Map.pop(tasks, ref)
         Process.demonitor(ref, [:flush])
 
         usable =
@@ -177,24 +161,16 @@ defmodule AttentionServer.Contradictions do
             _ -> %{}
           end
 
-        collect(rest, Map.merge(scores, usable), deadline, clock)
+        collect(rest, Map.merge(scores, usable))
 
       {:DOWN, ref, :process, _pid, _reason} when is_map_key(tasks, ref) ->
-        collect(Map.delete(tasks, ref), scores, deadline, clock)
-    after
-      remaining ->
-        stop_pending(tasks, scores)
+        collect(Map.delete(tasks, ref), scores)
     end
-  end
-
-  defp stop_pending(tasks, scores) do
-    Enum.each(tasks, fn {_ref, {task, _identities}} -> Task.shutdown(task, :brutal_kill) end)
-    {scores, true}
   end
 
   # Answers are normalized scores from JevClient.parse_scores/2. Missing or
   # invalid individual answers never count as negative comparisons.
-  def result(items, scores, timed_out?) do
+  def result(items, scores) do
     valid =
       Map.filter(scores, fn {_id, score} -> is_number(score) and score >= 0 and score <= 1 end)
 
@@ -225,7 +201,7 @@ defmodule AttentionServer.Contradictions do
       else
         %{
           "status" => "incomplete",
-          "reason" => if(timed_out?, do: "timeout", else: "unavailable"),
+          "reason" => "unavailable",
           "unchecked" => unchecked
         }
       end

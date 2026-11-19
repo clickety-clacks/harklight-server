@@ -4,8 +4,9 @@
 
 - Jev send results can report possibly contradictory open messages to the
   posting agent, with sender identities and a reconciliation warning. Delivery
-  and push commit before checking; the result waits at most five seconds and
-  reports incomplete comparisons explicitly. Baseline sends and revisions do
+  and push commit before checking; the result waits until every comparison
+  answers or fails, with no fixed deadline, and reports incomplete comparisons
+  explicitly. Baseline sends and revisions do
   not run a check. Batch size remains unset pending synthetic Jev measurement.
 
 ---

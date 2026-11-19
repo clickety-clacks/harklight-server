@@ -105,7 +105,7 @@ chosen =
   |> Enum.filter(fn row ->
     Enum.sum(Enum.map(row.repeats, & &1.found)) == best_found and
       Enum.sum(Enum.map(row.repeats, & &1.false_warnings)) == best_false and
-      Enum.all?(row.repeats, &(&1.usable == length(items))) and row.worst_ms <= 5_000
+      Enum.all?(row.repeats, &(&1.usable == length(items)))
   end)
   |> Enum.map(& &1.size)
   |> Enum.max(fn -> nil end)

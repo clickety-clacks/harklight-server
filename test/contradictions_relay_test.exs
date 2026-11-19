@@ -204,17 +204,19 @@ defmodule AttentionServer.ContradictionsRelayTest do
     assert_receive {:evaluated, [{"app:test", "m2"}]}, 2_000
   end
 
-  test "slow check returns timeout within the contract bound after delivery" do
+  test "a check that never answers waits past the old bound and ends as a recorded failure" do
     parent = self()
 
     {relay, _} =
       start(
         contradiction_batch_size: 8,
         contradiction_evaluator: fn _ ->
-          send(parent, :waiting)
+          send(parent, {:waiting, self()})
 
+          # Stands in for the Jev transport: it answers only when the
+          # connection fails, the same way JevClient.post/3 ends.
           receive do
-            :never -> {:ok, %{}}
+            :connection_lost -> {:error, :unavailable}
           end
         end
       )
@@ -222,15 +224,18 @@ defmodule AttentionServer.ContradictionsRelayTest do
     request(relay, frame(1))
     jev(relay)
     sending = Task.async(fn -> request(relay, frame(2)) end)
-    assert_receive :waiting, 2_000
+    assert_receive {:waiting, call}, 2_000
     assert {:ok, events, _} = Relay.events(relay, "reader", 0)
     assert Enum.any?(events, &(&1["message_id"] == "m2"))
 
-    assert Task.await(sending, 6_000)["possible_contradictions"] == %{
-             "status" => "incomplete",
-             "reason" => "timeout",
-             "unchecked" => 1
-           }
+    # The removed five-second bound no longer ends the wait.
+    assert Task.yield(sending, 5_500) == nil
+    send(call, :connection_lost)
+
+    failed = %{"status" => "incomplete", "reason" => "unavailable", "unchecked" => 1}
+    assert Task.await(sending)["possible_contradictions"] == failed
+    # The failure is recorded on the receipt, so the same-op replay copies it.
+    assert request(relay, frame(2))["possible_contradictions"] == failed
   end
 
   test "empty Jev checked set, revision, and unavailable checks preserve delivery" do

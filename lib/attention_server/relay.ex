@@ -1172,9 +1172,6 @@ defmodule AttentionServer.Relay do
       parent = self()
       token = make_ref()
 
-      deadline =
-        Map.get(state, :last_delivery_commit_at, System.monotonic_time(:millisecond)) + 5_000
-
       evaluator = state.contradiction_evaluator
       posted = engine.messages[posted_key].message
 
@@ -1187,8 +1184,7 @@ defmodule AttentionServer.Relay do
               engine.jev_endpoint,
               engine.jev_model,
               size,
-              evaluator: evaluator,
-              deadline: deadline
+              evaluator: evaluator
             )
 
           send(parent, {:contradiction_done, receipt_key, token, check})
@@ -5846,10 +5842,7 @@ defmodule AttentionServer.Relay do
              )
            ) do
         {:ok, store} ->
-          next_state =
-            state
-            |> Map.put(:store, store)
-            |> Map.put(:last_delivery_commit_at, System.monotonic_time(:millisecond))
+          next_state = %{state | store: store}
 
           next_state =
             case Engine.authorized_person(next_engine, key) do

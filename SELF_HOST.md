@@ -515,8 +515,10 @@ the same persisted identity.
 
 New sends for a person using `jev-set` can return `possible_contradictions`.
 This is an advisory to the sender: delivery and its push are committed before
-checking, and a slow check waits only in that sender's result, for up to five
-seconds. Missing, invalid, failed or oversized comparisons report `incomplete`
+checking, and a slow check waits only in that sender's result. There is no
+fixed deadline: the result waits until every comparison answers or fails, and a
+comparison whose Jev connection is lost or refused ends as a failure. Missing,
+invalid, failed or oversized comparisons report `incomplete`
 with an unchecked count; any usable matches remain listed. Revisions do not
 trigger a check. Same-operation retries retain the original check result.
 
@@ -531,7 +533,7 @@ scripts/measure-contradictions.exs` in an isolated checkout with
 existing `ATTENTION_SERVER_JEV_KEY_PATH` in its environment. The script uses
 only its labeled synthetic messages. It measures sizes 1, 8 and 16 three times,
 prints accuracy, calls and median/worst elapsed time, and proposes the largest
-size meeting the contract's accuracy and five-second criteria. If none meets
+size meeting the contract's accuracy criteria. If none meets
 them, the product owner chooses. Its JSON records the labels, exact question,
 answer schema and threshold. It never prints or copies the key or its path.
 Record that output before fixing the batch-size setting.
