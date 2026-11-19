@@ -104,7 +104,7 @@ defmodule AttentionServer.ContradictionsTest do
     assert hd(check["messages"])["message_id"] == "message-2"
   end
 
-  test "without a deadline option the worker waits for a slow batch" do
+  test "the worker waits for a slow batch to answer" do
     [a, b] = Enum.map(1..2, &item/1)
 
     evaluator = fn request ->
