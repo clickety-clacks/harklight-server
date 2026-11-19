@@ -94,3 +94,58 @@ then this request from its `conversation_seq`; it does not send `view_get`.
 
 Older servers answer `inbox_list` with `unknown_type` and do not change sync
 mode, so a client can fall back to legacy replay on the same connection.
+
+## Connection roles
+
+A device WebSocket may declare a role in its upgrade request, so one stream
+connection can sync while separate request connections read and mutate without
+waiting on it or closing it:
+
+```text
+GET /relay?role=stream HTTP/1.1
+GET /relay?role=request HTTP/1.1
+```
+
+A connection that declares no role (`GET /relay`) is a legacy stream: its frame
+set, replies, displacement and close behavior are unchanged. Any other target is
+refused with `400 Bad Request`, which is how an older server answers a declared
+role; a client can fall back to one legacy connection on that answer. Roles
+apply to the device WebSocket only. The raw TLS transport is always legacy.
+
+A declared role receives this frame before any other:
+
+```json
+{"v":1,"type":"connection_admitted","connection_id":"c_...","role":"request"}
+```
+
+`connection_id` is opaque and safe to log. The server logs it when the
+connection opens, closes or has a frame refused.
+
+| Role | Accepts | Refuses with `wrong_connection_role` |
+|---|---|---|
+| `stream` | `resync`, `ack`, `conversation_open`, `conversation_ack`, `inbox_start`, `inbox_page`, `inbox_reconcile`, `inbox_receipts`, `inbox_checkpoint_ack`, `inbox_attach`, `focus_report` | every other frame type, including `inbox_list`, `conversation_page`, `view_get` and every mutation |
+| `request` | every other frame type: reads (`inbox_list`, `conversation_page`, `view_get`, `levels_get`) and mutations (`message_open`, `conversation_read`, `answer`, `discussion`, `levels_set`, `push_register` and the rest) | the stream frames above |
+
+A refusal uses the existing error envelope and echoes `ref`. A request
+connection never enters snapshot paging mode, holds no cursor, receives no
+change notices and leaves the device's focus state alone, so the paging
+checkpoint never refuses its mutations. Replies stay display-only and carry
+`view_rev` as described above. Uploads use the separate upload endpoint and are
+attached by a mutation on a request connection.
+
+Opening a stream, declared or legacy, closes the device's earlier stream
+connections. Opening a request connection closes nothing. Revoking or removing
+the device closes every connection of the device.
+
+Before the server closes a connection that declared a role, it sends a WebSocket
+close frame whose reason is one of these tokens:
+
+| Reason | Status | When |
+|---|---|---|
+| `superseded_by_new_stream` | 4409 | A newer stream of the same device opened |
+| `device_revoked` | 4403 | The device was revoked or removed |
+| `server_shutdown` | 1001 | The device listener stopped |
+| `idle_timeout` | 4408 | Reserved; the server has no idle timeout today |
+| `protocol_error` | 1002 | A frame could not be decoded |
+
+Legacy connections close as before, without a close frame.

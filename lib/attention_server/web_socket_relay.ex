@@ -4,11 +4,24 @@ defmodule AttentionServer.WebSocketRelay do
 
   The authenticated device session is opened only after the exact WebSocket
   subprotocol is negotiated. Relay owns application-frame sends and fencing.
+
+  A client may declare a connection role in the upgrade request,
+  `GET /relay?role=stream` or `GET /relay?role=request`. A declared role gets a
+  `connection_admitted` frame carrying its connection ID first, and a close
+  frame with a reason token before every server-initiated close. A request
+  without a role is a legacy stream and its wire bytes are unchanged.
   """
 
   use GenServer
 
-  alias AttentionServer.{DeviceIdentity, Diagnostics, EnrolledLeafVerify, JSON, Relay}
+  alias AttentionServer.{
+    ConnectionRole,
+    DeviceIdentity,
+    Diagnostics,
+    EnrolledLeafVerify,
+    JSON,
+    Relay
+  }
 
   @handshake_timeout :infinity
   @poll_ms 100
@@ -25,6 +38,10 @@ defmodule AttentionServer.WebSocketRelay do
 
   @doc "Encode one server-to-client text message without masking."
   def encode_text(payload) when is_binary(payload), do: encode_frame(1, payload)
+
+  @doc "Encode one server-to-client close frame with a status code and reason token."
+  def encode_close(code, reason) when is_integer(code) and is_atom(reason),
+    do: encode_frame(8, <<code::16, Atom.to_string(reason)::binary>>)
 
   @doc false
   def send_text_stream(socket, %JSON.StreamedLine{} = line) do
@@ -242,14 +259,15 @@ defmodule AttentionServer.WebSocketRelay do
                Relay.acknowledged_cursor(relay, key),
                :closed
              ),
-           {:ok, buffer} <- upgrade(tls_socket),
-           {:ok, session} <-
+           {:ok, buffer, role} <- upgrade(tls_socket),
+           {:ok, session, connection_id} <-
              Diagnostics.result(
                :device_relay,
                :session_setup,
-               Relay.open_websocket_session(relay, key, tls_socket, listener_id),
+               Relay.open_websocket_session(relay, key, tls_socket, listener_id, role),
                :closed
-             ) do
+             ),
+           :ok <- admit(relay, session, connection_id, role) do
         loop(tls_socket, relay, session, buffer, nil)
         Relay.close_session(relay, session)
       end
@@ -267,9 +285,23 @@ defmodule AttentionServer.WebSocketRelay do
     end
   end
 
+  # A declared role learns its connection ID before any other frame.
+  defp admit(_relay, _session, _connection_id, :legacy), do: :ok
+
+  defp admit(relay, session, connection_id, role) do
+    Process.put(:attention_connection_role, role)
+
+    Diagnostics.result(
+      :device_relay,
+      :response_write,
+      Relay.session_send(relay, session, [ConnectionRole.admitted_frame(connection_id, role)]),
+      :closed
+    )
+  end
+
   defp upgrade(socket) do
     with {:ok, headers, buffer} <- read_headers(socket, <<>>),
-         {:ok, key} <- validate_upgrade(headers),
+         {:ok, key, role} <- validate_upgrade(headers),
          accept <- Base.encode64(:crypto.hash(:sha, key <> @guid)),
          :ok <-
            :ssl.send(socket, [
@@ -282,7 +314,7 @@ defmodule AttentionServer.WebSocketRelay do
              @protocol,
              "\r\n\r\n"
            ]) do
-      {:ok, buffer}
+      {:ok, buffer, role}
     else
       {:error, reason} ->
         Diagnostics.failure(:device_relay, :websocket_upgrade, reason, :closed)
@@ -327,15 +359,16 @@ defmodule AttentionServer.WebSocketRelay do
 
   defp validate_upgrade(headers) do
     case String.split(headers, "\r\n") do
-      ["GET /relay HTTP/1.1" | lines] ->
-        with {:ok, fields} <- parse_headers(lines, %{}),
+      [request_line | lines] ->
+        with {:ok, role} <- relay_target(request_line),
+             {:ok, fields} <- parse_headers(lines, %{}),
              true <- token_ci?(fields["connection"], "upgrade"),
              true <- String.downcase(fields["upgrade"] || "") == "websocket",
              true <- fields["sec-websocket-version"] == "13",
              true <- token?(fields["sec-websocket-protocol"], @protocol),
              {:ok, key} <- valid_key(fields["sec-websocket-key"]),
              true <- is_binary(fields["host"]) and fields["host"] != "" do
-          {:ok, key}
+          {:ok, key, role}
         else
           _ -> {:error, :bad_upgrade}
         end
@@ -344,6 +377,11 @@ defmodule AttentionServer.WebSocketRelay do
         {:error, :bad_upgrade}
     end
   end
+
+  defp relay_target("GET /relay HTTP/1.1"), do: {:ok, :legacy}
+  defp relay_target("GET /relay?role=stream HTTP/1.1"), do: {:ok, :stream}
+  defp relay_target("GET /relay?role=request HTTP/1.1"), do: {:ok, :request}
+  defp relay_target(_), do: {:error, :bad_upgrade}
 
   defp parse_headers([], fields), do: {:ok, fields}
 
@@ -454,8 +492,23 @@ defmodule AttentionServer.WebSocketRelay do
       {:error, reason} ->
         Diagnostics.failure(:device_relay, :request_read, reason, :closed)
         _ = Relay.session_send(relay, session, [@bad_frame])
+        close_with_reason(relay, session, :protocol_error)
         :ok
     end
+  end
+
+  # Only a declared role receives close frames; legacy bytes stay unchanged.
+  defp close_with_reason(relay, session, reason) do
+    if ConnectionRole.explicit?(Process.get(:attention_connection_role)) do
+      _ =
+        Relay.session_send_control(
+          relay,
+          session,
+          IO.iodata_to_binary(encode_close(ConnectionRole.close_code(reason), reason))
+        )
+    end
+
+    :ok
   end
 
   defp consume_frame(_socket, _relay, _session, false, 1, payload, nil) do

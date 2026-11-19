@@ -41,6 +41,8 @@ defmodule AttentionServer.Relay do
     Store
   }
 
+  alias AttentionServer.ConnectionRole
+
   @browser_frame_types ~w(
                           inbox_start inbox_page inbox_reconcile inbox_receipts
                           inbox_checkpoint_ack inbox_attach conversation_open conversation_ack
@@ -666,6 +668,20 @@ defmodule AttentionServer.Relay do
         {:open_session, verified_key, self(), socket, listener, :websocket},
         :infinity
       )
+
+  @doc """
+  Opens a WebSocket device session with a connection role. `:legacy` behaves
+  exactly as `open_websocket_session/4`. Returns the session and its
+  server-issued connection ID.
+  """
+  def open_websocket_session(server, verified_key, socket, listener, role)
+      when role in [:legacy, :stream, :request],
+      do:
+        GenServer.call(
+          server,
+          {:open_session, verified_key, self(), socket, listener, :websocket, role},
+          :infinity
+        )
 
   def open_browser_recipient(
         server,
@@ -2974,7 +2990,18 @@ defmodule AttentionServer.Relay do
     {:reply, :ok, unregister_origin_listener_state(state, listener)}
   end
 
-  defp dispatch_call({:open_session, key, owner, socket, listener, transport}, _from, state) do
+  defp dispatch_call({:open_session, key, owner, socket, listener, transport}, from, state) do
+    case dispatch_call(
+           {:open_session, key, owner, socket, listener, transport, :legacy},
+           from,
+           state
+         ) do
+      {:reply, {:ok, id, _connection_id}, next} -> {:reply, {:ok, id}, next}
+      other -> other
+    end
+  end
+
+  defp dispatch_call({:open_session, key, owner, socket, listener, transport, role}, _from, state) do
     admission =
       if is_nil(listener) or Map.has_key?(state.tls_listeners, listener),
         do: Engine.acknowledged_cursor(state.store.engine, key),
@@ -2982,8 +3009,15 @@ defmodule AttentionServer.Relay do
 
     case admission do
       {:ok, cursor} ->
-        state = fence_sessions(state, key)
+        # A new stream (declared or legacy) supersedes only the device's earlier
+        # streams. A request connection displaces nothing.
+        state =
+          if role == :request,
+            do: state,
+            else: fence_stream_sessions(state, key)
+
         id = make_ref()
+        connection_id = ConnectionRole.new_connection_id()
 
         session = %{
           key: key,
@@ -3006,12 +3040,15 @@ defmodule AttentionServer.Relay do
           view_notice_due_at: nil,
           view_last_notice_at: nil,
           levels_support: false,
-          levels_notice: false
+          levels_notice: false,
+          role: role,
+          connection_id: connection_id
         }
 
         next = %{state | sessions: Map.put(state.sessions, id, session)}
+        ConnectionRole.log(:open, session)
 
-        {:reply, {:ok, id}, next}
+        {:reply, {:ok, id, connection_id}, next}
 
       error ->
         {:reply, error, state}
@@ -3058,7 +3095,9 @@ defmodule AttentionServer.Relay do
           owner: worker,
           socket: nil,
           listener: nil,
-          transport: :browser
+          transport: :browser,
+          role: :legacy,
+          connection_id: ConnectionRole.new_connection_id()
         })
 
       recipients =
@@ -3125,7 +3164,11 @@ defmodule AttentionServer.Relay do
          true <- not is_nil(socket) and is_list(frames) do
       {:reply, {:socket_write, socket, {:session, id}, frames, :session}, state}
     else
-      _ -> {:reply, {:error, :fenced}, drop_session(state, id)}
+      {:error, :forbidden} ->
+        {:reply, {:error, :fenced}, drop_session(state, id, :device_revoked)}
+
+      _ ->
+        {:reply, {:error, :fenced}, drop_session(state, id)}
     end
   end
 
@@ -3134,7 +3177,11 @@ defmodule AttentionServer.Relay do
          true <- not is_nil(socket) do
       {:reply, {:socket_write, socket, {:session_control, id}, [bytes], :session}, state}
     else
-      _ -> {:reply, {:error, :fenced}, drop_session(state, id)}
+      {:error, :forbidden} ->
+        {:reply, {:error, :fenced}, drop_session(state, id, :device_revoked)}
+
+      _ ->
+        {:reply, {:error, :fenced}, drop_session(state, id)}
     end
   end
 
@@ -3174,7 +3221,7 @@ defmodule AttentionServer.Relay do
       end
     else
       {:error, :forbidden} ->
-        {:reply, {:error, :forbidden}, drop_session(state, id)}
+        {:reply, {:error, :forbidden}, drop_session(state, id, :device_revoked)}
 
       {:error, :storage_unavailable} ->
         {:reply, {:ok, [error_line(%{}, "storage_unavailable")]}, state}
@@ -3259,7 +3306,7 @@ defmodule AttentionServer.Relay do
         end
 
       {:error, :forbidden} ->
-        {:reply, {:error, :forbidden}, drop_session(state, id)}
+        {:reply, {:error, :forbidden}, drop_session(state, id, :device_revoked)}
 
       error ->
         {:reply, error, state}
@@ -3455,6 +3502,9 @@ defmodule AttentionServer.Relay do
             browser_type not in @browser_frame_types ->
           {:reply, {:ok, [error_line(raw, "unknown_type")]}, state}
 
+        reason = role_refusal(session, browser_type) ->
+          {:reply, {:ok, [error_line(raw, reason)]}, state}
+
         true ->
           case JSON.decode_line(raw) do
             {:ok, %{"type" => "inbox_start"} = frame}
@@ -3472,7 +3522,7 @@ defmodule AttentionServer.Relay do
       end
     else
       {:error, :forbidden} ->
-        {:reply, {:error, :forbidden}, drop_session(state, id)}
+        {:reply, {:error, :forbidden}, drop_session(state, id, :device_revoked)}
 
       error ->
         {:reply, error, state}
@@ -3485,6 +3535,9 @@ defmodule AttentionServer.Relay do
     cond do
       session.transport == :browser and is_binary(type) and type not in @browser_frame_types ->
         {{:ok, [error_line(frame, "unknown_type")]}, state}
+
+      reason = role_refusal(session, type) ->
+        {{:ok, [error_line(frame, reason)]}, state}
 
       type == "inbox_start" and session.transport in [:websocket, :browser] ->
         inbox_start_call(state, id, session, frame, from)
@@ -3543,8 +3596,26 @@ defmodule AttentionServer.Relay do
     end
   end
 
+  # A role refusal is logged with the connection ID; legacy connections are
+  # never refused here.
+  defp role_refusal(session, type) do
+    case ConnectionRole.refusal(Map.get(session, :role, :legacy), type) do
+      nil ->
+        nil
+
+      reason ->
+        ConnectionRole.log(:refused, session, frame_type: type, reason: reason)
+        reason
+    end
+  end
+
+  # Levels change notices belong to the stream. A request connection reads and
+  # sets levels without subscribing to their notices.
+  defp levels_supported(%{role: :request} = session), do: session
+  defp levels_supported(session), do: %{session | levels_support: true}
+
   defp levels_session_request_frame(state, id, session, frame) do
-    session = %{session | levels_support: true}
+    session = levels_supported(session)
     state = put_session(state, id, session)
 
     case session_mutation_state_value(state, session, frame) do
@@ -4250,12 +4321,14 @@ defmodule AttentionServer.Relay do
       view_notice_due_at: nil,
       view_last_notice_at: nil,
       levels_support: false,
-      levels_notice: false
+      levels_notice: false,
+      role: :legacy,
+      connection_id: nil
     }
   end
 
   defp levels_session_request(state, id, session, raw) do
-    session = %{session | levels_support: true}
+    session = levels_supported(session)
     state = put_session(state, id, session)
 
     case session_mutation_state(state, session, raw) do
@@ -7255,9 +7328,18 @@ defmodule AttentionServer.Relay do
     end)
   end
 
+  # Device revocation or removal closes every connection of the device.
   defp fence_sessions(state, key) do
     Enum.reduce(state.sessions, state, fn {id, session}, acc ->
-      if session.key == key, do: drop_session(acc, id), else: acc
+      if session.key == key, do: drop_session(acc, id, :device_revoked), else: acc
+    end)
+  end
+
+  defp fence_stream_sessions(state, key) do
+    Enum.reduce(state.sessions, state, fn {id, session}, acc ->
+      if session.key == key and Map.get(session, :role, :legacy) != :request,
+        do: drop_session(acc, id, :superseded_by_new_stream),
+        else: acc
     end)
   end
 
@@ -7270,7 +7352,7 @@ defmodule AttentionServer.Relay do
         Process.demonitor(monitor, [:flush])
 
         Enum.reduce(state.sessions, %{state | tls_listeners: listeners}, fn {id, session}, acc ->
-          if session.listener == listener, do: drop_session(acc, id), else: acc
+          if session.listener == listener, do: drop_session(acc, id, :server_shutdown), else: acc
         end)
     end
   end
@@ -7718,30 +7800,74 @@ defmodule AttentionServer.Relay do
     |> Map.put("held_ms", max(now - held["accepted_at"], 0))
   end
 
-  defp drop_session(state, id) do
+  defp drop_session(state, id, reason \\ nil) do
     case Map.pop(state.sessions, id) do
       {nil, _} ->
         state
 
       {session, sessions} ->
+        role = Map.get(session, :role, :legacy)
         if session.owner, do: send(session.owner, {:attention_fenced, id})
+        close_frame? = close_frame?(session, role, reason)
 
         # Removing the session fences all serialized requests and writes.
         # TLS close can wait on the peer; keep that wait out of the shared Relay.
-        if session.socket,
+        if session.socket && not close_frame?,
           do: spawn(fn -> AttentionServer.SessionWriter.close(session.socket) end)
 
         state = %{state | sessions: sessions}
         state = cancel_socket_write(state, session.socket, {:error, :fenced})
 
-        if session.transport == :browser do
-          recipient_ref = {session.browser_session_id, session.recipient}
-          saved = %{connection_id: nil, session: %{session | owner: nil}}
-          %{state | browser_recipients: Map.put(state.browser_recipients, recipient_ref, saved)}
-        else
-          end_focus(state, session.key)
+        # A connection that declared a role learns why the server closed it:
+        # the close frame goes out before the transport closes.
+        if close_frame?, do: close_with_reason(session.socket, reason)
+
+        ConnectionRole.log(:close, session, reason: reason || :connection_ended)
+
+        cond do
+          session.transport == :browser ->
+            recipient_ref = {session.browser_session_id, session.recipient}
+            saved = %{connection_id: nil, session: %{session | owner: nil}}
+            %{state | browser_recipients: Map.put(state.browser_recipients, recipient_ref, saved)}
+
+          # Focus belongs to the device's stream; a request connection ending
+          # leaves it in place.
+          role == :request ->
+            state
+
+          true ->
+            end_focus(state, session.key)
         end
     end
+  end
+
+  defp close_frame?(session, role, reason) do
+    not is_nil(session.socket) and session.transport == :websocket and
+      ConnectionRole.explicit?(role) and reason in ConnectionRole.close_reasons()
+  end
+
+  @close_frame_wait_ms 1_000
+
+  defp close_with_reason(socket, reason) do
+    bytes = AttentionServer.WebSocketRelay.encode_close(ConnectionRole.close_code(reason), reason)
+
+    spawn(fn ->
+      parent = self()
+
+      sender =
+        spawn(fn ->
+          _ = :ssl.send(socket, bytes)
+          send(parent, {:close_frame_sent, self()})
+        end)
+
+      receive do
+        {:close_frame_sent, ^sender} -> :ok
+      after
+        @close_frame_wait_ms -> Process.exit(sender, :kill)
+      end
+
+      AttentionServer.SessionWriter.close(socket)
+    end)
   end
 
   defp drop_browser_connection(state, id, :replaced) do
