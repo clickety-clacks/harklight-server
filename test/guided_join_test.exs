@@ -183,7 +183,7 @@ defmodule AttentionServer.GuidedJoinTest do
 
   test "owner may name sender grants when approving a guided request", c do
     {:ok, engine, _} = create(c)
-    {:ok, pending, reply} = redeem(c, engine, c.config, 1)
+    {:ok, pending, reply} = redeem(c, engine, c.config)
 
     assert {:ok, approved, key} =
              Engine.pending_approve(
