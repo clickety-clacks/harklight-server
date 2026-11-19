@@ -1,6 +1,6 @@
 # Harklight client API v2: field-level contract
 
-Status: **draft for the delivery owner's acceptance, with the first rulings
+Status: **draft for the delivery owner's acceptance, with all rulings
 applied.** Nothing in this file is implemented. It turns the client API r2 specification (work item
 wi_e41bc552-9279-41d0-b015-07174b692dec, r2.4; §5.1 is unchanged from r2.3)
 into exact JSON shapes. Once it is accepted, this file is the binding
@@ -294,7 +294,7 @@ Every write that succeeds answers `200`, or `201` for `POST /v2/files`, with a
 | `POST /v2/items/{item_id}/seen` | `{}` |
 | `PUT /v2/items/{item_id}/read-position` | `{"entry_id": OpaqueId}` |
 | `POST /v2/items/{item_id}/replies` | `{"text": string, "file_ids"?: [OpaqueId]}` |
-| `POST /v2/items/{item_id}/answer` | `{"request_revision": int, "choice"?: string, "comment"?: string}` |
+| `POST /v2/items/{item_id}/answer` | `{"request_revision": int}` plus at most one of `"choice": string`, `"comment": string`, `"result": object` |
 | `PUT /v2/settings/priority-levels` | `{"levels": [PriorityLevel]}` with `If-Match` |
 | `PUT /v2/devices/me/push` | `{"token": string, "environment": "production" \| "sandbox", "revision": int}` |
 | `DELETE /v2/devices/me/push` | none |
@@ -314,6 +314,22 @@ Every write that succeeds answers `200`, or `201` for `POST /v2/files`, with a
         "settings": { "$ref": "#/$defs/Settings" }
       }
     },
+    "AnswerBody": {
+      "type": "object",
+      "required": ["request_revision"],
+      "properties": {
+        "request_revision": { "type": "integer", "minimum": 1 },
+        "choice": { "type": "string", "minLength": 1 },
+        "comment": { "type": "string" },
+        "result": { "type": "object" }
+      },
+      "additionalProperties": false,
+      "not": { "anyOf": [
+        { "required": ["choice", "comment"] },
+        { "required": ["choice", "result"] },
+        { "required": ["comment", "result"] }
+      ] }
+    },
     "FileCreated": {
       "type": "object",
       "required": ["file_id", "sha256", "size"],
@@ -327,17 +343,21 @@ Every write that succeeds answers `200`, or `201` for `POST /v2/files`, with a
 }
 ```
 
-- **Answer.**
-  - `choice` is the `id` of one action in the item's `message.answer_ui.actions`.
-    The server stores that action's `value`.
-  - `comment` is free text, stored beside the choice.
-  - With neither member, the answer is "no comment", today's
-    `answer_no_comment`.
-  - A `comment` with no `choice` is an answer only when the item's `answer_ui`
-    accepts free text today (a `text` action). Otherwise it is
-    `400 invalid_field` with `field: "comment"`.
-  - A `choice` that names no action is `400 invalid_field` with
+- **Answer.** The body carries at most one of `choice`, `comment` and
+  `result`, which keeps today's single stored answer value:
+  - `choice` is the `id` of one `value` action in the item's
+    `attention-client.actions/1` `answer_ui`. The server stores that action's
+    `value`. An `id` that names no such action is `400 invalid_field`, with
     `field: "choice"`.
+  - `comment` is the typed reply of the item's `text` action, stored as the
+    answer text. An item with no `text` action gets `400 invalid_field`, with
+    `field: "comment"`.
+  - `result` is the structured result of an `attention-client.ui/1`
+    `answer_ui`, stored as today's answer value. On an item with any other
+    `answer_ui`, it is `400 invalid_field`, with `field: "result"`.
+  - With none of them, the answer is "no comment", today's
+    `answer_no_comment`.
+  - More than one of them is `400 invalid_field`.
 - **Lifecycle** is not part of the client API. Terminal actions stay on the
   origin API, and their results are readable as `Item.terminal` and as
   `lifecycle` entries.
@@ -486,11 +506,13 @@ content, tokens or identities.
 
 ## 9. Rulings applied
 
-The delivery owner's first rulings on this draft are applied above:
+The delivery owner's rulings on this draft are applied above:
 
-1. **Answer** is `choice` (action `id`, server stores its `value`) plus an
-   optional `comment`. A comment alone is accepted only where free text is
-   accepted today.
+1. **Answer** carries at most one of `choice` (an action `id`, and the server
+   stores its `value`), `comment` (the typed reply of a `text` action) and
+   `result` (`attention-client.ui/1` only). With none of them, the answer is
+   no comment. More than one is `invalid_field`. This keeps today's answer
+   semantics (rulings 1, 9 and 10).
 2. **Lifecycle** is removed from the client API. No person-side clear or
    dismiss frame exists today: the only terminal write a person's device can
    make is `answer`, including its Seen choice and `answer_no_comment`. So
@@ -510,19 +532,8 @@ The delivery owner's first rulings on this draft are applied above:
 7. **Positions** start at 0, and resource `rev`s at 1 (§1).
 8. **Entry `position`** is immutable creation order. Paging, `before` and the
    read position compare by it.
+9. **Structured answers:** an optional `result` object, accepted only for
+   `attention-client.ui/1` items (see ruling 1 above).
+10. **Answer members are mutually exclusive** (see ruling 1 above).
 
-## 10. Open questions for the delivery owner
-
-9. **Structured answers.** Items whose `answer_ui` uses the
-   `attention-client.ui/1` schema (inputs of kind `response`, `text` or
-   `point`) are answered today with a structured result object, not with an
-   action `id`. `{choice, comment}` cannot carry that. Proposal: an optional
-   `result` object, accepted only for `attention-client.ui/1` items and
-   stored as today's answer value; `choice` and `comment` stay for
-   `attention-client.actions/1`.
-10. **Choice plus comment.** For `attention-client.actions/1` items, today's
-    answer is one value: either the chosen action's `value` or, for a `text`
-    action, the typed text. No stored answer holds both a choice and a
-    comment. Storing a comment beside a choice is therefore new answer
-    behavior. Should `choice` and `comment` be mutually exclusive instead
-    (`comment` meaning the `text` action's reply)?
+No questions are open.
