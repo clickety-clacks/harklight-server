@@ -400,13 +400,18 @@ defmodule AttentionServer.Conversation do
           end)
           |> MapSet.size()
 
+        # A request keeps its chat open while it is unresolved or while a person
+        # chat turn on it still waits for the agent to act on it.
         open_chats =
           entries
-          |> Enum.reduce(MapSet.new(), fn {_seq, entry}, requests ->
+          |> Enum.reduce(MapSet.new(), fn {seq, entry}, requests ->
             request_key = {person, entry["sender_id"], entry["message_id"]}
             record = Map.get(engine.messages, request_key)
 
-            if (entry["session_handle"] == handle and record) && record.origin == origin do
+            if (entry["session_handle"] == handle and record) && record.origin == origin and
+                 (is_nil(record.terminal) or
+                    (actionable?(entry) and needs_action?(engine, person, entry) and
+                       not Map.has_key?(engine.origin_actions, {person, origin, seq}))) do
               MapSet.put(requests, request_key)
             else
               requests
