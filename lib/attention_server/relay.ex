@@ -776,7 +776,8 @@ defmodule AttentionServer.Relay do
 
   @impl true
   def init(opts) do
-    case Store.open(Keyword.get(opts, :store_path)) do
+    case Store.open(Keyword.get(opts, :store_path))
+         |> client_api_v2_store(Keyword.get(opts, :feature_flags_path)) do
       {:ok, store} ->
         case startup_cleanup(store) do
           {:ok, store} ->
@@ -854,6 +855,28 @@ defmodule AttentionServer.Relay do
         {:stop, reason}
     end
   end
+
+  # With the client_api_v2 flag on at startup, the store writes the change log
+  # in every commit. The flag is read once, here, before any startup commit.
+  defp client_api_v2_store({:ok, store}, feature_flags_path) do
+    {flags, _warned} = AttentionServer.FeatureFlags.read(feature_flags_path, true)
+
+    if Map.get(flags, "client_api_v2") == true do
+      case Store.enable_change_log(store) do
+        {:ok, store} ->
+          {:ok, store}
+
+        {:error, reason} ->
+          Diagnostics.failure(:server_startup, :configuration, reason, :unavailable)
+          Store.close(store)
+          {:error, {:storage_unavailable, reason}}
+      end
+    else
+      {:ok, store}
+    end
+  end
+
+  defp client_api_v2_store(error, _feature_flags_path), do: error
 
   defp startup_cleanup(store) do
     actor_keys = browser_actor_keys(store.engine)

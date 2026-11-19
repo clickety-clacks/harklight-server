@@ -38,7 +38,8 @@ defmodule AttentionServer.Store do
     :large_persisted,
     :large_index,
     progress_version: 0,
-    encoding_cache: %{}
+    encoding_cache: %{},
+    change_log: false
   ]
 
   @progress_fields [:cursors, :conversation_cursors, :conversation_opened]
@@ -136,6 +137,20 @@ defmodule AttentionServer.Store do
   """
 
   def open(nil), do: {:ok, %__MODULE__{db: nil, engine: Engine.new(), version: 0}}
+
+  @doc """
+  Turns on the client API v2 change log for this durable store: creates its
+  tables, reconciles it with the snapshot, and from then on writes its rows in
+  every commit's transaction. A store that is never enabled is unchanged.
+  """
+  def enable_change_log(%__MODULE__{db: nil}), do: {:error, :not_durable}
+
+  def enable_change_log(%__MODULE__{db: db, version: version} = store) do
+    case AttentionServer.ChangeLog.enable(db, version) do
+      :ok -> {:ok, %{store | change_log: true}}
+      _ -> {:error, :storage_unavailable}
+    end
+  end
 
   def open(":memory:") do
     Diagnostics.failure(:server_storage, :store_open, :invalid_store_path, :unavailable)
@@ -1082,6 +1097,20 @@ defmodule AttentionServer.Store do
         large_index: nil
     }
 
+    # The change log's rows are found here, against the engine this process
+    # already holds, and written in the snapshot's transaction.
+    log =
+      if store.change_log do
+        pending = AttentionServer.ChangeLog.changes(store.engine, next)
+
+        seeded =
+          Map.new(pending, fn {person, _} ->
+            {person, AttentionServer.ChangeLog.seeded?(store.engine, person)}
+          end)
+
+        {pending, seeded}
+      end
+
     result =
       with {:ok, durable_next, persisted, index} <- prepare_large_data(store, next) do
         old_ids =
@@ -1093,15 +1122,17 @@ defmodule AttentionServer.Store do
         rows = LargeData.reference_index_rows(index)
 
         case Persistence.run(fn ->
-               persist_snapshot(generation, persisted, rows, audit, old_ids, next_ids)
+               persist_snapshot(generation, persisted, rows, audit, old_ids, next_ids, log)
              end) do
-          {:ok, cache} -> {:ok, cache, durable_next, persisted, index}
+          {:ok, cache, heads} -> {:ok, cache, heads, durable_next, persisted, index}
           error -> error
         end
       end
 
     case result do
-      {:ok, cache, durable_next, persisted, index} ->
+      {:ok, cache, heads, durable_next, persisted, index} ->
+        AttentionServer.ChangeLog.notify(heads)
+
         {:ok,
          %{
            store
@@ -1159,7 +1190,8 @@ defmodule AttentionServer.Store do
          reference_rows,
          audit,
          old_ids,
-         next_ids
+         next_ids,
+         log
        ) do
     with {payload, cache} <-
            SnapshotEncoding.encode(persisted, @format_version, store.encoding_cache),
@@ -1181,6 +1213,7 @@ defmodule AttentionServer.Store do
              "INSERT INTO relay_audit (person_id, actor_id, action, at_ms) VALUES (?, ?, ?, ?)",
              [audit.person, audit.actor, audit.action, System.system_time(:millisecond)]
            ),
+         {:ok, heads} <- append_change_log(db, log, version + 1),
          :ok <- Sqlite3.execute(db, "COMMIT") do
       if is_binary(upload_dir) do
         case LargeData.delete_unreferenced(upload_dir, old_ids, next_ids) do
@@ -1198,9 +1231,14 @@ defmodule AttentionServer.Store do
         end
       end
 
-      {:ok, cache}
+      {:ok, cache, heads}
     end
   end
+
+  defp append_change_log(_db, nil, _version), do: {:ok, %{}}
+
+  defp append_change_log(db, {pending, seeded}, version),
+    do: AttentionServer.ChangeLog.append(db, pending, seeded, version)
 
   # ACKs must be durable before their replies, but do not change retained history.
   # The overlay is tied to the snapshot generation. Older releases ignore it;
