@@ -1160,84 +1160,78 @@ defmodule AttentionServer.Engine do
     end
   end
 
-  @pending_lifetime_ms 24 * 60 * 60 * 1_000
-  @status_lifetime_ms 24 * 60 * 60 * 1_000
-
-  @doc "Create a content-free pending request; only the secret hash is persisted."
-  def pending_enroll(
-        %__MODULE__{pending_clock_high_water: floor},
-        _cert,
-        _label,
-        _code,
-        _hash,
-        now_ms
-      )
-      when is_integer(now_ms) and now_ms < floor,
-      do: {:error, :clock_unavailable}
-
-  def pending_enroll(%__MODULE__{} = engine, cert_der, label, code, secret_hash, now_ms)
-      when is_integer(now_ms) and now_ms >= 0 do
+  @doc "Create a content-free pending request; only the secret hash is persisted. A waiting request does not expire."
+  def pending_enroll(%__MODULE__{} = engine, cert_der, label, code, secret_hash) do
     with {:ok, key} <- DeviceIdentity.from_certificate(cert_der) do
-      compacted = compact_pending(engine, now_ms)
-
       cond do
         not bounded_text?(label) or not valid_code?(code) or
-          not (is_binary(secret_hash) and byte_size(secret_hash) == 32) or
-            not (is_integer(now_ms) and now_ms >= 0) ->
+            not (is_binary(secret_hash) and byte_size(secret_hash) == 32) ->
           {:error, :invalid_request}
 
-        principal_key_used?(compacted, key) ->
+        principal_key_used?(engine, key) ->
           {:error, :key_in_use}
 
-        Enum.any?(compacted.pending_enrollments, fn {_code, item} ->
+        Enum.any?(engine.pending_enrollments, fn {_code, item} ->
           item.key == key and item.state == :pending
         end) ->
           {:error, :key_pending}
 
-        Map.has_key?(compacted.pending_enrollments, code) or
-          Map.has_key?(compacted.pending_history, code) or
-          Enum.any?(compacted.pending_enrollments, fn {_code, item} ->
-            item.secret_hash == secret_hash
-          end) or
-            Enum.any?(compacted.pending_history, fn {_code, item} ->
-              item.secret_hash == secret_hash
-            end) ->
+        Map.has_key?(engine.pending_enrollments, code) or
+          Map.has_key?(engine.pending_history, code) or pending_secret_used?(engine, secret_hash) ->
           {:error, :collision}
 
         true ->
-          expires_at = now_ms + @pending_lifetime_ms
-
           item = %{
             key: key,
             certificate: cert_der,
             label: label,
             secret_hash: secret_hash,
-            expires_at: expires_at,
-            status_expires_at: expires_at + @status_lifetime_ms,
+            expires_at: nil,
+            status_expires_at: nil,
             state: :pending,
             person: nil,
             request_generation: 1
           }
 
           {:ok,
-           %{
-             compacted
-             | pending_enrollments: Map.put(compacted.pending_enrollments, code, item),
-               pending_clock_high_water: now_ms
-           }}
+           %{engine | pending_enrollments: Map.put(engine.pending_enrollments, code, item)}}
       end
+    else
+      _ -> {:error, :invalid_request}
     end
   end
 
-  def pending_enroll(_, _, _, _, _, _), do: {:error, :invalid_request}
+  @doc """
+  Start again for a key that already has a waiting plain request: the same
+  request and approval code are kept, the label is refreshed and the status
+  secret is replaced with the new one so the caller can read the request.
+  Returns `:none` when the key has no waiting plain request.
+  """
+  def pending_restart(%__MODULE__{} = engine, cert_der, label, secret_hash) do
+    with {:ok, key} <- DeviceIdentity.from_certificate(cert_der),
+         true <- bounded_text?(label),
+         true <- is_binary(secret_hash) and byte_size(secret_hash) == 32,
+         false <- pending_secret_used?(engine, secret_hash),
+         {code, item} <-
+           Enum.find(engine.pending_enrollments, fn {_code, item} ->
+             item.key == key and item.state == :pending and is_nil(item.person)
+           end) do
+      renewed = %{item | secret_hash: secret_hash, label: label}
 
-  def pending_status(%__MODULE__{} = engine, secret_hash, now_ms) do
-    now_ms = max(now_ms, engine.pending_clock_high_water)
+      {:ok, %{engine | pending_enrollments: Map.put(engine.pending_enrollments, code, renewed)},
+       code}
+    else
+      _ -> :none
+    end
+  end
 
+  defp pending_secret_used?(engine, secret_hash) do
+    Enum.any?(engine.pending_enrollments, fn {_code, item} -> item.secret_hash == secret_hash end) or
+      Enum.any?(engine.pending_history, fn {_code, item} -> item.secret_hash == secret_hash end)
+  end
+
+  def pending_status(%__MODULE__{} = engine, secret_hash) do
     case find_pending_secret(engine, secret_hash) do
-      {_, %{status_expires_at: deadline}} when now_ms >= deadline ->
-        {:error, :not_found}
-
       {code, %{state: :approved, person: person, key: key} = item} ->
         if get_in(engine.devices, [key, :revoked]) == false do
           if Map.get(item, :joined, false) do
@@ -1260,13 +1254,6 @@ defmodule AttentionServer.Engine do
 
       {_, %{state: state}} when state in [:declined, :cancelled] ->
         {:ok, %{"state" => Atom.to_string(state)}}
-
-      {code, %{state: :pending, expires_at: deadline, person: person} = item}
-      when now_ms >= deadline and not is_nil(person) ->
-        {:ok, pending_response(Map.put(item, :code, code), "expired")}
-
-      {_, %{state: :pending, expires_at: deadline}} when now_ms >= deadline ->
-        {:ok, %{"state" => "expired"}}
 
       {code, %{state: :pending} = item} ->
         if is_nil(item.person),
@@ -1291,104 +1278,58 @@ defmodule AttentionServer.Engine do
     if item.person, do: Map.put(base, "person_id", item.person), else: base
   end
 
-  @doc "Resume one original secret-bound waiting request; only its approval epoch changes."
-  def pending_resume(engine, secret_hash, cert_der, fresh_code, now_ms) do
-    cond do
-      not is_integer(now_ms) or now_ms < engine.pending_clock_high_water ->
-        {:error, :clock_unavailable}
+  @doc "Read one original secret-bound guided request again with the same certificate."
+  def pending_resume(engine, secret_hash, cert_der) do
+    with {:ok, key} <- DeviceIdentity.from_certificate(cert_der),
+         {code, item} <- find_pending_secret(engine, secret_hash),
+         true <- item.key == key do
+      cond do
+        Map.get(item, :joined, false) != true or is_nil(item.person) ->
+          {:error, :not_found}
 
-      true ->
-        with {:ok, key} <- DeviceIdentity.from_certificate(cert_der),
-             {old_code, item} <- find_pending_secret(engine, secret_hash),
-             true <- item.key == key do
-          cond do
-            Map.get(item, :joined, false) != true or is_nil(item.person) ->
+        item.state == :expired ->
+          {:error, :not_found}
+
+        item.state != :pending ->
+          case item.state do
+            :approved ->
+              if get_in(engine.devices, [key, :revoked]) == false,
+                do: {:ok, engine, pending_response(Map.put(item, :code, code), "approved")},
+                else: {:ok, engine, %{"state" => "revoked"}}
+
+            state when state in [:cancelled, :declined] ->
+              {:ok, engine, %{"state" => Atom.to_string(state)}}
+
+            _ ->
               {:error, :not_found}
-
-            item.state == :expired ->
-              {:error, :not_found}
-
-            item.state != :pending ->
-              case item.state do
-                :approved ->
-                  if get_in(engine.devices, [key, :revoked]) == false,
-                    do:
-                      {:ok, engine, pending_response(Map.put(item, :code, old_code), "approved")},
-                    else: {:ok, engine, %{"state" => "revoked"}}
-
-                state when state in [:cancelled, :declined] ->
-                  {:ok, engine, %{"state" => Atom.to_string(state)}}
-
-                _ ->
-                  {:error, :not_found}
-              end
-
-            is_nil(item.person) or not Map.has_key?(engine.persons, item.person) ->
-              {:error, :not_found}
-
-            principal_key_used?(engine, key) ->
-              {:error, :conflict}
-
-            now_ms < item.expires_at ->
-              {:ok, engine, pending_response(Map.put(item, :code, old_code), "pending")}
-
-            not valid_code?(fresh_code) or Map.has_key?(engine.pending_enrollments, fresh_code) or
-                Map.has_key?(engine.pending_history, fresh_code) ->
-              {:error, :collision}
-
-            true ->
-              renewed =
-                item
-                |> Map.put(:certificate, cert_der)
-                |> Map.put(:legacy_recovery, false)
-                |> Map.put(:expires_at, now_ms + @pending_lifetime_ms)
-                |> Map.put(
-                  :status_expires_at,
-                  now_ms + @pending_lifetime_ms + @status_lifetime_ms
-                )
-                |> Map.put(:request_generation, item.request_generation + 1)
-
-              invitations =
-                Map.new(engine.join_invitations, fn {hash, invite} ->
-                  if invite.code == old_code and invite.key == key and
-                       invite.secret_hash == secret_hash and invite.person == item.person,
-                     do: {hash, %{invite | code: fresh_code}},
-                     else: {hash, invite}
-                end)
-
-              next = %{
-                engine
-                | pending_enrollments:
-                    engine.pending_enrollments
-                    |> Map.delete(old_code)
-                    |> Map.put(fresh_code, renewed),
-                  join_invitations: invitations,
-                  pending_clock_high_water: now_ms
-              }
-
-              {:ok, next, pending_response(Map.put(renewed, :code, fresh_code), "pending")}
           end
-        else
-          _ -> {:error, :not_found}
-        end
+
+        not Map.has_key?(engine.persons, item.person) ->
+          {:error, :not_found}
+
+        principal_key_used?(engine, key) ->
+          {:error, :conflict}
+
+        true ->
+          {:ok, engine, pending_response(Map.put(item, :code, code), "pending")}
+      end
+    else
+      _ -> {:error, :not_found}
     end
   end
 
-  def pending_lookup(%__MODULE__{} = engine, person, owner_key, code, now_ms) do
-    now_ms = max(now_ms, engine.pending_clock_high_water)
-
+  def pending_lookup(%__MODULE__{} = engine, person, owner_key, code) do
     with {:ok, _revision} <- owner_revision(engine, person, owner_key),
          item when not is_nil(item) <-
            Map.get(engine.pending_enrollments, code) || Map.get(engine.pending_history, code),
-         true <- is_nil(Map.get(item, :person)) or item.person == person,
-         true <- now_ms < item.status_expires_at do
+         true <- is_nil(Map.get(item, :person)) or item.person == person do
       case item do
-        %{state: :pending, expires_at: deadline} when now_ms < deadline ->
+        %{state: :pending} ->
           {:ok,
            %{
              label: item.label,
              key: item.key,
-             expires_at: deadline,
+             expires_at: item.expires_at,
              can_grant_senders: is_nil(Map.get(item, :person))
            }}
 
@@ -1413,11 +1354,9 @@ defmodule AttentionServer.Engine do
         senders,
         now_ms
       ) do
-    now_ms = max(now_ms, engine.pending_clock_high_water)
-
     with {:ok, _revision} <- owner_revision(engine, person, owner_key),
          {:ok, :expected} <-
-           if(hex_key?(expected_key) and is_integer(expected_expires_at),
+           if(hex_key?(expected_key) and (is_nil(expected_expires_at) or is_integer(expected_expires_at)),
              do: {:ok, :expected},
              else: {:error, :invalid_expected_binding}
            ),
@@ -1438,10 +1377,6 @@ defmodule AttentionServer.Engine do
         item.key != expected_key or item.expires_at != expected_expires_at ->
           {:error, :not_found}
 
-        now_ms >= item.status_expires_at and
-            not (item.state == :approved and Map.get(item, :joined, false)) ->
-          {:error, :not_found}
-
         item.state == :approved and get_in(engine.devices, [item.key, :revoked]) == true ->
           {:error, :revoked}
 
@@ -1457,9 +1392,6 @@ defmodule AttentionServer.Engine do
 
         item.state in [:declined, :cancelled] ->
           {:error, item.state}
-
-        now_ms >= item.expires_at ->
-          {:error, :expired}
 
         principal_key_used?(engine, item.key) ->
           {:error, :key_in_use}
@@ -1485,8 +1417,7 @@ defmodule AttentionServer.Engine do
              %{
                granted
                | pending_enrollments: Map.delete(granted.pending_enrollments, code),
-                 pending_history: Map.put(granted.pending_history, code, receipt),
-                 pending_clock_high_water: now_ms
+                 pending_history: Map.put(granted.pending_history, code, receipt)
              }, item.key}
           end
       end
@@ -1503,87 +1434,7 @@ defmodule AttentionServer.Engine do
       Enum.find(engine.pending_history, fn {_code, item} -> item.secret_hash == secret_hash end)
   end
 
-  @doc "Persist a crossed pending deadline before releasing an observation."
-  def pending_observe_time(%__MODULE__{} = engine, {:secret, hash}, now_ms) do
-    observe_pending_deadline(engine, find_pending_secret(engine, hash), now_ms)
-  end
-
-  def pending_observe_time(%__MODULE__{} = engine, {:code, code}, now_ms) do
-    item = Map.get(engine.pending_enrollments, code) || Map.get(engine.pending_history, code)
-    observe_pending_deadline(engine, if(item, do: {code, item}, else: nil), now_ms)
-  end
-
-  defp observe_pending_deadline(engine, {_, item}, now_ms) do
-    crossed =
-      cond do
-        now_ms >= item.status_expires_at -> item.status_expires_at
-        now_ms >= item.expires_at -> item.expires_at
-        true -> engine.pending_clock_high_water
-      end
-
-    if crossed > engine.pending_clock_high_water,
-      do: %{engine | pending_clock_high_water: crossed},
-      else: engine
-  end
-
-  defp observe_pending_deadline(engine, _item, _now_ms), do: engine
-
-  defp compact_pending(engine, now_ms) do
-    retained_history =
-      Map.reject(engine.pending_history, fn {_code, receipt} ->
-        receipt.status_expires_at <= now_ms and
-          not (receipt.state == :approved and Map.get(receipt, :joined, false))
-      end)
-
-    {active, history} =
-      Enum.reduce(engine.pending_enrollments, {%{}, retained_history}, fn {code, item},
-                                                                          {active, history} ->
-        cond do
-          item.state == :approved ->
-            receipt = %{
-              state: :approved,
-              secret_hash: item.secret_hash,
-              person: item.person,
-              key: item.key,
-              label: item.label,
-              expires_at: item.expires_at,
-              status_expires_at: item.status_expires_at,
-              approved_by: Map.get(item, :approved_by),
-              request_generation: Map.get(item, :request_generation, 1),
-              joined: Map.get(item, :joined, false)
-            }
-
-            if now_ms < item.status_expires_at or receipt.joined,
-              do: {active, Map.put(history, code, receipt)},
-              else: {active, history}
-
-          item.expires_at <= now_ms and is_nil(item.person) ->
-            if now_ms < item.status_expires_at do
-              receipt = %{
-                state: :expired,
-                secret_hash: item.secret_hash,
-                key: item.key,
-                expires_at: item.expires_at,
-                status_expires_at: item.status_expires_at
-              }
-
-              {active, Map.put(history, code, receipt)}
-            else
-              {active, history}
-            end
-
-          true ->
-            {Map.put(active, code, item), history}
-        end
-      end)
-
-    %{engine | pending_enrollments: active, pending_history: history}
-    |> AttentionServer.GuidedJoin.compact(now_ms)
-  end
-
-  def pending_decline(engine, person, owner_key, code, expected_key, expected_deadline, now) do
-    now = max(now, engine.pending_clock_high_water)
-
+  def pending_decline(engine, person, owner_key, code, expected_key, expected_deadline) do
     with {:ok, _} <- owner_revision(engine, person, owner_key),
          %{state: :pending, person: ^person} = item <- Map.get(engine.pending_enrollments, code),
          true <- item.key == expected_key and item.expires_at == expected_deadline do
@@ -1603,8 +1454,7 @@ defmodule AttentionServer.Engine do
        %{
          engine
          | pending_enrollments: Map.delete(engine.pending_enrollments, code),
-           pending_history: Map.put(engine.pending_history, code, receipt),
-           pending_clock_high_water: now
+           pending_history: Map.put(engine.pending_history, code, receipt)
        }}
     else
       {:error, :forbidden} -> {:error, :forbidden}
@@ -1613,19 +1463,13 @@ defmodule AttentionServer.Engine do
   end
 
   @doc "Cancel only the exact secret-bound pending request; an already committed approval wins."
-  def pending_cancel(engine, secret_hash, code, expected_key, expected_deadline, now) do
-    now = max(now, engine.pending_clock_high_water)
-
+  def pending_cancel(engine, secret_hash, code, expected_key, expected_deadline) do
     with {current_code, item} <- find_pending_secret(engine, secret_hash),
          true <- item.key == expected_key do
       cond do
         item.state == :pending and
             (code != current_code or expected_deadline != item.expires_at) ->
-          {:error, :stale_request,
-           pending_response(
-             Map.put(item, :code, current_code),
-             if(now >= item.expires_at, do: "expired", else: "pending")
-           )}
+          {:error, :stale_request, pending_response(Map.put(item, :code, current_code), "pending")}
 
         item.state != :pending ->
           cond do
@@ -1640,7 +1484,7 @@ defmodule AttentionServer.Engine do
               {:ok, engine, %{"state" => Atom.to_string(item.state)}}
 
             true ->
-              with {:ok, status} <- pending_status(engine, secret_hash, now),
+              with {:ok, status} <- pending_status(engine, secret_hash),
                    do: {:ok, engine, status}
           end
 
@@ -1661,8 +1505,7 @@ defmodule AttentionServer.Engine do
           next = %{
             engine
             | pending_enrollments: Map.delete(engine.pending_enrollments, code),
-              pending_history: Map.put(engine.pending_history, code, receipt),
-              pending_clock_high_water: now
+              pending_history: Map.put(engine.pending_history, code, receipt)
           }
 
           {:ok, next, %{"state" => "cancelled"}}

@@ -11,17 +11,17 @@ defmodule AttentionServer.DashboardInventory do
 
   alias AttentionServer.Engine
 
-  def for_owner(%Engine{} = engine, person, owner_key, now_ms \\ System.system_time(:millisecond)) do
+  def for_owner(%Engine{} = engine, person, owner_key) do
     case Engine.owner_revision(engine, person, owner_key) do
-      {:ok, _revision} -> {:ok, snapshot(engine, {:person, person}, person, now_ms)}
+      {:ok, _revision} -> {:ok, snapshot(engine, {:person, person}, person)}
       _ -> {:error, :forbidden}
     end
   end
 
-  def for_device(%Engine{} = engine, device_key, now_ms \\ System.system_time(:millisecond)) do
+  def for_device(%Engine{} = engine, device_key) do
     case Map.get(engine.devices, device_key) do
       %{person: person, revoked: false} ->
-        {:ok, snapshot(engine, {:person, person}, person, now_ms)}
+        {:ok, snapshot(engine, {:person, person}, person)}
 
       _ ->
         {:error, :forbidden}
@@ -31,21 +31,18 @@ defmodule AttentionServer.DashboardInventory do
   def for_account_owner(
         %Engine{} = engine,
         configured_owner_person,
-        owner_key,
-        now_ms \\ System.system_time(:millisecond)
+        owner_key
       ) do
     case Engine.owner_revision(engine, configured_owner_person, owner_key) do
       {:ok, _revision} when is_binary(configured_owner_person) ->
-        {:ok, snapshot(engine, :all, "Server owner", now_ms)}
+        {:ok, snapshot(engine, :all, "Server owner")}
 
       _ ->
         {:error, :forbidden}
     end
   end
 
-  defp snapshot(engine, scope, display_name, now_ms) do
-    effective_now = max(now_ms, engine.pending_clock_high_water)
-
+  defp snapshot(engine, scope, display_name) do
     devices =
       engine.devices
       |> Enum.filter(fn {_key, device} -> visible_person?(scope, device.person) end)
@@ -65,8 +62,7 @@ defmodule AttentionServer.DashboardInventory do
     waiting =
       engine.pending_enrollments
       |> Enum.filter(fn {_code, item} ->
-        visible_person?(scope, item.person) and item.state == :pending and
-          item.expires_at > effective_now
+        visible_person?(scope, item.person) and item.state == :pending
       end)
       |> Enum.map(fn {code, item} ->
         %{code: code, label: item.label, person_name: item.person, device_id: item.key}

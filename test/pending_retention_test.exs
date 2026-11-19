@@ -10,73 +10,6 @@ defmodule AttentionServer.PendingRetentionTest do
     %{certs: certs}
   end
 
-  test "reclaims manual requests after their 24-hour approval and readback windows",
-       %{certs: certs} do
-    certificate = TLSFixtures.certificate_der!(certs, "a2")
-
-    engine =
-      Enum.reduce(0..1_024, Engine.new(), fn index, engine ->
-        assert {:ok, next} =
-                 Engine.pending_enroll(
-                   engine,
-                   certificate,
-                   "same local key after expiry",
-                   code(index),
-                   secret_hash(index),
-                   index * 86_400_001
-                 )
-
-        next
-      end)
-
-    assert map_size(engine.pending_enrollments) == 1
-    assert map_size(engine.pending_history) == 1
-
-    assert {:error, :not_found} =
-             Engine.pending_status(engine, secret_hash(0), 1_024 * 86_400_001)
-
-    assert {:ok, %{"state" => "expired"}} =
-             Engine.pending_status(engine, secret_hash(1_023), 1_024 * 86_400_001)
-
-    other_certificate = TLSFixtures.certificate_der!(certs, "unknown")
-
-    assert {:error, :collision} =
-             Engine.pending_enroll(
-               engine,
-               other_certificate,
-               "reused approval code",
-               code(1_023),
-               secret_hash(1_025),
-               1_024 * 86_400_001 + 1
-             )
-
-    assert {:error, :collision} =
-             Engine.pending_enroll(
-               engine,
-               other_certificate,
-               "reused status secret",
-               code(1_025),
-               secret_hash(1_023),
-               1_024 * 86_400_001 + 1
-             )
-
-    path = temp_path("many-expired")
-    {:ok, store} = Store.open(path)
-
-    assert {:ok, stored} =
-             Store.commit(store, engine, %{
-               person: "unassigned",
-               actor: "pending_submitter",
-               action: "pending_retention_test"
-             })
-
-    assert :ok = Store.close(stored)
-    assert {:ok, reloaded} = Store.open(path)
-    assert reloaded.engine.pending_enrollments == engine.pending_enrollments
-    assert reloaded.engine.pending_history == engine.pending_history
-    assert :ok = Store.close(reloaded)
-  end
-
   test "approved compact receipt preserves secret readback and same-owner retry across restart",
        %{certs: certs} do
     path = temp_path("approved")
@@ -138,7 +71,7 @@ defmodule AttentionServer.PendingRetentionTest do
              Relay.pending_status(restarted, request.status_secret)
   end
 
-  test "format-six snapshot migrates pending deadlines once", %{certs: certs} do
+  test "format-six snapshot migrates its stored pending deadlines once", %{certs: certs} do
     path = temp_path("migration")
     {:ok, store} = Store.open(path)
     assert :ok = Store.close(store)
@@ -151,11 +84,13 @@ defmodule AttentionServer.PendingRetentionTest do
         certificate,
         "old pending",
         code(77),
-        secret_hash(77),
-        1
+        secret_hash(77)
       )
 
-    old_item = pending.pending_enrollments[code(77)] |> Map.delete(:status_expires_at)
+    old_item =
+      pending.pending_enrollments[code(77)]
+      |> Map.put(:expires_at, 86_400_001)
+      |> Map.delete(:status_expires_at)
     old_pending = %{pending | pending_enrollments: %{code(77) => old_item}}
 
     payload =

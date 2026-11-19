@@ -203,9 +203,9 @@ protocol. See [SELF_HOST.md](SELF_HOST.md) for the compatibility evidence limits
 
 The optional HTTPS owner dashboard creates person-bound one-use invitations,
 reviews the current code/key/deadline and approves devices without sender rights.
-The app keeps its own private key. Default pending approval lasts 24 hours;
-ordinary expiry can renew the same retained device request without a new scan or
-key, while denial, cancellation and revocation remain terminal. See
+The app keeps its own private key. A pending approval does not expire, and
+starting again with the same key returns the same waiting request and code;
+denial, cancellation and revocation remain terminal. See
 [GUIDED_JOIN.md](GUIDED_JOIN.md) for the server interface.
 
 APNs is opt-in and requires protected signing-key configuration for the

@@ -407,7 +407,6 @@ defmodule AttentionServer.EnrollmentHTTPS do
       {:error, :capacity} -> {503, %{"error" => "capacity"}}
       {:error, :key_pending} -> {409, %{"error" => "key_pending"}}
       {:error, :key_in_use} -> {409, %{"error" => "key_in_use"}}
-      {:error, :clock_unavailable} -> {503, %{"error" => "unavailable"}}
       {:error, :storage_unavailable} -> {503, %{"error" => "unavailable"}}
       _ -> {400, %{"error" => "invalid_request"}}
     end
@@ -424,7 +423,7 @@ defmodule AttentionServer.EnrollmentHTTPS do
          } = request
        )
        when map_size(request) == 4 and is_binary(secret) and is_binary(code) and
-              is_binary(key) and is_integer(deadline) do
+              is_binary(key) and (is_integer(deadline) or is_nil(deadline)) do
     case Diagnostics.result(
            :enrollment_https,
            :request_dispatch,
@@ -490,7 +489,6 @@ defmodule AttentionServer.EnrollmentHTTPS do
         {:error, :invalid_request} -> {400, %{"error" => "invalid_request"}}
         {:error, :conflict} -> {409, %{"error" => "conflict"}}
         {:error, :storage_unavailable} -> {503, %{"error" => "unavailable"}}
-        {:error, :clock_unavailable} -> {503, %{"error" => "unavailable"}}
         _ -> {404, %{"error" => "not_found"}}
       end
     else

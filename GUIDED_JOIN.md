@@ -42,8 +42,9 @@ An owner TLS v1 request with `type: "invite_create"` and its authenticated
 `person_id` returns `ok: true` and an `invitation` object. The invitation fields
 are `v: 1`, `person_id`, `server_name`, `enrollment_url`, `relay_url`, `ca_pem`,
 `ca_sha256`, `invite_token` and `expires_at`. The pin is lowercase SHA-256 of the
-single public CA certificate's DER bytes. `expires_at` is Unix milliseconds,
-30 minutes after creation. Endpoint and trust values come from server
+single public CA certificate's DER bytes. `expires_at` is `null`: an invitation
+does not expire; it works once and stops working when the owner's authority
+changes. Endpoint and trust values come from server
 configuration; a caller cannot supply their own in the owner request.
 
 The invitation object also includes `join_url`: `harklight://join#` followed by
@@ -84,32 +85,25 @@ Successful redemption atomically commits invitation consumption and its
 person-bound pending request before a reply. The HTTP 200 response contains
 `state: "pending"`, `approval_code`, `expires_at` and `status_expires_at`. The
 app retains its own status secret; the server does not generate a replacement.
-Pending approval expires 24 hours after redemption by default. The status
-response includes person/device identity and both deadlines. A compact durable
-binding retains same-device recovery authority beyond ordinary status expiry.
+A pending approval does not expire; `expires_at` and `status_expires_at` are
+`null`. The status response includes person/device identity.
 
 The same invitation, device SPKI and status secret return the same live pending
-code and deadlines after a lost reply, concurrent retry or restart. A retry does
-not replace the certificate/label or extend expiry. Once redeemed, its fixed
-24-hour pending window applies even when the original thirty-minute initial
-redemption window ends. A different binding gets HTTP 409 `used`; an unredeemed
-expired invitation or expired pending request gets HTTP 410 `expired`. Unknown,
-wrong-destination or retired-owner invitations get HTTP 404 `refused`.
+code after a lost reply, concurrent retry or restart. A retry does
+not replace the certificate/label. A different binding gets HTTP 409 `used`.
+Unknown, wrong-destination or retired-owner invitations get HTTP 404 `refused`.
 
 Matching retries of approved, declined or cancelled requests return their truthful terminal
 state. `POST /enroll/status` with only `status_secret` preserves existing status
 behavior, including `declined`, `cancelled` and `revoked` terminal states.
 
-For ordinary expiry, send `POST /enroll/resume` with the same saved
+To read a saved request again, send `POST /enroll/resume` with the same saved
 `status_secret`, original PEM `public_certificate`, and optional `label`. No
 invitation token or private key is sent. The server verifies the retained
-person/SPKI/secret binding and atomically creates one current pending generation
-with a new 24-hour deadline. Repeating the same request after a lost response or
-restart returns the same live code and deadlines without extending them. The
-response includes `person_id` and `device_id`; the client must check the exact
-saved binding before adopting it. Superseded codes cannot approve the new
-request. Decline, cancellation, revocation and retired owner authority cannot
-renew. An approved saved request returns its retained approved binding, subject
+person/SPKI/secret binding and returns the current pending request with the same
+code. The response includes `person_id` and `device_id`; the client must check the exact
+saved binding before adopting it. Decline, cancellation, revocation and retired owner
+authority do not renew. An approved saved request returns its retained approved binding, subject
 to current revocation. Native proof of current relay access is still required;
 a historical approval does not override revocation.
 
@@ -134,7 +128,7 @@ it neither renews the request nor cancels a newer generation.
 Approval and cancellation are serialized against the same durable snapshot. If
 approval committed first, cancellation returns HTTP 200 `state: "approved"`
 with `person_id` and `device_id`; it does **not** remove that device. If decline
-or expiry won, cancellation reports `declined` or `expired`. The client must
+won, cancellation reports `declined`. The client must
 follow the returned state and must not assume cancellation while an outcome is
 unknown. A requester can then deliberately use the removal operation for an
 already approved device.
@@ -163,7 +157,7 @@ optional client-certificate interface; `Server` supplies its existing CA.
 
 First successful owner approval copies the original 1–256-byte device `label`
 into the device record and records `enrolled_at` as approval-time Unix
-milliseconds, using the enrollment clock fence. Approval retries do not change
+milliseconds. Approval retries do not change
 either value. Receipt cleanup, restart and revocation preserve both. These are
 metadata, not evidence of presence or a current connection.
 
@@ -253,21 +247,18 @@ The shared server call is `Relay.owner_invite_create(relay, person_id,
 verified_owner_key, request_id)`; owner TLS `invite_create` accepts that optional
 `request_id`, and `HeadlessOwner.invite/5` carries it. A same-person/current-owner
 retry with the same UUID returns the identical original unused invitation and
-deadline across lost replies and restart, without another active invitation or
-an extended deadline. A consumed action returns `used`, an expired action
-returns `expired`, a changed destination returns `request_conflict`, and failed
+invitation across lost replies and restart, without another active invitation.
+A consumed action returns `used`, a changed destination returns `request_conflict`, and failed
 persistence never returns success. No raw bearer is added to the store: it is
 recovered through purpose-separated HMAC under the existing durable random
-server key, bound to person, owner revision, request UUID and original deadline.
+server key, bound to person, owner revision, request UUID and the invitation's
+stored deadline field (`null`).
 The request UUID is nonsecret and creates no authority. Old snapshots initialize
 missing request IDs without changing existing invitation links or grants.
 
 An unconfirmed transport/result failure returns `state: unconfirmed` with the
 same request UUID and an instruction to retry that action; it is not an
-invitation proof. Explicit refused, expired, used and capacity results name the
+invitation proof. Explicit refused, used and capacity results name the
 available recovery. A deliberate new invitation uses a fresh request UUID.
-Expired records retain the existing bounded history; after history reclamation,
-a new authorized action can issue a fresh token, and the old shared URL is never
-reactivated because its original deadline is part of bearer derivation. The
-legacy private-file command remains available for diagnostic compatibility.
+The legacy private-file command remains available for diagnostic compatibility.
 Creating a handoff result does not send a notification or approve enrollment.

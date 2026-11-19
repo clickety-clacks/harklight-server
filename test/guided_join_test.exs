@@ -42,30 +42,29 @@ defmodule AttentionServer.GuidedJoinTest do
 
   test "only current owner creates a person-bound configured-trust invitation", c do
     assert {:error, :forbidden} =
-             GuidedJoin.create(c.engine, @person, c.other_key, c.token_hash, c.config, 0)
+             GuidedJoin.create(c.engine, @person, c.other_key, c.token_hash, c.config)
 
     assert {:ok, engine, invite} = create(c)
     assert invite.person == @person
-    assert invite.expires_at == 1_800_000
+    assert invite.expires_at == nil
     assert invite.configuration == c.config
     assert engine.devices == %{}
     assert engine.sender_grants == %{}
-    assert {:error, :refused} = redeem(c, engine, %{c.config | "server_name" => "other.test"}, 1)
+    assert {:error, :refused} = redeem(c, engine, %{c.config | "server_name" => "other.test"})
     {:ok, recovered} = Engine.operator_recover(engine, @person, c.device_key)
     assert recovered.join_invitations == %{}
-    assert {:error, :refused} = redeem(c, recovered, c.config, 1)
-    assert {:error, :expired} = redeem(c, engine, c.config, 1_800_000)
-    observed = GuidedJoin.observe_time(engine, c.token_hash, 1_800_000)
-    assert {:error, _} = redeem(c, observed, c.config, 1)
+    assert {:error, :refused} = redeem(c, recovered, c.config)
+    assert {:ok, _, _} = redeem(c, engine, c.config)
   end
 
-  test "redemption binds one exact key and retry does not replace or prolong pending request",
+  test "redemption binds one exact key and retry does not replace the pending request",
        c do
     {:ok, engine, _} = create(c)
-    assert {:ok, pending, reply} = redeem(c, engine, c.config, 1)
+    assert {:ok, pending, reply} = redeem(c, engine, c.config)
     assert reply["state"] == "pending"
     assert reply["approval_code"] == @code
-    assert reply["expires_at"] == 86_400_001
+    assert reply["expires_at"] == nil
+    assert reply["status_expires_at"] == nil
     assert pending.pending_enrollments[@code].person == @person
     assert pending.pending_enrollments[@code].key == c.device_key
 
@@ -77,8 +76,7 @@ defmodule AttentionServer.GuidedJoinTest do
                "changed retry label",
                c.secret_hash,
                @other_code,
-               c.config,
-               2
+               c.config
              )
 
     assert {:error, :used} =
@@ -89,8 +87,7 @@ defmodule AttentionServer.GuidedJoinTest do
                "same",
                :crypto.hash(:sha256, "other secret"),
                @other_code,
-               c.config,
-               2
+               c.config
              )
 
     assert {:error, :used} =
@@ -101,67 +98,11 @@ defmodule AttentionServer.GuidedJoinTest do
                "same",
                c.secret_hash,
                @other_code,
-               c.config,
-               2
+               c.config
              )
 
-    assert {:error, :expired} = redeem(c, pending, c.config, 86_400_001)
     assert map_size(pending.pending_enrollments) == 1
     assert pending.devices == %{}
-  end
-
-  test "late redemption retains its own fixed 24-hour approval/retry window", c do
-    {:ok, engine, _} = create(c)
-    {:ok, pending, reply} = redeem(c, engine, c.config, 1_740_000)
-    assert reply["expires_at"] == 88_140_000
-    assert {:ok, ^pending, ^reply} = redeem(c, pending, c.config, 1_800_001)
-    assert {:error, :expired} = redeem(c, pending, c.config, 88_140_000)
-  end
-
-  test "unused invitations expire by their own deadline and are not capped by count", c do
-    invite = %{
-      person: @person,
-      owner_key: c.owner_key,
-      owner_revision: 1,
-      configuration: c.config,
-      expires_at: 1_800_000,
-      retain_until: 1_800_000,
-      code: nil,
-      key: nil,
-      secret_hash: nil,
-      request_id: nil
-    }
-
-    invitations =
-      Map.new(1..1_024, fn index ->
-        {:crypto.hash(:sha256, "invite-#{index}"), invite}
-      end)
-
-    full = %{c.engine | join_invitations: invitations}
-    assert GuidedJoin.valid_state?(full)
-
-    overflow_hash = :crypto.hash(:sha256, "invite-1025")
-
-    assert {:ok, over_limit, _} =
-             GuidedJoin.create(full, @person, c.owner_key, overflow_hash, c.config, 1)
-
-    assert map_size(over_limit.join_invitations) == 1_025
-    assert GuidedJoin.valid_state?(over_limit)
-
-    after_expiry_hash = :crypto.hash(:sha256, "invite-after-expiry")
-
-    assert {:ok, compacted, _} =
-             GuidedJoin.create(
-               over_limit,
-               @person,
-               c.owner_key,
-               after_expiry_hash,
-               c.config,
-               1_800_001
-             )
-
-    assert map_size(compacted.join_invitations) == 1
-    assert Map.has_key?(compacted.join_invitations, after_expiry_hash)
   end
 
   test "owner recovery removes invitations superseded with the old owner", c do
@@ -169,7 +110,7 @@ defmodule AttentionServer.GuidedJoinTest do
     other_hash = :crypto.hash(:sha256, "other-person-invite")
 
     {:ok, with_other, _} =
-      GuidedJoin.create(engine, @other, c.other_key, other_hash, c.config, 1)
+      GuidedJoin.create(engine, @other, c.other_key, other_hash, c.config)
 
     {:ok, recovered} = Engine.operator_recover(with_other, @person, c.device_key)
 
@@ -181,9 +122,10 @@ defmodule AttentionServer.GuidedJoinTest do
   test "approval requires current intended owner, exact key/deadline and empty sender grants",
        c do
     {:ok, engine, _} = create(c)
-    {:ok, pending, reply} = redeem(c, engine, c.config, 1)
+    {:ok, pending, reply} = redeem(c, engine, c.config)
     deadline = reply["expires_at"]
-    assert {:error, :not_found} = Engine.pending_lookup(pending, @other, c.other_key, @code, 2)
+    assert deadline == nil
+    assert {:error, :not_found} = Engine.pending_lookup(pending, @other, c.other_key, @code)
 
     assert {:error, :not_found} =
              Engine.pending_approve(
@@ -216,7 +158,7 @@ defmodule AttentionServer.GuidedJoinTest do
                c.owner_key,
                @code,
                c.device_key,
-               deadline + 1,
+               1,
                [],
                2
              )
@@ -248,12 +190,12 @@ defmodule AttentionServer.GuidedJoinTest do
     assert key == c.device_key
     assert approved.devices[key].person == @person
     assert MapSet.size(Map.get(approved.sender_grants, {@person, key}, MapSet.new())) == 0
-    assert {:ok, %{"state" => "approved"}} = Engine.pending_status(approved, c.secret_hash, 3)
+    assert {:ok, %{"state" => "approved"}} = Engine.pending_status(approved, c.secret_hash)
   end
 
   test "exact owner decline is terminal and truthfully visible without enrolling a device", c do
     {:ok, engine, _} = create(c)
-    {:ok, pending, reply} = redeem(c, engine, c.config, 1)
+    {:ok, pending, reply} = redeem(c, engine, c.config)
     deadline = reply["expires_at"]
 
     assert {:error, :not_found} =
@@ -263,8 +205,7 @@ defmodule AttentionServer.GuidedJoinTest do
                c.other_key,
                @code,
                c.device_key,
-               deadline,
-               2
+               deadline
              )
 
     assert {:ok, declined} =
@@ -274,12 +215,11 @@ defmodule AttentionServer.GuidedJoinTest do
                c.owner_key,
                @code,
                c.device_key,
-               deadline,
-               2
+               deadline
              )
 
-    assert {:ok, %{"state" => "declined"}} = Engine.pending_status(declined, c.secret_hash, 3)
-    assert {:ok, ^declined, %{"state" => "declined"}} = redeem(c, declined, c.config, 3)
+    assert {:ok, %{"state" => "declined"}} = Engine.pending_status(declined, c.secret_hash)
+    assert {:ok, ^declined, %{"state" => "declined"}} = redeem(c, declined, c.config)
 
     assert {:error, :declined} =
              Engine.pending_approve(
@@ -426,8 +366,7 @@ defmodule AttentionServer.GuidedJoinTest do
     assert {:ok, %{"state" => "pending"}} =
              Engine.pending_status(
                migrated.engine,
-               :crypto.hash(:sha256, Base.decode16!(manual.status_secret, case: :lower)),
-               System.system_time(:millisecond)
+               :crypto.hash(:sha256, Base.decode16!(manual.status_secret, case: :lower))
              )
 
     assert {:ok, _, _} =
@@ -436,17 +375,16 @@ defmodule AttentionServer.GuidedJoinTest do
                person,
                c.owner_key,
                c.token_hash,
-               c.config,
-               System.system_time(:millisecond)
+               c.config
              )
 
     Store.close(migrated)
   end
 
-  test "approved device label and enrollment time outlive receipt cleanup, retry and revocation",
+  test "approved device label and enrollment time outlive retry and revocation",
        c do
     {:ok, engine, _} = create(c)
-    {:ok, pending, reply} = redeem(c, engine, c.config, 1)
+    {:ok, pending, reply} = redeem(c, engine, c.config)
 
     {:ok, approved, key} =
       Engine.pending_approve(
@@ -481,22 +419,14 @@ defmodule AttentionServer.GuidedJoinTest do
         TLSFixtures.certificate_der!(c.certs, "unknown"),
         "another device",
         @other_code,
-        :crypto.hash(:sha256, "fresh-status"),
-        reply["status_expires_at"]
+        :crypto.hash(:sha256, "fresh-status")
       )
 
     assert cleaned.pending_history[@code].joined
 
     assert {:ok, ^cleaned, %{"state" => "approved", "device_id" => ^key}} =
-             Engine.pending_resume(
-               cleaned,
-               c.secret_hash,
-               c.device,
-               @other_code,
-               reply["status_expires_at"]
-             )
+             Engine.pending_resume(cleaned, c.secret_hash, c.device)
 
-    assert cleaned.join_invitations == %{}
     {:ok, removed, _} = Engine.device_remove(cleaned, key)
     assert removed.devices[key].label == "app"
     assert removed.devices[key].enrolled_at == 123
@@ -510,73 +440,6 @@ defmodule AttentionServer.GuidedJoinTest do
     {:ok, reloaded} = Store.open(path)
     assert reloaded.engine.devices[key] == removed.devices[key]
     Store.close(reloaded)
-  end
-
-  test "a full retained-request set renews the existing joined attempt and admits another request",
-       c do
-    {:ok, engine, _} = create(c)
-    {:ok, pending, reply} = redeem(c, engine, c.config, 1)
-
-    retained =
-      Map.new(1..1_023, fn index ->
-        code = "ZZ" <> Base.encode32(<<index::40>>, padding: false)
-
-        {code,
-         %{
-           state: :expired,
-           key: c.other_key,
-           secret_hash: :crypto.hash(:sha256, <<index::32>>),
-           expires_at: reply["expires_at"] + 1,
-           status_expires_at: reply["expires_at"] + 86_400_000
-         }}
-      end)
-
-    full = %{pending | pending_history: retained}
-    assert map_size(full.pending_enrollments) + map_size(full.pending_history) == 1_024
-
-    assert {:ok, renewed, %{"request_generation" => 2, "approval_code" => new_code}} =
-             Engine.pending_resume(
-               full,
-               c.secret_hash,
-               c.device,
-               @other_code,
-               reply["expires_at"]
-             )
-
-    assert map_size(renewed.pending_enrollments) + map_size(renewed.pending_history) == 1_024
-
-    assert {:ok, over_limit} =
-             Engine.pending_enroll(
-               renewed,
-               TLSFixtures.certificate_der!(c.certs, "unknown"),
-               "new device",
-               "ABCDEFGH24",
-               :crypto.hash(:sha256, "new request"),
-               reply["expires_at"] + 1
-             )
-
-    assert map_size(over_limit.pending_enrollments) + map_size(over_limit.pending_history) ==
-             1_025
-
-    assert {:ok, declined} =
-             Engine.pending_decline(
-               renewed,
-               @person,
-               c.owner_key,
-               new_code,
-               c.device_key,
-               reply["expires_at"] + 86_400_000,
-               reply["expires_at"] + 1
-             )
-
-    assert {:ok, ^declined, %{"state" => "declined"}} =
-             Engine.pending_resume(
-               declined,
-               c.secret_hash,
-               c.device,
-               "ABCDEFGH24",
-               reply["expires_at"] + 2
-             )
   end
 
   test "legacy devices migrate to unknown metadata without inventing or changing authority", c do
@@ -614,7 +477,7 @@ defmodule AttentionServer.GuidedJoinTest do
     label = String.duplicate("x", 256)
 
     {:ok, pending, reply} =
-      GuidedJoin.redeem(engine, c.token_hash, c.device, label, c.secret_hash, @code, c.config, 1)
+      GuidedJoin.redeem(engine, c.token_hash, c.device, label, c.secret_hash, @code, c.config)
 
     {:ok, approved, key} =
       Engine.pending_approve(
@@ -638,8 +501,7 @@ defmodule AttentionServer.GuidedJoinTest do
                label <> "x",
                c.secret_hash,
                @code,
-               c.config,
-               1
+               c.config
              )
 
     path = database_path()
@@ -670,28 +532,28 @@ defmodule AttentionServer.GuidedJoinTest do
   test "requester cancellation is exact and whichever approval/cancellation commits first wins",
        c do
     {:ok, engine, _} = create(c)
-    {:ok, pending, reply} = redeem(c, engine, c.config, 1)
+    {:ok, pending, reply} = redeem(c, engine, c.config)
     deadline = reply["expires_at"]
 
-    for {secret, key, time} <- [
-          {c.token_hash, c.device_key, deadline},
-          {c.secret_hash, c.owner_key, deadline}
+    for {secret, key} <- [
+          {c.token_hash, c.device_key},
+          {c.secret_hash, c.owner_key}
         ] do
-      assert {:error, :not_found} = Engine.pending_cancel(pending, secret, @code, key, time, 2)
+      assert {:error, :not_found} = Engine.pending_cancel(pending, secret, @code, key, deadline)
     end
 
     assert {:error, :stale_request, %{"approval_code" => @code, "expires_at" => ^deadline}} =
-             Engine.pending_cancel(pending, c.secret_hash, @code, c.device_key, deadline + 1, 2)
+             Engine.pending_cancel(pending, c.secret_hash, @code, c.device_key, 1)
 
     {:ok, cancelled, status} =
-      Engine.pending_cancel(pending, c.secret_hash, @code, c.device_key, deadline, 2)
+      Engine.pending_cancel(pending, c.secret_hash, @code, c.device_key, deadline)
 
     assert status == %{"state" => "cancelled"}
     assert cancelled.devices == %{}
     assert cancelled.sender_grants == %{}
 
     assert {:ok, ^cancelled, ^status} =
-             Engine.pending_cancel(cancelled, c.secret_hash, @code, c.device_key, deadline, 3)
+             Engine.pending_cancel(cancelled, c.secret_hash, @code, c.device_key, deadline)
 
     assert {:error, :cancelled} =
              Engine.pending_approve(
@@ -705,25 +567,16 @@ defmodule AttentionServer.GuidedJoinTest do
                3
              )
 
-    assert {:ok, ^cancelled, %{"state" => "cancelled"}} = redeem(c, cancelled, c.config, 3)
+    assert {:ok, ^cancelled, %{"state" => "cancelled"}} = redeem(c, cancelled, c.config)
 
     {:ok, approved, key} =
       Engine.pending_approve(pending, @person, c.owner_key, @code, c.device_key, deadline, [], 2)
 
     assert {:ok, ^approved, %{"state" => "approved"}} =
-             Engine.pending_cancel(approved, c.secret_hash, @code, key, deadline, 3)
+             Engine.pending_cancel(approved, c.secret_hash, @code, key, deadline)
 
-    assert {:ok, expired_cancelled, %{"state" => "cancelled"}} =
-             Engine.pending_cancel(pending, c.secret_hash, @code, key, deadline, deadline)
-
-    assert {:ok, ^expired_cancelled, %{"state" => "cancelled"}} =
-             Engine.pending_resume(
-               expired_cancelled,
-               c.secret_hash,
-               c.device,
-               @other_code,
-               deadline + 1
-             )
+    assert {:ok, ^cancelled, %{"state" => "cancelled"}} =
+             Engine.pending_resume(cancelled, c.secret_hash, c.device)
   end
 
   test "fragment invitation carries the exact v1 payload and no authority in path or query", c do
@@ -752,40 +605,36 @@ defmodule AttentionServer.GuidedJoinTest do
     token = String.duplicate("a", 64)
     raw = Base.decode16!(token, case: :lower)
     hash = :crypto.hash(:sha256, raw)
-    assert {:ok, engine, _} = GuidedJoin.create(c.engine, @person, c.owner_key, hash, c.config, 0)
+    assert {:ok, engine, _} = GuidedJoin.create(c.engine, @person, c.owner_key, hash, c.config)
 
     assert GuidedJoin.bridge_link("https://relay.test:18447", token) ==
              "https://relay.test:18447/join##{token}"
 
-    assert {:ok, invitation} = GuidedJoin.resolve(engine, token, c.config, 1)
+    assert {:ok, invitation} = GuidedJoin.resolve(engine, token, c.config)
     assert invitation["person_id"] == @person
     assert invitation["invite_token"] == token
     assert invitation["join_url"] == GuidedJoin.link(Map.delete(invitation, "join_url"))
     assert engine.sender_grants == %{}
 
     assert {:error, :unavailable} =
-             GuidedJoin.resolve(engine, String.duplicate("b", 64), c.config, 1)
+             GuidedJoin.resolve(engine, String.duplicate("b", 64), c.config)
 
     assert {:error, :unavailable} =
-             GuidedJoin.resolve(engine, token, %{c.config | "server_name" => "wrong.test"}, 1)
+             GuidedJoin.resolve(engine, token, %{c.config | "server_name" => "wrong.test"})
 
     {:ok, recovered} = Engine.operator_recover(engine, @person, c.device_key)
-    assert {:error, :unavailable} = GuidedJoin.resolve(recovered, token, c.config, 1)
-    assert {:error, :expired} = GuidedJoin.resolve(engine, token, c.config, 1_800_000)
-    observed = GuidedJoin.observe_time(engine, hash, 1_800_000)
-    assert {:error, :unavailable} = GuidedJoin.resolve(observed, token, c.config, 1)
+    assert {:error, :unavailable} = GuidedJoin.resolve(recovered, token, c.config)
 
     assert {:ok, consumed, _} =
-             GuidedJoin.redeem(engine, hash, c.device, "phone", c.secret_hash, @code, c.config, 1)
+             GuidedJoin.redeem(engine, hash, c.device, "phone", c.secret_hash, @code, c.config)
 
-    assert {:error, :used} = GuidedJoin.resolve(consumed, token, c.config, 2)
+    assert {:error, :used} = GuidedJoin.resolve(consumed, token, c.config)
   end
 
-  defp create(c), do: GuidedJoin.create(c.engine, @person, c.owner_key, c.token_hash, c.config, 0)
+  defp create(c), do: GuidedJoin.create(c.engine, @person, c.owner_key, c.token_hash, c.config)
 
-  defp redeem(c, engine, config, now),
-    do:
-      GuidedJoin.redeem(engine, c.token_hash, c.device, "app", c.secret_hash, @code, config, now)
+  defp redeem(c, engine, config),
+    do: GuidedJoin.redeem(engine, c.token_hash, c.device, "app", c.secret_hash, @code, config)
 
   defp database_path do
     dir = Path.join(System.tmp_dir!(), "guided-join-#{System.unique_integer([:positive])}")

@@ -115,8 +115,10 @@ defmodule AttentionServer.CLI.Owner do
                   when is_binary(url) ->
                     :ok = IO.binwrite(io, url <> "\n")
 
+                    expiry = if is_integer(deadline), do: "; expires #{deadline}", else: ""
+
                     AttentionServer.CLI.shell().info(
-                      "One-use sign-in link saved to #{path}; expires #{deadline}"
+                      "One-use sign-in link saved to #{path}#{expiry}"
                     )
 
                   _ ->
@@ -137,7 +139,7 @@ defmodule AttentionServer.CLI.Owner do
         case HeadlessOwner.lookup(endpoint, certificate, key, person, code) do
           {:ok, %{"device_id" => device, "expires_at" => deadline, "label" => label}} ->
             AttentionServer.CLI.shell().info(
-              "Account: #{person}\nDevice: #{display_label(label)}\nPublic-key fingerprint: #{device}\nExpires: #{deadline}"
+              "Account: #{person}\nDevice: #{display_label(label)}\nPublic-key fingerprint: #{device}#{expiry_line(deadline)}"
             )
 
             if String.trim(
@@ -205,7 +207,7 @@ defmodule AttentionServer.CLI.Owner do
     case HeadlessOwner.lookup(endpoint, certificate, key, person, code) do
       {:ok, %{"label" => label, "device_id" => device, "expires_at" => deadline}} ->
         AttentionServer.CLI.shell().info(
-          "Account: #{person}\nDevice label (unsafe bytes escaped): #{display_label(label)}\nPublic-key fingerprint: #{device}\nExpires: #{deadline}"
+          "Account: #{person}\nDevice label (unsafe bytes escaped): #{display_label(label)}\nPublic-key fingerprint: #{device}#{expiry_line(deadline)}"
         )
 
         if String.trim(
@@ -483,6 +485,9 @@ defmodule AttentionServer.CLI.Owner do
 
   # Pending labels are attacker supplied. Keep terminal control, bidi and
   # ambiguous backslash bytes out of the trusted owner approval display.
+  defp expiry_line(deadline) when is_integer(deadline), do: "\nExpires: #{deadline}"
+  defp expiry_line(_), do: ""
+
   defp display_label(label) when is_binary(label) do
     for <<byte <- label>>, into: "" do
       if byte in 0x20..0x7E and byte != ?\\,

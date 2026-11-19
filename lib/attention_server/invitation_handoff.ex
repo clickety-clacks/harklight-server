@@ -51,7 +51,7 @@ defmodule AttentionServer.InvitationHandoff do
          person,
          request_id
        )
-       when is_binary(url) and is_integer(deadline) and deadline > 0 do
+       when is_binary(url) and (is_nil(deadline) or (is_integer(deadline) and deadline > 0)) do
     configuration =
       Map.take(invitation, ~w(server_name enrollment_url relay_url ca_pem ca_sha256))
 

@@ -52,7 +52,7 @@ defmodule AttentionServer.DashboardInventoryTest do
       label: "New iPad",
       state: :pending,
       person: @one,
-      expires_at: 10
+      expires_at: nil
     }
 
     cli_pending = %{
@@ -60,7 +60,7 @@ defmodule AttentionServer.DashboardInventoryTest do
       label: "CLI workstation",
       state: :pending,
       person: nil,
-      expires_at: 10
+      expires_at: nil
     }
 
     engine = %{
@@ -68,24 +68,17 @@ defmodule AttentionServer.DashboardInventoryTest do
       | pending_enrollments: %{"ABCDEFGH23" => pending, "KLMNPQRS34" => cli_pending}
     }
 
-    assert {:ok, own} = DashboardInventory.for_owner(engine, @one, @owner_one, 9)
+    assert {:ok, own} = DashboardInventory.for_owner(engine, @one, @owner_one)
     assert [%{code: "ABCDEFGH23", label: "New iPad"}] = own.waiting
 
-    assert {:ok, other} = DashboardInventory.for_owner(engine, @two, @owner_two, 9)
+    assert {:ok, other} = DashboardInventory.for_owner(engine, @two, @owner_two)
     assert other.waiting == []
 
     assert {:ok, account_owner} =
-             DashboardInventory.for_account_owner(engine, @one, @owner_one, 9)
+             DashboardInventory.for_account_owner(engine, @one, @owner_one)
 
     assert Enum.map(account_owner.waiting, & &1.code) == ["ABCDEFGH23", "KLMNPQRS34"]
     assert Enum.find(account_owner.waiting, &(&1.code == "KLMNPQRS34")).person_name == nil
-
-    assert {:ok, expired} = DashboardInventory.for_owner(engine, @one, @owner_one, 10)
-    assert expired.waiting == []
-
-    rolled_back = %{engine | pending_clock_high_water: 10}
-    assert {:ok, fenced} = DashboardInventory.for_owner(rolled_back, @one, @owner_one, 9)
-    assert fenced.waiting == []
   end
 
   test "explicit self-host owner can view all person metadata without granting peers the same scope" do

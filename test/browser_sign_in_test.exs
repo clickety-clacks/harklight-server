@@ -32,7 +32,7 @@ defmodule AttentionServer.BrowserSignInTest do
     %{engine: engine, hash: hash}
   end
 
-  test "only current person owner issues a ten-minute login, without device or sender grants",
+  test "only current person owner issues a login, without device or sender grants",
        c do
     {:ok, engine} = Engine.setup_device(c.engine, @person, @device)
     assert {:error, :forbidden} = BrowserSignIn.issue(engine, @person, @device, c.hash, 100)
@@ -40,7 +40,7 @@ defmodule AttentionServer.BrowserSignInTest do
     assert {:ok, issued, record} = BrowserSignIn.issue(engine, @person, @owner, c.hash, 100)
     assert record.person == @person
     assert record.owner_key == @owner
-    assert record.expires_at == 600_100
+    assert record.expires_at == nil
     assert issued.devices == engine.devices
     assert issued.sender_grants == engine.sender_grants
     assert issued.join_invitations == engine.join_invitations
@@ -51,7 +51,7 @@ defmodule AttentionServer.BrowserSignInTest do
   test "consume authenticates exactly the stored person-owner once with no caller-selected target",
        c do
     {:ok, issued, _} = BrowserSignIn.issue(c.engine, @person, @owner, c.hash, 100)
-    assert {:ok, consumed, principal} = BrowserSignIn.consume(issued, c.hash, 101)
+    assert {:ok, consumed, principal} = BrowserSignIn.consume(issued, c.hash)
 
     assert principal == %{
              person_id: @person,
@@ -61,10 +61,10 @@ defmodule AttentionServer.BrowserSignInTest do
            }
 
     refute Map.has_key?(consumed.browser_sign_ins, c.hash)
-    assert {:error, :invalid_sign_in} = BrowserSignIn.consume(consumed, c.hash, 102)
+    assert {:error, :invalid_sign_in} = BrowserSignIn.consume(consumed, c.hash)
 
     assert {:error, :invalid_sign_in} =
-             BrowserSignIn.consume(consumed, :crypto.hash(:sha256, "unknown"), 102)
+             BrowserSignIn.consume(consumed, :crypto.hash(:sha256, "unknown"))
 
     assert consumed.devices == %{}
     assert consumed.sender_grants == %{}
@@ -77,27 +77,23 @@ defmodule AttentionServer.BrowserSignInTest do
     assert {:error, :invalid_sign_in} = BrowserSignIn.token_hash(%{"person_id" => @person})
     refute c.hash == :crypto.hash(:sha256, Base.decode16!(raw, case: :lower))
     {:ok, issued, _} = BrowserSignIn.issue(c.engine, @person, @owner, c.hash, 100)
-    assert {:error, :not_found} = Engine.pending_status(issued, c.hash, 101)
+    assert {:error, :not_found} = Engine.pending_status(issued, c.hash)
     assert issued.join_invitations == %{}
   end
 
-  test "expiry and observed clock rollback cannot revive a login or alter enrollment time", c do
+  test "a login link never expires and works exactly once whenever it is used", c do
     {:ok, issued, record} = BrowserSignIn.issue(c.engine, @person, @owner, c.hash, 100)
-    assert {:error, :expired} = BrowserSignIn.consume(issued, c.hash, record.expires_at)
-    observed = BrowserSignIn.observe_time(issued, c.hash, record.expires_at)
-    assert {:error, :invalid_sign_in} = BrowserSignIn.consume(observed, c.hash, 101)
-    assert observed.browser_sign_in_clock_high_water == record.expires_at
-    assert observed.pending_clock_high_water == c.engine.pending_clock_high_water
-    refute Map.has_key?(observed.browser_sign_ins, c.hash)
-    other_hash = :crypto.hash(:sha256, "fresh-login")
+    assert record.expires_at == nil
+    assert record.issued_at == 100
 
-    assert {:error, :clock_unavailable} =
-             BrowserSignIn.issue(observed, @person, @owner, other_hash, 101)
+    # No clock dependency: a later issue with an earlier timestamp is accepted.
+    other_hash = :crypto.hash(:sha256, "second-login")
+    assert {:ok, two, _} = BrowserSignIn.issue(issued, @person, @owner, other_hash, 50)
+    assert map_size(two.browser_sign_ins) == 2
 
-    assert {:ok, cleaned, _} =
-             BrowserSignIn.issue(observed, @person, @owner, other_hash, record.expires_at)
-
-    refute Map.has_key?(cleaned.browser_sign_ins, c.hash)
+    assert {:ok, one_used, %{person_id: @person}} = BrowserSignIn.consume(two, c.hash)
+    assert {:error, :invalid_sign_in} = BrowserSignIn.consume(one_used, c.hash)
+    assert {:ok, _, %{person_id: @person}} = BrowserSignIn.consume(one_used, other_hash)
   end
 
   test "owner recovery invalidates an old issuer without delegating browser authority", c do
@@ -107,13 +103,13 @@ defmodule AttentionServer.BrowserSignInTest do
     {:ok, recovered} = Engine.operator_recover(with_other, @person, @device)
     assert map_size(recovered.browser_sign_ins) == 1
     assert Map.has_key?(recovered.browser_sign_ins, other_hash)
-    assert {:error, :invalid_sign_in} = BrowserSignIn.consume(recovered, c.hash, 102)
+    assert {:error, :invalid_sign_in} = BrowserSignIn.consume(recovered, c.hash)
     assert {:error, :forbidden} = BrowserSignIn.issue(recovered, @person, @owner, c.hash, 101)
     new_hash = :crypto.hash(:sha256, "new-current-owner")
     {:ok, fresh, _} = BrowserSignIn.issue(recovered, @person, @device, new_hash, 101)
 
     assert {:ok, _, %{owner_key: @device, owner_revision: 2, person_id: @person}} =
-             BrowserSignIn.consume(fresh, new_hash, 102)
+             BrowserSignIn.consume(fresh, new_hash)
   end
 
   test "concurrent consumption has one durable winner and raw token never enters the snapshot",
@@ -164,33 +160,6 @@ defmodule AttentionServer.BrowserSignInTest do
 
     assert {:error, :invalid_sign_in} =
              Relay.consume_browser_sign_in(restarted, String.duplicate("a", 64))
-  end
-
-  test "sign-in state accepts more than the former fixed record cap", c do
-    record = %{
-      person: @person,
-      owner_key: @owner,
-      owner_revision: 1,
-      issued_at: 100,
-      expires_at: 600_100
-    }
-
-    tokens =
-      Map.new(1..1_025, fn index ->
-        {:crypto.hash(:sha256, "login-#{index}"), record}
-      end)
-
-    full = %{c.engine | browser_sign_ins: tokens, browser_sign_in_clock_high_water: 100}
-    assert BrowserSignIn.valid_state?(full)
-
-    fresh_hash = :crypto.hash(:sha256, "login-after-former-cap")
-    assert {:ok, issued, _} = BrowserSignIn.issue(full, @person, @owner, fresh_hash, 101)
-    assert map_size(issued.browser_sign_ins) == 1_026
-
-    assert {:ok, consumed, %{person_id: @person}} =
-             BrowserSignIn.consume(issued, fresh_hash, 102)
-
-    refute Map.has_key?(consumed.browser_sign_ins, fresh_hash)
   end
 
   test "owner TLS issues only a same-person credential and refuses caller-supplied identity or lifetime",
