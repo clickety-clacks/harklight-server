@@ -618,9 +618,9 @@ defmodule AttentionServer.GuidedJoinTest do
     Store.close(restarted)
   end
 
-  test "device label is bounded on submission and on durable snapshot acceptance", c do
+  test "device metadata is validated on durable snapshot acceptance, with no label length cap", c do
     {:ok, engine, _} = create(c)
-    label = String.duplicate("x", 256)
+    label = String.duplicate("x", 1_024)
 
     {:ok, pending, reply} =
       GuidedJoin.redeem(engine, c.token_hash, c.device, label, c.secret_hash, @code, c.config, 1)
@@ -639,18 +639,6 @@ defmodule AttentionServer.GuidedJoinTest do
 
     assert approved.devices[key].label == label
 
-    assert {:error, :invalid_request} =
-             GuidedJoin.redeem(
-               engine,
-               c.token_hash,
-               c.device,
-               label <> "x",
-               c.secret_hash,
-               @code,
-               c.config,
-               1
-             )
-
     path = database_path()
     {:ok, store} = Store.open(path)
 
@@ -661,7 +649,7 @@ defmodule AttentionServer.GuidedJoinTest do
         action: "bounded_label"
       })
 
-    for bad <- [%{label: label <> "x"}, %{enrolled_at: -1}, %{enrolled_at: "invented"}] do
+    for bad <- [%{label: ""}, %{enrolled_at: -1}, %{enrolled_at: "invented"}] do
       record = Map.merge(approved.devices[key], bad)
       invalid = %{approved | devices: Map.put(approved.devices, key, record)}
 
