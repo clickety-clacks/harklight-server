@@ -5371,7 +5371,7 @@ defmodule AttentionServer.Relay do
       "revision" => revision
     }
 
-    if Message.uuid_v4?(attrs["op_id"]) and Message.sender_id?(sender) and
+    if Message.uuid?(attrs["op_id"]) and Message.sender_id?(sender) and
          Message.nonempty?(message) do
       {:ok, attrs}
     else
@@ -7853,7 +7853,7 @@ defmodule AttentionServer.Relay do
   end
 
   defp valid_upload_attributes?(attrs) when is_map(attrs) do
-    Message.uuid_v4?(attrs["op_id"]) and
+    Message.uuid?(attrs["op_id"]) and
       Message.sender_id?(attrs["sender_id"]) and
       Message.nonempty?(attrs["message_id"]) and
       is_integer(attrs["revision"]) and attrs["revision"] > 0 and
@@ -7863,7 +7863,7 @@ defmodule AttentionServer.Relay do
   defp valid_upload_attributes?(_), do: false
 
   defp valid_discard_attributes?(attrs) when is_map(attrs) do
-    Message.uuid_v4?(attrs["op_id"]) and
+    Message.uuid?(attrs["op_id"]) and
       Message.sender_id?(attrs["sender_id"]) and
       Message.nonempty?(attrs["message_id"]) and
       is_integer(attrs["revision"]) and attrs["revision"] > 0

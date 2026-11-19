@@ -145,7 +145,8 @@ defmodule AttentionServer.DashboardBrowserUploadTest do
       "sender_id" => "app:test",
       "message_id" => "over-inline-upload",
       "request_revision" => 1,
-      "text" => "Please see the attached file",
+      # A turn that carries a file needs no text.
+      "text" => "",
       "files" => [file_reference]
     }
 

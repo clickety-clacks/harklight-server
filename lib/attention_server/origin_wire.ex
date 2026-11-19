@@ -24,7 +24,7 @@ defmodule AttentionServer.OriginWire do
         selector = Enum.find(@selector_fields, &Map.has_key?(request, &1)) ->
           error("invalid_field", selector, ref)
 
-        request["type"] in @operation_types and not Message.uuid_v4?(request["op_id"]) ->
+        request["type"] in @operation_types and not Message.uuid?(request["op_id"]) ->
           error("invalid_field", "op_id", ref)
 
         true ->
@@ -377,7 +377,7 @@ defmodule AttentionServer.OriginWire do
   defp event_seq(_), do: {:error, :invalid_event_id}
 
   defp valid_ref?(value),
-    do: is_binary(value) and value != "" and byte_size(value) <= 256 and String.valid?(value)
+    do: is_binary(value) and value != "" and String.valid?(value)
 
   defp ok(value, ref), do: value |> Map.merge(%{"v" => 1, "type" => "ok"}) |> maybe_ref(ref)
 

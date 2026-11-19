@@ -167,6 +167,20 @@ defmodule AttentionServer.ContradictionsTest do
     refute Process.alive?(worker)
   end
 
+  test "without a deadline option the worker waits for a slow batch" do
+    [a, b] = Enum.map(1..2, &item/1)
+
+    evaluator = fn request ->
+      if request.candidates == [b.identity], do: Process.sleep(200)
+      {:ok, Map.new(request.candidates, &{&1, 1})}
+    end
+
+    check = Contradictions.run(@posted, [a, b], @endpoint, @model, 1, evaluator: evaluator)
+
+    assert check["status"] == "checked"
+    assert Enum.map(check["messages"], & &1["message_id"]) == ["message-1", "message-2"]
+  end
+
   test "unconfigured Jev reports incomplete without calling the evaluator" do
     check =
       Contradictions.run(@posted, [item(1), item(2)], "", "", 1,

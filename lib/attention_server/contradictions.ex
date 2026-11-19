@@ -89,11 +89,12 @@ defmodule AttentionServer.Contradictions do
     end
   end
 
-  # The caller commits delivery before entering this worker. One shared
-  # deadline covers composition and all parallel batches, not one per batch.
+  # The caller commits delivery before entering this worker. With no deadline
+  # option the worker waits for every batch; a caller may pass one shared
+  # deadline that covers composition and all parallel batches.
   def run(posted, items, endpoint, model, size, opts \\ []) do
     clock = Keyword.get(opts, :clock, fn -> System.monotonic_time(:millisecond) end)
-    deadline = Keyword.get_lazy(opts, :deadline, fn -> clock.() + 5_000 end)
+    deadline = Keyword.get(opts, :deadline, :infinity)
     evaluator = Keyword.get(opts, :evaluator, &JevClient.evaluate/1)
     requests = batches(posted, items, endpoint, model, size)
 
@@ -124,6 +125,10 @@ defmodule AttentionServer.Contradictions do
   end
 
   defp collect(tasks, scores, _deadline, _clock) when map_size(tasks) == 0, do: {scores, false}
+
+  defp collect(tasks, scores, :infinity, clock) do
+    await(tasks, scores, :infinity, :infinity, clock)
+  end
 
   defp collect(tasks, scores, deadline, clock) do
     remaining = deadline - clock.()
