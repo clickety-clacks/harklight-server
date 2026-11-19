@@ -401,8 +401,12 @@ defmodule AttentionServer.OriginHTTPSTest do
             %{
               "type" => "ok",
               "inline_decoded_bytes_per_entry" => 262_144,
-              "upload_cap_bytes_per_file" => "none"
+              "upload_cap_bytes_per_file" => "none",
+              "answer_ui_limits" => answer_ui_limits
             }} = request(c, "a2", %{"v" => 1, "type" => "file_limits"})
+
+    assert answer_ui_limits == AttentionServer.UI1.published_limits()
+    assert answer_ui_limits["inputs"] > 16
 
     assert {:error, _} = request(c, "unknown", %{"v" => 1, "type" => "file_limits"})
 
@@ -2023,7 +2027,8 @@ defmodule AttentionServer.OriginHTTPSTest do
     end
   end
 
-  test "origin stream covers explicitly declared handles; concurrent origin streams all get notices", c do
+  test "origin stream covers explicitly declared handles; concurrent origin streams all get notices",
+       c do
     {:ok, stream} = socket(c, "a2")
 
     :ok =
@@ -2680,22 +2685,24 @@ defmodule AttentionServer.OriginHTTPSTest do
              request(c, "a2", %{"v" => 1, "type" => "status", "session_handle" => @handle})
   end
 
-  test "origin HTTPS reports duplicate UI/1 document members as an actionable send error", c do
+  test "origin HTTPS accepts duplicate UI/1 document members and reports the unavailable screen",
+       c do
     body =
       ~s|{"v":1,"type":"send","op_id":"#{op(36)}","session_handle":"#{@handle}","message":{"sender_id":"app:test","message_id":"duplicate-ui1-http","created_at":1,"title":"Choose","message_type":"request","answer_ui":{"schema":"attention-client.ui/1","schema":"attention-client.ui/1"}}}|
 
     assert {:ok, 200,
             %{
-              "type" => "error",
-              "code" => "request_answer_ui_invalid",
-              "reason" => reason
+              "type" => "ok",
+              "field_warnings" => [%{"field" => "answer_ui", "detail" => detail}]
             }} = raw_request(c, "a2", http("POST", "/origin/v1", body))
 
-    assert reason =~ "schema"
-    assert reason =~ "member names must be unique"
+    assert detail =~ "schema"
+    assert detail =~ "member names must be unique"
 
-    assert {:ok, 200, %{"type" => "ok", "entries" => []}} =
+    assert {:ok, 200, %{"type" => "ok", "entries" => [entry]}} =
              request(c, "a2", %{"v" => 1, "type" => "feed", "since" => 0})
+
+    assert entry["message"]["answer_ui_unavailable"] == detail
   end
 
   defp op(n), do: "00000000-0000-4000-8000-#{String.pad_leading(Integer.to_string(n), 12, "0")}"

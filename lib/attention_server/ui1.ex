@@ -9,17 +9,58 @@ defmodule AttentionServer.UI1 do
   @optional ["resolvedByState", "answeredWithResult"]
   @terminal_states ~w(answered no_comment cleared expired superseded)
 
-  @doc "Validates a delivered UI/1 document against the app-authored grammar corpus."
-  def validate(document, delivered_file_names) when is_list(delivered_file_names) do
+  # Size and count limits the Server enforces on a UI/1 document. They are
+  # generous and published to senders as a capability; a client that can show
+  # less publishes its own, and a document over what a client can show is
+  # offered there as the plain reply (see Message.admit_answer_ui/2).
+  @default_limits %{
+    document_bytes: 1_048_576,
+    requires: 32,
+    illustrations: 256,
+    primitives_per_illustration: 4_096,
+    primitives_total: 16_384,
+    inputs: 128,
+    actions: 512,
+    scene_nodes: 4_096,
+    scene_depth: 64,
+    result_nodes: 4_096,
+    result_depth: 64,
+    result_point_path: 64,
+    array_items: 4_096,
+    object_members: 4_096,
+    identifier_bytes: 512
+  }
+  @limits_key :attention_server_ui1_limits
+
+  @doc "The limits enforced on a UI/1 document, as published to senders."
+  def limits, do: @default_limits
+
+  @doc "The same limits with string keys, for the published capability reply."
+  def published_limits,
+    do: Map.new(@default_limits, fn {name, value} -> {Atom.to_string(name), value} end)
+
+  defp limit(name), do: Map.fetch!(Process.get(@limits_key, @default_limits), name)
+
+  @doc """
+  Validates a delivered UI/1 document against the app-authored grammar corpus.
+  `limits` replaces the default size and count limits for this call.
+  """
+  def validate(document, delivered_file_names, limits \\ @default_limits)
+
+  def validate(document, delivered_file_names, limits) when is_list(delivered_file_names) do
+    previous = Process.put(@limits_key, limits)
+
     try do
       validate_document!(document, delivered_file_names)
       :ok
     catch
       {:invalid, path, reason} -> {:error, path, reason}
+    after
+      if previous, do: Process.put(@limits_key, previous), else: Process.delete(@limits_key)
     end
   end
 
-  def validate(_document, _delivered_file_names),
+  def validate(_document, _delivered_file_names, _limits),
     do: {:error, "$", "document must be an object; send a UI/1 document object"}
 
   defp validate_document!(document, delivered_file_names) do
@@ -33,13 +74,13 @@ defmodule AttentionServer.UI1 do
     byte_count = byte_size(JSON.encode!(document))
 
     require!(
-      byte_count <= 65_536,
+      byte_count <= limit(:document_bytes),
       "$",
-      "answer_ui document is #{byte_count} bytes; it must be at most 65536 UTF-8 bytes"
+      "answer_ui document is #{byte_count} bytes; it must be at most #{limit(:document_bytes)} UTF-8 bytes"
     )
 
     required =
-      string_array!(root["requires"], "requires", true, 8, "requires must be a string array")
+      string_array!(root["requires"], "requires", true, "requires must be a string array")
 
     unique_array!(required, "requires", "each used capability appears exactly once")
 
@@ -139,12 +180,16 @@ defmodule AttentionServer.UI1 do
       )
 
     require!(
-      result_count <= 128,
+      result_count <= limit(:result_nodes),
       "submission.result",
-      "at most 128 result constructor nodes are allowed"
+      "at most #{limit(:result_nodes)} result constructor nodes are allowed"
     )
 
-    require!(scene_state.count <= 128, "open", "at most 128 scene nodes are allowed")
+    require!(
+      scene_state.count <= limit(:scene_nodes),
+      "open",
+      "at most #{limit(:scene_nodes)} scene nodes are allowed"
+    )
 
     input_ids = Map.keys(input_kinds) |> MapSet.new()
     open_counts = scene_state.open_input_counts
@@ -195,7 +240,12 @@ defmodule AttentionServer.UI1 do
 
   defp parse_illustrations!(value, delivered_files, delivered_file_names) do
     values = array!(value, "illustrations", "illustrations must be an array")
-    require!(length(values) <= 64, "illustrations", "at most 64 illustrations are allowed")
+
+    require!(
+      length(values) <= limit(:illustrations),
+      "illustrations",
+      "at most #{limit(:illustrations)} illustrations are allowed"
+    )
 
     {ids, _primitive_total, contains_image} =
       values
@@ -228,9 +278,9 @@ defmodule AttentionServer.UI1 do
           array!(item["primitives"], "#{path}.primitives", "primitives must be an array")
 
         require!(
-          length(primitives) <= 512,
+          length(primitives) <= limit(:primitives_per_illustration),
           "#{path}.primitives",
-          "at most 512 primitives are allowed in one illustration"
+          "at most #{limit(:primitives_per_illustration)} primitives are allowed in one illustration"
         )
 
         found_image =
@@ -248,9 +298,9 @@ defmodule AttentionServer.UI1 do
         total = total + length(primitives)
 
         require!(
-          total <= 512,
+          total <= limit(:primitives_total),
           "illustrations",
-          "at most 512 primitives are allowed across illustrations"
+          "at most #{limit(:primitives_total)} primitives are allowed across illustrations"
         )
 
         {MapSet.put(ids, id), total, image? or found_image}
@@ -370,7 +420,12 @@ defmodule AttentionServer.UI1 do
 
   defp parse_inputs!(value, illustration_ids) do
     inputs = array!(value, "inputs", "inputs must be an array")
-    require!(length(inputs) <= 16, "inputs", "at most 16 inputs are allowed")
+
+    require!(
+      length(inputs) <= limit(:inputs),
+      "inputs",
+      "at most #{limit(:inputs)} inputs are allowed"
+    )
 
     Enum.reduce(Enum.with_index(inputs), {%{}, MapSet.new()}, fn {raw, index}, {kinds, refs} ->
       path = "inputs[#{index}]"
@@ -398,7 +453,12 @@ defmodule AttentionServer.UI1 do
               "response input requires at least one action"
             )
 
-            require!(length(actions) <= 64, "#{path}.actions", "at most 64 actions are allowed")
+            require!(
+              length(actions) <= limit(:actions),
+              "#{path}.actions",
+              "at most #{limit(:actions)} actions are allowed"
+            )
+
             action_refs = parse_actions!(actions, "#{path}.actions", illustration_ids)
             {id, MapSet.union(refs, action_refs)}
 
@@ -550,11 +610,21 @@ defmodule AttentionServer.UI1 do
          illustration_ids,
          state
        ) do
-    require!(depth <= 16, path, "scene depth must be at most 16")
+    require!(
+      depth <= limit(:scene_depth),
+      path,
+      "scene depth must be at most #{limit(:scene_depth)}"
+    )
+
     node = object!(raw, path, "scene node must be an object")
     kind = required_string!(node, "kind", path, "scene kind is required")
     state = %{state | count: state.count + 1}
-    require!(state.count <= 128, path, "at most 128 scene nodes are allowed")
+
+    require!(
+      state.count <= limit(:scene_nodes),
+      path,
+      "at most #{limit(:scene_nodes)} scene nodes are allowed"
+    )
 
     case kind do
       "stack" ->
@@ -711,9 +781,9 @@ defmodule AttentionServer.UI1 do
         path_values = array!(node["path"], "#{path}.path", "result-point path must be an array")
 
         require!(
-          length(path_values) <= 16,
+          length(path_values) <= limit(:result_point_path),
           "#{path}.path",
-          "result-point path permits at most 16 components"
+          "result-point path permits at most #{limit(:result_point_path)} components"
         )
 
         Enum.with_index(path_values)
@@ -783,11 +853,21 @@ defmodule AttentionServer.UI1 do
   end
 
   defp parse_constructor!(raw, path, depth, input_kinds, count, refs) do
-    require!(depth <= 16, path, "result constructor depth must be at most 16")
+    require!(
+      depth <= limit(:result_depth),
+      path,
+      "result constructor depth must be at most #{limit(:result_depth)}"
+    )
+
     node = object!(raw, path, "result constructor must be an object")
     kind = required_string!(node, "kind", path, "result constructor kind is required")
     count = count + 1
-    require!(count <= 128, path, "at most 128 result constructor nodes are allowed")
+
+    require!(
+      count <= limit(:result_nodes),
+      path,
+      "at most #{limit(:result_nodes)} result constructor nodes are allowed"
+    )
 
     case kind do
       "literal" ->
@@ -830,7 +910,13 @@ defmodule AttentionServer.UI1 do
         )
 
         items = array!(node["items"], "#{path}.items", "array constructor items must be an array")
-        require!(length(items) <= 128, "#{path}.items", "at most 128 array items are allowed")
+
+        require!(
+          length(items) <= limit(:array_items),
+          "#{path}.items",
+          "at most #{limit(:array_items)} array items are allowed"
+        )
+
         parse_constructor_children!(items, "#{path}.items", depth, input_kinds, count, refs)
 
       "object" ->
@@ -850,9 +936,9 @@ defmodule AttentionServer.UI1 do
           )
 
         require!(
-          length(members) <= 128,
+          length(members) <= limit(:object_members),
           "#{path}.members",
-          "at most 128 object members are allowed"
+          "at most #{limit(:object_members)} object members are allowed"
         )
 
         {refs, count, _seen} =
@@ -1013,10 +1099,15 @@ defmodule AttentionServer.UI1 do
   defp child_path("$", key), do: to_string(key)
   defp child_path(path, key), do: "#{path}.#{key}"
 
-  defp string_array!(value, path, nonempty, max_count, failure) do
+  defp string_array!(value, path, nonempty, failure) do
     values = array!(value, path, failure)
     require!(!nonempty or values != [], path, "requires must contain the capabilities used")
-    require!(length(values) <= max_count, path, "requires permits at most eight capabilities")
+
+    require!(
+      length(values) <= limit(:requires),
+      path,
+      "requires permits at most #{limit(:requires)} capabilities"
+    )
 
     values
     |> Enum.with_index()
@@ -1043,7 +1134,13 @@ defmodule AttentionServer.UI1 do
 
   defp identifier!(value, path) do
     string = string!(value, path, true, "identifier must be non-empty")
-    require!(byte_size(string) <= 128, path, "identifier is at most 128 UTF-8 bytes")
+
+    require!(
+      byte_size(string) <= limit(:identifier_bytes),
+      path,
+      "identifier is at most #{limit(:identifier_bytes)} UTF-8 bytes"
+    )
+
     string
   end
 

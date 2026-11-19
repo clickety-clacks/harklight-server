@@ -7,6 +7,25 @@ defmodule AttentionServer.UI1ConformanceTest do
   @corpus_sha256 "c616ceac8904ae4d12d66894a31971eeab8111d7d91bbe771489b49e6566f040"
   @app_corpus_source_revision "b45fca200a7c219e8d316dc7e299c5a24050b258"
   @app_grammar_revision "f936fa378381f33f6a53e20c81c95ff8e0b7e420"
+  # The limits the app published when the corpus was authored. The Server's own
+  # limits are larger; the corpus checks the grammar, so it runs at the app's.
+  @app_limits %{
+    document_bytes: 65_536,
+    requires: 8,
+    illustrations: 64,
+    primitives_per_illustration: 512,
+    primitives_total: 512,
+    inputs: 16,
+    actions: 64,
+    scene_nodes: 128,
+    scene_depth: 16,
+    result_nodes: 128,
+    result_depth: 16,
+    result_point_path: 16,
+    array_items: 128,
+    object_members: 128,
+    identifier_bytes: 128
+  }
   @duplicates_key :__attention_server_duplicate_keys__
   @moduletag app_corpus_source_revision: @app_corpus_source_revision,
              app_grammar_revision: @app_grammar_revision
@@ -56,7 +75,7 @@ defmodule AttentionServer.UI1ConformanceTest do
 
         validation =
           try do
-            UI1.validate(document, files)
+            UI1.validate(document, files, @app_limits)
           rescue
             error -> {:raised, Exception.format(:error, error, __STACKTRACE__)}
           end
@@ -86,19 +105,21 @@ defmodule AttentionServer.UI1ConformanceTest do
                Map.get(document, "schema") == "attention-client.ui/1" do
             admission =
               try do
-                Message.validate_ui1_admission(%{"answer_ui" => document}, files)
+                Message.admit_answer_ui(%{"answer_ui" => document}, files, @app_limits)
               rescue
                 error -> {:raised, Exception.format(:error, error, __STACKTRACE__)}
               end
 
             case {test_case["verdict"], admission} do
-              {"accept", :ok} ->
+              {"accept", {_message, []}} ->
                 []
 
               {"accept", other} ->
                 ["#{test_case["id"]}: direct Server admission returned #{inspect(other)}"]
 
-              {"reject", {:error, {:typed_message, "request_answer_ui_invalid", reason}}} ->
+              {"reject",
+               {%{"answer_ui_unavailable" => reason},
+                [%{"field" => "answer_ui", "reason" => "unavailable"}]}} ->
                 expected_path = test_case["fault"]["location"]
 
                 if String.contains?(reason, expected_path),
@@ -136,11 +157,55 @@ defmodule AttentionServer.UI1ConformanceTest do
       "answer_ui" => valid_without_inputs
     }
 
-    assert {:error, {:typed_message, "request_needs_answer_controls", reason}} =
-             Message.validate_ui1_admission(no_input_message, [])
+    # A typed request whose screen has no input is not refused: it gets the
+    # plain Reply and says its screen is not shown.
+    assert {degraded, [%{"field" => "answer_ui", "reason" => "unavailable", "detail" => detail}]} =
+             Message.admit_answer_ui(no_input_message, [])
 
-    assert reason =~ "at least one input"
-    assert :ok = Message.validate_ui1_admission(Map.delete(no_input_message, "message_type"), [])
+    assert detail =~ "at least one input"
+    assert degraded["answer_ui_unavailable"] == detail
+
+    assert degraded["answer_ui"] == %{
+             "schema" => "attention-client.actions/1",
+             "actions" => [%{"id" => "reply", "label" => "Reply", "kind" => "text"}]
+           }
+
+    untyped = Map.delete(no_input_message, "message_type")
+    assert {^untyped, []} = Message.admit_answer_ui(untyped, [])
+  end
+
+  test "screens over the app's limits are admitted by the Server's limits and degrade at the app's" do
+    corpus = decode_corpus!(File.read!(@corpus_path))
+
+    over_app_limits = ~w(
+      reject-input-count reject-action-count reject-scene-node-count
+      reject-result-node-count reject-result-array-count reject-result-object-count
+      reject-illustration-count reject-aggregate-primitive-limit
+      reject-action-id-too-long reject-delivered-size-65537
+    )
+
+    for id <- over_app_limits do
+      test_case = Enum.find(corpus["cases"], &(&1["id"] == id))
+      document = Map.get(test_case, "sent_document", test_case["document"])
+      files = test_case["delivered_file_names"]
+      message = %{"answer_ui" => document}
+
+      assert {^message, []} = Message.admit_answer_ui(message, files), id
+
+      assert {%{"answer_ui_unavailable" => detail} = degraded,
+              [%{"field" => "answer_ui", "reason" => "unavailable"}]} =
+               Message.admit_answer_ui(message, files, @app_limits),
+             id
+
+      refute Map.has_key?(degraded, "answer_ui"), id
+      assert detail =~ test_case["fault"]["location"], id
+    end
+  end
+
+  test "the Server publishes the limits it enforces" do
+    published = UI1.published_limits()
+    assert published["document_bytes"] == UI1.limits().document_bytes
+    assert Enum.all?(published, fn {name, value} -> is_binary(name) and is_integer(value) end)
   end
 
   test "V2 checks the Server-reencoded delivered document, including minus zero" do

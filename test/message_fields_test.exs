@@ -104,10 +104,9 @@ defmodule AttentionServer.MessageFieldsTest do
       request
       |> Map.put("answer_ui", %{"schema" => "attention-client.forms/2"})
 
-    assert {"request_answer_ui_unsupported", unsupported_reason} = typed_error(unsupported)
-    assert unsupported_reason =~ "attention-client.actions/1"
-    assert unsupported_reason =~ "attention-client.ui/1"
-    assert unsupported_reason =~ "got schema \"attention-client.forms/2\""
+    # A version this Server does not know is not refused; the client shows it
+    # or offers the plain reply.
+    assert :ok = Message.validate_typed_message(unsupported)
 
     ui1_request = Map.put(request, "answer_ui", @ui1_answer_ui)
     assert :ok = Message.validate_typed_message(ui1_request)
