@@ -67,6 +67,10 @@ defmodule AttentionServer.LargeData do
   def reference_index(term), do: index_rows(term, [], %{})
 
   @doc false
+  def reference_rows_at(term, path) do
+    term |> index_rows(Enum.reverse(path), %{}) |> reference_index_rows()
+  end
+
   def reference_index_rows(index) do
     index
     |> Map.values()
