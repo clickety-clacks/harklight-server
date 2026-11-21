@@ -5,8 +5,10 @@ defmodule AttentionServer.ClientAPI.Principal do
   - `kind: :device` — an enrolled device on the device listener. `key` is the
     device key (the SHA-256 of its certificate's public key).
   - `kind: :browser` — a signed-in browser session on the web origin. `key` is
-    the owner key the session was issued for, `session_id` the session's opaque
-    id and `owner_revision` the owner revision the session is pinned to.
+    the owner key the session was issued for, `session_id` the session's id
+    (the raw session hash, as the Relay and the change log's closing notices
+    name it; never sent to a client) and `owner_revision` the owner revision the
+    session is pinned to.
 
   Authorization is by principal, with the same rules as the same operation
   today.
@@ -19,7 +21,7 @@ defmodule AttentionServer.ClientAPI.Principal do
           person: String.t(),
           kind: :device | :browser,
           key: String.t(),
-          session_id: String.t() | nil,
+          session_id: binary() | nil,
           owner_revision: term()
         }
 end
@@ -75,7 +77,7 @@ defmodule AttentionServer.ClientAPI.Auth do
          person: person,
          kind: :browser,
          key: key,
-         session_id: Base.url_encode64(session, padding: false),
+         session_id: session,
          owner_revision: revision
        }}
     else
