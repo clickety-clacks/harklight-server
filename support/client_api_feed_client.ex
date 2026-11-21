@@ -9,6 +9,17 @@ defmodule AttentionServer.ClientAPIFeedClient do
 
   alias AttentionServer.JSON
 
+  @doc "Prunes the test Relay's log with its SQLite connection idle."
+  def prune_changes(relay, before_ms) do
+    :ok = :sys.suspend(relay)
+
+    try do
+      AttentionServer.ChangeLog.prune(:sys.get_state(relay).store, before_ms)
+    after
+      :ok = :sys.resume(relay)
+    end
+  end
+
   @doc "Connects with a device certificate (`name`), or with none for a browser."
   def connect(port, certs, name \\ nil, protocol \\ :http2) do
     client_cert =

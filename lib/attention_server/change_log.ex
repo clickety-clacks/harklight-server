@@ -766,17 +766,18 @@ defmodule AttentionServer.ChangeLog do
         cache
       )
       when is_map(ranks) do
-    unit_keys = AttentionServer.ClientAPI.Resources.rank_unit_keys(ranks)
-
     with {:ok, prior} <- prior_ranks(db, person, cache) do
       changed = for {id, rank} <- ranks, not same_rank?(Map.get(prior.ranks, id), rank), do: id
       dropped = for {id, _} <- prior.ranks, not Map.has_key?(ranks, id), do: id
-      changed_units = for {id, key} <- unit_keys, Map.get(prior.units, id) != key, do: id
-      dropped_units = for {id, _} <- prior.units, not Map.has_key?(unit_keys, id), do: id
+      changed_ranks = Map.take(ranks, changed)
+
+      {unit_keys, changed_units, dropped_units} =
+        rank_unit_changes(prior, ranks, changed_ranks, changed ++ dropped, cache)
+
       next_cache = %{ranks: ranks, units: unit_keys, ranked?: true}
 
-      if changed == [] and dropped == [] and changed_units == [] and dropped_units == [] and
-           prior.ranked? do
+      if changed == [] and dropped == [] and map_size(changed_units) == 0 and
+           dropped_units == [] and prior.ranked? do
         with {:ok, head} <- head(db, engine, person), do: {:ok, head, next_cache}
       else
         # A person's first stored ranking is what reads computed until now, so
@@ -784,15 +785,13 @@ defmodule AttentionServer.ChangeLog do
         items =
           if prior.ranked?, do: rank_changed_items(engine, person, changed ++ dropped), else: []
 
-        changed_ranks = Map.take(ranks, changed)
-
         with {:ok, head} <-
                write_stored_ranks(db, engine, person, %{
                  items: items,
                  ranks: changed_ranks,
                  encoded: Map.new(changed_ranks, fn {id, rank} -> {id, JSON.encode!(rank)} end),
                  dropped: dropped,
-                 units: Map.take(unit_keys, changed_units),
+                 units: changed_units,
                  dropped_units: dropped_units
                }),
              do: {:ok, head, next_cache}
@@ -801,6 +800,33 @@ defmodule AttentionServer.ChangeLog do
   end
 
   def put_ranks(%AttentionServer.Store{}, _person, _ranks, _cache), do: {:error, :disabled}
+
+  # The cache is the result of the last successful write, so only changed
+  # items can add, remove or move its rank units. On a cold read, compare
+  # all units to reconcile the rows recovered separately from SQLite.
+  defp rank_unit_changes(prior, ranks, _changed_ranks, _changed_or_dropped, nil) do
+    units = AttentionServer.ClientAPI.Resources.rank_unit_keys(ranks)
+    {upserts, deletes} = compare_rank_units(prior.units, units)
+    {units, upserts, deletes}
+  end
+
+  defp rank_unit_changes(prior, _ranks, changed_ranks, changed_or_dropped, _cache) do
+    old_units =
+      prior.ranks
+      |> Map.take(changed_or_dropped)
+      |> AttentionServer.ClientAPI.Resources.rank_unit_keys()
+
+    new_units = AttentionServer.ClientAPI.Resources.rank_unit_keys(changed_ranks)
+    {upserts, deletes} = compare_rank_units(old_units, new_units)
+    units = prior.units |> Map.drop(deletes) |> Map.merge(upserts)
+    {units, upserts, deletes}
+  end
+
+  defp compare_rank_units(old_units, new_units) do
+    upserts = for {id, key} <- new_units, Map.get(old_units, id) != key, into: %{}, do: {id, key}
+    deletes = for {id, _} <- old_units, not Map.has_key?(new_units, id), do: id
+    {upserts, deletes}
+  end
 
   # A ranking kept in memory compares by value; one read back from SQLite
   # (after a restart) compares by its stored JSON, which encodes the same

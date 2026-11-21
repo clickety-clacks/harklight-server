@@ -296,6 +296,29 @@ defmodule AttentionServer.ChangeLogTest do
     GenServer.stop(relay)
   end
 
+  test "ranks served immediately after cut-over converge with the next feed step", ctx do
+    relay = start(ctx, false)
+    setup_people(relay)
+    for {id, n} <- [{"one", 2}, {"two", 3}, {"three", 4}, {"three-b", 6}],
+        do: forward(relay, id, n)
+    GenServer.stop(relay)
+
+    relay = start(ctx)
+    assert {:ok, %{"items" => initial, "rev" => cursor}} = Reads.inbox(relay, "reader")
+    assert length(initial) == 4
+
+    forward(relay, "four", 5)
+    assert {:ok, principal} = Reads.client_principal(store(relay).engine, "reader")
+    assert {:ok, rows, false, _} = FeedStep.read(relay, principal, cursor, 100)
+    changes = for %{"kind" => "item", "data" => data} <- rows, do: data
+    held = Map.new(initial ++ changes, &{&1["item_id"], &1["rank"]})
+
+    assert {:ok, %{"items" => current}} = Reads.inbox(relay, "reader")
+    assert length(current) == 5
+    assert held == Map.new(current, &{&1["item_id"], &1["rank"]})
+    GenServer.stop(relay)
+  end
+
   test "rows survive a restart, and commits made with the log off reset cursors", ctx do
     relay = start(ctx)
     setup_people(relay)
@@ -633,15 +656,23 @@ defmodule AttentionServer.ChangeLogTest do
 
     relay = start(ctx)
 
-    # Touch the old item through an engine change and through a rank row.
-    assert %{"type" => "ok", "opened" => true} =
+    # Answering changes the pre-cut-over record itself.
+    key = {"A", "app:test", "old"}
+    assert %{terminal: nil} = Map.fetch!(store(relay).engine.messages, key)
+
+    assert %{"type" => "ok"} =
              request(relay, "reader", %{
-               "type" => "message_open",
+               "type" => "answer",
                "op_id" => op(3),
                "sender_id" => "app:test",
                "message_id" => "old",
-               "request_revision" => 1
+               "answer" => "Done"
              })
+
+    assert %{terminal: terminal} = Map.fetch!(store(relay).engine.messages, key)
+    refute is_nil(terminal)
+    assert {:error, :not_found} =
+             paused(relay, fn -> ChangeLog.created_at(store(relay), "A", item("old")) end)
 
     assert {:ok, _} =
              paused(relay, fn ->
@@ -757,13 +788,13 @@ defmodule AttentionServer.ChangeLogTest do
     # The Relay has already stored a ranking for A; start from a known one.
     ranks = %{
       i1 => %{"key" => "b", "section" => "current"},
-      i2 => %{"key" => "c", "section" => "current"}
+      i2 => %{"key" => "c", "section" => "current", "_reply" => %{"key" => "d"}}
     }
 
     start_head = head(relay)
 
-    assert {:ok, first_head} =
-             paused(relay, fn -> ChangeLog.put_ranks(store(relay), "A", ranks) end)
+    assert {:ok, first_head, cache} =
+             paused(relay, fn -> ChangeLog.put_ranks(store(relay), "A", ranks, nil) end)
 
     assert {:ok, page, false} =
              paused(relay, fn -> ChangeLog.rank_page(store(relay), "A", nil, 10) end)
@@ -771,7 +802,9 @@ defmodule AttentionServer.ChangeLogTest do
     assert page == [{i1, ranks[i1]}, {i2, ranks[i2]}]
     assert {:ok, %{"key" => "c"}} = paused(relay, fn -> ChangeLog.rank(store(relay), "A", i2) end)
 
-    assert {:ok, %{^i1 => "b", ^i2 => "c"}} =
+    reply_id = "r" <> i2
+
+    assert {:ok, %{^i1 => "b", ^i2 => "c", ^reply_id => "d"}} =
              paused(relay, fn -> ChangeLog.rank_keys(store(relay), "A") end)
 
     # Same ranking: nothing written.
@@ -779,10 +812,13 @@ defmodule AttentionServer.ChangeLogTest do
              paused(relay, fn -> ChangeLog.put_ranks(store(relay), "A", ranks) end)
 
     # A change in any member writes that item's row only.
-    moved = put_in(ranks, [i2, "section"], "resolved")
+    moved = put_in(ranks, [i2, "_reply", "key"], "e")
 
-    assert {:ok, moved_head} =
-             paused(relay, fn -> ChangeLog.put_ranks(store(relay), "A", moved) end)
+    assert {:ok, moved_head, cache} =
+             paused(relay, fn -> ChangeLog.put_ranks(store(relay), "A", moved, cache) end)
+
+    assert {:ok, %{^reply_id => "e"}} =
+             paused(relay, fn -> ChangeLog.rank_keys(store(relay), "A") end)
 
     assert {:ok, [%{kind: :item, resource_id: resource}], false, ^moved_head} =
              log(relay, first_head)
@@ -796,8 +832,14 @@ defmodule AttentionServer.ChangeLogTest do
     assert {:ok, [{^i1, _}], true} =
              paused(relay, fn -> ChangeLog.rank_page(store(relay), "A", nil, 1) end)
 
-    assert {:ok, gone_head} =
-             paused(relay, fn -> ChangeLog.put_ranks(store(relay), "A", Map.take(moved, [i1])) end)
+    assert {:ok, gone_head, cache} =
+             paused(relay, fn ->
+               ChangeLog.put_ranks(store(relay), "A", Map.take(moved, [i1]), cache)
+             end)
+
+    assert {:ok, units} = paused(relay, fn -> ChangeLog.rank_keys(store(relay), "A") end)
+    assert units == cache.units
+    assert units == %{i1 => "b"}
 
     assert gone_head > moved_head
     assert {:error, :not_found} = paused(relay, fn -> ChangeLog.rank(store(relay), "A", i2) end)
@@ -823,33 +865,31 @@ defmodule AttentionServer.ChangeLogTest do
   test "the relay stores ranks once per change and keeps other items' keys stable", ctx do
     relay = start(ctx)
     setup_people(relay)
-    for {id, n} <- [{"m1", 2}, {"m2", 3}, {"m3", 4}], do: forward(relay, id, n)
+    for {id, n} <- [{"m1", 2}, {"m2", 3}, {"m3", 4}, {"m4", 5}], do: forward(relay, id, n)
 
     assert {:ok, page, false} =
              paused(relay, fn -> ChangeLog.rank_page(store(relay), "A", nil, 100) end)
 
-    assert length(page) == 3
+    assert length(page) == 4
     keys = Enum.map(page, fn {_id, rank} -> rank["key"] end)
     assert keys == Enum.sort(keys)
     before = Map.new(page)
     before_head = head(relay)
 
     # A new item is ranked in; items whose rank did not move write no row.
-    forward(relay, "m4", 5)
+    forward(relay, "m5", 6)
 
     assert {:ok, after_page, false} =
              paused(relay, fn -> ChangeLog.rank_page(store(relay), "A", nil, 100) end)
 
-    assert length(after_page) == 4
+    assert length(after_page) == 5
     after_ranks = Map.new(after_page)
-
-    unchanged =
-      for {id, rank} <- before, Map.get(after_ranks, id) == rank, do: id
 
     assert {:ok, rows, false, _} = log(relay, before_head)
     engine = :sys.get_state(relay).store.engine
 
-    for id <- unchanged do
+    for {id, rank} <- before do
+      assert after_ranks[id] == rank
       {:ok, key} = AttentionServer.ClientAPI.Resources.item_key(engine, "A", id)
       refute Enum.any?(rows, &(&1.resource_id == ChangeLog.item_resource(key)))
     end
