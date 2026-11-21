@@ -75,7 +75,7 @@ Schemas use JSON Schema 2020-12. `$ref`s point into the `$defs` below.
         "name": { "type": "string" },
         "size": { "type": "integer", "minimum": 0 },
         "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
-        "content_type": { "type": "string" }
+        "content_type": { "type": "string", "description": "The file's stored type, so a browser can build a typed blob to preview it" }
       }
     },
 
@@ -323,7 +323,7 @@ Schemas use JSON Schema 2020-12. `$ref`s point into the `$defs` below.
 | `GET /v2/items/{item_id}/entries?before=&limit=` | `EntriesPage` |
 | `GET /v2/items/{item_id}/revisions/{n}` | `RevisionResponse`, for any request revision `n` from 1 to the current one |
 | `GET /v2/settings` | `SettingsResponse` |
-| `GET /v2/files/{file_id}` | The file bytes, with `Content-Type`, `Content-Length` and `ETag` |
+| `GET /v2/files/{file_id}` | The file bytes, with `Content-Length` and `ETag`; its type as described under Files below |
 | `GET /v2/me` | `Me`. Answerable while the account is paused. |
 
 ```json
@@ -415,9 +415,20 @@ Schemas use JSON Schema 2020-12. `$ref`s point into the `$defs` below.
   also an Entry of kind `result`, with its own `position`, so the thread keeps
   its status turns. `status` is today's closed list: `received`, `applied`,
   `refused`.
-- **Files.** A file uploaded through `POST /v2/files` is served with the
-  `Content-Type` it was sent with. Files attached inline before the cut-over
-  are served as `application/octet-stream`.
+- **Files.**
+  - **To a device**, a file is served with its stored `Content-Type`:
+    - a file uploaded through `POST /v2/files` keeps the type it was sent
+      with;
+    - a file attached inline before the cut-over is
+      `application/octet-stream`.
+  - **To a browser**, `GET /v2/files/{file_id}` is served exactly as today's
+    browser download:
+    - `Content-Type: application/octet-stream`;
+    - `Content-Disposition: attachment; filename*=UTF-8''<percent-encoded name>`;
+    - `Content-Length` and the sha256 `ETag`.
+
+    It is never inline on the web origin. `FileRef.content_type` carries the
+    stored type, so the web client can build a typed blob to preview the file.
 - **`GET /v2/me` features.** It carries only the server-controlled client
   features still behind a flag at 0.2. Today's three app flags are
   classified as follows:
