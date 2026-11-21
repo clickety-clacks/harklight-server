@@ -1106,13 +1106,14 @@ defmodule AttentionServer.Relay do
     with_persistence_reads(state, fn ->
       case dispatch_call(request, from, state) do
         {:reply, {:socket_write, socket, authority, frames, completion}, next} ->
+          next = rank_client_items(state, next)
           {:noreply, enqueue_socket_write(next, socket, authority, frames, completion, from)}
 
         {:reply, reply, next} ->
-          {:reply, reply, fence_socket_writes(next)}
+          {:reply, reply, fence_socket_writes(rank_client_items(state, next))}
 
         {:noreply, next} ->
-          {:noreply, fence_socket_writes(next)}
+          {:noreply, fence_socket_writes(rank_client_items(state, next))}
       end
     end)
   end
@@ -2242,6 +2243,7 @@ defmodule AttentionServer.Relay do
   defp dispatch_call({:owner_invite_create, person, owner}, _from, state) do
     token = :crypto.strong_rand_bytes(32)
     hash = :crypto.hash(:sha256, token)
+
     case AttentionServer.GuidedJoin.create(
            state.store.engine,
            person,
@@ -3468,8 +3470,56 @@ defmodule AttentionServer.Relay do
   def handle_info(message, state) do
     with_persistence_reads(state, fn ->
       {:noreply, next} = dispatch_info(message, state)
-      {:noreply, fence_socket_writes(next)}
+      {:noreply, fence_socket_writes(rank_client_items(state, next))}
     end)
+  end
+
+  # Client API v2 ranks are computed once per change, here, and stored with
+  # the change log, so reads page from the stored order. A person is ranked
+  # when a commit changed their client resources or their priority view
+  # changed. Runs only while the change log is on.
+  defp rank_client_items(_before, %{store: %Store{change_log: false}} = next), do: next
+
+  defp rank_client_items(before, next) do
+    views_changed =
+      if before.priority_views === next.priority_views do
+        []
+      else
+        (Map.keys(before.priority_views) ++ Map.keys(next.priority_views))
+        |> Enum.uniq()
+        |> Enum.reject(&(Map.get(before.priority_views, &1) === Map.get(next.priority_views, &1)))
+      end
+
+    persons = Enum.uniq(MapSet.to_list(next.store.change_log_touched) ++ views_changed)
+
+    if persons == [] do
+      next
+    else
+      Enum.each(persons, &store_client_ranks(next, &1))
+      %{next | store: %{next.store | change_log_touched: MapSet.new()}}
+    end
+  end
+
+  defp store_client_ranks(state, person) do
+    store = state.store
+
+    if Map.has_key?(store.engine.persons, person) do
+      with {:ok, previous} <- AttentionServer.ChangeLog.rank_keys(store, person),
+           ranks =
+             AttentionServer.ClientAPI.Resources.ranks(
+               store.engine,
+               person,
+               Map.get(state.priority_views, person),
+               previous
+             ),
+           {:ok, _head} <- AttentionServer.ChangeLog.put_ranks(store, person, ranks) do
+        :ok
+      else
+        error -> Diagnostics.failure(:server_storage, :state_commit, error, :retry)
+      end
+    end
+  rescue
+    error -> Diagnostics.failure(:server_storage, :state_commit, error, :retry)
   end
 
   defp dispatch_info({:socket_write_done, socket, token, result}, state) do
@@ -3893,7 +3943,9 @@ defmodule AttentionServer.Relay do
       if Map.has_key?(stream, :monitor), do: Process.demonitor(stream.monitor, [:flush])
     end)
 
-    if kept == [], do: {Map.delete(streams, key), false}, else: {Map.put(streams, key, kept), true}
+    if kept == [],
+      do: {Map.delete(streams, key), false},
+      else: {Map.put(streams, key, kept), true}
   end
 
   defp remove_origin_stream_index(index, identity, stream_key) do

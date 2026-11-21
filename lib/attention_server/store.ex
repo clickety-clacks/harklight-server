@@ -39,7 +39,9 @@ defmodule AttentionServer.Store do
     :large_index,
     progress_version: 0,
     encoding_cache: %{},
-    change_log: false
+    change_log: false,
+    # Persons whose client resources changed since the Relay last ranked them.
+    change_log_touched: MapSet.new()
   ]
 
   @progress_fields [:cursors, :conversation_cursors, :conversation_opened]
@@ -1144,7 +1146,9 @@ defmodule AttentionServer.Store do
              encoding_cache: cache,
              large_base: durable_next,
              large_persisted: persisted,
-             large_index: index
+             large_index: index,
+             change_log_touched:
+               MapSet.union(store.change_log_touched, MapSet.new(Map.keys(heads)))
          }}
 
       error ->
