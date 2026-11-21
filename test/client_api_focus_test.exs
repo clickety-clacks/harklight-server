@@ -198,7 +198,11 @@ defmodule AttentionServer.ClientAPIFocusTest do
     at(ctx, 5_000)
     assert {:ok, %{"client_id" => "reader", "delivery" => "held"}} = push_view(relay, "chat")
 
-    assert_receive {:client_api_show, "reader", live}, 1_000
+    assert_receive {:client_api_show, "reader", message}, 1_000
+
+    # The feed computes held_ms when it writes the event (round 11 r4 §4).
+    live = Focus.wire(message, 5_000)
+    assert Focus.wire(message, 5_400)["held_ms"] == 400
 
     assert %{"device_id" => "reader", "item_id" => ^item, "target" => "chat", "held_ms" => 0} =
              live
