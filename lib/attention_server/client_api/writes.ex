@@ -31,7 +31,7 @@ defmodule AttentionServer.ClientAPI.Writes do
   import Plug.Conn
 
   alias AttentionServer.{BrowserRecipient, ChangeLog, Engine, JSON, Relay}
-  alias AttentionServer.ClientAPI.{Context, Errors, Idempotency, Reads, Resources}
+  alias AttentionServer.ClientAPI.{Context, Errors, FeedRenderer, Idempotency, Reads, Resources}
 
   @max_body_bytes 64 * 1024
 
@@ -288,7 +288,7 @@ defmodule AttentionServer.ClientAPI.Writes do
 
   defp render({:reply, item_id, _text, _files}, who, person, %{"seq" => seq}, from, state) do
     with {:ok, 200, body} <- render_item(item_id, who, from, state),
-         {:ok, entry} <- render_entry(state, person, seq) do
+         {:ok, entry} <- render_entry(state, who, person, seq) do
       {:ok, 200, Map.put(body, "entry", entry)}
     end
   end
@@ -300,32 +300,35 @@ defmodule AttentionServer.ClientAPI.Writes do
     end
   end
 
-  # The entry a write created, rendered from the same state as its item.
-  defp render_entry(state, person, seq) do
+  # The entry a write created, rendered from the same state as its item, by
+  # the renderer the reads and the feed use. Its rev is the newest of the
+  # facts folded into it.
+  defp render_entry(state, who, person, seq) do
     engine = state.store.engine
+    view = Map.get(state.priority_views, person)
 
-    case Resources.entry_for_fact(engine, person, seq) do
-      %{} = entry ->
-        revs =
-          entry
-          |> Resources.entry_sources()
-          |> Enum.map(fn source ->
-            case ChangeLog.rev(state.store, person, ChangeLog.entry_resource(source)) do
-              {:ok, rev} -> rev
-              {:error, :not_found} -> 1
-              _ -> :error
-            end
-          end)
-
-        if :error in revs,
-          do: {:error, :storage_unavailable},
-          else:
-            {:ok,
-             entry |> Resources.stamp(Enum.max(revs)) |> then(&Resources.render(:entry, &1, nil))}
-
-      nil ->
-        {:error, :not_found}
+    with %{} = entry <- Resources.entry_for_fact(engine, person, seq, view),
+         {:ok, rev} <- entry_rev(state, person, entry),
+         context = %{engine: engine, store: state.store, view: view},
+         row = %{rev: rev, kind: :entry, resource_id: ChangeLog.entry_resource(seq)},
+         {:ok, rendered} <- FeedRenderer.render(context, who, row) do
+      {:ok, rendered}
+    else
+      {:error, _} = error -> error
+      _ -> {:error, :not_found}
     end
+  end
+
+  defp entry_rev(state, person, entry) do
+    entry
+    |> Resources.entry_sources()
+    |> Enum.reduce_while({:ok, 1}, fn source, {:ok, max} ->
+      case ChangeLog.rev(state.store, person, ChangeLog.entry_resource(source)) do
+        {:ok, rev} -> {:cont, {:ok, Kernel.max(rev, max)}}
+        {:error, :not_found} -> {:cont, {:ok, max}}
+        _ -> {:halt, {:error, :storage_unavailable}}
+      end
+    end)
   end
 
   ## Operations, as today's engine frames
