@@ -75,7 +75,7 @@ defmodule AttentionServer.ClientAPI.AgentShow do
 
     try do
       receive do
-        {^ref, :sent} -> "sent"
+        {^ref, :chunk_accepted} -> "sent"
         {^ref, :held} -> "held"
         {:DOWN, ^monitor, :process, ^writer, _} -> "held"
       after

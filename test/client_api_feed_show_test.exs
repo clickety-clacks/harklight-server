@@ -307,6 +307,8 @@ defmodule AttentionServer.ClientAPIFeedShowTest do
     refute Map.has_key?(received, :id)
     assert age >= 0
 
+    # Sent describes Plug chunk acceptance. Even after a successful chunk,
+    # the pending show must remain available in case the socket missed it.
     report = JSON.encode!(%{"screen" => "inbox", "ttl_s" => 120})
 
     assert {:ok, reader_conn, ref} =
@@ -518,7 +520,7 @@ defmodule AttentionServer.ClientAPIFeedShowTest do
     end)
   end
 
-  test "a failed server write reports held and keeps the focus fallback", ctx do
+  test "a Plug chunk error reports held and keeps the focus fallback", ctx do
     writer = controlled_writer(ctx, head(ctx.relay))
     request = show_in_request(ctx)
     assert_receive {:controlled_chunk, pid, :show}, 2_000

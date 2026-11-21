@@ -280,7 +280,9 @@ defmodule AttentionServer.ClientAPI.FeedStream do
 
         case chunk_safely(conn, event) do
           {:ok, conn} ->
-            show_result(reply_ref, :sent)
+            # Bandit can accept a chunk even when an HTTP/2 socket send fails.
+            # The same pending show remains available in the next focus response.
+            show_result(reply_ref, :chunk_accepted)
             wait(conn, %{state | last_show_id: id})
 
           {:error, _reason} ->
