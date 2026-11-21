@@ -1,3 +1,17 @@
+defmodule AttentionServer.ClientAPIFeedBatchTest.FailingRenderer do
+  # render_many always raises; render raises for the item titled "bad".
+  alias AttentionServer.ClientAPI.FeedRenderer
+
+  def render_many(_context, _principal, _rows), do: raise("render_many failed")
+
+  def render(context, principal, row) do
+    case FeedRenderer.render(context, principal, row) do
+      {:ok, %{"message" => %{"title" => "bad"}}} -> raise "bad row"
+      result -> result
+    end
+  end
+end
+
 defmodule AttentionServer.ClientAPIFeedBatchTest do
   # The JSON batch form of GET /v2/changes (docs/client-api-v2.md §6) through
   # the router: its cursor rules and 410, contract shapes, person scope, and
@@ -8,7 +22,7 @@ defmodule AttentionServer.ClientAPIFeedBatchTest do
   import Plug.Conn
 
   alias AttentionServer.{ChangeLog, JSON, Relay, TLSFixtures}
-  alias AttentionServer.ClientAPI.{Principal, Reads, Router}
+  alias AttentionServer.ClientAPI.{FeedStep, Principal, Reads, Router}
   alias AttentionServer.ClientAPISchema, as: Schema
 
   @handle "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
@@ -425,5 +439,67 @@ defmodule AttentionServer.ClientAPIFeedBatchTest do
       |> Router.call(ctx.router)
 
     assert conn.status == 401
+  end
+
+  ## Relay cost (review H2)
+
+  test "a long chat's backlog is read in one relay step in linear time", ctx do
+    forward(ctx.relay, "long", 1)
+
+    chat = fn from, to ->
+      for n <- from..to do
+        assert %{"type" => "ok"} =
+                 request(ctx.relay, ctx.reader, %{
+                   "type" => "discussion",
+                   "op_id" => op(1_000 + n),
+                   "sender_id" => "app:test",
+                   "message_id" => "long",
+                   "request_revision" => 1,
+                   "text" => "Turn #{n}"
+                 })
+      end
+    end
+
+    # The whole backlog in one step, as the Relay runs it: best of three.
+    step = fn ->
+      1..3
+      |> Enum.map(fn _ ->
+        {us, {:ok, changes, false, _}} =
+          :timer.tc(fn -> FeedStep.read(ctx.relay, principal(ctx), 0, 500) end)
+
+        {us, Enum.count(changes, &(&1["kind"] == "entry"))}
+      end)
+      |> Enum.min()
+    end
+
+    chat.(1, 100)
+    {short_us, short_entries} = step.()
+    chat.(101, 400)
+    {long_us, long_entries} = step.()
+
+    assert short_entries >= 100 and long_entries >= 400
+
+    # Four times the entries may cost at most eight times as much. Rebuilding
+    # the item's entries for each row is quadratic: about sixteen times.
+    assert long_us < 8 * max(short_us, 1_000),
+           "100 entries: #{short_us} us, 400 entries: #{long_us} us"
+  end
+
+  test "if a step's render fails, its rows render one at a time and a bad row is skipped", ctx do
+    renderer = AttentionServer.ClientAPIFeedBatchTest.FailingRenderer
+    Application.put_env(:attention_server, :client_api_feed_renderer, renderer)
+    on_exit(fn -> Application.delete_env(:attention_server, :client_api_feed_renderer) end)
+
+    forward(ctx.relay, "good", 1)
+    forward(ctx.relay, "bad", 2)
+
+    {200, batch} = batch(ctx, "?after=0")
+
+    titles =
+      for %{"kind" => "item", "data" => item} <- batch["changes"], do: item["message"]["title"]
+
+    assert titles == ["good"]
+    assert Enum.any?(batch["changes"], &(&1["kind"] == "counts"))
+    assert Process.alive?(ctx.relay)
   end
 end
