@@ -500,6 +500,66 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
     end
   end
 
+  test "serving a person reply on agent SSE records delivery on its original entry", ctx do
+    assert :ok = Relay.setup_sender(ctx.relay, ctx.reader, "app:agent")
+
+    assert %{"type" => "ok"} =
+             request(ctx.relay, ctx.reader, %{
+               "type" => "forward",
+               "op_id" => op(1),
+               "session_handle" => @handle,
+               "message" => %{
+                 "sender_id" => "app:agent",
+                 "message_id" => "stream-delivery",
+                 "created_at" => 1,
+                 "title" => "One conversation"
+               }
+             })
+
+    scope = {"A", ctx.reader}
+    assert {:ok, position} =
+             AttentionServer.AgentChangeLog.head(:sys.get_state(ctx.relay).store, scope)
+
+    assert %{"type" => "ok"} =
+             request(ctx.relay, "origin", %{
+               "type" => "discussion",
+               "op_id" => op(2),
+               "sender_id" => "app:agent",
+               "message_id" => "stream-delivery",
+               "request_revision" => 1,
+               "text" => "Deliver this once"
+             })
+
+    {conn, feed} = open_agent_feed(connect(ctx), "?after=#{position}")
+    {conn, feed} = await_open(conn, feed)
+    assert feed.status == 200
+
+    {conn, feed, before} = next_person_reply(conn, feed, 12)
+    assert before.data["delivery"]["delivered"] == false
+
+    {_conn, _feed, delivered} = next_person_reply(conn, feed, 12)
+    assert delivered.data["delivery"]["delivered"] == true
+    assert before.data["entry_id"] == delivered.data["entry_id"]
+    assert before.id < delivered.id
+
+    store = :sys.get_state(ctx.relay).store
+    assert {:ok, rev} =
+             AttentionServer.AgentChangeLog.rev(store, scope, {:entry, delivered.data["position"]})
+    assert rev == delivered.id
+  end
+
+  defp next_person_reply(_conn, _feed, 0), do: flunk("person reply event missing")
+
+  defp next_person_reply(conn, feed, attempts) do
+    case events(conn, feed, 1) do
+      {conn, feed, [%{event: "entry", data: %{"kind" => "reply", "author" => "person"}} = event]} ->
+        {conn, feed, event}
+
+      {conn, feed, [%{event: kind}]} when kind in ["heartbeat", "message", "entry"] ->
+        next_person_reply(conn, feed, attempts - 1)
+    end
+  end
+
   test "a live agent feed starts and stops focus when its see grant changes", ctx do
     Application.put_env(:attention_server, :client_api_feed_heartbeat_ms, 80)
     on_exit(fn -> Application.delete_env(:attention_server, :client_api_feed_heartbeat_ms) end)
