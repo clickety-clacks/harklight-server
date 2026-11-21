@@ -1420,16 +1420,7 @@ defmodule AttentionServer.Relay do
     do: {:reply, Engine.agent_identity(state.store.engine, key), state}
 
   defp dispatch_call({:origin_feed, key, since}, _from, state) do
-    case Engine.deliver_origin_feed(state.store.engine, key, since) do
-      {:ok, next, reply} ->
-        case commit(state.store, next, audit(state.store.engine, key, "origin_feed")) do
-          {:ok, store} -> {:reply, {:ok, reply}, %{state | store: store}}
-          _ -> {:reply, {:error, :storage_unavailable}, state}
-        end
-
-      error ->
-        {:reply, error, state}
-    end
+    commit_origin_fact(state, key, "origin_feed", &Engine.deliver_origin_feed(&1, key, since))
   end
 
   defp dispatch_call(
@@ -1447,29 +1438,12 @@ defmodule AttentionServer.Relay do
   end
 
   defp dispatch_call({:origin_advisory_ack, key, handle, advisory_id}, _from, state) do
-    engine = state.store.engine
-
-    {next, result, touched} =
-      track_transition(state, engine, fn current ->
-        case BounceDecision.advisory_ack(current, key, handle, advisory_id) do
-          {:ok, next, reply} -> {next, {:ok, reply}}
-          error -> {current, error}
-        end
-      end)
-
-    case result do
-      {:ok, reply} when next == engine ->
-        {:reply, {:ok, reply}, state}
-
-      {:ok, reply} ->
-        case commit_request(state.store, next, touched, audit(engine, key, "origin_advisory_ack")) do
-          {:ok, store} -> {:reply, {:ok, reply}, %{state | store: store}}
-          _ -> {:reply, {:error, :storage_unavailable}, state}
-        end
-
-      error ->
-        {:reply, error, state}
-    end
+    commit_origin_fact(
+      state,
+      key,
+      "origin_advisory_ack",
+      &BounceDecision.advisory_ack(&1, key, handle, advisory_id)
+    )
   end
 
   defp dispatch_call({:origin_coverage, key}, _from, state) do
@@ -1944,42 +1918,25 @@ defmodule AttentionServer.Relay do
   end
 
   defp dispatch_call({:origin_ack2, key, feed_seq, declaration}, _from, state) do
-    case Engine.origin_ack2(state.store.engine, key, feed_seq, declaration) do
-      {:ok, next, reply} ->
-        case commit(state.store, next, audit(state.store.engine, key, "origin_ack2")) do
-          {:ok, store} -> {:reply, {:ok, reply}, %{state | store: store}}
-          _ -> {:reply, {:error, :storage_unavailable}, state}
-        end
-
-      error ->
-        {:reply, error, state}
-    end
+    commit_origin_fact(
+      state,
+      key,
+      "origin_ack2",
+      &Engine.origin_ack2(&1, key, feed_seq, declaration)
+    )
   end
 
   defp dispatch_call({:origin_ack, key, feed_seq, reports}, _from, state) do
-    case Engine.origin_ack(state.store.engine, key, feed_seq, reports) do
-      {:ok, next, reply} ->
-        case commit(state.store, next, audit(state.store.engine, key, "origin_ack")) do
-          {:ok, store} -> {:reply, {:ok, reply}, %{state | store: store}}
-          _ -> {:reply, {:error, :storage_unavailable}, state}
-        end
-
-      error ->
-        {:reply, error, state}
-    end
+    commit_origin_fact(state, key, "origin_ack", &Engine.origin_ack(&1, key, feed_seq, reports))
   end
 
   defp dispatch_call({:origin_file_use, key, feed_seq, name, outcome, op_id}, _from, state) do
-    case Engine.origin_file_use(state.store.engine, key, feed_seq, name, outcome, op_id) do
-      {:ok, next, reply} ->
-        case commit(state.store, next, audit(state.store.engine, key, "origin_file_use")) do
-          {:ok, store} -> {:reply, {:ok, reply}, %{state | store: store}}
-          _ -> {:reply, {:error, :storage_unavailable}, state}
-        end
-
-      error ->
-        {:reply, error, state}
-    end
+    commit_origin_fact(
+      state,
+      key,
+      "origin_file_use",
+      &Engine.origin_file_use(&1, key, feed_seq, name, outcome, op_id)
+    )
   end
 
   defp dispatch_call({:agent_send_request, key, revision, request, socket}, _from, state) do
@@ -5513,6 +5470,29 @@ defmodule AttentionServer.Relay do
   defp track_transition(_state, engine, transition) do
     {next, reply} = transition.(engine)
     {next, reply, nil}
+  end
+
+  defp commit_origin_fact(state, key, action, transition) do
+    engine = state.store.engine
+
+    {next, result, touched} =
+      track_transition(state, engine, fn current ->
+        case transition.(current) do
+          {:ok, next, reply} -> {next, {:ok, reply}}
+          error -> {current, error}
+        end
+      end)
+
+    case result do
+      {:ok, reply} ->
+        case commit_request(state.store, next, touched, audit(engine, key, action)) do
+          {:ok, store} -> {:reply, {:ok, reply}, %{state | store: store}}
+          _ -> {:reply, {:error, :storage_unavailable}, state}
+        end
+
+      error ->
+        {:reply, error, state}
+    end
   end
 
   defp request_availability(state, key, engine, touched) do

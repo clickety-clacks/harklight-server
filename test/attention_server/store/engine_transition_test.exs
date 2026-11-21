@@ -772,6 +772,74 @@ defmodule AttentionServer.Store.EngineTransitionTest do
     GenServer.stop(reopened)
   end
 
+  test "keyed origin delivery acknowledgements and file use survive reopen" do
+    path = legacy_store_path()
+    {:ok, legacy} = Relay.start_link(store_path: path, clock: fn -> 100 end)
+    {:ok, send} = JSON.decode_line(forward_line())
+
+    line =
+      send
+      |> Map.put("session_handle", "00000000-0000-4000-8000-000000000010")
+      |> JSON.encode_line()
+
+    assert {:ok, accepted} = Relay.request_line(legacy, @origin, line)
+    assert {:ok, %{"type" => "ok"}} = JSON.decode_line(accepted)
+
+    line =
+      JSON.encode_line(%{
+        "v" => 1,
+        "type" => "discussion",
+        "op_id" => "00000000-0000-4000-8000-000000000012",
+        "sender_id" => "app:test/worker",
+        "message_id" => "msg",
+        "request_revision" => 1,
+        "text" => "Inspect the attachment",
+        "files" => [%{"name" => "image.bin", "data_base64" => Base.encode64(<<0, 1, 255>>)}]
+      })
+
+    assert {:ok, discussed} = Relay.request_line(legacy, @reader, line)
+    assert {:ok, %{"type" => "ok"}} = JSON.decode_line(discussed)
+    GenServer.stop(legacy)
+    {:ok, old} = Store.open(path)
+    assert {:ok, _} = KeyedMigration.convert(old)
+    :ok = Store.close(old)
+    flags = path <> ".flags"
+    File.write!(flags, JSON.encode!(%{"client_api_v2" => true}))
+    opts = [store_path: path, store_mode: :keyed, feature_flags_path: flags, clock: fn -> 100 end]
+    {:ok, relay} = Relay.start_link(opts)
+
+    assert {:ok, %{"entries" => [_, %{"delivered" => false, "files" => [file]}]}} =
+             Relay.origin_feed(relay, @origin, 0)
+
+    assert Base.decode64!(file["data_base64"]) == <<0, 1, 255>>
+    ack2 = %{"op_id" => "00000000-0000-4000-8000-000000000013", "outcome" => "handed"}
+    assert {:ok, %{"status" => "recorded"}} = Relay.origin_ack2(relay, @origin, 2, ack2)
+    transfer = [%{"name" => "image.bin", "status" => "transferred"}]
+    assert {:ok, %{"status" => "delivered"}} = Relay.origin_ack(relay, @origin, 2, transfer)
+    outcome = %{"status" => "used"}
+    op = "00000000-0000-4000-8000-000000000014"
+
+    assert {:ok, %{"status" => "used"}} =
+             Relay.origin_file_use(relay, @origin, 2, "image.bin", outcome, op)
+
+    committed = :sys.get_state(relay).store
+    GenServer.stop(relay)
+    {:ok, reopened} = Relay.start_link(opts)
+    live = :sys.get_state(reopened).store
+    assert full_diff(committed.engine, live.engine) == MapSet.new()
+    assert index_state(committed) == index_state(live)
+    assert {:ok, %{"duplicate" => true}} = Relay.origin_ack2(reopened, @origin, 2, ack2)
+
+    assert {:ok, %{"status" => "already_delivered"}} =
+             Relay.origin_ack(reopened, @origin, 2, transfer)
+
+    assert {:ok, %{"duplicate" => true}} =
+             Relay.origin_file_use(reopened, @origin, 2, "image.bin", outcome, op)
+
+    assert :sys.get_state(reopened).store.version == committed.version
+    GenServer.stop(reopened)
+  end
+
   defp normalize_action_times(engine) do
     actions =
       Map.new(engine.origin_actions, fn {key, action} ->

@@ -3247,6 +3247,21 @@ defmodule AttentionServer.Store do
       not MapSet.member?(engine.conversation_opened, key) or
         owns_or_browser?(engine, person, actor)
 
+  defp valid_authority_reference?(engine, {:row, :origin_receipts, {person, origin, _} = key}) do
+    case Map.fetch(engine.origin_receipts, key) do
+      {:ok, receipt} ->
+        owns?(engine, person, origin) and Conversation.valid_origin_receipt?(engine, key, receipt)
+
+      :error ->
+        true
+    end
+  end
+
+  defp valid_authority_reference?(engine, {:origin_feed, scope, {:delivery_ack, seq}}) do
+    valid_authority_reference?(engine, {:row, :origin_feeds, scope}) and
+      Conversation.valid_delivery_ack?(engine, scope, seq)
+  end
+
   defp valid_authority_reference?(engine, {:origin_feed, scope, _}),
     do: valid_authority_reference?(engine, {:row, :origin_feeds, scope})
 

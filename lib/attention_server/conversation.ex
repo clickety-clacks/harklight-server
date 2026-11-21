@@ -251,7 +251,7 @@ defmodule AttentionServer.Conversation do
                   uses: %{}
                 }
 
-                {:ok, %{engine | origin_receipts: Map.put(engine.origin_receipts, key, receipt)},
+                {:ok, Engine.put_row(engine, :origin_receipts, key, receipt),
                  %{
                    "status" => "delivered",
                    "event_id" => entry["event_id"],
@@ -306,7 +306,7 @@ defmodule AttentionServer.Conversation do
         case Map.get(uses, name) do
           nil ->
             next_receipt = Map.put(receipt, :uses, Map.put(uses, name, outcome))
-            next = %{engine | origin_receipts: Map.put(engine.origin_receipts, key, next_receipt)}
+            next = Engine.put_row(engine, :origin_receipts, key, next_receipt)
 
             {:ok, next,
              %{"status" => outcome["status"], "event_id" => entry["event_id"], "file" => name}}
@@ -579,25 +579,49 @@ defmodule AttentionServer.Conversation do
   end
 
   defp valid_delivery_acks?(engine, person, origin, feed) do
-    Enum.all?(Map.get(feed, :delivery_acks, %{}), fn {feed_seq, stages} ->
-      entry = Map.fetch!(feed.entries, feed_seq)
-
-      entry["author"] == "person" and entry["kind"] in ~w(discussion terminal) and
-        Map.has_key?(stages, :ack1) and
-        Enum.all?(stages, fn {stage, seq} ->
-          fact = Map.fetch!(engine.conversation_events, {person, seq})
-          payload = fact.payload
-
-          stage in [:ack1, :ack2] and
-            fact.key == {person, entry["sender_id"], entry["message_id"]} and
-            engine.messages[fact.key].origin == origin and
-            payload["kind"] == "delivery_ack" and payload["stage"] == Atom.to_string(stage) and
-            payload["event_id"] == entry["event_id"] and
-            payload["request_revision"] == entry["request_revision"] and
-            payload["session_handle"] == entry["session_handle"] and
-            (stage == :ack1 or seq > stages.ack1)
-        end)
+    Enum.all?(Map.get(feed, :delivery_acks, %{}), fn {feed_seq, _stages} ->
+      valid_delivery_ack?(engine, {person, origin}, feed_seq)
     end)
+  end
+
+  @doc false
+  def valid_delivery_ack?(engine, {person, origin} = scope, feed_seq) do
+    feed = Map.fetch!(engine.origin_feeds, scope)
+    entry = Map.fetch!(feed.entries, feed_seq)
+    stages = Map.fetch!(feed.delivery_acks, feed_seq)
+
+    entry["author"] == "person" and entry["kind"] in ~w(discussion terminal) and
+      Map.has_key?(stages, :ack1) and
+      Enum.all?(stages, fn {stage, seq} ->
+        fact = Map.fetch!(engine.conversation_events, {person, seq})
+        payload = fact.payload
+
+        stage in [:ack1, :ack2] and
+          fact.key == {person, entry["sender_id"], entry["message_id"]} and
+          engine.messages[fact.key].origin == origin and
+          payload["kind"] == "delivery_ack" and payload["stage"] == Atom.to_string(stage) and
+          payload["event_id"] == entry["event_id"] and
+          payload["request_revision"] == entry["request_revision"] and
+          payload["session_handle"] == entry["session_handle"] and
+          (stage == :ack1 or seq > stages.ack1)
+      end)
+  rescue
+    _ -> false
+  end
+
+  @doc false
+  def valid_origin_receipt?(engine, {person, origin, seq}, receipt) do
+    entry = get_in(engine.origin_feeds, [{person, origin}, :entries, seq])
+
+    actionable?(entry) and is_integer(receipt.delivered_at) and receipt.delivered_at > 0 and
+      ConversationFiles.valid_transfer_state?(entry, Map.get(receipt, :transfers, %{})) and
+      is_map(Map.get(receipt, :uses, %{})) and
+      Enum.all?(Map.get(receipt, :uses, %{}), fn {name, outcome} ->
+        Enum.any?(Map.get(entry, "files", []), &(&1["name"] == name)) and
+          ConversationFiles.valid_use?(outcome)
+      end)
+  rescue
+    _ -> false
   end
 
   def valid_state?(engine) do
@@ -623,16 +647,8 @@ defmodule AttentionServer.Conversation do
           (is_nil(session.last_detached_at) or
              (is_integer(session.last_detached_at) and session.last_detached_at > 0))
       end) and
-      Enum.all?(engine.origin_receipts, fn {{person, origin, seq}, receipt} ->
-        entry = get_in(engine.origin_feeds, [{person, origin}, :entries, seq])
-
-        actionable?(entry) and is_integer(receipt.delivered_at) and receipt.delivered_at > 0 and
-          ConversationFiles.valid_transfer_state?(entry, Map.get(receipt, :transfers, %{})) and
-          is_map(Map.get(receipt, :uses, %{})) and
-          Enum.all?(Map.get(receipt, :uses, %{}), fn {name, outcome} ->
-            Enum.any?(Map.get(entry, "files", []), &(&1["name"] == name)) and
-              ConversationFiles.valid_use?(outcome)
-          end)
+      Enum.all?(engine.origin_receipts, fn {key, receipt} ->
+        valid_origin_receipt?(engine, key, receipt)
       end) and
       Enum.all?(engine.origin_actions, fn {{person, origin, seq}, action} ->
         actionable?(get_in(engine.origin_feeds, [{person, origin}, :entries, seq])) and
