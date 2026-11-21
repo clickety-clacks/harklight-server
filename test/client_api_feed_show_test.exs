@@ -141,8 +141,6 @@ defmodule AttentionServer.ClientAPIFeedShowTest do
   end
 
   defmodule PausedStream do
-    def get_http_protocol(_), do: :"HTTP/2"
-
     def send_chunked(test, 200, _headers) do
       send(test, {:stream_paused, self()})
 
@@ -443,8 +441,6 @@ defmodule AttentionServer.ClientAPIFeedShowTest do
   end
 
   defmodule ControlledShowStream do
-    def get_http_protocol(_), do: :"HTTP/2"
-
     def send_chunked({test, _} = opts, 200, _headers) do
       send(test, {:controlled_open, self()})
       {:ok, "", opts}
@@ -705,7 +701,7 @@ defmodule AttentionServer.ClientAPIFeedShowTest do
     end
   end
 
-  test "an HTTP/1.1 feed leaves the agent show pending for the next focus write", ctx do
+  test "an HTTP/1.1 feed receives one agent show and keeps the focus fallback", ctx do
     heartbeat_fast()
     reader = connect(ctx.port, ctx.certs, "a1", :http1)
     assert Mint.HTTP.protocol(reader) == :http1
@@ -718,10 +714,12 @@ defmodule AttentionServer.ClientAPIFeedShowTest do
 
     response = Task.await(show_in_request(ctx))
     assert response.status == 200
-    assert %{"state" => "held", "show_id" => id} = body(response)
-    {reader, _feed, observed} = events(reader, feed, 3)
-    assert Enum.any?(observed, &(&1.event == "heartbeat"))
-    refute Enum.any?(observed, &(&1.event == "show"))
+    assert %{"state" => "sent", "show_id" => id} = body(response)
+
+    {reader, feed, received, _prior} = until_show(reader, feed)
+    assert %{event: "show", data: %{"show_id" => ^id, "target" => "chat"}} = received
+    {reader, _feed, following} = events(reader, feed, 3)
+    refute Enum.any?(following, &(&1.event == "show"))
 
     focus = connect(ctx.port, ctx.certs, "a1", :http1)
     report = JSON.encode!(%{"screen" => "inbox", "ttl_s" => 120})
