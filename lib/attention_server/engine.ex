@@ -34,7 +34,8 @@ defmodule AttentionServer.Engine do
   @push_window_ms 300_000
   @maintainer_scopes MapSet.new(~w(devices senders view_items configure))
 
-  defstruct relay_instance_id: nil,
+  defstruct touched_keys: nil,
+            relay_instance_id: nil,
             agent_cursor_key: nil,
             persons: %{},
             owners: %{},
@@ -2044,6 +2045,59 @@ defmodule AttentionServer.Engine do
     else
       _ -> {engine, {:error, :forbidden}}
     end
+  end
+
+  @doc false
+  def request_line_with_touches(%__MODULE__{} = engine, key, raw, request_at) do
+    with_touches(engine, &request_line(&1, key, raw, request_at))
+  end
+
+  @doc false
+  def with_touches(%__MODULE__{} = engine, transition) do
+    {next, reply} = transition.(%{engine | touched_keys: MapSet.new()})
+    {%{next | touched_keys: nil}, reply, next.touched_keys}
+  end
+
+  @doc false
+  def put_row(%__MODULE__{} = engine, field, key, value) do
+    rows = Map.fetch!(engine, field)
+    next = Map.replace!(engine, field, Map.put(rows, key, value))
+
+    if is_nil(engine.touched_keys) or Map.fetch(rows, key) === {:ok, value},
+      do: next,
+      else: touch_fact(next, {:row, field, key})
+  end
+
+  @doc false
+  def delete_row(%__MODULE__{} = engine, field, key) do
+    rows = Map.fetch!(engine, field)
+
+    if Map.has_key?(rows, key) do
+      engine
+      |> Map.replace!(field, Map.delete(rows, key))
+      |> touch_fact({:row, field, key})
+    else
+      engine
+    end
+  end
+
+  @doc false
+  def put_member(%__MODULE__{} = engine, field, key) do
+    members = Map.fetch!(engine, field)
+
+    if MapSet.member?(members, key),
+      do: engine,
+      else:
+        engine
+        |> Map.replace!(field, MapSet.put(members, key))
+        |> touch_fact({:member, field, key})
+  end
+
+  @doc false
+  def touch_fact(%__MODULE__{touched_keys: nil} = engine, _address), do: engine
+
+  def touch_fact(%__MODULE__{} = engine, address) do
+    %{engine | touched_keys: MapSet.put(engine.touched_keys, address)}
   end
 
   @doc false
