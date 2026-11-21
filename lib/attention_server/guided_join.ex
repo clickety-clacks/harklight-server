@@ -7,10 +7,15 @@ defmodule AttentionServer.GuidedJoin do
 
   alias AttentionServer.{DeviceIdentity, Diagnostics, Engine}
 
-  def configuration(name, enroll_port, relay_port, ca_pem) do
+  @doc """
+  Invitation v2 trust configuration. `device_url` is the origin of the device
+  listener that serves client API v2; it replaces the v1 `relay_url`
+  (contract round 27). Clients read it and never derive it.
+  """
+  def configuration(name, enroll_port, device_port, ca_pem) do
     with true <- is_binary(name) and Regex.match?(~r/\A[a-zA-Z0-9][a-zA-Z0-9.-]{0,252}\z/, name),
          true <- is_integer(enroll_port) and enroll_port in 1..65_535,
-         true <- is_integer(relay_port) and relay_port in 1..65_535,
+         true <- is_integer(device_port) and device_port in 1..65_535,
          true <- is_binary(ca_pem) and byte_size(ca_pem) <= 16 * 1024,
          [{:Certificate, der, :not_encrypted}] <- :public_key.pem_decode(ca_pem),
          true <- match?({:OTPCertificate, _, _, _}, :public_key.pkix_decode_cert(der, :otp)) do
@@ -18,7 +23,7 @@ defmodule AttentionServer.GuidedJoin do
        %{
          "server_name" => name,
          "enrollment_url" => "https://#{name}:#{enroll_port}/enroll",
-         "relay_url" => "wss://#{name}:#{relay_port}/relay",
+         "device_url" => "https://#{name}:#{device_port}",
          "ca_pem" => :public_key.pem_encode([{:Certificate, der, :not_encrypted}]),
          "ca_sha256" => Base.encode16(:crypto.hash(:sha256, der), case: :lower)
        }}
@@ -142,7 +147,7 @@ defmodule AttentionServer.GuidedJoin do
   def invitation_response(invite, token) do
     response =
       Map.merge(invite.configuration, %{
-        "v" => 1,
+        "v" => 2,
         "person_id" => invite.person,
         "invite_token" => Base.encode16(token, case: :lower),
         "expires_at" => invite.expires_at
@@ -163,12 +168,15 @@ defmodule AttentionServer.GuidedJoin do
          {:ok, raw} <- Base.decode16(token, case: :lower),
          invite when is_map(invite) <-
            Map.get(engine.join_invitations, :crypto.hash(:sha256, raw)),
-         true <- invite.configuration == configuration,
          {:ok, revision} <- Engine.owner_revision(engine, invite.person, invite.owner_key),
          true <- revision == invite.owner_revision do
-      if is_nil(invite.code),
-        do: {:ok, invitation_response(invite, raw)},
-        else: {:error, :used}
+      case {served_configuration(invite, configuration), invite.code} do
+        {:current, nil} -> {:ok, invitation_response(invite, raw)}
+        {:current, _code} -> {:error, :used}
+        {:v1, nil} -> {:error, :reissue_required}
+        {:v1, _code} -> {:error, :used}
+        {:other, _code} -> {:error, :unavailable}
+      end
     else
       _ -> {:error, :unavailable}
     end
@@ -178,18 +186,40 @@ defmodule AttentionServer.GuidedJoin do
     with true <- hash?(hash) and hash?(secret_hash),
          {:ok, key} <- DeviceIdentity.from_certificate(certificate),
          invite when is_map(invite) <- Map.get(engine.join_invitations, hash),
-         true <- invite.configuration == configuration,
          {:ok, revision} <- Engine.owner_revision(engine, invite.person, invite.owner_key),
          true <- revision == invite.owner_revision do
-      if is_nil(invite.code) do
-        consume(engine, hash, invite, certificate, label, secret_hash, code)
-      else
-        retry(engine, invite, key, secret_hash)
+      # A consumed invitation stored before invitation v2 still recovers its
+      # pending request, as other pre-cutover pending enrollments do; an
+      # unused one is refused so the owner issues a v2 invitation instead.
+      case {served_configuration(invite, configuration), invite.code} do
+        {:current, nil} -> consume(engine, hash, invite, certificate, label, secret_hash, code)
+        {:current, _code} -> retry(engine, invite, key, secret_hash)
+        {:v1, nil} -> {:error, :reissue_required}
+        {:v1, _code} -> retry(engine, invite, key, secret_hash)
+        {:other, _code} -> {:error, :refused}
       end
     else
       _ -> {:error, :refused}
     end
   end
+
+  # An invitation matches the current configuration, is a pre-v2 invitation
+  # for this same server (stored before the cutover), or belongs to another
+  # configuration.
+  defp served_configuration(%{configuration: stored}, current) do
+    cond do
+      stored == current -> :current
+      v1_configuration?(stored) and same_server_v1?(stored, current) -> :v1
+      true -> :other
+    end
+  end
+
+  defp same_server_v1?(stored, current) when is_map(current) do
+    Map.take(stored, ~w(server_name enrollment_url ca_pem ca_sha256)) ==
+      Map.take(current, ~w(server_name enrollment_url ca_pem ca_sha256))
+  end
+
+  defp same_server_v1?(_stored, _current), do: false
 
   defp consume(engine, hash, invite, certificate, label, secret_hash, code) do
     with {:ok, pending} <- Engine.pending_enroll(engine, certificate, label, code, secret_hash) do
@@ -253,14 +283,14 @@ defmodule AttentionServer.GuidedJoin do
         %{
           "server_name" => name,
           "enrollment_url" => enrollment,
-          "relay_url" => relay,
+          "device_url" => device,
           "ca_pem" => ca,
           "ca_sha256" => pin
         } = config
       ) do
     with %URI{port: ep} <- URI.parse(enrollment),
-         %URI{port: rp} <- URI.parse(relay),
-         {:ok, expected} <- configuration(name, ep, rp, ca) do
+         %URI{port: dp} <- URI.parse(device),
+         {:ok, expected} <- configuration(name, ep, dp, ca) do
       config == expected and is_binary(pin)
     else
       _ -> false
@@ -273,12 +303,46 @@ defmodule AttentionServer.GuidedJoin do
 
   def valid_configuration?(_), do: false
 
+  @doc """
+  The configuration of an invitation stored before invitation v2: the v1
+  `relay_url` (`wss://NAME:PORT/relay`) in place of `device_url`. It stays
+  valid in stored state so an upgraded store opens, but it is never served.
+  """
+  def v1_configuration?(
+        %{
+          "server_name" => name,
+          "enrollment_url" => enrollment,
+          "relay_url" => relay,
+          "ca_pem" => ca
+        } = config
+      )
+      when is_binary(enrollment) and is_binary(relay) do
+    with %URI{scheme: "wss", port: port, path: "/relay"} <- URI.parse(relay),
+         %URI{port: ep} <- URI.parse(enrollment),
+         {:ok, expected} <- configuration(name, ep, port, ca) do
+      config ==
+        expected
+        |> Map.delete("device_url")
+        |> Map.put("relay_url", "wss://#{name}:#{port}/relay")
+    else
+      _ -> false
+    end
+  rescue
+    error ->
+      Diagnostics.failure(:server_storage, :store_open, error, :unavailable)
+      false
+  end
+
+  def v1_configuration?(_), do: false
+
   def valid_state?(engine) do
     is_map(engine.join_invitations) and
       Enum.all?(engine.join_invitations, fn {hash, invite} ->
         hash?(hash) and map_size(invite) == 10 and Map.has_key?(engine.persons, invite.person) and
           key?(invite.owner_key) and is_integer(invite.owner_revision) and
-          invite.owner_revision > 0 and valid_configuration?(invite.configuration) and
+          invite.owner_revision > 0 and
+          (valid_configuration?(invite.configuration) or
+             v1_configuration?(invite.configuration)) and
           (is_nil(invite.expires_at) or (is_integer(invite.expires_at) and invite.expires_at > 0)) and
           (is_nil(invite.retain_until) or is_integer(invite.retain_until)) and
           (is_nil(invite.request_id) or AttentionServer.Message.uuid_v4?(invite.request_id)) and

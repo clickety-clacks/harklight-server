@@ -577,10 +577,95 @@ defmodule AttentionServer.GuidedJoinTest do
              Engine.pending_resume(cancelled, c.secret_hash, c.device)
   end
 
-  test "fragment invitation carries the exact v1 payload and no authority in path or query", c do
+  test "invitation v2 names the device listener origin and no relay URL", c do
+    assert Map.keys(c.config) |> Enum.sort() ==
+             ~w(ca_pem ca_sha256 device_url enrollment_url server_name)
+
+    assert c.config["device_url"] == "https://relay.test:18443"
+    assert c.config["enrollment_url"] == "https://relay.test:18444/enroll"
+    assert GuidedJoin.valid_configuration?(c.config)
+    refute GuidedJoin.valid_configuration?(v1_config(c.config))
+
+    for bad <- [
+          "http://relay.test:18443",
+          "https://relay.test:18443/v2",
+          "https://other.test:18443"
+        ] do
+      refute GuidedJoin.valid_configuration?(%{c.config | "device_url" => bad})
+    end
+
+    token = String.duplicate("a", 64)
+    hash = :crypto.hash(:sha256, Base.decode16!(token, case: :lower))
+    assert {:ok, engine, _} = GuidedJoin.create(c.engine, @person, c.owner_key, hash, c.config)
+    assert {:ok, invitation} = GuidedJoin.resolve(engine, token, c.config)
+    assert invitation["v"] == 2
+    assert invitation["device_url"] == "https://relay.test:18443"
+    refute Map.has_key?(invitation, "relay_url")
+    {:ok, payload} = Base.url_decode64(URI.parse(invitation["join_url"]).fragment, padding: false)
+    assert {:ok, decoded} = AttentionServer.JSON.decode_line(payload <> "\n")
+    assert decoded == Map.delete(invitation, "join_url")
+  end
+
+  test "an unused invitation stored before invitation v2 keeps state valid and asks for a reissue",
+       c do
+    token = String.duplicate("a", 64)
+    hash = :crypto.hash(:sha256, Base.decode16!(token, case: :lower))
+    assert {:ok, engine, _} = GuidedJoin.create(c.engine, @person, c.owner_key, hash, c.config)
+    engine = with_v1_configuration(engine, hash, c.config)
+
+    assert GuidedJoin.valid_state?(engine)
+    assert {:error, :reissue_required} = GuidedJoin.resolve(engine, token, c.config)
+
+    assert {:error, :reissue_required} =
+             GuidedJoin.redeem(engine, hash, c.device, "phone", c.secret_hash, @code, c.config)
+
+    malformed =
+      update_in(engine.join_invitations[hash].configuration, fn config ->
+        %{config | "relay_url" => "wss://relay.test:18443/v2"}
+      end)
+
+    refute GuidedJoin.valid_state?(malformed)
+  end
+
+  test "a consumed pre-v2 invitation still recovers its pending request but is never served", c do
+    token = String.duplicate("a", 64)
+    hash = :crypto.hash(:sha256, Base.decode16!(token, case: :lower))
+    assert {:ok, engine, _} = GuidedJoin.create(c.engine, @person, c.owner_key, hash, c.config)
+
+    assert {:ok, consumed, %{"approval_code" => @code}} =
+             GuidedJoin.redeem(engine, hash, c.device, "phone", c.secret_hash, @code, c.config)
+
+    consumed = with_v1_configuration(consumed, hash, c.config)
+    assert GuidedJoin.valid_state?(consumed)
+    assert {:error, :used} = GuidedJoin.resolve(consumed, token, c.config)
+
+    assert {:ok, ^consumed, %{"approval_code" => @code}} =
+             GuidedJoin.redeem(
+               consumed,
+               hash,
+               c.device,
+               "phone",
+               c.secret_hash,
+               @other_code,
+               c.config
+             )
+
+    assert {:error, :used} =
+             GuidedJoin.redeem(
+               consumed,
+               hash,
+               c.device,
+               "phone",
+               :crypto.hash(:sha256, "x"),
+               @other_code,
+               c.config
+             )
+  end
+
+  test "fragment invitation carries the exact v2 payload and no authority in path or query", c do
     invite =
       Map.merge(c.config, %{
-        "v" => 1,
+        "v" => 2,
         "person_id" => @person,
         "invite_token" => String.duplicate("a", 64),
         "expires_at" => 1_800_000,
@@ -630,6 +715,18 @@ defmodule AttentionServer.GuidedJoinTest do
   end
 
   defp create(c), do: GuidedJoin.create(c.engine, @person, c.owner_key, c.token_hash, c.config)
+
+  # The trust configuration an invitation stored before invitation v2 carries.
+  defp v1_config(config) do
+    %URI{host: host, port: port} = URI.parse(config["device_url"])
+
+    config
+    |> Map.delete("device_url")
+    |> Map.put("relay_url", "wss://#{host}:#{port}/relay")
+  end
+
+  defp with_v1_configuration(engine, hash, config),
+    do: put_in(engine.join_invitations[hash].configuration, v1_config(config))
 
   defp redeem(c, engine, config),
     do: GuidedJoin.redeem(engine, c.token_hash, c.device, "app", c.secret_hash, @code, config)

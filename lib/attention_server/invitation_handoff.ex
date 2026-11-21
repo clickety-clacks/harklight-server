@@ -53,7 +53,7 @@ defmodule AttentionServer.InvitationHandoff do
        )
        when is_binary(url) and (is_nil(deadline) or (is_integer(deadline) and deadline > 0)) do
     configuration =
-      Map.take(invitation, ~w(server_name enrollment_url relay_url ca_pem ca_sha256))
+      Map.take(invitation, ~w(server_name enrollment_url device_url ca_pem ca_sha256))
 
     if GuidedJoin.valid_configuration?(configuration) and
          url == GuidedJoin.link(Map.delete(invitation, "join_url")) do
@@ -63,7 +63,7 @@ defmodule AttentionServer.InvitationHandoff do
         state: "ready",
         request_id: request_id,
         account: person,
-        destination: Map.take(configuration, ~w(server_name enrollment_url relay_url)),
+        destination: Map.take(configuration, ~w(server_name enrollment_url device_url)),
         expires_at: deadline,
         share_url: share_url,
         full_url: url,
