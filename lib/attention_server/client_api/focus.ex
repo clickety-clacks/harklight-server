@@ -34,6 +34,14 @@ defmodule AttentionServer.ClientAPI.Focus do
     end
   end
 
+  @doc """
+  Ends the calling process's show subscription for `device_key`, for a feed
+  that closes in a process that lives on (HTTP/1.1 connection reuse).
+  """
+  @spec unsubscribe_shows(String.t()) :: :ok
+  def unsubscribe_shows(device_key) when is_binary(device_key),
+    do: Registry.unregister(@registry, {:client_api_show, device_key})
+
   @doc false
   # Called by the Relay when it holds a show; sends it to the device's open
   # feeds. With no feed open, or the registry not running, it does nothing.

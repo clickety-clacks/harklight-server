@@ -216,6 +216,14 @@ defmodule AttentionServer.ClientAPIFocusTest do
     assert show["held_ms"] == 750
     assert Map.delete(show, "held_ms") == Map.delete(live, "held_ms")
 
+    # A feed that closes unsubscribes; later shows are not sent to it.
+    :ok = Focus.unsubscribe_shows("reader")
+    assert {:ok, _} = push_view(relay, "message")
+    refute_receive {:client_api_show, "reader", _}, 200
+
+    assert {:ok, 200, %{"show" => %{"target" => "message"}}, false} =
+             Writes.focus(relay, "reader", %{"screen" => "inbox", "ttl_s" => 120})
+
     # Consumed: the next write carries none. A show never marks anything Seen.
     assert {:ok, 200, body, false} =
              Writes.focus(relay, "reader", %{"screen" => "inbox", "ttl_s" => 120})
