@@ -2974,10 +2974,7 @@ defmodule AttentionServer.Relay do
 
   defp dispatch_call({:end_browser_session, browser_session_id}, _from, state) do
     if state.store.change_log,
-      do:
-        AttentionServer.ChangeLog.notify_closing([
-          {{:browser_session, browser_session_id}, :revoked}
-        ])
+      do: AttentionServer.ChangeLog.notify_closing([{{:browser_session, browser_session_id}, :revoked}])
 
     state =
       state.sessions
