@@ -660,6 +660,19 @@ defmodule AttentionServer.ClientAPIResourcesTest do
         |> Enum.map(&elem(&1, 1))
 
       assert by_key == listed
+
+      # The change log keeps keys by rank unit, and maps each unit to its item.
+      {:ok, chat_id} = Resources.item_id(engine, key("chat"))
+      unit_keys = Resources.rank_unit_keys(Resources.ranks(engine, "A", view))
+      assert unit_keys["r" <> chat_id] == chat["reply_rank_key"]
+      assert unit_keys[chat_id] == items[key("chat")]["rank"]["key"]
+      assert map_size(unit_keys) == map_size(items) + 1
+      assert {:ok, key("chat")} == Resources.rank_unit_item(engine, "A", "r" <> chat_id)
+      assert {:ok, key("chat")} == Resources.rank_unit_item(engine, "A", chat_id)
+
+      assert Resources.ranks(engine, "A", view, unit_keys) |> Resources.rank_unit_keys() ==
+               unit_keys
+
       GenServer.stop(relay)
     end
 

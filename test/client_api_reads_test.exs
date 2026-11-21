@@ -289,6 +289,8 @@ defmodule AttentionServer.ClientAPIReadsTest do
     assert position > 0
     assert Enum.all?(entries, &(&1["rev"] >= 1 and &1["rev"] <= position))
     assert entries |> Enum.map(& &1["rev"]) |> Enum.uniq() |> length() == length(entries)
+    # Entries created with the change log on carry their first-seen time.
+    assert Enum.all?(entries, &(is_integer(&1["at_ms"]) and &1["at_ms"] > 0))
 
     first = hd(entries)
 
