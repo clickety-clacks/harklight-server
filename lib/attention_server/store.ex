@@ -237,15 +237,18 @@ defmodule AttentionServer.Store do
     end
   end
 
-  defp finalize_mode(%__MODULE__{mode: :keyed} = store),
-    do:
-      {:ok,
-       %{
-         store
-         | source_bindings: KeyedValidation.source_index(store.engine.messages),
-           upload_links: KeyedValidation.upload_index(store.engine),
-           authority_index: KeyedValidation.authority_index(store.engine)
-       }}
+  defp finalize_mode(%__MODULE__{mode: :keyed} = store) do
+    engine = AttentionServer.RouteBIndex.enable_request_lookup(store.engine)
+
+    {:ok,
+     %{
+       store
+       | engine: engine,
+         source_bindings: KeyedValidation.source_index(engine.messages),
+         upload_links: KeyedValidation.upload_index(engine),
+         authority_index: KeyedValidation.authority_index(engine)
+     }}
+  end
 
   defp finalize_mode(%__MODULE__{mode: :legacy} = store) do
     with {:ok, store} <- load_progress(store) do

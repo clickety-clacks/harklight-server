@@ -12,6 +12,7 @@ defmodule AttentionServer.RouteBIndex do
       entry_positions: %{},
       advisory_sequences: %{},
       messages_by_origin_session: %{},
+      request_keys_by_id: nil,
       conversation_summary_by_item: %{},
       unresolved_count_by_person: %{}
     }
@@ -19,6 +20,11 @@ defmodule AttentionServer.RouteBIndex do
 
   def rebuild(engine) do
     index = %{new() | agent_feed?: Map.get(engine.route_b_index, :agent_feed?, false)}
+
+    index =
+      if is_map(engine.route_b_index[:request_keys_by_id]),
+        do: %{index | request_keys_by_id: %{}},
+        else: index
 
     index =
       Enum.reduce(engine.messages, index, fn {key, record}, current ->
@@ -32,6 +38,22 @@ defmodule AttentionServer.RouteBIndex do
 
     index_advisories(index, engine.advisory_feeds)
   end
+
+  def enable_request_lookup(engine) do
+    index =
+      Enum.reduce(engine.messages, %{engine.route_b_index | request_keys_by_id: %{}}, fn
+        {key, _record}, index -> put_request_key(index, key, nil)
+      end)
+
+    %{engine | route_b_index: index}
+  end
+
+  defp put_request_key(%{request_keys_by_id: lookup} = index, {person, _, id} = key, nil)
+       when is_map(lookup) do
+    %{index | request_keys_by_id: Map.update(lookup, {person, id}, [key], &[key | &1])}
+  end
+
+  defp put_request_key(index, _key, _previous), do: index
 
   def enable_agent_feed(%{route_b_index: %{agent_feed?: true}} = engine), do: engine
 
@@ -66,6 +88,7 @@ defmodule AttentionServer.RouteBIndex do
   defp index_advisories(index, _feeds), do: index
 
   def put_message(index, {person, sender, id} = key, previous, record) do
+    index = put_request_key(index, key, previous)
     index = put_session_message(index, key, previous, record)
     index = put_agent_message(index, key, previous, record)
     previous_resolved? = match?(%{terminal: terminal} when not is_nil(terminal), previous)

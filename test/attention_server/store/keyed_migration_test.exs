@@ -1,7 +1,7 @@
 defmodule AttentionServer.Store.KeyedMigrationTest do
   use ExUnit.Case, async: true
 
-  alias AttentionServer.Store
+  alias AttentionServer.{RouteBIndex, Store}
   alias AttentionServer.Store.{KeyedMigration, RecordCodec, RecordTable}
   alias Exqlite.Sqlite3
 
@@ -26,7 +26,7 @@ defmodule AttentionServer.Store.KeyedMigrationTest do
     assert {:error, _reason} = Store.open(path)
     assert {:ok, keyed} = Store.open(path, :keyed)
     assert keyed.version == generation
-    assert keyed.engine == store.engine
+    assert keyed.engine == RouteBIndex.enable_request_lookup(store.engine)
     assert :ok = Store.close(keyed)
     assert {:ok, db} = Sqlite3.open(path)
 

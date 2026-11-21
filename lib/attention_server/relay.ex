@@ -50,7 +50,7 @@ defmodule AttentionServer.Relay do
                         )
   @keyed_request_types ~w(
     forward message_open discussion answer conversation_reply conversation_revise
-    conversation_read subscribe_remote
+    conversation_read subscribe_remote answer_no_comment lifecycle
   )
 
   def start_link(opts \\ []) do

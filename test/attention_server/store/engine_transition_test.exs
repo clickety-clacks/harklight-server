@@ -395,6 +395,53 @@ defmodule AttentionServer.Store.EngineTransitionTest do
     assert {:ok, %{"type" => "ok", "revision" => 1}} = JSON.decode_line(subscribed)
     assert {:ok, [^subscribed]} = Relay.session_request_line(keyed, keyed_session, subscribe)
 
+    for {id, operation_id} <- [
+          {"no-comment", "00000000-0000-4000-8000-000000000021"},
+          {"cleared", "00000000-0000-4000-8000-000000000022"}
+        ] do
+      line =
+        send
+        |> put_in(["message", "message_id"], id)
+        |> Map.put("op_id", operation_id)
+        |> JSON.encode_line()
+
+      assert {:ok, accepted} = Relay.request_line(legacy, @origin, line)
+      assert {:ok, %{"type" => "ok"}} = JSON.decode_line(accepted)
+      assert {:ok, ^accepted} = Relay.request_line(keyed, @origin, line)
+    end
+
+    no_comment =
+      JSON.encode_line(%{
+        "type" => "answer_no_comment",
+        "request_id" => "no-comment",
+        "request_revision" => 1
+      })
+
+    for duplicate? <- [false, true] do
+      assert {:ok, answer} = Relay.request_line(legacy, @reader, no_comment)
+
+      assert {:ok, %{"type" => "ok", "terminal_kind" => "no_comment"} = result} =
+               JSON.decode_line(answer)
+
+      assert Map.get(result, "duplicate", false) == duplicate?
+      assert {:ok, ^answer} = Relay.request_line(keyed, @reader, no_comment)
+    end
+
+    clear =
+      JSON.encode_line(%{
+        "v" => 1,
+        "type" => "lifecycle",
+        "op_id" => "00000000-0000-4000-8000-000000000023",
+        "sender_id" => "app:test/worker",
+        "message_id" => "cleared",
+        "state" => "cleared",
+        "at" => 98
+      })
+
+    assert {:ok, cleared} = Relay.request_line(legacy, @origin, clear)
+    assert {:ok, %{"type" => "ok"}} = JSON.decode_line(cleared)
+    assert {:ok, ^cleared} = Relay.request_line(keyed, @origin, clear)
+
     live_keyed = :sys.get_state(keyed).store
     GenServer.stop(legacy)
     GenServer.stop(keyed)
@@ -457,6 +504,12 @@ defmodule AttentionServer.Store.EngineTransitionTest do
       engine.route_b_index
       |> Map.update!(:resolved_messages_by_person, &ordered_rows/1)
       |> Map.update!(:conversations_by_item, &ordered_rows/1)
+      |> Map.update!(:sent_messages_by_agent, &ordered_rows/1)
+      |> Map.update!(:agent_entry_pages, &ordered_rows/1)
+      |> Map.update!(:messages_by_origin_session, fn origins ->
+        Map.new(origins, fn {origin, sessions} -> {origin, sorted_lists(sessions)} end)
+      end)
+      |> Map.update!(:request_keys_by_id, &sorted_lists/1)
       |> Map.update!(
         :unresolved_count_by_person,
         &Map.reject(&1, fn {_, count} -> count == 0 end)
@@ -475,6 +528,10 @@ defmodule AttentionServer.Store.EngineTransitionTest do
 
   defp ordered_rows(trees) do
     Map.new(trees, fn {key, tree} -> {key, :gb_trees.to_list(tree)} end)
+  end
+
+  defp sorted_lists(rows) do
+    Map.new(rows, fn {key, values} -> {key, Enum.sort(values)} end)
   end
 
   defp replace_body(engine, item, body) do

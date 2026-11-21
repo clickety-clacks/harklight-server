@@ -94,6 +94,7 @@ defmodule AttentionServer.Engine do
               entry_positions: %{},
               advisory_sequences: %{},
               messages_by_origin_session: %{},
+              request_keys_by_id: nil,
               conversation_summary_by_item: %{},
               unresolved_count_by_person: %{}
             }
@@ -2087,9 +2088,7 @@ defmodule AttentionServer.Engine do
     keys =
       case frame do
         %{"type" => "answer_no_comment", "request_id" => id} when is_binary(id) ->
-          matches = for {{^person, _sender, ^id} = key, _record} <- engine.messages, do: key
-
-          case matches do
+          case request_keys(engine, person, id) do
             [key] -> [key]
             _ -> []
           end
@@ -2176,7 +2175,7 @@ defmodule AttentionServer.Engine do
         "request_revision" => terminal_entry["request_revision"]
       }
 
-      %{next | events: Map.put(next.events, {person, seq}, Map.put(event, :payload, payload))}
+      put_row(next, :events, {person, seq}, Map.put(event, :payload, payload))
     else
       next
     end
@@ -3188,18 +3187,20 @@ defmodule AttentionServer.Engine do
   end
 
   defp no_comment_terminal(engine, person, device, request_id, seq) do
-    matches =
-      for {{^person, _sender, ^request_id} = message_key, record} <- engine.messages,
-          do: {message_key, record}
-
-    case matches do
-      [{message_key, %{terminal: %{seq: ^seq}} = record}] ->
-        {:ok, project_paging_terminal(engine, record, message_key, device)}
-
-      _ ->
-        {:error, :snapshot_unavailable}
+    with [message_key] <- request_keys(engine, person, request_id),
+         %{terminal: %{seq: ^seq}} = record <- Map.get(engine.messages, message_key) do
+      {:ok, project_paging_terminal(engine, record, message_key, device)}
+    else
+      _ -> {:error, :snapshot_unavailable}
     end
   end
+
+  defp request_keys(%{route_b_index: %{request_keys_by_id: lookup}}, person, id)
+       when is_map(lookup),
+       do: Map.get(lookup, {person, id}, [])
+
+  defp request_keys(engine, person, id),
+    do: for({{^person, _, ^id} = key, _record} <- engine.messages, do: key)
 
   @doc false
   def reconcile_operation(%__MODULE__{} = engine, key, frame, high, committed_at_snapshot?)
@@ -4448,12 +4449,10 @@ defmodule AttentionServer.Engine do
          op_id
        ) do
     if kind in [:device, :browser] and Message.nonempty?(request_id) do
-      matches =
-        for {{^person, _sender, ^request_id} = key, record} <- engine.messages,
-            do: {key, record}
+      case request_keys(engine, person, request_id) do
+        [key] ->
+          record = Map.fetch!(engine.messages, key)
 
-      case matches do
-        [{key, record}] ->
           case valid_no_comment_revision(record, request_revision) do
             {:error, current} ->
               failure("stale_revision", "request_revision", %{"current_revision" => current})
@@ -4563,7 +4562,7 @@ defmodule AttentionServer.Engine do
             "request_revision" => terminal_entry["request_revision"]
           })
 
-        %{next | events: Map.put(next.events, {person, seq}, updated)}
+        put_row(next, :events, {person, seq}, updated)
       else
         next
       end
