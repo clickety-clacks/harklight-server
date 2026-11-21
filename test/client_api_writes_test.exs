@@ -4,7 +4,7 @@ defmodule AttentionServer.ClientAPIWritesTest do
   use ExUnit.Case, async: false
 
   alias AttentionServer.{ChangeLog, JSON, Relay}
-  alias AttentionServer.ClientAPI.{Context, Principal, Reads, Writes}
+  alias AttentionServer.ClientAPI.{Context, FeedRenderer, Principal, Reads, Writes}
   alias AttentionServer.ClientAPISchema, as: Schema
 
   @handle "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
@@ -810,6 +810,77 @@ defmodule AttentionServer.ClientAPIWritesTest do
 
       GenServer.stop(relay)
     end
+  end
+
+  # Every write's change is on the one write path: replaying the rendered log
+  # from empty, with the version rule, reaches what the snapshot reads show.
+  test "after every kind of write, replaying the log from empty equals the snapshot",
+       %{path: path, flags: flags} do
+    relay = scripted_relay(path, flags, push_enabled: true)
+
+    forward_message(relay, 40, %{
+      "message_id" => "pick",
+      "message_type" => "request",
+      "answer_ui" => @choices
+    })
+
+    one = item_id(relay, "one")
+    two = item_id(relay, "two")
+    pick = item_id(relay, "pick")
+    {note, _} = person_note(relay, "one", 41, "Question")
+    agent = agent_reply(relay, "one", 42, note, "Answer")
+
+    assert {201, %{"file_id" => file_id}, _} =
+             send_file(relay, "bytes", [{"idempotency-key", key()}])
+
+    assert {:ok, 200, _, false} = Writes.seen(relay, "reader", two, key())
+    assert {:ok, 200, _, false} = Writes.read_position(relay, "reader", one, agent)
+
+    assert {:ok, 200, _, false} =
+             Writes.reply(relay, "reader", one, "With a file", [file_id], key())
+
+    assert {:ok, 200, _, false} = Writes.answer(relay, "reader", pick, 1, {:choice, "yes"}, key())
+    assert {:ok, 200, _, false} = Writes.answer(relay, "reader", two, 1, :no_comment, key())
+
+    assert {:ok, 200, _, false} =
+             Writes.priority_levels(relay, "reader", @levels, settings_etag(relay, "reader"))
+
+    assert {:ok, 200, _, false} = Writes.push(relay, "reader", @token, "production", 1)
+
+    state = :sys.get_state(relay)
+    view = Map.get(state.priority_views, "A")
+    context = %{engine: state.store.engine, store: state.store, view: view}
+    assert {:ok, rows, false, head} = ChangeLog.read(state.store, "A", 0, 1000)
+
+    applied =
+      Enum.reduce(rows, %{}, fn row, acc ->
+        case FeedRenderer.render(context, "reader", row) do
+          {:ok, data} ->
+            case row.kind do
+              :item -> Map.put(acc, {:item, data["item_id"]}, data)
+              :entry -> Map.put(acc, {:entry, data["entry_id"]}, data)
+              kind when kind in [:counts, :settings] -> Map.put(acc, kind, data)
+              _ -> acc
+            end
+
+          :skip ->
+            acc
+        end
+      end)
+
+    assert {:ok, inbox} = Reads.inbox(relay, "reader")
+    assert inbox["rev"] == head
+    assert applied[:counts] == inbox["counts"]
+
+    for item <- inbox["items"] do
+      assert applied[{:item, item["item_id"]}] == item
+      assert {:ok, %{"entries" => entries}} = Reads.entries(relay, "reader", item["item_id"])
+      for entry <- entries, do: assert(applied[{:entry, entry["entry_id"]}] == entry)
+    end
+
+    assert {:ok, %{"settings" => settings}} = Reads.settings(relay, "reader")
+    assert applied[:settings] == settings
+    GenServer.stop(relay)
   end
 
   describe "HTTP" do
