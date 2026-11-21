@@ -1,7 +1,7 @@
 defmodule AttentionServer.StoreBrowserSnapshotCleanupTest do
   use ExUnit.Case, async: false
 
-  alias AttentionServer.{BrowserRecipient, Engine, Store}
+  alias AttentionServer.{BrowserRecipient, Engine, Relay, Store}
   alias Exqlite.Sqlite3
 
   test "browser recipient progress is valid without creating a device record" do
@@ -87,6 +87,47 @@ defmodule AttentionServer.StoreBrowserSnapshotCleanupTest do
     assert count(store.db, "SELECT count(*) FROM relay_inbox_receipt_pages") == 1
     assert :ok = Store.discard_browser_inbox_snapshots(store)
     assert count(store.db, "SELECT count(*) FROM relay_inbox_snapshots") == 1
+  end
+
+  test "keyed Relay startup removes browser progress and retains device progress" do
+    directory =
+      Path.join(System.tmp_dir!(), "keyed-browser-cleanup-#{System.unique_integer([:positive])}")
+
+    File.mkdir_p!(directory)
+    on_exit(fn -> File.rm_rf!(directory) end)
+    path = Path.join(directory, "relay.sqlite3")
+    {:ok, old} = Store.open(path)
+    person = "00000000-0000-4000-8000-000000000010"
+
+    browser =
+      BrowserRecipient.key(
+        person,
+        String.duplicate("a", 43),
+        "00000000-0000-4000-8000-000000000011"
+      )
+
+    {:ok, engine} = Engine.setup_person(old.engine, person)
+    {:ok, engine} = Engine.setup_device(engine, person, "device")
+
+    engine = %{
+      engine
+      | cursors: Map.put(engine.cursors, {person, browser}, 0),
+        conversation_cursors: %{{person, browser} => 0},
+        conversation_opened: MapSet.new([{person, browser}])
+    }
+
+    {:ok, old} = Store.commit(old, engine, %{person: person, actor: browser, action: "setup"})
+    assert {:ok, generation} = Store.KeyedMigration.convert(old)
+    :ok = Store.close(old)
+
+    {:ok, relay} = Relay.start_link(store_path: path, store_mode: :keyed)
+    GenServer.stop(relay)
+    {:ok, store} = Store.open(path, :keyed)
+    assert store.version == generation + 1
+    assert store.engine.cursors == %{{person, "device"} => 0}
+    assert store.engine.conversation_cursors == %{}
+    assert MapSet.size(store.engine.conversation_opened) == 0
+    :ok = Store.close(store)
   end
 
   defp insert_snapshot(db, person, device, snapshot_id) do

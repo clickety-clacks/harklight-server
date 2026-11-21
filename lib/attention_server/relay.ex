@@ -906,11 +906,10 @@ defmodule AttentionServer.Relay do
   defp client_api_v2_store(error, _feature_flags_path), do: error
 
   defp startup_cleanup(store) do
-    actor_keys = browser_actor_keys(store.engine)
-    engine = discard_browser_actor_state(store.engine, actor_keys)
+    actor_keys = browser_actor_keys(store)
 
     with :ok <- Store.discard_building_inbox_snapshots(store),
-         {:ok, store} <- commit_browser_cleanup(store, engine),
+         {:ok, store} <- commit_browser_cleanup(store, actor_keys, "browser_session_restart"),
          :ok <- Store.discard_browser_inbox_snapshots(store) do
       {:ok, store}
     else
@@ -919,17 +918,33 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  defp commit_browser_cleanup(store, engine) do
-    if engine == store.engine do
-      {:ok, store}
-    else
-      commit(store, engine, %{
-        person: "system",
-        actor: "browser_session",
-        action: "browser_session_restart"
-      })
-    end
+  defp commit_browser_cleanup(%Store{mode: :keyed} = store, actor_keys, action) do
+    rows =
+      Enum.reduce(actor_keys, MapSet.new(), fn actor, keys ->
+        MapSet.union(keys, Map.get(store.authority_index, {:actor, actor}, MapSet.new()))
+      end)
+      |> Enum.filter(fn
+        {:row, field, _} when field in [:cursors, :conversation_cursors, :receipts] -> true
+        {:member, :conversation_opened, _} -> true
+        _ -> false
+      end)
+
+    engine =
+      Enum.reduce(rows, store.engine, fn
+        {:row, field, key}, current -> Map.update!(current, field, &Map.delete(&1, key))
+        {:member, field, key}, current -> Map.update!(current, field, &MapSet.delete(&1, key))
+      end)
+
+    commit_known_rows(store, engine, browser_cleanup_audit(action), rows)
   end
+
+  defp commit_browser_cleanup(store, actor_keys, action) do
+    engine = discard_browser_actor_state(store.engine, actor_keys)
+    commit(store, engine, browser_cleanup_audit(action))
+  end
+
+  defp browser_cleanup_audit(action),
+    do: %{person: "system", actor: "browser_session", action: action}
 
   @impl true
   def terminate(_reason, %{store: store}), do: Store.close(store)
@@ -8020,13 +8035,7 @@ defmodule AttentionServer.Relay do
         fail_inbox_build(acc, key, :forbidden, true)
       end)
 
-    engine = discard_browser_actor_state(state.store.engine, actor_keys)
-
-    case commit(state.store, engine, %{
-           person: "system",
-           actor: "browser_session",
-           action: "browser_session_end"
-         }) do
+    case commit_browser_cleanup(state.store, actor_keys, "browser_session_end") do
       {:ok, store} ->
         next = %{state | store: store}
 
@@ -8048,7 +8057,11 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  defp browser_actor_keys(engine) do
+  defp browser_actor_keys(%Store{mode: :keyed, authority_index: index}) do
+    for {:actor, key} <- Map.keys(index), BrowserRecipient.person(key) != :error, do: key
+  end
+
+  defp browser_actor_keys(%Store{engine: engine}) do
     keys =
       Enum.map(engine.cursors, fn {{_person, key}, _seq} -> key end) ++
         Enum.map(engine.conversation_cursors, fn {{_person, key}, _seq} -> key end) ++
