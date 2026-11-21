@@ -25,7 +25,6 @@ defmodule AttentionServer.ClientAPI.AgentResources do
          "revision" => record.revision,
          "message" => current["message"],
          "files" => current["files"],
-         "delivered" => true,
          "seen" => Resources.seen?(engine, key, record)
        }
        |> put("session", Map.get(record, :session_handle))
