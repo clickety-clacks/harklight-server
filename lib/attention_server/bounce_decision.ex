@@ -323,11 +323,11 @@ defmodule AttentionServer.BounceDecision do
     end
   end
 
-  def advisory_ack(%Engine{} = engine, key, handle, advisory_id) do
+  def advisory_ack(%Engine{} = engine, key, handle, advisory_id, v2? \\ false) do
     with {:ok, person} <- Engine.authorized_person(engine, key),
          true <- Message.uuid_v4?(handle),
          true <- Message.uuid_v4?(advisory_id),
-         {:ok, _session} <- supported_session(engine, person, key, handle) do
+         {:ok, _session} <- advisory_ack_session(engine, person, key, handle, v2?) do
       feed_key = {person, key, handle}
       feed = Map.get(engine.advisory_feeds, feed_key, empty_advisory_feed())
 
@@ -362,6 +362,15 @@ defmodule AttentionServer.BounceDecision do
       error -> error
     end
   end
+
+  defp advisory_ack_session(engine, person, key, handle, false),
+    do: supported_session(engine, person, key, handle)
+
+  defp advisory_ack_session(engine, person, key, handle, true),
+    do: Map.fetch(engine.origin_sessions, {person, key, handle}) |> normalize_advisory_session()
+
+  defp normalize_advisory_session({:ok, _} = session), do: session
+  defp normalize_advisory_session(:error), do: {:error, :not_found}
 
   def valid_state?(%Engine{} = engine, :incremental) do
     is_map(engine.bounce_levels) and is_map(engine.bounce_revisions) and

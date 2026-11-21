@@ -288,6 +288,585 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
     assert get(ctx, "a2", path <> "1").status == 404
   end
 
+  describe "agent message writes" do
+    @describetag :agent_message_writes
+
+    test "send creates one server-issued item and only successes consume a key", ctx do
+      path = "/v2/agent/messages"
+
+      body = %{
+        "sender" => "app:test",
+        "session" => @first_session,
+        "message" => %{"title" => "Sent over v2", "created_at" => 1}
+      }
+
+      invalid = put_in(body["message"]["message_id"], "caller-id")
+      assert request(ctx, "a1", "POST", path, invalid, 1).status == 400
+
+      sent = request(ctx, "a1", "POST", path, body, 1)
+      assert sent.status == 200
+      assert %{"message" => message} = contract(ctx, "AgentWriteResult", sent)
+      assert message["item_id"]
+      refute Map.has_key?(message, "legacy_message_id")
+
+      replay = request(ctx, "a1", "POST", path, body, 1)
+      assert replay.status == 200
+
+      assert List.keyfind(replay.headers, "idempotent-replayed", 0) ==
+               {"idempotent-replayed", "true"}
+
+      assert replay.body == sent.body
+
+      changed = put_in(body["message"]["title"], "Different intent")
+      assert_error(request(ctx, "a1", "POST", path, changed, 1), 409, "idempotency_conflict")
+
+      other_key = request(ctx, "a2", "POST", path, body, 1)
+      assert other_key.status == 200
+
+      refute contract(ctx, "AgentWriteResult", other_key)["message"]["item_id"] ==
+               message["item_id"]
+    end
+
+    test "revise uses If-Match, advances revision, and replays before checking it", ctx do
+      id = forward(ctx, "a1", 1, @first_session)
+      path = "/v2/agent/messages/" <> id
+      body = %{"message" => %{"title" => "Updated", "created_at" => 1}}
+
+      assert_error(request(ctx, "a1", "PUT", path, body, 2), 412, "precondition_failed")
+
+      assert_error(
+        request(ctx, "a1", "PUT", path, body, 2, [{"if-match", ~s("2")}]),
+        412,
+        "precondition_failed"
+      )
+
+      headers = [{"if-match", ~s("1")}]
+      revised = request(ctx, "a1", "PUT", path, body, 2, headers)
+      assert revised.status == 200
+
+      assert %{"message" => %{"revision" => 2, "message" => %{"title" => "Updated"}}} =
+               contract(ctx, "AgentWriteResult", revised)
+
+      replay = request(ctx, "a1", "PUT", path, body, 2, headers)
+      assert replay.status == 200
+      assert replay.body == revised.body
+      assert_error(request(ctx, "a2", "PUT", path, body, 3, headers), 404, "not_found")
+    end
+
+    test "correlated revise keeps, carries, and clears current attachments", ctx do
+      sent =
+        frame(ctx, "a1", %{
+          "type" => "forward",
+          "op_id" => op(1),
+          "session_handle" => @first_session,
+          "message" => %{
+            "sender_id" => "app:test",
+            "message_id" => "inline",
+            "title" => "Original",
+            "created_at" => 1
+          },
+          "files" => [%{"name" => "inline.txt", "data_base64" => Base.encode64("fixture")}]
+        })
+
+      id = Resources.item_id(%{accepted_seq: sent["seq"]})
+      path = "/v2/agent/messages/" <> id
+      entry_id = person_reply(ctx, id, 2)
+      message = %{"title" => "Updated", "created_at" => 1}
+      body = %{"message" => message, "in_reply_to" => entry_id}
+
+      revised = request(ctx, "a1", "PUT", path, body, 3, [{"if-match", "1"}])
+      assert revised.status == 200
+
+      assert %{
+               "message" => %{"files" => [%{"file_id" => file}]},
+               "entry" => %{"entry_id" => ^entry_id, "delivery" => %{"acted" => true}}
+             } = contract(ctx, "AgentWriteResult", revised)
+
+      assert get(ctx, "a1", "/v2/files/" <> file).body == "fixture"
+      body = %{"message" => %{"title" => "Carried", "created_at" => 1}, "file_ids" => [file]}
+      carried = request(ctx, "a1", "PUT", path, body, 4, [{"if-match", "2"}])
+      assert carried.status == 200
+
+      assert %{"message" => %{"files" => [%{"name" => "inline.txt"}]}} =
+               contract(ctx, "AgentWriteResult", carried)
+
+      body = %{"message" => %{"title" => "Cleared", "created_at" => 1}, "file_ids" => []}
+      cleared = request(ctx, "a1", "PUT", path, body, 5, [{"if-match", "3"}])
+      assert %{"message" => %{"files" => []}} = contract(ctx, "AgentWriteResult", cleared)
+    end
+
+    test "a correlated revise refuses an already acted turn without changing the revision", ctx do
+      id = forward(ctx, "a1", 1, @first_session)
+      entry_id = person_reply(ctx, id, 2)
+      path = "/v2/agent/messages/" <> id
+
+      assert request(
+               ctx,
+               "a1",
+               "POST",
+               path <> "/replies",
+               %{"text" => "Acted", "in_reply_to" => entry_id},
+               3
+             ).status == 200
+
+      body = %{"message" => %{"title" => "Refused", "created_at" => 1}, "in_reply_to" => entry_id}
+
+      assert_error(
+        request(ctx, "a1", "PUT", path, body, 4, [{"if-match", "1"}]),
+        409,
+        "already_closed"
+      )
+
+      assert %{"message" => %{"revision" => 1, "message" => %{"title" => "Message 1"}}} =
+               contract(ctx, "SentMessageResponse", get(ctx, "a1", path))
+    end
+
+    test "lifecycle stamps the transition and already_closed applies to a repeat", ctx do
+      id = forward(ctx, "a1", 1, nil)
+      path = "/v2/agent/messages/" <> id <> "/lifecycle"
+
+      assert_error(
+        request(ctx, "a1", "POST", path, %{"action" => "retracted"}, 2),
+        400,
+        "invalid_field"
+      )
+
+      response = request(ctx, "a1", "POST", path, %{"action" => "cleared"}, 2)
+      assert response.status == 200
+
+      assert %{"message" => %{"terminal" => %{"state" => "cleared", "at_ms" => at_ms}}} =
+               contract(ctx, "AgentWriteResult", response)
+
+      assert abs(System.system_time(:millisecond) - at_ms) < 60_000
+
+      assert_error(
+        request(ctx, "a1", "POST", path, %{"action" => "expired"}, 3),
+        409,
+        "already_closed"
+      )
+    end
+
+    test "correlated retract marks the person's turn acted without recording handoff", ctx do
+      id = forward(ctx, "a1", 1, @first_session)
+      entry_id = person_reply(ctx, id, 2)
+      path = "/v2/agent/messages/" <> id <> "/retract"
+      body = %{"in_reply_to" => entry_id}
+      assert_error(request(ctx, "a2", "POST", path, body, 3), 404, "not_found")
+
+      response = request(ctx, "a1", "POST", path, body, 3)
+      assert response.status == 200
+
+      assert %{
+               "message" => %{"terminal" => %{"state" => "retracted"}},
+               "entry" => %{"entry_id" => ^entry_id, "delivery" => %{"acted" => true} = delivery}
+             } = contract(ctx, "AgentWriteResult", response)
+
+      refute Map.has_key?(delivery, "outcome")
+      assert_error(request(ctx, "a1", "POST", path, %{}, 4), 409, "already_retracted")
+    end
+
+    test "plain and repeated correlated replies are accepted on an answered conversation", ctx do
+      id = forward(ctx, "a1", 1, @first_session)
+      received = person_reply(ctx, id, 2)
+      item = "/v2/agent/messages/" <> id
+
+      answer =
+        request(ctx, "a2", "POST", "/v2/items/" <> id <> "/answer", %{"request_revision" => 1}, 3)
+
+      assert answer.status == 200
+
+      for {n, body} <- [
+            {4, %{"text" => "Plain"}},
+            {5, %{"text" => "Correlated", "in_reply_to" => received}},
+            {6, %{"text" => "Follow-up", "in_reply_to" => received}}
+          ] do
+        response = request(ctx, "a1", "POST", item <> "/replies", body, n)
+        assert response.status == 200
+
+        assert %{"entry" => %{"kind" => "reply", "author" => "origin"}} =
+                 contract(ctx, "AgentWriteResult", response)
+      end
+
+      sessionless = forward(ctx, "a1", 7, nil)
+
+      assert_error(
+        request(
+          ctx,
+          "a1",
+          "POST",
+          "/v2/agent/messages/" <> sessionless <> "/replies",
+          %{"text" => "No chat"},
+          8
+        ),
+        400,
+        "unsupported"
+      )
+    end
+  end
+
+  describe "agent results, receipts and session end" do
+    @describetag :agent_receipts
+
+    test "the message receipt and result require a session and an answer in that order", ctx do
+      for {n, session, status, token} <- [
+            {1, nil, 400, "unsupported"},
+            {2, @first_session, 409, "not_answered"}
+          ] do
+        id = forward(ctx, "a1", n, session)
+        path = "/v2/agent/messages/" <> id
+
+        assert_error(
+          request(ctx, "a1", "POST", path <> "/receipt", %{"outcome" => "handed"}, n + 2),
+          status,
+          token
+        )
+
+        assert_error(
+          request(ctx, "a1", "POST", path <> "/result", %{"status" => "received"}, n + 4),
+          status,
+          token
+        )
+      end
+    end
+
+    test "answer receipt ensures delivery and a result marks the answer acted", ctx do
+      id = forward(ctx, "a1", 1, @first_session)
+      item = "/v2/agent/messages/" <> id
+
+      answer =
+        request(
+          ctx,
+          "a2",
+          "POST",
+          "/v2/items/" <> id <> "/answer",
+          %{"request_revision" => 1, "comment" => "Person answer"},
+          2
+        )
+
+      assert answer.status == 200
+
+      receipt =
+        request(
+          ctx,
+          "a1",
+          "POST",
+          item <> "/receipt",
+          %{"outcome" => "handed", "agent" => "fixture"},
+          3
+        )
+
+      assert receipt.status == 200
+
+      assert %{
+               "status" => "recorded",
+               "stage_outcome" => "handed",
+               "message" => %{
+                 "terminal" => %{"delivery" => %{"delivered" => true, "agent" => "fixture"}}
+               }
+             } = contract(ctx, "AgentReceiptResult", receipt)
+
+      result = request(ctx, "a1", "POST", item <> "/result", %{"status" => "applied"}, 4)
+      assert result.status == 200
+
+      assert %{
+               "message" => %{
+                 "result" => %{"status" => "applied"},
+                 "terminal" => %{"delivery" => %{"acted" => true}}
+               },
+               "entry" => %{"kind" => "result"}
+             } = contract(ctx, "AgentWriteResult", result)
+
+      assert_error(
+        request(ctx, "a1", "POST", item <> "/result", %{"status" => "received"}, 5),
+        409,
+        "already_closed"
+      )
+    end
+
+    test "chat receipt applies only to the scoped person turn", ctx do
+      id = forward(ctx, "a1", 1, @first_session)
+      entry = person_reply(ctx, id, 2)
+      path = "/v2/agent/messages/" <> id <> "/entries/" <> entry <> "/receipt"
+      body = %{"outcome" => "not_handed", "reason" => "Fixture declined"}
+      assert_error(request(ctx, "a2", "POST", path, body, 3), 404, "not_found")
+
+      first = request(ctx, "a1", "POST", path, body, 3)
+      assert first.status == 200
+
+      assert %{"entry" => %{"delivery" => %{"delivered" => true, "outcome" => "not_handed"}}} =
+               contract(ctx, "AgentReceiptResult", first)
+
+      rescued = request(ctx, "a1", "POST", path, %{"outcome" => "handed", "rerouted" => true}, 4)
+
+      assert %{"status" => "recorded", "stage_outcome" => "handed"} =
+               contract(ctx, "AgentReceiptResult", rescued)
+
+      already = request(ctx, "a1", "POST", path, body, 5)
+
+      assert %{"status" => "superseded", "stage_outcome" => "handed"} =
+               contract(ctx, "AgentReceiptResult", already)
+    end
+
+    test "ending a session is scoped and leaves the conversation open", ctx do
+      id = forward(ctx, "a1", 1, @first_session)
+      path = "/v2/agent/sessions/" <> @first_session <> "/end"
+      assert_error(request(ctx, "a2", "POST", path, %{}, 2), 404, "not_found")
+      ended = request(ctx, "a1", "POST", path, %{}, 2)
+      assert ended.status == 200
+      item = "/v2/agent/messages/" <> id
+
+      assert %{"message" => %{"availability" => %{"state" => "gone"}}} =
+               contract(ctx, "SentMessageResponse", get(ctx, "a1", item))
+
+      assert request(ctx, "a1", "POST", item <> "/replies", %{"text" => "After end"}, 3).status ==
+               200
+    end
+  end
+
+  describe "agent files" do
+    @describetag :agent_files
+
+    test "upload handles are scoped, attach to file-only replies, and give distinct download IDs",
+         ctx do
+      id = forward(ctx, "a1", 1, @first_session)
+      characters = "file contents"
+      upload = upload(ctx, "a1", 2, characters)
+      assert upload.status == 201
+      handle = contract(ctx, "FileCreated", upload)["file_id"]
+      path = "/v2/files/" <> handle
+      assert_error(get(ctx, "a1", path), 404, "not_found")
+
+      :sys.replace_state(ctx.relay, fn state ->
+        update_in(state.store.engine.sender_grants, &Map.delete(&1, {"A", ctx.keys["a2"]}))
+      end)
+
+      assert_error(request(ctx, "a2", "DELETE", path, %{}, 3), 404, "not_found")
+
+      sent =
+        request(
+          ctx,
+          "a1",
+          "POST",
+          "/v2/agent/messages/" <> id <> "/replies",
+          %{"file_ids" => [handle]},
+          4
+        )
+
+      assert sent.status == 200
+
+      assert %{"entry" => %{"files" => [%{"file_id" => download}]}} =
+               contract(ctx, "AgentWriteResult", sent)
+
+      refute handle == download
+      file = get(ctx, "a1", "/v2/files/" <> download)
+      assert file.status == 200
+      assert file.body == characters
+      assert_error(request(ctx, "a1", "DELETE", path, %{}, 5), 409, "already_closed")
+    end
+
+    test "file-use preserves transfer failure, duplicate and conflict outcomes", ctx do
+      item_id = forward(ctx, "a1", 1, @first_session)
+      item = "/v2/agent/messages/" <> item_id
+      handle = contract(ctx, "FileCreated", upload(ctx, "a2", 2, "person attachment"))["file_id"]
+
+      reply =
+        request(
+          ctx,
+          "a2",
+          "POST",
+          "/v2/items/" <> item_id <> "/replies",
+          %{"text" => "File for the agent", "file_ids" => [handle]},
+          3
+        )
+
+      assert %{"entry" => %{"entry_id" => entry, "files" => [%{"file_id" => file}]}} =
+               contract(ctx, "WriteResult", reply)
+
+      turn = item <> "/entries/" <> entry
+      path = turn <> "/file-use"
+      failed = %{"file_id" => file, "transfer" => "not_transferred", "reason" => "Fixture"}
+      assert_error(request(ctx, "a1", "POST", path, failed, 4), 404, "not_found")
+
+      assert request(ctx, "a1", "POST", turn <> "/receipt", %{"outcome" => "handed"}, 5).status ==
+               200
+
+      response = request(ctx, "a1", "POST", path, failed, 4)
+      assert response.status == 200
+
+      assert %{"file_id" => ^file, "transfer" => "not_transferred"} =
+               decode_response(response)
+
+      assert %{"duplicate" => true} =
+               decode_response(request(ctx, "a1", "POST", path, failed, 6))
+
+      usable = request(ctx, "a1", "POST", path, %{"file_id" => file, "use" => "used"}, 7)
+      assert usable.status == 200
+
+      assert %{
+               "use" => "used",
+               "entry" => %{
+                 "delivery" => %{
+                   "file_uses" => [
+                     %{"file_id" => ^file, "transfer" => "not_transferred", "use" => "used"}
+                   ]
+                 }
+               }
+             } = decode_response(usable)
+
+      conflict = %{"file_id" => file, "transfer" => "transferred", "use" => "used"}
+      assert_error(request(ctx, "a1", "POST", path, conflict, 8), 409, "already_closed")
+    end
+
+    test "the uploader can delete an unattached upload, including idempotent retry", ctx do
+      assert %{"file_id" => handle} =
+               contract(ctx, "FileCreated", upload(ctx, "a1", 1, "discard"))
+
+      path = "/v2/files/" <> handle
+      first = request(ctx, "a1", "DELETE", path, %{}, 2)
+      assert first.status == 204
+      assert first.body == ""
+      replay = request(ctx, "a1", "DELETE", path, %{}, 2)
+      assert replay.status == 204
+
+      assert List.keyfind(replay.headers, "idempotent-replayed", 0) ==
+               {"idempotent-replayed", "true"}
+
+      assert_error(request(ctx, "a1", "DELETE", path, %{}, 3), 404, "not_found")
+    end
+  end
+
+  defp upload(ctx, name, n, data) do
+    headers = [
+      {"content-type", "text/plain"},
+      {"content-length", Integer.to_string(byte_size(data))},
+      {"content-disposition", "attachment; filename*=UTF-8''fixture.txt"},
+      {"idempotency-key", op(n)}
+    ]
+
+    conn = ClientAPIFeedClient.connect(ctx.port, ctx.certs, name)
+    assert {:ok, conn, ref} = Mint.HTTP.request(conn, "POST", "/v2/files", headers, data)
+    {conn, response} = ClientAPIFeedClient.collect(conn, ref)
+    Mint.HTTP.close(conn)
+    response
+  end
+
+  @tag :agent_advisory
+  test "acknowledges the retained advisory of the scoped sent message", ctx do
+    alias AttentionServer.{BounceDecision, BouncePolicy, Store}
+
+    :sys.replace_state(ctx.relay, fn state ->
+      at = state.clock.()
+      levels = [%{"name" => "Urgent", "lower_bound" => 0, "bounce_after_days" => 1}]
+      {:ok, normalized} = BouncePolicy.normalize_levels(levels)
+
+      {:ok, configured, _} =
+        BounceDecision.configure_levels(state.store.engine, "A", normalized, at)
+
+      {:ok, store} =
+        Store.commit(state.store, configured, %{
+          person: "A",
+          actor: "fixture",
+          action: "configure_fixture"
+        })
+
+      %{state | store: store}
+    end)
+
+    id =
+      frame(ctx, "a1", %{
+        "type" => "forward",
+        "op_id" => op(1),
+        "session_handle" => @first_session,
+        "route" => "claude-code",
+        "cli_version" => "fixture",
+        "unsupported_reason" => nil,
+        "advisory_v1" => true,
+        "message" => %{
+          "sender_id" => "app:test",
+          "message_id" => "advisory-item",
+          "title" => "Needs attention",
+          "message_type" => "fyi",
+          "answer_ui" => %{
+            "schema" => "attention-client.actions/1",
+            "actions" => [
+              %{
+                "id" => "seen",
+                "label" => "Seen",
+                "kind" => "value",
+                "value" => %{"acknowledgment" => "seen"}
+              }
+            ]
+          },
+          "created_at" => 1
+        }
+      })
+      |> then(&Resources.item_id(%{accepted_seq: &1["seq"]}))
+
+    key = {"A", "app:test", "advisory-item"}
+
+    state =
+      :sys.replace_state(ctx.relay, fn state ->
+        engine = state.store.engine
+        at = engine.messages[key].accepted_at
+
+        selected =
+          BounceDecision.record_scores(
+            engine,
+            "A",
+            [
+              %{"sender_id" => "app:test", "message_id" => "advisory-item", "score" => 0.9}
+            ],
+            at
+          )
+
+        next = BounceDecision.evaluate_due(selected, at + 86_400_001)
+
+        {:ok, store} =
+          Store.commit(state.store, next, %{
+            person: "A",
+            actor: "fixture",
+            action: "advisory_fixture"
+          })
+
+        %{state | store: store}
+      end)
+
+    feed = state.store.engine.advisory_feeds[{"A", ctx.keys["a1"], @first_session}]
+    assert %{"advisory_id" => advisory_id} = feed.entries[1]
+    path = "/v2/agent/messages/" <> id <> "/advisories/ack"
+    body = %{"advisory_id" => advisory_id}
+    assert_error(request(ctx, "a2", "POST", path, body, 2), 404, "not_found")
+    first = request(ctx, "a1", "POST", path, body, 2)
+    assert first.status == 200
+
+    assert %{"delivered" => true, "already_delivered" => false} =
+             contract(ctx, "AgentAdvisoryAckResult", first)
+
+    assert %{"already_delivered" => true} =
+             contract(ctx, "AgentAdvisoryAckResult", request(ctx, "a1", "POST", path, body, 3))
+  end
+
+  defp person_reply(ctx, id, n) do
+    path = "/v2/items/" <> id <> "/replies"
+    response = request(ctx, "a2", "POST", path, %{"text" => "Person turn"}, n)
+    assert response.status == 200
+    contract(ctx, "WriteResult", response)["entry"]["entry_id"]
+  end
+
+  defp assert_error(response, status, token) do
+    assert response.status == status
+    assert {:ok, %{"error" => ^token}} = JSON.decode_line(response.body <> "\n")
+  end
+
+  defp request(ctx, name, method, path, body, n, extra_headers \\ []) do
+    headers = [{"content-type", "application/json"}, {"idempotency-key", op(n)} | extra_headers]
+    conn = ClientAPIFeedClient.connect(ctx.port, ctx.certs, name)
+    assert {:ok, conn, ref} = Mint.HTTP.request(conn, method, path, headers, JSON.encode!(body))
+    {conn, response} = ClientAPIFeedClient.collect(conn, ref)
+    Mint.HTTP.close(conn)
+    response
+  end
+
   defp forward(ctx, name, n, session) do
     %{"seq" => seq} =
       frame(ctx, name, %{
@@ -320,6 +899,11 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
     {conn, response} = ClientAPIFeedClient.collect(conn, ref)
     Mint.HTTP.close(conn)
     response
+  end
+
+  defp decode_response(response) do
+    assert {:ok, body} = JSON.decode_line(response.body <> "\n")
+    body
   end
 
   defp contract(ctx, schema, response) do
