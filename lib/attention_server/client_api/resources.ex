@@ -30,7 +30,6 @@ defmodule AttentionServer.ClientAPI.Resources do
   @sources "_sources"
   @digits "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
   @base byte_size(@digits)
-  @seq_ceiling 99_999_999_999_999_999_999
 
   @type key :: {person :: String.t(), sender :: String.t(), message_id :: String.t()}
   @type principal :: %{
@@ -173,19 +172,19 @@ defmodule AttentionServer.ClientAPI.Resources do
   def item(%Engine{} = engine, {person, sender, _id} = key, %{"key" => _} = rank) do
     record = Map.fetch!(engine.messages, key)
     summary = Map.get(engine.route_b_index.conversation_summary_by_item, key, %{})
-    item_id = item_id(record)
-    files = record |> Map.get(:files_by_revision, %{}) |> Map.get(record.revision, [])
+    {reply, rank} = Map.pop(rank, "_reply")
 
     %{
-      "item_id" => item_id,
+      "item_id" => item_id(record),
       "sender" => sender,
       "request_revision" => record.revision,
       "message" => record.message,
-      "files" => file_refs(files, "fi#{record.accepted_seq}.#{record.revision}."),
+      "files" => item_files(record),
       "seen" => seen?(engine, key, record),
-      "chat" => chat(engine, key, record, summary),
+      "chat" => chat(engine, key, record, summary, reply),
       "terminal" => terminal(record),
       "rank" => rank,
+      "created_at_ms" => Map.get(record, :accepted_at),
       @viewer => %{"origin" => record.origin}
     }
     |> put_present("availability", item_availability(engine, person, record, summary))
@@ -234,14 +233,89 @@ defmodule AttentionServer.ClientAPI.Resources do
     MapSet.member?(engine.opened_revisions, {person, sender, id, substantive})
   end
 
-  defp chat(engine, key, record, summary) do
-    %{
+  defp chat(engine, {person, _, _} = key, record, summary, reply) do
+    read_through = Map.get(engine.chat_read_positions, key, 0)
+
+    # Agent replies after the read position, as today's reply rows count them.
+    unread =
+      engine.route_b_index.conversations_by_item
+      |> Map.get(key, :gb_trees.empty())
+      |> :gb_trees.values()
+      |> Enum.count(fn seq ->
+        seq > read_through and
+          match?(
+            %{payload: %{"kind" => "reply", "author" => "origin"}},
+            Map.get(engine.conversation_events, {person, seq})
+          )
+      end)
+
+    chat = %{
       "available" => is_binary(Map.get(record, :session_handle)),
       "started" => Map.get(summary, :chat_started, false),
-      "read_position" => optional_entry_id(Map.get(engine.chat_read_positions, key, 0)),
-      "last_origin_reply" => optional_entry_id(Map.get(summary, :latest_origin_reply_seq))
+      "read_position" => optional_entry_id(read_through),
+      "last_origin_reply" => optional_entry_id(Map.get(summary, :latest_origin_reply_seq)),
+      "unread_replies" => unread
     }
+
+    # Today's chat-reply row, while it has unread replies (contract rounds 5
+    # and 6): its key in Rank.key's space, and its group in free order.
+    case reply do
+      %{"key" => reply_key, "group" => group} when unread > 0 ->
+        Map.merge(chat, %{"reply_rank_key" => reply_key, "reply_group" => group})
+
+      _ ->
+        chat
+    end
   end
+
+  # The current revision's files, plus files of earlier revisions that the
+  # current answer screen names (a revision keeps showing revision 1's images).
+  defp item_files(record) do
+    by_revision = Map.get(record, :files_by_revision, %{})
+    current = Map.get(by_revision, record.revision, [])
+    own = file_refs(current, "fi#{record.accepted_seq}.#{record.revision}.")
+    present = MapSet.new(current, & &1["name"])
+
+    referenced =
+      record.message
+      |> Map.get("answer_ui")
+      |> screen_file_names()
+      |> Enum.reject(&MapSet.member?(present, &1))
+
+    earlier =
+      Enum.flat_map(Enum.uniq(referenced), fn name ->
+        (record.revision - 1)..1//-1
+        |> Enum.find_value([], fn n ->
+          files = Map.get(by_revision, n, [])
+
+          case Enum.find_index(files, &(&1["name"] == name)) do
+            nil ->
+              nil
+
+            index ->
+              [file_ref(Enum.at(files, index), "fi#{record.accepted_seq}.#{n}.", index)]
+          end
+        end)
+      end)
+
+    own ++ earlier
+  end
+
+  # The names a UI/1 screen's image primitives use ("file": name).
+  defp screen_file_names(%{} = value) when not is_struct(value) do
+    own =
+      case value do
+        %{"file" => name} when is_binary(name) -> [name]
+        _ -> []
+      end
+
+    own ++ Enum.flat_map(Map.values(value), &screen_file_names/1)
+  end
+
+  defp screen_file_names(values) when is_list(values),
+    do: Enum.flat_map(values, &screen_file_names/1)
+
+  defp screen_file_names(_), do: []
 
   defp optional_entry_id(seq) when is_integer(seq) and seq > 0, do: entry_id(seq)
   defp optional_entry_id(_), do: nil
@@ -321,80 +395,137 @@ defmodule AttentionServer.ClientAPI.Resources do
   defp file_refs(files, prefix) when is_list(files) do
     files
     |> Enum.with_index()
-    |> Enum.map(fn {file, index} ->
-      file_id =
-        case file do
-          %{"tier" => "upload", "upload_id" => id} -> "fu" <> id
-          _ -> prefix <> Integer.to_string(index)
-        end
-
-      %{
-        "file_id" => file_id,
-        "name" => file["name"],
-        "size" => file["size"],
-        "sha256" => file["sha256"]
-      }
-    end)
+    |> Enum.map(fn {file, index} -> file_ref(file, prefix, index) end)
   end
 
   defp file_refs(_files, _prefix), do: []
 
+  defp file_ref(file, prefix, index) do
+    file_id =
+      case file do
+        %{"tier" => "upload", "upload_id" => id} -> "fu" <> id
+        _ -> prefix <> Integer.to_string(index)
+      end
+
+    %{
+      "file_id" => file_id,
+      "name" => file["name"],
+      "size" => file["size"],
+      "sha256" => file["sha256"]
+    }
+  end
+
   ## Rank
 
   @doc """
-  Every item's Rank, keyed by `item_id`. The order is today's inbox order:
-  items in the priority view's order, then other unresolved items, then
-  resolved items, newest first.
+  Every item's Rank, keyed by `item_id`, in today's inbox order: the priority
+  view's `list_items` (`Placement.list_items/4`), which holds the current and
+  resolved sections, free-order groups and chat-reply rows. Items the view
+  does not list (none yet, or a progress message) follow: open ones, then
+  resolved ones, newest first.
 
-  `previous` maps `item_id` to the rank key last given to clients. Items in the
-  view keep their previous key wherever the order allows, so moving one item
-  rewrites only that item's key (`rank_keys/2`). Keys outside the view depend
-  only on the item.
+  A Rank has `key` and `section`, plus `group` for current items in free
+  order, and `score`/`due_at_ms` from the view. An item with a chat-reply row
+  carries that row's key and group under the internal `"_reply"` member, which
+  `item/3` turns into `Chat.reply_rank_key` and `Chat.reply_group`.
+
+  `previous` maps rank unit ids (`item_id`, or `"r"` and the `item_id` for a
+  reply row) to the keys last given to clients. Units keep their previous key
+  wherever the order allows, so moving one rewrites only its key
+  (`rank_keys/2`).
   """
   def ranks(%Engine{} = engine, person, view, previous \\ %{}) when is_map(previous) do
     entries = view_entries(view)
+    listed = listed_units(engine, person, view)
+    listed_items = for {:item, id, _key, _section, _group} <- listed, into: MapSet.new(), do: id
 
-    {ranked, unranked} =
+    unlisted =
       engine
       |> item_keys(person)
       |> Enum.map(&{&1, Map.fetch!(engine.messages, &1)})
-      |> Enum.split_with(fn {{_, sender, id}, record} ->
-        is_nil(record.terminal) and Map.has_key?(entries, {sender, id})
+      |> Enum.reject(fn {_key, record} -> MapSet.member?(listed_items, item_id(record)) end)
+      |> Enum.sort_by(fn {_key, record} ->
+        {not is_nil(record.terminal), -record.accepted_seq}
+      end)
+      |> Enum.map(fn {key, record} ->
+        section = if is_nil(record.terminal), do: "current", else: "resolved"
+        {:item, item_id(record), key, section, nil}
       end)
 
-    position = view_positions(view)
+    units = listed ++ unlisted
+    keys = rank_keys(previous, Enum.map(units, &unit_id/1))
 
-    ordered_ids =
-      ranked
-      |> Enum.sort_by(fn {{_, sender, id}, _} -> Map.fetch!(position, {sender, id}) end)
-      |> Enum.map(fn {_, record} -> item_id(record) end)
-
-    ranked_keys = rank_keys(previous, ordered_ids)
-
-    ranked_ranks =
-      Map.new(ranked, fn {{_, sender, id}, record} ->
-        item_id = item_id(record)
-
+    Enum.reduce(units, %{}, fn
+      {:item, id, {_, sender, message_id}, section, group}, acc ->
         rank =
-          %{"key" => Map.fetch!(ranked_keys, item_id)}
-          |> put_view_fields(Map.fetch!(entries, {sender, id}))
+          %{"key" => Map.fetch!(keys, id), "section" => section}
+          |> put_present("group", group)
+          |> put_view_fields(Map.get(entries, {sender, message_id}, %{}))
 
-        {item_id, rank}
-      end)
+        Map.update(acc, id, rank, &Map.merge(rank, Map.take(&1, ["_reply"])))
 
-    Enum.reduce(unranked, ranked_ranks, fn {_key, record}, acc ->
-      band = if is_nil(record.terminal), do: "2", else: "3"
-      Map.put(acc, item_id(record), %{"key" => band <> descending(record.accepted_seq)})
+      {:reply, id, _key, _section, group} = unit, acc ->
+        reply = %{"_reply" => %{"key" => Map.fetch!(keys, unit_id(unit)), "group" => group}}
+        Map.update(acc, id, reply, &Map.merge(&1, reply))
     end)
   end
 
+  defp unit_id({:item, id, _, _, _}), do: id
+  defp unit_id({:reply, id, _, _, _}), do: "r" <> id
+
+  # Today's list rows, in order, as rank units. Reply rows count only while
+  # they have unread agent replies; read ones are history that clients draw
+  # from the item itself.
+  defp listed_units(engine, person, %{list_items: rows}) when is_list(rows) do
+    {units, _seen} =
+      Enum.reduce(rows, {[], MapSet.new()}, fn row, {units, seen} ->
+        with %{"sender_id" => sender, "message_id" => message_id} <- row,
+             key = {person, sender, message_id},
+             %{accepted_seq: _} = record <- Map.get(engine.messages, key),
+             {:ok, unit} <- list_unit(row, item_id(record), key, record),
+             false <- MapSet.member?(seen, unit_id(unit)) do
+          {[unit | units], MapSet.put(seen, unit_id(unit))}
+        else
+          _ -> {units, seen}
+        end
+      end)
+
+    Enum.reverse(units)
+  end
+
+  defp listed_units(_engine, _person, _view), do: []
+
+  defp list_unit(%{"kind" => "message"} = row, id, key, record) do
+    {section, group} =
+      case row do
+        %{"free_section" => %{"state" => "active", "group" => group}} -> {"current", group}
+        %{"free_section" => %{"state" => "history"}} -> {"resolved", nil}
+        _ -> {if(is_nil(record.terminal), do: "current", else: "resolved"), nil}
+      end
+
+    group = if group in ~w(common earlier_messages), do: group, else: nil
+    {:ok, {:item, id, key, section, group}}
+  end
+
+  defp list_unit(%{"kind" => "reply", "unseen_count" => unseen} = row, id, key, _record)
+       when is_integer(unseen) and unseen > 0 do
+    group =
+      case row do
+        %{"free_section" => %{"group" => group}}
+        when group in ~w(earlier_chat_replies earlier_chat_replies_unknown) ->
+          group
+
+        _ ->
+          nil
+      end
+
+    {:ok, {:reply, id, key, "current", group}}
+  end
+
+  defp list_unit(_row, _id, _key, _record), do: :skip
+
   defp view_entries(%{message_entries_by_identity: entries}) when is_map(entries), do: entries
   defp view_entries(_), do: %{}
-
-  defp view_positions(%{message_order: order}) when is_list(order),
-    do: order |> Enum.with_index() |> Map.new()
-
-  defp view_positions(_), do: %{}
 
   defp put_view_fields(rank, entry) do
     rank
@@ -402,11 +533,8 @@ defmodule AttentionServer.ClientAPI.Resources do
     |> put_present("due_at_ms", time_ms(entry["due_at"]))
   end
 
-  defp descending(seq) when is_integer(seq) and seq > 0 and seq <= @seq_ceiling,
-    do: String.pad_leading(Integer.to_string(@seq_ceiling - seq), 20, "0")
-
   @doc """
-  Assigns rank keys to `ordered_ids` (best first) in the ranked band. Keys sort
+  Assigns rank keys to `ordered_ids` (first first). Keys sort
   ascending, bytewise. The longest run of ids whose `previous` keys are already
   in order keeps them. Every other id gets a new key between its kept
   neighbours, so a single move rewrites a single key.

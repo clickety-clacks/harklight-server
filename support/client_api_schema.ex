@@ -16,9 +16,9 @@ defmodule AttentionServer.ClientAPISchema do
   defp compact(block), do: block |> String.split("\n") |> Enum.map_join(" ", &String.trim/1)
 
   @doc """
-  The contract's defs with the delivery owner's round-4 rulings (contract
-  rulings on the reads component's data gaps) applied. Remove this once those
-  rulings are folded into docs/client-api-v2.md; every step is a no-op then.
+  The contract's defs with the delivery owner's rulings of rounds 4 to 6
+  applied. Remove this once those rulings are folded into
+  docs/client-api-v2.md; every step is a no-op then.
   """
   def contract_defs(path) do
     defs(path)
@@ -39,6 +39,29 @@ defmodule AttentionServer.ClientAPISchema do
     end)
     |> update_in(["Settings", "properties", "push", "properties", "state", "enum"], fn states ->
       if "expired" in states, do: states, else: states ++ ["expired"]
+    end)
+    # Rounds 5 and 6: sections, free-order groups, reply rows, first-seen time.
+    |> update_in(["Item", "required"], &Enum.uniq(&1 ++ ["created_at_ms"]))
+    |> update_in(
+      ["Item", "properties"],
+      &Map.put_new(&1, "created_at_ms", %{"$ref" => "#/$defs/TimeMs"})
+    )
+    |> update_in(["Rank", "required"], &Enum.uniq(&1 ++ ["section"]))
+    |> update_in(["Rank", "properties"], fn properties ->
+      properties
+      |> Map.put_new("section", %{"enum" => ["current", "resolved"]})
+      |> Map.put_new("group", %{"enum" => ["common", "earlier_messages"]})
+    end)
+    |> update_in(["Chat", "properties"], fn properties ->
+      properties
+      |> Map.put_new("unread_replies", %{"type" => "integer", "minimum" => 0})
+      |> Map.put_new("reply_rank_key", %{"type" => "string"})
+      |> Map.put_new("reply_group", %{
+        "oneOf" => [
+          %{"type" => "null"},
+          %{"enum" => ["earlier_chat_replies", "earlier_chat_replies_unknown"]}
+        ]
+      })
     end)
     |> Map.put_new("RevisionResponse", %{
       "type" => "object",

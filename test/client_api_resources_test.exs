@@ -322,11 +322,28 @@ defmodule AttentionServer.ClientAPIResourcesTest do
         end
       end
 
-      # Rank keys sort into today's inbox order.
+      # Rank keys sort into today's list order (Placement.list_items), and
+      # sections follow its free-order state.
       by_key = items |> Map.values() |> Enum.sort_by(& &1["rank"]["key"])
 
-      assert Enum.map(by_key, & &1["item_id"]) ==
-               Enum.map(rows, &Map.fetch!(items, key(&1["message_id"]))["item_id"])
+      listed =
+        view.list_items
+        |> Enum.filter(&(&1["kind"] == "message"))
+        |> Enum.map(&Map.fetch!(items, key(&1["message_id"])))
+
+      assert Enum.map(by_key, & &1["item_id"]) == Enum.map(listed, & &1["item_id"])
+
+      for row <- view.list_items, row["kind"] == "message" do
+        rank = Map.fetch!(items, key(row["message_id"]))["rank"]
+
+        case row["free_section"] do
+          %{"state" => "active", "group" => group} ->
+            assert rank["section"] == "current" and rank["group"] == group
+
+          %{"state" => "history"} ->
+            assert rank["section"] == "resolved" and not Map.has_key?(rank, "group")
+        end
+      end
 
       GenServer.stop(relay)
     end
@@ -550,29 +567,142 @@ defmodule AttentionServer.ClientAPIResourcesTest do
       end
     end
 
-    test "unranked open items sort after ranked ones and resolved ones last, newest first",
+    test "without a view, open items come first and resolved ones last, newest first",
          %{path: path} do
       relay = scripted_relay(path)
       {engine, _view} = snapshot(relay)
       ranks = Resources.ranks(engine, "A", nil)
 
-      by_state =
+      ordered =
         engine
         |> Resources.item_keys("A")
         |> Enum.map(fn key ->
           {:ok, id} = Resources.item_id(engine, key)
+          record = engine.messages[key]
+          {ranks[id]["key"], is_nil(record.terminal), record.accepted_seq, ranks[id]["section"]}
+        end)
+        |> Enum.sort()
 
-          {is_nil(engine.messages[key].terminal), engine.messages[key].accepted_seq,
-           ranks[id]["key"]}
+      assert Enum.map(ordered, &elem(&1, 1)) == [true, true, true, false, false, false]
+
+      for {_, open, _, section} <- ordered,
+          do: assert(section == if(open, do: "current", else: "resolved"))
+
+      resolved = for {_, false, seq, _} <- ordered, do: seq
+      assert resolved == Enum.sort(resolved, :desc)
+      GenServer.stop(relay)
+    end
+
+    test "an unread agent reply gets today's reply row: its key and group on Chat",
+         %{path: path} do
+      relay = scripted_relay(path)
+      {engine, _} = snapshot(relay)
+
+      [question] =
+        engine |> Resources.entries(key("chat")) |> Enum.filter(&(&1["author"] == "person"))
+
+      [%{"event_id" => event_id}] =
+        engine.origin_feeds[{"A", "origin"}].entries
+        |> Map.values()
+        |> Enum.filter(&(&1["kind"] == "discussion"))
+
+      refute question == nil
+
+      assert %{"type" => "ok"} =
+               request(relay, "origin", %{
+                 "type" => "conversation_reply",
+                 "op_id" => op(40),
+                 "sender_id" => "app:test",
+                 "message_id" => "chat",
+                 "request_revision" => 1,
+                 "in_reply_to" => String.to_integer(event_id),
+                 "text" => "One more thing"
+               })
+
+      {engine, view} = snapshot(relay)
+      items = rendered_items(engine, view, "reader")
+      chat = items[key("chat")]["chat"]
+      assert chat["unread_replies"] == 1
+      assert is_binary(chat["reply_rank_key"])
+      assert chat["reply_group"] in [nil, "earlier_chat_replies", "earlier_chat_replies_unknown"]
+      assert Map.has_key?(chat, "reply_group")
+
+      for {k, item} <- items, k != key("chat") do
+        assert item["chat"]["unread_replies"] == 0
+        refute Map.has_key?(item["chat"], "reply_rank_key")
+      end
+
+      # The reply row sorts among item rows where today's list puts it.
+      listed =
+        Enum.flat_map(view.list_items, fn
+          %{"kind" => "message", "message_id" => id} ->
+            [{:item, id}]
+
+          %{"kind" => "reply", "message_id" => id, "unseen_count" => n} when n > 0 ->
+            [{:reply, id}]
+
+          _ ->
+            []
         end)
 
-      for {open, _, key} <- by_state,
-          do: assert(String.first(key) == if(open, do: "2", else: "3"))
+      by_key =
+        items
+        |> Enum.flat_map(fn {{_, _, id}, item} ->
+          [{item["rank"]["key"], {:item, id}}] ++
+            if(item["chat"]["reply_rank_key"],
+              do: [{item["chat"]["reply_rank_key"], {:reply, id}}],
+              else: []
+            )
+        end)
+        |> Enum.sort()
+        |> Enum.map(&elem(&1, 1))
 
-      resolved = for {false, seq, key} <- by_state, do: {seq, key}
+      assert by_key == listed
+      GenServer.stop(relay)
+    end
 
-      assert resolved |> Enum.sort_by(&elem(&1, 1)) |> Enum.map(&elem(&1, 0)) ==
-               resolved |> Enum.map(&elem(&1, 0)) |> Enum.sort(:desc)
+    test "items carry when they arrived, and earlier revisions' files their screen names",
+         %{path: path} do
+      relay = scripted_relay(path)
+      {engine, view} = snapshot(relay)
+      items = rendered_items(engine, view, "reader")
+
+      assert Enum.all?(
+               Map.values(items),
+               &(is_integer(&1["created_at_ms"]) and &1["created_at_ms"] > 0)
+             )
+
+      file = %{
+        "name" => "plan.png",
+        "tier" => "inline",
+        "size" => 3,
+        "sha256" => String.duplicate("a", 64),
+        "data_base64" => "AAAA"
+      }
+
+      other = %{file | "name" => "unused.png"}
+
+      engine =
+        update_in(engine.messages[key("revised")], fn record ->
+          %{
+            record
+            | message:
+                Map.put(record.message, "answer_ui", %{
+                  "schema" => "attention-client.ui/1",
+                  "body" => [%{"kind" => "image", "file" => "plan.png"}]
+                }),
+              files_by_revision: %{1 => [other, file], 2 => []}
+          }
+        end)
+
+      {:ok, id} = Resources.item_id(engine, key("revised"))
+      rank = Map.fetch!(Resources.ranks(engine, "A", view), id)
+
+      assert [%{"name" => "plan.png", "file_id" => file_id}] =
+               Resources.item(engine, key("revised"), rank)["files"]
+
+      assert {:ok, {:inline, %{"name" => "plan.png"}}} =
+               Resources.file_source(engine, "A", file_id)
 
       GenServer.stop(relay)
     end
