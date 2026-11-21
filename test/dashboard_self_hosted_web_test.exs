@@ -1,11 +1,9 @@
 defmodule AttentionServer.DashboardSelfHostedWebTest do
   use ExUnit.Case, async: true
 
-  alias AttentionServer.{DashboardBrowserWebSocket, DashboardReadHTTP, JSON}
+  alias AttentionServer.{DashboardReadHTTP, JSON}
 
   @origin "https://server.example.test:9443"
-  @recipient "00000000-0000-4000-8000-000000000001"
-  @upload_id "00000000-0000-4000-8000-000000000002"
   @web_commit "3434a38c86cd3069952cd67d9b0bf0650b86d224"
   @web_archive "harklight-web-3434a38c86cd3069952cd67d9b0bf0650b86d224.tar.gz"
   @web_archive_sha256 "563f1448b79b398abf5ace4fcb5411fed70d5b2eba01f2cdec2aeacfdeffbc5b"
@@ -27,57 +25,6 @@ defmodule AttentionServer.DashboardSelfHostedWebTest do
 
     def list_devices(_state, _principal),
       do: {:ok, %{person_name: "Local owner", devices: [], waiting: []}}
-
-    def browser_file_command(state, {cookie, recipient, request}) do
-      Agent.update(state, &Map.put(&1, :file_command, {cookie, recipient, request}))
-
-      if request["type"] == "discard_uploads" do
-        {:error, :session_ended}
-      else
-        {:ok,
-         %{
-           "v" => 1,
-           "type" => "ok",
-           "inline_decoded_bytes_per_entry" => 262_144,
-           "upload_cap_bytes_per_file" => 1_000_000
-         }}
-      end
-    end
-
-    def browser_file_limits(_state, {_cookie, _recipient}),
-      do: {:ok, %{"upload_cap_bytes_per_file" => 1_000_000}}
-
-    def browser_upload_begin(_state, {_cookie, _recipient, _attrs, _size, _worker}),
-      do: {:ok, :lease}
-
-    def browser_upload_file(state, {_cookie, _recipient, attrs, path, size, sha256, :lease}) do
-      bytes = File.read!(path)
-      Agent.update(state, &Map.put(&1, :uploaded, {attrs, bytes, size, sha256}))
-
-      {:ok,
-       %{
-         "upload_id" => "00000000-0000-4000-8000-000000000002",
-         "name" => attrs["name"],
-         "size" => size,
-         "sha256" => sha256,
-         "duplicate" => false
-       }}
-    end
-
-    def browser_upload_end(state, {_cookie, _recipient, :lease}) do
-      Agent.update(state, &Map.update!(&1, :upload_ended, fn count -> count + 1 end))
-    end
-
-    def browser_fetch_file(state, {_cookie, upload_id}) do
-      if upload_id == "00000000-0000-4000-8000-000000000002" do
-        Agent.get(state, fn %{uploaded: {_attrs, bytes, size, sha256}, fetch_path: path} ->
-          File.write!(path, bytes)
-          {:ok, %{size: size, sha256: sha256, name: "large.txt"}, path}
-        end)
-      else
-        {:error, :not_found}
-      end
-    end
   end
 
   setup do
@@ -160,13 +107,27 @@ defmodule AttentionServer.DashboardSelfHostedWebTest do
       assert response.resp_body == index
 
       assert Plug.Conn.get_resp_header(response, "content-security-policy") == [
-               "default-src 'none'; script-src 'self'; connect-src 'self' wss://server.example.test:9443; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' blob: data:; base-uri 'none'; frame-ancestors 'none'"
+               "default-src 'none'; script-src 'self'; connect-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' blob: data:; base-uri 'none'; frame-ancestors 'none'"
              ]
     end
 
     devices = get("/devices", "active", opts)
     assert devices.status == 200
     assert Plug.Conn.get_resp_header(devices, "content-security-policy") == [@dashboard_csp]
+  end
+
+  test "the web client CSP allows only same-origin connections with no configured origin",
+       %{state: state} do
+    opts = DashboardReadHTTP.init(backend: {Backend, state}, skill_path: __ENV__.file)
+
+    for path <- ["/app/", "/inbox", "/settings", "/app/config.json"] do
+      response = get(path, "active", opts)
+      assert response.status == 200
+
+      assert Plug.Conn.get_resp_header(response, "content-security-policy") == [
+               "default-src 'none'; script-src 'self'; connect-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' blob: data:; base-uri 'none'; frame-ancestors 'none'"
+             ]
+    end
   end
 
   test "self-hosted app configuration enables only shipped client features", %{opts: opts} do
@@ -181,7 +142,7 @@ defmodule AttentionServer.DashboardSelfHostedWebTest do
     assert Plug.Conn.get_resp_header(response, "cache-control") == ["no-store"]
 
     assert Plug.Conn.get_resp_header(response, "content-security-policy") == [
-             "default-src 'none'; script-src 'self'; connect-src 'self' wss://server.example.test:9443; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' blob: data:; base-uri 'none'; frame-ancestors 'none'"
+             "default-src 'none'; script-src 'self'; connect-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' blob: data:; base-uri 'none'; frame-ancestors 'none'"
            ]
 
     assert {:ok,
@@ -236,117 +197,10 @@ defmodule AttentionServer.DashboardSelfHostedWebTest do
     assert Agent.get(state, & &1.ended) == ["active"]
   end
 
-  test "self-hosted profile, relay upgrade, commands, uploads and file reads use the browser handlers",
-       %{
-         opts: opts,
-         state: state
-       } do
+  test "self-hosted profile names the signed-in person", %{opts: opts} do
     profile = get("/api/profile", "active", opts)
     assert profile.status == 200
     assert {:ok, %{"display_name" => "Local owner"}} = JSON.decode_line(profile.resp_body <> "\n")
-
-    command =
-      Plug.Test.conn(
-        :post,
-        "/browser/v1?recipient=" <> @recipient,
-        JSON.encode!(%{"v" => 1, "type" => "file_limits"})
-      )
-      |> Plug.Conn.put_req_header("origin", @origin)
-      |> Plug.Conn.put_req_header("cookie", "__Host-harklight=active")
-      |> Plug.Conn.put_req_header("content-type", "application/json")
-      |> Map.put(:scheme, :https)
-      |> Map.put(:port, 9443)
-      |> DashboardReadHTTP.call(opts)
-
-    assert command.status == 200
-
-    assert {:ok, %{"type" => "ok", "upload_cap_bytes_per_file" => 1_000_000}} =
-             JSON.decode_line(command.resp_body <> "\n")
-
-    assert Agent.get(state, & &1.file_command) == {
-             "active",
-             @recipient,
-             %{"v" => 1, "type" => "file_limits"}
-           }
-
-    ended_command =
-      Plug.Test.conn(
-        :post,
-        "/browser/v1?recipient=" <> @recipient,
-        JSON.encode!(%{"v" => 1, "type" => "discard_uploads"})
-      )
-      |> Plug.Conn.put_req_header("origin", @origin)
-      |> Plug.Conn.put_req_header("cookie", "__Host-harklight=active")
-      |> Plug.Conn.put_req_header("content-type", "application/json")
-      |> Map.put(:scheme, :https)
-      |> Map.put(:port, 9443)
-      |> DashboardReadHTTP.call(opts)
-
-    assert ended_command.status == 303
-    assert Plug.Conn.get_resp_header(ended_command, "location") == ["/sign-in"]
-
-    payload = String.duplicate("a", 262_145)
-
-    upload =
-      Plug.Test.conn(:post, "/browser/v1/upload?recipient=" <> @recipient, payload)
-      |> Plug.Conn.put_req_header("origin", @origin)
-      |> Plug.Conn.put_req_header("cookie", "__Host-harklight=active")
-      |> Plug.Conn.put_req_header("content-type", "application/octet-stream")
-      |> Plug.Conn.put_req_header("content-length", Integer.to_string(byte_size(payload)))
-      |> Plug.Conn.put_req_header(
-        "x-harklight-file-name",
-        Base.url_encode64("large.txt", padding: false)
-      )
-      |> Plug.Conn.put_req_header("x-harklight-op-id", "00000000-0000-4000-8000-000000000003")
-      |> Plug.Conn.put_req_header("x-harklight-sender-id", "browser:fixture")
-      |> Plug.Conn.put_req_header("x-harklight-message-id", "message-fixture")
-      |> Plug.Conn.put_req_header("x-harklight-request-revision", "2")
-      |> Map.put(:scheme, :https)
-      |> Map.put(:port, 9443)
-      |> DashboardReadHTTP.call(opts)
-
-    assert upload.status == 200
-
-    assert {:ok,
-            %{
-              "v" => 1,
-              "type" => "ok",
-              "upload_id" => @upload_id,
-              "name" => "large.txt",
-              "size" => 262_145,
-              "sha256" => hash,
-              "duplicate" => false
-            }} = JSON.decode_line(upload.resp_body <> "\n")
-
-    assert hash == sha256(payload)
-    assert Agent.get(state, & &1.upload_ended) == 1
-
-    fetched = get("/browser/v1/files/" <> @upload_id, "active", opts)
-    assert fetched.status == 200
-    assert fetched.resp_body == payload
-
-    for subprotocol <- [nil, "attention-relay/1"] do
-      conn = Plug.Test.conn(:get, "/browser/relay?recipient=" <> @recipient)
-
-      conn =
-        conn
-        |> Plug.Conn.put_req_header("origin", @origin)
-        |> Plug.Conn.put_req_header("cookie", "__Host-harklight=active")
-        |> Map.put(:scheme, :https)
-        |> Map.put(:port, 9443)
-
-      conn =
-        if subprotocol,
-          do: Plug.Conn.put_req_header(conn, "sec-websocket-protocol", subprotocol),
-          else: conn
-
-      upgraded = DashboardReadHTTP.call(conn, opts)
-      assert upgraded.status == 101
-      assert upgraded.state == :upgraded
-
-      assert_receive {_ref, :upgrade,
-                      {:websocket, {DashboardBrowserWebSocket, _handler_opts, _connection_opts}}}
-    end
   end
 
   defp get(path, cookie, opts) do

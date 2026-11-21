@@ -123,6 +123,39 @@ defmodule AttentionServer.DashboardReadHTTPTest do
              "from an older Harklight Server. Ask the account owner for a new invitation."
   end
 
+  test "the retired browser transport paths are ordinary unknown dashboard paths",
+       %{opts: opts} do
+    requests = [
+      {:get, "/browser/relay", nil},
+      {:post, "/browser/v1", ~s({"v":1,"type":"resync"})},
+      {:post, "/browser/v1/upload", "bytes"},
+      {:get, "/browser/v1/files/00000000-0000-4000-8000-000000000002", nil}
+    ]
+
+    for {method, path, body} <- requests, session <- [nil, "member-session"] do
+      conn =
+        %{Plug.Test.conn(method, path, body) | scheme: :https, port: 443}
+        |> Plug.Conn.put_req_header("origin", "https://www.example.com")
+        |> Plug.Conn.put_req_header("upgrade", "websocket")
+        |> Plug.Conn.put_req_header("connection", "Upgrade")
+        |> Plug.Conn.put_req_header("sec-websocket-version", "13")
+        |> Plug.Conn.put_req_header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+
+      conn =
+        if session,
+          do: Plug.Conn.put_req_header(conn, "cookie", "__Host-harklight=#{session}"),
+          else: conn
+
+      response = DashboardReadHTTP.call(conn, opts)
+
+      if session do
+        assert {response.status, response.resp_body} == {404, "Not found"}
+      else
+        assert {response.status, response.resp_body} == {401, "Sign in to view your devices"}
+      end
+    end
+  end
+
   test "device records are unavailable before sign-in", %{opts: opts} do
     for path <- ["/devices", "/components", "/agent-skills", "/levels"] do
       response = path |> secure_get() |> DashboardReadHTTP.call(opts)
