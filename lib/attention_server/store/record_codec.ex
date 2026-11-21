@@ -1,8 +1,10 @@
 defmodule AttentionServer.Store.RecordCodec do
   @moduledoc false
 
-  alias AttentionServer.Engine
+  alias AttentionServer.{Engine, Store.StoredTerms}
 
+  @record_version :relay_record_v1
+  @term_options [:deterministic, {:minor_version, 2}]
   @derived [:advisory_id_index, :open_default_index, :route_b_index]
 
   @fields Map.new(Map.drop(Map.from_struct(%Engine{}), [:advisory_feeds | @derived]), fn
@@ -43,12 +45,18 @@ defmodule AttentionServer.Store.RecordCodec do
   end
 
   def encode_row(address, value) do
-    key = :erlang.term_to_binary(address, [:deterministic])
-    payload = :erlang.term_to_binary(value, [:compressed])
+    key = :erlang.term_to_binary({@record_version, address}, @term_options)
+    payload = :erlang.term_to_binary(value, [:compressed | @term_options])
     {key, payload, checksum(key, payload)}
   end
 
+  # Persist this identity with the keyed store. Reopen on a different OTP
+  # major requires rekeying before point writes are allowed.
+  def identity, do: {@record_version, List.to_string(:erlang.system_info(:otp_release))}
+
   def decode(records) do
+    :ok = StoredTerms.load_atoms()
+
     case Enum.reduce_while(records, {%Engine{}, @required}, &load_record/2) do
       {engine, required} when is_struct(required, MapSet) ->
         if MapSet.size(required) == 0 and
@@ -66,7 +74,7 @@ defmodule AttentionServer.Store.RecordCodec do
   defp load_record({key, payload, hash}, {engine, required})
        when is_binary(key) and is_binary(payload) and is_binary(hash) do
     with true <- hash == checksum(key, payload),
-         address <- :erlang.binary_to_term(key, [:safe]),
+         {@record_version, address} <- :erlang.binary_to_term(key, [:safe]),
          value <- :erlang.binary_to_term(payload, [:safe]),
          {:ok, next, needed} <- insert(engine, required, address, value) do
       {:cont, {next, needed}}

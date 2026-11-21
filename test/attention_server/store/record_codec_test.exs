@@ -65,4 +65,61 @@ defmodule AttentionServer.Store.RecordCodecTest do
     assert {:error, :invalid_state} = RecordCodec.decode(List.delete(rows, high))
     assert {:error, :invalid_state} = RecordCodec.decode([entry | rows])
   end
+
+  test "record identity includes the application codec version" do
+    {key, _, _} = RecordCodec.encode_row({:row, :messages, "msg"}, nil)
+    assert binary_part(key, 0, 2) == <<131, 104>>
+    assert :erlang.binary_to_term(key, [:safe]) == {:relay_record_v1, {:row, :messages, "msg"}}
+  end
+
+  test "retains event rows and decimal values" do
+    key = {"person", 7}
+    value = %{payload: %{"answer" => %AttentionServer.JSON.DecimalToken{raw: "-2.4e100"}}}
+    engine = %{Engine.new() | conversation_events: %{key => value}}
+
+    rows = engine |> RecordCodec.encode() |> Enum.to_list()
+    assert RecordCodec.encode_row({:row, :conversation_events, key}, value) in rows
+    assert {:ok, ^engine} = RecordCodec.decode(rows)
+  end
+
+  test "fresh VMs encode the same record bytes across atom insertion orders" do
+    contents = """
+    numbers = if hd(System.argv()) == "asc", do: 1..80, else: 80..1
+    map = Map.new(numbers, fn n -> {String.to_atom("codec_test_atom_\#{n}"), n} end)
+    {_, _, digest} = AttentionServer.Store.RecordCodec.encode_row({:row, :messages, "msg"}, map)
+    IO.puts(Base.encode16(digest))
+    """
+
+    assert {first, 0} = cold_elixir(contents, ["asc"])
+    assert {second, 0} = cold_elixir(contents, ["desc"])
+    assert first == second
+  end
+
+  test "fresh VM decodes a row with a persisted decimal token" do
+    value = %AttentionServer.JSON.DecimalToken{raw: "1.234e567"}
+    engine = %{Engine.new() | conversation_events: %{{"person", 7} => value}}
+
+    fixture =
+      engine
+      |> RecordCodec.encode()
+      |> Enum.to_list()
+      |> :erlang.term_to_binary()
+      |> Base.encode64()
+
+    contents = """
+    rows = System.argv() |> hd() |> Base.decode64!() |> :erlang.binary_to_term([:safe])
+    {:ok, engine} = AttentionServer.Store.RecordCodec.decode(rows)
+    IO.puts(engine.conversation_events[{"person", 7}].raw)
+    """
+
+    assert {"1.234e567\n", 0} = cold_elixir(contents, [fixture])
+  end
+
+  defp cold_elixir(contents, args) do
+    beam_dir = :code.which(RecordCodec) |> List.to_string() |> Path.dirname()
+
+    System.cmd(System.find_executable("elixir"), ["-pa", beam_dir, "-e", contents, "--" | args],
+      stderr_to_stdout: true
+    )
+  end
 end
