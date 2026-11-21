@@ -154,7 +154,9 @@ defmodule AttentionServer.HeadlessV2Write do
   end
 
   def write_private(path, value, mode \\ :replace) when mode in [:replace, :new] do
-    temporary = path <> ".new-" <> integer_hex(System.unique_integer([:positive]), 1)
+    # A random suffix: concurrent tool runs are separate VMs, so a VM-local
+    # unique integer can repeat between them.
+    temporary = path <> ".new-" <> hex(:crypto.strong_rand_bytes(8))
 
     with {:ok, io} <- File.open(temporary, [:write, :exclusive, :binary]) do
       result =
