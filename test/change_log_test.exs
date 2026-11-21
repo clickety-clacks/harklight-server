@@ -788,13 +788,13 @@ defmodule AttentionServer.ChangeLogTest do
     # The Relay has already stored a ranking for A; start from a known one.
     ranks = %{
       i1 => %{"key" => "b", "section" => "current"},
-      i2 => %{"key" => "c", "section" => "current"}
+      i2 => %{"key" => "c", "section" => "current", "_reply" => %{"key" => "d"}}
     }
 
     start_head = head(relay)
 
-    assert {:ok, first_head} =
-             paused(relay, fn -> ChangeLog.put_ranks(store(relay), "A", ranks) end)
+    assert {:ok, first_head, cache} =
+             paused(relay, fn -> ChangeLog.put_ranks(store(relay), "A", ranks, nil) end)
 
     assert {:ok, page, false} =
              paused(relay, fn -> ChangeLog.rank_page(store(relay), "A", nil, 10) end)
@@ -802,7 +802,9 @@ defmodule AttentionServer.ChangeLogTest do
     assert page == [{i1, ranks[i1]}, {i2, ranks[i2]}]
     assert {:ok, %{"key" => "c"}} = paused(relay, fn -> ChangeLog.rank(store(relay), "A", i2) end)
 
-    assert {:ok, %{^i1 => "b", ^i2 => "c"}} =
+    reply_id = "r" <> i2
+
+    assert {:ok, %{^i1 => "b", ^i2 => "c", ^reply_id => "d"}} =
              paused(relay, fn -> ChangeLog.rank_keys(store(relay), "A") end)
 
     # Same ranking: nothing written.
@@ -810,10 +812,13 @@ defmodule AttentionServer.ChangeLogTest do
              paused(relay, fn -> ChangeLog.put_ranks(store(relay), "A", ranks) end)
 
     # A change in any member writes that item's row only.
-    moved = put_in(ranks, [i2, "section"], "resolved")
+    moved = put_in(ranks, [i2, "_reply", "key"], "e")
 
-    assert {:ok, moved_head} =
-             paused(relay, fn -> ChangeLog.put_ranks(store(relay), "A", moved) end)
+    assert {:ok, moved_head, cache} =
+             paused(relay, fn -> ChangeLog.put_ranks(store(relay), "A", moved, cache) end)
+
+    assert {:ok, %{^reply_id => "e"}} =
+             paused(relay, fn -> ChangeLog.rank_keys(store(relay), "A") end)
 
     assert {:ok, [%{kind: :item, resource_id: resource}], false, ^moved_head} =
              log(relay, first_head)
@@ -827,8 +832,14 @@ defmodule AttentionServer.ChangeLogTest do
     assert {:ok, [{^i1, _}], true} =
              paused(relay, fn -> ChangeLog.rank_page(store(relay), "A", nil, 1) end)
 
-    assert {:ok, gone_head} =
-             paused(relay, fn -> ChangeLog.put_ranks(store(relay), "A", Map.take(moved, [i1])) end)
+    assert {:ok, gone_head, cache} =
+             paused(relay, fn ->
+               ChangeLog.put_ranks(store(relay), "A", Map.take(moved, [i1]), cache)
+             end)
+
+    assert {:ok, units} = paused(relay, fn -> ChangeLog.rank_keys(store(relay), "A") end)
+    assert units == cache.units
+    assert units == %{i1 => "b"}
 
     assert gone_head > moved_head
     assert {:error, :not_found} = paused(relay, fn -> ChangeLog.rank(store(relay), "A", i2) end)
