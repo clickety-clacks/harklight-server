@@ -229,6 +229,92 @@ defmodule AttentionServer.Store.EngineTransitionTest do
     :ok = Store.close(keyed)
   end
 
+  test "shuffled transitions agree with the full validator and cold index rebuild" do
+    legacy_path = legacy_store_path()
+    keyed_path = legacy_path <> ".keyed"
+    File.cp!(legacy_path, keyed_path)
+    {:ok, legacy} = Store.open(legacy_path)
+    {:ok, old} = Store.open(keyed_path)
+    assert {:ok, _} = KeyedMigration.convert(old)
+    :ok = Store.close(old)
+    {:ok, keyed} = Store.open(keyed_path, :keyed)
+    {:ok, keyed} = Store.enable_change_log(keyed)
+    {:ok, legacy} = Store.enable_change_log(legacy)
+    {:ok, send} = JSON.decode_line(forward_line())
+    send = Map.put(send, "session_handle", "00000000-0000-4000-8000-000000000010")
+    :rand.seed(:exsss, {408, 517, 626})
+    ids = Enum.map(1..12, &"oracle-#{&1}")
+
+    arrivals =
+      for id <- Enum.shuffle(ids),
+          do: {@origin, put_in(send["message"]["message_id"], id)}
+
+    responses =
+      Enum.map(Enum.shuffle(ids), fn id ->
+        frame = %{"v" => 1, "sender_id" => "app:test/worker", "message_id" => id}
+
+        case :rand.uniform(3) do
+          1 ->
+            {@reader, Map.merge(frame, %{"type" => "answer", "answer" => nil})}
+
+          2 ->
+            {@reader,
+             Map.merge(frame, %{
+               "type" => "discussion",
+               "request_revision" => 1,
+               "text" => "question"
+             })}
+
+          3 ->
+            {@origin,
+             Map.merge(frame, %{"type" => "lifecycle", "state" => "cleared", "at" => 100})}
+        end
+      end)
+
+    {legacy, keyed} =
+      Enum.reduce(Enum.with_index(arrivals ++ responses, 100), {legacy, keyed}, fn
+        {{actor, frame}, operation}, {legacy, keyed} ->
+          op =
+            "00000000-0000-4000-8000-" <>
+              String.pad_leading(Integer.to_string(operation), 12, "0")
+
+          line = frame |> Map.put("op_id", op) |> JSON.encode_line()
+          {original, {:ok, response}} = Engine.request_line(legacy.engine, actor, line, operation)
+
+          {changed, {:ok, ^response}, keys} =
+            Engine.request_line_with_touches(keyed.engine, actor, line, operation)
+
+          assert {:ok, %{"type" => "ok"}} = JSON.decode_line(response)
+          assert keys == full_diff(keyed.engine, changed)
+          assert full_diff(original, changed) == MapSet.new()
+          audit = %{person: @person, actor: actor, action: frame["type"]}
+
+          if frame["type"] == "forward" do
+            key = {@person, "app:test/worker", frame["message"]["message_id"]}
+            bad_original = put_in(original.messages[key].origin, "unknown")
+            bad_changed = put_in(changed.messages[key].origin, "unknown")
+
+            assert {:error, :storage_unavailable, ^legacy} =
+                     Store.commit(legacy, bad_original, audit)
+
+            assert {:error, :storage_unavailable, ^keyed} =
+                     Store.commit(keyed, {bad_changed, keys}, audit)
+          end
+
+          assert {:ok, legacy} = Store.commit(legacy, original, audit)
+          assert {:ok, keyed} = Store.commit(keyed, {changed, keys}, audit)
+          assert full_diff(legacy.engine, keyed.engine) == MapSet.new()
+          {legacy, keyed}
+      end)
+
+    :ok = Store.close(legacy)
+    :ok = Store.close(keyed)
+    assert {:ok, reopened} = Store.open(keyed_path, :keyed)
+    assert {:ok, reopened} = Store.enable_change_log(reopened)
+    assert index_state(keyed) == index_state(reopened)
+    :ok = Store.close(reopened)
+  end
+
   test "keyed reference rollback and final owner cleanup respect durable rows" do
     path = legacy_store_path()
     {:ok, legacy} = Store.open(path)
