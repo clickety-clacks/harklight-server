@@ -383,10 +383,15 @@ defmodule AttentionServer.HeadlessDeviceV2Test do
         else: System.delete_env("ATTENTION_SERVER_FEATURE_FLAGS_PATH")
     end)
 
+    # On by default, like the server: unset, or a file without the key.
     System.delete_env("ATTENTION_SERVER_FEATURE_FLAGS_PATH")
-    refute AttentionServer.HeadlessTLS.client_api_v2?()
+    assert AttentionServer.HeadlessTLS.client_api_v2?()
 
     on = Path.join(ctx.dir, "tool-flags.json")
+    File.write!(on, ~s({"other":true}))
+    System.put_env("ATTENTION_SERVER_FEATURE_FLAGS_PATH", on)
+    assert AttentionServer.HeadlessTLS.client_api_v2?()
+
     File.write!(on, ~s({"client_api_v2":true}))
     System.put_env("ATTENTION_SERVER_FEATURE_FLAGS_PATH", on)
     assert AttentionServer.HeadlessTLS.client_api_v2?()

@@ -28,6 +28,22 @@ defmodule AttentionServer.HeadlessToolTest do
     on_exit(fn -> File.rm_rf!(dir) end)
     db_path = Path.join(dir, "relay.sqlite3")
     identity_dir = Path.join(dir, "new-device")
+
+    # This proof runs against the retained /relay listener, so the tools speak
+    # protocol 0.1 here instead of their v2 default.
+    previous_flags = System.get_env("ATTENTION_SERVER_FEATURE_FLAGS_PATH")
+
+    System.put_env(
+      "ATTENTION_SERVER_FEATURE_FLAGS_PATH",
+      AttentionServer.LegacyProtocol.flags!(dir)
+    )
+
+    on_exit(fn ->
+      if previous_flags,
+        do: System.put_env("ATTENTION_SERVER_FEATURE_FLAGS_PATH", previous_flags),
+        else: System.delete_env("ATTENTION_SERVER_FEATURE_FLAGS_PATH")
+    end)
+
     assert {:ok, person} = OperatorTool.bootstrap(db_path, Path.join(certs, "a1.pem"))
     {:ok, relay} = Relay.start_link(store_path: db_path)
 

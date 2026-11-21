@@ -74,7 +74,7 @@ commands or upgrade. Historical binary name attention_server, Mix application
 :attention_server, ATTENTION_SERVER_* variables, /relay, attention-relay/1 and
 /agent/v1 retain their existing meaning.
 
-Four listeners default to loopback: WebSocket 18443, enrollment HTTPS 18444,
+Four listeners default to loopback: device HTTPS 18443, enrollment HTTPS 18444,
 owner TLS 18445 and agent HTTPS 18446. For another machine to connect, set each
 required ATTENTION_SERVER_*_BIND explicitly in server.env and arrange routing
 and firewall access. Use the DNS hostname embedded in the certificate.
@@ -121,8 +121,12 @@ below: it carries the configured destination and pinned public CA. The app keeps
 its own private device key; never transfer an owner or CA private key to it.
 For headless commands use the tailnet IP in --connect and the exact
 certificate hostname in --name. Enrollment uses 18444, owner management 18445,
-device relay wss://HOSTNAME:18443/relay and authorized-agent HTTPS 18446.
-An app/server peer must negotiate attention-relay/1 and enroll its exact key.
+the device client API https://HOSTNAME:18443/v2 and authorized-agent HTTPS 18446.
+An app or headless device must enroll its exact key and present it over mutual
+TLS on the device port, which serves client API v2 (protocol 0.2) only. The
+temporary `client_api_v2` flag is on by default; setting it to `false` in the
+feature-flags file (see Client feature flags) starts the retained protocol 0.1
+`/relay` WebSocket (attention-relay/1) instead, until that path is removed.
 
 ## Agent conversation CLI
 
@@ -283,7 +287,7 @@ an APNs request; after adding the Production settings, the device must register
 a higher revision to clear that binding. FCM is unsupported.
 
 An enrolled app registers its own current address over the authenticated relay.
-With `client_api_v2` enabled, the full provider attempt has a provisional
+With `client_api_v2` on (the default), the full provider attempt has a provisional
 20,000 ms deadline, including connection setup and any provider-token refresh.
 Set `ATTENTION_SERVER_APNS_ATTEMPT_TIMEOUT_MS` in `server.env` to override it.
 Use a positive integer in milliseconds within the runtime timer range.
@@ -522,3 +526,8 @@ Nonboolean entries are ignored. An unset path yields `{}`. A missing, unreadable
 or malformed configured file also yields `{}` and logs one warning per Relay
 lifetime without preventing startup or sync. APNs `attention.server` carries
 the same persisted identity.
+
+The same file also holds the temporary Server flag `client_api_v2`, which the
+Server reads once at startup rather than per connection. It is on unless the
+file sets it to `false`; a missing, unreadable or malformed file leaves it on.
+Changing it requires a restart.

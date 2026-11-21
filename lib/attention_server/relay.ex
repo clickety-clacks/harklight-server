@@ -794,7 +794,7 @@ defmodule AttentionServer.Relay do
   @impl true
   def init(opts) do
     case Store.open(Keyword.get(opts, :store_path))
-         |> client_api_v2_store(Keyword.get(opts, :feature_flags_path)) do
+         |> client_api_v2_store(client_api_v2_option(opts)) do
       {:ok, store} ->
         case startup_cleanup(store) do
           {:ok, store} ->
@@ -884,7 +884,10 @@ defmodule AttentionServer.Relay do
   end
 
   # With the client_api_v2 flag on at startup, the store writes the change log
-  # in every commit. The flag is read once, here, before any startup commit.
+  # in every commit. It is decided once, here, before any startup commit.
+  # Server passes the value it resolved (on by default, explicit false kept); a
+  # Relay started directly without that option reads the feature-flags file,
+  # where an absent key stays off.
   # Change-log rows older than the retention window are pruned daily; a cursor
   # older than the oldest retained row gets cursor_expired.
   @change_log_retention_ms 30 * 24 * 60 * 60 * 1_000
@@ -896,10 +899,21 @@ defmodule AttentionServer.Relay do
 
   defp schedule_change_log_prune(_store, _delay_ms), do: :ok
 
-  defp client_api_v2_store({:ok, store}, feature_flags_path) do
-    {flags, _warned} = AttentionServer.FeatureFlags.read(feature_flags_path, true)
+  defp client_api_v2_option(opts) do
+    case Keyword.fetch(opts, :client_api_v2) do
+      {:ok, enabled} when is_boolean(enabled) ->
+        enabled
 
-    if Map.get(flags, "client_api_v2") == true do
+      _ ->
+        {flags, _warned} =
+          AttentionServer.FeatureFlags.read(Keyword.get(opts, :feature_flags_path), true)
+
+        Map.get(flags, "client_api_v2") == true
+    end
+  end
+
+  defp client_api_v2_store({:ok, store}, enabled?) do
+    if enabled? do
       case Store.enable_change_log(store) do
         {:ok, store} ->
           {:ok, store}
@@ -914,7 +928,7 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  defp client_api_v2_store(error, _feature_flags_path), do: error
+  defp client_api_v2_store(error, _enabled?), do: error
 
   defp startup_cleanup(store) do
     actor_keys = browser_actor_keys(store.engine)
