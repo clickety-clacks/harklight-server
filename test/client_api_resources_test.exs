@@ -1,7 +1,7 @@
 defmodule AttentionServer.ClientAPIResourcesTest do
   use ExUnit.Case, async: false
 
-  alias AttentionServer.{Engine, JSON, Relay}
+  alias AttentionServer.{Engine, JSON, Placement, Relay}
   alias AttentionServer.ClientAPI.Resources
   alias AttentionServer.ClientAPISchema, as: Schema
 
@@ -468,6 +468,182 @@ defmodule AttentionServer.ClientAPIResourcesTest do
     end
   end
 
+  describe "round 7 and 8" do
+    test "each origin result is a result entry, and the item shows the latest", %{path: path} do
+      relay = scripted_relay(path)
+      {engine, _} = snapshot(relay)
+
+      %{"feed_seq" => terminal_seq} =
+        engine.origin_feeds[{"A", "origin"}].entries
+        |> Map.values()
+        |> Enum.find(&(&1["kind"] == "terminal" and &1["message_id"] == "answered"))
+
+      assert {:ok, _} = Relay.origin_ack(relay, "origin", terminal_seq)
+
+      for {status, n} <- [{"received", 50}, {"applied", 51}] do
+        assert %{"type" => "ok"} =
+                 request(relay, "origin", %{
+                   "type" => "conversation_result",
+                   "op_id" => op(n),
+                   "sender_id" => "app:test",
+                   "message_id" => "answered",
+                   "in_reply_to" => terminal_seq,
+                   "status" => status
+                 })
+      end
+
+      {engine, view} = snapshot(relay)
+
+      assert [
+               %{"kind" => "result", "author" => "origin", "result" => first},
+               %{"kind" => "result", "result" => second}
+             ] =
+               engine
+               |> Resources.entries(key("answered"), view)
+               |> Enum.filter(&(&1["kind"] == "result"))
+
+      assert first == %{"status" => "received", "revision" => 1, "result_ref" => op(50)}
+      assert second == %{"status" => "applied", "revision" => 2, "result_ref" => op(51)}
+      item = rendered_items(engine, view, "reader")[key("answered")]
+      assert item["result"] == %{"status" => "applied", "revision" => 2, "result_ref" => op(51)}
+
+      defs = Schema.contract_defs(@contract)
+
+      for entry <- Resources.entries(engine, key("answered"), view) do
+        rendered = entry |> Resources.stamp(1) |> then(&Resources.render(:entry, &1, nil))
+
+        assert {entry["entry_id"], Schema.errors(defs, "Entry", rendered)} ==
+                 {entry["entry_id"], []}
+      end
+
+      GenServer.stop(relay)
+    end
+
+    test "reply fields stay with every reply read, with today's priority; items carry arrival",
+         %{path: path} do
+      relay = scripted_relay(path)
+      {engine, view} = snapshot(relay)
+      items = rendered_items(engine, view, "reader")
+      chat = items[key("chat")]["chat"]
+
+      # The scripted reader read through the agent's only reply.
+      assert chat["unread_replies"] == 0
+      assert is_binary(chat["reply_rank_key"])
+      assert Map.has_key?(chat, "reply_group")
+
+      assert chat["reply_priority"] == %{"level" => "normal"} or
+               match?(%{"level" => "normal", "score" => _}, chat["reply_priority"])
+
+      for {k, item} <- items,
+          k != key("chat"),
+          do: refute(Map.has_key?(item["chat"], "reply_rank_key"))
+
+      assert [%{"author" => "origin", "priority" => %{"level" => "normal"}}] =
+               engine
+               |> Resources.entries(key("chat"), view)
+               |> Enum.filter(&(&1["kind"] == "reply" and &1["author"] == "origin"))
+
+      for item <- Map.values(items) do
+        assert is_integer(item["arrival"]) and item["arrival"] > 0
+        assert is_integer(item["created_at_ms"])
+      end
+
+      arrivals = items |> Map.values() |> Enum.map(& &1["arrival"])
+      assert arrivals == Enum.uniq(arrivals)
+
+      undated = update_in(engine.messages[key("old")], &Map.drop(&1, [:accepted_at, :free_order]))
+      {:ok, old_id} = Resources.item_id(undated, key("old"))
+      rank = Map.fetch!(Resources.ranks(undated, "A", view), old_id)
+      old = Resources.item(undated, key("old"), rank)
+      refute Map.has_key?(old, "created_at_ms") or Map.has_key?(old, "arrival")
+      GenServer.stop(relay)
+    end
+  end
+
+  describe "inbox order against today's" do
+    test "rank order equals today's Route B inbox paging in free order, with threads and history",
+         %{path: path} do
+      relay = scripted_relay(path)
+
+      for {id, thread, n} <- [
+            {"t-a", "plan", 60},
+            {"solo", nil, 61},
+            {"t-b", "plan", 62},
+            {"t-c", "other", 63}
+          ] do
+        extra = if thread, do: %{"thread" => thread}, else: %{}
+        forward(relay, id, n, extra)
+      end
+
+      assert %{"type" => "ok"} =
+               request(relay, "reader", %{
+                 "type" => "answer",
+                 "op_id" => op(64),
+                 "sender_id" => "app:test",
+                 "message_id" => "t-a",
+                 "answer" => nil
+               })
+
+      {engine, view} = snapshot(relay)
+      assert Placement.choice(engine, "A") == "baseline"
+      items = rendered_items(engine, view, "reader")
+
+      route_b =
+        Stream.unfold(nil, fn
+          :done ->
+            nil
+
+          cursor ->
+            {:ok, page} =
+              Engine.route_b_inbox_page(
+                engine,
+                "reader",
+                view.message_order,
+                view.message_order_suffixes,
+                view.message_entries_by_identity,
+                3,
+                cursor
+              )
+
+            next =
+              case page["next_cursor"] do
+                nil ->
+                  :done
+
+                encoded ->
+                  encoded
+                  |> Base.url_decode64!(padding: false)
+                  |> Kernel.<>("\n")
+                  |> JSON.decode_line()
+                  |> then(fn {:ok, %{"sender_id" => s, "message_id" => m}} -> {s, m} end)
+              end
+
+            {page["rows"], next}
+        end)
+        |> Enum.flat_map(& &1)
+        |> Enum.map(& &1["message_id"])
+
+      by_rank =
+        items
+        |> Enum.sort_by(fn {_, item} -> item["rank"]["key"] end)
+        |> Enum.map(fn {{_, _, id}, _} -> id end)
+
+      listed = for %{"kind" => "message", "message_id" => id} <- view.list_items, do: id
+
+      assert by_rank == listed
+      # Today's two orders agree on the current section; report where they differ.
+      current =
+        for {{_, _, id}, item} <- Enum.sort_by(items, fn {_, i} -> i["rank"]["key"] end),
+            item["rank"]["section"] == "current",
+            do: id
+
+      assert Enum.take(route_b, length(current)) == current
+      send(self(), {:orders, route_b, by_rank})
+      assert route_b == by_rank
+      GenServer.stop(relay)
+    end
+  end
+
   describe "revisions" do
     test "every request revision reads, including the first", %{path: path} do
       relay = scripted_relay(path)
@@ -640,7 +816,7 @@ defmodule AttentionServer.ClientAPIResourcesTest do
           %{"kind" => "message", "message_id" => id} ->
             [{:item, id}]
 
-          %{"kind" => "reply", "message_id" => id, "unseen_count" => n} when n > 0 ->
+          %{"kind" => "reply", "message_id" => id} ->
             [{:reply, id}]
 
           _ ->

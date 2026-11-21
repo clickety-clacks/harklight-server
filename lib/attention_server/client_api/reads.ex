@@ -323,7 +323,7 @@ defmodule AttentionServer.ClientAPI.Reads do
          {:ok, item_key} <- Resources.item_key(engine, principal.person, item_id),
          {:ok, limit} <- limit(params),
          {:ok, position} <- head(state, principal.person) do
-      all = Resources.entries(engine, item_key)
+      all = Resources.entries(engine, item_key, Map.get(state.priority_views, principal.person))
 
       with {:ok, older_than} <- before(params, all) do
         eligible = if older_than, do: Enum.filter(all, &(&1["position"] < older_than)), else: all
