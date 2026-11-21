@@ -373,8 +373,7 @@ defmodule AttentionServer.ClientAPI.Reads do
       # about an unreadable flags file where it reads it for itself.
       {flags, _warned} = FeatureFlags.read(state.feature_flags_path, true)
 
-      {:ok,
-       %{
+      response = %{
          "account" => %{
            "state" =>
              if(Engine.delivery_stopped?(engine, principal.person), do: "paused", else: "active")
@@ -387,7 +386,9 @@ defmodule AttentionServer.ClientAPI.Reads do
            "answer_ui_limits" => UI1.published_limits(),
            "retention_days" => @retention_days
          }
-       }}
+       }
+
+      {:ok, with_sender_names(response, engine, principal)}
     end
   end
 
@@ -417,6 +418,13 @@ defmodule AttentionServer.ClientAPI.Reads do
       end
     end
   end
+
+  defp with_sender_names(response, engine, %{kind: :device, person: person, key: key}) do
+    names = engine.sender_grants |> Map.get({person, key}, []) |> Enum.sort()
+    Map.put(response, "sender_names", names)
+  end
+
+  defp with_sender_names(response, _engine, _principal), do: response
 
   # The bytes are decoded and checked by the caller, outside the relay: large
   # inline data lives in a file, and reading it must neither block the relay
