@@ -650,11 +650,12 @@ Only their transport changes, and they are device-only.
       rebaseline as for `410`.
   - A held show for this device may arrive as an id-less `event: show`
     (§5.1).
+  - A feed that drops with no `closing` is recorded with initiator
+    `os_network` or `unknown`, and reconnected with `Last-Event-ID`.
 - **`after` older than retention:** `410` with an `Error` body whose `error` is
   `cursor_expired`, in both forms.
 - **Feed ID:** the feed's `Request-Id` is its ID. The server logs it at open,
-  and at close with `revoked`, `server_shutdown`, `account_paused` or
-  `client_closed`.
+  and at close with its `closing` reason, or `client_closed`.
 
 ## 6.1 The log is compacted
 

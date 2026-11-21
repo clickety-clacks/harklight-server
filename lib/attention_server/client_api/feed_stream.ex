@@ -13,7 +13,9 @@ defmodule AttentionServer.ClientAPI.FeedStream do
       session ends;
     - `account_paused` when the account is paused;
     - `server_shutdown` when the server stops (`ClientAPI.FeedShutdown`) or
-      the Relay exits.
+      the Relay exits;
+    - `cursor_expired` when the position falls out of retention mid-stream;
+    - `storage_unavailable` when a mid-stream read fails (round 17).
   - The feed's ID is its `Request-Id`. It is logged at open, and at close
     with the reason, `client_closed` when the client went away.
 
@@ -111,10 +113,13 @@ defmodule AttentionServer.ClientAPI.FeedStream do
       {:error, :unauthorized} ->
         closing(conn, state, "revoked")
 
-      # The cursor fell behind retention while open. Ending lets the client's
-      # reconnect get 410 and re-read a snapshot.
-      {:error, reason} ->
-        finish(conn, state, Atom.to_string(reason))
+      # The cursor fell behind retention while open: the client rebaselines.
+      {:error, :cursor_expired} ->
+        closing(conn, state, "cursor_expired")
+
+      # Any other read failure is transient: the client reconnects later.
+      {:error, _reason} ->
+        closing(conn, state, "storage_unavailable")
     end
   catch
     :exit, _reason -> closing(conn, state, "server_shutdown")
