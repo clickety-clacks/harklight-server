@@ -30,8 +30,17 @@ defmodule AttentionServer.ClientAPI.Writes do
 
   import Plug.Conn
 
-  alias AttentionServer.{BrowserRecipient, ChangeLog, Engine, JSON, Relay}
-  alias AttentionServer.ClientAPI.{Context, Errors, FeedRenderer, Idempotency, Reads, Resources}
+  alias AttentionServer.{BrowserRecipient, ChangeLog, ConversationFiles, Engine, JSON, Relay}
+
+  alias AttentionServer.ClientAPI.{
+    Context,
+    Errors,
+    FeedRenderer,
+    Idempotency,
+    Reads,
+    Resources,
+    Uploads
+  }
 
   @max_body_bytes 64 * 1024
 
@@ -46,7 +55,8 @@ defmodule AttentionServer.ClientAPI.Writes do
       {"POST", ["items", :item_id, "answer"], :post_answer},
       {"PUT", ["settings", "priority-levels"], :put_priority_levels},
       {"PUT", ["devices", "me", "push"], :put_push},
-      {"DELETE", ["devices", "me", "push"], :delete_push}
+      {"DELETE", ["devices", "me", "push"], :delete_push},
+      {"POST", ["files"], :post_files}
     ]
   end
 
@@ -140,6 +150,33 @@ defmodule AttentionServer.ClientAPI.Writes do
       respond(conn, remove_push(ctx.relay, ctx.principal, key))
     else
       {:error, token, field} -> Errors.send_error(conn, token, field: field)
+    end
+  end
+
+  @doc false
+  def post_files(conn, %Context{} = ctx) do
+    with {:ok, key} <- required_key(conn),
+         {:ok, name} <- file_name(conn),
+         {:ok, length} <- content_length(conn),
+         {:ok, dir, cap} <- call(ctx.relay, {:upload_target, ctx.principal}),
+         :ok <- within_cap(length, cap) do
+      tmp = Path.join(dir, ".tmp-" <> Base.url_encode64(:crypto.strong_rand_bytes(12)))
+
+      try do
+        case receive_file(conn, tmp, length, cap) do
+          {:ok, size, sha256, conn} ->
+            meta = %{name: name, content_type: content_type(conn), size: size, sha256: sha256}
+            respond(conn, file(ctx.relay, ctx.principal, meta, tmp, key))
+
+          {:error, token, field, conn} ->
+            Errors.send_error(conn, token, field: field)
+        end
+      after
+        File.rm(tmp)
+      end
+    else
+      {:error, token} -> Errors.send_error(conn, to_string(token))
+      {:error, token, field} -> Errors.send_error(conn, to_string(token), field: field)
     end
   end
 
@@ -240,6 +277,24 @@ defmodule AttentionServer.ClientAPI.Writes do
     })
   end
 
+  @doc """
+  `POST /v2/files`: stage a file the person's replies can name by `file_id`.
+  `meta` has `:name`, `:content_type`, `:size` and `:sha256` of the bytes
+  written to `tmp_path`, which is moved into place.
+  """
+  def file(relay, who, meta, tmp_path, idempotency_key) do
+    write(relay, who, idempotency_key, {:file, meta, tmp_path}, %{
+      method: "POST",
+      path: ["files"],
+      body: %{
+        "name" => meta.name,
+        "content_type" => meta.content_type,
+        "size" => meta.size,
+        "sha256" => meta.sha256
+      }
+    })
+  end
+
   defp write(relay, who, key, operation, request) do
     digest = Idempotency.digest(request.method, request.path, request.body)
 
@@ -247,8 +302,11 @@ defmodule AttentionServer.ClientAPI.Writes do
       {:replay, status, body} ->
         result({:ok, status, body}, true)
 
-      {:apply, engine_key, frame} ->
-        outcome = apply_frame(relay, engine_key, frame)
+      {:apply, engine_key, frame, staged} ->
+        outcome =
+          with {:ok, frame} <- attach_files(relay, engine_key, frame, staged),
+               do: apply_frame(relay, engine_key, frame)
+
         result(call(relay, {:finish, who, key, digest, operation, outcome}), false)
 
       :unchanged ->
@@ -296,7 +354,12 @@ defmodule AttentionServer.ClientAPI.Writes do
            )
 
   # Today's field names that the client API renamed.
-  @fields %{"address" => "token", "address_kind" => "token", "profile_id" => "environment"}
+  @fields %{
+    "address" => "token",
+    "address_kind" => "token",
+    "profile_id" => "environment",
+    "files" => "file_ids"
+  }
 
   defp refusal(reason, reply) do
     token =
@@ -316,19 +379,79 @@ defmodule AttentionServer.ClientAPI.Writes do
     end
   end
 
+  # Each staged file is uploaded to the reply's message through today's
+  # upload path, under the reply's operation, then named in its frame.
+  defp attach_files(_relay, _engine_key, frame, []), do: {:ok, frame}
+
+  defp attach_files(relay, engine_key, frame, staged) do
+    Enum.reduce_while(staged, {:ok, []}, fn file, {:ok, acc} ->
+      attrs = %{
+        "op_id" => frame["op_id"],
+        "sender_id" => frame["sender_id"],
+        "message_id" => frame["message_id"],
+        "revision" => frame["request_revision"],
+        "name" => file.name,
+        "content_type" => file.content_type
+      }
+
+      case upload(relay, engine_key, attrs, file) do
+        {:ok, upload_id} ->
+          ref = %{"name" => file.name, "upload_id" => upload_id, "size" => file.size}
+          {:cont, {:ok, [Map.put(ref, "sha256", file.sha256) | acc]}}
+
+        error ->
+          {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, files} -> {:ok, Map.put(frame, "files", Enum.reverse(files))}
+      error -> error
+    end
+  end
+
+  defp upload(relay, engine_key, attrs, file) do
+    with {:ok, lease} <- Relay.upload_begin(relay, engine_key, attrs, file.size) do
+      try do
+        Relay.upload_file(relay, engine_key, attrs, file.path, file.size, file.sha256, lease)
+      after
+        Relay.upload_end(relay, lease)
+      end
+    end
+    |> case do
+      {:ok, %{"upload_id" => upload_id}} -> {:ok, upload_id}
+      {:error, :upload_cap_exceeded} -> {:error, "payload_too_large"}
+      {:error, :forbidden} -> {:error, "forbidden"}
+      {:error, :storage_unavailable} -> {:error, "storage_unavailable"}
+      _ -> {:error, "retry_later"}
+    end
+  end
+
   defp call(relay, request),
     do: GenServer.call(relay, {:client_api, __MODULE__, request}, :infinity)
 
   ## Inside the relay
 
   @doc false
+  def handle_call({:upload_target, who}, _from, state) do
+    reply =
+      with {:ok, _principal} <- principal(state.store.engine, who),
+           {:ok, dir} <- staging_dir(state) do
+        {:ok, dir, Map.get(state, :upload_cap, :none)}
+      end
+
+    {:reply, reply, state}
+  end
+
   def handle_call({:begin, who, key, digest, operation}, _from, state) do
     reply =
       with {:ok, principal} <- principal(state.store.engine, who),
            {:ok, nil} <- stored(state, principal.person, key, digest),
            :ok <- precondition(state, who, principal, operation),
-           {:ok, frame} <- frame(state.store.engine, principal, key, operation) do
-        if frame == :unchanged, do: :unchanged, else: {:apply, principal.engine_key, frame}
+           {:ok, frame} <- frame(state.store.engine, principal, key, operation),
+           {:ok, staged} <- staged_files(state, principal, operation) do
+        if frame == :unchanged,
+          do: :unchanged,
+          else: {:apply, principal.engine_key, frame, staged}
       else
         {:ok, %{status: status, body: body}} -> {:replay, status, body}
         error -> error
@@ -406,6 +529,25 @@ defmodule AttentionServer.ClientAPI.Writes do
 
   defp render({:answer, item_id, _revision, _value}, who, _person, _reply, from, state),
     do: render_item(item_id, who, from, state)
+
+  defp render({:file, meta, tmp_path}, _who, person, _reply, _from, state) do
+    case Uploads.stage(state.store, person, meta, tmp_path) do
+      {:ok, file_id} ->
+        {:ok, 201,
+         %{
+           "file_id" => file_id,
+           "name" => meta.name,
+           "sha256" => meta.sha256,
+           "size" => meta.size
+         }}
+
+      {:error, :disabled} ->
+        {:error, :not_found}
+
+      _ ->
+        {:error, :storage_unavailable}
+    end
+  end
 
   defp render(operation, who, _person, _reply, from, state)
        when operation == :remove_push or elem(operation, 0) in [:priority_levels, :push] do
@@ -539,10 +681,9 @@ defmodule AttentionServer.ClientAPI.Writes do
 
   # Chat never closes: the reply goes to the item's current revision in any
   # state. The engine stores it for the agent whether or not it is listening.
-  defp frame(engine, principal, key, {:reply, item_id, text, file_ids}) do
+  defp frame(engine, principal, key, {:reply, item_id, text, _file_ids}) do
     with {:ok, {_person, sender, message_id} = message_key} <-
-           Resources.item_key(engine, principal.person, item_id),
-         :ok <- no_file_ids(file_ids) do
+           Resources.item_key(engine, principal.person, item_id) do
       %{revision: revision} = Map.fetch!(engine.messages, message_key)
 
       {:ok,
@@ -593,6 +734,43 @@ defmodule AttentionServer.ClientAPI.Writes do
     end
   end
 
+  defp frame(_engine, _principal, key, {:priority_levels, levels, _if_match}) do
+    {:ok,
+     %{
+       "v" => 1,
+       "type" => "levels_set",
+       "ref" => "client_api_v2",
+       "op_id" => op_id(key),
+       "levels" => levels
+     }}
+  end
+
+  defp frame(_engine, _principal, key, {:push, token, environment, revision}) do
+    {:ok,
+     %{
+       "v" => 1,
+       "type" => "push_register",
+       "op_id" => op_id(key),
+       "revision" => revision,
+       "address_kind" => "apns_token",
+       "address" => token,
+       "profile_id" => "harklight-" <> environment
+     }}
+  end
+
+  # The binding is removed at the next revision; DELETE carries none.
+  defp frame(engine, principal, key, :remove_push) do
+    revision =
+      case Map.get(engine.push_bindings, {principal.person, principal.engine_key}) do
+        %{revision: current} -> current + 1
+        nil -> 1
+      end
+
+    {:ok, %{"v" => 1, "type" => "push_remove", "op_id" => op_id(key), "revision" => revision}}
+  end
+
+  defp frame(_engine, _principal, _key, {:file, _meta, _tmp_path}), do: {:ok, :unchanged}
+
   defp answer_frame(key, sender, message_id, revision, answer) do
     %{
       "v" => 1,
@@ -635,44 +813,31 @@ defmodule AttentionServer.ClientAPI.Writes do
     end
   end
 
-  defp frame(_engine, _principal, key, {:priority_levels, levels, _if_match}) do
-    {:ok,
-     %{
-       "v" => 1,
-       "type" => "levels_set",
-       "ref" => "client_api_v2",
-       "op_id" => op_id(key),
-       "levels" => levels
-     }}
-  end
-
-  defp frame(_engine, _principal, key, {:push, token, environment, revision}) do
-    {:ok,
-     %{
-       "v" => 1,
-       "type" => "push_register",
-       "op_id" => op_id(key),
-       "revision" => revision,
-       "address_kind" => "apns_token",
-       "address" => token,
-       "profile_id" => "harklight-" <> environment
-     }}
-  end
-
-  # The binding is removed at the next revision; DELETE carries none.
-  defp frame(engine, principal, key, :remove_push) do
-    revision =
-      case Map.get(engine.push_bindings, {principal.person, principal.engine_key}) do
-        %{revision: current} -> current + 1
-        nil -> 1
+  # The staged files a reply names, resolved for its person.
+  defp staged_files(state, principal, {:reply, _item_id, _text, file_ids}) do
+    Enum.reduce_while(file_ids, {:ok, []}, fn file_id, {:ok, acc} ->
+      case Uploads.fetch(state.store, principal.person, file_id) do
+        {:ok, staged} -> {:cont, {:ok, [staged | acc]}}
+        {:error, :not_found} -> {:halt, {:error, :invalid_field, "file_ids"}}
+        {:error, :disabled} -> {:halt, {:error, :not_found}}
+        _ -> {:halt, {:error, :storage_unavailable}}
       end
-
-    {:ok, %{"v" => 1, "type" => "push_remove", "op_id" => op_id(key), "revision" => revision}}
+    end)
+    |> case do
+      {:ok, staged} -> {:ok, Enum.reverse(staged)}
+      error -> error
+    end
   end
 
-  # Uploaded files arrive with POST /v2/files, a later slice.
-  defp no_file_ids([]), do: :ok
-  defp no_file_ids(_), do: {:error, :unsupported, "file_ids"}
+  defp staged_files(_state, _principal, _operation), do: {:ok, []}
+
+  defp staging_dir(state) do
+    case Uploads.dir(state.store) do
+      {:ok, dir} -> {:ok, dir}
+      {:error, :disabled} -> {:error, :not_found}
+      _ -> {:error, :storage_unavailable}
+    end
+  end
 
   defp item_entry_seq(engine, person, message_key, entry_id) do
     with {:ok, seq} <- Resources.entry_seq(entry_id),
@@ -801,6 +966,92 @@ defmodule AttentionServer.ClientAPI.Writes do
 
       _ ->
         {:error, "invalid_field", nil}
+    end
+  end
+
+  # Content-Disposition: attachment; filename*=UTF-8''<percent-encoded name>
+  # (RFC 6266, RFC 5987).
+  defp file_name(conn) do
+    with [value | _] <- get_req_header(conn, "content-disposition"),
+         [_, encoded] <- Regex.run(~r/filename\*\s*=\s*UTF-8''([^;\s]+)/i, value),
+         name when is_binary(name) <- percent_decode(encoded),
+         true <- name != "" and String.valid?(name) and ConversationFiles.valid_name?(name) do
+      {:ok, name}
+    else
+      _ -> {:error, "invalid_field", "name"}
+    end
+  end
+
+  defp percent_decode(encoded) do
+    URI.decode(encoded)
+  rescue
+    ArgumentError -> nil
+  end
+
+  defp content_length(conn) do
+    with [value] <- get_req_header(conn, "content-length"),
+         {n, ""} when n >= 0 <- Integer.parse(value) do
+      {:ok, n}
+    else
+      _ -> {:error, "invalid_field", "Content-Length"}
+    end
+  end
+
+  defp content_type(conn) do
+    case get_req_header(conn, "content-type") do
+      [value | _] when value != "" -> value
+      _ -> "application/octet-stream"
+    end
+  end
+
+  defp within_cap(_length, :none), do: :ok
+  defp within_cap(length, cap) when is_integer(cap) and length <= cap, do: :ok
+  defp within_cap(_length, _cap), do: {:error, "payload_too_large", nil}
+
+  # Streams the body to `tmp`, hashing it, and checks it is exactly
+  # Content-Length bytes and within the upload cap.
+  defp receive_file(conn, tmp, length, cap) do
+    case File.open(tmp, [:write, :binary, :exclusive]) do
+      {:ok, io} ->
+        try do
+          receive_chunks(conn, io, :crypto.hash_init(:sha256), 0, length, cap)
+        after
+          File.close(io)
+        end
+
+      _ ->
+        {:error, "storage_unavailable", nil, conn}
+    end
+  end
+
+  defp receive_chunks(conn, io, hash, size, length, cap) do
+    case read_body(conn, length: 1_000_000, read_length: 1_000_000) do
+      {status, data, conn} when status in [:ok, :more] ->
+        size = size + byte_size(data)
+
+        cond do
+          is_integer(cap) and size > cap ->
+            {:error, "payload_too_large", nil, conn}
+
+          size > length ->
+            {:error, "invalid_field", "Content-Length", conn}
+
+          IO.binwrite(io, data) != :ok ->
+            {:error, "storage_unavailable", nil, conn}
+
+          status == :more ->
+            receive_chunks(conn, io, :crypto.hash_update(hash, data), size, length, cap)
+
+          size != length ->
+            {:error, "invalid_field", "Content-Length", conn}
+
+          true ->
+            digest = hash |> :crypto.hash_update(data) |> :crypto.hash_final()
+            {:ok, size, Base.encode16(digest, case: :lower), conn}
+        end
+
+      {:error, _} ->
+        {:error, "invalid_field", nil, conn}
     end
   end
 
