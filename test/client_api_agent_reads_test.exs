@@ -237,13 +237,18 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
     end)
 
     path = "/v2/agent/messages/" <> id <> "/entries?limit=1"
+    response = get(ctx, "a1", path)
+    assert response.status == 200
+
+    body = Elixir.JSON.decode!(response.body)
+    assert ClientAPISchema.errors(ctx.defs, "AgentEntriesPage", body) == []
 
     assert %{
              "entries" => [
                %{"position" => ^position, "priority" => %{"level" => "now", "score" => 0.9}}
              ],
              "older" => true
-           } = contract(ctx, "AgentEntriesPage", get(ctx, "a1", path))
+           } = body
   end
 
   test "me reports the enrolled key's sender names", ctx do
