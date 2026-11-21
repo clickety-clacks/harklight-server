@@ -419,6 +419,10 @@ Schemas use JSON Schema 2020-12. `$ref`s point into the `$defs` below.
   its status turns. `status` is today's closed list: `received`, `applied`,
   `refused`.
 - **Files.**
+  - Use the download ID from `FileRef.file_id` on the Item or Entry for
+    `GET /v2/files/{file_id}`. Only that ID is served by GET. Using the upload
+    handle returned by `POST /v2/files` for GET returns `404 not_found`.
+    Treat the two identifiers as independent.
   - **To a device**, a file is served with its stored `Content-Type`:
     - a file uploaded through `POST /v2/files` keeps the type it was sent
       with;
@@ -500,6 +504,7 @@ Every write that succeeds answers `200`, or `201` for `POST /v2/files`, with a
     },
     "FileCreated": {
       "type": "object",
+      "description": "Staged upload. Its file_id is an upload handle for attachment or discard.",
       "required": ["file_id", "name", "sha256", "size"],
       "properties": {
         "file_id": { "$ref": "#/$defs/OpaqueId" },
@@ -539,6 +544,11 @@ Every write that succeeds answers `200`, or `201` for `POST /v2/files`, with a
     `choice: "seen"` yields `{"kind":"seen"}`. An answer with no matching
     outcome leaves `Terminal.answer` absent. Answers stored before 0.2 on
     UI/1 items keep today's shape-based outcomes.
+- **Upload handle.** `POST /v2/files` returns `FileCreated.file_id`. Use this
+  handle only in a write's `file_ids` (replies, agent sends and revisions) or
+  in `DELETE /v2/files/{id}` to discard an unattached upload. Discarding an
+  attached upload returns `409 already_closed`. To fetch the attached bytes,
+  use the download ID from the resource's `FileRef`.
 - **File name.** `POST /v2/files` requires the name in
   `Content-Disposition: attachment; filename*=UTF-8''<percent-encoded name>`
   (RFC 6266, RFC 5987). A missing or empty name is `400 invalid_field`, with
