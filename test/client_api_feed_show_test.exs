@@ -62,8 +62,7 @@ defmodule AttentionServer.ClientAPIFeedShowTest do
            relay: relay,
            certfile: Path.join(certs, "server.pem"),
            keyfile: Path.join(certs, "server.key"),
-           cacertfile: Path.join(certs, "ca.pem"),
-           routes: [ClientAPI.Reads, ClientAPI.Feed, AttentionServer.AgentAPI.Feed]
+           cacertfile: Path.join(certs, "ca.pem")
          ]},
         id: make_ref()
       )
@@ -258,6 +257,91 @@ defmodule AttentionServer.ClientAPIFeedShowTest do
              Writes.focus(ctx.relay, ctx.reader, %{"screen" => "inbox", "ttl_s" => 120})
 
     assert show_id == show.data["show_id"]
+  end
+
+  test "the enrolled TLS route uses the push grant and delivers one id on focus and SSE", ctx do
+    assert {:ok, origin} =
+             Relay.setup_device_certificate(
+               ctx.relay,
+               "A",
+               TLSFixtures.certificate_der!(ctx.certs, "a2")
+             )
+
+    origin_conn = connect(ctx.port, ctx.certs, "a2")
+    reader_conn = connect(ctx.port, ctx.certs, "a1")
+    {reader_conn, feed} = open_feed(reader_conn, "?after=#{head(ctx.relay)}")
+    {reader_conn, feed} = await_open(reader_conn, feed)
+
+    assert {:ok, %{"items" => [%{"item_id" => item}]}} =
+             ClientAPI.Reads.inbox(ctx.relay, ctx.reader)
+
+    request = %{"item_id" => item, "target" => "chat"}
+    key = "00000000-0000-4000-8000-000000000007"
+
+    {origin_conn, refused} = show_request(origin_conn, key, request)
+    assert refused.status == 403
+    assert body(refused)["error"] == "forbidden"
+
+    # Enable only the existing push switch on the certificate used by the request.
+    :sys.replace_state(ctx.relay, fn state ->
+      put_in(state.store.engine.devices[origin].push_view, true)
+    end)
+
+    rev = head(ctx.relay)
+    {origin_conn, accepted} = show_request(origin_conn, key, request)
+    assert accepted.status == 200
+    assert %{"show_id" => id, "device_id" => reader} = body(accepted)
+    assert reader == ctx.reader
+
+    {reader_conn, feed, received, _} = until_show(reader_conn, feed)
+
+    assert %{event: "show", data: %{"show_id" => ^id, "target" => "chat", "held_ms" => age}} =
+             received
+
+    refute Map.has_key?(received, :id)
+    assert age >= 0
+
+    report = JSON.encode!(%{"screen" => "inbox", "ttl_s" => 120})
+
+    assert {:ok, reader_conn, ref} =
+             Mint.HTTP.request(reader_conn, "PUT", "/v2/devices/me/focus", [], report)
+
+    {reader_conn, focused} = collect(reader_conn, ref)
+    assert focused.status == 200
+    assert %{"show" => %{"show_id" => ^id, "held_ms" => later_age}} = body(focused)
+    assert later_age >= age
+
+    {origin_conn, replay} = show_request(origin_conn, key, request)
+    assert replay.status == 200
+    assert {"idempotent-replayed", "true"} in replay.headers
+    assert body(replay) == body(accepted)
+
+    {origin_conn, conflict} = show_request(origin_conn, key, %{request | "target" => "message"})
+    assert conflict.status == 409
+    assert body(conflict)["error"] == "idempotency_conflict"
+    assert head(ctx.relay) == rev
+
+    Mint.HTTP.close(origin_conn)
+    Mint.HTTP.close(reader_conn)
+    assert feed.status == 200
+  end
+
+  defp show_request(conn, key, request) do
+    assert {:ok, conn, ref} =
+             Mint.HTTP.request(
+               conn,
+               "POST",
+               "/v2/agent/show",
+               [{"idempotency-key", key}],
+               JSON.encode!(request)
+             )
+
+    collect(conn, ref)
+  end
+
+  defp body(response) do
+    assert {:ok, body} = JSON.decode_line(response.body <> "\n")
+    body
   end
 
   test "a show is never in a batch and never replayed on resume", ctx do
