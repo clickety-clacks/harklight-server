@@ -81,6 +81,27 @@ if System.get_env("ATTENTION_SERVER_ENABLE") == "1" do
         nil
     end
 
+  apns =
+    if apns do
+      case System.get_env("ATTENTION_SERVER_APNS_ATTEMPT_TIMEOUT_MS") do
+        nil ->
+          apns
+
+        value ->
+          case Integer.parse(value) do
+            {ms, ""} when ms in 1..4_294_967_295 ->
+              Keyword.put(apns, :attempt_timeout_ms, ms)
+
+            _ ->
+              Logger.warning(
+                "event=harklight_apns_attempt_timeout outcome=default reason=invalid"
+              )
+
+              apns
+          end
+      end
+    end
+
   {deployment_mode, deployment_mode_valid?} =
     case System.get_env("ATTENTION_SERVER_DEPLOYMENT_MODE", "self_hosted") do
       "self_hosted" ->
