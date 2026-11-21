@@ -1,0 +1,125 @@
+defmodule AttentionServer.Store.KeyedMigrationTest do
+  use ExUnit.Case, async: true
+
+  import ExUnit.CaptureLog
+
+  alias AttentionServer.{Engine, Store}
+  alias AttentionServer.Store.{KeyedMigration, RecordCodec, RecordTable}
+  alias Exqlite.Sqlite3
+
+  @moduletag :tmp_dir
+
+  setup %{tmp_dir: directory} do
+    path = Path.join(directory, "relay.sqlite3")
+    assert {:ok, store} = Store.open(path)
+    %{path: path, store: store}
+  end
+
+  test "a legacy store has no keyed state", %{store: store} do
+    assert {:error, :not_keyed} = KeyedMigration.load(store.db)
+    assert :ok = Store.close(store)
+  end
+
+  test "reads verified keyed records at their current generation", %{store: store} do
+    assert {:ok, engine} = Engine.setup_person(store.engine, "reader")
+    assert {:ok, 1} = stage_keyed(store.db, engine, RecordCodec.identity())
+    assert {:ok, ^engine, 1} = KeyedMigration.load(store.db)
+
+    row = RecordCodec.encode_row({:field, :pending_clock_high_water}, 12)
+
+    assert {:ok, :saved} =
+             RecordTable.commit(store.db, 1, [{:put, row}], fn _, _ -> {:ok, :saved} end)
+
+    assert {:ok, %{pending_clock_high_water: 12}, 2} = KeyedMigration.load(store.db)
+    assert :ok = Store.close(store)
+  end
+
+  test "legacy startup names FORMAT30 and leaves the converted database intact", %{
+    path: path,
+    store: store
+  } do
+    assert {:ok, 1} = stage_keyed(store.db, store.engine, RecordCodec.identity())
+    assert :ok = Store.close(store)
+    before_refusal = File.read!(path)
+
+    warning =
+      capture_log(fn ->
+        assert {:error, {:storage_unavailable, {:error, :format30_requires_keyed_mode}}} =
+                 Store.open(path)
+      end)
+
+    assert warning =~ "FORMAT30"
+    assert warning =~ "restore the pre-upgrade backup"
+    assert File.read!(path) == before_refusal
+  end
+
+  test "checks the producing OTP major before reading records", %{store: store} do
+    {codec, current} = RecordCodec.identity()
+    different = "another OTP major"
+    assert {:ok, 1} = stage_keyed(store.db, store.engine, {codec, different})
+    assert :ok = Sqlite3.execute(store.db, "DROP TABLE relay_records")
+
+    assert {:error, {:unsupported_otp_major, ^different, ^current}} =
+             KeyedMigration.load(store.db)
+
+    assert :ok = Store.close(store)
+  end
+
+  test "rejects an anchor checksum or a generation older than the anchor", %{store: store} do
+    assert {:ok, 1} = stage_keyed(store.db, store.engine, RecordCodec.identity())
+    assert :ok = Sqlite3.execute(store.db, "UPDATE relay_record_generation SET generation = 0")
+    assert {:error, :invalid_state} = KeyedMigration.load(store.db)
+
+    assert :ok = Sqlite3.execute(store.db, "UPDATE relay_record_generation SET generation = 1")
+    assert :ok = Sqlite3.execute(store.db, "UPDATE relay_state SET checksum = zeroblob(32)")
+    assert {:error, :invalid_state} = KeyedMigration.load(store.db)
+    assert :ok = Store.close(store)
+  end
+
+  test "a fresh VM can decode the keyed anchor before application startup", %{
+    path: path,
+    store: store
+  } do
+    assert {:ok, 1} = stage_keyed(store.db, store.engine, RecordCodec.identity())
+    assert :ok = Store.close(store)
+
+    script = """
+    path = System.fetch_env!("KEYED_COLD_OPEN_TEST_PATH")
+    {:ok, db} = Exqlite.Sqlite3.open(path)
+    {:ok, %AttentionServer.Engine{}, 1} = AttentionServer.Store.KeyedMigration.load(db)
+    :ok = Exqlite.Sqlite3.close(db)
+    """
+
+    {output, status} =
+      System.cmd("mix", ["run", "--no-start", "--no-compile", "-e", script],
+        env: [
+          {"MIX_ENV", "test"},
+          {"ERL_FLAGS", "+S 2:2"},
+          {"ATTENTION_SERVER_ENABLE", "0"},
+          {"KEYED_COLD_OPEN_TEST_PATH", path}
+        ],
+        stderr_to_stdout: true
+      )
+
+    assert status == 0, output
+  end
+
+  defp stage_keyed(db, engine, identity) do
+    payload = :erlang.term_to_binary({:attention_relay_keyed_state, 30, identity})
+    digest = :crypto.hash(:sha256, payload)
+
+    RecordTable.transaction(db, fn ->
+      with :ok <- RecordTable.seed(db, 1, RecordCodec.encode(engine)),
+           {:ok, statement} <-
+             Sqlite3.prepare(db, "UPDATE relay_state SET version = 1, payload = ?, checksum = ?") do
+        try do
+          with :ok <- Sqlite3.bind(statement, [{:blob, payload}, {:blob, digest}]),
+               :done <- Sqlite3.step(db, statement),
+               do: {:ok, 1}
+        after
+          Sqlite3.release(db, statement)
+        end
+      end
+    end)
+  end
+end
