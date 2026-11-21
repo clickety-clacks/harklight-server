@@ -30,7 +30,13 @@ defmodule AttentionServer.ClientAPI.Uploads do
       at_ms INTEGER NOT NULL
     )
     """,
-    "CREATE INDEX IF NOT EXISTS client_staged_files_at ON client_staged_files (at_ms)"
+    "CREATE INDEX IF NOT EXISTS client_staged_files_at ON client_staged_files (at_ms)",
+    """
+    CREATE TABLE IF NOT EXISTS client_staged_file_owners (
+      file_id TEXT PRIMARY KEY NOT NULL REFERENCES client_staged_files(file_id) ON DELETE CASCADE,
+      owner_key TEXT NOT NULL
+    )
+    """
   ]
 
   @type staged :: %{
@@ -62,7 +68,15 @@ defmodule AttentionServer.ClientAPI.Uploads do
   @doc "Moves a fully written temporary file into place and records it."
   @spec stage(struct(), String.t(), map(), String.t()) ::
           {:ok, String.t()} | {:error, term()}
-  def stage(%AttentionServer.Store{change_log: true, db: db} = store, person, meta, tmp_path) do
+  def stage(store, person, meta, tmp_path, owner \\ nil)
+
+  def stage(
+        %AttentionServer.Store{change_log: true, db: db} = store,
+        person,
+        meta,
+        tmp_path,
+        owner
+      ) do
     file_id = "fs" <> Base.url_encode64(:crypto.strong_rand_bytes(18), padding: false)
     now = System.system_time(:millisecond)
 
@@ -76,7 +90,8 @@ defmodule AttentionServer.ClientAPI.Uploads do
              "INSERT INTO client_staged_files (file_id, person_id, name, content_type, size, sha256, at_ms) " <>
                "VALUES (?, ?, ?, ?, ?, ?, ?)",
              [file_id, person, meta.name, meta.content_type, meta.size, meta.sha256, now]
-           ) do
+           ),
+         :ok <- remember_owner(db, file_id, owner) do
       {:ok, file_id}
     else
       {:error, :disabled} = error -> error
@@ -84,7 +99,7 @@ defmodule AttentionServer.ClientAPI.Uploads do
     end
   end
 
-  def stage(%AttentionServer.Store{}, _person, _meta, _tmp_path), do: {:error, :disabled}
+  def stage(%AttentionServer.Store{}, _person, _meta, _tmp_path, _owner), do: {:error, :disabled}
 
   @doc "The person's staged file, if it exists and is retained."
   @spec fetch(struct(), String.t(), String.t()) ::
@@ -127,6 +142,37 @@ defmodule AttentionServer.ClientAPI.Uploads do
 
   def fetch(%AttentionServer.Store{change_log: true}, _person, _file_id), do: {:error, :not_found}
   def fetch(%AttentionServer.Store{}, _person, _file_id), do: {:error, :disabled}
+
+  @doc false
+  def fetch_owned(store, {person, owner}, file_id) do
+    with {:ok, file} <- fetch(store, person, file_id),
+         {:ok, [^owner]} <-
+           one(store.db, "SELECT owner_key FROM client_staged_file_owners WHERE file_id = ?", [
+             file_id
+           ]) do
+      {:ok, file}
+    else
+      {:ok, _} -> {:error, :not_found}
+      error -> error
+    end
+  end
+
+  @doc false
+  def discard(store, %{file_id: id, path: path}) do
+    with :ok <- run(store.db, "DELETE FROM client_staged_files WHERE file_id = ?", [id]) do
+      File.rm(path)
+      :ok
+    end
+  end
+
+  defp remember_owner(_db, _id, nil), do: :ok
+
+  defp remember_owner(db, id, owner),
+    do:
+      run(db, "INSERT INTO client_staged_file_owners (file_id, owner_key) VALUES (?, ?)", [
+        id,
+        owner
+      ])
 
   defp prune(db, dir, before_ms) do
     with {:ok, rows} <-

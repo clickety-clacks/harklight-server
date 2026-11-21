@@ -210,6 +210,7 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
 
     test "send creates one server-issued item and only successes consume a key", ctx do
       path = "/v2/agent/messages"
+
       body = %{
         "sender" => "app:test",
         "session" => @first_session,
@@ -227,7 +228,10 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
 
       replay = request(ctx, "a1", "POST", path, body, 1)
       assert replay.status == 200
-      assert List.keyfind(replay.headers, "idempotent-replayed", 0) == {"idempotent-replayed", "true"}
+
+      assert List.keyfind(replay.headers, "idempotent-replayed", 0) ==
+               {"idempotent-replayed", "true"}
+
       assert replay.body == sent.body
 
       changed = put_in(body["message"]["title"], "Different intent")
@@ -235,7 +239,9 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
 
       other_key = request(ctx, "a2", "POST", path, body, 1)
       assert other_key.status == 200
-      refute contract(ctx, "AgentWriteResult", other_key)["message"]["item_id"] == message["item_id"]
+
+      refute contract(ctx, "AgentWriteResult", other_key)["message"]["item_id"] ==
+               message["item_id"]
     end
 
     test "revise uses If-Match, advances revision, and replays before checking it", ctx do
@@ -244,6 +250,7 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
       body = %{"message" => %{"title" => "Updated", "created_at" => 1}}
 
       assert_error(request(ctx, "a1", "PUT", path, body, 2), 412, "precondition_failed")
+
       assert_error(
         request(ctx, "a1", "PUT", path, body, 2, [{"if-match", ~s("2")}]),
         412,
@@ -266,14 +273,26 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
     test "lifecycle stamps the transition and already_closed applies to a repeat", ctx do
       id = forward(ctx, "a1", 1, nil)
       path = "/v2/agent/messages/" <> id <> "/lifecycle"
-      assert_error(request(ctx, "a1", "POST", path, %{"action" => "retracted"}, 2), 400, "invalid_field")
+
+      assert_error(
+        request(ctx, "a1", "POST", path, %{"action" => "retracted"}, 2),
+        400,
+        "invalid_field"
+      )
 
       response = request(ctx, "a1", "POST", path, %{"action" => "cleared"}, 2)
       assert response.status == 200
+
       assert %{"message" => %{"terminal" => %{"state" => "cleared", "at_ms" => at_ms}}} =
                contract(ctx, "AgentWriteResult", response)
+
       assert abs(System.system_time(:millisecond) - at_ms) < 60_000
-      assert_error(request(ctx, "a1", "POST", path, %{"action" => "expired"}, 3), 409, "already_closed")
+
+      assert_error(
+        request(ctx, "a1", "POST", path, %{"action" => "expired"}, 3),
+        409,
+        "already_closed"
+      )
     end
 
     test "correlated retract marks the person's turn acted without recording handoff", ctx do
@@ -299,7 +318,10 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
       id = forward(ctx, "a1", 1, @first_session)
       received = person_reply(ctx, id, 2)
       item = "/v2/agent/messages/" <> id
-      answer = request(ctx, "a2", "POST", "/v2/items/" <> id <> "/answer", %{"request_revision" => 1}, 3)
+
+      answer =
+        request(ctx, "a2", "POST", "/v2/items/" <> id <> "/answer", %{"request_revision" => 1}, 3)
+
       assert answer.status == 200
 
       for {n, body} <- [
@@ -309,17 +331,431 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
           ] do
         response = request(ctx, "a1", "POST", item <> "/replies", body, n)
         assert response.status == 200
+
         assert %{"entry" => %{"kind" => "reply", "author" => "origin"}} =
                  contract(ctx, "AgentWriteResult", response)
       end
 
       sessionless = forward(ctx, "a1", 7, nil)
+
       assert_error(
-        request(ctx, "a1", "POST", "/v2/agent/messages/" <> sessionless <> "/replies", %{"text" => "No chat"}, 8),
+        request(
+          ctx,
+          "a1",
+          "POST",
+          "/v2/agent/messages/" <> sessionless <> "/replies",
+          %{"text" => "No chat"},
+          8
+        ),
         400,
         "unsupported"
       )
     end
+  end
+
+  describe "agent results, receipts and session end" do
+    @describetag :agent_receipts
+
+    test "the message receipt and result require a session and an answer in that order", ctx do
+      for {n, session, status, token} <- [
+            {1, nil, 400, "unsupported"},
+            {2, @first_session, 409, "not_answered"}
+          ] do
+        id = forward(ctx, "a1", n, session)
+        path = "/v2/agent/messages/" <> id
+
+        assert_error(
+          request(ctx, "a1", "POST", path <> "/receipt", %{"outcome" => "handed"}, n + 2),
+          status,
+          token
+        )
+
+        assert_error(
+          request(ctx, "a1", "POST", path <> "/result", %{"status" => "received"}, n + 4),
+          status,
+          token
+        )
+      end
+    end
+
+    test "answer receipt ensures delivery and a result marks the answer acted", ctx do
+      id = forward(ctx, "a1", 1, @first_session)
+      item = "/v2/agent/messages/" <> id
+
+      answer =
+        request(
+          ctx,
+          "a2",
+          "POST",
+          "/v2/items/" <> id <> "/answer",
+          %{"request_revision" => 1, "comment" => "Person answer"},
+          2
+        )
+
+      assert answer.status == 200
+
+      receipt =
+        request(
+          ctx,
+          "a1",
+          "POST",
+          item <> "/receipt",
+          %{"outcome" => "handed", "agent" => "fixture"},
+          3
+        )
+
+      assert receipt.status == 200
+
+      assert %{
+               "status" => "recorded",
+               "stage_outcome" => "handed",
+               "message" => %{
+                 "terminal" => %{"delivery" => %{"delivered" => true, "agent" => "fixture"}}
+               }
+             } = contract(ctx, "AgentReceiptResult", receipt)
+
+      result = request(ctx, "a1", "POST", item <> "/result", %{"status" => "applied"}, 4)
+      assert result.status == 200
+
+      assert %{
+               "message" => %{
+                 "result" => %{"status" => "applied"},
+                 "terminal" => %{"delivery" => %{"acted" => true}}
+               },
+               "entry" => %{"kind" => "result"}
+             } = contract(ctx, "AgentWriteResult", result)
+
+      assert_error(
+        request(ctx, "a1", "POST", item <> "/result", %{"status" => "received"}, 5),
+        409,
+        "already_closed"
+      )
+    end
+
+    test "chat receipt applies only to the scoped person turn", ctx do
+      id = forward(ctx, "a1", 1, @first_session)
+      entry = person_reply(ctx, id, 2)
+      path = "/v2/agent/messages/" <> id <> "/entries/" <> entry <> "/receipt"
+      body = %{"outcome" => "not_handed", "reason" => "Fixture declined"}
+      assert_error(request(ctx, "a2", "POST", path, body, 3), 404, "not_found")
+
+      first = request(ctx, "a1", "POST", path, body, 3)
+      assert first.status == 200
+
+      assert %{"entry" => %{"delivery" => %{"delivered" => true, "outcome" => "not_handed"}}} =
+               contract(ctx, "AgentReceiptResult", first)
+
+      rescued = request(ctx, "a1", "POST", path, %{"outcome" => "handed", "rerouted" => true}, 4)
+
+      assert %{"status" => "recorded", "stage_outcome" => "handed"} =
+               contract(ctx, "AgentReceiptResult", rescued)
+
+      already = request(ctx, "a1", "POST", path, body, 5)
+
+      assert %{"status" => "superseded", "stage_outcome" => "handed"} =
+               contract(ctx, "AgentReceiptResult", already)
+    end
+
+    test "ending a session is scoped and leaves the conversation open", ctx do
+      id = forward(ctx, "a1", 1, @first_session)
+      path = "/v2/agent/sessions/" <> @first_session <> "/end"
+      assert_error(request(ctx, "a2", "POST", path, %{}, 2), 404, "not_found")
+      ended = request(ctx, "a1", "POST", path, %{}, 2)
+      assert ended.status == 200
+      item = "/v2/agent/messages/" <> id
+
+      assert %{"message" => %{"availability" => %{"state" => "gone"}}} =
+               contract(ctx, "SentMessageResponse", get(ctx, "a1", item))
+
+      assert request(ctx, "a1", "POST", item <> "/replies", %{"text" => "After end"}, 3).status ==
+               200
+    end
+  end
+
+  describe "agent files" do
+    @describetag :agent_files
+
+    test "upload handles are scoped, attach to file-only replies, and give distinct download IDs",
+         ctx do
+      id = forward(ctx, "a1", 1, @first_session)
+      characters = "file contents"
+      upload = upload(ctx, "a1", 2, characters)
+      assert upload.status == 201
+      handle = contract(ctx, "FileCreated", upload)["file_id"]
+      path = "/v2/files/" <> handle
+      assert_error(get(ctx, "a1", path), 404, "not_found")
+      assert_error(request(ctx, "a2", "DELETE", path, %{}, 3), 404, "not_found")
+
+      sent =
+        request(
+          ctx,
+          "a1",
+          "POST",
+          "/v2/agent/messages/" <> id <> "/replies",
+          %{"file_ids" => [handle]},
+          4
+        )
+
+      assert sent.status == 200
+
+      assert %{"entry" => %{"files" => [%{"file_id" => download}]}} =
+               contract(ctx, "AgentWriteResult", sent)
+
+      refute handle == download
+      file = get(ctx, "a1", "/v2/files/" <> download)
+      assert file.status == 200
+      assert file.body == characters
+      assert_error(request(ctx, "a1", "DELETE", path, %{}, 5), 409, "already_closed")
+    end
+
+    test "file-use preserves transfer failure, duplicate and conflict outcomes", ctx do
+      item_id = forward(ctx, "a1", 1, @first_session)
+      item = "/v2/agent/messages/" <> item_id
+      handle = contract(ctx, "FileCreated", upload(ctx, "a2", 2, "person attachment"))["file_id"]
+
+      reply =
+        request(
+          ctx,
+          "a2",
+          "POST",
+          "/v2/items/" <> item_id <> "/replies",
+          %{"text" => "File for the agent", "file_ids" => [handle]},
+          3
+        )
+
+      assert %{"entry" => %{"entry_id" => entry, "files" => [%{"file_id" => file}]}} =
+               contract(ctx, "WriteResult", reply)
+
+      turn = item <> "/entries/" <> entry
+      use = %{"file_id" => file, "outcome" => "not_transferred", "reason" => "Fixture"}
+      assert_error(request(ctx, "a1", "POST", turn <> "/file-use", use, 4), 404, "not_found")
+
+      assert request(ctx, "a1", "POST", turn <> "/receipt", %{"outcome" => "handed"}, 5).status ==
+               200
+
+      response = request(ctx, "a1", "POST", turn <> "/file-use", use, 4)
+      assert response.status == 200
+
+      assert %{"file_id" => ^file, "outcome" => "not_transferred"} =
+               contract(ctx, "AgentFileUseResult", response)
+
+      assert %{"duplicate" => true} =
+               contract(
+                 ctx,
+                 "AgentFileUseResult",
+                 request(ctx, "a1", "POST", turn <> "/file-use", use, 6)
+               )
+
+      assert_error(
+        request(
+          ctx,
+          "a1",
+          "POST",
+          turn <> "/file-use",
+          %{"file_id" => file, "outcome" => "used"},
+          7
+        ),
+        409,
+        "already_closed"
+      )
+    end
+
+    test "the uploader can delete an unattached upload, including idempotent retry", ctx do
+      assert %{"file_id" => handle} =
+               contract(ctx, "FileCreated", upload(ctx, "a1", 1, "discard"))
+
+      path = "/v2/files/" <> handle
+      first = request(ctx, "a1", "DELETE", path, %{}, 2)
+      assert first.status == 204
+      assert first.body == ""
+      replay = request(ctx, "a1", "DELETE", path, %{}, 2)
+      assert replay.status == 204
+
+      assert List.keyfind(replay.headers, "idempotent-replayed", 0) ==
+               {"idempotent-replayed", "true"}
+
+      assert_error(request(ctx, "a1", "DELETE", path, %{}, 3), 404, "not_found")
+    end
+  end
+
+  defp upload(ctx, name, n, data) do
+    headers = [
+      {"content-type", "text/plain"},
+      {"content-length", Integer.to_string(byte_size(data))},
+      {"content-disposition", "attachment; filename*=UTF-8''fixture.txt"},
+      {"idempotency-key", op(n)}
+    ]
+
+    conn = ClientAPIFeedClient.connect(ctx.port, ctx.certs, name)
+    assert {:ok, conn, ref} = Mint.HTTP.request(conn, "POST", "/v2/files", headers, data)
+    {conn, response} = ClientAPIFeedClient.collect(conn, ref)
+    Mint.HTTP.close(conn)
+    response
+  end
+
+  describe "agent focus and show" do
+    @describetag :agent_focus
+
+    test "focus requires see permission and lists only eligible account devices", ctx do
+      id = forward(ctx, "a1", 1, @first_session)
+      report = %{"screen" => "message", "item_id" => id, "ttl_s" => 120}
+      assert request(ctx, "a2", "PUT", "/v2/devices/me/focus", report, 2).status == 200
+
+      assert request(
+               ctx,
+               "b1",
+               "PUT",
+               "/v2/devices/me/focus",
+               %{"screen" => "inbox", "ttl_s" => 120},
+               3
+             ).status == 200
+
+      route = "/v2/agent/focus"
+      assert_error(get(ctx, "a1", route), 403, "forbidden")
+      grant(ctx, "a1", :see_focus)
+
+      assert %{"clients" => [%{"device_id" => key, "screen" => "message", "item_id" => ^id}]} =
+               contract(ctx, "AgentFocus", get(ctx, "a1", route))
+
+      assert key == ctx.keys["a2"]
+    end
+
+    test "push permission alone can hold a show for an explicitly targeted device", ctx do
+      id = forward(ctx, "a1", 1, @first_session)
+      focus = "/v2/devices/me/focus"
+      report = %{"screen" => "inbox", "ttl_s" => 120}
+      assert request(ctx, "a2", "PUT", focus, report, 2).status == 200
+      path = "/v2/agent/show"
+      body = %{"item_id" => id, "target" => "chat", "device_id" => ctx.keys["a2"]}
+      assert_error(request(ctx, "a1", "POST", path, body, 3), 403, "forbidden")
+      grant(ctx, "a1", :push_view)
+
+      blocked = Map.put(body, "device_name", "Ambiguous")
+      assert_error(request(ctx, "a1", "POST", path, blocked, 3), 400, "invalid_field")
+      response = request(ctx, "a1", "POST", path, body, 3)
+      assert response.status == 200
+
+      assert %{"show_id" => show_id, "device_id" => device, "state" => "held"} =
+               contract(ctx, "AgentShowResult", response)
+
+      assert device == ctx.keys["a2"]
+
+      assert %{"show" => %{"show_id" => ^show_id, "item_id" => ^id, "target" => "chat"}} =
+               contract(ctx, "WriteResult", request(ctx, "a2", "PUT", focus, report, 4))
+
+      replay = request(ctx, "a1", "POST", path, body, 3)
+      assert replay.body == response.body
+
+      assert List.keyfind(replay.headers, "idempotent-replayed", 0) ==
+               {"idempotent-replayed", "true"}
+
+      refute Map.has_key?(
+               contract(ctx, "WriteResult", request(ctx, "a2", "PUT", focus, report, 5)),
+               "show"
+             )
+    end
+  end
+
+  defp grant(ctx, name, field) do
+    :sys.replace_state(ctx.relay, fn state ->
+      put_in(state.store.engine.devices[ctx.keys[name]][field], true)
+    end)
+  end
+
+  @tag :agent_advisory
+  test "acknowledges the retained advisory of the scoped sent message", ctx do
+    alias AttentionServer.{BounceDecision, BouncePolicy, Store}
+
+    :sys.replace_state(ctx.relay, fn state ->
+      at = state.clock.()
+      levels = [%{"name" => "Urgent", "lower_bound" => 0, "bounce_after_days" => 1}]
+      {:ok, normalized} = BouncePolicy.normalize_levels(levels)
+
+      {:ok, configured, _} =
+        BounceDecision.configure_levels(state.store.engine, "A", normalized, at)
+
+      {:ok, store} =
+        Store.commit(state.store, configured, %{
+          person: "A",
+          actor: "fixture",
+          action: "configure_fixture"
+        })
+
+      %{state | store: store}
+    end)
+
+    id =
+      frame(ctx, "a1", %{
+        "type" => "forward",
+        "op_id" => op(1),
+        "session_handle" => @first_session,
+        "route" => "claude-code",
+        "cli_version" => "fixture",
+        "unsupported_reason" => nil,
+        "advisory_v1" => true,
+        "message" => %{
+          "sender_id" => "app:test",
+          "message_id" => "advisory-item",
+          "title" => "Needs attention",
+          "message_type" => "fyi",
+          "answer_ui" => %{
+            "schema" => "attention-client.actions/1",
+            "actions" => [
+              %{
+                "id" => "seen",
+                "label" => "Seen",
+                "kind" => "value",
+                "value" => %{"acknowledgment" => "seen"}
+              }
+            ]
+          },
+          "created_at" => 1
+        }
+      })
+      |> then(&Resources.item_id(%{accepted_seq: &1["seq"]}))
+
+    key = {"A", "app:test", "advisory-item"}
+
+    state =
+      :sys.replace_state(ctx.relay, fn state ->
+        engine = state.store.engine
+        at = engine.messages[key].accepted_at
+
+        selected =
+          BounceDecision.record_scores(
+            engine,
+            "A",
+            [
+              %{"sender_id" => "app:test", "message_id" => "advisory-item", "score" => 0.9}
+            ],
+            at
+          )
+
+        next = BounceDecision.evaluate_due(selected, at + 86_400_001)
+
+        {:ok, store} =
+          Store.commit(state.store, next, %{
+            person: "A",
+            actor: "fixture",
+            action: "advisory_fixture"
+          })
+
+        %{state | store: store}
+      end)
+
+    feed = state.store.engine.advisory_feeds[{"A", ctx.keys["a1"], @first_session}]
+    assert %{"advisory_id" => advisory_id} = feed.entries[1]
+    path = "/v2/agent/messages/" <> id <> "/advisories/ack"
+    body = %{"advisory_id" => advisory_id}
+    assert_error(request(ctx, "a2", "POST", path, body, 2), 404, "not_found")
+    first = request(ctx, "a1", "POST", path, body, 2)
+    assert first.status == 200
+
+    assert %{"delivered" => true, "already_delivered" => false} =
+             contract(ctx, "AgentAdvisoryAckResult", first)
+
+    assert %{"already_delivered" => true} =
+             contract(ctx, "AgentAdvisoryAckResult", request(ctx, "a1", "POST", path, body, 3))
   end
 
   defp person_reply(ctx, id, n) do

@@ -284,11 +284,16 @@ defmodule AttentionServer.Conversation do
 
   def ack(_, _, _, _, _), do: {:error, :not_found}
 
-  def file_use(engine, person, origin, feed_seq, name, outcome)
+  def file_use(engine, person, origin, feed_seq, name, outcome, v2? \\ false)
+
+  def file_use(engine, person, origin, feed_seq, name, outcome, v2?)
       when is_integer(feed_seq) and feed_seq > 0 and is_binary(name) do
     key = {person, origin, feed_seq}
     entry = get_in(engine.origin_feeds, [{person, origin}, :entries, feed_seq])
-    receipt = Map.get(engine.origin_receipts, key)
+
+    receipt =
+      Map.get(engine.origin_receipts, key) ||
+        if(v2?, do: receipt_from_delivery(engine, person, origin, entry))
 
     cond do
       is_nil(receipt) or is_nil(entry) ->
@@ -297,7 +302,8 @@ defmodule AttentionServer.Conversation do
       not Enum.any?(Map.get(entry, "files", []), &(&1["name"] == name)) ->
         {:error, :not_found}
 
-      not ConversationFiles.valid_use?(outcome) ->
+      not ConversationFiles.valid_use?(outcome) or
+          (outcome["status"] == "not_transferred" and not v2?) ->
         {:error, :file_use}
 
       true ->
@@ -326,7 +332,19 @@ defmodule AttentionServer.Conversation do
     end
   end
 
-  def file_use(_, _, _, _, _, _), do: {:error, :not_found}
+  def file_use(_, _, _, _, _, _, _), do: {:error, :not_found}
+
+  defp receipt_from_delivery(engine, person, origin, %{"author" => "person"} = entry) do
+    case AttentionServer.Engine.delivery_ack_fact(engine, person, origin, entry, :ack1) do
+      %{"at_ms" => at} ->
+        %{delivered_at: at, transfers: %{}, uses: %{}, implicit_ack: true}
+
+      _ ->
+        nil
+    end
+  end
+
+  defp receipt_from_delivery(_engine, _person, _origin, _entry), do: nil
 
   def actionable?(%{"kind" => kind, "author" => author}),
     do: kind in ["discussion", "terminal"] and author != "origin"
@@ -408,7 +426,7 @@ defmodule AttentionServer.Conversation do
             request_key = {person, entry["sender_id"], entry["message_id"]}
             record = Map.get(engine.messages, request_key)
 
-            if (entry["session_handle"] == handle and record) && record.origin == origin and
+            if ((entry["session_handle"] == handle and record) && record.origin == origin) and
                  (is_nil(record.terminal) or
                     (actionable?(entry) and needs_action?(engine, person, entry) and
                        not Map.has_key?(engine.origin_actions, {person, origin, seq}))) do
@@ -626,7 +644,7 @@ defmodule AttentionServer.Conversation do
         entry = get_in(engine.origin_feeds, [{person, origin}, :entries, seq])
 
         actionable?(entry) and is_integer(receipt.delivered_at) and receipt.delivered_at > 0 and
-          ConversationFiles.valid_transfer_state?(entry, Map.get(receipt, :transfers, %{})) and
+          valid_receipt_transfers?(engine, person, origin, entry, receipt) and
           is_map(Map.get(receipt, :uses, %{})) and
           Enum.all?(Map.get(receipt, :uses, %{}), fn {name, outcome} ->
             Enum.any?(Map.get(entry, "files", []), &(&1["name"] == name)) and
@@ -640,4 +658,18 @@ defmodule AttentionServer.Conversation do
   rescue
     _ -> false
   end
+
+  defp valid_receipt_transfers?(
+         engine,
+         person,
+         origin,
+         entry,
+         %{implicit_ack: true, transfers: %{}} = receipt
+       ) do
+    map_size(receipt.transfers) == 0 and
+      is_map(AttentionServer.Engine.delivery_ack_fact(engine, person, origin, entry, :ack1))
+  end
+
+  defp valid_receipt_transfers?(_engine, _person, _origin, entry, receipt),
+    do: ConversationFiles.valid_transfer_state?(entry, Map.get(receipt, :transfers, %{}))
 end

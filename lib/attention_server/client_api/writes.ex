@@ -405,9 +405,9 @@ defmodule AttentionServer.ClientAPI.Writes do
 
   # Each staged file is uploaded to the reply's message through today's
   # upload path, under the reply's operation, then named in its frame.
-  defp attach_files(_relay, _engine_key, frame, []), do: {:ok, frame}
+  def attach_files(_relay, _engine_key, frame, []), do: {:ok, frame}
 
-  defp attach_files(relay, engine_key, frame, staged) do
+  def attach_files(relay, engine_key, frame, staged) do
     Enum.reduce_while(staged, {:ok, []}, fn file, {:ok, acc} ->
       attrs = %{
         "op_id" => frame["op_id"],
@@ -415,7 +415,8 @@ defmodule AttentionServer.ClientAPI.Writes do
         "message_id" => frame["message_id"],
         "revision" => frame["request_revision"],
         "name" => file.name,
-        client_api_v2_content_type: file.content_type
+        client_api_v2_content_type: file.content_type,
+        client_api_v2_upload_handle: file.file_id
       }
 
       case upload(relay, engine_key, attrs, file) do
@@ -501,7 +502,8 @@ defmodule AttentionServer.ClientAPI.Writes do
   def handle_call({:begin, who, key, digest, operation}, from, state) do
     reply =
       with {:ok, principal} <- principal(state.store.engine, who),
-           {:ok, nil} <- stored(state, principal.person, key, digest, who, from),
+           {:ok, nil} <-
+             stored(state, receipt_scope(principal, operation), key, digest, who, from),
            :ok <- precondition(state, who, principal, operation),
            {:ok, frame} <- frame(state.store.engine, principal, key, operation),
            {:ok, staged} <- staged_files(state, principal, operation) do
@@ -523,7 +525,7 @@ defmodule AttentionServer.ClientAPI.Writes do
           {:ok, reply} ->
             result = render(operation, who, principal.person, reply, from, state)
             receipt = receipt(operation, reply, result)
-            remember(state, principal.person, key, digest, result, receipt)
+            remember(state, receipt_scope(principal, operation), key, digest, result, receipt)
 
           error ->
             error
@@ -532,6 +534,11 @@ defmodule AttentionServer.ClientAPI.Writes do
 
     {:reply, reply, state}
   end
+
+  defp receipt_scope(%{kind: :device, person: person, engine_key: device}, {:file, _, _}),
+    do: Idempotency.agent_scope(person, device)
+
+  defp receipt_scope(principal, _operation), do: principal.person
 
   defp stored(_state, _person, nil, _digest, _who, _from), do: {:ok, nil}
 
@@ -611,8 +618,10 @@ defmodule AttentionServer.ClientAPI.Writes do
   defp render({:answer, item_id, _revision, _value}, who, _person, _reply, from, state),
     do: render_item(item_id, who, from, state)
 
-  defp render({:file, meta, tmp_path}, _who, person, _reply, _from, state) do
-    case Uploads.stage(state.store, person, meta, tmp_path) do
+  defp render({:file, meta, tmp_path}, who, person, _reply, _from, state) do
+    owner = if match?(%{kind: :device}, who), do: who.key, else: nil
+
+    case Uploads.stage(state.store, person, meta, tmp_path, owner) do
       {:ok, file_id} ->
         {:ok, 201,
          %{
@@ -1020,7 +1029,7 @@ defmodule AttentionServer.ClientAPI.Writes do
 
   ## HTTP helpers
 
-  defp required_key(conn) do
+  def required_key(conn) do
     case get_req_header(conn, "idempotency-key") do
       [key] ->
         if Idempotency.valid_key?(key),
@@ -1032,7 +1041,7 @@ defmodule AttentionServer.ClientAPI.Writes do
     end
   end
 
-  defp optional_key(conn) do
+  def optional_key(conn) do
     case get_req_header(conn, "idempotency-key") do
       [] -> {:ok, nil}
       _ -> required_key(conn)
@@ -1272,8 +1281,8 @@ defmodule AttentionServer.ClientAPI.Writes do
     end
   end
 
-  defp device_only(%{kind: :device}), do: :ok
-  defp device_only(_principal), do: {:error, "forbidden", nil}
+  def device_only(%{kind: :device}), do: :ok
+  def device_only(_principal), do: {:error, "forbidden", nil}
 
   defp file_ids(body) do
     case Map.get(body, "file_ids", []) do
@@ -1306,17 +1315,17 @@ defmodule AttentionServer.ClientAPI.Writes do
     end
   end
 
-  defp only_members(body, allowed) do
+  def only_members(body, allowed) do
     case Enum.find(Map.keys(body), &(&1 not in allowed)) do
       nil -> :ok
       member -> {:error, "invalid_field", member}
     end
   end
 
-  defp respond(conn, {:ok, status, body, replayed?}),
+  def respond(conn, {:ok, status, body, replayed?}),
     do: conn |> replayed(replayed?) |> Errors.send_json(status, body)
 
-  defp respond(conn, {:error, token, field, replayed?}),
+  def respond(conn, {:error, token, field, replayed?}),
     do: conn |> replayed(replayed?) |> Errors.send_error(token, field: field)
 
   defp replayed(conn, true), do: put_resp_header(conn, "idempotent-replayed", "true")

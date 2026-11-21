@@ -2766,10 +2766,11 @@ defmodule AttentionServer.Engine do
   end
 
   @doc "One origin-session file-use report after a delivered person turn."
-  def origin_file_use(%__MODULE__{} = engine, key, feed_seq, name, outcome, op_id) do
+  def origin_file_use(%__MODULE__{} = engine, key, feed_seq, name, outcome, op_id, v2? \\ false) do
     with {:ok, person} <- authorized_person(engine, key),
          true <- Message.uuid?(op_id),
-         {:ok, next, reply} <- Conversation.file_use(engine, person, key, feed_seq, name, outcome) do
+         {:ok, next, reply} <-
+           Conversation.file_use(engine, person, key, feed_seq, name, outcome, v2?) do
       if next == engine do
         {:ok, next, reply}
       else
@@ -4036,6 +4037,11 @@ defmodule AttentionServer.Engine do
           files_by_revision: %{1 => files}
         }
 
+        record =
+          if frame["agent_api_v2"] == true,
+            do: Map.put(record, :agent_api_v2, true),
+            else: record
+
         fields =
           if record.session_handle,
             do: %{"seq" => seq, "revision" => 1, "session_handle" => record.session_handle},
@@ -4820,7 +4826,7 @@ defmodule AttentionServer.Engine do
          :ok <- valid_global_id(frame),
          {:ok, files} <- ConversationFiles.normalize(frame, engine, person, actor),
          {:ok, frame} <- conversation_text(frame, files),
-         true <- is_integer(frame["in_reply_to"]) and frame["in_reply_to"] > 0,
+         true <- valid_reply_target?(frame),
          true <- is_integer(frame["request_revision"]) and frame["request_revision"] > 0 do
       semantic =
         frame
@@ -4846,17 +4852,9 @@ defmodule AttentionServer.Engine do
         failure("not_origin")
 
       %{origin: ^actor, session_handle: handle} when is_binary(handle) ->
-        with {:ok, %{"kind" => "discussion", "request_revision" => revision} = acted_turn} <-
-               Conversation.person_entry(engine, person, actor, frame["in_reply_to"], key),
-             true <- revision == frame["request_revision"],
-             {:ok, acted, first_reply?} <-
-               conversation_act_for_reply(
-                 engine,
-                 person,
-                 actor,
-                 frame["in_reply_to"],
-                 frame["op_id"]
-               ) do
+        revision = frame["request_revision"]
+
+        with {:ok, acted, acted_turn} <- reply_target(engine, person, actor, key, frame) do
           {next, seq} = next_conversation_seq(acted, person)
           {next, arrival} = next_free_order(next, person)
 
@@ -4868,11 +4866,15 @@ defmodule AttentionServer.Engine do
               "message_id" => frame["message_id"],
               "session_handle" => handle,
               "request_revision" => revision,
-              "in_reply_to" => Integer.to_string(frame["in_reply_to"]),
               "op_id" => frame["op_id"],
               "text" => frame["text"]
             }
             |> ConversationFiles.put_entry(files)
+            |> then(fn entry ->
+              if is_integer(frame["in_reply_to"]),
+                do: Map.put(entry, "in_reply_to", Integer.to_string(frame["in_reply_to"])),
+                else: entry
+            end)
 
           {next, feed_entry} = Conversation.append_entry(next, person, actor, entry)
           fields = %{"seq" => seq, "event_id" => feed_entry["event_id"]}
@@ -4887,7 +4889,7 @@ defmodule AttentionServer.Engine do
           # Further replies to the same person event are accepted; only the
           # first one records the event as acted on.
           next =
-            if first_reply? do
+            if acted_turn do
               {next, _acted_seq} =
                 append_acted_fact(
                   next,
@@ -4906,7 +4908,7 @@ defmodule AttentionServer.Engine do
 
           {:ok, next, fields}
         else
-          false -> failure("stale_revision")
+          {:error, :stale_revision} -> failure("stale_revision")
           {:error, :inactive_account} -> failure("inactive_account")
           _ -> failure("not_found")
         end
@@ -4916,6 +4918,34 @@ defmodule AttentionServer.Engine do
 
       _ ->
         failure("not_found")
+    end
+  end
+
+  defp valid_reply_target?(%{"agent_api_v2" => true} = frame)
+       when not is_map_key(frame, "in_reply_to"),
+       do: true
+
+  defp valid_reply_target?(%{"in_reply_to" => seq}), do: is_integer(seq) and seq > 0
+  defp valid_reply_target?(_), do: false
+
+  defp reply_target(engine, person, _actor, _key, %{"agent_api_v2" => true} = frame)
+       when not is_map_key(frame, "in_reply_to") do
+    with :ok <- delivery_allowed(engine, person), do: {:ok, engine, nil}
+  end
+
+  defp reply_target(engine, person, actor, key, frame) do
+    seq = frame["in_reply_to"]
+
+    with {:ok, %{"kind" => "discussion", "request_revision" => revision} = turn} <-
+           Conversation.person_entry(engine, person, actor, seq, key),
+         true <- revision == frame["request_revision"],
+         {:ok, acted, first?} <-
+           conversation_act_for_reply(engine, person, actor, seq, frame["op_id"]) do
+      {:ok, acted, if(first?, do: turn)}
+    else
+      false -> {:error, :stale_revision}
+      {:error, _} = error -> error
+      _ -> {:error, :not_found}
     end
   end
 
