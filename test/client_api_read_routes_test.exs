@@ -67,7 +67,7 @@ defmodule AttentionServer.ClientAPIReadRoutesTest do
       assert {:ok, %{"type" => "ok"}} = JSON.decode_line(line)
     end
 
-    %{relay: relay, reader: reader, der: der}
+    %{relay: relay, reader: reader, der: der, flags: flags}
   end
 
   defp op(n), do: "00000000-0000-4000-8000-#{String.pad_leading(Integer.to_string(n), 12, "0")}"
@@ -213,5 +213,51 @@ defmodule AttentionServer.ClientAPIReadRoutesTest do
       |> Router.call(opts)
 
     assert stranger.status == 401
+  end
+
+  test "me reports the account, the operator's client features and the published limits", ctx do
+    me = Reads.get_me(get("/v2/me"), ctx(ctx))
+    assert me.status == 200
+    body = body(me)
+
+    defs =
+      AttentionServer.ClientAPISchema.contract_defs(
+        Path.expand("../docs/client-api-v2.md", __DIR__)
+      )
+
+    assert AttentionServer.ClientAPISchema.errors(defs, "Me", body) == []
+
+    assert body["account"] == %{"state" => "active"}
+
+    assert body["features"] == %{
+             "server_matched_push_routing" => false,
+             "priority_level_editing" => false
+           }
+
+    assert body["limits"]["answer_ui_limits"] == AttentionServer.UI1.published_limits()
+
+    assert body["limits"]["inline_decoded_bytes_per_entry"] ==
+             AttentionServer.ConversationFiles.inline_limit()
+
+    assert body["limits"]["retention_days"] == 30
+
+    assert body["limits"]["upload_cap_bytes_per_file"] == "none" or
+             is_integer(body["limits"]["upload_cap_bytes_per_file"])
+
+    File.write!(
+      ctx.flags,
+      ~s({"client_api_v2":true,"priority_level_editing":true,"progress_inbox":true})
+    )
+
+    assert %{"features" => features} = body(Reads.get_me(get("/v2/me"), ctx(ctx)))
+    assert features == %{"server_matched_push_routing" => false, "priority_level_editing" => true}
+
+    :sys.replace_state(ctx.relay, fn state ->
+      engine = state.store.engine
+      stopped = %{engine | delivery_states: Map.put(engine.delivery_states, "A", "STOPPED")}
+      %{state | store: %{state.store | engine: stopped}}
+    end)
+
+    assert %{"account" => %{"state" => "paused"}} = body(Reads.get_me(get("/v2/me"), ctx(ctx)))
   end
 end

@@ -20,8 +20,22 @@ defmodule AttentionServer.ClientAPI.Reads do
 
   import Plug.Conn
 
-  alias AttentionServer.{ChangeLog, Engine, JSON, LargeData, Relay}
+  alias AttentionServer.{
+    ChangeLog,
+    ConversationFiles,
+    Engine,
+    FeatureFlags,
+    JSON,
+    LargeData,
+    Relay,
+    UI1
+  }
+
   alias AttentionServer.ClientAPI.{Context, Errors, Resources}
+
+  # The client features still behind an operator flag at 0.2 (contract §4).
+  @client_features ~w(server_matched_push_routing priority_level_editing)
+  @retention_days 30
 
   @default_limit 50
   @max_limit 200
@@ -36,6 +50,7 @@ defmodule AttentionServer.ClientAPI.Reads do
       {"GET", ["items", :item_id, "entries"], :get_entries},
       {"GET", ["items", :item_id, "revisions", :n], :get_revision},
       {"GET", ["settings"], :get_settings},
+      {"GET", ["me"], :get_me},
       {"GET", ["files", :file_id], :get_file}
     ]
   end
@@ -67,6 +82,9 @@ defmodule AttentionServer.ClientAPI.Reads do
   @doc false
   def get_settings(conn, %Context{} = ctx),
     do: respond(conn, settings(ctx.relay, ctx.principal), &etag(&1["settings"]))
+
+  @doc false
+  def get_me(conn, %Context{} = ctx), do: respond(conn, me(ctx.relay, ctx.principal))
 
   @doc false
   def get_file(conn, %Context{} = ctx) do
@@ -146,6 +164,9 @@ defmodule AttentionServer.ClientAPI.Reads do
 
   @doc "`GET /v2/items/{item_id}/revisions/{n}`: one request revision, 1 to current."
   def revision(relay, key, item_id, n), do: call(relay, {:revision, key, item_id, n})
+
+  @doc "`GET /v2/me`: the account's state, client features and limits."
+  def me(relay, key), do: call(relay, {:me, key})
 
   @doc "`GET /v2/settings`."
   def settings(relay, key), do: call(relay, {:settings, key})
@@ -321,6 +342,32 @@ defmodule AttentionServer.ClientAPI.Reads do
            "older" => length(eligible) > limit
          }}
       end
+    end
+  end
+
+  defp read({:me, key}, state) do
+    engine = state.store.engine
+
+    with {:ok, principal} <- principal(engine, key) do
+      # Read with warnings already given, so a read never logs; the Relay warns
+      # about an unreadable flags file where it reads it for itself.
+      {flags, _warned} = FeatureFlags.read(state.feature_flags_path, true)
+
+      {:ok,
+       %{
+         "account" => %{
+           "state" =>
+             if(Engine.delivery_stopped?(engine, principal.person), do: "paused", else: "active")
+         },
+         "features" => Map.new(@client_features, &{&1, Map.get(flags, &1) == true}),
+         "limits" => %{
+           "upload_cap_bytes_per_file" =>
+             if(state.upload_cap == :none, do: "none", else: state.upload_cap),
+           "inline_decoded_bytes_per_entry" => ConversationFiles.inline_limit(),
+           "answer_ui_limits" => UI1.published_limits(),
+           "retention_days" => @retention_days
+         }
+       }}
     end
   end
 
