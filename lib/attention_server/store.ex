@@ -612,6 +612,32 @@ defmodule AttentionServer.Store do
     end)
   end
 
+  # Name the retained uploads that halt orphan cleanup so an operator can
+  # find and repair them. Only well-formed upload ids are logged.
+  defp log_unavailable_retained_uploads(%__MODULE__{engine: engine, upload_dir: directory}) do
+    unavailable =
+      for {id, _owners} <- KeyedValidation.upload_index(engine),
+          not retained_upload_available?(engine, directory, id),
+          do: id
+
+    {ids, malformed} = Enum.split_with(unavailable, &AttentionServer.Message.uuid_v4?/1)
+
+    Logger.warning(
+      "event=harklight_unavailable_retained_upload retained_uploads=#{length(unavailable)} " <>
+        "malformed_ids=#{length(malformed)} upload_ids=#{ids |> Enum.sort() |> Enum.join(",")}"
+    )
+  end
+
+  defp retained_upload_available?(engine, directory, id) do
+    with true <- AttentionServer.Message.uuid_v4?(id),
+         {:ok, upload} <- Map.fetch(engine.uploads, id),
+         :ok <- verify_upload_size(Path.join(directory, id), upload) do
+      true
+    else
+      _ -> false
+    end
+  end
+
   defp verify_upload_size(path, %{size: size}) do
     case File.stat(path) do
       {:ok, %{type: :regular, size: ^size}} -> :ok
@@ -696,6 +722,7 @@ defmodule AttentionServer.Store do
         # Fetching this attachment already fails independently. Leave files in
         # place while the retained upload inventory cannot be verified.
         Diagnostics.failure(:upload_cleanup, :startup_cleanup, :upload_integrity_mismatch)
+        log_unavailable_retained_uploads(store)
         :ok
 
       {:error, reason} ->

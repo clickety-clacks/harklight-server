@@ -1,6 +1,8 @@
 defmodule AttentionServer.Store.LegacyRevisionUploadsTest do
   use ExUnit.Case, async: true
 
+  import ExUnit.CaptureLog
+
   alias AttentionServer.{JSON, Relay, Store}
   alias AttentionServer.Store.KeyedMigration
   alias Exqlite.Sqlite3
@@ -110,7 +112,9 @@ defmodule AttentionServer.Store.LegacyRevisionUploadsTest do
     orphan = Path.join(Path.dirname(file_path), @orphan)
     File.write!(orphan, "orphan")
 
-    assert {:ok, store} = Store.open(path)
+    {result, log} = with_log(fn -> Store.open(path) end)
+    assert {:ok, store} = result
+    assert log =~ "retained_uploads=1 malformed_ids=0 upload_ids=#{Path.basename(file_path)}"
     assert File.exists?(orphan)
 
     assert KeyedMigration.convert_store(store, fn _, _, generation -> {:ok, generation} end) ==
