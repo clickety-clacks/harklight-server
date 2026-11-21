@@ -8,11 +8,16 @@ defmodule AttentionServer.DashboardHTTPS do
   In `saas` deployment mode no account-owner person is configured, so the
   account-wide view is unreachable; a configured public origin replaces the
   listener's own host and port in links and in the form-origin check.
+
+  With the temporary `client_api_v2` flag on, the listener also serves client
+  API v2 at `/v2` for signed-in browsers and offers HTTP/2 through ALPN. With it
+  off, `/v2` answers 404 and the listener speaks HTTP/1.1 only, as before.
   """
 
   use Supervisor
 
   alias AttentionServer.{
+    ClientAPI,
     DashboardBackend,
     DashboardBrowserSession,
     DashboardReadHTTP,
@@ -28,6 +33,7 @@ defmodule AttentionServer.DashboardHTTPS do
     hosted? = Keyword.get(opts, :deployment_mode, :self_hosted) == :saas
     owner_person = if hosted?, do: nil, else: Keyword.fetch!(opts, :owner_person)
     sessions_name = {:global, {__MODULE__, relay}}
+    client_api_v2 = Keyword.get(opts, :client_api_v2, false) == true
 
     backend = %DashboardBackend{
       relay: relay,
@@ -47,21 +53,29 @@ defmodule AttentionServer.DashboardHTTPS do
       Supervisor.child_spec(
         {Bandit,
          plug:
-           {DashboardReadHTTP,
-            backend: {DashboardBackend, backend},
-            skill_path: Keyword.fetch!(opts, :skill_path),
-            expected_origin: Keyword.get(opts, :public_origin),
-            hosted: hosted?,
-            hosted_addresses: Keyword.get(opts, :hosted_addresses, %{}),
-            hosted_testflight_url: Keyword.get(opts, :hosted_testflight_url),
-            skill_path_saas: Keyword.get(opts, :skill_path_saas),
-            skill_path_core: Keyword.get(opts, :skill_path_core)},
+           {ClientAPI.WebOrigin,
+            [
+              dashboard:
+                {DashboardReadHTTP,
+                 backend: {DashboardBackend, backend},
+                 skill_path: Keyword.fetch!(opts, :skill_path),
+                 expected_origin: Keyword.get(opts, :public_origin),
+                 hosted: hosted?,
+                 hosted_addresses: Keyword.get(opts, :hosted_addresses, %{}),
+                 hosted_testflight_url: Keyword.get(opts, :hosted_testflight_url),
+                 skill_path_saas: Keyword.get(opts, :skill_path_saas),
+                 skill_path_core: Keyword.get(opts, :skill_path_core)},
+              client_api_v2: client_api_v2,
+              relay: relay,
+              backend: {DashboardBackend, backend},
+              expected_origin: Keyword.get(opts, :public_origin)
+            ] ++ client_api_routes(opts)},
          scheme: :https,
          ip: Keyword.fetch!(opts, :ip),
          port: Keyword.fetch!(opts, :port),
          certfile: Keyword.fetch!(opts, :certfile),
          keyfile: Keyword.fetch!(opts, :keyfile),
-         http_2_options: [enabled: false],
+         http_2_options: [enabled: client_api_v2],
          startup_log: false},
         id: :dashboard_listener
       )
@@ -81,5 +95,13 @@ defmodule AttentionServer.DashboardHTTPS do
     kind, reason ->
       Diagnostics.failure(:dashboard_http, :configuration, {kind, reason}, :unavailable)
       :erlang.raise(kind, reason, __STACKTRACE__)
+  end
+
+  # Test seam: client API route modules replacing the router's own.
+  defp client_api_routes(opts) do
+    case Keyword.fetch(opts, :client_api_routes) do
+      {:ok, routes} -> [routes: routes]
+      :error -> []
+    end
   end
 end

@@ -396,7 +396,9 @@ defmodule AttentionServer.DashboardBrowserHTTP do
     end
   end
 
-  defp exact_origin?(conn, opts) do
+  @doc false
+  # Also the client API's write-origin check on the web origin.
+  def exact_origin?(conn, opts) do
     expected = expected_origin(conn, opts)
     get_req_header(conn, "origin") == [expected]
   end

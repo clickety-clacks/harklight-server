@@ -21,6 +21,9 @@ defmodule AttentionServer.DashboardBackend do
   def end_session(%__MODULE__{sessions: sessions}, cookie),
     do: DashboardBrowserSession.end_session(sessions, cookie)
 
+  def browser_context(%__MODULE__{sessions: sessions}, cookie),
+    do: DashboardBrowserSession.context(sessions, cookie)
+
   def open_browser_connection(%__MODULE__{sessions: sessions}, {cookie, recipient, worker}),
     do:
       apply(DashboardBrowserSession, :open_browser_connection, [

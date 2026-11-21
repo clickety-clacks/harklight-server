@@ -2,6 +2,11 @@ defmodule AttentionServer.Server do
   @moduledoc """
   Opt-in supervised Relay, `/relay` WebSocket and separate owner/agent TLS listeners.
 
+  With the temporary `client_api_v2` flag on (read once at startup from the
+  feature-flags file, see docs/feature-flags.md), the device port serves client
+  API v2 (`/v2`) through `ClientAPI.Listener` instead of the `/relay` WebSocket.
+  The two never run together.
+
   Certificate paths and a durable store path are explicit operator config.
   Production deployment remains separate work.
   """
@@ -11,6 +16,7 @@ defmodule AttentionServer.Server do
 
   alias AttentionServer.{
     AgentHTTPS,
+    ClientAPI,
     DashboardHTTPS,
     EnrollmentHTTPS,
     Diagnostics,
@@ -25,7 +31,17 @@ defmodule AttentionServer.Server do
   def start_link(opts), do: Supervisor.start_link(__MODULE__, opts, Keyword.take(opts, [:name]))
 
   def relay(server), do: child(server, :relay)
-  def port(server), do: server |> child(:web_socket) |> WebSocketRelay.port()
+
+  def port(server) do
+    if client_api_v2?(server),
+      do: server |> child(:client_api) |> ClientAPI.Listener.port(),
+      else: server |> child(:web_socket) |> WebSocketRelay.port()
+  end
+
+  @doc "Whether this server started with the `client_api_v2` flag on."
+  def client_api_v2?(server),
+    do: Enum.any?(Supervisor.which_children(server), &match?({:client_api, _, _, _}, &1))
+
   def enroll_port(server), do: server |> child(:enrollment_https) |> EnrollmentHTTPS.port()
   def owner_port(server), do: server |> child(:owner_tls) |> OwnerTLS.port()
   def agent_port(server), do: server |> child(:agent_https) |> AgentHTTPS.port()
@@ -74,6 +90,7 @@ defmodule AttentionServer.Server do
         hosted_configuration(opts, deployment_mode, upload_cap, public_origin)
 
       apns_opts = Keyword.get(opts, :apns)
+      client_api_v2 = client_api_v2_flag(Keyword.get(opts, :feature_flags_path))
 
       relay_opts = [
         name: relay_name,
@@ -117,6 +134,7 @@ defmodule AttentionServer.Server do
         if dashboard_opts do
           dashboard_opts
           |> Keyword.put(:deployment_mode, deployment_mode)
+          |> Keyword.put(:client_api_v2, client_api_v2)
           |> Keyword.put(:public_origin, public_origin)
           |> Keyword.put(:hosted_addresses, hosted_addresses)
           |> Keyword.put(
@@ -176,9 +194,19 @@ defmodule AttentionServer.Server do
         ip: Keyword.get(opts, :origin_ip, {127, 0, 0, 1})
       ]
 
+      device_listener =
+        if client_api_v2 do
+          Supervisor.child_spec(
+            {ClientAPI.Listener, web_opts},
+            id: :client_api
+          )
+        else
+          Supervisor.child_spec({WebSocketRelay, web_opts}, id: :web_socket)
+        end
+
       children = [
         Supervisor.child_spec({Relay, relay_opts}, id: :relay),
-        Supervisor.child_spec({WebSocketRelay, web_opts}, id: :web_socket),
+        device_listener,
         Supervisor.child_spec({OwnerTLS, owner_opts}, id: :owner_tls),
         Supervisor.child_spec({AgentHTTPS, agent_opts}, id: :agent_https)
       ]
@@ -270,6 +298,11 @@ defmodule AttentionServer.Server do
     kind, reason ->
       Diagnostics.failure(:server_startup, :configuration, {kind, reason}, :unavailable)
       :erlang.raise(kind, reason, __STACKTRACE__)
+  end
+
+  defp client_api_v2_flag(feature_flags_path) do
+    {flags, _warned} = AttentionServer.FeatureFlags.read(feature_flags_path, true)
+    Map.get(flags, "client_api_v2") == true
   end
 
   defp normalize_deployment_mode(mode) when mode in [:self_hosted, :saas], do: mode
