@@ -771,7 +771,7 @@ visible text. Its `attention` member changes:
       "required": ["error", "retryable", "request_id"],
       "properties": {
         "error": { "enum": ["not_found", "invalid_field", "stale_request", "already_answered",
-                            "already_retracted", "already_closed", "idempotency_conflict", "precondition_failed",
+                            "already_retracted", "already_closed", "not_answered", "idempotency_conflict", "precondition_failed",
                             "cursor_expired", "unauthorized", "forbidden", "retry_later",
                             "storage_unavailable", "payload_too_large", "unsupported",
                             "account_paused"] },
@@ -793,8 +793,9 @@ visible text. Its `attention` member changes:
 | `not_found` | 404 | false | Unknown or invisible item, entry or file (`unknown_message`, `not_found`) |
 | `stale_request` | 409 | false | `request_revision` is behind the item (`stale_revision`) |
 | `already_answered` | 409 | false | Only on `/answer`: the item's `terminal` is already set (`closed`) |
-| `already_retracted` | 409 | false | The origin retracted the item (`retracted`) |
-| `already_closed` | 409 | false | A closed message or result refuses the agent transition (§9.2) |
+| `already_retracted` | 409 | false | The origin retracted the item (`retracted`); also an agent revise or retract on that item |
+| `already_closed` | 409 | false | A closed message refuses agent revise, retract or lifecycle, a result conflicts with one already recorded, a file-use report conflicts, or a file is already attached (§9.2) |
+| `not_answered` | 409 | false | The agent tried to record a result before an answer |
 | `idempotency_conflict` | 409 | false | Same key, different request (`operation_conflict`) |
 | `precondition_failed` | 412 | false | `If-Match` does not match. Also a superseded push `revision` (`stale_push_binding`). |
 | `cursor_expired` | 410 | false | `after` is older than retention |
@@ -848,7 +849,8 @@ matches the original method, target, parameters and request contents and
 returns the stored success with `Idempotent-Replayed: true`. Refusals are
 evaluated again. A different request under a stored key answers
 `409 idempotency_conflict`. The retention and simultaneous-request rules in
-§5 apply. Show receipts, like held shows, live in relay memory.
+§5 apply. Show receipts live in relay memory alongside held shows. The
+server evaluates a show replay after a restart as a new request.
 
 `GET /v2/me` keeps `Me` and adds `sender_names: [string]` for an enrolled
 key. An empty array means the key has no sender names. A name ending in
@@ -862,6 +864,7 @@ provides the file caps and retention window.
 | `GET /v2/agent/messages?page=&session=&sender=&legacy_message_id=` | `SentMessagesPage` |
 | `GET /v2/agent/messages/{item_id}` | `SentMessageResponse` |
 | `GET /v2/agent/messages/{item_id}/entries?before=&limit=` | `AgentEntriesPage` |
+| `GET /v2/agent/messages/{item_id}/revisions/{n}` | `AgentRevisionResponse` |
 | `GET /v2/agent/focus` | `AgentFocus` |
 
 The following definitions extend the shared `$defs`. Read positions and
@@ -880,7 +883,8 @@ agents with existing data. Clients apply newer versions of each resource.
         "state": { "enum": ["answered", "cleared", "expired", "superseded", "retracted"] },
         "at_ms": { "$ref": "#/$defs/TimeMs" },
         "answer": { "description": "The raw stored answer, including an explicit null. Present exactly when an answer value was stored." },
-        "outcome": { "$ref": "#/$defs/AnswerOutcome" }
+        "outcome": { "$ref": "#/$defs/AnswerOutcome" },
+        "delivery": { "$ref": "#/$defs/AgentDelivery" }
       }
     },
     "SentMessage": {
@@ -899,7 +903,9 @@ agents with existing data. Clients apply newer versions of each resource.
         "terminal": { "$ref": "#/$defs/AgentTerminal" },
         "delivered": { "type": "boolean", "description": "Delivery recorded for the current substantive revision" },
         "seen": { "type": "boolean", "description": "Mark Seen recorded for the current substantive revision" },
-        "result": { "$ref": "#/$defs/OriginResult" }
+        "result": { "$ref": "#/$defs/OriginResult" },
+        "availability": { "$ref": "#/$defs/Availability" },
+        "advisories": { "type": "array", "items": { "$ref": "#/$defs/AgentAdvisory" } }
       }
     },
     "AgentEntry": {
@@ -928,14 +934,33 @@ agents with existing data. Clients apply newer versions of each resource.
             "score": { "type": "number" }
           }
         },
-        "delivery": {
+        "delivery": { "$ref": "#/$defs/AgentDelivery" }
+      }
+    },
+    "AgentDelivery": {
+      "type": "object",
+      "properties": {
+        "delivered": { "type": "boolean" },
+        "acted": { "type": "boolean" },
+        "outcome": { "enum": ["handed", "not_handed"] },
+        "reason": { "type": "string" },
+        "agent": { "type": "string" },
+        "rerouted": { "type": "boolean" },
+        "file_uses": { "type": "array", "items": { "$ref": "#/$defs/AgentFileUse" } }
+      }
+    },
+    "AgentRevisionResponse": {
+      "type": "object",
+      "required": ["rev", "revision"],
+      "properties": {
+        "rev": { "$ref": "#/$defs/Position" },
+        "revision": {
           "type": "object",
+          "required": ["request_revision", "message", "files"],
           "properties": {
-            "delivered": { "type": "boolean" },
-            "acted": { "type": "boolean" },
-            "outcome": { "enum": ["handed", "not_handed"] },
-            "reason": { "type": "string" },
-            "used_file_ids": { "$ref": "#/$defs/AgentFileIds" }
+            "request_revision": { "type": "integer", "minimum": 1 },
+            "message": { "type": "object" },
+            "files": { "type": "array", "items": { "$ref": "#/$defs/FileRef" } }
           }
         }
       }
@@ -996,11 +1021,18 @@ agents with existing data. Clients apply newer versions of each resource.
   `next_page` as `page` with the same filters. The last page omits `next_page`.
   `sender` and `legacy_message_id` are exact-match filters. The latter
   matches only pre-cut-over messages. Agents can use the two filters
-  together to resolve their old references to `item_id`.
+  together to resolve their old references to `item_id`. The
+  `session` filter is a UUIDv4. Malformed filters answer `400 invalid_field`
+  with the field. Message pages contain up to 50 messages.
+  A token binds the account, key and filters. Pages report their observed
+  position, and may see edits made after page one.
+- Historical revision reads follow §4 and return `404 not_found` for
+  unavailable revisions.
 - `PUT` compares against the message's integer `revision`. The message
   read's quoted `ETag` covers the entire resource version for conditional
   `GET`, including changes to terminal state and receipts.
-- Entry ordering and `before` follow §4. `older` is true when another page
+- Entry ordering and `before` follow §4, including the default limit of
+  50 and maximum of 200. `older` is true when another page
   precedes the returned one. Agent entries keep the common Entry fields and
   add the agent’s receipt details. Retraction retains its lifecycle entry.
   Answers and other terminal actions are read from `SentMessage.terminal`.
@@ -1010,7 +1042,10 @@ agents with existing data. Clients apply newer versions of each resource.
   ordered by last focus activity and then by device ID. A lapsed report ends
   listing and targetability immediately. See and push grants are independent
   and off by default. Focus is scoped to the enrolled key's account. A
-  caller without the see grant receives `403 forbidden`.
+  caller without the see grant receives `403 forbidden`. The v2 projection
+  maps today's `client_id` to `device_id`, `reported_at` to
+  `reported_at_ms`, `sender_id` plus `message_id` to `item_id`, and
+  `visible_event_id` to `visible_entry_id`.
 
 ### 9.2 Writes
 
@@ -1018,11 +1053,14 @@ agents with existing data. Clients apply newer versions of each resource.
 |---|---|---|
 | `POST /v2/agent/messages` | `SendMessageBody` | `AgentWriteResult` with `message` |
 | `PUT /v2/agent/messages/{item_id}` | `ReviseMessageBody`, with `If-Match: <revision>` | `AgentWriteResult` with `message` |
-| `POST /v2/agent/messages/{item_id}/retract` | `RetractMessageBody` | `AgentWriteResult` with `message` |
+| `POST /v2/agent/messages/{item_id}/retract` | `RetractMessageBody` | `AgentWriteResult` with `message` and optional acted `entry` |
 | `POST /v2/agent/messages/{item_id}/lifecycle` | `AgentLifecycleBody` | `AgentWriteResult` with `message` |
 | `POST /v2/agent/messages/{item_id}/replies` | `AgentReplyBody` | `AgentWriteResult` with `entry` |
 | `POST /v2/agent/messages/{item_id}/result` | `AgentResultBody` | `AgentWriteResult` with `message` and `entry` |
-| `POST /v2/agent/messages/{item_id}/entries/{entry_id}/receipt` | `AgentReceiptBody` | `AgentWriteResult` with `entry` |
+| `POST /v2/agent/messages/{item_id}/receipt` | `AgentReceiptBody` | `AgentReceiptResult` with `message` |
+| `POST /v2/agent/messages/{item_id}/entries/{entry_id}/receipt` | `AgentReceiptBody` | `AgentReceiptResult` with `entry` |
+| `POST /v2/agent/messages/{item_id}/entries/{entry_id}/file-use` | `AgentFileUseBody` | `AgentFileUseResult` |
+| `POST /v2/agent/messages/{item_id}/advisories/ack` | `AgentAdvisoryAckBody` | `AgentAdvisoryAckResult` |
 | `POST /v2/agent/sessions/{session}/end` | `EmptyBody` | `AgentWriteResult` |
 | `POST /v2/agent/show` | `AgentShowBody` | `AgentShowResult` |
 | `POST /v2/files` | The §5 upload headers and raw bytes | `FileCreated` (201) |
@@ -1036,6 +1074,21 @@ also include the message or entry affected by the same transaction.
   "$defs": {
     "EmptyBody": { "type": "object", "additionalProperties": false },
     "AgentFileIds": { "type": "array", "items": { "$ref": "#/$defs/OpaqueId" } },
+    "AgentMessageContent": {
+      "type": "object",
+      "required": ["title", "created_at"],
+      "properties": {
+        "title": { "type": "string", "minLength": 1 },
+        "created_at": { "type": "integer" },
+        "body": { "type": "string" },
+        "message_type": { "enum": ["fyi", "request"] },
+        "answer_ui": { "type": "object" },
+        "callback": { "type": "object" },
+        "open": {},
+        "progress": {}
+      },
+      "not": { "anyOf": [{ "required": ["sender_id"] }, { "required": ["message_id"] }] }
+    },
     "SendMessageBody": {
       "type": "object",
       "required": ["sender", "message"],
@@ -1044,7 +1097,7 @@ also include the message or entry affected by the same transaction.
         "sender": { "type": "string" },
         "session": { "$ref": "#/$defs/AgentSession" },
         "supersedes": { "type": "array", "items": { "$ref": "#/$defs/OpaqueId" } },
-        "message": { "type": "object" },
+        "message": { "$ref": "#/$defs/AgentMessageContent" },
         "file_ids": { "$ref": "#/$defs/AgentFileIds" }
       }
     },
@@ -1058,7 +1111,7 @@ also include the message or entry affected by the same transaction.
       "required": ["message"],
       "additionalProperties": false,
       "properties": {
-        "message": { "type": "object" },
+        "message": { "$ref": "#/$defs/AgentMessageContent" },
         "file_ids": { "$ref": "#/$defs/AgentFileIds" }
       }
     },
@@ -1082,10 +1135,7 @@ also include the message or entry affected by the same transaction.
       "type": "object",
       "required": ["status"],
       "additionalProperties": false,
-      "properties": {
-        "status": { "enum": ["received", "applied", "refused"] },
-        "result_ref": { "type": "string" }
-      }
+      "properties": { "status": { "enum": ["received", "applied", "refused"] } }
     },
     "AgentReceiptBody": {
       "type": "object",
@@ -1094,11 +1144,72 @@ also include the message or entry affected by the same transaction.
       "properties": {
         "outcome": { "enum": ["handed", "not_handed"] },
         "reason": { "type": "string", "minLength": 1 },
-        "used_file_ids": { "$ref": "#/$defs/AgentFileIds" }
+        "agent": { "type": "string", "minLength": 1 },
+        "rerouted": { "type": "boolean" }
       },
       "if": { "properties": { "outcome": { "const": "not_handed" } } },
+      "then": { "required": ["reason"], "not": { "required": ["rerouted"] } },
+      "else": { "not": { "required": ["reason"] } }
+    },
+    "AgentReceiptResult": {
+      "type": "object",
+      "required": ["rev", "status", "stage_outcome"],
+      "properties": {
+        "rev": { "$ref": "#/$defs/Position" },
+        "status": { "enum": ["recorded", "already_recorded", "superseded"] },
+        "stage_outcome": { "enum": ["handed", "not_handed"] },
+        "message": { "$ref": "#/$defs/SentMessage" },
+        "entry": { "$ref": "#/$defs/AgentEntry" }
+      }
+    },
+    "AgentFileUseBody": {
+      "type": "object",
+      "required": ["file_id", "outcome"],
+      "additionalProperties": false,
+      "properties": {
+        "file_id": { "$ref": "#/$defs/OpaqueId" },
+        "outcome": { "enum": ["used", "unusable"] },
+        "reason": { "type": "string", "minLength": 1 }
+      },
+      "if": { "properties": { "outcome": { "const": "unusable" } } },
       "then": { "required": ["reason"] },
       "else": { "not": { "required": ["reason"] } }
+    },
+    "AgentFileUse": {
+      "type": "object",
+      "required": ["file_id", "outcome"],
+      "properties": {
+        "file_id": { "$ref": "#/$defs/OpaqueId" },
+        "outcome": { "enum": ["used", "unusable"] },
+        "reason": { "type": "string" }
+      }
+    },
+    "AgentFileUseResult": {
+      "type": "object",
+      "required": ["rev", "entry", "file_id", "outcome"],
+      "properties": {
+        "rev": { "$ref": "#/$defs/Position" },
+        "entry": { "$ref": "#/$defs/AgentEntry" },
+        "file_id": { "$ref": "#/$defs/OpaqueId" },
+        "outcome": { "enum": ["used", "unusable"] },
+        "duplicate": { "type": "boolean" }
+      }
+    },
+    "AgentAdvisoryAckBody": {
+      "type": "object",
+      "required": ["advisory_id"],
+      "additionalProperties": false,
+      "properties": { "advisory_id": { "$ref": "#/$defs/OpaqueId" } }
+    },
+    "AgentAdvisoryAckResult": {
+      "type": "object",
+      "required": ["rev", "advisory_id", "delivered", "already_delivered"],
+      "properties": {
+        "rev": { "$ref": "#/$defs/Position" },
+        "advisory_id": { "$ref": "#/$defs/OpaqueId" },
+        "delivered": { "const": true },
+        "already_delivered": { "type": "boolean" }
+      }
     },
     "AgentShowBody": {
       "type": "object",
@@ -1107,15 +1218,17 @@ also include the message or entry affected by the same transaction.
       "properties": {
         "item_id": { "$ref": "#/$defs/OpaqueId" },
         "target": { "enum": ["message", "chat"] },
-        "device_id": { "$ref": "#/$defs/OpaqueId" }
+        "device_name": { "type": "string", "minLength": 1 }
       }
     },
     "AgentShowResult": {
       "type": "object",
-      "required": ["show_id", "device_id"],
+      "required": ["show_id", "device_id", "device_name", "state"],
       "properties": {
         "show_id": { "$ref": "#/$defs/OpaqueId" },
-        "device_id": { "$ref": "#/$defs/OpaqueId" }
+        "device_id": { "$ref": "#/$defs/OpaqueId" },
+        "device_name": { "type": "string" },
+        "state": { "enum": ["sent", "held"] }
       }
     },
     "AgentWriteResult": {
@@ -1143,8 +1256,13 @@ also include the message or entry affected by the same transaction.
 ```
 
 - **Send and revise.** The server issues `item_id`. A sender needing a local
-  reference maps it to that ID. The structured content uses today's message
-  rules with identity supplied by the endpoint. An unauthorized sender
+  reference maps it to that ID. The message has today's required `title`
+  and integer `created_at`. Its `body`, `answer_ui`, `callback`, `open`,
+  `progress` and other content follow today's message validation. The
+  request's top-level `sender` supplies sender identity on send. Neither
+  `sender_id` nor `message_id` is a content input. Existing immutability
+  and inheritance rules for message content, answer UI and progress apply
+  on revise. Files are supplied by `file_ids`. An unauthorized sender
   answers `403 forbidden`. Revise requires `If-Match` with the current
   integer `revision`; a missing or mismatched precondition answers
   `412 precondition_failed`. A retracted message refuses revision with
@@ -1164,28 +1282,44 @@ also include the message or entry affected by the same transaction.
   identifies an entry in that conversation. A send without a session has no
   conversation (§5), and replies to it answer `400 unsupported`. Feed
   activity is informational. There is no `accepts_replies` member.
-- **Result.** Applies to the current answer and follows today's result
-  transition rules. `received` can advance to `applied` or `refused`.
-  A disallowed state transition answers `409 already_closed`. A malformed
-  status answers `400 invalid_field` with `field: "status"`. `already_answered` is reserved for the person's
+- **Result.** Applies to the current answer. Before an answer it returns
+  `409 not_answered`. `received` can advance to `applied` or `refused`.
+  A conflicting result or a transition after a final result returns
+  `409 already_closed`. A malformed status answers `400 invalid_field`
+  with `field: "status"`. The server derives `result_ref` from the
+  operation, as today. `already_answered` is reserved for the person's
   `/answer`.
-- **Receipt.** A receipt targets a person-authored reply or answer.
-  `not_handed` requires a non-blank reason and may later advance to
-  `handed`. A handoff already recorded as `handed` stays handed.
-  `used_file_ids` names files from the referenced entry actually used by
-  the agent. The updated entry folds in delivery and handoff facts.
-- **End session.** Marks the agent's session as gone for the person.
+- **Receipt.** A message receipt targets that item's answer. An entry
+  receipt targets a person-authored chat turn of that item. `not_handed`
+  requires a non-blank reason and may advance to `handed`. A handoff
+  already recorded as `handed` stays handed. The optional `agent` is
+  non-blank. `rerouted` is valid only for `handed`. The response reports
+  whether the request recorded a new handoff, found that outcome already
+  recorded, or was superseded by the existing handoff. It also carries the
+  effective `stage_outcome` and affected message or entry.
+- **File use.** The file must belong to the referenced delivered turn.
+  Report `used` or `unusable`, with a reason required for `unusable`.
+  An identical use report is a duplicate. A different report for the same
+  file and turn conflicts with the existing one and answers
+  `409 already_closed`.
+- **Advisory acknowledgment.** Supply the advisory's ID from the item.
+  The response reports whether it was already marked delivered.
+- **End session.** `404 not_found` for an unknown session of this enrolled
+  key. Otherwise it marks the session gone for the person. The affected
+  messages change availability on the feed and keep their conversations.
 - **Show.** A push grant is required (`403 forbidden` without it). The item
-  must be in the same account. An explicit device must be listed and
-  targetable. Otherwise the server chooses the most recently active listed
-  device when the request is made. An unknown item or missing target device
-  answers `404 not_found`. It holds or sends the view exactly as in §5.1.
+  must be in the same account. The server resolves an explicit
+  `device_name` under the push grant alone. Otherwise it chooses the most
+  recently active listed device when the request is made. An unknown item
+  or missing target device answers `404 not_found`. It holds or sends the
+  view as in §5.1 and returns the resolved device name and delivery state.
 - **Files.** An agent uses the §4 device download response for
   `GET /v2/files/{file_id}`, including its stored type and quoted sha256
   ETag. It can download files it is authorized to read through its own
   messages and their conversations. An agent may discard only its own
   upload while it is unattached. An unknown or inaccessible file answers
-  `404 not_found`. An attached upload cannot be discarded.
+  `404 not_found`. An attached upload answers
+  `409 already_closed`.
 - Durable changes use the same transaction as the corresponding per-agent
   change rows. Focus and held shows use relay memory as in §5.1.
 
@@ -1197,8 +1331,10 @@ The JSON and SSE transports follow §6, including batch limits,
 `Last-Event-ID` precedence, heartbeat at least every 25 seconds, and the
 closed `Closing.reason` list. The feed applies §6.1 compaction. On
 `410 cursor_expired` or a closing with `cursor_expired`, read all pages
-of `GET /v2/agent/messages` using the same session filter, take the
-first page's position, and reopen.
+of `GET /v2/agent/messages` with the same session filter, rebuild each open
+item's entries and advisory state, then reopen at the first message page's
+position. On ordinary reconnect, send `Last-Event-ID`. A filtered feed
+can skip agent-wide revisions.
 
 ```json
 {
@@ -1236,7 +1372,8 @@ first page's position, and reopen.
       "required": ["advisory_id", "advisory_type", "request_revision", "text"],
       "properties": {
         "advisory_id": { "$ref": "#/$defs/OpaqueId" },
-        "advisory_type": { "enum": ["unseen_interval_elapsed"] },
+        "advisory_type": { "enum": ["unseen_interval_elapsed", "possible_contradictions"] },
+        "delivered": { "type": "boolean" },
         "request_revision": { "type": "integer", "minimum": 1 },
         "text": { "type": "string" },
         "accepted_at_ms": { "$ref": "#/$defs/TimeMs" },
@@ -1271,9 +1408,10 @@ first page's position, and reopen.
 - Answers and terminal close-outs appear as `message` changes, including
   on sends without a session. The per-agent `rev` orders these changes
   against chat entries in commit order.
-- The first time a person-authored entry is served in the feed, the server
-  records Delivered once. The receipt write is the explicit handoff to
-  the model. A later delivery or receipt updates the same entry resource.
+- The first time a person-authored chat entry or answer is served on the
+  feed, the server records Delivered once. The receipt write is the
+  explicit handoff to the model. Delivery and receipt changes update the
+  same entry or message resource.
 - A person sees the agent or session as listening while there is a covering
   open feed, or a covering batch was fetched in the last 60 seconds. Chat
   is stored and delivered on the next read regardless of feed activity.
@@ -1282,6 +1420,44 @@ first page's position, and reopen.
   Switching the see grant off stops focus events within 15 seconds.
 - Change-log verification replays the retained agent log from empty and
   compares the resulting sent-message map with a fresh paged read.
+
+### 9.4 Legacy commands
+
+| v2 route or disposition | Legacy command or surface |
+|---|---|
+| `POST /v2/agent/messages` | `send` |
+| `PUT /v2/agent/messages/{item_id}` | `revise`, including progress |
+| `POST /v2/agent/messages/{item_id}/retract` (round 19) | `withdraw`, `retract` |
+| `POST /v2/agent/messages/{item_id}/lifecycle` | `lifecycle` |
+| `POST /v2/agent/messages/{item_id}/replies` | `reply` |
+| `POST /v2/agent/messages/{item_id}/result` | `result` |
+| `POST /v2/agent/messages/{item_id}/receipt` for an answer, or `POST /v2/agent/messages/{item_id}/entries/{entry_id}/receipt` for a chat turn (round 20) | `ack2` |
+| `POST /v2/agent/messages/{item_id}/entries/{entry_id}/file-use` (round 20) | `file_use` |
+| `POST /v2/agent/sessions/{session}/end` | `session_end` |
+| `POST /v2/files` | `upload` |
+| `GET /v2/files/{file_id}` | File fetch |
+| `DELETE /v2/files/{file_id}` | `discard_uploads` |
+| `GET /v2/me` (agent spec r2 §1) | `file_limits` |
+| `GET /v2/agent/messages/{item_id}`, or `GET /v2/agent/messages/{item_id}/revisions/{n}` for a selected revision | `message_get` |
+| `GET /v2/agent/changes` with optional `session` (agent spec r2 §4) | `feed`, change notices, session listen, coverage stream |
+| Automatic when the feed serves the turn (agent spec r2 §4) | `ack` (ACK1) |
+| Retired. Feed activity supplies availability (agent spec r2 §§0, 4) | `support`, `attachment_update`, `status`, `coverage` |
+| Retired. Feeds are independent (agent spec r2 §§0, 4) | Exclusive listener, reconnect takeover |
+| `advisory` changes on `GET /v2/agent/changes` (agent spec r2 §4) | `advisory_feed` |
+| `POST /v2/agent/messages/{item_id}/advisories/ack` (round 20) | `advisory_ack` |
+| `GET /v2/agent/focus` (round 19) | `focus_get` |
+| Ephemeral `focus` on the agent SSE feed (round 19) | Focus stream |
+| `POST /v2/agent/show` (rounds 19–20) | `view_show` |
+| Client item and entry reads, or `GET /v2/search` for the exact legacy sender and ID pair (rounds 19–20) | Granted-agent `get` |
+| `GET /v2/search` (rounds 19–20) | Granted-agent `search` |
+| `POST /v2/items/{item_id}/answer` (rounds 19–20) | Granted-agent `respond` |
+
+For example, an agent reporting a result before the person answers gets
+`409` with this body and a matching `Request-Id` response header.
+
+```json
+{"error":"not_answered","retryable":false,"request_id":"Lk4nY3_qtbE4R1c9"}
+```
 
 ## 10. Rulings applied
 
