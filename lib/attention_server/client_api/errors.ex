@@ -21,6 +21,7 @@ defmodule AttentionServer.ClientAPI.Errors do
     "unsupported" => {400, false},
     "unauthorized" => {401, false},
     "forbidden" => {403, false},
+    "account_paused" => {403, false},
     "not_found" => {404, false},
     "stale_request" => {409, false},
     "already_answered" => {409, false},
@@ -47,6 +48,7 @@ defmodule AttentionServer.ClientAPI.Errors do
     retracted: "already_retracted",
     operation_conflict: "idempotency_conflict",
     stale_push_binding: "precondition_failed",
+    inactive_account: "account_paused",
     too_large: "payload_too_large",
     upload_cap_exceeded: "payload_too_large",
     storage_unavailable: "storage_unavailable"
