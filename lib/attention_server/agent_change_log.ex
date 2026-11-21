@@ -44,16 +44,18 @@ defmodule AttentionServer.AgentChangeLog do
   Finds the agent resources changed by one engine transition. Store appends
   these rows in the same transaction as the engine and the person's log.
   """
-  def changes(%Engine{} = old, %Engine{} = next) when old === next, do: %{}
-
-  def changes(%Engine{} = old, %Engine{} = next) do
-    entries = conversation_changes(old, next)
+  def changes(%Engine{} = old, %Engine{} = next, changed) do
+    entries =
+      for {_, seq} = event <- changed.entries do
+        %{key: key, payload: payload} = Map.fetch!(next.conversation_events, event)
+        {seq, key, payload}
+      end
 
     messages =
       [
-        changed_keys(old.messages, next.messages),
-        changed_keys(old.bounce_revisions, next.bounce_revisions),
-        opened_keys(old.opened_revisions, next.opened_revisions),
+        changed.messages,
+        changed.bounce,
+        changed.opened,
         for(
           {_seq, key, %{"kind" => kind}} <- entries,
           kind in ~w(receipt delivery_ack acted),
@@ -86,18 +88,6 @@ defmodule AttentionServer.AgentChangeLog do
     end
   end
 
-  defp conversation_changes(old, next) do
-    old.conversation_events
-    |> changed_keys(next.conversation_events)
-    |> Enum.sort()
-    |> Enum.flat_map(fn {_, seq} = event ->
-      case Map.get(next.conversation_events, event) do
-        %{key: key, payload: payload} -> [{seq, key, payload}]
-        nil -> []
-      end
-    end)
-  end
-
   defp advisory_changes(old, next) do
     old.advisory_feeds
     |> changed_keys(next.advisory_feeds)
@@ -117,18 +107,10 @@ defmodule AttentionServer.AgentChangeLog do
     end)
   end
 
-  defp opened_keys(old, next) when old === next, do: []
-
-  defp opened_keys(old, next) do
-    old
-    |> MapSet.symmetric_difference(next)
-    |> Enum.map(fn {person, sender, id, _revision} -> {person, sender, id} end)
-  end
-
   defp changed_keys(old, next) when old === next, do: []
 
   defp changed_keys(old, next) do
-    for {key, value} <- next, Map.fetch(old, key) != {:ok, value}, do: key
+    for {key, value} <- next, Map.fetch(old, key) !== {:ok, value}, do: key
   end
 
   @doc "Enables the log at startup, seeding only agents with retained messages."

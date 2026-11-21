@@ -1105,7 +1105,8 @@ defmodule AttentionServer.Store do
     # already holds, and written in the snapshot's transaction.
     log =
       if store.change_log do
-        pending = AttentionServer.ChangeLog.changes(store.engine, next)
+        changed = AttentionServer.ChangeLog.changed_resources(store.engine, next)
+        pending = AttentionServer.ChangeLog.changes(store.engine, next, changed)
 
         seeded =
           Map.new(pending, fn {person, _} ->
@@ -1116,8 +1117,8 @@ defmodule AttentionServer.Store do
           pending: pending,
           seeded: seeded,
           closings: AttentionServer.ChangeLog.closings(store.engine, next),
-          created: AttentionServer.ChangeLog.new_resources(store.engine, next),
-          agent_pending: AttentionServer.AgentChangeLog.changes(store.engine, next)
+          created: AttentionServer.ChangeLog.new_resources(store.engine, next, changed),
+          agent_pending: AttentionServer.AgentChangeLog.changes(store.engine, next, changed)
         }
       end
 
