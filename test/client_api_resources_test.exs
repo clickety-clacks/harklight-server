@@ -933,6 +933,28 @@ defmodule AttentionServer.ClientAPIResourcesTest do
       end
     end
 
+    # The change log's hook passes the keys it stored as previous. Keeping
+    # them must cost about linear time: 4x the ids, not 16x (quadratic).
+    test "keeping previous keys scales linearly, whether nothing or something moved" do
+      cost = fn n, shuffle? ->
+        ids = Enum.map(1..n, &"i#{&1}")
+        previous = Resources.rank_keys(%{}, ids)
+        order = if shuffle?, do: Enum.reverse(Enum.take(ids, 10)) ++ Enum.drop(ids, 10), else: ids
+
+        1..3
+        |> Enum.map(fn _ ->
+          elem(:timer.tc(fn -> Resources.rank_keys(previous, order) end), 0)
+        end)
+        |> Enum.min()
+      end
+
+      for shuffle? <- [false, true] do
+        small = cost.(5_000, shuffle?)
+        large = cost.(20_000, shuffle?)
+        assert large < max(small, 2_000) * 8, "#{small} us for 5k, #{large} us for 20k"
+      end
+    end
+
     test "midpoint is strictly between its bounds and has no trailing zero" do
       pairs = [
         {"", nil},
