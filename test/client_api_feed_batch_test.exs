@@ -12,6 +12,21 @@ defmodule AttentionServer.ClientAPIFeedBatchTest.FailingRenderer do
   end
 end
 
+defmodule AttentionServer.ClientAPIFeedBatchTest.StoreFailingRenderer do
+  # Reports a failed store for the item titled "unreadable".
+  alias AttentionServer.ClientAPI.FeedRenderer
+
+  def render_many(context, principal, rows) do
+    Enum.map(FeedRenderer.render_many(context, principal, rows), fn
+      {row, {:ok, %{"message" => %{"title" => "unreadable"}}}} ->
+        {row, {:error, :storage_unavailable}}
+
+      result ->
+        result
+    end)
+  end
+end
+
 defmodule AttentionServer.ClientAPIFeedBatchTest do
   # The JSON batch form of GET /v2/changes (docs/client-api-v2.md §6) through
   # the router: its cursor rules and 410, contract shapes, person scope, and
@@ -513,6 +528,22 @@ defmodule AttentionServer.ClientAPIFeedBatchTest do
 
     assert titles == ["good"]
     assert Enum.any?(batch["changes"], &(&1["kind"] == "counts"))
+    assert Process.alive?(ctx.relay)
+  end
+
+  test "a row the renderer cannot read from its store fails the step, never a silent gap", ctx do
+    renderer = AttentionServer.ClientAPIFeedBatchTest.StoreFailingRenderer
+    Application.put_env(:attention_server, :client_api_feed_renderer, renderer)
+    on_exit(fn -> Application.delete_env(:attention_server, :client_api_feed_renderer) end)
+
+    forward(ctx.relay, "fine", 1)
+    assert {200, %{"changes" => [_ | _]}} = batch(ctx, "?after=0")
+    forward(ctx.relay, "unreadable", 2)
+
+    # The client retries later from the same cursor; nothing is skipped.
+    assert {503, %{"error" => "storage_unavailable", "retryable" => true}} =
+             batch(ctx, "?after=0")
+
     assert Process.alive?(ctx.relay)
   end
 end
