@@ -12,7 +12,10 @@ defmodule AttentionServer.ClientAPI.FeedStream do
     - `revoked` when the device is revoked or removed, or the browser
       session ends;
     - `account_paused` when the account is paused;
-    - `server_shutdown` when the Relay stops.
+    - `server_shutdown` when the server stops (`ClientAPI.FeedShutdown`) or
+      the Relay exits;
+    - `cursor_expired` when the position falls out of retention mid-stream;
+    - `storage_unavailable` when a mid-stream read fails (round 17).
   - The feed's ID is its `Request-Id`. It is logged at open, and at close
     with the reason, `client_closed` when the client went away.
 
@@ -35,7 +38,7 @@ defmodule AttentionServer.ClientAPI.FeedStream do
   require Logger
 
   alias AttentionServer.{ChangeLog, JSON}
-  alias AttentionServer.ClientAPI.{Context, Feed, FeedStep}
+  alias AttentionServer.ClientAPI.{Context, Feed, FeedShutdown, FeedStep}
 
   # Rows per Relay step. Smaller than a batch's 500, so a long backlog
   # interleaves with other work in the Relay.
@@ -50,12 +53,14 @@ defmodule AttentionServer.ClientAPI.FeedStream do
     # still reaches us.
     :ok = ChangeLog.subscribe(person)
     :ok = ChangeLog.subscribe_closing(ctx.principal)
+    :ok = FeedShutdown.subscribe()
 
     try do
       open(conn, ctx, cursor)
     after
       ChangeLog.unsubscribe(person)
       ChangeLog.unsubscribe_closing(ctx.principal)
+      FeedShutdown.unsubscribe()
       flush_wakeups()
       flush_closings()
     end
@@ -108,10 +113,13 @@ defmodule AttentionServer.ClientAPI.FeedStream do
       {:error, :unauthorized} ->
         closing(conn, state, "revoked")
 
-      # The cursor fell behind retention while open. Ending lets the client's
-      # reconnect get 410 and re-read a snapshot.
-      {:error, reason} ->
-        finish(conn, state, Atom.to_string(reason))
+      # The cursor fell behind retention while open: the client rebaselines.
+      {:error, :cursor_expired} ->
+        closing(conn, state, "cursor_expired")
+
+      # Any other read failure is transient: the client reconnects later.
+      {:error, _reason} ->
+        closing(conn, state, "storage_unavailable")
     end
   catch
     :exit, _reason -> closing(conn, state, "server_shutdown")
@@ -126,7 +134,8 @@ defmodule AttentionServer.ClientAPI.FeedStream do
       {:change_log, _person, _head} ->
         wait(conn, state)
 
-      {:client_closing, _scope, reason} when reason in [:revoked, :account_paused] ->
+      {:client_closing, _scope, reason}
+      when reason in [:revoked, :account_paused, :server_shutdown] ->
         closing(conn, state, Atom.to_string(reason))
 
       {:DOWN, ref, :process, _pid, _reason} when ref == state.relay ->
@@ -164,7 +173,15 @@ defmodule AttentionServer.ClientAPI.FeedStream do
 
   @doc false
   def event(%{"rev" => rev, "kind" => kind, "data" => data}),
-    do: ["id: ", Integer.to_string(rev), "\nevent: ", kind, "\ndata: ", JSON.encode!(data), "\n\n"]
+    do: [
+      "id: ",
+      Integer.to_string(rev),
+      "\nevent: ",
+      kind,
+      "\ndata: ",
+      JSON.encode!(data),
+      "\n\n"
+    ]
 
   # The HTTP server raises, rather than returning an error, when a send cannot
   # complete, for example when the peer has gone or its window stays closed.
@@ -175,7 +192,9 @@ defmodule AttentionServer.ClientAPI.FeedStream do
   end
 
   defp closing(conn, state, reason) do
-    _ = chunk_safely(conn, ["event: closing\ndata: ", JSON.encode!(%{"reason" => reason}), "\n\n"])
+    _ =
+      chunk_safely(conn, ["event: closing\ndata: ", JSON.encode!(%{"reason" => reason}), "\n\n"])
+
     finish(conn, state, reason)
   end
 

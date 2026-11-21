@@ -120,7 +120,14 @@ defmodule AttentionServer.ClientAPI.FeedStep do
   | :disabled | :storage_unavailable}`.
   """
   def read(relay, principal, cursor, limit),
-    do: GenServer.call(relay, {:client_api, __MODULE__, {:read, principal, cursor, limit}})
+    do:
+      GenServer.call(
+        relay,
+        {:client_api, __MODULE__, {:read, principal, cursor, limit}},
+        # As the reads do: a busy Relay is waited for, not mistaken for a
+        # stopped one. A Relay that exits still ends the call.
+        :infinity
+      )
 
   @doc false
   def handle_call({:read, principal, cursor, limit}, _from, state) do

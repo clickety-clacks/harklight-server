@@ -1,3 +1,19 @@
+defmodule AttentionServer.ClientAPIFeedStreamTest.SubscriptionProbe do
+  # A feed renderer that reports, from inside the Relay step, which processes
+  # are subscribed to person A's change log at that moment.
+  def render(context, principal, row) do
+    case :persistent_term.get({__MODULE__, :test}, nil) do
+      pid when is_pid(pid) ->
+        send(pid, {:subscribed_at_read, Registry.lookup(AttentionServer.ChangeLog.Registry, "A")})
+
+      _ ->
+        :ok
+    end
+
+    AttentionServer.ClientAPI.FeedRenderer.render(context, principal, row)
+  end
+end
+
 defmodule AttentionServer.ClientAPIFeedStreamTest do
   # GET /v2/changes as Server-Sent Events (docs/client-api-v2.md §6), over
   # HTTP/2 with mutual TLS, behind client_api_v2.
@@ -380,7 +396,10 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
   defp break_store(ctx) do
     original = :sys.get_state(ctx.relay)
     :sys.replace_state(ctx.relay, fn state -> put_in(state.store.db, :unusable) end)
-    on_exit(fn -> if Process.alive?(ctx.relay), do: :sys.replace_state(ctx.relay, fn _ -> original end) end)
+
+    on_exit(fn ->
+      if Process.alive?(ctx.relay), do: :sys.replace_state(ctx.relay, fn _ -> original end)
+    end)
   end
 
   test "a change-log read that fails or raises answers storage_unavailable and the Relay lives",
@@ -399,7 +418,7 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
     assert Process.alive?(ctx.relay)
   end
 
-  test "a storage failure mid-stream ends the feed without closing: server_shutdown", ctx do
+  test "a storage failure mid-stream ends the feed with closing: storage_unavailable", ctx do
     log =
       capture_log(fn ->
         conn = connect(ctx)
@@ -410,13 +429,39 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
         break_store(ctx)
         send(pid, {:change_log, "A", 1_000_000})
 
-        {_conn, feed} = drain(conn, feed)
-        refute feed.buffer =~ "event: closing"
+        {conn, feed, closing} = until_closing(conn, feed)
+        assert closing == %{event: "closing", data: %{"reason" => "storage_unavailable"}}
+        assert {_conn, %{done: true}} = drain(conn, feed)
         assert Process.alive?(ctx.relay)
         Process.sleep(50)
       end)
 
     assert log =~ "phase=close reason=storage_unavailable"
+  end
+
+  test "a position that falls out of retention mid-stream gets closing: cursor_expired", ctx do
+    forward(ctx.relay, "m1", 1)
+    conn = connect(ctx)
+    {conn, feed} = open_feed(conn, "?after=0")
+    {conn, feed, _backlog} = changes_through(conn, feed, head(ctx))
+    pid = feed_pid()
+
+    # While the feed is held, later changes commit and retention passes them.
+    :erlang.suspend_process(pid)
+    forward(ctx.relay, "m2", 2)
+    forward(ctx.relay, "m3", 3)
+
+    assert {:ok, _} =
+             ChangeLog.prune(
+               :sys.get_state(ctx.relay).store,
+               System.system_time(:millisecond) + 1
+             )
+
+    :erlang.resume_process(pid)
+
+    {conn, feed, closing} = until_closing(conn, feed)
+    assert closing == %{event: "closing", data: %{"reason" => "cursor_expired"}}
+    assert {_conn, %{done: true}} = drain(conn, feed)
   end
 
   test "a principal that stops authenticating mid-stream gets closing: revoked", ctx do
@@ -464,5 +509,29 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
       refute Enum.any?(messages, &match?({:feed_heartbeat, _}, &1))
       refute Enum.any?(messages, &match?({:client_closing, _, _}, &1))
     end
+  end
+
+  ## No lost wake-up (review H4)
+
+  test "the feed is subscribed before its first read", ctx do
+    forward(ctx.relay, "m1", 1)
+    probe = AttentionServer.ClientAPIFeedStreamTest.SubscriptionProbe
+    :persistent_term.put({probe, :test}, self())
+    Application.put_env(:attention_server, :client_api_feed_renderer, probe)
+
+    on_exit(fn ->
+      Application.delete_env(:attention_server, :client_api_feed_renderer)
+      :persistent_term.erase({probe, :test})
+    end)
+
+    conn = connect(ctx)
+    {conn, feed} = open_feed(conn, "?after=0")
+    {_conn, _feed} = await_open(conn, feed)
+
+    # At the first read, the feed's process is already subscribed, so a
+    # commit between that read and the feed's wait still wakes it.
+    assert_receive {:subscribed_at_read, subscribers}, 5_000
+    assert [{pid, _}] = subscribers
+    assert pid != GenServer.whereis(ctx.relay)
   end
 end
