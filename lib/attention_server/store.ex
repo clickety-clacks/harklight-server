@@ -1331,9 +1331,16 @@ defmodule AttentionServer.Store do
       ) do
     projected_entries = if store.change_log, do: projected_entries, else: []
 
-    if MapSet.size(touched) == 0 and projected_entries == [],
-      do: {:ok, store},
-      else: commit_keyed(store, next, touched, audit, projected_entries)
+    cond do
+      MapSet.size(touched) > 0 or projected_entries != [] ->
+        commit_keyed(store, next, touched, audit, projected_entries)
+
+      KeyedValidation.untouched_change(store.engine, next, touched) == :ok ->
+        {:ok, store}
+
+      true ->
+        keyed_commit_failure(store, {:error, {:untouched_change, :empty}}, :unavailable, audit)
+    end
   end
 
   def commit(%__MODULE__{mode: :keyed} = store, _next, _audit, _projected_entries),
@@ -1366,7 +1373,8 @@ defmodule AttentionServer.Store do
     old = store.engine
     items = for {:row, :messages, key} <- touched, do: key
 
-    with true <- valid_state?(next) || :invalid_state,
+    with :ok <- KeyedValidation.untouched_change(old, next, touched),
+         true <- valid_state?(next) || :invalid_state,
          :ok <- KeyedValidation.sequences(old, next, touched),
          {:ok, upload_links, _related} <-
            KeyedValidation.upload_changes(store.upload_links, old, next, touched),
@@ -1441,6 +1449,7 @@ defmodule AttentionServer.Store do
   defp keyed_commit_failure(store, error, outcome, audit) do
     reason =
       case error do
+        {:error, {:untouched_change, _address}} -> :untouched_change
         {:error, reason} -> reason
         reason -> reason
       end

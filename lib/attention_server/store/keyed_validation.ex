@@ -594,4 +594,120 @@ defmodule AttentionServer.Store.KeyedValidation do
 
   defp present({:ok, _}), do: 1
   defp present(:error), do: 0
+
+  # A record that changed without a touched address would be acknowledged in
+  # memory but never written, so a keyed commit refuses it before writing.
+  # Unchanged values share their terms with the current engine, so this is
+  # an identity scan of the persisted fields. Over-reporting is allowed.
+  def untouched_change(old, next, touched) do
+    old
+    |> Map.from_struct()
+    |> Map.drop([:advisory_feeds, :origin_feeds | RecordCodec.derived_fields()])
+    |> Enum.reduce_while(:ok, fn {field, before}, :ok ->
+      case untouched_field_change(field, before, Map.fetch!(next, field), touched) do
+        :ok -> {:cont, :ok}
+        error -> {:halt, error}
+      end
+    end)
+    |> then(fn
+      :ok ->
+        with :ok <-
+               untouched_feed_change(:origin_feed, old.origin_feeds, next.origin_feeds, touched) do
+          untouched_feed_change(:advisory, old.advisory_feeds, next.advisory_feeds, touched)
+        end
+
+      error ->
+        error
+    end)
+  end
+
+  defp untouched_field_change(_field, same, same, _touched), do: :ok
+
+  defp untouched_field_change(field, %MapSet{} = before, %MapSet{} = after_set, touched) do
+    before
+    |> MapSet.symmetric_difference(after_set)
+    |> first_untouched(&{:member, field, &1}, touched)
+  end
+
+  defp untouched_field_change(field, before, after_rows, touched)
+       when is_map(before) and is_map(after_rows) do
+    changed_keys(before, after_rows) |> first_untouched(&{:row, field, &1}, touched)
+  end
+
+  defp untouched_field_change(field, _before, _after, touched),
+    do: first_untouched([field], &{:field, &1}, touched)
+
+  defp untouched_feed_change(_kind, same, same, _touched), do: :ok
+
+  defp untouched_feed_change(kind, before, after_feeds, touched) do
+    before
+    |> Map.keys()
+    |> Enum.concat(Map.keys(after_feeds))
+    |> Enum.uniq()
+    |> Enum.reduce_while(:ok, fn scope, :ok ->
+      case untouched_scope_change(
+             kind,
+             scope,
+             Map.get(before, scope),
+             Map.get(after_feeds, scope),
+             touched
+           ) do
+        :ok -> {:cont, :ok}
+        error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp untouched_scope_change(_kind, _scope, same, same, _touched), do: :ok
+
+  defp untouched_scope_change(kind, scope, before, after_feed, touched) do
+    before = before || %{}
+    after_feed = after_feed || %{}
+
+    facts =
+      [{:high, Map.get(before, :high), Map.get(after_feed, :high)}] ++
+        collection(kind, :entries, :entry, before, after_feed) ++
+        if(kind == :origin_feed,
+          do: collection(kind, :delivery_acks, :delivery_ack, before, after_feed),
+          else: receipts(before, after_feed)
+        )
+
+    Enum.reduce_while(facts, :ok, fn
+      {_fact, same, same}, :ok -> {:cont, :ok}
+      {fact, _, _}, :ok -> {:halt, first_untouched([fact], &{kind, scope, &1}, touched)}
+    end)
+  end
+
+  defp collection(_kind, field, tag, before, after_feed) do
+    old = Map.get(before, field, %{})
+    new = Map.get(after_feed, field, %{})
+
+    for key <- changed_keys(old, new),
+        do: {{tag, key}, Map.get(old, key), Map.get(new, key, :removed)}
+  end
+
+  defp receipts(before, after_feed) do
+    old = Map.get(before, :receipts, MapSet.new())
+    new = Map.get(after_feed, :receipts, MapSet.new())
+
+    for id <- MapSet.symmetric_difference(old, new),
+        do: {{:receipt, id}, MapSet.member?(old, id), MapSet.member?(new, id)}
+  end
+
+  defp changed_keys(same, same), do: []
+
+  defp changed_keys(before, after_rows) do
+    added_or_changed =
+      for {key, value} <- after_rows, Map.fetch(before, key) !== {:ok, value}, do: key
+
+    removed = for {key, _} <- before, not Map.has_key?(after_rows, key), do: key
+    added_or_changed ++ removed
+  end
+
+  defp first_untouched(keys, address, touched) do
+    case Enum.find(keys, &(not MapSet.member?(touched, address.(&1)))) do
+      nil -> :ok
+      key -> {:error, {:untouched_change, address.(key)}}
+    end
+  end
 end

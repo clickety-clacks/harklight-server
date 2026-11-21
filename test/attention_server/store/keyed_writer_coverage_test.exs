@@ -1,6 +1,8 @@
 defmodule AttentionServer.Store.KeyedWriterCoverageTest do
   use ExUnit.Case, async: true
 
+  import ExUnit.CaptureLog
+
   alias AttentionServer.{Engine, Relay, Store}
   alias AttentionServer.Store.RecordCodec
   alias Exqlite.Sqlite3
@@ -203,6 +205,59 @@ defmodule AttentionServer.Store.KeyedWriterCoverageTest do
     end
   end
 
+  test "a keyed commit that omits a changed record is refused and writes nothing", %{path: path} do
+    assert {:ok, store} = Store.open(path, :keyed)
+    {next, touched} = touched(store, forward(store, "omitted"))
+    assert MapSet.size(touched) > 1
+    before = fingerprint(store)
+
+    log =
+      capture_log(fn ->
+        for omitted <- touched do
+          partial = MapSet.delete(touched, omitted)
+
+          assert {:error, :storage_unavailable, ^store} =
+                   Store.commit(store, {next, partial}, @audit)
+
+          assert fingerprint(store) == before
+        end
+      end)
+
+    assert log =~ "cause=untouched_change"
+    assert :ok = Store.close(store)
+    assert {:ok, reopened} = Store.open(path, :keyed)
+    assert records(reopened.engine) == records(store.engine)
+    assert :ok = Store.close(reopened)
+  end
+
+  test "a keyed commit with an empty touched set and a real change is refused", %{path: path} do
+    assert {:ok, store} = Store.open(path, :keyed)
+    {next, _touched} = touched(store, proposal(store))
+    before = fingerprint(store)
+
+    capture_log(fn ->
+      assert {:error, :storage_unavailable, ^store} =
+               Store.commit(store, {next, MapSet.new()}, @audit)
+    end)
+
+    assert fingerprint(store) == before
+    assert {:ok, ^store} = Store.commit(store, {store.engine, MapSet.new()}, @audit)
+    assert :ok = Store.close(store)
+  end
+
+  test "a keyed commit may over-report touched records", %{path: path, id: id} do
+    assert {:ok, store} = Store.open(path, :keyed)
+    {next, touched} = touched(store, proposal(store))
+    extra = MapSet.put(touched, {:row, :uploads, id})
+    assert {:ok, committed} = Store.commit(store, {next, extra}, @audit)
+    assert :ok = Store.close(committed)
+
+    assert {:ok, reopened} = Store.open(path, :keyed)
+    assert records(reopened.engine) == records(committed.engine)
+    assert Map.has_key?(reopened.engine.uploads, id)
+    assert :ok = Store.close(reopened)
+  end
+
   test "a keyed upload deletion removes its file after the commit", %{path: path, id: id} do
     assert {:ok, store} = Store.open(path, :keyed)
     file = Path.join(store.upload_dir, id)
@@ -274,6 +329,25 @@ defmodule AttentionServer.Store.KeyedWriterCoverageTest do
   defp proposal(store) do
     assert {:ok, engine} = Engine.setup_person(store.engine, "B#{store.version}")
     engine
+  end
+
+  defp forward(store, id) do
+    frame = %{
+      "v" => 1,
+      "type" => "forward",
+      "op_id" => "00000000-0000-4000-8000-000000000040",
+      "message" => %{
+        "sender_id" => "app:test",
+        "message_id" => id,
+        "created_at" => 1,
+        "title" => id
+      }
+    }
+
+    {next, {:ok, _}} =
+      Engine.request_line(store.engine, "origin", AttentionServer.JSON.encode_line(frame), 1_000)
+
+    next
   end
 
   defp records(engine) do
