@@ -1406,23 +1406,7 @@ defmodule AttentionServer.Store do
       {:ok, [version, payload, checksum]} when is_integer(version) and is_binary(payload) ->
         if :crypto.hash(:sha256, payload) == checksum do
           try do
-            # Safe decoding accepts only atoms already loaded by this VM.
-            # Load the modules that define persisted record fields before a
-            # cold release reads snapshots containing invitations, browser
-            # sign-ins, JSON decimal values or provider state.
-            for module <- [
-                  Engine,
-                  BounceDecision,
-                  Conversation,
-                  GuidedJoin,
-                  BrowserSignIn,
-                  AttentionServer.JSON.DecimalToken,
-                  APNS,
-                  AttentionServer.AgentAccess,
-                  AttentionServer.Message
-                ] do
-              {:module, ^module} = Code.ensure_loaded(module)
-            end
+            :ok = AttentionServer.Store.StoredTerms.load_atoms()
 
             case :erlang.binary_to_term(payload, [:safe]) do
               {:attention_relay_state, format, %Engine{} = stored}

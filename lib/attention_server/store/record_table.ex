@@ -39,9 +39,19 @@ defmodule AttentionServer.Store.RecordTable do
   # append performs SQL only, on this same connection. Callers publish the
   # new Engine and notify subscribers after the transaction returns success.
   def commit(db, expected_generation, records, append) do
+    transaction(db, fn -> persist(db, expected_generation, records, append) end)
+  end
+
+  def seed(db, generation, rows) do
+    with :ok <- create(db, generation) do
+      write_records(db, Stream.map(rows, &{:put, &1}))
+    end
+  end
+
+  def transaction(db, write) do
     with :ok <- Sqlite3.execute(db, "BEGIN IMMEDIATE") do
       try do
-        case persist(db, expected_generation, records, append) do
+        case finish(db, write.()) do
           {:ok, _} = result ->
             result
 
@@ -66,11 +76,16 @@ defmodule AttentionServer.Store.RecordTable do
            ),
          :ok <- require_changed_generation(db),
          :ok <- write_records(db, records),
-         {:ok, metadata} <- append.(),
-         :ok <- Sqlite3.execute(db, "COMMIT") do
+         {:ok, metadata} <- append.() do
       {:ok, metadata}
     end
   end
+
+  defp finish(db, {:ok, _} = result) do
+    with :ok <- Sqlite3.execute(db, "COMMIT"), do: result
+  end
+
+  defp finish(_db, error), do: error
 
   defp require_changed_generation(db) do
     case Sqlite3.changes(db) do
