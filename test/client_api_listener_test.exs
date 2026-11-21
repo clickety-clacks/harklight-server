@@ -19,6 +19,8 @@ defmodule AttentionServer.ClientAPIListenerTest do
     TLSFixtures
   }
 
+  alias AttentionServer.ClientAPI.Idempotency
+
   defmodule TestRoutes do
     @behaviour AttentionServer.ClientAPI.Routes
 
@@ -854,8 +856,8 @@ defmodule AttentionServer.ClientAPIListenerTest do
 
       assert {:ok, conn, invalid} = request(conn, "GET", "/v2/settings")
 
-      assert %{"state" => "endpoint_invalid", "binding_id" => ^binding} =
-               json(invalid)["settings"]["push"]
+      assert %{"state" => "endpoint_invalid"} = invalid_push = json(invalid)["settings"]["push"]
+      refute Map.has_key?(invalid_push, "binding_id")
 
       assert {:ok, _conn, %{status: 200} = deleted} =
                request(conn, "DELETE", "/v2/devices/me/push")
@@ -893,6 +895,37 @@ defmodule AttentionServer.ClientAPIListenerTest do
 
       assert replayed_delete.body == deleted.body
       assert header(replayed_delete, "idempotent-replayed") == ["true"]
+    end
+
+    test "legacy compact push receipts cannot replay a replacement binding", ctx do
+      path = ["devices", "me", "push"]
+      old_put = %{"token" => String.duplicate("ab", 32), "environment" => "sandbox", "revision" => 1}
+      put_key = push_key(7)
+      delete_key = push_key(8)
+      assert {:ok, conn} = device_connect(ctx, "a1", :http2)
+      assert {:ok, conn, %{status: 200}} = register_push(conn, "ab", 1, push_key(1))
+      assert {:ok, conn, %{status: 200} = rebound} = register_push(conn, "cd", 2, push_key(2))
+
+      :sys.replace_state(ctx.relay, fn state ->
+        for {method, key, body} <- [{"PUT", put_key, old_put}, {"DELETE", delete_key, %{}}] do
+          digest = Idempotency.digest(method, path, body)
+          assert :ok = Idempotency.save(state.store, "A", key, digest, 200, %{"settings" => true})
+        end
+
+        state
+      end)
+
+      assert {:ok, conn, %{status: 409} = put} = register_push(conn, "ab", 1, put_key)
+      assert {:ok, conn, %{status: 409} = delete} =
+               request(conn, "DELETE", "/v2/devices/me/push", [{"idempotency-key", delete_key}])
+
+      for refused <- [put, delete] do
+        assert json(refused)["error"] == "idempotency_conflict"
+        assert header(refused, "idempotent-replayed") == []
+      end
+
+      assert {:ok, _conn, current} = request(conn, "GET", "/v2/settings")
+      assert current.body == rebound.body
     end
   end
 
