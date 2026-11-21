@@ -2701,14 +2701,7 @@ defmodule AttentionServer.Store do
         valid_uploads?(engine) and
         valid_upload_references?(engine) and
         LargeData.valid_refs?(engine) and
-        Enum.all?(engine.devices, fn {_key, device} ->
-          Map.has_key?(engine.persons, device.person) and
-            is_integer(device.enrollment_revision) and device.enrollment_revision > 0 and
-            (is_nil(device.label) or
-               (is_binary(device.label) and byte_size(device.label) >= 1)) and
-            (is_nil(device.enrolled_at) or
-               (is_integer(device.enrolled_at) and device.enrolled_at >= 0))
-        end) and
+        Enum.all?(engine.devices, fn {_, device} -> valid_device?(engine, device) end) and
         Enum.all?(engine.agents, fn {key, agent} -> valid_agent?(engine, key, agent) end) and
         engine.agents |> Map.values() |> Enum.map(&{&1.person, &1.id}) |> Enum.uniq() |> length() ==
           map_size(engine.agents) and
@@ -3018,6 +3011,13 @@ defmodule AttentionServer.Store do
 
   defp binding_id?(value), do: AttentionServer.Message.uuid_v4?(value)
 
+  defp valid_device?(engine, device) do
+    Map.has_key?(engine.persons, device.person) and
+      is_integer(device.enrollment_revision) and device.enrollment_revision > 0 and
+      (is_nil(device.label) or (is_binary(device.label) and byte_size(device.label) >= 1)) and
+      (is_nil(device.enrolled_at) or (is_integer(device.enrolled_at) and device.enrolled_at >= 0))
+  end
+
   defp valid_agent?(engine, key, agent) do
     hex_key?(key) and
       Map.has_key?(engine.persons, agent.person) and
@@ -3063,13 +3063,7 @@ defmodule AttentionServer.Store do
     retired = engine.retired_owner_keys
 
     is_map(owners) and is_struct(retired, MapSet) and
-      Enum.all?(owners, fn {person, owner} ->
-        Map.has_key?(engine.persons, person) and
-          hex_key?(owner.key) and is_integer(owner.revision) and owner.revision > 0 and
-          not Map.has_key?(engine.devices, owner.key) and
-          not Map.has_key?(engine.agents, owner.key) and
-          not MapSet.member?(retired, owner.key)
-      end) and
+      Enum.all?(owners, fn {person, owner} -> valid_owner?(engine, person, owner) end) and
       owners |> Map.values() |> Enum.map(& &1.key) |> Enum.uniq() |> length() == map_size(owners) and
       Enum.all?(retired, fn key ->
         hex_key?(key) and not Map.has_key?(engine.devices, key) and
@@ -3077,40 +3071,50 @@ defmodule AttentionServer.Store do
       end)
   end
 
+  defp valid_owner?(engine, person, owner) do
+    Map.has_key?(engine.persons, person) and
+      hex_key?(owner.key) and is_integer(owner.revision) and owner.revision > 0 and
+      not Map.has_key?(engine.devices, owner.key) and
+      not Map.has_key?(engine.agents, owner.key) and
+      not MapSet.member?(engine.retired_owner_keys, owner.key)
+  end
+
   defp valid_pending?(engine) do
     pending = engine.pending_enrollments
 
     is_map(pending) and is_map(engine.pending_history) and
-      Enum.all?(pending, fn {code, item} ->
-        is_binary(code) and Regex.match?(~r/\A[A-Z2-7]{10}\z/, code) and
-          hex_key?(item.key) and
-          ((is_binary(item.certificate) and
-              AttentionServer.DeviceIdentity.from_certificate(item.certificate) == {:ok, item.key}) or
-             (is_nil(item.certificate) and Map.get(item, :legacy_recovery) == true and
-                not is_nil(item.person))) and
-          is_binary(item.label) and byte_size(item.label) >= 1 and
-          is_binary(item.secret_hash) and byte_size(item.secret_hash) == 32 and
-          valid_pending_deadlines?(item.expires_at, item.status_expires_at) and
-          is_integer(item.request_generation) and item.request_generation > 0 and
-          Map.get(item, :joined, false) in [true, false] and
-          case item do
-            %{state: :pending, person: nil} ->
-              true
-
-            %{state: :pending, person: person} ->
-              Map.has_key?(engine.persons, person)
-
-            %{state: :approved, person: person, key: key} ->
-              get_in(engine.devices, [key, :person]) == person and
-                (is_nil(Map.get(item, :approved_by)) or
-                   hex_key?(item.approved_by))
-
-            _ ->
-              false
-          end
-      end) and
+      Enum.all?(pending, fn {code, item} -> valid_pending_item?(engine, code, item) end) and
       pending |> Map.values() |> Enum.map(& &1.secret_hash) |> Enum.uniq() |> length() ==
         map_size(pending)
+  end
+
+  defp valid_pending_item?(engine, code, item) do
+    is_binary(code) and Regex.match?(~r/\A[A-Z2-7]{10}\z/, code) and
+      hex_key?(item.key) and
+      ((is_binary(item.certificate) and
+          AttentionServer.DeviceIdentity.from_certificate(item.certificate) == {:ok, item.key}) or
+         (is_nil(item.certificate) and Map.get(item, :legacy_recovery) == true and
+            not is_nil(item.person))) and
+      is_binary(item.label) and byte_size(item.label) >= 1 and
+      is_binary(item.secret_hash) and byte_size(item.secret_hash) == 32 and
+      valid_pending_deadlines?(item.expires_at, item.status_expires_at) and
+      is_integer(item.request_generation) and item.request_generation > 0 and
+      Map.get(item, :joined, false) in [true, false] and
+      case item do
+        %{state: :pending, person: nil} ->
+          true
+
+        %{state: :pending, person: person} ->
+          Map.has_key?(engine.persons, person)
+
+        %{state: :approved, person: person, key: key} ->
+          get_in(engine.devices, [key, :person]) == person and
+            (is_nil(Map.get(item, :approved_by)) or
+               hex_key?(item.approved_by))
+
+        _ ->
+          false
+      end
   end
 
   # Current requests carry no deadlines; requests stored earlier keep theirs,
@@ -3131,79 +3135,83 @@ defmodule AttentionServer.Store do
           Enum.map(Map.values(history), & &1.secret_hash)
 
       Enum.all?(history, fn {code, receipt} ->
-        is_binary(code) and Regex.match?(~r/\A[A-Z2-7]{10}\z/, code) and
-          case receipt do
-            %{
-              state: :expired,
-              secret_hash: hash,
-              key: key,
-              expires_at: expires_at,
-              status_expires_at: status_expires_at
-            } = exact ->
-              map_size(exact) == 5 and is_binary(hash) and byte_size(hash) == 32 and
-                hex_key?(key) and valid_pending_deadlines?(expires_at, status_expires_at)
-
-            %{
-              state: :cancelled,
-              secret_hash: hash,
-              person: person,
-              key: key,
-              label: label,
-              expires_at: expires_at,
-              status_expires_at: status_expires_at
-            } = exact ->
-              map_size(exact) in [7, 8] and Map.get(exact, :joined, false) in [true, false] and
-                is_binary(hash) and byte_size(hash) == 32 and
-                (is_nil(person) or Map.has_key?(engine.persons, person)) and hex_key?(key) and
-                is_binary(label) and byte_size(label) >= 1 and
-                valid_pending_deadlines?(expires_at, status_expires_at)
-
-            %{
-              state: :declined,
-              secret_hash: hash,
-              person: person,
-              key: key,
-              label: label,
-              expires_at: expires_at,
-              status_expires_at: status_expires_at,
-              declined_by: owner
-            } = exact ->
-              map_size(exact) in [8, 9] and Map.get(exact, :joined, false) in [true, false] and
-                is_binary(hash) and byte_size(hash) == 32 and
-                Map.has_key?(engine.persons, person) and hex_key?(key) and hex_key?(owner) and
-                is_binary(label) and byte_size(label) >= 1 and
-                valid_pending_deadlines?(expires_at, status_expires_at)
-
-            %{
-              state: :approved,
-              secret_hash: hash,
-              person: person,
-              key: key,
-              label: label,
-              expires_at: expires_at,
-              status_expires_at: status_expires_at,
-              approved_by: approved_by
-            } = exact ->
-              map_size(exact) in [8, 9, 10] and
-                Map.get(exact, :joined, false) in [true, false] and
-                is_integer(Map.get(exact, :request_generation, 1)) and
-                Map.get(exact, :request_generation, 1) > 0 and
-                is_binary(hash) and byte_size(hash) == 32 and
-                Map.has_key?(engine.persons, person) and hex_key?(key) and
-                is_binary(label) and byte_size(label) >= 1 and
-                valid_pending_deadlines?(expires_at, status_expires_at) and
-                (is_nil(approved_by) or hex_key?(approved_by)) and
-                get_in(engine.devices, [key, :person]) == person
-
-            _ ->
-              false
-          end
+        valid_pending_resolution?(engine, code, receipt)
       end) and
         Enum.all?(history, fn {code, _} -> not Map.has_key?(engine.pending_enrollments, code) end) and
         length(Enum.uniq(secrets)) == length(secrets)
     else
       false
     end
+  end
+
+  defp valid_pending_resolution?(engine, code, receipt) do
+    is_binary(code) and Regex.match?(~r/\A[A-Z2-7]{10}\z/, code) and
+      case receipt do
+        %{
+          state: :expired,
+          secret_hash: hash,
+          key: key,
+          expires_at: expires_at,
+          status_expires_at: status_expires_at
+        } = exact ->
+          map_size(exact) == 5 and is_binary(hash) and byte_size(hash) == 32 and
+            hex_key?(key) and valid_pending_deadlines?(expires_at, status_expires_at)
+
+        %{
+          state: :cancelled,
+          secret_hash: hash,
+          person: person,
+          key: key,
+          label: label,
+          expires_at: expires_at,
+          status_expires_at: status_expires_at
+        } = exact ->
+          map_size(exact) in [7, 8] and Map.get(exact, :joined, false) in [true, false] and
+            is_binary(hash) and byte_size(hash) == 32 and
+            (is_nil(person) or Map.has_key?(engine.persons, person)) and hex_key?(key) and
+            is_binary(label) and byte_size(label) >= 1 and
+            valid_pending_deadlines?(expires_at, status_expires_at)
+
+        %{
+          state: :declined,
+          secret_hash: hash,
+          person: person,
+          key: key,
+          label: label,
+          expires_at: expires_at,
+          status_expires_at: status_expires_at,
+          declined_by: owner
+        } = exact ->
+          map_size(exact) in [8, 9] and Map.get(exact, :joined, false) in [true, false] and
+            is_binary(hash) and byte_size(hash) == 32 and
+            Map.has_key?(engine.persons, person) and hex_key?(key) and hex_key?(owner) and
+            is_binary(label) and byte_size(label) >= 1 and
+            valid_pending_deadlines?(expires_at, status_expires_at)
+
+        %{
+          state: :approved,
+          secret_hash: hash,
+          person: person,
+          key: key,
+          label: label,
+          expires_at: expires_at,
+          status_expires_at: status_expires_at,
+          approved_by: approved_by
+        } = exact ->
+          map_size(exact) in [8, 9, 10] and
+            Map.get(exact, :joined, false) in [true, false] and
+            is_integer(Map.get(exact, :request_generation, 1)) and
+            Map.get(exact, :request_generation, 1) > 0 and
+            is_binary(hash) and byte_size(hash) == 32 and
+            Map.has_key?(engine.persons, person) and hex_key?(key) and
+            is_binary(label) and byte_size(label) >= 1 and
+            valid_pending_deadlines?(expires_at, status_expires_at) and
+            (is_nil(approved_by) or hex_key?(approved_by)) and
+            get_in(engine.devices, [key, :person]) == person
+
+        _ ->
+          false
+      end
   end
 
   defp valid_maintainers?(engine) do
@@ -3316,6 +3324,41 @@ defmodule AttentionServer.Store do
     case Map.fetch(engine.agents, key) do
       {:ok, agent} -> valid_agent?(engine, key, agent)
       :error -> true
+    end
+  end
+
+  defp valid_authority_reference?(engine, {:row, :devices, key}) do
+    case Map.fetch(engine.devices, key) do
+      {:ok, device} -> valid_device?(engine, device)
+      :error -> true
+    end
+  end
+
+  defp valid_authority_reference?(engine, {:row, :owners, person}) do
+    case Map.fetch(engine.owners, person) do
+      {:ok, owner} -> valid_owner?(engine, person, owner)
+      :error -> true
+    end
+  end
+
+  defp valid_authority_reference?(engine, {:row, :pending_enrollments, code}) do
+    case Map.fetch(engine.pending_enrollments, code) do
+      {:ok, item} ->
+        not Map.has_key?(engine.pending_history, code) and valid_pending_item?(engine, code, item)
+
+      :error ->
+        true
+    end
+  end
+
+  defp valid_authority_reference?(engine, {:row, :pending_history, code}) do
+    case Map.fetch(engine.pending_history, code) do
+      {:ok, receipt} ->
+        not Map.has_key?(engine.pending_enrollments, code) and
+          valid_pending_resolution?(engine, code, receipt)
+
+      :error ->
+        true
     end
   end
 

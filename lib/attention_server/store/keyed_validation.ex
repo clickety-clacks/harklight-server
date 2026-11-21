@@ -49,7 +49,12 @@ defmodule AttentionServer.Store.KeyedValidation do
     :cursors,
     :conversation_cursors,
     :origin_sessions,
-    :origin_feeds
+    :origin_feeds,
+    :owners,
+    :devices,
+    :agents,
+    :pending_enrollments,
+    :pending_history
   ]
 
   def authority_index(engine) do
@@ -138,6 +143,26 @@ defmodule AttentionServer.Store.KeyedValidation do
 
   defp authority_owners(engine, {:row, :receipts, {person, actor, _} = key}) do
     if Map.has_key?(engine.receipts, key), do: [{:person, person}, {:actor, actor}], else: []
+  end
+
+  defp authority_owners(engine, {:row, :owners, person}) do
+    if Map.has_key?(engine.owners, person), do: [{:person, person}], else: []
+  end
+
+  defp authority_owners(engine, {:row, field, key}) when field in [:devices, :agents] do
+    case Map.get(Map.fetch!(engine, field), key) do
+      %{person: person} -> [{:person, person}]
+      _ -> []
+    end
+  end
+
+  defp authority_owners(engine, {:row, field, code})
+       when field in [:pending_enrollments, :pending_history] do
+    case Map.get(Map.fetch!(engine, field), code) do
+      %{state: :approved, key: key, person: person} -> [{:person, person}, {:actor, key}]
+      %{person: person} when is_binary(person) -> [{:person, person}]
+      _ -> []
+    end
   end
 
   defp authority_owners(engine, {:row, field, {person, actor} = key})

@@ -16,6 +16,7 @@ defmodule AttentionServer.Store.EngineTransitionTest do
   alias Exqlite.Sqlite3
 
   @person "a"
+  @sender "app:test/worker"
   @origin String.duplicate("a", 64)
   @reader String.duplicate("b", 64)
   @derived [
@@ -1448,6 +1449,75 @@ defmodule AttentionServer.Store.EngineTransitionTest do
     assert Enum.map(history, & &1.action) == ~w(register replace revoke)
     assert full_diff(live.engine, reopened.engine) == MapSet.new()
     :ok = Store.close(reopened)
+  end
+
+  test "keyed manual enrollment retries and approval preserve both authority and history" do
+    path = legacy_store_path()
+    {:ok, store} = Store.open(path)
+    assert {:ok, _} = KeyedMigration.convert(store)
+    :ok = Store.close(store)
+    opts = [store_path: path, store_mode: :keyed]
+    {:ok, relay} = Relay.start_link(opts)
+    owner = enrollment_certificate("owner")
+    device = enrollment_certificate("device")
+    {:ok, owner_key} = AttentionServer.DeviceIdentity.from_certificate(owner)
+    {:ok, device_key} = AttentionServer.DeviceIdentity.from_certificate(device)
+
+    assert {:ok, person} = Relay.operator_bootstrap(relay, owner)
+    assert {:ok, first} = Relay.pending_enroll(relay, device, "first")
+    assert {:ok, renewed} = Relay.pending_enroll(relay, device, "renewed")
+    assert first.approval_code == renewed.approval_code
+    code = renewed.approval_code
+    assert {:error, :not_found} = Relay.pending_status(relay, first.status_secret)
+
+    before = :sys.get_state(relay).store
+
+    assert :ok =
+             Sqlite3.execute(before.db, """
+             CREATE TRIGGER keyed_approval_fault BEFORE INSERT ON relay_audit
+             WHEN NEW.action = 'owner_device_approve'
+             BEGIN SELECT RAISE(ABORT, 'failed'); END
+             """)
+
+    assert {:error, :storage_unavailable} =
+             Relay.owner_pending_approve(relay, person, owner_key, code, device_key, nil, [
+               @sender
+             ])
+
+    assert :sys.get_state(relay).store.version == before.version
+    assert :ok = Sqlite3.execute(before.db, "DROP TRIGGER keyed_approval_fault")
+
+    assert {:ok, ^device_key} =
+             Relay.owner_pending_approve(relay, person, owner_key, code, device_key, nil, [
+               @sender
+             ])
+
+    live = :sys.get_state(relay).store
+    GenServer.stop(relay)
+
+    {:ok, reopened} = Relay.start_link(opts)
+
+    assert {:ok, ^device_key} =
+             Relay.owner_pending_approve(reopened, person, owner_key, code, device_key, nil, [
+               @sender
+             ])
+
+    store = :sys.get_state(reopened).store
+    assert store.version == live.version
+
+    assert %{state: :approved, person: ^person, key: ^device_key, label: "renewed"} =
+             store.engine.pending_history[code]
+
+    assert MapSet.member?(store.engine.sender_grants[{person, device_key}], @sender)
+    assert full_diff(live.engine, store.engine) == MapSet.new()
+    GenServer.stop(reopened)
+  end
+
+  defp enrollment_certificate(name) do
+    %{cert: der} =
+      :public_key.pkix_test_root_cert(String.to_charlist(name), key: {:namedCurve, :secp256r1})
+
+    der
   end
 
   defp agent_write(relay, operation, params, body, op_id, match \\ []) do

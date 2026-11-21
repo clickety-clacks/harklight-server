@@ -2067,11 +2067,11 @@ defmodule AttentionServer.Relay do
   defp dispatch_call({:pending_enroll, certificate_der, label}, _from, state) do
     case generate_pending(state.store.engine, certificate_der, label, 8) do
       {:ok, next_engine, code, secret} ->
-        case commit(state.store, next_engine, %{
-               person: "unassigned",
-               actor: "pending_submitter",
-               action: "pending_enrollment"
-             }) do
+        audit = %{person: "unassigned", actor: "pending_submitter", action: "pending_enrollment"}
+
+        case commit_known_rows(state.store, next_engine, audit, [
+               {:row, :pending_enrollments, code}
+             ]) do
           {:ok, store} ->
             {:reply,
              {:ok,
@@ -2367,11 +2367,9 @@ defmodule AttentionServer.Relay do
     with {:ok, hash} <- secret_hash(secret) do
       case Engine.pending_cancel(state.store.engine, hash, code, key, deadline) do
         {:ok, next, reply} ->
-          case commit(state.store, next, %{
-                 person: "requester",
-                 actor: "pending_submitter",
-                 action: "pending_cancel"
-               }) do
+          audit = %{person: "requester", actor: "pending_submitter", action: "pending_cancel"}
+
+          case commit_known_rows(state.store, next, audit, pending_resolution_rows(code)) do
             {:ok, store} -> {:reply, {:ok, reply}, %{state | store: store}}
             _ -> {:reply, {:error, :storage_unavailable}, state}
           end
@@ -2427,11 +2425,9 @@ defmodule AttentionServer.Relay do
   defp dispatch_call({:owner_pending_decline, person, owner, code, key, deadline}, _from, state) do
     case Engine.pending_decline(state.store.engine, person, owner, code, key, deadline) do
       {:ok, next} ->
-        case commit(state.store, next, %{
-               person: person,
-               actor: owner,
-               action: "owner_device_decline"
-             }) do
+        audit = %{person: person, actor: owner, action: "owner_device_decline"}
+
+        case commit_known_rows(state.store, next, audit, pending_resolution_rows(code)) do
           {:ok, store} -> {:reply, :ok, %{state | store: store}}
           _ -> {:reply, {:error, :storage_unavailable}, state}
         end
@@ -2486,11 +2482,18 @@ defmodule AttentionServer.Relay do
            now_ms
          ) do
       {:ok, next_engine, device_key} ->
-        case commit(state.store, next_engine, %{
-               person: person,
-               actor: key,
-               action: "owner_device_approve"
-             }) do
+        audit = %{person: person, actor: key, action: "owner_device_approve"}
+        scope = {person, device_key}
+
+        addresses = [
+          {:row, :devices, device_key},
+          {:row, :subscriptions, scope},
+          {:row, :cursors, scope},
+          {:row, :sender_grants, scope}
+          | pending_resolution_rows(code)
+        ]
+
+        case commit_known_rows(state.store, next_engine, audit, addresses) do
           {:ok, store} ->
             next_state = ensure_priority_view_if_missing(%{state | store: store}, person)
             {:reply, {:ok, device_key}, next_state}
@@ -2629,11 +2632,10 @@ defmodule AttentionServer.Relay do
 
     case Engine.operator_bootstrap(state.store.engine, person, key) do
       {:ok, next_engine} ->
-        case commit(state.store, next_engine, %{
-               person: person,
-               actor: "local_operator",
-               action: "owner_bootstrap"
-             }) do
+        audit = %{person: person, actor: "local_operator", action: "owner_bootstrap"}
+        addresses = [{:row, :persons, person}, {:row, :owners, person}]
+
+        case commit_known_rows(state.store, next_engine, audit, addresses) do
           {:ok, store} ->
             next_state = ensure_priority_view_if_missing(%{state | store: store}, person)
             {:reply, {:ok, person}, next_state}
@@ -7598,6 +7600,9 @@ defmodule AttentionServer.Relay do
   end
 
   defp commit_known_rows(store, next, audit, _addresses), do: commit(store, next, audit)
+
+  defp pending_resolution_rows(code),
+    do: [{:row, :pending_enrollments, code}, {:row, :pending_history, code}]
 
   # Origin-feed changes are announced only by the request paths that append
   # them. This keeps unrelated commits out of every attached origin stream.
