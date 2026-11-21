@@ -1,8 +1,15 @@
 defmodule AttentionServer.AgentAPI.Focus do
   @moduledoc false
 
+  @behaviour AttentionServer.ClientAPI.Routes
+
   alias AttentionServer.{Relay, RouteBIndex}
-  alias AttentionServer.ClientAPI.Resources
+  alias AttentionServer.ClientAPI.{Reads, Resources}
+
+  @impl true
+  def routes, do: [{"GET", ["agent", "focus"], :snapshot}]
+
+  def snapshot(conn, ctx), do: Reads.respond(conn, get(ctx.relay, ctx.principal))
 
   def notify_grant(person, key) do
     registry = AttentionServer.ChangeLog.Registry
