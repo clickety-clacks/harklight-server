@@ -7032,8 +7032,12 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  defp initial_delivery_availability(%{store: %{change_log: true}} = state, key, engine,
-                                    %{"type" => "forward", "message" => message})
+  defp initial_delivery_availability(
+         %{store: %{change_log: true}} = state,
+         key,
+         engine,
+         %{"type" => "forward", "message" => message}
+       )
        when is_map(message) do
     with {:ok, person} <- Engine.authorized_person(engine, key),
          item = {person, message["sender_id"], message["message_id"]},
