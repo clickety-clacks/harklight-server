@@ -1012,15 +1012,13 @@ defmodule AttentionServer.LargeData do
     end
   end
 
-  defp sync_directory(directory) do
-    case :file.open(String.to_charlist(directory), [:read, :raw]) do
+  @doc false
+  def sync_directory(directory) do
+    case :file.open(String.to_charlist(directory), [:read, :raw, :directory]) do
       {:ok, file} ->
         result = :file.sync(file)
         _ = :file.close(file)
         result
-
-      {:error, :eisdir} ->
-        :ok
 
       error ->
         error

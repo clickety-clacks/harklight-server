@@ -334,20 +334,21 @@ defmodule AttentionServer.Store do
       when is_binary(upload_dir) and is_binary(staged) do
     target = Path.join(upload_dir, metadata.id)
 
-    case File.rename(staged, target) do
+    result =
+      with :ok <- File.rename(staged, target) do
+        case LargeData.sync_directory(upload_dir) do
+          :ok ->
+            :ok
+
+          error ->
+            _ = File.rm(target)
+            error
+        end
+      end
+
+    case result do
       :ok ->
         {:ok, target}
-
-      {:error, reason} ->
-        Diagnostics.failure(
-          :server_storage,
-          :upload_publish,
-          reason,
-          :unavailable,
-          operation_id(metadata)
-        )
-
-        {:error, :storage_unavailable}
 
       other ->
         Diagnostics.failure(
