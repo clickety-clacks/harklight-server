@@ -29,6 +29,7 @@ defmodule AttentionServer.ClientAPIListenerTest do
         {"GET", ["me"], :whoami},
         {"POST", ["echo", :id], :echo},
         {"GET", ["boom"], :boom},
+        {"GET", ["bad", :thing], :bad_field},
         {"GET", ["held"], :held},
         {"GET", ["held-stream"], :held, stream: true},
         {"GET", ["closing"], :closing, stream: true}
@@ -59,6 +60,12 @@ defmodule AttentionServer.ClientAPIListenerTest do
     def echo(conn, %Context{params: %{id: id}}), do: Errors.send_json(conn, 200, %{"id" => id})
 
     def boom(_conn, _ctx), do: raise("handler defect")
+
+    # A handler naming the offending member by its route capture (an atom).
+    def bad_field(conn, %Context{params: params}) do
+      [field] = Map.keys(params)
+      Errors.send_error(conn, "invalid_field", field: field)
+    end
 
     # Holds its slot until the test releases it.
     def held(conn, _ctx) do
@@ -288,6 +295,15 @@ defmodule AttentionServer.ClientAPIListenerTest do
       assert {:ok, _conn, %{status: 200}} = request(conn, "GET", "/v2/whoami")
     end
 
+    test "an error naming its field by atom answers 400 with that field", ctx do
+      assert {:ok, conn} = device_connect(ctx, "a1", :http2)
+      assert {:ok, _conn, response} = request(conn, "GET", "/v2/bad/x")
+      assert response.status == 400
+
+      assert %{"error" => "invalid_field", "field" => "thing", "retryable" => false} =
+               json(response)
+    end
+
     test "a handler defect answers 503 retry_later with Retry-After", ctx do
       assert {:ok, conn} = device_connect(ctx, "a1", :http2)
 
@@ -320,6 +336,12 @@ defmodule AttentionServer.ClientAPIListenerTest do
     assert response.status == 503
     assert header(response, "retry-after") == ["1"]
     assert %{"error" => "retry_later", "retryable" => true} = json(response)
+
+    # The limit is counted before authentication and routing, so a saturated
+    # server sheds every request before it reaches the Relay.
+    assert {:ok, conn, response} = request(conn, "GET", "/v2/nothing")
+    assert response.status == 503
+    assert %{"error" => "retry_later"} = json(response)
 
     # A stream route does not take a slot.
     assert {:ok, conn, stream_ref} = Mint.HTTP.request(conn, "GET", "/v2/held-stream", [], nil)
