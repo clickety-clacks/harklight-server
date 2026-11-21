@@ -2,7 +2,7 @@
 
 Harklight brings messages and questions from your AI agents into one inbox on your iPhone, so you can read them and answer without opening a terminal. This guide connects an agent to your hosted Harklight account, sends a first message to your iPhone and shows how the agent picks up your answer. It also shows how to remove the agent's access.
 
-You need a Harklight account at [app.harklight.net](https://app.harklight.net/account/sign-in), an iPhone, and a Mac or Linux computer where your agent runs. The commands use Harklight Agent 0.1.9.
+You need a Harklight account at [app.harklight.net](https://app.harklight.net/account/sign-in), an iPhone, and a Mac or Linux computer where your agent runs. The commands use Harklight Agent 0.2.0.
 
 ## Get the Harklight app
 
@@ -14,26 +14,26 @@ Harklight on iPhone does not use your website password. Instead, you invite the 
 
 The iPhone app is a public beta. Joining a hosted account from it, and receiving and answering messages in it, have not yet been confirmed end to end. The steps below follow the beta app and the website as they are built. If a screen does not match a step, stop there rather than looking for another way to connect.
 
-1. Sign in to [your Harklight account](https://app.harklight.net/account/sign-in), open [Devices](https://app.harklight.net/devices) and choose Create invitation. The Invitation ready page shows your account and when the invitation expires.
+1. Sign in to [your Harklight account](https://app.harklight.net/account/sign-in), open [Devices](https://app.harklight.net/devices) and choose Create invitation. The Invitation ready page shows your account.
 2. Get the invitation onto your iPhone. Use Share invitation or Copy tappable link to send yourself the tappable invitation link, then tap it on the iPhone; it opens Harklight. If the link won't open, copy the Full invitation for Paste instead, open Harklight, paste it into Full invitation and choose Check invitation.
 3. On the Join screen, check that You join as shows your account, give the device a name if you like, and choose Join. Harklight shows an approval code and waits for approval. You can leave the app; it remembers the request.
 4. Back in Devices, under Waiting for approval, choose Review exact request for your iPhone. Check that Code on device matches the code on your iPhone and that Joins as shows your account, then choose Approve this exact device. If a Sender IDs field appears, leave it empty: the phone receives requests and needs no sender rights.
 5. Harklight shows Connected. Choose Continue, then choose whether to turn on notifications. Without them you still see requests when you open Harklight. Requests for your account show up in the Inbox.
 
-If the invitation expires before you join, create a new one in Devices.
+An invitation does not expire, but it works only once and stops working if the account owner's authority changes. An unused invitation created before the service moved to Harklight 0.2 is refused, and its link page asks for a new invitation. In either case, create a new invitation in Devices.
 
 ## Install Harklight Agent
 
-Download Harklight Agent 0.1.9 and `SHA256SUMS` from the [0.1.9 release](https://github.com/clickety-clacks/harklight-agent/releases/tag/v0.1.9). Choose the archive for the computer running your agent:
+Download Harklight Agent 0.2.0 and `SHA256SUMS` from the [0.2.0 release](https://github.com/clickety-clacks/harklight-agent/releases/tag/v0.2.0). Choose the archive for the computer running your agent:
 
 | Computer | Archive |
 | --- | --- |
-| Mac with Apple silicon | `harklight-agent-0.1.9-aarch64-apple-darwin.tar.gz` |
-| Mac with Intel processor | `harklight-agent-0.1.9-x86_64-apple-darwin.tar.gz` |
-| Linux on x86_64 | `harklight-agent-0.1.9-x86_64-unknown-linux-gnu.tar.gz` |
-| Linux on arm64 | `harklight-agent-0.1.9-aarch64-unknown-linux-gnu.tar.gz` |
+| Mac with Apple silicon | `harklight-agent-0.2.0-aarch64-apple-darwin.tar.gz` |
+| Mac with Intel processor | `harklight-agent-0.2.0-x86_64-apple-darwin.tar.gz` |
+| Linux on x86_64 | `harklight-agent-0.2.0-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux on arm64 | `harklight-agent-0.2.0-aarch64-unknown-linux-gnu.tar.gz` |
 
-Verify the downloaded archive against `SHA256SUMS`. On macOS run `shasum -a 256 --check --ignore-missing SHA256SUMS` in the download directory; on Linux use `sha256sum --check --ignore-missing SHA256SUMS`. Continue only if your archive is reported OK. Extract it and install the included `harklight-agent` executable on your PATH using the included README. Run `harklight-agent --version` to confirm 0.1.9. Installing the CLI does not enroll an agent or start a listener.
+Verify the downloaded archive against `SHA256SUMS`. On macOS run `shasum -a 256 --check --ignore-missing SHA256SUMS` in the download directory; on Linux use `sha256sum --check --ignore-missing SHA256SUMS`. Continue only if your archive is reported OK. Extract it and install the included `harklight-agent` executable on your PATH using the included README. Run `harklight-agent --version` to confirm 0.2.0. Installing the CLI does not enroll an agent or start a listener.
 
 ## Enroll your agent
 
@@ -74,54 +74,53 @@ Only an approved result confirms enrollment. Check the returned account/device i
 
 Once enrollment is approved with its sender ID, the agent can start a conversation with you. An agent works only in conversations it started; enrollment does not give it access to other senders' conversations.
 
-An agent running in Claude Code declares its actual runtime when creating a conversation:
+The agent creates a conversation with its first message:
 
 ```sh
 harklight-agent --identity-dir ./my-agent-identity --ca-file ./harklight-agent-ca.pem \
-  send --session new --sender-id app:my-agent --route claude-code \
+  send --session new --sender-id app:my-agent \
   --type request --reply --title "Connection check" \
   --body "Please reply to confirm you received this message."
 ```
 
-Use `--route codex` for Codex or `--route other` for another runtime, not a false runtime declaration to enable listening. Retain the returned session handle, message ID and operation ID. Subsequent sends through the saved handle omit the route. An accepted send means the service took the message, not that you have seen it. This example does not enable background listening.
+Retain the returned session handle, item ID and operation ID. Subsequent sends in the same conversation pass the saved handle to `--session`. An accepted send means the service took the message, not that you have seen it. This example does not enable background listening.
 
 In Harklight on your iPhone, open the Inbox and open the Connection check message. It asks for a written answer: write it and choose Send answer. Your answer completes the request. While a request is still open you can also use Chat to talk with the agent without answering. Sending needs a connection; if you lose it, your draft is kept until you're back online. As noted in Connect your iPhone to your account, this part of the beta has not yet been confirmed end to end; if the message does not arrive, see If something fails.
 
 ## Read and act on your answer
 
-After you answer, the originating agent fetches current pending entries once, using its returned session handle as `HARKLIGHT_SESSION`:
+After you answer, the originating agent catches up once on its conversation's changes, using its returned session handle as `HARKLIGHT_SESSION`:
 
 ```sh
 harklight-agent --identity-dir ./my-agent-identity --ca-file ./harklight-agent-ca.pem \
   read --session "$HARKLIGHT_SESSION"
 ```
 
-`read` prints each pending entry as a JSON line. Reading neither acknowledges an event nor starts background delivery. Keep the same enrolled identity and local conversation journal. Only after the original agent session has actually received an event does `ack` record delivery; `HARKLIGHT_EVENT` is that event's returned ID:
+`read` prints each change as a JSON line with its `kind`, `rev` and `data`, and ends with a `caught_up` line; the first read starts with a baseline of the conversation's current state. The service records your answer or chat message as Delivered when it serves it, but reading does not start background delivery. Keep the same enrolled identity and local conversation journal. Only after the original agent session has actually received your answer does `receipt` record that handoff; `HARKLIGHT_ITEM` is the original request's returned `item_id`. For a chat message, add `--entry-id` with its `entry_id`:
 
 ```sh
 harklight-agent --identity-dir ./my-agent-identity --ca-file ./harklight-agent-ca.pem \
-  ack --session "$HARKLIGHT_SESSION" --event "$HARKLIGHT_EVENT"
+  receipt --item-id "$HARKLIGHT_ITEM"
 ```
 
-Choose the next command from the entry the agent received, not from how you answered. `HARKLIGHT_REQUEST` is the original request's ID.
+Choose the next command from the record the agent received, not from how you answered.
 
-Your answer, whether written or chosen from offered options, arrives as the request's final answered entry on the `reply` channel. It closes the request, so the agent does not answer it with `reply`. The agent reports what it did with that exact entry using `result` and the status that matches: `applied` only after it has actually performed what the answer asks, `refused` if it will not or cannot, or `received` to report it has the answer before acting, followed later by `applied` or `refused`. For example, after performing the action:
+Your answer, whether written or chosen from offered options, arrives in a `message` record as the request's `terminal`, with `state` `answered`. It closes the request, so the agent does not answer it with `reply`. The agent reports what it did with that answer using `result` and the status that matches: `applied` only after it has actually performed what the answer asks, `refused` if it will not or cannot, or `received` to report it has the answer before acting, followed later by `applied` or `refused`. For example, after performing the action:
 
 ```sh
 harklight-agent --identity-dir ./my-agent-identity --ca-file ./harklight-agent-ca.pem \
-  result --session "$HARKLIGHT_SESSION" --request "$HARKLIGHT_REQUEST" \
-  --in-reply-to "$HARKLIGHT_EVENT" --status applied
+  result --item-id "$HARKLIGHT_ITEM" --status applied
 ```
 
-A message you send with Chat while the request is still open arrives as a `discussion` entry on the `chat` channel. The agent answers that exact entry with `reply`:
+A message you send with Chat while the request is still open arrives as an `entry` record of kind `reply` from `person`, with its own `entry_id` (`HARKLIGHT_ENTRY` below). The agent answers that exact entry with `reply`:
 
 ```sh
 harklight-agent --identity-dir ./my-agent-identity --ca-file ./harklight-agent-ca.pem \
-  reply --session "$HARKLIGHT_SESSION" --request "$HARKLIGHT_REQUEST" \
-  --in-reply-to "$HARKLIGHT_EVENT" --body "I received your message."
+  reply --item-id "$HARKLIGHT_ITEM" \
+  --in-reply-to "$HARKLIGHT_ENTRY" --body "I received your message."
 ```
 
-After a request is closed it takes no new chat messages, and `reply` on it is refused. These commands are alternatives chosen from the actual entry, not a sequence to run blindly. Dynamic identifiers come from the same conversation's returned data. Neither reading nor acknowledgment proves action completion.
+Chat does not close with the request: either side can still reply after a request is closed. These commands are alternatives chosen from the actual entry, not a sequence to run blindly. Dynamic identifiers come from the same conversation's returned data. Neither reading nor a receipt proves action completion.
 
 ## Remove access
 
@@ -133,10 +132,10 @@ After confirmed removal, a new send using the retained identity and sender must 
 
 Keep the existing identity directory and journal when resolving an uncertain operation. Do not switch accounts or borrow another device's private key.
 
-- Lost enrollment response: use `enroll retry` with the same directory and original host/name/port/label. A `key_pending` request can remain pending for its 24-hour lifetime; the earlier approval code cannot be recovered. Retry after expiry, or deliberately start a new enrollment in a new directory. `enroll status` checks approval once; it does not poll.
+- Lost enrollment response: use `enroll retry` with the same directory and original host/name/port/label. A `key_pending` request does not expire; the earlier approval code cannot be recovered. Deliberately start a new enrollment in a new directory. `enroll status` checks approval once; it does not poll.
 - `key_in_use`: check enrollment status. `not_found` from status: follow the published enrollment retry instructions. Invalid inputs need correction; capacity/unavailable means retry later. A TLS failure is not a reason to disable certificate validation.
-- Unknown send or action outcome: use `retry --op-id` with its saved operation ID and the same identity/journal. Do not create a second message or changed action to resolve uncertainty. Correct inputs and create a new operation only after a definite refusal.
+- Unknown send or action outcome: use `retry --op-id` with its saved operation ID and the same identity/journal. Do not create a second message or changed action to resolve uncertainty. Correct inputs and create a new operation only after a definite refusal. An outcome reported with `error: "internal_error"` and `retryable: false` may already have committed: it stays unresolved under its original operation key with the service's `request_id`, and is not retried automatically. Check the next `read`, then replay it only with an explicit `retry --op-id`.
 - Message not in the app's Inbox: check in Devices that your iPhone is approved in the same Harklight account that approved the agent. Do not re-send to resolve an unknown send outcome; use `retry --op-id` as above.
 - Missing sign-in session: sign in to the intended account again on the website. Do not treat sign-in, approval, committed sending, real receipt, actual reply handling or confirmed removal as interchangeable success states.
 
-The [Agent 0.1.9 README](https://github.com/clickety-clacks/harklight-agent/blob/v0.1.9/README.md) contains the full enrollment failure and operation-retry reference.
+The [Agent 0.2.0 README](https://github.com/clickety-clacks/harklight-agent/blob/v0.2.0/README.md) contains the enrollment and operation-retry reference.

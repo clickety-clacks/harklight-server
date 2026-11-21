@@ -1,25 +1,30 @@
 # Harklight conversation core
 
-This is the shared source for both Harklight agent skills. The package build
-copies this text into each skill so either installed skill is self-contained.
-Examples describe `harklight-agent` 0.1.5 and the corresponding server APIs.
-Check the installed version and command help before using a capability; a
-published client or this document does not establish a deployed endpoint or
-same-session delivery integration.
+This is the shared core of the self-hosted Harklight agent skill. The package
+build appends this text to that skill so the installed skill is self-contained,
+and also publishes it as `core.md`; the hosted skill is a separate standalone
+guide. Examples describe `harklight-agent` 0.2.0 and the client API v2 server
+routes of protocol 0.2. Check the installed version and command help before
+using a capability; a published client or this document does not establish a
+deployed endpoint or same-session delivery integration.
 
 ## Identities and sender grants
 
 An enrolled **device identity** sends under its sender grants and reads the
-origin conversation feed for messages sent by that device. It can also read its
-person's device inbox through the separate device interface. Enrollment does
-not grant ownership or every sender ID. The **sender ID** identifies the source
-of a message; a message's identity is its sender ID plus message ID. Neither a
-self-stated source label nor a session handle grants access.
+agent change feed (`/v2/agent`) for messages sent by that enrolled key. It can
+also read its person's device inbox through the separate device interface.
+Enrollment does not grant ownership or every sender ID. The **sender ID**
+identifies the source of a message; a message's identity is its server-issued
+`item_id`. A sender ID plus message ID only looks up a message accepted before
+the cutover to protocol 0.2. Neither a self-stated source label nor a session
+handle grants access.
 
 A separately registered **agent identity** supports search, get and deliberate
-response under current read/respond grants at the agent HTTPS endpoint. It
-cannot send a new message. A device enrollment and sender grant do not substitute
-for agent registration or those scopes; an agent key does not substitute for
+answer through separately scoped person routes on the same mutual-TLS device
+listener. It reads the person's full view even with empty grants; answering
+needs current read and respond grants for the item's sender. It cannot send a
+new message. A device enrollment and sender grant do not substitute for agent
+registration or those scopes; an agent key does not substitute for
 the enrolled origin identity used by `harklight-agent`.
 
 Sender patterns use the same rule for origin-session sends from an enrolled
@@ -44,22 +49,25 @@ starts listening. Use the originating device's existing configuration:
 | --- | --- |
 | `--identity-dir` | `HARKLIGHT_IDENTITY_DIR` |
 | `--ca-file` | `HARKLIGHT_CA_FILE` |
-| `--origin-port` | `HARKLIGHT_ORIGIN_PORT` |
+| `--device-port` | `HARKLIGHT_DEVICE_PORT` |
 | `--state-dir` | `HARKLIGHT_AGENT_STATE_DIR` |
 
 The private identity directory contains `server.json`, `enrollment.json`,
 `identity.pem` and `identity.key`; the CLI checks the configured CA fingerprint
-and authenticates with the device certificate. The origin HTTPS port is distinct
-from enrollment, relay, dashboard and registered-agent ports. Supply it through
-`server.json`'s `origin_port` or the explicit option/environment variable;
-the client does not infer it from the relay port.
+and authenticates with the device certificate. The device port, which serves
+client API v2, is distinct from the enrollment, owner and dashboard ports;
+registered agents use the same device port. A new enrollment saves it in
+`server.json` as `device_port`. For an existing identity whose saved port
+points to enrollment, supply it through the explicit option/environment
+variable.
 
 Preserve the private journal and staged files across restarts. Its default is
 `~/Library/Application Support/Harklight/Agent` on macOS,
 `$XDG_STATE_HOME/harklight-agent` on Linux when that variable is set, otherwise
-`~/.local/state/harklight-agent`. It keeps the origin-wide feed cursor, entries
-and operation recovery state for the enrolled device in SQLite. Earlier
-`origin-feed.json` state migrates on open, leaving the original file unchanged.
+`~/.local/state/harklight-agent`. It keeps one feed cursor per scope (each
+session filter, plus a separate unfiltered scope), entries and operation
+recovery state for the enrolled device in SQLite. The first read of a scope
+takes a fresh baseline; a protocol 0.1 feed cursor is not converted.
 History has no retention limit; keep adequate disk space. Resetting this state
 is not a reply-retrieval or uncertain-send recovery procedure.
 
@@ -68,7 +76,7 @@ is not a reply-retrieval or uncertain-send recovery procedure.
 Use `send --display-name NAME` only with a sender release
 that exposes this option and corresponding server and app support. The option
 supplies the optional `message.display_name` string on the existing session
-send. The released Agent 0.1.5 does not include this option.
+send. Agent 0.2.0 includes this option.
 
 With that support, the app displays the supplied name exactly. A notification for
 one pending request carries the whole name as its alert title when it fits with
@@ -99,17 +107,18 @@ decision offers meaningful choices plus text Reply; an informational notice
 offers only Seen. Opening a message is never Seen or an answer. Do not replace
 structured choices with numbered options that the person must type.
 
-Set `HARKLIGHT_ROUTE` to the actual `claude-code`, `codex` or `other` route:
+For a decision:
 
 ```sh
-harklight-agent send --session new --sender-id app:example \
-  --route "$HARKLIGHT_ROUTE" --title "Choose the next step" \
-  --body "Select an option or write a note." --choice "Proceed" --choice "Defer"
+harklight-agent send --session new --sender-id app:example --type request \
+  --title "Choose the next step" --body "Select an option or write a note." \
+  --choice "Proceed" --choice "Defer" --reply
 ```
 
-Omit `--choice` for an open question. Use `--informational` for a Seen-only
-notice; it cannot be combined with `--choice`. Repeated choices submit their
-exact label as a JSON string. Every send carries a valid
+Omit `--choice` and keep `--reply` for an open question; `--type request`
+needs at least one `--choice` or `--reply`. Use `--type fyi` for a Seen-only
+notice; it cannot be combined with `--choice` or `--reply`. Repeated choices
+submit their exact label as a JSON string. Every send carries a valid
 `attention-client.actions/1` descriptor: text actions return the entered JSON
 string; value actions return their exact JSON value. The Seen action is:
 
@@ -128,13 +137,11 @@ An invalid or unfamiliar explicit descriptor has no guaranteed answer control.
 Rich `attention-client.ui/1` scenes and other JSON fields require receiving-client
 support; an accepted document alone proves no rendering or execution behavior.
 
-Save the full returned session handle, sender/message identity, revision and
-UUIDv4 operation ID. The committed result also contains `message_url`, a
-`harklight://message/…` link whose sender and message path segments are separately
-percent-encoded. A title, shortened display ID or vendor thread ID is not the
-session handle. For another request on the same handle, use `--session` with
-that handle and omit `--route`. Supply `--vendor-session-id` only from a documented
-harness interface; it does not prove receipt of a turn.
+Save the returned session handle (a session UUID), item ID, revision and
+UUIDv4 operation ID. The committed result carries them as `session_handle`,
+`item_id`, `response.message.revision` and `op_id`. A title, shortened display
+ID or vendor thread ID is not the session handle. For another request on the
+same handle, use `--session` with that handle.
 
 A committed send means server acceptance, not phone display, human attention or
 execution of the requested work. `outcome_unknown` is not a refusal. Preserve
@@ -145,156 +152,165 @@ harklight-agent retry --op-id "$HARKLIGHT_OP_ID"
 ```
 
 Do not send another message to discover whether an uncertain one committed.
-The journal records operations before submission and reconciles them with the
-feed. Keep the same operation key and staged file bytes on recovery. A new
-intentional action is different from retrying an unresolved operation.
+The journal records each operation's exact request before submission, and
+`retry` reuses the saved operation key, bytes and precondition. Keep the same
+operation key and staged file bytes on recovery. A new intentional action is
+different from retrying an unresolved operation. An `outcome_unknown` with
+`error:"internal_error"` and `retryable:false` may already have committed; it
+stays unresolved under its original operation key, reports the Server's
+`request_id`, and is not retried automatically. Replay requires an explicit
+`retry`.
 
 ## Listen where the originating session supports it
 
-Sending and listening have separate support. A local interactive Claude Code
-session requires version 2.1.234 or later and background tasks enabled. Arm
-one waiter as a background command in that same session after a successful send:
+Sending and listening have separate support. Where the originating session
+can run a background command, arm one waiter in that same session after a
+successful send:
 
 ```sh
-harklight-agent listen --next --session "$HARKLIGHT_SESSION" \
-  --session-context interactive --claude-code-version "$(claude --version)" \
-  --background-tasks-enabled
+harklight-agent listen --next --session "$HARKLIGHT_SESSION"
 ```
 
-The waiter holds an SSE connection, prints one pending event as JSON and exits
-so the session can process it and rearm. Cursor-only change notices cause the
-CLI to fetch authoritative feed entries on connection, a newer notice or
-reconnect; it does not poll on a timer. Reconnection can re-offer pending events.
-`listen --follow` is a continuous JSON-lines stream, not the Claude one-event
-background completion pattern.
+The waiter catches up from the saved cursor, then holds an SSE connection to
+the agent change feed filtered to that session. It prints each durable change
+as a JSON line and exits after durable changes arrive, so the session can
+process them and rearm; it does not poll on a timer. A dropped connection,
+server shutdown or 60 seconds of read silence reconnects from the last emitted
+position, and a restart can replay output already printed. `listen --follow`
+is a continuous JSON-lines stream, not the one-waiter background completion
+pattern. Omit `--session` to follow every message sent by the enrolled key.
+Feed connections are independent: several readers may follow the same scope.
 
-The CLI's support record is capability metadata, not proof that a harness
-received an event. Real same-session background-completion delivery must be
-established by the integration. Do not claim it from a running process, queued
-background task or printed line. A hosted Claude SDK session is not an interactive
-terminal: use its actual `--session-context sdk`, which records the limitation
-without attaching a stream. Preserve any concrete `unsupported_reason`; never
-supply false context or background flags to suppress it.
+Revocation and account pause stop the command with a definite diagnostic. A
+`500 internal_error` batch or an SSE close with reason `internal_error` stops
+it at its last completed position and prints "live updates paused" with the
+operation, token and Request-Id on stderr. Start a new invocation to resume
+from that position.
 
-In client 0.1.5, the native Codex listen route is rejected before opening the
-stream. Interactive mode, a background process, a vendor session ID or
-Claude-specific flags do not enable it; do not invent a `codex queue` route.
-An `other` route is unsupported unless an existing controller actually
-supervises the stream and delivers entries into the originating session. Such
-an integration declares `send --session new --route other --controller` and
-`listen --follow --controller --session "$HARKLIGHT_SESSION"`. These flags
-record the controller's declaration, not independent delivery evidence.
+Feed output is not proof that a harness received an entry. Real same-session
+background-completion delivery must be established by the integration. Do not
+claim it from a running process, queued background task or printed line.
+
 The standalone CLI does not provide a managed runtime's wake integration.
 An existing runtime may own that integration and deliver entries into its
-originating agent session. Follow that runtime's supported send/receive procedure
-without adding a competing standalone listener. Its delivery evidence does not
-change the native Codex listener's support or establish support in other contexts.
+originating agent session. Follow that runtime's supported send/receive
+procedure.
 
 Keep unsupported work with its current task owner, report the actual limitation
 and use a supported continuation or a later one-shot read. Do not fabricate a
 listener, transfer the sender or introduce a receipt-polling loop. If a background
 completion is not delivered, retain the queued work for the next turn of the
-same session. When it resumes, check `status --session "$HARKLIGHT_SESSION"` and
-rearm if work remains and no listener is active. Loss of a connection or process
-does not close a request or conversation.
+same session. When it resumes, catch up with
+`read --session "$HARKLIGHT_SESSION"` and rearm if work remains. Loss of a
+connection or process does not close a request or conversation.
 
 ## Read once without listening
 
-Client 0.1.5 includes a one-shot read for senders whose route cannot listen:
+Agent 0.2.0 includes a one-shot read for a session that does not keep a
+listener:
 
 ```sh
 harklight-agent read --session "$HARKLIGHT_SESSION"
 ```
 
-It fetches the enrolled origin's feed once from the saved cursor, journals the
-entries, and prints pending actionable entries for the selected handle locally.
-The server feed is origin-wide, not session-filtered; entries for other handles
-can be journaled too. Read does not ACK, apply an answer, open a stream, arm
-support, change the unsupported reason or promise future background delivery.
-It advances local journal state, not a server read receipt.
+It fetches the agent change feed once from the saved cursor for that session's
+scope, prints each change as a JSON line and ends with
+`{"kind":"caught_up","rev":N}`. The server filters the feed to the selected
+session; a batch position can pass agent-wide revisions for other sessions,
+including in an empty batch. On first contact or cursor expiry it first prints
+`{"kind":"baseline",...}`, snapshot rows and
+`{"kind":"baseline_complete","rev":N}`. The CLI commits the scope's cursor after
+writing the corresponding output. `--after REV` starts from a caller's own
+committed cursor and `--snapshot` takes a fresh baseline instead of the saved
+cursor. Serving a person turn or answer records it as Delivered on the server;
+that is not a handoff receipt. Read does not apply an answer, open a stream or
+promise future background delivery.
 
-Successful empty output means no pending actionable output for this handle at
+Successful output with only `caught_up` means no new change for this scope at
 that read. It does not prove closure, absence of an already handled answer or
-that no answer will arrive. A failure is not an empty successful read. Read
-again when the originating work resumes; do not send again or add a polling
-timer. `status` shows availability and pending counts but does not retrieve an
-answer. For an already valid handle, `attach` is not a prerequisite for this
-one-shot read. `result` reports what happened to a retrieved answer; it does not
-retrieve one or subscribe to future replies.
+that no answer will arrive. A failure is not an empty successful read: a failed
+read exits nonzero with the diagnostic on stderr and leaves the cursor at the
+last completed output. Read again when the originating work resumes; do not
+send again or add a polling timer. `result` reports what happened to a
+retrieved answer; it does not retrieve one or subscribe to future replies.
 
 ## Read an origin message by ID
 
-Agent 0.1.9 or newer can read one origin message from a compatible Server by
-its sender and message IDs:
+Agent 0.2.0 can read one sent message by its item ID, or a message accepted
+before the cutover by its exact sender and message IDs:
 
 ```sh
+harklight-agent message-get --item-id "$HARKLIGHT_ITEM"
+harklight-agent message-get --item-id "$HARKLIGHT_ITEM" --revision N
 harklight-agent message-get --sender-id S --message-id M
-harklight-agent message-get --sender-id S --message-id M --revision N
 ```
 
-Omit `--revision` to read the latest version; use it to select a retained
-revision. This read does not mark the message Seen or update the local journal.
-`revision_unavailable` means the requested revision is no longer retained; it
-is gone.
+Omit `--revision` to read the latest version, returned as `{rev,message}`; use
+it to select a retained revision, returned as `{rev,revision}`. This read does
+not mark the message Seen. `not_found` for a selected revision means the
+requested revision is no longer retained; it is gone.
 
 ## Handle events and outcomes
 
-Match `session_handle`, `request.sender_id`, `request.message_id`,
-`request_revision` and `event_id` against the saved request. Inspect `entry.kind`,
-`entry.author`, `channel`, `delivered` and `acted`; do not classify by body text.
-One cursor carries both channels: `reply` holds request-side entries, revisions,
-results and terminals; `chat` holds person discussion and origin conversation
-replies. An answer or No comment ends the request but can leave chat open.
-Listen remains active while status reports `open_chats > 0`; do not stop only
-because `open_requests` is zero. Honor the CLI's actual idle result.
+Match `item_id`, `session` and `request_revision` against the saved request,
+and identify each entry by `entry_id` and its `rev`. Inspect the record `kind`
+and, for an entry, its `kind`, `author` and `delivery`; do not classify by body
+text. One cursor carries `message`, `entry` and `advisory` records: a `message`
+record carries the item, with an answer or close-out in `data.terminal`; an
+`entry` record carries person and origin replies, retractions, revisions and
+results. An answer or No comment ends the request but leaves chat open.
 
-A newly received person turn or terminal needs an explicit originating-session
-ACK before acting:
+The server records a person turn or answer as Delivered when it serves it in a
+feed response. A newly received person turn or answer needs an explicit handoff
+receipt once the originating session has actually received it:
 
 ```sh
-harklight-agent ack --session "$HARKLIGHT_SESSION" --event "$HARKLIGHT_EVENT"
+harklight-agent receipt --item-id "$HARKLIGHT_ITEM" --entry-id "$HARKLIGHT_ENTRY"
+harklight-agent receipt --item-id "$HARKLIGHT_ITEM"
 ```
 
-Feed fetch, journal persistence, stdout and listener attachment are not this
-acknowledgment. ACK means delivered, not acted. If already delivered and acted,
-do not repeat the effect. For a discussion turn, reply to its exact request and
-event, preserving the current revision:
+Omit `--entry-id` for the answer. Use `--not-handed REASON` when the handoff
+failed. Feed fetch, server Delivered, journal persistence and stdout are not
+this receipt. A receipt means handed, not acted. If already delivered and acted,
+do not repeat the effect. For a person chat turn, reply to its exact item and
+entry; the server derives the current request revision:
 
 ```sh
-harklight-agent reply --session "$HARKLIGHT_SESSION" \
-  --request "$HARKLIGHT_REQUEST" --in-reply-to "$HARKLIGHT_EVENT" \
-  --body "Here is the requested detail."
+harklight-agent reply --item-id "$HARKLIGHT_ITEM" \
+  --in-reply-to "$HARKLIGHT_ENTRY" --body "Here is the requested detail."
 ```
 
 Discussion is not a terminal answer or an expansion of task authority. A chat
-entry can arrive after the request has ended, but client 0.1.5 refuses `reply`
-once a closing terminal is in its journal. Receiving or acknowledging that
-entry does not reopen the request or establish that replying is allowed.
-Preserve the refusal rather than sending a replacement to bypass closure. For a
-payload-bearing answered terminal, retain the exact JSON `entry.answer`, including
-the distinction between JSON `null` and an absent answer. Apply only the
-authorized outcome, at most once, and report it against the terminal event:
+entry can arrive after the request has ended: chat never closes, and either side
+may reply in every item state, including after an answer or retraction.
+Receiving or replying to that entry does not reopen the request. For a
+payload-bearing answered terminal, retain the exact JSON `terminal.answer`,
+including the distinction between JSON `null` and an absent answer;
+`terminal.outcome` identifies its kind. Apply only the authorized outcome, at
+most once, and report it against the item:
 
 ```sh
-harklight-agent result --session "$HARKLIGHT_SESSION" \
-  --request "$HARKLIGHT_REQUEST" --in-reply-to "$HARKLIGHT_EVENT" --status applied
+harklight-agent result --item-id "$HARKLIGHT_ITEM" --status applied
 ```
 
 Use `refused` if the effect cannot be applied, `received` when received but not
-confirmed applied. A replay with `delivered:true, acted:false` needs an actual
-effect check: if already done, report applied without doing it again; if absent,
-perform the authorized action once; if uncertain, do not repeat it or claim
-success. For a re-offered discussion, first recover any unresolved reply with
-its original operation ID. If it committed, do not reply twice. Apply the same
-effect check to any external work prompted by discussion.
+confirmed applied. A replay whose `delivery` shows `delivered:true` without
+`acted:true` needs an actual effect check: if already done, report applied
+without doing it again; if absent, perform the authorized action once; if
+uncertain, do not repeat it or claim success. For a re-offered discussion, first
+recover any unresolved reply with its original operation ID. If it committed, do
+not reply twice. Apply the same effect check to any external work prompted by
+discussion.
 
-No comment is a payload-free terminal, identified by `terminal_kind:"no_comment"`
-and the CLI's `final_terminal:"NoComment"`. It is not JSON null, an approval or
-an instruction to execute the request. Acknowledge it and report `result --status received` against that terminal
-to record receipt without claiming an applied answer; do not invent a payload. Native clients must submit the displayed request revision for No
-comment; missing/stale revisions are refused. The CLI does not update the app.
-For cleared, expired or superseded terminals, acknowledge and stop the obsolete
-request work; do not report an applied answer. An origin-authored retraction is
+No comment is a payload-free terminal, identified by
+`terminal.outcome.kind:"no_comment"` with no `terminal.answer`. It is not JSON
+null, an approval or an instruction to execute the request. Record its handoff
+with `receipt` and report `result --status received` for that item to record
+receipt without claiming an applied answer; do not invent a payload. Native
+clients must submit the displayed request revision for No comment;
+missing/stale revisions are refused. The CLI does not update the app.
+For cleared, expired or superseded terminals, stop the obsolete request work;
+do not report an applied answer. An origin-authored retraction is
 retained history, not an actionable prompt or a request to reopen. Closed
 messages remain readable; preserve useful drafts and pending answers while
 respecting the actual terminal state.
@@ -319,91 +335,93 @@ outcome is not confirmed cleanup.
 An in-place revision keeps the request identity and advances its revision:
 
 ```sh
-harklight-agent revise --session "$HARKLIGHT_SESSION" \
-  --request "$HARKLIGHT_REQUEST" --base-revision "$HARKLIGHT_REVISION" \
+harklight-agent revise --item-id "$HARKLIGHT_ITEM" \
+  --base-revision "$HARKLIGHT_REVISION" \
   --title "Updated request" --body "The revised details."
-harklight-agent retract --session "$HARKLIGHT_SESSION" --request "$HARKLIGHT_REQUEST"
+harklight-agent retract --item-id "$HARKLIGHT_ITEM"
 ```
 
-Use the current base revision and stop acting on a stale draft after revision.
+Use the current base revision and stop acting on a stale draft after revision;
+a stale base revision is refused with `412 precondition_failed`.
 `--choice` replaces choices; `--clear-choices` leaves valid text Reply controls.
-Retraction deliberately withdraws an open request using the sender/message
-identity saved in the selected journal; it is not a person answer and does not
-erase history. The older `withdraw` command remains available, including its
-optional `--in-reply-to` form. Recover an uncertain operation with its original
-`op_id`; a refusal with reason `retracted` remains a refusal.
+Retraction deliberately withdraws an open request by its item ID; it is not a
+person answer and does not erase history. Its optional
+`--in-reply-to ENTRY_ID` form also records that person entry as acted on.
+Recover an uncertain operation with its original `op_id`; a refusal with
+`already_retracted` remains a refusal.
 
 Supersession sends a new message replacing earlier messages from the same sender:
 
 ```sh
 harklight-agent send --session "$HARKLIGHT_SESSION" --sender-id app:example \
-  --title "Replacement plan" --supersedes "$EARLIER_ID_1" --supersedes "$EARLIER_ID_2"
+  --type request --reply --title "Replacement plan" \
+  --supersedes "$EARLIER_ITEM_1" --supersedes "$EARLIER_ITEM_2"
 ```
 
-Use exact earlier message IDs, not handles. Unknown or already closed targets
-produce informational `supersedes_warnings`; the new message and other valid
-supersessions still post. Superseding is distinct from revising in place.
+Use exact earlier item IDs, not handles. `--supersedes-local` instead resolves a
+local reference for the same sender before delivery. Invalid, unknown or already
+closed targets produce informational `supersedes_warnings`; the new message and
+other valid supersessions still post. Superseding is distinct from revising in
+place.
 
 ## Files and transfer reports
 
-Repeat `--file PATH` on send, reply or revise to attach files. The CLI obtains
-the origin's decoded inline allowance and upload cap, sends exact bytes inline
-within that allowance, then uploads remaining files and references their server
-identity, byte count and SHA-256. The upload body is separate from the 2 MiB JSON
-entry bound. An exceeded cap, failed upload, unusable limits or oversized final
-entry refuses the whole entry. Keep the draft and files; do not split/truncate
+Repeat `--file PATH` on send, reply or revise to attach files. The CLI stages
+the exact bytes, uploads each file separately before the message write and
+references the returned upload handles in the write's `file_ids`. The server's
+published upload cap applies to each file. `file-upload --file PATH` returns an
+upload handle that a later reply or revise can pass with `--file-id`. The
+upload body is separate from the 2 MiB JSON entry bound. An exceeded cap,
+failed upload, unusable limits or oversized final entry refuses the whole
+entry. Keep the draft and files; do not split/truncate
 an attachment or silently send only the text. Recovery reuses the same operation
 key and staged bytes.
 
-For incoming files, inspect each file's local `path`, `transfer` and `use` fields.
-The CLI saves verified bytes under the private session/event journal before
-emitting the entry. ACK records `transferred` or `not_transferred` with a reason.
-A transfer receipt is not proof that the agent read or used the file. After ACK,
-report use only for transferred files:
+For incoming files, inspect each entry's `files`: each reference carries a
+download ID (`file_id`), `name`, `size` and `sha256`. Fetch a file explicitly
+with `file-get`; the CLI verifies the bytes before creating the destination.
+Transfer and use are reported per entry and file, and the two outcomes are
+recorded independently. A transfer report is not proof that the agent read or
+used the file. After recording the handoff, report each file in its own
+operation:
 
 ```sh
-harklight-agent file-use --session "$HARKLIGHT_SESSION" \
-  --event "$HARKLIGHT_EVENT" --file "notes.pdf" --used
-harklight-agent file-use --session "$HARKLIGHT_SESSION" \
-  --event "$HARKLIGHT_EVENT" --file "diagram.png" --unusable \
+harklight-agent file-get --file-id "$HARKLIGHT_FILE" --output notes.pdf
+harklight-agent file-use --item-id "$HARKLIGHT_ITEM" \
+  --entry-id "$HARKLIGHT_ENTRY" --file-id "$HARKLIGHT_FILE" --transferred --used
+harklight-agent file-use --item-id "$HARKLIGHT_ITEM" \
+  --entry-id "$HARKLIGHT_ENTRY" --file-id "$HARKLIGHT_FILE_2" --unusable \
   --reason "This session cannot inspect this format."
 ```
 
 These are the agent's own reports, not independent evidence of vendor action.
 Explicit client navigation away from a message with unsubmitted uploads may use
-`discard-uploads --sender-id ID --message-id ID --revision N`. Journal its
-operation key and use `retry` after uncertainty. `state:"committed"` means the
-scope includes a committed reference; unsubmitted siblings may still have been
-deleted. `discarded` counts unreferenced files deleted; zero proves no particular
-file's deletion. Preserve text drafts and require reselecting discarded/fenced
-files. Process exit, disconnect, session end or view rebuild is not that
-navigation event. The server's one-hour inactivity cleanup for unsubmitted
-agent uploads is separate.
+`discard-uploads --file-id HANDLE` for each of its own unattached upload
+handles. Journal its operation key and use `retry` after uncertainty. An upload
+already attached to a message or entry is refused with `already_closed`.
+Preserve text drafts and require reselecting discarded files. Process exit,
+disconnect, session end or view rebuild is not that navigation event. The
+server keeps unattached uploads for its 30-day retention window, separately.
 
 ## Runtime recovery facilities
 
 A runtime that must durably bind its sending-session record before submission
 can use `send --prepare --op-id UUID` with the normal send inputs, persist the
-returned operation/request/file manifest, then call `send --execute --op-id UUID`.
-Prepare may read file limits but submits neither uploads nor the message.
-Execute uses only the saved inputs; recover uncertainty with the same operation.
-This facility does not create a listener or a delivery integration.
+returned `prepared` record (operation ID, session handle, local request ID and
+immutable metadata including file names, lengths and digests), then call
+`send --execute --op-id UUID`. Prepare is local: it stages exact input bytes and
+submits neither uploads nor the message. Execute uses only the saved inputs;
+recover uncertainty with the same operation. This facility does not create a
+listener or a delivery integration.
 
-After a restart on the same host with the same enrollment and journal,
-`attach --session HANDLE --vendor-session-id ID --route ROUTE` updates the
-existing handle's vendor ID and support record. A successful attach can report
-`ready_for_listen:false`; it does not enable an unsupported listener or prove
-same-session delivery. Use `none` to clear the vendor ID. It requires the
-committed creating send in the journal, preserves history,
-and does not migrate an origin to another device. Wait for both operations to
-be confirmed before listening; recover an uncertain printed operation, then
-repeat attach with unchanged inputs to resume. Use `session end --session HANDLE --gone` only when deliberately reporting that the originating session is gone;
-process exit by itself is not a person answer.
+Use `session end --session HANDLE` only when deliberately reporting that the
+originating session is gone; process exit by itself is not a person answer.
 
 ## Separately granted agent search and response
 
-Use this only when a registered-agent endpoint and compatible server CLI are
-available. A person owner registers the public key created by
+Use this only when a registered agent identity and compatible server CLI are
+available; the CLI connects to the device port, which serves client API v2. A
+person owner registers the public key created by
 `agent keygen --directory "$AGENT_DIR"` using `owner agent-register`, then sets
 read/respond patterns with `owner agent-grants-replace`. Those are separately
 authorized provisioning operations, not repairs to try after a blocked send.
@@ -412,32 +430,45 @@ With connection details and the registered identity supplied for this purpose:
 
 ```sh
 "$HARKLIGHT_SERVER_CLI" agent search --directory "$AGENT_DIR" \
-  --connect "$SERVER_ADDRESS" --name "$SERVER_NAME" --port "$AGENT_PORT" \
-  --ca "$CA_PEM" --sender app:example --text "next step"
+  --connect "$SERVER_ADDRESS" --name "$SERVER_NAME" --port "$DEVICE_PORT" \
+  --ca "$CA_PEM" --sender app:example --q "next step"
 "$HARKLIGHT_SERVER_CLI" agent get --directory "$AGENT_DIR" \
-  --connect "$SERVER_ADDRESS" --name "$SERVER_NAME" --port "$AGENT_PORT" \
+  --connect "$SERVER_ADDRESS" --name "$SERVER_NAME" --port "$DEVICE_PORT" \
+  --ca "$CA_PEM" --item-id "$ITEM_ID" --entries
+"$HARKLIGHT_SERVER_CLI" agent get --directory "$AGENT_DIR" \
+  --connect "$SERVER_ADDRESS" --name "$SERVER_NAME" --port "$DEVICE_PORT" \
   --ca "$CA_PEM" --sender app:example --message request-1
 ```
 
-Search also accepts `--state`, `--limit` and its returned `--cursor`. Get returns
-the exact message visible under current read scope. To answer an open message,
-use `acceptance_seq` and `request_revision` from the same get/search item, a
-caller-held UUIDv4 operation ID, an intent reference meaningful to the task and
-a file containing one JSON value. The acceptance sequence stays unchanged after
-a revision; `request_revision` identifies the content being answered. Set
-`ACCEPTANCE_SEQ` and `REQUEST_REVISION` from those returned fields:
+Search (`GET /v2/search`) also accepts `--message`, `--state`, `--limit` and
+`--page` with a previous response's `next_page`. Get (`GET /v2/items/{item_id}`)
+reads the person's item by `--item-id`, or the item an exact `--sender` and
+`--message` name; `--entries` adds its entries page (`--before`, `--limit`).
+Each prints the server's JSON body. Reading needs no read grant. To answer an
+open message, use the item's `request_revision` from the same get/search item
+and a file containing one AnswerBody object: at most one of `choice` (an action
+`id`), `comment` or `result`, or `{}` to answer with no comment. Set
+`REQUEST_REVISION` from that returned field:
 
 ```sh
-"$HARKLIGHT_SERVER_CLI" agent respond --directory "$AGENT_DIR" \
-  --connect "$SERVER_ADDRESS" --name "$SERVER_NAME" --port "$AGENT_PORT" \
+"$HARKLIGHT_SERVER_CLI" agent answer --directory "$AGENT_DIR" \
+  --connect "$SERVER_ADDRESS" --name "$SERVER_NAME" --port "$DEVICE_PORT" \
   --ca "$CA_PEM" --sender app:example --message request-1 \
-  --acceptance "$ACCEPTANCE_SEQ" --request-revision "$REQUEST_REVISION" --op "$OP_ID" --intent-ref "$INTENT_REF" \
-  --answer-file answer.json
+  --request-revision "$REQUEST_REVISION" --answer-file answer.json
 ```
 
-The CLI displays the exact target and asks for `ANSWER` before submission.
-Respond requires current read and respond grants. Reuse the same operation ID
-and exact answer after an uncertain result; a changed answer is a new deliberate
-decision and may lose to an already committed terminal response. This operation
-records a response; it neither executes the source action nor proves phone
-display. It is not the originating device's request/listen/reply procedure.
+`agent respond` is the same command. It is `POST /v2/items/{item_id}/answer`.
+The CLI saves the exact body and an `Idempotency-Key` (`--key UUID`, or a
+generated one) under `operations/` in the agent directory before anything is
+sent. It names its item by `--item-id`, or by an exact `--sender` and
+`--message`. The CLI shows the item, revision, key and exact body and asks for
+`ANSWER` before submission.
+Answering requires current read and respond grants for the item's sender.
+Rerunning the same command resends the same body with the same key; the server
+replays a committed answer (`"replayed": true`) instead of writing a second one.
+Nothing is retried automatically, including after a non-retryable
+`internal_error`. A different body for the same item and revision is refused
+locally (`operation_conflict`). A changed answer is a new deliberate decision
+and may lose to an already committed terminal response. This operation records a response; it
+neither executes the source action nor proves phone display. It is not the
+originating device's request/listen/reply procedure.
