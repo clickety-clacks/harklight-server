@@ -5,7 +5,9 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
 
   import ExUnit.CaptureLog
 
-  alias AttentionServer.{ChangeLog, ClientAPI, JSON, Relay, TLSFixtures}
+  import AttentionServer.ClientAPIFeedClient, except: [connect: 2, connect: 3, connect: 4]
+
+  alias AttentionServer.{ChangeLog, ClientAPI, ClientAPIFeedClient, JSON, Relay, TLSFixtures}
   alias AttentionServer.ClientAPI.{Principal, Reads}
 
   @handle "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
@@ -94,131 +96,7 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
              })
   end
 
-  defp connect(ctx) do
-    assert {:ok, conn} =
-             Mint.HTTP.connect(:https, "127.0.0.1", ctx.port,
-               hostname: "relay.test",
-               protocols: [:http2],
-               mode: :passive,
-               transport_opts: [
-                 versions: [:"tlsv1.3"],
-                 cacertfile: Path.join(ctx.certs, "ca.pem"),
-                 certfile: Path.join(ctx.certs, "a1.pem"),
-                 keyfile: Path.join(ctx.certs, "a1.key"),
-                 server_name_indication: ~c"relay.test",
-                 timeout: 5_000
-               ]
-             )
-
-    conn
-  end
-
-  defp batch(conn, query) do
-    {:ok, conn, ref} =
-      Mint.HTTP.request(
-        conn,
-        "GET",
-        "/v2/changes" <> query,
-        [{"accept", "application/json"}],
-        nil
-      )
-
-    {conn, response} = collect(conn, ref, %{headers: [], body: ""})
-    assert {:ok, body} = JSON.decode_line(response.body <> "\n")
-    {conn, response.status, body}
-  end
-
-  defp collect(conn, ref, acc) do
-    {:ok, conn, responses} = Mint.HTTP.recv(conn, 0, 5_000)
-
-    acc =
-      Enum.reduce(responses, acc, fn
-        {:status, ^ref, status}, acc -> Map.put(acc, :status, status)
-        {:headers, ^ref, headers}, acc -> Map.update!(acc, :headers, &(&1 ++ headers))
-        {:data, ^ref, data}, acc -> Map.update!(acc, :body, &(&1 <> data))
-        {:done, ^ref}, acc -> Map.put(acc, :done, true)
-        _, acc -> acc
-      end)
-
-    if acc[:done], do: {conn, acc}, else: collect(conn, ref, acc)
-  end
-
-  defp open_feed(conn, query \\ "", headers \\ []) do
-    {:ok, conn, ref} =
-      Mint.HTTP.request(
-        conn,
-        "GET",
-        "/v2/changes" <> query,
-        [{"accept", "text/event-stream"} | headers],
-        nil
-      )
-
-    {conn, %{ref: ref, buffer: "", status: nil, headers: [], done: false}}
-  end
-
-  defp recv(conn, feed) do
-    {:ok, conn, responses} = Mint.HTTP.recv(conn, 0, 5_000)
-
-    feed =
-      Enum.reduce(responses, feed, fn
-        {:status, ref, status}, f when ref == feed.ref -> %{f | status: status}
-        {:headers, ref, headers}, f when ref == feed.ref -> %{f | headers: f.headers ++ headers}
-        {:data, ref, data}, f when ref == feed.ref -> %{f | buffer: f.buffer <> data}
-        {:done, ref}, f when ref == feed.ref -> %{f | done: true}
-        _, f -> f
-      end)
-
-    {conn, feed}
-  end
-
-  # Reads until `count` events (heartbeats included) have arrived.
-  defp events(conn, feed, count, acc \\ [])
-
-  defp events(conn, feed, count, acc) when length(acc) >= count,
-    do: {conn, feed, Enum.reverse(acc)}
-
-  defp events(conn, feed, count, acc) do
-    case String.split(feed.buffer, "\n\n", parts: 2) do
-      [block, rest] ->
-        events(conn, %{feed | buffer: rest}, count, [parse(block) | acc])
-
-      [_incomplete] ->
-        if feed.done, do: flunk("feed ended after #{length(acc)} events")
-        {conn, feed} = recv(conn, feed)
-        events(conn, feed, count, acc)
-    end
-  end
-
-  # Reads change events until one has `id` >= rev, skipping heartbeats.
-  defp changes_through(conn, feed, rev, acc \\ []) do
-    {conn, feed, [event]} = events(conn, feed, 1)
-
-    cond do
-      event[:event] == "heartbeat" -> changes_through(conn, feed, rev, acc)
-      event.id >= rev -> {conn, feed, Enum.reverse([event | acc])}
-      true -> changes_through(conn, feed, rev, [event | acc])
-    end
-  end
-
-  defp await_open(conn, %{status: nil} = feed) do
-    {conn, feed} = recv(conn, feed)
-    await_open(conn, feed)
-  end
-
-  defp await_open(conn, feed), do: {conn, feed}
-
-  defp parse(block) do
-    block
-    |> String.split("\n")
-    |> Enum.reduce(%{}, fn line, event ->
-      case String.split(line, ": ", parts: 2) do
-        ["id", id] -> Map.put(event, :id, String.to_integer(id))
-        ["event", kind] -> Map.put(event, :event, kind)
-        ["data", data] -> Map.put(event, :data, elem(JSON.decode_line(data <> "\n"), 1))
-        _ -> event
-      end
-    end)
-  end
+  defp connect(ctx), do: ClientAPIFeedClient.connect(ctx.port, ctx.certs, "a1")
 
   defp head(ctx), do: elem(ChangeLog.head(:sys.get_state(ctx.relay).store, "A"), 1)
 
