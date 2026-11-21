@@ -30,7 +30,7 @@ defmodule AttentionServer.ClientAPI.Writes do
 
   import Plug.Conn
 
-  alias AttentionServer.{BrowserRecipient, Engine, JSON, Relay}
+  alias AttentionServer.{BrowserRecipient, ChangeLog, Engine, JSON, Relay}
   alias AttentionServer.ClientAPI.{Context, Errors, Idempotency, Reads, Resources}
 
   @max_body_bytes 64 * 1024
@@ -40,7 +40,9 @@ defmodule AttentionServer.ClientAPI.Writes do
   @impl true
   def routes do
     [
-      {"POST", ["items", :item_id, "seen"], :post_seen}
+      {"POST", ["items", :item_id, "seen"], :post_seen},
+      {"PUT", ["items", :item_id, "read-position"], :put_read_position},
+      {"POST", ["items", :item_id, "replies"], :post_replies}
     ]
   end
 
@@ -50,6 +52,33 @@ defmodule AttentionServer.ClientAPI.Writes do
          {:ok, body, conn} <- json_body(conn),
          :ok <- only_members(body, []) do
       respond(conn, seen(ctx.relay, ctx.principal, ctx.params.item_id, key))
+    else
+      {:error, token, field, conn} -> Errors.send_error(conn, token, field: field)
+      {:error, token, field} -> Errors.send_error(conn, token, field: field)
+    end
+  end
+
+  @doc false
+  def put_read_position(conn, %Context{} = ctx) do
+    with {:ok, key} <- optional_key(conn),
+         {:ok, body, conn} <- json_body(conn),
+         :ok <- only_members(body, ["entry_id"]),
+         {:ok, entry_id} <- string_member(body, "entry_id") do
+      respond(conn, read_position(ctx.relay, ctx.principal, ctx.params.item_id, entry_id, key))
+    else
+      {:error, token, field, conn} -> Errors.send_error(conn, token, field: field)
+      {:error, token, field} -> Errors.send_error(conn, token, field: field)
+    end
+  end
+
+  @doc false
+  def post_replies(conn, %Context{} = ctx) do
+    with {:ok, key} <- required_key(conn),
+         {:ok, body, conn} <- json_body(conn),
+         :ok <- only_members(body, ["text", "file_ids"]),
+         {:ok, text} <- string_member(body, "text"),
+         {:ok, file_ids} <- file_ids(body) do
+      respond(conn, reply(ctx.relay, ctx.principal, ctx.params.item_id, text, file_ids, key))
     else
       {:error, token, field, conn} -> Errors.send_error(conn, token, field: field)
       {:error, token, field} -> Errors.send_error(conn, token, field: field)
@@ -67,6 +96,36 @@ defmodule AttentionServer.ClientAPI.Writes do
     })
   end
 
+  @doc """
+  `PUT /v2/items/{item_id}/read-position`: the chat read position, compared by
+  entry `position`, max-wins. It reads through the newest agent reply at or
+  before `entry_id`; an entry at or below the current position leaves the item
+  unchanged and answers it.
+  """
+  def read_position(relay, who, item_id, entry_id, idempotency_key \\ nil) do
+    write(relay, who, idempotency_key, {:read_position, item_id, entry_id}, %{
+      method: "PUT",
+      path: ["items", item_id, "read-position"],
+      body: %{"entry_id" => entry_id}
+    })
+  end
+
+  @doc """
+  `POST /v2/items/{item_id}/replies`: the person's reply in the item's chat
+  (today's `discussion`), accepted in every item state and whether or not the
+  agent is listening.
+  """
+  def reply(relay, who, item_id, text, file_ids \\ [], idempotency_key) do
+    body = %{"text" => text}
+    body = if file_ids == [], do: body, else: Map.put(body, "file_ids", file_ids)
+
+    write(relay, who, idempotency_key, {:reply, item_id, text, file_ids}, %{
+      method: "POST",
+      path: ["items", item_id, "replies"],
+      body: body
+    })
+  end
+
   defp write(relay, who, key, operation, request) do
     digest = Idempotency.digest(request.method, request.path, request.body)
 
@@ -77,6 +136,9 @@ defmodule AttentionServer.ClientAPI.Writes do
       {:apply, engine_key, frame} ->
         outcome = apply_frame(relay, engine_key, frame)
         result(call(relay, {:finish, who, key, digest, operation, outcome}), false)
+
+      :unchanged ->
+        result(call(relay, {:finish, who, key, digest, operation, {:ok, :unchanged}}), false)
 
       error ->
         result(error, false)
@@ -142,7 +204,7 @@ defmodule AttentionServer.ClientAPI.Writes do
       with {:ok, principal} <- principal(state.store.engine, who),
            {:ok, nil} <- stored(state, principal.person, key, digest),
            {:ok, frame} <- frame(state.store.engine, principal, key, operation) do
-        {:apply, principal.engine_key, frame}
+        if frame == :unchanged, do: :unchanged, else: {:apply, principal.engine_key, frame}
       else
         {:ok, %{status: status, body: body}} -> {:replay, status, body}
         error -> error
@@ -156,7 +218,7 @@ defmodule AttentionServer.ClientAPI.Writes do
       with {:ok, principal} <- principal(state.store.engine, who) do
         result =
           case outcome do
-            {:ok, _reply} -> render(operation, who, from, state)
+            {:ok, reply} -> render(operation, who, principal.person, reply, from, state)
             error -> error
           end
 
@@ -212,10 +274,51 @@ defmodule AttentionServer.ClientAPI.Writes do
     end
   end
 
-  defp render({:seen, item_id}, who, from, state) do
+  defp render({:seen, item_id}, who, _person, _reply, from, state),
+    do: render_item(item_id, who, from, state)
+
+  defp render({:read_position, item_id, _entry_id}, who, _person, _reply, from, state),
+    do: render_item(item_id, who, from, state)
+
+  defp render({:reply, item_id, _text, _files}, who, person, %{"seq" => seq}, from, state) do
+    with {:ok, 200, body} <- render_item(item_id, who, from, state),
+         {:ok, entry} <- render_entry(state, person, seq) do
+      {:ok, 200, Map.put(body, "entry", entry)}
+    end
+  end
+
+  defp render_item(item_id, who, from, state) do
     case Reads.handle_call({:item, who, item_id}, from, state) do
       {:reply, {:ok, body}, _state} -> {:ok, 200, body}
       {:reply, error, _state} -> error
+    end
+  end
+
+  # The entry a write created, rendered from the same state as its item.
+  defp render_entry(state, person, seq) do
+    engine = state.store.engine
+
+    case Resources.entry_for_fact(engine, person, seq) do
+      %{} = entry ->
+        revs =
+          entry
+          |> Resources.entry_sources()
+          |> Enum.map(fn source ->
+            case ChangeLog.rev(state.store, person, ChangeLog.entry_resource(source)) do
+              {:ok, rev} -> rev
+              {:error, :not_found} -> 1
+              _ -> :error
+            end
+          end)
+
+        if :error in revs,
+          do: {:error, :storage_unavailable},
+          else:
+            {:ok,
+             entry |> Resources.stamp(Enum.max(revs)) |> then(&Resources.render(:entry, &1, nil))}
+
+      nil ->
+        {:error, :not_found}
     end
   end
 
@@ -235,6 +338,77 @@ defmodule AttentionServer.ClientAPI.Writes do
          "message_id" => message_id,
          "request_revision" => revision
        }}
+    end
+  end
+
+  # The read position moves to the newest agent reply at or before the entry,
+  # never backward. With none past the current position nothing changes.
+  defp frame(engine, principal, key, {:read_position, item_id, entry_id}) do
+    person = principal.person
+
+    with {:ok, {_person, sender, message_id} = message_key} <-
+           Resources.item_key(engine, person, item_id),
+         {:ok, seq} <- item_entry_seq(engine, person, message_key, entry_id) do
+      current = Map.get(engine.chat_read_positions, message_key, 0)
+
+      case newest_origin_reply(engine, person, message_key, seq, current) do
+        nil ->
+          {:ok, :unchanged}
+
+        through ->
+          {:ok,
+           %{
+             "v" => 1,
+             "type" => "conversation_read",
+             "op_id" => op_id(key),
+             "sender_id" => sender,
+             "message_id" => message_id,
+             "read_through_conversation_seq" => through
+           }}
+      end
+    end
+  end
+
+  # Chat never closes: the reply goes to the item's current revision in any
+  # state. The engine stores it for the agent whether or not it is listening.
+  defp frame(engine, principal, key, {:reply, item_id, text, file_ids}) do
+    with {:ok, {_person, sender, message_id} = message_key} <-
+           Resources.item_key(engine, principal.person, item_id),
+         :ok <- no_file_ids(file_ids) do
+      %{revision: revision} = Map.fetch!(engine.messages, message_key)
+
+      {:ok,
+       %{
+         "v" => 1,
+         "type" => "discussion",
+         "op_id" => op_id(key),
+         "sender_id" => sender,
+         "message_id" => message_id,
+         "request_revision" => revision,
+         "text" => text
+       }}
+    end
+  end
+
+  # Uploaded files arrive with POST /v2/files, a later slice.
+  defp no_file_ids([]), do: :ok
+  defp no_file_ids(_), do: {:error, :unsupported, "file_ids"}
+
+  defp item_entry_seq(engine, person, message_key, entry_id) do
+    with {:ok, seq} <- Resources.entry_seq(entry_id),
+         %{key: ^message_key} <- Map.get(engine.conversation_events, {person, seq}) do
+      {:ok, seq}
+    else
+      _ -> {:error, :invalid_field, "entry_id"}
+    end
+  end
+
+  defp newest_origin_reply(_engine, _person, _key, seq, current) when seq <= current, do: nil
+
+  defp newest_origin_reply(engine, person, key, seq, current) do
+    case Map.get(engine.conversation_events, {person, seq}) do
+      %{key: ^key, payload: %{"kind" => "reply", "author" => "origin"}} -> seq
+      _ -> newest_origin_reply(engine, person, key, seq - 1, current)
     end
   end
 
@@ -299,6 +473,32 @@ defmodule AttentionServer.ClientAPI.Writes do
 
       _ ->
         {:error, "invalid_field", "Idempotency-Key"}
+    end
+  end
+
+  defp optional_key(conn) do
+    case get_req_header(conn, "idempotency-key") do
+      [] -> {:ok, nil}
+      _ -> required_key(conn)
+    end
+  end
+
+  defp string_member(body, name) do
+    case Map.get(body, name) do
+      value when is_binary(value) -> {:ok, value}
+      _ -> {:error, "invalid_field", name}
+    end
+  end
+
+  defp file_ids(body) do
+    case Map.get(body, "file_ids", []) do
+      ids when is_list(ids) ->
+        if Enum.all?(ids, &(is_binary(&1) and &1 != "")),
+          do: {:ok, ids},
+          else: {:error, "invalid_field", "file_ids"}
+
+      _ ->
+        {:error, "invalid_field", "file_ids"}
     end
   end
 
