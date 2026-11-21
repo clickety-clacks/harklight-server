@@ -1417,10 +1417,10 @@ Writes return 200 unless the table says otherwise. Each response schema requires
   and the server successfully writes the ephemeral `show` frame to that
   connection. The handler waits only for the server feed writer's result,
   bounded by the shared request timeout. Otherwise the state is `held`,
-  including when the write fails or is skipped. In either case, the show
-  stays pending in relay memory. The device's next focus-write response
-  carries it only while it is still pending (§5.1). Both delivery paths
-  use the same `show_id`, which the client applies once.
+  including when the write fails or is skipped. In either case, the
+  device's next focus-write response carries the show only while it is
+  still pending (§5.1). Both delivery paths use the same `show_id`,
+  which the client applies once.
 - **Files.** An agent uses the §4 device download response for
   `GET /v2/files/{file_id}`, including its stored type and quoted sha256
   ETag. `FileCreated.file_id` is the upload handle, accepted by a write's
