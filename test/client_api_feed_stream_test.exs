@@ -446,10 +446,7 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
     principal = %Principal{kind: :device, key: agent, person: person}
     conn = ClientAPIFeedClient.connect(ctx.port, ctx.certs, "b1")
 
-    {:ok, conn, ref} =
-      Mint.HTTP.request(conn, "GET", "/v2/agent/changes", [{"accept", "text/event-stream"}], nil)
-
-    feed = %{ref: ref, buffer: "", status: nil, headers: [], done: false}
+    {conn, feed} = open_agent_feed(conn)
     {conn, feed} = await_open(conn, feed)
     assert feed.status == 200
 
@@ -483,6 +480,27 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
     {_conn, feed, beats} = events(conn, feed, 2)
     assert beats == List.duplicate(%{event: "heartbeat", data: %{}}, 2)
     refute feed.done
+  end
+
+  test "an agent storage failure closes the SSE feed and leaves Relay alive", ctx do
+    {conn, feed} = open_agent_feed(connect(ctx))
+    {conn, feed} = await_open(conn, feed)
+    assert feed.status == 200
+    break_store(ctx)
+
+    assert :ok = ChangeLog.notify(%{{:agent, "A", ctx.reader} => 1})
+    {conn, feed, closing} = until_closing(conn, feed)
+
+    assert closing == %{event: "closing", data: %{"reason" => "storage_unavailable"}}
+    assert {_conn, %{done: true}} = drain(conn, feed)
+    assert Process.alive?(ctx.relay)
+  end
+
+  defp open_agent_feed(conn) do
+    {:ok, conn, ref} =
+      Mint.HTTP.request(conn, "GET", "/v2/agent/changes", [{"accept", "text/event-stream"}], nil)
+
+    {conn, %{ref: ref, buffer: "", status: nil, headers: [], done: false}}
   end
 
   defp next_focus(_conn, _feed, 0), do: flunk("focus event missing")
