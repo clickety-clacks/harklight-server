@@ -16,11 +16,8 @@ defmodule AttentionServer.AgentAPI.FeedRenderer do
       entries
       |> Enum.group_by(&elem(&1, 0), &elem(&1, 1))
       |> Enum.flat_map(fn {engine_key, positions} ->
-        positions = MapSet.new(positions)
-
-        with {:ok, raw} <- AgentResources.raw_entries(state, scope, engine_key),
-             page = Enum.filter(raw, &MapSet.member?(positions, &1["position"])),
-             {:ok, wire} <- AgentResources.render_entries(state, scope, page) do
+        with {:ok, raw} <- AgentResources.raw_entries(state, scope, engine_key, positions),
+             {:ok, wire} <- AgentResources.render_entries(state, scope, raw) do
           Enum.map(wire, &{&1["position"], &1})
         else
           _ -> []
