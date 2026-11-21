@@ -80,7 +80,7 @@ defmodule AttentionServer.ClientAPI.Errors do
   @doc """
   Send the error envelope for `token`.
 
-  Options: `field` (the offending member name) and `retry_after` (seconds, used
+  Options: `field` (the offending member name, a string or an atom) and `retry_after` (seconds, used
   only on `503`; defaults to #{@default_retry_after_s}).
   """
   @spec send_error(Plug.Conn.t(), token(), keyword()) :: Plug.Conn.t()
@@ -118,4 +118,7 @@ defmodule AttentionServer.ClientAPI.Errors do
 
   defp maybe_put(map, _key, nil), do: map
   defp maybe_put(map, key, value) when is_binary(value), do: Map.put(map, key, value)
+
+  defp maybe_put(map, key, value) when is_atom(value),
+    do: Map.put(map, key, Atom.to_string(value))
 end
