@@ -1118,6 +1118,7 @@ defmodule AttentionServer.ChangeLog do
            ),
          :ok <- raise_floors(db, floors),
          :ok <- run(db, "DELETE FROM client_changes WHERE at_ms < ?", [before_ms]),
+         :ok <- AttentionServer.AgentChangeLog.prune(db, before_ms),
          :ok <- Sqlite3.execute(db, "COMMIT") do
       {:ok, Enum.reduce(floors, 0, fn [_, _, count], acc -> acc + count end)}
     else

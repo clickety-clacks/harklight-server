@@ -148,8 +148,10 @@ defmodule AttentionServer.Store do
   def enable_change_log(%__MODULE__{db: nil}), do: {:error, :not_durable}
 
   def enable_change_log(%__MODULE__{db: db, version: version} = store) do
-    case AttentionServer.ChangeLog.enable(db, version) do
-      :ok -> {:ok, %{store | change_log: true}}
+    with :ok <- AttentionServer.ChangeLog.enable(db, version),
+         :ok <- AttentionServer.AgentChangeLog.enable(db, store.engine, version) do
+      {:ok, %{store | change_log: true}}
+    else
       _ -> {:error, :storage_unavailable}
     end
   end
@@ -1110,8 +1112,13 @@ defmodule AttentionServer.Store do
             {person, AttentionServer.ChangeLog.seeded?(store.engine, person)}
           end)
 
-        {pending, seeded, AttentionServer.ChangeLog.closings(store.engine, next),
-         AttentionServer.ChangeLog.new_resources(store.engine, next)}
+        %{
+          pending: pending,
+          seeded: seeded,
+          closings: AttentionServer.ChangeLog.closings(store.engine, next),
+          created: AttentionServer.ChangeLog.new_resources(store.engine, next),
+          agent_pending: AttentionServer.AgentChangeLog.changes(store.engine, next)
+        }
       end
 
     result =
@@ -1127,15 +1134,19 @@ defmodule AttentionServer.Store do
         case Persistence.run(fn ->
                persist_snapshot(generation, persisted, rows, audit, old_ids, next_ids, log)
              end) do
-          {:ok, cache, heads} -> {:ok, cache, heads, durable_next, persisted, index}
-          error -> error
+          {:ok, cache, heads, agent_heads} ->
+            {:ok, cache, heads, agent_heads, durable_next, persisted, index}
+
+          error ->
+            error
         end
       end
 
     case result do
-      {:ok, cache, heads, durable_next, persisted, index} ->
+      {:ok, cache, heads, agent_heads, durable_next, persisted, index} ->
         AttentionServer.ChangeLog.notify(heads)
-        if log, do: AttentionServer.ChangeLog.notify_closing(elem(log, 2))
+        AttentionServer.ChangeLog.notify(agent_heads)
+        if log, do: AttentionServer.ChangeLog.notify_closing(log.closings)
 
         {:ok,
          %{
@@ -1219,7 +1230,7 @@ defmodule AttentionServer.Store do
              "INSERT INTO relay_audit (person_id, actor_id, action, at_ms) VALUES (?, ?, ?, ?)",
              [audit.person, audit.actor, audit.action, System.system_time(:millisecond)]
            ),
-         {:ok, heads} <- append_change_log(db, log, version + 1),
+         {:ok, heads, agent_heads} <- append_change_logs(db, log, version + 1),
          :ok <- Sqlite3.execute(db, "COMMIT") do
       if is_binary(upload_dir) do
         case LargeData.delete_unreferenced(upload_dir, old_ids, next_ids) do
@@ -1237,14 +1248,20 @@ defmodule AttentionServer.Store do
         end
       end
 
-      {:ok, cache, heads}
+      {:ok, cache, heads, agent_heads}
     end
   end
 
-  defp append_change_log(_db, nil, _version), do: {:ok, %{}}
+  defp append_change_logs(_db, nil, _version), do: {:ok, %{}, %{}}
 
-  defp append_change_log(db, {pending, seeded, _closings, created}, version),
-    do: AttentionServer.ChangeLog.append(db, pending, seeded, version, created)
+  defp append_change_logs(db, log, version) do
+    with {:ok, heads} <-
+           AttentionServer.ChangeLog.append(db, log.pending, log.seeded, version, log.created),
+         {:ok, agent_heads} <-
+           AttentionServer.AgentChangeLog.append(db, log.agent_pending, version) do
+      {:ok, heads, agent_heads}
+    end
+  end
 
   # ACKs must be durable before their replies, but do not change retained history.
   # The overlay is tied to the snapshot generation. Older releases ignore it;
