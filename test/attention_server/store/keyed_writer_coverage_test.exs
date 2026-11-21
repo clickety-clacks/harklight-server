@@ -2,6 +2,7 @@ defmodule AttentionServer.Store.KeyedWriterCoverageTest do
   use ExUnit.Case, async: true
 
   alias AttentionServer.{Engine, Relay, Store}
+  alias AttentionServer.Store.RecordCodec
   alias Exqlite.Sqlite3
 
   @moduletag :tmp_dir
@@ -14,8 +15,10 @@ defmodule AttentionServer.Store.KeyedWriterCoverageTest do
   # store. A new public function fails the first test until it is classified,
   # and an engine writer fails the second test until it has a refusal probe.
   #
-  # :engine_writer - changes engine state; must refuse on a keyed store until
-  #                  the keyed writer is installed.
+  # :keyed_writer  - changes engine state through the keyed commit; must
+  #                  succeed on a keyed store and survive a keyed reopen.
+  # :keyed_refused - changes engine state but has no keyed form; must refuse
+  #                  on a keyed store and leave every table and file unchanged.
   # :side_table    - writes only mode-neutral tables that a keyed reopen reads
   #                  back unchanged (inbox snapshot paging, change log setup,
   #                  which conversion advances to the keyed generation).
@@ -26,11 +29,11 @@ defmodule AttentionServer.Store.KeyedWriterCoverageTest do
     {:open, 2} => :lifecycle,
     {:close, 1} => :lifecycle,
     {:enable_change_log, 1} => :side_table,
-    {:commit, 3} => :engine_writer,
-    {:commit, 4} => :engine_writer,
-    {:put_published_upload, 2} => :engine_writer,
-    {:delete_uploads, 3} => :engine_writer,
-    {:accept_inbox_checkpoint, 8} => :engine_writer,
+    {:commit, 3} => :keyed_writer,
+    {:commit, 4} => :keyed_writer,
+    {:put_published_upload, 2} => :keyed_writer,
+    {:delete_uploads, 3} => :keyed_writer,
+    {:accept_inbox_checkpoint, 8} => :keyed_refused,
     {:stage_upload, 3} => :files,
     {:publish_staged_upload, 3} => :files,
     {:prune_untracked_uploads, 1} => :files,
@@ -95,12 +98,11 @@ defmodule AttentionServer.Store.KeyedWriterCoverageTest do
     assert Enum.sort(exported) == Enum.sort(Map.keys(@classification))
   end
 
-  test "every engine writer refuses a keyed store and leaves its state unchanged", %{
-    path: path,
-    id: id
+  test "every keyed-refused writer refuses a keyed store and leaves its state unchanged", %{
+    path: path
   } do
-    writers = for {fun, :engine_writer} <- @classification, do: fun
-    probes = refusal_probes(id)
+    writers = for {fun, :keyed_refused} <- @classification, do: fun
+    probes = refusal_probes()
     assert Enum.sort(writers) == Enum.sort(Map.keys(probes))
 
     for {{name, arity} = fun, probe} <- probes do
@@ -121,6 +123,98 @@ defmodule AttentionServer.Store.KeyedWriterCoverageTest do
       assert reopened.engine == store.engine
       assert :ok = Store.close(reopened)
     end
+  end
+
+  test "every keyed writer commits on a keyed store and survives a keyed reopen", %{
+    path: path,
+    id: id
+  } do
+    writers = for {fun, :keyed_writer} <- @classification, do: fun
+    probes = writer_probes(id)
+    assert Enum.sort(writers) == Enum.sort(Map.keys(probes))
+
+    # Deletion runs last because the upload probe copies the fixture upload.
+    for {{name, arity}, probe} <- Enum.sort_by(probes, &(elem(elem(&1, 0), 0) == :delete_uploads)) do
+      assert {:ok, store} = Store.open(path, :keyed)
+      before = fingerprint(store)
+
+      assert {:ok, committed} = probe.(store), "#{name}/#{arity} did not commit"
+      assert committed.mode == :keyed
+      assert committed.version == store.version + 1
+      refute fingerprint(committed) == before, "#{name}/#{arity} wrote nothing"
+      assert :ok = Store.close(committed)
+
+      assert {:ok, reopened} = Store.open(path, :keyed)
+      assert reopened.version == committed.version
+      assert records(reopened.engine) == records(committed.engine)
+      assert :ok = Store.close(reopened)
+    end
+  end
+
+  test "a keyed commit without touched addresses is refused", %{path: path} do
+    assert {:ok, store} = Store.open(path, :keyed)
+    before = fingerprint(store)
+    assert {:error, :storage_unavailable, ^store} = Store.commit(store, proposal(store), @audit)
+    assert fingerprint(store) == before
+    assert :ok = Store.close(store)
+  end
+
+  test "a keyed commit appends change log rows that a keyed reopen keeps", %{path: path} do
+    assert {:ok, store} = Store.open(path, :keyed)
+    assert {:ok, store} = Store.enable_change_log(store)
+    assert {:ok, [[epoch]]} = epoch(store.db)
+
+    frame = %{
+      "v" => 1,
+      "type" => "forward",
+      "op_id" => "00000000-0000-4000-8000-000000000030",
+      "message" => %{
+        "sender_id" => "app:test",
+        "message_id" => "logged",
+        "created_at" => 1,
+        "title" => "Logged"
+      }
+    }
+
+    {next, _reply} =
+      Engine.request_line(store.engine, "origin", AttentionServer.JSON.encode_line(frame), 1_000)
+
+    assert {:ok, committed} = Store.commit(store, touched(store, next), @audit)
+    assert {:ok, [[count]]} = query(committed.db, "SELECT count(*) FROM client_changes")
+    assert count > 0
+
+    assert {:ok, [[version]]} =
+             query(committed.db, "SELECT store_version FROM client_change_log_state WHERE id = 1")
+
+    assert version == committed.version
+    assert :ok = Store.close(committed)
+
+    assert {:ok, reopened} = Store.open(path, :keyed)
+    assert {:ok, reopened} = Store.enable_change_log(reopened)
+    assert {:ok, [[^epoch]]} = epoch(reopened.db)
+    assert {:ok, [[^count]]} = query(reopened.db, "SELECT count(*) FROM client_changes")
+    assert :ok = Store.close(reopened)
+  end
+
+  defp epoch(db) do
+    case query(db, "SELECT epoch FROM client_change_log_epoch WHERE id = 1") do
+      {:ok, []} -> {:ok, [[0]]}
+      other -> other
+    end
+  end
+
+  test "a keyed upload deletion removes its file after the commit", %{path: path, id: id} do
+    assert {:ok, store} = Store.open(path, :keyed)
+    file = Path.join(store.upload_dir, id)
+    assert File.exists?(file)
+    assert {:ok, committed} = Store.delete_uploads(store, [id], @audit)
+    refute File.exists?(file)
+    refute Map.has_key?(committed.engine.uploads, id)
+    assert :ok = Store.close(committed)
+
+    assert {:ok, reopened} = Store.open(path, :keyed)
+    refute Map.has_key?(reopened.engine.uploads, id)
+    assert :ok = Store.close(reopened)
   end
 
   test "a refused keyed checkpoint stays pending and retryable after reopen", %{path: path} do
@@ -159,22 +253,44 @@ defmodule AttentionServer.Store.KeyedWriterCoverageTest do
     assert :ok = Store.close(reopened)
   end
 
-  defp refusal_probes(id) do
+  defp refusal_probes do
+    %{{:accept_inbox_checkpoint, 8} => &accept/1}
+  end
+
+  defp writer_probes(id) do
     %{
-      {:commit, 3} => fn store -> Store.commit(store, proposal(store), @audit) end,
-      {:commit, 4} => fn store -> Store.commit(store, proposal(store), @audit, []) end,
+      {:commit, 3} => fn store -> Store.commit(store, touched(store, proposal(store)), @audit) end,
+      {:commit, 4} => fn store ->
+        Store.commit(store, touched(store, proposal(store)), @audit, [])
+      end,
       {:put_published_upload, 2} => fn store ->
         metadata = %{Map.fetch!(store.engine.uploads, id) | id: @second_upload}
         Store.put_published_upload(store, metadata)
       end,
-      {:delete_uploads, 3} => fn store -> Store.delete_uploads(store, [id], @audit) end,
-      {:accept_inbox_checkpoint, 8} => &accept/1
+      {:delete_uploads, 3} => fn store -> Store.delete_uploads(store, [id], @audit) end
     }
   end
 
   defp proposal(store) do
-    assert {:ok, engine} = Engine.setup_person(store.engine, "B")
+    assert {:ok, engine} = Engine.setup_person(store.engine, "B#{store.version}")
     engine
+  end
+
+  defp records(engine) do
+    Map.new(RecordCodec.encode(engine), fn {key, payload, _checksum} -> {key, payload} end)
+  end
+
+  # Test oracle: every record whose encoding differs is a touched address.
+  defp touched(store, next) do
+    old = records(store.engine)
+    new = records(next)
+
+    addresses =
+      MapSet.union(MapSet.new(Map.keys(old)), MapSet.new(Map.keys(new)))
+      |> Enum.reject(&(Map.fetch(old, &1) === Map.fetch(new, &1)))
+      |> MapSet.new(&elem(:erlang.binary_to_term(&1), 1))
+
+    {next, addresses}
   end
 
   defp pending_snapshot(store) do
