@@ -631,6 +631,23 @@ Only their transport changes, and they are device-only.
   restores normal open and read behavior. A show itself never causes Seen, an
   answer, a reply, an open, a read, APNs, sound, haptics, or a device wake.
 
+## 5.2 Device removal and sign-out
+
+In-app sign-out that removes this device uses the existing
+`POST /device/remove` on the enrollment listener, authenticated with the
+device certificate. This route is outside `/v2`. Before calling it, the
+client makes a best-effort `PUT /v2/devices/me/focus` with
+`screen: "signed_out"` so focus readers see the sign-out immediately.
+
+Removing the device removes its push binding and ends its open feeds with
+`event: closing` and `reason: "revoked"`. New connections with the removed
+certificate fail at TLS. An already-open connection can return
+`401 unauthorized` on a subsequent request (§7).
+
+Removal by the owner or through account removal has the same revocation
+signals. The app offers re-enrolment when it learns that the device was
+revoked elsewhere.
+
 ## 6. The change feed
 
 `GET /v2/changes?after=<rev>&limit=<n>`
