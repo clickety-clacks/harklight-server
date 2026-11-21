@@ -590,8 +590,8 @@ defmodule AttentionServer.Store do
 
   defp check_retained_uploads(%__MODULE__{engine: engine, upload_dir: directory}, verify) do
     engine
-    |> retained_upload_ids()
-    |> Enum.reduce_while(:ok, fn id, :ok ->
+    |> KeyedValidation.upload_index()
+    |> Enum.reduce_while(:ok, fn {id, _address}, :ok ->
       with true <- AttentionServer.Message.uuid_v4?(id),
            {:ok, upload} <- Map.fetch(engine.uploads, id),
            :ok <- verify.(Path.join(directory, id), upload) do
@@ -600,16 +600,6 @@ defmodule AttentionServer.Store do
         _ -> {:halt, {:error, :retained_upload_unavailable}}
       end
     end)
-  end
-
-  defp retained_upload_ids(engine) do
-    origin_ids = engine |> KeyedValidation.upload_index() |> Map.keys() |> MapSet.new()
-
-    for {_key, record} <- engine.messages,
-        {_revision, files} <- Map.get(record, :files_by_revision, %{}),
-        %{"tier" => "upload", "upload_id" => id} <- files,
-        into: origin_ids,
-        do: id
   end
 
   defp verify_upload_size(path, %{size: size}) do
