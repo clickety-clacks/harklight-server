@@ -60,6 +60,10 @@ defmodule AttentionServer.Store.KeyedDifferentialTest do
       assert responses == :same, detail
       assert codec_diff(legacy_next, keyed_next) == MapSet.new(), detail
 
+      if kind == :wire do
+        assert_complete_touches(keyed.engine, keyed_next, touched, detail)
+      end
+
       old_result = Store.commit(legacy, legacy_next, audit(label))
       new_result = Store.commit(keyed, {keyed_next, touched}, audit(label))
       old_ok = match?({:ok, _}, old_result)
@@ -221,13 +225,8 @@ defmodule AttentionServer.Store.KeyedDifferentialTest do
     at = 1_000 + n
     {plain, old_response} = Engine.request_line(legacy.engine, actor, raw, at)
 
-    {tracked, new_response, _engine_touched} =
+    {tracked, new_response, touched} =
       Engine.request_line_with_touches(keyed.engine, actor, raw, at)
-
-    # This sweep checks the keyed Store against the legacy Store for a complete
-    # touched set, taken from the record diff. Engine touch completeness for
-    # wire operations is checked separately once every transition reports it.
-    touched = codec_diff(keyed.engine, tracked)
 
     responses = if old_response == new_response, do: :same, else: {old_response, new_response}
     {:wire, frame["type"], plain, tracked, touched, responses}
