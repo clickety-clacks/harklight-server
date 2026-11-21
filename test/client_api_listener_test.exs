@@ -26,6 +26,7 @@ defmodule AttentionServer.ClientAPIListenerTest do
     def routes do
       [
         {"GET", ["whoami"], :whoami},
+        {"GET", ["me"], :whoami},
         {"POST", ["echo", :id], :echo},
         {"GET", ["boom"], :boom},
         {"GET", ["held"], :held},
@@ -221,6 +222,56 @@ defmodule AttentionServer.ClientAPIListenerTest do
         assert {:ok, _other, %{status: 200}} = request(other, "GET", "/v2/whoami")
         assert keys["a1"] != key
       end
+    end
+
+    test "a paused account gets 403 account_paused on every request except GET /v2/me", ctx do
+      assert {:ok, person} = Relay.hosted_account_create(ctx.relay, "acct-paused")
+      TLSFixtures.make_self_signed_client!(ctx.certs, "paused-device")
+
+      assert {:ok, _key} =
+               Relay.setup_device_certificate(
+                 ctx.relay,
+                 person,
+                 TLSFixtures.certificate_der!(ctx.certs, "paused-device")
+               )
+
+      assert {:ok, conn} = device_connect(ctx, "paused-device", :http2)
+      assert {:ok, conn, %{status: 200}} = request(conn, "GET", "/v2/whoami")
+      assert {:ok, _} = Relay.hosted_delivery_state(ctx.relay, person, "STOPPED")
+
+      refused = [
+        {"GET", "/v2/whoami"},
+        {"POST", "/v2/echo/x"},
+        {"GET", "/v2/nothing"},
+        {"POST", "/v2/me"},
+        {"GET", "/v2/me/more"}
+      ]
+
+      conn =
+        Enum.reduce(refused, conn, fn {method, path}, conn ->
+          assert {:ok, conn, response} = request(conn, method, path)
+          assert response.status == 403
+          assert [request_id] = header(response, "request-id")
+
+          assert json(response) == %{
+                   "error" => "account_paused",
+                   "retryable" => false,
+                   "request_id" => request_id
+                 }
+
+          conn
+        end)
+
+      assert {:ok, conn, response} = request(conn, "GET", "/v2/me")
+      assert response.status == 200
+      assert json(response)["person"] == person
+
+      # Another account is unaffected.
+      assert {:ok, other} = device_connect(ctx, "a1", :http2)
+      assert {:ok, _other, %{status: 200}} = request(other, "GET", "/v2/whoami")
+
+      assert {:ok, _} = Relay.hosted_delivery_state(ctx.relay, person, "RESTORED")
+      assert {:ok, _conn, %{status: 200}} = request(conn, "GET", "/v2/whoami")
     end
 
     test "a handler defect answers 503 retry_later with Retry-After", ctx do
