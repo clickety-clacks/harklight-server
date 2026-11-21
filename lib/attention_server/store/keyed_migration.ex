@@ -9,7 +9,11 @@ defmodule AttentionServer.Store.KeyedMigration do
 
   # The caller supplies the fully normalized and verified legacy Store,
   # including its generation-matched progress overlay.
-  def convert(%Store{db: db, engine: engine, version: version} = store) do
+  def convert(%Store{} = store) do
+    with {:ok, prepared} <- convert_store(store), do: {:ok, prepared.version}
+  end
+
+  def convert_store(%Store{db: db, engine: engine, version: version} = store) do
     persisted = LargeData.persist_refs(engine)
     expected = canonical(persisted)
     generation = version + 1
@@ -24,10 +28,11 @@ defmodule AttentionServer.Store.KeyedMigration do
            :ok <- RecordTable.seed(db, generation, RecordCodec.encode(persisted)),
            {:ok, restored} <- read_records(db),
            true <- canonical(restored) === expected,
+           {:ok, prepared} <- Store.prepare_keyed_conversion(store, restored, generation),
            :ok <- write_anchor(db, version, generation),
            :ok <- advance_current_logs(db, version, generation),
            :ok <- Sqlite3.execute(db, "DELETE FROM relay_device_progress") do
-        {:ok, generation}
+        {:ok, prepared}
       else
         false -> {:error, :migration_readback_mismatch}
         error -> error

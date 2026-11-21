@@ -23,7 +23,17 @@ defmodule AttentionServer.Store.KeyedMigrationTest do
     assert {:ok, generation} = KeyedMigration.convert(store)
     assert generation == store.version + 1
     assert :ok = Store.close(store)
-    assert {:error, _reason} = Store.open(path)
+    before_refusal = File.read!(path)
+
+    refusal =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert {:error, {:storage_unavailable, {:error, :format30_requires_keyed_mode}}} =
+                 Store.open(path)
+      end)
+
+    assert refusal =~ "FORMAT30"
+    assert refusal =~ "restore the pre-upgrade backup"
+    assert File.read!(path) == before_refusal
     assert {:ok, keyed} = Store.open(path, :keyed)
     assert keyed.version == generation
     assert keyed.engine == RouteBIndex.enable_keyed_lookups(store.engine)

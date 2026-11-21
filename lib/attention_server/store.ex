@@ -9,6 +9,8 @@ defmodule AttentionServer.Store do
   silently replacing committed work. This is not a public database API.
   """
 
+  require Logger
+
   alias AttentionServer.{
     APNS,
     BrowserRecipient,
@@ -50,6 +52,7 @@ defmodule AttentionServer.Store do
     source_bindings: %{},
     upload_links: %{},
     authority_index: %{},
+    blob_owners: %{},
     progress_version: 0,
     encoding_cache: %{},
     change_log: false,
@@ -189,9 +192,8 @@ defmodule AttentionServer.Store do
         open(path, :keyed)
 
       {:ok, :legacy} ->
-        with {:ok, legacy} <- open(path, :legacy),
-             {:ok, _} <- convert_and_close(legacy) do
-          open(path, :keyed)
+        with {:ok, legacy} <- open(path, :legacy) do
+          convert_legacy_store(legacy)
         end
 
       error ->
@@ -251,16 +253,40 @@ defmodule AttentionServer.Store do
     end
   end
 
-  defp convert_and_close(legacy) do
-    try do
-      KeyedMigration.convert(legacy)
-    after
-      close(legacy)
+  defp convert_legacy_store(legacy) do
+    case KeyedMigration.convert_store(legacy) do
+      {:ok, _} = converted ->
+        converted
+
+      error ->
+        _ = close(legacy)
+        error
+    end
+  catch
+    kind, reason ->
+      _ = close(legacy)
+      :erlang.raise(kind, reason, __STACKTRACE__)
+  end
+
+  @doc false
+  def prepare_keyed_conversion(legacy, decoded, generation) do
+    with {:ok, engine} <- validate_keyed_engine(decoded),
+         engine = rebuild_open_indexes(engine),
+         {:ok, rows} <- load_large_data_references(legacy.db),
+         {:ok, engine} <- LargeData.attach_paths(engine, legacy.upload_dir, rows),
+         :ok <- LargeData.verify_all(engine) do
+      finalize_mode(%__MODULE__{
+        db: legacy.db,
+        upload_dir: legacy.upload_dir,
+        engine: engine,
+        version: generation,
+        mode: :keyed
+      })
     end
   end
 
   defp finalize_open(db, upload_dir, engine, version, mode) do
-    engine = engine |> Engine.rebuild_default_index() |> Conversation.index_origin_feeds()
+    engine = rebuild_open_indexes(engine)
 
     with {:ok, reference_rows} <- load_large_data_references(db),
          :ok <- File.mkdir_p(upload_dir),
@@ -281,6 +307,10 @@ defmodule AttentionServer.Store do
     end
   end
 
+  defp rebuild_open_indexes(engine) do
+    engine |> Engine.rebuild_default_index() |> Conversation.index_origin_feeds()
+  end
+
   defp finalize_mode(%__MODULE__{mode: :keyed} = store) do
     engine = AttentionServer.RouteBIndex.enable_keyed_lookups(store.engine)
 
@@ -290,7 +320,8 @@ defmodule AttentionServer.Store do
        | engine: engine,
          source_bindings: engine.route_b_index.source_bindings,
          upload_links: KeyedValidation.upload_index(engine),
-         authority_index: KeyedValidation.authority_index(engine)
+         authority_index: KeyedValidation.authority_index(engine),
+         blob_owners: KeyedReference.blob_owners(engine)
      }}
   end
 
@@ -1217,14 +1248,15 @@ defmodule AttentionServer.Store do
 
   defp initialize(db, _upload_dir, :keyed) do
     with {:ok, engine, generation} <- KeyedMigration.load(db),
-         engine = engine |> BounceDecision.rebuild_indexes() |> Engine.rebuild_route_b_index(),
-         true <- valid_state?(engine),
+         {:ok, engine} <- validate_keyed_engine(engine),
          :ok <- set_durability(db) do
       {:ok, engine, generation}
-    else
-      false -> {:error, :invalid_state}
-      error -> error
     end
+  end
+
+  defp validate_keyed_engine(decoded) do
+    engine = decoded |> BounceDecision.rebuild_indexes() |> Engine.rebuild_route_b_index()
+    if valid_state?(engine), do: {:ok, engine}, else: {:error, :invalid_state}
   end
 
   defp set_durability(db),
@@ -1327,7 +1359,8 @@ defmodule AttentionServer.Store do
                items
              ),
            {:ok, prepared} <-
-             KeyedReference.prepare(store.engine, next, touched, store.upload_dir) do
+             KeyedReference.prepare(store.engine, next, touched, store.upload_dir),
+           {:ok, blob_owners} <- update_blob_owners(store, prepared) do
         %{engine: next, records: records, delete_paths: deleted, reference_rows: refs} = prepared
         log = prepare_change_logs(store, next, touched, projected_entries)
         %{db: db, version: version} = store
@@ -1343,7 +1376,9 @@ defmodule AttentionServer.Store do
                end)
              end) do
           {:ok, {heads, agent_heads}} ->
-            prune_reference_candidates(db, store.upload_dir, prepared.orphan_candidates)
+            removed = for {id, change} <- prepared.blob_delta, change < 0, do: id
+            candidates = prepared.orphan_candidates ++ removed
+            prune_reference_candidates(db, store.upload_dir, candidates, blob_owners)
             AttentionServer.ChangeLog.notify(heads)
             AttentionServer.ChangeLog.notify(agent_heads)
             if log, do: AttentionServer.ChangeLog.notify_closing(log.closings)
@@ -1355,6 +1390,7 @@ defmodule AttentionServer.Store do
                  source_bindings: index,
                  upload_links: upload_links,
                  authority_index: authority_index,
+                 blob_owners: blob_owners,
                  version: store.version + 1,
                  change_log_touched:
                    MapSet.union(store.change_log_touched, MapSet.new(Map.keys(heads)))
@@ -1393,10 +1429,25 @@ defmodule AttentionServer.Store do
     end)
   end
 
-  defp prune_reference_candidates(db, directory, candidates) do
+  defp update_blob_owners(store, prepared) do
+    case KeyedReference.update_blob_owners(store.blob_owners, prepared.blob_delta) do
+      {:ok, _} = result ->
+        result
+
+      error ->
+        LargeData.cleanup_created(prepared.created)
+        error
+    end
+  end
+
+  defp prune_reference_candidates(db, directory, candidates, owners) do
     Enum.each(Enum.uniq(candidates), fn id ->
       if one(db, "SELECT 1 FROM relay_large_data_refs WHERE id = ? LIMIT 1", [id]) == {:ok, nil} do
-        _ = File.rm(Path.join(directory, id))
+        if Map.has_key?(owners, id) do
+          Logger.warning("event=harklight_unresolved_large_data_reference retained_blobs=1")
+        else
+          _ = File.rm(Path.join(directory, id))
+        end
       end
     end)
   end
@@ -1790,8 +1841,16 @@ defmodule AttentionServer.Store do
         if :crypto.hash(:sha256, payload) == checksum do
           try do
             :ok = AttentionServer.Store.StoredTerms.load_atoms()
+            _ = RecordCodec.identity()
 
             case :erlang.binary_to_term(payload, [:safe]) do
+              {:attention_relay_keyed_state, 30, _identity} ->
+                Logger.error(
+                  "Harklight Store uses FORMAT30. To run Harklight 0.1.x, restore the pre-upgrade backup."
+                )
+
+                {:error, :format30_requires_keyed_mode}
+
               {:attention_relay_state, format, %Engine{} = stored}
               when format in [
                      1,

@@ -4,6 +4,23 @@ defmodule AttentionServer.Store.KeyedReference do
   alias AttentionServer.LargeData
   alias AttentionServer.Store.RecordCodec
 
+  def blob_owners(engine) do
+    engine
+    |> Map.from_struct()
+    |> Map.drop(RecordCodec.derived_fields())
+    |> LargeData.count_blob_owners()
+  end
+
+  def update_blob_owners(owners, delta) do
+    Enum.reduce_while(delta, {:ok, owners}, fn {id, change}, {:ok, current} ->
+      case Map.get(current, id, 0) + change do
+        count when count > 0 -> {:cont, {:ok, Map.put(current, id, count)}}
+        0 -> {:cont, {:ok, Map.delete(current, id)}}
+        _ -> {:halt, {:error, :invalid_blob_owners}}
+      end
+    end)
+  end
+
   def prepare(old, next, touched, directory) do
     changes = %{
       engine: next,
@@ -11,6 +28,7 @@ defmodule AttentionServer.Store.KeyedReference do
       delete_paths: [],
       reference_rows: [],
       orphan_candidates: [],
+      blob_delta: %{},
       created: []
     }
 
@@ -23,13 +41,19 @@ defmodule AttentionServer.Store.KeyedReference do
           deleted = Enum.map(previous, &hd/1)
           candidates = Enum.map(previous, fn [_, _, id, _, _] -> id end)
 
+          blob_delta =
+            old
+            |> count_record_blobs(address, updated.blob_delta, -1)
+            |> then(&count_record_blobs(updated.engine, address, &1, 1))
+
           {:cont,
            {:ok,
             %{
               updated
               | delete_paths: deleted ++ updated.delete_paths,
                 reference_rows: rows ++ updated.reference_rows,
-                orphan_candidates: candidates ++ updated.orphan_candidates
+                orphan_candidates: candidates ++ updated.orphan_candidates,
+                blob_delta: blob_delta
             }}}
 
         error ->
@@ -37,6 +61,13 @@ defmodule AttentionServer.Store.KeyedReference do
           {:halt, error}
       end
     end)
+  end
+
+  defp count_record_blobs(engine, address, counts, direction) do
+    case RecordCodec.lookup(engine, address) do
+      {:ok, value} -> LargeData.count_blob_owners(value, counts, direction)
+      :error -> counts
+    end
   end
 
   defp prepare_record(changes, address, directory) do

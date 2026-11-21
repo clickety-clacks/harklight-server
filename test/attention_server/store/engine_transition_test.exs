@@ -457,6 +457,41 @@ defmodule AttentionServer.Store.EngineTransitionTest do
     :ok = Store.close(reopened)
   end
 
+  test "keyed cleanup retains unresolved markers until their last owner disappears" do
+    path = legacy_store_path()
+    {:ok, store} = Store.open(path, :keyed_cutover)
+    audit = %{person: @person, actor: @origin, action: "forward"}
+    item = {@person, @sender, "msg"}
+    body = :binary.copy("r", AttentionServer.LargeData.inline_limit() + 1)
+
+    {next, {:ok, _}, keys} =
+      Engine.request_line_with_touches(store.engine, @origin, forward_line(), 100)
+
+    {:ok, store} = Store.commit(store, {replace_body(next, item, body), keys}, audit)
+    ref = store.engine.messages[item].message["body"]
+    marker = AttentionServer.LargeData.persist_refs(ref)
+    touched = MapSet.new([{:row, :messages, item}])
+
+    assert {:ok, store} =
+             Store.commit(store, {replace_body(store.engine, item, marker), touched}, audit)
+
+    assert File.read(ref.path) == {:ok, body}
+    :ok = Store.close(store)
+    assert {:ok, reopened} = Store.open(path, :keyed)
+    assert reopened.engine.messages[item].message["body"] == marker
+    assert File.read(ref.path) == {:ok, body}
+
+    assert {:ok, committed} =
+             Store.commit(
+               reopened,
+               {replace_body(reopened.engine, item, "short"), touched},
+               audit
+             )
+
+    refute File.exists?(ref.path)
+    :ok = Store.close(committed)
+  end
+
   test "retained ownership prevents deleting a device from the keyed store" do
     path = legacy_store_path()
     {:ok, legacy} = Store.open(path)
