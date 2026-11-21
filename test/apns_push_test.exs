@@ -1742,26 +1742,7 @@ defmodule AttentionServer.APNSPushTest do
     register_test_binding(relay, fast_key, fast_token, 2)
     forward_test_message(relay, sender_key)
 
-    stalled_send = fn _config, _claim, _cached_token ->
-      receive do
-        :release_stalled_attempt -> flunk("the stalled attempt must be canceled")
-      end
-    end
-
-    # A sender that cannot complete makes a zero-length yield deterministic.
-    deadline =
-      Task.async(fn ->
-        links = Process.info(self(), :links)
-
-        result =
-          Worker.handle_info(:dispatch, %{state | apns_send: stalled_send, attempt_timeout_ms: 0})
-
-        assert Process.info(self(), :links) == links
-        assert_received :dispatch
-        result
-      end)
-
-    assert {:noreply, state_after_timeout} = Task.await(deadline, 5_000)
+    state_after_timeout = dispatch_stalled_attempt(state)
 
     assert %{
              "push" => %{
@@ -1794,6 +1775,53 @@ defmodule AttentionServer.APNSPushTest do
 
     assert {:ok, [%{"message_id" => "first-push"}], 1} =
              Relay.events(restarted_relay, slow_key, 0)
+  end
+
+  defp dispatch_stalled_attempt(state) do
+    stalled_send = fn _config, _claim, _cached_token ->
+      receive do
+        :release_stalled_attempt -> flunk("the stalled attempt must be canceled")
+      end
+    end
+
+    dispatch =
+      Task.async(fn ->
+        receive do
+          :dispatch ->
+            # A sender that cannot complete makes a zero-length yield deterministic.
+            result =
+              Worker.handle_info(:dispatch, %{
+                state
+                | apns_send: stalled_send,
+                  attempt_timeout_ms: 0
+              })
+
+            assert_received :dispatch
+            result
+        end
+      end)
+
+    dispatcher = dispatch.pid
+    trace = :trace.session_create(:stalled_apns_attempt, self(), [])
+
+    try do
+      # The zero-length yield can cancel the task before the sender starts.
+      assert :trace.process(trace, dispatcher, true, [:procs]) == 1
+      send(dispatcher, :dispatch)
+      assert_receive {:trace, ^dispatcher, :spawn, attempt, _mfa}, 5_000
+
+      try do
+        result = Task.yield(dispatch, 5_000)
+        if is_nil(result), do: Task.shutdown(dispatch, :brutal_kill)
+        assert {:ok, {:noreply, state_after_timeout}} = result
+        refute Process.alive?(attempt)
+        state_after_timeout
+      after
+        Process.exit(attempt, :kill)
+      end
+    after
+      :trace.session_destroy(trace)
+    end
   end
 
   defp push_worker(server) do
