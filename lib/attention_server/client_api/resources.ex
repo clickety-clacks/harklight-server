@@ -196,9 +196,12 @@ defmodule AttentionServer.ClientAPI.Resources do
       "chat" => chat(engine, key, record, summary, reply),
       "terminal" => terminal(record),
       "rank" => rank,
-      "created_at_ms" => Map.get(record, :accepted_at),
       @viewer => %{"origin" => record.origin}
     }
+    # Round 8: arrival (today's free-order counter) orders the new-messages
+    # area; created_at_ms is display only and absent when the record has none.
+    |> put_present("created_at_ms", time_ms(Map.get(record, :accepted_at)))
+    |> put_present("arrival", positive(Map.get(record, :free_order)))
     |> put_present("availability", item_availability(engine, person, record, summary))
     |> put_present("result", origin_result(record))
   end
@@ -269,11 +272,16 @@ defmodule AttentionServer.ClientAPI.Resources do
       "unread_replies" => unread
     }
 
-    # Today's chat-reply row, while it has unread replies (contract rounds 5
-    # and 6): its key in Rank.key's space, and its group in free order.
+    # Today's chat-reply row, whenever the item has an agent reply (contract
+    # round 7): its key in Rank.key's space, its group in free order, and its
+    # priority as today's reply rows show it.
     case reply do
-      %{"key" => reply_key, "group" => group} when unread > 0 ->
-        Map.merge(chat, %{"reply_rank_key" => reply_key, "reply_group" => group})
+      %{"key" => reply_key, "group" => group, "priority" => priority} ->
+        Map.merge(chat, %{
+          "reply_rank_key" => reply_key,
+          "reply_group" => group,
+          "reply_priority" => priority
+        })
 
       _ ->
         chat
@@ -448,6 +456,7 @@ defmodule AttentionServer.ClientAPI.Resources do
   """
   def ranks(%Engine{} = engine, person, view, previous \\ %{}) when is_map(previous) do
     entries = view_entries(view)
+    reply_levels = view_reply_entries(view)
     listed = listed_units(engine, person, view)
     listed_items = for {:item, id, _key, _section, _group} <- listed, into: MapSet.new(), do: id
 
@@ -476,8 +485,17 @@ defmodule AttentionServer.ClientAPI.Resources do
 
         Map.update(acc, id, rank, &Map.merge(rank, Map.take(&1, ["_reply"])))
 
-      {:reply, id, _key, _section, group} = unit, acc ->
-        reply = %{"_reply" => %{"key" => Map.fetch!(keys, unit_id(unit)), "group" => group}}
+      {:reply, id, key, row, _} = unit, acc ->
+        reply = %{
+          "_reply" => %{
+            "key" => Map.fetch!(keys, unit_id(unit)),
+            "group" => row.group,
+            "priority" =>
+              %{"level" => reply_row_level(engine, key, reply_levels)}
+              |> put_present("score", row.score)
+          }
+        }
+
         Map.update(acc, id, reply, &Map.merge(&1, reply))
     end)
   end
@@ -507,9 +525,8 @@ defmodule AttentionServer.ClientAPI.Resources do
   defp unit_id({:item, id, _, _, _}), do: id
   defp unit_id({:reply, id, _, _, _}), do: "r" <> id
 
-  # Today's list rows, in order, as rank units. Reply rows count only while
-  # they have unread agent replies; read ones are history that clients draw
-  # from the item itself.
+  # Today's list rows, in order, as rank units, including every chat-reply row
+  # (round 7: clients choose which reply rows to draw).
   defp listed_units(engine, person, %{list_items: rows}) when is_list(rows) do
     {units, _seen} =
       Enum.reduce(rows, {[], MapSet.new()}, fn row, {units, seen} ->
@@ -542,7 +559,7 @@ defmodule AttentionServer.ClientAPI.Resources do
   end
 
   defp list_unit(%{"kind" => "reply", "unseen_count" => unseen} = row, id, key, _record)
-       when is_integer(unseen) and unseen > 0 do
+       when is_integer(unseen) and unseen >= 0 do
     group =
       case row do
         %{"free_section" => %{"group" => group}}
@@ -553,10 +570,68 @@ defmodule AttentionServer.ClientAPI.Resources do
           nil
       end
 
-    {:ok, {:reply, id, key, "current", group}}
+    score = if is_number(row["score"]), do: row["score"]
+    {:ok, {:reply, id, key, %{group: group, score: score}, nil}}
   end
 
   defp list_unit(_row, _id, _key, _record), do: :skip
+
+  # Today's per-reply priority view entries, by item and conversation sequence.
+  defp view_reply_entries(%{replies: replies}) when is_list(replies) do
+    Enum.reduce(replies, %{}, fn
+      %{"sender_id" => sender, "message_id" => id, "conversation_seq" => seq} = entry, acc
+      when is_integer(seq) ->
+        Map.update(acc, {sender, id}, %{seq => entry}, &Map.put(&1, seq, entry))
+
+      _, acc ->
+        acc
+    end)
+  end
+
+  defp view_reply_entries(_), do: %{}
+
+  @levels ~w(low normal high now)
+
+  # A reply's level is today's display priority for it: the view's priority,
+  # which is the item's effective urgency, or that urgency when the view
+  # carries none (the selected ranking does not decorate replies).
+  defp reply_level(entry, record) do
+    case entry do
+      %{"priority" => level} when level in @levels -> level
+      _ -> Message.effective_urgency(record.message)
+    end
+  end
+
+  # A reply row's level: the highest among its unseen replies, or with none
+  # unseen, its newest reply's.
+  defp reply_row_level(engine, {person, sender, id} = key, reply_entries) do
+    record = Map.fetch!(engine.messages, key)
+    read_through = Map.get(engine.chat_read_positions, key, 0)
+    by_seq = Map.get(reply_entries, {sender, id}, %{})
+
+    replies =
+      engine.route_b_index.conversations_by_item
+      |> Map.get(key, :gb_trees.empty())
+      |> :gb_trees.values()
+      |> Enum.filter(fn seq ->
+        match?(
+          %{payload: %{"kind" => "reply", "author" => "origin"}},
+          Map.get(engine.conversation_events, {person, seq})
+        )
+      end)
+
+    chosen =
+      case Enum.filter(replies, &(&1 > read_through)) do
+        [] -> Enum.take(replies, 1)
+        unseen -> unseen
+      end
+
+    chosen
+    |> Enum.map(&reply_level(Map.get(by_seq, &1), record))
+    |> Enum.max_by(&Enum.find_index(@levels, fn level -> level == &1 end), fn ->
+      Message.effective_urgency(record.message)
+    end)
+  end
 
   defp view_entries(%{message_entries_by_identity: entries}) when is_map(entries), do: entries
   defp view_entries(_), do: %{}
@@ -710,7 +785,8 @@ defmodule AttentionServer.ClientAPI.Resources do
   `position`. Receipts and acknowledgments are not entries; they show on the
   entry they refer to as `delivery`.
   """
-  def entries(%Engine{} = engine, {person, _, _} = key) do
+  def entries(%Engine{} = engine, {person, sender, id} = key, view \\ nil) do
+    reply_entries = view |> view_reply_entries() |> Map.get({sender, id}, %{})
     record = Map.fetch!(engine.messages, key)
     item_id = item_id(record)
 
@@ -727,6 +803,15 @@ defmodule AttentionServer.ClientAPI.Resources do
           is_binary(event_id),
           into: %{},
           do: {event_id, seq}
+
+    # Each result fact is a result entry, numbered like Item.result.revision.
+    results =
+      facts
+      |> Enum.filter(fn {_seq, payload} -> payload["kind"] == "result" end)
+      |> Enum.with_index(1)
+      |> Map.new(fn {{seq, _payload}, n} -> {seq, n} end)
+
+    context = %{by_event_id: by_event_id, results: results, replies: reply_entries}
 
     # Receipt and acknowledgment facts mark the entry they refer to. Each entry
     # records the facts it is made of, so its rev can be the newest of theirs.
@@ -745,7 +830,7 @@ defmodule AttentionServer.ClientAPI.Resources do
     Enum.flat_map(facts, fn {seq, payload} ->
       {marks, folded_seqs} = Map.get(folded, seq, {%{}, []})
 
-      case entry(item_id, record, seq, payload, by_event_id) do
+      case entry(item_id, record, seq, payload, context) do
         nil ->
           []
 
@@ -774,13 +859,13 @@ defmodule AttentionServer.ClientAPI.Resources do
   @doc """
   The entry a conversation fact shows up in: the fact's own entry, the entry
   a receipt or acknowledgment fact marks, or nil for facts that are not part
-  of any entry (read positions, file reports, results).
+  of any entry (read positions and file reports).
   """
-  def entry_for_fact(%Engine{} = engine, person, seq) do
+  def entry_for_fact(%Engine{} = engine, person, seq, view \\ nil) do
     case Map.get(engine.conversation_events, {person, seq}) do
       %{key: {^person, _, _} = key} ->
         if Map.has_key?(engine.messages, key),
-          do: engine |> entries(key) |> Enum.find(&(seq in &1[@sources])),
+          do: engine |> entries(key, view) |> Enum.find(&(seq in &1[@sources])),
           else: nil
 
       _ ->
@@ -800,7 +885,7 @@ defmodule AttentionServer.ClientAPI.Resources do
   defp delivery_effect(%{"kind" => "acted", "event_id" => id}), do: {"acted", id}
   defp delivery_effect(_), do: nil
 
-  defp entry(item_id, record, seq, %{"kind" => kind} = payload, by_event_id) do
+  defp entry(item_id, record, seq, %{"kind" => kind} = payload, context) do
     base = %{
       "entry_id" => entry_id(seq),
       "item_id" => item_id,
@@ -812,11 +897,40 @@ defmodule AttentionServer.ClientAPI.Resources do
       k when k in ~w(discussion reply) ->
         author = if k == "discussion", do: "person", else: Map.get(payload, "author", "origin")
 
+        entry =
+          base
+          |> Map.merge(%{"kind" => "reply", "author" => author})
+          |> put_present("text", payload["text"])
+          |> put_present("files", entry_files(payload, seq))
+          |> put_present("in_reply_to", reply_target(payload, context.by_event_id))
+
+        # An agent reply carries today's per-reply priority (round 7).
+        if author == "origin" do
+          view_entry = Map.get(context.replies, seq)
+
+          score =
+            case view_entry do
+              %{"score" => score} when is_number(score) -> score
+              _ -> nil
+            end
+
+          Map.put(
+            entry,
+            "priority",
+            put_present(%{"level" => reply_level(view_entry, record)}, "score", score)
+          )
+        else
+          entry
+        end
+
+      "result" ->
+        result =
+          %{"status" => payload["status"], "revision" => Map.fetch!(context.results, seq)}
+          |> put_present("result_ref", if(is_binary(payload["op_id"]), do: payload["op_id"]))
+
         base
-        |> Map.merge(%{"kind" => "reply", "author" => author})
-        |> put_present("text", payload["text"])
-        |> put_present("files", entry_files(payload, seq))
-        |> put_present("in_reply_to", reply_target(payload, by_event_id))
+        |> Map.merge(%{"kind" => "result", "author" => "origin", "result" => result})
+        |> put_present("in_reply_to", reply_target(payload, context.by_event_id))
 
       "revision" ->
         base
@@ -932,6 +1046,9 @@ defmodule AttentionServer.ClientAPI.Resources do
     do: payload
 
   ## Helpers
+
+  defp positive(value) when is_integer(value) and value > 0, do: value
+  defp positive(_), do: nil
 
   defp time_ms(value) when is_integer(value) and value >= 0, do: value
   defp time_ms(_), do: nil
