@@ -1299,6 +1299,7 @@ defmodule AttentionServer.Store do
       with true <-
              Enum.all?(MapSet.union(touched, affected), &valid_authority_reference?(next, &1)),
            true <- Enum.all?(touched, &valid_push_address_change?(store.engine, next, &1)),
+           true <- Enum.all?(touched, &valid_transition_fact?(store.engine, next, &1)),
            :ok <- KeyedValidation.sequences(store.engine, next, touched),
            {:ok, upload_links, entries} <-
              KeyedValidation.upload_changes(store.upload_links, store.engine, next, touched),
@@ -2523,7 +2524,7 @@ defmodule AttentionServer.Store do
   defp valid_free_order?(engine) do
     is_map(engine.free_order_highs) and
       Enum.all?(engine.free_order_highs, fn {person, high} ->
-        Map.has_key?(engine.persons, person) and is_integer(high) and high >= 0
+        valid_order_high?(engine, person, high)
       end) and
       Enum.all?(engine.messages, fn {{person, _, _}, record} ->
         valid_arrival?(record, Map.get(engine.free_order_highs, person, 0))
@@ -2533,12 +2534,17 @@ defmodule AttentionServer.Store do
       end)
   end
 
-  defp valid_arrival?(record, high) do
+  defp valid_order_high?(engine, person, high),
+    do: Map.has_key?(engine.persons, person) and is_integer(high) and high >= 0
+
+  defp valid_arrival?(record, high) when is_map(record) do
     case Map.get(record, :free_order) do
       nil -> true
       order -> is_integer(order) and order > 0 and order <= high
     end
   end
+
+  defp valid_arrival?(_, _), do: false
 
   defp encode_state(engine) do
     persisted =
@@ -2758,7 +2764,7 @@ defmodule AttentionServer.Store do
   defp valid_state?(%Engine{} = engine, bounce_validation) do
     try do
       valid_instance?(engine.relay_instance_id) and
-        is_binary(engine.agent_cursor_key) and byte_size(engine.agent_cursor_key) == 32 and
+        valid_cursor_key?(engine.agent_cursor_key) and
         is_map(engine.open_default_index) and
         Enum.all?(engine.open_default_index, fn {key, at} ->
           is_tuple(key) and tuple_size(key) == 3 and is_integer(at)
@@ -2806,26 +2812,12 @@ defmodule AttentionServer.Store do
         map_size(engine.conversation_events) ==
           Enum.reduce(engine.conversation_highs, 0, fn {_person, high}, sum -> sum + high end) and
         is_map(engine.chat_read_positions) and
-        Enum.all?(engine.chat_read_positions, fn {{person, sender, id} = key, position} ->
-          Map.has_key?(engine.persons, person) and Map.has_key?(engine.messages, key) and
-            is_binary(sender) and is_binary(id) and is_integer(position) and position > 0 and
-            match?(
-              %{key: ^key, payload: %{"kind" => "reply", "author" => "origin"}},
-              Map.get(engine.conversation_events, {person, position})
-            )
+        Enum.all?(engine.chat_read_positions, fn {key, position} ->
+          valid_chat_position?(engine, key, position)
         end) and
         is_map(engine.reply_group_history) and
-        Enum.all?(engine.reply_group_history, fn {key = {person, _, _}, history} ->
-          Map.has_key?(engine.messages, key) and is_map(history.scores) and
-            is_number(history.score) and history.score >= 0 and history.score <= 1 and
-            Enum.all?(history.scores, fn {seq, score} ->
-              is_number(score) and score >= 0 and score <= 1 and
-                seq > Map.get(engine.chat_read_positions, key, 0) and
-                match?(
-                  %{key: ^key, payload: %{"kind" => "reply", "author" => "origin"}},
-                  Map.get(engine.conversation_events, {person, seq})
-                )
-            end)
+        Enum.all?(engine.reply_group_history, fn {key, history} ->
+          valid_reply_history?(engine, key, history)
         end) and
         is_map(engine.conversation_cursors) and
         Enum.all?(engine.conversation_cursors, fn {{person, key}, seq} ->
@@ -2878,11 +2870,47 @@ defmodule AttentionServer.Store do
   defp valid_prioritization?(engine) do
     is_map(engine.algorithm_choices) and
       Enum.all?(engine.algorithm_choices, fn {person, choice} ->
-        Map.has_key?(engine.persons, person) and choice in ["baseline", "jev-set"]
+        valid_algorithm_choice?(engine, person, choice)
       end) and
-      (is_nil(engine.jev_endpoint) or
-         AttentionServer.JevClient.valid_endpoint?(engine.jev_endpoint)) and
-      (is_nil(engine.jev_model) or AttentionServer.JevClient.valid_model?(engine.jev_model))
+      valid_jev_endpoint?(engine.jev_endpoint) and valid_jev_model?(engine.jev_model)
+  end
+
+  defp valid_algorithm_choice?(engine, person, choice),
+    do: Map.has_key?(engine.persons, person) and choice in ["baseline", "jev-set"]
+
+  defp valid_jev_endpoint?(nil), do: true
+  defp valid_jev_endpoint?(value), do: AttentionServer.JevClient.valid_endpoint?(value)
+
+  defp valid_jev_model?(nil), do: true
+  defp valid_jev_model?(value), do: AttentionServer.JevClient.valid_model?(value)
+
+  defp valid_cursor_key?(key), do: is_binary(key) and byte_size(key) == 32
+
+  defp valid_chat_position?(engine, {person, sender, id} = key, position) do
+    Map.has_key?(engine.persons, person) and Map.has_key?(engine.messages, key) and
+      is_binary(sender) and is_binary(id) and is_integer(position) and position > 0 and
+      origin_reply_at?(engine, key, position)
+  end
+
+  defp valid_chat_position?(_, _, _), do: false
+
+  defp valid_reply_history?(engine, key, %{scores: scores, score: score}) when is_map(scores) do
+    Map.has_key?(engine.messages, key) and valid_reply_score?(score) and
+      Enum.all?(scores, fn {seq, score} ->
+        valid_reply_score?(score) and seq > Map.get(engine.chat_read_positions, key, 0) and
+          origin_reply_at?(engine, key, seq)
+      end)
+  end
+
+  defp valid_reply_history?(_, _, _), do: false
+
+  defp valid_reply_score?(score), do: is_number(score) and score >= 0 and score <= 1
+
+  defp origin_reply_at?(engine, {person, _, _} = key, seq) do
+    match?(
+      %{key: ^key, payload: %{"kind" => "reply", "author" => "origin"}},
+      Map.get(engine.conversation_events, {person, seq})
+    )
   end
 
   defp valid_uploads?(engine) do
@@ -3455,6 +3483,20 @@ defmodule AttentionServer.Store do
     end
   end
 
+  defp valid_authority_reference?(engine, {:row, :algorithm_choices, person}) do
+    case Map.fetch(engine.algorithm_choices, person) do
+      {:ok, choice} -> valid_algorithm_choice?(engine, person, choice)
+      :error -> true
+    end
+  end
+
+  defp valid_authority_reference?(engine, {:row, :free_order_highs, person}) do
+    case Map.fetch(engine.free_order_highs, person) do
+      {:ok, high} -> valid_order_high?(engine, person, high)
+      :error -> true
+    end
+  end
+
   defp valid_authority_reference?(engine, {:row, :bounce_levels, person}) do
     case Map.fetch(engine.bounce_levels, person) do
       {:ok, config} -> BounceDecision.valid_configuration?(engine, person, config)
@@ -3579,6 +3621,64 @@ defmodule AttentionServer.Store do
 
   defp valid_authority_reference?(_engine, _address), do: true
 
+  defp valid_transition_fact?(_old, next, {:field, :agent_cursor_key}),
+    do: valid_cursor_key?(next.agent_cursor_key)
+
+  defp valid_transition_fact?(_old, next, {:field, :jev_endpoint}),
+    do: valid_jev_endpoint?(next.jev_endpoint)
+
+  defp valid_transition_fact?(_old, next, {:field, :jev_model}),
+    do: valid_jev_model?(next.jev_model)
+
+  defp valid_transition_fact?(_old, next, {:field, :pending_clock_high_water}),
+    do: is_integer(next.pending_clock_high_water) and next.pending_clock_high_water >= 0
+
+  defp valid_transition_fact?(_old, next, {:field, :relay_instance_id}),
+    do: valid_instance?(next.relay_instance_id)
+
+  # Published ordering and reply facts are append-only. Lowering their high
+  # water mark or replacing a reply could invalidate untouched references.
+  defp valid_transition_fact?(old, next, {:row, :free_order_highs, person}) do
+    case Map.fetch(next.free_order_highs, person) do
+      {:ok, high} ->
+        is_integer(high) and high >= Map.get(old.free_order_highs, person, 0)
+
+      :error ->
+        not Map.has_key?(old.free_order_highs, person)
+    end
+  end
+
+  defp valid_transition_fact?(old, next, {:row, :conversation_events, {person, _} = key}) do
+    event = Map.get(next.conversation_events, key)
+
+    case Map.fetch(old.conversation_events, key) do
+      {:ok, published} -> event === published
+      :error -> is_nil(event) or valid_arrival?(event, Map.get(next.free_order_highs, person, 0))
+    end
+  end
+
+  defp valid_transition_fact?(_old, next, {:row, :chat_read_positions, key}) do
+    case Map.fetch(next.chat_read_positions, key) do
+      {:ok, position} ->
+        valid_chat_position?(next, key, position) and valid_scored_reply?(next, key)
+
+      :error ->
+        true
+    end
+  end
+
+  defp valid_transition_fact?(_old, next, {:row, :reply_group_history, key}),
+    do: valid_scored_reply?(next, key)
+
+  defp valid_transition_fact?(_old, _next, _address), do: true
+
+  defp valid_scored_reply?(engine, key) do
+    case Map.fetch(engine.reply_group_history, key) do
+      {:ok, history} -> valid_reply_history?(engine, key, history)
+      :error -> true
+    end
+  end
+
   defp valid_push_address_change?(old, next, {:row, :push_bindings, key}) do
     case Map.get(next.push_bindings, key) do
       %{active: true, address: address} ->
@@ -3603,12 +3703,13 @@ defmodule AttentionServer.Store do
         terminal = record.terminal
 
         valid_item?(next, key, record) and
+          valid_arrival?(record, Map.get(next.free_order_highs, person, 0)) and
           (is_nil(prior) or prior === terminal) and
           (is_nil(terminal) or
              match?(%{kind: :lifecycle, key: ^key}, next.events[{person, terminal.seq}]))
 
       :error ->
-        true
+        not Map.has_key?(old.messages, key)
     end
   rescue
     _ -> false

@@ -59,6 +59,8 @@ defmodule AttentionServer.Store.KeyedValidation do
     :join_invitations,
     :hosted_accounts,
     :delivery_states,
+    :algorithm_choices,
+    :free_order_highs,
     :bounce_levels,
     :maintainer_grants,
     :enrollment_read_grants
@@ -170,7 +172,7 @@ defmodule AttentionServer.Store.KeyedValidation do
   end
 
   defp authority_owners(engine, {:row, field, person})
-       when field in [:delivery_states, :bounce_levels] do
+       when field in [:delivery_states, :algorithm_choices, :free_order_highs, :bounce_levels] do
     if Map.has_key?(Map.fetch!(engine, field), person), do: [{:person, person}], else: []
   end
 

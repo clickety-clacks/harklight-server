@@ -43,10 +43,27 @@ defmodule AttentionServer.Store.RecordCodecTest do
 
   test "derived indexes are rebuilt by the caller" do
     baseline = Engine.new()
-    with_index = %{baseline | open_default_index: %{{"person", "sender", "message"} => 27}}
+    item = {"person", "sender", "message"}
+    origin_entry = {"person", "origin", "session", "sender", "message"}
 
-    assert Enum.to_list(RecordCodec.encode(baseline)) ==
-             Enum.to_list(RecordCodec.encode(with_index))
+    with_indexes = %{
+      baseline
+      | open_default_index: %{item => 27},
+        bounce_discussed_messages: MapSet.new([item]),
+        bounce_origin_entries: MapSet.new([origin_entry])
+    }
+
+    rows = Enum.to_list(RecordCodec.encode(baseline))
+    assert rows == Enum.to_list(RecordCodec.encode(with_indexes))
+
+    rehearsal_cache_rows = [
+      RecordCodec.encode_row({:member, :bounce_discussed_messages, item}, true),
+      RecordCodec.encode_row({:member, :bounce_origin_entries, origin_entry}, true)
+    ]
+
+    assert {:ok, decoded} = RecordCodec.decode(rehearsal_cache_rows ++ rows)
+    assert decoded.bounce_discussed_messages == MapSet.new()
+    assert decoded.bounce_origin_entries == MapSet.new()
   end
 
   test "encodes advisory counters, entries and receipts as separate records" do

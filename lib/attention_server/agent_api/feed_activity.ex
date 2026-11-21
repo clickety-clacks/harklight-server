@@ -140,16 +140,21 @@ defmodule AttentionServer.AgentAPI.FeedActivity do
          listening = listening?(state, scope),
          status = if(listening, do: "listening", else: "not_listening"),
          detached_at = if(listening, do: nil, else: state.clock.()),
-         next = Engine.agent_feed_availability(store.engine, scope, status, detached_at, keys),
-         {:ok, committed} <-
-           Store.commit(store, next, %{
-             person: person,
-             actor: agent,
-             action: "agent_feed_availability"
-           }) do
+         transition = &Engine.agent_feed_availability(&1, scope, status, detached_at, keys),
+         audit = %{person: person, actor: agent, action: "agent_feed_availability"},
+         {:ok, committed} <- commit_availability(store, transition, audit) do
       %{state | store: committed}
     else
       _ -> state
     end
+  end
+
+  defp commit_availability(%Store{mode: :keyed} = store, transition, audit) do
+    {next, :ok, touched} = Engine.with_touches(store.engine, &{transition.(&1), :ok})
+    Store.commit(store, {next, touched}, audit)
+  end
+
+  defp commit_availability(store, transition, audit) do
+    Store.commit(store, transition.(store.engine), audit)
   end
 end

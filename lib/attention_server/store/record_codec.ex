@@ -5,13 +5,14 @@ defmodule AttentionServer.Store.RecordCodec do
 
   @record_version :relay_record_v1
   @term_options [:deterministic, {:minor_version, 2}]
+  @bounce_caches [:bounce_discussed_messages, :bounce_origin_entries]
   @derived [
-    :advisory_id_index,
-    :bounce_deadline_index,
-    :open_default_index,
-    :route_b_index,
-    :touched_keys
-  ]
+             :advisory_id_index,
+             :bounce_deadline_index,
+             :open_default_index,
+             :route_b_index,
+             :touched_keys
+           ] ++ @bounce_caches
 
   @fields Map.new(
             Map.drop(Map.from_struct(%Engine{}), [:advisory_feeds, :origin_feeds | @derived]),
@@ -156,6 +157,10 @@ defmodule AttentionServer.Store.RecordCodec do
       end
     end
   end
+
+  # Earlier keyed rehearsal builds persisted these derived memberships.
+  defp insert(engine, required, {:member, field, _key}, true) when field in @bounce_caches,
+    do: {:ok, engine, required}
 
   defp insert(engine, required, {:member, field, key}, true) do
     if @fields[field] == :member do

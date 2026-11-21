@@ -44,7 +44,7 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
     %{certs: certs}
   end
 
-  setup %{certs: certs} do
+  setup %{certs: certs} = context do
     dir = Path.join(System.tmp_dir!(), "harklight-sse-#{System.unique_integer([:positive])}")
     File.mkdir_p!(dir)
     on_exit(fn -> File.rm_rf!(dir) end)
@@ -55,6 +55,7 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
       start_supervised!(
         {Relay,
          store_path: Path.join(dir, "state.sqlite3"),
+         store_mode: Map.get(context, :store_mode, :legacy),
          feature_flags_path: flags,
          agent_fixture_mode: true},
         restart: :temporary
@@ -491,6 +492,50 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
                  })
                )
     end)
+  end
+
+  @tag store_mode: :keyed_cutover
+  test "keyed agent feed persists listening and detach through both logs", ctx do
+    {id, _, _, _} = priority_reply(ctx)
+    scope = {"A", ctx.reader}
+    store = :sys.get_state(ctx.relay).store
+    assert {:ok, person_head} = ChangeLog.head(store, "A")
+    assert {:ok, agent_head} = AttentionServer.AgentChangeLog.head(store, scope)
+
+    {conn, feed} = open_agent_feed(connect(ctx), "?after=#{agent_head}&session=#{@handle}")
+    {conn, feed} = await_open(conn, feed)
+    assert feed.status == 200
+
+    assert eventually(fn -> agent_availability(ctx, id, "listening") end)
+    listening = :sys.get_state(ctx.relay).store
+    assert listening.version > store.version
+    assert {:ok, next_person_head} = ChangeLog.head(listening, "A")
+    assert {:ok, next_agent_head} = AttentionServer.AgentChangeLog.head(listening, scope)
+    assert next_person_head > person_head
+    assert next_agent_head > agent_head
+
+    Mint.HTTP.close(conn)
+    assert eventually(fn -> agent_availability(ctx, id, "not_listening") end)
+    detached = :sys.get_state(ctx.relay).store
+    assert detached.version > listening.version
+    assert {:ok, final_person_head} = ChangeLog.head(detached, "A")
+    assert {:ok, final_agent_head} = AttentionServer.AgentChangeLog.head(detached, scope)
+    assert final_person_head > next_person_head
+    assert final_agent_head > next_agent_head
+  end
+
+  defp agent_availability(ctx, id, status) do
+    conn = connect(ctx)
+
+    assert {:ok, conn, ref} =
+             Mint.HTTP.request(conn, "GET", "/v2/agent/messages/#{id}/entries", [], nil)
+
+    {conn, response} = collect(conn, ref)
+    Mint.HTTP.close(conn)
+    assert response.status == 200
+    assert {:ok, %{"entries" => entries}} = JSON.decode_line(response.body <> "\n")
+    latest = Enum.find(Enum.reverse(entries), &(&1["kind"] == "availability"))
+    get_in(latest, ["availability", "state"]) == status
   end
 
   defp priority_reply(ctx) do

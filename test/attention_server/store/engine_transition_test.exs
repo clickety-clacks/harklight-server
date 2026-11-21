@@ -230,6 +230,53 @@ defmodule AttentionServer.Store.EngineTransitionTest do
     :ok = Store.close(keyed)
   end
 
+  test "keyed commits reject malformed priority, cursor and retained item changes" do
+    path = legacy_store_path()
+    {:ok, initial} = Store.open(path)
+    {engine, {:ok, _}} = Engine.request_line(initial.engine, @origin, forward_line(), 100)
+    audit = %{person: @person, actor: @origin, action: "forward"}
+    {:ok, legacy} = Store.commit(initial, engine, audit)
+    keyed_path = path <> ".keyed"
+    :ok = Store.close(legacy)
+    File.cp!(path, keyed_path)
+    {:ok, legacy} = Store.open(path)
+    {:ok, prepared} = Store.open(keyed_path)
+    assert {:ok, _} = KeyedMigration.convert(prepared)
+    :ok = Store.close(prepared)
+    {:ok, keyed} = Store.open(keyed_path, :keyed)
+    item = {@person, @sender, "msg"}
+
+    changes = [
+      invalid_algorithm: &put_in(&1.algorithm_choices[@person], "unknown"),
+      invalid_jev_model: &%{&1 | jev_model: 100},
+      invalid_cursor_key: &%{&1 | agent_cursor_key: <<0>>},
+      negative_order_high: &put_in(&1.free_order_highs[@person], -1),
+      order_beyond_high: &put_in(&1.messages[item].free_order, 2_000_000),
+      dangling_read: &put_in(&1.chat_read_positions[item], 3),
+      dangling_score: &put_in(&1.reply_group_history[item], %{score: 0.9, scores: %{3 => 0.9}}),
+      missing_published_item: &%{&1 | messages: Map.delete(&1.messages, item)}
+    ]
+
+    for {name, mutate} <- changes do
+      next = mutate.(keyed.engine)
+      touched = full_diff(keyed.engine, next)
+      assert MapSet.size(touched) == 1, inspect(name)
+
+      assert Store.commit(legacy, mutate.(legacy.engine), audit) ==
+               {:error, :storage_unavailable, legacy},
+             inspect(name)
+
+      assert Store.commit(keyed, {next, touched}, audit) == {:error, :storage_unavailable, keyed},
+             inspect(name)
+    end
+
+    :ok = Store.close(legacy)
+    :ok = Store.close(keyed)
+    assert {:ok, reopened} = Store.open(keyed_path, :keyed)
+    assert reopened.version == keyed.version
+    assert :ok = Store.close(reopened)
+  end
+
   test "shuffled transitions agree with the full validator and cold index rebuild" do
     legacy_path = legacy_store_path()
     keyed_path = legacy_path <> ".keyed"

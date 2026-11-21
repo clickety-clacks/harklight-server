@@ -26,9 +26,12 @@ defmodule AttentionServer.LargeDataCommitOracleTest do
     {relay, key} = start_relay(path, certs)
 
     :erlang.trace(relay, true, [:call, {:tracer, self()}])
-    :erlang.trace_pattern({Store, :commit, 3}, true, [])
+    # Include callers using the default-argument wrapper as well as callers
+    # that pass projected entries explicitly.
+    commit = {Store, :commit, 4}
+    :erlang.trace_pattern(commit, true, [:local])
 
-    on_exit(fn -> :erlang.trace_pattern({Store, :commit, 3}, false, []) end)
+    on_exit(fn -> :erlang.trace_pattern(commit, false, [:local]) end)
     %{path: path, certs: certs, relay: relay, key: key}
   end
 
@@ -151,7 +154,7 @@ defmodule AttentionServer.LargeDataCommitOracleTest do
 
   defp drain_commits(acc) do
     receive do
-      {:trace, _pid, :call, {Store, :commit, [before, proposed, _audit]}} ->
+      {:trace, _pid, :call, {Store, :commit, [before, proposed, _audit, _projected]}} ->
         drain_commits([{before, proposed} | acc])
     after
       0 -> Enum.reverse(acc)
