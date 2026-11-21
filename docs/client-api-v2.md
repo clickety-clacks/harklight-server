@@ -37,7 +37,8 @@ by default. It becomes the only client protocol in Server 0.2.x.
   are named `*_at_ms`.
 - Message content from a sender (`Item.message`) is passed through unchanged, as
   today. Every other member is defined here.
-- Absent and `null` mean the same thing unless a member says otherwise.
+- Absent and `null` mean the same thing unless a member says otherwise. The
+  one exception is `result` in an answer body, where presence counts (§5).
 
 ## 2. Headers
 
@@ -81,7 +82,7 @@ Schemas use JSON Schema 2020-12. `$ref`s point into the `$defs` below.
     "Item": {
       "type": "object",
       "required": ["item_id", "rev", "sender", "request_revision", "message", "files",
-                   "seen", "chat", "rank", "created_at_ms"],
+                   "seen", "chat", "rank"],
       "properties": {
         "item_id": { "$ref": "#/$defs/OpaqueId" },
         "rev": { "$ref": "#/$defs/Rev" },
@@ -90,7 +91,9 @@ Schemas use JSON Schema 2020-12. `$ref`s point into the `$defs` below.
         "message": { "type": "object", "description": "Current message content, passed through unchanged" },
         "files": { "type": "array", "items": { "$ref": "#/$defs/FileRef" }, "description": "Every file the item offers: the current revision's files plus any earlier revision's files that the current answer_ui references by name. Answer forms validate against this list alone." },
         "seen": { "type": "boolean", "description": "Mark Seen for the current substantive revision (today's opened)" },
-        "created_at_ms": { "$ref": "#/$defs/TimeMs", "description": "When the item first reached the person; orders the new-messages area" },
+        "created_at_ms": { "$ref": "#/$defs/TimeMs", "description": "Display only: the record's stored acceptance time. Absent when the record has none; every item accepted by 0.2 has it." },
+        "arrival": { "type": "integer", "minimum": 1, "description": "Today's per-person free-order arrival counter; orders the new-messages area. Absent on items from before free order, which sit in Rank.group earlier_messages." },
+        "thread": { "type": "string", "description": "The item's effective group thread (possibly inherited). Group key is (sender, thread); members are adjacent in Rank.key order." },
         "as": { "enum": ["message", "knock"], "description": "Present only when this client is a recipient, not the item's origin" },
         "chat": { "$ref": "#/$defs/Chat" },
         "availability": { "$ref": "#/$defs/Availability" },
@@ -104,13 +107,27 @@ Schemas use JSON Schema 2020-12. `$ref`s point into the `$defs` below.
       "type": "object",
       "required": ["started"],
       "properties": {
-        "available": { "type": "boolean", "description": "Informational only: the item came from an agent conversation. Never a gate on replies." },
+        "available": { "type": "boolean", "description": "The item has an agent conversation. Clients hide the composer when false; /replies then answers 400 unsupported. Not a listening indicator." },
         "started": { "type": "boolean" },
         "read_position": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/OpaqueId" }], "description": "entry_id read through" },
         "last_origin_reply": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/OpaqueId" }], "description": "entry_id of the newest origin reply" },
         "unread_replies": { "type": "integer", "minimum": 0, "description": "Agent replies after the person's read position, computed by the server" },
-        "reply_group": { "enum": ["earlier_chat_replies", "earlier_chat_replies_unknown"], "description": "Present whenever the item has at least one agent chat reply, even when unread_replies is 0: today's verified or unknown reply row" },
-        "reply_rank_key": { "type": "string", "description": "Present whenever reply_group is: where the reply row sorts, in Rank.key's space" }
+        "reply_group": { "oneOf": [{ "type": "null" }, { "enum": ["earlier_chat_replies", "earlier_chat_replies_unknown"] }], "description": "Present whenever the item has at least one agent chat reply, even when unread_replies is 0: today's verified or unknown reply row, or null where today's reply row has no group (ranked order, or free order's common group)" },
+        "reply_rank_key": { "type": "string", "description": "Present whenever reply_group is: where the reply row sorts, in Rank.key's space" },
+        "reply_priority": { "$ref": "#/$defs/ReplyPriority" }
+      }
+    },
+
+    "PriorityLevel4": { "enum": ["now", "high", "normal", "low"] },
+
+    "ReplyPriority": {
+      "type": "object",
+      "description": "Present with reply_group: the reply row's level (the highest among its unseen replies; with none unseen, today's row level), score and due time, as today",
+      "required": ["level"],
+      "properties": {
+        "level": { "$ref": "#/$defs/PriorityLevel4" },
+        "score": { "type": "number" },
+        "due_at_ms": { "$ref": "#/$defs/TimeMs" }
       }
     },
 
@@ -139,9 +156,11 @@ Schemas use JSON Schema 2020-12. `$ref`s point into the `$defs` below.
       "description": "Today's person-facing answer_outcome, unchanged in shape. Never the origin-only raw answer. Seen by every principal that can see the item.",
       "required": ["kind"],
       "properties": {
-        "kind": { "enum": ["seen", "reply", "default", "no_comment"] },
-        "text": { "type": "string" },
-        "value": { "description": "Only for kind default: the default answer's value" }
+        "kind": { "enum": ["seen", "choice", "reply", "result", "default", "no_comment"] },
+        "id": { "type": "string", "description": "kind choice: the matched answer_ui action's id" },
+        "label": { "type": "string", "description": "kind choice: that action's label" },
+        "text": { "type": "string", "description": "kind reply: the plain-text answer" },
+        "value": { "description": "kind result: the structured answer, any JSON value including null; kind default: the default answer's value" }
       }
     },
 
@@ -163,8 +182,9 @@ Schemas use JSON Schema 2020-12. `$ref`s point into the `$defs` below.
         "key": { "type": "string", "description": "Sort ascending, byte-wise, to get the server's inbox order across and within sections" },
         "section": { "enum": ["current", "resolved"], "description": "Draw a heading where it changes; resolved takes today's History heading (closed list, §4)" },
         "group": { "enum": ["common", "earlier_messages"], "description": "Only for current items while the inbox is in free order; common has no heading" },
-        "score": { "type": "number" },
-        "due_at_ms": { "$ref": "#/$defs/TimeMs" }
+        "level": { "$ref": "#/$defs/PriorityLevel4", "description": "Always present for current items: today's per-item urgency. Clients draw the urgent and high marks from it in every order." },
+        "score": { "type": "number", "description": "Present for current items wherever today's priority view has it" },
+        "due_at_ms": { "$ref": "#/$defs/TimeMs", "description": "Present wherever today's priority view has it" }
       }
     },
 
@@ -175,7 +195,7 @@ Schemas use JSON Schema 2020-12. `$ref`s point into the `$defs` below.
         "entry_id": { "$ref": "#/$defs/OpaqueId" },
         "item_id": { "$ref": "#/$defs/OpaqueId" },
         "rev": { "$ref": "#/$defs/Rev" },
-        "position": { "type": "integer", "minimum": 1, "description": "Creation order within the item; unique per item and never changes" },
+        "position": { "type": "integer", "minimum": 1, "description": "Creation order, unique per person, compared only within an item; not dense (gaps are normal). Never changes." },
         "kind": { "enum": ["reply", "lifecycle", "revision", "availability", "result"], "description": "lifecycle is only the origin's retraction fact; a revision entry (request revision 2 and later) marks that a revision happened; a result entry is one origin result fact. The answer outcome is Item.terminal, not an entry." },
         "author": { "enum": ["person", "origin", "server"] },
         "at_ms": { "$ref": "#/$defs/TimeMs", "description": "Absent on entries from before the cut-over; every entry created by 0.2 carries it" },
@@ -185,7 +205,16 @@ Schemas use JSON Schema 2020-12. `$ref`s point into the `$defs` below.
         "in_reply_to": { "$ref": "#/$defs/OpaqueId" },
         "state": { "enum": ["active", "withdrawn", "retracted"], "description": "A withdrawal or retraction is an upsert of this member; entries are never removed" },
         "availability": { "$ref": "#/$defs/Availability" },
-        "result": { "$ref": "#/$defs/OriginResult", "description": "On result entries" },
+        "result": { "$ref": "#/$defs/OriginResult", "description": "On result entries, nested like availability" },
+        "priority": {
+          "type": "object",
+          "description": "On agent reply entries: the reply's level and score from today's view",
+          "required": ["level"],
+          "properties": {
+            "level": { "$ref": "#/$defs/PriorityLevel4" },
+            "score": { "type": "number" }
+          }
+        },
         "delivery": {
           "type": "object",
           "description": "Receipts for a person-authored entry, folded in from today's receipt facts",
@@ -407,11 +436,11 @@ Every write that succeeds answers `200`, or `201` for `POST /v2/files`, with a
 | `POST /v2/items/{item_id}/seen` | `{}` |
 | `PUT /v2/items/{item_id}/read-position` | `{"entry_id": OpaqueId}` |
 | `POST /v2/items/{item_id}/replies` | `{"text": string, "file_ids"?: [OpaqueId]}` |
-| `POST /v2/items/{item_id}/answer` | `{"request_revision": int}` plus at most one of `"choice": string`, `"comment": string`, `"result": object` |
+| `POST /v2/items/{item_id}/answer` | `{"request_revision": int}` plus at most one of `"choice": string`, `"comment": string`, `"result": any JSON value` |
 | `PUT /v2/settings/priority-levels` | `{"levels": [PriorityLevel]}` with `If-Match` |
 | `PUT /v2/devices/me/push` | `{"token": string, "environment": "production" \| "sandbox", "revision": int}` |
 | `DELETE /v2/devices/me/push` | none |
-| `PUT /v2/devices/me/focus` | `{"item_id"?: OpaqueId, "ttl_s": int 1..3600}` |
+| `PUT /v2/devices/me/focus` | `{"screen": "inbox" \| "message" \| "chat" \| "settings" \| "signed_out" \| "not_in_front", "item_id"?: OpaqueId, "visible_entry_id"?: OpaqueId, "ttl_s": int}` (§5.1) |
 | `POST /v2/files` | Raw bytes with `Content-Type`, `Content-Length` and `Content-Disposition: attachment; filename*=UTF-8''<percent-encoded name>` |
 
 ```json
@@ -434,7 +463,7 @@ Every write that succeeds answers `200`, or `201` for `POST /v2/files`, with a
         "request_revision": { "type": "integer", "minimum": 1 },
         "choice": { "type": "string", "minLength": 1 },
         "comment": { "type": "string" },
-        "result": { "type": "object" }
+        "result": { "description": "Any JSON value, null included; presence selects a structured answer" }
       },
       "additionalProperties": false,
       "not": { "anyOf": [
@@ -457,9 +486,12 @@ Every write that succeeds answers `200`, or `201` for `POST /v2/files`, with a
 }
 ```
 
-- **Answer.** The body carries at most one of `choice`, `comment` and
-  `result`, which keeps today's single stored answer value. The first answer
-  settles a request, and a second gets `409 already_answered`.
+- **Answer.** An item is answerable while its `terminal` is null, today's
+  engine rule, FYIs included: an FYI's Seen is `choice: "seen"`. Once
+  `terminal` is set, an answer is `409 already_answered`, or
+  `already_retracted` for a retraction. The body carries at most one of
+  `choice`, `comment` and `result`, which keeps today's single stored answer
+  value.
   - `choice` is the `id` of one `value` action in the item's
     `attention-client.actions/1` `answer_ui`. The server stores that action's
     `value`. An `id` that names no such action is `400 invalid_field`, with
@@ -468,35 +500,78 @@ Every write that succeeds answers `200`, or `201` for `POST /v2/files`, with a
     item**: an item with an open request, with or without an `answer_ui`,
     including one that carries an answer screen.
   - `result` is the structured result of an `attention-client.ui/1`
-    `answer_ui`, stored as today's answer value. On an item with any other
-    `answer_ui`, it is `400 invalid_field`, with `field: "result"`.
+    `answer_ui`: **any JSON value**, null included, stored unchanged.
+    **Presence selects it**: `"result": null` is a structured answer whose
+    value is null. On an item with any other `answer_ui`, a present `result`
+    is `400 invalid_field`, with `field: "result"`.
   - With none of them, the answer is "no comment", today's
     `answer_no_comment`.
-  - More than one of them is `400 invalid_field`.
-  - An item with no open request, such as an FYI, is not answerable: an answer
-    there is `409 already_answered` if it was answered, otherwise
-    `400 invalid_field`. Chat uses `/replies`.
+  - More than one of them present is `400 invalid_field`.
+  - The answer outcome then reads as `Terminal.answer`: `choice` with the
+    action's `id` and `label`, `reply` with `text` for a plain-text answer
+    (including on a UI/1 item), `result` with `value` for a structured
+    answer, `seen`, `default` or `no_comment`. Answers stored before 0.2 on
+    UI/1 items keep today's outcome.
 - **File name.** `POST /v2/files` requires the name in
   `Content-Disposition: attachment; filename*=UTF-8''<percent-encoded name>`
   (RFC 6266, RFC 5987). A missing or empty name is `400 invalid_field`, with
   `field: "name"`. Replies keep `file_ids`, because the name belongs to the
   file.
-- **Replies** are accepted in every item state: open, answered, terminal,
-  retracted but still visible, and while the agent is not listening. A reply
-  to an agent that is not listening is stored and delivered when the agent
-  next reads. The API encodes no chat-closing rule, and availability is
-  informational.
+- **Replies** are accepted in every item state on an item with an agent
+  conversation (`Chat.available`): open, answered, terminal, retracted but
+  still visible, and while the agent is not listening. A reply to an agent
+  that is not listening is stored and delivered when the agent next reads.
+  The API encodes no chat-closing rule, and availability is informational.
+  On an item sent without a conversation (`Chat.available: false`), a reply
+  is `400 unsupported`. `404` is only for items the person cannot see.
 - **Lifecycle** is not part of the client API. Terminal actions stay on the
   origin API. Their results are readable as `Item.terminal`, and a retraction
   also as a `lifecycle` entry.
 - **Read position** takes an `entry_id`, and the server compares entries by
   `position`, max-wins. Sending an entry at or below the current position
   answers `200` with the unchanged item.
-- **Idempotency** is keyed by person and `Idempotency-Key`. It holds for at
-  least the 30-day change-log retention window.
+- **Idempotency** is keyed by person and `Idempotency-Key`, and it stores
+  **successes only**, as today's receipts do. It holds for at least the
+  30-day change-log retention window.
+  - A repeat with the same key and digest returns the stored success with
+    `Idempotent-Replayed: true`.
+  - A refused request is not stored, so a retry with the same key is
+    evaluated again.
+  - A different digest under a stored key is `409 idempotency_conflict`.
+  - Two clients sending the same key at the same moment may both apply. Keys
+    are UUIDv4 values minted once per intent by one client, so this is not a
+    production pattern, and nothing defends against it.
 - **`DELETE /v2/devices/me/push`** answers `200` with `WriteResult` carrying
   `settings`.
 - **`/v2/devices/me/*`** paths answer `403` to a browser principal.
+
+## 5.1 Focus and held shows
+
+Focus and push-a-view keep today's behavior (the focus spec as shipped).
+Only their transport changes, and they are device-only.
+
+- **`PUT /v2/devices/me/focus`** takes today's report fields:
+  - `screen`: today's set, including `not_in_front`;
+  - `item_id` (for today's sender and message IDs);
+  - `visible_entry_id` (for today's visible event);
+  - `ttl_s`.
+
+  Its `reported_at` rule is today's: the first report, or a change to an
+  in-front screen. A refresh with unchanged fields is liveness only. A lapsed
+  `ttl_s` ends focus, listing and targetability immediately, like today's
+  session end. A fresh accepted report restores them. A device is opted in to
+  shows only by an accepted focus report, and `signed_out` opts it out.
+- **Held shows** are memory-only. They are **never change-log rows**, and
+  nothing about focus or shows is stored. A show is
+  `{show_id, device_id, item_id, target: "message" | "chat", held_ms}`, where
+  `held_ms` is its age when the Server writes it. Each show addresses exactly
+  one device. It reaches that device:
+  - in the response to its next focus write;
+  - and, while the device holds an open feed, as an id-less `event: show`
+    that is never in a JSON batch or replay.
+
+  Both carry the same `show_id`, so the device applies it once. A show never
+  causes Seen, an answer, a reply, an open or a read.
 
 ## 6. The change feed
 
@@ -540,7 +615,7 @@ Every write that succeeds answers `200`, or `201` for `POST /v2/files`, with a
     "Closing": {
       "type": "object",
       "required": ["reason"],
-      "properties": { "reason": { "enum": ["revoked", "server_shutdown", "account_paused"] } }
+      "properties": { "reason": { "enum": ["revoked", "account_paused", "server_shutdown", "cursor_expired", "storage_unavailable"] } }
     }
   }
 }
@@ -550,6 +625,10 @@ Every write that succeeds answers `200`, or `201` for `POST /v2/files`, with a
   - The body is a `ChangeBatch`.
   - `limit` defaults to 500, with a maximum of 500.
   - `changes` are in increasing `rev` order and gap-free.
+  - `rev` is the position the batch is complete through: its last change's
+    `rev`, later if trailing log rows have no client form, or `after` when
+    nothing was read. Clients move their cursor to it even when it is past
+    the last change.
   - `after=0`, or no `after`, means "from the start". It is served only if
     the person's log is retained from rev 1. Otherwise, including every person
     seeded at cut-over, it is `410 cursor_expired`, and the client reads a
@@ -561,9 +640,16 @@ Every write that succeeds answers `200`, or `201` for `POST /v2/files`, with a
     line** at least every 25 s, and never ends a feed for idleness. A heartbeat
     never moves the cursor and never appears in a JSON batch. Clients use it
     only for the 60 s liveness rule.
-  - Before a server-initiated end, it sends `event: closing` with
+  - Before every server-initiated end, it sends `event: closing` with
     `data: Closing`. That event has **no `id:` line**, because it is not a log
-    change and must not move `Last-Event-ID`.
+    change and must not move `Last-Event-ID`. The reasons are:
+    - `revoked` and `account_paused`: stop, and re-enrol or show "paused";
+    - `server_shutdown` and `storage_unavailable`: reconnect with
+      `Last-Event-ID` after backoff;
+    - `cursor_expired`: the position fell out of retention mid-stream, so
+      rebaseline as for `410`.
+  - A held show for this device may arrive as an id-less `event: show`
+    (§5.1).
 - **`after` older than retention:** `410` with an `Error` body whose `error` is
   `cursor_expired`, in both forms.
 - **Feed ID:** the feed's `Request-Id` is its ID. The server logs it at open,
@@ -585,6 +671,11 @@ What clients see:
   `rev`. Clients must not rely on seeing every intermediate state.
 - Chat turns are their own Entry resources, so no turn is ever skipped.
 - `item_removed` rows are kept as tombstones for the retention window.
+- A log row may have no client form (for example a read-position fact), but
+  every client-visible effect of the fact it records also writes the
+  affected resource's row. A read position writes the item's row, so another
+  device sees `Chat.read_position`, `unread_replies` and `reply_priority`
+  change.
 
 The Server tests completeness by replaying the log, from empty and from a
 mid-log cursor, and comparing the result with a fresh snapshot.
@@ -653,13 +744,13 @@ visible text. Its `attention` member changes:
 | `account_paused` | 403 | false | The account is paused (`inactive_account`). Every `/v2` request except `GET /v2/me` gets it; open feeds get `closing` with `account_paused`. |
 | `not_found` | 404 | false | Unknown or invisible item, entry or file (`unknown_message`, `not_found`) |
 | `stale_request` | 409 | false | `request_revision` is behind the item (`stale_revision`) |
-| `already_answered` | 409 | false | Only on `/answer`: the item is already answered, or has no open request and was answered (`closed`) |
+| `already_answered` | 409 | false | Only on `/answer`: the item's `terminal` is already set (`closed`) |
 | `already_retracted` | 409 | false | The origin retracted the item (`retracted`) |
 | `idempotency_conflict` | 409 | false | Same key, different request (`operation_conflict`) |
 | `precondition_failed` | 412 | false | `If-Match` does not match. Also a superseded push `revision` (`stale_push_binding`). |
 | `cursor_expired` | 410 | false | `after` is older than retention |
 | `payload_too_large` | 413 | false | Body or file over the limit (`too_large`, `upload_cap_exceeded`) |
-| `unsupported` | 400 | false | The server does not serve this here, for example push with push disabled |
+| `unsupported` | 400 | false | The server does not serve this here: push with push disabled, or a reply on an item with no agent conversation |
 | `retry_later` | 503 | true | Load shedding, with `Retry-After` |
 | `storage_unavailable` | 503 | true | The store could not commit, with `Retry-After` |
 
@@ -698,8 +789,8 @@ content, tokens or identities.
 The delivery owner's rulings on this draft are applied above:
 
 1. **Answer** carries at most one of `choice` (an action `id`, and the server
-   stores its `value`), `comment` (the typed reply of a `text` action) and
-   `result` (`attention-client.ui/1` only). With none of them, the answer is
+   stores its `value`), `comment` (the plain-text answer, accepted on every
+   answerable item) and `result` (`attention-client.ui/1` only). With none of them, the answer is
    no comment. More than one is `invalid_field`. This keeps today's answer
    semantics (rulings 1, 9 and 10).
 2. **Lifecycle** is removed from the client API. No person-side clear or
@@ -756,5 +847,21 @@ applied as well. Round 4 wins where rounds conflict:
   - reply-row fields are present whenever the item has an agent chat reply;
   - `Item.result` is the latest result, and each result fact is also a
     `result` entry. This supersedes round 4 item 2 for results.
+  - Its addendum adds `Entry.priority` on agent replies and
+    `Chat.reply_priority`, and nests a result entry's `result`.
+- **Rounds 8 to 17:**
+  - `Item.created_at_ms` is optional and display-only, and `Item.arrival`
+    orders the new-messages area (8);
+  - `Item.thread` and adjacent group members (9);
+  - answerable means `terminal` is null, FYIs included (10);
+  - focus and held shows are transport-only and never log rows (11, §5.1);
+  - the batch position, and a row for every client-visible effect (12);
+  - idempotency stores successes only, and replies need a conversation (13);
+  - `Rank.score` and `due_at_ms` wherever today has them (14);
+  - `Terminal.answer` gains `choice`, `Rank.level` is always present for
+    current items, and the `Entry.position` wording (15);
+  - `result` is any JSON value, with a `result` outcome kind (16);
+  - the closing reasons `cursor_expired` and `storage_unavailable` (17).
+- `Chat.reply_group` may be null, where today's reply row has no group.
 
 No questions are open.
