@@ -102,20 +102,37 @@ defmodule AttentionServer.ClientAPI.Reads do
             send_resp(conn, 304, "")
 
           Map.has_key?(file, :path) ->
-            conn
-            |> put_resp_header("content-type", file.content_type)
-            |> send_file(200, file.path)
+            conn |> file_headers(ctx.principal, file) |> send_file(200, file.path)
 
           true ->
-            conn
-            |> put_resp_header("content-type", file.content_type)
-            |> send_resp(200, file.data)
+            conn |> file_headers(ctx.principal, file) |> send_resp(200, file.data)
         end
 
       error ->
         respond(conn, error)
     end
   end
+
+  # Round 18: a browser gets a file exactly as today's browser download, an
+  # attachment of application/octet-stream, so the web origin never renders
+  # it inline; a device gets the stored type.
+  defp file_headers(conn, %{kind: :browser}, file) do
+    disposition =
+      case file[:name] do
+        name when is_binary(name) and name != "" ->
+          "attachment; filename*=UTF-8''" <> URI.encode(name, &URI.char_unreserved?/1)
+
+        _ ->
+          "attachment"
+      end
+
+    conn
+    |> put_resp_header("content-type", "application/octet-stream")
+    |> put_resp_header("content-disposition", disposition)
+  end
+
+  defp file_headers(conn, _device, file),
+    do: put_resp_header(conn, "content-type", file.content_type)
 
   # Only the parameters a read takes; anything else in the query is ignored.
   defp query(conn, names), do: Map.take(conn.query_params, names)
@@ -183,7 +200,13 @@ defmodule AttentionServer.ClientAPI.Reads do
             # Uploads made through POST /v2/files keep the type they were sent
             # with; older uploads have none.
             content_type = Map.get(upload, :content_type) || "application/octet-stream"
-            {:ok, file_result(size, sha256, path: path, content_type: content_type)}
+
+            {:ok,
+             file_result(size, sha256,
+               path: path,
+               content_type: content_type,
+               name: Map.get(upload, :name)
+             )}
 
           {:error, :storage_unavailable} ->
             {:error, :storage_unavailable}
@@ -192,9 +215,9 @@ defmodule AttentionServer.ClientAPI.Reads do
             {:error, :not_found}
         end
 
-      {:ok, {:inline, data, sha256}} ->
+      {:ok, {:inline, data, sha256, name}} ->
         with {:ok, bytes} <- inline_bytes(data, sha256),
-             do: {:ok, file_result(byte_size(bytes), sha256, data: bytes)}
+             do: {:ok, file_result(byte_size(bytes), sha256, data: bytes, name: name)}
 
       error ->
         error
@@ -403,9 +426,9 @@ defmodule AttentionServer.ClientAPI.Reads do
   # The bytes are decoded and checked by the caller, outside the relay: large
   # inline data lives in a file, and reading it must neither block the relay
   # nor crash it when the file is missing or damaged.
-  defp inline_file(%{"data_base64" => data, "sha256" => sha256})
+  defp inline_file(%{"data_base64" => data, "sha256" => sha256} = file)
        when is_binary(data) or is_struct(data, LargeData.Ref),
-       do: {:ok, {:inline, data, sha256}}
+       do: {:ok, {:inline, data, sha256, file["name"]}}
 
   defp inline_file(_file), do: {:error, :not_found}
 

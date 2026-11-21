@@ -213,7 +213,7 @@ defmodule AttentionServer.ClientAPI.Resources do
       "sender" => sender,
       "request_revision" => record.revision,
       "message" => record.message,
-      "files" => item_files(record),
+      "files" => engine |> typed_files(item_files(record)),
       "seen" => seen?(engine, key, record),
       "chat" => chat(engine, key, record, summary, reply),
       "terminal" => terminal(record),
@@ -244,7 +244,7 @@ defmodule AttentionServer.ClientAPI.Resources do
        %{
          "request_revision" => n,
          "message" => message,
-         "files" => file_refs(files, "fi#{record.accepted_seq}.#{n}.")
+         "files" => typed_files(engine, file_refs(files, "fi#{record.accepted_seq}.#{n}."))
        }}
     else
       _ -> {:error, :not_found}
@@ -502,6 +502,23 @@ defmodule AttentionServer.ClientAPI.Resources do
 
   defp file_refs(_files, _prefix), do: []
 
+  # Round 18: FileRef.content_type is the type an upload was sent with, kept
+  # on the upload; files from before the cut-over have none.
+  defp typed_files(engine, refs) when is_list(refs) do
+    Enum.map(refs, fn
+      %{"file_id" => "fu" <> upload_id} = ref ->
+        case Map.get(engine.uploads, upload_id) do
+          %{content_type: type} when is_binary(type) -> Map.put_new(ref, "content_type", type)
+          _ -> ref
+        end
+
+      ref ->
+        ref
+    end)
+  end
+
+  defp typed_files(_engine, refs), do: refs
+
   defp file_ref(file, prefix, index) do
     file_id =
       case file do
@@ -515,6 +532,7 @@ defmodule AttentionServer.ClientAPI.Resources do
       "size" => file["size"],
       "sha256" => file["sha256"]
     }
+    |> put_present("content_type", if(is_binary(file["content_type"]), do: file["content_type"]))
   end
 
   ## Rank
@@ -903,7 +921,12 @@ defmodule AttentionServer.ClientAPI.Resources do
       |> Enum.with_index(1)
       |> Map.new(fn {{seq, _payload}, n} -> {seq, n} end)
 
-    context = %{by_event_id: by_event_id, results: results, replies: reply_entries}
+    context = %{
+      by_event_id: by_event_id,
+      results: results,
+      replies: reply_entries,
+      engine: engine
+    }
 
     # Receipt and acknowledgment facts mark the entry they refer to. Each entry
     # records the facts it is made of, so its rev can be the newest of theirs.
@@ -993,7 +1016,7 @@ defmodule AttentionServer.ClientAPI.Resources do
           base
           |> Map.merge(%{"kind" => "reply", "author" => author})
           |> put_present("text", payload["text"])
-          |> put_present("files", entry_files(payload, seq))
+          |> put_present("files", typed_entry_files(context, payload, seq))
           |> put_present("in_reply_to", reply_target(payload, context.by_event_id))
 
         # An agent reply carries today's per-reply priority (round 7).
@@ -1027,7 +1050,7 @@ defmodule AttentionServer.ClientAPI.Resources do
       "revision" ->
         base
         |> Map.merge(%{"kind" => "revision", "author" => "origin"})
-        |> put_present("files", entry_files(payload, seq))
+        |> put_present("files", typed_entry_files(context, payload, seq))
 
       "availability" ->
         base
@@ -1047,6 +1070,13 @@ defmodule AttentionServer.ClientAPI.Resources do
 
   defp entry_files(%{"files" => [_ | _] = files}, seq), do: file_refs(files, "fe#{seq}.")
   defp entry_files(_payload, _seq), do: nil
+
+  defp typed_entry_files(context, payload, seq) do
+    case entry_files(payload, seq) do
+      nil -> nil
+      refs -> typed_files(context.engine, refs)
+    end
+  end
 
   defp reply_target(%{"in_reply_to" => event_id}, by_event_id) when is_binary(event_id) do
     case Map.get(by_event_id, event_id) do
