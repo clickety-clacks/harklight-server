@@ -1413,14 +1413,16 @@ Writes return 200 unless the table says otherwise. Each response schema requires
   recently active listed device when the request is made. An unknown item
   or missing target device answers `404 not_found`. The response returns
   the resolved device name and delivery state. The state is `sent` when
-  the resolved target device is opted in and listed, has an open SSE feed,
-  and the server successfully writes the ephemeral `show` frame to that
-  connection. The handler waits only for the server feed writer's result,
-  bounded by the shared request timeout. Otherwise the state is `held`,
-  including when the write fails or is skipped. In either case, the
-  device's next focus-write response carries the show only while it is
-  still pending (§5.1). Both delivery paths use the same `show_id`,
-  which the client applies once.
+  the resolved target device is opted in and listed, its feed writer hands
+  the ephemeral `show` frame to the device's open HTTP/2 SSE stream, and
+  `Plug.Conn.chunk` returns success. The handler waits for the writer's
+  result up to the shared request timeout. Otherwise the state is `held`,
+  including when the write fails or is skipped, the show has already been
+  consumed, or the wait times out. A single transport send failure can
+  still yield `sent` if the connection stays open and Bandit returns chunk
+  success. For either state, the device's next focus-write response carries
+  the show only while it is still pending (§5.1). Both delivery paths use
+  the same `show_id`, which the client applies once.
 - **Files.** An agent uses the §4 device download response for
   `GET /v2/files/{file_id}`, including its stored type and quoted sha256
   ETag. `FileCreated.file_id` is the upload handle, accepted by a write's
