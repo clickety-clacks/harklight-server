@@ -812,6 +812,86 @@ defmodule AttentionServer.ClientAPIWritesTest do
     end
   end
 
+  describe "the Content-Type sent with POST /v2/files" do
+    test "is kept on the reply's upload and served back, across a restart",
+         %{path: path, flags: flags} do
+      relay = scripted_relay(path, flags)
+      one = item_id(relay, "one")
+
+      assert {201, %{"file_id" => file_id}, _} =
+               send_file(relay, "png bytes", [{"idempotency-key", key()}])
+
+      assert {:ok, 200, %{"entry" => %{"files" => [%{"file_id" => served}]}}, false} =
+               Writes.reply(relay, "reader", one, "A picture", [file_id], key())
+
+      assert {:ok, %{content_type: "image/png"}} = Reads.file(relay, "reader", served)
+      GenServer.stop(relay)
+
+      # The store reopens and validates the record with the extra key.
+      relay = start(path, flags)
+      assert {:ok, %{content_type: "image/png"}} = Reads.file(relay, "reader", served)
+      GenServer.stop(relay)
+    end
+
+    test "today's upload paths keep their record shape and serve octet-stream",
+         %{path: path, flags: flags} do
+      relay = scripted_relay(path, flags)
+      bytes = "legacy bytes"
+      hash = Base.encode16(:crypto.hash(:sha256, bytes), case: :lower)
+      source = Path.join(Path.dirname(path), "legacy.bin")
+      File.write!(source, bytes)
+
+      # Today's attributes are decoded JSON: a client-sent "content_type" is not kept.
+      attrs = %{
+        "op_id" => op(90),
+        "sender_id" => "app:test",
+        "message_id" => "one",
+        "revision" => 1,
+        "name" => "legacy.bin",
+        "content_type" => "text/html"
+      }
+
+      assert {:ok, lease} = Relay.upload_begin(relay, "reader", attrs, byte_size(bytes))
+
+      assert {:ok, %{"upload_id" => upload_id}} =
+               Relay.upload_file(relay, "reader", attrs, source, byte_size(bytes), hash, lease)
+
+      assert :ok = Relay.upload_end(relay, lease)
+
+      record = :sys.get_state(relay).store.engine.uploads[upload_id]
+      refute Map.has_key?(record, :content_type)
+
+      assert Enum.sort(Map.keys(record)) ==
+               Enum.sort(
+                 ~w(id person uploader uploader_kind op_id sender_id message_id revision name size sha256 last_activity_ms)a
+               )
+
+      # Referenced by today's discussion frame, it serves with no stored type.
+      assert %{"type" => "ok"} =
+               request(relay, "reader", %{
+                 "type" => "discussion",
+                 "op_id" => op(90),
+                 "sender_id" => "app:test",
+                 "message_id" => "one",
+                 "request_revision" => 1,
+                 "text" => "Legacy file",
+                 "files" => [
+                   %{
+                     "name" => "legacy.bin",
+                     "upload_id" => upload_id,
+                     "size" => byte_size(bytes),
+                     "sha256" => hash
+                   }
+                 ]
+               })
+
+      assert {:ok, %{content_type: "application/octet-stream"}} =
+               Reads.file(relay, "reader", "fu" <> upload_id)
+
+      GenServer.stop(relay)
+    end
+  end
+
   # Every write's change is on the one write path: replaying the rendered log
   # from empty, with the version rule, reaches what the snapshot reads show.
   test "after every kind of write, replaying the log from empty equals the snapshot",
