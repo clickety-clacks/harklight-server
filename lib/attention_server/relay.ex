@@ -827,6 +827,7 @@ defmodule AttentionServer.Relay do
               focus_clients: %{},
               focus_clients_by_person: %{},
               held_shows: %{},
+              agent_show_receipts: %{},
               focus_streams: %{},
               focus_streams_by_person: %{},
               tls_listeners: %{},
@@ -3653,7 +3654,11 @@ defmodule AttentionServer.Relay do
     Task.start(fn -> AttentionServer.ClientAPI.Uploads.clean_discarded(relay) end)
 
     schedule_change_log_prune(state.store, @change_log_prune_interval_ms)
-    {:noreply, state}
+
+    receipts =
+      Map.reject(state.agent_show_receipts, fn {_, receipt} -> receipt.at_ms < before_ms end)
+
+    {:noreply, %{state | agent_show_receipts: receipts}}
   end
 
   defp dispatch_info(:refresh_default_sweep_index, state) do
@@ -8359,6 +8364,10 @@ defmodule AttentionServer.Relay do
     end
   end
 
+  @doc false
+  def apply_agent_show(state, key, request, show_id),
+    do: handle_view_show(state, key, Map.put(request, :show_id, show_id))
+
   defp handle_view_show(state, key, request) do
     case focus_authorized_person(state.store.engine, key, :push) do
       {:ok, person} -> validate_and_send_show(state, person, key, request)
@@ -8435,6 +8444,16 @@ defmodule AttentionServer.Relay do
       "target" => request["target"]
     }
 
+    case request[:show_id] do
+      id when is_binary(id) ->
+        hold_show(state, agent_key, client, Map.put(show, "show_id", id))
+
+      nil ->
+        send_legacy_show(state, agent_key, client, show, client_key)
+    end
+  end
+
+  defp send_legacy_show(state, agent_key, client, show, client_key) do
     live_session =
       Enum.find(state.sessions, fn {_id, session} ->
         session.key == client_key and session.focus_opted_in
@@ -8454,7 +8473,9 @@ defmodule AttentionServer.Relay do
     held = Map.put(show, "accepted_at", state.clock.())
     next = %{state | held_shows: Map.put(state.held_shows, client["client_id"], held)}
 
-    AttentionServer.ClientAPI.Focus.notify_show(client["client_id"])
+    unless Map.has_key?(show, "show_id") do
+      AttentionServer.ClientAPI.Focus.notify_show(client["client_id"])
+    end
 
     {{:ok,
       %{
@@ -8466,7 +8487,7 @@ defmodule AttentionServer.Relay do
 
   defp held_show_frame(held, now) do
     held
-    |> Map.drop(["accepted_at"])
+    |> Map.drop(["accepted_at", "show_id"])
     |> Map.put("held_ms", max(now - held["accepted_at"], 0))
   end
 

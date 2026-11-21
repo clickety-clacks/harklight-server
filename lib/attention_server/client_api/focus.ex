@@ -43,15 +43,29 @@ defmodule AttentionServer.ClientAPI.Focus do
     do: Registry.unregister(@registry, {:client_api_show, device_key})
 
   @doc false
-  # The held show stays in the relay. This only wakes subscribed feeds.
   def notify_show(device_key) do
-    if Process.whereis(@registry) do
-      Registry.dispatch(@registry, {:client_api_show, device_key}, fn entries ->
-        for {pid, _} <- entries, do: send(pid, {:client_api_show, device_key})
-      end)
-    end
+    Enum.each(show_writers(device_key), fn {pid, _} ->
+      send(pid, {:client_api_show, device_key})
+    end)
+  end
 
-    :ok
+  @doc false
+  # Offer the exact held show to one writer. The HTTP request owns the wait.
+  def offer_show(device_key, show_id, result_ref) do
+    case Enum.find(show_writers(device_key), fn {pid, _} -> Process.alive?(pid) end) do
+      {pid, _} ->
+        send(pid, {:client_api_show, device_key, show_id, result_ref})
+        pid
+
+      nil ->
+        nil
+    end
+  end
+
+  defp show_writers(device_key) do
+    if Process.whereis(@registry),
+      do: Registry.lookup(@registry, {:client_api_show, device_key}),
+      else: []
   end
 
   @doc "Reads the current held show for an authenticated device with an active focus report."
@@ -99,6 +113,8 @@ defmodule AttentionServer.ClientAPI.Focus do
   end
 
   # Stable for one held show, so both deliveries carry the same id.
+  defp show_id(_device_key, %{"show_id" => id}), do: id
+
   defp show_id(device_key, held) do
     material =
       Enum.join(

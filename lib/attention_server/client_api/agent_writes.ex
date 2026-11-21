@@ -9,6 +9,7 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
 
   alias AttentionServer.ClientAPI.{
     AgentResources,
+    AgentShow,
     Errors,
     Idempotency,
     Resources,
@@ -171,7 +172,7 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
     case authorize(state, scope) do
       :ok ->
         case lookup(state, receipt_scope, key) do
-          {:ok, %{digest: ^digest, status: status, body: stored}} ->
+          {:ok, %{digest: ^digest, status: status, body: stored}} when is_binary(stored) ->
             {:reply, {:stored, status, stored}, state}
 
           {:ok, %{}} ->
@@ -339,8 +340,7 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
     end
   end
 
-  defp lookup(_state, _scope, nil), do: {:ok, nil}
-  defp lookup(state, scope, key), do: Idempotency.lookup_encoded(state.store, scope, key)
+  defp lookup(state, scope, key), do: AgentShow.lookup(state, scope, key)
 
   defp apply_operation(
          state,

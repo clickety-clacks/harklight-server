@@ -94,6 +94,7 @@ defmodule AttentionServer.ClientAPI.Router do
   @route_modules [
     AttentionServer.ClientAPI.Reads,
     AttentionServer.ClientAPI.AgentReads,
+    AttentionServer.ClientAPI.AgentShow,
     AttentionServer.ClientAPI.AgentWrites,
     AttentionServer.ClientAPI.Writes,
     AttentionServer.ClientAPI.Feed,
@@ -102,6 +103,11 @@ defmodule AttentionServer.ClientAPI.Router do
   ]
 
   @default_max_in_flight 512
+
+  @doc false
+  # Matches the device listener's HTTP/2 writer wait default.
+  def request_timeout_ms,
+    do: Application.get_env(:attention_server, :client_api_request_timeout_ms, 15_000)
 
   @impl Plug
   def init(opts) do
