@@ -49,6 +49,8 @@ defmodule AttentionServer.Store.RecordTable do
     end
   end
 
+  # Only a tagged success commits. A bare SQL success does not publish the
+  # caller's result.
   def transaction(db, write) do
     with :ok <- Sqlite3.execute(db, "BEGIN IMMEDIATE") do
       try do
@@ -88,7 +90,8 @@ defmodule AttentionServer.Store.RecordTable do
     with :ok <- Sqlite3.execute(db, "COMMIT"), do: result
   end
 
-  defp finish(_db, error), do: error
+  defp finish(_db, {:error, _} = error), do: error
+  defp finish(_db, _other), do: {:error, :invalid_transaction_result}
 
   defp append_rows(append, db, generation) do
     case append.(db, generation) do

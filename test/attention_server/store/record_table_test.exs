@@ -89,6 +89,16 @@ defmodule AttentionServer.Store.RecordTableTest do
     assert_versions(db, 9)
   end
 
+  test "a bare transaction callback result reports rollback", %{db: db} do
+    assert {:error, :invalid_transaction_result} =
+             RecordTable.transaction(db, fn ->
+               Sqlite3.execute(db, "INSERT INTO audit VALUES (10)")
+             end)
+
+    assert {:ok, []} = query(db, "SELECT seq FROM audit")
+    assert_versions(db, 9)
+  end
+
   defp appends(old, next) do
     changed = ChangeLog.changed_resources(old, next)
     person = ChangeLog.changes(old, next, changed)
