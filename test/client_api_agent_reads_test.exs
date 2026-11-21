@@ -447,7 +447,7 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
     end
 
     test "lifecycle refuses a retracted item with the closed transition error", ctx do
-      id = forward(ctx, "a1", 1, nil)
+      id = forward(ctx, "a1", 1, @first_session)
       item = "/v2/agent/messages/" <> id
       assert request(ctx, "a1", "POST", item <> "/retract", %{}, 2).status == 200
 
@@ -458,6 +458,16 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
       )
 
       assert_error(request(ctx, "a1", "POST", item <> "/retract", %{}, 4), 409, "already_retracted")
+    end
+
+    test "can retract a message without a session", ctx do
+      id = forward(ctx, "a1", 1, nil)
+      item = "/v2/agent/messages/" <> id
+      response = request(ctx, "a1", "POST", item <> "/retract", %{}, 2)
+      assert response.status == 200
+
+      assert %{"message" => %{"terminal" => %{"state" => "retracted"}}} =
+               contract(ctx, "AgentRetractResult", response)
     end
 
     test "correlated retract marks the person's turn acted without recording handoff", ctx do

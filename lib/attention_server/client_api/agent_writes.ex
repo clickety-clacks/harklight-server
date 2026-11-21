@@ -431,9 +431,8 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
 
   defp item_frame(state, key, record, :retract, _match, body) do
     with :ok <- open(record),
-         {:ok, correlation, position} <- correlation(state, key, record, body),
-         {:ok, frame} <- retract_frame(state, record, correlation) do
-      {:ok, frame, position}
+         {:ok, correlation, position} <- correlation(state, key, record, body) do
+      {:ok, Map.put(correlation, "type", "conversation_withdraw"), position}
     end
   end
 
@@ -588,19 +587,6 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
   end
 
   defp if_match(_headers, _revision), do: {:error, :precondition_failed}
-
-  defp retract_frame(state, %{session_handle: nil}, correlation) when map_size(correlation) == 0,
-    do:
-      {:ok,
-       %{
-         "type" => "lifecycle",
-         "state" => "retracted",
-         "at" => state.clock.(),
-         "by" => "origin_withdrawal"
-       }}
-
-  defp retract_frame(_state, _record, correlation),
-    do: {:ok, Map.put(correlation, "type", "conversation_withdraw")}
 
   defp correlation(state, key, record, %{"in_reply_to" => id}) do
     with {:ok, sequence, position, revision} <- person_turn(state, key, id) do

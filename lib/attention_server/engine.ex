@@ -5333,7 +5333,7 @@ defmodule AttentionServer.Engine do
 
     case Map.get(engine.messages, key) do
       %{origin: ^actor, session_handle: handle, terminal: nil}
-      when is_binary(handle) ->
+      when is_binary(handle) or (is_nil(handle) and frame.agent_api_v2 == true) ->
         with {:ok, acted} <- maybe_act_person_entry(engine, person, actor, key, frame) do
           terminal_frame =
             frame
