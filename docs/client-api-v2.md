@@ -871,7 +871,9 @@ The server logs the failing resource key with the `Request-Id`. A committed
 write stays committed when its response fails to render, and its effect is
 visible on the next read. Replaying the same keyed request uses the committed
 outcome without repeating the mutation. If it still cannot be rendered, the
-replay returns `internal_error`.
+replay returns `internal_error`. If a committed push write failed before its
+original response could be captured, replay still returns `internal_error`.
+Read `GET /v2/settings` for the current binding.
 
 The app, web client, Agent CLI and integrations surface `internal_error`
 in context and record it in the Error Log. Copy details includes the
