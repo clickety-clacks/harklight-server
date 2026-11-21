@@ -24,7 +24,15 @@ defmodule AttentionServer.Store do
   }
 
   alias Exqlite.Sqlite3
-  alias AttentionServer.Store.{KeyedValidation, Persistence, RecordCodec, SnapshotEncoding}
+
+  alias AttentionServer.Store.{
+    KeyedMigration,
+    KeyedReference,
+    KeyedValidation,
+    Persistence,
+    RecordCodec,
+    SnapshotEncoding
+  }
 
   @format_version 29
   @inbox_index_chunk_size 20
@@ -39,6 +47,11 @@ defmodule AttentionServer.Store do
     :large_base,
     :large_persisted,
     :large_index,
+    mode: :legacy,
+    source_bindings: %{},
+    upload_links: %{},
+    authority_index: %{},
+    blob_owners: %{},
     progress_version: 0,
     encoding_cache: %{},
     change_log: false,
@@ -164,51 +177,40 @@ defmodule AttentionServer.Store do
     {:error, :invalid_store_path}
   end
 
-  def open(path) when is_binary(path) and path != "" do
+  def open(path) when is_binary(path) and path != "", do: open(path, :legacy)
+
+  def open(_) do
+    Diagnostics.failure(:server_storage, :store_open, :invalid_store_path, :unavailable)
+    {:error, :invalid_store_path}
+  end
+
+  def open(path, :keyed_cutover)
+      when is_binary(path) and path != "" and path != ":memory:" do
+    case cutover_mode(path) do
+      {:ok, :keyed} ->
+        open(path, :keyed)
+
+      {:ok, :legacy} ->
+        with {:ok, legacy} <- open(path, :legacy) do
+          convert_legacy_store(legacy)
+        end
+
+      error ->
+        error
+    end
+  end
+
+  def open(path, mode) when is_binary(path) and path != "" and mode in [:legacy, :keyed] do
     upload_dir = Path.expand(path) <> ".uploads"
 
     case Sqlite3.open(path) do
       {:ok, db} ->
-        case initialize(db, upload_dir) do
+        case initialize(db, upload_dir, mode) do
           {:ok, engine, version} ->
-            engine =
-              engine
-              |> Engine.rebuild_default_index()
-              |> Conversation.index_origin_feeds()
+            case finalize_open(db, upload_dir, engine, version, mode) do
+              {:ok, store} ->
+                {:ok, store}
 
-            with {:ok, reference_rows} <- load_large_data_references(db),
-                 :ok <- File.mkdir_p(upload_dir),
-                 :ok <- File.chmod(upload_dir, 0o700),
-                 {:ok, engine} <- LargeData.attach_paths(engine, upload_dir, reference_rows),
-                 :ok <- LargeData.verify_all(engine),
-                 :ok <-
-                   prune_untracked_uploads(%__MODULE__{
-                     db: db,
-                     engine: engine,
-                     version: version,
-                     upload_dir: upload_dir
-                   }),
-                 :ok <- LargeData.prune(upload_dir, engine),
-                 :ok <-
-                   sync_large_data_references(db, LargeData.persisted_references(engine)),
-                 {:ok, store} <-
-                   load_progress(%__MODULE__{
-                     db: db,
-                     engine: engine,
-                     version: version,
-                     upload_dir: upload_dir
-                   }) do
-              engine = store.engine
-              persisted = LargeData.persist_refs(engine)
-
-              {_payload, cache} =
-                Persistence.run(fn -> SnapshotEncoding.encode(persisted, @format_version) end)
-
-              # The base is seeded by the first snapshot commit, which takes
-              # the full path: a loaded state is externalized exactly as
-              # before, including any oversized inline string it may hold.
-              {:ok, %{store | encoding_cache: cache}}
-            else
               {:error, reason} ->
                 Diagnostics.failure(:server_storage, :store_open, reason, :unavailable)
                 _ = Sqlite3.close(db)
@@ -232,9 +234,104 @@ defmodule AttentionServer.Store do
     end
   end
 
-  def open(_) do
-    Diagnostics.failure(:server_storage, :store_open, :invalid_store_path, :unavailable)
-    {:error, :invalid_store_path}
+  defp cutover_mode(path) do
+    with {:ok, db} <- Sqlite3.open(path) do
+      try do
+        case one(
+               db,
+               "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name IN ('relay_records', 'relay_record_generation') LIMIT 1",
+               []
+             ) do
+          {:ok, [1]} -> {:ok, :keyed}
+          {:ok, nil} -> {:ok, :legacy}
+          error -> error
+        end
+      after
+        Sqlite3.close(db)
+      end
+    end
+  end
+
+  defp convert_legacy_store(legacy) do
+    case KeyedMigration.convert_store(legacy, &prepare_keyed_conversion/3) do
+      {:ok, _} = converted ->
+        converted
+
+      error ->
+        _ = close(legacy)
+        error
+    end
+  catch
+    kind, reason ->
+      _ = close(legacy)
+      :erlang.raise(kind, reason, __STACKTRACE__)
+  end
+
+  defp prepare_keyed_conversion(legacy, decoded, generation) do
+    with {:ok, engine} <- validate_keyed_engine(decoded),
+         engine = rebuild_open_indexes(engine),
+         {:ok, rows} <- load_large_data_references(legacy.db),
+         {:ok, engine} <- LargeData.attach_paths(engine, legacy.upload_dir, rows),
+         :ok <- LargeData.verify_all(engine) do
+      finalize_mode(%__MODULE__{
+        db: legacy.db,
+        upload_dir: legacy.upload_dir,
+        engine: engine,
+        version: generation,
+        mode: :keyed
+      })
+    end
+  end
+
+  defp finalize_open(db, upload_dir, engine, version, mode) do
+    engine = rebuild_open_indexes(engine)
+
+    with {:ok, reference_rows} <- load_large_data_references(db),
+         :ok <- File.mkdir_p(upload_dir),
+         :ok <- File.chmod(upload_dir, 0o700),
+         {:ok, engine} <- LargeData.attach_paths(engine, upload_dir, reference_rows),
+         :ok <- LargeData.verify_all(engine),
+         store = %__MODULE__{
+           db: db,
+           engine: engine,
+           version: version,
+           upload_dir: upload_dir,
+           mode: mode
+         },
+         :ok <- prune_untracked_uploads(store),
+         :ok <- LargeData.prune(upload_dir, engine),
+         :ok <- sync_large_data_references(db, LargeData.persisted_references(engine)) do
+      finalize_mode(store)
+    end
+  end
+
+  defp rebuild_open_indexes(engine) do
+    engine |> Engine.rebuild_default_index() |> Conversation.index_origin_feeds()
+  end
+
+  defp finalize_mode(%__MODULE__{mode: :keyed} = store) do
+    engine = AttentionServer.RouteBIndex.enable_keyed_lookups(store.engine)
+
+    {:ok,
+     %{
+       store
+       | engine: engine,
+         source_bindings: engine.route_b_index.source_bindings,
+         upload_links: KeyedValidation.upload_index(engine),
+         authority_index: KeyedValidation.authority_index(engine),
+         blob_owners: KeyedReference.blob_owners(engine)
+     }}
+  end
+
+  defp finalize_mode(%__MODULE__{mode: :legacy} = store) do
+    with {:ok, store} <- load_progress(store) do
+      persisted = LargeData.persist_refs(store.engine)
+
+      {_payload, cache} =
+        Persistence.run(fn -> SnapshotEncoding.encode(persisted, @format_version) end)
+
+      {:ok, %{store | encoding_cache: cache}}
+    end
   end
 
   def close(%__MODULE__{db: nil}), do: :ok
@@ -1091,19 +1188,42 @@ defmodule AttentionServer.Store do
     end
   end
 
-  defp initialize(db, upload_dir) do
-    with :ok <- Sqlite3.execute(db, "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;"),
-         :ok <- Sqlite3.execute(db, @schema),
-         result <- load_or_create(db, upload_dir) do
-      result
+  defp initialize(db, upload_dir, :legacy) do
+    with :ok <- set_durability(db),
+         :ok <- Sqlite3.execute(db, @schema) do
+      load_or_create(db, upload_dir)
     end
   end
+
+  defp initialize(db, _upload_dir, :keyed) do
+    with {:ok, engine, generation} <- KeyedMigration.load(db),
+         {:ok, engine} <- validate_keyed_engine(engine),
+         :ok <- set_durability(db) do
+      {:ok, engine, generation}
+    end
+  end
+
+  defp validate_keyed_engine(decoded) do
+    engine = decoded |> BounceDecision.rebuild_indexes() |> Engine.rebuild_route_b_index()
+    if valid_state?(engine), do: {:ok, engine}, else: {:error, :invalid_state}
+  rescue
+    _ -> {:error, :invalid_state}
+  end
+
+  defp set_durability(db),
+    do: Sqlite3.execute(db, "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")
 
   @doc """
   Commits engine state and its change-log rows. A publisher can supply the
   canonical entry keys whose projection changed without changing their facts.
   """
-  def commit(store, next, audit, projected_entries \\ []) do
+  def commit(store, next, audit, projected_entries \\ [])
+
+  # The keyed writer is installed in its own slice.
+  def commit(%__MODULE__{mode: :keyed} = store, _next, _audit, _projected_entries),
+    do: {:error, :storage_unavailable, store}
+
+  def commit(store, next, audit, projected_entries) do
     projected_entries = if store.change_log, do: projected_entries, else: []
 
     case do_commit(store, next, audit, projected_entries) do
