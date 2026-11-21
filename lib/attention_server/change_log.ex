@@ -279,7 +279,9 @@ defmodule AttentionServer.ChangeLog do
 
   @doc """
   The client API connections `old -> next` must end, from the same commit:
-  `{{:device, key}, :revoked}` for a device revoked or removed, and
+  `{{:device, key}, :revoked}` for a device revoked or removed,
+  `{{:owner, person}, :revoked}` for a changed owner key or revision (which
+  ends that person's browser sessions), and
   `{{:person, person}, :account_paused}` for an account whose delivery stopped.
   Pure.
   """
@@ -306,7 +308,19 @@ defmodule AttentionServer.ChangeLog do
             do: {{:person, person}, :account_paused}
       end
 
-    devices ++ paused
+    # A browser session is pinned to its person's owner key and revision, so
+    # any change to the owner entry (a revoked or recovered owner key, a new
+    # revision) ends every browser session of that person.
+    owners =
+      if old.owners === next.owners do
+        []
+      else
+        for {person, owner} <- old.owners,
+            Map.get(next.owners, person) != owner,
+            do: {{:owner, person}, :revoked}
+      end
+
+    devices ++ paused ++ owners
   end
 
   @doc """
@@ -333,8 +347,14 @@ defmodule AttentionServer.ChangeLog do
   def subscribe_closing(%{kind: :device, key: key, person: person}),
     do: register_closing([{:device, key}, {:person, person}])
 
-  def subscribe_closing(%{kind: :browser, session_id: session_id, person: person}),
-    do: register_closing([{:browser_session, session_id}, {:person, person}])
+  def subscribe_closing(%{kind: :browser, session_id: session_id, person: person} = principal) do
+    owner_key = Map.get(principal, :key)
+    device = if is_binary(owner_key), do: [{:device, owner_key}], else: []
+
+    register_closing(
+      [{:browser_session, session_id}, {:owner, person}, {:person, person}] ++ device
+    )
+  end
 
   defp register_closing(scopes) do
     Enum.each(scopes, fn scope -> Registry.register(@registry, {:closing, scope}, nil) end)
@@ -348,8 +368,14 @@ defmodule AttentionServer.ChangeLog do
   def unsubscribe_closing(%{kind: :device, key: key, person: person}),
     do: unregister_closing([{:device, key}, {:person, person}])
 
-  def unsubscribe_closing(%{kind: :browser, session_id: session_id, person: person}),
-    do: unregister_closing([{:browser_session, session_id}, {:person, person}])
+  def unsubscribe_closing(%{kind: :browser, session_id: session_id, person: person} = principal) do
+    owner_key = Map.get(principal, :key)
+    device = if is_binary(owner_key), do: [{:device, owner_key}], else: []
+
+    unregister_closing(
+      [{:browser_session, session_id}, {:owner, person}, {:person, person}] ++ device
+    )
+  end
 
   defp unregister_closing(scopes) do
     Enum.each(scopes, fn scope -> Registry.unregister(@registry, {:closing, scope}) end)
