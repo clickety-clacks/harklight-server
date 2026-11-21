@@ -4330,6 +4330,13 @@ defmodule AttentionServer.Engine do
           seq: seq
         }
 
+        # Client API v2 records which answer path was taken (contract rulings
+        # round 16); today's frames carry none, so their terminals keep their shape.
+        terminal =
+          if answer? and is_binary(frame["answer_path"]),
+            do: Map.put(terminal, :answer_path, frame["answer_path"]),
+            else: terminal
+
         reply =
           %{"seq" => seq}
           |> then(fn fields ->
@@ -5519,8 +5526,14 @@ defmodule AttentionServer.Engine do
     end
   end
 
+  @answer_paths ~w(result comment choice)
+
   defp valid_terminal_fields(frame, true) do
-    if Map.has_key?(frame, "answer"), do: :ok, else: {:error, "answer"}
+    cond do
+      not Map.has_key?(frame, "answer") -> {:error, "answer"}
+      Map.get(frame, "answer_path", "result") not in @answer_paths -> {:error, "answer_path"}
+      true -> :ok
+    end
   end
 
   defp valid_terminal_fields(frame, false) do
@@ -5546,7 +5559,7 @@ defmodule AttentionServer.Engine do
       "message_id" => frame["message_id"],
       "answer" => frame["answer"]
     }
-    |> Map.merge(Map.take(frame, ~w(request_revision)))
+    |> Map.merge(Map.take(frame, ~w(request_revision answer_path)))
   end
 
   defp terminal_semantic(frame, false) do

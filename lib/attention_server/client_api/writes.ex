@@ -815,7 +815,8 @@ defmodule AttentionServer.ClientAPI.Writes do
                  }}
 
               {:answer, answer} ->
-                {:ok, answer_frame(key, sender, message_id, revision, answer)}
+                frame = answer_frame(key, sender, message_id, revision, answer)
+                {:ok, Map.put(frame, "answer_path", answer_path(value))}
             end
           end
       end
@@ -858,6 +859,12 @@ defmodule AttentionServer.ClientAPI.Writes do
   end
 
   defp frame(_engine, _principal, _key, {:file, _meta, _tmp_path}), do: {:ok, :unchanged}
+
+  # Which answer path stored the value, so a UI/1 result and a plain-text
+  # answer stay distinguishable (contract rulings round 16 addendum).
+  defp answer_path({:result, _}), do: "result"
+  defp answer_path({:comment, _}), do: "comment"
+  defp answer_path({:choice, _}), do: "choice"
 
   defp answer_frame(key, sender, message_id, revision, answer) do
     %{
