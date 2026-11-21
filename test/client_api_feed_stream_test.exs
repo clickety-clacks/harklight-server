@@ -501,6 +501,8 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
   end
 
   test "serving a person reply on agent SSE records delivery on its original entry", ctx do
+    Application.put_env(:attention_server, :client_api_feed_heartbeat_ms, 100)
+    on_exit(fn -> Application.delete_env(:attention_server, :client_api_feed_heartbeat_ms) end)
     assert :ok = Relay.setup_sender(ctx.relay, ctx.reader, "app:agent")
 
     assert %{"type" => "ok"} =
@@ -517,6 +519,7 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
              })
 
     scope = {"A", ctx.reader}
+
     assert {:ok, position} =
              AttentionServer.AgentChangeLog.head(:sys.get_state(ctx.relay).store, scope)
 
@@ -543,8 +546,14 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
     assert before.id < delivered.id
 
     store = :sys.get_state(ctx.relay).store
+
     assert {:ok, rev} =
-             AttentionServer.AgentChangeLog.rev(store, scope, {:entry, delivered.data["position"]})
+             AttentionServer.AgentChangeLog.rev(
+               store,
+               scope,
+               {:entry, delivered.data["position"]}
+             )
+
     assert rev == delivered.id
   end
 
