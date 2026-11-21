@@ -1248,7 +1248,7 @@ defmodule AttentionServer.Store do
          {:ok, heads, agent_heads} <- append_change_logs(db, log, version + 1),
          :ok <- Sqlite3.execute(db, "COMMIT") do
       if is_binary(upload_dir) do
-        case LargeData.delete_unreferenced(upload_dir, old_ids, next_ids) do
+        case LargeData.delete_unreferenced(upload_dir, old_ids, next_ids, persisted) do
           :ok ->
             :ok
 

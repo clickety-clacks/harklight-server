@@ -1098,6 +1098,87 @@ defmodule AttentionServer.ConversationFeedTest do
     GenServer.stop(upgraded)
   end
 
+  test "reopen retains intact large data when its reference rows are missing", %{path: path} do
+    assert {:ok, relay} = Relay.start_link(store_path: path)
+    assert :ok = Relay.setup_person(relay, "A")
+    assert :ok = Relay.setup_device(relay, "A", "origin")
+    assert :ok = Relay.setup_sender(relay, "origin", "app:test")
+
+    body = :binary.copy("x", LargeData.inline_limit() + 1)
+    id = "retained-large-body"
+
+    assert %{"type" => "ok"} =
+             request(relay, "origin", %{
+               "type" => "forward",
+               "op_id" => op(508),
+               "session_handle" => @handle,
+               "message" => %{
+                 "sender_id" => "app:test",
+                 "message_id" => id,
+                 "created_at" => 1,
+                 "title" => "Retained content",
+                 "body" => body
+               }
+             })
+
+    store = :sys.get_state(relay).store
+    key = {"A", "app:test", id}
+    assert %LargeData.Ref{} = ref = store.engine.messages[key].message["body"]
+    marker = LargeData.persist_refs(ref)
+    refs = large_data_reference_rows(path)
+    assert refs != []
+    GenServer.stop(relay)
+
+    {:ok, db} = Sqlite3.open(path)
+    assert :ok = Sqlite3.execute(db, "DELETE FROM relay_large_data_refs")
+    assert :ok = Sqlite3.close(db)
+
+    orphan = Path.join(store.upload_dir, String.duplicate("0", 64))
+    File.write!(orphan, "orphan")
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert {:ok, reopened} = Store.open(path)
+        assert reopened.engine.messages[key].message["body"] == marker
+        assert :ok = Store.close(reopened)
+      end)
+
+    assert File.read(ref.path) == {:ok, body}
+    assert log =~ "event=harklight_unresolved_large_data_reference"
+    assert large_data_reference_rows(path) == []
+    refute File.exists?(orphan)
+
+    {:ok, db} = Sqlite3.open(path)
+
+    {:ok, stmt} =
+      Sqlite3.prepare(
+        db,
+        "INSERT INTO relay_large_data_refs (path, marker, id, size, sha256) VALUES (?, ?, ?, ?, ?)"
+      )
+
+    for [path_key, marker, id, size, sha256] <- refs do
+      assert :ok = Sqlite3.bind(stmt, [{:blob, path_key}, marker, id, size, sha256])
+      assert :done = Sqlite3.step(db, stmt)
+      assert :ok = Sqlite3.reset(stmt)
+    end
+
+    assert :ok = Sqlite3.release(db, stmt)
+    assert :ok = Sqlite3.close(db)
+    assert {:ok, repaired} = Store.open(path)
+    assert repaired.engine.messages[key].message["body"] == ref
+    assert LargeData.read!(ref) == body
+
+    # Also exercise retirement through the snapshot commit path. A marker
+    # remains in the durable state after the last registered reference goes.
+    next = LargeData.persist_refs(repaired.engine)
+    audit = %{person: "A", actor: "origin", action: "retain_marker"}
+
+    assert {:ok, committed} = Store.commit(repaired, next, audit)
+    assert large_data_reference_rows(path) == []
+    assert File.read(ref.path) == {:ok, body}
+    assert :ok = Store.close(committed)
+  end
+
   test "FORMAT29 inline large title and body remain readable without a format migration", %{
     path: path
   } do
