@@ -67,9 +67,17 @@ defmodule AttentionServer.Store.RecordCodecTest do
   end
 
   test "record identity includes the application codec version" do
-    {key, _, _} = RecordCodec.encode_row({:row, :messages, "msg"}, nil)
-    assert binary_part(key, 0, 2) == <<131, 104>>
-    assert :erlang.binary_to_term(key, [:safe]) == {:relay_record_v1, {:row, :messages, "msg"}}
+    address = {:row, :messages, {"person", "sender", "msg"}}
+
+    expected =
+      Base.decode16!(
+        "836802770F72656C61795F7265636F72645F763168037703726F7777086D65737361676573" <>
+          "68036D00000006706572736F6E6D0000000673656E6465726D000000036D7367"
+      )
+
+    assert RecordCodec.encode_key(address) == expected
+    assert {^expected, _, _} = RecordCodec.encode_row(address, nil)
+    assert :erlang.binary_to_term(expected, [:safe]) == {:relay_record_v1, address}
   end
 
   test "retains event rows and decimal values" do
