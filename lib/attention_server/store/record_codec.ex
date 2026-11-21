@@ -62,26 +62,17 @@ defmodule AttentionServer.Store.RecordCodec do
     Stream.concat([fields, advisories, origins])
   end
 
-  def operations(engine, touched) do
-    Enum.map(touched, fn address ->
-      case record(engine, address) do
-        {:ok, value} -> {:put, encode_row(address, value)}
-        :error -> {:delete, encode_key(address)}
-      end
-    end)
-  end
+  def lookup(engine, {:field, field}), do: Map.fetch(engine, field)
+  def lookup(engine, {:row, field, key}), do: Map.fetch(Map.fetch!(engine, field), key)
 
-  defp record(engine, {:field, field}), do: Map.fetch(engine, field)
-  defp record(engine, {:row, field, key}), do: Map.fetch(Map.fetch!(engine, field), key)
-
-  defp record(engine, {:member, field, key}) do
+  def lookup(engine, {:member, field, key}) do
     if MapSet.member?(Map.fetch!(engine, field), key), do: {:ok, true}, else: :error
   end
 
-  defp record(engine, {:origin_feed, scope, fact}),
+  def lookup(engine, {:origin_feed, scope, fact}),
     do: feed_record(Map.get(engine.origin_feeds, scope, %{}), fact)
 
-  defp record(engine, {:advisory, scope, fact}),
+  def lookup(engine, {:advisory, scope, fact}),
     do: feed_record(Map.get(engine.advisory_feeds, scope, %{}), fact)
 
   defp feed_record(feed, :high), do: Map.fetch(feed, :high)

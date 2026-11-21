@@ -217,6 +217,76 @@ defmodule AttentionServer.Store.EngineTransitionTest do
     :ok = Store.close(keyed)
   end
 
+  test "keyed reference rollback and final owner cleanup respect durable rows" do
+    path = legacy_store_path()
+    {:ok, legacy} = Store.open(path)
+    assert {:ok, _} = KeyedMigration.convert(legacy)
+    :ok = Store.close(legacy)
+    {:ok, store} = Store.open(path, :keyed)
+    audit = %{person: @person, actor: @origin, action: "forward"}
+
+    {next, {:ok, _}, keys} =
+      Engine.request_line_with_touches(store.engine, @origin, forward_line(), 100)
+
+    item = {@person, "app:test/worker", "msg"}
+    body = :binary.copy("r", AttentionServer.LargeData.inline_limit() + 1)
+    next = replace_body(next, item, body)
+
+    assert :ok =
+             Sqlite3.execute(store.db, """
+             CREATE TRIGGER keyed_reference_fault BEFORE INSERT ON relay_large_data_refs
+             BEGIN SELECT RAISE(ABORT, 'failed'); END
+             """)
+
+    assert {:error, :storage_unavailable, ^store} = Store.commit(store, {next, keys}, audit)
+    :ok = Store.close(store)
+    {:ok, store} = Store.open(path, :keyed)
+    assert File.ls!(store.upload_dir) == []
+    assert :ok = Sqlite3.execute(store.db, "DROP TRIGGER keyed_reference_fault")
+
+    {:ok, store} = Store.commit(store, {next, keys}, audit)
+    assert [filename] = File.ls!(store.upload_dir)
+    file = Path.join(store.upload_dir, filename)
+    assert File.read!(file) == body
+    {:ok, frame} = JSON.decode_line(forward_line())
+    frame = frame |> put_in(["message", "message_id"], "second")
+    frame = Map.put(frame, "op_id", "00000000-0000-4000-8000-000000000002")
+
+    {next, {:ok, _}, keys} =
+      Engine.request_line_with_touches(store.engine, @origin, JSON.encode!(frame) <> "\n", 200)
+
+    second = {@person, "app:test/worker", "second"}
+    {:ok, store} = Store.commit(store, {replace_body(next, second, body), keys}, audit)
+
+    {:ok, store} =
+      Store.commit(
+        store,
+        {replace_body(store.engine, item, "short"), MapSet.new([{:row, :messages, item}])},
+        audit
+      )
+
+    assert File.exists?(file)
+
+    {:ok, store} =
+      Store.commit(
+        store,
+        {replace_body(store.engine, second, "short"), MapSet.new([{:row, :messages, second}])},
+        audit
+      )
+
+    refute File.exists?(file)
+    :ok = Store.close(store)
+    assert {:ok, reopened} = Store.open(path, :keyed)
+    assert map_size(reopened.engine.messages) == 2
+    :ok = Store.close(reopened)
+  end
+
+  defp replace_body(engine, item, body) do
+    engine
+    |> put_in([Access.key!(:messages), item, :message, "body"], body)
+    |> put_in([Access.key!(:messages), item, :revisions, 1, "body"], body)
+  end
+
   defp normalized_legacy_engine do
     {:ok, reopened} = Store.open(legacy_store_path())
     :ok = Store.close(reopened)

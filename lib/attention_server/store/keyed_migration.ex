@@ -17,6 +17,11 @@ defmodule AttentionServer.Store.KeyedMigration do
 
     RecordTable.transaction(db, fn ->
       with :ok <- verify_previous_progress(store),
+           :ok <-
+             Sqlite3.execute(
+               db,
+               "CREATE INDEX relay_large_data_refs_id ON relay_large_data_refs (id)"
+             ),
            :ok <- RecordTable.seed(db, generation, RecordCodec.encode(persisted)),
            {:ok, restored} <- read_records(db),
            true <- canonical(restored) === expected,

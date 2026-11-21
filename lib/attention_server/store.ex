@@ -25,9 +25,9 @@ defmodule AttentionServer.Store do
 
   alias AttentionServer.Store.{
     KeyedMigration,
+    KeyedReference,
     KeyedValidation,
     Persistence,
-    RecordCodec,
     RecordTable,
     SnapshotEncoding
   }
@@ -1109,20 +1109,24 @@ defmodule AttentionServer.Store do
                store.engine.messages,
                next.messages,
                items
-             ) do
-        records = RecordCodec.operations(next, touched)
+             ),
+           {:ok, prepared} <-
+             KeyedReference.prepare(store.engine, next, touched, store.upload_dir) do
+        %{engine: next, records: records, delete_paths: deleted, reference_rows: refs} = prepared
         log = prepare_change_logs(store, next, touched)
         %{db: db, version: version} = store
 
         case Persistence.run(fn ->
                RecordTable.commit(db, version, records, fn db, generation ->
-                 with :ok <- write_audit(db, audit),
+                 with :ok <- write_reference_delta(db, deleted, refs),
+                      :ok <- write_audit(db, audit),
                       {:ok, heads, agent_heads} <- append_change_logs(db, log, generation) do
                    {:ok, {heads, agent_heads}}
                  end
                end)
              end) do
           {:ok, {heads, agent_heads}} ->
+            prune_reference_candidates(db, store.upload_dir, prepared.orphan_candidates)
             AttentionServer.ChangeLog.notify(heads)
             AttentionServer.ChangeLog.notify(agent_heads)
             if log, do: AttentionServer.ChangeLog.notify_closing(log.closings)
@@ -1150,6 +1154,32 @@ defmodule AttentionServer.Store do
       _ ->
         {:error, :storage_unavailable, store}
     end
+  end
+
+  defp write_reference_delta(db, deleted_paths, reference_rows) do
+    with :ok <-
+           write_reference_rows(deleted_paths, fn path ->
+             run(db, "DELETE FROM relay_large_data_refs WHERE path = ?", [{:blob, path}])
+           end) do
+      write_reference_rows(reference_rows, &insert_reference(db, &1))
+    end
+  end
+
+  defp write_reference_rows(rows, write) do
+    Enum.reduce_while(rows, :ok, fn row, :ok ->
+      case write.(row) do
+        :ok -> {:cont, :ok}
+        error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp prune_reference_candidates(db, directory, candidates) do
+    Enum.each(Enum.uniq(candidates), fn id ->
+      if one(db, "SELECT 1 FROM relay_large_data_refs WHERE id = ? LIMIT 1", [id]) == {:ok, nil} do
+        _ = File.rm(Path.join(directory, id))
+      end
+    end)
   end
 
   defp write_audit(db, audit) do
@@ -1761,22 +1791,19 @@ defmodule AttentionServer.Store do
 
   defp write_large_data_references(db, rows) do
     with :ok <- Sqlite3.execute(db, "DELETE FROM relay_large_data_refs") do
-      Enum.reduce_while(rows, :ok, fn
-        [path, marker, id, size, sha256], :ok ->
-          case run(
-                 db,
-                 "INSERT INTO relay_large_data_refs (path, marker, id, size, sha256) VALUES (?, ?, ?, ?, ?)",
-                 [{:blob, path}, marker, id, size, sha256]
-               ) do
-            :ok -> {:cont, :ok}
-            error -> {:halt, error}
-          end
-
-        _row, :ok ->
-          {:halt, {:error, :invalid_large_data_reference}}
-      end)
+      write_reference_rows(rows, &insert_reference(db, &1))
     end
   end
+
+  defp insert_reference(db, [path, marker, id, size, sha256]) do
+    run(
+      db,
+      "INSERT INTO relay_large_data_refs (path, marker, id, size, sha256) VALUES (?, ?, ?, ?, ?)",
+      [{:blob, path}, marker, id, size, sha256]
+    )
+  end
+
+  defp insert_reference(_db, _row), do: {:error, :invalid_large_data_reference}
 
   defp collect_rows(db, stmt, acc) do
     case Sqlite3.step(db, stmt) do
