@@ -36,14 +36,7 @@ defmodule AttentionServer.ClientAPI.FeedRenderer do
         context = Map.put(context, :entries_by_fact, entries)
 
         Enum.map(decoded, fn {row, resource} ->
-          key = resource_key(resource, context, principal)
-
-          result =
-            Projection.run(key, fn ->
-              render_row(row.kind, resource, context, principal, row.rev)
-            end)
-
-          {row, result}
+          {row, render_row(row.kind, resource, context, principal, row.rev)}
         end)
 
       _ ->
@@ -51,32 +44,18 @@ defmodule AttentionServer.ClientAPI.FeedRenderer do
     end
   end
 
-  defp resource_key({:entry, seq}, context, _principal) do
-    case Map.get(context.entries_by_fact, seq) do
-      %{"entry_id" => id} -> {:entry, id}
-      _ -> {:entry, Resources.entry_id(seq)}
-    end
-  end
-
-  defp resource_key({:item, {sender, message_id}}, context, principal) do
-    case Resources.item_id(context.engine, {principal.person, sender, message_id}) do
-      {:ok, id} -> {:item, id}
-      _ -> :item
-    end
-  end
-
-  defp resource_key(_resource, _context, _principal), do: :change
-
   defp render_row(:item, {:item, {sender, message_id}}, context, principal, rev) do
     key = {principal.person, sender, message_id}
 
     with {:ok, item_id} <- Resources.item_id(context.engine, key),
          {:ok, rank} <- Reads.item_rank(context, principal.person, item_id) do
-      {:ok,
-       context.engine
-       |> Resources.item(key, rank)
-       |> Resources.stamp(rev)
-       |> then(&Resources.render(:item, &1, principal))}
+      Projection.run({:item, item_id}, fn ->
+        {:ok,
+         context.engine
+         |> Resources.item(key, rank)
+         |> Resources.stamp(rev)
+         |> then(&Resources.render(:item, &1, principal))}
+      end)
     else
       # The feed must fail the step rather than skip a change it could not
       # render because the store failed.
@@ -108,11 +87,13 @@ defmodule AttentionServer.ClientAPI.FeedRenderer do
             _ -> nil
           end
 
-        {:ok,
-         entry
-         |> Resources.stamp(rev)
-         |> Resources.put_at(at_ms)
-         |> then(&Resources.render(:entry, &1, principal))}
+        Projection.run(Projection.change_key(entry), fn ->
+          {:ok,
+           entry
+           |> Resources.stamp(rev)
+           |> Resources.put_at(at_ms)
+           |> then(&Resources.render(:entry, &1, principal))}
+        end)
     end
   end
 
