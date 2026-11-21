@@ -19,6 +19,8 @@ defmodule AttentionServer.ChangeLog do
   """
 
   alias AttentionServer.{Engine, JSON}
+  import AttentionServer.ChangeLog.SQLite, only: [all: 3, one: 3, run: 3]
+
   alias Exqlite.Sqlite3
 
   @registry AttentionServer.ChangeLog.Registry
@@ -158,17 +160,35 @@ defmodule AttentionServer.ChangeLog do
   @spec changes(struct(), struct()) :: pending
   def changes(%Engine{} = old, %Engine{} = next) when old === next, do: %{}
 
-  def changes(%Engine{} = old, %Engine{} = next) do
+  def changes(%Engine{} = old, %Engine{} = next),
+    do: changes(old, next, changed_resources(old, next))
+
+  @doc false
+  def changed_resources(%Engine{} = old, %Engine{} = next) do
+    %{
+      messages: changed_keys(old.messages, next.messages),
+      bounce: changed_keys(old.bounce_revisions, next.bounce_revisions),
+      opened: opened_keys(old.opened_revisions, next.opened_revisions),
+      entries:
+        old.conversation_events
+        |> changed_keys(next.conversation_events)
+        |> Enum.filter(&Map.has_key?(next.conversation_events, &1))
+        |> Enum.sort()
+    }
+  end
+
+  @doc false
+  def changes(%Engine{} = old, %Engine{} = next, changed) do
     item_keys =
       [
-        changed_keys(old.messages, next.messages),
+        changed.messages,
         changed_keys(old.chat_read_positions, next.chat_read_positions),
         changed_keys(
           old.route_b_index.conversation_summary_by_item,
           next.route_b_index.conversation_summary_by_item
         ),
-        changed_keys(old.bounce_revisions, next.bounce_revisions),
-        opened_keys(old.opened_revisions, next.opened_revisions),
+        changed.bounce,
+        changed.opened,
         subscription_keys(old, next)
       ]
       |> Enum.concat()
@@ -181,11 +201,7 @@ defmodule AttentionServer.ChangeLog do
       end)
 
     entries =
-      old.conversation_events
-      |> changed_keys(next.conversation_events)
-      |> Enum.filter(&Map.has_key?(next.conversation_events, &1))
-      |> Enum.sort()
-      |> Enum.map(fn {person, seq} -> {person, {:entry, entry_resource(seq)}} end)
+      Enum.map(changed.entries, fn {person, seq} -> {person, {:entry, entry_resource(seq)}} end)
 
     counts =
       old.route_b_index.unresolved_count_by_person
@@ -252,26 +268,20 @@ defmodule AttentionServer.ChangeLog do
   """
   def new_resources(%Engine{} = old, %Engine{} = next) when old === next, do: %{}
 
-  def new_resources(%Engine{} = old, %Engine{} = next) do
+  def new_resources(%Engine{} = old, %Engine{} = next),
+    do: new_resources(old, next, changed_resources(old, next))
+
+  @doc false
+  def new_resources(%Engine{} = old, %Engine{} = next, changed) do
     items =
-      if old.messages === next.messages,
-        do: [],
-        else:
-          for(
-            {{person, _, _} = key, _} <- next.messages,
-            not Map.has_key?(old.messages, key),
-            do: {person, item_resource(key)}
-          )
+      for {person, _, _} = key <- changed.messages,
+          Map.has_key?(next.messages, key) and not Map.has_key?(old.messages, key),
+          do: {person, item_resource(key)}
 
     entries =
-      if old.conversation_events === next.conversation_events,
-        do: [],
-        else:
-          for(
-            {{person, seq} = key, _} <- next.conversation_events,
-            not Map.has_key?(old.conversation_events, key),
-            do: {person, entry_resource(seq)}
-          )
+      for {person, seq} = key <- changed.entries,
+          not Map.has_key?(old.conversation_events, key),
+          do: {person, entry_resource(seq)}
 
     (items ++ entries)
     |> Enum.group_by(fn {person, _} -> person end, fn {_, id} -> id end)
@@ -1116,6 +1126,7 @@ defmodule AttentionServer.ChangeLog do
            ),
          :ok <- raise_floors(db, floors),
          :ok <- run(db, "DELETE FROM client_changes WHERE at_ms < ?", [before_ms]),
+         :ok <- AttentionServer.AgentChangeLog.prune(db, before_ms),
          :ok <- Sqlite3.execute(db, "COMMIT") do
       {:ok, Enum.reduce(floors, 0, fn [_, _, count], acc -> acc + count end)}
     else
@@ -1136,47 +1147,5 @@ defmodule AttentionServer.ChangeLog do
         error -> {:halt, error}
       end
     end)
-  end
-
-  # -- SQLite helpers ---------------------------------------------------------
-
-  defp one(db, sql, params) do
-    statement(db, sql, params, fn stmt ->
-      case Sqlite3.step(db, stmt) do
-        {:row, row} -> {:ok, row}
-        :done -> {:ok, nil}
-        error -> error
-      end
-    end)
-  end
-
-  defp all(db, sql, params), do: statement(db, sql, params, &collect(db, &1, []))
-
-  defp collect(db, stmt, acc) do
-    case Sqlite3.step(db, stmt) do
-      {:row, row} -> collect(db, stmt, [row | acc])
-      :done -> {:ok, Enum.reverse(acc)}
-      error -> error
-    end
-  end
-
-  defp run(db, sql, params) do
-    case statement(db, sql, params, &Sqlite3.step(db, &1)) do
-      :done -> :ok
-      error -> error
-    end
-  end
-
-  defp statement(db, sql, params, fun) do
-    with {:ok, stmt} <- Sqlite3.prepare(db, sql) do
-      result =
-        case Sqlite3.bind(stmt, params) do
-          :ok -> fun.(stmt)
-          error -> error
-        end
-
-      _ = Sqlite3.release(db, stmt)
-      result
-    end
   end
 end
