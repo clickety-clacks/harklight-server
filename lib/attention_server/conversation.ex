@@ -530,6 +530,14 @@ defmodule AttentionServer.Conversation do
     end
   end
 
+  @doc false
+  def session_end_transition(engine, scope) do
+    case Map.fetch!(engine.origin_sessions, scope) do
+      %{gone: true} -> :unchanged
+      %{last_detached_at: detached_at} -> {:ended, detached_at}
+    end
+  end
+
   def mark_gone(engine, person, origin, handle) do
     key = {person, origin, handle}
 

@@ -6765,12 +6765,12 @@ defmodule AttentionServer.Relay do
   end
 
   defp end_session_availability(state, next, {person, key, handle} = scope, :agent_v2) do
-    case Map.fetch!(state.store.engine.origin_sessions, scope) do
-      %{gone: true} ->
+    case Conversation.session_end_transition(state.store.engine, scope) do
+      :unchanged ->
         next
 
-      session ->
-        Engine.origin_availability(next, person, key, handle, "gone", session.last_detached_at)
+      {:ended, detached_at} ->
+        Engine.origin_availability(next, person, key, handle, "gone", detached_at)
     end
   end
 
