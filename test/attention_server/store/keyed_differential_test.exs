@@ -44,6 +44,7 @@ defmodule AttentionServer.Store.KeyedDifferentialTest do
       {kind, label, legacy_next, keyed_next, touched, responses} = proposal(legacy, keyed, step)
       detail = "step #{step}, #{inspect(label)}"
       assert responses == :same, detail
+      assert codec_diff(legacy_next, keyed_next) == MapSet.new(), detail
 
       if kind == :wire do
         assert MapSet.subset?(codec_diff(keyed.engine, keyed_next), touched), detail
@@ -295,8 +296,8 @@ defmodule AttentionServer.Store.KeyedDifferentialTest do
         end
 
       is_map(value) ->
-        {{field, :empty_map_insert},
-         fn e -> Map.update!(e, field, &Map.put(&1, @person, perturb(nil, 0))) end}
+        row = perturb(nil, 0)
+        {{field, :empty_map_insert}, fn e -> Map.update!(e, field, &Map.put(&1, @person, row)) end}
 
       true ->
         v = perturb(value, 0)
