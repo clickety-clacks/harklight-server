@@ -597,7 +597,7 @@ defmodule AttentionServer.ClientAPI.Writes do
         case outcome do
           {:ok, reply} ->
             result = render(operation, who, principal.person, reply, from, state)
-            receipt = receipt(operation, reply, result)
+            receipt = receipt(operation, reply, result, principal)
             remember(state, principal.person, key, digest, result, receipt)
 
           error ->
@@ -663,6 +663,14 @@ defmodule AttentionServer.ClientAPI.Writes do
 
   defp remember(_state, _person, _key, _digest, result, _receipt), do: result
 
+  # A push response identifies the binding at the time of the write. Keep
+  # that small response so a rebind or later delivery cannot rewrite a replay.
+  defp receipt(operation, _reply, {:ok, 200, body}, %{engine_key: device})
+       when operation == :remove_push or elem(operation, 0) == :push,
+       do: %{"push_result" => body, "device" => device}
+
+  defp receipt(operation, reply, result, _principal), do: receipt(operation, reply, result)
+
   defp receipt({:reply, item_id, _text, _files}, %{"seq" => seq}, _result),
     do: %{"item_id" => item_id, "entry_seq" => seq}
 
@@ -674,6 +682,14 @@ defmodule AttentionServer.ClientAPI.Writes do
 
   defp replay(%{"file" => body}, _who, _person, _from, _state), do: {:ok, body}
   defp replay(%{"discarded_file" => true}, _who, _person, _from, _state), do: {:ok, %{}}
+
+  defp replay(%{"push_result" => body, "device" => device}, who, _person, _from, state) do
+    case principal(state.store.engine, who) do
+      {:ok, %{kind: :device, engine_key: ^device}} -> {:ok, body}
+      {:ok, _} -> {:error, :idempotency_conflict}
+      error -> error
+    end
+  end
 
   defp replay(%{"settings" => true}, who, _person, from, state) do
     case Reads.handle_call({:settings, who}, from, state) do
@@ -953,11 +969,11 @@ defmodule AttentionServer.ClientAPI.Writes do
     end
   end
 
-  # The binding is removed at the next revision; DELETE carries none. With no
-  # active binding, a DELETE (or its retry) changes nothing.
+  # The binding is removed at the next revision; DELETE carries none. An
+  # invalidated endpoint still has a binding ID until removed.
   defp frame(engine, principal, key, :remove_push) do
     case Map.get(engine.push_bindings, {principal.person, principal.engine_key}) do
-      %{revision: current, active: true} ->
+      %{revision: current, binding_id: id} when is_binary(id) ->
         {:ok,
          %{"v" => 1, "type" => "push_remove", "op_id" => op_id(key), "revision" => current + 1}}
 
