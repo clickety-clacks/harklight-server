@@ -140,6 +140,7 @@ defmodule AttentionServer.ClientAPI.FeedStep do
     # A principal that no longer authenticates reads nothing, even on a
     # connection opened before its access ended.
     with {:ok, _} <- authorized(state, principal),
+         :ok <- ChangeLog.ranks_available(state.store, person),
          {:ok, rows, more, position} <- ChangeLog.read(state.store, person, cursor, limit) do
       context = %{
         engine: state.store.engine,

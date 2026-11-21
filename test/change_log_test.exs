@@ -717,14 +717,14 @@ defmodule AttentionServer.ChangeLogTest do
       assert {:error, :storage_unavailable} = Reads.item(relay, "reader", item_id)
       assert {:error, :storage_unavailable} = FeedStep.read(relay, principal, cursor, 100)
     after
-      unblock_rank_inserts(db)
+      paused(relay, fn -> unblock_rank_inserts(db) end)
     end
 
     assert {:ok, _} =
              wait_for_stored_rank(relay, item_id, System.monotonic_time(:millisecond) + 2_500)
 
     assert {:ok, %{"items" => [_, _]}} = Reads.inbox(relay, "reader")
-    assert {:ok, %{"item" => %{"id" => ^item_id}}} = Reads.item(relay, "reader", item_id)
+    assert {:ok, %{"item" => %{"item_id" => ^item_id}}} = Reads.item(relay, "reader", item_id)
     assert {:ok, [_ | _], false, _} = FeedStep.read(relay, principal, cursor, 100)
     GenServer.stop(relay)
   end
