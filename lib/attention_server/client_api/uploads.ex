@@ -13,6 +13,8 @@ defmodule AttentionServer.ClientAPI.Uploads do
   retention window. Call these from the Relay process.
   """
 
+  alias AttentionServer.ClientAPI.Idempotency
+  alias AttentionServer.Diagnostics
   alias Exqlite.Sqlite3
 
   @retention_ms 30 * 24 * 60 * 60 * 1000
@@ -30,7 +32,8 @@ defmodule AttentionServer.ClientAPI.Uploads do
       at_ms INTEGER NOT NULL
     )
     """,
-    "CREATE INDEX IF NOT EXISTS client_staged_files_at ON client_staged_files (at_ms)"
+    "CREATE INDEX IF NOT EXISTS client_staged_files_at ON client_staged_files (at_ms)",
+    "CREATE TABLE IF NOT EXISTS client_discarded_files (file_id TEXT PRIMARY KEY NOT NULL)"
   ]
 
   @type staged :: %{
@@ -127,6 +130,121 @@ defmodule AttentionServer.ClientAPI.Uploads do
 
   def fetch(%AttentionServer.Store{change_log: true}, _person, _file_id), do: {:error, :not_found}
   def fetch(%AttentionServer.Store{}, _person, _file_id), do: {:error, :disabled}
+
+  @doc "Forget an unattached file and its bytes, storing any replay receipt with the deletion."
+  def discard(%AttentionServer.Store{change_log: true, db: db} = store, person, file_id, key, digest) do
+    with :ok <- ensure(db),
+         {:ok, [1]} <-
+           one(
+             db,
+             "SELECT 1 FROM client_staged_files WHERE file_id = ? AND person_id = ? AND at_ms >= ?",
+             [file_id, person, System.system_time(:millisecond) - @retention_ms]
+           ),
+         :ok <- Sqlite3.execute(db, "BEGIN IMMEDIATE"),
+         :ok <- commit_discard(store, db, person, file_id, key, digest) do
+      :ok
+    else
+      {:ok, nil} -> {:error, :not_found}
+      {:error, :disabled} = error -> error
+      _ -> {:error, :storage_unavailable}
+    end
+  end
+
+  def discard(%AttentionServer.Store{}, _person, _file_id, _key, _digest), do: {:error, :disabled}
+
+  defp commit_discard(store, db, person, file_id, key, digest) do
+    with :ok <-
+           run(db, "DELETE FROM client_staged_files WHERE file_id = ? AND person_id = ?", [
+             file_id,
+             person
+           ]),
+         :ok <- run(db, "INSERT INTO client_discarded_files (file_id) VALUES (?)", [file_id]),
+         :ok <- save_discard_receipt(store, person, key, digest),
+         :ok <- Sqlite3.execute(db, "COMMIT") do
+      :ok
+    else
+      error ->
+        _ = Sqlite3.execute(db, "ROLLBACK")
+        error
+    end
+  end
+
+  defp save_discard_receipt(_store, _person, nil, _digest), do: :ok
+
+  defp save_discard_receipt(store, person, key, digest),
+    do: Idempotency.save(store, person, key, digest, 204, %{"discarded_file" => true})
+
+  @doc "Unlink committed discards outside Relay, retaining failed cleanup for another attempt."
+  def clean_discarded(relay, file_id \\ nil) do
+    case GenServer.call(relay, {:client_api, __MODULE__, {:discarded, file_id}}, :infinity) do
+      {:ok, dir, rows} ->
+        removed =
+          for [id] <- rows, unlink_discarded(Path.join(dir, id)) == :ok, do: id
+
+        if removed != [] do
+          GenServer.call(relay, {:client_api, __MODULE__, {:discard_cleaned, removed}}, :infinity)
+        end
+
+      {:error, reason} ->
+        Diagnostics.failure(:server_storage, :upload_delete, reason, :unavailable)
+    end
+  catch
+    :exit, _reason -> :ok
+  end
+
+  @doc false
+  def handle_call({:discarded, file_id}, _from, %{store: store} = state) do
+    reply =
+      with %AttentionServer.Store{change_log: true, db: db, upload_dir: dir} when is_binary(dir) <-
+             store,
+           {:ok, rows} <- pending_discards(db, file_id) do
+        {:ok, Path.join(dir, @dir), rows}
+      else
+        {:error, _} = error -> error
+        _ -> {:ok, nil, []}
+      end
+
+    {:reply, reply, state}
+  end
+
+  def handle_call({:discard_cleaned, ids}, _from, %{store: store} = state) do
+    Enum.each(ids, fn id ->
+      case run(store.db, "DELETE FROM client_discarded_files WHERE file_id = ?", [id]) do
+        :ok -> :ok
+        {:error, reason} -> Diagnostics.failure(:server_storage, :upload_delete, reason, :retry)
+      end
+    end)
+
+    {:reply, :ok, state}
+  end
+
+  # The table is lazy, like the staged files themselves. Startup cleanup
+  # need not initialize upload storage on a server that has never used it.
+  defp pending_discards(db, nil) do
+    with {:ok, [1]} <-
+           one(db, "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", [
+             "client_discarded_files"
+           ]) do
+      all(db, "SELECT file_id FROM client_discarded_files", [])
+    else
+      {:ok, nil} -> {:ok, []}
+      error -> error
+    end
+  end
+
+  defp pending_discards(db, file_id),
+    do: all(db, "SELECT file_id FROM client_discarded_files WHERE file_id = ?", [file_id])
+
+  # Attached copies have their own download IDs and paths.
+  defp unlink_discarded(path) do
+    case File.rm(path) do
+      :ok -> :ok
+      {:error, :enoent} -> :ok
+      {:error, reason} ->
+        Diagnostics.failure(:server_storage, :upload_delete, reason, :retry)
+        {:error, reason}
+    end
+  end
 
   defp prune(db, dir, before_ms) do
     with {:ok, rows} <-

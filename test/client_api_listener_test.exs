@@ -682,6 +682,16 @@ defmodule AttentionServer.ClientAPIListenerTest do
       assert {:ok, _conn, %{status: 200}} = request(conn, "GET", "/sign-in")
     end
 
+    test "the web origin does not mount the upload discard route", ctx do
+      ctx = Map.merge(ctx, web_origin(ctx, []))
+      assert {:ok, conn} = browser_connect(ctx, :http1)
+      headers = [{"cookie", cookie(ctx.cookie)}]
+
+      assert {:ok, _conn, response} = request(conn, "DELETE", "/v2/files/fs-test", headers)
+      assert response.status == 404
+      assert header(response, "request-id") == []
+    end
+
     test "the server starts today's /relay WebSocket and no /v2 listener", ctx do
       flags = Path.join(ctx.dir, "flags.json")
       File.write!(flags, ~s({"client_api_v2":false}))

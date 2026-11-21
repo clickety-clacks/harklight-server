@@ -547,9 +547,12 @@ Every write that succeeds answers `200`, or `201` for `POST /v2/files`, with a
     UI/1 items keep today's shape-based outcomes.
 - **Upload handle.** `POST /v2/files` returns `FileCreated.file_id`. Use this
   handle only in a write's `file_ids` (replies, agent sends and revisions) or
-  in `DELETE /v2/files/{id}` to discard an unattached upload. Discarding an
-  attached upload returns `409 already_closed`. To fetch the attached bytes,
-  use the download ID from the resource's `FileRef`.
+  in `DELETE /v2/files/{id}` to discard an unattached upload (204, no body).
+  Discarding an attached upload returns `409 already_closed`. To fetch the
+  attached bytes, use the download ID from the resource's `FileRef`.
+  For uploads attached before the server recorded the handle association,
+  discarding the old staging handle can return 204 and existing downloads
+  remain available.
 - **File name.** `POST /v2/files` requires the name in
   `Content-Disposition: attachment; filename*=UTF-8''<percent-encoded name>`
   (RFC 6266, RFC 5987). A missing or empty name is `400 invalid_field`, with
@@ -804,7 +807,7 @@ visible text. Its `attention` member changes:
 | `stale_request` | 409 | false | `request_revision` is behind the item (`stale_revision`) |
 | `already_answered` | 409 | false | Only on `/answer`: the item's `terminal` is already set (`closed`) |
 | `already_retracted` | 409 | false | The origin retracted the item (`retracted`); also an agent revise or retract on that item |
-| `already_closed` | 409 | false | A closed message refuses agent revise, retract or lifecycle, a result conflicts with one already recorded, a file-use report conflicts, or a file is already attached (§9.2) |
+| `already_closed` | 409 | false | A discard targets an attached upload handle, a closed message refuses an agent write, or an agent result or file-use report conflicts (§5, §9.2) |
 | `not_answered` | 409 | false | The agent tried to record a result before an answer |
 | `idempotency_conflict` | 409 | false | Same key, different request (`operation_conflict`) |
 | `precondition_failed` | 412 | false | `If-Match` does not match. Also a superseded push `revision` (`stale_push_binding`). |
