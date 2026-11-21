@@ -1,7 +1,7 @@
 defmodule AttentionServer.Store.EngineTransitionTest do
   use ExUnit.Case, async: true
 
-  alias AttentionServer.{AgentChangeLog, ChangeLog, Engine, JSON, Store}
+  alias AttentionServer.{AgentChangeLog, ChangeLog, Engine, JSON, Relay, Store}
   alias AttentionServer.Store.KeyedMigration
   alias Exqlite.Sqlite3
 
@@ -313,6 +313,51 @@ defmodule AttentionServer.Store.EngineTransitionTest do
     assert MapSet.member?(keys, {:row, :cursors, {@person, @reader}})
     assert MapSet.member?(keys, {:member, :conversation_opened, {@person, @reader}})
     assert MapSet.member?(keys, {:row, :conversation_cursors, {@person, @reader}})
+  end
+
+  test "draft keyed Relay matches legacy request adapters and reopens with the same facts" do
+    legacy_path = legacy_store_path()
+    keyed_path = legacy_path <> ".keyed"
+    File.cp!(legacy_path, keyed_path)
+    {:ok, old} = Store.open(keyed_path)
+    assert {:ok, _} = KeyedMigration.convert(old)
+    :ok = Store.close(old)
+    {:ok, legacy} = Relay.start_link(store_path: legacy_path, clock: fn -> 100 end)
+
+    {:ok, keyed} =
+      Relay.start_link(store_path: keyed_path, store_mode: :keyed, clock: fn -> 100 end)
+
+    {:ok, send} = JSON.decode_line(forward_line())
+
+    send =
+      Map.merge(send, %{"session_handle" => "00000000-0000-4000-8000-000000000010", "files" => []})
+
+    target = %{"v" => 1, "sender_id" => "app:test/worker", "message_id" => "msg"}
+
+    operations = [
+      {@origin, send},
+      {@reader, Map.merge(target, %{"type" => "message_open", "request_revision" => 1})},
+      {@reader,
+       Map.merge(target, %{"type" => "discussion", "request_revision" => 1, "text" => "question"})},
+      {@reader, Map.merge(target, %{"type" => "answer", "answer" => nil})}
+    ]
+
+    for {{actor, frame}, n} <- Enum.with_index(operations, 1) do
+      line =
+        JSON.encode!(Map.put(frame, "op_id", "00000000-0000-4000-8000-00000000000#{n}")) <> "\n"
+
+      assert {:ok, expected} = Relay.request_line(legacy, actor, line)
+      assert {:ok, %{"type" => "ok"}} = JSON.decode_line(expected)
+      assert {:ok, ^expected} = Relay.request_line(keyed, actor, line)
+    end
+
+    GenServer.stop(legacy)
+    GenServer.stop(keyed)
+    {:ok, legacy} = Store.open(legacy_path)
+    {:ok, keyed} = Store.open(keyed_path, :keyed)
+    assert full_diff(legacy.engine, keyed.engine) == MapSet.new()
+    :ok = Store.close(legacy)
+    :ok = Store.close(keyed)
   end
 
   defp replace_body(engine, item, body) do

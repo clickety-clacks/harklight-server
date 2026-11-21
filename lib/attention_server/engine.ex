@@ -3049,7 +3049,7 @@ defmodule AttentionServer.Engine do
     payload = %{"availability" => status, "last_detached_at" => detached_at}
 
     updated = Map.put(event, :payload, Map.merge(Map.get(event, :payload, %{}), payload))
-    %{engine | events: Map.put(engine.events, {person, seq}, updated)}
+    put_row(engine, :events, {person, seq}, updated)
   end
 
   @doc false

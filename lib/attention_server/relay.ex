@@ -5328,6 +5328,19 @@ defmodule AttentionServer.Relay do
     end
   end
 
+  defp perform_request(%{store: %Store{mode: :keyed}} = state, key, raw) do
+    case JSON.decode_line(raw) do
+      {:ok, %{"type" => type, "files" => _} = frame} when type in ["forward", "discussion"] ->
+        perform_request_frame(state, key, frame)
+
+      {:ok, %{"type" => type}} when type in ["forward", "message_open", "discussion", "answer"] ->
+        perform_request_line(state, key, raw)
+
+      _ ->
+        {{:ok, error_line(raw, "storage_unavailable")}, state}
+    end
+  end
+
   defp perform_request(state, key, raw) do
     case JSON.decode_line(raw) do
       {:ok, %{"type" => type, "files" => _} = frame}
@@ -5340,9 +5353,15 @@ defmodule AttentionServer.Relay do
   end
 
   defp perform_request_line(state, key, raw) do
-    {next_engine, reply} = Engine.request_line(state.store.engine, key, raw, state.clock.())
-    next_engine = with_coverage_availability(state, key, next_engine)
-    next_engine = with_initial_origin_availability(state, key, next_engine)
+    {next_engine, reply, touched} =
+      request_transition(
+        state,
+        key,
+        state.store.engine,
+        &Engine.request_line(&1, key, raw, state.clock.())
+      )
+
+    {next_engine, touched} = request_availability(state, key, next_engine, touched)
 
     operation_id =
       case JSON.decode_line(raw) do
@@ -5367,7 +5386,8 @@ defmodule AttentionServer.Relay do
       operation_id,
       targets,
       request_action(raw),
-      raw
+      raw,
+      touched
     )
   end
 
@@ -5377,8 +5397,13 @@ defmodule AttentionServer.Relay do
         {{:ok, error_line(frame, reason)}, state}
 
       {:ok, request_engine, request_frame, created_ids, created_paths} ->
-        {next_engine, reply} =
-          Engine.request_frame(request_engine, key, request_frame, state.clock.())
+        {next_engine, reply, touched} =
+          request_transition(
+            state,
+            key,
+            request_engine,
+            &Engine.request_frame(&1, key, request_frame, state.clock.())
+          )
 
         {next_engine, created_ids, created_paths} =
           if request_success?(reply) do
@@ -5388,8 +5413,11 @@ defmodule AttentionServer.Relay do
             {drop_upload_ids(next_engine, created_ids), [], []}
           end
 
-        next_engine = with_coverage_availability(state, key, next_engine)
-        next_engine = with_initial_origin_availability(state, key, next_engine)
+        {next_engine, touched} = request_availability(state, key, next_engine, touched)
+
+        touched =
+          if touched, do: Enum.reduce(created_ids, touched, &MapSet.put(&2, {:row, :uploads, &1}))
+
         operation_id = Diagnostics.operation_id(frame)
         targets = origin_feed_targets(state.store.engine, next_engine, key, request_frame)
 
@@ -5402,7 +5430,8 @@ defmodule AttentionServer.Relay do
             operation_id,
             targets,
             frame["type"] || "relay_request",
-            frame
+            frame,
+            touched
           )
 
         if created_ids != [] and request_success?(reply) and
@@ -5411,6 +5440,29 @@ defmodule AttentionServer.Relay do
         else
           {reply, next_state}
         end
+    end
+  end
+
+  defp request_transition(%{store: %Store{mode: :keyed}}, _key, engine, apply_request),
+    do: Engine.with_touches(engine, apply_request)
+
+  defp request_transition(_state, _key, engine, apply_request) do
+    {next, reply} = apply_request.(engine)
+    {next, reply, nil}
+  end
+
+  defp request_availability(state, key, engine, touched) do
+    transition = fn current ->
+      next = with_coverage_availability(state, key, current)
+      {with_initial_origin_availability(state, key, next), nil}
+    end
+
+    if touched do
+      {next, nil, keys} = Engine.with_touches(engine, transition)
+      {next, MapSet.union(touched, keys)}
+    else
+      {next, nil} = transition.(engine)
+      {next, nil}
     end
   end
 
@@ -5747,13 +5799,26 @@ defmodule AttentionServer.Relay do
 
   defp request_success?(_), do: false
 
-  defp finish_request(state, key, next_engine, reply, operation_id, targets, action, original) do
-    if next_engine == state.store.engine do
+  defp finish_request(
+         state,
+         key,
+         next_engine,
+         reply,
+         operation_id,
+         targets,
+         action,
+         original,
+         touched
+       ) do
+    unchanged = if touched, do: MapSet.size(touched) == 0, else: next_engine == state.store.engine
+
+    if unchanged do
       {reply, state}
     else
-      case commit(
+      case commit_request(
              state.store,
              next_engine,
+             touched,
              Map.put(
                audit(state.store.engine, key, action),
                :operation_id,
@@ -7071,6 +7136,18 @@ defmodule AttentionServer.Relay do
 
       current
     end)
+  end
+
+  defp commit_request(store, next, nil, audit), do: commit(store, next, audit)
+
+  defp commit_request(store, next, touched, audit) do
+    result = Store.commit(store, {next, touched}, audit)
+
+    if match?({:ok, _}, result) and Enum.any?(touched, &match?({:row, :messages, _}, &1)) do
+      send(self(), :refresh_default_sweep_index)
+    end
+
+    result
   end
 
   defp commit_progress(store, next, audit, field) do
