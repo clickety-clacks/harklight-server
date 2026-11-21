@@ -47,6 +47,7 @@ defmodule AttentionServer.Store do
     :large_index,
     mode: :legacy,
     source_bindings: %{},
+    upload_links: %{},
     progress_version: 0,
     encoding_cache: %{},
     change_log: false,
@@ -235,7 +236,13 @@ defmodule AttentionServer.Store do
   end
 
   defp finalize_mode(%__MODULE__{mode: :keyed} = store),
-    do: {:ok, %{store | source_bindings: KeyedValidation.source_index(store.engine.messages)}}
+    do:
+      {:ok,
+       %{
+         store
+         | source_bindings: KeyedValidation.source_index(store.engine.messages),
+           upload_links: KeyedValidation.upload_index(store.engine)
+       }}
 
   defp finalize_mode(%__MODULE__{mode: :legacy} = store) do
     with {:ok, store} <- load_progress(store) do
@@ -352,6 +359,17 @@ defmodule AttentionServer.Store do
   def put_published_upload(%__MODULE__{db: nil}, _metadata),
     do: {:error, :storage_unavailable}
 
+  def put_published_upload(%__MODULE__{mode: :keyed} = store, metadata) do
+    next = put_in(store.engine.uploads[metadata.id], metadata)
+    keys = MapSet.new([{:row, :uploads, metadata.id}])
+    audit = %{person: metadata.person, actor: metadata.uploader, action: "file_upload"}
+
+    case commit(store, {next, keys}, audit) do
+      {:ok, committed} -> {:ok, committed}
+      _ -> {:error, :storage_unavailable}
+    end
+  end
+
   def put_published_upload(%__MODULE__{} = store, metadata) do
     next = %{store.engine | uploads: Map.put(store.engine.uploads, metadata.id, metadata)}
 
@@ -463,7 +481,12 @@ defmodule AttentionServer.Store do
   def delete_uploads(%__MODULE__{} = store, ids, audit) when is_list(ids) do
     next = %{store.engine | uploads: Map.drop(store.engine.uploads, ids)}
 
-    case commit(store, next, audit) do
+    proposal =
+      if store.mode == :keyed,
+        do: {next, MapSet.new(ids, &{:row, :uploads, &1})},
+        else: next
+
+    case commit(store, proposal, audit) do
       {:ok, updated} ->
         result =
           Enum.reduce_while(ids, :ok, fn id, :ok ->
@@ -1102,6 +1125,23 @@ defmodule AttentionServer.Store do
 
     result =
       with :ok <- KeyedValidation.sequences(store.engine, next, touched),
+           {:ok, upload_links, entries} <-
+             KeyedValidation.upload_changes(store.upload_links, store.engine, next, touched),
+           true <-
+             Enum.all?(entries, fn {person, entry} ->
+               valid_entry_uploads?(next, person, entry)
+             end),
+           true <-
+             Enum.all?(touched, fn
+               {:row, :uploads, id} ->
+                 case Map.fetch(next.uploads, id) do
+                   {:ok, upload} -> valid_upload?(next, id, upload)
+                   :error -> not Map.has_key?(upload_links, id)
+                 end
+
+               _ ->
+                 true
+             end),
            true <- Enum.all?(items, &valid_item_change?(store.engine, next, &1)),
            {:ok, index} <-
              KeyedValidation.source_changes(
@@ -1136,6 +1176,7 @@ defmodule AttentionServer.Store do
                store
                | engine: next,
                  source_bindings: index,
+                 upload_links: upload_links,
                  version: store.version + 1,
                  change_log_touched:
                    MapSet.union(store.change_log_touched, MapSet.new(Map.keys(heads)))
@@ -2673,50 +2714,54 @@ defmodule AttentionServer.Store do
 
   defp valid_uploads?(engine) do
     is_map(engine.uploads) and
-      Enum.all?(engine.uploads, fn {id, upload} ->
-        AttentionServer.Message.uuid_v4?(id) and upload.id == id and
-          Map.has_key?(engine.persons, upload.person) and
-          owns_or_browser?(engine, upload.person, upload.uploader) and
-          AttentionServer.Message.uuid?(upload.op_id) and
-          AttentionServer.Message.sender_id?(upload.sender_id) and
-          is_binary(upload.message_id) and upload.message_id != "" and
-          is_integer(upload.revision) and upload.revision > 0 and
-          Map.get(upload, :uploader_kind) in [nil, "agent", "client"] and
-          AttentionServer.ConversationFiles.valid_name?(upload.name) and
-          is_integer(upload.size) and upload.size >= 0 and
-          is_integer(upload.last_activity_ms) and upload.last_activity_ms >= 0 and
-          is_binary(upload.sha256) and
-          Regex.match?(~r/\A[0-9a-f]{64}\z/, upload.sha256)
-      end)
+      Enum.all?(engine.uploads, fn {id, upload} -> valid_upload?(engine, id, upload) end)
+  end
+
+  defp valid_upload?(engine, id, upload) do
+    AttentionServer.Message.uuid_v4?(id) and upload.id == id and
+      Map.has_key?(engine.persons, upload.person) and
+      owns_or_browser?(engine, upload.person, upload.uploader) and
+      AttentionServer.Message.uuid?(upload.op_id) and
+      AttentionServer.Message.sender_id?(upload.sender_id) and
+      is_binary(upload.message_id) and upload.message_id != "" and
+      is_integer(upload.revision) and upload.revision > 0 and
+      Map.get(upload, :uploader_kind) in [nil, "agent", "client"] and
+      AttentionServer.ConversationFiles.valid_name?(upload.name) and
+      is_integer(upload.size) and upload.size >= 0 and
+      is_integer(upload.last_activity_ms) and upload.last_activity_ms >= 0 and
+      is_binary(upload.sha256) and
+      Regex.match?(~r/\A[0-9a-f]{64}\z/, upload.sha256)
   end
 
   defp valid_upload_references?(engine) do
     Enum.all?(engine.origin_feeds, fn {{person, _origin}, feed} ->
-      Enum.all?(feed.entries, fn {_seq, entry} ->
-        Enum.all?(Map.get(entry, "files", []), fn file ->
-          case file["tier"] do
-            "inline" ->
-              true
+      Enum.all?(feed.entries, fn {_seq, entry} -> valid_entry_uploads?(engine, person, entry) end)
+    end)
+  end
 
-            "upload" ->
-              case Map.get(engine.uploads, file["upload_id"]) do
-                %{person: ^person} = upload ->
-                  upload.op_id == entry["op_id"] and
-                    upload.sender_id == entry["sender_id"] and
-                    upload.message_id == entry["message_id"] and
-                    upload.revision == entry["request_revision"] and
-                    upload.name == file["name"] and upload.size == file["size"] and
-                    upload.sha256 == file["sha256"]
+  defp valid_entry_uploads?(engine, person, entry) do
+    Enum.all?(Map.get(entry, "files", []), fn file ->
+      case file["tier"] do
+        "inline" ->
+          true
 
-                _ ->
-                  false
-              end
+        "upload" ->
+          case Map.get(engine.uploads, file["upload_id"]) do
+            %{person: ^person} = upload ->
+              upload.op_id == entry["op_id"] and
+                upload.sender_id == entry["sender_id"] and
+                upload.message_id == entry["message_id"] and
+                upload.revision == entry["request_revision"] and
+                upload.name == file["name"] and upload.size == file["size"] and
+                upload.sha256 == file["sha256"]
 
             _ ->
               false
           end
-        end)
-      end)
+
+        _ ->
+          false
+      end
     end)
   end
 

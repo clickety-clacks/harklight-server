@@ -38,6 +38,57 @@ defmodule AttentionServer.Store.KeyedValidation do
 
   defp source_key(_), do: nil
 
+  def upload_index(engine) do
+    for {scope, feed} <- engine.origin_feeds, {seq, entry} <- feed.entries, reduce: %{} do
+      index -> add_upload_links(index, {scope, seq}, entry)
+    end
+  end
+
+  def upload_changes(index, old, next, touched) do
+    {index, changed, uploads} =
+      Enum.reduce(touched, {index, MapSet.new(), []}, fn
+        {:origin_feed, scope, {:entry, seq}}, {index, changed, uploads} ->
+          key = {scope, seq}
+          before_entry = get_in(old.origin_feeds, [scope, :entries, seq])
+          after_entry = get_in(next.origin_feeds, [scope, :entries, seq])
+
+          index =
+            Enum.reduce(upload_ids(before_entry), index, fn id, acc ->
+              owners = MapSet.delete(Map.get(acc, id, MapSet.new()), key)
+              if MapSet.size(owners) == 0, do: Map.delete(acc, id), else: Map.put(acc, id, owners)
+            end)
+
+          {add_upload_links(index, key, after_entry), MapSet.put(changed, key), uploads}
+
+        {:row, :uploads, id}, {index, changed, uploads} ->
+          {index, changed, [id | uploads]}
+
+        _, acc ->
+          acc
+      end)
+
+    related = Enum.reduce(uploads, changed, &MapSet.union(Map.get(index, &1, MapSet.new()), &2))
+
+    entries =
+      for {{person, _} = scope, seq} <- related,
+          entry = get_in(next.origin_feeds, [scope, :entries, seq]),
+          do: {person, entry}
+
+    {:ok, index, entries}
+  end
+
+  defp add_upload_links(index, key, entry) do
+    Enum.reduce(upload_ids(entry), index, fn id, acc ->
+      Map.update(acc, id, MapSet.new([key]), &MapSet.put(&1, key))
+    end)
+  end
+
+  defp upload_ids(nil), do: []
+
+  defp upload_ids(entry) do
+    for %{"tier" => "upload", "upload_id" => id} <- Map.get(entry, "files", []), do: id
+  end
+
   # The committed Engine satisfied the full validator. Each changed sequence
   # must still be inside its person's high-water mark, and the live row count
   # must change by exactly the same amount as that high-water mark.

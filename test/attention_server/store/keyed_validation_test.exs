@@ -39,4 +39,30 @@ defmodule AttentionServer.Store.KeyedValidationTest do
     touched = [{:row, :persons, @person}, {:row, :events, {@person, 1}}]
     assert {:error, :invalid_sequence} = KeyedValidation.sequences(old, next, touched)
   end
+
+  test "upload changes visit only the indexed owning entries" do
+    scope = {@person, "origin"}
+    target = %{"files" => [%{"tier" => "upload", "upload_id" => "file"}]}
+    unrelated = %{"files" => [%{"tier" => "upload", "upload_id" => "other"}]}
+
+    engine = %{
+      Engine.new()
+      | origin_feeds: %{scope => %{entries: %{1 => target, 2 => unrelated}}}
+    }
+
+    index = KeyedValidation.upload_index(engine)
+
+    assert {:ok, ^index, [{@person, ^target}]} =
+             KeyedValidation.upload_changes(index, engine, engine, [{:row, :uploads, "file"}])
+
+    next = put_in(engine.origin_feeds[scope].entries, %{2 => unrelated})
+
+    assert {:ok, updated, []} =
+             KeyedValidation.upload_changes(index, engine, next, [
+               {:origin_feed, scope, {:entry, 1}}
+             ])
+
+    refute Map.has_key?(updated, "file")
+    assert updated["other"] == index["other"]
+  end
 end
