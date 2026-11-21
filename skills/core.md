@@ -179,7 +179,9 @@ server shutdown or 60 seconds of read silence reconnects from the last emitted
 position, and a restart can replay output already printed. `listen --follow`
 is a continuous JSON-lines stream, not the one-waiter background completion
 pattern. Omit `--session` to follow every message sent by the enrolled key.
-Feed connections are independent: several readers may follow the same scope.
+Feed connections are independent on the server: several readers may follow the
+same scope. Readers that share one identity directory share its saved cursor
+for that scope.
 
 Revocation and account pause stop the command with a definite diagnostic. A
 `500 internal_error` batch or an SSE close with reason `internal_error` stops
@@ -342,8 +344,10 @@ harklight-agent retract --item-id "$HARKLIGHT_ITEM"
 ```
 
 Use the current base revision and stop acting on a stale draft after revision;
-a stale base revision is refused with `412 precondition_failed`.
-`--choice` replaces choices; `--clear-choices` leaves valid text Reply controls.
+the CLI refuses a stale base revision before sending ("base revision does not
+match the current message", exit 2). `--choice` replaces the whole action set,
+including a text Reply; pass `--reply` again to keep it. `--clear-choices`
+removes the choices; with `--reply` it leaves only the text Reply.
 Retraction deliberately withdraws an open request by its item ID; it is not a
 person answer and does not erase history. Its optional
 `--in-reply-to ENTRY_ID` form also records that person entry as acted on.
