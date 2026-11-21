@@ -130,7 +130,11 @@ defmodule AttentionServer.HeadlessEnrollment do
     end
   end
 
-  @doc "Prove the approved local key reaches /relay and its first replay barrier; never ACK unseen content."
+  @doc """
+  Prove the approved local key reaches the device port: its `/relay` first
+  replay barrier, or with `client_api_v2` on one `GET /v2/inbox`. Never ACKs
+  unseen content.
+  """
   def verify_relay(directory, endpoint) do
     certificate_path = Path.join(directory, "identity.pem")
     key_path = Path.join(directory, "identity.key")
@@ -140,6 +144,7 @@ defmodule AttentionServer.HeadlessEnrollment do
          {:ok, pem} <- File.read(certificate_path),
          [{:Certificate, der, :not_encrypted}] <- :public_key.pem_decode(pem),
          {:ok, ^expected} <- DeviceIdentity.from_certificate(der),
+         :relay <- if(Map.get(endpoint, :client_api_v2) == true, do: :v2, else: :relay),
          {:ok, socket} <- HeadlessTLS.connect(endpoint, {certificate_path, key_path}) do
       try do
         with :ok <- upgrade(socket, endpoint.name),
@@ -152,10 +157,20 @@ defmodule AttentionServer.HeadlessEnrollment do
         :ssl.close(socket)
       end
     else
+      :v2 -> verify_v2(endpoint, {certificate_path, key_path})
       _ -> {:error, :relay_proof_failed}
     end
   rescue
     _ -> {:error, :relay_proof_failed}
+  end
+
+  # With client_api_v2 on, the proof is one authenticated inbox read: the key
+  # is admitted and the server answers for its person. Nothing is acknowledged.
+  defp verify_v2(endpoint, identity) do
+    case HeadlessTLS.v2_get(endpoint, identity, "/v2/inbox?limit=1") do
+      {:ok, 200, %{"rev" => rev, "items" => items}} when is_integer(rev) and is_list(items) -> :ok
+      _ -> {:error, :relay_proof_failed}
+    end
   end
 
   defp upgrade(socket, name) do
