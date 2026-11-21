@@ -505,35 +505,7 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
   test "serving a person reply on agent SSE records delivery on its original entry", ctx do
     Application.put_env(:attention_server, :client_api_feed_heartbeat_ms, 100)
     on_exit(fn -> Application.delete_env(:attention_server, :client_api_feed_heartbeat_ms) end)
-    assert :ok = Relay.setup_sender(ctx.relay, ctx.reader, "app:agent")
-
-    assert %{"type" => "ok"} =
-             request(ctx.relay, ctx.reader, %{
-               "type" => "forward",
-               "op_id" => op(1),
-               "session_handle" => @handle,
-               "message" => %{
-                 "sender_id" => "app:agent",
-                 "message_id" => "stream-delivery",
-                 "created_at" => 1,
-                 "title" => "One conversation"
-               }
-             })
-
-    scope = {"A", ctx.reader}
-
-    assert {:ok, position} =
-             AttentionServer.AgentChangeLog.head(:sys.get_state(ctx.relay).store, scope)
-
-    assert %{"type" => "ok"} =
-             request(ctx.relay, "origin", %{
-               "type" => "discussion",
-               "op_id" => op(2),
-               "sender_id" => "app:agent",
-               "message_id" => "stream-delivery",
-               "request_revision" => 1,
-               "text" => "Deliver this once"
-             })
+    {scope, position, _entry_position} = pending_agent_reply(ctx)
 
     {conn, feed} = open_agent_feed(connect(ctx), "?after=#{position}")
     {conn, feed} = await_open(conn, feed)
@@ -557,6 +529,137 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
              )
 
     assert rev == delivered.id
+  end
+
+  for transport <- [:batch, :sse] do
+    test "the agent #{transport} can resume after a Delivered write fails", ctx do
+      {scope, cursor, position} = pending_agent_reply(ctx)
+      assert {:ok, undelivered_rev} = agent_entry_rev(ctx.relay, scope, position)
+
+      set_feed_writable(ctx.relay, false)
+      resume_at = interrupted_feed_cursor(connect(ctx), cursor, unquote(transport))
+      set_feed_writable(ctx.relay, true)
+
+      conn = resume_agent_feed(connect(ctx), resume_at, unquote(transport))
+
+      assert eventually(fn ->
+               case agent_entry_rev(ctx.relay, scope, position) do
+                 {:ok, delivered_rev} -> delivered_rev > undelivered_rev
+                 _ -> false
+               end
+             end)
+
+      Mint.HTTP.close(conn)
+    end
+  end
+
+  defp pending_agent_reply(ctx) do
+    assert :ok = Relay.setup_sender(ctx.relay, ctx.reader, "app:agent")
+
+    assert %{"type" => "ok"} =
+             request(ctx.relay, ctx.reader, %{
+               "type" => "forward",
+               "op_id" => op(1),
+               "session_handle" => @handle,
+               "message" => %{
+                 "sender_id" => "app:agent",
+                 "message_id" => "stream-delivery",
+                 "created_at" => 1,
+                 "title" => "One conversation"
+               }
+             })
+
+    scope = {"A", ctx.reader}
+
+    assert {:ok, position} =
+             AttentionServer.AgentChangeLog.head(:sys.get_state(ctx.relay).store, scope)
+
+    assert %{"type" => "ok", "seq" => entry_position} =
+             request(ctx.relay, "origin", %{
+               "type" => "discussion",
+               "op_id" => op(2),
+               "sender_id" => "app:agent",
+               "message_id" => "stream-delivery",
+               "request_revision" => 1,
+               "text" => "Deliver this once"
+             })
+
+    {scope, position, entry_position}
+  end
+
+  defp interrupted_feed_cursor(conn, cursor, :batch) do
+    {conn, response} = agent_batch(conn, "?after=#{cursor}", [])
+    Mint.HTTP.close(conn)
+
+    case response.status do
+      200 ->
+        assert {:ok, %{"rev" => position}} = JSON.decode_line(response.body <> "\n")
+        position
+
+      503 ->
+        assert {:ok, %{"error" => "storage_unavailable"}} =
+                 JSON.decode_line(response.body <> "\n")
+
+        cursor
+    end
+  end
+
+  defp interrupted_feed_cursor(conn, cursor, :sse) do
+    {conn, feed} = open_agent_feed(conn, "?after=#{cursor}")
+    {conn, feed} = await_open(conn, feed)
+
+    case feed.status do
+      200 ->
+        interrupted_stream_cursor(conn, feed, cursor)
+
+      503 ->
+        {conn, feed} = drain(conn, feed)
+
+        assert {:ok, %{"error" => "storage_unavailable"}} =
+                 JSON.decode_line(feed.buffer <> "\n")
+
+        Mint.HTTP.close(conn)
+        cursor
+    end
+  end
+
+  defp interrupted_stream_cursor(conn, feed, cursor) do
+    case events(conn, feed, 1) do
+      {conn, _feed, [%{event: "closing", data: %{"reason" => "storage_unavailable"}}]} ->
+        Mint.HTTP.close(conn)
+        cursor
+
+      {conn, feed, [event]} ->
+        interrupted_stream_cursor(conn, feed, Map.get(event, :id, cursor))
+    end
+  end
+
+  defp resume_agent_feed(conn, cursor, :batch) do
+    {conn, response} = agent_batch(conn, "?after=#{cursor}", [])
+    assert response.status == 200
+    conn
+  end
+
+  defp resume_agent_feed(conn, cursor, :sse) do
+    headers = [{"last-event-id", Integer.to_string(cursor)}]
+    {conn, feed} = open_agent_feed(conn, "?after=0", headers)
+    {conn, feed} = await_open(conn, feed)
+    assert feed.status == 200
+    conn
+  end
+
+  defp set_feed_writable(relay, writable?) do
+    setting = if writable?, do: "OFF", else: "ON"
+
+    :sys.replace_state(relay, fn state ->
+      assert :ok = Exqlite.Sqlite3.execute(state.store.db, "PRAGMA query_only = #{setting}")
+      state
+    end)
+  end
+
+  defp agent_entry_rev(relay, scope, position) do
+    store = :sys.get_state(relay).store
+    AttentionServer.AgentChangeLog.rev(store, scope, {:entry, position})
   end
 
   defp next_person_reply(_conn, _feed, 0), do: flunk("person reply event missing")
