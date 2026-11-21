@@ -1179,6 +1179,21 @@ defmodule AttentionServer.Store do
       ),
       do: {:error, :storage_unavailable, store}
 
+  # A keyed store keeps device cursors in its records and does not read
+  # relay_device_progress, so the legacy body would acknowledge a cursor that
+  # a keyed reopen cannot see. Refuse until the keyed writer commits cursors.
+  def accept_inbox_checkpoint(
+        %__MODULE__{mode: :keyed} = store,
+        _engine,
+        _person,
+        _device,
+        _snapshot_id,
+        _high,
+        _batches,
+        _audit
+      ),
+      do: {:error, :storage_unavailable, store}
+
   def accept_inbox_checkpoint(
         %__MODULE__{} = store,
         engine,
