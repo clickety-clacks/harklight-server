@@ -762,11 +762,14 @@ defmodule AttentionServer.ClientAPI.Writes do
 
   # Chat never closes: the reply goes to the item's current revision in any
   # state. The engine stores it for the agent whether or not it is listening.
+  # An item sent without a session has no conversation at all: a reply there
+  # is 400 unsupported (contract rulings round 13); not_found is only for an
+  # item the person cannot see.
   defp frame(engine, principal, key, {:reply, item_id, text, _file_ids}) do
     with {:ok, {_person, sender, message_id} = message_key} <-
-           Resources.item_key(engine, principal.person, item_id) do
-      %{revision: revision} = Map.fetch!(engine.messages, message_key)
-
+           Resources.item_key(engine, principal.person, item_id),
+         record = Map.fetch!(engine.messages, message_key),
+         :ok <- has_conversation(record) do
       {:ok,
        %{
          "v" => 1,
@@ -774,10 +777,14 @@ defmodule AttentionServer.ClientAPI.Writes do
          "op_id" => op_id(key),
          "sender_id" => sender,
          "message_id" => message_id,
-         "request_revision" => revision,
+         "request_revision" => record.revision,
          "text" => text
        }}
     end
+  end
+
+  defp has_conversation(record) do
+    if is_binary(Map.get(record, :session_handle)), do: :ok, else: {:error, :unsupported}
   end
 
   # An answer goes to the engine as today's answer (or answer_no_comment)
