@@ -232,8 +232,7 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
     for change <- live["changes"] do
       assert %{event: kind, data: data} = by_id[change["rev"]]
 
-      assert {kind, Map.delete(data, "rank")} ==
-               {change["kind"], Map.delete(change["data"], "rank")}
+      assert {kind, data} == {change["kind"], change["data"]}
     end
   end
 
@@ -290,20 +289,16 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
     replayed = apply_events(%{items: %{}, entries: %{}, counts: nil}, seen ++ resumed)
     expected = snapshot(ctx)
     assert expected.rev == final
-    assert without_rank(replayed.items) == without_rank(expected.items)
+    assert replayed.items == expected.items
     assert replayed.entries == expected.entries
     assert replayed.counts == expected.counts
   end
 
-  # Rank keys move without an item row until the Relay records rank changes
-  # in the change log (docs/change-log-interface.md, "Not yet on main"). The
-  # skipped test below holds the full check until then.
-  defp without_rank(items),
-    do: Map.new(items, fn {id, item} -> {id, Map.delete(item, "rank")} end)
-
-  @tag skip: "rank keys move without an item row until append_ranks runs in the Relay"
+  # Rank keys are stored per change (#228, #231), so a moved rank is an item
+  # row and a replay reaches the snapshot's keys, also under concurrent
+  # writes (above).
   test "replaying the feed reaches the snapshot's rank keys", ctx do
-    for n <- 1..12, do: forward(ctx.relay, "m#{n}", n)
+    for n <- 1..40, do: forward(ctx.relay, "m#{n}", n)
     conn = connect(ctx)
     {conn, feed} = open_feed(conn, "?after=0")
     {_conn, _feed, events} = changes_through(conn, feed, head(ctx))
