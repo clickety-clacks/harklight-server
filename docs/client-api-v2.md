@@ -1414,12 +1414,13 @@ Writes return 200 unless the table says otherwise. Each response schema requires
   or missing target device answers `404 not_found`. The response returns
   the resolved device name and delivery state. The state is `sent` when
   the resolved target device is opted in and listed, has an open SSE feed,
-  and the ephemeral `show` event was handed to that feed's writer.
-  Otherwise the state is `held`. The HTTP response returns without
-  waiting for the device. In either case, the show stays pending in relay
-  memory. The device's next focus-write response carries it if it is
-  still pending (§5.1). Both delivery paths use the same `show_id`,
-  which the client applies once.
+  and the server successfully writes the ephemeral `show` frame to that
+  connection. The handler waits only for the server feed writer's result,
+  bounded by the shared request timeout. Otherwise the state is `held`,
+  including when the write fails or is skipped. In either case, the show
+  stays pending in relay memory. The device's next focus-write response
+  carries it only while it is still pending (§5.1). Both delivery paths
+  use the same `show_id`, which the client applies once.
 - **Files.** An agent uses the §4 device download response for
   `GET /v2/files/{file_id}`, including its stored type and quoted sha256
   ETag. `FileCreated.file_id` is the upload handle, accepted by a write's
