@@ -288,7 +288,7 @@ defmodule AttentionServer.Store do
      %{
        store
        | engine: engine,
-         source_bindings: KeyedValidation.source_index(engine.messages),
+         source_bindings: engine.route_b_index.source_bindings,
          upload_links: KeyedValidation.upload_index(engine),
          authority_index: KeyedValidation.authority_index(engine)
      }}
@@ -1350,7 +1350,7 @@ defmodule AttentionServer.Store do
             {:ok,
              %{
                store
-               | engine: next,
+               | engine: put_in(next.route_b_index.source_bindings, index),
                  source_bindings: index,
                  upload_links: upload_links,
                  authority_index: authority_index,

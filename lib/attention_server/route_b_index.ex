@@ -15,6 +15,7 @@ defmodule AttentionServer.RouteBIndex do
       advisory_sequences: %{},
       messages_by_origin_session: %{},
       request_keys_by_id: nil,
+      source_bindings: nil,
       covered_sessions_by_origin: %{},
       push_bindings: nil,
       pending_messages_by_person: %{},
@@ -47,6 +48,7 @@ defmodule AttentionServer.RouteBIndex do
     |> index_advisories(engine.advisory_feeds)
     |> index_covered_sessions(engine.origin_sessions)
     |> index_push_bindings(engine)
+    |> index_source_bindings(engine)
     |> index_reply_scores(engine.reply_group_history)
   end
 
@@ -77,6 +79,7 @@ defmodule AttentionServer.RouteBIndex do
       index
       |> index_covered_sessions(engine.origin_sessions)
       |> index_push_bindings(engine)
+      |> index_source_bindings(engine)
 
     %{engine | route_b_index: index}
   end
@@ -90,6 +93,15 @@ defmodule AttentionServer.RouteBIndex do
   end
 
   defp index_push_bindings(index, _engine), do: index
+
+  defp index_source_bindings(%{request_keys_by_id: lookup} = index, engine) when is_map(lookup) do
+    %{
+      index
+      | source_bindings: AttentionServer.Store.KeyedValidation.source_index(engine.messages)
+    }
+  end
+
+  defp index_source_bindings(index, _engine), do: index
 
   defp index_covered_sessions(%{request_keys_by_id: lookup} = index, sessions)
        when is_map(lookup) do
@@ -226,6 +238,17 @@ defmodule AttentionServer.RouteBIndex do
 
   def pending_messages(index, person, high \\ nil),
     do: ordered_candidates(index.pending_messages_by_person, person, high)
+
+  def message_keys(index, person) do
+    pending = index |> pending_messages(person) |> Stream.map(&elem(&1, 1))
+
+    resolved =
+      index.resolved_messages_by_person
+      |> Map.get(person, :gb_trees.empty())
+      |> :gb_trees.values()
+
+    Stream.concat(pending, resolved)
+  end
 
   def origin_replies(index, person, high \\ nil),
     do: ordered_candidates(index.origin_replies_by_person, person, high)

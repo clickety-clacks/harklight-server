@@ -65,16 +65,8 @@ defmodule AttentionServer.FreeOrder do
 
   defp person_messages(%{route_b_index: %{request_keys_by_id: lookup} = index} = engine, person)
        when is_map(lookup) do
-    open =
-      index |> AttentionServer.RouteBIndex.pending_messages(person) |> Stream.map(&elem(&1, 1))
-
-    resolved =
-      index.resolved_messages_by_person
-      |> Map.get(person, :gb_trees.empty())
-      |> :gb_trees.values()
-
-    open
-    |> Stream.concat(resolved)
+    index
+    |> AttentionServer.RouteBIndex.message_keys(person)
     |> Stream.map(fn key -> {key, Map.fetch!(engine.messages, key)} end)
   end
 

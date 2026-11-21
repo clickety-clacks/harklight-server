@@ -4042,6 +4042,20 @@ defmodule AttentionServer.Engine do
     end
   end
 
+  defp source_tuple_bound_elsewhere?(
+         %{route_b_index: %{source_bindings: bindings}},
+         target,
+         binding
+       )
+       when is_map(bindings) do
+    tuple = {binding["source_instance_id"], binding["request_id"], binding["request_revision"]}
+
+    case Map.get(bindings, tuple) do
+      nil -> false
+      key -> key != target
+    end
+  end
+
   defp source_tuple_bound_elsewhere?(engine, target, binding) do
     tuple = Map.take(binding, ~w(source_instance_id request_id request_revision))
 

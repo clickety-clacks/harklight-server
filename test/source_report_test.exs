@@ -357,6 +357,102 @@ defmodule AttentionServer.SourceReportTest do
              Store.open(path)
   end
 
+  test "keyed native source binding, results and enrollment readback survive reopen", %{
+    relay: old,
+    path: path
+  } do
+    :ok = GenServer.stop(old)
+
+    opts = [
+      store_path: path,
+      store_mode: :keyed_cutover,
+      source_fixture_mode: true,
+      enrollment_fixture_mode: true
+    ]
+
+    {:ok, relay} = Relay.start_link(opts)
+    assert %{"seq" => 1, "type" => "ok"} = send_origin(relay, "a1", op(201), message("keyed"))
+    assert %{"seq" => 2, "type" => "ok"} = send_origin(relay, "a1", op(202), message("collision"))
+    assert :ok = Relay.grant_source_report(relay, "A", "a1", "source", ["app:test"], "delegation")
+
+    source = %{
+      "sender_id" => "app:test",
+      "source_instance_id" => "source",
+      "request_id" => "one",
+      "request_revision" => "rev"
+    }
+
+    bind =
+      Map.merge(source, %{
+        "type" => "source_bind",
+        "op_id" => op(203),
+        "message_id" => "keyed",
+        "acceptance_seq" => 1
+      })
+
+    assert %{"type" => "ok"} = request(relay, "a1", bind)
+    collision = %{bind | "op_id" => op(204), "message_id" => "collision", "acceptance_seq" => 2}
+    assert %{"reason" => "source_binding_conflict"} = request(relay, "a1", collision)
+
+    assert %{"seq" => 3} =
+             request(relay, "a2", %{
+               "type" => "answer",
+               "op_id" => op(205),
+               "message_id" => "keyed",
+               "sender_id" => "app:test",
+               "answer" => nil
+             })
+
+    result =
+      Map.merge(source, %{
+        "type" => "source_result",
+        "op_id" => op(206),
+        "message_id" => "keyed",
+        "terminal_seq" => 3,
+        "status" => "applied",
+        "result_ref" => "outcome",
+        "result_revision" => 1
+      })
+
+    assert %{"type" => "ok", "status" => "applied"} = request(relay, "a1", result)
+
+    connector = String.duplicate("d", 64)
+    target_key = String.duplicate("e", 64)
+    assert :ok = Relay.setup_device(relay, "A", connector)
+    assert :ok = Relay.setup_device(relay, "A", target_key)
+    target = %{"kind" => "device", "id" => target_key, "key_fingerprint" => target_key}
+    grant = op(207)
+
+    assert :ok =
+             Relay.grant_enrollment_read_fixture(
+               relay,
+               "A",
+               connector,
+               grant,
+               "source",
+               target,
+               "fixture"
+             )
+
+    proof = %{
+      "type" => "enrollment_readback",
+      "proof_version" => 1,
+      "grant_id" => grant,
+      "source_instance_id" => "source",
+      "target" => target
+    }
+
+    assert %{"proof" => %{"state" => "active"}} = request(relay, connector, proof)
+    version = :sys.get_state(relay).store.version
+    :ok = GenServer.stop(relay)
+    {:ok, relay} = Relay.start_link(opts)
+    assert %{"duplicate" => true} = request(relay, "a1", result)
+    assert %{"reason" => "source_binding_conflict"} = request(relay, "a1", collision)
+    assert %{"reason" => "not_found"} = request(relay, "b1", proof)
+    assert :sys.get_state(relay).store.version == version
+    GenServer.stop(relay)
+  end
+
   test "format-one SQLite snapshot preserves stored messages and source report fields", %{
     relay: relay,
     path: path

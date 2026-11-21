@@ -254,6 +254,7 @@ defmodule AttentionServer.ChangeLog do
       )
     )
     |> Map.put(:settings, touched_settings(touched, old, next))
+    |> Map.put(:subscription_items, touched_subscription_items(touched, old, next))
     |> Map.put(:session_keys, for({:row, :origin_sessions, scope} <- touched, do: scope))
     |> Map.put(:advisories, for({:advisory, scope, {:entry, seq}} <- touched, do: {scope, seq}))
     |> Map.put(
@@ -314,7 +315,7 @@ defmodule AttentionServer.ChangeLog do
         end),
         changed.bounce,
         changed.opened,
-        subscription_keys(old, next)
+        Map.get_lazy(changed, :subscription_items, fn -> subscription_keys(old, next) end)
       ]
       |> Enum.concat()
       |> Enum.uniq()
@@ -387,7 +388,26 @@ defmodule AttentionServer.ChangeLog do
     |> changed_keys(next.subscriptions)
     |> Enum.map(fn {person, _device} -> person end)
     |> Enum.uniq()
-    |> Enum.flat_map(fn person ->
+    |> subscription_items(next)
+  end
+
+  defp touched_subscription_items(touched, old, next) do
+    persons =
+      for {:row, :subscriptions, {person, _} = key} <- touched,
+          Map.fetch(old.subscriptions, key) !== Map.fetch(next.subscriptions, key),
+          into: MapSet.new(),
+          do: person
+
+    subscription_items(persons, next)
+  end
+
+  defp subscription_items(persons, %{route_b_index: %{request_keys_by_id: lookup} = index})
+       when is_map(lookup) do
+    Enum.flat_map(persons, &AttentionServer.RouteBIndex.message_keys(index, &1))
+  end
+
+  defp subscription_items(persons, next) do
+    Enum.flat_map(persons, fn person ->
       for {{^person, _, _} = key, _} <- next.messages, do: key
     end)
   end
