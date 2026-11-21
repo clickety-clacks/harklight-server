@@ -418,7 +418,7 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
     assert Process.alive?(ctx.relay)
   end
 
-  test "a storage failure mid-stream ends the feed without closing: server_shutdown", ctx do
+  test "a storage failure mid-stream ends the feed with closing: storage_unavailable", ctx do
     log =
       capture_log(fn ->
         conn = connect(ctx)
@@ -429,13 +429,39 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
         break_store(ctx)
         send(pid, {:change_log, "A", 1_000_000})
 
-        {_conn, feed} = drain(conn, feed)
-        refute feed.buffer =~ "event: closing"
+        {conn, feed, closing} = until_closing(conn, feed)
+        assert closing == %{event: "closing", data: %{"reason" => "storage_unavailable"}}
+        assert {_conn, %{done: true}} = drain(conn, feed)
         assert Process.alive?(ctx.relay)
         Process.sleep(50)
       end)
 
     assert log =~ "phase=close reason=storage_unavailable"
+  end
+
+  test "a position that falls out of retention mid-stream gets closing: cursor_expired", ctx do
+    forward(ctx.relay, "m1", 1)
+    conn = connect(ctx)
+    {conn, feed} = open_feed(conn, "?after=0")
+    {conn, feed, _backlog} = changes_through(conn, feed, head(ctx))
+    pid = feed_pid()
+
+    # While the feed is held, later changes commit and retention passes them.
+    :erlang.suspend_process(pid)
+    forward(ctx.relay, "m2", 2)
+    forward(ctx.relay, "m3", 3)
+
+    assert {:ok, _} =
+             ChangeLog.prune(
+               :sys.get_state(ctx.relay).store,
+               System.system_time(:millisecond) + 1
+             )
+
+    :erlang.resume_process(pid)
+
+    {conn, feed, closing} = until_closing(conn, feed)
+    assert closing == %{event: "closing", data: %{"reason" => "cursor_expired"}}
+    assert {_conn, %{done: true}} = drain(conn, feed)
   end
 
   test "a principal that stops authenticating mid-stream gets closing: revoked", ctx do
