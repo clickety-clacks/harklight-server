@@ -71,6 +71,7 @@ defmodule AttentionServer.LargeData do
     term |> index_rows(Enum.reverse(path), %{}) |> reference_index_rows()
   end
 
+  @doc false
   def reference_index_rows(index) do
     index
     |> Map.values()
@@ -342,7 +343,13 @@ defmodule AttentionServer.LargeData do
 
   defp unmarked_blobs(ids, term) do
     candidates = MapSet.new(ids)
-    unmarked = remove_marked_blobs(term, candidates)
+
+    unmarked =
+      reduce_blob_ids(term, candidates, fn
+        id, :marker, remaining -> MapSet.delete(remaining, id)
+        _id, :reference, remaining -> remaining
+      end)
+
     retained_count = MapSet.size(candidates) - MapSet.size(unmarked)
 
     if retained_count > 0 do
@@ -356,32 +363,35 @@ defmodule AttentionServer.LargeData do
     Enum.filter(ids, &MapSet.member?(unmarked, &1))
   end
 
-  defp remove_marked_blobs(
-         <<@persisted_ref_prefix, id::binary-size(64), "; bytes=", size::binary>>,
-         candidates
-       ) do
-    if MapSet.member?(candidates, id) and Regex.match?(~r/\A(?:0|[1-9][0-9]*)\]\z/, size),
-      do: MapSet.delete(candidates, id),
-      else: candidates
+  @doc false
+  def count_blob_owners(term, counts \\ %{}, amount \\ 1) do
+    reduce_blob_ids(term, counts, fn id, _kind, remaining ->
+      Map.update(remaining, id, amount, &(&1 + amount))
+    end)
   end
 
-  defp remove_marked_blobs(%Ref{}, candidates), do: candidates
+  defp reduce_blob_ids(
+         <<@persisted_ref_prefix, id::binary-size(64), "; bytes=", size::binary>>,
+         acc,
+         fun
+       ) do
+    if blob_id?(id) and Regex.match?(~r/\A(?:0|[1-9][0-9]*)\]\z/, size),
+      do: fun.(id, :marker, acc),
+      else: acc
+  end
 
-  defp remove_marked_blobs(term, candidates) when is_map(term),
-    do:
-      :maps.fold(
-        fn _key, value, remaining -> remove_marked_blobs(value, remaining) end,
-        candidates,
-        term
-      )
+  defp reduce_blob_ids(%Ref{id: id}, acc, fun), do: fun.(id, :reference, acc)
 
-  defp remove_marked_blobs(term, candidates) when is_tuple(term),
-    do: remove_marked_blobs(Tuple.to_list(term), candidates)
+  defp reduce_blob_ids(term, acc, fun) when is_map(term),
+    do: :maps.fold(fn _key, value, current -> reduce_blob_ids(value, current, fun) end, acc, term)
 
-  defp remove_marked_blobs(term, candidates) when is_list(term),
-    do: Enum.reduce(term, candidates, &remove_marked_blobs/2)
+  defp reduce_blob_ids(term, acc, fun) when is_tuple(term),
+    do: reduce_blob_ids(Tuple.to_list(term), acc, fun)
 
-  defp remove_marked_blobs(_term, candidates), do: candidates
+  defp reduce_blob_ids(term, acc, fun) when is_list(term),
+    do: Enum.reduce(term, acc, &reduce_blob_ids(&1, &2, fun))
+
+  defp reduce_blob_ids(_term, acc, _fun), do: acc
 
   defp delete_files(directory, names) do
     Enum.reduce_while(names, :ok, fn name, :ok ->
