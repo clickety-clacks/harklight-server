@@ -326,6 +326,21 @@ defmodule AttentionServer.ChangeLog do
     :ok
   end
 
+  @doc """
+  Ends `subscribe_closing/1` for the calling process, which may serve later
+  requests on the same connection.
+  """
+  def unsubscribe_closing(%{kind: :device, key: key, person: person}),
+    do: unregister_closing([{:device, key}, {:person, person}])
+
+  def unsubscribe_closing(%{kind: :browser, session_id: session_id, person: person}),
+    do: unregister_closing([{:browser_session, session_id}, {:person, person}])
+
+  defp unregister_closing(scopes) do
+    Enum.each(scopes, fn scope -> Registry.unregister(@registry, {:closing, scope}) end)
+    :ok
+  end
+
   @doc "Whether a person already had client-visible data, which seeds their log at rev 1."
   def seeded?(%Engine{} = engine, person) do
     Enum.any?(engine.messages, fn {{p, _, _}, _} -> p == person end) or
