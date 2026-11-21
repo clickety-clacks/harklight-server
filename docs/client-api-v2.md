@@ -182,7 +182,7 @@ Schemas use JSON Schema 2020-12. `$ref`s point into the `$defs` below.
         "key": { "type": "string", "description": "Sort ascending, byte-wise, to get the server's inbox order across and within sections" },
         "section": { "enum": ["current", "resolved"], "description": "Draw a heading where it changes; resolved takes today's History heading (closed list, §4)" },
         "group": { "enum": ["common", "earlier_messages"], "description": "Only for current items while the inbox is in free order; common has no heading" },
-        "level": { "$ref": "#/$defs/PriorityLevel4", "description": "Always present for current items: today's per-item urgency. Clients draw the urgent and high marks from it in every order." },
+        "level": { "$ref": "#/$defs/PriorityLevel4", "description": "Present only when the inbox view entry carries priority, in baseline and fallback views. Omitted under a selected JEV ranking and for progress FYIs." },
         "score": { "type": "number", "description": "Present for current items wherever today's priority view has it" },
         "due_at_ms": { "$ref": "#/$defs/TimeMs", "description": "Present wherever today's priority view has it" }
       }
@@ -874,8 +874,8 @@ applied as well. Round 4 wins where rounds conflict:
   - the batch position, and a row for every client-visible effect (12);
   - idempotency stores successes only, and replies need a conversation (13);
   - `Rank.score` and `due_at_ms` wherever today has them (14);
-  - `Terminal.answer` gains `choice`, `Rank.level` is always present for
-    current items, and the `Entry.position` wording (15);
+  - `Terminal.answer` gains `choice`, `Rank.level` follows the view entry's
+    priority, and the `Entry.position` wording (15 and its addendum);
   - `result` is any JSON value, with a `result` outcome kind (16);
   - the closing reasons `cursor_expired` and `storage_unavailable` (17).
 - `Chat.reply_group` may be null, where today's reply row has no group.
