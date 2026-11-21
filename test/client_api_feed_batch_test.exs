@@ -37,7 +37,7 @@ defmodule AttentionServer.ClientAPIFeedBatchTest do
   import Plug.Conn
 
   alias AttentionServer.{ChangeLog, ClientAPIFeedClient, JSON, Relay, TLSFixtures}
-  alias AttentionServer.ClientAPI.{FeedStep, Principal, Reads, Router}
+  alias AttentionServer.ClientAPI.{FeedStep, Principal, Reads, Resources, Router}
   alias AttentionServer.ClientAPISchema, as: Schema
 
   @handle "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
@@ -455,59 +455,42 @@ defmodule AttentionServer.ClientAPIFeedBatchTest do
 
   ## Relay cost (review H2)
 
-  test "a long chat's backlog is read in one relay step in linear time", ctx do
+  test "a long chat backlog uses one Relay step and builds its entries once", ctx do
     forward(ctx.relay, "long", 1)
 
-    chat = fn from, to ->
-      for n <- from..to do
-        assert %{"type" => "ok"} =
-                 request(ctx.relay, ctx.reader, %{
-                   "type" => "discussion",
-                   "op_id" => op(1_000 + n),
-                   "sender_id" => "app:test",
-                   "message_id" => "long",
-                   "request_revision" => 1,
-                   "text" => "Turn #{n}"
-                 })
-      end
+    for n <- 1..400 do
+      assert %{"type" => "ok"} =
+               request(ctx.relay, ctx.reader, %{
+                 "type" => "discussion",
+                 "op_id" => op(1_000 + n),
+                 "sender_id" => "app:test",
+                 "message_id" => "long",
+                 "request_revision" => 1,
+                 "text" => "Turn #{n}"
+               })
     end
 
-    # The whole backlog in one step, as the Relay runs it: best of three.
-    step = fn ->
-      1..3
-      |> Enum.map(fn _ ->
-        {us, {:ok, changes, false, _}} =
-          :timer.tc(fn -> FeedStep.read(ctx.relay, principal(ctx), 0, 500) end)
+    relay = ctx.relay
+    targets = [{FeedStep, :handle_call, 3}, {Resources, :entries, 3}]
+    trace = :trace.session_create(:feed_backlog_work, self(), [])
 
-        {us, Enum.count(changes, &(&1["kind"] == "entry"))}
-      end)
-      |> Enum.min()
-    end
-
-    chat.(1, 100)
-    {short_us, short_entries} = step.()
-    chat.(101, 400)
-    {long_us, long_entries} = step.()
-
-    assert short_entries >= 100 and long_entries >= 400
-
-    # Four times the entries may cost at most eight times as much. Rebuilding
-    # the item's entries for each row is quadratic: about sixteen times.
-    assert long_us < 8 * max(short_us, 1_000),
-           "100 entries: #{short_us} us, 400 entries: #{long_us} us"
-
-    # Another Relay caller during the 400-entry catch-up waits only for one
-    # short step. Row by row, it waited about 290 ms on a test host.
-    waits =
-      for _ <- 1..3 do
-        catch_up = Task.async(fn -> FeedStep.read(ctx.relay, principal(ctx), 0, 500) end)
-        Process.sleep(1)
-        {us, _} = :timer.tc(fn -> :sys.get_state(ctx.relay) end)
-        Task.await(catch_up)
-        us
+    try do
+      for {module, _, _} = target <- targets do
+        Code.ensure_loaded!(module)
+        assert :trace.function(trace, target, true, [:call_memory]) == 1
       end
 
-    assert Enum.min(waits) < 100_000, "a concurrent Relay call waited #{Enum.min(waits)} us"
+      assert :trace.process(trace, relay, true, [:call]) == 1
+
+      assert {200, %{"changes" => changes, "more" => false}} = batch(ctx, "?after=0&limit=500")
+      assert Enum.count(changes, &(&1["kind"] == "entry")) == 400
+
+      for target <- targets do
+        assert {:call_memory, [{^relay, 1, _words}]} = :trace.info(trace, target, :call_memory)
+      end
+    after
+      :trace.session_destroy(trace)
+    end
   end
 
   test "if a step's render fails, its rows render one at a time and a bad row is skipped", ctx do
