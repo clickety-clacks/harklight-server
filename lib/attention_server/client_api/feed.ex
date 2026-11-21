@@ -180,7 +180,8 @@ defmodule AttentionServer.ClientAPI.FeedStep do
     # A principal that no longer authenticates reads nothing, even on a
     # connection opened before its access ended.
     with {:ok, _} <- authorized(state, principal),
-         {:ok, rows, more, position} <- read_log(state.store, person, cursor, limit) do
+         :ok <- ChangeLog.ranks_available(state.store, person),
+         {:ok, rows, more, position} <- ChangeLog.read(state.store, person, cursor, limit) do
       context = %{
         engine: state.store.engine,
         store: state.store,
@@ -198,13 +199,10 @@ defmodule AttentionServer.ClientAPI.FeedStep do
         Diagnostics.failure(:client_api, :stream_read, reason, :failed)
         {:error, :storage_unavailable}
     end
-  end
-
-  defp read_log(store, person, cursor, limit) do
-    with :ok <- ChangeLog.ranks_available(store, person),
-         do: ChangeLog.read(store, person, cursor, limit)
   rescue
-    error -> {:error, error}
+    error ->
+      Diagnostics.failure(:client_api, :stream_read, error, :failed)
+      {:error, :storage_unavailable}
   end
 
   defp authorized(state, principal) do

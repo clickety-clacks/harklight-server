@@ -136,7 +136,7 @@ defmodule AttentionServer.AgentAPI.FeedStep do
 
   defp read_rows(%{store: store} = state, principal, session, cursor, limit) do
     with {:ok, agent} <- authorized(store.engine, principal),
-         {:ok, rows, more, position} <- read_log(store, agent, cursor, limit, session),
+         {:ok, rows, more, position} <- AgentChangeLog.read(store, agent, cursor, limit, session),
          {:ok, changes} <- render_changes(state, principal, rows) do
       {:ok, agent, changes, more, position}
     else
@@ -151,12 +151,10 @@ defmodule AttentionServer.AgentAPI.FeedStep do
         Diagnostics.failure(:client_api, :stream_read, reason, :failed)
         {:error, :storage_unavailable}
     end
-  end
-
-  defp read_log(store, agent, cursor, limit, session) do
-    AgentChangeLog.read(store, agent, cursor, limit, session)
   rescue
-    error -> {:error, error}
+    error ->
+      Diagnostics.failure(:client_api, :stream_read, error, :failed)
+      {:error, :storage_unavailable}
   end
 
   defp render_changes(state, principal, rows) do
