@@ -98,7 +98,7 @@ defmodule AttentionServer.ClientAPI.AgentShow do
          {:ok, nil} <- lookup(state, scope, key) do
       create_show(state, person, agent, body, {show_id, result_ref}, {scope, key}, digest)
     else
-      {:ok, %{digest: ^digest, status: status, body: result}} ->
+      {:ok, %{digest: ^digest, status: status, body: result}} when is_map(result) ->
         {:reply, {:ok, status, result, true}, state}
 
       {:ok, %{}} ->
@@ -123,10 +123,10 @@ defmodule AttentionServer.ClientAPI.AgentShow do
       %{at_ms: at_ms} = receipt ->
         if state.clock.() - at_ms < Idempotency.retention_ms(),
           do: {:ok, receipt},
-          else: Idempotency.lookup(state.store, scope, key)
+          else: Idempotency.lookup_encoded(state.store, scope, key)
 
       nil ->
-        Idempotency.lookup(state.store, scope, key)
+        Idempotency.lookup_encoded(state.store, scope, key)
     end
   end
 
@@ -173,7 +173,7 @@ defmodule AttentionServer.ClientAPI.AgentShow do
 
         {:reply, {:ok, 200, response, false}, next}
 
-      {:ok, %{digest: ^digest, status: status, body: stored}} ->
+      {:ok, %{digest: ^digest, status: status, body: stored}} when is_map(stored) ->
         {:reply, {:ok, status, stored, true}, state}
 
       {:ok, %{}} ->

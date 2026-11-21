@@ -172,7 +172,7 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
     case authorize(state, scope) do
       :ok ->
         case lookup(state, receipt_scope, key) do
-          {:ok, %{digest: ^digest, status: status, body: stored}} ->
+          {:ok, %{digest: ^digest, status: status, body: stored}} when is_binary(stored) ->
             {:reply, {:stored, status, stored}, state}
 
           {:ok, %{}} ->
