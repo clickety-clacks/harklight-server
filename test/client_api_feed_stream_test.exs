@@ -430,8 +430,7 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
     assert replayed == Map.new(messages, &{&1["item_id"], &1})
   end
 
-  test "agent entry replay reaches the reply's changed priority after an urgency revision",
-       ctx do
+  test "both feeds replay the updated reply priority after an urgency revision", ctx do
     assert :ok = Relay.setup_sender(ctx.relay, ctx.reader, "app:agent")
 
     message = %{
@@ -482,13 +481,13 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
     assert {:ok, %{"changes" => changes, "rev" => cursor}} =
              JSON.decode_line(before.body <> "\n")
 
-    assert [reply] =
-             for(
-               %{"kind" => "entry", "data" => %{"position" => ^position} = entry} <- changes,
-               do: entry
-             )
+    assert {person_conn, 200, %{"changes" => person_changes, "rev" => person_cursor}} =
+             batch(connect(ctx), "?after=0")
 
-    assert %{"priority" => %{"level" => "normal"}} = reply
+    agent_reply = replay_reply(changes, position, %{"rev" => 0})
+    person_reply = replay_reply(person_changes, position, %{"rev" => 0})
+    assert %{"priority" => %{"level" => "normal"}} = agent_reply
+    assert %{"priority" => %{"level" => "normal"}} = person_reply
 
     assert %{"type" => "ok", "revision" => 2} =
              request(
@@ -506,27 +505,44 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
     assert after_revision.status == 200
     assert {:ok, %{"changes" => changes}} = JSON.decode_line(after_revision.body <> "\n")
 
-    replayed =
-      Enum.reduce(changes, reply, fn
-        %{"kind" => "entry", "data" => %{"position" => ^position, "rev" => rev} = entry}, held ->
-          if rev > held["rev"], do: entry, else: held
-
-        _, held ->
-          held
-      end)
+    assert {person_conn, 200, %{"changes" => person_changes}} =
+             batch(person_conn, "?after=#{person_cursor}")
 
     id = ClientAPI.Resources.item_id(%{accepted_seq: accepted})
 
-    assert {:ok, conn, ref} =
-             Mint.HTTP.request(conn, "GET", "/v2/agent/messages/#{id}/entries", [], nil)
+    current = %{
+      agent: reply_snapshot(conn, "/v2/agent/messages/#{id}/entries", position),
+      person: reply_snapshot(person_conn, "/v2/items/#{id}/entries", position)
+    }
 
+    assert %{"priority" => %{"level" => "high"}} = current.agent
+    assert %{"priority" => %{"level" => "high"}} = current.person
+
+    assert %{
+             agent: replay_reply(changes, position, agent_reply),
+             person: replay_reply(person_changes, position, person_reply)
+           } == current
+
+    assert current.agent["rev"] > agent_reply["rev"]
+    assert current.person["rev"] > person_reply["rev"]
+  end
+
+  defp replay_reply(changes, position, reply) do
+    Enum.reduce(changes, reply, fn
+      %{"kind" => "entry", "data" => %{"position" => ^position, "rev" => rev} = entry}, held ->
+        if rev > held["rev"], do: entry, else: held
+
+      _, held ->
+        held
+    end)
+  end
+
+  defp reply_snapshot(conn, path, position) do
+    assert {:ok, conn, ref} = Mint.HTTP.request(conn, "GET", path, [], nil)
     {_conn, snapshot} = collect(conn, ref)
     assert snapshot.status == 200
     assert {:ok, %{"entries" => entries}} = JSON.decode_line(snapshot.body <> "\n")
-    current = Enum.find(entries, &(&1["position"] == position))
-    assert %{"priority" => %{"level" => "high"}} = current
-    assert replayed == current
-    assert replayed["rev"] > reply["rev"]
+    Enum.find(entries, &(&1["position"] == position))
   end
 
   test "filtered agent SSE resumes across concurrent writes and converges with the snapshot",
