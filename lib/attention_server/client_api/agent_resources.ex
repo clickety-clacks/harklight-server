@@ -142,11 +142,18 @@ defmodule AttentionServer.ClientAPI.AgentResources do
       ack2 = Engine.delivery_ack_fact(engine, person, agent, entry, :ack2) || %{}
       receipt = Map.get(engine.origin_receipts, {person, agent, seq}, %{})
       uses = Map.get(receipt, :uses, %{})
+      transfers = Map.get(receipt, :transfers, %{})
 
       reports =
-        for file <- files, %{} = result <- [Map.get(uses, file["name"])] do
-          %{"file_id" => file["file_id"], "outcome" => result["status"]}
-          |> put("reason", result["reason"])
+        for file <- files,
+            use = Map.get(uses, file["name"]),
+            transfer = Map.get(transfers, file["name"]),
+            use || transfer do
+          %{"file_id" => file["file_id"]}
+          |> put("transfer", transfer && transfer["status"])
+          |> put("transfer_reason", transfer && transfer["reason"])
+          |> put("use", use && use["status"])
+          |> put("use_reason", use && use["reason"])
         end
 
       Map.take(ack2, ["outcome", "reason", "rerouted"])

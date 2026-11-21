@@ -527,37 +527,38 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
                contract(ctx, "WriteResult", reply)
 
       turn = item <> "/entries/" <> entry
-      use = %{"file_id" => file, "outcome" => "not_transferred", "reason" => "Fixture"}
-      assert_error(request(ctx, "a1", "POST", turn <> "/file-use", use, 4), 404, "not_found")
+      path = turn <> "/file-use"
+      failed = %{"file_id" => file, "transfer" => "not_transferred", "reason" => "Fixture"}
+      assert_error(request(ctx, "a1", "POST", path, failed, 4), 404, "not_found")
 
       assert request(ctx, "a1", "POST", turn <> "/receipt", %{"outcome" => "handed"}, 5).status ==
                200
 
-      response = request(ctx, "a1", "POST", turn <> "/file-use", use, 4)
+      response = request(ctx, "a1", "POST", path, failed, 4)
       assert response.status == 200
 
-      assert %{"file_id" => ^file, "outcome" => "not_transferred"} =
-               contract(ctx, "AgentFileUseResult", response)
+      assert %{"file_id" => ^file, "transfer" => "not_transferred"} =
+               decode_response(response)
 
       assert %{"duplicate" => true} =
-               contract(
-                 ctx,
-                 "AgentFileUseResult",
-                 request(ctx, "a1", "POST", turn <> "/file-use", use, 6)
-               )
+               decode_response(request(ctx, "a1", "POST", path, failed, 6))
 
-      assert_error(
-        request(
-          ctx,
-          "a1",
-          "POST",
-          turn <> "/file-use",
-          %{"file_id" => file, "outcome" => "used"},
-          7
-        ),
-        409,
-        "already_closed"
-      )
+      usable = request(ctx, "a1", "POST", path, %{"file_id" => file, "use" => "used"}, 7)
+      assert usable.status == 200
+
+      assert %{
+               "use" => "used",
+               "entry" => %{
+                 "delivery" => %{
+                   "file_uses" => [
+                     %{"file_id" => ^file, "transfer" => "not_transferred", "use" => "used"}
+                   ]
+                 }
+               }
+             } = decode_response(usable)
+
+      conflict = %{"file_id" => file, "transfer" => "transferred", "use" => "used"}
+      assert_error(request(ctx, "a1", "POST", path, conflict, 8), 409, "already_closed")
     end
 
     test "the uploader can delete an unattached upload, including idempotent retry", ctx do
@@ -811,6 +812,11 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
     {conn, response} = ClientAPIFeedClient.collect(conn, ref)
     Mint.HTTP.close(conn)
     response
+  end
+
+  defp decode_response(response) do
+    assert {:ok, body} = JSON.decode_line(response.body <> "\n")
+    body
   end
 
   defp contract(ctx, schema, response) do

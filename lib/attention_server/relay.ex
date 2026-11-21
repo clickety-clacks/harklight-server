@@ -5365,7 +5365,7 @@ defmodule AttentionServer.Relay do
 
   @doc false
   def apply_agent_file_use(state, key, seq, name, outcome, op_id) do
-    case Engine.origin_file_use(state.store.engine, key, seq, name, outcome, op_id, true) do
+    case Engine.origin_file_report(state.store.engine, key, seq, name, outcome, op_id) do
       {:ok, engine, reply} ->
         case commit(state.store, engine, audit(state.store.engine, key, "origin_file_use")) do
           {:ok, store} -> {{:ok, reply}, %{state | store: store}}

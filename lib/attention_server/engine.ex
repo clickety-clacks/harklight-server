@@ -2766,11 +2766,10 @@ defmodule AttentionServer.Engine do
   end
 
   @doc "One origin-session file-use report after a delivered person turn."
-  def origin_file_use(%__MODULE__{} = engine, key, feed_seq, name, outcome, op_id, v2? \\ false) do
+  def origin_file_use(%__MODULE__{} = engine, key, feed_seq, name, outcome, op_id) do
     with {:ok, person} <- authorized_person(engine, key),
          true <- Message.uuid?(op_id),
-         {:ok, next, reply} <-
-           Conversation.file_use(engine, person, key, feed_seq, name, outcome, v2?) do
+         {:ok, next, reply} <- Conversation.file_use(engine, person, key, feed_seq, name, outcome) do
       if next == engine do
         {:ok, next, reply}
       else
@@ -2798,6 +2797,33 @@ defmodule AttentionServer.Engine do
     else
       false -> {:error, :invalid_op_id}
       error -> error
+    end
+  end
+
+  @doc false
+  def origin_file_report(%__MODULE__{} = engine, key, seq, name, report, op_id) do
+    with {:ok, person} <- authorized_person(engine, key),
+         {:ok, next, reply} <- Conversation.file_report(engine, person, key, seq, name, report) do
+      if next == engine do
+        {:ok, next, reply}
+      else
+        entry = next.origin_feeds[{person, key}].entries[seq]
+        message_key = {person, entry["sender_id"], entry["message_id"]}
+
+        payload = %{
+          "kind" => "file_use",
+          "author" => "origin",
+          "event_id" => entry["event_id"],
+          "request_revision" => entry["request_revision"],
+          "session_handle" => entry["session_handle"],
+          "file" => name,
+          "status" => reply["use"] || reply["transfer"],
+          "op_id" => op_id
+        }
+
+        {next, _seq} = append_conversation_fact(next, person, message_key, payload)
+        {:ok, next, reply}
+      end
     end
   end
 

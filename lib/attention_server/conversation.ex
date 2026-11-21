@@ -284,16 +284,11 @@ defmodule AttentionServer.Conversation do
 
   def ack(_, _, _, _, _), do: {:error, :not_found}
 
-  def file_use(engine, person, origin, feed_seq, name, outcome, v2? \\ false)
-
-  def file_use(engine, person, origin, feed_seq, name, outcome, v2?)
+  def file_use(engine, person, origin, feed_seq, name, outcome)
       when is_integer(feed_seq) and feed_seq > 0 and is_binary(name) do
     key = {person, origin, feed_seq}
     entry = get_in(engine.origin_feeds, [{person, origin}, :entries, feed_seq])
-
-    receipt =
-      Map.get(engine.origin_receipts, key) ||
-        if(v2?, do: receipt_from_delivery(engine, person, origin, entry))
+    receipt = Map.get(engine.origin_receipts, key)
 
     cond do
       is_nil(receipt) or is_nil(entry) ->
@@ -302,8 +297,7 @@ defmodule AttentionServer.Conversation do
       not Enum.any?(Map.get(entry, "files", []), &(&1["name"] == name)) ->
         {:error, :not_found}
 
-      not ConversationFiles.valid_use?(outcome) or
-          (outcome["status"] == "not_transferred" and not v2?) ->
+      not ConversationFiles.valid_use?(outcome) ->
         {:error, :file_use}
 
       true ->
@@ -332,7 +326,46 @@ defmodule AttentionServer.Conversation do
     end
   end
 
-  def file_use(_, _, _, _, _, _, _), do: {:error, :not_found}
+  def file_use(_, _, _, _, _, _), do: {:error, :not_found}
+
+  @doc false
+  def file_report(engine, person, origin, feed_seq, name, report) do
+    key = {person, origin, feed_seq}
+    entry = get_in(engine.origin_feeds, [{person, origin}, :entries, feed_seq])
+
+    with %{} = entry <- entry,
+         true <- Enum.any?(Map.get(entry, "files", []), &(&1["name"] == name)),
+         %{} = receipt <-
+           Map.get(engine.origin_receipts, key) ||
+             receipt_from_delivery(engine, person, origin, entry),
+         {:ok, next} <- record_file_report(receipt, name, report) do
+      reply =
+        %{"event_id" => entry["event_id"], "file" => name}
+        |> Map.merge(Map.new(report, fn {dimension, value} -> {dimension, value["status"]} end))
+
+      if next == receipt do
+        {:ok, engine, Map.put(reply, "duplicate", true)}
+      else
+        {:ok, %{engine | origin_receipts: Map.put(engine.origin_receipts, key, next)}, reply}
+      end
+    else
+      {:error, _} = error -> error
+      _ -> {:error, :not_found}
+    end
+  end
+
+  defp record_file_report(receipt, name, report) do
+    Enum.reduce_while(report, {:ok, receipt}, fn {dimension, value}, {:ok, next} ->
+      field = if dimension == "transfer", do: :transfers, else: :uses
+      current = Map.get(next, field, %{})
+
+      case Map.get(current, name) do
+        nil -> {:cont, {:ok, Map.put(next, field, Map.put(current, name, value))}}
+        ^value -> {:cont, {:ok, next}}
+        _ -> {:halt, {:error, :file_use_conflict}}
+      end
+    end)
+  end
 
   defp receipt_from_delivery(engine, person, origin, %{"author" => "person"} = entry) do
     case AttentionServer.Engine.delivery_ack_fact(engine, person, origin, entry, :ack1) do
@@ -666,8 +699,12 @@ defmodule AttentionServer.Conversation do
          entry,
          %{implicit_ack: true, transfers: %{}} = receipt
        ) do
-    map_size(receipt.transfers) == 0 and
-      is_map(AttentionServer.Engine.delivery_ack_fact(engine, person, origin, entry, :ack1))
+    files = MapSet.new(Map.get(entry, "files", []), & &1["name"])
+
+    is_map(AttentionServer.Engine.delivery_ack_fact(engine, person, origin, entry, :ack1)) and
+      Enum.all?(receipt.transfers, fn {name, report} ->
+        MapSet.member?(files, name) and ConversationFiles.valid_transfer_report?(name, report)
+      end)
   end
 
   defp valid_receipt_transfers?(_engine, _person, _origin, entry, receipt),

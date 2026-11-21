@@ -26,7 +26,7 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
     result: ~w(status),
     answer_receipt: ~w(outcome reason agent rerouted),
     chat_receipt: ~w(outcome reason agent rerouted),
-    file_use: ~w(file_id outcome reason),
+    file_use: ~w(file_id transfer use reason),
     advisory_ack: ~w(advisory_id),
     session_end: []
   }
@@ -506,9 +506,8 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
          {:ok, entry} <- AgentResources.entry(state, {person, record.origin}, key, position),
          file when is_map(file) <-
            Enum.find(entry["files"] || [], &(&1["file_id"] == body["file_id"])),
-         outcome = %{"status" => body["outcome"]} |> Map.merge(Map.take(body, ["reason"])),
-         true <- ConversationFiles.valid_use?(outcome) do
-      {:ok, {:file_use, sequence, file["name"], outcome}, {position, file["file_id"]}}
+         {:ok, report} <- file_report(body, file["name"]) do
+      {:ok, {:file_use, sequence, file["name"], report}, {position, file["file_id"]}}
     else
       nil -> {:error, :not_found}
       false -> {:error, "invalid_field", "outcome"}
@@ -532,6 +531,37 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
       end
     else
       {:error, "invalid_field", "advisory_id"}
+    end
+  end
+
+  defp file_report(body, name) do
+    dimensions = Map.take(body, ["transfer", "use"])
+    reason = body["reason"]
+    failures = ["not_transferred", "unusable"]
+
+    cond do
+      map_size(dimensions) == 0 ->
+        {:error, "invalid_field", "transfer"}
+
+      Map.has_key?(body, "reason") and
+          not Enum.any?(dimensions, fn {_, status} -> status in failures end) ->
+        {:error, "invalid_field", "reason"}
+
+      true ->
+        Enum.reduce_while(dimensions, {:ok, %{}}, fn {field, status}, {:ok, acc} ->
+          report = %{"status" => status}
+          report = if status in failures, do: Map.put(report, "reason", reason), else: report
+
+          valid =
+            case field do
+              "transfer" -> ConversationFiles.valid_transfer_report?(name, report)
+              "use" -> ConversationFiles.valid_use?(report)
+            end
+
+          if valid,
+            do: {:cont, {:ok, Map.put(acc, field, report)}},
+            else: {:halt, {:error, "invalid_field", field}}
+        end)
     end
   end
 
@@ -737,14 +767,13 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
   defp render(state, scope, :file_use, key, fields, {position, file_id}) do
     with {:ok, rev} <- AgentChangeLog.head(state.store, scope),
          {:ok, entry} <- AgentResources.entry(state, scope, key, position) do
-      body = Map.take(fields, ["duplicate"])
+      body = Map.take(fields, ["duplicate", "transfer", "use"])
 
       {:ok,
        Map.merge(body, %{
          "rev" => rev,
          "entry" => entry,
-         "file_id" => file_id,
-         "outcome" => fields["status"]
+         "file_id" => file_id
        })}
     end
   end

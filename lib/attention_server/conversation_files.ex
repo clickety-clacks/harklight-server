@@ -93,13 +93,16 @@ defmodule AttentionServer.ConversationFiles do
   def valid_use?(%{"status" => "used"} = report),
     do: Map.keys(report) |> Enum.sort() == ["status"]
 
-  def valid_use?(%{"status" => status, "reason" => reason} = report)
-      when status in ["unusable", "not_transferred"],
-      do:
-        Map.keys(report) |> Enum.sort() == ["reason", "status"] and is_binary(reason) and
-          reason != "" and String.valid?(reason)
+  def valid_use?(%{"status" => "unusable", "reason" => reason} = report),
+    do:
+      Map.keys(report) |> Enum.sort() == ["reason", "status"] and is_binary(reason) and
+        reason != "" and String.valid?(reason)
 
   def valid_use?(_), do: false
+
+  @doc false
+  def valid_transfer_report?(name, report),
+    do: valid_transfer?(Map.put(report, "name", name))
 
   defp normalize_transfers([], remaining, result) do
     if MapSet.size(remaining) == 0, do: {:ok, result}, else: {:error, :file_transfers}
