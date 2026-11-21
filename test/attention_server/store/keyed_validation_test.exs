@@ -102,29 +102,43 @@ defmodule AttentionServer.Store.KeyedValidationTest do
     assert {:error, :invalid_sequence} = KeyedValidation.sequences(old, next, touched)
   end
 
-  test "upload changes visit only the indexed owning entries" do
+  test "upload changes visit only the indexed owning entries and message revisions" do
     scope = {@person, "origin"}
-    target = %{"files" => [%{"tier" => "upload", "upload_id" => "file"}]}
+    files = [%{"tier" => "upload", "upload_id" => "file"}]
+    target = %{"files" => files}
     unrelated = %{"files" => [%{"tier" => "upload", "upload_id" => "other"}]}
+    entry = {:origin_feed, scope, {:entry, 1}}
+    message = {:row, :messages, @item}
+    upload = {:row, :uploads, "file"}
 
     engine = %{
       Engine.new()
-      | origin_feeds: %{scope => %{entries: %{1 => target, 2 => unrelated}}}
+      | messages: %{@item => %{files_by_revision: %{1 => files, 2 => files}}},
+        origin_feeds: %{scope => %{entries: %{1 => target, 2 => unrelated}}}
     }
 
     index = KeyedValidation.upload_index(engine)
 
-    assert {:ok, ^index, [{@person, ^target}]} =
-             KeyedValidation.upload_changes(index, engine, engine, [{:row, :uploads, "file"}])
+    assert {:ok, ^index, related} =
+             KeyedValidation.upload_changes(index, engine, engine, [upload])
+
+    assert related == MapSet.new([entry, message])
 
     next = put_in(engine.origin_feeds[scope].entries, %{2 => unrelated})
 
-    assert {:ok, updated, []} =
-             KeyedValidation.upload_changes(index, engine, next, [
-               {:origin_feed, scope, {:entry, 1}}
-             ])
+    assert {:ok, updated, related} =
+             KeyedValidation.upload_changes(index, engine, next, [entry, upload])
 
-    refute Map.has_key?(updated, "file")
+    assert related == MapSet.new([entry, message])
+    assert updated["file"] == MapSet.new([message])
     assert updated["other"] == index["other"]
+
+    removed = %{next | messages: %{}}
+
+    assert {:ok, final, _related} =
+             KeyedValidation.upload_changes(updated, next, removed, [message])
+
+    refute Map.has_key?(final, "file")
+    assert final["other"] == index["other"]
   end
 end

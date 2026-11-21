@@ -455,26 +455,33 @@ defmodule AttentionServer.Store.KeyedValidation do
   end
 
   def upload_index(engine) do
-    for {scope, feed} <- engine.origin_feeds, {seq, entry} <- feed.entries, reduce: %{} do
-      index -> add_upload_links(index, {scope, seq}, entry)
-    end
+    index =
+      for {scope, feed} <- engine.origin_feeds, {seq, entry} <- feed.entries, reduce: %{} do
+        index ->
+          add_upload_links(index, {:origin_feed, scope, {:entry, seq}}, entry_upload_ids(entry))
+      end
+
+    Enum.reduce(engine.messages, index, fn {key, record}, index ->
+      add_upload_links(index, {:row, :messages, key}, revision_upload_ids(record))
+    end)
   end
 
   def upload_changes(index, old, next, touched) do
     {index, changed, uploads} =
       Enum.reduce(touched, {index, MapSet.new(), []}, fn
-        {:origin_feed, scope, {:entry, seq}}, {index, changed, uploads} ->
-          key = {scope, seq}
-          before_entry = get_in(old.origin_feeds, [scope, :entries, seq])
-          after_entry = get_in(next.origin_feeds, [scope, :entries, seq])
+        {:origin_feed, scope, {:entry, seq}} = address, {index, changed, uploads} ->
+          before_ids = entry_upload_ids(get_in(old.origin_feeds, [scope, :entries, seq]))
+          after_ids = entry_upload_ids(get_in(next.origin_feeds, [scope, :entries, seq]))
 
-          index =
-            Enum.reduce(upload_ids(before_entry), index, fn id, acc ->
-              owners = MapSet.delete(Map.get(acc, id, MapSet.new()), key)
-              if MapSet.size(owners) == 0, do: Map.delete(acc, id), else: Map.put(acc, id, owners)
-            end)
+          {update_upload_links(index, address, before_ids, after_ids),
+           MapSet.put(changed, address), uploads}
 
-          {add_upload_links(index, key, after_entry), MapSet.put(changed, key), uploads}
+        {:row, :messages, key} = address, {index, changed, uploads} ->
+          before_ids = revision_upload_ids(Map.get(old.messages, key))
+          after_ids = revision_upload_ids(Map.get(next.messages, key))
+
+          {update_upload_links(index, address, before_ids, after_ids),
+           MapSet.put(changed, address), uploads}
 
         {:row, :uploads, id}, {index, changed, uploads} ->
           {index, changed, [id | uploads]}
@@ -484,25 +491,38 @@ defmodule AttentionServer.Store.KeyedValidation do
       end)
 
     related = Enum.reduce(uploads, changed, &MapSet.union(Map.get(index, &1, MapSet.new()), &2))
-
-    entries =
-      for {{person, _} = scope, seq} <- related,
-          entry = get_in(next.origin_feeds, [scope, :entries, seq]),
-          do: {person, entry}
-
-    {:ok, index, entries}
+    {:ok, index, related}
   end
 
-  defp add_upload_links(index, key, entry) do
-    Enum.reduce(upload_ids(entry), index, fn id, acc ->
-      Map.update(acc, id, MapSet.new([key]), &MapSet.put(&1, key))
+  defp update_upload_links(index, address, before_ids, after_ids) do
+    index =
+      Enum.reduce(before_ids, index, fn id, index ->
+        owners = MapSet.delete(Map.get(index, id, MapSet.new()), address)
+        if MapSet.size(owners) == 0, do: Map.delete(index, id), else: Map.put(index, id, owners)
+      end)
+
+    add_upload_links(index, address, after_ids)
+  end
+
+  defp add_upload_links(index, address, ids) do
+    Enum.reduce(ids, index, fn id, index ->
+      Map.update(index, id, MapSet.new([address]), &MapSet.put(&1, address))
     end)
   end
 
-  defp upload_ids(nil), do: []
+  defp entry_upload_ids(nil), do: []
 
-  defp upload_ids(entry) do
+  defp entry_upload_ids(entry) do
     for %{"tier" => "upload", "upload_id" => id} <- Map.get(entry, "files", []), do: id
+  end
+
+  defp revision_upload_ids(nil), do: MapSet.new()
+
+  defp revision_upload_ids(record) do
+    for {_revision, files} <- Map.get(record, :files_by_revision, %{}),
+        %{"tier" => "upload", "upload_id" => id} <- files,
+        into: MapSet.new(),
+        do: id
   end
 
   # The committed Engine satisfied the full validator. Each changed sequence
