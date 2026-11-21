@@ -8009,14 +8009,15 @@ defmodule AttentionServer.Relay do
     held = Map.put(show, "accepted_at", state.clock.())
     next = %{state | held_shows: Map.put(state.held_shows, client["client_id"], held)}
 
-    handed = AttentionServer.ClientAPI.Focus.offer_show(client["client_id"])
-    delivery = if handed and Map.has_key?(show, "show_id"), do: "sent", else: "held"
+    unless Map.has_key?(show, "show_id") do
+      AttentionServer.ClientAPI.Focus.notify_show(client["client_id"])
+    end
 
     {{:ok,
       %{
         "client_id" => client["client_id"],
         "device_name" => client["device_name"],
-        "delivery" => delivery
+        "delivery" => "held"
       }}, next}
   end
 

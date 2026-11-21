@@ -7,8 +7,10 @@ defmodule AttentionServer.ClientAPI.AgentShow do
   alias AttentionServer.ClientAPI.{
     AgentWrites,
     Errors,
+    Focus,
     Idempotency,
     Resources,
+    Router,
     Writes
   }
 
@@ -23,10 +25,61 @@ defmodule AttentionServer.ClientAPI.AgentShow do
          :ok <- validate_show(body) do
       digest = Idempotency.digest("POST", conn.path_info, body)
       show_id = "s" <> Base.url_encode64(:crypto.strong_rand_bytes(18), padding: false)
-      Writes.respond(conn, call(ctx, {:show, ctx.principal, key, digest, body, show_id}))
+      Writes.respond(conn, execute(ctx, key, digest, body, show_id))
     else
       {:error, token, field, response} -> Errors.send_error(response, token, field: field)
       {:error, token, field} -> Errors.send_error(conn, token, field: field)
+    end
+  end
+
+  defp execute(ctx, key, digest, body, show_id) do
+    result_ref = Process.alias()
+    deadline = System.monotonic_time(:millisecond) + Router.request_timeout_ms()
+
+    result =
+      try do
+        case call(ctx, {:show, ctx.principal, key, digest, body, show_id, result_ref}) do
+          {:wait_for_writer, writer, receipt_key, response} ->
+            state = await_writer(writer, result_ref, deadline)
+            {:finish_show, receipt_key, digest, %{response | "state" => state}}
+
+          outcome ->
+            outcome
+        end
+      after
+        close_result_ref(result_ref)
+      end
+
+    case result do
+      {:finish_show, _, _, _} = finish -> call(ctx, finish)
+      outcome -> outcome
+    end
+  end
+
+  defp close_result_ref(ref) do
+    Process.unalias(ref)
+
+    receive do
+      {^ref, _} -> :ok
+    after
+      0 -> :ok
+    end
+  end
+
+  defp await_writer(writer, ref, deadline) do
+    monitor = Process.monitor(writer)
+    remaining = max(deadline - System.monotonic_time(:millisecond), 0)
+
+    try do
+      receive do
+        {^ref, :sent} -> "sent"
+        {^ref, :held} -> "held"
+        {:DOWN, ^monitor, :process, ^writer, _} -> "held"
+      after
+        remaining -> "held"
+      end
+    after
+      Process.demonitor(monitor, [:flush])
     end
   end
 
@@ -35,7 +88,7 @@ defmodule AttentionServer.ClientAPI.AgentShow do
 
   @doc false
   def handle_call(
-        {:show, %{person: person, key: agent}, key, digest, body, show_id},
+        {:show, %{person: person, key: agent}, key, digest, body, show_id, result_ref},
         _from,
         state
       ) do
@@ -43,7 +96,7 @@ defmodule AttentionServer.ClientAPI.AgentShow do
 
     with :ok <- permitted(state, person, agent, :push_view),
          {:ok, nil} <- lookup(state, scope, key) do
-      create_show(state, person, agent, body, show_id, {scope, key}, digest)
+      create_show(state, person, agent, body, {show_id, result_ref}, {scope, key}, digest)
     else
       {:ok, %{digest: ^digest, status: status, body: result}} ->
         {:reply, {:ok, status, result, true}, state}
@@ -58,6 +111,9 @@ defmodule AttentionServer.ClientAPI.AgentShow do
         {:reply, {:error, "storage_unavailable", nil, false}, state}
     end
   end
+
+  def handle_call({:finish_show, receipt_key, digest, response}, _from, state),
+    do: finish_show(state, receipt_key, digest, response)
 
   @doc false
   def lookup(_state, _scope, nil), do: {:ok, nil}
@@ -74,7 +130,7 @@ defmodule AttentionServer.ClientAPI.AgentShow do
     end
   end
 
-  defp create_show(state, person, agent, body, show_id, receipt_key, digest) do
+  defp create_show(state, person, agent, body, {show_id, result_ref}, receipt_key, digest) do
     with {:ok, {^person, sender, message_id}} <-
            Resources.item_key(state.store.engine, person, body["item_id"]),
          frame = %{"sender_id" => sender, "message_id" => message_id, "target" => body["target"]},
@@ -87,14 +143,10 @@ defmodule AttentionServer.ClientAPI.AgentShow do
         "state" => resolved["delivery"]
       }
 
-      receipt = %{digest: digest, status: 200, body: response, at_ms: next.clock.()}
-
-      next = %{
-        next
-        | agent_show_receipts: Map.put(next.agent_show_receipts, receipt_key, receipt)
-      }
-
-      {:reply, {:ok, 200, response, false}, next}
+      case Focus.offer_show(resolved["client_id"], show_id, result_ref) do
+        nil -> finish_show(next, receipt_key, digest, response)
+        writer -> {:reply, {:wait_for_writer, writer, receipt_key, response}, next}
+      end
     else
       {:error, token} ->
         {:reply, {:error, to_string(token), nil, false}, state}
@@ -104,6 +156,31 @@ defmodule AttentionServer.ClientAPI.AgentShow do
 
       {{:error, token}, _} ->
         {:reply, {:error, to_string(token), nil, false}, state}
+    end
+  end
+
+  # The request which finishes first under a key keeps its successful receipt,
+  # as with the shared idempotency rules for simultaneous requests.
+  defp finish_show(state, {scope, key} = receipt_key, digest, response) do
+    case lookup(state, scope, key) do
+      {:ok, nil} ->
+        receipt = %{digest: digest, status: 200, body: response, at_ms: state.clock.()}
+
+        next = %{
+          state
+          | agent_show_receipts: Map.put(state.agent_show_receipts, receipt_key, receipt)
+        }
+
+        {:reply, {:ok, 200, response, false}, next}
+
+      {:ok, %{digest: ^digest, status: status, body: stored}} ->
+        {:reply, {:ok, status, stored, true}, state}
+
+      {:ok, %{}} ->
+        {:reply, {:ok, 200, response, false}, state}
+
+      {:error, _} ->
+        {:reply, {:error, "storage_unavailable", nil, false}, state}
     end
   end
 

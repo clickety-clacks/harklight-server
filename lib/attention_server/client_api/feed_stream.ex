@@ -186,7 +186,11 @@ defmodule AttentionServer.ClientAPI.FeedStream do
 
       {:client_api_show, device_key}
       when state.source == FeedStep and device_key == state.ctx.principal.key ->
-        write_pending_show(conn, state)
+        write_pending_show(conn, state, nil, nil)
+
+      {:client_api_show, device_key, show_id, reply_ref}
+      when state.source == FeedStep and device_key == state.ctx.principal.key ->
+        write_pending_show(conn, state, show_id, reply_ref)
 
       {:feed_heartbeat, ref} when ref == state.timer ->
         heartbeat(conn, state, &wait/2)
@@ -257,35 +261,49 @@ defmodule AttentionServer.ClientAPI.FeedStream do
 
   defp flush_shows do
     receive do
-      {:client_api_show, _device_key} -> flush_shows()
+      {:client_api_show, _device_key} ->
+        flush_shows()
+
+      {:client_api_show, _device_key, _id, ref} ->
+        show_result(ref, :held)
+        flush_shows()
     after
       0 -> :ok
     end
   end
 
-  defp write_pending_show(conn, state) do
+  defp write_pending_show(conn, state, expected_id, reply_ref) do
     case pending_show(state.ctx) do
-      %{"show_id" => id} = data when id != state.last_show_id ->
+      %{"show_id" => id} = data
+      when id != state.last_show_id and (is_nil(expected_id) or id == expected_id) ->
         event = ["event: show\ndata: ", JSON.encode!(data), "\n\n"]
 
         case chunk_safely(conn, event) do
-          {:ok, conn} -> wait(conn, %{state | last_show_id: id})
-          {:error, _reason} -> finish(conn, state, "client_closed")
+          {:ok, conn} ->
+            show_result(reply_ref, :sent)
+            wait(conn, %{state | last_show_id: id})
+
+          {:error, _reason} ->
+            show_result(reply_ref, :held)
+            finish(conn, state, "client_closed")
         end
 
-      %{"show_id" => _id} ->
-        wait(conn, state)
-
       {:error, :unauthorized} ->
+        show_result(reply_ref, :held)
         closing(conn, state, "revoked")
 
       {:error, :server_shutdown} ->
+        show_result(reply_ref, :held)
         closing(conn, state, "server_shutdown")
 
-      nil ->
+      _ ->
+        show_result(reply_ref, :held)
         wait(conn, state)
     end
   end
+
+  defp show_result(nil, _result), do: :ok
+  defp show_result(ref, result), do: send(ref, {ref, result})
 
   defp pending_show(ctx) do
     Focus.pending_show(ctx.relay, ctx.principal)

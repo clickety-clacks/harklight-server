@@ -438,6 +438,163 @@ defmodule AttentionServer.ClientAPIFeedShowTest do
     Mint.HTTP.close(conn)
   end
 
+  defmodule ControlledShowStream do
+    def send_chunked({test, _} = opts, 200, _headers) do
+      send(test, {:controlled_open, self()})
+      {:ok, "", opts}
+    end
+
+    def chunk({test, block_backlog?}, data) do
+      case IO.iodata_to_binary(data) do
+        "event: show\n" <> _ ->
+          wait_for_result(test, :show)
+
+        _ ->
+          if block_backlog? and is_nil(Process.put(:controlled_backlog, true)),
+            do: wait_for_result(test, :backlog),
+            else: :ok
+      end
+    end
+
+    defp wait_for_result(test, kind) do
+      send(test, {:controlled_chunk, self(), kind})
+
+      receive do
+        {:chunk_result, result} -> result
+      end
+    end
+  end
+
+  defp controlled_writer(ctx, cursor) do
+    test = self()
+
+    writer =
+      Task.async(fn ->
+        conn = %{
+          Plug.Test.conn(:get, "/v2/changes")
+          | adapter: {ControlledShowStream, {test, cursor == 0}}
+        }
+
+        stream_ctx = %Context{
+          principal: %{kind: :device, key: ctx.reader, person: "A"},
+          relay: ctx.relay,
+          request_id: "controlled-show-test"
+        }
+
+        FeedStream.serve(conn, stream_ctx, cursor)
+      end)
+
+    assert_receive {:controlled_open, pid}, 1_000
+    assert pid == writer.pid
+    writer
+  end
+
+  defp show_in_request(ctx) do
+    assert {:ok, origin} =
+             Relay.setup_device_certificate(
+               ctx.relay,
+               "A",
+               TLSFixtures.certificate_der!(ctx.certs, "a2")
+             )
+
+    :sys.replace_state(ctx.relay, fn state ->
+      put_in(state.store.engine.devices[origin].push_view, true)
+    end)
+
+    assert {:ok, %{"items" => [%{"item_id" => item}]}} =
+             ClientAPI.Reads.inbox(ctx.relay, ctx.reader)
+
+    Task.async(fn ->
+      conn = connect(ctx.port, ctx.certs, "a2")
+
+      {conn, response} =
+        show_request(conn, "00000000-0000-4000-8000-000000000011", %{
+          "item_id" => item,
+          "target" => "chat"
+        })
+
+      Mint.HTTP.close(conn)
+      response
+    end)
+  end
+
+  test "a failed server write reports held and keeps the focus fallback", ctx do
+    writer = controlled_writer(ctx, head(ctx.relay))
+    request = show_in_request(ctx)
+    assert_receive {:controlled_chunk, pid, :show}, 2_000
+    assert pid == writer.pid
+
+    send(pid, {:chunk_result, {:error, :closed}})
+    response = Task.await(request)
+    assert response.status == 200
+    assert %{"state" => "held", "show_id" => id} = body(response)
+
+    assert {:ok, 200, %{"show" => %{"show_id" => ^id}}, false} =
+             Writes.focus(ctx.relay, ctx.reader, %{"screen" => "inbox", "ttl_s" => 120})
+
+    Task.await(writer)
+  end
+
+  test "the request waits for a successful chunk without blocking Relay", ctx do
+    writer = controlled_writer(ctx, head(ctx.relay))
+    request = show_in_request(ctx)
+    assert_receive {:controlled_chunk, pid, :show}, 2_000
+    assert pid == writer.pid
+    assert Task.yield(request, 50) == nil
+    assert :ok = Relay.setup_person(ctx.relay, "unrelated")
+
+    send(pid, {:chunk_result, :ok})
+    response = Task.await(request)
+    assert response.status == 200
+    assert %{"state" => "sent"} = body(response)
+    Task.shutdown(writer, :brutal_kill)
+  end
+
+  test "the writer skips a show already consumed by focus", ctx do
+    writer = controlled_writer(ctx, 0)
+    assert_receive {:controlled_chunk, pid, :backlog}, 1_000
+    assert pid == writer.pid
+    request = show_in_request(ctx)
+
+    pending =
+      Enum.find_value(1..100, fn _ ->
+        show = :sys.get_state(ctx.relay).held_shows[ctx.reader]
+        if show, do: show, else: Process.sleep(10) && nil
+      end)
+
+    assert %{"show_id" => id} = pending
+
+    assert {:ok, 200, %{"show" => %{"show_id" => ^id}}, false} =
+             Writes.focus(ctx.relay, ctx.reader, %{"screen" => "inbox", "ttl_s" => 120})
+
+    send(pid, {:chunk_result, :ok})
+    response = Task.await(request)
+    assert response.status == 200
+    assert %{"state" => "held", "show_id" => ^id} = body(response)
+    refute_received {:controlled_chunk, ^pid, :show}
+    Task.shutdown(writer, :brutal_kill)
+  end
+
+  test "an unresponsive writer is held after the shared request timeout", ctx do
+    Application.put_env(:attention_server, :client_api_request_timeout_ms, 150)
+    on_exit(fn -> Application.delete_env(:attention_server, :client_api_request_timeout_ms) end)
+
+    writer = controlled_writer(ctx, head(ctx.relay))
+    request = show_in_request(ctx)
+    assert_receive {:controlled_chunk, pid, :show}, 2_000
+    assert pid == writer.pid
+    response = Task.await(request, 2_000)
+    assert response.status == 200
+    assert %{"state" => "held", "show_id" => id} = body(response)
+
+    send(pid, {:chunk_result, :ok})
+
+    assert {:ok, 200, %{"show" => %{"show_id" => ^id}}, false} =
+             Writes.focus(ctx.relay, ctx.reader, %{"screen" => "inbox", "ttl_s" => 120})
+
+    Task.shutdown(writer, :brutal_kill)
+  end
+
   defp show_request(conn, key, request) do
     assert {:ok, conn, ref} =
              Mint.HTTP.request(

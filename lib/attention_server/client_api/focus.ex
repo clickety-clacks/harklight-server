@@ -43,16 +43,29 @@ defmodule AttentionServer.ClientAPI.Focus do
     do: Registry.unregister(@registry, {:client_api_show, device_key})
 
   @doc false
-  # The show stays in Relay memory. Sending only hands the notification to
-  # each open device feed writer; its socket is never awaited here.
-  def offer_show(device_key) do
-    if Process.whereis(@registry) do
-      writers = Registry.lookup(@registry, {:client_api_show, device_key})
-      Enum.each(writers, fn {pid, _} -> send(pid, {:client_api_show, device_key}) end)
-      writers != []
-    else
-      false
+  def notify_show(device_key) do
+    Enum.each(show_writers(device_key), fn {pid, _} ->
+      send(pid, {:client_api_show, device_key})
+    end)
+  end
+
+  @doc false
+  # Offer the exact held show to one writer. The HTTP request owns the wait.
+  def offer_show(device_key, show_id, result_ref) do
+    case Enum.find(show_writers(device_key), fn {pid, _} -> Process.alive?(pid) end) do
+      {pid, _} ->
+        send(pid, {:client_api_show, device_key, show_id, result_ref})
+        pid
+
+      nil ->
+        nil
     end
+  end
+
+  defp show_writers(device_key) do
+    if Process.whereis(@registry),
+      do: Registry.lookup(@registry, {:client_api_show, device_key}),
+      else: []
   end
 
   @doc "Reads the current held show for an authenticated device with an active focus report."
