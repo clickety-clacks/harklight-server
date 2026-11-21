@@ -429,23 +429,23 @@ defmodule AttentionServer.ClientAPI.Resources do
     end
   end
 
-  # A UI/1 answer is a structured result, any JSON value, null included. A
-  # plain-text answer to the same item (the comment path) shows as a reply,
-  # known only by the answer path the write recorded; an unmarked string is
-  # never guessed either way.
+  # A /v2 answer to a UI/1 item records its path: a structured result (any
+  # JSON value, null included) or a plain-text comment, shown as a reply. An
+  # answer with no recorded path (before 0.2) shows exactly as today's
+  # answer_outcome does, so nothing is invented (contract round 16, option C).
   defp structured_outcome(terminal, answer) do
     case {Map.get(terminal, :answer_path), answer} do
-      {"comment", text} when is_binary(text) or is_struct(text, LargeData.Ref) ->
-        %{"kind" => "reply", "text" => text}
-
       {"result", value} ->
         %{"kind" => "result", "value" => value}
 
-      {nil, text} when is_binary(text) or is_struct(text, LargeData.Ref) ->
-        nil
+      {"comment", text} when is_binary(text) or is_struct(text, LargeData.Ref) ->
+        %{"kind" => "reply", "text" => text}
 
-      {nil, value} ->
-        %{"kind" => "result", "value" => value}
+      {nil, nil} ->
+        %{"kind" => "seen"}
+
+      {nil, text} when is_binary(text) or is_struct(text, LargeData.Ref) ->
+        %{"kind" => "reply", "text" => text}
 
       _ ->
         nil
