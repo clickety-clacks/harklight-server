@@ -748,41 +748,81 @@ defmodule AttentionServer.ChangeLog do
   Reads then page from the stored order (`rank_page/4`, `rank/3`) instead
   of ranking per read.
   """
-  def put_ranks(%AttentionServer.Store{change_log: true, db: db, engine: engine}, person, ranks)
+  def put_ranks(%AttentionServer.Store{} = store, person, ranks) when is_map(ranks) do
+    with {:ok, head, _cache} <- put_ranks(store, person, ranks, nil), do: {:ok, head}
+  end
+
+  @doc """
+  `put_ranks/3` against the person's last ranking kept in memory (`cache`,
+  as returned by the previous call, or `nil` after a restart). Rankings are
+  compared in memory, so an unchanged re-rank reads and writes nothing but
+  the head. With `nil`, the stored ranking is read once and compared by its
+  JSON. Returns `{:ok, head, cache}` for the next call.
+  """
+  def put_ranks(
+        %AttentionServer.Store{change_log: true, db: db, engine: engine},
+        person,
+        ranks,
+        cache
+      )
       when is_map(ranks) do
-    encoded = Map.new(ranks, fn {item_id, rank} -> {item_id, JSON.encode!(rank)} end)
     unit_keys = AttentionServer.ClientAPI.Resources.rank_unit_keys(ranks)
 
-    with {:ok, stored} <- stored_ranks(db, person),
-         {:ok, previous_units} <-
-           rank_keys(%AttentionServer.Store{change_log: true, db: db}, person),
-         {:ok, ranked?} <- ranked?(db, person) do
-      changed = for {id, json} <- encoded, Map.get(stored, id) != json, do: id
-      dropped = for {id, _} <- stored, not Map.has_key?(encoded, id), do: id
-      changed_units = for {id, key} <- unit_keys, Map.get(previous_units, id) != key, do: id
-      dropped_units = for {id, _} <- previous_units, not Map.has_key?(unit_keys, id), do: id
+    with {:ok, prior} <- prior_ranks(db, person, cache) do
+      changed = for {id, rank} <- ranks, not same_rank?(Map.get(prior.ranks, id), rank), do: id
+      dropped = for {id, _} <- prior.ranks, not Map.has_key?(ranks, id), do: id
+      changed_units = for {id, key} <- unit_keys, Map.get(prior.units, id) != key, do: id
+      dropped_units = for {id, _} <- prior.units, not Map.has_key?(unit_keys, id), do: id
+      next_cache = %{ranks: ranks, units: unit_keys, ranked?: true}
 
       if changed == [] and dropped == [] and changed_units == [] and dropped_units == [] and
-           ranked? do
-        head(db, engine, person)
+           prior.ranked? do
+        with {:ok, head} <- head(db, engine, person), do: {:ok, head, next_cache}
       else
         # A person's first stored ranking is what reads computed until now, so
         # it changes no item and writes no row.
-        items = if ranked?, do: rank_changed_items(engine, person, changed ++ dropped), else: []
+        items =
+          if prior.ranked?, do: rank_changed_items(engine, person, changed ++ dropped), else: []
 
-        write_stored_ranks(db, engine, person, %{
-          items: items,
-          ranks: Map.take(ranks, changed),
-          encoded: encoded,
-          dropped: dropped,
-          units: Map.take(unit_keys, changed_units),
-          dropped_units: dropped_units
-        })
+        changed_ranks = Map.take(ranks, changed)
+
+        with {:ok, head} <-
+               write_stored_ranks(db, engine, person, %{
+                 items: items,
+                 ranks: changed_ranks,
+                 encoded: Map.new(changed_ranks, fn {id, rank} -> {id, JSON.encode!(rank)} end),
+                 dropped: dropped,
+                 units: Map.take(unit_keys, changed_units),
+                 dropped_units: dropped_units
+               }),
+             do: {:ok, head, next_cache}
       end
     end
   end
 
-  def put_ranks(%AttentionServer.Store{}, _person, _ranks), do: {:error, :disabled}
+  def put_ranks(%AttentionServer.Store{}, _person, _ranks, _cache), do: {:error, :disabled}
+
+  # A ranking kept in memory compares by value; one read back from SQLite
+  # (after a restart) compares by its stored JSON, which encodes the same
+  # way.
+  defp prior_ranks(_db, _person, %{ranks: _, units: _, ranked?: _} = cache), do: {:ok, cache}
+
+  defp prior_ranks(db, person, nil) do
+    with {:ok, stored} <- stored_ranks(db, person),
+         {:ok, units} <- rank_keys(%AttentionServer.Store{change_log: true, db: db}, person),
+         {:ok, ranked?} <- ranked?(db, person) do
+      {:ok,
+       %{
+         ranks: Map.new(stored, fn {id, json} -> {id, {:json, json}} end),
+         units: units,
+         ranked?: ranked?
+       }}
+    end
+  end
+
+  defp same_rank?(nil, _rank), do: false
+  defp same_rank?({:json, json}, rank), do: json == JSON.encode!(rank)
+  defp same_rank?(previous, rank), do: previous == rank
 
   defp rank_changed_items(engine, person, item_ids) do
     item_ids

@@ -840,4 +840,76 @@ defmodule AttentionServer.ChangeLogTest do
     ChangeLog.notify_closing([{{:owner, "A"}, :revoked}, {{:device, "owner-key"}, :revoked}])
     refute_receive {:client_closing, _, _}, 200
   end
+
+  # Per-change cost of storing a person's ranking (owner's gate: the rank hook
+  # must cost no more than today's view rebuild; an unchanged re-rank must be
+  # nearly free).
+  defp synthetic_ranks(n, move \\ nil) do
+    Map.new(1..n, fn i ->
+      key = String.pad_leading(Integer.to_string(i), 8, "0")
+      key = if i == move, do: key <> "m", else: key
+      {"i#{i}", %{"key" => key, "section" => "current", "level" => "normal", "score" => i / n}}
+    end)
+  end
+
+  defp micros(fun) do
+    {us, value} = :timer.tc(fun)
+    {div(us, 1000), value}
+  end
+
+  test "an unchanged re-rank kept in memory costs almost nothing at 4k and 10k items", ctx do
+    relay = start(ctx)
+    setup_people(relay)
+
+    results =
+      for n <- [4_000, 10_000] do
+        person = "P#{n}"
+        assert :ok = Relay.setup_person(relay, person)
+        ranks = synthetic_ranks(n)
+
+        paused(relay, fn ->
+          store = store(relay)
+
+          {first_ms, {:ok, _, cache}} =
+            micros(fn -> ChangeLog.put_ranks(store, person, ranks, nil) end)
+
+          # Same ranking, kept in memory: compared in memory, nothing written.
+          {same_ms, {:ok, head, cache}} =
+            micros(fn -> ChangeLog.put_ranks(store, person, ranks, cache) end)
+
+          # One item moves: one stored rank changes.
+          moved = synthetic_ranks(n, 7)
+
+          {move_ms, {:ok, _, _}} =
+            micros(fn -> ChangeLog.put_ranks(store, person, moved, cache) end)
+
+          assert {:ok, %{"key" => "00000007m"}} = ChangeLog.rank(store, person, "i7")
+
+          # After a restart (no ranking in memory) the stored one is compared by
+          # its JSON: an unchanged ranking writes nothing.
+          {restart_ms, {:ok, ^head, _}} =
+            micros(fn -> ChangeLog.put_ranks(store, person, moved, nil) end)
+
+          assert same_ms < 25, "unchanged re-rank took #{same_ms} ms at #{n}"
+
+          %{
+            n: n,
+            first_ms: first_ms,
+            unchanged_ms: same_ms,
+            one_moved_ms: move_ms,
+            restart_ms: restart_ms
+          }
+        end)
+      end
+
+    summary =
+      Map.new(results, fn result ->
+        {Integer.to_string(result.n),
+         result |> Map.delete(:n) |> Map.new(fn {key, value} -> {Atom.to_string(key), value} end)}
+      end)
+
+    IO.puts("RANK_STORE_COST " <> JSON.encode!(summary))
+
+    GenServer.stop(relay)
+  end
 end
