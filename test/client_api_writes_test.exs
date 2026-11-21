@@ -661,7 +661,7 @@ defmodule AttentionServer.ClientAPIWritesTest do
       GenServer.stop(relay)
     end
 
-    test "an FYI is not answerable; a retracted item is already_retracted",
+    test "an FYI's Seen is its answer, as today; a retracted item is already_retracted",
          %{path: path, flags: flags} do
       relay = scripted_relay(path, flags)
 
@@ -673,8 +673,13 @@ defmodule AttentionServer.ClientAPIWritesTest do
 
       note = item_id(relay, "note")
 
-      for value <- [{:comment, "ok"}, :no_comment] do
-        assert {:error, "invalid_field", nil, false} =
+      assert {:ok, 200, %{"item" => %{"terminal" => %{"state" => "answered"}}}, false} =
+               Writes.answer(relay, "reader", note, 1, {:choice, "seen"}, key())
+
+      assert stored_terminal(relay, "note").answer == %{"acknowledgment" => "seen"}
+
+      for value <- [{:choice, "seen"}, {:comment, "ok"}, :no_comment] do
+        assert {:error, "already_answered", nil, false} =
                  Writes.answer(relay, "reader", note, 1, value, key())
       end
 

@@ -448,14 +448,11 @@ defmodule AttentionServer.ClientAPI.Writes do
       record = Map.fetch!(engine.messages, message_key)
 
       cond do
-        not is_nil(record.terminal) ->
+        not answerable?(record) ->
           {:ok, answer_frame(key, sender, message_id, revision, nil)}
 
         revision != record.revision ->
           {:error, :stale_request}
-
-        not answerable?(record) ->
-          {:error, :invalid_field}
 
         true ->
           with {:ok, stored} <- stored_answer(record, value) do
@@ -488,9 +485,10 @@ defmodule AttentionServer.ClientAPI.Writes do
     }
   end
 
-  # An item with an open request is answerable; an FYI is not
-  # (docs/client-api-v2.md §5).
-  defp answerable?(record), do: Map.get(record.message, "message_type") != "fyi"
+  # An item is answerable while it has no terminal state, exactly today's
+  # engine rule, FYIs included (contract rulings round 10). A settled item
+  # goes to the engine, so its refusal is today's.
+  defp answerable?(record), do: is_nil(record.terminal)
 
   # The value today's answer stores: a choice stores its action's value, a
   # comment its text, a UI/1 result the result object.
