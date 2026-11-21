@@ -785,7 +785,10 @@ defmodule AttentionServer.Relay do
 
   @impl true
   def init(opts) do
-    case Store.open(Keyword.get(opts, :store_path))
+    path = Keyword.get(opts, :store_path)
+    opened = if opts[:store_mode] == :keyed, do: Store.open(path, :keyed), else: Store.open(path)
+
+    case opened
          |> client_api_v2_store(Keyword.get(opts, :feature_flags_path)) do
       {:ok, store} ->
         case startup_cleanup(store) do
@@ -4997,10 +5000,11 @@ defmodule AttentionServer.Relay do
            {:ok, read_positions} <- Engine.chat_read_positions(state.store.engine, session.key),
            {:ok, next_engine} <- Engine.open_conversation(state.store.engine, session.key),
            {:ok, store} <-
-             commit(
+             commit_progress(
                state.store,
                next_engine,
-               audit(state.store.engine, session.key, "conversation_open")
+               audit(state.store.engine, session.key, "conversation_open"),
+               :conversation_opened
              ) do
         contiguous = if frame["since"] <= cursor, do: high, else: cursor
 
@@ -5051,10 +5055,11 @@ defmodule AttentionServer.Relay do
            {:ok, person} <- Engine.authorized_person(next_engine, session.key),
            %{view_rev: view_rev} <- Map.get(state.priority_views, person),
            {:ok, store} <-
-             commit(
+             commit_progress(
                state.store,
                next_engine,
-               audit(state.store.engine, session.key, "conversation_open")
+               audit(state.store.engine, session.key, "conversation_open"),
+               :conversation_opened
              ) do
         contiguous = if frame["since"] <= cursor, do: high, else: cursor
 
@@ -5249,10 +5254,11 @@ defmodule AttentionServer.Relay do
              session.conversation_contiguous
            ) do
         {:ok, next_engine, fields} ->
-          case commit(
+          case commit_progress(
                  state.store,
                  next_engine,
-                 audit(state.store.engine, session.key, "conversation_ack")
+                 audit(state.store.engine, session.key, "conversation_ack"),
+                 :conversation_cursors
                ) do
             {:ok, store} -> {{:ok, [ok_line(frame, fields)]}, %{state | store: store}}
             {:error, _, _} -> {{:ok, [error_line(frame, "storage_unavailable")]}, state}
@@ -5276,7 +5282,7 @@ defmodule AttentionServer.Relay do
       {:ok, next_engine, fields} ->
         audit = audit(state.store.engine, session.key, "cursor_ack")
 
-        case commit(state.store, next_engine, audit) do
+        case commit_progress(state.store, next_engine, audit, :cursors) do
           {:ok, store} -> {{:ok, [ok_line(frame, fields)]}, %{state | store: store}}
           {:error, _, _} -> {{:ok, [error_line(frame, "storage_unavailable")]}, state}
         end
@@ -6584,11 +6590,15 @@ defmodule AttentionServer.Relay do
         if changed == engine do
           state
         else
-          case commit(state.store, changed, %{
-                 person: person,
-                 actor: key,
-                 action: "prioritization_settings"
-               }) do
+          audit = %{person: person, actor: key, action: "prioritization_settings"}
+
+          addresses = [
+            {:row, :algorithm_choices, person},
+            {:field, :jev_endpoint},
+            {:field, :jev_model}
+          ]
+
+          case commit_known_rows(state.store, changed, audit, addresses) do
             {:ok, store} ->
               next = %{state | store: store}
 
@@ -6652,11 +6662,11 @@ defmodule AttentionServer.Relay do
             {:ok, state}
 
           {:ok, changed} ->
-            case commit(state.store, changed, %{
-                   person: person,
-                   actor: "hosted_component",
-                   action: "hosted_algorithm"
-                 }) do
+            audit = %{person: person, actor: "hosted_component", action: "hosted_algorithm"}
+
+            case commit_known_rows(state.store, changed, audit, [
+                   {:row, :algorithm_choices, person}
+                 ]) do
               {:ok, store} -> {:ok, priority_settings_changed(%{state | store: store}, person)}
               {:error, _, _} -> {:error, :storage_unavailable, state}
             end
@@ -7062,6 +7072,29 @@ defmodule AttentionServer.Relay do
       current
     end)
   end
+
+  defp commit_progress(store, next, audit, field) do
+    key = {audit.person, audit.actor}
+
+    address =
+      if field == :conversation_opened, do: {:member, field, key}, else: {:row, field, key}
+
+    commit_known_rows(store, next, audit, [address])
+  end
+
+  defp commit_known_rows(%Store{mode: :keyed} = store, next, audit, addresses) do
+    codec = AttentionServer.Store.RecordCodec
+
+    touched =
+      for address <- addresses,
+          codec.lookup(store.engine, address) !== codec.lookup(next, address),
+          into: MapSet.new(),
+          do: address
+
+    Store.commit(store, {next, touched}, audit)
+  end
+
+  defp commit_known_rows(store, next, audit, _addresses), do: commit(store, next, audit)
 
   # Origin-feed changes are announced only by the request paths that append
   # them. This keeps unrelated commits out of every attached origin stream.

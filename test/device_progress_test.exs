@@ -44,6 +44,34 @@ defmodule AttentionServer.DeviceProgressTest do
     %{path: path}
   end
 
+  test "explicit draft keyed Relay persists cursor and conversation progress", %{path: path} do
+    {:ok, legacy} = Store.open(path)
+    assert {:ok, generation} = Store.KeyedMigration.convert(legacy)
+    :ok = Store.close(legacy)
+
+    {:ok, relay} = Relay.start_link(store_path: path, store_mode: :keyed)
+    {:ok, session} = Relay.open_session(relay, "reader")
+    request(relay, session, %{"type" => "resync", "since" => 0})
+    request(relay, session, %{"type" => "conversation_open", "since" => 0})
+
+    assert [%{"type" => "ok", "seq" => 3}] =
+             request(relay, session, %{"type" => "ack", "seq" => 3})
+
+    assert [%{"type" => "ok", "conversation_seq" => 2}] =
+             request(relay, session, %{"type" => "conversation_ack", "conversation_seq" => 2})
+
+    assert [%{"type" => "ok", "seq" => 3}] =
+             request(relay, session, %{"type" => "ack", "seq" => 3})
+
+    GenServer.stop(relay)
+    assert {:ok, reopened} = Store.open(path, :keyed)
+    assert reopened.version == generation + 3
+    assert reopened.engine.cursors[{"A", "reader"}] == 3
+    assert reopened.engine.conversation_cursors[{"A", "reader"}] == 2
+    assert MapSet.member?(reopened.engine.conversation_opened, {"A", "reader"})
+    :ok = Store.close(reopened)
+  end
+
   test "cold replay and every ACK preserve the FORMAT29 snapshot and survive restart", %{
     path: path
   } do
