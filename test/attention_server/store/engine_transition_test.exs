@@ -1952,6 +1952,99 @@ defmodule AttentionServer.Store.EngineTransitionTest do
     for %{"kind" => "entry", "data" => %{"position" => ^position} = entry} <- changes, do: entry
   end
 
+  test "keyed local setup, dashboard levels, and owner grants persist across reopen" do
+    path = legacy_store_path() <> ".new"
+    opts = [store_path: path, store_mode: :keyed_cutover]
+    {:ok, relay} = Relay.start_link(opts)
+    owner = enrollment_certificate("settings owner")
+    {:ok, key} = AttentionServer.DeviceIdentity.from_certificate(owner)
+    {:ok, person} = Relay.operator_bootstrap(relay, owner)
+    grantee = "grantee"
+    device = String.duplicate("c", 64)
+    assert :ok = Relay.setup_person(relay, grantee)
+    assert :ok = Relay.setup_device(relay, person, device)
+    assert :ok = Relay.setup_sender(relay, device, @sender)
+
+    levels = [%{"name" => "Routine", "lower_bound" => 0, "bounce_after_days" => nil}]
+    assert {:ok, %{"levels" => ^levels}} = Relay.save_dashboard_levels(relay, person, key, levels)
+    maintain = "00000000-0000-4000-8000-000000000099"
+    enrollment = "00000000-0000-4000-8000-000000000100"
+    target = %{"kind" => "device", "id" => device, "key_fingerprint" => device}
+    assert :ok = Relay.owner_grant_maintainer(relay, person, key, maintain, grantee, ["devices"])
+
+    assert :ok =
+             Relay.owner_grant_enrollment_read(
+               relay,
+               person,
+               key,
+               device,
+               enrollment,
+               "source",
+               target
+             )
+
+    assert :ok = Relay.owner_revoke_maintainer(relay, person, key, maintain)
+    assert :ok = Relay.owner_revoke_enrollment_read(relay, person, key, enrollment)
+    before = :sys.get_state(relay).store
+    GenServer.stop(relay)
+
+    {:ok, relay} = Relay.start_link(opts)
+    assert {:ok, %{"levels" => ^levels}} = Relay.dashboard_levels(relay, person, key)
+    actual = :sys.get_state(relay).store
+    assert actual.version == before.version
+    assert is_integer(actual.engine.maintainer_grants[maintain].revoked_at)
+    assert actual.engine.enrollment_read_grants[enrollment].revoked
+    assert full_diff(before.engine, actual.engine) == MapSet.new()
+    GenServer.stop(relay)
+  end
+
+  test "keyed hosted test reset stages and removes only the designated account's device" do
+    path = legacy_store_path() <> ".new"
+    cert = enrollment_certificate("test reset")
+    pem = :public_key.pem_encode([{:Certificate, cert, :not_encrypted}])
+    {:ok, config} = AttentionServer.GuidedJoin.configuration("relay.test", 18444, 18443, pem)
+
+    opts = [
+      store_path: path,
+      store_mode: :keyed_cutover,
+      hosted_test_account: "designated",
+      dashboard_origin: "https://relay.test",
+      join_configuration: config
+    ]
+
+    {:ok, relay} = Relay.start_link(opts)
+    assert {:ok, person} = Relay.hosted_account_create(relay, "designated")
+    assert {:ok, separate} = Relay.hosted_account_create(relay, "separate")
+    assert :ok = Relay.setup_device(relay, separate, @reader)
+    assert {:ok, url} = Relay.hosted_sign_in_create(relay, person, "Tester")
+    token = url |> String.split("#", parts: 2) |> List.last()
+
+    assert {:ok, %{person_id: ^person, code: code}} =
+             Relay.hosted_test_reset(relay, "device-waiting")
+
+    assert :sys.get_state(relay).store.engine.pending_enrollments[code].person == person
+    assert {:ok, %{person_id: ^person}} = Relay.hosted_test_reset(relay, "device-enrolled")
+    %{engine: engine} = :sys.get_state(relay).store
+
+    assert [{device, %{label: "Test device"}}] =
+             Enum.filter(engine.devices, fn {_, row} -> row.person == person end)
+
+    assert engine.cursors[{person, device}] == 0
+    assert engine.subscriptions[{person, device}].revision == 0
+    assert {:ok, %{person_id: ^person}} = Relay.hosted_test_reset(relay, "no-devices")
+    live = :sys.get_state(relay).store
+    GenServer.stop(relay)
+
+    {:ok, reopened} = Relay.start_link(opts)
+    assert full_diff(live.engine, :sys.get_state(reopened).store.engine) == MapSet.new()
+    %{engine: engine} = :sys.get_state(reopened).store
+    assert %{person: ^separate} = engine.devices[@reader]
+    refute Map.has_key?(engine.devices, device)
+    refute Map.has_key?(engine.cursors, {person, device})
+    assert {:ok, %{person_id: ^person}} = Relay.consume_browser_sign_in(reopened, token)
+    GenServer.stop(reopened)
+  end
+
   defp enrollment_certificate(name) do
     %{cert: der} =
       :public_key.pkix_test_root_cert(String.to_charlist(name), key: {:namedCurve, :secp256r1})

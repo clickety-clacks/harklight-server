@@ -2844,12 +2844,8 @@ defmodule AttentionServer.Store do
             is_boolean(grant.revoked) and is_struct(grant.senders, MapSet) and
             Enum.all?(grant.senders, &AttentionServer.Message.sender_id?/1)
         end) and
-        Enum.all?(engine.enrollment_read_grants, fn {grant_id, grant} ->
-          AttentionServer.Message.uuid_v4?(grant_id) and
-            Map.has_key?(engine.persons, grant.person) and
-            owns?(engine, grant.person, grant.connector) and
-            nonempty?(grant.source_instance_id) and nonempty?(grant.issuer) and
-            is_boolean(grant.revoked) and valid_grant_target?(engine, grant.person, grant.target)
+        Enum.all?(engine.enrollment_read_grants, fn {id, grant} ->
+          valid_enrollment_read_grant?(engine, id, grant)
         end) and
         Enum.all?(engine.messages, fn {key, record} -> valid_item?(engine, key, record) end) and
         unique_source_bindings?(engine.messages) and
@@ -3298,17 +3294,29 @@ defmodule AttentionServer.Store do
   defp valid_maintainers?(engine) do
     is_map(engine.maintainer_grants) and
       Enum.all?(engine.maintainer_grants, fn {id, grant} ->
-        AttentionServer.Message.uuid_v4?(id) and
-          Map.has_key?(engine.persons, grant.target_person) and
-          Map.has_key?(engine.persons, grant.grantee_person) and
-          is_struct(grant.scopes, MapSet) and MapSet.size(grant.scopes) in 1..4 and
-          MapSet.subset?(grant.scopes, MapSet.new(~w(devices senders view_items configure))) and
-          is_integer(grant.granted_at) and grant.granted_at > 0 and
-          hex_key?(grant.granted_by) and
-          ((is_nil(grant.revoked_at) and is_nil(grant.revoked_by)) or
-             (is_integer(grant.revoked_at) and grant.revoked_at >= grant.granted_at and
-                hex_key?(grant.revoked_by)))
+        valid_maintainer?(engine, id, grant)
       end)
+  end
+
+  defp valid_maintainer?(engine, id, grant) do
+    AttentionServer.Message.uuid_v4?(id) and
+      Map.has_key?(engine.persons, grant.target_person) and
+      Map.has_key?(engine.persons, grant.grantee_person) and
+      is_struct(grant.scopes, MapSet) and MapSet.size(grant.scopes) in 1..4 and
+      MapSet.subset?(grant.scopes, MapSet.new(~w(devices senders view_items configure))) and
+      is_integer(grant.granted_at) and grant.granted_at > 0 and
+      hex_key?(grant.granted_by) and
+      ((is_nil(grant.revoked_at) and is_nil(grant.revoked_by)) or
+         (is_integer(grant.revoked_at) and grant.revoked_at >= grant.granted_at and
+            hex_key?(grant.revoked_by)))
+  end
+
+  defp valid_enrollment_read_grant?(engine, grant_id, grant) do
+    AttentionServer.Message.uuid_v4?(grant_id) and
+      Map.has_key?(engine.persons, grant.person) and
+      owns?(engine, grant.person, grant.connector) and
+      nonempty?(grant.source_instance_id) and nonempty?(grant.issuer) and
+      is_boolean(grant.revoked) and valid_grant_target?(engine, grant.person, grant.target)
   end
 
   defp valid_hosted_accounts?(engine) do
@@ -3443,6 +3451,27 @@ defmodule AttentionServer.Store do
   defp valid_authority_reference?(engine, {:row, :delivery_states, person}) do
     case Map.fetch(engine.delivery_states, person) do
       {:ok, state} -> valid_delivery_state?(engine, person, state)
+      :error -> true
+    end
+  end
+
+  defp valid_authority_reference?(engine, {:row, :bounce_levels, person}) do
+    case Map.fetch(engine.bounce_levels, person) do
+      {:ok, config} -> BounceDecision.valid_configuration?(engine, person, config)
+      :error -> true
+    end
+  end
+
+  defp valid_authority_reference?(engine, {:row, :maintainer_grants, id}) do
+    case Map.fetch(engine.maintainer_grants, id) do
+      {:ok, grant} -> valid_maintainer?(engine, id, grant)
+      :error -> true
+    end
+  end
+
+  defp valid_authority_reference?(engine, {:row, :enrollment_read_grants, id}) do
+    case Map.fetch(engine.enrollment_read_grants, id) do
+      {:ok, grant} -> valid_enrollment_read_grant?(engine, id, grant)
       :error -> true
     end
   end

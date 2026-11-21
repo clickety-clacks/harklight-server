@@ -890,6 +890,67 @@ defmodule AttentionServer.Engine do
     end
   end
 
+  @doc false
+  def hosted_test_reset(%__MODULE__{} = engine, person, rows) do
+    with %{test: true} <- hosted_account(engine, person),
+         false <-
+           Enum.any?(rows, fn
+             {:row, field, _} when field in [:agents, :messages, :uploads, :origin_feeds] -> true
+             _ -> false
+           end) do
+      devices = for {:row, :devices, key} <- rows, into: MapSet.new(), do: key
+      next = Enum.reduce(rows, engine, &reset_device_row(&2, &1, person, devices))
+      {:ok, next, MapSet.to_list(devices)}
+    else
+      true -> {:error, :not_resettable}
+      _ -> {:error, :not_test_account}
+    end
+  end
+
+  defp reset_device_row(engine, {:row, field, key}, _person, _devices)
+       when field in [:devices, :pending_enrollments, :pending_history, :join_invitations],
+       do: delete_row(engine, field, key)
+
+  defp reset_device_row(engine, {:row, :enrollment_read_grants, key}, person, devices) do
+    grant = engine.enrollment_read_grants[key]
+
+    if grant.person == person and MapSet.member?(devices, grant.connector),
+      do: delete_row(engine, :enrollment_read_grants, key),
+      else: engine
+  end
+
+  defp reset_device_row(engine, {:row, :push_bindings, {person, device} = key}, person, devices) do
+    if MapSet.member?(devices, device),
+      do: remove_push_binding(engine, key),
+      else: engine
+  end
+
+  defp reset_device_row(engine, {:row, field, {person, device} = key}, person, devices)
+       when field in [:sender_grants, :subscriptions, :cursors, :conversation_cursors] do
+    if MapSet.member?(devices, device), do: delete_row(engine, field, key), else: engine
+  end
+
+  defp reset_device_row(engine, {:row, field, {person, device, _} = key}, person, devices)
+       when field in [:receipts, :source_report_grants] do
+    if MapSet.member?(devices, device), do: delete_row(engine, field, key), else: engine
+  end
+
+  defp reset_device_row(
+         engine,
+         {:member, :conversation_opened, {person, device} = key},
+         person,
+         devices
+       ) do
+    if MapSet.member?(devices, device) do
+      %{engine | conversation_opened: MapSet.delete(engine.conversation_opened, key)}
+      |> touch_fact({:member, :conversation_opened, key})
+    else
+      engine
+    end
+  end
+
+  defp reset_device_row(engine, _row, _person, _devices), do: engine
+
   defp hosted_account_ref?(ref),
     do:
       is_binary(ref) and byte_size(ref) >= 1 and String.valid?(ref) and
@@ -1525,12 +1586,12 @@ defmodule AttentionServer.Engine do
               joined: Map.get(item, :joined, false)
             }
 
-            {:ok,
-             %{
-               granted
-               | pending_enrollments: Map.delete(granted.pending_enrollments, code),
-                 pending_history: Map.put(granted.pending_history, code, receipt)
-             }, item.key}
+            enrolled =
+              granted
+              |> delete_row(:pending_enrollments, code)
+              |> put_row(:pending_history, code, receipt)
+
+            {:ok, enrolled, item.key}
           end
       end
     else
@@ -1630,12 +1691,7 @@ defmodule AttentionServer.Engine do
 
   defp put_device_metadata(engine, key, label, now) do
     device = Map.fetch!(engine.devices, key)
-
-    %{
-      engine
-      | devices:
-          Map.put(engine.devices, key, Map.merge(device, %{label: label, enrolled_at: now}))
-    }
+    put_row(engine, :devices, key, %{device | label: label, enrolled_at: now})
   end
 
   @doc "A proved TLS device key removes only itself; retained revoked keys support lost-reply retry."
@@ -1768,23 +1824,23 @@ defmodule AttentionServer.Engine do
         {:error, :key_in_use}
 
       true ->
-        {:ok,
-         %{
-           engine
-           | devices:
-               Map.put(engine.devices, key, %{
-                 person: person,
-                 revoked: false,
-                 enrollment_revision: 1,
-                 label: nil,
-                 enrolled_at: nil,
-                 see_focus: false,
-                 push_view: false
-               }),
-             subscriptions:
-               Map.put(engine.subscriptions, {person, key}, %{revision: 0, senders: MapSet.new()}),
-             cursors: Map.put(engine.cursors, {person, key}, 0)
-         }}
+        device = %{
+          person: person,
+          revoked: false,
+          enrollment_revision: 1,
+          label: nil,
+          enrolled_at: nil,
+          see_focus: false,
+          push_view: false
+        }
+
+        next =
+          engine
+          |> put_row(:devices, key, device)
+          |> put_row(:subscriptions, {person, key}, %{revision: 0, senders: MapSet.new()})
+          |> put_row(:cursors, {person, key}, 0)
+
+        {:ok, next}
     end
   end
 
@@ -1862,15 +1918,8 @@ defmodule AttentionServer.Engine do
   def setup_sender(%__MODULE__{} = engine, key, pattern) do
     with {:ok, %{person: person}} <- principal(engine, key),
          true <- Message.sender_id?(pattern) do
-      grants =
-        Map.update(
-          engine.sender_grants,
-          {person, key},
-          MapSet.new([pattern]),
-          &MapSet.put(&1, pattern)
-        )
-
-      {:ok, %{engine | sender_grants: grants}}
+      grants = Map.get(engine.sender_grants, {person, key}, MapSet.new())
+      {:ok, put_row(engine, :sender_grants, {person, key}, MapSet.put(grants, pattern))}
     else
       _ -> {:error, :forbidden}
     end
@@ -6379,6 +6428,17 @@ defmodule AttentionServer.Engine do
     engine
     |> put_in([Access.key!(:route_b_index), :push_bindings], index)
     |> put_row(:push_bindings, key, binding)
+  end
+
+  defp remove_push_binding(engine, key) do
+    previous = Map.get(engine.push_bindings, key)
+
+    index =
+      AttentionServer.PushIndex.update(engine.route_b_index.push_bindings, key, previous, nil)
+
+    engine
+    |> put_in([Access.key!(:route_b_index), :push_bindings], index)
+    |> delete_row(:push_bindings, key)
   end
 
   # Unresolved deliveries gathered since the last push this device accepted

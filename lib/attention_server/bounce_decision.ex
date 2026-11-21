@@ -1022,16 +1022,21 @@ defmodule AttentionServer.BounceDecision do
   defp valid_configurations?(engine) do
     is_map(engine.bounce_levels) and
       Enum.all?(engine.bounce_levels, fn {person, config} ->
-        Map.has_key?(engine.persons, person) and is_map(config) and
-          Map.keys(config) |> Enum.sort() ==
-            [:after_conversation_seq, :after_delivery_seq, :configured_at_ms, :levels] and
-          BouncePolicy.valid_normalized_levels?(config.levels) and
-          is_integer(config.configured_at_ms) and config.configured_at_ms >= 0 and
-          is_integer(config.after_delivery_seq) and config.after_delivery_seq >= 0 and
-          config.after_delivery_seq <= Map.get(engine.persons, person, 0) and
-          is_integer(config.after_conversation_seq) and config.after_conversation_seq >= 0 and
-          config.after_conversation_seq <= Map.get(engine.conversation_highs, person, 0)
+        valid_configuration?(engine, person, config)
       end)
+  end
+
+  @doc false
+  def valid_configuration?(engine, person, config) do
+    Map.has_key?(engine.persons, person) and is_map(config) and
+      Map.keys(config) |> Enum.sort() ==
+        [:after_conversation_seq, :after_delivery_seq, :configured_at_ms, :levels] and
+      BouncePolicy.valid_normalized_levels?(config.levels) and
+      is_integer(config.configured_at_ms) and config.configured_at_ms >= 0 and
+      is_integer(config.after_delivery_seq) and config.after_delivery_seq >= 0 and
+      config.after_delivery_seq <= Map.get(engine.persons, person, 0) and
+      is_integer(config.after_conversation_seq) and config.after_conversation_seq >= 0 and
+      config.after_conversation_seq <= Map.get(engine.conversation_highs, person, 0)
   end
 
   defp valid_revision_states?(engine) do

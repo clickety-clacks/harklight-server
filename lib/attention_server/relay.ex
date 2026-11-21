@@ -1104,6 +1104,36 @@ defmodule AttentionServer.Relay do
     end
   end
 
+  defp track_hosted_test_reset(state, person, owner, target) do
+    engine = state.store.engine
+
+    {next, result, touched} =
+      track_transition(state, engine, fn current ->
+        with {:ok, cleared, removed} <- reset_hosted_test_account(state.store, current, person),
+             {:ok, staged, code} <- hosted_test_stage(cleared, person, owner, target, state) do
+          {staged, {:ok, removed, code}}
+        else
+          error -> {current, error}
+        end
+      end)
+
+    case result do
+      {:ok, removed, code} ->
+        touched = if touched, do: changed_rows(engine, next, touched)
+        {:ok, next, touched, removed, code}
+
+      error ->
+        error
+    end
+  end
+
+  defp reset_hosted_test_account(%Store{mode: :keyed, authority_index: index}, engine, person) do
+    Engine.hosted_test_reset(engine, person, Map.get(index, {:person, person}, MapSet.new()))
+  end
+
+  defp reset_hosted_test_account(_store, engine, person),
+    do: Engine.hosted_test_reset(engine, person)
+
   defp hosted_test_device do
     :public_key.pkix_test_root_cert(String.to_charlist(@hosted_test_device),
       key: {:namedCurve, :secp256r1}
@@ -1407,10 +1437,11 @@ defmodule AttentionServer.Relay do
       if next == state.store.engine do
         {:reply, {:ok, %{"levels" => BouncePolicy.public_levels(config.levels)}}, state}
       else
-        case commit(
+        case commit_known_rows(
                state.store,
                next,
-               %{person: person, actor: key, action: "dashboard_levels"}
+               %{person: person, actor: key, action: "dashboard_levels"},
+               [{:row, :bounce_levels, person}]
              ) do
           {:ok, store} ->
             next_state = %{state | store: store} |> notify_levels_changed(person)
@@ -2222,10 +2253,10 @@ defmodule AttentionServer.Relay do
          %{person: person} <-
            Map.get(engine.hosted_accounts, account_ref) || {:error, :not_created},
          owner when is_binary(owner) <- Engine.hosted_owner_key(engine, person),
-         {:ok, cleared, removed_keys} <- Engine.hosted_test_reset(engine, person),
-         {:ok, staged, code} <- hosted_test_stage(cleared, person, owner, target_state, state),
+         {:ok, staged, touched, removed_keys, code} <-
+           track_hosted_test_reset(state, person, owner, target_state),
          {:ok, store} <-
-           commit(state.store, staged, %{
+           commit_request(state.store, staged, touched, %{
              person: person,
              actor: "hosted_component",
              action: "hosted_test_reset"
@@ -2233,7 +2264,7 @@ defmodule AttentionServer.Relay do
       next = %{state | store: store}
 
       next =
-        if pending_signature(engine, person) != pending_signature(staged, person),
+        if pending_inputs_changed?(engine, staged, person, touched),
           do: pending_set_changed(next, person),
           else: next
 
@@ -2597,7 +2628,8 @@ defmodule AttentionServer.Relay do
            ),
            person,
            key,
-           "owner_enrollment_read_grant"
+           "owner_enrollment_read_grant",
+           [{:row, :enrollment_read_grants, grant_id}]
          )
 
   defp dispatch_call({:owner_revoke_enrollment_read, person, key, grant_id}, _from, state),
@@ -2607,7 +2639,8 @@ defmodule AttentionServer.Relay do
         Engine.owner_revoke_enrollment_read(state.store.engine, person, key, grant_id),
         person,
         key,
-        "owner_enrollment_read_revoke"
+        "owner_enrollment_read_revoke",
+        [{:row, :enrollment_read_grants, grant_id}]
       )
 
   defp dispatch_call(
@@ -2629,7 +2662,8 @@ defmodule AttentionServer.Relay do
            ),
            person,
            key,
-           "owner_maintainer_grant"
+           "owner_maintainer_grant",
+           [{:row, :maintainer_grants, grant_id}]
          )
 
   defp dispatch_call({:owner_revoke_maintainer, person, key, grant_id}, _from, state),
@@ -2645,7 +2679,8 @@ defmodule AttentionServer.Relay do
         ),
         person,
         key,
-        "owner_maintainer_revoke"
+        "owner_maintainer_revoke",
+        [{:row, :maintainer_grants, grant_id}]
       )
 
   defp dispatch_call({:operator_bootstrap, key}, _from, state) do
@@ -2699,7 +2734,8 @@ defmodule AttentionServer.Relay do
         Engine.setup_person(state.store.engine, person),
         person,
         "local_setup",
-        "person_setup"
+        "person_setup",
+        [{:row, :persons, person}]
       )
 
   defp dispatch_call({:setup_device, person, key}, _from, state),
@@ -2709,7 +2745,12 @@ defmodule AttentionServer.Relay do
         Engine.setup_device(state.store.engine, person, key),
         person,
         "local_setup",
-        "device_setup"
+        "device_setup",
+        [
+          {:row, :devices, key},
+          {:row, :subscriptions, {person, key}},
+          {:row, :cursors, {person, key}}
+        ]
       )
 
   defp dispatch_call(
@@ -2723,7 +2764,8 @@ defmodule AttentionServer.Relay do
            Engine.setup_agent_fixture(state.store.engine, person, id, key, senders),
            person,
            "local_fixture",
-           "agent_fixture_setup"
+           "agent_fixture_setup",
+           [{:row, :agents, key}]
          )
 
   defp dispatch_call({:setup_agent_fixture, _, _, _, _}, _from, state),
@@ -2736,7 +2778,8 @@ defmodule AttentionServer.Relay do
         Engine.revoke_agent_fixture(state.store.engine, key),
         get_in(state.store.engine.agents, [key, :person]),
         "local_owner_fixture",
-        "agent_fixture_revoke"
+        "agent_fixture_revoke",
+        [{:row, :agents, key}]
       )
 
   defp dispatch_call({:revoke_agent_fixture, _}, _from, state),
@@ -2747,11 +2790,11 @@ defmodule AttentionServer.Relay do
          _from,
          %{agent_fixture_mode: true} = state
        ) do
-    case Engine.fixture_agent_answer(state.store.engine, key, frame) do
-      {:ok, next_engine, fields} ->
+    case track_fact(state, &Engine.fixture_agent_answer(&1, key, frame)) do
+      {next_engine, {:ok, fields}, touched} ->
         person = get_in(state.store.engine.agents, [key, :person])
 
-        case commit(state.store, next_engine, %{
+        case commit_request(state.store, next_engine, touched, %{
                person: person,
                actor: key,
                action: "agent_fixture_answer"
@@ -2760,7 +2803,7 @@ defmodule AttentionServer.Relay do
           {:error, _, _} -> {:reply, {:error, :storage_unavailable}, state}
         end
 
-      {:error, reason, field, _terminal} ->
+      {_, {:error, reason, field, _terminal}, _} ->
         {:reply, {:error, reason, field}, state}
     end
   end
@@ -2776,7 +2819,8 @@ defmodule AttentionServer.Relay do
       Engine.setup_sender(state.store.engine, key, pattern),
       person,
       "local_setup",
-      "sender_setup"
+      "sender_setup",
+      [{:row, :sender_grants, {person, key}}]
     )
   end
 
@@ -2797,7 +2841,8 @@ defmodule AttentionServer.Relay do
       ),
       person,
       "local_source_owner_fixture",
-      "source_report_grant"
+      "source_report_grant",
+      [{:row, :source_report_grants, {person, key, source}}]
     )
   end
 
@@ -2814,7 +2859,8 @@ defmodule AttentionServer.Relay do
       Engine.revoke_source_report(state.store.engine, person, key, source),
       person,
       "local_source_owner_fixture",
-      "source_report_revoke"
+      "source_report_revoke",
+      [{:row, :source_report_grants, {person, key, source}}]
     )
   end
 
@@ -2840,7 +2886,8 @@ defmodule AttentionServer.Relay do
            ),
            person,
            "local_owner_fixture",
-           "enrollment_read_grant"
+           "enrollment_read_grant",
+           [{:row, :enrollment_read_grants, grant_id}]
          )
 
   defp dispatch_call({:grant_enrollment_read_fixture, _, _, _, _, _, _}, _from, state),
@@ -2857,7 +2904,8 @@ defmodule AttentionServer.Relay do
            Engine.revoke_enrollment_read(state.store.engine, person, grant_id),
            person,
            "local_owner_fixture",
-           "enrollment_read_revoke"
+           "enrollment_read_revoke",
+           [{:row, :enrollment_read_grants, grant_id}]
          )
 
   defp dispatch_call({:revoke_enrollment_read_fixture, _, _}, _from, state),
@@ -7462,17 +7510,10 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  defp setup(state, result, person, actor, action, addresses \\ nil)
-
   defp setup(state, {:ok, next_engine}, person, actor, action, addresses) do
     audit = %{person: person, actor: actor, action: action}
 
-    result =
-      if addresses,
-        do: commit_known_rows(state.store, next_engine, audit, addresses),
-        else: commit(state.store, next_engine, audit)
-
-    case result do
+    case commit_known_rows(state.store, next_engine, audit, addresses) do
       {:ok, store} ->
         state = %{state | store: store}
         state = ensure_priority_view_if_missing(state, person)

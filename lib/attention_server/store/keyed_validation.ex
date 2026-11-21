@@ -58,7 +58,10 @@ defmodule AttentionServer.Store.KeyedValidation do
     :browser_sign_ins,
     :join_invitations,
     :hosted_accounts,
-    :delivery_states
+    :delivery_states,
+    :bounce_levels,
+    :maintainer_grants,
+    :enrollment_read_grants
   ]
 
   def authority_index(engine) do
@@ -166,8 +169,26 @@ defmodule AttentionServer.Store.KeyedValidation do
     if Map.has_key?(engine.owners, person), do: [{:person, person}], else: []
   end
 
-  defp authority_owners(engine, {:row, :delivery_states, person}) do
-    if Map.has_key?(engine.delivery_states, person), do: [{:person, person}], else: []
+  defp authority_owners(engine, {:row, field, person})
+       when field in [:delivery_states, :bounce_levels] do
+    if Map.has_key?(Map.fetch!(engine, field), person), do: [{:person, person}], else: []
+  end
+
+  defp authority_owners(engine, {:row, :maintainer_grants, id}) do
+    case Map.get(engine.maintainer_grants, id) do
+      %{target_person: target, grantee_person: grantee} -> [{:person, target}, {:person, grantee}]
+      _ -> []
+    end
+  end
+
+  defp authority_owners(engine, {:row, :enrollment_read_grants, id}) do
+    case Map.get(engine.enrollment_read_grants, id) do
+      %{person: person, connector: key, target: %{"key_fingerprint" => target}} ->
+        [{:person, person}, {:actor, key}, {:actor, target}]
+
+      _ ->
+        []
+    end
   end
 
   defp authority_owners(engine, {:row, :hosted_accounts, ref}) do
