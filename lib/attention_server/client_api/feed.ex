@@ -11,7 +11,14 @@ defmodule AttentionServer.ClientAPI.Feed do
   - Otherwise one JSON batch: `{changes, rev, more}`.
 
   The cursor is `Last-Event-ID`, which takes precedence, or `?after`. A cursor
-  older than the retained log is `410 cursor_expired`.
+  older than the retained log, or newer than the person's position, is
+  `410 cursor_expired`.
+
+  A batch's `rev` is the position it is complete through (contract round 12):
+  the rev of the last log row read. That is its last change's `rev`, or later
+  when trailing rows have no client form, such as a read-position fact, or
+  `after` when nothing was read. So a batch of only such rows still advances
+  and never loops.
   """
 
   @behaviour AttentionServer.ClientAPI.Routes
@@ -243,24 +250,28 @@ defmodule AttentionServer.ClientAPI.FeedStep do
     do: GenServer.call(relay, {:client_api, __MODULE__, {:read, principal, cursor, limit}})
 
   @doc false
-  def handle_call({:read, principal, cursor, limit}, _from, state) do
+  def handle_call({:read, principal, cursor, limit}, _from, state),
+    do: {:reply, read_rows(state, principal, cursor, limit), state}
+
+  # Only the read and render run in the Relay; the caller encodes and sends.
+  # A failure here answers storage_unavailable and never takes down the Relay.
+  defp read_rows(state, principal, cursor, limit) do
     person = principal.person
 
-    case ChangeLog.read(state.store, person, cursor, limit) do
-      {:ok, rows, more, position} ->
-        context = %{
-          engine: state.store.engine,
-          store: state.store,
-          view: Map.get(Map.get(state, :priority_views, %{}), person)
-        }
+    with {:ok, rows, more, position} <- ChangeLog.read(state.store, person, cursor, limit) do
+      context = %{
+        engine: state.store.engine,
+        store: state.store,
+        view: Map.get(Map.get(state, :priority_views, %{}), person)
+      }
 
-        renderer = renderer()
-        changes = Enum.flat_map(rows, &render(renderer, context, principal, &1))
-        {:reply, {:ok, changes, more, position}, state}
-
-      {:error, reason} ->
-        {:reply, {:error, reason}, state}
+      renderer = renderer()
+      {:ok, Enum.flat_map(rows, &render(renderer, context, principal, &1)), more, position}
     end
+  rescue
+    error ->
+      Diagnostics.failure(:client_api, :stream_read, error, :failed)
+      {:error, :storage_unavailable}
   end
 
   # A renderer defect must not take down the Relay: the row is skipped and
@@ -275,7 +286,7 @@ defmodule AttentionServer.ClientAPI.FeedStep do
     end
   rescue
     error ->
-      Diagnostics.failure(:client_api, :stream_write, error, :outcome_unknown)
+      Diagnostics.failure(:client_api, :stream_read, error, :rejected)
       []
   end
 
