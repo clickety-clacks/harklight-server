@@ -147,7 +147,8 @@ defmodule AttentionServer.ClientAPI.FeedStep do
         view: Map.get(Map.get(state, :priority_views, %{}), person)
       }
 
-      {:ok, Enum.flat_map(rows, &render(context, principal, &1)), more, position}
+      with {:ok, changes} <- render_rows(context, principal, rows),
+           do: {:ok, changes, more, position}
     else
       {:error, reason} when reason in [:cursor_expired, :unauthorized, :disabled] ->
         {:error, reason}
@@ -170,18 +171,45 @@ defmodule AttentionServer.ClientAPI.FeedStep do
     end
   end
 
-  defp render(context, principal, %{rev: rev, kind: kind} = row) do
-    case renderer().render(context, principal, row) do
-      {:ok, data} when is_map(data) ->
-        [%{"rev" => rev, "kind" => Atom.to_string(kind), "data" => data}]
+  # One render_many call per step, so each item's entries are built once for
+  # all of its rows (review H2). If it raises, the rows render one at a time,
+  # so a single bad row is skipped rather than the whole step.
+  defp render_rows(context, principal, rows) do
+    renderer = renderer()
 
-      _ ->
-        []
+    results =
+      if Code.ensure_loaded?(renderer) and function_exported?(renderer, :render_many, 3) do
+        try do
+          renderer.render_many(context, principal, rows)
+        rescue
+          error ->
+            Diagnostics.failure(:client_api, :stream_read, error, :rejected)
+            Enum.map(rows, &{&1, render_one(renderer, context, principal, &1)})
+        end
+      else
+        Enum.map(rows, &{&1, render_one(renderer, context, principal, &1)})
+      end
+
+    # A row the renderer could not render because its store failed fails the
+    # whole step: dropping it would leave a silent gap. A :skip row has no
+    # client form and is skipped.
+    if Enum.any?(results, &match?({_row, {:error, :storage_unavailable}}, &1)) do
+      {:error, :storage_unavailable}
+    else
+      changes =
+        for {%{rev: rev, kind: kind}, {:ok, data}} when is_map(data) <- results,
+            do: %{"rev" => rev, "kind" => Atom.to_string(kind), "data" => data}
+
+      {:ok, changes}
     end
+  end
+
+  defp render_one(renderer, context, principal, row) do
+    renderer.render(context, principal, row)
   rescue
     error ->
       Diagnostics.failure(:client_api, :stream_read, error, :rejected)
-      []
+      :skip
   end
 
   defp renderer,
