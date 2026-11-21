@@ -1414,7 +1414,7 @@ Writes return 200 unless the table says otherwise. Each response schema requires
   or missing target device answers `404 not_found`. The response returns
   the resolved device name and delivery state. The state is `sent` when
   the resolved target device is opted in and listed, its feed writer hands
-  the ephemeral `show` frame to the device's open HTTP/2 SSE stream, and
+  the ephemeral `show` frame to the device's open SSE stream, and
   `Plug.Conn.chunk` returns success. The handler waits for the writer's
   result up to the shared request timeout. Otherwise the state is `held`,
   including when the write fails or is skipped, the show has already been
