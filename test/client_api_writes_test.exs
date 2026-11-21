@@ -376,6 +376,28 @@ defmodule AttentionServer.ClientAPIWritesTest do
       assert {:error, "invalid_field", "text", false} =
                Writes.reply(relay, "reader", one, "", key())
 
+      # An item sent with no session has no conversation: unsupported, not
+      # not_found (contract rulings round 13), and nothing is stored.
+      assert %{"type" => "ok"} =
+               request(relay, "origin", %{
+                 "type" => "forward",
+                 "op_id" => op(80),
+                 "message" => %{
+                   "sender_id" => "app:test",
+                   "message_id" => "no-chat",
+                   "created_at" => 80,
+                   "title" => "No chat"
+                 }
+               })
+
+      no_chat = item_id(relay, "no-chat")
+
+      assert {:ok, %{"item" => %{"chat" => %{"available" => false}}}} =
+               Reads.item(relay, "reader", no_chat)
+
+      assert {:error, "unsupported", nil, false} =
+               Writes.reply(relay, "reader", no_chat, "Hi", key())
+
       # Today's refusals keep their tokens: the item's own origin is not its reader.
       assert {:error, "forbidden", nil, false} = Writes.reply(relay, "origin", one, "Me", key())
 
