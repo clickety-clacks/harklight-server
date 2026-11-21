@@ -193,7 +193,8 @@ defmodule AttentionServer.ClientAPI.Reads do
         end
 
       {:ok, {:inline, data, sha256}} ->
-        {:ok, file_result(byte_size(data), sha256, data: data)}
+        with {:ok, bytes} <- inline_bytes(data, sha256),
+             do: {:ok, file_result(byte_size(bytes), sha256, data: bytes)}
 
       error ->
         error
@@ -399,22 +400,31 @@ defmodule AttentionServer.ClientAPI.Reads do
     end
   end
 
-  defp inline_file(%{"data_base64" => data, "sha256" => sha256}) do
+  # The bytes are decoded and checked by the caller, outside the relay: large
+  # inline data lives in a file, and reading it must neither block the relay
+  # nor crash it when the file is missing or damaged.
+  defp inline_file(%{"data_base64" => data, "sha256" => sha256})
+       when is_binary(data) or is_struct(data, LargeData.Ref),
+       do: {:ok, {:inline, data, sha256}}
+
+  defp inline_file(_file), do: {:error, :not_found}
+
+  defp inline_bytes(data, sha256) do
     encoded =
       case data do
         %LargeData.Ref{} = ref -> LargeData.read!(ref)
-        data when is_binary(data) -> data
+        data -> data
       end
 
     with {:ok, bytes} <- Base.decode64(encoded),
          ^sha256 <- Base.encode16(:crypto.hash(:sha256, bytes), case: :lower) do
-      {:ok, {:inline, bytes, sha256}}
+      {:ok, bytes}
     else
       _ -> {:error, :storage_unavailable}
     end
+  rescue
+    ArgumentError -> {:error, :storage_unavailable}
   end
-
-  defp inline_file(_file), do: {:error, :not_found}
 
   defp render_item(state, principal, item_key, rank) do
     state.store.engine
