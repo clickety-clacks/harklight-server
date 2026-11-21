@@ -1355,8 +1355,8 @@ Writes return 200 unless the table says otherwise. Each response schema requires
   Transfer and use have independent histories. A later use may follow a
   failed transfer. A value or reason that disagrees with the prior report
   in the same dimension answers `409 already_closed`, and the request
-  applies neither report. If both reports repeat their existing values and
-  reasons, the response carries `duplicate: true`. The updated entry
+  applies neither report. If every supplied report repeats its existing value and
+  reason, the response carries `duplicate: true`. The updated entry
   carries the recorded transfer and use, with each report's reason when
   present.
 - **Advisory acknowledgment.** Supply the advisory's ID from the item.
