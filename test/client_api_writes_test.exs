@@ -159,12 +159,20 @@ defmodule AttentionServer.ClientAPIWritesTest do
       assert {:ok, 200, first, false} = Writes.seen(relay, "reader", one, k)
       {:ok, after_first} = head(relay)
 
-      # Another change moves the item on; the replay still answers the original.
+      # The receipt is compact: what the write changed, not the rendered body.
+      assert {:ok, %{status: 200, body: %{"item_id" => ^one}}} =
+               AttentionServer.ClientAPI.Idempotency.lookup(:sys.get_state(relay).store, "A", k)
+
+      assert {:ok, 200, ^first, true} = Writes.seen(relay, "reader", one, k)
+
+      # Another change moves the item on; a replay renders it now and applies nothing.
       discuss(relay, "one", 30, "A later note")
       {:ok, moved} = head(relay)
       assert moved > after_first
 
-      assert {:ok, 200, ^first, true} = Writes.seen(relay, "reader", one, k)
+      assert {:ok, 200, %{"rev" => ^moved, "item" => %{"item_id" => ^one, "seen" => true}}, true} =
+               Writes.seen(relay, "reader", one, k)
+
       assert head(relay) == {:ok, moved}
       assert changes_after(relay, moved) == []
       GenServer.stop(relay)
@@ -195,7 +203,9 @@ defmodule AttentionServer.ClientAPIWritesTest do
 
       # A device's key, resent by the same person's browser: the stored response.
       assert {:ok, 200, first, false} = Writes.seen(relay, "reader", one, k)
-      assert {:ok, 200, ^first, true} = Writes.seen(relay, browser, one, k)
+      assert {:ok, 200, replayed, true} = Writes.seen(relay, browser, one, k)
+      # Rendered for the browser that asked, which sees knocks.
+      assert Map.delete(replayed["item"], "as") == Map.delete(first["item"], "as")
       assert {:error, "idempotency_conflict", nil, false} = Writes.seen(relay, browser, two, k)
 
       # The same key is new for another person.
@@ -593,6 +603,40 @@ defmodule AttentionServer.ClientAPIWritesTest do
                Writes.answer(relay, "reader", one, 1, :no_comment, key())
 
       assert item["terminal"]["answer"] == %{"kind" => "no_comment"}
+      GenServer.stop(relay)
+    end
+
+    test "a refused request does not consume its key: the same request is evaluated again",
+         %{path: path, flags: flags} do
+      relay = scripted_relay(path, flags)
+      one = item_id(relay, "one")
+      k = key()
+
+      assert {:error, "stale_request", nil, false} =
+               Writes.answer(relay, "reader", one, 2, {:comment, "Yes"}, k)
+
+      assert {:ok, nil} =
+               AttentionServer.ClientAPI.Idempotency.lookup(:sys.get_state(relay).store, "A", k)
+
+      # The request moves to revision 2; the same request under the same key now applies.
+      message = :sys.get_state(relay).store.engine.messages[{"A", "app:test", "one"}].message
+
+      assert %{"type" => "ok"} =
+               request(relay, "origin", %{
+                 "type" => "conversation_revise",
+                 "op_id" => op(45),
+                 "sender_id" => "app:test",
+                 "message_id" => "one",
+                 "base_revision" => 1,
+                 "message" => Map.put(message, "title", "Revised")
+               })
+
+      assert {:ok, 200, %{"item" => %{"terminal" => %{"state" => "answered"}}} = body, false} =
+               Writes.answer(relay, "reader", one, 2, {:comment, "Yes"}, k)
+
+      assert {:ok, 200, ^body, true} =
+               Writes.answer(relay, "reader", one, 2, {:comment, "Yes"}, k)
+
       GenServer.stop(relay)
     end
 
