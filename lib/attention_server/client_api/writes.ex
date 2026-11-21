@@ -391,7 +391,7 @@ defmodule AttentionServer.ClientAPI.Writes do
         "message_id" => frame["message_id"],
         "revision" => frame["request_revision"],
         "name" => file.name,
-        "content_type" => file.content_type
+        client_api_v2_content_type: file.content_type
       }
 
       case upload(relay, engine_key, attrs, file) do

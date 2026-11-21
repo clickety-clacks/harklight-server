@@ -3249,6 +3249,10 @@ defmodule AttentionServer.Relay do
         last_activity_ms: System.system_time(:millisecond)
       }
 
+      # Client API v2 (POST /v2/files) keeps the sent Content-Type. Only that
+      # path sets this atom key; today's decoded-JSON attributes cannot.
+      base = put_client_content_type(base, attrs)
+
       previous =
         state.upload_index.ids_by_group
         |> Map.get(upload_group(person, key, attrs), MapSet.new())
@@ -3293,6 +3297,11 @@ defmodule AttentionServer.Relay do
         {:reply, {:error, :invalid_upload}, state}
     end
   end
+
+  defp put_client_content_type(base, %{client_api_v2_content_type: type}) when is_binary(type),
+    do: Map.put(base, :content_type, type)
+
+  defp put_client_content_type(base, _attrs), do: base
 
   defp upload_commit_call(state, key, upload, published, lease, context) do
     result =
