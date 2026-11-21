@@ -36,6 +36,7 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
   alias AttentionServer.ClientAPI.{Principal, Reads, Writes}
 
   @handle "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+  @other_handle "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
 
   setup_all do
     certs = TLSFixtures.create!()
@@ -429,6 +430,75 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
     assert replayed == Map.new(messages, &{&1["item_id"], &1})
   end
 
+  test "filtered agent SSE resumes across concurrent writes and converges with the snapshot", ctx do
+    assert :ok = Relay.setup_sender(ctx.relay, ctx.reader, "app:agent")
+    {conn, feed} = open_agent_feed(connect(ctx), "?session=#{@handle}")
+    {conn, feed} = await_open(conn, feed)
+    assert feed.status == 200
+
+    writer =
+      Task.async(fn ->
+        for n <- 1..40 do
+          session = if rem(n, 2) == 0, do: @handle, else: @other_handle
+
+          assert %{"type" => "ok"} =
+                   request(ctx.relay, ctx.reader, %{
+                     "type" => "forward",
+                     "op_id" => op(n),
+                     "session_handle" => session,
+                     "message" => %{
+                       "sender_id" => "app:agent",
+                       "message_id" => "concurrent-#{n}",
+                       "created_at" => n,
+                       "title" => "Concurrent #{n}"
+                     }
+                   })
+        end
+      end)
+
+    {conn, _feed, seen} = agent_messages(conn, feed, 3)
+    last_id = List.last(seen).id
+    Mint.HTTP.close(conn)
+
+    {conn, feed} =
+      open_agent_feed(connect(ctx), "?after=0&session=#{@handle}", [
+        {"last-event-id", Integer.to_string(last_id)}
+      ])
+
+    {conn, feed} = await_open(conn, feed)
+    assert feed.status == 200
+    {conn, _feed, resumed} = agent_messages(conn, feed, 17)
+    Task.await(writer, 10_000)
+    all = seen ++ resumed
+    assert Enum.all?(all, &(&1.data["session"] == @handle))
+    ids = Enum.map(all, & &1.id)
+    assert ids == Enum.sort(Enum.uniq(ids))
+    assert Enum.any?(Enum.chunk_every(ids, 2, 1, :discard), fn [a, b] -> b > a + 1 end)
+    replayed = Map.new(all, &{&1.data["item_id"], &1.data})
+
+    {:ok, conn, ref} =
+      Mint.HTTP.request(conn, "GET", "/v2/agent/messages?session=#{@handle}", [], nil)
+
+    {_conn, response} = collect(conn, ref)
+    assert response.status == 200
+    assert {:ok, %{"messages" => messages}} = JSON.decode_line(response.body <> "\n")
+    assert replayed == Map.new(messages, &{&1["item_id"], &1})
+  end
+
+  defp agent_messages(conn, feed, count, acc \\ [])
+
+  defp agent_messages(conn, feed, 0, acc), do: {conn, feed, Enum.reverse(acc)}
+
+  defp agent_messages(conn, feed, count, acc) do
+    case events(conn, feed, 1) do
+      {conn, feed, [%{event: "message"} = event]} ->
+        agent_messages(conn, feed, count - 1, [event | acc])
+
+      {conn, feed, [%{event: kind}]} when kind in ["heartbeat", "entry"] ->
+        agent_messages(conn, feed, count, acc)
+    end
+  end
+
   test "a live agent feed starts and stops focus when its see grant changes", ctx do
     Application.put_env(:attention_server, :client_api_feed_heartbeat_ms, 80)
     on_exit(fn -> Application.delete_env(:attention_server, :client_api_feed_heartbeat_ms) end)
@@ -496,9 +566,9 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
     assert Process.alive?(ctx.relay)
   end
 
-  defp open_agent_feed(conn) do
+  defp open_agent_feed(conn, query \\ "", headers \\ []) do
     {:ok, conn, ref} =
-      Mint.HTTP.request(conn, "GET", "/v2/agent/changes", [{"accept", "text/event-stream"}], nil)
+      Mint.HTTP.request(conn, "GET", "/v2/agent/changes" <> query, [{"accept", "text/event-stream"} | headers], nil)
 
     {conn, %{ref: ref, buffer: "", status: nil, headers: [], done: false}}
   end
