@@ -263,7 +263,6 @@ defmodule AttentionServer.ClientAPIFeedConvergenceTest do
     run(relay, rank_keys: false)
   end
 
-  @tag skip: "waits on the change log's rank rows (review finding F3)"
   test "clients converge including rank keys, after every step", %{relay: relay} do
     run(relay, rank_keys: true)
   end

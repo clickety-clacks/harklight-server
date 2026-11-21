@@ -18,67 +18,8 @@ defmodule AttentionServer.ClientAPISchema do
 
   defp compact(block), do: block |> String.split("\n") |> Enum.map_join(" ", &String.trim/1)
 
-  @doc """
-  The contract's defs, from docs/client-api-v2.md, with the delivery owner's
-  rulings of round 7 (with its addendum), rounds 8, 9, 15 and 16 applied where the
-  document does not carry them yet. Every step is a no-op once it does;
-  remove the overlay then.
-  """
-  def contract_defs(path), do: path |> defs() |> pending_rulings()
-
-  @level %{"enum" => ["now", "high", "normal", "low"]}
-
-  defp pending_rulings(defs) do
-    defs
-    |> update_in(["Entry", "properties", "kind", "enum"], &Enum.uniq(&1 ++ ["result"]))
-    |> update_in(["Entry", "properties"], fn properties ->
-      properties
-      |> Map.put_new("result", %{"$ref" => "#/$defs/OriginResult"})
-      |> Map.put_new("priority", %{
-        "type" => "object",
-        "required" => ["level"],
-        "properties" => %{"level" => @level, "score" => %{"type" => "number"}}
-      })
-    end)
-    |> update_in(["Chat", "properties"], fn properties ->
-      properties
-      |> Map.put_new("reply_priority", %{
-        "type" => "object",
-        "required" => ["level"],
-        "properties" => %{
-          "level" => @level,
-          "score" => %{"type" => "number"},
-          "due_at_ms" => %{"$ref" => "#/$defs/TimeMs"}
-        }
-      })
-      # Round 5: null outside free order (today's ranked reply rows).
-      |> Map.update!("reply_group", fn
-        %{"enum" => values} = group when is_list(values) ->
-          %{"oneOf" => [%{"type" => "null"}, Map.take(group, ["enum"])]}
-
-        group ->
-          group
-      end)
-    end)
-    |> update_in(["Item", "required"], &List.delete(&1, "created_at_ms"))
-    |> update_in(
-      ["Item", "properties"],
-      &Map.put_new(&1, "arrival", %{"type" => "integer", "minimum" => 1})
-    )
-    # Round 15.
-    |> update_in(["Rank", "properties"], &Map.put_new(&1, "level", @level))
-    |> update_in(["AnswerOutcome"], fn outcome ->
-      outcome
-      |> update_in(["properties", "kind", "enum"], &Enum.uniq(&1 ++ ["choice", "result"]))
-      |> update_in(["properties"], fn properties ->
-        properties
-        |> Map.put_new("id", %{"type" => "string"})
-        |> Map.put_new("label", %{"type" => "string"})
-      end)
-    end)
-    # Round 9.
-    |> update_in(["Item", "properties"], &Map.put_new(&1, "thread", %{"type" => "string"}))
-  end
+  @doc "The contract's defs, from docs/client-api-v2.md."
+  def contract_defs(path), do: defs(path)
 
   def errors(defs, name, value), do: check(defs, Map.fetch!(defs, name), value, name)
 
