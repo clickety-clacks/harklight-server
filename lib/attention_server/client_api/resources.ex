@@ -237,7 +237,9 @@ defmodule AttentionServer.ClientAPI.Resources do
   unchanged.
   """
   def revision(%Engine{} = engine, key, n) when is_integer(n) do
-    with %{revisions: %{^n => message}} = record <- Map.get(engine.messages, key) do
+    with %{message: current} = record <- Map.get(engine.messages, key),
+         message when is_map(message) <-
+           Map.get(Map.get(record, :revisions, %{1 => current}), n) do
       files = record |> Map.get(:files_by_revision, %{}) |> Map.get(n, [])
 
       {:ok,
@@ -256,18 +258,20 @@ defmodule AttentionServer.ClientAPI.Resources do
     do: %{"unresolved" => Map.get(engine.route_b_index.unresolved_count_by_person, person, 0)}
 
   # Today's `opened`: Seen for the current substantive revision.
-  defp seen?(engine, {person, sender, id} = key, record) do
+  def seen?(engine, {person, sender, id} = key, record) do
+    revision = Map.get(record, :revision, 1)
+
     substantive =
       case Map.get(engine.bounce_revisions, key) do
         %{raw_to_substantive: raw_to_substantive} = state ->
           Map.get(
             raw_to_substantive,
-            record.revision,
-            Map.get(state, :current_substantive_revision, record.revision)
+            revision,
+            Map.get(state, :current_substantive_revision, revision)
           )
 
         _ ->
-          record.revision
+          revision
       end
 
     MapSet.member?(engine.opened_revisions, {person, sender, id, substantive})
@@ -400,7 +404,7 @@ defmodule AttentionServer.ClientAPI.Resources do
 
   # Today's person-facing answer_outcome (contract rulings round 4, item 3).
   # The origin-only raw answer is never included.
-  defp answer_outcome(record, terminal) do
+  def answer_outcome(record, terminal) do
     case {Map.get(terminal, :kind), terminal.by, terminal.answer_present, terminal.answer} do
       {"no_comment", _, _, _} ->
         %{"kind" => "no_comment"}
@@ -488,11 +492,11 @@ defmodule AttentionServer.ClientAPI.Resources do
   defp text_or_nil(value) when is_binary(value), do: value
   defp text_or_nil(_), do: nil
 
-  defp origin_result(%{origin_result: %{status: status, revision: revision} = result}) do
+  def origin_result(%{origin_result: %{status: status, revision: revision} = result}) do
     put_present(%{"status" => status, "revision" => revision}, "result_ref", result[:result_ref])
   end
 
-  defp origin_result(_), do: nil
+  def origin_result(_), do: nil
 
   defp file_refs(files, prefix) when is_list(files) do
     files
@@ -1085,6 +1089,44 @@ defmodule AttentionServer.ClientAPI.Resources do
     end
   end
 
+  @doc false
+  def agent_entry(engine, {person, _, _} = key, record, position) do
+    with %{key: ^key, payload: payload} <- Map.get(engine.conversation_events, {person, position}) do
+      index = engine.route_b_index
+      id = payload["in_reply_to"]
+      related = AttentionServer.RouteBIndex.entry_position(index, key, id)
+      by_event_id = if related, do: %{id => related}, else: %{}
+
+      results =
+        if payload["kind"] == "result",
+          do: %{position => AttentionServer.RouteBIndex.result_revision(index, key, position)},
+          else: %{}
+
+      context = %{
+        by_event_id: by_event_id,
+        results: results,
+        replies: %{},
+        engine: engine,
+        person: person
+      }
+
+      case entry(item_id(record), record, position, payload, context) do
+        %{"author" => "person"} = projected ->
+          projected
+          |> Map.put("delivery", %{"delivered" => false, "acted" => false})
+          |> Map.put(@sources, [position])
+
+        %{} = projected ->
+          Map.put(projected, @sources, [position])
+
+        nil ->
+          nil
+      end
+    else
+      _ -> nil
+    end
+  end
+
   defp delivery_effect(%{"kind" => "receipt", "delivered" => true, "event_id" => id}),
     do: {"delivered", id}
 
@@ -1102,7 +1144,7 @@ defmodule AttentionServer.ClientAPI.Resources do
       "entry_id" => entry_id(seq),
       "item_id" => item_id,
       "position" => seq,
-      "request_revision" => Map.get(payload, "request_revision") || record.revision
+      "request_revision" => Map.get(payload, "request_revision") || Map.get(record, :revision, 1)
     }
 
     case kind do

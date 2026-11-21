@@ -161,9 +161,9 @@ defmodule AttentionServer.ClientAPI.Reads do
   # Only the parameters a read takes; anything else in the query is ignored.
   defp query(conn, names), do: Map.take(conn.query_params, names)
 
-  defp respond(conn, result, etag_of \\ &etag/1)
+  def respond(conn, result, etag_of \\ &etag/1)
 
-  defp respond(conn, {:ok, body}, etag_of) do
+  def respond(conn, {:ok, body}, etag_of) do
     tag = etag_of.(body)
 
     conn =
@@ -176,10 +176,10 @@ defmodule AttentionServer.ClientAPI.Reads do
       else: Errors.send_json(conn, 200, body)
   end
 
-  defp respond(conn, {:error, token}, _etag_of),
+  def respond(conn, {:error, token}, _etag_of),
     do: Errors.send_error(conn, Atom.to_string(token))
 
-  defp respond(conn, {:error, token, field}, _etag_of),
+  def respond(conn, {:error, token, field}, _etag_of),
     do: Errors.send_error(conn, Atom.to_string(token), field: field)
 
   # If-None-Match uses the weak comparison (RFC 9110 §13.1.2).
@@ -438,21 +438,22 @@ defmodule AttentionServer.ClientAPI.Reads do
       # about an unreadable flags file where it reads it for itself.
       {flags, _warned} = FeatureFlags.read(state.feature_flags_path, true)
 
-      {:ok,
-       %{
-         "account" => %{
-           "state" =>
-             if(Engine.delivery_stopped?(engine, principal.person), do: "paused", else: "active")
-         },
-         "features" => Map.new(@client_features, &{&1, Map.get(flags, &1) == true}),
-         "limits" => %{
-           "upload_cap_bytes_per_file" =>
-             if(state.upload_cap == :none, do: "none", else: state.upload_cap),
-           "inline_decoded_bytes_per_entry" => ConversationFiles.inline_limit(),
-           "answer_ui_limits" => UI1.published_limits(),
-           "retention_days" => @retention_days
-         }
-       }}
+      response = %{
+        "account" => %{
+          "state" =>
+            if(Engine.delivery_stopped?(engine, principal.person), do: "paused", else: "active")
+        },
+        "features" => Map.new(@client_features, &{&1, Map.get(flags, &1) == true}),
+        "limits" => %{
+          "upload_cap_bytes_per_file" =>
+            if(state.upload_cap == :none, do: "none", else: state.upload_cap),
+          "inline_decoded_bytes_per_entry" => ConversationFiles.inline_limit(),
+          "answer_ui_limits" => UI1.published_limits(),
+          "retention_days" => @retention_days
+        }
+      }
+
+      {:ok, with_sender_names(response, engine, principal)}
     end
   end
 
@@ -482,6 +483,13 @@ defmodule AttentionServer.ClientAPI.Reads do
       end
     end
   end
+
+  defp with_sender_names(response, engine, %{kind: :device, person: person, key: key}) do
+    names = engine.sender_grants |> Map.get({person, key}, []) |> Enum.sort()
+    Map.put(response, "sender_names", names)
+  end
+
+  defp with_sender_names(response, _engine, _principal), do: response
 
   # The bytes are decoded and checked by the caller, outside the relay: large
   # inline data lives in a file, and reading it must neither block the relay
@@ -673,7 +681,7 @@ defmodule AttentionServer.ClientAPI.Reads do
 
   ## Parameters
 
-  defp limit(params) do
+  def limit(params) do
     case Map.get(params, "limit") do
       nil -> {:ok, @default_limit}
       value -> parse_limit(value)
@@ -691,16 +699,16 @@ defmodule AttentionServer.ClientAPI.Reads do
 
   defp parse_limit(_value), do: {:error, :invalid_field, "limit"}
 
-  defp revision_number(n) when is_integer(n) and n > 0, do: {:ok, n}
+  def revision_number(n) when is_integer(n) and n > 0, do: {:ok, n}
 
-  defp revision_number(n) when is_binary(n) do
+  def revision_number(n) when is_binary(n) do
     case Integer.parse(n) do
       {value, ""} when value > 0 -> {:ok, value}
       _ -> {:error, :not_found}
     end
   end
 
-  defp revision_number(_n), do: {:error, :not_found}
+  def revision_number(_n), do: {:error, :not_found}
 
   defp page(params) do
     case Map.get(params, "page") do
@@ -718,7 +726,7 @@ defmodule AttentionServer.ClientAPI.Reads do
     end
   end
 
-  defp before(params, entries) do
+  def before(params, entries) do
     case Map.get(params, "before") do
       nil ->
         {:ok, nil}
