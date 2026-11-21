@@ -23,7 +23,8 @@ defmodule AttentionServer.ClientAPIFeedConvergenceTest do
              Relay.start_link(
                store_path: Path.join(dir, "state.sqlite3"),
                feature_flags_path: flags,
-               agent_fixture_mode: true
+               agent_fixture_mode: true,
+               push_enabled: true
              )
 
     on_exit(fn -> if Process.alive?(relay), do: GenServer.stop(relay) end)
@@ -59,7 +60,8 @@ defmodule AttentionServer.ClientAPIFeedConvergenceTest do
   end
 
   # The script, one step at a time: arrivals, a chat, a receipt, answers, an
-  # open, a read on another device, a revision, a retraction and a result.
+  # open, a read on another device, a revision, a retraction, a result,
+  # priority levels and a push registration.
   defp steps(relay) do
     [
       fn -> forward(relay, "one", 2) end,
@@ -151,6 +153,24 @@ defmodule AttentionServer.ClientAPIFeedConvergenceTest do
           "message_id" => "two",
           "in_reply_to" => terminal,
           "status" => "received"
+        })
+      end,
+      fn ->
+        request(relay, "reader", %{
+          "type" => "levels_set",
+          "ref" => "levels",
+          "op_id" => op(18),
+          "levels" => [%{"name" => "Routine", "lower_bound" => 0, "bounce_after_days" => nil}]
+        })
+      end,
+      fn ->
+        request(relay, "reader", %{
+          "type" => "push_register",
+          "op_id" => op(19),
+          "revision" => 1,
+          "profile_id" => "harklight-sandbox",
+          "address_kind" => "apns_token",
+          "address" => String.duplicate("ab", 32)
         })
       end,
       # Last, on an item nothing touches afterwards: a missed row would show.
@@ -248,6 +268,9 @@ defmodule AttentionServer.ClientAPIFeedConvergenceTest do
         do: assert({id, model.entries[id]} == {id, entry})
 
     assert model.counts == final.counts
+
+    # A client holds settings once a settings row or a snapshot has given them.
+    if model.settings, do: assert(model.settings == final.settings)
   end
 
   # Rank keys move when other items do, and the change log writes rank rows
@@ -302,6 +325,10 @@ defmodule AttentionServer.ClientAPIFeedConvergenceTest do
       if joined, do: assert_converged(joined, now, rank_keys: keys?)
       joined = if index == half - 1, do: now, else: joined
       {live, joined}
+    end)
+    |> then(fn {live, _joined} ->
+      # The levels and push steps reached the client that started empty.
+      assert live.settings == snapshot(relay).settings
     end)
   end
 end
