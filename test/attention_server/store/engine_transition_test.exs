@@ -368,9 +368,11 @@ defmodule AttentionServer.Store.EngineTransitionTest do
     next =
       put_in(next.advisory_feeds[scope], %{
         high: 1,
-        entries: %{1 => %{"advisory_id" => "id"}},
+        entries: %{1 => %{"advisory_id" => "id", "sender_id" => "sender", "message_id" => "item"}},
         receipts: MapSet.new()
       })
+
+    next = put_in(next.advisory_id_index[{scope, "id"}], 1)
 
     keys =
       MapSet.new([

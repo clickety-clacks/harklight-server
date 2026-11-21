@@ -7,6 +7,7 @@ defmodule AttentionServer.ClientAPIListenerTest do
 
   alias AttentionServer.{
     ClientAPI,
+    ClientAPIFeedClient,
     DashboardBrowserSession,
     DashboardHTTPS,
     DeviceIdentity,
@@ -472,6 +473,198 @@ defmodule AttentionServer.ClientAPIListenerTest do
     end
   end
 
+  describe "owner-registered agents on the device port" do
+    test "a registered agent reads the full view with empty grants", ctx do
+      {relay, person, owner, agent, port} = start_granted_agent(ctx, true, "granted")
+      assert :ok = Relay.setup_device(relay, person, "fixture-origin")
+
+      for {sender, id, n} <- [{"app:first", "first", 1}, {"app:second", "second", 2}] do
+        forward_granted_fixture(relay, sender, id, n)
+      end
+
+      assert {:ok, conn} = device_connect(Map.put(ctx, :port, port), "granted", :http2)
+      assert {:ok, conn, %{status: 200} = inbox} = request(conn, "GET", "/v2/inbox")
+      assert %{"items" => items, "counts" => %{"unresolved" => 2}} = json(inbox)
+      assert Enum.sort(Enum.map(items, & &1["sender"])) == ["app:first", "app:second"]
+
+      conn =
+        Enum.reduce(items, conn, fn item, conn ->
+          Enum.reduce(["", "/entries", "/revisions/1"], conn, fn suffix, conn ->
+            assert {:ok, conn, %{status: 200}} =
+                     request(conn, "GET", "/v2/items/" <> item["item_id"] <> suffix)
+
+            conn
+          end)
+        end)
+
+      assert {:ok, conn, %{status: 200} = batch} = request(conn, "GET", "/v2/changes")
+      changes = json(batch)["changes"]
+
+      assert Enum.sort(for(%{"kind" => "item", "data" => item} <- changes, do: item["sender"])) ==
+               ["app:first", "app:second"]
+
+      visible = hd(items)["item_id"]
+
+      conn =
+        Enum.reduce(
+          [
+            {"POST", "/v2/items/" <> visible <> "/replies"},
+            {"POST", "/v2/items/" <> visible <> "/seen"},
+            {"PUT", "/v2/devices/me/focus"},
+            {"DELETE", "/v2/files/anything"},
+            {"POST", "/v2/agent/messages"},
+            {"GET", "/v2/settings"},
+            {"GET", "/v2/files/anything"}
+          ],
+          conn,
+          fn {method, path}, conn ->
+            assert {:ok, conn, %{status: 403} = denied} = request(conn, method, path)
+            assert json(denied)["error"] == "forbidden"
+            conn
+          end
+        )
+
+      {conn, feed} = ClientAPIFeedClient.open_feed(conn, "?after=#{json(batch)["rev"]}")
+      {conn, feed} = ClientAPIFeedClient.await_open(conn, feed)
+      assert feed.status == 200
+
+      assert :ok = Relay.owner_revoke_agent(relay, person, owner, agent)
+      {conn, feed, closing} = ClientAPIFeedClient.until_closing(conn, feed)
+      assert closing == %{event: "closing", data: %{"reason" => "revoked"}}
+      {conn, %{done: true}} = ClientAPIFeedClient.drain(conn, feed)
+      assert {:ok, _, %{status: 401}} = request(conn, "GET", "/v2/inbox")
+    end
+
+    test "search keeps literal matching, exact filters, and newest-first paging", ctx do
+      {relay, person, owner, agent, port} = start_granted_agent(ctx, true, "granted-search")
+      assert :ok = Relay.setup_device(relay, person, "fixture-origin")
+      number = %JSON.DecimalToken{raw: "0.12345678901234567890123456789"}
+      needle = number.raw
+
+      forward_granted_fixture(relay, "app:alpha", "first", 1, [%{"text" => needle}])
+      forward_granted_fixture(relay, "app:beta", "numeric", 2, [%{needle => number}])
+      forward_granted_fixture(relay, "app:beta", "last", 3, [%{"text" => needle}])
+
+      assert {:ok, conn} = device_connect(Map.put(ctx, :port, port), "granted-search", :http2)
+      path = "/v2/search?q=" <> needle
+      assert {:ok, conn, %{status: 200} = first} = request(conn, "GET", path <> "&limit=1")
+
+      assert %{
+               "rev" => rev,
+               "items" => [%{"sender" => "app:beta", "message" => %{"message_id" => "last"}}],
+               "next_page" => page
+             } = json(first)
+
+      assert is_integer(rev) and rev > 0
+      assert byte_size(page) <= 4_096
+      forward_granted_fixture(relay, "app:beta", "new", 4, [%{"text" => needle}])
+
+      assert :ok =
+               Relay.owner_replace_agent_grants(relay, person, owner, agent, 1, ["app:beta"], [
+                 "app:beta"
+               ])
+
+      assert {:ok, conn, %{status: 200} = second} =
+               request(conn, "GET", path <> "&limit=4&page=" <> page)
+
+      assert %{"items" => [%{"message" => %{"message_id" => "first"}}]} = json(second)
+      refute Map.has_key?(json(second), "next_page")
+
+      assert {:ok, conn, %{status: 200} = exact} =
+               request(
+                 conn,
+                 "GET",
+                 path <> "&sender=app:alpha&message_id=first&state=open&limit=500"
+               )
+
+      assert %{"items" => [%{"message" => %{"message_id" => "first"}}]} = json(exact)
+
+      assert {:ok, conn, %{status: 404}} =
+               request(conn, "GET", path <> "&sender=app:beta&message_id=numeric")
+
+      assert {:ok, conn, %{status: 400} = invalid} =
+               request(conn, "GET", "/v2/search?q=different&page=" <> page)
+
+      assert %{"error" => "invalid_field", "field" => "page"} = json(invalid)
+
+      oversized_page = "s" <> String.duplicate("a", 4_096)
+
+      assert {:ok, _conn, %{status: 400} = oversized} =
+               request(conn, "GET", path <> "&page=" <> oversized_page)
+
+      assert %{"error" => "invalid_field", "field" => "page"} = json(oversized)
+    end
+
+    test "the legacy device listener does not admit an agent certificate with the flag off",
+         ctx do
+      {_relay, _person, _owner, _agent, port} = start_granted_agent(ctx, false, "granted-off")
+
+      case raw_connect(ctx.certs, port, "granted-off") do
+        {:error, {:tls_alert, {:handshake_failure, _}}} ->
+          :ok
+
+        {:ok, socket} ->
+          assert {:error, {:tls_alert, {:handshake_failure, _}}} = :ssl.recv(socket, 0, 5_000)
+      end
+    end
+  end
+
+  defp start_granted_agent(ctx, enabled, name) do
+    flags = Path.join(ctx.dir, "flags.json")
+    File.write!(flags, JSON.encode!(%{"client_api_v2" => enabled}))
+
+    server =
+      start_supervised!({Server, Keyword.put(server_opts(ctx), :feature_flags_path, flags)})
+
+    relay = Server.relay(server)
+    owner_der = TLSFixtures.certificate_der!(ctx.certs, "a1")
+    assert {:ok, person} = Relay.operator_bootstrap(relay, owner_der)
+    assert {:ok, owner} = DeviceIdentity.from_certificate(owner_der)
+
+    TLSFixtures.make_self_signed_client!(ctx.certs, name)
+
+    assert {:ok, agent} =
+             DeviceIdentity.from_certificate(TLSFixtures.certificate_der!(ctx.certs, name))
+
+    assert :ok =
+             Relay.owner_register_agent(
+               relay,
+               person,
+               owner,
+               "00000000-0000-4000-8000-000000000001",
+               agent
+             )
+
+    assert {:ok, _reader} =
+             Relay.setup_device_certificate(
+               relay,
+               person,
+               TLSFixtures.certificate_der!(ctx.certs, "a2")
+             )
+
+    {relay, person, owner, agent, Server.port(server)}
+  end
+
+  defp forward_granted_fixture(relay, sender, id, n, nested \\ []) do
+    assert :ok = Relay.setup_sender(relay, "fixture-origin", sender)
+
+    frame = %{
+      "v" => 1,
+      "type" => "forward",
+      "op_id" => "00000000-0000-4000-8000-00000000000#{n}",
+      "message" => %{
+        "sender_id" => sender,
+        "message_id" => id,
+        "created_at" => n,
+        "title" => id,
+        "unknown" => %{"nested" => nested}
+      }
+    }
+
+    assert {:ok, line} = Relay.request_line(relay, "fixture-origin", JSON.encode!(frame) <> "\n")
+    assert {:ok, %{"type" => "ok"}} = JSON.decode_line(line)
+  end
+
   describe "flag off" do
     test "the web origin answers 404 on /v2 and stays HTTP/1.1 only", ctx do
       ctx = Map.merge(ctx, web_origin(ctx, []))
@@ -487,6 +680,16 @@ defmodule AttentionServer.ClientAPIListenerTest do
         end)
 
       assert {:ok, _conn, %{status: 200}} = request(conn, "GET", "/sign-in")
+    end
+
+    test "the web origin does not mount the upload discard route", ctx do
+      ctx = Map.merge(ctx, web_origin(ctx, []))
+      assert {:ok, conn} = browser_connect(ctx, :http1)
+      headers = [{"cookie", cookie(ctx.cookie)}]
+
+      assert {:ok, _conn, response} = request(conn, "DELETE", "/v2/files/fs-test", headers)
+      assert response.status == 404
+      assert header(response, "request-id") == []
     end
 
     test "the server starts today's /relay WebSocket and no /v2 listener", ctx do

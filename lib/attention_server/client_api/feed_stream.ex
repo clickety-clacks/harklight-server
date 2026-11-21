@@ -16,6 +16,11 @@ defmodule AttentionServer.ClientAPI.FeedStream do
       the Relay exits;
     - `cursor_expired` when the position falls out of retention mid-stream;
     - `storage_unavailable` when a mid-stream read fails (round 17).
+  - A device's feed also carries its held shows (round 11 r4 §3b): an
+    `event: show` with the show's data and no `id:` line. A show comes from
+    the Relay's memory-only focus state (`ClientAPI.Focus`), never from the
+    change log, so it is never in a batch, never replayed on resume, and
+    never moves the cursor. Its `held_ms` is its age when written.
   - The feed's ID is its `Request-Id`. It is logged at open, and at close
     with the reason, `client_closed` when the client went away.
 
@@ -38,7 +43,7 @@ defmodule AttentionServer.ClientAPI.FeedStream do
   require Logger
 
   alias AttentionServer.{ChangeLog, JSON}
-  alias AttentionServer.ClientAPI.{Context, Feed, FeedShutdown, FeedStep}
+  alias AttentionServer.ClientAPI.{Context, Feed, FeedShutdown, FeedStep, Focus}
 
   # Rows per Relay step. Smaller than a batch's 500, so a long backlog
   # interleaves with other work in the Relay.
@@ -52,6 +57,7 @@ defmodule AttentionServer.ClientAPI.FeedStream do
     watcher = watch(ctx)
     :ok = ChangeLog.subscribe_closing(ctx.principal)
     :ok = FeedShutdown.subscribe()
+    subscribe_shows(ctx.principal)
 
     try do
       open(conn, ctx, cursor, watcher)
@@ -59,8 +65,10 @@ defmodule AttentionServer.ClientAPI.FeedStream do
       send(watcher, {:feed_done, self()})
       ChangeLog.unsubscribe_closing(ctx.principal)
       FeedShutdown.unsubscribe()
+      unsubscribe_shows(ctx.principal)
       flush_wakeups()
       flush_closings()
+      flush_shows()
     end
   end
 
@@ -82,6 +90,7 @@ defmodule AttentionServer.ClientAPI.FeedStream do
             cursor: position,
             watcher: watcher,
             relay: monitor(ctx.relay),
+            last_show_id: nil,
             timer: nil,
             timer_ref: nil
           })
@@ -141,6 +150,9 @@ defmodule AttentionServer.ClientAPI.FeedStream do
       {:DOWN, ref, :process, _pid, _reason} when ref == state.relay ->
         closing(conn, state, "server_shutdown")
 
+      {:client_api_show, device_key} when device_key == state.ctx.principal.key ->
+        write_pending_show(conn, state)
+
       {:feed_heartbeat, ref} when ref == state.timer ->
         case chunk_safely(conn, "event: heartbeat\ndata: {}\n\n") do
           {:ok, conn} -> wait(conn, schedule_heartbeat(state))
@@ -167,6 +179,52 @@ defmodule AttentionServer.ClientAPI.FeedStream do
     after
       0 -> :ok
     end
+  end
+
+  # Shows are held per device; a browser has none.
+  defp subscribe_shows(%{kind: :device, key: key}), do: Focus.subscribe_shows(key)
+  defp subscribe_shows(_principal), do: :ok
+
+  defp unsubscribe_shows(%{kind: :device, key: key}), do: Focus.unsubscribe_shows(key)
+
+  defp unsubscribe_shows(_principal), do: :ok
+
+  defp flush_shows do
+    receive do
+      {:client_api_show, _device_key} -> flush_shows()
+    after
+      0 -> :ok
+    end
+  end
+
+  defp write_pending_show(conn, state) do
+    case pending_show(state.ctx) do
+      %{"show_id" => id} = data when id != state.last_show_id ->
+        event = ["event: show\ndata: ", JSON.encode!(data), "\n\n"]
+
+        case chunk_safely(conn, event) do
+          {:ok, conn} -> wait(conn, %{state | last_show_id: id})
+          {:error, _reason} -> finish(conn, state, "client_closed")
+        end
+
+      %{"show_id" => _id} ->
+        wait(conn, state)
+
+      {:error, :unauthorized} ->
+        closing(conn, state, "revoked")
+
+      {:error, :server_shutdown} ->
+        closing(conn, state, "server_shutdown")
+
+      nil ->
+        wait(conn, state)
+    end
+  end
+
+  defp pending_show(ctx) do
+    Focus.pending_show(ctx.relay, ctx.principal)
+  catch
+    :exit, _reason -> {:error, :server_shutdown}
   end
 
   defp send_changes(conn, []), do: {:ok, conn}

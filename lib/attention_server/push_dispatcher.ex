@@ -105,22 +105,30 @@ defmodule AttentionServer.PushDispatcher.Worker do
 
   use GenServer
 
+  require Logger
+
   alias AttentionServer.{APNS, Diagnostics, Relay}
 
   @idle_interval 1_000
+  # Provisional until the bounded path records real provider attempt durations.
+  @default_attempt_timeout_ms 20_000
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts)
 
   @impl true
   def init(opts) do
     relay = Keyword.fetch!(opts, :relay)
-    apns = opts |> Keyword.fetch!(:apns) |> APNS.prepare!()
+    apns_opts = Keyword.fetch!(opts, :apns)
+    apns = APNS.prepare!(apns_opts)
     :ok = Relay.enable_push(relay)
 
     state = %{
       relay: relay,
       apns: apns,
       apns_send: Keyword.get(opts, :apns_send, &APNS.send/3),
+      bounded_attempts?: Keyword.get(opts, :bounded_attempts, false),
+      attempt_timeout_ms:
+        Keyword.get(apns_opts, :attempt_timeout_ms, @default_attempt_timeout_ms),
       cached_token: nil
     }
 
@@ -141,7 +149,7 @@ defmodule AttentionServer.PushDispatcher.Worker do
         schedule(@idle_interval, state)
 
       {:ok, claim} ->
-        {outcome, cached_token} = state.apns_send.(state.apns, claim, state.cached_token)
+        {outcome, cached_token} = send_attempt(state, claim)
 
         case relay_call(:push_finish, claim.claim_id, fn ->
                Relay.finish_push(state.relay, claim, outcome, System.system_time(:millisecond))
@@ -184,6 +192,32 @@ defmodule AttentionServer.PushDispatcher.Worker do
   @impl true
   def format_status(status) do
     Map.update!(status, :state, &Map.drop(&1, [:cached_token, :apns]))
+  end
+
+  defp send_attempt(%{bounded_attempts?: false} = state, claim) do
+    state.apns_send.(state.apns, claim, state.cached_token)
+  end
+
+  defp send_attempt(state, claim) do
+    # The linked task owns the passive Mint connection. Stop it before handing
+    # the serial dispatch lane to the next claim.
+    started_at = System.monotonic_time(:millisecond)
+    task = Task.async(fn -> state.apns_send.(state.apns, claim, state.cached_token) end)
+
+    {result, outcome} =
+      case Task.yield(task, state.attempt_timeout_ms) do
+        {:ok, {%{state: outcome}, _cached_token} = result} ->
+          {result, outcome}
+
+        nil ->
+          _ = Task.shutdown(task, :brutal_kill)
+          Diagnostics.failure(:apns_dispatch, :push_request, :timeout, :retry, claim.claim_id)
+          {{%{state: "retry"}, state.cached_token}, "timeout"}
+      end
+
+    duration_ms = System.monotonic_time(:millisecond) - started_at
+    Logger.info("event=harklight_apns_attempt duration_ms=#{duration_ms} outcome=#{outcome}")
+    result
   end
 
   defp schedule(delay, state) do

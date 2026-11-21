@@ -886,11 +886,20 @@ defmodule AttentionServer.ClientAPIWritesTest do
       assert {:error, "precondition_failed", nil, false} =
                Writes.push(relay, "reader", String.duplicate("cd", 32), "sandbox", 1)
 
+      # PUT is idempotent: the same binding again, with no key, is an unchanged success.
+      {:ok, position} = head(relay)
+      assert {:ok, 200, ^body, false} = Writes.push(relay, "reader", @token, "production", 1)
+      assert head(relay) == {:ok, position}
+
       assert {:ok, 200, %{"settings" => %{"push" => push}}, false} =
                Writes.remove_push(relay, "reader")
 
       assert %{"state" => "canceled", "revision" => 2} = push
       refute Map.has_key?(push, "environment")
+
+      # Removing again changes nothing.
+      assert {:ok, 200, %{"settings" => %{"push" => ^push}}, false} =
+               Writes.remove_push(relay, "reader")
 
       # Another device's binding is its own.
       assert {:ok, %{"settings" => %{"push" => %{"state" => "unconfigured"}}}} =
@@ -1292,6 +1301,13 @@ defmodule AttentionServer.ClientAPIWritesTest do
     assert {:ok, 200, %{"entry" => %{"files" => [_]}}, false} =
              Writes.reply(relay, browser, one, "From the web", [from_browser], key())
 
+    # Two staged files with one name cannot go in one reply: a client fix, not a retry.
+    assert {201, %{"file_id" => twin}, _} =
+             send_file(relay, "other bytes", [{"idempotency-key", key()}])
+
+    assert {:error, "invalid_field", "file_ids", false} =
+             Writes.reply(relay, "reader", one, "Both", [file_id, twin], key())
+
     # Another person's staged file cannot be named.
     stranger = %Principal{person: "B", kind: :device, key: "stranger"}
 
@@ -1300,6 +1316,41 @@ defmodule AttentionServer.ClientAPIWritesTest do
 
     assert {:error, "invalid_field", "file_ids", false} =
              Writes.reply(relay, "reader", one, "x", [theirs], key())
+
+    GenServer.stop(relay)
+  end
+
+  test "bodies as large as today's path accepts are accepted: a long reply, a large UI/1 result",
+       %{path: path, flags: flags} do
+    relay = scripted_relay(path, flags)
+    long = String.duplicate("a long pasted reply ", 10_000)
+    assert byte_size(long) > 64 * 1024
+
+    assert {200, %{"entry" => %{"text" => ^long}}, _} =
+             post(
+               relay,
+               ["items", item_id(relay, "one"), "replies"],
+               JSON.encode!(%{"text" => long}),
+               [
+                 {"idempotency-key", key()}
+               ]
+             )
+
+    forward_message(
+      relay,
+      60,
+      %{"message_id" => "big-form", "message_type" => "request", "answer_ui" => @form},
+      [%{"name" => "cover.png", "data_base64" => Base.encode64("not image bytes")}]
+    )
+
+    result = for n <- 1..4_000, do: %{"choice" => "blue", "note" => "row #{n}"}
+    body = JSON.encode!(%{"request_revision" => 1, "result" => result})
+    assert byte_size(body) > 64 * 1024
+
+    assert {200, %{"item" => %{"terminal" => %{"state" => "answered"}}}, _} =
+             post(relay, ["items", item_id(relay, "big-form"), "answer"], body, [
+               {"idempotency-key", key()}
+             ])
 
     GenServer.stop(relay)
   end

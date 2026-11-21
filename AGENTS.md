@@ -97,6 +97,11 @@ the available release route. Tagging and
 publishing need no additional human approval. Fix a bad release on `main` and
 ship a new release; do not patch a deployment by hand.
 
+End every release's notes with a **Compatibility** paragraph. Name the protocol
+version (0.1 or 0.2) and list the verified compatible versions of Harklight
+Server, the app, the web client, and Harklight Agent. For releases using
+protocol 0.1, state that protocol 0.2 supersedes it.
+
 The intended process is CI publishing releases, but this repository currently
 has no automatic release-building or publishing workflow. Implementing that
 automation is separate work. Source CI does not publish, and publishing does

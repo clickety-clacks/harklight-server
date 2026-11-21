@@ -7,7 +7,7 @@ defmodule AttentionServer.AgentChangeLog do
 
   import AttentionServer.ChangeLog.SQLite, only: [all: 3, one: 3, run: 3]
 
-  alias AttentionServer.{ChangeLog, Engine, Store}
+  alias AttentionServer.{ChangeLog, Engine, RouteBIndex, Store}
   alias Exqlite.Sqlite3
 
   @schema """
@@ -51,16 +51,16 @@ defmodule AttentionServer.AgentChangeLog do
         {seq, key, payload}
       end
 
+    advisories = advisory_changes(old, next, changed)
+
     messages =
       [
         changed.messages,
         changed.bounce,
         changed.opened,
-        for(
-          {_seq, key, %{"kind" => kind}} <- entries,
-          kind in ~w(receipt delivery_ack acted),
-          do: key
-        )
+        changed_sessions(old, next),
+        Enum.map(advisories, &elem(&1, 0)),
+        for({_, key, payload} <- entries, answer_receipt?(next, key, payload), do: key)
       ]
       |> Enum.concat()
       |> Enum.uniq()
@@ -70,11 +70,18 @@ defmodule AttentionServer.AgentChangeLog do
       end)
 
     entries =
-      Enum.flat_map(entries, fn {seq, key, _payload} ->
-        item_row(next, key, :entry, fn -> ChangeLog.entry_resource(seq) end)
+      entries
+      |> Enum.flat_map(fn {seq, key, payload} ->
+        case entry_position(next, key, seq, payload) do
+          nil -> []
+          position -> item_row(next, key, :entry, fn -> ChangeLog.entry_resource(position) end)
+        end
       end)
+      |> Enum.uniq()
 
-    (messages ++ entries ++ advisory_changes(old, next, changed))
+    advisory_rows = Enum.map(advisories, &elem(&1, 1))
+
+    (messages ++ entries ++ advisory_rows)
     |> Enum.group_by(fn {agent, _row} -> agent end, fn {_agent, row} -> row end)
   end
 
@@ -88,25 +95,65 @@ defmodule AttentionServer.AgentChangeLog do
     end
   end
 
-  defp advisory_changes(old, next, %{advisories: keys}) do
-    for {{person, agent, session} = scope, seq} <- Enum.sort(keys),
-        seq > (get_in(old.advisory_feeds, [scope, :high]) || 0),
-        %{"advisory_id" => id} <- [get_in(next.advisory_feeds, [scope, :entries, seq])],
-        do: {{person, agent}, {:advisory, "advisory:" <> id, session}}
+  defp entry_position(_engine, _key, seq, %{"kind" => kind})
+       when kind in ~w(discussion reply revision availability retraction result),
+       do: seq
+
+  defp entry_position(engine, key, _seq, %{"kind" => kind, "event_id" => id})
+       when kind in ~w(receipt delivery_ack acted file_transfer file_use),
+       do: RouteBIndex.entry_position(engine.route_b_index, key, id)
+
+  defp entry_position(_engine, _key, _seq, _payload), do: nil
+
+  defp answer_receipt?(engine, {person, _, _} = key, %{"kind" => kind, "event_id" => id})
+       when kind in ~w(receipt delivery_ack acted) and is_binary(id) do
+    with %{terminal: %{seq: seq, state: "answered"}} <- Map.get(engine.messages, key),
+         %{payload: %{"event_id" => ^id}} <- Map.get(engine.events, {person, seq}) do
+      true
+    else
+      _ -> false
+    end
   end
 
-  defp advisory_changes(old, next, _changed) do
-    old.advisory_feeds
-    |> changed_keys(next.advisory_feeds)
+  defp answer_receipt?(_engine, _key, _payload), do: false
+
+  defp changed_sessions(old, next) do
+    old.origin_sessions
+    |> changed_keys(next.origin_sessions)
+    |> Enum.flat_map(fn scope ->
+      was_gone = get_in(old.origin_sessions, [scope, :gone]) == true
+      gone = get_in(next.origin_sessions, [scope, :gone]) == true
+
+      if was_gone != gone do
+        RouteBIndex.session_messages(next.route_b_index, scope)
+      else
+        []
+      end
+    end)
+  end
+
+  defp advisory_changes(old, next, changed) do
+    changed
+    |> Map.get_lazy(:advisory_scopes, fn -> changed_keys(old.advisory_feeds, next.advisory_feeds) end)
     |> Enum.sort()
     |> Enum.flat_map(fn {person, agent, session} = key ->
       case Map.get(next.advisory_feeds, key) do
-        %{high: high, entries: entries} ->
-          previous_high = get_in(old.advisory_feeds, [key, :high]) || 0
+        %{high: high, entries: entries, receipts: receipts} ->
+          previous = Map.get(old.advisory_feeds, key, %{high: 0, receipts: MapSet.new()})
 
-          for seq <- (previous_high + 1)..high//1,
-              %{"advisory_id" => id} <- [Map.get(entries, seq)],
-              do: {{person, agent}, {:advisory, "advisory:" <> id, session}}
+          created =
+            for seq <- (previous.high + 1)..high//1,
+                %{"advisory_id" => id} <- [Map.get(entries, seq)],
+                do: id
+
+          acknowledged = receipts |> MapSet.difference(previous.receipts) |> Enum.sort()
+
+          for id <- Enum.uniq(created ++ acknowledged),
+              seq = Map.fetch!(next.advisory_id_index, {key, id}),
+              %{"sender_id" => sender, "message_id" => message_id} <- [Map.fetch!(entries, seq)],
+              do:
+                {{person, sender, message_id},
+                 {{person, agent}, {:advisory, resource_id({:advisory, id}), session}}}
 
         nil ->
           []

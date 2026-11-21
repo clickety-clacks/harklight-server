@@ -87,6 +87,10 @@ defmodule AttentionServer.Engine do
             route_b_index: %{
               resolved_messages_by_person: %{},
               conversations_by_item: %{},
+              agent_feed?: false,
+              entry_positions: %{},
+              advisory_sequences: %{},
+              messages_by_origin_session: %{},
               conversation_summary_by_item: %{},
               unresolved_count_by_person: %{}
             }

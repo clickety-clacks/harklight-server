@@ -1025,25 +1025,33 @@ defmodule AttentionServer.ClientAPIResourcesTest do
       end
     end
 
-    # The change log's hook passes the keys it stored as previous. Keeping
-    # them must cost about linear time: 4x the ids, not 16x (quadratic).
+    # The old patience sort copied a growing tuple at every step. Count
+    # allocated words so the test catches those copies regardless of GC or load.
     test "keeping previous keys scales linearly, whether nothing or something moved" do
       cost = fn n, shuffle? ->
         ids = Enum.map(1..n, &"i#{&1}")
         previous = Resources.rank_keys(%{}, ids)
         order = if shuffle?, do: Enum.reverse(Enum.take(ids, 10)) ++ Enum.drop(ids, 10), else: ids
 
-        1..3
-        |> Enum.map(fn _ ->
-          elem(:timer.tc(fn -> Resources.rank_keys(previous, order) end), 0)
-        end)
-        |> Enum.min()
+        trace = :trace.session_create(:rank_key_allocations, self(), [])
+        target = {Resources, :rank_keys, 2}
+        pid = self()
+
+        try do
+          assert :trace.function(trace, target, true, [:call_memory]) == 1
+          assert :trace.process(trace, pid, true, [:call]) == 1
+          Resources.rank_keys(previous, order)
+          assert {:call_memory, [{^pid, 1, words}]} = :trace.info(trace, target, :call_memory)
+          words
+        after
+          :trace.session_destroy(trace)
+        end
       end
 
       for shuffle? <- [false, true] do
         small = cost.(5_000, shuffle?)
         large = cost.(20_000, shuffle?)
-        assert large < max(small, 2_000) * 8, "#{small} us for 5k, #{large} us for 20k"
+        assert large < small * 8, "#{small} allocated words for 5k, #{large} for 20k"
       end
     end
 

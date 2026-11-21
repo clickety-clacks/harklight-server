@@ -16,10 +16,12 @@ defmodule AttentionServer.ClientAPI.Focus do
   is the show's age when it is written.
 
   The feed (C5) calls `subscribe_shows/1` for a device principal and then
-  receives `{:client_api_show, device_key, show}` for each show held for it.
+  receives `{:client_api_show, device_key}` whenever a show is held for it.
+  The feed reads the current held show from the relay just before writing
+  the id-less event, when it computes the show's age (round 11 r4 §4).
   """
 
-  alias AttentionServer.ClientAPI.{Resources, Writes}
+  alias AttentionServer.ClientAPI.{Reads, Resources, Writes}
 
   @registry AttentionServer.ChangeLog.Registry
 
@@ -32,20 +34,51 @@ defmodule AttentionServer.ClientAPI.Focus do
     end
   end
 
+  @doc """
+  Ends the calling process's show subscription for `device_key`, for a feed
+  that closes in a process that lives on (HTTP/1.1 connection reuse).
+  """
+  @spec unsubscribe_shows(String.t()) :: :ok
+  def unsubscribe_shows(device_key) when is_binary(device_key),
+    do: Registry.unregister(@registry, {:client_api_show, device_key})
+
   @doc false
-  # Called by the Relay when it holds a show; sends it to the device's open
-  # feeds. With no feed open, or the registry not running, it does nothing.
-  def held(engine, device_key, held, now) do
+  # The held show stays in the relay. This only wakes subscribed feeds.
+  def notify_show(device_key) do
     if Process.whereis(@registry) do
       Registry.dispatch(@registry, {:client_api_show, device_key}, fn entries ->
-        case show(engine, device_key, held, now) do
-          nil -> :ok
-          show -> for {pid, _} <- entries, do: send(pid, {:client_api_show, device_key, show})
-        end
+        for {pid, _} <- entries, do: send(pid, {:client_api_show, device_key})
       end)
     end
 
     :ok
+  end
+
+  @doc "Reads the current held show for an authenticated device with an active focus report."
+  def pending_show(relay, principal),
+    do: GenServer.call(relay, {:client_api, __MODULE__, {:pending_show, principal}}, :infinity)
+
+  @doc false
+  def handle_call({:pending_show, principal}, _from, state) do
+    engine = state.store.engine
+
+    data =
+      case Reads.client_principal(engine, principal) do
+        {:ok, %{kind: :device, key: key}} ->
+          # Ending focus stops live delivery while leaving the show held for
+          # the device's next accepted focus report.
+          with %{client_api_token: _} <- Map.get(state.focus_clients, key),
+               %{} = held <- Map.get(state.held_shows, key) do
+            show(engine, key, held, state.clock.())
+          else
+            _ -> nil
+          end
+
+        _ ->
+          {:error, :unauthorized}
+      end
+
+    {:reply, data, state}
   end
 
   @doc "The wire form of a held show for `device_key`, or nil if its item is gone."
@@ -83,16 +116,30 @@ defmodule AttentionServer.ClientAPI.Focus do
   end
 
   @doc false
-  # Schedules the lapse of a focus report: after `ttl_ms` with no newer report
-  # (a newer report carries a new token), the device's focus ends.
-  def schedule_lapse(relay, device_key, token, ttl_ms) do
-    {:ok, _ref} = :timer.apply_after(ttl_ms, __MODULE__, :lapse, [relay, device_key, token])
-    :ok
+  # Schedules the lapse of a focus report and returns its token: after
+  # `ttl_ms` with no newer report, the device's focus ends. The token carries
+  # the timer, so a renewal cancels it (cancel_lapse/1) and only one timer per
+  # device is live; a stale timer would do nothing anyway (the token differs).
+  def schedule_lapse(relay, device_key, ttl_ms) do
+    id = make_ref()
+
+    {:ok, timer} =
+      :timer.apply_after(ttl_ms, __MODULE__, :lapse, [relay, device_key, {:lapse, id}])
+
+    {:lapse, id, timer}
   end
 
   @doc false
-  def lapse(relay, device_key, token) do
-    GenServer.call(relay, {:client_api, Writes, {:focus_lapse, device_key, token}}, 30_000)
+  def cancel_lapse({:lapse, _id, timer}) do
+    _ = :timer.cancel(timer)
+    :ok
+  end
+
+  def cancel_lapse(_none), do: :ok
+
+  @doc false
+  def lapse(relay, device_key, {:lapse, id}) do
+    GenServer.call(relay, {:client_api, Writes, {:focus_lapse, device_key, id}}, 30_000)
   catch
     :exit, _ -> :ok
   end

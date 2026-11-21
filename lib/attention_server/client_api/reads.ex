@@ -31,7 +31,7 @@ defmodule AttentionServer.ClientAPI.Reads do
     UI1
   }
 
-  alias AttentionServer.ClientAPI.{Context, Errors, Resources}
+  alias AttentionServer.ClientAPI.{Context, Errors, Resources, Search}
 
   # The client features still behind an operator flag at 0.2 (contract §4).
   @client_features ~w(server_matched_push_routing priority_level_editing)
@@ -45,10 +45,11 @@ defmodule AttentionServer.ClientAPI.Reads do
   @impl true
   def routes do
     [
-      {"GET", ["inbox"], :get_inbox},
-      {"GET", ["items", :item_id], :get_item},
-      {"GET", ["items", :item_id, "entries"], :get_entries},
-      {"GET", ["items", :item_id, "revisions", :n], :get_revision},
+      {"GET", ["inbox"], :get_inbox, granted_agent: true},
+      {"GET", ["search"], :get_search, granted_agent: true},
+      {"GET", ["items", :item_id], :get_item, granted_agent: true},
+      {"GET", ["items", :item_id, "entries"], :get_entries, granted_agent: true},
+      {"GET", ["items", :item_id, "revisions", :n], :get_revision, granted_agent: true},
       {"GET", ["settings"], :get_settings},
       {"GET", ["me"], :get_me},
       {"GET", ["files", :file_id], :get_file}
@@ -59,6 +60,29 @@ defmodule AttentionServer.ClientAPI.Reads do
   def get_inbox(conn, %Context{} = ctx) do
     conn = fetch_query_params(conn)
     respond(conn, inbox(ctx.relay, ctx.principal, query(conn, ~w(limit page))))
+  end
+
+  @doc false
+  def get_search(conn, %Context{principal: %{kind: :agent} = principal} = ctx) do
+    conn = fetch_query_params(conn)
+    params = query(conn, ~w(q sender message_id state limit page))
+    respond(conn, search(ctx.relay, principal, params))
+  end
+
+  def get_search(conn, %Context{}), do: Errors.send_error(conn, "not_found")
+
+  defp search(relay, who, params) do
+    with {:ok, filters, limit} <- Search.query(params),
+         {:ok, principal, current_high, position} <- call(relay, {:search_snapshot, who}),
+         binding = Search.binding(principal, filters),
+         {:ok, high, before} <- Search.position(params["page"], current_high, binding),
+         {:ok, matches} <-
+           Search.matches(filters, before, limit, fn sequence ->
+             call(relay, {:search_candidates, who, position, sequence, filters})
+           end),
+         {:ok, items} <- call(relay, {:search_items, who, position, matches}) do
+      Search.response(position, items, filters, %{limit: limit, high: high, binding: binding})
+    end
   end
 
   @doc false
@@ -305,6 +329,47 @@ defmodule AttentionServer.ClientAPI.Reads do
     end
   end
 
+  defp read({:search_snapshot, who}, state) do
+    engine = state.store.engine
+
+    with {:ok, %{kind: :agent, person: person} = principal} <- principal(engine, who),
+         :ok <- ChangeLog.ranks_available(state.store, person),
+         {:ok, position} <- head(state, person) do
+      {:ok, principal, Map.get(engine.persons, person, 0), position}
+    end
+  end
+
+  defp read({:search_candidates, who, position, sequence, filters}, state) do
+    engine = state.store.engine
+
+    with {:ok, %{kind: :agent, person: person}} <- principal(engine, who),
+         :ok <- search_position(state, person, position) do
+      {:ok, Search.candidates(engine, person, sequence, filters)}
+    end
+  end
+
+  defp read({:search_items, who, position, matches}, state) do
+    engine = state.store.engine
+
+    with {:ok, %{kind: :agent, person: person} = principal} <- principal(engine, who),
+         :ok <- ChangeLog.ranks_available(state.store, person),
+         :ok <- search_position(state, person, position) do
+      context = %{engine: engine, store: state.store, view: view(state, person)}
+
+      items =
+        Enum.map(matches, fn {seq, key} ->
+          with {:ok, id} <- Resources.item_id(engine, key),
+               {:ok, rank} <- item_rank(context, person, id) do
+            {seq, render_item(state, principal, key, rank)}
+          else
+            {:error, token} -> throw({:client_api_read, token})
+          end
+        end)
+
+      {:ok, items}
+    end
+  end
+
   defp read({:item, key, item_id}, state) do
     engine = state.store.engine
 
@@ -477,6 +542,16 @@ defmodule AttentionServer.ClientAPI.Reads do
     end
   end
 
+  defp principal(engine, %{kind: :agent, person: person, key: key}) do
+    case Engine.agent_identity(engine, key) do
+      {:ok, ^person, id, _revision} ->
+        {:ok, %{person: person, key: key, id: id, kind: :agent, senders: MapSet.new()}}
+
+      _ ->
+        {:error, :unauthorized}
+    end
+  end
+
   defp principal(engine, %{kind: :device, key: key}), do: principal(engine, key)
 
   defp principal(engine, key) when is_binary(key) do
@@ -554,6 +629,14 @@ defmodule AttentionServer.ClientAPI.Reads do
   # Positions and resource revs come from the change log, in this same relay
   # step. Ranks have no rows of their own yet, so rank keys are recomputed from
   # the current order until the change log keeps the keys it last emitted.
+
+  defp search_position(state, person, position) do
+    case head(state, person) do
+      {:ok, ^position} -> :ok
+      {:ok, _new_position} -> {:error, :retry_later}
+      error -> error
+    end
+  end
 
   defp head(state, person) do
     case ChangeLog.head(state.store, person) do

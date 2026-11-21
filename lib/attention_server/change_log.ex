@@ -246,6 +246,7 @@ defmodule AttentionServer.ChangeLog do
       )
     )
     |> Map.put(:settings, touched_settings(touched, old, next))
+    |> Map.put(:advisory_scopes, for({:advisory, scope, _} <- touched, into: MapSet.new(), do: scope))
     |> Map.put(:advisories, for({:advisory, scope, {:entry, seq}} <- touched, do: {scope, seq}))
   end
 
@@ -420,6 +421,15 @@ defmodule AttentionServer.ChangeLog do
             do: {{:device, key}, :revoked}
       end
 
+    agents =
+      if old.agents === next.agents do
+        []
+      else
+        for {key, %{revoked: false}} <- old.agents,
+            not match?(%{revoked: false}, Map.get(next.agents, key)),
+            do: {{:agent, key}, :revoked}
+      end
+
     paused =
       if old.delivery_states === next.delivery_states do
         []
@@ -441,7 +451,7 @@ defmodule AttentionServer.ChangeLog do
             do: {{:owner, person}, :revoked}
       end
 
-    devices ++ paused ++ owners
+    devices ++ agents ++ paused ++ owners
   end
 
   def closings(old, next, touched) do
@@ -499,6 +509,9 @@ defmodule AttentionServer.ChangeLog do
   def subscribe_closing(%{kind: :device, key: key, person: person}),
     do: register_closing([{:device, key}, {:person, person}])
 
+  def subscribe_closing(%{kind: :agent, key: key, person: person}),
+    do: register_closing([{:agent, key}, {:person, person}])
+
   def subscribe_closing(%{kind: :browser, session_id: session_id, person: person} = principal) do
     owner_key = Map.get(principal, :key)
     device = if is_binary(owner_key), do: [{:device, owner_key}], else: []
@@ -519,6 +532,9 @@ defmodule AttentionServer.ChangeLog do
   """
   def unsubscribe_closing(%{kind: :device, key: key, person: person}),
     do: unregister_closing([{:device, key}, {:person, person}])
+
+  def unsubscribe_closing(%{kind: :agent, key: key, person: person}),
+    do: unregister_closing([{:agent, key}, {:person, person}])
 
   def unsubscribe_closing(%{kind: :browser, session_id: session_id, person: person} = principal) do
     owner_key = Map.get(principal, :key)

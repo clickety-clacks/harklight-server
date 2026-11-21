@@ -5,23 +5,61 @@ defmodule AttentionServer.RouteBIndex do
     %{
       resolved_messages_by_person: %{},
       conversations_by_item: %{},
+      agent_feed?: false,
+      entry_positions: %{},
+      advisory_sequences: %{},
+      messages_by_origin_session: %{},
       conversation_summary_by_item: %{},
       unresolved_count_by_person: %{}
     }
   end
 
   def rebuild(engine) do
+    index = %{new() | agent_feed?: Map.get(engine.route_b_index, :agent_feed?, false)}
+
     index =
-      Enum.reduce(engine.messages, new(), fn {key, record}, current ->
+      Enum.reduce(engine.messages, index, fn {key, record}, current ->
         put_message(current, key, nil, record)
       end)
 
-    Enum.reduce(engine.conversation_events, index, fn {{person, seq}, event}, current ->
-      put_conversation_event(current, person, seq, event.key, event.payload)
+    index =
+      Enum.reduce(engine.conversation_events, index, fn {{person, seq}, event}, current ->
+        put_conversation_event(current, person, seq, event.key, event.payload)
+      end)
+
+    index_advisories(index, engine.advisory_feeds)
+  end
+
+  def enable_agent_feed(%{route_b_index: %{agent_feed?: true}} = engine), do: engine
+
+  def enable_agent_feed(engine) do
+    index = %{engine.route_b_index | agent_feed?: true}
+
+    index =
+      Enum.reduce(engine.messages, index, fn {key, record}, current ->
+        put_session_message(current, key, nil, record)
+      end)
+
+    index =
+      Enum.reduce(engine.conversation_events, index, fn {{_, seq}, event}, current ->
+        put_entry_position(current, event.key, seq, event.payload)
+      end)
+
+    %{engine | route_b_index: index_advisories(index, engine.advisory_feeds)}
+  end
+
+  defp index_advisories(%{agent_feed?: true} = index, feeds) do
+    Enum.reduce(feeds, index, fn {{person, _, _}, feed}, current ->
+      Enum.reduce(feed.entries, current, fn {seq, item}, acc ->
+        put_advisory(acc, {person, item["sender_id"], item["message_id"]}, seq)
+      end)
     end)
   end
 
+  defp index_advisories(index, _feeds), do: index
+
   def put_message(index, {person, sender, id} = key, previous, record) do
+    index = put_session_message(index, key, previous, record)
     previous_resolved? = match?(%{terminal: terminal} when not is_nil(terminal), previous)
     current_resolved? = not is_nil(record.terminal)
 
@@ -60,6 +98,8 @@ defmodule AttentionServer.RouteBIndex do
     tree = :gb_trees.enter({-seq, seq}, seq, tree)
     index = put_in(index, [:conversations_by_item, key], tree)
 
+    index = put_entry_position(index, key, seq, payload)
+
     summary =
       Map.get(index.conversation_summary_by_item, key, %{
         latest_seq: 0,
@@ -96,6 +136,46 @@ defmodule AttentionServer.RouteBIndex do
 
     put_in(index, [:conversation_summary_by_item, key], summary)
   end
+
+  def put_advisory(%{agent_feed?: true} = index, item, seq),
+    do:
+      update_in(
+        index.advisory_sequences,
+        &Map.update(&1, item, [seq], fn seqs -> [seq | seqs] end)
+      )
+
+  def put_advisory(index, _item, _seq), do: index
+
+  def advisory_sequences(index, item), do: Map.get(index.advisory_sequences, item, [])
+
+  def entry_position(index, key, id), do: Map.get(index.entry_positions, {key, id})
+
+  def session_messages(index, {person, origin, session}),
+    do: get_in(index.messages_by_origin_session, [{person, origin}, session]) || []
+
+  defp put_entry_position(%{agent_feed?: true} = index, key, seq, %{
+         "kind" => kind,
+         "event_id" => id
+       })
+       when kind in ["discussion", "reply", "revision"] and is_binary(id),
+       do: put_in(index.entry_positions[{key, id}], seq)
+
+  defp put_entry_position(index, _key, _seq, _payload), do: index
+
+  # Message ownership and session are fixed at acceptance.
+  defp put_session_message(%{agent_feed?: true} = index, {person, _, _} = key, nil, %{
+         origin: origin,
+         session_handle: session
+       })
+       when is_binary(origin) and is_binary(session) do
+    update_in(index.messages_by_origin_session, fn sessions ->
+      Map.update(sessions, {person, origin}, %{session => [key]}, fn own ->
+        Map.update(own, session, [key], &[key | &1])
+      end)
+    end)
+  end
+
+  defp put_session_message(index, _key, _previous, _record), do: index
 
   defp unresolved_delta(previous, record) do
     previous_unresolved? = match?(%{terminal: nil}, previous)

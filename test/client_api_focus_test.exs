@@ -198,7 +198,12 @@ defmodule AttentionServer.ClientAPIFocusTest do
     at(ctx, 5_000)
     assert {:ok, %{"client_id" => "reader", "delivery" => "held"}} = push_view(relay, "chat")
 
-    assert_receive {:client_api_show, "reader", live}, 1_000
+    assert_receive {:client_api_show, "reader"}, 1_000
+
+    # The feed computes held_ms when it writes the event (round 11 r4 §4).
+    live = Focus.pending_show(relay, "reader")
+    at(ctx, 5_400)
+    assert Focus.pending_show(relay, "reader")["held_ms"] == 400
 
     assert %{"device_id" => "reader", "item_id" => ^item, "target" => "chat", "held_ms" => 0} =
              live
@@ -211,6 +216,15 @@ defmodule AttentionServer.ClientAPIFocusTest do
     assert show["show_id"] == live["show_id"]
     assert show["held_ms"] == 750
     assert Map.delete(show, "held_ms") == Map.delete(live, "held_ms")
+    assert Focus.pending_show(relay, "reader") == nil
+
+    # A feed that closes unsubscribes; later shows are not sent to it.
+    :ok = Focus.unsubscribe_shows("reader")
+    assert {:ok, _} = push_view(relay, "message")
+    refute_receive {:client_api_show, "reader"}, 200
+
+    assert {:ok, 200, %{"show" => %{"target" => "message"}}, false} =
+             Writes.focus(relay, "reader", %{"screen" => "inbox", "ttl_s" => 120})
 
     # Consumed: the next write carries none. A show never marks anything Seen.
     assert {:ok, 200, body, false} =
