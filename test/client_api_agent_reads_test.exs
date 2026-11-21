@@ -189,24 +189,35 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
       assert Enum.any?(changes, &(get_in(&1, ["data", "entry_id"]) == entry))
     end
 
-    test "a committed reply survives a response fault and keyed replay", ctx do
-      fault_on_entry(:any)
-      path = "/v2/items/" <> ctx.item <> "/replies"
-      body = %{"text" => "Committed before the response"}
+    for {stage, probe_key} <- [{"entry projection", :entry}, {"renderer setup", :feed}] do
+      test "a committed reply survives a fault in #{stage} and keyed replay", ctx do
+        probe_key = unquote(probe_key)
 
-      assert_internal_error(request(ctx, "a2", "POST", path, body, 2))
-      assert Server.relay(ctx.server) == ctx.relay
+        Application.put_env(:attention_server, :client_api_projection_fault, fn
+          {:entry, _id} when probe_key == :entry -> raise "deterministic projection fault"
+          ^probe_key -> raise "deterministic projection fault"
+          _ -> :ok
+        end)
 
-      assert_internal_error(request(ctx, "a2", "POST", path, body, 2))
-      Application.delete_env(:attention_server, :client_api_projection_fault)
+        path = "/v2/items/" <> ctx.item <> "/replies"
+        body = %{"text" => "Committed before the response"}
 
-      replay = request(ctx, "a2", "POST", path, body, 2)
-      assert replay.status == 200
-      assert {"idempotent-replayed", "true"} = List.keyfind(replay.headers, "idempotent-replayed", 0)
-      assert %{"entry" => %{"entry_id" => id}} = contract(ctx, "WriteResult", replay)
+        assert_internal_error(request(ctx, "a2", "POST", path, body, 2))
+        assert Server.relay(ctx.server) == ctx.relay
 
-      read = get(ctx, "a2", "/v2/items/" <> ctx.item <> "/entries")
-      assert [%{"entry_id" => ^id}] = contract(ctx, "EntriesPage", read)["entries"]
+        assert_internal_error(request(ctx, "a2", "POST", path, body, 2))
+        Application.delete_env(:attention_server, :client_api_projection_fault)
+
+        replay = request(ctx, "a2", "POST", path, body, 2)
+        assert replay.status == 200
+        assert {"idempotent-replayed", "true"} =
+                 List.keyfind(replay.headers, "idempotent-replayed", 0)
+
+        assert %{"entry" => %{"entry_id" => id}} = contract(ctx, "WriteResult", replay)
+
+        read = get(ctx, "a2", "/v2/items/" <> ctx.item <> "/entries")
+        assert [%{"entry_id" => ^id}] = contract(ctx, "EntriesPage", read)["entries"]
+      end
     end
 
     test "a committed agent reply saves its receipt before rendering", ctx do
