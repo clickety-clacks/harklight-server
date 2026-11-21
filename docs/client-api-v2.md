@@ -37,8 +37,9 @@ by default. It becomes the only client protocol in Server 0.2.x.
   are named `*_at_ms`.
 - Message content from a sender (`Item.message`) is passed through unchanged, as
   today. Every other member is defined here.
-- Absent and `null` mean the same thing unless a member says otherwise. The
-  one exception is `result` in an answer body, where presence counts (§5).
+- Absent and `null` mean the same thing unless a member says otherwise.
+  `"result": null` selects a structured answer (§5), and
+  `"reply_group": null` identifies a reply row with no group (§4).
 
 ## 2. Headers
 
@@ -404,13 +405,15 @@ Schemas use JSON Schema 2020-12. `$ref`s point into the `$defs` below.
 
   `rank.key` orders items across and within sections. While the inbox is in
   free order, `current` items also carry `Rank.group` (`common`, which has no
-  heading, or `earlier_messages`). Today's unread-reply rows are a client
-  rendering of the item's chat state: while `Chat.unread_replies > 0`, the
-  item carries `Chat.reply_group` (today's verified or unknown reply row) and
-  `Chat.reply_rank_key`, which places the reply row among item rows in
-  `Rank.key`'s space, exactly as today. Both are present whenever the item has
-  at least one agent chat reply, even when all are read: clients keep their
-  own row rules, and the Replied tab draws all of them.
+  heading, or `earlier_messages`). Clients use `Rank.level` for the priority
+  mark when present, otherwise compare `Rank.score` with the settings levels
+  when present. If neither field is present, draw no mark.
+
+  An item with an agent chat reply carries `Chat.reply_group` and
+  `Chat.reply_rank_key` even when all replies are read. The key places the
+  reply row among item rows in `Rank.key`'s space. Its presence identifies a
+  reply row even when the group is null. Clients keep their own row rules,
+  and the Replied tab draws all reply rows.
 - **Results.** `Item.result` is the latest origin result. Each result fact is
   also an Entry of kind `result`, with its own `position`, so the thread keeps
   its status turns. `status` is today's closed list: `received`, `applied`,
@@ -464,7 +467,19 @@ Every write that succeeds answers `200`, or `201` for `POST /v2/files`, with a
         "rev": { "$ref": "#/$defs/Position" },
         "item": { "$ref": "#/$defs/Item" },
         "entry": { "$ref": "#/$defs/Entry" },
-        "settings": { "$ref": "#/$defs/Settings" }
+        "settings": { "$ref": "#/$defs/Settings" },
+        "show": { "$ref": "#/$defs/Show", "description": "Only on a focus write, when this device has a pending show" }
+      }
+    },
+    "Show": {
+      "type": "object",
+      "required": ["show_id", "device_id", "item_id", "target", "held_ms"],
+      "properties": {
+        "show_id": { "$ref": "#/$defs/OpaqueId" },
+        "device_id": { "$ref": "#/$defs/OpaqueId" },
+        "item_id": { "$ref": "#/$defs/OpaqueId" },
+        "target": { "enum": ["message", "chat"] },
+        "held_ms": { "type": "integer", "minimum": 0 }
       }
     },
     "AnswerBody": {
@@ -497,8 +512,8 @@ Every write that succeeds answers `200`, or `201` for `POST /v2/files`, with a
 }
 ```
 
-- **Answer.** An item is answerable while its `terminal` is null, today's
-  engine rule, FYIs included: an FYI's Seen is `choice: "seen"`. Once
+- **Answer.** An item is answerable while its `terminal` is null, including
+  FYIs. Clients offer only Seen for FYIs and send `choice: "seen"`. Once
   `terminal` is set, an answer is `409 already_answered`, or
   `already_retracted` for a retraction. The body carries at most one of
   `choice`, `comment` and `result`, which keeps today's single stored answer
@@ -507,9 +522,8 @@ Every write that succeeds answers `200`, or `201` for `POST /v2/files`, with a
     `attention-client.actions/1` `answer_ui`. The server stores that action's
     `value`. An `id` that names no such action is `400 invalid_field`, with
     `field: "choice"`.
-  - `comment` is a plain-text answer. It is accepted on **any answerable
-    item**: an item with an open request, with or without an `answer_ui`,
-    including one that carries an answer screen.
+  - `comment` is a plain-text answer. The server accepts it on any answerable
+    item, with or without an `answer_ui`, including one with an answer screen.
   - `result` is the structured result of an `attention-client.ui/1`
     `answer_ui`: **any JSON value**, null included, stored unchanged.
     **Presence selects it**: `"result": null` is a structured answer whose
@@ -521,8 +535,10 @@ Every write that succeeds answers `200`, or `201` for `POST /v2/files`, with a
   - The answer outcome then reads as `Terminal.answer`: `choice` with the
     action's `id` and `label`, `reply` with `text` for a plain-text answer
     (including on a UI/1 item), `result` with `value` for a structured
-    answer, `seen`, `default` or `no_comment`. Answers stored before 0.2 on
-    UI/1 items keep today's outcome.
+    answer, `seen`, `default` or `no_comment`. An FYI answered with
+    `choice: "seen"` yields `{"kind":"seen"}`. An answer with no matching
+    outcome leaves `Terminal.answer` absent. Answers stored before 0.2 on
+    UI/1 items keep today's shape-based outcomes.
 - **File name.** `POST /v2/files` requires the name in
   `Content-Disposition: attachment; filename*=UTF-8''<percent-encoded name>`
   (RFC 6266, RFC 5987). A missing or empty name is `400 invalid_field`, with
@@ -563,30 +579,43 @@ Only their transport changes, and they are device-only.
 
 - **`PUT /v2/devices/me/focus`** takes today's report fields:
   - `screen`: today's set, including `not_in_front`;
-  - `item_id` (for today's sender and message IDs);
-  - `visible_entry_id` (for today's visible event);
+  - `item_id`: required for `message` and `chat`, absent for other screens;
+  - `visible_entry_id`: optional for `chat`, absent for other screens;
   - `ttl_s`: an integer from 1 to 3600. Clients send 120 and refresh every
     60 s while in front.
 
-  Clients serialize focus writes per device: one `PUT` in flight, and the
-  latest report replaces any queued one.
+  Report screen changes and send `not_in_front` on backgrounding. Debounce
+  changes within a screen by one second and renew within `ttl_s` while in
+  front. Send IDs only, keep network and disk work off the main thread, and
+  avoid reporting per scroll frame. Clients serialize focus writes per
+  device. With one `PUT` in flight, the latest report replaces any queued one.
 
   Its `reported_at` rule is today's: the first report, or a change to an
-  in-front screen. A refresh with unchanged fields is liveness only. A lapsed
-  `ttl_s` ends focus, listing and targetability immediately, like today's
+  in-front screen. An unchanged refresh maintains liveness without changing
+  rank or default-target order. A lapsed `ttl_s` ends focus, listing and
+  targetability immediately, like today's
   session end. A fresh accepted report restores them. A device is opted in to
   shows only by an accepted focus report, and `signed_out` opts it out.
 - **Held shows** are memory-only. They are **never change-log rows**, and
   nothing about focus or shows is stored. A show is
   `{show_id, device_id, item_id, target: "message" | "chat", held_ms}`, where
   `held_ms` is its age when the Server writes it. Each show addresses exactly
-  one device. It reaches that device:
-  - in the response to its next focus write;
-  - and, while the device holds an open feed, as an id-less `event: show`
-    that is never in a JSON batch or replay.
+  one device. An accepted show survives a `ttl_s` lapse without expiring.
+  The server holds the latest show until consumption, replacement, device
+  removal or revocation, or server restart. Turning off an agent's see or
+  push grant leaves accepted shows intact.
 
-  Both carry the same `show_id`, so the device applies it once. A show never
-  causes Seen, an answer, a reply, an open or a read.
+  The device receives it in `WriteResult.show` on its next focus write, or
+  while it holds an open SSE feed, as an id-less `event: show` with a `Show`
+  payload. The server uses the same `show_id` on both paths, and the client
+  applies it once. SSE shows never appear in a JSON batch or replay.
+
+  The server recomputes `held_ms` on every delivery. The client subtracts it
+  from its local receipt time and compares that time with the person's own
+  open time. Check latest-show and own-open order both on receipt and before
+  applying the show. Preserve typing deferral and the draft. The first touch
+  restores normal open and read behavior. A show itself never causes Seen, an
+  answer, a reply, an open, a read, APNs, sound, haptics, or a device wake.
 
 ## 6. The change feed
 
@@ -668,7 +697,9 @@ Only their transport changes, and they are device-only.
   - A feed that drops with no `closing` is recorded with initiator
     `os_network` or `unknown`, and reconnected with `Last-Event-ID`.
 - **`after` older than retention:** `410` with an `Error` body whose `error` is
-  `cursor_expired`, in both forms.
+  `cursor_expired`, in both forms. After either a 410 or an SSE closing with
+  this reason, read every page of `GET /v2/inbox`, set the cursor to the first
+  page's `rev`, and reopen the feed using that cursor.
 - **Feed ID:** the feed's `Request-Id` is its ID. The server logs it at open,
   and at close with its `closing` reason, or `client_closed`.
 
@@ -828,7 +859,7 @@ The delivery owner's rulings on this draft are applied above:
 7. **Positions** start at 0, and resource `rev`s at 1 (§1).
 8. **Entry `position`** is immutable creation order. Paging, `before` and the
    read position compare by it.
-9. **Structured answers:** an optional `result` object, accepted only for
+9. **Structured answers:** an optional `result` of any JSON type, accepted only for
    `attention-client.ui/1` items (see ruling 1 above).
 10. **Answer members are mutually exclusive** (see ruling 1 above).
 

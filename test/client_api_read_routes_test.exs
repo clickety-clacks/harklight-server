@@ -328,4 +328,59 @@ defmodule AttentionServer.ClientAPIReadRoutesTest do
     assert get_resp_header(device, "content-disposition") == []
     assert get_resp_header(device, "content-type") == ["application/octet-stream"]
   end
+
+  test "a device gets its uploaded content type in a file reference and download", ctx do
+    opts = Router.init(relay: ctx.relay)
+
+    request = fn conn ->
+      conn
+      |> put_peer_data(%{address: {127, 0, 0, 1}, port: 1, ssl_cert: ctx.der})
+      |> Router.call(opts)
+    end
+
+    inbox = request.(conn(:get, "/v2/inbox"))
+    assert inbox.status == 200
+    item = Enum.find(body(inbox)["items"], &(&1["message"]["message_id"] == "one"))
+    item_path = "/v2/items/#{item["item_id"]}"
+
+    upload =
+      conn(:post, "/v2/files", @bytes)
+      |> put_req_header("content-type", "image/png")
+      |> put_req_header("content-length", Integer.to_string(byte_size(@bytes)))
+      |> put_req_header("content-disposition", "attachment; filename*=UTF-8''pic.png")
+      |> put_req_header("idempotency-key", op(20))
+      |> request.()
+
+    assert upload.status == 201
+    assert %{"file_id" => uploaded} = body(upload)
+
+    reply =
+      conn(
+        :post,
+        item_path <> "/replies",
+        JSON.encode!(%{"text" => "Picture", "file_ids" => [uploaded]})
+      )
+      |> put_req_header("content-type", "application/json")
+      |> put_req_header("idempotency-key", op(21))
+      |> request.()
+
+    assert reply.status == 200
+
+    assert %{"entry" => %{"files" => [%{"file_id" => served, "content_type" => "image/png"}]}} =
+             body(reply)
+
+    entries = request.(conn(:get, item_path <> "/entries"))
+    assert entries.status == 200
+
+    assert %{
+             "entries" => [%{"files" => [%{"file_id" => ^served, "content_type" => "image/png"}]}]
+           } =
+             body(entries)
+
+    download = request.(conn(:get, "/v2/files/#{served}"))
+    assert download.status == 200
+    assert download.resp_body == @bytes
+    assert get_resp_header(download, "content-type") == ["image/png"]
+    assert get_resp_header(download, "content-disposition") == []
+  end
 end
