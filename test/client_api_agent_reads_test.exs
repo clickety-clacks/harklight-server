@@ -122,12 +122,21 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
     assert get(ctx, "a1", "/v2/agent/messages?page=" <> page).status == 400
   end
 
+  @tag :agent_focus
   @tag flag: false
   test "the server leaves the agent HTTP routes and durable log disabled with the flag off",
        ctx do
     forward(ctx, "a1", 1, @first_session)
     refute Server.client_api_v2?(ctx.server)
     refute Enum.any?(Supervisor.which_children(ctx.server), &(elem(&1, 0) == :client_api))
+
+    conn = ClientAPIFeedClient.connect(ctx.port, ctx.certs, "a1", :http1)
+    assert {:ok, conn, ref} = Mint.HTTP.request(conn, "GET", "/v2/agent/focus", [], nil)
+    {conn, response} = ClientAPIFeedClient.collect(conn, ref)
+    Mint.HTTP.close(conn)
+    assert response.status == 400
+    refute List.keymember?(response.headers, "request-id", 0)
+
     state = :sys.get_state(ctx.relay)
     assert {:error, :disabled} = AgentChangeLog.head(state.store, {"A", ctx.keys["a1"]})
     assert state.store.engine.route_b_index.sent_messages_by_agent == %{}
@@ -268,13 +277,16 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
 
     route = "/v2/agent/focus"
     assert_error(get(ctx, "a1", route), 403, "forbidden")
+
     :sys.replace_state(ctx.relay, fn state ->
       put_in(state.store.engine.devices[ctx.keys["a1"]].see_focus, true)
     end)
 
+    key = ctx.keys["a2"]
     snapshot = contract(ctx, "AgentFocus", get(ctx, "a1", route))
-    assert %{"clients" => [%{"device_id" => key, "screen" => "message", "item_id" => ^id}]} = snapshot
-    assert key == ctx.keys["a2"]
+
+    assert %{"clients" => [%{"device_id" => ^key, "screen" => "message", "item_id" => ^id}]} =
+             snapshot
 
     state = :sys.get_state(ctx.relay)
     assert {:ok, head} = AgentChangeLog.head(state.store, {"A", ctx.keys["a1"]})
