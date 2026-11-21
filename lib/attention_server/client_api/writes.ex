@@ -43,7 +43,9 @@ defmodule AttentionServer.ClientAPI.Writes do
     Uploads
   }
 
-  @max_body_bytes 64 * 1024
+  # Today's request frame limit (TlsRelay packet_size), so a UI/1 result or a
+  # long reply that today's path accepts is accepted here too. No new limit.
+  @max_body_bytes 2 * 1024 * 1024
 
   ## Routes (mounted by ClientAPI.Router behind client_api_v2)
 
@@ -444,6 +446,7 @@ defmodule AttentionServer.ClientAPI.Writes do
     |> case do
       {:ok, %{"upload_id" => upload_id}} -> {:ok, upload_id}
       {:error, :upload_cap_exceeded} -> {:error, "payload_too_large"}
+      {:error, :upload_conflict} -> {:error, "invalid_field", "file_ids"}
       {:error, :forbidden} -> {:error, "forbidden"}
       {:error, :storage_unavailable} -> {:error, "storage_unavailable"}
       _ -> {:error, "retry_later"}
@@ -479,10 +482,10 @@ defmodule AttentionServer.ClientAPI.Writes do
         if report["screen"] == "signed_out" do
           AttentionServer.Relay.client_api_focus(state, {:signed_out, key})
         else
-          token = make_ref()
-          result = AttentionServer.Relay.client_api_focus(state, {:report, key, reported, token})
-          :ok = Focus.schedule_lapse(self(), key, token, report["ttl_s"] * 1000)
-          result
+          # One lapse timer per device: a renewal cancels the previous one.
+          Focus.cancel_lapse(get_in(state.focus_clients, [key, :client_api_token]))
+          token = Focus.schedule_lapse(self(), key, report["ttl_s"] * 1000)
+          AttentionServer.Relay.client_api_focus(state, {:report, key, reported, token})
         end
 
       show = held && Focus.show(engine, key, held, state.clock.())
@@ -493,9 +496,16 @@ defmodule AttentionServer.ClientAPI.Writes do
     end
   end
 
-  def handle_call({:focus_lapse, key, token}, _from, state) do
-    {nil, next} = AttentionServer.Relay.client_api_focus(state, {:lapse, key, token})
-    {:reply, :ok, next}
+  # Only the timer of the device's newest report ends its focus.
+  def handle_call({:focus_lapse, key, id}, _from, state) do
+    case get_in(state.focus_clients, [key, :client_api_token]) do
+      {:lapse, ^id, _timer} = token ->
+        {nil, next} = AttentionServer.Relay.client_api_focus(state, {:lapse, key, token})
+        {:reply, :ok, next}
+
+      _ ->
+        {:reply, :ok, state}
+    end
   end
 
   def handle_call({:begin, who, key, digest, operation}, from, state) do
@@ -783,10 +793,6 @@ defmodule AttentionServer.ClientAPI.Writes do
     end
   end
 
-  defp has_conversation(record) do
-    if is_binary(Map.get(record, :session_handle)), do: :ok, else: {:error, :unsupported}
-  end
-
   # An answer goes to the engine as today's answer (or answer_no_comment)
   # frame, which keeps the first-answer-settles, stale-revision and
   # retraction rules. A settled item goes straight to the engine, so its
@@ -834,7 +840,40 @@ defmodule AttentionServer.ClientAPI.Writes do
      }}
   end
 
-  defp frame(_engine, _principal, key, {:push, token, environment, revision}) do
+  # PUT is idempotent: the same binding at the same revision is an unchanged
+  # success, so a retry after a lost response is not a stale 412.
+  defp frame(engine, principal, key, {:push, token, environment, revision}) do
+    case Map.get(engine.push_bindings, {principal.person, principal.engine_key}) do
+      %{revision: ^revision, active: true, address: address, profile_id: profile_id} ->
+        if address == String.downcase(token) and profile_id == "harklight-" <> environment,
+          do: {:ok, :unchanged},
+          else: push_frame(key, token, environment, revision)
+
+      _ ->
+        push_frame(key, token, environment, revision)
+    end
+  end
+
+  # The binding is removed at the next revision; DELETE carries none. With no
+  # active binding, a DELETE (or its retry) changes nothing.
+  defp frame(engine, principal, key, :remove_push) do
+    case Map.get(engine.push_bindings, {principal.person, principal.engine_key}) do
+      %{revision: current, active: true} ->
+        {:ok,
+         %{"v" => 1, "type" => "push_remove", "op_id" => op_id(key), "revision" => current + 1}}
+
+      _ ->
+        {:ok, :unchanged}
+    end
+  end
+
+  defp frame(_engine, _principal, _key, {:file, _meta, _tmp_path}), do: {:ok, :unchanged}
+
+  defp has_conversation(record) do
+    if is_binary(Map.get(record, :session_handle)), do: :ok, else: {:error, :unsupported}
+  end
+
+  defp push_frame(key, token, environment, revision) do
     {:ok,
      %{
        "v" => 1,
@@ -846,19 +885,6 @@ defmodule AttentionServer.ClientAPI.Writes do
        "profile_id" => "harklight-" <> environment
      }}
   end
-
-  # The binding is removed at the next revision; DELETE carries none.
-  defp frame(engine, principal, key, :remove_push) do
-    revision =
-      case Map.get(engine.push_bindings, {principal.person, principal.engine_key}) do
-        %{revision: current} -> current + 1
-        nil -> 1
-      end
-
-    {:ok, %{"v" => 1, "type" => "push_remove", "op_id" => op_id(key), "revision" => revision}}
-  end
-
-  defp frame(_engine, _principal, _key, {:file, _meta, _tmp_path}), do: {:ok, :unchanged}
 
   # Which answer path stored the value, so a UI/1 result and a plain-text
   # answer stay distinguishable (contract rulings round 16 addendum).
@@ -919,8 +945,17 @@ defmodule AttentionServer.ClientAPI.Writes do
       end
     end)
     |> case do
-      {:ok, staged} -> {:ok, Enum.reverse(staged)}
-      error -> error
+      {:ok, staged} ->
+        staged = Enum.reverse(staged)
+
+        # One name per reply, as today's engine requires; a duplicate is the
+        # client's to fix, never a retry.
+        if length(Enum.uniq_by(staged, & &1.name)) == length(staged),
+          do: {:ok, staged},
+          else: {:error, :invalid_field, "file_ids"}
+
+      error ->
+        error
     end
   end
 
