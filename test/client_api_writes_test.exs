@@ -432,6 +432,272 @@ defmodule AttentionServer.ClientAPIWritesTest do
     end
   end
 
+  defp forward_message(relay, operation, message, files \\ nil) do
+    frame = %{
+      "type" => "forward",
+      "op_id" => op(operation),
+      "session_handle" => @handle,
+      "message" =>
+        Map.merge(
+          %{"sender_id" => "app:test", "created_at" => operation, "title" => "Q"},
+          message
+        )
+    }
+
+    frame = if files, do: Map.put(frame, "files", files), else: frame
+    assert %{"type" => "ok"} = request(relay, "origin", frame)
+  end
+
+  @choices %{
+    "schema" => "attention-client.actions/1",
+    "actions" => [
+      %{"id" => "yes", "label" => "Yes", "kind" => "value", "value" => %{"pick" => "yes"}},
+      %{"id" => "reply", "label" => "Reply", "kind" => "text"}
+    ]
+  }
+
+  @seen %{
+    "schema" => "attention-client.actions/1",
+    "actions" => [
+      %{
+        "id" => "seen",
+        "label" => "Seen",
+        "kind" => "value",
+        "value" => %{"acknowledgment" => "seen"}
+      }
+    ]
+  }
+
+  # The known-valid UI/1 screen of message_fields_relay_test, with its image.
+  @form %{
+    "schema" => "attention-client.ui/1",
+    "requires" => ["scene/1", "result/1", "illustration/1", "response/1", "image/1"],
+    "illustrations" => [
+      %{
+        "id" => "cover",
+        "label" => "Cover",
+        "width" => 100,
+        "height" => 100,
+        "primitives" => [
+          %{
+            "kind" => "image",
+            "x" => 0,
+            "y" => 0,
+            "width" => 100,
+            "height" => 100,
+            "file" => "cover.png"
+          }
+        ]
+      }
+    ],
+    "inputs" => [
+      %{
+        "kind" => "response",
+        "id" => "cover-choice",
+        "label" => "Choose a cover",
+        "actions" => [
+          %{
+            "id" => "blue",
+            "label" => "Blue cover",
+            "kind" => "value",
+            "value" => "blue",
+            "illustration" => "cover"
+          }
+        ]
+      }
+    ],
+    "open" => %{"kind" => "input", "id" => "cover-choice", "layout" => "cards"},
+    "resolved" => %{"kind" => "text", "text" => "Recorded", "style" => "body"},
+    "submission" => %{
+      "label" => "Send answer",
+      "result" => %{"kind" => "input", "id" => "cover-choice"}
+    }
+  }
+
+  defp stored_terminal(relay, id),
+    do: :sys.get_state(relay).store.engine.messages[{"A", "app:test", id}].terminal
+
+  describe "POST /v2/items/{item_id}/answer" do
+    test "a choice stores its action's value; the first answer settles the request",
+         %{path: path, flags: flags} do
+      relay = scripted_relay(path, flags)
+
+      forward_message(relay, 40, %{
+        "message_id" => "pick",
+        "message_type" => "request",
+        "answer_ui" => @choices
+      })
+
+      pick = item_id(relay, "pick")
+      {:ok, before} = head(relay)
+      k = key()
+
+      assert {:ok, 200, body, false} =
+               Writes.answer(relay, "reader", pick, 1, {:choice, "yes"}, k)
+
+      assert Schema.errors(Schema.contract_defs(@contract), "WriteResult", body) == []
+
+      assert %{"rev" => position, "item" => %{"terminal" => %{"state" => "answered"}} = item} =
+               body
+
+      assert item["rev"] > before and item["rev"] <= position
+      assert stored_terminal(relay, "pick").answer == %{"pick" => "yes"}
+      assert Enum.any?(changes_after(relay, before), &(&1.resource_id == item_resource("pick")))
+
+      # The same request again is the stored response; another answer is refused.
+      assert {:ok, 200, ^body, true} =
+               Writes.answer(relay, "reader", pick, 1, {:choice, "yes"}, k)
+
+      assert {:error, "already_answered", nil, false} =
+               Writes.answer(relay, "reader", pick, 1, {:comment, "Actually no"}, key())
+
+      assert {:error, "already_answered", nil, false} =
+               Writes.answer(relay, "reader", pick, 1, :no_comment, key())
+
+      # Chat stays open after the answer.
+      assert {:ok, 200, _, false} = Writes.reply(relay, "reader", pick, "One more thing", key())
+      GenServer.stop(relay)
+    end
+
+    test "a comment is a plain-text answer on any answerable item", %{path: path, flags: flags} do
+      relay = scripted_relay(path, flags)
+
+      forward_message(relay, 40, %{
+        "message_id" => "pick",
+        "message_type" => "request",
+        "answer_ui" => @choices
+      })
+
+      for id <- ["one", "pick"] do
+        assert {:ok, 200, %{"item" => item}, false} =
+                 Writes.answer(
+                   relay,
+                   "reader",
+                   item_id(relay, id),
+                   1,
+                   {:comment, "Sounds good"},
+                   key()
+                 )
+
+        assert item["terminal"]["answer"] == %{"kind" => "reply", "text" => "Sounds good"}
+      end
+
+      GenServer.stop(relay)
+    end
+
+    test "no member is no comment", %{path: path, flags: flags} do
+      relay = scripted_relay(path, flags)
+      one = item_id(relay, "one")
+
+      assert {:ok, 200, %{"item" => item}, false} =
+               Writes.answer(relay, "reader", one, 1, :no_comment, key())
+
+      assert item["terminal"]["answer"] == %{"kind" => "no_comment"}
+      GenServer.stop(relay)
+    end
+
+    test "a stale request_revision is stale_request, and nothing is applied",
+         %{path: path, flags: flags} do
+      relay = scripted_relay(path, flags)
+      one = item_id(relay, "one")
+      {:ok, position} = head(relay)
+
+      for value <- [{:comment, "Yes"}, :no_comment, {:choice, "yes"}] do
+        assert {:error, "stale_request", nil, false} =
+                 Writes.answer(relay, "reader", one, 2, value, key())
+      end
+
+      assert head(relay) == {:ok, position}
+      assert stored_terminal(relay, "one") == nil
+      GenServer.stop(relay)
+    end
+
+    test "choice and result must match the item's answer screen", %{path: path, flags: flags} do
+      relay = scripted_relay(path, flags)
+
+      forward_message(relay, 40, %{
+        "message_id" => "pick",
+        "message_type" => "request",
+        "answer_ui" => @choices
+      })
+
+      pick = item_id(relay, "pick")
+      one = item_id(relay, "one")
+
+      for {item, value, field} <- [
+            {pick, {:choice, "nope"}, "choice"},
+            {pick, {:choice, "reply"}, "choice"},
+            {one, {:choice, "yes"}, "choice"},
+            {pick, {:result, %{"a" => 1}}, "result"},
+            {one, {:result, %{"a" => 1}}, "result"}
+          ] do
+        assert {:error, "invalid_field", ^field, false} =
+                 Writes.answer(relay, "reader", item, 1, value, key())
+      end
+
+      # A UI/1 screen takes a result, stored as today's answer value.
+      forward_message(
+        relay,
+        41,
+        %{
+          "message_id" => "form",
+          "message_type" => "request",
+          "answer_ui" => @form
+        },
+        [%{"name" => "cover.png", "data_base64" => Base.encode64("not image bytes")}]
+      )
+
+      form = item_id(relay, "form")
+
+      assert {:ok, %{"item" => %{"message" => %{"answer_ui" => %{"schema" => ui}}}}} =
+               Reads.item(relay, "reader", form)
+
+      assert ui == "attention-client.ui/1"
+
+      assert {:ok, 200, %{"item" => %{"terminal" => %{"state" => "answered"}}}, false} =
+               Writes.answer(relay, "reader", form, 1, {:result, %{"choice" => "blue"}}, key())
+
+      assert stored_terminal(relay, "form").answer == %{"choice" => "blue"}
+      GenServer.stop(relay)
+    end
+
+    test "an FYI's Seen is its answer, as today; a retracted item is already_retracted",
+         %{path: path, flags: flags} do
+      relay = scripted_relay(path, flags)
+
+      forward_message(relay, 40, %{
+        "message_id" => "note",
+        "message_type" => "fyi",
+        "answer_ui" => @seen
+      })
+
+      note = item_id(relay, "note")
+
+      assert {:ok, 200, %{"item" => %{"terminal" => %{"state" => "answered"}}}, false} =
+               Writes.answer(relay, "reader", note, 1, {:choice, "seen"}, key())
+
+      assert stored_terminal(relay, "note").answer == %{"acknowledgment" => "seen"}
+
+      for value <- [{:choice, "seen"}, {:comment, "ok"}, :no_comment] do
+        assert {:error, "already_answered", nil, false} =
+                 Writes.answer(relay, "reader", note, 1, value, key())
+      end
+
+      assert %{"type" => "ok", "state" => "retracted"} =
+               request(relay, "origin", %{
+                 "type" => "conversation_withdraw",
+                 "op_id" => op(41),
+                 "sender_id" => "app:test",
+                 "message_id" => "two"
+               })
+
+      assert {:error, "already_retracted", nil, false} =
+               Writes.answer(relay, "reader", item_id(relay, "two"), 1, {:comment, "Hi"}, key())
+
+      GenServer.stop(relay)
+    end
+  end
+
   describe "HTTP" do
     defp post(relay, path_info, body, headers) do
       conn =
@@ -447,7 +713,14 @@ defmodule AttentionServer.ClientAPIWritesTest do
         params: %{item_id: Enum.at(path_info, 1)}
       }
 
-      conn = Writes.post_seen(conn, ctx)
+      handler =
+        case List.last(path_info) do
+          "seen" -> :post_seen
+          "answer" -> :post_answer
+          "replies" -> :post_replies
+        end
+
+      conn = apply(Writes, handler, [conn, ctx])
       {conn.status, JSON.decode_line(conn.resp_body <> "\n") |> elem(1), conn}
     end
 
@@ -485,6 +758,34 @@ defmodule AttentionServer.ClientAPIWritesTest do
 
       GenServer.stop(relay)
     end
+  end
+
+  test "answer bodies carry request_revision and at most one of choice, comment and result",
+       %{path: path, flags: flags} do
+    relay = scripted_relay(path, flags)
+    route = ["items", item_id(relay, "one"), "answer"]
+
+    for {body, field} <- [
+          {~s({}), "request_revision"},
+          {~s({"request_revision":0}), "request_revision"},
+          {~s({"request_revision":1,"choice":"a","comment":"b"}), nil},
+          {~s({"request_revision":1,"comment":"b","result":{}}), nil},
+          {~s({"request_revision":1,"choice":""}), "choice"},
+          {~s({"request_revision":1,"comment":5}), "comment"},
+          {~s({"request_revision":1,"result":[]}), "result"},
+          {~s({"request_revision":1,"other":1}), "other"}
+        ] do
+      assert {400, error, _} = post(relay, route, body, [{"idempotency-key", key()}])
+      assert error["error"] == "invalid_field"
+      assert error["field"] == field
+    end
+
+    assert {200, %{"item" => %{"terminal" => %{"state" => "answered"}}}, _} =
+             post(relay, route, ~s({"request_revision":1,"comment":"Yes"}), [
+               {"idempotency-key", key()}
+             ])
+
+    GenServer.stop(relay)
   end
 
   defp discuss(relay, id, operation, text) do

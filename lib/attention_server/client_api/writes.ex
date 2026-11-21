@@ -42,7 +42,8 @@ defmodule AttentionServer.ClientAPI.Writes do
     [
       {"POST", ["items", :item_id, "seen"], :post_seen},
       {"PUT", ["items", :item_id, "read-position"], :put_read_position},
-      {"POST", ["items", :item_id, "replies"], :post_replies}
+      {"POST", ["items", :item_id, "replies"], :post_replies},
+      {"POST", ["items", :item_id, "answer"], :post_answer}
     ]
   end
 
@@ -79,6 +80,20 @@ defmodule AttentionServer.ClientAPI.Writes do
          {:ok, text} <- string_member(body, "text"),
          {:ok, file_ids} <- file_ids(body) do
       respond(conn, reply(ctx.relay, ctx.principal, ctx.params.item_id, text, file_ids, key))
+    else
+      {:error, token, field, conn} -> Errors.send_error(conn, token, field: field)
+      {:error, token, field} -> Errors.send_error(conn, token, field: field)
+    end
+  end
+
+  @doc false
+  def post_answer(conn, %Context{} = ctx) do
+    with {:ok, key} <- required_key(conn),
+         {:ok, body, conn} <- json_body(conn),
+         :ok <- only_members(body, ["request_revision", "choice", "comment", "result"]),
+         {:ok, revision} <- request_revision(body),
+         {:ok, value} <- answer_value(body) do
+      respond(conn, answer(ctx.relay, ctx.principal, ctx.params.item_id, revision, value, key))
     else
       {:error, token, field, conn} -> Errors.send_error(conn, token, field: field)
       {:error, token, field} -> Errors.send_error(conn, token, field: field)
@@ -123,6 +138,27 @@ defmodule AttentionServer.ClientAPI.Writes do
       method: "POST",
       path: ["items", item_id, "replies"],
       body: body
+    })
+  end
+
+  @doc """
+  `POST /v2/items/{item_id}/answer`: answer the item's open request at
+  `request_revision`. `value` is `{:choice, action_id}`, `{:comment, text}`,
+  `{:result, map}` or `:no_comment`. The first answer settles the request.
+  """
+  def answer(relay, who, item_id, request_revision, value, idempotency_key) do
+    body =
+      case value do
+        {:choice, id} -> %{"choice" => id}
+        {:comment, text} -> %{"comment" => text}
+        {:result, result} -> %{"result" => result}
+        :no_comment -> %{}
+      end
+
+    write(relay, who, idempotency_key, {:answer, item_id, request_revision, value}, %{
+      method: "POST",
+      path: ["items", item_id, "answer"],
+      body: Map.put(body, "request_revision", request_revision)
     })
   end
 
@@ -286,6 +322,9 @@ defmodule AttentionServer.ClientAPI.Writes do
   defp render({:read_position, item_id, _entry_id}, who, _person, _reply, from, state),
     do: render_item(item_id, who, from, state)
 
+  defp render({:answer, item_id, _revision, _value}, who, _person, _reply, from, state),
+    do: render_item(item_id, who, from, state)
+
   defp render({:reply, item_id, _text, _files}, who, person, %{"seq" => seq}, from, state) do
     with {:ok, 200, body} <- render_item(item_id, who, from, state),
          {:ok, entry} <- render_entry(state, who, person, seq) do
@@ -399,6 +438,83 @@ defmodule AttentionServer.ClientAPI.Writes do
     end
   end
 
+  # An answer goes to the engine as today's answer (or answer_no_comment)
+  # frame, which keeps the first-answer-settles, stale-revision and
+  # retraction rules. A settled item goes straight to the engine, so its
+  # refusal is today's.
+  defp frame(engine, principal, key, {:answer, item_id, revision, value}) do
+    with {:ok, {_person, sender, message_id} = message_key} <-
+           Resources.item_key(engine, principal.person, item_id) do
+      record = Map.fetch!(engine.messages, message_key)
+
+      cond do
+        not answerable?(record) ->
+          {:ok, answer_frame(key, sender, message_id, revision, nil)}
+
+        revision != record.revision ->
+          {:error, :stale_request}
+
+        true ->
+          with {:ok, stored} <- stored_answer(record, value) do
+            case stored do
+              :no_comment ->
+                {:ok,
+                 %{
+                   "type" => "answer_no_comment",
+                   "request_id" => message_id,
+                   "request_revision" => revision
+                 }}
+
+              {:answer, answer} ->
+                {:ok, answer_frame(key, sender, message_id, revision, answer)}
+            end
+          end
+      end
+    end
+  end
+
+  defp answer_frame(key, sender, message_id, revision, answer) do
+    %{
+      "v" => 1,
+      "type" => "answer",
+      "op_id" => op_id(key),
+      "sender_id" => sender,
+      "message_id" => message_id,
+      "request_revision" => revision,
+      "answer" => answer
+    }
+  end
+
+  # An item is answerable while it has no terminal state, exactly today's
+  # engine rule, FYIs included (contract rulings round 10). A settled item
+  # goes to the engine, so its refusal is today's.
+  defp answerable?(record), do: is_nil(record.terminal)
+
+  # The value today's answer stores: a choice stores its action's value, a
+  # comment its text, a UI/1 result the result object.
+  defp stored_answer(_record, :no_comment), do: {:ok, :no_comment}
+  defp stored_answer(_record, {:comment, text}), do: {:ok, {:answer, text}}
+
+  defp stored_answer(record, {:choice, id}) do
+    case Map.get(record.message, "answer_ui") do
+      %{"schema" => "attention-client.actions/1", "actions" => actions} when is_list(actions) ->
+        case Enum.find(actions, &(is_map(&1) and &1["id"] == id and &1["kind"] == "value")) do
+          %{} = action -> {:ok, {:answer, Map.get(action, "value")}}
+          nil -> {:error, :invalid_field, "choice"}
+        end
+
+      _ ->
+        {:error, :invalid_field, "choice"}
+    end
+  end
+
+  defp stored_answer(record, {:result, result}) do
+    case Map.get(record.message, "answer_ui") do
+      %{"schema" => "attention-client.ui/1"} -> {:ok, {:answer, result}}
+      _ -> {:error, :invalid_field, "result"}
+    end
+  end
+
   # Uploaded files arrive with POST /v2/files, a later slice.
   defp no_file_ids([]), do: :ok
   defp no_file_ids(_), do: {:error, :unsupported, "file_ids"}
@@ -496,6 +612,36 @@ defmodule AttentionServer.ClientAPI.Writes do
     case Map.get(body, name) do
       value when is_binary(value) -> {:ok, value}
       _ -> {:error, "invalid_field", name}
+    end
+  end
+
+  defp request_revision(body) do
+    case Map.get(body, "request_revision") do
+      n when is_integer(n) and n >= 1 -> {:ok, n}
+      _ -> {:error, "invalid_field", "request_revision"}
+    end
+  end
+
+  # At most one of choice, comment and result; none is no comment.
+  defp answer_value(body) do
+    case Map.take(body, ["choice", "comment", "result"]) |> Map.to_list() do
+      [] ->
+        {:ok, :no_comment}
+
+      [{"choice", id}] when is_binary(id) and id != "" ->
+        {:ok, {:choice, id}}
+
+      [{"comment", text}] when is_binary(text) ->
+        {:ok, {:comment, text}}
+
+      [{"result", result}] when is_map(result) and not is_struct(result) ->
+        {:ok, {:result, result}}
+
+      [{name, _}] ->
+        {:error, "invalid_field", name}
+
+      _ ->
+        {:error, "invalid_field", nil}
     end
   end
 
