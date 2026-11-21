@@ -150,7 +150,8 @@ defmodule AttentionServer.Store do
   def enable_change_log(%__MODULE__{db: db, version: version} = store) do
     with :ok <- AttentionServer.ChangeLog.enable(db, version),
          :ok <- AttentionServer.AgentChangeLog.enable(db, store.engine, version) do
-      {:ok, %{store | change_log: true}}
+      engine = AttentionServer.RouteBIndex.enable_agent_feed(store.engine)
+      {:ok, %{store | change_log: true, engine: engine}}
     else
       _ -> {:error, :storage_unavailable}
     end

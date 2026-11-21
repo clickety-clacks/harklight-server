@@ -42,10 +42,38 @@ defmodule AttentionServer.AgentChangeLogTest do
     relay = start(ctx, false)
     setup_people(relay)
     forward(relay, "origin", "retained", 1, @session)
+
+    assert %{"type" => "ok", "seq" => seq, "event_id" => event_id} =
+             request(relay, "other", %{
+               "type" => "discussion",
+               "op_id" => op(2),
+               "sender_id" => "app:test",
+               "message_id" => "retained",
+               "request_revision" => 1,
+               "text" => "Pre-cut-over chat"
+             })
+
     assert {:error, :disabled} = read(relay, "origin")
+
+    assert %{
+             agent_feed?: false,
+             entry_positions: positions,
+             messages_by_origin_session: sessions,
+             advisory_sequences: advisories
+           } = stored(relay, & &1.engine.route_b_index)
+
+    assert positions == %{} and sessions == %{} and advisories == %{}
     GenServer.stop(relay)
 
     relay = start(ctx)
+    retained = key("retained")
+
+    assert %{
+             agent_feed?: true,
+             entry_positions: %{{^retained, ^event_id} => ^seq},
+             messages_by_origin_session: %{{"A", "origin"} => %{@session => [^retained]}}
+           } = stored(relay, & &1.engine.route_b_index)
+
     assert {:error, :cursor_expired} = read(relay, "origin")
     assert {:ok, [], false, 1} = read(relay, "origin", 1)
 

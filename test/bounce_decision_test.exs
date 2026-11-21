@@ -134,8 +134,10 @@ defmodule AttentionServer.BounceDecisionTest do
   test "defaults are read without storing a table and leave unscored messages inert" do
     {engine, _record} = fixture(configured?: false)
     refute Map.has_key?(engine.bounce_levels, @person)
+
     assert BounceDecision.levels(engine, @person) ==
              BouncePolicy.public_levels(BouncePolicy.default_levels())
+
     assert selection(engine) == nil
     assert BounceDecision.next_deadline(engine) == nil
 
@@ -183,6 +185,7 @@ defmodule AttentionServer.BounceDecisionTest do
     state = engine.bounce_revisions[key()]
     revision = %{state.revisions[1] | qualified: false}
     retained_state = %{state | revisions: Map.put(state.revisions, 1, revision)}
+
     retained = %{
       engine
       | bounce_revisions: Map.put(engine.bounce_revisions, key(), retained_state)
@@ -423,6 +426,7 @@ defmodule AttentionServer.BounceDecisionTest do
 
     assert selection(bounced)["decision"] == "bounced"
     assert BounceDecision.advisory_cursor(bounced, @person, @origin, @handle) == 1
+    assert bounced.route_b_index.advisory_sequences == %{}
     assert bounced.origin_feeds[origin_feed_key()].high == 1
     assert bounced.events == engine.events
 
