@@ -378,36 +378,50 @@ defmodule AttentionServer.ChangeLogTest do
     GenServer.stop(relay)
   end
 
-  test "rank keys write item rows only for items whose key changed", ctx do
+  test "rank keys write one item row per item whose unit keys changed", ctx do
     relay = start(ctx)
     setup_people(relay)
     forward(relay, "m1", 2)
     forward(relay, "m2", 3)
-    store = store(relay)
-    assert {:ok, %{}} = ChangeLog.rank_keys(store, "A")
+    assert {:ok, %{}} = ChangeLog.rank_keys(store(relay), "A")
     assert :ok = ChangeLog.subscribe("A")
 
-    first = %{item("m1") => "a", item("m2") => "b"}
+    # Unit IDs are opaque: an item row, and an item's chat-reply row.
+    items = %{"u1" => item("m1"), "r-u1" => item("m1"), "u2" => item("m2")}
+    item_of = &Map.fetch(items, &1)
+
+    first = %{"u1" => "a", "r-u1" => "ab", "u2" => "b"}
     start_head = head(relay)
-    assert {:ok, ranked_head} = ChangeLog.append_ranks(store(relay), "A", first)
+    assert {:ok, ranked_head} = ChangeLog.append_ranks(store(relay), "A", first, item_of)
     assert_receive {:change_log, "A", ^ranked_head}, 1_000
     assert {:ok, ranked, false, ^ranked_head} = log(relay, start_head)
-    assert Enum.map(ranked, & &1.resource_id) |> Enum.sort() == Enum.sort(Map.keys(first))
+
+    assert Enum.map(ranked, & &1.resource_id) |> Enum.sort() ==
+             Enum.sort([item("m1"), item("m2")])
+
     assert Enum.all?(ranked, &(&1.kind == :item))
     assert {:ok, ^first} = ChangeLog.rank_keys(store(relay), "A")
 
     # Unchanged keys write nothing.
-    assert {:ok, ^ranked_head} = ChangeLog.append_ranks(store(relay), "A", first)
+    assert {:ok, ^ranked_head} = ChangeLog.append_ranks(store(relay), "A", first, item_of)
 
-    # Moving one item writes one row; an item no longer ranked loses its key.
-    assert {:ok, moved_head} = ChangeLog.append_ranks(store(relay), "A", %{item("m1") => "c"})
+    # A moved reply row writes its item's row; a unit no longer ranked loses its
+    # key and also writes its item's row.
+    moved = %{"u1" => "a", "r-u1" => "ac"}
+    assert {:ok, moved_head} = ChangeLog.append_ranks(store(relay), "A", moved, item_of)
+    assert {:ok, rows, false, ^moved_head} = log(relay, ranked_head)
+    assert Enum.map(rows, & &1.resource_id) |> Enum.sort() == Enum.sort([item("m1"), item("m2")])
+    assert {:ok, ^moved} = ChangeLog.rank_keys(store(relay), "A")
 
-    assert {:ok, [%{kind: :item, resource_id: moved}], false, ^moved_head} =
-             log(relay, ranked_head)
+    # A unit whose item no longer exists still loses its key, with no row.
+    assert {:ok, ^moved_head} =
+             ChangeLog.append_ranks(store(relay), "A", %{"u1" => "a", "r-u1" => "ac"}, item_of)
 
-    assert moved == item("m1")
-    assert {:ok, %{} = keys} = ChangeLog.rank_keys(store(relay), "A")
-    assert keys == %{item("m1") => "c"}
+    assert {:ok, gone_head} =
+             ChangeLog.append_ranks(store(relay), "A", %{"u1" => "a"}, fn _ -> :error end)
+
+    assert gone_head == moved_head
+    assert {:ok, %{"u1" => "a"}} = ChangeLog.rank_keys(store(relay), "A")
     assert :ok = ChangeLog.unsubscribe("A")
     GenServer.stop(relay)
   end

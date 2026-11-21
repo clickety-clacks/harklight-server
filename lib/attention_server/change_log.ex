@@ -523,7 +523,10 @@ defmodule AttentionServer.ChangeLog do
 
   def created_at(%AttentionServer.Store{}, _person, _resource_id), do: {:error, :disabled}
 
-  @doc "The rank key last emitted for each of the person's items, by item resource ID."
+  @doc """
+  The rank key last emitted for each of the person's rank units, by the reads
+  component's opaque unit ID (an item row or an item's chat-reply row).
+  """
   def rank_keys(%AttentionServer.Store{change_log: true, db: db}, person) do
     with {:ok, rows} <-
            all(db, "SELECT resource_id, rank_key FROM client_rank_keys WHERE person_id = ?", [
@@ -536,35 +539,53 @@ defmodule AttentionServer.ChangeLog do
   def rank_keys(%AttentionServer.Store{}, _person), do: {:error, :disabled}
 
   @doc """
-  Records the person's current rank keys (`%{item_resource => key}`, from the
-  reads component's ranking) in one transaction. Every item whose key changed
-  gets an `:item` row, and items no longer ranked lose their stored key.
-  Unchanged keys write nothing. Returns the person's head.
+  Records the person's current rank keys (`%{unit_id => key}`, from the reads
+  component's ranking) in one transaction. `item_of` maps a unit ID to its
+  item's resource ID (`{:ok, resource}`), or `:error` for an item that no
+  longer exists. Each item with a unit whose key changed, appeared or
+  disappeared gets one `:item` row; units no longer ranked lose their stored
+  key. Unchanged keys write nothing. Returns the person's head.
   """
-  def append_ranks(%AttentionServer.Store{change_log: true, db: db, engine: engine}, person, keys)
-      when is_map(keys) do
+  def append_ranks(
+        %AttentionServer.Store{change_log: true, db: db, engine: engine},
+        person,
+        keys,
+        item_of
+      )
+      when is_map(keys) and is_function(item_of, 1) do
     with {:ok, previous} <- rank_keys(%AttentionServer.Store{change_log: true, db: db}, person) do
       changed = for {id, key} <- keys, Map.get(previous, id) != key, do: id
       dropped = for {id, _} <- previous, not Map.has_key?(keys, id), do: id
 
+      items =
+        (changed ++ dropped)
+        |> Enum.flat_map(fn unit ->
+          case item_of.(unit) do
+            {:ok, resource} -> [resource]
+            _ -> []
+          end
+        end)
+        |> Enum.uniq()
+        |> Enum.sort()
+
       if changed == [] and dropped == [] do
         head(db, engine, person)
       else
-        write_ranks(db, engine, person, keys, Enum.sort(changed), dropped)
+        write_ranks(db, engine, person, Map.take(keys, changed), items, dropped)
       end
     end
   end
 
-  def append_ranks(%AttentionServer.Store{}, _person, _keys), do: {:error, :disabled}
+  def append_ranks(%AttentionServer.Store{}, _person, _keys, _item_of), do: {:error, :disabled}
 
-  defp write_ranks(db, engine, person, keys, changed, dropped) do
+  defp write_ranks(db, engine, person, keys, items, dropped) do
     now = System.system_time(:millisecond)
 
     result =
       with :ok <- Sqlite3.execute(db, "BEGIN IMMEDIATE"),
            {:ok, {head, floor, seed_rev}} <-
              load_meta(db, person, fn -> seeded?(engine, person) end),
-           {:ok, head} <- write_rows(db, person, Enum.map(changed, &{:item, &1}), head, now),
+           {:ok, head} <- write_rows(db, person, Enum.map(items, &{:item, &1}), head, now),
            :ok <-
              run(
                db,
@@ -572,7 +593,7 @@ defmodule AttentionServer.ChangeLog do
                  "ON CONFLICT (person_id) DO UPDATE SET head = excluded.head",
                [person, head, floor, seed_rev]
              ),
-           :ok <- store_rank_keys(db, person, Map.take(keys, changed), dropped),
+           :ok <- store_rank_keys(db, person, keys, dropped),
            :ok <- Sqlite3.execute(db, "COMMIT") do
         {:ok, head}
       end
