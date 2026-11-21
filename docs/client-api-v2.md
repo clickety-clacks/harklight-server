@@ -1535,10 +1535,19 @@ can skip agent-wide revisions.
 - Answers and terminal close-outs appear as `message` changes, including
   on sends without a session. The per-agent `rev` orders these changes
   against chat entries in commit order.
-- The first time a person-authored chat entry or answer is served on the
-  feed, the server records Delivered once. The receipt write is the
-  explicit handoff to the model. Delivery and receipt changes update the
-  same entry or message resource.
+- Delivered (`ack1`) means the server has durably committed a
+  person-authored chat entry or answer to a feed response for this agent.
+  The server records it once, before writing the JSON batch or SSE frame.
+  The agent reports the handoff outcome separately with a `handed` or
+  `not_handed` receipt. Delivery and receipt changes update the same entry
+  or message.
+- If the Delivered commit fails, the cursor stays at its position before
+  the batch or frame. A JSON batch returns `503 storage_unavailable` with
+  `Retry-After`. An SSE stream sends `closing` with reason
+  `storage_unavailable` and no `id:` line, then ends before writing the
+  affected frame. If the transport drops after a successful commit,
+  resuming from the agent's cursor returns the entry or answer again and
+  preserves the existing Delivered record.
 - A person sees the agent or session as listening while there is a covering
   open feed, or a covering batch was fetched in the last 60 seconds. Chat
   is stored and delivered on the next read regardless of feed activity.
