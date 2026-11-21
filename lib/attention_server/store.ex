@@ -1445,7 +1445,11 @@ defmodule AttentionServer.Store do
     %{
       pending: pending,
       seeded: seeded,
-      closings: AttentionServer.ChangeLog.closings(store.engine, next),
+      closings:
+        if(touched,
+          do: AttentionServer.ChangeLog.closings(store.engine, next, touched),
+          else: AttentionServer.ChangeLog.closings(store.engine, next)
+        ),
       created: AttentionServer.ChangeLog.new_resources(store.engine, next, changed),
       agent_pending: AttentionServer.AgentChangeLog.changes(store.engine, next, changed)
     }

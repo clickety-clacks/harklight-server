@@ -246,6 +246,7 @@ defmodule AttentionServer.ChangeLog do
       )
     )
     |> Map.put(:settings, touched_settings(touched, old, next))
+    |> Map.put(:advisories, for({:advisory, scope, {:entry, seq}} <- touched, do: {scope, seq}))
   end
 
   defp changed_candidates(keys, old, next) do
@@ -441,6 +442,37 @@ defmodule AttentionServer.ChangeLog do
       end
 
     devices ++ paused ++ owners
+  end
+
+  def closings(old, next, touched) do
+    Enum.flat_map(touched, fn
+      {:row, :devices, key} ->
+        case Map.fetch(old.devices, key) do
+          {:ok, device} ->
+            replacement = Map.get(next.devices, key)
+
+            if not Map.get(device, :revoked, false) and
+                 (is_nil(replacement) or Map.get(replacement, :revoked, false)),
+               do: [{{:device, key}, :revoked}],
+               else: []
+
+          :error ->
+            []
+        end
+
+      {:row, :delivery_states, person} ->
+        if old.delivery_states[person] != "STOPPED" and next.delivery_states[person] == "STOPPED",
+          do: [{{:person, person}, :account_paused}],
+          else: []
+
+      {:row, :owners, person} ->
+        if Map.has_key?(old.owners, person) and old.owners[person] != next.owners[person],
+          do: [{{:owner, person}, :revoked}],
+          else: []
+
+      _ ->
+        []
+    end)
   end
 
   @doc """

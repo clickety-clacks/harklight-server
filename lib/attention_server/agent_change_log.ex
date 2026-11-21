@@ -74,7 +74,7 @@ defmodule AttentionServer.AgentChangeLog do
         item_row(next, key, :entry, fn -> ChangeLog.entry_resource(seq) end)
       end)
 
-    (messages ++ entries ++ advisory_changes(old, next))
+    (messages ++ entries ++ advisory_changes(old, next, changed))
     |> Enum.group_by(fn {agent, _row} -> agent end, fn {_agent, row} -> row end)
   end
 
@@ -88,7 +88,14 @@ defmodule AttentionServer.AgentChangeLog do
     end
   end
 
-  defp advisory_changes(old, next) do
+  defp advisory_changes(old, next, %{advisories: keys}) do
+    for {{person, agent, session} = scope, seq} <- Enum.sort(keys),
+        seq > (get_in(old.advisory_feeds, [scope, :high]) || 0),
+        %{"advisory_id" => id} <- [get_in(next.advisory_feeds, [scope, :entries, seq])],
+        do: {{person, agent}, {:advisory, "advisory:" <> id, session}}
+  end
+
+  defp advisory_changes(old, next, _changed) do
     old.advisory_feeds
     |> changed_keys(next.advisory_feeds)
     |> Enum.sort()

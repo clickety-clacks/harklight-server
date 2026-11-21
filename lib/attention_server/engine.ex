@@ -5903,105 +5903,101 @@ defmodule AttentionServer.Engine do
   defp queue_push_hint(engine, person, high) do
     now_ms = System.system_time(:millisecond)
 
-    bindings =
-      Map.new(engine.push_bindings, fn
-        {{^person, _device} = key, %{active: true} = binding} ->
-          if high > Map.get(engine.cursors, key, 0) do
-            fresh =
-              binding.pending_high == 0 and binding.pending_conversation_high == 0
+    Enum.reduce(engine.push_bindings, engine, fn
+      {{^person, _device} = key, %{active: true} = binding}, current ->
+        if high > Map.get(engine.cursors, key, 0) do
+          fresh =
+            binding.pending_high == 0 and binding.pending_conversation_high == 0
 
-            # The first unsent item is eligible at once. Items arriving within
-            # five minutes of the last push, or during an in-flight push, wait
-            # for the end of that window and go out as one push.
-            opens_window? =
-              fresh or
-                (binding.state == "sending" and high > binding.pending_high and
-                   is_nil(binding.next_at))
+          # The first unsent item is eligible at once. Items arriving within
+          # five minutes of the last push, or during an in-flight push, wait
+          # for the end of that window and go out as one push.
+          opens_window? =
+            fresh or
+              (binding.state == "sending" and high > binding.pending_high and
+                 is_nil(binding.next_at))
 
-            deadline_at = if opens_window?, do: now_ms, else: binding.deadline_at
+          deadline_at = if opens_window?, do: now_ms, else: binding.deadline_at
 
-            next_at = if opens_window?, do: push_open_at(binding, now_ms), else: binding.next_at
+          next_at = if opens_window?, do: push_open_at(binding, now_ms), else: binding.next_at
 
-            state =
-              cond do
-                binding.state in ["sending", "blocked_configuration"] -> binding.state
-                fresh -> "queued"
-                true -> binding.state
-              end
+          state =
+            cond do
+              binding.state in ["sending", "blocked_configuration"] -> binding.state
+              fresh -> "queued"
+              true -> binding.state
+            end
 
-            {key,
-             %{
-               binding
-               | pending_high: max(binding.pending_high, high),
-                 deadline_at: deadline_at,
-                 next_at: next_at,
-                 state: state
-             }}
-          else
-            {key, binding}
-          end
+          updated = %{
+            binding
+            | pending_high: max(binding.pending_high, high),
+              deadline_at: deadline_at,
+              next_at: next_at,
+              state: state
+          }
 
-        {key, binding} ->
-          {key, binding}
-      end)
+          put_row(current, :push_bindings, key, updated)
+        else
+          current
+        end
 
-    %{engine | push_bindings: bindings}
+      _, current ->
+        current
+    end)
   end
 
   defp queue_conversation_hint(engine, person, high) do
     now_ms = System.system_time(:millisecond)
 
-    bindings =
-      Map.new(engine.push_bindings, fn
-        {{^person, _device} = key, %{active: true} = binding} ->
-          reply? =
-            case Map.get(engine.conversation_events, {person, high}) do
-              %{key: message_key, payload: %{"kind" => "reply", "author" => "origin"}} ->
-                engine.messages[message_key].origin != elem(key, 1)
+    Enum.reduce(engine.push_bindings, engine, fn
+      {{^person, _device} = key, %{active: true} = binding}, current ->
+        reply? =
+          case Map.get(engine.conversation_events, {person, high}) do
+            %{key: message_key, payload: %{"kind" => "reply", "author" => "origin"}} ->
+              engine.messages[message_key].origin != elem(key, 1)
 
-              _ ->
-                false
-            end
-
-          if (reply? and high > binding.accepted_conversation_high) or
-               (MapSet.member?(engine.conversation_opened, key) and
-                  high > Map.get(engine.conversation_cursors, key, 0)) do
-            fresh =
-              binding.pending_high == 0 and binding.pending_conversation_high == 0
-
-            opens_window? =
-              fresh or
-                (binding.state == "sending" and high > binding.pending_conversation_high and
-                   is_nil(binding.next_at))
-
-            deadline_at = if opens_window?, do: now_ms, else: binding.deadline_at
-
-            next_at = if opens_window?, do: push_open_at(binding, now_ms), else: binding.next_at
-
-            state =
-              cond do
-                binding.state in ["sending", "blocked_configuration"] -> binding.state
-                fresh -> "queued"
-                true -> binding.state
-              end
-
-            {key,
-             %{
-               binding
-               | pending_conversation_high: max(binding.pending_conversation_high, high),
-                 deadline_at: deadline_at,
-                 next_at: next_at,
-                 state: state
-             }}
-          else
-            {key, binding}
+            _ ->
+              false
           end
 
-        {key, binding} ->
-          {key, binding}
-      end)
+        if (reply? and high > binding.accepted_conversation_high) or
+             (MapSet.member?(engine.conversation_opened, key) and
+                high > Map.get(engine.conversation_cursors, key, 0)) do
+          fresh =
+            binding.pending_high == 0 and binding.pending_conversation_high == 0
 
-    %{engine | push_bindings: bindings}
+          opens_window? =
+            fresh or
+              (binding.state == "sending" and high > binding.pending_conversation_high and
+                 is_nil(binding.next_at))
+
+          deadline_at = if opens_window?, do: now_ms, else: binding.deadline_at
+
+          next_at = if opens_window?, do: push_open_at(binding, now_ms), else: binding.next_at
+
+          state =
+            cond do
+              binding.state in ["sending", "blocked_configuration"] -> binding.state
+              fresh -> "queued"
+              true -> binding.state
+            end
+
+          updated = %{
+            binding
+            | pending_conversation_high: max(binding.pending_conversation_high, high),
+              deadline_at: deadline_at,
+              next_at: next_at,
+              state: state
+          }
+
+          put_row(current, :push_bindings, key, updated)
+        else
+          current
+        end
+
+      _, current ->
+        current
+    end)
   end
 
   # Unresolved deliveries gathered since the last push this device accepted

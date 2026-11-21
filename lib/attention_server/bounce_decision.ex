@@ -340,7 +340,11 @@ defmodule AttentionServer.BounceDecision do
           else
             updated = %{feed | receipts: MapSet.put(feed.receipts, advisory_id)}
 
-            {:ok, %{engine | advisory_feeds: Map.put(engine.advisory_feeds, feed_key, updated)},
+            engine =
+              %{engine | advisory_feeds: Map.put(engine.advisory_feeds, feed_key, updated)}
+              |> Engine.touch_fact({:advisory, feed_key, {:receipt, advisory_id}})
+
+            {:ok, engine,
              %{
                "session_handle" => handle,
                "advisory_id" => advisory_id,
@@ -651,7 +655,10 @@ defmodule AttentionServer.BounceDecision do
         advisory_id_index: Map.put(engine.advisory_id_index, {feed_key, advisory_id}, sequence)
     }
 
-    update_selection(engine, key, state, sub_revision, selection, "bounced", nil, advisory_id)
+    engine
+    |> Engine.touch_fact({:advisory, feed_key, :high})
+    |> Engine.touch_fact({:advisory, feed_key, {:entry, sequence}})
+    |> update_selection(key, state, sub_revision, selection, "bounced", nil, advisory_id)
   end
 
   defp update_selection(

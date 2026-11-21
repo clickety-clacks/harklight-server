@@ -360,6 +360,33 @@ defmodule AttentionServer.Store.EngineTransitionTest do
     :ok = Store.close(keyed)
   end
 
+  test "keyed advisory and closing projections match legacy output" do
+    scope = {@person, @origin, "session"}
+    old = setup_engine(Engine.new())
+    next = put_in(old.devices[@reader].revoked, true)
+
+    next =
+      put_in(next.advisory_feeds[scope], %{
+        high: 1,
+        entries: %{1 => %{"advisory_id" => "id"}},
+        receipts: MapSet.new()
+      })
+
+    keys =
+      MapSet.new([
+        {:row, :devices, @reader},
+        {:advisory, scope, :high},
+        {:advisory, scope, {:entry, 1}}
+      ])
+
+    keyed = ChangeLog.changed_resources(old, next, keys)
+    legacy = ChangeLog.changed_resources(old, next)
+
+    assert ChangeLog.closings(old, next, keys) == ChangeLog.closings(old, next)
+    assert AgentChangeLog.changes(old, next, keyed) == AgentChangeLog.changes(old, next, legacy)
+    assert map_size(AgentChangeLog.changes(old, next, keyed)) == 1
+  end
+
   defp replace_body(engine, item, body) do
     engine
     |> put_in([Access.key!(:messages), item, :message, "body"], body)
