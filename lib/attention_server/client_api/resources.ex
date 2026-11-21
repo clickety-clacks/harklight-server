@@ -470,6 +470,28 @@ defmodule AttentionServer.ClientAPI.Resources do
     end)
   end
 
+  @doc """
+  The keys of `ranks/4`'s output by rank unit id: what the change log keeps
+  and passes back as `previous`. An item row's unit id is its `item_id`; its
+  chat-reply row's is `"r"` followed by the `item_id`.
+  """
+  def rank_unit_keys(ranks) when is_map(ranks) do
+    Enum.reduce(ranks, %{}, fn {id, rank}, acc ->
+      acc = Map.put(acc, id, Map.fetch!(rank, "key"))
+
+      case rank do
+        %{"_reply" => %{"key" => key}} -> Map.put(acc, "r" <> id, key)
+        _ -> acc
+      end
+    end)
+  end
+
+  @doc "The engine key of the item a rank unit belongs to."
+  def rank_unit_item(%Engine{} = engine, person, "r" <> item_id),
+    do: item_key(engine, person, item_id)
+
+  def rank_unit_item(%Engine{} = engine, person, item_id), do: item_key(engine, person, item_id)
+
   defp unit_id({:item, id, _, _, _}), do: id
   defp unit_id({:reply, id, _, _, _}), do: "r" <> id
 
@@ -849,6 +871,15 @@ defmodule AttentionServer.ClientAPI.Resources do
   @unconfigured_push %{"state" => "unconfigured", "revision" => 0}
 
   ## Rendering
+
+  @doc """
+  Sets `Entry.at_ms` from the change log's first-seen time. Entries from
+  before the cut-over have none and stay without it.
+  """
+  def put_at(entry, at_ms) when is_integer(at_ms) and at_ms >= 0,
+    do: Map.put(entry, "at_ms", at_ms)
+
+  def put_at(entry, _none), do: entry
 
   @doc "Sets the resource `rev` from the change log on a projected resource."
   def stamp(payload, rev) when is_map(payload) and is_integer(rev) and rev > 0,

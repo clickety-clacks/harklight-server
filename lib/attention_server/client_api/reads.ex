@@ -332,6 +332,7 @@ defmodule AttentionServer.ClientAPI.Reads do
           Enum.map(page, fn entry ->
             entry
             |> Resources.stamp(entry_rev(state, principal.person, entry))
+            |> Resources.put_at(first_seen(state, principal.person, entry))
             |> then(&Resources.render(:entry, &1, principal))
           end)
 
@@ -489,6 +490,13 @@ defmodule AttentionServer.ClientAPI.Reads do
     |> Resources.entry_sources()
     |> Enum.map(&rev(state, person, ChangeLog.entry_resource(&1)))
     |> Enum.max()
+  end
+
+  defp first_seen(state, person, entry) do
+    case ChangeLog.created_at(state.store, person, ChangeLog.entry_resource(entry["position"])) do
+      {:ok, at_ms} -> at_ms
+      _ -> nil
+    end
   end
 
   defp previous_rank_keys(_state, _person), do: %{}
