@@ -583,7 +583,7 @@ defmodule AttentionServer.Store.EngineTransitionTest do
     assert map_size(AgentChangeLog.changes(old, next, keyed)) == 1
   end
 
-  test "keyed session closure durably publishes availability for its open requests" do
+  test "keyed origin session changes durably publish availability for its open requests" do
     path = legacy_store_path()
     handle = "00000000-0000-4000-8000-000000000010"
     {:ok, store} = Store.open(path)
@@ -591,16 +591,6 @@ defmodule AttentionServer.Store.EngineTransitionTest do
     line = send |> Map.put("session_handle", handle) |> JSON.encode_line()
     {engine, {:ok, accepted}} = Engine.request_line(store.engine, @origin, line, 100)
     assert {:ok, %{"type" => "ok"}} = JSON.decode_line(accepted)
-
-    assert {:ok, engine, _} =
-             Engine.origin_support(engine, @origin, %{
-               "type" => "support",
-               "op_id" => "00000000-0000-4000-8000-000000000011",
-               "session_handle" => handle,
-               "route" => "claude-code",
-               "cli_version" => "test",
-               "unsupported_reason" => nil
-             })
 
     assert {:ok, store} =
              Store.commit(store, engine, %{person: @person, actor: @origin, action: "setup"})
@@ -612,6 +602,47 @@ defmodule AttentionServer.Store.EngineTransitionTest do
 
     {:ok, relay} =
       Relay.start_link(store_path: path, store_mode: :keyed, feature_flags_path: flags)
+
+    support = %{
+      "type" => "support",
+      "op_id" => "00000000-0000-4000-8000-000000000011",
+      "session_handle" => handle,
+      "route" => "other",
+      "cli_version" => "test",
+      "unsupported_reason" => nil,
+      "origin_listener" => true
+    }
+
+    assert {:ok, %{"listening_support" => %{"origin_listener" => true}}} =
+             Relay.origin_support(relay, @origin, support)
+
+    supported = :sys.get_state(relay).store.version
+    assert {:ok, %{"duplicate" => true}} = Relay.origin_support(relay, @origin, support)
+    assert :sys.get_state(relay).store.version == supported
+
+    assert {:ok, %{"vendor_session_id" => "attached-vendor"}} =
+             Relay.origin_attachment_update(relay, @origin, %{
+               "type" => "attachment_update",
+               "op_id" => "00000000-0000-4000-8000-000000000012",
+               "session_handle" => handle,
+               "vendor_session_id" => "attached-vendor"
+             })
+
+    assert :ok = Relay.origin_stream_attach(relay, @origin, handle, self())
+    assert {:ok, %{"availability" => "listening"}} = Relay.origin_status(relay, @origin, handle)
+    assert :ok = Relay.origin_stream_detach(relay, @origin, handle, self())
+    assert :ok = Relay.origin_stream_attach(relay, @origin, :origin, self())
+    assert {:ok, %{"availability" => "listening"}} = Relay.origin_status(relay, @origin, handle)
+    assert :ok = Relay.origin_stream_detach(relay, @origin, :origin, self())
+
+    assert {:ok, %{"availability" => "not_listening", "last_detached_at" => at}} =
+             Relay.origin_status(relay, @origin, handle)
+
+    assert is_integer(at)
+    assert {:ok, changes, 5} = Relay.conversation_events(relay, @reader, 0)
+
+    assert Enum.map(changes, & &1["availability"]) ==
+             ~w(not_listening listening not_listening listening not_listening)
 
     before = :sys.get_state(relay).store
     scope = {@person, @origin}

@@ -3222,9 +3222,18 @@ defmodule AttentionServer.Store do
        when field in [:sender_grants, :subscriptions, :origin_feeds],
        do: not Map.has_key?(Map.fetch!(engine, field), key) or owns?(engine, person, actor)
 
-  defp valid_authority_reference?(engine, {:row, field, {person, actor, _} = key})
-       when field in [:source_report_grants, :origin_sessions],
-       do: not Map.has_key?(Map.fetch!(engine, field), key) or owns?(engine, person, actor)
+  defp valid_authority_reference?(
+         engine,
+         {:row, :source_report_grants, {person, actor, _} = key}
+       ),
+       do: not Map.has_key?(engine.source_report_grants, key) or owns?(engine, person, actor)
+
+  defp valid_authority_reference?(engine, {:row, :origin_sessions, key}) do
+    case Map.fetch(engine.origin_sessions, key) do
+      {:ok, session} -> Conversation.valid_origin_session?(engine, key, session)
+      :error -> true
+    end
+  end
 
   defp valid_authority_reference?(engine, {:row, field, {person, actor} = key})
        when field in [:cursors, :conversation_cursors] do

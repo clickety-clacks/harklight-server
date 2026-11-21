@@ -13,6 +13,7 @@ defmodule AttentionServer.RouteBIndex do
       advisory_sequences: %{},
       messages_by_origin_session: %{},
       request_keys_by_id: nil,
+      covered_sessions_by_origin: %{},
       conversation_summary_by_item: %{},
       unresolved_count_by_person: %{}
     }
@@ -36,7 +37,9 @@ defmodule AttentionServer.RouteBIndex do
         put_conversation_event(current, person, seq, event.key, event.payload)
       end)
 
-    index_advisories(index, engine.advisory_feeds)
+    index
+    |> index_advisories(engine.advisory_feeds)
+    |> index_covered_sessions(engine.origin_sessions)
   end
 
   def enable_keyed_lookups(engine) do
@@ -48,8 +51,45 @@ defmodule AttentionServer.RouteBIndex do
           if index.agent_feed?, do: index, else: put_session_message(index, key, nil, record)
       end)
 
-    %{engine | route_b_index: index}
+    %{engine | route_b_index: index_covered_sessions(index, engine.origin_sessions)}
   end
+
+  defp index_covered_sessions(%{request_keys_by_id: lookup} = index, sessions)
+       when is_map(lookup) do
+    Enum.reduce(sessions, %{index | covered_sessions_by_origin: %{}}, fn {key, session}, acc ->
+      put_origin_session(acc, key, nil, session)
+    end)
+  end
+
+  defp index_covered_sessions(index, _sessions), do: index
+
+  def put_origin_session(
+        %{request_keys_by_id: lookup} = index,
+        {person, origin, handle},
+        prior,
+        next
+      )
+      when is_map(lookup) do
+    old? = get_in(prior, [:support, "origin_listener"]) == true
+    new? = get_in(next, [:support, "origin_listener"]) == true
+
+    if old? == new? do
+      index
+    else
+      scope = {person, origin}
+      covered = Map.get(index.covered_sessions_by_origin, scope, MapSet.new())
+      updated = if new?, do: MapSet.put(covered, handle), else: MapSet.delete(covered, handle)
+
+      scopes =
+        if MapSet.size(updated) == 0,
+          do: Map.delete(index.covered_sessions_by_origin, scope),
+          else: Map.put(index.covered_sessions_by_origin, scope, updated)
+
+      %{index | covered_sessions_by_origin: scopes}
+    end
+  end
+
+  def put_origin_session(index, _key, _prior, _next), do: index
 
   defp put_request_key(%{request_keys_by_id: lookup} = index, {person, _, id} = key, nil)
        when is_map(lookup) do

@@ -95,6 +95,7 @@ defmodule AttentionServer.Engine do
               advisory_sequences: %{},
               messages_by_origin_session: %{},
               request_keys_by_id: nil,
+              covered_sessions_by_origin: %{},
               conversation_summary_by_item: %{},
               unresolved_count_by_person: %{}
             }

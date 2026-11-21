@@ -49,12 +49,7 @@ defmodule AttentionServer.Conversation do
           |> Map.put("origin", origin)
           |> Map.put("reported_at", System.system_time(:millisecond))
 
-        {:ok,
-         %{
-           engine
-           | origin_sessions:
-               Map.put(engine.origin_sessions, key, Map.put(session, :support, record))
-         }, record}
+        {:ok, put_session(engine, key, Map.put(session, :support, record)), record}
     end
   end
 
@@ -68,7 +63,7 @@ defmodule AttentionServer.Conversation do
       session ->
         updated = Map.put(session, :vendor_session_id, vendor_session_id)
 
-        {:ok, %{engine | origin_sessions: Map.put(engine.origin_sessions, key, updated)}, updated}
+        {:ok, put_session(engine, key, updated), updated}
     end
   end
 
@@ -123,7 +118,7 @@ defmodule AttentionServer.Conversation do
       |> ConversationFiles.put_entry(Map.get(record, :files_by_revision, %{}) |> Map.get(1, []))
 
     engine
-    |> Engine.put_row(:origin_sessions, session_key, session)
+    |> put_session(session_key, session)
     |> append_entry(person, origin, entry)
   end
 
@@ -487,7 +482,7 @@ defmodule AttentionServer.Conversation do
         {:error, :not_found}
 
       session ->
-        {:ok, Engine.put_row(engine, :origin_sessions, key, %{session | gone: true})}
+        {:ok, put_session(engine, key, %{session | gone: true})}
     end
   end
 
@@ -499,11 +494,7 @@ defmodule AttentionServer.Conversation do
         {:error, :not_found}
 
       session ->
-        {:ok,
-         %{
-           engine
-           | origin_sessions: Map.put(engine.origin_sessions, key, %{session | gone: false})
-         }}
+        {:ok, put_session(engine, key, %{session | gone: false})}
     end
   end
 
@@ -516,8 +507,20 @@ defmodule AttentionServer.Conversation do
 
       session ->
         updated = %{session | last_detached_at: System.system_time(:millisecond)}
-        {:ok, %{engine | origin_sessions: Map.put(engine.origin_sessions, key, updated)}}
+        {:ok, put_session(engine, key, updated)}
     end
+  end
+
+  defp put_session(engine, key, session) do
+    index =
+      AttentionServer.RouteBIndex.put_origin_session(
+        engine.route_b_index,
+        key,
+        Map.get(engine.origin_sessions, key),
+        session
+      )
+
+    Engine.put_row(%{engine | route_b_index: index}, :origin_sessions, key, session)
   end
 
   defp needs_action?(engine, person, %{"kind" => "discussion"} = entry) do
@@ -610,6 +613,19 @@ defmodule AttentionServer.Conversation do
   end
 
   @doc false
+  def valid_origin_session?(engine, {person, origin, handle}, session) do
+    get_in(engine.devices, [origin, :person]) == person and
+      valid_session?(handle, session.vendor_session_id) and
+      valid_support_record?(Map.get(session, :support)) and
+      (is_nil(Map.get(session, :support)) or session.support["origin"] == origin) and
+      is_boolean(session.gone) and
+      (is_nil(session.last_detached_at) or
+         (is_integer(session.last_detached_at) and session.last_detached_at > 0))
+  rescue
+    _ -> false
+  end
+
+  @doc false
   def valid_origin_receipt?(engine, {person, origin, seq}, receipt) do
     entry = get_in(engine.origin_feeds, [{person, origin}, :entries, seq])
 
@@ -638,14 +654,8 @@ defmodule AttentionServer.Conversation do
             Message.uuid_v4?(entry["session_handle"])
         end)
     end) and
-      Enum.all?(engine.origin_sessions, fn {{person, origin, handle}, session} ->
-        get_in(engine.devices, [origin, :person]) == person and
-          valid_session?(handle, session.vendor_session_id) and
-          valid_support_record?(Map.get(session, :support)) and
-          (is_nil(Map.get(session, :support)) or session.support["origin"] == origin) and
-          is_boolean(session.gone) and
-          (is_nil(session.last_detached_at) or
-             (is_integer(session.last_detached_at) and session.last_detached_at > 0))
+      Enum.all?(engine.origin_sessions, fn {key, session} ->
+        valid_origin_session?(engine, key, session)
       end) and
       Enum.all?(engine.origin_receipts, fn {key, receipt} ->
         valid_origin_receipt?(engine, key, receipt)
