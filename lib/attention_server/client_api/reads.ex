@@ -45,10 +45,10 @@ defmodule AttentionServer.ClientAPI.Reads do
   @impl true
   def routes do
     [
-      {"GET", ["inbox"], :get_inbox},
-      {"GET", ["items", :item_id], :get_item},
-      {"GET", ["items", :item_id, "entries"], :get_entries},
-      {"GET", ["items", :item_id, "revisions", :n], :get_revision},
+      {"GET", ["inbox"], :get_inbox, granted_agent: true},
+      {"GET", ["items", :item_id], :get_item, granted_agent: true},
+      {"GET", ["items", :item_id, "entries"], :get_entries, granted_agent: true},
+      {"GET", ["items", :item_id, "revisions", :n], :get_revision, granted_agent: true},
       {"GET", ["settings"], :get_settings},
       {"GET", ["me"], :get_me},
       {"GET", ["files", :file_id], :get_file}
@@ -471,6 +471,16 @@ defmodule AttentionServer.ClientAPI.Reads do
            kind: :browser,
            senders: MapSet.new()
          }}
+
+      _ ->
+        {:error, :unauthorized}
+    end
+  end
+
+  defp principal(engine, %{kind: :agent, person: person, key: key}) do
+    case Engine.agent_identity(engine, key) do
+      {:ok, ^person, _id, _revision} ->
+        {:ok, %{person: person, key: key, kind: :agent, senders: MapSet.new()}}
 
       _ ->
         {:error, :unauthorized}

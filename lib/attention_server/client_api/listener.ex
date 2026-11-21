@@ -4,9 +4,8 @@ defmodule AttentionServer.ClientAPI.Listener do
   HTTP/2 through ALPN and HTTP/1.1, serving `/v2` only.
 
   It takes the device relay's port when `client_api_v2` is on; the server never
-  runs it beside `WebSocketRelay`. The TLS handshake admits only a currently
-  enrolled device certificate, exactly as `WebSocketRelay` does
-  (`EnrolledLeafVerify.device/1`), so a revoked device fails at the handshake.
+  runs it beside `WebSocketRelay`. It admits enrolled device certificates and
+  owner-registered agent certificates.
   """
 
   alias AttentionServer.ClientAPI.Router
@@ -42,7 +41,7 @@ defmodule AttentionServer.ClientAPI.Listener do
         transport_options: [
           versions: [:"tlsv1.3"],
           verify: :verify_peer,
-          verify_fun: EnrolledLeafVerify.device(relay),
+          verify_fun: EnrolledLeafVerify.client_api(relay),
           fail_if_no_peer_cert: true,
           cacertfile: Keyword.fetch!(opts, :cacertfile),
           reuseaddr: true,

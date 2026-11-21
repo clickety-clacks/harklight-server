@@ -28,7 +28,7 @@ defmodule AttentionServer.ClientAPI.Feed do
   @max_limit 500
 
   @impl true
-  def routes, do: [{"GET", ["changes"], :changes, stream: true}]
+  def routes, do: [{"GET", ["changes"], :changes, stream: true, granted_agent: true}]
 
   def changes(conn, %Context{} = ctx) do
     conn = fetch_query_params(conn)
