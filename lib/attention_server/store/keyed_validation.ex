@@ -54,7 +54,9 @@ defmodule AttentionServer.Store.KeyedValidation do
     :devices,
     :agents,
     :pending_enrollments,
-    :pending_history
+    :pending_history,
+    :browser_sign_ins,
+    :join_invitations
   ]
 
   def authority_index(engine) do
@@ -69,6 +71,9 @@ defmodule AttentionServer.Store.KeyedValidation do
       edit_authority_index(acc, engine, {:member, :conversation_opened, key}, :add)
     end)
   end
+
+  def scoped_rows(index, field, scope),
+    do: Map.get(index, {:scope, field, scope}, MapSet.new())
 
   def authority_changes(index, old, next, touched) do
     updated =
@@ -136,8 +141,15 @@ defmodule AttentionServer.Store.KeyedValidation do
 
   defp authority_owners(engine, {:row, :uploads, id}) do
     case Map.get(engine.uploads, id) do
-      nil -> []
-      upload -> [{:person, upload.person}, {:actor, upload.uploader}]
+      nil ->
+        []
+
+      upload ->
+        [
+          {:person, upload.person},
+          {:actor, upload.uploader},
+          {:scope, :uploads, {upload.person, upload.uploader}}
+        ]
     end
   end
 
@@ -165,6 +177,14 @@ defmodule AttentionServer.Store.KeyedValidation do
     end
   end
 
+  defp authority_owners(engine, {:row, field, token})
+       when field in [:browser_sign_ins, :join_invitations] do
+    case Map.get(Map.fetch!(engine, field), token) do
+      %{person: person} -> [{:scope, field, person}]
+      _ -> []
+    end
+  end
+
   defp authority_owners(engine, {:row, field, {person, actor} = key})
        when field in [
               :sender_grants,
@@ -178,8 +198,14 @@ defmodule AttentionServer.Store.KeyedValidation do
   end
 
   defp authority_owners(engine, {:row, field, {person, actor, _} = key})
-       when field in [:source_report_grants, :origin_sessions] do
+       when field == :source_report_grants do
     row_owners(engine, field, key, person, actor)
+  end
+
+  defp authority_owners(engine, {:row, :origin_sessions, {person, actor, _} = key}) do
+    if Map.has_key?(engine.origin_sessions, key),
+      do: [{:person, person}, {:actor, actor}, {:scope, :origin_sessions, {person, actor}}],
+      else: []
   end
 
   defp authority_owners(engine, {:member, :conversation_opened, {person, actor} = key}) do

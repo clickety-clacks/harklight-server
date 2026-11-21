@@ -915,25 +915,16 @@ defmodule AttentionServer.Engine do
         String.trim(label) != "" and not Regex.match?(~r/\p{C}/u, label)
 
   @doc "Local-operator recovery preserves person identity and retires the old key forever."
-  def operator_recover(%__MODULE__{} = engine, person, new_key) do
+  def operator_recover(%__MODULE__{} = engine, person, new_key, rows \\ :all) do
     case Map.get(engine.owners, person) do
       %{key: old_key, revision: revision} = owner ->
         if hex_key?(new_key) and not principal_key_used?(engine, new_key) do
-          {:ok,
-           %{
-             engine
-             | owners:
-                 Map.put(engine.owners, person, %{owner | key: new_key, revision: revision + 1}),
-               retired_owner_keys: MapSet.put(engine.retired_owner_keys, old_key),
-               browser_sign_ins:
-                 Map.reject(engine.browser_sign_ins, fn {_, sign_in} ->
-                   Map.get(sign_in, :person) == person
-                 end),
-               join_invitations:
-                 Map.reject(engine.join_invitations, fn {_, invitation} ->
-                   Map.get(invitation, :person) == person
-                 end)
-           }}
+          next =
+            engine
+            |> put_row(:owners, person, %{owner | key: new_key, revision: revision + 1})
+            |> put_member(:retired_owner_keys, old_key)
+
+          {:ok, revoke_owner_credentials(next, person, rows)}
         else
           {:error, :key_in_use}
         end
@@ -941,6 +932,23 @@ defmodule AttentionServer.Engine do
       _ ->
         {:error, :not_found}
     end
+  end
+
+  defp revoke_owner_credentials(engine, person, :all) do
+    Enum.reduce([:browser_sign_ins, :join_invitations], engine, fn field, next ->
+      Map.update!(next, field, fn values ->
+        Map.reject(values, fn {_, item} -> Map.get(item, :person) == person end)
+      end)
+    end)
+  end
+
+  defp revoke_owner_credentials(engine, person, rows) do
+    Enum.reduce(rows, engine, fn {:row, field, key}, next ->
+      case Map.get(Map.fetch!(next, field), key) do
+        %{person: ^person} -> delete_row(next, field, key)
+        _ -> next
+      end
+    end)
   end
 
   def owner_revision(%__MODULE__{} = engine, person, key) do
@@ -2104,6 +2112,19 @@ defmodule AttentionServer.Engine do
     if is_nil(engine.touched_keys) or Map.fetch(rows, key) === {:ok, value},
       do: next,
       else: touch_fact(next, {:row, field, key})
+  end
+
+  @doc false
+  def delete_row(%__MODULE__{} = engine, field, key) do
+    case Map.pop(Map.fetch!(engine, field), key) do
+      {nil, _} ->
+        engine
+
+      {_, remaining} ->
+        engine
+        |> Map.replace!(field, remaining)
+        |> touch_fact({:row, field, key})
+    end
   end
 
   @doc false

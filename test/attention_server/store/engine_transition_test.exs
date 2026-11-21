@@ -1565,6 +1565,131 @@ defmodule AttentionServer.Store.EngineTransitionTest do
     GenServer.stop(reopened)
   end
 
+  test "keyed device removal ends its sessions and forgets abandoned uploads in one generation" do
+    path = legacy_store_path()
+    {:ok, legacy} = Store.open(path)
+    {:ok, _} = KeyedMigration.convert(legacy)
+    :ok = Store.close(legacy)
+    opts = [store_path: path, store_mode: :keyed]
+    {:ok, relay} = Relay.start_link(opts)
+    handle = "00000000-0000-4000-8000-000000000079"
+    {:ok, frame} = JSON.decode_line(forward_line())
+
+    assert {:ok, reply} =
+             Relay.request_line(
+               relay,
+               @origin,
+               JSON.encode_line(Map.put(frame, "session_handle", handle))
+             )
+
+    assert {:ok, %{"type" => "ok"}} = JSON.decode_line(reply)
+
+    attrs = %{
+      "op_id" => "00000000-0000-4000-8000-000000000080",
+      "sender_id" => @sender,
+      "message_id" => "abandoned",
+      "revision" => 1,
+      "name" => "abandoned.bin"
+    }
+
+    data = "unreferenced"
+    source = Path.join(Path.dirname(path), "source.bin")
+    File.write!(source, data)
+    hash = Base.encode16(:crypto.hash(:sha256, data), case: :lower)
+    assert {:ok, lease} = Relay.upload_begin(relay, @origin, attrs, byte_size(data))
+
+    assert {:ok, %{"upload_id" => id}} =
+             Relay.upload_file(relay, @origin, attrs, source, byte_size(data), hash, lease)
+
+    assert :ok = Relay.upload_end(relay, lease)
+
+    before = :sys.get_state(relay).store
+    assert {:ok, upload_path} = Store.get_upload(before, id)
+
+    assert :ok =
+             Sqlite3.execute(before.db, """
+             CREATE TRIGGER keyed_device_remove_fault BEFORE INSERT ON relay_audit
+             WHEN NEW.action = 'device_self_remove'
+             BEGIN SELECT RAISE(ABORT, 'failed'); END
+             """)
+
+    assert {:error, :storage_unavailable} = Relay.device_remove(relay, @origin)
+    assert :sys.get_state(relay).store.version == before.version
+    assert File.read!(upload_path) == data
+    assert :ok = Sqlite3.execute(before.db, "DROP TRIGGER keyed_device_remove_fault")
+
+    assert {:ok, %{"state" => "removed", "enrollment_revision" => 2}} =
+             Relay.device_remove(relay, @origin)
+
+    live = :sys.get_state(relay).store
+    assert live.version == before.version + 1
+    assert live.engine.origin_sessions[{@person, @origin, handle}].gone
+    assert live.engine.devices[@origin].revoked
+    refute live.engine.devices[@reader].revoked
+    assert :error = Map.fetch(live.engine.uploads, id)
+    refute File.exists?(upload_path)
+    assert {:ok, %{"enrollment_revision" => 2}} = Relay.device_remove(relay, @origin)
+    assert :sys.get_state(relay).store.version == live.version
+
+    GenServer.stop(relay)
+    {:ok, reopened} = Store.open(path, :keyed)
+    assert full_diff(live.engine, reopened.engine) == MapSet.new()
+    assert index_state(live) == index_state(reopened)
+    audit = %{person: @person, actor: @origin, action: "file_cleanup_retry"}
+    assert {:ok, ^reopened} = Store.delete_uploads(reopened, [id], audit)
+    :ok = Store.close(reopened)
+  end
+
+  test "keyed owner recovery retires one owner's tokens and preserves unrelated authority" do
+    path = legacy_store_path()
+    {:ok, legacy} = Store.open(path)
+    a = "00000000-0000-4000-8000-000000000081"
+    b = "00000000-0000-4000-8000-000000000082"
+    a_key = String.duplicate("e", 64)
+    b_key = String.duplicate("f", 64)
+    cert = enrollment_certificate("replacement")
+    {:ok, replacement} = AttentionServer.DeviceIdentity.from_certificate(cert)
+    pem = :public_key.pem_encode([{:Certificate, cert, :not_encrypted}])
+    {:ok, config} = AttentionServer.GuidedJoin.configuration("relay.test", 18444, 18443, pem)
+
+    engine =
+      Enum.reduce([{a, a_key}, {b, b_key}], legacy.engine, fn {person, owner}, engine ->
+        {:ok, engine} = Engine.operator_bootstrap(engine, person, owner)
+        sign_in = :crypto.hash(:sha256, person <> "browser")
+        invitation = :crypto.hash(:sha256, person <> "join")
+
+        {:ok, engine, _} =
+          AttentionServer.BrowserSignIn.issue(engine, person, owner, sign_in, 100)
+
+        {:ok, engine, _} =
+          AttentionServer.GuidedJoin.create(engine, person, owner, invitation, config)
+
+        engine
+      end)
+
+    {:ok, legacy} = Store.commit(legacy, engine, %{person: a, actor: a_key, action: "setup"})
+    assert {:ok, _} = KeyedMigration.convert(legacy)
+    :ok = Store.close(legacy)
+    opts = [store_path: path, store_mode: :keyed]
+    {:ok, relay} = Relay.start_link(opts)
+
+    assert {:ok, 1} = Relay.owner_revision(relay, a, a_key)
+    assert :ok = Relay.operator_recover(relay, a, cert)
+    assert {:error, :forbidden} = Relay.owner_revision(relay, a, a_key)
+    assert {:ok, 2} = Relay.owner_revision(relay, a, replacement)
+    assert {:ok, 1} = Relay.owner_revision(relay, b, b_key)
+    live = :sys.get_state(relay).store
+    assert MapSet.member?(live.engine.retired_owner_keys, a_key)
+    assert [%{person: ^b}] = Map.values(live.engine.browser_sign_ins)
+    assert [%{person: ^b}] = Map.values(live.engine.join_invitations)
+    GenServer.stop(relay)
+
+    {:ok, reopened} = Store.open(path, :keyed)
+    assert full_diff(live.engine, reopened.engine) == MapSet.new()
+    assert index_state(live) == index_state(reopened)
+    :ok = Store.close(reopened)
+  end
+
   defp enrollment_certificate(name) do
     %{cert: der} =
       :public_key.pkix_test_root_cert(String.to_charlist(name), key: {:namedCurve, :secp256r1})

@@ -491,7 +491,7 @@ defmodule AttentionServer.Store do
 
     proposal =
       if store.mode == :keyed,
-        do: {next, MapSet.new(ids, &{:row, :uploads, &1})},
+        do: {next, existing_upload_rows(store.engine, ids)},
         else: next
 
     case commit(store, proposal, audit) do
@@ -526,6 +526,10 @@ defmodule AttentionServer.Store do
       {:error, reason, _} ->
         {:error, reason, store}
     end
+  end
+
+  defp existing_upload_rows(engine, ids) do
+    for id <- ids, Map.has_key?(engine.uploads, id), into: MapSet.new(), do: {:row, :uploads, id}
   end
 
   @doc "Remove upload files whose authority metadata was already removed by a prior commit."

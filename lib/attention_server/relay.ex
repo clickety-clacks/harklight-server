@@ -2393,13 +2393,11 @@ defmodule AttentionServer.Relay do
   end
 
   defp dispatch_call({:device_remove, key}, _from, state) do
-    case Engine.device_remove(state.store.engine, key) do
-      {:ok, next, reply} ->
-        next = revoke_origin_sessions(state, next, reply["person_id"], key)
-
+    case track_device_removal(state, key, &Engine.device_remove(&1, key)) do
+      {:ok, proposal, reply} ->
         case commit_device_removal(
                state,
-               next,
+               proposal,
                reply["person_id"],
                key,
                key,
@@ -2508,13 +2506,13 @@ defmodule AttentionServer.Relay do
   end
 
   defp dispatch_call({:owner_revoke_device, person, owner_key, device_key}, _from, state) do
-    case Engine.owner_revoke_device(state.store.engine, person, owner_key, device_key) do
-      {:ok, next_engine} ->
-        next_engine = revoke_origin_sessions(state, next_engine, person, device_key)
+    revoke = &Engine.owner_revoke_device(&1, person, owner_key, device_key)
 
+    case track_device_removal(state, device_key, revoke) do
+      {:ok, proposal, :ok} ->
         case commit_device_removal(
                state,
-               next_engine,
+               proposal,
                person,
                device_key,
                owner_key,
@@ -2649,15 +2647,27 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  defp dispatch_call({:operator_recover, person, key}, _from, state),
-    do:
-      setup(
-        state,
-        Engine.operator_recover(state.store.engine, person, key),
-        person,
-        "local_operator",
-        "owner_recovery"
-      )
+  defp dispatch_call({:operator_recover, person, key}, _from, state) do
+    rows = owner_credentials(state.store, person)
+
+    {next, result, touched} =
+      track_transition(state, state.store.engine, fn current ->
+        case Engine.operator_recover(current, person, key, rows) do
+          {:ok, next} -> {next, :ok}
+          error -> {current, error}
+        end
+      end)
+
+    with :ok <- result,
+         audit = %{person: person, actor: "local_operator", action: "owner_recovery"},
+         {:ok, store} <- commit_request(state.store, next, touched, audit) do
+      next = ensure_priority_view_if_missing(%{state | store: store}, person)
+      {:reply, :ok, next}
+    else
+      {:error, reason} -> {:reply, {:error, reason}, state}
+      {:error, _, _} -> {:reply, {:error, :storage_unavailable}, state}
+    end
+  end
 
   defp dispatch_call({:setup_person, person}, _from, state),
     do:
@@ -2833,13 +2843,11 @@ defmodule AttentionServer.Relay do
   defp dispatch_call({:revoke_device, key}, _from, state) do
     person = person_of(state.store.engine, key)
 
-    case Engine.revoke_device(state.store.engine, key) do
-      {:ok, next_engine} ->
-        next_engine = revoke_origin_sessions(state, next_engine, person, key)
-
+    case track_device_removal(state, key, &Engine.revoke_device(&1, key)) do
+      {:ok, proposal, :ok} ->
         case commit_device_removal(
                state,
-               next_engine,
+               proposal,
                person,
                key,
                "local_setup",
@@ -7044,21 +7052,61 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  defp commit_device_removal(state, next_engine, person, key, actor, action) do
-    engine = state.store.engine
+  defp track_device_removal(state, key, revoke) do
+    {next, result, touched} =
+      track_transition(state, state.store.engine, fn engine ->
+        case revoke.(engine) do
+          {:ok, next} -> stage_device_removal(state, next, key, :ok)
+          {:ok, next, reply} -> stage_device_removal(state, next, key, reply)
+          error -> {engine, error}
+        end
+      end)
+
+    case result do
+      {:ok, reply, removed} -> {:ok, {next, touched, removed}, reply}
+      error -> error
+    end
+  end
+
+  defp stage_device_removal(state, engine, key, reply) do
+    person = engine.devices[key].person
+    engine = revoke_origin_sessions(state, engine, person, key)
     references = Map.get(state.upload_index.references_by_person, person, MapSet.new())
 
-    abandoned_ids =
-      for {id, %{person: ^person, uploader: ^key}} <- engine.uploads,
+    removed =
+      for id <- device_upload_ids(state.store, person, key),
           not MapSet.member?(references, id),
           do: id
 
-    next_engine = %{next_engine | uploads: Map.drop(next_engine.uploads, abandoned_ids)}
+    next = Enum.reduce(removed, engine, &Engine.delete_row(&2, :uploads, &1))
+    {next, {:ok, reply, removed}}
+  end
+
+  defp device_upload_ids(%Store{mode: :keyed, authority_index: index}, person, key) do
+    for {:row, :uploads, id} <-
+          Store.KeyedValidation.scoped_rows(index, :uploads, {person, key}),
+        do: id
+  end
+
+  defp device_upload_ids(store, person, key) do
+    for {id, %{person: ^person, uploader: ^key}} <- store.engine.uploads, do: id
+  end
+
+  defp owner_credentials(%Store{mode: :keyed, authority_index: index}, person) do
+    Stream.concat(
+      Store.KeyedValidation.scoped_rows(index, :browser_sign_ins, person),
+      Store.KeyedValidation.scoped_rows(index, :join_invitations, person)
+    )
+  end
+
+  defp owner_credentials(_store, _person), do: :all
+
+  defp commit_device_removal(state, {next_engine, touched, removed}, person, key, actor, action) do
+    engine = state.store.engine
     audit = %{person: person, actor: actor, action: action}
 
-    case commit(state.store, next_engine, audit) do
+    case commit_request(state.store, next_engine, touched, audit) do
       {:ok, store} ->
-        removed = removed_upload_ids(engine, store.engine, abandoned_ids)
         upload_index = remove_uploads_from_index(state.upload_index, engine, removed)
 
         active_uploads =
@@ -7088,12 +7136,10 @@ defmodule AttentionServer.Relay do
   end
 
   defp revoke_origin_sessions(state, engine, person, origin) do
-    engine.origin_sessions
-    |> Enum.filter(fn {{session_person, session_origin, _handle}, _session} ->
-      session_person == person and session_origin == origin
-    end)
-    |> Enum.sort_by(fn {{_session_person, _session_origin, handle}, _session} -> handle end)
-    |> Enum.reduce(engine, fn {{^person, ^origin, handle} = key, _session}, current ->
+    state.store
+    |> device_session_keys(person, origin)
+    |> Enum.sort()
+    |> Enum.reduce(engine, fn {^person, ^origin, handle} = key, current ->
       previous = origin_session_status(state, state.store.engine, key)
 
       case Conversation.mark_gone(current, person, origin, handle) do
@@ -7113,6 +7159,16 @@ defmodule AttentionServer.Relay do
           current
       end
     end)
+  end
+
+  defp device_session_keys(%Store{mode: :keyed, authority_index: index}, person, origin) do
+    for {:row, :origin_sessions, key} <-
+          Store.KeyedValidation.scoped_rows(index, :origin_sessions, {person, origin}),
+        do: key
+  end
+
+  defp device_session_keys(store, person, origin) do
+    for {{^person, ^origin, _} = key, _session} <- store.engine.origin_sessions, do: key
   end
 
   defp end_origin_session(state, engine, key, handle, transport) do
