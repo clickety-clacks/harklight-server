@@ -57,7 +57,6 @@ defmodule AttentionServer.ClientAPI.FeedStream do
     watcher = watch(ctx, source)
     :ok = ChangeLog.subscribe_closing(ctx.principal)
     :ok = FeedShutdown.subscribe()
-    subscribe_shows(ctx.principal, source)
 
     try do
       open(conn, ctx, cursor, watcher, source)
@@ -75,6 +74,7 @@ defmodule AttentionServer.ClientAPI.FeedStream do
   defp open(conn, ctx, cursor, watcher, source) do
     case source.read(ctx, cursor, @page) do
       {:ok, changes, more, position} ->
+        subscribe_shows(ctx.principal, source)
         conn = start_stream(conn)
 
         send(watcher, {:feed_opened, self()})

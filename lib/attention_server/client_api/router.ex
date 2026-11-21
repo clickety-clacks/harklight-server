@@ -94,6 +94,7 @@ defmodule AttentionServer.ClientAPI.Router do
   @route_modules [
     AttentionServer.ClientAPI.Reads,
     AttentionServer.ClientAPI.AgentReads,
+    AttentionServer.ClientAPI.AgentShow,
     AttentionServer.ClientAPI.AgentWrites,
     AttentionServer.ClientAPI.Writes,
     AttentionServer.ClientAPI.Feed,

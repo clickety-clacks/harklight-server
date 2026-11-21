@@ -43,15 +43,16 @@ defmodule AttentionServer.ClientAPI.Focus do
     do: Registry.unregister(@registry, {:client_api_show, device_key})
 
   @doc false
-  # The held show stays in the relay. This only wakes subscribed feeds.
-  def notify_show(device_key) do
+  # The show stays in Relay memory. Sending only hands the notification to
+  # each open device feed writer; its socket is never awaited here.
+  def offer_show(device_key) do
     if Process.whereis(@registry) do
-      Registry.dispatch(@registry, {:client_api_show, device_key}, fn entries ->
-        for {pid, _} <- entries, do: send(pid, {:client_api_show, device_key})
-      end)
+      writers = Registry.lookup(@registry, {:client_api_show, device_key})
+      Enum.each(writers, fn {pid, _} -> send(pid, {:client_api_show, device_key}) end)
+      writers != []
+    else
+      false
     end
-
-    :ok
   end
 
   @doc "Reads the current held show for an authenticated device with an active focus report."
@@ -99,6 +100,8 @@ defmodule AttentionServer.ClientAPI.Focus do
   end
 
   # Stable for one held show, so both deliveries carry the same id.
+  defp show_id(_device_key, %{"show_id" => id}), do: id
+
   defp show_id(device_key, held) do
     material =
       Enum.join(

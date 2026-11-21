@@ -9,6 +9,7 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
 
   alias AttentionServer.ClientAPI.{
     AgentResources,
+    AgentShow,
     Errors,
     Idempotency,
     Resources,
@@ -339,8 +340,7 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
     end
   end
 
-  defp lookup(_state, _scope, nil), do: {:ok, nil}
-  defp lookup(state, scope, key), do: Idempotency.lookup_encoded(state.store, scope, key)
+  defp lookup(state, scope, key), do: AgentShow.lookup(state, scope, key)
 
   defp apply_operation(
          state,

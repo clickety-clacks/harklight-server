@@ -6,7 +6,7 @@ defmodule AttentionServer.ClientAPIFeedShowTest do
 
   import AttentionServer.ClientAPIFeedClient
 
-  alias AttentionServer.{ChangeLog, ClientAPI, JSON, Relay, TLSFixtures}
+  alias AttentionServer.{ChangeLog, ClientAPI, JSON, Relay, Server, TLSFixtures}
   alias AttentionServer.ClientAPI.{Context, FeedStream, Writes}
 
   @handle "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
@@ -67,7 +67,13 @@ defmodule AttentionServer.ClientAPIFeedShowTest do
         id: make_ref()
       )
 
-    %{relay: relay, reader: reader, port: ClientAPI.Listener.port(listener), certs: certs}
+    %{
+      relay: relay,
+      reader: reader,
+      port: ClientAPI.Listener.port(listener),
+      certs: certs,
+      dir: dir
+    }
   end
 
   defp forward(relay, id, n) do
@@ -290,7 +296,7 @@ defmodule AttentionServer.ClientAPIFeedShowTest do
     rev = head(ctx.relay)
     {origin_conn, accepted} = show_request(origin_conn, key, request)
     assert accepted.status == 200
-    assert %{"show_id" => id, "device_id" => reader} = body(accepted)
+    assert %{"show_id" => id, "device_id" => reader, "state" => "sent"} = body(accepted)
     assert reader == ctx.reader
 
     {reader_conn, feed, received, _} = until_show(reader_conn, feed)
@@ -319,11 +325,117 @@ defmodule AttentionServer.ClientAPIFeedShowTest do
     {origin_conn, conflict} = show_request(origin_conn, key, %{request | "target" => "message"})
     assert conflict.status == 409
     assert body(conflict)["error"] == "idempotency_conflict"
+
+    assert {:ok, origin_conn, ref} =
+             Mint.HTTP.request(
+               origin_conn,
+               "POST",
+               "/v2/agent/sessions/unknown/end",
+               [{"idempotency-key", key}],
+               "{}"
+             )
+
+    {origin_conn, cross_route} = collect(origin_conn, ref)
+    assert cross_route.status == 409
+    assert body(cross_route)["error"] == "idempotency_conflict"
     assert head(ctx.relay) == rev
 
     Mint.HTTP.close(origin_conn)
     Mint.HTTP.close(reader_conn)
     assert feed.status == 200
+  end
+
+  test "the TLS route holds an explicitly named device show until focus refresh", ctx do
+    assert {:ok, origin} =
+             Relay.setup_device_certificate(
+               ctx.relay,
+               "A",
+               TLSFixtures.certificate_der!(ctx.certs, "a2")
+             )
+
+    :sys.replace_state(ctx.relay, fn state ->
+      state = put_in(state.store.engine.devices[origin].push_view, true)
+      put_in(state.store.engine.devices[ctx.reader][:label], "Reader’s Tablet")
+    end)
+
+    conn = connect(ctx.port, ctx.certs, "a2")
+
+    assert {:ok, %{"items" => [%{"item_id" => item}]}} =
+             ClientAPI.Reads.inbox(ctx.relay, ctx.reader)
+
+    request = %{"item_id" => item, "target" => "message", "device_name" => "READER'S TABLET"}
+    key = "00000000-0000-4000-8000-000000000008"
+    {conn, invalid} = show_request(conn, key, Map.put(request, "device_id", ctx.reader))
+    assert invalid.status == 400
+    assert %{"error" => "invalid_field", "field" => "device_id"} = body(invalid)
+
+    {conn, accepted} = show_request(conn, key, request)
+    assert accepted.status == 200
+
+    assert %{
+             "show_id" => id,
+             "device_id" => reader,
+             "device_name" => "Reader’s Tablet",
+             "state" => "held"
+           } = body(accepted)
+
+    assert reader == ctx.reader
+
+    assert {:ok, 200, %{"show" => %{"show_id" => ^id, "item_id" => ^item}}, false} =
+             Writes.focus(ctx.relay, ctx.reader, %{"screen" => "inbox", "ttl_s" => 120})
+
+    explicit_key = "00000000-0000-4000-8000-000000000009"
+    explicit = Map.put(Map.delete(request, "device_name"), "device_id", origin)
+    {conn, unlisted} = show_request(conn, explicit_key, explicit)
+    assert unlisted.status == 404
+
+    {conn, accepted} =
+      show_request(conn, explicit_key, %{explicit | "device_id" => ctx.reader})
+
+    assert accepted.status == 200
+    assert %{"show_id" => explicit_id, "device_id" => ^reader, "state" => "held"} = body(accepted)
+    assert explicit_id != id
+    Mint.HTTP.close(conn)
+  end
+
+  test "the flag-off device listener has no agent show route", ctx do
+    flags = Path.join(ctx.dir, "flags-disabled.json")
+    File.write!(flags, ~s({"client_api_v2":false}))
+
+    server =
+      start_supervised!(
+        {Server,
+         store_path: Path.join(ctx.dir, "disabled.sqlite3"),
+         feature_flags_path: flags,
+         enrollment_enabled: false,
+         certfile: Path.join(ctx.certs, "server.pem"),
+         keyfile: Path.join(ctx.certs, "server.key"),
+         cacertfile: Path.join(ctx.certs, "ca.pem")}
+      )
+
+    refute Server.client_api_v2?(server)
+    relay = Server.relay(server)
+    assert :ok = Relay.setup_person(relay, "A")
+
+    assert {:ok, _key} =
+             Relay.setup_device_certificate(
+               relay,
+               "A",
+               TLSFixtures.certificate_der!(ctx.certs, "a2")
+             )
+
+    conn = connect(Server.port(server), ctx.certs, "a2", :http1)
+
+    {conn, refused} =
+      show_request(conn, "00000000-0000-4000-8000-000000000010", %{
+        "item_id" => "i1",
+        "target" => "message"
+      })
+
+    assert refused.status == 400
+    assert refused.body == ""
+    refute Enum.any?(refused.headers, fn {name, _} -> name == "request-id" end)
+    Mint.HTTP.close(conn)
   end
 
   defp show_request(conn, key, request) do
