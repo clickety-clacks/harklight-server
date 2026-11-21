@@ -130,7 +130,16 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
     end
   end
 
-  defp feed_pids, do: for({pid, _} <- Registry.lookup(ChangeLog.Registry, "A"), do: pid)
+  # The feeds of the reader device: the processes subscribed to its closing.
+  defp feed_pids(ctx),
+    do:
+      for(
+        {pid, _} <- Registry.lookup(ChangeLog.Registry, {:closing, {:device, ctx.reader}}),
+        do: pid
+      )
+
+  # Change-log subscribers of person A (each feed's watcher).
+  defp watchers, do: for({pid, _} <- Registry.lookup(ChangeLog.Registry, "A"), do: pid)
 
   defp principal(ctx), do: %Principal{person: "A", kind: :device, key: ctx.reader}
 
@@ -242,7 +251,7 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
     {_conn, response} = collect(conn, feed.ref, %{headers: [], body: ""})
     assert response.status == 410
     assert {:ok, %{"error" => "cursor_expired"}} = JSON.decode_line(response.body <> "\n")
-    assert eventually(fn -> feed_pids() == [] end)
+    assert eventually(fn -> feed_pids(ctx) == [] and watchers() == [] end)
   end
 
   ## Resume
@@ -341,7 +350,7 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
         {conn, feed} = await_open(conn, feed)
         [request_id] = for {"request-id", id} <- feed.headers, do: id
         send(self(), {:request_id, request_id})
-        [pid] = feed_pids()
+        [pid] = feed_pids(ctx)
         ref = Process.monitor(pid)
         Mint.HTTP.close(conn)
         assert_receive {:DOWN, ^ref, :process, ^pid, _}, 5_000
@@ -361,33 +370,41 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
     conn = connect(ctx)
     {conn, feed} = open_feed(conn)
     {_conn, _feed} = await_open(conn, feed)
-    [pid] = feed_pids()
+    [pid] = feed_pids(ctx)
 
-    # The client reads nothing more. Far more than its HTTP/2 window arrives.
-    title = String.duplicate("x", 2_000)
+    # The client reads nothing more. Far more than its windows and the socket
+    # buffers can hold arrives, so the feed's send blocks (review N1).
+    title = String.duplicate("x", 200_000)
 
-    for n <- 1..150 do
+    for n <- 1..60 do
       {micros, _} = :timer.tc(fn -> forward(ctx.relay, "m#{n}", n, title) end)
       # Each write commits promptly: the relay never waits on the feed.
       assert micros < 2_000_000
     end
 
+    # Small commits while the send is blocked: each wakes the watcher.
+    for n <- 61..260, do: forward(ctx.relay, "m#{n}", n)
+
     {micros, {:ok, _}} = :timer.tc(fn -> ChangeLog.head(:sys.get_state(ctx.relay).store, "A") end)
     assert micros < 1_000_000
 
-    # The blocked feed holds at most one page and one wake-up.
-    {:message_queue_len, queued} = Process.info(pid, :message_queue_len)
+    # The feed is blocked in the HTTP server's send ...
+    {:current_stacktrace, stack} = Process.info(pid, :current_stacktrace)
+    assert Enum.any?(stack, &match?({Plug.Conn, :chunk, _, _}, &1))
+
+    # ... and holds at most one wake-up and one page.
+    {:messages, messages} = Process.info(pid, :messages)
+    assert Enum.count(messages, &match?({:change_log, _, _}, &1)) <= 1
     {:memory, memory} = Process.info(pid, :memory)
-    assert queued <= 5
-    assert memory < 8_000_000
+    assert memory < 64_000_000
   end
 
   ## Ends that are not the server's shutdown (review of #207)
 
   # The feed's own process, once it has subscribed.
-  defp feed_pid do
-    assert eventually(fn -> feed_pids() != [] end)
-    [pid] = feed_pids()
+  defp feed_pid(ctx) do
+    assert eventually(fn -> feed_pids(ctx) != [] end)
+    [pid] = feed_pids(ctx)
     pid
   end
 
@@ -424,7 +441,7 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
         conn = connect(ctx)
         {conn, feed} = open_feed(conn)
         {conn, feed} = await_open(conn, feed)
-        pid = feed_pid()
+        pid = feed_pid(ctx)
 
         break_store(ctx)
         send(pid, {:change_log, "A", 1_000_000})
@@ -444,7 +461,7 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
     conn = connect(ctx)
     {conn, feed} = open_feed(conn, "?after=0")
     {conn, feed, _backlog} = changes_through(conn, feed, head(ctx))
-    pid = feed_pid()
+    pid = feed_pid(ctx)
 
     # While the feed is held, later changes commit and retention passes them.
     :erlang.suspend_process(pid)
@@ -468,7 +485,7 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
     conn = connect(ctx)
     {conn, feed} = open_feed(conn)
     {conn, feed} = await_open(conn, feed)
-    pid = feed_pid()
+    pid = feed_pid(ctx)
 
     # The device leaves the engine with no closing signal, as a read racing
     # its revocation sees it.
@@ -489,7 +506,7 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
     conn = ClientAPIFeedClient.connect(ctx.port, ctx.certs, "a1", :http1)
     {conn, feed} = open_feed(conn)
     {conn, feed} = await_open(conn, feed)
-    pid = feed_pid()
+    pid = feed_pid(ctx)
 
     # End the feed from the server side, without revoking the device: the
     # store fails once, then recovers.
