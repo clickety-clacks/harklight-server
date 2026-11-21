@@ -164,7 +164,9 @@ defmodule AttentionServer.Store.EngineTransitionTest do
 
     :ok = Store.close(committed)
     assert {:ok, reopened} = Store.open(path, :keyed)
+    assert {:ok, reopened} = Store.enable_change_log(reopened)
     assert full_diff(committed.engine, reopened.engine) == MapSet.new()
+    assert index_state(committed) == index_state(reopened)
     assert reopened.version == committed.version
     :ok = Store.close(reopened)
   end
@@ -378,13 +380,17 @@ defmodule AttentionServer.Store.EngineTransitionTest do
       assert {:ok, ^expected} = Relay.request_line(keyed, actor, line)
     end
 
+    live_keyed = :sys.get_state(keyed).store
     GenServer.stop(legacy)
     GenServer.stop(keyed)
     {:ok, legacy} = Store.open(legacy_path)
     {:ok, keyed} = Store.open(keyed_path, :keyed)
+    {:ok, keyed} = Store.enable_change_log(keyed)
 
     assert full_diff(normalize_action_times(legacy.engine), normalize_action_times(keyed.engine)) ==
              MapSet.new()
+
+    assert index_state(live_keyed) == index_state(keyed)
 
     :ok = Store.close(legacy)
     :ok = Store.close(keyed)
@@ -427,6 +433,33 @@ defmodule AttentionServer.Store.EngineTransitionTest do
       end)
 
     %{engine | origin_actions: actions}
+  end
+
+  defp index_state(store) do
+    engine = store.engine
+
+    route =
+      engine.route_b_index
+      |> Map.update!(:resolved_messages_by_person, &ordered_rows/1)
+      |> Map.update!(:conversations_by_item, &ordered_rows/1)
+      |> Map.update!(
+        :unresolved_count_by_person,
+        &Map.reject(&1, fn {_, count} -> count == 0 end)
+      )
+
+    engine
+    |> Map.take(@derived)
+    |> Map.put(:route_b_index, route)
+    |> Map.update!(:bounce_deadline_index, &:gb_trees.to_list/1)
+    |> Map.put(
+      :origin_entry_lookup,
+      Map.new(engine.origin_feeds, fn {key, feed} -> {key, feed.entry_seqs_by_handle} end)
+    )
+    |> Map.merge(Map.take(store, [:source_bindings, :upload_links, :authority_index]))
+  end
+
+  defp ordered_rows(trees) do
+    Map.new(trees, fn {key, tree} -> {key, :gb_trees.to_list(tree)} end)
   end
 
   defp replace_body(engine, item, body) do
