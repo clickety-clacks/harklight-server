@@ -703,7 +703,7 @@ defmodule AttentionServer.BounceDecision do
   defp put_revision_state(engine, key, state) do
     old_state = Map.get(engine.bounce_revisions, key)
     engine = remove_revision_index(engine, key, old_state)
-    engine = %{engine | bounce_revisions: Map.put(engine.bounce_revisions, key, state)}
+    engine = Engine.put_row(engine, :bounce_revisions, key, state)
     add_revision_index(engine, key, state)
   end
 

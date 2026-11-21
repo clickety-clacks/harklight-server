@@ -2191,6 +2191,7 @@ defmodule AttentionServer.Store do
       |> Map.delete(:open_default_index)
       |> Map.delete(:advisory_id_index)
       |> Map.delete(:route_b_index)
+      |> Map.delete(:touched_keys)
       |> Map.put(:__struct__, Engine)
 
     :erlang.term_to_binary({:attention_relay_state, @format_version, persisted}, [

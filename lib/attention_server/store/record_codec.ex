@@ -5,7 +5,7 @@ defmodule AttentionServer.Store.RecordCodec do
 
   @record_version :relay_record_v1
   @term_options [:deterministic, {:minor_version, 2}]
-  @derived [:advisory_id_index, :open_default_index, :route_b_index]
+  @derived [:advisory_id_index, :open_default_index, :route_b_index, :touched_keys]
 
   @fields Map.new(Map.drop(Map.from_struct(%Engine{}), [:advisory_feeds | @derived]), fn
             {field, %MapSet{}} -> {field, :member}

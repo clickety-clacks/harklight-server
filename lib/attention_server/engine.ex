@@ -33,7 +33,8 @@ defmodule AttentionServer.Engine do
   @push_window_ms 300_000
   @maintainer_scopes MapSet.new(~w(devices senders view_items configure))
 
-  defstruct relay_instance_id: nil,
+  defstruct touched_keys: nil,
+            relay_instance_id: nil,
             agent_cursor_key: nil,
             persons: %{},
             owners: %{},
@@ -1978,6 +1979,25 @@ defmodule AttentionServer.Engine do
     else
       _ -> {engine, {:error, :forbidden}}
     end
+  end
+
+  @doc false
+  def request_line_with_touches(%__MODULE__{} = engine, key, raw, request_at) do
+    {next, reply} = request_line(%{engine | touched_keys: MapSet.new()}, key, raw, request_at)
+    {%{next | touched_keys: nil}, reply, next.touched_keys}
+  end
+
+  @doc false
+  def put_row(%__MODULE__{} = engine, field, key, value) do
+    engine
+    |> Map.update!(field, &Map.put(&1, key, value))
+    |> touch_row(field, key)
+  end
+
+  defp touch_row(%__MODULE__{touched_keys: nil} = engine, _field, _key), do: engine
+
+  defp touch_row(%__MODULE__{} = engine, field, key) do
+    %{engine | touched_keys: MapSet.put(engine.touched_keys, {:row, field, key})}
   end
 
   @doc false
@@ -4059,10 +4079,7 @@ defmodule AttentionServer.Engine do
               "listening_support" => support
             }
 
-            %{
-              next
-              | events: Map.put(next.events, {person, seq}, Map.put(event, :payload, payload))
-            }
+            put_row(next, :events, {person, seq}, Map.put(event, :payload, payload))
           else
             next
           end
@@ -5438,7 +5455,7 @@ defmodule AttentionServer.Engine do
   # The counter and arrival are part of the same committed Engine snapshot.
   defp next_free_order(engine, person) do
     order = Map.get(engine.free_order_highs, person, 0) + 1
-    {%{engine | free_order_highs: Map.put(engine.free_order_highs, person, order)}, order}
+    {put_row(engine, :free_order_highs, person, order), order}
   end
 
   defp put_reply_free_order(engine, person, seq, order) do
@@ -5462,12 +5479,8 @@ defmodule AttentionServer.Engine do
         do: MapSet.put(engine.bounce_discussed_messages, key),
         else: engine.bounce_discussed_messages
 
-    %{
-      engine
-      | conversation_events: Map.put(engine.conversation_events, {person, seq}, event),
-        route_b_index: route_b_index,
-        bounce_discussed_messages: discussed
-    }
+    engine = %{engine | route_b_index: route_b_index, bounce_discussed_messages: discussed}
+    put_row(engine, :conversation_events, {person, seq}, event)
   end
 
   defp append_conversation_fact(engine, person, key, payload) do
@@ -5817,17 +5830,17 @@ defmodule AttentionServer.Engine do
 
   defp save_receipt(engine, person, device, op, semantic, reply) do
     item = %{semantic: JSON.canonical(semantic), reply: reply}
-    %{engine | receipts: Map.put(engine.receipts, {person, device, op}, item)}
+    put_row(engine, :receipts, {person, device, op}, item)
   end
 
   defp next_seq(engine, person) do
     seq = engine.persons[person] + 1
-    {%{engine | persons: Map.put(engine.persons, person, seq)}, seq}
+    {put_row(engine, :persons, person, seq), seq}
   end
 
   defp next_conversation_seq(engine, person) do
     seq = Map.get(engine.conversation_highs, person, 0) + 1
-    {%{engine | conversation_highs: Map.put(engine.conversation_highs, person, seq)}, seq}
+    {put_row(engine, :conversation_highs, person, seq), seq}
   end
 
   defp put_message(engine, key, record) do
@@ -5842,12 +5855,8 @@ defmodule AttentionServer.Engine do
     route_b_index =
       AttentionServer.RouteBIndex.put_message(engine.route_b_index, key, previous, record)
 
-    %{
-      engine
-      | open_default_index: open_default_index,
-        messages: Map.put(engine.messages, key, record),
-        route_b_index: route_b_index
-    }
+    engine = %{engine | open_default_index: open_default_index, route_b_index: route_b_index}
+    put_row(engine, :messages, key, record)
   end
 
   defp default_due_at(record) do
@@ -5862,7 +5871,7 @@ defmodule AttentionServer.Engine do
   end
 
   defp put_event(engine, person, seq, kind, key),
-    do: %{engine | events: Map.put(engine.events, {person, seq}, %{kind: kind, key: key})}
+    do: put_row(engine, :events, {person, seq}, %{kind: kind, key: key})
 
   # When a push for this binding may next go out: now, unless a push started
   # less than one window ago, in which case at the end of that window.

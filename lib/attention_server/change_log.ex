@@ -178,6 +178,44 @@ defmodule AttentionServer.ChangeLog do
   end
 
   @doc false
+  def changed_resources(%Engine{} = old, %Engine{} = next, touched) do
+    changed =
+      Enum.reduce(touched, %{messages: [], bounce: [], opened: [], entries: []}, fn
+        {:row, :messages, key}, acc ->
+          collect_change(acc, :messages, key, old.messages, next.messages)
+
+        {:row, :bounce_revisions, key}, acc ->
+          collect_change(acc, :bounce, key, old.bounce_revisions, next.bounce_revisions)
+
+        {:row, :conversation_events, key}, acc ->
+          if Map.has_key?(next.conversation_events, key) do
+            collect_change(acc, :entries, key, old.conversation_events, next.conversation_events)
+          else
+            acc
+          end
+
+        {:member, :opened_revisions, {person, sender, id, _} = key}, acc ->
+          if MapSet.member?(old.opened_revisions, key) ==
+               MapSet.member?(next.opened_revisions, key) do
+            acc
+          else
+            %{acc | opened: [{person, sender, id} | acc.opened]}
+          end
+
+        _, acc ->
+          acc
+      end)
+
+    %{changed | entries: Enum.sort(changed.entries)}
+  end
+
+  defp collect_change(changed, kind, key, old, next) do
+    if Map.fetch(old, key) === Map.fetch(next, key),
+      do: changed,
+      else: Map.update!(changed, kind, &[key | &1])
+  end
+
+  @doc false
   def changes(%Engine{} = old, %Engine{} = next, changed) do
     item_keys =
       [

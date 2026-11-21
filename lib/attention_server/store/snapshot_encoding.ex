@@ -8,7 +8,7 @@ defmodule AttentionServer.Store.SnapshotEncoding do
     fields =
       engine
       |> Map.from_struct()
-      |> Map.drop([:open_default_index, :advisory_id_index, :route_b_index])
+      |> Map.drop([:open_default_index, :advisory_id_index, :route_b_index, :touched_keys])
 
     fields = Map.put(fields, :__struct__, engine.__struct__)
 
