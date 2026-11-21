@@ -20,8 +20,7 @@ defmodule AttentionServer.EnrollmentHTTPS do
   # An unused invitation created before invitation v2 (contract round 27).
   @reissue_required %{
     "error" => "invitation_reissue_required",
-    "message" =>
-      "This invitation is from an older Harklight Server. Ask the account owner for a new invitation."
+    "message" => "This invitation is from an older Harklight Server. Ask for a new invitation."
   }
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts)

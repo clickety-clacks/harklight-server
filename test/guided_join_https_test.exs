@@ -524,6 +524,7 @@ defmodule AttentionServer.GuidedJoinHTTPSTest do
 
     assert message =~ "older Harklight Server"
     assert message =~ "new invitation"
+    refute message =~ "owner"
     assert :sys.get_state(relay).store.engine.pending_enrollments == %{}
   end
 
