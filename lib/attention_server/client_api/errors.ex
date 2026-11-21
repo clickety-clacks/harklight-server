@@ -14,6 +14,7 @@ defmodule AttentionServer.ClientAPI.Errors do
   import Plug.Conn
 
   alias AttentionServer.JSON
+  alias AttentionServer.ClientAPI.Projection
 
   # token => {status, retryable}
   @tokens %{
@@ -32,6 +33,7 @@ defmodule AttentionServer.ClientAPI.Errors do
     "cursor_expired" => {410, false},
     "precondition_failed" => {412, false},
     "payload_too_large" => {413, false},
+    "internal_error" => {500, false},
     "retry_later" => {503, true},
     "storage_unavailable" => {503, true}
   }
@@ -103,15 +105,24 @@ defmodule AttentionServer.ClientAPI.Errors do
 
     conn
     |> assign(:client_api_error, token)
-    |> send_json(status, body)
+    |> send_encoded_json(status, JSON.encode!(body))
   end
 
   @doc "Send a JSON body with `status`."
   @spec send_json(Plug.Conn.t(), pos_integer(), map()) :: Plug.Conn.t()
   def send_json(conn, status, body) when is_map(body) do
+    encoded = Projection.run(Projection.response_key(body), fn -> JSON.encode!(body) end)
+    send_encoded_json(conn, status, encoded)
+  end
+
+  defp send_encoded_json(conn, status, encoded) do
     conn
     |> put_resp_content_type("application/json", "utf-8")
-    |> send_resp(status, JSON.encode!(body))
+    |> send_resp(status, encoded)
+  end
+
+  def projection_error(conn, %Projection{} = fault) do
+    conn |> Projection.log(fault) |> send_error("internal_error")
   end
 
   @doc "The request's `Request-Id`, set by the router before any handler runs."

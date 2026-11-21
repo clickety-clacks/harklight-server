@@ -9,7 +9,7 @@ defmodule AttentionServer.ClientAPI.FeedRenderer do
   """
 
   alias AttentionServer.ChangeLog
-  alias AttentionServer.ClientAPI.{Reads, Resources}
+  alias AttentionServer.ClientAPI.{Projection, Reads, Resources}
 
   @doc """
   Renders one row: `{:ok, data}`, `:skip` for a row with no client form, or
@@ -49,11 +49,13 @@ defmodule AttentionServer.ClientAPI.FeedRenderer do
 
     with {:ok, item_id} <- Resources.item_id(context.engine, key),
          {:ok, rank} <- Reads.item_rank(context, principal.person, item_id) do
-      {:ok,
-       context.engine
-       |> Resources.item(key, rank)
-       |> Resources.stamp(rev)
-       |> then(&Resources.render(:item, &1, principal))}
+      Projection.run({:item, item_id}, fn ->
+        {:ok,
+         context.engine
+         |> Resources.item(key, rank)
+         |> Resources.stamp(rev)
+         |> then(&Resources.render(:item, &1, principal))}
+      end)
     else
       # The feed must fail the step rather than skip a change it could not
       # render because the store failed.
@@ -85,11 +87,13 @@ defmodule AttentionServer.ClientAPI.FeedRenderer do
             _ -> nil
           end
 
-        {:ok,
-         entry
-         |> Resources.stamp(rev)
-         |> Resources.put_at(at_ms)
-         |> then(&Resources.render(:entry, &1, principal))}
+        Projection.run(Projection.change_key(entry), fn ->
+          {:ok,
+           entry
+           |> Resources.stamp(rev)
+           |> Resources.put_at(at_ms)
+           |> then(&Resources.render(:entry, &1, principal))}
+        end)
     end
   end
 

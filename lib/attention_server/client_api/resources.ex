@@ -24,6 +24,8 @@ defmodule AttentionServer.ClientAPI.Resources do
   This module reads engine state only. It never changes it.
   """
 
+  alias AttentionServer.ClientAPI.Projection
+
   alias AttentionServer.{BounceDecision, Conversation, Engine, LargeData, Message, ReplyPriority}
 
   @viewer "_viewer"
@@ -71,6 +73,13 @@ defmodule AttentionServer.ClientAPI.Resources do
             _ -> nil
           end
         end)
+    end
+  end
+
+  defp item_projection_key(engine, key) do
+    case Map.get(engine.messages, key) do
+      %{accepted_seq: seq} when is_integer(seq) and seq > 0 -> {:item, "i" <> Integer.to_string(seq)}
+      _ -> :item
     end
   end
 
@@ -202,7 +211,11 @@ defmodule AttentionServer.ClientAPI.Resources do
   The person-level Item for one engine key, without `rev`. `rank` is the item's
   Rank from `ranks/4`.
   """
-  def item(%Engine{} = engine, {person, sender, _id} = key, %{"key" => _} = rank) do
+  def item(%Engine{} = engine, key, %{"key" => _} = rank) do
+    Projection.run(item_projection_key(engine, key), fn -> project_item(engine, key, rank) end)
+  end
+
+  defp project_item(engine, {person, sender, _id} = key, rank) do
     record = Map.fetch!(engine.messages, key)
     summary = Map.get(engine.route_b_index.conversation_summary_by_item, key, %{})
     {reply, rank} = Map.pop(rank, "_reply")
@@ -237,6 +250,10 @@ defmodule AttentionServer.ClientAPI.Resources do
   unchanged.
   """
   def revision(%Engine{} = engine, key, n) when is_integer(n) do
+    Projection.run(item_projection_key(engine, key), fn -> project_revision(engine, key, n) end)
+  end
+
+  defp project_revision(engine, key, n) do
     with %{message: current} = record <- Map.get(engine.messages, key),
          message when is_map(message) <-
            Map.get(Map.get(record, :revisions, %{1 => current}), n) do
@@ -982,7 +999,11 @@ defmodule AttentionServer.ClientAPI.Resources do
       |> Map.get(key, :gb_trees.empty())
       |> :gb_trees.values()
       |> Enum.reverse()
-      |> Enum.map(&{&1, Map.fetch!(engine.conversation_events, {person, &1}).payload})
+      |> Enum.map(fn seq ->
+        Projection.run({:entry, entry_id(seq)}, fn ->
+          {seq, Map.fetch!(engine.conversation_events, {person, seq}).payload}
+        end)
+      end)
 
     by_event_id =
       for {seq, %{"kind" => kind, "event_id" => event_id}} <- facts,
@@ -1092,7 +1113,13 @@ defmodule AttentionServer.ClientAPI.Resources do
   end
 
   @doc false
-  def agent_entry(engine, {person, _, _} = key, record, position) do
+  def agent_entry(engine, key, record, position) do
+    Projection.run({:entry, entry_id(position)}, fn ->
+      project_agent_entry(engine, key, record, position)
+    end)
+  end
+
+  defp project_agent_entry(engine, {person, _, _} = key, record, position) do
     with %{key: ^key, payload: payload} <- Map.get(engine.conversation_events, {person, position}) do
       index = engine.route_b_index
       id = payload["in_reply_to"]
@@ -1140,7 +1167,16 @@ defmodule AttentionServer.ClientAPI.Resources do
   defp delivery_effect(%{"kind" => "acted", "event_id" => id}), do: {"acted", id}
   defp delivery_effect(_), do: nil
 
-  defp entry(item_id, record, seq, %{"kind" => kind} = payload, context) do
+  defp entry(item_id, record, seq, payload, context) do
+    key = {:entry, entry_id(seq)}
+
+    Projection.run(key, fn ->
+      Projection.probe(key)
+      render_entry(item_id, record, seq, payload, context)
+    end)
+  end
+
+  defp render_entry(item_id, record, seq, %{"kind" => kind} = payload, context) do
     base = %{
       "entry_id" => entry_id(seq),
       "item_id" => item_id,
@@ -1233,6 +1269,10 @@ defmodule AttentionServer.ClientAPI.Resources do
   and is chosen by `render/3`.
   """
   def settings(%Engine{} = engine, person) do
+    Projection.run(:settings, fn -> project_settings(engine, person) end)
+  end
+
+  defp project_settings(engine, person) do
     push =
       for {{^person, device}, binding} <- engine.push_bindings,
           into: %{},
@@ -1278,28 +1318,32 @@ defmodule AttentionServer.ClientAPI.Resources do
   Entry, Settings, Counts or removal.
   """
   def render(:item, %{@viewer => %{"origin" => origin}} = item, %{key: key} = principal) do
-    item = Map.delete(item, @viewer)
+    Projection.run(Projection.change_key(item), fn ->
+      item = Map.delete(item, @viewer)
 
-    if key == origin do
-      item
-    else
-      sender = Map.fetch!(item, "sender")
+      if key == origin do
+        item
+      else
+        sender = Map.fetch!(item, "sender")
 
-      Map.put(
-        item,
-        "as",
-        if(MapSet.member?(principal.senders, sender), do: "message", else: "knock")
-      )
-    end
+        Map.put(
+          item,
+          "as",
+          if(MapSet.member?(principal.senders, sender), do: "message", else: "knock")
+        )
+      end
+    end)
   end
 
   def render(:settings, %{@viewer => %{"push" => push}} = settings, %{key: key, kind: kind}) do
-    status =
-      if kind == :device, do: Map.get(push, key, @unconfigured_push), else: @unconfigured_push
+    Projection.run(:settings, fn ->
+      status =
+        if kind == :device, do: Map.get(push, key, @unconfigured_push), else: @unconfigured_push
 
-    settings
-    |> Map.delete(@viewer)
-    |> Map.put("push", status)
+      settings
+      |> Map.delete(@viewer)
+      |> Map.put("push", status)
+    end)
   end
 
   def render(:entry, entry, _principal), do: Map.delete(entry, @sources)

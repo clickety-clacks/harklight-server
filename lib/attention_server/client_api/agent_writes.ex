@@ -12,6 +12,7 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
     AgentShow,
     Errors,
     Idempotency,
+    Projection,
     Resources,
     Uploads,
     Writes
@@ -214,8 +215,8 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
       with :ok <- authorize(state, scope),
            {:ok, nil} <- lookup(state, receipt_scope(scope), key),
            {:ok, {_, sender, id} = message_key, attributes, _} <-
-             frame(state, scope, operation, target, op_id, match, body),
-           {:ok, selected} <- select_files(state, scope, operation, message_key, body) do
+             checked_frame(state, scope, operation, target, op_id, match, body),
+           {:ok, selected} <- checked_files(state, scope, operation, message_key, body) do
         staged = for {:staged, file} <- selected, do: file
         revision =
           case operation do
@@ -242,8 +243,7 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
   end
 
   def handle_call(
-        {:replay_resources, %{person: person, key: agent},
-         %{"item_id" => item, "include_message" => message?, "entry_position" => position}},
+        {:replay_resources, %{person: person, key: agent}, %{"item_id" => item} = receipt},
         _from,
         state
       ) do
@@ -251,14 +251,23 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
 
     result =
       with :ok <- authorize(state, scope),
-           {:ok, key} <- AgentResources.own_item_key(state, scope, item),
-           {:ok, rev} <- AgentChangeLog.head(state.store, scope),
-           {:ok, message} <- replay_message(state, scope, key, message?),
-           {:ok, entry} <- replay_entry(state, scope, key, position) do
-        {:ok, %{"rev" => rev} |> put_resource("message", message) |> put_resource("entry", entry)}
+           {:ok, key} <- AgentResources.own_item_key(state, scope, item) do
+        project_receipt(state, scope, key, receipt)
       end
 
     {:reply, result, state}
+  end
+
+  defp project_receipt(_state, _scope, _key, %{"item_id" => nil}), do: {:ok, %{}}
+
+  defp project_receipt(state, scope, key, receipt) do
+    Projection.capture(fn ->
+      with {:ok, rev} <- AgentChangeLog.head(state.store, scope),
+           {:ok, message} <- replay_message(state, scope, key, receipt["include_message"]),
+           {:ok, entry} <- replay_entry(state, scope, key, receipt["entry_position"]) do
+        {:ok, %{"rev" => rev} |> put_resource("message", message) |> put_resource("entry", entry)}
+      end
+    end)
   end
 
   defp replay_message(state, scope, key, true), do: AgentResources.message(state, scope, key)
@@ -355,10 +364,10 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
          op_id,
          uploads
        ) do
-    case frame(state, scope, operation, item_id, op_id, match, body) do
+    case checked_frame(state, scope, operation, item_id, op_id, match, body) do
       {:ok, message_key, attributes, extras} ->
         {reply, next} =
-          with {:ok, selected} <- select_files(state, scope, operation, message_key, body),
+          with {:ok, selected} <- checked_files(state, scope, operation, message_key, body),
                {:ok, frame} <- attach_selected(attributes, operation, selected, uploads) do
             staged = for {:staged, file} <- selected, do: file.file_id
             sources = Map.new(Enum.zip(Enum.map(uploads, & &1["upload_id"]), staged))
@@ -369,9 +378,10 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
 
         response =
           with {:ok, fields} <- reply,
-               {:ok, body} <- render(next, scope, operation, message_key, fields, extras),
-               :ok <- save(next, receipt_scope, key, digest, body) do
-            {:ok, 200, body, false}
+               {:ok, receipt} <- committed_receipt(next, scope, operation, message_key, fields, extras),
+               :ok <- save(next, receipt_scope, key, digest, receipt),
+               {:ok, resources} <- project_receipt(next, scope, message_key, receipt) do
+            {:ok, 200, Map.merge(receipt["outcome"], resources), false}
           else
             error -> refusal(error)
           end
@@ -763,102 +773,64 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
     end
   end
 
-  defp render(state, scope, :reply, key, %{"seq" => seq}, _extras) do
-    with {:ok, rev} <- AgentChangeLog.head(state.store, scope),
-         {:ok, entry} <- AgentResources.entry(state, scope, key, seq) do
-      {:ok, %{"rev" => rev, "entry" => entry}}
-    end
+  defp checked_frame(state, scope, operation, target, op_id, match, body) do
+    Projection.capture(fn -> frame(state, scope, operation, target, op_id, match, body) end)
   end
 
-  defp render(state, scope, :session_end, _key, _fields, _extra) do
-    with {:ok, rev} <- AgentChangeLog.head(state.store, scope), do: {:ok, %{"rev" => rev}}
+  defp checked_files(state, scope, operation, key, body) do
+    Projection.capture(fn -> select_files(state, scope, operation, key, body) end)
   end
 
-  defp render(state, scope, :result, key, %{"seq" => seq}, _extra) do
-    with {:ok, rev} <- AgentChangeLog.head(state.store, scope),
-         {:ok, message} <- AgentResources.message(state, scope, key),
-         {:ok, entry} <- AgentResources.entry(state, scope, key, seq) do
-      {:ok, %{"rev" => rev, "message" => message, "entry" => entry}}
-    end
-  end
+  defp committed_receipt(state, scope, operation, key, fields, extras) do
+    {message?, position, outcome} = receipt_fields(operation, fields, extras)
 
-  defp render(state, scope, :answer_receipt, key, fields, _extra) do
     with {:ok, rev} <- AgentChangeLog.head(state.store, scope),
-         {:ok, message} <- AgentResources.message(state, scope, key) do
-      body = Map.take(fields, ["status", "stage_outcome"])
-      {:ok, Map.merge(body, %{"rev" => rev, "message" => message})}
-    end
-  end
-
-  defp render(state, scope, :chat_receipt, key, fields, position) do
-    with {:ok, rev} <- AgentChangeLog.head(state.store, scope),
-         {:ok, entry} <- AgentResources.entry(state, scope, key, position) do
-      body = Map.take(fields, ["status", "stage_outcome"])
-      {:ok, Map.merge(body, %{"rev" => rev, "entry" => entry})}
-    end
-  end
-
-  defp render(state, scope, :file_use, key, fields, {position, file_id}) do
-    with {:ok, rev} <- AgentChangeLog.head(state.store, scope),
-         {:ok, entry} <- AgentResources.entry(state, scope, key, position) do
-      body = Map.take(fields, ["duplicate", "transfer", "use"])
-
+         {:ok, item_id} <- receipt_item(state, key, message? or is_integer(position)) do
       {:ok,
-       Map.merge(body, %{
-         "rev" => rev,
-         "entry" => entry,
-         "file_id" => file_id
-       })}
+       %{
+         "agent_write" => 1,
+         "item_id" => item_id,
+         "include_message" => message?,
+         "entry_position" => position,
+         "outcome" => Map.put(outcome, "rev", rev)
+       }}
     end
   end
 
-  defp render(state, scope, :advisory_ack, _key, fields, _extras) do
-    with {:ok, rev} <- AgentChangeLog.head(state.store, scope) do
-      {:ok,
-       fields |> Map.take(~w(advisory_id delivered already_delivered)) |> Map.put("rev", rev)}
-    end
-  end
+  defp receipt_item(state, key, true), do: Resources.item_id(state.store.engine, key)
+  defp receipt_item(_state, _key, false), do: {:ok, nil}
 
-  defp render(state, scope, operation, key, _fields, extras) do
-    with {:ok, rev} <- AgentChangeLog.head(state.store, scope),
-         {:ok, message} <- AgentResources.message(state, scope, key) do
-      body = %{"rev" => rev, "message" => message}
+  defp receipt_fields(:reply, %{"seq" => seq}, _extras), do: {false, seq, %{}}
+  defp receipt_fields(:result, %{"seq" => seq}, _extras), do: {true, seq, %{}}
+  defp receipt_fields(:session_end, _fields, _extras), do: {false, nil, %{}}
 
-      case {operation, extras} do
-        {:send, [_ | _] = warnings} ->
-          {:ok, Map.put(body, "supersedes_warnings", warnings)}
+  defp receipt_fields(:answer_receipt, fields, _extras),
+    do: {true, nil, Map.take(fields, ~w(status stage_outcome))}
 
-        {mutation, seq} when mutation in [:retract, :revise] and is_integer(seq) ->
-          with {:ok, entry} <- AgentResources.entry(state, scope, key, seq) do
-            {:ok, Map.put(body, "entry", entry)}
-          end
+  defp receipt_fields(:chat_receipt, fields, position),
+    do: {false, position, Map.take(fields, ~w(status stage_outcome))}
 
-        _ ->
-          {:ok, body}
-      end
-    end
-  end
+  defp receipt_fields(:file_use, fields, {position, file_id}),
+    do: {false, position, fields |> Map.take(~w(duplicate transfer use)) |> Map.put("file_id", file_id)}
 
-  defp save(state, scope, key, digest, body, status \\ 200)
-  defp save(_state, _scope, nil, _digest, _body, _status), do: :ok
+  defp receipt_fields(:advisory_ack, fields, _extras),
+    do: {false, nil, Map.take(fields, ~w(advisory_id delivered already_delivered))}
 
-  defp save(state, scope, key, digest, body, status),
-    do: Idempotency.save(state.store, scope, key, digest, status, compact_receipt(body))
+  defp receipt_fields(:send, _fields, [_ | _] = warnings),
+    do: {true, nil, %{"supersedes_warnings" => warnings}}
 
-  defp compact_receipt(body) do
-    message = body["message"]
-    entry = body["entry"]
-    resource = message || entry || %{}
+  defp receipt_fields(operation, _fields, seq)
+       when operation in [:retract, :revise] and is_integer(seq),
+       do: {true, seq, %{}}
 
-    %{
-      "agent_write" => 1,
-      "item_id" => resource["item_id"],
-      "include_message" => is_map(message),
-      "entry_position" => entry && entry["position"],
-      "outcome" => Map.drop(body, ["message", "entry"])
-    }
-  end
+  defp receipt_fields(_operation, _fields, _extras), do: {true, nil, %{}}
 
+  defp save(_state, _scope, nil, _digest, _receipt), do: :ok
+
+  defp save(state, scope, key, digest, receipt),
+    do: Idempotency.save(state.store, scope, key, digest, 200, receipt)
+
+  defp refusal({:error, %Projection{}} = error), do: error
   defp refusal({:error, token, field}), do: {:error, to_string(token), field, false}
   defp refusal({:error, token}) when is_atom(token), do: {:error, to_string(token), nil, false}
   defp refusal(_), do: {:error, "storage_unavailable", nil, false}

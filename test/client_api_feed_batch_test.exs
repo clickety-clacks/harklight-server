@@ -493,7 +493,7 @@ defmodule AttentionServer.ClientAPIFeedBatchTest do
     end
   end
 
-  test "if a step's render fails, its rows render one at a time and a bad row is skipped", ctx do
+  test "a failing renderer stops the batch and leaves every row available for replay", ctx do
     renderer = AttentionServer.ClientAPIFeedBatchTest.FailingRenderer
     Application.put_env(:attention_server, :client_api_feed_renderer, renderer)
     on_exit(fn -> Application.delete_env(:attention_server, :client_api_feed_renderer) end)
@@ -501,12 +501,16 @@ defmodule AttentionServer.ClientAPIFeedBatchTest do
     forward(ctx.relay, "good", 1)
     forward(ctx.relay, "bad", 2)
 
+    assert {500, %{"error" => "internal_error", "retryable" => false}} =
+             batch(ctx, "?after=0")
+
+    Application.delete_env(:attention_server, :client_api_feed_renderer)
     {200, batch} = batch(ctx, "?after=0")
 
     titles =
       for %{"kind" => "item", "data" => item} <- batch["changes"], do: item["message"]["title"]
 
-    assert titles == ["good"]
+    assert titles == ["good", "bad"]
     assert Enum.any?(batch["changes"], &(&1["kind"] == "counts"))
     assert Process.alive?(ctx.relay)
   end

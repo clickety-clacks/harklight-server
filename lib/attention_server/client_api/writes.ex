@@ -38,6 +38,7 @@ defmodule AttentionServer.ClientAPI.Writes do
     FeedRenderer,
     Focus,
     Idempotency,
+    Projection,
     Reads,
     Resources,
     Uploads
@@ -392,6 +393,7 @@ defmodule AttentionServer.ClientAPI.Writes do
   end
 
   defp result({:ok, status, body}, replayed?), do: {:ok, status, body, replayed?}
+  defp result({:error, %Projection{} = fault}, _replayed?), do: {:error, fault}
   defp result({:error, token}, replayed?), do: {:error, to_string(token), nil, replayed?}
 
   defp result({:error, token, field}, replayed?),
@@ -560,9 +562,14 @@ defmodule AttentionServer.ClientAPI.Writes do
           AttentionServer.Relay.client_api_focus(state, {:report, key, reported, token})
         end
 
-      show = held && Focus.show(engine, key, held, state.clock.())
-      body = if show, do: %{"rev" => position, "show" => show}, else: %{"rev" => position}
-      {:reply, {:ok, 200, body}, next}
+      result =
+        Projection.capture(fn ->
+          show = held && Focus.show(engine, key, held, state.clock.())
+          body = if show, do: %{"rev" => position, "show" => show}, else: %{"rev" => position}
+          {:ok, 200, body}
+        end)
+
+      {:reply, result, next}
     else
       error -> {:reply, error, state}
     end
@@ -605,7 +612,9 @@ defmodule AttentionServer.ClientAPI.Writes do
       with {:ok, principal} <- operation_principal(state.store.engine, who, operation) do
         case outcome do
           {:ok, reply} ->
-            result = render(operation, who, principal.person, reply, from, state)
+            result =
+              Projection.capture(fn -> render(operation, who, principal.person, reply, from, state) end)
+
             receipt = receipt(operation, reply, result, principal)
             remember(state, principal.person, key, digest, result, receipt)
 
@@ -642,7 +651,7 @@ defmodule AttentionServer.ClientAPI.Writes do
         {:ok, nil}
 
       {:ok, %{digest: ^digest, status: status, body: receipt}} ->
-        case replay(receipt, who, person, from, state) do
+        case Projection.capture(fn -> replay(receipt, who, person, from, state) end) do
           {:ok, body} -> {:replay, status, body}
           error -> error
         end
@@ -662,21 +671,32 @@ defmodule AttentionServer.ClientAPI.Writes do
   # operation receipts only on success: a refused request retried with the
   # same key is evaluated again. The receipt is compact (what the write
   # changed); a replay renders those resources from current state.
-  defp remember(state, person, key, digest, {:ok, status, _body} = result, receipt)
-       when is_binary(key) do
+  defp remember(state, person, key, digest, {:ok, status, _body} = result, receipt),
+    do: remember_committed(state, person, key, digest, status, result, receipt)
+
+  defp remember(state, person, key, digest, {:error, %Projection{}} = result, receipt),
+    do: remember_committed(state, person, key, digest, 200, result, receipt)
+
+  defp remember(_state, _person, _key, _digest, result, _receipt), do: result
+
+  defp remember_committed(_state, _person, nil, _digest, _status, result, _receipt), do: result
+
+  defp remember_committed(state, person, key, digest, status, result, receipt) do
     case Idempotency.save(state.store, person, key, digest, status, receipt) do
       :ok -> result
       _ -> {:error, :storage_unavailable}
     end
   end
 
-  defp remember(_state, _person, _key, _digest, result, _receipt), do: result
-
   # A push response identifies the binding at the time of the write. Keep
   # that small response so a rebind or later delivery cannot rewrite a replay.
   defp receipt(operation, _reply, {:ok, 200, body}, %{engine_key: device})
        when operation == :remove_push or elem(operation, 0) == :push,
        do: %{"push_result" => body, "device" => device}
+
+  defp receipt(operation, _reply, {:error, %Projection{}}, %{engine_key: device})
+       when operation == :remove_push or elem(operation, 0) == :push,
+       do: %{"push_projection_failed" => device}
 
   defp receipt(operation, reply, result, _principal), do: receipt(operation, reply, result)
 
@@ -691,6 +711,19 @@ defmodule AttentionServer.ClientAPI.Writes do
 
   defp replay(%{"file" => body}, _who, _person, _from, _state), do: {:ok, body}
   defp replay(%{"discarded_file" => true}, _who, _person, _from, _state), do: {:ok, %{}}
+
+  defp replay(%{"push_projection_failed" => device}, who, _person, _from, state) do
+    case principal(state.store.engine, who) do
+      {:ok, %{kind: :device, engine_key: ^device}} ->
+        {:error, %Projection{key: :settings, cause: "committed_projection_failed"}}
+
+      {:ok, _} ->
+        {:error, :idempotency_conflict}
+
+      error ->
+        error
+    end
+  end
 
   defp replay(%{"push_result" => body, "device" => device}, who, _person, _from, state) do
     case principal(state.store.engine, who) do
@@ -810,9 +843,13 @@ defmodule AttentionServer.ClientAPI.Writes do
   defp precondition(state, who, _principal, {:priority_levels, _levels, if_match}) do
     case Reads.handle_call({:settings, who}, nil, state) do
       {:reply, {:ok, %{"settings" => settings}}, _state} ->
-        if if_match == "*" or Reads.etag(settings) in if_match_tags(if_match),
-          do: :ok,
-          else: {:error, :precondition_failed}
+        Projection.capture(fn ->
+          Projection.run(:settings, fn ->
+            if if_match == "*" or Reads.etag(settings) in if_match_tags(if_match),
+              do: :ok,
+              else: {:error, :precondition_failed}
+          end)
+        end)
 
       {:reply, error, _state} ->
         error
@@ -1494,6 +1531,8 @@ defmodule AttentionServer.ClientAPI.Writes do
 
   def respond(conn, {:ok, status, body, replayed?}),
     do: conn |> replayed(replayed?) |> Errors.send_json(status, body)
+
+  def respond(conn, {:error, %Projection{} = fault}), do: Errors.projection_error(conn, fault)
 
   def respond(conn, {:error, token, field, replayed?}),
     do: conn |> replayed(replayed?) |> Errors.send_error(token, field: field)

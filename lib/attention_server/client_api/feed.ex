@@ -23,7 +23,8 @@ defmodule AttentionServer.ClientAPI.Feed do
 
   import Plug.Conn
 
-  alias AttentionServer.ClientAPI.{Context, Errors, FeedStep, FeedStream}
+  alias AttentionServer.JSON
+  alias AttentionServer.ClientAPI.{Context, Errors, FeedStep, FeedStream, Projection}
 
   @max_limit 500
 
@@ -46,11 +47,30 @@ defmodule AttentionServer.ClientAPI.Feed do
   defp batch(conn, ctx, cursor, limit) do
     case FeedStep.read(ctx.relay, ctx.principal, cursor, limit) do
       {:ok, changes, more, position} ->
-        Errors.send_json(conn, 200, %{"changes" => changes, "rev" => position, "more" => more})
+        send_batch(conn, changes, more, position)
 
       {:error, reason} ->
         send_read_error(conn, reason)
     end
+  end
+
+  def send_batch(conn, changes, more, position) do
+    encoded =
+      Enum.map_intersperse(changes, ",", fn %{"data" => data} = change ->
+        Projection.run(Projection.change_key(data), fn -> JSON.encode!(change) end)
+      end)
+
+    body = [
+      "{\"changes\":[",
+      encoded,
+      "],\"more\":",
+      JSON.encode!(more),
+      ",\"rev\":",
+      Integer.to_string(position),
+      "}"
+    ]
+
+    conn |> put_resp_content_type("application/json", "utf-8") |> send_resp(200, body)
   end
 
   ## Request parsing
@@ -96,6 +116,7 @@ defmodule AttentionServer.ClientAPI.Feed do
   def send_read_error(conn, :account_paused), do: Errors.send_error(conn, "account_paused")
   def send_read_error(conn, :unauthorized), do: Errors.send_error(conn, "unauthorized")
   def send_read_error(conn, :disabled), do: Errors.send_error(conn, "not_found")
+  def send_read_error(conn, %Projection{} = fault), do: Errors.projection_error(conn, fault)
   def send_read_error(conn, _reason), do: Errors.send_error(conn, "storage_unavailable")
 end
 
@@ -107,13 +128,13 @@ defmodule AttentionServer.ClientAPI.FeedStep do
   the Relay; the caller encodes and sends.
 
   Rows render through `ClientAPI.FeedRenderer` (replaceable in tests through
-  the `:client_api_feed_renderer` application setting). A row the renderer
-  skips, or one whose rendering fails, is not sent; a failure is reported to
-  diagnostics and never takes down the Relay.
+  the `:client_api_feed_renderer` application setting). A row with no wire
+  form can be skipped. A projection failure stops the step at its input
+  cursor and never takes down the Relay.
   """
 
   alias AttentionServer.{ChangeLog, Diagnostics}
-  alias AttentionServer.ClientAPI.Reads
+  alias AttentionServer.ClientAPI.{FeedRenderer, Projection, Reads}
 
   @doc false
   def scope(ctx), do: ctx.principal.person
@@ -167,7 +188,7 @@ defmodule AttentionServer.ClientAPI.FeedStep do
         view: Map.get(Map.get(state, :priority_views, %{}), person)
       }
 
-      with {:ok, changes} <- render_rows(context, principal, rows),
+      with {:ok, changes} <- Projection.capture(fn -> render_rows(context, principal, rows) end),
            do: {:ok, changes, more, position}
     else
       {:error, reason} when reason in [:cursor_expired, :unauthorized, :disabled] ->
@@ -191,23 +212,22 @@ defmodule AttentionServer.ClientAPI.FeedStep do
     end
   end
 
-  # One render_many call per step, so each item's entries are built once for
-  # all of its rows (review H2). If it raises, the rows render one at a time,
-  # so a single bad row is skipped rather than the whole step.
   defp render_rows(context, principal, rows) do
     renderer = renderer()
 
     results =
-      if Code.ensure_loaded?(renderer) and function_exported?(renderer, :render_many, 3) do
-        try do
-          renderer.render_many(context, principal, rows)
-        rescue
-          error ->
-            Diagnostics.failure(:client_api, :stream_read, error, :rejected)
-            Enum.map(rows, &{&1, render_one(renderer, context, principal, &1)})
-        end
-      else
-        Enum.map(rows, &{&1, render_one(renderer, context, principal, &1)})
+      cond do
+        renderer == FeedRenderer ->
+          FeedRenderer.render_many(context, principal, rows)
+
+        Code.ensure_loaded?(renderer) and function_exported?(renderer, :render_many, 3) ->
+          Projection.run(:feed, fn -> renderer.render_many(context, principal, rows) end)
+
+        true ->
+          Enum.map(rows, fn row ->
+            result = Projection.run(:feed, fn -> renderer.render(context, principal, row) end)
+            {row, result}
+          end)
       end
 
     changes(results)
@@ -229,19 +249,11 @@ defmodule AttentionServer.ClientAPI.FeedStep do
     end
   end
 
-  defp render_one(renderer, context, principal, row) do
-    renderer.render(context, principal, row)
-  rescue
-    error ->
-      Diagnostics.failure(:client_api, :stream_read, error, :rejected)
-      :skip
-  end
-
   defp renderer,
     do:
       Application.get_env(
         :attention_server,
         :client_api_feed_renderer,
-        AttentionServer.ClientAPI.FeedRenderer
+        FeedRenderer
       )
 end

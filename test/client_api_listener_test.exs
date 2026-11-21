@@ -308,7 +308,7 @@ defmodule AttentionServer.ClientAPIListenerTest do
                json(response)
     end
 
-    test "a handler defect answers 503 retry_later with Retry-After", ctx do
+    test "a handler defect answers 500 with a non-retryable token", ctx do
       assert {:ok, conn} = device_connect(ctx, "a1", :http2)
 
       log =
@@ -318,10 +318,14 @@ defmodule AttentionServer.ClientAPIListenerTest do
         end)
 
       assert_received {:response, response}
-      assert response.status == 503
-      assert header(response, "retry-after") == ["1"]
-      assert %{"error" => "retry_later", "retryable" => true} = json(response)
-      assert log =~ "operation=client_api"
+      assert response.status == 500
+      assert header(response, "retry-after") == []
+      assert [request_id] = header(response, "request-id")
+
+      assert %{"error" => "internal_error", "retryable" => false, "request_id" => ^request_id} =
+               json(response)
+
+      assert log =~ "event=harklight_projection_failure request_id=#{request_id}"
       refute log =~ "handler defect"
     end
   end

@@ -6,7 +6,7 @@ defmodule AttentionServer.ClientAPI.AgentReads do
   import Plug.Conn, only: [fetch_query_params: 1]
 
   alias AttentionServer.{AgentChangeLog, Engine, Message, RouteBIndex}
-  alias AttentionServer.ClientAPI.{AgentResources, Context, Reads}
+  alias AttentionServer.ClientAPI.{AgentResources, Context, Projection, Reads}
 
   @page_size 50
   @filters ~w(session sender legacy_message_id)
@@ -52,7 +52,7 @@ defmodule AttentionServer.ClientAPI.AgentReads do
     result =
       with {:ok, ^person} <- Engine.authorized_person(state.store.engine, key),
            {:ok, head} <- AgentChangeLog.head(state.store, scope) do
-        read(request, state, scope, head)
+        Projection.capture(fn -> read(request, state, scope, head) end)
       else
         {:error, :disabled} -> {:error, :not_found}
         {:error, :unauthorized} -> {:error, :unauthorized}
