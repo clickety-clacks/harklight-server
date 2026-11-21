@@ -475,7 +475,12 @@ defmodule AttentionServer.DashboardReadHTTP do
             send_resp(conn, 400, "The level table is invalid.")
         end
 
-      {_, _, conn} ->
+      # json_body refuses a foreign origin, content type or body as
+      # {:error, conn}; any other body shape is {:ok, body, conn}.
+      {:error, conn} ->
+        send_resp(conn, 400, "The level table is invalid.")
+
+      {:ok, _body, conn} ->
         send_resp(conn, 400, "The level table is invalid.")
     end
   end

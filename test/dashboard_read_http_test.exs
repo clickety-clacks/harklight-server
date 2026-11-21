@@ -190,6 +190,27 @@ defmodule AttentionServer.DashboardReadHTTPTest do
     invalid = json_post("/levels", %{"level" => rows}, "member-session")
     invalid = DashboardReadHTTP.call(invalid, opts)
     assert invalid.status == 400
+
+    # A refused origin, content type or body is a 400, not a server error.
+    refused = [
+      json_post("/levels", %{"levels" => rows}, "member-session")
+      |> Plug.Conn.put_req_header("origin", "https://elsewhere.example"),
+      json_post("/levels", %{"levels" => rows}, "member-session")
+      |> Plug.Conn.put_req_header("content-type", "text/plain"),
+      %{
+        Plug.Test.conn(:post, "/levels", "not json")
+        | scheme: :https,
+          port: 443
+      }
+      |> Plug.Conn.put_req_header("cookie", "__Host-harklight=member-session")
+      |> Plug.Conn.put_req_header("origin", "https://www.example.com")
+      |> Plug.Conn.put_req_header("content-type", "application/json")
+    ]
+
+    for conn <- refused do
+      response = DashboardReadHTTP.call(conn, opts)
+      assert {response.status, response.resp_body} == {400, "The level table is invalid."}
+    end
   end
 
   test "all three guidance files are served without a dashboard session", %{opts: opts} do
