@@ -128,13 +128,8 @@ defmodule AttentionServer.BounceDecision do
   def record_open(%Engine{} = engine, key, record, raw_revision) do
     case substantive_revision(engine, key, record, raw_revision) do
       {next, sub_revision} when is_integer(sub_revision) ->
-        opened =
-          MapSet.put(
-            next.opened_revisions,
-            Tuple.insert_at(key, tuple_size(key), sub_revision)
-          )
-
-        {:ok, %{next | opened_revisions: opened}, sub_revision}
+        member = Tuple.insert_at(key, tuple_size(key), sub_revision)
+        {:ok, Engine.put_member(next, :opened_revisions, member), sub_revision}
 
       {_next, nil} ->
         {:error, :invalid_revision}
@@ -240,14 +235,9 @@ defmodule AttentionServer.BounceDecision do
         end
       end)
 
-    waiting_routes =
-      if MapSet.size(still_waiting) == 0 do
-        Map.delete(engine.bounce_waiting_routes, session_key)
-      else
-        Map.put(engine.bounce_waiting_routes, session_key, still_waiting)
-      end
-
-    %{engine | bounce_waiting_routes: waiting_routes}
+    if MapSet.size(still_waiting) == 0,
+      do: Engine.delete_row(engine, :bounce_waiting_routes, session_key),
+      else: Engine.put_row(engine, :bounce_waiting_routes, session_key, still_waiting)
   end
 
   def rebuild_indexes(%Engine{} = engine) do
@@ -304,7 +294,11 @@ defmodule AttentionServer.BounceDecision do
           else
             updated = %{feed | receipts: MapSet.put(feed.receipts, advisory_id)}
 
-            {:ok, %{engine | advisory_feeds: Map.put(engine.advisory_feeds, feed_key, updated)},
+            engine =
+              %{engine | advisory_feeds: Map.put(engine.advisory_feeds, feed_key, updated)}
+              |> Engine.touch_fact({:advisory, feed_key, {:receipt, advisory_id}})
+
+            {:ok, engine,
              %{
                "session_handle" => handle,
                "advisory_id" => advisory_id,
@@ -559,7 +553,10 @@ defmodule AttentionServer.BounceDecision do
         case Map.get(engine.origin_sessions, {person, origin, handle}) do
           %{gone: false} = session ->
             if Map.get(record, :agent_api_v2, false) or
-                 match?(%{"advisory_v1" => true, "unsupported_reason" => nil}, Map.get(session, :support)),
+                 match?(
+                   %{"advisory_v1" => true, "unsupported_reason" => nil},
+                   Map.get(session, :support)
+                 ),
                do: :supported,
                else: :unsupported
 
@@ -613,6 +610,11 @@ defmodule AttentionServer.BounceDecision do
           AttentionServer.RouteBIndex.put_advisory(engine.route_b_index, key, sequence)
     }
 
+    engine =
+      engine
+      |> Engine.touch_fact({:advisory, feed_key, :high})
+      |> Engine.touch_fact({:advisory, feed_key, {:entry, sequence}})
+
     update_selection(engine, key, state, sub_revision, selection, "bounced", nil, advisory_id)
   end
 
@@ -660,7 +662,7 @@ defmodule AttentionServer.BounceDecision do
   defp put_revision_state(engine, key, state) do
     old_state = Map.get(engine.bounce_revisions, key)
     engine = remove_revision_index(engine, key, old_state)
-    engine = %{engine | bounce_revisions: Map.put(engine.bounce_revisions, key, state)}
+    engine = Engine.put_row(engine, :bounce_revisions, key, state)
     add_revision_index(engine, key, state)
   end
 
@@ -713,11 +715,7 @@ defmodule AttentionServer.BounceDecision do
         |> then(fn current ->
           waiting = Map.get(current.bounce_waiting_routes, session_key, MapSet.new())
 
-          %{
-            current
-            | bounce_waiting_routes:
-                Map.put(current.bounce_waiting_routes, session_key, MapSet.put(waiting, item))
-          }
+          Engine.put_row(current, :bounce_waiting_routes, session_key, MapSet.put(waiting, item))
         end)
 
       _ ->
@@ -741,12 +739,9 @@ defmodule AttentionServer.BounceDecision do
       %MapSet{} = waiting ->
         remaining = MapSet.delete(waiting, {key, sub_revision})
 
-        waiting_routes =
-          if MapSet.size(remaining) == 0,
-            do: Map.delete(engine.bounce_waiting_routes, session_key),
-            else: Map.put(engine.bounce_waiting_routes, session_key, remaining)
-
-        %{engine | bounce_waiting_routes: waiting_routes}
+        if MapSet.size(remaining) == 0,
+          do: Engine.delete_row(engine, :bounce_waiting_routes, session_key),
+          else: Engine.put_row(engine, :bounce_waiting_routes, session_key, remaining)
 
       _ ->
         engine
@@ -904,7 +899,7 @@ defmodule AttentionServer.BounceDecision do
   end
 
   defp put_configuration(engine, person, config),
-    do: %{engine | bounce_levels: Map.put(engine.bounce_levels, person, config)}
+    do: Engine.put_row(engine, :bounce_levels, person, config)
 
   # Defaults apply to newly accepted deliveries and revisions. Existing stored
   # qualification flags (including legacy false values) remain unchanged, so
