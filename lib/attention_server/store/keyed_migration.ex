@@ -1,10 +1,41 @@
 defmodule AttentionServer.Store.KeyedMigration do
   @moduledoc false
 
+  alias AttentionServer.{Conversation, LargeData, Store}
   alias AttentionServer.Store.{RecordCodec, RecordTable}
   alias Exqlite.Sqlite3
 
   @format 30
+
+  # Prepare the validated in-memory readback before committing the anchor.
+  # Runtime selection of the converter belongs to the guarded Store opener.
+  def convert_store(%Store{db: db, engine: engine, version: version} = store, prepare)
+      when is_function(prepare, 3) do
+    persisted = LargeData.persist_refs(engine)
+    expected = canonical(persisted)
+    generation = version + 1
+
+    RecordTable.transaction(db, fn ->
+      with :ok <- verify_previous_progress(store),
+           :ok <-
+             Sqlite3.execute(
+               db,
+               "CREATE INDEX relay_large_data_refs_id ON relay_large_data_refs (id)"
+             ),
+           :ok <- RecordTable.seed(db, generation, RecordCodec.encode(persisted)),
+           {:ok, restored} <- read_records(db),
+           true <- canonical(restored) === expected,
+           {:ok, prepared} <- prepare.(store, restored, generation),
+           :ok <- write_anchor(db, version, generation),
+           :ok <- advance_current_logs(db, version, generation),
+           :ok <- Sqlite3.execute(db, "DELETE FROM relay_device_progress") do
+        {:ok, prepared}
+      else
+        false -> {:error, :migration_readback_mismatch}
+        error -> error
+      end
+    end)
+  end
 
   def load(db) do
     # Load the codec's identity atom before decoding the anchor with :safe.
@@ -45,6 +76,77 @@ defmodule AttentionServer.Store.KeyedMigration do
 
   defp read_records(db) do
     with {:ok, rows} <- RecordTable.rows(db), do: RecordCodec.decode(rows)
+  end
+
+  defp canonical(engine) do
+    engine
+    |> Conversation.index_origin_feeds()
+    |> Map.from_struct()
+    |> Map.drop(RecordCodec.derived_fields())
+  end
+
+  defp verify_previous_progress(store) do
+    with {:ok, rows} <-
+           query(
+             store.db,
+             "SELECT version FROM relay_device_progress WHERE id = 1 AND snapshot_version = ?",
+             [store.version]
+           ),
+         true <-
+           rows == [[store.progress_version]] or (rows == [] and store.progress_version == 0) do
+      :ok
+    else
+      false -> {:error, :stale_progress}
+      error -> error
+    end
+  end
+
+  defp write_anchor(db, previous, generation) do
+    payload =
+      :erlang.term_to_binary({:attention_relay_keyed_state, @format, RecordCodec.identity()})
+
+    params = [generation, {:blob, payload}, {:blob, :crypto.hash(:sha256, payload)}, previous]
+
+    with :done <-
+           statement(
+             db,
+             "UPDATE relay_state SET version = ?, payload = ?, checksum = ? WHERE id = 1 AND version = ?",
+             params,
+             &Sqlite3.step(db, &1)
+           ),
+         {:ok, 1} <- Sqlite3.changes(db) do
+      :ok
+    else
+      {:ok, 0} -> {:error, :stale_generation}
+      error -> error
+    end
+  end
+
+  # Conversion preserves the facts and feed rows. Only logs already current
+  # at the legacy snapshot generation can follow its new generation.
+  defp advance_current_logs(db, previous, generation) do
+    Enum.reduce_while(~w(client_change_log_state agent_change_log_state), :ok, fn table, :ok ->
+      case advance_current_log(db, table, previous, generation) do
+        :ok -> {:cont, :ok}
+        error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp advance_current_log(db, table, previous, generation) do
+    case query(db, "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?", [table]) do
+      {:ok, []} ->
+        :ok
+
+      {:ok, [[1]]} ->
+        sql = "UPDATE #{table} SET store_version = ? WHERE id = 1 AND store_version = ?"
+
+        with :done <- statement(db, sql, [generation, previous], &Sqlite3.step(db, &1)),
+             do: :ok
+
+      error ->
+        error
+    end
   end
 
   defp query(db, sql, params), do: statement(db, sql, params, &Sqlite3.fetch_all(db, &1))
