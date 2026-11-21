@@ -141,6 +141,14 @@ defmodule AttentionServer.ClientAPI.FeedStep do
       }
 
       {:ok, Enum.flat_map(rows, &render(context, principal, &1)), more, position}
+    else
+      {:error, reason} when reason in [:cursor_expired, :unauthorized, :disabled] ->
+        {:error, reason}
+
+      # Any other failure of the store is a storage failure to the client.
+      {:error, reason} ->
+        Diagnostics.failure(:client_api, :stream_read, reason, :failed)
+        {:error, :storage_unavailable}
     end
   rescue
     error ->
