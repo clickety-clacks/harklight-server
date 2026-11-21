@@ -262,14 +262,8 @@ defmodule AttentionServer.InboxPaging do
           {:error, :checkpoint_conflict}
 
         nil ->
-          with {:ok, next_engine, results, applied} <-
-                 reconcile_operations(store, engine, key, snapshot, operations),
-               {:ok, next_store} <-
-                 Store.commit(store, next_engine, %{
-                   person: person,
-                   actor: key,
-                   action: "inbox_reconcile"
-                 }) do
+          with {:ok, next_engine, results, applied, touched} <-
+                 stage_reconciliation(store, engine, key, snapshot, operations) do
             result =
               ok(frame, %{
                 "paging_version" => 1,
@@ -280,23 +274,74 @@ defmodule AttentionServer.InboxPaging do
               })
               |> Map.delete("ref")
 
-            case Store.save_inbox_batch(
-                   next_store,
-                   person,
-                   key,
-                   snapshot.snapshot_id,
-                   batch_id,
-                   digest,
-                   result
-                 ) do
-              {:ok, saved} -> {:ok, saved, next_store, applied}
-              {:error, reason} -> {:error, reason, next_store, applied}
-            end
-          else
-            {:error, reason, _store} -> {:error, reason}
-            {:error, reason} -> {:error, reason}
+            audit = %{person: person, actor: key, action: "inbox_reconcile"}
+            persist_batch(store, next_engine, applied, touched, audit, snapshot, digest, result)
           end
       end
+    end
+  end
+
+  defp stage_reconciliation(%Store{mode: :keyed} = store, engine, key, snapshot, operations) do
+    {next, result, touched} =
+      Engine.with_touches(engine, fn current ->
+        case reconcile_operations(store, current, key, snapshot, operations) do
+          {:ok, next, results, applied} -> {next, {:ok, results, applied}}
+          error -> {current, error}
+        end
+      end)
+
+    with {:ok, results, applied} <- result, do: {:ok, next, results, applied, touched}
+  end
+
+  defp stage_reconciliation(store, engine, key, snapshot, operations) do
+    with {:ok, next, results, applied} <-
+           reconcile_operations(store, engine, key, snapshot, operations),
+         do: {:ok, next, results, applied, nil}
+  end
+
+  defp persist_batch(
+         %Store{mode: :keyed} = store,
+         next,
+         _applied,
+         touched,
+         audit,
+         snapshot,
+         digest,
+         result
+       ) do
+    case Store.commit_inbox_batch(
+           store,
+           next,
+           touched,
+           audit,
+           snapshot.snapshot_id,
+           result["batch_id"],
+           digest,
+           result
+         ) do
+      {:ok, committed} -> {:ok, result, committed, touched}
+      {:error, reason, _store} -> {:error, reason}
+    end
+  end
+
+  defp persist_batch(store, next, applied, nil, audit, snapshot, digest, result) do
+    case Store.commit(store, next, audit) do
+      {:ok, committed} ->
+        case Store.save_inbox_batch(
+               committed,
+               audit.person,
+               audit.actor,
+               snapshot.snapshot_id,
+               result["batch_id"],
+               digest,
+               result
+             ) do
+          {:ok, saved} -> {:ok, saved, committed, applied}
+          {:error, reason} -> {:error, reason, committed, applied}
+        end
+
+      {:error, reason, _store} ->
+        {:error, reason}
     end
   end
 

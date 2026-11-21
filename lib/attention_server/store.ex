@@ -28,6 +28,7 @@ defmodule AttentionServer.Store do
     KeyedReference,
     KeyedValidation,
     Persistence,
+    RecordCodec,
     RecordTable,
     SnapshotEncoding
   }
@@ -1040,6 +1041,76 @@ defmodule AttentionServer.Store do
       do: {:error, :storage_unavailable, store}
 
   def accept_inbox_checkpoint(
+        %__MODULE__{mode: :keyed, db: db} = store,
+        engine,
+        person,
+        device,
+        snapshot_id,
+        high,
+        batches,
+        audit
+      ) do
+    address = {:row, :cursors, {person, device}}
+
+    with {:ok, ^person} <- Engine.authorized_person(engine, device),
+         {:ok, next} <- Engine.checkpoint_cursor(engine, device, high),
+         true <- valid_authority_reference?(next, address) do
+      records =
+        if Map.get(engine.cursors, {person, device}) == high,
+          do: [],
+          else: [{:put, RecordCodec.encode_row({:row, :cursors, {person, device}}, high)}]
+
+      result =
+        Persistence.run(fn ->
+          RecordTable.transaction(db, fn ->
+            with {:ok, generation} when generation == store.version <- RecordTable.generation(db),
+                 {:ok, duplicate?} <-
+                   checkpoint_status(db, person, device, snapshot_id, high, batches) do
+              if duplicate? do
+                {:ok, true}
+              else
+                RecordTable.write_generation(db, generation, records, fn db, _ ->
+                  with :ok <- accept_checkpoint_row(db, person, device, snapshot_id),
+                       :ok <- write_audit(db, audit),
+                       do: {:ok, false}
+                end)
+              end
+            else
+              {:ok, _stale} -> {:error, :storage_unavailable}
+              error -> error
+            end
+          end)
+        end)
+
+      case result do
+        {:ok, true} ->
+          {:ok, store, true}
+
+        {:ok, false} ->
+          {authority, _} =
+            KeyedValidation.authority_changes(store.authority_index, engine, next, [address])
+
+          committed = %{
+            store
+            | engine: next,
+              authority_index: authority,
+              version: store.version + 1
+          }
+
+          Persistence.committed(committed)
+          {:ok, committed, false}
+
+        {:error, reason} ->
+          {:error, reason, store}
+      end
+    else
+      false -> {:error, :forbidden, store}
+      {:ok, _other_person} -> {:error, :forbidden, store}
+      {:error, reason} -> {:error, reason, store}
+    end
+  end
+
+  def accept_inbox_checkpoint(
         %__MODULE__{} = store,
         engine,
         person,
@@ -1053,14 +1124,8 @@ defmodule AttentionServer.Store do
          %__MODULE__{db: db} <- store,
          :ok <- Sqlite3.execute(db, "BEGIN IMMEDIATE"),
          :ok <- check_progress_version(store),
-         {:ok, row} <-
-           one(
-             db,
-             "SELECT status, high_water, receipts_complete FROM relay_inbox_snapshots WHERE person_id = ? AND device_id = ? AND snapshot_id = ?",
-             [person, device, snapshot_id]
-           ),
          {:ok, duplicate?} <-
-           checkpoint_ready(db, row, person, device, snapshot_id, high, batches),
+           checkpoint_status(db, person, device, snapshot_id, high, batches),
          :ok <-
            if(duplicate?,
              do: :ok,
@@ -1081,6 +1146,17 @@ defmodule AttentionServer.Store do
       {:error, reason, _} ->
         _ = if store.db, do: Sqlite3.execute(store.db, "ROLLBACK")
         {:error, reason, store}
+    end
+  end
+
+  defp checkpoint_status(db, person, device, snapshot_id, high, batches) do
+    with {:ok, row} <-
+           one(
+             db,
+             "SELECT status, high_water, receipts_complete FROM relay_inbox_snapshots WHERE person_id = ? AND device_id = ? AND snapshot_id = ?",
+             [person, device, snapshot_id]
+           ) do
+      checkpoint_ready(db, row, person, device, snapshot_id, high, batches)
     end
   end
 
@@ -1126,7 +1202,24 @@ defmodule AttentionServer.Store do
     end
   end
 
-  defp commit_keyed(store, next, touched, audit) do
+  def commit_inbox_batch(store, next, touched, audit, snapshot_id, batch_id, digest, result) do
+    commit_keyed(store, next, touched, audit, fn ->
+      case save_inbox_batch(
+             store,
+             audit.person,
+             audit.actor,
+             snapshot_id,
+             batch_id,
+             digest,
+             result
+           ) do
+        {:ok, _saved} -> :ok
+        error -> error
+      end
+    end)
+  end
+
+  defp commit_keyed(store, next, touched, audit, write_metadata \\ fn -> :ok end) do
     items = for {:row, :messages, key} <- touched, do: key
 
     {authority_index, affected} =
@@ -1171,6 +1264,7 @@ defmodule AttentionServer.Store do
                RecordTable.commit(db, version, records, fn db, generation ->
                  with :ok <- write_reference_delta(db, deleted, refs),
                       :ok <- write_audit(db, audit),
+                      :ok <- write_metadata.(),
                       {:ok, heads, agent_heads} <- append_change_logs(db, log, generation) do
                    {:ok, {heads, agent_heads}}
                  end
@@ -2301,10 +2395,13 @@ defmodule AttentionServer.Store do
        do: {:error, :checkpoint_conflict}
 
   defp checkpoint_commit(store, next_engine, person, device, snapshot_id, audit) do
-    db = store.db
-
     with :ok <- write_progress(store, next_engine),
-         :ok <-
+         :ok <- accept_checkpoint_row(store.db, person, device, snapshot_id),
+         do: write_audit(store.db, audit)
+  end
+
+  defp accept_checkpoint_row(db, person, device, snapshot_id) do
+    with :ok <-
            run(
              db,
              "UPDATE relay_inbox_snapshots SET status = 'replaced' WHERE person_id = ? AND device_id = ? AND status IN ('pending', 'accepted') AND snapshot_id != ?",
@@ -2316,13 +2413,7 @@ defmodule AttentionServer.Store do
              "UPDATE relay_inbox_snapshots SET status = 'accepted' WHERE person_id = ? AND device_id = ? AND snapshot_id = ? AND status = 'pending'",
              [person, device, snapshot_id]
            ),
-         {:ok, 1} <- Sqlite3.changes(db),
-         :ok <-
-           run(
-             db,
-             "INSERT INTO relay_audit (person_id, actor_id, action, at_ms) VALUES (?, ?, ?, ?)",
-             [audit.person, audit.actor, audit.action, System.system_time(:millisecond)]
-           ) do
+         {:ok, 1} <- Sqlite3.changes(db) do
       :ok
     else
       {:ok, 0} -> {:error, :snapshot_unavailable}

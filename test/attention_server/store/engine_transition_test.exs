@@ -988,6 +988,84 @@ defmodule AttentionServer.Store.EngineTransitionTest do
     GenServer.stop(reopened)
   end
 
+  test "keyed default timer commits only due answers and retries failed writes" do
+    path = legacy_store_path()
+    {:ok, legacy} = Store.open(path)
+    assert {:ok, _} = KeyedMigration.convert(legacy)
+    :ok = Store.close(legacy)
+    flags = path <> ".flags"
+    File.write!(flags, JSON.encode!(%{"client_api_v2" => true}))
+    clock = :atomics.new(1, [])
+    :atomics.put(clock, 1, 100)
+
+    opts = [
+      store_path: path,
+      store_mode: :keyed,
+      feature_flags_path: flags,
+      clock: fn -> :atomics.get(clock, 1) end
+    ]
+
+    {:ok, relay} = Relay.start_link(opts)
+    handle = "00000000-0000-4000-8000-000000000010"
+    {:ok, frame} = JSON.decode_line(forward_line())
+
+    for {id, at, op} <- [
+          {"due", 20_001, "00000000-0000-4000-8000-000000000021"},
+          {"later", 40_002, "00000000-0000-4000-8000-000000000022"}
+        ] do
+      line =
+        frame
+        |> Map.merge(%{"session_handle" => handle, "op_id" => op})
+        |> Map.update!("message", fn message ->
+          Map.merge(message, %{
+            "message_id" => id,
+            "message_type" => "request",
+            "answer_ui" => %{
+              "schema" => "attention-client.actions/1",
+              "actions" => [
+                %{"id" => "later", "label" => "Later", "kind" => "value", "value" => %{"n" => 2}}
+              ]
+            },
+            "default" => %{"at" => at, "value" => %{"n" => 2}}
+          })
+        end)
+        |> JSON.encode_line()
+
+      assert {:ok, reply} = Relay.request_line(relay, @origin, line)
+      assert {:ok, %{"type" => "ok"}} = JSON.decode_line(reply)
+    end
+
+    before = :sys.get_state(relay)
+    :atomics.put(clock, 1, 20_001)
+
+    assert :ok =
+             Sqlite3.execute(before.store.db, """
+             CREATE TRIGGER keyed_default_fault BEFORE INSERT ON relay_audit
+             WHEN NEW.action = 'default_answer_sweep'
+             BEGIN SELECT RAISE(ABORT, 'failed'); END
+             """)
+
+    send(relay, {:default_sweep, before.default_timer_generation})
+    retry = :sys.get_state(relay)
+    assert retry.store.version == before.store.version
+    assert :ok = Sqlite3.execute(retry.store.db, "DROP TRIGGER keyed_default_fault")
+    send(relay, {:default_sweep, retry.default_timer_generation})
+    live = :sys.get_state(relay).store
+    assert live.version == before.store.version + 1
+
+    assert %{terminal: %{by: "default", answer: %{"n" => 2}}} =
+             live.engine.messages[{@person, "app:test/worker", "due"}]
+
+    assert %{terminal: nil} = live.engine.messages[{@person, "app:test/worker", "later"}]
+
+    GenServer.stop(relay)
+    assert {:ok, reopened} = Store.open(path, :keyed)
+    assert {:ok, reopened} = Store.enable_change_log(reopened)
+    assert full_diff(live.engine, reopened.engine) == MapSet.new()
+    assert index_state(live) == index_state(reopened)
+    :ok = Store.close(reopened)
+  end
+
   defp agent_write(relay, operation, params, body, op_id) do
     principal = %{person: @person, key: @origin}
 

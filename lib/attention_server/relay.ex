@@ -807,6 +807,7 @@ defmodule AttentionServer.Relay do
               feature_flags_warned: false,
               clock: Keyword.get(opts, :clock, fn -> System.system_time(:millisecond) end),
               default_index: Engine.default_index(store.engine),
+              default_deadlines: default_deadlines(store),
               default_timer: nil,
               default_timer_generation: 0,
               bounce_deadline_timer: nil,
@@ -3596,6 +3597,26 @@ defmodule AttentionServer.Relay do
     {:noreply, reschedule_default_sweep(state, Engine.default_index(state.store.engine))}
   end
 
+  defp dispatch_info({:refresh_default_sweep_index, keys}, state) do
+    fresh = Engine.default_index(state.store.engine)
+
+    {index, deadlines} =
+      Enum.reduce(keys, {state.default_index, state.default_deadlines}, fn key, {index, tree} ->
+        tree =
+          case Map.fetch(index, key) do
+            {:ok, at} -> :gb_trees.delete_any({at, key}, tree)
+            :error -> tree
+          end
+
+        case Map.fetch(fresh, key) do
+          {:ok, at} -> {Map.put(index, key, at), :gb_trees.enter({at, key}, true, tree)}
+          :error -> {Map.delete(index, key), tree}
+        end
+      end)
+
+    {:noreply, reschedule_default_sweep(%{state | default_deadlines: deadlines}, index)}
+  end
+
   defp dispatch_info(
          {:bounce_due, generation},
          %{bounce_deadline_generation: generation} = state
@@ -3636,19 +3657,19 @@ defmodule AttentionServer.Relay do
     old_engine = state.store.engine
     now_ms = state.clock.()
 
-    due_index =
-      state.default_index
-      |> Enum.filter(fn {_key, at} -> is_integer(at) and at <= now_ms end)
-      |> Map.new()
+    due_index = due_defaults(state, now_ms)
 
-    next_engine = Engine.sweep_due_defaults(old_engine, now_ms, due_index)
+    {next_engine, nil, touched} =
+      track_transition(state, old_engine, fn engine ->
+        {Engine.sweep_due_defaults(engine, now_ms, due_index), nil}
+      end)
 
     if next_engine == old_engine do
       if map_size(due_index) == 0,
         do: {:noreply, reschedule_default_sweep(state, state.default_index)},
         else: {:noreply, schedule_default_retry(state)}
     else
-      case commit(state.store, next_engine, %{
+      case commit_request(state.store, next_engine, touched, %{
              person: "system",
              actor: "default_answer",
              action: "default_answer_sweep"
@@ -3657,17 +3678,14 @@ defmodule AttentionServer.Relay do
           next_state = %{state | store: store}
 
           next_state =
-            next_engine.origin_feeds
-            |> Map.keys()
+            sweep_origin_targets(next_engine, touched)
             |> Enum.reduce(next_state, fn target, current ->
               record_origin_feed_change(current, old_engine, next_engine, target)
             end)
 
-          people = Map.keys(next_engine.persons)
-
           next_state =
-            Enum.reduce(people, next_state, fn person, current ->
-              if pending_signature(old_engine, person) != pending_signature(next_engine, person),
+            Enum.reduce(sweep_people(next_engine, touched), next_state, fn person, current ->
+              if pending_inputs_changed?(old_engine, next_engine, person, touched),
                 do: pending_set_changed(current, person),
                 else: current
             end)
@@ -3675,7 +3693,7 @@ defmodule AttentionServer.Relay do
           {:noreply, next_state}
 
         {:error, reason, next_store} ->
-          Diagnostics.failure(:message_default, :default_sweep, reason, :unavailable)
+          Diagnostics.failure(:server_storage, :state_commit, reason, :unavailable)
           {:noreply, schedule_default_retry(%{state | store: next_store})}
       end
     end
@@ -4722,6 +4740,27 @@ defmodule AttentionServer.Relay do
 
   # A reconciliation can now commit a No comment terminal. Preserve the same
   # origin-feed and pending-view notifications as an ordinary device request.
+  defp reconciled_state(state, store, _key, []) when state.store.engine == store.engine,
+    do: %{state | store: store}
+
+  defp reconciled_state(state, store, _key, %MapSet{} = touched) do
+    old = state.store.engine
+    engine = store.engine
+    notify_default_changes(old, engine, touched)
+
+    state =
+      Enum.reduce(sweep_origin_targets(engine, touched), %{state | store: store}, fn scope,
+                                                                                     current ->
+        record_origin_feed_change(current, old, engine, scope)
+      end)
+
+    Enum.reduce(sweep_people(engine, touched), state, fn person, current ->
+      if pending_inputs_changed?(old, engine, person, touched),
+        do: pending_set_changed(current, person),
+        else: current
+    end)
+  end
+
   defp reconciled_state(state, store, key, applied) do
     next = %{state | store: store}
 
@@ -5325,14 +5364,7 @@ defmodule AttentionServer.Relay do
         _ -> nil
       end
 
-    targets =
-      case JSON.decode_line(raw) do
-        {:ok, request} when is_map(request) ->
-          origin_feed_targets(state.store.engine, next_engine, key, request)
-
-        _ ->
-          []
-      end
+    targets = request_origin_targets(state, next_engine, key, raw, touched)
 
     finish_request(
       state,
@@ -5435,7 +5467,7 @@ defmodule AttentionServer.Relay do
           end
 
         operation_id = Diagnostics.operation_id(frame)
-        targets = origin_feed_targets(state.store.engine, next_engine, key, request_frame)
+        targets = request_origin_targets(state, next_engine, key, request_frame, touched)
 
         {reply, next_state} =
           finish_request(
@@ -5895,10 +5927,9 @@ defmodule AttentionServer.Relay do
           next_state =
             case Engine.authorized_person(state.store.engine, key) do
               {:ok, person} ->
-                if pending_signature(state.store.engine, person) !=
-                     pending_signature(next_engine, person),
-                   do: pending_set_changed(next_state, person),
-                   else: next_state
+                if pending_inputs_changed?(state.store.engine, next_engine, person, touched),
+                  do: pending_set_changed(next_state, person),
+                  else: next_state
 
               _ ->
                 next_state
@@ -6237,6 +6268,33 @@ defmodule AttentionServer.Relay do
     |> Enum.map(&{&1.identity, &1.revision, &1.message})
     |> Enum.sort_by(&elem(&1, 0))
   end
+
+  defp pending_inputs_changed?(old, next, person, nil),
+    do: pending_signature(old, person) != pending_signature(next, person)
+
+  defp pending_inputs_changed?(old, next, person, touched) do
+    Enum.any?(touched, fn
+      {:row, :messages, {^person, _, _} = key} ->
+        pending_message_fields(old.messages[key]) != pending_message_fields(next.messages[key])
+
+      {:row, :chat_read_positions, {^person, _, _} = key} ->
+        Map.get(old.chat_read_positions, key, 0) != Map.get(next.chat_read_positions, key, 0)
+
+      {:row, :conversation_events, {^person, _} = key} ->
+        reply_event?(old.conversation_events[key]) or reply_event?(next.conversation_events[key])
+
+      _ ->
+        false
+    end)
+  end
+
+  defp pending_message_fields(nil), do: nil
+
+  defp pending_message_fields(record),
+    do: {is_nil(record.terminal), record.revision, record.message}
+
+  defp reply_event?(%{payload: %{"kind" => "reply", "author" => "origin"}}), do: true
+  defp reply_event?(_), do: false
 
   defp pending_set_changed(state, person) do
     previous = Map.get(state.priority_views, person)
@@ -7248,6 +7306,51 @@ defmodule AttentionServer.Relay do
   defp setup(state, {:error, reason}, _person, _actor, _action),
     do: {:reply, {:error, reason}, state}
 
+  defp default_deadlines(%Store{mode: :keyed, engine: engine}) do
+    Enum.reduce(Engine.default_index(engine), :gb_trees.empty(), fn {key, at}, tree ->
+      :gb_trees.enter({at, key}, true, tree)
+    end)
+  end
+
+  defp default_deadlines(_store), do: nil
+
+  defp due_defaults(%{default_deadlines: nil, default_index: index}, now_ms) do
+    Map.filter(index, fn {_key, at} -> is_integer(at) and at <= now_ms end)
+  end
+
+  defp due_defaults(%{default_deadlines: tree}, now_ms) do
+    due_deadlines(:gb_trees.iterator(tree), now_ms, %{})
+  end
+
+  defp due_deadlines(iterator, now_ms, due) do
+    case :gb_trees.next(iterator) do
+      {{at, key}, true, next} when at <= now_ms ->
+        due_deadlines(next, now_ms, Map.put(due, key, at))
+
+      _ ->
+        due
+    end
+  end
+
+  defp sweep_origin_targets(engine, nil), do: Map.keys(engine.origin_feeds)
+
+  defp sweep_origin_targets(_engine, touched),
+    do: for({:origin_feed, scope, :high} <- touched, do: scope)
+
+  defp sweep_people(engine, nil), do: Map.keys(engine.persons)
+
+  defp sweep_people(_engine, touched),
+    do: for({:row, :persons, person} <- touched, do: person)
+
+  defp next_default_deadline(nil, index), do: Enum.min(Map.values(index), &<=/2, fn -> nil end)
+
+  defp next_default_deadline(tree, _index) do
+    unless :gb_trees.is_empty(tree) do
+      {{at, _key}, true} = :gb_trees.smallest(tree)
+      at
+    end
+  end
+
   defp reschedule_default_sweep(state, index) do
     if is_reference(state.default_timer), do: Process.cancel_timer(state.default_timer)
 
@@ -7260,7 +7363,7 @@ defmodule AttentionServer.Relay do
         default_timer_generation: generation
     }
 
-    case Enum.min(index |> Map.values(), &<=/2, fn -> nil end) do
+    case next_default_deadline(state.default_deadlines, index) do
       at when is_integer(at) ->
         delay = min(max(at - state.clock.(), 0), @max_timer_delay_ms)
         timer = Process.send_after(self(), {:default_sweep, generation}, delay)
@@ -7361,11 +7464,23 @@ defmodule AttentionServer.Relay do
   defp commit_request(store, next, touched, audit) do
     result = Store.commit(store, {next, touched}, audit)
 
-    if match?({:ok, _}, result) and Enum.any?(touched, &match?({:row, :messages, _}, &1)) do
-      send(self(), :refresh_default_sweep_index)
+    with {:ok, committed} <- result do
+      notify_default_changes(store.engine, committed.engine, touched)
     end
 
     result
+  end
+
+  defp notify_default_changes(old, current, touched) do
+    old = Engine.default_index(old)
+    current = Engine.default_index(current)
+
+    keys =
+      for {:row, :messages, key} <- touched,
+          Map.get(old, key) != Map.get(current, key),
+          do: key
+
+    if keys != [], do: send(self(), {:refresh_default_sweep_index, keys})
   end
 
   defp commit_progress(store, next, audit, field) do
@@ -7402,6 +7517,22 @@ defmodule AttentionServer.Relay do
 
     result
   end
+
+  defp request_origin_targets(_state, engine, _key, _request, %MapSet{} = touched),
+    do: sweep_origin_targets(engine, touched)
+
+  defp request_origin_targets(state, engine, key, raw, nil) when is_binary(raw) do
+    case JSON.decode_line(raw) do
+      {:ok, request} when is_map(request) ->
+        origin_feed_targets(state.store.engine, engine, key, request)
+
+      _ ->
+        []
+    end
+  end
+
+  defp request_origin_targets(state, engine, key, request, nil),
+    do: origin_feed_targets(state.store.engine, engine, key, request)
 
   defp origin_feed_targets(
          old_engine,

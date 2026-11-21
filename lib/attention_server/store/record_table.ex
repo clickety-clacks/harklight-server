@@ -40,7 +40,7 @@ defmodule AttentionServer.Store.RecordTable do
   # only. It must return {:ok, metadata} or {:error, reason}. Callers publish
   # the Engine and notify subscribers after commit returns success.
   def commit(db, expected_generation, records, append) do
-    transaction(db, fn -> persist(db, expected_generation, records, append) end)
+    transaction(db, fn -> write_generation(db, expected_generation, records, append) end)
   end
 
   def seed(db, generation, rows) do
@@ -68,7 +68,9 @@ defmodule AttentionServer.Store.RecordTable do
     end
   end
 
-  defp persist(db, expected_generation, records, append) do
+  # Composes records with a caller's transaction when its preconditions must
+  # be checked before any row is changed.
+  def write_generation(db, expected_generation, records, append) do
     with :ok <-
            run(
              db,

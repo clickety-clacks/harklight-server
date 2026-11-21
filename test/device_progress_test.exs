@@ -181,6 +181,98 @@ defmodule AttentionServer.DeviceProgressTest do
     assert snapshot(path) == before
   end
 
+  test "keyed paged replay commits reconciliation and checkpoint metadata atomically", %{
+    path: path
+  } do
+    {:ok, legacy} = Store.open(path)
+    assert {:ok, generation} = Store.KeyedMigration.convert(legacy)
+    :ok = Store.close(legacy)
+    opts = [store_path: path, store_mode: :keyed]
+    {:ok, relay} = Relay.start_link(opts)
+    {:ok, session} = Relay.open_websocket_session(relay, "reader", nil, nil)
+
+    start = %{
+      "type" => "inbox_start",
+      "paging_version" => 1,
+      "startup_id" => "cold",
+      "since" => 0
+    }
+
+    assert [%{"snapshot_id" => id, "high_water" => 8}] = request(relay, session, start)
+
+    reconcile = %{
+      "type" => "inbox_reconcile",
+      "paging_version" => 1,
+      "snapshot_id" => id,
+      "batch_id" => "terminal",
+      "operations" => [
+        %{
+          "type" => "answer_no_comment",
+          "request_id" => "m1",
+          "request_revision" => 1,
+          "op_id" => op(201)
+        }
+      ]
+    }
+
+    db = :sys.get_state(relay).store.db
+
+    assert :ok =
+             Sqlite3.execute(db, """
+             CREATE TRIGGER keyed_batch_fault BEFORE INSERT ON relay_inbox_batches
+             BEGIN SELECT RAISE(ABORT, 'failed'); END
+             """)
+
+    assert [%{"type" => "error"}] = request(relay, session, reconcile)
+    rolled_back = :sys.get_state(relay).store
+    assert rolled_back.version == generation
+    assert rolled_back.engine.messages[{"A", "app:test", "m1"}].terminal == nil
+    assert :ok = Sqlite3.execute(db, "DROP TRIGGER keyed_batch_fault")
+
+    assert [%{"results" => [%{"status" => "committed"}]} = batch] =
+             request(relay, session, reconcile)
+
+    assert :sys.get_state(relay).store.version == generation + 1
+
+    checkpoint = %{
+      "type" => "inbox_checkpoint_ack",
+      "paging_version" => 1,
+      "snapshot_id" => id,
+      "high_water" => 8,
+      "reconciled_batches" => ["terminal"],
+      "pending_manifest_complete" => true
+    }
+
+    assert :ok =
+             Sqlite3.execute(db, """
+             CREATE TRIGGER keyed_checkpoint_fault BEFORE UPDATE ON relay_inbox_snapshots
+             WHEN NEW.status = 'accepted'
+             BEGIN SELECT RAISE(ABORT, 'failed'); END
+             """)
+
+    assert [%{"type" => "error"}] = request(relay, session, checkpoint)
+    assert {:ok, 0} = Relay.acknowledged_cursor(relay, "reader")
+    assert :sys.get_state(relay).store.version == generation + 1
+    assert :ok = Sqlite3.execute(db, "DROP TRIGGER keyed_checkpoint_fault")
+    assert [%{"checkpoint_accepted" => true}] = request(relay, session, checkpoint)
+    assert :sys.get_state(relay).store.version == generation + 2
+    GenServer.stop(relay)
+
+    {:ok, reopened} = Relay.start_link(opts)
+    assert {:ok, 8} = Relay.acknowledged_cursor(reopened, "reader")
+    {:ok, session} = Relay.open_websocket_session(reopened, "reader", nil, nil)
+    assert [%{"snapshot_id" => ^id}] = request(reopened, session, start)
+    assert [^batch] = request(reopened, session, reconcile)
+
+    assert [%{"checkpoint_accepted" => true, "duplicate" => true}] =
+             request(reopened, session, checkpoint)
+
+    live = :sys.get_state(reopened).store
+    assert live.version == generation + 2
+    assert live.engine.messages[{"A", "app:test", "m1"}].terminal.kind == "no_comment"
+    GenServer.stop(reopened)
+  end
+
   test "stale ACK and full-snapshot writers cannot overwrite accepted progress", %{path: path} do
     {:ok, first} = Store.open(path)
     {:ok, stale} = Store.open(path)
