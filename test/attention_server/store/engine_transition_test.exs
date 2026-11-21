@@ -1779,6 +1779,179 @@ defmodule AttentionServer.Store.EngineTransitionTest do
     :ok = Store.close(reopened)
   end
 
+  test "keyed cold cutover replays a retained live reply score once in both feeds" do
+    alias AttentionServer.AgentAPI.FeedStep, as: AgentFeed
+    alias AttentionServer.ClientAPI.{AgentResources, FeedStep, Reads, Resources}
+
+    path = legacy_store_path()
+    flags = path <> ".flags"
+    File.write!(flags, JSON.encode!(%{"client_api_v2" => true}))
+    opts = [store_path: path, feature_flags_path: flags, clock: fn -> 100 end]
+    {:ok, relay} = Relay.start_link(opts)
+    handle = "00000000-0000-4000-8000-000000000084"
+    {item, live} = priority_reply(relay, "live-score", handle, 91)
+    {aggregate_item, historical} = priority_reply(relay, "aggregate", handle, 94)
+    audit = %{person: @person, actor: "server", action: "reply_group_scores"}
+    current = :sys.get_state(relay).store
+
+    {engine, projected} =
+      Engine.retain_reply_scores(
+        current.engine,
+        @person,
+        [score_entry(item, live, 0.9), score_entry(aggregate_item, historical, 0.7)],
+        true
+      )
+
+    {:ok, current} = Store.commit(current, engine, audit, projected)
+
+    {engine, projected} =
+      Engine.retain_reply_scores(current.engine, @person, [score_entry(item, live, 0.9)], true)
+
+    {:ok, current} = Store.commit(current, engine, audit, projected)
+    :sys.replace_state(relay, &%{&1 | store: current})
+    scope = {@person, @origin}
+    {:ok, person_cursor} = ChangeLog.head(current, @person)
+    {:ok, agent_cursor} = AgentChangeLog.head(current, scope)
+    assert %{score: 0.9, scores: %{^live => 0.9}} = current.engine.reply_group_history[item]
+    assert %{score: 0.7, scores: scores} = current.engine.reply_group_history[aggregate_item]
+    assert scores == %{}
+    GenServer.stop(relay)
+    {:ok, legacy} = Store.open(path)
+    {:ok, _} = KeyedMigration.convert(legacy)
+    :ok = Store.close(legacy)
+    opts = Keyword.put(opts, :store_mode, :keyed)
+    {start_us, {:ok, relay}} = :timer.tc(fn -> Relay.start_link(opts) end)
+    state = :sys.get_state(relay)
+    assert state.store.engine.reply_group_history[item] == %{score: 0.9, scores: %{}}
+    assert state.store.engine.reply_group_history[aggregate_item] == %{score: 0.7, scores: %{}}
+    assert {:ok, next_person} = ChangeLog.head(state.store, @person)
+    assert {:ok, next_agent} = AgentChangeLog.head(state.store, scope)
+    assert next_person > person_cursor
+    assert next_agent > agent_cursor
+
+    person = %{person: @person, kind: :device, key: @reader}
+
+    agent_ctx = %{
+      relay: relay,
+      principal: %{person: @person, kind: :device, key: @origin},
+      params: %{session: handle}
+    }
+
+    assert {:ok, person_changes, false, ^next_person} =
+             FeedStep.read(relay, person, person_cursor, 20)
+
+    assert {:ok, agent_changes, false, ^next_agent} = AgentFeed.read(agent_ctx, agent_cursor, 20)
+    item_id = Resources.item_id(state.store.engine.messages[item])
+    assert {:ok, %{"entries" => person_entries}} = Reads.entries(relay, @reader, item_id)
+    assert {:ok, agent_entry} = AgentResources.entry(state, scope, item, live)
+    assert matching_entries(agent_changes, live) == [agent_entry]
+
+    assert matching_entries(person_changes, live) ==
+             Enum.filter(person_entries, &(&1["position"] == live))
+
+    assert [%{"priority" => %{"level" => _} = priority}] = matching_entries(person_changes, live)
+    refute Map.has_key?(priority, "score")
+    assert matching_entries(agent_changes, historical) == []
+    assert matching_entries(person_changes, historical) == []
+
+    IO.puts(
+      "keyed reply-score cold start #{start_us} us, person #{person_cursor}->#{next_person}, agent #{agent_cursor}->#{next_agent}"
+    )
+
+    GenServer.stop(relay)
+    {:ok, restarted} = Relay.start_link(opts)
+    assert {:ok, [], false, ^next_person} = FeedStep.read(restarted, person, next_person, 20)
+
+    assert {:ok, [], false, ^next_agent} =
+             AgentFeed.read(%{agent_ctx | relay: restarted}, next_agent, 20)
+
+    GenServer.stop(restarted)
+
+    {:ok, store} = Store.open(path, :keyed)
+    {:ok, store} = Store.enable_change_log(store)
+    {:ok, rows} = AttentionServer.Store.RecordTable.rows(store.db)
+    projection = {store.engine, MapSet.new()}
+
+    assert :ok =
+             Sqlite3.execute(store.db, """
+             CREATE TRIGGER keyed_priority_agent_fault BEFORE INSERT ON agent_changes
+             BEGIN SELECT RAISE(ABORT, 'failed'); END
+             """)
+
+    assert {:error, :storage_unavailable, ^store} =
+             Store.commit(store, projection, audit, [{@person, live}])
+
+    assert {:ok, ^next_person} = ChangeLog.head(store, @person)
+    assert {:ok, ^next_agent} = AgentChangeLog.head(store, scope)
+    assert :ok = Sqlite3.execute(store.db, "DROP TRIGGER keyed_priority_agent_fault")
+    assert {:ok, committed} = Store.commit(store, projection, audit, [{@person, live}])
+    assert committed.version == store.version + 1
+    assert {:ok, ^rows} = AttentionServer.Store.RecordTable.rows(committed.db)
+    assert {:ok, bumped_person} = ChangeLog.head(committed, @person)
+    assert {:ok, bumped_agent} = AgentChangeLog.head(committed, scope)
+    assert bumped_person > next_person and bumped_agent > next_agent
+    :ok = Store.close(committed)
+  end
+
+  defp priority_reply(relay, id, handle, n) do
+    target = %{"v" => 1, "sender_id" => @sender, "message_id" => id}
+    message = Map.merge(Map.drop(target, ["v"]), %{"created_at" => 1, "title" => "Request"})
+
+    assert %{"type" => "ok"} =
+             priority_request(relay, @origin, n, %{
+               "v" => 1,
+               "type" => "forward",
+               "session_handle" => handle,
+               "message" => message
+             })
+
+    assert %{"type" => "ok", "event_id" => turn} =
+             priority_request(
+               relay,
+               @reader,
+               n + 1,
+               Map.merge(target, %{
+                 "type" => "discussion",
+                 "request_revision" => 1,
+                 "text" => "Question"
+               })
+             )
+
+    assert %{"type" => "ok", "seq" => position} =
+             priority_request(
+               relay,
+               @origin,
+               n + 2,
+               Map.merge(target, %{
+                 "type" => "conversation_reply",
+                 "request_revision" => 1,
+                 "in_reply_to" => String.to_integer(turn),
+                 "text" => "Reply"
+               })
+             )
+
+    {{@person, @sender, id}, position}
+  end
+
+  defp priority_request(relay, actor, n, frame) do
+    op = "00000000-0000-4000-8000-" <> String.pad_leading(Integer.to_string(n), 12, "0")
+    {:ok, line} = Relay.request_line(relay, actor, JSON.encode_line(Map.put(frame, "op_id", op)))
+    {:ok, reply} = JSON.decode_line(line)
+    reply
+  end
+
+  defp score_entry({_, sender, id}, position, score),
+    do: %{
+      "sender_id" => sender,
+      "message_id" => id,
+      "conversation_seq" => position,
+      "score" => score
+    }
+
+  defp matching_entries(changes, position) do
+    for %{"kind" => "entry", "data" => %{"position" => ^position} = entry} <- changes, do: entry
+  end
+
   defp enrollment_certificate(name) do
     %{cert: der} =
       :public_key.pkix_test_root_cert(String.to_charlist(name), key: {:namedCurve, :secp256r1})

@@ -25,6 +25,7 @@ defmodule AttentionServer.Store.KeyedMigration do
            {:ok, restored} <- read_records(db),
            true <- canonical(restored) === expected,
            :ok <- write_anchor(db, version, generation),
+           :ok <- advance_current_logs(db, version, generation),
            :ok <- Sqlite3.execute(db, "DELETE FROM relay_device_progress") do
         {:ok, generation}
       else
@@ -116,6 +117,33 @@ defmodule AttentionServer.Store.KeyedMigration do
     else
       {:ok, 0} -> {:error, :stale_generation}
       error -> error
+    end
+  end
+
+  # Conversion preserves the facts and feed rows. Only logs already current
+  # at the legacy snapshot generation can follow its new generation.
+  defp advance_current_logs(db, previous, generation) do
+    Enum.reduce_while(~w(client_change_log_state agent_change_log_state), :ok, fn table, :ok ->
+      case advance_current_log(db, table, previous, generation) do
+        :ok -> {:cont, :ok}
+        error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp advance_current_log(db, table, previous, generation) do
+    case query(db, "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?", [table]) do
+      {:ok, []} ->
+        :ok
+
+      {:ok, [[1]]} ->
+        sql = "UPDATE #{table} SET store_version = ? WHERE id = 1 AND store_version = ?"
+
+        with :done <- statement(db, sql, [generation, previous], &Sqlite3.step(db, &1)),
+             do: :ok
+
+      error ->
+        error
     end
   end
 

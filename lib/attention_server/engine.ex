@@ -24,6 +24,7 @@ defmodule AttentionServer.Engine do
     JSON,
     LargeData,
     Message,
+    RouteBIndex,
     SenderNames
   }
 
@@ -84,22 +85,7 @@ defmodule AttentionServer.Engine do
             bounce_origin_entries: MapSet.new(),
             advisory_id_index: %{},
             advisory_feeds: %{},
-            route_b_index: %{
-              resolved_messages_by_person: %{},
-              sent_messages_by_agent: %{},
-              agent_results: %{},
-              agent_entry_pages: %{},
-              conversations_by_item: %{},
-              agent_feed?: false,
-              entry_positions: %{},
-              advisory_sequences: %{},
-              messages_by_origin_session: %{},
-              request_keys_by_id: nil,
-              covered_sessions_by_origin: %{},
-              push_bindings: nil,
-              conversation_summary_by_item: %{},
-              unresolved_count_by_person: %{}
-            }
+            route_b_index: RouteBIndex.new()
 
   def new do
     %__MODULE__{
@@ -4961,6 +4947,13 @@ defmodule AttentionServer.Engine do
   # the very same durable transition as its read position. An empty aggregate
   # leaves the last valid group score intact, including on the final read.
   def retain_reply_scores(engine, person, entries) do
+    {next, _entries} =
+      retain_reply_scores(engine, person, entries, engine.route_b_index.agent_feed?)
+
+    next
+  end
+
+  def retain_reply_scores(engine, person, entries, track_entries?) do
     scores =
       Enum.reduce(entries, %{}, fn
         %{"sender_id" => sender, "message_id" => id, "conversation_seq" => seq, "score" => score},
@@ -4972,20 +4965,54 @@ defmodule AttentionServer.Engine do
           acc
       end)
 
-    keys =
-      Enum.uniq(
-        Map.keys(scores) ++
-          Enum.filter(
-            Map.keys(engine.reply_group_history),
-            &(elem(&1, 0) == person)
-          )
+    previous_keys =
+      if track_entries? do
+        RouteBIndex.scored_reply_items(engine.route_b_index, person)
+      else
+        Enum.filter(Map.keys(engine.reply_group_history), &(elem(&1, 0) == person))
+      end
+
+    keys = Enum.into(Map.keys(scores), MapSet.new(previous_keys))
+
+    {next, changed_entries} =
+      Enum.reduce(
+        keys,
+        {engine, []},
+        fn key, {current_engine, changed_entries} ->
+          current = Map.get(scores, key, %{})
+          prior = Map.get(current_engine.reply_group_history, key, %{scores: %{}})
+
+          changed_entries =
+            if track_entries? do
+              AttentionServer.ReplyPriority.changed_score_entries(person, prior.scores, current) ++
+                changed_entries
+            else
+              changed_entries
+            end
+
+          had_scores? = map_size(prior.scores) > 0
+          has_scores? = map_size(current) > 0
+
+          index = current_engine.route_b_index
+
+          current_engine =
+            if track_entries? and had_scores? != has_scores?,
+              do: %{
+                current_engine
+                | route_b_index: RouteBIndex.put_reply_scores(index, key, current)
+              },
+              else: current_engine
+
+          {put_row(
+             current_engine,
+             :reply_group_history,
+             key,
+             update_reply_aggregate(prior, current)
+           ), changed_entries}
+        end
       )
 
-    Enum.reduce(keys, engine, fn key, state ->
-      current = Map.get(scores, key, %{})
-      prior = Map.get(state.reply_group_history, key, %{scores: %{}})
-      put_row(state, :reply_group_history, key, update_reply_aggregate(prior, current))
-    end)
+    {next, changed_entries}
   end
 
   defp retain_read_group_score(engine, key, position) do
@@ -4993,7 +5020,14 @@ defmodule AttentionServer.Engine do
       {:ok, prior} ->
         remaining = Map.reject(prior.scores, fn {seq, _} -> seq <= position end)
 
-        put_row(engine, :reply_group_history, key, update_reply_aggregate(prior, remaining))
+        index = RouteBIndex.put_reply_scores(engine.route_b_index, key, remaining)
+
+        put_row(
+          %{engine | route_b_index: index},
+          :reply_group_history,
+          key,
+          update_reply_aggregate(prior, remaining)
+        )
 
       :error ->
         engine

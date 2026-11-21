@@ -164,21 +164,26 @@ defmodule AttentionServer.ChangeLog do
     do: changes(old, next, changed_resources(old, next))
 
   @doc false
-  def changed_resources(%Engine{} = old, %Engine{} = next) do
+  def changed_resources(old, next, keys \\ [])
+
+  def changed_resources(%Engine{} = old, %Engine{} = next, %MapSet{} = touched),
+    do: changed_resources(old, next, touched, [])
+
+  def changed_resources(%Engine{} = old, %Engine{} = next, projected_entries) do
+    messages = changed_keys(old.messages, next.messages)
+
+    entries = changed_keys(old.conversation_events, next.conversation_events)
+
     %{
-      messages: changed_keys(old.messages, next.messages),
+      messages: messages,
       bounce: changed_keys(old.bounce_revisions, next.bounce_revisions),
       opened: opened_keys(old.opened_revisions, next.opened_revisions),
-      entries:
-        old.conversation_events
-        |> changed_keys(next.conversation_events)
-        |> Enum.filter(&Map.has_key?(next.conversation_events, &1))
-        |> Enum.sort()
+      entries: change_entry_keys(old, next, messages, entries, projected_entries)
     }
   end
 
   @doc false
-  def changed_resources(%Engine{} = old, %Engine{} = next, touched) do
+  def changed_resources(%Engine{} = old, %Engine{} = next, %MapSet{} = touched, projected_entries) do
     changed =
       Enum.reduce(touched, %{messages: [], bounce: [], opened: [], entries: []}, fn
         {:row, :messages, key}, acc ->
@@ -224,7 +229,10 @@ defmodule AttentionServer.ChangeLog do
     counts = for {person, _, _} <- item_candidates, into: MapSet.new(), do: person
 
     changed
-    |> Map.update!(:entries, &Enum.sort/1)
+    |> Map.put(
+      :entries,
+      change_entry_keys(old, next, changed.messages, changed.entries, projected_entries)
+    )
     |> Map.put(
       :read_positions,
       changed_candidates(item_candidates, old.chat_read_positions, next.chat_read_positions)
@@ -252,6 +260,16 @@ defmodule AttentionServer.ChangeLog do
       :advisory_receipts,
       for({:advisory, scope, {:receipt, id}} <- touched, do: {scope, id})
     )
+  end
+
+  defp change_entry_keys(old, next, messages, entries, projected) do
+    priority_entries =
+      AttentionServer.ReplyPriority.affected_entries(old, next, messages, entries)
+
+    (entries ++ priority_entries ++ projected)
+    |> Enum.uniq()
+    |> Enum.filter(&Map.has_key?(next.conversation_events, &1))
+    |> Enum.sort()
   end
 
   defp changed_candidates(keys, old, next) do

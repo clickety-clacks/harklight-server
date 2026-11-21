@@ -1187,17 +1187,32 @@ defmodule AttentionServer.Store do
   defp set_durability(db),
     do: Sqlite3.execute(db, "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")
 
-  def commit(%__MODULE__{mode: :keyed} = store, {%Engine{} = next, %MapSet{} = touched}, audit) do
-    if MapSet.size(touched) == 0,
+  @doc """
+  Commits engine state and both change logs. Publishers can supply canonical
+  entry keys whose projection changed while their stored facts stayed equal.
+  """
+  def commit(store, next, audit, projected_entries \\ [])
+
+  def commit(
+        %__MODULE__{mode: :keyed} = store,
+        {%Engine{} = next, %MapSet{} = touched},
+        audit,
+        projected_entries
+      ) do
+    projected_entries = if store.change_log, do: projected_entries, else: []
+
+    if MapSet.size(touched) == 0 and projected_entries == [],
       do: {:ok, store},
-      else: commit_keyed(store, next, touched, audit)
+      else: commit_keyed(store, next, touched, audit, projected_entries)
   end
 
-  def commit(%__MODULE__{mode: :keyed} = store, _next, _audit),
+  def commit(%__MODULE__{mode: :keyed} = store, _next, _audit, _projected_entries),
     do: {:error, :storage_unavailable, store}
 
-  def commit(store, next, audit) do
-    case do_commit(store, next, audit) do
+  def commit(store, next, audit, projected_entries) do
+    projected_entries = if store.change_log, do: projected_entries, else: []
+
+    case do_commit(store, next, audit, projected_entries) do
       {:ok, committed} = result ->
         Persistence.committed(committed)
         result
@@ -1208,7 +1223,7 @@ defmodule AttentionServer.Store do
   end
 
   def commit_inbox_batch(store, next, touched, audit, snapshot_id, batch_id, digest, result) do
-    commit_keyed(store, next, touched, audit, fn ->
+    commit_keyed(store, next, touched, audit, [], fn ->
       case save_inbox_batch(
              store,
              audit.person,
@@ -1224,7 +1239,14 @@ defmodule AttentionServer.Store do
     end)
   end
 
-  defp commit_keyed(store, next, touched, audit, write_metadata \\ fn -> :ok end) do
+  defp commit_keyed(
+         store,
+         next,
+         touched,
+         audit,
+         projected_entries,
+         write_metadata \\ fn -> :ok end
+       ) do
     items = for {:row, :messages, key} <- touched, do: key
 
     {authority_index, affected} =
@@ -1263,7 +1285,7 @@ defmodule AttentionServer.Store do
            {:ok, prepared} <-
              KeyedReference.prepare(store.engine, next, touched, store.upload_dir) do
         %{engine: next, records: records, delete_paths: deleted, reference_rows: refs} = prepared
-        log = prepare_change_logs(store, next, touched)
+        log = prepare_change_logs(store, next, touched, projected_entries)
         %{db: db, version: version} = store
 
         case Persistence.run(fn ->
@@ -1344,19 +1366,19 @@ defmodule AttentionServer.Store do
     ])
   end
 
-  defp do_commit(%__MODULE__{engine: old} = store, next, _audit) when old == next,
+  defp do_commit(%__MODULE__{engine: old} = store, next, _audit, []) when old == next,
     do: {:ok, store}
 
-  defp do_commit(%__MODULE__{db: nil} = store, next, _audit),
+  defp do_commit(%__MODULE__{db: nil} = store, next, _audit, _projected_entries),
     do: {:ok, %{store | engine: next}}
 
-  defp do_commit(%__MODULE__{} = store, next, audit) do
+  defp do_commit(%__MODULE__{} = store, next, audit, projected_entries) do
     cond do
-      progress_only?(store.engine, next) and valid_progress?(next) ->
+      projected_entries == [] and progress_only?(store.engine, next) and valid_progress?(next) ->
         commit_progress(store, next, audit)
 
       valid_state?(next, :incremental) ->
-        commit_durable(store, next, audit)
+        commit_durable(store, next, audit, projected_entries)
 
       true ->
         Diagnostics.failure(
@@ -1371,7 +1393,12 @@ defmodule AttentionServer.Store do
     end
   end
 
-  defp commit_durable(%__MODULE__{db: db, version: version} = store, next, audit) do
+  defp commit_durable(
+         %__MODULE__{db: db, version: version} = store,
+         next,
+         audit,
+         projected_entries \\ []
+       ) do
     # Large-data preparation runs here, against the previous durable base this
     # process already holds, so only changed subterms are walked and nothing
     # large is copied to or from the worker. The worker needs the generation and
@@ -1387,7 +1414,7 @@ defmodule AttentionServer.Store do
 
     # The change log's rows are found here, against the engine this process
     # already holds, and written in the snapshot's transaction.
-    log = prepare_change_logs(store, next, nil)
+    log = prepare_change_logs(store, next, nil, projected_entries)
 
     result =
       with {:ok, durable_next, persisted, index} <- prepare_large_data(store, next) do
@@ -1520,14 +1547,20 @@ defmodule AttentionServer.Store do
     end
   end
 
-  defp prepare_change_logs(%__MODULE__{change_log: false}, _next, _touched), do: nil
+  defp prepare_change_logs(%__MODULE__{change_log: false}, _next, _touched, _projected_entries),
+    do: nil
 
-  defp prepare_change_logs(store, next, touched) do
+  defp prepare_change_logs(store, next, touched, projected_entries) do
     changed =
       if touched do
-        AttentionServer.ChangeLog.changed_resources(store.engine, next, touched)
+        AttentionServer.ChangeLog.changed_resources(
+          store.engine,
+          next,
+          touched,
+          projected_entries
+        )
       else
-        AttentionServer.ChangeLog.changed_resources(store.engine, next)
+        AttentionServer.ChangeLog.changed_resources(store.engine, next, projected_entries)
       end
 
     pending = AttentionServer.ChangeLog.changes(store.engine, next, changed)

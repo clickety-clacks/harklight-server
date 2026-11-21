@@ -6114,14 +6114,14 @@ defmodule AttentionServer.Relay do
     previous = Map.get(state.priority_views, person)
     engine_entries = Map.get(view, :engine_entries, Map.get(view, :entries, []))
 
-    {next, nil, touched} =
+    {next, projected_entries, touched} =
       track_transition(state, state.store.engine, fn engine ->
-        {Engine.retain_reply_scores(engine, person, engine_entries), nil}
+        Engine.retain_reply_scores(engine, person, engine_entries, state.store.change_log)
       end)
 
     audit = %{person: person, actor: "server", action: "reply_group_scores"}
 
-    case commit_request(state.store, next, touched, audit) do
+    case commit_request(state.store, next, touched, audit, projected_entries) do
       {:ok, store} ->
         publish_priority_view(
           %{state | store: store},
@@ -7633,10 +7633,13 @@ defmodule AttentionServer.Relay do
     end)
   end
 
-  defp commit_request(store, next, nil, audit), do: commit(store, next, audit)
+  defp commit_request(store, next, touched, audit, projected_entries \\ [])
 
-  defp commit_request(store, next, touched, audit) do
-    result = Store.commit(store, {next, touched}, audit)
+  defp commit_request(store, next, nil, audit, projected_entries),
+    do: commit(store, next, audit, projected_entries)
+
+  defp commit_request(store, next, touched, audit, projected_entries) do
+    result = Store.commit(store, {next, touched}, audit, projected_entries)
 
     with {:ok, committed} <- result do
       notify_default_changes(store.engine, committed.engine, touched)
@@ -7687,8 +7690,8 @@ defmodule AttentionServer.Relay do
 
   # Origin-feed changes are announced only by the request paths that append
   # them. This keeps unrelated commits out of every attached origin stream.
-  defp commit(store, next, audit) do
-    result = Store.commit(store, next, audit)
+  defp commit(store, next, audit, projected_entries \\ []) do
+    result = Store.commit(store, next, audit, projected_entries)
 
     if match?({:ok, _}, result) and store.engine.messages != next.messages do
       send(self(), :refresh_default_sweep_index)
