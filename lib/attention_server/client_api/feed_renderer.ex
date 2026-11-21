@@ -11,11 +11,31 @@ defmodule AttentionServer.ClientAPI.FeedRenderer do
   alias AttentionServer.ChangeLog
   alias AttentionServer.ClientAPI.{Reads, Resources}
 
-  def render(%{engine: engine} = context, who, %{rev: rev, kind: kind, resource_id: id}) do
-    with {:ok, principal} <- Reads.client_principal(engine, who) do
-      render_row(kind, ChangeLog.decode_resource(id), context, principal, rev)
-    else
-      _ -> :skip
+  @doc "Renders one row: `{:ok, data}` or `:skip`."
+  def render(context, who, row) do
+    [{^row, result}] = render_many(context, who, [row])
+    result
+  end
+
+  @doc """
+  Renders a step's rows together: `[{row, {:ok, data} | :skip}]`, in order.
+  The principal is resolved once, and each item's entries are built once for
+  all of its rows, so a long chat's backlog costs one pass, not one per row.
+  """
+  def render_many(%{engine: engine} = context, who, rows) when is_list(rows) do
+    case Reads.client_principal(engine, who) do
+      {:ok, principal} ->
+        decoded = Enum.map(rows, &{&1, ChangeLog.decode_resource(&1.resource_id)})
+        seqs = for {_row, {:entry, seq}} <- decoded, do: seq
+        entries = Resources.entries_by_fact(engine, principal.person, seqs, context.view)
+        context = Map.put(context, :entries_by_fact, entries)
+
+        Enum.map(decoded, fn {row, resource} ->
+          {row, render_row(row.kind, resource, context, principal, row.rev)}
+        end)
+
+      _ ->
+        Enum.map(rows, &{&1, :skip})
     end
   end
 
@@ -42,7 +62,7 @@ defmodule AttentionServer.ClientAPI.FeedRenderer do
   end
 
   defp render_row(:entry, {:entry, seq}, context, principal, rev) do
-    case Resources.entry_for_fact(context.engine, principal.person, seq, context.view) do
+    case Map.get(context.entries_by_fact, seq) do
       nil ->
         :skip
 

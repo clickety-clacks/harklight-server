@@ -972,6 +972,32 @@ defmodule AttentionServer.ClientAPI.Resources do
   def entry_sources(%{@sources => seqs}), do: seqs
 
   @doc """
+  The entries a set of conversation facts show up in, as `%{seq => entry}`:
+  each fact's own entry, or the entry a receipt or acknowledgment marks. Facts
+  outside any entry are left out. Each item's entries are built once.
+  """
+  def entries_by_fact(%Engine{} = engine, person, seqs, view \\ nil) do
+    seqs
+    |> Enum.uniq()
+    |> Enum.group_by(fn seq ->
+      case Map.get(engine.conversation_events, {person, seq}) do
+        %{key: {^person, _, _} = key} -> if Map.has_key?(engine.messages, key), do: key
+        _ -> nil
+      end
+    end)
+    |> Enum.reject(fn {key, _seqs} -> is_nil(key) end)
+    |> Enum.flat_map(fn {key, wanted} ->
+      wanted = MapSet.new(wanted)
+
+      for entry <- entries(engine, key, view),
+          seq <- entry[@sources],
+          MapSet.member?(wanted, seq),
+          do: {seq, entry}
+    end)
+    |> Map.new()
+  end
+
+  @doc """
   The entry a conversation fact shows up in: the fact's own entry, the entry
   a receipt or acknowledgment fact marks, or nil for facts that are not part
   of any entry (read positions and file reports).
