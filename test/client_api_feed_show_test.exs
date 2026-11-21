@@ -575,7 +575,7 @@ defmodule AttentionServer.ClientAPIFeedShowTest do
     response = Task.await(show_in_request(ctx))
     assert response.status == 200
     assert %{"state" => "held", "show_id" => id} = body(response)
-    {reader, feed, [event]} = events(reader, feed, 1)
+    {reader, feed, event} = until_closing(reader, feed)
     assert event == %{event: "closing", data: %{"reason" => "internal_error"}}
     {reader, feed} = drain(reader, feed)
     assert feed.done
