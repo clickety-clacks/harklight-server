@@ -59,10 +59,12 @@ ChangeLog.prune(store, before_ms) :: {:ok, deleted}   # raises the floor; the Re
 ChangeLog.created_at(store, person, resource_id) :: {:ok, at_ms} | {:error, :not_found}
   # when the log first wrote the resource (Entry.at_ms, Item.created_at_ms);
   # none for resources from before the cut-over
-ChangeLog.rank_keys(store, person) :: {:ok, %{item_resource => key}}
-ChangeLog.append_ranks(store, person, %{item_resource => key}) :: {:ok, position}
-  # records the reads component's current rank keys; writes an :item row for
-  # each item whose key changed, drops keys of items no longer ranked
+ChangeLog.rank_keys(store, person) :: {:ok, %{unit_id => key}}
+ChangeLog.append_ranks(store, person, %{unit_id => key}, item_of) :: {:ok, position}
+  # records the reads component's current rank keys by its opaque rank unit IDs
+  # (an item row, or an item's chat-reply row); item_of.(unit_id) returns
+  # {:ok, item_resource} or :error; one :item row per item with a changed,
+  # new or dropped unit; dropped units lose their stored key
 
 # Closing signal, for feeds (C5). The caller is told
 # {:client_closing, scope, reason} when its device is revoked or removed
