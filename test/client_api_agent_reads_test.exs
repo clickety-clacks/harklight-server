@@ -191,6 +191,56 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
     assert get(ctx, "a2", path).status == 404
   end
 
+  test "bounded entries retain an agent reply's cached priority", ctx do
+    id = forward(ctx, "a1", 1, @first_session)
+
+    turn =
+      frame(ctx, "a2", %{
+        "type" => "discussion",
+        "op_id" => op(2),
+        "sender_id" => "app:test",
+        "message_id" => "item-1",
+        "request_revision" => 1,
+        "text" => "Question"
+      })
+
+    %{"seq" => position} =
+      frame(ctx, "a1", %{
+        "type" => "conversation_reply",
+        "op_id" => op(3),
+        "sender_id" => "app:test",
+        "message_id" => "item-1",
+        "request_revision" => 1,
+        "in_reply_to" => String.to_integer(turn["event_id"]),
+        "text" => "Reply"
+      })
+
+    reply = %{
+      "sender_id" => "app:test",
+      "message_id" => "item-1",
+      "conversation_seq" => position,
+      "priority" => "now",
+      "score" => 0.9
+    }
+
+    :sys.replace_state(ctx.relay, fn state ->
+      update_in(state.priority_views["A"], fn view ->
+        view
+        |> Map.put(:replies, [reply])
+        |> Map.put(:reply_entries_by_item, %{{"app:test", "item-1"} => %{position => reply}})
+      end)
+    end)
+
+    path = "/v2/agent/messages/" <> id <> "/entries?limit=1"
+
+    assert %{
+             "entries" => [
+               %{"position" => ^position, "priority" => %{"level" => "now", "score" => 0.9}}
+             ],
+             "older" => true
+           } = contract(ctx, "AgentEntriesPage", get(ctx, "a1", path))
+  end
+
   test "me reports the enrolled key's sender names", ctx do
     response = get(ctx, "a1", "/v2/me")
     assert response.status == 200
