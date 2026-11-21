@@ -7,7 +7,10 @@ defmodule AttentionServer.APNSPushTest.Provider do
     {:ok, body, conn} = Plug.Conn.read_body(conn)
     send(test_pid, {:apns_request, conn.method, conn.request_path, conn.req_headers, body})
 
-    case Agent.get(response_agent, & &1) do
+    response = Agent.get(response_agent, & &1)
+    response = if is_function(response, 1), do: response.(conn.request_path), else: response
+
+    case response do
       {status, response_body} ->
         Plug.Conn.send_resp(conn, status, response_body)
 
@@ -149,6 +152,85 @@ defmodule AttentionServer.APNSPushTest do
       provider_port: port,
       provider_response: response_agent
     }
+  end
+
+  test "v2 bounds a stalled first push, dispatches to another device and retries after restart",
+       ctx do
+    flags = Path.join(ctx.dir, "flags.json")
+    File.write!(flags, ~s({"client_api_v2":true}))
+    store_path = Path.join(ctx.dir, "bounded-push.sqlite3")
+
+    options =
+      server_options(ctx.certs, store_path) ++
+        [apns: apns_options(ctx), feature_flags_path: flags]
+
+    server = start_test_server(options)
+    assert Server.client_api_v2?(server)
+    relay = Server.relay(server)
+    {sender_key, slow_key} = setup_test_devices(relay, ctx.certs)
+
+    slow_path = "/3/device/" <> @device_token
+    fast_token = String.duplicate("cd", 32)
+    fast_path = "/3/device/" <> fast_token
+
+    hold_provider_response(ctx, slow_path)
+    register_test_binding(relay, slow_key, @device_token, 1)
+    forward_test_message(relay, sender_key)
+
+    # The first message must go out on the next worker poll, without waiting for pacing.
+    assert_receive {:apns_request, "POST", ^slow_path, headers, body}, 2_000
+    assert Map.new(headers)["apns-push-type"] == "alert"
+    assert {:ok, %{"aps" => %{"alert" => %{}}}} = JSON.decode_line(body <> "\n")
+    assert_receive {:provider_waiting, _slow_handler}, 1_000
+
+    # The relay still responds while the separate sender owns the connection.
+    assert %{"push" => %{"state" => "sending"}} =
+             request_frame(relay, slow_key, %{"type" => "push_status"})
+
+    register_test_binding(relay, sender_key, fast_token, 2)
+    assert_receive {:apns_request, "POST", ^fast_path, _, _}, 7_000
+
+    assert %{
+             "push" => %{
+               "state" => "waiting_retry",
+               "attempt_count" => 1,
+               "last_outcome" => %{"state" => "retry"}
+             }
+           } = request_frame(relay, slow_key, %{"type" => "push_status"})
+
+    assert_push_accepted(relay, sender_key, 1)
+    assert :ok = Supervisor.stop(server)
+    Agent.update(ctx.provider_response, fn _ -> {200, ""} end)
+
+    restarted = start_test_server(options)
+    restarted_relay = Server.relay(restarted)
+    assert_receive {:apns_request, "POST", ^slow_path, _, _}, 3_000
+    assert_push_accepted(restarted_relay, slow_key, 2)
+
+    assert {:ok, [%{"message_id" => "first-push"}], 1} =
+             Relay.events(restarted_relay, slow_key, 0)
+  end
+
+  test "with v2 off the dispatcher waits for the provider response", ctx do
+    server = start_apns_server(ctx, Path.join(ctx.dir, "legacy-push.sqlite3"))
+    refute Server.client_api_v2?(server)
+    relay = Server.relay(server)
+    {sender_key, app_key} = setup_test_devices(relay, ctx.certs)
+    path = "/3/device/" <> @device_token
+
+    hold_provider_response(ctx, path)
+    register_test_binding(relay, app_key, @device_token, 1)
+    forward_test_message(relay, sender_key)
+
+    assert_receive {:apns_request, "POST", ^path, _, _}, 2_000
+    assert_receive {:provider_waiting, handler}, 1_000
+    refute_receive {:apns_request, "POST", ^path, _, _}, 6_000
+
+    assert %{"push" => %{"state" => "sending", "attempt_count" => 1}} =
+             request_frame(relay, app_key, %{"type" => "push_status"})
+
+    send(handler, :release_provider_response)
+    assert_push_accepted(relay, app_key, 1)
   end
 
   test "a provider transport failure keeps retry identity and emits retrievable safe cause",
@@ -1656,12 +1738,80 @@ defmodule AttentionServer.APNSPushTest do
   end
 
   defp start_apns_server(ctx, store_path) do
-    {:ok, server} =
-      Server.start_link(server_options(ctx.certs, store_path) ++ [apns: apns_options(ctx)])
+    start_test_server(server_options(ctx.certs, store_path) ++ [apns: apns_options(ctx)])
+  end
 
+  defp start_test_server(options) do
+    {:ok, server} = Server.start_link(options)
     Process.unlink(server)
     on_exit(fn -> if Process.alive?(server), do: Supervisor.stop(server) end)
     server
+  end
+
+  defp hold_provider_response(ctx, slow_path) do
+    owner = self()
+
+    Agent.update(ctx.provider_response, fn _ ->
+      fn
+        ^slow_path ->
+          send(owner, {:provider_waiting, self()})
+
+          receive do
+            :release_provider_response -> {200, ""}
+          after
+            15_000 -> {200, ""}
+          end
+
+        _ ->
+          {200, ""}
+      end
+    end)
+  end
+
+  defp register_test_binding(relay, key, token, operation) do
+    assert %{"type" => "ok"} =
+             request_frame(relay, key, %{
+               "type" => "push_register",
+               "op_id" => op(operation),
+               "revision" => 1,
+               "profile_id" => @provider_profile,
+               "address_kind" => "apns_token",
+               "address" => token
+             })
+  end
+
+  defp forward_test_message(relay, sender_key) do
+    assert %{"type" => "ok", "seq" => 1} =
+             OriginWire.command(relay, sender_key, %{
+               "v" => 1,
+               "type" => "send",
+               "op_id" => op(3),
+               "message" => %{
+                 "sender_id" => "app:test",
+                 "message_id" => "first-push",
+                 "created_at" => 1,
+                 "title" => "First push"
+               }
+             })
+  end
+
+  defp assert_push_accepted(relay, key, attempts) do
+    assert Enum.any?(1..100, fn _ ->
+             case request_frame(relay, key, %{"type" => "push_status"}) do
+               %{
+                 "push" => %{
+                   "state" => "ready",
+                   "attempt_count" => ^attempts,
+                   "last_outcome" => %{"state" => "provider_accepted"}
+                 }
+               } ->
+                 true
+
+               _ ->
+                 Process.sleep(10)
+                 false
+             end
+           end)
   end
 
   defp setup_test_devices(relay, certs) do

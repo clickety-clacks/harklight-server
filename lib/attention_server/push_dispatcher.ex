@@ -108,6 +108,8 @@ defmodule AttentionServer.PushDispatcher.Worker do
   alias AttentionServer.{APNS, Diagnostics, Relay}
 
   @idle_interval 1_000
+  # Three times the 946 ms p99 measured against the loopback TLS/HTTP2 stand-in.
+  @attempt_timeout_ms 2_840
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts)
 
@@ -121,6 +123,7 @@ defmodule AttentionServer.PushDispatcher.Worker do
       relay: relay,
       apns: apns,
       apns_send: Keyword.get(opts, :apns_send, &APNS.send/3),
+      bounded_attempts?: Keyword.get(opts, :bounded_attempts, false),
       cached_token: nil
     }
 
@@ -141,7 +144,7 @@ defmodule AttentionServer.PushDispatcher.Worker do
         schedule(@idle_interval, state)
 
       {:ok, claim} ->
-        {outcome, cached_token} = state.apns_send.(state.apns, claim, state.cached_token)
+        {outcome, cached_token} = send_attempt(state, claim)
 
         case relay_call(:push_finish, claim.claim_id, fn ->
                Relay.finish_push(state.relay, claim, outcome, System.system_time(:millisecond))
@@ -184,6 +187,26 @@ defmodule AttentionServer.PushDispatcher.Worker do
   @impl true
   def format_status(status) do
     Map.update!(status, :state, &Map.drop(&1, [:cached_token, :apns]))
+  end
+
+  defp send_attempt(%{bounded_attempts?: false} = state, claim) do
+    state.apns_send.(state.apns, claim, state.cached_token)
+  end
+
+  defp send_attempt(state, claim) do
+    # The linked task owns the passive Mint connection. Stop it before handing
+    # the serial dispatch lane to the next claim.
+    task = Task.async(fn -> state.apns_send.(state.apns, claim, state.cached_token) end)
+
+    case Task.yield(task, @attempt_timeout_ms) do
+      {:ok, result} ->
+        result
+
+      nil ->
+        _ = Task.shutdown(task, :brutal_kill)
+        Diagnostics.failure(:apns_dispatch, :push_request, :timeout, :retry, claim.claim_id)
+        {%{state: "retry"}, state.cached_token}
+    end
   end
 
   defp schedule(delay, state) do
