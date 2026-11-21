@@ -11,7 +11,7 @@ defmodule AttentionServer.CLI.Device do
   answer file may contain any JSON value, including `null`.
   """
 
-  alias AttentionServer.{HeadlessDevice, JSON, ToolEndpoint}
+  alias AttentionServer.{HeadlessDevice, HeadlessTLS, JSON, ToolEndpoint}
 
   def run([command | args]) when command in ["read", "respond"] do
     {options, rest, invalid} =
@@ -35,7 +35,7 @@ defmodule AttentionServer.CLI.Device do
 
     endpoint =
       case ToolEndpoint.from_options(options) do
-        {:ok, value} -> value
+        {:ok, value} -> Map.put(value, :client_api_v2, HeadlessTLS.client_api_v2?())
         _ -> AttentionServer.CLI.error!("--connect, --name, --port and --ca are required")
       end
 

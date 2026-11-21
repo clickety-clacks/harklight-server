@@ -152,6 +152,90 @@ defmodule AttentionServer.HeadlessTLS do
     end
   end
 
+  @doc """
+  Whether the tools speak client API v2: the temporary `client_api_v2` key in
+  the `ATTENTION_SERVER_FEATURE_FLAGS_PATH` file, the same flag and file the
+  server reads (docs/feature-flags.md). Off when unset.
+  """
+  def client_api_v2? do
+    {flags, _warned} =
+      AttentionServer.FeatureFlags.read(
+        System.get_env("ATTENTION_SERVER_FEATURE_FLAGS_PATH"),
+        true
+      )
+
+    Map.get(flags, "client_api_v2") == true
+  end
+
+  @doc """
+  One mutual-TLS client API v2 `GET` over HTTP/1.1 with the device identity.
+  Returns the HTTP status and the decoded JSON body; the status is separate
+  from application success.
+  """
+  def v2_get(endpoint, {certificate, key}, path) do
+    options = [
+      hostname: endpoint.name,
+      protocols: [:http1],
+      mode: :passive,
+      transport_opts: [
+        versions: [:"tlsv1.3"],
+        cacertfile: endpoint.ca_file,
+        certfile: certificate,
+        keyfile: key,
+        server_name_indication: String.to_charlist(endpoint.name),
+        session_tickets: :disabled
+      ]
+    ]
+
+    with {:ok, conn} <- Mint.HTTP.connect(:https, host(endpoint.address), endpoint.port, options) do
+      try do
+        with {:ok, conn, ref} <-
+               mint(Mint.HTTP.request(conn, "GET", path, [{"accept", "application/json"}], nil)),
+             {:ok, status, body} <- v2_response(conn, ref, nil, []),
+             {:ok, value} <- JSON.decode_line(body <> "\n", @max_agent_http + 1) do
+          {:ok, status, value}
+        else
+          {:error, :response_too_large} = error -> error
+          {:error, %{__exception__: true}} -> {:error, :connection_failed}
+          _ -> {:error, :invalid_http_response}
+        end
+      after
+        Mint.HTTP.close(conn)
+      end
+    else
+      _ -> {:error, :connection_failed}
+    end
+  end
+
+  defp host(address) when is_tuple(address), do: address |> :inet.ntoa() |> List.to_string()
+  defp host(address) when is_list(address), do: List.to_string(address)
+
+  defp mint({:error, _conn, reason}), do: {:error, reason}
+  defp mint(other), do: other
+
+  # No client-side deadline, as for the other tools.
+  defp v2_response(conn, ref, status, body) do
+    case Mint.HTTP.recv(conn, 0, :infinity) do
+      {:ok, conn, responses} ->
+        {status, body, done} =
+          Enum.reduce(responses, {status, body, false}, fn
+            {:status, ^ref, value}, {_, body, done} -> {value, body, done}
+            {:data, ^ref, data}, {status, body, done} -> {status, [body | data], done}
+            {:done, ^ref}, {status, body, _} -> {status, body, true}
+            _other, acc -> acc
+          end)
+
+        cond do
+          IO.iodata_length(body) > @max_agent_http -> {:error, :response_too_large}
+          done and is_integer(status) -> {:ok, status, IO.iodata_to_binary(body)}
+          true -> v2_response(conn, ref, status, body)
+        end
+
+      {:error, _conn, reason, _responses} ->
+        {:error, reason}
+    end
+  end
+
   defp read_agent_line(_socket, bytes) when byte_size(bytes) > 6 * 1024 * 1024,
     do: {:error, :response_too_large}
 

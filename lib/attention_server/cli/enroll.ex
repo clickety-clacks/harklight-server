@@ -67,7 +67,13 @@ defmodule AttentionServer.CLI.Enroll do
 
           case HeadlessEnrollment.status(directory, endpoint) do
             {:ok, %{"state" => "approved"} = approval} ->
-              case HeadlessEnrollment.verify_relay(directory, %{endpoint | port: relay_port}) do
+              relay_endpoint =
+                Map.merge(endpoint, %{
+                  port: relay_port,
+                  client_api_v2: AttentionServer.HeadlessTLS.client_api_v2?()
+                })
+
+              case HeadlessEnrollment.verify_relay(directory, relay_endpoint) do
                 :ok -> {:ok, approval}
                 error -> error
               end

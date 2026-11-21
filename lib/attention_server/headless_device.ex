@@ -5,6 +5,10 @@ defmodule AttentionServer.HeadlessDevice do
   Replayed events are stored locally before their cursor is acknowledged. A
   request's operation ID and exact JSON are stored before it is sent, so an
   uncertain network result can be retried with the same semantics.
+
+  With the temporary `client_api_v2` flag on (`endpoint.client_api_v2`), `read`
+  speaks client API v2 instead: it pages through `GET /v2/inbox`, stores every
+  item under `v2/`, and only then stores the cursor, the first page's `rev`.
   """
 
   import Bitwise
@@ -17,6 +21,11 @@ defmodule AttentionServer.HeadlessDevice do
   # accepted by the server, so allow two protocol-sized requests plus metadata.
   @max_server_frame 2 * @max_server_request_frame + 16_384
 
+  # Inbox page size for client API v2 reads (the contract's maximum).
+  @v2_page_limit 200
+
+  def read(directory, %{client_api_v2: true} = endpoint), do: v2_read(directory, endpoint)
+
   def read(directory, endpoint) do
     with_session(directory, endpoint, fn socket ->
       with {:ok, high} <- sync(directory, socket),
@@ -25,6 +34,10 @@ defmodule AttentionServer.HeadlessDevice do
       end
     end)
   end
+
+  # Client API v2 respond lands in a later slice; never fall back to /relay.
+  def respond(_directory, %{client_api_v2: true}, _sender, _message_id, _answer_file),
+    do: {:error, :client_api_v2_respond_unavailable}
 
   def respond(directory, endpoint, sender, message_id, answer_file) do
     with :ok <- existing_private_directory(directory),
@@ -48,6 +61,66 @@ defmodule AttentionServer.HeadlessDevice do
              end
            end) do
       {:ok, Map.put(result, "op_id", frame["op_id"])}
+    end
+  end
+
+  # A full snapshot: every inbox page, stored, then the cursor. The cursor is
+  # the first page's rev, so anything that moved while paging is after it
+  # (spec §5.1, rebaseline). Items no longer in the inbox are dropped.
+  defp v2_read(directory, endpoint) do
+    identity = {Path.join(directory, "identity.pem"), Path.join(directory, "identity.key")}
+    limit = Map.get(endpoint, :v2_page_limit, @v2_page_limit)
+
+    with {:ok, _} <- enrolled_identity(directory, endpoint),
+         {:ok, rev, items} <- v2_inbox(endpoint, identity, limit, nil, nil, %{}),
+         :ok <- private_directory(Path.join(directory, "v2")),
+         items = items |> Map.values() |> Enum.sort_by(&get_in(&1, ["rank", "key"])),
+         :ok <- write_private(Path.join([directory, "v2", "items.json"]), %{"items" => items}),
+         :ok <- write_private(Path.join([directory, "v2", "cursor.json"]), %{"rev" => rev}) do
+      {:ok, %{"rev" => rev, "items" => items}}
+    end
+  end
+
+  defp v2_inbox(endpoint, identity, limit, page, first_rev, items) do
+    path =
+      "/v2/inbox?limit=#{limit}" <>
+        if(page, do: "&page=" <> URI.encode_www_form(page), else: "")
+
+    case HeadlessTLS.v2_get(endpoint, identity, path) do
+      {:ok, 200, %{"rev" => rev, "items" => page_items} = body}
+      when is_integer(rev) and rev >= 0 and is_list(page_items) ->
+        if Enum.all?(page_items, &v2_item?/1),
+          do: v2_page(endpoint, identity, limit, body, first_rev || rev, page_items, items),
+          else: {:error, :invalid_v2_response}
+
+      {:ok, _status, %{"error" => token} = error} when is_binary(token) ->
+        {:error, {:server, error}}
+
+      {:ok, _status, _body} ->
+        {:error, :invalid_v2_response}
+
+      error ->
+        error
+    end
+  end
+
+  defp v2_item?(%{"item_id" => id, "rev" => rev}) when is_binary(id) and is_integer(rev),
+    do: true
+
+  defp v2_item?(_), do: false
+
+  defp v2_page(endpoint, identity, limit, body, first_rev, page_items, items) do
+    items =
+      Enum.reduce(page_items, items, fn %{"item_id" => id, "rev" => item_rev} = item, acc ->
+        case acc do
+          %{^id => %{"rev" => held}} when held >= item_rev -> acc
+          _ -> Map.put(acc, id, item)
+        end
+      end)
+
+    case body["next_page"] do
+      next when is_binary(next) -> v2_inbox(endpoint, identity, limit, next, first_rev, items)
+      _ -> {:ok, first_rev, items}
     end
   end
 
