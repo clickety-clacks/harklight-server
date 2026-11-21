@@ -86,6 +86,8 @@ defmodule AttentionServer.Engine do
             route_b_index: %{
               resolved_messages_by_person: %{},
               conversations_by_item: %{},
+              entry_positions: %{},
+              messages_by_origin_session: %{},
               conversation_summary_by_item: %{},
               unresolved_count_by_person: %{}
             }
@@ -2569,6 +2571,43 @@ defmodule AttentionServer.Engine do
     end
   end
 
+  @doc "Records ACK1 for the authorized conversation resources a v2 feed wrote."
+  def agent_feed_delivered(%__MODULE__{} = engine, person, key, targets) do
+    with {:ok, ^person} <- authorized_person(engine, key) do
+      next =
+        Enum.reduce(targets, engine, fn target, current ->
+          case agent_delivery_target(current, person, key, target) do
+            %{"author" => "person"} = entry ->
+              ensure_delivery_ack1(current, person, key, entry)
+
+            _ ->
+              current
+          end
+        end)
+
+      {:ok, next}
+    end
+  end
+
+  defp agent_delivery_target(engine, person, origin, {:entry, position}) do
+    with %{key: key, payload: %{"kind" => "discussion"} = entry} <-
+           Map.get(engine.conversation_events, {person, position}),
+         %{origin: ^origin} <- Map.get(engine.messages, key) do
+      entry
+    end
+  end
+
+  defp agent_delivery_target(engine, person, origin, {:answer, {person, sender, id} = key}) do
+    with %{origin: ^origin, session_handle: session, terminal: %{state: "answered", seq: seq}}
+         when is_binary(session) <- Map.get(engine.messages, key),
+         %{payload: %{"event_id" => event_id}} <- Map.get(engine.events, {person, seq}),
+         {feed_seq, ""} <- Integer.parse(event_id),
+         %{"kind" => "terminal", "sender_id" => ^sender, "message_id" => ^id, "terminal_seq" => ^seq} =
+           entry <- get_in(engine.origin_feeds, [{person, origin}, :entries, feed_seq]) do
+      entry
+    end
+  end
+
   @doc "System handoff acknowledgment, independent of the agent's Seen receipt."
   def origin_ack2(%__MODULE__{} = engine, key, feed_seq, frame) do
     with {:ok, person} <- authorized_person(engine, key),
@@ -2966,11 +3005,10 @@ defmodule AttentionServer.Engine do
     support = get_in(engine.origin_sessions, [{person, origin, handle}, :support])
 
     requests =
-      engine.messages
-      |> Enum.filter(fn {{request_person, _, _}, record} ->
-        request_person == person and record.origin == origin and
-          Map.get(record, :session_handle) == handle and is_nil(record.terminal)
-      end)
+      engine.route_b_index
+      |> AttentionServer.RouteBIndex.session_messages({person, origin, handle})
+      |> Enum.map(&{&1, Map.fetch!(engine.messages, &1)})
+      |> Enum.filter(fn {_key, record} -> is_nil(record.terminal) end)
       |> Enum.sort_by(fn {_, record} -> record.accepted_seq end)
 
     next =

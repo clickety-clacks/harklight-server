@@ -5,6 +5,8 @@ defmodule AttentionServer.RouteBIndex do
     %{
       resolved_messages_by_person: %{},
       conversations_by_item: %{},
+      entry_positions: %{},
+      messages_by_origin_session: %{},
       conversation_summary_by_item: %{},
       unresolved_count_by_person: %{}
     }
@@ -22,6 +24,7 @@ defmodule AttentionServer.RouteBIndex do
   end
 
   def put_message(index, {person, sender, id} = key, previous, record) do
+    index = put_session_message(index, key, previous, record)
     previous_resolved? = match?(%{terminal: terminal} when not is_nil(terminal), previous)
     current_resolved? = not is_nil(record.terminal)
 
@@ -60,6 +63,16 @@ defmodule AttentionServer.RouteBIndex do
     tree = :gb_trees.enter({-seq, seq}, seq, tree)
     index = put_in(index, [:conversations_by_item, key], tree)
 
+    index =
+      case payload do
+        %{"kind" => kind, "event_id" => id}
+        when kind in ["discussion", "reply", "revision"] and is_binary(id) ->
+          put_in(index, [:entry_positions, {key, id}], seq)
+
+        _ ->
+          index
+      end
+
     summary =
       Map.get(index.conversation_summary_by_item, key, %{
         latest_seq: 0,
@@ -96,6 +109,29 @@ defmodule AttentionServer.RouteBIndex do
 
     put_in(index, [:conversation_summary_by_item, key], summary)
   end
+
+  def entry_position(index, key, id), do: Map.get(index.entry_positions, {key, id})
+
+  def session_messages(index, {person, origin, session}),
+    do: get_in(index.messages_by_origin_session, [{person, origin}, session]) || []
+
+  def origin_sessions(index, person, origin),
+    do: index.messages_by_origin_session |> Map.get({person, origin}, %{}) |> Map.keys()
+
+  # Message ownership and session are fixed at acceptance.
+  defp put_session_message(index, {person, _, _} = key, nil, %{
+         origin: origin,
+         session_handle: session
+       })
+       when is_binary(origin) and is_binary(session) do
+    update_in(index.messages_by_origin_session, fn sessions ->
+      Map.update(sessions, {person, origin}, %{session => [key]}, fn own ->
+        Map.update(own, session, [key], &[key | &1])
+      end)
+    end)
+  end
+
+  defp put_session_message(index, _key, _previous, _record), do: index
 
   defp unresolved_delta(previous, record) do
     previous_unresolved? = match?(%{terminal: nil}, previous)

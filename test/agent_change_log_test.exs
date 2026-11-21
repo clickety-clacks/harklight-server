@@ -2,6 +2,7 @@ defmodule AttentionServer.AgentChangeLogTest do
   use ExUnit.Case, async: false
 
   alias AttentionServer.{AgentChangeLog, ChangeLog, JSON, Relay}
+  alias AttentionServer.AgentAPI.{FeedActivity, FeedStep}
   alias Exqlite.Sqlite3
 
   @session "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
@@ -176,6 +177,140 @@ defmodule AttentionServer.AgentChangeLogTest do
     GenServer.stop(relay)
   end
 
+  test "delivery updates the original entry resource, including on replay", ctx do
+    relay = start(ctx)
+    setup_people(relay)
+    forward(relay, "origin", "chat", 1, @session)
+    scope = {"A", "origin"}
+
+    assert %{"type" => "ok", "seq" => chat_seq} =
+             request(relay, "other", %{
+               "type" => "discussion",
+               "op_id" => op(2),
+               "sender_id" => "app:test",
+               "message_id" => "chat",
+               "request_revision" => 1,
+               "text" => "An entry to deliver"
+             })
+
+    resource = {:entry, chat_seq}
+    assert {:ok, first_rev} = stored(relay, &AgentChangeLog.rev(&1, scope, resource))
+
+    change = %{
+      "kind" => "entry",
+      "data" => %{
+        "kind" => "reply",
+        "author" => "person",
+        "position" => chat_seq,
+        "delivery" => %{"delivered" => false}
+      }
+    }
+
+    assert :ok = FeedStep.transmitted(feed_context(relay, "other"), [change])
+    assert {:ok, ^first_rev} = stored(relay, &AgentChangeLog.rev(&1, scope, resource))
+    assert :ok = FeedStep.transmitted(feed_context(relay, "origin"), [change])
+    assert {:ok, updated_rev} = stored(relay, &AgentChangeLog.rev(&1, scope, resource))
+    assert updated_rev > first_rev
+
+    assert {:ok, rows, false, head} = read(relay, "origin")
+    assert [%{resource: ^resource, rev: ^updated_rev}] = Enum.filter(rows, &(&1.kind == :entry))
+
+    assert :ok = FeedStep.transmitted(feed_context(relay, "origin"), [change])
+    assert {:ok, [], false, ^head} = read(relay, "origin", head)
+    GenServer.stop(relay)
+  end
+
+  test "an answer's delivery updates the message resource with no answer entry", ctx do
+    relay = start(ctx)
+    setup_people(relay)
+    forward(relay, "origin", "question", 1, @session)
+
+    assert %{"type" => "ok"} =
+             request(relay, "other", %{
+               "type" => "answer",
+               "op_id" => op(2),
+               "sender_id" => "app:test",
+               "message_id" => "question",
+               "request_revision" => 1,
+               "answer" => "Yes"
+             })
+
+    assert {:ok, _, false, answer_rev} = read(relay, "origin")
+
+    assert :ok =
+             FeedStep.transmitted(feed_context(relay, "origin"), [
+               %{
+                 "kind" => "message",
+                 "data" => %{
+                   "item_id" => "i1",
+                   "session" => @session,
+                   "delivered" => false,
+                   "terminal" => %{"state" => "answered"}
+                 }
+               }
+             ])
+
+    resource = {:message, key("question")}
+
+    assert {:ok, [%{resource: ^resource, rev: delivery_rev}], false, delivery_rev} =
+             read(relay, "origin", answer_rev)
+
+    assert delivery_rev > answer_rev
+    GenServer.stop(relay)
+  end
+
+  test "ending a session revises only messages from the affected session", ctx do
+    relay = start(ctx)
+    setup_people(relay)
+    forward(relay, "origin", "affected", 1, @session)
+    forward(relay, "origin", "unaffected", 2, @other_session)
+    assert {:ok, _, false, previous} = read(relay, "origin")
+
+    assert :ok = Relay.origin_session_gone(relay, "origin", @session)
+
+    assert {:ok, rows, false, next} = read(relay, "origin", previous)
+    assert [{"affected", rev}] = messages(rows)
+    assert previous < rev and rev <= next
+    GenServer.stop(relay)
+  end
+
+  test "open feeds and a recent batch cover sessions independently", ctx do
+    relay = start(ctx)
+    setup_people(relay)
+    forward(relay, "origin", "covered", 1, @session)
+    forward(relay, "origin", "uncovered", 2, @other_session)
+
+    scope = {"A", "origin", @session}
+    other = {"A", "origin", @other_session}
+    feed = Map.put(feed_context(relay, "origin"), :params, %{session: @session})
+
+    FeedActivity.observe(feed, :open)
+    FeedActivity.observe(feed, :open)
+    FeedActivity.observe(feed, :close)
+
+    state = :sys.get_state(relay)
+    assert FeedActivity.listening?(state, scope)
+    refute FeedActivity.listening?(state, other)
+    assert get_in(state.store.engine.route_b_index, [
+             :conversation_summary_by_item,
+             key("covered"),
+             :availability,
+             :payload,
+             "availability"
+           ]) == "listening"
+
+    FeedActivity.observe(feed, :batch)
+    FeedActivity.observe(feed, :close)
+    state = :sys.get_state(relay)
+    assert FeedActivity.listening?(state, scope)
+
+    {_, token} = state.agent_feed_activity.batches[scope]
+    send(relay, {:agent_feed_activity, {:expire, token}, scope})
+
+    refute FeedActivity.listening?(:sys.get_state(relay), scope)
+    GenServer.stop(relay)
+  end
+
   test "a disabled interval expires the previous cursor and rebaselines on reopen", ctx do
     relay = start(ctx)
     setup_people(relay)
@@ -268,6 +403,8 @@ defmodule AttentionServer.AgentChangeLogTest do
     assert {:ok, reply} = JSON.decode_line(line)
     reply
   end
+
+  defp feed_context(relay, key), do: %{relay: relay, principal: %{kind: :device, person: "A", key: key}}
 
   defp key(id), do: {"A", "app:test", id}
 

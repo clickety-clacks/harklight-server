@@ -46,15 +46,15 @@ defmodule AttentionServer.ClientAPI.FeedStream do
   @default_heartbeat_ms 20_000
 
   @doc "Serves the stream from `cursor`. Errors before the stream opens are JSON."
-  def serve(conn, %Context{} = ctx, cursor) do
+  def serve(conn, %Context{} = ctx, cursor, source \\ FeedStep) do
     # Subscribe before the first read: a commit or a closing after the read
     # still reaches us. The watcher holds the change-log subscription.
-    watcher = watch(ctx)
+    watcher = watch(ctx, source)
     :ok = ChangeLog.subscribe_closing(ctx.principal)
     :ok = FeedShutdown.subscribe()
 
     try do
-      open(conn, ctx, cursor, watcher)
+      open(conn, ctx, cursor, watcher, source)
     after
       send(watcher, {:feed_done, self()})
       ChangeLog.unsubscribe_closing(ctx.principal)
@@ -64,11 +64,9 @@ defmodule AttentionServer.ClientAPI.FeedStream do
     end
   end
 
-  defp open(conn, ctx, cursor, watcher) do
-    case FeedStep.read(ctx.relay, ctx.principal, cursor, @page) do
+  defp open(conn, ctx, cursor, watcher, source) do
+    case source.read(ctx, cursor, @page) do
       {:ok, changes, more, position} ->
-        send(watcher, {:feed_opened, self()})
-
         conn =
           conn
           |> put_resp_header("content-type", "text/event-stream; charset=utf-8")
@@ -76,9 +74,12 @@ defmodule AttentionServer.ClientAPI.FeedStream do
           |> put_resp_header("x-accel-buffering", "no")
           |> send_chunked(200)
 
+        send(watcher, {:feed_opened, self()})
+
         state =
           schedule_heartbeat(%{
             ctx: ctx,
+            source: source,
             cursor: position,
             watcher: watcher,
             relay: monitor(ctx.relay),
@@ -86,10 +87,7 @@ defmodule AttentionServer.ClientAPI.FeedStream do
             timer_ref: nil
           })
 
-        case send_changes(conn, changes) do
-          {:ok, conn} -> if more, do: pump(conn, state), else: wait(conn, state)
-          {:error, _reason} -> finish(conn, state, "client_closed")
-        end
+        send_page(conn, state, changes, more)
 
       {:error, reason} ->
         Feed.send_read_error(conn, reason)
@@ -98,18 +96,18 @@ defmodule AttentionServer.ClientAPI.FeedStream do
 
   # Reads and sends pages until the feed has caught up with the log.
   defp pump(conn, state) do
-    case FeedStep.read(state.ctx.relay, state.ctx.principal, state.cursor, @page) do
+    case state.source.read(state.ctx, state.cursor, @page) do
       {:ok, changes, more, position} ->
         state = %{state | cursor: position}
 
-        case send_changes(conn, changes) do
-          {:ok, conn} -> if more, do: pump(conn, state), else: wait(conn, state)
-          {:error, _reason} -> finish(conn, state, "client_closed")
-        end
+        send_page(conn, state, changes, more)
 
       # The principal stopped authenticating before its closing arrived.
       {:error, :unauthorized} ->
         closing(conn, state, "revoked")
+
+      {:error, :account_paused} ->
+        closing(conn, state, "account_paused")
 
       # The cursor fell behind retention while open: the client rebaselines.
       {:error, :cursor_expired} ->
@@ -121,6 +119,43 @@ defmodule AttentionServer.ClientAPI.FeedStream do
     end
   catch
     :exit, _reason -> closing(conn, state, "server_shutdown")
+  end
+
+  defp send_page(conn, state, changes, more) do
+    case send_changes(conn, changes) do
+      {:ok, conn} ->
+        case state.source.transmitted(state.ctx, changes) do
+          :ok -> continue(conn, state, more)
+          {:error, :account_paused} -> closing(conn, state, "account_paused")
+          {:error, :unauthorized} -> closing(conn, state, "revoked")
+          {:error, _reason} -> closing(conn, state, "storage_unavailable")
+        end
+
+      {:error, _reason} ->
+        finish(conn, state, "client_closed")
+    end
+  end
+
+  defp continue(conn, state, false), do: wait(conn, state)
+
+  defp continue(conn, state, true) do
+    # Ready control messages must be serviced between pages even when writes
+    # keep the feed permanently behind the head.
+    receive do
+      {:client_closing, _scope, reason} ->
+        closing(conn, state, Atom.to_string(reason))
+
+      {:DOWN, ref, :process, _pid, _reason} when ref == state.relay ->
+        closing(conn, state, "server_shutdown")
+
+      {:feed_heartbeat, ref} when ref == state.timer ->
+        heartbeat(conn, state, &pump/2)
+
+      {:feed_focus, watcher} when watcher == state.watcher ->
+        write_focus(conn, state, &pump/2)
+    after
+      0 -> pump(conn, state)
+    end
   end
 
   defp wait(conn, state) do
@@ -142,10 +177,32 @@ defmodule AttentionServer.ClientAPI.FeedStream do
         closing(conn, state, "server_shutdown")
 
       {:feed_heartbeat, ref} when ref == state.timer ->
-        case chunk_safely(conn, "event: heartbeat\ndata: {}\n\n") do
-          {:ok, conn} -> wait(conn, schedule_heartbeat(state))
+        heartbeat(conn, state, &wait/2)
+
+      {:feed_focus, watcher} when watcher == state.watcher ->
+        write_focus(conn, state, &wait/2)
+    end
+  end
+
+  defp heartbeat(conn, state, next) do
+    case chunk_safely(conn, "event: heartbeat\ndata: {}\n\n") do
+      {:ok, conn} -> next.(conn, schedule_heartbeat(state))
+      {:error, _reason} -> finish(conn, state, "client_closed")
+    end
+  end
+
+  defp write_focus(conn, state, next) do
+    send(state.watcher, {:feed_focus_woken, self()})
+
+    case state.source.focus(state.ctx) do
+      {:ok, data} ->
+        case chunk_safely(conn, ["event: focus\ndata: ", JSON.encode!(data), "\n\n"]) do
+          {:ok, conn} -> next.(conn, state)
           {:error, _reason} -> finish(conn, state, "client_closed")
         end
+
+      _ ->
+        next.(conn, state)
     end
   end
 
@@ -154,6 +211,7 @@ defmodule AttentionServer.ClientAPI.FeedStream do
   defp flush_wakeups do
     receive do
       {:change_log, _person, _head} -> flush_wakeups()
+      {:feed_focus, _watcher} -> flush_wakeups()
     after
       0 -> :ok
     end
@@ -226,16 +284,27 @@ defmodule AttentionServer.ClientAPI.FeedStream do
   #   cannot log its own close, so the watcher logs `client_closed`.
   #
   # It subscribes before returning, so the feed's first read comes after it.
-  defp watch(ctx) do
+  defp watch(ctx, source) do
     feed = self()
-    person = ctx.principal.person
+    scope = source.scope(ctx)
 
     {pid, ref} =
       spawn_monitor(fn ->
         monitor = Process.monitor(feed)
-        :ok = ChangeLog.subscribe(person)
+        :ok = ChangeLog.subscribe(scope)
         send(feed, {:feed_watching, self()})
-        watching(%{ctx: ctx, feed: feed, monitor: monitor, sent: false, head: nil, opened: false})
+        watching(%{
+          ctx: ctx,
+          scope: scope,
+          source: source,
+          feed: feed,
+          monitor: monitor,
+          sent: false,
+          head: nil,
+          focus_sent: false,
+          focus_pending: false,
+          opened: false
+        })
       end)
 
     receive do
@@ -264,23 +333,49 @@ defmodule AttentionServer.ClientAPI.FeedStream do
             watching(%{w | sent: false})
 
           head ->
-            send(feed, {:change_log, w.ctx.principal.person, head})
+            send(feed, {:change_log, w.scope, head})
             watching(%{w | sent: true, head: nil})
+        end
+
+      {:focus_change, _data} ->
+        if w.focus_sent do
+          watching(%{w | focus_pending: true})
+        else
+          send(feed, {:feed_focus, self()})
+          watching(%{w | focus_sent: true})
+        end
+
+      :focus_forbidden ->
+        watching(%{w | focus_pending: false})
+
+      {:feed_focus_woken, ^feed} ->
+        if w.focus_pending do
+          send(feed, {:feed_focus, self()})
+          watching(%{w | focus_pending: false})
+        else
+          watching(%{w | focus_sent: false})
         end
 
       {:feed_opened, ^feed} ->
         log(w.ctx, "open", nil)
+        w.source.opened(w.ctx)
+
         watching(%{w | opened: true})
 
       {:feed_closed, ^feed, reason} ->
         log(w.ctx, "close", reason)
+        if w.opened, do: w.source.closed(w.ctx)
         watching(%{w | opened: false})
 
       {:feed_done, ^feed} ->
+        if w.opened, do: w.source.closed(w.ctx)
         :ok
 
       {:DOWN, ref, :process, ^feed, _} when ref == w.monitor ->
-        if w.opened, do: log(w.ctx, "close", "client_closed")
+        if w.opened do
+          log(w.ctx, "close", "client_closed")
+          w.source.closed(w.ctx)
+        end
     end
   end
 

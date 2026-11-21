@@ -3613,6 +3613,10 @@ defmodule AttentionServer.Relay do
     end
   end
 
+  defp dispatch_info({:agent_feed_activity, action, scope}, %{store: %{change_log: true}} = state) do
+    {:noreply, AttentionServer.AgentAPI.FeedActivity.handle_info(action, scope, state)}
+  end
+
   defp dispatch_info(:change_log_prune, state) do
     before_ms = state.clock.() - @change_log_retention_ms
 
@@ -7367,6 +7371,14 @@ defmodule AttentionServer.Relay do
 
       _ ->
         state
+    end
+  end
+
+  @doc false
+  def agent_focus(state, person, key) do
+    case focus_authorized_person(state.store.engine, key, :see) do
+      {:ok, ^person} -> {:ok, focus_list(state, person)}
+      _ -> {:error, :forbidden}
     end
   end
 
