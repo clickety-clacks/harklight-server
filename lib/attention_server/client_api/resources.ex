@@ -560,18 +560,16 @@ defmodule AttentionServer.ClientAPI.Resources do
     listed = listed_units(engine, person, view)
     listed_items = for {:item, id, _key, _section, _group} <- listed, into: MapSet.new(), do: id
 
+    # The view lists every item in the usual case; walking the person's items
+    # is needed only when it does not (a progress message, or no view yet).
+    resolved = Map.get(engine.route_b_index.resolved_messages_by_person, person, :gb_trees.empty())
+
+    total =
+      Map.get(engine.route_b_index.unresolved_count_by_person, person, 0) +
+        :gb_trees.size(resolved)
+
     unlisted =
-      engine
-      |> item_keys(person)
-      |> Enum.map(&{&1, Map.fetch!(engine.messages, &1)})
-      |> Enum.reject(fn {_key, record} -> MapSet.member?(listed_items, item_id(record)) end)
-      |> Enum.sort_by(fn {_key, record} ->
-        {not is_nil(record.terminal), -record.accepted_seq}
-      end)
-      |> Enum.map(fn {key, record} ->
-        section = if is_nil(record.terminal), do: "current", else: "resolved"
-        {:item, item_id(record), key, section, nil}
-      end)
+      if MapSet.size(listed_items) >= total, do: [], else: unlisted_units(engine, person, listed_items)
 
     units = listed ++ unlisted
     keys = rank_keys(previous, Enum.map(units, &unit_id/1))
@@ -622,6 +620,19 @@ defmodule AttentionServer.ClientAPI.Resources do
     do: item_key(engine, person, item_id)
 
   def rank_unit_item(%Engine{} = engine, person, item_id), do: item_key(engine, person, item_id)
+
+  # Items the view does not list: open ones, then resolved ones, newest first.
+  defp unlisted_units(engine, person, listed_items) do
+    engine
+    |> item_keys(person)
+    |> Enum.map(&{&1, Map.fetch!(engine.messages, &1)})
+    |> Enum.reject(fn {_key, record} -> MapSet.member?(listed_items, item_id(record)) end)
+    |> Enum.sort_by(fn {_key, record} -> {not is_nil(record.terminal), -record.accepted_seq} end)
+    |> Enum.map(fn {key, record} ->
+      section = if is_nil(record.terminal), do: "current", else: "resolved"
+      {:item, item_id(record), key, section, nil}
+    end)
+  end
 
   defp unit_id({:item, id, _, _, _}), do: id
   defp unit_id({:reply, id, _, _, _}), do: "r" <> id
@@ -772,6 +783,26 @@ defmodule AttentionServer.ClientAPI.Resources do
         end
       end)
 
+    if length(candidates) == length(ordered_ids) and increasing?(candidates) do
+      # Nothing moved: every id keeps its key (the change log's usual re-rank).
+      ordered_ids |> Enum.zip(Enum.map(candidates, &elem(&1, 1))) |> Map.new()
+    else
+      reassign(ordered_ids, candidates)
+    end
+  end
+
+  defp increasing?([{_, first} | rest]) do
+    {ok, _} =
+      Enum.reduce_while(rest, {true, first}, fn {_, key}, {true, last} ->
+        if key > last, do: {:cont, {true, key}}, else: {:halt, {false, key}}
+      end)
+
+    ok
+  end
+
+  defp increasing?([]), do: true
+
+  defp reassign(ordered_ids, candidates) do
     kept = candidates |> longest_increasing() |> Map.new()
 
     {assigned, pending, low} =
@@ -796,32 +827,28 @@ defmodule AttentionServer.ClientAPI.Resources do
       fraction |> :binary.bin_to_list() |> Enum.all?(&(digit_value(&1) != nil))
   end
 
-  # Patience sorting: the longest strictly increasing subsequence by key.
+  # Patience sorting: the longest strictly increasing subsequence by key, in
+  # O(n log n). The tails live in an :array, which updates in O(log n); a
+  # tuple would be copied on every step.
   defp longest_increasing([]), do: []
 
   defp longest_increasing(pairs) do
-    {tails, links} =
-      Enum.reduce(pairs, {{}, %{}}, fn {_index, key} = pair, {tails, links} ->
-        slot = lower_bound(tails, key, 0, tuple_size(tails))
-        previous = if slot > 0, do: elem(tails, slot - 1), else: nil
-        links = Map.put(links, pair, previous)
-
-        tails =
-          if slot == tuple_size(tails),
-            do: :erlang.append_element(tails, pair),
-            else: put_elem(tails, slot, pair)
-
-        {tails, links}
+    {tails, size, links} =
+      Enum.reduce(pairs, {:array.new(), 0, %{}}, fn {index, key} = pair, {tails, size, links} ->
+        slot = lower_bound(tails, key, 0, size)
+        previous = if slot > 0, do: :array.get(slot - 1, tails), else: nil
+        size = if slot == size, do: size + 1, else: size
+        {:array.set(slot, pair, tails), size, Map.put(links, index, previous)}
       end)
 
-    walk(elem(tails, tuple_size(tails) - 1), links, [])
+    walk(:array.get(size - 1, tails), links, [])
   end
 
   defp lower_bound(_tails, _key, low, high) when low >= high, do: low
 
   defp lower_bound(tails, key, low, high) do
     middle = div(low + high, 2)
-    {_index, middle_key} = elem(tails, middle)
+    {_index, middle_key} = :array.get(middle, tails)
 
     if middle_key < key,
       do: lower_bound(tails, key, middle + 1, high),
@@ -829,7 +856,9 @@ defmodule AttentionServer.ClientAPI.Resources do
   end
 
   defp walk(nil, _links, acc), do: acc
-  defp walk(pair, links, acc), do: walk(Map.fetch!(links, pair), links, [pair | acc])
+
+  defp walk({index, _key} = pair, links, acc),
+    do: walk(Map.fetch!(links, index), links, [pair | acc])
 
   # Evenly bisected fractions strictly between low and high (nil = the end).
   defp spread(_low, _high, []), do: []
