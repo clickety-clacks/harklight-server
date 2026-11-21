@@ -1140,7 +1140,13 @@ defmodule AttentionServer.ClientAPI.Resources do
   defp delivery_effect(%{"kind" => "acted", "event_id" => id}), do: {"acted", id}
   defp delivery_effect(_), do: nil
 
-  defp entry(item_id, record, seq, %{"kind" => kind} = payload, context) do
+  defp entry(item_id, record, seq, payload, context) do
+    AttentionServer.ClientAPI.Projection.run({:entry, entry_id(seq)}, fn ->
+      render_entry(item_id, record, seq, payload, context)
+    end)
+  end
+
+  defp render_entry(item_id, record, seq, %{"kind" => kind} = payload, context) do
     base = %{
       "entry_id" => entry_id(seq),
       "item_id" => item_id,
