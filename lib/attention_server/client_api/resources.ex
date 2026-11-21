@@ -24,7 +24,7 @@ defmodule AttentionServer.ClientAPI.Resources do
   This module reads engine state only. It never changes it.
   """
 
-  alias AttentionServer.{BounceDecision, Conversation, Engine, LargeData, Message}
+  alias AttentionServer.{BounceDecision, Conversation, Engine, LargeData, Message, Placement}
 
   @viewer "_viewer"
   @sources "_sources"
@@ -185,6 +185,7 @@ defmodule AttentionServer.ClientAPI.Resources do
     record = Map.fetch!(engine.messages, key)
     summary = Map.get(engine.route_b_index.conversation_summary_by_item, key, %{})
     {reply, rank} = Map.pop(rank, "_reply")
+    {thread, rank} = Map.pop(rank, "_thread")
 
     %{
       "item_id" => item_id(record),
@@ -202,6 +203,9 @@ defmodule AttentionServer.ClientAPI.Resources do
     # area; created_at_ms is display only and absent when the record has none.
     |> put_present("created_at_ms", time_ms(Map.get(record, :accepted_at)))
     |> put_present("arrival", positive(Map.get(record, :free_order)))
+    # Round 9: the effective group thread, so clients form today's thread rows
+    # from adjacent items with the same (sender, thread).
+    |> put_present("thread", thread)
     |> put_present("availability", item_availability(engine, person, record, summary))
     |> put_present("result", origin_result(record))
   end
@@ -457,6 +461,7 @@ defmodule AttentionServer.ClientAPI.Resources do
   def ranks(%Engine{} = engine, person, view, previous \\ %{}) when is_map(previous) do
     entries = view_entries(view)
     reply_levels = view_reply_entries(view)
+    threads = effective_threads(engine, person)
     listed = listed_units(engine, person, view)
     listed_items = for {:item, id, _key, _section, _group} <- listed, into: MapSet.new(), do: id
 
@@ -482,6 +487,7 @@ defmodule AttentionServer.ClientAPI.Resources do
           %{"key" => Map.fetch!(keys, id), "section" => section}
           |> put_present("group", group)
           |> put_view_fields(Map.get(entries, {sender, message_id}, %{}))
+          |> put_present("_thread", Map.get(threads, {sender, message_id}))
 
         Map.update(acc, id, rank, &Map.merge(rank, Map.take(&1, ["_reply"])))
 
@@ -575,6 +581,15 @@ defmodule AttentionServer.ClientAPI.Resources do
   end
 
   defp list_unit(_row, _id, _key, _record), do: :skip
+
+  # Today's effective group threads (Placement.items: inherited through
+  # supersedes), for open items in a thread group.
+  defp effective_threads(engine, person) do
+    for %{identity: identity, message: %{"thread" => thread}} <- Placement.items(engine, person),
+        is_binary(thread) and thread != "",
+        into: %{},
+        do: {identity, thread}
+  end
 
   # Today's per-reply priority view entries, by item and conversation sequence.
   defp view_reply_entries(%{replies: replies}) when is_list(replies) do

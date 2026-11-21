@@ -20,7 +20,7 @@ defmodule AttentionServer.ClientAPISchema do
 
   @doc """
   The contract's defs, from docs/client-api-v2.md, with the delivery owner's
-  rulings of round 7 (with its addendum) and round 8 applied where the
+  rulings of round 7 (with its addendum), round 8 and round 9 applied where the
   document does not carry them yet. Every step is a no-op once it does;
   remove the overlay then.
   """
@@ -61,7 +61,12 @@ defmodule AttentionServer.ClientAPISchema do
       end)
     end)
     |> update_in(["Item", "required"], &List.delete(&1, "created_at_ms"))
-    |> update_in(["Item", "properties"], &Map.put_new(&1, "arrival", %{"type" => "integer", "minimum" => 1}))
+    |> update_in(
+      ["Item", "properties"],
+      &Map.put_new(&1, "arrival", %{"type" => "integer", "minimum" => 1})
+    )
+    # Round 9.
+    |> update_in(["Item", "properties"], &Map.put_new(&1, "thread", %{"type" => "string"}))
   end
 
   def errors(defs, name, value), do: check(defs, Map.fetch!(defs, name), value, name)
