@@ -32,7 +32,8 @@ defmodule AttentionServer.ClientAPI.Uploads do
       at_ms INTEGER NOT NULL
     )
     """,
-    "CREATE INDEX IF NOT EXISTS client_staged_files_at ON client_staged_files (at_ms)"
+    "CREATE INDEX IF NOT EXISTS client_staged_files_at ON client_staged_files (at_ms)",
+    "CREATE TABLE IF NOT EXISTS client_discarded_files (file_id TEXT PRIMARY KEY NOT NULL)"
   ]
 
   @type staged :: %{
@@ -132,8 +133,7 @@ defmodule AttentionServer.ClientAPI.Uploads do
 
   @doc "Forget an unattached file and its bytes, storing any replay receipt with the deletion."
   def discard(%AttentionServer.Store{change_log: true, db: db} = store, person, file_id, key, digest) do
-    with {:ok, dir} <- dir(store),
-         :ok <- ensure(db),
+    with :ok <- ensure(db),
          {:ok, [1]} <-
            one(
              db,
@@ -142,7 +142,6 @@ defmodule AttentionServer.ClientAPI.Uploads do
            ),
          :ok <- Sqlite3.execute(db, "BEGIN IMMEDIATE"),
          :ok <- commit_discard(store, db, person, file_id, key, digest) do
-      unlink_discarded(Path.join(dir, file_id))
       :ok
     else
       {:ok, nil} -> {:error, :not_found}
@@ -159,6 +158,7 @@ defmodule AttentionServer.ClientAPI.Uploads do
              file_id,
              person
            ]),
+         :ok <- run(db, "INSERT INTO client_discarded_files (file_id) VALUES (?)", [file_id]),
          :ok <- save_discard_receipt(store, person, key, digest),
          :ok <- Sqlite3.execute(db, "COMMIT") do
       :ok
@@ -174,13 +174,75 @@ defmodule AttentionServer.ClientAPI.Uploads do
   defp save_discard_receipt(store, person, key, digest),
     do: Idempotency.save(store, person, key, digest, 204, %{"discarded_file" => true})
 
-  # Attached bytes have their own upload ID and path. Only unlink staged bytes
-  # after committing removal of the row that made them addressable.
+  @doc "Unlink committed discards outside Relay, retaining failed cleanup for another attempt."
+  def clean_discarded(relay, file_id \\ nil) do
+    case GenServer.call(relay, {:client_api, __MODULE__, {:discarded, file_id}}, :infinity) do
+      {:ok, dir, rows} ->
+        removed =
+          for [id] <- rows, unlink_discarded(Path.join(dir, id)) == :ok, do: id
+
+        if removed != [] do
+          GenServer.call(relay, {:client_api, __MODULE__, {:discard_cleaned, removed}}, :infinity)
+        end
+
+      {:error, reason} ->
+        Diagnostics.failure(:server_storage, :upload_delete, reason, :unavailable)
+    end
+  catch
+    :exit, _reason -> :ok
+  end
+
+  @doc false
+  def handle_call({:discarded, file_id}, _from, %{store: store} = state) do
+    reply =
+      with %AttentionServer.Store{change_log: true, db: db, upload_dir: dir} when is_binary(dir) <-
+             store,
+           {:ok, rows} <- pending_discards(db, file_id) do
+        {:ok, Path.join(dir, @dir), rows}
+      else
+        {:error, _} = error -> error
+        _ -> {:ok, nil, []}
+      end
+
+    {:reply, reply, state}
+  end
+
+  def handle_call({:discard_cleaned, ids}, _from, %{store: store} = state) do
+    Enum.each(ids, fn id ->
+      case run(store.db, "DELETE FROM client_discarded_files WHERE file_id = ?", [id]) do
+        :ok -> :ok
+        {:error, reason} -> Diagnostics.failure(:server_storage, :upload_delete, reason, :retry)
+      end
+    end)
+
+    {:reply, :ok, state}
+  end
+
+  # The table is lazy, like the staged files themselves. Startup cleanup
+  # need not initialize upload storage on a server that has never used it.
+  defp pending_discards(db, nil) do
+    with {:ok, [1]} <-
+           one(db, "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", [
+             "client_discarded_files"
+           ]) do
+      all(db, "SELECT file_id FROM client_discarded_files", [])
+    else
+      {:ok, nil} -> {:ok, []}
+      error -> error
+    end
+  end
+
+  defp pending_discards(db, file_id),
+    do: all(db, "SELECT file_id FROM client_discarded_files WHERE file_id = ?", [file_id])
+
+  # Attached copies have their own download IDs and paths.
   defp unlink_discarded(path) do
     case File.rm(path) do
       :ok -> :ok
       {:error, :enoent} -> :ok
-      {:error, reason} -> Diagnostics.failure(:server_storage, :upload_delete, reason, :unavailable)
+      {:error, reason} ->
+        Diagnostics.failure(:server_storage, :upload_delete, reason, :retry)
+        {:error, reason}
     end
   end
 

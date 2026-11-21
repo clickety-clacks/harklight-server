@@ -113,6 +113,20 @@ defmodule AttentionServer.ClientAPIReadRoutesTest do
     body(conn)["file_id"]
   end
 
+  defp restart_relay(%{relay: relay, store_path: store_path, flags: flags}) do
+    GenServer.stop(relay)
+
+    assert {:ok, relay} =
+             Relay.start_link(
+               store_path: store_path,
+               feature_flags_path: flags,
+               agent_fixture_mode: true
+             )
+
+    on_exit(fn -> if Process.alive?(relay), do: GenServer.stop(relay) end)
+    relay
+  end
+
   test "discard removes the staged row and bytes, and replays by person and key", ctx do
     %{relay: relay, der: der, certs: certs} = ctx
     handle = stage_file(relay, der, op(100))
@@ -167,7 +181,7 @@ defmodule AttentionServer.ClientAPIReadRoutesTest do
   end
 
   test "discard refuses an attached upload without affecting the downloadable file", ctx do
-    %{relay: relay, reader: reader, der: der, store_path: store_path, flags: flags} = ctx
+    %{relay: relay, reader: reader, der: der} = ctx
     handle = stage_file(relay, der, op(110))
     twin = stage_file(relay, der, op(111))
     {:ok, %{"items" => items}} = Reads.inbox(relay, reader)
@@ -186,16 +200,7 @@ defmodule AttentionServer.ClientAPIReadRoutesTest do
     assert reply.status == 200
     assert [%{"file_id" => download_id}] = body(reply)["entry"]["files"]
     refute download_id == handle
-    GenServer.stop(relay)
-
-    assert {:ok, relay} =
-             Relay.start_link(
-               store_path: store_path,
-               feature_flags_path: flags,
-               agent_fixture_mode: true
-             )
-
-    on_exit(fn -> if Process.alive?(relay), do: GenServer.stop(relay) end)
+    relay = restart_relay(ctx)
 
     refused = file_request(relay, der, conn(:delete, "/v2/files/" <> handle))
     assert refused.status == 409
@@ -206,6 +211,44 @@ defmodule AttentionServer.ClientAPIReadRoutesTest do
     downloaded = file_request(relay, der, conn(:get, "/v2/files/" <> download_id))
     assert downloaded.status == 200
     assert downloaded.resp_body == @bytes
+  end
+
+  test "discard cleanup retries after unlink failure on replay and after restart", ctx do
+    %{relay: relay, der: der} = ctx
+    store = :sys.get_state(relay).store
+
+    [{replay_path, replay_request}, {boot_path, _}] =
+      for n <- [120, 122] do
+        id = stage_file(relay, der, op(n))
+        assert {:ok, %{path: path}} = Uploads.fetch(store, "A", id)
+        File.rename!(path, path <> ".fixture")
+        File.mkdir!(path)
+
+        req = conn(:delete, "/v2/files/" <> id) |> put_req_header("idempotency-key", op(n + 1))
+        assert file_request(relay, der, req).status == 204
+        assert {:error, :not_found} = Uploads.fetch(store, "A", id)
+        assert File.dir?(path)
+
+        File.rmdir!(path)
+        File.rename!(path <> ".fixture", path)
+        {path, req}
+      end
+
+    replay = file_request(relay, der, replay_request)
+    assert get_resp_header(replay, "idempotent-replayed") == ["true"]
+    refute File.exists?(replay_path)
+    assert File.regular?(boot_path)
+
+    restart_relay(ctx)
+
+    assert Enum.reduce_while(1..100, false, fn _, _ ->
+             if File.exists?(boot_path) do
+               Process.sleep(20)
+               {:cont, false}
+             else
+               {:halt, true}
+             end
+           end)
   end
 
   test "a read answers 200 with an ETag, and 304 when the client already has it", ctx do

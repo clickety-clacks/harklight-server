@@ -185,19 +185,21 @@ defmodule AttentionServer.ClientAPI.Writes do
 
   @doc false
   def delete_file(conn, %Context{} = ctx) do
-    respond_to_discard(conn, ctx.params.file_id, fn file_id, key, digest ->
+    respond_to_discard(conn, ctx, fn file_id, key, digest ->
       call(ctx.relay, {:discard_file, ctx.principal, file_id, key, digest})
     end)
   end
 
   @doc "Serve a discard using a caller that authorizes the principal and runs the write in Relay."
-  def respond_to_discard(conn, file_id, discard) do
+  def respond_to_discard(conn, %Context{params: %{file_id: file_id}} = ctx, discard) do
     with {:ok, key} <- optional_key(conn) do
       digest = Idempotency.digest("DELETE", ["files", file_id], %{})
 
       case discard.(file_id, key, digest) do
-        {:ok, 204, %{}} -> send_resp(conn, 204, "")
-        {:replay, 204, %{}} -> conn |> replayed(true) |> send_resp(204, "")
+        {status, 204, %{}} when status in [:ok, :replay] ->
+          Uploads.clean_discarded(ctx.relay, file_id)
+          conn |> replayed(status == :replay) |> send_resp(204, "")
+
         error -> respond(conn, result(error, false))
       end
     else

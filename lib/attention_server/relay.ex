@@ -3639,6 +3639,11 @@ defmodule AttentionServer.Relay do
       {:error, reason} -> Diagnostics.failure(:server_storage, :periodic_cleanup, reason, :retry)
     end
 
+    # This runs at startup and daily. File IO stays in the worker, while
+    # Relay reads and acknowledges the durable list of pending discards.
+    relay = self()
+    Task.start(fn -> AttentionServer.ClientAPI.Uploads.clean_discarded(relay) end)
+
     schedule_change_log_prune(state.store, @change_log_prune_interval_ms)
     {:noreply, state}
   end
