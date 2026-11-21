@@ -40,6 +40,8 @@ defmodule AttentionServer.ChangeLog do
   }
   @kind_atoms Map.new(@kinds, fn {atom, text} -> {text, atom} end)
 
+  @rank_projection_version 1
+
   @schema [
     """
     CREATE TABLE IF NOT EXISTS client_changes (
@@ -107,7 +109,8 @@ defmodule AttentionServer.ChangeLog do
     """
     CREATE TABLE IF NOT EXISTS client_change_log_state (
       id INTEGER PRIMARY KEY CHECK (id = 1),
-      store_version INTEGER NOT NULL
+      store_version INTEGER NOT NULL,
+      rank_projection_version INTEGER NOT NULL DEFAULT 0
     )
     """
   ]
@@ -393,13 +396,14 @@ defmodule AttentionServer.ChangeLog do
 
   @doc """
   Creates the tables and reconciles the log with the store snapshot. If the
-  store was committed while the log was off, every person's log restarts past
-  their head: clients holding an older cursor get `cursor_expired` and
-  re-read a snapshot, so nothing changed meanwhile is missed.
+  store was committed while the log was off, or its previous rank projection
+  used different keys, every person's log restarts past their head. Clients
+  holding an older cursor get `cursor_expired` and re-read a snapshot.
   """
   def enable(db, store_version) do
     with :ok <- Enum.reduce_while(@schema, :ok, &create(db, &1, &2)),
          :ok <- Sqlite3.execute(db, "BEGIN IMMEDIATE"),
+         :ok <- add_rank_projection_version(db),
          :ok <- reconcile(db, store_version),
          :ok <- Sqlite3.execute(db, "COMMIT") do
       :ok
@@ -417,17 +421,37 @@ defmodule AttentionServer.ChangeLog do
     end
   end
 
-  defp reconcile(db, store_version) do
-    case one(db, "SELECT store_version FROM client_change_log_state WHERE id = 1", []) do
-      {:ok, nil} ->
-        run(db, "INSERT INTO client_change_log_state (id, store_version) VALUES (1, ?)", [
-          store_version
-        ])
+  defp add_rank_projection_version(db) do
+    with {:ok, columns} <- all(db, "PRAGMA table_info(client_change_log_state)", []) do
+      if Enum.any?(columns, &match?([_, "rank_projection_version" | _], &1)) do
+        :ok
+      else
+        Sqlite3.execute(
+          db,
+          "ALTER TABLE client_change_log_state ADD COLUMN rank_projection_version " <>
+            "INTEGER NOT NULL DEFAULT 0"
+        )
+      end
+    end
+  end
 
-      {:ok, [^store_version]} ->
+  defp reconcile(db, store_version) do
+    case one(
+           db,
+           "SELECT store_version, rank_projection_version FROM client_change_log_state WHERE id = 1",
+           []
+         ) do
+      {:ok, nil} ->
+        run(
+          db,
+          "INSERT INTO client_change_log_state (id, store_version, rank_projection_version) VALUES (1, ?, ?)",
+          [store_version, @rank_projection_version]
+        )
+
+      {:ok, [^store_version, @rank_projection_version]} ->
         :ok
 
-      {:ok, [_stale]} ->
+      {:ok, [_, _]} ->
         with :ok <-
                run(
                  db,
@@ -449,9 +473,11 @@ defmodule AttentionServer.ChangeLog do
                    "ON CONFLICT (id) DO UPDATE SET epoch = excluded.epoch",
                  [epoch + 1]
                ) do
-          run(db, "UPDATE client_change_log_state SET store_version = ? WHERE id = 1", [
-            store_version
-          ])
+          run(
+            db,
+            "UPDATE client_change_log_state SET store_version = ?, rank_projection_version = ? WHERE id = 1",
+            [store_version, @rank_projection_version]
+          )
         end
 
       error ->
