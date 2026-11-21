@@ -21,7 +21,7 @@ defmodule AttentionServer.ClientAPI.Focus do
   the id-less event, when it computes the show's age (round 11 r4 §4).
   """
 
-  alias AttentionServer.ClientAPI.{Reads, Resources, Writes}
+  alias AttentionServer.ClientAPI.{Projection, Reads, Resources, Writes}
 
   @registry AttentionServer.ChangeLog.Registry
 
@@ -83,7 +83,9 @@ defmodule AttentionServer.ClientAPI.Focus do
           # the device's next accepted focus report.
           with %{client_api_token: _} <- Map.get(state.focus_clients, key),
                %{} = held <- Map.get(state.held_shows, key) do
-            show(engine, key, held, state.clock.())
+            Projection.capture(fn ->
+              show(engine, key, held, state.clock.())
+            end)
           else
             _ -> nil
           end
@@ -100,13 +102,15 @@ defmodule AttentionServer.ClientAPI.Focus do
     with %{person: person} <- Map.get(engine.devices, device_key),
          {:ok, item_id} <-
            Resources.item_id(engine, {person, held["sender_id"], held["message_id"]}) do
-      %{
-        "show_id" => show_id(device_key, held),
-        "device_id" => device_key,
-        "item_id" => item_id,
-        "target" => held["target"],
-        "held_ms" => max(now - accepted_at, 0)
-      }
+      Projection.run({:item, item_id}, fn ->
+        %{
+          "show_id" => show_id(device_key, held),
+          "device_id" => device_key,
+          "item_id" => item_id,
+          "target" => held["target"],
+          "held_ms" => max(now - accepted_at, 0)
+        }
+      end)
     else
       _ -> nil
     end

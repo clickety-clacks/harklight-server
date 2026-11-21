@@ -33,8 +33,7 @@ defmodule AttentionServer.AgentAPI.Feed do
   defp batch(conn, ctx, cursor, limit) do
     case FeedStep.read(ctx, cursor, limit) do
       {:ok, changes, more, position} ->
-        conn =
-          Errors.send_json(conn, 200, %{"changes" => changes, "rev" => position, "more" => more})
+        conn = Feed.send_batch(conn, changes, more, position)
 
         FeedActivity.observe(ctx, :batch)
 
@@ -57,7 +56,7 @@ defmodule AttentionServer.AgentAPI.FeedStep do
 
   alias AttentionServer.{AgentChangeLog, Diagnostics, Engine, Relay, Store}
   alias AttentionServer.AgentAPI.{FeedActivity, FeedRenderer, Focus}
-  alias AttentionServer.ClientAPI.{FeedStep, Resources}
+  alias AttentionServer.ClientAPI.{FeedStep, Projection, Resources}
 
   def scope(%{principal: %{person: person, key: key}}), do: {:agent, person, key}
 
@@ -138,10 +137,12 @@ defmodule AttentionServer.AgentAPI.FeedStep do
   defp read_rows(%{store: store} = state, principal, session, cursor, limit) do
     with {:ok, agent} <- authorized(store.engine, principal),
          {:ok, rows, more, position} <- AgentChangeLog.read(store, agent, cursor, limit, session),
-         {:ok, changes} <-
-           state |> FeedRenderer.render_many(principal, rows) |> FeedStep.changes() do
+         {:ok, changes} <- render_changes(state, principal, rows) do
       {:ok, agent, changes, more, position}
     else
+      {:error, %Projection{}} = error ->
+        error
+
       {:error, reason}
       when reason in [:cursor_expired, :account_paused, :unauthorized, :disabled] ->
         {:error, reason}
@@ -154,6 +155,14 @@ defmodule AttentionServer.AgentAPI.FeedStep do
     error ->
       Diagnostics.failure(:client_api, :stream_read, error, :failed)
       {:error, :storage_unavailable}
+  end
+
+  defp render_changes(state, principal, rows) do
+    Projection.capture(fn ->
+      Projection.run(:agent_feed, fn ->
+        state |> FeedRenderer.render_many(principal, rows) |> FeedStep.changes()
+      end)
+    end)
   end
 
   defp authorized(engine, %{kind: :device, person: person, key: key}) do

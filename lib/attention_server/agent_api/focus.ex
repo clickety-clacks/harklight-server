@@ -4,7 +4,7 @@ defmodule AttentionServer.AgentAPI.Focus do
   @behaviour AttentionServer.ClientAPI.Routes
 
   alias AttentionServer.{Relay, RouteBIndex}
-  alias AttentionServer.ClientAPI.{Reads, Resources}
+  alias AttentionServer.ClientAPI.{Projection, Reads, Resources}
 
   @impl true
   def routes, do: [{"GET", ["agent", "focus"], :snapshot}]
@@ -30,14 +30,21 @@ defmodule AttentionServer.AgentAPI.Focus do
 
   def handle_call({:get, person, key}, _from, state) do
     result =
-      with {:ok, clients} <- Relay.agent_focus(state, person, key) do
-        {:ok, %{"clients" => Enum.map(clients, &render(state.store.engine, person, &1))}}
-      end
+      Projection.capture(fn ->
+        with {:ok, clients} <-
+               Projection.run(:focus, fn -> Relay.agent_focus(state, person, key) end) do
+          {:ok, %{"clients" => Enum.map(clients, &render(state.store.engine, person, &1))}}
+        end
+      end)
 
     {:reply, result, state}
   end
 
   defp render(engine, person, client) do
+    Projection.run(:focus, fn -> project(engine, person, client) end)
+  end
+
+  defp project(engine, person, client) do
     base =
       client
       |> Map.take(~w(device_name screen in_front connected))

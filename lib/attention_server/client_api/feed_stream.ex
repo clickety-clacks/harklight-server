@@ -15,7 +15,8 @@ defmodule AttentionServer.ClientAPI.FeedStream do
     - `server_shutdown` when the server stops (`ClientAPI.FeedShutdown`) or
       the Relay exits;
     - `cursor_expired` when the position falls out of retention mid-stream;
-    - `storage_unavailable` when a mid-stream read fails (round 17).
+    - `storage_unavailable` when a mid-stream storage read fails (round 17);
+    - `internal_error` when a projection fails (round 26).
   - A device's feed also carries its held shows (round 11 r4 §3b): an
     `event: show` with the show's data and no `id:` line. A show comes from
     the Relay's memory-only focus state (`ClientAPI.Focus`), never from the
@@ -43,7 +44,7 @@ defmodule AttentionServer.ClientAPI.FeedStream do
   require Logger
 
   alias AttentionServer.{ChangeLog, JSON}
-  alias AttentionServer.ClientAPI.{Context, Feed, FeedShutdown, FeedStep, Focus}
+  alias AttentionServer.ClientAPI.{Context, Feed, FeedShutdown, FeedStep, Focus, Projection}
 
   # Rows per Relay step. Smaller than a batch's 500, so a long backlog
   # interleaves with other work in the Relay.
@@ -93,6 +94,12 @@ defmodule AttentionServer.ClientAPI.FeedStream do
 
         send_page(conn, state, changes, more)
 
+      {:error, %Projection{} = fault} ->
+        conn
+        |> Projection.log(fault)
+        |> start_stream()
+        |> send_closing("internal_error")
+
       {:error, :delivery_unavailable} ->
         conn |> start_stream() |> send_closing("storage_unavailable")
 
@@ -131,6 +138,9 @@ defmodule AttentionServer.ClientAPI.FeedStream do
       {:error, :server_shutdown} ->
         closing(conn, state, "server_shutdown")
 
+      {:error, %Projection{} = fault} ->
+        projection_closing(conn, state, fault)
+
       # Any other read failure is transient: the client reconnects later.
       {:error, _reason} ->
         closing(conn, state, "storage_unavailable")
@@ -138,8 +148,11 @@ defmodule AttentionServer.ClientAPI.FeedStream do
   end
 
   defp send_page(conn, state, changes, more) do
-    case send_changes(conn, changes) do
+    case Projection.capture(fn -> send_changes(conn, changes) end) do
       {:ok, conn} -> continue(conn, state, more)
+      {:error, %Projection{} = fault} ->
+        projection_closing(conn, state, fault)
+
       {:error, _reason} -> finish(conn, state, "client_closed")
     end
   end
@@ -212,10 +225,14 @@ defmodule AttentionServer.ClientAPI.FeedStream do
 
     case relay_step(fn -> state.source.focus(state.ctx) end) do
       {:ok, data} ->
-        case chunk_safely(conn, ["event: focus\ndata: ", JSON.encode!(data), "\n\n"]) do
+        case write_ephemeral(conn, "focus", data, :focus) do
           {:ok, conn} -> next.(conn, state)
+          {:error, %Projection{} = fault} -> projection_closing(conn, state, fault)
           {:error, _reason} -> finish(conn, state, "client_closed")
         end
+
+      {:error, %Projection{} = fault} ->
+        projection_closing(conn, state, fault)
 
       {:error, :server_shutdown} ->
         closing(conn, state, "server_shutdown")
@@ -276,14 +293,16 @@ defmodule AttentionServer.ClientAPI.FeedStream do
     case pending_show(state.ctx) do
       %{"show_id" => id} = data
       when id != state.last_show_id and (is_nil(expected_id) or id == expected_id) ->
-        event = ["event: show\ndata: ", JSON.encode!(data), "\n\n"]
-
-        case chunk_safely(conn, event) do
+        case write_ephemeral(conn, "show", data, Projection.change_key(data)) do
           {:ok, conn} ->
             # Plug can report chunk acceptance despite a transport failure.
             # The same pending show remains available in the next focus response.
             show_result(reply_ref, :chunk_accepted)
             wait(conn, %{state | last_show_id: id})
+
+          {:error, %Projection{} = fault} ->
+            show_result(reply_ref, :held)
+            projection_closing(conn, state, fault)
 
           {:error, _reason} ->
             show_result(reply_ref, :held)
@@ -297,6 +316,10 @@ defmodule AttentionServer.ClientAPI.FeedStream do
       {:error, :server_shutdown} ->
         show_result(reply_ref, :held)
         closing(conn, state, "server_shutdown")
+
+      {:error, %Projection{} = fault} ->
+        show_result(reply_ref, :held)
+        projection_closing(conn, state, fault)
 
       _ ->
         show_result(reply_ref, :held)
@@ -316,6 +339,13 @@ defmodule AttentionServer.ClientAPI.FeedStream do
   defp send_changes(conn, []), do: {:ok, conn}
   defp send_changes(conn, changes), do: chunk_safely(conn, Enum.map(changes, &event/1))
 
+  defp write_ephemeral(conn, event, data, key) do
+    Projection.capture(fn ->
+      json = Projection.run(key, fn -> JSON.encode!(data) end)
+      chunk_safely(conn, ["event: ", event, "\ndata: ", json, "\n\n"])
+    end)
+  end
+
   @doc false
   def event(%{"rev" => rev, "kind" => kind, "data" => data}),
     do: [
@@ -324,9 +354,18 @@ defmodule AttentionServer.ClientAPI.FeedStream do
       "\nevent: ",
       kind,
       "\ndata: ",
-      JSON.encode!(data),
+      Projection.run(
+        Projection.change_key(data),
+        fn -> JSON.encode!(data) end
+      ),
       "\n\n"
     ]
+
+  defp projection_closing(conn, state, fault) do
+    conn
+    |> Projection.log(fault)
+    |> closing(state, "internal_error")
+  end
 
   # The HTTP server raises, rather than returning an error, when a send cannot
   # complete, for example when the peer has gone or its window stays closed.

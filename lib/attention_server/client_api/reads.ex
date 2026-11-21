@@ -31,7 +31,7 @@ defmodule AttentionServer.ClientAPI.Reads do
     UI1
   }
 
-  alias AttentionServer.ClientAPI.{Context, Errors, Resources, Search}
+  alias AttentionServer.ClientAPI.{Context, Errors, Projection, Resources, Search}
 
   # The client features still behind an operator flag at 0.2 (contract §4).
   @client_features ~w(server_matched_push_routing priority_level_editing)
@@ -176,6 +176,9 @@ defmodule AttentionServer.ClientAPI.Reads do
       else: Errors.send_json(conn, 200, body)
   end
 
+  def respond(conn, {:error, %Projection{} = fault}, _etag_of),
+    do: Errors.projection_error(conn, fault)
+
   def respond(conn, {:error, token}, _etag_of),
     do: Errors.send_error(conn, Atom.to_string(token))
 
@@ -285,7 +288,7 @@ defmodule AttentionServer.ClientAPI.Reads do
   def handle_call(request, _from, state) do
     reply =
       try do
-        read(request, state)
+        Projection.capture(fn -> read(request, state) end)
       catch
         {:client_api_read, token} -> {:error, token}
       end
@@ -478,7 +481,8 @@ defmodule AttentionServer.ClientAPI.Reads do
     engine = state.store.engine
 
     with {:ok, principal} <- principal(engine, key),
-         {:ok, source} <- Resources.file_source(engine, principal.person, file_id) do
+         {:ok, source} <-
+           Projection.run(:file, fn -> Resources.file_source(engine, principal.person, file_id) end) do
       case source do
         {:upload, upload_id} -> {:ok, {:upload, upload_id}}
         {:inline, file} -> inline_file(file)

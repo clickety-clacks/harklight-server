@@ -87,7 +87,7 @@ defmodule AttentionServer.ClientAPI.Router do
 
   require Logger
 
-  alias AttentionServer.ClientAPI.{Auth, Context, Errors}
+  alias AttentionServer.ClientAPI.{Auth, Context, Errors, Projection}
   alias AttentionServer.{Diagnostics, Relay}
 
   # Components add their route module here: C3 reads, C4 writes, C5 the feed.
@@ -256,14 +256,23 @@ defmodule AttentionServer.ClientAPI.Router do
         sent
 
       %Plug.Conn{} = unsent ->
-        Diagnostics.failure(:client_api, :request_dispatch, :no_response, :outcome_unknown)
-        Errors.send_error(unsent, "retry_later")
+        Errors.projection_error(unsent, %Projection{
+          key: Projection.resource(ctx.params),
+          cause: "no_response"
+        })
     end
   rescue
     error ->
-      Diagnostics.failure(:client_api, :request_dispatch, error, :outcome_unknown)
-      unless_sent(conn, &Errors.send_error(&1, "retry_later"))
+      fault = %Projection{
+        key: Projection.resource(ctx.params),
+        cause: Diagnostics.cause_class(error)
+      }
+
+      unless_sent(conn, &Errors.projection_error(&1, fault))
   catch
+    %Projection{} = fault ->
+      unless_sent(conn, &Errors.projection_error(&1, fault))
+
     :exit, reason ->
       Diagnostics.failure(:client_api, :relay_boundary, reason, :outcome_unknown, nil, opts.relay)
       unless_sent(conn, &Errors.send_error(&1, "retry_later"))

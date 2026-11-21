@@ -2,7 +2,7 @@ defmodule AttentionServer.ClientAPI.AgentResources do
   @moduledoc "Shared agent snapshot and change-feed projections."
 
   alias AttentionServer.{AgentChangeLog, ChangeLog, Conversation, Engine, RouteBIndex}
-  alias AttentionServer.ClientAPI.Resources
+  alias AttentionServer.ClientAPI.{Projection, Resources}
 
   def own_item_key(state, {person, _agent} = scope, item_id) do
     with {:ok, key} <- Resources.item_key(state.store.engine, person, item_id),
@@ -18,23 +18,25 @@ defmodule AttentionServer.ClientAPI.AgentResources do
          {:ok, rev} <- known_rev(state.store, scope, {:message, key}),
          request_revision = Map.get(record, :revision, 1),
          {:ok, current} <- revision(state, key, request_revision) do
-      {:ok,
-       %{
-         "item_id" => Resources.item_id(record),
-         "rev" => rev,
-         "sender" => sender,
-         "revision" => request_revision,
-         "message" => current["message"],
-         "files" => current["files"],
-         "seen" => Resources.seen?(engine, key, record)
-       }
-       |> put("session", Map.get(record, :session_handle))
-       |> put("created_at_ms", Map.get(record, :accepted_at))
-       |> put("legacy_message_id", if(!Map.get(record, :agent_api_v2, false), do: id))
-       |> put("terminal", terminal(engine, scope, record))
-       |> put("availability", availability(engine, person, agent, record))
-       |> put("advisories", advisories(engine, scope, key))
-       |> put("result", Resources.origin_result(record))}
+      Projection.run({:item, Resources.item_id(record)}, fn ->
+        {:ok,
+         %{
+           "item_id" => Resources.item_id(record),
+           "rev" => rev,
+           "sender" => sender,
+           "revision" => request_revision,
+           "message" => current["message"],
+           "files" => current["files"],
+           "seen" => Resources.seen?(engine, key, record)
+         }
+         |> put("session", Map.get(record, :session_handle))
+         |> put("created_at_ms", Map.get(record, :accepted_at))
+         |> put("legacy_message_id", if(!Map.get(record, :agent_api_v2, false), do: id))
+         |> put("terminal", terminal(engine, scope, record))
+         |> put("availability", availability(engine, person, agent, record))
+         |> put("advisories", advisories(engine, scope, key))
+         |> put("result", Resources.origin_result(record))}
+      end)
     end
   end
 
@@ -150,12 +152,14 @@ defmodule AttentionServer.ClientAPI.AgentResources do
           _ -> nil
         end
 
-      {:ok,
-       raw
-       |> enrich_delivery(state.store.engine, scope)
-       |> Resources.put_at(at)
-       |> Resources.stamp(rev)
-       |> then(&Resources.render(:entry, &1, nil))}
+      Projection.run({:entry, Resources.entry_id(position)}, fn ->
+        {:ok,
+         raw
+         |> enrich_delivery(state.store.engine, scope)
+         |> Resources.put_at(at)
+         |> Resources.stamp(rev)
+         |> then(&Resources.render(:entry, &1, nil))}
+      end)
     end
   end
 
