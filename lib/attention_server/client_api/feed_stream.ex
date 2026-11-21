@@ -149,11 +149,8 @@ defmodule AttentionServer.ClientAPI.FeedStream do
       {:DOWN, ref, :process, _pid, _reason} when ref == state.relay ->
         closing(conn, state, "server_shutdown")
 
-      {:client_api_show, _device_key, held} ->
-        case chunk_safely(conn, show_event(held)) do
-          {:ok, conn} -> wait(conn, state)
-          {:error, _reason} -> finish(conn, state, "client_closed")
-        end
+      {:client_api_show, device_key, id} when device_key == state.ctx.principal.key ->
+        write_pending_show(conn, state, id)
 
       {:feed_heartbeat, ref} when ref == state.timer ->
         case chunk_safely(conn, "event: heartbeat\ndata: {}\n\n") do
@@ -193,17 +190,34 @@ defmodule AttentionServer.ClientAPI.FeedStream do
 
   defp flush_shows do
     receive do
-      {:client_api_show, _device_key, _held} -> flush_shows()
+      {:client_api_show, _device_key, _id} -> flush_shows()
     after
       0 -> :ok
     end
   end
 
-  # held_ms is the show's age at the moment it is written (round 11 r4 §4).
-  @doc false
-  def show_event(held) do
-    data = Focus.wire(held, System.system_time(:millisecond))
-    ["event: show\ndata: ", JSON.encode!(data), "\n\n"]
+  defp write_pending_show(conn, state, id) do
+    case pending_show(state.ctx, id) do
+      nil ->
+        wait(conn, state)
+
+      {:error, :server_shutdown} ->
+        closing(conn, state, "server_shutdown")
+
+      data ->
+        event = ["event: show\ndata: ", JSON.encode!(data), "\n\n"]
+
+        case chunk_safely(conn, event) do
+          {:ok, conn} -> wait(conn, state)
+          {:error, _reason} -> finish(conn, state, "client_closed")
+        end
+    end
+  end
+
+  defp pending_show(ctx, id) do
+    Focus.pending_show(ctx.relay, ctx.principal, id)
+  catch
+    :exit, _reason -> {:error, :server_shutdown}
   end
 
   defp send_changes(conn, []), do: {:ok, conn}

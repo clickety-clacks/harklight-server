@@ -16,12 +16,12 @@ defmodule AttentionServer.ClientAPI.Focus do
   is the show's age when it is written.
 
   The feed (C5) calls `subscribe_shows/1` for a device principal and then
-  receives `{:client_api_show, device_key, held}` for each show held for it.
-  It writes `wire(held, now)` as an id-less `event: show`, so `held_ms` is the
-  show's age at the moment it is written (round 11 r4 §4).
+  receives `{:client_api_show, device_key, show_id}` for each show held for it.
+  The feed resolves the ID against current relay state just before writing
+  the id-less event, when it computes the show's age (round 11 r4 §4).
   """
 
-  alias AttentionServer.ClientAPI.{Resources, Writes}
+  alias AttentionServer.ClientAPI.{Reads, Resources, Writes}
 
   @registry AttentionServer.ChangeLog.Registry
 
@@ -43,31 +43,38 @@ defmodule AttentionServer.ClientAPI.Focus do
     do: Registry.unregister(@registry, {:client_api_show, device_key})
 
   @doc false
-  # Called by the Relay when it holds a show; sends it to the device's open
-  # feeds. With no feed open, or the registry not running, it does nothing.
-  def held(engine, device_key, held, _now) do
+  # A notification carries only the ID. The held show stays in the relay.
+  def notify_show(device_key, held) do
     if Process.whereis(@registry) do
       Registry.dispatch(@registry, {:client_api_show, device_key}, fn entries ->
-        case show(engine, device_key, held, Map.fetch!(held, "accepted_at")) do
-          nil ->
-            :ok
-
-          show ->
-            message = %{show: Map.delete(show, "held_ms"), accepted_at: held["accepted_at"]}
-            for {pid, _} <- entries, do: send(pid, {:client_api_show, device_key, message})
-        end
+        id = show_id(device_key, held)
+        for {pid, _} <- entries, do: send(pid, {:client_api_show, device_key, id})
       end)
     end
 
     :ok
   end
 
-  @doc """
-  The `show` event data for a held show received by a feed, with `held_ms`
-  computed at `now`, the moment the feed writes it.
-  """
-  def wire(%{show: show, accepted_at: accepted_at}, now) when is_integer(now),
-    do: Map.put(show, "held_ms", max(now - accepted_at, 0))
+  @doc "Reads a notified show if it is still held for the authenticated device."
+  def pending_show(relay, principal, id),
+    do:
+      GenServer.call(relay, {:client_api, __MODULE__, {:pending_show, principal, id}}, :infinity)
+
+  @doc false
+  def handle_call({:pending_show, principal, id}, _from, state) do
+    engine = state.store.engine
+
+    data =
+      with {:ok, %{kind: :device, key: key}} <- Reads.client_principal(engine, principal),
+           %{} = held <- Map.get(state.held_shows, key),
+           ^id <- show_id(key, held) do
+        show(engine, key, held, state.clock.())
+      else
+        _ -> nil
+      end
+
+    {:reply, data, state}
+  end
 
   @doc "The wire form of a held show for `device_key`, or nil if its item is gone."
   def show(engine, device_key, %{"accepted_at" => accepted_at} = held, now) do
