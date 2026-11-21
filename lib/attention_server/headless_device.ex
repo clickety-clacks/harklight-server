@@ -7,9 +7,11 @@ defmodule AttentionServer.HeadlessDevice do
   uncertain network result can be retried with the same semantics.
 
   With the temporary `client_api_v2` flag on (`endpoint.client_api_v2`), both
-  speak client API v2 instead. `read` pages through `GET /v2/inbox`, stores
-  every item under `v2/`, and only then stores the cursor, the first page's
-  `rev`. `respond` resolves `--sender`/`--message-id` to the item delivered to
+  speak client API v2 instead. The first `read` pages through `GET /v2/inbox`,
+  stores every item under `v2/`, and only then stores the cursor, the first
+  page's `rev`. Later reads fetch the JSON change batch after that cursor,
+  storing each batch before advancing it; `410 cursor_expired` means a fresh
+  snapshot. `respond` resolves `--sender`/`--message-id` to the item delivered to
   this device, stores the exact answer body with a fresh `Idempotency-Key`,
   and only then sends `POST /v2/items/{item_id}/answer`.
   """
@@ -24,8 +26,10 @@ defmodule AttentionServer.HeadlessDevice do
   # accepted by the server, so allow two protocol-sized requests plus metadata.
   @max_server_frame 2 * @max_server_request_frame + 16_384
 
-  # Inbox page size for client API v2 reads (the contract's maximum).
+  # Inbox page size and change-batch size for client API v2 reads (the
+  # contract's maxima).
   @v2_page_limit 200
+  @v2_batch_limit 500
 
   def read(directory, %{client_api_v2: true} = endpoint), do: v2_read(directory, endpoint)
 
@@ -122,17 +126,116 @@ defmodule AttentionServer.HeadlessDevice do
   # A full snapshot: every inbox page, stored, then the cursor. The cursor is
   # the first page's rev, so anything that moved while paging is after it
   # (spec §5.1, rebaseline). Items no longer in the inbox are dropped.
+  # With a stored cursor, read forward with the JSON change batch; without one,
+  # or when the server says the cursor expired, take a full snapshot.
   defp v2_read(directory, endpoint) do
     identity = {Path.join(directory, "identity.pem"), Path.join(directory, "identity.key")}
-    limit = Map.get(endpoint, :v2_page_limit, @v2_page_limit)
 
     with {:ok, _} <- enrolled_identity(directory, endpoint),
-         {:ok, rev, items} <- v2_inbox(endpoint, identity, limit, nil, nil, %{}),
-         :ok <- private_directory(Path.join(directory, "v2")),
-         items = items |> Map.values() |> Enum.sort_by(&get_in(&1, ["rank", "key"])),
-         :ok <- write_private(Path.join([directory, "v2", "items.json"]), %{"items" => items}),
-         :ok <- write_private(Path.join([directory, "v2", "cursor.json"]), %{"rev" => rev}) do
-      {:ok, %{"rev" => rev, "items" => items}}
+         :ok <- private_directory(Path.join(directory, "v2")) do
+      case v2_held(directory) do
+        {:ok, rev, items, tombstones} ->
+          case v2_forward(directory, endpoint, identity, rev, items, tombstones) do
+            {:error, :cursor_expired} -> v2_snapshot(directory, endpoint, identity)
+            other -> other
+          end
+
+        :none ->
+          v2_snapshot(directory, endpoint, identity)
+      end
+    end
+  end
+
+  defp v2_snapshot(directory, endpoint, identity) do
+    limit = Map.get(endpoint, :v2_page_limit, @v2_page_limit)
+
+    with {:ok, rev, items} <- v2_inbox(endpoint, identity, limit, nil, nil, %{}),
+         :ok <- v2_store(directory, rev, items, %{}) do
+      {:ok, %{"rev" => rev, "items" => v2_ordered(items)}}
+    end
+  end
+
+  # Each batch is gap-free, so it is stored and only then is the cursor
+  # advanced to its rev (spec §5.1). Changes are applied by the version rule:
+  # an item replaces what is held only at a higher rev, and a removal leaves a
+  # tombstone. Entries, counts and settings are not kept here; the cursor still
+  # moves past them.
+  defp v2_forward(directory, endpoint, identity, rev, items, tombstones) do
+    limit = Map.get(endpoint, :v2_batch_limit, @v2_batch_limit)
+
+    case HeadlessTLS.v2_get(endpoint, identity, "/v2/changes?after=#{rev}&limit=#{limit}") do
+      {:ok, 200, %{"changes" => changes, "rev" => next, "more" => more}}
+      when is_list(changes) and is_integer(next) and next >= rev and is_boolean(more) ->
+        with {:ok, items, tombstones} <- v2_apply(changes, items, tombstones),
+             :ok <- v2_store(directory, next, items, tombstones) do
+          if more,
+            do: v2_forward(directory, endpoint, identity, next, items, tombstones),
+            else: {:ok, %{"rev" => next, "items" => v2_ordered(items)}}
+        end
+
+      {:ok, 410, %{"error" => "cursor_expired"}} ->
+        {:error, :cursor_expired}
+
+      {:ok, _status, %{"error" => token} = error} when is_binary(token) ->
+        {:error, {:server, error}}
+
+      {:ok, _status, _body} ->
+        {:error, :invalid_v2_response}
+
+      error ->
+        error
+    end
+  end
+
+  defp v2_apply(changes, items, tombstones) do
+    Enum.reduce_while(changes, {:ok, items, tombstones}, fn
+      %{"kind" => "item", "rev" => rev, "data" => %{"item_id" => id} = item}, {:ok, items, dead}
+      when is_integer(rev) and is_binary(id) ->
+        held = max(get_in(items, [id, "rev"]) || 0, Map.get(dead, id, 0))
+
+        if rev > held,
+          do: {:cont, {:ok, Map.put(items, id, item), Map.delete(dead, id)}},
+          else: {:cont, {:ok, items, dead}}
+
+      %{"kind" => "item_removed", "rev" => rev, "data" => %{"item_id" => id}}, {:ok, items, dead}
+      when is_integer(rev) and is_binary(id) ->
+        if rev > (get_in(items, [id, "rev"]) || 0),
+          do:
+            {:cont,
+             {:ok, Map.delete(items, id), Map.put(dead, id, max(rev, Map.get(dead, id, 0)))}},
+          else: {:cont, {:ok, items, dead}}
+
+      %{"kind" => kind, "rev" => rev}, acc when is_binary(kind) and is_integer(rev) ->
+        {:cont, acc}
+
+      _change, _acc ->
+        {:halt, {:error, :invalid_v2_response}}
+    end)
+  end
+
+  defp v2_store(directory, rev, items, tombstones) do
+    with :ok <-
+           write_private(Path.join([directory, "v2", "items.json"]), %{
+             "items" => v2_ordered(items),
+             "tombstones" => tombstones
+           }),
+         do: write_private(Path.join([directory, "v2", "cursor.json"]), %{"rev" => rev})
+  end
+
+  defp v2_ordered(items), do: items |> Map.values() |> Enum.sort_by(&get_in(&1, ["rank", "key"]))
+
+  # The held state: the cursor and the items stored before it. Anything
+  # unreadable means no usable cursor, so the next read is a snapshot.
+  defp v2_held(directory) do
+    with {:ok, %{"rev" => rev}} when is_integer(rev) and rev >= 0 <-
+           read_json(Path.join([directory, "v2", "cursor.json"])),
+         {:ok, %{"items" => items} = held} when is_list(items) <-
+           read_json(Path.join([directory, "v2", "items.json"])),
+         true <- Enum.all?(items, &v2_item?/1),
+         tombstones when is_map(tombstones) <- Map.get(held, "tombstones", %{}) do
+      {:ok, rev, Map.new(items, &{&1["item_id"], &1}), tombstones}
+    else
+      _ -> :none
     end
   end
 
