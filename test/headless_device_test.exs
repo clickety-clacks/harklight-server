@@ -88,9 +88,11 @@ defmodule AttentionServer.HeadlessDeviceTest do
         {name, identity}
       end)
 
+    # These are linked to the test process, so they may already be shutting
+    # down when on_exit runs; stopping one that is mid-exit is not a failure.
     on_exit(fn ->
-      if Process.alive?(web), do: GenServer.stop(web)
-      if Process.alive?(relay), do: GenServer.stop(relay)
+      stop_quietly(web)
+      stop_quietly(relay)
     end)
 
     %{
@@ -470,5 +472,11 @@ defmodule AttentionServer.HeadlessDeviceTest do
     assert {:ok, line} = Relay.request_line(relay, key, JSON.encode!(frame) <> "\n")
     assert {:ok, response} = JSON.decode_line(line)
     response
+  end
+
+  defp stop_quietly(pid) do
+    if Process.alive?(pid), do: GenServer.stop(pid)
+  catch
+    :exit, _reason -> :ok
   end
 end
