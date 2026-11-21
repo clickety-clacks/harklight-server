@@ -268,6 +268,7 @@ Schemas use JSON Schema 2020-12. `$ref`s point into the `$defs` below.
       "type": "object",
       "required": ["account", "features", "limits"],
       "properties": {
+        "sender_names": { "type": "array", "items": { "type": "string" }, "description": "On an enrolled key, its authorized sender names and slash-terminated prefixes" },
         "account": {
           "type": "object",
           "required": ["state"],
@@ -880,6 +881,7 @@ agents with existing data. Clients apply newer versions of each resource.
 ```json
 {
   "$defs": {
+    "AgentSession": { "type": "string", "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$" },
     "AgentTerminal": {
       "type": "object",
       "required": ["state", "at_ms"],
@@ -896,7 +898,7 @@ agents with existing data. Clients apply newer versions of each resource.
         "item_id": { "$ref": "#/$defs/OpaqueId" },
         "rev": { "$ref": "#/$defs/Rev" },
         "sender": { "type": "string" },
-        "session": { "type": "string", "format": "uuid" },
+        "session": { "$ref": "#/$defs/AgentSession" },
         "revision": { "type": "integer", "minimum": 1 },
         "message": { "type": "object", "description": "Current admitted sender content" },
         "files": { "type": "array", "items": { "$ref": "#/$defs/FileRef" } },
@@ -1037,7 +1039,7 @@ also include the message or entry affected by the same transaction.
       "additionalProperties": false,
       "properties": {
         "sender": { "type": "string" },
-        "session": { "type": "string", "format": "uuid" },
+        "session": { "$ref": "#/$defs/AgentSession" },
         "message": { "type": "object" },
         "file_ids": { "$ref": "#/$defs/AgentFileIds" }
       }
@@ -1210,7 +1212,7 @@ first page's position, and reopen.
       "required": ["advisory_id", "advisory_type", "request_revision", "text"],
       "properties": {
         "advisory_id": { "$ref": "#/$defs/OpaqueId" },
-        "advisory_type": { "enum": ["unseen_interval_elapsed", "possible_contradiction", "clear_contradiction"] },
+        "advisory_type": { "enum": ["unseen_interval_elapsed"] },
         "request_revision": { "type": "integer", "minimum": 1 },
         "text": { "type": "string" },
         "accepted_at_ms": { "$ref": "#/$defs/TimeMs" },
