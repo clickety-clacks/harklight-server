@@ -241,6 +241,194 @@ defmodule AttentionServer.ClientAPIWritesTest do
     end
   end
 
+  defp agent_reply(relay, id, operation, to, text) do
+    assert %{"type" => "ok", "seq" => seq} =
+             request(relay, "origin", %{
+               "type" => "conversation_reply",
+               "op_id" => op(operation),
+               "sender_id" => "app:test",
+               "message_id" => id,
+               "request_revision" => 1,
+               "in_reply_to" => to,
+               "text" => text
+             })
+
+    AttentionServer.ClientAPI.Resources.entry_id(seq)
+  end
+
+  defp person_note(relay, id, operation, text) do
+    assert %{"type" => "ok", "event_id" => event, "seq" => seq} =
+             request(relay, "reader", %{
+               "type" => "discussion",
+               "op_id" => op(operation),
+               "sender_id" => "app:test",
+               "message_id" => id,
+               "request_revision" => 1,
+               "text" => text
+             })
+
+    {String.to_integer(event), AttentionServer.ClientAPI.Resources.entry_id(seq)}
+  end
+
+  describe "POST /v2/items/{item_id}/replies" do
+    test "a reply returns the item and the new entry, and emits the entry's change row",
+         %{path: path, flags: flags} do
+      relay = scripted_relay(path, flags)
+      one = item_id(relay, "one")
+      {:ok, before} = head(relay)
+
+      assert {:ok, 200, body, false} =
+               Writes.reply(relay, "reader", one, "Can you say more?", key())
+
+      assert Schema.errors(Schema.contract_defs(@contract), "WriteResult", body) == []
+      assert %{"rev" => position, "item" => %{"item_id" => ^one}, "entry" => entry} = body
+
+      assert %{"item_id" => ^one, "kind" => "reply", "author" => "person"} = entry
+      assert entry["text"] == "Can you say more?"
+      assert entry["rev"] > before and entry["rev"] <= position
+
+      {:ok, seq} = AttentionServer.ClientAPI.Resources.entry_seq(entry["entry_id"])
+      changes = changes_after(relay, before)
+      assert Enum.any?(changes, &(&1.resource_id == ChangeLog.entry_resource(seq)))
+
+      assert {:ok, %{"entries" => entries}} = Reads.entries(relay, "reader", one)
+      assert List.last(entries) == entry
+      GenServer.stop(relay)
+    end
+
+    test "replies are accepted in every item state, to an agent that is not listening",
+         %{path: path, flags: flags} do
+      relay = scripted_relay(path, flags)
+
+      for {id, n} <- [{"answered", 40}, {"cleared", 41}, {"retracted", 42}],
+          do: forward(relay, id, n)
+
+      assert %{"type" => "ok"} =
+               request(relay, "reader", %{
+                 "type" => "answer",
+                 "op_id" => op(50),
+                 "sender_id" => "app:test",
+                 "message_id" => "answered",
+                 "request_revision" => 1,
+                 "answer" => nil
+               })
+
+      assert %{"type" => "ok"} =
+               request(relay, "origin", %{
+                 "type" => "lifecycle",
+                 "op_id" => op(51),
+                 "sender_id" => "app:test",
+                 "message_id" => "cleared",
+                 "state" => "cleared",
+                 "at" => 5
+               })
+
+      assert %{"type" => "ok", "state" => "retracted"} =
+               request(relay, "origin", %{
+                 "type" => "conversation_withdraw",
+                 "op_id" => op(52),
+                 "sender_id" => "app:test",
+                 "message_id" => "retracted"
+               })
+
+      # The agent stops listening; chat stays open and the reply is held for it.
+      assert :ok = Relay.origin_session_gone(relay, "origin", @handle)
+
+      for id <- ["one", "answered", "cleared", "retracted"] do
+        item = item_id(relay, id)
+        assert {:ok, %{"item" => before}} = Reads.item(relay, "reader", item)
+        assert before["availability"]["state"] in ["not_listening", "gone", "unsupported"]
+
+        assert {:ok, 200, %{"entry" => %{"text" => "Still there?"}}, false} =
+                 Writes.reply(relay, "reader", item, "Still there?", key())
+      end
+
+      GenServer.stop(relay)
+    end
+
+    test "a repeated reply is replayed, not posted twice; files wait for uploads",
+         %{path: path, flags: flags} do
+      relay = scripted_relay(path, flags)
+      one = item_id(relay, "one")
+      k = key()
+      assert {:ok, 200, first, false} = Writes.reply(relay, "reader", one, "Once", k)
+      assert {:ok, 200, ^first, true} = Writes.reply(relay, "reader", one, "Once", k)
+
+      assert {:error, "idempotency_conflict", nil, false} =
+               Writes.reply(relay, "reader", one, "Twice", k)
+
+      assert {:ok, %{"entries" => entries}} = Reads.entries(relay, "reader", one)
+      assert Enum.count(entries, &(&1["text"] == "Once")) == 1
+
+      assert {:error, "unsupported", "file_ids", false} =
+               Writes.reply(relay, "reader", one, "See file", ["fu1"], key())
+
+      assert {:error, "invalid_field", "text", false} =
+               Writes.reply(relay, "reader", one, "", key())
+
+      GenServer.stop(relay)
+    end
+  end
+
+  describe "PUT /v2/items/{item_id}/read-position" do
+    test "max-wins by position, through the newest agent reply at or before the entry",
+         %{path: path, flags: flags} do
+      relay = scripted_relay(path, flags)
+      one = item_id(relay, "one")
+      {note, note_entry} = person_note(relay, "one", 60, "Question")
+      first = agent_reply(relay, "one", 61, note, "First answer")
+      second = agent_reply(relay, "one", 62, note, "Second answer")
+      {_, later_note} = person_note(relay, "one", 63, "Thanks")
+
+      assert {:ok, %{"item" => %{"chat" => chat}}} = Reads.item(relay, "reader", one)
+      assert chat["read_position"] == nil
+
+      assert {:ok, 200, %{"item" => %{"chat" => %{"read_position" => ^first}}} = body, false} =
+               Writes.read_position(relay, "reader", one, first)
+
+      assert body["rev"] >= body["item"]["rev"]
+
+      # At or below the current position: 200 with the unchanged item, nothing written.
+      {:ok, position} = head(relay)
+
+      for entry <- [first, note_entry] do
+        assert {:ok, 200, %{"rev" => ^position, "item" => item}, false} =
+                 Writes.read_position(relay, "reader", one, entry)
+
+        assert item["chat"]["read_position"] == first
+      end
+
+      assert head(relay) == {:ok, position}
+
+      # A later entry of the person's own reads through the newest agent reply before it.
+      assert {:ok, 200, %{"item" => %{"chat" => %{"read_position" => ^second}}}, false} =
+               Writes.read_position(relay, "reader", one, later_note, key())
+
+      assert {:ok, %{"item" => %{"chat" => %{"read_position" => ^second}}}} =
+               Reads.item(relay, "reader", one)
+
+      GenServer.stop(relay)
+    end
+
+    test "an entry of another item, or no entry, is invalid_field", %{path: path, flags: flags} do
+      relay = scripted_relay(path, flags)
+      one = item_id(relay, "one")
+      two = item_id(relay, "two")
+      {note, _} = person_note(relay, "one", 70, "Question")
+      reply = agent_reply(relay, "one", 71, note, "Answer")
+
+      assert {:error, "invalid_field", "entry_id", false} =
+               Writes.read_position(relay, "reader", two, reply)
+
+      for bad <- ["e999", "x1", "e0"] do
+        assert {:error, "invalid_field", "entry_id", false} =
+                 Writes.read_position(relay, "reader", one, bad)
+      end
+
+      GenServer.stop(relay)
+    end
+  end
+
   describe "HTTP" do
     defp post(relay, path_info, body, headers) do
       conn =
