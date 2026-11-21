@@ -283,6 +283,19 @@ an APNs request; after adding the Production settings, the device must register
 a higher revision to clear that binding. FCM is unsupported.
 
 An enrolled app registers its own current address over the authenticated relay.
+With `client_api_v2` enabled, the full provider attempt has a provisional
+20,000 ms deadline, including connection setup and any provider-token refresh.
+Set `ATTENTION_SERVER_APNS_ATTEMPT_TIMEOUT_MS` in `server.env` to override it.
+Use a positive integer in milliseconds within the runtime timer range.
+An invalid value uses the provisional default. The Server logs each provider
+attempt's elapsed milliseconds and outcome as `harklight_apns_attempt` to inform
+future tuning.
+
+When the deadline expires, the Server stops the attempt, keeps the notification
+queued for the existing retry schedule, and moves on to other eligible devices.
+APNs may have accepted the interrupted request, so a retry can produce a
+duplicate alert. The message stays in the durable store.
+
 For an APNs alert about a single pending request, the alert title is the supplied
 `display_name`; when absent, it is the message's exact `sender_id`. An explicitly
 supplied empty string stays empty. The name is carried whole when it fits with
