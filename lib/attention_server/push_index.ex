@@ -1,10 +1,12 @@
 defmodule AttentionServer.PushIndex do
   @moduledoc false
 
-  defstruct people: %{}, addresses: %{}, queued: {0, nil}, claims: {0, nil}
+  defstruct people: %{}, addresses: %{}, stopped: MapSet.new(), queued: {0, nil}, claims: {0, nil}
 
-  def build(bindings) do
-    Enum.reduce(bindings, %__MODULE__{}, fn {key, binding}, index ->
+  def build(bindings, delivery_states) do
+    stopped = for {person, "STOPPED"} <- delivery_states, into: MapSet.new(), do: person
+
+    Enum.reduce(bindings, %__MODULE__{stopped: stopped}, fn {key, binding}, index ->
       update(index, key, nil, binding)
     end)
   end
@@ -26,24 +28,34 @@ defmodule AttentionServer.PushIndex do
     |> expired_keys(cutoff, [])
   end
 
-  def ready(index, now, eligible?) do
-    first_ready(:gb_trees.iterator(index.queued), now, eligible?)
+  def ready(index, now) do
+    case :gb_trees.next(:gb_trees.iterator(index.queued)) do
+      {{at, key}, true, _next} when at <= now -> key
+      _ -> nil
+    end
+  end
+
+  def set_stopped(nil, _person, _stopped, _bindings), do: nil
+
+  def set_stopped(index, person, stopped?, bindings) do
+    queued =
+      Enum.reduce(keys(index, person), index.queued, fn key, tree ->
+        at = queued_at(Map.fetch!(bindings, key))
+        if stopped?, do: drop_deadline(tree, at, key), else: put_deadline(tree, at, key)
+      end)
+
+    stopped =
+      if stopped?,
+        do: MapSet.put(index.stopped, person),
+        else: MapSet.delete(index.stopped, person)
+
+    %{index | queued: queued, stopped: stopped}
   end
 
   defp expired_keys(iter, cutoff, keys) do
     case :gb_trees.next(iter) do
       {{at, key}, true, next} when at <= cutoff -> expired_keys(next, cutoff, [key | keys])
       _ -> keys
-    end
-  end
-
-  defp first_ready(iter, cutoff, eligible?) do
-    case :gb_trees.next(iter) do
-      {{at, {person, _} = key}, true, next} when at <= cutoff ->
-        if eligible?.(person), do: key, else: first_ready(next, cutoff, eligible?)
-
-      _ ->
-        nil
     end
   end
 
@@ -54,7 +66,7 @@ defmodule AttentionServer.PushIndex do
       index
       | people: Map.put(index.people, person, MapSet.put(keys, key)),
         addresses: Map.put(index.addresses, address, key),
-        queued: put_deadline(index.queued, queued_at(binding), key),
+        queued: put_deadline(index.queued, eligible_at(index, person, binding), key),
         claims: put_deadline(index.claims, claimed_at(binding), key)
     }
   end
@@ -79,6 +91,10 @@ defmodule AttentionServer.PushIndex do
   end
 
   defp remove(index, _person, _key, _binding), do: index
+
+  defp eligible_at(index, person, binding) do
+    if not MapSet.member?(index.stopped, person), do: queued_at(binding)
+  end
 
   defp queued_at(%{state: state, next_at: at} = binding)
        when state in ["queued", "waiting_retry"] and is_integer(at) do

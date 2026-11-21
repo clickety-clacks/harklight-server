@@ -28,7 +28,9 @@ defmodule AttentionServer.Placement do
 
   def reassess(%Engine{} = engine, person, previous) do
     case algorithm(choice(engine, person)) do
-      nil -> :none
+      nil ->
+        :none
+
       implementation ->
         implementation.reassess(ranking_message_items(engine, person), previous || [])
     end
@@ -119,7 +121,7 @@ defmodule AttentionServer.Placement do
     do: Map.get(engine.algorithm_choices, person, "baseline")
 
   def items(%Engine{} = engine, person) do
-    engine.messages
+    pending_records(engine, person)
     |> Enum.flat_map(fn
       {{^person, sender, id}, %{terminal: nil} = record} ->
         message = record.message
@@ -145,6 +147,15 @@ defmodule AttentionServer.Placement do
     end)
   end
 
+  defp pending_records(%{route_b_index: %{request_keys_by_id: lookup} = index} = engine, person)
+       when is_map(lookup) do
+    index
+    |> AttentionServer.RouteBIndex.pending_messages(person)
+    |> Stream.map(fn {_, key} -> {key, Map.fetch!(engine.messages, key)} end)
+  end
+
+  defp pending_records(engine, _person), do: engine.messages
+
   # Ranking and normal rows share one traversal of retained conversation events.
   # The summary is ephemeral; complete history remains in the existing engine.
   def ranking_projection(%Engine{} = engine, person) do
@@ -160,7 +171,7 @@ defmodule AttentionServer.Placement do
 
   defp reply_projection(engine, person) do
     {items, groups} =
-      Enum.reduce(engine.conversation_events, {[], %{}}, fn
+      Enum.reduce(origin_reply_records(engine, person), {[], %{}}, fn
         {{^person, seq}, %{key: key, payload: %{"kind" => "reply", "author" => "origin"} = reply}},
         {items, groups} ->
           {_, sender, id} = key
@@ -216,6 +227,21 @@ defmodule AttentionServer.Placement do
 
     {Enum.sort_by(items, & &1.identity), groups}
   end
+
+  defp origin_reply_records(
+         %{route_b_index: %{request_keys_by_id: lookup} = index} = engine,
+         person
+       )
+       when is_map(lookup) do
+    index
+    |> AttentionServer.RouteBIndex.origin_replies(person)
+    |> Stream.map(fn {seq, _} ->
+      address = {person, seq}
+      {address, Map.fetch!(engine.conversation_events, address)}
+    end)
+  end
+
+  defp origin_reply_records(engine, _person), do: engine.conversation_events
 
   # The engine's mixed order supplies group positions; choose the highest
   # scored unseen member, then collapse the chat and group message threads.

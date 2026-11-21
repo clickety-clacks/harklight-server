@@ -2045,6 +2045,81 @@ defmodule AttentionServer.Store.EngineTransitionTest do
     GenServer.stop(reopened)
   end
 
+  test "keyed pause removes one account from ready claims and a badge excludes progress" do
+    path = legacy_store_path()
+    opts = [store_path: path, store_mode: :keyed_cutover]
+    {:ok, relay} = Relay.start_link(opts)
+    :ok = Relay.enable_push(relay)
+    {:ok, paused_person} = Relay.hosted_account_create(relay, "paused-push")
+    paused_device = String.duplicate("e", 64)
+    :ok = Relay.setup_device(relay, paused_person, paused_device)
+    :ok = Relay.setup_sender(relay, paused_device, @sender)
+
+    for {key, n, address} <- [{paused_device, 171, "ab"}, {@reader, 172, "cd"}] do
+      assert %{"type" => "ok"} =
+               priority_request(relay, key, n, %{
+                 "v" => 1,
+                 "type" => "push_register",
+                 "revision" => 1,
+                 "profile_id" => "harklight-sandbox",
+                 "address_kind" => "apns_token",
+                 "address" => String.duplicate(address, 32)
+               })
+    end
+
+    {:ok, forward} = JSON.decode_line(forward_line())
+    assert %{"type" => "ok"} = priority_request(relay, paused_device, 173, forward)
+    assert %{"type" => "ok"} = priority_request(relay, @origin, 174, forward)
+
+    seen = %{
+      "schema" => "attention-client.actions/1",
+      "actions" => [
+        %{
+          "id" => "seen",
+          "label" => "Seen",
+          "kind" => "value",
+          "value" => %{"acknowledgment" => "seen"}
+        }
+      ]
+    }
+
+    progress =
+      Map.merge(forward["message"], %{
+        "message_id" => "progress",
+        "message_type" => "fyi",
+        "answer_ui" => seen,
+        "progress" => %{"percent" => 100, "stage" => "done", "segments" => []}
+      })
+
+    assert %{"type" => "ok"} =
+             priority_request(relay, @origin, 175, Map.put(forward, "message", progress))
+
+    assert {:ok, %{state: "STOPPED"}} =
+             Relay.hosted_delivery_state(relay, paused_person, "STOPPED")
+
+    %{engine: engine} = :sys.get_state(relay).store
+    index = engine.route_b_index
+    assert [{{_, {@person, @reader}}, true}] = :gb_trees.to_list(index.push_bindings.queued)
+    assert AttentionServer.RouteBIndex.push_badge(index, @person) == 1
+    now = System.system_time(:millisecond) + 1000
+    assert {:ok, %{device: @reader, badge: 1} = claim} = Relay.claim_push(relay, now)
+    assert :ok = Relay.finish_push(relay, claim, %{state: "provider_accepted"}, now)
+    assert {:ok, nil} = Relay.claim_push(relay, now)
+    GenServer.stop(relay)
+
+    {:ok, relay} = Relay.start_link(opts)
+    :ok = Relay.enable_push(relay)
+    assert {:ok, nil} = Relay.claim_push(relay, now)
+
+    assert {:ok, %{state: "RESTORED"}} =
+             Relay.hosted_delivery_state(relay, paused_person, "RESTORED")
+
+    assert {:ok, %{device: ^paused_device, person: ^paused_person, badge: 1}} =
+             Relay.claim_push(relay, now)
+
+    GenServer.stop(relay)
+  end
+
   defp enrollment_certificate(name) do
     %{cert: der} =
       :public_key.pkix_test_root_cert(String.to_charlist(name), key: {:namedCurve, :secp256r1})
@@ -2089,12 +2164,21 @@ defmodule AttentionServer.Store.EngineTransitionTest do
       engine.route_b_index
       |> Map.update!(:resolved_messages_by_person, &ordered_rows/1)
       |> Map.update!(:conversations_by_item, &ordered_rows/1)
+      |> Map.update!(:pending_messages_by_person, &ordered_rows/1)
+      |> Map.update!(:origin_replies_by_person, &ordered_rows/1)
       |> Map.update!(:sent_messages_by_agent, &ordered_rows/1)
       |> Map.update!(:agent_entry_pages, &ordered_rows/1)
       |> Map.update!(:messages_by_origin_session, fn origins ->
         Map.new(origins, fn {origin, sessions} -> {origin, sorted_lists(sessions)} end)
       end)
       |> Map.update!(:request_keys_by_id, &sorted_lists/1)
+      |> Map.update!(:push_bindings, fn index ->
+        %{
+          index
+          | queued: :gb_trees.to_list(index.queued),
+            claims: :gb_trees.to_list(index.claims)
+        }
+      end)
       |> Map.update!(
         :unresolved_count_by_person,
         &Map.reject(&1, fn {_, count} -> count == 0 end)

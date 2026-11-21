@@ -250,7 +250,7 @@ defmodule AttentionServer.Engine do
   defp next_push_candidate(engine, now_ms) do
     index = engine.route_b_index.push_bindings
 
-    if key = AttentionServer.PushIndex.ready(index, now_ms, &(not delivery_stopped?(engine, &1))) do
+    if key = AttentionServer.PushIndex.ready(index, now_ms) do
       {key, Map.fetch!(engine.push_bindings, key)}
     end
   end
@@ -773,7 +773,19 @@ defmodule AttentionServer.Engine do
       if Map.get(engine.delivery_states, person) == target_state do
         {:ok, engine, target_state}
       else
-        next = %{engine | delivery_states: Map.put(engine.delivery_states, person, target_state)}
+        push =
+          AttentionServer.PushIndex.set_stopped(
+            engine.route_b_index.push_bindings,
+            person,
+            target_state == "STOPPED",
+            engine.push_bindings
+          )
+
+        next =
+          engine
+          |> put_in([Access.key!(:route_b_index), :push_bindings], push)
+          |> put_row(:delivery_states, person, target_state)
+
         {:ok, next, target_state}
       end
     else
@@ -6443,6 +6455,21 @@ defmodule AttentionServer.Engine do
 
   # Unresolved deliveries gathered since the last push this device accepted
   # (or synced), newest first. One push covers all of them.
+  defp push_gathered_records(
+         %{route_b_index: %{request_keys_by_id: lookup}} = engine,
+         person,
+         device,
+         binding
+       )
+       when is_map(lookup) do
+    floor = max(binding.accepted_high, Map.get(engine.cursors, {person, device}, 0))
+
+    engine.route_b_index
+    |> RouteBIndex.pending_messages(person, binding.pending_high)
+    |> Stream.take_while(fn {seq, _} -> seq > floor end)
+    |> Enum.map(fn {_, key} -> {key, Map.fetch!(engine.messages, key)} end)
+  end
+
   defp push_gathered_records(engine, person, device, binding) do
     floor = max(binding.accepted_high, Map.get(engine.cursors, {person, device}, 0))
     high = binding.pending_high
@@ -6467,6 +6494,22 @@ defmodule AttentionServer.Engine do
     end
   end
 
+  defp push_chat_reply(
+         %{route_b_index: %{request_keys_by_id: lookup}} = engine,
+         person,
+         device,
+         binding
+       )
+       when is_map(lookup) do
+    engine.route_b_index
+    |> RouteBIndex.origin_replies(person, binding.pending_conversation_high)
+    |> Stream.take_while(fn {seq, _} -> seq > binding.accepted_conversation_high end)
+    |> Enum.find_value(fn {seq, key} ->
+      payload = Map.fetch!(engine.conversation_events, {person, seq}).payload
+      push_reply_for(engine, person, device, binding, key, payload)
+    end)
+  end
+
   defp push_chat_reply(engine, person, device, binding) do
     engine.conversation_events
     |> Enum.filter(fn
@@ -6478,19 +6521,27 @@ defmodule AttentionServer.Engine do
     end)
     |> Enum.sort_by(fn {{_, seq}, _} -> seq end, :desc)
     |> Enum.find_value(fn {_, %{key: key, payload: payload}} ->
-      case Map.get(engine.messages, key) do
-        %{origin: origin} = record when origin != device ->
-          if push_locator({key, record}, person, device, binding.binding_id),
-            do: {key, record, payload}
-
-        _ ->
-          nil
-      end
+      push_reply_for(engine, person, device, binding, key, payload)
     end)
+  end
+
+  defp push_reply_for(engine, person, device, binding, key, payload) do
+    case Map.get(engine.messages, key) do
+      %{origin: origin} = record when origin != device ->
+        if push_locator({key, record}, person, device, binding.binding_id),
+          do: {key, record, payload}
+
+      _ ->
+        nil
+    end
   end
 
   # The recipient's Inbox count as the server sees it: accepted requests with
   # no explicit action yet. Retracted and answered items are resolved.
+  defp inbox_badge(%{route_b_index: %{request_keys_by_id: lookup} = index}, person)
+       when is_map(lookup),
+       do: RouteBIndex.push_badge(index, person)
+
   defp inbox_badge(engine, person) do
     Enum.count(engine.messages, fn
       {{^person, _sender, _id}, %{terminal: nil, message: message}} ->

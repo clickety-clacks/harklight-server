@@ -6,7 +6,7 @@ defmodule AttentionServer.FreeOrder do
   # Sort units, then flatten: reply rows never split a parent thread.
   def list_items(engine, person, replies, summaries) do
     parents =
-      engine.messages
+      person_messages(engine, person)
       |> Enum.filter(fn {{p, _, _}, _} -> p == person end)
       |> Enum.group_by(fn {{_, sender, id}, record} ->
         original = Map.get(record, :revisions, %{}) |> Map.get(1, record.message)
@@ -62,6 +62,23 @@ defmodule AttentionServer.FreeOrder do
     |> Enum.sort_by(&elem(&1, 0))
     |> Enum.flat_map(&elem(&1, 1))
   end
+
+  defp person_messages(%{route_b_index: %{request_keys_by_id: lookup} = index} = engine, person)
+       when is_map(lookup) do
+    open =
+      index |> AttentionServer.RouteBIndex.pending_messages(person) |> Stream.map(&elem(&1, 1))
+
+    resolved =
+      index.resolved_messages_by_person
+      |> Map.get(person, :gb_trees.empty())
+      |> :gb_trees.values()
+
+    open
+    |> Stream.concat(resolved)
+    |> Stream.map(fn key -> {key, Map.fetch!(engine.messages, key)} end)
+  end
+
+  defp person_messages(engine, _person), do: engine.messages
 
   defp parent_order({{_, sender, id}, record}) do
     case Map.get(record, :free_order) do

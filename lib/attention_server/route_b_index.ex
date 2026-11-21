@@ -17,6 +17,9 @@ defmodule AttentionServer.RouteBIndex do
       request_keys_by_id: nil,
       covered_sessions_by_origin: %{},
       push_bindings: nil,
+      pending_messages_by_person: %{},
+      origin_replies_by_person: %{},
+      push_badges: %{},
       conversation_summary_by_item: %{},
       unresolved_count_by_person: %{}
     }
@@ -48,24 +51,42 @@ defmodule AttentionServer.RouteBIndex do
   end
 
   def enable_keyed_lookups(engine) do
+    start = %{
+      engine.route_b_index
+      | request_keys_by_id: %{},
+        pending_messages_by_person: %{},
+        origin_replies_by_person: %{},
+        push_badges: %{}
+    }
+
     index =
-      Enum.reduce(engine.messages, %{engine.route_b_index | request_keys_by_id: %{}}, fn
+      Enum.reduce(engine.messages, start, fn
         {key, record}, index ->
           index = put_request_key(index, key, nil)
+          index = put_pending_message(index, key, nil, record)
 
           if index.agent_feed?, do: index, else: put_session_message(index, key, nil, record)
       end)
 
     index =
+      Enum.reduce(engine.conversation_events, index, fn {{person, seq}, event}, acc ->
+        put_origin_reply(acc, person, seq, event.key, event.payload)
+      end)
+
+    index =
       index
       |> index_covered_sessions(engine.origin_sessions)
-      |> Map.put(:push_bindings, AttentionServer.PushIndex.build(engine.push_bindings))
+      |> index_push_bindings(engine)
 
     %{engine | route_b_index: index}
   end
 
   defp index_push_bindings(%{request_keys_by_id: lookup} = index, engine) when is_map(lookup) do
-    %{index | push_bindings: AttentionServer.PushIndex.build(engine.push_bindings)}
+    %{
+      index
+      | push_bindings:
+          AttentionServer.PushIndex.build(engine.push_bindings, engine.delivery_states)
+    }
   end
 
   defp index_push_bindings(index, _engine), do: index
@@ -170,6 +191,7 @@ defmodule AttentionServer.RouteBIndex do
     index = put_request_key(index, key, previous)
     index = put_session_message(index, key, previous, record)
     index = put_agent_message(index, key, previous, record)
+    index = put_pending_message(index, key, previous, record)
     previous_resolved? = match?(%{terminal: terminal} when not is_nil(terminal), previous)
     current_resolved? = not is_nil(record.terminal)
 
@@ -201,6 +223,71 @@ defmodule AttentionServer.RouteBIndex do
       put_in(index, [:unresolved_count_by_person, person], count)
     end
   end
+
+  def pending_messages(index, person, high \\ nil),
+    do: ordered_candidates(index.pending_messages_by_person, person, high)
+
+  def origin_replies(index, person, high \\ nil),
+    do: ordered_candidates(index.origin_replies_by_person, person, high)
+
+  def push_badge(index, person), do: Map.get(index.push_badges, person, 0)
+
+  defp ordered_candidates(trees, person, high) do
+    tree = Map.get(trees, person, :gb_trees.empty())
+
+    iter =
+      if is_integer(high),
+        do: :gb_trees.iterator_from(-high, tree),
+        else: :gb_trees.iterator(tree)
+
+    Stream.unfold(iter, fn current ->
+      case :gb_trees.next(current) do
+        {order, key, next} -> {{-order, key}, next}
+        :none -> nil
+      end
+    end)
+  end
+
+  defp put_pending_message(%{request_keys_by_id: nil} = index, _key, _old, _new), do: index
+
+  defp put_pending_message(index, {person, _, _} = key, old, new) do
+    old_open? = match?(%{terminal: nil}, old)
+    new_open? = is_nil(new.terminal)
+
+    index =
+      if old_open? == new_open? do
+        index
+      else
+        tree = Map.get(index.pending_messages_by_person, person, :gb_trees.empty())
+        order = -new.accepted_seq
+
+        next =
+          if new_open?,
+            do: :gb_trees.enter(order, key, tree),
+            else: :gb_trees.delete_any(order, tree)
+
+        trees =
+          if :gb_trees.is_empty(next),
+            do: Map.delete(index.pending_messages_by_person, person),
+            else: Map.put(index.pending_messages_by_person, person, next)
+
+        %{index | pending_messages_by_person: trees}
+      end
+
+    delta = counts_for_badge(new) - counts_for_badge(old)
+    count = push_badge(index, person) + delta
+
+    cond do
+      delta == 0 -> index
+      count == 0 -> %{index | push_badges: Map.delete(index.push_badges, person)}
+      true -> put_in(index.push_badges[person], count)
+    end
+  end
+
+  defp counts_for_badge(%{terminal: nil, message: message}),
+    do: if(AttentionServer.Message.progress_message?(message), do: 0, else: 1)
+
+  defp counts_for_badge(_), do: 0
 
   def message_page(index, scope, filters),
     do: Map.get(index.sent_messages_by_agent, {scope, filters}, :gb_trees.empty())
@@ -298,6 +385,7 @@ defmodule AttentionServer.RouteBIndex do
 
     index = put_entry_position(index, key, seq, payload)
     index = put_agent_entry(index, key, seq, payload)
+    index = put_origin_reply(index, person, seq, key, payload)
 
     summary =
       Map.get(index.conversation_summary_by_item, key, %{
@@ -335,6 +423,20 @@ defmodule AttentionServer.RouteBIndex do
 
     put_in(index, [:conversation_summary_by_item, key], summary)
   end
+
+  defp put_origin_reply(
+         %{request_keys_by_id: lookup} = index,
+         person,
+         seq,
+         key,
+         %{"kind" => "reply", "author" => "origin"}
+       )
+       when is_map(lookup) do
+    order = Map.get(index.origin_replies_by_person, person, :gb_trees.empty())
+    put_in(index.origin_replies_by_person[person], :gb_trees.enter(-seq, key, order))
+  end
+
+  defp put_origin_reply(index, _person, _seq, _key, _payload), do: index
 
   def put_advisory(%{agent_feed?: true} = index, item, seq),
     do:
