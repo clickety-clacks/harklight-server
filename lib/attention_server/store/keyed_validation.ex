@@ -45,6 +45,7 @@ defmodule AttentionServer.Store.KeyedValidation do
     :sender_grants,
     :source_report_grants,
     :subscriptions,
+    :push_bindings,
     :cursors,
     :conversation_cursors,
     :origin_sessions,
@@ -143,6 +144,7 @@ defmodule AttentionServer.Store.KeyedValidation do
        when field in [
               :sender_grants,
               :subscriptions,
+              :push_bindings,
               :cursors,
               :conversation_cursors,
               :origin_feeds

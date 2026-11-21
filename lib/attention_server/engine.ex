@@ -96,6 +96,7 @@ defmodule AttentionServer.Engine do
               messages_by_origin_session: %{},
               request_keys_by_id: nil,
               covered_sessions_by_origin: %{},
+              push_bindings: nil,
               conversation_summary_by_item: %{},
               unresolved_count_by_person: %{}
             }
@@ -109,34 +110,9 @@ defmodule AttentionServer.Engine do
 
   @doc false
   def claim_push(%__MODULE__{} = engine, now_ms) when is_integer(now_ms) do
-    bindings =
-      Map.new(engine.push_bindings, fn {key, binding} ->
-        cond do
-          binding.state == "sending" and is_integer(binding.claim_at) and
-              binding.claim_at + @push_claim_timeout_ms <= now_ms ->
-            {key, clear_push_claim(%{binding | state: "waiting_retry", next_at: now_ms})}
+    next = expire_push_claims(engine, now_ms)
 
-          true ->
-            {key, binding}
-        end
-      end)
-
-    next = %{engine | push_bindings: bindings}
-
-    candidate =
-      next.push_bindings
-      |> Enum.filter(fn {{person, _device}, binding} ->
-        not delivery_stopped?(next, person) and binding.active and
-          (binding.pending_high > 0 or binding.pending_conversation_high > 0) and
-          binding.state in ["queued", "waiting_retry"] and
-          is_integer(binding.next_at) and binding.next_at <= now_ms
-      end)
-      |> Enum.sort_by(fn {{person, device}, binding} ->
-        {binding.next_at, person, device}
-      end)
-      |> List.first()
-
-    case candidate do
+    case next_push_candidate(next, now_ms) do
       nil ->
         {:ok, next, nil}
 
@@ -247,7 +223,49 @@ defmodule AttentionServer.Engine do
             next_at: nil
         }
 
-        {:ok, %{next | push_bindings: Map.put(next.push_bindings, key, claimed)}, claim}
+        {:ok, put_push_binding(next, key, claimed), claim}
+    end
+  end
+
+  defp expire_push_claims(engine, now_ms) do
+    cutoff = now_ms - @push_claim_timeout_ms
+
+    keys =
+      case engine.route_b_index.push_bindings do
+        nil ->
+          for {key, %{state: "sending", claim_at: at}} <- engine.push_bindings,
+              is_integer(at) and at <= cutoff,
+              do: key
+
+        index ->
+          AttentionServer.PushIndex.expired(index, cutoff)
+      end
+
+    Enum.reduce(keys, engine, fn key, current ->
+      binding = Map.fetch!(current.push_bindings, key)
+      updated = clear_push_claim(%{binding | state: "waiting_retry", next_at: now_ms})
+      put_push_binding(current, key, updated)
+    end)
+  end
+
+  defp next_push_candidate(%{route_b_index: %{push_bindings: nil}} = engine, now_ms) do
+    engine.push_bindings
+    |> Enum.filter(fn {{person, _device}, binding} ->
+      not delivery_stopped?(engine, person) and binding.active and
+        (binding.pending_high > 0 or binding.pending_conversation_high > 0) and
+        binding.state in ["queued", "waiting_retry"] and
+        is_integer(binding.next_at) and binding.next_at <= now_ms
+    end)
+    |> Enum.min_by(fn {{person, device}, binding} -> {binding.next_at, person, device} end, fn ->
+      nil
+    end)
+  end
+
+  defp next_push_candidate(engine, now_ms) do
+    index = engine.route_b_index.push_bindings
+
+    if key = AttentionServer.PushIndex.ready(index, now_ms, &(not delivery_stopped?(engine, &1))) do
+      {key, Map.fetch!(engine.push_bindings, key)}
     end
   end
 
@@ -260,7 +278,7 @@ defmodule AttentionServer.Engine do
       when revision == claim.revision and binding_id == claim.binding_id and
              claim_id == claim.claim_id ->
         updated = finish_push_binding(binding, claim, outcome, now_ms)
-        {:ok, %{engine | push_bindings: Map.put(engine.push_bindings, key, updated)}}
+        {:ok, put_push_binding(engine, key, updated)}
 
       _ ->
         {:ok, engine}
@@ -383,10 +401,8 @@ defmodule AttentionServer.Engine do
 
         next =
           engine
-          |> Map.put(
-            :push_bindings,
-            engine.push_bindings |> release_push_address(key, address) |> Map.put(key, binding)
-          )
+          |> release_push_address(key, address)
+          |> put_push_binding(key, binding)
           |> save_receipt(person, device, frame["op_id"], semantic, reply)
 
         {:ok, next, reply}
@@ -395,13 +411,23 @@ defmodule AttentionServer.Engine do
 
   # The newest registration of an address owns it: any other device's active
   # binding for the same address is canceled and keeps its own revision.
-  defp release_push_address(bindings, key, address) do
-    Map.new(bindings, fn
-      {other, %{active: true, address: ^address} = old} when other != key ->
-        {other, canceled_push_binding(old.revision)}
+  defp release_push_address(engine, key, address) do
+    candidates =
+      case engine.route_b_index.push_bindings do
+        nil ->
+          for {other, %{active: true, address: ^address}} <- engine.push_bindings, do: other
 
-      entry ->
-        entry
+        index ->
+          List.wrap(AttentionServer.PushIndex.owner(index, address))
+      end
+
+    Enum.reduce(candidates, engine, fn
+      ^key, current ->
+        current
+
+      other, current ->
+        old = Map.fetch!(current.push_bindings, other)
+        put_push_binding(current, other, canceled_push_binding(old.revision))
     end)
   end
 
@@ -431,7 +457,7 @@ defmodule AttentionServer.Engine do
 
             next =
               engine
-              |> Map.put(:push_bindings, Map.put(engine.push_bindings, key, canceled))
+              |> put_push_binding(key, canceled)
               |> save_receipt(person, device, frame["op_id"], semantic, reply)
 
             {:ok, next, reply}
@@ -1881,13 +1907,12 @@ defmodule AttentionServer.Engine do
           binding = Map.get(engine.push_bindings, binding_key)
           revision = if binding, do: binding.revision + 1, else: 1
 
-          {:ok,
-           %{
-             engine
-             | devices: Map.put(engine.devices, key, updated),
-               push_bindings:
-                 Map.put(engine.push_bindings, binding_key, canceled_push_binding(revision))
-           }}
+          next =
+            engine
+            |> put_row(:devices, key, updated)
+            |> put_push_binding(binding_key, canceled_push_binding(revision))
+
+          {:ok, next}
         end
 
       :error ->
@@ -6182,7 +6207,7 @@ defmodule AttentionServer.Engine do
   defp queue_push_hint(engine, person, high) do
     now_ms = System.system_time(:millisecond)
 
-    Enum.reduce(engine.push_bindings, engine, fn
+    Enum.reduce(push_bindings_for(engine, person), engine, fn
       {{^person, _device} = key, %{active: true} = binding}, current ->
         if high > Map.get(engine.cursors, key, 0) do
           fresh =
@@ -6215,7 +6240,7 @@ defmodule AttentionServer.Engine do
               state: state
           }
 
-          put_row(current, :push_bindings, key, updated)
+          put_push_binding(current, key, updated)
         else
           current
         end
@@ -6228,7 +6253,7 @@ defmodule AttentionServer.Engine do
   defp queue_conversation_hint(engine, person, high) do
     now_ms = System.system_time(:millisecond)
 
-    Enum.reduce(engine.push_bindings, engine, fn
+    Enum.reduce(push_bindings_for(engine, person), engine, fn
       {{^person, _device} = key, %{active: true} = binding}, current ->
         reply? =
           case Map.get(engine.conversation_events, {person, high}) do
@@ -6269,7 +6294,7 @@ defmodule AttentionServer.Engine do
               state: state
           }
 
-          put_row(current, :push_bindings, key, updated)
+          put_push_binding(current, key, updated)
         else
           current
         end
@@ -6277,6 +6302,28 @@ defmodule AttentionServer.Engine do
       _, current ->
         current
     end)
+  end
+
+  defp push_bindings_for(%{route_b_index: %{push_bindings: nil}} = engine, _person),
+    do: engine.push_bindings
+
+  defp push_bindings_for(engine, person) do
+    for key <- AttentionServer.PushIndex.keys(engine.route_b_index.push_bindings, person),
+        do: {key, Map.fetch!(engine.push_bindings, key)}
+  end
+
+  defp put_push_binding(%{route_b_index: %{push_bindings: nil}} = engine, key, binding),
+    do: put_row(engine, :push_bindings, key, binding)
+
+  defp put_push_binding(engine, key, binding) do
+    previous = Map.get(engine.push_bindings, key)
+
+    index =
+      AttentionServer.PushIndex.update(engine.route_b_index.push_bindings, key, previous, binding)
+
+    engine
+    |> put_in([Access.key!(:route_b_index), :push_bindings], index)
+    |> put_row(:push_bindings, key, binding)
   end
 
   # Unresolved deliveries gathered since the last push this device accepted

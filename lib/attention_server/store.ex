@@ -1228,6 +1228,7 @@ defmodule AttentionServer.Store do
     result =
       with true <-
              Enum.all?(MapSet.union(touched, affected), &valid_authority_reference?(next, &1)),
+           true <- Enum.all?(touched, &valid_push_address_change?(store.engine, next, &1)),
            :ok <- KeyedValidation.sequences(store.engine, next, touched),
            {:ok, upload_links, entries} <-
              KeyedValidation.upload_changes(store.upload_links, store.engine, next, touched),
@@ -2708,21 +2709,7 @@ defmodule AttentionServer.Store do
             (is_nil(device.enrolled_at) or
                (is_integer(device.enrolled_at) and device.enrolled_at >= 0))
         end) and
-        Enum.all?(engine.agents, fn {key, agent} ->
-          hex_key?(key) and
-            Map.has_key?(engine.persons, agent.person) and
-            not Map.has_key?(engine.devices, key) and
-            AttentionServer.Message.uuid_v4?(agent.id) and
-            is_boolean(agent.revoked) and is_struct(agent.senders, MapSet) and
-            is_integer(agent.enrollment_revision) and agent.enrollment_revision > 0 and
-            Enum.all?(agent.senders, &AttentionServer.Message.sender_id?/1) and
-            is_struct(agent.read_grants, MapSet) and is_struct(agent.respond_grants, MapSet) and
-            is_integer(agent.grant_revision) and agent.grant_revision > 0 and
-            (is_nil(agent.granted_by) or hex_key?(agent.granted_by)) and
-            valid_agent_history?(agent) and
-            AttentionServer.AgentAccess.valid_patterns?(MapSet.to_list(agent.read_grants)) and
-            AttentionServer.AgentAccess.valid_patterns?(MapSet.to_list(agent.respond_grants))
-        end) and
+        Enum.all?(engine.agents, fn {key, agent} -> valid_agent?(engine, key, agent) end) and
         engine.agents |> Map.values() |> Enum.map(&{&1.person, &1.id}) |> Enum.uniq() |> length() ==
           map_size(engine.agents) and
         Enum.all?(engine.sender_grants, fn {{person, key}, _} -> owns?(engine, person, key) end) and
@@ -3031,6 +3018,22 @@ defmodule AttentionServer.Store do
 
   defp binding_id?(value), do: AttentionServer.Message.uuid_v4?(value)
 
+  defp valid_agent?(engine, key, agent) do
+    hex_key?(key) and
+      Map.has_key?(engine.persons, agent.person) and
+      not Map.has_key?(engine.devices, key) and
+      AttentionServer.Message.uuid_v4?(agent.id) and
+      is_boolean(agent.revoked) and is_struct(agent.senders, MapSet) and
+      is_integer(agent.enrollment_revision) and agent.enrollment_revision > 0 and
+      Enum.all?(agent.senders, &AttentionServer.Message.sender_id?/1) and
+      is_struct(agent.read_grants, MapSet) and is_struct(agent.respond_grants, MapSet) and
+      is_integer(agent.grant_revision) and agent.grant_revision > 0 and
+      (is_nil(agent.granted_by) or hex_key?(agent.granted_by)) and
+      valid_agent_history?(agent) and
+      AttentionServer.AgentAccess.valid_patterns?(MapSet.to_list(agent.read_grants)) and
+      AttentionServer.AgentAccess.valid_patterns?(MapSet.to_list(agent.respond_grants))
+  end
+
   defp valid_agent_history?(agent) do
     history = agent.grant_history
 
@@ -3309,9 +3312,26 @@ defmodule AttentionServer.Store do
   defp valid_authority_reference?(engine, {:row, :receipts, {person, actor, _} = key}),
     do: not Map.has_key?(engine.receipts, key) or actor_owns?(engine, person, actor)
 
+  defp valid_authority_reference?(engine, {:row, :agents, key}) do
+    case Map.fetch(engine.agents, key) do
+      {:ok, agent} -> valid_agent?(engine, key, agent)
+      :error -> true
+    end
+  end
+
   defp valid_authority_reference?(engine, {:row, field, {person, actor} = key})
        when field in [:sender_grants, :subscriptions, :origin_feeds],
        do: not Map.has_key?(Map.fetch!(engine, field), key) or owns?(engine, person, actor)
+
+  defp valid_authority_reference?(engine, {:row, :push_bindings, {person, device} = key}) do
+    case Map.fetch(engine.push_bindings, key) do
+      {:ok, binding} ->
+        owns?(engine, person, device) and valid_push_binding?(binding, engine, person, device)
+
+      :error ->
+        true
+    end
+  end
 
   defp valid_authority_reference?(
          engine,
@@ -3366,6 +3386,23 @@ defmodule AttentionServer.Store do
     do: valid_authority_reference?(engine, {:row, :origin_feeds, scope})
 
   defp valid_authority_reference?(_engine, _address), do: true
+
+  defp valid_push_address_change?(old, next, {:row, :push_bindings, key}) do
+    case Map.get(next.push_bindings, key) do
+      %{active: true, address: address} ->
+        previous = AttentionServer.PushIndex.owner(old.route_b_index.push_bindings, address)
+        current = AttentionServer.PushIndex.owner(next.route_b_index.push_bindings, address)
+
+        current == key and
+          (previous == key or
+             not match?(%{active: true, address: ^address}, Map.get(next.push_bindings, previous)))
+
+      _ ->
+        true
+    end
+  end
+
+  defp valid_push_address_change?(_old, _next, _address), do: true
 
   defp valid_item_change?(old, next, {person, _, _} = key) do
     case Map.fetch(next.messages, key) do

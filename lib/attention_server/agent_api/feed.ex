@@ -106,14 +106,31 @@ defmodule AttentionServer.AgentAPI.FeedStep do
   defp commit_delivery(store, {person, key}, targets) do
     targets = resolve_answers(store.engine, person, targets)
 
-    with {:ok, next} <- Engine.agent_feed_delivered(store.engine, person, key, targets),
+    with {:ok, next, transition} <- stage_delivery(store, person, key, targets),
          audit = delivery_audit(store.engine, next, person, key),
-         {:ok, store} <- Store.commit(store, next, audit) do
+         {:ok, store} <- Store.commit(store, transition, audit) do
       {:ok, store}
     else
       {:error, reason, _store} -> delivery_failure(reason)
       {:error, reason} -> delivery_failure(reason)
     end
+  end
+
+  defp stage_delivery(%Store{mode: :keyed, engine: engine}, person, key, targets) do
+    {next, result, touched} =
+      Engine.with_touches(engine, fn current ->
+        case Engine.agent_feed_delivered(current, person, key, targets) do
+          {:ok, next} -> {next, :ok}
+          error -> {current, error}
+        end
+      end)
+
+    with :ok <- result, do: {:ok, next, {next, touched}}
+  end
+
+  defp stage_delivery(store, person, key, targets) do
+    with {:ok, next} <- Engine.agent_feed_delivered(store.engine, person, key, targets),
+         do: {:ok, next, next}
   end
 
   defp delivery_audit(previous, next, person, key) do

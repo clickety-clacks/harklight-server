@@ -988,11 +988,15 @@ defmodule AttentionServer.Store.EngineTransitionTest do
     GenServer.stop(relay)
     {:ok, reopened} = Relay.start_link(opts)
 
-    assert {:ok, 200, ^ended, true} =
-             agent_write(reopened, :session_end, %{session: handle}, %{}, end_op)
+    assert_agent_receipt(
+      agent_write(reopened, :session_end, %{session: handle}, %{}, end_op),
+      ended
+    )
 
-    assert {:ok, 200, ^retracted, true} =
-             agent_write(reopened, :retract, %{item_id: id}, %{}, clear_op)
+    assert_agent_receipt(
+      agent_write(reopened, :retract, %{item_id: id}, %{}, clear_op),
+      retracted
+    )
 
     live = :sys.get_state(reopened).store
     assert live.version == committed.version
@@ -1236,19 +1240,214 @@ defmodule AttentionServer.Store.EngineTransitionTest do
     GenServer.stop(relay)
     {:ok, reopened} = Relay.start_link(opts)
 
-    assert {:ok, 200, ^revision, true} =
-             agent_write(reopened, :revise, item, revised, revise_op, ["1"])
+    assert_agent_receipt(
+      agent_write(reopened, :revise, item, revised, revise_op, ["1"]),
+      revision
+    )
 
-    assert {:ok, 200, ^use, true} = agent_write(reopened, :file_use, turn, file_body, file_op)
+    assert_agent_receipt(agent_write(reopened, :file_use, turn, file_body, file_op), use)
 
-    assert {:ok, 200, ^result, true} =
-             agent_write(reopened, :result, item, result_body, result_op)
+    assert_agent_receipt(agent_write(reopened, :result, item, result_body, result_op), result)
 
     cold = :sys.get_state(reopened).store
     assert cold.version == live.version
     assert full_diff(cold.engine, live.engine) == MapSet.new()
     assert index_state(cold) == index_state(live)
     GenServer.stop(reopened)
+  end
+
+  test "keyed first agent feed delivery rolls back and replays one receipt" do
+    path = legacy_store_path()
+    {:ok, old} = Store.open(path)
+    assert {:ok, _} = KeyedMigration.convert(old)
+    :ok = Store.close(old)
+    flags = path <> ".flags"
+    File.write!(flags, JSON.encode!(%{"client_api_v2" => true}))
+    opts = [store_path: path, store_mode: :keyed, feature_flags_path: flags, clock: fn -> 100 end]
+    {:ok, relay} = Relay.start_link(opts)
+    handle = "00000000-0000-4000-8000-000000000010"
+    {:ok, send} = JSON.decode_line(forward_line())
+    line = send |> Map.put("session_handle", handle) |> JSON.encode_line()
+    assert {:ok, accepted} = Relay.request_line(relay, @origin, line)
+    assert {:ok, %{"type" => "ok"}} = JSON.decode_line(accepted)
+    scope = {@person, @origin}
+    {:ok, cursor} = AgentChangeLog.head(:sys.get_state(relay).store, scope)
+
+    discuss = %{
+      "v" => 1,
+      "type" => "discussion",
+      "sender_id" => "app:test/worker",
+      "message_id" => "msg",
+      "request_revision" => 1,
+      "op_id" => "00000000-0000-4000-8000-000000000051",
+      "text" => "question"
+    }
+
+    assert {:ok, line} = Relay.request_line(relay, @reader, JSON.encode_line(discuss))
+    assert {:ok, %{"type" => "ok", "seq" => 1}} = JSON.decode_line(line)
+    before = :sys.get_state(relay).store
+
+    ctx = %{
+      relay: relay,
+      principal: %{kind: :device, key: @origin, person: @person},
+      params: %{session: handle}
+    }
+
+    alias AttentionServer.AgentAPI.FeedStep
+
+    assert :ok =
+             Sqlite3.execute(before.db, """
+             CREATE TRIGGER keyed_agent_delivery_fault BEFORE INSERT ON relay_audit
+             WHEN NEW.action = 'agent_feed_delivered'
+             BEGIN SELECT RAISE(ABORT, 'failed'); END
+             """)
+
+    assert {:error, :delivery_unavailable} = FeedStep.read(ctx, cursor, 1)
+    assert :sys.get_state(relay).store.version == before.version
+    assert :ok = Sqlite3.execute(before.db, "DROP TRIGGER keyed_agent_delivery_fault")
+
+    assert {:ok, [%{"data" => %{"delivery" => %{"delivered" => false}}}], false, _} =
+             FeedStep.read(ctx, cursor, 1)
+
+    live = :sys.get_state(relay).store
+    assert live.version == before.version + 1
+
+    assert %{
+             payload: %{
+               "kind" => "delivery_ack",
+               "stage" => "ack1",
+               "event_id" => "2",
+               "request_revision" => 1
+             }
+           } = live.engine.conversation_events[{@person, 2}]
+
+    GenServer.stop(relay)
+    {:ok, reopened} = Relay.start_link(opts)
+
+    assert {:ok, [%{"data" => %{"delivery" => %{"delivered" => true}}}], false, _} =
+             FeedStep.read(%{ctx | relay: reopened}, cursor, 1)
+
+    assert :sys.get_state(reopened).store.version == live.version
+    GenServer.stop(reopened)
+  end
+
+  test "keyed push registration, reassignment and claim retry use scoped bindings" do
+    path = legacy_store_path()
+    {:ok, store} = Store.open(path)
+    other = String.duplicate("d", 64)
+    {:ok, engine} = Engine.setup_person(store.engine, "other")
+    {:ok, engine} = Engine.setup_device(engine, "other", other)
+    {:ok, store} = Store.commit(store, engine, %{person: "other", actor: other, action: "setup"})
+    assert {:ok, _} = KeyedMigration.convert(store)
+    :ok = Store.close(store)
+    {:ok, relay} = Relay.start_link(store_path: path, store_mode: :keyed)
+    :ok = Relay.enable_push(relay)
+    address = String.duplicate("ab", 32)
+
+    for {device, address, op} <- [
+          {@origin, address, "00000000-0000-4000-8000-000000000061"},
+          {@reader, address, "00000000-0000-4000-8000-000000000062"},
+          {other, String.duplicate("cd", 32), "00000000-0000-4000-8000-000000000063"}
+        ] do
+      frame = %{
+        "v" => 1,
+        "type" => "push_register",
+        "op_id" => op,
+        "revision" => 1,
+        "profile_id" => "harklight-sandbox",
+        "address_kind" => "apns_token",
+        "address" => address
+      }
+
+      assert {:ok, reply} = Relay.request_line(relay, device, JSON.encode_line(frame))
+      assert {:ok, %{"type" => "ok"}} = JSON.decode_line(reply)
+    end
+
+    assert {:ok, reply} = Relay.request_line(relay, @origin, forward_line())
+    assert {:ok, %{"type" => "ok"}} = JSON.decode_line(reply)
+    before = :sys.get_state(relay).store
+    refute before.engine.push_bindings[{@person, @origin}].active
+    assert before.engine.push_bindings[{@person, @reader}].pending_high == 1
+    assert before.engine.push_bindings[{"other", other}].pending_high == 0
+    now = System.system_time(:millisecond) + 1_000
+
+    assert :ok =
+             Sqlite3.execute(before.db, """
+             CREATE TRIGGER keyed_push_claim_fault BEFORE INSERT ON relay_audit
+             WHEN NEW.action = 'push_claim'
+             BEGIN SELECT RAISE(ABORT, 'failed'); END
+             """)
+
+    assert {:error, :storage_unavailable} = Relay.claim_push(relay, now)
+    assert :sys.get_state(relay).store.version == before.version
+    assert :ok = Sqlite3.execute(before.db, "DROP TRIGGER keyed_push_claim_fault")
+    assert {:ok, %{device: @reader, address: ^address} = first} = Relay.claim_push(relay, now)
+    assert {:ok, nil} = Relay.claim_push(relay, now + 29_999)
+    assert {:ok, %{device: @reader} = retried} = Relay.claim_push(relay, now + 30_000)
+    assert retried.claim_id != first.claim_id
+    assert :ok = Relay.finish_push(relay, first, %{state: "provider_accepted"}, now + 30_001)
+    assert :ok = Relay.finish_push(relay, retried, %{state: "provider_accepted"}, now + 30_001)
+
+    remove =
+      JSON.encode_line(%{
+        "v" => 1,
+        "type" => "push_remove",
+        "op_id" => "00000000-0000-4000-8000-000000000064",
+        "revision" => 2
+      })
+
+    assert {:ok, reply} = Relay.request_line(relay, @reader, remove)
+    assert {:ok, %{"type" => "ok"}} = JSON.decode_line(reply)
+    live = :sys.get_state(relay).store
+    assert live.engine.push_bindings[{@person, @reader}].revision == 2
+    GenServer.stop(relay)
+    {:ok, reopened} = Store.open(path, :keyed)
+    assert full_diff(live.engine, reopened.engine) == MapSet.new()
+    assert index_state(live) == index_state(reopened)
+    :ok = Store.close(reopened)
+  end
+
+  test "keyed owner agent grants retain revision and authority after reopen" do
+    path = legacy_store_path()
+    {:ok, store} = Store.open(path)
+    person = "00000000-0000-4000-8000-000000000071"
+    owner = String.duplicate("e", 64)
+    agent = String.duplicate("f", 64)
+    id = "00000000-0000-4000-8000-000000000072"
+    assert {:ok, engine} = Engine.operator_bootstrap(store.engine, person, owner)
+
+    assert {:ok, store} =
+             Store.commit(store, engine, %{person: person, actor: owner, action: "bootstrap"})
+
+    assert {:ok, _} = KeyedMigration.convert(store)
+    :ok = Store.close(store)
+    opts = [store_path: path, store_mode: :keyed]
+    {:ok, relay} = Relay.start_link(opts)
+
+    assert :ok = Relay.owner_register_agent(relay, person, owner, id, agent)
+
+    assert {:error, :forbidden} =
+             Relay.owner_replace_agent_grants(relay, person, @reader, agent, 1, [], [])
+
+    assert :ok =
+             Relay.owner_replace_agent_grants(relay, person, owner, agent, 1, ["app:test/*"], [])
+
+    assert {:error, :stale_or_invalid_grant} =
+             Relay.owner_replace_agent_grants(relay, person, owner, agent, 1, [], [])
+
+    assert :ok = Relay.owner_revoke_agent(relay, person, owner, agent)
+    live = :sys.get_state(relay).store
+    assert :ok = Relay.owner_revoke_agent(relay, person, owner, agent)
+    assert :sys.get_state(relay).store.version == live.version
+    GenServer.stop(relay)
+    {:ok, reopened} = Store.open(path, :keyed)
+
+    assert %{revoked: true, grant_revision: 3, enrollment_revision: 2, grant_history: history} =
+             reopened.engine.agents[agent]
+
+    assert Enum.map(history, & &1.action) == ~w(register replace revoke)
+    assert full_diff(live.engine, reopened.engine) == MapSet.new()
+    :ok = Store.close(reopened)
   end
 
   defp agent_write(relay, operation, params, body, op_id, match \\ []) do
@@ -1259,6 +1458,16 @@ defmodule AttentionServer.Store.EngineTransitionTest do
 
     call = {:execute, {principal, operation, params, op_id, digest, match, body}, op_id, []}
     GenServer.call(relay, {:client_api, AttentionServer.ClientAPI.AgentWrites, call})
+  end
+
+  defp assert_agent_receipt({:stored, 200, encoded}, original) do
+    assert {:ok, %{"agent_write" => 1, "outcome" => outcome} = stored} =
+             JSON.decode_line(encoded <> "\n")
+
+    assert outcome == Map.drop(original, ["message", "entry"])
+    resource = original["message"] || original["entry"] || %{}
+    assert stored["item_id"] == resource["item_id"]
+    assert stored["entry_position"] == get_in(original, ["entry", "position"])
   end
 
   defp normalize_action_times(engine) do

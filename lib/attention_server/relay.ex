@@ -51,7 +51,7 @@ defmodule AttentionServer.Relay do
   @keyed_request_types ~w(
     forward message_open discussion answer conversation_reply conversation_revise
     conversation_read subscribe_remote answer_no_comment lifecycle conversation_result conversation_withdraw
-    levels_get levels_set
+    levels_get levels_set push_register push_remove push_status
   )
 
   def start_link(opts \\ []) do
@@ -1214,12 +1214,12 @@ defmodule AttentionServer.Relay do
     do: {:reply, :ok, %{state | push_enabled: true}}
 
   defp dispatch_call({:claim_push, now_ms}, _from, state) when is_integer(now_ms) do
-    case Engine.claim_push(state.store.engine, now_ms) do
-      {:ok, next_engine, claim} when next_engine == state.store.engine ->
+    case track_origin_fact(state, &Engine.claim_push(&1, now_ms)) do
+      {next_engine, {:ok, claim}, _} when next_engine == state.store.engine ->
         {:reply, {:ok, claim}, state}
 
-      {:ok, next_engine, claim} ->
-        case commit(state.store, next_engine, %{
+      {next_engine, {:ok, claim}, touched} ->
+        case commit_request(state.store, next_engine, touched, %{
                person: if(claim, do: claim.person, else: "system"),
                actor: "apns_dispatcher",
                action: "push_claim"
@@ -1232,12 +1232,18 @@ defmodule AttentionServer.Relay do
 
   defp dispatch_call({:finish_push, claim, outcome, now_ms}, _from, state)
        when is_integer(now_ms) do
-    case Engine.finish_push(state.store.engine, claim, outcome, now_ms) do
-      {:ok, next_engine} when next_engine == state.store.engine ->
+    {next, :ok, touched} =
+      track_transition(state, state.store.engine, fn engine ->
+        {:ok, next} = Engine.finish_push(engine, claim, outcome, now_ms)
+        {next, :ok}
+      end)
+
+    case next do
+      next_engine when next_engine == state.store.engine ->
         {:reply, :ok, state}
 
-      {:ok, next_engine} ->
-        case commit(state.store, next_engine, %{
+      next_engine ->
+        case commit_request(state.store, next_engine, touched, %{
                person: claim.person,
                actor: "apns_dispatcher",
                action: "push_finish"
@@ -2004,7 +2010,8 @@ defmodule AttentionServer.Relay do
         Engine.owner_register_agent(state.store.engine, person, owner_key, id, agent_key),
         person,
         owner_key,
-        "owner_agent_register"
+        "owner_agent_register",
+        [{:row, :agents, agent_key}]
       )
 
   defp dispatch_call(
@@ -2026,7 +2033,8 @@ defmodule AttentionServer.Relay do
            ),
            person,
            owner_key,
-           "owner_agent_grants_replace"
+           "owner_agent_grants_replace",
+           [{:row, :agents, agent_key}]
          )
 
   defp dispatch_call({:owner_revoke_agent, person, owner_key, agent_key}, _from, state),
@@ -2036,7 +2044,8 @@ defmodule AttentionServer.Relay do
         Engine.owner_revoke_agent(state.store.engine, person, owner_key, agent_key),
         person,
         owner_key,
-        "owner_agent_revoke"
+        "owner_agent_revoke",
+        [{:row, :agents, agent_key}]
       )
 
   defp dispatch_call({:owner_list_agents, person, owner_key}, _from, state),
@@ -5506,7 +5515,8 @@ defmodule AttentionServer.Relay do
             {drop_upload_ids(next_engine, created_ids), [], []}
           end
 
-        {next_engine, touched} = request_availability(state, key, next_engine, touched, request_frame)
+        {next_engine, touched} =
+          request_availability(state, key, next_engine, touched, request_frame)
 
         touched =
           if touched do
@@ -7365,8 +7375,17 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  defp setup(state, {:ok, next_engine}, person, actor, action) do
-    case commit(state.store, next_engine, %{person: person, actor: actor, action: action}) do
+  defp setup(state, result, person, actor, action, addresses \\ nil)
+
+  defp setup(state, {:ok, next_engine}, person, actor, action, addresses) do
+    audit = %{person: person, actor: actor, action: action}
+
+    result =
+      if addresses,
+        do: commit_known_rows(state.store, next_engine, audit, addresses),
+        else: commit(state.store, next_engine, audit)
+
+    case result do
       {:ok, store} ->
         state = %{state | store: store}
         state = ensure_priority_view_if_missing(state, person)
@@ -7377,7 +7396,7 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  defp setup(state, {:error, reason}, _person, _actor, _action),
+  defp setup(state, {:error, reason}, _person, _actor, _action, _addresses),
     do: {:reply, {:error, reason}, state}
 
   defp default_deadlines(%Store{mode: :keyed, engine: engine}) do

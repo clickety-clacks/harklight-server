@@ -14,6 +14,7 @@ defmodule AttentionServer.RouteBIndex do
       messages_by_origin_session: %{},
       request_keys_by_id: nil,
       covered_sessions_by_origin: %{},
+      push_bindings: nil,
       conversation_summary_by_item: %{},
       unresolved_count_by_person: %{}
     }
@@ -40,6 +41,7 @@ defmodule AttentionServer.RouteBIndex do
     index
     |> index_advisories(engine.advisory_feeds)
     |> index_covered_sessions(engine.origin_sessions)
+    |> index_push_bindings(engine)
   end
 
   def enable_keyed_lookups(engine) do
@@ -51,8 +53,19 @@ defmodule AttentionServer.RouteBIndex do
           if index.agent_feed?, do: index, else: put_session_message(index, key, nil, record)
       end)
 
-    %{engine | route_b_index: index_covered_sessions(index, engine.origin_sessions)}
+    index =
+      index
+      |> index_covered_sessions(engine.origin_sessions)
+      |> Map.put(:push_bindings, AttentionServer.PushIndex.build(engine.push_bindings))
+
+    %{engine | route_b_index: index}
   end
+
+  defp index_push_bindings(%{request_keys_by_id: lookup} = index, engine) when is_map(lookup) do
+    %{index | push_bindings: AttentionServer.PushIndex.build(engine.push_bindings)}
+  end
+
+  defp index_push_bindings(index, _engine), do: index
 
   defp index_covered_sessions(%{request_keys_by_id: lookup} = index, sessions)
        when is_map(lookup) do
