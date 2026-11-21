@@ -182,14 +182,16 @@ defmodule AttentionServer.ClientAPIFeedConvergenceTest do
     end
   end
 
-  defp catch_up(relay, model) do
+  defp catch_up(relay, model, dropped \\ fn _row -> false end) do
     state = :sys.get_state(relay)
     context = %{engine: state.store.engine, store: state.store, view: state.priority_views["A"]}
     {:ok, rows, more, position} = ChangeLog.read(state.store, "A", model.cursor, 500)
     refute more
 
     model =
-      Enum.reduce(rows, model, fn row, model ->
+      rows
+      |> Enum.reject(dropped)
+      |> Enum.reduce(model, fn row, model ->
         case FeedRenderer.render(context, @principal, row) do
           {:ok, data} -> apply_change(model, row.kind, data)
           :skip -> model
@@ -257,41 +259,50 @@ defmodule AttentionServer.ClientAPIFeedConvergenceTest do
     |> update_in(["chat"], &Map.delete(&1, "reply_rank_key"))
   end
 
-  test "clients converge on everything but rank keys", %{relay: relay} do
-    {live, joined, final} = run(relay)
-    assert_converged(live, final, rank_keys: false)
-    assert_converged(joined, final, rank_keys: false)
+  test "clients converge on everything but rank keys, after every step", %{relay: relay} do
+    run(relay, rank_keys: false)
   end
 
   @tag skip: "waits on the change log's rank rows (review finding F3)"
-  test "clients converge including rank keys", %{relay: relay} do
-    {live, joined, final} = run(relay)
-    assert_converged(live, final)
-    assert_converged(joined, final)
+  test "clients converge including rank keys, after every step", %{relay: relay} do
+    run(relay, rank_keys: true)
+  end
+
+  # The check's own proof: a client that misses one item row (the Seen open
+  # of the last step) is caught as diverged.
+  test "a missed item row is caught", %{relay: relay} do
+    missed = ChangeLog.item_resource({"A", "app:test", "one"})
+    last = length(steps(relay)) - 1
+
+    dropped = fn index ->
+      if index == last,
+        do: &(&1.kind == :item and &1.resource_id == missed),
+        else: fn _row -> false end
+    end
+
+    assert_raise ExUnit.AssertionError, ~r/seen/, fn ->
+      run(relay, rank_keys: false, dropped: dropped)
+    end
   end
 
   # A client catching up after every step, and one starting from a
-  # mid-script snapshot, both against the final snapshot.
-  defp run(relay) do
-    steps = steps(relay)
-    {early, late} = Enum.split(steps, div(length(steps), 2))
+  # mid-run snapshot, each compared with a snapshot after every step.
+  defp run(relay, opts) do
+    keys? = Keyword.fetch!(opts, :rank_keys)
+    dropped = Keyword.get(opts, :dropped, fn _index -> fn _row -> false end end)
+    steps = relay |> steps() |> Enum.with_index()
+    half = div(length(steps), 2)
 
-    live =
-      Enum.reduce(early, empty_model(), fn step, model ->
-        step.()
-        catch_up(relay, model)
-      end)
-
-    joined = snapshot(relay)
-
-    {live, joined} =
-      Enum.reduce(late, {live, joined}, fn step, {live, joined} ->
-        step.()
-        {catch_up(relay, live), catch_up(relay, joined)}
-      end)
-
-    final = snapshot(relay)
-    assert live.cursor == final.cursor and joined.cursor == final.cursor
-    {live, joined, final}
+    Enum.reduce(steps, {empty_model(), nil}, fn {step, index}, {live, joined} ->
+      step.()
+      live = catch_up(relay, live, dropped.(index))
+      joined = if joined, do: catch_up(relay, joined, dropped.(index)), else: nil
+      now = snapshot(relay)
+      assert live.cursor == now.cursor
+      assert_converged(live, now, rank_keys: keys?)
+      if joined, do: assert_converged(joined, now, rank_keys: keys?)
+      joined = if index == half - 1, do: now, else: joined
+      {live, joined}
+    end)
   end
 end
