@@ -286,6 +286,15 @@ defmodule AttentionServer.Server do
           children
         end
 
+      # Last, so it stops first: open change feeds get closing: server_shutdown
+      # before the listeners carrying them stop.
+      children =
+        if client_api_v2,
+          do:
+            children ++
+              [Supervisor.child_spec(ClientAPI.FeedShutdown, id: :client_api_feed_shutdown)],
+          else: children
+
       Supervisor.init(children, strategy: :rest_for_one)
     else
       _ -> raise ArgumentError, "missing server certificate or store configuration"
