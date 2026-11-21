@@ -7,6 +7,7 @@ defmodule AttentionServer.RouteBIndex do
       sent_messages_by_agent: %{},
       agent_entry_pages: %{},
       origin_reply_positions: %{},
+      scored_reply_items_by_person: %{},
       agent_results: %{},
       conversations_by_item: %{},
       agent_feed?: false,
@@ -31,7 +32,9 @@ defmodule AttentionServer.RouteBIndex do
         put_conversation_event(current, person, seq, event.key, event.payload)
       end)
 
-    index_advisories(index, engine.advisory_feeds)
+    index
+    |> index_advisories(engine.advisory_feeds)
+    |> index_reply_scores(engine.reply_group_history)
   end
 
   def enable_agent_feed(%{route_b_index: %{agent_feed?: true}} = engine), do: engine
@@ -53,8 +56,25 @@ defmodule AttentionServer.RouteBIndex do
         |> put_agent_entry(event.key, seq, event.payload)
       end)
 
-    %{engine | route_b_index: index_advisories(index, engine.advisory_feeds)}
+    index =
+      index
+      |> index_advisories(engine.advisory_feeds)
+      |> index_reply_scores(engine.reply_group_history)
+
+    %{engine | route_b_index: index}
   end
+
+  defp index_reply_scores(%{agent_feed?: true} = index, history) do
+    Enum.reduce(history, index, fn
+      {key, %{scores: scores}}, current when map_size(scores) > 0 ->
+        put_reply_scores(current, key, scores)
+
+      _, current ->
+        current
+    end)
+  end
+
+  defp index_reply_scores(index, _history), do: index
 
   defp index_advisories(%{agent_feed?: true} = index, feeds) do
     Enum.reduce(feeds, index, fn {{person, _, _}, feed}, current ->
@@ -108,6 +128,25 @@ defmodule AttentionServer.RouteBIndex do
     do: Map.get(index.agent_entry_pages, key, :gb_trees.empty())
 
   def origin_reply_positions(index, key), do: Map.get(index.origin_reply_positions, key, [])
+
+  def scored_reply_items(index, person),
+    do: Map.get(index.scored_reply_items_by_person, person, MapSet.new())
+
+  def put_reply_scores(%{agent_feed?: true} = index, {person, _, _} = key, scores) do
+    items = scored_reply_items(index, person)
+
+    if map_size(scores) == 0 do
+      remaining = MapSet.delete(items, key)
+
+      if MapSet.size(remaining) == 0,
+        do: update_in(index.scored_reply_items_by_person, &Map.delete(&1, person)),
+        else: put_in(index.scored_reply_items_by_person[person], remaining)
+    else
+      put_in(index.scored_reply_items_by_person[person], MapSet.put(items, key))
+    end
+  end
+
+  def put_reply_scores(index, _key, _scores), do: index
 
   def result_revision(index, key, position),
     do: Enum.count(Map.get(index.agent_results, key, []), &(&1 <= position))

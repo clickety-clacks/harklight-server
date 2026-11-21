@@ -142,6 +142,7 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
     assert state.store.engine.route_b_index.sent_messages_by_agent == %{}
     assert state.store.engine.route_b_index.agent_entry_pages == %{}
     assert state.store.engine.route_b_index.origin_reply_positions == %{}
+    assert state.store.engine.route_b_index.scored_reply_items_by_person == %{}
     refute Map.has_key?(state.priority_views["A"], :reply_entries_by_item)
 
     opted_in = AttentionServer.RouteBIndex.enable_agent_feed(state.store.engine)

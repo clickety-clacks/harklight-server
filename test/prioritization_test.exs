@@ -13,6 +13,7 @@ defmodule AttentionServer.PrioritizationTest do
     Message,
     Placement,
     Relay,
+    RouteBIndex,
     Store,
     TLSFixtures
   }
@@ -2851,6 +2852,34 @@ defmodule AttentionServer.PrioritizationTest do
     assert :sys.get_state(restarted).store.engine.reply_group_history[
              {"person-a", "app:test", "reply-history"}
            ].score == 0.9
+  end
+
+  test "an enabled score publication clears only its own active reply scores after rebuild" do
+    published = {"person-a", "app:test", "published"}
+    historical = {"person-a", "app:test", "historical"}
+    other = {"person-b", "app:test", "other"}
+
+    engine =
+      %{
+        Engine.new()
+        | reply_group_history: %{
+            published => %{score: 0.9, scores: %{3 => 0.9}},
+            historical => %{score: 0.6, scores: %{}},
+            other => %{score: 0.7, scores: %{5 => 0.7}}
+          }
+      }
+      |> RouteBIndex.enable_agent_feed()
+      |> Engine.rebuild_route_b_index()
+
+    assert RouteBIndex.scored_reply_items(engine.route_b_index, "person-a") ==
+             MapSet.new([published])
+
+    assert {next, [{"person-a", 3}]} = Engine.retain_reply_scores(engine, "person-a", [], true)
+    assert next.reply_group_history[published] == %{score: 0.9, scores: %{}}
+    assert next.reply_group_history[historical] == engine.reply_group_history[historical]
+    assert next.reply_group_history[other] == engine.reply_group_history[other]
+    assert RouteBIndex.scored_reply_items(next.route_b_index, "person-a") == MapSet.new()
+    assert RouteBIndex.scored_reply_items(next.route_b_index, "person-b") == MapSet.new([other])
   end
 
   test "never-scored history stays unscored and a person's turn does not reactivate it", %{
