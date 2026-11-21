@@ -7,6 +7,12 @@ defmodule AttentionServer.ClientAPI.FeedStream do
     `data: <data as one line of JSON>`.
   - It sends `event: heartbeat` with `data: {}` and no `id:` line at least
     every 25 s, and never ends for idleness.
+  - Before a server-initiated end it sends `event: closing` with
+    `data: {"reason": ...}` and no `id:` line, so the cursor does not move:
+    - `revoked` when the device is revoked or removed, or the browser
+      session ends;
+    - `account_paused` when the account is paused;
+    - `server_shutdown` when the Relay stops.
   - The feed's ID is its `Request-Id`. It is logged at open, and at close
     with the reason, `client_closed` when the client went away.
 
@@ -40,14 +46,18 @@ defmodule AttentionServer.ClientAPI.FeedStream do
   def serve(conn, %Context{} = ctx, cursor) do
     person = ctx.principal.person
 
-    # Subscribe before the first read: a commit after the read still wakes us.
+    # Subscribe before the first read: a commit or a closing after the read
+    # still reaches us.
     :ok = ChangeLog.subscribe(person)
+    :ok = ChangeLog.subscribe_closing(ctx.principal)
 
     try do
       open(conn, ctx, cursor)
     after
       ChangeLog.unsubscribe(person)
+      ChangeLog.unsubscribe_closing(ctx.principal)
       flush_wakeups()
+      flush_closings()
     end
   end
 
@@ -68,6 +78,7 @@ defmodule AttentionServer.ClientAPI.FeedStream do
             ctx: ctx,
             cursor: position,
             watcher: watcher,
+            relay: monitor(ctx.relay),
             timer: nil,
             timer_ref: nil
           })
@@ -93,13 +104,17 @@ defmodule AttentionServer.ClientAPI.FeedStream do
           {:error, _reason} -> finish(conn, state, "client_closed")
         end
 
+      # The principal stopped authenticating before its closing arrived.
+      {:error, :unauthorized} ->
+        closing(conn, state, "revoked")
+
       # The cursor fell behind retention while open. Ending lets the client's
       # reconnect get 410 and re-read a snapshot.
       {:error, reason} ->
         finish(conn, state, Atom.to_string(reason))
     end
   catch
-    :exit, _reason -> finish(conn, state, "relay_unavailable")
+    :exit, _reason -> closing(conn, state, "server_shutdown")
   end
 
   defp wait(conn, state) do
@@ -110,6 +125,12 @@ defmodule AttentionServer.ClientAPI.FeedStream do
 
       {:change_log, _person, _head} ->
         wait(conn, state)
+
+      {:client_closing, _scope, reason} when reason in [:revoked, :account_paused] ->
+        closing(conn, state, Atom.to_string(reason))
+
+      {:DOWN, ref, :process, _pid, _reason} when ref == state.relay ->
+        closing(conn, state, "server_shutdown")
 
       {:feed_heartbeat, ref} when ref == state.timer ->
         case chunk_safely(conn, "event: heartbeat\ndata: {}\n\n") do
@@ -123,6 +144,16 @@ defmodule AttentionServer.ClientAPI.FeedStream do
   defp flush_wakeups do
     receive do
       {:change_log, _person, _head} -> flush_wakeups()
+    after
+      0 -> :ok
+    end
+  end
+
+  # A second closing for the same end (two of the principal's scopes) must not
+  # end a later feed served by this process.
+  defp flush_closings do
+    receive do
+      {:client_closing, _scope, _reason} -> flush_closings()
     after
       0 -> :ok
     end
@@ -143,11 +174,24 @@ defmodule AttentionServer.ClientAPI.FeedStream do
     error -> {:error, error}
   end
 
+  defp closing(conn, state, reason) do
+    _ = chunk_safely(conn, ["event: closing\ndata: ", JSON.encode!(%{"reason" => reason}), "\n\n"])
+    finish(conn, state, reason)
+  end
+
+  defp monitor(relay) do
+    case GenServer.whereis(relay) do
+      pid when is_pid(pid) -> Process.monitor(pid)
+      _ -> nil
+    end
+  end
+
   # A client that has gone is noticed at the next send, a heartbeat at the
   # latest: the HTTP server reports it then. The server's own messages are
   # left for it in the mailbox.
   defp finish(conn, state, reason) do
     cancel_heartbeat(state)
+    if state.relay, do: Process.demonitor(state.relay, [:flush])
     send(state.watcher, {:feed_closed, self(), reason})
     conn
   end

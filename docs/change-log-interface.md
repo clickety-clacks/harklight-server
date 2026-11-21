@@ -72,6 +72,7 @@ ChangeLog.append_ranks(store, person, %{unit_id => key}, item_of) :: {:ok, posit
 # ({:browser_session, id}, :revoked) or its account is paused
 # ({:person, person}, :account_paused).
 ChangeLog.subscribe_closing(principal) :: :ok
+ChangeLog.unsubscribe_closing(principal) :: :ok   # when the feed ends
 
 # Write side. Store only.
 ChangeLog.changes(old_engine, next_engine) :: %{person => [{kind, resource_id}]}
