@@ -24,6 +24,10 @@ defmodule AttentionServer.Store.KeyedMigrationTest do
     assert generation == store.version + 1
     assert :ok = Store.close(store)
     assert {:error, _reason} = Store.open(path)
+    assert {:ok, keyed} = Store.open(path, :keyed)
+    assert keyed.version == generation
+    assert keyed.engine == store.engine
+    assert :ok = Store.close(keyed)
     assert {:ok, db} = Sqlite3.open(path)
 
     try do
@@ -31,7 +35,10 @@ defmodule AttentionServer.Store.KeyedMigrationTest do
       assert engine == store.engine
 
       row = RecordCodec.encode_row({:field, :pending_clock_high_water}, 10)
-      assert {:ok, nil} = RecordTable.commit(db, generation, [{:put, row}], fn -> {:ok, nil} end)
+
+      assert {:ok, nil} =
+               RecordTable.commit(db, generation, [{:put, row}], fn _, _ -> {:ok, nil} end)
+
       assert {:ok, engine, advanced} = KeyedMigration.load(db)
       assert advanced == generation + 1
       assert engine.pending_clock_high_water == 10
@@ -55,5 +62,16 @@ defmodule AttentionServer.Store.KeyedMigrationTest do
     assert legacy.version == store.version
     assert legacy.engine == store.engine
     assert :ok = Store.close(legacy)
+  end
+
+  test "keyed Store.open performs full state validation after reading rows", ctx do
+    %{path: path, store: store} = ctx
+    assert {:ok, generation} = KeyedMigration.convert(store)
+    row = RecordCodec.encode_row({:field, :pending_clock_high_water}, -1)
+
+    assert {:ok, nil} =
+             RecordTable.commit(store.db, generation, [{:put, row}], fn _, _ -> {:ok, nil} end)
+
+    assert {:error, _reason} = Store.open(path, :keyed)
   end
 end
