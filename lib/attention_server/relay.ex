@@ -352,6 +352,10 @@ defmodule AttentionServer.Relay do
         :infinity
       )
 
+  @doc false
+  def client_agent_answer(server, key, frame),
+    do: GenServer.call(server, {:client_agent_answer, key, frame}, :infinity)
+
   def owner_register_agent(server, person, owner_key, id, agent_key),
     do:
       GenServer.call(server, {:owner_register_agent, person, owner_key, id, agent_key}, :infinity)
@@ -1948,6 +1952,27 @@ defmodule AttentionServer.Relay do
         {:reply, error, state}
     end
   end
+
+  defp dispatch_call(
+         {:client_agent_answer, key, frame},
+         _from,
+         %{store: %{change_log: true}} = state
+       ) do
+    with {:ok, person, _id, _revision} <- Engine.agent_identity(state.store.engine, key),
+         {:ok, next_engine, fields} <-
+           Engine.client_agent_answer(state.store.engine, key, frame, state.clock.()) do
+      case commit_agent_answer(state, next_engine, person, key, frame) do
+        {:ok, next_state} -> {:reply, {:ok, fields}, next_state}
+        :error -> {:reply, {:error, :storage_unavailable}, state}
+      end
+    else
+      {:error, :forbidden} -> {:reply, {:error, :unauthorized}, state}
+      error -> {:reply, error, state}
+    end
+  end
+
+  defp dispatch_call({:client_agent_answer, _key, _frame}, _from, state),
+    do: {:reply, {:error, :not_found}, state}
 
   defp dispatch_call({:agent_send_request, key, revision, request, socket}, _from, state) do
     case Engine.agent_identity(state.store.engine, key) do
@@ -4051,32 +4076,12 @@ defmodule AttentionServer.Relay do
   defp agent_request(state, person, key, %{"v" => 1, "type" => "answer"} = request) do
     case Engine.agent_answer(state.store.engine, key, request) do
       {:ok, next_engine, fields} ->
-        target = origin_feed_target_for_person(next_engine, person, request)
-
-        case commit(state.store, next_engine, %{
-               person: person,
-               actor: key,
-               action: "agent_answer"
-             }) do
-          {:ok, store} ->
-            next_state =
-              record_origin_feed_change(
-                %{state | store: store},
-                state.store.engine,
-                next_engine,
-                target
-              )
-
-            next_state =
-              if pending_signature(state.store.engine, person) !=
-                   pending_signature(next_engine, person),
-                 do: pending_set_changed(next_state, person),
-                 else: next_state
-
+        case commit_agent_answer(state, next_engine, person, key, request) do
+          {:ok, next_state} ->
             {%{"v" => 1, "type" => "answer_result", "ok" => true} |> Map.merge(fields),
              next_state}
 
-          _ ->
+          :error ->
             {%{"v" => 1, "error" => "storage_unavailable"}, state}
         end
 
@@ -4090,6 +4095,33 @@ defmodule AttentionServer.Relay do
 
   defp agent_request(state, _person, _key, _request),
     do: {%{"v" => 1, "error" => "invalid_request"}, state}
+
+  # The two transports commit agent answers through the same store boundary.
+  defp commit_agent_answer(state, next_engine, person, key, frame) do
+    target = origin_feed_target_for_person(next_engine, person, frame)
+
+    case commit(state.store, next_engine, %{person: person, actor: key, action: "agent_answer"}) do
+      {:ok, store} ->
+        next_state =
+          record_origin_feed_change(
+            %{state | store: store},
+            state.store.engine,
+            next_engine,
+            target
+          )
+
+        next_state =
+          if pending_signature(state.store.engine, person) !=
+               pending_signature(next_engine, person),
+             do: pending_set_changed(next_state, person),
+             else: next_state
+
+        {:ok, next_state}
+
+      _ ->
+        :error
+    end
+  end
 
   defp active_session(state, id) do
     case Map.get(state.sessions, id) do

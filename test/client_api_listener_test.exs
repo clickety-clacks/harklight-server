@@ -535,6 +535,74 @@ defmodule AttentionServer.ClientAPIListenerTest do
       assert {:ok, _, %{status: 401}} = request(conn, "GET", "/v2/inbox")
     end
 
+    test "only senders matching both answer grants can be answered", ctx do
+      {relay, person, owner, agent, port} = start_granted_agent(ctx, true, "granted-answer")
+      assert :ok = Relay.setup_device(relay, person, "fixture-origin")
+      forward_granted_fixture(relay, "app:team/first", "same", 1)
+      forward_granted_fixture(relay, "app:team/second", "same", 2)
+
+      assert {:ok, conn} = device_connect(Map.put(ctx, :port, port), "granted-answer", :http2)
+      assert {:ok, conn, %{status: 200} = inbox} = request(conn, "GET", "/v2/inbox")
+      items = Map.new(json(inbox)["items"], &{&1["sender"], &1["item_id"]})
+      path = "/v2/items/" <> items["app:team/first"] <> "/answer"
+      other_path = "/v2/items/" <> items["app:team/second"] <> "/answer"
+      headers = [{"idempotency-key", "00000000-0000-4000-8000-000000000004"}]
+      body = JSON.encode!(%{"request_revision" => 1})
+
+      assert {:ok, conn, %{status: 403}} = request(conn, "POST", path, headers, body)
+
+      assert :ok =
+               Relay.owner_replace_agent_grants(relay, person, owner, agent, 1, [], [
+                 "app:team/first"
+               ])
+
+      assert {:ok, conn, %{status: 403}} = request(conn, "POST", path, headers, body)
+
+      assert :ok =
+               Relay.owner_replace_agent_grants(relay, person, owner, agent, 2, ["app:team/"], [
+                 "app:team/first"
+               ])
+
+      assert {:ok, conn, %{status: 403}} = request(conn, "POST", other_path, headers, body)
+      stale = JSON.encode!(%{"request_revision" => 2})
+      assert {:ok, conn, %{status: 409} = conflict} = request(conn, "POST", path, headers, stale)
+      assert %{"error" => "stale_request"} = json(conflict)
+
+      assert {:ok, conn, %{status: 200} = answer} = request(conn, "POST", path, headers, body)
+      assert %{"item" => %{"terminal" => %{"state" => "answered"}}} = json(answer)
+      assert {:ok, conn, %{status: 200} = replay} = request(conn, "POST", path, headers, body)
+      assert header(replay, "idempotent-replayed") == ["true"]
+
+      assert :ok =
+               Relay.owner_replace_agent_grants(relay, person, owner, agent, 3, ["app:team/"], [
+                 "app:team/"
+               ])
+
+      comment = JSON.encode!(%{"request_revision" => 1, "comment" => "settled"})
+
+      assert {:ok, conn, %{status: 409} = conflict} =
+               request(conn, "POST", other_path, headers, comment)
+
+      assert %{"error" => "idempotency_conflict"} = json(conflict)
+
+      other_headers = [{"idempotency-key", "00000000-0000-4000-8000-000000000005"}]
+
+      assert {:ok, conn, %{status: 200} = commented} =
+               request(conn, "POST", other_path, other_headers, comment)
+
+      assert %{
+               "item" => %{
+                 "item_id" => second_id,
+                 "terminal" => %{"state" => "answered", "answer" => %{"kind" => "reply", "text" => "settled"}}
+               }
+             } = json(commented)
+
+      assert second_id == items["app:team/second"]
+
+      assert :ok = Relay.owner_replace_agent_grants(relay, person, owner, agent, 4, [], [])
+      assert {:ok, _conn, %{status: 403}} = request(conn, "POST", path, headers, body)
+    end
+
     test "the legacy device listener does not admit an agent certificate with the flag off",
          ctx do
       {_relay, _person, _owner, _agent, port} = start_granted_agent(ctx, false, "granted-off")
@@ -860,8 +928,14 @@ defmodule AttentionServer.ClientAPIListenerTest do
     result
   end
 
-  defp request(conn, method, path, headers \\ []) do
-    case Mint.HTTP.request(conn, method, path, headers, if(method in ~w(POST PUT), do: "{}")) do
+  defp request(conn, method, path, headers \\ [], body \\ nil) do
+    case Mint.HTTP.request(
+           conn,
+           method,
+           path,
+           headers,
+           body || if(method in ~w(POST PUT), do: "{}")
+         ) do
       {:ok, conn, ref} -> collect(conn, ref, %{headers: [], body: ""})
       {:error, conn, reason} -> {:error, conn, reason}
     end
