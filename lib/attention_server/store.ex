@@ -46,6 +46,7 @@ defmodule AttentionServer.Store do
     :large_persisted,
     :large_index,
     mode: :legacy,
+    source_bindings: %{},
     progress_version: 0,
     encoding_cache: %{},
     change_log: false,
@@ -233,7 +234,8 @@ defmodule AttentionServer.Store do
     end
   end
 
-  defp finalize_mode(%__MODULE__{mode: :keyed} = store), do: {:ok, store}
+  defp finalize_mode(%__MODULE__{mode: :keyed} = store),
+    do: {:ok, %{store | source_bindings: KeyedValidation.source_index(store.engine.messages)}}
 
   defp finalize_mode(%__MODULE__{mode: :legacy} = store) do
     with {:ok, store} <- load_progress(store) do
@@ -1096,8 +1098,18 @@ defmodule AttentionServer.Store do
   end
 
   defp commit_keyed(store, next, touched, audit) do
+    items = for {:row, :messages, key} <- touched, do: key
+
     result =
-      with :ok <- KeyedValidation.sequences(store.engine, next, touched) do
+      with :ok <- KeyedValidation.sequences(store.engine, next, touched),
+           true <- Enum.all?(items, &valid_item_change?(store.engine, next, &1)),
+           {:ok, index} <-
+             KeyedValidation.source_changes(
+               store.source_bindings,
+               store.engine.messages,
+               next.messages,
+               items
+             ) do
         records = RecordCodec.operations(next, touched)
         log = prepare_change_logs(store, next, touched)
         %{db: db, version: version} = store
@@ -1119,6 +1131,7 @@ defmodule AttentionServer.Store do
              %{
                store
                | engine: next,
+                 source_bindings: index,
                  version: store.version + 1,
                  change_log_touched:
                    MapSet.union(store.change_log_touched, MapSet.new(Map.keys(heads)))
@@ -2593,16 +2606,7 @@ defmodule AttentionServer.Store do
             nonempty?(grant.source_instance_id) and nonempty?(grant.issuer) and
             is_boolean(grant.revoked) and valid_grant_target?(engine, grant.person, grant.target)
         end) and
-        Enum.all?(engine.messages, fn {{person, sender, id}, record} ->
-          owns?(engine, person, record.origin) and
-            record.message["sender_id"] == sender and record.message["message_id"] == id and
-            valid_seq?(engine, person, record.accepted_seq) and
-            valid_conversation_record?(record) and valid_origin_result?(record) and
-            (is_nil(record.terminal) or
-               (valid_terminal_actor?(engine, person, record.terminal) and
-                  valid_seq?(engine, person, record.terminal.seq))) and
-            valid_source_record?(record)
-        end) and
+        Enum.all?(engine.messages, fn {key, record} -> valid_item?(engine, key, record) end) and
         unique_source_bindings?(engine.messages) and
         Enum.all?(engine.events, fn {{person, seq}, event} ->
           valid_seq?(engine, person, seq) and elem(event.key, 0) == person and
@@ -3099,6 +3103,35 @@ defmodule AttentionServer.Store do
 
   defp valid_seq?(engine, person, seq),
     do: is_integer(seq) and seq > 0 and seq <= Map.get(engine.persons, person, 0)
+
+  defp valid_item_change?(old, next, {person, _, _} = key) do
+    case Map.fetch(next.messages, key) do
+      {:ok, record} ->
+        prior = get_in(old.messages, [key, :terminal])
+        terminal = record.terminal
+
+        valid_item?(next, key, record) and
+          (is_nil(prior) or prior === terminal) and
+          (is_nil(terminal) or
+             match?(%{kind: :lifecycle, key: ^key}, next.events[{person, terminal.seq}]))
+
+      :error ->
+        true
+    end
+  rescue
+    _ -> false
+  end
+
+  defp valid_item?(engine, {person, sender, id}, record) do
+    owns?(engine, person, record.origin) and
+      record.message["sender_id"] == sender and record.message["message_id"] == id and
+      valid_seq?(engine, person, record.accepted_seq) and
+      valid_conversation_record?(record) and valid_origin_result?(record) and
+      (is_nil(record.terminal) or
+         (valid_terminal_actor?(engine, person, record.terminal) and
+            valid_seq?(engine, person, record.terminal.seq))) and
+      valid_source_record?(record)
+  end
 
   defp valid_source_record?(record) do
     binding = Map.get(record, :source_binding)

@@ -169,6 +169,54 @@ defmodule AttentionServer.Store.EngineTransitionTest do
     :ok = Store.close(reopened)
   end
 
+  test "keyed and full Store validation agree on actor and binding perturbations" do
+    path = legacy_store_path()
+    {:ok, legacy} = Store.open(path)
+    {first, {:ok, _}} = Engine.request_line(legacy.engine, @origin, forward_line(), 100)
+    {:ok, frame} = JSON.decode_line(forward_line())
+
+    frame =
+      frame
+      |> put_in(["message", "message_id"], "another")
+      |> Map.put(
+        "op_id",
+        "00000000-0000-4000-8000-000000000002"
+      )
+
+    {next, {:ok, _}} = Engine.request_line(first, @origin, JSON.encode!(frame) <> "\n", 200)
+    item = {@person, "app:test/worker", "msg"}
+    other = {@person, "app:test/worker", "another"}
+
+    binding = %{
+      "source_instance_id" => "source",
+      "request_id" => "req",
+      "request_revision" => "rev"
+    }
+
+    next = put_in(next.messages[item].source_binding, Map.put(binding, "acceptance_seq", 1))
+    audit = %{person: @person, actor: @origin, action: "forward"}
+    {:ok, legacy} = Store.commit(legacy, next, audit)
+
+    assert {:ok, _} = KeyedMigration.convert(legacy)
+    :ok = Store.close(legacy)
+    {:ok, keyed} = Store.open(path, :keyed)
+
+    invalid = [
+      put_in(next.messages[other].source_binding, Map.put(binding, "acceptance_seq", 2)),
+      put_in(next.messages[other].origin, "invalid actor")
+    ]
+
+    for proposed <- invalid do
+      assert {:error, :storage_unavailable, ^keyed} =
+               Store.commit(keyed, {proposed, MapSet.new([{:row, :messages, other}])}, audit)
+
+      full = %{legacy | db: keyed.db}
+      assert {:error, :storage_unavailable, ^full} = Store.commit(full, proposed, audit)
+    end
+
+    :ok = Store.close(keyed)
+  end
+
   defp normalized_legacy_engine do
     {:ok, reopened} = Store.open(legacy_store_path())
     :ok = Store.close(reopened)

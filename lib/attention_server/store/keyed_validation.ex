@@ -1,6 +1,43 @@
 defmodule AttentionServer.Store.KeyedValidation do
   @moduledoc false
 
+  def source_index(messages) do
+    Enum.reduce(messages, %{}, fn {key, record}, index ->
+      case source_key(record) do
+        nil -> index
+        source -> Map.put(index, source, key)
+      end
+    end)
+  end
+
+  def source_changes(index, old_messages, next_messages, changed_items) do
+    cleared =
+      Enum.reduce(changed_items, index, fn key, current ->
+        case source_key(Map.get(old_messages, key)) do
+          nil -> current
+          source -> Map.delete(current, source)
+        end
+      end)
+
+    Enum.reduce_while(changed_items, {:ok, cleared}, fn key, {:ok, current} ->
+      case source_key(Map.get(next_messages, key)) do
+        nil ->
+          {:cont, {:ok, current}}
+
+        source ->
+          if Map.has_key?(current, source),
+            do: {:halt, {:error, :source_binding_conflict}},
+            else: {:cont, {:ok, Map.put(current, source, key)}}
+      end
+    end)
+  end
+
+  defp source_key(%{source_binding: binding}) when is_map(binding) do
+    {binding["source_instance_id"], binding["request_id"], binding["request_revision"]}
+  end
+
+  defp source_key(_), do: nil
+
   # The committed Engine satisfied the full validator. Each changed sequence
   # must still be inside its person's high-water mark, and the live row count
   # must change by exactly the same amount as that high-water mark.
