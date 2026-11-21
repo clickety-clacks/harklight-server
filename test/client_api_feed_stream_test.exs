@@ -729,23 +729,31 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
   ## A slow client
 
   test "a client that stops reading holds no backlog and never blocks the relay", ctx do
-    conn = connect(ctx)
+    # Close the stream's flow-control window up front so the first change
+    # blocks, regardless of socket buffer sizes or test host load.
+    assert {:ok, conn} = Mint.HTTP2.put_settings(connect(ctx), initial_window_size: 0)
     {conn, feed} = open_feed(conn)
-    {_conn, _feed} = await_open(conn, feed)
+    {conn, _feed} = await_open(conn, feed)
     [pid] = feed_pids(ctx)
 
-    # The client reads nothing more. Far more than its windows and the socket
-    # buffers can hold arrives, so the feed's send blocks (review N1).
-    title = String.duplicate("x", 200_000)
+    forward(ctx.relay, "m1", 1)
 
-    for n <- 1..60 do
-      {micros, _} = :timer.tc(fn -> forward(ctx.relay, "m#{n}", n, title) end)
+    assert eventually(fn ->
+             case Process.info(pid, :current_stacktrace) do
+               {:current_stacktrace, stack} ->
+                 Enum.any?(stack, &match?({Plug.Conn, :chunk, _, _}, &1))
+
+               nil ->
+                 false
+             end
+           end)
+
+    # These commits wake the watcher while the first send is still blocked.
+    for n <- 2..40 do
+      {micros, _} = :timer.tc(fn -> forward(ctx.relay, "m#{n}", n) end)
       # Each write commits promptly: the relay never waits on the feed.
       assert micros < 2_000_000
     end
-
-    # Small commits while the send is blocked: each wakes the watcher.
-    for n <- 61..260, do: forward(ctx.relay, "m#{n}", n)
 
     {micros, {:ok, _}} = :timer.tc(fn -> ChangeLog.head(:sys.get_state(ctx.relay).store, "A") end)
     assert micros < 1_000_000
@@ -759,6 +767,7 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
     assert Enum.count(messages, &match?({:change_log, _, _}, &1)) <= 1
     {:memory, memory} = Process.info(pid, :memory)
     assert memory < 64_000_000
+    Mint.HTTP.close(conn)
   end
 
   ## Ends that are not the server's shutdown (review of #207)
