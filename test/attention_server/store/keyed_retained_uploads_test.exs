@@ -77,10 +77,12 @@ defmodule AttentionServer.Store.KeyedRetainedUploadsTest do
     path: path,
     upload_path: file
   } do
+    assert {:ok, legacy} = Store.open(path)
     File.rm!(file)
     before = legacy_anchor(path)
 
-    assert {:error, :retained_upload_unavailable} = convert(path)
+    assert {:error, :retained_upload_unavailable} = convert_open_store(legacy)
+    assert :ok = Store.close(legacy)
     assert legacy_anchor(path) == before
     assert_unconverted(path)
 
@@ -90,10 +92,12 @@ defmodule AttentionServer.Store.KeyedRetainedUploadsTest do
   end
 
   test "same-size corrupt retained bytes refuse conversion", %{path: path, upload_path: file} do
+    assert {:ok, legacy} = Store.open(path)
     File.write!(file, <<0, 17, 250, 98>>)
     before = legacy_anchor(path)
 
-    assert {:error, :retained_upload_unavailable} = convert(path)
+    assert {:error, :retained_upload_unavailable} = convert_open_store(legacy)
+    assert :ok = Store.close(legacy)
     assert legacy_anchor(path) == before
     assert_unconverted(path)
   end
@@ -142,11 +146,15 @@ defmodule AttentionServer.Store.KeyedRetainedUploadsTest do
   defp convert(path) do
     with {:ok, legacy} <- Store.open(path) do
       try do
-        KeyedMigration.convert_store(legacy, fn _, _, generation -> {:ok, generation} end)
+        convert_open_store(legacy)
       after
         Store.close(legacy)
       end
     end
+  end
+
+  defp convert_open_store(legacy) do
+    KeyedMigration.convert_store(legacy, fn _, _, generation -> {:ok, generation} end)
   end
 
   defp legacy_anchor(path) do

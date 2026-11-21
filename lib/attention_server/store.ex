@@ -447,21 +447,42 @@ defmodule AttentionServer.Store do
   end
 
   @doc false
-  def verify_retained_uploads(%__MODULE__{engine: engine, upload_dir: directory}) do
+  def verify_retained_uploads(%__MODULE__{engine: engine} = store) do
     if valid_upload_references?(engine) do
-      engine
-      |> KeyedValidation.upload_index()
-      |> Enum.reduce_while(:ok, fn {id, _entries}, :ok ->
-        with true <- AttentionServer.Message.uuid_v4?(id),
-             {:ok, upload} <- Map.fetch(engine.uploads, id),
-             :ok <- verify_upload(Path.join(directory, id), upload) do
-          {:cont, :ok}
-        else
-          _ -> {:halt, {:error, :retained_upload_unavailable}}
-        end
-      end)
+      check_retained_uploads(store, &verify_upload/2)
     else
       {:error, :retained_upload_unavailable}
+    end
+  end
+
+  defp check_retained_uploads(%__MODULE__{engine: engine, upload_dir: directory}, verify) do
+    engine
+    |> retained_upload_ids()
+    |> Enum.reduce_while(:ok, fn id, :ok ->
+      with true <- AttentionServer.Message.uuid_v4?(id),
+           {:ok, upload} <- Map.fetch(engine.uploads, id),
+           :ok <- verify.(Path.join(directory, id), upload) do
+        {:cont, :ok}
+      else
+        _ -> {:halt, {:error, :retained_upload_unavailable}}
+      end
+    end)
+  end
+
+  defp retained_upload_ids(engine) do
+    origin_ids = engine |> KeyedValidation.upload_index() |> Map.keys() |> MapSet.new()
+
+    for {_key, record} <- engine.messages,
+        {_revision, files} <- Map.get(record, :files_by_revision, %{}),
+        %{"tier" => "upload", "upload_id" => id} <- files,
+        into: origin_ids,
+        do: id
+  end
+
+  defp verify_upload_size(path, %{size: size}) do
+    case File.stat(path) do
+      {:ok, %{type: :regular, size: ^size}} -> :ok
+      _ -> {:error, :retained_upload_unavailable}
     end
   end
 
@@ -509,7 +530,8 @@ defmodule AttentionServer.Store do
   def prune_untracked_uploads(%__MODULE__{upload_dir: nil}), do: :ok
 
   def prune_untracked_uploads(%__MODULE__{} = store) do
-    with {:ok, names} <- File.ls(store.upload_dir) do
+    with :ok <- check_retained_uploads(store, &verify_upload_size/2),
+         {:ok, names} <- File.ls(store.upload_dir) do
       names
       |> Enum.filter(fn name ->
         cond do
@@ -537,6 +559,12 @@ defmodule AttentionServer.Store do
         end
       end)
     else
+      {:error, :retained_upload_unavailable} ->
+        # Fetching this attachment already fails independently. Leave files in
+        # place while the retained upload inventory cannot be verified.
+        Diagnostics.failure(:upload_cleanup, :startup_cleanup, :upload_integrity_mismatch)
+        :ok
+
       {:error, reason} ->
         Diagnostics.failure(:server_storage, :store_open, reason, :unavailable)
         {:error, :storage_unavailable}
@@ -2556,11 +2584,11 @@ defmodule AttentionServer.Store do
             nonempty?(grant.source_instance_id) and nonempty?(grant.issuer) and
             is_boolean(grant.revoked) and valid_grant_target?(engine, grant.person, grant.target)
         end) and
-        Enum.all?(engine.messages, fn {{person, sender, id}, record} ->
+        Enum.all?(engine.messages, fn {{person, sender, id} = key, record} ->
           owns?(engine, person, record.origin) and
             record.message["sender_id"] == sender and record.message["message_id"] == id and
             valid_seq?(engine, person, record.accepted_seq) and
-            valid_conversation_record?(record) and valid_origin_result?(record) and
+            valid_conversation_record?(engine, key, record) and valid_origin_result?(record) and
             (is_nil(record.terminal) or
                (valid_terminal_actor?(engine, person, record.terminal) and
                   valid_seq?(engine, person, record.terminal.seq))) and
@@ -2652,38 +2680,61 @@ defmodule AttentionServer.Store do
     end)
   end
 
-  defp valid_conversation_record?(record) do
+  defp valid_conversation_record?(engine, key, record) do
     handle = Map.get(record, :session_handle)
     vendor = Map.get(record, :vendor_session_id)
     revision = Map.get(record, :revision, 1)
     revisions = Map.get(record, :revisions, %{1 => record.message})
     files_by_revision = Map.get(record, :files_by_revision, %{})
 
-    case handle do
-      nil ->
-        is_nil(vendor) and revision == 1
+    files_valid? =
+      is_map(files_by_revision) and
+        Enum.all?(files_by_revision, fn {n, files} ->
+          is_integer(n) and n >= 1 and n <= revision and
+            AttentionServer.ConversationFiles.valid_stored?(files) and
+            valid_revision_uploads?(engine, key, n, files)
+        end)
 
-      _ ->
-        AttentionServer.Conversation.valid_session?(handle, vendor) and
-          is_integer(revision) and revision >= 1 and is_map(revisions) and
-          is_map(files_by_revision) and
-          Enum.all?(files_by_revision, fn {n, files} ->
-            is_integer(n) and n >= 1 and n <= revision and
-              AttentionServer.ConversationFiles.valid_stored?(files)
-          end) and
-          map_size(revisions) == revision and revisions[revision] == record.message and
-          Enum.all?(1..revision, fn n ->
-            case Map.fetch(revisions, n) do
-              {:ok, message} ->
-                AttentionServer.Message.validate(message) == :ok and
-                  message["sender_id"] == record.message["sender_id"] and
-                  message["message_id"] == record.message["message_id"]
+    files_valid? and
+      case handle do
+        nil ->
+          is_nil(vendor) and revision == 1
 
-              :error ->
-                false
-            end
-          end)
-    end
+        _ ->
+          AttentionServer.Conversation.valid_session?(handle, vendor) and
+            is_integer(revision) and revision >= 1 and is_map(revisions) and
+            map_size(revisions) == revision and revisions[revision] == record.message and
+            Enum.all?(1..revision, fn n ->
+              case Map.fetch(revisions, n) do
+                {:ok, message} ->
+                  AttentionServer.Message.validate(message) == :ok and
+                    message["sender_id"] == record.message["sender_id"] and
+                    message["message_id"] == record.message["message_id"]
+
+                :error ->
+                  false
+              end
+            end)
+      end
+  end
+
+  defp valid_revision_uploads?(engine, {person, sender, message_id}, revision, files) do
+    Enum.all?(files, fn
+      %{"tier" => "upload", "upload_id" => id} = file ->
+        case Map.get(engine.uploads, id) do
+          %{person: ^person, sender_id: ^sender, message_id: ^message_id} = upload ->
+            # A later revision can carry a file from this message's earlier revision.
+            is_integer(upload.revision) and upload.revision <= revision and
+              upload.name == file["name"] and upload.size == file["size"] and
+              upload.sha256 == file["sha256"]
+
+          _ ->
+            false
+        end
+
+      _inline ->
+        true
+    end)
   end
 
   defp valid_origin_result?(record) do
