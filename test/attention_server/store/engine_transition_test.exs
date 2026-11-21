@@ -380,6 +380,21 @@ defmodule AttentionServer.Store.EngineTransitionTest do
       assert {:ok, ^expected} = Relay.request_line(keyed, actor, line)
     end
 
+    subscribe =
+      JSON.encode!(%{
+        "v" => 1,
+        "type" => "subscribe_remote",
+        "op_id" => "00000000-0000-4000-8000-000000000020",
+        "revision" => 1,
+        "sender_ids" => ["app:test/worker"]
+      }) <> "\n"
+
+    assert {:ok, legacy_session} = Relay.open_session(legacy, @reader)
+    assert {:ok, keyed_session} = Relay.open_session(keyed, @reader)
+    assert {:ok, [subscribed]} = Relay.session_request_line(legacy, legacy_session, subscribe)
+    assert {:ok, %{"type" => "ok", "revision" => 1}} = JSON.decode_line(subscribed)
+    assert {:ok, [^subscribed]} = Relay.session_request_line(keyed, keyed_session, subscribe)
+
     live_keyed = :sys.get_state(keyed).store
     GenServer.stop(legacy)
     GenServer.stop(keyed)

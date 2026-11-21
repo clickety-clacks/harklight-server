@@ -3926,13 +3926,10 @@ defmodule AttentionServer.Engine do
         :missing ->
           next =
             engine
-            |> Map.put(
-              :subscriptions,
-              Map.put(engine.subscriptions, {person, device}, %{
-                revision: revision,
-                senders: MapSet.new(senders)
-              })
-            )
+            |> put_row(:subscriptions, {person, device}, %{
+              revision: revision,
+              senders: MapSet.new(senders)
+            })
             |> save_receipt(person, device, frame["op_id"], semantic, %{"revision" => revision})
 
           {:ok, next, %{"revision" => revision}}

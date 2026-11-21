@@ -48,6 +48,10 @@ defmodule AttentionServer.Relay do
                           message_open answer answer_no_comment discussion conversation_read
                           view_get
                         )
+  @keyed_request_types ~w(
+    forward message_open discussion answer conversation_reply conversation_revise
+    conversation_read subscribe_remote
+  )
 
   def start_link(opts \\ []) do
     GenServer.start_link(__MODULE__, opts, Keyword.take(opts, [:name]))
@@ -5368,16 +5372,7 @@ defmodule AttentionServer.Relay do
       when type in ["forward", "discussion", "conversation_reply", "conversation_revise"] ->
         perform_request_frame(state, key, frame)
 
-      {:ok, %{"type" => type}}
-      when type in [
-             "forward",
-             "message_open",
-             "discussion",
-             "answer",
-             "conversation_reply",
-             "conversation_revise",
-             "conversation_read"
-           ] ->
+      {:ok, %{"type" => type}} when type in @keyed_request_types ->
         perform_request_line(state, key, raw)
 
       _ ->
@@ -5447,6 +5442,14 @@ defmodule AttentionServer.Relay do
   end
 
   defp perform_request_frame(state, key, frame, staged_sources \\ %{}) do
+    if state.store.mode == :keyed and frame["type"] not in @keyed_request_types do
+      {{:ok, error_line(frame, "storage_unavailable")}, state}
+    else
+      apply_request_frame(state, key, frame, staged_sources)
+    end
+  end
+
+  defp apply_request_frame(state, key, frame, staged_sources) do
     case prepare_inline_overflow_uploads(state, key, frame) do
       {:error, reason} ->
         {{:ok, error_line(frame, reason)}, state}
