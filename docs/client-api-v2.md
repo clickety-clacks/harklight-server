@@ -781,7 +781,7 @@ visible text. Its `attention` member changes:
       "required": ["error", "retryable", "request_id"],
       "properties": {
         "error": { "enum": ["not_found", "invalid_field", "stale_request", "already_answered",
-                            "already_retracted", "idempotency_conflict", "precondition_failed",
+                            "already_retracted", "already_closed", "idempotency_conflict", "precondition_failed",
                             "cursor_expired", "unauthorized", "forbidden", "retry_later",
                             "storage_unavailable", "payload_too_large", "unsupported",
                             "account_paused"] },
@@ -804,6 +804,7 @@ visible text. Its `attention` member changes:
 | `stale_request` | 409 | false | `request_revision` is behind the item (`stale_revision`) |
 | `already_answered` | 409 | false | Only on `/answer`: the item's `terminal` is already set (`closed`) |
 | `already_retracted` | 409 | false | The origin retracted the item (`retracted`) |
+| `already_closed` | 409 | false | A closed message or result refuses the agent transition (§9.2) |
 | `idempotency_conflict` | 409 | false | Same key, different request (`operation_conflict`) |
 | `precondition_failed` | 412 | false | `If-Match` does not match. Also a superseded push `revision` (`stale_push_binding`). |
 | `cursor_expired` | 410 | false | `after` is older than retention |
@@ -868,7 +869,7 @@ provides the file caps and retention window.
 
 | Request | Response body |
 |---|---|
-| `GET /v2/agent/messages?page=&session=` | `SentMessagesPage` |
+| `GET /v2/agent/messages?page=&session=&sender=&legacy_message_id=` | `SentMessagesPage` |
 | `GET /v2/agent/messages/{item_id}` | `SentMessageResponse` |
 | `GET /v2/agent/messages/{item_id}/entries?before=&limit=` | `AgentEntriesPage` |
 | `GET /v2/agent/focus` | `AgentFocus` |
@@ -888,7 +889,8 @@ agents with existing data. Clients apply newer versions of each resource.
       "properties": {
         "state": { "enum": ["answered", "cleared", "expired", "superseded", "retracted"] },
         "at_ms": { "$ref": "#/$defs/TimeMs" },
-        "answer": { "description": "The raw stored answer, including an explicit null. Present exactly when there is an answer value." }
+        "answer": { "description": "The raw stored answer, including an explicit null. Present exactly when an answer value was stored." },
+        "outcome": { "$ref": "#/$defs/AnswerOutcome" }
       }
     },
     "SentMessage": {
@@ -899,6 +901,7 @@ agents with existing data. Clients apply newer versions of each resource.
         "rev": { "$ref": "#/$defs/Rev" },
         "sender": { "type": "string" },
         "session": { "$ref": "#/$defs/AgentSession" },
+        "legacy_message_id": { "type": "string", "description": "Agent-chosen message_id carried over from before cut-over" },
         "revision": { "type": "integer", "minimum": 1 },
         "message": { "type": "object", "description": "Current admitted sender content" },
         "files": { "type": "array", "items": { "$ref": "#/$defs/FileRef" } },
@@ -917,7 +920,7 @@ agents with existing data. Clients apply newer versions of each resource.
         "item_id": { "$ref": "#/$defs/OpaqueId" },
         "rev": { "$ref": "#/$defs/Rev" },
         "position": { "type": "integer", "minimum": 1 },
-        "kind": { "enum": ["reply", "answer", "lifecycle", "revision", "availability", "result"] },
+        "kind": { "enum": ["reply", "lifecycle", "revision", "availability", "result"] },
         "author": { "enum": ["person", "origin", "server"] },
         "request_revision": { "type": "integer", "minimum": 1 },
         "at_ms": { "$ref": "#/$defs/TimeMs" },
@@ -925,9 +928,16 @@ agents with existing data. Clients apply newer versions of each resource.
         "files": { "type": "array", "items": { "$ref": "#/$defs/FileRef" } },
         "in_reply_to": { "$ref": "#/$defs/OpaqueId" },
         "state": { "enum": ["active", "withdrawn", "retracted"] },
-        "terminal": { "$ref": "#/$defs/AgentTerminal", "description": "On answer and lifecycle entries" },
         "availability": { "$ref": "#/$defs/Availability" },
         "result": { "$ref": "#/$defs/OriginResult" },
+        "priority": {
+          "type": "object",
+          "required": ["level"],
+          "properties": {
+            "level": { "$ref": "#/$defs/PriorityLevel4" },
+            "score": { "type": "number" }
+          }
+        },
         "delivery": {
           "type": "object",
           "properties": {
@@ -993,16 +1003,19 @@ agents with existing data. Clients apply newer versions of each resource.
 
 - The message list includes retained terminal messages. It sorts by original
   acceptance, newest first, with a stable tie-breaker. Pass back the opaque
-  `next_page` as `page` with the same session filter. The last page omits
-  `next_page`.
+  `next_page` as `page` with the same filters. The last page omits `next_page`.
+  `sender` and `legacy_message_id` are exact-match filters. The latter
+  matches only pre-cut-over messages. Agents can use the two filters
+  together to resolve their old references to `item_id`.
 - `PUT` compares against the message's integer `revision`. The message
   read's quoted `ETag` covers the entire resource version for conditional
   `GET`, including changes to terminal state and receipts.
 - Entry ordering and `before` follow §4. `older` is true when another page
   precedes the returned one. Agent entries keep the common Entry fields and
-  add answers, other terminal actions and the agent's receipt details. A
-  message without a session has no agent conversation and returns an empty
-  entry page.
+  add the agent’s receipt details. Retraction retains its lifecycle entry.
+  Answers and other terminal actions are read from `SentMessage.terminal`.
+  A message without a session has no agent conversation and returns an
+  empty entry page.
 - Focus requires a see grant. The listing follows §5.1, with current devices
   ordered by last focus activity and then by device ID. A lapsed report ends
   listing and targetability immediately. See and push grants are independent
@@ -1015,7 +1028,7 @@ agents with existing data. Clients apply newer versions of each resource.
 |---|---|---|
 | `POST /v2/agent/messages` | `SendMessageBody` | `AgentWriteResult` with `message` |
 | `PUT /v2/agent/messages/{item_id}` | `ReviseMessageBody`, with `If-Match: <revision>` | `AgentWriteResult` with `message` |
-| `POST /v2/agent/messages/{item_id}/retract` | `EmptyBody` | `AgentWriteResult` with `message` |
+| `POST /v2/agent/messages/{item_id}/retract` | `RetractMessageBody` | `AgentWriteResult` with `message` |
 | `POST /v2/agent/messages/{item_id}/lifecycle` | `AgentLifecycleBody` | `AgentWriteResult` with `message` |
 | `POST /v2/agent/messages/{item_id}/replies` | `AgentReplyBody` | `AgentWriteResult` with `entry` |
 | `POST /v2/agent/messages/{item_id}/result` | `AgentResultBody` | `AgentWriteResult` with `message` and `entry` |
@@ -1040,9 +1053,15 @@ also include the message or entry affected by the same transaction.
       "properties": {
         "sender": { "type": "string" },
         "session": { "$ref": "#/$defs/AgentSession" },
+        "supersedes": { "type": "array", "items": { "$ref": "#/$defs/OpaqueId" } },
         "message": { "type": "object" },
         "file_ids": { "$ref": "#/$defs/AgentFileIds" }
       }
+    },
+    "RetractMessageBody": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": { "in_reply_to": { "$ref": "#/$defs/OpaqueId" } }
     },
     "ReviseMessageBody": {
       "type": "object",
@@ -1115,7 +1134,18 @@ also include the message or entry affected by the same transaction.
       "properties": {
         "rev": { "$ref": "#/$defs/Position" },
         "message": { "$ref": "#/$defs/SentMessage" },
-        "entry": { "$ref": "#/$defs/AgentEntry" }
+        "entry": { "$ref": "#/$defs/AgentEntry" },
+        "supersedes_warnings": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["item_id", "reason"],
+            "properties": {
+              "item_id": { "$ref": "#/$defs/OpaqueId" },
+              "reason": { "enum": ["invalid", "unknown", "closed"] }
+            }
+          }
+        }
       }
     }
   }
@@ -1129,12 +1159,16 @@ also include the message or entry affected by the same transaction.
   integer `revision`; a missing or mismatched precondition answers
   `412 precondition_failed`. A retracted message refuses revision with
   `409 already_retracted`. Progress updates are revisions of an FYI using
-  its `progress` member.
+  its `progress` member. On send, `supersedes` closes earlier messages of
+  the same agent under today’s transition rules. The response carries
+  `supersedes_warnings` for any targets that cannot be superseded.
 - **Lifecycle and retract.** Both stamp the time on the server. Lifecycle
   follows the existing transition rules. A repeat retraction under a new
-  key answers `409 already_retracted`. A disallowed transition answers
-  `400 invalid_field`, with `field: "action"` for lifecycle. Use the
-  receipt endpoint to acknowledge handoff independently of retraction.
+  key answers `409 already_retracted`. A closed message that refuses the
+  transition answers `409 already_closed`. A malformed lifecycle action
+  answers `400 invalid_field` with `field: "action"`. When retract names a
+  person entry in `in_reply_to`, it also marks that entry acted. Handoff
+  still uses the receipt endpoint.
 - **Replies.** Either side may reply any number of times in every item
   state, including after answer or retraction. If supplied, `in_reply_to`
   identifies an entry in that conversation. A send without a session has no
@@ -1142,8 +1176,8 @@ also include the message or entry affected by the same transaction.
   activity is informational. There is no `accepts_replies` member.
 - **Result.** Applies to the current answer and follows today's result
   transition rules. `received` can advance to `applied` or `refused`.
-  Illegal result transitions answer `400 invalid_field` with
-  `field: "status"`. `already_answered` is reserved for the person's
+  A disallowed state transition answers `409 already_closed`. A malformed
+  status answers `400 invalid_field` with `field: "status"`. `already_answered` is reserved for the person's
   `/answer`.
 - **Receipt.** A receipt targets a person-authored reply or answer.
   `not_handed` requires a non-blank reason and may later advance to
@@ -1244,6 +1278,9 @@ first page's position, and reopen.
   Every feed still uses the agent-wide `rev`. A batch position can be later
   than the last returned change, including in an empty filtered batch.
   Feed connections are independent, and any number may cover a session.
+- Answers and terminal close-outs appear as `message` changes, including
+  on sends without a session. The per-agent `rev` orders these changes
+  against chat entries in commit order.
 - The first time a person-authored entry is served in the feed, the server
   records Delivered once. The receipt write is the explicit handoff to
   the model. A later delivery or receipt updates the same entry resource.
