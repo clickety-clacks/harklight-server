@@ -807,7 +807,7 @@ visible text. Its `attention` member changes:
 | `stale_request` | 409 | false | `request_revision` is behind the item (`stale_revision`) |
 | `already_answered` | 409 | false | Only on `/answer`: the item's `terminal` is already set (`closed`) |
 | `already_retracted` | 409 | false | The origin retracted the item (`retracted`); also an agent revise or retract on that item |
-| `already_closed` | 409 | false | A discard targets an attached upload handle, a closed message refuses an agent write, or an agent result or file-use report conflicts (§5, §9.2) |
+| `already_closed` | 409 | false | A discard targets an attached upload handle, an agent write targets a closed message, a correlated revise targets an already-acted turn, or an agent result or file-use report conflicts (§5, §9.2) |
 | `not_answered` | 409 | false | The agent tried to record a result before an answer |
 | `idempotency_conflict` | 409 | false | Same key, different request (`operation_conflict`) |
 | `precondition_failed` | 412 | false | `If-Match` does not match. Also a superseded push `revision` (`stale_push_binding`). |
@@ -1064,7 +1064,7 @@ agents with existing data. Clients apply newer versions of each resource.
 | Request | Body | Success body |
 |---|---|---|
 | `POST /v2/agent/messages` | `SendMessageBody` | `AgentSendResult` |
-| `PUT /v2/agent/messages/{item_id}` | `ReviseMessageBody`, with `If-Match: <revision>` | `AgentMessageResult` |
+| `PUT /v2/agent/messages/{item_id}` | `ReviseMessageBody`, with `If-Match: <revision>` | `AgentReviseResult` |
 | `POST /v2/agent/messages/{item_id}/retract` | `RetractMessageBody` | `AgentRetractResult` |
 | `POST /v2/agent/messages/{item_id}/lifecycle` | `AgentLifecycleBody` | `AgentMessageResult` |
 | `POST /v2/agent/messages/{item_id}/replies` | `AgentReplyBody` | `AgentReplyResult` |
@@ -1123,7 +1123,8 @@ Writes return 200 unless the table says otherwise. Each response schema requires
       "additionalProperties": false,
       "properties": {
         "message": { "$ref": "#/$defs/AgentMessageContent" },
-        "file_ids": { "$ref": "#/$defs/AgentFileIds" }
+        "file_ids": { "$ref": "#/$defs/AgentFileIds" },
+        "in_reply_to": { "$ref": "#/$defs/OpaqueId" }
       }
     },
     "AgentLifecycleBody": {
@@ -1178,36 +1179,45 @@ Writes return 200 unless the table says otherwise. Each response schema requires
     },
     "AgentFileUseBody": {
       "type": "object",
-      "required": ["file_id", "outcome"],
+      "required": ["file_id"],
       "additionalProperties": false,
       "properties": {
         "file_id": { "$ref": "#/$defs/OpaqueId" },
-        "outcome": { "enum": ["used", "unusable", "not_transferred"] },
+        "transfer": { "enum": ["transferred", "not_transferred"] },
+        "use": { "enum": ["used", "unusable"] },
         "reason": { "type": "string", "minLength": 1 }
       },
-      "if": { "properties": { "outcome": { "enum": ["unusable", "not_transferred"] } } },
+      "anyOf": [{ "required": ["transfer"] }, { "required": ["use"] }],
+      "if": { "anyOf": [
+        { "required": ["transfer"], "properties": { "transfer": { "const": "not_transferred" } } },
+        { "required": ["use"], "properties": { "use": { "const": "unusable" } } }
+      ] },
       "then": { "required": ["reason"] },
       "else": { "not": { "required": ["reason"] } }
     },
     "AgentFileUse": {
       "type": "object",
-      "required": ["file_id", "outcome"],
+      "required": ["file_id"],
       "properties": {
         "file_id": { "$ref": "#/$defs/OpaqueId" },
-        "outcome": { "enum": ["used", "unusable", "not_transferred"] },
-        "reason": { "type": "string" }
+        "transfer": { "enum": ["transferred", "not_transferred"] },
+        "transfer_reason": { "type": "string" },
+        "use": { "enum": ["used", "unusable"] },
+        "use_reason": { "type": "string" }
       }
     },
     "AgentFileUseResult": {
       "type": "object",
-      "required": ["rev", "entry", "file_id", "outcome"],
+      "required": ["rev", "entry", "file_id"],
       "properties": {
         "rev": { "$ref": "#/$defs/Position" },
         "entry": { "$ref": "#/$defs/AgentEntry" },
         "file_id": { "$ref": "#/$defs/OpaqueId" },
-        "outcome": { "enum": ["used", "unusable", "not_transferred"] },
+        "transfer": { "enum": ["transferred", "not_transferred"] },
+        "use": { "enum": ["used", "unusable"] },
         "duplicate": { "type": "boolean" }
-      }
+      },
+      "anyOf": [{ "required": ["transfer"] }, { "required": ["use"] }]
     },
     "AgentAdvisoryAckBody": {
       "type": "object",
@@ -1249,6 +1259,12 @@ Writes return 200 unless the table says otherwise. Each response schema requires
     },
     "AgentSendResult": {"$ref": "#/$defs/AgentWriteResult", "type": "object", "required": ["rev", "message"], "properties": {"rev": {}, "message": {}, "supersedes_warnings": {}}, "additionalProperties": false},
     "AgentMessageResult": {"$ref": "#/$defs/AgentWriteResult", "type": "object", "required": ["rev", "message"], "properties": {"rev": {}, "message": {}}, "additionalProperties": false},
+    "AgentReviseResult": {
+      "$ref": "#/$defs/AgentWriteResult",
+      "required": ["rev", "message"],
+      "properties": { "rev": {}, "message": {}, "entry": {} },
+      "additionalProperties": false
+    },
     "AgentRetractResult": {"$ref": "#/$defs/AgentWriteResult", "type": "object", "required": ["rev", "message"], "properties": {"rev": {}, "message": {}, "entry": {}}, "additionalProperties": false},
     "AgentReplyResult": {"$ref": "#/$defs/AgentWriteResult", "type": "object", "required": ["rev", "entry"], "properties": {"rev": {}, "entry": {}}, "additionalProperties": false},
     "AgentResultWriteResult": {"$ref": "#/$defs/AgentWriteResult", "type": "object", "required": ["rev", "message", "entry"], "properties": {"rev": {}, "message": {}, "entry": {}}, "additionalProperties": false},
@@ -1297,6 +1313,22 @@ Writes return 200 unless the table says otherwise. Each response schema requires
   and already-terminal targets produce `invalid`, `unknown` and `closed`
   warnings respectively (`Engine.supersede_listed_targets`). The response carries
   `supersedes_warnings` for any targets that cannot be superseded.
+- **Correlated revise.** Optional `in_reply_to` names a person chat turn
+  on this item at its current revision. A different item or kind is
+  `404 not_found`, and an earlier revision is `409 stale_request`.
+  The successful write marks the turn acted and returns it as `entry`.
+  A turn already acted on returns `409 already_closed` and applies no
+  revision (`Conversation.act`).
+- **Revise attachments.** Omit `file_ids` to keep the current revision's
+  attachments, including migrated inline files, under the same
+  `If-Match`. An empty array clears the attachments. A nonempty array is
+  the complete replacement set. Its members may be upload handles or
+  `FileRef.file_id` download IDs of files currently on this item's
+  revision. The latter carry existing files without re-upload. Other IDs
+  return `400 invalid_field` with `field: "file_ids"`. For all three
+  forms, the server validates retained IDs and applies the new revision
+  and its complete attachment set atomically with the `If-Match` check.
+  Other write routes accept upload handles only.
 - **Lifecycle and retract.** Only the item's originating key can use either
   route. Both stamp the time on the server. Lifecycle
   follows the existing transition rules. A repeat retraction under a new
@@ -1340,13 +1372,16 @@ Writes return 200 unless the table says otherwise. Each response schema requires
   recorded, or was superseded by the existing handoff. It also carries the
   effective `stage_outcome` and affected message or entry.
 - **File use.** The file must belong to the referenced delivered turn.
-  Report `used`, `unusable` or `not_transferred`. Provide a nonempty
-  reason for either unsuccessful outcome and omit it for `used`.
-  `not_transferred` folds the legacy ACK1 attachment transfer report into
-  this route (`ConversationFiles.valid_use?` and `transfers_for`).
-  An identical use report is a duplicate. A different report for the same
-  file and turn conflicts with the existing one and answers
-  `409 already_closed`.
+  Send at least one of `transfer` (`transferred` or `not_transferred`) or
+  `use` (`used` or `unusable`). Supply a nonempty reason for an unsuccessful
+  report. If both reports are unsuccessful, the reason applies to both.
+  Transfer and use have independent histories. A later use may follow a
+  failed transfer. A value or reason that disagrees with the prior report
+  in the same dimension answers `409 already_closed`, and the request
+  applies neither report. If every supplied report repeats its existing value and
+  reason, the response carries `duplicate: true`. The updated entry
+  carries the recorded transfer and use, with each report's reason when
+  present.
 - **Advisory acknowledgment.** Supply the advisory's ID from the item.
   The response reports whether it was already marked delivered.
 - **End session.** `404 not_found` for an unknown session of this enrolled
@@ -1517,7 +1552,7 @@ can skip agent-wide revisions.
 | `GET /v2/agent/messages/{item_id}`, or `GET /v2/agent/messages/{item_id}/revisions/{n}` for a selected revision | `message_get` |
 | `GET /v2/agent/changes` with optional `session` (agent spec r2 §4) | `feed`, change notices, session listen, coverage stream |
 | Automatic when the feed serves the turn (agent spec r2 §4) | `ack` (ACK1) |
-| `POST /v2/agent/messages/{item_id}/entries/{entry_id}/file-use` with `not_transferred` and reason | ACK1 attachment transfer reports (round 20 addendum 3) |
+| `POST /v2/agent/messages/{item_id}/entries/{entry_id}/file-use` with `transfer` and reason when required | ACK1 attachment transfer reports (round 20 addendum 4) |
 | `GET /v2/agent/messages` | Baseline for a new or expired feed cursor |
 | Retired. Feed activity supplies availability (agent spec r2 §§0, 4) | `support`, `attachment_update`, `status`, `coverage` |
 | Retired. Feeds are independent (agent spec r2 §§0, 4) | Exclusive listener, reconnect takeover |
