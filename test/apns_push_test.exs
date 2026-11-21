@@ -89,6 +89,7 @@ defmodule AttentionServer.APNSPushTest do
     TLSFixtures
   }
 
+  alias AttentionServer.PushDispatcher.Worker
   alias Exqlite.Sqlite3
 
   @provider_profile "harklight-sandbox"
@@ -1717,33 +1718,31 @@ defmodule AttentionServer.APNSPushTest do
 
     options =
       server_options(ctx.certs, store_path) ++
-        [apns: apns_options(ctx) ++ [attempt_timeout_ms: 1_500], feature_flags_path: flags]
+        [apns: apns_options(ctx) ++ [attempt_timeout_ms: 10_000], feature_flags_path: flags]
 
     server = start_test_server(options)
     assert Server.client_api_v2?(server)
     relay = Server.relay(server)
-    {sender_key, slow_key} = setup_test_devices(relay, ctx.certs)
+    {sender_key, app_key} = setup_test_devices(relay, ctx.certs)
+    # A single send queues both devices at the same instant. The worker
+    # claims the lower device key first when the due times are equal.
+    [slow_key, fast_key] = Enum.sort([sender_key, app_key])
+
+    # Use the real worker state and advance one dispatch at a time so we can
+    # inspect its durable retry before the next poll can claim it again.
+    state = :sys.get_state(push_worker(server))
+    assert %{bounded_attempts?: true, attempt_timeout_ms: 10_000} = state
+    assert :ok = Supervisor.terminate_child(server, :push_dispatcher)
 
     slow_path = "/3/device/" <> @device_token
     fast_token = String.duplicate("cd", 32)
     fast_path = "/3/device/" <> fast_token
 
-    hold_provider_response(ctx, slow_path)
     register_test_binding(relay, slow_key, @device_token, 1)
+    register_test_binding(relay, fast_key, fast_token, 2)
     forward_test_message(relay, sender_key)
 
-    # The first message must go out on the next worker poll, without waiting for pacing.
-    assert_receive {:apns_request, "POST", ^slow_path, headers, body}, 2_000
-    assert Map.new(headers)["apns-push-type"] == "alert"
-    assert {:ok, %{"aps" => %{"alert" => %{}}}} = JSON.decode_line(body <> "\n")
-    assert_receive {:provider_waiting, _slow_handler}, 1_000
-
-    # The relay still responds while the separate sender owns the connection.
-    assert %{"push" => %{"state" => "sending"}} =
-             request_frame(relay, slow_key, %{"type" => "push_status"})
-
-    register_test_binding(relay, sender_key, fast_token, 2)
-    assert_receive {:apns_request, "POST", ^fast_path, _, _}, 2_500
+    state_after_timeout = dispatch_stalled_attempt(state)
 
     assert %{
              "push" => %{
@@ -1753,17 +1752,86 @@ defmodule AttentionServer.APNSPushTest do
              }
            } = request_frame(relay, slow_key, %{"type" => "push_status"})
 
-    assert_push_accepted(relay, sender_key, 1)
+    assert {:noreply, _state} =
+             Worker.handle_info(:dispatch, %{
+               state_after_timeout
+               | apns_send: state.apns_send,
+                 attempt_timeout_ms: state.attempt_timeout_ms
+             })
+
+    assert_received :dispatch
+    assert_received {:apns_request, "POST", ^fast_path, headers, body}
+    assert Map.new(headers)["apns-push-type"] == "alert"
+    assert {:ok, %{"aps" => %{"alert" => %{}}}} = JSON.decode_line(body <> "\n")
+    assert_push_accepted(relay, fast_key, 1)
     assert :ok = Supervisor.stop(server)
-    Agent.update(ctx.provider_response, fn _ -> {200, ""} end)
 
     restarted = start_test_server(options)
     restarted_relay = Server.relay(restarted)
-    assert_receive {:apns_request, "POST", ^slow_path, _, _}, 3_000
+    assert_receive {:apns_request, "POST", ^slow_path, _, _}, 10_000
+    # The worker answers the system request after it persists the outcome.
+    _ = :sys.get_state(push_worker(restarted), 10_000)
     assert_push_accepted(restarted_relay, slow_key, 2)
 
     assert {:ok, [%{"message_id" => "first-push"}], 1} =
              Relay.events(restarted_relay, slow_key, 0)
+  end
+
+  defp dispatch_stalled_attempt(state) do
+    stalled_send = fn _config, _claim, _cached_token ->
+      receive do
+        :release_stalled_attempt -> flunk("the stalled attempt must be canceled")
+      end
+    end
+
+    dispatch =
+      Task.async(fn ->
+        receive do
+          :dispatch ->
+            # A sender that cannot complete makes a zero-length yield deterministic.
+            result =
+              Worker.handle_info(:dispatch, %{
+                state
+                | apns_send: stalled_send,
+                  attempt_timeout_ms: 0
+              })
+
+            assert_received :dispatch
+            result
+        end
+      end)
+
+    dispatcher = dispatch.pid
+    trace = :trace.session_create(:stalled_apns_attempt, self(), [])
+
+    try do
+      # The zero-length yield can cancel the task before the sender starts.
+      assert :trace.process(trace, dispatcher, true, [:procs]) == 1
+      send(dispatcher, :dispatch)
+      assert_receive {:trace, ^dispatcher, :spawn, attempt, _mfa}, 5_000
+      monitor = Process.monitor(attempt)
+
+      try do
+        result = Task.yield(dispatch, 5_000)
+        if is_nil(result), do: Task.shutdown(dispatch, :brutal_kill)
+        assert {:ok, {:noreply, state_after_timeout}} = result
+        assert_receive {:DOWN, ^monitor, :process, ^attempt, _reason}, 5_000
+        state_after_timeout
+      after
+        Process.demonitor(monitor, [:flush])
+        Process.exit(attempt, :kill)
+      end
+    after
+      :trace.session_destroy(trace)
+    end
+  end
+
+  defp push_worker(server) do
+    assert {:push_dispatcher, dispatcher, :worker, _} =
+             List.keyfind(Supervisor.which_children(server), :push_dispatcher, 0)
+
+    %{child: worker} = :sys.get_state(dispatcher)
+    worker
   end
 
   defp hold_provider_response(ctx, slow_path) do
