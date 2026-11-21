@@ -858,6 +858,34 @@ defmodule AttentionServer.ClientAPIResourcesTest do
     end
   end
 
+  describe "rank score and due time" do
+    test "the view's score and due time reach Rank; baseline entries carry only a level",
+         %{path: path} do
+      relay = scripted_relay(path)
+      forward(relay, "due", 80, %{"urgency" => "now", "by_when" => 4_102_444_800_000})
+      {engine, view} = snapshot(relay)
+      due = view.message_entries_by_identity[{"app:test", "due"}]
+      refute Map.has_key?(due, "score")
+      assert due["priority"] == "now"
+
+      items = rendered_items(engine, view, "reader")
+      assert items[key("due")]["rank"]["due_at_ms"] == 4_102_444_800_000
+      refute Map.has_key?(items[key("due")]["rank"], "score")
+
+      # A scored view (today's selected ranking) carries score per item.
+      scored =
+        update_in(view.message_entries_by_identity, fn entries ->
+          Map.new(entries, fn {identity, entry} -> {identity, Map.put(entry, "score", 0.75)} end)
+        end)
+
+      ranks = Resources.ranks(engine, "A", scored)
+      {:ok, id} = Resources.item_id(engine, key("due"))
+      assert ranks[id]["score"] == 0.75
+      assert ranks[id]["due_at_ms"] == 4_102_444_800_000
+      GenServer.stop(relay)
+    end
+  end
+
   describe "availability entries" do
     test "an availability change is a schema-conformant server entry on each open item",
          %{path: path} do
