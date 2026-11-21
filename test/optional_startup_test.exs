@@ -12,6 +12,27 @@ defmodule AttentionServer.OptionalStartupTest do
     %{certs: certs}
   end
 
+  test "explicit keyed cutover starts the supervised listeners and converts once", %{certs: certs} do
+    opts = server_opts(certs)
+    legacy = start_server(opts)
+    legacy_relay = Server.relay(legacy)
+    assert :ok = AttentionServer.Relay.setup_person(legacy_relay, "retained")
+    before = :sys.get_state(legacy_relay).store.version
+    :ok = Supervisor.stop(legacy)
+
+    opts = Keyword.put(opts, :store_mode, :keyed_cutover)
+    converted = start_server(opts)
+    assert_core_listeners(converted)
+    store = :sys.get_state(Server.relay(converted)).store
+    assert store.mode == :keyed
+    assert store.version == before + 1
+    assert Map.has_key?(store.engine.persons, "retained")
+    :ok = Supervisor.stop(converted)
+
+    reopened = start_server(opts)
+    assert :sys.get_state(Server.relay(reopened)).store.version == store.version
+  end
+
   test "SaaS hosted routes run uncapped and emit one startup notice", %{certs: certs} do
     opts =
       server_opts(certs)
