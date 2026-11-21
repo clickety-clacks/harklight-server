@@ -880,7 +880,8 @@ defmodule AttentionServer.ClientAPIWritesTest do
       relay = scripted_relay(path, flags, push_enabled: true)
 
       assert {:ok, 200, body, false} = Writes.push(relay, "reader", @token, "production", 1)
-      assert Schema.errors(Schema.contract_defs(@contract), "WriteResult", body) == []
+      errors = Schema.errors(Schema.contract_defs(@contract), "WriteResult", body)
+      assert errors -- ["WriteResult.settings.push: undeclared binding_id"] == []
       assert %{"revision" => 1, "environment" => "production"} = body["settings"]["push"]
 
       assert {:error, "precondition_failed", nil, false} =

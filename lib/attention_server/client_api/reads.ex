@@ -439,6 +439,8 @@ defmodule AttentionServer.ClientAPI.Reads do
       {flags, _warned} = FeatureFlags.read(state.feature_flags_path, true)
 
       response = %{
+        "server" => %{"id" => engine.relay_instance_id},
+        "principal" => enrollment_ids(principal),
         "account" => %{
           "state" =>
             if(Engine.delivery_stopped?(engine, principal.person), do: "paused", else: "active")
@@ -483,6 +485,11 @@ defmodule AttentionServer.ClientAPI.Reads do
       end
     end
   end
+
+  defp enrollment_ids(%{kind: :device, person: person, key: device}),
+    do: %{"person_id" => person, "device_id" => device}
+
+  defp enrollment_ids(%{person: person}), do: %{"person_id" => person}
 
   defp with_sender_names(response, engine, %{kind: :device, person: person, key: key}) do
     names = engine.sender_grants |> Map.get({person, key}, []) |> Enum.sort()
