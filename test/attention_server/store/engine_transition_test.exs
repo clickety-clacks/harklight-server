@@ -871,6 +871,64 @@ defmodule AttentionServer.Store.EngineTransitionTest do
     GenServer.stop(reopened)
   end
 
+  test "keyed agent v2 send, session end and retract replay from durable state" do
+    path = legacy_store_path()
+    {:ok, old} = Store.open(path)
+    assert {:ok, _} = KeyedMigration.convert(old)
+    :ok = Store.close(old)
+    flags = path <> ".flags"
+    File.write!(flags, JSON.encode!(%{"client_api_v2" => true}))
+    opts = [store_path: path, store_mode: :keyed, feature_flags_path: flags, clock: fn -> 100 end]
+    {:ok, relay} = Relay.start_link(opts)
+    handle = "00000000-0000-4000-8000-000000000010"
+
+    body = %{
+      "sender" => "app:test/worker",
+      "session" => handle,
+      "message" => %{"title" => "Sent over v2", "created_at" => 1}
+    }
+
+    assert {:ok, 200, %{"message" => %{"item_id" => id}}, false} =
+             agent_write(relay, :send, %{}, body, "00000000-0000-4000-8000-000000000011")
+
+    end_op = "00000000-0000-4000-8000-000000000012"
+
+    assert {:ok, 200, ended, false} =
+             agent_write(relay, :session_end, %{session: handle}, %{}, end_op)
+
+    clear_op = "00000000-0000-4000-8000-000000000013"
+
+    assert {:ok, 200, %{"message" => %{"terminal" => %{"state" => "retracted"}}} = retracted,
+            false} =
+             agent_write(relay, :retract, %{item_id: id}, %{}, clear_op)
+
+    committed = :sys.get_state(relay).store
+    GenServer.stop(relay)
+    {:ok, reopened} = Relay.start_link(opts)
+
+    assert {:ok, 200, ^ended, true} =
+             agent_write(reopened, :session_end, %{session: handle}, %{}, end_op)
+
+    assert {:ok, 200, ^retracted, true} =
+             agent_write(reopened, :retract, %{item_id: id}, %{}, clear_op)
+
+    live = :sys.get_state(reopened).store
+    assert live.version == committed.version
+    assert full_diff(committed.engine, live.engine) == MapSet.new()
+    assert index_state(committed) == index_state(live)
+    GenServer.stop(reopened)
+  end
+
+  defp agent_write(relay, operation, params, body, op_id) do
+    principal = %{person: @person, key: @origin}
+
+    digest =
+      AttentionServer.ClientAPI.Idempotency.digest("POST", [Atom.to_string(operation)], body)
+
+    call = {:execute, {principal, operation, params, op_id, digest, [], body}, op_id, []}
+    GenServer.call(relay, {:client_api, AttentionServer.ClientAPI.AgentWrites, call})
+  end
+
   defp normalize_action_times(engine) do
     actions =
       Map.new(engine.origin_actions, fn {key, action} ->

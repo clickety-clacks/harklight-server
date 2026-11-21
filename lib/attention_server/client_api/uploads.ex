@@ -33,6 +33,12 @@ defmodule AttentionServer.ClientAPI.Uploads do
     )
     """,
     "CREATE INDEX IF NOT EXISTS client_staged_files_at ON client_staged_files (at_ms)",
+    """
+    CREATE TABLE IF NOT EXISTS client_staged_file_owners (
+      file_id TEXT PRIMARY KEY NOT NULL REFERENCES client_staged_files(file_id) ON DELETE CASCADE,
+      owner_key TEXT NOT NULL
+    )
+    """,
     "CREATE TABLE IF NOT EXISTS client_discarded_files (file_id TEXT PRIMARY KEY NOT NULL)"
   ]
 
@@ -65,29 +71,60 @@ defmodule AttentionServer.ClientAPI.Uploads do
   @doc "Moves a fully written temporary file into place and records it."
   @spec stage(struct(), String.t(), map(), String.t()) ::
           {:ok, String.t()} | {:error, term()}
-  def stage(%AttentionServer.Store{change_log: true, db: db} = store, person, meta, tmp_path) do
+  def stage(store, person, meta, tmp_path, owner \\ nil)
+
+  def stage(
+        %AttentionServer.Store{change_log: true, db: db} = store,
+        person,
+        meta,
+        tmp_path,
+        owner
+      ) do
     file_id = "fs" <> Base.url_encode64(:crypto.strong_rand_bytes(18), padding: false)
     now = System.system_time(:millisecond)
 
     with {:ok, dir} <- dir(store),
          :ok <- ensure(db),
          :ok <- prune(db, dir, now - @retention_ms),
-         :ok <- File.rename(tmp_path, Path.join(dir, file_id)),
-         :ok <-
-           run(
-             db,
-             "INSERT INTO client_staged_files (file_id, person_id, name, content_type, size, sha256, at_ms) " <>
-               "VALUES (?, ?, ?, ?, ?, ?, ?)",
-             [file_id, person, meta.name, meta.content_type, meta.size, meta.sha256, now]
-           ) do
-      {:ok, file_id}
+         path = Path.join(dir, file_id),
+         :ok <- File.rename(tmp_path, path) do
+      attrs = [file_id, person, meta.name, meta.content_type, meta.size, meta.sha256, now]
+
+      case record_staged_file(db, file_id, attrs, owner) do
+        :ok ->
+          {:ok, file_id}
+
+        {:error, _} ->
+          _ = File.rm(path)
+          {:error, :storage_unavailable}
+      end
     else
       {:error, :disabled} = error -> error
       _ -> {:error, :storage_unavailable}
     end
   end
 
-  def stage(%AttentionServer.Store{}, _person, _meta, _tmp_path), do: {:error, :disabled}
+  def stage(%AttentionServer.Store{}, _person, _meta, _tmp_path, _owner), do: {:error, :disabled}
+
+  defp record_staged_file(db, file_id, attrs, owner) do
+    with :ok <- Sqlite3.execute(db, "BEGIN IMMEDIATE") do
+      with :ok <-
+             run(
+               db,
+               "INSERT INTO client_staged_files (file_id, person_id, name, content_type, size, sha256, at_ms) " <>
+                 "VALUES (?, ?, ?, ?, ?, ?, ?)",
+               attrs
+             ),
+           :ok <- remember_owner(db, file_id, owner),
+           :ok <- Sqlite3.execute(db, "COMMIT") do
+        :ok
+      else
+        error ->
+          _ = Sqlite3.execute(db, "ROLLBACK")
+          error
+      end
+    end
+  end
 
   @doc "The person's staged file, if it exists and is retained."
   @spec fetch(struct(), String.t(), String.t()) ::
@@ -131,6 +168,44 @@ defmodule AttentionServer.ClientAPI.Uploads do
   def fetch(%AttentionServer.Store{change_log: true}, _person, _file_id), do: {:error, :not_found}
   def fetch(%AttentionServer.Store{}, _person, _file_id), do: {:error, :disabled}
 
+  @doc false
+  def fetch_owned(store, {person, owner}, file_id) do
+    with {:ok, file} <- fetch(store, person, file_id),
+         {:ok, [^owner]} <-
+           one(store.db, "SELECT owner_key FROM client_staged_file_owners WHERE file_id = ?", [
+             file_id
+           ]) do
+      {:ok, file}
+    else
+      {:ok, _} -> {:error, :not_found}
+      error -> error
+    end
+  end
+
+  @doc false
+  def verify_discard_owner(%AttentionServer.Store{change_log: true, db: db}, id, owner) do
+    with :ok <- ensure(db) do
+      case one(db, "SELECT owner_key FROM client_staged_file_owners WHERE file_id = ?", [id]) do
+        # Handles staged before ownership tracking are still account-scoped.
+        {:ok, nil} -> :ok
+        {:ok, [^owner]} -> :ok
+        {:ok, _} -> {:error, :not_found}
+        _ -> {:error, :storage_unavailable}
+      end
+    end
+  end
+
+  def verify_discard_owner(_store, _id, _owner), do: {:error, :disabled}
+
+  defp remember_owner(_db, _id, nil), do: :ok
+
+  defp remember_owner(db, id, owner),
+    do:
+      run(db, "INSERT INTO client_staged_file_owners (file_id, owner_key) VALUES (?, ?)", [
+        id,
+        owner
+      ])
+
   @doc "Forget an unattached file and its bytes, storing any replay receipt with the deletion."
   def discard(%AttentionServer.Store{change_log: true, db: db} = store, person, file_id, key, digest) do
     with :ok <- ensure(db),
@@ -150,10 +225,12 @@ defmodule AttentionServer.ClientAPI.Uploads do
     end
   end
 
-  def discard(%AttentionServer.Store{}, _person, _file_id, _key, _digest), do: {:error, :disabled}
+  def discard(%AttentionServer.Store{}, _person, _file_id, _key, _digest),
+    do: {:error, :disabled}
 
   defp commit_discard(store, db, person, file_id, key, digest) do
-    with :ok <-
+    with :ok <- run(db, "DELETE FROM client_staged_file_owners WHERE file_id = ?", [file_id]),
+         :ok <-
            run(db, "DELETE FROM client_staged_files WHERE file_id = ? AND person_id = ?", [
              file_id,
              person
@@ -238,8 +315,12 @@ defmodule AttentionServer.ClientAPI.Uploads do
   # Attached copies have their own download IDs and paths.
   defp unlink_discarded(path) do
     case File.rm(path) do
-      :ok -> :ok
-      {:error, :enoent} -> :ok
+      :ok ->
+        :ok
+
+      {:error, :enoent} ->
+        :ok
+
       {:error, reason} ->
         Diagnostics.failure(:server_storage, :upload_delete, reason, :retry)
         {:error, reason}
@@ -250,7 +331,15 @@ defmodule AttentionServer.ClientAPI.Uploads do
     with {:ok, rows} <-
            all(db, "SELECT file_id FROM client_staged_files WHERE at_ms < ?", [before_ms]) do
       Enum.each(rows, fn [file_id] -> File.rm(Path.join(dir, file_id)) end)
-      run(db, "DELETE FROM client_staged_files WHERE at_ms < ?", [before_ms])
+
+      with :ok <-
+             run(
+               db,
+               "DELETE FROM client_staged_file_owners WHERE file_id IN (SELECT file_id FROM client_staged_files WHERE at_ms < ?)",
+               [before_ms]
+             ) do
+        run(db, "DELETE FROM client_staged_files WHERE at_ms < ?", [before_ms])
+      end
     end
   end
 

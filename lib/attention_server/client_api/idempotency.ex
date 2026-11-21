@@ -71,6 +71,10 @@ defmodule AttentionServer.ClientAPI.Idempotency do
     Base.encode16(:crypto.hash(:sha256, canonical), case: :lower)
   end
 
+  @doc false
+  def agent_scope(person, key),
+    do: "agent:" <> Base.url_encode64(:erlang.term_to_binary({person, key}), padding: false)
+
   @doc "The stored receipt for `{person, key}`, if any."
   @spec lookup(struct(), String.t(), String.t()) ::
           {:ok, receipt() | nil} | {:error, :disabled | term()}
