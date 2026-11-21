@@ -16,13 +16,123 @@ defmodule AttentionServer.ClientAPI.Reads do
   `ClientAPI.Principal`). A bare device key is accepted too.
   """
 
+  @behaviour AttentionServer.ClientAPI.Routes
+
+  import Plug.Conn
+
   alias AttentionServer.{ChangeLog, Engine, JSON, LargeData, Relay}
-  alias AttentionServer.ClientAPI.Resources
+  alias AttentionServer.ClientAPI.{Context, Errors, Resources}
 
   @default_limit 50
   @max_limit 200
 
-  ## Public reads, called outside the relay process
+  ## Routes (mounted by ClientAPI.Router behind client_api_v2)
+
+  @impl true
+  def routes do
+    [
+      {"GET", ["inbox"], :get_inbox},
+      {"GET", ["items", :item_id], :get_item},
+      {"GET", ["items", :item_id, "entries"], :get_entries},
+      {"GET", ["items", :item_id, "revisions", :n], :get_revision},
+      {"GET", ["settings"], :get_settings},
+      {"GET", ["files", :file_id], :get_file}
+    ]
+  end
+
+  @doc false
+  def get_inbox(conn, %Context{} = ctx) do
+    conn = fetch_query_params(conn)
+    respond(conn, inbox(ctx.relay, ctx.principal, query(conn, ~w(limit page))))
+  end
+
+  @doc false
+  def get_item(conn, %Context{} = ctx),
+    do: respond(conn, item(ctx.relay, ctx.principal, ctx.params.item_id))
+
+  @doc false
+  def get_entries(conn, %Context{} = ctx) do
+    conn = fetch_query_params(conn)
+
+    respond(
+      conn,
+      entries(ctx.relay, ctx.principal, ctx.params.item_id, query(conn, ~w(before limit)))
+    )
+  end
+
+  @doc false
+  def get_revision(conn, %Context{} = ctx),
+    do: respond(conn, revision(ctx.relay, ctx.principal, ctx.params.item_id, ctx.params.n))
+
+  @doc false
+  def get_settings(conn, %Context{} = ctx),
+    do: respond(conn, settings(ctx.relay, ctx.principal), &etag(&1["settings"]))
+
+  @doc false
+  def get_file(conn, %Context{} = ctx) do
+    case file(ctx.relay, ctx.principal, ctx.params.file_id) do
+      {:ok, file} ->
+        tag = file_etag(file)
+
+        conn =
+          conn
+          |> put_resp_header("etag", tag)
+          |> put_resp_header("cache-control", "private, no-cache")
+
+        cond do
+          not_modified?(conn, tag) ->
+            send_resp(conn, 304, "")
+
+          Map.has_key?(file, :path) ->
+            conn
+            |> put_resp_header("content-type", file.content_type)
+            |> send_file(200, file.path)
+
+          true ->
+            conn
+            |> put_resp_header("content-type", file.content_type)
+            |> send_resp(200, file.data)
+        end
+
+      error ->
+        respond(conn, error)
+    end
+  end
+
+  # Only the parameters a read takes; anything else in the query is ignored.
+  defp query(conn, names), do: Map.take(conn.query_params, names)
+
+  defp respond(conn, result, etag_of \\ &etag/1)
+
+  defp respond(conn, {:ok, body}, etag_of) do
+    tag = etag_of.(body)
+
+    conn =
+      conn
+      |> put_resp_header("etag", tag)
+      |> put_resp_header("cache-control", "private, no-cache")
+
+    if not_modified?(conn, tag),
+      do: send_resp(conn, 304, ""),
+      else: Errors.send_json(conn, 200, body)
+  end
+
+  defp respond(conn, {:error, token}, _etag_of),
+    do: Errors.send_error(conn, Atom.to_string(token))
+
+  defp respond(conn, {:error, token, field}, _etag_of),
+    do: Errors.send_error(conn, Atom.to_string(token), field: field)
+
+  # If-None-Match uses the weak comparison (RFC 9110 §13.1.2).
+  defp not_modified?(conn, tag) do
+    conn
+    |> get_req_header("if-none-match")
+    |> Enum.flat_map(&String.split(&1, ","))
+    |> Enum.map(&String.trim/1)
+    |> Enum.any?(&(&1 == "*" or &1 == tag or &1 == "W/" <> tag))
+  end
+
+  ## Reads, called outside the relay process
 
   @doc "`GET /v2/inbox`: params `\"limit\"` and `\"page\"`, as given in the query."
   def inbox(relay, key, params \\ %{}), do: call(relay, {:inbox, key, params})
