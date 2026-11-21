@@ -363,4 +363,51 @@ defmodule AttentionServer.ClientAPIReadsTest do
     assert {:error, :unauthorized} = Reads.inbox(relay, %{kind: :device, key: "owner-a"})
     GenServer.stop(relay)
   end
+
+  test "an inline file whose stored data is gone answers storage_unavailable, and the relay lives",
+       %{path: path, flags: flags} do
+    relay = scripted_relay(path, flags)
+    file_item = item_id(relay, "file")
+    assert {:ok, %{"item" => %{"files" => [ref]}}} = Reads.item(relay, "reader", file_item)
+
+    :sys.replace_state(relay, fn state ->
+      engine = state.store.engine
+      key = {"A", "app:test", "file"}
+
+      gone = %AttentionServer.LargeData.Ref{
+        id: "gone",
+        size: 10,
+        sha256: String.duplicate("0", 64),
+        path: Path.join(System.tmp_dir!(), "no-such-large-data")
+      }
+
+      engine =
+        update_in(engine.messages[key].files_by_revision[1], fn [file] ->
+          [%{file | "data_base64" => gone}]
+        end)
+
+      %{state | store: %{state.store | engine: engine}}
+    end)
+
+    assert {:error, :storage_unavailable} = Reads.file(relay, "reader", ref["file_id"])
+    assert Process.alive?(relay)
+    assert {:ok, _} = Reads.inbox(relay, "reader")
+    GenServer.stop(relay)
+  end
+
+  test "a person's items are found from their own sequence, not every person's", %{
+    path: path,
+    flags: flags
+  } do
+    relay = scripted_relay(path, flags)
+    engine = :sys.get_state(relay).store.engine
+    scanned = for {{"A", _, _} = key, _} <- engine.messages, do: key
+
+    assert Enum.sort(AttentionServer.ClientAPI.Resources.item_keys(engine, "A")) ==
+             Enum.sort(scanned)
+
+    assert AttentionServer.ClientAPI.Resources.item_keys(engine, "B") == []
+    assert AttentionServer.ClientAPI.Resources.item_keys(engine, "nobody") == []
+    GenServer.stop(relay)
+  end
 end

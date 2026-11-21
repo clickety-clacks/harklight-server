@@ -161,8 +161,20 @@ defmodule AttentionServer.ClientAPI.Resources do
   ## Items
 
   @doc "Every engine key of the person's items, in no particular order."
+  #
+  # Each item is the delivery event at its acceptance sequence, so the person's
+  # own sequence is walked instead of every person's messages.
   def item_keys(%Engine{} = engine, person) do
-    for {{^person, _, _} = key, _record} <- engine.messages, do: key
+    high =
+      case Map.get(engine.persons, person) do
+        high when is_integer(high) and high > 0 -> high
+        _ -> 0
+      end
+
+    for seq <- 1..high//1,
+        %{key: {^person, _, _} = key} <- [Map.get(engine.events, {person, seq})],
+        match?(%{accepted_seq: ^seq}, Map.get(engine.messages, key)),
+        do: key
   end
 
   @doc """
