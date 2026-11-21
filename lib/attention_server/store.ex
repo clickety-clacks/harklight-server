@@ -1045,26 +1045,27 @@ defmodule AttentionServer.Store do
     end
   end
 
-  defp initialize(db, upload_dir, mode) do
-    with :ok <- Sqlite3.execute(db, "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;"),
-         :ok <- Sqlite3.execute(db, @schema),
-         result <- load_mode(db, upload_dir, mode) do
-      result
+  defp initialize(db, upload_dir, :legacy) do
+    with :ok <- set_durability(db),
+         :ok <- Sqlite3.execute(db, @schema) do
+      load_or_create(db, upload_dir)
     end
   end
 
-  defp load_mode(db, upload_dir, :legacy), do: load_or_create(db, upload_dir)
-
-  defp load_mode(db, _upload_dir, :keyed) do
+  defp initialize(db, _upload_dir, :keyed) do
     with {:ok, engine, generation} <- KeyedMigration.load(db),
          engine = engine |> BounceDecision.rebuild_indexes() |> Engine.rebuild_route_b_index(),
-         true <- valid_state?(engine) do
+         true <- valid_state?(engine),
+         :ok <- set_durability(db) do
       {:ok, engine, generation}
     else
       false -> {:error, :invalid_state}
       error -> error
     end
   end
+
+  defp set_durability(db),
+    do: Sqlite3.execute(db, "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")
 
   def commit(%__MODULE__{mode: :keyed} = store, _next, _audit),
     do: {:error, :storage_unavailable, store}

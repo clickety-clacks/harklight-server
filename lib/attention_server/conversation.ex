@@ -4,7 +4,7 @@ defmodule AttentionServer.Conversation do
   delivery and action facts live separately so replay never changes a turn.
   """
 
-  alias AttentionServer.{ConversationFiles, Message}
+  alias AttentionServer.{ConversationFiles, Engine, Message}
 
   def valid_session?(handle, vendor_id) do
     Message.uuid_v4?(handle) and
@@ -123,7 +123,7 @@ defmodule AttentionServer.Conversation do
       |> ConversationFiles.put_entry(Map.get(record, :files_by_revision, %{}) |> Map.get(1, []))
 
     engine
-    |> Map.update!(:origin_sessions, &Map.put(&1, session_key, session))
+    |> Engine.put_row(:origin_sessions, session_key, session)
     |> append_entry(person, origin, entry)
   end
 
@@ -408,7 +408,7 @@ defmodule AttentionServer.Conversation do
             request_key = {person, entry["sender_id"], entry["message_id"]}
             record = Map.get(engine.messages, request_key)
 
-            if (entry["session_handle"] == handle and record) && record.origin == origin and
+            if ((entry["session_handle"] == handle and record) && record.origin == origin) and
                  (is_nil(record.terminal) or
                     (actionable?(entry) and needs_action?(engine, person, entry) and
                        not Map.has_key?(engine.origin_actions, {person, origin, seq}))) do
@@ -570,11 +570,16 @@ defmodule AttentionServer.Conversation do
         engine.bounce_origin_entries
       end
 
-    {%{
-       engine
-       | origin_feeds: Map.put(engine.origin_feeds, key, updated),
-         bounce_origin_entries: origin_entries
-     }, item}
+    engine =
+      %{
+        engine
+        | origin_feeds: Map.put(engine.origin_feeds, key, updated),
+          bounce_origin_entries: origin_entries
+      }
+      |> Engine.touch_fact({:origin_feed, key, :high})
+      |> Engine.touch_fact({:origin_feed, key, {:entry, seq}})
+
+    {engine, item}
   end
 
   defp valid_delivery_acks?(engine, person, origin, feed) do

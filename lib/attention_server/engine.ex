@@ -1989,15 +1989,31 @@ defmodule AttentionServer.Engine do
 
   @doc false
   def put_row(%__MODULE__{} = engine, field, key, value) do
-    engine
-    |> Map.update!(field, &Map.put(&1, key, value))
-    |> touch_row(field, key)
+    rows = Map.fetch!(engine, field)
+    next = Map.replace!(engine, field, Map.put(rows, key, value))
+
+    if is_nil(engine.touched_keys) or Map.fetch(rows, key) === {:ok, value},
+      do: next,
+      else: touch_fact(next, {:row, field, key})
   end
 
-  defp touch_row(%__MODULE__{touched_keys: nil} = engine, _field, _key), do: engine
+  @doc false
+  def put_member(%__MODULE__{} = engine, field, key) do
+    members = Map.fetch!(engine, field)
 
-  defp touch_row(%__MODULE__{} = engine, field, key) do
-    %{engine | touched_keys: MapSet.put(engine.touched_keys, {:row, field, key})}
+    if MapSet.member?(members, key),
+      do: engine,
+      else:
+        engine
+        |> Map.replace!(field, MapSet.put(members, key))
+        |> touch_fact({:member, field, key})
+  end
+
+  @doc false
+  def touch_fact(%__MODULE__{touched_keys: nil} = engine, _address), do: engine
+
+  def touch_fact(%__MODULE__{} = engine, address) do
+    %{engine | touched_keys: MapSet.put(engine.touched_keys, address)}
   end
 
   @doc false
@@ -4385,7 +4401,7 @@ defmodule AttentionServer.Engine do
                 "request_revision" => terminal_entry["request_revision"]
               })
 
-            %{next | events: Map.put(next.events, {person, seq}, updated)}
+            put_row(next, :events, {person, seq}, updated)
           else
             next
           end

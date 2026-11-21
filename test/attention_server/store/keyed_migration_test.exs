@@ -74,4 +74,22 @@ defmodule AttentionServer.Store.KeyedMigrationTest do
 
     assert {:error, _reason} = Store.open(path, :keyed)
   end
+
+  test "keyed open refuses a different producing OTP major before reconciliation", ctx do
+    %{path: path, store: store} = ctx
+    assert {:ok, _} = KeyedMigration.convert(store)
+    {codec, running_major} = RecordCodec.identity()
+    wrong_major = "different"
+    anchor = :erlang.term_to_binary({:attention_relay_keyed_state, 30, {codec, wrong_major}})
+    digest = :crypto.hash(:sha256, anchor)
+    {:ok, stmt} = Sqlite3.prepare(store.db, "UPDATE relay_state SET payload = ?, checksum = ?")
+    :ok = Sqlite3.bind(stmt, [{:blob, anchor}, {:blob, digest}])
+    :done = Sqlite3.step(store.db, stmt)
+    :ok = Sqlite3.release(store.db, stmt)
+
+    assert {:error,
+            {:storage_unavailable,
+             {:error, {:unsupported_otp_major, ^wrong_major, ^running_major}}}} =
+             Store.open(path, :keyed)
+  end
 end

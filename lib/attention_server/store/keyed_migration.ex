@@ -35,7 +35,7 @@ defmodule AttentionServer.Store.KeyedMigration do
            query(db, "SELECT version, payload, checksum FROM relay_state WHERE id = 1", []),
          true <- :crypto.hash(:sha256, payload) == checksum,
          {:ok, identity} <- decode_anchor(payload),
-         true <- identity == RecordCodec.identity(),
+         :ok <- check_identity(identity),
          {:ok, generation} <- RecordTable.generation(db),
          true <- generation >= version,
          {:ok, engine} <- read_records(db) do
@@ -56,6 +56,16 @@ defmodule AttentionServer.Store.KeyedMigration do
   rescue
     ArgumentError -> {:error, :invalid_state}
   end
+
+  defp check_identity({codec, written_major}) do
+    case RecordCodec.identity() do
+      {^codec, ^written_major} -> :ok
+      {^codec, running_major} -> {:error, {:unsupported_otp_major, written_major, running_major}}
+      _ -> {:error, :unsupported_record_codec}
+    end
+  end
+
+  defp check_identity(_), do: {:error, :unsupported_record_codec}
 
   defp read_records(db) do
     with {:ok, rows} <- RecordTable.rows(db), do: RecordCodec.decode(rows)

@@ -128,13 +128,8 @@ defmodule AttentionServer.BounceDecision do
   def record_open(%Engine{} = engine, key, record, raw_revision) do
     case substantive_revision(engine, key, record, raw_revision) do
       {next, sub_revision} when is_integer(sub_revision) ->
-        opened =
-          MapSet.put(
-            next.opened_revisions,
-            Tuple.insert_at(key, tuple_size(key), sub_revision)
-          )
-
-        {:ok, %{next | opened_revisions: opened}, sub_revision}
+        member = Tuple.append(key, sub_revision)
+        {:ok, Engine.put_member(next, :opened_revisions, member), sub_revision}
 
       {_next, nil} ->
         {:error, :invalid_revision}
