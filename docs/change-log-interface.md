@@ -54,7 +54,22 @@ ChangeLog.read(store, person, after, limit) ::
   # :cursor_expired.
 ChangeLog.subscribe(person) :: :ok     # caller gets {:change_log, person, head}
 ChangeLog.unsubscribe(person) :: :ok   # after each committed append; a wake-up only
-ChangeLog.prune(store, before_ms) :: {:ok, deleted}   # raises the floor
+ChangeLog.prune(store, before_ms) :: {:ok, deleted}   # raises the floor; the Relay
+  # runs it daily with a 30-day window
+ChangeLog.created_at(store, person, resource_id) :: {:ok, at_ms} | {:error, :not_found}
+  # when the log first wrote the resource (Entry.at_ms, Item.created_at_ms);
+  # none for resources from before the cut-over
+ChangeLog.rank_keys(store, person) :: {:ok, %{item_resource => key}}
+ChangeLog.append_ranks(store, person, %{item_resource => key}) :: {:ok, position}
+  # records the reads component's current rank keys; writes an :item row for
+  # each item whose key changed, drops keys of items no longer ranked
+
+# Closing signal, for feeds (C5). The caller is told
+# {:client_closing, scope, reason} when its device is revoked or removed
+# ({:device, key}, :revoked), its browser session ends
+# ({:browser_session, id}, :revoked) or its account is paused
+# ({:person, person}, :account_paused).
+ChangeLog.subscribe_closing(principal) :: :ok
 
 # Write side. Store only.
 ChangeLog.changes(old_engine, next_engine) :: %{person => [{kind, resource_id}]}
@@ -74,12 +89,14 @@ reads must be added here; the replay test catches an omission.
 - **Entry:** `conversation_events`.
 - **Counts:** the unresolved count.
 - **Settings:** `bounce_levels` and the person's `push_bindings`.
-- **Rank** is derived in the Relay, not the engine. Its rows come in a later
-  slice.
+- **Rank** is derived in the Relay, not the engine. Rank rows come from
+  `append_ranks/3`, which the Relay calls with the reads component's ranking.
+- **Closings** come from the same diff: a device that becomes revoked or
+  leaves `devices`, and a person whose delivery state becomes `STOPPED`. A
+  browser session's end comes from the Relay's `end_browser_session`.
 
-## Not yet in this slice
+## Not yet on main
 
-- Rank rows.
-- Retention scheduling (`prune/2` exists but nothing calls it yet).
-- The replay-equals-inbox property test, which needs the reads component's
-  renderer.
+- The Relay call to `append_ranks/3` when the priority view changes, and the
+  replay-equals-snapshot test from empty and from a mid-log cursor. Both need
+  the reads component's ranking and renderer.

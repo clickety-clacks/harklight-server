@@ -1108,7 +1108,7 @@ defmodule AttentionServer.Store do
             {person, AttentionServer.ChangeLog.seeded?(store.engine, person)}
           end)
 
-        {pending, seeded}
+        {pending, seeded, AttentionServer.ChangeLog.closings(store.engine, next)}
       end
 
     result =
@@ -1132,6 +1132,7 @@ defmodule AttentionServer.Store do
     case result do
       {:ok, cache, heads, durable_next, persisted, index} ->
         AttentionServer.ChangeLog.notify(heads)
+        if log, do: AttentionServer.ChangeLog.notify_closing(elem(log, 2))
 
         {:ok,
          %{
@@ -1237,7 +1238,7 @@ defmodule AttentionServer.Store do
 
   defp append_change_log(_db, nil, _version), do: {:ok, %{}}
 
-  defp append_change_log(db, {pending, seeded}, version),
+  defp append_change_log(db, {pending, seeded, _closings}, version),
     do: AttentionServer.ChangeLog.append(db, pending, seeded, version)
 
   # ACKs must be durable before their replies, but do not change retained history.

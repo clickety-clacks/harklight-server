@@ -847,6 +847,7 @@ defmodule AttentionServer.Relay do
             state = initialize_priority_views(state)
             state = reschedule_default_sweep(state, state.default_index)
             state = reschedule_bounce_sweep(state)
+            schedule_change_log_prune(state.store, 0)
 
             {:ok, state}
 
@@ -862,6 +863,16 @@ defmodule AttentionServer.Relay do
 
   # With the client_api_v2 flag on at startup, the store writes the change log
   # in every commit. The flag is read once, here, before any startup commit.
+  # Change-log rows older than the retention window are pruned daily; a cursor
+  # older than the oldest retained row gets cursor_expired.
+  @change_log_retention_ms 30 * 24 * 60 * 60 * 1_000
+  @change_log_prune_interval_ms 24 * 60 * 60 * 1_000
+
+  defp schedule_change_log_prune(%Store{change_log: true}, delay_ms),
+    do: Process.send_after(self(), :change_log_prune, delay_ms)
+
+  defp schedule_change_log_prune(_store, _delay_ms), do: :ok
+
   defp client_api_v2_store({:ok, store}, feature_flags_path) do
     {flags, _warned} = AttentionServer.FeatureFlags.read(feature_flags_path, true)
 
@@ -2950,6 +2961,9 @@ defmodule AttentionServer.Relay do
   end
 
   defp dispatch_call({:end_browser_session, browser_session_id}, _from, state) do
+    if state.store.change_log,
+      do: AttentionServer.ChangeLog.notify_closing([{{:browser_session, browser_session_id}, :revoked}])
+
     state =
       state.sessions
       |> Enum.filter(fn {_id, session} ->
@@ -3460,6 +3474,18 @@ defmodule AttentionServer.Relay do
       _ ->
         {:noreply, state}
     end
+  end
+
+  defp dispatch_info(:change_log_prune, state) do
+    before_ms = state.clock.() - @change_log_retention_ms
+
+    case AttentionServer.ChangeLog.prune(state.store, before_ms) do
+      {:ok, _deleted} -> :ok
+      {:error, reason} -> Diagnostics.failure(:server_storage, :periodic_cleanup, reason, :retry)
+    end
+
+    schedule_change_log_prune(state.store, @change_log_prune_interval_ms)
+    {:noreply, state}
   end
 
   defp dispatch_info(:refresh_default_sweep_index, state) do
