@@ -25,8 +25,8 @@ defmodule AttentionServer.ClientAPIWritesTest do
     %{path: Path.join(dir, "state.sqlite3"), flags: flags}
   end
 
-  defp start(path, flags) do
-    opts = [store_path: path, agent_fixture_mode: true]
+  defp start(path, flags, extra \\ []) do
+    opts = [store_path: path, agent_fixture_mode: true] ++ extra
     opts = if flags, do: Keyword.put(opts, :feature_flags_path, flags), else: opts
     assert {:ok, relay} = Relay.start_link(opts)
     relay
@@ -64,8 +64,8 @@ defmodule AttentionServer.ClientAPIWritesTest do
              })
   end
 
-  defp scripted_relay(path, flags) do
-    relay = start(path, flags)
+  defp scripted_relay(path, flags, extra \\ []) do
+    relay = start(path, flags, extra)
     assert :ok = Relay.setup_person(relay, "A")
     assert :ok = Relay.setup_device(relay, "A", "origin")
     assert :ok = Relay.setup_device(relay, "A", "reader")
@@ -698,10 +698,124 @@ defmodule AttentionServer.ClientAPIWritesTest do
     end
   end
 
+  @levels [
+    %{"name" => "Low", "lower_bound" => 0, "bounce_after_days" => nil},
+    %{"name" => "High", "lower_bound" => 0.5, "bounce_after_days" => 2}
+  ]
+
+  defp settings_etag(relay, who) do
+    {:ok, %{"settings" => settings}} = Reads.settings(relay, who)
+    Reads.etag(settings)
+  end
+
+  describe "PUT /v2/settings/priority-levels" do
+    test "If-Match with the Settings ETag replaces the levels; a stale one is 412",
+         %{path: path, flags: flags} do
+      relay = scripted_relay(path, flags)
+      held = settings_etag(relay, "reader")
+      {:ok, before} = head(relay)
+
+      assert {:ok, 200, body, false} = Writes.priority_levels(relay, "reader", @levels, held)
+
+      # Checked in its wire form: stored decimals encode exactly as sent.
+      wire = Elixir.JSON.decode!(JSON.encode!(body))
+      assert Schema.errors(Schema.contract_defs(@contract), "WriteResult", wire) == []
+      assert Enum.map(wire["settings"]["priority_levels"], & &1["lower_bound"]) == [0, 0.5]
+      assert %{"rev" => position, "settings" => settings} = body
+      assert Enum.map(settings["priority_levels"], & &1["name"]) == ["Low", "High"]
+      assert settings["rev"] > before and settings["rev"] <= position
+      assert Enum.any?(changes_after(relay, before), &(&1.resource_id == "settings"))
+
+      # The write's result is what GET /v2/settings now reads, with the same ETag.
+      assert {:ok, %{"settings" => ^settings}} = Reads.settings(relay, "reader")
+      assert settings_etag(relay, "reader") == Reads.etag(settings)
+
+      # The ETag the client held is stale now: nothing is applied.
+      {:ok, position} = head(relay)
+
+      assert {:error, "precondition_failed", nil, false} =
+               Writes.priority_levels(relay, "reader", Enum.take(@levels, 1), held)
+
+      assert head(relay) == {:ok, position}
+
+      assert {:ok, 200, _, false} =
+               Writes.priority_levels(relay, "reader", Enum.take(@levels, 1), "*")
+
+      GenServer.stop(relay)
+    end
+
+    test "invalid levels are invalid_field", %{path: path, flags: flags} do
+      relay = scripted_relay(path, flags)
+      tag = settings_etag(relay, "reader")
+
+      for levels <- [[], [%{"name" => "x"}], Enum.reverse(@levels)] do
+        assert {:error, "invalid_field", "levels", false} =
+                 Writes.priority_levels(relay, "reader", levels, tag)
+      end
+
+      GenServer.stop(relay)
+    end
+  end
+
+  @token String.duplicate("ab", 32)
+
+  describe "/v2/devices/me/push" do
+    test "PUT registers the device's binding, DELETE removes it; a stale revision is 412",
+         %{path: path, flags: flags} do
+      relay = scripted_relay(path, flags, push_enabled: true)
+
+      assert {:ok, 200, body, false} = Writes.push(relay, "reader", @token, "production", 1)
+      assert Schema.errors(Schema.contract_defs(@contract), "WriteResult", body) == []
+      assert %{"revision" => 1, "environment" => "production"} = body["settings"]["push"]
+
+      assert {:error, "precondition_failed", nil, false} =
+               Writes.push(relay, "reader", String.duplicate("cd", 32), "sandbox", 1)
+
+      assert {:ok, 200, %{"settings" => %{"push" => push}}, false} =
+               Writes.remove_push(relay, "reader")
+
+      assert %{"state" => "canceled", "revision" => 2} = push
+      refute Map.has_key?(push, "environment")
+
+      # Another device's binding is its own.
+      assert {:ok, %{"settings" => %{"push" => %{"state" => "unconfigured"}}}} =
+               Reads.settings(relay, "origin")
+
+      GenServer.stop(relay)
+    end
+
+    test "bad fields keep the client API's names", %{path: path, flags: flags} do
+      relay = scripted_relay(path, flags, push_enabled: true)
+
+      assert {:error, "invalid_field", "token", false} =
+               Writes.push(relay, "reader", "not-a-token", "production", 1)
+
+      GenServer.stop(relay)
+    end
+
+    test "browsers are forbidden, and push disabled is unsupported", %{path: path, flags: flags} do
+      relay = scripted_relay(path, flags, push_enabled: true)
+      browser = with_owner(relay)
+
+      assert {:error, "forbidden", nil, false} =
+               Writes.push(relay, browser, @token, "production", 1)
+
+      assert {:error, "forbidden", nil, false} = Writes.remove_push(relay, browser)
+      GenServer.stop(relay)
+
+      relay = start(path, flags)
+
+      assert {:error, "unsupported", nil, false} =
+               Writes.push(relay, "reader", @token, "production", 1)
+
+      GenServer.stop(relay)
+    end
+  end
+
   describe "HTTP" do
-    defp post(relay, path_info, body, headers) do
+    defp post(relay, path_info, body, headers, method \\ "POST") do
       conn =
-        Plug.Test.conn("POST", "/v2/" <> Enum.join(path_info, "/"), body)
+        Plug.Test.conn(method, "/v2/" <> Enum.join(path_info, "/"), body)
         |> Plug.Conn.assign(:client_api_request_id, "req-1")
 
       conn = Enum.reduce(headers, conn, fn {k, v}, c -> Plug.Conn.put_req_header(c, k, v) end)
@@ -714,10 +828,14 @@ defmodule AttentionServer.ClientAPIWritesTest do
       }
 
       handler =
-        case List.last(path_info) do
-          "seen" -> :post_seen
-          "answer" -> :post_answer
-          "replies" -> :post_replies
+        case {method, List.last(path_info)} do
+          {_, "seen"} -> :post_seen
+          {_, "answer"} -> :post_answer
+          {_, "replies"} -> :post_replies
+          {_, "read-position"} -> :put_read_position
+          {_, "priority-levels"} -> :put_priority_levels
+          {"PUT", "push"} -> :put_push
+          {"DELETE", "push"} -> :delete_push
         end
 
       conn = apply(Writes, handler, [conn, ctx])
@@ -758,6 +876,46 @@ defmodule AttentionServer.ClientAPIWritesTest do
 
       GenServer.stop(relay)
     end
+  end
+
+  test "priority levels need If-Match; push bodies are checked; browsers get 403",
+       %{path: path, flags: flags} do
+    relay = scripted_relay(path, flags, push_enabled: true)
+    levels = JSON.encode!(%{"levels" => @levels})
+
+    assert {400, %{"error" => "invalid_field", "field" => "If-Match"}, _} =
+             post(relay, ["settings", "priority-levels"], levels, [], "PUT")
+
+    assert {412, %{"error" => "precondition_failed"}, _} =
+             post(relay, ["settings", "priority-levels"], levels, [{"if-match", ~s("x")}], "PUT")
+
+    tag = settings_etag(relay, "reader")
+
+    assert {200, %{"settings" => _}, _} =
+             post(relay, ["settings", "priority-levels"], levels, [{"if-match", tag}], "PUT")
+
+    for {body, field} <- [
+          {~s({"token":"#{@token}","environment":"staging","revision":1}), "environment"},
+          {~s({"token":"#{@token}","environment":"production","revision":0}), "revision"},
+          {~s({"environment":"production","revision":1}), "token"}
+        ] do
+      assert {400, %{"error" => "invalid_field", "field" => ^field}, _} =
+               post(relay, ["devices", "me", "push"], body, [], "PUT")
+    end
+
+    assert {200, %{"settings" => %{"push" => %{"revision" => 1}}}, _} =
+             post(
+               relay,
+               ["devices", "me", "push"],
+               ~s({"token":"#{@token}","environment":"sandbox","revision":1}),
+               [],
+               "PUT"
+             )
+
+    assert {200, %{"settings" => %{"push" => %{"state" => "canceled"}}}, _} =
+             post(relay, ["devices", "me", "push"], "", [], "DELETE")
+
+    GenServer.stop(relay)
   end
 
   test "answer bodies carry request_revision and at most one of choice, comment and result",
