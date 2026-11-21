@@ -8,9 +8,9 @@ defmodule AttentionServer.HeadlessDevice do
 
   With the temporary `client_api_v2` flag on (`endpoint.client_api_v2`), both
   speak client API v2 instead. The first `read` pages through `GET /v2/inbox`,
-  stores every item under `v2/`, and only then stores the cursor, the first
-  page's `rev`. Later reads fetch the JSON change batch after that cursor,
-  storing each batch before advancing it; `410 cursor_expired` means a fresh
+  stores every item in `v2/items.json` together with its cursor, the first
+  page's `rev`, in one atomic write. Later reads fetch the JSON change batch
+  after that cursor and store each batch with its new cursor the same way; `410 cursor_expired` means a fresh
   snapshot. `respond` resolves `--sender`/`--message-id` to the item delivered to
   this device, stores the exact answer body with a fresh `Idempotency-Key`,
   and only then sends `POST /v2/items/{item_id}/answer`.
@@ -164,6 +164,10 @@ defmodule AttentionServer.HeadlessDevice do
     limit = Map.get(endpoint, :v2_batch_limit, @v2_batch_limit)
 
     case HeadlessTLS.v2_get(endpoint, identity, "/v2/changes?after=#{rev}&limit=#{limit}") do
+      {:ok, 200, %{"rev" => next, "more" => true}} when next == rev ->
+        # `more` with no progress would repeat this request forever (review C6-4).
+        {:error, :no_progress}
+
       {:ok, 200, %{"changes" => changes, "rev" => next, "more" => more}}
       when is_list(changes) and is_integer(next) and next >= rev and is_boolean(more) ->
         with {:ok, items, tombstones} <- v2_apply(changes, items, tombstones),
@@ -205,21 +209,26 @@ defmodule AttentionServer.HeadlessDevice do
              {:ok, Map.delete(items, id), Map.put(dead, id, max(rev, Map.get(dead, id, 0)))}},
           else: {:cont, {:ok, items, dead}}
 
-      %{"kind" => kind, "rev" => rev}, acc when is_binary(kind) and is_integer(rev) ->
+      %{"kind" => kind, "rev" => rev}, acc
+      when is_binary(kind) and kind not in ["item", "item_removed"] and is_integer(rev) ->
         {:cont, acc}
 
+      # A malformed item change is never skipped: the read fails and the
+      # cursor stays where it was (review C6-3).
       _change, _acc ->
-        {:halt, {:error, :invalid_v2_response}}
+        {:halt, {:error, :invalid_v2_change}}
     end)
   end
 
+  # The cursor and the items it covers are one file, written by one atomic
+  # rename. Overlapping reads (a respond reads too) can only leave an older but
+  # consistent state, never a cursor ahead of its items (review C6-1).
   defp v2_store(directory, rev, items, tombstones) do
-    with :ok <-
-           write_private(Path.join([directory, "v2", "items.json"]), %{
-             "items" => v2_ordered(items),
-             "tombstones" => tombstones
-           }),
-         do: write_private(Path.join([directory, "v2", "cursor.json"]), %{"rev" => rev})
+    write_private(Path.join([directory, "v2", "items.json"]), %{
+      "rev" => rev,
+      "items" => v2_ordered(items),
+      "tombstones" => tombstones
+    })
   end
 
   defp v2_ordered(items), do: items |> Map.values() |> Enum.sort_by(&get_in(&1, ["rank", "key"]))
@@ -227,10 +236,9 @@ defmodule AttentionServer.HeadlessDevice do
   # The held state: the cursor and the items stored before it. Anything
   # unreadable means no usable cursor, so the next read is a snapshot.
   defp v2_held(directory) do
-    with {:ok, %{"rev" => rev}} when is_integer(rev) and rev >= 0 <-
-           read_json(Path.join([directory, "v2", "cursor.json"])),
-         {:ok, %{"items" => items} = held} when is_list(items) <-
-           read_json(Path.join([directory, "v2", "items.json"])),
+    with {:ok, %{"rev" => rev, "items" => items} = held}
+         when is_integer(rev) and rev >= 0 and is_list(items) <-
+           read_local_json(Path.join([directory, "v2", "items.json"])),
          true <- Enum.all?(items, &v2_item?/1),
          tombstones when is_map(tombstones) <- Map.get(held, "tombstones", %{}) do
       {:ok, rev, Map.new(items, &{&1["item_id"], &1}), tombstones}
@@ -752,6 +760,12 @@ defmodule AttentionServer.HeadlessDevice do
     else
       _ -> {:error, :invalid_document}
     end
+  end
+
+  # Local state the tool wrote itself: no server frame limit applies (review
+  # C6-2); the store holds every item the person can see.
+  defp read_local_json(path) do
+    with {:ok, contents} <- File.read(path), do: JSON.decode_line(contents <> "\n")
   end
 
   defp read_json(path) do
