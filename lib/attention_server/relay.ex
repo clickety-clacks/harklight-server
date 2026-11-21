@@ -3495,16 +3495,28 @@ defmodule AttentionServer.Relay do
     if persons == [] do
       next
     else
-      Enum.each(persons, &store_client_ranks(next, &1))
+      next = Enum.reduce(persons, next, &store_client_ranks(&2, &1))
       %{next | store: %{next.store | change_log_touched: MapSet.new()}}
     end
   end
 
+  # The person's last stored ranking is kept here, so an unchanged re-rank is
+  # compared in memory and writes nothing. A failure drops it, and the next
+  # ranking compares against SQLite again.
   defp store_client_ranks(state, person) do
     store = state.store
+    caches = Map.get(state, :client_rank_cache, %{})
 
     if Map.has_key?(store.engine.persons, person) do
-      with {:ok, previous} <- AttentionServer.ChangeLog.rank_keys(store, person),
+      cache = Map.get(caches, person)
+
+      previous =
+        case cache do
+          %{units: units} -> {:ok, units}
+          nil -> AttentionServer.ChangeLog.rank_keys(store, person)
+        end
+
+      with {:ok, previous} <- previous,
            ranks =
              AttentionServer.ClientAPI.Resources.ranks(
                store.engine,
@@ -3512,14 +3524,26 @@ defmodule AttentionServer.Relay do
                Map.get(state.priority_views, person),
                previous
              ),
-           {:ok, _head} <- AttentionServer.ChangeLog.put_ranks(store, person, ranks) do
-        :ok
+           {:ok, _head, next_cache} <-
+             AttentionServer.ChangeLog.put_ranks(store, person, ranks, cache) do
+        Map.put(state, :client_rank_cache, Map.put(caches, person, next_cache))
       else
-        error -> Diagnostics.failure(:server_storage, :state_commit, error, :retry)
+        error ->
+          Diagnostics.failure(:server_storage, :state_commit, error, :retry)
+          Map.put(state, :client_rank_cache, Map.delete(caches, person))
       end
+    else
+      state
     end
   rescue
-    error -> Diagnostics.failure(:server_storage, :state_commit, error, :retry)
+    error ->
+      Diagnostics.failure(:server_storage, :state_commit, error, :retry)
+
+      Map.put(
+        state,
+        :client_rank_cache,
+        Map.delete(Map.get(state, :client_rank_cache, %{}), person)
+      )
   end
 
   defp dispatch_info({:socket_write_done, socket, token, result}, state) do
