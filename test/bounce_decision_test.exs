@@ -134,8 +134,10 @@ defmodule AttentionServer.BounceDecisionTest do
   test "defaults are read without storing a table and leave unscored messages inert" do
     {engine, _record} = fixture(configured?: false)
     refute Map.has_key?(engine.bounce_levels, @person)
+
     assert BounceDecision.levels(engine, @person) ==
              BouncePolicy.public_levels(BouncePolicy.default_levels())
+
     assert selection(engine) == nil
     assert BounceDecision.next_deadline(engine) == nil
 
@@ -183,6 +185,7 @@ defmodule AttentionServer.BounceDecisionTest do
     state = engine.bounce_revisions[key()]
     revision = %{state.revisions[1] | qualified: false}
     retained_state = %{state | revisions: Map.put(state.revisions, 1, revision)}
+
     retained = %{
       engine
       | bounce_revisions: Map.put(engine.bounce_revisions, key(), retained_state)
@@ -388,6 +391,22 @@ defmodule AttentionServer.BounceDecisionTest do
     assert selection(terminal_at_due)["reason"] == "terminal"
   end
 
+  test "an undeclared session supports v2 advisories and leaves legacy messages pending" do
+    {engine, _record} = fixture()
+    engine = update_in(engine.origin_sessions[advisory_feed_key()], &Map.delete(&1, :support))
+    selected = score(engine, 0.9, 1_050)
+    due_at = selection(selected)["due_at_ms"]
+
+    pending = BounceDecision.evaluate_due(selected, due_at)
+    assert selection(pending)["decision"] == "pending"
+    assert BounceDecision.advisory_cursor(pending, @person, @origin, @handle) == 0
+
+    v2 = put_in(selected.messages[key()][:agent_api_v2], true)
+    bounced = BounceDecision.evaluate_due(v2, due_at)
+    assert selection(bounced)["decision"] == "bounced"
+    assert BounceDecision.advisory_cursor(bounced, @person, @origin, @handle) == 1
+  end
+
   test "unsupported sessions retain due work; original-session fetch and ack stay separate" do
     {engine, _record} = fixture(supported?: false)
     selected = score(engine, 0.9, 1_050)
@@ -407,6 +426,7 @@ defmodule AttentionServer.BounceDecisionTest do
 
     assert selection(bounced)["decision"] == "bounced"
     assert BounceDecision.advisory_cursor(bounced, @person, @origin, @handle) == 1
+    assert bounced.route_b_index.advisory_sequences == %{}
     assert bounced.origin_feeds[origin_feed_key()].high == 1
     assert bounced.events == engine.events
 

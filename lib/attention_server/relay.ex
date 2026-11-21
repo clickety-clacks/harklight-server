@@ -3664,25 +3664,12 @@ defmodule AttentionServer.Relay do
     if changed_keys == [] do
       {:noreply, reschedule_bounce_sweep(state)}
     else
-      case commit(state.store, next_engine, %{
-             person: "system",
-             actor: "bounce_decision",
-             action: "bounce_due"
-           }) do
-        {:ok, store} ->
-          next_state = %{state | store: store}
+      case persist_bounce_decision(state, old_engine, next_engine, changed_keys, "bounce_due") do
+        {:ok, next_state} ->
+          {:noreply, next_state}
 
-          next_state =
-            record_advisory_feed_change(next_state, old_engine, next_engine, changed_keys)
-
-          {:noreply, reschedule_bounce_sweep(next_state)}
-
-        {:error, reason, _store} ->
+        {:error, reason} ->
           Diagnostics.failure(:bounce_schedule, :decision_commit, reason, :unavailable)
-          {:noreply, schedule_bounce_retry(state)}
-
-        other ->
-          Diagnostics.failure(:bounce_schedule, :decision_commit, other, :unavailable)
           {:noreply, schedule_bounce_retry(state)}
       end
     end
@@ -6414,19 +6401,23 @@ defmodule AttentionServer.Relay do
   defp persist_bounce_decision(state, old_engine, next_engine, changed_keys, action) do
     audit = %{person: "system", actor: "bounce_decision", action: action}
 
-    case commit(state.store, next_engine, audit) do
-      {:ok, store} ->
-        next_state = %{state | store: store}
+    with {:ok, next_engine} <-
+           AttentionServer.AgentAPI.Advisories.stamp_decisions(state.store, next_engine, changed_keys),
+         {:ok, store} <- commit(state.store, next_engine, audit) do
+      next_state = %{state | store: store}
 
-        next_state =
-          next_state
-          |> record_advisory_feed_change(old_engine, next_engine, changed_keys)
-          |> reschedule_bounce_sweep()
+      next_state =
+        next_state
+        |> record_advisory_feed_change(old_engine, next_engine, changed_keys)
+        |> reschedule_bounce_sweep()
 
-        {:ok, next_state}
-
+      {:ok, next_state}
+    else
       {:error, reason, _store} ->
         {:error, reason}
+
+      {:error, _} = error ->
+        error
 
       error ->
         {:error, error}

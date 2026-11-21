@@ -42,10 +42,38 @@ defmodule AttentionServer.AgentChangeLogTest do
     relay = start(ctx, false)
     setup_people(relay)
     forward(relay, "origin", "retained", 1, @session)
+
+    assert %{"type" => "ok", "seq" => seq, "event_id" => event_id} =
+             request(relay, "other", %{
+               "type" => "discussion",
+               "op_id" => op(2),
+               "sender_id" => "app:test",
+               "message_id" => "retained",
+               "request_revision" => 1,
+               "text" => "Pre-cut-over chat"
+             })
+
     assert {:error, :disabled} = read(relay, "origin")
+
+    assert %{
+             agent_feed?: false,
+             entry_positions: positions,
+             messages_by_origin_session: sessions,
+             advisory_sequences: advisories
+           } = stored(relay, & &1.engine.route_b_index)
+
+    assert positions == %{} and sessions == %{} and advisories == %{}
     GenServer.stop(relay)
 
     relay = start(ctx)
+    retained = key("retained")
+
+    assert %{
+             agent_feed?: true,
+             entry_positions: %{{^retained, ^event_id} => ^seq},
+             messages_by_origin_session: %{{"A", "origin"} => %{@session => [^retained]}}
+           } = stored(relay, & &1.engine.route_b_index)
+
     assert {:error, :cursor_expired} = read(relay, "origin")
     assert {:ok, [], false, 1} = read(relay, "origin", 1)
 
@@ -173,6 +201,82 @@ defmodule AttentionServer.AgentChangeLogTest do
                AgentChangeLog.rev(store, {"A", "origin"}, {:message, sessionless_key})
     end)
 
+    GenServer.stop(relay)
+  end
+
+  test "delivery updates the original entry resource, including on replay", ctx do
+    relay = start(ctx)
+    setup_people(relay)
+    forward(relay, "origin", "chat", 1, @session)
+    scope = {"A", "origin"}
+
+    assert %{"type" => "ok", "seq" => chat_seq} =
+             request(relay, "other", %{
+               "type" => "discussion",
+               "op_id" => op(2),
+               "sender_id" => "app:test",
+               "message_id" => "chat",
+               "request_revision" => 1,
+               "text" => "An entry to deliver"
+             })
+
+    resource = {:entry, chat_seq}
+    assert {:ok, first_rev} = stored(relay, &AgentChangeLog.rev(&1, scope, resource))
+
+    assert {:ok, %{"entries" => _}} = Relay.origin_feed(relay, "other", 0)
+    assert {:ok, ^first_rev} = stored(relay, &AgentChangeLog.rev(&1, scope, resource))
+    assert {:ok, %{"entries" => _}} = Relay.origin_feed(relay, "origin", 0)
+    assert {:ok, updated_rev} = stored(relay, &AgentChangeLog.rev(&1, scope, resource))
+    assert updated_rev > first_rev
+
+    assert {:ok, rows, false, head} = read(relay, "origin")
+    assert [%{resource: ^resource, rev: ^updated_rev}] = Enum.filter(rows, &(&1.kind == :entry))
+
+    assert {:ok, %{"entries" => _}} = Relay.origin_feed(relay, "origin", 0)
+    assert {:ok, [], false, ^head} = read(relay, "origin", head)
+    GenServer.stop(relay)
+  end
+
+  test "an answer's delivery updates the message resource with no answer entry", ctx do
+    relay = start(ctx)
+    setup_people(relay)
+    forward(relay, "origin", "question", 1, @session)
+
+    assert %{"type" => "ok"} =
+             request(relay, "other", %{
+               "type" => "answer",
+               "op_id" => op(2),
+               "sender_id" => "app:test",
+               "message_id" => "question",
+               "request_revision" => 1,
+               "answer" => "Yes"
+             })
+
+    assert {:ok, _, false, answer_rev} = read(relay, "origin")
+
+    assert {:ok, %{"entries" => _}} = Relay.origin_feed(relay, "origin", 0)
+
+    resource = {:message, key("question")}
+
+    assert {:ok, [%{resource: ^resource, rev: delivery_rev}], false, delivery_rev} =
+             read(relay, "origin", answer_rev)
+
+    assert delivery_rev > answer_rev
+    GenServer.stop(relay)
+  end
+
+  test "ending a session revises only messages from the affected session", ctx do
+    relay = start(ctx)
+    setup_people(relay)
+    forward(relay, "origin", "affected", 1, @session)
+    forward(relay, "origin", "unaffected", 2, @other_session)
+    assert {:ok, _, false, previous} = read(relay, "origin")
+
+    assert :ok = Relay.origin_session_gone(relay, "origin", @session)
+
+    assert {:ok, rows, false, next} = read(relay, "origin", previous)
+    assert [{"affected", rev}] = messages(rows)
+    assert previous < rev and rev <= next
     GenServer.stop(relay)
   end
 
