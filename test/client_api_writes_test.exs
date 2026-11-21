@@ -360,8 +360,8 @@ defmodule AttentionServer.ClientAPIWritesTest do
       assert {:ok, %{"entries" => entries}} = Reads.entries(relay, "reader", one)
       assert Enum.count(entries, &(&1["text"] == "Once")) == 1
 
-      assert {:error, "unsupported", "file_ids", false} =
-               Writes.reply(relay, "reader", one, "See file", ["fu1"], key())
+      assert {:error, "invalid_field", "file_ids", false} =
+               Writes.reply(relay, "reader", one, "See file", ["fs-unknown"], key())
 
       assert {:error, "invalid_field", "text", false} =
                Writes.reply(relay, "reader", one, "", key())
@@ -813,7 +813,7 @@ defmodule AttentionServer.ClientAPIWritesTest do
   end
 
   describe "HTTP" do
-    defp post(relay, path_info, body, headers, method \\ "POST") do
+    defp post(relay, path_info, body, headers, method \\ "POST", principal \\ nil) do
       conn =
         Plug.Test.conn(method, "/v2/" <> Enum.join(path_info, "/"), body)
         |> Plug.Conn.assign(:client_api_request_id, "req-1")
@@ -821,7 +821,7 @@ defmodule AttentionServer.ClientAPIWritesTest do
       conn = Enum.reduce(headers, conn, fn {k, v}, c -> Plug.Conn.put_req_header(c, k, v) end)
 
       ctx = %Context{
-        principal: %Principal{person: "A", kind: :device, key: "reader"},
+        principal: principal || %Principal{person: "A", kind: :device, key: "reader"},
         relay: relay,
         request_id: "req-1",
         params: %{item_id: Enum.at(path_info, 1)}
@@ -836,6 +836,7 @@ defmodule AttentionServer.ClientAPIWritesTest do
           {_, "priority-levels"} -> :put_priority_levels
           {"PUT", "push"} -> :put_push
           {"DELETE", "push"} -> :delete_push
+          {_, "files"} -> :post_files
         end
 
       conn = apply(Writes, handler, [conn, ctx])
@@ -914,6 +915,122 @@ defmodule AttentionServer.ClientAPIWritesTest do
 
     assert {200, %{"settings" => %{"push" => %{"state" => "canceled"}}}, _} =
              post(relay, ["devices", "me", "push"], "", [], "DELETE")
+
+    GenServer.stop(relay)
+  end
+
+  defp send_file(relay, bytes, headers, principal \\ nil) do
+    headers =
+      [
+        {"content-type", "image/png"},
+        {"content-length", Integer.to_string(byte_size(bytes))},
+        {"content-disposition", "attachment; filename*=UTF-8''caf%C3%A9%20plan.png"}
+      ]
+      |> Enum.reject(fn {name, _} -> List.keymember?(headers, name, 0) end)
+      |> Kernel.++(headers)
+      |> Enum.reject(fn {_, value} -> is_nil(value) end)
+
+    post(relay, ["files"], bytes, headers, "POST", principal)
+  end
+
+  defp staged_dir(relay) do
+    Path.join(:sys.get_state(relay).store.upload_dir, "client-api-v2-staged")
+  end
+
+  test "POST /v2/files stages the bytes under their name and replays by key",
+       %{path: path, flags: flags} do
+    relay = scripted_relay(path, flags)
+    bytes = :binary.copy(<<1, 2, 3, 250>>, 1000)
+    k = key()
+
+    assert {201, created, conn} = send_file(relay, bytes, [{"idempotency-key", k}])
+    assert Schema.errors(Schema.contract_defs(@contract), "FileCreated", created) == []
+    assert created["name"] == "café plan.png"
+    assert created["size"] == byte_size(bytes)
+    assert created["sha256"] == Base.encode16(:crypto.hash(:sha256, bytes), case: :lower)
+    assert Plug.Conn.get_resp_header(conn, "idempotent-replayed") == []
+
+    assert {201, ^created, conn} = send_file(relay, bytes, [{"idempotency-key", k}])
+    assert Plug.Conn.get_resp_header(conn, "idempotent-replayed") == ["true"]
+
+    assert {409, %{"error" => "idempotency_conflict"}, _} =
+             send_file(relay, "other", [{"idempotency-key", k}])
+
+    # One staged copy, and no temporary files left behind.
+    assert File.ls!(staged_dir(relay)) == [created["file_id"]]
+    GenServer.stop(relay)
+  end
+
+  test "POST /v2/files needs a name, a length and room under the cap", %{path: path, flags: flags} do
+    relay = scripted_relay(path, flags, upload_cap: 10)
+
+    for {headers, field} <- [
+          {[{"content-disposition", nil}], "name"},
+          {[{"content-disposition", "attachment; filename=plain.png"}], "name"},
+          {[{"content-disposition", "attachment; filename*=UTF-8''"}], "name"},
+          {[{"content-length", nil}], "Content-Length"},
+          {[{"content-length", "3"}], "Content-Length"}
+        ] do
+      assert {400, %{"error" => "invalid_field", "field" => ^field}, _} =
+               send_file(relay, "abcd", [{"idempotency-key", key()} | headers])
+    end
+
+    assert {413, %{"error" => "payload_too_large"}, _} =
+             send_file(relay, String.duplicate("x", 11), [{"idempotency-key", key()}])
+
+    assert {400, %{"error" => "invalid_field", "field" => "Idempotency-Key"}, _} =
+             send_file(relay, "abcd", [])
+
+    assert File.ls!(staged_dir(relay)) == []
+    GenServer.stop(relay)
+  end
+
+  test "a reply names staged files; they arrive as the entry's files, readable by GET",
+       %{path: path, flags: flags} do
+    relay = scripted_relay(path, flags)
+    browser = with_owner(relay)
+    one = item_id(relay, "one")
+    bytes = "the plan, in bytes"
+
+    assert {201, %{"file_id" => file_id}, _} =
+             send_file(relay, bytes, [{"idempotency-key", key()}])
+
+    k = key()
+
+    assert {:ok, 200, %{"entry" => entry} = body, false} =
+             Writes.reply(relay, "reader", one, "Here it is", [file_id], k)
+
+    assert Schema.errors(Schema.contract_defs(@contract), "WriteResult", body) == []
+    assert [%{"name" => "café plan.png", "file_id" => entry_file}] = entry["files"]
+    assert {:ok, %{size: size}} = Reads.file(relay, "reader", entry_file)
+    assert size == byte_size(bytes)
+
+    assert {:ok, 200, ^body, true} =
+             Writes.reply(relay, "reader", one, "Here it is", [file_id], k)
+
+    # A browser's staged file is its person's, and only theirs.
+    browser_principal = %Principal{
+      person: "A",
+      kind: :browser,
+      key: browser.key,
+      owner_revision: 4,
+      session_id: "s1"
+    }
+
+    assert {201, %{"file_id" => from_browser}, _} =
+             send_file(relay, "browser bytes", [{"idempotency-key", key()}], browser_principal)
+
+    assert {:ok, 200, %{"entry" => %{"files" => [_]}}, false} =
+             Writes.reply(relay, browser, one, "From the web", [from_browser], key())
+
+    # Another person's staged file cannot be named.
+    stranger = %Principal{person: "B", kind: :device, key: "stranger"}
+
+    assert {201, %{"file_id" => theirs}, _} =
+             send_file(relay, "not yours", [{"idempotency-key", key()}], stranger)
+
+    assert {:error, "invalid_field", "file_ids", false} =
+             Writes.reply(relay, "reader", one, "x", [theirs], key())
 
     GenServer.stop(relay)
   end
