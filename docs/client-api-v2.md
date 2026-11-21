@@ -860,7 +860,7 @@ visible text. Its `attention` member changes:
 | `cursor_expired` | 410 | false | `after` is older than retention |
 | `payload_too_large` | 413 | false | Body or file over the limit (`too_large`, `upload_cap_exceeded`) |
 | `unsupported` | 400 | false | The server does not serve this here: push with push disabled, or a reply, answer receipt or agent result on an item with no agent conversation |
-| `internal_error` | 500 | false | A server projection or render fault. Includes `Request-Id` and has no `Retry-After`. |
+| `internal_error` | 500 | false | An unexpected server fault during request handling, projection, or rendering. Includes `Request-Id` and has no `Retry-After`. |
 | `retry_later` | 503 | true | Load shedding, with `Retry-After` |
 | `storage_unavailable` | 503 | true | The store could not commit, with `Retry-After` |
 
@@ -1621,6 +1621,9 @@ surfaces the paused feed for manual resume.
   affected frame. If the transport drops after a successful commit,
   resuming from the agent's cursor returns the entry or answer again and
   preserves the existing Delivered record.
+- Encoding runs after a successful Delivered commit. An encoding fault
+  leaves the record committed and the cursor unchanged. Resuming from
+  that cursor returns the entry or answer again.
 - A person sees the agent or session as listening while there is a covering
   open feed, or a covering batch was fetched in the last 60 seconds. Chat
   is stored and delivered on the next read regardless of feed activity.

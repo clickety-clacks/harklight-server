@@ -180,8 +180,7 @@ defmodule AttentionServer.ClientAPI.FeedStep do
     # A principal that no longer authenticates reads nothing, even on a
     # connection opened before its access ended.
     with {:ok, _} <- authorized(state, principal),
-         :ok <- ChangeLog.ranks_available(state.store, person),
-         {:ok, rows, more, position} <- ChangeLog.read(state.store, person, cursor, limit) do
+         {:ok, rows, more, position} <- read_log(state.store, person, cursor, limit) do
       context = %{
         engine: state.store.engine,
         store: state.store,
@@ -199,10 +198,13 @@ defmodule AttentionServer.ClientAPI.FeedStep do
         Diagnostics.failure(:client_api, :stream_read, reason, :failed)
         {:error, :storage_unavailable}
     end
+  end
+
+  defp read_log(store, person, cursor, limit) do
+    with :ok <- ChangeLog.ranks_available(store, person),
+         do: ChangeLog.read(store, person, cursor, limit)
   rescue
-    error ->
-      Diagnostics.failure(:client_api, :stream_read, error, :failed)
-      {:error, :storage_unavailable}
+    error -> {:error, error}
   end
 
   defp authorized(state, principal) do
@@ -213,24 +215,21 @@ defmodule AttentionServer.ClientAPI.FeedStep do
   end
 
   defp render_rows(context, principal, rows) do
-    renderer = renderer()
+    Projection.run(:feed, fn ->
+      renderer = renderer()
 
-    results =
-      cond do
-        renderer == FeedRenderer ->
-          FeedRenderer.render_many(context, principal, rows)
-
-        Code.ensure_loaded?(renderer) and function_exported?(renderer, :render_many, 3) ->
-          Projection.run(:feed, fn -> renderer.render_many(context, principal, rows) end)
-
-        true ->
+      results =
+        if renderer == FeedRenderer or
+             (Code.ensure_loaded?(renderer) and function_exported?(renderer, :render_many, 3)) do
+          renderer.render_many(context, principal, rows)
+        else
           Enum.map(rows, fn row ->
-            result = Projection.run(:feed, fn -> renderer.render(context, principal, row) end)
-            {row, result}
+            {row, renderer.render(context, principal, row)}
           end)
-      end
+        end
 
-    changes(results)
+      changes(results)
+    end)
   end
 
   @doc false
