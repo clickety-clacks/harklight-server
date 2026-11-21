@@ -637,6 +637,10 @@ defmodule AttentionServer.Relay do
   def device_person(server, verified_key),
     do: GenServer.call(server, {:device_person, verified_key}, :infinity)
 
+  @doc "Whether a person's account is paused (`inactive_account`), for the client API."
+  def account_paused?(server, person),
+    do: GenServer.call(server, {:account_paused?, person}, :infinity)
+
   def open_session(server, verified_key),
     do: GenServer.call(server, {:open_session, verified_key, nil, nil, nil, :raw}, :infinity)
 
@@ -1203,6 +1207,9 @@ defmodule AttentionServer.Relay do
 
   defp dispatch_call({:device_person, key}, _from, state),
     do: {:reply, Engine.authorized_person(state.store.engine, key), state}
+
+  defp dispatch_call({:account_paused?, person}, _from, state),
+    do: {:reply, Engine.delivery_stopped?(state.store.engine, person), state}
 
   defp dispatch_call({:owner_revision, person, key}, _from, state),
     do: {:reply, Engine.owner_revision(state.store.engine, person, key), state}

@@ -35,8 +35,9 @@ defmodule AttentionServer.ClientAPI.Routes do
     feed, from the in-flight request limit.
 
   Before a handler runs, the router has set `Request-Id`, authenticated the
-  principal (401 otherwise), applied the browser write-origin check (403) and
-  the load limit (503 with `Retry-After`). Unmatched requests get 404
+  principal (401 otherwise), refused a paused account (403 `account_paused`,
+  on every request except `GET /v2/me`), applied the browser write-origin check
+  (403) and the load limit (503 with `Retry-After`). Unmatched requests get 404
   `not_found`. A handler that raises, or exits from a Relay call, answers 503
   `retry_later`. Request bodies are not read by the router.
   """
@@ -84,7 +85,7 @@ defmodule AttentionServer.ClientAPI.Router do
   require Logger
 
   alias AttentionServer.ClientAPI.{Auth, Context, Errors}
-  alias AttentionServer.Diagnostics
+  alias AttentionServer.{Diagnostics, Relay}
 
   # Components add their route module here: C3 reads, C4 writes, C5 the feed.
   @route_modules []
@@ -124,14 +125,24 @@ defmodule AttentionServer.ClientAPI.Router do
   defp authenticated(conn, opts, segments, request_id) do
     case authenticate(conn, opts) do
       {:ok, principal} ->
-        if origin_ok?(conn, opts.auth) do
-          dispatch(conn, opts, segments, %Context{
-            principal: principal,
-            relay: opts.relay,
-            request_id: request_id
-          })
-        else
-          Errors.send_error(conn, "forbidden")
+        paused = paused?(conn, opts, segments, principal)
+
+        cond do
+          paused == :unavailable ->
+            Errors.send_error(conn, "retry_later")
+
+          paused ->
+            Errors.send_error(conn, "account_paused")
+
+          not origin_ok?(conn, opts.auth) ->
+            Errors.send_error(conn, "forbidden")
+
+          true ->
+            dispatch(conn, opts, segments, %Context{
+              principal: principal,
+              relay: opts.relay,
+              request_id: request_id
+            })
         end
 
       {:error, :unauthorized} ->
@@ -154,6 +165,15 @@ defmodule AttentionServer.ClientAPI.Router do
     Auth.browser(conn, backend)
   catch
     :exit, _reason -> {:error, :unavailable}
+  end
+
+  # A paused account may still read who it is: `GET /v2/me` reports the pause.
+  defp paused?(%Plug.Conn{method: "GET"}, _opts, ["me"], _principal), do: false
+
+  defp paused?(_conn, opts, _segments, principal) do
+    Relay.account_paused?(opts.relay, principal.person) == true
+  catch
+    :exit, _reason -> :unavailable
   end
 
   defp origin_ok?(conn, {:browser, _backend, origin}), do: Auth.browser_origin_ok?(conn, origin)
