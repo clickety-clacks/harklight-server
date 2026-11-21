@@ -1983,7 +1983,12 @@ defmodule AttentionServer.Engine do
 
   @doc false
   def request_line_with_touches(%__MODULE__{} = engine, key, raw, request_at) do
-    {next, reply} = request_line(%{engine | touched_keys: MapSet.new()}, key, raw, request_at)
+    with_touches(engine, &request_line(&1, key, raw, request_at))
+  end
+
+  @doc false
+  def with_touches(%__MODULE__{} = engine, transition) do
+    {next, reply} = transition.(%{engine | touched_keys: MapSet.new()})
     {%{next | touched_keys: nil}, reply, next.touched_keys}
   end
 
@@ -2433,8 +2438,7 @@ defmodule AttentionServer.Engine do
 
   def open_conversation(%__MODULE__{} = engine, key) do
     with {:ok, %{person: person, key: device}} <- principal(engine, key) do
-      {:ok,
-       %{engine | conversation_opened: MapSet.put(engine.conversation_opened, {person, device})}}
+      {:ok, put_member(engine, :conversation_opened, {person, device})}
     end
   end
 
@@ -2443,10 +2447,7 @@ defmodule AttentionServer.Engine do
       current = Map.get(engine.conversation_cursors, {person, device}, 0)
 
       if is_integer(seq) and seq >= current and seq <= highest_sent do
-        next = %{
-          engine
-          | conversation_cursors: Map.put(engine.conversation_cursors, {person, device}, seq)
-        }
+        next = put_row(engine, :conversation_cursors, {person, device}, seq)
 
         {:ok, next, %{"conversation_seq" => seq}}
       else
@@ -3242,7 +3243,7 @@ defmodule AttentionServer.Engine do
   def checkpoint_cursor(%__MODULE__{} = engine, key, high) do
     with {:ok, %{person: person}} <- principal(engine, key),
          true <- is_integer(high) and high >= 0 and high <= engine.persons[person] do
-      {:ok, %{engine | cursors: Map.put(engine.cursors, {person, key}, high)}}
+      {:ok, put_row(engine, :cursors, {person, key}, high)}
     else
       {:error, :forbidden} -> {:error, :forbidden}
       false -> {:error, :invalid_cursor}
@@ -3339,7 +3340,7 @@ defmodule AttentionServer.Engine do
       current = Map.get(engine.cursors, {person, key}, 0)
 
       if is_integer(seq) and seq >= current and seq <= highest_sent do
-        next = %{engine | cursors: Map.put(engine.cursors, {person, key}, seq)}
+        next = put_row(engine, :cursors, {person, key}, seq)
         {:ok, next, %{"seq" => seq}}
       else
         {:error, :invalid_cursor}

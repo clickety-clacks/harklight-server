@@ -297,6 +297,24 @@ defmodule AttentionServer.Store.EngineTransitionTest do
     :ok = Store.close(keyed)
   end
 
+  test "direct cursor and conversation writers emit their touched records" do
+    engine = normalized_legacy_engine()
+    {engine, {:ok, _}} = Engine.request_line(engine, @origin, forward_line(), 100)
+
+    {next, :ok, keys} =
+      Engine.with_touches(engine, fn current ->
+        {:ok, current, _reply} = Engine.acknowledge(current, @reader, 1, 1)
+        {:ok, current} = Engine.open_conversation(current, @reader)
+        {:ok, current, _reply} = Engine.acknowledge_conversation(current, @reader, 0, 0)
+        {current, :ok}
+      end)
+
+    assert keys == full_diff(engine, next)
+    assert MapSet.member?(keys, {:row, :cursors, {@person, @reader}})
+    assert MapSet.member?(keys, {:member, :conversation_opened, {@person, @reader}})
+    assert MapSet.member?(keys, {:row, :conversation_cursors, {@person, @reader}})
+  end
+
   defp replace_body(engine, item, body) do
     engine
     |> put_in([Access.key!(:messages), item, :message, "body"], body)

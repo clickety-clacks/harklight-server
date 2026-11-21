@@ -38,17 +38,37 @@ defmodule AttentionServer.Store.KeyedValidation do
 
   defp source_key(_), do: nil
 
+  @authority_rows [
+    :messages,
+    :uploads,
+    :receipts,
+    :sender_grants,
+    :source_report_grants,
+    :subscriptions,
+    :cursors,
+    :conversation_cursors,
+    :origin_sessions,
+    :origin_feeds
+  ]
+
   def authority_index(engine) do
-    for field <- [:messages, :uploads, :receipts],
-        key <- Map.keys(Map.fetch!(engine, field)),
-        reduce: %{} do
-      index -> edit_authority_index(index, engine, {:row, field, key}, :add)
-    end
+    index =
+      for field <- @authority_rows,
+          key <- Map.keys(Map.fetch!(engine, field)),
+          reduce: %{} do
+        index -> edit_authority_index(index, engine, {:row, field, key}, :add)
+      end
+
+    Enum.reduce(engine.conversation_opened, index, fn key, acc ->
+      edit_authority_index(acc, engine, {:member, :conversation_opened, key}, :add)
+    end)
   end
 
   def authority_changes(index, old, next, touched) do
     updated =
       Enum.reduce(touched, index, fn address, acc ->
+        address = authority_address(address)
+
         acc
         |> edit_authority_index(old, address, :remove)
         |> edit_authority_index(next, address, :add)
@@ -57,9 +77,16 @@ defmodule AttentionServer.Store.KeyedValidation do
     affected =
       Enum.reduce(touched, MapSet.new(), fn
         {:row, :persons, person}, keys ->
-          if Map.has_key?(old.persons, person) != Map.has_key?(next.persons, person),
-            do: MapSet.union(keys, Map.get(updated, {:person, person}, MapSet.new())),
-            else: keys
+          if Map.has_key?(old.persons, person) != Map.has_key?(next.persons, person) or
+               Map.get(next.persons, person, 0) < Map.get(old.persons, person, 0),
+             do: MapSet.union(keys, Map.get(updated, {:person, person}, MapSet.new())),
+             else: keys
+
+        {:row, :conversation_highs, person}, keys ->
+          if Map.get(next.conversation_highs, person, 0) <
+               Map.get(old.conversation_highs, person, 0),
+             do: MapSet.union(keys, Map.get(updated, {:person, person}, MapSet.new())),
+             else: keys
 
         {:row, field, actor}, keys when field in [:devices, :agents] ->
           before = owner_identity(Map.get(Map.fetch!(old, field), actor))
@@ -112,7 +139,38 @@ defmodule AttentionServer.Store.KeyedValidation do
     if Map.has_key?(engine.receipts, key), do: [{:person, person}, {:actor, actor}], else: []
   end
 
+  defp authority_owners(engine, {:row, field, {person, actor} = key})
+       when field in [
+              :sender_grants,
+              :subscriptions,
+              :cursors,
+              :conversation_cursors,
+              :origin_feeds
+            ] do
+    row_owners(engine, field, key, person, actor)
+  end
+
+  defp authority_owners(engine, {:row, field, {person, actor, _} = key})
+       when field in [:source_report_grants, :origin_sessions] do
+    row_owners(engine, field, key, person, actor)
+  end
+
+  defp authority_owners(engine, {:member, :conversation_opened, {person, actor} = key}) do
+    if MapSet.member?(engine.conversation_opened, key),
+      do: [{:person, person}, {:actor, actor}],
+      else: []
+  end
+
   defp authority_owners(_engine, _address), do: []
+
+  defp authority_address({:origin_feed, scope, _}), do: {:row, :origin_feeds, scope}
+  defp authority_address(address), do: address
+
+  defp row_owners(engine, field, key, person, actor) do
+    if Map.has_key?(Map.fetch!(engine, field), key),
+      do: [{:person, person}, {:actor, actor}],
+      else: []
+  end
 
   def upload_index(engine) do
     for {scope, feed} <- engine.origin_feeds, {seq, entry} <- feed.entries, reduce: %{} do

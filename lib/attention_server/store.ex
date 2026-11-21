@@ -3201,6 +3201,38 @@ defmodule AttentionServer.Store do
   defp valid_authority_reference?(engine, {:row, :receipts, {person, actor, _} = key}),
     do: not Map.has_key?(engine.receipts, key) or actor_owns?(engine, person, actor)
 
+  defp valid_authority_reference?(engine, {:row, field, {person, actor} = key})
+       when field in [:sender_grants, :subscriptions, :origin_feeds],
+       do: not Map.has_key?(Map.fetch!(engine, field), key) or owns?(engine, person, actor)
+
+  defp valid_authority_reference?(engine, {:row, field, {person, actor, _} = key})
+       when field in [:source_report_grants, :origin_sessions],
+       do: not Map.has_key?(Map.fetch!(engine, field), key) or owns?(engine, person, actor)
+
+  defp valid_authority_reference?(engine, {:row, field, {person, actor} = key})
+       when field in [:cursors, :conversation_cursors] do
+    high =
+      if field == :cursors,
+        do: Map.get(engine.persons, person, 0),
+        else: Map.get(engine.conversation_highs, person, 0)
+
+    case Map.fetch(Map.fetch!(engine, field), key) do
+      {:ok, seq} ->
+        owns_or_browser?(engine, person, actor) and is_integer(seq) and seq >= 0 and seq <= high
+
+      :error ->
+        true
+    end
+  end
+
+  defp valid_authority_reference?(engine, {:member, :conversation_opened, {person, actor} = key}),
+    do:
+      not MapSet.member?(engine.conversation_opened, key) or
+        owns_or_browser?(engine, person, actor)
+
+  defp valid_authority_reference?(engine, {:origin_feed, scope, _}),
+    do: valid_authority_reference?(engine, {:row, :origin_feeds, scope})
+
   defp valid_authority_reference?(_engine, _address), do: true
 
   defp valid_item_change?(old, next, {person, _, _} = key) do
