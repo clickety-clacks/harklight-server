@@ -1064,7 +1064,7 @@ agents with existing data. Clients apply newer versions of each resource.
 | Request | Body | Success body |
 |---|---|---|
 | `POST /v2/agent/messages` | `SendMessageBody` | `AgentSendResult` |
-| `PUT /v2/agent/messages/{item_id}` | `ReviseMessageBody`, with `If-Match: <revision>` | `AgentMessageResult` |
+| `PUT /v2/agent/messages/{item_id}` | `ReviseMessageBody`, with `If-Match: <revision>` | `AgentReviseResult` |
 | `POST /v2/agent/messages/{item_id}/retract` | `RetractMessageBody` | `AgentRetractResult` |
 | `POST /v2/agent/messages/{item_id}/lifecycle` | `AgentLifecycleBody` | `AgentMessageResult` |
 | `POST /v2/agent/messages/{item_id}/replies` | `AgentReplyBody` | `AgentReplyResult` |
@@ -1123,7 +1123,8 @@ Writes return 200 unless the table says otherwise. Each response schema requires
       "additionalProperties": false,
       "properties": {
         "message": { "$ref": "#/$defs/AgentMessageContent" },
-        "file_ids": { "$ref": "#/$defs/AgentFileIds" }
+        "file_ids": { "$ref": "#/$defs/AgentFileIds" },
+        "in_reply_to": { "$ref": "#/$defs/OpaqueId" }
       }
     },
     "AgentLifecycleBody": {
@@ -1258,6 +1259,12 @@ Writes return 200 unless the table says otherwise. Each response schema requires
     },
     "AgentSendResult": {"$ref": "#/$defs/AgentWriteResult", "type": "object", "required": ["rev", "message"], "properties": {"rev": {}, "message": {}, "supersedes_warnings": {}}, "additionalProperties": false},
     "AgentMessageResult": {"$ref": "#/$defs/AgentWriteResult", "type": "object", "required": ["rev", "message"], "properties": {"rev": {}, "message": {}}, "additionalProperties": false},
+    "AgentReviseResult": {
+      "$ref": "#/$defs/AgentWriteResult",
+      "required": ["rev", "message"],
+      "properties": { "rev": {}, "message": {}, "entry": {} },
+      "additionalProperties": false
+    },
     "AgentRetractResult": {"$ref": "#/$defs/AgentWriteResult", "type": "object", "required": ["rev", "message"], "properties": {"rev": {}, "message": {}, "entry": {}}, "additionalProperties": false},
     "AgentReplyResult": {"$ref": "#/$defs/AgentWriteResult", "type": "object", "required": ["rev", "entry"], "properties": {"rev": {}, "entry": {}}, "additionalProperties": false},
     "AgentResultWriteResult": {"$ref": "#/$defs/AgentWriteResult", "type": "object", "required": ["rev", "message", "entry"], "properties": {"rev": {}, "message": {}, "entry": {}}, "additionalProperties": false},
@@ -1306,6 +1313,18 @@ Writes return 200 unless the table says otherwise. Each response schema requires
   and already-terminal targets produce `invalid`, `unknown` and `closed`
   warnings respectively (`Engine.supersede_listed_targets`). The response carries
   `supersedes_warnings` for any targets that cannot be superseded.
+- **Correlated revise.** Optional `in_reply_to` names a person chat turn
+  on this item at its current revision. A different item or kind is
+  `404 not_found`, and an earlier revision is `409 stale_request`.
+  The successful write marks the turn acted and returns it as `entry`.
+- **Revise attachments.** Omit `file_ids` to keep the current revision's
+  attachments, including migrated inline files, under the same
+  `If-Match`. An empty array clears the attachments. A nonempty array is
+  the complete replacement set. Its members may be upload handles or
+  `FileRef.file_id` download IDs of files currently on this item's
+  revision. The latter carry existing files without re-upload. Other IDs
+  return `400 invalid_field` with `field: "file_ids"`. Other write routes
+  accept upload handles only.
 - **Lifecycle and retract.** Only the item's originating key can use either
   route. Both stamp the time on the server. Lifecycle
   follows the existing transition rules. A repeat retraction under a new
