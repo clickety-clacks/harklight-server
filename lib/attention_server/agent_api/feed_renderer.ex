@@ -1,7 +1,7 @@
 defmodule AttentionServer.AgentAPI.FeedRenderer do
   @moduledoc false
 
-  alias AttentionServer.AgentAPI.{Advisories, Focus}
+  alias AttentionServer.AgentAPI.Advisories
   alias AttentionServer.ClientAPI.AgentResources
 
   def render_many(%{store: %{engine: engine}} = state, %{person: person, key: key}, rows) do
@@ -29,13 +29,6 @@ defmodule AttentionServer.AgentAPI.FeedRenderer do
       |> Map.new()
 
     Enum.map(rows, fn row -> {row, render_row(state, scope, row, entries)} end)
-  end
-
-  def focus(ctx) do
-    case Focus.get(ctx.relay, ctx.principal) do
-      {:ok, projection} -> {:ok, %{"focus" => projection}}
-      error -> error
-    end
   end
 
   defp render_row(state, scope, %{resource: {:message, key}, rev: rev}, _entries) do

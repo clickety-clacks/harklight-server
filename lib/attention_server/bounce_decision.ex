@@ -299,7 +299,9 @@ defmodule AttentionServer.BounceDecision do
             Enum.map((since + 1)..feed.high, fn sequence ->
               entry = Map.fetch!(feed.entries, sequence)
 
-              Map.put(entry, "delivered", MapSet.member?(feed.receipts, entry["advisory_id"]))
+              entry
+              |> Map.delete("decided_at_rev")
+              |> Map.put("delivered", MapSet.member?(feed.receipts, entry["advisory_id"]))
             end)
           end
 
@@ -592,8 +594,11 @@ defmodule AttentionServer.BounceDecision do
 
       true ->
         case Map.get(engine.origin_sessions, {person, origin, handle}) do
-          %{gone: false, support: %{"advisory_v1" => true, "unsupported_reason" => nil}} ->
-            :supported
+          %{gone: false} = session ->
+            if Map.get(record, :agent_api_v2, false) or
+                 match?(%{"advisory_v1" => true, "unsupported_reason" => nil}, session.support),
+               do: :supported,
+               else: :unsupported
 
           _ ->
             :unsupported
@@ -1179,7 +1184,9 @@ defmodule AttentionServer.BounceDecision do
     selection = get_in(state, [:revisions, sub_revision, :selection])
     record = Map.get(engine.messages, key)
 
-    is_map(entry) and Map.keys(entry) |> Enum.sort() == Enum.sort(@advisory_fields) and
+    is_map(entry) and Map.keys(Map.delete(entry, "decided_at_rev")) |> Enum.sort() ==
+        Enum.sort(@advisory_fields) and
+      is_integer(Map.get(entry, "decided_at_rev", 0)) and Map.get(entry, "decided_at_rev", 0) >= 0 and
       entry["kind"] == "advisory" and entry["advisory_type"] == "unseen_interval_elapsed" and
       entry["author"] == "server" and Message.uuid_v4?(entry["advisory_id"]) and
       entry["advisory_seq"] == sequence and entry["session_handle"] == handle and

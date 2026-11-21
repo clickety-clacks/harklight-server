@@ -373,6 +373,8 @@ defmodule AttentionServer.ConversationFeedTest do
       })
 
     :sys.replace_state(relay, &%{&1 | store: selected_store})
+    scope = {"A", "origin"}
+    assert {:ok, decision_cursor} = AgentChangeLog.head(selected_store, scope)
     :atomics.put(clock, 1, due_at + 25)
     generation = :sys.get_state(relay).bounce_deadline_generation
     send(relay, {:bounce_due, generation})
@@ -389,13 +391,12 @@ defmodule AttentionServer.ConversationFeedTest do
     assert :sys.get_state(relay).store.engine.messages[{"A", "app:test", "durable-advisory"}].terminal ==
              nil
 
-    scope = {"A", "origin"}
     message_key = {"A", "app:test", "durable-advisory"}
     advisory_id = advisory["advisory_id"]
     store = :sys.get_state(relay).store
     assert {:ok, before_ack} = AgentChangeLog.head(store, scope)
 
-    assert [%{"advisory_id" => ^advisory_id, "delivered" => false}] =
+    assert [%{"advisory_id" => ^advisory_id, "delivered" => false, "decided_at_rev" => ^decision_cursor}] =
              Advisories.for_message(store.engine, scope, message_key)
 
     assert {:ok, first_ack} =
@@ -415,7 +416,7 @@ defmodule AttentionServer.ConversationFeedTest do
     GenServer.stop(relay)
     assert {:ok, restarted} = Relay.start_link(opts)
 
-    assert [%{"advisory_id" => ^advisory_id, "delivered" => true}] =
+    assert [%{"advisory_id" => ^advisory_id, "delivered" => true, "decided_at_rev" => ^decision_cursor}] =
              Advisories.for_message(:sys.get_state(restarted).store.engine, scope, message_key)
 
     assert {:ok, replayed} = Relay.origin_advisory_feed(restarted, "origin", @handle, 0)

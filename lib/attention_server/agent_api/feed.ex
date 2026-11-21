@@ -65,7 +65,7 @@ defmodule AttentionServer.AgentAPI.FeedStep do
 
   alias AttentionServer.{AgentChangeLog, Diagnostics, Engine, Relay, Store}
   alias AttentionServer.AgentAPI.{FeedActivity, FeedRenderer}
-  alias AttentionServer.ClientAPI.{FeedStep, Resources}
+  alias AttentionServer.ClientAPI.{AgentFocus, FeedStep, Resources}
 
   def scope(%{principal: %{person: person, key: key}}), do: {:agent, person, key}
 
@@ -92,10 +92,18 @@ defmodule AttentionServer.AgentAPI.FeedStep do
 
   def closed(ctx), do: FeedActivity.observe(ctx, :close)
 
-  def focus(ctx), do: FeedRenderer.focus(ctx)
+  def focus(%{relay: relay, principal: %{person: person, key: key}}) do
+    case call(relay, {:focus, person, key}) do
+      {:ok, projection} -> {:ok, %{"focus" => projection}}
+      error -> error
+    end
+  end
 
   defp call(relay, request),
     do: GenServer.call(relay, {:client_api, __MODULE__, request}, :infinity)
+
+  def handle_call({:focus, person, key}, _from, state),
+    do: {:reply, AgentFocus.snapshot(state, person, key), state}
 
   def handle_call({:read, principal, session, cursor, limit}, _from, state),
     do: {:reply, read_rows(state, principal, session, cursor, limit), state}
