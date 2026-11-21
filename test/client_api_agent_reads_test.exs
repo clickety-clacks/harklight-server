@@ -1,7 +1,15 @@
 defmodule AttentionServer.ClientAPIAgentReadsTest do
   use ExUnit.Case, async: false
 
-  alias AttentionServer.{ClientAPIFeedClient, ClientAPISchema, JSON, Relay, Server, TLSFixtures}
+  alias AttentionServer.{
+    AgentChangeLog,
+    ClientAPIFeedClient,
+    ClientAPISchema,
+    JSON,
+    Relay,
+    Server,
+    TLSFixtures
+  }
   alias AttentionServer.ClientAPI.Resources
 
   @first_session "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
@@ -14,13 +22,13 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
     %{certs: certs, defs: defs}
   end
 
-  setup %{certs: certs} do
+  setup %{certs: certs} = context do
     dir = Path.join(System.tmp_dir!(), "agent-reads-#{System.unique_integer([:positive])}")
     File.mkdir_p!(dir)
     on_exit(fn -> File.rm_rf!(dir) end)
 
     flags = Path.join(dir, "flags.json")
-    File.write!(flags, ~s({"client_api_v2":true}))
+    File.write!(flags, JSON.encode!(%{"client_api_v2" => Map.get(context, :flag, true)}))
 
     server =
       start_supervised!(
@@ -55,7 +63,7 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
     assert :ok = Relay.setup_sender(relay, keys["a2"], "app:test")
     assert :ok = Relay.setup_sender(relay, keys["b1"], "app:test")
 
-    %{relay: relay, keys: keys, port: Server.port(server)}
+    %{server: server, relay: relay, keys: keys, port: Server.port(server)}
   end
 
   test "lists only the enrolled agent's messages, newest first, and filters by session", ctx do
@@ -75,6 +83,40 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
 
     scoped = get(ctx, "a1", "/v2/agent/messages?session=" <> @first_session)
     assert contract(ctx, "SentMessagesPage", scoped)["messages"] == [older]
+
+    legacy =
+      get(ctx, "a1", "/v2/agent/messages?sender=app%3Atest&legacy_message_id=item-1")
+
+    assert older["legacy_message_id"] == "item-1"
+    assert contract(ctx, "SentMessagesPage", legacy)["messages"] == [older]
+    assert get(ctx, "a1", "/v2/agent/messages?session=invalid").status == 400
+  end
+
+  test "message pages bind the token to the agent and the filters", ctx do
+    for n <- 1..51, do: forward(ctx, "a1", n, @first_session)
+    filter = "/v2/agent/messages?session=" <> @first_session
+
+    assert %{"messages" => messages, "next_page" => page} =
+             contract(ctx, "SentMessagesPage", get(ctx, "a1", filter))
+
+    assert Enum.map(messages, & &1["legacy_message_id"]) ==
+             Enum.map(51..2, &"item-#{&1}")
+
+    next = filter <> "&page=" <> page
+    last = contract(ctx, "SentMessagesPage", get(ctx, "a1", next))
+    assert [%{"legacy_message_id" => "item-1"}] = last["messages"]
+    refute Map.has_key?(last, "next_page")
+    assert get(ctx, "a2", next).status == 400
+    assert get(ctx, "a1", "/v2/agent/messages?page=" <> page).status == 400
+  end
+
+  @tag flag: false
+  test "the server leaves the agent HTTP routes and durable log disabled with the flag off", ctx do
+    forward(ctx, "a1", 1, @first_session)
+    refute Server.client_api_v2?(ctx.server)
+    refute Enum.any?(Supervisor.which_children(ctx.server), &(elem(&1, 0) == :client_api))
+    state = :sys.get_state(ctx.relay)
+    assert {:error, :disabled} = AgentChangeLog.head(state.store, {"A", ctx.keys["a1"]})
   end
 
   test "reads one message with an ETag and hides it from other principals", ctx do
@@ -129,6 +171,37 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
     assert contract(ctx, "Me", response)["sender_names"] == ["app:test"]
   end
 
+  test "reads the selected historical revision and hides it from other principals", ctx do
+    id = forward(ctx, "a1", 1, @first_session)
+
+    frame(ctx, "a1", %{
+      "type" => "conversation_revise",
+      "op_id" => op(2),
+      "sender_id" => "app:test",
+      "message_id" => "item-1",
+      "base_revision" => 1,
+      "message" => %{
+        "sender_id" => "app:test",
+        "message_id" => "item-1",
+        "title" => "Revised",
+        "created_at" => 1
+      }
+    })
+
+    path = "/v2/agent/messages/" <> id <> "/revisions/"
+    original = get(ctx, "a1", path <> "1")
+    assert original.status == 200
+
+    assert %{"revision" => %{"request_revision" => 1, "message" => %{"title" => "Message 1"}}} =
+             contract(ctx, "AgentRevisionResponse", original)
+
+    assert %{"revision" => %{"request_revision" => 2, "message" => %{"title" => "Revised"}}} =
+             contract(ctx, "AgentRevisionResponse", get(ctx, "a1", path <> "2"))
+
+    assert get(ctx, "a1", path <> "3").status == 404
+    assert get(ctx, "a2", path <> "1").status == 404
+  end
+
   defp forward(ctx, name, n, session) do
     %{"seq" => seq} =
       frame(ctx, name, %{
@@ -153,7 +226,7 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
     decoded
   end
 
-  defp op(n), do: "00000000-0000-4000-8000-00000000000#{n}"
+  defp op(n), do: "00000000-0000-4000-8000-#{String.pad_leading(Integer.to_string(n), 12, "0")}"
 
   defp get(ctx, name, path, headers \\ []) do
     conn = ClientAPIFeedClient.connect(ctx.port, ctx.certs, name)

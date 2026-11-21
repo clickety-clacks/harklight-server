@@ -256,7 +256,7 @@ defmodule AttentionServer.ClientAPI.Resources do
     do: %{"unresolved" => Map.get(engine.route_b_index.unresolved_count_by_person, person, 0)}
 
   # Today's `opened`: Seen for the current substantive revision.
-  defp seen?(engine, {person, sender, id} = key, record) do
+  def seen?(engine, {person, sender, id} = key, record) do
     substantive =
       case Map.get(engine.bounce_revisions, key) do
         %{raw_to_substantive: raw_to_substantive} = state ->
@@ -400,7 +400,7 @@ defmodule AttentionServer.ClientAPI.Resources do
 
   # Today's person-facing answer_outcome (contract rulings round 4, item 3).
   # The origin-only raw answer is never included.
-  defp answer_outcome(record, terminal) do
+  def answer_outcome(record, terminal) do
     case {Map.get(terminal, :kind), terminal.by, terminal.answer_present, terminal.answer} do
       {"no_comment", _, _, _} ->
         %{"kind" => "no_comment"}
@@ -488,11 +488,11 @@ defmodule AttentionServer.ClientAPI.Resources do
   defp text_or_nil(value) when is_binary(value), do: value
   defp text_or_nil(_), do: nil
 
-  defp origin_result(%{origin_result: %{status: status, revision: revision} = result}) do
+  def origin_result(%{origin_result: %{status: status, revision: revision} = result}) do
     put_present(%{"status" => status, "revision" => revision}, "result_ref", result[:result_ref])
   end
 
-  defp origin_result(_), do: nil
+  def origin_result(_), do: nil
 
   defp file_refs(files, prefix) when is_list(files) do
     files

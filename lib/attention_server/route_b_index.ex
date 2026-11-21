@@ -4,6 +4,7 @@ defmodule AttentionServer.RouteBIndex do
   def new do
     %{
       resolved_messages_by_person: %{},
+      sent_messages_by_agent: %{},
       conversations_by_item: %{},
       conversation_summary_by_item: %{},
       unresolved_count_by_person: %{}
@@ -22,6 +23,8 @@ defmodule AttentionServer.RouteBIndex do
   end
 
   def put_message(index, {person, sender, id} = key, previous, record) do
+    index = index_sent_message(index, key, previous, record)
+
     previous_resolved? = match?(%{terminal: terminal} when not is_nil(terminal), previous)
     current_resolved? = not is_nil(record.terminal)
 
@@ -53,6 +56,15 @@ defmodule AttentionServer.RouteBIndex do
       put_in(index, [:unresolved_count_by_person, person], count)
     end
   end
+
+  defp index_sent_message(index, {person, _, _} = key, nil, %{origin: agent} = record)
+       when is_binary(agent) do
+    scope = {person, agent}
+    tree = Map.get(index.sent_messages_by_agent, scope, :gb_trees.empty())
+    put_in(index, [:sent_messages_by_agent, scope], :gb_trees.insert(-record.accepted_seq, key, tree))
+  end
+
+  defp index_sent_message(index, _key, _previous, _record), do: index
 
   def put_conversation_event(index, person, seq, {row_person, _sender, _id} = key, payload)
       when row_person == person do

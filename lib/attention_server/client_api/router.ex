@@ -91,6 +91,7 @@ defmodule AttentionServer.ClientAPI.Router do
   # Components add their route module here: C3 reads, C4 writes, C5 the feed.
   @route_modules [
     AttentionServer.ClientAPI.Reads,
+    AttentionServer.ClientAPI.AgentReads,
     AttentionServer.ClientAPI.Writes,
     AttentionServer.ClientAPI.Feed
   ]
