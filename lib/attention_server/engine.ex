@@ -24,6 +24,7 @@ defmodule AttentionServer.Engine do
     JSON,
     LargeData,
     Message,
+    RouteBIndex,
     SenderNames
   }
 
@@ -83,19 +84,7 @@ defmodule AttentionServer.Engine do
             bounce_origin_entries: MapSet.new(),
             advisory_id_index: %{},
             advisory_feeds: %{},
-            route_b_index: %{
-              resolved_messages_by_person: %{},
-              sent_messages_by_agent: %{},
-              agent_results: %{},
-              agent_entry_pages: %{},
-              conversations_by_item: %{},
-              agent_feed?: false,
-              entry_positions: %{},
-              advisory_sequences: %{},
-              messages_by_origin_session: %{},
-              conversation_summary_by_item: %{},
-              unresolved_count_by_person: %{}
-            }
+            route_b_index: RouteBIndex.new()
 
   def new do
     %__MODULE__{
@@ -4881,6 +4870,13 @@ defmodule AttentionServer.Engine do
   # the very same durable transition as its read position. An empty aggregate
   # leaves the last valid group score intact, including on the final read.
   def retain_reply_scores(engine, person, entries) do
+    {next, _entries} =
+      retain_reply_scores(engine, person, entries, engine.route_b_index.agent_feed?)
+
+    next
+  end
+
+  def retain_reply_scores(engine, person, entries, track_entries?) do
     scores =
       Enum.reduce(entries, %{}, fn
         %{"sender_id" => sender, "message_id" => id, "conversation_seq" => seq, "score" => score},
@@ -4892,23 +4888,44 @@ defmodule AttentionServer.Engine do
           acc
       end)
 
-    keys =
-      Enum.uniq(
-        Map.keys(scores) ++
-          Enum.filter(
-            Map.keys(engine.reply_group_history),
-            &(elem(&1, 0) == person)
-          )
+    previous_keys =
+      if track_entries? do
+        RouteBIndex.scored_reply_items(engine.route_b_index, person)
+      else
+        Enum.filter(Map.keys(engine.reply_group_history), &(elem(&1, 0) == person))
+      end
+
+    keys = Enum.into(Map.keys(scores), MapSet.new(previous_keys))
+
+    {history, index, changed_entries} =
+      Enum.reduce(
+        keys,
+        {engine.reply_group_history, engine.route_b_index, []},
+        fn key, {history, index, changed_entries} ->
+          current = Map.get(scores, key, %{})
+          prior = Map.get(history, key, %{scores: %{}})
+
+          changed_entries =
+            if track_entries? do
+              AttentionServer.ReplyPriority.changed_score_entries(person, prior.scores, current) ++
+                changed_entries
+            else
+              changed_entries
+            end
+
+          had_scores? = map_size(prior.scores) > 0
+          has_scores? = map_size(current) > 0
+
+          index =
+            if track_entries? and had_scores? != has_scores?,
+              do: RouteBIndex.put_reply_scores(index, key, current),
+              else: index
+
+          {Map.put(history, key, update_reply_aggregate(prior, current)), index, changed_entries}
+        end
       )
 
-    history =
-      Enum.reduce(keys, engine.reply_group_history, fn key, history ->
-        current = Map.get(scores, key, %{})
-        prior = Map.get(history, key, %{scores: %{}})
-        Map.put(history, key, update_reply_aggregate(prior, current))
-      end)
-
-    %{engine | reply_group_history: history}
+    {%{engine | reply_group_history: history, route_b_index: index}, changed_entries}
   end
 
   defp retain_read_group_score(engine, key, position) do
@@ -4919,7 +4936,8 @@ defmodule AttentionServer.Engine do
         history =
           Map.put(engine.reply_group_history, key, update_reply_aggregate(prior, remaining))
 
-        %{engine | reply_group_history: history}
+        index = RouteBIndex.put_reply_scores(engine.route_b_index, key, remaining)
+        %{engine | reply_group_history: history, route_b_index: index}
 
       :error ->
         engine

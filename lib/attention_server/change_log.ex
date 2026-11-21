@@ -164,16 +164,25 @@ defmodule AttentionServer.ChangeLog do
     do: changes(old, next, changed_resources(old, next))
 
   @doc false
-  def changed_resources(%Engine{} = old, %Engine{} = next) do
+  def changed_resources(%Engine{} = old, %Engine{} = next, projected_entries \\ []) do
+    messages = changed_keys(old.messages, next.messages)
+
+    entries = changed_keys(old.conversation_events, next.conversation_events)
+
+    priority_entries =
+      AttentionServer.ReplyPriority.affected_entries(old, next, messages, entries)
+
+    entries =
+      (entries ++ priority_entries ++ projected_entries)
+      |> Enum.uniq()
+      |> Enum.filter(&Map.has_key?(next.conversation_events, &1))
+      |> Enum.sort()
+
     %{
-      messages: changed_keys(old.messages, next.messages),
+      messages: messages,
       bounce: changed_keys(old.bounce_revisions, next.bounce_revisions),
       opened: opened_keys(old.opened_revisions, next.opened_revisions),
-      entries:
-        old.conversation_events
-        |> changed_keys(next.conversation_events)
-        |> Enum.filter(&Map.has_key?(next.conversation_events, &1))
-        |> Enum.sort()
+      entries: entries
     }
   end
 

@@ -79,7 +79,13 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
         id: make_ref()
       )
 
-    %{relay: relay, reader: reader, port: ClientAPI.Listener.port(listener), certs: certs}
+    %{
+      relay: relay,
+      reader: reader,
+      port: ClientAPI.Listener.port(listener),
+      certs: certs,
+      dir: dir
+    }
   end
 
   ## Helpers
@@ -428,6 +434,229 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
     assert response.status == 200
     assert {:ok, %{"messages" => messages}} = JSON.decode_line(response.body <> "\n")
     assert replayed == Map.new(messages, &{&1["item_id"], &1})
+  end
+
+  test "both feeds replay the updated reply priority after an urgency revision", ctx do
+    {id, position, message, target} = priority_reply(ctx)
+
+    check_priority_replay(ctx, id, position, %{"level" => "normal"}, %{"level" => "high"}, fn ->
+      assert %{"type" => "ok", "revision" => 2} =
+               request(
+                 ctx.relay,
+                 ctx.reader,
+                 Map.merge(target, %{
+                   "type" => "conversation_revise",
+                   "op_id" => op(4),
+                   "base_revision" => 1,
+                   "message" => Map.put(message, "urgency", "high")
+                 })
+               )
+    end)
+  end
+
+  test "both feeds replay a change to a published reply score", ctx do
+    {id, position, _message, target} = priority_reply(ctx)
+    prepare_score_publication(ctx)
+    identity = {target["sender_id"], target["message_id"], position}
+    publish_reply_score(ctx.relay, identity, 0.9)
+
+    after_priority = %{"level" => "normal", "score" => %JSON.DecimalToken{raw: "0.7"}}
+
+    current =
+      check_priority_replay(
+        ctx,
+        id,
+        position,
+        %{"level" => "normal", "score" => %JSON.DecimalToken{raw: "0.9"}},
+        after_priority,
+        fn -> publish_reply_score(ctx.relay, identity, 0.7) end
+      )
+
+    publish_reply_score(ctx.relay, identity, 0.7)
+
+    assert current.agent ==
+             reply_snapshot(connect(ctx), "/v2/agent/messages/#{id}/entries", position)
+
+    assert current.person == reply_snapshot(connect(ctx), "/v2/items/#{id}/entries", position)
+
+    check_priority_replay(ctx, id, position, after_priority, %{"level" => "normal"}, fn ->
+      assert %{"type" => "ok"} =
+               request(
+                 ctx.relay,
+                 "origin",
+                 Map.merge(target, %{
+                   "type" => "conversation_read",
+                   "op_id" => op(4),
+                   "read_through_conversation_seq" => position
+                 })
+               )
+    end)
+  end
+
+  defp priority_reply(ctx) do
+    assert :ok = Relay.setup_sender(ctx.relay, ctx.reader, "app:agent")
+
+    message = %{
+      "sender_id" => "app:agent",
+      "message_id" => "priority-revision",
+      "created_at" => 1,
+      "title" => "A request"
+    }
+
+    assert %{"type" => "ok", "seq" => accepted} =
+             request(ctx.relay, ctx.reader, %{
+               "type" => "forward",
+               "op_id" => op(1),
+               "session_handle" => @handle,
+               "message" => message
+             })
+
+    target = Map.take(message, ["sender_id", "message_id"])
+
+    assert %{"type" => "ok", "event_id" => turn} =
+             request(
+               ctx.relay,
+               "origin",
+               Map.merge(target, %{
+                 "type" => "discussion",
+                 "op_id" => op(2),
+                 "request_revision" => 1,
+                 "text" => "Question"
+               })
+             )
+
+    assert %{"type" => "ok", "seq" => position} =
+             request(
+               ctx.relay,
+               ctx.reader,
+               Map.merge(target, %{
+                 "type" => "conversation_reply",
+                 "op_id" => op(3),
+                 "request_revision" => 1,
+                 "in_reply_to" => String.to_integer(turn),
+                 "text" => "Reply"
+               })
+             )
+
+    {ClientAPI.Resources.item_id(%{accepted_seq: accepted}), position, message, target}
+  end
+
+  defp check_priority_replay(ctx, id, position, before_priority, after_priority, update) do
+    {conn, before} = agent_batch(connect(ctx), "?after=0", [])
+    assert before.status == 200
+
+    assert {:ok, %{"changes" => changes, "rev" => cursor}} =
+             JSON.decode_line(before.body <> "\n")
+
+    assert {person_conn, 200, %{"changes" => person_changes, "rev" => person_cursor}} =
+             batch(connect(ctx), "?after=0")
+
+    agent_reply = replay_reply(changes, position, %{"rev" => 0})
+    person_reply = replay_reply(person_changes, position, %{"rev" => 0})
+    assert %{"priority" => ^before_priority} = agent_reply
+    assert %{"priority" => ^before_priority} = person_reply
+
+    update.()
+
+    {conn, after_revision} = agent_batch(conn, "?after=#{cursor}", [])
+    assert after_revision.status == 200
+    assert {:ok, %{"changes" => changes}} = JSON.decode_line(after_revision.body <> "\n")
+
+    assert {person_conn, 200, %{"changes" => person_changes}} =
+             batch(person_conn, "?after=#{person_cursor}")
+
+    current = %{
+      agent: reply_snapshot(conn, "/v2/agent/messages/#{id}/entries", position),
+      person: reply_snapshot(person_conn, "/v2/items/#{id}/entries", position)
+    }
+
+    assert %{"priority" => ^after_priority} = current.agent
+    assert %{"priority" => ^after_priority} = current.person
+
+    assert %{
+             agent: replay_reply(changes, position, agent_reply),
+             person: replay_reply(person_changes, position, person_reply)
+           } == current
+
+    assert current.agent["rev"] > agent_reply["rev"]
+    assert current.person["rev"] > person_reply["rev"]
+    current
+  end
+
+  defp prepare_score_publication(ctx) do
+    key_path = Path.join(ctx.dir, "synthetic-jev-key")
+    File.write!(key_path, Base.url_encode64(:crypto.strong_rand_bytes(32), padding: false))
+    previous = System.get_env("ATTENTION_SERVER_JEV_KEY_PATH")
+    System.put_env("ATTENTION_SERVER_JEV_KEY_PATH", key_path)
+
+    on_exit(fn ->
+      if previous,
+        do: System.put_env("ATTENTION_SERVER_JEV_KEY_PATH", previous),
+        else: System.delete_env("ATTENTION_SERVER_JEV_KEY_PATH")
+    end)
+
+    :sys.replace_state(ctx.relay, fn state ->
+      assert {:ok, engine} =
+               AttentionServer.Engine.set_jev_connection(
+                 state.store.engine,
+                 "https://127.0.0.1:1/v1/systemone",
+                 "jev-latest"
+               )
+
+      assert {:ok, engine} = AttentionServer.Engine.set_algorithm_choice(engine, "A", "jev-set")
+
+      assert {:ok, store} =
+               AttentionServer.Store.commit(state.store, engine, %{
+                 person: "A",
+                 actor: "owner",
+                 action: "choice"
+               })
+
+      %{state | store: store, priority_evaluator: fn _ -> {:error, :unavailable} end}
+    end)
+  end
+
+  defp publish_reply_score(relay, identity, score) do
+    # Supply a ranking worker's result to the normal publication handler.
+    worker = self()
+
+    state =
+      :sys.replace_state(relay, fn state ->
+        sequence = Map.get(state.priority_sequences, "A", 0) + 1
+        generation = Map.get(state.priority_generations, "A", 0) + 1
+        job = %{sequence: sequence, generation: generation, monitor: Process.monitor(worker)}
+
+        %{
+          state
+          | priority_generations: Map.put(state.priority_generations, "A", generation),
+            priority_sequences: Map.put(state.priority_sequences, "A", sequence),
+            priority_jobs: Map.put(state.priority_jobs, "A", job)
+        }
+      end)
+
+    %{sequence: sequence, generation: generation} = state.priority_jobs["A"]
+    send(relay, {:prioritization_result, "A", sequence, generation, {:ok, %{identity => score}}})
+    assert %{priority_jobs: jobs} = :sys.get_state(relay)
+    refute Map.has_key?(jobs, "A")
+  end
+
+  defp replay_reply(changes, position, reply) do
+    Enum.reduce(changes, reply, fn
+      %{"kind" => "entry", "data" => %{"position" => ^position, "rev" => rev} = entry}, held ->
+        if rev > held["rev"], do: entry, else: held
+
+      _, held ->
+        held
+    end)
+  end
+
+  defp reply_snapshot(conn, path, position) do
+    assert {:ok, conn, ref} = Mint.HTTP.request(conn, "GET", path, [], nil)
+    {conn, snapshot} = collect(conn, ref)
+    Mint.HTTP.close(conn)
+    assert snapshot.status == 200
+    assert {:ok, %{"entries" => entries}} = JSON.decode_line(snapshot.body <> "\n")
+    Enum.find(entries, &(&1["position"] == position))
   end
 
   test "filtered agent SSE resumes across concurrent writes and converges with the snapshot",
