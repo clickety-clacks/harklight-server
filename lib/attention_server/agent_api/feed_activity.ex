@@ -4,9 +4,13 @@ defmodule AttentionServer.AgentAPI.FeedActivity do
   alias AttentionServer.{Engine, RouteBIndex, Store}
 
   @recent_ms 60_000
+  @projection_page_size 100
   @empty %{open: %{}, batches: %{}}
 
-  def observe(%{relay: relay, principal: %{person: person, key: key}, params: %{session: session}}, action) do
+  def observe(
+        %{relay: relay, principal: %{person: person, key: key}, params: %{session: session}},
+        action
+      ) do
     send(GenServer.whereis(relay), {:agent_feed_activity, action, {person, key, session}})
     :ok
   catch
@@ -17,6 +21,29 @@ defmodule AttentionServer.AgentAPI.FeedActivity do
     activity = Map.get(state, :agent_feed_activity, @empty)
     covered?(activity, {person, agent, nil}) or covered?(activity, {person, agent, session})
   end
+
+  def reset(state) do
+    engine = state.store.engine
+
+    scopes =
+      for {{person, _, _} = item,
+           %{terminal: nil, origin: origin, session_handle: session} = record} <- engine.messages,
+          is_binary(session),
+          stale_listening?(engine, item, record),
+          do: {person, origin, session}
+
+    enqueue(state, Enum.uniq(scopes))
+  end
+
+  defp stale_listening?(engine, {person, _, _} = item, record) do
+    payload =
+      get_in(engine.route_b_index, [:conversation_summary_by_item, item, :availability, :payload]) ||
+        get_in(engine.events, [{person, record.accepted_seq}, :payload])
+
+    match?(%{"availability_source" => "agent_feed", "availability" => "listening"}, payload)
+  end
+
+  def handle_info(:project, nil, state), do: project(state)
 
   def handle_info(action, {person, agent, session} = scope, state) do
     previous = Map.get(state, :agent_feed_activity, @empty)
@@ -33,7 +60,13 @@ defmodule AttentionServer.AgentAPI.FeedActivity do
           RouteBIndex.origin_sessions(state.store.engine.route_b_index, person, agent)
         end
 
-      update_availability(next_state, previous, sessions, person, agent)
+      scopes =
+        for handle <- sessions,
+            session_scope = {person, agent, handle},
+            listening?(state, session_scope) != listening?(next_state, session_scope),
+            do: session_scope
+
+      enqueue(next_state, scopes)
     end
   end
 
@@ -60,7 +93,10 @@ defmodule AttentionServer.AgentAPI.FeedActivity do
     end
 
     token = make_ref()
-    timer = Process.send_after(self(), {:agent_feed_activity, {:expire, token}, scope}, @recent_ms)
+
+    timer =
+      Process.send_after(self(), {:agent_feed_activity, {:expire, token}, scope}, @recent_ms)
+
     put_in(activity.batches[scope], {timer, token})
   end
 
@@ -71,27 +107,48 @@ defmodule AttentionServer.AgentAPI.FeedActivity do
     end
   end
 
-  defp update_availability(state, previous, sessions, person, agent) do
+  defp enqueue(state, scopes) do
+    jobs = Map.get(state, :agent_availability_jobs, :queue.new())
+    ready? = :queue.is_empty(jobs)
+    jobs = Enum.reduce(scopes, jobs, &:queue.in({&1, nil}, &2))
+    state = Map.put(state, :agent_availability_jobs, jobs)
+    if ready?, do: project(state), else: state
+  end
+
+  defp project(state) do
+    jobs = Map.fetch!(state, :agent_availability_jobs)
+
+    case :queue.out(jobs) do
+      {{:value, {scope, keys}}, rest} ->
+        keys = keys || RouteBIndex.session_messages(state.store.engine.route_b_index, scope)
+        {page, remaining} = Enum.split(keys, @projection_page_size)
+        next_jobs = if remaining == [], do: rest, else: :queue.in({scope, remaining}, rest)
+        state = apply_page(state, scope, page)
+
+        unless :queue.is_empty(next_jobs), do: send(self(), {:agent_feed_activity, :project, nil})
+        Map.put(state, :agent_availability_jobs, next_jobs)
+
+      {:empty, _} ->
+        state
+    end
+  end
+
+  defp apply_page(state, {person, agent, _} = scope, keys) do
     store = state.store
-    previous_state = Map.put(state, :agent_feed_activity, previous)
 
-    next =
-      Enum.reduce(sessions, store.engine, fn session, engine ->
-        scope = {person, agent, session}
-        listening = listening?(state, scope)
-
-        if listening != listening?(previous_state, scope) and
-             match?(%{gone: false}, Map.get(engine.origin_sessions, scope)) do
-          status = if listening, do: "listening", else: "not_listening"
-          detached_at = if listening, do: nil, else: state.clock.()
-          Engine.origin_availability(engine, person, agent, session, status, detached_at)
-        else
-          engine
-        end
-      end)
-
-    case Store.commit(store, next, %{person: person, actor: agent, action: "agent_feed_availability"}) do
-      {:ok, committed} -> %{state | store: committed}
+    with %{gone: false} <- Map.get(store.engine.origin_sessions, scope),
+         listening = listening?(state, scope),
+         status = if(listening, do: "listening", else: "not_listening"),
+         detached_at = if(listening, do: nil, else: state.clock.()),
+         next = Engine.agent_feed_availability(store.engine, scope, status, detached_at, keys),
+         {:ok, committed} <-
+           Store.commit(store, next, %{
+             person: person,
+             actor: agent,
+             action: "agent_feed_availability"
+           }) do
+      %{state | store: committed}
+    else
       _ -> state
     end
   end

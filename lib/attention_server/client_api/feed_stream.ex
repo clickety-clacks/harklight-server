@@ -96,7 +96,7 @@ defmodule AttentionServer.ClientAPI.FeedStream do
 
   # Reads and sends pages until the feed has caught up with the log.
   defp pump(conn, state) do
-    case state.source.read(state.ctx, state.cursor, @page) do
+    case relay_step(fn -> state.source.read(state.ctx, state.cursor, @page) end) do
       {:ok, changes, more, position} ->
         state = %{state | cursor: position}
 
@@ -113,21 +113,23 @@ defmodule AttentionServer.ClientAPI.FeedStream do
       {:error, :cursor_expired} ->
         closing(conn, state, "cursor_expired")
 
+      {:error, :server_shutdown} ->
+        closing(conn, state, "server_shutdown")
+
       # Any other read failure is transient: the client reconnects later.
       {:error, _reason} ->
         closing(conn, state, "storage_unavailable")
     end
-  catch
-    :exit, _reason -> closing(conn, state, "server_shutdown")
   end
 
   defp send_page(conn, state, changes, more) do
     case send_changes(conn, changes) do
       {:ok, conn} ->
-        case state.source.transmitted(state.ctx, changes) do
+        case relay_step(fn -> state.source.transmitted(state.ctx, changes) end) do
           :ok -> continue(conn, state, more)
           {:error, :account_paused} -> closing(conn, state, "account_paused")
           {:error, :unauthorized} -> closing(conn, state, "revoked")
+          {:error, :server_shutdown} -> closing(conn, state, "server_shutdown")
           {:error, _reason} -> closing(conn, state, "storage_unavailable")
         end
 
@@ -194,16 +196,25 @@ defmodule AttentionServer.ClientAPI.FeedStream do
   defp write_focus(conn, state, next) do
     send(state.watcher, {:feed_focus_woken, self()})
 
-    case state.source.focus(state.ctx) do
+    case relay_step(fn -> state.source.focus(state.ctx) end) do
       {:ok, data} ->
         case chunk_safely(conn, ["event: focus\ndata: ", JSON.encode!(data), "\n\n"]) do
           {:ok, conn} -> next.(conn, state)
           {:error, _reason} -> finish(conn, state, "client_closed")
         end
 
+      {:error, :server_shutdown} ->
+        closing(conn, state, "server_shutdown")
+
       _ ->
         next.(conn, state)
     end
+  end
+
+  defp relay_step(fun) do
+    fun.()
+  catch
+    :exit, _reason -> {:error, :server_shutdown}
   end
 
   # A wake-up left over when the feed ends must not reach a later feed served
@@ -293,6 +304,7 @@ defmodule AttentionServer.ClientAPI.FeedStream do
         monitor = Process.monitor(feed)
         :ok = ChangeLog.subscribe(scope)
         send(feed, {:feed_watching, self()})
+
         watching(%{
           ctx: ctx,
           scope: scope,

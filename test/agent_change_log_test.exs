@@ -291,6 +291,7 @@ defmodule AttentionServer.AgentChangeLogTest do
     state = :sys.get_state(relay)
     assert FeedActivity.listening?(state, scope)
     refute FeedActivity.listening?(state, other)
+
     assert get_in(state.store.engine.route_b_index, [
              :conversation_summary_by_item,
              key("covered"),
@@ -308,6 +309,23 @@ defmodule AttentionServer.AgentChangeLogTest do
     send(relay, {:agent_feed_activity, {:expire, token}, scope})
 
     refute FeedActivity.listening?(:sys.get_state(relay), scope)
+
+    FeedActivity.observe(feed, :open)
+    assert FeedActivity.listening?(:sys.get_state(relay), scope)
+    GenServer.stop(relay)
+
+    relay = start(ctx)
+    state = :sys.get_state(relay)
+    refute FeedActivity.listening?(state, scope)
+
+    assert get_in(state.store.engine.route_b_index, [
+             :conversation_summary_by_item,
+             key("covered"),
+             :availability,
+             :payload,
+             "availability"
+           ]) == "not_listening"
+
     GenServer.stop(relay)
   end
 
@@ -404,7 +422,8 @@ defmodule AttentionServer.AgentChangeLogTest do
     reply
   end
 
-  defp feed_context(relay, key), do: %{relay: relay, principal: %{kind: :device, person: "A", key: key}}
+  defp feed_context(relay, key),
+    do: %{relay: relay, principal: %{kind: :device, person: "A", key: key}}
 
   defp key(id), do: {"A", "app:test", id}
 

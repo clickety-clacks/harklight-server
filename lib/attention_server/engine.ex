@@ -87,6 +87,7 @@ defmodule AttentionServer.Engine do
               resolved_messages_by_person: %{},
               conversations_by_item: %{},
               entry_positions: %{},
+              advisory_sequences: %{},
               messages_by_origin_session: %{},
               conversation_summary_by_item: %{},
               unresolved_count_by_person: %{}
@@ -2589,15 +2590,18 @@ defmodule AttentionServer.Engine do
     end
   end
 
-  defp agent_delivery_target(engine, person, origin, {:entry, position}) do
+  @doc false
+  def agent_delivery_target(engine, person, origin, {:entry, position}) do
     with %{key: key, payload: %{"kind" => "discussion"} = entry} <-
            Map.get(engine.conversation_events, {person, position}),
          %{origin: ^origin} <- Map.get(engine.messages, key) do
       entry
+    else
+      _ -> nil
     end
   end
 
-  defp agent_delivery_target(engine, person, origin, {:answer, {person, sender, id} = key}) do
+  def agent_delivery_target(engine, person, origin, {:answer, {person, sender, id} = key}) do
     with %{origin: ^origin, session_handle: session, terminal: %{state: "answered", seq: seq}}
          when is_binary(session) <- Map.get(engine.messages, key),
          %{payload: %{"event_id" => event_id}} <- Map.get(engine.events, {person, seq}),
@@ -2605,8 +2609,12 @@ defmodule AttentionServer.Engine do
          %{"kind" => "terminal", "sender_id" => ^sender, "message_id" => ^id, "terminal_seq" => ^seq} =
            entry <- get_in(engine.origin_feeds, [{person, origin}, :entries, feed_seq]) do
       entry
+    else
+      _ -> nil
     end
   end
+
+  def agent_delivery_target(_engine, _person, _origin, _target), do: nil
 
   @doc "System handoff acknowledgment, independent of the agent's Seen receipt."
   def origin_ack2(%__MODULE__{} = engine, key, feed_seq, frame) do
@@ -3002,14 +3010,50 @@ defmodule AttentionServer.Engine do
 
   @doc "A durable same-person availability change for open requests on one origin handle."
   def origin_availability(%__MODULE__{} = engine, person, origin, handle, status, detached_at) do
-    support = get_in(engine.origin_sessions, [{person, origin, handle}, :support])
-
     requests =
       engine.route_b_index
       |> AttentionServer.RouteBIndex.session_messages({person, origin, handle})
-      |> Enum.map(&{&1, Map.fetch!(engine.messages, &1)})
-      |> Enum.filter(fn {_key, record} -> is_nil(record.terminal) end)
+      |> open_availability_requests(engine)
       |> Enum.sort_by(fn {_, record} -> record.accepted_seq end)
+
+    write_origin_availability(engine, {person, origin, handle}, status, detached_at, requests, %{})
+  end
+
+  @doc false
+  def agent_feed_availability(engine, {person, _, _} = scope, status, detached_at, keys) do
+    requests =
+      keys
+      |> open_availability_requests(engine)
+      |> Enum.reject(fn {key, record} ->
+        summary = Map.get(engine.route_b_index.conversation_summary_by_item, key, %{})
+
+        current =
+          case summary do
+            %{availability: %{payload: %{"availability" => available}}} -> available
+            _ -> get_in(engine.events, [{person, record.accepted_seq}, :payload, "availability"])
+          end
+
+        current == status
+      end)
+
+    write_origin_availability(
+      engine,
+      scope,
+      status,
+      detached_at,
+      requests,
+      %{"availability_source" => "agent_feed"}
+    )
+  end
+
+  defp open_availability_requests(keys, engine) do
+    for key <- keys,
+        %{terminal: nil} = record <- [Map.get(engine.messages, key)],
+        do: {key, record}
+  end
+
+  defp write_origin_availability(engine, {person, origin, handle}, status, detached_at, requests, extra) do
+    support = get_in(engine.origin_sessions, [{person, origin, handle}, :support])
 
     next =
       Enum.reduce(requests, engine, fn {message_key, record}, current ->
@@ -3034,7 +3078,7 @@ defmodule AttentionServer.Engine do
           "request_revision" => Map.get(record, :revision, 1)
         }
 
-        put_conversation_event(current, person, seq, message_key, payload)
+        put_conversation_event(current, person, seq, message_key, Map.merge(payload, extra))
       end)
 
     if next == engine,
@@ -3044,8 +3088,21 @@ defmodule AttentionServer.Engine do
 
   @doc "Add the current origin-handle status to a newly accepted delivery event."
   def origin_delivery_availability(%__MODULE__{} = engine, person, seq, status, detached_at) do
+    put_delivery_availability(engine, person, seq, status, detached_at, %{})
+  end
+
+  @doc false
+  def agent_feed_delivery_availability(engine, person, seq, listening?) do
+    status = if listening?, do: "listening", else: "not_listening"
+
+    put_delivery_availability(engine, person, seq, status, nil, %{
+      "availability_source" => "agent_feed"
+    })
+  end
+
+  defp put_delivery_availability(engine, person, seq, status, detached_at, extra) do
     event = engine.events[{person, seq}]
-    payload = %{"availability" => status, "last_detached_at" => detached_at}
+    payload = Map.merge(extra, %{"availability" => status, "last_detached_at" => detached_at})
 
     updated = Map.put(event, :payload, Map.merge(Map.get(event, :payload, %{}), payload))
     %{engine | events: Map.put(engine.events, {person, seq}, updated)}

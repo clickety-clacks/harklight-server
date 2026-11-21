@@ -12,6 +12,8 @@ defmodule AttentionServer.ConversationFeedTest do
     Store
   }
 
+  alias AttentionServer.AgentChangeLog
+  alias AttentionServer.AgentAPI.Advisories
   alias Exqlite.Sqlite3
   alias AttentionServer.Store.SnapshotEncoding
 
@@ -289,7 +291,10 @@ defmodule AttentionServer.ConversationFeedTest do
     clock = :atomics.new(1, [])
     :atomics.put(clock, 1, System.system_time(:millisecond))
     clock_fn = fn -> :atomics.get(clock, 1) end
-    assert {:ok, relay} = Relay.start_link(store_path: path, clock: clock_fn)
+    flags = path <> ".flags"
+    File.write!(flags, ~s({"client_api_v2":true}))
+    opts = [store_path: path, clock: clock_fn, feature_flags_path: flags]
+    assert {:ok, relay} = Relay.start_link(opts)
     assert :ok = Relay.setup_person(relay, "A")
     assert :ok = Relay.setup_device(relay, "A", "origin")
     assert :ok = Relay.setup_device(relay, "A", "reader")
@@ -384,17 +389,34 @@ defmodule AttentionServer.ConversationFeedTest do
     assert :sys.get_state(relay).store.engine.messages[{"A", "app:test", "durable-advisory"}].terminal ==
              nil
 
+    scope = {"A", "origin"}
+    message_key = {"A", "app:test", "durable-advisory"}
+    advisory_id = advisory["advisory_id"]
+    store = :sys.get_state(relay).store
+    assert {:ok, before_ack} = AgentChangeLog.head(store, scope)
+
+    assert [%{"advisory_id" => ^advisory_id, "delivered" => false}] =
+             Advisories.for_message(store.engine, scope, message_key)
+
     assert {:ok, first_ack} =
              Relay.origin_advisory_ack(relay, "origin", @handle, advisory["advisory_id"])
 
     assert first_ack["delivered"] and not first_ack["already_delivered"]
+    store = :sys.get_state(relay).store
+
+    assert {:ok, [%{resource: {:message, ^message_key}}, %{resource: {:advisory, ^advisory_id}}],
+            false, _} = AgentChangeLog.read(store, scope, before_ack, 10, @handle)
+
     assert {:ok, fetched_after_ack} = Relay.origin_advisory_feed(relay, "origin", @handle, 0)
     assert hd(fetched_after_ack["entries"])["delivered"]
     assert {:ok, ordinary_after_ack} = Relay.origin_feed(relay, "origin", 0)
     assert ordinary_after_ack == ordinary_before
 
     GenServer.stop(relay)
-    assert {:ok, restarted} = Relay.start_link(store_path: path, clock: clock_fn)
+    assert {:ok, restarted} = Relay.start_link(opts)
+
+    assert [%{"advisory_id" => ^advisory_id, "delivered" => true}] =
+             Advisories.for_message(:sys.get_state(restarted).store.engine, scope, message_key)
 
     assert {:ok, replayed} = Relay.origin_advisory_feed(restarted, "origin", @handle, 0)
     assert replayed["cursor"] == 1

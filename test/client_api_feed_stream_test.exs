@@ -64,8 +64,7 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
            relay: relay,
            certfile: Path.join(certs, "server.pem"),
            keyfile: Path.join(certs, "server.key"),
-           cacertfile: Path.join(certs, "ca.pem"),
-           routes: [ClientAPI.Reads, ClientAPI.Feed]
+           cacertfile: Path.join(certs, "ca.pem")
          ]},
         id: make_ref()
       )
@@ -301,6 +300,124 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
     {_conn, _feed, events} = changes_through(conn, feed, head(ctx))
     replayed = apply_events(%{items: %{}, entries: %{}, counts: nil}, events)
     assert replayed.items == snapshot(ctx).items
+  end
+
+  test "the mounted agent feed honors Last-Event-ID and validates session", ctx do
+    conn = connect(ctx)
+    {conn, result} =
+      agent_batch(conn, "?after=invalid&session=#{@handle}", [{"last-event-id", "0"}])
+
+    assert result.status == 200
+    assert {:ok, %{"changes" => [], "rev" => 0, "more" => false}} =
+             JSON.decode_line(result.body <> "\n")
+
+    {conn, invalid} = agent_batch(conn, "?session=invalid", [])
+    assert invalid.status == 400
+    assert {:ok, %{"error" => "invalid_field", "field" => "session"}} =
+             JSON.decode_line(invalid.body <> "\n")
+
+    {_conn, expired} = agent_batch(conn, "?after=1", [])
+    assert expired.status == 410
+  end
+
+  test "agent replay reaches the message snapshot after chat, a raw answer and a sessionless close", ctx do
+    assert :ok = Relay.setup_sender(ctx.relay, ctx.reader, "app:agent")
+
+    for {id, n, session} <- [{"chat", 1, @handle}, {"sessionless", 2, nil}] do
+      frame = %{
+        "type" => "forward",
+        "op_id" => op(n),
+        "message" => %{
+          "sender_id" => "app:agent",
+          "message_id" => id,
+          "created_at" => n,
+          "title" => id
+        }
+      }
+
+      frame = if session, do: Map.put(frame, "session_handle", session), else: frame
+      assert %{"type" => "ok"} = request(ctx.relay, ctx.reader, frame)
+    end
+
+    assert %{"type" => "ok"} =
+             request(ctx.relay, "origin", %{
+               "type" => "discussion",
+               "op_id" => op(3),
+               "sender_id" => "app:agent",
+               "message_id" => "chat",
+               "request_revision" => 1,
+               "text" => "Question before answer"
+             })
+
+    assert %{"type" => "ok"} =
+             request(ctx.relay, "origin", %{
+               "type" => "answer",
+               "op_id" => op(4),
+               "sender_id" => "app:agent",
+               "message_id" => "chat",
+               "request_revision" => 1,
+               "answer" => nil
+             })
+
+    assert %{"type" => "ok"} =
+             request(ctx.relay, ctx.reader, %{
+               "type" => "lifecycle",
+               "op_id" => op(5),
+               "sender_id" => "app:agent",
+               "message_id" => "sessionless",
+               "state" => "cleared",
+               "at" => 6
+             })
+
+    {conn, first} = agent_batch(connect(ctx), "?after=0", [])
+    assert first.status == 200
+    assert {:ok, %{"changes" => changes, "rev" => first_rev}} =
+             JSON.decode_line(first.body <> "\n")
+
+    assert [
+             %{"kind" => "entry", "data" => %{"kind" => "reply"}, "rev" => chat_rev},
+             %{"kind" => "message", "data" => %{"terminal" => %{"state" => "answered", "answer" => nil}}, "rev" => answer_rev},
+             %{"kind" => "message", "data" => %{"terminal" => %{"state" => "cleared"}}, "rev" => close_rev}
+           ] = changes
+
+    assert chat_rev < answer_rev and answer_rev < close_rev
+
+    assert eventually(fn ->
+             store = :sys.get_state(ctx.relay).store
+
+             case AttentionServer.AgentChangeLog.head(store, {"A", ctx.reader}) do
+               {:ok, head} -> head > first_rev
+               _ -> false
+             end
+           end)
+
+    {conn, receipts} = agent_batch(conn, "?after=#{first_rev}", [])
+    assert receipts.status == 200
+    assert {:ok, %{"changes" => receipt_changes}} = JSON.decode_line(receipts.body <> "\n")
+
+    replayed =
+      for %{"kind" => "message", "data" => message} <- changes ++ receipt_changes,
+          into: %{},
+          do: {message["item_id"], message}
+
+    {:ok, conn, ref} = Mint.HTTP.request(conn, "GET", "/v2/agent/messages", [], nil)
+    {_conn, response} = collect(conn, ref)
+    assert response.status == 200
+    assert {:ok, %{"messages" => messages}} = JSON.decode_line(response.body <> "\n")
+    assert replayed == Map.new(messages, &{&1["item_id"], &1})
+  end
+
+  defp agent_batch(conn, query, headers) do
+    {:ok, conn, ref} =
+      Mint.HTTP.request(
+        conn,
+        "GET",
+        "/v2/agent/changes" <> query,
+        [{"accept", "application/json"} | headers],
+        nil
+      )
+
+    collect(conn, ref)
   end
 
   ## Liveness

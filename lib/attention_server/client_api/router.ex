@@ -92,7 +92,8 @@ defmodule AttentionServer.ClientAPI.Router do
   @route_modules [
     AttentionServer.ClientAPI.Reads,
     AttentionServer.ClientAPI.Writes,
-    AttentionServer.ClientAPI.Feed
+    AttentionServer.ClientAPI.Feed,
+    AttentionServer.AgentAPI.Feed
   ]
 
   @default_max_in_flight 512

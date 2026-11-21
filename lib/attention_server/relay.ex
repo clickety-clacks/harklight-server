@@ -857,6 +857,11 @@ defmodule AttentionServer.Relay do
             state = reschedule_bounce_sweep(state)
             schedule_change_log_prune(state.store, 0)
 
+            state =
+              if state.store.change_log,
+                do: AttentionServer.AgentAPI.FeedActivity.reset(state),
+                else: state
+
             {:ok, state}
 
           error ->

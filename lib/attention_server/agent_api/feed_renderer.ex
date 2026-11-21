@@ -1,8 +1,8 @@
 defmodule AttentionServer.AgentAPI.FeedRenderer do
   @moduledoc false
 
-  alias AttentionServer.AgentAPI.Focus
-  alias AttentionServer.ClientAPI.{AgentResources, Resources}
+  alias AttentionServer.AgentAPI.{Advisories, Focus}
+  alias AttentionServer.ClientAPI.AgentResources
 
   def render_many(%{store: %{engine: engine}} = state, %{person: person, key: key}, rows) do
     scope = {person, key}
@@ -16,16 +16,14 @@ defmodule AttentionServer.AgentAPI.FeedRenderer do
       entries
       |> Enum.group_by(&elem(&1, 0), &elem(&1, 1))
       |> Enum.flat_map(fn {engine_key, positions} ->
-        case AgentResources.entries(state, scope, engine_key) do
-          {:ok, wire_entries} ->
-            positions = MapSet.new(positions)
+        positions = MapSet.new(positions)
 
-            for %{"position" => position} = entry <- wire_entries,
-                MapSet.member?(positions, position),
-                do: {position, entry}
-
-          {:error, _reason} ->
-            []
+        with {:ok, raw} <- AgentResources.raw_entries(state, scope, engine_key),
+             page = Enum.filter(raw, &MapSet.member?(positions, &1["position"])),
+             {:ok, wire} <- AgentResources.render_entries(state, scope, page) do
+          Enum.map(wire, &{&1["position"], &1})
+        else
+          _ -> []
         end
       end)
       |> Map.new()
@@ -60,21 +58,6 @@ defmodule AttentionServer.AgentAPI.FeedRenderer do
          %{resource: {:advisory, id}, session: session},
          _entries
        ) do
-    scope = {person, key, session}
-
-    with {:ok, sequence} <- Map.fetch(engine.advisory_id_index, {scope, id}),
-         %{entries: %{^sequence => advisory}, receipts: receipts} <-
-           Map.get(engine.advisory_feeds, scope),
-         %{"sender_id" => sender, "message_id" => message_id} <- advisory,
-         {:ok, item_id} <- Resources.item_id(engine, {person, sender, message_id}) do
-      advisory =
-        advisory
-        |> Map.drop(~w(kind sender_id message_id session_handle advisory_seq origin_cursor_at_decision))
-        |> Map.put("delivered", MapSet.member?(receipts, id))
-
-      {:ok, %{"item_id" => item_id, "advisory" => advisory}}
-    else
-      _ -> {:error, :storage_unavailable}
-    end
+    Advisories.change(engine, {person, key, session}, id)
   end
 end

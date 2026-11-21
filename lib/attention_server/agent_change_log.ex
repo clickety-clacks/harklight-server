@@ -51,12 +51,15 @@ defmodule AttentionServer.AgentChangeLog do
         {seq, key, payload}
       end
 
+    advisories = advisory_changes(old, next)
+
     messages =
       [
         changed.messages,
         changed.bounce,
         changed.opened,
         changed_sessions(old, next),
+        Enum.map(advisories, &elem(&1, 0)),
         for({_, key, payload} <- entries, answer_receipt?(next, key, payload), do: key)
       ]
       |> Enum.concat()
@@ -76,7 +79,9 @@ defmodule AttentionServer.AgentChangeLog do
       end)
       |> Enum.uniq()
 
-    (messages ++ entries ++ advisory_changes(old, next))
+    advisory_rows = Enum.map(advisories, &elem(&1, 1))
+
+    (messages ++ entries ++ advisory_rows)
     |> Enum.group_by(fn {agent, _row} -> agent end, fn {_agent, row} -> row end)
   end
 
@@ -144,7 +149,11 @@ defmodule AttentionServer.AgentChangeLog do
           acknowledged = receipts |> MapSet.difference(previous.receipts) |> Enum.sort()
 
           for id <- Enum.uniq(created ++ acknowledged),
-              do: {{person, agent}, {:advisory, resource_id({:advisory, id}), session}}
+              seq = Map.fetch!(next.advisory_id_index, {key, id}),
+              %{"sender_id" => sender, "message_id" => message_id} <- [Map.fetch!(entries, seq)],
+              do:
+                {{person, sender, message_id},
+                 {{person, agent}, {:advisory, resource_id({:advisory, id}), session}}}
 
         nil ->
           []

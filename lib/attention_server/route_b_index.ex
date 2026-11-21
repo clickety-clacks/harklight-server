@@ -6,6 +6,7 @@ defmodule AttentionServer.RouteBIndex do
       resolved_messages_by_person: %{},
       conversations_by_item: %{},
       entry_positions: %{},
+      advisory_sequences: %{},
       messages_by_origin_session: %{},
       conversation_summary_by_item: %{},
       unresolved_count_by_person: %{}
@@ -18,8 +19,15 @@ defmodule AttentionServer.RouteBIndex do
         put_message(current, key, nil, record)
       end)
 
-    Enum.reduce(engine.conversation_events, index, fn {{person, seq}, event}, current ->
-      put_conversation_event(current, person, seq, event.key, event.payload)
+    index =
+      Enum.reduce(engine.conversation_events, index, fn {{person, seq}, event}, current ->
+        put_conversation_event(current, person, seq, event.key, event.payload)
+      end)
+
+    Enum.reduce(engine.advisory_feeds, index, fn {{person, _, _}, feed}, current ->
+      Enum.reduce(feed.entries, current, fn {seq, item}, acc ->
+        put_advisory(acc, {person, item["sender_id"], item["message_id"]}, seq)
+      end)
     end)
   end
 
@@ -109,6 +117,15 @@ defmodule AttentionServer.RouteBIndex do
 
     put_in(index, [:conversation_summary_by_item, key], summary)
   end
+
+  def put_advisory(index, item, seq),
+    do:
+      update_in(
+        index.advisory_sequences,
+        &Map.update(&1, item, [seq], fn seqs -> [seq | seqs] end)
+      )
+
+  def advisory_sequences(index, item), do: Map.get(index.advisory_sequences, item, [])
 
   def entry_position(index, key, id), do: Map.get(index.entry_positions, {key, id})
 

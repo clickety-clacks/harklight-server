@@ -7,7 +7,7 @@ defmodule AttentionServer.AgentAPI.Feed do
 
   alias AttentionServer.AgentAPI.{FeedActivity, FeedStep}
   alias AttentionServer.ClientAPI.{Errors, Feed, FeedStream}
-  alias AttentionServer.Message
+  alias AttentionServer.{Diagnostics, Message}
 
   @impl true
   def routes, do: [{"GET", ["agent", "changes"], :changes, stream: true}]
@@ -33,9 +33,19 @@ defmodule AttentionServer.AgentAPI.Feed do
   defp batch(conn, ctx, cursor, limit) do
     case FeedStep.read(ctx, cursor, limit) do
       {:ok, changes, more, position} ->
-        conn = Errors.send_json(conn, 200, %{"changes" => changes, "rev" => position, "more" => more})
+        conn =
+          Errors.send_json(conn, 200, %{"changes" => changes, "rev" => position, "more" => more})
+
         FeedActivity.observe(ctx, :batch)
-        FeedStep.transmitted(ctx, changes)
+
+        case FeedStep.transmitted(ctx, changes) do
+          :ok ->
+            :ok
+
+          {:error, reason} ->
+            Diagnostics.failure(:client_api, :agent_batch_delivered, reason, :failed)
+        end
+
         conn
 
       {:error, reason} ->
@@ -81,7 +91,8 @@ defmodule AttentionServer.AgentAPI.FeedStep do
 
   def focus(ctx), do: FeedRenderer.focus(ctx)
 
-  defp call(relay, request), do: GenServer.call(relay, {:client_api, __MODULE__, request}, :infinity)
+  defp call(relay, request),
+    do: GenServer.call(relay, {:client_api, __MODULE__, request}, :infinity)
 
   def handle_call({:read, principal, session, cursor, limit}, _from, state),
     do: {:reply, read_rows(state, principal, session, cursor, limit), state}
@@ -90,7 +101,8 @@ defmodule AttentionServer.AgentAPI.FeedStep do
     with {:ok, {person, key}} <- authorized(store.engine, principal),
          targets <- resolve_answers(store.engine, person, targets),
          {:ok, next} <- Engine.agent_feed_delivered(store.engine, person, key, targets),
-         {:ok, store} <- Store.commit(store, next, %{person: person, actor: key, action: "agent_feed_delivered"}) do
+         {:ok, store} <-
+           Store.commit(store, next, %{person: person, actor: key, action: "agent_feed_delivered"}) do
       {:reply, :ok, %{state | store: store}}
     else
       {:error, reason, _store} -> {:reply, {:error, reason}, state}
@@ -101,10 +113,12 @@ defmodule AttentionServer.AgentAPI.FeedStep do
   defp read_rows(%{store: store} = state, principal, session, cursor, limit) do
     with {:ok, agent} <- authorized(store.engine, principal),
          {:ok, rows, more, position} <- AgentChangeLog.read(store, agent, cursor, limit, session),
-         {:ok, changes} <- state |> FeedRenderer.render_many(principal, rows) |> FeedStep.changes() do
+         {:ok, changes} <-
+           state |> FeedRenderer.render_many(principal, rows) |> FeedStep.changes() do
       {:ok, changes, more, position}
     else
-      {:error, reason} when reason in [:cursor_expired, :account_paused, :unauthorized, :disabled] ->
+      {:error, reason}
+      when reason in [:cursor_expired, :account_paused, :unauthorized, :disabled] ->
         {:error, reason}
 
       {:error, reason} ->
@@ -131,12 +145,24 @@ defmodule AttentionServer.AgentAPI.FeedStep do
 
   defp authorized(_engine, _principal), do: {:error, :unauthorized}
 
-  defp delivery_target(%{"kind" => "entry", "data" => %{"kind" => "reply", "author" => "person", "position" => position, "delivery" => %{"delivered" => false}}}),
-    do: [{:entry, position}]
+  defp delivery_target(%{
+         "kind" => "entry",
+         "data" => %{
+           "kind" => "reply",
+           "author" => "person",
+           "position" => position,
+           "delivery" => %{"delivered" => false}
+         }
+       }),
+       do: [{:entry, position}]
 
   defp delivery_target(%{
          "kind" => "message",
-         "data" => %{"item_id" => id, "session" => _, "terminal" => %{"state" => "answered"} = terminal}
+         "data" => %{
+           "item_id" => id,
+           "session" => _,
+           "terminal" => %{"state" => "answered"} = terminal
+         }
        }) do
     if get_in(terminal, ["delivery", "delivered"]) == true, do: [], else: [{:answer, id}]
   end
