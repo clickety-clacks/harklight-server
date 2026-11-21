@@ -47,6 +47,25 @@ defmodule AttentionServer.Store.KeyedMigrationTest do
     end
   end
 
+  test "explicit cutover opens existing and fresh stores and converts each only once", ctx do
+    %{path: path, store: legacy} = ctx
+    :ok = Store.close(legacy)
+    {:ok, converted} = Store.open(path, :keyed_cutover)
+    assert converted.version == legacy.version + 1
+    assert converted.mode == :keyed
+    :ok = Store.close(converted)
+    {:ok, reopened} = Store.open(path, :keyed_cutover)
+    assert reopened.version == converted.version
+    :ok = Store.close(reopened)
+
+    fresh = path <> ".fresh"
+    {:ok, initialized} = Store.open(fresh, :keyed_cutover)
+    assert initialized.mode == :keyed
+    :ok = Store.close(initialized)
+    {:ok, initialized} = Store.open(fresh, :keyed)
+    :ok = Store.close(initialized)
+  end
+
   test "an anchor write failure leaves the legacy snapshot readable and no keyed schema", ctx do
     %{path: path, store: store} = ctx
 
@@ -118,5 +137,10 @@ defmodule AttentionServer.Store.KeyedMigrationTest do
             {:storage_unavailable,
              {:error, {:unsupported_otp_major, ^wrong_major, ^running_major}}}} =
              Store.open(path, :keyed)
+
+    assert {:error,
+            {:storage_unavailable,
+             {:error, {:unsupported_otp_major, ^wrong_major, ^running_major}}}} =
+             Store.open(path, :keyed_cutover)
   end
 end

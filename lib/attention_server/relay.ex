@@ -799,7 +799,13 @@ defmodule AttentionServer.Relay do
   @impl true
   def init(opts) do
     path = Keyword.get(opts, :store_path)
-    opened = if opts[:store_mode] == :keyed, do: Store.open(path, :keyed), else: Store.open(path)
+
+    opened =
+      case opts[:store_mode] do
+        :keyed_cutover -> Store.open(path, :keyed_cutover)
+        :keyed -> Store.open(path, :keyed)
+        _ -> Store.open(path)
+      end
 
     case opened
          |> client_api_v2_store(Keyword.get(opts, :feature_flags_path)) do

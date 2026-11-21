@@ -182,6 +182,23 @@ defmodule AttentionServer.Store do
     {:error, :invalid_store_path}
   end
 
+  def open(path, :keyed_cutover)
+      when is_binary(path) and path != "" and path != ":memory:" do
+    case cutover_mode(path) do
+      {:ok, :keyed} ->
+        open(path, :keyed)
+
+      {:ok, :legacy} ->
+        with {:ok, legacy} <- open(path, :legacy),
+             {:ok, _} <- convert_and_close(legacy) do
+          open(path, :keyed)
+        end
+
+      error ->
+        error
+    end
+  end
+
   def open(path, mode) when is_binary(path) and path != "" and mode in [:legacy, :keyed] do
     upload_dir = Path.expand(path) <> ".uploads"
 
@@ -213,6 +230,32 @@ defmodule AttentionServer.Store do
       error ->
         Diagnostics.failure(:server_storage, :store_open, error, :unavailable)
         {:error, {:storage_unavailable, error}}
+    end
+  end
+
+  defp cutover_mode(path) do
+    with {:ok, db} <- Sqlite3.open(path) do
+      try do
+        case one(
+               db,
+               "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name IN ('relay_records', 'relay_record_generation') LIMIT 1",
+               []
+             ) do
+          {:ok, [1]} -> {:ok, :keyed}
+          {:ok, nil} -> {:ok, :legacy}
+          error -> error
+        end
+      after
+        Sqlite3.close(db)
+      end
+    end
+  end
+
+  defp convert_and_close(legacy) do
+    try do
+      KeyedMigration.convert(legacy)
+    after
+      close(legacy)
     end
   end
 
