@@ -546,7 +546,7 @@ Every write that succeeds answers `200`, or `201` for `POST /v2/files`, with a
     UI/1 items keep today's shape-based outcomes.
 - **Upload handle.** `POST /v2/files` returns `FileCreated.file_id`. Use this
   handle only in a write's `file_ids` (replies, agent sends and revisions) or
-  in `DELETE /v2/files/{id}` to discard an unattached upload. Discarding an
+  in `DELETE /v2/files/{id}` to discard an unattached upload (204, no body). Discarding an
   attached upload returns `409 already_closed`. To fetch the attached bytes,
   use the download ID from the resource's `FileRef`.
 - **File name.** `POST /v2/files` requires the name in
@@ -780,7 +780,7 @@ visible text. Its `attention` member changes:
       "required": ["error", "retryable", "request_id"],
       "properties": {
         "error": { "enum": ["not_found", "invalid_field", "stale_request", "already_answered",
-                            "already_retracted", "idempotency_conflict", "precondition_failed",
+                            "already_retracted", "already_closed", "idempotency_conflict", "precondition_failed",
                             "cursor_expired", "unauthorized", "forbidden", "retry_later",
                             "storage_unavailable", "payload_too_large", "unsupported",
                             "account_paused"] },
@@ -803,6 +803,7 @@ visible text. Its `attention` member changes:
 | `stale_request` | 409 | false | `request_revision` is behind the item (`stale_revision`) |
 | `already_answered` | 409 | false | Only on `/answer`: the item's `terminal` is already set (`closed`) |
 | `already_retracted` | 409 | false | The origin retracted the item (`retracted`) |
+| `already_closed` | 409 | false | The upload handle already belongs to a message or reply |
 | `idempotency_conflict` | 409 | false | Same key, different request (`operation_conflict`) |
 | `precondition_failed` | 412 | false | `If-Match` does not match. Also a superseded push `revision` (`stale_push_binding`). |
 | `cursor_expired` | 410 | false | `after` is older than retention |

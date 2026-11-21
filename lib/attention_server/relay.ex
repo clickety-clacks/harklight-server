@@ -606,6 +606,10 @@ defmodule AttentionServer.Relay do
     do: GenServer.call(server, {:request_line, verified_key, line}, :infinity)
 
   @doc false
+  def request_staged_reply(server, verified_key, frame, sources),
+    do: GenServer.call(server, {:request_staged_reply, verified_key, frame, sources}, :infinity)
+
+  @doc false
   def request_frame(server, verified_key, frame),
     do: GenServer.call(server, {:request_frame, verified_key, frame}, :infinity)
 
@@ -1138,6 +1142,20 @@ defmodule AttentionServer.Relay do
   defp dispatch_call({:request_line, key, raw}, _from, state) do
     {reply, next} = request(state, key, raw)
     {:reply, reply, next}
+  end
+
+  defp dispatch_call(
+         {:request_staged_reply, key, %{"type" => "discussion"} = frame, sources},
+         _from,
+         state
+       ) do
+    with {:ok, person} <- Engine.authorized_person(state.store.engine, key),
+         :ok <- verify_staged_reply_sources(state.store, person, sources) do
+      {reply, next} = perform_request_frame(state, key, frame, sources)
+      {:reply, reply, next}
+    else
+      {:error, reason} -> {:reply, {:error, reason}, state}
+    end
   end
 
   defp dispatch_call({:request_frame, key, frame}, _from, state) do
@@ -3274,7 +3292,7 @@ defmodule AttentionServer.Relay do
 
       case previous do
         {_id, upload} ->
-          if Map.drop(upload, [:id, :last_activity_ms, :uploader_kind]) ==
+          if Map.drop(upload, [:id, :last_activity_ms, :uploader_kind, :staged_file_id]) ==
                Map.drop(base, [:last_activity_ms, :uploader_kind]) do
             {:reply, {:ok, :duplicate, upload_reply(upload, true)}, state}
           else
@@ -3330,7 +3348,7 @@ defmodule AttentionServer.Relay do
 
         case previous do
           {_id, stored} ->
-            if Map.drop(stored, [:id, :last_activity_ms, :uploader_kind]) ==
+            if Map.drop(stored, [:id, :last_activity_ms, :uploader_kind, :staged_file_id]) ==
                  Map.drop(upload, [:id, :last_activity_ms, :uploader_kind]) do
               {:reply, {:ok, upload_reply(stored, true)}, state}
             else
@@ -5365,7 +5383,18 @@ defmodule AttentionServer.Relay do
     )
   end
 
-  defp perform_request_frame(state, key, frame) do
+  # Copying uploads takes place outside the Relay. Check the source handles
+  # here so a completed discard cannot be followed by a reply using that handle.
+  defp verify_staged_reply_sources(store, person, sources) do
+    Enum.reduce_while(sources, :ok, fn {_upload_id, file_id}, :ok ->
+      case AttentionServer.ClientAPI.Uploads.fetch(store, person, file_id) do
+        {:ok, _} -> {:cont, :ok}
+        error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp perform_request_frame(state, key, frame, staged_sources \\ %{}) do
     case prepare_inline_overflow_uploads(state, key, frame) do
       {:error, reason} ->
         {{:ok, error_line(frame, reason)}, state}
@@ -5376,7 +5405,7 @@ defmodule AttentionServer.Relay do
 
         {next_engine, created_ids, created_paths} =
           if request_success?(reply) do
-            {next_engine, created_ids, created_paths}
+            {record_staged_reply_sources(next_engine, staged_sources), created_ids, created_paths}
           else
             AttentionServer.LargeData.cleanup_created(created_paths)
             {drop_upload_ids(next_engine, created_ids), [], []}
@@ -5406,6 +5435,17 @@ defmodule AttentionServer.Relay do
           {reply, next_state}
         end
     end
+  end
+
+  defp record_staged_reply_sources(engine, sources) when map_size(sources) == 0, do: engine
+
+  defp record_staged_reply_sources(engine, sources) do
+    uploads =
+      Enum.reduce(sources, engine.uploads, fn {upload_id, file_id}, uploads ->
+        Map.update!(uploads, upload_id, &Map.put_new(&1, :staged_file_id, file_id))
+      end)
+
+    %{engine | uploads: uploads}
   end
 
   defp prepare_inline_overflow_uploads(state, key, frame) do
@@ -5658,7 +5698,7 @@ defmodule AttentionServer.Relay do
 
         case existing do
           upload when is_map(upload) ->
-            if Map.drop(upload, [:id, :last_activity_ms, :uploader_kind]) ==
+            if Map.drop(upload, [:id, :last_activity_ms, :uploader_kind, :staged_file_id]) ==
                  Map.drop(base, [:last_activity_ms, :uploader_kind]) do
               with {:ok, path} <- Store.get_upload(state.store, upload.id),
                    :ok <- Store.verify_upload(path, upload) do
@@ -8061,6 +8101,15 @@ defmodule AttentionServer.Relay do
     upload_index.references_by_person
     |> Map.get(person, MapSet.new())
     |> MapSet.member?(id)
+  end
+
+  @doc false
+  def staged_upload_attached?(state, person, file_id) do
+    state.upload_index.references_by_person
+    |> Map.get(person, MapSet.new())
+    |> Enum.any?(fn id ->
+      match?(%{staged_file_id: ^file_id}, Map.get(state.store.engine.uploads, id))
+    end)
   end
 
   defp fetched_file_for_person(state, person, id) do

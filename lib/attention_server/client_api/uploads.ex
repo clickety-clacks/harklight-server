@@ -13,6 +13,8 @@ defmodule AttentionServer.ClientAPI.Uploads do
   retention window. Call these from the Relay process.
   """
 
+  alias AttentionServer.ClientAPI.Idempotency
+  alias AttentionServer.Diagnostics
   alias Exqlite.Sqlite3
 
   @retention_ms 30 * 24 * 60 * 60 * 1000
@@ -127,6 +129,60 @@ defmodule AttentionServer.ClientAPI.Uploads do
 
   def fetch(%AttentionServer.Store{change_log: true}, _person, _file_id), do: {:error, :not_found}
   def fetch(%AttentionServer.Store{}, _person, _file_id), do: {:error, :disabled}
+
+  @doc "Forget an unattached file and its bytes, storing any replay receipt with the deletion."
+  def discard(%AttentionServer.Store{change_log: true, db: db} = store, person, file_id, key, digest) do
+    with {:ok, dir} <- dir(store),
+         :ok <- ensure(db),
+         {:ok, [1]} <-
+           one(
+             db,
+             "SELECT 1 FROM client_staged_files WHERE file_id = ? AND person_id = ? AND at_ms >= ?",
+             [file_id, person, System.system_time(:millisecond) - @retention_ms]
+           ),
+         :ok <- Sqlite3.execute(db, "BEGIN IMMEDIATE"),
+         :ok <- commit_discard(store, db, person, file_id, key, digest) do
+      unlink_discarded(Path.join(dir, file_id))
+      :ok
+    else
+      {:ok, nil} -> {:error, :not_found}
+      {:error, :disabled} = error -> error
+      _ -> {:error, :storage_unavailable}
+    end
+  end
+
+  def discard(%AttentionServer.Store{}, _person, _file_id, _key, _digest), do: {:error, :disabled}
+
+  defp commit_discard(store, db, person, file_id, key, digest) do
+    with :ok <-
+           run(db, "DELETE FROM client_staged_files WHERE file_id = ? AND person_id = ?", [
+             file_id,
+             person
+           ]),
+         :ok <- save_discard_receipt(store, person, key, digest),
+         :ok <- Sqlite3.execute(db, "COMMIT") do
+      :ok
+    else
+      error ->
+        _ = Sqlite3.execute(db, "ROLLBACK")
+        error
+    end
+  end
+
+  defp save_discard_receipt(_store, _person, nil, _digest), do: :ok
+
+  defp save_discard_receipt(store, person, key, digest),
+    do: Idempotency.save(store, person, key, digest, 204, %{"discarded_file" => true})
+
+  # Attached bytes have their own upload ID and path. Only unlink staged bytes
+  # after committing removal of the row that made them addressable.
+  defp unlink_discarded(path) do
+    case File.rm(path) do
+      :ok -> :ok
+      {:error, :enoent} -> :ok
+      {:error, reason} -> Diagnostics.failure(:server_storage, :upload_delete, reason, :unavailable)
+    end
+  end
 
   defp prune(db, dir, before_ms) do
     with {:ok, rows} <-

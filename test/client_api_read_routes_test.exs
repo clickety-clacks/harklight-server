@@ -7,7 +7,7 @@ defmodule AttentionServer.ClientAPIReadRoutesTest do
   import Plug.Conn
 
   alias AttentionServer.{JSON, Relay, TLSFixtures}
-  alias AttentionServer.ClientAPI.{Context, Principal, Reads, Router}
+  alias AttentionServer.ClientAPI.{Context, Principal, Reads, Router, Uploads}
 
   @handle "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
   @bytes :binary.copy(<<1, 2, 3, 4>>, 50)
@@ -27,9 +27,11 @@ defmodule AttentionServer.ClientAPIReadRoutesTest do
     flags = Path.join(dir, "flags.json")
     File.write!(flags, ~s({"client_api_v2":true}))
 
+    store_path = Path.join(dir, "state.sqlite3")
+
     assert {:ok, relay} =
              Relay.start_link(
-               store_path: Path.join(dir, "state.sqlite3"),
+               store_path: store_path,
                feature_flags_path: flags,
                agent_fixture_mode: true
              )
@@ -67,7 +69,7 @@ defmodule AttentionServer.ClientAPIReadRoutesTest do
       assert {:ok, %{"type" => "ok"}} = JSON.decode_line(line)
     end
 
-    %{relay: relay, reader: reader, der: der, flags: flags}
+    %{relay: relay, reader: reader, der: der, flags: flags, store_path: store_path}
   end
 
   defp op(n), do: "00000000-0000-4000-8000-#{String.pad_leading(Integer.to_string(n), 12, "0")}"
@@ -92,6 +94,115 @@ defmodule AttentionServer.ClientAPIReadRoutesTest do
   end
 
   defp etag(conn), do: conn |> get_resp_header("etag") |> List.first()
+
+  defp file_request(relay, der, conn) do
+    conn
+    |> put_peer_data(%{address: {127, 0, 0, 1}, port: 1, ssl_cert: der})
+    |> Router.call(Router.init(relay: relay))
+  end
+
+  defp stage_file(relay, der, key) do
+    conn =
+      conn(:post, "/v2/files", @bytes)
+      |> put_req_header("idempotency-key", key)
+      |> put_req_header("content-length", Integer.to_string(byte_size(@bytes)))
+      |> put_req_header("content-disposition", "attachment; filename*=UTF-8''discard.bin")
+      |> then(&file_request(relay, der, &1))
+
+    assert conn.status == 201
+    body(conn)["file_id"]
+  end
+
+  test "discard removes the staged row and bytes, and replays by person and key", ctx do
+    %{relay: relay, der: der, certs: certs} = ctx
+    handle = stage_file(relay, der, op(100))
+    other_handle = stage_file(relay, der, op(101))
+    store = :sys.get_state(relay).store
+    assert {:ok, %{path: staged_path}} = Uploads.fetch(store, "A", handle)
+    delete = conn(:delete, "/v2/files/" <> handle) |> put_req_header("idempotency-key", op(102))
+
+    stranger = TLSFixtures.certificate_der!(certs, "b1")
+    assert :ok = Relay.setup_person(relay, "B")
+    assert {:ok, _} = Relay.setup_device_certificate(relay, "B", stranger)
+    refused = file_request(relay, stranger, delete)
+    assert refused.status == 404
+    assert body(refused)["error"] == "not_found"
+    assert File.regular?(staged_path)
+
+    first = file_request(relay, der, delete)
+    assert first.status == 204
+    assert first.resp_body == ""
+    assert get_resp_header(first, "idempotent-replayed") == []
+    assert {:error, :not_found} = Uploads.fetch(store, "A", handle)
+    refute File.exists?(staged_path)
+
+    replay = file_request(relay, der, delete)
+    assert replay.status == 204
+    assert replay.resp_body == ""
+    assert get_resp_header(replay, "idempotent-replayed") == ["true"]
+
+    conflict =
+      conn(:delete, "/v2/files/" <> other_handle)
+      |> put_req_header("idempotency-key", op(102))
+      |> then(&file_request(relay, der, &1))
+
+    assert conflict.status == 409
+    assert body(conflict)["error"] == "idempotency_conflict"
+    assert {:ok, _} = Uploads.fetch(store, "A", other_handle)
+
+    absent = file_request(relay, der, conn(:delete, "/v2/files/" <> handle))
+    assert absent.status == 404
+    assert body(absent)["error"] == "not_found"
+
+    invalid =
+      conn(:delete, "/v2/files/" <> other_handle)
+      |> put_req_header("idempotency-key", "invalid")
+      |> then(&file_request(relay, der, &1))
+
+    assert invalid.status == 400
+    assert body(invalid)["field"] == "Idempotency-Key"
+  end
+
+  test "discard refuses an attached upload without affecting the downloadable file", ctx do
+    %{relay: relay, reader: reader, der: der, store_path: store_path, flags: flags} = ctx
+    handle = stage_file(relay, der, op(110))
+    twin = stage_file(relay, der, op(111))
+    {:ok, %{"items" => items}} = Reads.inbox(relay, reader)
+    item = Enum.find(items, &(&1["message"]["message_id"] == "two"))
+
+    reply =
+      conn(
+        :post,
+        "/v2/items/" <> item["item_id"] <> "/replies",
+        JSON.encode!(%{"text" => "With a file", "file_ids" => [handle]})
+      )
+      |> put_req_header("content-type", "application/json")
+      |> put_req_header("idempotency-key", op(112))
+      |> then(&file_request(relay, der, &1))
+
+    assert reply.status == 200
+    assert [%{"file_id" => download_id}] = body(reply)["entry"]["files"]
+    GenServer.stop(relay)
+
+    assert {:ok, relay} =
+             Relay.start_link(
+               store_path: store_path,
+               feature_flags_path: flags,
+               agent_fixture_mode: true
+             )
+
+    on_exit(fn -> if Process.alive?(relay), do: GenServer.stop(relay) end)
+
+    refused = file_request(relay, der, conn(:delete, "/v2/files/" <> handle))
+    assert refused.status == 409
+    assert body(refused)["error"] == "already_closed"
+
+    discarded = file_request(relay, der, conn(:delete, "/v2/files/" <> twin))
+    assert discarded.status == 204
+    downloaded = file_request(relay, der, conn(:get, "/v2/files/" <> download_id))
+    assert downloaded.status == 200
+    assert downloaded.resp_body == @bytes
+  end
 
   test "a read answers 200 with an ETag, and 304 when the client already has it", ctx do
     first = Reads.get_inbox(get("/v2/inbox?limit=2&unknown=1"), ctx(ctx))

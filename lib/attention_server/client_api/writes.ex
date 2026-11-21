@@ -58,6 +58,7 @@ defmodule AttentionServer.ClientAPI.Writes do
       {"PUT", ["devices", "me", "push"], :put_push},
       {"DELETE", ["devices", "me", "push"], :delete_push},
       {"POST", ["files"], :post_files},
+      {"DELETE", ["files", :file_id], :delete_file},
       {"PUT", ["devices", "me", "focus"], :put_focus}
     ]
   end
@@ -179,6 +180,22 @@ defmodule AttentionServer.ClientAPI.Writes do
     else
       {:error, token} -> Errors.send_error(conn, to_string(token))
       {:error, token, field} -> Errors.send_error(conn, to_string(token), field: field)
+    end
+  end
+
+  @doc false
+  def delete_file(conn, %Context{} = ctx) do
+    with {:ok, key} <- optional_key(conn) do
+      file_id = ctx.params.file_id
+      digest = Idempotency.digest("DELETE", ["files", file_id], %{})
+
+      case call(ctx.relay, {:discard_file, ctx.principal, file_id, key, digest}) do
+        {:ok, 204, %{}} -> send_resp(conn, 204, "")
+        {:replay, 204, %{}} -> conn |> replayed(true) |> send_resp(204, "")
+        error -> respond(conn, result(error, false))
+      end
+    else
+      {:error, token, field} -> Errors.send_error(conn, token, field: field)
     end
   end
 
@@ -332,7 +349,7 @@ defmodule AttentionServer.ClientAPI.Writes do
       {:apply, engine_key, frame, staged} ->
         outcome =
           with {:ok, frame} <- attach_files(relay, engine_key, frame, staged),
-               do: apply_frame(relay, engine_key, frame)
+               do: apply_frame(relay, engine_key, frame, staged)
 
         result(call(relay, {:finish, who, key, digest, operation, outcome}), false)
 
@@ -350,22 +367,33 @@ defmodule AttentionServer.ClientAPI.Writes do
   defp result({:error, token, field}, replayed?),
     do: {:error, to_string(token), field, replayed?}
 
-  defp apply_frame(relay, engine_key, frame) do
-    case Relay.request_line(relay, engine_key, JSON.encode!(frame) <> "\n") do
-      {:ok, line} ->
-        case JSON.decode_line(line) do
-          {:ok, %{"type" => "ok"} = reply} -> {:ok, reply}
-          {:ok, %{"type" => "error", "reason" => reason} = reply} -> refusal(reason, reply)
-          _ -> {:error, "retry_later"}
-        end
+  defp apply_frame(relay, engine_key, frame, []) do
+    relay
+    |> Relay.request_line(engine_key, JSON.encode!(frame) <> "\n")
+    |> apply_reply()
+  end
 
-      {:error, :forbidden} ->
-        {:error, "unauthorized"}
+  defp apply_frame(relay, engine_key, frame, staged) do
+    sources =
+      Map.new(Enum.zip(frame["files"], staged), fn {file, source} ->
+        {file["upload_id"], source.file_id}
+      end)
 
-      _ ->
-        {:error, "retry_later"}
+    relay |> Relay.request_staged_reply(engine_key, frame, sources) |> apply_reply()
+  end
+
+  defp apply_reply({:ok, line}) do
+    case JSON.decode_line(line) do
+      {:ok, %{"type" => "ok"} = reply} -> {:ok, reply}
+      {:ok, %{"type" => "error", "reason" => reason} = reply} -> refusal(reason, reply)
+      _ -> {:error, "retry_later"}
     end
   end
+
+  defp apply_reply({:error, :forbidden}), do: {:error, "unauthorized"}
+  defp apply_reply({:error, :not_found}), do: {:error, "invalid_field", "file_ids"}
+  defp apply_reply({:error, :storage_unavailable}), do: {:error, "storage_unavailable"}
+  defp apply_reply(_), do: {:error, "retry_later"}
 
   # Today's refusal reasons, as tokens (ClientAPI.Errors). A reason with no
   # token is a request the client cannot fix by resending.
@@ -461,6 +489,23 @@ defmodule AttentionServer.ClientAPI.Writes do
       with {:ok, _principal} <- principal(state.store.engine, who),
            {:ok, dir} <- staging_dir(state) do
         {:ok, dir, Map.get(state, :upload_cap, :none)}
+      end
+
+    {:reply, reply, state}
+  end
+
+  def handle_call({:discard_file, who, file_id, key, digest}, from, state) do
+    reply =
+      with {:ok, principal} <- principal(state.store.engine, who),
+           person = principal.person,
+           {:ok, nil} <- stored(state, person, key, digest, who, from),
+           false <- Relay.staged_upload_attached?(state, person, file_id),
+           :ok <- Uploads.discard(state.store, person, file_id, key, digest) do
+        {:ok, 204, %{}}
+      else
+        true -> {:error, :already_closed}
+        {:error, :disabled} -> {:error, :not_found}
+        other -> other
       end
 
     {:reply, reply, state}
@@ -581,6 +626,7 @@ defmodule AttentionServer.ClientAPI.Writes do
   defp receipt(_settings_write, _reply, _result), do: %{"settings" => true}
 
   defp replay(%{"file" => body}, _who, _person, _from, _state), do: {:ok, body}
+  defp replay(%{"discarded_file" => true}, _who, _person, _from, _state), do: {:ok, %{}}
 
   defp replay(%{"settings" => true}, who, _person, from, state) do
     case Reads.handle_call({:settings, who}, from, state) do
