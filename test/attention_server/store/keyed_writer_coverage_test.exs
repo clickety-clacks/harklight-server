@@ -1,0 +1,251 @@
+defmodule AttentionServer.Store.KeyedWriterCoverageTest do
+  use ExUnit.Case, async: true
+
+  alias AttentionServer.{Engine, Relay, Store}
+  alias Exqlite.Sqlite3
+
+  @moduletag :tmp_dir
+  @op "00000000-0000-4000-8000-000000000020"
+  @second_upload "00000000-0000-4000-8000-000000000021"
+  @bytes <<1, 2, 3, 5, 8>>
+  @audit %{person: "A", actor: "origin", action: "keyed_writer_probe"}
+
+  # Every public Store function, classified by what it may write on a keyed
+  # store. A new public function fails the first test until it is classified,
+  # and an engine writer fails the second test until it has a refusal probe.
+  #
+  # :engine_writer - changes engine state; must refuse on a keyed store until
+  #                  the keyed writer is installed.
+  # :side_table    - writes only mode-neutral tables that a keyed reopen reads
+  #                  back unchanged (inbox snapshot paging, change log setup,
+  #                  which conversion advances to the keyed generation).
+  # :files         - stages or prunes upload files against engine metadata.
+  # :read / :lifecycle - no durable write of engine state.
+  @classification %{
+    {:open, 1} => :lifecycle,
+    {:open, 2} => :lifecycle,
+    {:close, 1} => :lifecycle,
+    {:enable_change_log, 1} => :side_table,
+    {:commit, 3} => :engine_writer,
+    {:commit, 4} => :engine_writer,
+    {:put_published_upload, 2} => :engine_writer,
+    {:delete_uploads, 3} => :engine_writer,
+    {:accept_inbox_checkpoint, 8} => :engine_writer,
+    {:stage_upload, 3} => :files,
+    {:publish_staged_upload, 3} => :files,
+    {:prune_untracked_uploads, 1} => :files,
+    {:get_upload, 2} => :read,
+    {:verify_upload, 2} => :read,
+    {:verify_retained_uploads, 1} => :read,
+    {:inbox_startup, 4} => :read,
+    {:inbox_snapshot, 4} => :read,
+    {:inbox_items, 3} => :read,
+    {:inbox_receipt_sequences, 4} => :read,
+    {:inbox_operation_at_snapshot?, 3} => :read,
+    {:inbox_batch, 5} => :read,
+    {:inbox_receipt_page, 5} => :read,
+    {:inbox_checkpoint_status, 4} => :read,
+    {:begin_inbox_snapshot, 2} => :side_table,
+    {:save_inbox_snapshot_chunk, 5} => :side_table,
+    {:finish_inbox_snapshot, 3} => :side_table,
+    {:discard_building_inbox_snapshots, 1} => :side_table,
+    {:discard_browser_inbox_snapshots, 1} => :side_table,
+    {:discard_inbox_snapshots_for_device, 3} => :side_table,
+    {:discard_inbox_snapshot, 2} => :side_table,
+    {:save_inbox_batch, 7} => :side_table,
+    {:save_inbox_receipt_page, 7} => :side_table
+  }
+
+  setup %{tmp_dir: directory} do
+    path = Path.join(directory, "state.sqlite3")
+    assert {:ok, relay} = Relay.start_link(store_path: path)
+    assert :ok = Relay.setup_person(relay, "A")
+    assert :ok = Relay.setup_device(relay, "A", "origin")
+    assert :ok = Relay.setup_sender(relay, "origin", "app:test")
+
+    source = Path.join(directory, "source.bin")
+    File.write!(source, @bytes)
+    size = byte_size(@bytes)
+    digest = Base.encode16(:crypto.hash(:sha256, @bytes), case: :lower)
+
+    attributes = %{
+      "op_id" => @op,
+      "sender_id" => "app:test",
+      "message_id" => "item",
+      "revision" => 1,
+      "name" => "payload.bin"
+    }
+
+    assert {:ok, lease} = Relay.upload_begin(relay, "origin", attributes, size)
+
+    assert {:ok, %{"upload_id" => id}} =
+             Relay.upload_file(relay, "origin", attributes, source, size, digest, lease)
+
+    assert :ok = Relay.upload_end(relay, lease)
+    assert :ok = GenServer.stop(relay)
+
+    assert {:ok, keyed} = Store.open(path, :keyed_cutover)
+    assert keyed.mode == :keyed
+    assert :ok = Store.close(keyed)
+    %{path: path, id: id}
+  end
+
+  test "every public Store function is classified for keyed mode" do
+    exported = Store.__info__(:functions) -- [__struct__: 0, __struct__: 1]
+    assert Enum.sort(exported) == Enum.sort(Map.keys(@classification))
+  end
+
+  test "every engine writer refuses a keyed store and leaves its state unchanged", %{
+    path: path,
+    id: id
+  } do
+    writers = for {fun, :engine_writer} <- @classification, do: fun
+    probes = refusal_probes(id)
+    assert Enum.sort(writers) == Enum.sort(Map.keys(probes))
+
+    for {{name, arity} = fun, probe} <- probes do
+      assert {:ok, store} = Store.open(path, :keyed)
+      store = pending_snapshot(store)
+      before = fingerprint(store)
+
+      result = probe.(store)
+
+      assert match?({:error, :storage_unavailable}, result) or
+               match?({:error, :storage_unavailable, _}, result),
+             "#{name}/#{arity} did not refuse a keyed store: #{inspect(result)}"
+
+      assert fingerprint(store) == before, "#{inspect(fun)} wrote to a keyed store"
+      assert :ok = Store.close(store)
+
+      assert {:ok, reopened} = Store.open(path, :keyed)
+      assert reopened.engine == store.engine
+      assert :ok = Store.close(reopened)
+    end
+  end
+
+  test "a refused keyed checkpoint stays pending and retryable after reopen", %{path: path} do
+    assert {:ok, store} = Store.open(path, :keyed)
+    store = pending_snapshot(store)
+
+    assert {:error, :storage_unavailable, ^store} = accept(store)
+    assert {:ok, %{status: "pending"}} = status(store)
+    assert {:ok, [[0]]} = query(store.db, "SELECT count(*) FROM relay_device_progress")
+    assert :ok = Store.close(store)
+
+    assert {:ok, reopened} = Store.open(path, :keyed)
+    assert Map.get(reopened.engine.cursors, {"A", "origin"}, 0) == 0
+    assert {:ok, %{status: "pending"}} = status(reopened)
+    assert {:error, :storage_unavailable, ^reopened} = accept(reopened)
+    assert :ok = Store.close(reopened)
+  end
+
+  test "inbox paging side tables written on a keyed store survive a keyed reopen", %{path: path} do
+    assert {:ok, store} = Store.open(path, :keyed)
+    store = pending_snapshot(store)
+
+    digest = :crypto.hash(:sha256, "b1")
+
+    assert {:ok, %{ok: true}} =
+             Store.save_inbox_batch(store, "A", "origin", "snapshot", "b1", digest, %{ok: true})
+
+    assert :ok = Store.close(store)
+
+    assert {:ok, reopened} = Store.open(path, :keyed)
+    assert {:ok, %{status: "pending"}} = status(reopened)
+
+    assert {:ok, %{digest: ^digest, result: %{ok: true}}} =
+             Store.inbox_batch(reopened, "A", "origin", "snapshot", "b1")
+
+    assert :ok = Store.close(reopened)
+  end
+
+  defp refusal_probes(id) do
+    %{
+      {:commit, 3} => fn store -> Store.commit(store, proposal(store), @audit) end,
+      {:commit, 4} => fn store -> Store.commit(store, proposal(store), @audit, []) end,
+      {:put_published_upload, 2} => fn store ->
+        metadata = %{Map.fetch!(store.engine.uploads, id) | id: @second_upload}
+        Store.put_published_upload(store, metadata)
+      end,
+      {:delete_uploads, 3} => fn store -> Store.delete_uploads(store, [id], @audit) end,
+      {:accept_inbox_checkpoint, 8} => &accept/1
+    }
+  end
+
+  defp proposal(store) do
+    assert {:ok, engine} = Engine.setup_person(store.engine, "B")
+    engine
+  end
+
+  defp pending_snapshot(store) do
+    case Store.inbox_snapshot(store, "A", "origin", "snapshot") do
+      {:ok, nil} ->
+        attrs = %{
+          person_id: "A",
+          device_id: "origin",
+          startup_id: "startup",
+          snapshot_id: "snapshot",
+          since: 0,
+          high_water: 0,
+          cursor_secret: :binary.copy(<<7>>, 32)
+        }
+
+        assert {:ok, snapshot} = Store.begin_inbox_snapshot(store, attrs)
+
+        assert :ok =
+                 Store.finish_inbox_snapshot(store, snapshot, %{
+                   items: 0,
+                   receipts: 0,
+                   operation_ids: 0
+                 })
+
+      {:ok, _snapshot} ->
+        :ok
+    end
+
+    store
+  end
+
+  defp accept(store) do
+    Store.accept_inbox_checkpoint(
+      store,
+      store.engine,
+      "A",
+      "origin",
+      "snapshot",
+      0,
+      [],
+      @audit
+    )
+  end
+
+  defp status(store), do: Store.inbox_checkpoint_status(store, "A", "origin", "snapshot")
+
+  defp fingerprint(store) do
+    {:ok, tables} =
+      query(store.db, "SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name")
+
+    rows =
+      for [table] <- tables do
+        {:ok, rows} = query(store.db, ~s(SELECT * FROM "#{table}" ORDER BY 1))
+        {table, Enum.sort(rows)}
+      end
+
+    files =
+      for name <- Enum.sort(File.ls!(store.upload_dir)) do
+        {name, File.read!(Path.join(store.upload_dir, name))}
+      end
+
+    :crypto.hash(:sha256, :erlang.term_to_binary({rows, files}))
+  end
+
+  defp query(db, sql) do
+    {:ok, statement} = Sqlite3.prepare(db, sql)
+
+    try do
+      Sqlite3.fetch_all(db, statement)
+    after
+      Sqlite3.release(db, statement)
+    end
+  end
+end
