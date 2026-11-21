@@ -1133,7 +1133,7 @@ defmodule AttentionServer.Store do
 
     with {:ok, ^person} <- Engine.authorized_person(engine, device),
          {:ok, next} <- Engine.checkpoint_cursor(engine, device, high),
-         true <- valid_authority_reference?(next, address) do
+         true <- KeyedValidation.checked(fn -> valid_keyed_fact?(store.engine, next, address) end) do
       records =
         if Map.get(engine.cursors, {person, device}) == high,
           do: [],
@@ -1257,6 +1257,8 @@ defmodule AttentionServer.Store do
   defp validate_keyed_engine(decoded) do
     engine = decoded |> BounceDecision.rebuild_indexes() |> Engine.rebuild_route_b_index()
     if valid_state?(engine), do: {:ok, engine}, else: {:error, :invalid_state}
+  rescue
+    _ -> {:error, :invalid_state}
   end
 
   defp set_durability(db),
@@ -1322,42 +1324,9 @@ defmodule AttentionServer.Store do
          projected_entries,
          write_metadata \\ fn -> :ok end
        ) do
-    items = for {:row, :messages, key} <- touched, do: key
-
-    {authority_index, affected} =
-      KeyedValidation.authority_changes(store.authority_index, store.engine, next, touched)
-
     result =
-      with true <-
-             Enum.all?(MapSet.union(touched, affected), &valid_authority_reference?(next, &1)),
-           true <- Enum.all?(touched, &valid_push_address_change?(store.engine, next, &1)),
-           true <- Enum.all?(touched, &valid_transition_fact?(store.engine, next, &1)),
-           :ok <- KeyedValidation.sequences(store.engine, next, touched),
-           {:ok, upload_links, entries} <-
-             KeyedValidation.upload_changes(store.upload_links, store.engine, next, touched),
-           true <-
-             Enum.all?(entries, fn {person, entry} ->
-               valid_entry_uploads?(next, person, entry)
-             end),
-           true <-
-             Enum.all?(touched, fn
-               {:row, :uploads, id} ->
-                 case Map.fetch(next.uploads, id) do
-                   {:ok, upload} -> valid_upload?(next, id, upload)
-                   :error -> not Map.has_key?(upload_links, id)
-                 end
-
-               _ ->
-                 true
-             end),
-           true <- Enum.all?(items, &valid_item_change?(store.engine, next, &1)),
-           {:ok, index} <-
-             KeyedValidation.source_changes(
-               store.source_bindings,
-               store.engine.messages,
-               next.messages,
-               items
-             ),
+      with {:ok, authority_index, upload_links, index} <-
+             validate_keyed_commit(store, next, touched),
            {:ok, prepared} <-
              KeyedReference.prepare(store.engine, next, touched, store.upload_dir),
            {:ok, blob_owners} <- update_blob_owners(store, prepared) do
@@ -1411,6 +1380,41 @@ defmodule AttentionServer.Store do
     end
   end
 
+  defp validate_keyed_commit(store, next, touched) do
+    old = store.engine
+
+    KeyedValidation.checked(fn ->
+      with :ok <- KeyedValidation.preflight(old, next, touched),
+           :ok <- KeyedValidation.sequences(old, next, touched),
+           {authority_index, affected} <-
+             KeyedValidation.authority_changes(store.authority_index, old, next, touched),
+           true <- KeyedValidation.unique_authority?(authority_index, next, touched),
+           true <- Enum.all?(MapSet.union(touched, affected), &valid_keyed_fact?(old, next, &1)),
+           {:ok, upload_links, entries} <-
+             KeyedValidation.upload_changes(store.upload_links, old, next, touched),
+           true <-
+             Enum.all?(entries, fn {person, entry} ->
+               valid_entry_uploads?(next, person, entry)
+             end),
+           true <- Enum.all?(touched, &valid_upload_removal?(next, upload_links, &1)),
+           items = for({:row, :messages, key} <- touched, do: key),
+           {:ok, index} <-
+             KeyedValidation.source_changes(
+               store.source_bindings,
+               old.messages,
+               next.messages,
+               items
+             ) do
+        {:ok, authority_index, upload_links, index}
+      end
+    end)
+  end
+
+  defp valid_upload_removal?(next, upload_links, {:row, :uploads, id}),
+    do: Map.has_key?(next.uploads, id) or not Map.has_key?(upload_links, id)
+
+  defp valid_upload_removal?(_next, _upload_links, _address), do: true
+
   defp write_reference_delta(db, deleted_paths, reference_rows) do
     with :ok <-
            write_reference_rows(deleted_paths, fn path ->
@@ -1444,7 +1448,9 @@ defmodule AttentionServer.Store do
     Enum.each(Enum.uniq(candidates), fn id ->
       if one(db, "SELECT 1 FROM relay_large_data_refs WHERE id = ? LIMIT 1", [id]) == {:ok, nil} do
         if Map.has_key?(owners, id) do
-          Logger.warning("event=harklight_unresolved_large_data_reference retained_blobs=1")
+          Logger.warning(
+            "event=harklight_unresolved_large_data_reference retained_blobs=1 sha256=#{id}"
+          )
         else
           _ = File.rm(Path.join(directory, id))
         end
@@ -2893,9 +2899,7 @@ defmodule AttentionServer.Store do
           actor_owns?(engine, person, key)
         end) and
         Enum.all?(engine.source_report_grants, fn {{person, key, source}, grant} ->
-          owns?(engine, person, key) and nonempty?(source) and nonempty?(grant.delegation_ref) and
-            is_boolean(grant.revoked) and is_struct(grant.senders, MapSet) and
-            Enum.all?(grant.senders, &AttentionServer.Message.sender_id?/1)
+          valid_source_report_grant?(engine, person, key, source, grant)
         end) and
         Enum.all?(engine.enrollment_read_grants, fn {id, grant} ->
           valid_enrollment_read_grant?(engine, id, grant)
@@ -3401,6 +3405,12 @@ defmodule AttentionServer.Store do
             hex_key?(grant.revoked_by)))
   end
 
+  defp valid_source_report_grant?(engine, person, key, source, grant) do
+    owns?(engine, person, key) and nonempty?(source) and nonempty?(grant.delegation_ref) and
+      is_boolean(grant.revoked) and is_struct(grant.senders, MapSet) and
+      Enum.all?(grant.senders, &AttentionServer.Message.sender_id?/1)
+  end
+
   defp valid_enrollment_read_grant?(engine, grant_id, grant) do
     AttentionServer.Message.uuid_v4?(grant_id) and
       Map.has_key?(engine.persons, grant.person) and
@@ -3487,100 +3497,95 @@ defmodule AttentionServer.Store do
   defp valid_seq?(engine, person, seq),
     do: is_integer(seq) and seq > 0 and seq <= Map.get(engine.persons, person, 0)
 
-  defp valid_authority_reference?(engine, {:row, :messages, key}) do
-    case Map.fetch(engine.messages, key) do
-      {:ok, item} -> valid_item?(engine, key, item)
-      :error -> true
-    end
-  end
+  defp valid_keyed_fact?(old, next, {:row, :messages, key}),
+    do: valid_item_change?(old, next, key) and valid_bounce_revision?(next, key)
 
-  defp valid_authority_reference?(engine, {:row, :uploads, key}) do
+  defp valid_keyed_fact?(_old, engine, {:row, :uploads, key}) do
     case Map.fetch(engine.uploads, key) do
       {:ok, upload} -> valid_upload?(engine, key, upload)
       :error -> true
     end
   end
 
-  defp valid_authority_reference?(engine, {:row, :receipts, {person, actor, _} = key}),
+  defp valid_keyed_fact?(_old, engine, {:row, :receipts, {person, actor, _} = key}),
     do: not Map.has_key?(engine.receipts, key) or actor_owns?(engine, person, actor)
 
-  defp valid_authority_reference?(engine, {:row, :agents, key}) do
+  defp valid_keyed_fact?(_old, engine, {:row, :agents, key}) do
     case Map.fetch(engine.agents, key) do
-      {:ok, agent} -> valid_agent?(engine, key, agent)
-      :error -> true
+      {:ok, agent} ->
+        not MapSet.member?(engine.retired_owner_keys, key) and valid_agent?(engine, key, agent)
+
+      :error ->
+        true
     end
   end
 
-  defp valid_authority_reference?(engine, {:row, :devices, key}) do
+  defp valid_keyed_fact?(_old, engine, {:row, :devices, key}) do
     case Map.fetch(engine.devices, key) do
-      {:ok, device} -> valid_device?(engine, device)
-      :error -> true
+      {:ok, device} ->
+        not MapSet.member?(engine.retired_owner_keys, key) and valid_device?(engine, device)
+
+      :error ->
+        true
     end
   end
 
-  defp valid_authority_reference?(engine, {:row, :owners, person}) do
+  defp valid_keyed_fact?(_old, engine, {:row, :owners, person}) do
     case Map.fetch(engine.owners, person) do
       {:ok, owner} -> valid_owner?(engine, person, owner)
       :error -> true
     end
   end
 
-  defp valid_authority_reference?(engine, {:member, :retired_owner_keys, key}),
+  defp valid_keyed_fact?(_old, engine, {:member, :retired_owner_keys, key}),
     do:
       not MapSet.member?(engine.retired_owner_keys, key) or
         (hex_key?(key) and not Map.has_key?(engine.devices, key) and
            not Map.has_key?(engine.agents, key))
 
-  defp valid_authority_reference?(engine, {:row, :hosted_accounts, reference}) do
+  defp valid_keyed_fact?(_old, engine, {:row, :hosted_accounts, reference}) do
     case Map.fetch(engine.hosted_accounts, reference) do
       {:ok, record} -> valid_hosted_account?(engine, reference, record)
       :error -> true
     end
   end
 
-  defp valid_authority_reference?(engine, {:row, :delivery_states, person}) do
+  defp valid_keyed_fact?(_old, engine, {:row, :delivery_states, person}) do
     case Map.fetch(engine.delivery_states, person) do
       {:ok, state} -> valid_delivery_state?(engine, person, state)
       :error -> true
     end
   end
 
-  defp valid_authority_reference?(engine, {:row, :algorithm_choices, person}) do
+  defp valid_keyed_fact?(_old, engine, {:row, :algorithm_choices, person}) do
     case Map.fetch(engine.algorithm_choices, person) do
       {:ok, choice} -> valid_algorithm_choice?(engine, person, choice)
       :error -> true
     end
   end
 
-  defp valid_authority_reference?(engine, {:row, :free_order_highs, person}) do
-    case Map.fetch(engine.free_order_highs, person) do
-      {:ok, high} -> valid_order_high?(engine, person, high)
-      :error -> true
-    end
-  end
-
-  defp valid_authority_reference?(engine, {:row, :bounce_levels, person}) do
+  defp valid_keyed_fact?(_old, engine, {:row, :bounce_levels, person}) do
     case Map.fetch(engine.bounce_levels, person) do
       {:ok, config} -> BounceDecision.valid_configuration?(engine, person, config)
       :error -> true
     end
   end
 
-  defp valid_authority_reference?(engine, {:row, :maintainer_grants, id}) do
+  defp valid_keyed_fact?(_old, engine, {:row, :maintainer_grants, id}) do
     case Map.fetch(engine.maintainer_grants, id) do
       {:ok, grant} -> valid_maintainer?(engine, id, grant)
       :error -> true
     end
   end
 
-  defp valid_authority_reference?(engine, {:row, :enrollment_read_grants, id}) do
+  defp valid_keyed_fact?(_old, engine, {:row, :enrollment_read_grants, id}) do
     case Map.fetch(engine.enrollment_read_grants, id) do
       {:ok, grant} -> valid_enrollment_read_grant?(engine, id, grant)
       :error -> true
     end
   end
 
-  defp valid_authority_reference?(engine, {:row, :pending_enrollments, code}) do
+  defp valid_keyed_fact?(_old, engine, {:row, :pending_enrollments, code}) do
     case Map.fetch(engine.pending_enrollments, code) do
       {:ok, item} ->
         not Map.has_key?(engine.pending_history, code) and valid_pending_item?(engine, code, item)
@@ -3590,7 +3595,7 @@ defmodule AttentionServer.Store do
     end
   end
 
-  defp valid_authority_reference?(engine, {:row, :pending_history, code}) do
+  defp valid_keyed_fact?(_old, engine, {:row, :pending_history, code}) do
     case Map.fetch(engine.pending_history, code) do
       {:ok, receipt} ->
         not Map.has_key?(engine.pending_enrollments, code) and
@@ -3601,48 +3606,54 @@ defmodule AttentionServer.Store do
     end
   end
 
-  defp valid_authority_reference?(engine, {:row, :browser_sign_ins, hash}) do
+  defp valid_keyed_fact?(_old, engine, {:row, :browser_sign_ins, hash}) do
     case Map.fetch(engine.browser_sign_ins, hash) do
       {:ok, record} -> BrowserSignIn.valid_record?(engine, hash, record)
       :error -> true
     end
   end
 
-  defp valid_authority_reference?(engine, {:row, :join_invitations, hash}) do
+  defp valid_keyed_fact?(_old, engine, {:row, :join_invitations, hash}) do
     case Map.fetch(engine.join_invitations, hash) do
       {:ok, record} -> GuidedJoin.valid_record?(engine, hash, record)
       :error -> true
     end
   end
 
-  defp valid_authority_reference?(engine, {:row, field, {person, actor} = key})
+  defp valid_keyed_fact?(_old, engine, {:row, field, {person, actor} = key})
        when field in [:sender_grants, :subscriptions, :origin_feeds],
        do: not Map.has_key?(Map.fetch!(engine, field), key) or owns?(engine, person, actor)
 
-  defp valid_authority_reference?(engine, {:row, :push_bindings, {person, device} = key}) do
+  defp valid_keyed_fact?(old, engine, {:row, :push_bindings, {person, device} = key}) do
     case Map.fetch(engine.push_bindings, key) do
       {:ok, binding} ->
-        owns?(engine, person, device) and valid_push_binding?(binding, engine, person, device)
+        owns?(engine, person, device) and valid_push_binding?(binding, engine, person, device) and
+          valid_push_address_change?(old, engine, {:row, :push_bindings, key})
 
       :error ->
         true
     end
   end
 
-  defp valid_authority_reference?(
+  defp valid_keyed_fact?(
+         _old,
          engine,
-         {:row, :source_report_grants, {person, actor, _} = key}
-       ),
-       do: not Map.has_key?(engine.source_report_grants, key) or owns?(engine, person, actor)
+         {:row, :source_report_grants, {person, actor, source} = key}
+       ) do
+    case Map.fetch(engine.source_report_grants, key) do
+      {:ok, grant} -> valid_source_report_grant?(engine, person, actor, source, grant)
+      :error -> true
+    end
+  end
 
-  defp valid_authority_reference?(engine, {:row, :origin_sessions, key}) do
+  defp valid_keyed_fact?(_old, engine, {:row, :origin_sessions, key}) do
     case Map.fetch(engine.origin_sessions, key) do
       {:ok, session} -> Conversation.valid_origin_session?(engine, key, session)
       :error -> true
     end
   end
 
-  defp valid_authority_reference?(engine, {:row, field, {person, actor} = key})
+  defp valid_keyed_fact?(_old, engine, {:row, field, {person, actor} = key})
        when field in [:cursors, :conversation_cursors] do
     high =
       if field == :cursors,
@@ -3658,12 +3669,12 @@ defmodule AttentionServer.Store do
     end
   end
 
-  defp valid_authority_reference?(engine, {:member, :conversation_opened, {person, actor} = key}),
+  defp valid_keyed_fact?(_old, engine, {:member, :conversation_opened, {person, actor} = key}),
     do:
       not MapSet.member?(engine.conversation_opened, key) or
         owns_or_browser?(engine, person, actor)
 
-  defp valid_authority_reference?(engine, {:row, :origin_receipts, {person, origin, _} = key}) do
+  defp valid_keyed_fact?(_old, engine, {:row, :origin_receipts, {person, origin, _} = key}) do
     case Map.fetch(engine.origin_receipts, key) do
       {:ok, receipt} ->
         owns?(engine, person, origin) and Conversation.valid_origin_receipt?(engine, key, receipt)
@@ -3673,44 +3684,34 @@ defmodule AttentionServer.Store do
     end
   end
 
-  defp valid_authority_reference?(engine, {:origin_feed, scope, {:delivery_ack, seq}}) do
-    valid_authority_reference?(engine, {:row, :origin_feeds, scope}) and
-      Conversation.valid_delivery_ack?(engine, scope, seq)
-  end
-
-  defp valid_authority_reference?(engine, {:origin_feed, scope, _}),
-    do: valid_authority_reference?(engine, {:row, :origin_feeds, scope})
-
-  defp valid_authority_reference?(_engine, _address), do: true
-
-  defp valid_transition_fact?(_old, next, {:field, :agent_cursor_key}),
+  defp valid_keyed_fact?(_old, next, {:field, :agent_cursor_key}),
     do: valid_cursor_key?(next.agent_cursor_key)
 
-  defp valid_transition_fact?(_old, next, {:field, :jev_endpoint}),
+  defp valid_keyed_fact?(_old, next, {:field, :jev_endpoint}),
     do: valid_jev_endpoint?(next.jev_endpoint)
 
-  defp valid_transition_fact?(_old, next, {:field, :jev_model}),
+  defp valid_keyed_fact?(_old, next, {:field, :jev_model}),
     do: valid_jev_model?(next.jev_model)
 
-  defp valid_transition_fact?(_old, next, {:field, :pending_clock_high_water}),
+  defp valid_keyed_fact?(_old, next, {:field, :pending_clock_high_water}),
     do: is_integer(next.pending_clock_high_water) and next.pending_clock_high_water >= 0
 
-  defp valid_transition_fact?(_old, next, {:field, :relay_instance_id}),
+  defp valid_keyed_fact?(_old, next, {:field, :relay_instance_id}),
     do: valid_instance?(next.relay_instance_id)
 
   # Published ordering and reply facts are append-only. Lowering their high
   # water mark or replacing a reply could invalidate untouched references.
-  defp valid_transition_fact?(old, next, {:row, :free_order_highs, person}) do
+  defp valid_keyed_fact?(old, next, {:row, :free_order_highs, person}) do
     case Map.fetch(next.free_order_highs, person) do
       {:ok, high} ->
-        is_integer(high) and high >= Map.get(old.free_order_highs, person, 0)
+        valid_order_high?(next, person, high) and high >= Map.get(old.free_order_highs, person, 0)
 
       :error ->
         not Map.has_key?(old.free_order_highs, person)
     end
   end
 
-  defp valid_transition_fact?(old, next, {:row, :conversation_events, {person, _} = key}) do
+  defp valid_keyed_fact?(old, next, {:row, :conversation_events, {person, _} = key}) do
     event = Map.get(next.conversation_events, key)
 
     case Map.fetch(old.conversation_events, key) do
@@ -3719,7 +3720,7 @@ defmodule AttentionServer.Store do
     end
   end
 
-  defp valid_transition_fact?(_old, next, {:row, :chat_read_positions, key}) do
+  defp valid_keyed_fact?(_old, next, {:row, :chat_read_positions, key}) do
     case Map.fetch(next.chat_read_positions, key) do
       {:ok, position} ->
         valid_chat_position?(next, key, position) and valid_scored_reply?(next, key)
@@ -3729,10 +3730,74 @@ defmodule AttentionServer.Store do
     end
   end
 
-  defp valid_transition_fact?(_old, next, {:row, :reply_group_history, key}),
+  defp valid_keyed_fact?(_old, next, {:row, :reply_group_history, key}),
     do: valid_scored_reply?(next, key)
 
-  defp valid_transition_fact?(_old, _next, _address), do: true
+  defp valid_keyed_fact?(_old, next, {:field, :browser_sign_in_clock_high_water}),
+    do:
+      is_integer(next.browser_sign_in_clock_high_water) and
+        next.browser_sign_in_clock_high_water >= 0
+
+  # Bounds and continuity for these addresses were checked by preflight or
+  # sequences above. Origin actions also use the full validator's predicate.
+  defp valid_keyed_fact?(_old, _next, {:row, field, _})
+       when field in [:persons, :origin_actions],
+       do: true
+
+  defp valid_keyed_fact?(_old, next, {:row, :conversation_highs, person}),
+    do: not Map.has_key?(next.conversation_highs, person) or Map.has_key?(next.persons, person)
+
+  defp valid_keyed_fact?(old, next, {:row, :events, key}) do
+    case Map.fetch(old.events, key) do
+      {:ok, published} -> Map.get(next.events, key) === published
+      :error -> true
+    end
+  end
+
+  defp valid_keyed_fact?(_old, _next, {:origin_feed, _scope, :high}), do: true
+  defp valid_keyed_fact?(_old, _next, {:origin_feed, _scope, {:entry, _seq}}), do: true
+  defp valid_keyed_fact?(_old, _next, {:origin_feed, _scope, {:delivery_ack, _seq}}), do: true
+
+  defp valid_keyed_fact?(old, next, {:row, :bounce_revisions, key}) do
+    case Map.fetch(next.bounce_revisions, key) do
+      {:ok, revision} ->
+        old_revision = Map.get(old.bounce_revisions, key, %{revisions: %{}})
+
+        retained? =
+          Enum.all?(old_revision.revisions, fn
+            {sub, %{selection: %{"decision" => "bounced"} = selection}} ->
+              match?(%{selection: ^selection}, Map.get(revision.revisions, sub))
+
+            {sub, _} ->
+              Map.has_key?(revision.revisions, sub)
+          end)
+
+        retained? and valid_bounce_revision?(next, key)
+
+      :error ->
+        not Map.has_key?(old.bounce_revisions, key)
+    end
+  end
+
+  defp valid_keyed_fact?(_old, next, {:row, :bounce_waiting_routes, scope}),
+    do: BounceDecision.valid_waiting_route?(next, scope)
+
+  defp valid_keyed_fact?(_old, next, {:member, :opened_revisions, key}),
+    do:
+      not MapSet.member?(next.opened_revisions, key) or
+        BounceDecision.valid_opened_revision?(next, key)
+
+  defp valid_keyed_fact?(old, next, {:advisory, scope, part}),
+    do: BounceDecision.valid_advisory_change?(old, next, scope, part)
+
+  defp valid_keyed_fact?(_old, _next, _address), do: false
+
+  defp valid_bounce_revision?(engine, key) do
+    case Map.fetch(engine.bounce_revisions, key) do
+      {:ok, revision} -> BounceDecision.valid_revision_state?(engine, key, revision)
+      :error -> true
+    end
+  end
 
   defp valid_scored_reply?(engine, key) do
     case Map.fetch(engine.reply_group_history, key) do

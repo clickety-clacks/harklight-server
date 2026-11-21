@@ -1549,10 +1549,7 @@ defmodule AttentionServer.Relay do
 
         case commit_request(state.store, next, touched, audit(old, key, "origin_support")) do
           {:ok, store} ->
-            store = %{
-              store
-              | engine: BounceDecision.requeue_supported_session(store.engine, session_key)
-            }
+            store = requeue_legacy_session(store, session_key)
 
             next_state =
               %{state | store: store}
@@ -1910,10 +1907,7 @@ defmodule AttentionServer.Relay do
           &MapSet.put(&1, stream_key)
         )
 
-      store = %{
-        store
-        | engine: BounceDecision.requeue_supported_session(store.engine, stream_key)
-      }
+      store = requeue_legacy_session(store, stream_key)
 
       next_state = %{
         state
@@ -7279,7 +7273,14 @@ defmodule AttentionServer.Relay do
   defp track_origin_coverage(state, proposed, person, origin) do
     track_transition(state, state.store.engine, fn engine ->
       proposed = %{proposed | store: %{proposed.store | engine: engine}}
-      {origin_availability_changes(state, proposed, person, origin), nil}
+      engine = origin_availability_changes(state, proposed, person, origin)
+
+      engine =
+        if state.store.mode == :keyed,
+          do: requeue_origin_handles(engine, person, origin),
+          else: engine
+
+      {engine, nil}
     end)
   end
 
@@ -7422,16 +7423,23 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  defp requeue_covered(state, person, origin) do
-    engine =
-      Enum.reduce(
-        covered_handles(state.store.engine, person, origin),
-        state.store.engine,
-        fn handle, engine ->
-          BounceDecision.requeue_supported_session(engine, {person, origin, handle})
-        end
-      )
+  defp requeue_legacy_session(%{mode: :keyed} = store, _scope), do: store
 
+  defp requeue_legacy_session(store, scope) do
+    %{store | engine: BounceDecision.requeue_supported_session(store.engine, scope)}
+  end
+
+  defp requeue_origin_handles(engine, person, origin) do
+    Enum.reduce(covered_handles(engine, person, origin), engine, fn handle, current ->
+      BounceDecision.requeue_supported_session(current, {person, origin, handle})
+    end)
+  end
+
+  defp requeue_covered(%{store: %{mode: :keyed}} = state, _person, _origin),
+    do: reschedule_bounce_sweep(state)
+
+  defp requeue_covered(state, person, origin) do
+    engine = requeue_origin_handles(state.store.engine, person, origin)
     %{state | store: %{state.store | engine: engine}} |> reschedule_bounce_sweep()
   end
 

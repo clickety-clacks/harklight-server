@@ -21,7 +21,9 @@ defmodule AttentionServer.Store.KeyedReference do
     end)
   end
 
-  def prepare(old, next, touched, directory) do
+  # For a rekey, pass both the removed and inserted address so both paths
+  # are updated. A set ensures each record contributes to the delta once.
+  def prepare(old, next, %MapSet{} = touched, directory) do
     changes = %{
       engine: next,
       records: [],

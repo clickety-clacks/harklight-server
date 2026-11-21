@@ -699,19 +699,32 @@ defmodule AttentionServer.Conversation do
     _ -> false
   end
 
+  @doc false
+  def valid_origin_entry?(seq, high, entry) when is_map(entry) do
+    is_integer(seq) and seq > 0 and is_integer(high) and seq <= high and
+      entry["feed_seq"] == seq and entry["event_id"] == Integer.to_string(seq) and
+      entry["kind"] in ["revision", "discussion", "reply", "terminal", "result"] and
+      entry["author"] in ["origin", "person", "agent", "server"] and
+      Message.uuid_v4?(entry["session_handle"])
+  end
+
+  def valid_origin_entry?(_, _, _), do: false
+
+  @doc false
+  def valid_origin_action?(engine, {person, origin, seq}, action) when is_map(action) do
+    actionable?(get_in(engine.origin_feeds, [{person, origin}, :entries, seq])) and
+      Message.uuid?(Map.get(action, :op_id)) and is_integer(Map.get(action, :at))
+  end
+
+  def valid_origin_action?(_, _, _), do: false
+
   def valid_state?(engine) do
     Enum.all?(engine.origin_feeds, fn {{person, origin}, feed} ->
       get_in(engine.devices, [origin, :person]) == person and
         is_integer(feed.high) and feed.high >= 0 and
         map_size(feed.entries) == feed.high and
         valid_delivery_acks?(engine, person, origin, feed) and
-        Enum.all?(feed.entries, fn {seq, entry} ->
-          is_integer(seq) and seq > 0 and seq <= feed.high and
-            entry["feed_seq"] == seq and entry["event_id"] == Integer.to_string(seq) and
-            entry["kind"] in ["revision", "discussion", "reply", "terminal", "result"] and
-            entry["author"] in ["origin", "person", "agent", "server"] and
-            Message.uuid_v4?(entry["session_handle"])
-        end)
+        Enum.all?(feed.entries, fn {seq, entry} -> valid_origin_entry?(seq, feed.high, entry) end)
     end) and
       Enum.all?(engine.origin_sessions, fn {key, session} ->
         valid_origin_session?(engine, key, session)
@@ -719,9 +732,8 @@ defmodule AttentionServer.Conversation do
       Enum.all?(engine.origin_receipts, fn {key, receipt} ->
         valid_origin_receipt?(engine, key, receipt)
       end) and
-      Enum.all?(engine.origin_actions, fn {{person, origin, seq}, action} ->
-        actionable?(get_in(engine.origin_feeds, [{person, origin}, :entries, seq])) and
-          Message.uuid?(action.op_id) and is_integer(action.at)
+      Enum.all?(engine.origin_actions, fn {key, action} ->
+        valid_origin_action?(engine, key, action)
       end)
   rescue
     _ -> false

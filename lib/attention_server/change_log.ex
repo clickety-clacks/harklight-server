@@ -512,6 +512,12 @@ defmodule AttentionServer.ChangeLog do
             []
         end
 
+      {:row, :agents, key} ->
+        if match?(%{revoked: false}, Map.get(old.agents, key)) and
+             not match?(%{revoked: false}, Map.get(next.agents, key)),
+           do: [{{:agent, key}, :revoked}],
+           else: []
+
       {:row, :delivery_states, person} ->
         if old.delivery_states[person] != "STOPPED" and next.delivery_states[person] == "STOPPED",
           do: [{{:person, person}, :account_paused}],

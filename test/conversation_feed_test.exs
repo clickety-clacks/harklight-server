@@ -1174,6 +1174,7 @@ defmodule AttentionServer.ConversationFeedTest do
 
     assert File.read(ref.path) == {:ok, body}
     assert log =~ "event=harklight_unresolved_large_data_reference"
+    assert log =~ "sha256=#{ref.id}"
     assert large_data_reference_rows(path) == []
     refute File.exists?(orphan)
 

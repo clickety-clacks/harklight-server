@@ -230,6 +230,32 @@ defmodule AttentionServer.Store.EngineTransitionTest do
     :ok = Store.close(keyed)
   end
 
+  test "malformed keyed rows refuse cleanly without advancing generation" do
+    path = legacy_store_path()
+    {:ok, store} = Store.open(path, :keyed_cutover)
+    audit = %{person: @person, actor: @origin, action: "bad facts"}
+
+    for {engine, address} <- [
+          {%{store.engine | browser_sign_in_clock_high_water: -5},
+           {:field, :browser_sign_in_clock_high_water}},
+          {put_in(store.engine.hosted_accounts["broken"], "not a map"),
+           {:row, :hosted_accounts, "broken"}},
+          {put_in(store.engine.push_bindings["broken"], %{}), {:row, :push_bindings, "broken"}},
+          {store.engine, {:field, :unknown}},
+          {store.engine, {:origin_feed, {@person, @origin}, {:unknown, 1}}}
+        ] do
+      touched = MapSet.new([address])
+
+      assert {:error, :storage_unavailable, ^store} =
+               Store.commit(store, {engine, touched}, audit)
+    end
+
+    assert {:ok, decoded, version} = KeyedMigration.load(store.db)
+    assert version == store.version
+    assert full_diff(decoded, store.engine) == MapSet.new()
+    :ok = Store.close(store)
+  end
+
   test "keyed commits reject malformed priority, cursor and retained item changes" do
     path = legacy_store_path()
     {:ok, initial} = Store.open(path)
@@ -900,6 +926,9 @@ defmodule AttentionServer.Store.EngineTransitionTest do
 
     state = :sys.get_state(relay)
     assert state.store.engine.bounce_waiting_routes == %{}
+    assert {:ok, durable, generation} = KeyedMigration.load(state.store.db)
+    assert generation == state.store.version
+    assert durable.bounce_waiting_routes == %{}
     assert BounceDecision.next_deadline(state.store.engine) == due_at
     assert {:ok, decision_rev} = AgentChangeLog.head(state.store, scope)
     :atomics.put(clock, 1, due_at)
@@ -1534,7 +1563,9 @@ defmodule AttentionServer.Store.EngineTransitionTest do
 
     assert {:ok, _} = KeyedMigration.convert(store)
     :ok = Store.close(store)
-    opts = [store_path: path, store_mode: :keyed]
+    flags = path <> ".flags"
+    File.write!(flags, JSON.encode!(%{"client_api_v2" => true}))
+    opts = [store_path: path, store_mode: :keyed, feature_flags_path: flags]
     {:ok, relay} = Relay.start_link(opts)
 
     assert :ok = Relay.owner_register_agent(relay, person, owner, id, agent)
@@ -1548,7 +1579,11 @@ defmodule AttentionServer.Store.EngineTransitionTest do
     assert {:error, :stale_or_invalid_grant} =
              Relay.owner_replace_agent_grants(relay, person, owner, agent, 1, [], [])
 
+    principal = %{kind: :agent, key: agent, person: person}
+    assert :ok = ChangeLog.subscribe_closing(principal)
     assert :ok = Relay.owner_revoke_agent(relay, person, owner, agent)
+    assert_receive {:client_closing, {:agent, ^agent}, :revoked}
+    assert :ok = ChangeLog.unsubscribe_closing(principal)
     live = :sys.get_state(relay).store
     assert :ok = Relay.owner_revoke_agent(relay, person, owner, agent)
     assert :sys.get_state(relay).store.version == live.version

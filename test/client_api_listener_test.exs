@@ -477,65 +477,69 @@ defmodule AttentionServer.ClientAPIListenerTest do
   end
 
   describe "owner-registered agents on the device port" do
-    test "a registered agent reads the full view with empty grants", ctx do
-      {relay, person, owner, agent, port} = start_granted_agent(ctx, true, "granted")
-      assert :ok = Relay.setup_device(relay, person, "fixture-origin")
+    for mode <- [:legacy, :keyed_cutover] do
+      @tag store_mode: mode
+      test "a registered agent reads the full view with empty grants in #{mode} mode", ctx do
+        enrollment_name = "granted-#{ctx.store_mode}"
+        {relay, person, owner, agent, port} = start_granted_agent(ctx, true, enrollment_name)
+        assert :ok = Relay.setup_device(relay, person, "fixture-origin")
 
-      for {sender, id, n} <- [{"app:first", "first", 1}, {"app:second", "second", 2}] do
-        forward_granted_fixture(relay, sender, id, n)
-      end
+        for {sender, id, n} <- [{"app:first", "first", 1}, {"app:second", "second", 2}] do
+          forward_granted_fixture(relay, sender, id, n)
+        end
 
-      assert {:ok, conn} = device_connect(Map.put(ctx, :port, port), "granted", :http2)
-      assert {:ok, conn, %{status: 200} = inbox} = request(conn, "GET", "/v2/inbox")
-      assert %{"items" => items, "counts" => %{"unresolved" => 2}} = json(inbox)
-      assert Enum.sort(Enum.map(items, & &1["sender"])) == ["app:first", "app:second"]
+        assert {:ok, conn} = device_connect(Map.put(ctx, :port, port), enrollment_name, :http2)
+        assert {:ok, conn, %{status: 200} = inbox} = request(conn, "GET", "/v2/inbox")
+        assert %{"items" => items, "counts" => %{"unresolved" => 2}} = json(inbox)
+        assert Enum.sort(Enum.map(items, & &1["sender"])) == ["app:first", "app:second"]
 
-      conn =
-        Enum.reduce(items, conn, fn item, conn ->
-          Enum.reduce(["", "/entries", "/revisions/1"], conn, fn suffix, conn ->
-            assert {:ok, conn, %{status: 200}} =
-                     request(conn, "GET", "/v2/items/" <> item["item_id"] <> suffix)
+        conn =
+          Enum.reduce(items, conn, fn item, conn ->
+            Enum.reduce(["", "/entries", "/revisions/1"], conn, fn suffix, conn ->
+              assert {:ok, conn, %{status: 200}} =
+                       request(conn, "GET", "/v2/items/" <> item["item_id"] <> suffix)
 
-            conn
+              conn
+            end)
           end)
-        end)
 
-      assert {:ok, conn, %{status: 200} = batch} = request(conn, "GET", "/v2/changes")
-      changes = json(batch)["changes"]
+        assert {:ok, conn, %{status: 200} = batch} = request(conn, "GET", "/v2/changes")
+        changes = json(batch)["changes"]
 
-      assert Enum.sort(for(%{"kind" => "item", "data" => item} <- changes, do: item["sender"])) ==
-               ["app:first", "app:second"]
+        assert Enum.sort(for(%{"kind" => "item", "data" => item} <- changes, do: item["sender"])) ==
+                 ["app:first", "app:second"]
 
-      visible = hd(items)["item_id"]
+        visible = hd(items)["item_id"]
 
-      conn =
-        Enum.reduce(
-          [
-            {"POST", "/v2/items/" <> visible <> "/replies"},
-            {"POST", "/v2/items/" <> visible <> "/seen"},
-            {"PUT", "/v2/devices/me/focus"},
-            {"DELETE", "/v2/files/anything"},
-            {"POST", "/v2/agent/messages"},
-            {"GET", "/v2/settings"},
-            {"GET", "/v2/files/anything"}
-          ],
-          conn,
-          fn {method, path}, conn ->
-            assert {:ok, conn, %{status: 403} = denied} = request(conn, method, path)
-            assert json(denied)["error"] == "forbidden"
-            conn
-          end
-        )
+        conn =
+          Enum.reduce(
+            [
+              {"POST", "/v2/items/" <> visible <> "/replies"},
+              {"POST", "/v2/items/" <> visible <> "/seen"},
+              {"PUT", "/v2/devices/me/focus"},
+              {"DELETE", "/v2/files/anything"},
+              {"POST", "/v2/agent/messages"},
+              {"GET", "/v2/settings"},
+              {"GET", "/v2/files/anything"}
+            ],
+            conn,
+            fn {method, path}, conn ->
+              assert {:ok, conn, %{status: 403} = denied} = request(conn, method, path)
+              assert json(denied)["error"] == "forbidden"
+              conn
+            end
+          )
 
-      {conn, feed} = ClientAPIFeedClient.open_feed(conn, "?after=#{json(batch)["rev"]}")
-      {conn, feed} = ClientAPIFeedClient.await_open(conn, feed)
-      assert feed.status == 200
+        {conn, feed} = ClientAPIFeedClient.open_feed(conn, "?after=#{json(batch)["rev"]}")
+        {conn, feed} = ClientAPIFeedClient.await_open(conn, feed)
+        assert feed.status == 200
 
-      assert :ok = Relay.owner_revoke_agent(relay, person, owner, agent)
-      {conn, feed, closing} = ClientAPIFeedClient.until_closing(conn, feed)
-      assert closing == %{event: "closing", data: %{"reason" => "revoked"}}
-      {conn, %{done: true}} = ClientAPIFeedClient.drain(conn, feed)
-      assert {:ok, _, %{status: 401}} = request(conn, "GET", "/v2/inbox")
+        assert :ok = Relay.owner_revoke_agent(relay, person, owner, agent)
+        {conn, feed, closing} = ClientAPIFeedClient.until_closing(conn, feed)
+        assert closing == %{event: "closing", data: %{"reason" => "revoked"}}
+        {conn, %{done: true}} = ClientAPIFeedClient.drain(conn, feed)
+        assert {:ok, _, %{status: 401}} = request(conn, "GET", "/v2/inbox")
+      end
     end
 
     test "search keeps literal matching, exact filters, and newest-first paging", ctx do
@@ -713,7 +717,13 @@ defmodule AttentionServer.ClientAPIListenerTest do
     File.write!(flags, JSON.encode!(%{"client_api_v2" => enabled}))
 
     server =
-      start_supervised!({Server, Keyword.put(server_opts(ctx), :feature_flags_path, flags)})
+      start_supervised!(
+        {Server,
+         Keyword.merge(server_opts(ctx),
+           feature_flags_path: flags,
+           store_mode: Map.get(ctx, :store_mode, :legacy)
+         )}
+      )
 
     relay = Server.relay(server)
     owner_der = TLSFixtures.certificate_der!(ctx.certs, "a1")

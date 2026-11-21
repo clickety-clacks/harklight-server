@@ -71,6 +71,7 @@ defmodule AttentionServer.LargeData do
     term |> index_rows(Enum.reverse(path), %{}) |> reference_index_rows()
   end
 
+  @doc false
   def reference_index_rows(index) do
     index
     |> Map.values()
@@ -352,8 +353,10 @@ defmodule AttentionServer.LargeData do
     retained_count = MapSet.size(candidates) - MapSet.size(unmarked)
 
     if retained_count > 0 do
+      hashes = candidates |> MapSet.difference(unmarked) |> Enum.sort() |> Enum.join(",")
+
       Logger.warning(
-        "event=harklight_unresolved_large_data_reference retained_blobs=#{retained_count}"
+        "event=harklight_unresolved_large_data_reference retained_blobs=#{retained_count} sha256=#{hashes}"
       )
     end
 
