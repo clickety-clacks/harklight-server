@@ -2680,7 +2680,12 @@ defmodule AttentionServer.Engine do
          when is_binary(session) <- Map.get(engine.messages, key),
          %{payload: %{"event_id" => event_id}} <- Map.get(engine.events, {person, seq}),
          {feed_seq, ""} <- Integer.parse(event_id),
-         %{"kind" => "terminal", "sender_id" => ^sender, "message_id" => ^id, "terminal_seq" => ^seq} =
+         %{
+           "kind" => "terminal",
+           "sender_id" => ^sender,
+           "message_id" => ^id,
+           "terminal_seq" => ^seq
+         } =
            entry <- get_in(engine.origin_feeds, [{person, origin}, :entries, feed_seq]) do
       entry
     else
@@ -3117,7 +3122,14 @@ defmodule AttentionServer.Engine do
       |> origin_availability_requests(person, origin, handle)
       |> Enum.sort_by(fn {_, record} -> record.accepted_seq end)
 
-    write_origin_availability(engine, {person, origin, handle}, status, detached_at, requests, %{})
+    write_origin_availability(
+      engine,
+      {person, origin, handle},
+      status,
+      detached_at,
+      requests,
+      %{}
+    )
   end
 
   @doc false
@@ -3153,7 +3165,14 @@ defmodule AttentionServer.Engine do
         do: {key, record}
   end
 
-  defp write_origin_availability(engine, {person, origin, handle}, status, detached_at, requests, extra) do
+  defp write_origin_availability(
+         engine,
+         {person, origin, handle},
+         status,
+         detached_at,
+         requests,
+         extra
+       ) do
     support = get_in(engine.origin_sessions, [{person, origin, handle}, :support])
 
     next =
