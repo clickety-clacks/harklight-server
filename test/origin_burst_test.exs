@@ -132,13 +132,23 @@ defmodule AttentionServer.OriginBurstTest do
           "count" => count,
           "max_concurrent" => @burst_batch_size,
           "batch_count" => div(count + @burst_batch_size - 1, @burst_batch_size),
-          "outcomes" => outcomes,
+          "outcome_counts" => Enum.frequencies_by(outcomes, & &1["outcome"]),
+          "max_total_ms" => outcomes |> Enum.map(& &1["total_ms"]) |> Enum.max(fn -> nil end),
           "net_before" => before,
           "net_after" => after_counters,
           "elapsed_ms" => System.monotonic_time(:millisecond) - start,
           "pending_feed_preserved" => feed_before == feed_after
         })
     )
+
+    # The full per-handle list is large, and a very long log line hides the
+    # rest of the run in some log viewers, so it is printed only on failure.
+    passed? =
+      feed_before == feed_after and length(outcomes) == count and
+        MapSet.new(Enum.map(outcomes, & &1["handle"])) == MapSet.new(handles) and
+        Enum.all?(outcomes, &(&1["outcome"] == "attached"))
+
+    unless passed?, do: IO.puts("BURST_OUTCOMES " <> JSON.encode!(outcomes))
 
     assert feed_before == feed_after
     assert length(outcomes) == count
