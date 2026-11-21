@@ -270,10 +270,40 @@ defmodule AttentionServer.Store.EngineTransitionTest do
              inspect(name)
     end
 
+    answer_line =
+      JSON.encode_line(%{
+        "v" => 1,
+        "type" => "answer",
+        "sender_id" => @sender,
+        "message_id" => "msg",
+        "answer" => nil,
+        "op_id" => "00000000-0000-4000-8000-000000000002"
+      })
+
+    {answered, {:ok, reply}} = Engine.request_line(legacy.engine, @reader, answer_line, 200)
+    assert {:ok, %{"type" => "ok"}} = JSON.decode_line(reply)
+
+    {next, {:ok, ^reply}, touched} =
+      Engine.request_line_with_touches(keyed.engine, @reader, answer_line, 200)
+
+    answer_audit = %{person: @person, actor: @reader, action: "answer"}
+    assert {:ok, legacy} = Store.commit(legacy, answered, answer_audit)
+    assert {:ok, keyed} = Store.commit(keyed, {next, touched}, answer_audit)
+
+    rewrite_timestamp = fn engine -> update_in(engine.messages[item].terminal.at, &(&1 + 1)) end
+    rewritten = rewrite_timestamp.(keyed.engine)
+
+    assert {:error, :storage_unavailable, ^legacy} =
+             Store.commit(legacy, rewrite_timestamp.(legacy.engine), answer_audit)
+
+    assert {:error, :storage_unavailable, ^keyed} =
+             Store.commit(keyed, {rewritten, full_diff(keyed.engine, rewritten)}, answer_audit)
+
     :ok = Store.close(legacy)
     :ok = Store.close(keyed)
     assert {:ok, reopened} = Store.open(keyed_path, :keyed)
     assert reopened.version == keyed.version
+    assert reopened.engine.messages[item].terminal === keyed.engine.messages[item].terminal
     assert :ok = Store.close(reopened)
   end
 

@@ -1421,7 +1421,7 @@ defmodule AttentionServer.Store do
       projected_entries == [] and progress_only?(store.engine, next) and valid_progress?(next) ->
         commit_progress(store, next, audit)
 
-      valid_state?(next, :incremental) ->
+      valid_state?(next, :incremental, store.engine.messages) ->
         commit_durable(store, next, audit, projected_entries)
 
       true ->
@@ -2759,9 +2759,11 @@ defmodule AttentionServer.Store do
 
   # The durable hot path checks bounce index containers without rescanning their
   # retained rows. Store open performs the full cross-map bounce validation.
-  defp valid_state?(%Engine{} = engine), do: valid_state?(engine, :full)
+  defp valid_state?(engine), do: valid_state?(engine, :full)
 
-  defp valid_state?(%Engine{} = engine, bounce_validation) do
+  defp valid_state?(engine, bounce_validation), do: valid_state?(engine, bounce_validation, %{})
+
+  defp valid_state?(%Engine{} = engine, bounce_validation, previous_messages) do
     try do
       valid_instance?(engine.relay_instance_id) and
         valid_cursor_key?(engine.agent_cursor_key) and
@@ -2839,7 +2841,9 @@ defmodule AttentionServer.Store do
         Enum.all?(engine.enrollment_read_grants, fn {id, grant} ->
           valid_enrollment_read_grant?(engine, id, grant)
         end) and
-        Enum.all?(engine.messages, fn {key, record} -> valid_item?(engine, key, record) end) and
+        Enum.all?(engine.messages, fn {key, record} ->
+          valid_item?(engine, key, record) and terminal_unchanged?(previous_messages, key, record)
+        end) and
         unique_source_bindings?(engine.messages) and
         Enum.all?(engine.events, fn {{person, seq}, event} ->
           valid_seq?(engine, person, seq) and elem(event.key, 0) == person and
@@ -2852,8 +2856,7 @@ defmodule AttentionServer.Store do
     end
   end
 
-  defp valid_state?(_, _), do: false
-  defp valid_state?(_), do: false
+  defp valid_state?(_, _, _), do: false
 
   defp same_state_except_bounce_indexes?(loaded, stored) do
     %{
@@ -3699,12 +3702,11 @@ defmodule AttentionServer.Store do
   defp valid_item_change?(old, next, {person, _, _} = key) do
     case Map.fetch(next.messages, key) do
       {:ok, record} ->
-        prior = get_in(old.messages, [key, :terminal])
         terminal = record.terminal
 
         valid_item?(next, key, record) and
           valid_arrival?(record, Map.get(next.free_order_highs, person, 0)) and
-          (is_nil(prior) or prior === terminal) and
+          terminal_unchanged?(old.messages, key, record) and
           (is_nil(terminal) or
              match?(%{kind: :lifecycle, key: ^key}, next.events[{person, terminal.seq}]))
 
@@ -3713,6 +3715,13 @@ defmodule AttentionServer.Store do
     end
   rescue
     _ -> false
+  end
+
+  defp terminal_unchanged?(messages, key, record) do
+    case Map.get(messages, key) do
+      %{terminal: prior} when not is_nil(prior) -> prior === record.terminal
+      _ -> true
+    end
   end
 
   defp valid_item?(engine, {person, sender, id}, record) do
