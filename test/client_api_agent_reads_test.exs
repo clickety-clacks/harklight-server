@@ -446,6 +446,20 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
       )
     end
 
+    test "lifecycle refuses a retracted item with the closed transition error", ctx do
+      id = forward(ctx, "a1", 1, nil)
+      item = "/v2/agent/messages/" <> id
+      assert request(ctx, "a1", "POST", item <> "/retract", %{}, 2).status == 200
+
+      assert_error(
+        request(ctx, "a1", "POST", item <> "/lifecycle", %{"action" => "expired"}, 3),
+        409,
+        "already_closed"
+      )
+
+      assert_error(request(ctx, "a1", "POST", item <> "/retract", %{}, 4), 409, "already_retracted")
+    end
+
     test "correlated retract marks the person's turn acted without recording handoff", ctx do
       id = forward(ctx, "a1", 1, @first_session)
       entry_id = person_reply(ctx, id, 2)
@@ -621,6 +635,30 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
       assert request(ctx, "a1", "POST", item <> "/replies", %{"text" => "After end"}, 3).status ==
                200
     end
+
+    test "ending a v2 session records gone for its open items", ctx do
+      body = %{
+        "sender" => "app:test",
+        "session" => @first_session,
+        "message" => %{"title" => "Open", "created_at" => 1}
+      }
+
+      sent = request(ctx, "a1", "POST", "/v2/agent/messages", body, 1)
+      id = contract(ctx, "AgentSendResult", sent)["message"]["item_id"]
+      other = forward(ctx, "a1", 2, @other_session)
+      path = "/v2/agent/sessions/" <> @first_session <> "/end"
+
+      assert request(ctx, "a1", "POST", path, %{}, 3).status == 200
+      assert request(ctx, "a1", "POST", path, %{}, 4).status == 200
+
+      entries = fn item ->
+        route = "/v2/agent/messages/" <> item <> "/entries"
+        contract(ctx, "AgentEntriesPage", get(ctx, "a1", route))["entries"]
+      end
+
+      assert [%{"kind" => "availability", "availability" => %{"state" => "gone"}}] = entries.(id)
+      refute Enum.any?(entries.(other), &(&1["availability"]["state"] == "gone"))
+    end
   end
 
   describe "agent files" do
@@ -662,6 +700,49 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
       assert file.status == 200
       assert file.body == characters
       assert_error(request(ctx, "a1", "DELETE", path, %{}, 5), 409, "already_closed")
+    end
+
+    test "shared file idempotency is person scoped across device keys", ctx do
+      first = upload(ctx, "a1", 1, "first")
+      assert first.status == 201
+      assert_error(upload(ctx, "a2", 1, "different"), 409, "idempotency_conflict")
+      assert upload(ctx, "b1", 1, "different account").status == 201
+
+      first_id = contract(ctx, "FileCreated", first)["file_id"]
+      second = upload(ctx, "a2", 2, "second")
+      second_id = contract(ctx, "FileCreated", second)["file_id"]
+
+      assert request(ctx, "a1", "DELETE", "/v2/files/" <> first_id, %{}, 3).status == 204
+
+      assert_error(
+        request(ctx, "a2", "DELETE", "/v2/files/" <> second_id, %{}, 3),
+        409,
+        "idempotency_conflict"
+      )
+
+      assert request(ctx, "a2", "DELETE", "/v2/files/" <> second_id, %{}, 4).status == 204
+    end
+
+    test "a same-account device can discard a handle staged before ownership tracking", ctx do
+      test_pid = self()
+
+      :sys.replace_state(ctx.relay, fn state ->
+        alias AttentionServer.ClientAPI.Uploads
+
+        {:ok, dir} = Uploads.dir(state.store)
+        path = Path.join(dir, "pre-owner-fixture")
+        File.write!(path, "fixture")
+
+        attrs = %{name: "legacy.txt", content_type: "text/plain", size: 7, sha256: String.duplicate("a", 64)}
+        {:ok, handle} = Uploads.stage(state.store, "A", attrs, path)
+        send(test_pid, {:pre_owner_handle, handle})
+        state
+      end)
+
+      assert_receive {:pre_owner_handle, handle}
+      path = "/v2/files/" <> handle
+      assert_error(request(ctx, "b1", "DELETE", path, %{}, 1), 404, "not_found")
+      assert request(ctx, "a2", "DELETE", path, %{}, 1).status == 204
     end
 
     test "file-use preserves transfer failure, duplicate and conflict outcomes", ctx do
