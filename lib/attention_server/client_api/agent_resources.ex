@@ -44,22 +44,31 @@ defmodule AttentionServer.ClientAPI.AgentResources do
     end
   end
 
-  def entries(state, {person, _agent} = scope, key) do
+  def entries(state, scope, key) do
+    with {:ok, raw} <- raw_entries(state, scope, key) do
+      render_entries(state, scope, raw)
+    end
+  end
+
+  def raw_entries(state, {person, _agent} = scope, key) do
     engine = state.store.engine
 
     with {:ok, _record} <- own_record(engine, scope, key) do
-      engine
-      |> Resources.entries(key, Map.get(state.priority_views, person))
-      |> Enum.reduce_while({:ok, []}, fn raw, {:ok, acc} ->
-        case render_entry(state, scope, raw) do
-          {:ok, entry} -> {:cont, {:ok, [entry | acc]}}
-          error -> {:halt, error}
-        end
-      end)
-      |> case do
-        {:ok, entries} -> {:ok, Enum.reverse(entries)}
-        error -> error
+      {:ok, Resources.entries(engine, key, Map.get(state.priority_views, person))}
+    end
+  end
+
+  def render_entries(state, scope, raw_entries) do
+    raw_entries
+    |> Enum.reduce_while({:ok, []}, fn raw, {:ok, acc} ->
+      case render_entry(state, scope, raw) do
+        {:ok, entry} -> {:cont, {:ok, [entry | acc]}}
+        error -> {:halt, error}
       end
+    end)
+    |> case do
+      {:ok, entries} -> {:ok, Enum.reverse(entries)}
+      error -> error
     end
   end
 
@@ -93,7 +102,11 @@ defmodule AttentionServer.ClientAPI.AgentResources do
     end
   end
 
-  defp enrich_delivery(%{"author" => "person", "kind" => "reply"} = raw, engine, {person, _} = scope) do
+  defp enrich_delivery(
+         %{"author" => "person", "kind" => "reply"} = raw,
+         engine,
+         {person, _} = scope
+       ) do
     event = engine.conversation_events[{person, raw["position"]}]
     delivery = delivery(engine, scope, event.payload["event_id"], raw["files"] || [])
     Map.update!(raw, "delivery", &Map.merge(&1, delivery))
@@ -163,7 +176,9 @@ defmodule AttentionServer.ClientAPI.AgentResources do
       %{entries: entries, receipts: receipts} ->
         for {_, %{"sender_id" => ^sender, "message_id" => ^id} = entry} <- Enum.sort(entries) do
           entry
-          |> Map.take(~w(advisory_id advisory_type request_revision text accepted_at_ms due_at_ms evaluated_at_ms level_name bounce_after_days))
+          |> Map.take(
+            ~w(advisory_id advisory_type request_revision text accepted_at_ms due_at_ms evaluated_at_ms level_name bounce_after_days)
+          )
           |> Map.put("delivered", MapSet.member?(receipts, entry["advisory_id"]))
         end
 

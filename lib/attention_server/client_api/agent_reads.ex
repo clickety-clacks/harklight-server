@@ -68,7 +68,8 @@ defmodule AttentionServer.ClientAPI.AgentReads do
     with :ok <- validate_filters(filters),
          prefix = page_prefix(scope, filters),
          {:ok, start} <- page_start(Map.get(params, "page"), prefix) do
-      tree = Map.get(state.store.engine.route_b_index.sent_messages_by_agent, scope, :gb_trees.empty())
+      tree =
+        Map.get(state.store.engine.route_b_index.sent_messages_by_agent, scope, :gb_trees.empty())
 
       rows =
         iterator(tree, start)
@@ -104,11 +105,14 @@ defmodule AttentionServer.ClientAPI.AgentReads do
   defp read({:entries, item_id, params}, state, scope, head) do
     with {:ok, key} <- AgentResources.own_item_key(state, scope, item_id),
          {:ok, limit} <- Reads.limit(params),
-         {:ok, entries} <- AgentResources.entries(state, scope, key),
+         {:ok, entries} <- AgentResources.raw_entries(state, scope, key),
          {:ok, before} <- Reads.before(params, entries) do
       eligible = Enum.take_while(entries, &(!before or &1["position"] < before))
       shown = Enum.take(eligible, -limit)
-      {:ok, %{"rev" => head, "entries" => shown, "older" => length(eligible) > limit}}
+
+      with {:ok, rendered} <- AgentResources.render_entries(state, scope, shown) do
+        {:ok, %{"rev" => head, "entries" => rendered, "older" => length(eligible) > limit}}
+      end
     end
   end
 
@@ -151,8 +155,12 @@ defmodule AttentionServer.ClientAPI.AgentReads do
     record = Map.fetch!(engine.messages, key)
 
     Enum.all?(filters, fn
-      {"session", value} -> Map.get(record, :session_handle) == value
-      {"sender", value} -> sender == value
+      {"session", value} ->
+        Map.get(record, :session_handle) == value
+
+      {"sender", value} ->
+        sender == value
+
       {"legacy_message_id", value} ->
         legacy_message_id == value and not Map.get(record, :agent_api_v2, false)
     end)

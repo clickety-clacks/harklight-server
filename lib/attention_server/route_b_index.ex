@@ -61,7 +61,12 @@ defmodule AttentionServer.RouteBIndex do
        when is_binary(agent) do
     scope = {person, agent}
     tree = Map.get(index.sent_messages_by_agent, scope, :gb_trees.empty())
-    put_in(index, [:sent_messages_by_agent, scope], :gb_trees.insert(-record.accepted_seq, key, tree))
+
+    put_in(
+      index,
+      [:sent_messages_by_agent, scope],
+      :gb_trees.insert(-record.accepted_seq, key, tree)
+    )
   end
 
   defp index_sent_message(index, _key, _previous, _record), do: index

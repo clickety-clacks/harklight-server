@@ -2667,7 +2667,8 @@ defmodule AttentionServer.Engine do
 
   # The feed stores journal pointers, separate from the immutable turn and Seen state.
   # Store.commit persists both the pointer and fact in the same SQLite transaction.
-  defp delivery_ack_fact(engine, person, origin, entry, stage) do
+  @doc false
+  def delivery_ack_fact(engine, person, origin, entry, stage) do
     feed = Map.fetch!(engine.origin_feeds, {person, origin})
     stages = Map.get(Map.get(feed, :delivery_acks, %{}), entry["feed_seq"], %{})
 

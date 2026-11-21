@@ -10,6 +10,7 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
     Server,
     TLSFixtures
   }
+
   alias AttentionServer.ClientAPI.Resources
 
   @first_session "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
@@ -100,7 +101,7 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
              contract(ctx, "SentMessagesPage", get(ctx, "a1", filter))
 
     assert Enum.map(messages, & &1["legacy_message_id"]) ==
-             Enum.map(51..2, &"item-#{&1}")
+             Enum.map(51..2//-1, &"item-#{&1}")
 
     next = filter <> "&page=" <> page
     last = contract(ctx, "SentMessagesPage", get(ctx, "a1", next))
@@ -111,7 +112,8 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
   end
 
   @tag flag: false
-  test "the server leaves the agent HTTP routes and durable log disabled with the flag off", ctx do
+  test "the server leaves the agent HTTP routes and durable log disabled with the flag off",
+       ctx do
     forward(ctx, "a1", 1, @first_session)
     refute Server.client_api_v2?(ctx.server)
     refute Enum.any?(Supervisor.which_children(ctx.server), &(elem(&1, 0) == :client_api))
@@ -125,6 +127,7 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
     path = "/v2/agent/messages/" <> id
     response = get(ctx, "a1", path)
     assert response.status == 200
+
     assert %{"message" => %{"item_id" => ^id, "session" => @first_session}} =
              contract(ctx, "SentMessageResponse", response)
 

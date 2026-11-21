@@ -374,19 +374,19 @@ defmodule AttentionServer.ClientAPI.Reads do
       {flags, _warned} = FeatureFlags.read(state.feature_flags_path, true)
 
       response = %{
-         "account" => %{
-           "state" =>
-             if(Engine.delivery_stopped?(engine, principal.person), do: "paused", else: "active")
-         },
-         "features" => Map.new(@client_features, &{&1, Map.get(flags, &1) == true}),
-         "limits" => %{
-           "upload_cap_bytes_per_file" =>
-             if(state.upload_cap == :none, do: "none", else: state.upload_cap),
-           "inline_decoded_bytes_per_entry" => ConversationFiles.inline_limit(),
-           "answer_ui_limits" => UI1.published_limits(),
-           "retention_days" => @retention_days
-         }
-       }
+        "account" => %{
+          "state" =>
+            if(Engine.delivery_stopped?(engine, principal.person), do: "paused", else: "active")
+        },
+        "features" => Map.new(@client_features, &{&1, Map.get(flags, &1) == true}),
+        "limits" => %{
+          "upload_cap_bytes_per_file" =>
+            if(state.upload_cap == :none, do: "none", else: state.upload_cap),
+          "inline_decoded_bytes_per_entry" => ConversationFiles.inline_limit(),
+          "answer_ui_limits" => UI1.published_limits(),
+          "retention_days" => @retention_days
+        }
+      }
 
       {:ok, with_sender_names(response, engine, principal)}
     end
