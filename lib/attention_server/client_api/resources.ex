@@ -417,10 +417,50 @@ defmodule AttentionServer.ClientAPI.Resources do
           end
         )
 
-      {_, "answer", true, nil} ->
+      # Round 16: on an answer-screen (UI/1) item the outcome follows the
+      # item's schema, not the value's shape.
+      {_, "answer", true, answer} ->
+        if ui1?(record.message),
+          do: structured_outcome(terminal, answer),
+          else: action_outcome(record, answer)
+
+      _ ->
+        nil
+    end
+  end
+
+  # A UI/1 answer is a structured result, any JSON value, null included. A
+  # plain-text answer to the same item (the comment path) shows as a reply,
+  # known only by the answer path the write recorded; an unmarked string is
+  # never guessed either way.
+  defp structured_outcome(terminal, answer) do
+    case {Map.get(terminal, :answer_path), answer} do
+      {"comment", text} when is_binary(text) or is_struct(text, LargeData.Ref) ->
+        %{"kind" => "reply", "text" => text}
+
+      {"result", value} ->
+        %{"kind" => "result", "value" => value}
+
+      {nil, text} when is_binary(text) or is_struct(text, LargeData.Ref) ->
+        nil
+
+      {nil, value} ->
+        %{"kind" => "result", "value" => value}
+
+      _ ->
+        nil
+    end
+  end
+
+  defp ui1?(%{"answer_ui" => %{"schema" => "attention-client.ui/1"}}), do: true
+  defp ui1?(_message), do: false
+
+  defp action_outcome(record, answer) do
+    case answer do
+      nil ->
         %{"kind" => "seen"}
 
-      {_, "answer", true, answer} ->
+      answer ->
         # An answer through one of the item's value actions stores that
         # action's value. The Seen action is seen; any other is the choice,
         # named by the action (contract round 15). Otherwise text is a reply.
@@ -437,9 +477,6 @@ defmodule AttentionServer.ClientAPI.Resources do
           nil ->
             nil
         end
-
-      _ ->
-        nil
     end
   end
 

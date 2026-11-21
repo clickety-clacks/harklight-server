@@ -737,6 +737,61 @@ defmodule AttentionServer.ClientAPIResourcesTest do
     end
   end
 
+  describe "structured answers" do
+    test "a UI/1 item's answer is kind result with any JSON value; a marked comment is a reply",
+         %{path: path} do
+      relay = scripted_relay(path)
+      {engine, view} = snapshot(relay)
+      defs = Schema.contract_defs(@contract)
+
+      outcome = fn answer, path_marker ->
+        engine =
+          update_in(engine.messages[key("answered")], fn record ->
+            terminal =
+              record.terminal
+              |> Map.merge(%{answer: answer, answer_present: true, by: "answer"})
+              |> then(fn t ->
+                if path_marker, do: Map.put(t, :answer_path, path_marker), else: t
+              end)
+
+            %{
+              record
+              | message:
+                  Map.put(record.message, "answer_ui", %{"schema" => "attention-client.ui/1"}),
+                terminal: terminal
+            }
+          end)
+
+        {:ok, id} = Resources.item_id(engine, key("answered"))
+
+        item =
+          Resources.item(
+            engine,
+            key("answered"),
+            Map.fetch!(Resources.ranks(engine, "A", view), id)
+          )
+
+        rendered =
+          item
+          |> Resources.stamp(1)
+          |> then(&Resources.render(:item, &1, %{key: "reader", senders: MapSet.new()}))
+
+        assert Schema.errors(defs, "Item", rendered) == []
+        item["terminal"]["answer"]
+      end
+
+      for value <- [nil, %{"x" => 1}, [1, 2], 3, true] do
+        assert outcome.(value, nil) == %{"kind" => "result", "value" => value}
+      end
+
+      assert outcome.("ok", "result") == %{"kind" => "result", "value" => "ok"}
+      assert outcome.("on my way", "comment") == %{"kind" => "reply", "text" => "on my way"}
+      # An unmarked string is never guessed.
+      assert outcome.("ambiguous", nil) == nil
+      GenServer.stop(relay)
+    end
+  end
+
   describe "rank level" do
     test "Rank carries today's display level wherever the view entry has one", %{path: path} do
       relay = scripted_relay(path)
