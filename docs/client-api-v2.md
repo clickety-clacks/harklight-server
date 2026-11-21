@@ -440,7 +440,7 @@ Every write that succeeds answers `200`, or `201` for `POST /v2/files`, with a
 | `PUT /v2/settings/priority-levels` | `{"levels": [PriorityLevel]}` with `If-Match` |
 | `PUT /v2/devices/me/push` | `{"token": string, "environment": "production" \| "sandbox", "revision": int}` |
 | `DELETE /v2/devices/me/push` | none |
-| `PUT /v2/devices/me/focus` | `{"screen": "inbox" \| "message" \| "chat" \| "settings" \| "signed_out" \| "not_in_front", "item_id"?: OpaqueId, "visible_entry_id"?: OpaqueId, "ttl_s": int}` (§5.1) |
+| `PUT /v2/devices/me/focus` | `{"screen": "inbox" \| "message" \| "chat" \| "settings" \| "signed_out" \| "not_in_front", "item_id"?: OpaqueId, "visible_entry_id"?: OpaqueId, "ttl_s": int 1..3600}` (§5.1) |
 | `POST /v2/files` | Raw bytes with `Content-Type`, `Content-Length` and `Content-Disposition: attachment; filename*=UTF-8''<percent-encoded name>` |
 
 ```json
@@ -554,7 +554,11 @@ Only their transport changes, and they are device-only.
   - `screen`: today's set, including `not_in_front`;
   - `item_id` (for today's sender and message IDs);
   - `visible_entry_id` (for today's visible event);
-  - `ttl_s`.
+  - `ttl_s`: an integer from 1 to 3600. Clients send 120 and refresh every
+    60 s while in front.
+
+  Clients serialize focus writes per device: one `PUT` in flight, and the
+  latest report replaces any queued one.
 
   Its `reported_at` rule is today's: the first report, or a change to an
   in-front screen. A refresh with unchanged fields is liveness only. A lapsed
