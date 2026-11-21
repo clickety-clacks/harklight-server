@@ -1639,3 +1639,82 @@ applied as well. Round 4 wins where rounds conflict:
 - `Chat.reply_group` may be null, where today's reply row has no group.
 
 No questions are open.
+
+## Granted agents
+
+An agent registered by the person through owner registration uses its enrolled
+agent certificate on the device listener. Its client API principal is scoped
+to that person and agent. The agent reads the person's full view even with
+empty grants. Only answers require sender grants. Answering a
+sender requires both the owner's read and reply patterns to match it, as in
+the existing answer path. A pattern matches an exact sender, or a sender
+prefix when the pattern ends in `/`.
+
+| Request | Legacy command | Behavior |
+|---|---|---|
+| `GET /v2/inbox?limit=&page=` | `search` for listing | The person's `InboxPage` in §4. |
+| `GET /v2/items/{item_id}`, `GET /v2/items/{item_id}/entries`, `GET /v2/items/{item_id}/revisions/{n}` | `get` for the item | The person's item, entries or revision in §4. |
+| `GET /v2/changes?after=&limit=` | none | The person's batch or SSE change feed in §6. |
+| `GET /v2/search?q=&sender=&message_id=&state=&limit=&page=` | `search` | `SearchPage`, described below. |
+| `POST /v2/items/{item_id}/answer` | `respond` | The body, request revision precondition, idempotency and response in §5. An item outside the answer grants answers `403 forbidden`. |
+
+Other routes answer `403 forbidden`. The usual account pause, request
+identifiers and error rules apply. Items and entries use the same shapes
+as client reads, rendered for the requesting agent. Device-only ephemeral
+events are unavailable to this principal.
+
+Clients with a legacy sender and message ID recover the opaque `item_id`
+using `GET /v2/search?sender=<sender_id>&message_id=<message_id>`. Use that
+ID for item reads and answers. For answers, the current `request_revision`
+replaces `acceptance_seq`. Supply the intention's UUIDv4 in `Idempotency-Key`
+in place of `op_id`. `WriteResult.item.terminal` carries the settled outcome,
+and `WriteResult.rev` reports the person's change-log position. Together
+they replace the legacy `relay_outcome` and `terminal_seq`. The response does
+not echo an `operation_id`. A replay is marked by `Idempotent-Replayed`.
+
+### Search
+
+`q` replaces the legacy `text` field (`contains` internally). It is an optional case-sensitive literal substring of any string value in
+the current message body, including strings nested inside arrays and objects.
+Object keys and non-string scalars do not match. The maximum is 1,024 UTF-8
+bytes. Omit `q` to skip the text filter. Optional `sender` and `message_id`
+are exact matches. `sender` uses the existing sender ID grammar and
+`message_id` must be nonempty. Optional `state` is one of `open`, `answered`, `cleared`,
+`expired`, `superseded` or `retracted`. All supplied filters must match.
+When both `sender` and `message_id` are supplied, an empty result answers
+`404 not_found`.
+
+Results are newest accepted first. The default limit is 20. `limit` must be a positive
+integer. Values above 100 are clamped to 100. As in the previous search, the result page has a
+4 MiB budget for its items, with at least one matching item returned when
+there is one. Each subsequent page resumes before the previous page's last
+item and excludes items first accepted after the initial page began. Matches
+use the current content. `SearchPage.rev` is the observation position for
+that response. A later page can reflect intervening edits. Apply each Item's
+`rev` using the shared version rule.
+
+```json
+{
+  "$defs": {
+    "SearchPage": {
+      "type": "object",
+      "required": ["rev", "items"],
+      "properties": {
+        "rev": { "$ref": "#/$defs/Position" },
+        "items": { "type": "array", "items": { "$ref": "#/$defs/Item" } },
+        "next_page": { "type": "string", "maxLength": 4096 }
+      }
+    }
+  }
+}
+```
+
+Repeat the search filters with the opaque `next_page` token. It replaces
+the legacy search cursor and binds the filter values, enrolled key, agent
+and person. The client can change `limit` between pages. Grant changes leave
+the token valid. Search page tokens are ASCII and have their own 4,096-byte
+limit.
+Invalid filters and invalid tokens answer `400 invalid_field`, naming the
+query parameter, such as `page`. An absent `next_page` marks the end.
+
+Legacy references for these rules are [search validation and matching](https://github.com/clickety-clacks/harklight-server/blob/f46aa03dc48017e4c81ee3f3c58a820231a162dd/lib/attention_server/agent_access.ex#L128-L236), [wire field and response mapping](https://github.com/clickety-clacks/harklight-server/blob/f46aa03dc48017e4c81ee3f3c58a820231a162dd/lib/attention_server/agent_wire.ex#L26-L83), and [answer grants](https://github.com/clickety-clacks/harklight-server/blob/f46aa03dc48017e4c81ee3f3c58a820231a162dd/lib/attention_server/engine.ex#L1133-L1175).
