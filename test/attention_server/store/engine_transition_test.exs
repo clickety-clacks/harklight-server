@@ -1147,13 +1147,117 @@ defmodule AttentionServer.Store.EngineTransitionTest do
     GenServer.stop(reopened)
   end
 
-  defp agent_write(relay, operation, params, body, op_id) do
+  test "keyed agent v2 revision, result and file-use replay after reopen" do
+    path = legacy_store_path()
+    {:ok, old} = Store.open(path)
+    assert {:ok, _} = KeyedMigration.convert(old)
+    :ok = Store.close(old)
+    flags = path <> ".flags"
+    File.write!(flags, JSON.encode!(%{"client_api_v2" => true}))
+    opts = [store_path: path, store_mode: :keyed, feature_flags_path: flags, clock: fn -> 100 end]
+    {:ok, relay} = Relay.start_link(opts)
+
+    body = %{
+      "sender" => "app:test/worker",
+      "session" => "00000000-0000-4000-8000-000000000010",
+      "message" => %{"title" => "Sent over v2", "created_at" => 1}
+    }
+
+    assert {:ok, 200, %{"message" => %{"item_id" => id}}, false} =
+             agent_write(relay, :send, %{}, body, "00000000-0000-4000-8000-000000000041")
+
+    item = %{item_id: id}
+    revised = %{"message" => %{"title" => "Revised over v2", "created_at" => 1}}
+    revise_op = "00000000-0000-4000-8000-000000000042"
+
+    assert {:ok, 200, %{"message" => %{"revision" => 2}} = revision, false} =
+             agent_write(relay, :revise, item, revised, revise_op, ["1"])
+
+    state = :sys.get_state(relay)
+    scope = {@person, @origin}
+    alias AttentionServer.ClientAPI.AgentResources
+    assert {:ok, {_, sender, message_id} = key} = AgentResources.own_item_key(state, scope, id)
+
+    frame = %{
+      "v" => 1,
+      "sender_id" => sender,
+      "message_id" => message_id,
+      "request_revision" => 2
+    }
+
+    discuss =
+      Map.merge(frame, %{
+        "type" => "discussion",
+        "op_id" => "00000000-0000-4000-8000-000000000043",
+        "text" => "Attachment for the revised request",
+        "files" => [%{"name" => "sample.bin", "data_base64" => Base.encode64(<<0, 5, 8>>)}]
+      })
+
+    assert {:ok, reply} = Relay.request_line(relay, @reader, JSON.encode_line(discuss))
+    assert {:ok, %{"type" => "ok", "seq" => seq}} = JSON.decode_line(reply)
+
+    assert {:ok, %{"entry_id" => entry, "files" => [%{"file_id" => file}]}} =
+             AgentResources.entry(:sys.get_state(relay), scope, key, seq)
+
+    turn = Map.put(item, :entry_id, entry)
+
+    assert {:ok, 200, %{"stage_outcome" => "handed"}, false} =
+             agent_write(
+               relay,
+               :chat_receipt,
+               turn,
+               %{"outcome" => "handed"},
+               "00000000-0000-4000-8000-000000000044"
+             )
+
+    file_body = %{"file_id" => file, "transfer" => "transferred", "use" => "used"}
+    file_op = "00000000-0000-4000-8000-000000000045"
+
+    assert {:ok, 200, %{"file_id" => ^file, "transfer" => "transferred", "use" => "used"} = use,
+            false} =
+             agent_write(relay, :file_use, turn, file_body, file_op)
+
+    answer =
+      Map.merge(frame, %{
+        "type" => "answer",
+        "answer" => nil,
+        "op_id" => "00000000-0000-4000-8000-000000000046"
+      })
+
+    assert {:ok, reply} = Relay.request_line(relay, @reader, JSON.encode_line(answer))
+    assert {:ok, %{"type" => "ok"}} = JSON.decode_line(reply)
+    result_body = %{"status" => "applied"}
+    result_op = "00000000-0000-4000-8000-000000000047"
+
+    assert {:ok, 200, %{"message" => %{"result" => %{"status" => "applied"}}} = result, false} =
+             agent_write(relay, :result, item, result_body, result_op)
+
+    live = :sys.get_state(relay).store
+    GenServer.stop(relay)
+    {:ok, reopened} = Relay.start_link(opts)
+
+    assert {:ok, 200, ^revision, true} =
+             agent_write(reopened, :revise, item, revised, revise_op, ["1"])
+
+    assert {:ok, 200, ^use, true} = agent_write(reopened, :file_use, turn, file_body, file_op)
+
+    assert {:ok, 200, ^result, true} =
+             agent_write(reopened, :result, item, result_body, result_op)
+
+    cold = :sys.get_state(reopened).store
+    assert cold.version == live.version
+    assert full_diff(cold.engine, live.engine) == MapSet.new()
+    assert index_state(cold) == index_state(live)
+    GenServer.stop(reopened)
+  end
+
+  defp agent_write(relay, operation, params, body, op_id, match \\ []) do
     principal = %{person: @person, key: @origin}
 
     digest =
       AttentionServer.ClientAPI.Idempotency.digest("POST", [Atom.to_string(operation)], body)
 
-    call = {:execute, {principal, operation, params, op_id, digest, [], body}, op_id, []}
+    call = {:execute, {principal, operation, params, op_id, digest, match, body}, op_id, []}
     GenServer.call(relay, {:client_api, AttentionServer.ClientAPI.AgentWrites, call})
   end
 
