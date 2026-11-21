@@ -128,15 +128,27 @@ defmodule AttentionServer.ClientAPIFeedClosingTest do
 
     test "a closed feed releases its subscriptions", ctx do
       {conn, feed} = open(ctx, "a1")
+      scope = {:closing, {:device, ctx.keys["a1"]}}
+      assert [{feed_pid, _}] = Registry.lookup(ChangeLog.Registry, scope)
+      assert [{watcher, _}] = Registry.lookup(ChangeLog.Registry, "A")
+
       assert :ok = Relay.revoke_device(ctx.relay, ctx.keys["a1"])
       {conn, feed, _closing} = until_closing(conn, feed)
       drain(conn, feed)
 
-      assert eventually(fn ->
-               Registry.lookup(ChangeLog.Registry, "A") == [] and
-                 Registry.lookup(ChangeLog.Registry, {:closing, {:device, ctx.keys["a1"]}}) == [] and
-                 Registry.lookup(ChangeLog.Registry, {:closing, {:person, "A"}}) == []
-             end)
+      # This feed's own registrations, so no other process can disturb the
+      # check (review N2).
+      released = fn ->
+        Registry.keys(ChangeLog.Registry, feed_pid) == [] and
+          Registry.keys(ChangeLog.Registry, watcher) == []
+      end
+
+      assert eventually(released),
+             "still registered: " <>
+               inspect(
+                 feed: {Process.alive?(feed_pid), Registry.keys(ChangeLog.Registry, feed_pid)},
+                 watcher: {Process.alive?(watcher), Registry.keys(ChangeLog.Registry, watcher)}
+               )
     end
   end
 
