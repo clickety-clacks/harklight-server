@@ -37,10 +37,12 @@ defmodule AttentionServer.SelfSignedEnrollmentTest do
         cacertfile: Path.join(certs, "ca.pem")
       )
 
+    # These are linked to the test process, so they may already be shutting
+    # down when on_exit runs; stopping one that is mid-exit is not a failure.
     on_exit(fn ->
-      if Process.alive?(owner_tls), do: GenServer.stop(owner_tls)
-      if Process.alive?(web), do: GenServer.stop(web)
-      if Process.alive?(relay), do: GenServer.stop(relay)
+      stop_quietly(owner_tls)
+      stop_quietly(web)
+      stop_quietly(relay)
     end)
 
     %{relay: relay, web: web, owner_tls: owner_tls}
@@ -169,5 +171,11 @@ defmodule AttentionServer.SelfSignedEnrollmentTest do
     engine = :sys.get_state(relay).store.engine
     item = Map.get(engine.pending_enrollments, code) || Map.get(engine.pending_history, code)
     Relay.owner_pending_approve(relay, person, owner, code, item.key, item.expires_at, senders)
+  end
+
+  defp stop_quietly(pid) do
+    if Process.alive?(pid), do: GenServer.stop(pid)
+  catch
+    :exit, _reason -> :ok
   end
 end
