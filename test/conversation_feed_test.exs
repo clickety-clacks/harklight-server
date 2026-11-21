@@ -1125,6 +1125,22 @@ defmodule AttentionServer.ConversationFeedTest do
     key = {"A", "app:test", id}
     assert %LargeData.Ref{} = ref = store.engine.messages[key].message["body"]
     marker = LargeData.persist_refs(ref)
+    literal_id = "authored-marker-text"
+
+    assert %{"type" => "ok"} =
+             request(relay, "origin", %{
+               "type" => "forward",
+               "op_id" => op(509),
+               "session_handle" => @handle,
+               "message" => %{
+                 "sender_id" => "app:test",
+                 "message_id" => literal_id,
+                 "created_at" => 1,
+                 "title" => "Literal marker",
+                 "body" => marker
+               }
+             })
+
     refs = large_data_reference_rows(path)
     assert refs != []
     GenServer.stop(relay)
@@ -1140,11 +1156,14 @@ defmodule AttentionServer.ConversationFeedTest do
       ExUnit.CaptureLog.capture_log(fn ->
         assert {:ok, reopened} = Store.open(path)
         assert reopened.engine.messages[key].message["body"] == marker
+        assert reopened.engine.messages[{"A", "app:test", literal_id}].message["body"] == marker
         assert :ok = Store.close(reopened)
       end)
 
     assert File.read(ref.path) == {:ok, body}
     assert log =~ "event=harklight_unresolved_large_data_reference"
+    assert log =~ "retained_blobs=1 sha256=#{ref.id}"
+    refute log =~ body
     assert large_data_reference_rows(path) == []
     refute File.exists?(orphan)
 
