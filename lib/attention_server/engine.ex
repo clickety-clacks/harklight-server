@@ -1182,6 +1182,76 @@ defmodule AttentionServer.Engine do
     end
   end
 
+  @doc false
+  def client_agent_answer(engine, key, frame, now) do
+    sender = frame["sender_id"]
+
+    with {:ok, %{person: person, id: id}} <- client_agent_answer_scope(engine, key, sender) do
+      actor = %{person: person, key: key, id: id, kind: :agent, request_at: now}
+
+      case frame["type"] do
+        "answer" ->
+          terminal(engine, actor, frame, true)
+
+        "answer_no_comment" ->
+          message_key = {person, sender, frame["message_id"]}
+          client_agent_no_comment(engine, actor, message_key, frame)
+      end
+    else
+      {:error, token} -> failure(Atom.to_string(token))
+    end
+  end
+
+  @doc false
+  def client_agent_answer_scope(engine, key, sender) do
+    case Map.get(engine.agents, key) do
+      %{revoked: false} = agent ->
+        if AgentAccess.allowed?(agent.read_grants, sender) and
+             AgentAccess.allowed?(agent.respond_grants, sender),
+           do: {:ok, agent},
+           else: {:error, :forbidden}
+
+      _ ->
+        {:error, :unauthorized}
+    end
+  end
+
+  defp client_agent_no_comment(engine, actor, message_key, frame) do
+    op = frame["op_id"]
+    revision = frame["request_revision"]
+
+    case Map.fetch(engine.messages, message_key) do
+      {:ok, %{terminal: nil, revision: ^revision} = record} ->
+        commit_no_comment(
+          engine,
+          actor.person,
+          actor.key,
+          actor.id,
+          :agent,
+          message_key,
+          record,
+          op,
+          actor.request_at
+        )
+
+      {:ok, %{terminal: nil}} ->
+        failure("stale_revision", "request_revision")
+
+      {:ok, %{terminal: %{state: "retracted"} = terminal}} ->
+        failure("retracted", nil, retracted_terminal_snapshot(terminal))
+
+      {:ok, %{terminal: %{kind: "no_comment", actor: key, op_id: ^op, seq: seq}}}
+      when key == actor.key ->
+        {:ok, engine, %{"seq" => seq, "terminal_kind" => "no_comment", "duplicate" => true}}
+
+      {:ok, record} ->
+        failure("closed", nil, project_terminal(record, message_key, actor.key))
+
+      :error ->
+        failure("not_found")
+    end
+  end
+
   @doc "Create a content-free pending request; only the secret hash is persisted. A waiting request does not expire."
   def pending_enroll(%__MODULE__{} = engine, cert_der, label, code, secret_hash) do
     with {:ok, key} <- DeviceIdentity.from_certificate(cert_der) do
