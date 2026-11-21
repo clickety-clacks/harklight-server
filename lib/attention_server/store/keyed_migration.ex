@@ -17,6 +17,7 @@ defmodule AttentionServer.Store.KeyedMigration do
 
     RecordTable.transaction(db, fn ->
       with :ok <- verify_previous_progress(store),
+           :ok <- Store.verify_retained_uploads(store),
            :ok <-
              Sqlite3.execute(
                db,
