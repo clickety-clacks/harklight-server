@@ -40,9 +40,19 @@ defmodule AttentionServer.Store.RecordTable do
   # only. It must return {:ok, metadata} or {:error, reason}. Callers publish
   # the Engine and notify subscribers after commit returns success.
   def commit(db, expected_generation, records, append) do
+    transaction(db, fn -> write_generation(db, expected_generation, records, append) end)
+  end
+
+  def seed(db, generation, rows) do
+    with :ok <- create(db, generation) do
+      write_records(db, Stream.map(rows, &{:put, &1}))
+    end
+  end
+
+  def transaction(db, write) do
     with :ok <- Sqlite3.execute(db, "BEGIN IMMEDIATE") do
       try do
-        case persist(db, expected_generation, records, append) do
+        case finish(db, write.()) do
           {:ok, _} = result ->
             result
 
@@ -58,7 +68,9 @@ defmodule AttentionServer.Store.RecordTable do
     end
   end
 
-  defp persist(db, expected_generation, records, append) do
+  # Composes records with a caller's transaction when its preconditions must
+  # be checked before any row is changed.
+  def write_generation(db, expected_generation, records, append) do
     with :ok <-
            run(
              db,
@@ -67,11 +79,16 @@ defmodule AttentionServer.Store.RecordTable do
            ),
          :ok <- require_changed_generation(db),
          :ok <- write_records(db, records),
-         {:ok, metadata} <- append_rows(append, db, expected_generation + 1),
-         :ok <- Sqlite3.execute(db, "COMMIT") do
+         {:ok, metadata} <- append_rows(append, db, expected_generation + 1) do
       {:ok, metadata}
     end
   end
+
+  defp finish(db, {:ok, _} = result) do
+    with :ok <- Sqlite3.execute(db, "COMMIT"), do: result
+  end
+
+  defp finish(_db, error), do: error
 
   defp append_rows(append, db, generation) do
     case append.(db, generation) do
