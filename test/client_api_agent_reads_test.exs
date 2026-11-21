@@ -442,7 +442,8 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
         })
 
       state = :sys.get_state(ctx.relay)
-      assert %LargeData.Ref{} = state.store.engine.messages[{"A", "app:test", "large-title"}].message["title"]
+      record = state.store.engine.messages[{"A", "app:test", "large-title"}]
+      assert %LargeData.Ref{} = record.message["title"]
       path = "/v2/agent/messages/" <> Resources.item_id(%{accepted_seq: seq}) <> "/lifecycle"
       body = %{"action" => "expired"}
       trace = {LargeData, :read!, 1}
@@ -485,6 +486,32 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
         :erlang.trace(relay, false, [:call])
         :erlang.trace_pattern(trace, false, [])
       end
+    end
+
+    test "a full success receipt from before compact storage still replays", ctx do
+      alias AttentionServer.ClientAPI.Idempotency
+
+      id = forward(ctx, "a1", 1, nil)
+      path = "/v2/agent/messages/" <> id <> "/lifecycle"
+      body = %{"action" => "expired"}
+      first = request(ctx, "a1", "POST", path, body, 2)
+      assert first.status == 200
+
+      state = :sys.get_state(ctx.relay)
+      scope = Idempotency.agent_scope("A", ctx.keys["a1"])
+
+      digest =
+        Idempotency.digest("POST", ["v2", "agent", "messages", id, "lifecycle"], %{
+          "body" => body,
+          "if_match" => []
+        })
+
+      assert :ok = Idempotency.save(state.store, scope, op(3), digest, 200, decode_response(first))
+
+      replay = request(ctx, "a1", "POST", path, body, 3)
+      assert replay.status == 200
+      assert replay.body == first.body
+      assert {"idempotent-replayed", "true"} in replay.headers
     end
 
     test "lifecycle stamps the transition and already_closed applies to a repeat", ctx do
