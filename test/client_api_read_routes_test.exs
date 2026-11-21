@@ -1,0 +1,217 @@
+defmodule AttentionServer.ClientAPIReadRoutesTest do
+  # The reads mounted on the client API router: query parameters, ETag and
+  # If-None-Match, error envelopes and file responses.
+  use ExUnit.Case, async: false
+
+  import Plug.Test
+  import Plug.Conn
+
+  alias AttentionServer.{JSON, Relay, TLSFixtures}
+  alias AttentionServer.ClientAPI.{Context, Principal, Reads, Router}
+
+  @handle "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+  @bytes :binary.copy(<<1, 2, 3, 4>>, 50)
+
+  setup_all do
+    certs = TLSFixtures.create!()
+    on_exit(fn -> File.rm_rf!(certs) end)
+    %{certs: certs}
+  end
+
+  setup %{certs: certs} do
+    dir =
+      Path.join(System.tmp_dir!(), "harklight-read-routes-#{System.unique_integer([:positive])}")
+
+    File.mkdir_p!(dir)
+    on_exit(fn -> File.rm_rf!(dir) end)
+    flags = Path.join(dir, "flags.json")
+    File.write!(flags, ~s({"client_api_v2":true}))
+
+    assert {:ok, relay} =
+             Relay.start_link(
+               store_path: Path.join(dir, "state.sqlite3"),
+               feature_flags_path: flags,
+               agent_fixture_mode: true
+             )
+
+    on_exit(fn -> if Process.alive?(relay), do: GenServer.stop(relay) end)
+
+    der = TLSFixtures.certificate_der!(certs, "a1")
+    assert :ok = Relay.setup_person(relay, "A")
+    assert :ok = Relay.setup_device(relay, "A", "origin")
+    assert {:ok, reader} = Relay.setup_device_certificate(relay, "A", der)
+    assert :ok = Relay.setup_sender(relay, "origin", "app:test")
+
+    for {id, n} <- [{"one", 2}, {"two", 3}, {"three", 4}] do
+      frame = %{
+        "type" => "forward",
+        "op_id" => op(n),
+        "session_handle" => @handle,
+        "message" => %{
+          "sender_id" => "app:test",
+          "message_id" => id,
+          "created_at" => n,
+          "title" => id
+        }
+      }
+
+      frame =
+        if id == "one",
+          do:
+            Map.put(frame, "files", [%{"name" => "a.bin", "data_base64" => Base.encode64(@bytes)}]),
+          else: frame
+
+      assert {:ok, line} =
+               Relay.request_line(relay, "origin", JSON.encode!(Map.put(frame, "v", 1)) <> "\n")
+
+      assert {:ok, %{"type" => "ok"}} = JSON.decode_line(line)
+    end
+
+    %{relay: relay, reader: reader, der: der}
+  end
+
+  defp op(n), do: "00000000-0000-4000-8000-#{String.pad_leading(Integer.to_string(n), 12, "0")}"
+
+  defp ctx(%{relay: relay, reader: reader}, params \\ %{}) do
+    %Context{
+      principal: %Principal{person: "A", kind: :device, key: reader},
+      relay: relay,
+      request_id: "req-1",
+      params: params
+    }
+  end
+
+  defp get(path, headers \\ []) do
+    Enum.reduce(headers, conn(:get, path), fn {k, v}, conn -> put_req_header(conn, k, v) end)
+    |> assign(:client_api_request_id, "req-1")
+  end
+
+  defp body(conn) do
+    assert {:ok, decoded} = JSON.decode_line(conn.resp_body <> "\n")
+    decoded
+  end
+
+  defp etag(conn), do: conn |> get_resp_header("etag") |> List.first()
+
+  test "a read answers 200 with an ETag, and 304 when the client already has it", ctx do
+    first = Reads.get_inbox(get("/v2/inbox?limit=2&unknown=1"), ctx(ctx))
+    assert first.status == 200
+    assert get_resp_header(first, "cache-control") == ["private, no-cache"]
+    assert %{"items" => [_, _], "next_page" => page} = body(first)
+    tag = etag(first)
+    assert tag == Reads.etag(body(first))
+
+    for header <- [tag, "W/" <> tag, ~s("other", #{tag}), "*"] do
+      again = Reads.get_inbox(get("/v2/inbox?limit=2", [{"if-none-match", header}]), ctx(ctx))
+      assert again.status == 304
+      assert again.resp_body == ""
+      assert etag(again) == tag
+    end
+
+    changed =
+      Reads.get_inbox(get("/v2/inbox?limit=2", [{"if-none-match", ~s("stale")}]), ctx(ctx))
+
+    assert changed.status == 200
+
+    rest = Reads.get_inbox(get("/v2/inbox?limit=2&page=" <> page), ctx(ctx))
+    assert %{"items" => [_]} = body(rest)
+    refute etag(rest) == tag
+  end
+
+  test "bad parameters answer the contract's error envelope", ctx do
+    bad = Reads.get_inbox(get("/v2/inbox?limit=0"), ctx(ctx))
+    assert bad.status == 400
+
+    assert body(bad) == %{
+             "error" => "invalid_field",
+             "field" => "limit",
+             "retryable" => false,
+             "request_id" => "req-1"
+           }
+
+    listed = Reads.get_inbox(get("/v2/inbox?limit[]=2"), ctx(ctx))
+    assert listed.status == 400
+
+    missing = Reads.get_item(get("/v2/items/i999"), ctx(ctx, %{item_id: "i999"}))
+    assert missing.status == 404
+    assert body(missing)["error"] == "not_found"
+
+    revoked = %{ctx(ctx) | principal: %Principal{person: "A", kind: :device, key: "gone"}}
+    assert Reads.get_settings(get("/v2/settings"), revoked).status == 401
+  end
+
+  test "items, entries, revisions and settings read through their routes", ctx do
+    %{"items" => items} = body(Reads.get_inbox(get("/v2/inbox"), ctx(ctx)))
+    one = Enum.find(items, &(&1["message"]["message_id"] == "one"))
+
+    item = Reads.get_item(get("/v2/items/x"), ctx(ctx, %{item_id: one["item_id"]}))
+    assert %{"item" => %{"item_id" => id}} = body(item)
+    assert id == one["item_id"]
+
+    entries =
+      Reads.get_entries(get("/v2/items/x/entries?limit=5"), ctx(ctx, %{item_id: id}))
+
+    assert %{"entries" => [], "older" => false} = body(entries)
+
+    revision =
+      Reads.get_revision(get("/v2/items/x/revisions/1"), ctx(ctx, %{item_id: id, n: "1"}))
+
+    assert %{"revision" => %{"request_revision" => 1}} = body(revision)
+
+    assert Reads.get_revision(get("/v2/items/x/revisions/2"), ctx(ctx, %{item_id: id, n: "2"})).status ==
+             404
+
+    settings = Reads.get_settings(get("/v2/settings"), ctx(ctx))
+    assert etag(settings) == Reads.etag(body(settings)["settings"])
+
+    unchanged =
+      Reads.get_settings(get("/v2/settings", [{"if-none-match", etag(settings)}]), ctx(ctx))
+
+    assert unchanged.status == 304
+  end
+
+  test "a file answers its bytes with its type and sha256 ETag", ctx do
+    %{"items" => items} = body(Reads.get_inbox(get("/v2/inbox"), ctx(ctx)))
+    [ref] = Enum.find(items, &(&1["message"]["message_id"] == "one"))["files"]
+    path = "/v2/files/" <> ref["file_id"]
+
+    file = Reads.get_file(get(path), ctx(ctx, %{file_id: ref["file_id"]}))
+    assert file.status == 200
+    assert file.resp_body == @bytes
+    assert get_resp_header(file, "content-type") == ["application/octet-stream"]
+    assert etag(file) == ~s("#{ref["sha256"]}")
+
+    cached =
+      Reads.get_file(
+        get(path, [{"if-none-match", etag(file)}]),
+        ctx(ctx, %{file_id: ref["file_id"]})
+      )
+
+    assert cached.status == 304
+    assert cached.resp_body == ""
+
+    missing = Reads.get_file(get("/v2/files/fx"), ctx(ctx, %{file_id: "fx"}))
+    assert missing.status == 404
+  end
+
+  test "the router serves the reads to an enrolled device", ctx do
+    opts = Router.init(relay: ctx.relay)
+
+    conn =
+      conn(:get, "/v2/inbox?limit=1")
+      |> put_peer_data(%{address: {127, 0, 0, 1}, port: 1, ssl_cert: ctx.der})
+      |> Router.call(opts)
+
+    assert conn.status == 200
+    assert [_request_id] = get_resp_header(conn, "request-id")
+    assert %{"items" => [%{"item_id" => _}], "next_page" => _, "rev" => rev} = body(conn)
+    assert rev > 0
+
+    stranger =
+      conn(:get, "/v2/inbox")
+      |> put_peer_data(%{address: {127, 0, 0, 1}, port: 1, ssl_cert: "not a certificate"})
+      |> Router.call(opts)
+
+    assert stranger.status == 401
+  end
+end

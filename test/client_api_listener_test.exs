@@ -439,8 +439,8 @@ defmodule AttentionServer.ClientAPIListenerTest do
     ctx = Map.put(ctx, :port, Server.port(server))
     assert {:ok, conn} = device_connect(ctx, "a1", :http2)
     assert {:ok, _conn, response} = request(conn, "GET", "/v2/inbox")
-    # No component has mounted routes yet.
-    assert response.status == 404
+    # The reads component serves /v2/inbox on the device port.
+    assert response.status == 200
     assert [_] = header(response, "request-id")
 
     assert {:ok, socket} = raw_connect(ctx.certs, ctx.port, "a1")
