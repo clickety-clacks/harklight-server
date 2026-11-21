@@ -8,6 +8,14 @@ defmodule AttentionServer.HeadlessDeviceV2Test do
 
   @handle "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 
+  @choices %{
+    "schema" => "attention-client.actions/1",
+    "actions" => [
+      %{"id" => "yes", "label" => "Yes", "kind" => "value", "value" => %{"pick" => "yes"}},
+      %{"id" => "reply", "label" => "Reply", "kind" => "text"}
+    ]
+  }
+
   setup_all do
     certs = TLSFixtures.create!()
     on_exit(fn -> File.rm_rf!(certs) end)
@@ -113,12 +121,84 @@ defmodule AttentionServer.HeadlessDeviceV2Test do
     assert read_json!(directory, "v2/cursor.json") == %{"rev" => rev}
   end
 
-  test "device respond over client API v2 refuses until it is available", ctx do
-    answer = Path.join(ctx.dir, "answer.json")
-    File.write!(answer, "null")
+  test "device respond answers once, storing its key and exact body before sending", ctx do
+    forward!(ctx.relay, "pick", 7, %{"message_type" => "request", "answer_ui" => @choices})
+    directory = ctx.identities["a1"]
+    answer = answer_file!(ctx.dir, %{"choice" => "yes"})
 
-    assert {:error, :client_api_v2_respond_unavailable} =
-             HeadlessDevice.respond(ctx.identities["a1"], ctx.endpoint, "app:test", "one", answer)
+    assert {:ok, %{"rev" => rev, "item" => item, "idempotency_key" => key, "replayed" => false}} =
+             HeadlessDevice.respond(directory, ctx.endpoint, "app:test", "pick", answer)
+
+    assert is_integer(rev)
+    assert %{"terminal" => %{"state" => "answered"}} = item
+    assert key =~ ~r/\A[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\z/
+
+    assert [saved] = Path.wildcard(Path.join([directory, "operations", "v2-*.json"]))
+    assert {:ok, stored} = JSON.decode_line(File.read!(saved))
+    assert stored["idempotency_key"] == key
+    assert stored["item_id"] == item["item_id"]
+    assert stored["body"] == %{"choice" => "yes", "request_revision" => 1}
+
+    # A retry of the same intent resends the same key and body: the stored outcome.
+    assert {:ok, %{"idempotency_key" => ^key, "replayed" => true, "rev" => ^rev}} =
+             HeadlessDevice.respond(directory, ctx.endpoint, "app:test", "pick", answer)
+
+    # A different answer is a new intent, refused because the request is settled.
+    other = answer_file!(ctx.dir, %{"comment" => "Actually no"}, "other.json")
+
+    assert {:error, {:server, %{"error" => "already_answered", "retryable" => false}}} =
+             HeadlessDevice.respond(directory, ctx.endpoint, "app:test", "pick", other)
+  end
+
+  test "device respond refuses what this device was not delivered", ctx do
+    forward!(ctx.relay, "pick", 7, %{"message_type" => "request", "answer_ui" => @choices})
+    answer = answer_file!(ctx.dir, %{})
+
+    assert {:error, :not_in_inbox} =
+             HeadlessDevice.respond(
+               ctx.identities["a1"],
+               ctx.endpoint,
+               "app:test",
+               "nope",
+               answer
+             )
+
+    assert {:error, :not_in_inbox} =
+             HeadlessDevice.respond(
+               ctx.identities["a1"],
+               ctx.endpoint,
+               "app:other",
+               "pick",
+               answer
+             )
+
+    assert {:error, :not_in_inbox} =
+             HeadlessDevice.respond(
+               ctx.identities["b1"],
+               ctx.endpoint,
+               "app:test",
+               "pick",
+               answer
+             )
+
+    assert Path.wildcard(Path.join([ctx.identities["a1"], "operations", "v2-*.json"])) == []
+  end
+
+  test "device respond takes only the contract's answer body", ctx do
+    forward!(ctx.relay, "pick", 7, %{"message_type" => "request", "answer_ui" => @choices})
+
+    for value <- [nil, "yes", %{"choice" => "yes", "comment" => "x"}, %{"note" => nil}] do
+      answer = answer_file!(ctx.dir, value)
+
+      assert {:error, :invalid_answer} =
+               HeadlessDevice.respond(
+                 ctx.identities["a1"],
+                 ctx.endpoint,
+                 "app:test",
+                 "pick",
+                 answer
+               )
+    end
   end
 
   test "the enrollment proof is one GET /v2/inbox with the approved key", ctx do
@@ -156,17 +236,22 @@ defmodule AttentionServer.HeadlessDeviceV2Test do
     refute AttentionServer.HeadlessTLS.client_api_v2?()
   end
 
-  defp forward!(relay, id, n) do
+  defp answer_file!(dir, value, name \\ "answer.json") do
+    path = Path.join(dir, name)
+    File.write!(path, JSON.encode!(value))
+    path
+  end
+
+  defp forward!(relay, id, n, extra \\ %{}) do
     frame = %{
       "type" => "forward",
       "op_id" => "00000000-0000-4000-8000-#{String.pad_leading(Integer.to_string(n), 12, "0")}",
       "session_handle" => @handle,
-      "message" => %{
-        "sender_id" => "app:test",
-        "message_id" => id,
-        "created_at" => n,
-        "title" => id
-      }
+      "message" =>
+        Map.merge(
+          %{"sender_id" => "app:test", "message_id" => id, "created_at" => n, "title" => id},
+          extra
+        )
     }
 
     assert {:ok, line} =

@@ -172,7 +172,18 @@ defmodule AttentionServer.HeadlessTLS do
   Returns the HTTP status and the decoded JSON body; the status is separate
   from application success.
   """
-  def v2_get(endpoint, {certificate, key}, path) do
+  def v2_get(endpoint, identity, path) do
+    with {:ok, status, _headers, value} <-
+           v2_request(endpoint, identity, "GET", path, [{"accept", "application/json"}], nil),
+         do: {:ok, status, value}
+  end
+
+  @doc """
+  One mutual-TLS client API v2 request over HTTP/1.1 with the device identity.
+  Returns the HTTP status, the response headers (lowercase names) and the
+  decoded JSON body.
+  """
+  def v2_request(endpoint, {certificate, key}, method, path, headers, body) do
     options = [
       hostname: endpoint.name,
       protocols: [:http1],
@@ -189,11 +200,10 @@ defmodule AttentionServer.HeadlessTLS do
 
     with {:ok, conn} <- Mint.HTTP.connect(:https, host(endpoint.address), endpoint.port, options) do
       try do
-        with {:ok, conn, ref} <-
-               mint(Mint.HTTP.request(conn, "GET", path, [{"accept", "application/json"}], nil)),
-             {:ok, status, body} <- v2_response(conn, ref, nil, []),
-             {:ok, value} <- JSON.decode_line(body <> "\n", @max_agent_http + 1) do
-          {:ok, status, value}
+        with {:ok, conn, ref} <- mint(Mint.HTTP.request(conn, method, path, headers, body)),
+             {:ok, status, response_headers, response} <- v2_response(conn, ref, nil, [], []),
+             {:ok, value} <- JSON.decode_line(response <> "\n", @max_agent_http + 1) do
+          {:ok, status, response_headers, value}
         else
           {:error, :response_too_large} = error -> error
           {:error, %{__exception__: true}} -> {:error, :connection_failed}
@@ -214,21 +224,31 @@ defmodule AttentionServer.HeadlessTLS do
   defp mint(other), do: other
 
   # No client-side deadline, as for the other tools.
-  defp v2_response(conn, ref, status, body) do
+  defp v2_response(conn, ref, status, headers, body) do
     case Mint.HTTP.recv(conn, 0, :infinity) do
       {:ok, conn, responses} ->
-        {status, body, done} =
-          Enum.reduce(responses, {status, body, false}, fn
-            {:status, ^ref, value}, {_, body, done} -> {value, body, done}
-            {:data, ^ref, data}, {status, body, done} -> {status, [body | data], done}
-            {:done, ^ref}, {status, body, _} -> {status, body, true}
-            _other, acc -> acc
+        {status, headers, body, done} =
+          Enum.reduce(responses, {status, headers, body, false}, fn
+            {:status, ^ref, value}, {_, headers, body, done} ->
+              {value, headers, body, done}
+
+            {:headers, ^ref, more}, {status, headers, body, done} ->
+              {status, headers ++ more, body, done}
+
+            {:data, ^ref, data}, {status, headers, body, done} ->
+              {status, headers, [body | data], done}
+
+            {:done, ^ref}, {status, headers, body, _} ->
+              {status, headers, body, true}
+
+            _other, acc ->
+              acc
           end)
 
         cond do
           IO.iodata_length(body) > @max_agent_http -> {:error, :response_too_large}
-          done and is_integer(status) -> {:ok, status, IO.iodata_to_binary(body)}
-          true -> v2_response(conn, ref, status, body)
+          done and is_integer(status) -> {:ok, status, headers, IO.iodata_to_binary(body)}
+          true -> v2_response(conn, ref, status, headers, body)
         end
 
       {:error, _conn, reason, _responses} ->

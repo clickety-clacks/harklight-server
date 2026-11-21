@@ -6,9 +6,12 @@ defmodule AttentionServer.HeadlessDevice do
   request's operation ID and exact JSON are stored before it is sent, so an
   uncertain network result can be retried with the same semantics.
 
-  With the temporary `client_api_v2` flag on (`endpoint.client_api_v2`), `read`
-  speaks client API v2 instead: it pages through `GET /v2/inbox`, stores every
-  item under `v2/`, and only then stores the cursor, the first page's `rev`.
+  With the temporary `client_api_v2` flag on (`endpoint.client_api_v2`), both
+  speak client API v2 instead. `read` pages through `GET /v2/inbox`, stores
+  every item under `v2/`, and only then stores the cursor, the first page's
+  `rev`. `respond` resolves `--sender`/`--message-id` to the item delivered to
+  this device, stores the exact answer body with a fresh `Idempotency-Key`,
+  and only then sends `POST /v2/items/{item_id}/answer`.
   """
 
   import Bitwise
@@ -35,9 +38,61 @@ defmodule AttentionServer.HeadlessDevice do
     end)
   end
 
-  # Client API v2 respond lands in a later slice; never fall back to /relay.
-  def respond(_directory, %{client_api_v2: true}, _sender, _message_id, _answer_file),
-    do: {:error, :client_api_v2_respond_unavailable}
+  # The answer file over client API v2 is the contract's AnswerBody: an object
+  # with at most one of choice, comment and result, and optionally
+  # request_revision. `{}` answers with no comment.
+  @v2_answer_members ~w(request_revision choice comment result)
+
+  def respond(directory, %{client_api_v2: true} = endpoint, sender, message_id, answer_file) do
+    identity = {Path.join(directory, "identity.pem"), Path.join(directory, "identity.key")}
+
+    with :ok <- existing_private_directory(directory),
+         {:ok, answer} <- read_document(answer_file),
+         :ok <- v2_answer_body(answer),
+         {:ok, _} <- enrolled_identity(directory, endpoint),
+         {:ok, saved} <-
+           v2_saved_answer(directory, endpoint, %{
+             "sender_id" => sender,
+             "message_id" => message_id,
+             "answer" => answer
+           }) do
+      path = "/v2/items/" <> URI.encode(saved["item_id"], &URI.char_unreserved?/1) <> "/answer"
+
+      headers = [
+        {"accept", "application/json"},
+        {"content-type", "application/json"},
+        {"idempotency-key", saved["idempotency_key"]}
+      ]
+
+      case HeadlessTLS.v2_request(
+             endpoint,
+             identity,
+             "POST",
+             path,
+             headers,
+             JSON.encode!(saved["body"])
+           ) do
+        {:ok, status, response_headers, %{"rev" => rev} = result}
+        when status in [200, 201] and is_integer(rev) ->
+          {:ok,
+           result
+           |> Map.put("idempotency_key", saved["idempotency_key"])
+           |> Map.put(
+             "replayed",
+             {"idempotent-replayed", "true"} in response_headers
+           )}
+
+        {:ok, _status, _headers, %{"error" => token} = error} when is_binary(token) ->
+          {:error, {:server, error}}
+
+        {:ok, _status, _headers, _body} ->
+          {:error, :invalid_v2_response}
+
+        error ->
+          error
+      end
+    end
+  end
 
   def respond(directory, endpoint, sender, message_id, answer_file) do
     with :ok <- existing_private_directory(directory),
@@ -121,6 +176,74 @@ defmodule AttentionServer.HeadlessDevice do
     case body["next_page"] do
       next when is_binary(next) -> v2_inbox(endpoint, identity, limit, next, first_rev, items)
       _ -> {:ok, first_rev, items}
+    end
+  end
+
+  defp v2_answer_body(answer) when is_map(answer) do
+    chosen = Enum.count(~w(choice comment result), &Map.has_key?(answer, &1))
+
+    if Enum.all?(Map.keys(answer), &(&1 in @v2_answer_members)) and chosen <= 1,
+      do: :ok,
+      else: {:error, :invalid_answer}
+  end
+
+  defp v2_answer_body(_answer), do: {:error, :invalid_answer}
+
+  # The exact request is stored, with its Idempotency-Key, before the first
+  # send. A retry of the same sender, message and answer file reuses it as is,
+  # so an uncertain result is resent with the same key and body.
+  defp v2_saved_answer(directory, endpoint, semantic) do
+    digest = hex(:crypto.hash(:sha256, JSON.encode!(semantic)))
+    path = Path.join([directory, "operations", "v2-" <> digest <> ".json"])
+
+    with :ok <- private_directory(Path.dirname(path)) do
+      case read_json(path) do
+        {:ok,
+         %{"request" => ^semantic, "item_id" => id, "body" => body, "idempotency_key" => key} =
+             saved}
+        when is_binary(id) and is_map(body) and is_binary(key) ->
+          {:ok, saved}
+
+        {:error, :enoent} ->
+          with {:ok, item} <- v2_resolve(directory, endpoint, semantic) do
+            saved = %{
+              "request" => semantic,
+              "item_id" => item["item_id"],
+              "body" =>
+                Map.put_new(semantic["answer"], "request_revision", item["request_revision"]),
+              "idempotency_key" => uuid_v4()
+            }
+
+            case write_private(path, saved, :new) do
+              :ok -> {:ok, saved}
+              {:error, :eexist} -> v2_saved_answer(directory, endpoint, semantic)
+              other -> other
+            end
+          end
+
+        _ ->
+          {:error, :operation_conflict}
+      end
+    end
+  end
+
+  # The item the sender's message became, as delivered to this device: a fresh
+  # read, matched by sender and the message's own message_id. As today, an item
+  # this device originated (no `as`) is not answered; the server authorizes
+  # everything else.
+  defp v2_resolve(directory, endpoint, %{"sender_id" => sender, "message_id" => id}) do
+    with {:ok, %{"items" => items}} <- v2_read(directory, endpoint) do
+      case Enum.find(items, fn item ->
+             item["sender"] == sender and get_in(item, ["message", "message_id"]) == id and
+               Map.has_key?(item, "as")
+           end) do
+        %{"item_id" => item_id, "request_revision" => revision} = item
+        when is_binary(item_id) and is_integer(revision) ->
+          {:ok, item}
+
+        _ ->
+          {:error, :not_in_inbox}
+      end
     end
   end
 
