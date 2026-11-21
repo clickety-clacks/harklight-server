@@ -164,7 +164,7 @@ defmodule AttentionServer.ClientAPI.Reads do
   def respond(conn, result, etag_of \\ &etag/1)
 
   def respond(conn, {:ok, body}, etag_of) do
-    tag = etag_of.(body)
+    tag = Projection.run(Projection.response_key(body), fn -> etag_of.(body) end)
 
     conn =
       conn

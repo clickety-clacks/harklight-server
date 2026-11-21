@@ -41,6 +41,12 @@ defmodule AttentionServer.ClientAPI.Projection do
   def change_key(%{"item_id" => id}), do: {:item, id}
   def change_key(_), do: :change
 
+  def response_key(%{"entry" => entry}), do: change_key(entry)
+  def response_key(%{"item" => item}), do: change_key(item)
+  def response_key(%{"message" => %{"item_id" => _} = message}), do: change_key(message)
+  def response_key(%{"settings" => _}), do: :settings
+  def response_key(_body), do: :response
+
   defp safe_key({kind, id}) when kind in [:item, :entry] and is_binary(id) do
     if byte_size(id) <= 32 and Regex.match?(~r/\A[ie][0-9]+\z/, id),
       do: "#{kind}:#{id}",

@@ -111,9 +111,11 @@ defmodule AttentionServer.ClientAPI.Errors do
   @doc "Send a JSON body with `status`."
   @spec send_json(Plug.Conn.t(), pos_integer(), map()) :: Plug.Conn.t()
   def send_json(conn, status, body) when is_map(body) do
+    encoded = Projection.run(Projection.response_key(body), fn -> JSON.encode!(body) end)
+
     conn
     |> put_resp_content_type("application/json", "utf-8")
-    |> send_resp(status, JSON.encode!(body))
+    |> send_resp(status, encoded)
   end
 
   def projection_error(conn, %Projection{} = fault) do
