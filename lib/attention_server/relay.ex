@@ -1743,6 +1743,11 @@ defmodule AttentionServer.Relay do
     end
   end
 
+  # Client API v2 modules run in the relay's serialized step, so a response and
+  # the change-log position it reports come from one state.
+  defp dispatch_call({:client_api, handler, request}, from, state) when is_atom(handler),
+    do: handler.handle_call(request, from, state)
+
   defp dispatch_call({:view_show, key, request}, _from, state) do
     {result, next} = handle_view_show(state, key, request)
     {:reply, result, next}
