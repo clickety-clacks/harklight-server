@@ -15,7 +15,7 @@ defmodule AttentionServer.ClientAPI.Focus do
   Shows are `{show_id, device_id, item_id, target, held_ms}`, where `held_ms`
   is the show's age when it is written.
 
-  The feed (C5) calls `subscribe_shows/1` for a device principal and then
+  The feed (C5) calls `subscribe_shows/2` for a device principal and then
   receives `{:client_api_show, device_key}` whenever a show is held for it.
   The feed reads the current held show from the relay just before writing
   the id-less event, when it computes the show's age (round 11 r4 §4).
@@ -26,9 +26,9 @@ defmodule AttentionServer.ClientAPI.Focus do
   @registry AttentionServer.ChangeLog.Registry
 
   @doc "Subscribes the calling feed process to shows held for `device_key`."
-  @spec subscribe_shows(String.t()) :: :ok
-  def subscribe_shows(device_key) when is_binary(device_key) do
-    case Registry.register(@registry, {:client_api_show, device_key}, nil) do
+  @spec subscribe_shows(String.t(), atom()) :: :ok
+  def subscribe_shows(device_key, protocol) when is_binary(device_key) do
+    case Registry.register(@registry, {:client_api_show, device_key}, protocol) do
       {:ok, _} -> :ok
       {:error, {:already_registered, _}} -> :ok
     end
@@ -52,7 +52,9 @@ defmodule AttentionServer.ClientAPI.Focus do
   @doc false
   # Offer the exact held show to one writer. The HTTP request owns the wait.
   def offer_show(device_key, show_id, result_ref) do
-    case Enum.find(show_writers(device_key), fn {pid, _} -> Process.alive?(pid) end) do
+    case Enum.find(show_writers(device_key), fn {pid, protocol} ->
+           protocol == :"HTTP/2" and Process.alive?(pid)
+         end) do
       {pid, _} ->
         send(pid, {:client_api_show, device_key, show_id, result_ref})
         pid
@@ -69,11 +71,16 @@ defmodule AttentionServer.ClientAPI.Focus do
   end
 
   @doc "Reads the current held show for an authenticated device with an active focus report."
-  def pending_show(relay, principal),
-    do: GenServer.call(relay, {:client_api, __MODULE__, {:pending_show, principal}}, :infinity)
+  def pending_show(relay, principal, protocol \\ :"HTTP/2"),
+    do:
+      GenServer.call(
+        relay,
+        {:client_api, __MODULE__, {:pending_show, principal, protocol}},
+        :infinity
+      )
 
   @doc false
-  def handle_call({:pending_show, principal}, _from, state) do
+  def handle_call({:pending_show, principal, protocol}, _from, state) do
     engine = state.store.engine
 
     data =
@@ -82,7 +89,8 @@ defmodule AttentionServer.ClientAPI.Focus do
           # Ending focus stops live delivery while leaving the show held for
           # the device's next accepted focus report.
           with %{client_api_token: _} <- Map.get(state.focus_clients, key),
-               %{} = held <- Map.get(state.held_shows, key) do
+               %{} = held <- Map.get(state.held_shows, key),
+               true <- protocol == :"HTTP/2" or not Map.has_key?(held, "show_id") do
             show(engine, key, held, state.clock.())
           else
             _ -> nil

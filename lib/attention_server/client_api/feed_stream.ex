@@ -74,7 +74,7 @@ defmodule AttentionServer.ClientAPI.FeedStream do
   defp open(conn, ctx, cursor, watcher, source) do
     case source.read(ctx, cursor, @page) do
       {:ok, changes, more, position} ->
-        subscribe_shows(ctx.principal, source)
+        subscribe_shows(conn, ctx.principal, source)
         conn = start_stream(conn)
 
         send(watcher, {:feed_opened, self()})
@@ -253,8 +253,10 @@ defmodule AttentionServer.ClientAPI.FeedStream do
   end
 
   # Shows are held per device; a browser has none.
-  defp subscribe_shows(%{kind: :device, key: key}, FeedStep), do: Focus.subscribe_shows(key)
-  defp subscribe_shows(_principal, _source), do: :ok
+  defp subscribe_shows(conn, %{kind: :device, key: key}, FeedStep),
+    do: Focus.subscribe_shows(key, get_http_protocol(conn))
+
+  defp subscribe_shows(_conn, _principal, _source), do: :ok
 
   defp unsubscribe_shows(%{kind: :device, key: key}, FeedStep), do: Focus.unsubscribe_shows(key)
   defp unsubscribe_shows(_principal, _source), do: :ok
@@ -273,7 +275,7 @@ defmodule AttentionServer.ClientAPI.FeedStream do
   end
 
   defp write_pending_show(conn, state, expected_id, reply_ref) do
-    case pending_show(state.ctx) do
+    case pending_show(conn, state.ctx) do
       %{"show_id" => id} = data
       when id != state.last_show_id and (is_nil(expected_id) or id == expected_id) ->
         event = ["event: show\ndata: ", JSON.encode!(data), "\n\n"]
@@ -307,8 +309,8 @@ defmodule AttentionServer.ClientAPI.FeedStream do
   defp show_result(nil, _result), do: :ok
   defp show_result(ref, result), do: send(ref, {ref, result})
 
-  defp pending_show(ctx) do
-    Focus.pending_show(ctx.relay, ctx.principal)
+  defp pending_show(conn, ctx) do
+    Focus.pending_show(ctx.relay, ctx.principal, get_http_protocol(conn))
   catch
     :exit, _reason -> {:error, :server_shutdown}
   end

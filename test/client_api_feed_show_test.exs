@@ -141,6 +141,8 @@ defmodule AttentionServer.ClientAPIFeedShowTest do
   end
 
   defmodule PausedStream do
+    def get_http_protocol(_), do: :"HTTP/2"
+
     def send_chunked(test, 200, _headers) do
       send(test, {:stream_paused, self()})
 
@@ -441,6 +443,8 @@ defmodule AttentionServer.ClientAPIFeedShowTest do
   end
 
   defmodule ControlledShowStream do
+    def get_http_protocol(_), do: :"HTTP/2"
+
     def send_chunked({test, _} = opts, 200, _headers) do
       send(test, {:controlled_open, self()})
       {:ok, "", opts}
@@ -699,6 +703,33 @@ defmodule AttentionServer.ClientAPIFeedShowTest do
 
         collect_show_pair(conn, first, second, responses)
     end
+  end
+
+  test "an HTTP/1.1 feed leaves the agent show pending for the next focus write", ctx do
+    heartbeat_fast()
+    reader = connect(ctx.port, ctx.certs, "a1", :http1)
+    assert Mint.HTTP.protocol(reader) == :http1
+    {reader, feed} = open_feed(reader, "?after=#{head(ctx.relay)}")
+    {reader, feed} = await_open(reader, feed)
+    assert feed.status == 200
+
+    response = Task.await(show_in_request(ctx))
+    assert response.status == 200
+    assert %{"state" => "held", "show_id" => id} = body(response)
+    {reader, _feed, observed} = events(reader, feed, 3)
+    assert Enum.all?(observed, &(&1 == %{event: "heartbeat", data: %{}}))
+
+    focus = connect(ctx.port, ctx.certs, "a1", :http1)
+    report = JSON.encode!(%{"screen" => "inbox", "ttl_s" => 120})
+
+    assert {:ok, focus, ref} =
+             Mint.HTTP.request(focus, "PUT", "/v2/devices/me/focus", [], report)
+
+    {focus, focused} = collect(focus, ref)
+    assert focused.status == 200
+    assert %{"show" => %{"show_id" => ^id, "target" => "chat"}} = body(focused)
+    Mint.HTTP.close(focus)
+    Mint.HTTP.close(reader)
   end
 
   defp show_request(conn, key, request) do
