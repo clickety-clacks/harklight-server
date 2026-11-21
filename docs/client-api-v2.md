@@ -109,8 +109,8 @@ Schemas use JSON Schema 2020-12. `$ref`s point into the `$defs` below.
         "read_position": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/OpaqueId" }], "description": "entry_id read through" },
         "last_origin_reply": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/OpaqueId" }], "description": "entry_id of the newest origin reply" },
         "unread_replies": { "type": "integer", "minimum": 0, "description": "Agent replies after the person's read position, computed by the server" },
-        "reply_group": { "enum": ["earlier_chat_replies", "earlier_chat_replies_unknown"], "description": "Present only while unread_replies > 0: today's verified or unknown reply row" },
-        "reply_rank_key": { "type": "string", "description": "Present only while unread_replies > 0: where the reply row sorts, in Rank.key's space" }
+        "reply_group": { "enum": ["earlier_chat_replies", "earlier_chat_replies_unknown"], "description": "Present whenever the item has at least one agent chat reply, even when unread_replies is 0: today's verified or unknown reply row" },
+        "reply_rank_key": { "type": "string", "description": "Present whenever reply_group is: where the reply row sorts, in Rank.key's space" }
       }
     },
 
@@ -147,9 +147,10 @@ Schemas use JSON Schema 2020-12. `$ref`s point into the `$defs` below.
 
     "OriginResult": {
       "type": "object",
+      "description": "An origin result. Item.result is the latest; each result fact is also a result Entry.",
       "required": ["status", "revision"],
       "properties": {
-        "status": { "type": "string" },
+        "status": { "enum": ["received", "applied", "refused"] },
         "result_ref": { "type": "string" },
         "revision": { "type": "integer", "minimum": 1 }
       }
@@ -175,7 +176,7 @@ Schemas use JSON Schema 2020-12. `$ref`s point into the `$defs` below.
         "item_id": { "$ref": "#/$defs/OpaqueId" },
         "rev": { "$ref": "#/$defs/Rev" },
         "position": { "type": "integer", "minimum": 1, "description": "Creation order within the item; unique per item and never changes" },
-        "kind": { "enum": ["reply", "lifecycle", "revision", "availability"], "description": "lifecycle is only the origin's retraction fact; a revision entry (request revision 2 and later) marks that a revision happened. The answer outcome is Item.terminal, not an entry." },
+        "kind": { "enum": ["reply", "lifecycle", "revision", "availability", "result"], "description": "lifecycle is only the origin's retraction fact; a revision entry (request revision 2 and later) marks that a revision happened; a result entry is one origin result fact. The answer outcome is Item.terminal, not an entry." },
         "author": { "enum": ["person", "origin", "server"] },
         "at_ms": { "$ref": "#/$defs/TimeMs", "description": "Absent on entries from before the cut-over; every entry created by 0.2 carries it" },
         "request_revision": { "type": "integer", "minimum": 1 },
@@ -184,6 +185,7 @@ Schemas use JSON Schema 2020-12. `$ref`s point into the `$defs` below.
         "in_reply_to": { "$ref": "#/$defs/OpaqueId" },
         "state": { "enum": ["active", "withdrawn", "retracted"], "description": "A withdrawal or retraction is an upsert of this member; entries are never removed" },
         "availability": { "$ref": "#/$defs/Availability" },
+        "result": { "$ref": "#/$defs/OriginResult", "description": "On result entries" },
         "delivery": {
           "type": "object",
           "description": "Receipts for a person-authored entry, folded in from today's receipt facts",
@@ -377,7 +379,13 @@ Schemas use JSON Schema 2020-12. `$ref`s point into the `$defs` below.
   rendering of the item's chat state: while `Chat.unread_replies > 0`, the
   item carries `Chat.reply_group` (today's verified or unknown reply row) and
   `Chat.reply_rank_key`, which places the reply row among item rows in
-  `Rank.key`'s space, exactly as today.
+  `Rank.key`'s space, exactly as today. Both are present whenever the item has
+  at least one agent chat reply, even when all are read: clients keep their
+  own row rules, and the Replied tab draws all of them.
+- **Results.** `Item.result` is the latest origin result. Each result fact is
+  also an Entry of kind `result`, with its own `position`, so the thread keeps
+  its status turns. `status` is today's closed list: `received`, `applied`,
+  `refused`.
 - **Files.** A file uploaded through `POST /v2/files` is served with the
   `Content-Type` it was sent with. Files attached inline before the cut-over
   are served as `application/octet-stream`.
@@ -744,5 +752,9 @@ applied as well. Round 4 wins where rounds conflict:
   `Chat.reply_rank_key` (rounds 5 and 6).
 - **Compacted log:** §6.1.
 - **Push payload:** §6.2.
+- **Round 7:**
+  - reply-row fields are present whenever the item has an agent chat reply;
+  - `Item.result` is the latest result, and each result fact is also a
+    `result` entry. This supersedes round 4 item 2 for results.
 
 No questions are open.
