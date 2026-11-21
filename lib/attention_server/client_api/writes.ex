@@ -36,6 +36,7 @@ defmodule AttentionServer.ClientAPI.Writes do
     Context,
     Errors,
     FeedRenderer,
+    Focus,
     Idempotency,
     Reads,
     Resources,
@@ -56,7 +57,8 @@ defmodule AttentionServer.ClientAPI.Writes do
       {"PUT", ["settings", "priority-levels"], :put_priority_levels},
       {"PUT", ["devices", "me", "push"], :put_push},
       {"DELETE", ["devices", "me", "push"], :delete_push},
-      {"POST", ["files"], :post_files}
+      {"POST", ["files"], :post_files},
+      {"PUT", ["devices", "me", "focus"], :put_focus}
     ]
   end
 
@@ -180,7 +182,32 @@ defmodule AttentionServer.ClientAPI.Writes do
     end
   end
 
+  @doc false
+  def put_focus(conn, %Context{} = ctx) do
+    with :ok <- device_only(ctx.principal),
+         {:ok, _key} <- optional_key(conn),
+         {:ok, body, conn} <- json_body(conn),
+         {:ok, report} <- focus_report(body) do
+      respond(conn, focus(ctx.relay, ctx.principal, report))
+    else
+      {:error, token, field, conn} -> Errors.send_error(conn, token, field: field)
+      {:error, token, field} -> Errors.send_error(conn, token, field: field)
+    end
+  end
+
   ## Writes, called outside the relay process
+
+  @doc """
+  `PUT /v2/devices/me/focus`: today's focus report for this device. `report`
+  has `"screen"`, `"ttl_s"` and, as today's screens need them, `"item_id"` and
+  `"visible_entry_id"`. Answers `{rev, show?}` with the device's held show.
+  """
+  def focus(relay, who, report) do
+    case focus_report(report) do
+      {:ok, report} -> result(call(relay, {:focus, who, report}), false)
+      {:error, token, field} -> {:error, token, field, false}
+    end
+  end
 
   @doc "`POST /v2/items/{item_id}/seen`: mark the item's current revision Seen."
   def seen(relay, who, item_id, idempotency_key) do
@@ -440,6 +467,38 @@ defmodule AttentionServer.ClientAPI.Writes do
       end
 
     {:reply, reply, state}
+  end
+
+  def handle_call({:focus, who, report}, _from, state) do
+    engine = state.store.engine
+
+    with {:ok, principal} <- principal(engine, who),
+         :ok <- if(principal.kind == :device, do: :ok, else: {:error, :forbidden}),
+         {:ok, position} <- position(state, principal.person),
+         {:ok, reported} <- reported_focus(engine, principal.person, report) do
+      key = principal.engine_key
+
+      {held, next} =
+        if report["screen"] == "signed_out" do
+          AttentionServer.Relay.client_api_focus(state, {:signed_out, key})
+        else
+          token = make_ref()
+          result = AttentionServer.Relay.client_api_focus(state, {:report, key, reported, token})
+          :ok = Focus.schedule_lapse(self(), key, token, report["ttl_s"] * 1000)
+          result
+        end
+
+      show = held && Focus.show(engine, key, held, state.clock.())
+      body = if show, do: %{"rev" => position, "show" => show}, else: %{"rev" => position}
+      {:reply, {:ok, 200, body}, next}
+    else
+      error -> {:reply, error, state}
+    end
+  end
+
+  def handle_call({:focus_lapse, key, token}, _from, state) do
+    {nil, next} = AttentionServer.Relay.client_api_focus(state, {:lapse, key, token})
+    {:reply, :ok, next}
   end
 
   def handle_call({:begin, who, key, digest, operation}, _from, state) do
@@ -1052,6 +1111,86 @@ defmodule AttentionServer.ClientAPI.Writes do
 
       {:error, _} ->
         {:error, "invalid_field", nil, conn}
+    end
+  end
+
+  @focus_screens ~w(inbox message chat settings signed_out not_in_front)
+
+  # Today's focus_report shape rules (focus spec r6 V2), with item_id for the
+  # pair and visible_entry_id for visible_event_id.
+  defp focus_report(body) do
+    screen = body["screen"]
+    pair? = screen in ["message", "chat"]
+
+    cond do
+      member = Enum.find(Map.keys(body), &(&1 not in ~w(screen item_id visible_entry_id ttl_s))) ->
+        {:error, "invalid_field", member}
+
+      screen not in @focus_screens ->
+        {:error, "invalid_field", "screen"}
+
+      pair? and not (is_binary(body["item_id"]) and body["item_id"] != "") ->
+        {:error, "invalid_field", "item_id"}
+
+      not pair? and Map.has_key?(body, "item_id") ->
+        {:error, "invalid_field", "item_id"}
+
+      Map.has_key?(body, "visible_entry_id") and
+          not (screen == "chat" and is_binary(body["visible_entry_id"])) ->
+        {:error, "invalid_field", "visible_entry_id"}
+
+      not (is_integer(body["ttl_s"]) and body["ttl_s"] in 1..3600) ->
+        {:error, "invalid_field", "ttl_s"}
+
+      true ->
+        {:ok, body}
+    end
+  end
+
+  # The report in today's identifiers, which the origin focus APIs read.
+  defp reported_focus(engine, person, report) do
+    base = %{"screen" => report["screen"]}
+
+    case report["item_id"] do
+      nil ->
+        {:ok, base}
+
+      item_id ->
+        with {:ok, {_person, sender, message_id} = message_key} <-
+               item_or_invalid(engine, person, item_id),
+             {:ok, visible} <- visible_event(engine, person, message_key, report) do
+          base
+          |> Map.merge(%{"sender_id" => sender, "message_id" => message_id})
+          |> then(&if(visible, do: Map.put(&1, "visible_event_id", visible), else: &1))
+          |> then(&{:ok, &1})
+        end
+    end
+  end
+
+  defp item_or_invalid(engine, person, item_id) do
+    case Resources.item_key(engine, person, item_id) do
+      {:ok, key} -> {:ok, key}
+      _ -> {:error, :invalid_field, "item_id"}
+    end
+  end
+
+  defp visible_event(engine, person, message_key, %{"visible_entry_id" => entry_id}) do
+    with {:ok, seq} <- Resources.entry_seq(entry_id),
+         %{key: ^message_key, payload: %{"event_id" => event_id}} when is_binary(event_id) <-
+           Map.get(engine.conversation_events, {person, seq}) do
+      {:ok, event_id}
+    else
+      _ -> {:error, :invalid_field, "visible_entry_id"}
+    end
+  end
+
+  defp visible_event(_engine, _person, _message_key, _report), do: {:ok, nil}
+
+  defp position(state, person) do
+    case ChangeLog.head(state.store, person) do
+      {:ok, head} -> {:ok, head}
+      {:error, :disabled} -> {:error, :not_found}
+      _ -> {:error, :storage_unavailable}
     end
   end
 
