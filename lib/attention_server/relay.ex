@@ -7544,6 +7544,51 @@ defmodule AttentionServer.Relay do
     if person, do: notify_focus_streams(next, person), else: next
   end
 
+  @doc false
+  # Client API v2 focus (contract rulings round 11): today's focus report,
+  # carried by PUT /v2/devices/me/focus instead of a session, and kept in
+  # memory only, as today. Called only by ClientAPI.Focus inside the relay
+  # step, so with client_api_v2 off it never runs. A report applies today's
+  # reported_at rule and focus notices, and takes the device's held show; a
+  # lapse of its ttl, or signed_out, ends focus as today's disconnect does.
+  # Returns {held_show | nil, state}.
+  def client_api_focus(state, {:report, key, reported, token}) do
+    now = state.clock.()
+    person = person_for_device(state.store.engine, key)
+    existing = Map.get(state.focus_clients, key)
+    changed = is_nil(existing) or focus_fields(existing) != reported
+
+    reported_at =
+      cond do
+        is_nil(existing) -> now
+        changed and reported["screen"] in ["inbox", "message", "chat", "settings"] -> now
+        true -> existing.reported_at
+      end
+
+    focus =
+      reported
+      |> Map.new(fn {name, value} -> {String.to_existing_atom(name), value} end)
+      |> Map.merge(%{reported_at: reported_at, person: person, connected: true})
+      |> Map.put(:client_api_token, token)
+
+    next = put_focus_client(state, key, focus)
+    next = if person, do: notify_focus_change(state, next, person), else: next
+
+    case Map.pop(next.held_shows, key) do
+      {nil, _shows} -> {nil, next}
+      {held, shows} -> {held, %{next | held_shows: shows}}
+    end
+  end
+
+  def client_api_focus(state, {:signed_out, key}), do: {nil, end_focus(state, key)}
+
+  def client_api_focus(state, {:lapse, key, token}) do
+    case Map.get(state.focus_clients, key) do
+      %{client_api_token: ^token} -> {nil, end_focus(state, key)}
+      _ -> {nil, state}
+    end
+  end
+
   defp focus_report_request(state, id, session, frame) do
     case envelope_error(frame) || focus_report_error(frame) do
       {reason, field} ->
@@ -7748,6 +7793,13 @@ defmodule AttentionServer.Relay do
   defp hold_show(state, _agent_key, client, show) do
     held = Map.put(show, "accepted_at", state.clock.())
     next = %{state | held_shows: Map.put(state.held_shows, client["client_id"], held)}
+
+    AttentionServer.ClientAPI.Focus.held(
+      state.store.engine,
+      client["client_id"],
+      held,
+      state.clock.()
+    )
 
     {{:ok,
       %{
