@@ -138,6 +138,18 @@ defmodule AttentionServer.Store.LegacyRevisionUploadsTest do
     assert :ok = Store.close(store)
   end
 
+  test "refused explicit conversion preserves files scheduled for open cleanup", %{
+    path: path,
+    file_path: file_path
+  } do
+    File.write!(file_path, <<0, 17, 250, 98>>)
+    orphan = Path.join(Path.dirname(file_path), String.duplicate("f", 64))
+    File.write!(orphan, "orphan")
+
+    assert Store.open(path, :keyed_cutover) == {:error, :retained_upload_unavailable}
+    assert File.read(orphan) == {:ok, "orphan"}
+  end
+
   defp open_revision_only(path) do
     assert {:ok, store} = Store.open(path)
     assert {:ok, store} = Store.commit(store, revision_only(store.engine), audit())
