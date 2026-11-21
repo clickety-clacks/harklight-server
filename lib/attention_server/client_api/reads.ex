@@ -487,14 +487,16 @@ defmodule AttentionServer.ClientAPI.Reads do
   # a feed batch or repeated reads of unchanged state compute them once. The
   # comparison is by identity in practice: an unchanged state is the same
   # term. Stored ranks from the change log replace this (review finding F5).
+  #
+  # One slot for the whole relay, so it holds at most one earlier engine.
   defp memo_ranks(engine, person, view, previous) do
-    case Process.get({__MODULE__, :ranks, person}) do
-      {^engine, ^view, ranks} ->
+    case Process.get({__MODULE__, :ranks}) do
+      {^person, ^engine, ^view, ranks} ->
         ranks
 
       _ ->
         ranks = Resources.ranks(engine, person, view, previous.())
-        Process.put({__MODULE__, :ranks, person}, {engine, view, ranks})
+        Process.put({__MODULE__, :ranks}, {person, engine, view, ranks})
         ranks
     end
   end

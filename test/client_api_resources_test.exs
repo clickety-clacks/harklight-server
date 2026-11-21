@@ -688,6 +688,72 @@ defmodule AttentionServer.ClientAPIResourcesTest do
       assert %{"state" => "answered", "answer" => %{"kind" => "seen"}} = item["terminal"]
       GenServer.stop(relay)
     end
+
+    test "an answer through another value action shows answer kind choice with its id and label",
+         %{path: path} do
+      relay = scripted_relay(path)
+
+      forward(relay, "deploy", 72, %{
+        "answer_ui" => %{
+          "schema" => "attention-client.actions/1",
+          "actions" => [
+            %{
+              "id" => "go",
+              "label" => "Deploy",
+              "kind" => "value",
+              "value" => %{"deploy" => true}
+            },
+            %{
+              "id" => "stop",
+              "label" => "Hold",
+              "kind" => "value",
+              "value" => %{"deploy" => false}
+            }
+          ]
+        }
+      })
+
+      assert %{"type" => "ok"} =
+               request(relay, "reader", %{
+                 "type" => "answer",
+                 "op_id" => op(73),
+                 "sender_id" => "app:test",
+                 "message_id" => "deploy",
+                 "answer" => %{"deploy" => false}
+               })
+
+      {engine, view} = snapshot(relay)
+      item = rendered_items(engine, view, "reader")[key("deploy")]
+
+      assert item["terminal"]["answer"] == %{
+               "kind" => "choice",
+               "id" => "stop",
+               "label" => "Hold"
+             }
+
+      defs = Schema.contract_defs(@contract)
+      assert Schema.errors(defs, "Item", item) == []
+      GenServer.stop(relay)
+    end
+  end
+
+  describe "rank level" do
+    test "Rank carries today's display level wherever the view entry has one", %{path: path} do
+      relay = scripted_relay(path)
+      forward(relay, "urgent", 74, %{"urgency" => "now"})
+      {engine, view} = snapshot(relay)
+      items = rendered_items(engine, view, "reader")
+      assert items[key("urgent")]["rank"]["level"] == "now"
+
+      for {{_, _, id}, item} <- items do
+        case view.message_entries_by_identity[{"app:test", id}] do
+          %{"priority" => level} -> assert item["rank"]["level"] == level
+          _ -> refute Map.has_key?(item["rank"], "level")
+        end
+      end
+
+      GenServer.stop(relay)
+    end
   end
 
   describe "availability entries" do

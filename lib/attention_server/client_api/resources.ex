@@ -24,7 +24,7 @@ defmodule AttentionServer.ClientAPI.Resources do
   This module reads engine state only. It never changes it.
   """
 
-  alias AttentionServer.{BounceDecision, Conversation, Engine, LargeData, Message, Placement}
+  alias AttentionServer.{BounceDecision, Conversation, Engine, LargeData, Message}
 
   @viewer "_viewer"
   @sources "_sources"
@@ -420,26 +420,36 @@ defmodule AttentionServer.ClientAPI.Resources do
       {_, "answer", true, nil} ->
         %{"kind" => "seen"}
 
-      {_, "answer", true, answer} when is_binary(answer) ->
-        %{"kind" => "reply", "text" => answer}
+      {_, "answer", true, answer} ->
+        # An answer through one of the item's value actions stores that
+        # action's value. The Seen action is seen; any other is the choice,
+        # named by the action (contract round 15). Otherwise text is a reply.
+        case value_action(record.message, answer) do
+          %{"id" => "seen"} ->
+            %{"kind" => "seen"}
 
-      {_, "answer", true, %LargeData.Ref{} = answer} ->
-        %{"kind" => "reply", "text" => answer}
+          %{"id" => id} = action when is_binary(id) ->
+            put_present(%{"kind" => "choice", "id" => id}, "label", text_or_nil(action["label"]))
 
-      # A Seen answer stores the Seen action's value, which today's outcome
-      # has no case for; the contract's outcome for it is seen.
-      {_, "answer", true, %{} = answer} ->
-        if seen_value?(record.message, answer), do: %{"kind" => "seen"}
+          nil when is_binary(answer) or is_struct(answer, LargeData.Ref) ->
+            %{"kind" => "reply", "text" => answer}
+
+          nil ->
+            nil
+        end
 
       _ ->
         nil
     end
   end
 
-  defp seen_value?(%{"answer_ui" => %{"actions" => actions}}, answer) when is_list(actions),
-    do: Enum.any?(actions, &match?(%{"id" => "seen", "kind" => "value", "value" => ^answer}, &1))
+  defp value_action(%{"answer_ui" => %{"actions" => actions}}, answer) when is_list(actions),
+    do: Enum.find(actions, &match?(%{"kind" => "value", "value" => ^answer}, &1))
 
-  defp seen_value?(_message, _answer), do: false
+  defp value_action(_message, _answer), do: nil
+
+  defp text_or_nil(value) when is_binary(value), do: value
+  defp text_or_nil(_), do: nil
 
   defp origin_result(%{origin_result: %{status: status, revision: revision} = result}) do
     put_present(%{"status" => status, "revision" => revision}, "result_ref", result[:result_ref])
@@ -492,7 +502,6 @@ defmodule AttentionServer.ClientAPI.Resources do
   def ranks(%Engine{} = engine, person, view, previous \\ %{}) when is_map(previous) do
     entries = view_entries(view)
     reply_levels = view_reply_entries(view)
-    threads = effective_threads(engine, person)
     listed = listed_units(engine, person, view)
     listed_items = for {:item, id, _key, _section, _group} <- listed, into: MapSet.new(), do: id
 
@@ -518,7 +527,7 @@ defmodule AttentionServer.ClientAPI.Resources do
           %{"key" => Map.fetch!(keys, id), "section" => section}
           |> put_present("group", group)
           |> put_view_fields(Map.get(entries, {sender, message_id}, %{}))
-          |> put_present("_thread", Map.get(threads, {sender, message_id}))
+          |> put_present("_thread", view_thread(Map.get(entries, {sender, message_id})))
 
         Map.update(acc, id, rank, &Map.merge(rank, Map.take(&1, ["_reply"])))
 
@@ -613,14 +622,11 @@ defmodule AttentionServer.ClientAPI.Resources do
 
   defp list_unit(_row, _id, _key, _record), do: :skip
 
-  # Today's effective group threads (Placement.items: inherited through
-  # supersedes), for open items in a thread group.
-  defp effective_threads(engine, person) do
-    for %{identity: identity, message: %{"thread" => thread}} <- Placement.items(engine, person),
-        is_binary(thread) and thread != "",
-        into: %{},
-        do: {identity, thread}
-  end
+  # The effective group thread, as the view's entry carries it: Placement
+  # builds each entry from Placement.items, where the thread is inherited
+  # through supersedes. Reading it here avoids rescanning every message.
+  defp view_thread(%{"thread" => thread}) when is_binary(thread) and thread != "", do: thread
+  defp view_thread(_entry), do: nil
 
   # Today's per-reply priority view entries, by item and conversation sequence.
   defp view_reply_entries(%{replies: replies}) when is_list(replies) do
@@ -682,8 +688,11 @@ defmodule AttentionServer.ClientAPI.Resources do
   defp view_entries(%{message_entries_by_identity: entries}) when is_map(entries), do: entries
   defp view_entries(_), do: %{}
 
+  # Round 15: level is today's display priority, wherever the view entry has
+  # one; score and due time where the view has them.
   defp put_view_fields(rank, entry) do
     rank
+    |> put_present("level", if(entry["priority"] in @levels, do: entry["priority"]))
     |> put_present("score", if(is_number(entry["score"]), do: entry["score"]))
     |> put_present("due_at_ms", time_ms(entry["due_at"]))
   end
