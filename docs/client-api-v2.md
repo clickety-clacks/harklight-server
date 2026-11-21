@@ -533,7 +533,7 @@ Every write that succeeds answers `200`, or `201` for `POST /v2/files`, with a
       "required": ["changes", "rev", "more"],
       "properties": {
         "changes": { "type": "array", "items": { "$ref": "#/$defs/Change" } },
-        "rev": { "$ref": "#/$defs/Position", "description": "rev of the last change, or the request's after when changes is empty" },
+        "rev": { "$ref": "#/$defs/Position", "description": "The position the batch is complete through: its last change's rev, or later if trailing log rows have no client form, or the request's after when nothing was read (round 12)" },
         "more": { "type": "boolean" }
       }
     },
