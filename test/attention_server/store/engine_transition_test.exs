@@ -322,10 +322,21 @@ defmodule AttentionServer.Store.EngineTransitionTest do
     {:ok, old} = Store.open(keyed_path)
     assert {:ok, _} = KeyedMigration.convert(old)
     :ok = Store.close(old)
-    {:ok, legacy} = Relay.start_link(store_path: legacy_path, clock: fn -> 100 end)
+    flags = legacy_path <> ".flags"
+    File.write!(flags, JSON.encode!(%{"client_api_v2" => true}))
+
+    {:ok, legacy} =
+      Relay.start_link(store_path: legacy_path, feature_flags_path: flags, clock: fn -> 100 end)
 
     {:ok, keyed} =
-      Relay.start_link(store_path: keyed_path, store_mode: :keyed, clock: fn -> 100 end)
+      Relay.start_link(
+        store_path: keyed_path,
+        store_mode: :keyed,
+        feature_flags_path: flags,
+        clock: fn -> 100 end
+      )
+
+    assert Map.has_key?(:sys.get_state(keyed).priority_views, @person)
 
     {:ok, send} = JSON.decode_line(forward_line())
 

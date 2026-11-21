@@ -831,6 +831,7 @@ defmodule AttentionServer.Relay do
               client_rank_cache: %{},
               client_rank_retry: nil,
               priority_views: %{},
+              priority_view_touched: MapSet.new(),
               priority_recorded_scores: %{},
               priority_generations: %{},
               priority_timers: %{},
@@ -859,7 +860,7 @@ defmodule AttentionServer.Relay do
             }
 
             state = initialize_priority_views(state)
-            state = initialize_client_ranks(state)
+            state = %{initialize_client_ranks(state) | priority_view_touched: MapSet.new()}
             state = reschedule_default_sweep(state, state.default_index)
             state = reschedule_bounce_sweep(state)
             schedule_change_log_prune(state.store, 0)
@@ -3534,16 +3535,24 @@ defmodule AttentionServer.Relay do
   # the change log, so reads page from the stored order. A person is ranked
   # when a commit changed their client resources or their priority view
   # changed. Runs only while the change log is on.
-  defp rank_client_items(_before, %{store: %Store{change_log: false}} = next), do: next
+  defp rank_client_items(_before, %{store: %Store{change_log: false}} = next),
+    do: %{next | priority_view_touched: MapSet.new()}
 
   defp rank_client_items(before, next) do
     views_changed =
-      if before.priority_views === next.priority_views do
-        []
-      else
-        (Map.keys(before.priority_views) ++ Map.keys(next.priority_views))
-        |> Enum.uniq()
-        |> Enum.reject(&(Map.get(before.priority_views, &1) === Map.get(next.priority_views, &1)))
+      cond do
+        next.store.mode == :keyed ->
+          next.priority_view_touched
+
+        before.priority_views === next.priority_views ->
+          []
+
+        true ->
+          (Map.keys(before.priority_views) ++ Map.keys(next.priority_views))
+          |> Enum.uniq()
+          |> Enum.reject(
+            &(Map.get(before.priority_views, &1) === Map.get(next.priority_views, &1))
+          )
       end
 
     # Failed ranks stay touched until the timer retries them. Reads and other
@@ -3553,7 +3562,7 @@ defmodule AttentionServer.Relay do
       |> MapSet.union(MapSet.new(views_changed))
       |> MapSet.difference(before.store.change_log_touched)
 
-    persist_client_ranks(next, persons)
+    persist_client_ranks(%{next | priority_view_touched: MapSet.new()}, persons)
   end
 
   defp persist_client_ranks(state, persons) do
@@ -5453,7 +5462,11 @@ defmodule AttentionServer.Relay do
 
         touched =
           if touched do
-            ids = if request_success?(reply), do: created_ids ++ Map.keys(staged_sources), else: created_ids
+            ids =
+              if request_success?(reply),
+                do: created_ids ++ Map.keys(staged_sources),
+                else: created_ids
+
             Enum.reduce(ids, touched, &MapSet.put(&2, {:row, :uploads, &1}))
           end
 
@@ -5985,13 +5998,14 @@ defmodule AttentionServer.Relay do
     previous = Map.get(state.priority_views, person)
     engine_entries = Map.get(view, :engine_entries, Map.get(view, :entries, []))
 
-    next = Engine.retain_reply_scores(state.store.engine, person, engine_entries)
+    {next, nil, touched} =
+      request_transition(state, nil, state.store.engine, fn engine ->
+        {Engine.retain_reply_scores(engine, person, engine_entries), nil}
+      end)
 
-    case commit(state.store, next, %{
-           person: person,
-           actor: "server",
-           action: "reply_group_scores"
-         }) do
+    audit = %{person: person, actor: "server", action: "reply_group_scores"}
+
+    case commit_request(state.store, next, touched, audit) do
       {:ok, store} ->
         publish_priority_view(
           %{state | store: store},
@@ -6108,19 +6122,14 @@ defmodule AttentionServer.Relay do
            :free_order_version
          ]) ==
            comparable do
-      Map.put(
-        state,
-        :priority_views,
-        Map.put(
-          state.priority_views,
-          person,
-          previous
-          |> Map.put(:engine_entries, engine_entries)
-          |> Map.put(:message_order, message_order)
-          |> Map.put(:message_entries_by_identity, message_entries_by_identity)
-          |> Map.put(:message_order_suffixes, message_order_suffixes)
-        )
-      )
+      view =
+        previous
+        |> Map.put(:engine_entries, engine_entries)
+        |> Map.put(:message_order, message_order)
+        |> Map.put(:message_entries_by_identity, message_entries_by_identity)
+        |> Map.put(:message_order_suffixes, message_order_suffixes)
+
+      set_priority_view(state, person, view)
     else
       counter = state.priority_revision_counter + 1
       view_rev = state.priority_revision_namespace <> ":" <> Integer.to_string(counter)
@@ -6135,9 +6144,25 @@ defmodule AttentionServer.Relay do
 
       state
       |> Map.put(:priority_revision_counter, counter)
-      |> Map.put(:priority_views, Map.put(state.priority_views, person, view))
+      |> set_priority_view(person, view)
       |> notify_priority_view_change(person, view_rev)
     end
+  end
+
+  defp set_priority_view(state, person, view) do
+    previous = Map.get(state.priority_views, person)
+
+    views =
+      if is_nil(view),
+        do: Map.delete(state.priority_views, person),
+        else: Map.put(state.priority_views, person, view)
+
+    touched =
+      if state.store.mode == :keyed and previous !== view,
+        do: MapSet.put(state.priority_view_touched, person),
+        else: state.priority_view_touched
+
+    %{state | priority_views: views, priority_view_touched: touched}
   end
 
   defp notify_priority_view_change(state, person, view_rev) do
@@ -6491,7 +6516,11 @@ defmodule AttentionServer.Relay do
     audit = %{person: "system", actor: "bounce_decision", action: action}
 
     with {:ok, next_engine} <-
-           AttentionServer.AgentAPI.Advisories.stamp_decisions(state.store, next_engine, changed_keys),
+           AttentionServer.AgentAPI.Advisories.stamp_decisions(
+             state.store,
+             next_engine,
+             changed_keys
+           ),
          {:ok, store} <- commit(state.store, next_engine, audit) do
       next_state = %{state | store: store}
 
@@ -6738,10 +6767,7 @@ defmodule AttentionServer.Relay do
                          %{basis: "selected"},
                          Map.get(current.priority_views, affected_person)
                        ) do
-                    %{
-                      current
-                      | priority_views: Map.delete(current.priority_views, affected_person)
-                    }
+                    set_priority_view(current, affected_person, nil)
                   else
                     current
                   end

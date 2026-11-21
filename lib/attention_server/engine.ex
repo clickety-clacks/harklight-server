@@ -4702,14 +4702,11 @@ defmodule AttentionServer.Engine do
           )
       )
 
-    history =
-      Enum.reduce(keys, engine.reply_group_history, fn key, history ->
-        current = Map.get(scores, key, %{})
-        prior = Map.get(history, key, %{scores: %{}})
-        Map.put(history, key, update_reply_aggregate(prior, current))
-      end)
-
-    %{engine | reply_group_history: history}
+    Enum.reduce(keys, engine, fn key, state ->
+      current = Map.get(scores, key, %{})
+      prior = Map.get(state.reply_group_history, key, %{scores: %{}})
+      put_row(state, :reply_group_history, key, update_reply_aggregate(prior, current))
+    end)
   end
 
   defp retain_read_group_score(engine, key, position) do
