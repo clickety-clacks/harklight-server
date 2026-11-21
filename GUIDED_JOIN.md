@@ -40,15 +40,26 @@ same current-owner review and approval operations; see SELF_HOST.md.
 
 An owner TLS v1 request with `type: "invite_create"` and its authenticated
 `person_id` returns `ok: true` and an `invitation` object. The invitation fields
-are `v: 1`, `person_id`, `server_name`, `enrollment_url`, `relay_url`, `ca_pem`,
-`ca_sha256`, `invite_token` and `expires_at`. The pin is lowercase SHA-256 of the
+are `v: 2`, `person_id`, `server_name`, `enrollment_url`, `device_url`, `ca_pem`,
+`ca_sha256`, `invite_token` and `expires_at`. `device_url` is
+`https://<server_name>:<device-port>`, the origin of the device listener that
+serves client API v2; clients read it and never derive it from another field.
+Invitation v2 replaces the v1 `relay_url` (contract round 27). The pin is lowercase SHA-256 of the
 single public CA certificate's DER bytes. `expires_at` is `null`: an invitation
 does not expire; it works once and stops working when the owner's authority
 changes. Endpoint and trust values come from server
 configuration; a caller cannot supply their own in the owner request.
 
+An unused invitation created by an earlier Server (invitation v1, with
+`relay_url`) is not served or redeemed after the upgrade. The short link's
+resolve answers HTTP 410 and the bridge page asks for a new invitation.
+`POST /enroll` with its token answers HTTP 410
+`{"error":"invitation_reissue_required","message":...}`. The owner creates a
+new invitation. A v1 invitation that was already redeemed keeps recovering its
+pending request, like other pending enrollments created before the upgrade.
+
 The invitation object also includes `join_url`: `harklight://join#` followed by
-unpadded base64url of the UTF-8 JSON invitation v1 (without the `join_url` field
+unpadded base64url of the UTF-8 JSON invitation v2 (without the `join_url` field
 itself). The CLI's private JSON file includes this link. The full native link has
 no HTTP query or path. Optional `person_label` and
 `inviter_label` inside a link are display-only; `person_id`, configured pinned

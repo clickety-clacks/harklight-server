@@ -15,6 +15,11 @@ defmodule AttentionServer.DashboardReadHTTPTest do
 
     def resolve_session(_), do: {:error, :invalid_session}
 
+    def resolve_invitation("a" <> _ = token) when byte_size(token) == 64,
+      do: {:error, :reissue_required}
+
+    def resolve_invitation(_token), do: {:error, :unavailable}
+
     def list_devices(%{person_id: "mike"}) do
       {:ok,
        %{
@@ -92,6 +97,30 @@ defmodule AttentionServer.DashboardReadHTTPTest do
           skill_path_core: core_path
         )
     }
+  end
+
+  test "the bridge asks for a new invitation when the stored one predates invitation v2",
+       %{opts: opts} do
+    resolve = fn token ->
+      %{Plug.Test.conn(:post, "/join/resolve", token) | scheme: :https, port: 443}
+      |> Plug.Conn.put_req_header("origin", "https://www.example.com")
+      |> Plug.Conn.put_req_header("content-type", "text/plain")
+      |> DashboardReadHTTP.call(opts)
+    end
+
+    old = resolve.(String.duplicate("a", 64))
+    assert old.status == 410
+    assert old.resp_body == "Invitation reissue required"
+
+    gone = resolve.(String.duplicate("b", 64))
+    assert gone.status == 404
+
+    script = "/join.js" |> secure_get() |> DashboardReadHTTP.call(opts)
+    assert script.status == 200
+    assert script.resp_body =~ ~s(reason === "Invitation reissue required")
+
+    assert script.resp_body =~
+             "from an older Harklight Server. Ask the account owner for a new invitation."
   end
 
   test "device records are unavailable before sign-in", %{opts: opts} do

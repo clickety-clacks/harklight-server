@@ -17,6 +17,13 @@ defmodule AttentionServer.EnrollmentHTTPS do
   @max_body 32 * 1024
   @max_certificate 16 * 1024
 
+  # An unused invitation created before invitation v2 (contract round 27).
+  @reissue_required %{
+    "error" => "invitation_reissue_required",
+    "message" =>
+      "This invitation is from an older Harklight Server. Ask the account owner for a new invitation."
+  }
+
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts)
   def port(server), do: GenServer.call(server, :port, :infinity)
 
@@ -378,6 +385,7 @@ defmodule AttentionServer.EnrollmentHTTPS do
         {:error, :capacity} -> {503, %{"error" => "capacity"}}
         {:error, :storage_unavailable} -> {503, %{"error" => "unavailable"}}
         {:error, :refused} -> {404, %{"error" => "refused"}}
+        {:error, :reissue_required} -> {410, @reissue_required}
         _ -> {400, %{"error" => "invalid_request"}}
       end
     else

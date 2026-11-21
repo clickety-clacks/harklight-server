@@ -74,6 +74,7 @@ defmodule AttentionServer.Diagnostics do
     refused: "refused",
     stale_request: "stale_request",
     request_conflict: "request_conflict",
+    reissue_required: "reissue_required",
     clock_unavailable: "clock_unavailable",
     not_supported: "not_supported",
     invalid_session: "invalid_session",

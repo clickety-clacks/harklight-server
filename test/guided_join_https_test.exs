@@ -469,6 +469,69 @@ defmodule AttentionServer.GuidedJoinHTTPSTest do
     assert {:error, :forbidden} = Relay.acknowledged_cursor(restarted, key)
   end
 
+  test "after the upgrade an unused pre-v2 invitation is refused with a reissue request", c do
+    owner_key = owner_key(c)
+    {:ok, invitation} = Relay.owner_invite_create(c.relay, c.person, owner_key)
+    token = invitation["invite_token"]
+    hash = :crypto.hash(:sha256, Base.decode16!(token, case: :lower))
+    assert invitation["v"] == 2
+    assert invitation["device_url"] == "https://relay.test:18443"
+
+    # Rewrite the stored invitation to the shape a 0.1 Server wrote, then
+    # reopen the durable store as the upgraded Server does.
+    stop_supervised!(EnrollmentHTTPS)
+    stop_supervised!(OwnerTLS)
+    stop_supervised!(Relay)
+    {:ok, store} = Store.open(c.path)
+    engine = store.engine
+    config = engine.join_invitations[hash].configuration
+    %URI{host: host, port: port} = URI.parse(config["device_url"])
+
+    v1 =
+      config
+      |> Map.delete("device_url")
+      |> Map.put("relay_url", "wss://#{host}:#{port}/relay")
+
+    next = put_in(engine.join_invitations[hash].configuration, v1)
+
+    assert {:ok, store} =
+             Store.commit(store, next, %{person: c.person, actor: "test", action: "v1_invite"})
+
+    Store.close(store)
+
+    relay = start_supervised!({Relay, store_path: c.path, join_configuration: c.config})
+
+    listener =
+      start_supervised!(
+        {EnrollmentHTTPS,
+         relay: relay,
+         cacertfile: Path.join(c.certs, "ca.pem"),
+         certfile: Path.join(c.certs, "server.pem"),
+         keyfile: Path.join(c.certs, "server.key")}
+      )
+
+    c = %{c | relay: relay, listener: listener}
+    assert {:error, :reissue_required} = Relay.invitation_resolve(relay, token)
+
+    request = %{
+      "invite_token" => token,
+      "status_secret" => String.duplicate("a", 64),
+      "public_certificate" => File.read!(Path.join(c.certs, "a2.pem"))
+    }
+
+    assert {410, %{"error" => "invitation_reissue_required", "message" => message}} =
+             post(c, "/enroll", request)
+
+    assert message =~ "older Harklight Server"
+    assert message =~ "new invitation"
+    assert :sys.get_state(relay).store.engine.pending_enrollments == %{}
+  end
+
+  defp owner_key(c) do
+    {:ok, key} = DeviceIdentity.from_certificate(TLSFixtures.certificate_der!(c.certs, "a1"))
+    key
+  end
+
   defp owner(c, identity, request) do
     {:ok, socket} =
       :ssl.connect({127, 0, 0, 1}, OwnerTLS.port(c.owner),

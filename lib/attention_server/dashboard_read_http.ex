@@ -1258,7 +1258,10 @@ defmodule AttentionServer.DashboardReadHTTP do
             return;
           }
           if (!response.ok) {
-            status.textContent = "This invitation is expired, used, or unavailable.";
+            const reason = response.status === 410 ? await response.text() : "";
+            status.textContent = reason === "Invitation reissue required"
+              ? "This invitation is from an older Harklight Server. Ask for a new invitation."
+              : "This invitation is expired, used, or unavailable.";
             return;
           }
           const invitation = await response.json();
@@ -1306,7 +1309,10 @@ defmodule AttentionServer.DashboardReadHTTP do
             return;
           }
           if (!response.ok) {
-            status.textContent = "This invitation is expired, used, or unavailable. Ask the account owner for a new one.";
+            const reason = response.status === 410 ? await response.text() : "";
+            status.textContent = reason === "Invitation reissue required"
+              ? "This invitation is from an older Harklight Server. Ask the account owner for a new invitation."
+              : "This invitation is expired, used, or unavailable. Ask the account owner for a new one.";
             return;
           }
           const invitation = await response.json();
@@ -1345,6 +1351,9 @@ defmodule AttentionServer.DashboardReadHTTP do
 
               {:error, reason} when reason in [:used, :expired] ->
                 send_resp(conn, 410, "Invitation no longer available")
+
+              {:error, :reissue_required} ->
+                send_resp(conn, 410, "Invitation reissue required")
 
               {:error, :storage_unavailable} ->
                 send_resp(conn, 503, "Invitation check unavailable; try the same link again")
