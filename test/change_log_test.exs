@@ -2,6 +2,7 @@ defmodule AttentionServer.ChangeLogTest do
   use ExUnit.Case, async: false
 
   alias AttentionServer.{ChangeLog, Engine, JSON, Relay}
+  alias AttentionServer.ClientAPI.{FeedStep, Reads}
   alias Exqlite.Sqlite3
 
   @handle "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
@@ -292,6 +293,29 @@ defmodule AttentionServer.ChangeLogTest do
     assert {:ok, changes, false, position} = log(relay, 1)
     assert Enum.all?(changes, &(&1.rev >= 2))
     assert position == head(relay)
+    GenServer.stop(relay)
+  end
+
+  test "ranks served immediately after cut-over converge with the next feed step", ctx do
+    relay = start(ctx, false)
+    setup_people(relay)
+    for {id, n} <- [{"one", 2}, {"two", 3}, {"three", 4}, {"three-b", 6}],
+        do: forward(relay, id, n)
+    GenServer.stop(relay)
+
+    relay = start(ctx)
+    assert {:ok, %{"items" => initial, "rev" => cursor}} = Reads.inbox(relay, "reader")
+    assert length(initial) == 4
+
+    forward(relay, "four", 5)
+    assert {:ok, principal} = Reads.client_principal(store(relay).engine, "reader")
+    assert {:ok, rows, false, _} = FeedStep.read(relay, principal, cursor, 100)
+    changes = for %{"kind" => "item", "data" => data} <- rows, do: data
+    held = Map.new(initial ++ changes, &{&1["item_id"], &1["rank"]})
+
+    assert {:ok, %{"items" => current}} = Reads.inbox(relay, "reader")
+    assert length(current) == 5
+    assert held == Map.new(current, &{&1["item_id"], &1["rank"]})
     GenServer.stop(relay)
   end
 
@@ -632,15 +656,23 @@ defmodule AttentionServer.ChangeLogTest do
 
     relay = start(ctx)
 
-    # Touch the old item through an engine change and through a rank row.
-    assert %{"type" => "ok", "opened" => true} =
+    # Answering changes the pre-cut-over record itself.
+    key = {"A", "app:test", "old"}
+    assert %{terminal: nil} = Map.fetch!(store(relay).engine.messages, key)
+
+    assert %{"type" => "ok"} =
              request(relay, "reader", %{
-               "type" => "message_open",
+               "type" => "answer",
                "op_id" => op(3),
                "sender_id" => "app:test",
                "message_id" => "old",
-               "request_revision" => 1
+               "answer" => "Done"
              })
+
+    assert %{terminal: terminal} = Map.fetch!(store(relay).engine.messages, key)
+    refute is_nil(terminal)
+    assert {:error, :not_found} =
+             paused(relay, fn -> ChangeLog.created_at(store(relay), "A", item("old")) end)
 
     assert {:ok, _} =
              paused(relay, fn ->
@@ -669,6 +701,81 @@ defmodule AttentionServer.ChangeLogTest do
     item_id
   end
 
+  defp block_rank_inserts(ctx) do
+    {:ok, db} = Sqlite3.open(ctx.path)
+
+    :ok =
+      Sqlite3.execute(db, """
+      CREATE TRIGGER fail_rank_insert BEFORE INSERT ON client_ranks
+      BEGIN SELECT RAISE(ABORT, 'rank insert failed'); END
+      """)
+
+    db
+  end
+
+  defp unblock_rank_inserts(db) do
+    :ok = Sqlite3.execute(db, "DROP TRIGGER fail_rank_insert")
+    Sqlite3.close(db)
+  end
+
+  defp wait_for_stored_rank(relay, item_id, deadline) do
+    case paused(relay, fn -> ChangeLog.rank(store(relay), "A", item_id) end) do
+      {:error, :not_found} = error ->
+        if System.monotonic_time(:millisecond) < deadline do
+          Process.sleep(20)
+          wait_for_stored_rank(relay, item_id, deadline)
+        else
+          error
+        end
+
+      result ->
+        result
+    end
+  end
+
+  test "a failed rank write is reported and retried without another commit", ctx do
+    relay = start(ctx)
+    setup_people(relay)
+    forward(relay, "one", 2)
+    cursor = head(relay)
+    db = block_rank_inserts(ctx)
+    forward(relay, "two", 3)
+    item_id = item_id_of(relay, "two")
+    assert {:ok, principal} = Reads.client_principal(store(relay).engine, "reader")
+
+    try do
+      assert {:error, :storage_unavailable} = Reads.inbox(relay, "reader")
+      assert {:error, :storage_unavailable} = Reads.item(relay, "reader", item_id)
+      assert {:error, :storage_unavailable} = FeedStep.read(relay, principal, cursor, 100)
+    after
+      paused(relay, fn -> unblock_rank_inserts(db) end)
+    end
+
+    assert {:ok, _} =
+             wait_for_stored_rank(relay, item_id, System.monotonic_time(:millisecond) + 2_500)
+
+    assert {:ok, %{"items" => [_, _]}} = Reads.inbox(relay, "reader")
+    assert {:ok, %{"item" => %{"item_id" => ^item_id}}} = Reads.item(relay, "reader", item_id)
+    assert {:ok, [_ | _], false, _} = FeedStep.read(relay, principal, cursor, 100)
+    GenServer.stop(relay)
+  end
+
+  test "startup repairs a rank write left incomplete before shutdown", ctx do
+    relay = start(ctx)
+    setup_people(relay)
+    forward(relay, "one", 2)
+    db = block_rank_inserts(ctx)
+    forward(relay, "two", 3)
+    item_id = item_id_of(relay, "two")
+    GenServer.stop(relay)
+    unblock_rank_inserts(db)
+
+    relay = start(ctx)
+    assert {:ok, _} = paused(relay, fn -> ChangeLog.rank(store(relay), "A", item_id) end)
+    assert {:ok, %{"items" => [_, _]}} = Reads.inbox(relay, "reader")
+    GenServer.stop(relay)
+  end
+
   test "stored ranks write an item row only when an item's rank changes", ctx do
     relay = start(ctx)
     setup_people(relay)
@@ -681,13 +788,13 @@ defmodule AttentionServer.ChangeLogTest do
     # The Relay has already stored a ranking for A; start from a known one.
     ranks = %{
       i1 => %{"key" => "b", "section" => "current"},
-      i2 => %{"key" => "c", "section" => "current"}
+      i2 => %{"key" => "c", "section" => "current", "_reply" => %{"key" => "d"}}
     }
 
     start_head = head(relay)
 
-    assert {:ok, first_head} =
-             paused(relay, fn -> ChangeLog.put_ranks(store(relay), "A", ranks) end)
+    assert {:ok, first_head, cache} =
+             paused(relay, fn -> ChangeLog.put_ranks(store(relay), "A", ranks, nil) end)
 
     assert {:ok, page, false} =
              paused(relay, fn -> ChangeLog.rank_page(store(relay), "A", nil, 10) end)
@@ -695,7 +802,9 @@ defmodule AttentionServer.ChangeLogTest do
     assert page == [{i1, ranks[i1]}, {i2, ranks[i2]}]
     assert {:ok, %{"key" => "c"}} = paused(relay, fn -> ChangeLog.rank(store(relay), "A", i2) end)
 
-    assert {:ok, %{^i1 => "b", ^i2 => "c"}} =
+    reply_id = "r" <> i2
+
+    assert {:ok, %{^i1 => "b", ^i2 => "c", ^reply_id => "d"}} =
              paused(relay, fn -> ChangeLog.rank_keys(store(relay), "A") end)
 
     # Same ranking: nothing written.
@@ -703,10 +812,13 @@ defmodule AttentionServer.ChangeLogTest do
              paused(relay, fn -> ChangeLog.put_ranks(store(relay), "A", ranks) end)
 
     # A change in any member writes that item's row only.
-    moved = put_in(ranks, [i2, "section"], "resolved")
+    moved = put_in(ranks, [i2, "_reply", "key"], "e")
 
-    assert {:ok, moved_head} =
-             paused(relay, fn -> ChangeLog.put_ranks(store(relay), "A", moved) end)
+    assert {:ok, moved_head, cache} =
+             paused(relay, fn -> ChangeLog.put_ranks(store(relay), "A", moved, cache) end)
+
+    assert {:ok, %{^reply_id => "e"}} =
+             paused(relay, fn -> ChangeLog.rank_keys(store(relay), "A") end)
 
     assert {:ok, [%{kind: :item, resource_id: resource}], false, ^moved_head} =
              log(relay, first_head)
@@ -720,8 +832,14 @@ defmodule AttentionServer.ChangeLogTest do
     assert {:ok, [{^i1, _}], true} =
              paused(relay, fn -> ChangeLog.rank_page(store(relay), "A", nil, 1) end)
 
-    assert {:ok, gone_head} =
-             paused(relay, fn -> ChangeLog.put_ranks(store(relay), "A", Map.take(moved, [i1])) end)
+    assert {:ok, gone_head, cache} =
+             paused(relay, fn ->
+               ChangeLog.put_ranks(store(relay), "A", Map.take(moved, [i1]), cache)
+             end)
+
+    assert {:ok, units} = paused(relay, fn -> ChangeLog.rank_keys(store(relay), "A") end)
+    assert units == cache.units
+    assert units == %{i1 => "b"}
 
     assert gone_head > moved_head
     assert {:error, :not_found} = paused(relay, fn -> ChangeLog.rank(store(relay), "A", i2) end)
@@ -747,33 +865,31 @@ defmodule AttentionServer.ChangeLogTest do
   test "the relay stores ranks once per change and keeps other items' keys stable", ctx do
     relay = start(ctx)
     setup_people(relay)
-    for {id, n} <- [{"m1", 2}, {"m2", 3}, {"m3", 4}], do: forward(relay, id, n)
+    for {id, n} <- [{"m1", 2}, {"m2", 3}, {"m3", 4}, {"m4", 5}], do: forward(relay, id, n)
 
     assert {:ok, page, false} =
              paused(relay, fn -> ChangeLog.rank_page(store(relay), "A", nil, 100) end)
 
-    assert length(page) == 3
+    assert length(page) == 4
     keys = Enum.map(page, fn {_id, rank} -> rank["key"] end)
     assert keys == Enum.sort(keys)
     before = Map.new(page)
     before_head = head(relay)
 
     # A new item is ranked in; items whose rank did not move write no row.
-    forward(relay, "m4", 5)
+    forward(relay, "m5", 6)
 
     assert {:ok, after_page, false} =
              paused(relay, fn -> ChangeLog.rank_page(store(relay), "A", nil, 100) end)
 
-    assert length(after_page) == 4
+    assert length(after_page) == 5
     after_ranks = Map.new(after_page)
-
-    unchanged =
-      for {id, rank} <- before, Map.get(after_ranks, id) == rank, do: id
 
     assert {:ok, rows, false, _} = log(relay, before_head)
     engine = :sys.get_state(relay).store.engine
 
-    for id <- unchanged do
+    for {id, rank} <- before do
+      assert after_ranks[id] == rank
       {:ok, key} = AttentionServer.ClientAPI.Resources.item_key(engine, "A", id)
       refute Enum.any?(rows, &(&1.resource_id == ChangeLog.item_resource(key)))
     end
@@ -839,6 +955,46 @@ defmodule AttentionServer.ChangeLogTest do
     :ok = ChangeLog.unsubscribe_closing(browser)
     ChangeLog.notify_closing([{{:owner, "A"}, :revoked}, {{:device, "owner-key"}, :revoked}])
     refute_receive {:client_closing, _, _}, 200
+  end
+
+  test "switching to stored-rank reads expires cursors from the old rank projection once", ctx do
+    relay = start(ctx)
+    setup_people(relay)
+    forward(relay, "one", 2)
+    cursor = head(relay)
+
+    assert {:ok, created_at} =
+             paused(relay, fn -> ChangeLog.created_at(store(relay), "A", item("one")) end)
+
+    GenServer.stop(relay)
+
+    # Recreate the change-log state table as it existed before this transition.
+    {:ok, db} = Sqlite3.open(ctx.path)
+
+    :ok =
+      Sqlite3.execute(db, """
+      CREATE TABLE old_log_state (id INTEGER PRIMARY KEY CHECK (id = 1), store_version INTEGER NOT NULL);
+      INSERT INTO old_log_state SELECT id, store_version FROM client_change_log_state;
+      DROP TABLE client_change_log_state;
+      ALTER TABLE old_log_state RENAME TO client_change_log_state;
+      """)
+
+    Sqlite3.close(db)
+
+    relay = start(ctx)
+    assert {:error, :cursor_expired} = log(relay, cursor)
+    position = head(relay)
+    assert position == cursor + 1
+    assert {:ok, %{"rev" => ^position, "items" => [_]}} = Reads.inbox(relay, "reader")
+
+    assert {:ok, ^created_at} =
+             paused(relay, fn -> ChangeLog.created_at(store(relay), "A", item("one")) end)
+
+    GenServer.stop(relay)
+
+    relay = start(ctx)
+    assert {:ok, [], false, ^position} = log(relay, position)
+    GenServer.stop(relay)
   end
 
   # Per-change cost of storing a person's ranking (owner's gate: the rank hook

@@ -40,6 +40,8 @@ defmodule AttentionServer.ChangeLog do
   }
   @kind_atoms Map.new(@kinds, fn {atom, text} -> {text, atom} end)
 
+  @rank_projection_version 1
+
   @schema [
     """
     CREATE TABLE IF NOT EXISTS client_changes (
@@ -107,7 +109,8 @@ defmodule AttentionServer.ChangeLog do
     """
     CREATE TABLE IF NOT EXISTS client_change_log_state (
       id INTEGER PRIMARY KEY CHECK (id = 1),
-      store_version INTEGER NOT NULL
+      store_version INTEGER NOT NULL,
+      rank_projection_version INTEGER NOT NULL DEFAULT 0
     )
     """
   ]
@@ -393,13 +396,14 @@ defmodule AttentionServer.ChangeLog do
 
   @doc """
   Creates the tables and reconciles the log with the store snapshot. If the
-  store was committed while the log was off, every person's log restarts past
-  their head: clients holding an older cursor get `cursor_expired` and
-  re-read a snapshot, so nothing changed meanwhile is missed.
+  store was committed while the log was off, or its previous rank projection
+  used different keys, every person's log restarts past their head. Clients
+  holding an older cursor get `cursor_expired` and re-read a snapshot.
   """
   def enable(db, store_version) do
     with :ok <- Enum.reduce_while(@schema, :ok, &create(db, &1, &2)),
          :ok <- Sqlite3.execute(db, "BEGIN IMMEDIATE"),
+         :ok <- add_rank_projection_version(db),
          :ok <- reconcile(db, store_version),
          :ok <- Sqlite3.execute(db, "COMMIT") do
       :ok
@@ -417,17 +421,37 @@ defmodule AttentionServer.ChangeLog do
     end
   end
 
-  defp reconcile(db, store_version) do
-    case one(db, "SELECT store_version FROM client_change_log_state WHERE id = 1", []) do
-      {:ok, nil} ->
-        run(db, "INSERT INTO client_change_log_state (id, store_version) VALUES (1, ?)", [
-          store_version
-        ])
+  defp add_rank_projection_version(db) do
+    with {:ok, columns} <- all(db, "PRAGMA table_info(client_change_log_state)", []) do
+      if Enum.any?(columns, &match?([_, "rank_projection_version" | _], &1)) do
+        :ok
+      else
+        Sqlite3.execute(
+          db,
+          "ALTER TABLE client_change_log_state ADD COLUMN rank_projection_version " <>
+            "INTEGER NOT NULL DEFAULT 0"
+        )
+      end
+    end
+  end
 
-      {:ok, [^store_version]} ->
+  defp reconcile(db, store_version) do
+    case one(
+           db,
+           "SELECT store_version, rank_projection_version FROM client_change_log_state WHERE id = 1",
+           []
+         ) do
+      {:ok, nil} ->
+        run(
+          db,
+          "INSERT INTO client_change_log_state (id, store_version, rank_projection_version) VALUES (1, ?, ?)",
+          [store_version, @rank_projection_version]
+        )
+
+      {:ok, [^store_version, @rank_projection_version]} ->
         :ok
 
-      {:ok, [_stale]} ->
+      {:ok, [_, _]} ->
         with :ok <-
                run(
                  db,
@@ -449,9 +473,11 @@ defmodule AttentionServer.ChangeLog do
                    "ON CONFLICT (id) DO UPDATE SET epoch = excluded.epoch",
                  [epoch + 1]
                ) do
-          run(db, "UPDATE client_change_log_state SET store_version = ? WHERE id = 1", [
-            store_version
-          ])
+          run(
+            db,
+            "UPDATE client_change_log_state SET store_version = ?, rank_projection_version = ? WHERE id = 1",
+            [store_version, @rank_projection_version]
+          )
         end
 
       error ->
@@ -766,17 +792,18 @@ defmodule AttentionServer.ChangeLog do
         cache
       )
       when is_map(ranks) do
-    unit_keys = AttentionServer.ClientAPI.Resources.rank_unit_keys(ranks)
-
     with {:ok, prior} <- prior_ranks(db, person, cache) do
       changed = for {id, rank} <- ranks, not same_rank?(Map.get(prior.ranks, id), rank), do: id
       dropped = for {id, _} <- prior.ranks, not Map.has_key?(ranks, id), do: id
-      changed_units = for {id, key} <- unit_keys, Map.get(prior.units, id) != key, do: id
-      dropped_units = for {id, _} <- prior.units, not Map.has_key?(unit_keys, id), do: id
+      changed_ranks = Map.take(ranks, changed)
+
+      {unit_keys, changed_units, dropped_units} =
+        rank_unit_changes(prior, ranks, changed_ranks, changed ++ dropped, cache)
+
       next_cache = %{ranks: ranks, units: unit_keys, ranked?: true}
 
-      if changed == [] and dropped == [] and changed_units == [] and dropped_units == [] and
-           prior.ranked? do
+      if changed == [] and dropped == [] and map_size(changed_units) == 0 and
+           dropped_units == [] and prior.ranked? do
         with {:ok, head} <- head(db, engine, person), do: {:ok, head, next_cache}
       else
         # A person's first stored ranking is what reads computed until now, so
@@ -784,15 +811,13 @@ defmodule AttentionServer.ChangeLog do
         items =
           if prior.ranked?, do: rank_changed_items(engine, person, changed ++ dropped), else: []
 
-        changed_ranks = Map.take(ranks, changed)
-
         with {:ok, head} <-
                write_stored_ranks(db, engine, person, %{
                  items: items,
                  ranks: changed_ranks,
                  encoded: Map.new(changed_ranks, fn {id, rank} -> {id, JSON.encode!(rank)} end),
                  dropped: dropped,
-                 units: Map.take(unit_keys, changed_units),
+                 units: changed_units,
                  dropped_units: dropped_units
                }),
              do: {:ok, head, next_cache}
@@ -801,6 +826,33 @@ defmodule AttentionServer.ChangeLog do
   end
 
   def put_ranks(%AttentionServer.Store{}, _person, _ranks, _cache), do: {:error, :disabled}
+
+  # The cache is the result of the last successful write, so only changed
+  # items can add, remove or move its rank units. On a cold read, compare
+  # all units to reconcile the rows recovered separately from SQLite.
+  defp rank_unit_changes(prior, ranks, _changed_ranks, _changed_or_dropped, nil) do
+    units = AttentionServer.ClientAPI.Resources.rank_unit_keys(ranks)
+    {upserts, deletes} = compare_rank_units(prior.units, units)
+    {units, upserts, deletes}
+  end
+
+  defp rank_unit_changes(prior, _ranks, changed_ranks, changed_or_dropped, _cache) do
+    old_units =
+      prior.ranks
+      |> Map.take(changed_or_dropped)
+      |> AttentionServer.ClientAPI.Resources.rank_unit_keys()
+
+    new_units = AttentionServer.ClientAPI.Resources.rank_unit_keys(changed_ranks)
+    {upserts, deletes} = compare_rank_units(old_units, new_units)
+    units = prior.units |> Map.drop(deletes) |> Map.merge(upserts)
+    {units, upserts, deletes}
+  end
+
+  defp compare_rank_units(old_units, new_units) do
+    upserts = for {id, key} <- new_units, Map.get(old_units, id) != key, into: %{}, do: {id, key}
+    deletes = for {id, _} <- old_units, not Map.has_key?(new_units, id), do: id
+    {upserts, deletes}
+  end
 
   # A ranking kept in memory compares by value; one read back from SQLite
   # (after a restart) compares by its stored JSON, which encodes the same
@@ -834,6 +886,11 @@ defmodule AttentionServer.ChangeLog do
     end)
     |> Enum.uniq()
     |> Enum.sort()
+  end
+
+  @doc false
+  def ranks_available(%AttentionServer.Store{change_log_touched: touched}, person) do
+    if MapSet.member?(touched, person), do: {:error, :storage_unavailable}, else: :ok
   end
 
   @doc """

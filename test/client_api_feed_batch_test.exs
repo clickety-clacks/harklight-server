@@ -36,7 +36,7 @@ defmodule AttentionServer.ClientAPIFeedBatchTest do
   import Plug.Test
   import Plug.Conn
 
-  alias AttentionServer.{ChangeLog, JSON, Relay, TLSFixtures}
+  alias AttentionServer.{ChangeLog, ClientAPIFeedClient, JSON, Relay, TLSFixtures}
   alias AttentionServer.ClientAPI.{FeedStep, Principal, Reads, Router}
   alias AttentionServer.ClientAPISchema, as: Schema
 
@@ -357,10 +357,7 @@ defmodule AttentionServer.ClientAPIFeedBatchTest do
     {200, %{"rev" => rev}} = batch(ctx, "?after=0")
 
     assert {:ok, _} =
-             ChangeLog.prune(
-               :sys.get_state(ctx.relay).store,
-               System.system_time(:millisecond) + 1
-             )
+             ClientAPIFeedClient.prune_changes(ctx.relay, System.system_time(:millisecond) + 1)
 
     assert {410, %{"error" => "cursor_expired", "retryable" => false, "request_id" => _}} =
              batch(ctx, "?after=0")
