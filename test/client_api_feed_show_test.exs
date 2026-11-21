@@ -184,6 +184,29 @@ defmodule AttentionServer.ClientAPIFeedShowTest do
     refute_received {:stream_chunk, "event: show\ndata: " <> _}
   end
 
+  test "signing out suppresses live delivery and preserves the held show", ctx do
+    heartbeat_fast()
+    stream = pause_before_first_chunk(ctx)
+    assert {:ok, %{"delivery" => "held"}} = push_view(ctx.relay, "chat")
+
+    assert {:ok, 200, signed_out, false} =
+             Writes.focus(ctx.relay, ctx.reader, %{"screen" => "signed_out", "ttl_s" => 120})
+
+    refute Map.has_key?(signed_out, "show")
+    send(stream.pid, :resume)
+
+    assert_receive {:stream_chunk, first}, 1_000
+    assert first == "event: heartbeat\ndata: {}\n\n"
+
+    assert {:ok, 200, %{"show" => %{"target" => "chat"}}, false} =
+             Writes.focus(ctx.relay, ctx.reader, %{"screen" => "inbox", "ttl_s" => 120})
+
+    assert :ok = Relay.revoke_device(ctx.relay, ctx.reader)
+    assert_receive {:stream_chunk, "event: closing\ndata: {\"reason\":\"revoked\"}\n\n"}, 1_000
+    Task.await(stream)
+    refute_received {:stream_chunk, "event: show\ndata: " <> _}
+  end
+
   test "a held show reaches the device's open feed as an id-less show event", ctx do
     conn = connect(ctx.port, ctx.certs, "a1")
     {conn, feed} = open_feed(conn, "?after=#{head(ctx.relay)}")

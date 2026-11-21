@@ -54,7 +54,7 @@ defmodule AttentionServer.ClientAPI.Focus do
     :ok
   end
 
-  @doc "Reads the current held show for a device that still authenticates."
+  @doc "Reads the current held show for an authenticated device with an active focus report."
   def pending_show(relay, principal),
     do: GenServer.call(relay, {:client_api, __MODULE__, {:pending_show, principal}}, :infinity)
 
@@ -65,9 +65,13 @@ defmodule AttentionServer.ClientAPI.Focus do
     data =
       case Reads.client_principal(engine, principal) do
         {:ok, %{kind: :device, key: key}} ->
-          case Map.get(state.held_shows, key) do
-            nil -> nil
-            held -> show(engine, key, held, state.clock.())
+          # Ending focus stops live delivery while leaving the show held for
+          # the device's next accepted focus report.
+          with %{client_api_token: _} <- Map.get(state.focus_clients, key),
+               %{} = held <- Map.get(state.held_shows, key) do
+            show(engine, key, held, state.clock.())
+          else
+            _ -> nil
           end
 
         _ ->
