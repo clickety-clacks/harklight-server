@@ -810,7 +810,7 @@ visible text. Its `attention` member changes:
 | `precondition_failed` | 412 | false | `If-Match` does not match. Also a superseded push `revision` (`stale_push_binding`). |
 | `cursor_expired` | 410 | false | `after` is older than retention |
 | `payload_too_large` | 413 | false | Body or file over the limit (`too_large`, `upload_cap_exceeded`) |
-| `unsupported` | 400 | false | The server does not serve this here: push with push disabled, or a reply on an item with no agent conversation |
+| `unsupported` | 400 | false | The server does not serve this here: push with push disabled, or a reply, answer receipt or agent result on an item with no agent conversation |
 | `retry_later` | 503 | true | Load shedding, with `Retry-After` |
 | `storage_unavailable` | 503 | true | The store could not commit, with `Retry-After` |
 
@@ -1292,7 +1292,8 @@ also include the message or entry affected by the same transaction.
   identifies an entry in that conversation. A send without a session has no
   conversation (§5), and replies to it answer `400 unsupported`. Feed
   activity is informational. There is no `accepts_replies` member.
-- **Result.** Applies to the current answer. Before an answer it returns
+- **Result.** Applies to the current answer of a message with a session.
+  A sessionless message answers `400 unsupported`. Before an answer it returns
   `409 not_answered`. `received` can advance to `applied` or `refused`.
   A conflicting result or a transition after a final result returns
   `409 already_closed`. A malformed status answers `400 invalid_field`
@@ -1300,7 +1301,8 @@ also include the message or entry affected by the same transaction.
   operation, as today. `already_answered` is reserved for the person's
   `/answer`.
 - **Receipt.** A message receipt targets that item's answer. An entry
-  receipt targets a person-authored chat turn of that item. `not_handed`
+  receipt targets a person-authored chat turn of that item. A sessionless
+  message answers `400 unsupported`. `not_handed`
   requires a non-blank reason and may advance to `handed`. A handoff
   already recorded as `handed` stays handed. The optional `agent` is
   non-blank. `rerouted` is valid only for `handed`. The response reports
@@ -1354,17 +1356,12 @@ can skip agent-wide revisions.
       "required": ["rev", "kind", "data"],
       "properties": {
         "rev": { "$ref": "#/$defs/Rev" },
-        "kind": { "enum": ["message", "message_removed", "entry", "advisory"] },
+        "kind": { "enum": ["message", "entry", "advisory"] },
         "data": {}
       },
       "allOf": [
         { "if": { "properties": { "kind": { "const": "message" } } },
           "then": { "properties": { "data": { "$ref": "#/$defs/SentMessage" } } } },
-        { "if": { "properties": { "kind": { "const": "message_removed" } } },
-          "then": { "properties": { "data": {
-            "type": "object", "required": ["item_id"],
-            "properties": { "item_id": { "$ref": "#/$defs/OpaqueId" } }
-          } } } },
         { "if": { "properties": { "kind": { "const": "entry" } } },
           "then": { "properties": { "data": { "$ref": "#/$defs/AgentEntry" } } } },
         { "if": { "properties": { "kind": { "const": "advisory" } } },
