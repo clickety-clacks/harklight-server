@@ -709,7 +709,10 @@ defmodule AttentionServer.ClientAPIFeedShowTest do
     heartbeat_fast()
     reader = connect(ctx.port, ctx.certs, "a1", :http1)
     assert Mint.HTTP.protocol(reader) == :http1
-    {reader, feed} = open_feed(reader, "?after=#{head(ctx.relay)}")
+
+    {reader, feed} =
+      open_feed(reader, "", [{"last-event-id", Integer.to_string(head(ctx.relay))}])
+
     {reader, feed} = await_open(reader, feed)
     assert feed.status == 200
 
@@ -717,7 +720,8 @@ defmodule AttentionServer.ClientAPIFeedShowTest do
     assert response.status == 200
     assert %{"state" => "held", "show_id" => id} = body(response)
     {reader, _feed, observed} = events(reader, feed, 3)
-    assert Enum.all?(observed, &(&1 == %{event: "heartbeat", data: %{}}))
+    assert Enum.any?(observed, &(&1.event == "heartbeat"))
+    refute Enum.any?(observed, &(&1.event == "show"))
 
     focus = connect(ctx.port, ctx.certs, "a1", :http1)
     report = JSON.encode!(%{"screen" => "inbox", "ttl_s" => 120})

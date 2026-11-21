@@ -27,7 +27,7 @@ defmodule AttentionServer.ClientAPI.Focus do
 
   @doc "Subscribes the calling feed process to shows held for `device_key`."
   @spec subscribe_shows(String.t(), atom()) :: :ok
-  def subscribe_shows(device_key, protocol) when is_binary(device_key) do
+  def subscribe_shows(device_key, protocol \\ nil) when is_binary(device_key) do
     case Registry.register(@registry, {:client_api_show, device_key}, protocol) do
       {:ok, _} -> :ok
       {:error, {:already_registered, _}} -> :ok
@@ -88,6 +88,7 @@ defmodule AttentionServer.ClientAPI.Focus do
         {:ok, %{kind: :device, key: key}} ->
           # Ending focus stops live delivery while leaving the show held for
           # the device's next accepted focus report.
+          # A legacy notification may already be queued when an agent show replaces it.
           with %{client_api_token: _} <- Map.get(state.focus_clients, key),
                %{} = held <- Map.get(state.held_shows, key),
                true <- protocol == :"HTTP/2" or not Map.has_key?(held, "show_id") do
