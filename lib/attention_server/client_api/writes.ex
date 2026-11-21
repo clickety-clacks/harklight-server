@@ -1053,7 +1053,9 @@ defmodule AttentionServer.ClientAPI.Writes do
     end
   end
 
-  # At most one of choice, comment and result; none is no comment.
+  # At most one of choice, comment and result, counted by presence; none is no
+  # comment. A result is any JSON value, null included, stored unchanged
+  # (contract rulings round 16).
   defp answer_value(body) do
     case Map.take(body, ["choice", "comment", "result"]) |> Map.to_list() do
       [] ->
@@ -1065,7 +1067,7 @@ defmodule AttentionServer.ClientAPI.Writes do
       [{"comment", text}] when is_binary(text) ->
         {:ok, {:comment, text}}
 
-      [{"result", result}] when is_map(result) and not is_struct(result) ->
+      [{"result", result}] ->
         {:ok, {:result, result}}
 
       [{name, _}] ->
