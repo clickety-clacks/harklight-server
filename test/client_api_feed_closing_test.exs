@@ -15,6 +15,7 @@ defmodule AttentionServer.ClientAPIFeedClosingTest do
     GuidedJoin,
     JSON,
     Relay,
+    Server,
     TLSFixtures
   }
 
@@ -137,6 +138,37 @@ defmodule AttentionServer.ClientAPIFeedClosingTest do
                  Registry.lookup(ChangeLog.Registry, {:closing, {:person, "A"}}) == []
              end)
     end
+  end
+
+  ## The server stopping (review H1)
+
+  test "a graceful server stop ends open feeds with closing: server_shutdown", ctx do
+    server =
+      start_supervised!(
+        {Server,
+         [
+           store_path: Path.join(ctx.dir, "server.sqlite3"),
+           certfile: Path.join(ctx.certs, "server.pem"),
+           keyfile: Path.join(ctx.certs, "server.key"),
+           cacertfile: Path.join(ctx.certs, "ca.pem"),
+           enrollment_enabled: false,
+           feature_flags_path: ctx.flags
+         ]},
+        restart: :temporary
+      )
+
+    relay = Server.relay(server)
+    assert :ok = Relay.setup_person(relay, "A")
+    der = TLSFixtures.certificate_der!(ctx.certs, "a1")
+    assert {:ok, _key} = Relay.setup_device_certificate(relay, "A", der)
+
+    {conn, feed} = open(%{port: Server.port(server), certs: ctx.certs}, "a1")
+
+    # The listeners stop before the Relay; the feed must hear first.
+    stopping = Task.async(fn -> Supervisor.stop(server) end)
+    {_conn, _feed, closing} = until_closing(conn, feed)
+    assert closing == %{event: "closing", data: %{"reason" => "server_shutdown"}}
+    assert :ok = Task.await(stopping, 10_000)
   end
 
   ## Browsers
