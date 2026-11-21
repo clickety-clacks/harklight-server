@@ -574,8 +574,7 @@ defmodule AttentionServer.ClientAPI.Writes do
   def handle_call({:begin, who, key, digest, operation}, from, state) do
     reply =
       with {:ok, principal} <- operation_principal(state.store.engine, who, operation),
-           {:ok, nil} <-
-             stored(state, principal.person, receipt_key(principal, key), digest, who, from),
+           {:ok, nil} <- stored(state, principal.person, key, digest, who, from),
            :ok <- precondition(state, who, principal, operation),
            {:ok, frame} <- frame(state.store.engine, principal, key, operation),
            {:ok, staged} <- staged_files(state, principal, operation) do
@@ -599,15 +598,7 @@ defmodule AttentionServer.ClientAPI.Writes do
           {:ok, reply} ->
             result = render(operation, who, principal.person, reply, from, state)
             receipt = receipt(operation, reply, result)
-
-            remember(
-              state,
-              principal.person,
-              receipt_key(principal, key),
-              digest,
-              result,
-              receipt
-            )
+            remember(state, principal.person, key, digest, result, receipt)
 
           error ->
             error
@@ -633,11 +624,6 @@ defmodule AttentionServer.ClientAPI.Writes do
       other -> other
     end
   end
-
-  defp receipt_key(%{kind: :agent, engine_key: agent}, key) when is_binary(key),
-    do: uuid_v4(:crypto.hash(:sha256, "granted-agent:" <> agent <> ":" <> key))
-
-  defp receipt_key(_principal, key), do: key
 
   defp stored(_state, _person, nil, _digest, _who, _from), do: {:ok, nil}
 

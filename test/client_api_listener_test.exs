@@ -628,10 +628,35 @@ defmodule AttentionServer.ClientAPIListenerTest do
       assert {:ok, conn, %{status: 409} = conflict} = request(conn, "POST", path, headers, stale)
       assert %{"error" => "stale_request"} = json(conflict)
 
+      conn =
+        Enum.reduce(
+          [{"deliberate", true}, {"intent_ref", "obsolete"}, {"acceptance_seq", 1}],
+          conn,
+          fn {field, value}, conn ->
+            obsolete_body = JSON.encode!(%{"request_revision" => 1, field => value})
+
+            assert {:ok, conn, %{status: 400} = rejected} =
+                     request(conn, "POST", path, headers, obsolete_body)
+
+            assert %{"error" => "invalid_field", "field" => ^field} = json(rejected)
+            conn
+          end
+        )
+
       assert {:ok, conn, %{status: 200} = answer} = request(conn, "POST", path, headers, body)
       assert %{"item" => %{"terminal" => %{"state" => "answered"}}} = json(answer)
       assert {:ok, conn, %{status: 200} = replay} = request(conn, "POST", path, headers, body)
       assert header(replay, "idempotent-replayed") == ["true"]
+
+      assert {:ok, device} = device_connect(Map.put(ctx, :port, port), "a2", :http2)
+
+      device_body = JSON.encode!(%{"request_revision" => 1, "comment" => "different answer"})
+
+      assert {:ok, device, %{status: 409} = device_conflict} =
+               request(device, "POST", other_path, headers, device_body)
+
+      assert %{"error" => "idempotency_conflict"} = json(device_conflict)
+      Mint.HTTP.close(device)
 
       assert :ok =
                Relay.owner_replace_agent_grants(relay, person, owner, agent, 3, ["app:team/"], [
@@ -653,7 +678,10 @@ defmodule AttentionServer.ClientAPIListenerTest do
       assert %{
                "item" => %{
                  "item_id" => second_id,
-                 "terminal" => %{"state" => "answered", "answer" => %{"kind" => "reply", "text" => "settled"}}
+                 "terminal" => %{
+                   "state" => "answered",
+                   "answer" => %{"kind" => "reply", "text" => "settled"}
+                 }
                }
              } = json(commented)
 
