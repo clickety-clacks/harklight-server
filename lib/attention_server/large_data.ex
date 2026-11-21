@@ -7,6 +7,8 @@ end
 defmodule AttentionServer.LargeData do
   @moduledoc false
 
+  require Logger
+
   alias AttentionServer.LargeData.Ref
 
   @inline_limit 2 * 1024 * 1024
@@ -301,38 +303,86 @@ defmodule AttentionServer.LargeData do
 
     with :ok <- verify_all(term),
          {:ok, names} <- File.ls(directory) do
-      names
-      |> Enum.filter(fn name ->
-        String.ends_with?(name, ".staged") or
-          (Regex.match?(~r/\A[0-9a-f]{64}\z/, name) and not Map.has_key?(references, name))
-      end)
-      |> Enum.reduce_while(:ok, fn name, :ok ->
-        case File.rm(Path.join(directory, name)) do
-          :ok -> {:cont, :ok}
-          {:error, :enoent} -> {:cont, :ok}
-          _ -> {:halt, {:error, :storage_unavailable}}
-        end
-      end)
+      {staged, files} = Enum.split_with(names, &String.ends_with?(&1, ".staged"))
+
+      orphaned =
+        files
+        |> Enum.filter(&blob_id?/1)
+        |> unmarked_blobs(term)
+        |> Enum.reject(&Map.has_key?(references, &1))
+
+      delete_files(directory, staged ++ orphaned)
     else
       _ -> {:error, :storage_unavailable}
     end
   end
 
   @doc false
-  def delete_unreferenced(directory, old_term, next_term) when is_binary(directory) do
+  def delete_unreferenced(directory, old_term, next_term, persisted) when is_binary(directory) do
     retained = refs(next_term)
 
-    refs(old_term)
-    |> Enum.reject(fn {id, _ref} -> Map.has_key?(retained, id) end)
-    |> Enum.reduce_while(:ok, fn {id, _ref}, :ok ->
-      if Regex.match?(~r/\A[0-9a-f]{64}\z/, id) do
-        case File.rm(Path.join(directory, id)) do
-          :ok -> {:cont, :ok}
-          {:error, :enoent} -> {:cont, :ok}
-          _ -> {:halt, {:error, :storage_unavailable}}
-        end
-      else
-        {:halt, {:error, :storage_unavailable}}
+    removed = for {id, _ref} <- refs(old_term), not Map.has_key?(retained, id), do: id
+
+    if Enum.all?(removed, &blob_id?/1) do
+      delete_files(directory, unmarked_blobs(removed, persisted))
+    else
+      {:error, :storage_unavailable}
+    end
+  end
+
+  defp blob_id?(name), do: Regex.match?(~r/\A[0-9a-f]{64}\z/, name)
+
+  # A plain string can be user text or a marker that could not be attached.
+  # Leave it unchanged and keep the file until the reference can be resolved.
+  defp unmarked_blobs([], _term), do: []
+
+  defp unmarked_blobs(ids, term) do
+    candidates = MapSet.new(ids)
+    unmarked = remove_marked_blobs(term, candidates)
+    retained_count = MapSet.size(candidates) - MapSet.size(unmarked)
+
+    if retained_count > 0 do
+      Logger.warning(
+        "event=harklight_unresolved_large_data_reference retained_blobs=#{retained_count}"
+      )
+    end
+
+    Enum.filter(ids, &MapSet.member?(unmarked, &1))
+  end
+
+  defp remove_marked_blobs(
+         <<@persisted_ref_prefix, id::binary-size(64), "; bytes=", size::binary>>,
+         candidates
+       ) do
+    if MapSet.member?(candidates, id) and Regex.match?(~r/\A(?:0|[1-9][0-9]*)\]\z/, size),
+      do: MapSet.delete(candidates, id),
+      else: candidates
+  end
+
+  defp remove_marked_blobs(%Ref{}, candidates), do: candidates
+
+  defp remove_marked_blobs(term, candidates) when is_map(term),
+    do:
+      :maps.fold(
+        fn _key, value, remaining -> remove_marked_blobs(value, remaining) end,
+        candidates,
+        term
+      )
+
+  defp remove_marked_blobs(term, candidates) when is_tuple(term),
+    do: remove_marked_blobs(Tuple.to_list(term), candidates)
+
+  defp remove_marked_blobs(term, candidates) when is_list(term),
+    do: Enum.reduce(term, candidates, &remove_marked_blobs/2)
+
+  defp remove_marked_blobs(_term, candidates), do: candidates
+
+  defp delete_files(directory, names) do
+    Enum.reduce_while(names, :ok, fn name, :ok ->
+      case File.rm(Path.join(directory, name)) do
+        :ok -> {:cont, :ok}
+        {:error, :enoent} -> {:cont, :ok}
+        _ -> {:halt, {:error, :storage_unavailable}}
       end
     end)
   end
