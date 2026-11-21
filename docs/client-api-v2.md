@@ -1327,8 +1327,11 @@ also include the message or entry affected by the same transaction.
   view as in §5.1 and returns the resolved device name and delivery state.
 - **Files.** An agent uses the §4 device download response for
   `GET /v2/files/{file_id}`, including its stored type and quoted sha256
-  ETag. It can download files it is authorized to read through its own
-  messages and their conversations. An agent may discard only its own
+  ETag. `FileCreated.file_id` is the upload handle, accepted by a write's
+  `file_ids` and by DELETE. The `FileRef.file_id` attached to a message or
+  entry is the download ID. Downloading by upload handle returns
+  `404 not_found`. An agent can download files it is authorized to read
+  through its messages and their conversations. It may discard only its own
   upload while it is unattached. An unknown or inaccessible file answers
   `404 not_found`. An attached upload answers
   `409 already_closed`.
