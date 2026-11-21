@@ -995,6 +995,26 @@ defmodule AttentionServer.ClientAPIResourcesTest do
                ["i51", "i52"]
     end
 
+    test "repeated inserts at either end keep rank keys bounded" do
+      initial = Enum.map(1..25, &"i#{&1}")
+
+      for side <- [:front, :back] do
+        Enum.reduce(26..1_025, {initial, Resources.rank_keys(%{}, initial)}, fn n, {ids, keys} ->
+          order =
+            case side do
+              :front -> ["i#{n}" | Enum.drop(ids, -1)]
+              :back -> tl(ids) ++ ["i#{n}"]
+            end
+
+          next = Resources.rank_keys(keys, order)
+          ordered = in_order(next, order)
+          assert ordered?(ordered)
+          assert Enum.all?(ordered, &(byte_size(&1) <= 48))
+          {order, next}
+        end)
+      end
+    end
+
     test "any reordering of previous keys yields an ordered assignment" do
       for seed <- 1..25 do
         :rand.seed(:exsss, {seed, seed, seed})
