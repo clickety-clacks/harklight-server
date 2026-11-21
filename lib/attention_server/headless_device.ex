@@ -16,11 +16,17 @@ defmodule AttentionServer.HeadlessDevice do
 
   import Bitwise
 
-  alias AttentionServer.{DeviceIdentity, HeadlessTLS, JSON}
+  import AttentionServer.HeadlessV2Write,
+    only: [
+      existing_private_directory: 1,
+      hex: 1,
+      private_directory: 1,
+      read_document: 1,
+      read_json: 1,
+      write_private: 2
+    ]
 
-  # Size cap on the small JSON documents the enrollment flow stores
-  # (`server.json`, `enrollment.json`) and on v2 operation journals.
-  @max_local_document 2 * 2 * 1024 * 1024 + 16_384
+  alias AttentionServer.{DeviceIdentity, HeadlessTLS, HeadlessV2Write, JSON}
 
   # Inbox page size and change-batch size for client API v2 reads (the
   # contract's maxima).
@@ -29,59 +35,25 @@ defmodule AttentionServer.HeadlessDevice do
 
   def read(directory, endpoint), do: v2_read(directory, endpoint)
 
-  # The answer file over client API v2 is the contract's AnswerBody: an object
-  # with at most one of choice, comment and result, and optionally
-  # request_revision. `{}` answers with no comment.
-  @v2_answer_members ~w(request_revision choice comment result)
-
+  # The answer file is the contract's AnswerBody: an object with at most one of
+  # choice, comment and result, and optionally request_revision. `{}` answers
+  # with no comment.
   def respond(directory, endpoint, sender, message_id, answer_file) do
     identity = {Path.join(directory, "identity.pem"), Path.join(directory, "identity.key")}
+    request = %{"sender_id" => sender, "message_id" => message_id}
 
     with :ok <- existing_private_directory(directory),
          {:ok, answer} <- read_document(answer_file),
-         :ok <- v2_answer_body(answer),
+         true <- HeadlessV2Write.answer_body?(answer) || {:error, :invalid_answer},
          {:ok, _} <- enrolled_identity(directory, endpoint),
          {:ok, saved} <-
-           v2_saved_answer(directory, endpoint, %{
-             "sender_id" => sender,
-             "message_id" => message_id,
-             "answer" => answer
-           }) do
-      path = "/v2/items/" <> URI.encode(saved["item_id"], &URI.char_unreserved?/1) <> "/answer"
-
-      headers = [
-        {"accept", "application/json"},
-        {"content-type", "application/json"},
-        {"idempotency-key", saved["idempotency_key"]}
-      ]
-
-      case HeadlessTLS.v2_request(
-             endpoint,
-             identity,
-             "POST",
-             path,
-             headers,
-             JSON.encode!(saved["body"])
-           ) do
-        {:ok, status, response_headers, %{"rev" => rev} = result}
-        when status in [200, 201] and is_integer(rev) ->
-          {:ok,
-           result
-           |> Map.put("idempotency_key", saved["idempotency_key"])
-           |> Map.put(
-             "replayed",
-             {"idempotent-replayed", "true"} in response_headers
-           )}
-
-        {:ok, _status, _headers, %{"error" => token} = error} when is_binary(token) ->
-          {:error, {:server, error}}
-
-        {:ok, _status, _headers, _body} ->
-          {:error, :invalid_v2_response}
-
-        error ->
-          error
-      end
+           HeadlessV2Write.saved_answer(directory, Map.put(request, "answer", answer), nil, fn ->
+             with {:ok, item} <- v2_resolve(directory, endpoint, request) do
+               body = Map.put_new(answer, "request_revision", item["request_revision"])
+               {:ok, item["item_id"], body}
+             end
+           end) do
+      HeadlessV2Write.post_answer(endpoint, identity, saved)
     end
   end
 
@@ -252,54 +224,6 @@ defmodule AttentionServer.HeadlessDevice do
     end
   end
 
-  defp v2_answer_body(answer) when is_map(answer) do
-    chosen = Enum.count(~w(choice comment result), &Map.has_key?(answer, &1))
-
-    if Enum.all?(Map.keys(answer), &(&1 in @v2_answer_members)) and chosen <= 1,
-      do: :ok,
-      else: {:error, :invalid_answer}
-  end
-
-  defp v2_answer_body(_answer), do: {:error, :invalid_answer}
-
-  # The exact request is stored, with its Idempotency-Key, before the first
-  # send. A retry of the same sender, message and answer file reuses it as is,
-  # so an uncertain result is resent with the same key and body.
-  defp v2_saved_answer(directory, endpoint, semantic) do
-    digest = hex(:crypto.hash(:sha256, JSON.encode!(semantic)))
-    path = Path.join([directory, "operations", "v2-" <> digest <> ".json"])
-
-    with :ok <- private_directory(Path.dirname(path)) do
-      case read_json(path) do
-        {:ok,
-         %{"request" => ^semantic, "item_id" => id, "body" => body, "idempotency_key" => key} =
-             saved}
-        when is_binary(id) and is_map(body) and is_binary(key) ->
-          {:ok, saved}
-
-        {:error, :enoent} ->
-          with {:ok, item} <- v2_resolve(directory, endpoint, semantic) do
-            saved = %{
-              "request" => semantic,
-              "item_id" => item["item_id"],
-              "body" =>
-                Map.put_new(semantic["answer"], "request_revision", item["request_revision"]),
-              "idempotency_key" => uuid_v4()
-            }
-
-            case write_private(path, saved, :new) do
-              :ok -> {:ok, saved}
-              {:error, :eexist} -> v2_saved_answer(directory, endpoint, semantic)
-              other -> other
-            end
-          end
-
-        _ ->
-          {:error, :operation_conflict}
-      end
-    end
-  end
-
   # The item the sender's message became, as delivered to this device: a fresh
   # read, matched by sender and the message's own message_id. As today, an item
   # this device originated (no `as`) is not answered; the server authorizes
@@ -348,116 +272,9 @@ defmodule AttentionServer.HeadlessDevice do
 
   defp address_string(address) when is_list(address), do: List.to_string(address)
 
-  defp uuid_v4 do
-    <<a::32, b::16, c::16, d::16, e::48>> = :crypto.strong_rand_bytes(16)
-
-    Enum.join(
-      [
-        integer_hex(a, 8),
-        integer_hex(b, 4),
-        integer_hex(0x4000 ||| (c &&& 0x0FFF), 4),
-        integer_hex(0x8000 ||| (d &&& 0x3FFF), 4),
-        integer_hex(e, 12)
-      ],
-      "-"
-    )
-  end
-
-  defp integer_hex(value, width),
-    do: value |> Integer.to_string(16) |> String.downcase() |> String.pad_leading(width, "0")
-
-  defp hex(bytes), do: Base.encode16(bytes, case: :lower)
-
-  defp private_directory(path) do
-    case File.mkdir(path) do
-      :ok ->
-        File.chmod(path, 0o700)
-
-      {:error, :eexist} ->
-        existing_private_directory(path)
-
-      error ->
-        error
-    end
-  end
-
-  defp existing_private_directory(path) do
-    case File.lstat(path) do
-      {:ok, %File.Stat{type: :directory, mode: mode}} ->
-        if (mode &&& 0o077) == 0, do: :ok, else: {:error, :unsafe_local_directory}
-
-      _ ->
-        {:error, :unsafe_local_directory}
-    end
-  end
-
-  defp write_private(path, value, mode \\ :replace) when mode in [:replace, :new] do
-    temporary = path <> ".new-" <> integer_hex(System.unique_integer([:positive]), 1)
-
-    with {:ok, io} <- File.open(temporary, [:write, :exclusive, :binary]) do
-      result =
-        with :ok <- File.chmod(temporary, 0o600),
-             :ok <- IO.binwrite(io, JSON.encode!(value) <> "\n"),
-             :ok <- :file.sync(io) do
-          :ok
-        end
-
-      _ = File.close(io)
-
-      case result do
-        :ok ->
-          installed =
-            if mode == :new,
-              do: File.ln(temporary, path),
-              else: File.rename(temporary, path)
-
-          _ = File.rm(temporary)
-
-          case installed do
-            :ok ->
-              case System.cmd("sync", [Path.dirname(path)], stderr_to_stdout: true) do
-                {_, 0} -> :ok
-                _ -> {:error, :local_save_failed}
-              end
-
-            {:error, :eexist} ->
-              {:error, :eexist}
-
-            _ ->
-              {:error, :local_save_failed}
-          end
-
-        _ ->
-          _ = File.rm(temporary)
-          {:error, :local_save_failed}
-      end
-    end
-  end
-
-  defp read_document(path) do
-    with {:ok, contents} <- File.read(path),
-         {:ok, value} <- JSON.decode_line(contents <> "\n", byte_size(contents) + 1) do
-      {:ok, value}
-    else
-      _ -> {:error, :invalid_document}
-    end
-  end
-
   # Local state the tool wrote itself: no server frame limit applies (review
   # C6-2); the store holds every item the person can see.
   defp read_local_json(path) do
     with {:ok, contents} <- File.read(path), do: JSON.decode_line(contents <> "\n")
-  end
-
-  defp read_json(path) do
-    with {:ok, contents} <- File.read(path),
-         true <- byte_size(contents) <= @max_local_document do
-      # Stored documents need no line terminator. The added LF is decoder
-      # framing only; keep the limit on the original file bytes.
-      JSON.decode_line(contents <> "\n", @max_local_document + 1)
-    else
-      false -> {:error, :bad_frame}
-      error -> error
-    end
   end
 end
