@@ -338,10 +338,21 @@ defmodule AttentionServer.ClientAPIListenerTest do
     assert %{"error" => "retry_later", "retryable" => true} = json(response)
 
     # The limit is counted before authentication and routing, so a saturated
-    # server sheds every request before it reaches the Relay.
-    assert {:ok, conn, response} = request(conn, "GET", "/v2/nothing")
-    assert response.status == 503
-    assert %{"error" => "retry_later"} = json(response)
+    # server sheds every request before it reaches the Relay: with the Relay
+    # suspended, authenticating would block, so only an early limit answers.
+    :ok = :sys.suspend(relay)
+
+    conn =
+      try do
+        Enum.reduce(["/v2/whoami", "/v2/nothing"], conn, fn path, conn ->
+          assert {:ok, conn, response} = request(conn, "GET", path)
+          assert response.status == 503
+          assert %{"error" => "retry_later"} = json(response)
+          conn
+        end)
+      after
+        :ok = :sys.resume(relay)
+      end
 
     # A stream route does not take a slot.
     assert {:ok, conn, stream_ref} = Mint.HTTP.request(conn, "GET", "/v2/held-stream", [], nil)
