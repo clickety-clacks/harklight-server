@@ -2,6 +2,7 @@ defmodule AttentionServer.AgentChangeLogTest do
   use ExUnit.Case, async: false
 
   alias AttentionServer.{AgentChangeLog, ChangeLog, JSON, Relay}
+  alias AttentionServer.AgentAPI.FeedActivity
   alias Exqlite.Sqlite3
 
   @session "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
@@ -277,6 +278,66 @@ defmodule AttentionServer.AgentChangeLogTest do
     assert {:ok, rows, false, next} = read(relay, "origin", previous)
     assert [{"affected", rev}] = messages(rows)
     assert previous < rev and rev <= next
+    GenServer.stop(relay)
+  end
+
+  test "open feeds and a recent batch cover sessions independently", ctx do
+    relay = start(ctx)
+    setup_people(relay)
+    forward(relay, "origin", "covered", 1, @session)
+    forward(relay, "origin", "uncovered", 2, @other_session)
+
+    scope = {"A", "origin", @session}
+    other = {"A", "origin", @other_session}
+
+    feed = %{
+      relay: relay,
+      principal: %{kind: :device, person: "A", key: "origin"},
+      params: %{session: @session}
+    }
+
+    FeedActivity.observe(feed, :open)
+    FeedActivity.observe(feed, :open)
+    FeedActivity.observe(feed, :close)
+
+    state = :sys.get_state(relay)
+    assert FeedActivity.listening?(state, scope)
+    refute FeedActivity.listening?(state, other)
+
+    assert get_in(state.store.engine.route_b_index, [
+             :conversation_summary_by_item,
+             key("covered"),
+             :availability,
+             :payload,
+             "availability"
+           ]) == "listening"
+
+    FeedActivity.observe(feed, :batch)
+    FeedActivity.observe(feed, :close)
+    state = :sys.get_state(relay)
+    assert FeedActivity.listening?(state, scope)
+
+    {_, token} = state.agent_feed_activity.batches[scope]
+    send(relay, {:agent_feed_activity, {:expire, token}, scope})
+
+    refute FeedActivity.listening?(:sys.get_state(relay), scope)
+
+    FeedActivity.observe(feed, :open)
+    assert FeedActivity.listening?(:sys.get_state(relay), scope)
+    GenServer.stop(relay)
+
+    relay = start(ctx)
+    state = :sys.get_state(relay)
+    refute FeedActivity.listening?(state, scope)
+
+    assert get_in(state.store.engine.route_b_index, [
+             :conversation_summary_by_item,
+             key("covered"),
+             :availability,
+             :payload,
+             "availability"
+           ]) == "not_listening"
+
     GenServer.stop(relay)
   end
 
