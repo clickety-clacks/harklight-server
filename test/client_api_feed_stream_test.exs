@@ -430,6 +430,105 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
     assert replayed == Map.new(messages, &{&1["item_id"], &1})
   end
 
+  test "agent entry replay reaches the reply's changed priority after an urgency revision",
+       ctx do
+    assert :ok = Relay.setup_sender(ctx.relay, ctx.reader, "app:agent")
+
+    message = %{
+      "sender_id" => "app:agent",
+      "message_id" => "priority-revision",
+      "created_at" => 1,
+      "title" => "A request"
+    }
+
+    assert %{"type" => "ok", "seq" => accepted} =
+             request(ctx.relay, ctx.reader, %{
+               "type" => "forward",
+               "op_id" => op(1),
+               "session_handle" => @handle,
+               "message" => message
+             })
+
+    target = Map.take(message, ["sender_id", "message_id"])
+
+    assert %{"type" => "ok", "event_id" => turn} =
+             request(
+               ctx.relay,
+               "origin",
+               Map.merge(target, %{
+                 "type" => "discussion",
+                 "op_id" => op(2),
+                 "request_revision" => 1,
+                 "text" => "Question"
+               })
+             )
+
+    assert %{"type" => "ok", "seq" => position} =
+             request(
+               ctx.relay,
+               ctx.reader,
+               Map.merge(target, %{
+                 "type" => "conversation_reply",
+                 "op_id" => op(3),
+                 "request_revision" => 1,
+                 "in_reply_to" => String.to_integer(turn),
+                 "text" => "Reply"
+               })
+             )
+
+    {conn, before} = agent_batch(connect(ctx), "?after=0", [])
+    assert before.status == 200
+
+    assert {:ok, %{"changes" => changes, "rev" => cursor}} =
+             JSON.decode_line(before.body <> "\n")
+
+    assert [reply] =
+             for(
+               %{"kind" => "entry", "data" => %{"position" => ^position} = entry} <- changes,
+               do: entry
+             )
+
+    assert %{"priority" => %{"level" => "normal"}} = reply
+
+    assert %{"type" => "ok", "revision" => 2} =
+             request(
+               ctx.relay,
+               ctx.reader,
+               Map.merge(target, %{
+                 "type" => "conversation_revise",
+                 "op_id" => op(4),
+                 "base_revision" => 1,
+                 "message" => Map.put(message, "urgency", "high")
+               })
+             )
+
+    {conn, after_revision} = agent_batch(conn, "?after=#{cursor}", [])
+    assert after_revision.status == 200
+    assert {:ok, %{"changes" => changes}} = JSON.decode_line(after_revision.body <> "\n")
+
+    replayed =
+      Enum.reduce(changes, reply, fn
+        %{"kind" => "entry", "data" => %{"position" => ^position, "rev" => rev} = entry}, held ->
+          if rev > held["rev"], do: entry, else: held
+
+        _, held ->
+          held
+      end)
+
+    id = ClientAPI.Resources.item_id(%{accepted_seq: accepted})
+
+    assert {:ok, conn, ref} =
+             Mint.HTTP.request(conn, "GET", "/v2/agent/messages/#{id}/entries", [], nil)
+
+    {_conn, snapshot} = collect(conn, ref)
+    assert snapshot.status == 200
+    assert {:ok, %{"entries" => entries}} = JSON.decode_line(snapshot.body <> "\n")
+    current = Enum.find(entries, &(&1["position"] == position))
+    assert %{"priority" => %{"level" => "high"}} = current
+    assert replayed == current
+    assert replayed["rev"] > reply["rev"]
+  end
+
   test "filtered agent SSE resumes across concurrent writes and converges with the snapshot",
        ctx do
     Application.put_env(:attention_server, :client_api_feed_heartbeat_ms, 100)
