@@ -2,10 +2,10 @@ defmodule AttentionServer.Server do
   @moduledoc """
   Opt-in supervised Relay, `/relay` WebSocket and separate owner/agent TLS listeners.
 
-  With the temporary `client_api_v2` flag on (read once at startup from the
-  feature-flags file, see docs/feature-flags.md), the device port serves client
-  API v2 (`/v2`) through `ClientAPI.Listener` instead of the `/relay` WebSocket.
-  The two never run together.
+  The device port serves client API v2 (`/v2`) through `ClientAPI.Listener`.
+  The temporary `client_api_v2` flag is on by default (read once at startup from
+  the feature-flags file, see docs/feature-flags.md); setting it to false starts
+  the retained `/relay` WebSocket instead. The two never run together.
 
   Certificate paths and a durable store path are explicit operator config.
   Production deployment remains separate work.
@@ -99,6 +99,7 @@ defmodule AttentionServer.Server do
         deployment_mode: deployment_mode,
         jev_score_record_path: Keyword.get(opts, :jev_score_record_path),
         feature_flags_path: Keyword.get(opts, :feature_flags_path),
+        client_api_v2: client_api_v2,
         upload_cap: upload_cap
       ]
 
@@ -309,9 +310,11 @@ defmodule AttentionServer.Server do
       :erlang.raise(kind, reason, __STACKTRACE__)
   end
 
+  # On unless the feature-flags file sets the key to false. Relay receives
+  # this resolved value, so both change logs follow the same choice.
   defp client_api_v2_flag(feature_flags_path) do
     {flags, _warned} = AttentionServer.FeatureFlags.read(feature_flags_path, true)
-    Map.get(flags, "client_api_v2") == true
+    Map.get(flags, "client_api_v2", true) == true
   end
 
   defp normalize_deployment_mode(mode) when mode in [:self_hosted, :saas], do: mode

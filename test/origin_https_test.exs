@@ -32,6 +32,7 @@ defmodule AttentionServer.OriginHTTPSTest do
 
     {:ok, server} =
       Server.start_link(
+        feature_flags_path: AttentionServer.LegacyProtocol.flags!(Path.dirname(store_path)),
         store_path: store_path,
         certfile: Path.join(certs, "server.pem"),
         keyfile: Path.join(certs, "server.key"),
@@ -628,6 +629,7 @@ defmodule AttentionServer.OriginHTTPSTest do
 
     {:ok, restarted} =
       Server.start_link(
+        feature_flags_path: AttentionServer.LegacyProtocol.flags!(Path.dirname(c.store_path)),
         store_path: c.store_path,
         certfile: Path.join(c.certs, "server.pem"),
         keyfile: Path.join(c.certs, "server.key"),
@@ -821,6 +823,7 @@ defmodule AttentionServer.OriginHTTPSTest do
 
     {:ok, restarted} =
       Server.start_link(
+        feature_flags_path: AttentionServer.LegacyProtocol.flags!(Path.dirname(c.store_path)),
         store_path: c.store_path,
         certfile: Path.join(c.certs, "server.pem"),
         keyfile: Path.join(c.certs, "server.key"),
@@ -887,6 +890,7 @@ defmodule AttentionServer.OriginHTTPSTest do
 
     {:ok, restarted} =
       Server.start_link(
+        feature_flags_path: AttentionServer.LegacyProtocol.flags!(Path.dirname(c.store_path)),
         store_path: c.store_path,
         certfile: Path.join(c.certs, "server.pem"),
         keyfile: Path.join(c.certs, "server.key"),

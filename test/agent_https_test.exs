@@ -733,8 +733,11 @@ defmodule AttentionServer.AgentHTTPSTest do
              nil
   end
 
+  # The /agent/v1 listener and its WebSocket devices are the retained
+  # protocol 0.1 path, so these servers opt out of the v2 default.
   defp server_options(certs, path) do
     [
+      feature_flags_path: AttentionServer.LegacyProtocol.flags!(Path.dirname(path)),
       store_path: path,
       certfile: Path.join(certs, "server.pem"),
       keyfile: Path.join(certs, "server.key"),

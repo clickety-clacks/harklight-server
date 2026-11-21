@@ -6,9 +6,9 @@ defmodule AttentionServer.DashboardSelfHostedWebTest do
   @origin "https://server.example.test:9443"
   @recipient "00000000-0000-4000-8000-000000000001"
   @upload_id "00000000-0000-4000-8000-000000000002"
-  @web_commit "4bc2aaaac830e2e1619c07c47e70e5ce3f9e9765"
-  @web_archive "harklight-web-4bc2aaaac830e2e1619c07c47e70e5ce3f9e9765.tar.gz"
-  @web_archive_sha256 "11d93d654ab48e4f368464740c173cf4774cbcda3cd7a15ede28160dd3c6ce29"
+  @web_commit "3434a38c86cd3069952cd67d9b0bf0650b86d224"
+  @web_archive "harklight-web-3434a38c86cd3069952cd67d9b0bf0650b86d224.tar.gz"
+  @web_archive_sha256 "563f1448b79b398abf5ace4fcb5411fed70d5b2eba01f2cdec2aeacfdeffbc5b"
   @dashboard_csp "default-src 'none'; script-src 'self'; connect-src 'self'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'"
 
   defmodule Backend do

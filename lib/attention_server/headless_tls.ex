@@ -154,8 +154,8 @@ defmodule AttentionServer.HeadlessTLS do
 
   @doc """
   Whether the tools speak client API v2: the temporary `client_api_v2` key in
-  the `ATTENTION_SERVER_FEATURE_FLAGS_PATH` file, the same flag and file the
-  server reads (docs/feature-flags.md). Off when unset.
+  the `ATTENTION_SERVER_FEATURE_FLAGS_PATH` file, the same flag, file and
+  default the server uses (docs/feature-flags.md). On unless set to false.
   """
   def client_api_v2? do
     {flags, _warned} =
@@ -164,7 +164,7 @@ defmodule AttentionServer.HeadlessTLS do
         true
       )
 
-    Map.get(flags, "client_api_v2") == true
+    Map.get(flags, "client_api_v2", true) == true
   end
 
   @doc """

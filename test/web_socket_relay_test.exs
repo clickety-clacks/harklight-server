@@ -1723,6 +1723,7 @@ defmodule AttentionServer.WebSocketRelayTest do
 
     {:ok, server} =
       Server.start_link(
+        feature_flags_path: AttentionServer.LegacyProtocol.flags!(Path.dirname(path)),
         store_path: path <> ".supervised",
         certfile: Path.join(certs, "server.pem"),
         keyfile: Path.join(certs, "server.key"),

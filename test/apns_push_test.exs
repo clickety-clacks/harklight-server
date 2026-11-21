@@ -155,10 +155,15 @@ defmodule AttentionServer.APNSPushTest do
     }
   end
 
-  test "v2 bounds a stalled first push, dispatches to another device and retries after restart",
-       ctx do
-    log = capture_log(fn -> assert_bounded_push_and_restart(ctx) end)
+  for flags <- [:default, :explicit_on] do
+    test "v2 (#{flags}) bounds a stalled first push, dispatches to another device and retries after restart",
+         ctx do
+      log = capture_log(fn -> assert_bounded_push_and_restart(ctx, unquote(flags)) end)
+      assert_bounded_push_log(log)
+    end
+  end
 
+  defp assert_bounded_push_log(log) do
     assert log =~ ~r/event=harklight_apns_attempt duration_ms=\d+ outcome=timeout\b/
 
     assert length(
@@ -176,6 +181,7 @@ defmodule AttentionServer.APNSPushTest do
     store_path = Path.join(ctx.dir, "legacy-push.sqlite3")
     apns = apns_options(ctx) ++ [attempt_timeout_ms: 1_500]
     server = start_test_server(server_options(ctx.certs, store_path) ++ [apns: apns])
+
     refute Server.client_api_v2?(server)
     relay = Server.relay(server)
     {sender_key, app_key} = setup_test_devices(relay, ctx.certs)
@@ -1614,7 +1620,15 @@ defmodule AttentionServer.APNSPushTest do
     assert String.trim(verification) == "Verified OK"
   end
 
+  # These tests register and observe push over the retained /relay device
+  # path, so they opt out of the v2 default. The bounded-attempt test starts
+  # from base_server_options/2 to run on the v2 path.
   defp server_options(certs, store_path) do
+    base_server_options(certs, store_path) ++
+      [feature_flags_path: AttentionServer.LegacyProtocol.flags!(Path.dirname(store_path))]
+  end
+
+  defp base_server_options(certs, store_path) do
     [
       store_path: store_path,
       certfile: Path.join(certs, "server.pem"),
@@ -1711,14 +1725,23 @@ defmodule AttentionServer.APNSPushTest do
     server
   end
 
-  defp assert_bounded_push_and_restart(ctx) do
-    flags = Path.join(ctx.dir, "flags.json")
-    File.write!(flags, ~s({"client_api_v2":true}))
+  defp assert_bounded_push_and_restart(ctx, flags) do
     store_path = Path.join(ctx.dir, "bounded-push.sqlite3")
 
+    flag_options =
+      case flags do
+        :default ->
+          []
+
+        :explicit_on ->
+          path = Path.join(ctx.dir, "flags.json")
+          File.write!(path, ~s({"client_api_v2":true}))
+          [feature_flags_path: path]
+      end
+
     options =
-      server_options(ctx.certs, store_path) ++
-        [apns: apns_options(ctx) ++ [attempt_timeout_ms: 10_000], feature_flags_path: flags]
+      base_server_options(ctx.certs, store_path) ++
+        [apns: apns_options(ctx) ++ [attempt_timeout_ms: 10_000]] ++ flag_options
 
     server = start_test_server(options)
     assert Server.client_api_v2?(server)
