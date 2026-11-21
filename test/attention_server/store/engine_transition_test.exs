@@ -1690,6 +1690,56 @@ defmodule AttentionServer.Store.EngineTransitionTest do
     :ok = Store.close(reopened)
   end
 
+  test "keyed browser sign-in and guided enrollment replay through Relay after reopen" do
+    path = legacy_store_path()
+    {:ok, legacy} = Store.open(path)
+    assert {:ok, _} = KeyedMigration.convert(legacy)
+    :ok = Store.close(legacy)
+    owner = enrollment_certificate("guided owner")
+    device = enrollment_certificate("guided device")
+    {:ok, owner_key} = AttentionServer.DeviceIdentity.from_certificate(owner)
+    {:ok, device_key} = AttentionServer.DeviceIdentity.from_certificate(device)
+    pem = :public_key.pem_encode([{:Certificate, owner, :not_encrypted}])
+    {:ok, config} = AttentionServer.GuidedJoin.configuration("relay.test", 18444, 18443, pem)
+    opts = [store_path: path, store_mode: :keyed, join_configuration: config]
+    {:ok, relay} = Relay.start_link(opts)
+    assert {:ok, person} = Relay.operator_bootstrap(relay, owner)
+
+    assert {:ok, %{"sign_in_token" => browser}} =
+             Relay.owner_browser_sign_in_create(relay, person, owner_key)
+
+    request = "00000000-0000-4000-8000-000000000083"
+
+    assert {:ok, %{"invite_token" => token} = invitation} =
+             Relay.owner_invite_create(relay, person, owner_key, request)
+
+    assert {:ok, ^invitation} = Relay.owner_invite_create(relay, person, owner_key, request)
+    secret = String.duplicate("12", 32)
+
+    assert {:ok, %{"approval_code" => code, "person_id" => ^person} = pending} =
+             Relay.invited_enroll(relay, token, device, "guided", secret)
+
+    generation = :sys.get_state(relay).store.version
+    GenServer.stop(relay)
+
+    {:ok, reopened} = Relay.start_link(opts)
+    assert {:ok, ^pending} = Relay.invited_enroll(reopened, token, device, "guided", secret)
+    assert :sys.get_state(reopened).store.version == generation
+
+    assert {:ok, %{person_id: ^person, owner_revision: 1}} =
+             Relay.consume_browser_sign_in(reopened, browser)
+
+    assert {:error, :invalid_sign_in} = Relay.consume_browser_sign_in(reopened, browser)
+
+    assert {:ok, ^device_key} =
+             Relay.owner_pending_approve(reopened, person, owner_key, code, device_key, nil, [])
+
+    assert %{state: :approved, key: ^device_key, joined: true} =
+             :sys.get_state(reopened).store.engine.pending_history[code]
+
+    GenServer.stop(reopened)
+  end
+
   defp enrollment_certificate(name) do
     %{cert: der} =
       :public_key.pkix_test_root_cert(String.to_charlist(name), key: {:namedCurve, :secp256r1})

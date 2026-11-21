@@ -24,15 +24,17 @@ defmodule AttentionServer.BrowserSignIn do
     with {:ok, revision} <- Engine.owner_revision(engine, person, owner_key),
          true <- hash?(hash),
          true <- is_integer(now) and now >= 0 do
-      tokens =
-        Map.reject(engine.browser_sign_ins, fn {_, item} ->
-          not is_nil(Map.get(item, :consumed_at)) or
-            Engine.owner_revision(engine, item.person, item.owner_key) !=
-              {:ok, item.owner_revision}
+      engine =
+        Enum.reduce(engine.browser_sign_ins, engine, fn {key, item}, next ->
+          if not is_nil(Map.get(item, :consumed_at)) or
+               Engine.owner_revision(engine, item.person, item.owner_key) !=
+                 {:ok, item.owner_revision},
+             do: Engine.delete_row(next, :browser_sign_ins, key),
+             else: next
         end)
 
       cond do
-        Map.has_key?(tokens, hash) ->
+        Map.has_key?(engine.browser_sign_ins, hash) ->
           {:error, :collision}
 
         true ->
@@ -44,7 +46,7 @@ defmodule AttentionServer.BrowserSignIn do
             expires_at: nil
           }
 
-          {:ok, %{engine | browser_sign_ins: Map.put(tokens, hash, record)}, record}
+          {:ok, Engine.put_row(engine, :browser_sign_ins, hash, record), record}
       end
     else
       {:error, :forbidden} -> {:error, :forbidden}
@@ -57,7 +59,7 @@ defmodule AttentionServer.BrowserSignIn do
          {:ok, revision} <- Engine.owner_revision(engine, item.person, item.owner_key),
          true <- revision == item.owner_revision do
       if is_nil(Map.get(item, :consumed_at)) do
-        next = %{engine | browser_sign_ins: Map.delete(engine.browser_sign_ins, hash)}
+        next = Engine.delete_row(engine, :browser_sign_ins, hash)
 
         principal = %{
           person_id: item.person,
@@ -86,7 +88,8 @@ defmodule AttentionServer.BrowserSignIn do
 
   # Records keep the stored shape; older ones carry a deadline that is no longer
   # enforced, current ones carry nil.
-  defp valid_record?(engine, hash, record) when is_map(record) do
+  @doc false
+  def valid_record?(engine, hash, record) when is_map(record) do
     person = Map.get(record, :person)
     owner_key = Map.get(record, :owner_key)
     owner_revision = Map.get(record, :owner_revision)
@@ -108,7 +111,7 @@ defmodule AttentionServer.BrowserSignIn do
       (current? or legacy?)
   end
 
-  defp valid_record?(_engine, _hash, _record), do: false
+  def valid_record?(_engine, _hash, _record), do: false
 
   defp hash?(hash), do: is_binary(hash) and byte_size(hash) == 32
   defp key?(key), do: is_binary(key) and Regex.match?(~r/\A[0-9a-f]{64}\z/, key)

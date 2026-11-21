@@ -3367,6 +3367,20 @@ defmodule AttentionServer.Store do
     end
   end
 
+  defp valid_authority_reference?(engine, {:row, :browser_sign_ins, hash}) do
+    case Map.fetch(engine.browser_sign_ins, hash) do
+      {:ok, record} -> BrowserSignIn.valid_record?(engine, hash, record)
+      :error -> true
+    end
+  end
+
+  defp valid_authority_reference?(engine, {:row, :join_invitations, hash}) do
+    case Map.fetch(engine.join_invitations, hash) do
+      {:ok, record} -> GuidedJoin.valid_record?(engine, hash, record)
+      :error -> true
+    end
+  end
+
   defp valid_authority_reference?(engine, {:row, field, {person, actor} = key})
        when field in [:sender_grants, :subscriptions, :origin_feeds],
        do: not Map.has_key?(Map.fetch!(engine, field), key) or owns?(engine, person, actor)

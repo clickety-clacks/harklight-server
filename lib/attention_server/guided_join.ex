@@ -61,11 +61,7 @@ defmodule AttentionServer.GuidedJoin do
             request_id: nil
           }
 
-          {:ok,
-           %{
-             engine
-             | join_invitations: Map.put(engine.join_invitations, token_hash, invite)
-           }, invite}
+          {:ok, Engine.put_row(engine, :join_invitations, token_hash, invite), invite}
       end
     else
       {:error, :forbidden} -> {:error, :forbidden}
@@ -111,7 +107,7 @@ defmodule AttentionServer.GuidedJoin do
 
           with {:ok, next, invitation} <- create(engine, person, owner, hash, configuration) do
             invitation = %{invitation | request_id: request_id}
-            next = %{next | join_invitations: Map.put(next.join_invitations, hash, invitation)}
+            next = Engine.put_row(next, :join_invitations, hash, invitation)
             {:ok, next, invitation, token}
           end
       end
@@ -204,11 +200,10 @@ defmodule AttentionServer.GuidedJoin do
           retain_until: nil
       }
 
-      next = %{
+      next =
         pending
-        | pending_enrollments: Map.put(pending.pending_enrollments, code, bound),
-          join_invitations: Map.put(pending.join_invitations, hash, consumed)
-      }
+        |> Engine.put_row(:pending_enrollments, code, bound)
+        |> Engine.put_row(:join_invitations, hash, consumed)
 
       {:ok, next, response(next, code, item)}
     end
@@ -239,15 +234,14 @@ defmodule AttentionServer.GuidedJoin do
   end
 
   @doc "Drop invitations whose owner authority has since changed."
-  def compact(engine),
-    do: %{
-      engine
-      | join_invitations:
-          Map.reject(engine.join_invitations, fn {_, invite} ->
-            Engine.owner_revision(engine, invite.person, invite.owner_key) !=
-              {:ok, invite.owner_revision}
-          end)
-    }
+  def compact(engine) do
+    Enum.reduce(engine.join_invitations, engine, fn {key, invite}, next ->
+      if Engine.owner_revision(engine, invite.person, invite.owner_key) !=
+           {:ok, invite.owner_revision},
+         do: Engine.delete_row(next, :join_invitations, key),
+         else: next
+    end)
+  end
 
   def valid_configuration?(
         %{
@@ -276,14 +270,19 @@ defmodule AttentionServer.GuidedJoin do
   def valid_state?(engine) do
     is_map(engine.join_invitations) and
       Enum.all?(engine.join_invitations, fn {hash, invite} ->
-        hash?(hash) and map_size(invite) == 10 and Map.has_key?(engine.persons, invite.person) and
-          key?(invite.owner_key) and is_integer(invite.owner_revision) and
-          invite.owner_revision > 0 and valid_configuration?(invite.configuration) and
-          (is_nil(invite.expires_at) or (is_integer(invite.expires_at) and invite.expires_at > 0)) and
-          (is_nil(invite.retain_until) or is_integer(invite.retain_until)) and
-          (is_nil(invite.request_id) or AttentionServer.Message.uuid_v4?(invite.request_id)) and
-          valid_binding?(engine, invite)
+        valid_record?(engine, hash, invite)
       end)
+  end
+
+  @doc false
+  def valid_record?(engine, hash, invite) do
+    hash?(hash) and map_size(invite) == 10 and Map.has_key?(engine.persons, invite.person) and
+      key?(invite.owner_key) and is_integer(invite.owner_revision) and
+      invite.owner_revision > 0 and valid_configuration?(invite.configuration) and
+      (is_nil(invite.expires_at) or (is_integer(invite.expires_at) and invite.expires_at > 0)) and
+      (is_nil(invite.retain_until) or is_integer(invite.retain_until)) and
+      (is_nil(invite.request_id) or AttentionServer.Message.uuid_v4?(invite.request_id)) and
+      valid_binding?(engine, invite)
   end
 
   defp valid_binding?(_engine, %{code: nil, key: nil, secret_hash: nil}), do: true

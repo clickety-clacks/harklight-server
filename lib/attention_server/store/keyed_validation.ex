@@ -107,6 +107,9 @@ defmodule AttentionServer.Store.KeyedValidation do
             do: keys,
             else: MapSet.union(keys, Map.get(updated, {:actor, actor}, MapSet.new()))
 
+        {:row, field, code}, keys when field in [:pending_enrollments, :pending_history] ->
+          MapSet.union(keys, scoped_rows(updated, :invitation_code, code))
+
         _, keys ->
           keys
       end)
@@ -180,8 +183,14 @@ defmodule AttentionServer.Store.KeyedValidation do
   defp authority_owners(engine, {:row, field, token})
        when field in [:browser_sign_ins, :join_invitations] do
     case Map.get(Map.fetch!(engine, field), token) do
-      %{person: person} -> [{:scope, field, person}]
-      _ -> []
+      %{person: person, code: code} when is_binary(code) ->
+        [{:person, person}, {:scope, field, person}, {:scope, :invitation_code, code}]
+
+      %{person: person} ->
+        [{:person, person}, {:scope, field, person}]
+
+      _ ->
+        []
     end
   end
 

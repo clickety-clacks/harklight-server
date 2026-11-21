@@ -972,14 +972,20 @@ defmodule AttentionServer.Relay do
 
   # Issue a one-use browser sign-in for a person under its verified or server-held
   # owner key. The URL is present only when a dashboard origin is configured.
-  defp issue_browser_sign_in(state, engine, person, owner, actor) do
+  defp issue_browser_sign_in(state, engine, person, owner, actor, extra_rows \\ []) do
     token = "hbs1_" <> Base.encode16(:crypto.strong_rand_bytes(32), case: :lower)
     {:ok, hash} = AttentionServer.BrowserSignIn.token_hash(token)
     now = System.system_time(:millisecond)
 
-    case AttentionServer.BrowserSignIn.issue(engine, person, owner, hash, now) do
-      {:ok, next, record} ->
-        case commit(state.store, next, %{
+    issue = &AttentionServer.BrowserSignIn.issue(&1, person, owner, hash, now)
+
+    case track_fact(state, engine, issue) do
+      {next, {:ok, record}, touched} ->
+        touched =
+          if touched,
+            do: MapSet.union(touched, changed_rows(state.store.engine, engine, extra_rows))
+
+        case commit_request(state.store, next, touched, %{
                person: person,
                actor: actor,
                action: "owner_browser_sign_in_create"
@@ -1007,7 +1013,7 @@ defmodule AttentionServer.Relay do
             {:error, :storage_unavailable}
         end
 
-      error ->
+      {_, error, _} ->
         error
     end
   end
@@ -1215,7 +1221,7 @@ defmodule AttentionServer.Relay do
     do: {:reply, :ok, %{state | push_enabled: true}}
 
   defp dispatch_call({:claim_push, now_ms}, _from, state) when is_integer(now_ms) do
-    case track_origin_fact(state, &Engine.claim_push(&1, now_ms)) do
+    case track_fact(state, &Engine.claim_push(&1, now_ms)) do
       {next_engine, {:ok, claim}, _} when next_engine == state.store.engine ->
         {:reply, {:ok, claim}, state}
 
@@ -1497,7 +1503,7 @@ defmodule AttentionServer.Relay do
     old = state.store.engine
 
     {next, result, touched} =
-      track_origin_fact(state, &apply_origin_support(state, &1, key, declaration))
+      track_fact(state, &apply_origin_support(state, &1, key, declaration))
 
     case result do
       {:ok, %{"duplicate" => true} = reply} when next == old ->
@@ -1536,7 +1542,7 @@ defmodule AttentionServer.Relay do
     old = state.store.engine
 
     {next, result, touched} =
-      track_origin_fact(state, &apply_origin_attachment(state, &1, key, declaration))
+      track_fact(state, &apply_origin_attachment(state, &1, key, declaration))
 
     case result do
       {:ok, reply} ->
@@ -1843,7 +1849,7 @@ defmodule AttentionServer.Relay do
 
     with {:ok, person} <- Engine.authorized_person(engine, key),
          {attached, {:ok, :ok}, touched} <-
-           track_origin_fact(state, &attach_origin_session(state, &1, {person, key, handle})),
+           track_fact(state, &attach_origin_session(state, &1, {person, key, handle})),
          {:ok, store} <-
            commit_request(state.store, attached, touched, audit(engine, key, "origin_attach")) do
       stream_key = {person, key, handle}
@@ -1936,7 +1942,7 @@ defmodule AttentionServer.Relay do
        ) do
     with {:ok, person, _id, _revision} <- Engine.agent_identity(state.store.engine, key),
          {next_engine, {:ok, fields}, touched} <-
-           track_origin_fact(state, &Engine.client_agent_answer(&1, key, frame, state.clock.())) do
+           track_fact(state, &Engine.client_agent_answer(&1, key, frame, state.clock.())) do
       case commit_agent_answer(state, next_engine, person, key, frame, touched) do
         {:ok, next_state} -> {:reply, {:ok, fields}, next_state}
         :error -> {:reply, {:error, :storage_unavailable}, state}
@@ -2138,7 +2144,9 @@ defmodule AttentionServer.Relay do
          true <- is_binary(state.dashboard_origin) || {:error, :no_public_origin},
          {:ok, labelled} <- hosted_label_for(engine, person, record.test, label),
          {:ok, response, next} <-
-           issue_browser_sign_in(state, labelled, person, owner, "hosted_component") do
+           issue_browser_sign_in(state, labelled, person, owner, "hosted_component", [
+             {:row, :hosted_accounts, record.account_ref}
+           ]) do
       {:reply, {:ok, Map.fetch!(response, "sign_in_url")}, next}
     else
       {:error, reason} -> {:reply, {:error, reason}, state}
@@ -2229,11 +2237,13 @@ defmodule AttentionServer.Relay do
     with {:ok, hash} <- AttentionServer.BrowserSignIn.token_hash(token) do
       case AttentionServer.BrowserSignIn.consume(state.store.engine, hash) do
         {:ok, next, principal} ->
-          case commit(state.store, next, %{
-                 person: principal.person_id,
-                 actor: principal.owner_key,
-                 action: "browser_sign_in_consume"
-               }) do
+          audit = %{
+            person: principal.person_id,
+            actor: principal.owner_key,
+            action: "browser_sign_in_consume"
+          }
+
+          case commit_known_rows(state.store, next, audit, [{:row, :browser_sign_ins, hash}]) do
             {:ok, committed} ->
               principal = with_hosted_label(principal, :display_name, next)
               {:reply, {:ok, principal}, %{state | store: committed}}
@@ -2254,15 +2264,11 @@ defmodule AttentionServer.Relay do
     token = :crypto.strong_rand_bytes(32)
     hash = :crypto.hash(:sha256, token)
 
-    case AttentionServer.GuidedJoin.create(
-           state.store.engine,
-           person,
-           owner,
-           hash,
-           state.join_configuration
-         ) do
-      {:ok, next, invite} ->
-        case commit(state.store, next, %{
+    create = &AttentionServer.GuidedJoin.create(&1, person, owner, hash, state.join_configuration)
+
+    case track_fact(state, create) do
+      {next, {:ok, invite}, touched} ->
+        case commit_request(state.store, next, touched, %{
                person: person,
                actor: owner,
                action: "owner_invite_create"
@@ -2275,7 +2281,7 @@ defmodule AttentionServer.Relay do
             {:reply, {:error, :storage_unavailable}, state}
         end
 
-      error ->
+      {_, error, _} ->
         {:reply, error, state}
     end
   end
@@ -2305,18 +2311,22 @@ defmodule AttentionServer.Relay do
   end
 
   defp dispatch_call({:owner_invite_create, person, owner, request_id}, _from, state) do
-    result =
-      AttentionServer.GuidedJoin.create_for_request(
-        state.store.engine,
-        person,
-        owner,
-        request_id,
-        state.join_configuration
-      )
+    create = fn engine ->
+      case AttentionServer.GuidedJoin.create_for_request(
+             engine,
+             person,
+             owner,
+             request_id,
+             state.join_configuration
+           ) do
+        {:ok, next, invite, token} -> {:ok, next, {invite, token}}
+        error -> error
+      end
+    end
 
-    case result do
-      {:ok, next, invite, token} ->
-        case commit(state.store, next, %{
+    case track_fact(state, create) do
+      {next, {:ok, {invite, token}}, touched} ->
+        case commit_request(state.store, next, touched, %{
                person: person,
                actor: owner,
                action: "owner_invite_create",
@@ -2330,24 +2340,19 @@ defmodule AttentionServer.Relay do
             {:reply, {:error, :storage_unavailable}, state}
         end
 
-      error ->
+      {_, error, _} ->
         {:reply, error, state}
     end
   end
 
   defp dispatch_call({:invited_enroll, token, certificate, label, status_secret}, _from, state) do
     with {:ok, hash} <- secret_hash(token), {:ok, status_hash} <- secret_hash(status_secret) do
-      case guided_pending(
-             state.store.engine,
-             hash,
-             certificate,
-             label,
-             status_hash,
-             state.join_configuration,
-             8
-           ) do
-        {:ok, next, response} ->
-          case commit(state.store, next, %{
+      consume =
+        &guided_pending(&1, hash, certificate, label, status_hash, state.join_configuration, 8)
+
+      case track_fact(state, consume) do
+        {next, {:ok, response}, touched} ->
+          case commit_request(state.store, next, touched, %{
                  person: next.join_invitations[hash].person,
                  actor: "invited_submitter",
                  action: "invited_pending_enrollment"
@@ -2356,7 +2361,7 @@ defmodule AttentionServer.Relay do
             _ -> {:reply, {:error, :storage_unavailable}, state}
           end
 
-        error ->
+        {_, error, _} ->
           {:reply, error, state}
       end
     else
@@ -3988,7 +3993,7 @@ defmodule AttentionServer.Relay do
       %{state | origin_streams: streams, origin_streams_by_identity: streams_by_identity}
 
     {next, result, touched} =
-      track_origin_fact(state, fn engine ->
+      track_fact(state, fn engine ->
         with {:ok, next} <- Conversation.mark_detached(engine, person, origin, handle) do
           previous = origin_session_status(state, engine, key)
           current = origin_session_status(proposed, next, key)
@@ -4094,7 +4099,7 @@ defmodule AttentionServer.Relay do
   end
 
   defp agent_request(state, person, key, %{"v" => 1, "type" => "answer"} = request) do
-    case track_origin_fact(state, &Engine.agent_answer(&1, key, request)) do
+    case track_fact(state, &Engine.agent_answer(&1, key, request)) do
       {next_engine, {:ok, fields}, touched} ->
         case commit_agent_answer(state, next_engine, person, key, request, touched) do
           {:ok, next_state} ->
@@ -5579,7 +5584,7 @@ defmodule AttentionServer.Relay do
   defp commit_origin_fact(state, key, action, transition) do
     engine = state.store.engine
 
-    {next, result, touched} = track_origin_fact(state, transition)
+    {next, result, touched} = track_fact(state, transition)
 
     case result do
       {:ok, reply} ->
@@ -5593,8 +5598,10 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  defp track_origin_fact(state, transition) do
-    track_transition(state, state.store.engine, fn current ->
+  defp track_fact(state, transition), do: track_fact(state, state.store.engine, transition)
+
+  defp track_fact(state, engine, transition) do
+    track_transition(state, engine, fn current ->
       case transition.(current) do
         {:ok, next, reply} -> {next, {:ok, reply}}
         error -> {current, error}
@@ -7649,18 +7656,20 @@ defmodule AttentionServer.Relay do
   end
 
   defp commit_known_rows(%Store{mode: :keyed} = store, next, audit, addresses) do
-    codec = AttentionServer.Store.RecordCodec
-
-    touched =
-      for address <- addresses,
-          codec.lookup(store.engine, address) !== codec.lookup(next, address),
-          into: MapSet.new(),
-          do: address
-
+    touched = changed_rows(store.engine, next, addresses)
     Store.commit(store, {next, touched}, audit)
   end
 
   defp commit_known_rows(store, next, audit, _addresses), do: commit(store, next, audit)
+
+  defp changed_rows(old, next, addresses) do
+    codec = AttentionServer.Store.RecordCodec
+
+    for address <- addresses,
+        codec.lookup(old, address) !== codec.lookup(next, address),
+        into: MapSet.new(),
+        do: address
+  end
 
   defp pending_resolution_rows(code),
     do: [{:row, :pending_enrollments, code}, {:row, :pending_history, code}]
