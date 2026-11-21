@@ -7,6 +7,7 @@ defmodule AttentionServer.ClientAPIListenerTest do
 
   alias AttentionServer.{
     ClientAPI,
+    ClientAPIFeedClient,
     DashboardBrowserSession,
     DashboardHTTPS,
     DeviceIdentity,
@@ -470,6 +471,137 @@ defmodule AttentionServer.ClientAPIListenerTest do
       assert response.status == 200
       assert header(response, "request-id") == []
     end
+  end
+
+  describe "owner-registered agents on the device port" do
+    test "a registered agent reads the full view with empty grants", ctx do
+      {relay, person, owner, agent, port} = start_granted_agent(ctx, true, "granted")
+      assert :ok = Relay.setup_device(relay, person, "fixture-origin")
+
+      for {sender, id, n} <- [{"app:first", "first", 1}, {"app:second", "second", 2}] do
+        forward_granted_fixture(relay, sender, id, n)
+      end
+
+      assert {:ok, conn} = device_connect(Map.put(ctx, :port, port), "granted", :http2)
+      assert {:ok, conn, %{status: 200} = inbox} = request(conn, "GET", "/v2/inbox")
+      assert %{"items" => items, "counts" => %{"unresolved" => 2}} = json(inbox)
+      assert Enum.sort(Enum.map(items, & &1["sender"])) == ["app:first", "app:second"]
+
+      conn =
+        Enum.reduce(items, conn, fn item, conn ->
+          Enum.reduce(["", "/entries", "/revisions/1"], conn, fn suffix, conn ->
+            assert {:ok, conn, %{status: 200}} =
+                     request(conn, "GET", "/v2/items/" <> item["item_id"] <> suffix)
+
+            conn
+          end)
+        end)
+
+      assert {:ok, conn, %{status: 200} = batch} = request(conn, "GET", "/v2/changes")
+      changes = json(batch)["changes"]
+
+      assert Enum.sort(for(%{"kind" => "item", "data" => item} <- changes, do: item["sender"])) ==
+               ["app:first", "app:second"]
+
+      visible = hd(items)["item_id"]
+
+      conn =
+        Enum.reduce(
+          [
+            {"POST", "/v2/items/" <> visible <> "/replies"},
+            {"POST", "/v2/items/" <> visible <> "/seen"},
+            {"PUT", "/v2/devices/me/focus"},
+            {"DELETE", "/v2/files/anything"},
+            {"POST", "/v2/agent/messages"},
+            {"GET", "/v2/settings"},
+            {"GET", "/v2/files/anything"}
+          ],
+          conn,
+          fn {method, path}, conn ->
+            assert {:ok, conn, %{status: 403} = denied} = request(conn, method, path)
+            assert json(denied)["error"] == "forbidden"
+            conn
+          end
+        )
+
+      {conn, feed} = ClientAPIFeedClient.open_feed(conn, "?after=#{json(batch)["rev"]}")
+      {conn, feed} = ClientAPIFeedClient.await_open(conn, feed)
+      assert feed.status == 200
+
+      assert :ok = Relay.owner_revoke_agent(relay, person, owner, agent)
+      {conn, feed, closing} = ClientAPIFeedClient.until_closing(conn, feed)
+      assert closing == %{event: "closing", data: %{"reason" => "revoked"}}
+      {conn, %{done: true}} = ClientAPIFeedClient.drain(conn, feed)
+      assert {:ok, _, %{status: 401}} = request(conn, "GET", "/v2/inbox")
+    end
+
+    test "the legacy device listener does not admit an agent certificate with the flag off",
+         ctx do
+      {_relay, _person, _owner, _agent, port} = start_granted_agent(ctx, false, "granted-off")
+
+      case raw_connect(ctx.certs, port, "granted-off") do
+        {:error, {:tls_alert, {:handshake_failure, _}}} ->
+          :ok
+
+        {:ok, socket} ->
+          assert {:error, {:tls_alert, {:handshake_failure, _}}} = :ssl.recv(socket, 0, 5_000)
+      end
+    end
+  end
+
+  defp start_granted_agent(ctx, enabled, name) do
+    flags = Path.join(ctx.dir, "flags.json")
+    File.write!(flags, JSON.encode!(%{"client_api_v2" => enabled}))
+
+    server =
+      start_supervised!({Server, Keyword.put(server_opts(ctx), :feature_flags_path, flags)})
+
+    relay = Server.relay(server)
+    owner_der = TLSFixtures.certificate_der!(ctx.certs, "a1")
+    assert {:ok, person} = Relay.operator_bootstrap(relay, owner_der)
+    assert {:ok, owner} = DeviceIdentity.from_certificate(owner_der)
+
+    TLSFixtures.make_self_signed_client!(ctx.certs, name)
+
+    assert {:ok, agent} =
+             DeviceIdentity.from_certificate(TLSFixtures.certificate_der!(ctx.certs, name))
+
+    assert :ok =
+             Relay.owner_register_agent(
+               relay,
+               person,
+               owner,
+               "00000000-0000-4000-8000-000000000001",
+               agent
+             )
+
+    assert {:ok, _reader} =
+             Relay.setup_device_certificate(
+               relay,
+               person,
+               TLSFixtures.certificate_der!(ctx.certs, "a2")
+             )
+
+    {relay, person, owner, agent, Server.port(server)}
+  end
+
+  defp forward_granted_fixture(relay, sender, id, n) do
+    assert :ok = Relay.setup_sender(relay, "fixture-origin", sender)
+
+    frame = %{
+      "v" => 1,
+      "type" => "forward",
+      "op_id" => "00000000-0000-4000-8000-00000000000#{n}",
+      "message" => %{
+        "sender_id" => sender,
+        "message_id" => id,
+        "created_at" => n,
+        "title" => id
+      }
+    }
+
+    assert {:ok, line} = Relay.request_line(relay, "fixture-origin", JSON.encode!(frame) <> "\n")
+    assert {:ok, %{"type" => "ok"}} = JSON.decode_line(line)
   end
 
   describe "flag off" do
