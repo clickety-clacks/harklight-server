@@ -717,4 +717,51 @@ defmodule AttentionServer.ChangeLogTest do
     assert fresh == after_ranks
     GenServer.stop(relay)
   end
+
+  test "a changed owner key or revision closes that person's browser feeds" do
+    {:ok, engine} = Engine.setup_person(Engine.new(), "A")
+    owned = %{engine | owners: Map.put(engine.owners, "A", %{key: "owner-key", revision: 1})}
+    assert ChangeLog.closings(owned, owned) == []
+
+    bumped = %{owned | owners: Map.put(owned.owners, "A", %{key: "owner-key", revision: 2})}
+    assert ChangeLog.closings(owned, bumped) == [{{:owner, "A"}, :revoked}]
+
+    recovered = %{owned | owners: Map.put(owned.owners, "A", %{key: "new-key", revision: 1})}
+    assert ChangeLog.closings(owned, recovered) == [{{:owner, "A"}, :revoked}]
+
+    gone = %{owned | owners: Map.delete(owned.owners, "A")}
+    assert ChangeLog.closings(owned, gone) == [{{:owner, "A"}, :revoked}]
+  end
+
+  test "a browser feed hears its owner key's revocation and its owner change" do
+    browser = %{kind: :browser, session_id: "session-hash", person: "A", key: "owner-key"}
+    me = self()
+
+    feed =
+      spawn_link(fn ->
+        :ok = ChangeLog.subscribe_closing(browser)
+        send(me, :subscribed)
+
+        receive do
+          message -> send(me, {:feed, message})
+        end
+
+        receive do
+          message -> send(me, {:feed, message})
+        end
+      end)
+
+    assert_receive :subscribed
+    ChangeLog.notify_closing([{{:device, "owner-key"}, :revoked}])
+    assert_receive {:feed, {:client_closing, {:device, "owner-key"}, :revoked}}, 1_000
+    ChangeLog.notify_closing([{{:owner, "A"}, :revoked}])
+    assert_receive {:feed, {:client_closing, {:owner, "A"}, :revoked}}, 1_000
+    Process.unlink(feed)
+
+    # Unsubscribing releases every scope it took.
+    :ok = ChangeLog.subscribe_closing(browser)
+    :ok = ChangeLog.unsubscribe_closing(browser)
+    ChangeLog.notify_closing([{{:owner, "A"}, :revoked}, {{:device, "owner-key"}, :revoked}])
+    refute_receive {:client_closing, _, _}, 200
+  end
 end
