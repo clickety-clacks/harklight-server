@@ -159,7 +159,9 @@ defmodule AttentionServer.AgentAPI.FeedStep do
 
   defp render_changes(state, principal, rows) do
     Projection.capture(fn ->
-      state |> FeedRenderer.render_many(principal, rows) |> FeedStep.changes()
+      Projection.run(:feed, fn ->
+        state |> FeedRenderer.render_many(principal, rows) |> FeedStep.changes()
+      end)
     end)
   end
 

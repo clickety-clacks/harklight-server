@@ -537,6 +537,76 @@ defmodule AttentionServer.ClientAPIFeedShowTest do
     Task.await(writer)
   end
 
+  @tag :projection_fault
+  test "a Show projection fault in a focus response leaves the Show pending", ctx do
+    assert {:ok, %{"items" => [%{"item_id" => item}]}} =
+             ClientAPI.Reads.inbox(ctx.relay, ctx.reader)
+
+    response = Task.await(show_in_request(ctx))
+    assert response.status == 200
+    assert %{"state" => "held", "show_id" => id} = body(response)
+    fault_at({:show_projection, item})
+
+    reader = connect(ctx.port, ctx.certs, "a1")
+    {reader, failed} = focus_request(reader)
+    assert failed.status == 500
+    assert {"request-id", request_id} = List.keyfind(failed.headers, "request-id", 0)
+    refute List.keymember?(failed.headers, "retry-after", 0)
+
+    assert %{"error" => "internal_error", "retryable" => false, "request_id" => ^request_id} =
+             body(failed)
+
+    Application.delete_env(:attention_server, :client_api_projection_fault)
+    {reader, recovered} = focus_request(reader)
+    assert recovered.status == 200
+    assert %{"show" => %{"show_id" => ^id}} = body(recovered)
+    Mint.HTTP.close(reader)
+    assert Process.alive?(ctx.relay)
+  end
+
+  @tag :projection_fault
+  test "a Show frame fault closes SSE and reports held to the agent", ctx do
+    reader = connect(ctx.port, ctx.certs, "a1")
+    {reader, feed} = open_feed(reader, "?after=#{head(ctx.relay)}")
+    {reader, feed} = await_open(reader, feed)
+    assert feed.status == 200
+
+    fault_at({:feed_event, "show"})
+    response = Task.await(show_in_request(ctx))
+    assert response.status == 200
+    assert %{"state" => "held", "show_id" => id} = body(response)
+    {reader, feed, event} = until_closing(reader, feed)
+    assert event == %{event: "closing", data: %{"reason" => "internal_error"}}
+    {reader, feed} = drain(reader, feed)
+    assert feed.done
+    Mint.HTTP.close(reader)
+
+    Application.delete_env(:attention_server, :client_api_projection_fault)
+    reader = connect(ctx.port, ctx.certs, "a1")
+    {reader, focused} = focus_request(reader)
+    assert %{"show" => %{"show_id" => ^id}} = body(focused)
+    Mint.HTTP.close(reader)
+    assert Process.alive?(ctx.relay)
+  end
+
+  defp fault_at(key) do
+    on_exit(fn -> Application.delete_env(:attention_server, :client_api_projection_fault) end)
+
+    Application.put_env(:attention_server, :client_api_projection_fault, fn
+      ^key -> raise "Show test fault"
+      _ -> :ok
+    end)
+  end
+
+  defp focus_request(conn) do
+    report = JSON.encode!(%{"screen" => "inbox", "ttl_s" => 120})
+
+    assert {:ok, conn, ref} =
+             Mint.HTTP.request(conn, "PUT", "/v2/devices/me/focus", [], report)
+
+    collect(conn, ref)
+  end
+
   test "the request waits for a successful chunk without blocking Relay", ctx do
     writer = controlled_writer(ctx, head(ctx.relay))
     request = show_in_request(ctx)

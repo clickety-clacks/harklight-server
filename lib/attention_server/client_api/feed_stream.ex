@@ -339,7 +339,12 @@ defmodule AttentionServer.ClientAPI.FeedStream do
 
   defp write_ephemeral(conn, event, data, key) do
     Projection.capture(fn ->
-      json = Projection.run(key, fn -> JSON.encode!(data) end)
+      json =
+        Projection.run(key, fn ->
+          Projection.probe({:feed_event, event})
+          JSON.encode!(data)
+        end)
+
       chunk_safely(conn, ["event: ", event, "\ndata: ", json, "\n\n"])
     end)
   end

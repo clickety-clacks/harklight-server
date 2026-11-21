@@ -213,24 +213,21 @@ defmodule AttentionServer.ClientAPI.FeedStep do
   end
 
   defp render_rows(context, principal, rows) do
-    renderer = renderer()
+    Projection.run(:feed, fn ->
+      renderer = renderer()
 
-    results =
-      cond do
-        renderer == FeedRenderer ->
-          FeedRenderer.render_many(context, principal, rows)
-
-        Code.ensure_loaded?(renderer) and function_exported?(renderer, :render_many, 3) ->
-          Projection.run(:feed, fn -> renderer.render_many(context, principal, rows) end)
-
-        true ->
+      results =
+        if renderer == FeedRenderer or
+             (Code.ensure_loaded?(renderer) and function_exported?(renderer, :render_many, 3)) do
+          renderer.render_many(context, principal, rows)
+        else
           Enum.map(rows, fn row ->
-            result = Projection.run(:feed, fn -> renderer.render(context, principal, row) end)
-            {row, result}
+            {row, renderer.render(context, principal, row)}
           end)
-      end
+        end
 
-    changes(results)
+      changes(results)
+    end)
   end
 
   @doc false

@@ -103,6 +103,26 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
       assert Enum.any?(changes, &(get_in(&1, ["data", "entry_id"]) == entry))
     end
 
+    for {name, path} <- [{"a2", "/v2/changes?after=0"}, {"a1", "/v2/agent/changes?after=0"}] do
+      test "a failure before resource rendering stops #{path} at the original cursor", ctx do
+        name = unquote(name)
+        path = unquote(path)
+        entry = person_reply(ctx, ctx.item, 2)
+
+        Application.put_env(:attention_server, :client_api_projection_fault, fn
+          :feed -> raise "feed setup fault"
+          _ -> :ok
+        end)
+
+        assert_internal_error(get(ctx, name, path))
+        assert Server.relay(ctx.server) == ctx.relay
+        Application.delete_env(:attention_server, :client_api_projection_fault)
+
+        assert %{"changes" => changes} = Elixir.JSON.decode!(get(ctx, name, path).body)
+        assert Enum.any?(changes, &(get_in(&1, ["data", "entry_id"]) == entry))
+      end
+    end
+
     test "the person SSE backlog closes without advancing the cursor", ctx do
       assert {:ok, before} = ChangeLog.head(:sys.get_state(ctx.relay).store, "A")
       entry = person_reply(ctx, ctx.item, 2)
@@ -500,6 +520,52 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
 
     assert %{event: "focus", data: %{"focus" => ^snapshot}} = event
     refute Map.has_key?(event, :id)
+  end
+
+  @tag :projection_fault
+  test "a Focus fault returns 500 on GET or closes the agent SSE feed", ctx do
+    id = forward(ctx, "a1", 1, @first_session)
+    report = %{"screen" => "message", "item_id" => id, "ttl_s" => 120}
+    assert request(ctx, "a2", "PUT", "/v2/devices/me/focus", report, 2).status == 200
+
+    :sys.replace_state(ctx.relay, fn state ->
+      put_in(state.store.engine.devices[ctx.keys["a1"]].see_focus, true)
+    end)
+
+    on_exit(fn -> Application.delete_env(:attention_server, :client_api_projection_fault) end)
+
+    Application.put_env(:attention_server, :client_api_projection_fault, fn
+      :focus_snapshot -> raise "Focus snapshot fault"
+      _ -> :ok
+    end)
+
+    assert_internal_error(get(ctx, "a1", "/v2/agent/focus"))
+
+    Application.put_env(:attention_server, :client_api_projection_fault, fn
+      {:feed_event, "focus"} -> raise "Focus frame fault"
+      _ -> :ok
+    end)
+
+    store = :sys.get_state(ctx.relay).store
+    assert {:ok, head} = AgentChangeLog.head(store, {"A", ctx.keys["a1"]})
+    conn = ClientAPIFeedClient.connect(ctx.port, ctx.certs, "a1")
+    feed_path = "/v2/agent/changes?after=#{head}&session=#{@other_session}"
+
+    assert {:ok, conn, ref} =
+             Mint.HTTP.request(conn, "GET", feed_path, [{"accept", "text/event-stream"}], nil)
+
+    feed = %{ref: ref, buffer: "", status: nil, headers: [], done: false}
+    {conn, feed} = ClientAPIFeedClient.await_open(conn, feed)
+    assert feed.status == 200
+    {conn, feed, [event]} = ClientAPIFeedClient.events(conn, feed, 1)
+    assert event == %{event: "closing", data: %{"reason" => "internal_error"}}
+    {conn, feed} = ClientAPIFeedClient.drain(conn, feed)
+    assert feed.done
+    Mint.HTTP.close(conn)
+
+    Application.delete_env(:attention_server, :client_api_projection_fault)
+    assert get(ctx, "a1", "/v2/agent/focus").status == 200
+    assert Server.relay(ctx.server) == ctx.relay
   end
 
   test "me reports the enrolled key's sender names", ctx do

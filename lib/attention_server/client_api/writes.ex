@@ -569,6 +569,13 @@ defmodule AttentionServer.ClientAPI.Writes do
           {:ok, 200, body}
         end)
 
+      # A failed projection did not deliver the pending Show.
+      next =
+        case result do
+          {:error, %Projection{}} when is_map(held) -> put_in(next.held_shows[key], held)
+          _ -> next
+        end
+
       {:reply, result, next}
     else
       error -> {:reply, error, state}
