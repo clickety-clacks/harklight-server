@@ -484,6 +484,17 @@ defmodule AttentionServer.Store do
   def put_published_upload(%__MODULE__{db: nil}, _metadata),
     do: {:error, :storage_unavailable}
 
+  def put_published_upload(%__MODULE__{mode: :keyed, engine: engine} = store, metadata) do
+    next = %{engine | uploads: Map.put(engine.uploads, metadata.id, metadata)}
+    touched = MapSet.new([{:row, :uploads, metadata.id}])
+    audit = %{person: metadata.person, actor: metadata.uploader, action: "file_upload"}
+
+    case commit(store, {next, touched}, audit) do
+      {:ok, committed} -> {:ok, committed}
+      _ -> {:error, :storage_unavailable}
+    end
+  end
+
   def put_published_upload(%__MODULE__{} = store, metadata) do
     next = %{store.engine | uploads: Map.put(store.engine.uploads, metadata.id, metadata)}
 
@@ -651,7 +662,20 @@ defmodule AttentionServer.Store do
   def delete_uploads(%__MODULE__{} = store, ids, audit) when is_list(ids) do
     next = %{store.engine | uploads: Map.drop(store.engine.uploads, ids)}
 
-    case commit(store, next, audit) do
+    proposal =
+      if store.mode == :keyed do
+        touched =
+          for id <- ids,
+              Map.has_key?(store.engine.uploads, id),
+              into: MapSet.new(),
+              do: {:row, :uploads, id}
+
+        {next, touched}
+      else
+        next
+      end
+
+    case commit(store, proposal, audit) do
       {:ok, updated} ->
         result =
           Enum.reduce_while(ids, :ok, fn id, :ok ->
@@ -1297,7 +1321,21 @@ defmodule AttentionServer.Store do
   """
   def commit(store, next, audit, projected_entries \\ [])
 
-  # The keyed writer is installed in its own slice.
+  # A keyed store commits only the records named by the transition's touched
+  # addresses. Callers that cannot supply them are refused.
+  def commit(
+        %__MODULE__{mode: :keyed} = store,
+        {%Engine{} = next, %MapSet{} = touched},
+        audit,
+        projected_entries
+      ) do
+    projected_entries = if store.change_log, do: projected_entries, else: []
+
+    if MapSet.size(touched) == 0 and projected_entries == [],
+      do: {:ok, store},
+      else: commit_keyed(store, next, touched, audit, projected_entries)
+  end
+
   def commit(%__MODULE__{mode: :keyed} = store, _next, _audit, _projected_entries),
     do: {:error, :storage_unavailable, store}
 
@@ -1312,6 +1350,187 @@ defmodule AttentionServer.Store do
       other ->
         other
     end
+  end
+
+  # The whole-state validator still guards keyed commits; per-address
+  # validation replaces it once it is proven equivalent. It runs in :full
+  # mode because a keyed open validates fully, so every committed state must
+  # also reopen.
+  defp commit_keyed(
+         %__MODULE__{db: db, version: version} = store,
+         next,
+         touched,
+         audit,
+         projected
+       ) do
+    old = store.engine
+    items = for {:row, :messages, key} <- touched, do: key
+
+    with true <- valid_state?(next) || :invalid_state,
+         :ok <- KeyedValidation.sequences(old, next, touched),
+         {:ok, upload_links, _related} <-
+           KeyedValidation.upload_changes(store.upload_links, old, next, touched),
+         {authority_index, _affected} <-
+           KeyedValidation.authority_changes(store.authority_index, old, next, touched),
+         {:ok, source_bindings} <-
+           KeyedValidation.source_changes(
+             store.source_bindings,
+             old.messages,
+             next.messages,
+             items
+           ),
+         {:ok, prepared} <- KeyedReference.prepare(old, next, touched, store.upload_dir),
+         {:ok, blob_owners} <- update_blob_owners(store.blob_owners, prepared) do
+      log = keyed_change_log(store, next, projected)
+
+      result =
+        Persistence.run(fn ->
+          RecordTable.commit(db, version, prepared.records, fn db, generation ->
+            with :ok <- write_reference_delta(db, prepared.delete_paths, prepared.reference_rows),
+                 :ok <- write_audit(db, audit),
+                 {:ok, heads, agent_heads} <- append_change_logs(db, log, generation) do
+              {:ok, {heads, agent_heads}}
+            end
+          end)
+        end)
+
+      case result do
+        {:ok, {heads, agent_heads}} ->
+          prune_released_blobs(store.upload_dir, prepared.orphan_candidates, blob_owners, audit)
+          AttentionServer.ChangeLog.notify(heads)
+          AttentionServer.ChangeLog.notify(agent_heads)
+          if log, do: AttentionServer.ChangeLog.notify_closing(log.closings)
+
+          engine = prepared.engine
+
+          committed = %{
+            store
+            | engine: put_in(engine.route_b_index.source_bindings, source_bindings),
+              version: version + 1,
+              source_bindings: source_bindings,
+              upload_links: upload_links,
+              authority_index: authority_index,
+              blob_owners: blob_owners,
+              change_log_touched:
+                MapSet.union(store.change_log_touched, MapSet.new(Map.keys(heads)))
+          }
+
+          Persistence.committed(committed)
+          {:ok, committed}
+
+        error ->
+          LargeData.cleanup_created(prepared.created)
+          keyed_commit_failure(store, error, :outcome_unknown, audit)
+      end
+    else
+      error -> keyed_commit_failure(store, error, :unavailable, audit)
+    end
+  end
+
+  defp update_blob_owners(owners, prepared) do
+    case KeyedReference.update_blob_owners(owners, prepared.blob_delta) do
+      {:ok, _} = updated ->
+        updated
+
+      error ->
+        LargeData.cleanup_created(prepared.created)
+        error
+    end
+  end
+
+  defp keyed_commit_failure(store, error, outcome, audit) do
+    reason =
+      case error do
+        {:error, reason} -> reason
+        reason -> reason
+      end
+
+    Diagnostics.failure(:server_storage, :state_commit, reason, outcome, operation_id(audit))
+    {:error, :storage_unavailable, store}
+  end
+
+  defp keyed_change_log(%__MODULE__{change_log: false}, _next, _projected), do: nil
+
+  defp keyed_change_log(store, next, projected) do
+    changed = AttentionServer.ChangeLog.changed_resources(store.engine, next, projected)
+    pending = AttentionServer.ChangeLog.changes(store.engine, next, changed)
+
+    %{
+      pending: pending,
+      seeded:
+        Map.new(pending, fn {person, _} ->
+          {person, AttentionServer.ChangeLog.seeded?(store.engine, person)}
+        end),
+      closings: AttentionServer.ChangeLog.closings(store.engine, next),
+      created: AttentionServer.ChangeLog.new_resources(store.engine, next, changed),
+      agent_pending: AttentionServer.AgentChangeLog.changes(store.engine, next, changed)
+    }
+  end
+
+  defp write_reference_delta(db, deleted_paths, reference_rows) do
+    with :ok <-
+           each_ok(deleted_paths, fn path ->
+             run(db, "DELETE FROM relay_large_data_refs WHERE path = ?", [{:blob, path}])
+           end) do
+      each_ok(reference_rows, fn
+        [path, marker, id, size, sha256] ->
+          run(
+            db,
+            "INSERT INTO relay_large_data_refs (path, marker, id, size, sha256) VALUES (?, ?, ?, ?, ?)",
+            [{:blob, path}, marker, id, size, sha256]
+          )
+
+        _row ->
+          {:error, :invalid_large_data_reference}
+      end)
+    end
+  end
+
+  defp each_ok(rows, write) do
+    Enum.reduce_while(rows, :ok, fn row, :ok ->
+      case write.(row) do
+        :ok -> {:cont, :ok}
+        error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp write_audit(db, audit) do
+    run(db, "INSERT INTO relay_audit (person_id, actor_id, action, at_ms) VALUES (?, ?, ?, ?)", [
+      audit.person,
+      audit.actor,
+      audit.action,
+      System.system_time(:millisecond)
+    ])
+  end
+
+  # A blob whose last owning record was rewritten or removed in this commit
+  # is deleted after the commit is durable. A failed unlink leaves an orphan
+  # for the next open's cleanup.
+  defp prune_released_blobs(nil, _candidates, _owners, _audit), do: :ok
+
+  defp prune_released_blobs(directory, candidates, owners, audit) do
+    candidates
+    |> Enum.uniq()
+    |> Enum.reject(&Map.has_key?(owners, &1))
+    |> Enum.each(fn id ->
+      case File.rm(Path.join(directory, id)) do
+        :ok ->
+          :ok
+
+        {:error, :enoent} ->
+          :ok
+
+        {:error, reason} ->
+          Diagnostics.failure(
+            :server_storage,
+            :large_data_delete,
+            reason,
+            :unavailable,
+            operation_id(audit)
+          )
+      end
+    end)
   end
 
   defp do_commit(%__MODULE__{engine: old} = store, next, _audit, []) when old == next,
