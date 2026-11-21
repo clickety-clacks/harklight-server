@@ -32,6 +32,7 @@ defmodule AttentionServer.ClientAPIFeedRendererTest do
     assert :ok = Relay.setup_person(relay, "A")
     assert :ok = Relay.setup_device(relay, "A", "origin")
     assert :ok = Relay.setup_device(relay, "A", "reader")
+    assert :ok = Relay.setup_device(relay, "A", "phone")
     assert :ok = Relay.setup_sender(relay, "origin", "app:test")
     %{relay: relay}
   end
@@ -72,7 +73,7 @@ defmodule AttentionServer.ClientAPIFeedRendererTest do
                "text" => "Question"
              })
 
-    assert %{"type" => "ok"} =
+    assert %{"type" => "ok", "seq" => reply_seq} =
              request(relay, "origin", %{
                "type" => "conversation_reply",
                "op_id" => op(11),
@@ -90,6 +91,18 @@ defmodule AttentionServer.ClientAPIFeedRendererTest do
                "sender_id" => "app:test",
                "message_id" => "two",
                "answer" => nil
+             })
+
+    # Contract round 12: a read position set on another of the person's
+    # devices changes the item (read position, unread replies, reply
+    # priority) through the item's own row.
+    assert %{"type" => "ok"} =
+             request(relay, "phone", %{
+               "type" => "conversation_read",
+               "op_id" => op(13),
+               "sender_id" => "app:test",
+               "message_id" => "one",
+               "read_through_conversation_seq" => reply_seq
              })
   end
 
@@ -160,6 +173,44 @@ defmodule AttentionServer.ClientAPIFeedRendererTest do
 
     replayed_items = for {{:item, id}, _} <- applied, do: id
     assert Enum.sort(replayed_items) == inbox["items"] |> Enum.map(& &1["item_id"]) |> Enum.sort()
+
+    # The other device's read reached the replayed item.
+    one = Enum.find(inbox["items"], &(&1["message"]["message_id"] == "one"))
+    assert one["chat"]["unread_replies"] == 0
+    assert is_binary(one["chat"]["read_position"])
+    assert applied[{:item, one["item_id"]}]["chat"] == one["chat"]
+
+    # The read-position fact itself is a formless row; the item's row, written
+    # with it, carries the effect.
+    state = :sys.get_state(relay)
+    {:ok, rows, false, _} = ChangeLog.read(state.store, "A", 0, 500)
+
+    [read_seq] =
+      for {{"A", seq}, %{payload: %{"kind" => "read_position"}}} <-
+            state.store.engine.conversation_events,
+          do: seq
+
+    read_row = Enum.find(rows, &(&1.resource_id == ChangeLog.entry_resource(read_seq)))
+    context = %{engine: state.store.engine, store: state.store, view: state.priority_views["A"]}
+    assert FeedRenderer.render(context, principal, read_row) == :skip
+
+    item_row =
+      Enum.find(
+        rows,
+        &(&1.kind == :item and &1.resource_id == ChangeLog.item_resource({"A", "app:test", "one"}))
+      )
+
+    # Written by the read's commit: after the agent reply's row, beside the
+    # read fact's row.
+    [reply_seq] =
+      for {{"A", seq},
+           %{key: {"A", "app:test", "one"}, payload: %{"kind" => "reply", "author" => "origin"}}} <-
+            state.store.engine.conversation_events,
+          do: seq
+
+    reply_row = Enum.find(rows, &(&1.resource_id == ChangeLog.entry_resource(reply_seq)))
+    assert item_row.rev > reply_row.rev
+    assert abs(item_row.rev - read_row.rev) <= 2
   end
 
   test "a principal that no longer authenticates gets nothing rendered", %{relay: relay} do
