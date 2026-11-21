@@ -23,8 +23,17 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
 
   import AttentionServer.ClientAPIFeedClient, except: [connect: 2, connect: 3, connect: 4]
 
-  alias AttentionServer.{ChangeLog, ClientAPI, ClientAPIFeedClient, JSON, Relay, TLSFixtures}
-  alias AttentionServer.ClientAPI.{Principal, Reads}
+  alias AttentionServer.{
+    ChangeLog,
+    ClientAPI,
+    ClientAPIFeedClient,
+    DeviceIdentity,
+    JSON,
+    Relay,
+    TLSFixtures
+  }
+
+  alias AttentionServer.ClientAPI.{Principal, Reads, Writes}
 
   @handle "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 
@@ -304,15 +313,18 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
 
   test "the mounted agent feed honors Last-Event-ID and validates session", ctx do
     conn = connect(ctx)
+
     {conn, result} =
       agent_batch(conn, "?after=invalid&session=#{@handle}", [{"last-event-id", "0"}])
 
     assert result.status == 200
+
     assert {:ok, %{"changes" => [], "rev" => 0, "more" => false}} =
              JSON.decode_line(result.body <> "\n")
 
     {conn, invalid} = agent_batch(conn, "?session=invalid", [])
     assert invalid.status == 400
+
     assert {:ok, %{"error" => "invalid_field", "field" => "session"}} =
              JSON.decode_line(invalid.body <> "\n")
 
@@ -320,7 +332,8 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
     assert expired.status == 410
   end
 
-  test "agent replay reaches the message snapshot after chat, a raw answer and a sessionless close", ctx do
+  test "agent replay reaches the message snapshot after chat, a raw answer and a sessionless close",
+       ctx do
     assert :ok = Relay.setup_sender(ctx.relay, ctx.reader, "app:agent")
 
     for {id, n, session} <- [{"chat", 1, @handle}, {"sessionless", 2, nil}] do
@@ -371,13 +384,22 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
 
     {conn, first} = agent_batch(connect(ctx), "?after=0", [])
     assert first.status == 200
+
     assert {:ok, %{"changes" => changes, "rev" => first_rev}} =
              JSON.decode_line(first.body <> "\n")
 
     assert [
              %{"kind" => "entry", "data" => %{"kind" => "reply"}, "rev" => chat_rev},
-             %{"kind" => "message", "data" => %{"terminal" => %{"state" => "answered", "answer" => nil}}, "rev" => answer_rev},
-             %{"kind" => "message", "data" => %{"terminal" => %{"state" => "cleared"}}, "rev" => close_rev}
+             %{
+               "kind" => "message",
+               "data" => %{"terminal" => %{"state" => "answered", "answer" => nil}},
+               "rev" => answer_rev
+             },
+             %{
+               "kind" => "message",
+               "data" => %{"terminal" => %{"state" => "cleared"}},
+               "rev" => close_rev
+             }
            ] = changes
 
     assert chat_rev < answer_rev and answer_rev < close_rev
@@ -405,6 +427,71 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
     assert response.status == 200
     assert {:ok, %{"messages" => messages}} = JSON.decode_line(response.body <> "\n")
     assert replayed == Map.new(messages, &{&1["item_id"], &1})
+  end
+
+  test "a live agent feed starts and stops focus when its see grant changes", ctx do
+    Application.put_env(:attention_server, :client_api_feed_heartbeat_ms, 80)
+    on_exit(fn -> Application.delete_env(:attention_server, :client_api_feed_heartbeat_ms) end)
+    owner_cert = TLSFixtures.certificate_der!(ctx.certs, "a2")
+    {:ok, owner} = DeviceIdentity.from_certificate(owner_cert)
+    assert {:ok, person} = Relay.operator_bootstrap(ctx.relay, owner_cert)
+
+    assert {:ok, agent} =
+             Relay.setup_device_certificate(
+               ctx.relay,
+               person,
+               TLSFixtures.certificate_der!(ctx.certs, "b1")
+             )
+
+    principal = %Principal{kind: :device, key: agent, person: person}
+    conn = ClientAPIFeedClient.connect(ctx.port, ctx.certs, "b1")
+
+    {:ok, conn, ref} =
+      Mint.HTTP.request(conn, "GET", "/v2/agent/changes", [{"accept", "text/event-stream"}], nil)
+
+    feed = %{ref: ref, buffer: "", status: nil, headers: [], done: false}
+    {conn, feed} = await_open(conn, feed)
+    assert feed.status == 200
+
+    {conn, feed, [beat]} = events(conn, feed, 1)
+    assert beat == %{event: "heartbeat", data: %{}}
+
+    assert :ok =
+             Relay.save_dashboard_focus_permission(ctx.relay, person, owner, agent, :see, true)
+
+    {conn, feed, focus} = next_focus(conn, feed, 10)
+    assert focus == %{event: "focus", data: %{"focus" => %{"clients" => []}}}
+
+    assert {:ok, 200, _, false} =
+             Writes.focus(ctx.relay, principal, %{"screen" => "inbox", "ttl_s" => 120})
+
+    {conn, feed, focus} = next_focus(conn, feed, 10)
+
+    assert %{
+             event: "focus",
+             data: %{"focus" => %{"clients" => [%{"device_id" => ^agent, "screen" => "inbox"}]}}
+           } = focus
+
+    refute Map.has_key?(focus, :id)
+
+    assert :ok =
+             Relay.save_dashboard_focus_permission(ctx.relay, person, owner, agent, :see, false)
+
+    assert {:ok, 200, _, false} =
+             Writes.focus(ctx.relay, principal, %{"screen" => "settings", "ttl_s" => 120})
+
+    {_conn, feed, beats} = events(conn, feed, 2)
+    assert beats == List.duplicate(%{event: "heartbeat", data: %{}}, 2)
+    refute feed.done
+  end
+
+  defp next_focus(_conn, _feed, 0), do: flunk("focus event missing")
+
+  defp next_focus(conn, feed, attempts) do
+    case events(conn, feed, 1) do
+      {conn, feed, [%{event: "heartbeat"}]} -> next_focus(conn, feed, attempts - 1)
+      {conn, feed, [%{event: "focus"} = event]} -> {conn, feed, event}
+    end
   end
 
   defp agent_batch(conn, query, headers) do

@@ -43,7 +43,7 @@ defmodule AttentionServer.AgentAPI.Feed do
             :ok
 
           {:error, reason} ->
-            Diagnostics.failure(:client_api, :agent_batch_delivered, reason, :failed)
+            Diagnostics.failure(:client_api, :state_commit, reason, :failed)
         end
 
         conn
@@ -78,9 +78,12 @@ defmodule AttentionServer.AgentAPI.FeedStep do
     if targets == [], do: :ok, else: call(relay, {:delivered, principal, targets})
   end
 
-  def opened(%{relay: relay, principal: %{key: key}} = ctx) do
+  def opened(ctx) do
     FeedActivity.observe(ctx, :open)
+    focus_granted(ctx)
+  end
 
+  def focus_granted(%{relay: relay, principal: %{key: key}}) do
     case Relay.focus_stream_attach(relay, key, self()) do
       {:ok, data} -> send(self(), {:focus_change, data})
       _ -> :ok
@@ -122,12 +125,12 @@ defmodule AttentionServer.AgentAPI.FeedStep do
         {:error, reason}
 
       {:error, reason} ->
-        Diagnostics.failure(:client_api, :agent_stream_read, reason, :failed)
+        Diagnostics.failure(:client_api, :stream_read, reason, :failed)
         {:error, :storage_unavailable}
     end
   rescue
     error ->
-      Diagnostics.failure(:client_api, :agent_stream_read, error, :failed)
+      Diagnostics.failure(:client_api, :stream_read, error, :failed)
       {:error, :storage_unavailable}
   end
 

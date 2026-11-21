@@ -1292,6 +1292,10 @@ defmodule AttentionServer.Relay do
                   do: close_focus_streams(next, device_key),
                   else: next
 
+              if store.change_log and permission == :see and enabled do
+                AttentionServer.AgentAPI.Focus.notify_grant(person, device_key)
+              end
+
               {:reply, :ok, next}
 
             _ ->
@@ -1767,6 +1771,10 @@ defmodule AttentionServer.Relay do
   defp dispatch_call({:focus_stream_attach, key, worker}, _from, state) when is_pid(worker) do
     case focus_authorized_person(state.store.engine, key, :see) do
       {:ok, person} ->
+        if existing = Map.get(state.focus_streams, worker) do
+          Process.demonitor(existing.monitor, [:flush])
+        end
+
         monitor = Process.monitor(worker)
         stream = %{key: key, person: person, monitor: monitor}
         next = put_focus_stream(state, worker, stream)

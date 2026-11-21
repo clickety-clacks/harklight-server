@@ -131,6 +131,9 @@ defmodule AttentionServer.ClientAPI.FeedStep do
   def closed(_ctx), do: :ok
 
   @doc false
+  def focus_granted(_ctx), do: :ok
+
+  @doc false
   def focus(_ctx), do: :skip
 
   @doc """
