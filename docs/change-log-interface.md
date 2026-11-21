@@ -59,12 +59,17 @@ ChangeLog.prune(store, before_ms) :: {:ok, deleted}   # raises the floor; the Re
 ChangeLog.created_at(store, person, resource_id) :: {:ok, at_ms} | {:error, :not_found}
   # when the log first wrote the resource (Entry.at_ms, Item.created_at_ms);
   # none for resources from before the cut-over
+ChangeLog.put_ranks(store, person, ranks) :: {:ok, position}
+  # stores the reads component's whole ranking (%{item_id => rank}, from
+  # ClientAPI.Resources.ranks/4); an :item row for each item whose rank changed
+  # in any member or that is no longer ranked; the person's first stored
+  # ranking writes no row (it is what reads computed until then)
+ChangeLog.rank_page(store, person, after_key | nil, limit) ::
+  {:ok, [{item_id, rank}], more} | {:error, :none}
+  # stored ranks in ascending key order; :none until first stored
+ChangeLog.rank(store, person, item_id) :: {:ok, rank} | {:error, :not_found}
 ChangeLog.rank_keys(store, person) :: {:ok, %{unit_id => key}}
-ChangeLog.append_ranks(store, person, %{unit_id => key}, item_of) :: {:ok, position}
-  # records the reads component's current rank keys by its opaque rank unit IDs
-  # (an item row, or an item's chat-reply row); item_of.(unit_id) returns
-  # {:ok, item_resource} or :error; one :item row per item with a changed,
-  # new or dropped unit; dropped units lose their stored key
+  # the stored rank-unit keys, passed back to Resources.ranks/4 as `previous`
 
 # Closing signal, for feeds (C5). The caller is told
 # {:client_closing, scope, reason} when its device is revoked or removed
@@ -92,14 +97,11 @@ reads must be added here; the replay test catches an omission.
 - **Entry:** `conversation_events`.
 - **Counts:** the unresolved count.
 - **Settings:** `bounce_levels` and the person's `push_bindings`.
-- **Rank** is derived in the Relay, not the engine. Rank rows come from
-  `append_ranks/3`, which the Relay calls with the reads component's ranking.
+- **Rank** is derived in the Relay, not the engine. After every call that
+  committed a change for a person, or changed their priority view, the Relay
+  ranks that person once (`Resources.ranks/4` with the stored keys as
+  `previous`) and stores the result with `put_ranks/3`. Reads page from the
+  stored order instead of ranking per read.
 - **Closings** come from the same diff: a device that becomes revoked or
   leaves `devices`, and a person whose delivery state becomes `STOPPED`. A
   browser session's end comes from the Relay's `end_browser_session`.
-
-## Not yet on main
-
-- The Relay call to `append_ranks/3` when the priority view changes, and the
-  replay-equals-snapshot test from empty and from a mid-log cursor. Both need
-  the reads component's ranking and renderer.

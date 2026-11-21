@@ -84,6 +84,21 @@ defmodule AttentionServer.ChangeLog do
     ) WITHOUT ROWID
     """,
     """
+    CREATE TABLE IF NOT EXISTS client_ranks (
+      person_id TEXT NOT NULL,
+      item_id TEXT NOT NULL,
+      rank_key TEXT NOT NULL,
+      rank_json TEXT NOT NULL,
+      PRIMARY KEY (person_id, item_id)
+    ) WITHOUT ROWID
+    """,
+    "CREATE INDEX IF NOT EXISTS client_ranks_order ON client_ranks (person_id, rank_key)",
+    """
+    CREATE TABLE IF NOT EXISTS client_rank_state (
+      person_id TEXT PRIMARY KEY
+    ) WITHOUT ROWID
+    """,
+    """
     CREATE TABLE IF NOT EXISTS client_change_log_epoch (
       id INTEGER PRIMARY KEY CHECK (id = 1),
       epoch INTEGER NOT NULL
@@ -396,6 +411,8 @@ defmodule AttentionServer.ChangeLog do
              :ok <- run(db, "DELETE FROM client_changes", []),
              :ok <- run(db, "DELETE FROM client_resource_revs", []),
              :ok <- run(db, "DELETE FROM client_rank_keys", []),
+             :ok <- run(db, "DELETE FROM client_ranks", []),
+             :ok <- run(db, "DELETE FROM client_rank_state", []),
              # A person with no log yet reads as seeded at the epoch; raising
              # it moves them past any head they were shown before the reset.
              {:ok, epoch} <- epoch(db),
@@ -693,6 +710,182 @@ defmodule AttentionServer.ChangeLog do
         _ = Sqlite3.execute(db, "ROLLBACK")
         error
     end
+  end
+
+  @doc """
+  Stores the person's whole ranking from the reads component
+  (`%{item_id => rank}`, from `ClientAPI.Resources.ranks/4`) in one
+  transaction. Every item whose rank changed in any member (key, section,
+  group, score, due date, reply row), and every item no longer ranked, gets
+  one `:item` row. The rank-unit keys are kept for the next ranking's
+  `previous`. Unchanged ranks write nothing. Returns the person's head.
+  Reads then page from the stored order (`rank_page/4`, `rank/3`) instead
+  of ranking per read.
+  """
+  def put_ranks(%AttentionServer.Store{change_log: true, db: db, engine: engine}, person, ranks)
+      when is_map(ranks) do
+    encoded = Map.new(ranks, fn {item_id, rank} -> {item_id, JSON.encode!(rank)} end)
+    unit_keys = AttentionServer.ClientAPI.Resources.rank_unit_keys(ranks)
+
+    with {:ok, stored} <- stored_ranks(db, person),
+         {:ok, previous_units} <-
+           rank_keys(%AttentionServer.Store{change_log: true, db: db}, person),
+         {:ok, ranked?} <- ranked?(db, person) do
+      changed = for {id, json} <- encoded, Map.get(stored, id) != json, do: id
+      dropped = for {id, _} <- stored, not Map.has_key?(encoded, id), do: id
+      changed_units = for {id, key} <- unit_keys, Map.get(previous_units, id) != key, do: id
+      dropped_units = for {id, _} <- previous_units, not Map.has_key?(unit_keys, id), do: id
+
+      if changed == [] and dropped == [] and changed_units == [] and dropped_units == [] and
+           ranked? do
+        head(db, engine, person)
+      else
+        # A person's first stored ranking is what reads computed until now, so
+        # it changes no item and writes no row.
+        items = if ranked?, do: rank_changed_items(engine, person, changed ++ dropped), else: []
+
+        write_stored_ranks(db, engine, person, %{
+          items: items,
+          ranks: Map.take(ranks, changed),
+          encoded: encoded,
+          dropped: dropped,
+          units: Map.take(unit_keys, changed_units),
+          dropped_units: dropped_units
+        })
+      end
+    end
+  end
+
+  def put_ranks(%AttentionServer.Store{}, _person, _ranks), do: {:error, :disabled}
+
+  defp rank_changed_items(engine, person, item_ids) do
+    item_ids
+    |> Enum.flat_map(fn item_id ->
+      case AttentionServer.ClientAPI.Resources.item_key(engine, person, item_id) do
+        {:ok, key} -> [item_resource(key)]
+        _ -> []
+      end
+    end)
+    |> Enum.uniq()
+    |> Enum.sort()
+  end
+
+  @doc """
+  Up to `limit` stored ranks after `after_key` (or from the start), in
+  ascending rank-key order: `{:ok, [{item_id, rank}], more}`. `{:error, :none}`
+  until the person's ranking has first been stored.
+  """
+  def rank_page(%AttentionServer.Store{change_log: true, db: db}, person, after_key, limit)
+      when (is_nil(after_key) or is_binary(after_key)) and is_integer(limit) and limit > 0 do
+    with {:ok, true} <- ranked?(db, person),
+         {:ok, rows} <-
+           all(
+             db,
+             "SELECT item_id, rank_json FROM client_ranks WHERE person_id = ? AND rank_key > ? " <>
+               "ORDER BY rank_key LIMIT ?",
+             [person, after_key || "", limit + 1]
+           ) do
+      {page, rest} = Enum.split(rows, limit)
+      {:ok, Enum.map(page, fn [item_id, json] -> {item_id, decode_rank(json)} end), rest != []}
+    else
+      {:ok, false} -> {:error, :none}
+      error -> error
+    end
+  end
+
+  def rank_page(%AttentionServer.Store{}, _person, _after_key, _limit), do: {:error, :disabled}
+
+  @doc "One item's stored rank."
+  def rank(%AttentionServer.Store{change_log: true, db: db}, person, item_id) do
+    case one(db, "SELECT rank_json FROM client_ranks WHERE person_id = ? AND item_id = ?", [
+           person,
+           item_id
+         ]) do
+      {:ok, [json]} -> {:ok, decode_rank(json)}
+      {:ok, nil} -> {:error, :not_found}
+      error -> error
+    end
+  end
+
+  def rank(%AttentionServer.Store{}, _person, _item_id), do: {:error, :disabled}
+
+  defp decode_rank(json) do
+    {:ok, rank} = JSON.decode_line(json <> "\n")
+    rank
+  end
+
+  defp stored_ranks(db, person) do
+    with {:ok, rows} <-
+           all(db, "SELECT item_id, rank_json FROM client_ranks WHERE person_id = ?", [person]) do
+      {:ok, Map.new(rows, fn [item_id, json] -> {item_id, json} end)}
+    end
+  end
+
+  defp ranked?(db, person) do
+    with {:ok, row} <- one(db, "SELECT 1 FROM client_rank_state WHERE person_id = ?", [person]),
+         do: {:ok, row != nil}
+  end
+
+  defp write_stored_ranks(db, engine, person, change) do
+    now = System.system_time(:millisecond)
+
+    result =
+      with :ok <- Sqlite3.execute(db, "BEGIN IMMEDIATE"),
+           {:ok, {head, floor, seed_rev}} <-
+             load_meta(db, person, fn -> seeded?(engine, person) end),
+           {:ok, head} <-
+             write_rows(db, person, Enum.map(change.items, &{:item, &1}), head, now, MapSet.new()),
+           :ok <-
+             run(
+               db,
+               "INSERT INTO client_change_log_meta (person_id, head, floor, seed_rev) VALUES (?, ?, ?, ?) " <>
+                 "ON CONFLICT (person_id) DO UPDATE SET head = excluded.head",
+               [person, head, floor, seed_rev]
+             ),
+           :ok <- upsert_ranks(db, person, change.ranks, change.encoded),
+           :ok <- delete_ranks(db, person, change.dropped),
+           :ok <- store_rank_keys(db, person, change.units, change.dropped_units),
+           :ok <-
+             run(db, "INSERT OR IGNORE INTO client_rank_state (person_id) VALUES (?)", [person]),
+           :ok <- Sqlite3.execute(db, "COMMIT") do
+        {:ok, head}
+      end
+
+    case result do
+      {:ok, head} ->
+        notify(%{person => head})
+        {:ok, head}
+
+      error ->
+        _ = Sqlite3.execute(db, "ROLLBACK")
+        error
+    end
+  end
+
+  defp upsert_ranks(db, person, ranks, encoded) do
+    Enum.reduce_while(ranks, :ok, fn {item_id, rank}, :ok ->
+      case run(
+             db,
+             "INSERT INTO client_ranks (person_id, item_id, rank_key, rank_json) VALUES (?, ?, ?, ?) " <>
+               "ON CONFLICT (person_id, item_id) DO UPDATE SET rank_key = excluded.rank_key, rank_json = excluded.rank_json",
+             [person, item_id, Map.fetch!(rank, "key"), Map.fetch!(encoded, item_id)]
+           ) do
+        :ok -> {:cont, :ok}
+        error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp delete_ranks(db, person, item_ids) do
+    Enum.reduce_while(item_ids, :ok, fn item_id, :ok ->
+      case run(db, "DELETE FROM client_ranks WHERE person_id = ? AND item_id = ?", [
+             person,
+             item_id
+           ]) do
+        :ok -> {:cont, :ok}
+        error -> {:halt, error}
+      end
+    end)
   end
 
   defp store_rank_keys(db, person, keys, dropped) do

@@ -293,10 +293,11 @@ defmodule AttentionServer.ClientAPIFeedTest do
 
   test "Last-Event-ID resumes with no gap and takes precedence over after", ctx do
     forward(ctx, "m1", 1)
-    first_head = head(ctx)
     conn = connect(ctx)
+    # Compaction keeps only each resource's latest row, so count rows, not revs.
+    {conn, 200, backlog} = batch(conn, "?after=0")
     {conn, feed} = open_feed(conn, "?after=0")
-    {conn, _feed, seen} = events(conn, feed, first_head)
+    {conn, _feed, seen} = events(conn, feed, length(backlog["changes"]))
     last_id = List.last(seen).id
     Mint.HTTP.close(conn)
 
@@ -305,7 +306,7 @@ defmodule AttentionServer.ClientAPIFeedTest do
 
     conn = connect(ctx)
     {conn, 200, expected} = batch(conn, "?after=#{last_id}")
-    assert List.last(expected["changes"])["rev"] == head(ctx)
+    assert expected["rev"] == head(ctx)
     {conn, feed} = open_feed(conn, "?after=0", [{"last-event-id", Integer.to_string(last_id)}])
     {_conn, _feed, resumed} = events(conn, feed, length(expected["changes"]))
     assert Enum.map(resumed, & &1.id) == Enum.map(expected["changes"], & &1["rev"])
