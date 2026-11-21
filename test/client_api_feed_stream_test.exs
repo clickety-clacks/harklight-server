@@ -365,4 +365,104 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
     assert queued <= 5
     assert memory < 8_000_000
   end
+
+  ## Ends that are not the server's shutdown (review of #207)
+
+  # The feed's own process, once it has subscribed.
+  defp feed_pid do
+    assert eventually(fn -> feed_pids() != [] end)
+    [pid] = feed_pids()
+    pid
+  end
+
+  # Replaces the Relay's store with one whose database is unusable, so its
+  # next change-log read raises inside the Relay step.
+  defp break_store(ctx) do
+    original = :sys.get_state(ctx.relay)
+    :sys.replace_state(ctx.relay, fn state -> put_in(state.store.db, :unusable) end)
+    on_exit(fn -> if Process.alive?(ctx.relay), do: :sys.replace_state(ctx.relay, fn _ -> original end) end)
+  end
+
+  test "a change-log read that fails or raises answers storage_unavailable and the Relay lives",
+       ctx do
+    break_store(ctx)
+
+    assert AttentionServer.ClientAPI.FeedStep.read(ctx.relay, principal(ctx), 0, 10) ==
+             {:error, :storage_unavailable}
+
+    # A raise inside the Relay step: the engine itself is unusable.
+    :sys.replace_state(ctx.relay, fn state -> put_in(state.store.engine, :unusable) end)
+
+    assert AttentionServer.ClientAPI.FeedStep.read(ctx.relay, principal(ctx), 0, 10) ==
+             {:error, :storage_unavailable}
+
+    assert Process.alive?(ctx.relay)
+  end
+
+  test "a storage failure mid-stream ends the feed without closing: server_shutdown", ctx do
+    log =
+      capture_log(fn ->
+        conn = connect(ctx)
+        {conn, feed} = open_feed(conn)
+        {conn, feed} = await_open(conn, feed)
+        pid = feed_pid()
+
+        break_store(ctx)
+        send(pid, {:change_log, "A", 1_000_000})
+
+        {_conn, feed} = drain(conn, feed)
+        refute feed.buffer =~ "event: closing"
+        assert Process.alive?(ctx.relay)
+        Process.sleep(50)
+      end)
+
+    assert log =~ "phase=close reason=storage_unavailable"
+  end
+
+  test "a principal that stops authenticating mid-stream gets closing: revoked", ctx do
+    conn = connect(ctx)
+    {conn, feed} = open_feed(conn)
+    {conn, feed} = await_open(conn, feed)
+    pid = feed_pid()
+
+    # The device leaves the engine with no closing signal, as a read racing
+    # its revocation sees it.
+    :sys.replace_state(ctx.relay, fn state ->
+      update_in(state.store.engine.devices, &Map.delete(&1, ctx.reader))
+    end)
+
+    send(pid, {:change_log, "A", 1_000_000})
+    {conn, feed, closing} = until_closing(conn, feed)
+    assert closing == %{event: "closing", data: %{"reason" => "revoked"}}
+    assert {_conn, %{done: true}} = drain(conn, feed)
+  end
+
+  test "an HTTP/1.1 connection reused after a feed keeps no subscription or timer", ctx do
+    Application.put_env(:attention_server, :client_api_feed_heartbeat_ms, 50)
+    on_exit(fn -> Application.delete_env(:attention_server, :client_api_feed_heartbeat_ms) end)
+
+    conn = ClientAPIFeedClient.connect(ctx.port, ctx.certs, "a1", :http1)
+    {conn, feed} = open_feed(conn)
+    {conn, feed} = await_open(conn, feed)
+    pid = feed_pid()
+
+    # End the feed from the server side, without revoking the device: the
+    # store fails once, then recovers.
+    original = :sys.get_state(ctx.relay)
+    :sys.replace_state(ctx.relay, fn state -> put_in(state.store.db, :unusable) end)
+    send(pid, {:change_log, "A", 1_000_000})
+    {conn, _feed} = drain(conn, feed)
+    :sys.replace_state(ctx.relay, fn _ -> original end)
+
+    # The same connection serves another request.
+    {_conn, 200, _batch} = batch(conn, "?after=0")
+    Process.sleep(200)
+
+    if Process.alive?(pid) do
+      assert Registry.keys(ChangeLog.Registry, pid) == []
+      {:messages, messages} = Process.info(pid, :messages)
+      refute Enum.any?(messages, &match?({:feed_heartbeat, _}, &1))
+      refute Enum.any?(messages, &match?({:client_closing, _, _}, &1))
+    end
+  end
 end
