@@ -122,9 +122,6 @@ defmodule AttentionServer.ClientAPI.FeedStep do
   def read(ctx, cursor, limit), do: read(ctx.relay, ctx.principal, cursor, limit)
 
   @doc false
-  def transmitted(_ctx, _changes), do: :ok
-
-  @doc false
   def opened(_ctx), do: :ok
 
   @doc false

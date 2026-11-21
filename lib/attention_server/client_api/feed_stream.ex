@@ -75,12 +75,7 @@ defmodule AttentionServer.ClientAPI.FeedStream do
   defp open(conn, ctx, cursor, watcher, source) do
     case source.read(ctx, cursor, @page) do
       {:ok, changes, more, position} ->
-        conn =
-          conn
-          |> put_resp_header("content-type", "text/event-stream; charset=utf-8")
-          |> put_resp_header("cache-control", "no-cache")
-          |> put_resp_header("x-accel-buffering", "no")
-          |> send_chunked(200)
+        conn = start_stream(conn)
 
         send(watcher, {:feed_opened, self()})
 
@@ -98,9 +93,20 @@ defmodule AttentionServer.ClientAPI.FeedStream do
 
         send_page(conn, state, changes, more)
 
+      {:error, :delivery_unavailable} ->
+        conn |> start_stream() |> send_closing("storage_unavailable")
+
       {:error, reason} ->
         Feed.send_read_error(conn, reason)
     end
+  end
+
+  defp start_stream(conn) do
+    conn
+    |> put_resp_header("content-type", "text/event-stream; charset=utf-8")
+    |> put_resp_header("cache-control", "no-cache")
+    |> put_resp_header("x-accel-buffering", "no")
+    |> send_chunked(200)
   end
 
   # Reads and sends pages until the feed has caught up with the log.
@@ -133,17 +139,8 @@ defmodule AttentionServer.ClientAPI.FeedStream do
 
   defp send_page(conn, state, changes, more) do
     case send_changes(conn, changes) do
-      {:ok, conn} ->
-        case relay_step(fn -> state.source.transmitted(state.ctx, changes) end) do
-          :ok -> continue(conn, state, more)
-          {:error, :account_paused} -> closing(conn, state, "account_paused")
-          {:error, :unauthorized} -> closing(conn, state, "revoked")
-          {:error, :server_shutdown} -> closing(conn, state, "server_shutdown")
-          {:error, _reason} -> closing(conn, state, "storage_unavailable")
-        end
-
-      {:error, _reason} ->
-        finish(conn, state, "client_closed")
+      {:ok, conn} -> continue(conn, state, more)
+      {:error, _reason} -> finish(conn, state, "client_closed")
     end
   end
 
@@ -320,10 +317,18 @@ defmodule AttentionServer.ClientAPI.FeedStream do
   end
 
   defp closing(conn, state, reason) do
-    _ =
-      chunk_safely(conn, ["event: closing\ndata: ", JSON.encode!(%{"reason" => reason}), "\n\n"])
+    conn |> send_closing(reason) |> finish(state, reason)
+  end
 
-    finish(conn, state, reason)
+  defp send_closing(conn, reason) do
+    case chunk_safely(conn, [
+           "event: closing\ndata: ",
+           JSON.encode!(%{"reason" => reason}),
+           "\n\n"
+         ]) do
+      {:ok, conn} -> conn
+      {:error, _reason} -> conn
+    end
   end
 
   defp monitor(relay) do

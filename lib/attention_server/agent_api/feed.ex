@@ -7,7 +7,7 @@ defmodule AttentionServer.AgentAPI.Feed do
 
   alias AttentionServer.AgentAPI.{FeedActivity, FeedStep}
   alias AttentionServer.ClientAPI.{Errors, Feed, FeedStream}
-  alias AttentionServer.{Diagnostics, Message}
+  alias AttentionServer.Message
 
   @impl true
   def routes, do: [{"GET", ["agent", "changes"], :changes, stream: true}]
@@ -38,14 +38,6 @@ defmodule AttentionServer.AgentAPI.Feed do
 
         FeedActivity.observe(ctx, :batch)
 
-        case FeedStep.transmitted(ctx, changes) do
-          :ok ->
-            :ok
-
-          {:error, reason} ->
-            Diagnostics.failure(:client_api, :state_commit, reason, :failed)
-        end
-
         conn
 
       {:error, reason} ->
@@ -72,12 +64,6 @@ defmodule AttentionServer.AgentAPI.FeedStep do
   def read(%{relay: relay, principal: principal, params: %{session: session}}, cursor, limit),
     do: call(relay, {:read, principal, session, cursor, limit})
 
-  def transmitted(%{relay: relay, principal: principal}, changes) do
-    targets = Enum.flat_map(changes, &delivery_target/1)
-
-    if targets == [], do: :ok, else: call(relay, {:delivered, principal, targets})
-  end
-
   def opened(ctx) do
     FeedActivity.observe(ctx, :open)
     focus_granted(ctx)
@@ -102,20 +88,37 @@ defmodule AttentionServer.AgentAPI.FeedStep do
   defp call(relay, request),
     do: GenServer.call(relay, {:client_api, __MODULE__, request}, :infinity)
 
-  def handle_call({:read, principal, session, cursor, limit}, _from, state),
-    do: {:reply, read_rows(state, principal, session, cursor, limit), state}
-
-  def handle_call({:delivered, principal, targets}, _from, %{store: store} = state) do
-    with {:ok, {person, key}} <- authorized(store.engine, principal),
-         targets <- resolve_answers(store.engine, person, targets),
-         {:ok, next} <- Engine.agent_feed_delivered(store.engine, person, key, targets),
-         {:ok, store} <-
-           Store.commit(store, next, %{person: person, actor: key, action: "agent_feed_delivered"}) do
-      {:reply, :ok, %{state | store: store}}
+  def handle_call({:read, principal, session, cursor, limit}, _from, %{store: store} = state) do
+    with {:ok, agent, changes, more, position} <-
+           read_rows(state, principal, session, cursor, limit),
+         targets = Enum.flat_map(changes, &delivery_target/1),
+         {:ok, store} <- commit_delivery(store, agent, targets) do
+      {:reply, {:ok, changes, more, position}, %{state | store: store}}
     else
-      {:error, reason, _store} -> {:reply, {:error, reason}, state}
       {:error, _} = error -> {:reply, error, state}
     end
+  end
+
+  defp commit_delivery(store, _agent, []), do: {:ok, store}
+
+  # As in the legacy origin fetch, the page's cursor and payload are selected
+  # before ACK1, but neither is returned until the receipt commit succeeds.
+  defp commit_delivery(store, {person, key}, targets) do
+    targets = resolve_answers(store.engine, person, targets)
+
+    with {:ok, next} <- Engine.agent_feed_delivered(store.engine, person, key, targets),
+         {:ok, store} <-
+           Store.commit(store, next, %{person: person, actor: key, action: "agent_feed_delivered"}) do
+      {:ok, store}
+    else
+      {:error, reason, _store} -> delivery_failure(reason)
+      {:error, reason} -> delivery_failure(reason)
+    end
+  end
+
+  defp delivery_failure(reason) do
+    Diagnostics.failure(:client_api, :state_commit, reason, :failed)
+    {:error, :delivery_unavailable}
   end
 
   defp read_rows(%{store: store} = state, principal, session, cursor, limit) do
@@ -123,7 +126,7 @@ defmodule AttentionServer.AgentAPI.FeedStep do
          {:ok, rows, more, position} <- AgentChangeLog.read(store, agent, cursor, limit, session),
          {:ok, changes} <-
            state |> FeedRenderer.render_many(principal, rows) |> FeedStep.changes() do
-      {:ok, changes, more, position}
+      {:ok, agent, changes, more, position}
     else
       {:error, reason}
       when reason in [:cursor_expired, :account_paused, :unauthorized, :disabled] ->

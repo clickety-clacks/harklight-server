@@ -537,20 +537,53 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
       assert {:ok, undelivered_rev} = agent_entry_rev(ctx.relay, scope, position)
 
       set_feed_writable(ctx.relay, false)
-      resume_at = interrupted_feed_cursor(connect(ctx), cursor, unquote(transport))
+      expect_delivery_failure(connect(ctx), cursor, unquote(transport))
+      assert {:ok, ^undelivered_rev} = agent_entry_rev(ctx.relay, scope, position)
       set_feed_writable(ctx.relay, true)
 
-      conn = resume_agent_feed(connect(ctx), resume_at, unquote(transport))
+      {conn, first} = resume_agent_feed(connect(ctx), cursor, unquote(transport))
+      assert %{"position" => ^position, "rev" => ^undelivered_rev} = first
+      assert {:ok, delivered_rev} = agent_entry_rev(ctx.relay, scope, position)
+      assert delivered_rev > undelivered_rev
+      Mint.HTTP.close(conn)
 
-      assert eventually(fn ->
-               case agent_entry_rev(ctx.relay, scope, position) do
-                 {:ok, delivered_rev} -> delivered_rev > undelivered_rev
-                 _ -> false
-               end
-             end)
+      {conn, replayed} = resume_agent_feed(connect(ctx), cursor, unquote(transport))
 
+      assert %{
+               "position" => ^position,
+               "rev" => ^delivered_rev,
+               "delivery" => %{"delivered" => true}
+             } = replayed
+
+      assert {:ok, ^delivered_rev} = agent_entry_rev(ctx.relay, scope, position)
       Mint.HTTP.close(conn)
     end
+  end
+
+  test "a disconnected agent resumes a reply whose delivery was already committed", ctx do
+    {scope, cursor, position} = pending_agent_reply(ctx)
+    assert {:ok, undelivered_rev} = agent_entry_rev(ctx.relay, scope, position)
+
+    # Headers can arrive, but the zero window prevents the reply frame being written.
+    assert {:ok, conn} = Mint.HTTP2.put_settings(connect(ctx), initial_window_size: 0)
+    {conn, feed} = open_agent_feed(conn, "?after=#{cursor}")
+    {conn, feed} = await_open(conn, feed)
+    assert feed.status == 200
+    assert feed.buffer == ""
+    assert {:ok, delivered_rev} = agent_entry_rev(ctx.relay, scope, position)
+    assert delivered_rev > undelivered_rev
+    Mint.HTTP.close(conn)
+
+    {conn, replayed} = resume_agent_feed(connect(ctx), cursor, :sse)
+
+    assert %{
+             "position" => ^position,
+             "rev" => ^delivered_rev,
+             "delivery" => %{"delivered" => true}
+           } = replayed
+
+    assert {:ok, ^delivered_rev} = agent_entry_rev(ctx.relay, scope, position)
+    Mint.HTTP.close(conn)
   end
 
   defp pending_agent_reply(ctx) do
@@ -587,57 +620,40 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
     {scope, position, entry_position}
   end
 
-  defp interrupted_feed_cursor(conn, cursor, :batch) do
+  defp expect_delivery_failure(conn, cursor, :batch) do
     {conn, response} = agent_batch(conn, "?after=#{cursor}", [])
     Mint.HTTP.close(conn)
+    assert response.status == 503
+    assert {"retry-after", _seconds} = List.keyfind(response.headers, "retry-after", 0)
 
-    case response.status do
-      200 ->
-        assert {:ok, %{"rev" => position}} = JSON.decode_line(response.body <> "\n")
-        position
+    assert {:ok, %{"error" => "storage_unavailable"} = body} =
+             JSON.decode_line(response.body <> "\n")
 
-      503 ->
-        assert {:ok, %{"error" => "storage_unavailable"}} =
-                 JSON.decode_line(response.body <> "\n")
-
-        cursor
-    end
+    refute Map.has_key?(body, "rev")
   end
 
-  defp interrupted_feed_cursor(conn, cursor, :sse) do
+  defp expect_delivery_failure(conn, cursor, :sse) do
     {conn, feed} = open_agent_feed(conn, "?after=#{cursor}")
     {conn, feed} = await_open(conn, feed)
-
-    case feed.status do
-      200 ->
-        interrupted_stream_cursor(conn, feed, cursor)
-
-      503 ->
-        {conn, feed} = drain(conn, feed)
-
-        assert {:ok, %{"error" => "storage_unavailable"}} =
-                 JSON.decode_line(feed.buffer <> "\n")
-
-        Mint.HTTP.close(conn)
-        cursor
-    end
-  end
-
-  defp interrupted_stream_cursor(conn, feed, cursor) do
-    case events(conn, feed, 1) do
-      {conn, _feed, [%{event: "closing", data: %{"reason" => "storage_unavailable"}}]} ->
-        Mint.HTTP.close(conn)
-        cursor
-
-      {conn, feed, [event]} ->
-        interrupted_stream_cursor(conn, feed, Map.get(event, :id, cursor))
-    end
+    assert feed.status == 200
+    {conn, feed, [event]} = events(conn, feed, 1)
+    assert event == %{event: "closing", data: %{"reason" => "storage_unavailable"}}
+    assert {conn, %{done: true, buffer: ""}} = drain(conn, feed)
+    Mint.HTTP.close(conn)
   end
 
   defp resume_agent_feed(conn, cursor, :batch) do
     {conn, response} = agent_batch(conn, "?after=#{cursor}", [])
     assert response.status == 200
-    conn
+    assert {:ok, %{"changes" => changes}} = JSON.decode_line(response.body <> "\n")
+
+    entry =
+      Enum.find_value(changes, fn
+        %{"kind" => "entry", "data" => %{"kind" => "reply", "author" => "person"} = data} -> data
+        _ -> nil
+      end)
+
+    {conn, entry}
   end
 
   defp resume_agent_feed(conn, cursor, :sse) do
@@ -645,7 +661,8 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
     {conn, feed} = open_agent_feed(conn, "?after=0", headers)
     {conn, feed} = await_open(conn, feed)
     assert feed.status == 200
-    conn
+    {conn, _feed, event} = next_person_reply(conn, feed, 12)
+    {conn, event.data}
   end
 
   defp set_feed_writable(relay, writable?) do
