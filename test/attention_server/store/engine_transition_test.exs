@@ -672,7 +672,7 @@ defmodule AttentionServer.Store.EngineTransitionTest do
     :ok = Store.close(reopened)
   end
 
-  test "keyed timer publishes an advisory and acknowledgement survives reopen" do
+  test "keyed timer defers until support, retries a failed advisory commit and retains acknowledgement" do
     path = legacy_store_path()
     handle = "00000000-0000-4000-8000-000000000010"
     {:ok, store} = Store.open(path)
@@ -712,7 +712,7 @@ defmodule AttentionServer.Store.EngineTransitionTest do
                "session_handle" => handle,
                "route" => "claude-code",
                "cli_version" => "test",
-               "unsupported_reason" => nil,
+               "unsupported_reason" => "route unavailable",
                "advisory_v1" => true
              })
 
@@ -746,6 +746,35 @@ defmodule AttentionServer.Store.EngineTransitionTest do
     assert {:ok, relay} = Relay.start_link(opts)
     state = :sys.get_state(relay)
     scope = {@person, @origin}
+    session = {@person, @origin, handle}
+    :atomics.put(clock, 1, due_at)
+    send(relay, {:bounce_due, state.bounce_deadline_generation})
+    deferred = :sys.get_state(relay).store
+    assert deferred.version == state.store.version + 1
+    assert MapSet.size(deferred.engine.bounce_waiting_routes[session]) == 1
+    assert BounceDecision.next_deadline(deferred.engine) == nil
+    GenServer.stop(relay)
+
+    :atomics.put(clock, 1, 100)
+    assert {:ok, relay} = Relay.start_link(opts)
+
+    assert :sys.get_state(relay).store.engine.bounce_waiting_routes ==
+             deferred.engine.bounce_waiting_routes
+
+    assert {:ok, %{"listening_support" => %{"unsupported_reason" => nil}}} =
+             Relay.origin_support(relay, @origin, %{
+               "type" => "support",
+               "op_id" => "00000000-0000-4000-8000-000000000015",
+               "session_handle" => handle,
+               "route" => "claude-code",
+               "cli_version" => "test",
+               "unsupported_reason" => nil,
+               "advisory_v1" => true
+             })
+
+    state = :sys.get_state(relay)
+    assert state.store.engine.bounce_waiting_routes == %{}
+    assert BounceDecision.next_deadline(state.store.engine) == due_at
     assert {:ok, decision_rev} = AgentChangeLog.head(state.store, scope)
     :atomics.put(clock, 1, due_at)
 
@@ -800,6 +829,46 @@ defmodule AttentionServer.Store.EngineTransitionTest do
     live = :sys.get_state(reopened).store
     assert live.version == committed.version
     assert index_state(live) == index_state(committed)
+    GenServer.stop(reopened)
+  end
+
+  test "keyed no-comment refuses an id shared by two senders before and after reopen" do
+    path = legacy_store_path()
+    {:ok, old} = Store.open(path)
+    {:ok, engine} = Engine.setup_sender(old.engine, @origin, "app:test/other")
+    audit = %{person: @person, actor: @origin, action: "setup"}
+    {:ok, old} = Store.commit(old, engine, audit)
+    assert {:ok, _} = KeyedMigration.convert(old)
+    :ok = Store.close(old)
+    opts = [store_path: path, store_mode: :keyed, clock: fn -> 100 end]
+    {:ok, relay} = Relay.start_link(opts)
+    assert {:ok, accepted} = Relay.request_line(relay, @origin, forward_line())
+    assert {:ok, %{"type" => "ok"}} = JSON.decode_line(accepted)
+    {:ok, second} = JSON.decode_line(forward_line())
+
+    line =
+      second
+      |> Map.put("op_id", "00000000-0000-4000-8000-000000000021")
+      |> put_in(["message", "sender_id"], "app:test/other")
+      |> JSON.encode_line()
+
+    assert {:ok, accepted} = Relay.request_line(relay, @origin, line)
+    assert {:ok, %{"type" => "ok"}} = JSON.decode_line(accepted)
+
+    request =
+      JSON.encode_line(%{
+        "type" => "answer_no_comment",
+        "request_id" => "msg",
+        "request_revision" => 1
+      })
+
+    assert {:ok, refused} = Relay.request_line(relay, @reader, request)
+    assert {:ok, %{"type" => "error", "reason" => "not_found"}} = JSON.decode_line(refused)
+    committed = :sys.get_state(relay).store
+    GenServer.stop(relay)
+    {:ok, reopened} = Relay.start_link(opts)
+    assert {:ok, ^refused} = Relay.request_line(reopened, @reader, request)
+    assert :sys.get_state(reopened).store.version == committed.version
     GenServer.stop(reopened)
   end
 
