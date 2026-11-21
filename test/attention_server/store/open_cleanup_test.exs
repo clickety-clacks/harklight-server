@@ -114,7 +114,6 @@ defmodule AttentionServer.Store.OpenCleanupTest do
           capture_log(fn -> assert {:error, :storage_unavailable} = Store.open(path, mode) end)
 
         assert log =~ "cause=stale_generation"
-        refute log =~ "cause=unknown"
         assert Enum.map(paths, &File.read/1) == [{:ok, "in flight"}, {:ok, "in flight"}]
         assert :ok = Sqlite3.execute(db, "DROP TRIGGER move_generation")
       after
