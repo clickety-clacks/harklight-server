@@ -2882,6 +2882,38 @@ defmodule AttentionServer.PrioritizationTest do
     assert RouteBIndex.scored_reply_items(next.route_b_index, "person-b") == MapSet.new([other])
   end
 
+  test "publishing one reply score does not traverse unrelated accounts' histories" do
+    key = {"person-a", "app:test", "reply"}
+
+    entries = [
+      %{"sender_id" => "app:test", "message_id" => "reply", "conversation_seq" => 3, "score" => 0.7}
+    ]
+
+    [small, large] =
+      for size <- [0, 10_000] do
+        history =
+          for n <- 1..size//1, into: %{key => %{score: 0.9, scores: %{3 => 0.9}}} do
+            {{"person-b", "app:test", Integer.to_string(n)}, %{score: 0.5, scores: %{1 => 0.5}}}
+          end
+
+        engine =
+          %{Engine.new() | reply_group_history: history}
+          |> RouteBIndex.enable_agent_feed()
+
+        Enum.min(
+          for _ <- 1..5 do
+            {:reductions, start} = Process.info(self(), :reductions)
+            result = Engine.retain_reply_scores(engine, "person-a", entries, true)
+            {:reductions, finish} = Process.info(self(), :reductions)
+            assert {_next, [{"person-a", 3}]} = result
+            finish - start
+          end
+        )
+      end
+
+    assert large < max(small, 256) * 4
+  end
+
   test "never-scored history stays unscored and a person's turn does not reactivate it", %{
     path: path
   } do
