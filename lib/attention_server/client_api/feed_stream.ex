@@ -187,10 +187,7 @@ defmodule AttentionServer.ClientAPI.FeedStream do
   defp subscribe_shows(%{kind: :device, key: key}), do: Focus.subscribe_shows(key)
   defp subscribe_shows(_principal), do: :ok
 
-  # Focus has no unsubscribe yet; this is the key Focus.subscribe_shows/1
-  # registers under.
-  defp unsubscribe_shows(%{kind: :device, key: key}),
-    do: Registry.unregister(AttentionServer.ChangeLog.Registry, {:client_api_show, key})
+  defp unsubscribe_shows(%{kind: :device, key: key}), do: Focus.unsubscribe_shows(key)
 
   defp unsubscribe_shows(_principal), do: :ok
 
