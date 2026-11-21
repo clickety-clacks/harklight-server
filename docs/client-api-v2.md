@@ -1178,36 +1178,45 @@ Writes return 200 unless the table says otherwise. Each response schema requires
     },
     "AgentFileUseBody": {
       "type": "object",
-      "required": ["file_id", "outcome"],
+      "required": ["file_id"],
       "additionalProperties": false,
       "properties": {
         "file_id": { "$ref": "#/$defs/OpaqueId" },
-        "outcome": { "enum": ["used", "unusable", "not_transferred"] },
+        "transfer": { "enum": ["transferred", "not_transferred"] },
+        "use": { "enum": ["used", "unusable"] },
         "reason": { "type": "string", "minLength": 1 }
       },
-      "if": { "properties": { "outcome": { "enum": ["unusable", "not_transferred"] } } },
+      "anyOf": [{ "required": ["transfer"] }, { "required": ["use"] }],
+      "if": { "anyOf": [
+        { "required": ["transfer"], "properties": { "transfer": { "const": "not_transferred" } } },
+        { "required": ["use"], "properties": { "use": { "const": "unusable" } } }
+      ] },
       "then": { "required": ["reason"] },
       "else": { "not": { "required": ["reason"] } }
     },
     "AgentFileUse": {
       "type": "object",
-      "required": ["file_id", "outcome"],
+      "required": ["file_id"],
       "properties": {
         "file_id": { "$ref": "#/$defs/OpaqueId" },
-        "outcome": { "enum": ["used", "unusable", "not_transferred"] },
-        "reason": { "type": "string" }
+        "transfer": { "enum": ["transferred", "not_transferred"] },
+        "transfer_reason": { "type": "string" },
+        "use": { "enum": ["used", "unusable"] },
+        "use_reason": { "type": "string" }
       }
     },
     "AgentFileUseResult": {
       "type": "object",
-      "required": ["rev", "entry", "file_id", "outcome"],
+      "required": ["rev", "entry", "file_id"],
       "properties": {
         "rev": { "$ref": "#/$defs/Position" },
         "entry": { "$ref": "#/$defs/AgentEntry" },
         "file_id": { "$ref": "#/$defs/OpaqueId" },
-        "outcome": { "enum": ["used", "unusable", "not_transferred"] },
+        "transfer": { "enum": ["transferred", "not_transferred"] },
+        "use": { "enum": ["used", "unusable"] },
         "duplicate": { "type": "boolean" }
-      }
+      },
+      "anyOf": [{ "required": ["transfer"] }, { "required": ["use"] }]
     },
     "AgentAdvisoryAckBody": {
       "type": "object",
@@ -1340,13 +1349,16 @@ Writes return 200 unless the table says otherwise. Each response schema requires
   recorded, or was superseded by the existing handoff. It also carries the
   effective `stage_outcome` and affected message or entry.
 - **File use.** The file must belong to the referenced delivered turn.
-  Report `used`, `unusable` or `not_transferred`. Provide a nonempty
-  reason for either unsuccessful outcome and omit it for `used`.
-  `not_transferred` folds the legacy ACK1 attachment transfer report into
-  this route (`ConversationFiles.valid_use?` and `transfers_for`).
-  An identical use report is a duplicate. A different report for the same
-  file and turn conflicts with the existing one and answers
-  `409 already_closed`.
+  Send at least one of `transfer` (`transferred` or `not_transferred`) or
+  `use` (`used` or `unusable`). Supply a nonempty reason for an unsuccessful
+  report. If both reports are unsuccessful, the reason applies to both.
+  Transfer and use have independent histories. A later use may follow a
+  failed transfer. A value or reason that disagrees with the prior report
+  in the same dimension answers `409 already_closed`, and the request
+  applies neither report. If both reports repeat their existing values and
+  reasons, the response carries `duplicate: true`. The updated entry
+  carries the recorded transfer and use, with each report's reason when
+  present.
 - **Advisory acknowledgment.** Supply the advisory's ID from the item.
   The response reports whether it was already marked delivered.
 - **End session.** `404 not_found` for an unknown session of this enrolled
@@ -1517,7 +1529,7 @@ can skip agent-wide revisions.
 | `GET /v2/agent/messages/{item_id}`, or `GET /v2/agent/messages/{item_id}/revisions/{n}` for a selected revision | `message_get` |
 | `GET /v2/agent/changes` with optional `session` (agent spec r2 §4) | `feed`, change notices, session listen, coverage stream |
 | Automatic when the feed serves the turn (agent spec r2 §4) | `ack` (ACK1) |
-| `POST /v2/agent/messages/{item_id}/entries/{entry_id}/file-use` with `not_transferred` and reason | ACK1 attachment transfer reports (round 20 addendum 3) |
+| `POST /v2/agent/messages/{item_id}/entries/{entry_id}/file-use` with `transfer` and reason when required | ACK1 attachment transfer reports (round 20 addendum 4) |
 | `GET /v2/agent/messages` | Baseline for a new or expired feed cursor |
 | Retired. Feed activity supplies availability (agent spec r2 §§0, 4) | `support`, `attachment_update`, `status`, `coverage` |
 | Retired. Feeds are independent (agent spec r2 §§0, 4) | Exclusive listener, reconnect takeover |
