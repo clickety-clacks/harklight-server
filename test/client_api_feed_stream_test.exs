@@ -432,6 +432,8 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
 
   test "filtered agent SSE resumes across concurrent writes and converges with the snapshot",
        ctx do
+    Application.put_env(:attention_server, :client_api_feed_heartbeat_ms, 100)
+    on_exit(fn -> Application.delete_env(:attention_server, :client_api_feed_heartbeat_ms) end)
     assert :ok = Relay.setup_sender(ctx.relay, ctx.reader, "app:agent")
     {conn, feed} = open_agent_feed(connect(ctx), "?session=#{@handle}")
     {conn, feed} = await_open(conn, feed)
@@ -468,8 +470,8 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
 
     {conn, feed} = await_open(conn, feed)
     assert feed.status == 200
+    Task.await(writer, 30_000)
     {conn, _feed, resumed} = agent_messages(conn, feed, 17)
-    Task.await(writer, 10_000)
     all = seen ++ resumed
     assert Enum.all?(all, &(&1.data["session"] == @handle))
     ids = Enum.map(all, & &1.id)
