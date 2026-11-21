@@ -54,6 +54,7 @@ defmodule AttentionServer.Diagnostics do
     invalid_json: "invalid_json",
     storage_unavailable: "storage_unavailable",
     stale_generation: "stale_generation",
+    untouched_change: "untouched_change",
     incomplete_upload: "incomplete_upload",
     upload_conflict: "upload_conflict",
     upload_discarded: "upload_discarded",
