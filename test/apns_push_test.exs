@@ -1809,14 +1809,16 @@ defmodule AttentionServer.APNSPushTest do
       assert :trace.process(trace, dispatcher, true, [:procs]) == 1
       send(dispatcher, :dispatch)
       assert_receive {:trace, ^dispatcher, :spawn, attempt, _mfa}, 5_000
+      monitor = Process.monitor(attempt)
 
       try do
         result = Task.yield(dispatch, 5_000)
         if is_nil(result), do: Task.shutdown(dispatch, :brutal_kill)
         assert {:ok, {:noreply, state_after_timeout}} = result
-        refute Process.alive?(attempt)
+        assert_receive {:DOWN, ^monitor, :process, ^attempt, _reason}, 5_000
         state_after_timeout
       after
+        Process.demonitor(monitor, [:flush])
         Process.exit(attempt, :kill)
       end
     after
