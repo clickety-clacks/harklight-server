@@ -724,6 +724,22 @@ defmodule AttentionServer.ClientAPIWritesTest do
                Writes.answer(relay, "reader", form, 1, {:result, %{"choice" => "blue"}}, key())
 
       assert stored_terminal(relay, "form").answer == %{"choice" => "blue"}
+
+      # Any JSON value is a result, null included, stored unchanged (round 16).
+      for {id, n, result} <- [{"form-null", 42, nil}, {"form-list", 43, ["blue", 2, true]}] do
+        forward_message(
+          relay,
+          n,
+          %{"message_id" => id, "message_type" => "request", "answer_ui" => @form},
+          [%{"name" => "cover.png", "data_base64" => Base.encode64("not image bytes")}]
+        )
+
+        assert {:ok, 200, %{"item" => %{"terminal" => %{"state" => "answered"}}}, false} =
+                 Writes.answer(relay, "reader", item_id(relay, id), 1, {:result, result}, key())
+
+        assert stored_terminal(relay, id).answer == result
+      end
+
       GenServer.stop(relay)
     end
 
@@ -1268,6 +1284,8 @@ defmodule AttentionServer.ClientAPIWritesTest do
           {~s({"request_revision":1,"choice":""}), "choice"},
           {~s({"request_revision":1,"comment":5}), "comment"},
           {~s({"request_revision":1,"result":[]}), "result"},
+          {~s({"request_revision":1,"result":null}), "result"},
+          {~s({"request_revision":1,"choice":"a","result":null}), nil},
           {~s({"request_revision":1,"other":1}), "other"}
         ] do
       assert {400, error, _} = post(relay, route, body, [{"idempotency-key", key()}])
@@ -1279,6 +1297,24 @@ defmodule AttentionServer.ClientAPIWritesTest do
              post(relay, route, ~s({"request_revision":1,"comment":"Yes"}), [
                {"idempotency-key", key()}
              ])
+
+    # On a UI/1 screen a present result is the answer, whatever JSON it is (round 16).
+    for {id, n, body} <- [
+          {"form-null", 50, ~s({"request_revision":1,"result":null})},
+          {"form-list", 51, ~s({"request_revision":1,"result":["blue",2]})}
+        ] do
+      forward_message(
+        relay,
+        n,
+        %{"message_id" => id, "message_type" => "request", "answer_ui" => @form},
+        [%{"name" => "cover.png", "data_base64" => Base.encode64("not image bytes")}]
+      )
+
+      assert {200, %{"item" => %{"terminal" => %{"state" => "answered"}}}, _} =
+               post(relay, ["items", item_id(relay, id), "answer"], body, [
+                 {"idempotency-key", key()}
+               ])
+    end
 
     GenServer.stop(relay)
   end
