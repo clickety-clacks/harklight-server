@@ -24,7 +24,7 @@ defmodule AttentionServer.Store do
   }
 
   alias Exqlite.Sqlite3
-  alias AttentionServer.Store.{Persistence, RecordCodec, SnapshotEncoding}
+  alias AttentionServer.Store.{KeyedValidation, Persistence, RecordCodec, SnapshotEncoding}
 
   @format_version 29
   @inbox_index_chunk_size 20
@@ -443,6 +443,25 @@ defmodule AttentionServer.Store do
         )
 
         {:error, :storage_unavailable}
+    end
+  end
+
+  @doc false
+  def verify_retained_uploads(%__MODULE__{engine: engine, upload_dir: directory}) do
+    if valid_upload_references?(engine) do
+      engine
+      |> KeyedValidation.upload_index()
+      |> Enum.reduce_while(:ok, fn {id, _entries}, :ok ->
+        with true <- AttentionServer.Message.uuid_v4?(id),
+             {:ok, upload} <- Map.fetch(engine.uploads, id),
+             :ok <- verify_upload(Path.join(directory, id), upload) do
+          {:cont, :ok}
+        else
+          _ -> {:halt, {:error, :retained_upload_unavailable}}
+        end
+      end)
+    else
+      {:error, :retained_upload_unavailable}
     end
   end
 
