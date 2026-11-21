@@ -763,11 +763,14 @@ defmodule AttentionServer.ClientAPI.Resources do
     |> put_present("due_at_ms", time_ms(entry["due_at"]))
   end
 
+  @max_rank_key_bytes 48
+
   @doc """
   Assigns rank keys to `ordered_ids` (first first). Keys sort
   ascending, bytewise. The longest run of ids whose `previous` keys are already
   in order keeps them. Every other id gets a new key between its kept
-  neighbours, so a single move rewrites a single key.
+  neighbours, so a single move normally rewrites a single key. If a gap
+  requires an overlong key, the order is spread again with short keys.
   """
   def rank_keys(previous, ordered_ids) when is_map(previous) and is_list(ordered_ids) do
     candidates =
@@ -775,7 +778,7 @@ defmodule AttentionServer.ClientAPI.Resources do
       |> Enum.with_index()
       |> Enum.flat_map(fn {id, index} ->
         case Map.get(previous, id) do
-          "1" <> fraction = key when fraction != "" ->
+          "1" <> fraction = key when fraction != "" and byte_size(key) <= @max_rank_key_bytes ->
             if valid_fraction?(fraction), do: [{index, key}], else: []
 
           _ ->
@@ -787,7 +790,13 @@ defmodule AttentionServer.ClientAPI.Resources do
       # Nothing moved: every id keeps its key (the change log's usual re-rank).
       ordered_ids |> Enum.zip(Enum.map(candidates, &elem(&1, 1))) |> Map.new()
     else
-      reassign(ordered_ids, candidates)
+      keys = reassign(ordered_ids, candidates)
+
+      if Enum.any?(keys, fn {_id, key} -> byte_size(key) > @max_rank_key_bytes end) do
+        Map.new(spread("", nil, ordered_ids))
+      else
+        keys
+      end
     end
   end
 
