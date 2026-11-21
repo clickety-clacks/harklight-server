@@ -448,15 +448,28 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
              } = contract(ctx, "AgentWriteResult", revised)
 
       assert get(ctx, "a1", "/v2/files/" <> file).body == "fixture"
+      follow_up = person_reply(ctx, id, 4)
+      entries = get(ctx, "a2", "/v2/items/" <> id <> "/entries")
+      assert entries.status == 200
+
+      person_entries = contract(ctx, "EntriesPage", entries)["entries"]
+
+      assert Enum.any?(person_entries, &match?(%{"entry_id" => ^follow_up}, &1))
+
+      assert Enum.any?(
+               person_entries,
+               &match?(%{"kind" => "revision", "files" => [%{"file_id" => ^file}]}, &1)
+             )
+
       body = %{"message" => %{"title" => "Carried", "created_at" => 1}, "file_ids" => [file]}
-      carried = request(ctx, "a1", "PUT", path, body, 4, [{"if-match", "2"}])
+      carried = request(ctx, "a1", "PUT", path, body, 5, [{"if-match", "2"}])
       assert carried.status == 200
 
       assert %{"message" => %{"files" => [%{"name" => "inline.txt"}]}} =
                contract(ctx, "AgentWriteResult", carried)
 
       body = %{"message" => %{"title" => "Cleared", "created_at" => 1}, "file_ids" => []}
-      cleared = request(ctx, "a1", "PUT", path, body, 5, [{"if-match", "3"}])
+      cleared = request(ctx, "a1", "PUT", path, body, 6, [{"if-match", "3"}])
       assert %{"message" => %{"files" => []}} = contract(ctx, "AgentWriteResult", cleared)
     end
 
