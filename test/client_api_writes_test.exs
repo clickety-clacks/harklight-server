@@ -834,7 +834,9 @@ defmodule AttentionServer.ClientAPIWritesTest do
              send_file(relay, "bytes", [{"idempotency-key", key()}])
 
     assert {:ok, 200, _, false} = Writes.seen(relay, "reader", two, key())
-    assert {:ok, 200, _, false} = Writes.read_position(relay, "reader", one, agent)
+    # The read position is moved by another device of the person (round 12).
+    assert :ok = Relay.setup_device(relay, "A", "second")
+    assert {:ok, 200, _, false} = Writes.read_position(relay, "second", one, agent)
 
     assert {:ok, 200, _, false} =
              Writes.reply(relay, "reader", one, "With a file", [file_id], key())
@@ -871,6 +873,7 @@ defmodule AttentionServer.ClientAPIWritesTest do
     assert {:ok, inbox} = Reads.inbox(relay, "reader")
     assert inbox["rev"] == head
     assert applied[:counts] == inbox["counts"]
+    assert applied[{:item, one}]["chat"]["read_position"] == agent
 
     for item <- inbox["items"] do
       assert applied[{:item, item["item_id"]}] == item
