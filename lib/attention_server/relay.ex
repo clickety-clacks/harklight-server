@@ -51,6 +51,7 @@ defmodule AttentionServer.Relay do
   @keyed_request_types ~w(
     forward message_open discussion answer conversation_reply conversation_revise
     conversation_read subscribe_remote answer_no_comment lifecycle conversation_result conversation_withdraw
+    levels_get levels_set
   )
 
   def start_link(opts \\ []) do
@@ -1914,14 +1915,15 @@ defmodule AttentionServer.Relay do
          %{store: %{change_log: true}} = state
        ) do
     with {:ok, person, _id, _revision} <- Engine.agent_identity(state.store.engine, key),
-         {:ok, next_engine, fields} <-
-           Engine.client_agent_answer(state.store.engine, key, frame, state.clock.()) do
-      case commit_agent_answer(state, next_engine, person, key, frame) do
+         {next_engine, {:ok, fields}, touched} <-
+           track_origin_fact(state, &Engine.client_agent_answer(&1, key, frame, state.clock.())) do
+      case commit_agent_answer(state, next_engine, person, key, frame, touched) do
         {:ok, next_state} -> {:reply, {:ok, fields}, next_state}
         :error -> {:reply, {:error, :storage_unavailable}, state}
       end
     else
       {:error, :forbidden} -> {:reply, {:error, :unauthorized}, state}
+      {_, error, _} -> {:reply, error, state}
       error -> {:reply, error, state}
     end
   end
@@ -4051,9 +4053,9 @@ defmodule AttentionServer.Relay do
   end
 
   defp agent_request(state, person, key, %{"v" => 1, "type" => "answer"} = request) do
-    case Engine.agent_answer(state.store.engine, key, request) do
-      {:ok, next_engine, fields} ->
-        case commit_agent_answer(state, next_engine, person, key, request) do
+    case track_origin_fact(state, &Engine.agent_answer(&1, key, request)) do
+      {next_engine, {:ok, fields}, touched} ->
+        case commit_agent_answer(state, next_engine, person, key, request, touched) do
           {:ok, next_state} ->
             {%{"v" => 1, "type" => "answer_result", "ok" => true} |> Map.merge(fields),
              next_state}
@@ -4062,7 +4064,7 @@ defmodule AttentionServer.Relay do
             {%{"v" => 1, "error" => "storage_unavailable"}, state}
         end
 
-      {:error, reason, field, terminal} ->
+      {_, {:error, reason, field, terminal}, _} ->
         reply = %{"v" => 1, "error" => reason}
         reply = if field, do: Map.put(reply, "field", field), else: reply
         reply = if terminal, do: Map.put(reply, "terminal", terminal), else: reply
@@ -4074,24 +4076,25 @@ defmodule AttentionServer.Relay do
     do: {%{"v" => 1, "error" => "invalid_request"}, state}
 
   # The two transports commit agent answers through the same store boundary.
-  defp commit_agent_answer(state, next_engine, person, key, frame) do
-    target = origin_feed_target_for_person(next_engine, person, frame)
+  defp commit_agent_answer(state, next_engine, person, key, frame, touched) do
+    targets =
+      if touched,
+        do: sweep_origin_targets(next_engine, touched),
+        else: [origin_feed_target_for_person(next_engine, person, frame)]
 
-    case commit(state.store, next_engine, %{person: person, actor: key, action: "agent_answer"}) do
+    audit = %{person: person, actor: key, action: "agent_answer"}
+
+    case commit_request(state.store, next_engine, touched, audit) do
       {:ok, store} ->
         next_state =
-          record_origin_feed_change(
-            %{state | store: store},
-            state.store.engine,
-            next_engine,
-            target
-          )
+          Enum.reduce(targets, %{state | store: store}, fn target, current ->
+            record_origin_feed_change(current, state.store.engine, next_engine, target)
+          end)
 
         next_state =
-          if pending_signature(state.store.engine, person) !=
-               pending_signature(next_engine, person),
-             do: pending_set_changed(next_state, person),
-             else: next_state
+          if pending_inputs_changed?(state.store.engine, next_engine, person, touched),
+            do: pending_set_changed(next_state, person),
+            else: next_state
 
         {:ok, next_state}
 

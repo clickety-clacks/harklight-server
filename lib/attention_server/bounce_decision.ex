@@ -963,7 +963,7 @@ defmodule AttentionServer.BounceDecision do
   end
 
   defp put_configuration(engine, person, config),
-    do: %{engine | bounce_levels: Map.put(engine.bounce_levels, person, config)}
+    do: Engine.put_row(engine, :bounce_levels, person, config)
 
   # Defaults apply to newly accepted deliveries and revisions. Existing stored
   # qualification flags (including legacy false values) remain unchanged, so

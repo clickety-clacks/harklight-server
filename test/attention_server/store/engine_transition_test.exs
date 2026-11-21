@@ -491,6 +491,19 @@ defmodule AttentionServer.Store.EngineTransitionTest do
     assert {:ok, %{"type" => "ok", "revision" => 1}} = JSON.decode_line(subscribed)
     assert {:ok, [^subscribed]} = Relay.session_request_line(keyed, keyed_session, subscribe)
 
+    levels =
+      JSON.encode_line(%{
+        "v" => 1,
+        "type" => "levels_set",
+        "ref" => "levels",
+        "op_id" => "00000000-0000-4000-8000-000000000024",
+        "levels" => [%{"name" => "Routine", "lower_bound" => 0, "bounce_after_days" => nil}]
+      })
+
+    assert {:ok, configured} = Relay.request_line(legacy, @reader, levels)
+    assert {:ok, %{"type" => "ok"}} = JSON.decode_line(configured)
+    assert {:ok, ^configured} = Relay.request_line(keyed, @reader, levels)
+
     for {id, operation_id} <- [
           {"no-comment", "00000000-0000-4000-8000-000000000021"},
           {"cleared", "00000000-0000-4000-8000-000000000022"}
@@ -1064,6 +1077,74 @@ defmodule AttentionServer.Store.EngineTransitionTest do
     assert full_diff(live.engine, reopened.engine) == MapSet.new()
     assert index_state(live) == index_state(reopened)
     :ok = Store.close(reopened)
+  end
+
+  test "keyed client API answer commits for a registered agent and replays after reopen" do
+    path = legacy_store_path()
+    agent = String.duplicate("c", 64)
+    origin = String.duplicate("d", 64)
+    owner = String.duplicate("e", 64)
+    person = "00000000-0000-4000-8000-000000000029"
+    {:ok, legacy} = Store.open(path)
+    {:ok, engine} = Engine.operator_bootstrap(legacy.engine, person, owner)
+    {:ok, engine} = Engine.setup_device(engine, person, origin)
+    {:ok, engine} = Engine.setup_sender(engine, origin, "app:test/worker")
+
+    {:ok, engine} =
+      Engine.owner_register_agent(
+        engine,
+        person,
+        owner,
+        "00000000-0000-4000-8000-000000000030",
+        agent
+      )
+
+    {:ok, engine} =
+      Engine.owner_replace_agent_grants(engine, person, owner, agent, 1, ["app:test/worker"], [
+        "app:test/worker"
+      ])
+
+    {:ok, legacy} = Store.commit(legacy, engine, %{person: person, actor: owner, action: "setup"})
+    assert {:ok, _} = KeyedMigration.convert(legacy)
+    :ok = Store.close(legacy)
+    flags = path <> ".flags"
+    File.write!(flags, JSON.encode!(%{"client_api_v2" => true}))
+    opts = [store_path: path, store_mode: :keyed, feature_flags_path: flags, clock: fn -> 100 end]
+    {:ok, relay} = Relay.start_link(opts)
+    {:ok, send} = JSON.decode_line(forward_line())
+
+    line =
+      send
+      |> Map.put("session_handle", "00000000-0000-4000-8000-000000000010")
+      |> JSON.encode_line()
+
+    assert {:ok, accepted} = Relay.request_line(relay, origin, line)
+    assert {:ok, %{"type" => "ok"}} = JSON.decode_line(accepted)
+
+    answer = %{
+      "v" => 1,
+      "type" => "answer",
+      "sender_id" => "app:test/worker",
+      "message_id" => "msg",
+      "request_revision" => 1,
+      "answer" => nil,
+      "op_id" => "00000000-0000-4000-8000-000000000031"
+    }
+
+    assert {:ok, %{"seq" => 2}} = Relay.client_agent_answer(relay, agent, answer)
+    live = :sys.get_state(relay).store
+    GenServer.stop(relay)
+    {:ok, reopened} = Relay.start_link(opts)
+
+    assert {:ok, %{"seq" => 2, "duplicate" => true}} =
+             Relay.client_agent_answer(reopened, agent, answer)
+
+    assert :sys.get_state(reopened).store.version == live.version
+
+    assert :sys.get_state(reopened).store.engine.messages[{person, "app:test/worker", "msg"}].terminal.actor ==
+             agent
+
+    GenServer.stop(reopened)
   end
 
   defp agent_write(relay, operation, params, body, op_id) do
