@@ -569,7 +569,9 @@ defmodule AttentionServer.ClientAPIResourcesTest do
             {"t-a", "plan", 60},
             {"solo", nil, 61},
             {"t-b", "plan", 62},
-            {"t-c", "other", 63}
+            {"t-c", "other", 63},
+            {"solo-2", nil, 65},
+            {"t-d", "plan", 66}
           ] do
         extra = if thread, do: %{"thread" => thread}, else: %{}
         forward(relay, id, n, extra)
@@ -631,6 +633,15 @@ defmodule AttentionServer.ClientAPIResourcesTest do
       listed = for %{"kind" => "message", "message_id" => id} <- view.list_items, do: id
 
       assert by_rank == listed
+
+      # Round 9: open members of one (sender, thread) group are adjacent, and
+      # carry the thread; resolved and unthreaded items carry none.
+      threads = Map.new(items, fn {{_, _, id}, item} -> {id, item["thread"]} end)
+      assert threads["t-b"] == "plan" and threads["t-d"] == "plan" and threads["t-c"] == "other"
+      assert threads["solo"] == nil and threads["t-a"] == nil
+      b = Enum.find_index(by_rank, &(&1 == "t-b"))
+      d = Enum.find_index(by_rank, &(&1 == "t-d"))
+      assert abs(b - d) == 1
       # Today's two orders agree on the current section; report where they differ.
       current =
         for {{_, _, id}, item} <- Enum.sort_by(items, fn {_, i} -> i["rank"]["key"] end),
