@@ -43,7 +43,10 @@ defmodule AttentionServer.ClientAPI.Writes do
       {"POST", ["items", :item_id, "seen"], :post_seen},
       {"PUT", ["items", :item_id, "read-position"], :put_read_position},
       {"POST", ["items", :item_id, "replies"], :post_replies},
-      {"POST", ["items", :item_id, "answer"], :post_answer}
+      {"POST", ["items", :item_id, "answer"], :post_answer},
+      {"PUT", ["settings", "priority-levels"], :put_priority_levels},
+      {"PUT", ["devices", "me", "push"], :put_push},
+      {"DELETE", ["devices", "me", "push"], :delete_push}
     ]
   end
 
@@ -96,6 +99,46 @@ defmodule AttentionServer.ClientAPI.Writes do
       respond(conn, answer(ctx.relay, ctx.principal, ctx.params.item_id, revision, value, key))
     else
       {:error, token, field, conn} -> Errors.send_error(conn, token, field: field)
+      {:error, token, field} -> Errors.send_error(conn, token, field: field)
+    end
+  end
+
+  @doc false
+  def put_priority_levels(conn, %Context{} = ctx) do
+    with {:ok, key} <- optional_key(conn),
+         {:ok, if_match} <- if_match(conn),
+         {:ok, body, conn} <- json_body(conn),
+         :ok <- only_members(body, ["levels"]),
+         {:ok, levels} <- list_member(body, "levels") do
+      respond(conn, priority_levels(ctx.relay, ctx.principal, levels, if_match, key))
+    else
+      {:error, token, field, conn} -> Errors.send_error(conn, token, field: field)
+      {:error, token, field} -> Errors.send_error(conn, token, field: field)
+    end
+  end
+
+  @doc false
+  def put_push(conn, %Context{} = ctx) do
+    with :ok <- device_only(ctx.principal),
+         {:ok, key} <- optional_key(conn),
+         {:ok, body, conn} <- json_body(conn),
+         :ok <- only_members(body, ["token", "environment", "revision"]),
+         {:ok, token} <- string_member(body, "token"),
+         {:ok, environment} <- environment(body),
+         {:ok, revision} <- push_revision(body) do
+      respond(conn, push(ctx.relay, ctx.principal, token, environment, revision, key))
+    else
+      {:error, token, field, conn} -> Errors.send_error(conn, token, field: field)
+      {:error, token, field} -> Errors.send_error(conn, token, field: field)
+    end
+  end
+
+  @doc false
+  def delete_push(conn, %Context{} = ctx) do
+    with :ok <- device_only(ctx.principal),
+         {:ok, key} <- optional_key(conn) do
+      respond(conn, remove_push(ctx.relay, ctx.principal, key))
+    else
       {:error, token, field} -> Errors.send_error(conn, token, field: field)
     end
   end
@@ -162,6 +205,41 @@ defmodule AttentionServer.ClientAPI.Writes do
     })
   end
 
+  @doc """
+  `PUT /v2/settings/priority-levels`: replace the person's priority levels.
+  `if_match` is the `ETag` of the Settings the client holds; a stale one is
+  `412 precondition_failed`.
+  """
+  def priority_levels(relay, who, levels, if_match, idempotency_key \\ nil) do
+    write(relay, who, idempotency_key, {:priority_levels, levels, if_match}, %{
+      method: "PUT",
+      path: ["settings", "priority-levels"],
+      body: %{"levels" => levels, "if_match" => if_match}
+    })
+  end
+
+  @doc """
+  `PUT /v2/devices/me/push`: register or replace this device's push binding.
+  `environment` is `"production"` or `"sandbox"`. A `revision` at or below the
+  current binding's is `412 precondition_failed`.
+  """
+  def push(relay, who, token, environment, revision, idempotency_key \\ nil) do
+    write(relay, who, idempotency_key, {:push, token, environment, revision}, %{
+      method: "PUT",
+      path: ["devices", "me", "push"],
+      body: %{"token" => token, "environment" => environment, "revision" => revision}
+    })
+  end
+
+  @doc "`DELETE /v2/devices/me/push`: remove this device's push binding."
+  def remove_push(relay, who, idempotency_key \\ nil) do
+    write(relay, who, idempotency_key, :remove_push, %{
+      method: "DELETE",
+      path: ["devices", "me", "push"],
+      body: %{}
+    })
+  end
+
   defp write(relay, who, key, operation, request) do
     digest = Idempotency.digest(request.method, request.path, request.body)
 
@@ -217,6 +295,9 @@ defmodule AttentionServer.ClientAPI.Writes do
              &{Atom.to_string(&1), &1}
            )
 
+  # Today's field names that the client API renamed.
+  @fields %{"address" => "token", "address_kind" => "token", "profile_id" => "environment"}
+
   defp refusal(reason, reply) do
     token =
       with {:ok, atom} <- Map.fetch(@reasons, reason),
@@ -228,7 +309,7 @@ defmodule AttentionServer.ClientAPI.Writes do
 
     case reply do
       %{"field" => field} when is_binary(field) and token == "invalid_field" ->
-        {:error, token, field}
+        {:error, token, Map.get(@fields, field, field)}
 
       _ ->
         {:error, token}
@@ -245,6 +326,7 @@ defmodule AttentionServer.ClientAPI.Writes do
     reply =
       with {:ok, principal} <- principal(state.store.engine, who),
            {:ok, nil} <- stored(state, principal.person, key, digest),
+           :ok <- precondition(state, who, principal, operation),
            {:ok, frame} <- frame(state.store.engine, principal, key, operation) do
         if frame == :unchanged, do: :unchanged, else: {:apply, principal.engine_key, frame}
       else
@@ -325,6 +407,14 @@ defmodule AttentionServer.ClientAPI.Writes do
   defp render({:answer, item_id, _revision, _value}, who, _person, _reply, from, state),
     do: render_item(item_id, who, from, state)
 
+  defp render(operation, who, _person, _reply, from, state)
+       when operation == :remove_push or elem(operation, 0) in [:priority_levels, :push] do
+    case Reads.handle_call({:settings, who}, from, state) do
+      {:reply, {:ok, body}, _state} -> {:ok, 200, body}
+      {:reply, error, _state} -> error
+    end
+  end
+
   defp render({:reply, item_id, _text, _files}, who, person, %{"seq" => seq}, from, state) do
     with {:ok, 200, body} <- render_item(item_id, who, from, state),
          {:ok, entry} <- render_entry(state, who, person, seq) do
@@ -369,6 +459,36 @@ defmodule AttentionServer.ClientAPI.Writes do
       end
     end)
   end
+
+  ## Preconditions checked in the begin step
+
+  # If-Match is compared with the ETag of the Settings this principal reads
+  # now, the same value GET /v2/settings sends.
+  defp precondition(state, who, _principal, {:priority_levels, _levels, if_match}) do
+    case Reads.handle_call({:settings, who}, nil, state) do
+      {:reply, {:ok, %{"settings" => settings}}, _state} ->
+        if if_match == "*" or Reads.etag(settings) in if_match_tags(if_match),
+          do: :ok,
+          else: {:error, :precondition_failed}
+
+      {:reply, error, _state} ->
+        error
+    end
+  end
+
+  defp precondition(state, _who, principal, operation)
+       when operation == :remove_push or elem(operation, 0) == :push do
+    cond do
+      principal.kind != :device -> {:error, :forbidden}
+      not Map.get(state, :push_enabled, false) -> {:error, :unsupported}
+      true -> :ok
+    end
+  end
+
+  defp precondition(_state, _who, _principal, _operation), do: :ok
+
+  defp if_match_tags(value),
+    do: value |> String.split(",") |> Enum.map(&String.trim/1)
 
   ## Operations, as today's engine frames
 
@@ -515,6 +635,41 @@ defmodule AttentionServer.ClientAPI.Writes do
     end
   end
 
+  defp frame(_engine, _principal, key, {:priority_levels, levels, _if_match}) do
+    {:ok,
+     %{
+       "v" => 1,
+       "type" => "levels_set",
+       "ref" => "client_api_v2",
+       "op_id" => op_id(key),
+       "levels" => levels
+     }}
+  end
+
+  defp frame(_engine, _principal, key, {:push, token, environment, revision}) do
+    {:ok,
+     %{
+       "v" => 1,
+       "type" => "push_register",
+       "op_id" => op_id(key),
+       "revision" => revision,
+       "address_kind" => "apns_token",
+       "address" => token,
+       "profile_id" => "harklight-" <> environment
+     }}
+  end
+
+  # The binding is removed at the next revision; DELETE carries none.
+  defp frame(engine, principal, key, :remove_push) do
+    revision =
+      case Map.get(engine.push_bindings, {principal.person, principal.engine_key}) do
+        %{revision: current} -> current + 1
+        nil -> 1
+      end
+
+    {:ok, %{"v" => 1, "type" => "push_remove", "op_id" => op_id(key), "revision" => revision}}
+  end
+
   # Uploaded files arrive with POST /v2/files, a later slice.
   defp no_file_ids([]), do: :ok
   defp no_file_ids(_), do: {:error, :unsupported, "file_ids"}
@@ -559,6 +714,7 @@ defmodule AttentionServer.ClientAPI.Writes do
         {:ok,
          %{
            person: person,
+           kind: :browser,
            engine_key: BrowserRecipient.key(person, session, recipient)
          }}
 
@@ -571,8 +727,11 @@ defmodule AttentionServer.ClientAPI.Writes do
 
   defp principal(engine, key) when is_binary(key) do
     case Resources.principal(engine, key) do
-      {:ok, %{kind: :device, person: person}} -> {:ok, %{person: person, engine_key: key}}
-      _ -> {:error, :unauthorized}
+      {:ok, %{kind: :device, person: person}} ->
+        {:ok, %{person: person, kind: :device, engine_key: key}}
+
+      _ ->
+        {:error, :unauthorized}
     end
   end
 
@@ -644,6 +803,37 @@ defmodule AttentionServer.ClientAPI.Writes do
         {:error, "invalid_field", nil}
     end
   end
+
+  defp if_match(conn) do
+    case get_req_header(conn, "if-match") do
+      [value | _] when value != "" -> {:ok, Enum.join(get_req_header(conn, "if-match"), ",")}
+      _ -> {:error, "invalid_field", "If-Match"}
+    end
+  end
+
+  defp list_member(body, name) do
+    case Map.get(body, name) do
+      value when is_list(value) -> {:ok, value}
+      _ -> {:error, "invalid_field", name}
+    end
+  end
+
+  defp environment(body) do
+    case Map.get(body, "environment") do
+      value when value in ["production", "sandbox"] -> {:ok, value}
+      _ -> {:error, "invalid_field", "environment"}
+    end
+  end
+
+  defp push_revision(body) do
+    case Map.get(body, "revision") do
+      n when is_integer(n) and n >= 1 -> {:ok, n}
+      _ -> {:error, "invalid_field", "revision"}
+    end
+  end
+
+  defp device_only(%{kind: :device}), do: :ok
+  defp device_only(_principal), do: {:error, "forbidden", nil}
 
   defp file_ids(body) do
     case Map.get(body, "file_ids", []) do
