@@ -3239,25 +3239,30 @@ defmodule AttentionServer.Store do
     accounts = engine.hosted_accounts
 
     is_map(accounts) and
-      Enum.all?(accounts, fn {ref, record} ->
-        is_binary(ref) and byte_size(ref) >= 1 and map_size(record) == 3 and
-          Map.has_key?(engine.persons, record.person) and
-          Map.has_key?(engine.owners, record.person) and
-          (is_nil(record.label) or
-             (is_binary(record.label) and byte_size(record.label) >= 1)) and
-          is_boolean(record.test)
-      end) and
+      Enum.all?(accounts, fn {ref, record} -> valid_hosted_account?(engine, ref, record) end) and
       accounts |> Map.values() |> Enum.map(& &1.person) |> Enum.uniq() |> length() ==
         map_size(accounts)
+  end
+
+  defp valid_hosted_account?(engine, ref, record) do
+    is_binary(ref) and byte_size(ref) >= 1 and map_size(record) == 3 and
+      Map.has_key?(engine.persons, record.person) and
+      Map.has_key?(engine.owners, record.person) and
+      (is_nil(record.label) or (is_binary(record.label) and byte_size(record.label) >= 1)) and
+      is_boolean(record.test)
   end
 
   defp valid_delivery_states?(engine) do
     is_map(engine.delivery_states) and
       Enum.all?(engine.delivery_states, fn {person, state} ->
-        is_binary(person) and Map.has_key?(engine.persons, person) and
-          state in ["STOPPED", "RESTORED"]
+        valid_delivery_state?(engine, person, state)
       end)
   end
+
+  defp valid_delivery_state?(engine, person, state),
+    do:
+      Map.has_key?(engine.persons, person) and is_binary(person) and
+        state in ["STOPPED", "RESTORED"]
 
   defp valid_instance?(id),
     do: is_binary(id) and byte_size(id) == 32 and Regex.match?(~r/\A[0-9a-f]{32}\z/, id)
@@ -3342,6 +3347,26 @@ defmodule AttentionServer.Store do
   defp valid_authority_reference?(engine, {:row, :owners, person}) do
     case Map.fetch(engine.owners, person) do
       {:ok, owner} -> valid_owner?(engine, person, owner)
+      :error -> true
+    end
+  end
+
+  defp valid_authority_reference?(engine, {:member, :retired_owner_keys, key}),
+    do:
+      not MapSet.member?(engine.retired_owner_keys, key) or
+        (hex_key?(key) and not Map.has_key?(engine.devices, key) and
+           not Map.has_key?(engine.agents, key))
+
+  defp valid_authority_reference?(engine, {:row, :hosted_accounts, reference}) do
+    case Map.fetch(engine.hosted_accounts, reference) do
+      {:ok, record} -> valid_hosted_account?(engine, reference, record)
+      :error -> true
+    end
+  end
+
+  defp valid_authority_reference?(engine, {:row, :delivery_states, person}) do
+    case Map.fetch(engine.delivery_states, person) do
+      {:ok, state} -> valid_delivery_state?(engine, person, state)
       :error -> true
     end
   end

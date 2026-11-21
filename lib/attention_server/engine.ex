@@ -2116,14 +2116,14 @@ defmodule AttentionServer.Engine do
 
   @doc false
   def delete_row(%__MODULE__{} = engine, field, key) do
-    case Map.pop(Map.fetch!(engine, field), key) do
-      {nil, _} ->
-        engine
+    rows = Map.fetch!(engine, field)
 
-      {_, remaining} ->
-        engine
-        |> Map.replace!(field, remaining)
-        |> touch_fact({:row, field, key})
+    if Map.has_key?(rows, key) do
+      engine
+      |> Map.replace!(field, Map.delete(rows, key))
+      |> touch_fact({:row, field, key})
+    else
+      engine
     end
   end
 

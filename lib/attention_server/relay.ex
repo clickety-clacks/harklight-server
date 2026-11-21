@@ -1339,10 +1339,11 @@ defmodule AttentionServer.Relay do
 
           {:reply, :ok, next}
         else
-          case commit(
+          case commit_known_rows(
                  state.store,
                  next_engine,
-                 %{person: person, actor: key, action: "dashboard_focus_permission"}
+                 %{person: person, actor: key, action: "dashboard_focus_permission"},
+                 [{:row, :devices, device_key}]
                ) do
             {:ok, store} ->
               next = %{state | store: store}
@@ -2117,11 +2118,19 @@ defmodule AttentionServer.Relay do
       if next == engine do
         {:reply, {:ok, record.person}, state}
       else
-        case commit(state.store, next, %{
-               person: record.person,
-               actor: "hosted_component",
-               action: "hosted_account_create"
-             }) do
+        audit = %{
+          person: record.person,
+          actor: "hosted_component",
+          action: "hosted_account_create"
+        }
+
+        addresses = [
+          {:row, :persons, record.person},
+          {:row, :owners, record.person},
+          {:row, :hosted_accounts, account_ref}
+        ]
+
+        case commit_known_rows(state.store, next, audit, addresses) do
           {:ok, store} ->
             next_state = ensure_priority_view_if_missing(%{state | store: store}, record.person)
             {:reply, {:ok, record.person}, next_state}
@@ -2180,11 +2189,11 @@ defmodule AttentionServer.Relay do
         if next_engine == state.store.engine do
           {:reply, {:ok, result}, state}
         else
-          case commit(state.store, next_engine, %{
-                 person: person,
-                 actor: "hosted_component",
-                 action: "hosted_delivery_state"
-               }) do
+          audit = %{person: person, actor: "hosted_component", action: "hosted_delivery_state"}
+
+          case commit_known_rows(state.store, next_engine, audit, [
+                 {:row, :delivery_states, person}
+               ]) do
             {:ok, store} ->
               {:reply, {:ok, result}, %{state | store: store}}
 
@@ -2548,7 +2557,8 @@ defmodule AttentionServer.Relay do
         Engine.owner_grant_sender(state.store.engine, person, key, device, pattern),
         person,
         key,
-        "owner_sender_grant"
+        "owner_sender_grant",
+        [{:row, :sender_grants, {person, device}}]
       )
 
   defp dispatch_call({:owner_revoke_sender, person, key, device, pattern}, _from, state),
@@ -2558,7 +2568,8 @@ defmodule AttentionServer.Relay do
         Engine.owner_revoke_sender(state.store.engine, person, key, device, pattern),
         person,
         key,
-        "owner_sender_revoke"
+        "owner_sender_revoke",
+        [{:row, :sender_grants, {person, device}}]
       )
 
   defp dispatch_call(

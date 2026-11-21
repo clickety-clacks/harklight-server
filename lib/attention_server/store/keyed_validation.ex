@@ -56,7 +56,9 @@ defmodule AttentionServer.Store.KeyedValidation do
     :pending_enrollments,
     :pending_history,
     :browser_sign_ins,
-    :join_invitations
+    :join_invitations,
+    :hosted_accounts,
+    :delivery_states
   ]
 
   def authority_index(engine) do
@@ -164,6 +166,17 @@ defmodule AttentionServer.Store.KeyedValidation do
     if Map.has_key?(engine.owners, person), do: [{:person, person}], else: []
   end
 
+  defp authority_owners(engine, {:row, :delivery_states, person}) do
+    if Map.has_key?(engine.delivery_states, person), do: [{:person, person}], else: []
+  end
+
+  defp authority_owners(engine, {:row, :hosted_accounts, ref}) do
+    case Map.get(engine.hosted_accounts, ref) do
+      %{person: person} -> [{:person, person}]
+      _ -> []
+    end
+  end
+
   defp authority_owners(engine, {:row, field, key}) when field in [:devices, :agents] do
     case Map.get(Map.fetch!(engine, field), key) do
       %{person: person} -> [{:person, person}]
@@ -206,9 +219,8 @@ defmodule AttentionServer.Store.KeyedValidation do
     row_owners(engine, field, key, person, actor)
   end
 
-  defp authority_owners(engine, {:row, field, {person, actor, _} = key})
-       when field == :source_report_grants do
-    row_owners(engine, field, key, person, actor)
+  defp authority_owners(engine, {:row, :source_report_grants, {person, actor, _} = key}) do
+    row_owners(engine, :source_report_grants, key, person, actor)
   end
 
   defp authority_owners(engine, {:row, :origin_sessions, {person, actor, _} = key}) do

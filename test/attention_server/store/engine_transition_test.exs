@@ -1740,6 +1740,45 @@ defmodule AttentionServer.Store.EngineTransitionTest do
     GenServer.stop(reopened)
   end
 
+  test "keyed hosted delivery settings and dashboard device permissions survive reopen" do
+    path = legacy_store_path()
+    {:ok, legacy} = Store.open(path)
+    assert {:ok, _} = KeyedMigration.convert(legacy)
+    :ok = Store.close(legacy)
+    opts = [store_path: path, store_mode: :keyed, dashboard_origin: "https://relay.test"]
+    {:ok, relay} = Relay.start_link(opts)
+    assert {:ok, person} = Relay.hosted_account_create(relay, "hosted-fixture")
+    assert {:ok, ^person} = Relay.hosted_account_create(relay, "hosted-fixture")
+    assert {:ok, _} = Relay.hosted_sign_in_create(relay, person, "Hosted fixture")
+    %{key: owner} = :sys.get_state(relay).store.engine.owners[person]
+    device = enrollment_certificate("hosted device")
+    {:ok, device_key} = AttentionServer.DeviceIdentity.from_certificate(device)
+    assert {:ok, %{approval_code: code}} = Relay.pending_enroll(relay, device, "hosted device")
+
+    assert {:ok, ^device_key} =
+             Relay.owner_pending_approve(relay, person, owner, code, device_key, nil, [])
+
+    assert :ok =
+             Relay.save_dashboard_focus_permission(relay, person, owner, device_key, :see, true)
+
+    assert :ok =
+             Relay.save_dashboard_focus_permission(relay, person, owner, device_key, :push, true)
+
+    assert {:ok, %{state: "STOPPED"}} = Relay.hosted_delivery_state(relay, person, "STOPPED")
+    live = :sys.get_state(relay).store
+    GenServer.stop(relay)
+
+    {:ok, reopened} = Store.open(path, :keyed)
+
+    assert %{person: ^person, label: "Hosted fixture"} =
+             reopened.engine.hosted_accounts["hosted-fixture"]
+
+    assert %{see_focus: true, push_view: true} = reopened.engine.devices[device_key]
+    assert reopened.engine.delivery_states[person] == "STOPPED"
+    assert full_diff(live.engine, reopened.engine) == MapSet.new()
+    :ok = Store.close(reopened)
+  end
+
   defp enrollment_certificate(name) do
     %{cert: der} =
       :public_key.pkix_test_root_cert(String.to_charlist(name), key: {:namedCurve, :secp256r1})
