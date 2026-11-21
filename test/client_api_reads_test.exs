@@ -410,4 +410,43 @@ defmodule AttentionServer.ClientAPIReadsTest do
     assert AttentionServer.ClientAPI.Resources.item_keys(engine, "nobody") == []
     GenServer.stop(relay)
   end
+
+  # Review finding F3: with ranks stored once per change, keys of items that
+  # did not move stay put, so paging across a change neither repeats nor skips
+  # them, and anything that did move has a change after the first page.
+  test "paging across a rank change neither repeats nor skips an unmoved item",
+       %{path: path, flags: flags} do
+    relay = scripted_relay(path, flags)
+    for n <- 1..4, do: forward(relay, "more-#{n}", 30 + n)
+
+    assert {:ok, %{"items" => first, "next_page" => page, "rev" => first_rev}} =
+             Reads.inbox(relay, "reader", %{"limit" => "3"})
+
+    keys_before = Map.new(first, &{&1["item_id"], &1["rank"]["key"]})
+
+    # Two arrivals rank ahead of everything; nothing else moves.
+    forward(relay, "late-1", 40)
+    forward(relay, "late-2", 41)
+
+    rest = all_pages(relay, "reader", 3, page) |> Enum.flat_map(& &1["items"])
+    shown = Enum.map(first ++ rest, & &1["item_id"])
+    assert shown == Enum.uniq(shown), "an item repeated across pages"
+
+    {:ok, %{"items" => now}} = Reads.inbox(relay, "reader", %{"limit" => "200"})
+    late = for item <- now, item["message"]["message_id"] in ["late-1", "late-2"], do: item
+    assert length(late) == 2
+
+    for item <- now, item not in late do
+      assert item["item_id"] in shown, "an unmoved item was skipped"
+    end
+
+    # Items on the first page kept their keys, and each arrival has a change
+    # after the first page's position, so the feed delivers what paging missed.
+    for item <- now,
+        Map.has_key?(keys_before, item["item_id"]),
+        do: assert(item["rank"]["key"] == keys_before[item["item_id"]])
+
+    for item <- late, do: assert(item["rev"] > first_rev)
+    GenServer.stop(relay)
+  end
 end

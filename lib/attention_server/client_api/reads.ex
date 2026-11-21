@@ -277,21 +277,14 @@ defmodule AttentionServer.ClientAPI.Reads do
          {:ok, after_key} <- page(params),
          {:ok, _} <- head(state, principal.person) do
       person = principal.person
-      ranks = ranks(state, person)
-
-      candidates =
-        ranks
-        |> Enum.map(fn {item_id, rank} -> {rank["key"], item_id, rank} end)
-        |> Enum.sort()
-        |> Enum.drop_while(fn {rank_key, _, _} -> after_key && rank_key <= after_key end)
-        |> Enum.take(limit + 1)
-
-      shown = Enum.take(candidates, limit)
+      {shown, more?} = rank_page(state, person, after_key, limit)
 
       items =
-        Enum.map(shown, fn {_rank_key, item_id, rank} ->
-          {:ok, item_key} = Resources.item_key(engine, person, item_id)
-          render_item(state, principal, item_key, rank)
+        Enum.flat_map(shown, fn {item_id, rank} ->
+          case Resources.item_key(engine, person, item_id) do
+            {:ok, item_key} -> [render_item(state, principal, item_key, rank)]
+            _ -> []
+          end
         end)
 
       {:ok, position} = head(state, person)
@@ -302,8 +295,8 @@ defmodule AttentionServer.ClientAPI.Reads do
         "counts" => Resources.counts(engine, person)
       }
 
-      if length(candidates) > limit do
-        {last_key, _, _} = List.last(shown)
+      if more? do
+        {_item_id, %{"key" => last_key}} = List.last(shown)
         {:ok, Map.put(body, "next_page", "p" <> Base.url_encode64(last_key, padding: false))}
       else
         {:ok, body}
@@ -316,9 +309,9 @@ defmodule AttentionServer.ClientAPI.Reads do
 
     with {:ok, principal} <- principal(engine, key),
          {:ok, item_key} <- Resources.item_key(engine, principal.person, item_id),
-         {:ok, position} <- head(state, principal.person) do
-      rank = Map.fetch!(ranks(state, principal.person), item_id)
-
+         {:ok, position} <- head(state, principal.person),
+         context = %{engine: engine, store: state.store, view: view(state, principal.person)},
+         {:ok, rank} <- item_rank(context, principal.person, item_id) do
       {:ok,
        %{
          "rev" => position,
@@ -493,36 +486,66 @@ defmodule AttentionServer.ClientAPI.Reads do
 
   defp principal(_engine, _who), do: {:error, :unauthorized}
 
-  defp ranks(state, person) do
-    view = Map.get(state.priority_views, person)
-    memo_ranks(state.store.engine, person, view, fn -> previous_rank_keys(state, person) end)
+  # Ranks are stored by the change log's rank hook, once per change (review
+  # findings F3/F5). A read pages from that stored order. Only a person with
+  # nothing stored yet has them computed here, from the same inputs the hook
+  # uses, so the result is the same.
+
+  defp rank_page(state, person, after_key, limit) do
+    case ChangeLog.rank_page(state.store, person, after_key, limit) do
+      {:ok, page, more?} ->
+        {page, more?}
+
+      {:error, :none} ->
+        candidates =
+          state
+          |> computed_ranks(person)
+          |> Enum.sort_by(fn {_item_id, rank} -> rank["key"] end)
+          |> Enum.drop_while(fn {_item_id, rank} -> after_key && rank["key"] <= after_key end)
+          |> Enum.take(limit + 1)
+
+        {Enum.take(candidates, limit), length(candidates) > limit}
+
+      _ ->
+        throw({:client_api_read, :storage_unavailable})
+    end
   end
 
   @doc false
-  # One item's rank for the feed renderer, from the same ranks reads use.
-  def item_rank(%{engine: engine, view: view}, person, item_id) do
-    engine
-    |> memo_ranks(person, view, fn -> %{} end)
-    |> Map.fetch(item_id)
-  end
-
-  # Ranks are kept for the last engine and view they were computed from, so
-  # a feed batch or repeated reads of unchanged state compute them once. The
-  # comparison is by identity in practice: an unchanged state is the same
-  # term. Stored ranks from the change log replace this (review finding F5).
-  #
-  # One slot for the whole relay, so it holds at most one earlier engine.
-  defp memo_ranks(engine, person, view, previous) do
-    case Process.get({__MODULE__, :ranks}) do
-      {^person, ^engine, ^view, ranks} ->
-        ranks
+  # One item's rank, for reads and the feed renderer: stored, or computed for
+  # a person with nothing stored yet.
+  def item_rank(%{engine: engine, store: store, view: view}, person, item_id) do
+    case ChangeLog.rank(store, person, item_id) do
+      {:ok, rank} ->
+        {:ok, rank}
 
       _ ->
-        ranks = Resources.ranks(engine, person, view, previous.())
-        Process.put({__MODULE__, :ranks}, {person, engine, view, ranks})
-        ranks
+        case engine
+             |> Resources.ranks(person, view, stored_unit_keys(store, person))
+             |> Map.fetch(item_id) do
+          {:ok, rank} -> {:ok, rank}
+          :error -> {:error, :not_found}
+        end
     end
   end
+
+  defp computed_ranks(state, person),
+    do:
+      Resources.ranks(
+        state.store.engine,
+        person,
+        view(state, person),
+        stored_unit_keys(state.store, person)
+      )
+
+  defp stored_unit_keys(store, person) do
+    case ChangeLog.rank_keys(store, person) do
+      {:ok, keys} -> keys
+      _ -> %{}
+    end
+  end
+
+  defp view(state, person), do: Map.get(state.priority_views, person)
 
   ## Change-log positions
   #
@@ -562,8 +585,6 @@ defmodule AttentionServer.ClientAPI.Reads do
       _ -> nil
     end
   end
-
-  defp previous_rank_keys(_state, _person), do: %{}
 
   ## Parameters
 
