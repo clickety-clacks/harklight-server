@@ -996,7 +996,8 @@ defmodule AttentionServer.ClientAPI.Resources do
       by_event_id: by_event_id,
       results: results,
       replies: reply_entries,
-      engine: engine
+      engine: engine,
+      person: person
     }
 
     # Receipt and acknowledgment facts mark the entry they refer to. Each entry
@@ -1145,9 +1146,17 @@ defmodule AttentionServer.ClientAPI.Resources do
         |> put_present("in_reply_to", reply_target(payload, context.by_event_id))
 
       "revision" ->
+        key = {context.person, payload["sender_id"], payload["message_id"]}
+        files =
+          if payload["agent_api_v2_files"] do
+            {:ok, resource} = revision(context.engine, key, payload["request_revision"])
+            if resource["files"] != [], do: resource["files"]
+          else
+            typed_entry_files(context, payload, seq)
+          end
         base
         |> Map.merge(%{"kind" => "revision", "author" => "origin"})
-        |> put_present("files", typed_entry_files(context, payload, seq))
+        |> put_present("files", files)
 
       "availability" ->
         base

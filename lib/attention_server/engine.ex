@@ -4992,7 +4992,8 @@ defmodule AttentionServer.Engine do
          :ok <- valid_op(frame),
          :ok <- valid_global_id(frame),
          :ok <- valid_revision_message(engine, person, frame["message"]),
-         {:ok, files} <- ConversationFiles.normalize(frame, engine, person, actor),
+         {:ok, uploaded} <- ConversationFiles.normalize(frame, engine, person, actor),
+         {:ok, files} <- revision_files(frame, uploaded),
          true <- is_integer(frame["base_revision"]) and frame["base_revision"] > 0,
          true <-
            frame["message"]["sender_id"] == frame["sender_id"] and
@@ -5018,6 +5019,7 @@ defmodule AttentionServer.Engine do
             frame,
             semantic,
             files,
+            uploaded,
             Map.get(principal, :request_at, System.system_time(:millisecond))
           )
       end
@@ -5028,7 +5030,20 @@ defmodule AttentionServer.Engine do
     end
   end
 
-  defp commit_conversation_revise(engine, person, actor, frame, semantic, files, accepted_at) do
+  defp revision_files(%{agent_file_order: order}, uploaded) do
+    {files, []} =
+      Enum.map_reduce(order, uploaded, fn
+        {:carried, file}, remaining -> {file, remaining}
+        :uploaded, [file | remaining] -> {file, remaining}
+      end)
+
+    names = Enum.map(files, & &1["name"])
+    if length(names) == length(Enum.uniq(names)), do: {:ok, files}, else: {:error, "file_ids"}
+  end
+
+  defp revision_files(_frame, uploaded), do: {:ok, uploaded}
+
+  defp commit_conversation_revise(engine, person, actor, frame, semantic, files, uploaded, accepted_at) do
     key = {person, frame["sender_id"], frame["message_id"]}
 
     case Map.get(engine.messages, key) do
@@ -5085,7 +5100,12 @@ defmodule AttentionServer.Engine do
                       do: Map.put(entry, "in_reply_to", Integer.to_string(frame["in_reply_to"])),
                       else: entry
                   end)
-                  |> ConversationFiles.put_entry(files)
+                  |> ConversationFiles.put_entry(uploaded)
+                  |> then(fn entry ->
+                    if Map.has_key?(frame, :agent_file_order),
+                      do: Map.put(entry, "agent_api_v2_files", true),
+                      else: entry
+                  end)
 
                 {next, feed_entry} = Conversation.append_entry(next, person, actor, entry)
 

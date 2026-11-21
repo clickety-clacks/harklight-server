@@ -19,7 +19,7 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
   @lifecycle ~w(answered cleared expired superseded)
   @members %{
     send: ~w(sender session message file_ids supersedes),
-    revise: ~w(message file_ids),
+    revise: ~w(message file_ids in_reply_to),
     retract: ~w(in_reply_to),
     lifecycle: ~w(action),
     reply: ~w(text file_ids in_reply_to),
@@ -118,7 +118,7 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
     case call(ctx, {:prepare_uploads, input, op_id}) do
       {:ok, frame, staged} ->
         with {:ok, prepared} <- Writes.attach_files(ctx.relay, ctx.principal.key, frame, staged),
-             do: {:ok, prepared["files"]}
+             do: {:ok, Map.get(prepared, "files", [])}
 
       {:ok, :replay} ->
         {:ok, []}
@@ -206,9 +206,10 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
     reply =
       with :ok <- authorize(state, scope),
            {:ok, nil} <- lookup(state, receipt_scope(scope), key),
-           {:ok, {_, sender, id}, attributes, _} <-
+           {:ok, {_, sender, id} = message_key, attributes, _} <-
              frame(state, scope, operation, target, op_id, match, body),
-           {:ok, staged} <- staged_files(state, scope, body) do
+           {:ok, selected} <- select_files(state, scope, operation, message_key, body) do
+        staged = for {:staged, file} <- selected, do: file
         revision =
           case operation do
             :send -> 1
@@ -267,17 +268,58 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
 
   defp receipt_scope({person, agent}), do: Idempotency.agent_scope(person, agent)
 
-  defp staged_files(state, scope, body) do
-    Map.get(body, "file_ids", [])
-    |> Enum.reduce_while({:ok, []}, fn id, {:ok, acc} ->
-      case Uploads.fetch_owned(state.store, scope, id) do
-        {:ok, file} -> {:cont, {:ok, [file | acc]}}
-        error -> {:halt, error}
+  defp select_files(state, scope, :revise, key, body) do
+    record = state.store.engine.messages[key]
+    raw = Map.get(record.files_by_revision, record.revision, [])
+
+    if Map.has_key?(body, "file_ids") do
+      with {:ok, current} <- Resources.revision(state.store.engine, key, record.revision) do
+        carried = Map.new(Enum.zip(Enum.map(current["files"], & &1["file_id"]), raw))
+        select_files(state, scope, body["file_ids"], carried)
+      end
+    else
+      {:ok, Enum.map(raw, &{:carried, &1})}
+    end
+  end
+
+  defp select_files(state, scope, _operation, _key, body),
+    do: select_files(state, scope, Map.get(body, "file_ids", []), %{})
+
+  defp select_files(state, scope, ids, carried) do
+    Enum.reduce_while(ids, {:ok, []}, fn id, {:ok, acc} ->
+      case Map.fetch(carried, id) do
+        {:ok, existing} -> {:cont, {:ok, [{:carried, existing} | acc]}}
+        :error ->
+          case Uploads.fetch_owned(state.store, scope, id) do
+            {:ok, file} -> {:cont, {:ok, [{:staged, file} | acc]}}
+            {:error, :not_found} -> {:halt, {:error, "invalid_field", "file_ids"}}
+            error -> {:halt, error}
+          end
       end
     end)
     |> case do
       {:ok, files} -> {:ok, Enum.reverse(files)}
       error -> error
+    end
+  end
+
+  defp attach_selected(frame, operation, selected, uploads) do
+    staged = Enum.count(selected, &match?({:staged, _}, &1))
+
+    if staged == length(uploads) do
+      frame = if uploads == [], do: frame, else: Map.put(frame, "files", uploads)
+
+      if operation == :revise do
+        order = Enum.map(selected, fn
+          {:carried, file} -> {:carried, file}
+          {:staged, _} -> :uploaded
+        end)
+        {:ok, Map.put(frame, :agent_file_order, order)}
+      else
+        {:ok, frame}
+      end
+    else
+      {:error, "invalid_field", "file_ids"}
     end
   end
 
@@ -312,12 +354,10 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
     case frame(state, scope, operation, item_id, op_id, match, body) do
       {:ok, message_key, attributes, extras} ->
         {reply, next} =
-          with {:ok, _} <- staged_files(state, scope, body),
-               true <- length(Map.get(body, "file_ids", [])) == length(uploads) do
-            frame = if uploads == [], do: attributes, else: Map.put(attributes, "files", uploads)
+          with {:ok, selected} <- select_files(state, scope, operation, message_key, body),
+               {:ok, frame} <- attach_selected(attributes, operation, selected, uploads) do
             apply_frame(state, agent, operation, frame, op_id)
           else
-            false -> {{:error, :not_found}, state}
             error -> {error, state}
           end
 
@@ -424,17 +464,18 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
     end
   end
 
-  defp item_frame(_state, {_, sender, id}, record, :revise, match, body) do
+  defp item_frame(state, {_, sender, id} = key, record, :revise, match, body) do
     with :ok <- open(record),
          :ok <- if_match(match, record.revision),
          {:ok, message} <- content(body),
-         :ok <- files(body) do
-      {:ok,
-       %{
-         "type" => "conversation_revise",
-         "message" => Map.merge(message, %{"sender_id" => sender, "message_id" => id}),
-         "base_revision" => record.revision
-       }, nil}
+         :ok <- files(body),
+         {:ok, correlation, position} <- correlation(state, key, record, body) do
+      frame = %{
+        "type" => "conversation_revise",
+        "message" => Map.merge(message, %{"sender_id" => sender, "message_id" => id}),
+        "base_revision" => record.revision
+      }
+      {:ok, Map.merge(frame, correlation), position}
     end
   end
 
@@ -794,7 +835,7 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
         {:send, [_ | _] = warnings} ->
           {:ok, Map.put(body, "supersedes_warnings", warnings)}
 
-        {:retract, seq} when is_integer(seq) ->
+        {mutation, seq} when mutation in [:retract, :revise] and is_integer(seq) ->
           with {:ok, entry} <- AgentResources.entry(state, scope, key, seq) do
             {:ok, Map.put(body, "entry", entry)}
           end

@@ -270,6 +270,37 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
       assert_error(request(ctx, "a2", "PUT", path, body, 3, headers), 404, "not_found")
     end
 
+    test "correlated revise keeps, carries, and clears current attachments", ctx do
+      sent = frame(ctx, "a1", %{
+        "type" => "forward",
+        "op_id" => op(1),
+        "session_handle" => @first_session,
+        "message" => %{"sender_id" => "app:test", "message_id" => "inline", "title" => "Original", "created_at" => 1},
+        "files" => [%{"name" => "inline.txt", "data_base64" => Base.encode64("fixture")}]
+      })
+      id = Resources.item_id(%{accepted_seq: sent["seq"]})
+      path = "/v2/agent/messages/" <> id
+      entry_id = person_reply(ctx, id, 2)
+      message = %{"title" => "Updated", "created_at" => 1}
+      body = %{"message" => message, "in_reply_to" => entry_id}
+
+      revised = request(ctx, "a1", "PUT", path, body, 3, [{"if-match", "1"}])
+      assert revised.status == 200
+      assert %{
+        "message" => %{"files" => [%{"file_id" => file}]},
+        "entry" => %{"entry_id" => ^entry_id, "delivery" => %{"acted" => true}}
+      } = contract(ctx, "AgentWriteResult", revised)
+      assert get(ctx, "a1", "/v2/files/" <> file).body == "fixture"
+      body = %{"message" => %{"title" => "Carried", "created_at" => 1}, "file_ids" => [file]}
+      carried = request(ctx, "a1", "PUT", path, body, 4, [{"if-match", "2"}])
+      assert carried.status == 200
+      assert %{"message" => %{"files" => [%{"name" => "inline.txt"}]}} =
+        contract(ctx, "AgentWriteResult", carried)
+      body = %{"message" => %{"title" => "Cleared", "created_at" => 1}, "file_ids" => []}
+      cleared = request(ctx, "a1", "PUT", path, body, 5, [{"if-match", "3"}])
+      assert %{"message" => %{"files" => []}} = contract(ctx, "AgentWriteResult", cleared)
+    end
+
     test "lifecycle stamps the transition and already_closed applies to a repeat", ctx do
       id = forward(ctx, "a1", 1, nil)
       path = "/v2/agent/messages/" <> id <> "/lifecycle"
