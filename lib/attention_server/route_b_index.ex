@@ -39,10 +39,13 @@ defmodule AttentionServer.RouteBIndex do
     index_advisories(index, engine.advisory_feeds)
   end
 
-  def enable_request_lookup(engine) do
+  def enable_keyed_lookups(engine) do
     index =
       Enum.reduce(engine.messages, %{engine.route_b_index | request_keys_by_id: %{}}, fn
-        {key, _record}, index -> put_request_key(index, key, nil)
+        {key, record}, index ->
+          index = put_request_key(index, key, nil)
+
+          if index.agent_feed?, do: index, else: put_session_message(index, key, nil, record)
       end)
 
     %{engine | route_b_index: index}
@@ -62,9 +65,12 @@ defmodule AttentionServer.RouteBIndex do
 
     index =
       Enum.reduce(engine.messages, index, fn {key, record}, current ->
-        current
-        |> put_session_message(key, nil, record)
-        |> put_agent_message(key, nil, record)
+        current =
+          if is_nil(current.request_keys_by_id),
+            do: put_session_message(current, key, nil, record),
+            else: current
+
+        put_agent_message(current, key, nil, record)
       end)
 
     index =
@@ -254,11 +260,13 @@ defmodule AttentionServer.RouteBIndex do
   defp put_entry_position(index, _key, _seq, _payload), do: index
 
   # Message ownership and session are fixed at acceptance.
-  defp put_session_message(%{agent_feed?: true} = index, {person, _, _} = key, nil, %{
-         origin: origin,
-         session_handle: session
-       })
-       when is_binary(origin) and is_binary(session) do
+  defp put_session_message(
+         %{agent_feed?: agent_feed?, request_keys_by_id: request_keys} = index,
+         {person, _, _} = key,
+         nil,
+         %{origin: origin, session_handle: session}
+       )
+       when (agent_feed? or is_map(request_keys)) and is_binary(origin) and is_binary(session) do
     update_in(index.messages_by_origin_session, fn sessions ->
       Map.update(sessions, {person, origin}, %{session => [key]}, fn own ->
         Map.update(own, session, [key], &[key | &1])

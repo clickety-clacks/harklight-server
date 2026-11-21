@@ -58,7 +58,7 @@ defmodule AttentionServer.AgentChangeLog do
         changed.messages,
         changed.bounce,
         changed.opened,
-        changed_sessions(old, next),
+        changed_sessions(old, next, changed),
         Enum.map(advisories, &elem(&1, 0)),
         for({_, key, payload} <- entries, answer_receipt?(next, key, payload), do: key)
       ]
@@ -117,9 +117,11 @@ defmodule AttentionServer.AgentChangeLog do
 
   defp answer_receipt?(_engine, _key, _payload), do: false
 
-  defp changed_sessions(old, next) do
-    old.origin_sessions
-    |> changed_keys(next.origin_sessions)
+  defp changed_sessions(old, next, changed) do
+    changed
+    |> Map.get_lazy(:session_keys, fn ->
+      changed_keys(old.origin_sessions, next.origin_sessions)
+    end)
     |> Enum.flat_map(fn scope ->
       was_gone = get_in(old.origin_sessions, [scope, :gone]) == true
       gone = get_in(next.origin_sessions, [scope, :gone]) == true
@@ -134,7 +136,9 @@ defmodule AttentionServer.AgentChangeLog do
 
   defp advisory_changes(old, next, changed) do
     changed
-    |> Map.get_lazy(:advisory_scopes, fn -> changed_keys(old.advisory_feeds, next.advisory_feeds) end)
+    |> Map.get_lazy(:advisory_scopes, fn ->
+      changed_keys(old.advisory_feeds, next.advisory_feeds)
+    end)
     |> Enum.sort()
     |> Enum.flat_map(fn {person, agent, session} = key ->
       case Map.get(next.advisory_feeds, key) do

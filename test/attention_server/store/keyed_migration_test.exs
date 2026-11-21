@@ -26,7 +26,7 @@ defmodule AttentionServer.Store.KeyedMigrationTest do
     assert {:error, _reason} = Store.open(path)
     assert {:ok, keyed} = Store.open(path, :keyed)
     assert keyed.version == generation
-    assert keyed.engine == RouteBIndex.enable_request_lookup(store.engine)
+    assert keyed.engine == RouteBIndex.enable_keyed_lookups(store.engine)
     assert :ok = Store.close(keyed)
     assert {:ok, db} = Sqlite3.open(path)
 

@@ -238,7 +238,7 @@ defmodule AttentionServer.Store do
   end
 
   defp finalize_mode(%__MODULE__{mode: :keyed} = store) do
-    engine = AttentionServer.RouteBIndex.enable_request_lookup(store.engine)
+    engine = AttentionServer.RouteBIndex.enable_keyed_lookups(store.engine)
 
     {:ok,
      %{

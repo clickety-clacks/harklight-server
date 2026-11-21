@@ -487,11 +487,7 @@ defmodule AttentionServer.Conversation do
         {:error, :not_found}
 
       session ->
-        {:ok,
-         %{
-           engine
-           | origin_sessions: Map.put(engine.origin_sessions, key, %{session | gone: true})
-         }}
+        {:ok, Engine.put_row(engine, :origin_sessions, key, %{session | gone: true})}
     end
   end
 

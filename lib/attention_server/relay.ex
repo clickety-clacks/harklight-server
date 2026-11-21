@@ -1745,32 +1745,14 @@ defmodule AttentionServer.Relay do
   end
 
   defp dispatch_call({:origin_session_gone, key, handle}, _from, state) do
-    case Engine.origin_session_gone(state.store.engine, key, handle) do
-      {:ok, next} ->
-        {:ok, person} = Engine.authorized_person(next, key)
-        listening? = origin_listening?(state, next, {person, key, handle})
-        {:ok, previous} = Engine.origin_status(state.store.engine, key, handle, listening?)
-        {:ok, current} = Engine.origin_status(next, key, handle, listening?)
+    engine = state.store.engine
 
-        next =
-          if previous["availability"] == current["availability"] do
-            next
-          else
-            Engine.origin_availability(
-              next,
-              person,
-              key,
-              handle,
-              current["availability"],
-              current["last_detached_at"]
-            )
-          end
+    {next, result, touched} =
+      request_transition(state, key, engine, &end_origin_session(state, &1, key, handle))
 
-        case commit(
-               state.store,
-               next,
-               audit(state.store.engine, key, "origin_session_gone")
-             ) do
+    case result do
+      :ok ->
+        case commit_request(state.store, next, touched, audit(engine, key, "origin_session_gone")) do
           {:ok, store} -> {:reply, :ok, %{state | store: store}}
           _ -> {:reply, {:error, :storage_unavailable}, state}
         end
@@ -6985,6 +6967,20 @@ defmodule AttentionServer.Relay do
           current
       end
     end)
+  end
+
+  defp end_origin_session(state, engine, key, handle) do
+    case Engine.origin_session_gone(engine, key, handle) do
+      {:ok, gone} ->
+        {:ok, person} = Engine.authorized_person(gone, key)
+        listening? = origin_listening?(state, gone, {person, key, handle})
+        previous = Engine.origin_status(engine, key, handle, listening?)
+        current = Engine.origin_status(gone, key, handle, listening?)
+        {append_origin_availability_if_changed(gone, person, key, handle, previous, current), :ok}
+
+      error ->
+        {engine, error}
+    end
   end
 
   defp origin_availability_changes(before, after_state, person, origin) do

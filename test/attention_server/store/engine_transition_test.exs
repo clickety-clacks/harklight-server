@@ -487,6 +487,64 @@ defmodule AttentionServer.Store.EngineTransitionTest do
     assert map_size(AgentChangeLog.changes(old, next, keyed)) == 1
   end
 
+  test "keyed session closure durably publishes availability for its open requests" do
+    path = legacy_store_path()
+    handle = "00000000-0000-4000-8000-000000000010"
+    {:ok, store} = Store.open(path)
+    {:ok, send} = JSON.decode_line(forward_line())
+    line = send |> Map.put("session_handle", handle) |> JSON.encode_line()
+    {engine, {:ok, accepted}} = Engine.request_line(store.engine, @origin, line, 100)
+    assert {:ok, %{"type" => "ok"}} = JSON.decode_line(accepted)
+
+    assert {:ok, engine, _} =
+             Engine.origin_support(engine, @origin, %{
+               "type" => "support",
+               "op_id" => "00000000-0000-4000-8000-000000000011",
+               "session_handle" => handle,
+               "route" => "claude-code",
+               "cli_version" => "test",
+               "unsupported_reason" => nil
+             })
+
+    assert {:ok, store} =
+             Store.commit(store, engine, %{person: @person, actor: @origin, action: "setup"})
+
+    assert {:ok, _} = KeyedMigration.convert(store)
+    :ok = Store.close(store)
+    flags = path <> ".flags"
+    File.write!(flags, JSON.encode!(%{"client_api_v2" => true}))
+
+    {:ok, relay} =
+      Relay.start_link(store_path: path, store_mode: :keyed, feature_flags_path: flags)
+
+    before = :sys.get_state(relay).store
+    scope = {@person, @origin}
+    assert {:ok, agent_head} = AgentChangeLog.head(before, scope)
+    assert {:ok, person_head} = ChangeLog.head(before, @person)
+    assert :ok = Relay.origin_session_gone(relay, @origin, handle)
+
+    live = :sys.get_state(relay).store
+    assert live.engine.origin_sessions[{@person, @origin, handle}].gone
+    seq = live.engine.conversation_highs[@person]
+
+    assert %{payload: %{"kind" => "availability", "availability" => "gone"}} =
+             live.engine.conversation_events[{@person, seq}]
+
+    assert {:ok, [%{resource: {:message, _}}, %{resource: {:entry, ^seq}}], false, _} =
+             AgentChangeLog.read(live, scope, agent_head, 10, handle)
+
+    assert {:ok, person_next} = ChangeLog.head(live, @person)
+    assert person_next > person_head
+    assert :ok = Relay.origin_session_gone(relay, @origin, handle)
+    assert :sys.get_state(relay).store.version == live.version
+    GenServer.stop(relay)
+    assert {:ok, reopened} = Store.open(path, :keyed)
+    assert {:ok, reopened} = Store.enable_change_log(reopened)
+    assert full_diff(live.engine, reopened.engine) == MapSet.new()
+    assert index_state(live) == index_state(reopened)
+    :ok = Store.close(reopened)
+  end
+
   defp normalize_action_times(engine) do
     actions =
       Map.new(engine.origin_actions, fn {key, action} ->
