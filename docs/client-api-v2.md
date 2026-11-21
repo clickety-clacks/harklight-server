@@ -807,7 +807,7 @@ visible text. Its `attention` member changes:
 | `stale_request` | 409 | false | `request_revision` is behind the item (`stale_revision`) |
 | `already_answered` | 409 | false | Only on `/answer`: the item's `terminal` is already set (`closed`) |
 | `already_retracted` | 409 | false | The origin retracted the item (`retracted`); also an agent revise or retract on that item |
-| `already_closed` | 409 | false | A discard targets an attached upload handle, an agent write targets a closed message, a correlated revise targets an already-acted turn, or an agent result or file-use report conflicts (§5, §9.2) |
+| `already_closed` | 409 | false | A discard targets an attached upload handle, an agent lifecycle or result operation targets a closed message, a correlated revise targets an already-acted turn, or an agent result or file-use report conflicts (§5, §9.2) |
 | `not_answered` | 409 | false | The agent tried to record a result before an answer |
 | `idempotency_conflict` | 409 | false | Same key, different request (`operation_conflict`) |
 | `precondition_failed` | 412 | false | `If-Match` does not match. Also a superseded push `revision` (`stale_push_binding`). |
