@@ -16,6 +16,13 @@ defmodule AttentionServer.CLI.Device do
   action `id`), `comment` or `result`, and optionally `request_revision`; `{}`
   answers with no comment. Its exact body and `Idempotency-Key` are saved
   before sending, so a retry of the same answer resends them unchanged.
+
+  The saved body pins the request revision of the first attempt. If the
+  request was revised before that answer first reached the server, every
+  rerun gets `stale_request`. To answer the new revision, run `read`, then add
+  that item's `request_revision` to the answer file. That is a new answer with
+  its own saved request and key. The old saved request stays under
+  `operations/` and is never resent.
   """
 
   alias AttentionServer.{HeadlessDevice, HeadlessTLS, JSON, ToolEndpoint}

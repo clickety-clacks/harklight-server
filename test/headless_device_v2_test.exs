@@ -448,7 +448,8 @@ defmodule AttentionServer.HeadlessDeviceV2Test do
   end
 
   defp read_json!(directory, file) do
-    assert {:ok, value} = JSON.decode_line(File.read!(Path.join(directory, file)))
+    bytes = File.read!(Path.join(directory, file))
+    assert {:ok, value} = JSON.decode_line(String.trim_trailing(bytes, "\n") <> "\n")
     value
   end
 end
