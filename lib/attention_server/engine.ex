@@ -4714,10 +4714,7 @@ defmodule AttentionServer.Engine do
       {:ok, prior} ->
         remaining = Map.reject(prior.scores, fn {seq, _} -> seq <= position end)
 
-        history =
-          Map.put(engine.reply_group_history, key, update_reply_aggregate(prior, remaining))
-
-        %{engine | reply_group_history: history}
+        put_row(engine, :reply_group_history, key, update_reply_aggregate(prior, remaining))
 
       :error ->
         engine
@@ -4768,12 +4765,7 @@ defmodule AttentionServer.Engine do
 
               next =
                 next
-                |> then(fn state ->
-                  %{
-                    state
-                    | chat_read_positions: Map.put(state.chat_read_positions, key, position)
-                  }
-                end)
+                |> put_row(:chat_read_positions, key, position)
                 |> retain_read_group_score(key, position)
                 |> put_conversation_event(person, seq, key, payload)
                 |> queue_conversation_hint(person, seq)

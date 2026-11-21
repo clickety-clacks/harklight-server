@@ -351,7 +351,7 @@ defmodule AttentionServer.Conversation do
       {:error, :already_acted}
     else
       action = %{op_id: op_id, at: System.system_time(:millisecond)}
-      {:ok, %{engine | origin_actions: Map.put(engine.origin_actions, key, action)}}
+      {:ok, Engine.put_row(engine, :origin_actions, key, action)}
     end
   end
 

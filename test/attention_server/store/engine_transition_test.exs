@@ -350,7 +350,23 @@ defmodule AttentionServer.Store.EngineTransitionTest do
       {@reader, Map.merge(target, %{"type" => "message_open", "request_revision" => 1})},
       {@reader,
        Map.merge(target, %{"type" => "discussion", "request_revision" => 1, "text" => "question"})},
-      {@reader, Map.merge(target, %{"type" => "answer", "answer" => nil})}
+      {@origin,
+       Map.merge(target, %{
+         "type" => "conversation_reply",
+         "request_revision" => 1,
+         "in_reply_to" => 2,
+         "text" => "answer to chat"
+       })},
+      {@reader,
+       Map.merge(target, %{"type" => "conversation_read", "read_through_conversation_seq" => 2})},
+      {@origin,
+       Map.merge(target, %{
+         "type" => "conversation_revise",
+         "base_revision" => 1,
+         "message" => Map.put(send["message"], "title", "updated")
+       })},
+      {@reader,
+       Map.merge(target, %{"type" => "answer", "answer" => nil, "request_revision" => 2})}
     ]
 
     for {{actor, frame}, n} <- Enum.with_index(operations, 1) do
@@ -366,7 +382,10 @@ defmodule AttentionServer.Store.EngineTransitionTest do
     GenServer.stop(keyed)
     {:ok, legacy} = Store.open(legacy_path)
     {:ok, keyed} = Store.open(keyed_path, :keyed)
-    assert full_diff(legacy.engine, keyed.engine) == MapSet.new()
+
+    assert full_diff(normalize_action_times(legacy.engine), normalize_action_times(keyed.engine)) ==
+             MapSet.new()
+
     :ok = Store.close(legacy)
     :ok = Store.close(keyed)
   end
@@ -398,6 +417,16 @@ defmodule AttentionServer.Store.EngineTransitionTest do
     assert ChangeLog.closings(old, next, keys) == ChangeLog.closings(old, next)
     assert AgentChangeLog.changes(old, next, keyed) == AgentChangeLog.changes(old, next, legacy)
     assert map_size(AgentChangeLog.changes(old, next, keyed)) == 1
+  end
+
+  defp normalize_action_times(engine) do
+    actions =
+      Map.new(engine.origin_actions, fn {key, action} ->
+        assert is_integer(action.at) and action.at > 0
+        {key, %{action | at: 0}}
+      end)
+
+    %{engine | origin_actions: actions}
   end
 
   defp replace_body(engine, item, body) do

@@ -5364,10 +5364,20 @@ defmodule AttentionServer.Relay do
 
   defp perform_request(%{store: %Store{mode: :keyed}} = state, key, raw) do
     case JSON.decode_line(raw) do
-      {:ok, %{"type" => type, "files" => _} = frame} when type in ["forward", "discussion"] ->
+      {:ok, %{"type" => type, "files" => _} = frame}
+      when type in ["forward", "discussion", "conversation_reply", "conversation_revise"] ->
         perform_request_frame(state, key, frame)
 
-      {:ok, %{"type" => type}} when type in ["forward", "message_open", "discussion", "answer"] ->
+      {:ok, %{"type" => type}}
+      when type in [
+             "forward",
+             "message_open",
+             "discussion",
+             "answer",
+             "conversation_reply",
+             "conversation_revise",
+             "conversation_read"
+           ] ->
         perform_request_line(state, key, raw)
 
       _ ->
