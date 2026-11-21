@@ -1702,7 +1702,7 @@ that response. A later page can reflect intervening edits. Apply each Item's
       "properties": {
         "rev": { "$ref": "#/$defs/Position" },
         "items": { "type": "array", "items": { "$ref": "#/$defs/Item" } },
-        "next_page": { "$ref": "#/$defs/OpaqueId" }
+        "next_page": { "type": "string", "maxLength": 4096 }
       }
     }
   }
@@ -1712,6 +1712,9 @@ that response. A later page can reflect intervening edits. Apply each Item's
 Repeat the search filters with the opaque `next_page` token. It replaces
 the legacy search cursor and binds the filter values, enrolled key, agent
 and person. The client can change `limit` between pages. Grant changes leave
-the token valid. The shared 128-character opaque token limit applies.
+the token valid. Search page tokens are ASCII and have their own 4,096-byte
+limit.
 Invalid filters and invalid tokens answer `400 invalid_field`, naming the
 query parameter, such as `page`. An absent `next_page` marks the end.
+
+Legacy references for these rules are [search validation and matching](https://github.com/clickety-clacks/harklight-server/blob/f46aa03dc48017e4c81ee3f3c58a820231a162dd/lib/attention_server/agent_access.ex#L128-L236), [wire field and response mapping](https://github.com/clickety-clacks/harklight-server/blob/f46aa03dc48017e4c81ee3f3c58a820231a162dd/lib/attention_server/agent_wire.ex#L26-L83), and [answer grants](https://github.com/clickety-clacks/harklight-server/blob/f46aa03dc48017e4c81ee3f3c58a820231a162dd/lib/attention_server/engine.ex#L1133-L1175).
