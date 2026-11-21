@@ -4064,7 +4064,7 @@ defmodule AttentionServer.Engine do
         }
 
         record =
-          if frame["agent_api_v2"] == true,
+          if frame[:agent_api_v2] == true,
             do: Map.put(record, :agent_api_v2, true),
             else: record
 
@@ -4947,14 +4947,14 @@ defmodule AttentionServer.Engine do
     end
   end
 
-  defp valid_reply_target?(%{"agent_api_v2" => true} = frame)
+  defp valid_reply_target?(%{agent_api_v2: true} = frame)
        when not is_map_key(frame, "in_reply_to"),
        do: true
 
   defp valid_reply_target?(%{"in_reply_to" => seq}), do: is_integer(seq) and seq > 0
   defp valid_reply_target?(_), do: false
 
-  defp reply_target(engine, person, _actor, _key, %{"agent_api_v2" => true} = frame)
+  defp reply_target(engine, person, _actor, _key, %{agent_api_v2: true} = frame)
        when not is_map_key(frame, "in_reply_to") do
     with :ok <- delivery_allowed(engine, person), do: {:ok, engine, nil}
   end

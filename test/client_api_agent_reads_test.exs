@@ -301,6 +301,19 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
       assert %{"message" => %{"files" => []}} = contract(ctx, "AgentWriteResult", cleared)
     end
 
+    test "a correlated revise refuses an already acted turn without changing the revision", ctx do
+      id = forward(ctx, "a1", 1, @first_session)
+      entry_id = person_reply(ctx, id, 2)
+      path = "/v2/agent/messages/" <> id
+      assert request(ctx, "a1", "POST", path <> "/replies",
+        %{"text" => "Acted", "in_reply_to" => entry_id}, 3).status == 200
+
+      body = %{"message" => %{"title" => "Refused", "created_at" => 1}, "in_reply_to" => entry_id}
+      assert_error(request(ctx, "a1", "PUT", path, body, 4, [{"if-match", "1"}]), 409, "already_closed")
+      assert %{"message" => %{"revision" => 1, "message" => %{"title" => "Message 1"}}} =
+               contract(ctx, "SentMessageResponse", get(ctx, "a1", path))
+    end
+
     test "lifecycle stamps the transition and already_closed applies to a repeat", ctx do
       id = forward(ctx, "a1", 1, nil)
       path = "/v2/agent/messages/" <> id <> "/lifecycle"

@@ -378,7 +378,7 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
   end
 
   defp apply_frame(state, agent, operation, attributes, op_id) when is_map(attributes) do
-    frame = Map.merge(attributes, %{"v" => 1, "op_id" => op_id, "agent_api_v2" => true})
+    frame = Map.merge(attributes, %{"v" => 1, "op_id" => op_id, :agent_api_v2 => true})
     {reply, next} = Relay.apply_agent_frame(state, agent, frame)
     {decode_reply(reply, operation), next}
   end
@@ -749,6 +749,7 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
 
   defp engine_error("sender_not_authorized", _), do: "forbidden"
   defp engine_error("closed", _), do: "already_closed"
+  defp engine_error("already_acted", _), do: "already_closed"
   defp engine_error("receipt_conflict", _), do: "already_closed"
   defp engine_error("retracted", _), do: "already_retracted"
   defp engine_error("stale_revision", :revise), do: "precondition_failed"
