@@ -5,7 +5,7 @@ defmodule AttentionServer.Store.RecordCodec do
 
   @derived [:advisory_id_index, :open_default_index, :route_b_index]
 
-  @fields Map.new(Map.drop(Map.from_struct(%Engine{}), @derived), fn
+  @fields Map.new(Map.drop(Map.from_struct(%Engine{}), [:advisory_feeds | @derived]), fn
             {field, %MapSet{}} -> {field, :member}
             {field, value} when is_map(value) -> {field, :row}
             {field, _value} -> {field, :field}
@@ -15,15 +15,31 @@ defmodule AttentionServer.Store.RecordCodec do
   # Enumerate at boot or migration. Routine writes only call encode_row/2
   # for records named by the transition.
   def encode(%Engine{} = engine) do
-    Stream.flat_map(@fields, fn {field, kind} ->
-      value = Map.fetch!(engine, field)
+    fields =
+      Stream.flat_map(@fields, fn {field, kind} ->
+        value = Map.fetch!(engine, field)
 
-      case kind do
-        :field -> [encode_row({:field, field}, value)]
-        :row -> Stream.map(value, fn {key, row} -> encode_row({:row, field, key}, row) end)
-        :member -> Stream.map(value, &encode_row({:member, field, &1}, true))
-      end
-    end)
+        case kind do
+          :field -> [encode_row({:field, field}, value)]
+          :row -> Stream.map(value, fn {key, row} -> encode_row({:row, field, key}, row) end)
+          :member -> Stream.map(value, &encode_row({:member, field, &1}, true))
+        end
+      end)
+
+    advisories =
+      Stream.flat_map(engine.advisory_feeds, fn {scope, feed} ->
+        entries =
+          Stream.map(feed.entries, fn {seq, entry} ->
+            encode_row({:advisory, scope, {:entry, seq}}, entry)
+          end)
+
+        receipts =
+          Stream.map(feed.receipts, &encode_row({:advisory, scope, {:receipt, &1}}, true))
+
+        Stream.concat([[encode_row({:advisory, scope, :high}, feed.high)], entries, receipts])
+      end)
+
+    Stream.concat(fields, advisories)
   end
 
   def encode_row(address, value) do
@@ -35,7 +51,12 @@ defmodule AttentionServer.Store.RecordCodec do
   def decode(records) do
     case Enum.reduce_while(records, {%Engine{}, @required}, &load_record/2) do
       {engine, required} when is_struct(required, MapSet) ->
-        if MapSet.size(required) == 0, do: {:ok, engine}, else: {:error, :invalid_state}
+        if MapSet.size(required) == 0 and
+             Enum.all?(engine.advisory_feeds, fn {_scope, feed} -> not is_nil(feed.high) end) do
+          {:ok, engine}
+        else
+          {:error, :invalid_state}
+        end
 
       :invalid ->
         {:error, :invalid_state}
@@ -84,7 +105,33 @@ defmodule AttentionServer.Store.RecordCodec do
     end
   end
 
+  defp insert(engine, required, {:advisory, scope, fact}, value) do
+    feed =
+      Map.get(engine.advisory_feeds, scope, %{high: nil, entries: %{}, receipts: MapSet.new()})
+
+    with {:ok, updated} <- insert_advisory(feed, fact, value) do
+      {:ok, %{engine | advisory_feeds: Map.put(engine.advisory_feeds, scope, updated)}, required}
+    end
+  end
+
   defp insert(_, _, _, _), do: :invalid
+
+  defp insert_advisory(%{high: nil} = feed, :high, high) when is_integer(high) and high >= 0,
+    do: {:ok, %{feed | high: high}}
+
+  defp insert_advisory(feed, {:entry, seq}, entry) do
+    unless Map.has_key?(feed.entries, seq) do
+      {:ok, %{feed | entries: Map.put(feed.entries, seq, entry)}}
+    end
+  end
+
+  defp insert_advisory(feed, {:receipt, id}, true) do
+    unless MapSet.member?(feed.receipts, id) do
+      {:ok, %{feed | receipts: MapSet.put(feed.receipts, id)}}
+    end
+  end
+
+  defp insert_advisory(_, _, _), do: :invalid
 
   defp checksum(key, payload), do: :crypto.hash(:sha256, [key, payload])
 end

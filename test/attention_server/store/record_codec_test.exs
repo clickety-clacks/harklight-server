@@ -48,4 +48,21 @@ defmodule AttentionServer.Store.RecordCodecTest do
     assert Enum.to_list(RecordCodec.encode(baseline)) ==
              Enum.to_list(RecordCodec.encode(with_index))
   end
+
+  test "encodes advisory counters, entries and receipts as separate records" do
+    scope = {"person", "origin", "session"}
+    feed = %{high: 2, entries: %{1 => :old, 2 => :new}, receipts: MapSet.new([:old_id])}
+    engine = %{Engine.new() | advisory_feeds: %{scope => feed}}
+    rows = engine |> RecordCodec.encode() |> Enum.to_list()
+    entry = RecordCodec.encode_row({:advisory, scope, {:entry, 2}}, :new)
+    receipt = RecordCodec.encode_row({:advisory, scope, {:receipt, :old_id}}, true)
+    high = RecordCodec.encode_row({:advisory, scope, :high}, 2)
+
+    assert entry in rows
+    assert receipt in rows
+    assert high in rows
+    assert {:ok, ^engine} = RecordCodec.decode(Enum.reverse(rows))
+    assert {:error, :invalid_state} = RecordCodec.decode(List.delete(rows, high))
+    assert {:error, :invalid_state} = RecordCodec.decode([entry | rows])
+  end
 end
