@@ -2,12 +2,15 @@ defmodule AttentionServer.ClientAPI.Feed do
   @moduledoc """
   `GET /v2/changes`: the person's change feed (docs/client-api-v2.md §6).
 
-  This slice serves the JSON batch form: `{changes, rev, more}`, up to `limit`
-  changes (default and maximum 500), each `{rev, kind, data}` in increasing
-  `rev` with no gap. The cursor is `Last-Event-ID`, which takes precedence, or
-  `?after`; no cursor means from the start. A cursor older than the retained
-  log, or newer than the person's position, is `410 cursor_expired`. The
-  Server-Sent Events form answers `400 unsupported` until its slice lands.
+  - `Accept: text/event-stream` holds a Server-Sent Events stream
+    (`ClientAPI.FeedStream`): the backlog after the cursor, then live changes.
+  - Otherwise one JSON batch: `{changes, rev, more}`, up to `limit` changes
+    (default and maximum 500).
+
+  In both forms each change is `{rev, kind, data}`, in increasing `rev` with
+  no gap. The cursor is `Last-Event-ID`, which takes precedence, or `?after`;
+  no cursor means from the start. A cursor older than the retained log, or
+  newer than the person's position, is `410 cursor_expired`.
 
   The batch's `rev` is the position the batch is complete through: the rev of
   the last log row read. That is the last change's `rev`, or `after` when no
@@ -20,7 +23,7 @@ defmodule AttentionServer.ClientAPI.Feed do
 
   import Plug.Conn
 
-  alias AttentionServer.ClientAPI.{Context, Errors, FeedStep}
+  alias AttentionServer.ClientAPI.{Context, Errors, FeedStep, FeedStream}
 
   @max_limit 500
 
@@ -33,7 +36,7 @@ defmodule AttentionServer.ClientAPI.Feed do
     with {:ok, cursor} <- cursor(conn),
          {:ok, limit} <- limit(conn.query_params["limit"]) do
       if event_stream?(conn),
-        do: Errors.send_error(conn, "unsupported"),
+        do: FeedStream.serve(conn, ctx, cursor),
         else: batch(conn, ctx, cursor, limit)
     else
       {:error, field} -> Errors.send_error(conn, "invalid_field", field: field)

@@ -8,7 +8,7 @@ defmodule AttentionServer.ClientAPIFeedTest do
   import Plug.Conn
 
   alias AttentionServer.{ChangeLog, JSON, Relay, TLSFixtures}
-  alias AttentionServer.ClientAPI.{Feed, Principal, Reads, Router}
+  alias AttentionServer.ClientAPI.{Principal, Reads, Router}
   alias AttentionServer.ClientAPISchema, as: Schema
 
   @handle "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
@@ -423,12 +423,5 @@ defmodule AttentionServer.ClientAPIFeedTest do
       |> Router.call(ctx.router)
 
     assert conn.status == 401
-  end
-
-  test "the stream form is refused until it is served", ctx do
-    conn = get(ctx, "/v2/changes", [{"accept", "text/event-stream"}])
-    assert conn.status == 400
-    assert body(conn)["error"] == "unsupported"
-    assert Feed.event_stream?(conn)
   end
 end
