@@ -26,6 +26,7 @@ defmodule AttentionServer.Relay do
     BrowserRecipient,
     BounceDecision,
     BouncePolicy,
+    ChangeLog,
     Conversation,
     ConversationFiles,
     DashboardInventory,
@@ -820,6 +821,8 @@ defmodule AttentionServer.Relay do
                   Keyword.get(opts, :deployment_mode, :self_hosted),
                   Keyword.get(opts, :jev_score_record_path)
                 ),
+              client_rank_cache: %{},
+              client_rank_retry: nil,
               priority_views: %{},
               priority_recorded_scores: %{},
               priority_generations: %{},
@@ -849,6 +852,7 @@ defmodule AttentionServer.Relay do
             }
 
             state = initialize_priority_views(state)
+            state = initialize_client_ranks(state)
             state = reschedule_default_sweep(state, state.default_index)
             state = reschedule_bounce_sweep(state)
             schedule_change_log_prune(state.store, 0)
@@ -871,6 +875,7 @@ defmodule AttentionServer.Relay do
   # older than the oldest retained row gets cursor_expired.
   @change_log_retention_ms 30 * 24 * 60 * 60 * 1_000
   @change_log_prune_interval_ms 24 * 60 * 60 * 1_000
+  @client_rank_retry_ms 250
 
   defp schedule_change_log_prune(%Store{change_log: true}, delay_ms),
     do: Process.send_after(self(), :change_log_prune, delay_ms)
@@ -3483,6 +3488,12 @@ defmodule AttentionServer.Relay do
     end)
   end
 
+  defp initialize_client_ranks(%{store: %Store{change_log: false}} = state), do: state
+
+  defp initialize_client_ranks(state) do
+    persist_client_ranks(state, Map.keys(state.store.engine.persons))
+  end
+
   # Client API v2 ranks are computed once per change, here, and stored with
   # the change log, so reads page from the stored order. A person is ranked
   # when a commit changed their client resources or their priority view
@@ -3499,13 +3510,24 @@ defmodule AttentionServer.Relay do
         |> Enum.reject(&(Map.get(before.priority_views, &1) === Map.get(next.priority_views, &1)))
       end
 
-    persons = Enum.uniq(MapSet.to_list(next.store.change_log_touched) ++ views_changed)
+    # Failed ranks stay touched until the timer retries them. Reads and other
+    # unrelated Relay traffic must not repeatedly retry a failing write.
+    persons =
+      next.store.change_log_touched
+      |> MapSet.union(MapSet.new(views_changed))
+      |> MapSet.difference(before.store.change_log_touched)
 
-    if persons == [] do
-      next
+    persist_client_ranks(next, persons)
+  end
+
+  defp persist_client_ranks(state, persons) do
+    state = Enum.reduce(persons, state, &store_client_ranks(&2, &1))
+
+    if state.client_rank_retry == nil and MapSet.size(state.store.change_log_touched) > 0 do
+      timer = Process.send_after(self(), :retry_client_ranks, @client_rank_retry_ms)
+      %{state | client_rank_retry: timer}
     else
-      next = Enum.reduce(persons, next, &store_client_ranks(&2, &1))
-      %{next | store: %{next.store | change_log_touched: MapSet.new()}}
+      state
     end
   end
 
@@ -3514,45 +3536,62 @@ defmodule AttentionServer.Relay do
   # ranking compares against SQLite again.
   defp store_client_ranks(state, person) do
     store = state.store
-    caches = Map.get(state, :client_rank_cache, %{})
+    cache = Map.get(state.client_rank_cache, person)
 
-    if Map.has_key?(store.engine.persons, person) do
-      cache = Map.get(caches, person)
+    result =
+      if Map.has_key?(store.engine.persons, person) do
+        previous =
+          case cache do
+            %{units: units} -> {:ok, units}
+            nil -> ChangeLog.rank_keys(store, person)
+          end
 
-      previous =
-        case cache do
-          %{units: units} -> {:ok, units}
-          nil -> AttentionServer.ChangeLog.rank_keys(store, person)
+        with {:ok, previous} <- previous do
+          ranks =
+            AttentionServer.ClientAPI.Resources.ranks(
+              store.engine,
+              person,
+              Map.get(state.priority_views, person),
+              previous
+            )
+
+          ChangeLog.put_ranks(store, person, ranks, cache)
         end
-
-      with {:ok, previous} <- previous,
-           ranks =
-             AttentionServer.ClientAPI.Resources.ranks(
-               store.engine,
-               person,
-               Map.get(state.priority_views, person),
-               previous
-             ),
-           {:ok, _head, next_cache} <-
-             AttentionServer.ChangeLog.put_ranks(store, person, ranks, cache) do
-        Map.put(state, :client_rank_cache, Map.put(caches, person, next_cache))
       else
-        error ->
-          Diagnostics.failure(:server_storage, :state_commit, error, :retry)
-          Map.put(state, :client_rank_cache, Map.delete(caches, person))
+        {:ok, nil, nil}
       end
-    else
-      state
+
+    case result do
+      {:ok, _head, next_cache} ->
+        caches =
+          if next_cache,
+            do: Map.put(state.client_rank_cache, person, next_cache),
+            else: Map.delete(state.client_rank_cache, person)
+
+        store = %{store | change_log_touched: MapSet.delete(store.change_log_touched, person)}
+        %{state | store: store, client_rank_cache: caches}
+
+      error ->
+        retry_client_rank(state, person, error)
     end
   rescue
-    error ->
-      Diagnostics.failure(:server_storage, :state_commit, error, :retry)
+    error -> retry_client_rank(state, person, error)
+  end
 
-      Map.put(
-        state,
-        :client_rank_cache,
-        Map.delete(Map.get(state, :client_rank_cache, %{}), person)
-      )
+  defp retry_client_rank(state, person, error) do
+    Diagnostics.failure(:server_storage, :state_commit, error, :retry)
+
+    store = %{
+      state.store
+      | change_log_touched: MapSet.put(state.store.change_log_touched, person)
+    }
+
+    %{state | store: store, client_rank_cache: Map.delete(state.client_rank_cache, person)}
+  end
+
+  defp dispatch_info(:retry_client_ranks, state) do
+    {:noreply,
+     persist_client_ranks(%{state | client_rank_retry: nil}, state.store.change_log_touched)}
   end
 
   defp dispatch_info({:socket_write_done, socket, token, result}, state) do

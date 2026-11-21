@@ -836,6 +836,11 @@ defmodule AttentionServer.ChangeLog do
     |> Enum.sort()
   end
 
+  @doc false
+  def ranks_available(%AttentionServer.Store{change_log_touched: touched}, person) do
+    if MapSet.member?(touched, person), do: {:error, :storage_unavailable}, else: :ok
+  end
+
   @doc """
   Up to `limit` stored ranks after `after_key` (or from the start), in
   ascending rank-key order: `{:ok, [{item_id, rank}], more}`. `{:error, :none}`
