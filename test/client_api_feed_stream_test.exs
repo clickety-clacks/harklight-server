@@ -23,10 +23,20 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
 
   import AttentionServer.ClientAPIFeedClient, except: [connect: 2, connect: 3, connect: 4]
 
-  alias AttentionServer.{ChangeLog, ClientAPI, ClientAPIFeedClient, JSON, Relay, TLSFixtures}
-  alias AttentionServer.ClientAPI.{Principal, Reads}
+  alias AttentionServer.{
+    ChangeLog,
+    ClientAPI,
+    ClientAPIFeedClient,
+    DeviceIdentity,
+    JSON,
+    Relay,
+    TLSFixtures
+  }
+
+  alias AttentionServer.ClientAPI.{Principal, Reads, Writes}
 
   @handle "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+  @other_handle "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
 
   setup_all do
     certs = TLSFixtures.create!()
@@ -64,8 +74,7 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
            relay: relay,
            certfile: Path.join(certs, "server.pem"),
            keyfile: Path.join(certs, "server.key"),
-           cacertfile: Path.join(certs, "ca.pem"),
-           routes: [ClientAPI.Reads, ClientAPI.Feed]
+           cacertfile: Path.join(certs, "ca.pem")
          ]},
         id: make_ref()
       )
@@ -303,6 +312,487 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
     assert replayed.items == snapshot(ctx).items
   end
 
+  test "the mounted agent feed honors Last-Event-ID and validates session", ctx do
+    conn = connect(ctx)
+
+    {conn, result} =
+      agent_batch(conn, "?after=invalid&session=#{@handle}", [{"last-event-id", "0"}])
+
+    assert result.status == 200
+
+    assert {:ok, %{"changes" => [], "rev" => 0, "more" => false}} =
+             JSON.decode_line(result.body <> "\n")
+
+    {conn, invalid} = agent_batch(conn, "?session=invalid", [])
+    assert invalid.status == 400
+
+    assert {:ok, %{"error" => "invalid_field", "field" => "session"}} =
+             JSON.decode_line(invalid.body <> "\n")
+
+    {_conn, expired} = agent_batch(conn, "?after=1", [])
+    assert expired.status == 410
+  end
+
+  test "agent replay reaches the message snapshot after chat, a raw answer and a sessionless close",
+       ctx do
+    assert :ok = Relay.setup_sender(ctx.relay, ctx.reader, "app:agent")
+
+    for {id, n, session} <- [{"chat", 1, @handle}, {"sessionless", 2, nil}] do
+      frame = %{
+        "type" => "forward",
+        "op_id" => op(n),
+        "message" => %{
+          "sender_id" => "app:agent",
+          "message_id" => id,
+          "created_at" => n,
+          "title" => id
+        }
+      }
+
+      frame = if session, do: Map.put(frame, "session_handle", session), else: frame
+      assert %{"type" => "ok"} = request(ctx.relay, ctx.reader, frame)
+    end
+
+    assert %{"type" => "ok"} =
+             request(ctx.relay, "origin", %{
+               "type" => "discussion",
+               "op_id" => op(3),
+               "sender_id" => "app:agent",
+               "message_id" => "chat",
+               "request_revision" => 1,
+               "text" => "Question before answer"
+             })
+
+    assert %{"type" => "ok"} =
+             request(ctx.relay, "origin", %{
+               "type" => "answer",
+               "op_id" => op(4),
+               "sender_id" => "app:agent",
+               "message_id" => "chat",
+               "request_revision" => 1,
+               "answer" => nil
+             })
+
+    assert %{"type" => "ok"} =
+             request(ctx.relay, ctx.reader, %{
+               "type" => "lifecycle",
+               "op_id" => op(5),
+               "sender_id" => "app:agent",
+               "message_id" => "sessionless",
+               "state" => "cleared",
+               "at" => 6
+             })
+
+    {conn, first} = agent_batch(connect(ctx), "?after=0", [])
+    assert first.status == 200
+
+    assert {:ok, %{"changes" => changes, "rev" => first_rev}} =
+             JSON.decode_line(first.body <> "\n")
+
+    assert [
+             %{"kind" => "entry", "data" => %{"kind" => "reply"}, "rev" => chat_rev},
+             %{
+               "kind" => "message",
+               "data" => %{"terminal" => %{"state" => "answered", "answer" => nil}},
+               "rev" => answer_rev
+             },
+             %{
+               "kind" => "message",
+               "data" => %{"terminal" => %{"state" => "cleared"}},
+               "rev" => close_rev
+             }
+           ] = changes
+
+    assert chat_rev < answer_rev and answer_rev < close_rev
+
+    assert eventually(fn ->
+             store = :sys.get_state(ctx.relay).store
+
+             case AttentionServer.AgentChangeLog.head(store, {"A", ctx.reader}) do
+               {:ok, head} -> head > first_rev
+               _ -> false
+             end
+           end)
+
+    {conn, receipts} = agent_batch(conn, "?after=#{first_rev}", [])
+    assert receipts.status == 200
+    assert {:ok, %{"changes" => receipt_changes}} = JSON.decode_line(receipts.body <> "\n")
+
+    replayed =
+      for %{"kind" => "message", "data" => message} <- changes ++ receipt_changes,
+          into: %{},
+          do: {message["item_id"], message}
+
+    {:ok, conn, ref} = Mint.HTTP.request(conn, "GET", "/v2/agent/messages", [], nil)
+    {_conn, response} = collect(conn, ref)
+    assert response.status == 200
+    assert {:ok, %{"messages" => messages}} = JSON.decode_line(response.body <> "\n")
+    assert replayed == Map.new(messages, &{&1["item_id"], &1})
+  end
+
+  test "filtered agent SSE resumes across concurrent writes and converges with the snapshot",
+       ctx do
+    Application.put_env(:attention_server, :client_api_feed_heartbeat_ms, 100)
+    on_exit(fn -> Application.delete_env(:attention_server, :client_api_feed_heartbeat_ms) end)
+    assert :ok = Relay.setup_sender(ctx.relay, ctx.reader, "app:agent")
+    {conn, feed} = open_agent_feed(connect(ctx), "?session=#{@handle}")
+    {conn, feed} = await_open(conn, feed)
+    assert feed.status == 200
+
+    writer =
+      Task.async(fn ->
+        for n <- 1..40 do
+          session = if rem(n, 2) == 0, do: @handle, else: @other_handle
+
+          assert %{"type" => "ok"} =
+                   request(ctx.relay, ctx.reader, %{
+                     "type" => "forward",
+                     "op_id" => op(n),
+                     "session_handle" => session,
+                     "message" => %{
+                       "sender_id" => "app:agent",
+                       "message_id" => "concurrent-#{n}",
+                       "created_at" => n,
+                       "title" => "Concurrent #{n}"
+                     }
+                   })
+        end
+      end)
+
+    {conn, _feed, seen} = agent_messages(conn, feed, 3)
+    last_id = List.last(seen).id
+    Mint.HTTP.close(conn)
+
+    {conn, feed} =
+      open_agent_feed(connect(ctx), "?after=0&session=#{@handle}", [
+        {"last-event-id", Integer.to_string(last_id)}
+      ])
+
+    {conn, feed} = await_open(conn, feed)
+    assert feed.status == 200
+    Task.await(writer, 30_000)
+    {conn, _feed, resumed} = agent_messages(conn, feed, 17)
+    all = seen ++ resumed
+    assert Enum.all?(all, &(&1.data["session"] == @handle))
+    ids = Enum.map(all, & &1.id)
+    assert ids == Enum.sort(Enum.uniq(ids))
+    assert Enum.any?(Enum.chunk_every(ids, 2, 1, :discard), fn [a, b] -> b > a + 1 end)
+    replayed = Map.new(all, &{&1.data["item_id"], &1.data})
+
+    {:ok, conn, ref} =
+      Mint.HTTP.request(conn, "GET", "/v2/agent/messages?session=#{@handle}", [], nil)
+
+    {_conn, response} = collect(conn, ref)
+    assert response.status == 200
+    assert {:ok, %{"messages" => messages}} = JSON.decode_line(response.body <> "\n")
+    assert replayed == Map.new(messages, &{&1["item_id"], &1})
+  end
+
+  defp agent_messages(conn, feed, count, acc \\ [])
+
+  defp agent_messages(conn, feed, 0, acc), do: {conn, feed, Enum.reverse(acc)}
+
+  defp agent_messages(conn, feed, count, acc) do
+    case events(conn, feed, 1) do
+      {conn, feed, [%{event: "message"} = event]} ->
+        agent_messages(conn, feed, count - 1, [event | acc])
+
+      {conn, feed, [%{event: kind}]} when kind in ["heartbeat", "entry"] ->
+        agent_messages(conn, feed, count, acc)
+    end
+  end
+
+  test "serving a person reply on agent SSE records delivery on its original entry", ctx do
+    Application.put_env(:attention_server, :client_api_feed_heartbeat_ms, 100)
+    on_exit(fn -> Application.delete_env(:attention_server, :client_api_feed_heartbeat_ms) end)
+    {scope, position, _entry_position} = pending_agent_reply(ctx)
+
+    {conn, feed} = open_agent_feed(connect(ctx), "?after=#{position}")
+    {conn, feed} = await_open(conn, feed)
+    assert feed.status == 200
+
+    {conn, feed, before} = next_person_reply(conn, feed, 12)
+    assert before.data["delivery"]["delivered"] == false
+
+    {_conn, _feed, delivered} = next_person_reply(conn, feed, 12)
+    assert delivered.data["delivery"]["delivered"] == true
+    assert before.data["entry_id"] == delivered.data["entry_id"]
+    assert before.id < delivered.id
+
+    store = :sys.get_state(ctx.relay).store
+
+    assert {:ok, rev} =
+             AttentionServer.AgentChangeLog.rev(
+               store,
+               scope,
+               {:entry, delivered.data["position"]}
+             )
+
+    assert rev == delivered.id
+  end
+
+  for transport <- [:batch, :sse] do
+    test "the agent #{transport} can resume after a Delivered write fails", ctx do
+      {scope, cursor, position} = pending_agent_reply(ctx)
+      assert {:ok, undelivered_rev} = agent_entry_rev(ctx.relay, scope, position)
+
+      set_feed_writable(ctx.relay, false)
+      expect_delivery_failure(connect(ctx), cursor, unquote(transport))
+      assert {:ok, ^undelivered_rev} = agent_entry_rev(ctx.relay, scope, position)
+      set_feed_writable(ctx.relay, true)
+
+      {conn, first} = resume_agent_feed(connect(ctx), cursor, unquote(transport))
+      assert %{"position" => ^position, "rev" => ^undelivered_rev} = first
+      assert {:ok, delivered_rev} = agent_entry_rev(ctx.relay, scope, position)
+      assert delivered_rev > undelivered_rev
+      Mint.HTTP.close(conn)
+
+      {conn, replayed} = resume_agent_feed(connect(ctx), cursor, unquote(transport))
+
+      assert %{
+               "position" => ^position,
+               "rev" => ^delivered_rev,
+               "delivery" => %{"delivered" => true}
+             } = replayed
+
+      assert {:ok, ^delivered_rev} = agent_entry_rev(ctx.relay, scope, position)
+      Mint.HTTP.close(conn)
+    end
+  end
+
+  test "a disconnected agent resumes a reply whose delivery was already committed", ctx do
+    {scope, cursor, position} = pending_agent_reply(ctx)
+    assert {:ok, undelivered_rev} = agent_entry_rev(ctx.relay, scope, position)
+
+    # Headers can arrive, but the zero window prevents the reply frame being written.
+    assert {:ok, conn} = Mint.HTTP2.put_settings(connect(ctx), initial_window_size: 0)
+    {conn, feed} = open_agent_feed(conn, "?after=#{cursor}")
+    {conn, feed} = await_open(conn, feed)
+    assert feed.status == 200
+    assert feed.buffer == ""
+    assert {:ok, delivered_rev} = agent_entry_rev(ctx.relay, scope, position)
+    assert delivered_rev > undelivered_rev
+    Mint.HTTP.close(conn)
+
+    {conn, replayed} = resume_agent_feed(connect(ctx), cursor, :sse)
+
+    assert %{
+             "position" => ^position,
+             "rev" => ^delivered_rev,
+             "delivery" => %{"delivered" => true}
+           } = replayed
+
+    assert {:ok, ^delivered_rev} = agent_entry_rev(ctx.relay, scope, position)
+    Mint.HTTP.close(conn)
+  end
+
+  defp pending_agent_reply(ctx) do
+    assert :ok = Relay.setup_sender(ctx.relay, ctx.reader, "app:agent")
+
+    assert %{"type" => "ok"} =
+             request(ctx.relay, ctx.reader, %{
+               "type" => "forward",
+               "op_id" => op(1),
+               "session_handle" => @handle,
+               "message" => %{
+                 "sender_id" => "app:agent",
+                 "message_id" => "stream-delivery",
+                 "created_at" => 1,
+                 "title" => "One conversation"
+               }
+             })
+
+    scope = {"A", ctx.reader}
+
+    assert {:ok, position} =
+             AttentionServer.AgentChangeLog.head(:sys.get_state(ctx.relay).store, scope)
+
+    assert %{"type" => "ok", "seq" => entry_position} =
+             request(ctx.relay, "origin", %{
+               "type" => "discussion",
+               "op_id" => op(2),
+               "sender_id" => "app:agent",
+               "message_id" => "stream-delivery",
+               "request_revision" => 1,
+               "text" => "Deliver this once"
+             })
+
+    {scope, position, entry_position}
+  end
+
+  defp expect_delivery_failure(conn, cursor, :batch) do
+    {conn, response} = agent_batch(conn, "?after=#{cursor}", [])
+    Mint.HTTP.close(conn)
+    assert response.status == 503
+    assert {"retry-after", _seconds} = List.keyfind(response.headers, "retry-after", 0)
+
+    assert {:ok, %{"error" => "storage_unavailable"} = body} =
+             JSON.decode_line(response.body <> "\n")
+
+    refute Map.has_key?(body, "rev")
+  end
+
+  defp expect_delivery_failure(conn, cursor, :sse) do
+    {conn, feed} = open_agent_feed(conn, "?after=#{cursor}")
+    {conn, feed} = await_open(conn, feed)
+    assert feed.status == 200
+    {conn, feed, [event]} = events(conn, feed, 1)
+    assert event == %{event: "closing", data: %{"reason" => "storage_unavailable"}}
+    assert {conn, %{done: true, buffer: ""}} = drain(conn, feed)
+    Mint.HTTP.close(conn)
+  end
+
+  defp resume_agent_feed(conn, cursor, :batch) do
+    {conn, response} = agent_batch(conn, "?after=#{cursor}", [])
+    assert response.status == 200
+    assert {:ok, %{"changes" => changes}} = JSON.decode_line(response.body <> "\n")
+
+    entry =
+      Enum.find_value(changes, fn
+        %{"kind" => "entry", "data" => %{"kind" => "reply", "author" => "person"} = data} -> data
+        _ -> nil
+      end)
+
+    {conn, entry}
+  end
+
+  defp resume_agent_feed(conn, cursor, :sse) do
+    headers = [{"last-event-id", Integer.to_string(cursor)}]
+    {conn, feed} = open_agent_feed(conn, "?after=0", headers)
+    {conn, feed} = await_open(conn, feed)
+    assert feed.status == 200
+    {conn, _feed, event} = next_person_reply(conn, feed, 12)
+    {conn, event.data}
+  end
+
+  defp set_feed_writable(relay, writable?) do
+    setting = if writable?, do: "OFF", else: "ON"
+
+    :sys.replace_state(relay, fn state ->
+      assert :ok = Exqlite.Sqlite3.execute(state.store.db, "PRAGMA query_only = #{setting}")
+      state
+    end)
+  end
+
+  defp agent_entry_rev(relay, scope, position) do
+    store = :sys.get_state(relay).store
+    AttentionServer.AgentChangeLog.rev(store, scope, {:entry, position})
+  end
+
+  defp next_person_reply(_conn, _feed, 0), do: flunk("person reply event missing")
+
+  defp next_person_reply(conn, feed, attempts) do
+    case events(conn, feed, 1) do
+      {conn, feed, [%{event: "entry", data: %{"kind" => "reply", "author" => "person"}} = event]} ->
+        {conn, feed, event}
+
+      {conn, feed, [%{event: kind}]} when kind in ["heartbeat", "message", "entry"] ->
+        next_person_reply(conn, feed, attempts - 1)
+    end
+  end
+
+  test "a live agent feed starts and stops focus when its see grant changes", ctx do
+    Application.put_env(:attention_server, :client_api_feed_heartbeat_ms, 80)
+    on_exit(fn -> Application.delete_env(:attention_server, :client_api_feed_heartbeat_ms) end)
+    owner_cert = TLSFixtures.certificate_der!(ctx.certs, "a2")
+    {:ok, owner} = DeviceIdentity.from_certificate(owner_cert)
+    assert {:ok, person} = Relay.operator_bootstrap(ctx.relay, owner_cert)
+
+    assert {:ok, agent} =
+             Relay.setup_device_certificate(
+               ctx.relay,
+               person,
+               TLSFixtures.certificate_der!(ctx.certs, "b1")
+             )
+
+    principal = %Principal{kind: :device, key: agent, person: person}
+    conn = ClientAPIFeedClient.connect(ctx.port, ctx.certs, "b1")
+
+    {conn, feed} = open_agent_feed(conn)
+    {conn, feed} = await_open(conn, feed)
+    assert feed.status == 200
+
+    {conn, feed, [beat]} = events(conn, feed, 1)
+    assert beat == %{event: "heartbeat", data: %{}}
+
+    assert :ok =
+             Relay.save_dashboard_focus_permission(ctx.relay, person, owner, agent, :see, true)
+
+    {conn, feed, focus} = next_focus(conn, feed, 10)
+    assert focus == %{event: "focus", data: %{"focus" => %{"clients" => []}}}
+
+    assert {:ok, 200, _, false} =
+             Writes.focus(ctx.relay, principal, %{"screen" => "inbox", "ttl_s" => 120})
+
+    {conn, feed, focus} = next_focus(conn, feed, 10)
+
+    assert %{
+             event: "focus",
+             data: %{"focus" => %{"clients" => [%{"device_id" => ^agent, "screen" => "inbox"}]}}
+           } = focus
+
+    refute Map.has_key?(focus, :id)
+
+    assert :ok =
+             Relay.save_dashboard_focus_permission(ctx.relay, person, owner, agent, :see, false)
+
+    assert {:ok, 200, _, false} =
+             Writes.focus(ctx.relay, principal, %{"screen" => "settings", "ttl_s" => 120})
+
+    {_conn, feed, beats} = events(conn, feed, 2)
+    assert beats == List.duplicate(%{event: "heartbeat", data: %{}}, 2)
+    refute feed.done
+  end
+
+  test "an agent storage failure closes the SSE feed and leaves Relay alive", ctx do
+    {conn, feed} = open_agent_feed(connect(ctx))
+    {conn, feed} = await_open(conn, feed)
+    assert feed.status == 200
+    break_store(ctx)
+
+    assert :ok = ChangeLog.notify(%{{:agent, "A", ctx.reader} => 1})
+    {conn, feed, closing} = until_closing(conn, feed)
+
+    assert closing == %{event: "closing", data: %{"reason" => "storage_unavailable"}}
+    assert {_conn, %{done: true}} = drain(conn, feed)
+    assert Process.alive?(ctx.relay)
+  end
+
+  defp open_agent_feed(conn, query \\ "", headers \\ []) do
+    {:ok, conn, ref} =
+      Mint.HTTP.request(
+        conn,
+        "GET",
+        "/v2/agent/changes" <> query,
+        [{"accept", "text/event-stream"} | headers],
+        nil
+      )
+
+    {conn, %{ref: ref, buffer: "", status: nil, headers: [], done: false}}
+  end
+
+  defp next_focus(_conn, _feed, 0), do: flunk("focus event missing")
+
+  defp next_focus(conn, feed, attempts) do
+    case events(conn, feed, 1) do
+      {conn, feed, [%{event: "heartbeat"}]} -> next_focus(conn, feed, attempts - 1)
+      {conn, feed, [%{event: "focus"} = event]} -> {conn, feed, event}
+    end
+  end
+
+  defp agent_batch(conn, query, headers) do
+    {:ok, conn, ref} =
+      Mint.HTTP.request(
+        conn,
+        "GET",
+        "/v2/agent/changes" <> query,
+        [{"accept", "application/json"} | headers],
+        nil
+      )
+
+    collect(conn, ref)
+  end
+
   ## Liveness
 
   test "an idle feed sends id-less heartbeats and stays open", ctx do
@@ -359,23 +849,31 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
   ## A slow client
 
   test "a client that stops reading holds no backlog and never blocks the relay", ctx do
-    conn = connect(ctx)
+    # Close the stream's flow-control window up front so the first change
+    # blocks, regardless of socket buffer sizes or test host load.
+    assert {:ok, conn} = Mint.HTTP2.put_settings(connect(ctx), initial_window_size: 0)
     {conn, feed} = open_feed(conn)
-    {_conn, _feed} = await_open(conn, feed)
+    {conn, _feed} = await_open(conn, feed)
     [pid] = feed_pids(ctx)
 
-    # The client reads nothing more. Far more than its windows and the socket
-    # buffers can hold arrives, so the feed's send blocks (review N1).
-    title = String.duplicate("x", 200_000)
+    forward(ctx.relay, "m1", 1)
 
-    for n <- 1..60 do
-      {micros, _} = :timer.tc(fn -> forward(ctx.relay, "m#{n}", n, title) end)
+    assert eventually(fn ->
+             case Process.info(pid, :current_stacktrace) do
+               {:current_stacktrace, stack} ->
+                 Enum.any?(stack, &match?({Plug.Conn, :chunk, _, _}, &1))
+
+               nil ->
+                 false
+             end
+           end)
+
+    # These commits wake the watcher while the first send is still blocked.
+    for n <- 2..40 do
+      {micros, _} = :timer.tc(fn -> forward(ctx.relay, "m#{n}", n) end)
       # Each write commits promptly: the relay never waits on the feed.
       assert micros < 2_000_000
     end
-
-    # Small commits while the send is blocked: each wakes the watcher.
-    for n <- 61..260, do: forward(ctx.relay, "m#{n}", n)
 
     {micros, {:ok, _}} = :timer.tc(fn -> ChangeLog.head(:sys.get_state(ctx.relay).store, "A") end)
     assert micros < 1_000_000
@@ -389,6 +887,7 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
     assert Enum.count(messages, &match?({:change_log, _, _}, &1)) <= 1
     {:memory, memory} = Process.info(pid, :memory)
     assert memory < 64_000_000
+    Mint.HTTP.close(conn)
   end
 
   ## Ends that are not the server's shutdown (review of #207)

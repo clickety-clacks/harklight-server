@@ -875,6 +875,11 @@ defmodule AttentionServer.Relay do
             state = reschedule_bounce_sweep(state)
             schedule_change_log_prune(state.store, 0)
 
+            state =
+              if state.store.change_log,
+                do: AttentionServer.AgentAPI.FeedActivity.reset(state),
+                else: state
+
             {:ok, state}
 
           error ->
@@ -1334,6 +1339,10 @@ defmodule AttentionServer.Relay do
                   do: close_focus_streams(next, device_key),
                   else: next
 
+              if store.change_log and permission == :see and enabled do
+                AttentionServer.AgentAPI.Focus.notify_grant(person, device_key)
+              end
+
               {:reply, :ok, next}
 
             _ ->
@@ -1748,6 +1757,10 @@ defmodule AttentionServer.Relay do
   defp dispatch_call({:focus_stream_attach, key, worker}, _from, state) when is_pid(worker) do
     case focus_authorized_person(state.store.engine, key, :see) do
       {:ok, person} ->
+        if existing = Map.get(state.focus_streams, worker) do
+          Process.demonitor(existing.monitor, [:flush])
+        end
+
         monitor = Process.monitor(worker)
         stream = %{key: key, person: person, monitor: monitor}
         next = put_focus_stream(state, worker, stream)
@@ -3603,6 +3616,10 @@ defmodule AttentionServer.Relay do
     end
   end
 
+  defp dispatch_info({:agent_feed_activity, action, scope}, %{store: %{change_log: true}} = state) do
+    {:noreply, AttentionServer.AgentAPI.FeedActivity.handle_info(action, scope, state)}
+  end
+
   defp dispatch_info(:change_log_prune, state) do
     before_ms = state.clock.() - @change_log_retention_ms
 
@@ -5391,7 +5408,7 @@ defmodule AttentionServer.Relay do
         &Engine.request_line(&1, key, raw, state.clock.())
       )
 
-    {next_engine, touched} = request_availability(state, key, next_engine, touched)
+    {next_engine, touched} = request_availability(state, key, next_engine, touched, nil)
 
     operation_id =
       case JSON.decode_line(raw) do
@@ -5489,7 +5506,7 @@ defmodule AttentionServer.Relay do
             {drop_upload_ids(next_engine, created_ids), [], []}
           end
 
-        {next_engine, touched} = request_availability(state, key, next_engine, touched)
+        {next_engine, touched} = request_availability(state, key, next_engine, touched, request_frame)
 
         touched =
           if touched do
@@ -5560,10 +5577,10 @@ defmodule AttentionServer.Relay do
     end)
   end
 
-  defp request_availability(state, key, engine, touched) do
+  defp request_availability(state, key, engine, touched, frame) do
     transition = fn current ->
       next = with_coverage_availability(state, key, current, touched)
-      {with_initial_origin_availability(state, key, next), nil}
+      {initial_delivery_availability(state, key, next, frame), nil}
     end
 
     if touched do
@@ -7291,6 +7308,28 @@ defmodule AttentionServer.Relay do
     end
   end
 
+  defp initial_delivery_availability(
+         %{store: %{change_log: true}} = state,
+         key,
+         engine,
+         %{"type" => "forward", "message" => message}
+       )
+       when is_map(message) do
+    with {:ok, person} <- Engine.authorized_person(engine, key),
+         item = {person, message["sender_id"], message["message_id"]},
+         false <- Map.has_key?(state.store.engine.messages, item),
+         %{agent_api_v2: true, origin: ^key, accepted_seq: seq, session_handle: session}
+         when is_binary(session) <- Map.get(engine.messages, item) do
+      listening = AttentionServer.AgentAPI.FeedActivity.listening?(state, {person, key, session})
+      Engine.agent_feed_delivery_availability(engine, person, seq, listening)
+    else
+      _ -> with_initial_origin_availability(state, key, engine)
+    end
+  end
+
+  defp initial_delivery_availability(state, key, engine, _frame),
+    do: with_initial_origin_availability(state, key, engine)
+
   defp with_initial_origin_availability(state, key, next_engine) do
     case Engine.authorized_person(next_engine, key) do
       {:ok, person} ->
@@ -7861,6 +7900,14 @@ defmodule AttentionServer.Relay do
 
       _ ->
         state
+    end
+  end
+
+  @doc false
+  def agent_focus(state, person, key) do
+    case focus_authorized_person(state.store.engine, key, :see) do
+      {:ok, ^person} -> {:ok, focus_list(state, person)}
+      _ -> {:error, :forbidden}
     end
   end
 

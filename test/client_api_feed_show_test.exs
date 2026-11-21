@@ -63,7 +63,7 @@ defmodule AttentionServer.ClientAPIFeedShowTest do
            certfile: Path.join(certs, "server.pem"),
            keyfile: Path.join(certs, "server.key"),
            cacertfile: Path.join(certs, "ca.pem"),
-           routes: [ClientAPI.Reads, ClientAPI.Feed]
+           routes: [ClientAPI.Reads, ClientAPI.Feed, AttentionServer.AgentAPI.Feed]
          ]},
         id: make_ref()
       )
@@ -111,6 +111,28 @@ defmodule AttentionServer.ClientAPIFeedShowTest do
   defp heartbeat_fast do
     Application.put_env(:attention_server, :client_api_feed_heartbeat_ms, 50)
     on_exit(fn -> Application.delete_env(:attention_server, :client_api_feed_heartbeat_ms) end)
+  end
+
+  test "a held show reaches the device feed but not the same key's agent feed", ctx do
+    heartbeat_fast()
+    client = connect(ctx.port, ctx.certs, "a1")
+    {client, client_feed} = open_feed(client, "?after=#{head(ctx.relay)}")
+    {client, client_feed} = await_open(client, client_feed)
+
+    agent = connect(ctx.port, ctx.certs, "a1")
+
+    {:ok, agent, ref} =
+      Mint.HTTP.request(agent, "GET", "/v2/agent/changes", [{"accept", "text/event-stream"}], nil)
+
+    agent_feed = %{ref: ref, buffer: "", status: nil, headers: [], done: false}
+    {agent, agent_feed} = await_open(agent, agent_feed)
+    assert client_feed.status == 200 and agent_feed.status == 200
+
+    assert {:ok, %{"delivery" => "held"}} = push_view(ctx.relay, "chat")
+    {_client, _client_feed, event, _prior} = until_show(client, client_feed)
+    assert %{event: "show", data: %{"target" => "chat"}} = event
+    {_agent, _agent_feed, agent_events} = events(agent, agent_feed, 3)
+    assert agent_events == List.duplicate(%{event: "heartbeat", data: %{}}, 3)
   end
 
   defmodule PausedStream do

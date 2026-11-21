@@ -78,7 +78,21 @@ defmodule AttentionServer.ClientAPI.Idempotency do
   @doc "The stored receipt for `{person, key}`, if any."
   @spec lookup(struct(), String.t(), String.t()) ::
           {:ok, receipt() | nil} | {:error, :disabled | term()}
-  def lookup(%AttentionServer.Store{change_log: true, db: db}, person, key)
+  def lookup(store, person, key) do
+    case lookup_encoded(store, person, key) do
+      {:ok, %{body: body} = receipt} ->
+        case JSON.decode_line(body <> "\n") do
+          {:ok, decoded} when is_map(decoded) -> {:ok, %{receipt | body: decoded}}
+          _ -> {:error, :corrupt_receipt}
+        end
+
+      other ->
+        other
+    end
+  end
+
+  @doc false
+  def lookup_encoded(%AttentionServer.Store{change_log: true, db: db}, person, key)
       when is_binary(person) and is_binary(key) do
     with :ok <- ensure(db),
          {:ok, row} <-
@@ -89,22 +103,13 @@ defmodule AttentionServer.ClientAPI.Idempotency do
              [person, key, now() - @retention_ms]
            ) do
       case row do
-        nil ->
-          {:ok, nil}
-
-        [digest, status, body] ->
-          case JSON.decode_line(body <> "\n") do
-            {:ok, decoded} when is_map(decoded) ->
-              {:ok, %{digest: digest, status: status, body: decoded}}
-
-            _ ->
-              {:error, :corrupt_receipt}
-          end
+        nil -> {:ok, nil}
+        [digest, status, body] -> {:ok, %{digest: digest, status: status, body: body}}
       end
     end
   end
 
-  def lookup(%AttentionServer.Store{}, _person, _key), do: {:error, :disabled}
+  def lookup_encoded(%AttentionServer.Store{}, _person, _key), do: {:error, :disabled}
 
   @doc """
   Stores the outcome of `{person, key}`. A receipt that already exists is kept:
