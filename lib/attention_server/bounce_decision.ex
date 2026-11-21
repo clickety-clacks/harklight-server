@@ -596,7 +596,7 @@ defmodule AttentionServer.BounceDecision do
         case Map.get(engine.origin_sessions, {person, origin, handle}) do
           %{gone: false} = session ->
             if Map.get(record, :agent_api_v2, false) or
-                 match?(%{"advisory_v1" => true, "unsupported_reason" => nil}, session.support),
+                 match?(%{"advisory_v1" => true, "unsupported_reason" => nil}, Map.get(session, :support)),
                do: :supported,
                else: :unsupported
 

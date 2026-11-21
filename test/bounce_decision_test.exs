@@ -388,6 +388,22 @@ defmodule AttentionServer.BounceDecisionTest do
     assert selection(terminal_at_due)["reason"] == "terminal"
   end
 
+  test "an undeclared session supports v2 advisories and leaves legacy messages pending" do
+    {engine, _record} = fixture()
+    engine = update_in(engine.origin_sessions[advisory_feed_key()], &Map.delete(&1, :support))
+    selected = score(engine, 0.9, 1_050)
+    due_at = selection(selected)["due_at_ms"]
+
+    pending = BounceDecision.evaluate_due(selected, due_at)
+    assert selection(pending)["decision"] == "pending"
+    assert BounceDecision.advisory_cursor(pending, @person, @origin, @handle) == 0
+
+    v2 = put_in(selected.messages[key()][:agent_api_v2], true)
+    bounced = BounceDecision.evaluate_due(v2, due_at)
+    assert selection(bounced)["decision"] == "bounced"
+    assert BounceDecision.advisory_cursor(bounced, @person, @origin, @handle) == 1
+  end
+
   test "unsupported sessions retain due work; original-session fetch and ack stay separate" do
     {engine, _record} = fixture(supported?: false)
     selected = score(engine, 0.9, 1_050)
