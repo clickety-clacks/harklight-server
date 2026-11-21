@@ -28,7 +28,7 @@ defmodule AttentionServer.ClientAPI.Feed do
   @max_limit 500
 
   @impl true
-  def routes, do: [{"GET", ["changes"], :changes, stream: true}]
+  def routes, do: [{"GET", ["changes"], :changes, stream: true, granted_agent: true}]
 
   def changes(conn, %Context{} = ctx) do
     conn = fetch_query_params(conn)
@@ -140,6 +140,7 @@ defmodule AttentionServer.ClientAPI.FeedStep do
     # A principal that no longer authenticates reads nothing, even on a
     # connection opened before its access ended.
     with {:ok, _} <- authorized(state, principal),
+         :ok <- ChangeLog.ranks_available(state.store, person),
          {:ok, rows, more, position} <- ChangeLog.read(state.store, person, cursor, limit) do
       context = %{
         engine: state.store.engine,

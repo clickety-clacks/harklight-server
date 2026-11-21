@@ -557,32 +557,42 @@ defmodule AttentionServer.ClientAPI.Resources do
   def ranks(%Engine{} = engine, person, view, previous \\ %{}) when is_map(previous) do
     entries = view_entries(view)
     reply_levels = view_reply_entries(view)
-    listed = listed_units(engine, person, view)
-    listed_items = for {:item, id, _key, _section, _group} <- listed, into: MapSet.new(), do: id
+    {listed, listed_count} = listed_units(engine, person, view)
 
     # The view lists every item in the usual case; walking the person's items
     # is needed only when it does not (a progress message, or no view yet).
-    resolved = Map.get(engine.route_b_index.resolved_messages_by_person, person, :gb_trees.empty())
+    resolved =
+      Map.get(engine.route_b_index.resolved_messages_by_person, person, :gb_trees.empty())
 
     total =
       Map.get(engine.route_b_index.unresolved_count_by_person, person, 0) +
         :gb_trees.size(resolved)
 
     unlisted =
-      if MapSet.size(listed_items) >= total, do: [], else: unlisted_units(engine, person, listed_items)
+      if listed_count >= total do
+        []
+      else
+        listed_items = for {:item, id, _, _, _} <- listed, into: MapSet.new(), do: id
+        unlisted_units(engine, person, listed_items)
+      end
 
     units = listed ++ unlisted
     keys = rank_keys(previous, Enum.map(units, &unit_id/1))
 
     Enum.reduce(units, %{}, fn
       {:item, id, {_, sender, message_id}, section, group}, acc ->
+        entry = Map.get(entries, {sender, message_id}, %{})
+
         rank =
           %{"key" => Map.fetch!(keys, id), "section" => section}
           |> put_present("group", group)
-          |> put_view_fields(Map.get(entries, {sender, message_id}, %{}))
-          |> put_present("_thread", view_thread(Map.get(entries, {sender, message_id})))
+          |> put_view_fields(entry)
+          |> put_present("_thread", view_thread(entry))
 
-        Map.update(acc, id, rank, &Map.merge(rank, Map.take(&1, ["_reply"])))
+        case acc do
+          %{^id => %{"_reply" => reply}} -> Map.put(acc, id, Map.put(rank, "_reply", reply))
+          _ -> Map.put(acc, id, rank)
+        end
 
       {:reply, id, key, row, _} = unit, acc ->
         reply = %{
@@ -640,23 +650,25 @@ defmodule AttentionServer.ClientAPI.Resources do
   # Today's list rows, in order, as rank units, including every chat-reply row
   # (round 7: clients choose which reply rows to draw).
   defp listed_units(engine, person, %{list_items: rows}) when is_list(rows) do
-    {units, _seen} =
-      Enum.reduce(rows, {[], MapSet.new()}, fn row, {units, seen} ->
+    {units, _seen, count} =
+      Enum.reduce(rows, {[], MapSet.new(), 0}, fn row, {units, seen, count} ->
         with %{"sender_id" => sender, "message_id" => message_id} <- row,
              key = {person, sender, message_id},
              %{accepted_seq: _} = record <- Map.get(engine.messages, key),
              {:ok, unit} <- list_unit(row, item_id(record), key, record),
-             false <- MapSet.member?(seen, unit_id(unit)) do
-          {[unit | units], MapSet.put(seen, unit_id(unit))}
+             id = unit_id(unit),
+             false <- MapSet.member?(seen, id) do
+          count = if elem(unit, 0) == :item, do: count + 1, else: count
+          {[unit | units], MapSet.put(seen, id), count}
         else
-          _ -> {units, seen}
+          _ -> {units, seen, count}
         end
       end)
 
-    Enum.reverse(units)
+    {Enum.reverse(units), count}
   end
 
-  defp listed_units(_engine, _person, _view), do: []
+  defp listed_units(_engine, _person, _view), do: {[], 0}
 
   defp list_unit(%{"kind" => "message"} = row, id, key, record) do
     {section, group} =
@@ -763,33 +775,60 @@ defmodule AttentionServer.ClientAPI.Resources do
     |> put_present("due_at_ms", time_ms(entry["due_at"]))
   end
 
+  @max_rank_key_bytes 48
+
   @doc """
   Assigns rank keys to `ordered_ids` (first first). Keys sort
   ascending, bytewise. The longest run of ids whose `previous` keys are already
   in order keeps them. Every other id gets a new key between its kept
-  neighbours, so a single move rewrites a single key.
+  neighbours, so a single move normally rewrites a single key. If a gap
+  requires an overlong key, the order is spread again with short keys.
   """
   def rank_keys(previous, ordered_ids) when is_map(previous) and is_list(ordered_ids) do
-    candidates =
-      ordered_ids
-      |> Enum.with_index()
-      |> Enum.flat_map(fn {id, index} ->
-        case Map.get(previous, id) do
-          "1" <> fraction = key when fraction != "" ->
-            if valid_fraction?(fraction), do: [{index, key}], else: []
-
-          _ ->
-            []
-        end
-      end)
-
-    if length(candidates) == length(ordered_ids) and increasing?(candidates) do
-      # Nothing moved: every id keeps its key (the change log's usual re-rank).
-      ordered_ids |> Enum.zip(Enum.map(candidates, &elem(&1, 1))) |> Map.new()
+    if map_size(previous) == length(ordered_ids) and previous_in_order?(ordered_ids, previous, "") do
+      previous
     else
-      reassign(ordered_ids, candidates)
+      candidates =
+        ordered_ids
+        |> Enum.with_index()
+        |> Enum.reduce([], fn {id, index}, acc ->
+          case Map.get(previous, id) do
+            key when is_binary(key) ->
+              if valid_rank_key?(key), do: [{index, key} | acc], else: acc
+
+            _ ->
+              acc
+          end
+        end)
+        |> Enum.reverse()
+
+      keys = reassign(ordered_ids, candidates)
+
+      if Enum.any?(keys, fn {_id, key} -> byte_size(key) > @max_rank_key_bytes end) do
+        Map.new(spread("", nil, ordered_ids))
+      else
+        keys
+      end
     end
   end
+
+  defp previous_in_order?([], _previous, _last), do: true
+
+  defp previous_in_order?([id | ids], previous, last) do
+    case previous do
+      %{^id => key} when is_binary(key) and key > last ->
+        valid_rank_key?(key) and previous_in_order?(ids, previous, key)
+
+      _ ->
+        false
+    end
+  end
+
+  defp valid_rank_key?(<<"1", fraction::binary>> = key)
+       when byte_size(fraction) > 0 and byte_size(key) <= @max_rank_key_bytes,
+       do: valid_fraction?(fraction)
+
+  defp valid_rank_key?(_key), do: false
 
   defp increasing?([{_, first} | rest]) do
     {ok, _} =
@@ -803,29 +842,32 @@ defmodule AttentionServer.ClientAPI.Resources do
   defp increasing?([]), do: true
 
   defp reassign(ordered_ids, candidates) do
-    kept = candidates |> longest_increasing() |> Map.new()
+    # An insertion or deletion can leave every remaining key in order.
+    kept = if increasing?(candidates), do: candidates, else: longest_increasing(candidates)
+    assign_rank_gaps(kept, ordered_ids, 0, "", %{})
+  end
 
-    {assigned, pending, low} =
-      ordered_ids
-      |> Enum.with_index()
-      |> Enum.reduce({[], [], ""}, fn {id, index}, {assigned, pending, low} ->
-        case Map.get(kept, index) do
-          nil ->
-            {assigned, [id | pending], low}
+  defp assign_rank_gaps([], ids, _offset, low, assigned) do
+    Enum.into(spread(low, nil, ids), assigned)
+  end
 
-          "1" <> fraction = key ->
-            fresh = spread(low, fraction, Enum.reverse(pending))
-            {[{id, key} | fresh ++ assigned], [], fraction}
-        end
+  defp assign_rank_gaps([{index, "1" <> high = key} | kept], ids, offset, low, assigned) do
+    {gap, [id | remaining]} = Enum.split(ids, index - offset)
+
+    assigned =
+      Enum.reduce(spread(low, high, gap), Map.put(assigned, id, key), fn {id, key}, acc ->
+        Map.put(acc, id, key)
       end)
 
-    Map.new(spread(low, nil, Enum.reverse(pending)) ++ assigned)
+    assign_rank_gaps(kept, remaining, index + 1, high, assigned)
   end
 
-  defp valid_fraction?(fraction) do
-    not String.ends_with?(fraction, "0") and
-      fraction |> :binary.bin_to_list() |> Enum.all?(&(digit_value(&1) != nil))
+  defp valid_fraction?(<<digit, rest::binary>>)
+       when digit in ?0..?9 or digit in ?A..?Z or digit in ?a..?z do
+    if rest == "", do: digit != ?0, else: valid_fraction?(rest)
   end
+
+  defp valid_fraction?(_fraction), do: false
 
   # Patience sorting: the longest strictly increasing subsequence by key, in
   # O(n log n). The tails live in an :array, which updates in O(log n); a

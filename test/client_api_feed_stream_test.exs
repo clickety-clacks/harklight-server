@@ -240,10 +240,7 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
     forward(ctx.relay, "m1", 1)
 
     assert {:ok, _} =
-             ChangeLog.prune(
-               :sys.get_state(ctx.relay).store,
-               System.system_time(:millisecond) + 1
-             )
+             ClientAPIFeedClient.prune_changes(ctx.relay, System.system_time(:millisecond) + 1)
 
     conn = connect(ctx)
     {conn, feed} = open_feed(conn, "?after=0")
@@ -464,10 +461,7 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
     forward(ctx.relay, "m3", 3)
 
     assert {:ok, _} =
-             ChangeLog.prune(
-               :sys.get_state(ctx.relay).store,
-               System.system_time(:millisecond) + 1
-             )
+             ClientAPIFeedClient.prune_changes(ctx.relay, System.system_time(:millisecond) + 1)
 
     :erlang.resume_process(pid)
 

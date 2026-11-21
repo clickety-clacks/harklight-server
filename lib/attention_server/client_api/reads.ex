@@ -45,10 +45,10 @@ defmodule AttentionServer.ClientAPI.Reads do
   @impl true
   def routes do
     [
-      {"GET", ["inbox"], :get_inbox},
-      {"GET", ["items", :item_id], :get_item},
-      {"GET", ["items", :item_id, "entries"], :get_entries},
-      {"GET", ["items", :item_id, "revisions", :n], :get_revision},
+      {"GET", ["inbox"], :get_inbox, granted_agent: true},
+      {"GET", ["items", :item_id], :get_item, granted_agent: true},
+      {"GET", ["items", :item_id, "entries"], :get_entries, granted_agent: true},
+      {"GET", ["items", :item_id, "revisions", :n], :get_revision, granted_agent: true},
       {"GET", ["settings"], :get_settings},
       {"GET", ["me"], :get_me},
       {"GET", ["files", :file_id], :get_file}
@@ -275,6 +275,7 @@ defmodule AttentionServer.ClientAPI.Reads do
     with {:ok, principal} <- principal(engine, key),
          {:ok, limit} <- limit(params),
          {:ok, after_key} <- page(params),
+         :ok <- ChangeLog.ranks_available(state.store, principal.person),
          {:ok, _} <- head(state, principal.person) do
       person = principal.person
       {shown, more?} = rank_page(state, person, after_key, limit)
@@ -309,6 +310,7 @@ defmodule AttentionServer.ClientAPI.Reads do
 
     with {:ok, principal} <- principal(engine, key),
          {:ok, item_key} <- Resources.item_key(engine, principal.person, item_id),
+         :ok <- ChangeLog.ranks_available(state.store, principal.person),
          {:ok, position} <- head(state, principal.person),
          context = %{engine: engine, store: state.store, view: view(state, principal.person)},
          {:ok, rank} <- item_rank(context, principal.person, item_id) do
@@ -475,6 +477,16 @@ defmodule AttentionServer.ClientAPI.Reads do
     end
   end
 
+  defp principal(engine, %{kind: :agent, person: person, key: key}) do
+    case Engine.agent_identity(engine, key) do
+      {:ok, ^person, _id, _revision} ->
+        {:ok, %{person: person, key: key, kind: :agent, senders: MapSet.new()}}
+
+      _ ->
+        {:error, :unauthorized}
+    end
+  end
+
   defp principal(engine, %{kind: :device, key: key}), do: principal(engine, key)
 
   defp principal(engine, key) when is_binary(key) do
@@ -497,14 +509,19 @@ defmodule AttentionServer.ClientAPI.Reads do
         {page, more?}
 
       {:error, :none} ->
-        candidates =
-          state
-          |> computed_ranks(person)
-          |> Enum.sort_by(fn {_item_id, rank} -> rank["key"] end)
-          |> Enum.drop_while(fn {_item_id, rank} -> after_key && rank["key"] <= after_key end)
-          |> Enum.take(limit + 1)
+        case computed_ranks(state.store.engine, state.store, view(state, person), person) do
+          {:ok, ranks} ->
+            candidates =
+              ranks
+              |> Enum.sort_by(fn {_item_id, rank} -> rank["key"] end)
+              |> Enum.drop_while(fn {_item_id, rank} -> after_key && rank["key"] <= after_key end)
+              |> Enum.take(limit + 1)
 
-        {Enum.take(candidates, limit), length(candidates) > limit}
+            {Enum.take(candidates, limit), length(candidates) > limit}
+
+          {:error, reason} ->
+            throw({:client_api_read, reason})
+        end
 
       _ ->
         throw({:client_api_read, :storage_unavailable})
@@ -519,34 +536,24 @@ defmodule AttentionServer.ClientAPI.Reads do
       {:ok, rank} ->
         {:ok, rank}
 
-      # A store that fails is a storage failure, never a reason to compute
-      # every rank inside the relay.
-      {:error, reason} when reason not in [:not_found, :disabled] ->
-        {:error, :storage_unavailable}
+      {:error, reason} when reason in [:not_found, :disabled] ->
+        with {:ok, ranks} <- computed_ranks(engine, store, view, person) do
+          case Map.fetch(ranks, item_id) do
+            {:ok, rank} -> {:ok, rank}
+            :error -> {:error, :not_found}
+          end
+        end
 
       _ ->
-        case engine
-             |> Resources.ranks(person, view, stored_unit_keys(store, person))
-             |> Map.fetch(item_id) do
-          {:ok, rank} -> {:ok, rank}
-          :error -> {:error, :not_found}
-        end
+        {:error, :storage_unavailable}
     end
   end
 
-  defp computed_ranks(state, person),
-    do:
-      Resources.ranks(
-        state.store.engine,
-        person,
-        view(state, person),
-        stored_unit_keys(state.store, person)
-      )
-
-  defp stored_unit_keys(store, person) do
+  defp computed_ranks(engine, store, view, person) do
     case ChangeLog.rank_keys(store, person) do
-      {:ok, keys} -> keys
-      _ -> %{}
+      {:ok, keys} -> {:ok, Resources.ranks(engine, person, view, keys)}
+      {:error, :disabled} -> {:ok, Resources.ranks(engine, person, view, %{})}
+      _ -> {:error, :storage_unavailable}
     end
   end
 

@@ -19,6 +19,7 @@ defmodule AttentionServer.APNSRuntimeConfigTest do
     "ATTENTION_SERVER_APNS_KEY_PATH" => "/protected/sandbox-key",
     "ATTENTION_SERVER_APNS_KEY_ID" => "SANDBOX001",
     "ATTENTION_SERVER_APNS_TEAM_ID" => "TESTTEAMID",
+    "ATTENTION_SERVER_APNS_ATTEMPT_TIMEOUT_MS" => nil,
     "ATTENTION_SERVER_APNS_PRODUCTION_KEY_PATH" => nil,
     "ATTENTION_SERVER_APNS_PRODUCTION_KEY_ID" => nil,
     "ATTENTION_SERVER_DEPLOYMENT_MODE" => nil,
@@ -107,6 +108,22 @@ defmodule AttentionServer.APNSRuntimeConfigTest do
                    [key_path: "/protected/production-key", key_id: "PRODKEY001"]
         end
       )
+    end)
+  end
+
+  test "runtime APNs attempt timeout is optional and accepts positive milliseconds" do
+    variable = "ATTENTION_SERVER_APNS_ATTEMPT_TIMEOUT_MS"
+
+    with_env(@server_env, fn ->
+      refute Keyword.has_key?(runtime_apns_config(), :attempt_timeout_ms)
+
+      with_env(%{variable => "1500"}, fn ->
+        assert runtime_apns_config()[:attempt_timeout_ms] == 1_500
+      end)
+
+      with_env(%{variable => "0"}, fn ->
+        refute Keyword.has_key?(runtime_apns_config(), :attempt_timeout_ms)
+      end)
     end)
   end
 

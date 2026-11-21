@@ -4,6 +4,8 @@ defmodule AttentionServer.ClientAPI.Principal do
 
   - `kind: :device` — an enrolled device on the device listener. `key` is the
     device key (the SHA-256 of its certificate's public key).
+  - `kind: :agent` — an owner-registered agent on the device listener.
+    `key` is the enrolled agent key.
   - `kind: :browser` — a signed-in browser session on the web origin. `key` is
     the owner key the session was issued for, `session_id` the session's id
     (the raw session hash, as the Relay and the change log's closing notices
@@ -19,7 +21,7 @@ defmodule AttentionServer.ClientAPI.Principal do
 
   @type t :: %__MODULE__{
           person: String.t(),
-          kind: :device | :browser,
+          kind: :device | :browser | :agent,
           key: String.t(),
           session_id: binary() | nil,
           owner_revision: term()
@@ -30,10 +32,8 @@ defmodule AttentionServer.ClientAPI.Auth do
   @moduledoc """
   The two client API authenticators. Both resolve to a `ClientAPI.Principal`.
 
-  - **Device**: the device listener's TLS handshake admits only a currently
-    enrolled certificate (`EnrolledLeafVerify.device/1`). Each request checks the
-    enrollment again, so a device revoked while its connection is open has its
-    next request refused.
+  - **Device listener**: enrolled device and owner-registered agent
+    certificates. Each request checks enrollment again.
   - **Browser**: the existing sign-in cookie session on the web origin. A
     missing, ended or expired session is refused. Writes also require the exact
     web origin, as the existing browser routes do.
@@ -45,16 +45,31 @@ defmodule AttentionServer.ClientAPI.Auth do
   @cookie "__Host-harklight"
   @write_methods ~w(POST PUT PATCH DELETE)
 
-  @doc "The device principal for a request on the device listener."
+  @doc "The enrolled principal for a request on the device listener."
   @spec device(Plug.Conn.t(), GenServer.server()) ::
           {:ok, Principal.t()} | {:error, :unauthorized}
   def device(conn, relay) do
     with %{ssl_cert: der} when is_binary(der) <- Plug.Conn.get_peer_data(conn),
-         {:ok, key} <- DeviceIdentity.from_certificate(der),
-         {:ok, person} when is_binary(person) <- Relay.device_person(relay, key) do
-      {:ok, %Principal{person: person, kind: :device, key: key}}
+         {:ok, key} <- DeviceIdentity.from_certificate(der) do
+      enrolled_principal(relay, key)
     else
       _ -> {:error, :unauthorized}
+    end
+  end
+
+  defp enrolled_principal(relay, key) do
+    case Relay.device_person(relay, key) do
+      {:ok, person} when is_binary(person) ->
+        {:ok, %Principal{person: person, kind: :device, key: key}}
+
+      _ ->
+        case Relay.agent_identity(relay, key) do
+          {:ok, person, _id, _revision} ->
+            {:ok, %Principal{person: person, kind: :agent, key: key}}
+
+          _ ->
+            {:error, :unauthorized}
+        end
     end
   end
 
