@@ -816,19 +816,21 @@ defmodule AttentionServer.ClientAPI.Writes do
   # the renderer the reads and the feed use. Its rev is the newest of the
   # facts folded into it.
   defp render_entry(state, who, person, seq) do
-    engine = state.store.engine
-    view = Map.get(state.priority_views, person)
+    Projection.run({:entry, Resources.entry_id(seq)}, fn ->
+      engine = state.store.engine
+      view = Map.get(state.priority_views, person)
 
-    with %{} = entry <- Resources.entry_for_fact(engine, person, seq, view),
-         {:ok, rev} <- entry_rev(state, person, entry),
-         context = %{engine: engine, store: state.store, view: view},
-         row = %{rev: rev, kind: :entry, resource_id: ChangeLog.entry_resource(seq)},
-         {:ok, rendered} <- FeedRenderer.render(context, who, row) do
-      {:ok, rendered}
-    else
-      {:error, _} = error -> error
-      _ -> {:error, :not_found}
-    end
+      with %{} = entry <- Resources.entry_for_fact(engine, person, seq, view),
+           {:ok, rev} <- entry_rev(state, person, entry),
+           context = %{engine: engine, store: state.store, view: view},
+           row = %{rev: rev, kind: :entry, resource_id: ChangeLog.entry_resource(seq)},
+           {:ok, rendered} <- FeedRenderer.render(context, who, row) do
+        {:ok, rendered}
+      else
+        {:error, _} = error -> error
+        _ -> {:error, :not_found}
+      end
+    end)
   end
 
   defp entry_rev(state, person, entry) do
