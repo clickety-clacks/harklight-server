@@ -141,6 +141,7 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
     assert {:error, :disabled} = AgentChangeLog.head(state.store, {"A", ctx.keys["a1"]})
     assert state.store.engine.route_b_index.sent_messages_by_agent == %{}
     assert state.store.engine.route_b_index.agent_entry_pages == %{}
+    assert state.store.engine.route_b_index.origin_reply_positions == %{}
     refute Map.has_key?(state.priority_views["A"], :reply_entries_by_item)
 
     opted_in = AttentionServer.RouteBIndex.enable_agent_feed(state.store.engine)
@@ -201,7 +202,7 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
     assert get(ctx, "a2", path).status == 404
   end
 
-  test "bounded entries retain an agent reply's cached priority", ctx do
+  test "bounded entries render an agent reply's committed priority", ctx do
     id = forward(ctx, "a1", 1, @first_session)
 
     turn =
@@ -233,16 +234,22 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
       "sender_id" => "app:test",
       "message_id" => "item-1",
       "conversation_seq" => position,
-      "priority" => "now",
       "score" => 0.9
     }
 
     :sys.replace_state(ctx.relay, fn state ->
-      update_in(state.priority_views["A"], fn view ->
-        view
-        |> Map.put(:replies, [reply])
-        |> Map.put(:reply_entries_by_item, %{{"app:test", "item-1"} => %{position => reply}})
-      end)
+      {engine, positions} =
+        AttentionServer.Engine.retain_reply_scores(state.store.engine, "A", [reply], true)
+
+      assert {:ok, store} =
+               AttentionServer.Store.commit(
+                 state.store,
+                 engine,
+                 %{person: "A", actor: "server", action: "reply_group_scores"},
+                 positions
+               )
+
+      %{state | store: store}
     end)
 
     path = "/v2/agent/messages/" <> id <> "/entries?limit=1"
@@ -254,7 +261,7 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
 
     assert %{
              "entries" => [
-               %{"position" => ^position, "priority" => %{"level" => "now", "score" => 0.9}}
+               %{"position" => ^position, "priority" => %{"level" => "normal", "score" => 0.9}}
              ],
              "older" => true
            } = body

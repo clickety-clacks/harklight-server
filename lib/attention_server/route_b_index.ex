@@ -6,6 +6,7 @@ defmodule AttentionServer.RouteBIndex do
       resolved_messages_by_person: %{},
       sent_messages_by_agent: %{},
       agent_entry_pages: %{},
+      origin_reply_positions: %{},
       agent_results: %{},
       conversations_by_item: %{},
       agent_feed?: false,
@@ -106,6 +107,8 @@ defmodule AttentionServer.RouteBIndex do
   def entry_page(index, key),
     do: Map.get(index.agent_entry_pages, key, :gb_trees.empty())
 
+  def origin_reply_positions(index, key), do: Map.get(index.origin_reply_positions, key, [])
+
   def result_revision(index, key, position),
     do: Enum.count(Map.get(index.agent_results, key, []), &(&1 <= position))
 
@@ -146,15 +149,23 @@ defmodule AttentionServer.RouteBIndex do
 
   defp put_agent_message(index, _key, _previous, _record), do: index
 
-  defp put_agent_entry(%{agent_feed?: true} = index, key, seq, %{"kind" => kind})
+  defp put_agent_entry(%{agent_feed?: true} = index, key, seq, %{"kind" => kind} = payload)
        when kind in ~w(discussion reply revision result availability retraction) do
     page = Map.get(index.agent_entry_pages, key, :gb_trees.empty())
     index = put_in(index.agent_entry_pages[key], :gb_trees.enter(-seq, seq, page))
 
-    if kind == "result",
-      do:
-        update_in(index.agent_results, &Map.update(&1, key, [seq], fn seqs -> [seq | seqs] end)),
-      else: index
+    case payload do
+      %{"kind" => "result"} ->
+        update_in(index.agent_results, &Map.update(&1, key, [seq], fn seqs -> [seq | seqs] end))
+
+      %{"kind" => "reply", "author" => "origin"} ->
+        update_in(index.origin_reply_positions, fn replies ->
+          Map.update(replies, key, [seq], fn positions -> [seq | positions] end)
+        end)
+
+      _ ->
+        index
+    end
   end
 
   defp put_agent_entry(index, _key, _seq, _payload), do: index

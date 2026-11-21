@@ -4881,6 +4881,11 @@ defmodule AttentionServer.Engine do
   # the very same durable transition as its read position. An empty aggregate
   # leaves the last valid group score intact, including on the final read.
   def retain_reply_scores(engine, person, entries) do
+    {next, []} = retain_reply_scores(engine, person, entries, false)
+    next
+  end
+
+  def retain_reply_scores(engine, person, entries, track_entries?) do
     scores =
       Enum.reduce(entries, %{}, fn
         %{"sender_id" => sender, "message_id" => id, "conversation_seq" => seq, "score" => score},
@@ -4901,14 +4906,23 @@ defmodule AttentionServer.Engine do
           )
       )
 
-    history =
-      Enum.reduce(keys, engine.reply_group_history, fn key, history ->
+    {history, changed_entries} =
+      Enum.reduce(keys, {engine.reply_group_history, []}, fn key, {history, changed_entries} ->
         current = Map.get(scores, key, %{})
         prior = Map.get(history, key, %{scores: %{}})
-        Map.put(history, key, update_reply_aggregate(prior, current))
+
+        changed_entries =
+          if track_entries? do
+            AttentionServer.ReplyPriority.changed_score_entries(person, prior.scores, current) ++
+              changed_entries
+          else
+            changed_entries
+          end
+
+        {Map.put(history, key, update_reply_aggregate(prior, current)), changed_entries}
       end)
 
-    %{engine | reply_group_history: history}
+    {%{engine | reply_group_history: history}, changed_entries}
   end
 
   defp retain_read_group_score(engine, key, position) do

@@ -1050,8 +1050,14 @@ defmodule AttentionServer.Store do
     end
   end
 
-  def commit(store, next, audit) do
-    case do_commit(store, next, audit) do
+  @doc """
+  Commits engine state and its change-log rows. A publisher can supply the
+  canonical entry keys whose projection changed without changing their facts.
+  """
+  def commit(store, next, audit, projected_entries \\ []) do
+    projected_entries = if store.change_log, do: projected_entries, else: []
+
+    case do_commit(store, next, audit, projected_entries) do
       {:ok, committed} = result ->
         Persistence.committed(committed)
         result
@@ -1061,19 +1067,19 @@ defmodule AttentionServer.Store do
     end
   end
 
-  defp do_commit(%__MODULE__{engine: old} = store, next, _audit) when old == next,
+  defp do_commit(%__MODULE__{engine: old} = store, next, _audit, []) when old == next,
     do: {:ok, store}
 
-  defp do_commit(%__MODULE__{db: nil} = store, next, _audit),
+  defp do_commit(%__MODULE__{db: nil} = store, next, _audit, _projected_entries),
     do: {:ok, %{store | engine: next}}
 
-  defp do_commit(%__MODULE__{} = store, next, audit) do
+  defp do_commit(%__MODULE__{} = store, next, audit, projected_entries) do
     cond do
-      progress_only?(store.engine, next) and valid_progress?(next) ->
+      projected_entries == [] and progress_only?(store.engine, next) and valid_progress?(next) ->
         commit_progress(store, next, audit)
 
       valid_state?(next, :incremental) ->
-        commit_durable(store, next, audit)
+        commit_durable(store, next, audit, projected_entries)
 
       true ->
         Diagnostics.failure(
@@ -1088,7 +1094,12 @@ defmodule AttentionServer.Store do
     end
   end
 
-  defp commit_durable(%__MODULE__{db: db, version: version} = store, next, audit) do
+  defp commit_durable(
+         %__MODULE__{db: db, version: version} = store,
+         next,
+         audit,
+         projected_entries \\ []
+       ) do
     # Large-data preparation runs here, against the previous durable base this
     # process already holds, so only changed subterms are walked and nothing
     # large is copied to or from the worker. The worker needs the generation and
@@ -1106,7 +1117,9 @@ defmodule AttentionServer.Store do
     # already holds, and written in the snapshot's transaction.
     log =
       if store.change_log do
-        changed = AttentionServer.ChangeLog.changed_resources(store.engine, next)
+        changed =
+          AttentionServer.ChangeLog.changed_resources(store.engine, next, projected_entries)
+
         pending = AttentionServer.ChangeLog.changes(store.engine, next, changed)
 
         seeded =

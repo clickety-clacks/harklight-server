@@ -460,14 +460,37 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
     identity = {target["sender_id"], target["message_id"], position}
     publish_reply_score(ctx.relay, identity, 0.9)
 
-    check_priority_replay(
-      ctx,
-      id,
-      position,
-      %{"level" => "normal", "score" => %JSON.DecimalToken{raw: "0.9"}},
-      %{"level" => "normal", "score" => %JSON.DecimalToken{raw: "0.7"}},
-      fn -> publish_reply_score(ctx.relay, identity, 0.7) end
-    )
+    after_priority = %{"level" => "normal", "score" => %JSON.DecimalToken{raw: "0.7"}}
+
+    current =
+      check_priority_replay(
+        ctx,
+        id,
+        position,
+        %{"level" => "normal", "score" => %JSON.DecimalToken{raw: "0.9"}},
+        after_priority,
+        fn -> publish_reply_score(ctx.relay, identity, 0.7) end
+      )
+
+    publish_reply_score(ctx.relay, identity, 0.7)
+
+    assert current.agent ==
+             reply_snapshot(connect(ctx), "/v2/agent/messages/#{id}/entries", position)
+
+    assert current.person == reply_snapshot(connect(ctx), "/v2/items/#{id}/entries", position)
+
+    check_priority_replay(ctx, id, position, after_priority, %{"level" => "normal"}, fn ->
+      assert %{"type" => "ok"} =
+               request(
+                 ctx.relay,
+                 "origin",
+                 Map.merge(target, %{
+                   "type" => "conversation_read",
+                   "op_id" => op(4),
+                   "read_through_conversation_seq" => position
+                 })
+               )
+    end)
   end
 
   defp priority_reply(ctx) do
@@ -557,6 +580,7 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
 
     assert current.agent["rev"] > agent_reply["rev"]
     assert current.person["rev"] > person_reply["rev"]
+    current
   end
 
   defp prepare_score_publication(ctx) do
@@ -628,7 +652,8 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
 
   defp reply_snapshot(conn, path, position) do
     assert {:ok, conn, ref} = Mint.HTTP.request(conn, "GET", path, [], nil)
-    {_conn, snapshot} = collect(conn, ref)
+    {conn, snapshot} = collect(conn, ref)
+    Mint.HTTP.close(conn)
     assert snapshot.status == 200
     assert {:ok, %{"entries" => entries}} = JSON.decode_line(snapshot.body <> "\n")
     Enum.find(entries, &(&1["position"] == position))

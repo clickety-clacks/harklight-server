@@ -5967,13 +5967,17 @@ defmodule AttentionServer.Relay do
     previous = Map.get(state.priority_views, person)
     engine_entries = Map.get(view, :engine_entries, Map.get(view, :entries, []))
 
-    next = Engine.retain_reply_scores(state.store.engine, person, engine_entries)
+    {next, projected_entries} =
+      Engine.retain_reply_scores(
+        state.store.engine,
+        person,
+        engine_entries,
+        state.store.change_log
+      )
 
-    case commit(state.store, next, %{
-           person: person,
-           actor: "server",
-           action: "reply_group_scores"
-         }) do
+    audit = %{person: person, actor: "server", action: "reply_group_scores"}
+
+    case Store.commit(state.store, next, audit, projected_entries) do
       {:ok, store} ->
         publish_priority_view(
           %{state | store: store},

@@ -24,7 +24,7 @@ defmodule AttentionServer.ClientAPI.Resources do
   This module reads engine state only. It never changes it.
   """
 
-  alias AttentionServer.{BounceDecision, Conversation, Engine, LargeData, Message}
+  alias AttentionServer.{BounceDecision, Conversation, Engine, LargeData, Message, ReplyPriority}
 
   @viewer "_viewer"
   @sources "_sources"
@@ -973,8 +973,7 @@ defmodule AttentionServer.ClientAPI.Resources do
   `position`. Receipts and acknowledgments are not entries; they show on the
   entry they refer to as `delivery`.
   """
-  def entries(%Engine{} = engine, {person, sender, id} = key, view \\ nil) do
-    reply_entries = view |> view_reply_entries() |> Map.get({sender, id}, %{})
+  def entries(%Engine{} = engine, {person, _, _} = key, _view \\ nil) do
     record = Map.fetch!(engine.messages, key)
     item_id = item_id(record)
 
@@ -1002,7 +1001,7 @@ defmodule AttentionServer.ClientAPI.Resources do
     context = %{
       by_event_id: by_event_id,
       results: results,
-      replies: reply_entries,
+      key: key,
       engine: engine
     }
 
@@ -1093,7 +1092,7 @@ defmodule AttentionServer.ClientAPI.Resources do
   end
 
   @doc false
-  def agent_entry(engine, {person, _, _} = key, record, position, reply_entries) do
+  def agent_entry(engine, {person, _, _} = key, record, position) do
     with %{key: ^key, payload: payload} <- Map.get(engine.conversation_events, {person, position}) do
       index = engine.route_b_index
       id = payload["in_reply_to"]
@@ -1108,7 +1107,7 @@ defmodule AttentionServer.ClientAPI.Resources do
       context = %{
         by_event_id: by_event_id,
         results: results,
-        replies: reply_entries,
+        key: key,
         engine: engine,
         person: person
       }
@@ -1163,19 +1162,8 @@ defmodule AttentionServer.ClientAPI.Resources do
 
         # An agent reply carries today's per-reply priority (round 7).
         if author == "origin" do
-          view_entry = Map.get(context.replies, seq)
-
-          score =
-            case view_entry do
-              %{"score" => score} when is_number(score) -> score
-              _ -> nil
-            end
-
-          Map.put(
-            entry,
-            "priority",
-            put_present(%{"level" => reply_level(view_entry, record)}, "score", score)
-          )
+          priority = ReplyPriority.project(context.engine, context.key, seq, record)
+          Map.put(entry, "priority", priority)
         else
           entry
         end
