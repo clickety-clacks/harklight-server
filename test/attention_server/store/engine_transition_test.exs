@@ -32,7 +32,7 @@ defmodule AttentionServer.Store.EngineTransitionTest do
     changed = ChangeLog.changed_resources(engine, next, touched)
 
     expected = ChangeLog.changed_resources(engine, next)
-    assert changed == expected
+    assert Map.take(changed, Map.keys(expected)) == expected
     assert ChangeLog.changes(engine, next, changed) == ChangeLog.changes(engine, next)
     assert ChangeLog.new_resources(engine, next, changed) == ChangeLog.new_resources(engine, next)
 

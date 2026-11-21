@@ -206,7 +206,66 @@ defmodule AttentionServer.ChangeLog do
           acc
       end)
 
-    %{changed | entries: Enum.sort(changed.entries)}
+    item_candidates =
+      Enum.reduce(touched, MapSet.new(changed.messages), fn
+        {:row, :chat_read_positions, key}, acc ->
+          MapSet.put(acc, key)
+
+        {:row, :conversation_events, key}, acc ->
+          Enum.reduce([old.conversation_events[key], next.conversation_events[key]], acc, fn
+            %{key: item}, items -> MapSet.put(items, item)
+            _, items -> items
+          end)
+
+        _, acc ->
+          acc
+      end)
+
+    counts = for {person, _, _} <- item_candidates, into: MapSet.new(), do: person
+
+    changed
+    |> Map.update!(:entries, &Enum.sort/1)
+    |> Map.put(
+      :read_positions,
+      changed_candidates(item_candidates, old.chat_read_positions, next.chat_read_positions)
+    )
+    |> Map.put(
+      :summaries,
+      changed_candidates(
+        item_candidates,
+        old.route_b_index.conversation_summary_by_item,
+        next.route_b_index.conversation_summary_by_item
+      )
+    )
+    |> Map.put(
+      :counts,
+      changed_candidates(
+        counts,
+        old.route_b_index.unresolved_count_by_person,
+        next.route_b_index.unresolved_count_by_person
+      )
+    )
+    |> Map.put(:settings, touched_settings(touched, old, next))
+  end
+
+  defp changed_candidates(keys, old, next) do
+    Enum.reject(keys, &(Map.fetch(old, &1) === Map.fetch(next, &1)))
+  end
+
+  defp touched_settings(touched, old, next) do
+    Enum.flat_map(touched, fn
+      {:row, :bounce_levels, person} ->
+        changed_candidates([person], old.bounce_levels, next.bounce_levels)
+
+      {:row, :push_bindings, {person, _} = key} ->
+        if Map.fetch(old.push_bindings, key) === Map.fetch(next.push_bindings, key),
+          do: [],
+          else: [person]
+
+      _ ->
+        []
+    end)
+    |> Enum.uniq()
   end
 
   defp collect_change(changed, kind, key, old, next) do
@@ -220,11 +279,15 @@ defmodule AttentionServer.ChangeLog do
     item_keys =
       [
         changed.messages,
-        changed_keys(old.chat_read_positions, next.chat_read_positions),
-        changed_keys(
-          old.route_b_index.conversation_summary_by_item,
-          next.route_b_index.conversation_summary_by_item
-        ),
+        Map.get_lazy(changed, :read_positions, fn ->
+          changed_keys(old.chat_read_positions, next.chat_read_positions)
+        end),
+        Map.get_lazy(changed, :summaries, fn ->
+          changed_keys(
+            old.route_b_index.conversation_summary_by_item,
+            next.route_b_index.conversation_summary_by_item
+          )
+        end),
         changed.bounce,
         changed.opened,
         subscription_keys(old, next)
@@ -242,19 +305,25 @@ defmodule AttentionServer.ChangeLog do
       Enum.map(changed.entries, fn {person, seq} -> {person, {:entry, entry_resource(seq)}} end)
 
     counts =
-      old.route_b_index.unresolved_count_by_person
-      |> changed_keys(next.route_b_index.unresolved_count_by_person)
+      Map.get_lazy(changed, :counts, fn ->
+        changed_keys(
+          old.route_b_index.unresolved_count_by_person,
+          next.route_b_index.unresolved_count_by_person
+        )
+      end)
       |> Enum.map(&{&1, {:counts, "counts"}})
 
     settings =
-      [
-        changed_keys(old.bounce_levels, next.bounce_levels),
-        old.push_bindings
-        |> changed_keys(next.push_bindings)
-        |> Enum.map(fn {person, _device} -> person end)
-      ]
-      |> Enum.concat()
-      |> Enum.uniq()
+      Map.get_lazy(changed, :settings, fn ->
+        [
+          changed_keys(old.bounce_levels, next.bounce_levels),
+          old.push_bindings
+          |> changed_keys(next.push_bindings)
+          |> Enum.map(fn {person, _device} -> person end)
+        ]
+        |> Enum.concat()
+        |> Enum.uniq()
+      end)
       |> Enum.map(&{&1, {:settings, "settings"}})
 
     (Enum.sort(items) ++ entries ++ counts ++ settings)

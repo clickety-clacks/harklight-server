@@ -1430,7 +1430,16 @@ defmodule AttentionServer.Store do
 
     seeded =
       Map.new(pending, fn {person, _} ->
-        {person, AttentionServer.ChangeLog.seeded?(store.engine, person)}
+        seeded =
+          if touched do
+            Map.get(store.engine.persons, person, 0) > 0 or
+              Map.get(store.engine.conversation_highs, person, 0) > 0 or
+              Map.has_key?(store.engine.bounce_levels, person)
+          else
+            AttentionServer.ChangeLog.seeded?(store.engine, person)
+          end
+
+        {person, seeded}
       end)
 
     %{
