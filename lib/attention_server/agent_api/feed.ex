@@ -107,13 +107,27 @@ defmodule AttentionServer.AgentAPI.FeedStep do
     targets = resolve_answers(store.engine, person, targets)
 
     with {:ok, next} <- Engine.agent_feed_delivered(store.engine, person, key, targets),
-         {:ok, store} <-
-           Store.commit(store, next, %{person: person, actor: key, action: "agent_feed_delivered"}) do
+         audit = delivery_audit(store.engine, next, person, key),
+         {:ok, store} <- Store.commit(store, next, audit) do
       {:ok, store}
     else
       {:error, reason, _store} -> delivery_failure(reason)
       {:error, reason} -> delivery_failure(reason)
     end
+  end
+
+  defp delivery_audit(previous, next, person, key) do
+    # ACK1 only appends conversation facts for this person. Pass their
+    # canonical keys to the shared commit without inspecting retained history.
+    before = Map.get(previous.conversation_highs, person, 0)
+    latest = Map.get(next.conversation_highs, person, 0)
+
+    %{
+      person: person,
+      actor: key,
+      action: "agent_feed_delivered",
+      conversation_entry_keys: for(seq <- (before + 1)..latest//1, do: {person, seq})
+    }
   end
 
   defp delivery_failure(reason) do
