@@ -711,7 +711,7 @@ revoked elsewhere.
     "Closing": {
       "type": "object",
       "required": ["reason"],
-      "properties": { "reason": { "enum": ["revoked", "account_paused", "server_shutdown", "cursor_expired", "storage_unavailable"] } }
+      "properties": { "reason": { "enum": ["revoked", "account_paused", "server_shutdown", "cursor_expired", "storage_unavailable", "internal_error"] } }
     }
   }
 }
@@ -742,6 +742,9 @@ revoked elsewhere.
     - `revoked` and `account_paused`: stop, and re-enrol or show "paused";
     - `server_shutdown` and `storage_unavailable`: reconnect with
       `Last-Event-ID` after backoff;
+    - `internal_error`: show “live updates paused” with the error details
+      and keep the last applied cursor. Resume only on user action or a
+      return to the foreground.
     - `cursor_expired`: the position fell out of retention mid-stream, so
       rebaseline as for `410`.
   - A held show for this device may arrive as an id-less `event: show`
@@ -754,6 +757,9 @@ revoked elsewhere.
   page's `rev`, and reopen the feed using that cursor.
 - **Feed ID:** the feed's `Request-Id` is its ID. The server logs it at open,
   and at close with its `closing` reason, or `client_closed`.
+- A failed projection ends the feed step without skipping a change or
+  advancing past it. A JSON batch returns `500 internal_error` with no
+  cursor. SSE sends an id-less `closing` with `internal_error` and ends.
 
 ## 6.1 The log is compacted
 
@@ -826,7 +832,7 @@ visible text. Its `attention` member changes:
         "error": { "enum": ["not_found", "invalid_field", "stale_request", "already_answered",
                             "already_retracted", "already_closed", "not_answered", "idempotency_conflict", "precondition_failed",
                             "cursor_expired", "unauthorized", "forbidden", "retry_later",
-                            "storage_unavailable", "payload_too_large", "unsupported",
+                            "storage_unavailable", "internal_error", "payload_too_large", "unsupported",
                             "account_paused"] },
         "field": { "type": "string" },
         "retryable": { "type": "boolean" },
@@ -854,11 +860,23 @@ visible text. Its `attention` member changes:
 | `cursor_expired` | 410 | false | `after` is older than retention |
 | `payload_too_large` | 413 | false | Body or file over the limit (`too_large`, `upload_cap_exceeded`) |
 | `unsupported` | 400 | false | The server does not serve this here: push with push disabled, or a reply, answer receipt or agent result on an item with no agent conversation |
+| `internal_error` | 500 | false | A server projection or render fault. Includes `Request-Id` and has no `Retry-After`. |
 | `retry_later` | 503 | true | Load shedding, with `Retry-After` |
 | `storage_unavailable` | 503 | true | The store could not commit, with `Retry-After` |
 
 No other token is sent. Error bodies never contain free-form text, message
 content, tokens or identities.
+
+The server logs the failing resource key with the `Request-Id`. A committed
+write stays committed when its response fails to render, and its effect is
+visible on the next read. Replaying the same keyed request uses the committed
+outcome without repeating the mutation. If it still cannot be rendered, the
+replay returns `internal_error`.
+
+The app, web client, Agent CLI and integrations surface `internal_error`
+in context and record it in the Error Log. Copy details includes the
+`Request-Id`, operation and token. Clients retry only on user action or
+return to the foreground. The CLI can try again on the next invocation.
 
 ## 8. Carried over from today, and dropped
 
@@ -1485,6 +1503,12 @@ of `GET /v2/agent/messages` with the same session filter, rebuild each open
 item's entries and advisory state, then reopen at the first message page's
 position. On ordinary reconnect, send `Last-Event-ID`. A filtered feed
 can skip agent-wide revisions.
+
+The §7 projection error and client retry rules also apply to every agent
+request. A projection fault returns `500 internal_error` for an agent
+batch or an id-less `closing` with reason `internal_error` for SSE.
+The server keeps the cursor before the failed change, and the agent
+surfaces the paused feed for manual resume.
 
 ```json
 {
