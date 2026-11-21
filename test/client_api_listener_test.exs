@@ -30,8 +30,22 @@ defmodule AttentionServer.ClientAPIListenerTest do
         {"POST", ["echo", :id], :echo},
         {"GET", ["boom"], :boom},
         {"GET", ["held"], :held},
-        {"GET", ["held-stream"], :held, stream: true}
+        {"GET", ["held-stream"], :held, stream: true},
+        {"GET", ["closing"], :closing, stream: true}
       ]
+    end
+
+    # Waits for the change log's closing notice for this principal, as a feed does.
+    def closing(conn, %Context{principal: principal}) do
+      :ok = AttentionServer.ChangeLog.subscribe_closing(principal)
+      send(:persistent_term.get({__MODULE__, :test}), {:closing_subscribed, self()})
+
+      receive do
+        {:client_closing, _scope, reason} ->
+          Errors.send_json(conn, 200, %{"reason" => Atom.to_string(reason)})
+      after
+        3_000 -> Errors.send_json(conn, 200, %{"reason" => "none"})
+      end
     end
 
     def whoami(conn, %Context{principal: principal, request_id: request_id}) do
@@ -394,6 +408,19 @@ defmodule AttentionServer.ClientAPIListenerTest do
       assert {:ok, _conn, %{status: 200}} = request(conn, "GET", "/v2/whoami", [cookie])
     end
 
+    test "signing out sends the closing notice to that browser's open requests", ctx do
+      assert {:ok, conn} = browser_connect(ctx, :http2)
+      headers = [{"cookie", cookie(ctx.cookie)}]
+      assert {:ok, conn, ref} = Mint.HTTP.request(conn, "GET", "/v2/closing", headers, nil)
+      assert_receive {:closing_subscribed, _pid}, 5_000
+
+      DashboardBrowserSession.end_session(ctx.sessions, ctx.cookie)
+
+      assert {:ok, _conn, response} = collect(conn, ref, %{headers: [], body: ""})
+      assert response.status == 200
+      assert json(response) == %{"reason" => "revoked"}
+    end
+
     test "signing out ends the browser's /v2 access", ctx do
       assert {:ok, conn} = browser_connect(ctx, :http2)
       cookie = {"cookie", cookie(ctx.cookie)}
@@ -525,6 +552,7 @@ defmodule AttentionServer.ClientAPIListenerTest do
       start_supervised!(
         {Relay,
          store_path: Path.join(dir, "web.sqlite3"),
+         feature_flags_path: flags_file(dir, Keyword.get(extra, :client_api_v2, false)),
          join_configuration: join,
          dashboard_origin: origin,
          enrollment_fixture_mode: true},
@@ -570,6 +598,12 @@ defmodule AttentionServer.ClientAPIListenerTest do
       cookie: cookie,
       sessions: sessions
     }
+  end
+
+  defp flags_file(dir, on?) do
+    path = Path.join(dir, "web-flags.json")
+    File.write!(path, ~s({"client_api_v2":#{on?}}))
+    path
   end
 
   defp server_opts(%{dir: dir, certs: certs}) do
