@@ -483,6 +483,19 @@ defmodule AttentionServer.ClientAPIFeedBatchTest do
     # the item's entries for each row is quadratic: about sixteen times.
     assert long_us < 8 * max(short_us, 1_000),
            "100 entries: #{short_us} us, 400 entries: #{long_us} us"
+
+    # Another Relay caller during the 400-entry catch-up waits only for one
+    # short step. Row by row, it waited about 290 ms on a test host.
+    waits =
+      for _ <- 1..3 do
+        catch_up = Task.async(fn -> FeedStep.read(ctx.relay, principal(ctx), 0, 500) end)
+        Process.sleep(1)
+        {us, _} = :timer.tc(fn -> :sys.get_state(ctx.relay) end)
+        Task.await(catch_up)
+        us
+      end
+
+    assert Enum.min(waits) < 100_000, "a concurrent Relay call waited #{Enum.min(waits)} us"
   end
 
   test "if a step's render fails, its rows render one at a time and a bad row is skipped", ctx do
