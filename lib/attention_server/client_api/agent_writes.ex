@@ -83,7 +83,7 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
           error -> refusal(error)
         end
 
-      Writes.respond(conn, result)
+      Writes.respond(conn, replay_success(ctx, result))
     else
       {:error, token, field, response} -> Errors.send_error(response, token, field: field)
       {:error, token, field} -> Errors.send_error(conn, token, field: field)
@@ -92,6 +92,33 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
 
   defp call(ctx, request),
     do: GenServer.call(ctx.relay, {:client_api, __MODULE__, request}, :infinity)
+
+  defp replay_success(ctx, {:stored, status, encoded}) do
+    case JSON.decode_line(encoded <> "\n") do
+      {:ok, receipt} when is_map(receipt) ->
+        case replay_body(ctx, receipt) do
+          {:ok, body} -> {:ok, status, body, true}
+          error -> refusal(error)
+        end
+
+      _ ->
+        refusal({:error, :storage_unavailable})
+    end
+  end
+
+  defp replay_success(_ctx, result), do: result
+
+  defp replay_body(_ctx, %{"agent_write" => 1, "item_id" => nil, "outcome" => outcome}),
+    do: {:ok, outcome}
+
+  defp replay_body(ctx, %{"agent_write" => 1, "outcome" => outcome} = receipt) do
+    with {:ok, resources} <- call(ctx, {:replay_resources, ctx.principal, receipt}) do
+      {:ok, Map.merge(outcome, resources)}
+    end
+  end
+
+  # Earlier versions stored the full success. Decode it in the HTTP process.
+  defp replay_body(_ctx, body), do: {:ok, body}
 
   defp prepare_uploads(ctx, {_, _, _, _, _, _, %{"file_ids" => [_ | _]}} = input, op_id) do
     case call(ctx, {:prepare_uploads, input, op_id}) do
@@ -145,7 +172,7 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
       :ok ->
         case lookup(state, receipt_scope, key) do
           {:ok, %{digest: ^digest, status: status, body: stored}} ->
-            {:reply, {:ok, status, stored, true}, state}
+            {:reply, {:stored, status, stored}, state}
 
           {:ok, %{}} ->
             {:reply, {:error, "idempotency_conflict", nil, false}, state}
@@ -212,6 +239,35 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
 
     {:reply, reply, state}
   end
+
+  def handle_call(
+        {:replay_resources, %{person: person, key: agent},
+         %{"item_id" => item, "include_message" => message?, "entry_position" => position}},
+        _from,
+        state
+      ) do
+    scope = {person, agent}
+
+    result =
+      with :ok <- authorize(state, scope),
+           {:ok, key} <- AgentResources.own_item_key(state, scope, item),
+           {:ok, rev} <- AgentChangeLog.head(state.store, scope),
+           {:ok, message} <- replay_message(state, scope, key, message?),
+           {:ok, entry} <- replay_entry(state, scope, key, position) do
+        {:ok, %{"rev" => rev} |> put_resource("message", message) |> put_resource("entry", entry)}
+      end
+
+    {:reply, result, state}
+  end
+
+  defp replay_message(state, scope, key, true), do: AgentResources.message(state, scope, key)
+  defp replay_message(_state, _scope, _key, false), do: {:ok, nil}
+
+  defp replay_entry(_state, _scope, _key, nil), do: {:ok, nil}
+  defp replay_entry(state, scope, key, position), do: AgentResources.entry(state, scope, key, position)
+
+  defp put_resource(body, _field, nil), do: body
+  defp put_resource(body, field, resource), do: Map.put(body, field, resource)
 
   defp receipt_scope({person, agent}), do: Idempotency.agent_scope(person, agent)
 
@@ -284,7 +340,7 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
   end
 
   defp lookup(_state, _scope, nil), do: {:ok, nil}
-  defp lookup(state, scope, key), do: Idempotency.lookup(state.store, scope, key)
+  defp lookup(state, scope, key), do: Idempotency.lookup_encoded(state.store, scope, key)
 
   defp apply_operation(
          state,
@@ -787,7 +843,21 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
   defp save(_state, _scope, nil, _digest, _body, _status), do: :ok
 
   defp save(state, scope, key, digest, body, status),
-    do: Idempotency.save(state.store, scope, key, digest, status, body)
+    do: Idempotency.save(state.store, scope, key, digest, status, compact_receipt(body))
+
+  defp compact_receipt(body) do
+    message = body["message"]
+    entry = body["entry"]
+    resource = message || entry || %{}
+
+    %{
+      "agent_write" => 1,
+      "item_id" => resource["item_id"],
+      "include_message" => is_map(message),
+      "entry_position" => entry && entry["position"],
+      "outcome" => Map.drop(body, ["message", "entry"])
+    }
+  end
 
   defp refusal({:error, token, field}), do: {:error, to_string(token), field, false}
   defp refusal({:error, token}) when is_atom(token), do: {:error, to_string(token), nil, false}
