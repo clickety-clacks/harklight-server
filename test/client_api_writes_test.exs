@@ -574,6 +574,7 @@ defmodule AttentionServer.ClientAPIWritesTest do
 
       assert item["rev"] > before and item["rev"] <= position
       assert stored_terminal(relay, "pick").answer == %{"pick" => "yes"}
+      assert stored_terminal(relay, "pick").answer_path == "choice"
       assert Enum.any?(changes_after(relay, before), &(&1.resource_id == item_resource("pick")))
 
       # The same request again is the stored response; another answer is refused.
@@ -612,7 +613,38 @@ defmodule AttentionServer.ClientAPIWritesTest do
                  )
 
         assert item["terminal"]["answer"] == %{"kind" => "reply", "text" => "Sounds good"}
+        assert stored_terminal(relay, id).answer_path == "comment"
       end
+
+      # A plain-text answer on a UI/1 screen stays distinguishable from a string result.
+      for {id, n, value, path} <- [
+            {"form-text", 44, {:comment, "blue"}, "comment"},
+            {"form-string", 45, {:result, "blue"}, "result"}
+          ] do
+        forward_message(
+          relay,
+          n,
+          %{"message_id" => id, "message_type" => "request", "answer_ui" => @form},
+          [%{"name" => "cover.png", "data_base64" => Base.encode64("not image bytes")}]
+        )
+
+        assert {:ok, 200, _, false} =
+                 Writes.answer(relay, "reader", item_id(relay, id), 1, value, key())
+
+        assert %{answer: "blue", answer_path: ^path} = stored_terminal(relay, id)
+      end
+
+      # Today's answer frame records no path: its terminal keeps today's shape.
+      assert %{"type" => "ok"} =
+               request(relay, "reader", %{
+                 "type" => "answer",
+                 "op_id" => op(46),
+                 "sender_id" => "app:test",
+                 "message_id" => "two",
+                 "answer" => "Yes"
+               })
+
+      refute Map.has_key?(stored_terminal(relay, "two"), :answer_path)
 
       GenServer.stop(relay)
     end
@@ -724,6 +756,7 @@ defmodule AttentionServer.ClientAPIWritesTest do
                Writes.answer(relay, "reader", form, 1, {:result, %{"choice" => "blue"}}, key())
 
       assert stored_terminal(relay, "form").answer == %{"choice" => "blue"}
+      assert stored_terminal(relay, "form").answer_path == "result"
 
       # Any JSON value is a result, null included, stored unchanged (round 16).
       for {id, n, result} <- [{"form-null", 42, nil}, {"form-list", 43, ["blue", 2, true]}] do
