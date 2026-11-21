@@ -104,6 +104,68 @@ defmodule AttentionServer.Store.KeyedMigrationTest do
     assert status == 0, output
   end
 
+  test "folds saved progress and advances each current change log with the anchor", %{
+    store: store
+  } do
+    assert {:ok, store} = Store.enable_change_log(store)
+    assert {:ok, engine} = Engine.setup_person(store.engine, "reader")
+    assert {:ok, engine} = Engine.setup_device(engine, "reader", "device")
+    audit = %{person: "reader", actor: "device", action: "prepare"}
+    assert {:ok, store} = Store.commit(store, engine, audit)
+    assert {:ok, next} = Engine.open_conversation(store.engine, "device")
+    assert {:ok, store} = Store.commit(store, next, audit)
+    assert store.progress_version == 1
+    generation = store.version + 1
+
+    assert {:ok, ^generation} =
+             KeyedMigration.convert_store(store, fn legacy, restored, version ->
+               assert {:error, :not_keyed} = KeyedMigration.load(legacy.db)
+               assert MapSet.member?(restored.conversation_opened, {"reader", "device"})
+               assert version == generation
+               {:ok, version}
+             end)
+
+    assert {:ok, engine, ^generation} = KeyedMigration.load(store.db)
+    assert MapSet.member?(engine.conversation_opened, {"reader", "device"})
+    assert [[0]] = rows(store.db, "SELECT COUNT(*) FROM relay_device_progress")
+    assert [[^generation]] = rows(store.db, "SELECT store_version FROM client_change_log_state")
+    assert [[^generation]] = rows(store.db, "SELECT store_version FROM agent_change_log_state")
+    assert :ok = Store.close(store)
+  end
+
+  test "a preparation failure rolls back the new keyed tables and anchor", %{
+    path: path,
+    store: store
+  } do
+    assert_raise RuntimeError, "index build failed", fn ->
+      KeyedMigration.convert_store(store, fn legacy, _, _ ->
+        assert {:error, :not_keyed} = KeyedMigration.load(legacy.db)
+        raise "index build failed"
+      end)
+    end
+
+    assert [] =
+             rows(store.db, "SELECT name FROM sqlite_schema WHERE name LIKE 'relay_record%'")
+
+    assert {:error, :not_keyed} = KeyedMigration.load(store.db)
+    assert :ok = Store.close(store)
+    assert {:ok, legacy} = Store.open(path)
+    assert legacy.version == store.version
+    assert legacy.engine == store.engine
+    assert :ok = Store.close(legacy)
+  end
+
+  defp rows(db, sql) do
+    assert {:ok, statement} = Sqlite3.prepare(db, sql)
+
+    try do
+      assert {:ok, rows} = Sqlite3.fetch_all(db, statement)
+      rows
+    after
+      :ok = Sqlite3.release(db, statement)
+    end
+  end
+
   defp stage_keyed(db, engine, identity) do
     payload = :erlang.term_to_binary({:attention_relay_keyed_state, 30, identity})
     digest = :crypto.hash(:sha256, payload)
