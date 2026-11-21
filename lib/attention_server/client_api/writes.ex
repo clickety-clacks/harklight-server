@@ -171,12 +171,20 @@ defmodule AttentionServer.ClientAPI.Writes do
     end
   end
 
-  # Today's refusal reasons, as tokens. A reason with no token is a request the
-  # client cannot fix by resending.
+  # Today's refusal reasons, as tokens (ClientAPI.Errors). A reason with no
+  # token is a request the client cannot fix by resending.
+  @reasons Map.new(
+             ~w(invalid_field bad_frame forbidden not_person not_origin unknown_message
+                not_found stale_revision closed retracted operation_conflict
+                stale_push_binding inactive_account too_large upload_cap_exceeded
+                storage_unavailable)a,
+             &{Atom.to_string(&1), &1}
+           )
+
   defp refusal(reason, reply) do
     token =
-      with true <- is_binary(reason),
-           {:ok, token} <- Errors.token_for_reason(String.to_existing_atom(reason)) do
+      with {:ok, atom} <- Map.fetch(@reasons, reason),
+           {:ok, token} <- Errors.token_for_reason(atom) do
         token
       else
         _ -> "invalid_field"
@@ -189,8 +197,6 @@ defmodule AttentionServer.ClientAPI.Writes do
       _ ->
         {:error, token}
     end
-  rescue
-    ArgumentError -> {:error, "invalid_field"}
   end
 
   defp call(relay, request),

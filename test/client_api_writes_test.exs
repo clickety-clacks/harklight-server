@@ -366,6 +366,9 @@ defmodule AttentionServer.ClientAPIWritesTest do
       assert {:error, "invalid_field", "text", false} =
                Writes.reply(relay, "reader", one, "", key())
 
+      # Today's refusals keep their tokens: the item's own origin is not its reader.
+      assert {:error, "forbidden", nil, false} = Writes.reply(relay, "origin", one, "Me", key())
+
       GenServer.stop(relay)
     end
   end
