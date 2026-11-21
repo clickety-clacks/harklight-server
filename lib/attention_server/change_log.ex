@@ -68,6 +68,22 @@ defmodule AttentionServer.ChangeLog do
     ) WITHOUT ROWID
     """,
     """
+    CREATE TABLE IF NOT EXISTS client_resource_created (
+      person_id TEXT NOT NULL,
+      resource_id TEXT NOT NULL,
+      created_at_ms INTEGER NOT NULL,
+      PRIMARY KEY (person_id, resource_id)
+    ) WITHOUT ROWID
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS client_rank_keys (
+      person_id TEXT NOT NULL,
+      resource_id TEXT NOT NULL,
+      rank_key TEXT NOT NULL,
+      PRIMARY KEY (person_id, resource_id)
+    ) WITHOUT ROWID
+    """,
+    """
     CREATE TABLE IF NOT EXISTS client_change_log_state (
       id INTEGER PRIMARY KEY CHECK (id = 1),
       store_version INTEGER NOT NULL
@@ -205,6 +221,72 @@ defmodule AttentionServer.ChangeLog do
     end)
   end
 
+  # -- closing signal ---------------------------------------------------------
+
+  @doc """
+  The client API connections `old -> next` must end, from the same commit:
+  `{{:device, key}, :revoked}` for a device revoked or removed, and
+  `{{:person, person}, :account_paused}` for an account whose delivery stopped.
+  Pure.
+  """
+  def closings(%Engine{} = old, %Engine{} = next) when old === next, do: []
+
+  def closings(%Engine{} = old, %Engine{} = next) do
+    devices =
+      if old.devices === next.devices do
+        []
+      else
+        for {key, device} <- old.devices,
+            not Map.get(device, :revoked, false),
+            match?(nil, Map.get(next.devices, key)) or
+              Map.get(Map.get(next.devices, key, %{}), :revoked, false),
+            do: {{:device, key}, :revoked}
+      end
+
+    paused =
+      if old.delivery_states === next.delivery_states do
+        []
+      else
+        for {person, "STOPPED"} <- next.delivery_states,
+            Map.get(old.delivery_states, person) != "STOPPED",
+            do: {{:person, person}, :account_paused}
+      end
+
+    devices ++ paused
+  end
+
+  @doc """
+  Tells every subscriber of each scope that its connections must end:
+  `{:client_closing, scope, reason}`. Scopes are `{:device, key}`,
+  `{:browser_session, id}` and `{:person, person}`.
+  """
+  def notify_closing(closings) when is_list(closings) do
+    if Process.whereis(@registry) do
+      Enum.each(closings, fn {scope, reason} ->
+        Registry.dispatch(@registry, {:closing, scope}, fn entries ->
+          for {pid, _} <- entries, do: send(pid, {:client_closing, scope, reason})
+        end)
+      end)
+    end
+
+    :ok
+  end
+
+  @doc """
+  The calling process (a feed) is told `{:client_closing, scope, reason}` when
+  its principal is revoked, its browser session ends or its account is paused.
+  """
+  def subscribe_closing(%{kind: :device, key: key, person: person}),
+    do: register_closing([{:device, key}, {:person, person}])
+
+  def subscribe_closing(%{kind: :browser, session_id: session_id, person: person}),
+    do: register_closing([{:browser_session, session_id}, {:person, person}])
+
+  defp register_closing(scopes) do
+    Enum.each(scopes, fn scope -> Registry.register(@registry, {:closing, scope}, nil) end)
+    :ok
+  end
+
   @doc "Whether a person already had client-visible data, which seeds their log at rev 1."
   def seeded?(%Engine{} = engine, person) do
     Enum.any?(engine.messages, fn {{p, _, _}, _} -> p == person end) or
@@ -258,7 +340,8 @@ defmodule AttentionServer.ChangeLog do
                  []
                ),
              :ok <- run(db, "DELETE FROM client_changes", []),
-             :ok <- run(db, "DELETE FROM client_resource_revs", []) do
+             :ok <- run(db, "DELETE FROM client_resource_revs", []),
+             :ok <- run(db, "DELETE FROM client_rank_keys", []) do
           run(db, "UPDATE client_change_log_state SET store_version = ? WHERE id = 1", [
             store_version
           ])
@@ -339,6 +422,12 @@ defmodule AttentionServer.ChangeLog do
                "INSERT INTO client_resource_revs (person_id, resource_id, rev) VALUES (?, ?, ?) " <>
                  "ON CONFLICT (person_id, resource_id) DO UPDATE SET rev = excluded.rev",
                [person, resource_id, rev]
+             ),
+           :ok <-
+             run(
+               db,
+               "INSERT OR IGNORE INTO client_resource_created (person_id, resource_id, created_at_ms) VALUES (?, ?, ?)",
+               [person, resource_id, now]
              ) do
         {:cont, {:ok, rev}}
       else
@@ -414,6 +503,111 @@ defmodule AttentionServer.ChangeLog do
     do: prune_rows(db, before_ms)
 
   def prune(%AttentionServer.Store{}, _before_ms), do: {:error, :disabled}
+
+  @doc """
+  When the log first wrote a row for the resource: an entry's creation time
+  for entries created while the log runs. Resources from before the cut-over
+  have none (`{:error, :not_found}`).
+  """
+  def created_at(%AttentionServer.Store{change_log: true, db: db}, person, resource_id) do
+    case one(
+           db,
+           "SELECT created_at_ms FROM client_resource_created WHERE person_id = ? AND resource_id = ?",
+           [person, resource_id]
+         ) do
+      {:ok, [at_ms]} -> {:ok, at_ms}
+      {:ok, nil} -> {:error, :not_found}
+      error -> error
+    end
+  end
+
+  def created_at(%AttentionServer.Store{}, _person, _resource_id), do: {:error, :disabled}
+
+  @doc "The rank key last emitted for each of the person's items, by item resource ID."
+  def rank_keys(%AttentionServer.Store{change_log: true, db: db}, person) do
+    with {:ok, rows} <-
+           all(db, "SELECT resource_id, rank_key FROM client_rank_keys WHERE person_id = ?", [
+             person
+           ]) do
+      {:ok, Map.new(rows, fn [resource_id, key] -> {resource_id, key} end)}
+    end
+  end
+
+  def rank_keys(%AttentionServer.Store{}, _person), do: {:error, :disabled}
+
+  @doc """
+  Records the person's current rank keys (`%{item_resource => key}`, from the
+  reads component's ranking) in one transaction. Every item whose key changed
+  gets an `:item` row, and items no longer ranked lose their stored key.
+  Unchanged keys write nothing. Returns the person's head.
+  """
+  def append_ranks(%AttentionServer.Store{change_log: true, db: db, engine: engine}, person, keys)
+      when is_map(keys) do
+    with {:ok, previous} <- rank_keys(%AttentionServer.Store{change_log: true, db: db}, person) do
+      changed = for {id, key} <- keys, Map.get(previous, id) != key, do: id
+      dropped = for {id, _} <- previous, not Map.has_key?(keys, id), do: id
+
+      if changed == [] and dropped == [] do
+        head(db, engine, person)
+      else
+        write_ranks(db, engine, person, keys, Enum.sort(changed), dropped)
+      end
+    end
+  end
+
+  def append_ranks(%AttentionServer.Store{}, _person, _keys), do: {:error, :disabled}
+
+  defp write_ranks(db, engine, person, keys, changed, dropped) do
+    now = System.system_time(:millisecond)
+
+    result =
+      with :ok <- Sqlite3.execute(db, "BEGIN IMMEDIATE"),
+           {:ok, {head, floor, seed_rev}} <-
+             load_meta(db, person, fn -> seeded?(engine, person) end),
+           {:ok, head} <- write_rows(db, person, Enum.map(changed, &{:item, &1}), head, now),
+           :ok <-
+             run(
+               db,
+               "INSERT INTO client_change_log_meta (person_id, head, floor, seed_rev) VALUES (?, ?, ?, ?) " <>
+                 "ON CONFLICT (person_id) DO UPDATE SET head = excluded.head",
+               [person, head, floor, seed_rev]
+             ),
+           :ok <- store_rank_keys(db, person, Map.take(keys, changed), dropped),
+           :ok <- Sqlite3.execute(db, "COMMIT") do
+        {:ok, head}
+      end
+
+    case result do
+      {:ok, head} ->
+        notify(%{person => head})
+        {:ok, head}
+
+      error ->
+        _ = Sqlite3.execute(db, "ROLLBACK")
+        error
+    end
+  end
+
+  defp store_rank_keys(db, person, keys, dropped) do
+    upserts =
+      Enum.map(keys, fn {id, key} ->
+        {"INSERT INTO client_rank_keys (person_id, resource_id, rank_key) VALUES (?, ?, ?) " <>
+           "ON CONFLICT (person_id, resource_id) DO UPDATE SET rank_key = excluded.rank_key",
+         [person, id, key]}
+      end)
+
+    deletes =
+      Enum.map(dropped, fn id ->
+        {"DELETE FROM client_rank_keys WHERE person_id = ? AND resource_id = ?", [person, id]}
+      end)
+
+    Enum.reduce_while(upserts ++ deletes, :ok, fn {sql, params}, :ok ->
+      case run(db, sql, params) do
+        :ok -> {:cont, :ok}
+        error -> {:halt, error}
+      end
+    end)
+  end
 
   @doc "The person's position: every change up to and including it has been written."
   @spec head(term(), struct(), person) :: {:ok, position} | {:error, term()}

@@ -331,4 +331,171 @@ defmodule AttentionServer.ChangeLogTest do
     assert {:ok, [_ | _], false, _} = log(relay, last)
     GenServer.stop(relay)
   end
+
+  test "entries created while the log runs record when they were first written", ctx do
+    relay = start(ctx, false)
+    setup_people(relay)
+    forward(relay, "chat", 2)
+
+    assert %{"type" => "ok"} =
+             request(relay, "reader", %{
+               "type" => "discussion",
+               "op_id" => op(3),
+               "sender_id" => "app:test",
+               "message_id" => "chat",
+               "request_revision" => 1,
+               "text" => "Before the cut-over"
+             })
+
+    GenServer.stop(relay)
+
+    relay = start(ctx)
+    assert {:ok, [], false, _} = log(relay, 1)
+    before = System.system_time(:millisecond)
+
+    assert %{"type" => "ok"} =
+             request(relay, "reader", %{
+               "type" => "discussion",
+               "op_id" => op(4),
+               "sender_id" => "app:test",
+               "message_id" => "chat",
+               "request_revision" => 1,
+               "text" => "After the cut-over"
+             })
+
+    assert {:ok, changes, false, _} = log(relay, 1)
+    assert [%{resource_id: new_entry}] = Enum.filter(changes, &(&1.kind == :entry))
+    assert {:ok, at_ms} = ChangeLog.created_at(store(relay), "A", new_entry)
+    assert at_ms >= before
+
+    # The pre-cut-over entry has no recorded time, and a later row for the
+    # same resource keeps the first time.
+    assert {:entry, seq} = ChangeLog.decode_resource(new_entry)
+
+    assert {:error, :not_found} =
+             ChangeLog.created_at(store(relay), "A", ChangeLog.entry_resource(seq - 1))
+
+    GenServer.stop(relay)
+  end
+
+  test "rank keys write item rows only for items whose key changed", ctx do
+    relay = start(ctx)
+    setup_people(relay)
+    forward(relay, "m1", 2)
+    forward(relay, "m2", 3)
+    store = store(relay)
+    assert {:ok, %{}} = ChangeLog.rank_keys(store, "A")
+    assert :ok = ChangeLog.subscribe("A")
+
+    first = %{item("m1") => "a", item("m2") => "b"}
+    start_head = head(relay)
+    assert {:ok, ranked_head} = ChangeLog.append_ranks(store(relay), "A", first)
+    assert_receive {:change_log, "A", ^ranked_head}, 1_000
+    assert {:ok, ranked, false, ^ranked_head} = log(relay, start_head)
+    assert Enum.map(ranked, & &1.resource_id) |> Enum.sort() == Enum.sort(Map.keys(first))
+    assert Enum.all?(ranked, &(&1.kind == :item))
+    assert {:ok, ^first} = ChangeLog.rank_keys(store(relay), "A")
+
+    # Unchanged keys write nothing.
+    assert {:ok, ^ranked_head} = ChangeLog.append_ranks(store(relay), "A", first)
+
+    # Moving one item writes one row; an item no longer ranked loses its key.
+    assert {:ok, moved_head} = ChangeLog.append_ranks(store(relay), "A", %{item("m1") => "c"})
+
+    assert {:ok, [%{kind: :item, resource_id: moved}], false, ^moved_head} =
+             log(relay, ranked_head)
+
+    assert moved == item("m1")
+    assert {:ok, %{} = keys} = ChangeLog.rank_keys(store(relay), "A")
+    assert keys == %{item("m1") => "c"}
+    assert :ok = ChangeLog.unsubscribe("A")
+    GenServer.stop(relay)
+  end
+
+  test "the relay prunes rows past the 30-day retention window", ctx do
+    offset = :atomics.new(1, [])
+    clock = fn -> System.system_time(:millisecond) + :atomics.get(offset, 1) end
+
+    assert {:ok, relay} =
+             Relay.start_link(
+               store_path: ctx.path,
+               agent_fixture_mode: true,
+               feature_flags_path: ctx.flags,
+               clock: clock
+             )
+
+    setup_people(relay)
+    forward(relay, "m1", 2)
+    last = head(relay)
+
+    # Within the window nothing is pruned.
+    send(relay, :change_log_prune)
+    assert {:ok, [_ | _], false, ^last} = log(relay, 0)
+
+    :atomics.put(offset, 1, 31 * 24 * 60 * 60 * 1_000)
+    send(relay, :change_log_prune)
+    assert {:error, :cursor_expired} = log(relay, 0)
+    assert {:ok, [], false, ^last} = log(relay, last)
+    GenServer.stop(relay)
+  end
+
+  test "revoking a device signals only that device's subscribers to close", ctx do
+    relay = start(ctx)
+    setup_people(relay)
+    me = self()
+
+    reader =
+      spawn_link(fn ->
+        :ok = ChangeLog.subscribe_closing(%{kind: :device, key: "reader", person: "A"})
+        send(me, :subscribed)
+
+        receive do
+          message -> send(me, {:reader, message})
+        end
+      end)
+
+    origin =
+      spawn_link(fn ->
+        :ok = ChangeLog.subscribe_closing(%{kind: :device, key: "origin", person: "A"})
+        send(me, :subscribed)
+
+        receive do
+          message -> send(me, {:origin, message})
+        end
+      end)
+
+    assert_receive :subscribed
+    assert_receive :subscribed
+    assert :ok = Relay.revoke_device(relay, "reader")
+
+    assert_receive {:reader, {:client_closing, {:device, "reader"}, :revoked}}, 1_000
+    refute_receive {:origin, _}, 200
+    Enum.each([reader, origin], &Process.unlink/1)
+    GenServer.stop(relay)
+  end
+
+  test "ending a browser session signals its feeds to close", ctx do
+    relay = start(ctx)
+    setup_people(relay)
+
+    :ok =
+      ChangeLog.subscribe_closing(%{kind: :browser, session_id: "session-1", person: "A"})
+
+    assert :ok = Relay.end_browser_session(relay, "session-1")
+    assert_receive {:client_closing, {:browser_session, "session-1"}, :revoked}, 1_000
+    GenServer.stop(relay)
+  end
+
+  test "a paused account and a removed device are closings of the same commit" do
+    {:ok, engine} = Engine.setup_person(Engine.new(), "A")
+    {:ok, engine} = Engine.setup_device(engine, "A", "phone")
+    assert ChangeLog.closings(engine, engine) == []
+
+    paused = %{engine | delivery_states: Map.put(engine.delivery_states, "A", "STOPPED")}
+    assert ChangeLog.closings(engine, paused) == [{{:person, "A"}, :account_paused}]
+    assert ChangeLog.closings(paused, paused) == []
+
+    removed = %{engine | devices: Map.delete(engine.devices, "phone")}
+    assert ChangeLog.closings(engine, removed) == [{{:device, "phone"}, :revoked}]
+  end
 end
