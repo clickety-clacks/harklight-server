@@ -1,6 +1,191 @@
 defmodule AttentionServer.Store.KeyedValidation do
   @moduledoc false
 
+  alias AttentionServer.{Conversation, LargeData, Store.RecordCodec}
+
+  @scalar_fields [
+    :agent_cursor_key,
+    :browser_sign_in_clock_high_water,
+    :jev_endpoint,
+    :jev_model,
+    :pending_clock_high_water,
+    :relay_instance_id
+  ]
+
+  @single_keys [
+    :agents,
+    :algorithm_choices,
+    :bounce_levels,
+    :browser_sign_ins,
+    :conversation_highs,
+    :delivery_states,
+    :devices,
+    :enrollment_read_grants,
+    :free_order_highs,
+    :hosted_accounts,
+    :join_invitations,
+    :maintainer_grants,
+    :owners,
+    :pending_enrollments,
+    :pending_history,
+    :persons,
+    :uploads
+  ]
+
+  @pair_keys [:conversation_cursors, :cursors, :push_bindings, :sender_grants, :subscriptions]
+  @ordered_keys [:events, :conversation_events]
+  @item_keys [:bounce_revisions, :chat_read_positions, :messages, :reply_group_history]
+  @actor_keys [:origin_sessions, :receipts, :source_report_grants]
+  @origin_seq_keys [:origin_actions, :origin_receipts]
+
+  # A new persisted field must gain an explicit address and validation rule.
+  def preflight(old, next, %MapSet{} = touched) do
+    checked(fn ->
+      if Enum.all?(touched, &valid_fact_shape?(next, &1)) and origin_feeds?(old, next, touched),
+        do: :ok,
+        else: {:error, :invalid_fact}
+    end)
+  end
+
+  # Keep exceptions from invalid proposed facts inside validation, before any
+  # file, SQL, or notification work can begin.
+  def checked(validate) do
+    validate.()
+  rescue
+    _ -> {:error, :invalid_fact}
+  end
+
+  defp valid_fact_shape?(next, address) do
+    known_address?(address) and
+      case RecordCodec.lookup(next, address) do
+        {:ok, value} -> valid_fact_value?(next, address, value) and LargeData.valid_refs?(value)
+        :error -> not match?({:field, _}, address)
+      end
+  end
+
+  defp known_address?({:field, field}), do: field in @scalar_fields
+  defp known_address?({:row, field, key}) when field in @single_keys, do: is_binary(key)
+
+  defp known_address?({:row, field, {person, actor}}) when field in @pair_keys,
+    do: is_binary(person) and is_binary(actor)
+
+  defp known_address?({:row, field, {person, seq}}) when field in @ordered_keys,
+    do: is_binary(person) and positive_integer?(seq)
+
+  defp known_address?({:row, field, key}) when field in @item_keys or field in @actor_keys,
+    do: binary_triple?(key)
+
+  defp known_address?({:row, :bounce_waiting_routes, {person, origin, handle}}),
+    do: is_binary(person) and is_binary(origin) and (is_nil(handle) or is_binary(handle))
+
+  defp known_address?({:row, field, {person, origin, seq}}) when field in @origin_seq_keys,
+    do: is_binary(person) and is_binary(origin) and positive_integer?(seq)
+
+  defp known_address?({:member, :retired_owner_keys, key}), do: is_binary(key)
+
+  defp known_address?({:member, :conversation_opened, {person, actor}}),
+    do: is_binary(person) and is_binary(actor)
+
+  defp known_address?({:member, :opened_revisions, {person, sender, item, revision}}),
+    do: binary_triple?({person, sender, item}) and positive_integer?(revision)
+
+  defp known_address?({:origin_feed, {person, origin}, part}) do
+    is_binary(person) and is_binary(origin) and
+      case part do
+        :high -> true
+        {:entry, seq} -> positive_integer?(seq)
+        {:delivery_ack, seq} -> positive_integer?(seq)
+        _ -> false
+      end
+  end
+
+  defp known_address?({:advisory, scope, part}) do
+    binary_triple?(scope) and
+      case part do
+        :high -> true
+        {:entry, seq} -> positive_integer?(seq)
+        {:receipt, id} -> is_binary(id)
+        _ -> false
+      end
+  end
+
+  defp known_address?(_), do: false
+
+  defp positive_integer?(value), do: is_integer(value) and value > 0
+  defp nonnegative_integer?(value), do: is_integer(value) and value >= 0
+
+  defp binary_triple?({a, b, c}), do: is_binary(a) and is_binary(b) and is_binary(c)
+  defp binary_triple?(_), do: false
+
+  defp valid_fact_value?(_engine, {:field, field}, value)
+       when field in [:browser_sign_in_clock_high_water, :pending_clock_high_water],
+       do: nonnegative_integer?(value)
+
+  defp valid_fact_value?(_engine, {:row, field, _}, value)
+       when field in [:persons, :conversation_highs],
+       do: nonnegative_integer?(value)
+
+  defp valid_fact_value?(engine, {:row, :origin_actions, key}, value),
+    do: Conversation.valid_origin_action?(engine, key, value)
+
+  defp valid_fact_value?(_engine, _address, _value), do: true
+
+  defp origin_feeds?(old, next, touched) do
+    # Existing entries are immutable. Given contiguous old history, only the
+    # changed positions and the number of new rows are needed to prove coverage.
+    counts =
+      Enum.reduce(touched, %{}, fn
+        {:origin_feed, scope, :high}, counts ->
+          Map.put_new(counts, scope, 0)
+
+        {:origin_feed, scope, {:entry, seq}}, counts ->
+          appended =
+            if is_nil(get_in(old.origin_feeds, [scope, :entries, seq])), do: 1, else: 0
+
+          Map.update(counts, scope, appended, &(&1 + appended))
+
+        {:origin_feed, scope, {:delivery_ack, _}}, counts ->
+          Map.put_new(counts, scope, 0)
+
+        _, counts ->
+          counts
+      end)
+
+    Enum.all?(counts, fn {{person, origin} = scope, appended} ->
+      old_high = get_in(old.origin_feeds, [scope, :high]) || 0
+
+      case Map.get(next.origin_feeds, scope) do
+        %{high: high, entries: entries} ->
+          get_in(next.devices, [origin, :person]) == person and
+            nonnegative_integer?(high) and is_map(entries) and map_size(entries) == high and
+            high == old_high + appended and
+            ((Map.has_key?(old.origin_feeds, scope) and high == old_high) or
+               MapSet.member?(touched, {:origin_feed, scope, :high}))
+
+        _ ->
+          false
+      end
+    end) and Enum.all?(touched, &valid_origin_change?(old, next, &1))
+  end
+
+  defp valid_origin_change?(old, next, {:origin_feed, scope, {:entry, seq}}) do
+    entry = get_in(next.origin_feeds, [scope, :entries, seq])
+
+    case get_in(old.origin_feeds, [scope, :entries, seq]) do
+      nil ->
+        Conversation.valid_origin_entry?(seq, get_in(next.origin_feeds, [scope, :high]), entry)
+
+      prior ->
+        prior === entry
+    end
+  end
+
+  defp valid_origin_change?(_old, next, {:origin_feed, scope, {:delivery_ack, seq}}) do
+    Conversation.valid_delivery_ack?(next, scope, seq)
+  end
+
+  defp valid_origin_change?(_old, _next, _address), do: true
+
   def source_index(messages) do
     Enum.reduce(messages, %{}, fn {key, record}, index ->
       case source_key(record) do

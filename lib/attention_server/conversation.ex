@@ -637,26 +637,54 @@ defmodule AttentionServer.Conversation do
   end
 
   defp valid_delivery_acks?(engine, person, origin, feed) do
-    Enum.all?(Map.get(feed, :delivery_acks, %{}), fn {feed_seq, stages} ->
-      entry = Map.fetch!(feed.entries, feed_seq)
-
-      entry["author"] == "person" and entry["kind"] in ~w(discussion terminal) and
-        Map.has_key?(stages, :ack1) and
-        Enum.all?(stages, fn {stage, seq} ->
-          fact = Map.fetch!(engine.conversation_events, {person, seq})
-          payload = fact.payload
-
-          stage in [:ack1, :ack2] and
-            fact.key == {person, entry["sender_id"], entry["message_id"]} and
-            engine.messages[fact.key].origin == origin and
-            payload["kind"] == "delivery_ack" and payload["stage"] == Atom.to_string(stage) and
-            payload["event_id"] == entry["event_id"] and
-            payload["request_revision"] == entry["request_revision"] and
-            payload["session_handle"] == entry["session_handle"] and
-            (stage == :ack1 or seq > stages.ack1)
-        end)
+    Enum.all?(Map.get(feed, :delivery_acks, %{}), fn {feed_seq, _stages} ->
+      valid_delivery_ack?(engine, {person, origin}, feed_seq)
     end)
   end
+
+  @doc false
+  def valid_delivery_ack?(engine, {person, origin} = scope, feed_seq) do
+    feed = Map.fetch!(engine.origin_feeds, scope)
+    entry = Map.fetch!(feed.entries, feed_seq)
+    stages = Map.fetch!(feed.delivery_acks, feed_seq)
+
+    entry["author"] == "person" and entry["kind"] in ~w(discussion terminal) and
+      Map.has_key?(stages, :ack1) and
+      Enum.all?(stages, fn {stage, seq} ->
+        fact = Map.fetch!(engine.conversation_events, {person, seq})
+        payload = fact.payload
+
+        stage in [:ack1, :ack2] and
+          fact.key == {person, entry["sender_id"], entry["message_id"]} and
+          engine.messages[fact.key].origin == origin and
+          payload["kind"] == "delivery_ack" and payload["stage"] == Atom.to_string(stage) and
+          payload["event_id"] == entry["event_id"] and
+          payload["request_revision"] == entry["request_revision"] and
+          payload["session_handle"] == entry["session_handle"] and
+          (stage == :ack1 or seq > stages.ack1)
+      end)
+  rescue
+    _ -> false
+  end
+
+  @doc false
+  def valid_origin_entry?(seq, high, entry) when is_map(entry) do
+    is_integer(seq) and seq > 0 and is_integer(high) and seq <= high and
+      entry["feed_seq"] == seq and entry["event_id"] == Integer.to_string(seq) and
+      entry["kind"] in ["revision", "discussion", "reply", "terminal", "result"] and
+      entry["author"] in ["origin", "person", "agent", "server"] and
+      Message.uuid_v4?(entry["session_handle"])
+  end
+
+  def valid_origin_entry?(_, _, _), do: false
+
+  @doc false
+  def valid_origin_action?(engine, {person, origin, seq}, action) when is_map(action) do
+    actionable?(get_in(engine.origin_feeds, [{person, origin}, :entries, seq])) and
+      Message.uuid?(Map.get(action, :op_id)) and is_integer(Map.get(action, :at))
+  end
+
+  def valid_origin_action?(_, _, _), do: false
 
   def valid_state?(engine) do
     Enum.all?(engine.origin_feeds, fn {{person, origin}, feed} ->
@@ -664,13 +692,7 @@ defmodule AttentionServer.Conversation do
         is_integer(feed.high) and feed.high >= 0 and
         map_size(feed.entries) == feed.high and
         valid_delivery_acks?(engine, person, origin, feed) and
-        Enum.all?(feed.entries, fn {seq, entry} ->
-          is_integer(seq) and seq > 0 and seq <= feed.high and
-            entry["feed_seq"] == seq and entry["event_id"] == Integer.to_string(seq) and
-            entry["kind"] in ["revision", "discussion", "reply", "terminal", "result"] and
-            entry["author"] in ["origin", "person", "agent", "server"] and
-            Message.uuid_v4?(entry["session_handle"])
-        end)
+        Enum.all?(feed.entries, fn {seq, entry} -> valid_origin_entry?(seq, feed.high, entry) end)
     end) and
       Enum.all?(engine.origin_sessions, fn {{person, origin, handle}, session} ->
         get_in(engine.devices, [origin, :person]) == person and
@@ -692,9 +714,8 @@ defmodule AttentionServer.Conversation do
               ConversationFiles.valid_use?(outcome)
           end)
       end) and
-      Enum.all?(engine.origin_actions, fn {{person, origin, seq}, action} ->
-        actionable?(get_in(engine.origin_feeds, [{person, origin}, :entries, seq])) and
-          Message.uuid?(action.op_id) and is_integer(action.at)
+      Enum.all?(engine.origin_actions, fn {key, action} ->
+        valid_origin_action?(engine, key, action)
       end)
   rescue
     _ -> false
