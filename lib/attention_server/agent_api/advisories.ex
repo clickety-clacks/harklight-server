@@ -52,7 +52,9 @@ defmodule AttentionServer.AgentAPI.Advisories do
            Map.get(engine.advisory_feeds, scope),
          %{"sender_id" => sender, "message_id" => message_id} <- advisory,
          {:ok, item_id} <- Resources.item_id(engine, {person, sender, message_id}) do
-      {:ok, %{"item_id" => item_id, "advisory" => render(advisory, receipts)}}
+      AttentionServer.ClientAPI.Projection.run({:item, item_id}, fn ->
+        {:ok, %{"item_id" => item_id, "advisory" => render(advisory, receipts)}}
+      end)
     else
       _ -> {:error, :storage_unavailable}
     end

@@ -843,9 +843,13 @@ defmodule AttentionServer.ClientAPI.Writes do
   defp precondition(state, who, _principal, {:priority_levels, _levels, if_match}) do
     case Reads.handle_call({:settings, who}, nil, state) do
       {:reply, {:ok, %{"settings" => settings}}, _state} ->
-        if if_match == "*" or Reads.etag(settings) in if_match_tags(if_match),
-          do: :ok,
-          else: {:error, :precondition_failed}
+        Projection.capture(fn ->
+          Projection.run(:settings, fn ->
+            if if_match == "*" or Reads.etag(settings) in if_match_tags(if_match),
+              do: :ok,
+              else: {:error, :precondition_failed}
+          end)
+        end)
 
       {:reply, error, _state} ->
         error

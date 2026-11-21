@@ -84,7 +84,7 @@ defmodule AttentionServer.ClientAPI.FeedStream do
           schedule_heartbeat(%{
             ctx: ctx,
             source: source,
-            cursor: position,
+            cursor: cursor,
             watcher: watcher,
             relay: monitor(ctx.relay),
             last_show_id: nil,
@@ -92,7 +92,7 @@ defmodule AttentionServer.ClientAPI.FeedStream do
             timer_ref: nil
           })
 
-        send_page(conn, state, changes, more)
+        send_page(conn, state, changes, more, position)
 
       {:error, %Projection{} = fault} ->
         conn
@@ -120,9 +120,7 @@ defmodule AttentionServer.ClientAPI.FeedStream do
   defp pump(conn, state) do
     case relay_step(fn -> state.source.read(state.ctx, state.cursor, @page) end) do
       {:ok, changes, more, position} ->
-        state = %{state | cursor: position}
-
-        send_page(conn, state, changes, more)
+        send_page(conn, state, changes, more, position)
 
       # The principal stopped authenticating before its closing arrived.
       {:error, :unauthorized} ->
@@ -147,9 +145,9 @@ defmodule AttentionServer.ClientAPI.FeedStream do
     end
   end
 
-  defp send_page(conn, state, changes, more) do
+  defp send_page(conn, state, changes, more, position) do
     case Projection.capture(fn -> send_changes(conn, changes) end) do
-      {:ok, conn} -> continue(conn, state, more)
+      {:ok, conn} -> continue(conn, %{state | cursor: position}, more)
       {:error, %Projection{} = fault} ->
         projection_closing(conn, state, fault)
 

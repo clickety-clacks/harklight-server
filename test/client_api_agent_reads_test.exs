@@ -80,8 +80,13 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
       entry = person_reply(ctx, ctx.item, 2)
       fault_on_entry(entry)
 
-      reply = get(ctx, "a2", "/v2/items/" <> ctx.item <> "/entries")
+      {reply, log} =
+        ExUnit.CaptureLog.with_log(fn -> get(ctx, "a2", "/v2/items/" <> ctx.item <> "/entries") end)
+
       assert_internal_error(reply)
+      {"request-id", request_id} = List.keyfind(reply.headers, "request-id", 0)
+      assert log =~ "request_id=#{request_id} resource=entry:#{entry}"
+      refute log =~ "deterministic projection fault"
       assert Server.relay(ctx.server) == ctx.relay
     end
 
@@ -115,6 +120,25 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
       assert Server.relay(ctx.server) == ctx.relay
     end
 
+    test "a live SSE feed closes on a subsequent projection fault", ctx do
+      assert {:ok, before} = ChangeLog.head(:sys.get_state(ctx.relay).store, "A")
+      conn = ClientAPIFeedClient.connect(ctx.port, ctx.certs, "a2")
+      {conn, feed} = ClientAPIFeedClient.open_feed(conn, "?after=#{before}")
+      {conn, feed} = ClientAPIFeedClient.await_open(conn, feed)
+      assert feed.status == 200
+      fault_on_entry(:any)
+
+      path = "/v2/items/" <> ctx.item <> "/replies"
+      assert_internal_error(request(ctx, "a2", "POST", path, %{"text" => "Live reply"}, 2))
+
+      {conn, feed, [event]} = ClientAPIFeedClient.events(conn, feed, 1)
+      assert event == %{event: "closing", data: %{"reason" => "internal_error"}}
+      {conn, feed} = ClientAPIFeedClient.drain(conn, feed)
+      assert feed.done
+      Mint.HTTP.close(conn)
+      assert Server.relay(ctx.server) == ctx.relay
+    end
+
     test "an agent batch fails before recording delivery and replays the entry", ctx do
       entry = person_reply(ctx, ctx.item, 2)
       fault_on_entry(entry)
@@ -122,6 +146,18 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
 
       assert_internal_error(get(ctx, "a1", path))
       assert Server.relay(ctx.server) == ctx.relay
+
+      conn = ClientAPIFeedClient.connect(ctx.port, ctx.certs, "a1")
+      headers = [{"accept", "text/event-stream"}]
+      assert {:ok, conn, ref} = Mint.HTTP.request(conn, "GET", path, headers, nil)
+      feed = %{ref: ref, buffer: "", status: nil, headers: [], done: false}
+      {conn, feed} = ClientAPIFeedClient.await_open(conn, feed)
+      assert feed.status == 200
+      {conn, feed, [event]} = ClientAPIFeedClient.events(conn, feed, 1)
+      assert event == %{event: "closing", data: %{"reason" => "internal_error"}}
+      {conn, feed} = ClientAPIFeedClient.drain(conn, feed)
+      assert feed.done
+      Mint.HTTP.close(conn)
       Application.delete_env(:attention_server, :client_api_projection_fault)
 
       entries = get(ctx, "a1", "/v2/agent/messages/" <> ctx.item <> "/entries")
@@ -151,6 +187,54 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
 
       read = get(ctx, "a2", "/v2/items/" <> ctx.item <> "/entries")
       assert [%{"entry_id" => ^id}] = contract(ctx, "EntriesPage", read)["entries"]
+    end
+
+    test "a committed agent reply saves its receipt before rendering", ctx do
+      fault_on_entry(:any)
+      path = "/v2/agent/messages/" <> ctx.item <> "/replies"
+      body = %{"text" => "Agent reply with a failing response"}
+
+      assert_internal_error(request(ctx, "a1", "POST", path, body, 2))
+      assert_internal_error(request(ctx, "a1", "POST", path, body, 2))
+      assert Server.relay(ctx.server) == ctx.relay
+      Application.delete_env(:attention_server, :client_api_projection_fault)
+
+      replay = request(ctx, "a1", "POST", path, body, 2)
+      assert replay.status == 200
+      assert {"idempotent-replayed", "true"} = List.keyfind(replay.headers, "idempotent-replayed", 0)
+      assert %{"entry" => %{"entry_id" => id}} = contract(ctx, "AgentWriteResult", replay)
+
+      read = get(ctx, "a1", "/v2/agent/messages/" <> ctx.item <> "/entries")
+      assert [%{"entry_id" => ^id}] = contract(ctx, "AgentEntriesPage", read)["entries"]
+    end
+
+    test "the shared file route distinguishes a projection error from storage", ctx do
+      staged = upload(ctx, "a1", 2, "attachment bytes")
+      assert %{"file_id" => handle} = contract(ctx, "FileCreated", staged)
+
+      reply =
+        request(
+          ctx,
+          "a1",
+          "POST",
+          "/v2/agent/messages/" <> ctx.item <> "/replies",
+          %{"file_ids" => [handle]},
+          3
+        )
+
+      assert %{"entry" => %{"files" => [%{"file_id" => file}]}} =
+               contract(ctx, "AgentWriteResult", reply)
+
+      Application.put_env(:attention_server, :client_api_projection_fault, fn
+        :file -> raise "deterministic projection fault"
+        _ -> :ok
+      end)
+
+      path = "/v2/files/" <> file
+      assert_internal_error(get(ctx, "a2", path))
+      assert Server.relay(ctx.server) == ctx.relay
+      Application.delete_env(:attention_server, :client_api_projection_fault)
+      assert get(ctx, "a2", path).body == "attachment bytes"
     end
   end
 
@@ -229,6 +313,8 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
   @tag flag: false
   test "the server leaves the agent HTTP routes and durable log disabled with the flag off",
        ctx do
+    fault_on_entry(:any)
+    on_exit(fn -> Application.delete_env(:attention_server, :client_api_projection_fault) end)
     forward(ctx, "a1", 1, @first_session)
     refute Server.client_api_v2?(ctx.server)
     refute Enum.any?(Supervisor.which_children(ctx.server), &(elem(&1, 0) == :client_api))

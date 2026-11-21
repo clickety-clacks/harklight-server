@@ -63,10 +63,10 @@ defmodule AttentionServer.ClientAPI.Feed do
     body = [
       "{\"changes\":[",
       encoded,
-      "],\"rev\":",
-      Integer.to_string(position),
-      ",\"more\":",
+      "],\"more\":",
       JSON.encode!(more),
+      ",\"rev\":",
+      Integer.to_string(position),
       "}"
     ]
 
@@ -134,7 +134,7 @@ defmodule AttentionServer.ClientAPI.FeedStep do
   """
 
   alias AttentionServer.{ChangeLog, Diagnostics}
-  alias AttentionServer.ClientAPI.{Projection, Reads}
+  alias AttentionServer.ClientAPI.{FeedRenderer, Projection, Reads}
 
   @doc false
   def scope(ctx), do: ctx.principal.person
@@ -216,15 +216,18 @@ defmodule AttentionServer.ClientAPI.FeedStep do
     renderer = renderer()
 
     results =
-      if Code.ensure_loaded?(renderer) and function_exported?(renderer, :render_many, 3) do
-        Projection.run(:feed, fn ->
-          renderer.render_many(context, principal, rows)
-        end)
-      else
-        Enum.map(rows, fn row ->
-          result = Projection.run(:feed, fn -> renderer.render(context, principal, row) end)
-          {row, result}
-        end)
+      cond do
+        renderer == FeedRenderer ->
+          FeedRenderer.render_many(context, principal, rows)
+
+        Code.ensure_loaded?(renderer) and function_exported?(renderer, :render_many, 3) ->
+          Projection.run(:feed, fn -> renderer.render_many(context, principal, rows) end)
+
+        true ->
+          Enum.map(rows, fn row ->
+            result = Projection.run(:feed, fn -> renderer.render(context, principal, row) end)
+            {row, result}
+          end)
       end
 
     changes(results)
@@ -251,6 +254,6 @@ defmodule AttentionServer.ClientAPI.FeedStep do
       Application.get_env(
         :attention_server,
         :client_api_feed_renderer,
-        AttentionServer.ClientAPI.FeedRenderer
+        FeedRenderer
       )
 end

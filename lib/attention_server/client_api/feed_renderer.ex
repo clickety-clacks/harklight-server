@@ -9,7 +9,7 @@ defmodule AttentionServer.ClientAPI.FeedRenderer do
   """
 
   alias AttentionServer.ChangeLog
-  alias AttentionServer.ClientAPI.{Reads, Resources}
+  alias AttentionServer.ClientAPI.{Projection, Reads, Resources}
 
   @doc """
   Renders one row: `{:ok, data}`, `:skip` for a row with no client form, or
@@ -36,13 +36,36 @@ defmodule AttentionServer.ClientAPI.FeedRenderer do
         context = Map.put(context, :entries_by_fact, entries)
 
         Enum.map(decoded, fn {row, resource} ->
-          {row, render_row(row.kind, resource, context, principal, row.rev)}
+          key = resource_key(resource, context, principal)
+
+          result =
+            Projection.run(key, fn ->
+              render_row(row.kind, resource, context, principal, row.rev)
+            end)
+
+          {row, result}
         end)
 
       _ ->
         Enum.map(rows, &{&1, :skip})
     end
   end
+
+  defp resource_key({:entry, seq}, context, _principal) do
+    case Map.get(context.entries_by_fact, seq) do
+      %{"entry_id" => id} -> {:entry, id}
+      _ -> {:entry, Resources.entry_id(seq)}
+    end
+  end
+
+  defp resource_key({:item, {sender, message_id}}, context, principal) do
+    case Resources.item_id(context.engine, {principal.person, sender, message_id}) do
+      {:ok, id} -> {:item, id}
+      _ -> :item
+    end
+  end
+
+  defp resource_key(_resource, _context, _principal), do: :change
 
   defp render_row(:item, {:item, {sender, message_id}}, context, principal, rev) do
     key = {principal.person, sender, message_id}

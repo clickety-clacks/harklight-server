@@ -990,11 +990,7 @@ defmodule AttentionServer.ClientAPI.Resources do
   `position`. Receipts and acknowledgments are not entries; they show on the
   entry they refer to as `delivery`.
   """
-  def entries(%Engine{} = engine, key, _view \\ nil) do
-    Projection.run(item_projection_key(engine, key), fn -> project_entries(engine, key) end)
-  end
-
-  defp project_entries(engine, {person, _, _} = key) do
+  def entries(%Engine{} = engine, {person, _, _} = key, _view \\ nil) do
     record = Map.fetch!(engine.messages, key)
     item_id = item_id(record)
 
@@ -1003,7 +999,11 @@ defmodule AttentionServer.ClientAPI.Resources do
       |> Map.get(key, :gb_trees.empty())
       |> :gb_trees.values()
       |> Enum.reverse()
-      |> Enum.map(&{&1, Map.fetch!(engine.conversation_events, {person, &1}).payload})
+      |> Enum.map(fn seq ->
+        Projection.run({:entry, entry_id(seq)}, fn ->
+          {seq, Map.fetch!(engine.conversation_events, {person, seq}).payload}
+        end)
+      end)
 
     by_event_id =
       for {seq, %{"kind" => kind, "event_id" => event_id}} <- facts,
@@ -1315,28 +1315,32 @@ defmodule AttentionServer.ClientAPI.Resources do
   Entry, Settings, Counts or removal.
   """
   def render(:item, %{@viewer => %{"origin" => origin}} = item, %{key: key} = principal) do
-    item = Map.delete(item, @viewer)
+    Projection.run(Projection.change_key(item), fn ->
+      item = Map.delete(item, @viewer)
 
-    if key == origin do
-      item
-    else
-      sender = Map.fetch!(item, "sender")
+      if key == origin do
+        item
+      else
+        sender = Map.fetch!(item, "sender")
 
-      Map.put(
-        item,
-        "as",
-        if(MapSet.member?(principal.senders, sender), do: "message", else: "knock")
-      )
-    end
+        Map.put(
+          item,
+          "as",
+          if(MapSet.member?(principal.senders, sender), do: "message", else: "knock")
+        )
+      end
+    end)
   end
 
   def render(:settings, %{@viewer => %{"push" => push}} = settings, %{key: key, kind: kind}) do
-    status =
-      if kind == :device, do: Map.get(push, key, @unconfigured_push), else: @unconfigured_push
+    Projection.run(:settings, fn ->
+      status =
+        if kind == :device, do: Map.get(push, key, @unconfigured_push), else: @unconfigured_push
 
-    settings
-    |> Map.delete(@viewer)
-    |> Map.put("push", status)
+      settings
+      |> Map.delete(@viewer)
+      |> Map.put("push", status)
+    end)
   end
 
   def render(:entry, entry, _principal), do: Map.delete(entry, @sources)
