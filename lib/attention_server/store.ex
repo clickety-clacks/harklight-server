@@ -9,6 +9,8 @@ defmodule AttentionServer.Store do
   silently replacing committed work. This is not a public database API.
   """
 
+  require Logger
+
   alias AttentionServer.{
     APNS,
     BrowserRecipient,
@@ -22,7 +24,7 @@ defmodule AttentionServer.Store do
   }
 
   alias Exqlite.Sqlite3
-  alias AttentionServer.Store.{Persistence, SnapshotEncoding}
+  alias AttentionServer.Store.{Persistence, RecordCodec, SnapshotEncoding}
 
   @format_version 29
   @inbox_index_chunk_size 20
@@ -1438,7 +1440,16 @@ defmodule AttentionServer.Store do
               {:module, ^module} = Code.ensure_loaded(module)
             end
 
+            _ = RecordCodec.identity()
+
             case :erlang.binary_to_term(payload, [:safe]) do
+              {:attention_relay_keyed_state, 30, _identity} ->
+                Logger.error(
+                  "Harklight Store uses FORMAT30. To run Harklight 0.1.x, restore the pre-upgrade backup."
+                )
+
+                {:error, :format30_requires_keyed_mode}
+
               {:attention_relay_state, format, %Engine{} = stored}
               when format in [
                      1,
