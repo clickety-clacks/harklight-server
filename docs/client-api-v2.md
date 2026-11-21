@@ -807,7 +807,7 @@ visible text. Its `attention` member changes:
 | `stale_request` | 409 | false | `request_revision` is behind the item (`stale_revision`) |
 | `already_answered` | 409 | false | Only on `/answer`: the item's `terminal` is already set (`closed`) |
 | `already_retracted` | 409 | false | The origin retracted the item (`retracted`); also an agent revise or retract on that item |
-| `already_closed` | 409 | false | A discard targets an attached upload handle, a closed message refuses an agent write, or an agent result or file-use report conflicts (§5, §9.2) |
+| `already_closed` | 409 | false | A discard targets an attached upload handle, an agent write targets a closed message, a correlated revise targets an already-acted turn, or an agent result or file-use report conflicts (§5, §9.2) |
 | `not_answered` | 409 | false | The agent tried to record a result before an answer |
 | `idempotency_conflict` | 409 | false | Same key, different request (`operation_conflict`) |
 | `precondition_failed` | 412 | false | `If-Match` does not match. Also a superseded push `revision` (`stale_push_binding`). |
@@ -1317,14 +1317,18 @@ Writes return 200 unless the table says otherwise. Each response schema requires
   on this item at its current revision. A different item or kind is
   `404 not_found`, and an earlier revision is `409 stale_request`.
   The successful write marks the turn acted and returns it as `entry`.
+  A turn already acted on returns `409 already_closed` and applies no
+  revision (`Conversation.act`).
 - **Revise attachments.** Omit `file_ids` to keep the current revision's
   attachments, including migrated inline files, under the same
   `If-Match`. An empty array clears the attachments. A nonempty array is
   the complete replacement set. Its members may be upload handles or
   `FileRef.file_id` download IDs of files currently on this item's
   revision. The latter carry existing files without re-upload. Other IDs
-  return `400 invalid_field` with `field: "file_ids"`. Other write routes
-  accept upload handles only.
+  return `400 invalid_field` with `field: "file_ids"`. For all three
+  forms, the server validates retained IDs and applies the new revision
+  and its complete attachment set atomically with the `If-Match` check.
+  Other write routes accept upload handles only.
 - **Lifecycle and retract.** Only the item's originating key can use either
   route. Both stamp the time on the server. Lifecycle
   follows the existing transition rules. A repeat retraction under a new
