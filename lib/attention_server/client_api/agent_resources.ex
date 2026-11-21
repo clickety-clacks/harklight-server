@@ -54,12 +54,14 @@ defmodule AttentionServer.ClientAPI.AgentResources do
     engine = state.store.engine
 
     with {:ok, record} <- own_record(engine, scope, key) do
+      replies = reply_entries(state, key)
+
       entries =
         engine.route_b_index
         |> RouteBIndex.entry_page(key)
         |> :gb_trees.values()
         |> Enum.reverse()
-        |> Enum.map(&Resources.agent_entry(engine, key, record, &1))
+        |> Enum.map(&Resources.agent_entry(engine, key, record, &1, replies))
 
       {:ok, entries}
     end
@@ -69,9 +71,11 @@ defmodule AttentionServer.ClientAPI.AgentResources do
     engine = state.store.engine
 
     with {:ok, record} <- own_record(engine, scope, key) do
+      replies = reply_entries(state, key)
+
       entries =
         Enum.flat_map(positions, fn position ->
-          case Resources.agent_entry(engine, key, record, position) do
+          case Resources.agent_entry(engine, key, record, position, replies) do
             nil -> []
             entry -> [entry]
           end
@@ -98,12 +102,17 @@ defmodule AttentionServer.ClientAPI.AgentResources do
         |> Enum.take(limit + 1)
 
       {page, rest} = Enum.split(positions, limit)
-      raw = Enum.map(Enum.reverse(page), &Resources.agent_entry(engine, key, record, &1))
+      replies = reply_entries(state, key)
+      raw = Enum.map(Enum.reverse(page), &Resources.agent_entry(engine, key, record, &1, replies))
 
       with {:ok, rendered} <- render_entries(state, scope, raw) do
         {:ok, rendered, rest != []}
       end
     end
+  end
+
+  defp reply_entries(state, {person, sender, id}) do
+    get_in(state.priority_views, [person, :reply_entries_by_item, {sender, id}]) || %{}
   end
 
   defp entry_iterator(tree, nil), do: {:ok, :gb_trees.iterator(tree)}
@@ -135,7 +144,8 @@ defmodule AttentionServer.ClientAPI.AgentResources do
     engine = state.store.engine
 
     with {:ok, record} <- own_record(engine, scope, key),
-         %{} = raw <- Resources.agent_entry(engine, key, record, position) do
+         replies = reply_entries(state, key),
+         %{} = raw <- Resources.agent_entry(engine, key, record, position, replies) do
       render_entry(state, scope, raw)
     else
       _ -> {:error, :not_found}

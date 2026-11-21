@@ -711,7 +711,12 @@ defmodule AttentionServer.ClientAPI.Resources do
   defp view_thread(_entry), do: nil
 
   # Today's per-reply priority view entries, by item and conversation sequence.
-  defp view_reply_entries(%{replies: replies}) when is_list(replies) do
+  defp view_reply_entries(%{reply_entries_by_item: index}), do: index
+  defp view_reply_entries(%{replies: replies}) when is_list(replies), do: index_reply_entries(replies)
+  defp view_reply_entries(_), do: %{}
+
+  @doc false
+  def index_reply_entries(replies) do
     Enum.reduce(replies, %{}, fn
       %{"sender_id" => sender, "message_id" => id, "conversation_seq" => seq} = entry, acc
       when is_integer(seq) ->
@@ -721,8 +726,6 @@ defmodule AttentionServer.ClientAPI.Resources do
         acc
     end)
   end
-
-  defp view_reply_entries(_), do: %{}
 
   @levels ~w(low normal high now)
 
@@ -1090,7 +1093,7 @@ defmodule AttentionServer.ClientAPI.Resources do
   end
 
   @doc false
-  def agent_entry(engine, {person, _, _} = key, record, position) do
+  def agent_entry(engine, {person, _, _} = key, record, position, reply_entries) do
     with %{key: ^key, payload: payload} <- Map.get(engine.conversation_events, {person, position}) do
       index = engine.route_b_index
       id = payload["in_reply_to"]
@@ -1105,7 +1108,7 @@ defmodule AttentionServer.ClientAPI.Resources do
       context = %{
         by_event_id: by_event_id,
         results: results,
-        replies: %{},
+        replies: reply_entries,
         engine: engine,
         person: person
       }

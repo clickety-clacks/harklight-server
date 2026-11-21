@@ -6044,6 +6044,14 @@ defmodule AttentionServer.Relay do
         |> Map.put(:message_order_suffixes, message_order_suffixes)
         |> Map.put(:view_rev, view_rev)
 
+      view =
+        if state.store.change_log do
+          index = AttentionServer.ClientAPI.Resources.index_reply_entries(view.replies)
+          Map.put(view, :reply_entries_by_item, index)
+        else
+          view
+        end
+
       state
       |> Map.put(:priority_revision_counter, counter)
       |> Map.put(:priority_views, Map.put(state.priority_views, person, view))

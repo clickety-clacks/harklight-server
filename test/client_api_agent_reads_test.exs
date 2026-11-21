@@ -132,6 +132,7 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
     assert {:error, :disabled} = AgentChangeLog.head(state.store, {"A", ctx.keys["a1"]})
     assert state.store.engine.route_b_index.sent_messages_by_agent == %{}
     assert state.store.engine.route_b_index.agent_entry_pages == %{}
+    refute Map.has_key?(state.priority_views["A"], :reply_entries_by_item)
 
     opted_in = AttentionServer.RouteBIndex.enable_agent_feed(state.store.engine)
     index = opted_in.route_b_index
@@ -214,6 +215,10 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
         "in_reply_to" => String.to_integer(turn["event_id"]),
         "text" => "Reply"
       })
+
+    view = :sys.get_state(ctx.relay).priority_views["A"]
+    assert %{^position => %{"conversation_seq" => ^position}} =
+             view.reply_entries_by_item[{"app:test", "item-1"}]
 
     reply = %{
       "sender_id" => "app:test",
