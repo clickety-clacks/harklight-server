@@ -94,10 +94,13 @@ defmodule AttentionServer.HeadlessDeviceV2Test do
     assert keys == Enum.sort(keys)
 
     assert Enum.sort(Enum.map(items, & &1["message"]["title"])) == ~w(one three two)
-    assert read_json!(directory, "v2/cursor.json") == %{"rev" => rev}
-    assert read_json!(directory, "v2/items.json") == %{"items" => items, "tombstones" => %{}}
+    # One file holds the cursor and the items it covers.
+    assert read_json!(directory, "v2/items.json") ==
+             %{"rev" => rev, "items" => items, "tombstones" => %{}}
 
-    for file <- ~w(v2 v2/items.json v2/cursor.json) do
+    refute File.exists?(Path.join(directory, "v2/cursor.json"))
+
+    for file <- ~w(v2 v2/items.json) do
       assert {:ok, %File.Stat{mode: mode}} = File.stat(Path.join(directory, file))
       assert Bitwise.band(mode, 0o077) == 0
     end
@@ -106,7 +109,7 @@ defmodule AttentionServer.HeadlessDeviceV2Test do
     assert {:ok, %{"rev" => later, "items" => more}} = HeadlessDevice.read(directory, endpoint)
     assert later > rev
     assert length(more) == 4
-    assert read_json!(directory, "v2/cursor.json") == %{"rev" => later}
+    assert read_json!(directory, "v2/items.json")["rev"] == later
 
     # Another person's device sees none of it.
     assert {:ok, %{"items" => []}} = HeadlessDevice.read(ctx.identities["b1"], ctx.endpoint)
@@ -131,8 +134,7 @@ defmodule AttentionServer.HeadlessDeviceV2Test do
     assert later > rev
     titles = Enum.map(items, & &1["message"]["title"])
     assert Enum.sort(titles) == ~w(four held three two)
-    assert read_json!(directory, "v2/cursor.json") == %{"rev" => later}
-    assert read_json!(directory, "v2/items.json")["items"] == items
+    assert %{"rev" => ^later, "items" => ^items} = read_json!(directory, "v2/items.json")
 
     # Nothing new: the cursor stays and the items are as held.
     assert {:ok, %{"rev" => ^later, "items" => ^items}} = HeadlessDevice.read(directory, endpoint)
@@ -144,13 +146,15 @@ defmodule AttentionServer.HeadlessDeviceV2Test do
     assert {:ok, %{"rev" => rev, "items" => items}} = HeadlessDevice.read(directory, ctx.endpoint)
 
     # A cursor the server no longer serves (here, past its position) is 410.
-    File.write!(Path.join(directory, "v2/cursor.json"), JSON.encode!(%{"rev" => rev + 1000}))
-    File.write!(Path.join(directory, "v2/items.json"), JSON.encode!(%{"items" => []}))
+    File.write!(
+      Path.join(directory, "v2/items.json"),
+      JSON.encode!(%{"rev" => rev + 1000, "items" => [], "tombstones" => %{}})
+    )
 
     assert {:ok, %{"rev" => ^rev, "items" => ^items}} =
              HeadlessDevice.read(directory, ctx.endpoint)
 
-    assert read_json!(directory, "v2/cursor.json") == %{"rev" => rev}
+    assert read_json!(directory, "v2/items.json")["rev"] == rev
   end
 
   test "device read refuses a revoked device and keeps its stored cursor", ctx do
@@ -159,7 +163,121 @@ defmodule AttentionServer.HeadlessDeviceV2Test do
     assert {:ok, %{"rev" => rev}} = HeadlessDevice.read(directory, ctx.endpoint)
     assert :ok = Relay.revoke_device(ctx.relay, ctx.keys["a1"])
     assert {:error, _reason} = HeadlessDevice.read(directory, ctx.endpoint)
-    assert read_json!(directory, "v2/cursor.json") == %{"rev" => rev}
+    assert read_json!(directory, "v2/items.json")["rev"] == rev
+  end
+
+  # Review C6-1. A respond reads internally, so it can overlap a read on the
+  # same directory, and the older read's write can land last. Whatever lands
+  # last must hold a cursor and the items it covers, so no change is skipped.
+  test "an older read's state landing last is consistent and skips nothing", ctx do
+    forward!(ctx.relay, "one", 2)
+    directory = ctx.identities["a1"]
+    state = Path.join(directory, "v2")
+    assert {:ok, _} = HeadlessDevice.read(directory, ctx.endpoint)
+    older = File.read!(Path.join(state, "items.json"))
+
+    forward!(ctx.relay, "two", 3)
+    assert {:ok, %{"items" => newer}} = HeadlessDevice.read(directory, ctx.endpoint)
+    assert length(newer) == 2
+
+    # The older read's items write lands after the newer read's writes, as in
+    # the interleaving A items, B items, B cursor, A cursor (review C6-1).
+    File.write!(Path.join(state, "items.json"), older)
+
+    forward!(ctx.relay, "three", 4)
+    assert {:ok, %{"items" => items}} = HeadlessDevice.read(directory, ctx.endpoint)
+    assert Enum.sort(Enum.map(items, & &1["message"]["title"])) == ~w(one three two)
+  end
+
+  # Review C6-2. The stored state is local, so its size is not capped by the
+  # server frame limit: a large store still reads forward instead of
+  # re-snapshotting.
+  test "a stored state larger than a server frame still reads forward", ctx do
+    big = String.duplicate("x", 900_000)
+    for n <- 1..6, do: forward!(ctx.relay, "big-#{n}", n + 1, %{"body" => big})
+    directory = ctx.identities["a1"]
+    assert {:ok, _} = HeadlessDevice.read(directory, ctx.endpoint)
+    assert File.stat!(Path.join(directory, "v2/items.json")).size > 5 * 1024 * 1024
+
+    held = read_json!(directory, "v2/items.json")
+    marked = update_in(held, ["items", Access.at(0), "message", "title"], fn _ -> "held" end)
+    File.write!(Path.join(directory, "v2/items.json"), JSON.encode!(marked))
+
+    forward!(ctx.relay, "small", 20)
+    assert {:ok, %{"items" => items}} = HeadlessDevice.read(directory, ctx.endpoint)
+    assert length(items) == 7
+    assert "held" in Enum.map(items, & &1["message"]["title"])
+  end
+
+  describe "against a server sending a bad batch" do
+    setup ctx do
+      server = start_supervised!({Bandit, fake_server_opts(ctx)}, id: :fake_server)
+      {:ok, {_ip, port}} = ThousandIsland.listener_info(server)
+      directory = ctx.identities["a1"]
+
+      File.write!(
+        Path.join(directory, "v2/items.json") |> tap(&File.mkdir_p!(Path.dirname(&1))),
+        JSON.encode!(%{"rev" => 5, "items" => [], "tombstones" => %{}})
+      )
+
+      File.chmod!(Path.join(directory, "v2"), 0o700)
+      %{fake: Map.put(ctx.endpoint, :port, port), directory: directory}
+    end
+
+    # Review C6-3: a malformed item change fails the read; the cursor stays.
+    test "a malformed item change fails loudly and keeps the cursor", ctx do
+      for bad <- [
+            %{"rev" => 6, "kind" => "item", "data" => %{}},
+            %{"rev" => 6, "kind" => "item"},
+            %{"rev" => 6, "kind" => "item_removed", "data" => %{"item_id" => 1}}
+          ] do
+        :persistent_term.put({__MODULE__, :batch}, %{
+          "changes" => [bad],
+          "rev" => 6,
+          "more" => false
+        })
+
+        assert {:error, :invalid_v2_change} = HeadlessDevice.read(ctx.directory, ctx.fake)
+        assert read_json!(ctx.directory, "v2/items.json")["rev"] == 5
+      end
+    end
+
+    # Review C6-4: `more` with no progress is an error, not an endless loop.
+    test "more with no progress fails instead of repeating forever", ctx do
+      :persistent_term.put({__MODULE__, :batch}, %{"changes" => [], "rev" => 5, "more" => true})
+      assert {:error, :no_progress} = HeadlessDevice.read(ctx.directory, ctx.fake)
+      assert read_json!(ctx.directory, "v2/items.json")["rev"] == 5
+    end
+  end
+
+  defmodule FakeServer do
+    @moduledoc false
+    import Plug.Conn
+
+    def init(test), do: test
+
+    def call(%{request_path: "/v2/changes"} = conn, test) do
+      body = :persistent_term.get({test, :batch})
+
+      conn
+      |> put_resp_content_type("application/json")
+      |> send_resp(200, AttentionServer.JSON.encode!(body))
+    end
+
+    def call(conn, _test), do: send_resp(conn, 404, ~s({"error":"not_found","retryable":false}))
+  end
+
+  defp fake_server_opts(%{certs: certs}) do
+    [
+      plug: {FakeServer, __MODULE__},
+      scheme: :https,
+      ip: {127, 0, 0, 1},
+      port: 0,
+      certfile: Path.join(certs, "server.pem"),
+      keyfile: Path.join(certs, "server.key"),
+      http_2_options: [enabled: false],
+      startup_log: false
+    ]
   end
 
   test "device respond answers once, storing its key and exact body before sending", ctx do
