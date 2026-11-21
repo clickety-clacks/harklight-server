@@ -28,6 +28,8 @@ defmodule AttentionServer.ClientAPI.FeedRenderer do
   all of its rows, so a long chat's backlog costs one pass, not one per row.
   """
   def render_many(%{engine: engine} = context, who, rows) when is_list(rows) do
+    Projection.probe(:feed)
+
     case Reads.client_principal(engine, who) do
       {:ok, principal} ->
         decoded = Enum.map(rows, &{&1, ChangeLog.decode_resource(&1.resource_id)})

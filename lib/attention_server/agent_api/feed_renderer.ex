@@ -2,9 +2,10 @@ defmodule AttentionServer.AgentAPI.FeedRenderer do
   @moduledoc false
 
   alias AttentionServer.AgentAPI.Advisories
-  alias AttentionServer.ClientAPI.AgentResources
+  alias AttentionServer.ClientAPI.{AgentResources, Projection}
 
   def render_many(%{store: %{engine: engine}} = state, %{person: person, key: key}, rows) do
+    Projection.probe(:feed)
     scope = {person, key}
 
     entries =

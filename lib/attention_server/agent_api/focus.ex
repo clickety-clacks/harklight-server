@@ -41,7 +41,10 @@ defmodule AttentionServer.AgentAPI.Focus do
   end
 
   defp render(engine, person, client) do
-    Projection.run(:focus, fn -> project(engine, person, client) end)
+    Projection.run(:focus, fn ->
+      Projection.probe(:focus_snapshot)
+      project(engine, person, client)
+    end)
   end
 
   defp project(engine, person, client) do

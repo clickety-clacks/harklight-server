@@ -103,6 +103,8 @@ defmodule AttentionServer.ClientAPI.Focus do
          {:ok, item_id} <-
            Resources.item_id(engine, {person, held["sender_id"], held["message_id"]}) do
       Projection.run({:item, item_id}, fn ->
+        Projection.probe({:show_projection, item_id})
+
         %{
           "show_id" => show_id(device_key, held),
           "device_id" => device_key,
