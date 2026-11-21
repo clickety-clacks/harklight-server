@@ -64,6 +64,33 @@ defmodule AttentionServer.Store.KeyedMigrationTest do
     assert :ok = Store.close(legacy)
   end
 
+  test "a fresh VM can open the keyed anchor before loading the codec", ctx do
+    %{path: path, store: store} = ctx
+    assert {:ok, _} = KeyedMigration.convert(store)
+    assert :ok = Store.close(store)
+
+    script = """
+    path = System.fetch_env!("KEYED_COLD_OPEN_TEST_PATH")
+    {:ok, store} = AttentionServer.Store.open(path, :keyed)
+    :ok = AttentionServer.Store.close(store)
+    IO.puts("cold_reopen=ok")
+    """
+
+    {output, status} =
+      System.cmd("mix", ["run", "--no-start", "--no-compile", "-e", script],
+        env: [
+          {"MIX_ENV", "test"},
+          {"ERL_FLAGS", "+S 2:2"},
+          {"ATTENTION_SERVER_ENABLE", "0"},
+          {"KEYED_COLD_OPEN_TEST_PATH", path}
+        ],
+        stderr_to_stdout: true
+      )
+
+    assert status == 0, output
+    assert output =~ "cold_reopen=ok"
+  end
+
   test "keyed Store.open performs full state validation after reading rows", ctx do
     %{path: path, store: store} = ctx
     assert {:ok, generation} = KeyedMigration.convert(store)

@@ -35,11 +35,14 @@ defmodule AttentionServer.Store.KeyedMigration do
   end
 
   def load(db) do
+    # Load the codec's identity atom before decoding the anchor with :safe.
+    supported_identity = RecordCodec.identity()
+
     with {:ok, [[version, payload, checksum]]} <-
            query(db, "SELECT version, payload, checksum FROM relay_state WHERE id = 1", []),
          true <- :crypto.hash(:sha256, payload) == checksum,
          {:ok, identity} <- decode_anchor(payload),
-         :ok <- check_identity(identity),
+         :ok <- check_identity(identity, supported_identity),
          {:ok, generation} <- RecordTable.generation(db),
          true <- generation >= version,
          {:ok, engine} <- read_records(db) do
@@ -61,15 +64,12 @@ defmodule AttentionServer.Store.KeyedMigration do
     ArgumentError -> {:error, :invalid_state}
   end
 
-  defp check_identity({codec, written_major}) do
-    case RecordCodec.identity() do
-      {^codec, ^written_major} -> :ok
-      {^codec, running_major} -> {:error, {:unsupported_otp_major, written_major, running_major}}
-      _ -> {:error, :unsupported_record_codec}
-    end
-  end
+  defp check_identity(identity, identity), do: :ok
 
-  defp check_identity(_), do: {:error, :unsupported_record_codec}
+  defp check_identity({codec, written_major}, {codec, running_major}),
+    do: {:error, {:unsupported_otp_major, written_major, running_major}}
+
+  defp check_identity(_, _), do: {:error, :unsupported_record_codec}
 
   defp read_records(db) do
     with {:ok, rows} <- RecordTable.rows(db), do: RecordCodec.decode(rows)
