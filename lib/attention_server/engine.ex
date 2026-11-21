@@ -3001,11 +3001,8 @@ defmodule AttentionServer.Engine do
     support = get_in(engine.origin_sessions, [{person, origin, handle}, :support])
 
     requests =
-      engine.messages
-      |> Enum.filter(fn {{request_person, _, _}, record} ->
-        request_person == person and record.origin == origin and
-          Map.get(record, :session_handle) == handle and is_nil(record.terminal)
-      end)
+      engine
+      |> origin_availability_requests(person, origin, handle)
       |> Enum.sort_by(fn {_, record} -> record.accepted_seq end)
 
     next =
@@ -3037,6 +3034,25 @@ defmodule AttentionServer.Engine do
     if next == engine,
       do: next,
       else: queue_conversation_hint(next, person, next.conversation_highs[person])
+  end
+
+  defp origin_availability_requests(
+         %{route_b_index: %{agent_feed?: true} = index} = engine,
+         person,
+         origin,
+         handle
+       ) do
+    for key <- AttentionServer.RouteBIndex.session_messages(index, {person, origin, handle}),
+        %{terminal: nil} = record <- [Map.get(engine.messages, key)] do
+      {key, record}
+    end
+  end
+
+  defp origin_availability_requests(engine, person, origin, handle) do
+    Enum.filter(engine.messages, fn {{request_person, _, _}, record} ->
+      request_person == person and record.origin == origin and
+        Map.get(record, :session_handle) == handle and is_nil(record.terminal)
+    end)
   end
 
   @doc "Add the current origin-handle status to a newly accepted delivery event."

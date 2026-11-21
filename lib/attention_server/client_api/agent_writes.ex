@@ -345,7 +345,7 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
 
   defp apply_frame(state, agent, _operation, {:session_end, session}, _op_id, _sources) do
     {:reply, reply, next} =
-      Relay.apply_agent_command(state, {:origin_session_gone, agent, session})
+      Relay.apply_agent_command(state, {:origin_session_gone, agent, session, :agent_v2})
 
     {if(reply == :ok, do: {:ok, %{}}, else: reply), next}
   end
@@ -439,11 +439,11 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
 
   defp item_frame(state, _key, record, :lifecycle, _match, body) do
     with true <- body["action"] in @lifecycle,
-         :ok <- open(record) do
+         nil <- record.terminal do
       {:ok, %{"type" => "lifecycle", "state" => body["action"], "at" => state.clock.()}, nil}
     else
       false -> {:error, "invalid_field", "action"}
-      error -> error
+      %{} -> {:error, :already_closed}
     end
   end
 

@@ -186,7 +186,8 @@ defmodule AttentionServer.ClientAPI.Uploads do
   def verify_discard_owner(%AttentionServer.Store{change_log: true, db: db}, id, owner) do
     with :ok <- ensure(db) do
       case one(db, "SELECT owner_key FROM client_staged_file_owners WHERE file_id = ?", [id]) do
-        {:ok, nil} when is_nil(owner) -> :ok
+        # Handles staged before ownership tracking are still account-scoped.
+        {:ok, nil} -> :ok
         {:ok, [^owner]} -> :ok
         {:ok, _} -> {:error, :not_found}
         _ -> {:error, :storage_unavailable}
@@ -206,16 +207,7 @@ defmodule AttentionServer.ClientAPI.Uploads do
       ])
 
   @doc "Forget an unattached file and its bytes, storing any replay receipt with the deletion."
-  def discard(store, person, file_id, key, digest, receipt_scope \\ nil)
-
-  def discard(
-        %AttentionServer.Store{change_log: true, db: db} = store,
-        person,
-        file_id,
-        key,
-        digest,
-        receipt_scope
-      ) do
+  def discard(%AttentionServer.Store{change_log: true, db: db} = store, person, file_id, key, digest) do
     with :ok <- ensure(db),
          {:ok, [1]} <-
            one(
@@ -224,7 +216,7 @@ defmodule AttentionServer.ClientAPI.Uploads do
              [file_id, person, System.system_time(:millisecond) - @retention_ms]
            ),
          :ok <- Sqlite3.execute(db, "BEGIN IMMEDIATE"),
-         :ok <- commit_discard(store, db, person, file_id, key, digest, receipt_scope || person) do
+         :ok <- commit_discard(store, db, person, file_id, key, digest) do
       :ok
     else
       {:ok, nil} -> {:error, :not_found}
@@ -233,10 +225,10 @@ defmodule AttentionServer.ClientAPI.Uploads do
     end
   end
 
-  def discard(%AttentionServer.Store{}, _person, _file_id, _key, _digest, _receipt_scope),
+  def discard(%AttentionServer.Store{}, _person, _file_id, _key, _digest),
     do: {:error, :disabled}
 
-  defp commit_discard(store, db, person, file_id, key, digest, receipt_scope) do
+  defp commit_discard(store, db, person, file_id, key, digest) do
     with :ok <- run(db, "DELETE FROM client_staged_file_owners WHERE file_id = ?", [file_id]),
          :ok <-
            run(db, "DELETE FROM client_staged_files WHERE file_id = ? AND person_id = ?", [
@@ -244,7 +236,7 @@ defmodule AttentionServer.ClientAPI.Uploads do
              person
            ]),
          :ok <- run(db, "INSERT INTO client_discarded_files (file_id) VALUES (?)", [file_id]),
-         :ok <- save_discard_receipt(store, receipt_scope, key, digest),
+         :ok <- save_discard_receipt(store, person, key, digest),
          :ok <- Sqlite3.execute(db, "COMMIT") do
       :ok
     else
@@ -256,8 +248,8 @@ defmodule AttentionServer.ClientAPI.Uploads do
 
   defp save_discard_receipt(_store, _person, nil, _digest), do: :ok
 
-  defp save_discard_receipt(store, receipt_scope, key, digest),
-    do: Idempotency.save(store, receipt_scope, key, digest, 204, %{"discarded_file" => true})
+  defp save_discard_receipt(store, person, key, digest),
+    do: Idempotency.save(store, person, key, digest, 204, %{"discarded_file" => true})
 
   @doc "Unlink committed discards outside Relay, retaining failed cleanup for another attempt."
   def clean_discarded(relay, file_id \\ nil) do

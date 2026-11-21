@@ -733,7 +733,12 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
         path = Path.join(dir, "pre-owner-fixture")
         File.write!(path, "fixture")
 
-        attrs = %{name: "legacy.txt", content_type: "text/plain", size: 7, sha256: String.duplicate("a", 64)}
+        attrs = %{
+          name: "legacy.txt",
+          content_type: "text/plain",
+          size: 7,
+          sha256: :crypto.hash(:sha256, "fixture") |> Base.encode16(case: :lower)
+        }
         {:ok, handle} = Uploads.stage(state.store, "A", attrs, path)
         send(test_pid, {:pre_owner_handle, handle})
         state

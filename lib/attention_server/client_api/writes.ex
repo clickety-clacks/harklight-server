@@ -564,8 +564,7 @@ defmodule AttentionServer.ClientAPI.Writes do
   def handle_call({:begin, who, key, digest, operation}, from, state) do
     reply =
       with {:ok, principal} <- principal(state.store.engine, who),
-           {:ok, nil} <-
-             stored(state, receipt_scope(principal, operation), key, digest, who, from),
+           {:ok, nil} <- stored(state, principal.person, key, digest, who, from),
            :ok <- precondition(state, who, principal, operation),
            {:ok, frame} <- frame(state.store.engine, principal, key, operation),
            {:ok, staged} <- staged_files(state, principal, operation) do
@@ -587,7 +586,7 @@ defmodule AttentionServer.ClientAPI.Writes do
           {:ok, reply} ->
             result = render(operation, who, principal.person, reply, from, state)
             receipt = receipt(operation, reply, result)
-            remember(state, receipt_scope(principal, operation), key, digest, result, receipt)
+            remember(state, principal.person, key, digest, result, receipt)
 
           error ->
             error
@@ -597,22 +596,15 @@ defmodule AttentionServer.ClientAPI.Writes do
     {:reply, reply, state}
   end
 
-  defp receipt_scope(%{kind: :device, person: person, engine_key: device}, {:file, _, _}),
-    do: Idempotency.agent_scope(person, device)
-
-  defp receipt_scope(principal, _operation), do: principal.person
-
   defp discard_owner(%{kind: :device, engine_key: device}), do: device
   defp discard_owner(_principal), do: nil
 
   @doc "Discard within Relay after the caller has authorized the principal."
   def discard_staged_upload(state, person, file_id, key, digest, owner \\ nil) do
-    scope = if owner, do: Idempotency.agent_scope(person, owner), else: person
-
-    with {:ok, nil} <- stored(state, scope, key, digest, nil, nil),
+    with {:ok, nil} <- stored(state, person, key, digest, nil, nil),
          :ok <- Uploads.verify_discard_owner(state.store, file_id, owner),
          false <- Relay.staged_upload_attached?(state, person, file_id),
-         :ok <- Uploads.discard(state.store, person, file_id, key, digest, scope) do
+         :ok <- Uploads.discard(state.store, person, file_id, key, digest) do
       {:ok, 204, %{}}
     else
       true -> {:error, :already_closed}
