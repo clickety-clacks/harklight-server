@@ -1108,8 +1108,7 @@ defmodule AttentionServer.ClientAPI.Resources do
         by_event_id: by_event_id,
         results: results,
         key: key,
-        engine: engine,
-        person: person
+        engine: engine
       }
 
       case entry(item_id(record), record, position, payload, context) do
@@ -1180,9 +1179,7 @@ defmodule AttentionServer.ClientAPI.Resources do
       "revision" ->
         files =
           if payload["agent_api_v2_files"] do
-            key = {context.person, payload["sender_id"], payload["message_id"]}
-
-            case revision(context.engine, key, payload["request_revision"]) do
+            case revision(context.engine, context.key, payload["request_revision"]) do
               {:ok, %{"files" => [_ | _] = files}} -> files
               _ -> nil
             end
