@@ -38,6 +38,82 @@ defmodule AttentionServer.Store.KeyedValidation do
 
   defp source_key(_), do: nil
 
+  def authority_index(engine) do
+    for field <- [:messages, :uploads, :receipts],
+        key <- Map.keys(Map.fetch!(engine, field)),
+        reduce: %{} do
+      index -> edit_authority_index(index, engine, {:row, field, key}, :add)
+    end
+  end
+
+  def authority_changes(index, old, next, touched) do
+    updated =
+      Enum.reduce(touched, index, fn address, acc ->
+        acc
+        |> edit_authority_index(old, address, :remove)
+        |> edit_authority_index(next, address, :add)
+      end)
+
+    affected =
+      Enum.reduce(touched, MapSet.new(), fn
+        {:row, :persons, person}, keys ->
+          if Map.has_key?(old.persons, person) != Map.has_key?(next.persons, person),
+            do: MapSet.union(keys, Map.get(updated, {:person, person}, MapSet.new())),
+            else: keys
+
+        {:row, field, actor}, keys when field in [:devices, :agents] ->
+          before = owner_identity(Map.get(Map.fetch!(old, field), actor))
+          after_identity = owner_identity(Map.get(Map.fetch!(next, field), actor))
+
+          if before == after_identity,
+            do: keys,
+            else: MapSet.union(keys, Map.get(updated, {:actor, actor}, MapSet.new()))
+
+        _, keys ->
+          keys
+      end)
+
+    {updated, affected}
+  end
+
+  defp owner_identity(nil), do: nil
+  defp owner_identity(record), do: Map.take(record, [:person, :id])
+
+  defp edit_authority_index(index, engine, address, operation) do
+    Enum.reduce(authority_owners(engine, address), index, fn owner, acc ->
+      rows = Map.get(acc, owner, MapSet.new())
+
+      next =
+        if operation == :add, do: MapSet.put(rows, address), else: MapSet.delete(rows, address)
+
+      if MapSet.size(next) == 0, do: Map.delete(acc, owner), else: Map.put(acc, owner, next)
+    end)
+  end
+
+  defp authority_owners(engine, {:row, :messages, {person, _, _} = key}) do
+    case Map.get(engine.messages, key) do
+      nil ->
+        []
+
+      record ->
+        actors = [record.origin, get_in(record, [:terminal, :actor])] |> Enum.reject(&is_nil/1)
+        [{:person, person} | Enum.map(actors, &{:actor, &1})]
+    end
+  end
+
+  defp authority_owners(engine, {:row, :uploads, id}) do
+    case Map.get(engine.uploads, id) do
+      nil -> []
+      upload -> [{:person, upload.person}, {:actor, upload.uploader}]
+    end
+  end
+
+  defp authority_owners(engine, {:row, :receipts, {person, actor, _} = key}) do
+    if Map.has_key?(engine.receipts, key), do: [{:person, person}, {:actor, actor}], else: []
+  end
+
+  defp authority_owners(_engine, _address), do: []
+
   def upload_index(engine) do
     for {scope, feed} <- engine.origin_feeds, {seq, entry} <- feed.entries, reduce: %{} do
       index -> add_upload_links(index, {scope, seq}, entry)

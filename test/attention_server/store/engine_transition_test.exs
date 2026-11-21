@@ -281,6 +281,22 @@ defmodule AttentionServer.Store.EngineTransitionTest do
     :ok = Store.close(reopened)
   end
 
+  test "retained ownership prevents deleting a device from the keyed store" do
+    path = legacy_store_path()
+    {:ok, legacy} = Store.open(path)
+    {next, {:ok, _}} = Engine.request_line(legacy.engine, @origin, forward_line(), 100)
+    audit = %{person: @person, actor: @origin, action: "forward"}
+    {:ok, legacy} = Store.commit(legacy, next, audit)
+    assert {:ok, version} = KeyedMigration.convert(legacy)
+    :ok = Store.close(legacy)
+    {:ok, keyed} = Store.open(path, :keyed)
+    proposed = %{keyed.engine | devices: Map.delete(keyed.engine.devices, @origin)}
+    keys = MapSet.new([{:row, :devices, @origin}])
+    assert {:error, :storage_unavailable, ^keyed} = Store.commit(keyed, {proposed, keys}, audit)
+    assert {:ok, ^version} = AttentionServer.Store.RecordTable.generation(keyed.db)
+    :ok = Store.close(keyed)
+  end
+
   defp replace_body(engine, item, body) do
     engine
     |> put_in([Access.key!(:messages), item, :message, "body"], body)

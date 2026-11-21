@@ -48,6 +48,7 @@ defmodule AttentionServer.Store do
     mode: :legacy,
     source_bindings: %{},
     upload_links: %{},
+    authority_index: %{},
     progress_version: 0,
     encoding_cache: %{},
     change_log: false,
@@ -241,7 +242,8 @@ defmodule AttentionServer.Store do
        %{
          store
          | source_bindings: KeyedValidation.source_index(store.engine.messages),
-           upload_links: KeyedValidation.upload_index(store.engine)
+           upload_links: KeyedValidation.upload_index(store.engine),
+           authority_index: KeyedValidation.authority_index(store.engine)
        }}
 
   defp finalize_mode(%__MODULE__{mode: :legacy} = store) do
@@ -1123,8 +1125,13 @@ defmodule AttentionServer.Store do
   defp commit_keyed(store, next, touched, audit) do
     items = for {:row, :messages, key} <- touched, do: key
 
+    {authority_index, affected} =
+      KeyedValidation.authority_changes(store.authority_index, store.engine, next, touched)
+
     result =
-      with :ok <- KeyedValidation.sequences(store.engine, next, touched),
+      with true <-
+             Enum.all?(MapSet.union(touched, affected), &valid_authority_reference?(next, &1)),
+           :ok <- KeyedValidation.sequences(store.engine, next, touched),
            {:ok, upload_links, entries} <-
              KeyedValidation.upload_changes(store.upload_links, store.engine, next, touched),
            true <-
@@ -1177,6 +1184,7 @@ defmodule AttentionServer.Store do
                | engine: next,
                  source_bindings: index,
                  upload_links: upload_links,
+                 authority_index: authority_index,
                  version: store.version + 1,
                  change_log_touched:
                    MapSet.union(store.change_log_touched, MapSet.new(Map.keys(heads)))
@@ -3175,6 +3183,25 @@ defmodule AttentionServer.Store do
 
   defp valid_seq?(engine, person, seq),
     do: is_integer(seq) and seq > 0 and seq <= Map.get(engine.persons, person, 0)
+
+  defp valid_authority_reference?(engine, {:row, :messages, key}) do
+    case Map.fetch(engine.messages, key) do
+      {:ok, item} -> valid_item?(engine, key, item)
+      :error -> true
+    end
+  end
+
+  defp valid_authority_reference?(engine, {:row, :uploads, key}) do
+    case Map.fetch(engine.uploads, key) do
+      {:ok, upload} -> valid_upload?(engine, key, upload)
+      :error -> true
+    end
+  end
+
+  defp valid_authority_reference?(engine, {:row, :receipts, {person, actor, _} = key}),
+    do: not Map.has_key?(engine.receipts, key) or actor_owns?(engine, person, actor)
+
+  defp valid_authority_reference?(_engine, _address), do: true
 
   defp valid_item_change?(old, next, {person, _, _} = key) do
     case Map.fetch(next.messages, key) do
