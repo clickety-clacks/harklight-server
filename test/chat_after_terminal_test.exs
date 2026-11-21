@@ -201,4 +201,32 @@ defmodule AttentionServer.ChatAfterTerminalTest do
     assert held["kind"] == "discussion"
     assert held["delivered"] == false
   end
+
+  test "a request the sender closed with nothing waiting no longer counts as an open chat", %{
+    relay: relay
+  } do
+    send_request(relay, "settled", 300)
+
+    assert {:ok, %{"open_requests" => 1, "open_chats" => 1}} =
+             Relay.origin_status(relay, "origin", @handle)
+
+    assert %{"type" => "ok"} =
+             request(relay, "origin", %{
+               "type" => "lifecycle",
+               "op_id" => op(301),
+               "sender_id" => "app:test",
+               "message_id" => "settled",
+               "state" => "cleared",
+               "at" => 5
+             })
+
+    assert {:ok, %{"open_requests" => 0, "open_chats" => 0}} =
+             Relay.origin_status(relay, "origin", @handle)
+
+    # A person chat turn the agent has not acted on keeps the chat open.
+    assert %{"type" => "ok"} = discussion(relay, "settled", 302, "One more thing")
+
+    assert {:ok, %{"open_requests" => 0, "open_chats" => 1}} =
+             Relay.origin_status(relay, "origin", @handle)
+  end
 end
