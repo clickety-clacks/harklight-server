@@ -34,6 +34,8 @@ defmodule AttentionServer.ClientAPI.Routes do
   - `opts`: `stream: true` exempts a long-lived response, such as the change
     feed, from the in-flight request limit. Every other request, matched or
     not, counts toward the limit from before authentication.
+    `granted_agent: true` exposes the route to owner-registered agents. The
+    answer handler enforces sender grants before writing an item.
 
   Before a handler runs, the router has set `Request-Id`, authenticated the
   principal (401 otherwise), refused a paused account (403 `account_paused`,
@@ -154,7 +156,7 @@ defmodule AttentionServer.ClientAPI.Router do
           paused ->
             Errors.send_error(conn, "account_paused")
 
-          not origin_ok?(conn, opts.auth) ->
+          not principal_allowed?(principal, route) or not origin_ok?(conn, opts.auth) ->
             Errors.send_error(conn, "forbidden")
 
           true ->
@@ -195,6 +197,12 @@ defmodule AttentionServer.ClientAPI.Router do
   catch
     :exit, _reason -> :unavailable
   end
+
+  defp principal_allowed?(%{kind: :agent}, {:ok, _, _, _, route_opts}),
+    do: Keyword.get(route_opts, :granted_agent, false)
+
+  defp principal_allowed?(%{kind: :agent}, :nomatch), do: false
+  defp principal_allowed?(_principal, _route), do: true
 
   defp origin_ok?(conn, {:browser, _backend, origin}), do: Auth.browser_origin_ok?(conn, origin)
   defp origin_ok?(_conn, :device), do: true

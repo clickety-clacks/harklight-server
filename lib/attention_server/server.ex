@@ -225,7 +225,7 @@ defmodule AttentionServer.Server do
               optional_child_spec(
                 :push_dispatcher,
                 PushDispatcher,
-                [relay: relay_name, apns: apns_opts],
+                [relay: relay_name, apns: apns_opts, bounded_attempts: client_api_v2],
                 :apns_dispatch,
                 :configuration,
                 :worker
