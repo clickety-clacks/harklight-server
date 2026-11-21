@@ -2,11 +2,22 @@ defmodule AttentionServer.ClientAPI.Idempotency do
   @moduledoc """
   The client API v2 `Idempotency-Key` store (docs/client-api-v2.md §2 and §5).
 
-  A write's outcome is stored as `{person, key} → (digest, status, body)`. The
-  scope is the **person**, not the client: a device and a browser of the same
-  person share one key space, as the spec asks. A repeat with the same digest
-  gets the stored response back with `Idempotent-Replayed: true` and applies
-  nothing. A repeat with a different digest is `409 idempotency_conflict`.
+  A committed write is stored as `{person, key} → (digest, status, receipt)`.
+  The scope is the **person**, not the client: a device and a browser of the
+  same person share one key space, as the spec asks.
+
+  - Only successes are stored, as today's engine keeps operation receipts
+    only on success: a refused request retried with the same key is evaluated
+    again.
+  - The receipt is compact: what the write changed (an item, its new entry,
+    settings, or a staged file's FileCreated). A repeat with the same digest
+    renders those resources from current state, answers with the stored
+    status and `Idempotent-Replayed: true`, and applies nothing.
+  - A repeat with a different digest is `409 idempotency_conflict`.
+  - The same key sent at the same moment by two different clients of one
+    person may apply twice: begin and finish are separate relay steps, and
+    the engine's own receipts deduplicate per client. A key is minted on one
+    client, so this is not a production pattern (accepted, review C4).
 
   Receipts are kept for at least the change log's 30-day retention window, and
   older ones are pruned as new ones are written. The table lives in the
