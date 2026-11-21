@@ -143,6 +143,8 @@ defmodule AttentionServer.CLIAgentV2Test do
     # Cancelling at the prompt: the journal already holds the exact request,
     # and nothing reached the server.
     assert_raise Mix.Error, ~r/answer cancelled/, fn -> run!(ctx, args, "no") end
+    # Closed input cancels too.
+    assert_raise Mix.Error, ~r/answer cancelled/, fn -> run!(ctx, args, :eof) end
     [journal] = journals(ctx)
 
     assert %{"item_id" => item, "body" => %{"request_revision" => 1}, "idempotency_key" => key} =

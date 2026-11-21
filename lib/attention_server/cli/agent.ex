@@ -210,12 +210,14 @@ defmodule AttentionServer.CLI.Agent do
         "Answer item #{visible(saved["item_id"])}, revision #{revision}, key #{saved["idempotency_key"]}, body #{JSON.encode!(saved["body"])}"
       )
 
-      if String.trim(
-           AttentionServer.CLI.shell().prompt(
-             "Type ANSWER to submit this exact deliberate response: "
-           ) || ""
-         ) != "ANSWER",
-         do: AttentionServer.CLI.error!("answer cancelled")
+      # Anything but a typed ANSWER, including closed input, cancels.
+      typed =
+        AttentionServer.CLI.shell().prompt(
+          "Type ANSWER to submit this exact deliberate response: "
+        )
+
+      unless is_binary(typed) and String.trim(typed) == "ANSWER",
+        do: AttentionServer.CLI.error!("answer cancelled")
 
       HeadlessV2Write.post_answer(endpoint, identity, saved)
     end
