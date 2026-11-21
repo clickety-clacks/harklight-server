@@ -4,6 +4,7 @@ defmodule AttentionServer.ClientAPI.Search do
   alias AttentionServer.{AgentAccess, JSON, Message}
 
   @states ~w(open answered cleared expired superseded retracted)
+  @max_token_bytes 4_096
   @max_page_bytes 4 * 1024 * 1024
 
   def query(params) do
@@ -36,7 +37,8 @@ defmodule AttentionServer.ClientAPI.Search do
 
   def position(nil, high, _binding), do: {:ok, high, high + 1}
 
-  def position("s" <> encoded, current_high, binding) when byte_size(encoded) < 128 do
+  def position("s" <> encoded, current_high, binding)
+      when byte_size(encoded) < @max_token_bytes do
     with {:ok, <<high::64, before::64, ^binding::binary-size(32)>>} <-
            Base.url_decode64(encoded, padding: false),
          true <- before > 0 and before <= high and high <= current_high do

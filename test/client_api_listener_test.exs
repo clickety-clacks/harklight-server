@@ -556,7 +556,7 @@ defmodule AttentionServer.ClientAPIListenerTest do
              } = json(first)
 
       assert is_integer(rev) and rev > 0
-      assert byte_size(page) <= 128
+      assert byte_size(page) <= 4_096
       forward_granted_fixture(relay, "app:beta", "new", 4, [%{"text" => needle}])
 
       assert :ok =
@@ -582,10 +582,17 @@ defmodule AttentionServer.ClientAPIListenerTest do
       assert {:ok, conn, %{status: 404}} =
                request(conn, "GET", path <> "&sender=app:beta&message_id=numeric")
 
-      assert {:ok, _conn, %{status: 400} = invalid} =
+      assert {:ok, conn, %{status: 400} = invalid} =
                request(conn, "GET", "/v2/search?q=different&page=" <> page)
 
       assert %{"error" => "invalid_field", "field" => "page"} = json(invalid)
+
+      oversized_page = "s" <> String.duplicate("a", 4_096)
+
+      assert {:ok, _conn, %{status: 400} = oversized} =
+               request(conn, "GET", path <> "&page=" <> oversized_page)
+
+      assert %{"error" => "invalid_field", "field" => "page"} = json(oversized)
     end
 
     test "the legacy device listener does not admit an agent certificate with the flag off",
