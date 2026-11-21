@@ -5565,12 +5565,12 @@ defmodule AttentionServer.Relay do
             &Engine.request_frame(&1, key, request_frame, state.clock.())
           )
 
-        {next_engine, created_ids, created_paths} =
+        {next_engine, created_ids} =
           if request_success?(reply) do
-            {record_staged_reply_sources(next_engine, staged_sources), created_ids, created_paths}
+            {record_staged_reply_sources(next_engine, staged_sources), created_ids}
           else
             AttentionServer.LargeData.cleanup_created(created_paths)
-            {drop_upload_ids(next_engine, created_ids), [], []}
+            {drop_upload_ids(next_engine, created_ids), []}
           end
 
         {next_engine, touched} =
@@ -5602,12 +5602,34 @@ defmodule AttentionServer.Relay do
             touched
           )
 
-        if created_ids != [] and request_success?(reply) and
-             Enum.all?(created_ids, &Map.has_key?(next_state.store.engine.uploads, &1)) do
-          {reply, %{next_state | upload_index: build_upload_index(next_state.store.engine)}}
-        else
-          {reply, next_state}
-        end
+        {reply, finish_inline_uploads(next_state, created_ids, created_paths, reply)}
+    end
+  end
+
+  defp finish_inline_uploads(state, [], _paths, _reply), do: state
+
+  defp finish_inline_uploads(state, ids, paths, reply) do
+    uploads = state.store.engine.uploads
+
+    cond do
+      request_success?(reply) and Enum.all?(ids, &Map.has_key?(uploads, &1)) ->
+        index =
+          if state.store.mode == :keyed do
+            Enum.reduce(ids, state.upload_index, fn id, index ->
+              add_upload_to_index(index, Map.fetch!(uploads, id))
+            end)
+          else
+            build_upload_index(state.store.engine)
+          end
+
+        %{state | upload_index: index}
+
+      state.store.mode == :keyed ->
+        AttentionServer.LargeData.cleanup_created(paths)
+        state
+
+      true ->
+        state
     end
   end
 

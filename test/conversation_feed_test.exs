@@ -735,7 +735,16 @@ defmodule AttentionServer.ConversationFeedTest do
   end
 
   test "aggregate inline attachments above the threshold use the upload tier", %{path: path} do
-    assert {:ok, relay} = Relay.start_link(store_path: path)
+    inline_upload_roundtrip(path, :legacy)
+  end
+
+  test "keyed overflow upload rolls back its bytes with a failed metadata commit", %{path: path} do
+    inline_upload_roundtrip(path, :keyed_cutover)
+  end
+
+  defp inline_upload_roundtrip(path, mode) do
+    opts = [store_path: path, store_mode: mode]
+    assert {:ok, relay} = Relay.start_link(opts)
     assert :ok = Relay.setup_person(relay, "A")
     assert :ok = Relay.setup_device(relay, "A", "origin")
     assert :ok = Relay.setup_device(relay, "A", "reader")
@@ -782,19 +791,39 @@ defmodule AttentionServer.ConversationFeedTest do
     assert byte_size(overflow_bytes) < 262_144
     assert byte_size(inline_bytes) + byte_size(overflow_bytes) > 262_144
 
-    assert %{"type" => "ok"} =
-             request(relay, "reader", %{
-               "type" => "discussion",
-               "op_id" => op(502),
-               "sender_id" => "app:test",
-               "message_id" => "file-request",
-               "request_revision" => 1,
-               "text" => "Please clarify",
-               "files" => [
-                 %{"name" => "inline.bin", "data_base64" => Base.encode64(inline_bytes)},
-                 %{"name" => "overflow.bin", "data_base64" => Base.encode64(overflow_bytes)}
-               ]
-             })
+    discussion = %{
+      "type" => "discussion",
+      "op_id" => op(502),
+      "sender_id" => "app:test",
+      "message_id" => "file-request",
+      "request_revision" => 1,
+      "text" => "Please clarify",
+      "files" => [
+        %{"name" => "inline.bin", "data_base64" => Base.encode64(inline_bytes)},
+        %{"name" => "overflow.bin", "data_base64" => Base.encode64(overflow_bytes)}
+      ]
+    }
+
+    if mode == :keyed_cutover do
+      store = :sys.get_state(relay).store
+      files = File.ls!(store.upload_dir) |> Enum.sort()
+
+      assert :ok =
+               Sqlite3.execute(store.db, """
+               CREATE TRIGGER reject_discussion BEFORE INSERT ON relay_audit
+               WHEN NEW.action = 'discussion'
+               BEGIN SELECT RAISE(ABORT, 'failed'); END
+               """)
+
+      assert %{"type" => "error", "reason" => "storage_unavailable"} =
+               request(relay, "reader", discussion)
+
+      assert :sys.get_state(relay).store.version == store.version
+      assert File.ls!(store.upload_dir) |> Enum.sort() == files
+      assert :ok = Sqlite3.execute(store.db, "DROP TRIGGER reject_discussion")
+    end
+
+    assert %{"type" => "ok"} = request(relay, "reader", discussion)
 
     assert {:ok, %{"entries" => [_, pending]}} = Relay.origin_feed(relay, "origin", 0)
     assert pending["delivered"] == false
@@ -816,7 +845,7 @@ defmodule AttentionServer.ConversationFeedTest do
              Relay.origin_file_limits(relay, "origin")
 
     GenServer.stop(relay)
-    assert {:ok, restarted} = Relay.start_link(store_path: path)
+    assert {:ok, restarted} = Relay.start_link(opts)
     assert {:ok, [replayed], 1} = Relay.events(restarted, "reader", 0)
     assert replayed["files"] == recipient_delivery["files"]
 

@@ -6,7 +6,7 @@ defmodule AttentionServer.Store.SnapshotEncodingTest do
     persisted =
       engine
       |> Map.from_struct()
-      |> Map.drop([:open_default_index, :advisory_id_index, :route_b_index])
+      |> Map.drop([:open_default_index, :advisory_id_index, :route_b_index, :touched_keys])
 
     {:attention_relay_state, 29, Map.put(persisted, :__struct__, Engine)}
   end
@@ -45,7 +45,7 @@ defmodule AttentionServer.Store.SnapshotEncodingTest do
     assert :erlang.binary_to_term(payload) == expected(next)
   end
 
-  test "FORMAT29 preserves delivery state and focus permissions but excludes rebuilt route indexes" do
+  test "FORMAT29 preserves delivery state and focus permissions, excluding transient fields" do
     {:ok, engine} = Engine.setup_person(Engine.new(), "person")
     {:ok, engine} = Engine.setup_device(engine, "person", "device")
 
@@ -58,7 +58,8 @@ defmodule AttentionServer.Store.SnapshotEncodingTest do
             "device",
             &Map.merge(&1, %{see_focus: true, push_view: true})
           ),
-        route_b_index: %{transient: "must be rebuilt"}
+        route_b_index: %{transient: "must be rebuilt"},
+        touched_keys: MapSet.new([{:row, :devices, "device"}])
     }
 
     {payload, _cache} = SnapshotEncoding.encode(engine, 29)
@@ -67,6 +68,7 @@ defmodule AttentionServer.Store.SnapshotEncodingTest do
     assert persisted.devices["device"].see_focus
     assert persisted.devices["device"].push_view
     refute Map.has_key?(persisted, :route_b_index)
+    refute Map.has_key?(persisted, :touched_keys)
   end
 
   test "origin history remains readable across entry append, delivery update and removal" do
