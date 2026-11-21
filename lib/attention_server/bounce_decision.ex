@@ -239,14 +239,7 @@ defmodule AttentionServer.BounceDecision do
         end
       end)
 
-    waiting_routes =
-      if MapSet.size(still_waiting) == 0 do
-        Map.delete(engine.bounce_waiting_routes, session_key)
-      else
-        Map.put(engine.bounce_waiting_routes, session_key, still_waiting)
-      end
-
-    %{engine | bounce_waiting_routes: waiting_routes}
+    put_waiting_route(engine, session_key, still_waiting)
   end
 
   def rebuild_indexes(%Engine{} = engine) do
@@ -595,7 +588,10 @@ defmodule AttentionServer.BounceDecision do
         case Map.get(engine.origin_sessions, {person, origin, handle}) do
           %{gone: false} = session ->
             if Map.get(record, :agent_api_v2, false) or
-                 match?(%{"advisory_v1" => true, "unsupported_reason" => nil}, Map.get(session, :support)),
+                 match?(
+                   %{"advisory_v1" => true, "unsupported_reason" => nil},
+                   Map.get(session, :support)
+                 ),
                do: :supported,
                else: :unsupported
 
@@ -765,11 +761,7 @@ defmodule AttentionServer.BounceDecision do
         |> then(fn current ->
           waiting = Map.get(current.bounce_waiting_routes, session_key, MapSet.new())
 
-          %{
-            current
-            | bounce_waiting_routes:
-                Map.put(current.bounce_waiting_routes, session_key, MapSet.put(waiting, item))
-          }
+          put_waiting_route(current, session_key, MapSet.put(waiting, item))
         end)
 
       _ ->
@@ -791,17 +783,23 @@ defmodule AttentionServer.BounceDecision do
 
     case Map.get(engine.bounce_waiting_routes, session_key) do
       %MapSet{} = waiting ->
-        remaining = MapSet.delete(waiting, {key, sub_revision})
-
-        waiting_routes =
-          if MapSet.size(remaining) == 0,
-            do: Map.delete(engine.bounce_waiting_routes, session_key),
-            else: Map.put(engine.bounce_waiting_routes, session_key, remaining)
-
-        %{engine | bounce_waiting_routes: waiting_routes}
+        put_waiting_route(engine, session_key, MapSet.delete(waiting, {key, sub_revision}))
 
       _ ->
         engine
+    end
+  end
+
+  defp put_waiting_route(engine, session_key, waiting) do
+    if MapSet.size(waiting) == 0 do
+      if Map.has_key?(engine.bounce_waiting_routes, session_key) do
+        %{engine | bounce_waiting_routes: Map.delete(engine.bounce_waiting_routes, session_key)}
+        |> Engine.touch_fact({:row, :bounce_waiting_routes, session_key})
+      else
+        engine
+      end
+    else
+      Engine.put_row(engine, :bounce_waiting_routes, session_key, waiting)
     end
   end
 

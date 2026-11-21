@@ -5,7 +5,13 @@ defmodule AttentionServer.Store.RecordCodec do
 
   @record_version :relay_record_v1
   @term_options [:deterministic, {:minor_version, 2}]
-  @derived [:advisory_id_index, :open_default_index, :route_b_index, :touched_keys]
+  @derived [
+    :advisory_id_index,
+    :bounce_deadline_index,
+    :open_default_index,
+    :route_b_index,
+    :touched_keys
+  ]
 
   @fields Map.new(
             Map.drop(Map.from_struct(%Engine{}), [:advisory_feeds, :origin_feeds | @derived]),
@@ -16,6 +22,8 @@ defmodule AttentionServer.Store.RecordCodec do
             end
           )
   @required MapSet.new(for {field, :field} <- @fields, do: field)
+
+  def derived_fields, do: @derived
 
   # Enumerate at boot or migration. Routine writes only call encode_row/2
   # for records named by the transition.

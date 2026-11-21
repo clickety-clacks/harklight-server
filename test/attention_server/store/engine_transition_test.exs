@@ -1,7 +1,17 @@
 defmodule AttentionServer.Store.EngineTransitionTest do
   use ExUnit.Case, async: true
 
-  alias AttentionServer.{AgentChangeLog, ChangeLog, Engine, JSON, Relay, Store}
+  alias AttentionServer.{
+    AgentChangeLog,
+    BounceDecision,
+    BouncePolicy,
+    ChangeLog,
+    Engine,
+    JSON,
+    Relay,
+    Store
+  }
+
   alias AttentionServer.Store.KeyedMigration
   alias Exqlite.Sqlite3
 
@@ -543,6 +553,137 @@ defmodule AttentionServer.Store.EngineTransitionTest do
     assert full_diff(live.engine, reopened.engine) == MapSet.new()
     assert index_state(live) == index_state(reopened)
     :ok = Store.close(reopened)
+  end
+
+  test "keyed timer publishes an advisory and acknowledgement survives reopen" do
+    path = legacy_store_path()
+    handle = "00000000-0000-4000-8000-000000000010"
+    {:ok, store} = Store.open(path)
+
+    {:ok, levels} =
+      BouncePolicy.normalize_levels([
+        %{"name" => "Follow up", "lower_bound" => 0, "bounce_after_days" => 1}
+      ])
+
+    assert {:ok, engine, _} = BounceDecision.configure_levels(store.engine, @person, levels, 100)
+    {:ok, send} = JSON.decode_line(forward_line())
+
+    line =
+      send
+      |> Map.put("session_handle", handle)
+      |> put_in(["message", "message_type"], "fyi")
+      |> put_in(["message", "answer_ui"], %{
+        "schema" => "attention-client.actions/1",
+        "actions" => [
+          %{
+            "id" => "seen",
+            "label" => "Seen",
+            "kind" => "value",
+            "value" => %{"acknowledgment" => "seen"}
+          }
+        ]
+      })
+      |> JSON.encode_line()
+
+    {engine, {:ok, accepted}} = Engine.request_line(engine, @origin, line, 100)
+    assert {:ok, %{"type" => "ok"}} = JSON.decode_line(accepted)
+
+    assert {:ok, engine, _} =
+             Engine.origin_support(engine, @origin, %{
+               "type" => "support",
+               "op_id" => "00000000-0000-4000-8000-000000000011",
+               "session_handle" => handle,
+               "route" => "claude-code",
+               "cli_version" => "test",
+               "unsupported_reason" => nil,
+               "advisory_v1" => true
+             })
+
+    selected =
+      BounceDecision.record_scores(
+        engine,
+        @person,
+        [%{"sender_id" => "app:test/worker", "message_id" => "msg", "score" => 0.9}],
+        100
+      )
+
+    assert due_at = BounceDecision.next_deadline(selected)
+
+    assert {:ok, store} =
+             Store.commit(store, selected, %{person: @person, actor: @origin, action: "setup"})
+
+    assert {:ok, _} = KeyedMigration.convert(store)
+    :ok = Store.close(store)
+    flags = path <> ".flags"
+    File.write!(flags, JSON.encode!(%{"client_api_v2" => true}))
+    clock = :atomics.new(1, [])
+    :atomics.put(clock, 1, 100)
+
+    opts = [
+      store_path: path,
+      store_mode: :keyed,
+      feature_flags_path: flags,
+      clock: fn -> :atomics.get(clock, 1) end
+    ]
+
+    assert {:ok, relay} = Relay.start_link(opts)
+    state = :sys.get_state(relay)
+    scope = {@person, @origin}
+    assert {:ok, decision_rev} = AgentChangeLog.head(state.store, scope)
+    :atomics.put(clock, 1, due_at)
+
+    assert :ok =
+             Sqlite3.execute(state.store.db, """
+             CREATE TRIGGER keyed_advisory_fault BEFORE INSERT ON agent_changes
+             WHEN NEW.resource_id LIKE 'advisory:%'
+             BEGIN SELECT RAISE(ABORT, 'failed'); END
+             """)
+
+    send(relay, {:bounce_due, state.bounce_deadline_generation})
+    retry = :sys.get_state(relay)
+
+    assert {:ok, %{"cursor" => 0, "entries" => []}} =
+             Relay.origin_advisory_feed(relay, @origin, handle, 0)
+
+    assert retry.store.version == state.store.version
+    assert {:ok, ^decision_rev} = AgentChangeLog.head(retry.store, scope)
+    assert :ok = Sqlite3.execute(state.store.db, "DROP TRIGGER keyed_advisory_fault")
+    send(relay, {:bounce_due, retry.bounce_deadline_generation})
+    store = :sys.get_state(relay).store
+
+    assert {:ok, %{"cursor" => 1, "entries" => [%{"advisory_id" => id, "delivered" => false}]}} =
+             Relay.origin_advisory_feed(relay, @origin, handle, 0)
+
+    assert get_in(store.engine.advisory_feeds, [
+             {@person, @origin, handle},
+             :entries,
+             1,
+             "decided_at_rev"
+           ]) == decision_rev
+
+    assert {:ok, before_ack} = AgentChangeLog.head(store, scope)
+
+    assert {:ok, %{"already_delivered" => false}} =
+             Relay.origin_advisory_ack(relay, @origin, handle, id)
+
+    committed = :sys.get_state(relay).store
+
+    assert {:ok, [%{resource: {:message, _}}, %{resource: {:advisory, ^id}}], false, _} =
+             AgentChangeLog.read(committed, scope, before_ack, 10, handle)
+
+    GenServer.stop(relay)
+    assert {:ok, reopened} = Relay.start_link(opts)
+
+    assert {:ok, %{"cursor" => 1, "entries" => [%{"advisory_id" => ^id, "delivered" => true}]}} =
+             Relay.origin_advisory_feed(reopened, @origin, handle, 0)
+
+    assert {:ok, %{"already_delivered" => true}} =
+             Relay.origin_advisory_ack(reopened, @origin, handle, id)
+
+    live = :sys.get_state(reopened).store
+    assert live.version == committed.version
+    assert index_state(live) == index_state(committed)
+    GenServer.stop(reopened)
   end
 
   defp normalize_action_times(engine) do

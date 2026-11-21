@@ -134,13 +134,28 @@ defmodule AttentionServer.AgentChangeLog do
     end)
   end
 
-  defp advisory_changes(old, next, changed) do
-    changed
-    |> Map.get_lazy(:advisory_scopes, fn ->
-      changed_keys(old.advisory_feeds, next.advisory_feeds)
-    end)
+  defp advisory_changes(old, next, %{advisories: entries, advisory_receipts: receipts}) do
+    created =
+      for {scope, seq} <- Enum.sort(entries),
+          next_entry = get_in(next.advisory_feeds, [scope, :entries, seq]),
+          is_map(next_entry),
+          next_entry !== get_in(old.advisory_feeds, [scope, :entries, seq]),
+          do: advisory_row(scope, next_entry)
+
+    acknowledged =
+      for {scope, id} <- Enum.sort(receipts),
+          member_of_feed?(next, scope, id) and not member_of_feed?(old, scope, id),
+          seq = Map.fetch!(next.advisory_id_index, {scope, id}),
+          do: advisory_row(scope, get_in(next.advisory_feeds, [scope, :entries, seq]))
+
+    Enum.uniq(created ++ acknowledged)
+  end
+
+  defp advisory_changes(old, next, _changed) do
+    old.advisory_feeds
+    |> changed_keys(next.advisory_feeds)
     |> Enum.sort()
-    |> Enum.flat_map(fn {person, agent, session} = key ->
+    |> Enum.flat_map(fn key ->
       case Map.get(next.advisory_feeds, key) do
         %{high: high, entries: entries, receipts: receipts} ->
           previous = Map.get(old.advisory_feeds, key, %{high: 0, receipts: MapSet.new()})
@@ -154,15 +169,28 @@ defmodule AttentionServer.AgentChangeLog do
 
           for id <- Enum.uniq(created ++ acknowledged),
               seq = Map.fetch!(next.advisory_id_index, {key, id}),
-              %{"sender_id" => sender, "message_id" => message_id} <- [Map.fetch!(entries, seq)],
-              do:
-                {{person, sender, message_id},
-                 {{person, agent}, {:advisory, resource_id({:advisory, id}), session}}}
+              do: advisory_row(key, Map.fetch!(entries, seq))
 
         nil ->
           []
       end
     end)
+  end
+
+  defp member_of_feed?(engine, scope, id) do
+    case get_in(engine.advisory_feeds, [scope, :receipts]) do
+      %MapSet{} = receipts -> MapSet.member?(receipts, id)
+      nil -> false
+    end
+  end
+
+  defp advisory_row({person, agent, session}, %{
+         "advisory_id" => id,
+         "sender_id" => sender,
+         "message_id" => message_id
+       }) do
+    {{person, sender, message_id},
+     {{person, agent}, {:advisory, resource_id({:advisory, id}), session}}}
   end
 
   defp changed_keys(old, next) when old === next, do: []

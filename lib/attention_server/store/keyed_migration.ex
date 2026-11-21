@@ -6,7 +6,6 @@ defmodule AttentionServer.Store.KeyedMigration do
   alias Exqlite.Sqlite3
 
   @format 30
-  @derived [:advisory_id_index, :open_default_index, :route_b_index, :touched_keys]
 
   # The caller supplies the fully normalized and verified legacy Store,
   # including its generation-matched progress overlay.
@@ -80,7 +79,7 @@ defmodule AttentionServer.Store.KeyedMigration do
     engine
     |> Conversation.index_origin_feeds()
     |> Map.from_struct()
-    |> Map.drop(@derived)
+    |> Map.drop(RecordCodec.derived_fields())
   end
 
   defp verify_previous_progress(store) do

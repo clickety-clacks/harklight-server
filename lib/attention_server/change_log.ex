@@ -247,11 +247,11 @@ defmodule AttentionServer.ChangeLog do
     )
     |> Map.put(:settings, touched_settings(touched, old, next))
     |> Map.put(:session_keys, for({:row, :origin_sessions, scope} <- touched, do: scope))
-    |> Map.put(
-      :advisory_scopes,
-      for({:advisory, scope, _} <- touched, into: MapSet.new(), do: scope)
-    )
     |> Map.put(:advisories, for({:advisory, scope, {:entry, seq}} <- touched, do: {scope, seq}))
+    |> Map.put(
+      :advisory_receipts,
+      for({:advisory, scope, {:receipt, id}} <- touched, do: {scope, id})
+    )
   end
 
   defp changed_candidates(keys, old, next) do

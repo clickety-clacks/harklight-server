@@ -1447,12 +1447,22 @@ defmodule AttentionServer.Relay do
   end
 
   defp dispatch_call({:origin_advisory_ack, key, handle, advisory_id}, _from, state) do
-    case BounceDecision.advisory_ack(state.store.engine, key, handle, advisory_id) do
-      {:ok, next, reply} when next == state.store.engine ->
+    engine = state.store.engine
+
+    {next, result, touched} =
+      track_transition(state, engine, fn current ->
+        case BounceDecision.advisory_ack(current, key, handle, advisory_id) do
+          {:ok, next, reply} -> {next, {:ok, reply}}
+          error -> {current, error}
+        end
+      end)
+
+    case result do
+      {:ok, reply} when next == engine ->
         {:reply, {:ok, reply}, state}
 
-      {:ok, next, reply} ->
-        case commit(state.store, next, audit(state.store.engine, key, "origin_advisory_ack")) do
+      {:ok, reply} ->
+        case commit_request(state.store, next, touched, audit(engine, key, "origin_advisory_ack")) do
           {:ok, store} -> {:reply, {:ok, reply}, %{state | store: store}}
           _ -> {:reply, {:error, :storage_unavailable}, state}
         end
@@ -1748,7 +1758,7 @@ defmodule AttentionServer.Relay do
     engine = state.store.engine
 
     {next, result, touched} =
-      request_transition(state, key, engine, &end_origin_session(state, &1, key, handle))
+      track_transition(state, engine, &end_origin_session(state, &1, key, handle))
 
     case result do
       :ok ->
@@ -3672,17 +3682,26 @@ defmodule AttentionServer.Relay do
     state = %{state | bounce_deadline_timer: nil}
     old_engine = state.store.engine
     now_ms = state.clock.()
-    {next_engine, changed_keys} = BounceDecision.evaluate_due_with_changes(old_engine, now_ms)
+
+    {next_engine, changed_keys, touched} =
+      track_transition(state, old_engine, &BounceDecision.evaluate_due_with_changes(&1, now_ms))
 
     if changed_keys == [] do
       {:noreply, reschedule_bounce_sweep(state)}
     else
-      case persist_bounce_decision(state, old_engine, next_engine, changed_keys, "bounce_due") do
+      case persist_bounce_decision(
+             state,
+             old_engine,
+             next_engine,
+             changed_keys,
+             touched,
+             "bounce_due"
+           ) do
         {:ok, next_state} ->
           {:noreply, next_state}
 
         {:error, reason} ->
-          Diagnostics.failure(:bounce_schedule, :decision_commit, reason, :unavailable)
+          Diagnostics.failure(:server_storage, :state_commit, reason, :unavailable)
           {:noreply, schedule_bounce_retry(state)}
       end
     end
@@ -5375,9 +5394,8 @@ defmodule AttentionServer.Relay do
 
   defp perform_request_line(state, key, raw) do
     {next_engine, reply, touched} =
-      request_transition(
+      track_transition(
         state,
-        key,
         state.store.engine,
         &Engine.request_line(&1, key, raw, state.clock.())
       )
@@ -5438,9 +5456,8 @@ defmodule AttentionServer.Relay do
 
       {:ok, request_engine, request_frame, created_ids, created_paths} ->
         {next_engine, reply, touched} =
-          request_transition(
+          track_transition(
             state,
-            key,
             request_engine,
             &Engine.request_frame(&1, key, request_frame, state.clock.())
           )
@@ -5490,11 +5507,11 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  defp request_transition(%{store: %Store{mode: :keyed}}, _key, engine, apply_request),
-    do: Engine.with_touches(engine, apply_request)
+  defp track_transition(%{store: %Store{mode: :keyed}}, engine, transition),
+    do: Engine.with_touches(engine, transition)
 
-  defp request_transition(_state, _key, engine, apply_request) do
-    {next, reply} = apply_request.(engine)
+  defp track_transition(_state, engine, transition) do
+    {next, reply} = transition.(engine)
     {next, reply, nil}
   end
 
@@ -5994,7 +6011,7 @@ defmodule AttentionServer.Relay do
     engine_entries = Map.get(view, :engine_entries, Map.get(view, :entries, []))
 
     {next, nil, touched} =
-      request_transition(state, nil, state.store.engine, fn engine ->
+      track_transition(state, state.store.engine, fn engine ->
         {Engine.retain_reply_scores(engine, person, engine_entries), nil}
       end)
 
@@ -6478,14 +6495,19 @@ defmodule AttentionServer.Relay do
   defp put_scored_priority_view(state, person, items, entries, reply_summary) do
     old_engine = state.store.engine
 
-    {next_engine, changed_keys} =
-      BounceDecision.record_scores_with_changes(old_engine, person, entries, state.clock.())
+    {next_engine, changed_keys, touched} =
+      track_transition(
+        state,
+        old_engine,
+        &BounceDecision.record_scores_with_changes(&1, person, entries, state.clock.())
+      )
 
     case persist_bounce_decision(
            state,
            old_engine,
            next_engine,
            changed_keys,
+           touched,
            "bounce_score_selection"
          ) do
       {:ok, next_state} ->
@@ -6505,17 +6527,17 @@ defmodule AttentionServer.Relay do
         {next_state, false}
 
       {:error, reason} ->
-        Diagnostics.failure(:bounce_schedule, :score_selection_commit, reason, :unavailable)
+        Diagnostics.failure(:server_storage, :state_commit, reason, :unavailable)
 
         {put_priority_view(state, person, fallback_view(items), reply_summary), true}
     end
   end
 
-  defp persist_bounce_decision(state, old_engine, next_engine, _changed_keys, _action)
+  defp persist_bounce_decision(state, old_engine, next_engine, _changed_keys, _touched, _action)
        when old_engine == next_engine,
        do: {:ok, state}
 
-  defp persist_bounce_decision(state, old_engine, next_engine, changed_keys, action) do
+  defp persist_bounce_decision(state, old_engine, next_engine, changed_keys, touched, action) do
     audit = %{person: "system", actor: "bounce_decision", action: action}
 
     with {:ok, next_engine} <-
@@ -6524,7 +6546,7 @@ defmodule AttentionServer.Relay do
              next_engine,
              changed_keys
            ),
-         {:ok, store} <- commit(state.store, next_engine, audit) do
+         {:ok, store} <- commit_request(state.store, next_engine, touched, audit) do
       next_state = %{state | store: store}
 
       next_state =
