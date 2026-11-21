@@ -426,10 +426,20 @@ defmodule AttentionServer.ClientAPI.Resources do
       {_, "answer", true, %LargeData.Ref{} = answer} ->
         %{"kind" => "reply", "text" => answer}
 
+      # A Seen answer stores the Seen action's value, which today's outcome
+      # has no case for; the contract's outcome for it is seen.
+      {_, "answer", true, %{} = answer} ->
+        if seen_value?(record.message, answer), do: %{"kind" => "seen"}
+
       _ ->
         nil
     end
   end
+
+  defp seen_value?(%{"answer_ui" => %{"actions" => actions}}, answer) when is_list(actions),
+    do: Enum.any?(actions, &match?(%{"id" => "seen", "kind" => "value", "value" => ^answer}, &1))
+
+  defp seen_value?(_message, _answer), do: false
 
   defp origin_result(%{origin_result: %{status: status, revision: revision} = result}) do
     put_present(%{"status" => status, "revision" => revision}, "result_ref", result[:result_ref])

@@ -655,6 +655,41 @@ defmodule AttentionServer.ClientAPIResourcesTest do
     end
   end
 
+  describe "answer outcomes" do
+    test "an FYI answered with its Seen action shows answer kind seen", %{path: path} do
+      relay = scripted_relay(path)
+
+      forward(relay, "fyi", 70, %{
+        "message_type" => "fyi",
+        "answer_ui" => %{
+          "schema" => "attention-client.actions/1",
+          "actions" => [
+            %{
+              "id" => "seen",
+              "label" => "Seen",
+              "kind" => "value",
+              "value" => %{"acknowledgment" => "seen"}
+            }
+          ]
+        }
+      })
+
+      assert %{"type" => "ok"} =
+               request(relay, "reader", %{
+                 "type" => "answer",
+                 "op_id" => op(71),
+                 "sender_id" => "app:test",
+                 "message_id" => "fyi",
+                 "answer" => %{"acknowledgment" => "seen"}
+               })
+
+      {engine, view} = snapshot(relay)
+      item = rendered_items(engine, view, "reader")[key("fyi")]
+      assert %{"state" => "answered", "answer" => %{"kind" => "seen"}} = item["terminal"]
+      GenServer.stop(relay)
+    end
+  end
+
   describe "availability entries" do
     test "an availability change is a schema-conformant server entry on each open item",
          %{path: path} do
