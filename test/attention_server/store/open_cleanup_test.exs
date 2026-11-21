@@ -1,6 +1,8 @@
 defmodule AttentionServer.Store.OpenCleanupTest do
   use ExUnit.Case, async: true
 
+  import ExUnit.CaptureLog
+
   alias AttentionServer.{JSON, LargeData, Relay, Store}
   alias Exqlite.Sqlite3
 
@@ -47,7 +49,8 @@ defmodule AttentionServer.Store.OpenCleanupTest do
       paths = orphan_files(path)
 
       try do
-        assert {:error, _} = Store.open(path, mode)
+        log = capture_log(fn -> assert {:error, _} = Store.open(path, mode) end)
+        assert log =~ "cause=busy"
         assert Enum.map(paths, &File.read/1) == [{:ok, "in flight"}, {:ok, "in flight"}]
       after
         Sqlite3.execute(db, "ROLLBACK")
@@ -78,6 +81,49 @@ defmodule AttentionServer.Store.OpenCleanupTest do
       assert Enum.map(paths, &File.read/1) == [{:ok, "in flight"}, {:ok, "in flight"}]
     after
       Sqlite3.close(db)
+    end
+  end
+
+  for mode <- [:legacy, :keyed] do
+    test "a #{mode} open whose generation moves before cleanup is refused and prunes nothing", %{
+      path: path
+    } do
+      mode = unquote(mode)
+
+      bump =
+        if mode == :keyed do
+          assert {:ok, keyed} = Store.open(path, :keyed_cutover)
+          assert :ok = Store.close(keyed)
+          "UPDATE relay_record_generation SET generation = generation + 1 WHERE id = 1"
+        else
+          "UPDATE relay_state SET version = version + 1 WHERE id = 1"
+        end
+
+      assert {:ok, db} = Sqlite3.open(path)
+
+      assert :ok =
+               Sqlite3.execute(db, """
+               CREATE TRIGGER move_generation AFTER INSERT ON relay_large_data_refs
+               BEGIN #{bump}; END;
+               """)
+
+      paths = orphan_files(path)
+
+      try do
+        log =
+          capture_log(fn -> assert {:error, :storage_unavailable} = Store.open(path, mode) end)
+
+        assert log =~ "cause=stale_generation"
+        refute log =~ "cause=unknown"
+        assert Enum.map(paths, &File.read/1) == [{:ok, "in flight"}, {:ok, "in flight"}]
+        assert :ok = Sqlite3.execute(db, "DROP TRIGGER move_generation")
+      after
+        Sqlite3.close(db)
+      end
+
+      assert {:ok, store} = Store.open(path, mode)
+      assert :ok = Store.close(store)
+      refute Enum.any?(paths, &File.exists?/1)
     end
   end
 

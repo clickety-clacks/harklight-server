@@ -53,6 +53,7 @@ defmodule AttentionServer.Diagnostics do
     bad_frame: "protocol_frame_rejected",
     invalid_json: "invalid_json",
     storage_unavailable: "storage_unavailable",
+    stale_generation: "stale_generation",
     incomplete_upload: "incomplete_upload",
     upload_conflict: "upload_conflict",
     upload_discarded: "upload_discarded",
@@ -103,6 +104,7 @@ defmodule AttentionServer.Diagnostics do
                    end),
                    %{
                      "BadDeviceToken" => "apns_bad_device_token",
+                     "database is locked" => "busy",
                      "ExpiredProviderToken" => "apns_expired_provider_token",
                      "ExpiredToken" => "apns_expired_token",
                      "Unregistered" => "apns_unregistered",
