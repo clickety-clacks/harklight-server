@@ -1411,8 +1411,18 @@ Writes return 200 unless the table says otherwise. Each response schema requires
   to straight apostrophes (`Relay.normalized_device_name`). With neither
   selector, the server chooses the most
   recently active listed device when the request is made. An unknown item
-  or missing target device answers `404 not_found`. It holds or sends the
-  view as in §5.1 and returns the resolved device name and delivery state.
+  or missing target device answers `404 not_found`. The response returns
+  the resolved device name and delivery state. The state is `sent` when
+  the resolved target device is opted in and listed, its feed writer hands
+  the ephemeral `show` frame to the device's open HTTP/2 SSE stream, and
+  `Plug.Conn.chunk` returns success. The handler waits for the writer's
+  result up to the shared request timeout. Otherwise the state is `held`,
+  including when the write fails or is skipped, the show has already been
+  consumed, or the wait times out. A single transport send failure can
+  still yield `sent` if the connection stays open and Bandit returns chunk
+  success. For either state, the device's next focus-write response carries
+  the show only while it is still pending (§5.1). Both delivery paths use
+  the same `show_id`, which the client applies once.
 - **Files.** An agent uses the §4 device download response for
   `GET /v2/files/{file_id}`, including its stored type and quoted sha256
   ETag. `FileCreated.file_id` is the upload handle, accepted by a write's
