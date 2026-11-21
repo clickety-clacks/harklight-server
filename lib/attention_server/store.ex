@@ -1108,7 +1108,8 @@ defmodule AttentionServer.Store do
             {person, AttentionServer.ChangeLog.seeded?(store.engine, person)}
           end)
 
-        {pending, seeded, AttentionServer.ChangeLog.closings(store.engine, next)}
+        {pending, seeded, AttentionServer.ChangeLog.closings(store.engine, next),
+         AttentionServer.ChangeLog.new_resources(store.engine, next)}
       end
 
     result =
@@ -1238,8 +1239,8 @@ defmodule AttentionServer.Store do
 
   defp append_change_log(_db, nil, _version), do: {:ok, %{}}
 
-  defp append_change_log(db, {pending, seeded, _closings}, version),
-    do: AttentionServer.ChangeLog.append(db, pending, seeded, version)
+  defp append_change_log(db, {pending, seeded, _closings, created}, version),
+    do: AttentionServer.ChangeLog.append(db, pending, seeded, version, created)
 
   # ACKs must be durable before their replies, but do not change retained history.
   # The overlay is tied to the snapshot generation. Older releases ignore it;
