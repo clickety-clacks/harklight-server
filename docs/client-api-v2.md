@@ -1413,12 +1413,12 @@ Writes return 200 unless the table says otherwise. Each response schema requires
   recently active listed device when the request is made. An unknown item
   or missing target device answers `404 not_found`. The response returns
   the resolved device name and delivery state. The state is `sent` when
-  the target device is opted in and listed, has an open SSE feed, and
-  the server hands the ephemeral `show` event to that feed's writer.
+  the resolved target device is opted in and listed, has an open SSE feed,
+  and the ephemeral `show` event was handed to that feed's writer.
   Otherwise the state is `held`. The HTTP response returns without
-  waiting for the device. In either case, the same show stays pending
-  in relay memory and also arrives in the device's next focus-write
-  response as in §5.1. Both delivery paths use the same `show_id`,
+  waiting for the device. In either case, the show stays pending in relay
+  memory. The device's next focus-write response carries it if it is
+  still pending (§5.1). Both delivery paths use the same `show_id`,
   which the client applies once.
 - **Files.** An agent uses the §4 device download response for
   `GET /v2/files/{file_id}`, including its stored type and quoted sha256
