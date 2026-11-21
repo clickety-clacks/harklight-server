@@ -3,7 +3,13 @@ defmodule AttentionServer.Store.Transition do
 
   alias AttentionServer.Engine
 
-  @separate [:advisory_feeds, :advisory_id_index, :open_default_index, :route_b_index]
+  @separate [
+    :advisory_feeds,
+    :advisory_id_index,
+    :open_default_index,
+    :route_b_index,
+    :touched_keys
+  ]
   @fields Map.new(Map.drop(Map.from_struct(%Engine{}), @separate), fn
             {field, %MapSet{}} -> {field, :member}
             {field, value} when is_map(value) -> {field, :row}

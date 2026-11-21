@@ -43,10 +43,27 @@ defmodule AttentionServer.Store.RecordCodecTest do
 
   test "derived indexes are rebuilt by the caller" do
     baseline = Engine.new()
-    with_index = %{baseline | open_default_index: %{{"person", "sender", "message"} => 27}}
+    item = {"person", "sender", "message"}
+    origin_entry = {"person", "origin", "session", "sender", "message"}
 
-    assert Enum.to_list(RecordCodec.encode(baseline)) ==
-             Enum.to_list(RecordCodec.encode(with_index))
+    with_indexes = %{
+      baseline
+      | open_default_index: %{item => 27},
+        bounce_discussed_messages: MapSet.new([item]),
+        bounce_origin_entries: MapSet.new([origin_entry])
+    }
+
+    rows = Enum.to_list(RecordCodec.encode(baseline))
+    assert rows == Enum.to_list(RecordCodec.encode(with_indexes))
+
+    rehearsal_cache_rows = [
+      RecordCodec.encode_row({:member, :bounce_discussed_messages, item}, true),
+      RecordCodec.encode_row({:member, :bounce_origin_entries, origin_entry}, true)
+    ]
+
+    assert {:ok, decoded} = RecordCodec.decode(rehearsal_cache_rows ++ rows)
+    assert decoded.bounce_discussed_messages == MapSet.new()
+    assert decoded.bounce_origin_entries == MapSet.new()
   end
 
   test "encodes advisory counters, entries and receipts as separate records" do
@@ -121,6 +138,35 @@ defmodule AttentionServer.Store.RecordCodecTest do
     """
 
     assert {"1.234e567\n", 0} = cold_elixir(contents, [fixture])
+  end
+
+  test "origin history persists as independent high, entry and delivery rows" do
+    scope = {"person", "origin"}
+
+    entries =
+      Map.new(
+        1..300,
+        &{&1, %{"session_handle" => "session", "event_id" => Integer.to_string(&1)}}
+      )
+
+    feed = %{high: 300, entries: entries, delivery_acks: %{1 => %{ack1: 4}}}
+    engine = %{Engine.new() | origin_feeds: %{scope => feed}}
+    normalized = AttentionServer.Conversation.index_origin_feeds(engine)
+    before = MapSet.new(RecordCodec.encode(normalized))
+    next = put_in(normalized.origin_feeds[scope].delivery_acks[1], %{ack1: 4, ack2: 7})
+    after_rows = MapSet.new(RecordCodec.encode(next))
+
+    assert MapSet.to_list(MapSet.difference(after_rows, before)) ==
+             [
+               RecordCodec.encode_row({:origin_feed, scope, {:delivery_ack, 1}}, %{
+                 ack1: 4,
+                 ack2: 7
+               })
+             ]
+
+    assert {:ok, decoded} = RecordCodec.decode(after_rows |> Enum.to_list() |> Enum.reverse())
+    refute Map.has_key?(decoded.origin_feeds[scope], :entry_seqs_by_handle)
+    assert AttentionServer.Conversation.index_origin_feeds(decoded) == next
   end
 
   defp cold_elixir(contents, args) do
