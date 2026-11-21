@@ -367,8 +367,8 @@ defmodule AttentionServer.Store do
   def put_published_upload(%__MODULE__{db: nil}, _metadata),
     do: {:error, :storage_unavailable}
 
-  def put_published_upload(%__MODULE__{mode: :keyed} = store, metadata) do
-    next = put_in(store.engine.uploads[metadata.id], metadata)
+  def put_published_upload(%__MODULE__{mode: :keyed, engine: engine} = store, metadata) do
+    next = put_in(engine.uploads[metadata.id], metadata)
     keys = MapSet.new([{:row, :uploads, metadata.id}])
     audit = %{person: metadata.person, actor: metadata.uploader, action: "file_upload"}
 

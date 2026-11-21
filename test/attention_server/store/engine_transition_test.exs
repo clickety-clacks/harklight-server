@@ -1513,6 +1513,58 @@ defmodule AttentionServer.Store.EngineTransitionTest do
     GenServer.stop(reopened)
   end
 
+  test "keyed staged upload through Relay persists one authorization across retry and reopen" do
+    path = legacy_store_path()
+    {:ok, legacy} = Store.open(path)
+    assert {:ok, _} = KeyedMigration.convert(legacy)
+    :ok = Store.close(legacy)
+    opts = [store_path: path, store_mode: :keyed]
+    {:ok, relay} = Relay.start_link(opts)
+    bytes = <<0, 255, 42>>
+    sha = Base.encode16(:crypto.hash(:sha256, bytes), case: :lower)
+    source = Path.join(Path.dirname(path), "source.bin")
+    File.write!(source, bytes)
+
+    attrs = %{
+      "op_id" => "00000000-0000-4000-8000-000000000078",
+      "sender_id" => @sender,
+      "message_id" => "attachment",
+      "revision" => 1,
+      "name" => "attachment.bin"
+    }
+
+    assert {:ok, lease} = Relay.upload_begin(relay, @origin, attrs, byte_size(bytes))
+
+    assert {:ok, %{"upload_id" => id, "duplicate" => false}} =
+             Relay.upload_file(relay, @origin, attrs, source, byte_size(bytes), sha, lease)
+
+    assert :ok = Relay.upload_end(relay, lease)
+    live = :sys.get_state(relay).store
+    GenServer.stop(relay)
+
+    {:ok, reopened} = Relay.start_link(opts)
+    assert {:ok, duplicate_lease} = Relay.upload_begin(reopened, @origin, attrs, byte_size(bytes))
+
+    assert {:ok, %{"upload_id" => ^id, "duplicate" => true}} =
+             Relay.upload_file(
+               reopened,
+               @origin,
+               attrs,
+               source,
+               byte_size(bytes),
+               sha,
+               duplicate_lease
+             )
+
+    assert :ok = Relay.upload_end(reopened, duplicate_lease)
+    stored = :sys.get_state(reopened).store
+    assert stored.version == live.version
+    assert full_diff(live.engine, stored.engine) == MapSet.new()
+    assert {:ok, upload_path} = Store.get_upload(stored, id)
+    assert File.read!(upload_path) == bytes
+    GenServer.stop(reopened)
+  end
+
   defp enrollment_certificate(name) do
     %{cert: der} =
       :public_key.pkix_test_root_cert(String.to_charlist(name), key: {:namedCurve, :secp256r1})
