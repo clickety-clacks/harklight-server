@@ -11,14 +11,19 @@ defmodule AttentionServer.ClientAPI.FeedRenderer do
   alias AttentionServer.ChangeLog
   alias AttentionServer.ClientAPI.{Reads, Resources}
 
-  @doc "Renders one row: `{:ok, data}` or `:skip`."
+  @doc """
+  Renders one row: `{:ok, data}`, `:skip` for a row with no client form, or
+  `{:error, :storage_unavailable}` when the store failed, which the feed must
+  treat as a failed step, never as a skipped row.
+  """
   def render(context, who, row) do
     [{^row, result}] = render_many(context, who, [row])
     result
   end
 
   @doc """
-  Renders a step's rows together: `[{row, {:ok, data} | :skip}]`, in order.
+  Renders a step's rows together: `[{row, {:ok, data} | :skip | {:error,
+  :storage_unavailable}}]`, in order.
   The principal is resolved once, and each item's entries are built once for
   all of its rows, so a long chat's backlog costs one pass, not one per row.
   """
@@ -50,6 +55,9 @@ defmodule AttentionServer.ClientAPI.FeedRenderer do
        |> Resources.stamp(rev)
        |> then(&Resources.render(:item, &1, principal))}
     else
+      # The feed must fail the step rather than skip a change it could not
+      # render because the store failed.
+      {:error, :storage_unavailable} -> {:error, :storage_unavailable}
       _ -> :skip
     end
   end

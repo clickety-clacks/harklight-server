@@ -449,4 +449,31 @@ defmodule AttentionServer.ClientAPIReadsTest do
     for item <- late, do: assert(item["rev"] > first_rev)
     GenServer.stop(relay)
   end
+
+  test "a failing rank store answers storage_unavailable, not a recomputation", %{
+    path: path,
+    flags: flags
+  } do
+    relay = scripted_relay(path, flags)
+    one = item_id(relay, "one")
+    assert {:ok, _} = Reads.item(relay, "reader", one)
+
+    :sys.replace_state(relay, fn state -> %{state | store: %{state.store | db: :unusable}} end)
+
+    state = :sys.get_state(relay)
+    context = %{engine: state.store.engine, store: state.store, view: nil}
+    assert {:error, :storage_unavailable} = Reads.item_rank(context, "A", one)
+
+    principal = %AttentionServer.ClientAPI.Principal{person: "A", kind: :device, key: "reader"}
+    {:ok, key} = AttentionServer.ClientAPI.Resources.item_key(state.store.engine, "A", one)
+
+    row = %{
+      rev: 99,
+      kind: :item,
+      resource_id: AttentionServer.ChangeLog.item_resource(key)
+    }
+
+    assert AttentionServer.ClientAPI.FeedRenderer.render(context, principal, row) ==
+             {:error, :storage_unavailable}
+  end
 end
