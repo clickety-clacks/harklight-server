@@ -899,7 +899,13 @@ defmodule AttentionServer.ClientAPIListenerTest do
 
     test "legacy compact push receipts cannot replay a replacement binding", ctx do
       path = ["devices", "me", "push"]
-      old_put = %{"token" => String.duplicate("ab", 32), "environment" => "sandbox", "revision" => 1}
+
+      old_put = %{
+        "token" => String.duplicate("ab", 32),
+        "environment" => "sandbox",
+        "revision" => 1
+      }
+
       put_key = push_key(7)
       delete_key = push_key(8)
       assert {:ok, conn} = device_connect(ctx, "a1", :http2)
@@ -916,6 +922,7 @@ defmodule AttentionServer.ClientAPIListenerTest do
       end)
 
       assert {:ok, conn, %{status: 409} = put} = register_push(conn, "ab", 1, put_key)
+
       assert {:ok, conn, %{status: 409} = delete} =
                request(conn, "DELETE", "/v2/devices/me/push", [{"idempotency-key", delete_key}])
 

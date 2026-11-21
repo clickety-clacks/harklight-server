@@ -1261,7 +1261,7 @@ defmodule AttentionServer.ClientAPI.Resources do
 
   defp push_status(binding) do
     %{"state" => binding.state, "revision" => binding.revision}
-    |> put_present("binding_id", Map.get(binding, :binding_id))
+    |> put_present("binding_id", if(binding.active, do: Map.get(binding, :binding_id)))
     |> put_present("environment", if(binding.active, do: environment(binding.profile_id)))
     |> put_present("last_attempt_at_ms", time_ms(Map.get(binding, :last_attempt_at)))
     |> put_present("next_attempt_at_ms", time_ms(Map.get(binding, :next_at)))

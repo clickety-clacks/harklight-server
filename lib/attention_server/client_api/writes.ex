@@ -310,6 +310,10 @@ defmodule AttentionServer.ClientAPI.Writes do
     })
   end
 
+  # The old digest identifies a receipt with no recorded push response. A
+  # retry with that key must conflict instead of replaying current settings.
+  @push_receipt_version 2
+
   @doc """
   `PUT /v2/devices/me/push`: register or replace this device's push binding.
   `environment` is `"production"` or `"sandbox"`. A `revision` at or below the
@@ -319,7 +323,12 @@ defmodule AttentionServer.ClientAPI.Writes do
     write(relay, who, idempotency_key, {:push, token, environment, revision}, %{
       method: "PUT",
       path: ["devices", "me", "push"],
-      body: %{"token" => token, "environment" => environment, "revision" => revision}
+      body: %{
+        "token" => token,
+        "environment" => environment,
+        "revision" => revision,
+        "receipt_version" => @push_receipt_version
+      }
     })
   end
 
@@ -328,7 +337,7 @@ defmodule AttentionServer.ClientAPI.Writes do
     write(relay, who, idempotency_key, :remove_push, %{
       method: "DELETE",
       path: ["devices", "me", "push"],
-      body: %{}
+      body: %{"receipt_version" => @push_receipt_version}
     })
   end
 
