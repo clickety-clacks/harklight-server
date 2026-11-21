@@ -95,7 +95,7 @@ defmodule AttentionServer.HeadlessDeviceV2Test do
 
     assert Enum.sort(Enum.map(items, & &1["message"]["title"])) == ~w(one three two)
     assert read_json!(directory, "v2/cursor.json") == %{"rev" => rev}
-    assert read_json!(directory, "v2/items.json") == %{"items" => items}
+    assert read_json!(directory, "v2/items.json") == %{"items" => items, "tombstones" => %{}}
 
     for file <- ~w(v2 v2/items.json v2/cursor.json) do
       assert {:ok, %File.Stat{mode: mode}} = File.stat(Path.join(directory, file))
@@ -110,6 +110,47 @@ defmodule AttentionServer.HeadlessDeviceV2Test do
 
     # Another person's device sees none of it.
     assert {:ok, %{"items" => []}} = HeadlessDevice.read(ctx.identities["b1"], ctx.endpoint)
+  end
+
+  test "a later read applies only the change batches after the stored cursor", ctx do
+    forward!(ctx.relay, "one", 2)
+    directory = ctx.identities["a1"]
+    assert {:ok, %{"rev" => rev}} = HeadlessDevice.read(directory, ctx.endpoint)
+
+    # Mark the held copy locally. A snapshot would overwrite it; applying only
+    # the changes after the cursor leaves an unchanged item as held.
+    held = read_json!(directory, "v2/items.json")
+    marked = update_in(held, ["items", Access.at(0), "message", "title"], fn _ -> "held" end)
+    File.write!(Path.join(directory, "v2/items.json"), JSON.encode!(marked))
+
+    for {id, n} <- [{"two", 3}, {"three", 4}, {"four", 5}], do: forward!(ctx.relay, id, n)
+
+    # One change per batch, so the read follows `more` across batches.
+    endpoint = Map.put(ctx.endpoint, :v2_batch_limit, 1)
+    assert {:ok, %{"rev" => later, "items" => items}} = HeadlessDevice.read(directory, endpoint)
+    assert later > rev
+    titles = Enum.map(items, & &1["message"]["title"])
+    assert Enum.sort(titles) == ~w(four held three two)
+    assert read_json!(directory, "v2/cursor.json") == %{"rev" => later}
+    assert read_json!(directory, "v2/items.json")["items"] == items
+
+    # Nothing new: the cursor stays and the items are as held.
+    assert {:ok, %{"rev" => ^later, "items" => ^items}} = HeadlessDevice.read(directory, endpoint)
+  end
+
+  test "an expired cursor rebaselines from a fresh snapshot", ctx do
+    forward!(ctx.relay, "one", 2)
+    directory = ctx.identities["a1"]
+    assert {:ok, %{"rev" => rev, "items" => items}} = HeadlessDevice.read(directory, ctx.endpoint)
+
+    # A cursor the server no longer serves (here, past its position) is 410.
+    File.write!(Path.join(directory, "v2/cursor.json"), JSON.encode!(%{"rev" => rev + 1000}))
+    File.write!(Path.join(directory, "v2/items.json"), JSON.encode!(%{"items" => []}))
+
+    assert {:ok, %{"rev" => ^rev, "items" => ^items}} =
+             HeadlessDevice.read(directory, ctx.endpoint)
+
+    assert read_json!(directory, "v2/cursor.json") == %{"rev" => rev}
   end
 
   test "device read refuses a revoked device and keeps its stored cursor", ctx do
