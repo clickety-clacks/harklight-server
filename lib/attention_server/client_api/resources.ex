@@ -53,6 +53,27 @@ defmodule AttentionServer.ClientAPI.Resources do
     end
   end
 
+  @doc """
+  The `item_id` an item had, for a removal: from its record, or when the
+  record is gone, from the delivery event at its acceptance sequence.
+  """
+  def removed_item_id(%Engine{} = engine, {person, _, _} = key) do
+    case item_id(engine, key) do
+      {:ok, item_id} ->
+        {:ok, item_id}
+
+      _ ->
+        high = Map.get(engine.persons, person, 0)
+
+        Enum.find_value(1..max(high, 0)//1, {:error, :not_found}, fn seq ->
+          case Map.get(engine.events, {person, seq}) do
+            %{kind: :delivery, key: ^key} -> {:ok, "i" <> Integer.to_string(seq)}
+            _ -> nil
+          end
+        end)
+    end
+  end
+
   @doc "Resolves an `item_id` to the engine key of one of the person's items."
   def item_key(%Engine{} = engine, person, "i" <> digits) when is_binary(person) do
     with {:ok, seq} <- parse_seq(digits),

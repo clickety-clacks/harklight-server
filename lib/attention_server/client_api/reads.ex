@@ -433,6 +433,10 @@ defmodule AttentionServer.ClientAPI.Reads do
     |> then(&Resources.render(:item, &1, principal))
   end
 
+  @doc false
+  # The render principal for a request principal, shared with the feed renderer.
+  def client_principal(engine, who), do: principal(engine, who)
+
   # A browser session is the person's owner key pinned to an owner revision,
   # re-checked here as today's browser paths do. It is never an item's origin
   # and has no subscriptions, so it sees knocks, as today's browser rows do.
@@ -444,7 +448,8 @@ defmodule AttentionServer.ClientAPI.Reads do
         {:ok,
          %{
            person: person,
-           key: "browser:" <> to_string(Map.get(who, :session_id)),
+           # Internal only: never an origin, never sent or logged.
+           key: "browser:" <> Base.url_encode64(to_string(Map.get(who, :session_id))),
            kind: :browser,
            senders: MapSet.new()
          }}
@@ -467,7 +472,31 @@ defmodule AttentionServer.ClientAPI.Reads do
 
   defp ranks(state, person) do
     view = Map.get(state.priority_views, person)
-    Resources.ranks(state.store.engine, person, view, previous_rank_keys(state, person))
+    memo_ranks(state.store.engine, person, view, fn -> previous_rank_keys(state, person) end)
+  end
+
+  @doc false
+  # One item's rank for the feed renderer, from the same ranks reads use.
+  def item_rank(%{engine: engine, view: view}, person, item_id) do
+    engine
+    |> memo_ranks(person, view, fn -> %{} end)
+    |> Map.fetch(item_id)
+  end
+
+  # Ranks are kept for the last engine and view they were computed from, so
+  # a feed batch or repeated reads of unchanged state compute them once. The
+  # comparison is by identity in practice: an unchanged state is the same
+  # term. Stored ranks from the change log replace this (review finding F5).
+  defp memo_ranks(engine, person, view, previous) do
+    case Process.get({__MODULE__, :ranks, person}) do
+      {^engine, ^view, ranks} ->
+        ranks
+
+      _ ->
+        ranks = Resources.ranks(engine, person, view, previous.())
+        Process.put({__MODULE__, :ranks, person}, {engine, view, ranks})
+        ranks
+    end
   end
 
   ## Change-log positions
