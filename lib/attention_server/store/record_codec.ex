@@ -44,8 +44,10 @@ defmodule AttentionServer.Store.RecordCodec do
     Stream.concat(fields, advisories)
   end
 
+  def encode_key(address), do: :erlang.term_to_binary({@record_version, address}, @term_options)
+
   def encode_row(address, value) do
-    key = :erlang.term_to_binary({@record_version, address}, @term_options)
+    key = encode_key(address)
     payload = :erlang.term_to_binary(value, [:compressed | @term_options])
     {key, payload, checksum(key, payload)}
   end
