@@ -595,6 +595,110 @@ defmodule AttentionServer.ClientAPIFeedShowTest do
     Task.shutdown(writer, :brutal_kill)
   end
 
+  test "one TLS connection retrying an in-flight key produces one show", ctx do
+    assert {:ok, origin} =
+             Relay.setup_device_certificate(
+               ctx.relay,
+               "A",
+               TLSFixtures.certificate_der!(ctx.certs, "a2")
+             )
+
+    :sys.replace_state(ctx.relay, fn state ->
+      put_in(state.store.engine.devices[origin].push_view, true)
+    end)
+
+    writer = controlled_writer(ctx, head(ctx.relay))
+
+    assert {:ok, %{"items" => [%{"item_id" => item}]}} =
+             ClientAPI.Reads.inbox(ctx.relay, ctx.reader)
+
+    test = self()
+    key = "00000000-0000-4000-8000-000000000012"
+    data = JSON.encode!(%{"item_id" => item, "target" => "chat"})
+    headers = [{"idempotency-key", key}]
+
+    request =
+      Task.async(fn ->
+        conn = connect(ctx.port, ctx.certs, "a2")
+
+        assert {:ok, conn, first} =
+                 Mint.HTTP.request(conn, "POST", "/v2/agent/show", headers, data)
+
+        receive do
+          :same_key_retry -> :ok
+        end
+
+        assert {:ok, conn, second} =
+                 Mint.HTTP.request(conn, "POST", "/v2/agent/show", headers, data)
+
+        send(test, :second_show_request_sent)
+        collect_show_pair(conn, first, second, %{})
+      end)
+
+    assert_receive {:controlled_chunk, pid, :show}, 2_000
+    assert pid == writer.pid
+    first_id = :sys.get_state(ctx.relay).held_shows[ctx.reader]["show_id"]
+    send(request.pid, :same_key_retry)
+    assert_receive :second_show_request_sent, 2_000
+
+    duplicate_queued? =
+      Enum.any?(1..100, fn _ ->
+        {:messages, messages} = Process.info(pid, :messages)
+
+        Enum.any?(messages, fn
+          {:client_api_show, _, id, _} -> id != first_id
+          _ -> false
+        end) || (Process.sleep(5) && false)
+      end)
+
+    send(pid, {:chunk_result, :ok})
+
+    if duplicate_queued? do
+      assert_receive {:controlled_chunk, ^pid, :show}, 2_000
+      send(pid, {:chunk_result, :ok})
+    end
+
+    {first, replay} = Task.await(request)
+    assert first.status == 200
+    assert replay.status == 200
+    assert %{"show_id" => ^first_id, "state" => "sent"} = body(first)
+    assert body(replay) == body(first)
+    assert {"idempotent-replayed", "true"} in replay.headers
+    refute duplicate_queued?
+    Task.shutdown(writer, :brutal_kill)
+  end
+
+  defp collect_show_pair(conn, first, second, responses) do
+    case responses do
+      %{^first => %{done: true} = original, ^second => %{done: true} = replay} ->
+        Mint.HTTP.close(conn)
+        {original, replay}
+
+      _ ->
+        assert {:ok, conn, events} = Mint.HTTP.recv(conn, 0, 4_000)
+
+        responses =
+          Enum.reduce(events, responses, fn
+            {:status, ref, status}, acc ->
+              Map.put(acc, ref, %{status: status, headers: [], body: ""})
+
+            {:headers, ref, headers}, acc ->
+              update_in(acc[ref].headers, &(&1 ++ headers))
+
+            {:data, ref, data}, acc ->
+              update_in(acc[ref].body, &(&1 <> data))
+
+            {:done, ref}, acc ->
+              put_in(acc[ref][:done], true)
+
+            _, acc ->
+              acc
+          end)
+
+        collect_show_pair(conn, first, second, responses)
+    end
+  end
+
   defp show_request(conn, key, request) do
     assert {:ok, conn, ref} =
              Mint.HTTP.request(
