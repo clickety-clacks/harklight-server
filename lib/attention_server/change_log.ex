@@ -84,6 +84,12 @@ defmodule AttentionServer.ChangeLog do
     ) WITHOUT ROWID
     """,
     """
+    CREATE TABLE IF NOT EXISTS client_change_log_epoch (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      epoch INTEGER NOT NULL
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS client_change_log_state (
       id INTEGER PRIMARY KEY CHECK (id = 1),
       store_version INTEGER NOT NULL
@@ -221,6 +227,39 @@ defmodule AttentionServer.ChangeLog do
     end)
   end
 
+  @doc """
+  The items and entries `old -> next` brings into being, per person, as
+  resource IDs: the only resources whose first-seen time this commit stamps.
+  Pure.
+  """
+  def new_resources(%Engine{} = old, %Engine{} = next) when old === next, do: %{}
+
+  def new_resources(%Engine{} = old, %Engine{} = next) do
+    items =
+      if old.messages === next.messages,
+        do: [],
+        else:
+          for(
+            {{person, _, _} = key, _} <- next.messages,
+            not Map.has_key?(old.messages, key),
+            do: {person, item_resource(key)}
+          )
+
+    entries =
+      if old.conversation_events === next.conversation_events,
+        do: [],
+        else:
+          for(
+            {{person, seq} = key, _} <- next.conversation_events,
+            not Map.has_key?(old.conversation_events, key),
+            do: {person, entry_resource(seq)}
+          )
+
+    (items ++ entries)
+    |> Enum.group_by(fn {person, _} -> person end, fn {_, id} -> id end)
+    |> Map.new(fn {person, ids} -> {person, MapSet.new(ids)} end)
+  end
+
   # -- closing signal ---------------------------------------------------------
 
   @doc """
@@ -341,7 +380,17 @@ defmodule AttentionServer.ChangeLog do
                ),
              :ok <- run(db, "DELETE FROM client_changes", []),
              :ok <- run(db, "DELETE FROM client_resource_revs", []),
-             :ok <- run(db, "DELETE FROM client_rank_keys", []) do
+             :ok <- run(db, "DELETE FROM client_rank_keys", []),
+             # A person with no log yet reads as seeded at the epoch; raising
+             # it moves them past any head they were shown before the reset.
+             {:ok, epoch} <- epoch(db),
+             :ok <-
+               run(
+                 db,
+                 "INSERT INTO client_change_log_epoch (id, epoch) VALUES (1, ?) " <>
+                   "ON CONFLICT (id) DO UPDATE SET epoch = excluded.epoch",
+                 [epoch + 1]
+               ) do
           run(db, "UPDATE client_change_log_state SET store_version = ? WHERE id = 1", [
             store_version
           ])
@@ -360,14 +409,16 @@ defmodule AttentionServer.ChangeLog do
   snapshot this log reflects. `seeded` says, per person in `pending`, whether
   they had data before this commit. Returns each touched person's new head.
   """
-  @spec append(term(), pending, %{person => boolean()}, non_neg_integer()) ::
+  @spec append(term(), pending, %{person => boolean()}, non_neg_integer(), map()) ::
           {:ok, %{person => position}} | {:error, term()}
-  def append(db, pending, seeded, store_version) do
+  def append(db, pending, seeded, store_version, created \\ %{}) do
     now = System.system_time(:millisecond)
 
     result =
       Enum.reduce_while(pending, {:ok, %{}}, fn {person, rows}, {:ok, heads} ->
-        case append_person(db, person, rows, Map.get(seeded, person, false), now) do
+        new = Map.get(created, person, MapSet.new())
+
+        case append_person(db, person, rows, Map.get(seeded, person, false), now, new) do
           {:ok, head} -> {:cont, {:ok, Map.put(heads, person, head)}}
           error -> {:halt, error}
         end
@@ -386,9 +437,9 @@ defmodule AttentionServer.ChangeLog do
     end
   end
 
-  defp append_person(db, person, rows, seeded?, now) do
+  defp append_person(db, person, rows, seeded?, now, created) do
     with {:ok, {head, floor, seed_rev}} <- load_meta(db, person, seeded?),
-         {:ok, head} <- write_rows(db, person, rows, head, now),
+         {:ok, head} <- write_rows(db, person, rows, head, now, created),
          :ok <-
            run(
              db,
@@ -400,7 +451,9 @@ defmodule AttentionServer.ChangeLog do
     end
   end
 
-  defp write_rows(db, person, rows, head, now) do
+  # `created` holds the resources this commit brings into being; only those
+  # get a first-seen time, so a resource from before the cut-over never does.
+  defp write_rows(db, person, rows, head, now, created) do
     Enum.reduce_while(rows, {:ok, head}, fn {kind, resource_id}, {:ok, previous_head} ->
       rev = previous_head + 1
 
@@ -423,12 +476,7 @@ defmodule AttentionServer.ChangeLog do
                  "ON CONFLICT (person_id, resource_id) DO UPDATE SET rev = excluded.rev",
                [person, resource_id, rev]
              ),
-           :ok <-
-             run(
-               db,
-               "INSERT OR IGNORE INTO client_resource_created (person_id, resource_id, created_at_ms) VALUES (?, ?, ?)",
-               [person, resource_id, now]
-             ) do
+           :ok <- stamp_created(db, person, resource_id, now, created) do
         {:cont, {:ok, rev}}
       else
         error -> {:halt, error}
@@ -438,8 +486,20 @@ defmodule AttentionServer.ChangeLog do
 
   # A person's log starts on first use: at rev 1 with every existing resource
   # stamped rev 1 when they already had data, else empty at 0.
+  defp stamp_created(db, person, resource_id, now, created) do
+    if MapSet.member?(created, resource_id),
+      do:
+        run(
+          db,
+          "INSERT OR IGNORE INTO client_resource_created (person_id, resource_id, created_at_ms) VALUES (?, ?, ?)",
+          [person, resource_id, now]
+        ),
+      else: :ok
+  end
+
   # `seeded` is a boolean or a zero-arity function, evaluated only when the
-  # person has no log yet.
+  # person has no log yet. A person with data and no log starts at the
+  # epoch: 1 until the log is first reset, then higher.
   defp load_meta(db, person, seeded) do
     case one(db, "SELECT head, floor, seed_rev FROM client_change_log_meta WHERE person_id = ?", [
            person
@@ -448,12 +508,22 @@ defmodule AttentionServer.ChangeLog do
         {:ok, {head, floor, seed_rev}}
 
       {:ok, nil} ->
-        if (is_function(seeded, 0) and seeded.()) or seeded == true,
-          do: {:ok, {1, 1, 1}},
-          else: {:ok, {0, 0, 0}}
+        if (is_function(seeded, 0) and seeded.()) or seeded == true do
+          with {:ok, epoch} <- epoch(db), do: {:ok, {epoch, epoch, epoch}}
+        else
+          {:ok, {0, 0, 0}}
+        end
 
       error ->
         error
+    end
+  end
+
+  defp epoch(db) do
+    case one(db, "SELECT epoch FROM client_change_log_epoch WHERE id = 1", []) do
+      {:ok, [epoch]} -> {:ok, epoch}
+      {:ok, nil} -> {:ok, 1}
+      error -> error
     end
   end
 
@@ -585,7 +655,8 @@ defmodule AttentionServer.ChangeLog do
       with :ok <- Sqlite3.execute(db, "BEGIN IMMEDIATE"),
            {:ok, {head, floor, seed_rev}} <-
              load_meta(db, person, fn -> seeded?(engine, person) end),
-           {:ok, head} <- write_rows(db, person, Enum.map(items, &{:item, &1}), head, now),
+           {:ok, head} <-
+             write_rows(db, person, Enum.map(items, &{:item, &1}), head, now, MapSet.new()),
            :ok <-
              run(
                db,

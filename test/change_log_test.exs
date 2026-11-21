@@ -512,4 +512,103 @@ defmodule AttentionServer.ChangeLogTest do
     removed = %{engine | devices: Map.delete(engine.devices, "phone")}
     assert ChangeLog.closings(engine, removed) == [{{:device, "phone"}, :revoked}]
   end
+
+  test "a person seeded without a log row is moved past their head by a reset", ctx do
+    # Data before the cut-over; the person has no log row yet.
+    relay = start(ctx, false)
+    setup_people(relay)
+    forward(relay, "old", 2)
+    GenServer.stop(relay)
+
+    relay = start(ctx)
+    assert head(relay) == 1
+    shown = head(relay)
+    GenServer.stop(relay)
+
+    # A commit while the log is off, for that same person.
+    relay = start(ctx, false)
+    forward(relay, "unlogged", 3)
+    GenServer.stop(relay)
+
+    # The cursor the client holds must not read as current.
+    relay = start(ctx)
+    assert head(relay) > shown
+    assert {:error, :cursor_expired} = log(relay, shown)
+    GenServer.stop(relay)
+  end
+
+  test "a commit that fails inside the change-log write leaves no rows and no state", ctx do
+    relay = start(ctx)
+    setup_people(relay)
+    forward(relay, "m1", 2)
+    before_head = head(relay)
+    before_engine = :sys.get_state(relay).store.engine
+
+    {:ok, db} = Sqlite3.open(ctx.path)
+
+    :ok =
+      Sqlite3.execute(
+        db,
+        "CREATE TRIGGER fail_log BEFORE UPDATE ON client_change_log_state BEGIN SELECT RAISE(ABORT, 'refused'); END"
+      )
+
+    reply =
+      request(relay, "origin", %{
+        "type" => "forward",
+        "op_id" => op(3),
+        "session_handle" => @handle,
+        "message" => %{
+          "sender_id" => "app:test",
+          "message_id" => "m2",
+          "created_at" => 3,
+          "title" => "Refused"
+        }
+      })
+
+    assert reply["type"] == "error"
+    assert :sys.get_state(relay).store.engine == before_engine
+    assert head(relay) == before_head
+    assert {:ok, rows, false, ^before_head} = log(relay)
+    refute Enum.any?(rows, &(&1.resource_id == item("m2")))
+
+    # Once the fault is gone the same request commits, gap-free.
+    :ok = Sqlite3.execute(db, "DROP TRIGGER fail_log")
+    Sqlite3.close(db)
+    forward(relay, "m2", 3)
+    assert {:ok, after_rows, false, _} = log(relay, before_head)
+    assert Enum.any?(after_rows, &(&1.resource_id == item("m2")))
+    GenServer.stop(relay)
+  end
+
+  test "resources from before the cut-over never get a first-seen time", ctx do
+    relay = start(ctx, false)
+    setup_people(relay)
+    forward(relay, "old", 2)
+    GenServer.stop(relay)
+
+    relay = start(ctx)
+
+    # Touch the old item through an engine change and through a rank row.
+    assert %{"type" => "ok", "opened" => true} =
+             request(relay, "reader", %{
+               "type" => "message_open",
+               "op_id" => op(3),
+               "sender_id" => "app:test",
+               "message_id" => "old",
+               "request_revision" => 1
+             })
+
+    assert {:ok, _} =
+             ChangeLog.append_ranks(store(relay), "A", %{"u-old" => "k"}, fn _ ->
+               {:ok, item("old")}
+             end)
+
+    assert {:ok, [_ | _], false, _} = log(relay, 1)
+    assert {:error, :not_found} = ChangeLog.created_at(store(relay), "A", item("old"))
+
+    # A new item still gets one.
+    forward(relay, "new", 4)
+    assert {:ok, _} = ChangeLog.created_at(store(relay), "A", item("new"))
+    GenServer.stop(relay)
+  end
 end
