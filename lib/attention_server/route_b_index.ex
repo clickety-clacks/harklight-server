@@ -14,6 +14,13 @@ defmodule AttentionServer.RouteBIndex do
       entry_positions: %{},
       advisory_sequences: %{},
       messages_by_origin_session: %{},
+      request_keys_by_id: nil,
+      source_bindings: nil,
+      covered_sessions_by_origin: %{},
+      push_bindings: nil,
+      pending_messages_by_person: %{},
+      origin_replies_by_person: %{},
+      push_badges: %{},
       conversation_summary_by_item: %{},
       unresolved_count_by_person: %{}
     }
@@ -21,6 +28,11 @@ defmodule AttentionServer.RouteBIndex do
 
   def rebuild(engine) do
     index = %{new() | agent_feed?: Map.get(engine.route_b_index, :agent_feed?, false)}
+
+    index =
+      if is_map(engine.route_b_index[:request_keys_by_id]),
+        do: %{index | request_keys_by_id: %{}},
+        else: index
 
     index =
       Enum.reduce(engine.messages, index, fn {key, record}, current ->
@@ -34,8 +46,106 @@ defmodule AttentionServer.RouteBIndex do
 
     index
     |> index_advisories(engine.advisory_feeds)
+    |> index_covered_sessions(engine.origin_sessions)
+    |> index_push_bindings(engine)
+    |> index_source_bindings(engine)
     |> index_reply_scores(engine.reply_group_history)
   end
+
+  def enable_keyed_lookups(engine) do
+    start = %{
+      engine.route_b_index
+      | request_keys_by_id: %{},
+        pending_messages_by_person: %{},
+        origin_replies_by_person: %{},
+        push_badges: %{}
+    }
+
+    index =
+      Enum.reduce(engine.messages, start, fn
+        {key, record}, index ->
+          index = put_request_key(index, key, nil)
+          index = put_pending_message(index, key, nil, record)
+
+          if index.agent_feed?, do: index, else: put_session_message(index, key, nil, record)
+      end)
+
+    index =
+      Enum.reduce(engine.conversation_events, index, fn {{person, seq}, event}, acc ->
+        put_origin_reply(acc, person, seq, event.key, event.payload)
+      end)
+
+    index =
+      index
+      |> index_covered_sessions(engine.origin_sessions)
+      |> index_push_bindings(engine)
+      |> index_source_bindings(engine)
+
+    %{engine | route_b_index: index}
+  end
+
+  defp index_push_bindings(%{request_keys_by_id: lookup} = index, engine) when is_map(lookup) do
+    %{
+      index
+      | push_bindings:
+          AttentionServer.PushIndex.build(engine.push_bindings, engine.delivery_states)
+    }
+  end
+
+  defp index_push_bindings(index, _engine), do: index
+
+  defp index_source_bindings(%{request_keys_by_id: lookup} = index, engine) when is_map(lookup) do
+    %{
+      index
+      | source_bindings: AttentionServer.Store.KeyedValidation.source_index(engine.messages)
+    }
+  end
+
+  defp index_source_bindings(index, _engine), do: index
+
+  defp index_covered_sessions(%{request_keys_by_id: lookup} = index, sessions)
+       when is_map(lookup) do
+    Enum.reduce(sessions, %{index | covered_sessions_by_origin: %{}}, fn {key, session}, acc ->
+      put_origin_session(acc, key, nil, session)
+    end)
+  end
+
+  defp index_covered_sessions(index, _sessions), do: index
+
+  def put_origin_session(
+        %{request_keys_by_id: lookup} = index,
+        {person, origin, handle},
+        prior,
+        next
+      )
+      when is_map(lookup) do
+    old? = get_in(prior, [:support, "origin_listener"]) == true
+    new? = get_in(next, [:support, "origin_listener"]) == true
+
+    if old? == new? do
+      index
+    else
+      scope = {person, origin}
+      covered = Map.get(index.covered_sessions_by_origin, scope, MapSet.new())
+      updated = if new?, do: MapSet.put(covered, handle), else: MapSet.delete(covered, handle)
+
+      scopes =
+        if MapSet.size(updated) == 0,
+          do: Map.delete(index.covered_sessions_by_origin, scope),
+          else: Map.put(index.covered_sessions_by_origin, scope, updated)
+
+      %{index | covered_sessions_by_origin: scopes}
+    end
+  end
+
+  def put_origin_session(index, _key, _prior, _next), do: index
+
+  defp put_request_key(%{request_keys_by_id: lookup} = index, {person, _, id} = key, nil)
+       when is_map(lookup) do
+    %{index | request_keys_by_id: Map.update(lookup, {person, id}, [key], &[key | &1])}
+  end
+
+  defp put_request_key(index, _key, _previous), do: index
 
   def enable_agent_feed(%{route_b_index: %{agent_feed?: true}} = engine), do: engine
 
@@ -44,9 +154,12 @@ defmodule AttentionServer.RouteBIndex do
 
     index =
       Enum.reduce(engine.messages, index, fn {key, record}, current ->
-        current
-        |> put_session_message(key, nil, record)
-        |> put_agent_message(key, nil, record)
+        current =
+          if is_nil(current.request_keys_by_id),
+            do: put_session_message(current, key, nil, record),
+            else: current
+
+        put_agent_message(current, key, nil, record)
       end)
 
     index =
@@ -87,8 +200,10 @@ defmodule AttentionServer.RouteBIndex do
   defp index_advisories(index, _feeds), do: index
 
   def put_message(index, {person, sender, id} = key, previous, record) do
+    index = put_request_key(index, key, previous)
     index = put_session_message(index, key, previous, record)
     index = put_agent_message(index, key, previous, record)
+    index = put_pending_message(index, key, previous, record)
     previous_resolved? = match?(%{terminal: terminal} when not is_nil(terminal), previous)
     current_resolved? = not is_nil(record.terminal)
 
@@ -120,6 +235,82 @@ defmodule AttentionServer.RouteBIndex do
       put_in(index, [:unresolved_count_by_person, person], count)
     end
   end
+
+  def pending_messages(index, person, high \\ nil),
+    do: ordered_candidates(index.pending_messages_by_person, person, high)
+
+  def message_keys(index, person) do
+    pending = index |> pending_messages(person) |> Stream.map(&elem(&1, 1))
+
+    resolved =
+      index.resolved_messages_by_person
+      |> Map.get(person, :gb_trees.empty())
+      |> :gb_trees.values()
+
+    Stream.concat(pending, resolved)
+  end
+
+  def origin_replies(index, person, high \\ nil),
+    do: ordered_candidates(index.origin_replies_by_person, person, high)
+
+  def push_badge(index, person), do: Map.get(index.push_badges, person, 0)
+
+  defp ordered_candidates(trees, person, high) do
+    tree = Map.get(trees, person, :gb_trees.empty())
+
+    iter =
+      if is_integer(high),
+        do: :gb_trees.iterator_from(-high, tree),
+        else: :gb_trees.iterator(tree)
+
+    Stream.unfold(iter, fn current ->
+      case :gb_trees.next(current) do
+        {order, key, next} -> {{-order, key}, next}
+        :none -> nil
+      end
+    end)
+  end
+
+  defp put_pending_message(%{request_keys_by_id: nil} = index, _key, _old, _new), do: index
+
+  defp put_pending_message(index, {person, _, _} = key, old, new) do
+    old_open? = match?(%{terminal: nil}, old)
+    new_open? = is_nil(new.terminal)
+
+    index =
+      if old_open? == new_open? do
+        index
+      else
+        tree = Map.get(index.pending_messages_by_person, person, :gb_trees.empty())
+        order = -new.accepted_seq
+
+        next =
+          if new_open?,
+            do: :gb_trees.enter(order, key, tree),
+            else: :gb_trees.delete_any(order, tree)
+
+        trees =
+          if :gb_trees.is_empty(next),
+            do: Map.delete(index.pending_messages_by_person, person),
+            else: Map.put(index.pending_messages_by_person, person, next)
+
+        %{index | pending_messages_by_person: trees}
+      end
+
+    delta = counts_for_badge(new) - counts_for_badge(old)
+    count = push_badge(index, person) + delta
+
+    cond do
+      delta == 0 -> index
+      count == 0 -> %{index | push_badges: Map.delete(index.push_badges, person)}
+      true -> put_in(index.push_badges[person], count)
+    end
+  end
+
+  defp counts_for_badge(%{terminal: nil, message: message}),
+    do: if(AttentionServer.Message.progress_message?(message), do: 0, else: 1)
+
+  defp counts_for_badge(_), do: 0
 
   def message_page(index, scope, filters),
     do: Map.get(index.sent_messages_by_agent, {scope, filters}, :gb_trees.empty())
@@ -217,6 +408,7 @@ defmodule AttentionServer.RouteBIndex do
 
     index = put_entry_position(index, key, seq, payload)
     index = put_agent_entry(index, key, seq, payload)
+    index = put_origin_reply(index, person, seq, key, payload)
 
     summary =
       Map.get(index.conversation_summary_by_item, key, %{
@@ -255,6 +447,20 @@ defmodule AttentionServer.RouteBIndex do
     put_in(index, [:conversation_summary_by_item, key], summary)
   end
 
+  defp put_origin_reply(
+         %{request_keys_by_id: lookup} = index,
+         person,
+         seq,
+         key,
+         %{"kind" => "reply", "author" => "origin"}
+       )
+       when is_map(lookup) do
+    order = Map.get(index.origin_replies_by_person, person, :gb_trees.empty())
+    put_in(index.origin_replies_by_person[person], :gb_trees.enter(-seq, key, order))
+  end
+
+  defp put_origin_reply(index, _person, _seq, _key, _payload), do: index
+
   def put_advisory(%{agent_feed?: true} = index, item, seq),
     do:
       update_in(
@@ -284,11 +490,13 @@ defmodule AttentionServer.RouteBIndex do
   defp put_entry_position(index, _key, _seq, _payload), do: index
 
   # Message ownership and session are fixed at acceptance.
-  defp put_session_message(%{agent_feed?: true} = index, {person, _, _} = key, nil, %{
-         origin: origin,
-         session_handle: session
-       })
-       when is_binary(origin) and is_binary(session) do
+  defp put_session_message(
+         %{agent_feed?: agent_feed?, request_keys_by_id: request_keys} = index,
+         {person, _, _} = key,
+         nil,
+         %{origin: origin, session_handle: session}
+       )
+       when (agent_feed? or is_map(request_keys)) and is_binary(origin) and is_binary(session) do
     update_in(index.messages_by_origin_session, fn sessions ->
       Map.update(sessions, {person, origin}, %{session => [key]}, fn own ->
         Map.update(own, session, [key], &[key | &1])
