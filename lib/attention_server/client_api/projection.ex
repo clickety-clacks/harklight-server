@@ -11,7 +11,6 @@ defmodule AttentionServer.ClientAPI.Projection do
   # Convert the fault where the resource key is known. Catch only its tagged
   # result at route/step boundaries, leaving mutation and store errors alone.
   def run(key, render) do
-    inject_fault(key)
     render.()
   rescue
     exception -> throw(%__MODULE__{key: key, cause: Diagnostics.cause_class(exception)})
@@ -57,13 +56,13 @@ defmodule AttentionServer.ClientAPI.Projection do
   defp safe_key(kind) when is_atom(kind), do: Atom.to_string(kind)
 
   if Mix.env() == :test do
-    defp inject_fault(key) do
+    def probe(key) do
       case Application.get_env(:attention_server, :client_api_projection_fault) do
         nil -> :ok
         probe -> probe.(key)
       end
     end
   else
-    defp inject_fault(_key), do: :ok
+    def probe(_key), do: :ok
   end
 end

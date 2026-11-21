@@ -1168,7 +1168,10 @@ defmodule AttentionServer.ClientAPI.Resources do
   defp delivery_effect(_), do: nil
 
   defp entry(item_id, record, seq, payload, context) do
-    Projection.run({:entry, entry_id(seq)}, fn ->
+    key = {:entry, entry_id(seq)}
+
+    Projection.run(key, fn ->
+      Projection.probe(key)
       render_entry(item_id, record, seq, payload, context)
     end)
   end

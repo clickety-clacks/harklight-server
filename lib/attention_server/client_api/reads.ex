@@ -481,13 +481,19 @@ defmodule AttentionServer.ClientAPI.Reads do
     engine = state.store.engine
 
     with {:ok, principal} <- principal(engine, key),
-         {:ok, source} <-
-           Projection.run(:file, fn -> Resources.file_source(engine, principal.person, file_id) end) do
+         {:ok, source} <- project_file_source(engine, principal.person, file_id) do
       case source do
         {:upload, upload_id} -> {:ok, {:upload, upload_id}}
         {:inline, file} -> inline_file(file)
       end
     end
+  end
+
+  defp project_file_source(engine, person, file_id) do
+    Projection.run(:file, fn ->
+      Projection.probe(:file)
+      Resources.file_source(engine, person, file_id)
+    end)
   end
 
   defp enrollment_ids(%{kind: :device, person: person, key: device}),
