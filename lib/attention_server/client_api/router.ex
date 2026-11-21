@@ -32,7 +32,8 @@ defmodule AttentionServer.ClientAPI.Routes do
     must send the response, using `ClientAPI.Errors.send_json/3` or
     `send_error/3`, or for a stream `Plug.Conn.send_chunked/2`.
   - `opts`: `stream: true` exempts a long-lived response, such as the change
-    feed, from the in-flight request limit.
+    feed, from the in-flight request limit. Every other request, matched or
+    not, counts toward the limit from before authentication.
 
   Before a handler runs, the router has set `Request-Id`, authenticated the
   principal (401 otherwise), refused a paused account (403 `account_paused`,
@@ -117,12 +118,27 @@ defmodule AttentionServer.ClientAPI.Router do
       |> register_before_send(&log_response(&1, started))
 
     case conn.path_info do
-      ["v2" | segments] -> authenticated(conn, opts, segments, request_id)
-      _ -> Errors.send_error(conn, "not_found")
+      ["v2" | segments] ->
+        route = match(opts.routes, conn.method, segments)
+
+        # The load limit is counted before authentication, which calls the
+        # Relay, so a saturated server sheds requests instead of queueing them.
+        if stream?(route),
+          do: authenticated(conn, opts, segments, route, request_id),
+          else:
+            limited(conn, opts, fn -> authenticated(conn, opts, segments, route, request_id) end)
+
+      _ ->
+        Errors.send_error(conn, "not_found")
     end
   end
 
-  defp authenticated(conn, opts, segments, request_id) do
+  defp stream?({:ok, _module, _handler, _params, route_opts}),
+    do: Keyword.get(route_opts, :stream, false)
+
+  defp stream?(:nomatch), do: false
+
+  defp authenticated(conn, opts, segments, route, request_id) do
     case authenticate(conn, opts) do
       {:ok, principal} ->
         paused = paused?(conn, opts, segments, principal)
@@ -138,7 +154,7 @@ defmodule AttentionServer.ClientAPI.Router do
             Errors.send_error(conn, "forbidden")
 
           true ->
-            dispatch(conn, opts, segments, %Context{
+            dispatch(conn, opts, route, %Context{
               principal: principal,
               relay: opts.relay,
               request_id: request_id
@@ -189,16 +205,10 @@ defmodule AttentionServer.ClientAPI.Router do
 
   defp close_after_device_refusal(conn, _auth), do: conn
 
-  defp dispatch(conn, opts, segments, ctx) do
-    case match(opts.routes, conn.method, segments) do
-      {:ok, module, handler, params, route_opts} ->
-        ctx = %{ctx | params: params}
-
-        if Keyword.get(route_opts, :stream, false) do
-          run(conn, module, handler, ctx, opts)
-        else
-          limited(conn, opts, fn -> run(conn, module, handler, ctx, opts) end)
-        end
+  defp dispatch(conn, opts, route, ctx) do
+    case route do
+      {:ok, module, handler, params, _route_opts} ->
+        run(conn, module, handler, %{ctx | params: params}, opts)
 
       :nomatch ->
         Errors.send_error(conn, "not_found")
