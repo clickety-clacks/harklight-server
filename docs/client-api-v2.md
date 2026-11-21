@@ -1304,14 +1304,22 @@ Writes return 200 unless the table says otherwise. Each response schema requires
   still uses the receipt endpoint.
 - **Replies.** Either side may reply any number of times in every item
   state, including after answer or retraction. If supplied, `in_reply_to`
-  identifies an entry in that conversation. A send without a session has no
-  conversation (§5), and replies to it answer `400 unsupported`. Feed
-  activity is informational. There is no `accepts_replies` member.
+  identifies a person-authored chat turn of this item. The server derives
+  the current request revision. A missing target or one of the wrong item
+  or kind returns `404 not_found`. An earlier-revision turn returns
+  `409 stale_request`. The first correlated reply marks that turn acted,
+  and further correlated replies are legal (`Engine.commit_conversation_reply`).
+  A turn needs nonempty text or at least one file. Leave text absent for a
+  file-only reply (`Engine.conversation_text`). A send without a session has
+  no conversation (§5), and replies to it answer `400 unsupported`. Feed
+  activity is informational.
 - **Result.** Applies to the current answer of a message with a session.
   A sessionless message answers `400 unsupported` before the answer-state
   check. Before an answer a session-bound item returns
   `409 not_answered`. `received` can advance to `applied` or `refused`.
-  A conflicting result or a transition after a final result returns
+  The first successful result marks the person's answer acted
+  (`Engine.commit_conversation_result`). A conflicting result or a
+  transition after a final result returns
   `409 already_closed`. A malformed status answers `400 invalid_field`
   with `field: "status"`. The server derives `result_ref` from the
   operation, as today. `already_answered` is reserved for the person's
