@@ -3,6 +3,7 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
 
   alias AttentionServer.{
     AgentChangeLog,
+    ChangeLog,
     ClientAPIFeedClient,
     ClientAPISchema,
     JSON,
@@ -418,6 +419,7 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
       assert_error(request(ctx, "a2", "PUT", path, body, 3, headers), 404, "not_found")
     end
 
+    @tag :revision_attachment_render
     test "correlated revise keeps, carries, and clears current attachments", ctx do
       sent =
         frame(ctx, "a1", %{
@@ -697,6 +699,120 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
         "unsupported"
       )
     end
+  end
+
+  describe "rendering an agent revision with a v2 attachment" do
+    @describetag :revision_attachment_render
+
+    setup ctx do
+      sent =
+        request(
+          ctx,
+          "a1",
+          "POST",
+          "/v2/agent/messages",
+          %{
+            "sender" => "app:test",
+            "session" => @first_session,
+            "message" => %{"title" => "Original", "created_at" => 1}
+          },
+          1
+        )
+
+      assert %{"message" => %{"item_id" => id}} = contract(ctx, "AgentWriteResult", sent)
+      turn = person_reply(ctx, id, 2)
+      staged = upload(ctx, "a1", 3, "revision attachment")
+      assert %{"file_id" => handle} = contract(ctx, "FileCreated", staged)
+
+      revised =
+        request(
+          ctx,
+          "a1",
+          "PUT",
+          "/v2/agent/messages/" <> id,
+          %{
+            "message" => %{"title" => "Revised", "created_at" => 1},
+            "file_ids" => [handle],
+            "in_reply_to" => turn
+          },
+          4,
+          [{"if-match", "1"}]
+        )
+
+      assert revised.status == 200
+
+      assert %{"message" => %{"files" => [file]}, "entry" => %{"entry_id" => ^turn}} =
+               contract(ctx, "AgentWriteResult", revised)
+
+      %{revised_item: id, revision_file: file}
+    end
+
+    test "a person reply succeeds after the revision", ctx do
+      assert is_binary(person_reply(ctx, ctx.revised_item, 5))
+    end
+
+    test "the person entries read renders the revision attachment", ctx do
+      id = ctx.revised_item
+      response = get(ctx, "a2", "/v2/items/" <> id <> "/entries")
+      assert response.status == 200
+      entries = contract(ctx, "EntriesPage", response)["entries"]
+      assert_revision_attachment(entries, ctx)
+
+      assert get(ctx, "a2", "/v2/files/" <> ctx.revision_file["file_id"]).body ==
+               "revision attachment"
+    end
+
+    test "the person JSON batch includes the revision attachment", ctx do
+      conn = ClientAPIFeedClient.connect(ctx.port, ctx.certs, "a2")
+      {conn, status, batch} = ClientAPIFeedClient.batch(conn, "?after=0")
+      Mint.HTTP.close(conn)
+      assert status == 200
+
+      entries = for %{"kind" => "entry", "data" => entry} <- batch["changes"], do: entry
+      assert_revision_attachment(entries, ctx)
+    end
+
+    test "the person SSE backlog includes the revision attachment", ctx do
+      # A later, independent item provides a cursor the stream can reach
+      # even if the revision entry was dropped.
+      forward(ctx, "a2", 5, @other_session)
+      store = :sys.get_state(ctx.relay).store
+      assert {:ok, latest} = ChangeLog.head(store, "A")
+
+      conn = ClientAPIFeedClient.connect(ctx.port, ctx.certs, "a2")
+      {conn, feed} = ClientAPIFeedClient.open_feed(conn, "?after=0")
+      {conn, feed} = ClientAPIFeedClient.await_open(conn, feed)
+      assert feed.status == 200
+      {conn, _feed, changes} = ClientAPIFeedClient.changes_through(conn, feed, latest)
+      Mint.HTTP.close(conn)
+
+      entries = for %{event: "entry", data: entry} <- changes, do: entry
+      assert_revision_attachment(entries, ctx)
+    end
+
+    test "the agent entries read and batch render the same revision attachment", ctx do
+      path = "/v2/agent/messages/" <> ctx.revised_item <> "/entries"
+      response = get(ctx, "a1", path)
+      assert response.status == 200
+      assert_revision_attachment(contract(ctx, "AgentEntriesPage", response)["entries"], ctx)
+
+      batch = get(ctx, "a1", "/v2/agent/changes?after=0", [{"accept", "application/json"}])
+      assert batch.status == 200
+      changes = Elixir.JSON.decode!(batch.body)["changes"]
+      entries = for %{"kind" => "entry", "data" => entry} <- changes, do: entry
+
+      assert_revision_attachment(entries, ctx)
+    end
+  end
+
+  defp assert_revision_attachment(entries, %{revised_item: id, revision_file: file}) do
+    assert Enum.any?(
+             entries,
+             &match?(
+               %{"kind" => "revision", "item_id" => ^id, "request_revision" => 2, "files" => [^file]},
+               &1
+             )
+           )
   end
 
   describe "agent results, receipts and session end" do
