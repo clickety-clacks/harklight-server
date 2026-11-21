@@ -268,6 +268,7 @@ Schemas use JSON Schema 2020-12. `$ref`s point into the `$defs` below.
       "type": "object",
       "required": ["account", "features", "limits"],
       "properties": {
+        "sender_names": { "type": "array", "items": { "type": "string" }, "description": "On an enrolled key, its authorized sender names and slash-terminated prefixes" },
         "account": {
           "type": "object",
           "required": ["state"],
@@ -780,7 +781,7 @@ visible text. Its `attention` member changes:
       "required": ["error", "retryable", "request_id"],
       "properties": {
         "error": { "enum": ["not_found", "invalid_field", "stale_request", "already_answered",
-                            "already_retracted", "idempotency_conflict", "precondition_failed",
+                            "already_retracted", "already_closed", "not_answered", "idempotency_conflict", "precondition_failed",
                             "cursor_expired", "unauthorized", "forbidden", "retry_later",
                             "storage_unavailable", "payload_too_large", "unsupported",
                             "account_paused"] },
@@ -802,12 +803,14 @@ visible text. Its `attention` member changes:
 | `not_found` | 404 | false | Unknown or invisible item, entry or file (`unknown_message`, `not_found`) |
 | `stale_request` | 409 | false | `request_revision` is behind the item (`stale_revision`) |
 | `already_answered` | 409 | false | Only on `/answer`: the item's `terminal` is already set (`closed`) |
-| `already_retracted` | 409 | false | The origin retracted the item (`retracted`) |
+| `already_retracted` | 409 | false | The origin retracted the item (`retracted`); also an agent revise or retract on that item |
+| `already_closed` | 409 | false | A closed message refuses agent revise, retract or lifecycle, a result conflicts with one already recorded, a file-use report conflicts, or a file is already attached (§9.2) |
+| `not_answered` | 409 | false | The agent tried to record a result before an answer |
 | `idempotency_conflict` | 409 | false | Same key, different request (`operation_conflict`) |
 | `precondition_failed` | 412 | false | `If-Match` does not match. Also a superseded push `revision` (`stale_push_binding`). |
 | `cursor_expired` | 410 | false | `after` is older than retention |
 | `payload_too_large` | 413 | false | Body or file over the limit (`too_large`, `upload_cap_exceeded`) |
-| `unsupported` | 400 | false | The server does not serve this here: push with push disabled, or a reply on an item with no agent conversation |
+| `unsupported` | 400 | false | The server does not serve this here: push with push disabled, or a reply, answer receipt or agent result on an item with no agent conversation |
 | `retry_later` | 503 | true | Load shedding, with `Retry-After` |
 | `storage_unavailable` | 503 | true | The store could not commit, with `Retry-After` |
 
@@ -841,7 +844,721 @@ content, tokens or identities.
     `seen`, `delivery_ack` as separate entries; their effect shows up as
     `Entry.delivery`).
 
-## 9. Rulings applied
+## 9. Agent API
+
+An enrolled key may send as an agent and receive as a device. Requests under
+`/v2/agent` use mutual TLS on the device listener. Browser sessions and
+grant-scoped client principals cannot use these routes. A principal sees its
+own sent messages and their entries, scoped to the account and enrolled key.
+An unknown or out-of-scope item or entry answers `404 not_found`.
+
+The headers in §2 and the closed error and retry rules in §7 apply. An
+agent's idempotency scope is its account and enrolled key. Every `POST`
+requires a UUIDv4 `Idempotency-Key`. `PUT` and `DELETE` accept one. A replay
+matches the original method, target, parameters and request contents and
+returns the stored success with `Idempotent-Replayed: true`. Refusals are
+evaluated again. A different request under a stored key answers
+`409 idempotency_conflict`. The retention and simultaneous-request rules in
+§5 apply. Show receipts live in relay memory alongside held shows. The
+server evaluates a show replay after a restart as a new request.
+
+`GET /v2/me` keeps `Me` and adds `sender_names: [string]` for an enrolled
+key. An empty array means the key has no sender names. A name ending in
+`/` authorizes that prefix, as today. The client's existing `Me.limits`
+provides the file caps and retention window.
+
+### 9.1 Resources and reads
+
+| Request | Response body |
+|---|---|
+| `GET /v2/agent/messages?page=&session=&sender=&legacy_message_id=` | `SentMessagesPage` |
+| `GET /v2/agent/messages/{item_id}` | `SentMessageResponse` |
+| `GET /v2/agent/messages/{item_id}/entries?before=&limit=` | `AgentEntriesPage` |
+| `GET /v2/agent/messages/{item_id}/revisions/{n}` | `AgentRevisionResponse` |
+| `GET /v2/agent/focus` | `AgentFocus` |
+
+The following definitions extend the shared `$defs`. Read positions and
+resource versions use the agent's own log, independent of the person's log.
+An empty log is at position 0. Rollout seeds retained resources at 1 for
+agents with existing data. Clients apply newer versions of each resource.
+
+```json
+{
+  "$defs": {
+    "AgentSession": { "type": "string", "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$" },
+    "AgentTerminal": {
+      "type": "object",
+      "required": ["state", "at_ms"],
+      "properties": {
+        "state": { "enum": ["answered", "cleared", "expired", "superseded", "retracted"] },
+        "at_ms": { "$ref": "#/$defs/TimeMs" },
+        "answer": { "description": "The raw stored answer, including an explicit null. Present exactly when an answer value was stored." },
+        "outcome": { "$ref": "#/$defs/AnswerOutcome" },
+        "delivery": { "$ref": "#/$defs/AgentDelivery" }
+      }
+    },
+    "SentMessage": {
+      "type": "object",
+      "required": ["item_id", "rev", "sender", "revision", "message", "files", "seen"],
+      "properties": {
+        "item_id": { "$ref": "#/$defs/OpaqueId" },
+        "rev": { "$ref": "#/$defs/Rev" },
+        "sender": { "type": "string" },
+        "session": { "$ref": "#/$defs/AgentSession" },
+        "legacy_message_id": { "type": "string", "description": "Agent-chosen message_id carried over from before cut-over" },
+        "revision": { "type": "integer", "minimum": 1 },
+        "message": { "type": "object", "description": "Current admitted sender content" },
+        "files": { "type": "array", "items": { "$ref": "#/$defs/FileRef" } },
+        "created_at_ms": { "$ref": "#/$defs/TimeMs" },
+        "terminal": { "$ref": "#/$defs/AgentTerminal" },
+        "seen": { "type": "boolean", "description": "Mark Seen recorded for the current substantive revision" },
+        "result": { "$ref": "#/$defs/OriginResult" },
+        "availability": { "$ref": "#/$defs/Availability" },
+        "advisories": { "type": "array", "items": { "$ref": "#/$defs/AgentAdvisory" } }
+      }
+    },
+    "AgentEntry": {
+      "type": "object",
+      "required": ["entry_id", "item_id", "rev", "position", "kind", "author", "request_revision"],
+      "properties": {
+        "entry_id": { "$ref": "#/$defs/OpaqueId" },
+        "item_id": { "$ref": "#/$defs/OpaqueId" },
+        "rev": { "$ref": "#/$defs/Rev" },
+        "position": { "type": "integer", "minimum": 1 },
+        "kind": { "enum": ["reply", "lifecycle", "revision", "availability", "result"] },
+        "author": { "enum": ["person", "origin", "server"] },
+        "request_revision": { "type": "integer", "minimum": 1 },
+        "at_ms": { "$ref": "#/$defs/TimeMs" },
+        "text": { "type": "string" },
+        "files": { "type": "array", "items": { "$ref": "#/$defs/FileRef" } },
+        "in_reply_to": { "$ref": "#/$defs/OpaqueId" },
+        "state": { "enum": ["active", "withdrawn", "retracted"] },
+        "availability": { "$ref": "#/$defs/Availability" },
+        "result": { "$ref": "#/$defs/OriginResult" },
+        "priority": {
+          "type": "object",
+          "required": ["level"],
+          "properties": {
+            "level": { "$ref": "#/$defs/PriorityLevel4" },
+            "score": { "type": "number" }
+          }
+        },
+        "delivery": { "$ref": "#/$defs/AgentDelivery" }
+      }
+    },
+    "AgentDelivery": {
+      "type": "object",
+      "properties": {
+        "delivered": { "type": "boolean" },
+        "acted": { "type": "boolean" },
+        "outcome": { "enum": ["handed", "not_handed"] },
+        "reason": { "type": "string" },
+        "agent": { "type": "string" },
+        "rerouted": { "type": "boolean" },
+        "file_uses": { "type": "array", "items": { "$ref": "#/$defs/AgentFileUse" } }
+      }
+    },
+    "AgentRevisionResponse": {
+      "type": "object",
+      "required": ["rev", "revision"],
+      "properties": {
+        "rev": { "$ref": "#/$defs/Position" },
+        "revision": {
+          "type": "object",
+          "required": ["request_revision", "message", "files"],
+          "properties": {
+            "request_revision": { "type": "integer", "minimum": 1 },
+            "message": { "type": "object" },
+            "files": { "type": "array", "items": { "$ref": "#/$defs/FileRef" } }
+          }
+        }
+      }
+    },
+    "SentMessagesPage": {
+      "type": "object",
+      "required": ["rev", "messages"],
+      "properties": {
+        "rev": { "$ref": "#/$defs/Position" },
+        "messages": { "type": "array", "items": { "$ref": "#/$defs/SentMessage" } },
+        "next_page": { "$ref": "#/$defs/OpaqueId" }
+      }
+    },
+    "SentMessageResponse": {
+      "type": "object",
+      "required": ["rev", "message"],
+      "properties": {
+        "rev": { "$ref": "#/$defs/Position" },
+        "message": { "$ref": "#/$defs/SentMessage" }
+      }
+    },
+    "AgentEntriesPage": {
+      "type": "object",
+      "required": ["rev", "entries", "older"],
+      "properties": {
+        "rev": { "$ref": "#/$defs/Position" },
+        "entries": { "type": "array", "items": { "$ref": "#/$defs/AgentEntry" } },
+        "older": { "type": "boolean" }
+      }
+    },
+    "AgentFocus": {
+      "type": "object",
+      "required": ["clients"],
+      "properties": {
+        "clients": { "type": "array", "items": { "$ref": "#/$defs/FocusDevice" } }
+      }
+    },
+    "FocusDevice": {
+      "type": "object",
+      "required": ["device_id", "device_name", "screen", "reported_at_ms", "in_front", "connected"],
+      "properties": {
+        "device_id": { "$ref": "#/$defs/OpaqueId" },
+        "device_name": { "type": "string" },
+        "screen": { "enum": ["inbox", "message", "chat", "settings", "signed_out", "not_in_front"] },
+        "reported_at_ms": { "$ref": "#/$defs/TimeMs" },
+        "in_front": { "type": "boolean" },
+        "connected": { "type": "boolean" },
+        "item_id": { "$ref": "#/$defs/OpaqueId" },
+        "visible_entry_id": { "$ref": "#/$defs/OpaqueId" }
+      }
+    }
+  }
+}
+```
+
+- The message list includes retained terminal messages. It sorts by original
+  acceptance, newest first, with a stable tie-breaker. Pass back the opaque
+  `next_page` as `page` with the same filters. The last page omits `next_page`.
+  `sender` and `legacy_message_id` are exact-match filters. The latter
+  matches only pre-cut-over messages. Agents can use the two filters
+  together to resolve their old references to `item_id`. The
+  `session` filter is a UUIDv4. Malformed filters answer `400 invalid_field`
+  with the field. Message pages contain up to 50 messages.
+  A token binds the account, key and filters. Pages report their observed
+  position, and may see edits made after page one.
+- Historical revision reads follow §4 and return `404 not_found` for
+  unavailable revisions.
+- `PUT` compares against the message's integer `revision`. The message
+  read's quoted `ETag` covers the entire resource version for conditional
+  `GET`, including changes to terminal state and receipts.
+- Entry ordering and `before` follow §4, including the default limit of
+  50 and maximum of 200. `older` is true when another page
+  precedes the returned one. Agent entries keep the common Entry fields and
+  add the agent’s receipt details. Retraction retains its lifecycle entry.
+  Answers and other terminal actions are read from `SentMessage.terminal`.
+  A message without a session has no agent conversation and returns an
+  empty entry page.
+- Focus requires a see grant. The listing follows §5.1, with current devices
+  ordered by last focus activity and then by device ID. A lapsed report ends
+  listing and targetability immediately. See and push grants are independent
+  and off by default. Focus is scoped to the enrolled key's account. A
+  caller without the see grant receives `403 forbidden`. The v2 projection
+  maps today's `client_id` to `device_id`, `reported_at` to
+  `reported_at_ms`, `sender_id` plus `message_id` to `item_id`, and
+  `visible_event_id` to `visible_entry_id`.
+
+### 9.2 Writes
+
+| Request | Body | Success body |
+|---|---|---|
+| `POST /v2/agent/messages` | `SendMessageBody` | `AgentSendResult` |
+| `PUT /v2/agent/messages/{item_id}` | `ReviseMessageBody`, with `If-Match: <revision>` | `AgentMessageResult` |
+| `POST /v2/agent/messages/{item_id}/retract` | `RetractMessageBody` | `AgentRetractResult` |
+| `POST /v2/agent/messages/{item_id}/lifecycle` | `AgentLifecycleBody` | `AgentMessageResult` |
+| `POST /v2/agent/messages/{item_id}/replies` | `AgentReplyBody` | `AgentReplyResult` |
+| `POST /v2/agent/messages/{item_id}/result` | `AgentResultBody` | `AgentResultWriteResult` |
+| `POST /v2/agent/messages/{item_id}/receipt` | `AgentReceiptBody` | `AgentAnswerReceiptResult` |
+| `POST /v2/agent/messages/{item_id}/entries/{entry_id}/receipt` | `AgentReceiptBody` | `AgentEntryReceiptResult` |
+| `POST /v2/agent/messages/{item_id}/entries/{entry_id}/file-use` | `AgentFileUseBody` | `AgentFileUseResult` |
+| `POST /v2/agent/messages/{item_id}/advisories/ack` | `AgentAdvisoryAckBody` | `AgentAdvisoryAckResult` |
+| `POST /v2/agent/sessions/{session}/end` | `EmptyBody` | `AgentSessionEndResult` |
+| `POST /v2/agent/show` | `AgentShowBody` | `AgentShowResult` |
+| `POST /v2/files` | The §5 upload headers and raw bytes | `FileCreated` (201) |
+| `DELETE /v2/files/{file_id}` | None | No body (204) |
+
+Writes return 200 unless the table says otherwise. Each response schema requires the resources listed for its route.
+
+```json
+{
+  "$defs": {
+    "EmptyBody": { "type": "object", "additionalProperties": false },
+    "AgentFileIds": { "type": "array", "items": { "$ref": "#/$defs/OpaqueId" } },
+    "AgentMessageContent": {
+      "type": "object",
+      "required": ["title", "created_at"],
+      "properties": {
+        "title": { "type": "string", "minLength": 1 },
+        "created_at": { "type": "integer" },
+        "body": { "type": "string" },
+        "message_type": { "enum": ["fyi", "request"] },
+        "answer_ui": { "type": "object" },
+        "callback": { "type": "object" },
+        "open": {},
+        "progress": {}
+      },
+      "not": { "anyOf": [{ "required": ["sender_id"] }, { "required": ["message_id"] }] }
+    },
+    "SendMessageBody": {
+      "type": "object",
+      "required": ["sender", "message"],
+      "additionalProperties": false,
+      "properties": {
+        "sender": { "type": "string" },
+        "session": { "$ref": "#/$defs/AgentSession" },
+        "supersedes": { "type": "array", "items": { "$ref": "#/$defs/OpaqueId" } },
+        "message": { "$ref": "#/$defs/AgentMessageContent" },
+        "file_ids": { "$ref": "#/$defs/AgentFileIds" }
+      }
+    },
+    "RetractMessageBody": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": { "in_reply_to": { "$ref": "#/$defs/OpaqueId" } }
+    },
+    "ReviseMessageBody": {
+      "type": "object",
+      "required": ["message"],
+      "additionalProperties": false,
+      "properties": {
+        "message": { "$ref": "#/$defs/AgentMessageContent" },
+        "file_ids": { "$ref": "#/$defs/AgentFileIds" }
+      }
+    },
+    "AgentLifecycleBody": {
+      "type": "object",
+      "required": ["action"],
+      "additionalProperties": false,
+      "properties": { "action": { "enum": ["answered", "cleared", "expired", "superseded"] } }
+    },
+    "AgentReplyBody": {
+      "type": "object",
+      "additionalProperties": false,
+      "anyOf": [
+        { "required": ["text"], "properties": { "text": { "minLength": 1 } } },
+        { "required": ["file_ids"], "properties": { "file_ids": { "minItems": 1 } } }
+      ],
+      "properties": {
+        "text": { "type": "string" },
+        "file_ids": { "$ref": "#/$defs/AgentFileIds" },
+        "in_reply_to": { "$ref": "#/$defs/OpaqueId" }
+      }
+    },
+    "AgentResultBody": {
+      "type": "object",
+      "required": ["status"],
+      "additionalProperties": false,
+      "properties": { "status": { "enum": ["received", "applied", "refused"] } }
+    },
+    "AgentReceiptBody": {
+      "type": "object",
+      "required": ["outcome"],
+      "additionalProperties": false,
+      "properties": {
+        "outcome": { "enum": ["handed", "not_handed"] },
+        "reason": { "type": "string", "minLength": 1 },
+        "agent": { "type": "string", "minLength": 1 },
+        "rerouted": { "type": "boolean" }
+      },
+      "if": { "properties": { "outcome": { "const": "not_handed" } } },
+      "then": { "required": ["reason"], "not": { "required": ["rerouted"] } },
+      "else": { "not": { "required": ["reason"] } }
+    },
+    "AgentReceiptResult": {
+      "type": "object",
+      "required": ["rev", "status", "stage_outcome"],
+      "properties": {
+        "rev": { "$ref": "#/$defs/Position" },
+        "status": { "enum": ["recorded", "already_recorded", "superseded"] },
+        "stage_outcome": { "enum": ["handed", "not_handed"] },
+        "message": { "$ref": "#/$defs/SentMessage" },
+        "entry": { "$ref": "#/$defs/AgentEntry" }
+      }
+    },
+    "AgentFileUseBody": {
+      "type": "object",
+      "required": ["file_id", "outcome"],
+      "additionalProperties": false,
+      "properties": {
+        "file_id": { "$ref": "#/$defs/OpaqueId" },
+        "outcome": { "enum": ["used", "unusable", "not_transferred"] },
+        "reason": { "type": "string", "minLength": 1 }
+      },
+      "if": { "properties": { "outcome": { "enum": ["unusable", "not_transferred"] } } },
+      "then": { "required": ["reason"] },
+      "else": { "not": { "required": ["reason"] } }
+    },
+    "AgentFileUse": {
+      "type": "object",
+      "required": ["file_id", "outcome"],
+      "properties": {
+        "file_id": { "$ref": "#/$defs/OpaqueId" },
+        "outcome": { "enum": ["used", "unusable", "not_transferred"] },
+        "reason": { "type": "string" }
+      }
+    },
+    "AgentFileUseResult": {
+      "type": "object",
+      "required": ["rev", "entry", "file_id", "outcome"],
+      "properties": {
+        "rev": { "$ref": "#/$defs/Position" },
+        "entry": { "$ref": "#/$defs/AgentEntry" },
+        "file_id": { "$ref": "#/$defs/OpaqueId" },
+        "outcome": { "enum": ["used", "unusable", "not_transferred"] },
+        "duplicate": { "type": "boolean" }
+      }
+    },
+    "AgentAdvisoryAckBody": {
+      "type": "object",
+      "required": ["advisory_id"],
+      "additionalProperties": false,
+      "properties": { "advisory_id": { "$ref": "#/$defs/OpaqueId" } }
+    },
+    "AgentAdvisoryAckResult": {
+      "type": "object",
+      "required": ["rev", "advisory_id", "delivered", "already_delivered"],
+      "properties": {
+        "rev": { "$ref": "#/$defs/Position" },
+        "advisory_id": { "$ref": "#/$defs/OpaqueId" },
+        "delivered": { "const": true },
+        "already_delivered": { "type": "boolean" }
+      }
+    },
+    "AgentShowBody": {
+      "type": "object",
+      "required": ["item_id", "target"],
+      "additionalProperties": false,
+      "not": { "required": ["device_id", "device_name"] },
+      "properties": {
+        "item_id": { "$ref": "#/$defs/OpaqueId" },
+        "target": { "enum": ["message", "chat"] },
+        "device_id": { "$ref": "#/$defs/OpaqueId" },
+        "device_name": { "type": "string", "minLength": 1 }
+      }
+    },
+    "AgentShowResult": {
+      "type": "object",
+      "required": ["show_id", "device_id", "device_name", "state"],
+      "properties": {
+        "show_id": { "$ref": "#/$defs/OpaqueId" },
+        "device_id": { "$ref": "#/$defs/OpaqueId" },
+        "device_name": { "type": "string" },
+        "state": { "enum": ["sent", "held"] }
+      }
+    },
+    "AgentSendResult": {"$ref": "#/$defs/AgentWriteResult", "type": "object", "required": ["rev", "message"], "properties": {"rev": {}, "message": {}, "supersedes_warnings": {}}, "additionalProperties": false},
+    "AgentMessageResult": {"$ref": "#/$defs/AgentWriteResult", "type": "object", "required": ["rev", "message"], "properties": {"rev": {}, "message": {}}, "additionalProperties": false},
+    "AgentRetractResult": {"$ref": "#/$defs/AgentWriteResult", "type": "object", "required": ["rev", "message"], "properties": {"rev": {}, "message": {}, "entry": {}}, "additionalProperties": false},
+    "AgentReplyResult": {"$ref": "#/$defs/AgentWriteResult", "type": "object", "required": ["rev", "entry"], "properties": {"rev": {}, "entry": {}}, "additionalProperties": false},
+    "AgentResultWriteResult": {"$ref": "#/$defs/AgentWriteResult", "type": "object", "required": ["rev", "message", "entry"], "properties": {"rev": {}, "message": {}, "entry": {}}, "additionalProperties": false},
+    "AgentAnswerReceiptResult": {"$ref": "#/$defs/AgentReceiptResult", "type": "object", "required": ["rev", "message"], "properties": {"rev": {}, "status": {}, "stage_outcome": {}, "message": {}}, "additionalProperties": false},
+    "AgentEntryReceiptResult": {"$ref": "#/$defs/AgentReceiptResult", "type": "object", "required": ["rev", "entry"], "properties": {"rev": {}, "status": {}, "stage_outcome": {}, "entry": {}}, "additionalProperties": false},
+    "AgentSessionEndResult": {"$ref": "#/$defs/AgentWriteResult", "type": "object", "required": ["rev"], "properties": {"rev": {}}, "additionalProperties": false},
+    "AgentWriteResult": {
+      "type": "object",
+      "required": ["rev"],
+      "properties": {
+        "rev": { "$ref": "#/$defs/Position" },
+        "message": { "$ref": "#/$defs/SentMessage" },
+        "entry": { "$ref": "#/$defs/AgentEntry" },
+        "supersedes_warnings": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["item_id", "reason"],
+            "properties": {
+              "item_id": { "$ref": "#/$defs/OpaqueId" },
+              "reason": { "enum": ["invalid", "unknown", "closed"] }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+- **Send and revise.** The server issues `item_id`. A sender needing a local
+  reference maps it to that ID. The message has today's required `title`
+  and integer `created_at`. Its `body`, `answer_ui`, `callback`, `open`,
+  `progress` and other content follow today's message validation. The
+  request's top-level `sender` supplies sender identity on send. Neither
+  `sender_id` nor `message_id` is a content input. Existing immutability
+  and inheritance rules for message content, answer UI and progress apply
+  on revise. Files are supplied by `file_ids`. An unauthorized sender
+  answers `403 forbidden`. Revise requires `If-Match` with the current
+  integer `revision`; a missing or mismatched precondition answers
+  `412 precondition_failed`. A retracted message refuses revision with
+  `409 already_retracted`. Progress updates are revisions of an FYI using
+  its `progress` member. On send, `supersedes` closes earlier messages of
+  the same agent and sender under today's transition rules. Duplicates
+  are considered once in input order. Invalid, missing or inaccessible,
+  and already-terminal targets produce `invalid`, `unknown` and `closed`
+  warnings respectively (`Engine.supersede_listed_targets`). The response carries
+  `supersedes_warnings` for any targets that cannot be superseded.
+- **Lifecycle and retract.** Only the item's originating key can use either
+  route. Both stamp the time on the server. Lifecycle
+  follows the existing transition rules. A repeat retraction under a new
+  key answers `409 already_retracted`. A closed message that refuses the
+  transition answers `409 already_closed`. A malformed lifecycle action
+  answers `400 invalid_field` with `field: "action"`. When retract names a
+  person entry in `in_reply_to`, it also marks that entry acted. Handoff
+  still uses the receipt endpoint.
+- **Replies.** Either side may reply any number of times in every item
+  state, including after answer or retraction. If supplied, `in_reply_to`
+  identifies a person-authored chat turn of this item. The server derives
+  the current request revision. A missing target or one of the wrong item
+  or kind returns `404 not_found`. An earlier-revision turn returns
+  `409 stale_request`. The first correlated reply marks that turn acted,
+  and further correlated replies are legal (`Engine.commit_conversation_reply`).
+  A turn needs nonempty text or at least one file. Leave text absent for a
+  file-only reply (`Engine.conversation_text`). A send without a session has
+  no conversation (§5), and replies to it answer `400 unsupported`. Feed
+  activity is informational.
+- **Result.** Applies to the current answer of a message with a session.
+  A sessionless message answers `400 unsupported` before the answer-state
+  check. Before an answer a session-bound item returns
+  `409 not_answered`. `received` can advance to `applied` or `refused`.
+  The first successful result marks the person's answer acted
+  (`Engine.commit_conversation_result`). A conflicting result or a
+  transition after a final result returns
+  `409 already_closed`. A malformed status answers `400 invalid_field`
+  with `field: "status"`. The server derives `result_ref` from the
+  operation, as today. `already_answered` is reserved for the person's
+  `/answer`.
+- **Receipt.** A message receipt targets that item's answer. An entry
+  receipt targets a person-authored chat turn of that item. A sessionless
+  message answers `400 unsupported` before the answer-state check.
+  An item with a session but without an answer gets `409 not_answered`
+  on its message receipt. Recording a handoff ensures Delivered first
+  (`Engine.origin_ack2`). `not_handed`
+  requires a non-blank reason and may advance to `handed`. A handoff
+  already recorded as `handed` stays handed. The optional `agent` is
+  non-blank. `rerouted` is valid only for `handed`. The response reports
+  whether the request recorded a new handoff, found that outcome already
+  recorded, or was superseded by the existing handoff. It also carries the
+  effective `stage_outcome` and affected message or entry.
+- **File use.** The file must belong to the referenced delivered turn.
+  Report `used`, `unusable` or `not_transferred`. Provide a nonempty
+  reason for either unsuccessful outcome and omit it for `used`.
+  `not_transferred` folds the legacy ACK1 attachment transfer report into
+  this route (`ConversationFiles.valid_use?` and `transfers_for`).
+  An identical use report is a duplicate. A different report for the same
+  file and turn conflicts with the existing one and answers
+  `409 already_closed`.
+- **Advisory acknowledgment.** Supply the advisory's ID from the item.
+  The response reports whether it was already marked delivered.
+- **End session.** `404 not_found` for an unknown session of this enrolled
+  key. Otherwise it marks the session gone for the person. The affected
+  messages change availability on the feed and keep their conversations.
+- **Show.** A push grant is required (`403 forbidden` without it). The item
+  must be in the same account. The server resolves an explicit
+  `device_id` or `device_name` under the push grant alone. Supply at most
+  one of them. Name matching is case-insensitive and maps curly apostrophes
+  to straight apostrophes (`Relay.normalized_device_name`). With neither
+  selector, the server chooses the most
+  recently active listed device when the request is made. An unknown item
+  or missing target device answers `404 not_found`. It holds or sends the
+  view as in §5.1 and returns the resolved device name and delivery state.
+- **Files.** An agent uses the §4 device download response for
+  `GET /v2/files/{file_id}`, including its stored type and quoted sha256
+  ETag. `FileCreated.file_id` is the upload handle, accepted by a write's
+  `file_ids` and by DELETE. The `FileRef.file_id` attached to a message or
+  entry is the download ID. Downloading by upload handle returns
+  `404 not_found`. An agent can download files it is authorized to read
+  through its messages and their conversations. It may discard only its own
+  upload while it is unattached. An unknown or inaccessible file answers
+  `404 not_found`. An attached upload answers
+  `409 already_closed`.
+- Durable changes use the same transaction as the corresponding per-agent
+  change rows. Focus and held shows use relay memory as in §5.1.
+
+### 9.3 Agent change feed
+
+`GET /v2/agent/changes?after=<rev>&session=<session>&limit=<n>`
+
+The JSON and SSE transports follow §6, including batch limits,
+`Last-Event-ID` precedence, heartbeat at least every 25 seconds, and the
+closed `Closing.reason` list. The feed applies §6.1 compaction. On
+`410 cursor_expired` or a closing with `cursor_expired`, read all pages
+of `GET /v2/agent/messages` with the same session filter, rebuild each open
+item's entries and advisory state, then reopen at the first message page's
+position. On ordinary reconnect, send `Last-Event-ID`. A filtered feed
+can skip agent-wide revisions.
+
+```json
+{
+  "$defs": {
+    "AgentChange": {
+      "type": "object",
+      "required": ["rev", "kind", "data"],
+      "properties": {
+        "rev": { "$ref": "#/$defs/Rev" },
+        "kind": { "enum": ["message", "entry", "advisory"] },
+        "data": {}
+      },
+      "allOf": [
+        { "if": { "properties": { "kind": { "const": "message" } } },
+          "then": { "properties": { "data": { "$ref": "#/$defs/SentMessage" } } } },
+        { "if": { "properties": { "kind": { "const": "entry" } } },
+          "then": { "properties": { "data": { "$ref": "#/$defs/AgentEntry" } } } },
+        { "if": { "properties": { "kind": { "const": "advisory" } } },
+          "then": { "properties": { "data": {
+            "type": "object", "required": ["item_id", "advisory"],
+            "properties": {
+              "item_id": { "$ref": "#/$defs/OpaqueId" },
+              "advisory": { "$ref": "#/$defs/AgentAdvisory" }
+            }
+          } } } }
+      ]
+    },
+    "AgentAdvisory": {
+      "type": "object",
+      "required": ["advisory_id", "advisory_type", "request_revision"],
+      "properties": {
+        "advisory_id": { "$ref": "#/$defs/OpaqueId" },
+        "advisory_type": { "enum": ["unseen_interval_elapsed", "possible_contradictions"] },
+        "delivered": { "type": "boolean" },
+        "request_revision": { "type": "integer", "minimum": 1 },
+        "text": { "type": "string" },
+        "accepted_at_ms": { "$ref": "#/$defs/TimeMs" },
+        "due_at_ms": { "$ref": "#/$defs/TimeMs" },
+        "evaluated_at_ms": { "$ref": "#/$defs/TimeMs" },
+        "level_name": { "type": "string" },
+        "bounce_after_days": { "type": "number", "exclusiveMinimum": 0 },
+        "decided_at_rev": { "$ref": "#/$defs/Position" },
+        "status": { "enum": ["checked", "incomplete"] },
+        "reason": { "enum": ["timeout", "unavailable"] },
+        "unchecked": { "type": "integer", "minimum": 1 },
+        "warning": { "type": "string" },
+        "messages": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["sender_id", "message_id", "title"],
+            "properties": {
+              "sender_id": { "type": "string" },
+              "message_id": { "type": "string" },
+              "title": { "type": "string" },
+              "sender_name": { "type": "string" }
+            }
+          }
+        }
+      },
+      "if": { "properties": { "advisory_type": { "const": "unseen_interval_elapsed" } } },
+      "then": { "required": ["text", "accepted_at_ms", "due_at_ms", "evaluated_at_ms", "level_name", "bounce_after_days", "decided_at_rev"] },
+      "else": { "required": ["status"] }
+    },
+    "AgentChangeBatch": {
+      "type": "object",
+      "required": ["rev", "changes", "more"],
+      "properties": {
+        "rev": { "$ref": "#/$defs/Position" },
+        "changes": { "type": "array", "items": { "$ref": "#/$defs/AgentChange" } },
+        "more": { "type": "boolean" }
+      }
+    },
+    "AgentFocusEvent": {
+      "type": "object",
+      "required": ["focus"],
+      "properties": { "focus": { "$ref": "#/$defs/AgentFocus" } }
+    }
+  }
+}
+```
+
+| Feed kind | Payload |
+|---|---|
+| `message` | Full SentMessage |
+| `entry` | Full AgentEntry |
+| `advisory` / `unseen_interval_elapsed` | Item and advisory ID, request revision, accepted/due/evaluated times, level, bounce interval, text, delivered state and `decided_at_rev` (replaces the origin cursor at decision; `BounceDecision.append_advisory`) |
+| `advisory` / `possible_contradictions` | Item and advisory ID, request revision, check status, reason and unchecked count when incomplete, and warning and matched sender/message identifiers and titles when present (`Contradictions.result`) |
+| SSE `focus`, `heartbeat`, `closing` | Ephemeral, without an SSE ID |
+
+- A filtered feed omits changes for messages outside the named session.
+  Every feed still uses the agent-wide `rev`. A batch position can be later
+  than the last returned change, including in an empty filtered batch.
+  Feed connections are independent, and any number may cover a session.
+- Answers and terminal close-outs appear as `message` changes, including
+  on sends without a session. The per-agent `rev` orders these changes
+  against chat entries in commit order.
+- The first time a person-authored chat entry or answer is served on the
+  feed, the server records Delivered once. The receipt write is the
+  explicit handoff to the model. Delivery and receipt changes update the
+  same entry or message resource.
+- A person sees the agent or session as listening while there is a covering
+  open feed, or a covering batch was fetched in the last 60 seconds. Chat
+  is stored and delivered on the next read regardless of feed activity.
+- SSE may send `event: focus` with an `AgentFocusEvent` to a key with the
+  see grant. It has no `id:` line and is excluded from batches and replay.
+  Switching the see grant off stops focus events within 15 seconds.
+  The remaining feed continues.
+- Change-log verification replays the retained agent log from empty and
+  compares the resulting sent-message map with a fresh paged read.
+
+### 9.4 Legacy commands
+
+| v2 route or disposition | Legacy command or surface |
+|---|---|
+| `POST /v2/agent/messages` | `send` |
+| `PUT /v2/agent/messages/{item_id}` | `revise`, including progress |
+| `POST /v2/agent/messages/{item_id}/retract` (round 19) | `withdraw`, `retract` |
+| `POST /v2/agent/messages/{item_id}/lifecycle` | `lifecycle` |
+| `POST /v2/agent/messages/{item_id}/replies` | `reply` |
+| `POST /v2/agent/messages/{item_id}/result` | `result` |
+| `POST /v2/agent/messages/{item_id}/receipt` for an answer, or `POST /v2/agent/messages/{item_id}/entries/{entry_id}/receipt` for a chat turn (round 20) | `ack2` |
+| `POST /v2/agent/messages/{item_id}/entries/{entry_id}/file-use` (round 20) | `file_use` |
+| `POST /v2/agent/sessions/{session}/end` | `session_end` |
+| `POST /v2/files` | `upload` |
+| `GET /v2/files/{file_id}` | File fetch |
+| `DELETE /v2/files/{file_id}` | `discard_uploads` |
+| `GET /v2/me` (agent spec r2 §1) | `file_limits` |
+| `GET /v2/agent/messages/{item_id}`, or `GET /v2/agent/messages/{item_id}/revisions/{n}` for a selected revision | `message_get` |
+| `GET /v2/agent/changes` with optional `session` (agent spec r2 §4) | `feed`, change notices, session listen, coverage stream |
+| Automatic when the feed serves the turn (agent spec r2 §4) | `ack` (ACK1) |
+| `POST /v2/agent/messages/{item_id}/entries/{entry_id}/file-use` with `not_transferred` and reason | ACK1 attachment transfer reports (round 20 addendum 3) |
+| `GET /v2/agent/messages` | Baseline for a new or expired feed cursor |
+| Retired. Feed activity supplies availability (agent spec r2 §§0, 4) | `support`, `attachment_update`, `status`, `coverage` |
+| Retired. Feeds are independent (agent spec r2 §§0, 4) | Exclusive listener, reconnect takeover |
+| `advisory` changes on `GET /v2/agent/changes` (agent spec r2 §4) | `advisory_feed` |
+| `POST /v2/agent/messages/{item_id}/advisories/ack` (round 20) | `advisory_ack` |
+| `GET /v2/agent/focus` (round 19) | `focus_get` |
+| Ephemeral `focus` on the agent SSE feed (round 19) | Focus stream |
+| `POST /v2/agent/show` (rounds 19–20) | `view_show` |
+| Client item and entry reads, or `GET /v2/search` for the exact legacy sender and ID pair (rounds 19–20) | Granted-agent `get` |
+| `GET /v2/search` (rounds 19–20) | Granted-agent `search` |
+| `POST /v2/items/{item_id}/answer` (rounds 19–20) | Granted-agent `respond` |
+
+A message read can carry a present-null raw answer. The matching outcome
+below identifies a structured result.
+
+```json
+{
+  "rev": 8,
+  "message": {
+    "item_id": "i1",
+    "rev": 8,
+    "sender": "app:example",
+    "revision": 1,
+    "message": { "title": "Choose a value", "created_at": 1720000000000 },
+    "files": [],
+    "seen": false,
+    "terminal": {
+      "state": "answered",
+      "at_ms": 1720000001000,
+      "answer": null,
+      "outcome": { "kind": "result", "value": null }
+    }
+  }
+}
+```
+
+For example, an agent reporting a result before the person answers gets
+`409` with this body and a matching `Request-Id` response header.
+
+```json
+{"error":"not_answered","retryable":false,"request_id":"Lk4nY3_qtbE4R1c9"}
+```
+
+## 10. Rulings applied
 
 The delivery owner's rulings on this draft are applied above:
 
