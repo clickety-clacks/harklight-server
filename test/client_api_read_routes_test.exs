@@ -260,4 +260,37 @@ defmodule AttentionServer.ClientAPIReadRoutesTest do
 
     assert %{"account" => %{"state" => "paused"}} = body(Reads.get_me(get("/v2/me"), ctx(ctx)))
   end
+
+  test "an ETag from before a change no longer matches, so the client gets the new body", ctx do
+    first = Reads.get_inbox(get("/v2/inbox"), ctx(ctx))
+    old_tag = etag(first)
+
+    frame = %{
+      "type" => "forward",
+      "op_id" => op(30),
+      "session_handle" => @handle,
+      "message" => %{
+        "sender_id" => "app:test",
+        "message_id" => "four",
+        "created_at" => 30,
+        "title" => "four"
+      }
+    }
+
+    assert {:ok, line} =
+             Relay.request_line(ctx.relay, "origin", JSON.encode!(Map.put(frame, "v", 1)) <> "\n")
+
+    assert {:ok, %{"type" => "ok"}} = JSON.decode_line(line)
+
+    after_change = Reads.get_inbox(get("/v2/inbox", [{"if-none-match", old_tag}]), ctx(ctx))
+    assert after_change.status == 200
+    refute etag(after_change) == old_tag
+    assert body(after_change)["rev"] > body(first)["rev"]
+    assert length(body(after_change)["items"]) == length(body(first)["items"]) + 1
+
+    settings = Reads.get_settings(get("/v2/settings"), ctx(ctx))
+    # Settings did not change, so its ETag still matches.
+    again = Reads.get_settings(get("/v2/settings", [{"if-none-match", etag(settings)}]), ctx(ctx))
+    assert again.status == 304
+  end
 end

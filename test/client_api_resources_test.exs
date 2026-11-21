@@ -655,6 +655,43 @@ defmodule AttentionServer.ClientAPIResourcesTest do
     end
   end
 
+  describe "availability entries" do
+    test "an availability change is a schema-conformant server entry on each open item",
+         %{path: path} do
+      relay = scripted_relay(path)
+      {engine, view} = snapshot(relay)
+      defs = Schema.contract_defs(@contract)
+
+      engine = Engine.origin_availability(engine, "A", "origin", @handle, "not_listening", 1_234)
+
+      entries =
+        for key <- Resources.item_keys(engine, "A"),
+            entry <- Resources.entries(engine, key, view),
+            entry["kind"] == "availability",
+            do: entry
+
+      open =
+        for key <- Resources.item_keys(engine, "A"),
+            is_nil(engine.messages[key].terminal),
+            do: key
+
+      assert length(entries) == length(open)
+
+      for entry <- entries do
+        assert %{
+                 "author" => "server",
+                 "availability" => %{"state" => "not_listening", "last_detached_at_ms" => 1_234}
+               } = entry
+
+        rendered = entry |> Resources.stamp(1) |> then(&Resources.render(:entry, &1, nil))
+        assert Schema.errors(defs, "Entry", rendered) == []
+        assert Schema.errors(defs, "Entry", %{rendered | "author" => "system"}) != []
+      end
+
+      GenServer.stop(relay)
+    end
+  end
+
   describe "revisions" do
     test "every request revision reads, including the first", %{path: path} do
       relay = scripted_relay(path)
