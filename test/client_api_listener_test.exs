@@ -6,6 +6,7 @@ defmodule AttentionServer.ClientAPIListenerTest do
   import ExUnit.CaptureLog
 
   alias AttentionServer.{
+    APNS,
     ClientAPI,
     ClientAPIFeedClient,
     DashboardBrowserSession,
@@ -17,6 +18,8 @@ defmodule AttentionServer.ClientAPIListenerTest do
     Server,
     TLSFixtures
   }
+
+  alias AttentionServer.ClientAPI.Idempotency
 
   defmodule TestRoutes do
     @behaviour AttentionServer.ClientAPI.Routes
@@ -761,6 +764,214 @@ defmodule AttentionServer.ClientAPIListenerTest do
     assert {:ok, %{"type" => "ok"}} = JSON.decode_line(line)
   end
 
+  describe "push matching on the enrolled device listener" do
+    setup ctx do
+      flags = flags_file(ctx.dir, true)
+
+      server =
+        start_supervised!({Server, Keyword.put(server_opts(ctx), :feature_flags_path, flags)})
+
+      relay = Server.relay(server)
+      assert :ok = Relay.enable_push(relay)
+      assert :ok = Relay.setup_person(relay, "A")
+      assert :ok = Relay.setup_person(relay, "B")
+
+      for {person, name} <- [{"A", "a1"}, {"A", "a2"}, {"B", "b1"}] do
+        assert {:ok, _} =
+                 Relay.setup_device_certificate(
+                   relay,
+                   person,
+                   TLSFixtures.certificate_der!(ctx.certs, name)
+                 )
+      end
+
+      %{relay: relay, port: Server.port(server)}
+    end
+
+    test "me and settings expose exactly the application's push matching values", ctx do
+      %{relay: relay} = ctx
+      assert {:ok, conn} = device_connect(ctx, "a1", :http2)
+      assert {:ok, conn, %{status: 200} = me} = request(conn, "GET", "/v2/me")
+      assert {:ok, conn, %{status: 200} = put} = register_push(conn, "ab", 1, push_key(1))
+      assert {:ok, conn, %{status: 200} = settings} = request(conn, "GET", "/v2/settings")
+
+      assert {:ok, origin} =
+               DeviceIdentity.from_certificate(TLSFixtures.certificate_der!(ctx.certs, "a2"))
+
+      assert :ok = Relay.setup_sender(relay, origin, "app:push-match")
+
+      frame = %{
+        "v" => 1,
+        "type" => "forward",
+        "op_id" => push_key(2),
+        "message" => %{
+          "sender_id" => "app:push-match",
+          "message_id" => "push-match",
+          "title" => "A push to match",
+          "created_at" => 1
+        }
+      }
+
+      assert {:ok, line} = Relay.request_line(relay, origin, JSON.encode!(frame) <> "\n")
+      assert {:ok, %{"type" => "ok"}} = JSON.decode_line(line)
+      now = System.system_time(:millisecond) + 1_000
+      assert {:ok, claim} = Relay.claim_push(relay, now)
+
+      assert %{"server" => server, "locator" => locator} =
+               APNS.request_payload(claim)["attention"]
+
+      assert %{"person_id" => person, "device_id" => device, "binding_id" => binding} = locator
+
+      assert %{
+               "server" => %{"id" => ^server},
+               "principal" => %{"person_id" => ^person, "device_id" => ^device}
+             } = json(me)
+
+      assert json(put)["settings"]["push"]["binding_id"] == binding
+      assert json(settings)["settings"]["push"]["binding_id"] == binding
+
+      for {cert, expected_person} <- [{"a2", person}, {"b1", "B"}] do
+        assert {:ok, other} = device_connect(ctx, cert, :http2)
+        assert {:ok, other, %{status: 200} = other_me} = request(other, "GET", "/v2/me")
+
+        assert %{"person_id" => ^expected_person, "device_id" => other_device} =
+                 json(other_me)["principal"]
+
+        refute other_device == device
+
+        assert {:ok, other, %{status: 200} = other_settings} =
+                 request(other, "GET", "/v2/settings")
+
+        refute Map.has_key?(json(other_settings)["settings"]["push"], "binding_id")
+        Mint.HTTP.close(other)
+      end
+
+      assert :ok =
+               Relay.finish_push(
+                 relay,
+                 claim,
+                 %{state: "endpoint_invalid", invalidated_at_ms: now},
+                 now
+               )
+
+      assert {:ok, conn, invalid} = request(conn, "GET", "/v2/settings")
+
+      assert %{"state" => "endpoint_invalid"} = invalid_push = json(invalid)["settings"]["push"]
+      refute Map.has_key?(invalid_push, "binding_id")
+
+      assert {:ok, _conn, %{status: 200} = deleted} =
+               request(conn, "DELETE", "/v2/devices/me/push")
+
+      refute Map.has_key?(json(deleted)["settings"]["push"], "binding_id")
+    end
+
+    test "push receipts replay their original bytes after a rebind and stay device-scoped", ctx do
+      key = push_key(3)
+      assert {:ok, conn} = device_connect(ctx, "a1", :http2)
+      assert {:ok, conn, %{status: 200} = first} = register_push(conn, "ab", 1, key)
+      assert {:ok, conn, %{status: 200} = second} = register_push(conn, "cd", 2, push_key(4))
+      assert {:ok, conn, %{status: 200} = replay} = register_push(conn, "ab", 1, key)
+      assert replay.body == first.body
+      assert header(replay, "idempotent-replayed") == ["true"]
+      assert %{"binding_id" => first_binding} = json(first)["settings"]["push"]
+      assert %{"binding_id" => second_binding} = json(second)["settings"]["push"]
+      refute first_binding == second_binding
+
+      assert {:ok, conn, %{status: 200} = current} = request(conn, "GET", "/v2/settings")
+      assert json(current)["settings"]["push"]["binding_id"] == second_binding
+      assert {:ok, other} = device_connect(ctx, "a2", :http2)
+      assert {:ok, other, %{status: 409} = conflict} = register_push(other, "ab", 1, key)
+      assert json(conflict)["error"] == "idempotency_conflict"
+      Mint.HTTP.close(other)
+
+      assert {:ok, conn, %{status: 200} = deleted} =
+               request(conn, "DELETE", "/v2/devices/me/push", [{"idempotency-key", push_key(5)}])
+
+      refute Map.has_key?(json(deleted)["settings"]["push"], "binding_id")
+      assert {:ok, conn, %{status: 200} = _third} = register_push(conn, "ef", 4, push_key(6))
+
+      assert {:ok, _conn, %{status: 200} = replayed_delete} =
+               request(conn, "DELETE", "/v2/devices/me/push", [{"idempotency-key", push_key(5)}])
+
+      assert replayed_delete.body == deleted.body
+      assert header(replayed_delete, "idempotent-replayed") == ["true"]
+    end
+
+    test "legacy compact push receipts cannot replay a replacement binding", ctx do
+      path = ["devices", "me", "push"]
+
+      old_put = %{
+        "token" => String.duplicate("ab", 32),
+        "environment" => "sandbox",
+        "revision" => 1
+      }
+
+      put_key = push_key(7)
+      delete_key = push_key(8)
+      assert {:ok, conn} = device_connect(ctx, "a1", :http2)
+      assert {:ok, conn, %{status: 200}} = register_push(conn, "ab", 1, push_key(1))
+      assert {:ok, conn, %{status: 200} = rebound} = register_push(conn, "cd", 2, push_key(2))
+
+      :sys.replace_state(ctx.relay, fn state ->
+        for {method, key, body} <- [{"PUT", put_key, old_put}, {"DELETE", delete_key, %{}}] do
+          digest = Idempotency.digest(method, path, body)
+          assert :ok = Idempotency.save(state.store, "A", key, digest, 200, %{"settings" => true})
+        end
+
+        state
+      end)
+
+      assert {:ok, conn, %{status: 409} = put} = register_push(conn, "ab", 1, put_key)
+
+      assert {:ok, conn, %{status: 409} = delete} =
+               request(conn, "DELETE", "/v2/devices/me/push", [{"idempotency-key", delete_key}])
+
+      for refused <- [put, delete] do
+        assert json(refused)["error"] == "idempotency_conflict"
+        assert header(refused, "idempotent-replayed") == []
+      end
+
+      assert {:ok, _conn, current} = request(conn, "GET", "/v2/settings")
+      assert current.body == rebound.body
+    end
+  end
+
+  defp push_key(n), do: "00000000-0000-4000-8000-00000000000#{n}"
+
+  defp register_push(conn, octet, revision, key) do
+    body =
+      JSON.encode!(%{
+        "token" => String.duplicate(octet, 32),
+        "environment" => "sandbox",
+        "revision" => revision
+      })
+
+    request(
+      conn,
+      "PUT",
+      "/v2/devices/me/push",
+      [{"idempotency-key", key}, {"content-type", "application/json"}],
+      body
+    )
+  end
+
+  test "browser me identifies the person without a device or binding ID", ctx do
+    ctx =
+      Map.merge(
+        ctx,
+        web_origin(ctx, client_api_v2: true, client_api_routes: [ClientAPI.Reads])
+      )
+
+    assert {:ok, conn} = browser_connect(ctx, :http1)
+    headers = [{"cookie", cookie(ctx.cookie)}]
+    assert {:ok, conn, %{status: 200} = me} = request(conn, "GET", "/v2/me", headers)
+    assert %{"server" => %{"id" => server}, "principal" => principal} = json(me)
+    assert is_binary(server) and server != ""
+    assert principal == %{"person_id" => ctx.person}
+    assert {:ok, _conn, %{status: 200} = settings} = request(conn, "GET", "/v2/settings", headers)
+    refute Map.has_key?(json(settings)["settings"]["push"], "binding_id")
+  end
+
   describe "flag off" do
     test "the web origin answers 404 on /v2 and stays HTTP/1.1 only", ctx do
       ctx = Map.merge(ctx, web_origin(ctx, []))
@@ -772,6 +983,8 @@ defmodule AttentionServer.ClientAPIListenerTest do
           assert {:ok, conn, response} = request(conn, "GET", "/v2/whoami", headers)
           assert response.status == 404
           assert header(response, "request-id") == []
+          assert {:ok, conn, %{status: 404} = me} = request(conn, "GET", "/v2/me", headers)
+          assert header(me, "request-id") == []
           conn
         end)
 
@@ -913,7 +1126,7 @@ defmodule AttentionServer.ClientAPIListenerTest do
          certfile: Path.join(certs, "server.pem"),
          keyfile: Path.join(certs, "server.key"),
          skill_path: skill_path,
-         client_api_routes: [TestRoutes]
+         client_api_routes: Keyword.get(extra, :client_api_routes, [TestRoutes])
        ] ++ extra},
       id: :web_origin
     )
