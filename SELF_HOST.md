@@ -509,3 +509,30 @@ Nonboolean entries are ignored. An unset path yields `{}`. A missing, unreadable
 or malformed configured file also yields `{}` and logs one warning per Relay
 lifetime without preventing startup or sync. APNs `attention.server` carries
 the same persisted identity.
+
+### Contradiction advisory measurement
+
+New sends for a person using `jev-set` can return `possible_contradictions`.
+This is an advisory to the sender: delivery and its push are committed before
+checking, and a slow check waits only in that sender's result. There is no
+fixed deadline: the result waits until every comparison answers or fails, and a
+comparison whose Jev connection is lost or refused ends as a failure. Missing,
+invalid, failed or oversized comparisons report `incomplete`
+with an unchecked count; any usable matches remain listed. Revisions do not
+trigger a check. Same-operation retries retain the original check result.
+
+The named application setting `:attention_server, :contradiction_batch_size`
+is deliberately unset until measured. With no measured size, delivery still
+commits and a nonempty Jev checked set reports incomplete/unavailable. Baseline
+and empty checked sets make no comparison call and add no advisory.
+
+For an authorized synthetic measurement, run `mix run --no-start
+scripts/measure-contradictions.exs` in an isolated checkout with
+`HARKLIGHT_CONTRADICTION_ENDPOINT`, `HARKLIGHT_CONTRADICTION_MODEL`, and the
+existing `ATTENTION_SERVER_JEV_KEY_PATH` in its environment. The script uses
+only its labeled synthetic messages. It measures sizes 1, 8 and 16 three times,
+prints accuracy, calls and median/worst elapsed time, and proposes the largest
+size meeting the contract's accuracy criteria. If none meets
+them, the product owner chooses. Its JSON records the labels, exact question,
+answer schema and threshold. It never prints or copies the key or its path.
+Record that output before fixing the batch-size setting.

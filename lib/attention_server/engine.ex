@@ -4088,6 +4088,20 @@ defmodule AttentionServer.Engine do
             fields
           end
 
+        # Persist an incomplete fallback with delivery itself. A worker failure
+        # or restart cannot turn an unfinished check into a clean replay.
+        fields =
+          if AttentionServer.Placement.choice(next, person) == "jev-set" do
+            items = AttentionServer.Contradictions.items(next, person, key)
+
+            case AttentionServer.Contradictions.result(items, %{}) do
+              nil -> fields
+              check -> Map.put(fields, "possible_contradictions", check)
+            end
+          else
+            fields
+          end
+
         next = save_receipt(next, person, device, op, semantic, fields)
         {:ok, next, fields}
 

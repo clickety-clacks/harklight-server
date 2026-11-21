@@ -17,44 +17,6 @@ defmodule AttentionServer.ContradictionsTest do
     }
   end
 
-  # Each clock read happens at a collector iteration. The second read proves
-  # the first batch result was consumed, so expiry never races that result.
-  defp expire_after_first_result(items, evaluator) do
-    parent = self()
-
-    clock = fn ->
-      send(parent, {:clock_read, self()})
-
-      receive do
-        {:clock_time, now} -> now
-      end
-    end
-
-    running =
-      Task.async(fn ->
-        check =
-          Contradictions.run(@posted, items, @endpoint, @model, 1,
-            evaluator: evaluator,
-            clock: clock,
-            deadline: 60_000
-          )
-
-        # Inspect the actual run caller's mailbox after all batch tasks stop.
-        {check, Process.info(self(), :messages)}
-      end)
-
-    assert_receive {:pending, worker}, 2_000
-    monitor = Process.monitor(worker)
-    assert_receive {:clock_read, collector}, 2_000
-    send(collector, {:clock_time, 0})
-    assert_receive {:clock_read, ^collector}, 2_000
-    send(collector, {:clock_time, 60_000})
-    {check, {:messages, messages}} = Task.await(running)
-    refute Enum.any?(messages, &match?({_, {:ok, _}}, &1))
-    assert_receive {:DOWN, ^monitor, :process, ^worker, :killed}, 2_000
-    {check, worker}
-  end
-
   test "complete matches are oldest first and expose only identifying fields" do
     first = item(1)
     second = item(2)
@@ -62,8 +24,7 @@ defmodule AttentionServer.ContradictionsTest do
     check =
       Contradictions.result(
         [second, first],
-        %{first.identity => 1, second.identity => 0.75},
-        false
+        %{first.identity => 1, second.identity => 0.75}
       )
 
     assert check["status"] == "checked"
@@ -81,7 +42,7 @@ defmodule AttentionServer.ContradictionsTest do
 
   test "complete negative comparisons add no field" do
     candidate = item(1)
-    assert Contradictions.result([candidate], %{candidate.identity => 0}, false) == nil
+    assert Contradictions.result([candidate], %{candidate.identity => 0}) == nil
   end
 
   test "missing and invalid answers stay unchecked while usable matches survive" do
@@ -91,7 +52,7 @@ defmodule AttentionServer.ContradictionsTest do
           %{a.identity => 1, c.identity => "invalid"},
           %{a.identity => 1, c.identity => 4}
         ] do
-      check = Contradictions.result([a, b, c], scores, false)
+      check = Contradictions.result([a, b, c], scores)
       assert check["unchecked"] == 2
       assert check["reason"] == "unavailable"
       assert check["status"] == "incomplete"
@@ -99,7 +60,7 @@ defmodule AttentionServer.ContradictionsTest do
       assert length(check["messages"]) == 1
     end
 
-    assert Contradictions.result([a, b], %{}, false) == %{
+    assert Contradictions.result([a, b], %{}) == %{
              "status" => "incomplete",
              "reason" => "unavailable",
              "unchecked" => 2
@@ -143,31 +104,7 @@ defmodule AttentionServer.ContradictionsTest do
     assert hd(check["messages"])["message_id"] == "message-2"
   end
 
-  test "one shared deadline retains ready matches and discards late batches" do
-    [a, b] = Enum.map(1..2, &item/1)
-    parent = self()
-
-    evaluator = fn request ->
-      if request.candidates == [a.identity] do
-        {:ok, %{a.identity => 1}}
-      else
-        send(parent, {:pending, self()})
-
-        receive do
-          :finish -> {:ok, %{b.identity => 1}}
-        end
-      end
-    end
-
-    {check, worker} = expire_after_first_result([a, b], evaluator)
-
-    assert check["reason"] == "timeout"
-    assert check["unchecked"] == 1
-    assert hd(check["messages"])["message_id"] == "message-1"
-    refute Process.alive?(worker)
-  end
-
-  test "without a deadline option the worker waits for a slow batch" do
+  test "the worker waits for a slow batch to answer" do
     [a, b] = Enum.map(1..2, &item/1)
 
     evaluator = fn request ->
@@ -207,24 +144,36 @@ defmodule AttentionServer.ContradictionsTest do
     assert hd(check["messages"])["message_id"] == "message-2"
   end
 
-  test "timeout takes precedence over a failed comparison" do
+  test "a batch that never answers holds the result until its transport fails" do
     [a, b] = Enum.map(1..2, &item/1)
     parent = self()
 
     evaluator = fn request ->
       if request.candidates == [a.identity] do
-        {:error, :unavailable}
+        {:ok, %{a.identity => 1}}
       else
         send(parent, {:pending, self()})
 
         receive do
-          :finish -> {:ok, %{b.identity => 0}}
+          :connection_lost -> {:error, :unavailable}
         end
       end
     end
 
-    {check, _worker} = expire_after_first_result([a, b], evaluator)
+    running =
+      Task.async(fn ->
+        Contradictions.run(@posted, [a, b], @endpoint, @model, 1, evaluator: evaluator)
+      end)
 
-    assert check == %{"status" => "incomplete", "reason" => "timeout", "unchecked" => 2}
+    assert_receive {:pending, worker}, 2_000
+    # No deadline ends the wait; only the transport's own failure does.
+    assert Task.yield(running, 300) == nil
+    send(worker, :connection_lost)
+    check = Task.await(running)
+
+    assert check["status"] == "incomplete"
+    assert check["reason"] == "unavailable"
+    assert check["unchecked"] == 1
+    assert Enum.map(check["messages"], & &1["message_id"]) == ["message-1"]
   end
 end
