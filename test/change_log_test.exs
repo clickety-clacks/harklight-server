@@ -854,24 +854,24 @@ defmodule AttentionServer.ChangeLogTest do
   test "the relay stores ranks once per change and keeps other items' keys stable", ctx do
     relay = start(ctx)
     setup_people(relay)
-    for {id, n} <- [{"m1", 2}, {"m2", 3}, {"m3", 4}], do: forward(relay, id, n)
+    for {id, n} <- [{"m1", 2}, {"m2", 3}, {"m3", 4}, {"m4", 5}], do: forward(relay, id, n)
 
     assert {:ok, page, false} =
              paused(relay, fn -> ChangeLog.rank_page(store(relay), "A", nil, 100) end)
 
-    assert length(page) == 3
+    assert length(page) == 4
     keys = Enum.map(page, fn {_id, rank} -> rank["key"] end)
     assert keys == Enum.sort(keys)
     before = Map.new(page)
     before_head = head(relay)
 
     # A new item is ranked in; items whose rank did not move write no row.
-    forward(relay, "m4", 5)
+    forward(relay, "m5", 6)
 
     assert {:ok, after_page, false} =
              paused(relay, fn -> ChangeLog.rank_page(store(relay), "A", nil, 100) end)
 
-    assert length(after_page) == 4
+    assert length(after_page) == 5
     after_ranks = Map.new(after_page)
 
     assert {:ok, rows, false, _} = log(relay, before_head)

@@ -2,7 +2,7 @@ defmodule AttentionServer.ClientAPIFeedTest do
   # GET /v2/changes (docs/client-api-v2.md §6), behind client_api_v2.
   use ExUnit.Case, async: false
 
-  alias AttentionServer.{ChangeLog, ClientAPI, JSON, Relay, TLSFixtures}
+  alias AttentionServer.{ChangeLog, ClientAPIFeedClient, ClientAPI, JSON, Relay, TLSFixtures}
 
   @handle "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 
@@ -253,10 +253,7 @@ defmodule AttentionServer.ClientAPIFeedTest do
     forward(ctx, "m1", 1)
 
     assert {:ok, _} =
-             ChangeLog.prune(
-               :sys.get_state(ctx.relay).store,
-               System.system_time(:millisecond) + 1
-             )
+             ClientAPIFeedClient.prune_changes(ctx.relay, System.system_time(:millisecond) + 1)
 
     conn = connect(ctx)
 
