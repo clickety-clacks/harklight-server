@@ -1423,21 +1423,8 @@ defmodule AttentionServer.Relay do
     {:reply, BounceDecision.advisory_feed(state.store.engine, key, handle, since), state}
   end
 
-  defp dispatch_call({:origin_advisory_ack, key, handle, advisory_id}, _from, state) do
-    case BounceDecision.advisory_ack(state.store.engine, key, handle, advisory_id) do
-      {:ok, next, reply} when next == state.store.engine ->
-        {:reply, {:ok, reply}, state}
-
-      {:ok, next, reply} ->
-        case commit(state.store, next, audit(state.store.engine, key, "origin_advisory_ack")) do
-          {:ok, store} -> {:reply, {:ok, reply}, %{state | store: store}}
-          _ -> {:reply, {:error, :storage_unavailable}, state}
-        end
-
-      error ->
-        {:reply, error, state}
-    end
-  end
+  defp dispatch_call({:origin_advisory_ack, key, handle, advisory_id}, _from, state),
+    do: commit_advisory_ack(state, key, handle, advisory_id, false)
 
   defp dispatch_call({:origin_coverage, key}, _from, state) do
     case Engine.authorized_person(state.store.engine, key) do
@@ -1721,27 +1708,14 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  defp dispatch_call({:origin_session_gone, key, handle}, _from, state) do
+  defp dispatch_call({:origin_session_gone, key, handle}, from, state),
+    do: dispatch_call({:origin_session_gone, key, handle, :legacy}, from, state)
+
+  defp dispatch_call({:origin_session_gone, key, handle, transport}, _from, state) do
     case Engine.origin_session_gone(state.store.engine, key, handle) do
       {:ok, next} ->
         {:ok, person} = Engine.authorized_person(next, key)
-        listening? = origin_listening?(state, next, {person, key, handle})
-        {:ok, previous} = Engine.origin_status(state.store.engine, key, handle, listening?)
-        {:ok, current} = Engine.origin_status(next, key, handle, listening?)
-
-        next =
-          if previous["availability"] == current["availability"] do
-            next
-          else
-            Engine.origin_availability(
-              next,
-              person,
-              key,
-              handle,
-              current["availability"],
-              current["last_detached_at"]
-            )
-          end
+        next = end_session_availability(state, next, {person, key, handle}, transport)
 
         case commit(
                state.store,
@@ -5375,6 +5349,49 @@ defmodule AttentionServer.Relay do
     )
   end
 
+  @doc false
+  def apply_agent_frame(state, key, frame, sources),
+    do: perform_request_frame(state, key, frame, sources)
+
+  @doc false
+  def apply_agent_file_use(state, key, seq, name, outcome, op_id) do
+    case Engine.origin_file_report(state.store.engine, key, seq, name, outcome, op_id) do
+      {:ok, engine, reply} ->
+        case commit(state.store, engine, audit(state.store.engine, key, "origin_file_use")) do
+          {:ok, store} -> {{:ok, reply}, %{state | store: store}}
+          _ -> {{:error, :storage_unavailable}, state}
+        end
+
+      error ->
+        {error, state}
+    end
+  end
+
+  @doc false
+  def apply_agent_advisory_ack(state, key, handle, advisory_id) do
+    {:reply, reply, next} = commit_advisory_ack(state, key, handle, advisory_id, true)
+    {reply, next}
+  end
+
+  defp commit_advisory_ack(state, key, handle, advisory_id, v2?) do
+    case BounceDecision.advisory_ack(state.store.engine, key, handle, advisory_id, v2?) do
+      {:ok, next, reply} when next == state.store.engine ->
+        {:reply, {:ok, reply}, state}
+
+      {:ok, next, reply} ->
+        case commit(state.store, next, audit(state.store.engine, key, "origin_advisory_ack")) do
+          {:ok, store} -> {:reply, {:ok, reply}, %{state | store: store}}
+          _ -> {:reply, {:error, :storage_unavailable}, state}
+        end
+
+      error ->
+        {:reply, error, state}
+    end
+  end
+
+  @doc false
+  def apply_agent_command(state, request), do: dispatch_call(request, nil, state)
+
   # Copying uploads takes place outside the Relay. Check the source handles
   # here so a completed discard cannot be followed by a reply using that handle.
   defp verify_staged_reply_sources(store, person, sources) do
@@ -6745,6 +6762,23 @@ defmodule AttentionServer.Relay do
           do: handle
 
     Enum.sort(handles)
+  end
+
+  defp end_session_availability(state, next, {person, key, handle} = scope, :agent_v2) do
+    case Conversation.session_end_transition(state.store.engine, scope) do
+      :unchanged ->
+        next
+
+      {:ended, detached_at} ->
+        Engine.origin_availability(next, person, key, handle, "gone", detached_at)
+    end
+  end
+
+  defp end_session_availability(state, next, {person, key, handle} = scope, :legacy) do
+    listening? = origin_listening?(state, next, scope)
+    before = Engine.origin_status(state.store.engine, key, handle, listening?)
+    after_end = Engine.origin_status(next, key, handle, listening?)
+    append_origin_availability_if_changed(next, person, key, handle, before, after_end)
   end
 
   defp origin_listening?(state, engine, {person, origin, _handle} = key) do

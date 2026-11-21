@@ -27,6 +27,7 @@ defmodule AttentionServer.ClientAPI.Errors do
     "already_answered" => {409, false},
     "already_retracted" => {409, false},
     "already_closed" => {409, false},
+    "not_answered" => {409, false},
     "idempotency_conflict" => {409, false},
     "cursor_expired" => {410, false},
     "precondition_failed" => {412, false},

@@ -202,7 +202,8 @@ defmodule AttentionServer.ClientAPI.Writes do
           Uploads.clean_discarded(ctx.relay, file_id)
           conn |> replayed(status == :replay) |> send_resp(204, "")
 
-        error -> respond(conn, result(error, false))
+        error ->
+          respond(conn, result(error, false))
       end
     else
       {:error, token, field} -> Errors.send_error(conn, token, field: field)
@@ -443,9 +444,9 @@ defmodule AttentionServer.ClientAPI.Writes do
 
   # Each staged file is uploaded to the reply's message through today's
   # upload path, under the reply's operation, then named in its frame.
-  defp attach_files(_relay, _engine_key, frame, []), do: {:ok, frame}
+  def attach_files(_relay, _engine_key, frame, []), do: {:ok, frame}
 
-  defp attach_files(relay, engine_key, frame, staged) do
+  def attach_files(relay, engine_key, frame, staged) do
     Enum.reduce_while(staged, {:ok, []}, fn file, {:ok, acc} ->
       attrs = %{
         "op_id" => frame["op_id"],
@@ -507,8 +508,15 @@ defmodule AttentionServer.ClientAPI.Writes do
 
   def handle_call({:discard_file, who, file_id, key, digest}, _from, state) do
     reply =
-      with {:ok, %{person: person}} <- principal(state.store.engine, who) do
-        discard_staged_upload(state, person, file_id, key, digest)
+      with {:ok, principal} <- principal(state.store.engine, who) do
+        discard_staged_upload(
+          state,
+          principal.person,
+          file_id,
+          key,
+          digest,
+          discard_owner(principal)
+        )
       end
 
     {:reply, reply, state}
@@ -588,9 +596,13 @@ defmodule AttentionServer.ClientAPI.Writes do
     {:reply, reply, state}
   end
 
-  @doc "Discard within Relay after the caller has authorized the principal for this person."
-  def discard_staged_upload(state, person, file_id, key, digest) do
+  defp discard_owner(%{kind: :device, engine_key: device}), do: device
+  defp discard_owner(_principal), do: nil
+
+  @doc "Discard within Relay after the caller has authorized the principal."
+  def discard_staged_upload(state, person, file_id, key, digest, owner \\ nil) do
     with {:ok, nil} <- stored(state, person, key, digest, nil, nil),
+         :ok <- Uploads.verify_discard_owner(state.store, file_id, owner),
          false <- Relay.staged_upload_attached?(state, person, file_id),
          :ok <- Uploads.discard(state.store, person, file_id, key, digest) do
       {:ok, 204, %{}}
@@ -680,8 +692,10 @@ defmodule AttentionServer.ClientAPI.Writes do
   defp render({:answer, item_id, _revision, _value}, who, _person, _reply, from, state),
     do: render_item(item_id, who, from, state)
 
-  defp render({:file, meta, tmp_path}, _who, person, _reply, _from, state) do
-    case Uploads.stage(state.store, person, meta, tmp_path) do
+  defp render({:file, meta, tmp_path}, who, person, _reply, _from, state) do
+    owner = if match?(%{kind: :device}, who), do: who.key, else: nil
+
+    case Uploads.stage(state.store, person, meta, tmp_path, owner) do
       {:ok, file_id} ->
         {:ok, 201,
          %{
@@ -1121,7 +1135,7 @@ defmodule AttentionServer.ClientAPI.Writes do
 
   ## HTTP helpers
 
-  defp required_key(conn) do
+  def required_key(conn) do
     case get_req_header(conn, "idempotency-key") do
       [key] ->
         if Idempotency.valid_key?(key),
@@ -1133,7 +1147,7 @@ defmodule AttentionServer.ClientAPI.Writes do
     end
   end
 
-  defp optional_key(conn) do
+  def optional_key(conn) do
     case get_req_header(conn, "idempotency-key") do
       [] -> {:ok, nil}
       _ -> required_key(conn)
@@ -1373,8 +1387,8 @@ defmodule AttentionServer.ClientAPI.Writes do
     end
   end
 
-  defp device_only(%{kind: :device}), do: :ok
-  defp device_only(_principal), do: {:error, "forbidden", nil}
+  def device_only(%{kind: :device}), do: :ok
+  def device_only(_principal), do: {:error, "forbidden", nil}
 
   defp file_ids(body) do
     case Map.get(body, "file_ids", []) do
@@ -1407,17 +1421,17 @@ defmodule AttentionServer.ClientAPI.Writes do
     end
   end
 
-  defp only_members(body, allowed) do
+  def only_members(body, allowed) do
     case Enum.find(Map.keys(body), &(&1 not in allowed)) do
       nil -> :ok
       member -> {:error, "invalid_field", member}
     end
   end
 
-  defp respond(conn, {:ok, status, body, replayed?}),
+  def respond(conn, {:ok, status, body, replayed?}),
     do: conn |> replayed(replayed?) |> Errors.send_json(status, body)
 
-  defp respond(conn, {:error, token, field, replayed?}),
+  def respond(conn, {:error, token, field, replayed?}),
     do: conn |> replayed(replayed?) |> Errors.send_error(token, field: field)
 
   defp replayed(conn, true), do: put_resp_header(conn, "idempotent-replayed", "true")

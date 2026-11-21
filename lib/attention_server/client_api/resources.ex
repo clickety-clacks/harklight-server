@@ -1190,9 +1190,21 @@ defmodule AttentionServer.ClientAPI.Resources do
         |> put_present("in_reply_to", reply_target(payload, context.by_event_id))
 
       "revision" ->
+        files =
+          if payload["agent_api_v2_files"] do
+            key = {context.person, payload["sender_id"], payload["message_id"]}
+
+            case revision(context.engine, key, payload["request_revision"]) do
+              {:ok, %{"files" => [_ | _] = files}} -> files
+              _ -> nil
+            end
+          else
+            typed_entry_files(context, payload, seq)
+          end
+
         base
         |> Map.merge(%{"kind" => "revision", "author" => "origin"})
-        |> put_present("files", typed_entry_files(context, payload, seq))
+        |> put_present("files", files)
 
       "availability" ->
         base
