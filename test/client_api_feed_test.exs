@@ -41,6 +41,7 @@ defmodule AttentionServer.ClientAPIFeedTest do
     assert :ok = Relay.setup_person(relay, "A")
     assert :ok = Relay.setup_person(relay, "B")
     assert :ok = Relay.setup_device(relay, "A", "origin")
+    assert :ok = Relay.setup_device(relay, "A", "other")
     assert :ok = Relay.setup_device(relay, "B", "origin-b")
     assert {:ok, reader} = Relay.setup_device_certificate(relay, "A", ders["a1"])
     assert {:ok, _} = Relay.setup_device_certificate(relay, "B", ders["b1"])
@@ -99,6 +100,26 @@ defmodule AttentionServer.ClientAPIFeedTest do
                "request_revision" => 1,
                "in_reply_to" => String.to_integer(event_id),
                "text" => "Answer"
+             })
+  end
+
+  # The person reads the agent's reply on another of their devices (round 12).
+  defp read_elsewhere(%{relay: relay} = ctx, id, n) do
+    {:ok, %{"items" => items}} = Reads.inbox(relay, principal(ctx), %{"limit" => "200"})
+    item = Enum.find(items, &(&1["message"]["message_id"] == id))
+
+    {:ok, %{"entries" => entries}} =
+      Reads.entries(relay, principal(ctx), item["item_id"], %{"limit" => "200"})
+
+    through = entries |> Enum.map(& &1["position"]) |> Enum.max()
+
+    assert %{"type" => "ok"} =
+             request(relay, "other", %{
+               "type" => "conversation_read",
+               "op_id" => op(n),
+               "sender_id" => "app:test",
+               "message_id" => id,
+               "read_through_conversation_seq" => through
              })
   end
 
@@ -331,6 +352,7 @@ defmodule AttentionServer.ClientAPIFeedTest do
     for {id, n} <- [{"m1", 1}, {"m2", 2}, {"m3", 3}], do: forward(ctx.relay, id, n)
     converse(ctx, "m1", 10)
     answer(ctx, "m2", 20)
+    read_elsewhere(ctx, "m1", 30)
 
     # Small pages, so the replay crosses batch boundaries.
     {changes, rev} = all_changes(ctx, 0, 2)
@@ -355,6 +377,10 @@ defmodule AttentionServer.ClientAPIFeedTest do
     forward(ctx.relay, "m3", 3)
     converse(ctx, "m1", 10)
     answer(ctx, "m2", 20)
+    middle = snapshot(ctx)
+    # A read on another device changes the item's chat state (round 12).
+    read_elsewhere(ctx, "m1", 30)
+    assert middle.items != snapshot(ctx).items
 
     {changes, rev} = all_changes(ctx, before.rev, 2)
     assert changes != []
