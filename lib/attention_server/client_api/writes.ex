@@ -55,7 +55,7 @@ defmodule AttentionServer.ClientAPI.Writes do
       {"POST", ["items", :item_id, "seen"], :post_seen},
       {"PUT", ["items", :item_id, "read-position"], :put_read_position},
       {"POST", ["items", :item_id, "replies"], :post_replies},
-      {"POST", ["items", :item_id, "answer"], :post_answer},
+      {"POST", ["items", :item_id, "answer"], :post_answer, granted_agent: true},
       {"PUT", ["settings", "priority-levels"], :put_priority_levels},
       {"PUT", ["devices", "me", "push"], :put_push},
       {"DELETE", ["devices", "me", "push"], :delete_push},
@@ -357,6 +357,16 @@ defmodule AttentionServer.ClientAPI.Writes do
       {:replay, status, body} ->
         result({:ok, status, body}, true)
 
+      {:apply_agent, engine_key, frame} ->
+        outcome =
+          case Relay.client_agent_answer(relay, engine_key, frame) do
+            {:error, "unauthorized", _, _} -> {:error, :unauthorized}
+            {:error, reason, field, _terminal} -> refusal(reason, %{"field" => field})
+            result -> result
+          end
+
+        result(call(relay, {:finish, who, key, digest, operation, outcome}), false)
+
       {:apply, engine_key, frame, staged} ->
         outcome =
           with {:ok, frame} <- attach_files(relay, engine_key, frame, staged),
@@ -563,14 +573,16 @@ defmodule AttentionServer.ClientAPI.Writes do
 
   def handle_call({:begin, who, key, digest, operation}, from, state) do
     reply =
-      with {:ok, principal} <- principal(state.store.engine, who),
+      with {:ok, principal} <- operation_principal(state.store.engine, who, operation),
            {:ok, nil} <- stored(state, principal.person, key, digest, who, from),
            :ok <- precondition(state, who, principal, operation),
            {:ok, frame} <- frame(state.store.engine, principal, key, operation),
            {:ok, staged} <- staged_files(state, principal, operation) do
-        if frame == :unchanged,
-          do: :unchanged,
-          else: {:apply, principal.engine_key, frame, staged}
+        cond do
+          principal.kind == :agent -> {:apply_agent, principal.engine_key, frame}
+          frame == :unchanged -> :unchanged
+          true -> {:apply, principal.engine_key, frame, staged}
+        end
       else
         {:replay, status, body} -> {:replay, status, body}
         error -> error
@@ -581,7 +593,7 @@ defmodule AttentionServer.ClientAPI.Writes do
 
   def handle_call({:finish, who, key, digest, operation, outcome}, from, state) do
     reply =
-      with {:ok, principal} <- principal(state.store.engine, who) do
+      with {:ok, principal} <- operation_principal(state.store.engine, who, operation) do
         case outcome do
           {:ok, reply} ->
             result = render(operation, who, principal.person, reply, from, state)
@@ -870,6 +882,20 @@ defmodule AttentionServer.ClientAPI.Writes do
   # frame, which keeps the first-answer-settles, stale-revision and
   # retraction rules. A settled item goes straight to the engine, so its
   # refusal is today's.
+  defp frame(
+         engine,
+         %{kind: :agent, person: person},
+         key,
+         {:answer, item_id, revision, :no_comment}
+       ) do
+    with {:ok, {_, sender, message_id}} <- Resources.item_key(engine, person, item_id) do
+      {:ok,
+       key
+       |> answer_frame(sender, message_id, revision, nil)
+       |> Map.put("type", "answer_no_comment")}
+    end
+  end
+
   defp frame(engine, principal, key, {:answer, item_id, revision, value}) do
     with {:ok, {_person, sender, message_id} = message_key} <-
            Resources.item_key(engine, principal.person, item_id) do
@@ -1082,6 +1108,19 @@ defmodule AttentionServer.ClientAPI.Writes do
   # A PUT or DELETE may come without a key; the engine still needs an op_id.
   defp op_id(key) when is_binary(key), do: key
   defp op_id(nil), do: uuid_v4(:crypto.strong_rand_bytes(16))
+
+  defp operation_principal(
+         engine,
+         %{kind: :agent, person: person, key: key},
+         {:answer, item_id, _, _}
+       ) do
+    with {:ok, {^person, sender, _id}} <- Resources.item_key(engine, person, item_id),
+         {:ok, %{person: ^person}} <- Engine.client_agent_answer_scope(engine, key, sender) do
+      {:ok, %{kind: :agent, person: person, engine_key: key}}
+    end
+  end
+
+  defp operation_principal(engine, who, _operation), do: principal(engine, who)
 
   ## Principals
   #
