@@ -2,6 +2,7 @@ defmodule AttentionServer.ChangeLogTest do
   use ExUnit.Case, async: false
 
   alias AttentionServer.{ChangeLog, Engine, JSON, Relay}
+  alias AttentionServer.ClientAPI.{FeedStep, Reads}
   alias Exqlite.Sqlite3
 
   @handle "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
@@ -667,6 +668,81 @@ defmodule AttentionServer.ChangeLogTest do
     engine = :sys.get_state(relay).store.engine
     {:ok, item_id} = AttentionServer.ClientAPI.Resources.item_id(engine, {"A", "app:test", id})
     item_id
+  end
+
+  defp block_rank_inserts(ctx) do
+    {:ok, db} = Sqlite3.open(ctx.path)
+
+    :ok =
+      Sqlite3.execute(db, """
+      CREATE TRIGGER fail_rank_insert BEFORE INSERT ON client_ranks
+      BEGIN SELECT RAISE(ABORT, 'rank insert failed'); END
+      """)
+
+    db
+  end
+
+  defp unblock_rank_inserts(db) do
+    :ok = Sqlite3.execute(db, "DROP TRIGGER fail_rank_insert")
+    Sqlite3.close(db)
+  end
+
+  defp wait_for_stored_rank(relay, item_id, deadline) do
+    case paused(relay, fn -> ChangeLog.rank(store(relay), "A", item_id) end) do
+      {:error, :not_found} = error ->
+        if System.monotonic_time(:millisecond) < deadline do
+          Process.sleep(20)
+          wait_for_stored_rank(relay, item_id, deadline)
+        else
+          error
+        end
+
+      result ->
+        result
+    end
+  end
+
+  test "a failed rank write is reported and retried without another commit", ctx do
+    relay = start(ctx)
+    setup_people(relay)
+    forward(relay, "one", 2)
+    cursor = head(relay)
+    db = block_rank_inserts(ctx)
+    forward(relay, "two", 3)
+    item_id = item_id_of(relay, "two")
+    assert {:ok, principal} = Reads.client_principal(store(relay).engine, "reader")
+
+    try do
+      assert {:error, :storage_unavailable} = Reads.inbox(relay, "reader")
+      assert {:error, :storage_unavailable} = Reads.item(relay, "reader", item_id)
+      assert {:error, :storage_unavailable} = FeedStep.read(relay, principal, cursor, 100)
+    after
+      unblock_rank_inserts(db)
+    end
+
+    assert {:ok, _} =
+             wait_for_stored_rank(relay, item_id, System.monotonic_time(:millisecond) + 2_500)
+
+    assert {:ok, %{"items" => [_, _]}} = Reads.inbox(relay, "reader")
+    assert {:ok, %{"item" => %{"id" => ^item_id}}} = Reads.item(relay, "reader", item_id)
+    assert {:ok, [_ | _], false, _} = FeedStep.read(relay, principal, cursor, 100)
+    GenServer.stop(relay)
+  end
+
+  test "startup repairs a rank write left incomplete before shutdown", ctx do
+    relay = start(ctx)
+    setup_people(relay)
+    forward(relay, "one", 2)
+    db = block_rank_inserts(ctx)
+    forward(relay, "two", 3)
+    item_id = item_id_of(relay, "two")
+    GenServer.stop(relay)
+    unblock_rank_inserts(db)
+
+    relay = start(ctx)
+    assert {:ok, _} = paused(relay, fn -> ChangeLog.rank(store(relay), "A", item_id) end)
+    assert {:ok, %{"items" => [_, _]}} = Reads.inbox(relay, "reader")
+    GenServer.stop(relay)
   end
 
   test "stored ranks write an item row only when an item's rank changes", ctx do
