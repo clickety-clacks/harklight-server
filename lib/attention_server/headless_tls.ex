@@ -153,21 +153,6 @@ defmodule AttentionServer.HeadlessTLS do
   end
 
   @doc """
-  Whether the tools speak client API v2: the temporary `client_api_v2` key in
-  the `ATTENTION_SERVER_FEATURE_FLAGS_PATH` file, the same flag, file and
-  default the server uses (docs/feature-flags.md). On unless set to false.
-  """
-  def client_api_v2? do
-    {flags, _warned} =
-      AttentionServer.FeatureFlags.read(
-        System.get_env("ATTENTION_SERVER_FEATURE_FLAGS_PATH"),
-        true
-      )
-
-    Map.get(flags, "client_api_v2", true) == true
-  end
-
-  @doc """
   One mutual-TLS client API v2 `GET` over HTTP/1.1 with the device identity.
   Returns the HTTP status and the decoded JSON body; the status is separate
   from application success.

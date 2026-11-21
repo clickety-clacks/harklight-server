@@ -2,6 +2,7 @@ defmodule AttentionServer.HeadlessToolTest do
   use ExUnit.Case, async: false
 
   alias AttentionServer.{
+    ClientAPI,
     DeviceIdentity,
     EnrollmentHTTPS,
     HeadlessEnrollment,
@@ -11,8 +12,7 @@ defmodule AttentionServer.HeadlessToolTest do
     OperatorTool,
     OwnerTLS,
     Relay,
-    TLSFixtures,
-    WebSocketRelay
+    TLSFixtures
   }
 
   setup_all do
@@ -21,7 +21,7 @@ defmodule AttentionServer.HeadlessToolTest do
     %{certs: certs}
   end
 
-  test "headless key stays local through HTTPS request, owner proof, status and first relay sync",
+  test "headless key stays local through HTTPS request, owner proof, status and first device read",
        %{certs: certs} do
     dir = Path.join(System.tmp_dir!(), "attention-headless-#{System.unique_integer([:positive])}")
     File.mkdir_p!(dir)
@@ -29,23 +29,8 @@ defmodule AttentionServer.HeadlessToolTest do
     db_path = Path.join(dir, "relay.sqlite3")
     identity_dir = Path.join(dir, "new-device")
 
-    # This proof runs against the retained /relay listener, so the tools speak
-    # protocol 0.1 here instead of their v2 default.
-    previous_flags = System.get_env("ATTENTION_SERVER_FEATURE_FLAGS_PATH")
-
-    System.put_env(
-      "ATTENTION_SERVER_FEATURE_FLAGS_PATH",
-      AttentionServer.LegacyProtocol.flags!(dir)
-    )
-
-    on_exit(fn ->
-      if previous_flags,
-        do: System.put_env("ATTENTION_SERVER_FEATURE_FLAGS_PATH", previous_flags),
-        else: System.delete_env("ATTENTION_SERVER_FEATURE_FLAGS_PATH")
-    end)
-
     assert {:ok, person} = OperatorTool.bootstrap(db_path, Path.join(certs, "a1.pem"))
-    {:ok, relay} = Relay.start_link(store_path: db_path)
+    {:ok, relay} = Relay.start_link(store_path: db_path, client_api_v2: true)
 
     {:ok, enrollment} =
       EnrollmentHTTPS.start_link(
@@ -63,7 +48,7 @@ defmodule AttentionServer.HeadlessToolTest do
       )
 
     {:ok, web} =
-      WebSocketRelay.start_link(
+      ClientAPI.Listener.start_link(
         relay: relay,
         certfile: Path.join(certs, "server.pem"),
         keyfile: Path.join(certs, "server.key"),
@@ -71,12 +56,12 @@ defmodule AttentionServer.HeadlessToolTest do
       )
 
     on_exit(fn ->
-      for pid <- [web, owner, enrollment, relay], Process.alive?(pid), do: GenServer.stop(pid)
+      for pid <- [web, owner, enrollment, relay], Process.alive?(pid), do: stop_quietly(pid)
     end)
 
     enrollment_endpoint = endpoint(certs, EnrollmentHTTPS.port(enrollment))
     owner_endpoint = endpoint(certs, OwnerTLS.port(owner))
-    relay_endpoint = endpoint(certs, WebSocketRelay.port(web))
+    device_endpoint = endpoint(certs, ClientAPI.Listener.port(web))
     owner_cert = Path.join(certs, "a1.pem")
     owner_key = Path.join(certs, "a1.key")
 
@@ -184,7 +169,7 @@ defmodule AttentionServer.HeadlessToolTest do
     assert {:ok, %{"state" => "approved", "person_id" => ^person, "device_id" => ^device_key}} =
              HeadlessEnrollment.status(identity_dir, enrollment_endpoint)
 
-    assert :ok = HeadlessEnrollment.verify_relay(identity_dir, relay_endpoint)
+    assert :ok = HeadlessEnrollment.verify_access(identity_dir, device_endpoint)
 
     assert {:ok, %{"state" => "approved"}} =
              HeadlessEnrollment.status(identity_dir, enrollment_endpoint)
@@ -240,8 +225,8 @@ defmodule AttentionServer.HeadlessToolTest do
                "relay.test",
                "--port",
                Integer.to_string(EnrollmentHTTPS.port(enrollment)),
-               "--relay-port",
-               Integer.to_string(WebSocketRelay.port(web)),
+               "--device-port",
+               Integer.to_string(ClientAPI.Listener.port(web)),
                "--ca",
                Path.join(certs, "ca.pem")
              ])
@@ -454,4 +439,10 @@ defmodule AttentionServer.HeadlessToolTest do
       ca_file: Path.join(certs, "ca.pem"),
       port: port
     }
+
+  defp stop_quietly(pid) do
+    GenServer.stop(pid)
+  catch
+    :exit, _reason -> :ok
+  end
 end

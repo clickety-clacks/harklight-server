@@ -1,53 +1,40 @@
 defmodule AttentionServer.HeadlessDevice do
   @moduledoc """
-  Enrolled-device command path for the existing TLS `/relay` WebSocket wire.
+  Enrolled-device commands over client API v2 on the device port.
 
-  Replayed events are stored locally before their cursor is acknowledged. A
-  request's operation ID and exact JSON are stored before it is sent, so an
-  uncertain network result can be retried with the same semantics.
+  The first `read` pages through `GET /v2/inbox` and stores every item in
+  `v2/items.json` together with its cursor, the first page's `rev`, in one
+  atomic write. Later reads fetch the JSON change batch after that cursor and
+  store each batch with its new cursor the same way; `410 cursor_expired` means
+  a fresh snapshot. `respond` resolves `--sender`/`--message-id` to the item
+  delivered to this device, stores the exact answer body with a fresh
+  `Idempotency-Key`, and only then sends `POST /v2/items/{item_id}/answer`.
 
-  With the temporary `client_api_v2` flag on (`endpoint.client_api_v2`), both
-  speak client API v2 instead. The first `read` pages through `GET /v2/inbox`,
-  stores every item in `v2/items.json` together with its cursor, the first
-  page's `rev`, in one atomic write. Later reads fetch the JSON change batch
-  after that cursor and store each batch with its new cursor the same way; `410 cursor_expired` means a fresh
-  snapshot. `respond` resolves `--sender`/`--message-id` to the item delivered to
-  this device, stores the exact answer body with a fresh `Idempotency-Key`,
-  and only then sends `POST /v2/items/{item_id}/answer`.
+  Files a protocol 0.1 tool left in the directory (`cursor.json`, `events/`,
+  and `operations/` entries without the `v2-` prefix) are never read.
   """
 
   import Bitwise
 
   alias AttentionServer.{DeviceIdentity, HeadlessTLS, JSON}
 
-  @max_server_request_frame 2 * 1024 * 1024
-  # A server projection can repeat sender/message IDs outside the accepted M,
-  # or pair a terminal answer with those IDs. Both pieces originate in requests
-  # accepted by the server, so allow two protocol-sized requests plus metadata.
-  @max_server_frame 2 * @max_server_request_frame + 16_384
+  # Size cap on the small JSON documents the enrollment flow stores
+  # (`server.json`, `enrollment.json`) and on v2 operation journals.
+  @max_local_document 2 * 2 * 1024 * 1024 + 16_384
 
   # Inbox page size and change-batch size for client API v2 reads (the
   # contract's maxima).
   @v2_page_limit 200
   @v2_batch_limit 500
 
-  def read(directory, %{client_api_v2: true} = endpoint), do: v2_read(directory, endpoint)
-
-  def read(directory, endpoint) do
-    with_session(directory, endpoint, fn socket ->
-      with {:ok, high} <- sync(directory, socket),
-           {:ok, events} <- stored_events(directory) do
-        {:ok, %{"cursor" => high, "events" => events}}
-      end
-    end)
-  end
+  def read(directory, endpoint), do: v2_read(directory, endpoint)
 
   # The answer file over client API v2 is the contract's AnswerBody: an object
   # with at most one of choice, comment and result, and optionally
   # request_revision. `{}` answers with no comment.
   @v2_answer_members ~w(request_revision choice comment result)
 
-  def respond(directory, %{client_api_v2: true} = endpoint, sender, message_id, answer_file) do
+  def respond(directory, endpoint, sender, message_id, answer_file) do
     identity = {Path.join(directory, "identity.pem"), Path.join(directory, "identity.key")}
 
     with :ok <- existing_private_directory(directory),
@@ -95,31 +82,6 @@ defmodule AttentionServer.HeadlessDevice do
         error ->
           error
       end
-    end
-  end
-
-  def respond(directory, endpoint, sender, message_id, answer_file) do
-    with :ok <- existing_private_directory(directory),
-         {:ok, answer} <- read_document(answer_file),
-         {:ok, frame} <-
-           saved_operation(directory, %{
-             "type" => "answer",
-             "sender_id" => sender,
-             "message_id" => message_id,
-             "answer" => answer
-           }),
-         {:ok, result} <-
-           with_session(directory, endpoint, fn socket ->
-             with {:ok, _} <- sync(directory, socket),
-                  {:ok, events} <- stored_events(directory),
-                  true <- received_message?(events, sender, message_id, device_id(directory)) do
-               request(socket, frame)
-             else
-               false -> {:error, :not_in_inbox}
-               other -> other
-             end
-           end) do
-      {:ok, Map.put(result, "op_id", frame["op_id"])}
     end
   end
 
@@ -358,21 +320,6 @@ defmodule AttentionServer.HeadlessDevice do
     end
   end
 
-  defp with_session(directory, endpoint, fun) do
-    with {:ok, _} <- enrolled_identity(directory, endpoint),
-         {:ok, socket} <-
-           HeadlessTLS.connect(endpoint, {
-             Path.join(directory, "identity.pem"),
-             Path.join(directory, "identity.key")
-           }) do
-      try do
-        with :ok <- upgrade(socket, endpoint.name), do: fun.(socket)
-      after
-        :ssl.close(socket)
-      end
-    end
-  end
-
   defp enrolled_identity(directory, endpoint) do
     with :ok <- existing_private_directory(directory),
          {:ok, saved} <- read_json(Path.join(directory, "server.json")),
@@ -396,276 +343,10 @@ defmodule AttentionServer.HeadlessDevice do
     _ -> {:error, :identity_or_server_mismatch}
   end
 
-  defp device_id(directory) do
-    case read_json(Path.join(directory, "enrollment.json")) do
-      {:ok, %{"device_id" => id}} -> id
-      _ -> nil
-    end
-  end
-
   defp address_string(address) when is_tuple(address),
     do: address |> :inet.ntoa() |> List.to_string()
 
   defp address_string(address) when is_list(address), do: List.to_string(address)
-
-  defp upgrade(socket, name) do
-    key = Base.encode64(:crypto.strong_rand_bytes(16))
-    accept = Base.encode64(:crypto.hash(:sha, key <> "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
-
-    with :ok <-
-           :ssl.send(socket, [
-             "GET /relay HTTP/1.1\r\nHost: ",
-             name,
-             "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n",
-             "Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: ",
-             key,
-             "\r\nSec-WebSocket-Protocol: attention-relay/1\r\n\r\n"
-           ]),
-         {:ok, headers} <- read_headers(socket, <<>>),
-         true <-
-           String.starts_with?(headers, "HTTP/1.1 101 ") and
-             String.contains?(headers, "Sec-WebSocket-Accept: #{accept}\r\n") and
-             String.contains?(
-               String.downcase(headers),
-               "sec-websocket-protocol: attention-relay/1\r\n"
-             ) do
-      :ok
-    else
-      _ -> {:error, :bad_upgrade}
-    end
-  end
-
-  defp read_headers(_socket, bytes) when byte_size(bytes) > 16_384,
-    do: {:error, :bad_upgrade}
-
-  defp read_headers(socket, bytes) do
-    if String.ends_with?(bytes, "\r\n\r\n") do
-      {:ok, bytes}
-    else
-      case :ssl.recv(socket, 1, :infinity) do
-        {:ok, byte} -> read_headers(socket, bytes <> byte)
-        other -> other
-      end
-    end
-  end
-
-  defp sync(directory, socket) do
-    with {:ok, cursor} <- local_cursor(directory),
-         :ok <- send_frame(socket, %{"type" => "resync", "since" => cursor, "ref" => "sync"}),
-         {:ok, %{"type" => "ok", "ref" => "sync"}} <- read_frame(socket),
-         {:ok, high} <- replay(directory, socket, cursor),
-         :ok <- acknowledge(directory, socket, cursor, high) do
-      {:ok, high}
-    else
-      _ -> {:error, :replay_failed}
-    end
-  end
-
-  defp replay(directory, socket, previous) do
-    case read_frame(socket) do
-      {:ok, %{"type" => "delivery", "seq" => seq} = event}
-      when is_integer(seq) and seq == previous + 1 ->
-        with :ok <- store_event(directory, event), do: replay(directory, socket, seq)
-
-      {:ok, %{"type" => "lifecycle", "seq" => seq} = event}
-      when is_integer(seq) and seq == previous + 1 ->
-        with :ok <- store_event(directory, event), do: replay(directory, socket, seq)
-
-      {:ok, %{"type" => "resynced", "seq" => ^previous}} ->
-        {:ok, previous}
-
-      _ ->
-        {:error, :invalid_replay}
-    end
-  end
-
-  defp acknowledge(_directory, _socket, cursor, cursor), do: :ok
-
-  defp acknowledge(directory, socket, _cursor, high) do
-    with {:ok, %{"type" => "ok", "seq" => ^high}} <-
-           request(socket, %{"type" => "ack", "seq" => high}),
-         :ok <- write_private(Path.join(directory, "cursor.json"), %{"seq" => high}) do
-      :ok
-    end
-  end
-
-  defp local_cursor(directory) do
-    cursor =
-      case read_json(Path.join(directory, "cursor.json")) do
-        {:ok, %{"seq" => seq}} when is_integer(seq) and seq >= 0 -> {:ok, seq}
-        {:error, :enoent} -> {:ok, 0}
-        _ -> {:error, :invalid_local_cursor}
-      end
-
-    with {:ok, seq} <- cursor,
-         {:ok, events} <- stored_events(directory),
-         true <-
-           length(events) >= seq and
-             Enum.all?(Enum.with_index(events, 1), fn {event, expected} ->
-               event["seq"] == expected
-             end) do
-      {:ok, seq}
-    else
-      _ -> {:error, :invalid_local_cursor}
-    end
-  end
-
-  defp store_event(directory, %{"seq" => seq} = event) do
-    path =
-      Path.join([
-        directory,
-        "events",
-        String.pad_leading(Integer.to_string(seq), 20, "0") <> ".json"
-      ])
-
-    with :ok <- private_directory(Path.dirname(path)) do
-      case read_json(path) do
-        {:ok, ^event} ->
-          :ok
-
-        {:error, :enoent} ->
-          case write_private(path, event, :new) do
-            {:error, :eexist} ->
-              if read_json(path) == {:ok, event}, do: :ok, else: {:error, :event_conflict}
-
-            other ->
-              other
-          end
-
-        _ ->
-          {:error, :event_conflict}
-      end
-    end
-  end
-
-  defp stored_events(directory) do
-    path = Path.join(directory, "events")
-
-    case File.ls(path) do
-      {:error, :enoent} ->
-        {:ok, []}
-
-      {:ok, names} ->
-        names
-        |> Enum.filter(&Regex.match?(~r/\A[0-9]{20}\.json\z/, &1))
-        |> Enum.sort()
-        |> Enum.reduce_while({:ok, []}, fn name, {:ok, events} ->
-          case read_json(Path.join(path, name)) do
-            {:ok, %{"seq" => seq} = event} when is_integer(seq) ->
-              if String.pad_leading(Integer.to_string(seq), 20, "0") <> ".json" == name do
-                {:cont, {:ok, [event | events]}}
-              else
-                {:halt, {:error, :invalid_local_event}}
-              end
-
-            _ ->
-              {:halt, {:error, :invalid_local_event}}
-          end
-        end)
-        |> case do
-          {:ok, events} -> {:ok, Enum.reverse(events)}
-          other -> other
-        end
-
-      error ->
-        error
-    end
-  end
-
-  defp received_message?(events, sender, id, device) do
-    Enum.any?(events, fn event ->
-      event["type"] == "delivery" and event["sender_id"] == sender and
-        event["message_id"] == id and event["origin"] != device and
-        Map.has_key?(event, "message")
-    end)
-  end
-
-  defp request(socket, frame) do
-    ref = hex(:crypto.strong_rand_bytes(8))
-
-    with :ok <- send_frame(socket, Map.put(frame, "ref", ref)) do
-      reply(socket, ref)
-    end
-  end
-
-  defp reply(socket, ref) do
-    case read_frame(socket) do
-      {:ok, %{"ref" => ^ref, "type" => "ok"} = response} ->
-        {:ok, response}
-
-      {:ok, %{"ref" => ^ref, "type" => "error"} = response} ->
-        {:error, {:server, response}}
-
-      {:ok, %{"type" => kind}} when kind in ["delivery", "lifecycle"] ->
-        reply(socket, ref)
-
-      _ ->
-        {:error, :invalid_reply}
-    end
-  end
-
-  defp send_frame(socket, frame) do
-    payload = JSON.encode!(Map.put_new(frame, "v", 1)) <> "\n"
-    size = byte_size(payload)
-    mask = :crypto.strong_rand_bytes(4)
-    repeated = :binary.copy(mask, div(size + 3, 4))
-    encoded = :crypto.exor(payload, binary_part(repeated, 0, size))
-
-    header =
-      cond do
-        size < 126 -> <<1::1, 0::3, 1::4, 1::1, size::7>>
-        size < 65_536 -> <<1::1, 0::3, 1::4, 1::1, 126::7, size::16>>
-        true -> <<1::1, 0::3, 1::4, 1::1, 127::7, size::64>>
-      end
-
-    :ssl.send(socket, [header, mask, encoded])
-  end
-
-  defp read_frame(socket) do
-    with {:ok, <<1::1, 0::3, 1::4, 0::1, length::7>>} <- :ssl.recv(socket, 2, :infinity),
-         {:ok, size} <- frame_size(socket, length),
-         true <- size in 1..@max_server_frame,
-         {:ok, payload} <- :ssl.recv(socket, size, :infinity),
-         {:ok, value} <- JSON.decode_line(payload, @max_server_frame) do
-      {:ok, value}
-    else
-      _ -> {:error, :invalid_server_frame}
-    end
-  end
-
-  defp frame_size(_socket, size) when size < 126, do: {:ok, size}
-
-  defp frame_size(socket, 126) do
-    with {:ok, <<size::16>>} <- :ssl.recv(socket, 2, :infinity), do: {:ok, size}
-  end
-
-  defp frame_size(socket, 127) do
-    with {:ok, <<size::64>>} <- :ssl.recv(socket, 8, :infinity), do: {:ok, size}
-  end
-
-  defp saved_operation(directory, semantic) do
-    digest = hex(:crypto.hash(:sha256, JSON.encode!(semantic)))
-    path = Path.join([directory, "operations", digest <> ".json"])
-
-    with :ok <- private_directory(Path.dirname(path)) do
-      case read_json(path) do
-        {:ok, %{"request" => ^semantic, "op_id" => id}} when is_binary(id) ->
-          {:ok, Map.put(semantic, "op_id", id)}
-
-        {:error, :enoent} ->
-          id = uuid_v4()
-
-          case write_private(path, %{"request" => semantic, "op_id" => id}, :new) do
-            :ok -> {:ok, Map.put(semantic, "op_id", id)}
-            {:error, :eexist} -> saved_operation(directory, semantic)
-            other -> other
-          end
-
-        _ ->
-          {:error, :operation_conflict}
-      end
-    end
-  end
 
   defp uuid_v4 do
     <<a::32, b::16, c::16, d::16, e::48>> = :crypto.strong_rand_bytes(16)
@@ -770,10 +451,10 @@ defmodule AttentionServer.HeadlessDevice do
 
   defp read_json(path) do
     with {:ok, contents} <- File.read(path),
-         true <- byte_size(contents) <= @max_server_frame do
+         true <- byte_size(contents) <= @max_local_document do
       # Stored documents need no line terminator. The added LF is decoder
       # framing only; keep the limit on the original file bytes.
-      JSON.decode_line(contents <> "\n", @max_server_frame + 1)
+      JSON.decode_line(contents <> "\n", @max_local_document + 1)
     else
       false -> {:error, :bad_frame}
       error -> error

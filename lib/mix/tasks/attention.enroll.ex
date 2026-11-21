@@ -4,7 +4,7 @@ defmodule Mix.Tasks.Attention.Enroll do
 
       mix attention.enroll start --directory ./device --connect 127.0.0.1 --name relay.test --port 8443 --ca ca.pem --label 'Laptop'
       mix attention.enroll retry --directory ./device --connect 127.0.0.1 --name relay.test --port 8443 --ca ca.pem --label 'Laptop'
-      mix attention.enroll status --directory ./device --connect 127.0.0.1 --name relay.test --port 8443 --relay-port 8445 --ca ca.pem
+      mix attention.enroll status --directory ./device --connect 127.0.0.1 --name relay.test --port 8443 --device-port 8445 --ca ca.pem
 
   The displayed approval code is for the already authenticated owner. The
   status secret and private key remain in the local 0700 directory.

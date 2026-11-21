@@ -10,8 +10,6 @@ defmodule AttentionServer.HeadlessEnrollment do
   @pending_file "pending.json"
   @result_file "enrollment.json"
   @server_file "server.json"
-  # Replayed delivery and terminal frames can pair two bounded request inputs.
-  @max_server_frame 2 * (2 * 1024 * 1024) + 16_384
 
   def start(directory, endpoint, label) when is_binary(directory) and is_binary(label) do
     with true <- byte_size(label) >= 1,
@@ -131,11 +129,11 @@ defmodule AttentionServer.HeadlessEnrollment do
   end
 
   @doc """
-  Prove the approved local key reaches the device port: its `/relay` first
-  replay barrier, or with `client_api_v2` on one `GET /v2/inbox`. Never ACKs
-  unseen content.
+  Prove the approved local key reaches the device port: one authenticated
+  `GET /v2/inbox?limit=1` with the saved identity. The key is admitted and the
+  server answers for its person; nothing is acknowledged or stored.
   """
-  def verify_relay(directory, endpoint) do
+  def verify_access(directory, endpoint) do
     certificate_path = Path.join(directory, "identity.pem")
     key_path = Path.join(directory, "identity.key")
 
@@ -144,121 +142,15 @@ defmodule AttentionServer.HeadlessEnrollment do
          {:ok, pem} <- File.read(certificate_path),
          [{:Certificate, der, :not_encrypted}] <- :public_key.pem_decode(pem),
          {:ok, ^expected} <- DeviceIdentity.from_certificate(der),
-         :relay <- if(Map.get(endpoint, :client_api_v2) == true, do: :v2, else: :relay),
-         {:ok, socket} <- HeadlessTLS.connect(endpoint, {certificate_path, key_path}) do
-      try do
-        with :ok <- upgrade(socket, endpoint.name),
-             :ok <- send_resync(socket),
-             {:ok, %{"type" => "ok"}} <- read_frame(socket),
-             {:ok, %{"type" => "resynced"}} <- read_barrier(socket) do
-          :ok
-        end
-      after
-        :ssl.close(socket)
-      end
-    else
-      :v2 -> verify_v2(endpoint, {certificate_path, key_path})
-      _ -> {:error, :relay_proof_failed}
-    end
-  rescue
-    _ -> {:error, :relay_proof_failed}
-  end
-
-  # With client_api_v2 on, the proof is one authenticated inbox read: the key
-  # is admitted and the server answers for its person. Nothing is acknowledged.
-  defp verify_v2(endpoint, identity) do
-    case HeadlessTLS.v2_get(endpoint, identity, "/v2/inbox?limit=1") do
-      {:ok, 200, %{"rev" => rev, "items" => items}} when is_integer(rev) and is_list(items) -> :ok
-      _ -> {:error, :relay_proof_failed}
-    end
-  end
-
-  defp upgrade(socket, name) do
-    key = :crypto.strong_rand_bytes(16) |> Base.encode64()
-
-    request = [
-      "GET /relay HTTP/1.1\r\n",
-      "Host: #{name}\r\n",
-      "Upgrade: websocket\r\n",
-      "Connection: Upgrade\r\n",
-      "Sec-WebSocket-Version: 13\r\n",
-      "Sec-WebSocket-Key: #{key}\r\n",
-      "Sec-WebSocket-Protocol: attention-relay/1\r\n\r\n"
-    ]
-
-    with :ok <- :ssl.send(socket, request),
-         {:ok, headers} <- read_headers(socket, <<>>),
-         true <- String.starts_with?(headers, "HTTP/1.1 101 "),
-         true <-
-           String.contains?(
-             String.downcase(headers),
-             "sec-websocket-protocol: attention-relay/1\r\n"
-           ),
-         accept <-
-           Base.encode64(:crypto.hash(:sha, key <> "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")),
-         true <- String.contains?(headers, "Sec-WebSocket-Accept: #{accept}\r\n") do
+         {:ok, 200, %{"rev" => rev, "items" => items}}
+         when is_integer(rev) and is_list(items) <-
+           HeadlessTLS.v2_get(endpoint, {certificate_path, key_path}, "/v2/inbox?limit=1") do
       :ok
     else
-      _ -> {:error, :bad_upgrade}
+      _ -> {:error, :access_proof_failed}
     end
-  end
-
-  defp read_headers(_socket, bytes) when byte_size(bytes) > 16_384,
-    do: {:error, :headers_too_large}
-
-  defp read_headers(socket, bytes) do
-    if String.ends_with?(bytes, "\r\n\r\n") do
-      {:ok, bytes}
-    else
-      case :ssl.recv(socket, 1, :infinity) do
-        {:ok, byte} -> read_headers(socket, bytes <> byte)
-        error -> error
-      end
-    end
-  end
-
-  defp send_resync(socket) do
-    payload = JSON.encode!(%{"v" => 1, "type" => "resync", "since" => 0}) <> "\n"
-    size = byte_size(payload)
-    mask = :crypto.strong_rand_bytes(4)
-    repeated = :binary.copy(mask, div(size + 3, 4))
-    masked = :crypto.exor(payload, binary_part(repeated, 0, size))
-    :ssl.send(socket, [<<1::1, 0::3, 1::4, 1::1, size::7>>, mask, masked])
-  end
-
-  defp read_frame(socket) do
-    with {:ok, <<1::1, 0::3, 1::4, 0::1, length::7>>} <- :ssl.recv(socket, 2, :infinity),
-         {:ok, size} <- frame_size(socket, length),
-         true <- size in 1..@max_server_frame,
-         {:ok, payload} <- :ssl.recv(socket, size, :infinity),
-         {:ok, value} <- JSON.decode_line(payload, @max_server_frame) do
-      {:ok, value}
-    else
-      _ -> {:error, :bad_relay_frame}
-    end
-  end
-
-  defp frame_size(_socket, size) when size < 126, do: {:ok, size}
-
-  defp frame_size(socket, 126) do
-    with {:ok, <<size::16>>} <- :ssl.recv(socket, 2, :infinity), do: {:ok, size}
-  end
-
-  defp frame_size(socket, 127) do
-    with {:ok, <<size::64>>} <- :ssl.recv(socket, 8, :infinity), do: {:ok, size}
-  end
-
-  defp read_barrier(socket) do
-    case read_frame(socket) do
-      {:ok, %{"type" => "resynced"} = barrier} ->
-        {:ok, barrier}
-
-      {:ok, %{"type" => type}} when type in ["delivery", "lifecycle"] ->
-        read_barrier(socket)
-
-      _ ->
-        {:error, :bad_replay}
-    end
+  rescue
+    _ -> {:error, :access_proof_failed}
   end
 
   defp create_directory(directory) do
