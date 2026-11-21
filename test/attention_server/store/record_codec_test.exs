@@ -123,6 +123,35 @@ defmodule AttentionServer.Store.RecordCodecTest do
     assert {"1.234e567\n", 0} = cold_elixir(contents, [fixture])
   end
 
+  test "origin history persists as independent high, entry and delivery rows" do
+    scope = {"person", "origin"}
+
+    entries =
+      Map.new(
+        1..300,
+        &{&1, %{"session_handle" => "session", "event_id" => Integer.to_string(&1)}}
+      )
+
+    feed = %{high: 300, entries: entries, delivery_acks: %{1 => %{ack1: 4}}}
+    engine = %{Engine.new() | origin_feeds: %{scope => feed}}
+    normalized = AttentionServer.Conversation.index_origin_feeds(engine)
+    before = MapSet.new(RecordCodec.encode(normalized))
+    next = put_in(normalized.origin_feeds[scope].delivery_acks[1], %{ack1: 4, ack2: 7})
+    after_rows = MapSet.new(RecordCodec.encode(next))
+
+    assert MapSet.to_list(MapSet.difference(after_rows, before)) ==
+             [
+               RecordCodec.encode_row({:origin_feed, scope, {:delivery_ack, 1}}, %{
+                 ack1: 4,
+                 ack2: 7
+               })
+             ]
+
+    assert {:ok, decoded} = RecordCodec.decode(after_rows |> Enum.to_list() |> Enum.reverse())
+    refute Map.has_key?(decoded.origin_feeds[scope], :entry_seqs_by_handle)
+    assert AttentionServer.Conversation.index_origin_feeds(decoded) == next
+  end
+
   defp cold_elixir(contents, args) do
     beam_dir = :code.which(RecordCodec) |> List.to_string() |> Path.dirname()
 

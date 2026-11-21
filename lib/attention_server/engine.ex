@@ -2720,7 +2720,9 @@ defmodule AttentionServer.Engine do
     acks = Map.get(feed, :delivery_acks, %{})
     stages = Map.put(Map.get(acks, entry["feed_seq"], %{}), stage, seq)
     feed = Map.put(feed, :delivery_acks, Map.put(acks, entry["feed_seq"], stages))
+
     %{next | origin_feeds: Map.put(next.origin_feeds, feed_key, feed)}
+    |> touch_fact({:origin_feed, feed_key, {:delivery_ack, entry["feed_seq"]}})
   end
 
   defp delivery_ack_payload(engine, origin, entry, stage, agent) do

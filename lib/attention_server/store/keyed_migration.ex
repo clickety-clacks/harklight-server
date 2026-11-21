@@ -1,7 +1,7 @@
 defmodule AttentionServer.Store.KeyedMigration do
   @moduledoc false
 
-  alias AttentionServer.{LargeData, Store}
+  alias AttentionServer.{Conversation, LargeData, Store}
   alias AttentionServer.Store.{RecordCodec, RecordTable}
   alias Exqlite.Sqlite3
 
@@ -71,7 +71,12 @@ defmodule AttentionServer.Store.KeyedMigration do
     with {:ok, rows} <- RecordTable.rows(db), do: RecordCodec.decode(rows)
   end
 
-  defp canonical(engine), do: Map.drop(Map.from_struct(engine), @derived)
+  defp canonical(engine) do
+    engine
+    |> Conversation.index_origin_feeds()
+    |> Map.from_struct()
+    |> Map.drop(@derived)
+  end
 
   defp verify_previous_progress(store) do
     with {:ok, rows} <-
