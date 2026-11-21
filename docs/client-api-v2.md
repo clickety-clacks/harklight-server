@@ -108,7 +108,9 @@ Schemas use JSON Schema 2020-12. `$ref`s point into the `$defs` below.
         "started": { "type": "boolean" },
         "read_position": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/OpaqueId" }], "description": "entry_id read through" },
         "last_origin_reply": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/OpaqueId" }], "description": "entry_id of the newest origin reply" },
-        "unread_replies": { "type": "integer", "minimum": 0, "description": "Agent replies after the person's read position, computed by the server" }
+        "unread_replies": { "type": "integer", "minimum": 0, "description": "Agent replies after the person's read position, computed by the server" },
+        "reply_group": { "enum": ["earlier_chat_replies", "earlier_chat_replies_unknown"], "description": "Present only while unread_replies > 0: today's verified or unknown reply row" },
+        "reply_rank_key": { "type": "string", "description": "Present only while unread_replies > 0: where the reply row sorts, in Rank.key's space" }
       }
     },
 
@@ -158,7 +160,8 @@ Schemas use JSON Schema 2020-12. `$ref`s point into the `$defs` below.
       "required": ["key", "section"],
       "properties": {
         "key": { "type": "string", "description": "Sort ascending, byte-wise, to get the server's inbox order across and within sections" },
-        "section": { "enum": ["current", "resolved"], "description": "Draw a heading where it changes (closed list, §4)" },
+        "section": { "enum": ["current", "resolved"], "description": "Draw a heading where it changes; resolved takes today's History heading (closed list, §4)" },
+        "group": { "enum": ["common", "earlier_messages"], "description": "Only for current items while the inbox is in free order; common has no heading" },
         "score": { "type": "number" },
         "due_at_ms": { "$ref": "#/$defs/TimeMs" }
       }
@@ -231,31 +234,48 @@ Schemas use JSON Schema 2020-12. `$ref`s point into the `$defs` below.
 
     "Me": {
       "type": "object",
-      "required": ["account", "limits", "answer_ui_limits", "retention_days", "features"],
+      "required": ["account", "features", "limits"],
       "properties": {
         "account": {
           "type": "object",
           "required": ["state"],
           "properties": { "state": { "enum": ["active", "paused"] } }
         },
-        "limits": {
-          "type": "object",
-          "required": ["upload_cap_bytes_per_file", "inline_decoded_bytes_per_entry"],
-          "properties": {
-            "upload_cap_bytes_per_file": { "oneOf": [{ "type": "integer", "minimum": 0 }, { "const": "none" }] },
-            "inline_decoded_bytes_per_entry": { "type": "integer", "minimum": 0 }
-          }
-        },
-        "answer_ui_limits": {
-          "type": "object",
-          "description": "The one published UI/1 cap set (today's answer_ui_limits). Every 0.2 client renders up to it.",
-          "additionalProperties": { "type": "integer", "minimum": 0 }
-        },
-        "retention_days": { "type": "integer", "minimum": 1 },
         "features": {
           "type": "object",
           "description": "Server-controlled client features still behind a flag at 0.2 (§4)",
           "additionalProperties": { "type": "boolean" }
+        },
+        "limits": {
+          "type": "object",
+          "required": ["upload_cap_bytes_per_file", "inline_decoded_bytes_per_entry", "answer_ui_limits", "retention_days"],
+          "properties": {
+            "upload_cap_bytes_per_file": { "oneOf": [{ "type": "integer", "minimum": 0 }, { "const": "none" }] },
+            "inline_decoded_bytes_per_entry": { "type": "integer", "minimum": 0 },
+            "answer_ui_limits": {
+              "type": "object",
+              "description": "Exactly the Server's published UI/1 limits (UI1.published_limits). Every 0.2 client renders up to them.",
+              "required": ["document_bytes", "requires", "illustrations", "primitives_per_illustration", "primitives_total", "inputs", "actions", "scene_nodes", "scene_depth", "result_nodes", "result_depth", "result_point_path", "array_items", "object_members", "identifier_bytes"],
+              "properties": {
+                "document_bytes": { "type": "integer", "minimum": 0 },
+                "requires": { "type": "integer", "minimum": 0 },
+                "illustrations": { "type": "integer", "minimum": 0 },
+                "primitives_per_illustration": { "type": "integer", "minimum": 0 },
+                "primitives_total": { "type": "integer", "minimum": 0 },
+                "inputs": { "type": "integer", "minimum": 0 },
+                "actions": { "type": "integer", "minimum": 0 },
+                "scene_nodes": { "type": "integer", "minimum": 0 },
+                "scene_depth": { "type": "integer", "minimum": 0 },
+                "result_nodes": { "type": "integer", "minimum": 0 },
+                "result_depth": { "type": "integer", "minimum": 0 },
+                "result_point_path": { "type": "integer", "minimum": 0 },
+                "array_items": { "type": "integer", "minimum": 0 },
+                "object_members": { "type": "integer", "minimum": 0 },
+                "identifier_bytes": { "type": "integer", "minimum": 0 }
+              }
+            },
+            "retention_days": { "const": 30 }
+          }
         }
       }
     }
@@ -344,14 +364,20 @@ Schemas use JSON Schema 2020-12. `$ref`s point into the `$defs` below.
   version-gate them by `rev`.
 - The inbox pages through every item the person can see, terminal ones
   included, in rank order. `next_page` is absent on the last page.
-- **Sections** are a closed list taken from today's inbox order:
+- **Sections** are a closed list taken from today's inbox order
+  (`Placement.list_items`):
   - `current`: items still waiting on the person, in today's ranked or free
     order;
-  - `resolved`: settled items, newest first.
+  - `resolved`: settled items, newest first. Clients draw today's History
+    heading here.
 
-  `rank.key` orders items across and within sections. Today's unread-reply
-  rows are a client rendering of `Chat.unread_replies` and
-  `Chat.last_origin_reply`.
+  `rank.key` orders items across and within sections. While the inbox is in
+  free order, `current` items also carry `Rank.group` (`common`, which has no
+  heading, or `earlier_messages`). Today's unread-reply rows are a client
+  rendering of the item's chat state: while `Chat.unread_replies > 0`, the
+  item carries `Chat.reply_group` (today's verified or unknown reply row) and
+  `Chat.reply_rank_key`, which places the reply row among item rows in
+  `Rank.key`'s space, exactly as today.
 - **Files.** A file uploaded through `POST /v2/files` is served with the
   `Content-Type` it was sent with. Files attached inline before the cut-over
   are served as `application/octet-stream`.
@@ -536,7 +562,26 @@ Every write that succeeds answers `200`, or `201` for `POST /v2/files`, with a
   and at close with `revoked`, `server_shutdown`, `account_paused` or
   `client_closed`.
 
-## 6.1 Push payload
+## 6.1 The log is compacted
+
+The change log holds only each resource's latest row. A row is rendered from
+current state, in the same serialized step as reads and commits. Every change
+to a resource's client-visible inputs writes a new row for that resource,
+which removes the older one. So the state rendered at row rev N is that
+resource's state as of N.
+
+What clients see:
+
+- The feed and batches are gap-free, but may skip intermediate states of a
+  resource. Each resource appears at most once per catch-up, at its latest
+  `rev`. Clients must not rely on seeing every intermediate state.
+- Chat turns are their own Entry resources, so no turn is ever skipped.
+- `item_removed` rows are kept as tombstones for the retention window.
+
+The Server tests completeness by replaying the log, from empty and from a
+mid-log cursor, and comparing the result with a fresh snapshot.
+
+## 6.2 Push payload
 
 A 0.2 push keeps today's APNs alert, badge and background form, and today's
 visible text. Its `attention` member changes:
@@ -693,8 +738,11 @@ applied as well. Round 4 wins where rounds conflict:
   - a device revoked while its connection is open gets `401`.
 - **Inbox:** `Rank.section`, `Chat.unread_replies`, `Item.created_at_ms` and
   push state `expired`.
-- **`GET /v2/me`:** account state, file limits, the one published UI/1 cap
-  set, retention and live features.
-- **Push payload:** §6.1.
+- **`GET /v2/me`:** `account`, `features`, and `limits` (upload cap, inline
+  budget, the published UI/1 caps and the 30-day retention).
+- **Sections:** `Rank.section`, `Rank.group`, `Chat.reply_group` and
+  `Chat.reply_rank_key` (rounds 5 and 6).
+- **Compacted log:** §6.1.
+- **Push payload:** §6.2.
 
 No questions are open.
