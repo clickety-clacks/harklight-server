@@ -2,6 +2,7 @@ defmodule AttentionServer.AgentAPI.Advisories do
   @moduledoc false
 
   alias AttentionServer.{AgentChangeLog, BounceDecision, RouteBIndex, Store}
+  alias AttentionServer.ClientAPI.Resources
 
   def stamp_decisions(%Store{change_log: false}, next, _keys), do: {:ok, next}
 
@@ -42,6 +43,18 @@ defmodule AttentionServer.AgentAPI.Advisories do
       |> Enum.map(fn seq -> render(Map.fetch!(entries, seq), receipts) end)
     else
       _ -> []
+    end
+  end
+
+  def change(engine, {person, _, _} = scope, id) do
+    with {:ok, sequence} <- Map.fetch(engine.advisory_id_index, {scope, id}),
+         %{entries: %{^sequence => advisory}, receipts: receipts} <-
+           Map.get(engine.advisory_feeds, scope),
+         %{"sender_id" => sender, "message_id" => message_id} <- advisory,
+         {:ok, item_id} <- Resources.item_id(engine, {person, sender, message_id}) do
+      {:ok, %{"item_id" => item_id, "advisory" => render(advisory, receipts)}}
+    else
+      _ -> {:error, :storage_unavailable}
     end
   end
 

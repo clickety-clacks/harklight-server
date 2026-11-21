@@ -64,16 +64,16 @@ defmodule AttentionServer.ClientAPI.Feed do
     end
   end
 
-  defp limit(nil), do: {:ok, @max_limit}
+  def limit(nil), do: {:ok, @max_limit}
 
-  defp limit(value) when is_binary(value) do
+  def limit(value) when is_binary(value) do
     case Integer.parse(value) do
       {n, ""} when n > 0 -> {:ok, min(n, @max_limit)}
       _ -> {:error, "limit"}
     end
   end
 
-  defp limit(_value), do: {:error, "limit"}
+  def limit(_value), do: {:error, "limit"}
 
   defp position(value, field) when is_binary(value) do
     case Integer.parse(String.trim(value)) do
@@ -93,6 +93,7 @@ defmodule AttentionServer.ClientAPI.Feed do
 
   @doc false
   def send_read_error(conn, :cursor_expired), do: Errors.send_error(conn, "cursor_expired")
+  def send_read_error(conn, :account_paused), do: Errors.send_error(conn, "account_paused")
   def send_read_error(conn, :unauthorized), do: Errors.send_error(conn, "unauthorized")
   def send_read_error(conn, :disabled), do: Errors.send_error(conn, "not_found")
   def send_read_error(conn, _reason), do: Errors.send_error(conn, "storage_unavailable")
@@ -113,6 +114,27 @@ defmodule AttentionServer.ClientAPI.FeedStep do
 
   alias AttentionServer.{ChangeLog, Diagnostics}
   alias AttentionServer.ClientAPI.Reads
+
+  @doc false
+  def scope(ctx), do: ctx.principal.person
+
+  @doc false
+  def read(ctx, cursor, limit), do: read(ctx.relay, ctx.principal, cursor, limit)
+
+  @doc false
+  def transmitted(_ctx, _changes), do: :ok
+
+  @doc false
+  def opened(_ctx), do: :ok
+
+  @doc false
+  def closed(_ctx), do: :ok
+
+  @doc false
+  def focus_granted(_ctx), do: :ok
+
+  @doc false
+  def focus(_ctx), do: :skip
 
   @doc """
   Up to `limit` rows after `cursor`, rendered for `principal`:
@@ -191,6 +213,11 @@ defmodule AttentionServer.ClientAPI.FeedStep do
         Enum.map(rows, &{&1, render_one(renderer, context, principal, &1)})
       end
 
+    changes(results)
+  end
+
+  @doc false
+  def changes(results) do
     # A row the renderer could not render because its store failed fails the
     # whole step: dropping it would leave a silent gap. A :skip row has no
     # client form and is skipped.

@@ -221,6 +221,9 @@ defmodule AttentionServer.RouteBIndex do
   def session_messages(index, {person, origin, session}),
     do: get_in(index.messages_by_origin_session, [{person, origin}, session]) || []
 
+  def origin_sessions(index, person, origin),
+    do: index.messages_by_origin_session |> Map.get({person, origin}, %{}) |> Map.keys()
+
   defp put_entry_position(%{agent_feed?: true} = index, key, seq, %{
          "kind" => kind,
          "event_id" => id
