@@ -5,14 +5,9 @@ defmodule AttentionServer.CLI.Device do
       mix attention.device read --directory ./recipient --connect 127.0.0.1 --name relay.test --port 8445 --ca ca.pem
       mix attention.device respond --directory ./recipient --connect 127.0.0.1 --name relay.test --port 8445 --ca ca.pem --sender app:example --message-id request-1 --answer answer.json
 
-  The identity directory comes from `mix attention.enroll`. `read` saves
-  replayed events before ACK, and `respond` keeps its exact operation for safe
-  retry. New agent messages use the authenticated origin session route. An
-  answer file may contain any JSON value, including `null`.
-
-  With the temporary `client_api_v2` flag on (the `ATTENTION_SERVER_FEATURE_FLAGS_PATH`
-  file), both commands use client API v2. `read` prints `{rev, items}`. The
-  `respond` answer file is then a JSON object with at most one of `choice` (an
+  The identity directory comes from `mix attention.enroll`; `--port` is the
+  device port, which serves client API v2. `read` prints `{rev, items}`. The
+  `respond` answer file is a JSON object with at most one of `choice` (an
   action `id`), `comment` or `result`, and optionally `request_revision`; `{}`
   answers with no comment. Its exact body and `Idempotency-Key` are saved
   before sending, so a retry of the same answer resends them unchanged.
@@ -25,7 +20,7 @@ defmodule AttentionServer.CLI.Device do
   `operations/` and is never resent.
   """
 
-  alias AttentionServer.{HeadlessDevice, HeadlessTLS, JSON, ToolEndpoint}
+  alias AttentionServer.{HeadlessDevice, JSON, ToolEndpoint}
 
   def run([command | args]) when command in ["read", "respond"] do
     {options, rest, invalid} =
@@ -49,7 +44,7 @@ defmodule AttentionServer.CLI.Device do
 
     endpoint =
       case ToolEndpoint.from_options(options) do
-        {:ok, value} -> Map.put(value, :client_api_v2, HeadlessTLS.client_api_v2?())
+        {:ok, value} -> value
         _ -> AttentionServer.CLI.error!("--connect, --name, --port and --ca are required")
       end
 

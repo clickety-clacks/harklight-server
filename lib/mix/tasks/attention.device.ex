@@ -5,10 +5,12 @@ defmodule Mix.Tasks.Attention.Device do
       mix attention.device read --directory ./recipient --connect 127.0.0.1 --name relay.test --port 8445 --ca ca.pem
       mix attention.device respond --directory ./recipient --connect 127.0.0.1 --name relay.test --port 8445 --ca ca.pem --sender app:example --message-id request-1 --answer answer.json
 
-  The identity directory comes from `mix attention.enroll`. `read` saves
-  replayed events before ACK, and `respond` keeps its exact operation for safe
-  retry. Agents use the authenticated origin session route to send new messages.
-  An answer file may contain any JSON value, including `null`.
+  The identity directory comes from `mix attention.enroll`; `--port` is the
+  device port, which serves client API v2. `read` prints `{rev, items}`. The
+  `respond` answer file is a JSON object with at most one of `choice` (an
+  action `id`), `comment` or `result`, and optionally `request_revision`; `{}`
+  answers with no comment. Its exact body and `Idempotency-Key` are saved
+  before sending, so a retry of the same answer resends them unchanged.
   """
 
   use Mix.Task

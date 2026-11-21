@@ -1,7 +1,7 @@
 defmodule AttentionServer.HeadlessDeviceV2Test do
-  # The headless device tools over client API v2 (behind client_api_v2):
-  # device read (inbox snapshot stored before its cursor) and the enrollment
-  # proof (one GET /v2/inbox).
+  # The headless device tools over client API v2, their only protocol: device
+  # read (inbox snapshot stored before its cursor), respond, and the
+  # enrollment proof (one GET /v2/inbox).
   use ExUnit.Case, async: false
 
   alias AttentionServer.{ClientAPI, HeadlessDevice, HeadlessEnrollment, JSON, Relay, TLSFixtures}
@@ -73,8 +73,7 @@ defmodule AttentionServer.HeadlessDeviceV2Test do
       address: {127, 0, 0, 1},
       name: "relay.test",
       port: ClientAPI.Listener.port(listener),
-      ca_file: Path.join(certs, "ca.pem"),
-      client_api_v2: true
+      ca_file: Path.join(certs, "ca.pem")
     }
 
     identities = Map.new(~w(a1 b1), &{&1, identity!(dir, certs, &1, keys[&1], endpoint)})
@@ -361,44 +360,169 @@ defmodule AttentionServer.HeadlessDeviceV2Test do
   end
 
   test "the enrollment proof is one GET /v2/inbox with the approved key", ctx do
-    assert :ok = HeadlessEnrollment.verify_relay(ctx.identities["a1"], ctx.endpoint)
+    assert :ok = HeadlessEnrollment.verify_access(ctx.identities["a1"], ctx.endpoint)
     assert :ok = Relay.revoke_device(ctx.relay, ctx.keys["a1"])
 
-    assert {:error, :relay_proof_failed} =
-             HeadlessEnrollment.verify_relay(ctx.identities["a1"], ctx.endpoint)
+    assert {:error, :access_proof_failed} =
+             HeadlessEnrollment.verify_access(ctx.identities["a1"], ctx.endpoint)
   end
 
-  test "with the flag off the enrollment proof still needs /relay", ctx do
-    # The /v2 listener has no /relay upgrade, so the old proof fails as before.
-    endpoint = Map.put(ctx.endpoint, :client_api_v2, false)
-    assert {:error, _reason} = HeadlessEnrollment.verify_relay(ctx.identities["a1"], endpoint)
+  test "a directory a protocol 0.1 tool used opens without reading its old files", ctx do
+    forward!(ctx.relay, "carried", 2)
+    directory = ctx.identities["a1"]
+
+    legacy = %{
+      "cursor.json" => ~s({"seq":7}),
+      "events/00000000000000000007.json" => ~s({"seq":7,"type":"delivery"}),
+      ("operations/" <> String.duplicate("ab", 32) <> ".json") =>
+        ~s({"request":{"type":"answer"},"op_id":"00000000-0000-4000-8000-000000000009"})
+    }
+
+    for {name, bytes} <- legacy do
+      path = Path.join(directory, name)
+      File.mkdir_p!(Path.dirname(path))
+      File.chmod!(Path.dirname(path), 0o700)
+      File.write!(path, bytes)
+    end
+
+    assert {:ok, %{"items" => [%{"message" => %{"title" => "carried"}}]}} =
+             HeadlessDevice.read(directory, ctx.endpoint)
+
+    for {name, bytes} <- legacy, do: assert(File.read!(Path.join(directory, name)) == bytes)
   end
 
-  test "the tools read client_api_v2 from the server's feature-flags file", ctx do
-    previous = System.get_env("ATTENTION_SERVER_FEATURE_FLAGS_PATH")
+  test "against a server serving only the retained /relay path the tools fail, not hang", ctx do
+    relay =
+      start_supervised!(
+        {Relay,
+         store_path: Path.join(ctx.dir, "legacy.sqlite3"),
+         feature_flags_path: AttentionServer.LegacyProtocol.flags!(ctx.dir)},
+        id: :legacy_relay,
+        restart: :temporary
+      )
 
-    on_exit(fn ->
-      if previous,
-        do: System.put_env("ATTENTION_SERVER_FEATURE_FLAGS_PATH", previous),
-        else: System.delete_env("ATTENTION_SERVER_FEATURE_FLAGS_PATH")
-    end)
+    assert :ok = Relay.setup_person(relay, "A")
+    assert {:ok, _} = Relay.setup_device_certificate(relay, "A", certificate_der!(ctx, "a1"))
 
-    # On by default, like the server: unset, or a file without the key.
-    System.delete_env("ATTENTION_SERVER_FEATURE_FLAGS_PATH")
-    assert AttentionServer.HeadlessTLS.client_api_v2?()
+    web =
+      start_supervised!(
+        {AttentionServer.WebSocketRelay,
+         relay: relay,
+         certfile: Path.join(ctx.certs, "server.pem"),
+         keyfile: Path.join(ctx.certs, "server.key"),
+         cacertfile: Path.join(ctx.certs, "ca.pem")},
+        id: :legacy_web
+      )
 
-    on = Path.join(ctx.dir, "tool-flags.json")
-    File.write!(on, ~s({"other":true}))
-    System.put_env("ATTENTION_SERVER_FEATURE_FLAGS_PATH", on)
-    assert AttentionServer.HeadlessTLS.client_api_v2?()
+    endpoint = %{ctx.endpoint | port: AttentionServer.WebSocketRelay.port(web)}
+    directory = Path.join(ctx.dir, "legacy-device")
+    File.cp_r!(ctx.identities["a1"], directory)
+    rewrite_port!(directory, endpoint.port)
 
-    File.write!(on, ~s({"client_api_v2":true}))
-    System.put_env("ATTENTION_SERVER_FEATURE_FLAGS_PATH", on)
-    assert AttentionServer.HeadlessTLS.client_api_v2?()
-
-    File.write!(on, ~s({"client_api_v2":false}))
-    refute AttentionServer.HeadlessTLS.client_api_v2?()
+    task = Task.async(fn -> HeadlessDevice.read(directory, endpoint) end)
+    assert {:error, _reason} = Task.await(task, 10_000)
+    assert {:error, :access_proof_failed} = HeadlessEnrollment.verify_access(directory, endpoint)
   end
+
+  test "stored metadata keeps its byte limit with and without LF", ctx do
+    identity = ctx.identities["a1"]
+    max_bytes = 2 * (2 * 1024 * 1024) + 16_384
+
+    for ending <- ["", "\n"], {name, bytes} <- metadata(ctx) do
+      path = Path.join(identity, name)
+      padded = bytes <> String.duplicate(" ", max_bytes - byte_size(bytes) - byte_size(ending))
+      File.write!(path, padded <> ending)
+      assert {:ok, %{"items" => _}} = HeadlessDevice.read(identity, ctx.endpoint)
+      File.write!(path, padded <> " " <> ending)
+      assert {:error, :identity_or_server_mismatch} = HeadlessDevice.read(identity, ctx.endpoint)
+      File.write!(path, bytes)
+    end
+  end
+
+  test "stored metadata still rejects malformed JSON, trailing data and mismatched identity",
+       ctx do
+    identity = ctx.identities["a1"]
+
+    for {name, bytes} <- metadata(ctx) do
+      path = Path.join(identity, name)
+
+      for invalid <- ["{oops}", bytes <> "{}", bytes <> "\ntrue\n", "{\"x\":1,\"x\":2}"] do
+        File.write!(path, invalid)
+
+        assert {:error, :identity_or_server_mismatch} =
+                 HeadlessDevice.read(identity, ctx.endpoint)
+      end
+
+      File.write!(path, bytes)
+    end
+
+    for {field, value} <- [
+          {"address", "127.0.0.2"},
+          {"name", "other.test"},
+          {"ca_sha256", "wrong"}
+        ] do
+      assert {:ok, saved} = JSON.decode_line(metadata(ctx)["server.json"] <> "\n")
+      File.write!(Path.join(identity, "server.json"), JSON.encode!(Map.put(saved, field, value)))
+      assert {:error, :identity_or_server_mismatch} = HeadlessDevice.read(identity, ctx.endpoint)
+    end
+
+    File.write!(Path.join(identity, "server.json"), metadata(ctx)["server.json"])
+
+    File.write!(
+      Path.join(identity, "enrollment.json"),
+      ~s|{"person_id":"A","device_id":"#{ctx.keys["b1"]}"}|
+    )
+
+    assert {:error, :identity_or_server_mismatch} = HeadlessDevice.read(identity, ctx.endpoint)
+  end
+
+  test "stored messages remain scoped to their person", ctx do
+    forward!(ctx.relay, "tenant-request", 2)
+    assert {:ok, %{"items" => []}} = HeadlessDevice.read(ctx.identities["b1"], ctx.endpoint)
+
+    assert {:error, :not_in_inbox} =
+             HeadlessDevice.respond(
+               ctx.identities["b1"],
+               ctx.endpoint,
+               "app:test",
+               "tenant-request",
+               answer_file!(ctx.dir, %{})
+             )
+
+    assert {:ok, %{"items" => [%{"message" => %{"title" => "tenant-request"}}]}} =
+             HeadlessDevice.read(ctx.identities["a1"], ctx.endpoint)
+
+    wrong = Path.join(ctx.dir, "wrong")
+    File.cp_r!(ctx.identities["a1"], wrong)
+
+    File.write!(
+      Path.join(wrong, "enrollment.json"),
+      JSON.encode!(%{"person_id" => "A", "device_id" => ctx.keys["b1"]}) <> "\n"
+    )
+
+    assert {:error, :identity_or_server_mismatch} = HeadlessDevice.read(wrong, ctx.endpoint)
+  end
+
+  # Match ServerFile/EnrollmentFile field order and compact serde_json::to_vec
+  # output, including optional extra metadata a client may have saved.
+  defp metadata(ctx) do
+    ca_hash =
+      :crypto.hash(:sha256, File.read!(ctx.endpoint.ca_file)) |> Base.encode16(case: :lower)
+
+    %{
+      "server.json" =>
+        ~s|{"address":"127.0.0.1","name":"relay.test","port":#{ctx.endpoint.port},"ca_sha256":"#{ca_hash}","origin_port":18446}|,
+      "enrollment.json" => ~s|{"person_id":"A","device_id":"#{ctx.keys["a1"]}"}|
+    }
+  end
+
+  defp rewrite_port!(directory, port) do
+    path = Path.join(directory, "server.json")
+    {:ok, saved} = JSON.decode_line(File.read!(path) <> "\n")
+    File.write!(path, JSON.encode!(Map.put(saved, "port", port)) <> "\n")
+  end
+
+  defp certificate_der!(ctx, name), do: TLSFixtures.certificate_der!(ctx.certs, name)
 
   defp answer_file!(dir, value, name \\ "answer.json") do
     path = Path.join(dir, name)

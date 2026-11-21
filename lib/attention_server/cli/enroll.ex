@@ -4,7 +4,10 @@ defmodule AttentionServer.CLI.Enroll do
 
       mix attention.enroll start --directory ./device --connect 127.0.0.1 --name relay.test --port 8443 --ca ca.pem --label 'Laptop'
       mix attention.enroll retry --directory ./device --connect 127.0.0.1 --name relay.test --port 8443 --ca ca.pem --label 'Laptop'
-      mix attention.enroll status --directory ./device --connect 127.0.0.1 --name relay.test --port 8443 --relay-port 8445 --ca ca.pem
+      mix attention.enroll status --directory ./device --connect 127.0.0.1 --name relay.test --port 8443 --device-port 8445 --ca ca.pem
+
+  `status` with `--device-port` (the device listener that serves client API
+  v2) proves the approved key with one authenticated `GET /v2/inbox?limit=1`.
 
   The displayed approval code is for the already authenticated owner. The
   status secret and private key remain in the local 0700 directory.
@@ -20,7 +23,7 @@ defmodule AttentionServer.CLI.Enroll do
           connect: :string,
           name: :string,
           port: :integer,
-          relay_port: :integer,
+          device_port: :integer,
           ca: :string,
           label: :string
         ]
@@ -61,19 +64,15 @@ defmodule AttentionServer.CLI.Enroll do
           HeadlessEnrollment.submit_existing(directory, endpoint, label)
 
         "status" ->
-          relay_port =
-            Keyword.get(options, :relay_port) ||
-              AttentionServer.CLI.error!("--relay-port is required")
+          device_port =
+            Keyword.get(options, :device_port) ||
+              AttentionServer.CLI.error!("--device-port is required")
 
           case HeadlessEnrollment.status(directory, endpoint) do
             {:ok, %{"state" => "approved"} = approval} ->
-              relay_endpoint =
-                Map.merge(endpoint, %{
-                  port: relay_port,
-                  client_api_v2: AttentionServer.HeadlessTLS.client_api_v2?()
-                })
+              device_endpoint = Map.put(endpoint, :port, device_port)
 
-              case HeadlessEnrollment.verify_relay(directory, relay_endpoint) do
+              case HeadlessEnrollment.verify_access(directory, device_endpoint) do
                 :ok -> {:ok, approval}
                 error -> error
               end
@@ -90,7 +89,7 @@ defmodule AttentionServer.CLI.Enroll do
 
       {:ok, %{"state" => "approved"}} when command == "retry" ->
         AttentionServer.CLI.shell().info(
-          "historical approval observed; run status with --relay-port to prove current key access before treating enrollment as complete"
+          "historical approval observed; run status with --device-port to prove current key access before treating enrollment as complete"
         )
 
       {:ok, %{"state" => "approved", "person_id" => person, "device_id" => device}} ->

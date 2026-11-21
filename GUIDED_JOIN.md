@@ -6,13 +6,13 @@ commands. See SELF_HOST.md for installation and dashboard setup.
 The authenticated owner creates a person-bound invitation. The app keeps its
 fresh device private key and submits a public certificate. Redemption creates a
 pending request; the current owner separately approves its exact code, SPKI and
-deadline, optionally naming sender grants. Existing enrollment status and current relay
-TLS proof complete the server side of the flow.
+deadline, optionally naming sender grants. Existing enrollment status and a current
+device-port access proof complete the server side of the flow.
 
 ## Operator configuration and owner commands
 
 Set `ATTENTION_SERVER_JOIN_NAME` to the DNS name validated by clients. Invitations
-use that name, the configured enrollment/relay ports and the public certificate
+use that name, the configured enrollment and device ports and the public certificate
 in `ATTENTION_SERVER_CACERTFILE`. New bootstrap output includes this setting.
 Existing installations can add it to their server configuration for a future
 authorized restart, preserving the store, CA and owner. With no join name,
@@ -115,7 +115,7 @@ person/SPKI/secret binding and returns the current pending request with the same
 code. The response includes `person_id` and `device_id`; the client must check the exact
 saved binding before adopting it. Decline, cancellation, revocation and retired owner
 authority do not renew. An approved saved request returns its retained approved binding, subject
-to current revocation. Native proof of current relay access is still required;
+to current revocation. Native proof of current device-port access is still required;
 a historical approval does not override revocation.
 
 Owner decline uses `type: "pending_decline"`, `approval_code`,

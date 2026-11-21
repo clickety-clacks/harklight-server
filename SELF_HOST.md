@@ -101,7 +101,7 @@ shown account, label and key fingerprint before typing APPROVE:
 Sender scope is explicit and independent of enrollment. For a receiver use its
 own directory and label and omit --senders unless it also needs origin rights.
 
-    "$PACKAGE/bin/harklight" enroll status       --directory "$HOME/.local/share/harklight-sender"       --connect 127.0.0.1 --name localhost --port 18444 --relay-port 18443       --ca "$STATE/tls/ca.pem"
+    "$PACKAGE/bin/harklight" enroll status       --directory "$HOME/.local/share/harklight-sender"       --connect 127.0.0.1 --name localhost --port 18444 --device-port 18443       --ca "$STATE/tls/ca.pem"
 
 After a lost submission reply keep the existing identity and follow status/retry
 guidance. Enrollment success is not proof of receiver application of a message.
@@ -418,15 +418,19 @@ history.
 Use an enrolled device with read/respond access to see its person's stored
 messages:
 
-    "$PACKAGE/bin/harklight" device read --directory "$HOME/.local/share/harklight-receiver" --connect "$SERVER_ADDRESS" --name "$SERVER_NAME" --port "$RELAY_PORT" --ca "$CA_PEM"
+    "$PACKAGE/bin/harklight" device read --directory "$HOME/.local/share/harklight-receiver" --connect "$SERVER_ADDRESS" --name "$SERVER_NAME" --port "$DEVICE_PORT" --ca "$CA_PEM"
 
-To deliberately answer a request already delivered to that device, save one JSON
-value in `answer.json` and provide the exact sender and message ID:
+`DEVICE_PORT` is the device port (18443 by default), which serves client API
+v2. To deliberately answer a request already delivered to that device, save the
+answer body in `answer.json`: a JSON object with at most one of `choice` (an
+action `id`), `comment` or `result`, or `{}` to answer with no comment. Then
+provide the exact sender and message ID:
 
-    printf '%s\n' '{"choice":"continue","note":null}' > answer.json
-    "$PACKAGE/bin/harklight" device respond --directory "$HOME/.local/share/harklight-receiver" --connect "$SERVER_ADDRESS" --name "$SERVER_NAME" --port "$RELAY_PORT" --ca "$CA_PEM" --sender app:example --message-id request-1 --answer answer.json
+    printf '%s\n' '{"choice":"continue"}' > answer.json
+    "$PACKAGE/bin/harklight" device respond --directory "$HOME/.local/share/harklight-receiver" --connect "$SERVER_ADDRESS" --name "$SERVER_NAME" --port "$DEVICE_PORT" --ca "$CA_PEM" --sender app:example --message-id request-1 --answer answer.json
 
-The read command stores replayed events before ACK. A response is deliberate and
+The read command stores the inbox snapshot, and later change batches, before
+advancing its cursor; it acknowledges nothing. A response is deliberate and
 terminal; it does not execute a source action or authorize external operations.
 Use a supported answer UI when reading through the native app. Unknown UI
 remains unsupported.
