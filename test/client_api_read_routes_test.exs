@@ -293,4 +293,39 @@ defmodule AttentionServer.ClientAPIReadRoutesTest do
     again = Reads.get_settings(get("/v2/settings", [{"if-none-match", etag(settings)}]), ctx(ctx))
     assert again.status == 304
   end
+
+  test "a browser gets a file as an attachment of octet-stream; a device gets its type", ctx do
+    %{"items" => items} = body(Reads.get_inbox(get("/v2/inbox"), ctx(ctx)))
+    [ref] = Enum.find(items, &(&1["message"]["message_id"] == "one"))["files"]
+
+    :sys.replace_state(ctx.relay, fn state ->
+      engine = state.store.engine
+      owners = Map.put(engine.owners, "A", %{key: "owner-a", revision: 2})
+      %{state | store: %{state.store | engine: %{engine | owners: owners}}}
+    end)
+
+    browser = %Context{
+      principal: %Principal{
+        person: "A",
+        kind: :browser,
+        key: "owner-a",
+        owner_revision: 2,
+        session_id: :crypto.strong_rand_bytes(32)
+      },
+      relay: ctx.relay,
+      request_id: "req-1",
+      params: %{file_id: ref["file_id"]}
+    }
+
+    file = Reads.get_file(get("/v2/files/x"), browser)
+    assert file.status == 200
+    assert file.resp_body == @bytes
+    assert get_resp_header(file, "content-type") == ["application/octet-stream"]
+    assert get_resp_header(file, "content-disposition") == ["attachment; filename*=UTF-8''a.bin"]
+    assert get_resp_header(file, "etag") == [~s("#{ref["sha256"]}")]
+
+    device = Reads.get_file(get("/v2/files/x"), ctx(ctx, %{file_id: ref["file_id"]}))
+    assert get_resp_header(device, "content-disposition") == []
+    assert get_resp_header(device, "content-type") == ["application/octet-stream"]
+  end
 end

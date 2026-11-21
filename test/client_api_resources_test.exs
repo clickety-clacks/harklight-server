@@ -814,6 +814,50 @@ defmodule AttentionServer.ClientAPIResourcesTest do
     end
   end
 
+  describe "file types" do
+    test "an upload's stored type is FileRef.content_type; older files have none", %{path: path} do
+      relay = scripted_relay(path)
+      {engine, view} = snapshot(relay)
+      sha = String.duplicate("b", 64)
+
+      upload = %{
+        "tier" => "upload",
+        "upload_id" => "u-typed",
+        "name" => "photo.png",
+        "size" => 3,
+        "sha256" => sha
+      }
+
+      untyped = %{upload | "upload_id" => "u-plain", "name" => "old.bin"}
+
+      engine =
+        engine
+        |> Map.update!(:uploads, fn uploads ->
+          uploads
+          |> Map.put("u-typed", %{
+            person: "A",
+            name: "photo.png",
+            size: 3,
+            sha256: sha,
+            content_type: "image/png"
+          })
+          |> Map.put("u-plain", %{person: "A", name: "old.bin", size: 3, sha256: sha})
+        end)
+        |> update_in([Access.key(:messages), key("old")], fn record ->
+          %{record | files_by_revision: %{1 => [upload, untyped]}}
+        end)
+
+      {:ok, id} = Resources.item_id(engine, key("old"))
+
+      item =
+        Resources.item(engine, key("old"), Map.fetch!(Resources.ranks(engine, "A", view), id))
+
+      assert [%{"file_id" => "fuu-typed", "content_type" => "image/png"}, plain] = item["files"]
+      refute Map.has_key?(plain, "content_type")
+      GenServer.stop(relay)
+    end
+  end
+
   describe "availability entries" do
     test "an availability change is a schema-conformant server entry on each open item",
          %{path: path} do
