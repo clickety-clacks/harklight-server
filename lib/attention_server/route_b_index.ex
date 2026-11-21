@@ -4,6 +4,9 @@ defmodule AttentionServer.RouteBIndex do
   def new do
     %{
       resolved_messages_by_person: %{},
+      sent_messages_by_agent: %{},
+      agent_entry_pages: %{},
+      agent_results: %{},
       conversations_by_item: %{},
       agent_feed?: false,
       entry_positions: %{},
@@ -37,12 +40,16 @@ defmodule AttentionServer.RouteBIndex do
 
     index =
       Enum.reduce(engine.messages, index, fn {key, record}, current ->
-        put_session_message(current, key, nil, record)
+        current
+        |> put_session_message(key, nil, record)
+        |> put_agent_message(key, nil, record)
       end)
 
     index =
       Enum.reduce(engine.conversation_events, index, fn {{_, seq}, event}, current ->
-        put_entry_position(current, event.key, seq, event.payload)
+        current
+        |> put_entry_position(event.key, seq, event.payload)
+        |> put_agent_entry(event.key, seq, event.payload)
       end)
 
     %{engine | route_b_index: index_advisories(index, engine.advisory_feeds)}
@@ -60,6 +67,7 @@ defmodule AttentionServer.RouteBIndex do
 
   def put_message(index, {person, sender, id} = key, previous, record) do
     index = put_session_message(index, key, previous, record)
+    index = put_agent_message(index, key, previous, record)
     previous_resolved? = match?(%{terminal: terminal} when not is_nil(terminal), previous)
     current_resolved? = not is_nil(record.terminal)
 
@@ -92,6 +100,65 @@ defmodule AttentionServer.RouteBIndex do
     end
   end
 
+  def message_page(index, scope, filters),
+    do: Map.get(index.sent_messages_by_agent, {scope, filters}, :gb_trees.empty())
+
+  def entry_page(index, key),
+    do: Map.get(index.agent_entry_pages, key, :gb_trees.empty())
+
+  def result_revision(index, key, position),
+    do: Enum.count(Map.get(index.agent_results, key, []), &(&1 <= position))
+
+  defp put_agent_message(
+         %{agent_feed?: true} = index,
+         {person, sender, id} = key,
+         nil,
+         %{origin: agent} = record
+       )
+       when is_binary(agent) do
+    dimensions = [{"sender", sender}]
+
+    dimensions =
+      case Map.get(record, :session_handle) do
+        session when is_binary(session) -> [{"session", session} | dimensions]
+        _ -> dimensions
+      end
+
+    dimensions =
+      if Map.get(record, :agent_api_v2, false),
+        do: dimensions,
+        else: [{"legacy_message_id", id} | dimensions]
+
+    filters =
+      Enum.reduce(dimensions, [%{}], fn {name, value}, sets ->
+        sets ++ Enum.map(sets, &Map.put(&1, name, value))
+      end)
+
+    pages =
+      Enum.reduce(filters, index.sent_messages_by_agent, fn filter, pages ->
+        page = {{person, agent}, filter}
+        tree = Map.get(pages, page, :gb_trees.empty())
+        Map.put(pages, page, :gb_trees.enter(-record.accepted_seq, key, tree))
+      end)
+
+    %{index | sent_messages_by_agent: pages}
+  end
+
+  defp put_agent_message(index, _key, _previous, _record), do: index
+
+  defp put_agent_entry(%{agent_feed?: true} = index, key, seq, %{"kind" => kind})
+       when kind in ~w(discussion reply revision result availability retraction) do
+    page = Map.get(index.agent_entry_pages, key, :gb_trees.empty())
+    index = put_in(index.agent_entry_pages[key], :gb_trees.enter(-seq, seq, page))
+
+    if kind == "result",
+      do:
+        update_in(index.agent_results, &Map.update(&1, key, [seq], fn seqs -> [seq | seqs] end)),
+      else: index
+  end
+
+  defp put_agent_entry(index, _key, _seq, _payload), do: index
+
   def put_conversation_event(index, person, seq, {row_person, _sender, _id} = key, payload)
       when row_person == person do
     tree = Map.get(index.conversations_by_item, key, :gb_trees.empty())
@@ -99,6 +166,7 @@ defmodule AttentionServer.RouteBIndex do
     index = put_in(index, [:conversations_by_item, key], tree)
 
     index = put_entry_position(index, key, seq, payload)
+    index = put_agent_entry(index, key, seq, payload)
 
     summary =
       Map.get(index.conversation_summary_by_item, key, %{
