@@ -7794,7 +7794,7 @@ defmodule AttentionServer.Relay do
     held = Map.put(show, "accepted_at", state.clock.())
     next = %{state | held_shows: Map.put(state.held_shows, client["client_id"], held)}
 
-    AttentionServer.ClientAPI.Focus.notify_show(client["client_id"], held)
+    AttentionServer.ClientAPI.Focus.notify_show(client["client_id"])
 
     {{:ok,
       %{

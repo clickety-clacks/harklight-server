@@ -7,7 +7,7 @@ defmodule AttentionServer.ClientAPIFeedShowTest do
   import AttentionServer.ClientAPIFeedClient
 
   alias AttentionServer.{ChangeLog, ClientAPI, JSON, Relay, TLSFixtures}
-  alias AttentionServer.ClientAPI.Writes
+  alias AttentionServer.ClientAPI.{Context, FeedStream, Writes}
 
   @handle "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
   @agent String.duplicate("e", 64)
@@ -111,6 +111,77 @@ defmodule AttentionServer.ClientAPIFeedShowTest do
   defp heartbeat_fast do
     Application.put_env(:attention_server, :client_api_feed_heartbeat_ms, 50)
     on_exit(fn -> Application.delete_env(:attention_server, :client_api_feed_heartbeat_ms) end)
+  end
+
+  defmodule PausedStream do
+    def send_chunked(test, 200, _headers) do
+      send(test, {:stream_paused, self()})
+
+      receive do
+        :resume -> {:ok, "", test}
+      end
+    end
+
+    def chunk(test, data) do
+      send(test, {:stream_chunk, IO.iodata_to_binary(data)})
+      :ok
+    end
+  end
+
+  defp pause_before_first_chunk(ctx) do
+    test = self()
+    cursor = head(ctx.relay)
+
+    stream =
+      Task.async(fn ->
+        conn = %{Plug.Test.conn(:get, "/v2/changes") | adapter: {PausedStream, test}}
+
+        stream_ctx = %Context{
+          principal: %{kind: :device, key: ctx.reader, person: "A"},
+          relay: ctx.relay,
+          request_id: "paused-show-test"
+        }
+
+        FeedStream.serve(conn, stream_ctx, cursor)
+      end)
+
+    assert_receive {:stream_paused, pid}, 1_000
+    assert pid == stream.pid
+    stream
+  end
+
+  test "the stream writes only the current show when a newer show arrives before delivery", ctx do
+    heartbeat_fast()
+    stream = pause_before_first_chunk(ctx)
+    assert {:ok, %{"delivery" => "held"}} = push_view(ctx.relay, "message")
+    assert {:ok, %{"delivery" => "held"}} = push_view(ctx.relay, "chat")
+
+    send(stream.pid, :resume)
+
+    assert_receive {:stream_chunk, "event: show\ndata: " <> data}, 1_000
+    assert {:ok, %{"target" => "chat"}} = JSON.decode_line(data)
+
+    assert_receive {:stream_chunk, next}, 1_000
+    assert next == "event: heartbeat\ndata: {}\n\n"
+
+    assert :ok = Relay.revoke_device(ctx.relay, ctx.reader)
+
+    assert_receive {:stream_chunk, "event: closing\ndata: {\"reason\":\"revoked\"}\n\n"}, 1_000
+    Task.await(stream)
+    refute_received {:stream_chunk, "event: show\ndata: " <> _}
+  end
+
+  test "the stream closes without a show when the device is revoked before delivery", ctx do
+    stream = pause_before_first_chunk(ctx)
+    assert {:ok, %{"delivery" => "held"}} = push_view(ctx.relay, "chat")
+    assert :ok = Relay.revoke_device(ctx.relay, ctx.reader)
+
+    send(stream.pid, :resume)
+
+    assert_receive {:stream_chunk, first}, 1_000
+    assert first == "event: closing\ndata: {\"reason\":\"revoked\"}\n\n"
+    Task.await(stream)
+    refute_received {:stream_chunk, "event: show\ndata: " <> _}
   end
 
   test "a held show reaches the device's open feed as an id-less show event", ctx do

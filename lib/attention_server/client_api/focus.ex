@@ -16,8 +16,8 @@ defmodule AttentionServer.ClientAPI.Focus do
   is the show's age when it is written.
 
   The feed (C5) calls `subscribe_shows/1` for a device principal and then
-  receives `{:client_api_show, device_key, show_id}` for each show held for it.
-  The feed resolves the ID against current relay state just before writing
+  receives `{:client_api_show, device_key}` whenever a show is held for it.
+  The feed reads the current held show from the relay just before writing
   the id-less event, when it computes the show's age (round 11 r4 §4).
   """
 
@@ -43,34 +43,35 @@ defmodule AttentionServer.ClientAPI.Focus do
     do: Registry.unregister(@registry, {:client_api_show, device_key})
 
   @doc false
-  # A notification carries only the ID. The held show stays in the relay.
-  def notify_show(device_key, held) do
+  # The held show stays in the relay. This only wakes subscribed feeds.
+  def notify_show(device_key) do
     if Process.whereis(@registry) do
       Registry.dispatch(@registry, {:client_api_show, device_key}, fn entries ->
-        id = show_id(device_key, held)
-        for {pid, _} <- entries, do: send(pid, {:client_api_show, device_key, id})
+        for {pid, _} <- entries, do: send(pid, {:client_api_show, device_key})
       end)
     end
 
     :ok
   end
 
-  @doc "Reads a notified show if it is still held for the authenticated device."
-  def pending_show(relay, principal, id),
-    do:
-      GenServer.call(relay, {:client_api, __MODULE__, {:pending_show, principal, id}}, :infinity)
+  @doc "Reads the current held show for a device that still authenticates."
+  def pending_show(relay, principal),
+    do: GenServer.call(relay, {:client_api, __MODULE__, {:pending_show, principal}}, :infinity)
 
   @doc false
-  def handle_call({:pending_show, principal, id}, _from, state) do
+  def handle_call({:pending_show, principal}, _from, state) do
     engine = state.store.engine
 
     data =
-      with {:ok, %{kind: :device, key: key}} <- Reads.client_principal(engine, principal),
-           %{} = held <- Map.get(state.held_shows, key),
-           ^id <- show_id(key, held) do
-        show(engine, key, held, state.clock.())
-      else
-        _ -> nil
+      case Reads.client_principal(engine, principal) do
+        {:ok, %{kind: :device, key: key}} ->
+          case Map.get(state.held_shows, key) do
+            nil -> nil
+            held -> show(engine, key, held, state.clock.())
+          end
+
+        _ ->
+          {:error, :unauthorized}
       end
 
     {:reply, data, state}

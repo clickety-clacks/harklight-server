@@ -198,12 +198,12 @@ defmodule AttentionServer.ClientAPIFocusTest do
     at(ctx, 5_000)
     assert {:ok, %{"client_id" => "reader", "delivery" => "held"}} = push_view(relay, "chat")
 
-    assert_receive {:client_api_show, "reader", show_id}, 1_000
+    assert_receive {:client_api_show, "reader"}, 1_000
 
     # The feed computes held_ms when it writes the event (round 11 r4 §4).
-    live = Focus.pending_show(relay, "reader", show_id)
+    live = Focus.pending_show(relay, "reader")
     at(ctx, 5_400)
-    assert Focus.pending_show(relay, "reader", show_id)["held_ms"] == 400
+    assert Focus.pending_show(relay, "reader")["held_ms"] == 400
 
     assert %{"device_id" => "reader", "item_id" => ^item, "target" => "chat", "held_ms" => 0} =
              live
@@ -216,12 +216,12 @@ defmodule AttentionServer.ClientAPIFocusTest do
     assert show["show_id"] == live["show_id"]
     assert show["held_ms"] == 750
     assert Map.delete(show, "held_ms") == Map.delete(live, "held_ms")
-    assert Focus.pending_show(relay, "reader", show_id) == nil
+    assert Focus.pending_show(relay, "reader") == nil
 
     # A feed that closes unsubscribes; later shows are not sent to it.
     :ok = Focus.unsubscribe_shows("reader")
     assert {:ok, _} = push_view(relay, "message")
-    refute_receive {:client_api_show, "reader", _}, 200
+    refute_receive {:client_api_show, "reader"}, 200
 
     assert {:ok, 200, %{"show" => %{"target" => "message"}}, false} =
              Writes.focus(relay, "reader", %{"screen" => "inbox", "ttl_s" => 120})
@@ -242,28 +242,6 @@ defmodule AttentionServer.ClientAPIFocusTest do
 
     assert {:ok, 200, %{"show" => %{"target" => "chat"}}, false} =
              Writes.focus(relay, "reader", %{"screen" => "inbox", "ttl_s" => 120})
-  end
-
-  test "a show notification resolves only while that show is current", ctx do
-    relay = relay(ctx)
-
-    assert {:ok, 200, _, false} =
-             Writes.focus(relay, "reader", %{"screen" => "inbox", "ttl_s" => 120})
-
-    :ok = Focus.subscribe_shows("reader")
-    at(ctx, 5_000)
-    assert {:ok, %{"delivery" => "held"}} = push_view(relay, "message")
-    assert_receive {:client_api_show, "reader", first}, 1_000
-
-    at(ctx, 5_100)
-    assert {:ok, %{"delivery" => "held"}} = push_view(relay, "chat")
-    assert_receive {:client_api_show, "reader", current}, 1_000
-
-    at(ctx, 5_250)
-    assert Focus.pending_show(relay, "reader", first) == nil
-
-    assert %{"show_id" => ^current, "target" => "chat", "held_ms" => 150} =
-             Focus.pending_show(relay, "reader", current)
   end
 
   test "bad reports keep their field names; browsers are forbidden", ctx do
