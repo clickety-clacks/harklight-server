@@ -31,6 +31,7 @@ defmodule AttentionServer.Store do
     KeyedValidation,
     Persistence,
     RecordCodec,
+    RecordTable,
     SnapshotEncoding
   }
 
@@ -191,8 +192,9 @@ defmodule AttentionServer.Store do
         open(path, :keyed)
 
       {:ok, :legacy} ->
-        with {:ok, legacy} <- open(path, :legacy) do
-          convert_legacy_store(legacy)
+        with {:ok, legacy} <- open_store(path, :legacy),
+             {:ok, keyed} <- convert_legacy_store(legacy) do
+          finish_open(keyed)
         end
 
       error ->
@@ -201,6 +203,10 @@ defmodule AttentionServer.Store do
   end
 
   def open(path, mode) when is_binary(path) and path != "" and mode in [:legacy, :keyed] do
+    with {:ok, store} <- open_store(path, mode), do: finish_open(store)
+  end
+
+  defp open_store(path, mode) do
     upload_dir = Path.expand(path) <> ".uploads"
 
     case Sqlite3.open(path) do
@@ -298,10 +304,40 @@ defmodule AttentionServer.Store do
            upload_dir: upload_dir,
            mode: mode
          },
-         :ok <- prune_untracked_uploads(store),
-         :ok <- LargeData.prune(upload_dir, engine),
-         :ok <- sync_large_data_references(db, LargeData.persisted_references(engine)) do
-      finalize_mode(store)
+         {:ok, store} <- finalize_mode(store),
+         :ok <- sync_large_data_references(store, LargeData.persisted_references(engine)) do
+      {:ok, store}
+    end
+  end
+
+  defp finish_open(store) do
+    # Registry refresh and conversion can still refuse the open. Reacquire the
+    # writer lock after those steps succeed and check that the file inventory
+    # is still current before performing irreversible maintenance.
+    result =
+      RecordTable.transaction(store.db, fn ->
+        with :ok <- check_open_generation(store),
+             :ok <- prune_untracked_uploads(store),
+             :ok <- LargeData.prune(store.upload_dir, store.engine) do
+          {:ok, :pruned}
+        end
+      end)
+
+    Diagnostics.result(:upload_cleanup, :startup_cleanup, result, :unavailable)
+    {:ok, store}
+  end
+
+  defp check_open_generation(%__MODULE__{mode: :keyed, db: db, version: version}) do
+    case RecordTable.generation(db) do
+      {:ok, ^version} -> :ok
+      _ -> {:error, :stale_generation}
+    end
+  end
+
+  defp check_open_generation(%__MODULE__{db: db, version: version}) do
+    case one(db, "SELECT version FROM relay_state WHERE id = 1", []) do
+      {:ok, [^version]} -> :ok
+      _ -> {:error, :stale_generation}
     end
   end
 
@@ -1845,16 +1881,16 @@ defmodule AttentionServer.Store do
     )
   end
 
-  defp sync_large_data_references(db, rows) do
-    result =
-      with :ok <- Sqlite3.execute(db, "BEGIN IMMEDIATE"),
-           :ok <- write_large_data_references(db, rows),
-           :ok <- Sqlite3.execute(db, "COMMIT") do
-        :ok
-      end
-
-    if result != :ok, do: Sqlite3.execute(db, "ROLLBACK")
-    result
+  defp sync_large_data_references(%__MODULE__{db: db} = store, rows) do
+    case RecordTable.transaction(db, fn ->
+           with :ok <- check_open_generation(store),
+                :ok <- write_large_data_references(db, rows) do
+             {:ok, :synced}
+           end
+         end) do
+      {:ok, :synced} -> :ok
+      error -> error
+    end
   end
 
   defp write_large_data_references(db, rows) do

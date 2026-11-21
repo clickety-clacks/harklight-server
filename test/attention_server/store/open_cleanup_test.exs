@@ -1,0 +1,91 @@
+defmodule AttentionServer.Store.OpenCleanupTest do
+  use ExUnit.Case, async: true
+
+  alias AttentionServer.{JSON, LargeData, Relay, Store}
+  alias Exqlite.Sqlite3
+
+  @moduletag :tmp_dir
+  @uuid "00000000-0000-4000-8000-000000000010"
+
+  setup %{tmp_dir: directory} do
+    path = Path.join(directory, "state.sqlite3")
+    assert {:ok, relay} = Relay.start_link(store_path: path)
+    assert :ok = Relay.setup_person(relay, "A")
+    assert :ok = Relay.setup_device(relay, "A", "origin")
+    assert :ok = Relay.setup_sender(relay, "origin", "app:test")
+
+    frame = %{
+      "v" => 1,
+      "type" => "forward",
+      "op_id" => @uuid,
+      "message" => %{
+        "sender_id" => "app:test",
+        "message_id" => "item",
+        "created_at" => 1,
+        "title" => "Fixture",
+        "body" => :binary.copy("x", LargeData.inline_limit() + 1)
+      }
+    }
+
+    assert {:ok, response} = Relay.request_line(relay, "origin", JSON.encode_line(frame))
+    assert {:ok, %{"type" => "ok"}} = JSON.decode_line(response)
+    assert :ok = GenServer.stop(relay)
+    %{path: path}
+  end
+
+  for mode <- [:legacy, :keyed, :keyed_cutover] do
+    test "a refused #{mode} open cannot prune a file while a writer holds the lock", %{path: path} do
+      mode = unquote(mode)
+
+      if mode == :keyed do
+        assert {:ok, keyed} = Store.open(path, :keyed_cutover)
+        assert :ok = Store.close(keyed)
+      end
+
+      assert {:ok, db} = Sqlite3.open(path)
+      assert :ok = Sqlite3.execute(db, "BEGIN IMMEDIATE")
+      paths = orphan_files(path)
+
+      try do
+        assert {:error, _} = Store.open(path, mode)
+        assert Enum.map(paths, &File.read/1) == [{:ok, "in flight"}, {:ok, "in flight"}]
+      after
+        Sqlite3.execute(db, "ROLLBACK")
+        Sqlite3.close(db)
+      end
+
+      assert {:ok, store} = Store.open(path, mode)
+      assert :ok = Store.close(store)
+      refute Enum.any?(paths, &File.exists?/1)
+    end
+  end
+
+  test "a refused reference registry refresh leaves ordinary and large orphan files intact", %{
+    path: path
+  } do
+    assert {:ok, db} = Sqlite3.open(path)
+
+    assert :ok =
+             Sqlite3.execute(db, """
+             CREATE TRIGGER fail_refresh BEFORE DELETE ON relay_large_data_refs
+             BEGIN SELECT RAISE(ABORT, 'refresh refused'); END;
+             """)
+
+    paths = orphan_files(path)
+
+    try do
+      assert {:error, _} = Store.open(path)
+      assert Enum.map(paths, &File.read/1) == [{:ok, "in flight"}, {:ok, "in flight"}]
+    after
+      Sqlite3.close(db)
+    end
+  end
+
+  defp orphan_files(path) do
+    Enum.map([@uuid, String.duplicate("f", 64)], fn name ->
+      file = Path.join(path <> ".uploads", name)
+      File.write!(file, "in flight")
+      file
+    end)
+  end
+end
