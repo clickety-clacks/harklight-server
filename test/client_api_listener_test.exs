@@ -535,6 +535,66 @@ defmodule AttentionServer.ClientAPIListenerTest do
       assert {:ok, _, %{status: 401}} = request(conn, "GET", "/v2/inbox")
     end
 
+    test "search keeps literal matching, exact filters, and newest-first paging", ctx do
+      {relay, person, owner, agent, port} = start_granted_agent(ctx, true, "granted-search")
+      assert :ok = Relay.setup_device(relay, person, "fixture-origin")
+      number = %JSON.DecimalToken{raw: "0.12345678901234567890123456789"}
+      needle = number.raw
+
+      forward_granted_fixture(relay, "app:alpha", "first", 1, [%{"text" => needle}])
+      forward_granted_fixture(relay, "app:beta", "numeric", 2, [%{needle => number}])
+      forward_granted_fixture(relay, "app:beta", "last", 3, [%{"text" => needle}])
+
+      assert {:ok, conn} = device_connect(Map.put(ctx, :port, port), "granted-search", :http2)
+      path = "/v2/search?q=" <> needle
+      assert {:ok, conn, %{status: 200} = first} = request(conn, "GET", path <> "&limit=1")
+
+      assert %{
+               "rev" => rev,
+               "items" => [%{"sender" => "app:beta", "message" => %{"message_id" => "last"}}],
+               "next_page" => page
+             } = json(first)
+
+      assert is_integer(rev) and rev > 0
+      assert byte_size(page) <= 4_096
+      forward_granted_fixture(relay, "app:beta", "new", 4, [%{"text" => needle}])
+
+      assert :ok =
+               Relay.owner_replace_agent_grants(relay, person, owner, agent, 1, ["app:beta"], [
+                 "app:beta"
+               ])
+
+      assert {:ok, conn, %{status: 200} = second} =
+               request(conn, "GET", path <> "&limit=4&page=" <> page)
+
+      assert %{"items" => [%{"message" => %{"message_id" => "first"}}]} = json(second)
+      refute Map.has_key?(json(second), "next_page")
+
+      assert {:ok, conn, %{status: 200} = exact} =
+               request(
+                 conn,
+                 "GET",
+                 path <> "&sender=app:alpha&message_id=first&state=open&limit=500"
+               )
+
+      assert %{"items" => [%{"message" => %{"message_id" => "first"}}]} = json(exact)
+
+      assert {:ok, conn, %{status: 404}} =
+               request(conn, "GET", path <> "&sender=app:beta&message_id=numeric")
+
+      assert {:ok, conn, %{status: 400} = invalid} =
+               request(conn, "GET", "/v2/search?q=different&page=" <> page)
+
+      assert %{"error" => "invalid_field", "field" => "page"} = json(invalid)
+
+      oversized_page = "s" <> String.duplicate("a", 4_096)
+
+      assert {:ok, _conn, %{status: 400} = oversized} =
+               request(conn, "GET", path <> "&page=" <> oversized_page)
+
+      assert %{"error" => "invalid_field", "field" => "page"} = json(oversized)
+    end
+
     test "the legacy device listener does not admit an agent certificate with the flag off",
          ctx do
       {_relay, _person, _owner, _agent, port} = start_granted_agent(ctx, false, "granted-off")
@@ -585,7 +645,7 @@ defmodule AttentionServer.ClientAPIListenerTest do
     {relay, person, owner, agent, Server.port(server)}
   end
 
-  defp forward_granted_fixture(relay, sender, id, n) do
+  defp forward_granted_fixture(relay, sender, id, n, nested \\ []) do
     assert :ok = Relay.setup_sender(relay, "fixture-origin", sender)
 
     frame = %{
@@ -596,7 +656,8 @@ defmodule AttentionServer.ClientAPIListenerTest do
         "sender_id" => sender,
         "message_id" => id,
         "created_at" => n,
-        "title" => id
+        "title" => id,
+        "unknown" => %{"nested" => nested}
       }
     }
 

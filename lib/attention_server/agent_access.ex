@@ -219,21 +219,23 @@ defmodule AttentionServer.AgentAccess do
     {Enum.reverse(reversed), has_more}
   end
 
-  defp state_matches?(_, nil), do: true
-  defp state_matches?(%{terminal: nil}, "open"), do: true
-  defp state_matches?(%{terminal: %{state: state}}, state), do: true
-  defp state_matches?(_, _), do: false
+  @doc false
+  def state_matches?(_, nil), do: true
+  def state_matches?(%{terminal: nil}, "open"), do: true
+  def state_matches?(%{terminal: %{state: state}}, state), do: true
+  def state_matches?(_, _), do: false
 
-  defp contains?(_value, nil), do: true
-  defp contains?(value, needle) when is_binary(value), do: String.contains?(value, needle)
-  defp contains?(%LargeData.Ref{} = ref, needle), do: LargeData.contains?(ref, needle)
-  defp contains?(%JSON.DecimalToken{}, _needle), do: false
+  @doc false
+  def contains?(_value, nil), do: true
+  def contains?(value, needle) when is_binary(value), do: String.contains?(value, needle)
+  def contains?(%LargeData.Ref{} = ref, needle), do: LargeData.contains?(ref, needle)
+  def contains?(%JSON.DecimalToken{}, _needle), do: false
 
-  defp contains?(value, needle) when is_map(value),
+  def contains?(value, needle) when is_map(value),
     do: Enum.any?(value, fn {_, v} -> contains?(v, needle) end)
 
-  defp contains?(value, needle) when is_list(value), do: Enum.any?(value, &contains?(&1, needle))
-  defp contains?(_, _), do: false
+  def contains?(value, needle) when is_list(value), do: Enum.any?(value, &contains?(&1, needle))
+  def contains?(_, _), do: false
 
   defp project(record, observed) do
     message = record.message
