@@ -344,9 +344,6 @@ defmodule AttentionServer.ClientAPI.Writes do
     end
   end
 
-  defp result({:ok, _status, %{"error" => token} = body}, replayed?),
-    do: {:error, token, body["field"], replayed?}
-
   defp result({:ok, status, body}, replayed?), do: {:ok, status, body, replayed?}
   defp result({:error, token}, replayed?), do: {:error, to_string(token), nil, replayed?}
 
@@ -501,10 +498,10 @@ defmodule AttentionServer.ClientAPI.Writes do
     {:reply, :ok, next}
   end
 
-  def handle_call({:begin, who, key, digest, operation}, _from, state) do
+  def handle_call({:begin, who, key, digest, operation}, from, state) do
     reply =
       with {:ok, principal} <- principal(state.store.engine, who),
-           {:ok, nil} <- stored(state, principal.person, key, digest),
+           {:ok, nil} <- stored(state, principal.person, key, digest, who, from),
            :ok <- precondition(state, who, principal, operation),
            {:ok, frame} <- frame(state.store.engine, principal, key, operation),
            {:ok, staged} <- staged_files(state, principal, operation) do
@@ -512,7 +509,7 @@ defmodule AttentionServer.ClientAPI.Writes do
           do: :unchanged,
           else: {:apply, principal.engine_key, frame, staged}
       else
-        {:ok, %{status: status, body: body}} -> {:replay, status, body}
+        {:replay, status, body} -> {:replay, status, body}
         error -> error
       end
 
@@ -522,61 +519,86 @@ defmodule AttentionServer.ClientAPI.Writes do
   def handle_call({:finish, who, key, digest, operation, outcome}, from, state) do
     reply =
       with {:ok, principal} <- principal(state.store.engine, who) do
-        result =
-          case outcome do
-            {:ok, reply} -> render(operation, who, principal.person, reply, from, state)
-            error -> error
-          end
+        case outcome do
+          {:ok, reply} ->
+            result = render(operation, who, principal.person, reply, from, state)
+            receipt = receipt(operation, reply, result)
+            remember(state, principal.person, key, digest, result, receipt)
 
-        remember(state, principal.person, key, digest, result)
+          error ->
+            error
+        end
       end
 
     {:reply, reply, state}
   end
 
-  defp stored(_state, _person, nil, _digest), do: {:ok, nil}
+  defp stored(_state, _person, nil, _digest, _who, _from), do: {:ok, nil}
 
-  defp stored(state, person, key, digest) do
+  defp stored(state, person, key, digest, who, from) do
     case Idempotency.lookup(state.store, person, key) do
-      {:ok, nil} -> {:ok, nil}
-      {:ok, %{digest: ^digest} = receipt} -> {:ok, receipt}
-      {:ok, _other} -> {:error, :idempotency_conflict}
-      {:error, :disabled} -> {:error, :not_found}
-      {:error, _} -> {:error, :storage_unavailable}
-    end
-  end
+      {:ok, nil} ->
+        {:ok, nil}
 
-  # The first outcome a key gets is the one every repeat gets. Outcomes the
-  # client may retry (503s) are not stored, so the retry is applied.
-  defp remember(state, person, key, digest, result) do
-    case stored_form(result) do
-      {:store, status, body} when is_binary(key) ->
-        case Idempotency.save(state.store, person, key, digest, status, body) do
-          :ok -> {:ok, status, body}
-          _ -> {:error, :storage_unavailable}
+      {:ok, %{digest: ^digest, status: status, body: receipt}} ->
+        case replay(receipt, who, person, from, state) do
+          {:ok, body} -> {:replay, status, body}
+          error -> error
         end
 
-      {:store, status, body} ->
-        {:ok, status, body}
+      {:ok, _other} ->
+        {:error, :idempotency_conflict}
 
-      :transient ->
-        result
+      {:error, :disabled} ->
+        {:error, :not_found}
+
+      {:error, _} ->
+        {:error, :storage_unavailable}
     end
   end
 
-  defp stored_form({:ok, status, body}), do: {:store, status, body}
+  # Only a committed success is stored under the key, as today's engine keeps
+  # operation receipts only on success: a refused request retried with the
+  # same key is evaluated again. The receipt is compact (what the write
+  # changed); a replay renders those resources from current state.
+  defp remember(state, person, key, digest, {:ok, status, _body} = result, receipt)
+       when is_binary(key) do
+    case Idempotency.save(state.store, person, key, digest, status, receipt) do
+      :ok -> result
+      _ -> {:error, :storage_unavailable}
+    end
+  end
 
-  defp stored_form({:error, token}), do: stored_form({:error, token, nil})
+  defp remember(_state, _person, _key, _digest, result, _receipt), do: result
 
-  defp stored_form({:error, token, field}) do
-    token = to_string(token)
+  defp receipt({:reply, item_id, _text, _files}, %{"seq" => seq}, _result),
+    do: %{"item_id" => item_id, "entry_seq" => seq}
 
-    if Errors.retryable?(token) or token == "unauthorized" do
-      :transient
-    else
-      body = %{"error" => token}
-      body = if field, do: Map.put(body, "field", field), else: body
-      {:store, Errors.status(token), body}
+  defp receipt({kind, item_id}, _reply, _result) when kind in [:seen], do: %{"item_id" => item_id}
+  defp receipt({:read_position, item_id, _}, _reply, _result), do: %{"item_id" => item_id}
+  defp receipt({:answer, item_id, _, _}, _reply, _result), do: %{"item_id" => item_id}
+  defp receipt({:file, _meta, _tmp}, _reply, {:ok, _status, body}), do: %{"file" => body}
+  defp receipt(_settings_write, _reply, _result), do: %{"settings" => true}
+
+  defp replay(%{"file" => body}, _who, _person, _from, _state), do: {:ok, body}
+
+  defp replay(%{"settings" => true}, who, _person, from, state) do
+    case Reads.handle_call({:settings, who}, from, state) do
+      {:reply, {:ok, body}, _state} -> {:ok, body}
+      {:reply, error, _state} -> error
+    end
+  end
+
+  defp replay(%{"item_id" => item_id} = receipt, who, person, from, state) do
+    with {:ok, _status, body} <- render_item(item_id, who, from, state) do
+      case receipt do
+        %{"entry_seq" => seq} ->
+          with {:ok, entry} <- render_entry(state, who, person, seq),
+               do: {:ok, Map.put(body, "entry", entry)}
+
+        _ ->
+          {:ok, body}
+      end
     end
   end
 
@@ -740,11 +762,14 @@ defmodule AttentionServer.ClientAPI.Writes do
 
   # Chat never closes: the reply goes to the item's current revision in any
   # state. The engine stores it for the agent whether or not it is listening.
+  # An item sent without a session has no conversation at all: a reply there
+  # is 400 unsupported (contract rulings round 13); not_found is only for an
+  # item the person cannot see.
   defp frame(engine, principal, key, {:reply, item_id, text, _file_ids}) do
     with {:ok, {_person, sender, message_id} = message_key} <-
-           Resources.item_key(engine, principal.person, item_id) do
-      %{revision: revision} = Map.fetch!(engine.messages, message_key)
-
+           Resources.item_key(engine, principal.person, item_id),
+         record = Map.fetch!(engine.messages, message_key),
+         :ok <- has_conversation(record) do
       {:ok,
        %{
          "v" => 1,
@@ -752,10 +777,14 @@ defmodule AttentionServer.ClientAPI.Writes do
          "op_id" => op_id(key),
          "sender_id" => sender,
          "message_id" => message_id,
-         "request_revision" => revision,
+         "request_revision" => record.revision,
          "text" => text
        }}
     end
+  end
+
+  defp has_conversation(record) do
+    if is_binary(Map.get(record, :session_handle)), do: :ok, else: {:error, :unsupported}
   end
 
   # An answer goes to the engine as today's answer (or answer_no_comment)
@@ -907,12 +936,31 @@ defmodule AttentionServer.ClientAPI.Writes do
     end
   end
 
-  defp newest_origin_reply(_engine, _person, _key, seq, current) when seq <= current, do: nil
-
+  # Walks only this item's conversation, newest first, from the entry down to
+  # the current position (the Route B index keeps each item's seqs in order).
   defp newest_origin_reply(engine, person, key, seq, current) do
-    case Map.get(engine.conversation_events, {person, seq}) do
-      %{key: ^key, payload: %{"kind" => "reply", "author" => "origin"}} -> seq
-      _ -> newest_origin_reply(engine, person, key, seq - 1, current)
+    case Map.get(engine.route_b_index.conversations_by_item, key) do
+      nil ->
+        nil
+
+      tree ->
+        first_origin_reply(:gb_trees.iterator_from({-seq, seq}, tree), engine, person, current)
+    end
+  end
+
+  defp first_origin_reply(iterator, engine, person, current) do
+    case :gb_trees.next(iterator) do
+      {{_, seq}, _, _next} when seq <= current ->
+        nil
+
+      {{_, seq}, _, next} ->
+        case Map.get(engine.conversation_events, {person, seq}) do
+          %{payload: %{"kind" => "reply", "author" => "origin"}} -> seq
+          _ -> first_origin_reply(next, engine, person, current)
+        end
+
+      :none ->
+        nil
     end
   end
 
@@ -1005,7 +1053,9 @@ defmodule AttentionServer.ClientAPI.Writes do
     end
   end
 
-  # At most one of choice, comment and result; none is no comment.
+  # At most one of choice, comment and result, counted by presence; none is no
+  # comment. A result is any JSON value, null included, stored unchanged
+  # (contract rulings round 16).
   defp answer_value(body) do
     case Map.take(body, ["choice", "comment", "result"]) |> Map.to_list() do
       [] ->
@@ -1017,7 +1067,7 @@ defmodule AttentionServer.ClientAPI.Writes do
       [{"comment", text}] when is_binary(text) ->
         {:ok, {:comment, text}}
 
-      [{"result", result}] when is_map(result) and not is_struct(result) ->
+      [{"result", result}] ->
         {:ok, {:result, result}}
 
       [{name, _}] ->

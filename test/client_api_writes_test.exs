@@ -159,12 +159,20 @@ defmodule AttentionServer.ClientAPIWritesTest do
       assert {:ok, 200, first, false} = Writes.seen(relay, "reader", one, k)
       {:ok, after_first} = head(relay)
 
-      # Another change moves the item on; the replay still answers the original.
+      # The receipt is compact: what the write changed, not the rendered body.
+      assert {:ok, %{status: 200, body: %{"item_id" => ^one}}} =
+               AttentionServer.ClientAPI.Idempotency.lookup(:sys.get_state(relay).store, "A", k)
+
+      assert {:ok, 200, ^first, true} = Writes.seen(relay, "reader", one, k)
+
+      # Another change moves the item on; a replay renders it now and applies nothing.
       discuss(relay, "one", 30, "A later note")
       {:ok, moved} = head(relay)
       assert moved > after_first
 
-      assert {:ok, 200, ^first, true} = Writes.seen(relay, "reader", one, k)
+      assert {:ok, 200, %{"rev" => ^moved, "item" => %{"item_id" => ^one, "seen" => true}}, true} =
+               Writes.seen(relay, "reader", one, k)
+
       assert head(relay) == {:ok, moved}
       assert changes_after(relay, moved) == []
       GenServer.stop(relay)
@@ -195,7 +203,9 @@ defmodule AttentionServer.ClientAPIWritesTest do
 
       # A device's key, resent by the same person's browser: the stored response.
       assert {:ok, 200, first, false} = Writes.seen(relay, "reader", one, k)
-      assert {:ok, 200, ^first, true} = Writes.seen(relay, browser, one, k)
+      assert {:ok, 200, replayed, true} = Writes.seen(relay, browser, one, k)
+      # Rendered for the browser that asked, which sees knocks.
+      assert Map.delete(replayed["item"], "as") == Map.delete(first["item"], "as")
       assert {:error, "idempotency_conflict", nil, false} = Writes.seen(relay, browser, two, k)
 
       # The same key is new for another person.
@@ -365,6 +375,28 @@ defmodule AttentionServer.ClientAPIWritesTest do
 
       assert {:error, "invalid_field", "text", false} =
                Writes.reply(relay, "reader", one, "", key())
+
+      # An item sent with no session has no conversation: unsupported, not
+      # not_found (contract rulings round 13), and nothing is stored.
+      assert %{"type" => "ok"} =
+               request(relay, "origin", %{
+                 "type" => "forward",
+                 "op_id" => op(80),
+                 "message" => %{
+                   "sender_id" => "app:test",
+                   "message_id" => "no-chat",
+                   "created_at" => 80,
+                   "title" => "No chat"
+                 }
+               })
+
+      no_chat = item_id(relay, "no-chat")
+
+      assert {:ok, %{"item" => %{"chat" => %{"available" => false}}}} =
+               Reads.item(relay, "reader", no_chat)
+
+      assert {:error, "unsupported", nil, false} =
+               Writes.reply(relay, "reader", no_chat, "Hi", key())
 
       # Today's refusals keep their tokens: the item's own origin is not its reader.
       assert {:error, "forbidden", nil, false} = Writes.reply(relay, "origin", one, "Me", key())
@@ -596,6 +628,40 @@ defmodule AttentionServer.ClientAPIWritesTest do
       GenServer.stop(relay)
     end
 
+    test "a refused request does not consume its key: the same request is evaluated again",
+         %{path: path, flags: flags} do
+      relay = scripted_relay(path, flags)
+      one = item_id(relay, "one")
+      k = key()
+
+      assert {:error, "stale_request", nil, false} =
+               Writes.answer(relay, "reader", one, 2, {:comment, "Yes"}, k)
+
+      assert {:ok, nil} =
+               AttentionServer.ClientAPI.Idempotency.lookup(:sys.get_state(relay).store, "A", k)
+
+      # The request moves to revision 2; the same request under the same key now applies.
+      message = :sys.get_state(relay).store.engine.messages[{"A", "app:test", "one"}].message
+
+      assert %{"type" => "ok"} =
+               request(relay, "origin", %{
+                 "type" => "conversation_revise",
+                 "op_id" => op(45),
+                 "sender_id" => "app:test",
+                 "message_id" => "one",
+                 "base_revision" => 1,
+                 "message" => Map.put(message, "title", "Revised")
+               })
+
+      assert {:ok, 200, %{"item" => %{"terminal" => %{"state" => "answered"}}} = body, false} =
+               Writes.answer(relay, "reader", one, 2, {:comment, "Yes"}, k)
+
+      assert {:ok, 200, ^body, true} =
+               Writes.answer(relay, "reader", one, 2, {:comment, "Yes"}, k)
+
+      GenServer.stop(relay)
+    end
+
     test "a stale request_revision is stale_request, and nothing is applied",
          %{path: path, flags: flags} do
       relay = scripted_relay(path, flags)
@@ -658,6 +724,22 @@ defmodule AttentionServer.ClientAPIWritesTest do
                Writes.answer(relay, "reader", form, 1, {:result, %{"choice" => "blue"}}, key())
 
       assert stored_terminal(relay, "form").answer == %{"choice" => "blue"}
+
+      # Any JSON value is a result, null included, stored unchanged (round 16).
+      for {id, n, result} <- [{"form-null", 42, nil}, {"form-list", 43, ["blue", 2, true]}] do
+        forward_message(
+          relay,
+          n,
+          %{"message_id" => id, "message_type" => "request", "answer_ui" => @form},
+          [%{"name" => "cover.png", "data_base64" => Base.encode64("not image bytes")}]
+        )
+
+        assert {:ok, 200, %{"item" => %{"terminal" => %{"state" => "answered"}}}, false} =
+                 Writes.answer(relay, "reader", item_id(relay, id), 1, {:result, result}, key())
+
+        assert stored_terminal(relay, id).answer == result
+      end
+
       GenServer.stop(relay)
     end
 
@@ -1202,6 +1284,8 @@ defmodule AttentionServer.ClientAPIWritesTest do
           {~s({"request_revision":1,"choice":""}), "choice"},
           {~s({"request_revision":1,"comment":5}), "comment"},
           {~s({"request_revision":1,"result":[]}), "result"},
+          {~s({"request_revision":1,"result":null}), "result"},
+          {~s({"request_revision":1,"choice":"a","result":null}), nil},
           {~s({"request_revision":1,"other":1}), "other"}
         ] do
       assert {400, error, _} = post(relay, route, body, [{"idempotency-key", key()}])
@@ -1213,6 +1297,24 @@ defmodule AttentionServer.ClientAPIWritesTest do
              post(relay, route, ~s({"request_revision":1,"comment":"Yes"}), [
                {"idempotency-key", key()}
              ])
+
+    # On a UI/1 screen a present result is the answer, whatever JSON it is (round 16).
+    for {id, n, body} <- [
+          {"form-null", 50, ~s({"request_revision":1,"result":null})},
+          {"form-list", 51, ~s({"request_revision":1,"result":["blue",2]})}
+        ] do
+      forward_message(
+        relay,
+        n,
+        %{"message_id" => id, "message_type" => "request", "answer_ui" => @form},
+        [%{"name" => "cover.png", "data_base64" => Base.encode64("not image bytes")}]
+      )
+
+      assert {200, %{"item" => %{"terminal" => %{"state" => "answered"}}}, _} =
+               post(relay, ["items", item_id(relay, id), "answer"], body, [
+                 {"idempotency-key", key()}
+               ])
+    end
 
     GenServer.stop(relay)
   end
