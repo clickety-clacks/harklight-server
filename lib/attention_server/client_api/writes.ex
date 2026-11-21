@@ -185,11 +185,17 @@ defmodule AttentionServer.ClientAPI.Writes do
 
   @doc false
   def delete_file(conn, %Context{} = ctx) do
+    respond_to_discard(conn, ctx.params.file_id, fn file_id, key, digest ->
+      call(ctx.relay, {:discard_file, ctx.principal, file_id, key, digest})
+    end)
+  end
+
+  @doc "Serve a discard using a caller that authorizes the principal and runs the write in Relay."
+  def respond_to_discard(conn, file_id, discard) do
     with {:ok, key} <- optional_key(conn) do
-      file_id = ctx.params.file_id
       digest = Idempotency.digest("DELETE", ["files", file_id], %{})
 
-      case call(ctx.relay, {:discard_file, ctx.principal, file_id, key, digest}) do
+      case discard.(file_id, key, digest) do
         {:ok, 204, %{}} -> send_resp(conn, 204, "")
         {:replay, 204, %{}} -> conn |> replayed(true) |> send_resp(204, "")
         error -> respond(conn, result(error, false))
@@ -494,18 +500,10 @@ defmodule AttentionServer.ClientAPI.Writes do
     {:reply, reply, state}
   end
 
-  def handle_call({:discard_file, who, file_id, key, digest}, from, state) do
+  def handle_call({:discard_file, who, file_id, key, digest}, _from, state) do
     reply =
-      with {:ok, principal} <- principal(state.store.engine, who),
-           person = principal.person,
-           {:ok, nil} <- stored(state, person, key, digest, who, from),
-           false <- Relay.staged_upload_attached?(state, person, file_id),
-           :ok <- Uploads.discard(state.store, person, file_id, key, digest) do
-        {:ok, 204, %{}}
-      else
-        true -> {:error, :already_closed}
-        {:error, :disabled} -> {:error, :not_found}
-        other -> other
+      with {:ok, %{person: person}} <- principal(state.store.engine, who) do
+        discard_staged_upload(state, person, file_id, key, digest)
       end
 
     {:reply, reply, state}
@@ -576,6 +574,19 @@ defmodule AttentionServer.ClientAPI.Writes do
       end
 
     {:reply, reply, state}
+  end
+
+  @doc "Discard within Relay after the caller has authorized the principal for this person."
+  def discard_staged_upload(state, person, file_id, key, digest) do
+    with {:ok, nil} <- stored(state, person, key, digest, nil, nil),
+         false <- Relay.staged_upload_attached?(state, person, file_id),
+         :ok <- Uploads.discard(state.store, person, file_id, key, digest) do
+      {:ok, 204, %{}}
+    else
+      true -> {:error, :already_closed}
+      {:error, :disabled} -> {:error, :not_found}
+      other -> other
+    end
   end
 
   defp stored(_state, _person, nil, _digest, _who, _from), do: {:ok, nil}

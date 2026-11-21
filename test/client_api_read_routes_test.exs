@@ -120,6 +120,9 @@ defmodule AttentionServer.ClientAPIReadRoutesTest do
     store = :sys.get_state(relay).store
     assert {:ok, %{path: staged_path}} = Uploads.fetch(store, "A", handle)
     delete = conn(:delete, "/v2/files/" <> handle) |> put_req_header("idempotency-key", op(102))
+    fetched = file_request(relay, der, conn(:get, "/v2/files/" <> handle))
+    assert fetched.status == 404
+    assert body(fetched)["error"] == "not_found"
 
     stranger = TLSFixtures.certificate_der!(certs, "b1")
     assert :ok = Relay.setup_person(relay, "B")
@@ -182,6 +185,7 @@ defmodule AttentionServer.ClientAPIReadRoutesTest do
 
     assert reply.status == 200
     assert [%{"file_id" => download_id}] = body(reply)["entry"]["files"]
+    refute download_id == handle
     GenServer.stop(relay)
 
     assert {:ok, relay} =
