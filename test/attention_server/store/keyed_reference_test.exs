@@ -3,6 +3,11 @@ defmodule AttentionServer.Store.KeyedReferenceTest do
 
   alias AttentionServer.{Engine, LargeData, Store.KeyedReference}
 
+  test "rejects a delta that would give a blob a negative owner count" do
+    assert KeyedReference.update_blob_owners(%{"blob" => 1}, %{"blob" => -2}) ==
+             {:error, :invalid_blob_owners}
+  end
+
   test "prepares reference markers and exact legacy paths from touched records" do
     directory = Path.join(System.tmp_dir!(), "keyed-refs-#{System.unique_integer([:positive])}")
     File.mkdir_p!(directory)
