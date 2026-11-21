@@ -957,6 +957,46 @@ defmodule AttentionServer.ChangeLogTest do
     refute_receive {:client_closing, _, _}, 200
   end
 
+  test "switching to stored-rank reads expires cursors from the old rank projection once", ctx do
+    relay = start(ctx)
+    setup_people(relay)
+    forward(relay, "one", 2)
+    cursor = head(relay)
+
+    assert {:ok, created_at} =
+             paused(relay, fn -> ChangeLog.created_at(store(relay), "A", item("one")) end)
+
+    GenServer.stop(relay)
+
+    # Recreate the change-log state table as it existed before this transition.
+    {:ok, db} = Sqlite3.open(ctx.path)
+
+    :ok =
+      Sqlite3.execute(db, """
+      CREATE TABLE old_log_state (id INTEGER PRIMARY KEY CHECK (id = 1), store_version INTEGER NOT NULL);
+      INSERT INTO old_log_state SELECT id, store_version FROM client_change_log_state;
+      DROP TABLE client_change_log_state;
+      ALTER TABLE old_log_state RENAME TO client_change_log_state;
+      """)
+
+    Sqlite3.close(db)
+
+    relay = start(ctx)
+    assert {:error, :cursor_expired} = log(relay, cursor)
+    position = head(relay)
+    assert position == cursor + 1
+    assert {:ok, %{"rev" => ^position, "items" => [_]}} = Reads.inbox(relay, "reader")
+
+    assert {:ok, ^created_at} =
+             paused(relay, fn -> ChangeLog.created_at(store(relay), "A", item("one")) end)
+
+    GenServer.stop(relay)
+
+    relay = start(ctx)
+    assert {:ok, [], false, ^position} = log(relay, position)
+    GenServer.stop(relay)
+  end
+
   # Per-change cost of storing a person's ranking (owner's gate: the rank hook
   # must cost no more than today's view rebuild; an unchanged re-rank must be
   # nearly free).
