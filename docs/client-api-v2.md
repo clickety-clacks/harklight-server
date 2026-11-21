@@ -1434,6 +1434,20 @@ Writes return 200 unless the table says otherwise. Each response schema requires
 - Durable changes use the same transaction as the corresponding per-agent
   change rows. Focus and held shows use relay memory as in §5.1.
 
+- **Show lifetime and replay.** An unchanged focus refresh preserves the
+  device's activity position. A lapse or sign-out ends its eligibility for
+  new requests. An accepted show remains held for that device through a
+  lapse or a change to the sender's grants. The server keeps at most the
+  latest show per device and recomputes `held_ms` from acceptance at each
+  delivery. A successful retry returns the original result without replacing
+  the pending show or resetting its age. The receipt shares the enrolled
+  agent's idempotency scope with other agent writes, so a different request
+  under its key answers `409 idempotency_conflict`. Revocation or removal
+  of the destination discards its pending show. A restart clears held shows
+  and show receipts. See the legacy
+  [push authorization and target ordering](https://github.com/clickety-clacks/harklight-server/blob/2af46b992e6b86abdf48d2339a615378f1c485b4/lib/attention_server/relay.ex#L7451-L7510)
+  and [show validation and delivery](https://github.com/clickety-clacks/harklight-server/blob/2af46b992e6b86abdf48d2339a615378f1c485b4/lib/attention_server/relay.ex#L7819-L7923).
+
 ### 9.3 Agent change feed
 
 `GET /v2/agent/changes?after=<rev>&session=<session>&limit=<n>`

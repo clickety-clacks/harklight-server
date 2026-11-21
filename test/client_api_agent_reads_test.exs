@@ -421,6 +421,99 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
                contract(ctx, "SentMessageResponse", get(ctx, "a1", path))
     end
 
+    test "large write responses stay out of durable receipts and off the relay", ctx do
+      alias AttentionServer.ClientAPI.Idempotency
+      alias AttentionServer.LargeData
+      alias Exqlite.Sqlite3
+
+      title = String.duplicate("large-title-", div(LargeData.inline_limit(), 12) + 1)
+
+      %{"seq" => seq} =
+        frame(ctx, "a1", %{
+          "type" => "forward",
+          "op_id" => op(1),
+          "session_handle" => @first_session,
+          "message" => %{
+            "sender_id" => "app:test",
+            "message_id" => "large-title",
+            "title" => title,
+            "created_at" => 1
+          }
+        })
+
+      state = :sys.get_state(ctx.relay)
+      record = state.store.engine.messages[{"A", "app:test", "large-title"}]
+      assert %LargeData.Ref{} = record.message["title"]
+      path = "/v2/agent/messages/" <> Resources.item_id(%{accepted_seq: seq}) <> "/lifecycle"
+      body = %{"action" => "expired"}
+      trace = {LargeData, :read!, 1}
+      relay = ctx.relay
+      :erlang.trace_pattern(trace, true, [])
+      :erlang.trace(relay, true, [:call])
+
+      try do
+        first = request(ctx, "a1", "POST", path, body, 2)
+        assert first.status == 200
+
+        assert %{"message" => %{"message" => %{"title" => ^title}}} =
+                 contract(ctx, "AgentMessageResult", first)
+
+        replay = request(ctx, "a1", "POST", path, body, 2)
+        assert replay.status == 200
+        assert replay.body == first.body
+        assert {"idempotent-replayed", "true"} in replay.headers
+
+        delivered = :erlang.trace_delivered(relay)
+        assert_receive {:trace_delivered, ^relay, ^delivered}, 1_000
+        refute_received {:trace, ^relay, :call, {LargeData, :read!, [_]}}
+
+        assert {:ok, stmt} =
+                 Sqlite3.prepare(
+                   state.store.db,
+                   "SELECT length(body) FROM client_idempotency WHERE person_id = ? AND idempotency_key = ?"
+                 )
+
+        try do
+          assert :ok =
+                   Sqlite3.bind(stmt, [Idempotency.agent_scope("A", ctx.keys["a1"]), op(2)])
+
+          assert {:row, [bytes]} = Sqlite3.step(state.store.db, stmt)
+          assert bytes < 1_024
+        after
+          Sqlite3.release(state.store.db, stmt)
+        end
+      after
+        :erlang.trace(relay, false, [:call])
+        :erlang.trace_pattern(trace, false, [])
+      end
+    end
+
+    test "a full success receipt from before compact storage still replays", ctx do
+      alias AttentionServer.ClientAPI.Idempotency
+
+      id = forward(ctx, "a1", 1, nil)
+      path = "/v2/agent/messages/" <> id <> "/lifecycle"
+      body = %{"action" => "expired"}
+      first = request(ctx, "a1", "POST", path, body, 2)
+      assert first.status == 200
+
+      state = :sys.get_state(ctx.relay)
+      scope = Idempotency.agent_scope("A", ctx.keys["a1"])
+
+      digest =
+        Idempotency.digest("POST", ["v2", "agent", "messages", id, "lifecycle"], %{
+          "body" => body,
+          "if_match" => []
+        })
+
+      assert :ok = Idempotency.save(state.store, scope, op(3), digest, 200, decode_response(first))
+
+      replay = request(ctx, "a1", "POST", path, body, 3)
+      assert replay.status == 200
+      assert replay.body == first.body
+      assert {"idempotent-replayed", "true"} in replay.headers
+    end
+
     test "lifecycle stamps the transition and already_closed applies to a repeat", ctx do
       id = forward(ctx, "a1", 1, nil)
       path = "/v2/agent/messages/" <> id <> "/lifecycle"
