@@ -323,8 +323,18 @@ defmodule AttentionServer.Store do
         end
       end)
 
-    Diagnostics.result(:upload_cleanup, :startup_cleanup, result, :unavailable)
-    {:ok, store}
+    case result do
+      {:error, :stale_generation} ->
+        # Another writer committed after this open loaded its state, so the
+        # loaded engine is no longer current. Refuse the open.
+        Diagnostics.failure(:server_storage, :store_open, :stale_generation, :unavailable)
+        _ = close(store)
+        {:error, :storage_unavailable}
+
+      _ ->
+        Diagnostics.result(:upload_cleanup, :startup_cleanup, result, :unavailable)
+        {:ok, store}
+    end
   end
 
   defp check_open_generation(%__MODULE__{mode: :keyed, db: db, version: version}) do
