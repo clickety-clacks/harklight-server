@@ -39,7 +39,7 @@ defmodule AttentionServer.ClientAPI.Auth do
     web origin, as the existing browser routes do.
   """
 
-  alias AttentionServer.{DashboardBrowserHTTP, DeviceIdentity, Relay}
+  alias AttentionServer.{BrowserOrigin, DeviceIdentity, Relay}
   alias AttentionServer.ClientAPI.Principal
 
   @cookie "__Host-harklight"
@@ -110,7 +110,7 @@ defmodule AttentionServer.ClientAPI.Auth do
   @spec browser_origin_ok?(Plug.Conn.t(), String.t() | nil) :: boolean()
   def browser_origin_ok?(%Plug.Conn{method: method} = conn, expected_origin)
       when method in @write_methods,
-      do: DashboardBrowserHTTP.exact_origin?(conn, %{expected_origin: expected_origin})
+      do: BrowserOrigin.exact?(conn, %{expected_origin: expected_origin})
 
   def browser_origin_ok?(_conn, _expected_origin), do: true
 

@@ -26,6 +26,9 @@ defmodule AttentionServer.DashboardReadHTTP do
   @invite_cookie "__Host-harklight-invite"
   @invite_cookie_age 30 * 24 * 60 * 60
   @dashboard_csp "default-src 'none'; script-src 'self'; connect-src 'self'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'"
+  @web_client_csp "default-src 'none'; script-src 'self'; connect-src 'self'; " <>
+                    "style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' blob: data:; " <>
+                    "base-uri 'none'; frame-ancestors 'none'"
   @web_content_types %{
     ".html" => "text/html",
     ".js" => "text/javascript",
@@ -142,9 +145,6 @@ defmodule AttentionServer.DashboardReadHTTP do
       conn.method == "POST" and conn.request_path == "/join/resolve" ->
         resolve_join(conn, opts)
 
-      conn.method == "GET" and conn.request_path == "/browser/relay" ->
-        AttentionServer.DashboardBrowserHTTP.upgrade(conn, opts)
-
       conn.method == "GET" and conn.request_path == "/agent-skills/SKILL.md" ->
         serve_skill_file(conn, opts.skill_path)
 
@@ -246,26 +246,11 @@ defmodule AttentionServer.DashboardReadHTTP do
     ~s(<p>To get a new one-use sign-in link, ask the server owner to run <code>bin/harklight owner browser-sign-in</code>.</p>)
   end
 
-  defp content_security_policy(conn, %{hosted: false} = opts) do
-    if web_client_response?(conn.request_path) do
-      origin = expected_origin(conn, opts) |> URI.parse()
-
-      websocket_origin =
-        URI.to_string(%{
-          origin
-          | scheme: "wss",
-            userinfo: nil,
-            path: nil,
-            query: nil,
-            fragment: nil
-        })
-
-      "default-src 'none'; script-src 'self'; connect-src 'self' #{websocket_origin}; " <>
-        "style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' blob: data:; " <>
-        "base-uri 'none'; frame-ancestors 'none'"
-    else
-      @dashboard_csp
-    end
+  # The web client uses same-origin fetch and server-sent events only.
+  defp content_security_policy(conn, %{hosted: false}) do
+    if web_client_response?(conn.request_path),
+      do: @web_client_csp,
+      else: @dashboard_csp
   end
 
   defp content_security_policy(_conn, _opts), do: @dashboard_csp
@@ -329,27 +314,6 @@ defmodule AttentionServer.DashboardReadHTTP do
          _principal
        ),
        do: send_resp(conn, 503, "Profile unavailable")
-
-  defp route(
-         %{method: "POST", request_path: "/browser/v1"} = conn,
-         opts,
-         _principal
-       ),
-       do: AttentionServer.DashboardBrowserHTTP.command(conn, opts)
-
-  defp route(
-         %{method: "POST", request_path: "/browser/v1/upload"} = conn,
-         opts,
-         _principal
-       ),
-       do: AttentionServer.DashboardBrowserHTTP.upload(conn, opts)
-
-  defp route(
-         %{method: "GET", path_info: ["browser", "v1", "files", upload_id]} = conn,
-         opts,
-         _principal
-       ),
-       do: AttentionServer.DashboardBrowserHTTP.fetch_file(conn, opts, upload_id)
 
   defp route(
          %{method: "GET", request_path: "/app/config.json"} = conn,
@@ -963,15 +927,7 @@ defmodule AttentionServer.DashboardReadHTTP do
     end
   end
 
-  # The origin browser requests must come from: the configured public address
-  # when the server sits behind a front end, otherwise this listener's own.
-  defp expected_origin(_conn, %{expected_origin: origin}) when is_binary(origin), do: origin
-
-  defp expected_origin(conn, _opts) do
-    if conn.port == 443,
-      do: "https://" <> conn.host,
-      else: "https://" <> conn.host <> ":" <> Integer.to_string(conn.port)
-  end
+  defp expected_origin(conn, opts), do: AttentionServer.BrowserOrigin.expected(conn, opts)
 
   defp new_request_id do
     <<a::binary-size(6), b::8, c::8, d::8, e::binary-size(7)>> = :crypto.strong_rand_bytes(16)
