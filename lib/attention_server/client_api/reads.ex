@@ -519,6 +519,11 @@ defmodule AttentionServer.ClientAPI.Reads do
       {:ok, rank} ->
         {:ok, rank}
 
+      # A store that fails is a storage failure, never a reason to compute
+      # every rank inside the relay.
+      {:error, reason} when reason not in [:not_found, :disabled] ->
+        {:error, :storage_unavailable}
+
       _ ->
         case engine
              |> Resources.ranks(person, view, stored_unit_keys(store, person))
