@@ -62,6 +62,38 @@ defmodule AttentionServer.Store.RecordCodec do
     Stream.concat([fields, advisories, origins])
   end
 
+  def operations(engine, touched) do
+    Enum.map(touched, fn address ->
+      case record(engine, address) do
+        {:ok, value} -> {:put, encode_row(address, value)}
+        :error -> {:delete, encode_key(address)}
+      end
+    end)
+  end
+
+  defp record(engine, {:field, field}), do: Map.fetch(engine, field)
+  defp record(engine, {:row, field, key}), do: Map.fetch(Map.fetch!(engine, field), key)
+
+  defp record(engine, {:member, field, key}) do
+    if MapSet.member?(Map.fetch!(engine, field), key), do: {:ok, true}, else: :error
+  end
+
+  defp record(engine, {:origin_feed, scope, fact}),
+    do: feed_record(Map.get(engine.origin_feeds, scope, %{}), fact)
+
+  defp record(engine, {:advisory, scope, fact}),
+    do: feed_record(Map.get(engine.advisory_feeds, scope, %{}), fact)
+
+  defp feed_record(feed, :high), do: Map.fetch(feed, :high)
+  defp feed_record(feed, {:entry, seq}), do: Map.fetch(Map.get(feed, :entries, %{}), seq)
+
+  defp feed_record(feed, {:delivery_ack, seq}),
+    do: Map.fetch(Map.get(feed, :delivery_acks, %{}), seq)
+
+  defp feed_record(feed, {:receipt, id}) do
+    if MapSet.member?(Map.get(feed, :receipts, MapSet.new()), id), do: {:ok, true}, else: :error
+  end
+
   def encode_key(address), do: :erlang.term_to_binary({@record_version, address}, @term_options)
 
   def encode_row(address, value) do

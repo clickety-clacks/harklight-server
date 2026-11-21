@@ -2,6 +2,8 @@ defmodule AttentionServer.Store.EngineTransitionTest do
   use ExUnit.Case, async: true
 
   alias AttentionServer.{AgentChangeLog, ChangeLog, Engine, JSON, Store}
+  alias AttentionServer.Store.KeyedMigration
+  alias Exqlite.Sqlite3
 
   @person "a"
   @origin String.duplicate("a", 64)
@@ -97,7 +99,83 @@ defmodule AttentionServer.Store.EngineTransitionTest do
     end)
   end
 
+  test "keyed Store commits replay through both real feeds and roll back together" do
+    path = legacy_store_path()
+    {:ok, legacy} = Store.open(path)
+    assert {:ok, _} = KeyedMigration.convert(legacy)
+    :ok = Store.close(legacy)
+    {:ok, store} = Store.open(path, :keyed)
+    {:ok, store} = Store.enable_change_log(store)
+
+    audit = %{person: @person, actor: @origin, action: "forward"}
+    {:ok, frame} = JSON.decode_line(forward_line())
+    frame = Map.put(frame, "session_handle", "00000000-0000-4000-8000-000000000010")
+    line = JSON.encode!(frame) <> "\n"
+    {expected, reply} = Engine.request_line(store.engine, @origin, line, 100)
+
+    {^expected, ^reply, touched} =
+      Engine.request_line_with_touches(store.engine, @origin, line, 100)
+
+    assert :ok =
+             Sqlite3.execute(store.db, """
+             CREATE TRIGGER keyed_agent_fault BEFORE INSERT ON agent_changes
+             BEGIN SELECT RAISE(ABORT, 'failed'); END
+             """)
+
+    assert {:error, :storage_unavailable, ^store} =
+             Store.commit(store, {expected, touched}, audit)
+
+    assert {:ok, 0} = ChangeLog.head(store, @person)
+    assert {:ok, 0} = AgentChangeLog.head(store, {@person, @origin})
+    assert :ok = Sqlite3.execute(store.db, "DROP TRIGGER keyed_agent_fault")
+
+    assert {:ok, committed} = Store.commit(store, {expected, touched}, audit)
+    assert committed.engine == expected
+    assert committed.version == store.version + 1
+    assert {:ok, person_head} = ChangeLog.head(committed, @person)
+    assert person_head > 0
+    assert {:ok, 1} = AgentChangeLog.head(committed, {@person, @origin})
+
+    common = %{"v" => 1, "sender_id" => "app:test/worker", "message_id" => "msg"}
+
+    operations = [
+      %{"type" => "message_open", "request_revision" => 1},
+      %{"type" => "discussion", "request_revision" => 1, "text" => "question"},
+      %{"type" => "answer", "answer" => nil}
+    ]
+
+    committed =
+      Enum.reduce(Enum.with_index(operations, 2), committed, fn {frame, n}, current ->
+        attrs = Map.put(frame, "op_id", "00000000-0000-4000-8000-00000000000#{n}")
+        line = JSON.encode!(Map.merge(common, attrs)) <> "\n"
+        {legacy, reply} = Engine.request_line(current.engine, @reader, line, n * 100)
+        assert {:ok, response} = reply
+        assert {:ok, %{"type" => "ok"}} = JSON.decode_line(response)
+
+        {^legacy, ^reply, keys} =
+          Engine.request_line_with_touches(current.engine, @reader, line, n * 100)
+
+        audit = %{audit | actor: @reader, action: frame["type"]}
+        assert {:ok, next} = Store.commit(current, {legacy, keys}, audit)
+        assert next.engine == legacy
+        assert next.version == current.version + 1
+        next
+      end)
+
+    :ok = Store.close(committed)
+    assert {:ok, reopened} = Store.open(path, :keyed)
+    assert full_diff(committed.engine, reopened.engine) == MapSet.new()
+    assert reopened.version == committed.version
+    :ok = Store.close(reopened)
+  end
+
   defp normalized_legacy_engine do
+    {:ok, reopened} = Store.open(legacy_store_path())
+    :ok = Store.close(reopened)
+    reopened.engine
+  end
+
+  defp legacy_store_path do
     directory =
       Path.join(System.tmp_dir!(), "transition-oracle-#{System.unique_integer([:positive])}")
 
@@ -109,9 +187,7 @@ defmodule AttentionServer.Store.EngineTransitionTest do
     audit = %{person: @person, actor: "fixture", action: "setup"}
     {:ok, committed} = Store.commit(store, engine, audit)
     :ok = Store.close(committed)
-    {:ok, reopened} = Store.open(path)
-    :ok = Store.close(reopened)
-    reopened.engine
+    path
   end
 
   defp setup_engine(engine) do

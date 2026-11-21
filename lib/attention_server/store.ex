@@ -22,7 +22,15 @@ defmodule AttentionServer.Store do
   }
 
   alias Exqlite.Sqlite3
-  alias AttentionServer.Store.{KeyedMigration, Persistence, SnapshotEncoding}
+
+  alias AttentionServer.Store.{
+    KeyedMigration,
+    KeyedValidation,
+    Persistence,
+    RecordCodec,
+    RecordTable,
+    SnapshotEncoding
+  }
 
   @format_version 29
   @inbox_index_chunk_size 20
@@ -1067,6 +1075,12 @@ defmodule AttentionServer.Store do
   defp set_durability(db),
     do: Sqlite3.execute(db, "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")
 
+  def commit(%__MODULE__{mode: :keyed} = store, {%Engine{} = next, %MapSet{} = touched}, audit) do
+    if MapSet.size(touched) == 0,
+      do: {:ok, store},
+      else: commit_keyed(store, next, touched, audit)
+  end
+
   def commit(%__MODULE__{mode: :keyed} = store, _next, _audit),
     do: {:error, :storage_unavailable, store}
 
@@ -1079,6 +1093,59 @@ defmodule AttentionServer.Store do
       other ->
         other
     end
+  end
+
+  defp commit_keyed(store, next, touched, audit) do
+    result =
+      with :ok <- KeyedValidation.sequences(store.engine, next, touched) do
+        records = RecordCodec.operations(next, touched)
+        log = prepare_change_logs(store, next, touched)
+        %{db: db, version: version} = store
+
+        case Persistence.run(fn ->
+               RecordTable.commit(db, version, records, fn db, generation ->
+                 with :ok <- write_audit(db, audit),
+                      {:ok, heads, agent_heads} <- append_change_logs(db, log, generation) do
+                   {:ok, {heads, agent_heads}}
+                 end
+               end)
+             end) do
+          {:ok, {heads, agent_heads}} ->
+            AttentionServer.ChangeLog.notify(heads)
+            AttentionServer.ChangeLog.notify(agent_heads)
+            if log, do: AttentionServer.ChangeLog.notify_closing(log.closings)
+
+            {:ok,
+             %{
+               store
+               | engine: next,
+                 version: store.version + 1,
+                 change_log_touched:
+                   MapSet.union(store.change_log_touched, MapSet.new(Map.keys(heads)))
+             }}
+
+          error ->
+            error
+        end
+      end
+
+    case result do
+      {:ok, committed} ->
+        Persistence.committed(committed)
+        {:ok, committed}
+
+      _ ->
+        {:error, :storage_unavailable, store}
+    end
+  end
+
+  defp write_audit(db, audit) do
+    run(db, "INSERT INTO relay_audit (person_id, actor_id, action, at_ms) VALUES (?, ?, ?, ?)", [
+      audit.person,
+      audit.actor,
+      audit.action,
+      System.system_time(:millisecond)
+    ])
   end
 
   defp do_commit(%__MODULE__{engine: old} = store, next, _audit) when old == next,
@@ -1124,24 +1191,7 @@ defmodule AttentionServer.Store do
 
     # The change log's rows are found here, against the engine this process
     # already holds, and written in the snapshot's transaction.
-    log =
-      if store.change_log do
-        changed = AttentionServer.ChangeLog.changed_resources(store.engine, next)
-        pending = AttentionServer.ChangeLog.changes(store.engine, next, changed)
-
-        seeded =
-          Map.new(pending, fn {person, _} ->
-            {person, AttentionServer.ChangeLog.seeded?(store.engine, person)}
-          end)
-
-        %{
-          pending: pending,
-          seeded: seeded,
-          closings: AttentionServer.ChangeLog.closings(store.engine, next),
-          created: AttentionServer.ChangeLog.new_resources(store.engine, next, changed),
-          agent_pending: AttentionServer.AgentChangeLog.changes(store.engine, next, changed)
-        }
-      end
+    log = prepare_change_logs(store, next, nil)
 
     result =
       with {:ok, durable_next, persisted, index} <- prepare_large_data(store, next) do
@@ -1272,6 +1322,32 @@ defmodule AttentionServer.Store do
 
       {:ok, cache, heads, agent_heads}
     end
+  end
+
+  defp prepare_change_logs(%__MODULE__{change_log: false}, _next, _touched), do: nil
+
+  defp prepare_change_logs(store, next, touched) do
+    changed =
+      if touched do
+        AttentionServer.ChangeLog.changed_resources(store.engine, next, touched)
+      else
+        AttentionServer.ChangeLog.changed_resources(store.engine, next)
+      end
+
+    pending = AttentionServer.ChangeLog.changes(store.engine, next, changed)
+
+    seeded =
+      Map.new(pending, fn {person, _} ->
+        {person, AttentionServer.ChangeLog.seeded?(store.engine, person)}
+      end)
+
+    %{
+      pending: pending,
+      seeded: seeded,
+      closings: AttentionServer.ChangeLog.closings(store.engine, next),
+      created: AttentionServer.ChangeLog.new_resources(store.engine, next, changed),
+      agent_pending: AttentionServer.AgentChangeLog.changes(store.engine, next, changed)
+    }
   end
 
   defp append_change_logs(_db, nil, _version), do: {:ok, %{}, %{}}
