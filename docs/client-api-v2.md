@@ -250,6 +250,7 @@ Schemas use JSON Schema 2020-12. `$ref`s point into the `$defs` below.
           "properties": {
             "state": { "enum": ["unconfigured", "ready", "queued", "sending", "waiting_retry", "endpoint_invalid", "blocked_configuration", "canceled", "expired"] },
             "revision": { "type": "integer", "minimum": 0 },
+            "binding_id": { "$ref": "#/$defs/OpaqueId", "description": "Current push binding ID, as carried in a push. Omitted after removal or endpoint invalidation." },
             "environment": { "enum": ["production", "sandbox"] },
             "last_attempt_at_ms": { "$ref": "#/$defs/TimeMs" },
             "next_attempt_at_ms": { "$ref": "#/$defs/TimeMs" }
@@ -266,8 +267,23 @@ Schemas use JSON Schema 2020-12. `$ref`s point into the `$defs` below.
 
     "Me": {
       "type": "object",
-      "required": ["account", "features", "limits"],
+      "required": ["server", "principal", "account", "features", "limits"],
       "properties": {
+        "server": {
+          "type": "object",
+          "required": ["id"],
+          "properties": {
+            "id": { "$ref": "#/$defs/OpaqueId", "description": "The server value carried in a push." }
+          }
+        },
+        "principal": {
+          "type": "object",
+          "required": ["person_id"],
+          "properties": {
+            "person_id": { "$ref": "#/$defs/OpaqueId", "description": "The enrolled person's ID carried in a push." },
+            "device_id": { "$ref": "#/$defs/OpaqueId", "description": "The enrolled device's ID carried in a push. Present only for device principals." }
+          }
+        },
         "sender_names": { "type": "array", "items": { "type": "string" }, "description": "On an enrolled key, its authorized sender names and slash-terminated prefixes" },
         "account": {
           "type": "object",
@@ -584,6 +600,11 @@ Every write that succeeds answers `200`, or `201` for `POST /v2/files`, with a
     production pattern, and nothing defends against it.
 - **`DELETE /v2/devices/me/push`** answers `200` with `WriteResult` carrying
   `settings`.
+- A keyed push PUT or DELETE replays its original response for that device,
+  even if the binding has changed since the original request. Read
+  `GET /v2/settings` for the current binding. A key from a legacy compact
+  push receipt returns `409 idempotency_conflict` because the receipt has
+  no original response. The current binding is unchanged.
 - **`/v2/devices/me/*`** paths answer `403` to a browser principal.
 
 ## 5.1 Focus and held shows
@@ -787,9 +808,11 @@ visible text. Its `attention` member changes:
 - `item_id` and `rev` name the change that caused the push.
 - `sender_id`, `message_id` and `acceptance_seq` are dropped.
 - `target` is present only for a chat push, as today.
-- The app routes by `server` and `item_id`. If its cursor is already at or
-  past `rev`, there is nothing to fetch; otherwise it fetches a JSON batch
-  from its cursor.
+- The app matches the push `server`, `person_id`, and `device_id` to
+  `/v2/me` and the push `binding_id` to `Settings.push.binding_id`.
+  A mismatch is ignored and recorded in the Error Log. After all four IDs
+  match, the app does nothing if its durable cursor is at or past `rev`.
+  Otherwise it fetches a JSON batch from its cursor.
 
 ## 7. Errors
 
@@ -858,7 +881,7 @@ content, tokens or identities.
     `Chat.available` and the absence of `as`;
   - the `cleared` mapping of retractions for old clients (`retracted` is now a
     terminal state of its own);
-  - `unsupported_reason` text, push `binding_id`, `profile_id` and
+  - `unsupported_reason` text, push `profile_id` and
     `attempt_count`, and `op_id`s;
   - entry kinds that only agents act on (`file_use`, `file_transfer`, `acted`,
     `seen`, `delivery_ack` as separate entries; their effect shows up as
@@ -1411,8 +1434,18 @@ Writes return 200 unless the table says otherwise. Each response schema requires
   to straight apostrophes (`Relay.normalized_device_name`). With neither
   selector, the server chooses the most
   recently active listed device when the request is made. An unknown item
-  or missing target device answers `404 not_found`. It holds or sends the
-  view as in §5.1 and returns the resolved device name and delivery state.
+  or missing target device answers `404 not_found`. The response returns
+  the resolved device name and delivery state. The state is `sent` when
+  the resolved target device is opted in and listed, its feed writer hands
+  the ephemeral `show` frame to the device's open HTTP/2 SSE stream, and
+  `Plug.Conn.chunk` returns success. The handler waits for the writer's
+  result up to the shared request timeout. Otherwise the state is `held`,
+  including when the write fails or is skipped, the show has already been
+  consumed, or the wait times out. A single transport send failure can
+  still yield `sent` if the connection stays open and Bandit returns chunk
+  success. For either state, the device's next focus-write response carries
+  the show only while it is still pending (§5.1). Both delivery paths use
+  the same `show_id`, which the client applies once.
 - **Files.** An agent uses the §4 device download response for
   `GET /v2/files/{file_id}`, including its stored type and quoted sha256
   ETag. `FileCreated.file_id` is the upload handle, accepted by a write's
