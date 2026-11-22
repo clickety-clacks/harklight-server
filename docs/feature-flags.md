@@ -8,7 +8,7 @@ machine names and user identifiers out of this register.
 
 | Flag | Purpose | Owner | Work item | Default | Remove when |
 | --- | --- | --- | --- | --- | --- |
-| `config :attention_server, :keyed_validation` | Choose the keyed commit validator: `:full` whole-state check, `:incremental` per-address check, or `:both` (run both, raise on disagreement). Keyed commits always derive change-log rows from their touched addresses; `:both` also computes the whole-map log and raises naming any differing part | Harklight Server maintainers | W3 incremental keyed validation (W3a, stacked on #336; change logs W3d) | `:full`; `:both` in the test environment | Per-address validation is the production default (W3e) in a published release and accepted; then remove the whole-state keyed path |
+| `config :attention_server, :keyed_validation` | Choose the keyed commit validator: `:full` whole-state check, `:incremental` per-address check, or `:both` (run both, raise on disagreement). Keyed commits always derive change-log rows from their touched addresses; `:both` also computes the whole-map log and raises naming any differing part | Harklight Server maintainers | W3 incremental keyed validation (W3a, stacked on #336; change logs W3d) | `:incremental`; `:both` in the test environment | Per-address validation is the production default (W3e) in a published release and accepted; then remove the whole-state keyed path |
 
 The whole-server `ATTENTION_SERVER_ENABLE` startup switch and permanent operator
 configuration are not temporary feature flags. This register does not declare

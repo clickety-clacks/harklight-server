@@ -901,10 +901,8 @@ defmodule AttentionServer.Store do
     end
   end
 
-  # The whole-state validator still guards keyed commits in production;
-  # per-address validation replaces it once it is proven equivalent (see
-  # keyed_validation/3). The whole-state check runs in :full mode because a
-  # keyed open validates fully, so every committed state must also reopen.
+  # Keyed commits validate per address by default. Exceptional transitions
+  # still use the whole-state validator, which also checks the state at open.
   defp commit_keyed(
          %__MODULE__{db: db, version: version} = store,
          next,
@@ -981,9 +979,9 @@ defmodule AttentionServer.Store do
   end
 
   # `config :attention_server, :keyed_validation` selects the keyed commit
-  # validator: :full (default, production) runs the whole-state check,
-  # :incremental only the per-address verdict, and :both runs both and raises
-  # when they disagree, so tests fail loudly. See docs/feature-flags.md.
+  # validator: :incremental (production) uses the per-address verdict,
+  # :full runs the whole-state check, and :both runs both and raises when
+  # they disagree. See docs/feature-flags.md.
   defp keyed_validation(store, next, touched) do
     case Application.get_env(:attention_server, :keyed_validation, :full) do
       :incremental ->
