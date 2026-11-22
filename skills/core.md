@@ -57,9 +57,7 @@ The private identity directory contains `server.json`, `enrollment.json`,
 and authenticates with the device certificate. The device port, which serves
 client API v2, is distinct from the enrollment, owner and dashboard ports;
 registered agents use the same device port. A new enrollment saves it in
-`server.json` as `device_port`. For an existing identity whose saved port
-points to enrollment, supply it through the explicit option/environment
-variable.
+`server.json` as `device_port`.
 
 Preserve the private journal and staged files across restarts. Its default is
 `~/Library/Application Support/Harklight/Agent` on macOS,
@@ -240,13 +238,11 @@ retrieved answer; it does not retrieve one or subscribe to future replies.
 
 ## Read an origin message by ID
 
-Agent 0.2.0 can read one sent message by its item ID, or a message accepted
-before the cutover by its exact sender and message IDs:
+Agent 0.2.0 can read one sent message by its item ID:
 
 ```sh
 harklight-agent message-get --item-id "$HARKLIGHT_ITEM"
 harklight-agent message-get --item-id "$HARKLIGHT_ITEM" --revision N
-harklight-agent message-get --sender-id S --message-id M
 ```
 
 Omit `--revision` to read the latest version, returned as `{rev,message}`; use
@@ -273,7 +269,8 @@ harklight-agent receipt --item-id "$HARKLIGHT_ITEM" --entry-id "$HARKLIGHT_ENTRY
 harklight-agent receipt --item-id "$HARKLIGHT_ITEM"
 ```
 
-Omit `--entry-id` for the answer. Use `--not-handed REASON` when the handoff
+Omit `--entry-id` for the answer. Receipt and result follow a person's answer,
+including No comment. Use `--not-handed REASON` when the handoff
 failed. Feed fetch, server Delivered, journal persistence and stdout are not
 this receipt. A receipt means handed, not acted. If already delivered and acted,
 do not repeat the effect. For a person chat turn, reply to its exact item and
