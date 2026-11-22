@@ -22,8 +22,9 @@ defmodule AttentionServer.Store.KeyedWriterCoverageTest do
   # :keyed_refused - changes engine state but has no keyed form; must refuse
   #                  on a keyed store and leave every table and file unchanged.
   # :side_table    - writes only mode-neutral tables that a keyed reopen reads
-  #                  back unchanged (inbox snapshot paging, change log setup,
-  #                  which conversion advances to the keyed generation).
+  #                  back unchanged (startup cleanup of the 0.1 inbox snapshot
+  #                  paging rows, change log setup, which conversion advances
+  #                  to the keyed generation).
   # :files         - stages or prunes upload files against engine metadata.
   # :read / :lifecycle - no durable write of engine state.
   @classification %{
@@ -35,30 +36,14 @@ defmodule AttentionServer.Store.KeyedWriterCoverageTest do
     {:commit, 4} => :keyed_writer,
     {:put_published_upload, 2} => :keyed_writer,
     {:delete_uploads, 3} => :keyed_writer,
-    {:accept_inbox_checkpoint, 8} => :keyed_refused,
     {:stage_upload, 3} => :files,
     {:publish_staged_upload, 3} => :files,
     {:prune_untracked_uploads, 1} => :files,
     {:get_upload, 2} => :read,
     {:verify_upload, 2} => :read,
     {:verify_retained_uploads, 1} => :read,
-    {:inbox_startup, 4} => :read,
-    {:inbox_snapshot, 4} => :read,
-    {:inbox_items, 3} => :read,
-    {:inbox_receipt_sequences, 4} => :read,
-    {:inbox_operation_at_snapshot?, 3} => :read,
-    {:inbox_batch, 5} => :read,
-    {:inbox_receipt_page, 5} => :read,
-    {:inbox_checkpoint_status, 4} => :read,
-    {:begin_inbox_snapshot, 2} => :side_table,
-    {:save_inbox_snapshot_chunk, 5} => :side_table,
-    {:finish_inbox_snapshot, 3} => :side_table,
     {:discard_building_inbox_snapshots, 1} => :side_table,
-    {:discard_browser_inbox_snapshots, 1} => :side_table,
-    {:discard_inbox_snapshots_for_device, 3} => :side_table,
-    {:discard_inbox_snapshot, 2} => :side_table,
-    {:save_inbox_batch, 7} => :side_table,
-    {:save_inbox_receipt_page, 7} => :side_table
+    {:discard_browser_inbox_snapshots, 1} => :side_table
   }
 
   setup %{tmp_dir: directory} do
@@ -109,7 +94,6 @@ defmodule AttentionServer.Store.KeyedWriterCoverageTest do
 
     for {{name, arity} = fun, probe} <- probes do
       assert {:ok, store} = Store.open(path, :keyed)
-      store = pending_snapshot(store)
       before = fingerprint(store)
 
       result = probe.(store)
@@ -272,45 +256,7 @@ defmodule AttentionServer.Store.KeyedWriterCoverageTest do
     assert :ok = Store.close(reopened)
   end
 
-  test "a refused keyed checkpoint stays pending and retryable after reopen", %{path: path} do
-    assert {:ok, store} = Store.open(path, :keyed)
-    store = pending_snapshot(store)
-
-    assert {:error, :storage_unavailable, ^store} = accept(store)
-    assert {:ok, %{status: "pending"}} = status(store)
-    assert {:ok, [[0]]} = query(store.db, "SELECT count(*) FROM relay_device_progress")
-    assert :ok = Store.close(store)
-
-    assert {:ok, reopened} = Store.open(path, :keyed)
-    assert Map.get(reopened.engine.cursors, {"A", "origin"}, 0) == 0
-    assert {:ok, %{status: "pending"}} = status(reopened)
-    assert {:error, :storage_unavailable, ^reopened} = accept(reopened)
-    assert :ok = Store.close(reopened)
-  end
-
-  test "inbox paging side tables written on a keyed store survive a keyed reopen", %{path: path} do
-    assert {:ok, store} = Store.open(path, :keyed)
-    store = pending_snapshot(store)
-
-    digest = :crypto.hash(:sha256, "b1")
-
-    assert {:ok, %{ok: true}} =
-             Store.save_inbox_batch(store, "A", "origin", "snapshot", "b1", digest, %{ok: true})
-
-    assert :ok = Store.close(store)
-
-    assert {:ok, reopened} = Store.open(path, :keyed)
-    assert {:ok, %{status: "pending"}} = status(reopened)
-
-    assert {:ok, %{digest: ^digest, result: %{ok: true}}} =
-             Store.inbox_batch(reopened, "A", "origin", "snapshot", "b1")
-
-    assert :ok = Store.close(reopened)
-  end
-
-  defp refusal_probes do
-    %{{:accept_inbox_checkpoint, 8} => &accept/1}
-  end
+  defp refusal_probes, do: %{}
 
   defp writer_probes(id) do
     %{
@@ -366,50 +312,6 @@ defmodule AttentionServer.Store.KeyedWriterCoverageTest do
 
     {next, addresses}
   end
-
-  defp pending_snapshot(store) do
-    case Store.inbox_snapshot(store, "A", "origin", "snapshot") do
-      {:ok, nil} ->
-        attrs = %{
-          person_id: "A",
-          device_id: "origin",
-          startup_id: "startup",
-          snapshot_id: "snapshot",
-          since: 0,
-          high_water: 0,
-          cursor_secret: :binary.copy(<<7>>, 32)
-        }
-
-        assert {:ok, snapshot} = Store.begin_inbox_snapshot(store, attrs)
-
-        assert :ok =
-                 Store.finish_inbox_snapshot(store, snapshot, %{
-                   items: 0,
-                   receipts: 0,
-                   operation_ids: 0
-                 })
-
-      {:ok, _snapshot} ->
-        :ok
-    end
-
-    store
-  end
-
-  defp accept(store) do
-    Store.accept_inbox_checkpoint(
-      store,
-      store.engine,
-      "A",
-      "origin",
-      "snapshot",
-      0,
-      [],
-      @audit
-    )
-  end
-
-  defp status(store), do: Store.inbox_checkpoint_status(store, "A", "origin", "snapshot")
 
   defp fingerprint(store) do
     {:ok, tables} =
