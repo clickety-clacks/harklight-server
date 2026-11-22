@@ -197,7 +197,7 @@ defmodule AttentionServer.ChatPushTest do
   test "background-only streams are separate and person facts never alert" do
     {engine, _} = register(setup_engine(), 1)
     {engine, _} = forward(engine, "one")
-    {:ok, engine} = Engine.open_conversation(engine, @reader)
+    engine = Engine.put_member(engine, :conversation_opened, {@person, @reader})
     {engine, _} = discussion(engine, "one")
 
     {engine, _} =

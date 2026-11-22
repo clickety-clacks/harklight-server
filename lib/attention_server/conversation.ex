@@ -4,7 +4,7 @@ defmodule AttentionServer.Conversation do
   delivery and action facts live separately so replay never changes a turn.
   """
 
-  alias AttentionServer.{ConversationFiles, Message}
+  alias AttentionServer.{ConversationFiles, Engine, Message}
 
   def valid_session?(handle, vendor_id) do
     Message.uuid_v4?(handle) and
@@ -87,7 +87,7 @@ defmodule AttentionServer.Conversation do
       |> ConversationFiles.put_entry(Map.get(record, :files_by_revision, %{}) |> Map.get(1, []))
 
     engine
-    |> Map.update!(:origin_sessions, &Map.put(&1, session_key, session))
+    |> Engine.put_row(:origin_sessions, session_key, session)
     |> append_entry(person, origin, entry)
   end
 
@@ -166,7 +166,7 @@ defmodule AttentionServer.Conversation do
       if next == receipt do
         {:ok, engine, Map.put(reply, "duplicate", true)}
       else
-        {:ok, %{engine | origin_receipts: Map.put(engine.origin_receipts, key, next)}, reply}
+        {:ok, Engine.put_row(engine, :origin_receipts, key, next), reply}
       end
     else
       {:error, _} = error -> error
@@ -222,7 +222,7 @@ defmodule AttentionServer.Conversation do
       {:error, :already_acted}
     else
       action = %{op_id: op_id, at: System.system_time(:millisecond)}
-      {:ok, %{engine | origin_actions: Map.put(engine.origin_actions, key, action)}}
+      {:ok, Engine.put_row(engine, :origin_actions, key, action)}
     end
   end
 
@@ -366,11 +366,7 @@ defmodule AttentionServer.Conversation do
         {:error, :not_found}
 
       session ->
-        {:ok,
-         %{
-           engine
-           | origin_sessions: Map.put(engine.origin_sessions, key, %{session | gone: true})
-         }}
+        {:ok, Engine.put_row(engine, :origin_sessions, key, %{session | gone: true})}
     end
   end
 
@@ -383,7 +379,7 @@ defmodule AttentionServer.Conversation do
 
       session ->
         updated = %{session | last_detached_at: System.system_time(:millisecond)}
-        {:ok, %{engine | origin_sessions: Map.put(engine.origin_sessions, key, updated)}}
+        {:ok, Engine.put_row(engine, :origin_sessions, key, updated)}
     end
   end
 
@@ -433,11 +429,16 @@ defmodule AttentionServer.Conversation do
         engine.bounce_origin_entries
       end
 
-    {%{
-       engine
-       | origin_feeds: Map.put(engine.origin_feeds, key, updated),
-         bounce_origin_entries: origin_entries
-     }, item}
+    engine =
+      %{
+        engine
+        | origin_feeds: Map.put(engine.origin_feeds, key, updated),
+          bounce_origin_entries: origin_entries
+      }
+      |> Engine.touch_fact({:origin_feed, key, :high})
+      |> Engine.touch_fact({:origin_feed, key, {:entry, seq}})
+
+    {engine, item}
   end
 
   defp valid_delivery_acks?(engine, person, origin, feed) do

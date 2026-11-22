@@ -44,7 +44,12 @@ defmodule AttentionServer.BrowserSignIn do
             expires_at: nil
           }
 
-          {:ok, %{engine | browser_sign_ins: Map.put(tokens, hash, record)}, record}
+          next =
+            engine
+            |> Engine.replace_rows(:browser_sign_ins, tokens)
+            |> Engine.put_row(:browser_sign_ins, hash, record)
+
+          {:ok, next, record}
       end
     else
       {:error, :forbidden} -> {:error, :forbidden}
@@ -57,7 +62,7 @@ defmodule AttentionServer.BrowserSignIn do
          {:ok, revision} <- Engine.owner_revision(engine, item.person, item.owner_key),
          true <- revision == item.owner_revision do
       if is_nil(Map.get(item, :consumed_at)) do
-        next = %{engine | browser_sign_ins: Map.delete(engine.browser_sign_ins, hash)}
+        next = Engine.delete_row(engine, :browser_sign_ins, hash)
 
         principal = %{
           person_id: item.person,

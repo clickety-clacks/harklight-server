@@ -407,6 +407,42 @@ defmodule AttentionServer.BounceDecisionTest do
     assert BounceDecision.advisory_cursor(bounced, @person, @origin, @handle) == 1
   end
 
+  test "advisory append and acknowledgement report every record they write" do
+    {engine, _record} = fixture(supported?: false)
+    selected = score(engine, 0.9, 1_050)
+    due_at = selection(selected)["due_at_ms"]
+    pending = BounceDecision.evaluate_due(selected, due_at)
+    session = pending.origin_sessions[advisory_feed_key()]
+    supported = put_in(session.support["advisory_v1"], true)
+    pending = put_in(pending.origin_sessions[advisory_feed_key()], supported)
+    pending = BounceDecision.requeue_supported_session(pending, advisory_feed_key())
+
+    {bounced, :ok, keys} =
+      Engine.with_touches(pending, fn current ->
+        {BounceDecision.evaluate_due(current, due_at + 50), :ok}
+      end)
+
+    assert selection(bounced)["decision"] == "bounced"
+    assert keys == AttentionServer.TouchOracle.diff(pending, bounced)
+    assert MapSet.member?(keys, {:advisory, advisory_feed_key(), :high})
+    assert MapSet.member?(keys, {:advisory, advisory_feed_key(), {:entry, 1}})
+
+    [entry] = Map.values(bounced.advisory_feeds[advisory_feed_key()].entries)
+
+    {acked, :ok, keys} =
+      Engine.with_touches(bounced, fn current ->
+        {:ok, current, _reply} =
+          BounceDecision.advisory_ack(current, @origin, @handle, entry["advisory_id"])
+
+        {current, :ok}
+      end)
+
+    assert keys == AttentionServer.TouchOracle.diff(bounced, acked)
+
+    assert keys ==
+             MapSet.new([{:advisory, advisory_feed_key(), {:receipt, entry["advisory_id"]}}])
+  end
+
   test "unsupported sessions retain due work; the original session's feed and ack stay separate" do
     {engine, _record} = fixture(supported?: false)
     selected = score(engine, 0.9, 1_050)

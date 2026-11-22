@@ -120,7 +120,7 @@ defmodule AttentionServer.PreChangeLogStore do
   stored nothing.
   """
   def open_conversation(store, key) do
-    {:ok, engine} = Engine.open_conversation(store.engine, key)
+    engine = Engine.put_member(store.engine, :conversation_opened, {person(store, key), key})
     audit = %{person: person(store, key), actor: key, action: "conversation_open"}
     {:ok, store} = Store.commit(store, engine, audit)
     store

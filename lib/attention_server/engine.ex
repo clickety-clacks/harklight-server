@@ -108,7 +108,7 @@ defmodule AttentionServer.Engine do
         end
       end)
 
-    next = %{engine | push_bindings: bindings}
+    next = replace_rows(engine, :push_bindings, bindings)
 
     candidate =
       next.push_bindings
@@ -234,7 +234,7 @@ defmodule AttentionServer.Engine do
             next_at: nil
         }
 
-        {:ok, %{next | push_bindings: Map.put(next.push_bindings, key, claimed)}, claim}
+        {:ok, put_row(next, :push_bindings, key, claimed), claim}
     end
   end
 
@@ -247,7 +247,7 @@ defmodule AttentionServer.Engine do
       when revision == claim.revision and binding_id == claim.binding_id and
              claim_id == claim.claim_id ->
         updated = finish_push_binding(binding, claim, outcome, now_ms)
-        {:ok, %{engine | push_bindings: Map.put(engine.push_bindings, key, updated)}}
+        {:ok, put_row(engine, :push_bindings, key, updated)}
 
       _ ->
         {:ok, engine}
@@ -370,7 +370,7 @@ defmodule AttentionServer.Engine do
 
         next =
           engine
-          |> Map.put(
+          |> replace_rows(
             :push_bindings,
             engine.push_bindings |> release_push_address(key, address) |> Map.put(key, binding)
           )
@@ -418,7 +418,7 @@ defmodule AttentionServer.Engine do
 
             next =
               engine
-              |> Map.put(:push_bindings, Map.put(engine.push_bindings, key, canceled))
+              |> put_row(:push_bindings, key, canceled)
               |> save_receipt(person, device, frame["op_id"], semantic, reply)
 
             {:ok, next, reply}
@@ -659,7 +659,7 @@ defmodule AttentionServer.Engine do
     if Map.has_key?(engine.persons, person) do
       {:error, :person_exists}
     else
-      {:ok, %{engine | persons: Map.put(engine.persons, person, 0)}}
+      {:ok, put_row(engine, :persons, person, 0)}
     end
   end
 
@@ -679,11 +679,9 @@ defmodule AttentionServer.Engine do
 
       true ->
         {:ok,
-         %{
-           engine
-           | persons: Map.put(engine.persons, person, 0),
-             owners: Map.put(engine.owners, person, %{key: owner_key, revision: 1})
-         }}
+         engine
+         |> put_row(:persons, person, 0)
+         |> put_row(:owners, person, %{key: owner_key, revision: 1})}
     end
   end
 
@@ -705,15 +703,13 @@ defmodule AttentionServer.Engine do
         existing = engine.hosted_accounts[account_ref]
         record = %{existing | test: existing.test or test?}
 
-        {:ok, %{engine | hosted_accounts: Map.put(engine.hosted_accounts, account_ref, record)},
-         record}
+        {:ok, put_row(engine, :hosted_accounts, account_ref, record), record}
 
       true ->
         with {:ok, next} <- operator_bootstrap(engine, person, owner_key) do
           record = %{person: person, label: nil, test: test?}
 
-          {:ok, %{next | hosted_accounts: Map.put(next.hosted_accounts, account_ref, record)},
-           record}
+          {:ok, put_row(next, :hosted_accounts, account_ref, record), record}
         end
     end
   end
@@ -724,7 +720,7 @@ defmodule AttentionServer.Engine do
       %{account_ref: ref} = record ->
         if hosted_label?(label) do
           stored = record |> Map.delete(:account_ref) |> Map.put(:label, label)
-          {:ok, %{engine | hosted_accounts: Map.put(engine.hosted_accounts, ref, stored)}}
+          {:ok, put_row(engine, :hosted_accounts, ref, stored)}
         else
           {:error, :invalid_label}
         end
@@ -748,7 +744,7 @@ defmodule AttentionServer.Engine do
       if Map.get(engine.delivery_states, person) == target_state do
         {:ok, engine, target_state}
       else
-        next = %{engine | delivery_states: Map.put(engine.delivery_states, person, target_state)}
+        next = put_row(engine, :delivery_states, person, target_state)
         {:ok, next, target_state}
       end
     else
@@ -778,7 +774,7 @@ defmodule AttentionServer.Engine do
       if Map.get(engine.algorithm_choices, person, "baseline") == algorithm do
         {:ok, engine}
       else
-        {:ok, %{engine | algorithm_choices: Map.put(engine.algorithm_choices, person, algorithm)}}
+        {:ok, put_row(engine, :algorithm_choices, person, algorithm)}
       end
     else
       {:error, :not_found}
@@ -789,7 +785,7 @@ defmodule AttentionServer.Engine do
 
   @doc false
   def set_jev_connection(%__MODULE__{} = engine, endpoint, model) do
-    {:ok, %{engine | jev_endpoint: endpoint, jev_model: model}}
+    {:ok, engine |> put_field(:jev_endpoint, endpoint) |> put_field(:jev_model, model)}
   end
 
   @doc """
@@ -837,25 +833,32 @@ defmodule AttentionServer.Engine do
             {:error, :not_resettable}
 
           true ->
-            next = %{
+            next =
               engine
-              | devices: Map.drop(engine.devices, MapSet.to_list(keys)),
-                pending_enrollments: Map.drop(engine.pending_enrollments, pending_codes),
-                pending_history: Map.drop(engine.pending_history, history_codes),
-                join_invitations: Map.drop(engine.join_invitations, invitations),
-                push_bindings: drop.(engine.push_bindings),
-                sender_grants: drop.(engine.sender_grants),
-                subscriptions: drop.(engine.subscriptions),
-                cursors: drop.(engine.cursors),
-                conversation_cursors: drop.(engine.conversation_cursors),
-                conversation_opened: MapSet.filter(engine.conversation_opened, retained?),
-                receipts: drop.(engine.receipts),
-                source_report_grants: drop.(engine.source_report_grants),
-                enrollment_read_grants:
-                  Map.filter(engine.enrollment_read_grants, fn {_, grant} ->
-                    not (grant.person == person and MapSet.member?(keys, grant.connector))
-                  end)
-            }
+              |> replace_rows(:devices, Map.drop(engine.devices, MapSet.to_list(keys)))
+              |> replace_rows(
+                :pending_enrollments,
+                Map.drop(engine.pending_enrollments, pending_codes)
+              )
+              |> replace_rows(:pending_history, Map.drop(engine.pending_history, history_codes))
+              |> replace_rows(:join_invitations, Map.drop(engine.join_invitations, invitations))
+              |> replace_rows(:push_bindings, drop.(engine.push_bindings))
+              |> replace_rows(:sender_grants, drop.(engine.sender_grants))
+              |> replace_rows(:subscriptions, drop.(engine.subscriptions))
+              |> replace_rows(:cursors, drop.(engine.cursors))
+              |> replace_rows(:conversation_cursors, drop.(engine.conversation_cursors))
+              |> replace_members(
+                :conversation_opened,
+                MapSet.filter(engine.conversation_opened, retained?)
+              )
+              |> replace_rows(:receipts, drop.(engine.receipts))
+              |> replace_rows(:source_report_grants, drop.(engine.source_report_grants))
+              |> replace_rows(
+                :enrollment_read_grants,
+                Map.filter(engine.enrollment_read_grants, fn {_, grant} ->
+                  not (grant.person == person and MapSet.member?(keys, grant.connector))
+                end)
+              )
 
             {:ok, next, MapSet.to_list(keys)}
         end
@@ -881,20 +884,21 @@ defmodule AttentionServer.Engine do
       %{key: old_key, revision: revision} = owner ->
         if hex_key?(new_key) and not principal_key_used?(engine, new_key) do
           {:ok,
-           %{
-             engine
-             | owners:
-                 Map.put(engine.owners, person, %{owner | key: new_key, revision: revision + 1}),
-               retired_owner_keys: MapSet.put(engine.retired_owner_keys, old_key),
-               browser_sign_ins:
-                 Map.reject(engine.browser_sign_ins, fn {_, sign_in} ->
-                   Map.get(sign_in, :person) == person
-                 end),
-               join_invitations:
-                 Map.reject(engine.join_invitations, fn {_, invitation} ->
-                   Map.get(invitation, :person) == person
-                 end)
-           }}
+           engine
+           |> put_row(:owners, person, %{owner | key: new_key, revision: revision + 1})
+           |> put_member(:retired_owner_keys, old_key)
+           |> replace_rows(
+             :browser_sign_ins,
+             Map.reject(engine.browser_sign_ins, fn {_, sign_in} ->
+               Map.get(sign_in, :person) == person
+             end)
+           )
+           |> replace_rows(
+             :join_invitations,
+             Map.reject(engine.join_invitations, fn {_, invitation} ->
+               Map.get(invitation, :person) == person
+             end)
+           )}
         else
           {:error, :key_in_use}
         end
@@ -933,7 +937,7 @@ defmodule AttentionServer.Engine do
 
       case Map.get(engine.maintainer_grants, grant_id) do
         nil ->
-          {:ok, %{engine | maintainer_grants: Map.put(engine.maintainer_grants, grant_id, grant)}}
+          {:ok, put_row(engine, :maintainer_grants, grant_id, grant)}
 
         %{target_person: ^person, grantee_person: ^grantee, scopes: existing, revoked_at: nil}
         when existing == grant.scopes ->
@@ -957,7 +961,7 @@ defmodule AttentionServer.Engine do
         {:ok, engine}
       else
         revoked = %{grant | revoked_at: now_ms, revoked_by: owner_key}
-        {:ok, %{engine | maintainer_grants: Map.put(engine.maintainer_grants, grant_id, revoked)}}
+        {:ok, put_row(engine, :maintainer_grants, grant_id, revoked)}
       end
     else
       {:error, :forbidden} -> {:error, :forbidden}
@@ -1008,7 +1012,7 @@ defmodule AttentionServer.Engine do
             enrollment_revision: 1
           }
 
-          {:ok, %{engine | agents: Map.put(engine.agents, key, agent)}}
+          {:ok, put_row(engine, :agents, key, agent)}
       end
     end
   end
@@ -1039,7 +1043,7 @@ defmodule AttentionServer.Engine do
               [grant_snapshot(next_revision, owner_key, read_set, respond_set, false, "replace")]
       }
 
-      {:ok, %{engine | agents: Map.put(engine.agents, key, updated)}}
+      {:ok, put_row(engine, :agents, key, updated)}
     else
       {:error, :forbidden} -> {:error, :forbidden}
       false -> {:error, :stale_or_invalid_grant}
@@ -1075,7 +1079,7 @@ defmodule AttentionServer.Engine do
                 ]
         }
 
-        {:ok, %{engine | agents: Map.put(engine.agents, key, updated)}}
+        {:ok, put_row(engine, :agents, key, updated)}
       end
     else
       {:error, :forbidden} -> {:error, :forbidden}
@@ -1227,7 +1231,7 @@ defmodule AttentionServer.Engine do
             request_generation: 1
           }
 
-          {:ok, %{engine | pending_enrollments: Map.put(engine.pending_enrollments, code, item)}}
+          {:ok, put_row(engine, :pending_enrollments, code, item)}
       end
     else
       _ -> {:error, :invalid_request}
@@ -1251,8 +1255,7 @@ defmodule AttentionServer.Engine do
            end) do
       renewed = %{item | secret_hash: secret_hash, label: label}
 
-      {:ok, %{engine | pending_enrollments: Map.put(engine.pending_enrollments, code, renewed)},
-       code}
+      {:ok, put_row(engine, :pending_enrollments, code, renewed), code}
     else
       _ -> :none
     end
@@ -1445,11 +1448,9 @@ defmodule AttentionServer.Engine do
             }
 
             {:ok,
-             %{
-               granted
-               | pending_enrollments: Map.delete(granted.pending_enrollments, code),
-                 pending_history: Map.put(granted.pending_history, code, receipt)
-             }, item.key}
+             granted
+             |> delete_row(:pending_enrollments, code)
+             |> put_row(:pending_history, code, receipt), item.key}
           end
       end
     else
@@ -1482,11 +1483,9 @@ defmodule AttentionServer.Engine do
       }
 
       {:ok,
-       %{
-         engine
-         | pending_enrollments: Map.delete(engine.pending_enrollments, code),
-           pending_history: Map.put(engine.pending_history, code, receipt)
-       }}
+       engine
+       |> delete_row(:pending_enrollments, code)
+       |> put_row(:pending_history, code, receipt)}
     else
       {:error, :forbidden} -> {:error, :forbidden}
       _ -> {:error, :not_found}
@@ -1534,11 +1533,10 @@ defmodule AttentionServer.Engine do
 
           receipt = Map.put(receipt, :state, :cancelled)
 
-          next = %{
+          next =
             engine
-            | pending_enrollments: Map.delete(engine.pending_enrollments, code),
-              pending_history: Map.put(engine.pending_history, code, receipt)
-          }
+            |> delete_row(:pending_enrollments, code)
+            |> put_row(:pending_history, code, receipt)
 
           {:ok, next, %{"state" => "cancelled"}}
       end
@@ -1550,11 +1548,7 @@ defmodule AttentionServer.Engine do
   defp put_device_metadata(engine, key, label, now) do
     device = Map.fetch!(engine.devices, key)
 
-    %{
-      engine
-      | devices:
-          Map.put(engine.devices, key, Map.merge(device, %{label: label, enrolled_at: now}))
-    }
+    put_row(engine, :devices, key, Map.merge(device, %{label: label, enrolled_at: now}))
   end
 
   @doc "A proved TLS device key removes only itself; retained revoked keys support lost-reply retry."
@@ -1610,7 +1604,7 @@ defmodule AttentionServer.Engine do
         |> Map.put(:see_focus, see_focus)
         |> Map.put(:push_view, push_view)
 
-      {:ok, %{engine | devices: Map.put(engine.devices, device_key, updated)}}
+      {:ok, put_row(engine, :devices, device_key, updated)}
     else
       {:error, :forbidden} -> {:error, :forbidden}
       _ -> {:error, :not_found}
@@ -1639,11 +1633,7 @@ defmodule AttentionServer.Engine do
 
       if MapSet.member?(grants, pattern) do
         {:ok,
-         %{
-           engine
-           | sender_grants:
-               Map.put(engine.sender_grants, {person, device_key}, MapSet.delete(grants, pattern))
-         }}
+         put_row(engine, :sender_grants, {person, device_key}, MapSet.delete(grants, pattern))}
       else
         {:error, :not_found}
       end
@@ -1688,22 +1678,18 @@ defmodule AttentionServer.Engine do
 
       true ->
         {:ok,
-         %{
-           engine
-           | devices:
-               Map.put(engine.devices, key, %{
-                 person: person,
-                 revoked: false,
-                 enrollment_revision: 1,
-                 label: nil,
-                 enrolled_at: nil,
-                 see_focus: false,
-                 push_view: false
-               }),
-             subscriptions:
-               Map.put(engine.subscriptions, {person, key}, %{revision: 0, senders: MapSet.new()}),
-             cursors: Map.put(engine.cursors, {person, key}, 0)
-         }}
+         engine
+         |> put_row(:devices, key, %{
+           person: person,
+           revoked: false,
+           enrollment_revision: 1,
+           label: nil,
+           enrolled_at: nil,
+           see_focus: false,
+           push_view: false
+         })
+         |> put_row(:subscriptions, {person, key}, %{revision: 0, senders: MapSet.new()})
+         |> put_row(:cursors, {person, key}, 0)}
     end
   end
 
@@ -1745,7 +1731,7 @@ defmodule AttentionServer.Engine do
           enrollment_revision: 1
         }
 
-        {:ok, %{engine | agents: Map.put(engine.agents, key, agent)}}
+        {:ok, put_row(engine, :agents, key, agent)}
     end
   end
 
@@ -1789,7 +1775,7 @@ defmodule AttentionServer.Engine do
           &MapSet.put(&1, pattern)
         )
 
-      {:ok, %{engine | sender_grants: grants}}
+      {:ok, put_row(engine, :sender_grants, {person, key}, Map.fetch!(grants, {person, key}))}
     else
       _ -> {:error, :forbidden}
     end
@@ -1821,12 +1807,9 @@ defmodule AttentionServer.Engine do
           revision = if binding, do: binding.revision + 1, else: 1
 
           {:ok,
-           %{
-             engine
-             | devices: Map.put(engine.devices, key, updated),
-               push_bindings:
-                 Map.put(engine.push_bindings, binding_key, canceled_push_binding(revision))
-           }}
+           engine
+           |> put_row(:devices, key, updated)
+           |> put_row(:push_bindings, binding_key, canceled_push_binding(revision))}
         end
 
       :error ->
@@ -1862,7 +1845,7 @@ defmodule AttentionServer.Engine do
                   ]
           }
 
-          {:ok, %{engine | agents: Map.put(engine.agents, key, updated)}}
+          {:ok, put_row(engine, :agents, key, updated)}
         end
 
       :error ->
@@ -1908,12 +1891,7 @@ defmodule AttentionServer.Engine do
                 {:error, :invalid_target}
 
               true ->
-                {:ok,
-                 %{
-                   engine
-                   | enrollment_read_grants:
-                       Map.put(engine.enrollment_read_grants, grant_id, proposed)
-                 }}
+                {:ok, put_row(engine, :enrollment_read_grants, grant_id, proposed)}
             end
 
           ^proposed ->
@@ -1929,8 +1907,7 @@ defmodule AttentionServer.Engine do
   def revoke_enrollment_read(%__MODULE__{} = engine, person, grant_id) do
     case Map.get(engine.enrollment_read_grants, grant_id) do
       %{person: ^person, revoked: false} = grant ->
-        next = Map.put(engine.enrollment_read_grants, grant_id, %{grant | revoked: true})
-        {:ok, %{engine | enrollment_read_grants: next}}
+        {:ok, put_row(engine, :enrollment_read_grants, grant_id, %{grant | revoked: true})}
 
       %{person: ^person, revoked: true} ->
         {:ok, engine}
@@ -1947,12 +1924,7 @@ defmodule AttentionServer.Engine do
          true <- is_list(senders) and senders != [] and Enum.all?(senders, &Message.sender_id?/1) do
       grant = %{senders: MapSet.new(senders), delegation_ref: delegation_ref, revoked: false}
 
-      {:ok,
-       %{
-         engine
-         | source_report_grants:
-             Map.put(engine.source_report_grants, {person, key, source}, grant)
-       }}
+      {:ok, put_row(engine, :source_report_grants, {person, key, source}, grant)}
     else
       _ -> {:error, :forbidden}
     end
@@ -1965,14 +1937,10 @@ defmodule AttentionServer.Engine do
 
       grant ->
         {:ok,
-         %{
-           engine
-           | source_report_grants:
-               Map.put(engine.source_report_grants, {person, key, source}, %{
-                 grant
-                 | revoked: true
-               })
-         }}
+         put_row(engine, :source_report_grants, {person, key, source}, %{
+           grant
+           | revoked: true
+         })}
     end
   end
 
@@ -2043,6 +2011,50 @@ defmodule AttentionServer.Engine do
         engine
         |> Map.replace!(field, MapSet.put(members, key))
         |> touch_fact({:member, field, key})
+  end
+
+  @doc false
+  # Replaces a whole row field for bulk changes and touches each key whose
+  # value changed. The comparison runs only while touches are tracked.
+  def replace_rows(%__MODULE__{touched_keys: nil} = engine, field, rows),
+    do: Map.replace!(engine, field, rows)
+
+  def replace_rows(%__MODULE__{} = engine, field, rows) do
+    old = Map.fetch!(engine, field)
+
+    changed =
+      Enum.reduce(rows, MapSet.new(), fn {key, value}, acc ->
+        if Map.fetch(old, key) === {:ok, value}, do: acc, else: MapSet.put(acc, key)
+      end)
+
+    changed =
+      Enum.reduce(old, changed, fn {key, _}, acc ->
+        if Map.has_key?(rows, key), do: acc, else: MapSet.put(acc, key)
+      end)
+
+    Enum.reduce(changed, Map.replace!(engine, field, rows), &touch_fact(&2, {:row, field, &1}))
+  end
+
+  @doc false
+  def replace_members(%__MODULE__{touched_keys: nil} = engine, field, members),
+    do: Map.replace!(engine, field, members)
+
+  def replace_members(%__MODULE__{} = engine, field, members) do
+    old = Map.fetch!(engine, field)
+    changed = MapSet.union(MapSet.difference(old, members), MapSet.difference(members, old))
+
+    Enum.reduce(
+      changed,
+      Map.replace!(engine, field, members),
+      &touch_fact(&2, {:member, field, &1})
+    )
+  end
+
+  @doc false
+  def put_field(%__MODULE__{} = engine, field, value) do
+    if Map.fetch!(engine, field) === value,
+      do: engine,
+      else: engine |> Map.replace!(field, value) |> touch_fact({:field, field})
   end
 
   @doc false
@@ -2200,7 +2212,7 @@ defmodule AttentionServer.Engine do
         "request_revision" => terminal_entry["request_revision"]
       }
 
-      %{next | events: Map.put(next.events, {person, seq}, Map.put(event, :payload, payload))}
+      put_row(next, :events, {person, seq}, Map.put(event, :payload, payload))
     else
       next
     end
@@ -2256,13 +2268,6 @@ defmodule AttentionServer.Engine do
   def conversation_cursor(%__MODULE__{} = engine, key) do
     with {:ok, %{person: person, key: device}} <- principal(engine, key) do
       {:ok, Map.get(engine.conversation_cursors, {person, device}, 0)}
-    end
-  end
-
-  def open_conversation(%__MODULE__{} = engine, key) do
-    with {:ok, %{person: person, key: device}} <- principal(engine, key) do
-      {:ok,
-       %{engine | conversation_opened: MapSet.put(engine.conversation_opened, {person, device})}}
     end
   end
 
@@ -2431,7 +2436,9 @@ defmodule AttentionServer.Engine do
     acks = Map.get(feed, :delivery_acks, %{})
     stages = Map.put(Map.get(acks, entry["feed_seq"], %{}), stage, seq)
     feed = Map.put(feed, :delivery_acks, Map.put(acks, entry["feed_seq"], stages))
+
     %{next | origin_feeds: Map.put(next.origin_feeds, feed_key, feed)}
+    |> touch_fact({:origin_feed, feed_key, {:delivery_ack, entry["feed_seq"]}})
   end
 
   defp delivery_ack_payload(engine, origin, entry, stage, agent) do
@@ -2631,7 +2638,7 @@ defmodule AttentionServer.Engine do
     payload = Map.merge(extra, %{"availability" => status, "last_detached_at" => detached_at})
 
     updated = Map.put(event, :payload, Map.merge(Map.get(event, :payload, %{}), payload))
-    %{engine | events: Map.put(engine.events, {person, seq}, updated)}
+    put_row(engine, :events, {person, seq}, updated)
   end
 
   defp principal(engine, key) do
@@ -3284,13 +3291,10 @@ defmodule AttentionServer.Engine do
         :missing ->
           next =
             engine
-            |> Map.put(
-              :subscriptions,
-              Map.put(engine.subscriptions, {person, device}, %{
-                revision: revision,
-                senders: MapSet.new(senders)
-              })
-            )
+            |> put_row(:subscriptions, {person, device}, %{
+              revision: revision,
+              senders: MapSet.new(senders)
+            })
             |> save_receipt(person, device, frame["op_id"], semantic, %{"revision" => revision})
 
           {:ok, next, %{"revision" => revision}}
@@ -3469,10 +3473,7 @@ defmodule AttentionServer.Engine do
               "listening_support" => support
             }
 
-            %{
-              next
-              | events: Map.put(next.events, {person, seq}, Map.put(event, :payload, payload))
-            }
+            put_row(next, :events, {person, seq}, Map.put(event, :payload, payload))
           else
             next
           end
@@ -3645,7 +3646,7 @@ defmodule AttentionServer.Engine do
         "request_revision" => terminal_entry["request_revision"]
       }
 
-      %{next | events: Map.put(next.events, {person, seq}, Map.put(event, :payload, payload))}
+      put_row(next, :events, {person, seq}, Map.put(event, :payload, payload))
     else
       next
     end
@@ -3778,7 +3779,7 @@ defmodule AttentionServer.Engine do
                 "request_revision" => terminal_entry["request_revision"]
               })
 
-            %{next | events: Map.put(next.events, {person, seq}, updated)}
+            put_row(next, :events, {person, seq}, updated)
           else
             next
           end
@@ -3932,7 +3933,7 @@ defmodule AttentionServer.Engine do
             "request_revision" => terminal_entry["request_revision"]
           })
 
-        %{next | events: Map.put(next.events, {person, seq}, updated)}
+        put_row(next, :events, {person, seq}, updated)
       else
         next
       end
@@ -4090,7 +4091,12 @@ defmodule AttentionServer.Engine do
         end
       )
 
-    {%{engine | reply_group_history: history, route_b_index: index}, changed_entries}
+    engine =
+      Enum.reduce(keys, %{engine | route_b_index: index}, fn key, acc ->
+        put_row(acc, :reply_group_history, key, Map.fetch!(history, key))
+      end)
+
+    {engine, changed_entries}
   end
 
   defp retain_read_group_score(engine, key, position) do
@@ -4098,11 +4104,14 @@ defmodule AttentionServer.Engine do
       {:ok, prior} ->
         remaining = Map.reject(prior.scores, fn {seq, _} -> seq <= position end)
 
-        history =
-          Map.put(engine.reply_group_history, key, update_reply_aggregate(prior, remaining))
-
         index = RouteBIndex.put_reply_scores(engine.route_b_index, key, remaining)
-        %{engine | reply_group_history: history, route_b_index: index}
+
+        put_row(
+          %{engine | route_b_index: index},
+          :reply_group_history,
+          key,
+          update_reply_aggregate(prior, remaining)
+        )
 
       :error ->
         engine
@@ -4154,10 +4163,7 @@ defmodule AttentionServer.Engine do
               next =
                 next
                 |> then(fn state ->
-                  %{
-                    state
-                    | chat_read_positions: Map.put(state.chat_read_positions, key, position)
-                  }
+                  put_row(state, :chat_read_positions, key, position)
                 end)
                 |> retain_read_group_score(key, position)
                 |> put_conversation_event(person, seq, key, payload)
@@ -4438,7 +4444,16 @@ defmodule AttentionServer.Engine do
 
   defp revision_files(_frame, uploaded), do: {:ok, uploaded}
 
-  defp commit_conversation_revise(engine, person, actor, frame, semantic, files, uploaded, accepted_at) do
+  defp commit_conversation_revise(
+         engine,
+         person,
+         actor,
+         frame,
+         semantic,
+         files,
+         uploaded,
+         accepted_at
+       ) do
     key = {person, frame["sender_id"], frame["message_id"]}
 
     case Map.get(engine.messages, key) do
@@ -4904,11 +4919,12 @@ defmodule AttentionServer.Engine do
   # The counter and arrival are part of the same committed Engine snapshot.
   defp next_free_order(engine, person) do
     order = Map.get(engine.free_order_highs, person, 0) + 1
-    {%{engine | free_order_highs: Map.put(engine.free_order_highs, person, order)}, order}
+    {put_row(engine, :free_order_highs, person, order), order}
   end
 
   defp put_reply_free_order(engine, person, seq, order) do
-    update_in(engine.conversation_events[{person, seq}], &Map.put(&1, :free_order, order))
+    event = Map.fetch!(engine.conversation_events, {person, seq})
+    put_row(engine, :conversation_events, {person, seq}, Map.put(event, :free_order, order))
   end
 
   defp put_conversation_event(engine, person, seq, key, payload) do
@@ -4928,12 +4944,8 @@ defmodule AttentionServer.Engine do
         do: MapSet.put(engine.bounce_discussed_messages, key),
         else: engine.bounce_discussed_messages
 
-    %{
-      engine
-      | conversation_events: Map.put(engine.conversation_events, {person, seq}, event),
-        route_b_index: route_b_index,
-        bounce_discussed_messages: discussed
-    }
+    engine = %{engine | route_b_index: route_b_index, bounce_discussed_messages: discussed}
+    put_row(engine, :conversation_events, {person, seq}, event)
   end
 
   defp append_conversation_fact(engine, person, key, payload) do
@@ -5063,17 +5075,17 @@ defmodule AttentionServer.Engine do
 
   defp save_receipt(engine, person, device, op, semantic, reply) do
     item = %{semantic: JSON.canonical(semantic), reply: reply}
-    %{engine | receipts: Map.put(engine.receipts, {person, device, op}, item)}
+    put_row(engine, :receipts, {person, device, op}, item)
   end
 
   defp next_seq(engine, person) do
     seq = engine.persons[person] + 1
-    {%{engine | persons: Map.put(engine.persons, person, seq)}, seq}
+    {put_row(engine, :persons, person, seq), seq}
   end
 
   defp next_conversation_seq(engine, person) do
     seq = Map.get(engine.conversation_highs, person, 0) + 1
-    {%{engine | conversation_highs: Map.put(engine.conversation_highs, person, seq)}, seq}
+    {put_row(engine, :conversation_highs, person, seq), seq}
   end
 
   defp put_message(engine, key, record) do
@@ -5088,12 +5100,8 @@ defmodule AttentionServer.Engine do
     route_b_index =
       AttentionServer.RouteBIndex.put_message(engine.route_b_index, key, previous, record)
 
-    %{
-      engine
-      | open_default_index: open_default_index,
-        messages: Map.put(engine.messages, key, record),
-        route_b_index: route_b_index
-    }
+    engine = %{engine | open_default_index: open_default_index, route_b_index: route_b_index}
+    put_row(engine, :messages, key, record)
   end
 
   defp default_due_at(record) do
@@ -5108,7 +5116,7 @@ defmodule AttentionServer.Engine do
   end
 
   defp put_event(engine, person, seq, kind, key),
-    do: %{engine | events: Map.put(engine.events, {person, seq}, %{kind: kind, key: key})}
+    do: put_row(engine, :events, {person, seq}, %{kind: kind, key: key})
 
   # When a push for this binding may next go out: now, unless a push started
   # less than one window ago, in which case at the end of that window.
@@ -5163,7 +5171,7 @@ defmodule AttentionServer.Engine do
           {key, binding}
       end)
 
-    %{engine | push_bindings: bindings}
+    replace_rows(engine, :push_bindings, bindings)
   end
 
   defp queue_conversation_hint(engine, person, high) do
@@ -5219,7 +5227,7 @@ defmodule AttentionServer.Engine do
           {key, binding}
       end)
 
-    %{engine | push_bindings: bindings}
+    replace_rows(engine, :push_bindings, bindings)
   end
 
   # Unresolved deliveries gathered since the last push this device accepted

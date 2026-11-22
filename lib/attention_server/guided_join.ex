@@ -66,11 +66,7 @@ defmodule AttentionServer.GuidedJoin do
             request_id: nil
           }
 
-          {:ok,
-           %{
-             engine
-             | join_invitations: Map.put(engine.join_invitations, token_hash, invite)
-           }, invite}
+          {:ok, Engine.put_row(engine, :join_invitations, token_hash, invite), invite}
       end
     else
       {:error, :forbidden} -> {:error, :forbidden}
@@ -116,7 +112,7 @@ defmodule AttentionServer.GuidedJoin do
 
           with {:ok, next, invitation} <- create(engine, person, owner, hash, configuration) do
             invitation = %{invitation | request_id: request_id}
-            next = %{next | join_invitations: Map.put(next.join_invitations, hash, invitation)}
+            next = Engine.put_row(next, :join_invitations, hash, invitation)
             {:ok, next, invitation, token}
           end
       end
@@ -234,11 +230,10 @@ defmodule AttentionServer.GuidedJoin do
           retain_until: nil
       }
 
-      next = %{
+      next =
         pending
-        | pending_enrollments: Map.put(pending.pending_enrollments, code, bound),
-          join_invitations: Map.put(pending.join_invitations, hash, consumed)
-      }
+        |> Engine.put_row(:pending_enrollments, code, bound)
+        |> Engine.put_row(:join_invitations, hash, consumed)
 
       {:ok, next, response(next, code, item)}
     end
@@ -269,15 +264,16 @@ defmodule AttentionServer.GuidedJoin do
   end
 
   @doc "Drop invitations whose owner authority has since changed."
-  def compact(engine),
-    do: %{
-      engine
-      | join_invitations:
-          Map.reject(engine.join_invitations, fn {_, invite} ->
-            Engine.owner_revision(engine, invite.person, invite.owner_key) !=
-              {:ok, invite.owner_revision}
-          end)
-    }
+  def compact(engine) do
+    Engine.replace_rows(
+      engine,
+      :join_invitations,
+      Map.reject(engine.join_invitations, fn {_, invite} ->
+        Engine.owner_revision(engine, invite.person, invite.owner_key) !=
+          {:ok, invite.owner_revision}
+      end)
+    )
+  end
 
   def valid_configuration?(
         %{
