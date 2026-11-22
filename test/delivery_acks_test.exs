@@ -1,18 +1,11 @@
 defmodule AttentionServer.DeliveryAcksTest do
   use ExUnit.Case, async: false
 
-  alias AttentionServer.{Engine, HeadlessTLS, JSON, OriginWire, Relay, Server, Store, TLSFixtures}
+  alias AttentionServer.{Engine, JSON, LegacyOriginWire, Relay, Store}
   alias Exqlite.Sqlite3
 
   @handle "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
   defp op(n), do: "00000000-0000-4000-8000-#{String.pad_leading(to_string(n), 12, "0")}"
-
-  setup_all do
-    certs = TLSFixtures.create!()
-    TLSFixtures.make_self_signed_client!(certs, "reader")
-    on_exit(fn -> File.rm_rf!(certs) end)
-    %{certs: certs}
-  end
 
   setup do
     dir = Path.join(System.tmp_dir!(), "delivery-acks-#{System.unique_integer([:positive])}")
@@ -75,7 +68,7 @@ defmodule AttentionServer.DeliveryAcksTest do
   end
 
   defp support(relay, capable, n \\ 3) do
-    OriginWire.command(relay, "origin", %{
+    LegacyOriginWire.command(relay, "origin", %{
       "v" => 1,
       "type" => "support",
       "op_id" => op(n),
@@ -88,7 +81,7 @@ defmodule AttentionServer.DeliveryAcksTest do
   end
 
   defp ack2(relay, id, outcome, n, extra \\ %{}) do
-    OriginWire.command(
+    LegacyOriginWire.command(
       relay,
       "origin",
       Map.merge(
@@ -224,7 +217,7 @@ defmodule AttentionServer.DeliveryAcksTest do
 
     for key <- ["phone", "stranger", "unknown"] do
       assert %{"type" => "error"} =
-               OriginWire.command(c.relay, key, %{
+               LegacyOriginWire.command(c.relay, key, %{
                  "v" => 1,
                  "type" => "ack2",
                  "op_id" => op(4),
@@ -401,53 +394,11 @@ defmodule AttentionServer.DeliveryAcksTest do
     Store.close(store)
   end
 
-  test "authenticated HTTP feed and ACK2 produce live and catch-up facts for both clients", c do
-    path = Path.join(Path.dirname(c.path), "transport.sqlite3")
-
-    server =
-      start_supervised!(
-        {Server,
-         store_path: path,
-         certfile: Path.join(c.certs, "server.pem"),
-         keyfile: Path.join(c.certs, "server.key"),
-         cacertfile: Path.join(c.certs, "ca.pem"),
-         origin_port: 0,
-         relay_name: :"two_ack_#{System.unique_integer([:positive])}"}
-      )
-
-    relay = Server.relay(server)
-    {:ok, person} = Relay.operator_bootstrap(relay, TLSFixtures.certificate_der!(c.certs, "a1"))
-
-    {:ok, origin} =
-      Relay.setup_device_certificate(relay, person, TLSFixtures.certificate_der!(c.certs, "a2"))
-
-    {:ok, phone} =
-      Relay.setup_device_certificate(
-        relay,
-        person,
-        TLSFixtures.certificate_der!(c.certs, "reader")
-      )
-
-    {:ok, tablet} =
-      Relay.setup_device_certificate(relay, person, TLSFixtures.certificate_der!(c.certs, "b1"))
-
-    :ok = Relay.setup_sender(relay, origin, "app:test")
-
-    endpoint = %{
-      address: {127, 0, 0, 1},
-      name: "relay.test",
-      ca_file: Path.join(c.certs, "ca.pem"),
-      port: Server.origin_port(server)
-    }
-
-    http = fn frame ->
-      https_request(endpoint, c.certs, Map.put(frame, "v", 1))
-    end
-
-    send_request(relay, origin)
+  test "origin feed and ACK2 produce live and catch-up facts for both device sessions", c do
+    relay = c.relay
 
     sessions =
-      for device <- [phone, tablet] do
+      for device <- ["phone", "tablet"] do
         {:ok, session} = Relay.open_session(relay, device)
 
         {:ok, _} =
@@ -467,51 +418,19 @@ defmodule AttentionServer.DeliveryAcksTest do
         session
       end
 
-    id = discussion(relay, phone)
+    id = discussion(relay)
 
-    assert {:ok, 200, %{"type" => "ok", "listening_support" => %{"ack2" => true}}} =
-             http.(%{
-               "type" => "support",
-               "op_id" => op(3),
-               "session_handle" => @handle,
-               "route" => "codex",
-               "cli_version" => "fixture",
-               "unsupported_reason" => nil,
-               "ack2" => true
-             })
+    assert %{"type" => "ok", "listening_support" => %{"ack2" => true}} = support(relay, true)
+    assert delivery_facts(relay) == []
 
-    {:ok, stream} =
-      HeadlessTLS.connect(endpoint, {Path.join(c.certs, "a2.pem"), Path.join(c.certs, "a2.key")})
-
-    on_exit(fn -> :ssl.close(stream) end)
-
-    :ok =
-      :ssl.send(
-        stream,
-        "GET /origin/v1/stream?session=#{@handle} HTTP/1.1\r\nHost: relay.test\r\n\r\n"
-      )
-
-    notice = read_notice(stream, <<>>, 16)
-    assert notice =~ "HTTP/1.1 200 OK"
-    assert notice =~ "data: {\"cursor\":2}"
-    assert delivery_facts(relay, phone) == []
-
-    assert {:ok, 200, %{"type" => "ok", "entries" => [entry]}} =
-             http.(%{"type" => "feed", "since" => 1})
-
+    assert %{"type" => "ok", "entries" => [entry]} = feed(relay, 1)
     assert entry["event_id"] == id
     assert entry["delivered"] == false
 
-    assert {:ok, 200, %{"type" => "ok", "status" => "recorded", "stage_outcome" => "handed"}} =
-             http.(%{
-               "type" => "ack2",
-               "op_id" => op(4),
-               "event_id" => id,
-               "outcome" => "handed",
-               "agent" => "Reviewer"
-             })
+    assert %{"type" => "ok", "status" => "recorded", "stage_outcome" => "handed"} =
+             ack2(relay, id, "handed", 4, %{"agent" => "Reviewer"})
 
-    expected = delivery_facts(relay, phone)
+    expected = delivery_facts(relay)
 
     assert [
              %{"stage" => "ack1", "ack2_expected" => true},
@@ -531,7 +450,7 @@ defmodule AttentionServer.DeliveryAcksTest do
     end
 
     # Explicit catch-up uses the same authoritative journal and does not touch Seen.
-    {:ok, catching_up} = Relay.open_session(relay, tablet)
+    {:ok, catching_up} = Relay.open_session(relay, "tablet")
 
     {:ok, _} =
       Relay.session_request_line(
@@ -555,52 +474,18 @@ defmodule AttentionServer.DeliveryAcksTest do
 
     assert Enum.filter(replay, &(&1["kind"] == "delivery_ack")) == expected
 
-    assert {:ok, 200, %{"entries" => [%{"delivered" => false, "acted" => false}]}} =
-             http.(%{"type" => "feed", "since" => 1})
+    assert %{"entries" => [%{"delivered" => false, "acted" => false}]} = feed(relay, 1)
 
-    assert {:ok, 200, %{"status" => "delivered"}} = http.(%{"type" => "ack", "event_id" => id})
-    assert Enum.count(facts(relay, phone), &(&1["kind"] == "receipt")) == 1
+    assert %{"status" => "delivered"} =
+             LegacyOriginWire.command(relay, "origin", %{
+               "v" => 1,
+               "type" => "ack",
+               "event_id" => id
+             })
+
+    assert Enum.count(facts(relay), &(&1["kind"] == "receipt")) == 1
   end
 
-  defp https_request(endpoint, certs, frame) do
-    {:ok, socket} =
-      HeadlessTLS.connect(endpoint, {Path.join(certs, "a2.pem"), Path.join(certs, "a2.key")})
-
-    try do
-      body = JSON.encode!(frame)
-
-      :ok =
-        :ssl.send(socket, [
-          "POST /origin/v1 HTTP/1.1\r\nHost: relay.test\r\nContent-Type: application/json\r\nContent-Length: #{byte_size(body)}\r\nConnection: close\r\n\r\n",
-          body
-        ])
-
-      response = read_http(socket, <<>>)
-      [head, body] = :binary.split(response, "\r\n\r\n")
-      ["HTTP/1.1", status | _] = String.split(head)
-      {:ok, decoded} = JSON.decode_line(body <> "\n")
-      {:ok, String.to_integer(status), decoded}
-    after
-      :ssl.close(socket)
-    end
-  end
-
-  defp read_http(socket, bytes) do
-    case :ssl.recv(socket, 0, 5_000) do
-      {:ok, chunk} -> read_http(socket, bytes <> chunk)
-      {:error, :closed} -> bytes
-      error -> flunk("fixture HTTP response failed: #{inspect(error)}")
-    end
-  end
-
-  defp read_notice(_socket, _bytes, 0), do: flunk("no complete SSE notice")
-
-  defp read_notice(socket, bytes, remaining) do
-    if String.contains?(bytes, "data: {\"cursor\":2}\n\n") do
-      bytes
-    else
-      assert {:ok, chunk} = :ssl.recv(socket, 0, 5_000)
-      read_notice(socket, bytes <> chunk, remaining - 1)
-    end
-  end
+  defp feed(relay, since),
+    do: LegacyOriginWire.command(relay, "origin", %{"v" => 1, "type" => "feed", "since" => since})
 end

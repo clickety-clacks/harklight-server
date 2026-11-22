@@ -71,13 +71,14 @@ and owner certificates expire after one year.
 
 Stop the foreground process with Ctrl-C and confirm exit before local operator
 commands or upgrade. Historical binary name attention_server, Mix application
-:attention_server, ATTENTION_SERVER_* variables, /relay, attention-relay/1 and
-/agent/v1 retain their existing meaning.
+:attention_server, ATTENTION_SERVER_* variables, /relay and attention-relay/1
+retain their existing meaning.
 
-Four listeners default to loopback: device HTTPS 18443, enrollment HTTPS 18444,
-owner TLS 18445 and agent HTTPS 18446. For another machine to connect, set each
-required ATTENTION_SERVER_*_BIND explicitly in server.env and arrange routing
-and firewall access. Use the DNS hostname embedded in the certificate.
+Three listeners default to loopback: device HTTPS 18443, enrollment HTTPS 18444
+and owner TLS 18445. Devices and registered agents share the device port. For
+another machine to connect, set each required ATTENTION_SERVER_*_BIND explicitly
+in server.env and arrange routing and firewall access. Use the DNS hostname
+embedded in the certificate.
 No service, boot autostart, DNS or firewall change is performed by the package.
 
 State is external to the package; SQLite, certificates, owner identity and person
@@ -121,9 +122,9 @@ below: it carries the configured destination and pinned public CA. The app keeps
 its own private device key; never transfer an owner or CA private key to it.
 For headless commands use the tailnet IP in --connect and the exact
 certificate hostname in --name. Enrollment uses 18444, owner management 18445,
-the device client API https://HOSTNAME:18443/v2 and authorized-agent HTTPS 18446.
-An app or headless device must enroll its exact key and present it over mutual
-TLS on the device port, which serves client API v2 (protocol 0.2) only. The
+and the device client API https://HOSTNAME:18443/v2, which registered agents
+use too. An app or headless device must enroll its exact key and present it over
+mutual TLS on the device port, which serves client API v2 (protocol 0.2) only. The
 temporary `client_api_v2` flag is on by default; setting it to `false` in the
 feature-flags file (see Client feature flags) starts the retained protocol 0.1
 `/relay` WebSocket (attention-relay/1) instead, until that path is removed.
@@ -147,23 +148,25 @@ for uncertain actions and exact retries. The package does not migrate or reset
 an agent's journal during server installation. The CLI's README covers
 `send`, `listen`, `retry`, `retract` and file commands.
 
-Origin HTTPS is opt-in: set `ATTENTION_SERVER_ORIGIN_PORT` to a distinct free
-port and `ATTENTION_SERVER_ORIGIN_BIND` to its permitted bind address in private
-`server.env`, then use the normal authorized server restart. The origin listener
-uses the existing server TLS certificate/key and enrolled-device authentication.
-No new trust root or sender grant is created. The CLI needs this exact port in
-its enrolled `server.json` as `origin_port`, or through `--origin-port` or
-`HARKLIGHT_ORIGIN_PORT`; it does not infer it from the relay port. Routing and
-certificate-name validation still apply. An upgrade alone does not enable the
-origin endpoint or establish actual agent listening.
+The CLI sends and listens over client API v2 on the device port, with the same
+server certificate and enrolled-device authentication; there is no separate
+origin port. Agent 0.2 on an existing identity takes the device port from
+`--device-port` or `HARKLIGHT_DEVICE_PORT`; new enrollments save it. An upgrade
+alone does not establish actual agent listening.
+
+The protocol 0.1 agent (`/agent/v1`, 18446) and origin (`/origin/v1`) listeners
+are retired. The server no longer reads `ATTENTION_SERVER_AGENT_PORT`,
+`ATTENTION_SERVER_AGENT_BIND`, `ATTENTION_SERVER_ORIGIN_PORT` or
+`ATTENTION_SERVER_ORIGIN_BIND`; an existing `server.env` that still sets them
+starts normally and binds neither port. Remove them when convenient.
 
 `ATTENTION_SERVER_DEPLOYMENT_MODE` defaults to `self_hosted`.
 `ATTENTION_SERVER_UPLOAD_CAP_BYTES` defaults to `none` for self-hosting or may be
 a positive integer. The cap is optional in `saas` mode too: without it, the
 server starts uncapped and logs one startup notice; with it, uploads over the
 configured value are refused individually. The package elects no production
-SaaS cap. These settings and an origin endpoint change need deliberate
-configuration; installation leaves the protected environment unchanged.
+SaaS cap. These settings need deliberate configuration; installation leaves the
+protected environment unchanged.
 
 ## Optional self-hosted device dashboard
 

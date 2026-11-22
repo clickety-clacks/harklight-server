@@ -1124,54 +1124,6 @@ defmodule AttentionServer.Engine do
     end
   end
 
-  def agent_search(engine, key, request), do: AgentAccess.search(engine, key, request)
-  def agent_get(engine, key, request), do: AgentAccess.get(engine, key, request)
-
-  def agent_answer(engine, key, frame) do
-    # `deliberate` and `intent_ref` are no longer required; senders that still
-    # include them are accepted and the values are ignored.
-    frame = Map.drop(frame, ~w(deliberate intent_ref))
-
-    case Map.get(engine.agents, key) do
-      %{person: person, id: id, revoked: false} = agent ->
-        sender = frame["sender_id"]
-
-        cond do
-          not AgentAccess.allowed?(agent.read_grants, sender) or
-              not AgentAccess.allowed?(agent.respond_grants, sender) ->
-            failure("forbidden")
-
-          Enum.sort(Map.keys(Map.delete(frame, "request_revision"))) !=
-            ~w(acceptance_seq answer message_id op_id sender_id type v) or
-              frame["v"] != 1 ->
-            failure("invalid_field", "request")
-
-          frame["type"] != "answer" ->
-            failure("invalid_field", "type")
-
-          Map.has_key?(frame, "request_revision") and
-              not (is_integer(frame["request_revision"]) and frame["request_revision"] > 0) ->
-            failure("invalid_field", "request_revision")
-
-          not (is_integer(frame["acceptance_seq"]) and frame["acceptance_seq"] > 0) ->
-            failure("invalid_field", "acceptance_seq")
-
-          is_nil(Map.get(engine.messages, {person, sender, frame["message_id"]})) ->
-            failure("not_found")
-
-          get_in(engine.messages, [{person, sender, frame["message_id"]}, :accepted_seq]) !=
-              frame["acceptance_seq"] ->
-            failure("stale_target")
-
-          true ->
-            terminal(engine, %{person: person, key: key, id: id, kind: :agent}, frame, true)
-        end
-
-      _ ->
-        failure("forbidden")
-    end
-  end
-
   @doc false
   def client_agent_answer(engine, key, frame, now) do
     sender = frame["sender_id"]

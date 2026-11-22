@@ -15,7 +15,6 @@ defmodule AttentionServer.APNSRuntimeConfigTest do
     "ATTENTION_SERVER_PORT" => "18443",
     "ATTENTION_SERVER_ENROLL_PORT" => "18444",
     "ATTENTION_SERVER_OWNER_PORT" => "18445",
-    "ATTENTION_SERVER_AGENT_PORT" => "18446",
     "ATTENTION_SERVER_APNS_KEY_PATH" => "/protected/sandbox-key",
     "ATTENTION_SERVER_APNS_KEY_ID" => "SANDBOX001",
     "ATTENTION_SERVER_APNS_TEAM_ID" => "TESTTEAMID",
@@ -24,7 +23,6 @@ defmodule AttentionServer.APNSRuntimeConfigTest do
     "ATTENTION_SERVER_APNS_PRODUCTION_KEY_ID" => nil,
     "ATTENTION_SERVER_DEPLOYMENT_MODE" => nil,
     "ATTENTION_SERVER_UPLOAD_CAP_BYTES" => nil,
-    "ATTENTION_SERVER_ORIGIN_PORT" => "18447",
     "ATTENTION_SERVER_PUBLIC_BASE_URL" => nil,
     "ATTENTION_SERVER_HOSTED_PORT" => nil,
     "ATTENTION_SERVER_HOSTED_SIGN_IN_URL" => nil,
@@ -41,7 +39,6 @@ defmodule AttentionServer.APNSRuntimeConfigTest do
     "ATTENTION_SERVER_ENROLL_BIND" => nil,
     "ATTENTION_SERVER_BIND" => nil,
     "ATTENTION_SERVER_OWNER_BIND" => nil,
-    "ATTENTION_SERVER_AGENT_BIND" => nil,
     "ATTENTION_SERVER_JOIN_NAME" => nil
   }
 
@@ -183,8 +180,6 @@ defmodule AttentionServer.APNSRuntimeConfigTest do
       port: 0,
       enroll_port: 0,
       owner_port: 0,
-      agent_port: 0,
-      origin_port: 0,
       relay_name: String.to_atom("runtime_config_#{System.unique_integer([:positive])}")
     )
   end
@@ -200,8 +195,6 @@ defmodule AttentionServer.APNSRuntimeConfigTest do
     assert Server.port(server) > 0
     assert Server.enroll_port(server) > 0
     assert Server.owner_port(server) > 0
-    assert Server.agent_port(server) > 0
-    assert Server.origin_port(server) > 0
     assert is_pid(Server.relay(server))
   end
 

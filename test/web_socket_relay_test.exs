@@ -1,7 +1,7 @@
 defmodule AttentionServer.WebSocketRelayTest do
   use ExUnit.Case, async: false
 
-  alias AttentionServer.{JSON, OriginHTTPS, Relay, Server, TLSFixtures, WebSocketRelay}
+  alias AttentionServer.{JSON, Relay, Server, TLSFixtures, WebSocketRelay}
 
   setup_all do
     dir = TLSFixtures.create!()
@@ -1087,34 +1087,12 @@ defmodule AttentionServer.WebSocketRelayTest do
     :ssl.close(origin)
   end
 
-  test "an authenticated conversation opener learns only the currently bound origin HTTPS port",
-       %{certs: certs, web: web, relay: relay} do
+  test "an authenticated conversation opener is not offered a retired origin HTTPS port",
+       %{certs: certs, web: web} do
     assert {:ok, socket} = connect(web, certs, "a2")
     assert upgrade(socket) =~ "101 Switching Protocols"
     assert {[], %{"seq" => 0}} = resync(socket)
 
-    assert :ok = send_request(socket, %{"type" => "conversation_open", "since" => 0})
-    refute Map.has_key?(reply(socket), "origin_https_port")
-    assert %{"type" => "conversation_resynced", "conversation_seq" => 0} = reply(socket)
-
-    assert {:ok, origin} =
-             OriginHTTPS.start_link(
-               relay: relay,
-               certfile: Path.join(certs, "server.pem"),
-               keyfile: Path.join(certs, "server.key"),
-               cacertfile: Path.join(certs, "ca.pem"),
-               port: 0
-             )
-
-    on_exit(fn -> if Process.alive?(origin), do: GenServer.stop(origin) end)
-    bound_port = OriginHTTPS.port(origin)
-    assert bound_port in 1..65_535
-
-    assert :ok = send_request(socket, %{"type" => "conversation_open", "since" => 0})
-    assert %{"type" => "ok", "origin_https_port" => ^bound_port} = reply(socket)
-    assert %{"type" => "conversation_resynced", "conversation_seq" => 0} = reply(socket)
-
-    GenServer.stop(origin)
     assert :ok = send_request(socket, %{"type" => "conversation_open", "since" => 0})
     refute Map.has_key?(reply(socket), "origin_https_port")
     assert %{"type" => "conversation_resynced", "conversation_seq" => 0} = reply(socket)

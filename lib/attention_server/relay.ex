@@ -21,7 +21,6 @@ defmodule AttentionServer.Relay do
   @hosted_test_device "Test device"
 
   alias AttentionServer.{
-    AgentWire,
     AppliedScoreRecord,
     BrowserRecipient,
     BounceDecision,
@@ -334,24 +333,6 @@ defmodule AttentionServer.Relay do
         :infinity
       )
 
-  @doc "Release one agent reply within the same serialized authority boundary."
-  def agent_send_request(server, verified_agent_key, revision, request, socket),
-    do:
-      GenServer.call(
-        server,
-        {:agent_send_request, verified_agent_key, revision, request, socket},
-        :infinity
-      )
-
-  @doc "Release a G6 HTTP reply in the same serialized agent-authority boundary."
-  def agent_send_https(server, verified_agent_key, revision, request, socket),
-    do:
-      GenServer.call(
-        server,
-        {:agent_send_https, verified_agent_key, revision, request, socket},
-        :infinity
-      )
-
   @doc false
   def client_agent_answer(server, key, frame),
     do: GenServer.call(server, {:client_agent_answer, key, frame}, :infinity)
@@ -659,13 +640,6 @@ defmodule AttentionServer.Relay do
   def unregister_tls_listener(server, listener),
     do: GenServer.call(server, {:unregister_tls_listener, listener}, :infinity)
 
-  @doc "Advertise the bound origin HTTPS listener only while it is running."
-  def register_origin_listener(server, listener, port),
-    do: GenServer.call(server, {:register_origin_listener, listener, port}, :infinity)
-
-  def unregister_origin_listener(server, listener),
-    do: GenServer.call(server, {:unregister_origin_listener, listener}, :infinity)
-
   @doc "Opens a socket-backed session after a successful client-certificate handshake."
   def open_tls_session(server, verified_key, socket, listener),
     do:
@@ -822,7 +796,6 @@ defmodule AttentionServer.Relay do
               focus_streams: %{},
               focus_streams_by_person: %{},
               tls_listeners: %{},
-              origin_listener: nil,
               inbox_builds: %{},
               inbox_build_monitors: %{},
               applied_score_record:
@@ -1994,59 +1967,6 @@ defmodule AttentionServer.Relay do
   defp dispatch_call({:client_agent_answer, _key, _frame}, _from, state),
     do: {:reply, {:error, :not_found}, state}
 
-  defp dispatch_call({:agent_send_request, key, revision, request, socket}, _from, state) do
-    case Engine.agent_identity(state.store.engine, key) do
-      {:ok, person, _id, ^revision} ->
-        {reply, next_state} = agent_request(state, person, key, request)
-
-        Diagnostics.response_error(
-          :agent_tls,
-          :request_dispatch,
-          reply,
-          Diagnostics.operation_id(request)
-        )
-
-        result =
-          {:socket_write, socket, {:agent, key, revision},
-           [AttentionServer.JSON.encode_line(reply)], :result}
-
-        {:reply, result, next_state}
-
-      _ ->
-        {:reply, {:error, :forbidden}, state}
-    end
-  end
-
-  defp dispatch_call({:agent_send_https, key, revision, request, socket}, _from, state) do
-    case Engine.agent_identity(state.store.engine, key) do
-      {:ok, person, _id, ^revision} ->
-        {reply, next_state} =
-          case AgentWire.normalize(request) do
-            {:ok, inner, ref} ->
-              {result, updated} = agent_request(state, person, key, inner)
-              {AgentWire.application_reply(result, inner, ref), updated}
-
-            {:error, reason, field, ref} ->
-              {AgentWire.error(reason, field, ref), state}
-          end
-
-        Diagnostics.response_error(
-          :agent_https,
-          :request_dispatch,
-          reply,
-          Diagnostics.operation_id(request)
-        )
-
-        result =
-          {:socket_write, socket, {:agent, key, revision}, [{:http, 200, reply}], :result}
-
-        {:reply, result, next_state}
-
-      _ ->
-        {:reply, {:error, :forbidden}, state}
-    end
-  end
-
   defp dispatch_call({:owner_register_agent, person, owner_key, id, agent_key}, _from, state),
     do:
       setup(
@@ -2912,20 +2832,6 @@ defmodule AttentionServer.Relay do
 
   defp dispatch_call({:unregister_tls_listener, listener}, _from, state),
     do: {:reply, :ok, unregister_listener(state, listener)}
-
-  defp dispatch_call({:register_origin_listener, listener, port}, _from, state)
-       when is_pid(listener) and is_integer(port) and port in 1..65_535 do
-    if state.origin_listener do
-      {:reply, {:error, :already_registered}, state}
-    else
-      monitor = Process.monitor(listener)
-      {:reply, :ok, %{state | origin_listener: %{pid: listener, port: port, monitor: monitor}}}
-    end
-  end
-
-  defp dispatch_call({:unregister_origin_listener, listener}, _from, state) do
-    {:reply, :ok, unregister_origin_listener_state(state, listener)}
-  end
 
   defp dispatch_call({:open_session, key, owner, socket, listener, transport}, _from, state) do
     admission =
@@ -3849,10 +3755,6 @@ defmodule AttentionServer.Relay do
 
             {:noreply, %{state | active_uploads: Map.delete(state.active_uploads, lease)}}
 
-          match?(%{pid: ^listener, monitor: ^monitor}, state.origin_listener) ->
-            Diagnostics.failure(:origin_https, :server_terminate, reason, :unavailable)
-            {:noreply, %{state | origin_listener: nil}}
-
           Map.get(state.tls_listeners, listener) == monitor ->
             Diagnostics.failure(:device_relay, :server_terminate, reason, :unavailable)
             {:noreply, unregister_listener(state, listener)}
@@ -4079,44 +3981,7 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  defp agent_request(state, _person, key, %{"v" => 1, "type" => "search"} = request) do
-    case Engine.agent_search(state.store.engine, key, request) do
-      {:ok, reply} -> {reply, state}
-      {:error, reason} -> {%{"v" => 1, "error" => reason}, state}
-    end
-  end
-
-  defp agent_request(state, _person, key, %{"v" => 1, "type" => "get"} = request) do
-    case Engine.agent_get(state.store.engine, key, request) do
-      {:ok, reply} -> {reply, state}
-      {:error, reason} -> {%{"v" => 1, "error" => reason}, state}
-    end
-  end
-
-  defp agent_request(state, person, key, %{"v" => 1, "type" => "answer"} = request) do
-    case Engine.agent_answer(state.store.engine, key, request) do
-      {:ok, next_engine, fields} ->
-        case commit_agent_answer(state, next_engine, person, key, request) do
-          {:ok, next_state} ->
-            {%{"v" => 1, "type" => "answer_result", "ok" => true} |> Map.merge(fields),
-             next_state}
-
-          :error ->
-            {%{"v" => 1, "error" => "storage_unavailable"}, state}
-        end
-
-      {:error, reason, field, terminal} ->
-        reply = %{"v" => 1, "error" => reason}
-        reply = if field, do: Map.put(reply, "field", field), else: reply
-        reply = if terminal, do: Map.put(reply, "terminal", terminal), else: reply
-        {reply, state}
-    end
-  end
-
-  defp agent_request(state, _person, _key, _request),
-    do: {%{"v" => 1, "error" => "invalid_request"}, state}
-
-  # The two transports commit agent answers through the same store boundary.
+  # Client API v2 agent answers commit through the shared store boundary.
   defp commit_agent_answer(state, next_engine, person, key, frame) do
     target = origin_feed_target_for_person(next_engine, person, frame)
 
@@ -5063,14 +4928,8 @@ defmodule AttentionServer.Relay do
             conversation_contiguous: contiguous
         }
 
-        endpoint =
-          case state.origin_listener do
-            %{port: port} -> %{"origin_https_port" => port}
-            nil -> %{}
-          end
-
         frames =
-          [ok_line(frame, endpoint)] ++
+          [ok_line(frame, %{})] ++
             Enum.map(events, &line/1) ++
             [
               line(%{
@@ -5118,14 +4977,8 @@ defmodule AttentionServer.Relay do
             view_support: true
         }
 
-        endpoint =
-          case state.origin_listener do
-            %{port: port} -> %{"origin_https_port" => port}
-            nil -> %{}
-          end
-
         frames =
-          [ok_line(frame, endpoint)] ++
+          [ok_line(frame, %{})] ++
             Enum.map(events, &line/1) ++
             [
               line(%{
@@ -7531,17 +7384,6 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  defp unregister_origin_listener_state(state, listener) do
-    case state.origin_listener do
-      %{pid: ^listener, monitor: monitor} ->
-        Process.demonitor(monitor, [:flush])
-        %{state | origin_listener: nil}
-
-      _ ->
-        state
-    end
-  end
-
   @doc false
   def agent_focus(state, person, key) do
     case focus_authorized_person(state.store.engine, key, :see) do
@@ -8444,13 +8286,6 @@ defmodule AttentionServer.Relay do
 
   defp authorize_socket_write(state, {:session_control, id}, frame) do
     with {:ok, _session} <- active_session(state, id), do: {:ok, {:raw, frame}}
-  end
-
-  defp authorize_socket_write(state, {:agent, key, revision}, frame) do
-    case Engine.agent_identity(state.store.engine, key) do
-      {:ok, _, _, ^revision} -> {:ok, {:raw, frame}}
-      _ -> {:error, :forbidden}
-    end
   end
 
   defp authorize_socket_write(state, {:owner, person, key, revision}, frame) do

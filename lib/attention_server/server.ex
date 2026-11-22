@@ -1,8 +1,10 @@
 defmodule AttentionServer.Server do
   @moduledoc """
-  Opt-in supervised Relay, `/relay` WebSocket and separate owner/agent TLS listeners.
+  Opt-in supervised Relay, device listener and separate owner TLS listener.
 
-  The device port serves client API v2 (`/v2`) through `ClientAPI.Listener`.
+  The device port serves client API v2 (`/v2`) through `ClientAPI.Listener`,
+  for devices and registered agents alike. Protocol 0.1 agent and origin
+  listeners are retired; their former port options are ignored.
   The temporary `client_api_v2` flag is on by default (read once at startup from
   the feature-flags file, see docs/feature-flags.md); setting it to false starts
   the retained `/relay` WebSocket instead. The two never run together.
@@ -15,13 +17,11 @@ defmodule AttentionServer.Server do
   require Logger
 
   alias AttentionServer.{
-    AgentHTTPS,
     ClientAPI,
     DashboardHTTPS,
     EnrollmentHTTPS,
     Diagnostics,
     HostedHTTP,
-    OriginHTTPS,
     OwnerTLS,
     PushDispatcher,
     Relay,
@@ -44,8 +44,6 @@ defmodule AttentionServer.Server do
 
   def enroll_port(server), do: server |> child(:enrollment_https) |> EnrollmentHTTPS.port()
   def owner_port(server), do: server |> child(:owner_tls) |> OwnerTLS.port()
-  def agent_port(server), do: server |> child(:agent_https) |> AgentHTTPS.port()
-  def origin_port(server), do: server |> child(:origin_https) |> OriginHTTPS.port()
   def hosted_port(server), do: server |> child(:hosted_http) |> HostedHTTP.port()
 
   @impl true
@@ -177,24 +175,6 @@ defmodule AttentionServer.Server do
         ip: Keyword.get(opts, :owner_ip, {127, 0, 0, 1})
       ]
 
-      agent_opts = [
-        relay: relay_name,
-        certfile: certfile,
-        keyfile: keyfile,
-        cacertfile: cacertfile,
-        port: Keyword.get(opts, :agent_port, 0),
-        ip: Keyword.get(opts, :agent_ip, {127, 0, 0, 1})
-      ]
-
-      origin_opts = [
-        relay: relay_name,
-        certfile: certfile,
-        keyfile: keyfile,
-        cacertfile: cacertfile,
-        port: Keyword.get(opts, :origin_port, 0),
-        ip: Keyword.get(opts, :origin_ip, {127, 0, 0, 1})
-      ]
-
       device_listener =
         if client_api_v2 do
           Supervisor.child_spec(
@@ -208,16 +188,8 @@ defmodule AttentionServer.Server do
       children = [
         Supervisor.child_spec({Relay, relay_opts}, id: :relay),
         device_listener,
-        Supervisor.child_spec({OwnerTLS, owner_opts}, id: :owner_tls),
-        Supervisor.child_spec({AgentHTTPS, agent_opts}, id: :agent_https)
+        Supervisor.child_spec({OwnerTLS, owner_opts}, id: :owner_tls)
       ]
-
-      children =
-        if Keyword.has_key?(opts, :origin_port) do
-          children ++ [Supervisor.child_spec({OriginHTTPS, origin_opts}, id: :origin_https)]
-        else
-          children
-        end
 
       children =
         if apns_opts do

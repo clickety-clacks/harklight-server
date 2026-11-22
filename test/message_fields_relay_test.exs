@@ -1,7 +1,7 @@
 defmodule AttentionServer.MessageFieldsRelayTest do
   use ExUnit.Case, async: false
 
-  alias AttentionServer.{JSON, OriginWire, Placement, Relay}
+  alias AttentionServer.{JSON, LegacyOriginWire, Placement, Relay}
 
   @handle "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 
@@ -352,7 +352,7 @@ defmodule AttentionServer.MessageFieldsRelayTest do
     assert %{
              "type" => "ok",
              "field_warnings" => [%{"field" => "answer_ui", "detail" => detail}]
-           } = OriginWire.command(relay, "origin", request)
+           } = LegacyOriginWire.command(relay, "origin", request)
 
     assert detail =~ "schema"
     assert detail =~ "member names must be unique"

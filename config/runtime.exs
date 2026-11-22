@@ -150,8 +150,6 @@ if System.get_env("ATTENTION_SERVER_ENABLE") == "1" do
     ip: bind.("ATTENTION_SERVER_BIND"),
     owner_port: System.fetch_env!("ATTENTION_SERVER_OWNER_PORT") |> String.to_integer(),
     owner_ip: bind.("ATTENTION_SERVER_OWNER_BIND"),
-    agent_port: System.fetch_env!("ATTENTION_SERVER_AGENT_PORT") |> String.to_integer(),
-    agent_ip: bind.("ATTENTION_SERVER_AGENT_BIND"),
     join_name: System.get_env("ATTENTION_SERVER_JOIN_NAME"),
     deployment_mode: deployment_mode,
     jev_score_record_path: System.get_env("ATTENTION_SERVER_JEV_SCORE_RECORD_PATH"),
@@ -166,17 +164,6 @@ if System.get_env("ATTENTION_SERVER_ENABLE") == "1" do
 
       :disabled ->
         Keyword.put(server_opts, :enrollment_enabled, false)
-    end
-
-  server_opts =
-    case System.get_env("ATTENTION_SERVER_ORIGIN_PORT") do
-      nil ->
-        server_opts
-
-      port ->
-        server_opts
-        |> Keyword.put(:origin_port, String.to_integer(port))
-        |> Keyword.put(:origin_ip, bind.("ATTENTION_SERVER_ORIGIN_BIND"))
     end
 
   server_opts =

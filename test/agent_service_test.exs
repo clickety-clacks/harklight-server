@@ -1,26 +1,28 @@
 defmodule AttentionServer.AgentServiceTest do
+  # Registered agents read and answer over client API v2 on the device port;
+  # owners register, scope and revoke them over owner TLS. The protocol 0.1
+  # agent listeners these cases first exercised are retired.
   use ExUnit.Case, async: false
 
+  import ExUnit.CaptureLog
+
   alias AttentionServer.{
-    AgentHTTPS,
-    AgentTLS,
     DeviceIdentity,
     HeadlessAgent,
     HeadlessTLS,
     JSON,
-    OwnerTLS,
     Relay,
+    Server,
     TLSFixtures
   }
 
   @agent_id "00000000-0000-4000-8000-0000000000a1"
-  @op1 "00000000-0000-4000-8000-0000000000b1"
-  @op2 "00000000-0000-4000-8000-0000000000b2"
   @handle "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 
   setup_all do
     certs = TLSFixtures.create!()
     TLSFixtures.make_self_signed_client!(certs, "b2")
+    TLSFixtures.make_self_signed_client!(certs, "agent")
     TLSFixtures.make_self_signed_client!(certs, "other-agent")
     on_exit(fn -> File.rm_rf!(certs) end)
     %{certs: certs}
@@ -31,135 +33,55 @@ defmodule AttentionServer.AgentServiceTest do
     File.mkdir_p!(dir)
     on_exit(fn -> File.rm_rf!(dir) end)
     path = Path.join(dir, "state.sqlite3")
-    {:ok, relay} = Relay.start_link(store_path: path)
-    {:ok, owner} = listener(OwnerTLS, relay, certs)
-    {:ok, agent} = listener(AgentTLS, relay, certs)
-    {:ok, agent_https} = listener(AgentHTTPS, relay, certs)
-
-    processes = [agent_https, agent, owner, relay]
-
-    # The on_exit callback runs outside this setup process. Unlink fixtures so
-    # their explicit shutdown does not race with the test process exiting.
-    Enum.each(processes, &Process.unlink/1)
-
-    on_exit(fn ->
-      for pid <- processes, Process.alive?(pid), do: GenServer.stop(pid)
-    end)
-
-    %{relay: relay, owner: owner, agent: agent, agent_https: agent_https, path: path}
+    server = start_server(path, certs)
+    %{certs: certs, path: path, server: server, relay: Server.relay(server)}
   end
 
-  test "an agent answer refreshes the waiting view and notifies supporting sessions", context do
-    %{certs: certs, relay: relay, owner: owner, agent: agent} = context
-    {:ok, person} = Relay.operator_bootstrap(relay, TLSFixtures.certificate_der!(certs, "a1"))
+  test "an agent answer on /v2 settles the person's waiting item for its devices", ctx do
+    {person, device_key} = person_with_device(ctx)
+    assert %{"type" => "ok"} = forward(ctx.relay, device_key, "app:test", "waiting", "request")
+    agent_key = register_agent(ctx, person, "agent", ["app:test"], ["app:test"])
+    assert {:ok, ^person, @agent_id, 1} = Relay.agent_identity(ctx.relay, agent_key)
 
-    {:ok, device_key} =
-      Relay.setup_device_certificate(relay, person, TLSFixtures.certificate_der!(certs, "a2"))
+    assert {:ok, 200, %{"rev" => rev, "counts" => %{"unresolved" => 1}}} =
+             get(ctx, "a2", "/v2/inbox")
 
-    assert :ok = Relay.setup_sender(relay, device_key, "app:test")
+    id = item_id(ctx, "agent", "app:test", "waiting")
 
-    assert %{"type" => "ok", "seq" => seq} =
-             forward(relay, device_key, "app:test", "waiting", "request")
+    assert {:ok, 200, %{"item" => %{"terminal" => %{"state" => "answered"}}}} =
+             answer(ctx, "agent", id, %{"request_revision" => 1, "comment" => "done"}, key(1))
 
-    {:ok, agent_key} =
-      DeviceIdentity.from_certificate(TLSFixtures.certificate_der!(certs, "unknown"))
+    assert {:ok, 200, %{"counts" => %{"unresolved" => 0}}} = get(ctx, "a2", "/v2/inbox")
+    assert {:ok, 200, %{"changes" => changes}} = get(ctx, "a2", "/v2/changes?after=#{rev}")
 
-    owner_endpoint = endpoint(certs, OwnerTLS.port(owner))
-    agent_endpoint = endpoint(certs, AgentTLS.port(agent))
-    agent_cert = Path.join(certs, "unknown.pem")
-    agent_private = Path.join(certs, "unknown.key")
+    assert [%{"item_id" => ^id, "terminal" => terminal}] =
+             for(%{"kind" => "item", "data" => item} <- changes, do: item)
 
-    assert %{"ok" => true} =
-             owner_request(owner_endpoint, certs, "a1", person, %{
-               "type" => "agent_register",
-               "agent_id" => @agent_id,
-               "key_fingerprint" => agent_key
-             })
-
-    assert %{"ok" => true} =
-             owner_request(owner_endpoint, certs, "a1", person, %{
-               "type" => "agent_grants_replace",
-               "key_fingerprint" => agent_key,
-               "expected_revision" => 1,
-               "read_grants" => ["app:test"],
-               "respond_grants" => ["app:test"]
-             })
-
-    assert {:ok, supporting} = Relay.open_websocket_session(relay, device_key, nil, nil)
-
-    assert %{"type" => "resynced"} =
-             session_request(relay, supporting, %{"type" => "resync", "since" => 0})
-             |> List.last()
-
-    before = hd(session_request(relay, supporting, %{"type" => "view_get", "ref" => "before"}))
-    assert Enum.map(before["entries"], & &1["message_id"]) == ["waiting"]
-
-    assert %{"type" => "answer_result", "ok" => true} =
-             agent_request(
-               agent_endpoint,
-               agent_cert,
-               agent_private,
-               answer("app:test", "waiting", seq, unique_op(), "answered")
-             )
-
-    after_answer =
-      hd(session_request(relay, supporting, %{"type" => "view_get", "ref" => "after"}))
-
-    assert after_answer["entries"] == []
-    refute after_answer["view_rev"] == before["view_rev"]
-
-    assert [%{"type" => "view_changed", "view_rev" => notice_revision}] =
-             session_drain(relay, supporting)
-             |> Enum.filter(&(&1["type"] == "view_changed"))
-
-    assert notice_revision == after_answer["view_rev"]
+    assert %{"state" => "answered", "answer" => %{"kind" => "reply", "text" => "done"}} =
+             terminal
   end
 
-  test "authorized agents read every sender while responses remain scoped and cursors stay durable",
-       context do
-    %{certs: certs, relay: relay, owner: owner, agent: agent, path: path} = context
-    {:ok, person} = Relay.operator_bootstrap(relay, TLSFixtures.certificate_der!(certs, "a1"))
-    {:ok, other} = Relay.operator_bootstrap(relay, TLSFixtures.certificate_der!(certs, "b1"))
-
-    {:ok, device_key} =
-      Relay.setup_device_certificate(relay, person, TLSFixtures.certificate_der!(certs, "a2"))
-
-    {:ok, b_device} =
-      Relay.setup_device_certificate(relay, other, TLSFixtures.certificate_der!(certs, "b2"))
-
-    {:ok, agent_key} =
-      DeviceIdentity.from_certificate(TLSFixtures.certificate_der!(certs, "unknown"))
+  test "registered agents read only their own person while answers stay scoped and durable",
+       ctx do
+    {person, device_key} = person_with_device(ctx)
+    {:ok, other} = Relay.operator_bootstrap(ctx.relay, der(ctx, "b1"))
+    {:ok, b_device} = Relay.setup_device_certificate(ctx.relay, other, der(ctx, "b2"))
 
     for sender <- ~w(app:test app:private app:sub/x),
-        do: assert(:ok = Relay.setup_sender(relay, device_key, sender))
+        do: assert(:ok = Relay.setup_sender(ctx.relay, device_key, sender))
 
-    assert :ok = Relay.setup_sender(relay, b_device, "app:test")
+    assert :ok = Relay.setup_sender(ctx.relay, b_device, "app:test")
+    assert %{"seq" => 1} = forward(ctx.relay, device_key, "app:test", "one", "printer jam")
+    assert %{"seq" => 2} = forward(ctx.relay, device_key, "app:private", "hidden", "secret")
+    assert %{"seq" => 3} = forward(ctx.relay, device_key, "app:sub/x", "three", "other")
+    assert %{"seq" => 1} = forward(ctx.relay, b_device, "app:test", "one", "B printer jam")
 
-    assert %{"type" => "ok", "seq" => 1} =
-             forward(relay, device_key, "app:test", "one", "printer jam")
-
-    assert %{"type" => "ok", "seq" => 2} =
-             forward(relay, device_key, "app:private", "hidden", "printer jam secret")
-
-    assert %{"type" => "ok", "seq" => 3} =
-             forward(relay, device_key, "app:sub/x", "three", "other")
-
-    assert %{"type" => "ok", "seq" => 1} =
-             forward(relay, b_device, "app:test", "one", "B printer jam")
-
-    agent_endpoint = endpoint(certs, AgentTLS.port(agent))
-    owner_endpoint = endpoint(certs, OwnerTLS.port(owner))
-    cert = Path.join(certs, "unknown.pem")
-    private = Path.join(certs, "unknown.key")
-
-    assert {:error, _} =
-             HeadlessTLS.agent_request(agent_endpoint, cert, private, %{
-               "v" => 1,
-               "type" => "search"
-             })
+    {:ok, agent_key} = DeviceIdentity.from_certificate(der(ctx, "agent"))
+    {:ok, owner_key} = DeviceIdentity.from_certificate(der(ctx, "a1"))
+    assert {:error, _} = quietly(fn -> get(ctx, "agent", "/v2/search") end)
 
     assert %{"ok" => true} =
-             owner_request(owner_endpoint, certs, "a1", person, %{
+             owner_request(ctx, "a1", person, %{
                "type" => "agent_register",
                "agent_id" => @agent_id,
                "key_fingerprint" => agent_key
@@ -168,57 +90,40 @@ defmodule AttentionServer.AgentServiceTest do
     assert %{
              "ok" => true,
              "agents" => [%{"read_grants" => [], "respond_grants" => [], "grant_revision" => 1}]
-           } =
-             owner_request(owner_endpoint, certs, "a1", person, %{"type" => "agent_list"})
+           } = owner_request(ctx, "a1", person, %{"type" => "agent_list"})
 
-    assert {:ok,
-            %{
-              "items" => [
-                %{"sender_id" => "app:sub/x", "message_id" => "three"},
-                %{"sender_id" => "app:private", "message_id" => "hidden"},
-                %{"sender_id" => "app:test", "message_id" => "one"}
-              ],
-              "next_cursor" => nil,
-              "initial_high_water" => 3
-            }} =
-             HeadlessTLS.agent_request(agent_endpoint, cert, private, %{
-               "v" => 1,
-               "type" => "search"
-             })
+    # Empty grants read every sender of the agent's own person, never another's.
+    assert {:ok, 200, %{"items" => items}} = get(ctx, "agent", "/v2/search")
 
-    assert %{"item" => %{"message_id" => "one", "sender_id" => "app:test"}} =
-             agent_request(agent_endpoint, cert, private, %{
-               "v" => 1,
-               "type" => "get",
-               "sender_id" => "app:test",
-               "message_id" => "one"
-             })
+    assert Enum.map(items, &{&1["sender"], &1["message"]["message_id"]}) == [
+             {"app:sub/x", "three"},
+             {"app:private", "hidden"},
+             {"app:test", "one"}
+           ]
 
-    assert %{
-             "initial_high_water" => 3,
-             "items" => [
-               %{"sender_id" => "app:sub/x", "message_id" => "three"},
-               %{"sender_id" => "app:private", "message_id" => "hidden"},
-               %{"sender_id" => "app:test", "message_id" => "one"}
-             ],
-             "next_cursor" => nil
-           } =
-             agent_request(agent_endpoint, cert, private, %{
-               "v" => 1,
-               "type" => "search"
-             })
+    one = item_id(ctx, "agent", "app:test", "one")
 
-    assert %{"ok" => true} =
-             owner_request(owner_endpoint, certs, "a1", person, %{
+    assert {:ok, 200, %{"item" => %{"message" => %{"unknown" => %{"text" => "printer jam"}}}}} =
+             get(ctx, "agent", "/v2/items/" <> one)
+
+    assert %{"error" => "not_found"} =
+             owner_request(ctx, "b1", other, %{
                "type" => "agent_grants_replace",
                "key_fingerprint" => agent_key,
                "expected_revision" => 1,
-               "read_grants" => ["app:test", "app:sub/"],
-               "respond_grants" => []
+               "read_grants" => ["app:private"],
+               "respond_grants" => ["app:private"]
              })
 
+    replace_grants(ctx, person, agent_key, 1, ["app:test", "app:sub/"], [])
+    body = %{"request_revision" => 1}
+
+    assert {:ok, 403, %{"error" => "forbidden"}} = answer(ctx, "agent", one, body, key(1))
+
+    replace_grants(ctx, person, agent_key, 2, ["app:test"], ["app:test"])
+
     assert %{"error" => "not_found"} =
-             owner_request(owner_endpoint, certs, "b1", other, %{
+             owner_request(ctx, "a1", person, %{
                "type" => "agent_grants_replace",
                "key_fingerprint" => agent_key,
                "expected_revision" => 2,
@@ -226,126 +131,8 @@ defmodule AttentionServer.AgentServiceTest do
                "respond_grants" => ["app:private"]
              })
 
-    first =
-      agent_request(agent_endpoint, cert, private, %{"v" => 1, "type" => "search", "limit" => 1})
-
-    assert %{
-             "items" => [%{"sender_id" => "app:sub/x", "state" => "open"}],
-             "next_cursor" => cursor
-           } = first
-
-    assert is_binary(cursor)
-
-    second =
-      agent_request(agent_endpoint, cert, private, %{
-        "v" => 1,
-        "type" => "search",
-        "limit" => 1,
-        "cursor" => cursor
-      })
-
-    assert %{
-             "items" => [%{"sender_id" => "app:private", "message_id" => "hidden"}],
-             "next_cursor" => next_cursor
-           } = second
-
-    third =
-      agent_request(agent_endpoint, cert, private, %{
-        "v" => 1,
-        "type" => "search",
-        "limit" => 1,
-        "cursor" => next_cursor
-      })
-
-    assert %{"items" => [%{"message_id" => "one"}], "next_cursor" => nil} = third
-
-    assert %{"items" => [%{"message_id" => "hidden"}, %{"message_id" => "one"}]} =
-             agent_request(agent_endpoint, cert, private, %{
-               "v" => 1,
-               "type" => "search",
-               "contains" => "printer jam"
-             })
-
-    # A limit above the page maximum is clamped, not refused.
-    assert %{"items" => [%{"message_id" => "hidden"}, %{"message_id" => "one"}]} =
-             agent_request(agent_endpoint, cert, private, %{
-               "v" => 1,
-               "type" => "search",
-               "contains" => "printer jam",
-               "limit" => 500
-             })
-
-    assert %{"item" => %{"message_id" => "hidden", "sender_id" => "app:private"}} =
-             agent_request(agent_endpoint, cert, private, %{
-               "v" => 1,
-               "type" => "get",
-               "sender_id" => "app:private",
-               "message_id" => "hidden"
-             })
-
-    assert %{"items" => [%{"message_id" => "hidden", "sender_id" => "app:private"}]} =
-             agent_request(agent_endpoint, cert, private, %{
-               "v" => 1,
-               "type" => "search",
-               "sender_id" => "app:private",
-               "message_id" => "hidden"
-             })
-
-    assert %{"error" => "not_found"} =
-             agent_request(agent_endpoint, cert, private, %{
-               "v" => 1,
-               "type" => "search",
-               "sender_id" => "app:test",
-               "message_id" => "absent"
-             })
-
-    read_only = answer("app:test", "one", 1, @op1, nil)
-    assert %{"error" => "forbidden"} = agent_request(agent_endpoint, cert, private, read_only)
-
-    assert {:ok, staged} =
-             :ssl.connect({127, 0, 0, 1}, AgentTLS.port(agent),
-               versions: [:"tlsv1.3"],
-               verify: :verify_peer,
-               cacertfile: String.to_charlist(Path.join(certs, "ca.pem")),
-               certfile: String.to_charlist(cert),
-               keyfile: String.to_charlist(private),
-               server_name_indication: ~c"relay.test",
-               session_tickets: :disabled,
-               active: false,
-               mode: :binary,
-               packet: :line
-             )
-
-    assert %{"ok" => true} =
-             owner_request(owner_endpoint, certs, "a1", person, %{
-               "type" => "agent_grants_replace",
-               "key_fingerprint" => agent_key,
-               "expected_revision" => 2,
-               "read_grants" => ["app:test"],
-               "respond_grants" => ["app:test"]
-             })
-
-    assert :ok =
-             :ssl.send(
-               staged,
-               JSON.encode!(%{
-                 "v" => 1,
-                 "type" => "get",
-                 "sender_id" => "app:sub/x",
-                 "message_id" => "three"
-               }) <> "\n"
-             )
-
-    assert {:ok, staged_reply} = :ssl.recv(staged, 0, 3_000)
-    assert {:ok, %{"item" => %{"message_id" => "three", "sender_id" => "app:sub/x"}}} =
-             JSON.decode_line(staged_reply)
-    :ssl.close(staged)
-
-    {:ok, owner_key} =
-      DeviceIdentity.from_certificate(TLSFixtures.certificate_der!(certs, "a1"))
-
     assert %{grant_revision: 3, grant_history: history} =
-             :sys.get_state(relay).store.engine.agents[agent_key]
+             :sys.get_state(ctx.relay).store.engine.agents[agent_key]
 
     assert Enum.map(history, &{&1.revision, &1.action, &1.actor}) == [
              {1, "register", owner_key},
@@ -353,287 +140,121 @@ defmodule AttentionServer.AgentServiceTest do
              {3, "replace", owner_key}
            ]
 
-    assert %{"error" => "not_found"} =
-             owner_request(owner_endpoint, certs, "a1", person, %{
-               "type" => "agent_grants_replace",
-               "key_fingerprint" => agent_key,
-               "expected_revision" => 2,
-               "read_grants" => ["app:private"],
-               "respond_grants" => ["app:private"]
-             })
+    assert {:ok, 200, %{"item" => %{"terminal" => answered}}, false} =
+             answer_with_replay(ctx, "agent", one, body, key(2))
 
-    assert :sys.get_state(relay).store.engine.agents[agent_key].grant_revision == 3
+    assert %{"state" => "answered", "answer" => %{"kind" => "no_comment"}} = answered
+    assert {:ok, 200, _, true} = answer_with_replay(ctx, "agent", one, body, key(2))
 
-    assert %{"error" => "stale_query"} =
-             agent_request(agent_endpoint, cert, private, %{
-               "v" => 1,
-               "type" => "search",
-               "limit" => 1,
-               "cursor" => cursor
-             })
+    assert {:ok, 409, %{"error" => "already_answered"}} =
+             answer(ctx, "agent", one, %{"request_revision" => 1, "comment" => "late"}, key(3))
 
-    assert %{"error" => "stale_target"} =
-             agent_request(agent_endpoint, cert, private, %{read_only | "acceptance_seq" => 999})
+    server = restart(ctx)
+    restarted = %{ctx | server: server, relay: Server.relay(server)}
 
-    # An answer needs no `deliberate` or `intent_ref`; a retry that still
-    # carries them is the same operation.
-    without_intent = Map.drop(read_only, ["deliberate", "intent_ref"])
+    assert %{grant_revision: 3, grant_history: ^history} =
+             :sys.get_state(restarted.relay).store.engine.agents[agent_key]
 
-    assert %{"type" => "answer_result", "ok" => true, "seq" => 4} =
-             agent_request(agent_endpoint, cert, private, without_intent)
+    assert {:ok, 200, %{"item" => %{"terminal" => ^answered}}, true} =
+             answer_with_replay(restarted, "agent", one, body, key(2))
 
-    assert %{"type" => "answer_result", "duplicate" => true, "seq" => 4} =
-             agent_request(agent_endpoint, cert, private, read_only)
-
-    assert %{"type" => "answer_result", "duplicate" => true, "seq" => 4} =
-             agent_request(agent_endpoint, cert, private, without_intent)
-
-    assert %{"error" => "closed"} =
-             agent_request(
-               agent_endpoint,
-               cert,
-               private,
-               answer("app:test", "one", 1, @op2, "late")
-             )
-
-    assert %{
-             "item" => %{
-               "state" => "answered",
-               "answer" => nil,
-               "terminal_seq" => 4,
-               "source_status" => "unreported"
-             }
-           } =
-             agent_request(agent_endpoint, cert, private, %{
-               "v" => 1,
-               "type" => "get",
-               "sender_id" => "app:test",
-               "message_id" => "one"
-             })
-
-    assert {:ok, [origin | _], 4} = Relay.events(relay, device_key, 0)
-    refute Map.has_key?(origin, "message")
-
-    GenServer.stop(agent)
-    GenServer.stop(owner)
-    GenServer.stop(relay)
-    {:ok, restarted} = Relay.start_link(store_path: path)
-    {:ok, agent_restarted} = listener(AgentTLS, restarted, certs)
-
-    on_exit(fn ->
-      if Process.alive?(agent_restarted), do: GenServer.stop(agent_restarted)
-      if Process.alive?(restarted), do: GenServer.stop(restarted)
-    end)
-
-    restarted_endpoint = endpoint(certs, AgentTLS.port(agent_restarted))
-
-    assert %{grant_revision: 3, grant_history: persisted_history} =
-             :sys.get_state(restarted).store.engine.agents[agent_key]
-
-    assert persisted_history == history
-
-    assert %{"type" => "answer_result", "duplicate" => true, "seq" => 4} =
-             agent_request(restarted_endpoint, cert, private, read_only)
-
-    assert %{"item" => %{"answer" => nil}} =
-             agent_request(restarted_endpoint, cert, private, %{
-               "v" => 1,
-               "type" => "get",
-               "sender_id" => "app:test",
-               "message_id" => "one"
-             })
+    assert {:ok, 200, %{"item" => %{"terminal" => ^answered}}} =
+             get(restarted, "agent", "/v2/items/" <> one)
   end
 
-  test "agent admission is distinct from devices and a revoked staged TLS peer cannot disclose content",
-       context do
-    %{certs: certs, relay: relay, owner: owner, agent: agent} = context
-    {:ok, person} = Relay.operator_bootstrap(relay, TLSFixtures.certificate_der!(certs, "a1"))
-
-    {:ok, device_key} =
-      Relay.setup_device_certificate(relay, person, TLSFixtures.certificate_der!(certs, "a2"))
-
-    {:ok, agent_key} =
-      DeviceIdentity.from_certificate(TLSFixtures.certificate_der!(certs, "unknown"))
-
-    assert :ok = Relay.setup_sender(relay, device_key, "app:test")
-    assert %{"type" => "ok"} = forward(relay, device_key, "app:test", "secret", "private text")
-    agent_endpoint = endpoint(certs, AgentTLS.port(agent))
-    owner_endpoint = endpoint(certs, OwnerTLS.port(owner))
+  test "agent admission refuses device keys, expired certificates and revoked keys", ctx do
+    {person, device_key} = person_with_device(ctx)
+    assert %{"type" => "ok"} = forward(ctx.relay, device_key, "app:test", "secret", "private")
 
     assert %{"error" => "not_found"} =
-             owner_request(owner_endpoint, certs, "a1", person, %{
+             owner_request(ctx, "a1", person, %{
                "type" => "agent_register",
                "agent_id" => @agent_id,
                "key_fingerprint" => device_key
              })
 
-    assert %{"ok" => true} =
-             owner_request(owner_endpoint, certs, "a1", person, %{
-               "type" => "agent_register",
-               "agent_id" => @agent_id,
-               "key_fingerprint" => agent_key
-             })
+    agent_key = register_agent(ctx, person, "agent", ["app:test"], ["app:test"])
+    assert {:error, :forbidden} = Relay.acknowledged_cursor(ctx.relay, agent_key)
+    {:ok, expired_key} = DeviceIdentity.from_certificate(der(ctx, "expired"))
 
     assert %{"ok" => true} =
-             owner_request(owner_endpoint, certs, "a1", person, %{
-               "type" => "agent_grants_replace",
-               "key_fingerprint" => agent_key,
-               "expected_revision" => 1,
-               "read_grants" => ["app:test"],
-               "respond_grants" => ["app:test"]
-             })
-
-    assert {:error, :forbidden} = Relay.acknowledged_cursor(relay, agent_key)
-
-    {:ok, expired_key} =
-      DeviceIdentity.from_certificate(TLSFixtures.certificate_der!(certs, "expired"))
-
-    assert %{"ok" => true} =
-             owner_request(owner_endpoint, certs, "a1", person, %{
+             owner_request(ctx, "a1", person, %{
                "type" => "agent_register",
                "agent_id" => "00000000-0000-4000-8000-0000000000a2",
                "key_fingerprint" => expired_key
              })
 
-    assert {:error, _} =
-             HeadlessTLS.agent_request(
-               agent_endpoint,
-               Path.join(certs, "expired.pem"),
-               Path.join(certs, "expired.key"),
-               %{"v" => 1, "type" => "search"}
-             )
-
-    assert {:error, _} =
-             HeadlessTLS.agent_request(
-               agent_endpoint,
-               Path.join(certs, "unknown.pem"),
-               Path.join(certs, "a2.key"),
-               %{"v" => 1, "type" => "search"}
-             )
-
-    assert {:error, _} =
-             HeadlessTLS.agent_request(
-               agent_endpoint,
-               Path.join(certs, "a2.pem"),
-               Path.join(certs, "a2.key"),
-               %{"v" => 1, "type" => "get", "sender_id" => "app:test", "message_id" => "secret"}
-             )
-
-    assert {:ok, socket} =
-             :ssl.connect({127, 0, 0, 1}, AgentTLS.port(agent),
-               versions: [:"tlsv1.3"],
-               verify: :verify_peer,
-               cacertfile: String.to_charlist(Path.join(certs, "ca.pem")),
-               certfile: String.to_charlist(Path.join(certs, "unknown.pem")),
-               keyfile: String.to_charlist(Path.join(certs, "unknown.key")),
-               server_name_indication: ~c"relay.test",
-               session_tickets: :disabled,
-               active: false,
-               mode: :binary,
-               packet: :line
-             )
+    assert {:error, _} = quietly(fn -> get(ctx, "expired", "/v2/search") end)
+    id = item_id(ctx, "agent", "app:test", "secret")
+    assert {:ok, conn} = connect(ctx, "agent")
+    assert {:ok, conn, %{status: 200}} = request(conn, "GET", "/v2/items/" <> id)
 
     assert %{"ok" => true} =
-             owner_request(owner_endpoint, certs, "a1", person, %{
+             owner_request(ctx, "a1", person, %{
                "type" => "agent_revoke",
                "key_fingerprint" => agent_key
              })
 
-    query =
-      JSON.encode!(%{
-        "v" => 1,
-        "type" => "get",
-        "sender_id" => "app:test",
-        "message_id" => "secret"
-      }) <> "\n"
+    # The already-open connection gets no content and cannot answer: the next
+    # request is refused and the server may then close the connection.
+    assert {:ok, conn, %{status: 401}} = request(conn, "GET", "/v2/items/" <> id)
 
-    assert :ok = :ssl.send(socket, query)
-    assert {:error, _} = :ssl.recv(socket, 0, 3_000)
-    :ssl.close(socket)
+    late =
+      request(
+        conn,
+        "POST",
+        "/v2/items/" <> id <> "/answer",
+        [{"idempotency-key", key(1)}],
+        JSON.encode!(%{"request_revision" => 1})
+      )
 
-    assert {:error, _} =
-             HeadlessTLS.agent_request(
-               agent_endpoint,
-               Path.join(certs, "unknown.pem"),
-               Path.join(certs, "unknown.key"),
-               %{"v" => 1, "type" => "search"}
-             )
+    assert match?({:ok, _, %{status: 401}}, late) or match?({:error, _, _}, late)
+
+    assert {:ok, 200, %{"item" => %{"terminal" => nil}}} = get(ctx, "a2", "/v2/items/" <> id)
+    assert {:error, _} = quietly(fn -> get(ctx, "agent", "/v2/search") end)
   end
 
   test "headless self-signed service key is usable only after exact owner registration",
-       context do
-    %{certs: certs, relay: relay, owner: owner, agent_https: agent_https, path: path} = context
-    {:ok, person} = Relay.operator_bootstrap(relay, TLSFixtures.certificate_der!(certs, "a1"))
-    directory = Path.join(Path.dirname(path), "service-key")
+       ctx do
+    {person, device_key} = person_with_device(ctx)
+    assert %{"type" => "ok"} = forward(ctx.relay, device_key, "app:test", "question", "text")
+    directory = Path.join(Path.dirname(ctx.path), "service-key")
     assert {:ok, fingerprint} = HeadlessAgent.create_identity(directory)
     assert byte_size(fingerprint) == 64
     assert {:error, :existing_identity} = HeadlessAgent.create_identity(directory)
     assert {:ok, stat} = File.stat(Path.join(directory, "identity.key"))
     assert Bitwise.band(stat.mode, 0o777) == 0o600
-    agent_endpoint = endpoint(certs, AgentHTTPS.port(agent_https))
+    identity = {Path.join(directory, "identity.pem"), Path.join(directory, "identity.key")}
 
-    assert {:error, _} = HeadlessAgent.request(directory, agent_endpoint, %{"type" => "search"})
+    assert {:error, _} =
+             quietly(fn -> HeadlessTLS.v2_get(endpoint(ctx), identity, "/v2/search") end)
 
     assert %{"ok" => true} =
-             owner_request(endpoint(certs, OwnerTLS.port(owner)), certs, "a1", person, %{
+             owner_request(ctx, "a1", person, %{
                "type" => "agent_register",
                "agent_id" => @agent_id,
                "key_fingerprint" => fingerprint
              })
 
-    assert {:ok, %{"type" => "ok", "items" => []}} =
-             HeadlessAgent.request(directory, agent_endpoint, %{"type" => "search"})
+    assert {:ok, 200, %{"items" => [%{"item_id" => id}]}} =
+             HeadlessTLS.v2_get(endpoint(ctx), identity, "/v2/search")
 
-    assert {:error, {:application, "forbidden", %{"type" => "error"}}} =
-             HeadlessAgent.request(directory, agent_endpoint, %{
-               "type" => "respond",
-               "sender_id" => "app:test",
-               "message_id" => "unknown",
-               "acceptance_seq" => 1,
-               "op_id" => @op1,
-               "deliberate" => true,
-               "intent_ref" => "explicit-user-instruction",
-               "answer" => nil
-             })
+    assert {:ok, 403, _headers, %{"error" => "forbidden"}} =
+             HeadlessTLS.v2_request(
+               endpoint(ctx),
+               identity,
+               "POST",
+               "/v2/items/" <> id <> "/answer",
+               [{"content-type", "application/json"}, {"idempotency-key", key(1)}],
+               JSON.encode!(%{"request_revision" => 1})
+             )
   end
 
-  test "a concurrent device close and authenticated agent answer commit one terminal winner",
-       context do
-    %{certs: certs, relay: relay, owner: owner, agent: agent} = context
-    {:ok, person} = Relay.operator_bootstrap(relay, TLSFixtures.certificate_der!(certs, "a1"))
-
-    {:ok, device_key} =
-      Relay.setup_device_certificate(relay, person, TLSFixtures.certificate_der!(certs, "a2"))
-
-    {:ok, agent_key} =
-      DeviceIdentity.from_certificate(TLSFixtures.certificate_der!(certs, "unknown"))
-
-    assert :ok = Relay.setup_sender(relay, device_key, "app:test")
-
-    assert %{"type" => "ok", "seq" => 1} =
-             forward(relay, device_key, "app:test", "race", "race content")
-
-    owner_endpoint = endpoint(certs, OwnerTLS.port(owner))
-
-    assert %{"ok" => true} =
-             owner_request(owner_endpoint, certs, "a1", person, %{
-               "type" => "agent_register",
-               "agent_id" => @agent_id,
-               "key_fingerprint" => agent_key
-             })
-
-    assert %{"ok" => true} =
-             owner_request(owner_endpoint, certs, "a1", person, %{
-               "type" => "agent_grants_replace",
-               "key_fingerprint" => agent_key,
-               "expected_revision" => 1,
-               "read_grants" => ["app:test"],
-               "respond_grants" => ["app:test"]
-             })
-
-    agent_endpoint = endpoint(certs, AgentTLS.port(agent))
-    cert = Path.join(certs, "unknown.pem")
-    key = Path.join(certs, "unknown.key")
+  test "a concurrent device close and agent answer commit one terminal winner", ctx do
+    {person, device_key} = person_with_device(ctx)
+    assert %{"seq" => 1} = forward(ctx.relay, device_key, "app:test", "race", "race content")
+    register_agent(ctx, person, "agent", ["app:test"], ["app:test"])
+    id = item_id(ctx, "agent", "app:test", "race")
     parent = self()
 
     answer_task =
@@ -641,13 +262,7 @@ defmodule AttentionServer.AgentServiceTest do
         send(parent, :answer_ready)
 
         receive do
-          :go ->
-            agent_request(
-              agent_endpoint,
-              cert,
-              key,
-              answer("app:test", "race", 1, @op1, %{"choice" => "yes"})
-            )
+          :go -> answer(ctx, "agent", id, %{"request_revision" => 1}, key(1))
         end
       end)
 
@@ -657,19 +272,15 @@ defmodule AttentionServer.AgentServiceTest do
 
         receive do
           :go ->
-            frame = %{
+            device_request(ctx.relay, device_key, %{
               "v" => 1,
               "type" => "lifecycle",
-              "op_id" => @op2,
+              "op_id" => unique_op(),
               "sender_id" => "app:test",
               "message_id" => "race",
               "state" => "cleared",
               "at" => 1
-            }
-
-            {:ok, line} = Relay.request_line(relay, device_key, JSON.encode!(frame) <> "\n")
-            {:ok, reply} = JSON.decode_line(line)
-            reply
+            })
         end
       end)
 
@@ -679,35 +290,25 @@ defmodule AttentionServer.AgentServiceTest do
     send(close_task.pid, :go)
     answer_result = Task.await(answer_task, 10_000)
     close_result = Task.await(close_task, 10_000)
-    winners = Enum.count([answer_result, close_result], &(&1["seq"] == 2))
-    assert winners == 1
 
-    assert Enum.count(
-             [answer_result, close_result],
-             &(&1["error"] == "closed" or &1["reason"] == "closed")
-           ) == 1
+    answered? = match?({:ok, 200, _}, answer_result)
+    closed? = match?(%{"type" => "ok", "seq" => 2}, close_result)
+    assert answered? != closed?
 
-    assert %{"item" => %{"terminal_seq" => 2, "state" => state}} =
-             agent_request(agent_endpoint, cert, key, %{
-               "v" => 1,
-               "type" => "get",
-               "sender_id" => "app:test",
-               "message_id" => "race"
-             })
+    if answered?,
+      do: assert(%{"reason" => "closed"} = close_result),
+      else: assert({:ok, 409, %{"error" => "already_" <> _}} = answer_result)
+
+    assert {:ok, 200, %{"item" => %{"terminal" => %{"state" => state}}}} =
+             get(ctx, "agent", "/v2/items/" <> id)
 
     assert state in ["answered", "cleared"]
-    assert :sys.get_state(relay).store.engine.persons[person] == 2
+    assert :sys.get_state(ctx.relay).store.engine.persons[person] == 2
   end
 
   test "headless owner CLI requires explicit exact-key registration and scoped replacement",
-       context do
-    %{
-      certs: certs,
-      relay: relay,
-      owner: owner,
-      path: path
-    } = context
-
+       ctx do
+    %{certs: certs, relay: relay, path: path} = ctx
     {:ok, person} = Relay.operator_bootstrap(relay, TLSFixtures.certificate_der!(certs, "a1"))
     directory = Path.join(Path.dirname(path), "cli-agent")
     assert {:ok, fingerprint} = HeadlessAgent.create_identity(directory)
@@ -721,7 +322,7 @@ defmodule AttentionServer.AgentServiceTest do
       "--name",
       "relay.test",
       "--port",
-      Integer.to_string(OwnerTLS.port(owner)),
+      Integer.to_string(Server.owner_port(ctx.server)),
       "--ca",
       Path.join(certs, "ca.pem"),
       "--cert",
@@ -766,18 +367,9 @@ defmodule AttentionServer.AgentServiceTest do
     assert MapSet.member?(respond, "app:ops/questions")
   end
 
-  test "literal content search visits JSON string values but not nested decimal or integer tokens",
-       context do
-    %{certs: certs, relay: relay, owner: owner, agent: agent} = context
-    {:ok, person} = Relay.operator_bootstrap(relay, TLSFixtures.certificate_der!(certs, "a1"))
-
-    {:ok, device_key} =
-      Relay.setup_device_certificate(relay, person, TLSFixtures.certificate_der!(certs, "a2"))
-
-    {:ok, agent_key} =
-      DeviceIdentity.from_certificate(TLSFixtures.certificate_der!(certs, "unknown"))
-
-    assert :ok = Relay.setup_sender(relay, device_key, "app:test")
+  test "literal search visits JSON string values but not nested decimal or integer tokens",
+       ctx do
+    {person, device_key} = person_with_device(ctx)
     decimal = %JSON.DecimalToken{raw: "0.123456789012345678901234567890"}
     large = 9_007_199_254_740_993
 
@@ -785,83 +377,30 @@ defmodule AttentionServer.AgentServiceTest do
           {"numbers", [%{"amount" => decimal, "integer" => large}]},
           {"string", [%{"description" => decimal.raw}]}
         ] do
-      assert %{"type" => "ok"} =
-               device_request(relay, device_key, %{
-                 "v" => 1,
-                 "type" => "forward",
-                 "op_id" => unique_op(),
-                 "message" => %{
-                   "sender_id" => "app:test",
-                   "message_id" => id,
-                   "created_at" => 1,
-                   "title" => "item",
-                   "unknown" => %{"nested" => nested}
-                 }
-               })
+      assert %{"type" => "ok"} = forward_message(ctx.relay, device_key, message(id, nested))
     end
 
-    owner_endpoint = endpoint(certs, OwnerTLS.port(owner))
+    register_agent(ctx, person, "agent", ["app:test"], [])
 
-    assert %{"ok" => true} =
-             owner_request(owner_endpoint, certs, "a1", person, %{
-               "type" => "agent_register",
-               "agent_id" => @agent_id,
-               "key_fingerprint" => agent_key
-             })
+    assert {:ok, 200, %{"items" => [%{"message" => %{"message_id" => "string"}}]}} =
+             get(ctx, "agent", "/v2/search?q=" <> decimal.raw)
 
-    assert %{"ok" => true} =
-             owner_request(owner_endpoint, certs, "a1", person, %{
-               "type" => "agent_grants_replace",
-               "key_fingerprint" => agent_key,
-               "expected_revision" => 1,
-               "read_grants" => ["app:test"],
-               "respond_grants" => []
-             })
-
-    agent_endpoint = endpoint(certs, AgentTLS.port(agent))
-    cert = Path.join(certs, "unknown.pem")
-    private = Path.join(certs, "unknown.key")
-
-    assert %{"items" => [%{"message_id" => "string"}]} =
-             agent_request(agent_endpoint, cert, private, %{
-               "v" => 1,
-               "type" => "search",
-               "contains" => decimal.raw
-             })
-
-    assert %{"items" => []} =
-             agent_request(agent_endpoint, cert, private, %{
-               "v" => 1,
-               "type" => "search",
-               "contains" => Integer.to_string(large)
-             })
+    assert {:ok, 200, %{"items" => []}} =
+             get(ctx, "agent", "/v2/search?q=" <> Integer.to_string(large))
   end
 
-  test "the same agent UUID belongs independently to two people across restart", context do
-    %{certs: certs, relay: relay, owner: owner, agent: agent, path: path} = context
-    {:ok, person_a} = Relay.operator_bootstrap(relay, TLSFixtures.certificate_der!(certs, "a1"))
-    {:ok, person_b} = Relay.operator_bootstrap(relay, TLSFixtures.certificate_der!(certs, "b1"))
-
-    {:ok, device_a} =
-      Relay.setup_device_certificate(relay, person_a, TLSFixtures.certificate_der!(certs, "a2"))
-
-    {:ok, device_b} =
-      Relay.setup_device_certificate(relay, person_b, TLSFixtures.certificate_der!(certs, "b2"))
-
-    {:ok, key_a} = DeviceIdentity.from_certificate(TLSFixtures.certificate_der!(certs, "unknown"))
-
-    {:ok, key_b} =
-      DeviceIdentity.from_certificate(TLSFixtures.certificate_der!(certs, "other-agent"))
-
-    assert :ok = Relay.setup_sender(relay, device_a, "app:test")
-    assert :ok = Relay.setup_sender(relay, device_b, "app:test")
-    assert %{"type" => "ok"} = forward(relay, device_a, "app:test", "shared", "A only")
-    assert %{"type" => "ok"} = forward(relay, device_b, "app:test", "shared", "B only")
-
-    owner_endpoint = endpoint(certs, OwnerTLS.port(owner))
+  test "the same agent UUID belongs independently to two people across restart", ctx do
+    {person_a, device_a} = person_with_device(ctx)
+    {:ok, person_b} = Relay.operator_bootstrap(ctx.relay, der(ctx, "b1"))
+    {:ok, device_b} = Relay.setup_device_certificate(ctx.relay, person_b, der(ctx, "b2"))
+    {:ok, key_a} = DeviceIdentity.from_certificate(der(ctx, "agent"))
+    {:ok, key_b} = DeviceIdentity.from_certificate(der(ctx, "other-agent"))
+    assert :ok = Relay.setup_sender(ctx.relay, device_b, "app:test")
+    assert %{"type" => "ok"} = forward(ctx.relay, device_a, "app:test", "shared", "A only")
+    assert %{"type" => "ok"} = forward(ctx.relay, device_b, "app:test", "shared", "B only")
 
     assert %{"ok" => true} =
-             owner_request(owner_endpoint, certs, "a1", person_a, %{
+             owner_request(ctx, "a1", person_a, %{
                "type" => "agent_register",
                "agent_id" => @agent_id,
                "key_fingerprint" => key_a
@@ -869,306 +408,108 @@ defmodule AttentionServer.AgentServiceTest do
 
     # A registered key remains globally exclusive even when B uses the same UUID.
     assert %{"error" => "not_found"} =
-             owner_request(owner_endpoint, certs, "b1", person_b, %{
+             owner_request(ctx, "b1", person_b, %{
                "type" => "agent_register",
                "agent_id" => @agent_id,
                "key_fingerprint" => key_a
              })
 
     assert %{"ok" => true} =
-             owner_request(owner_endpoint, certs, "b1", person_b, %{
+             owner_request(ctx, "b1", person_b, %{
                "type" => "agent_register",
                "agent_id" => @agent_id,
                "key_fingerprint" => key_b
              })
 
-    {:ok, unused_key} =
-      DeviceIdentity.from_certificate(TLSFixtures.certificate_der!(certs, "expired"))
+    {:ok, unused_key} = DeviceIdentity.from_certificate(der(ctx, "expired"))
 
     assert %{"error" => "not_found"} =
-             owner_request(owner_endpoint, certs, "a1", person_a, %{
+             owner_request(ctx, "a1", person_a, %{
                "type" => "agent_register",
                "agent_id" => @agent_id,
                "key_fingerprint" => unused_key
              })
 
-    for {owner_name, person, key} <- [
-          {"a1", person_a, key_a},
-          {"b1", person_b, key_b}
-        ] do
+    for {owner_name, person, key} <- [{"a1", person_a, key_a}, {"b1", person_b, key_b}] do
       assert %{"ok" => true, "agents" => [%{"agent_id" => @agent_id, "key_fingerprint" => ^key}]} =
-               owner_request(owner_endpoint, certs, owner_name, person, %{"type" => "agent_list"})
+               owner_request(ctx, owner_name, person, %{"type" => "agent_list"})
     end
 
-    assert %{"ok" => true} =
-             owner_request(owner_endpoint, certs, "a1", person_a, %{
-               "type" => "agent_grants_replace",
-               "key_fingerprint" => key_a,
-               "expected_revision" => 1,
-               "read_grants" => ["app:test"],
-               "respond_grants" => []
-             })
+    replace_grants(ctx, person_a, key_a, 1, ["app:test"], [])
+    assert only_text(ctx, "agent") == "A only"
+    assert only_text(ctx, "other-agent") == "B only"
 
-    agent_endpoint = endpoint(certs, AgentTLS.port(agent))
-    cert_a = Path.join(certs, "unknown.pem")
-    private_a = Path.join(certs, "unknown.key")
-    cert_b = Path.join(certs, "other-agent.pem")
-    private_b = Path.join(certs, "other-agent.key")
-
-    assert %{"items" => [%{"message" => %{"unknown" => %{"text" => "A only"}}}]} =
-             agent_request(agent_endpoint, cert_a, private_a, %{"v" => 1, "type" => "search"})
-
-    assert %{
-             "items" => [%{"message" => %{"unknown" => %{"text" => "B only"}}}],
-             "initial_high_water" => 1
-           } =
-             agent_request(agent_endpoint, cert_b, private_b, %{"v" => 1, "type" => "search"})
-
-    assert %{"ok" => true} =
-             owner_request(owner_endpoint, certs, "b1", person_b, %{
-               "type" => "agent_grants_replace",
-               "key_fingerprint" => key_b,
-               "expected_revision" => 1,
-               "read_grants" => ["app:test"],
-               "respond_grants" => []
-             })
-
-    assert %{"items" => [%{"message" => %{"unknown" => %{"text" => "B only"}}}]} =
-             agent_request(agent_endpoint, cert_b, private_b, %{"v" => 1, "type" => "search"})
-
-    assert %{"item" => %{"message" => %{"unknown" => %{"text" => "A only"}}}} =
-             agent_request(agent_endpoint, cert_a, private_a, %{
-               "v" => 1,
-               "type" => "get",
-               "sender_id" => "app:test",
-               "message_id" => "shared"
-             })
-
-    GenServer.stop(agent)
-    GenServer.stop(owner)
-    GenServer.stop(relay)
-    {:ok, restarted} = Relay.start_link(store_path: path)
-    {:ok, owner_restarted} = listener(OwnerTLS, restarted, certs)
-    {:ok, agent_restarted} = listener(AgentTLS, restarted, certs)
-
-    on_exit(fn ->
-      for pid <- [agent_restarted, owner_restarted, restarted],
-          Process.alive?(pid),
-          do: GenServer.stop(pid)
-    end)
-
-    assert {:ok, ^person_a, @agent_id, 1} = Relay.agent_identity(restarted, key_a)
-    assert {:ok, ^person_b, @agent_id, 1} = Relay.agent_identity(restarted, key_b)
-
-    assert %{"items" => [%{"message" => %{"unknown" => %{"text" => "A only"}}}]} =
-             agent_request(endpoint(certs, AgentTLS.port(agent_restarted)), cert_a, private_a, %{
-               "v" => 1,
-               "type" => "search"
-             })
-
-    assert %{"items" => [%{"message" => %{"unknown" => %{"text" => "B only"}}}]} =
-             agent_request(endpoint(certs, AgentTLS.port(agent_restarted)), cert_b, private_b, %{
-               "v" => 1,
-               "type" => "search"
-             })
+    server = restart(ctx)
+    restarted = %{ctx | server: server, relay: Server.relay(server)}
+    assert {:ok, ^person_a, @agent_id, 1} = Relay.agent_identity(restarted.relay, key_a)
+    assert {:ok, ^person_b, @agent_id, 1} = Relay.agent_identity(restarted.relay, key_b)
+    assert only_text(restarted, "agent") == "A only"
+    assert only_text(restarted, "other-agent") == "B only"
 
     assert %{"agents" => [%{"key_fingerprint" => ^key_b}]} =
-             owner_request(
-               endpoint(certs, OwnerTLS.port(owner_restarted)),
-               certs,
-               "b1",
-               person_b,
-               %{
-                 "type" => "agent_list"
-               }
-             )
+             owner_request(restarted, "b1", person_b, %{"type" => "agent_list"})
   end
 
-  test "encrypted page cursor survives restart while lifecycle and exact JSON value advance",
-       context do
-    %{certs: certs, relay: relay, owner: owner, agent: agent, path: path} = context
-    {:ok, person} = Relay.operator_bootstrap(relay, TLSFixtures.certificate_der!(certs, "a1"))
-
-    {:ok, device_key} =
-      Relay.setup_device_certificate(relay, person, TLSFixtures.certificate_der!(certs, "a2"))
-
-    {:ok, agent_key} =
-      DeviceIdentity.from_certificate(TLSFixtures.certificate_der!(certs, "unknown"))
-
-    assert :ok = Relay.setup_sender(relay, device_key, "app:test")
-
-    large = 9_007_199_254_740_993
+  test "a search page continues across restart while its item's state advances and the message stays exact",
+       ctx do
+    {person, device_key} = person_with_device(ctx)
     decimal = %JSON.DecimalToken{raw: "0.123456789012345678901234567890"}
+    original = message("first", [%{"amount" => decimal, "integer" => 9_007_199_254_740_993}])
+    assert %{"seq" => 1} = forward_message(ctx.relay, device_key, original)
+    assert %{"seq" => 2} = forward(ctx.relay, device_key, "app:test", "second", "later")
+    register_agent(ctx, person, "agent", ["app:test"], [])
 
-    original = %{
-      "sender_id" => "app:test",
-      "message_id" => "first",
-      "created_at" => 1,
-      "title" => "precise",
-      "unknown" => %{"items" => [%{"amount" => decimal, "integer" => large}]}
-    }
+    assert {:ok, 200, %{"items" => [%{"message" => %{"message_id" => "second"}}]} = first} =
+             get(ctx, "agent", "/v2/search?limit=1")
 
-    assert %{"type" => "ok", "seq" => 1} =
-             device_request(relay, device_key, %{
-               "v" => 1,
-               "type" => "forward",
-               "op_id" => unique_op(),
-               "message" => original
-             })
+    page = first["next_page"]
+    assert is_binary(page) and not String.contains?(page, "app:test")
+    id = item_id(ctx, "agent", "app:test", "first")
 
-    assert %{"type" => "ok", "seq" => 2} =
-             forward(relay, device_key, "app:test", "second", "later")
+    assert {:ok, 200, _} =
+             answer(ctx, "a2", id, %{"request_revision" => 1, "comment" => "settled"}, key(1))
 
-    owner_endpoint = endpoint(certs, OwnerTLS.port(owner))
+    server = restart(ctx)
+    restarted = %{ctx | server: server, relay: Server.relay(server)}
 
-    assert %{"ok" => true} =
-             owner_request(owner_endpoint, certs, "a1", person, %{
-               "type" => "agent_register",
-               "agent_id" => @agent_id,
-               "key_fingerprint" => agent_key
-             })
+    assert {:ok, 200, %{"items" => [item]} = next} =
+             get(restarted, "agent", "/v2/search?limit=1&page=" <> page)
 
-    assert %{"ok" => true} =
-             owner_request(owner_endpoint, certs, "a1", person, %{
-               "type" => "agent_grants_replace",
-               "key_fingerprint" => agent_key,
-               "expected_revision" => 1,
-               "read_grants" => ["app:test"],
-               "respond_grants" => []
-             })
-
-    endpoint_before = endpoint(certs, AgentTLS.port(agent))
-    cert = Path.join(certs, "unknown.pem")
-    key = Path.join(certs, "unknown.key")
-
-    assert %{
-             "initial_high_water" => 2,
-             "items" => [%{"message_id" => "second"}],
-             "next_cursor" => cursor
-           } =
-             agent_request(endpoint_before, cert, key, %{
-               "v" => 1,
-               "type" => "search",
-               "limit" => 1
-             })
-
-    assert is_binary(cursor) and not String.contains?(cursor, "app:test")
-
-    assert %{"type" => "ok", "seq" => 3} =
-             device_request(relay, device_key, %{
-               "v" => 1,
-               "type" => "answer",
-               "sender_id" => "app:test",
-               "message_id" => "first",
-               "op_id" => unique_op(),
-               "answer" => %{"exact" => decimal, "large" => large}
-             })
-
-    GenServer.stop(agent)
-    GenServer.stop(owner)
-    GenServer.stop(relay)
-    {:ok, restarted} = Relay.start_link(store_path: path)
-    {:ok, agent_restarted} = listener(AgentTLS, restarted, certs)
-
-    on_exit(fn ->
-      if Process.alive?(agent_restarted), do: GenServer.stop(agent_restarted)
-      if Process.alive?(restarted), do: GenServer.stop(restarted)
-    end)
-
-    endpoint_after = endpoint(certs, AgentTLS.port(agent_restarted))
-
-    assert %{
-             "initial_high_water" => 2,
-             "items" => [
-               %{
-                 "message_id" => "first",
-                 "state" => "answered",
-                 "answer" => answer,
-                 "message" => recovered,
-                 "observation_high_water" => 3
-               }
-             ],
-             "next_cursor" => nil
-           } =
-             agent_request(endpoint_after, cert, key, %{
-               "v" => 1,
-               "type" => "search",
-               "limit" => 1,
-               "cursor" => cursor
-             })
-
-    assert answer == %{"exact" => decimal, "large" => large}
-    assert recovered == original
+    refute Map.has_key?(next, "next_page")
+    assert item["item_id"] == id
+    assert %{"state" => "answered", "answer" => %{"text" => "settled"}} = item["terminal"]
+    assert item["message"] == original
   end
 
   test "agent pages and detail preserve the immutable message beside current retracted state",
-       context do
-    %{certs: certs, relay: relay, owner: owner, agent: agent} = context
-    {:ok, person} = Relay.operator_bootstrap(relay, TLSFixtures.certificate_der!(certs, "a1"))
+       ctx do
+    {person, device_key} = person_with_device(ctx)
 
-    {:ok, device_key} =
-      Relay.setup_device_certificate(relay, person, TLSFixtures.certificate_der!(certs, "a2"))
-
-    {:ok, agent_key} =
-      DeviceIdentity.from_certificate(TLSFixtures.certificate_der!(certs, "unknown"))
-
-    assert :ok = Relay.setup_sender(relay, device_key, "app:test")
+    original = %{
+      "sender_id" => "app:test",
+      "message_id" => "retracted",
+      "created_at" => 1,
+      "title" => "title",
+      "unknown" => %{"text" => "original"}
+    }
 
     assert %{"type" => "ok", "seq" => 1} =
-             device_request(relay, device_key, %{
+             device_request(ctx.relay, device_key, %{
                "v" => 1,
                "type" => "forward",
                "op_id" => unique_op(),
                "session_handle" => @handle,
-               "message" => %{
-                 "sender_id" => "app:test",
-                 "message_id" => "retracted",
-                 "created_at" => 1,
-                 "title" => "title",
-                 "unknown" => %{"text" => "original"}
-               }
+               "message" => original
              })
 
-    assert %{"type" => "ok", "seq" => 2} =
-             forward(relay, device_key, "app:test", "later", "later")
+    assert %{"seq" => 2} = forward(ctx.relay, device_key, "app:test", "later", "later")
+    register_agent(ctx, person, "agent", ["app:test"], [])
 
-    owner_endpoint = endpoint(certs, OwnerTLS.port(owner))
+    assert {:ok, 200, %{"items" => [%{"message" => %{"message_id" => "later"}}]} = first} =
+             get(ctx, "agent", "/v2/search?limit=1")
 
-    assert %{"ok" => true} =
-             owner_request(owner_endpoint, certs, "a1", person, %{
-               "type" => "agent_register",
-               "agent_id" => @agent_id,
-               "key_fingerprint" => agent_key
-             })
-
-    assert %{"ok" => true} =
-             owner_request(owner_endpoint, certs, "a1", person, %{
-               "type" => "agent_grants_replace",
-               "key_fingerprint" => agent_key,
-               "expected_revision" => 1,
-               "read_grants" => ["app:test"],
-               "respond_grants" => []
-             })
-
-    agent_endpoint = endpoint(certs, AgentTLS.port(agent))
-    cert = Path.join(certs, "unknown.pem")
-    private = Path.join(certs, "unknown.key")
-
-    assert %{
-             "initial_high_water" => 2,
-             "items" => [%{"message_id" => "later"}],
-             "next_cursor" => cursor
-           } =
-             agent_request(agent_endpoint, cert, private, %{
-               "v" => 1,
-               "type" => "search",
-               "limit" => 1
-             })
-
-    assert is_binary(cursor)
-
-    assert %{"type" => "ok", "state" => "retracted", "retracted_at" => retracted_at} =
-             device_request(relay, device_key, %{
+    assert %{"type" => "ok", "state" => "retracted"} =
+             device_request(ctx.relay, device_key, %{
                "v" => 1,
                "type" => "conversation_withdraw",
                "op_id" => unique_op(),
@@ -1176,197 +517,170 @@ defmodule AttentionServer.AgentServiceTest do
                "message_id" => "retracted"
              })
 
-    assert %{
-             "initial_high_water" => 2,
-             "observation_high_water" => 3,
-             "items" => [page_item],
-             "next_cursor" => nil
-           } =
-             agent_request(agent_endpoint, cert, private, %{
-               "v" => 1,
-               "type" => "search",
-               "limit" => 1,
-               "cursor" => cursor
-             })
+    assert {:ok, 200, %{"items" => [page_item]}} =
+             get(ctx, "agent", "/v2/search?limit=1&page=" <> first["next_page"])
 
-    assert page_item["state"] == "retracted"
-    assert page_item["retracted_at"] == retracted_at
+    assert %{"state" => "retracted"} = page_item["terminal"]
+    assert page_item["message"] == original
 
-    assert page_item["message"] == %{
-             "sender_id" => "app:test",
-             "message_id" => "retracted",
-             "created_at" => 1,
-             "title" => "title",
-             "unknown" => %{"text" => "original"}
-           }
+    assert {:ok, 200, %{"item" => detail}} =
+             get(ctx, "agent", "/v2/items/" <> page_item["item_id"])
 
-    assert %{"item" => detail} =
-             agent_request(agent_endpoint, cert, private, %{
-               "v" => 1,
-               "type" => "get",
-               "sender_id" => "app:test",
-               "message_id" => "retracted"
-             })
-
-    assert detail["message"] == page_item["message"]
-    assert detail["state"] == "retracted"
-    assert detail["retracted_at"] == retracted_at
-
-    GenServer.stop(relay)
+    assert detail["message"] == original
+    assert detail["terminal"] == page_item["terminal"]
   end
 
-  test "stopping only the agent listener fences an accepted socket before a pending answer",
-       context do
-    %{certs: certs, relay: relay, owner: owner, agent: agent} = context
-    {:ok, person} = Relay.operator_bootstrap(relay, TLSFixtures.certificate_der!(certs, "a1"))
+  test "non-object answer bodies are refused without restarting Relay or changing the item",
+       ctx do
+    {person, device_key} = person_with_device(ctx)
+    assert %{"type" => "ok"} = forward(ctx.relay, device_key, "app:test", "kept", "open")
+    register_agent(ctx, person, "agent", ["app:test"], ["app:test"])
+    id = item_id(ctx, "agent", "app:test", "kept")
+    relay = ctx.relay
+    version = :sys.get_state(relay).store.version
 
-    {:ok, device_key} =
-      Relay.setup_device_certificate(relay, person, TLSFixtures.certificate_der!(certs, "a2"))
+    for {body, n} <- Enum.with_index(~w(1.25 1.25e7 [] 1 "value" null false), 1) do
+      assert {:ok, 400, %{"error" => "invalid_field"}} =
+               raw_answer(ctx, "agent", id, body, key(n))
+    end
 
-    {:ok, agent_key} =
-      DeviceIdentity.from_certificate(TLSFixtures.certificate_der!(certs, "unknown"))
+    assert Server.relay(ctx.server) == relay
+    assert Process.alive?(relay)
+    assert :sys.get_state(relay).store.version == version
+    assert {:ok, 200, %{"item" => %{"terminal" => nil}}} = get(ctx, "agent", "/v2/items/" <> id)
+  end
 
-    assert :ok = Relay.setup_sender(relay, device_key, "app:test")
+  test "an answer whose reply is never read commits once and replays on retry", ctx do
+    {person, device_key} = person_with_device(ctx)
+    assert %{"type" => "ok"} = forward(ctx.relay, device_key, "app:test", "lost", "question")
+    register_agent(ctx, person, "agent", ["app:test"], ["app:test"])
+    id = item_id(ctx, "agent", "app:test", "lost")
+    fields = %{"request_revision" => 1, "comment" => "sent once"}
+    body = JSON.encode!(fields)
 
-    assert %{"type" => "ok", "seq" => 1} =
-             forward(relay, device_key, "app:test", "stop", "private")
+    {:ok, socket} =
+      HeadlessTLS.connect(endpoint(ctx), {cert(ctx, "agent"), private(ctx, "agent")})
 
-    owner_endpoint = endpoint(certs, OwnerTLS.port(owner))
+    :ok =
+      :ssl.send(socket, [
+        "POST /v2/items/#{id}/answer HTTP/1.1\r\nHost: relay.test\r\n",
+        "Content-Type: application/json\r\nIdempotency-Key: #{key(1)}\r\n",
+        "Content-Length: #{byte_size(body)}\r\n\r\n",
+        body
+      ])
+
+    :ssl.close(socket)
+    terminal = await_terminal(ctx, id, 50)
+    assert %{"state" => "answered", "answer" => %{"text" => "sent once"}} = terminal
+
+    assert {:ok, 200, %{"item" => %{"terminal" => ^terminal}}, true} =
+             answer_with_replay(ctx, "agent", id, fields, key(1))
+
+    assert :sys.get_state(ctx.relay).store.engine.persons[person] == 2
+  end
+
+  # -- Fixtures -----------------------------------------------------------------
+
+  defp start_server(path, certs) do
+    {:ok, server} =
+      Server.start_link(
+        store_path: path,
+        certfile: Path.join(certs, "server.pem"),
+        keyfile: Path.join(certs, "server.key"),
+        cacertfile: Path.join(certs, "ca.pem"),
+        port: 0,
+        owner_port: 0,
+        enrollment_enabled: false,
+        relay_name: :"agent_service_#{System.unique_integer([:positive])}"
+      )
+
+    Process.unlink(server)
+    on_exit(fn -> if Process.alive?(server), do: Supervisor.stop(server) end)
+    server
+  end
+
+  defp restart(ctx) do
+    Supervisor.stop(ctx.server)
+    start_server(ctx.path, ctx.certs)
+  end
+
+  defp person_with_device(ctx) do
+    {:ok, person} = Relay.operator_bootstrap(ctx.relay, der(ctx, "a1"))
+    {:ok, device_key} = Relay.setup_device_certificate(ctx.relay, person, der(ctx, "a2"))
+    assert :ok = Relay.setup_sender(ctx.relay, device_key, "app:test")
+    {person, device_key}
+  end
+
+  defp register_agent(ctx, person, name, read, respond) do
+    {:ok, agent_key} = DeviceIdentity.from_certificate(der(ctx, name))
 
     assert %{"ok" => true} =
-             owner_request(owner_endpoint, certs, "a1", person, %{
+             owner_request(ctx, "a1", person, %{
                "type" => "agent_register",
                "agent_id" => @agent_id,
                "key_fingerprint" => agent_key
              })
 
+    if read != [] or respond != [], do: replace_grants(ctx, person, agent_key, 1, read, respond)
+    agent_key
+  end
+
+  defp replace_grants(ctx, person, agent_key, revision, read, respond) do
     assert %{"ok" => true} =
-             owner_request(owner_endpoint, certs, "a1", person, %{
+             owner_request(ctx, "a1", person, %{
                "type" => "agent_grants_replace",
                "key_fingerprint" => agent_key,
-               "expected_revision" => 1,
-               "read_grants" => ["app:test"],
-               "respond_grants" => ["app:test"]
+               "expected_revision" => revision,
+               "read_grants" => read,
+               "respond_grants" => respond
              })
-
-    {:ok, socket} =
-      :ssl.connect({127, 0, 0, 1}, AgentTLS.port(agent),
-        versions: [:"tlsv1.3"],
-        verify: :verify_peer,
-        cacertfile: String.to_charlist(Path.join(certs, "ca.pem")),
-        certfile: String.to_charlist(Path.join(certs, "unknown.pem")),
-        keyfile: String.to_charlist(Path.join(certs, "unknown.key")),
-        server_name_indication: ~c"relay.test",
-        session_tickets: :disabled,
-        active: false,
-        mode: :binary,
-        packet: :line
-      )
-
-    assert :ok = GenServer.stop(agent)
-    _ = :ssl.send(socket, JSON.encode!(answer("app:test", "stop", 1, @op1, nil)) <> "\n")
-    assert {:error, _} = :ssl.recv(socket, 0, 3_000)
-    :ssl.close(socket)
-    assert :sys.get_state(relay).store.engine.persons[person] == 1
-
-    assert :sys.get_state(relay).store.engine.messages[{person, "app:test", "stop"}].terminal ==
-             nil
   end
 
-  defp listener(module, relay, certs) do
-    module.start_link(
-      relay: relay,
-      certfile: Path.join(certs, "server.pem"),
-      keyfile: Path.join(certs, "server.key"),
-      cacertfile: Path.join(certs, "ca.pem")
-    )
-  end
-
-  defp endpoint(certs, port),
-    do: %{
-      address: {127, 0, 0, 1},
-      name: "relay.test",
-      ca_file: Path.join(certs, "ca.pem"),
-      port: port
-    }
-
-  defp owner_request(endpoint, certs, identity, person, fields) do
+  defp owner_request(ctx, identity, person, fields) do
     {:ok, reply} =
       HeadlessTLS.owner_request(
-        endpoint,
-        Path.join(certs, "#{identity}.pem"),
-        Path.join(certs, "#{identity}.key"),
+        endpoint(ctx, Server.owner_port(ctx.server)),
+        cert(ctx, identity),
+        private(ctx, identity),
         Map.merge(fields, %{"v" => 1, "person_id" => person})
       )
 
     reply
   end
 
-  defp agent_request(endpoint, cert, key, request) do
-    {:ok, reply} = HeadlessTLS.agent_request(endpoint, cert, key, request)
-    reply
-  end
-
-  defp session_request(relay, session, frame) do
-    assert {:ok, lines} =
-             Relay.session_request_line(
-               relay,
-               session,
-               JSON.encode!(Map.put_new(frame, "v", 1)) <> "\n"
-             )
-
-    Enum.map(lines, fn line ->
-      assert {:ok, reply} = JSON.decode_line(line)
-      reply
-    end)
-  end
-
-  defp session_drain(relay, session) do
-    assert {:ok, lines} = Relay.session_drain(relay, session)
-
-    Enum.map(lines, fn line ->
-      assert {:ok, reply} = JSON.decode_line(line)
-      reply
-    end)
-  end
-
   defp forward(relay, key, sender, id, text) do
-    request = %{
-      "v" => 1,
-      "type" => "forward",
-      "op_id" => unique_op(),
-      "message" => %{
-        "sender_id" => sender,
-        "message_id" => id,
-        "created_at" => 1,
-        "title" => "title",
-        "unknown" => %{"text" => text}
-      }
-    }
-
-    {:ok, line} = Relay.request_line(relay, key, JSON.encode!(request) <> "\n")
-    {:ok, reply} = JSON.decode_line(line)
-    reply
+    forward_message(relay, key, %{
+      "sender_id" => sender,
+      "message_id" => id,
+      "created_at" => 1,
+      "title" => "title",
+      "unknown" => %{"text" => text}
+    })
   end
+
+  defp forward_message(relay, key, message),
+    do:
+      device_request(relay, key, %{
+        "v" => 1,
+        "type" => "forward",
+        "op_id" => unique_op(),
+        "message" => message
+      })
+
+  defp message(id, nested),
+    do: %{
+      "sender_id" => "app:test",
+      "message_id" => id,
+      "created_at" => 1,
+      "title" => "item",
+      "unknown" => %{"nested" => nested}
+    }
 
   defp device_request(relay, key, frame) do
     {:ok, line} = Relay.request_line(relay, key, JSON.encode!(frame) <> "\n")
     {:ok, reply} = JSON.decode_line(line)
     reply
   end
-
-  defp answer(sender, id, seq, op, value),
-    do: %{
-      "v" => 1,
-      "type" => "answer",
-      "sender_id" => sender,
-      "message_id" => id,
-      "acceptance_seq" => seq,
-      "op_id" => op,
-      "deliberate" => true,
-      "intent_ref" => "human-instruction-1",
-      "answer" => value
-    }
 
   defp unique_op do
     suffix =
@@ -1377,4 +691,128 @@ defmodule AttentionServer.AgentServiceTest do
 
     "00000000-0000-4000-8000-" <> suffix
   end
+
+  defp key(n), do: "00000000-0000-4000-8000-0000000001" <> String.pad_leading("#{n}", 2, "0")
+
+  # -- Client API v2 over the device port --------------------------------------
+
+  defp get(ctx, name, path), do: HeadlessTLS.v2_get(endpoint(ctx), identity(ctx, name), path)
+
+  defp answer(ctx, name, id, body, idempotency_key) do
+    with {:ok, status, value, _replayed} <-
+           answer_with_replay(ctx, name, id, body, idempotency_key),
+         do: {:ok, status, value}
+  end
+
+  defp answer_with_replay(ctx, name, id, body, idempotency_key) do
+    with {:ok, status, headers, value} <-
+           raw_answer_request(ctx, name, id, JSON.encode!(body), idempotency_key),
+         do: {:ok, status, value, {"idempotent-replayed", "true"} in headers}
+  end
+
+  defp raw_answer(ctx, name, id, body, idempotency_key) do
+    with {:ok, status, _headers, value} <-
+           raw_answer_request(ctx, name, id, body, idempotency_key),
+         do: {:ok, status, value}
+  end
+
+  defp raw_answer_request(ctx, name, id, body, idempotency_key) do
+    HeadlessTLS.v2_request(
+      endpoint(ctx),
+      identity(ctx, name),
+      "POST",
+      "/v2/items/" <> id <> "/answer",
+      [{"content-type", "application/json"}, {"idempotency-key", idempotency_key}],
+      body
+    )
+  end
+
+  defp item_id(ctx, name, sender, message_id) do
+    assert {:ok, 200, %{"items" => [%{"item_id" => id}]}} =
+             get(ctx, name, "/v2/search?sender=#{sender}&message_id=#{message_id}")
+
+    id
+  end
+
+  defp only_text(ctx, name) do
+    assert {:ok, 200, %{"items" => [%{"message" => %{"unknown" => %{"text" => text}}}]}} =
+             get(ctx, name, "/v2/search")
+
+    text
+  end
+
+  defp await_terminal(_ctx, _id, 0), do: flunk("the unread answer was not committed")
+
+  defp await_terminal(ctx, id, attempts) do
+    case get(ctx, "a2", "/v2/items/" <> id) do
+      {:ok, 200, %{"item" => %{"terminal" => %{} = terminal}}} ->
+        terminal
+
+      _ ->
+        Process.sleep(20)
+        await_terminal(ctx, id, attempts - 1)
+    end
+  end
+
+  defp connect(ctx, name) do
+    {certificate, key} = identity(ctx, name)
+
+    Mint.HTTP.connect(:https, "127.0.0.1", Server.port(ctx.server),
+      hostname: "relay.test",
+      protocols: [:http1],
+      mode: :passive,
+      transport_opts: [
+        versions: [:"tlsv1.3"],
+        cacertfile: Path.join(ctx.certs, "ca.pem"),
+        certfile: certificate,
+        keyfile: key,
+        server_name_indication: ~c"relay.test",
+        timeout: 5_000
+      ]
+    )
+  end
+
+  defp request(conn, method, path, headers \\ [], body \\ nil) do
+    case Mint.HTTP.request(conn, method, path, headers, body) do
+      {:ok, conn, ref} -> collect(conn, ref, %{})
+      {:error, conn, reason} -> {:error, conn, reason}
+    end
+  end
+
+  defp collect(conn, ref, acc) do
+    case Mint.HTTP.recv(conn, 0, 5_000) do
+      {:ok, conn, responses} ->
+        acc =
+          Enum.reduce(responses, acc, fn
+            {:status, ^ref, status}, acc -> Map.put(acc, :status, status)
+            {:done, ^ref}, acc -> Map.put(acc, :done, true)
+            _other, acc -> acc
+          end)
+
+        if acc[:done], do: {:ok, conn, acc}, else: collect(conn, ref, acc)
+
+      {:error, conn, reason, _responses} ->
+        {:error, conn, reason}
+    end
+  end
+
+  # A refused TLS 1.3 client certificate can surface as a logged alert.
+  defp quietly(fun) do
+    capture_log(fn -> send(self(), {:quiet, fun.()}) end)
+    assert_received {:quiet, result}
+    result
+  end
+
+  defp endpoint(ctx, port \\ nil),
+    do: %{
+      address: {127, 0, 0, 1},
+      name: "relay.test",
+      ca_file: Path.join(ctx.certs, "ca.pem"),
+      port: port || Server.port(ctx.server)
+    }
+
+  defp identity(ctx, name), do: {cert(ctx, name), private(ctx, name)}
+  defp cert(ctx, name), do: Path.join(ctx.certs, "#{name}.pem")
+  defp private(ctx, name), do: Path.join(ctx.certs, "#{name}.key")
+  defp der(ctx, name), do: TLSFixtures.certificate_der!(ctx.certs, name)
 end

@@ -1,7 +1,7 @@
 defmodule AttentionServer.BrowserRelayRecipientTest do
   use ExUnit.Case, async: false
 
-  alias AttentionServer.{DeviceIdentity, JSON, OriginWire, Relay, TLSFixtures}
+  alias AttentionServer.{DeviceIdentity, JSON, LegacyOriginWire, Relay, TLSFixtures}
 
   @recipient_one "00000000-0000-4000-8000-000000000001"
   @recipient_two "00000000-0000-4000-8000-000000000002"
@@ -126,7 +126,7 @@ defmodule AttentionServer.BrowserRelayRecipientTest do
               "inline_decoded_bytes_per_entry" => inline_limit,
               "upload_cap_bytes_per_file" => "none"
             }} =
-             OriginWire.browser_command(c.relay, @browser_session, @recipient_one, %{
+             LegacyOriginWire.browser_command(c.relay, @browser_session, @recipient_one, %{
                "v" => 1,
                "type" => "file_limits",
                "ref" => "limits"
@@ -141,7 +141,7 @@ defmodule AttentionServer.BrowserRelayRecipientTest do
               "state" => "discarded",
               "discarded" => 0
             }} =
-             OriginWire.browser_command(c.relay, @browser_session, @recipient_one, %{
+             LegacyOriginWire.browser_command(c.relay, @browser_session, @recipient_one, %{
                "v" => 1,
                "type" => "discard_uploads",
                "ref" => "discard",
@@ -152,7 +152,7 @@ defmodule AttentionServer.BrowserRelayRecipientTest do
              })
 
     assert {:error, :forbidden} =
-             OriginWire.browser_command(c.relay, @browser_session, @recipient_two, %{
+             LegacyOriginWire.browser_command(c.relay, @browser_session, @recipient_two, %{
                "v" => 1,
                "type" => "file_limits"
              })

@@ -620,7 +620,6 @@ defmodule AttentionServer.DashboardHTTPSTest do
         port: available_port(),
         enroll_port: available_port(),
         owner_port: 0,
-        agent_port: 0,
         join_name: "relay.test",
         dashboard: [
           port: dashboard_port,
