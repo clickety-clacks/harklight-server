@@ -332,9 +332,7 @@ defmodule AttentionServer.BounceDecision do
   end
 
   def valid_state?(%Engine{} = engine, :full) do
-    valid_configurations?(engine) and valid_revision_states?(engine) and
-      valid_opened_revisions?(engine) and valid_advisory_feeds?(engine) and
-      valid_indexes?(engine)
+    valid_configurations?(engine) and valid_bounce_state?(engine)
   rescue
     _ -> false
   end
@@ -343,6 +341,17 @@ defmodule AttentionServer.BounceDecision do
 
   def valid_state?(_, _), do: false
   def valid_state?(_), do: false
+
+  # Everything the full check covers except the per-person configuration
+  # rows: revision states, opened revisions, advisory feeds and the derived
+  # indexes. Keyed validation still runs this as a whole-state scan.
+  @doc false
+  def valid_bounce_state?(%Engine{} = engine) do
+    valid_revision_states?(engine) and valid_opened_revisions?(engine) and
+      valid_advisory_feeds?(engine) and valid_indexes?(engine)
+  rescue
+    _ -> false
+  end
 
   def advisory_text(revision, evaluated_at_ms)
       when is_integer(revision) and revision > 0 and is_integer(evaluated_at_ms) do
@@ -958,16 +967,21 @@ defmodule AttentionServer.BounceDecision do
   defp valid_configurations?(engine) do
     is_map(engine.bounce_levels) and
       Enum.all?(engine.bounce_levels, fn {person, config} ->
-        Map.has_key?(engine.persons, person) and is_map(config) and
-          Map.keys(config) |> Enum.sort() ==
-            [:after_conversation_seq, :after_delivery_seq, :configured_at_ms, :levels] and
-          BouncePolicy.valid_normalized_levels?(config.levels) and
-          is_integer(config.configured_at_ms) and config.configured_at_ms >= 0 and
-          is_integer(config.after_delivery_seq) and config.after_delivery_seq >= 0 and
-          config.after_delivery_seq <= Map.get(engine.persons, person, 0) and
-          is_integer(config.after_conversation_seq) and config.after_conversation_seq >= 0 and
-          config.after_conversation_seq <= Map.get(engine.conversation_highs, person, 0)
+        valid_configuration?(engine, person, config)
       end)
+  end
+
+  @doc false
+  def valid_configuration?(engine, person, config) do
+    Map.has_key?(engine.persons, person) and is_map(config) and
+      Map.keys(config) |> Enum.sort() ==
+        [:after_conversation_seq, :after_delivery_seq, :configured_at_ms, :levels] and
+      BouncePolicy.valid_normalized_levels?(config.levels) and
+      is_integer(config.configured_at_ms) and config.configured_at_ms >= 0 and
+      is_integer(config.after_delivery_seq) and config.after_delivery_seq >= 0 and
+      config.after_delivery_seq <= Map.get(engine.persons, person, 0) and
+      is_integer(config.after_conversation_seq) and config.after_conversation_seq >= 0 and
+      config.after_conversation_seq <= Map.get(engine.conversation_highs, person, 0)
   end
 
   defp valid_revision_states?(engine) do

@@ -499,31 +499,41 @@ defmodule AttentionServer.Conversation do
         valid_delivery_acks?(engine, person, origin, feed) and
         Enum.all?(feed.entries, fn {seq, entry} -> valid_origin_entry?(seq, feed.high, entry) end)
     end) and
-      Enum.all?(engine.origin_sessions, fn {{person, origin, handle}, session} ->
-        get_in(engine.devices, [origin, :person]) == person and
-          valid_session?(handle, session.vendor_session_id) and
-          valid_support_record?(Map.get(session, :support)) and
-          (is_nil(Map.get(session, :support)) or session.support["origin"] == origin) and
-          is_boolean(session.gone) and
-          (is_nil(session.last_detached_at) or
-             (is_integer(session.last_detached_at) and session.last_detached_at > 0))
+      Enum.all?(engine.origin_sessions, fn {key, session} ->
+        valid_origin_session?(engine, key, session)
       end) and
-      Enum.all?(engine.origin_receipts, fn {{person, origin, seq}, receipt} ->
-        entry = get_in(engine.origin_feeds, [{person, origin}, :entries, seq])
-
-        actionable?(entry) and is_integer(receipt.delivered_at) and receipt.delivered_at > 0 and
-          valid_receipt_transfers?(engine, person, origin, entry, receipt) and
-          is_map(Map.get(receipt, :uses, %{})) and
-          Enum.all?(Map.get(receipt, :uses, %{}), fn {name, outcome} ->
-            Enum.any?(Map.get(entry, "files", []), &(&1["name"] == name)) and
-              ConversationFiles.valid_use?(outcome)
-          end)
+      Enum.all?(engine.origin_receipts, fn {key, receipt} ->
+        valid_origin_receipt?(engine, key, receipt)
       end) and
       Enum.all?(engine.origin_actions, fn {key, action} ->
         valid_origin_action?(engine, key, action)
       end)
   rescue
     _ -> false
+  end
+
+  @doc false
+  def valid_origin_session?(engine, {person, origin, handle}, session) do
+    get_in(engine.devices, [origin, :person]) == person and
+      valid_session?(handle, session.vendor_session_id) and
+      valid_support_record?(Map.get(session, :support)) and
+      (is_nil(Map.get(session, :support)) or session.support["origin"] == origin) and
+      is_boolean(session.gone) and
+      (is_nil(session.last_detached_at) or
+         (is_integer(session.last_detached_at) and session.last_detached_at > 0))
+  end
+
+  @doc false
+  def valid_origin_receipt?(engine, {person, origin, seq}, receipt) do
+    entry = get_in(engine.origin_feeds, [{person, origin}, :entries, seq])
+
+    actionable?(entry) and is_integer(receipt.delivered_at) and receipt.delivered_at > 0 and
+      valid_receipt_transfers?(engine, person, origin, entry, receipt) and
+      is_map(Map.get(receipt, :uses, %{})) and
+      Enum.all?(Map.get(receipt, :uses, %{}), fn {name, outcome} ->
+        Enum.any?(Map.get(entry, "files", []), &(&1["name"] == name)) and
+          ConversationFiles.valid_use?(outcome)
+      end)
   end
 
   defp valid_receipt_transfers?(
