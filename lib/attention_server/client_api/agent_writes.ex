@@ -337,6 +337,16 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
     end
   end
 
+  # Two staged files with the same bytes under one name attach as one upload
+  # twice. Relay refused that before the engine, naming no field; keep it.
+  defp distinct_upload_names(uploads) do
+    names = Enum.map(uploads, & &1["name"])
+
+    if length(Enum.uniq(names)) == length(names),
+      do: :ok,
+      else: {:error, "invalid_field", nil}
+  end
+
   defp authorize(state, {person, agent}) do
     with true <- state.store.change_log,
          {:ok, ^person} <- Engine.authorized_person(state.store.engine, agent) do
@@ -368,7 +378,8 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
       {:ok, message_key, attributes, extras} ->
         {reply, next} =
           with {:ok, selected} <- checked_files(state, scope, operation, message_key, body),
-               {:ok, frame} <- attach_selected(attributes, operation, selected, uploads) do
+               {:ok, frame} <- attach_selected(attributes, operation, selected, uploads),
+               :ok <- distinct_upload_names(uploads) do
             staged = for {:staged, file} <- selected, do: file.file_id
             sources = Map.new(Enum.zip(Enum.map(uploads, & &1["upload_id"]), staged))
             apply_frame(state, agent, operation, frame, op_id, sources)
