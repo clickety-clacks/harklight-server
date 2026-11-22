@@ -15,10 +15,11 @@ defmodule AttentionServer.ClientAPI.Focus do
   Shows are `{show_id, device_id, item_id, target, held_ms}`, where `held_ms`
   is the show's age when it is written.
 
-  The feed (C5) calls `subscribe_shows/1` for a device principal and then
-  receives `{:client_api_show, device_key}` whenever a show is held for it.
-  The feed reads the current held show from the relay just before writing
-  the id-less event, when it computes the show's age (round 11 r4 §4).
+  The feed (C5) calls `subscribe_shows/1` for a device principal. An agent's
+  show is offered to one subscribed feed as
+  `{:client_api_show, device_key, show_id, result_ref}`; the feed reads the
+  current held show from the relay just before writing the event, when it
+  computes the show's age (round 11 r4 §4).
   """
 
   alias AttentionServer.ClientAPI.{Projection, Reads, Resources, Writes}
@@ -41,13 +42,6 @@ defmodule AttentionServer.ClientAPI.Focus do
   @spec unsubscribe_shows(String.t()) :: :ok
   def unsubscribe_shows(device_key) when is_binary(device_key),
     do: Registry.unregister(@registry, {:client_api_show, device_key})
-
-  @doc false
-  def notify_show(device_key) do
-    Enum.each(show_writers(device_key), fn {pid, _} ->
-      send(pid, {:client_api_show, device_key})
-    end)
-  end
 
   @doc false
   # Offer the exact held show to one writer. The HTTP request owns the wait.
@@ -106,7 +100,7 @@ defmodule AttentionServer.ClientAPI.Focus do
         Projection.probe({:show_projection, item_id})
 
         %{
-          "show_id" => show_id(device_key, held),
+          "show_id" => Map.fetch!(held, "show_id"),
           "device_id" => device_key,
           "item_id" => item_id,
           "target" => held["target"],
@@ -116,25 +110,6 @@ defmodule AttentionServer.ClientAPI.Focus do
     else
       _ -> nil
     end
-  end
-
-  # Stable for one held show, so both deliveries carry the same id.
-  defp show_id(_device_key, %{"show_id" => id}), do: id
-
-  defp show_id(device_key, held) do
-    material =
-      Enum.join(
-        [
-          device_key,
-          held["sender_id"],
-          held["message_id"],
-          held["target"],
-          held["accepted_at"]
-        ],
-        <<0>>
-      )
-
-    "s" <> Base.url_encode64(binary_part(:crypto.hash(:sha256, material), 0, 18), padding: false)
   end
 
   @doc false

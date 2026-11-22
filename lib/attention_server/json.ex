@@ -707,18 +707,6 @@ defmodule AttentionServer.JSON do
     |> Enum.reduce(0, fn chunk, size -> size + byte_size(chunk) end)
   end
 
-  @doc false
-  def send_stream(socket, value) do
-    value
-    |> encode_stream()
-    |> Enum.reduce_while(:ok, fn chunk, :ok ->
-      case :ssl.send(socket, chunk) do
-        :ok -> {:cont, :ok}
-        error -> {:halt, error}
-      end
-    end)
-  end
-
   defp encode_value_stream(%AttentionServer.LargeData.Ref{} = ref) do
     Stream.concat([once("\""), AttentionServer.LargeData.escaped_stream(ref), once("\"")])
   end

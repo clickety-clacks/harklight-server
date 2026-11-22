@@ -285,6 +285,20 @@ defmodule AttentionServer.ClientAPI.Reads do
   ## Inside the relay
 
   @doc false
+  # `GET /v2/me` reads the flags file on each request, so file changes reach
+  # the next read without a restart. A missing, unreadable or malformed
+  # configured file gives no flags and logs one warning per Relay lifetime.
+  def handle_call({:me, key}, from, state) do
+    case principal(state.store.engine, key) do
+      {:ok, _principal} ->
+        {flags, warned} = FeatureFlags.read(state.feature_flags_path, state.feature_flags_warned)
+        handle_call({:me, key, flags}, from, %{state | feature_flags_warned: warned})
+
+      error ->
+        {:reply, error, state}
+    end
+  end
+
   def handle_call(request, _from, state) do
     reply =
       try do
@@ -433,14 +447,10 @@ defmodule AttentionServer.ClientAPI.Reads do
     end
   end
 
-  defp read({:me, key}, state) do
+  defp read({:me, key, flags}, state) do
     engine = state.store.engine
 
     with {:ok, principal} <- principal(engine, key) do
-      # Read with warnings already given, so a read never logs; the Relay warns
-      # about an unreadable flags file where it reads it for itself.
-      {flags, _warned} = FeatureFlags.read(state.feature_flags_path, true)
-
       response = %{
         "server" => %{"id" => engine.relay_instance_id},
         "principal" => enrollment_ids(principal),

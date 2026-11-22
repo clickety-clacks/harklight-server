@@ -3,8 +3,8 @@ defmodule AttentionServer.Relay do
   Serialized relay core with an optional durable SQLite store.
 
   `request_line/3` retains the first slice's trusted-key test seam. Devices
-  reach the Relay through client API v2 (`ClientAPI.Listener`); no listener
-  opens a socket-backed device session.
+  reach the Relay through client API v2 (`ClientAPI.Listener`); the Relay
+  keeps no device sessions.
   """
 
   use GenServer
@@ -461,20 +461,8 @@ defmodule AttentionServer.Relay do
   def finish_push(server, claim, outcome, now_ms),
     do: GenServer.call(server, {:finish_push, claim, outcome, now_ms}, :infinity)
 
-  def events(server, verified_key, since),
-    do: GenServer.call(server, {:events, verified_key, since}, :infinity)
-
-  def conversation_events(server, verified_key, since),
-    do: GenServer.call(server, {:conversation_events, verified_key, since}, :infinity)
-
-  def conversation_cursor(server, verified_key),
-    do: GenServer.call(server, {:conversation_cursor, verified_key}, :infinity)
-
   def acknowledged_cursor(server, verified_key),
     do: GenServer.call(server, {:cursor, verified_key}, :infinity)
-
-  def device_revoked?(server, verified_key),
-    do: GenServer.call(server, {:device_revoked?, verified_key}, :infinity)
 
   @doc "The current person for an enrolled, unrevoked device key (client API principal)."
   def device_person(server, verified_key),
@@ -484,57 +472,8 @@ defmodule AttentionServer.Relay do
   def account_paused?(server, person),
     do: GenServer.call(server, {:account_paused?, person}, :infinity)
 
-  def open_session(server, verified_key),
-    do: GenServer.call(server, {:open_session, verified_key, nil, nil, nil, :raw}, :infinity)
-
-  def register_tls_listener(server, listener),
-    do: GenServer.call(server, {:register_tls_listener, listener}, :infinity)
-
-  def unregister_tls_listener(server, listener),
-    do: GenServer.call(server, {:unregister_tls_listener, listener}, :infinity)
-
-  @doc "Opens a socket-backed session after a successful client-certificate handshake."
-  def open_tls_session(server, verified_key, socket, listener),
-    do:
-      GenServer.call(
-        server,
-        {:open_session, verified_key, self(), socket, listener, :raw},
-        :infinity
-      )
-
-  @doc "Opens a device session only after its authenticated WebSocket negotiation."
-  def open_websocket_session(server, verified_key, socket, listener),
-    do:
-      GenServer.call(
-        server,
-        {:open_session, verified_key, self(), socket, listener, :websocket},
-        :infinity
-      )
-
   def end_browser_session(server, browser_session_id),
     do: GenServer.call(server, {:end_browser_session, browser_session_id}, :infinity)
-
-  def session_request_line(server, session_id, line) do
-    GenServer.call(server, {:session_request_line, session_id, line}, :infinity)
-  end
-
-  @doc false
-  def session_request_file(server, session_id, path) do
-    GenServer.call(server, {:session_request_file, session_id, path}, :infinity)
-  end
-
-  def session_drain(server, session_id),
-    do: GenServer.call(server, {:session_drain, session_id}, :infinity)
-
-  @doc "Serializes socket output with session replacement and revocation."
-  def session_send(server, session_id, frames),
-    do: GenServer.call(server, {:session_send, session_id, frames}, :infinity)
-
-  def session_send_control(server, session_id, bytes),
-    do: GenServer.call(server, {:session_send_control, session_id, bytes}, :infinity)
-
-  def close_session(server, session_id),
-    do: GenServer.call(server, {:close_session, session_id}, :infinity)
 
   @impl true
   def init(opts) do
@@ -554,7 +493,6 @@ defmodule AttentionServer.Relay do
               bounce_deadline_generation: 0,
               upload_index: build_upload_index(store.engine),
               active_uploads: %{},
-              sessions: %{},
               socket_writes: %{},
               focus_clients: %{},
               focus_clients_by_person: %{},
@@ -562,7 +500,6 @@ defmodule AttentionServer.Relay do
               agent_show_receipts: %{},
               focus_streams: %{},
               focus_streams_by_person: %{},
-              tls_listeners: %{},
               applied_score_record:
                 AppliedScoreRecord.start(
                   Keyword.get(opts, :deployment_mode, :self_hosted),
@@ -583,9 +520,6 @@ defmodule AttentionServer.Relay do
               priority_failures: %{},
               priority_retry_timers: %{},
               priority_deadline_timers: %{},
-              priority_revision_namespace:
-                Base.url_encode64(:crypto.strong_rand_bytes(16), padding: false),
-              priority_revision_counter: 0,
               agent_fixture_mode: Keyword.get(opts, :agent_fixture_mode, false) == true,
               source_fixture_mode: Keyword.get(opts, :source_fixture_mode, false) == true,
               enrollment_fixture_mode: Keyword.get(opts, :enrollment_fixture_mode, false) == true,
@@ -931,20 +865,8 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  defp dispatch_call({:events, key, since}, _from, state),
-    do: {:reply, Engine.events(state.store.engine, key, since), state}
-
-  defp dispatch_call({:conversation_events, key, since}, _from, state),
-    do: {:reply, Engine.conversation_events(state.store.engine, key, since), state}
-
-  defp dispatch_call({:conversation_cursor, key}, _from, state),
-    do: {:reply, Engine.conversation_cursor(state.store.engine, key), state}
-
   defp dispatch_call({:cursor, key}, _from, state),
     do: {:reply, Engine.acknowledged_cursor(state.store.engine, key), state}
-
-  defp dispatch_call({:device_revoked?, key}, _from, state),
-    do: {:reply, Engine.device_revoked?(state.store.engine, key), state}
 
   defp dispatch_call({:device_person, key}, _from, state),
     do: {:reply, Engine.authorized_person(state.store.engine, key), state}
@@ -1076,7 +998,7 @@ defmodule AttentionServer.Relay do
                %{person: person, actor: key, action: "dashboard_levels"}
              ) do
           {:ok, store} ->
-            next_state = %{state | store: store} |> notify_levels_changed(person)
+            next_state = %{state | store: store}
 
             {:reply, {:ok, %{"levels" => BouncePolicy.public_levels(config.levels)}}, next_state}
 
@@ -1436,7 +1358,7 @@ defmodule AttentionServer.Relay do
          %{person: person} <-
            Map.get(engine.hosted_accounts, account_ref) || {:error, :not_created},
          owner when is_binary(owner) <- Engine.hosted_owner_key(engine, person),
-         {:ok, cleared, removed_keys} <- Engine.hosted_test_reset(engine, person),
+         {:ok, cleared, _removed_keys} <- Engine.hosted_test_reset(engine, person),
          {:ok, staged, code} <- hosted_test_stage(cleared, person, owner, target_state, state),
          {:ok, store} <-
            commit(state.store, staged, %{
@@ -1451,10 +1373,9 @@ defmodule AttentionServer.Relay do
           do: pending_set_changed(next, person),
           else: next
 
-      fenced = Enum.reduce(removed_keys, next, &fence_sessions(&2, &1))
       result = %{state: target_state, person_id: person}
       result = if target_state == "device-waiting", do: Map.put(result, :code, code), else: result
-      {:reply, {:ok, result}, fenced}
+      {:reply, {:ok, result}, next}
     else
       {:error, reason} -> {:reply, {:error, reason}, state}
       {:error, _, _} -> {:reply, {:error, :storage_unavailable}, state}
@@ -1647,11 +1568,11 @@ defmodule AttentionServer.Relay do
              ) do
           {:ok, next} ->
             next = remove_focus_device(next, key, reply["person_id"])
-            {:reply, {:ok, reply}, fence_sessions(next, key)}
+            {:reply, {:ok, reply}, next}
 
           {:error, _, next, :committed} ->
             next = remove_focus_device(next, key, reply["person_id"])
-            {:reply, {:error, :storage_unavailable}, fence_sessions(next, key)}
+            {:reply, {:error, :storage_unavailable}, next}
 
           {:error, _, _, :not_committed} ->
             {:reply, {:error, :storage_unavailable}, state}
@@ -1757,11 +1678,11 @@ defmodule AttentionServer.Relay do
              ) do
           {:ok, next} ->
             next = remove_focus_device(next, device_key, person)
-            {:reply, :ok, fence_sessions(next, device_key)}
+            {:reply, :ok, next}
 
           {:error, _, next, :committed} ->
             next = remove_focus_device(next, device_key, person)
-            {:reply, {:error, :storage_unavailable}, fence_sessions(next, device_key)}
+            {:reply, {:error, :storage_unavailable}, next}
 
           {:error, _, _, :not_committed} ->
             {:reply, {:error, :storage_unavailable}, state}
@@ -2083,11 +2004,11 @@ defmodule AttentionServer.Relay do
              ) do
           {:ok, next} ->
             next = remove_focus_device(next, key, person)
-            {:reply, :ok, fence_sessions(next, key)}
+            {:reply, :ok, next}
 
           {:error, _, next, :committed} ->
             next = remove_focus_device(next, key, person)
-            {:reply, {:error, :storage_unavailable}, fence_sessions(next, key)}
+            {:reply, {:error, :storage_unavailable}, next}
 
           {:error, _, _, :not_committed} ->
             {:reply, {:error, :storage_unavailable}, state}
@@ -2098,82 +2019,11 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  defp dispatch_call({:register_tls_listener, listener}, _from, state) when is_pid(listener) do
-    if Map.has_key?(state.tls_listeners, listener) do
-      {:reply, {:error, :already_registered}, state}
-    else
-      monitor = Process.monitor(listener)
-      {:reply, :ok, %{state | tls_listeners: Map.put(state.tls_listeners, listener, monitor)}}
-    end
-  end
-
-  defp dispatch_call({:unregister_tls_listener, listener}, _from, state),
-    do: {:reply, :ok, unregister_listener(state, listener)}
-
-  defp dispatch_call({:open_session, key, owner, socket, listener, transport}, _from, state) do
-    admission =
-      if is_nil(listener) or Map.has_key?(state.tls_listeners, listener),
-        do: Engine.acknowledged_cursor(state.store.engine, key),
-        else: {:error, :listener_stopped}
-
-    case admission do
-      {:ok, cursor} ->
-        state = fence_sessions(state, key)
-        id = make_ref()
-
-        session = %{
-          key: key,
-          focus_opted_in: false,
-          contiguous: cursor,
-          stream_seq: nil,
-          ready: false,
-          conversation_seq: nil,
-          conversation_contiguous: nil,
-          conversation_ready: false,
-          owner: owner,
-          socket: socket,
-          listener: listener,
-          transport: transport,
-          view_support: false,
-          view_notice: nil,
-          view_notice_due_at: nil,
-          view_last_notice_at: nil,
-          levels_support: false,
-          levels_notice: false
-        }
-
-        next = %{state | sessions: Map.put(state.sessions, id, session)}
-
-        {:reply, {:ok, id}, next}
-
-      error ->
-        {:reply, error, state}
-    end
-  end
-
   # Signing a browser out closes its v2 feeds. No Relay state is keyed by the
   # browser session; stored v2 browser actor state is discarded at startup.
   defp dispatch_call({:end_browser_session, browser_session_id}, _from, state) do
     AttentionServer.ChangeLog.notify_closing([{{:browser_session, browser_session_id}, :revoked}])
     {:reply, :ok, state}
-  end
-
-  defp dispatch_call({:session_send, id, frames}, _from, state) do
-    with {:ok, %{socket: socket}} <- active_session(state, id),
-         true <- not is_nil(socket) and is_list(frames) do
-      {:reply, {:socket_write, socket, {:session, id}, frames, :session}, state}
-    else
-      _ -> {:reply, {:error, :fenced}, drop_session(state, id)}
-    end
-  end
-
-  defp dispatch_call({:session_send_control, id, bytes}, _from, state) do
-    with {:ok, %{socket: socket}} <- active_session(state, id),
-         true <- not is_nil(socket) do
-      {:reply, {:socket_write, socket, {:session_control, id}, [bytes], :session}, state}
-    else
-      _ -> {:reply, {:error, :fenced}, drop_session(state, id)}
-    end
   end
 
   # Each frame is released under current authority. A released write belongs
@@ -2188,86 +2038,6 @@ defmodule AttentionServer.Relay do
 
       _ ->
         {:reply, {:error, :fenced}, state}
-    end
-  end
-
-  defp dispatch_call({:close_session, id}, _from, state),
-    do: {:reply, :ok, drop_session(state, id)}
-
-  defp dispatch_call({:session_request_line, id, raw}, _from, state),
-    do: session_request_line_call(state, id, raw)
-
-  defp dispatch_call({:session_request_file, id, path}, _from, state) do
-    with {:ok, session} <- active_session(state, id),
-         {:ok, frame} <- JSON.decode_line_file(path),
-         true <- is_map(frame) and not is_struct(frame) do
-      try do
-        {reply, next} = session_request_frame_call(state, id, session, frame)
-        {:reply, reply, next}
-      after
-        AttentionServer.LargeData.cleanup_transient_refs(frame)
-      end
-    else
-      {:error, :forbidden} ->
-        {:reply, {:error, :forbidden}, drop_session(state, id)}
-
-      {:error, :storage_unavailable} ->
-        {:reply, {:ok, [error_line(%{}, "storage_unavailable")]}, state}
-
-      _ ->
-        {:reply, {:ok, [error_line(%{}, "bad_frame")]}, state}
-    end
-  end
-
-  defp dispatch_call({:session_drain, id}, _from, state),
-    do: session_drain_call(state, id)
-
-  defp session_drain_call(state, id) do
-    with {:ok, session} <- active_session(state, id),
-         true <- session.ready,
-         {:ok, events, high} <- Engine.events(state.store.engine, session.key, session.stream_seq),
-         {:ok, conversation_events, conversation_high} <-
-           drain_conversation(state.store.engine, session) do
-      contiguous = if session.stream_seq <= session.contiguous, do: high, else: session.contiguous
-
-      conversation_contiguous =
-        if session.conversation_ready and
-             session.conversation_seq <= session.conversation_contiguous,
-           do: conversation_high,
-           else: session.conversation_contiguous
-
-      updated = %{
-        session
-        | stream_seq: high,
-          contiguous: contiguous,
-          conversation_seq: if(session.conversation_ready, do: conversation_high, else: nil),
-          conversation_contiguous: conversation_contiguous
-      }
-
-      {view_notice, updated} = take_view_notice(updated, System.monotonic_time(:millisecond))
-      {levels_notice, updated} = take_levels_notice(updated)
-      next = put_session(state, id, updated)
-
-      frames =
-        Enum.map(events ++ conversation_events, &line/1) ++ view_notice ++ levels_notice
-
-      {:reply, {:ok, frames}, next}
-    else
-      false ->
-        case Map.get(state.sessions, id) do
-          %{levels_notice: true} = session ->
-            {notice, updated} = take_levels_notice(session)
-            {:reply, {:ok, notice}, put_session(state, id, updated)}
-
-          _ ->
-            {:reply, {:error, :resync_required}, state}
-        end
-
-      {:error, :forbidden} ->
-        {:reply, {:error, :forbidden}, drop_session(state, id)}
-
-      error ->
-        {:reply, error, state}
     end
   end
 
@@ -2405,62 +2175,6 @@ defmodule AttentionServer.Relay do
         _ = File.rm(published)
         result
     end
-  end
-
-  defp session_request_line_call(state, id, raw) do
-    with {:ok, session} <- active_session(state, id) do
-      case JSON.decode_line(raw) do
-        {:ok, %{"type" => "focus_report"} = frame} ->
-          {reply, next} = focus_report_request(state, id, session, frame)
-          {:reply, reply, next}
-
-        _ ->
-          {reply, next} = session_request(state, id, session, raw)
-          {:reply, reply, next}
-      end
-    else
-      {:error, :forbidden} ->
-        {:reply, {:error, :forbidden}, drop_session(state, id)}
-
-      error ->
-        {:reply, error, state}
-    end
-  end
-
-  defp session_request_frame_call(state, id, session, frame) do
-    type = frame["type"]
-
-    cond do
-      type == "focus_report" ->
-        focus_report_request(state, id, session, frame)
-
-      type in ["resync", "ack", "conversation_open", "conversation_ack", "view_get"] ->
-        special_request(state, id, session, frame)
-
-      type in ["levels_get", "levels_set"] ->
-        levels_session_request_frame(state, id, session, frame)
-
-      type in ["forward", "answer_receipt"] ->
-        {{:ok, [error_line(frame, "unknown_type")]}, state}
-
-      not state.push_enabled and type in ["push_register", "push_remove", "push_status"] ->
-        {{:ok, [error_line(frame, "forbidden")]}, state}
-
-      not state.source_fixture_mode and type in ["source_bind", "source_result"] ->
-        {{:ok, [error_line(frame, "not_supported")]}, state}
-
-      true ->
-        perform_request_frame(state, session.key, frame)
-        |> then(fn {reply, next} -> {wrap_line(reply), next} end)
-    end
-  end
-
-  defp levels_session_request_frame(state, id, session, frame) do
-    session = %{session | levels_support: true}
-    state = put_session(state, id, session)
-
-    perform_request_frame(state, session.key, frame)
-    |> then(fn {reply, next} -> {wrap_line(reply), next} end)
   end
 
   @impl true
@@ -2752,7 +2466,7 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  defp dispatch_info({:DOWN, monitor, :process, listener, reason}, state) do
+  defp dispatch_info({:DOWN, monitor, :process, pid, reason}, state) do
     priority_job =
       Enum.find(state.priority_jobs, fn {_person, job} -> job.monitor == monitor end)
 
@@ -2781,12 +2495,8 @@ defmodule AttentionServer.Relay do
 
         {:noreply, %{state | active_uploads: Map.delete(state.active_uploads, lease)}}
 
-      Map.get(state.tls_listeners, listener) == monitor ->
-        Diagnostics.failure(:device_relay, :server_terminate, reason, :unavailable)
-        {:noreply, unregister_listener(state, listener)}
-
-      match?(%{monitor: ^monitor}, Map.get(state.focus_streams, listener)) ->
-        {:noreply, delete_focus_stream(state, listener)}
+      match?(%{monitor: ^monitor}, Map.get(state.focus_streams, pid)) ->
+        {:noreply, delete_focus_stream(state, pid)}
 
       true ->
         {:noreply, state}
@@ -2820,19 +2530,6 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  defp active_session(state, id) do
-    case Map.get(state.sessions, id) do
-      nil ->
-        {:error, :unknown_session}
-
-      session ->
-        case Engine.authorized_person(state.store.engine, session.key) do
-          {:ok, _} -> {:ok, session}
-          error -> error
-        end
-    end
-  end
-
   defp begin_upload(state, person, key, attrs, worker) do
     lease = make_ref()
 
@@ -2859,241 +2556,6 @@ defmodule AttentionServer.Relay do
     {:ok, lease, %{state | active_uploads: active}}
   end
 
-  defp view_get(state, id, session, frame) do
-    cond do
-      frame["v"] != 1 or not is_integer(frame["v"]) ->
-        {{:ok, [error_line(frame, "unsupported_version")]}, state}
-
-      not is_binary(frame["ref"]) ->
-        {{:ok, [error_line(frame, "invalid_field", "ref")]}, state}
-
-      Enum.any?(Map.keys(frame), &(&1 not in ~w(v type ref known_view_rev))) ->
-        {{:ok, [error_line(frame, "invalid_field")]}, state}
-
-      Map.has_key?(frame, "known_view_rev") and not is_binary(frame["known_view_rev"]) ->
-        {{:ok, [error_line(frame, "invalid_field", "known_view_rev")]}, state}
-
-      true ->
-        person = person_of(state.store.engine, session.key)
-        state = ensure_priority_view(state, person)
-        view = Map.fetch!(state.priority_views, person)
-        updated = %{session | view_support: true}
-        state = put_session(state, id, updated)
-
-        reply =
-          if frame["known_view_rev"] == view.view_rev do
-            %{
-              "v" => 1,
-              "type" => "ok",
-              "ref" => frame["ref"],
-              "view_rev" => view.view_rev,
-              "unchanged" => true
-            }
-          else
-            %{
-              "v" => 1,
-              "type" => "ok",
-              "ref" => frame["ref"],
-              "view_rev" => view.view_rev,
-              "algorithm" => view.algorithm,
-              "basis" => view.basis,
-              "entries" => view.entries,
-              "replies" => view.replies,
-              "list_items" => view.list_items
-            }
-            |> then(fn reply ->
-              if Map.has_key?(view, :free_order_version),
-                do: Map.put(reply, "free_order_version", view.free_order_version),
-                else: reply
-            end)
-          end
-
-        {{:ok, [line(reply)]}, state}
-    end
-  end
-
-  defp session_request(state, id, session, raw) do
-    case JSON.decode_line(raw) do
-      {:ok, %{"type" => type} = frame}
-      when type in ["resync", "ack", "conversation_open", "conversation_ack", "view_get"] ->
-        special_request(state, id, session, frame)
-
-      {:ok, %{"type" => type}} when type in ["levels_get", "levels_set"] ->
-        levels_session_request(state, id, session, raw)
-
-      {:ok, %{"type" => type} = frame} when type in ["forward", "answer_receipt"] ->
-        {{:ok, [error_line(frame, "unknown_type")]}, state}
-
-      _ ->
-        {reply, next} = request(state, session.key, raw)
-        {wrap_line(reply), next}
-    end
-  end
-
-  defp levels_session_request(state, id, session, raw) do
-    session = %{session | levels_support: true}
-    state = put_session(state, id, session)
-    {reply, next} = request(state, session.key, raw)
-    {wrap_line(reply), next}
-  end
-
-  defp special_request(state, id, session, frame) do
-    case envelope_error(frame) do
-      nil ->
-        case frame["type"] do
-          "resync" ->
-            resync(state, id, session, frame)
-
-          "ack" ->
-            ack(state, session, frame)
-
-          "conversation_open" ->
-            conversation_open(state, id, session, frame)
-
-          "conversation_ack" ->
-            conversation_ack(state, session, frame)
-
-          "view_get" ->
-            view_get(state, id, session, frame)
-        end
-
-      {reason, field} ->
-        {{:ok, [error_line(frame, reason, field)]}, state}
-    end
-  end
-
-  defp resynced_frame(state, high) do
-    {flags, warned} =
-      AttentionServer.FeatureFlags.read(state.feature_flags_path, state.feature_flags_warned)
-
-    frame = %{
-      "v" => 1,
-      "type" => "resynced",
-      "seq" => high,
-      "server" => state.store.engine.relay_instance_id,
-      "feature_flags" => flags
-    }
-
-    {frame, %{state | feature_flags_warned: warned}}
-  end
-
-  defp resync(state, id, session, frame) do
-    case Engine.events(state.store.engine, session.key, frame["since"]) do
-      {:ok, events, high} ->
-        contiguous = if frame["since"] <= session.contiguous, do: high, else: session.contiguous
-
-        updated = %{
-          session
-          | contiguous: contiguous,
-            stream_seq: high,
-            ready: true
-        }
-
-        {resynced, state} = resynced_frame(state, high)
-
-        frames =
-          [ok_line(frame, %{})] ++ Enum.map(events, &line/1) ++ [line(resynced)]
-
-        {{:ok, frames}, put_session(state, id, updated)}
-
-      {:error, reason} ->
-        {{:ok, [error_line(frame, Atom.to_string(reason))]}, state}
-    end
-  end
-
-  defp conversation_open(state, id, session, frame) do
-    if session.ready do
-      with {:ok, events, high} <-
-             Engine.conversation_events(state.store.engine, session.key, frame["since"]),
-           {:ok, cursor} <- Engine.conversation_cursor(state.store.engine, session.key),
-           {:ok, read_positions} <- Engine.chat_read_positions(state.store.engine, session.key),
-           {:ok, next_engine} <- Engine.open_conversation(state.store.engine, session.key),
-           {:ok, store} <-
-             commit(
-               state.store,
-               next_engine,
-               audit(state.store.engine, session.key, "conversation_open")
-             ) do
-        contiguous = if frame["since"] <= cursor, do: high, else: cursor
-
-        updated = %{
-          session
-          | conversation_ready: true,
-            conversation_seq: high,
-            conversation_contiguous: contiguous
-        }
-
-        frames =
-          [ok_line(frame, %{})] ++
-            Enum.map(events, &line/1) ++
-            [
-              line(%{
-                "v" => 1,
-                "type" => "conversation_resynced",
-                "conversation_seq" => high,
-                "chat_read_positions" => read_positions
-              })
-            ]
-
-        {{:ok, frames}, put_session(%{state | store: store}, id, updated)}
-      else
-        {:error, :storage_unavailable, _} ->
-          {{:ok, [error_line(frame, "storage_unavailable")]}, state}
-
-        {:error, reason} ->
-          {{:ok, [error_line(frame, Atom.to_string(reason))]}, state}
-      end
-    else
-      {{:ok, [error_line(frame, "resync_required")]}, state}
-    end
-  end
-
-  defp conversation_ack(state, session, frame) do
-    if session.conversation_ready do
-      case Engine.acknowledge_conversation(
-             state.store.engine,
-             session.key,
-             frame["conversation_seq"],
-             session.conversation_contiguous
-           ) do
-        {:ok, next_engine, fields} ->
-          case commit(
-                 state.store,
-                 next_engine,
-                 audit(state.store.engine, session.key, "conversation_ack")
-               ) do
-            {:ok, store} -> {{:ok, [ok_line(frame, fields)]}, %{state | store: store}}
-            {:error, _, _} -> {{:ok, [error_line(frame, "storage_unavailable")]}, state}
-          end
-
-        {:error, reason} ->
-          {{:ok, [error_line(frame, Atom.to_string(reason))]}, state}
-      end
-    else
-      {{:ok, [error_line(frame, "conversation_open_required")]}, state}
-    end
-  end
-
-  defp drain_conversation(engine, %{conversation_ready: true} = session),
-    do: Engine.conversation_events(engine, session.key, session.conversation_seq)
-
-  defp drain_conversation(_engine, _session), do: {:ok, [], nil}
-
-  defp ack(state, session, frame) do
-    case Engine.acknowledge(state.store.engine, session.key, frame["seq"], session.contiguous) do
-      {:ok, next_engine, fields} ->
-        audit = audit(state.store.engine, session.key, "cursor_ack")
-
-        case commit(state.store, next_engine, audit) do
-          {:ok, store} -> {{:ok, [ok_line(frame, fields)]}, %{state | store: store}}
-          {:error, _, _} -> {{:ok, [error_line(frame, "storage_unavailable")]}, state}
-        end
-
-      {:error, reason} ->
-        {{:ok, [error_line(frame, Atom.to_string(reason))]}, state}
-    end
-  end
-
   defp request(state, key, raw) do
     case Engine.authorized_person(state.store.engine, key) do
       {:ok, _person} ->
@@ -3105,7 +2567,7 @@ defmodule AttentionServer.Relay do
             {{:ok, error_line(raw, "not_supported")}, state}
 
           true ->
-            perform_request(state, key, raw)
+            perform_request_line(state, key, raw)
         end
 
       _ ->
@@ -3127,17 +2589,6 @@ defmodule AttentionServer.Relay do
 
       _ ->
         false
-    end
-  end
-
-  defp perform_request(state, key, raw) do
-    case JSON.decode_line(raw) do
-      {:ok, %{"type" => type, "files" => _} = frame}
-      when type in ["forward", "conversation_revise", "discussion", "conversation_reply"] ->
-        perform_request_frame(state, key, frame)
-
-      _ ->
-        perform_request_line(state, key, raw)
     end
   end
 
@@ -3222,7 +2673,7 @@ defmodule AttentionServer.Relay do
     end)
   end
 
-  defp perform_request_frame(state, key, frame, staged_sources \\ %{}) do
+  defp perform_request_frame(state, key, frame, staged_sources) do
     {next_engine, reply} = Engine.request_frame(state.store.engine, key, frame, state.clock.())
 
     next_engine =
@@ -3306,12 +2757,6 @@ defmodule AttentionServer.Relay do
 
               _ ->
                 next_state
-            end
-
-          next_state =
-            case changed_levels_person(state.store.engine, next_engine, key) do
-              {:ok, person} -> notify_levels_changed(next_state, person)
-              :unchanged -> next_state
             end
 
           {reply, next_state}
@@ -3443,6 +2888,8 @@ defmodule AttentionServer.Relay do
         Placement.list_items(state.store.engine, person, engine_entries, reply_summary)
       )
 
+    # Baseline entries follow the list order. Ranks read the entries through
+    # message_entries_by_identity, where the first entry for an identity wins.
     shown =
       if Placement.choice(state.store.engine, person) == "baseline" do
         entries_by_id = Map.new(messages, &{Placement.identity(&1), &1})
@@ -3457,9 +2904,7 @@ defmodule AttentionServer.Relay do
             end
           end)
 
-        shown
-        |> Map.put(:entries, ordered_messages)
-        |> Map.put(:free_order_version, 1)
+        Map.put(shown, :entries, ordered_messages)
       else
         shown
       end
@@ -3479,27 +2924,10 @@ defmodule AttentionServer.Relay do
     message_entries_by_identity =
       shown.entries |> Enum.reverse() |> Map.new(&{Placement.identity(&1), &1})
 
-    comparable =
-      Map.take(shown, [
-        :algorithm,
-        :basis,
-        :reason,
-        :entries,
-        :replies,
-        :list_items,
-        :free_order_version
-      ])
+    comparable = Map.take(shown, [:algorithm, :basis, :reason, :entries, :replies, :list_items])
 
     if previous &&
-         Map.take(previous, [
-           :algorithm,
-           :basis,
-           :reason,
-           :entries,
-           :replies,
-           :list_items,
-           :free_order_version
-         ]) ==
+         Map.take(previous, [:algorithm, :basis, :reason, :entries, :replies, :list_items]) ==
            comparable do
       Map.put(
         state,
@@ -3513,92 +2941,17 @@ defmodule AttentionServer.Relay do
         )
       )
     else
-      counter = state.priority_revision_counter + 1
-      view_rev = state.priority_revision_namespace <> ":" <> Integer.to_string(counter)
-
       view =
         comparable
         |> Map.put(:engine_entries, engine_entries)
         |> Map.put(:message_entries_by_identity, message_entries_by_identity)
-        |> Map.put(:view_rev, view_rev)
 
       index = AttentionServer.ClientAPI.Resources.index_reply_entries(view.replies)
       view = Map.put(view, :reply_entries_by_item, index)
 
-      state
-      |> Map.put(:priority_revision_counter, counter)
-      |> Map.put(:priority_views, Map.put(state.priority_views, person, view))
-      |> notify_priority_view_change(person, view_rev)
+      Map.put(state, :priority_views, Map.put(state.priority_views, person, view))
     end
   end
-
-  defp notify_priority_view_change(state, person, view_rev) do
-    now = System.monotonic_time(:millisecond)
-
-    sessions =
-      Map.new(state.sessions, fn {id, session} ->
-        case Engine.authorized_person(state.store.engine, session.key) do
-          {:ok, ^person} when session.view_support and session.ready ->
-            due_at =
-              case session.view_last_notice_at do
-                nil -> now
-                last when now - last >= 1_000 -> now
-                last -> last + 1_000
-              end
-
-            {id, %{session | view_notice: view_rev, view_notice_due_at: due_at}}
-
-          _ ->
-            {id, session}
-        end
-      end)
-
-    %{state | sessions: sessions}
-  end
-
-  defp changed_levels_person(old_engine, next_engine, key) do
-    with {:ok, person} <- Engine.authorized_person(old_engine, key),
-         {:ok, ^person} <- Engine.authorized_person(next_engine, key),
-         true <-
-           Map.get(old_engine.bounce_levels, person) != Map.get(next_engine.bounce_levels, person) do
-      {:ok, person}
-    else
-      _ -> :unchanged
-    end
-  end
-
-  defp notify_levels_changed(state, person) do
-    sessions =
-      Map.new(state.sessions, fn {id, session} ->
-        if session.levels_support and
-             Engine.authorized_person(state.store.engine, session.key) == {:ok, person} do
-          {id, %{session | levels_notice: true}}
-        else
-          {id, session}
-        end
-      end)
-
-    %{state | sessions: sessions}
-  end
-
-  defp take_view_notice(%{view_notice: nil} = session, _now), do: {[], session}
-
-  defp take_view_notice(
-         %{view_notice: view_rev, view_notice_due_at: due_at} = session,
-         now
-       )
-       when is_integer(due_at) and due_at <= now do
-    frame = line(%{"v" => 1, "type" => "view_changed", "view_rev" => view_rev})
-    {[frame], %{session | view_notice: nil, view_notice_due_at: nil, view_last_notice_at: now}}
-  end
-
-  defp take_view_notice(session, _now), do: {[], session}
-
-  defp take_levels_notice(%{levels_notice: true} = session) do
-    {[line(%{"v" => 1, "type" => "levels_changed"})], %{session | levels_notice: false}}
-  end
-
-  defp take_levels_notice(session), do: {[], session}
 
   defp pending_signature(engine, person) do
     engine
@@ -4737,16 +4090,6 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  defp envelope_error(frame) do
-    cond do
-      Map.has_key?(frame, "ref") and not is_binary(frame["ref"]) -> {"invalid_field", "ref"}
-      frame["v"] != 1 or not is_integer(frame["v"]) -> {"unsupported_version", nil}
-      true -> nil
-    end
-  end
-
-  defp ok_line(frame, fields), do: line(Map.merge(base("ok", frame), fields))
-
   defp error_line(%{} = frame, reason, field) do
     base("error", frame)
     |> Map.put("reason", reason)
@@ -4769,60 +4112,6 @@ defmodule AttentionServer.Relay do
   end
 
   defp line(frame), do: JSON.encode_line(frame)
-
-  defp put_session(state, id, session),
-    do: %{state | sessions: Map.put(state.sessions, id, session)}
-
-  # Enrollment proofs are refreshed at frame release, after any queued
-  # authority mutations, rather than when the response first enters the queue.
-  defp refresh_enrollment_frames(engine, key, frames) do
-    Enum.map(frames, fn line ->
-      case JSON.decode_line(line) do
-        {:ok, %{"type" => "ok", "proof" => %{"proof_version" => 1} = proof} = reply} ->
-          request = %{
-            "v" => 1,
-            "type" => "enrollment_readback",
-            "proof_version" => 1,
-            "grant_id" => proof["grant_id"],
-            "source_instance_id" => proof["source_instance_id"],
-            "target" => proof["target"]
-          }
-
-          request =
-            if Map.has_key?(reply, "ref"),
-              do: Map.put(request, "ref", reply["ref"]),
-              else: request
-
-          case Engine.request_line(engine, key, JSON.encode!(request) <> "\n") do
-            {^engine, {:ok, refreshed}} -> refreshed
-            _ -> JSON.encode!(%{"v" => 1, "type" => "error", "reason" => "not_found"}) <> "\n"
-          end
-
-        _ ->
-          line
-      end
-    end)
-  end
-
-  defp fence_sessions(state, key) do
-    Enum.reduce(state.sessions, state, fn {id, session}, acc ->
-      if session.key == key, do: drop_session(acc, id), else: acc
-    end)
-  end
-
-  defp unregister_listener(state, listener) do
-    case Map.pop(state.tls_listeners, listener) do
-      {nil, _} ->
-        state
-
-      {monitor, listeners} ->
-        Process.demonitor(monitor, [:flush])
-
-        Enum.reduce(state.sessions, %{state | tls_listeners: listeners}, fn {id, session}, acc ->
-          if session.listener == listener, do: drop_session(acc, id), else: acc
-        end)
-    end
-  end
 
   @doc false
   def agent_focus(state, person, key) do
@@ -5090,114 +4379,10 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  defp focus_report_request(state, id, session, frame) do
-    case envelope_error(frame) || focus_report_error(frame) do
-      {reason, field} ->
-        {{:ok, [error_line(frame, reason, field)]}, state}
-
-      nil when :erlang.map_get("screen", frame) == "signed_out" ->
-        next =
-          state
-          |> end_focus(session.key)
-          |> put_session(id, %{session | focus_opted_in: false})
-
-        {{:ok, [ok_line(frame, %{})]}, next}
-
-      nil ->
-        now = state.clock.()
-        key = session.key
-        person = person_for_device(state.store.engine, key)
-        reported = Map.take(frame, ~w(screen sender_id message_id visible_event_id))
-        existing = Map.get(state.focus_clients, key)
-        changed = is_nil(existing) or focus_fields(existing) != reported
-
-        reported_at =
-          cond do
-            is_nil(existing) -> now
-            changed and reported["screen"] in ["inbox", "message", "chat", "settings"] -> now
-            true -> existing.reported_at
-          end
-
-        focus =
-          reported
-          |> Map.new(fn {name, value} -> {String.to_atom(name), value} end)
-          |> Map.put(:reported_at, reported_at)
-          |> Map.put(:person, person)
-          |> Map.put(:connected, true)
-
-        next =
-          state
-          |> put_focus_client(key, focus)
-          |> put_session(id, %{session | focus_opted_in: true})
-
-        next = if person, do: notify_focus_change(state, next, person), else: next
-
-        ack = ok_line(frame, %{})
-
-        case Map.get(next.held_shows, key) do
-          nil ->
-            {{:ok, [ack]}, next}
-
-          held ->
-            show = held_show_frame(held, now)
-            frames = [ack, line(show)]
-
-            if session.socket do
-              {{:socket_write, session.socket, {:session, id}, frames, {:held_show, key, held}},
-               next}
-            else
-              {{:ok, frames}, %{next | held_shows: Map.delete(next.held_shows, key)}}
-            end
-        end
-    end
-  end
-
   defp focus_fields(focus) do
     focus
     |> Map.take([:screen, :sender_id, :message_id, :visible_event_id])
     |> Map.new(fn {key, value} -> {Atom.to_string(key), value} end)
-  end
-
-  defp focus_report_error(frame) do
-    screen = frame["screen"]
-    pair_screen = screen in ["message", "chat"]
-
-    cond do
-      not is_binary(frame["ref"]) ->
-        {"invalid_field", "ref"}
-
-      screen not in ["inbox", "message", "chat", "settings", "signed_out", "not_in_front"] ->
-        {"invalid_field", "screen"}
-
-      pair_screen and not Map.has_key?(frame, "sender_id") ->
-        {"invalid_field", "sender_id"}
-
-      pair_screen and not Message.sender_id?(frame["sender_id"]) ->
-        {"invalid_field", "sender_id"}
-
-      pair_screen and not Map.has_key?(frame, "message_id") ->
-        {"invalid_field", "message_id"}
-
-      pair_screen and not Message.nonempty?(frame["message_id"]) ->
-        {"invalid_field", "message_id"}
-
-      not pair_screen and Map.has_key?(frame, "sender_id") ->
-        {"invalid_field", "sender_id"}
-
-      not pair_screen and Map.has_key?(frame, "message_id") ->
-        {"invalid_field", "message_id"}
-
-      Map.has_key?(frame, "visible_event_id") and screen != "chat" ->
-        {"invalid_field", "visible_event_id"}
-
-      Map.has_key?(frame, "visible_event_id") and
-          not (is_binary(frame["visible_event_id"]) and
-                   Regex.match?(~r/\A[0-9]+\z/, frame["visible_event_id"])) ->
-        {"invalid_field", "visible_event_id"}
-
-      true ->
-        nil
-    end
   end
 
   @doc false
@@ -5206,12 +4391,12 @@ defmodule AttentionServer.Relay do
 
   defp handle_view_show(state, key, request) do
     case focus_authorized_person(state.store.engine, key, :push) do
-      {:ok, person} -> validate_and_send_show(state, person, key, request)
+      {:ok, person} -> validate_and_send_show(state, person, request)
       error -> {error, state}
     end
   end
 
-  defp validate_and_send_show(state, person, key, request) do
+  defp validate_and_send_show(state, person, request) do
     cond do
       not Message.sender_id?(request["sender_id"]) ->
         {{:error, {:invalid_field, "sender_id"}}, state}
@@ -5261,7 +4446,7 @@ defmodule AttentionServer.Relay do
             {{:error, {:not_found, "target_client"}}, state}
 
           client ->
-            send_or_hold_show(state, key, client, request)
+            hold_show(state, client, request)
         end
     end
   end
@@ -5269,49 +4454,16 @@ defmodule AttentionServer.Relay do
   defp normalized_device_name(name),
     do: name |> String.replace("’", "'") |> String.downcase()
 
-  defp send_or_hold_show(state, agent_key, client, request) do
-    client_key = client["client_id"]
-
-    show = %{
-      "v" => 1,
-      "type" => "view_show",
+  defp hold_show(state, client, request) do
+    held = %{
       "sender_id" => request["sender_id"],
       "message_id" => request["message_id"],
-      "target" => request["target"]
+      "target" => request["target"],
+      "show_id" => Map.fetch!(request, :show_id),
+      "accepted_at" => state.clock.()
     }
 
-    case request[:show_id] do
-      id when is_binary(id) ->
-        hold_show(state, agent_key, client, Map.put(show, "show_id", id))
-
-      nil ->
-        send_legacy_show(state, agent_key, client, show, client_key)
-    end
-  end
-
-  defp send_legacy_show(state, agent_key, client, show, client_key) do
-    live_session =
-      Enum.find(state.sessions, fn {_id, session} ->
-        session.key == client_key and session.focus_opted_in
-      end)
-
-    case live_session do
-      {id, %{socket: socket}} when not is_nil(socket) ->
-        {{:socket_write, socket, {:session, id}, [line(show)],
-          {:view_show, agent_key, client, show}}, state}
-
-      _ ->
-        hold_show(state, agent_key, client, show)
-    end
-  end
-
-  defp hold_show(state, _agent_key, client, show) do
-    held = Map.put(show, "accepted_at", state.clock.())
     next = %{state | held_shows: Map.put(state.held_shows, client["client_id"], held)}
-
-    unless Map.has_key?(show, "show_id") do
-      AttentionServer.ClientAPI.Focus.notify_show(client["client_id"])
-    end
 
     {{:ok,
       %{
@@ -5319,31 +4471,6 @@ defmodule AttentionServer.Relay do
         "device_name" => client["device_name"],
         "delivery" => "held"
       }}, next}
-  end
-
-  defp held_show_frame(held, now) do
-    held
-    |> Map.drop(["accepted_at", "show_id"])
-    |> Map.put("held_ms", max(now - held["accepted_at"], 0))
-  end
-
-  defp drop_session(state, id) do
-    case Map.pop(state.sessions, id) do
-      {nil, _} ->
-        state
-
-      {session, sessions} ->
-        if session.owner, do: send(session.owner, {:attention_fenced, id})
-
-        # Removing the session fences all serialized requests and writes.
-        # TLS close can wait on the peer; keep that wait out of the shared Relay.
-        if session.socket,
-          do: spawn(fn -> AttentionServer.SessionWriter.close(session.socket) end)
-
-        state = %{state | sessions: sessions}
-        state = cancel_socket_write(state, session.socket, {:error, :fenced})
-        end_focus(state, session.key)
-    end
   end
 
   defp browser_actor_keys(engine) do
@@ -5382,9 +4509,6 @@ defmodule AttentionServer.Relay do
           end)
     }
   end
-
-  defp wrap_line({:ok, line}), do: {:ok, [line]}
-  defp wrap_line(error), do: error
 
   defp upload_reply(upload, duplicate) do
     %{
@@ -5595,20 +4719,8 @@ defmodule AttentionServer.Relay do
   defp start_socket_write(state, socket, job, queue) do
     token = make_ref()
 
-    owner =
-      case job.authority do
-        {kind, id} when kind in [:session, :session_control] ->
-          case Map.get(state.sessions, id) do
-            %{owner: owner} when is_pid(owner) -> owner
-            _ -> elem(job.from, 0)
-          end
-
-        _ ->
-          elem(job.from, 0)
-      end
-
     {pid, monitor} =
-      AttentionServer.SessionWriter.start(self(), owner, socket, token, job.frames)
+      AttentionServer.SessionWriter.start(self(), elem(job.from, 0), socket, token, job.frames)
 
     write = %{pid: pid, monitor: monitor, token: token, job: job, queue: queue}
     put_in(state.socket_writes[socket], write)
@@ -5621,27 +4733,12 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  defp authorize_socket_write(state, {:session, id}, frame) do
-    with {:ok, session} <- active_session(state, id) do
-      [frame] = refresh_enrollment_frames(state.store.engine, session.key, [frame])
-
-      {:ok, {session.transport, frame}}
-    end
-  end
-
-  defp authorize_socket_write(state, {:session_control, id}, frame) do
-    with {:ok, _session} <- active_session(state, id), do: {:ok, {:raw, frame}}
-  end
-
   defp authorize_socket_write(state, {:owner, person, key, revision}, frame) do
     case Engine.owner_revision(state.store.engine, person, key) do
       {:ok, ^revision} -> {:ok, {:raw, frame}}
       _ -> {:error, :forbidden}
     end
   end
-
-  defp socket_authorized?(state, {:session, id}),
-    do: match?({:ok, _}, active_session(state, id))
 
   defp socket_authorized?(state, authority),
     do: match?({:ok, _}, authorize_socket_write(state, authority, ""))
@@ -5679,44 +4776,5 @@ defmodule AttentionServer.Relay do
     end)
   end
 
-  defp finish_socket_write(state, job, result) do
-    state =
-      case {result, job.authority} do
-        {:ok, _} -> state
-        {_, {kind, id}} when kind in [:session, :session_control] -> drop_session(state, id)
-        _ -> state
-      end
-
-    case job.completion do
-      :result ->
-        {result, state}
-
-      :session ->
-        {if(result == :ok, do: :ok, else: {:error, :fenced}), state}
-
-      {:held_show, key, held} ->
-        if result == :ok do
-          shows =
-            if Map.get(state.held_shows, key) == held,
-              do: Map.delete(state.held_shows, key),
-              else: state.held_shows
-
-          {{:ok, []}, %{state | held_shows: shows}}
-        else
-          {{:error, :send_failed}, state}
-        end
-
-      {:view_show, agent_key, client, show} ->
-        if result == :ok do
-          {{:ok,
-            %{
-              "client_id" => client["client_id"],
-              "device_name" => client["device_name"],
-              "delivery" => "sent"
-            }}, state}
-        else
-          hold_show(state, agent_key, client, show)
-        end
-    end
-  end
+  defp finish_socket_write(state, %{completion: :result}, result), do: {result, state}
 end

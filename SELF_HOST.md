@@ -530,15 +530,16 @@ that same artifact for clean-install evidence and publication.
 ### Client feature flags
 
 Optionally set `ATTENTION_SERVER_FEATURE_FLAGS_PATH` to a small nonsecret JSON
-object file containing names and boolean values. The Server includes those
-booleans in `resynced.feature_flags`, alongside its persisted identity in
-`resynced.server`. It reads the file at each new resynced construction, so file
-changes reach the next connection without restarting. No flags or defaults
-are hardcoded on the Server; omitted names use the app's built-in defaults.
-Nonboolean entries are ignored. An unset path yields `{}`. A missing, unreadable
-or malformed configured file also yields `{}` and logs one warning per Relay
-lifetime without preventing startup or sync. APNs `attention.server` carries
-the same persisted identity.
+object file containing names and boolean values. `GET /v2/me` reports the
+client features the Server still controls (`server_matched_push_routing` and
+`priority_level_editing`) in `features`, each `true` only when the file sets
+it to `true`, alongside the Server's persisted identity in `server.id`. The
+Server reads the file on each `GET /v2/me`, so file changes reach the next
+read without restarting. Other names and nonboolean entries are ignored. An
+unset path turns every feature off. A missing, unreadable or malformed
+configured file also turns every feature off and logs one warning per Relay
+lifetime, at the first read that finds it so, without preventing startup or
+sync. APNs `attention.server` carries the same persisted identity.
 
 The Server no longer reads a `client_api_v2` entry; one left in the file from
 an earlier release is ignored.

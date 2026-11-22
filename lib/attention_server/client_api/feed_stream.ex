@@ -195,10 +195,6 @@ defmodule AttentionServer.ClientAPI.FeedStream do
       {:DOWN, ref, :process, _pid, _reason} when ref == state.relay ->
         closing(conn, state, "server_shutdown")
 
-      {:client_api_show, device_key}
-      when state.source == FeedStep and device_key == state.ctx.principal.key ->
-        write_pending_show(conn, state, nil, nil)
-
       {:client_api_show, device_key, show_id, reply_ref}
       when state.source == FeedStep and device_key == state.ctx.principal.key ->
         write_pending_show(conn, state, show_id, reply_ref)
@@ -276,9 +272,6 @@ defmodule AttentionServer.ClientAPI.FeedStream do
 
   defp flush_shows do
     receive do
-      {:client_api_show, _device_key} ->
-        flush_shows()
-
       {:client_api_show, _device_key, _id, ref} ->
         show_result(ref, :held)
         flush_shows()
@@ -290,7 +283,7 @@ defmodule AttentionServer.ClientAPI.FeedStream do
   defp write_pending_show(conn, state, expected_id, reply_ref) do
     case pending_show(state.ctx) do
       %{"show_id" => id} = data
-      when id != state.last_show_id and (is_nil(expected_id) or id == expected_id) ->
+      when id != state.last_show_id and id == expected_id ->
         case write_ephemeral(conn, "show", data, Projection.change_key(data)) do
           {:ok, conn} ->
             # Plug can report chunk acceptance despite a transport failure.
@@ -325,7 +318,6 @@ defmodule AttentionServer.ClientAPI.FeedStream do
     end
   end
 
-  defp show_result(nil, _result), do: :ok
   defp show_result(ref, result), do: send(ref, {ref, result})
 
   defp pending_show(ctx) do
