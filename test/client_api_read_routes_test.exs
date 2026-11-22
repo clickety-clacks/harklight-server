@@ -543,4 +543,166 @@ defmodule AttentionServer.ClientAPIReadRoutesTest do
     assert get_resp_header(download, "content-type") == ["image/png"]
     assert get_resp_header(download, "content-disposition") == []
   end
+
+  # Ported from the protocol 0.1 WebSocket suite: a large stored message, with
+  # integers beyond the double range and nulls, reads whole after a cold
+  # reopen, and only for its own person.
+  test "a stored large message reads in full after a cold reopen, only for its person", ctx do
+    %{certs: certs} = ctx
+    b_der = TLSFixtures.certificate_der!(certs, "b1")
+    assert :ok = Relay.setup_person(ctx.relay, "B")
+    assert {:ok, _b1} = Relay.setup_device_certificate(ctx.relay, "B", b_der)
+    assert :ok = Relay.setup_device(ctx.relay, "B", "b-origin")
+    assert :ok = Relay.setup_sender(ctx.relay, "b-origin", "app:test")
+
+    message = %{
+      "sender_id" => "app:test",
+      "message_id" => "large",
+      "created_at" => 5,
+      "title" => "large",
+      "body" => String.duplicate("Ω", 550_000),
+      "nested" => %{"big" => 9_007_199_254_740_993, "null" => nil}
+    }
+
+    a_item = forward_item(ctx.relay, "origin", 30, message)
+    b_item = forward_item(ctx.relay, "b-origin", 31, %{message | "title" => "B-only"})
+    relay = restart_relay(ctx)
+
+    a_read = file_request(relay, ctx.der, conn(:get, "/v2/items/" <> a_item))
+    assert a_read.status == 200
+    assert body(a_read)["item"]["message"] == message
+
+    b_read = file_request(relay, b_der, conn(:get, "/v2/items/" <> b_item))
+    assert body(b_read)["item"]["message"]["title"] == "B-only"
+
+    # Item IDs are per person: each person's inbox holds only its own message.
+    titles = fn der ->
+      inbox = file_request(relay, der, conn(:get, "/v2/inbox"))
+      assert inbox.status == 200
+      for item <- body(inbox)["items"], do: item["message"]["title"]
+    end
+
+    assert titles.(b_der) == ["B-only"]
+    assert "large" in titles.(ctx.der)
+    refute "B-only" in titles.(ctx.der)
+  end
+
+  # Ported from the protocol 0.1 WebSocket suite: after a revision, a cold
+  # client reads the latest full Progress, unknown members included, from the
+  # item and the change log, and the first revision stays readable.
+  test "a cold read after a revision serves the latest full Progress", ctx do
+    first = %{
+      "updated_at" => "2026-11-11T10:00:00Z",
+      "percent" => 10,
+      "stage" => "spec_writing",
+      "note" => "Scope is clear",
+      "segments" => [
+        %{
+          "stage" => "spec_writing",
+          "width" => 10,
+          "note" => "Scope is clear",
+          "visit_at" => "2026-11-11T10:00:00Z",
+          "reported_percent" => 10,
+          "delta" => 10
+        }
+      ]
+    }
+
+    latest = %{
+      "updated_at" => "2026-11-11T10:02:00Z",
+      "percent" => 45,
+      "stage" => "testing",
+      "note" => "Paging is covered",
+      "segments" =>
+        first["segments"] ++
+          [
+            %{
+              "stage" => "coding",
+              "width" => 30,
+              "note" => "Implementation is ready",
+              "visit_at" => "2026-11-11T10:01:00Z",
+              "reported_percent" => 40,
+              "delta" => 30
+            },
+            %{
+              "stage" => "testing",
+              "width" => 5,
+              "note" => "Paging is covered",
+              "visit_at" => "2026-11-11T10:02:00Z",
+              "reported_percent" => 45,
+              "delta" => 5
+            }
+          ],
+      "future_member" => %{"retained" => [true, nil, "opaque"]}
+    }
+
+    message = %{
+      "sender_id" => "app:test",
+      "message_id" => "progress-example",
+      "created_at" => 6,
+      "title" => "Ship the inbox update",
+      "answer_ui" => %{
+        "schema" => "attention-client.actions/1",
+        "actions" => [
+          %{
+            "id" => "seen",
+            "label" => "Seen",
+            "kind" => "value",
+            "value" => %{"acknowledgment" => "seen"}
+          }
+        ]
+      },
+      "message_type" => "fyi",
+      "progress" => first
+    }
+
+    item = forward_item(ctx.relay, "origin", 40, message)
+    revised = Map.put(message, "progress", latest)
+
+    assert {:ok, line} =
+             Relay.request_line(
+               ctx.relay,
+               "origin",
+               JSON.encode!(%{
+                 "v" => 1,
+                 "type" => "conversation_revise",
+                 "op_id" => op(41),
+                 "sender_id" => "app:test",
+                 "message_id" => "progress-example",
+                 "base_revision" => 1,
+                 "message" => revised
+               }) <> "\n"
+             )
+
+    assert {:ok, %{"type" => "ok", "revision" => 2}} = JSON.decode_line(line)
+    relay = restart_relay(ctx)
+
+    read = file_request(relay, ctx.der, conn(:get, "/v2/items/" <> item))
+    assert read.status == 200
+    assert %{"request_revision" => 2, "message" => ^revised, "rev" => rev} = body(read)["item"]
+
+    {:ok, changes, _more, _position} =
+      AttentionServer.ChangeLog.read(:sys.get_state(relay).store, "A", 0, 500)
+
+    resource = AttentionServer.ChangeLog.item_resource({"A", "app:test", "progress-example"})
+    assert [%{rev: ^rev}] = Enum.filter(changes, &(&1.resource_id == resource))
+
+    older = file_request(relay, ctx.der, conn(:get, "/v2/items/#{item}/revisions/1"))
+    assert older.status == 200
+    assert body(older)["revision"]["message"]["progress"] == first
+  end
+
+  defp forward_item(relay, origin, n, message) do
+    frame = %{
+      "v" => 1,
+      "type" => "forward",
+      "op_id" => op(n),
+      "session_handle" => @handle,
+      "message" => message
+    }
+
+    assert {:ok, line} = Relay.request_line(relay, origin, JSON.encode!(frame) <> "\n")
+    assert {:ok, %{"type" => "ok", "seq" => seq}} = JSON.decode_line(line)
+    AttentionServer.ClientAPI.Resources.item_id(%{accepted_seq: seq})
+  end
 end

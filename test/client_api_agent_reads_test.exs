@@ -24,19 +24,15 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
     %{certs: certs, defs: defs}
   end
 
-  setup %{certs: certs} = context do
+  setup %{certs: certs} do
     dir = Path.join(System.tmp_dir!(), "agent-reads-#{System.unique_integer([:positive])}")
     File.mkdir_p!(dir)
     on_exit(fn -> File.rm_rf!(dir) end)
-
-    flags = Path.join(dir, "flags.json")
-    File.write!(flags, JSON.encode!(%{"client_api_v2" => Map.get(context, :flag, true)}))
 
     server =
       start_supervised!(
         {Server,
          store_path: Path.join(dir, "relay.sqlite3"),
-         feature_flags_path: flags,
          certfile: Path.join(certs, "server.pem"),
          keyfile: Path.join(certs, "server.key"),
          cacertfile: Path.join(certs, "ca.pem"),
@@ -338,42 +334,6 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
     refute Map.has_key?(last, "next_page")
     assert get(ctx, "a2", next).status == 400
     assert get(ctx, "a1", "/v2/agent/messages?page=" <> page).status == 400
-  end
-
-  @tag :agent_focus
-  @tag flag: false
-  test "the server leaves the agent HTTP routes and durable log disabled with the flag off",
-       ctx do
-    fault_on_entry(:any)
-    on_exit(fn -> Application.delete_env(:attention_server, :client_api_projection_fault) end)
-    forward(ctx, "a1", 1, @first_session)
-    refute Server.client_api_v2?(ctx.server)
-    refute Enum.any?(Supervisor.which_children(ctx.server), &(elem(&1, 0) == :client_api))
-
-    conn = ClientAPIFeedClient.connect(ctx.port, ctx.certs, "a1", :http1)
-    assert {:ok, conn, ref} = Mint.HTTP.request(conn, "GET", "/v2/agent/focus", [], nil)
-    {conn, response} = ClientAPIFeedClient.collect(conn, ref)
-    Mint.HTTP.close(conn)
-    assert response.status == 400
-    refute List.keymember?(response.headers, "request-id", 0)
-
-    state = :sys.get_state(ctx.relay)
-    assert {:error, :disabled} = AgentChangeLog.head(state.store, {"A", ctx.keys["a1"]})
-    assert state.store.engine.route_b_index.sent_messages_by_agent == %{}
-    assert state.store.engine.route_b_index.agent_entry_pages == %{}
-    assert state.store.engine.route_b_index.origin_reply_positions == %{}
-    assert state.store.engine.route_b_index.scored_reply_items_by_person == %{}
-    refute Map.has_key?(state.priority_views["A"], :reply_entries_by_item)
-
-    opted_in = AttentionServer.RouteBIndex.enable_agent_feed(state.store.engine)
-    index = opted_in.route_b_index
-
-    tree =
-      AttentionServer.RouteBIndex.message_page(index, {"A", ctx.keys["a1"]}, %{
-        "session" => @first_session
-      })
-
-    assert :gb_trees.size(tree) == 1
   end
 
   test "reads one message with an ETag and hides it from other principals", ctx do

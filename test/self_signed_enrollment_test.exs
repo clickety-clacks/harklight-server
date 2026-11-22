@@ -1,7 +1,9 @@
 defmodule AttentionServer.SelfSignedEnrollmentTest do
   use ExUnit.Case, async: false
 
-  alias AttentionServer.{OwnerTLS, Relay, TLSFixtures, WebSocketRelay}
+  @access_proof "GET /v2/inbox?limit=1 HTTP/1.1\r\nHost: relay.test\r\n\r\n"
+
+  alias AttentionServer.{ClientAPI, OwnerTLS, Relay, TLSFixtures}
 
   setup_all do
     certs = TLSFixtures.create!()
@@ -19,10 +21,12 @@ defmodule AttentionServer.SelfSignedEnrollmentTest do
 
     File.mkdir_p!(dir)
     on_exit(fn -> File.rm_rf!(dir) end)
-    {:ok, relay} = Relay.start_link(store_path: Path.join(dir, "relay.sqlite3"))
+
+    {:ok, relay} =
+      Relay.start_link(store_path: Path.join(dir, "relay.sqlite3"), client_api_v2: true)
 
     {:ok, web} =
-      WebSocketRelay.start_link(
+      ClientAPI.Listener.start_link(
         relay: relay,
         certfile: Path.join(certs, "server.pem"),
         keyfile: Path.join(certs, "server.key"),
@@ -48,7 +52,7 @@ defmodule AttentionServer.SelfSignedEnrollmentTest do
     %{relay: relay, web: web, owner_tls: owner_tls}
   end
 
-  test "only approved self-signed device leaf reaches /relay with TLS proof", %{
+  test "only approved self-signed device leaf reaches /v2 with TLS proof", %{
     certs: certs,
     relay: relay,
     web: web
@@ -65,24 +69,14 @@ defmodule AttentionServer.SelfSignedEnrollmentTest do
              relay_approve(relay, person, owner_key, pending.approval_code, [])
 
     assert_rejected(
-      connect_with_key(WebSocketRelay.port(web), certs, "local-device", "local-owner")
+      connect_with_key(ClientAPI.Listener.port(web), certs, "local-device", "local-owner")
     )
 
+    # The enrollment access proof: one authenticated GET /v2/inbox?limit=1.
     assert {:ok, socket} = connect(web, certs, "local-device")
-
-    assert :ok =
-             :ssl.send(socket, [
-               "GET /relay HTTP/1.1\r\n",
-               "Host: relay.test\r\n",
-               "Upgrade: websocket\r\n",
-               "Connection: Upgrade\r\n",
-               "Sec-WebSocket-Version: 13\r\n",
-               "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n",
-               "Sec-WebSocket-Protocol: attention-relay/1\r\n\r\n"
-             ])
-
+    assert :ok = :ssl.send(socket, @access_proof)
     assert {:ok, response} = :ssl.recv(socket, 0, 3_000)
-    assert String.starts_with?(response, "HTTP/1.1 101")
+    assert String.starts_with?(response, "HTTP/1.1 200")
     :ssl.close(socket)
     assert :ok = Relay.owner_revoke_device(relay, person, owner_key, device_key)
     assert_rejected(connect(web, certs, "local-device"))
@@ -139,12 +133,17 @@ defmodule AttentionServer.SelfSignedEnrollmentTest do
     end
   end
 
-  defp connect(web, certs, name), do: connect_port(WebSocketRelay.port(web), certs, name)
+  defp connect(web, certs, name), do: connect_port(ClientAPI.Listener.port(web), certs, name)
 
   defp assert_rejected({:error, _}), do: :ok
 
+  # A TLS 1.3 client may finish its side of the handshake before the server
+  # refuses the certificate. A refused peer then reads an alert or a close; an
+  # admitted one would get an HTTP answer to the proof request.
   defp assert_rejected({:ok, socket}) do
-    assert {:error, _} = :ssl.recv(socket, 0, 3_000)
+    _ = :ssl.send(socket, @access_proof)
+    assert {:error, reason} = :ssl.recv(socket, 0, 3_000)
+    refute reason == :timeout
     :ssl.close(socket)
   end
 

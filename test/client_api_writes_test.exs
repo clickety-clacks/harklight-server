@@ -660,6 +660,49 @@ defmodule AttentionServer.ClientAPIWritesTest do
       GenServer.stop(relay)
     end
 
+    test "no comment finalizes a choice request and a reply-only request with no payload",
+         %{path: path, flags: flags} do
+      relay = scripted_relay(path, flags)
+
+      forward_message(relay, 40, %{
+        "message_id" => "pick",
+        "message_type" => "request",
+        "answer_ui" => @choices
+      })
+
+      forward_message(relay, 41, %{
+        "message_id" => "reply-only",
+        "message_type" => "request",
+        "body" => "Please write a response",
+        "answer_ui" => %{
+          "schema" => "attention-client.actions/1",
+          "actions" => [%{"id" => "reply", "label" => "Reply", "kind" => "text"}]
+        }
+      })
+
+      for id <- ["pick", "reply-only"] do
+        item_id = item_id(relay, id)
+        k = key()
+
+        assert {:ok, 200, %{"item" => %{"terminal" => terminal}} = body, false} =
+                 Writes.answer(relay, "reader", item_id, 1, :no_comment, k)
+
+        assert terminal["state"] == "answered"
+        assert terminal["answer"] == %{"kind" => "no_comment"}
+
+        assert %{kind: "no_comment", answer_present: false, answer: nil} =
+                 stored = stored_terminal(relay, id)
+
+        # The same request is the stored response; it settles nothing again.
+        assert {:ok, 200, ^body, true} =
+                 Writes.answer(relay, "reader", item_id, 1, :no_comment, k)
+
+        assert stored_terminal(relay, id) == stored
+      end
+
+      GenServer.stop(relay)
+    end
+
     test "a refused request does not consume its key: the same request is evaluated again",
          %{path: path, flags: flags} do
       relay = scripted_relay(path, flags)

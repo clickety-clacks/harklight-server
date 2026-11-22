@@ -6,7 +6,7 @@ defmodule AttentionServer.ClientAPIFeedShowTest do
 
   import AttentionServer.ClientAPIFeedClient
 
-  alias AttentionServer.{ChangeLog, ClientAPI, JSON, Relay, Server, TLSFixtures}
+  alias AttentionServer.{ChangeLog, ClientAPI, JSON, Relay, TLSFixtures}
   alias AttentionServer.ClientAPI.{Context, FeedStream, Writes}
 
   @handle "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
@@ -397,46 +397,6 @@ defmodule AttentionServer.ClientAPIFeedShowTest do
     assert accepted.status == 200
     assert %{"show_id" => explicit_id, "device_id" => ^reader, "state" => "held"} = body(accepted)
     assert explicit_id != id
-    Mint.HTTP.close(conn)
-  end
-
-  test "the flag-off device listener has no agent show route", ctx do
-    flags = Path.join(ctx.dir, "flags-disabled.json")
-    File.write!(flags, ~s({"client_api_v2":false}))
-
-    server =
-      start_supervised!(
-        {Server,
-         store_path: Path.join(ctx.dir, "disabled.sqlite3"),
-         feature_flags_path: flags,
-         enrollment_enabled: false,
-         certfile: Path.join(ctx.certs, "server.pem"),
-         keyfile: Path.join(ctx.certs, "server.key"),
-         cacertfile: Path.join(ctx.certs, "ca.pem")}
-      )
-
-    refute Server.client_api_v2?(server)
-    relay = Server.relay(server)
-    assert :ok = Relay.setup_person(relay, "A")
-
-    assert {:ok, _key} =
-             Relay.setup_device_certificate(
-               relay,
-               "A",
-               TLSFixtures.certificate_der!(ctx.certs, "a2")
-             )
-
-    conn = connect(Server.port(server), ctx.certs, "a2", :http1)
-
-    {conn, refused} =
-      show_request(conn, "00000000-0000-4000-8000-000000000010", %{
-        "item_id" => "i1",
-        "target" => "message"
-      })
-
-    assert refused.status == 400
-    assert refused.body == ""
-    refute Enum.any?(refused.headers, fn {name, _} -> name == "request-id" end)
     Mint.HTTP.close(conn)
   end
 

@@ -40,7 +40,7 @@ defmodule AttentionServer.ClientAPI.Reads do
   @default_limit 50
   @max_limit 200
 
-  ## Routes (mounted by ClientAPI.Router behind client_api_v2)
+  ## Routes (mounted by ClientAPI.Router)
 
   @impl true
   def routes do
@@ -666,7 +666,7 @@ defmodule AttentionServer.ClientAPI.Reads do
   defp head(state, person) do
     case ChangeLog.head(state.store, person) do
       {:ok, head} -> {:ok, head}
-      # With client_api_v2 off there is no /v2 to read.
+      # A store without a change log has no /v2 to read.
       {:error, :disabled} -> {:error, :not_found}
       _ -> {:error, :storage_unavailable}
     end

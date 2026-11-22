@@ -6,7 +6,7 @@ defmodule AttentionServer.Diagnostics do
   alias AttentionServer.Message
 
   @operations ~w(device_relay origin_https enrollment_https owner_tls apns_dispatch upload_cleanup dashboard_http client_api server_storage server_startup)a
-  @phases ~w(listener_start listener_address accept worker_start socket_control server_terminate tls_handshake peer_certificate identity authentication session_setup relay_boundary websocket_upgrade request_read request_dispatch response_write response_drain stream_attach stream_detach stream_status stream_write stream_read upload_begin upload_read upload_commit file_fetch file_read file_cleanup push_claim push_request push_finish configuration startup_cleanup periodic_cleanup state_commit upload_stage upload_publish upload_verify upload_delete store_open store_close)a
+  @phases ~w(listener_start listener_address accept worker_start socket_control server_terminate tls_handshake peer_certificate identity authentication relay_boundary request_read request_dispatch response_write stream_attach stream_detach stream_status stream_write stream_read upload_begin upload_read upload_commit file_fetch file_read file_cleanup push_claim push_request push_finish configuration startup_cleanup periodic_cleanup state_commit upload_stage upload_publish upload_verify upload_delete store_open store_close)a
   @outcomes ~w(failed retry retry_100ms closed rejected response_unknown outcome_unknown unavailable canceled)a
 
   @causes %{
@@ -49,7 +49,6 @@ defmodule AttentionServer.Diagnostics do
     unexpected_message: "tls_unexpected_message",
     decode_error: "tls_decode_error",
     internal_error: "tls_internal_error",
-    bad_upgrade: "websocket_upgrade_rejected",
     bad_frame: "protocol_frame_rejected",
     invalid_json: "invalid_json",
     storage_unavailable: "storage_unavailable",

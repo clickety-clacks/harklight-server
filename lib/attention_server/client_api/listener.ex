@@ -3,9 +3,8 @@ defmodule AttentionServer.ClientAPI.Listener do
   The device listener for client API v2: Bandit over TLS 1.3 with mutual TLS,
   HTTP/2 through ALPN and HTTP/1.1, serving `/v2` only.
 
-  It takes the device relay's port when `client_api_v2` is on; the server never
-  runs it beside `WebSocketRelay`. It admits enrolled device certificates and
-  owner-registered agent certificates.
+  It is the only listener on the device port. It admits enrolled device
+  certificates and owner-registered agent certificates.
   """
 
   alias AttentionServer.ClientAPI.Router

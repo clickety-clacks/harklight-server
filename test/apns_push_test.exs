@@ -80,6 +80,7 @@ defmodule AttentionServer.APNSPushTest do
 
   alias AttentionServer.{
     APNS,
+    ClientAPIFeedClient,
     DeviceIdentity,
     Engine,
     JSON,
@@ -155,7 +156,7 @@ defmodule AttentionServer.APNSPushTest do
     }
   end
 
-  for flags <- [:default, :explicit_on] do
+  for flags <- [:default, :stale_off] do
     test "v2 (#{flags}) bounds a stalled first push, dispatches to another device and retries after restart",
          ctx do
       log = capture_log(fn -> assert_bounded_push_and_restart(ctx, unquote(flags)) end)
@@ -175,31 +176,6 @@ defmodule AttentionServer.APNSPushTest do
 
     refute log =~ @device_token
     refute log =~ "First push"
-  end
-
-  test "with v2 off the dispatcher waits for the provider response", ctx do
-    store_path = Path.join(ctx.dir, "legacy-push.sqlite3")
-    apns = apns_options(ctx) ++ [attempt_timeout_ms: 1_500]
-    server = start_test_server(server_options(ctx.certs, store_path) ++ [apns: apns])
-
-    refute Server.client_api_v2?(server)
-    relay = Server.relay(server)
-    {sender_key, app_key} = setup_test_devices(relay, ctx.certs)
-    path = "/3/device/" <> @device_token
-
-    hold_provider_response(ctx, path)
-    register_test_binding(relay, app_key, @device_token, 1)
-    forward_test_message(relay, sender_key)
-
-    assert_receive {:apns_request, "POST", ^path, _, _}, 2_000
-    assert_receive {:provider_waiting, handler}, 1_000
-    refute_receive {:apns_request, "POST", ^path, _, _}, 2_500
-
-    assert %{"push" => %{"state" => "sending", "attempt_count" => 1}} =
-             request_frame(relay, app_key, %{"type" => "push_status"})
-
-    send(handler, :release_provider_response)
-    assert_push_accepted(relay, app_key, 1)
   end
 
   test "a provider transport failure keeps retry identity and emits retrievable safe cause",
@@ -295,6 +271,40 @@ defmodule AttentionServer.APNSPushTest do
     assert outcome.http_status == 410
     assert outcome.reason == "Unregistered"
     assert outcome.invalidated_at_ms == registered_at
+  end
+
+  test "a dispatcher started without options bounds a stalled provider attempt", ctx do
+    claim = dispatcher_claim()
+    relay = start_dispatcher_test_relay(self(), [:ok], [claim])
+    owner = self()
+
+    stalled_send = fn _config, _claim, _cached_token ->
+      send(owner, {:stalled_attempt, self()})
+
+      receive do
+        :release_stalled_attempt -> {%{state: "provider_accepted"}, nil}
+      end
+    end
+
+    {:ok, dispatcher} =
+      AttentionServer.PushDispatcher.start_link(
+        relay: relay,
+        apns: apns_options(ctx) ++ [attempt_timeout_ms: 200],
+        apns_send: stalled_send
+      )
+
+    Process.unlink(dispatcher)
+    on_exit(fn -> if Process.alive?(dispatcher), do: GenServer.stop(dispatcher) end)
+
+    log =
+      capture_log(fn ->
+        assert_receive {:stalled_attempt, attempt}, 2_000
+        monitor = Process.monitor(attempt)
+        assert_receive {:apns_relay_finish, %{state: "retry"}}, 2_000
+        assert_receive {:DOWN, ^monitor, :process, ^attempt, _reason}, 2_000
+      end)
+
+    assert log =~ ~r/event=harklight_apns_attempt duration_ms=\d+ outcome=timeout\b/
   end
 
   test "a configured dispatcher recovers after its initial start fails with backoff", ctx do
@@ -805,59 +815,30 @@ defmodule AttentionServer.APNSPushTest do
                }) <> "\n"
              )
 
-    {:ok, sender_socket} = connect(first_server, certs, "a1")
-    assert upgrade(sender_socket) =~ "101 Switching Protocols"
-    assert {[], %{"seq" => 0}} = resync(sender_socket)
+    # The app device reads the persisted server identity and registers over v2.
+    me = v2(first_server, certs, "a2", "GET", "/v2/me")
+    assert me.status == 200
+    assert json(me)["server"]["id"] == persisted_server
 
-    {:ok, app_socket} = connect(first_server, certs, "a2")
-    assert upgrade(app_socket) =~ "101 Switching Protocols"
+    registered =
+      register_push(first_server, certs, "a2", String.upcase(@device_token), 1, op(1))
 
-    assert {[], %{"seq" => 0, "server" => ^persisted_server, "feature_flags" => %{}}} =
-             resync(app_socket)
-
-    assert :ok =
-             send_request(app_socket, %{
-               "type" => "push_register",
-               "ref" => "register",
-               "op_id" => op(1),
-               "revision" => 1,
-               "profile_id" => @provider_profile,
-               "address_kind" => "apns_token",
-               "address" => String.upcase(@device_token)
-             })
-
-    register_reply = reply(app_socket)
+    assert registered.status == 200
 
     assert %{
-             "type" => "ok",
-             "ref" => "register",
+             "state" => "ready",
              "revision" => 1,
              "binding_id" => binding_id,
-             "profile_id" => @provider_profile
-           } = register_reply
+             "environment" => "sandbox"
+           } = json(registered)["settings"]["push"]
 
     assert AttentionServer.Message.uuid_v4?(binding_id)
-    refute Map.has_key?(register_reply, "address")
-
-    assert :ok = send_request(app_socket, %{"type" => "push_status", "ref" => "status"})
-    status_reply = reply(app_socket)
-
-    assert %{
-             "type" => "ok",
-             "push" => %{
-               "state" => "ready",
-               "revision" => 1,
-               "binding_id" => ^binding_id,
-               "profile_id" => @provider_profile
-             }
-           } = status_reply
-
-    refute Map.has_key?(status_reply["push"], "address")
+    refute String.downcase(registered.body) =~ @device_token
+    assert push_settings(first_server, certs, "a2") == json(registered)["settings"]["push"]
 
     accept_test_delivery(
       relay,
       a1_key,
-      sender_socket,
       3,
       "apns-delivery",
       %{
@@ -868,8 +849,6 @@ defmodule AttentionServer.APNSPushTest do
 
     refute_receive {:apns_request, _, _, _}, 100
 
-    :ok = :ssl.close(sender_socket)
-    :ok = :ssl.close(app_socket)
     assert :ok = Supervisor.stop(first_server)
     seed_legacy_push_format16_past_window(store_path)
 
@@ -934,59 +913,43 @@ defmodule AttentionServer.APNSPushTest do
     assert_jwt_signature(key_path, dir, header64 <> "." <> claims64, signature)
 
     relay = Server.relay(server)
-    assert {:ok, app_socket} = connect(server, certs, "a2")
-    assert upgrade(app_socket) =~ "101 Switching Protocols"
+    assert json(v2(server, certs, "a2", "GET", "/v2/me"))["server"]["id"] == persisted_server
+    inbox = v2(server, certs, "a2", "GET", "/v2/inbox")
+    assert inbox.status == 200
 
-    assert {[%{"type" => "delivery", "seq" => 1}], %{"seq" => 1, "server" => ^persisted_server}} =
-             resync(app_socket)
+    assert [%{"item_id" => item_id}] =
+             Enum.filter(
+               json(inbox)["items"],
+               &(&1["message"]["message_id"] == "apns-delivery")
+             )
 
-    assert_push_state(app_socket, "ready")
+    assert_push_settings_state(server, certs, "a2", "ready")
 
-    assert :ok =
-             send_request(app_socket, %{
-               "type" => "push_register",
-               "ref" => "register-retry",
-               "op_id" => op(1),
-               "revision" => 1,
-               "profile_id" => @provider_profile,
-               "address_kind" => "apns_token",
-               "address" => String.upcase(@device_token)
-             })
+    # The same request again is its stored response; the key cannot name another token.
+    retry = register_push(server, certs, "a2", String.upcase(@device_token), 1, op(1))
+    assert retry.status == 200
+    assert {"idempotent-replayed", "true"} in retry.headers
+    assert json(retry)["settings"]["push"]["binding_id"] == binding_id
 
-    assert %{
-             "type" => "ok",
-             "ref" => "register-retry",
-             "revision" => 1,
-             "binding_id" => ^binding_id,
-             "profile_id" => @provider_profile,
-             "duplicate" => true
-           } = reply(app_socket)
-
-    assert :ok =
-             send_request(app_socket, %{
-               "type" => "push_register",
-               "op_id" => op(1),
-               "revision" => 1,
-               "profile_id" => @provider_profile,
-               "address_kind" => "apns_token",
-               "address" => String.duplicate("cd", 32)
-             })
-
-    assert %{"type" => "error", "reason" => "operation_conflict"} = reply(app_socket)
+    conflict = register_push(server, certs, "a2", String.duplicate("cd", 32), 1, op(1))
+    assert conflict.status == 409
+    assert json(conflict)["error"] == "idempotency_conflict"
 
     assert :ok = Supervisor.terminate_child(server, :push_dispatcher)
 
-    assert :ok =
-             send_request(app_socket, %{
-               "type" => "answer",
-               "op_id" => op(4),
-               "sender_id" => "app:test",
-               "message_id" => "apns-delivery",
-               "answer" => "received"
-             })
+    answered =
+      v2(
+        server,
+        certs,
+        "a2",
+        "POST",
+        "/v2/items/#{item_id}/answer",
+        %{"request_revision" => 1, "comment" => "received"},
+        [{"idempotency-key", op(4)}]
+      )
 
-    assert %{"type" => "ok", "seq" => 2} = reply(app_socket)
-    assert %{"type" => "lifecycle", "seq" => 2} = reply(app_socket)
+    assert answered.status == 200
+    assert json(answered)["item"]["terminal"]["state"] == "answered"
 
     assert {:ok, nil} = Relay.claim_push(relay, System.system_time(:millisecond) + 1_000)
     assert {:ok, claim} = Relay.claim_push(relay, System.system_time(:millisecond) + 300_001)
@@ -1017,20 +980,14 @@ defmodule AttentionServer.APNSPushTest do
                System.system_time(:millisecond) + 300_002
              )
 
-    assert :ok =
-             send_request(app_socket, %{
-               "type" => "push_remove",
-               "op_id" => op(5),
-               "revision" => 2
-             })
+    removed =
+      v2(server, certs, "a2", "DELETE", "/v2/devices/me/push", nil, [
+        {"idempotency-key", op(5)}
+      ])
 
-    assert %{"type" => "ok", "revision" => 2} = reply(app_socket)
-    assert :ok = send_request(app_socket, %{"type" => "push_status"})
-
-    assert %{"type" => "ok", "push" => %{"state" => "canceled", "revision" => 2}} =
-             reply(app_socket)
-
-    :ssl.close(app_socket)
+    assert removed.status == 200
+    assert %{"state" => "canceled", "revision" => 2} = json(removed)["settings"]["push"]
+    assert push_settings(server, certs, "a2")["state"] == "canceled"
   end
 
   test "each registered profile persists and routes its push to the matching APNs environment",
@@ -1241,38 +1198,32 @@ defmodule AttentionServer.APNSPushTest do
     server = start_apns_server(ctx, store_path)
     assert :ok = Supervisor.terminate_child(server, :push_dispatcher)
     relay = Server.relay(server)
-    {sender_key, _app_key} = setup_test_devices(relay, certs)
-    sender_socket = open_test_socket(server, certs, "a1")
-    app_socket = open_test_socket(server, certs, "a2")
+    {sender_key, app_key} = setup_test_devices(relay, certs)
 
-    assert %{"type" => "ok", "revision" => 1} = register_push(app_socket, 21, 1)
-    accept_test_delivery(relay, sender_key, sender_socket, 40, "reason-redaction")
-    assert %{"type" => "delivery", "seq" => 1} = reply(app_socket)
+    assert register_push(server, certs, "a2", @device_token, 1, op(21)).status == 200
+    accept_test_delivery(relay, sender_key, 40, "reason-redaction")
     send_queued_push(ctx, relay)
 
     assert_receive {:apns_request, "POST", _path, _headers, _body}, 12_000
-    assert_push_state(app_socket, "blocked_configuration")
+    assert_push_settings_state(server, certs, "a2", "blocked_configuration")
 
-    status = read_push_status(app_socket)
-    refute Map.has_key?(status["push"]["last_outcome"], "reason")
-    refute JSON.encode!(status) =~ @device_token
+    binding = stored_binding(relay, app_key)
+    refute Map.has_key?(binding.last_outcome, "reason")
+    refute inspect(binding.last_outcome) =~ @device_token
+    refute v2(server, certs, "a2", "GET", "/v2/settings").body =~ @device_token
 
-    :ok = :ssl.close(sender_socket)
-    :ok = :ssl.close(app_socket)
     assert :ok = Supervisor.stop(server)
 
     seed_legacy_provider_reason(store_path, @device_token)
 
     server = start_apns_server(ctx, store_path)
-    app_socket = open_test_socket(server, certs, "a2")
-    status = read_push_status(app_socket)
+    relay = Server.relay(server)
+    settings = v2(server, certs, "a2", "GET", "/v2/settings")
 
-    assert status["push"]["state"] == "blocked_configuration"
-    refute Map.has_key?(status["push"]["last_outcome"], "reason")
-    refute Map.has_key?(status["push"], "address")
-    refute JSON.encode!(status) =~ @device_token
+    assert json(settings)["settings"]["push"]["state"] == "blocked_configuration"
+    refute settings.body =~ @device_token
+    refute Map.has_key?(stored_binding(relay, app_key).last_outcome, "reason")
 
-    :ok = :ssl.close(app_socket)
     assert :ok = Supervisor.stop(server)
   end
 
@@ -1519,46 +1470,36 @@ defmodule AttentionServer.APNSPushTest do
     server = start_apns_server(ctx, store_path)
     assert :ok = Supervisor.terminate_child(server, :push_dispatcher)
     relay = Server.relay(server)
-    {sender_key, _app_key} = setup_test_devices(relay, certs)
-    sender_socket = open_test_socket(server, certs, "a1")
-    app_socket = open_test_socket(server, certs, "a2")
+    {sender_key, app_key} = setup_test_devices(relay, certs)
 
-    assert %{"type" => "ok", "revision" => 1} = register_push(app_socket, 31, 1)
-    accept_test_delivery(relay, sender_key, sender_socket, 40, "bad-device-token")
-    assert %{"type" => "delivery", "seq" => 1} = reply(app_socket)
+    assert register_push(server, certs, "a2", @device_token, 1, op(31)).status == 200
+    accept_test_delivery(relay, sender_key, 40, "bad-device-token")
     send_queued_push(ctx, relay)
 
     assert_receive {:apns_request, "POST", _path, _headers, _body}, 12_000
-    assert_push_state(app_socket, "endpoint_invalid")
+    assert_push_settings_state(server, certs, "a2", "endpoint_invalid")
 
-    status = read_push_status(app_socket)
-    assert get_in(status, ["push", "last_outcome", "reason"]) == "BadDeviceToken"
-    refute Map.has_key?(status["push"], "address")
-    refute JSON.encode!(status) =~ @device_token
+    settings = v2(server, certs, "a2", "GET", "/v2/settings")
+    refute Map.has_key?(json(settings)["settings"]["push"], "binding_id")
+    refute settings.body =~ @device_token
+    assert stored_binding(relay, app_key).last_outcome["reason"] == "BadDeviceToken"
     assert {:ok, nil} = Relay.claim_push(relay, System.system_time(:millisecond) + 86_400_000)
     refute_receive {:apns_request, _, _, _, _}, 1_100
 
-    :ok = :ssl.close(sender_socket)
-    :ok = :ssl.close(app_socket)
     assert :ok = Supervisor.stop(server)
 
     server = start_apns_server(ctx, store_path)
     assert :ok = Supervisor.terminate_child(server, :push_dispatcher)
     relay = Server.relay(server)
-    app_socket = open_test_socket(server, certs, "a2")
-    status = read_push_status(app_socket)
 
-    assert status["push"]["state"] == "endpoint_invalid"
-    assert get_in(status, ["push", "last_outcome", "reason"]) == "BadDeviceToken"
-    refute Map.has_key?(status["push"], "address")
+    assert push_settings(server, certs, "a2")["state"] == "endpoint_invalid"
+    assert stored_binding(relay, app_key).last_outcome["reason"] == "BadDeviceToken"
     assert {:ok, nil} = Relay.claim_push(relay, System.system_time(:millisecond) + 86_400_000)
 
-    sender_socket = open_test_socket(server, certs, "a1")
-    assert %{"type" => "ok", "revision" => 1} = register_push(sender_socket, 32, 1)
+    # The released address can be registered by another device.
+    assert register_push(server, certs, "a1", @device_token, 1, op(32)).status == 200
     refute_receive {:apns_request, _, _, _, _}, 1_100
 
-    :ok = :ssl.close(sender_socket)
-    :ok = :ssl.close(app_socket)
     assert :ok = Supervisor.stop(server)
   end
 
@@ -1620,15 +1561,7 @@ defmodule AttentionServer.APNSPushTest do
     assert String.trim(verification) == "Verified OK"
   end
 
-  # These tests register and observe push over the retained /relay device
-  # path, so they opt out of the v2 default. The bounded-attempt test starts
-  # from base_server_options/2 to run on the v2 path.
   defp server_options(certs, store_path) do
-    base_server_options(certs, store_path) ++
-      [feature_flags_path: AttentionServer.LegacyProtocol.flags!(Path.dirname(store_path))]
-  end
-
-  defp base_server_options(certs, store_path) do
     [
       store_path: store_path,
       certfile: Path.join(certs, "server.pem"),
@@ -1731,18 +1664,18 @@ defmodule AttentionServer.APNSPushTest do
         :default ->
           []
 
-        :explicit_on ->
+        :stale_off ->
+          # A file left from an earlier release is ignored: attempts stay bounded.
           path = Path.join(ctx.dir, "flags.json")
-          File.write!(path, ~s({"client_api_v2":true}))
+          File.write!(path, ~s({"client_api_v2":false}))
           [feature_flags_path: path]
       end
 
     options =
-      base_server_options(ctx.certs, store_path) ++
+      server_options(ctx.certs, store_path) ++
         [apns: apns_options(ctx) ++ [attempt_timeout_ms: 10_000]] ++ flag_options
 
     server = start_test_server(options)
-    assert Server.client_api_v2?(server)
     relay = Server.relay(server)
     {sender_key, app_key} = setup_test_devices(relay, ctx.certs)
     # A single send queues both devices at the same instant. The worker
@@ -1752,7 +1685,7 @@ defmodule AttentionServer.APNSPushTest do
     # Use the real worker state and advance one dispatch at a time so we can
     # inspect its durable retry before the next poll can claim it again.
     state = :sys.get_state(push_worker(server))
-    assert %{bounded_attempts?: true, attempt_timeout_ms: 10_000} = state
+    assert %{attempt_timeout_ms: 10_000} = state
     assert :ok = Supervisor.terminate_child(server, :push_dispatcher)
 
     slow_path = "/3/device/" <> @device_token
@@ -1855,26 +1788,6 @@ defmodule AttentionServer.APNSPushTest do
     worker
   end
 
-  defp hold_provider_response(ctx, slow_path) do
-    owner = self()
-
-    Agent.update(ctx.provider_response, fn _ ->
-      fn
-        ^slow_path ->
-          send(owner, {:provider_waiting, self()})
-
-          receive do
-            :release_provider_response -> {200, ""}
-          after
-            15_000 -> {200, ""}
-          end
-
-        _ ->
-          {200, ""}
-      end
-    end)
-  end
-
   defp register_test_binding(relay, key, token, operation) do
     assert %{"type" => "ok"} =
              request_frame(relay, key, %{
@@ -1942,25 +1855,63 @@ defmodule AttentionServer.APNSPushTest do
     {sender_key, app_key}
   end
 
-  defp open_test_socket(server, certs, name) do
-    {:ok, socket} = connect(server, certs, name)
-    assert upgrade(socket) =~ "101 Switching Protocols"
-    _ = resync(socket)
-    socket
+  # Client API v2 on the device port, as the app registers and reads push.
+  defp v2(server, certs, name, method, path, body \\ nil, headers \\ []) do
+    conn = ClientAPIFeedClient.connect(Server.port(server), certs, name)
+
+    {body, headers} =
+      if body,
+        do: {JSON.encode!(body), [{"content-type", "application/json"} | headers]},
+        else: {nil, headers}
+
+    {:ok, conn, ref} = Mint.HTTP.request(conn, method, path, headers, body)
+    {conn, response} = ClientAPIFeedClient.collect(conn, ref)
+    Mint.HTTP.close(conn)
+    response
   end
 
-  defp register_push(socket, operation, revision) do
-    assert :ok =
-             send_request(socket, %{
-               "type" => "push_register",
-               "op_id" => op(operation),
-               "revision" => revision,
-               "profile_id" => @provider_profile,
-               "address_kind" => "apns_token",
-               "address" => @device_token
-             })
+  defp json(response) do
+    assert {:ok, body} = JSON.decode_line(response.body <> "\n")
+    body
+  end
 
-    reply(socket)
+  defp register_push(server, certs, name, token, revision, key) do
+    v2(
+      server,
+      certs,
+      name,
+      "PUT",
+      "/v2/devices/me/push",
+      %{"token" => token, "environment" => "sandbox", "revision" => revision},
+      [{"idempotency-key", key}]
+    )
+  end
+
+  defp push_settings(server, certs, name) do
+    response = v2(server, certs, name, "GET", "/v2/settings")
+    assert response.status == 200
+    json(response)["settings"]["push"]
+  end
+
+  defp assert_push_settings_state(server, certs, name, expected, attempts \\ 50)
+
+  defp assert_push_settings_state(_server, _certs, _name, _expected, 0),
+    do: flunk("push state did not settle")
+
+  defp assert_push_settings_state(server, certs, name, expected, attempts) do
+    if push_settings(server, certs, name)["state"] != expected do
+      Process.sleep(20)
+      assert_push_settings_state(server, certs, name, expected, attempts - 1)
+    end
+  end
+
+  defp stored_binding(relay, key) do
+    {_key, binding} =
+      Enum.find(:sys.get_state(relay).store.engine.push_bindings, fn {{_person, device}, _} ->
+        device == key
+      end)
+
+    binding
   end
 
   defp request_frame(relay, key, frame) do
@@ -1971,14 +1922,7 @@ defmodule AttentionServer.APNSPushTest do
     reply
   end
 
-  defp accept_test_delivery(
-         relay,
-         sender_key,
-         socket,
-         operation,
-         message_id,
-         extra_fields \\ %{}
-       ) do
+  defp accept_test_delivery(relay, sender_key, operation, message_id, extra_fields \\ %{}) do
     message =
       %{
         "sender_id" => "app:test",
@@ -1995,13 +1939,6 @@ defmodule AttentionServer.APNSPushTest do
                "op_id" => op(operation),
                "message" => message
              })
-
-    assert %{"type" => "delivery", "seq" => 1} = reply(socket)
-  end
-
-  defp read_push_status(socket) do
-    assert :ok = send_request(socket, %{"type" => "push_status"})
-    reply(socket)
   end
 
   # Drives one already-eligible push the way the dispatcher would.
@@ -2088,96 +2025,6 @@ defmodule AttentionServer.APNSPushTest do
     assert :ok = Sqlite3.close(db)
   end
 
-  defp connect(server, certs, name) do
-    :ssl.connect({127, 0, 0, 1}, Server.port(server),
-      versions: [:"tlsv1.3"],
-      verify: :verify_peer,
-      cacertfile: String.to_charlist(Path.join(certs, "ca.pem")),
-      certfile: String.to_charlist(Path.join(certs, "#{name}.pem")),
-      keyfile: String.to_charlist(Path.join(certs, "#{name}.key")),
-      server_name_indication: ~c"relay.test",
-      session_tickets: :disabled,
-      active: false,
-      mode: :binary,
-      packet: :raw
-    )
-  end
-
-  defp upgrade(socket) do
-    assert :ok =
-             :ssl.send(socket, [
-               "GET /relay HTTP/1.1\r\n",
-               "Host: relay.test\r\n",
-               "Upgrade: websocket\r\n",
-               "Connection: Upgrade\r\n",
-               "Sec-WebSocket-Version: 13\r\n",
-               "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n",
-               "Sec-WebSocket-Protocol: attention-relay/1\r\n\r\n"
-             ])
-
-    read_http(socket, <<>>)
-  end
-
-  defp read_http(_socket, buffer) when byte_size(buffer) > 16_384, do: flunk("HTTP limit")
-
-  defp read_http(socket, buffer) do
-    if String.ends_with?(buffer, "\r\n\r\n") do
-      buffer
-    else
-      assert {:ok, byte} = :ssl.recv(socket, 1, 2_000)
-      read_http(socket, buffer <> byte)
-    end
-  end
-
-  defp resync(socket) do
-    assert :ok = send_request(socket, %{"type" => "resync", "since" => 0})
-    assert %{"type" => "ok"} = reply(socket)
-    drain_resync(socket, [])
-  end
-
-  defp drain_resync(socket, events) do
-    case reply(socket) do
-      %{"type" => "resynced"} = frame -> {Enum.reverse(events), frame}
-      event -> drain_resync(socket, [event | events])
-    end
-  end
-
-  defp send_request(socket, payload) do
-    payload = JSON.encode!(Map.put_new(payload, "v", 1)) <> "\n"
-    assert :ok = :ssl.send(socket, websocket_frame(payload))
-  end
-
-  defp websocket_frame(payload) do
-    mask = :crypto.strong_rand_bytes(4)
-    size = byte_size(payload)
-
-    header =
-      if size < 126,
-        do: <<1::1, 0::3, 1::4, 1::1, size::7>>,
-        else: <<1::1, 0::3, 1::4, 1::1, 126::7, size::16>>
-
-    repeated = :binary.copy(mask, div(size + 3, 4))
-    [header, mask, :crypto.exor(payload, binary_part(repeated, 0, size))]
-  end
-
-  defp reply(socket) do
-    assert {:ok, <<1::1, 0::3, 1::4, 0::1, length::7>>} = :ssl.recv(socket, 2, 2_000)
-
-    length =
-      case length do
-        126 ->
-          assert {:ok, <<size::16>>} = :ssl.recv(socket, 2, 2_000)
-          size
-
-        value ->
-          value
-      end
-
-    assert {:ok, payload} = :ssl.recv(socket, length, 2_000)
-    assert {:ok, value} = JSON.decode_line(payload)
-    value
-  end
-
   defp available_port do
     {:ok, socket} = :gen_tcp.listen(0, [:binary, active: false, reuseaddr: true])
     {:ok, {_address, port}} = :inet.sockname(socket)
@@ -2193,21 +2040,6 @@ defmodule AttentionServer.APNSPushTest do
       |> :public_key.pem_decode()
 
     der
-  end
-
-  defp assert_push_state(socket, expected, attempts \\ 50)
-  defp assert_push_state(_socket, _expected, 0), do: flunk("push state did not settle")
-
-  defp assert_push_state(socket, expected, attempts) do
-    assert :ok = send_request(socket, %{"type" => "push_status"})
-    reply = reply(socket)
-
-    if get_in(reply, ["push", "state"]) == expected do
-      :ok
-    else
-      Process.sleep(20)
-      assert_push_state(socket, expected, attempts - 1)
-    end
   end
 
   defp op(number), do: "00000000-0000-4000-8000-" <> String.pad_leading("#{number}", 12, "0")

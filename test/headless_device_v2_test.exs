@@ -391,39 +391,6 @@ defmodule AttentionServer.HeadlessDeviceV2Test do
     for {name, bytes} <- legacy, do: assert(File.read!(Path.join(directory, name)) == bytes)
   end
 
-  test "against a server serving only the retained /relay path the tools fail, not hang", ctx do
-    relay =
-      start_supervised!(
-        {Relay,
-         store_path: Path.join(ctx.dir, "legacy.sqlite3"),
-         feature_flags_path: AttentionServer.LegacyProtocol.flags!(ctx.dir)},
-        id: :legacy_relay,
-        restart: :temporary
-      )
-
-    assert :ok = Relay.setup_person(relay, "A")
-    assert {:ok, _} = Relay.setup_device_certificate(relay, "A", certificate_der!(ctx, "a1"))
-
-    web =
-      start_supervised!(
-        {AttentionServer.WebSocketRelay,
-         relay: relay,
-         certfile: Path.join(ctx.certs, "server.pem"),
-         keyfile: Path.join(ctx.certs, "server.key"),
-         cacertfile: Path.join(ctx.certs, "ca.pem")},
-        id: :legacy_web
-      )
-
-    endpoint = %{ctx.endpoint | port: AttentionServer.WebSocketRelay.port(web)}
-    directory = Path.join(ctx.dir, "legacy-device")
-    File.cp_r!(ctx.identities["a1"], directory)
-    rewrite_port!(directory, endpoint.port)
-
-    task = Task.async(fn -> HeadlessDevice.read(directory, endpoint) end)
-    assert {:error, _reason} = Task.await(task, 10_000)
-    assert {:error, :access_proof_failed} = HeadlessEnrollment.verify_access(directory, endpoint)
-  end
-
   test "stored metadata keeps its byte limit with and without LF", ctx do
     identity = ctx.identities["a1"]
     max_bytes = 2 * (2 * 1024 * 1024) + 16_384
@@ -515,14 +482,6 @@ defmodule AttentionServer.HeadlessDeviceV2Test do
       "enrollment.json" => ~s|{"person_id":"A","device_id":"#{ctx.keys["a1"]}"}|
     }
   end
-
-  defp rewrite_port!(directory, port) do
-    path = Path.join(directory, "server.json")
-    {:ok, saved} = JSON.decode_line(File.read!(path) <> "\n")
-    File.write!(path, JSON.encode!(Map.put(saved, "port", port)) <> "\n")
-  end
-
-  defp certificate_der!(ctx, name), do: TLSFixtures.certificate_der!(ctx.certs, name)
 
   defp answer_file!(dir, value, name \\ "answer.json") do
     path = Path.join(dir, name)

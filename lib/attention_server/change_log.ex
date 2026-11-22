@@ -15,7 +15,7 @@ defmodule AttentionServer.ChangeLog do
   `rev` order with no gap.
 
   Rows are written only while `Store.enable_change_log/1` has been called,
-  which the Relay does at startup when the `client_api_v2` flag is on.
+  which the Relay does at startup. The supervised Server always enables it.
   """
 
   alias AttentionServer.{Engine, JSON}

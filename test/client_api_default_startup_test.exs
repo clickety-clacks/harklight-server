@@ -1,9 +1,8 @@
 defmodule AttentionServer.ClientAPIDefaultStartupTest do
-  # Server 0.2.0 serves client API v2 by default: a supervised Server with no
-  # `client_api_v2` setting starts /v2, both change logs and the v2 dashboard
-  # origin. An explicit `false` keeps the retained old-protocol fixture path
-  # until the flag is deleted. A Relay started directly, without a resolved
-  # value from Server, keeps reading the feature-flags file as before.
+  # Server 0.2.0 serves client API v2 only: a supervised Server starts /v2,
+  # both change logs and the v2 dashboard origin, whatever the feature-flags
+  # file says about `client_api_v2`. A Relay started directly, without the
+  # Server's value, keeps reading the feature-flags file as before.
   use ExUnit.Case, async: false
 
   alias AttentionServer.{
@@ -102,7 +101,6 @@ defmodule AttentionServer.ClientAPIDefaultStartupTest do
     end
 
     test "the device port serves /v2 only, beside every other listener", ctx do
-      assert Server.client_api_v2?(ctx.server)
       assert child?(ctx.server, :client_api)
       assert child?(ctx.server, :client_api_feed_shutdown)
       refute child?(ctx.server, :web_socket)
@@ -176,26 +174,68 @@ defmodule AttentionServer.ClientAPIDefaultStartupTest do
     end
   end
 
-  test "an explicit false keeps the retained /relay path with no change log", ctx do
-    flags = Path.join(ctx.dir, "flags.json")
-    File.write!(flags, ~s({"client_api_v2":false}))
+  describe "a feature-flags file" do
+    test "with client_api_v2 false still starts /v2 only, with no /relay", ctx do
+      flags = Path.join(ctx.dir, "flags.json")
+      File.write!(flags, ~s({"client_api_v2":false,"priority_level_editing":true}))
+      ctx = start_flagged_server(ctx, flags)
 
-    server =
-      start_server(
-        store_path: Path.join(ctx.dir, "legacy.sqlite3"),
-        feature_flags_path: flags,
-        certfile: Path.join(ctx.certs, "server.pem"),
-        keyfile: Path.join(ctx.certs, "server.key"),
-        cacertfile: Path.join(ctx.certs, "ca.pem"),
-        port: 0,
-        enrollment_enabled: false
-      )
+      assert child?(ctx.server, :client_api)
+      assert child?(ctx.server, :client_api_feed_shutdown)
+      refute child?(ctx.server, :web_socket)
+      assert :sys.get_state(ctx.relay).store.change_log
 
-    refute Server.client_api_v2?(server)
-    assert child?(server, :web_socket)
-    refute child?(server, :client_api)
-    refute child?(server, :client_api_feed_shutdown)
-    refute :sys.get_state(Server.relay(server)).store.change_log
+      me = get(ctx, "b1", "/v2/me")
+      assert me.status == 200
+      assert decode(me)["features"]["priority_level_editing"] == true
+
+      assert {:ok, socket} = raw_connect(ctx.certs, ctx.port, "b1")
+
+      :ok =
+        :ssl.send(socket, [
+          "GET /relay HTTP/1.1\r\nHost: relay.test\r\nUpgrade: websocket\r\n",
+          "Connection: Upgrade\r\nSec-WebSocket-Version: 13\r\n",
+          "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n",
+          "Sec-WebSocket-Protocol: attention-relay/1\r\n\r\n"
+        ])
+
+      reply = recv_until(socket, ~s("error":"not_found"), "")
+      assert reply =~ "HTTP/1.1 404"
+      assert reply =~ ~r/request-id: \S+/i
+      :ssl.close(socket)
+    end
+
+    test "that is malformed, unreadable or missing gives default features and v2 still serves",
+         ctx do
+      malformed = Path.join(ctx.dir, "malformed.json")
+      File.write!(malformed, "{not json")
+      unreadable = Path.join(ctx.dir, "unreadable.json")
+      File.mkdir_p!(unreadable)
+      missing = Path.join(ctx.dir, "missing.json")
+
+      for {flags, n} <- Enum.with_index([malformed, unreadable, missing]) do
+        ctx = start_flagged_server(ctx, flags, "flags-#{n}")
+        assert child?(ctx.server, :client_api)
+
+        me = get(ctx, "b1", "/v2/me")
+        assert me.status == 200
+
+        assert decode(me)["features"] == %{
+                 "server_matched_push_routing" => false,
+                 "priority_level_editing" => false
+               }
+
+        assert get(ctx, "b1", "/v2/inbox").status == 200
+        Supervisor.stop(ctx.server)
+      end
+    end
+  end
+
+  test "the protocol 0.1 device adapters and the flag query are gone" do
+    refute Code.ensure_loaded?(AttentionServer.WebSocketRelay)
+    refute Code.ensure_loaded?(AttentionServer.TLSRelay)
+    assert Code.ensure_loaded?(Server)
+    refute function_exported?(Server, :client_api_v2?, 1)
   end
 
   describe "a Relay started directly" do
@@ -239,6 +279,31 @@ defmodule AttentionServer.ClientAPIDefaultStartupTest do
     Process.unlink(server)
     on_exit(fn -> if Process.alive?(server), do: Supervisor.stop(server) end)
     server
+  end
+
+  defp start_flagged_server(ctx, flags, name \\ "flagged") do
+    server =
+      start_server(
+        store_path: Path.join(ctx.dir, name <> ".sqlite3"),
+        feature_flags_path: flags,
+        certfile: Path.join(ctx.certs, "server.pem"),
+        keyfile: Path.join(ctx.certs, "server.key"),
+        cacertfile: Path.join(ctx.certs, "ca.pem"),
+        port: 0,
+        enrollment_enabled: false
+      )
+
+    relay = Server.relay(server)
+    assert :ok = Relay.setup_person(relay, "A")
+
+    assert {:ok, _key} =
+             Relay.setup_device_certificate(
+               relay,
+               "A",
+               TLSFixtures.certificate_der!(ctx.certs, "b1")
+             )
+
+    Map.merge(ctx, %{server: server, relay: relay, port: Server.port(server)})
   end
 
   defp start_relay(opts) do

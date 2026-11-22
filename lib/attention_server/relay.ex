@@ -2,11 +2,9 @@ defmodule AttentionServer.Relay do
   @moduledoc """
   Serialized relay core with an optional durable SQLite store.
 
-  `request_line/3` retains the first slice's trusted-key test seam. The
-  `TLSRelay` and `WebSocketRelay` bind an OTP-verified TLS client certificate
-  to the enrolled SPKI key before opening a socket-backed session. The
-  WebSocket adapter opens it only after `/relay` subprotocol negotiation.
-  Owner-approved enrollment remains separate work.
+  `request_line/3` retains the first slice's trusted-key test seam. Devices
+  reach the Relay through client API v2 (`ClientAPI.Listener`); no listener
+  opens a socket-backed device session.
   """
 
   use GenServer
@@ -858,9 +856,8 @@ defmodule AttentionServer.Relay do
 
   # With the client_api_v2 flag on at startup, the store writes the change log
   # in every commit. It is decided once, here, before any startup commit.
-  # Server passes the value it resolved (on by default, explicit false kept); a
-  # Relay started directly without that option reads the feature-flags file,
-  # where an absent key stays off.
+  # Server always passes true; a Relay started directly without that option
+  # reads the feature-flags file, where an absent key stays off.
   # Change-log rows older than the retention window are pruned daily; a cursor
   # older than the oldest retained row gets cursor_expired.
   @change_log_retention_ms 30 * 24 * 60 * 60 * 1_000
@@ -7609,9 +7606,9 @@ defmodule AttentionServer.Relay do
   # Client API v2 focus (contract rulings round 11): today's focus report,
   # carried by PUT /v2/devices/me/focus instead of a session, and kept in
   # memory only, as today. Called only by ClientAPI.Focus inside the relay
-  # step, so with client_api_v2 off it never runs. A report applies today's
-  # reported_at rule and focus notices, and takes the device's held show; a
-  # lapse of its ttl, or signed_out, ends focus as today's disconnect does.
+  # step. A report applies today's reported_at rule and focus notices, and
+  # takes the device's held show; a lapse of its ttl, or signed_out, ends
+  # focus as today's disconnect does.
   # Returns {held_show | nil, state}.
   def client_api_focus(state, {:report, key, reported, token}) do
     now = state.clock.()

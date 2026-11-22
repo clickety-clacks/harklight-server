@@ -21,8 +21,8 @@ defmodule AttentionServer.ClientAPI.Idempotency do
 
   Receipts are kept for at least the change log's 30-day retention window, and
   older ones are pruned as new ones are written. The table lives in the
-  store's SQLite database beside the change log and exists only while
-  `client_api_v2` is on.
+  store's SQLite database beside the change log and exists only while the
+  change log is enabled.
 
   Writes also pass the key to the engine as today's operation id, so a retry
   from the same client is deduplicated by the engine's own receipts inside the

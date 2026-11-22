@@ -233,10 +233,11 @@ tests use the documented `mix test` command on a permitted development host;
 they do not establish real-device notification delivery.
 
 The existing runtime identifiers remain supported: Mix app `:attention_server`,
-namespace `AttentionServer`, `ATTENTION_SERVER_*` variables, `mix attention.*`,
-`bin/attention_server`, `/relay` and `attention-relay/1`. The protocol 0.1
-agent (`/agent/v1`) and origin (`/origin/v1`) listeners are retired; registered
-agents and the conversation CLI use client API v2 on the device port. Durable
+namespace `AttentionServer`, `ATTENTION_SERVER_*` variables, `mix attention.*`
+and `bin/attention_server`. The protocol 0.1 device WebSocket (`/relay`,
+`attention-relay/1`), agent (`/agent/v1`) and origin (`/origin/v1`) listeners
+are retired; devices, registered agents and the conversation CLI use client
+API v2 on the device port. Durable
 messages and operation receipts preserve first acceptance and exact retry
 semantics across restart. Tailnet access alone grants no person or sender rights.
 

@@ -352,9 +352,8 @@ end
 
 defmodule AttentionServer.ClientAPI.WebOrigin do
   @moduledoc """
-  The web origin's plug: `/v2` goes to the client API router when
-  `client_api_v2` is on, and answers 404 when it is off. Every other path goes
-  to the dashboard unchanged.
+  The web origin's plug: `/v2` goes to the client API router. Every other path
+  goes to the dashboard unchanged.
   """
 
   @behaviour Plug
@@ -366,22 +365,17 @@ defmodule AttentionServer.ClientAPI.WebOrigin do
     {dashboard, dashboard_opts} = Keyword.fetch!(opts, :dashboard)
 
     client_api =
-      if Keyword.get(opts, :client_api_v2, false) == true do
-        [
-          relay: Keyword.fetch!(opts, :relay),
-          auth: {:browser, Keyword.fetch!(opts, :backend), Keyword.get(opts, :expected_origin)}
-        ]
-        |> Keyword.merge(Keyword.take(opts, [:routes, :max_in_flight]))
-        |> Router.init()
-      end
+      [
+        relay: Keyword.fetch!(opts, :relay),
+        auth: {:browser, Keyword.fetch!(opts, :backend), Keyword.get(opts, :expected_origin)}
+      ]
+      |> Keyword.merge(Keyword.take(opts, [:routes, :max_in_flight]))
+      |> Router.init()
 
     %{dashboard: {dashboard, dashboard.init(dashboard_opts)}, client_api: client_api}
   end
 
   @impl Plug
-  def call(%Plug.Conn{path_info: ["v2" | _]} = conn, %{client_api: nil}),
-    do: Plug.Conn.send_resp(conn, 404, "Not found")
-
   def call(%Plug.Conn{path_info: ["v2" | _]} = conn, %{client_api: client_api}),
     do: Router.call(conn, client_api)
 

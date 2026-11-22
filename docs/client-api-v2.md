@@ -8,8 +8,7 @@ exact JSON shapes and is the binding field-level contract. The behavior rules
 are the specification's: authentication, the version rule, gap-freedom,
 retention and retries. This file fixes names, types and the closed token list.
 
-The API is implemented in slices behind the `client_api_v2` feature flag, off
-by default. It becomes the only client protocol in Server 0.2.x.
+It is the only client protocol in Server 0.2.x.
 
 ## 1. Conventions
 

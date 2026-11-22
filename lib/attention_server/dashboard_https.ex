@@ -9,9 +9,8 @@ defmodule AttentionServer.DashboardHTTPS do
   account-wide view is unreachable; a configured public origin replaces the
   listener's own host and port in links and in the form-origin check.
 
-  With the temporary `client_api_v2` flag on, the listener also serves client
-  API v2 at `/v2` for signed-in browsers and offers HTTP/2 through ALPN. With it
-  off, `/v2` answers 404 and the listener speaks HTTP/1.1 only, as before.
+  The listener also serves client API v2 at `/v2` for signed-in browsers and
+  offers HTTP/2 through ALPN beside HTTP/1.1.
   """
 
   use Supervisor
@@ -33,7 +32,6 @@ defmodule AttentionServer.DashboardHTTPS do
     hosted? = Keyword.get(opts, :deployment_mode, :self_hosted) == :saas
     owner_person = if hosted?, do: nil, else: Keyword.fetch!(opts, :owner_person)
     sessions_name = {:global, {__MODULE__, relay}}
-    client_api_v2 = Keyword.get(opts, :client_api_v2, false) == true
 
     backend = %DashboardBackend{
       relay: relay,
@@ -65,7 +63,6 @@ defmodule AttentionServer.DashboardHTTPS do
                  hosted_testflight_url: Keyword.get(opts, :hosted_testflight_url),
                  skill_path_saas: Keyword.get(opts, :skill_path_saas),
                  skill_path_core: Keyword.get(opts, :skill_path_core)},
-              client_api_v2: client_api_v2,
               relay: relay,
               backend: {DashboardBackend, backend},
               expected_origin: Keyword.get(opts, :public_origin)
@@ -75,7 +72,6 @@ defmodule AttentionServer.DashboardHTTPS do
          port: Keyword.fetch!(opts, :port),
          certfile: Keyword.fetch!(opts, :certfile),
          keyfile: Keyword.fetch!(opts, :keyfile),
-         http_2_options: [enabled: client_api_v2],
          startup_log: false},
         id: :dashboard_listener
       )

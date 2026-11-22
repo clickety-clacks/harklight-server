@@ -126,7 +126,6 @@ defmodule AttentionServer.PushDispatcher.Worker do
       relay: relay,
       apns: apns,
       apns_send: Keyword.get(opts, :apns_send, &APNS.send/3),
-      bounded_attempts?: Keyword.get(opts, :bounded_attempts, false),
       attempt_timeout_ms:
         Keyword.get(apns_opts, :attempt_timeout_ms, @default_attempt_timeout_ms),
       cached_token: nil
@@ -192,10 +191,6 @@ defmodule AttentionServer.PushDispatcher.Worker do
   @impl true
   def format_status(status) do
     Map.update!(status, :state, &Map.drop(&1, [:cached_token, :apns]))
-  end
-
-  defp send_attempt(%{bounded_attempts?: false} = state, claim) do
-    state.apns_send.(state.apns, claim, state.cached_token)
   end
 
   defp send_attempt(state, claim) do
