@@ -36,12 +36,6 @@ defmodule AttentionServer.Relay do
     Store
   }
 
-  @browser_frame_types ~w(
-                          conversation_open conversation_ack
-                          message_open answer answer_no_comment discussion conversation_read
-                          view_get
-                        )
-
   def start_link(opts \\ []) do
     GenServer.start_link(__MODULE__, opts, Keyword.take(opts, [:name]))
   end
@@ -120,94 +114,13 @@ defmodule AttentionServer.Relay do
   def agent_identity(server, verified_agent_key),
     do: GenServer.call(server, {:agent_identity, verified_agent_key}, :infinity)
 
-  @doc "Read the current device origin's conversation feed without advancing its cursor."
-  def origin_feed(server, verified_device_key, since),
-    do: GenServer.call(server, {:origin_feed, verified_device_key, since}, :infinity)
-
-  @doc "Read one current-origin message without recording delivery, acknowledgment, or operation state."
-  def origin_message_get(server, verified_device_key, sender_id, message_id, request_revision),
-    do:
-      GenServer.call(
-        server,
-        {:origin_message_get, verified_device_key, sender_id, message_id, request_revision},
-        :infinity
-      )
-
-  def focus_get(server, verified_agent_key),
-    do: GenServer.call(server, {:focus_get, verified_agent_key}, :infinity)
-
-  def view_show(server, verified_agent_key, request),
-    do: GenServer.call(server, {:view_show, verified_agent_key, request}, :infinity)
-
   def focus_stream_attach(server, verified_agent_key, worker),
     do: GenServer.call(server, {:focus_stream_attach, verified_agent_key, worker}, :infinity)
-
-  def focus_stream_detach(server, verified_agent_key, worker),
-    do: GenServer.call(server, {:focus_stream_detach, verified_agent_key, worker}, :infinity)
-
-  def origin_advisory_feed(server, verified_device_key, handle, since),
-    do:
-      GenServer.call(
-        server,
-        {:origin_advisory_feed, verified_device_key, handle, since},
-        :infinity
-      )
-
-  def origin_advisory_ack(server, verified_device_key, handle, advisory_id),
-    do:
-      GenServer.call(
-        server,
-        {:origin_advisory_ack, verified_device_key, handle, advisory_id},
-        :infinity
-      )
-
-  @doc "Record one originating-session delivery receipt, separately from relay ACK."
-  def origin_ack(server, verified_device_key, feed_seq, reports \\ nil),
-    do: GenServer.call(server, {:origin_ack, verified_device_key, feed_seq, reports}, :infinity)
-
-  def origin_file_use(server, verified_device_key, feed_seq, name, outcome, op_id),
-    do:
-      GenServer.call(
-        server,
-        {:origin_file_use, verified_device_key, feed_seq, name, outcome, op_id},
-        :infinity
-      )
-
-  def origin_status(server, verified_device_key, handle),
-    do: GenServer.call(server, {:origin_status, verified_device_key, handle}, :infinity)
-
-  def origin_ack2(server, verified_device_key, feed_seq, declaration),
-    do:
-      GenServer.call(
-        server,
-        {:origin_ack2, verified_device_key, feed_seq, declaration},
-        :infinity
-      )
-
-  def origin_coverage(server, key), do: GenServer.call(server, {:origin_coverage, key}, :infinity)
-
-  def origin_support(server, verified_device_key, declaration),
-    do: GenServer.call(server, {:origin_support, verified_device_key, declaration}, :infinity)
-
-  def origin_attachment_update(server, verified_device_key, declaration),
-    do:
-      GenServer.call(
-        server,
-        {:origin_attachment_update, verified_device_key, declaration},
-        :infinity
-      )
-
-  @doc "Publish file limits only to a currently enrolled origin device."
-  def origin_file_limits(server, verified_device_key),
-    do: GenServer.call(server, {:origin_file_limits, verified_device_key}, :infinity)
 
   def upload_begin(server, verified_device_key, attributes, size),
     do: GenServer.call(server, {:upload_begin, verified_device_key, attributes, size}, :infinity)
 
   def upload_end(server, lease), do: GenServer.call(server, {:upload_end, lease}, :infinity)
-
-  def discard_uploads(server, verified_device_key, attributes),
-    do: GenServer.call(server, {:discard_uploads, verified_device_key, attributes}, :infinity)
 
   def upload_file(server, verified_device_key, attributes, path, size, sha256, lease \\ nil),
     do:
@@ -244,20 +157,8 @@ defmodule AttentionServer.Relay do
 
   defp verify_fetched_file(error), do: error
 
-  defp upload_file_outside_relay(server, key, attrs, path, size, hash, lease),
-    do: upload_file_outside_relay(server, key, attrs, path, size, hash, lease, :device)
-
-  defp upload_file_outside_relay(server, key, attrs, path, size, hash, lease, context) do
-    prepare =
-      case context do
-        :device ->
-          {:upload_prepare, key, attrs, size, hash, lease}
-
-        {:browser, browser_session_id, recipient} ->
-          {:browser_upload_prepare, browser_session_id, recipient, attrs, size, hash, lease}
-      end
-
-    case GenServer.call(server, prepare, :infinity) do
+  defp upload_file_outside_relay(server, key, attrs, path, size, hash, lease) do
+    case GenServer.call(server, {:upload_prepare, key, attrs, size, hash, lease}, :infinity) do
       {:ok, :duplicate, reply} ->
         {:ok, reply}
 
@@ -267,19 +168,9 @@ defmodule AttentionServer.Relay do
             try do
               case Store.publish_staged_upload(upload_dir, upload, staged) do
                 {:ok, published} ->
-                  commit =
-                    case context do
-                      :device ->
-                        {:upload_commit, key, upload, published, lease}
-
-                      {:browser, browser_session_id, recipient} ->
-                        {:browser_upload_commit, browser_session_id, recipient, upload, published,
-                         lease}
-                    end
-
                   GenServer.call(
                     server,
-                    commit,
+                    {:upload_commit, key, upload, published, lease},
                     :infinity
                   )
 
@@ -298,34 +189,6 @@ defmodule AttentionServer.Relay do
         error
     end
   end
-
-  def origin_session_gone(server, verified_device_key, handle),
-    do: GenServer.call(server, {:origin_session_gone, verified_device_key, handle}, :infinity)
-
-  @doc "Attach one authenticated origin SSE worker to a session handle."
-  def origin_stream_attach(server, verified_device_key, handle, worker, reconnect \\ false),
-    do:
-      GenServer.call(
-        server,
-        {:origin_stream_attach, verified_device_key, handle, worker, reconnect, false},
-        :infinity
-      )
-
-  def origin_stream_attach(server, verified_device_key, handle, worker, reconnect, advisory_v1),
-    do:
-      GenServer.call(
-        server,
-        {:origin_stream_attach, verified_device_key, handle, worker, reconnect, advisory_v1},
-        :infinity
-      )
-
-  def origin_stream_detach(server, verified_device_key, handle, worker),
-    do:
-      GenServer.call(
-        server,
-        {:origin_stream_detach, verified_device_key, handle, worker},
-        :infinity
-      )
 
   @doc false
   def client_agent_answer(server, key, frame),
@@ -589,10 +452,6 @@ defmodule AttentionServer.Relay do
     do: GenServer.call(server, {:request_staged_reply, verified_key, frame, sources}, :infinity)
 
   @doc false
-  def request_frame(server, verified_key, frame),
-    do: GenServer.call(server, {:request_frame, verified_key, frame}, :infinity)
-
-  @doc false
   def claim_push(server, now_ms), do: GenServer.call(server, {:claim_push, now_ms}, :infinity)
 
   @doc false
@@ -652,90 +511,8 @@ defmodule AttentionServer.Relay do
         :infinity
       )
 
-  def open_browser_recipient(
-        server,
-        person,
-        owner_key,
-        owner_revision,
-        browser_session_id,
-        recipient,
-        worker
-      ),
-      do:
-        GenServer.call(
-          server,
-          {:open_browser_recipient, person, owner_key, owner_revision, browser_session_id,
-           recipient, worker},
-          :infinity
-        )
-
   def end_browser_session(server, browser_session_id),
     do: GenServer.call(server, {:end_browser_session, browser_session_id}, :infinity)
-
-  def browser_session_request_line(server, browser_session_id, session_id, line),
-    do:
-      GenServer.call(
-        server,
-        {:browser_session_request_line, browser_session_id, session_id, line},
-        :infinity
-      )
-
-  def browser_session_drain(server, browser_session_id, session_id),
-    do:
-      GenServer.call(
-        server,
-        {:browser_session_drain, browser_session_id, session_id},
-        :infinity
-      )
-
-  def close_browser_connection(server, browser_session_id, session_id),
-    do:
-      GenServer.call(
-        server,
-        {:close_browser_connection, browser_session_id, session_id},
-        :infinity
-      )
-
-  def browser_file_limits(server, browser_session_id, recipient),
-    do: GenServer.call(server, {:browser_file_limits, browser_session_id, recipient}, :infinity)
-
-  def browser_discard_uploads(server, browser_session_id, recipient, attributes),
-    do:
-      GenServer.call(
-        server,
-        {:browser_discard_uploads, browser_session_id, recipient, attributes},
-        :infinity
-      )
-
-  def browser_upload_begin(server, browser_session_id, recipient, attributes, size, worker),
-    do:
-      GenServer.call(
-        server,
-        {:browser_upload_begin, browser_session_id, recipient, attributes, size, worker},
-        :infinity
-      )
-
-  def browser_upload_file(
-        server,
-        browser_session_id,
-        recipient,
-        attributes,
-        path,
-        size,
-        sha256,
-        lease
-      ),
-      do:
-        upload_file_outside_relay(
-          server,
-          nil,
-          attributes,
-          path,
-          size,
-          sha256,
-          lease,
-          {:browser, browser_session_id, recipient}
-        )
 
   def session_request_line(server, session_id, line) do
     GenServer.call(server, {:session_request_line, session_id, line}, :infinity)
@@ -779,9 +556,6 @@ defmodule AttentionServer.Relay do
               active_uploads: %{},
               sessions: %{},
               socket_writes: %{},
-              browser_recipients: %{},
-              origin_streams: %{},
-              origin_streams_by_identity: %{},
               focus_clients: %{},
               focus_clients_by_person: %{},
               held_shows: %{},
@@ -1119,24 +893,6 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  defp dispatch_call({:request_frame, key, frame}, _from, state) do
-    case Engine.authorized_person(state.store.engine, key) do
-      {:ok, _person} when is_map(frame) ->
-        if JSON.ui1_duplicate_request?(frame) or AttentionServer.LargeData.contains_ref?(frame) do
-          {reply, next} = perform_request_frame(state, key, frame)
-          {:reply, reply, next}
-        else
-          {:reply, {:ok, error_line(frame, "bad_frame")}, state}
-        end
-
-      {:ok, _person} ->
-        {:reply, {:ok, error_line(%{}, "bad_frame")}, state}
-
-      _ ->
-        {:reply, {:error, :forbidden}, state}
-    end
-  end
-
   defp dispatch_call(:enable_push, _from, state),
     do: {:reply, :ok, %{state | push_enabled: true}}
 
@@ -1361,222 +1117,12 @@ defmodule AttentionServer.Relay do
   defp dispatch_call({:agent_identity, key}, _from, state),
     do: {:reply, Engine.agent_identity(state.store.engine, key), state}
 
-  defp dispatch_call({:origin_feed, key, since}, _from, state) do
-    case Engine.deliver_origin_feed(state.store.engine, key, since) do
-      {:ok, next, reply} ->
-        case commit(state.store, next, audit(state.store.engine, key, "origin_feed")) do
-          {:ok, store} -> {:reply, {:ok, reply}, %{state | store: store}}
-          _ -> {:reply, {:error, :storage_unavailable}, state}
-        end
-
-      error ->
-        {:reply, error, state}
-    end
-  end
-
-  defp dispatch_call(
-         {:origin_message_get, key, sender_id, message_id, request_revision},
-         _from,
-         state
-       ) do
-    {:reply,
-     Engine.origin_message_get(state.store.engine, key, sender_id, message_id, request_revision),
-     state}
-  end
-
-  defp dispatch_call({:origin_advisory_feed, key, handle, since}, _from, state) do
-    {:reply, BounceDecision.advisory_feed(state.store.engine, key, handle, since), state}
-  end
-
-  defp dispatch_call({:origin_advisory_ack, key, handle, advisory_id}, _from, state),
-    do: commit_advisory_ack(state, key, handle, advisory_id, false)
-
-  defp dispatch_call({:origin_coverage, key}, _from, state) do
-    case Engine.authorized_person(state.store.engine, key) do
-      {:ok, person} -> {:reply, {:ok, covered_handles(state.store.engine, person, key)}, state}
-      error -> {:reply, error, state}
-    end
-  end
-
-  defp dispatch_call({:origin_status, key, :origin}, _from, state) do
-    case Engine.authorized_person(state.store.engine, key) do
-      {:ok, person} ->
-        high = Map.get(state.store.engine.origin_feeds, {person, key}, %{high: 0}).high
-        {:reply, {:ok, %{"cursor" => high}}, state}
-
-      error ->
-        {:reply, error, state}
-    end
-  end
-
-  defp dispatch_call({:origin_status, key, handle}, _from, state) do
-    engine = state.store.engine
-
-    case Engine.authorized_person(engine, key) do
-      {:ok, person} ->
-        listening? = origin_listening?(state, engine, {person, key, handle})
-        {:reply, Engine.origin_status(engine, key, handle, listening?), state}
-
-      error ->
-        {:reply, error, state}
-    end
-  end
-
-  defp dispatch_call({:origin_support, key, declaration}, _from, state) do
-    case Engine.origin_support(state.store.engine, key, declaration) do
-      {:ok, next, %{"duplicate" => true} = reply} when next == state.store.engine ->
-        {:reply, {:ok, reply}, state}
-
-      {:ok, next, reply} ->
-        old_engine = state.store.engine
-        {:ok, person} = Engine.authorized_person(next, key)
-        handle = declaration["session_handle"]
-        listening? = origin_listening?(state, next, {person, key, handle})
-        {:ok, current} = Engine.origin_status(next, key, handle, listening?)
-
-        # An unchanged declaration (the engine came back as it was) repeats what
-        # the session's open requests already record: append no availability
-        # event and commit nothing. A changed declaration records it as before.
-        next =
-          if next == old_engine,
-            do: next,
-            else:
-              Engine.origin_availability(
-                next,
-                person,
-                key,
-                handle,
-                current["availability"],
-                current["last_detached_at"]
-              )
-
-        session_key = {person, key, handle}
-
-        # An unchanged declaration leaves the engine as it is: nothing to commit.
-        committed =
-          if next == old_engine,
-            do: {:ok, state.store},
-            else: Store.commit(state.store, next, audit(old_engine, key, "origin_support"))
-
-        case committed do
-          {:ok, store} ->
-            store = %{
-              store
-              | engine: BounceDecision.requeue_supported_session(store.engine, session_key)
-            }
-
-            next_state =
-              %{state | store: store}
-              |> notify_coverage_change(old_engine, person, key)
-              |> refresh_stream_advisory_support({person, key, handle})
-              |> reschedule_bounce_sweep()
-
-            {:reply, {:ok, reply}, next_state}
-
-          _ ->
-            {:reply, {:error, :storage_unavailable}, state}
-        end
-
-      error ->
-        {:reply, error, state}
-    end
-  end
-
-  defp dispatch_call({:origin_attachment_update, key, declaration}, _from, state) do
-    case Engine.origin_attachment_update(state.store.engine, key, declaration) do
-      {:ok, next, reply} ->
-        {:ok, person} = Engine.authorized_person(next, key)
-        proposed = %{state | store: %{state.store | engine: next}}
-        next = origin_availability_changes(state, proposed, person, key)
-
-        # A duplicate or unchanged declaration leaves the engine as it is.
-        committed =
-          if next == state.store.engine,
-            do: {:ok, state.store},
-            else:
-              commit(
-                state.store,
-                next,
-                audit(state.store.engine, key, "origin_attachment_update")
-              )
-
-        case committed do
-          {:ok, store} ->
-            updated =
-              %{state | store: store}
-              |> notify_coverage_change(state.store.engine, person, key)
-              |> requeue_covered(person, key)
-
-            {:reply, {:ok, reply}, updated}
-
-          _ ->
-            {:reply, {:error, :storage_unavailable}, state}
-        end
-
-      error ->
-        {:reply, error, state}
-    end
-  end
-
-  defp dispatch_call({:origin_file_limits, key}, _from, state) do
-    file_limits_reply(state, key)
-  end
-
-  defp dispatch_call({:browser_file_limits, browser_session_id, recipient}, _from, state) do
-    case browser_recipient_session(state, browser_session_id, recipient) do
-      {:ok, session} -> file_limits_reply(state, session.key)
-      {:error, reason} -> {:reply, {:error, reason}, state}
-    end
-  end
-
-  defp dispatch_call({:discard_uploads, key, attrs}, _from, state) do
-    discard_uploads_call(state, key, attrs)
-  end
-
-  defp dispatch_call(
-         {:browser_discard_uploads, browser_session_id, recipient, attrs},
-         _from,
-         state
-       ) do
-    case browser_recipient_session(state, browser_session_id, recipient) do
-      {:ok, session} -> discard_uploads_call(state, session.key, attrs)
-      {:error, reason} -> {:reply, {:error, reason}, state}
-    end
-  end
-
-  defp dispatch_call(
-         {:browser_upload_begin, browser_session_id, recipient, attrs, size, worker},
-         _from,
-         state
-       ) do
-    with {:ok, session} <- browser_recipient_session(state, browser_session_id, recipient),
-         {:ok, person} <- Engine.authorized_person(state.store.engine, session.key),
-         true <- is_pid(worker),
-         true <- valid_upload_attributes?(attrs),
-         true <- is_integer(size) and size >= 0,
-         true <- state.upload_cap == :none or size <= state.upload_cap do
-      case begin_upload(state, person, session.key, attrs, size, worker, browser_session_id) do
-        {:ok, lease, next} -> {:reply, {:ok, lease}, next}
-        {:error, reason} -> {:reply, {:error, reason}, state}
-      end
-    else
-      {:error, reason} ->
-        {:reply, {:error, reason}, state}
-
-      false when is_integer(size) and is_integer(state.upload_cap) and size > state.upload_cap ->
-        {:reply, {:error, :upload_cap_exceeded}, state}
-
-      _ ->
-        {:reply, {:error, :invalid_upload}, state}
-    end
-  end
-
   defp dispatch_call({:upload_begin, key, attrs, size}, {worker, _}, state) do
     with {:ok, person} <- Engine.authorized_person(state.store.engine, key),
          true <- valid_upload_attributes?(attrs),
          true <- is_integer(size) and size >= 0,
          true <- state.upload_cap == :none or size <= state.upload_cap do
-      case begin_upload(state, person, key, attrs, size, worker, nil) do
+      case begin_upload(state, person, key, attrs, worker) do
         {:ok, lease, next} -> {:reply, {:ok, lease}, next}
         {:error, reason} -> {:reply, {:error, reason}, state}
       end
@@ -1600,54 +1146,10 @@ defmodule AttentionServer.Relay do
   end
 
   defp dispatch_call({:upload_prepare, key, attrs, size, hash, lease}, _from, state),
-    do: upload_prepare_call(state, key, attrs, size, hash, lease, :device)
-
-  defp dispatch_call(
-         {:browser_upload_prepare, browser_session_id, recipient, attrs, size, hash, lease},
-         _from,
-         state
-       ) do
-    case browser_recipient_session(state, browser_session_id, recipient) do
-      {:ok, session} ->
-        upload_prepare_call(
-          state,
-          session.key,
-          attrs,
-          size,
-          hash,
-          lease,
-          {:browser, browser_session_id, recipient}
-        )
-
-      {:error, reason} ->
-        {:reply, {:error, reason}, state}
-    end
-  end
+    do: upload_prepare_call(state, key, attrs, size, hash, lease)
 
   defp dispatch_call({:upload_commit, key, upload, published, lease}, _from, state),
-    do: upload_commit_call(state, key, upload, published, lease, :device)
-
-  defp dispatch_call(
-         {:browser_upload_commit, browser_session_id, recipient, upload, published, lease},
-         _from,
-         state
-       ) do
-    case browser_recipient_session(state, browser_session_id, recipient) do
-      {:ok, session} ->
-        upload_commit_call(
-          state,
-          session.key,
-          upload,
-          published,
-          lease,
-          {:browser, browser_session_id, recipient}
-        )
-
-      {:error, reason} ->
-        _ = File.rm(published)
-        {:reply, {:error, reason}, state}
-    end
-  end
+    do: upload_commit_call(state, key, upload, published, lease)
 
   defp dispatch_call({:fetch_file, key, id}, _from, state) do
     case Engine.authorized_person(state.store.engine, key) do
@@ -1673,14 +1175,11 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  defp dispatch_call({:origin_session_gone, key, handle}, from, state),
-    do: dispatch_call({:origin_session_gone, key, handle, :legacy}, from, state)
-
-  defp dispatch_call({:origin_session_gone, key, handle, transport}, _from, state) do
+  defp dispatch_call({:origin_session_gone, key, handle, :agent_v2}, _from, state) do
     case Engine.origin_session_gone(state.store.engine, key, handle) do
       {:ok, next} ->
         {:ok, person} = Engine.authorized_person(next, key)
-        next = end_session_availability(state, next, {person, key, handle}, transport)
+        next = end_session_availability(state, next, {person, key, handle})
 
         case commit(
                state.store,
@@ -1696,25 +1195,10 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  defp dispatch_call({:focus_get, key}, _from, state) do
-    case focus_authorized_person(state.store.engine, key, :see) do
-      {:ok, person} ->
-        {:reply, {:ok, %{"clients" => focus_list(state, person)}}, state}
-
-      error ->
-        {:reply, error, state}
-    end
-  end
-
   # Client API v2 modules run in the relay's serialized step, so a response and
   # the change-log position it reports come from one state.
   defp dispatch_call({:client_api, handler, request}, from, state) when is_atom(handler),
     do: handler.handle_call(request, from, state)
-
-  defp dispatch_call({:view_show, key, request}, _from, state) do
-    {result, next} = handle_view_show(state, key, request)
-    {:reply, result, next}
-  end
 
   defp dispatch_call({:focus_stream_attach, key, worker}, _from, state) when is_pid(worker) do
     case focus_authorized_person(state.store.engine, key, :see) do
@@ -1733,174 +1217,10 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  defp dispatch_call({:focus_stream_detach, key, worker}, _from, state) do
-    case Map.get(state.focus_streams, worker) do
-      %{key: ^key, monitor: monitor} ->
-        Process.demonitor(monitor, [:flush])
-        {:reply, :ok, delete_focus_stream(state, worker)}
-
-      _ ->
-        {:reply, :ok, state}
-    end
-  end
-
-  defp dispatch_call(
-         {:origin_stream_attach, key, :origin, worker, _reconnect, false},
-         _from,
-         state
-       ) do
-    with {:ok, person} <- Engine.authorized_person(state.store.engine, key) do
-      stream_key = {person, key, :origin}
-      proposed_streams = put_origin_stream(state.origin_streams, stream_key, %{worker: worker})
-      proposed = %{state | origin_streams: proposed_streams}
-      next = origin_availability_changes(state, proposed, person, key)
-
-      case Store.commit(state.store, next, audit(state.store.engine, key, "origin_attach")) do
-        {:ok, store} ->
-          demonitor_origin_worker(state, stream_key, worker)
-          stream = %{worker: worker, monitor: Process.monitor(worker), advisory_v1: false}
-
-          next_state = %{
-            proposed
-            | store: store,
-              origin_streams: put_origin_stream(state.origin_streams, stream_key, stream),
-              origin_streams_by_identity:
-                Map.update(
-                  state.origin_streams_by_identity,
-                  {person, key},
-                  MapSet.new([stream_key]),
-                  &MapSet.put(&1, stream_key)
-                )
-          }
-
-          {:reply, :ok, requeue_covered(next_state, person, key)}
-
-        _ ->
-          {:reply, {:error, :storage_unavailable}, state}
-      end
-    else
-      error -> {:reply, error, state}
-    end
-  end
-
-  defp dispatch_call(
-         {:origin_stream_attach, key, handle, worker, reconnect, advisory_requested},
-         _from,
-         state
-       )
-       when is_pid(worker) and is_boolean(reconnect) and is_boolean(advisory_requested) do
-    engine = state.store.engine
-
-    with {:ok, person} <- Engine.authorized_person(engine, key),
-         {:ok, _} <- Engine.origin_status(engine, key, handle, false),
-         {:ok, attached} <- Conversation.mark_attached(engine, person, key, handle),
-         {:ok, current} <- Engine.origin_status(attached, key, handle, true),
-         attached <-
-           if(Map.has_key?(state.origin_streams, {person, key, handle}),
-             # Another stream already makes this session listening; announce
-             # availability only when the first one attaches.
-             do: attached,
-             else:
-               Engine.origin_availability(
-                 attached,
-                 person,
-                 key,
-                 handle,
-                 current["availability"],
-                 current["last_detached_at"]
-               )
-           ),
-         {:ok, store} <-
-           Store.commit(state.store, attached, audit(engine, key, "origin_attach")) do
-      stream_key = {person, key, handle}
-      # Register only after the attachment commit succeeds. Other streams of
-      # this session stay attached; only this worker's own earlier entry is
-      # replaced.
-      demonitor_origin_worker(state, stream_key, worker)
-      monitor = Process.monitor(worker)
-
-      streams =
-        put_origin_stream(state.origin_streams, stream_key, %{
-          worker: worker,
-          monitor: monitor,
-          advisory_requested: advisory_requested,
-          advisory_v1:
-            advisory_requested and
-              BounceDecision.advisory_supported?(attached, person, key, handle)
-        })
-
-      streams_by_identity =
-        Map.update(
-          state.origin_streams_by_identity,
-          {person, key},
-          MapSet.new([stream_key]),
-          &MapSet.put(&1, stream_key)
-        )
-
-      store = %{
-        store
-        | engine: BounceDecision.requeue_supported_session(store.engine, stream_key)
-      }
-
-      next_state = %{
-        state
-        | store: store,
-          origin_streams: streams,
-          origin_streams_by_identity: streams_by_identity
-      }
-
-      next_state =
-        next_state
-        |> reschedule_bounce_sweep()
-
-      {:reply, :ok, next_state}
-    else
-      {:error, :not_found} = error -> {:reply, error, state}
-      {:error, :forbidden} = error -> {:reply, error, state}
-      _ -> {:reply, {:error, :storage_unavailable}, state}
-    end
-  end
-
-  defp dispatch_call({:origin_stream_detach, key, handle, worker}, _from, state) do
-    case Enum.find(state.origin_streams, fn
-           {{_person, ^key, ^handle}, streams} -> Enum.any?(streams, &(&1.worker == worker))
-           _ -> false
-         end) do
-      {stream_key, _} -> {:reply, :ok, detach_origin_stream(state, stream_key, worker)}
-      nil -> {:reply, :ok, state}
-    end
-  end
-
   defp dispatch_call({:origin_ack2, key, feed_seq, declaration}, _from, state) do
     case Engine.origin_ack2(state.store.engine, key, feed_seq, declaration) do
       {:ok, next, reply} ->
         case commit(state.store, next, audit(state.store.engine, key, "origin_ack2")) do
-          {:ok, store} -> {:reply, {:ok, reply}, %{state | store: store}}
-          _ -> {:reply, {:error, :storage_unavailable}, state}
-        end
-
-      error ->
-        {:reply, error, state}
-    end
-  end
-
-  defp dispatch_call({:origin_ack, key, feed_seq, reports}, _from, state) do
-    case Engine.origin_ack(state.store.engine, key, feed_seq, reports) do
-      {:ok, next, reply} ->
-        case commit(state.store, next, audit(state.store.engine, key, "origin_ack")) do
-          {:ok, store} -> {:reply, {:ok, reply}, %{state | store: store}}
-          _ -> {:reply, {:error, :storage_unavailable}, state}
-        end
-
-      error ->
-        {:reply, error, state}
-    end
-  end
-
-  defp dispatch_call({:origin_file_use, key, feed_seq, name, outcome, op_id}, _from, state) do
-    case Engine.origin_file_use(state.store.engine, key, feed_seq, name, outcome, op_id) do
-      {:ok, next, reply} ->
-        case commit(state.store, next, audit(state.store.engine, key, "origin_file_use")) do
           {:ok, store} -> {:reply, {:ok, reply}, %{state | store: store}}
           _ -> {:reply, {:error, :storage_unavailable}, state}
         end
@@ -2831,108 +2151,11 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  defp dispatch_call(
-         {:open_browser_recipient, person, owner_key, owner_revision, browser_session_id,
-          recipient, worker},
-         _from,
-         state
-       ) do
-    key = BrowserRecipient.key(person, browser_session_id, recipient)
-    recipient_ref = {browser_session_id, recipient}
-
-    with true <- is_pid(worker),
-         true <- Message.uuid_v4?(recipient),
-         true <- BrowserRecipient.valid_for?(key, person),
-         {:ok, ^owner_revision} <-
-           Engine.owner_revision(state.store.engine, person, owner_key) do
-      state =
-        case Map.get(state.browser_recipients, recipient_ref) do
-          %{connection_id: old_id} when not is_nil(old_id) ->
-            drop_browser_connection(state, old_id, :replaced)
-
-          _ ->
-            state
-        end
-
-      id = make_ref()
-
-      session =
-        case Map.get(state.browser_recipients, recipient_ref) do
-          %{session: saved} -> saved
-          _ -> empty_browser_session(key)
-        end
-        |> Map.merge(%{
-          key: key,
-          person: person,
-          owner_key: owner_key,
-          owner_revision: owner_revision,
-          browser_session_id: browser_session_id,
-          recipient: recipient,
-          owner: worker,
-          socket: nil,
-          listener: nil,
-          transport: :browser
-        })
-
-      recipients =
-        Map.put(state.browser_recipients, recipient_ref, %{connection_id: id, session: session})
-
-      {:reply, {:ok, id},
-       %{state | sessions: Map.put(state.sessions, id, session), browser_recipients: recipients}}
-    else
-      _ -> {:reply, {:error, :forbidden}, state}
-    end
-  end
-
+  # Signing a browser out closes its v2 feeds. No Relay state is keyed by the
+  # browser session; stored v2 browser actor state is discarded at startup.
   defp dispatch_call({:end_browser_session, browser_session_id}, _from, state) do
     AttentionServer.ChangeLog.notify_closing([{{:browser_session, browser_session_id}, :revoked}])
-
-    state =
-      state.sessions
-      |> Enum.filter(fn {_id, session} ->
-        session.transport == :browser and session.browser_session_id == browser_session_id
-      end)
-      |> Enum.reduce(state, fn {id, _session}, acc -> drop_session(acc, id) end)
-
-    actor_keys =
-      state.browser_recipients
-      |> Enum.flat_map(fn
-        {{^browser_session_id, _recipient}, %{session: %{key: key}}} -> [key]
-        _ -> []
-      end)
-
-    actor_key_set = MapSet.new(actor_keys)
-
-    active_uploads =
-      Map.new(state.active_uploads, fn {lease, active} ->
-        {_person, actor, _op_id, _sender, _message, _revision} = active.group
-
-        {lease,
-         %{
-           active
-           | canceled: active.canceled or MapSet.member?(actor_key_set, actor)
-         }}
-      end)
-
-    state = %{state | active_uploads: active_uploads}
-
-    case cleanup_browser_recipient_state(state, actor_keys) do
-      {:ok, next} ->
-        recipients =
-          Map.reject(next.browser_recipients, fn {{session_id, _recipient}, _} ->
-            session_id == browser_session_id
-          end)
-
-        {:reply, :ok, %{next | browser_recipients: recipients}}
-
-      {:error, reason, next} ->
-        recipients =
-          Map.reject(next.browser_recipients, fn {{session_id, _recipient}, _} ->
-            session_id == browser_session_id
-          end)
-
-        {:reply, {:error, reason}, %{next | browser_recipients: recipients}}
-    end
+    {:reply, :ok, state}
   end
 
   defp dispatch_call({:session_send, id, frames}, _from, state) do
@@ -2996,38 +2219,8 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  defp dispatch_call(
-         {:browser_session_request_line, browser_session_id, id, raw},
-         _from,
-         state
-       ) do
-    case browser_connection(state, browser_session_id, id) do
-      {:ok, _session} -> session_request_line_call(state, id, raw)
-      {:error, :forbidden} -> {:reply, {:error, :session_ended}, drop_session(state, id)}
-      {:error, reason} -> {:reply, {:error, reason}, state}
-    end
-  end
-
   defp dispatch_call({:session_drain, id}, _from, state),
     do: session_drain_call(state, id)
-
-  defp dispatch_call({:browser_session_drain, browser_session_id, id}, _from, state) do
-    case browser_connection(state, browser_session_id, id) do
-      {:ok, _session} -> session_drain_call(state, id)
-      {:error, :forbidden} -> {:reply, {:error, :session_ended}, drop_session(state, id)}
-      {:error, reason} -> {:reply, {:error, reason}, state}
-    end
-  end
-
-  defp dispatch_call({:close_browser_connection, browser_session_id, id}, _from, state) do
-    case Map.get(state.sessions, id) do
-      %{transport: :browser, browser_session_id: ^browser_session_id} ->
-        {:reply, :ok, drop_session(state, id)}
-
-      _ ->
-        {:reply, :ok, state}
-    end
-  end
 
   defp session_drain_call(state, id) do
     with {:ok, session} <- active_session(state, id),
@@ -3078,61 +2271,8 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  defp discard_uploads_call(state, key, attrs) do
+  defp upload_prepare_call(state, key, attrs, size, hash, lease) do
     with {:ok, person} <- Engine.authorized_person(state.store.engine, key),
-         true <- valid_discard_attributes?(attrs) do
-      scope = upload_request_scope(person, key, attrs)
-      engine = state.store.engine
-      references = Map.get(state.upload_index.references_by_person, person, MapSet.new())
-      scoped_ids = Map.get(state.upload_index.ids_by_request_scope, scope, MapSet.new())
-
-      ids =
-        for id <- scoped_ids,
-            not MapSet.member?(references, id),
-            do: id
-
-      committed? =
-        Enum.any?(scoped_ids, &MapSet.member?(references, &1))
-
-      active =
-        Map.new(state.active_uploads, fn {lease, active} ->
-          {lease,
-           %{active | canceled: active.canceled or upload_request_scope(active.group) == scope}}
-        end)
-
-      case Store.delete_uploads(state.store, ids, %{
-             person: person,
-             actor: key,
-             action: "upload_discard",
-             operation_id: Diagnostics.operation_id(attrs)
-           }) do
-        {:ok, store} ->
-          result = %{
-            "state" => if(committed?, do: "committed", else: "discarded"),
-            "discarded" => length(ids)
-          }
-
-          removed = removed_upload_ids(engine, store.engine, ids)
-          index = remove_uploads_from_index(state.upload_index, engine, removed)
-
-          {:reply, {:ok, result},
-           %{state | store: store, upload_index: index, active_uploads: active}}
-
-        {:error, reason, store} ->
-          removed = removed_upload_ids(engine, store.engine, ids)
-          index = remove_uploads_from_index(state.upload_index, engine, removed)
-
-          {:reply, {:error, reason},
-           %{state | store: store, upload_index: index, active_uploads: active}}
-      end
-    else
-      {:error, reason} -> {:reply, {:error, reason}, state}
-      _ -> {:reply, {:error, :invalid_upload}, state}
-    end
-  end
-
-  defp upload_prepare_call(state, key, attrs, size, hash, lease, context) do
-    with {:ok, person} <- upload_authorized_person(state, key, context),
          true <- is_integer(size) and size >= 0,
          true <- state.upload_cap == :none or size <= state.upload_cap,
          true <- valid_upload_attributes?(attrs),
@@ -3206,9 +2346,9 @@ defmodule AttentionServer.Relay do
 
   defp put_client_content_type(base, _attrs), do: base
 
-  defp upload_commit_call(state, key, upload, published, lease, context) do
+  defp upload_commit_call(state, key, upload, published, lease) do
     result =
-      with {:ok, person} <- upload_authorized_person(state, key, context),
+      with {:ok, person} <- Engine.authorized_person(state.store.engine, key),
            true <- person == upload.person and key == upload.uploader,
            :ok <- upload_lease_status(state, lease, upload_group(upload)),
            true <- state.upload_cap == :none or upload.size <= state.upload_cap do
@@ -3269,23 +2409,14 @@ defmodule AttentionServer.Relay do
 
   defp session_request_line_call(state, id, raw) do
     with {:ok, session} <- active_session(state, id) do
-      browser_type = browser_frame_type(raw)
+      case JSON.decode_line(raw) do
+        {:ok, %{"type" => "focus_report"} = frame} ->
+          {reply, next} = focus_report_request(state, id, session, frame)
+          {:reply, reply, next}
 
-      cond do
-        session.transport == :browser and is_binary(browser_type) and
-            browser_type not in @browser_frame_types ->
-          {:reply, {:ok, [error_line(raw, "unknown_type")]}, state}
-
-        true ->
-          case JSON.decode_line(raw) do
-            {:ok, %{"type" => "focus_report"} = frame} ->
-              {reply, next} = focus_report_request(state, id, session, frame)
-              {:reply, reply, next}
-
-            _ ->
-              {reply, next} = session_request(state, id, session, raw)
-              {:reply, reply, next}
-          end
+        _ ->
+          {reply, next} = session_request(state, id, session, raw)
+          {:reply, reply, next}
       end
     else
       {:error, :forbidden} ->
@@ -3300,9 +2431,6 @@ defmodule AttentionServer.Relay do
     type = frame["type"]
 
     cond do
-      session.transport == :browser and is_binary(type) and type not in @browser_frame_types ->
-        {{:ok, [error_line(frame, "unknown_type")]}, state}
-
       type == "focus_report" ->
         focus_report_request(state, id, session, frame)
 
@@ -3661,160 +2789,7 @@ defmodule AttentionServer.Relay do
         {:noreply, delete_focus_stream(state, listener)}
 
       true ->
-        case Enum.find(state.origin_streams, fn {_, streams} ->
-               Enum.any?(streams, &(&1.worker == listener and &1.monitor == monitor))
-             end) do
-          {stream_key, _} ->
-            Diagnostics.failure(:origin_https, :stream_detach, reason, :closed)
-            {:noreply, detach_origin_stream(state, stream_key, listener)}
-
-          nil ->
-            {:noreply, state}
-        end
-    end
-  end
-
-  defp detach_origin_stream(state, {person, origin, :origin} = key, worker) do
-    {streams, remaining?} = remove_origin_worker(state.origin_streams, key, worker)
-
-    if remaining? do
-      %{state | origin_streams: streams}
-    else
-      proposed = %{
-        state
-        | origin_streams: streams,
-          origin_streams_by_identity:
-            remove_origin_stream_index(state.origin_streams_by_identity, {person, origin}, key)
-      }
-
-      next = origin_availability_changes(state, proposed, person, origin)
-
-      case Store.commit(state.store, next, audit(state.store.engine, origin, "origin_detach")) do
-        {:ok, store} ->
-          %{proposed | store: store}
-
-        error ->
-          Diagnostics.failure(:origin_https, :stream_detach, error, :unavailable)
-          proposed
-      end
-    end
-  end
-
-  defp detach_origin_stream(state, {person, origin, handle} = key, worker) do
-    {streams, remaining?} = remove_origin_worker(state.origin_streams, key, worker)
-
-    if remaining? do
-      %{state | origin_streams: streams}
-    else
-      detach_last_origin_stream(state, key, streams, person, origin, handle)
-    end
-  end
-
-  defp detach_last_origin_stream(state, key, streams, person, origin, handle) do
-    streams_by_identity =
-      remove_origin_stream_index(state.origin_streams_by_identity, {person, origin}, key)
-
-    proposed =
-      %{state | origin_streams: streams, origin_streams_by_identity: streams_by_identity}
-
-    case Conversation.mark_detached(state.store.engine, person, origin, handle) do
-      {:ok, next} ->
-        proposed = %{proposed | store: %{state.store | engine: next}}
-
-        previous = origin_session_status(state, state.store.engine, key)
-        current = origin_session_status(proposed, next, key)
-
-        next =
-          case {previous, current} do
-            {{:ok, %{"availability" => "gone"}}, {:ok, %{"availability" => "gone"}}} ->
-              next
-
-            {_, {:ok, status}} ->
-              Engine.origin_availability(
-                next,
-                person,
-                origin,
-                handle,
-                status["availability"],
-                status["last_detached_at"]
-              )
-
-            _ ->
-              next
-          end
-
-        case Store.commit(
-               state.store,
-               next,
-               audit(state.store.engine, origin, "origin_detach")
-             ) do
-          {:ok, store} ->
-            %{
-              state
-              | origin_streams: streams,
-                origin_streams_by_identity: streams_by_identity,
-                store: store
-            }
-
-          {:error, reason, _store} ->
-            Diagnostics.failure(:origin_https, :stream_detach, reason, :unavailable)
-            %{state | origin_streams: streams, origin_streams_by_identity: streams_by_identity}
-
-          other ->
-            Diagnostics.failure(:origin_https, :stream_detach, other, :unavailable)
-            %{state | origin_streams: streams, origin_streams_by_identity: streams_by_identity}
-        end
-
-      {:error, reason} ->
-        Diagnostics.failure(:origin_https, :stream_detach, reason, :unavailable)
-        %{state | origin_streams: streams, origin_streams_by_identity: streams_by_identity}
-
-      other ->
-        Diagnostics.failure(:origin_https, :stream_detach, other, :unavailable)
-        %{state | origin_streams: streams, origin_streams_by_identity: streams_by_identity}
-    end
-  end
-
-  defp put_origin_stream(streams, key, %{worker: worker} = stream) do
-    Map.update(streams, key, [stream], fn existing ->
-      [stream | Enum.reject(existing, &(&1.worker == worker))]
-    end)
-  end
-
-  defp demonitor_origin_worker(state, key, worker) do
-    state.origin_streams
-    |> Map.get(key, [])
-    |> Enum.each(fn stream ->
-      if stream.worker == worker and Map.has_key?(stream, :monitor),
-        do: Process.demonitor(stream.monitor, [:flush])
-    end)
-  end
-
-  # Removes one worker's stream; the key disappears when its last stream goes.
-  defp remove_origin_worker(streams, key, worker) do
-    {removed, kept} =
-      streams |> Map.get(key, []) |> Enum.split_with(&(&1.worker == worker))
-
-    Enum.each(removed, fn stream ->
-      if Map.has_key?(stream, :monitor), do: Process.demonitor(stream.monitor, [:flush])
-    end)
-
-    if kept == [],
-      do: {Map.delete(streams, key), false},
-      else: {Map.put(streams, key, kept), true}
-  end
-
-  defp remove_origin_stream_index(index, identity, stream_key) do
-    case Map.get(index, identity) do
-      nil ->
-        index
-
-      streams ->
-        remaining = MapSet.delete(streams, stream_key)
-
-        if MapSet.size(remaining) == 0,
-          do: Map.delete(index, identity),
-          else: Map.put(index, identity, remaining)
+        {:noreply, state}
     end
   end
 
@@ -3850,20 +2825,6 @@ defmodule AttentionServer.Relay do
       nil ->
         {:error, :unknown_session}
 
-      %{transport: :browser} = session ->
-        with true <- BrowserRecipient.valid_for?(session.key, session.person),
-             {:ok, revision} <-
-               Engine.owner_revision(
-                 state.store.engine,
-                 session.person,
-                 session.owner_key
-               ),
-             true <- revision == session.owner_revision do
-          {:ok, session}
-        else
-          _ -> {:error, :forbidden}
-        end
-
       session ->
         case Engine.authorized_person(state.store.engine, session.key) do
           {:ok, _} -> {:ok, session}
@@ -3872,57 +2833,7 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  defp browser_connection(state, browser_session_id, id) do
-    case Map.get(state.sessions, id) do
-      %{transport: :browser, browser_session_id: ^browser_session_id} ->
-        active_session(state, id)
-
-      nil ->
-        {:error, :unknown_session}
-
-      _ ->
-        {:error, :forbidden}
-    end
-  end
-
-  defp browser_recipient_session(state, browser_session_id, recipient) do
-    case Map.get(state.browser_recipients, {browser_session_id, recipient}) do
-      %{session: %{transport: :browser} = session} ->
-        with true <-
-               session.key == BrowserRecipient.key(session.person, browser_session_id, recipient),
-             true <- BrowserRecipient.valid_for?(session.key, session.person),
-             {:ok, revision} <-
-               Engine.owner_revision(state.store.engine, session.person, session.owner_key),
-             true <- revision == session.owner_revision do
-          {:ok, session}
-        else
-          _ -> {:error, :session_ended}
-        end
-
-      _ ->
-        {:error, :forbidden}
-    end
-  end
-
-  defp file_limits_reply(state, key) do
-    case Engine.authorized_person(state.store.engine, key) do
-      {:ok, _person} ->
-        cap = if state.upload_cap == :none, do: "none", else: state.upload_cap
-
-        {:reply,
-         {:ok,
-          %{
-            "inline_decoded_bytes_per_entry" => ConversationFiles.inline_limit(),
-            "upload_cap_bytes_per_file" => cap,
-            "answer_ui_limits" => AttentionServer.UI1.published_limits()
-          }}, state}
-
-      _ ->
-        {:reply, {:error, :forbidden}, state}
-    end
-  end
-
-  defp begin_upload(state, person, key, attrs, _size, worker, browser_session_id) do
+  defp begin_upload(state, person, key, attrs, worker) do
     lease = make_ref()
 
     uploader_kind =
@@ -3941,23 +2852,11 @@ defmodule AttentionServer.Relay do
       Map.put(state.active_uploads, lease, %{
         group: upload_group(person, key, attrs),
         uploader_kind: uploader_kind,
-        browser_session_id: browser_session_id,
         canceled: false,
         monitor: monitor
       })
 
     {:ok, lease, %{state | active_uploads: active}}
-  end
-
-  defp upload_authorized_person(state, key, :device),
-    do: Engine.authorized_person(state.store.engine, key)
-
-  defp upload_authorized_person(state, key, {:browser, browser_session_id, recipient}) do
-    case browser_recipient_session(state, browser_session_id, recipient) do
-      {:ok, %{key: ^key, person: person}} -> {:ok, person}
-      {:ok, _other} -> {:error, :forbidden}
-      {:error, reason} -> {:error, reason}
-    end
   end
 
   defp view_get(state, id, session, frame) do
@@ -4029,36 +2928,6 @@ defmodule AttentionServer.Relay do
         {reply, next} = request(state, session.key, raw)
         {wrap_line(reply), next}
     end
-  end
-
-  defp browser_frame_type(raw) do
-    case JSON.decode_line(raw) do
-      {:ok, %{"type" => type}} when is_binary(type) -> type
-      _ -> nil
-    end
-  end
-
-  defp empty_browser_session(key) do
-    %{
-      key: key,
-      focus_opted_in: false,
-      contiguous: 0,
-      stream_seq: nil,
-      ready: false,
-      conversation_seq: nil,
-      conversation_contiguous: nil,
-      conversation_ready: false,
-      owner: nil,
-      socket: nil,
-      listener: nil,
-      transport: :browser,
-      view_support: false,
-      view_notice: nil,
-      view_notice_due_at: nil,
-      view_last_notice_at: nil,
-      levels_support: false,
-      levels_notice: false
-    }
   end
 
   defp levels_session_request(state, id, session, raw) do
@@ -4324,23 +3193,18 @@ defmodule AttentionServer.Relay do
 
   @doc false
   def apply_agent_advisory_ack(state, key, handle, advisory_id) do
-    {:reply, reply, next} = commit_advisory_ack(state, key, handle, advisory_id, true)
-    {reply, next}
-  end
-
-  defp commit_advisory_ack(state, key, handle, advisory_id, v2?) do
-    case BounceDecision.advisory_ack(state.store.engine, key, handle, advisory_id, v2?) do
+    case BounceDecision.advisory_ack(state.store.engine, key, handle, advisory_id, true) do
       {:ok, next, reply} when next == state.store.engine ->
-        {:reply, {:ok, reply}, state}
+        {{:ok, reply}, state}
 
       {:ok, next, reply} ->
         case commit(state.store, next, audit(state.store.engine, key, "origin_advisory_ack")) do
-          {:ok, store} -> {:reply, {:ok, reply}, %{state | store: store}}
-          _ -> {:reply, {:error, :storage_unavailable}, state}
+          {:ok, store} -> {{:ok, reply}, %{state | store: store}}
+          _ -> {{:error, :storage_unavailable}, state}
         end
 
       error ->
-        {:reply, error, state}
+        {error, state}
     end
   end
 
@@ -5015,20 +3879,13 @@ defmodule AttentionServer.Relay do
        when old_engine == next_engine,
        do: {:ok, state}
 
-  defp persist_bounce_decision(state, old_engine, next_engine, changed_keys, action) do
+  defp persist_bounce_decision(state, _old_engine, next_engine, changed_keys, action) do
     audit = %{person: "system", actor: "bounce_decision", action: action}
 
     with {:ok, next_engine} <-
            AttentionServer.AgentAPI.Advisories.stamp_decisions(state.store, next_engine, changed_keys),
          {:ok, store} <- commit(state.store, next_engine, audit) do
-      next_state = %{state | store: store}
-
-      next_state =
-        next_state
-        |> record_advisory_feed_change(old_engine, next_engine, changed_keys)
-        |> reschedule_bounce_sweep()
-
-      {:ok, next_state}
+      {:ok, reschedule_bounce_sweep(%{state | store: store})}
     else
       {:error, reason, _store} ->
         {:error, reason}
@@ -5356,7 +4213,7 @@ defmodule AttentionServer.Relay do
     Enum.sort(handles)
   end
 
-  defp end_session_availability(state, next, {person, key, handle} = scope, :agent_v2) do
+  defp end_session_availability(state, next, {person, key, handle} = scope) do
     case Conversation.session_end_transition(state.store.engine, scope) do
       :unchanged ->
         next
@@ -5366,21 +4223,11 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  defp end_session_availability(state, next, {person, key, handle} = scope, :legacy) do
-    listening? = origin_listening?(state, next, scope)
-    before = Engine.origin_status(state.store.engine, key, handle, listening?)
-    after_end = Engine.origin_status(next, key, handle, listening?)
-    append_origin_availability_if_changed(next, person, key, handle, before, after_end)
-  end
-
-  defp origin_listening?(state, engine, {person, origin, _handle} = key) do
-    Map.has_key?(state.origin_streams, key) or
-      (Map.has_key?(state.origin_streams, {person, origin, :origin}) and
-         get_in(engine.origin_sessions, [key, :support, "origin_listener"]) == true)
-  end
-
-  defp origin_session_status(state, engine, {person, origin, handle} = key) do
-    Conversation.status(engine, person, origin, handle, origin_listening?(state, engine, key))
+  # No origin stream attaches to a protocol 0.1 session handle any more, so the
+  # legacy status of a stored session never reports a listener. Client API v2
+  # sessions report availability through FeedActivity.
+  defp origin_session_status(engine, {person, origin, handle}) do
+    Conversation.status(engine, person, origin, handle, false)
   end
 
   defp append_origin_availability_if_changed(engine, person, origin, handle, previous, current) do
@@ -5460,11 +4307,11 @@ defmodule AttentionServer.Relay do
     end)
     |> Enum.sort_by(fn {{_session_person, _session_origin, handle}, _session} -> handle end)
     |> Enum.reduce(engine, fn {{^person, ^origin, handle} = key, _session}, current ->
-      previous = origin_session_status(state, state.store.engine, key)
+      previous = origin_session_status(state.store.engine, key)
 
       case Conversation.mark_gone(current, person, origin, handle) do
         {:ok, gone} ->
-          current_status = origin_session_status(state, gone, key)
+          current_status = origin_session_status(gone, key)
 
           append_origin_availability_if_changed(
             gone,
@@ -5484,8 +4331,8 @@ defmodule AttentionServer.Relay do
   defp origin_availability_changes(before, after_state, person, origin) do
     Enum.reduce(after_state.store.engine.origin_sessions, after_state.store.engine, fn
       {{^person, ^origin, handle} = key, _}, engine ->
-        old = origin_session_status(before, before.store.engine, key)
-        current = origin_session_status(after_state, engine, key)
+        old = origin_session_status(before.store.engine, key)
+        current = origin_session_status(engine, key)
 
         previous =
           case old do
@@ -5506,7 +4353,7 @@ defmodule AttentionServer.Relay do
                   engine
                 end
 
-              case origin_session_status(after_state, engine, key) do
+              case origin_session_status(engine, key) do
                 {:ok, updated} ->
                   append_origin_availability_if_changed(
                     engine,
@@ -5565,10 +4412,6 @@ defmodule AttentionServer.Relay do
   defp notify_coverage_change(state, old_engine, person, origin) do
     if covered_handles(old_engine, person, origin) !=
          covered_handles(state.store.engine, person, origin) do
-      state.origin_streams
-      |> Map.get({person, origin, :origin}, [])
-      |> Enum.each(&send(&1.worker, :origin_coverage_changed))
-
       requeue_covered(state, person, origin)
     else
       state
@@ -5609,8 +4452,7 @@ defmodule AttentionServer.Relay do
 
             if is_binary(Map.get(record, :session_handle)) do
               handle = record.session_handle
-              listening? = origin_listening?(state, next_engine, {person, key, handle})
-              {:ok, current} = Engine.origin_status(next_engine, key, handle, listening?)
+              {:ok, current} = Engine.origin_status(next_engine, key, handle, false)
 
               Engine.origin_delivery_availability(
                 next_engine,
@@ -5709,54 +4551,6 @@ defmodule AttentionServer.Relay do
     %{state | bounce_deadline_timer: timer, bounce_deadline_generation: generation}
   end
 
-  defp refresh_stream_advisory_support(state, {person, origin, handle} = stream_key) do
-    case Map.get(state.origin_streams, stream_key) do
-      streams when is_list(streams) ->
-        supported = BounceDecision.advisory_supported?(state.store.engine, person, origin, handle)
-
-        updated =
-          Enum.map(streams, fn
-            %{advisory_requested: requested} = stream ->
-              %{stream | advisory_v1: requested and supported}
-
-            stream ->
-              stream
-          end)
-
-        %{state | origin_streams: Map.put(state.origin_streams, stream_key, updated)}
-
-      _ ->
-        state
-    end
-  end
-
-  defp record_advisory_feed_change(state, old_engine, next_engine, changed_keys) do
-    BounceDecision.advisory_feed_keys_for_changes(next_engine, changed_keys)
-    |> Enum.reduce(state, fn {_person, _origin, handle} = key, current ->
-      old_high = get_in(old_engine.advisory_feeds, [key, :high]) || 0
-
-      case Map.get(next_engine.advisory_feeds, key) do
-        %{high: high} when high > old_high ->
-          current.origin_streams
-          |> Map.get(key, [])
-          |> Enum.each(fn
-            %{worker: worker, advisory_v1: true} ->
-              send(worker, {:origin_advisory_changed, handle, high})
-
-            _ ->
-              :ok
-          end)
-
-        _ ->
-          :ok
-      end
-
-      current
-    end)
-  end
-
-  # Origin-feed changes are announced only by the request paths that append
-  # them. This keeps unrelated commits out of every attached origin stream.
   defp commit(store, next, audit) do
     result = Store.commit(store, next, audit)
 
@@ -5865,14 +4659,6 @@ defmodule AttentionServer.Relay do
         |> MapSet.new()
 
       upload_index = add_upload_references(state.upload_index, person, new_ids)
-
-      state.origin_streams_by_identity
-      |> Map.get(key, MapSet.new())
-      |> Enum.each(fn stream_key ->
-        state.origin_streams
-        |> Map.get(stream_key, [])
-        |> Enum.each(&send(&1.worker, {:origin_state_changed, next_feed.high}))
-      end)
 
       %{state | upload_index: upload_index}
     else
@@ -5984,21 +4770,8 @@ defmodule AttentionServer.Relay do
 
   defp line(frame), do: JSON.encode_line(frame)
 
-  defp put_session(state, id, session) do
-    state = %{state | sessions: Map.put(state.sessions, id, session)}
-
-    if session.transport == :browser do
-      recipient_ref = {session.browser_session_id, session.recipient}
-      recipient = %{connection_id: id, session: session}
-
-      %{
-        state
-        | browser_recipients: Map.put(state.browser_recipients, recipient_ref, recipient)
-      }
-    else
-      state
-    end
-  end
+  defp put_session(state, id, session),
+    do: %{state | sessions: Map.put(state.sessions, id, session)}
 
   # Enrollment proofs are refreshed at frame release, after any queued
   # authority mutations, rather than when the response first enters the queue.
@@ -6569,62 +5342,7 @@ defmodule AttentionServer.Relay do
 
         state = %{state | sessions: sessions}
         state = cancel_socket_write(state, session.socket, {:error, :fenced})
-
-        if session.transport == :browser do
-          recipient_ref = {session.browser_session_id, session.recipient}
-          saved = %{connection_id: nil, session: %{session | owner: nil}}
-          %{state | browser_recipients: Map.put(state.browser_recipients, recipient_ref, saved)}
-        else
-          end_focus(state, session.key)
-        end
-    end
-  end
-
-  defp drop_browser_connection(state, id, :replaced) do
-    case Map.pop(state.sessions, id) do
-      {nil, _} ->
-        state
-
-      {session, sessions} ->
-        if session.owner, do: send(session.owner, {:browser_connection_replaced, id})
-        recipient_ref = {session.browser_session_id, session.recipient}
-        saved = %{connection_id: nil, session: %{session | owner: nil}}
-
-        %{
-          state
-          | sessions: sessions,
-            browser_recipients: Map.put(state.browser_recipients, recipient_ref, saved)
-        }
-    end
-  end
-
-  defp cleanup_browser_recipient_state(state, actor_keys) do
-    actor_keys = MapSet.new(actor_keys)
-    engine = discard_browser_actor_state(state.store.engine, actor_keys)
-
-    case commit(state.store, engine, %{
-           person: "system",
-           actor: "browser_session",
-           action: "browser_session_end"
-         }) do
-      {:ok, store} ->
-        next = %{state | store: store}
-
-        Enum.reduce_while(actor_keys, {:ok, next}, fn key, {:ok, acc} ->
-          case BrowserRecipient.person(key) do
-            {:ok, person} ->
-              case Store.discard_inbox_snapshots_for_device(acc.store, person, key) do
-                :ok -> {:cont, {:ok, acc}}
-                {:error, reason} -> {:halt, {:error, reason, acc}}
-              end
-
-            _ ->
-              {:cont, {:ok, acc}}
-          end
-        end)
-
-      {:error, reason, store} ->
-        {:error, reason, %{state | store: store}}
+        end_focus(state, session.key)
     end
   end
 
@@ -6688,15 +5406,6 @@ defmodule AttentionServer.Relay do
 
   defp valid_upload_attributes?(_), do: false
 
-  defp valid_discard_attributes?(attrs) when is_map(attrs) do
-    Message.uuid?(attrs["op_id"]) and
-      Message.sender_id?(attrs["sender_id"]) and
-      Message.nonempty?(attrs["message_id"]) and
-      is_integer(attrs["revision"]) and attrs["revision"] > 0
-  end
-
-  defp valid_discard_attributes?(_), do: false
-
   defp upload_group(person, key, attrs) do
     {person, key, attrs["op_id"], attrs["sender_id"], attrs["message_id"], attrs["revision"]}
   end
@@ -6704,18 +5413,6 @@ defmodule AttentionServer.Relay do
   defp upload_group(upload) do
     {upload.person, upload.uploader, upload.op_id, upload.sender_id, upload.message_id,
      upload.revision}
-  end
-
-  defp upload_request_scope(person, key, attrs) do
-    {person, key, attrs["sender_id"], attrs["message_id"], attrs["revision"]}
-  end
-
-  defp upload_request_scope(upload) when is_map(upload) do
-    {upload.person, upload.uploader, upload.sender_id, upload.message_id, upload.revision}
-  end
-
-  defp upload_request_scope({person, key, _op_id, sender_id, message_id, revision}) do
-    {person, key, sender_id, message_id, revision}
   end
 
   defp upload_lease_status(_state, nil, _group), do: :ok
@@ -6793,7 +5490,6 @@ defmodule AttentionServer.Relay do
     empty = %{
       references_by_person: %{},
       ids_by_group: %{},
-      ids_by_request_scope: %{},
       unsubmitted_agent_upload_ids: MapSet.new()
     }
 
@@ -6822,13 +5518,7 @@ defmodule AttentionServer.Relay do
   defp add_upload_to_index(index, upload, engine) do
     id = upload.id
     group = upload_group(upload)
-    scope = upload_request_scope(upload)
-
-    index = %{
-      index
-      | ids_by_group: put_index_id(index.ids_by_group, group, id),
-        ids_by_request_scope: put_index_id(index.ids_by_request_scope, scope, id)
-    }
+    index = %{index | ids_by_group: put_index_id(index.ids_by_group, group, id)}
 
     is_agent =
       case Map.get(upload, :uploader_kind) do
@@ -6854,12 +5544,10 @@ defmodule AttentionServer.Relay do
 
         upload ->
           group = upload_group(upload)
-          scope = upload_request_scope(upload)
 
           %{
             current
             | ids_by_group: remove_index_id(current.ids_by_group, group, id),
-              ids_by_request_scope: remove_index_id(current.ids_by_request_scope, scope, id),
               unsubmitted_agent_upload_ids:
                 MapSet.delete(current.unsubmitted_agent_upload_ids, id)
           }
