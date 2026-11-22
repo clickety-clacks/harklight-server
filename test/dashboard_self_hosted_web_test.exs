@@ -178,6 +178,9 @@ defmodule AttentionServer.DashboardSelfHostedWebTest do
     assert script.resp_body =~ ~s|new URLSearchParams(location.search).has("signed_out")|
     assert script.resp_body =~ ~s|signedOut&&token===""?"You are signed out."|
     assert script.resp_body =~ "This sign-in link is invalid. Ask the owner for a new one."
+    # The link fragment is cleared but the marker is kept, so a reload still
+    # shows the signed-out message.
+    assert script.resp_body =~ ~s|history.replaceState(null,"",location.pathname+location.search)|
 
     landing = get("/sign-in?signed_out=1", nil, opts)
     assert landing.status == 200

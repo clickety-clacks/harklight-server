@@ -1105,7 +1105,7 @@ defmodule AttentionServer.DashboardReadHTTP do
 
   defp sign_in_script(conn, _opts) do
     script =
-      ~S|const status=document.getElementById("status");const token=location.hash.slice(1);const signedOut=new URLSearchParams(location.search).has("signed_out");history.replaceState(null,"",location.pathname);if(!/^hbs1_[0-9a-f]{64}$/.test(token)){status.textContent=signedOut&&token===""?"You are signed out.":"This sign-in link is invalid. Ask the owner for a new one."}else{fetch("/sign-in",{method:"POST",headers:{"content-type":"text/plain"},credentials:"same-origin",body:token}).then(r=>{if(r.status===204){location.replace("/inbox")}else{status.textContent="This sign-in link is expired or already used. Ask the owner for a new one."}}).catch(()=>{status.textContent="The server could not be reached. Ask the owner for a new link if this one was used."})}|
+      ~S|const status=document.getElementById("status");const token=location.hash.slice(1);const signedOut=new URLSearchParams(location.search).has("signed_out");history.replaceState(null,"",location.pathname+location.search);if(!/^hbs1_[0-9a-f]{64}$/.test(token)){status.textContent=signedOut&&token===""?"You are signed out.":"This sign-in link is invalid. Ask the owner for a new one."}else{fetch("/sign-in",{method:"POST",headers:{"content-type":"text/plain"},credentials:"same-origin",body:token}).then(r=>{if(r.status===204){location.replace("/inbox")}else{status.textContent="This sign-in link is expired or already used. Ask the owner for a new one."}}).catch(()=>{status.textContent="The server could not be reached. Ask the owner for a new link if this one was used."})}|
 
     conn |> put_resp_content_type("text/javascript", "utf-8") |> send_resp(200, script)
   end
