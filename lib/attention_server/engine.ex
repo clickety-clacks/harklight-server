@@ -2271,12 +2271,6 @@ defmodule AttentionServer.Engine do
     end
   end
 
-  def open_conversation(%__MODULE__{} = engine, key) do
-    with {:ok, %{person: person, key: device}} <- principal(engine, key) do
-      {:ok, put_member(engine, :conversation_opened, {person, device})}
-    end
-  end
-
   @doc "Records ACK1 for authorized conversation resources selected for a v2 feed response."
   def agent_feed_delivered(%__MODULE__{} = engine, person, key, targets) do
     with {:ok, ^person} <- authorized_person(engine, key) do

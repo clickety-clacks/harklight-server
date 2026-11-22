@@ -15,7 +15,7 @@ defmodule AttentionServer.Store.KeyedStoreOpenTest do
     assert {:ok, engine} = Engine.setup_person(legacy.engine, "A")
     assert {:ok, engine} = Engine.setup_device(engine, "A", "device")
     assert {:ok, legacy} = Store.commit(legacy, engine, audit)
-    assert {:ok, opened} = Engine.open_conversation(legacy.engine, "device")
+    opened = Engine.put_member(legacy.engine, :conversation_opened, {"A", "device"})
     assert {:ok, legacy} = Store.commit(legacy, opened, audit)
     assert legacy.progress_version == 1
     assert :ok = Store.close(legacy)

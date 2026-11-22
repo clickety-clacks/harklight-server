@@ -112,7 +112,7 @@ defmodule AttentionServer.Store.KeyedMigrationTest do
     assert {:ok, engine} = Engine.setup_device(engine, "reader", "device")
     audit = %{person: "reader", actor: "device", action: "prepare"}
     assert {:ok, store} = Store.commit(store, engine, audit)
-    assert {:ok, next} = Engine.open_conversation(store.engine, "device")
+    next = Engine.put_member(store.engine, :conversation_opened, {"reader", "device"})
     assert {:ok, store} = Store.commit(store, next, audit)
     assert store.progress_version == 1
     generation = store.version + 1
