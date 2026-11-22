@@ -859,7 +859,7 @@ visible text. Its `attention` member changes:
 | `precondition_failed` | 412 | false | `If-Match` does not match. Also a superseded push `revision` (`stale_push_binding`). |
 | `cursor_expired` | 410 | false | `after` is older than retention |
 | `payload_too_large` | 413 | false | Body or file over the limit (`too_large`, `upload_cap_exceeded`) |
-| `unsupported` | 400 | false | The server does not serve this here: push with push disabled, or a reply, answer receipt or agent result on an item with no agent conversation |
+| `unsupported` | 400 | false | The server does not serve this here: push with push disabled, or a reply, answer receipt or agent result on an item with no agent conversation, or an answer receipt or agent result after a registered agent's answer |
 | `internal_error` | 500 | false | An unexpected server fault during request handling, projection, or rendering. Includes `Request-Id` and has no `Retry-After`. |
 | `retry_later` | 503 | true | Load shedding, with `Retry-After` |
 | `storage_unavailable` | 503 | true | The store could not commit, with `Retry-After` |
