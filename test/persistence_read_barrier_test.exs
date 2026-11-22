@@ -23,8 +23,10 @@ defmodule AttentionServer.PersistenceReadBarrierTest do
 
   defp audit, do: %{person: "person", actor: "test", action: "barrier"}
 
-  defp read(store, {:device_revoked?, key}, _from),
-    do: Engine.device_revoked?(store.engine, key)
+  defp read(store, {:cursor, key}, _from),
+    do: Engine.acknowledged_cursor(store.engine, key)
+
+  defp revoked?(engine, key), do: match?(%{revoked: true}, Map.get(engine.devices, key))
 
   # Disk work and worker scheduling are not subject to a 100 ms contract.
   # Observe each barrier event (or owner failure); the unchanged ExUnit test
@@ -86,14 +88,14 @@ defmodule AttentionServer.PersistenceReadBarrierTest do
 
     writer = await_event(owner, monitor, :writing)
     queued = Task.async(fn -> GenServer.call(owner, {:setup_device, "second"}) end)
-    refute GenServer.call(owner, {:device_revoked?, "device"})
+    assert {:ok, 0} = GenServer.call(owner, {:cursor, "device"})
     refute_received {:first_committed, _}
     queued_ref = queued.ref
     refute_received {^queued_ref, _}
     send(writer, :allow_commit)
     assert await_event(owner, monitor, :first_committed) == owner
     second_writer = await_event(owner, monitor, :second_write)
-    assert GenServer.call(owner, {:device_revoked?, "device"})
+    assert {:error, :forbidden} = GenServer.call(owner, {:cursor, "device"})
     queued_ref = queued.ref
     refute_received {^queued_ref, _}
     send(second_writer, :finish)
@@ -101,8 +103,8 @@ defmodule AttentionServer.PersistenceReadBarrierTest do
     assert await_exit(owner, monitor) == :normal
 
     {:ok, reopened} = Store.open(path)
-    assert Engine.device_revoked?(reopened.engine, "device")
-    refute Engine.device_revoked?(reopened.engine, "second")
+    assert revoked?(reopened.engine, "device")
+    refute revoked?(reopened.engine, "second")
     Store.close(reopened)
   end
 
@@ -124,12 +126,12 @@ defmodule AttentionServer.PersistenceReadBarrierTest do
       end)
 
     writer = await_event(owner, monitor, :writing)
-    refute GenServer.call(owner, {:device_revoked?, "device"})
+    assert {:ok, 0} = GenServer.call(owner, {:cursor, "device"})
     send(writer, :fail)
     assert await_exit(owner, monitor) == :persistence_failed
     refute_received :unexpected_success
     {:ok, reopened} = Store.open(path)
-    refute Engine.device_revoked?(reopened.engine, "device")
+    refute revoked?(reopened.engine, "device")
     Store.close(reopened)
   end
 end

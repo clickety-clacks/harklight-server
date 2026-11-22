@@ -78,15 +78,13 @@ defmodule AttentionServer.StoreBrowserSnapshotCleanupTest do
     insert_children(store.db, person, browser, "browser-snapshot")
     insert_children(store.db, person, device, "device-snapshot")
 
-    assert :ok = Store.discard_inbox_snapshots_for_device(store, person, browser)
+    assert :ok = Store.discard_browser_inbox_snapshots(store)
     assert count(store.db, "SELECT count(*) FROM relay_inbox_snapshots") == 1
     assert count(store.db, "SELECT count(*) FROM relay_inbox_item_pages") == 1
     assert count(store.db, "SELECT count(*) FROM relay_inbox_receipt_sequences") == 1
     assert count(store.db, "SELECT count(*) FROM relay_inbox_operation_receipts") == 1
     assert count(store.db, "SELECT count(*) FROM relay_inbox_batches") == 1
     assert count(store.db, "SELECT count(*) FROM relay_inbox_receipt_pages") == 1
-    assert :ok = Store.discard_browser_inbox_snapshots(store)
-    assert count(store.db, "SELECT count(*) FROM relay_inbox_snapshots") == 1
   end
 
   defp insert_snapshot(db, person, device, snapshot_id) do

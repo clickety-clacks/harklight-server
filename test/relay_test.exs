@@ -410,7 +410,12 @@ defmodule AttentionServer.RelayTest do
     state = :sys.get_state(relay)
     refute Map.has_key?(state, :inbox_builds)
     refute Map.has_key?(state, :inbox_build_monitors)
-    assert {:ok, nil} = AttentionServer.Store.inbox_startup(state.store, "A", "a2", "s")
+
+    {:ok, statement} =
+      Exqlite.Sqlite3.prepare(state.store.db, "SELECT count(*) FROM relay_inbox_snapshots")
+
+    assert {:ok, [[0]]} = Exqlite.Sqlite3.fetch_all(state.store.db, statement)
+    :ok = Exqlite.Sqlite3.release(state.store.db, statement)
     assert {:ok, [], 0} = RelayReaders.events(relay, "a1", 0)
   end
 

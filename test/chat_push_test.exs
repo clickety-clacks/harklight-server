@@ -81,6 +81,13 @@ defmodule AttentionServer.ChatPushTest do
   defp push_binding(engine), do: engine.push_bindings[{@person, @reader}]
   defp due(engine), do: push_binding(engine).next_at
 
+  # The reader's conversation cursor, as a 0.1 session's ACK stored it.
+  defp acknowledge_conversation(engine, seq),
+    do: %{
+      engine
+      | conversation_cursors: Map.put(engine.conversation_cursors, {@person, @reader}, seq)
+    }
+
   defp assert_round_trip(engine) do
     dir = Path.join(System.tmp_dir!(), "chat-push-#{System.unique_integer([:positive])}")
     File.mkdir_p!(dir)
@@ -108,7 +115,7 @@ defmodule AttentionServer.ChatPushTest do
 
     # Receiving/ACKing chat is not reading it and must not remove the alert.
     high = engine.conversation_highs[@person]
-    {:ok, engine, _} = Engine.acknowledge_conversation(engine, @reader, high, high)
+    engine = acknowledge_conversation(engine, high)
     now = due(engine)
     {:ok, engine, request_claim} = Engine.claim_push(engine, now)
     assert request_claim.stream == :request
@@ -259,7 +266,7 @@ defmodule AttentionServer.ChatPushTest do
     {engine, _} = reply(engine, "one", "Pending")
     before = push_binding(engine)
     high = engine.conversation_highs[@person]
-    {:ok, engine, _} = Engine.acknowledge_conversation(engine, @reader, high, high)
+    engine = acknowledge_conversation(engine, high)
     {engine, refreshed} = register(engine, 2)
     assert refreshed["binding_id"] == registered["binding_id"]
     assert push_binding(engine).accepted_high == before.accepted_high
