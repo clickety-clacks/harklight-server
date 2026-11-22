@@ -91,7 +91,8 @@ defmodule AttentionServer.BrowserSignIn do
 
   # Records keep the stored shape; older ones carry a deadline that is no longer
   # enforced, current ones carry nil.
-  defp valid_record?(engine, hash, record) when is_map(record) do
+  @doc false
+  def valid_record?(engine, hash, record) when is_map(record) do
     person = Map.get(record, :person)
     owner_key = Map.get(record, :owner_key)
     owner_revision = Map.get(record, :owner_revision)
@@ -113,7 +114,7 @@ defmodule AttentionServer.BrowserSignIn do
       (current? or legacy?)
   end
 
-  defp valid_record?(_engine, _hash, _record), do: false
+  def valid_record?(_engine, _hash, _record), do: false
 
   defp hash?(hash), do: is_binary(hash) and byte_size(hash) == 32
   defp key?(key), do: is_binary(key) and Regex.match?(~r/\A[0-9a-f]{64}\z/, key)

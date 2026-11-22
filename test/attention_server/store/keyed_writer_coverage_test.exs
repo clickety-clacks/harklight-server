@@ -42,6 +42,8 @@ defmodule AttentionServer.Store.KeyedWriterCoverageTest do
     {:get_upload, 2} => :read,
     {:verify_upload, 2} => :read,
     {:verify_retained_uploads, 1} => :read,
+    # Pure per-address keyed validation verdict, exposed for its tests.
+    {:incremental_verdict, 3} => :read,
     {:discard_building_inbox_snapshots, 1} => :side_table,
     {:discard_browser_inbox_snapshots, 1} => :side_table
   }

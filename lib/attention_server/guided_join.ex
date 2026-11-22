@@ -334,16 +334,21 @@ defmodule AttentionServer.GuidedJoin do
   def valid_state?(engine) do
     is_map(engine.join_invitations) and
       Enum.all?(engine.join_invitations, fn {hash, invite} ->
-        hash?(hash) and map_size(invite) == 10 and Map.has_key?(engine.persons, invite.person) and
-          key?(invite.owner_key) and is_integer(invite.owner_revision) and
-          invite.owner_revision > 0 and
-          (valid_configuration?(invite.configuration) or
-             v1_configuration?(invite.configuration)) and
-          (is_nil(invite.expires_at) or (is_integer(invite.expires_at) and invite.expires_at > 0)) and
-          (is_nil(invite.retain_until) or is_integer(invite.retain_until)) and
-          (is_nil(invite.request_id) or AttentionServer.Message.uuid_v4?(invite.request_id)) and
-          valid_binding?(engine, invite)
+        valid_record?(engine, hash, invite)
       end)
+  end
+
+  @doc false
+  def valid_record?(engine, hash, invite) do
+    hash?(hash) and map_size(invite) == 10 and Map.has_key?(engine.persons, invite.person) and
+      key?(invite.owner_key) and is_integer(invite.owner_revision) and
+      invite.owner_revision > 0 and
+      (valid_configuration?(invite.configuration) or
+         v1_configuration?(invite.configuration)) and
+      (is_nil(invite.expires_at) or (is_integer(invite.expires_at) and invite.expires_at > 0)) and
+      (is_nil(invite.retain_until) or is_integer(invite.retain_until)) and
+      (is_nil(invite.request_id) or AttentionServer.Message.uuid_v4?(invite.request_id)) and
+      valid_binding?(engine, invite)
   end
 
   defp valid_binding?(_engine, %{code: nil, key: nil, secret_hash: nil}), do: true
