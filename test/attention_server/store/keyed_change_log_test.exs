@@ -9,7 +9,7 @@ defmodule AttentionServer.Store.KeyedChangeLogTest do
   # also raises on a mismatch. The final coverage check makes sure every
   # dependency expansion actually produced rows, so dropping one fails here.
 
-  alias AttentionServer.{BounceDecision, ChangeLog, Engine, JSON, Store}
+  alias AttentionServer.{BounceDecision, BouncePolicy, ChangeLog, Engine, JSON, Store}
 
   @moduletag :tmp_dir
   @person "00000000-0000-4000-8000-0000000000aa"
@@ -85,7 +85,7 @@ defmodule AttentionServer.Store.KeyedChangeLogTest do
     state = start(directory)
     state = forward(state, 1, "m1", hd(@sessions), false)
     engine = state.store.engine
-    key = {@person, @sender, "m1"}
+    [key] = Map.keys(engine.messages)
 
     touched =
       MapSet.new([
@@ -103,13 +103,67 @@ defmodule AttentionServer.Store.KeyedChangeLogTest do
     :ok = Store.close(state.store)
   end
 
+  test "touching an unchanged opened revision emits no rows", %{tmp_dir: directory} do
+    state = start(directory)
+    state = forward(state, 1, "m1", hd(@sessions), false)
+    engine = state.store.engine
+    [{key, record}] = Map.to_list(engine.messages)
+    assert {:ok, opened, 1} = BounceDecision.record_open(engine, key, record, 1)
+
+    member = Tuple.append(key, 1)
+    assert MapSet.member?(opened.opened_revisions, member)
+    touched = MapSet.new([{:member, :opened_revisions, member}])
+
+    assert %{pending: pending, agent_pending: agent} =
+             ChangeLog.commit_log_touched(opened, opened, touched, [])
+
+    assert pending == %{}
+    assert agent == %{}
+    :ok = Store.close(state.store)
+  end
+
+  test "touching an already acknowledged advisory receipt emits no rows", %{tmp_dir: directory} do
+    state = start(directory)
+    handle = hd(@sessions)
+
+    state =
+      apply_op(state, :levels, fn engine ->
+        {:ok, configured, _} =
+          BounceDecision.configure_levels(engine, @person, BouncePolicy.default_levels(), at(1))
+
+        {:ok, configured}
+      end)
+
+    state = forward(state, 2, "m1", handle, true)
+    engine = state.store.engine
+    [{@person, sender, id}] = Map.keys(engine.messages)
+    scores = [%{"sender_id" => sender, "message_id" => id, "score" => 0.9}]
+    bounced = BounceDecision.record_scores(engine, @person, scores, at(2) + 86_400_000)
+
+    scope = {@person, @origin, handle}
+    assert %{"advisory_id" => advisory_id} = bounced.advisory_feeds[scope].entries[1]
+
+    assert {:ok, acked, %{"already_delivered" => false}} =
+             BounceDecision.advisory_ack(bounced, @origin, handle, advisory_id)
+
+    assert MapSet.member?(acked.advisory_feeds[scope].receipts, advisory_id)
+    touched = MapSet.new([{:advisory, scope, {:receipt, advisory_id}}])
+
+    assert %{pending: pending, agent_pending: agent} =
+             ChangeLog.commit_log_touched(acked, acked, touched, [])
+
+    assert pending == %{}
+    assert agent == %{}
+    :ok = Store.close(state.store)
+  end
+
   # Every engine read also appends a read_position event, whose summary
   # change names the item too; this pins the read-position rule on its own.
   test "a read position change alone names its item", %{tmp_dir: directory} do
     state = start(directory)
     state = forward(state, 1, "m1", hd(@sessions), false)
     old = state.store.engine
-    key = {@person, @sender, "m1"}
+    [key] = Map.keys(old.messages)
     next = %{old | chat_read_positions: Map.put(old.chat_read_positions, key, 1)}
     touched = MapSet.new([{:row, :chat_read_positions, key}])
     changed = ChangeLog.changed_resources_touched(old, next, touched, [])
