@@ -431,4 +431,78 @@ defmodule AttentionServer.RelayTest do
     assert {:ok, nil} = AttentionServer.Store.inbox_startup(state.store, "A", "a2", "s")
     assert {:ok, [], 0} = Relay.events(relay, "a1", 0)
   end
+
+  # Protocol 0.1 Route B reads (inbox_list, conversation_page) are gone, and
+  # conversation_open no longer has a bounded form: the bounded member is
+  # ignored, as it was before Route B, so the open is the legacy one.
+  test "the 0.1 Route B frames are unknown types and a bounded open is the legacy open", %{
+    relay: relay,
+    tmp_dir: dir
+  } do
+    assert %{"type" => "ok"} =
+             request(relay, "a1", %{"type" => "forward", "op_id" => op(1), "message" => message()})
+
+    frames = [
+      %{"type" => "inbox_list", "limit" => 20},
+      %{"type" => "conversation_page", "sender_id" => "app:test", "message_id" => "m"}
+    ]
+
+    assert {:ok, raw} = Relay.open_session(relay, "a1")
+    assert {:ok, websocket} = Relay.open_websocket_session(relay, "a2", nil, nil)
+    path = Path.join(dir, "frame.json")
+    before = :sys.get_state(relay).store.engine
+
+    for frame <- frames do
+      frame = Map.merge(frame, %{"v" => 1, "ref" => frame["type"]})
+      line = JSON.encode!(frame) <> "\n"
+      File.write!(path, line)
+      ref = frame["ref"]
+
+      assert %{"type" => "error", "reason" => "unknown_type", "ref" => ^ref} =
+               request(relay, "a1", frame)
+
+      for {session, reply} <- [
+            {raw, Relay.session_request_line(relay, raw, line)},
+            {websocket, Relay.session_request_line(relay, websocket, line)},
+            {websocket, Relay.session_request_file(relay, websocket, path)}
+          ] do
+        assert {:ok, [reply_line]} = reply, inspect(session)
+
+        assert {:ok, %{"type" => "error", "reason" => "unknown_type", "ref" => ^ref}} =
+                 JSON.decode_line(reply_line)
+      end
+    end
+
+    assert :sys.get_state(relay).store.engine == before
+
+    for {session, bounded} <- [{raw, true}, {websocket, "yes"}] do
+      resync = JSON.encode!(%{"v" => 1, "type" => "resync", "since" => 0}) <> "\n"
+      assert {:ok, [_ok | _]} = Relay.session_request_line(relay, session, resync)
+
+      open =
+        JSON.encode!(%{
+          "v" => 1,
+          "type" => "conversation_open",
+          "since" => 0,
+          "bounded" => bounded
+        }) <>
+          "\n"
+
+      assert {:ok, [ok, resynced]} = Relay.session_request_line(relay, session, open)
+      assert {:ok, %{"type" => "ok"}} = JSON.decode_line(ok)
+
+      assert {:ok, %{"type" => "conversation_resynced", "chat_read_positions" => []} = resynced} =
+               JSON.decode_line(resynced)
+
+      refute Map.has_key?(resynced, "view_rev")
+      session_state = :sys.get_state(relay).sessions[session]
+      refute session_state.view_support
+      refute Map.has_key?(session_state, :sync_mode)
+    end
+
+    view = :sys.get_state(relay).priority_views["A"]
+    refute Map.has_key?(view, :message_order)
+    refute Map.has_key?(view, :message_order_suffixes)
+    assert Map.has_key?(view, :message_entries_by_identity)
+  end
 end

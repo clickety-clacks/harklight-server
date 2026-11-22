@@ -287,40 +287,11 @@ defmodule AttentionServer.ClientAPIResourcesTest do
       GenServer.stop(relay)
     end
 
-    test "agree with today's Route B rows for the same reader", %{path: path} do
+    test "rank keys sort into today's list order and sections follow free order",
+         %{path: path} do
       relay = scripted_relay(path)
       {engine, view} = snapshot(relay)
       items = rendered_items(engine, view, "reader")
-
-      assert {:ok, %{"rows" => rows}} =
-               Engine.route_b_inbox_page(
-                 engine,
-                 "reader",
-                 view.message_order,
-                 view.message_order_suffixes,
-                 view.message_entries_by_identity,
-                 100,
-                 nil
-               )
-
-      assert length(rows) == map_size(items)
-
-      for row <- rows do
-        item = Map.fetch!(items, key(row["message_id"]))
-        assert item["seen"] == row["opened"]
-        assert item["request_revision"] == row["request_revision"]
-        assert item["message"] == row["message"]
-        assert item["as"] == row["as"]
-        assert item["chat"]["started"] == row["chat_started"]
-        assert item["chat"]["available"] == Map.has_key?(row, "session_handle")
-        assert item["availability"]["state"] == get_in(row, ["availability", "availability"])
-
-        case row["terminal"] do
-          nil -> assert item["terminal"] == nil
-          %{"terminal_reason" => "retracted"} -> assert item["terminal"]["state"] == "retracted"
-          terminal -> assert item["terminal"]["state"] == terminal["state"]
-        end
-      end
 
       # Rank keys sort into today's list order (Placement.list_items), and
       # sections follow its free-order state.
@@ -561,7 +532,7 @@ defmodule AttentionServer.ClientAPIResourcesTest do
   end
 
   describe "inbox order against today's" do
-    test "rank order equals today's Route B inbox paging in free order, with threads and history",
+    test "rank order equals today's inbox order in free order, with threads and history",
          %{path: path} do
       relay = scripted_relay(path)
 
@@ -590,41 +561,6 @@ defmodule AttentionServer.ClientAPIResourcesTest do
       assert Placement.choice(engine, "A") == "baseline"
       items = rendered_items(engine, view, "reader")
 
-      route_b =
-        Stream.unfold(nil, fn
-          :done ->
-            nil
-
-          cursor ->
-            {:ok, page} =
-              Engine.route_b_inbox_page(
-                engine,
-                "reader",
-                view.message_order,
-                view.message_order_suffixes,
-                view.message_entries_by_identity,
-                3,
-                cursor
-              )
-
-            next =
-              case page["next_cursor"] do
-                nil ->
-                  :done
-
-                encoded ->
-                  encoded
-                  |> Base.url_decode64!(padding: false)
-                  |> Kernel.<>("\n")
-                  |> JSON.decode_line()
-                  |> then(fn {:ok, %{"sender_id" => s, "message_id" => m}} -> {s, m} end)
-              end
-
-            {page["rows"], next}
-        end)
-        |> Enum.flat_map(& &1)
-        |> Enum.map(& &1["message_id"])
-
       by_rank =
         items
         |> Enum.sort_by(fn {_, item} -> item["rank"]["key"] end)
@@ -642,15 +578,12 @@ defmodule AttentionServer.ClientAPIResourcesTest do
       b = Enum.find_index(by_rank, &(&1 == "t-b"))
       d = Enum.find_index(by_rank, &(&1 == "t-d"))
       assert abs(b - d) == 1
-      # Today's two orders agree on the current section; report where they differ.
-      current =
-        for {{_, _, id}, item} <- Enum.sort_by(items, fn {_, i} -> i["rank"]["key"] end),
-            item["rank"]["section"] == "current",
-            do: id
 
-      assert Enum.take(route_b, length(current)) == current
-      send(self(), {:orders, route_b, by_rank})
-      assert route_b == by_rank
+      # Today's order, as the 0.1 Route B inbox paged it before Route B was
+      # removed.
+      assert by_rank ==
+               ~w(t-d t-b solo-2 t-c solo revised chat old t-a retracted silent answered)
+
       GenServer.stop(relay)
     end
   end

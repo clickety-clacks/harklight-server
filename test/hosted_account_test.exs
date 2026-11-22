@@ -2,6 +2,7 @@ defmodule AttentionServer.HostedAccountTest do
   use ExUnit.Case, async: false
 
   alias AttentionServer.{
+    ClientAPI,
     DashboardReadHTTP,
     DeviceIdentity,
     Engine,
@@ -48,21 +49,37 @@ defmodule AttentionServer.HostedAccountTest do
   end
 
   describe "hosted accounts in the relay" do
-    test "a newly created hosted owner has an empty Route B inbox", %{certs: certs, dir: dir} do
+    test "a newly created hosted owner has an empty inbox", %{certs: certs, dir: dir} do
       relay = start_relay(certs, dir, dashboard_origin: @origin)
-      assert {:ok, person} = Relay.hosted_account_create(relay, "acct-route-b-empty")
+      assert {:ok, person} = Relay.hosted_account_create(relay, "acct-empty-inbox")
 
       # Check the real hosted-account path before the local device fixture seam.
       assert Map.has_key?(:sys.get_state(relay).priority_views, person)
-      assert :ok = Relay.setup_device(relay, person, "route-b-device")
-      assert {:ok, session} = Relay.open_session(relay, "route-b-device")
+      assert :ok = Relay.setup_device(relay, person, "first-device")
       before = :sys.get_state(relay)
 
-      request = JSON.encode!(%{"v" => 1, "type" => "inbox_list"}) <> "\n"
-      assert {:ok, [response_line]} = Relay.session_request_line(relay, session, request)
-      assert {:ok, %{"type" => "ok", "rows" => [], "unresolved_count" => 0}} =
-               JSON.decode_line(response_line)
+      assert {:ok, %{"items" => [], "counts" => %{"unresolved" => 0}} = inbox} =
+               ClientAPI.Reads.inbox(relay, "first-device")
 
+      refute Map.has_key?(inbox, "next_page")
+      assert :sys.get_state(relay).store.engine == before.store.engine
+      GenServer.stop(relay)
+    end
+
+    test "an operator-created owner has an empty inbox", %{certs: certs, dir: dir} do
+      relay = start_relay(certs, dir, [])
+      owner_certificate = TLSFixtures.certificate_der!(certs, "a1")
+      assert {:ok, person} = Relay.operator_bootstrap(relay, owner_certificate)
+
+      # Check the real person-creation path before the local device fixture seam.
+      assert Map.has_key?(:sys.get_state(relay).priority_views, person)
+      assert :ok = Relay.setup_device(relay, person, "first-device")
+      before = :sys.get_state(relay)
+
+      assert {:ok, %{"items" => [], "counts" => %{"unresolved" => 0}} = inbox} =
+               ClientAPI.Reads.inbox(relay, "first-device")
+
+      refute Map.has_key?(inbox, "next_page")
       assert :sys.get_state(relay).store.engine == before.store.engine
       GenServer.stop(relay)
     end

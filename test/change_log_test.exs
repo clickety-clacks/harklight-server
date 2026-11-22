@@ -1067,10 +1067,12 @@ defmodule AttentionServer.ChangeLogTest do
 
   # A store from 0.1.x (v0.1.49, then slice 3 builds) never had the change log
   # on, and holds the 0.1 paging state: an accepted startup checkpoint, a
-  # startup left building, and device and conversation cursors. The first 0.2.0
-  # start seeds the log and stores the ranking once; a second start must change
-  # nothing, so the one-time cursor reset of #254 never fires again and clients
-  # keep their cursors.
+  # startup left building, and device and conversation cursors. It also holds
+  # what a 0.1 Route B client left: the conversation-opened marker of a bounded
+  # conversation_open (inbox_list and conversation_page stored nothing). The
+  # first 0.2.0 start seeds the log and stores the ranking once; a second start
+  # must change nothing, so the one-time cursor reset of #254 never fires again
+  # and clients keep their cursors.
   test "a store written with the log off is seeded once and a second start changes nothing",
        ctx do
     pre_log(ctx, fn store ->
@@ -1096,6 +1098,7 @@ defmodule AttentionServer.ChangeLogTest do
         "answer" => "Done"
       })
       |> PreChangeLogStore.paging_checkpoint("reader", "reader-startup")
+      |> PreChangeLogStore.open_conversation("reader")
       |> PreChangeLogStore.acknowledge_conversation("reader", 1)
       |> PreChangeLogStore.paging_building("origin", "origin-startup")
     end)
@@ -1110,6 +1113,7 @@ defmodule AttentionServer.ChangeLogTest do
     engine = store(relay).engine
     assert engine.cursors[{"A", "reader"}] == engine.persons["A"]
     assert engine.conversation_cursors[{"A", "reader"}] == 1
+    assert MapSet.member?(engine.conversation_opened, {"A", "reader"})
     assert head(relay) == 1
     assert {:error, :cursor_expired} = log(relay, 0)
     assert {:ok, [], false, 1} = log(relay, 1)
@@ -1140,6 +1144,7 @@ defmodule AttentionServer.ChangeLogTest do
     relay = start(ctx)
     assert store(relay).engine.cursors == engine.cursors
     assert store(relay).engine.conversation_cursors == engine.conversation_cursors
+    assert store(relay).engine.conversation_opened == engine.conversation_opened
     assert {:ok, [], false, ^cursor} = log(relay, cursor)
     assert {:ok, %{"rev" => ^cursor, "items" => ^items}} = Reads.inbox(relay, "reader")
     GenServer.stop(relay)

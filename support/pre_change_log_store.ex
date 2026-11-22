@@ -90,6 +90,19 @@ defmodule AttentionServer.PreChangeLogStore do
     store
   end
 
+  @doc """
+  Opens a device's conversation feed, as a 0.1 session's `conversation_open`
+  did, in its legacy and its bounded (Route B) form alike: it records the
+  conversation-opened marker. Route B's `inbox_list` and `conversation_page`
+  stored nothing.
+  """
+  def open_conversation(store, key) do
+    {:ok, engine} = Engine.open_conversation(store.engine, key)
+    audit = %{person: person(store, key), actor: key, action: "conversation_open"}
+    {:ok, store} = Store.commit(store, engine, audit)
+    store
+  end
+
   @doc "Acknowledges a device's conversation feed up to `seq`, as a 0.1 session did."
   def acknowledge_conversation(store, key, seq) do
     {:ok, engine, _reply} = Engine.acknowledge_conversation(store.engine, key, seq, seq)
