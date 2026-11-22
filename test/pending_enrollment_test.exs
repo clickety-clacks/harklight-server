@@ -142,12 +142,14 @@ defmodule AttentionServer.PendingEnrollmentTest do
     assert :none = Engine.pending_restart(approved, device, "approved", first_secret)
   end
 
+  @tag :tmp_dir
   test "a repeated enroll start through the relay returns the same approval code", %{
-    certs: certs
+    certs: certs,
+    tmp_dir: dir
   } do
     owner = TLSFixtures.certificate_der!(certs, "a1")
     device = TLSFixtures.certificate_der!(certs, "a2")
-    {:ok, relay} = Relay.start_link([])
+    {:ok, relay} = Relay.start_link(store_path: Path.join(dir, "state.sqlite3"))
     assert {:ok, _person} = Relay.operator_bootstrap(relay, owner)
 
     assert {:ok, first} = Relay.pending_enroll(relay, device, "waiting")

@@ -14,11 +14,9 @@ defmodule AttentionServer.ClientAPIFocusTest do
     dir = Path.join(System.tmp_dir!(), "harklight-focus-v2-#{System.unique_integer([:positive])}")
     File.mkdir_p!(dir)
     on_exit(fn -> File.rm_rf!(dir) end)
-    flags = Path.join(dir, "flags.json")
-    File.write!(flags, ~s({"client_api_v2":true}))
     clock = :atomics.new(1, [])
     :atomics.put(clock, 1, 1_000)
-    %{path: Path.join(dir, "state.sqlite3"), flags: flags, clock: clock}
+    %{path: Path.join(dir, "state.sqlite3"), clock: clock}
   end
 
   defp op(n), do: "00000000-0000-4000-8000-#{String.pad_leading(Integer.to_string(n), 12, "0")}"
@@ -31,17 +29,12 @@ defmodule AttentionServer.ClientAPIFocusTest do
     response
   end
 
-  defp relay(%{path: path, flags: flags, clock: clock}, opts \\ []) do
-    flags = Keyword.get(opts, :flags, flags)
-
+  defp relay(%{path: path, clock: clock}) do
     relay_opts = [
       store_path: path,
       agent_fixture_mode: true,
       clock: fn -> :atomics.get(clock, 1) end
     ]
-
-    relay_opts =
-      if flags, do: Keyword.put(relay_opts, :feature_flags_path, flags), else: relay_opts
 
     assert {:ok, relay} = Relay.start_link(relay_opts)
     on_exit(fn -> if Process.alive?(relay), do: GenServer.stop(relay) end)
@@ -283,17 +276,5 @@ defmodule AttentionServer.ClientAPIFocusTest do
 
     assert {:error, "forbidden", nil, false} =
              Writes.focus(relay, browser, %{"screen" => "inbox", "ttl_s" => 60})
-  end
-
-  test "with client_api_v2 off there is no focus write and no relay change", ctx do
-    relay = relay(ctx, flags: nil)
-    before = :sys.get_state(relay)
-
-    assert {:error, "not_found", nil, false} =
-             Writes.focus(relay, "reader", %{"screen" => "inbox", "ttl_s" => 60})
-
-    after_ = :sys.get_state(relay)
-    assert after_.focus_clients == before.focus_clients
-    assert after_.held_shows == before.held_shows
   end
 end

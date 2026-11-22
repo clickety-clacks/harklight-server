@@ -58,8 +58,11 @@ defmodule AttentionServer.SourceReportTest do
     reply
   end
 
-  test "source and agent fixture authority is disabled in a normal Relay process" do
-    {:ok, normal} = Relay.start_link()
+  @tag :tmp_dir
+  test "source and agent fixture authority is disabled in a normal Relay process", %{
+    tmp_dir: dir
+  } do
+    {:ok, normal} = Relay.start_link(store_path: Path.join(dir, "normal.sqlite3"))
     assert :ok = Relay.setup_person(normal, "A")
     assert :ok = Relay.setup_device(normal, "A", "a1")
 

@@ -1,7 +1,7 @@
 defmodule AttentionServer.ChangeLogTest do
   use ExUnit.Case, async: false
 
-  alias AttentionServer.{ChangeLog, Engine, JSON, Relay}
+  alias AttentionServer.{ChangeLog, Engine, JSON, PreChangeLogStore, Relay}
   alias AttentionServer.ClientAPI.{FeedStep, Reads}
   alias Exqlite.Sqlite3
 
@@ -11,19 +11,35 @@ defmodule AttentionServer.ChangeLogTest do
     dir = Path.join(System.tmp_dir!(), "change-log-#{System.unique_integer([:positive])}")
     File.mkdir_p!(dir)
     on_exit(fn -> File.rm_rf!(dir) end)
-    flags = Path.join(dir, "flags.json")
-    File.write!(flags, ~s({"client_api_v2":true}))
-    %{path: Path.join(dir, "state.sqlite3"), flags: flags, dir: dir}
+    %{path: Path.join(dir, "state.sqlite3"), dir: dir}
   end
 
   defp op(n), do: "00000000-0000-4000-8000-#{String.pad_leading(Integer.to_string(n), 12, "0")}"
 
-  defp start(ctx, flag \\ true) do
+  defp start(ctx) do
     opts = [store_path: ctx.path, agent_fixture_mode: true, push_enabled: true]
-    opts = if flag, do: Keyword.put(opts, :feature_flags_path, ctx.flags), else: opts
     assert {:ok, relay} = Relay.start_link(opts)
     relay
   end
+
+  # Commits as a Server before 0.2.0 made them, with the change log off.
+  defp pre_log(ctx, fun), do: PreChangeLogStore.write(ctx.path, fun)
+
+  defp pre_log_people(store) do
+    store
+    |> PreChangeLogStore.setup_person("A")
+    |> PreChangeLogStore.setup_device("A", "origin")
+    |> PreChangeLogStore.setup_device("A", "reader")
+    |> PreChangeLogStore.setup_sender("origin", "app:test")
+  end
+
+  defp pre_log_request(store, key, frame) do
+    assert {%{"type" => "ok"}, store} = PreChangeLogStore.request(store, key, frame)
+    store
+  end
+
+  defp pre_log_forward(store, id, n),
+    do: pre_log_request(store, "origin", forward_frame(id, n))
 
   defp setup_people(relay) do
     assert :ok = Relay.setup_person(relay, "A")
@@ -40,19 +56,21 @@ defmodule AttentionServer.ChangeLogTest do
     reply
   end
 
-  defp forward(relay, id, n) do
-    assert %{"type" => "ok"} =
-             request(relay, "origin", %{
-               "type" => "forward",
-               "op_id" => op(n),
-               "session_handle" => @handle,
-               "message" => %{
-                 "sender_id" => "app:test",
-                 "message_id" => id,
-                 "created_at" => n,
-                 "title" => "Question #{id}"
-               }
-             })
+  defp forward(relay, id, n),
+    do: assert(%{"type" => "ok"} = request(relay, "origin", forward_frame(id, n)))
+
+  defp forward_frame(id, n) do
+    %{
+      "type" => "forward",
+      "op_id" => op(n),
+      "session_handle" => @handle,
+      "message" => %{
+        "sender_id" => "app:test",
+        "message_id" => id,
+        "created_at" => n,
+        "title" => "Question #{id}"
+      }
+    }
   end
 
   defp store(relay), do: :sys.get_state(relay).store
@@ -96,14 +114,14 @@ defmodule AttentionServer.ChangeLogTest do
     end
   end
 
-  test "with the flag off the store has no change log tables and writes nothing", ctx do
-    relay = start(ctx, false)
-    setup_people(relay)
-    forward(relay, "m1", 2)
+  test "a store committed before 0.2.0 has no change log tables and no log", ctx do
+    pre_log(ctx, fn store ->
+      store = store |> pre_log_people() |> pre_log_forward("m1", 2)
+      refute store.change_log
+      assert {:error, :disabled} = ChangeLog.head(store, "A")
+      store
+    end)
 
-    refute store(relay).change_log
-    assert {:error, :disabled} = paused(relay, fn -> ChangeLog.head(store(relay), "A") end)
-    GenServer.stop(relay)
     assert tables(ctx.path) == []
   end
 
@@ -278,10 +296,7 @@ defmodule AttentionServer.ChangeLogTest do
   end
 
   test "existing data at cut-over is seeded at rev 1 and after=0 is cursor_expired", ctx do
-    relay = start(ctx, false)
-    setup_people(relay)
-    forward(relay, "old", 2)
-    GenServer.stop(relay)
+    pre_log(ctx, &(&1 |> pre_log_people() |> pre_log_forward("old", 2)))
 
     relay = start(ctx)
     assert head(relay) == 1
@@ -297,11 +312,10 @@ defmodule AttentionServer.ChangeLogTest do
   end
 
   test "ranks served immediately after cut-over converge with the next feed step", ctx do
-    relay = start(ctx, false)
-    setup_people(relay)
-    for {id, n} <- [{"one", 2}, {"two", 3}, {"three", 4}, {"three-b", 6}],
-        do: forward(relay, id, n)
-    GenServer.stop(relay)
+    pre_log(ctx, fn store ->
+      [{"one", 2}, {"two", 3}, {"three", 4}, {"three-b", 6}]
+      |> Enum.reduce(pre_log_people(store), fn {id, n}, store -> pre_log_forward(store, id, n) end)
+    end)
 
     relay = start(ctx)
     assert {:ok, %{"items" => initial, "rev" => cursor}} = Reads.inbox(relay, "reader")
@@ -330,11 +344,10 @@ defmodule AttentionServer.ChangeLogTest do
     assert {:ok, ^before_restart, false, ^logged} = log(relay)
     GenServer.stop(relay)
 
-    # A commit while the flag is off is not in the log, so the log restarts
-    # past its head and older cursors must re-read a snapshot.
-    relay = start(ctx, false)
-    forward(relay, "unlogged", 3)
-    GenServer.stop(relay)
+    # A commit made with the log off (a Server before 0.2.0 run on this store
+    # again) is not in the log, so the log restarts past its head and older
+    # cursors must re-read a snapshot.
+    pre_log(ctx, &pre_log_forward(&1, "unlogged", 3))
 
     relay = start(ctx)
     assert head(relay) == logged + 1
@@ -380,21 +393,19 @@ defmodule AttentionServer.ChangeLogTest do
   end
 
   test "entries created while the log runs record when they were first written", ctx do
-    relay = start(ctx, false)
-    setup_people(relay)
-    forward(relay, "chat", 2)
-
-    assert %{"type" => "ok"} =
-             request(relay, "reader", %{
-               "type" => "discussion",
-               "op_id" => op(3),
-               "sender_id" => "app:test",
-               "message_id" => "chat",
-               "request_revision" => 1,
-               "text" => "Before the cut-over"
-             })
-
-    GenServer.stop(relay)
+    pre_log(ctx, fn store ->
+      store
+      |> pre_log_people()
+      |> pre_log_forward("chat", 2)
+      |> pre_log_request("reader", %{
+        "type" => "discussion",
+        "op_id" => op(3),
+        "sender_id" => "app:test",
+        "message_id" => "chat",
+        "request_revision" => 1,
+        "text" => "Before the cut-over"
+      })
+    end)
 
     relay = start(ctx)
     assert {:ok, [], false, _} = log(relay, 1)
@@ -494,12 +505,7 @@ defmodule AttentionServer.ChangeLogTest do
     clock = fn -> System.system_time(:millisecond) + :atomics.get(offset, 1) end
 
     assert {:ok, relay} =
-             Relay.start_link(
-               store_path: ctx.path,
-               agent_fixture_mode: true,
-               feature_flags_path: ctx.flags,
-               clock: clock
-             )
+             Relay.start_link(store_path: ctx.path, agent_fixture_mode: true, clock: clock)
 
     setup_people(relay)
     forward(relay, "m1", 2)
@@ -583,10 +589,7 @@ defmodule AttentionServer.ChangeLogTest do
 
   test "a person seeded without a log row is moved past their head by a reset", ctx do
     # Data before the cut-over; the person has no log row yet.
-    relay = start(ctx, false)
-    setup_people(relay)
-    forward(relay, "old", 2)
-    GenServer.stop(relay)
+    pre_log(ctx, &(&1 |> pre_log_people() |> pre_log_forward("old", 2)))
 
     relay = start(ctx)
     assert head(relay) == 1
@@ -594,9 +597,7 @@ defmodule AttentionServer.ChangeLogTest do
     GenServer.stop(relay)
 
     # A commit while the log is off, for that same person.
-    relay = start(ctx, false)
-    forward(relay, "unlogged", 3)
-    GenServer.stop(relay)
+    pre_log(ctx, &pre_log_forward(&1, "unlogged", 3))
 
     # The cursor the client holds must not read as current.
     relay = start(ctx)
@@ -649,10 +650,7 @@ defmodule AttentionServer.ChangeLogTest do
   end
 
   test "resources from before the cut-over never get a first-seen time", ctx do
-    relay = start(ctx, false)
-    setup_people(relay)
-    forward(relay, "old", 2)
-    GenServer.stop(relay)
+    pre_log(ctx, &(&1 |> pre_log_people() |> pre_log_forward("old", 2)))
 
     relay = start(ctx)
 
@@ -995,6 +993,91 @@ defmodule AttentionServer.ChangeLogTest do
     relay = start(ctx)
     assert {:ok, [], false, ^position} = log(relay, position)
     GenServer.stop(relay)
+  end
+
+  # Every change-log and agent-log table, row for row, and the store version.
+  defp log_tables(path) do
+    {:ok, db} = Sqlite3.open(path)
+
+    query = fn sql ->
+      {:ok, stmt} = Sqlite3.prepare(db, sql)
+      {:ok, rows} = Sqlite3.fetch_all(db, stmt)
+      :ok = Sqlite3.release(db, stmt)
+      rows
+    end
+
+    names =
+      for [name] <-
+            query.(
+              "SELECT name FROM sqlite_master WHERE type = 'table' AND " <>
+                "(name LIKE 'client_%' OR name LIKE 'agent_%') ORDER BY name"
+            ),
+          do: name
+
+    tables = Map.new(names, &{&1, Enum.sort(query.("SELECT * FROM #{&1}"))})
+    [[version]] = query.("SELECT version FROM relay_state WHERE id = 1")
+    Sqlite3.close(db)
+    Map.put(tables, :store_version, version)
+  end
+
+  # A store from 0.1.x (v0.1.49, then slice 3 builds) never had the change log
+  # on. The first 0.2.0 start seeds it and stores the ranking once; a second
+  # start must change nothing, so the one-time cursor reset of #254 never
+  # fires again and clients keep their cursors.
+  test "a store written with the log off is seeded once and a second start changes nothing",
+       ctx do
+    pre_log(ctx, fn store ->
+      store
+      |> pre_log_people()
+      |> PreChangeLogStore.setup_person("B")
+      |> pre_log_forward("one", 2)
+      |> pre_log_forward("two", 3)
+      |> pre_log_forward("three", 4)
+      |> pre_log_request("reader", %{
+        "type" => "discussion",
+        "op_id" => op(5),
+        "sender_id" => "app:test",
+        "message_id" => "two",
+        "request_revision" => 1,
+        "text" => "Written by 0.1"
+      })
+      |> pre_log_request("reader", %{
+        "type" => "answer",
+        "op_id" => op(6),
+        "sender_id" => "app:test",
+        "message_id" => "three",
+        "answer" => "Done"
+      })
+    end)
+
+    assert tables(ctx.path) == []
+
+    relay = start(ctx)
+    assert head(relay) == 1
+    assert {:error, :cursor_expired} = log(relay, 0)
+    assert {:ok, [], false, 1} = log(relay, 1)
+
+    assert {:ok, %{"rev" => cursor, "items" => items}} = Reads.inbox(relay, "reader")
+    assert length(items) == 3
+
+    assert {:ok, stored, false} =
+             paused(relay, fn -> ChangeLog.rank_page(store(relay), "A", nil, 100) end)
+
+    assert Enum.map(stored, &elem(&1, 0)) == Enum.map(items, & &1["item_id"])
+    assert Map.new(stored) == Map.new(items, &{&1["item_id"], &1["rank"]})
+    GenServer.stop(relay)
+
+    first = log_tables(ctx.path)
+    assert [[1, _store_version, 1]] = first["client_change_log_state"]
+    assert first["client_change_log_epoch"] == []
+    assert length(first["client_ranks"]) == 3
+
+    relay = start(ctx)
+    assert {:ok, [], false, ^cursor} = log(relay, cursor)
+    assert {:ok, %{"rev" => ^cursor, "items" => ^items}} = Reads.inbox(relay, "reader")
+    GenServer.stop(relay)
+
+    assert log_tables(ctx.path) == first
   end
 
   # Per-change cost of storing a person's ranking (owner's gate: the rank hook

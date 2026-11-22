@@ -55,13 +55,10 @@ defmodule AttentionServer.ClientAPIFeedBatchTest do
 
     File.mkdir_p!(dir)
     on_exit(fn -> File.rm_rf!(dir) end)
-    flags = Path.join(dir, "flags.json")
-    File.write!(flags, ~s({"client_api_v2":true}))
 
     assert {:ok, relay} =
              Relay.start_link(
                store_path: Path.join(dir, "state.sqlite3"),
-               feature_flags_path: flags,
                agent_fixture_mode: true
              )
 

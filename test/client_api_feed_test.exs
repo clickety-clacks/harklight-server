@@ -1,5 +1,5 @@
 defmodule AttentionServer.ClientAPIFeedTest do
-  # GET /v2/changes (docs/client-api-v2.md §6), behind client_api_v2.
+  # GET /v2/changes (docs/client-api-v2.md §6).
   use ExUnit.Case, async: false
 
   alias AttentionServer.{ChangeLog, ClientAPIFeedClient, ClientAPI, JSON, Relay, TLSFixtures}
@@ -16,15 +16,10 @@ defmodule AttentionServer.ClientAPIFeedTest do
     dir = Path.join(System.tmp_dir!(), "harklight-feed-#{System.unique_integer([:positive])}")
     File.mkdir_p!(dir)
     on_exit(fn -> File.rm_rf!(dir) end)
-    flags = Path.join(dir, "flags.json")
-    File.write!(flags, ~s({"client_api_v2":true}))
 
     relay =
       start_supervised!(
-        {Relay,
-         store_path: Path.join(dir, "relay.sqlite3"),
-         enrollment_fixture_mode: true,
-         feature_flags_path: flags},
+        {Relay, store_path: Path.join(dir, "relay.sqlite3"), enrollment_fixture_mode: true},
         restart: :temporary
       )
 

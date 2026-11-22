@@ -31,9 +31,7 @@ defmodule AttentionServer.ClientAPIFeedClosingTest do
     dir = Path.join(System.tmp_dir!(), "harklight-closing-#{System.unique_integer([:positive])}")
     File.mkdir_p!(dir)
     on_exit(fn -> File.rm_rf!(dir) end)
-    flags = Path.join(dir, "flags.json")
-    File.write!(flags, ~s({"client_api_v2":true}))
-    %{dir: dir, certs: certs, flags: flags}
+    %{dir: dir, certs: certs}
   end
 
   defp heartbeat_fast do
@@ -49,7 +47,6 @@ defmodule AttentionServer.ClientAPIFeedClosingTest do
         start_supervised!(
           {Relay,
            store_path: Path.join(ctx.dir, "state.sqlite3"),
-           feature_flags_path: ctx.flags,
            enrollment_fixture_mode: true,
            agent_fixture_mode: true},
           restart: :temporary
@@ -163,8 +160,7 @@ defmodule AttentionServer.ClientAPIFeedClosingTest do
            certfile: Path.join(ctx.certs, "server.pem"),
            keyfile: Path.join(ctx.certs, "server.key"),
            cacertfile: Path.join(ctx.certs, "ca.pem"),
-           enrollment_enabled: false,
-           feature_flags_path: ctx.flags
+           enrollment_enabled: false
          ]},
         restart: :temporary
       )
@@ -264,7 +260,7 @@ defmodule AttentionServer.ClientAPIFeedClosingTest do
   end
 
   # The web origin with the feed mounted, and a signed-in browser session.
-  defp web_origin(%{dir: dir, certs: certs, flags: flags}) do
+  defp web_origin(%{dir: dir, certs: certs}) do
     skill_path = Path.join(dir, "skills/harklight-agent/SKILL.md")
     File.mkdir_p!(Path.dirname(skill_path))
     File.write!(skill_path, "---\nname: harklight-agent\nversion: \"0.1.0\"\n---\n\n# Agent")
@@ -278,7 +274,6 @@ defmodule AttentionServer.ClientAPIFeedClosingTest do
       start_supervised!(
         {Relay,
          store_path: Path.join(dir, "web.sqlite3"),
-         feature_flags_path: flags,
          join_configuration: join,
          dashboard_origin: origin,
          enrollment_fixture_mode: true},

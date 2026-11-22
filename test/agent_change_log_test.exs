@@ -1,7 +1,7 @@
 defmodule AttentionServer.AgentChangeLogTest do
   use ExUnit.Case, async: false
 
-  alias AttentionServer.{AgentChangeLog, ChangeLog, JSON, Relay}
+  alias AttentionServer.{AgentChangeLog, ChangeLog, JSON, PreChangeLogStore, Relay}
   alias AttentionServer.AgentAPI.FeedActivity
   alias Exqlite.Sqlite3
 
@@ -12,9 +12,7 @@ defmodule AttentionServer.AgentChangeLogTest do
     dir = Path.join(System.tmp_dir!(), "agent-change-log-#{System.unique_integer([:positive])}")
     File.mkdir_p!(dir)
     on_exit(fn -> File.rm_rf!(dir) end)
-    flags = Path.join(dir, "flags.json")
-    File.write!(flags, ~s({"client_api_v2":true}))
-    %{path: Path.join(dir, "state.sqlite3"), flags: flags}
+    %{path: Path.join(dir, "state.sqlite3")}
   end
 
   test "an empty agent starts at zero, with its own sequence across sessions", ctx do
@@ -40,31 +38,37 @@ defmodule AttentionServer.AgentChangeLogTest do
   end
 
   test "cut-over seeds retained messages and leaves agents with no messages at zero", ctx do
-    relay = start(ctx, false)
-    setup_people(relay)
-    forward(relay, "origin", "retained", 1, @session)
+    # Written before 0.2.0, with the change logs off.
+    test_pid = self()
 
-    assert %{"type" => "ok", "seq" => seq, "event_id" => event_id} =
-             request(relay, "other", %{
-               "type" => "discussion",
-               "op_id" => op(2),
-               "sender_id" => "app:test",
-               "message_id" => "retained",
-               "request_revision" => 1,
-               "text" => "Pre-cut-over chat"
-             })
+    PreChangeLogStore.write(ctx.path, fn store ->
+      store = store |> pre_log_people() |> pre_log_forward("origin", "retained", 1, @session)
 
-    assert {:error, :disabled} = read(relay, "origin")
+      assert {%{"type" => "ok", "seq" => seq, "event_id" => event_id}, store} =
+               PreChangeLogStore.request(store, "other", %{
+                 "type" => "discussion",
+                 "op_id" => op(2),
+                 "sender_id" => "app:test",
+                 "message_id" => "retained",
+                 "request_revision" => 1,
+                 "text" => "Pre-cut-over chat"
+               })
 
-    assert %{
-             agent_feed?: false,
-             entry_positions: positions,
-             messages_by_origin_session: sessions,
-             advisory_sequences: advisories
-           } = stored(relay, & &1.engine.route_b_index)
+      assert {:error, :disabled} = AgentChangeLog.read(store, {"A", "origin"}, 0, 500, nil)
 
-    assert positions == %{} and sessions == %{} and advisories == %{}
-    GenServer.stop(relay)
+      assert %{
+               agent_feed?: false,
+               entry_positions: positions,
+               messages_by_origin_session: sessions,
+               advisory_sequences: advisories
+             } = store.engine.route_b_index
+
+      assert positions == %{} and sessions == %{} and advisories == %{}
+      send(test_pid, {:seeded, seq, event_id})
+      store
+    end)
+
+    assert_received {:seeded, seq, event_id}
 
     relay = start(ctx)
     retained = key("retained")
@@ -348,10 +352,12 @@ defmodule AttentionServer.AgentChangeLogTest do
     assert {:ok, _, false, previous} = read(relay, "origin")
     GenServer.stop(relay)
 
-    relay = start(ctx, false)
-    forward(relay, "origin", "while-off", 2, @session)
-    forward(relay, "other", "first-while-off", 3, @other_session)
-    GenServer.stop(relay)
+    # A Server before 0.2.0 run on this store again commits with the logs off.
+    PreChangeLogStore.write(ctx.path, fn store ->
+      store
+      |> pre_log_forward("origin", "while-off", 2, @session)
+      |> pre_log_forward("other", "first-while-off", 3, @other_session)
+    end)
 
     relay = start(ctx)
     assert {:error, :cursor_expired} = read(relay, "origin", previous)
@@ -386,11 +392,26 @@ defmodule AttentionServer.AgentChangeLogTest do
     GenServer.stop(relay)
   end
 
-  defp start(ctx, flag \\ true) do
-    opts = [store_path: ctx.path, agent_fixture_mode: true]
-    opts = if flag, do: Keyword.put(opts, :feature_flags_path, ctx.flags), else: opts
-    assert {:ok, relay} = Relay.start_link(opts)
+  defp start(ctx) do
+    assert {:ok, relay} = Relay.start_link(store_path: ctx.path, agent_fixture_mode: true)
     relay
+  end
+
+  defp pre_log_people(store) do
+    store = PreChangeLogStore.setup_person(store, "A")
+
+    Enum.reduce(["origin", "other"], store, fn device, store ->
+      store
+      |> PreChangeLogStore.setup_device("A", device)
+      |> PreChangeLogStore.setup_sender(device, "app:test")
+    end)
+  end
+
+  defp pre_log_forward(store, device, id, n, session) do
+    assert {%{"type" => "ok"}, store} =
+             PreChangeLogStore.request(store, device, forward_frame(id, n, session))
+
+    store
   end
 
   defp setup_people(relay) do
@@ -406,7 +427,10 @@ defmodule AttentionServer.AgentChangeLogTest do
     assert %{"type" => "ok"} = send_message(relay, device, id, n, session)
   end
 
-  defp send_message(relay, device, id, n, session) do
+  defp send_message(relay, device, id, n, session),
+    do: request(relay, device, forward_frame(id, n, session))
+
+  defp forward_frame(id, n, session) do
     frame = %{
       "type" => "forward",
       "op_id" => op(n),
@@ -418,11 +442,7 @@ defmodule AttentionServer.AgentChangeLogTest do
       }
     }
 
-    request(
-      relay,
-      device,
-      if(session, do: Map.put(frame, "session_handle", session), else: frame)
-    )
+    if session, do: Map.put(frame, "session_handle", session), else: frame
   end
 
   defp op(n), do: "00000000-0000-4000-8000-#{String.pad_leading(Integer.to_string(n), 12, "0")}"

@@ -1,6 +1,6 @@
 defmodule AttentionServer.ClientAPIWritesTest do
   # Client API v2 writes and the Idempotency-Key store (docs/client-api-v2.md
-  # §2 and §5, spec §4 and §10), behind the client_api_v2 flag.
+  # §2 and §5, spec §4 and §10).
   use ExUnit.Case, async: false
 
   alias AttentionServer.{ChangeLog, JSON, Relay}
@@ -20,14 +20,11 @@ defmodule AttentionServer.ClientAPIWritesTest do
 
     File.mkdir_p!(dir)
     on_exit(fn -> File.rm_rf!(dir) end)
-    flags = Path.join(dir, "flags.json")
-    File.write!(flags, ~s({"client_api_v2":true}))
-    %{path: Path.join(dir, "state.sqlite3"), flags: flags}
+    %{path: Path.join(dir, "state.sqlite3")}
   end
 
-  defp start(path, flags, extra \\ []) do
+  defp start(path, extra \\ []) do
     opts = [store_path: path, agent_fixture_mode: true] ++ extra
-    opts = if flags, do: Keyword.put(opts, :feature_flags_path, flags), else: opts
     assert {:ok, relay} = Relay.start_link(opts)
     relay
   end
@@ -64,8 +61,8 @@ defmodule AttentionServer.ClientAPIWritesTest do
              })
   end
 
-  defp scripted_relay(path, flags, extra \\ []) do
-    relay = start(path, flags, extra)
+  defp scripted_relay(path, extra \\ []) do
+    relay = start(path, extra)
     assert :ok = Relay.setup_person(relay, "A")
     assert :ok = Relay.setup_device(relay, "A", "origin")
     assert :ok = Relay.setup_device(relay, "A", "reader")
@@ -104,8 +101,8 @@ defmodule AttentionServer.ClientAPIWritesTest do
 
   describe "POST /v2/items/{item_id}/seen" do
     test "marks the item Seen and returns it at its new rev, with its change row",
-         %{path: path, flags: flags} do
-      relay = scripted_relay(path, flags)
+         %{path: path} do
+      relay = scripted_relay(path)
       one = item_id(relay, "one")
       assert {:ok, %{"item" => %{"seen" => false}}} = Reads.item(relay, "reader", one)
       {:ok, before} = head(relay)
@@ -129,31 +126,20 @@ defmodule AttentionServer.ClientAPIWritesTest do
       GenServer.stop(relay)
     end
 
-    test "an unknown or another person's item is not_found", %{path: path, flags: flags} do
-      relay = scripted_relay(path, flags)
+    test "an unknown or another person's item is not_found", %{path: path} do
+      relay = scripted_relay(path)
       one = item_id(relay, "one")
       assert {:error, "not_found", nil, false} = Writes.seen(relay, "reader", "i999", key())
       assert {:error, "not_found", nil, false} = Writes.seen(relay, "stranger", one, key())
       assert {:error, "unauthorized", nil, false} = Writes.seen(relay, "nobody", one, key())
       GenServer.stop(relay)
     end
-
-    test "with client_api_v2 off there is nothing to write", %{path: path} do
-      relay = scripted_relay(path, nil)
-      engine = :sys.get_state(relay).store.engine
-      record = engine.messages[{"A", "app:test", "one"}]
-      one = AttentionServer.ClientAPI.Resources.item_id(record)
-
-      assert {:error, "not_found", nil, false} = Writes.seen(relay, "reader", one, key())
-      assert :sys.get_state(relay).store.engine == engine
-      GenServer.stop(relay)
-    end
   end
 
   describe "Idempotency-Key" do
     test "a repeat with the same key and body returns the stored response and applies nothing",
-         %{path: path, flags: flags} do
-      relay = scripted_relay(path, flags)
+         %{path: path} do
+      relay = scripted_relay(path)
       one = item_id(relay, "one")
       k = key()
       assert {:ok, 200, first, false} = Writes.seen(relay, "reader", one, k)
@@ -179,8 +165,8 @@ defmodule AttentionServer.ClientAPIWritesTest do
     end
 
     test "the same key with a different request is idempotency_conflict, and nothing is applied",
-         %{path: path, flags: flags} do
-      relay = scripted_relay(path, flags)
+         %{path: path} do
+      relay = scripted_relay(path)
       one = item_id(relay, "one")
       two = item_id(relay, "two")
       k = key()
@@ -194,8 +180,8 @@ defmodule AttentionServer.ClientAPIWritesTest do
     end
 
     test "keys are scoped per person: every client of the person shares them, others do not",
-         %{path: path, flags: flags} do
-      relay = scripted_relay(path, flags)
+         %{path: path} do
+      relay = scripted_relay(path)
       browser = with_owner(relay)
       one = item_id(relay, "one")
       two = item_id(relay, "two")
@@ -214,8 +200,8 @@ defmodule AttentionServer.ClientAPIWritesTest do
     end
 
     test "a write by a browser and one by a device of the same person see the same resources",
-         %{path: path, flags: flags} do
-      relay = scripted_relay(path, flags)
+         %{path: path} do
+      relay = scripted_relay(path)
       browser = with_owner(relay)
       one = item_id(relay, "one")
       two = item_id(relay, "two")
@@ -238,14 +224,14 @@ defmodule AttentionServer.ClientAPIWritesTest do
       GenServer.stop(relay)
     end
 
-    test "receipts survive a restart", %{path: path, flags: flags} do
-      relay = scripted_relay(path, flags)
+    test "receipts survive a restart", %{path: path} do
+      relay = scripted_relay(path)
       one = item_id(relay, "one")
       k = key()
       assert {:ok, 200, first, false} = Writes.seen(relay, "reader", one, k)
       GenServer.stop(relay)
 
-      relay = start(path, flags)
+      relay = start(path)
       assert {:ok, 200, ^first, true} = Writes.seen(relay, "reader", one, k)
       GenServer.stop(relay)
     end
@@ -282,8 +268,8 @@ defmodule AttentionServer.ClientAPIWritesTest do
 
   describe "POST /v2/items/{item_id}/replies" do
     test "a reply returns the item and the new entry, and emits the entry's change row",
-         %{path: path, flags: flags} do
-      relay = scripted_relay(path, flags)
+         %{path: path} do
+      relay = scripted_relay(path)
       one = item_id(relay, "one")
       {:ok, before} = head(relay)
 
@@ -307,8 +293,8 @@ defmodule AttentionServer.ClientAPIWritesTest do
     end
 
     test "replies are accepted in every item state, to an agent that is not listening",
-         %{path: path, flags: flags} do
-      relay = scripted_relay(path, flags)
+         %{path: path} do
+      relay = scripted_relay(path)
 
       for {id, n} <- [{"answered", 40}, {"cleared", 41}, {"retracted", 42}],
           do: forward(relay, id, n)
@@ -357,8 +343,8 @@ defmodule AttentionServer.ClientAPIWritesTest do
     end
 
     test "a repeated reply is replayed, not posted twice; files wait for uploads",
-         %{path: path, flags: flags} do
-      relay = scripted_relay(path, flags)
+         %{path: path} do
+      relay = scripted_relay(path)
       one = item_id(relay, "one")
       k = key()
       assert {:ok, 200, first, false} = Writes.reply(relay, "reader", one, "Once", k)
@@ -407,8 +393,8 @@ defmodule AttentionServer.ClientAPIWritesTest do
 
   describe "PUT /v2/items/{item_id}/read-position" do
     test "max-wins by position, through the newest agent reply at or before the entry",
-         %{path: path, flags: flags} do
-      relay = scripted_relay(path, flags)
+         %{path: path} do
+      relay = scripted_relay(path)
       one = item_id(relay, "one")
       {note, note_entry} = person_note(relay, "one", 60, "Question")
       first = agent_reply(relay, "one", 61, note, "First answer")
@@ -445,8 +431,8 @@ defmodule AttentionServer.ClientAPIWritesTest do
       GenServer.stop(relay)
     end
 
-    test "an entry of another item, or no entry, is invalid_field", %{path: path, flags: flags} do
-      relay = scripted_relay(path, flags)
+    test "an entry of another item, or no entry, is invalid_field", %{path: path} do
+      relay = scripted_relay(path)
       one = item_id(relay, "one")
       two = item_id(relay, "two")
       {note, _} = person_note(relay, "one", 70, "Question")
@@ -551,8 +537,8 @@ defmodule AttentionServer.ClientAPIWritesTest do
 
   describe "POST /v2/items/{item_id}/answer" do
     test "a choice stores its action's value; the first answer settles the request",
-         %{path: path, flags: flags} do
-      relay = scripted_relay(path, flags)
+         %{path: path} do
+      relay = scripted_relay(path)
 
       forward_message(relay, 40, %{
         "message_id" => "pick",
@@ -592,8 +578,8 @@ defmodule AttentionServer.ClientAPIWritesTest do
       GenServer.stop(relay)
     end
 
-    test "a comment is a plain-text answer on any answerable item", %{path: path, flags: flags} do
-      relay = scripted_relay(path, flags)
+    test "a comment is a plain-text answer on any answerable item", %{path: path} do
+      relay = scripted_relay(path)
 
       forward_message(relay, 40, %{
         "message_id" => "pick",
@@ -649,8 +635,8 @@ defmodule AttentionServer.ClientAPIWritesTest do
       GenServer.stop(relay)
     end
 
-    test "no member is no comment", %{path: path, flags: flags} do
-      relay = scripted_relay(path, flags)
+    test "no member is no comment", %{path: path} do
+      relay = scripted_relay(path)
       one = item_id(relay, "one")
 
       assert {:ok, 200, %{"item" => item}, false} =
@@ -661,8 +647,8 @@ defmodule AttentionServer.ClientAPIWritesTest do
     end
 
     test "no comment finalizes a choice request and a reply-only request with no payload",
-         %{path: path, flags: flags} do
-      relay = scripted_relay(path, flags)
+         %{path: path} do
+      relay = scripted_relay(path)
 
       forward_message(relay, 40, %{
         "message_id" => "pick",
@@ -704,8 +690,8 @@ defmodule AttentionServer.ClientAPIWritesTest do
     end
 
     test "a refused request does not consume its key: the same request is evaluated again",
-         %{path: path, flags: flags} do
-      relay = scripted_relay(path, flags)
+         %{path: path} do
+      relay = scripted_relay(path)
       one = item_id(relay, "one")
       k = key()
 
@@ -738,8 +724,8 @@ defmodule AttentionServer.ClientAPIWritesTest do
     end
 
     test "a stale request_revision is stale_request, and nothing is applied",
-         %{path: path, flags: flags} do
-      relay = scripted_relay(path, flags)
+         %{path: path} do
+      relay = scripted_relay(path)
       one = item_id(relay, "one")
       {:ok, position} = head(relay)
 
@@ -753,8 +739,8 @@ defmodule AttentionServer.ClientAPIWritesTest do
       GenServer.stop(relay)
     end
 
-    test "choice and result must match the item's answer screen", %{path: path, flags: flags} do
-      relay = scripted_relay(path, flags)
+    test "choice and result must match the item's answer screen", %{path: path} do
+      relay = scripted_relay(path)
 
       forward_message(relay, 40, %{
         "message_id" => "pick",
@@ -820,8 +806,8 @@ defmodule AttentionServer.ClientAPIWritesTest do
     end
 
     test "an FYI's Seen is its answer, as today; a retracted item is already_retracted",
-         %{path: path, flags: flags} do
-      relay = scripted_relay(path, flags)
+         %{path: path} do
+      relay = scripted_relay(path)
 
       forward_message(relay, 40, %{
         "message_id" => "note",
@@ -868,8 +854,8 @@ defmodule AttentionServer.ClientAPIWritesTest do
 
   describe "PUT /v2/settings/priority-levels" do
     test "If-Match with the Settings ETag replaces the levels; a stale one is 412",
-         %{path: path, flags: flags} do
-      relay = scripted_relay(path, flags)
+         %{path: path} do
+      relay = scripted_relay(path)
       held = settings_etag(relay, "reader")
       {:ok, before} = head(relay)
 
@@ -902,8 +888,8 @@ defmodule AttentionServer.ClientAPIWritesTest do
       GenServer.stop(relay)
     end
 
-    test "invalid levels are invalid_field", %{path: path, flags: flags} do
-      relay = scripted_relay(path, flags)
+    test "invalid levels are invalid_field", %{path: path} do
+      relay = scripted_relay(path)
       tag = settings_etag(relay, "reader")
 
       for levels <- [[], [%{"name" => "x"}], Enum.reverse(@levels)] do
@@ -919,8 +905,8 @@ defmodule AttentionServer.ClientAPIWritesTest do
 
   describe "/v2/devices/me/push" do
     test "PUT registers the device's binding, DELETE removes it; a stale revision is 412",
-         %{path: path, flags: flags} do
-      relay = scripted_relay(path, flags, push_enabled: true)
+         %{path: path} do
+      relay = scripted_relay(path, push_enabled: true)
 
       assert {:ok, 200, body, false} = Writes.push(relay, "reader", @token, "production", 1)
       errors = Schema.errors(Schema.contract_defs(@contract), "WriteResult", body)
@@ -952,8 +938,8 @@ defmodule AttentionServer.ClientAPIWritesTest do
       GenServer.stop(relay)
     end
 
-    test "bad fields keep the client API's names", %{path: path, flags: flags} do
-      relay = scripted_relay(path, flags, push_enabled: true)
+    test "bad fields keep the client API's names", %{path: path} do
+      relay = scripted_relay(path, push_enabled: true)
 
       assert {:error, "invalid_field", "token", false} =
                Writes.push(relay, "reader", "not-a-token", "production", 1)
@@ -961,8 +947,8 @@ defmodule AttentionServer.ClientAPIWritesTest do
       GenServer.stop(relay)
     end
 
-    test "browsers are forbidden, and push disabled is unsupported", %{path: path, flags: flags} do
-      relay = scripted_relay(path, flags, push_enabled: true)
+    test "browsers are forbidden, and push disabled is unsupported", %{path: path} do
+      relay = scripted_relay(path, push_enabled: true)
       browser = with_owner(relay)
 
       assert {:error, "forbidden", nil, false} =
@@ -971,7 +957,7 @@ defmodule AttentionServer.ClientAPIWritesTest do
       assert {:error, "forbidden", nil, false} = Writes.remove_push(relay, browser)
       GenServer.stop(relay)
 
-      relay = start(path, flags)
+      relay = start(path)
 
       assert {:error, "unsupported", nil, false} =
                Writes.push(relay, "reader", @token, "production", 1)
@@ -982,8 +968,8 @@ defmodule AttentionServer.ClientAPIWritesTest do
 
   describe "the Content-Type sent with POST /v2/files" do
     test "is kept on the reply's upload and served back, across a restart",
-         %{path: path, flags: flags} do
-      relay = scripted_relay(path, flags)
+         %{path: path} do
+      relay = scripted_relay(path)
       one = item_id(relay, "one")
 
       assert {201, %{"file_id" => file_id}, _} =
@@ -996,14 +982,14 @@ defmodule AttentionServer.ClientAPIWritesTest do
       GenServer.stop(relay)
 
       # The store reopens and validates the record with the extra key.
-      relay = start(path, flags)
+      relay = start(path)
       assert {:ok, %{content_type: "image/png"}} = Reads.file(relay, "reader", served)
       GenServer.stop(relay)
     end
 
     test "today's upload paths keep their record shape and serve octet-stream",
-         %{path: path, flags: flags} do
-      relay = scripted_relay(path, flags)
+         %{path: path} do
+      relay = scripted_relay(path)
       bytes = "legacy bytes"
       hash = Base.encode16(:crypto.hash(:sha256, bytes), case: :lower)
       source = Path.join(Path.dirname(path), "legacy.bin")
@@ -1063,8 +1049,8 @@ defmodule AttentionServer.ClientAPIWritesTest do
   # Every write's change is on the one write path: replaying the rendered log
   # from empty, with the version rule, reaches what the snapshot reads show.
   test "after every kind of write, replaying the log from empty equals the snapshot",
-       %{path: path, flags: flags} do
-    relay = scripted_relay(path, flags, push_enabled: true)
+       %{path: path} do
+    relay = scripted_relay(path, push_enabled: true)
 
     forward_message(relay, 40, %{
       "message_id" => "pick",
@@ -1166,8 +1152,8 @@ defmodule AttentionServer.ClientAPIWritesTest do
     end
 
     test "seen needs an Idempotency-Key, refuses unknown members and marks replays",
-         %{path: path, flags: flags} do
-      relay = scripted_relay(path, flags)
+         %{path: path} do
+      relay = scripted_relay(path)
       one = item_id(relay, "one")
       route = ["items", one, "seen"]
       k = key()
@@ -1202,8 +1188,8 @@ defmodule AttentionServer.ClientAPIWritesTest do
   end
 
   test "priority levels need If-Match; push bodies are checked; browsers get 403",
-       %{path: path, flags: flags} do
-    relay = scripted_relay(path, flags, push_enabled: true)
+       %{path: path} do
+    relay = scripted_relay(path, push_enabled: true)
     levels = JSON.encode!(%{"levels" => @levels})
 
     assert {400, %{"error" => "invalid_field", "field" => "If-Match"}, _} =
@@ -1260,8 +1246,8 @@ defmodule AttentionServer.ClientAPIWritesTest do
   end
 
   test "POST /v2/files stages the bytes under their name and replays by key",
-       %{path: path, flags: flags} do
-    relay = scripted_relay(path, flags)
+       %{path: path} do
+    relay = scripted_relay(path)
     bytes = :binary.copy(<<1, 2, 3, 250>>, 1000)
     k = key()
 
@@ -1283,8 +1269,8 @@ defmodule AttentionServer.ClientAPIWritesTest do
     GenServer.stop(relay)
   end
 
-  test "POST /v2/files needs a name, a length and room under the cap", %{path: path, flags: flags} do
-    relay = scripted_relay(path, flags, upload_cap: 10)
+  test "POST /v2/files needs a name, a length and room under the cap", %{path: path} do
+    relay = scripted_relay(path, upload_cap: 10)
 
     for {headers, field} <- [
           {[{"content-disposition", nil}], "name"},
@@ -1308,8 +1294,8 @@ defmodule AttentionServer.ClientAPIWritesTest do
   end
 
   test "a reply names staged files; they arrive as the entry's files, readable by GET",
-       %{path: path, flags: flags} do
-    relay = scripted_relay(path, flags)
+       %{path: path} do
+    relay = scripted_relay(path)
     browser = with_owner(relay)
     one = item_id(relay, "one")
     bytes = "the plan, in bytes"
@@ -1365,8 +1351,8 @@ defmodule AttentionServer.ClientAPIWritesTest do
   end
 
   test "bodies as large as today's path accepts are accepted: a long reply, a large UI/1 result",
-       %{path: path, flags: flags} do
-    relay = scripted_relay(path, flags)
+       %{path: path} do
+    relay = scripted_relay(path)
     long = String.duplicate("a long pasted reply ", 10_000)
     assert byte_size(long) > 64 * 1024
 
@@ -1400,8 +1386,8 @@ defmodule AttentionServer.ClientAPIWritesTest do
   end
 
   test "answer bodies carry request_revision and at most one of choice, comment and result",
-       %{path: path, flags: flags} do
-    relay = scripted_relay(path, flags)
+       %{path: path} do
+    relay = scripted_relay(path)
     route = ["items", item_id(relay, "one"), "answer"]
 
     for {body, field} <- [

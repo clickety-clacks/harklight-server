@@ -16,7 +16,7 @@ end
 
 defmodule AttentionServer.ClientAPIFeedStreamTest do
   # GET /v2/changes as Server-Sent Events (docs/client-api-v2.md §6), over
-  # HTTP/2 with mutual TLS, behind client_api_v2.
+  # HTTP/2 with mutual TLS.
   use ExUnit.Case, async: false
 
   import ExUnit.CaptureLog
@@ -48,15 +48,10 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
     dir = Path.join(System.tmp_dir!(), "harklight-sse-#{System.unique_integer([:positive])}")
     File.mkdir_p!(dir)
     on_exit(fn -> File.rm_rf!(dir) end)
-    flags = Path.join(dir, "flags.json")
-    File.write!(flags, ~s({"client_api_v2":true}))
 
     relay =
       start_supervised!(
-        {Relay,
-         store_path: Path.join(dir, "state.sqlite3"),
-         feature_flags_path: flags,
-         agent_fixture_mode: true},
+        {Relay, store_path: Path.join(dir, "state.sqlite3"), agent_fixture_mode: true},
         restart: :temporary
       )
 

@@ -30,9 +30,10 @@ and nothing is written.
 - **Cut-over seed.** A person who has data and no log starts at head 1, with
   every existing resource at rev 1. No row is written for the seed, and
   `after = 0` is then `:cursor_expired`.
-- **Missed commits.** If the store was committed while the log was off, every
-  person's log restarts past their head at startup. Older cursors get
-  `:cursor_expired`, so nothing changed meanwhile is lost.
+- **Missed commits.** If the store was committed while the log was off (by a
+  Server before 0.2.0), every person's log restarts past their head at
+  startup. Older cursors get `:cursor_expired`, so nothing changed meanwhile
+  is lost.
 
 ## Functions
 
@@ -82,7 +83,7 @@ ChangeLog.unsubscribe_closing(principal) :: :ok   # when the feed ends
 # Write side. Store only.
 ChangeLog.changes(old_engine, next_engine) :: %{person => [{kind, resource_id}]}
 ChangeLog.append(db, pending, seeded, store_version) :: {:ok, %{person => position}}
-Store.enable_change_log(store) :: {:ok, store}   # Relay, at startup, with the flag on
+Store.enable_change_log(store) :: {:ok, store}   # Relay, at startup, always
 ```
 
 ## What counts as a change

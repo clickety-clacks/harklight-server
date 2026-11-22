@@ -1,7 +1,7 @@
 defmodule AttentionServer.OperatorToolTest do
   use ExUnit.Case, async: false
 
-  alias AttentionServer.{DeviceIdentity, OperatorTool, Relay, TLSFixtures}
+  alias AttentionServer.{ChangeLog, DeviceIdentity, OperatorTool, Relay, TLSFixtures}
 
   setup_all do
     certs = TLSFixtures.create!()
@@ -38,5 +38,31 @@ defmodule AttentionServer.OperatorToolTest do
              OperatorTool.recover(Path.join(dir, "separate.sqlite3"), person, first)
 
     GenServer.stop(relay)
+  end
+
+  # The tool's Relay writes the change log like the Server's, so an owner
+  # recovery run while the Server is stopped does not expire clients' cursors.
+  @tag :tmp_dir
+  test "a recovery by the local tool is in the change log and keeps client cursors", %{
+    certs: certs,
+    tmp_dir: dir
+  } do
+    path = Path.join(dir, "relay.sqlite3")
+    assert {:ok, person} = OperatorTool.bootstrap(path, Path.join(certs, "a1.pem"))
+    cursor = head(path, person)
+    assert :ok = OperatorTool.recover(path, person, Path.join(certs, "a2.pem"))
+
+    {:ok, relay} = Relay.start_link(store_path: path)
+    store = :sys.get_state(relay).store
+    assert {:ok, _changes, false, position} = ChangeLog.read(store, person, cursor, 500)
+    assert position >= cursor
+    GenServer.stop(relay)
+  end
+
+  defp head(path, person) do
+    {:ok, relay} = Relay.start_link(store_path: path)
+    assert {:ok, head} = ChangeLog.head(:sys.get_state(relay).store, person)
+    GenServer.stop(relay)
+    head
   end
 end

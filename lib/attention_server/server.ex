@@ -84,9 +84,6 @@ defmodule AttentionServer.Server do
         deployment_mode: deployment_mode,
         jev_score_record_path: Keyword.get(opts, :jev_score_record_path),
         feature_flags_path: Keyword.get(opts, :feature_flags_path),
-        # Both change logs are always on under the Server. Passed explicitly
-        # so a Relay never reads `client_api_v2` from the feature-flags file.
-        client_api_v2: true,
         upload_cap: upload_cap
       ]
 

@@ -25,7 +25,7 @@ defmodule AttentionServer.ClientAPIReadRoutesTest do
     File.mkdir_p!(dir)
     on_exit(fn -> File.rm_rf!(dir) end)
     flags = Path.join(dir, "flags.json")
-    File.write!(flags, ~s({"client_api_v2":true}))
+    File.write!(flags, "{}")
 
     store_path = Path.join(dir, "state.sqlite3")
 
@@ -406,7 +406,7 @@ defmodule AttentionServer.ClientAPIReadRoutesTest do
 
     File.write!(
       ctx.flags,
-      ~s({"client_api_v2":true,"priority_level_editing":true,"progress_inbox":true})
+      ~s({"priority_level_editing":true,"progress_inbox":true})
     )
 
     assert %{"features" => features} = body(Reads.get_me(get("/v2/me"), ctx(ctx)))
