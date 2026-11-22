@@ -51,6 +51,7 @@ defmodule AttentionServer.Store do
     source_bindings: %{},
     upload_links: %{},
     authority_index: %{},
+    unique_index: %{},
     blob_owners: %{},
     progress_version: 0,
     encoding_cache: %{},
@@ -364,6 +365,7 @@ defmodule AttentionServer.Store do
          source_bindings: engine.route_b_index.source_bindings,
          upload_links: KeyedValidation.upload_index(engine),
          authority_index: KeyedValidation.authority_index(engine),
+         unique_index: KeyedValidation.unique_index(engine),
          blob_owners: KeyedReference.blob_owners(engine)
      }}
   end
@@ -920,6 +922,8 @@ defmodule AttentionServer.Store do
            KeyedValidation.upload_changes(store.upload_links, old, next, touched),
          {authority_index, _affected} <-
            KeyedValidation.authority_changes(store.authority_index, old, next, touched),
+         {unique_index, _conflict} <-
+           KeyedValidation.unique_changes(store.unique_index, old, next, touched),
          {:ok, source_bindings} <-
            KeyedValidation.source_changes(
              store.source_bindings,
@@ -958,6 +962,7 @@ defmodule AttentionServer.Store do
               source_bindings: source_bindings,
               upload_links: upload_links,
               authority_index: authority_index,
+              unique_index: unique_index,
               blob_owners: blob_owners,
               change_log_touched:
                 MapSet.union(store.change_log_touched, MapSet.new(Map.keys(heads)))
@@ -1085,12 +1090,31 @@ defmodule AttentionServer.Store do
                items
              )
            end),
+         {:ok, {unique_index, conflict}} <-
+           rescued(:unique, fn ->
+             KeyedValidation.unique_changes(store.unique_index, old, next, touched)
+           end),
          {:ok, addresses} <-
-           tagged(:dependents, fn -> keyed_addresses(store, old, next, touched) end),
-         :ok <- first_invalid_address(next, addresses) do
-      keyed_fallbacks(next, touched)
+           tagged(:dependents, fn ->
+             keyed_addresses(store, unique_index, old, next, touched)
+           end),
+         :ok <- first_invalid_address(next, addresses),
+         :ok <- unique_verdict(conflict) do
+      keyed_fallbacks(next)
     end
   end
+
+  defp rescued(tag, check) do
+    {:ok, check.()}
+  rescue
+    _ -> {:error, tag}
+  end
+
+  # A value the full validator requires to be unique (owner keys, the shared
+  # principal key space, pending secrets, hosted persons, agent ids, active
+  # push addresses), now carried by a touched row and another row.
+  defp unique_verdict(nil), do: :ok
+  defp unique_verdict({namespace, _value}), do: {:error, {:unique, namespace}}
 
   defp tagged(tag, check) do
     case check.() do
@@ -1107,8 +1131,10 @@ defmodule AttentionServer.Store do
   # record: the authority index names rows owned by a removed or lowered
   # person or by a device or agent whose identity changed, and rows bound to a
   # pending code; the upload index names entries and message revisions that
-  # reference a touched upload.
-  defp keyed_addresses(store, old, next, touched) do
+  # reference a touched upload, so removing an upload rechecks them; the
+  # uniqueness index names the hosted accounts of a touched owner row; and a
+  # touched device rechecks its push bindings, which read `revoked`.
+  defp keyed_addresses(store, unique_index, old, next, touched) do
     {_index, affected} =
       KeyedValidation.authority_changes(store.authority_index, old, next, touched)
 
@@ -1120,9 +1146,27 @@ defmodule AttentionServer.Store do
       |> MapSet.union(affected)
       |> MapSet.union(related)
       |> MapSet.union(MapSet.new(Enum.flat_map(touched, &local_dependents/1)))
+      |> MapSet.union(
+        MapSet.new(Enum.flat_map(touched, &record_dependents(unique_index, old, next, &1)))
+      )
 
     {:ok, addresses}
   end
+
+  # Hosted accounts read only whether their person has an owner row (#18).
+  defp record_dependents(unique_index, _old, _next, {:row, :owners, person}),
+    do: MapSet.to_list(KeyedValidation.unique_rows(unique_index, :hosted_person, person))
+
+  # An active binding needs its device not revoked (#23). A changed device
+  # person is already covered by the authority index.
+  defp record_dependents(_unique_index, old, next, {:row, :devices, key}) do
+    for engine <- [old, next],
+        %{person: person} <- [Map.get(engine.devices, key)],
+        uniq: true,
+        do: {:row, :push_bindings, {person, key}}
+  end
+
+  defp record_dependents(_unique_index, _old, _next, _address), do: []
 
   defp local_dependents({:row, :persons, person}), do: [{:row, :conversation_highs, person}]
 
@@ -1351,41 +1395,19 @@ defmodule AttentionServer.Store do
   defp valid_keyed_row?(_engine, _field, _key, _row), do: false
 
   # Concerns that per-address validation does not cover yet run as the
-  # existing whole-state sub-checks, each only when a field it reads was
-  # touched (untouched_change/3 proves the others unchanged). Derived indexes
-  # are not addressable, so their checks always run.
-  defp keyed_fallbacks(engine, touched) do
-    fields = MapSet.new(touched, &address_field/1)
-    touched? = fn names -> Enum.any?(names, &MapSet.member?(fields, &1)) end
-
+  # existing whole-state sub-checks until W3c. Derived indexes are not
+  # addressable, and bounce state reads message revisions and origins, so both
+  # always run.
+  defp keyed_fallbacks(engine) do
     [
       # W3c: derived default index (#3), not addressable.
-      {:open_default_index, true, fn -> valid_open_default_index?(engine) end},
+      {:open_default_index, fn -> valid_open_default_index?(engine) end},
       # W3c: bounce revisions, opened revisions, advisory feeds, waiting
       # routes and derived bounce indexes (#30-#34).
-      {:bounce_state, true, fn -> BounceDecision.valid_bounce_state?(engine) end},
-      # W3b: unique owner keys (#7) and one principal key space, checked from
-      # the device, agent and retired-key side (#6, #8).
-      {:owner_keys, touched?.([:owners, :retired_owner_keys, :devices, :agents]),
-       fn -> valid_owners?(engine) end},
-      # W3b: a new device must not take an agent's key (#39).
-      {:agent_keys, touched?.([:devices]), fn -> agent_keys_not_devices?(engine) end},
-      # W3b: agents unique by {person, id} (#40).
-      {:agent_ids, touched?.([:agents]), fn -> unique_agent_ids?(engine) end},
-      # W3b: pending secrets unique, alone and with history (#10, #13).
-      {:pending_secrets, touched?.([:pending_enrollments, :pending_history]),
-       fn -> unique_pending_secrets?(engine) end},
-      # W3b: one hosted account per person (#19); removing an owner row
-      # invalidates the person's hosted account (#18).
-      {:hosted_accounts, touched?.([:hosted_accounts, :owners]),
-       fn -> valid_hosted_accounts?(engine) end},
-      # W3b: active push addresses unique (#24).
-      {:push_addresses, touched?.([:push_bindings]), fn -> unique_push_addresses?(engine) end},
-      # W3b: a revoked device ends its active binding (#23).
-      {:push_devices, touched?.([:devices]), fn -> valid_push_bindings?(engine) end}
+      {:bounce_state, fn -> BounceDecision.valid_bounce_state?(engine) end}
     ]
-    |> Enum.find_value(:ok, fn {concern, run?, check} ->
-      if run? and not fallback_valid?(check), do: {:error, {:fallback, concern}}
+    |> Enum.find_value(:ok, fn {concern, check} ->
+      if not fallback_valid?(check), do: {:error, {:fallback, concern}}
     end)
   end
 
@@ -1394,11 +1416,6 @@ defmodule AttentionServer.Store do
   rescue
     _ -> false
   end
-
-  defp address_field({kind, field, _}) when kind in [:row, :member], do: field
-  defp address_field({:field, field}), do: field
-  defp address_field({:origin_feed, _, _}), do: :origin_feeds
-  defp address_field({:advisory, _, _}), do: :advisory_feeds
 
   defp update_blob_owners(owners, prepared) do
     case KeyedReference.update_blob_owners(owners, prepared.blob_delta) do
@@ -2930,9 +2947,6 @@ defmodule AttentionServer.Store do
     engine.agents |> Map.values() |> Enum.map(&{&1.person, &1.id}) |> Enum.uniq() |> length() ==
       map_size(engine.agents)
   end
-
-  defp agent_keys_not_devices?(engine),
-    do: Enum.all?(engine.agents, fn {key, _agent} -> not Map.has_key?(engine.devices, key) end)
 
   defp valid_agent_history?(agent) do
     history = agent.grant_history

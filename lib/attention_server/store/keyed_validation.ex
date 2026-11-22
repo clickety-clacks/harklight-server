@@ -454,6 +454,121 @@ defmodule AttentionServer.Store.KeyedValidation do
       else: []
   end
 
+  # Values the full validator requires to be carried by one row at most, as
+  # {namespace, value} => addresses carrying it (inventory rows in brackets):
+  #   :principal_key  one key space over device, agent, owner and retired
+  #                   owner keys, and owner keys among owners (#6, #7, #8, #39)
+  #   :pending_secret secret hashes across pending requests and history (#10, #13)
+  #   :hosted_person  one hosted account per person (#19)
+  #   :agent_id       agents by {person, id} (#40)
+  #   :push_address   active push addresses (#24)
+  # Devices, agents and retired keys are each keyed by the key itself, so one
+  # carrier per principal key is exactly the pairwise checks of #6-#8 and #39.
+  @unique_rows [
+    :owners,
+    :devices,
+    :agents,
+    :pending_enrollments,
+    :pending_history,
+    :hosted_accounts,
+    :push_bindings
+  ]
+
+  def unique_index(engine) do
+    index =
+      for field <- @unique_rows, key <- Map.keys(Map.fetch!(engine, field)), reduce: %{} do
+        index -> edit_unique_index(index, engine, {:row, field, key}, :add)
+      end
+
+    Enum.reduce(engine.retired_owner_keys, index, fn key, index ->
+      edit_unique_index(index, engine, {:member, :retired_owner_keys, key}, :add)
+    end)
+  end
+
+  def unique_rows(index, namespace, value),
+    do: Map.get(index, {namespace, value}, MapSet.new())
+
+  # The updated index and the first {namespace, value} a touched address now
+  # shares with another row, or nil. The committed state had no shared value,
+  # so every conflict includes a touched address carrying the value.
+  def unique_changes(index, old, next, touched) do
+    updated =
+      Enum.reduce(touched, index, fn address, acc ->
+        acc
+        |> edit_unique_index(old, address, :remove)
+        |> edit_unique_index(next, address, :add)
+      end)
+
+    conflict =
+      Enum.find_value(touched, fn address ->
+        Enum.find(unique_values(next, address), &(MapSet.size(Map.get(updated, &1)) > 1))
+      end)
+
+    {updated, conflict}
+  end
+
+  defp edit_unique_index(index, engine, address, operation) do
+    Enum.reduce(unique_values(engine, address), index, fn value, acc ->
+      rows = Map.get(acc, value, MapSet.new())
+
+      next =
+        if operation == :add, do: MapSet.put(rows, address), else: MapSet.delete(rows, address)
+
+      if MapSet.size(next) == 0, do: Map.delete(acc, value), else: Map.put(acc, value, next)
+    end)
+  end
+
+  # The patterns match the full validator's projections; a record they do not
+  # match fails its own row check.
+  defp unique_values(engine, {:row, :owners, person}) do
+    case Map.get(engine.owners, person) do
+      %{key: key} -> [{:principal_key, key}]
+      _ -> []
+    end
+  end
+
+  defp unique_values(engine, {:row, :devices, key}),
+    do: if(Map.has_key?(engine.devices, key), do: [{:principal_key, key}], else: [])
+
+  defp unique_values(engine, {:row, :agents, key}) do
+    case Map.fetch(engine.agents, key) do
+      {:ok, %{person: person, id: id}} -> [{:principal_key, key}, {:agent_id, {person, id}}]
+      {:ok, _} -> [{:principal_key, key}]
+      :error -> []
+    end
+  end
+
+  defp unique_values(engine, {:member, :retired_owner_keys, key}),
+    do:
+      if(MapSet.member?(engine.retired_owner_keys, key),
+        do: [{:principal_key, key}],
+        else: []
+      )
+
+  defp unique_values(engine, {:row, field, code})
+       when field in [:pending_enrollments, :pending_history] do
+    case Map.get(Map.fetch!(engine, field), code) do
+      %{secret_hash: hash} -> [{:pending_secret, hash}]
+      _ -> []
+    end
+  end
+
+  defp unique_values(engine, {:row, :hosted_accounts, ref}) do
+    case Map.get(engine.hosted_accounts, ref) do
+      %{person: person} -> [{:hosted_person, person}]
+      _ -> []
+    end
+  end
+
+  defp unique_values(engine, {:row, :push_bindings, key}) do
+    case Map.get(engine.push_bindings, key) do
+      %{active: true, address: address} -> [{:push_address, address}]
+      _ -> []
+    end
+  end
+
+  defp unique_values(_engine, _address), do: []
+
   def upload_index(engine) do
     index =
       for {scope, feed} <- engine.origin_feeds, {seq, entry} <- feed.entries, reduce: %{} do

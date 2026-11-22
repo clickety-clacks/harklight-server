@@ -239,7 +239,9 @@ defmodule AttentionServer.Store.EngineTransitionTest do
       :origin_entry_lookup,
       Map.new(engine.origin_feeds, fn {key, feed} -> {key, feed.entry_seqs_by_handle} end)
     )
-    |> Map.merge(Map.take(store, [:source_bindings, :upload_links, :authority_index]))
+    |> Map.merge(
+      Map.take(store, [:source_bindings, :upload_links, :authority_index, :unique_index])
+    )
   end
 
   defp ordered_rows(trees) do
