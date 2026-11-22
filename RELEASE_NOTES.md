@@ -1,15 +1,111 @@
-# Harklight Server v0.2.0 (in preparation)
+# Harklight Server v0.2.0
 
-The full notes are completed when the release is cut.
+**This is a breaking protocol release.** Server 0.2.0 speaks protocol 0.2 only.
+Move a deployment to it only after its app, agents and headless tools are on
+their 0.2 versions; protocol 0.1 clients cannot connect to it.
+
+## What changed for users
+
+- **Protocol 0.2 only.** The device port (18443 by default) serves client API
+  v2 (`/v2`) over mutual TLS. The app, the packaged web client, Harklight Agent
+  and the packaged tools all use it. The protocol 0.1 device WebSocket
+  (`/relay`), the browser transport (`/browser/relay` and `/browser/v1`) and the
+  `/origin/v1` and `/agent/v1` listeners are removed, with their replay and
+  paging. Protocol 0.1 apps, agents and headless tools cannot connect.
+- **Your data carries over.** Messages, accounts, grants, enrolled devices and
+  registered agents are kept. A device enrolled on 0.1 keeps its certificate
+  and needs no new enrollment once it runs a 0.2 client. Pending enrollments
+  survive and can still be approved.
+- **Invitations.** New invitations carry `device_url`, the device port's
+  `https://` address, in place of `relay_url`. Invitations created before the
+  upgrade and not yet used are no longer redeemed: the join page asks for a new
+  one, so create a new invitation from the dashboard. An invitation that was
+  already used keeps recovering its pending request.
+- **No expiry when joining.** Pending approvals, invitations and owner
+  sign-in links no longer expire; each still works once. Starting enrollment
+  again with the same key returns the same waiting request and approval code.
+  The owner can name sender grants when approving a device that joined from an
+  invitation.
+- **Headless device tools.** `bin/harklight device read`, `device respond` and
+  `enroll status` use `/v2`. `--device-port` replaces `--relay-port`; there is
+  no alias. Files a 0.1 tool left in its directory are not read or changed.
+- **Granted-agent tools.** `bin/harklight agent search`, `get` and `answer`
+  (also `respond`) use client API v2 on the device port with the agent's own
+  certificate. An answer is shown first and needs a typed `ANSWER`
+  confirmation; it is saved before it is sent, and rerunning the same command
+  replays a committed answer. The 0.1-only flags `--acceptance`, `--op`,
+  `--intent-ref`, `--text`, `--contains` and `--cursor` are refused by name.
+- **Retired settings.** `ATTENTION_SERVER_AGENT_PORT`,
+  `ATTENTION_SERVER_AGENT_BIND`, `ATTENTION_SERVER_ORIGIN_PORT` and
+  `ATTENTION_SERVER_ORIGIN_BIND` are ignored. The Server starts normally and
+  logs one notice for each that is still set
+  (`event=harklight_config outcome=ignored setting=NAME reason=retired_in_0.2.0`),
+  without its value. A `client_api_v2` entry in the feature-flags file is also
+  ignored.
+- **Web client and sign-out.** The packaged web client uses same-origin `/v2`
+  only. After a self-hosted sign-out the browser shows "You are signed out."
+  instead of reporting an invalid sign-in link.
+- **Chat stays open.** Chat on a request stays open after any outcome
+  (answered, No comment, cleared, expired, withdrawn or superseded), and an
+  agent can reply more than once to the same chat message. The first answer
+  still settles the request.
+- **Answer screens.** A custom answer screen that cannot be shown (over a
+  published limit, malformed, or naming a file that was not delivered) no
+  longer refuses the message. The message is delivered with the plain Reply
+  and marked `answer_ui_unavailable`.
+- **Notifications.** A device's first unsent item is pushed at once; items
+  within five minutes of the last push are grouped into one later push.
+  Registering a push address that another device holds takes it over. Each
+  APNs attempt has a 20,000 ms deadline by default
+  (`ATTENTION_SERVER_APNS_ATTEMPT_TIMEOUT_MS`), so a stalled attempt no longer
+  holds up other devices. The notification stays queued for retry, which can
+  produce a duplicate alert.
+- **Fixes.** A refused priority-levels save answers 400 instead of 500. A
+  sending agent's receipt or result after a separately granted agent answered
+  the item answers `400 unsupported` instead of `409 not_answered`.
+
+## Upgrade and recovery
+
+v0.2.0 writes FORMAT29, like the published v0.1.43, v0.1.44, v0.1.45, v0.1.48
+and v0.1.49 releases. Upgrading from v0.1.49 runs no store migration; supported
+FORMAT27 state migrates to FORMAT29 on first start as before. On first start
+the Server builds its client API v2 change feed and stored ranks from the
+existing data; later restarts leave them unchanged. Any client API v2 cursor
+issued before that start expires once, and the client reloads from a fresh
+snapshot.
+
+Before switching:
+
+1. Have the 0.2 app, Harklight Agent 0.2.0 and any 0.2 headless tools ready for
+   every client. 0.1 clients stop working when the Server switches.
+2. Finish or abandon unresolved 0.1 Agent operations with the 0.1 CLI before
+   switching. Agent 0.2.0 does not use 0.1 cursors; its first read takes a
+   fresh baseline. Pending enrollments survive. An existing identity takes the
+   device port from `--device-port` or `HARKLIGHT_DEVICE_PORT`.
+3. Stop the server and take a complete private-state backup, including the
+   database and keys (the release installer takes one).
+
+After the first start, remove the retired settings the startup notices name,
+replace `--relay-port` with `--device-port` in scripts, and create new
+invitations to replace unused ones.
+
+Returning to v0.1.49 or another 0.1.x release requires stopping the server,
+restoring the pre-start backup and selecting that release, and its clients
+must be on 0.1 again. The shared FORMAT29 number does not establish that 0.1.x
+can read state 0.2.0 has written; switching code alone is not a safe rollback.
+Restoring the backup loses every write made since it was taken and cannot undo
+external notifications or agent deliveries. Recovery can fail; do not assume
+success or a recovery time.
 
 ## Compatibility
 
-Protocol 0.2. The device port serves client API v2 (`/v2`) only, and the
-Server runs no `/origin/v1` and no `/agent/v1` listener. Protocol 0.1 apps,
-agents and headless tools cannot connect to it, so a deployment moves to
-0.2.0 only after its agents and clients are on their 0.2 versions. The
-verified compatible versions of the app, web client and Harklight Agent are
-named here when the release is cut.
+Protocol 0.2, which supersedes protocol 0.1. The device port serves client API
+v2 (`/v2`) only, and the Server runs no `/origin/v1` and no `/agent/v1`
+listener. Protocol 0.1 apps, agents and headless tools cannot connect to it, so
+a deployment moves to 0.2.0 only after its agents and clients are on their 0.2
+versions. Verified with this Server: Harklight Agent 0.2.0 and the web client
+bundle harklight-web `3434a38`, packaged with the Server. Compatible with the
+Harklight app 0.2.0.
 
 ---
 
