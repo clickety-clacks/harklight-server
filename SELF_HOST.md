@@ -437,11 +437,18 @@ remains unsupported.
 
 ## Authorized-agent tools remain available
 
-bin/harklight agent exposes existing keygen/search/get/respond tools.
-Owner agent-register, agent-grants-replace, agent-list and agent-revoke remain
-available. Register the exact public key and grant read/respond separately.
-Responses retain deliberate ANSWER confirmation, caller-held operation UUID,
-exact acceptance sequence, without source ruling authority.
+bin/harklight agent exposes keygen, search, get and answer (also spelled
+respond) on the device port over client API v2: `GET /v2/search`,
+`GET /v2/items/{item_id}` with its entries, and
+`POST /v2/items/{item_id}/answer`. Owner agent-register, agent-grants-replace,
+agent-list and agent-revoke remain available. Register the exact public key and
+grant read/respond separately; reading needs no read grant, and answering needs
+both grants for the item's sender. An answer names its item (`--item-id`, or an
+exact `--sender` and `--message`) and `--request-revision`, and its answer file
+is an AnswerBody object. Its exact body and Idempotency-Key are saved in the
+agent directory before it is sent, it needs a deliberate ANSWER confirmation,
+and rerunning the same command replays a committed answer instead of writing a
+second one. It carries no source ruling authority.
 
 ## Upgrade or rollback
 
