@@ -1100,7 +1100,7 @@ defmodule AttentionServer.Store do
            end),
          :ok <- first_invalid_address(next, addresses),
          :ok <- unique_verdict(conflict) do
-      keyed_fallbacks(next)
+      derived_verdict(old, next, touched)
     end
   end
 
@@ -1132,8 +1132,9 @@ defmodule AttentionServer.Store do
   # person or by a device or agent whose identity changed, and rows bound to a
   # pending code; the upload index names entries and message revisions that
   # reference a touched upload, so removing an upload rechecks them; the
-  # uniqueness index names the hosted accounts of a touched owner row; and a
-  # touched device rechecks its push bindings, which read `revoked`.
+  # uniqueness index names the hosted accounts of a touched owner row; a
+  # touched device rechecks its push bindings, which read `revoked`; and
+  # bounce state is rechecked where it reads any of these (bounce_dependents/3).
   defp keyed_addresses(store, unique_index, old, next, touched) do
     {_index, affected} =
       KeyedValidation.authority_changes(store.authority_index, old, next, touched)
@@ -1150,8 +1151,140 @@ defmodule AttentionServer.Store do
         MapSet.new(Enum.flat_map(touched, &record_dependents(unique_index, old, next, &1)))
       )
 
-    {:ok, addresses}
+    {:ok,
+     MapSet.union(
+       addresses,
+       MapSet.new(Enum.flat_map(addresses, &bounce_dependents(old, next, &1)))
+     )}
   end
+
+  # Bounce state (#30-#34) that reads another record. A message row is read
+  # by its bounce_revisions row (revision), its opened revisions, its waiting
+  # item and deadline entry (origin and session) and, when its session
+  # changes, its advisory entries. A bounce_revisions row is read by its
+  # opened revisions, waiting item and deadline entry, and by the advisory
+  # entries of a bounced selection it changes. A waiting route is read by the
+  # deadline entries of the items it held or holds, and an origin session by
+  # its advisory feed header. Origin sessions of a removed or reassigned
+  # device arrive here through the authority index. A touched advisory fact
+  # rechecks its feed header, the entries a lowered high drops and the
+  # receipts of a rewritten entry. Removing or re-originating a message falls
+  # back to the whole-state check (irregular_change/3); origin feed highs
+  # never drop on a regular transition (KeyedValidation.preflight/3).
+  defp bounce_dependents(old, next, {:row, :messages, key}) do
+    prior = Map.get(old.messages, key)
+    record = Map.get(next.messages, key)
+
+    entries =
+      if is_map(prior) and is_map(record) and
+           Map.get(prior, :session_handle) !== Map.get(record, :session_handle),
+         do: advisory_entries(next, key, prior),
+         else: []
+
+    [{:row, :bounce_revisions, key} | bounce_item_dependents(old, key)] ++ entries
+  end
+
+  defp bounce_dependents(old, next, {:row, :bounce_revisions, key}) do
+    prior = Map.get(old.messages, key)
+
+    entries =
+      if bounced_selection_changed?(
+           Map.get(old.bounce_revisions, key),
+           Map.get(next.bounce_revisions, key)
+         ),
+         do: advisory_entries(next, key, prior),
+         else: []
+
+    bounce_item_dependents(old, key) ++ entries
+  end
+
+  defp bounce_dependents(old, next, {:row, :bounce_waiting_routes, session_key}) do
+    for engine <- [old, next],
+        %MapSet{} = items <- [Map.get(engine.bounce_waiting_routes, session_key)],
+        {key, _sub_revision} <- items,
+        uniq: true,
+        do: {:bounce_queue, key}
+  end
+
+  defp bounce_dependents(_old, _next, {:row, :origin_sessions, feed_key}),
+    do: [{:advisory, feed_key, :high}]
+
+  defp bounce_dependents(old, next, {:advisory, feed_key, part}),
+    do: [{:advisory, feed_key, :high} | advisory_dependents(old, next, feed_key, part)]
+
+  defp bounce_dependents(_old, _next, _address), do: []
+
+  # Every existing opened revision of a message names a substantive revision
+  # of its old bounce row, and an untouched waiting route can hold only the
+  # message's old pending item under its old session, so those are what a
+  # change to the message or its bounce row can invalidate. A touched route
+  # is checked whole.
+  defp bounce_item_dependents(old, key) do
+    opened =
+      case Map.get(old.bounce_revisions, key) do
+        %{revisions: revisions} when is_map(revisions) ->
+          for sub_revision <- Map.keys(revisions),
+              do: {:member, :opened_revisions, Tuple.insert_at(key, 3, sub_revision)}
+
+        _ ->
+          []
+      end
+
+    waiting =
+      case BounceDecision.waiting_item(old, key) do
+        {session_key, item} -> [{:bounce_route_item, session_key, item}]
+        nil -> []
+      end
+
+    [{:bounce_queue, key} | opened ++ waiting]
+  end
+
+  # A valid entry for a message sits in the feed of the message's old origin
+  # and session; only a changed session or bounced selection reads them all.
+  defp advisory_entries(next, {person, _sender, _message_id} = key, prior) when is_map(prior) do
+    feed_key = {person, Map.get(prior, :origin), Map.get(prior, :session_handle)}
+
+    for sequence <- BounceDecision.advisory_sequences(next, feed_key, key),
+        do: {:advisory, feed_key, {:entry, sequence}}
+  end
+
+  defp advisory_entries(_next, _key, _prior), do: []
+
+  defp bounced_selection_changed?(%{revisions: revisions}, state) when is_map(revisions) do
+    Enum.any?(revisions, fn
+      {sub_revision, %{selection: %{"decision" => "bounced"} = selection}} ->
+        not match?(%{revisions: %{^sub_revision => %{selection: ^selection}}}, state)
+
+      _ ->
+        false
+    end)
+  end
+
+  defp bounced_selection_changed?(_prior, _state), do: false
+
+  defp advisory_dependents(old, next, feed_key, :high) do
+    with %{high: before} when is_integer(before) <- Map.get(old.advisory_feeds, feed_key),
+         %{high: high} when is_integer(high) and high >= 0 and high < before <-
+           Map.get(next.advisory_feeds, feed_key) do
+      for sequence <- (high + 1)..before//1, do: {:advisory, feed_key, {:entry, sequence}}
+    else
+      _ -> []
+    end
+  end
+
+  defp advisory_dependents(old, next, feed_key, {:entry, sequence}) do
+    case get_in(old.advisory_feeds, [feed_key, :entries, sequence]) do
+      %{"advisory_id" => advisory_id} = entry ->
+        if get_in(next.advisory_feeds, [feed_key, :entries, sequence]) === entry,
+          do: [],
+          else: [{:advisory, feed_key, {:receipt, advisory_id}}]
+
+      _ ->
+        []
+    end
+  end
+
+  defp advisory_dependents(_old, _next, _feed_key, _part), do: []
 
   # Hosted accounts read only whether their person has an owner row (#18).
   defp record_dependents(unique_index, _old, _next, {:row, :owners, person}),
@@ -1256,14 +1389,44 @@ defmodule AttentionServer.Store do
 
   defp keyed_address_valid?(_engine, {:origin_feed, _scope, _fact}), do: true
 
-  # Bounce rows, opened revisions and advisory feeds are checked whole by
-  # keyed_fallbacks/2 until W3c.
-  defp keyed_address_valid?(_engine, {:row, field, _key})
-       when field in [:bounce_revisions, :bounce_waiting_routes],
-       do: true
+  # Bounce state (#30-#34): see bounce_dependents/3 for what rechecks these.
+  defp keyed_address_valid?(engine, {:row, :bounce_revisions, key}) do
+    case Map.fetch(engine.bounce_revisions, key) do
+      {:ok, state} -> BounceDecision.valid_revision_state?(engine, key, state)
+      :error -> true
+    end
+  end
 
-  defp keyed_address_valid?(_engine, {:member, :opened_revisions, _member}), do: true
-  defp keyed_address_valid?(_engine, {:advisory, _scope, _fact}), do: true
+  defp keyed_address_valid?(engine, {:row, :bounce_waiting_routes, session_key}) do
+    case Map.fetch(engine.bounce_waiting_routes, session_key) do
+      {:ok, items} -> BounceDecision.valid_waiting_route?(engine, session_key, items)
+      :error -> true
+    end
+  end
+
+  defp keyed_address_valid?(engine, {:member, :opened_revisions, member}),
+    do:
+      not MapSet.member?(engine.opened_revisions, member) or
+        BounceDecision.valid_opened_revision?(engine, member)
+
+  defp keyed_address_valid?(engine, {:advisory, feed_key, part}),
+    do: BounceDecision.valid_advisory_fact?(engine, feed_key, part)
+
+  # Not record addresses: one item of a waiting route, and a message's share
+  # of the derived deadline index.
+  defp keyed_address_valid?(engine, {:bounce_route_item, session_key, item}) do
+    case Map.get(engine.bounce_waiting_routes, session_key) do
+      %MapSet{} = items ->
+        not MapSet.member?(items, item) or
+          BounceDecision.valid_waiting_item?(engine, session_key, item)
+
+      _ ->
+        true
+    end
+  end
+
+  defp keyed_address_valid?(engine, {:bounce_queue, key}),
+    do: BounceDecision.valid_queue_entry?(engine, key)
 
   defp keyed_address_valid?(engine, {:row, field, key}) do
     case Map.fetch(Map.fetch!(engine, field), key) do
@@ -1394,27 +1557,50 @@ defmodule AttentionServer.Store do
 
   defp valid_keyed_row?(_engine, _field, _key, _row), do: false
 
-  # Concerns that per-address validation does not cover yet run as the
-  # existing whole-state sub-checks until W3c. Derived indexes are not
-  # addressable, and bounce state reads message revisions and origins, so both
-  # always run.
-  defp keyed_fallbacks(engine) do
+  # Memory-only indexes are not addressable. The engine updates them with
+  # the records they derive from, so each is compared, for the touched
+  # records only, with what a rebuild for those records gives: the open
+  # default of a touched message (#3), and the bounce discussion,
+  # origin-revision and advisory id indexes (#34). The bounce deadline index
+  # is checked per message as {:bounce_queue, key}.
+  defp derived_verdict(old, next, touched) do
     [
-      # W3c: derived default index (#3), not addressable.
-      {:open_default_index, fn -> valid_open_default_index?(engine) end},
-      # W3c: bounce revisions, opened revisions, advisory feeds, waiting
-      # routes and derived bounce indexes (#30-#34).
-      {:bounce_state, fn -> BounceDecision.valid_bounce_state?(engine) end}
+      {:open_default_index, fn -> valid_open_defaults?(next, touched) end},
+      {:bounce_discussed_messages,
+       fn -> BounceDecision.valid_discussed_change?(old, next, touched) end},
+      {:bounce_origin_entries,
+       fn -> BounceDecision.valid_origin_entries_change?(next, touched) end},
+      {:advisory_id_index,
+       fn -> BounceDecision.valid_advisory_index_change?(old, next, touched) end}
     ]
-    |> Enum.find_value(:ok, fn {concern, check} ->
-      if not fallback_valid?(check), do: {:error, {:fallback, concern}}
+    |> Enum.find_value(:ok, fn {index, check} ->
+      if not derived_valid?(check), do: {:error, {:derived, index}}
     end)
   end
 
-  defp fallback_valid?(check) do
+  defp derived_valid?(check) do
     check.()
   rescue
     _ -> false
+  end
+
+  defp valid_open_defaults?(engine, touched) do
+    is_map(engine.open_default_index) and
+      Enum.all?(touched, fn
+        {:row, :messages, key} ->
+          expected =
+            with {:ok, record} <- Map.fetch(engine.messages, key),
+                 at when is_integer(at) <- Engine.default_due_at(record) do
+              {:ok, at}
+            else
+              _ -> :error
+            end
+
+          Map.fetch(engine.open_default_index, key) == expected
+
+        _ ->
+          true
+      end)
   end
 
   defp update_blob_owners(owners, prepared) do

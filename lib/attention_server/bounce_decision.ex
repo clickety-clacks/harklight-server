@@ -344,13 +344,11 @@ defmodule AttentionServer.BounceDecision do
 
   # Everything the full check covers except the per-person configuration
   # rows: revision states, opened revisions, advisory feeds and the derived
-  # indexes. Keyed validation still runs this as a whole-state scan.
-  @doc false
-  def valid_bounce_state?(%Engine{} = engine) do
+  # indexes. Keyed validation checks the same rows per touched address with
+  # the public per-record predicates below.
+  defp valid_bounce_state?(%Engine{} = engine) do
     valid_revision_states?(engine) and valid_opened_revisions?(engine) and
       valid_advisory_feeds?(engine) and valid_indexes?(engine)
-  rescue
-    _ -> false
   end
 
   def advisory_text(revision, evaluated_at_ms)
@@ -765,27 +763,31 @@ defmodule AttentionServer.BounceDecision do
 
   defp discussed_message_index(engine) do
     Enum.reduce(engine.conversation_events, MapSet.new(), fn {_event_key, event}, acc ->
-      if event.payload["kind"] == "discussion" and event.payload["author"] == "person",
+      if discussion_event?(event),
         do: MapSet.put(acc, event.key),
         else: acc
     end)
   end
 
+  defp discussion_event?(event),
+    do: event.payload["kind"] == "discussion" and event.payload["author"] == "person"
+
   defp origin_entry_index(engine) do
     Enum.reduce(engine.origin_feeds, MapSet.new(), fn {{person, origin}, feed}, acc ->
       Enum.reduce(feed.entries, acc, fn {_sequence, entry}, index ->
-        if entry["kind"] == "revision" and entry["author"] == "origin" and
-             is_binary(entry["session_handle"]) and is_binary(entry["sender_id"]) and
-             is_binary(entry["message_id"]) do
-          MapSet.put(
-            index,
-            {person, origin, entry["session_handle"], entry["sender_id"], entry["message_id"]}
-          )
-        else
-          index
+        case origin_entry_member(person, origin, entry) do
+          nil -> index
+          member -> MapSet.put(index, member)
         end
       end)
     end)
+  end
+
+  defp origin_entry_member(person, origin, entry) do
+    if entry["kind"] == "revision" and entry["author"] == "origin" and
+         is_binary(entry["session_handle"]) and is_binary(entry["sender_id"]) and
+         is_binary(entry["message_id"]),
+       do: {person, origin, entry["session_handle"], entry["sender_id"], entry["message_id"]}
   end
 
   defp valid_indexes?(engine) do
@@ -803,16 +805,7 @@ defmodule AttentionServer.BounceDecision do
     expected_queued = MapSet.difference(Map.keys(pending) |> MapSet.new(), waiting)
 
     Enum.all?(engine.bounce_waiting_routes, fn {session_key, entries} ->
-      is_tuple(session_key) and tuple_size(session_key) == 3 and is_struct(entries, MapSet) and
-        Enum.all?(entries, fn {key, sub_revision} = item ->
-          case {Map.get(pending, item), Map.get(engine.messages, key)} do
-            {due_at, record} when is_integer(due_at) and is_map(record) ->
-              session_key == bounce_session_key(key, record)
-
-            _ ->
-              false
-          end
-        end)
+      valid_waiting_route?(engine, session_key, entries)
     end) and
       MapSet.size(waiting) + MapSet.size(queued_ids) == map_size(pending) and
       MapSet.equal?(queued_ids, expected_queued) and
@@ -820,6 +813,173 @@ defmodule AttentionServer.BounceDecision do
       MapSet.equal?(engine.bounce_origin_entries, origin_entry_index(engine)) and
       engine.advisory_id_index == build_advisory_id_index(engine.advisory_feeds)
   end
+
+  # A persisted waiting-route row (#33): every item is its message's current
+  # pending revision, waiting under the message's own session.
+  @doc false
+  def valid_waiting_route?(engine, session_key, entries) do
+    is_tuple(session_key) and tuple_size(session_key) == 3 and is_struct(entries, MapSet) and
+      Enum.all?(entries, &valid_waiting_item?(engine, session_key, &1))
+  end
+
+  @doc false
+  def valid_waiting_item?(engine, session_key, {key, sub_revision}) do
+    case {pending_revision(Map.get(engine.bounce_revisions, key)), Map.get(engine.messages, key)} do
+      {{^sub_revision, due_at}, record} when is_integer(due_at) and is_map(record) ->
+        session_key == bounce_session_key(key, record)
+
+      _ ->
+        false
+    end
+  end
+
+  def valid_waiting_item?(_engine, _session_key, _item), do: false
+
+  # The waiting-route row and item a message's pending revision would occupy,
+  # or nil when it has none.
+  @doc false
+  def waiting_item(engine, key) do
+    with {sub_revision, _due_at} <- pending_revision(Map.get(engine.bounce_revisions, key)),
+         record when is_map(record) <- Map.get(engine.messages, key) do
+      {bounce_session_key(key, record), {key, sub_revision}}
+    else
+      _ -> nil
+    end
+  end
+
+  # One message's share of the derived deadline index (#34): a pending
+  # current revision is either waiting under its message's session or queued
+  # at its due time, never both. Deadline entries that do not match a pending
+  # revision are ignored, as in valid_indexes?/1.
+  @doc false
+  def valid_queue_entry?(engine, key) do
+    case pending_revision(Map.get(engine.bounce_revisions, key)) do
+      nil ->
+        true
+
+      {sub_revision, due_at} ->
+        item = {key, sub_revision}
+
+        waiting? =
+          case Map.get(engine.messages, key) do
+            record when is_map(record) ->
+              case Map.get(engine.bounce_waiting_routes, bounce_session_key(key, record)) do
+                %MapSet{} = entries -> MapSet.member?(entries, item)
+                _ -> false
+              end
+
+            _ ->
+              false
+          end
+
+        queued? = :gb_trees.is_defined({due_at, key, sub_revision}, engine.bounce_deadline_index)
+        waiting? != queued?
+    end
+  end
+
+  # The derived discussion index (#34) for the messages of touched
+  # conversation events. Published events are immutable on a regular keyed
+  # transition, so a message is discussed exactly when it was before or a
+  # touched event is a person's discussion of it.
+  @doc false
+  def valid_discussed_change?(old, next, touched) do
+    is_struct(next.bounce_discussed_messages, MapSet) and
+      touched
+      |> Enum.flat_map(fn
+        {:row, :conversation_events, event_key} ->
+          case Map.fetch(next.conversation_events, event_key) do
+            {:ok, event} -> [{event.key, discussion_event?(event)}]
+            :error -> []
+          end
+
+        _ ->
+          []
+      end)
+      |> Enum.group_by(&elem(&1, 0), &elem(&1, 1))
+      |> Enum.all?(fn {key, discussions} ->
+        MapSet.member?(next.bounce_discussed_messages, key) ==
+          (MapSet.member?(old.bounce_discussed_messages, key) or Enum.any?(discussions))
+      end)
+  end
+
+  # The derived origin-revision index (#34) for touched origin entries.
+  # Origin entries are immutable and origin feeds are never removed on a
+  # regular keyed transition (KeyedValidation.preflight/3), so only members
+  # produced by touched entries can change, and each must be present.
+  @doc false
+  def valid_origin_entries_change?(next, touched) do
+    is_struct(next.bounce_origin_entries, MapSet) and
+      Enum.all?(touched, fn
+        {:origin_feed, {person, origin} = scope, {:entry, seq}} ->
+          case get_in(next.origin_feeds, [scope, :entries, seq]) do
+            nil ->
+              true
+
+            entry ->
+              case origin_entry_member(person, origin, entry) do
+                nil -> true
+                member -> MapSet.member?(next.bounce_origin_entries, member)
+              end
+          end
+
+        _ ->
+          true
+      end)
+  end
+
+  # The derived advisory id index (#34) for the feeds of touched advisory
+  # entries. Old entry ids are exactly the old index keys, so an appended
+  # entry with a fresh id maps to its own sequence. A rewritten or removed
+  # entry, or a reused id, compares those ids against a rebuild of that one
+  # feed's index.
+  @doc false
+  def valid_advisory_index_change?(old, next, touched) do
+    is_map(next.advisory_id_index) and
+      touched
+      |> Enum.reduce(%{}, fn
+        {:advisory, scope, {:entry, seq}}, scopes ->
+          Map.update(scopes, scope, [seq], &[seq | &1])
+
+        _, scopes ->
+          scopes
+      end)
+      |> Enum.all?(fn {scope, seqs} -> valid_feed_index_change?(old, next, scope, seqs) end)
+  end
+
+  defp valid_feed_index_change?(old, next, scope, seqs) do
+    old_feed = Map.get(old.advisory_feeds, scope)
+    feed = Map.get(next.advisory_feeds, scope)
+    before = feed_entries(old_feed)
+    entries = feed_entries(feed)
+    changed = Enum.reject(seqs, &(Map.fetch(before, &1) === Map.fetch(entries, &1)))
+    appended = for seq <- changed, not Map.has_key?(before, seq), do: seq
+    appended_ids = for seq <- appended, id <- indexed_id(Map.get(entries, seq)), do: {id, seq}
+    ids = Enum.map(appended_ids, &elem(&1, 0))
+
+    fresh? =
+      length(appended) == length(changed) and length(Enum.uniq(ids)) == length(ids) and
+        not Enum.any?(ids, &Map.has_key?(old.advisory_id_index, {scope, &1}))
+
+    if fresh? do
+      Enum.all?(appended_ids, fn {id, seq} ->
+        Map.fetch(next.advisory_id_index, {scope, id}) == {:ok, seq}
+      end)
+    else
+      expected = if is_nil(feed), do: %{}, else: build_advisory_id_index(%{scope => feed})
+
+      for(seq <- changed, entry <- [Map.get(before, seq), Map.get(entries, seq)], do: entry)
+      |> Enum.flat_map(&indexed_id/1)
+      |> Enum.all?(fn id ->
+        Map.fetch(next.advisory_id_index, {scope, id}) == Map.fetch(expected, {scope, id})
+      end)
+    end
+  end
+
+  defp feed_entries(%{entries: entries}) when is_map(entries), do: entries
+  defp feed_entries(_feed), do: %{}
+
+  defp indexed_id(%{"advisory_id" => advisory_id}), do: [advisory_id]
+  defp indexed_id(_entry), do: []
 
   defp pending_revisions(engine) do
     Enum.reduce(engine.bounce_revisions, %{}, fn {key, state}, acc ->
@@ -986,42 +1146,51 @@ defmodule AttentionServer.BounceDecision do
 
   defp valid_revision_states?(engine) do
     is_map(engine.bounce_revisions) and
-      Enum.all?(engine.bounce_revisions, fn {key = {person, sender, message_id}, state} ->
-        record = Map.get(engine.messages, key)
-
-        map_size_ok =
-          match?(%{revision: revision} when is_integer(revision) and revision > 0, record)
-
-        map_size_ok and Map.has_key?(engine.persons, person) and Message.sender_id?(sender) and
-          is_binary(message_id) and message_id != "" and is_map(state) and
-          Map.keys(state) |> Enum.sort() ==
-            [:current_substantive_revision, :raw_to_substantive, :revisions] and
-          is_integer(state.current_substantive_revision) and
-          state.current_substantive_revision > 0 and
-          state.current_substantive_revision <= map_size(state.revisions) and
-          is_map(state.raw_to_substantive) and is_map(state.revisions) and
-          map_size(state.raw_to_substantive) == record.revision and
-          Enum.all?(1..record.revision, fn raw_revision ->
-            sub_revision = Map.get(state.raw_to_substantive, raw_revision)
-            is_integer(sub_revision) and Map.has_key?(state.revisions, sub_revision)
-          end) and
-          Map.get(state.raw_to_substantive, record.revision) == state.current_substantive_revision and
-          Enum.all?(state.revisions, fn {sub_revision, revision} ->
-            is_integer(sub_revision) and sub_revision > 0 and is_map(revision) and
-              Map.keys(revision) |> Enum.sort() == [
-                :accepted_at_ms,
-                :qualified,
-                :raw_revision,
-                :selection
-              ] and
-              is_integer(revision.raw_revision) and revision.raw_revision > 0 and
-              Map.get(state.raw_to_substantive, revision.raw_revision) == sub_revision and
-              is_integer(revision.accepted_at_ms) and revision.accepted_at_ms >= 0 and
-              is_boolean(revision.qualified) and
-              valid_selection?(revision.selection, revision.accepted_at_ms)
-          end)
+      Enum.all?(engine.bounce_revisions, fn {key, state} ->
+        valid_revision_state?(engine, key, state)
       end)
   end
+
+  # One bounce_revisions row (#30): it reads its message's revision and its
+  # person.
+  @doc false
+  def valid_revision_state?(engine, {person, sender, message_id} = key, state) do
+    record = Map.get(engine.messages, key)
+
+    map_size_ok =
+      match?(%{revision: revision} when is_integer(revision) and revision > 0, record)
+
+    map_size_ok and Map.has_key?(engine.persons, person) and Message.sender_id?(sender) and
+      is_binary(message_id) and message_id != "" and is_map(state) and
+      Map.keys(state) |> Enum.sort() ==
+        [:current_substantive_revision, :raw_to_substantive, :revisions] and
+      is_integer(state.current_substantive_revision) and
+      state.current_substantive_revision > 0 and
+      state.current_substantive_revision <= map_size(state.revisions) and
+      is_map(state.raw_to_substantive) and is_map(state.revisions) and
+      map_size(state.raw_to_substantive) == record.revision and
+      Enum.all?(1..record.revision, fn raw_revision ->
+        sub_revision = Map.get(state.raw_to_substantive, raw_revision)
+        is_integer(sub_revision) and Map.has_key?(state.revisions, sub_revision)
+      end) and
+      Map.get(state.raw_to_substantive, record.revision) == state.current_substantive_revision and
+      Enum.all?(state.revisions, fn {sub_revision, revision} ->
+        is_integer(sub_revision) and sub_revision > 0 and is_map(revision) and
+          Map.keys(revision) |> Enum.sort() == [
+            :accepted_at_ms,
+            :qualified,
+            :raw_revision,
+            :selection
+          ] and
+          is_integer(revision.raw_revision) and revision.raw_revision > 0 and
+          Map.get(state.raw_to_substantive, revision.raw_revision) == sub_revision and
+          is_integer(revision.accepted_at_ms) and revision.accepted_at_ms >= 0 and
+          is_boolean(revision.qualified) and
+          valid_selection?(revision.selection, revision.accepted_at_ms)
+      end)
+  end
+
+  def valid_revision_state?(_engine, _key, _state), do: false
 
   defp valid_selection?(nil, _accepted_at), do: true
 
@@ -1102,28 +1271,29 @@ defmodule AttentionServer.BounceDecision do
 
   defp valid_opened_revisions?(engine) do
     is_struct(engine.opened_revisions, MapSet) and
-      Enum.all?(engine.opened_revisions, fn {person, sender, message_id, sub_revision} ->
-        key = {person, sender, message_id}
-
-        Map.has_key?(engine.messages, key) and Map.has_key?(engine.persons, person) and
-          Message.sender_id?(sender) and is_binary(message_id) and message_id != "" and
-          match?(
-            %{revisions: revisions} when is_map_key(revisions, sub_revision),
-            Map.get(engine.bounce_revisions, key)
-          )
-      end)
+      Enum.all?(engine.opened_revisions, &valid_opened_revision?(engine, &1))
   end
+
+  # One opened_revisions member (#31): its message, person and substantive
+  # revision exist.
+  @doc false
+  def valid_opened_revision?(engine, {person, sender, message_id, sub_revision}) do
+    key = {person, sender, message_id}
+
+    Map.has_key?(engine.messages, key) and Map.has_key?(engine.persons, person) and
+      Message.sender_id?(sender) and is_binary(message_id) and message_id != "" and
+      match?(
+        %{revisions: revisions} when is_map_key(revisions, sub_revision),
+        Map.get(engine.bounce_revisions, key)
+      )
+  end
+
+  def valid_opened_revision?(_engine, _member), do: false
 
   defp valid_advisory_feeds?(engine) do
     is_map(engine.advisory_feeds) and
       Enum.all?(engine.advisory_feeds, fn {{person, origin, handle} = feed_key, feed} ->
-        origin_session = Map.get(engine.origin_sessions, feed_key)
-
-        is_map(origin_session) and Map.get(engine.devices, origin) != nil and
-          Map.get(engine.devices[origin], :person) == person and Message.uuid_v4?(handle) and
-          is_map(feed) and Map.keys(feed) |> Enum.sort() == [:entries, :high, :receipts] and
-          is_integer(feed.high) and feed.high >= 0 and is_map(feed.entries) and
-          map_size(feed.entries) == feed.high and is_struct(feed.receipts, MapSet) and
+        valid_advisory_header?(engine, feed_key, feed) and
           Enum.all?(sequence_range(feed.high), fn sequence ->
             case Map.get(feed.entries, sequence) do
               nil -> false
@@ -1135,6 +1305,70 @@ defmodule AttentionServer.BounceDecision do
               Enum.any?(feed.entries, fn {_seq, entry} -> entry["advisory_id"] == advisory_id end)
           end)
       end)
+  end
+
+  # One advisory feed fact (#32). The feed header reads its origin session
+  # and origin device; an entry reads its message's origin and session, its
+  # bounce selection and the origin feed high; a receipt needs an entry with
+  # its id, found through the advisory id index, whose touched entries
+  # valid_advisory_index_change?/3 checks. An absent feed or entry is valid
+  # here; the header checks the entry count.
+  @doc false
+  def valid_advisory_fact?(engine, {person, origin, handle} = feed_key, part) do
+    case Map.fetch(engine.advisory_feeds, feed_key) do
+      :error ->
+        true
+
+      {:ok, feed} ->
+        case part do
+          :high ->
+            valid_advisory_header?(engine, feed_key, feed)
+
+          {:entry, sequence} ->
+            case Map.fetch(feed.entries, sequence) do
+              :error ->
+                true
+
+              {:ok, entry} ->
+                sequence <= feed.high and
+                  valid_advisory_entry?(engine, person, origin, handle, sequence, entry)
+            end
+
+          {:receipt, advisory_id} ->
+            not MapSet.member?(feed.receipts, advisory_id) or
+              (Message.uuid_v4?(advisory_id) and
+                 case Map.fetch(engine.advisory_id_index, {feed_key, advisory_id}) do
+                   {:ok, sequence} -> feed.entries[sequence]["advisory_id"] == advisory_id
+                   :error -> false
+                 end)
+        end
+    end
+  end
+
+  def valid_advisory_fact?(_engine, _feed_key, _part), do: false
+
+  # The advisory entries of a message in a feed, by sequence.
+  @doc false
+  def advisory_sequences(engine, feed_key, {_person, sender, message_id}) do
+    case Map.get(engine.advisory_feeds, feed_key) do
+      %{entries: entries} when is_map(entries) ->
+        for {sequence, entry} <- entries,
+            is_map(entry) and entry["sender_id"] == sender and entry["message_id"] == message_id,
+            do: sequence
+
+      _ ->
+        []
+    end
+  end
+
+  defp valid_advisory_header?(engine, {person, origin, handle} = feed_key, feed) do
+    origin_session = Map.get(engine.origin_sessions, feed_key)
+
+    is_map(origin_session) and Map.get(engine.devices, origin) != nil and
+      Map.get(engine.devices[origin], :person) == person and Message.uuid_v4?(handle) and
+      is_map(feed) and Map.keys(feed) |> Enum.sort() == [:entries, :high, :receipts] and
+      is_integer(feed.high) and feed.high >= 0 and is_map(feed.entries) and
+      map_size(feed.entries) == feed.high and is_struct(feed.receipts, MapSet)
   end
 
   defp valid_advisory_entry?(engine, person, origin, handle, sequence, entry) do
