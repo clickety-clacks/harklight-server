@@ -1022,6 +1022,49 @@ defmodule AttentionServer.ChangeLogTest do
     Map.put(tables, :store_version, version)
   end
 
+  # The #254 reset: a log written under an older rank projection is reset
+  # once on open. A person with data and no log row of their own reads at the
+  # epoch, so the epoch must advance too, or a cursor shown before the reset
+  # would still be accepted against the new projection.
+  test "a log from an older rank projection resets once and expires cursors shown before it",
+       ctx do
+    pre_log(ctx, fn store ->
+      store
+      |> pre_log_people()
+      |> pre_log_forward("one", 2)
+      |> pre_log_forward("two", 3)
+    end)
+
+    relay = start(ctx)
+    assert head(relay) == 1
+    assert {:ok, [], false, 1} = log(relay, 1)
+    GenServer.stop(relay)
+
+    assert first = log_tables(ctx.path)
+    assert first["client_change_log_epoch"] == []
+    assert [[1, _version, _projection]] = first["client_change_log_state"]
+
+    {:ok, db} = Sqlite3.open(ctx.path)
+    :ok = Sqlite3.execute(db, "UPDATE client_change_log_state SET rank_projection_version = 0")
+    Sqlite3.close(db)
+
+    relay = start(ctx)
+    assert {:error, :cursor_expired} = log(relay, 1)
+    assert head(relay) == 2
+    assert {:ok, [], false, 2} = log(relay, 2)
+    GenServer.stop(relay)
+
+    reset = log_tables(ctx.path)
+    assert [[1, 2]] = reset["client_change_log_epoch"]
+
+    # Stable afterwards: the projection is current, so nothing resets again.
+    relay = start(ctx)
+    assert head(relay) == 2
+    assert {:ok, [], false, 2} = log(relay, 2)
+    GenServer.stop(relay)
+    assert log_tables(ctx.path)["client_change_log_epoch"] == reset["client_change_log_epoch"]
+  end
+
   # A store from 0.1.x (v0.1.49, then slice 3 builds) never had the change log
   # on, and holds the 0.1 paging state: an accepted startup checkpoint, a
   # startup left building, and device and conversation cursors. The first 0.2.0
