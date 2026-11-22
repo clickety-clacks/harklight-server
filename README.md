@@ -13,15 +13,15 @@ through Harklight.
 
 ## Install the server
 
-For the FORMAT29 v0.1.49 server package, use the release page below after
+For the FORMAT29 v0.2.0 server package, use the release page below after
 publication to download the Linux x86_64 archive, `SHA256SUMS` and
 `SELF_HOST.md`. Verify the checksum before extraction:
 
-[v0.1.49 release](https://github.com/clickety-clacks/harklight-server/releases/tag/v0.1.49)
+[v0.2.0 release](https://github.com/clickety-clacks/harklight-server/releases/tag/v0.2.0)
 
 ```sh
 sha256sum -c SHA256SUMS
-tar -xzf harklight-server-0.1.49-linux-x86_64.tar.gz
+tar -xzf harklight-server-0.2.0-linux-x86_64.tar.gz
 ```
 
 Follow [SELF_HOST.md](SELF_HOST.md) for a fresh installation, tailnet routing,
@@ -29,37 +29,35 @@ owner approval, start/stop and state-preserving upgrades. The package bundles
 Erlang/OTP; the server box needs no Mix, Hex or source checkout. Its supported
 target is Linux x86_64 with glibc 2.39 or newer and the libraries in `BUILD_INFO`.
 The package does not install a service, configure the tailnet or expose ports.
+Release publication does not install the server; installation is a separate
+manual action.
+
+v0.2.0 speaks protocol 0.2 only: the app, the packaged web client, Harklight
+Agent 0.2.0 and the packaged tools use client API v2 (`/v2`) on the device
+port. Protocol 0.1 apps, agents and headless tools cannot connect, so move a
+deployment to 0.2.0 only after its agents and clients are on their 0.2
+versions. See [RELEASE_NOTES.md](RELEASE_NOTES.md) for what changes for owners
+and what to do before switching.
 
 State, owner/device identities, trust roots and sender grants live outside the
 versioned package. Run one server per database. Keep private keys and backups
-private; do not repeat bootstrap over an existing installation.
-This source, v0.1.49, writes FORMAT29. From supported FORMAT27 state, including
-state written by the published v0.1.35 through v0.1.42 maintenance packages
-(for example v0.1.38), startup applies the FORMAT28
-device-focus defaults and FORMAT29 hosted-delivery-state initialization in
-order, preserving existing values and filling only missing values. The final
-migrated store is FORMAT29; the source does not establish a separately persisted
-intermediate FORMAT28 state. FORMAT29 large message data is stored in private
-files with durable database references. An older compatible FORMAT29 release
-that does not understand those references displays an explicit newer-server
-marker for that content, continues to serve other data, and preserves the
-referenced files; upgrading again restores full reads.
-Every registered, non-revoked agent can read all messages on the account it
-is registered to, regardless of sender. Sender filters select search results
-only; they do not limit access. Existing respond-grant values and response
-checks are unchanged. New registrations need no per-sender read grant for
-reads; answering still requires both a matching read grant and a matching
-respond grant. The published FORMAT27 packages, including v0.1.38 and v0.1.42,
-cannot read resulting FORMAT29 state. From FORMAT29 state written by v0.1.43,
-v0.1.44, v0.1.45 or v0.1.48, v0.1.49 runs no migration. Do not install v0.1.43:
-revising a message whose body is stored as large message data stops its relay process;
-v0.1.44 and later fix
-this. Changing only the selected code or
-release link is not a safe downgrade. Earlier v0.1.28 writes FORMAT25, while
-v0.1.27 and v0.1.26 write
-FORMAT24; see `SELF_HOST.md` for earlier package-format details.
+private; do not repeat bootstrap over an existing installation. This source,
+v0.2.0, writes FORMAT29, like the published v0.1.43, v0.1.44, v0.1.45, v0.1.48
+and v0.1.49 releases. From FORMAT29 state written by v0.1.49 or another of
+those releases, v0.2.0 runs no store migration. From supported FORMAT27 state,
+including state written by the published v0.1.35 through v0.1.42 maintenance
+packages (for example v0.1.38), startup applies the FORMAT28 device-focus
+defaults and FORMAT29 hosted-delivery-state initialization in order, preserving
+existing values and filling only missing values. FORMAT29 large message data is
+stored in private files with durable database references. Messages, accounts,
+grants, enrolled devices and registered agents carry over; a device enrolled on
+0.1 keeps its certificate. Unused invitations created before the upgrade are
+not redeemed and must be issued again. Every registered, non-revoked agent can
+read all messages on the account it is registered to, regardless of sender.
+Sender filters select search results only; they do not limit access. Answering
+still requires both a matching read grant and a matching respond grant.
 
-Before the first v0.1.49 start, stop the server and retain a complete private
+Before the first v0.2.0 start, stop the server and retain a complete private
 state backup. The release installer also takes one full private-root backup
 while the service is stopped and before switching releases. It attempts to
 restore this snapshot if the candidate start or process-readiness check fails.
@@ -69,12 +67,13 @@ and leave the service stopped. A successful isolated rehearsal is evidence for
 the tested archive and sequence, not a guarantee of recovery in every
 installation.
 
-After any v0.1.49 write, returning to a published FORMAT27 release such as
-v0.1.38 or v0.1.42 requires stopping the server, restoring the pre-start
-FORMAT27 backup and selecting that release; changing only the code or release link cannot make FORMAT29
-readable. This restore loses every write made since the backup and cannot undo
-external notifications, bounces or agent deliveries. Do not assume recovery
-success or a recovery time.
+After any v0.2.0 write, returning to v0.1.49 or another 0.1.x release requires
+stopping the server, restoring the pre-start backup and selecting that
+release, with its clients back on 0.1. The shared FORMAT29 number does not
+establish that 0.1.x can read state v0.2.0 has written; changing only the code
+or release link is not a safe downgrade. This restore loses every write made
+since the backup and cannot undo external notifications, bounces or agent
+deliveries. Do not assume recovery success or a recovery time.
 
 The first answer settles a request, and a second answer is refused. Chat on the
 request stays open after any outcome (answered, No comment, cleared, expired,
@@ -82,33 +81,11 @@ withdrawn or superseded): the person can keep writing and the agent can keep
 replying, more than once to the same chat message. A chat message to an agent
 that is not listening is accepted and delivered when the agent next listens.
 
-v0.1.32 adds a side-effect-free origin-message read by sender ID and message ID.
-The matching `harklight-agent message-get` interface shipped in Agent 0.1.9.
-That Agent release was published on 2026-11-11. The command reads the latest
-committed revision by default or a specific retained revision with
-`--revision N`. The read does not mark Seen; an unavailable requested revision
-returns `revision_unavailable`.
-
 Configurable score-based priority levels and unseen-message advisories first
 shipped in v0.1.30. When a request reaches its configured unseen interval, the
 server adds an advisory to the originating agent session asking whether the
 request is still valid and worth resending and whether its importance should be
 raised. It does not automatically resend the request or change its priority.
-
-Stable v0.1.31 was published on 2026-11-11 before v0.1.32. It includes the
-device-revocation origin-session gone behavior, durable device-level access reads
-and updates with connection-local sync hints and durable operation receipts,
-bounded Relay timeout outcomes recorded outside the request path, and omission
-of cached APNs tokens from push-dispatcher crash/status output. Configurable
-priority levels, unseen-message advisories, closed-chat behavior and Bandit
-1.14.0 were already present in v0.1.30. Release publication does not install the
-server; installation is a separate manual action.
-
-Version 0.1.25 and later persist delivery acknowledgements (ACK1 and ACK2).
-No safe code-only downgrade to 0.1.24 or earlier has been established once
-0.1.25 or later writes new data. Agree on recovery before cutover and retain the
-complete private pre-upgrade backup; restoring it discards all writes since
-capture.
 
 The archive does not contain the `harklight-agent` conversation CLI; install
 it separately as described under [Get the agent CLI](#get-the-agent-cli).
@@ -141,21 +118,22 @@ at a hosted service's address.
 
 The `harklight-agent` command-line client sends requests and listens for
 request-bound replies. It is released separately from the server at
-<https://github.com/clickety-clacks/harklight-agent>; the latest published
-release as of 2026-11-13 is v0.1.11. Install it with Homebrew on macOS or Linux:
+<https://github.com/clickety-clacks/harklight-agent>. Server 0.2.0 requires
+Harklight Agent 0.2.0, which is published with it; 0.1 Agent releases cannot
+connect. Install it with Homebrew on macOS or Linux:
 
 ```sh
 brew install clickety-clacks/tap/harklight-agent
 ```
 
 Or download the tarball for your platform and `SHA256SUMS` from the
-[release page](https://github.com/clickety-clacks/harklight-agent/releases/tag/v0.1.11),
+[release page](https://github.com/clickety-clacks/harklight-agent/releases/tag/v0.2.0),
 verify the checksum and put the binary on your `PATH`. Targets are
 `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-gnu` and
 `aarch64-unknown-linux-gnu`:
 
 ```sh
-v=0.1.11 t=x86_64-unknown-linux-gnu
+v=0.2.0 t=x86_64-unknown-linux-gnu
 base="https://github.com/clickety-clacks/harklight-agent/releases/download/v$v"
 curl -fLO "$base/harklight-agent-$v-$t.tar.gz"
 curl -fLO "$base/SHA256SUMS"
@@ -164,9 +142,12 @@ tar -xzf "harklight-agent-$v-$t.tar.gz"
 install -m 755 "harklight-agent-$v-$t/harklight-agent" ~/.local/bin/
 ```
 
-`harklight-agent --version` prints `harklight-agent 0.1.11`. The
+`harklight-agent --version` prints `harklight-agent 0.2.0`. The
 [shared conversation core](skills/core.md) describes
-its commands and message format.
+its commands and message format. Before switching an existing agent, finish
+or abandon its unresolved 0.1 operations with the 0.1 CLI; Agent 0.2.0 does
+not use 0.1 cursors, and pending enrollments survive. An existing identity
+takes the device port from `--device-port` or `HARKLIGHT_DEVICE_PORT`.
 
 Agents send new messages through the authenticated
 [`harklight-agent` session route](skills/core.md). Keep the originating session,
@@ -178,9 +159,8 @@ stored by the server; they do not create new messages or retrieve an origin
 receipt. Registered agent identities have separately granted
 search/get/respond access.
 
-Agent inbox search lists unresolved requests before resolved history, newest
-original server acceptance first within each group. Search pagination preserves
-its initial ordering snapshot; relay replay and contiguous ACK stay chronological.
+Agent search lists messages newest original acceptance first. Pass back its
+`next_page` with the same filters for the next page.
 The existing informational Seen value action and request Reply controls pass
 through unchanged. Receiving-client ordering, styling and controls depend on
 the installed client; upgrading the server alone does not establish those UI changes.
@@ -190,18 +170,16 @@ package.
 
 ## No comment and client compatibility
 
-This release includes the payload-free No comment terminal outcome. The app must
-send the displayed `request_revision` with `answer_no_comment`; ordinary requests
-use revision `1`. Missing or stale revisions are refused without answering the
-request. Installed app build11 sends the older two-field frame and cannot use
-No comment until a client update supplies the revision. Upgrading this server
-does not update the app. Ordinary choice and typed replies retain their existing
-protocol. See [SELF_HOST.md](SELF_HOST.md) for the compatibility evidence limits.
+No comment is an answer with none of `choice`, `comment` or `result`, sent
+with the displayed `request_revision`. A stale revision is refused without
+answering the request. Clients use client API v2; protocol 0.1 app builds
+cannot connect to this server, and upgrading the server does not update the
+app.
 
 ## Device joining and notifications
 
 The optional HTTPS owner dashboard creates person-bound one-use invitations,
-reviews the current code/key/deadline and approves devices without sender rights.
+reviews the current code and key and approves devices without sender rights.
 The app keeps its own private key. A pending approval does not expire, and
 starting again with the same key returns the same waiting request and code;
 denial, cancellation and revocation remain terminal. See
