@@ -111,6 +111,40 @@ defmodule AttentionServer.PreChangeLogStore do
     store
   end
 
+  @doc """
+  Records an origin's protocol 0.1 `support` declaration for its session
+  handle, as a 0.1 origin did. Client API v2 never writes one; a stored
+  record still decodes, and its `"ack2"` member sets `ack2_expected` on ACK1.
+  """
+  def origin_support(store, key, declaration) do
+    {:ok, engine, _reply} = Engine.origin_support(store.engine, key, declaration)
+
+    commit(store, {:ok, engine}, %{
+      person: person(store, key),
+      actor: key,
+      action: "origin_support"
+    })
+  end
+
+  @doc """
+  Records a protocol 0.1 origin `ack` (the legacy delivered receipt) for a
+  feed entry, as a 0.1 origin did. The stored receipt still marks the
+  entry delivered in v2 reads.
+  """
+  def origin_ack(store, key, feed_seq) do
+    {:ok, engine, _reply} = Engine.origin_ack(store.engine, key, feed_seq)
+    commit(store, {:ok, engine}, %{person: person(store, key), actor: key, action: "origin_ack"})
+  end
+
+  @doc """
+  Runs `fun` on a running Relay's store, inside the Relay, for seeding a
+  protocol 0.1 fact into a store a test is still serving. `fun` returns the
+  next store. Relay-side caches are not refreshed, so seed only facts that
+  no cache derives from.
+  """
+  def in_relay(relay, fun),
+    do: :sys.replace_state(relay, fn state -> %{state | store: fun.(state.store)} end)
+
   defp paging_snapshot(store, key, startup_id) do
     {:ok, items, receipts, operation_ids, high} = Engine.inbox_snapshot(store.engine, key, 0, [])
 

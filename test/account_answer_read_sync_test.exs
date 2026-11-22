@@ -80,10 +80,11 @@ defmodule AttentionServer.AccountAnswerReadSyncTest do
                "text" => "A question"
              })
 
-    assert {:ok, %{"entries" => entries}} = Relay.origin_feed(relay, "origin", 0)
+    entries = Map.values(:sys.get_state(relay).store.engine.origin_feeds[{"A", "origin"}].entries)
 
     discussion =
       entries
+      |> Enum.sort_by(& &1["feed_seq"])
       |> Enum.filter(&(&1["kind"] == "discussion" and &1["message_id"] == id))
       |> List.last()
 

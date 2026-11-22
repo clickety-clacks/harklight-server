@@ -1,7 +1,8 @@
 defmodule AttentionServer.ChatAfterTerminalTest do
   use ExUnit.Case, async: false
 
-  alias AttentionServer.{JSON, Relay}
+  alias AttentionServer.{AgentAPIInProcess, JSON, Relay}
+  alias AttentionServer.AgentAPI.FeedActivity
 
   @handle "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 
@@ -67,12 +68,21 @@ defmodule AttentionServer.ChatAfterTerminalTest do
     })
   end
 
+  defp item(relay, id), do: AgentAPIInProcess.item_id(relay, "A", "app:test", id)
+
+  # The origin's v2 view of the request's outcome.
   defp terminal_state(relay, id) do
-    {:ok, %{"entries" => entries}} = Relay.origin_feed(relay, "origin", 0)
+    assert {:ok, %{"message" => message}} =
+             AgentAPIInProcess.message(relay, "A", "origin", item(relay, id))
+
+    get_in(message, ["terminal", "state"])
+  end
+
+  defp origin_entries(relay, id) do
+    assert {:ok, %{"entries" => entries}} =
+             AgentAPIInProcess.entries(relay, "A", "origin", item(relay, id))
 
     entries
-    |> Enum.filter(&(&1["kind"] == "terminal" and &1["message_id"] == id))
-    |> Enum.map(& &1["terminal_state"])
   end
 
   test "chat stays open both ways after answered, cleared, expired, retracted and superseded", %{
@@ -139,7 +149,7 @@ defmodule AttentionServer.ChatAfterTerminalTest do
 
     for {id, n} <- [{"answered", 110}, {"cleared", 120}, {"retracted", 130}, {"old", 140}, {"expired", 160}] do
       before = terminal_state(relay, id)
-      assert before != []
+      assert is_binary(before)
 
       assert %{"type" => "ok", "event_id" => event} = discussion(relay, id, n, "After the end")
       assert %{"type" => "ok"} = reply(relay, id, n + 1, String.to_integer(event), "Still here")
@@ -177,10 +187,9 @@ defmodule AttentionServer.ChatAfterTerminalTest do
     assert %{"type" => "error", "reason" => "operation_conflict"} =
              reply(relay, "m", 13, to, "Different text")
 
-    assert {:ok, %{"entries" => entries}} = Relay.origin_feed(relay, "origin", 0)
-
-    assert entries
-           |> Enum.filter(&(&1["kind"] == "reply"))
+    assert relay
+           |> origin_entries("m")
+           |> Enum.filter(&(&1["kind"] == "reply" and &1["author"] != "person"))
            |> Enum.map(& &1["text"]) == ["One", "Two", "Three"]
 
     # The person event is recorded as acted on once.
@@ -191,42 +200,15 @@ defmodule AttentionServer.ChatAfterTerminalTest do
   test "chat to a sender that is not listening is accepted and held", %{relay: relay} do
     send_request(relay, "m", 10)
 
-    assert {:ok, %{"availability" => availability}} = Relay.origin_status(relay, "origin", @handle)
-    assert availability in ["not_listening", "unsupported"]
+    refute FeedActivity.listening?(:sys.get_state(relay), {"A", "origin", @handle})
 
-    assert %{"type" => "ok", "event_id" => event_id} = discussion(relay, "m", 11, "Anyone there?")
+    assert %{"type" => "ok"} = discussion(relay, "m", 11, "Anyone there?")
 
-    assert {:ok, %{"entries" => entries}} = Relay.origin_feed(relay, "origin", 0)
-    held = Enum.find(entries, &(&1["event_id"] == event_id))
-    assert held["kind"] == "discussion"
-    assert held["delivered"] == false
-  end
+    assert [held] =
+             relay |> origin_entries("m") |> Enum.filter(&(&1["author"] == "person"))
 
-  test "a request the sender closed with nothing waiting no longer counts as an open chat", %{
-    relay: relay
-  } do
-    send_request(relay, "settled", 300)
-
-    assert {:ok, %{"open_requests" => 1, "open_chats" => 1}} =
-             Relay.origin_status(relay, "origin", @handle)
-
-    assert %{"type" => "ok"} =
-             request(relay, "origin", %{
-               "type" => "lifecycle",
-               "op_id" => op(301),
-               "sender_id" => "app:test",
-               "message_id" => "settled",
-               "state" => "cleared",
-               "at" => 5
-             })
-
-    assert {:ok, %{"open_requests" => 0, "open_chats" => 0}} =
-             Relay.origin_status(relay, "origin", @handle)
-
-    # A person chat turn the agent has not acted on keeps the chat open.
-    assert %{"type" => "ok"} = discussion(relay, "settled", 302, "One more thing")
-
-    assert {:ok, %{"open_requests" => 0, "open_chats" => 1}} =
-             Relay.origin_status(relay, "origin", @handle)
+    assert held["kind"] == "reply"
+    assert held["text"] == "Anyone there?"
+    assert held["delivery"]["delivered"] == false
   end
 end

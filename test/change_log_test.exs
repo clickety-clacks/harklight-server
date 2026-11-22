@@ -1,7 +1,7 @@
 defmodule AttentionServer.ChangeLogTest do
   use ExUnit.Case, async: false
 
-  alias AttentionServer.{ChangeLog, Engine, JSON, PreChangeLogStore, Relay}
+  alias AttentionServer.{AgentAPIInProcess, ChangeLog, Engine, JSON, PreChangeLogStore, Relay}
   alias AttentionServer.ClientAPI.{Context, FeedStep, Principal, Reads}
   alias Exqlite.Sqlite3
 
@@ -9,6 +9,15 @@ defmodule AttentionServer.ChangeLogTest do
   @seed_bytes :binary.copy(<<0, 1, 254, 255>>, 300)
   # A file inline in a frame, as a protocol 0.1 client sent it.
   @seed_file %{"name" => "seed.bin", "data_base64" => Base.encode64(@seed_bytes)}
+  @seed_support %{
+    "type" => "support",
+    "op_id" => "00000000-0000-4000-8000-000000000007",
+    "session_handle" => @handle,
+    "route" => "claude-code",
+    "cli_version" => "0.1.0",
+    "unsupported_reason" => nil,
+    "ack2" => true
+  }
 
   setup do
     dir = Path.join(System.tmp_dir!(), "change-log-#{System.unique_integer([:positive])}")
@@ -1100,6 +1109,7 @@ defmodule AttentionServer.ChangeLogTest do
         "message_id" => "three",
         "answer" => "Done"
       })
+      |> PreChangeLogStore.origin_support("origin", @seed_support)
       |> PreChangeLogStore.paging_checkpoint("reader", "reader-startup")
       |> PreChangeLogStore.open_conversation("reader")
       |> PreChangeLogStore.acknowledge_conversation("reader", 1)
@@ -1130,6 +1140,15 @@ defmodule AttentionServer.ChangeLogTest do
 
     assert download(relay, file_id) == @seed_bytes
 
+    # The 0.1 origin support record decodes as it was written, and the origin's
+    # v2 read of its message serves the session without writing.
+    support = engine.origin_sessions[{"A", "origin", @handle}].support
+    assert support["route"] == "claude-code" and support["ack2"] == true
+    one = Enum.find(items, &(&1["message"]["message_id"] == "one"))["item_id"]
+
+    assert {:ok, %{"message" => %{"session" => @handle}}} =
+             AgentAPIInProcess.message(relay, "A", "origin", one)
+
     assert {:ok, stored, false} =
              paused(relay, fn -> ChangeLog.rank_page(store(relay), "A", nil, 100) end)
 
@@ -1157,6 +1176,7 @@ defmodule AttentionServer.ChangeLogTest do
     assert {:ok, [], false, ^cursor} = log(relay, cursor)
     assert {:ok, %{"rev" => ^cursor, "items" => ^items}} = Reads.inbox(relay, "reader")
     assert download(relay, file_id) == @seed_bytes
+    assert store(relay).engine.origin_sessions[{"A", "origin", @handle}].support == support
     GenServer.stop(relay)
 
     assert log_tables(ctx.path) == first

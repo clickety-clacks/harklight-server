@@ -9,6 +9,8 @@ defmodule AttentionServer.DashboardBackendTest do
   }
 
   alias AttentionServer.{DeviceIdentity, JSON, Relay, TLSFixtures}
+  alias AttentionServer.AgentAPI.Focus
+  alias AttentionServer.ClientAPI.{AgentShow, Context}
 
   @default_levels [
     %{"name" => "Low", "lower_bound" => 0, "bounce_after_days" => 7},
@@ -159,14 +161,9 @@ defmodule AttentionServer.DashboardBackendTest do
     assert %{see_focus: true, push_view: false} =
              :sys.get_state(relay).store.engine.devices[device_key]
 
-    assert {:ok, %{"clients" => []}} = Relay.focus_get(relay, device_key)
-
-    assert {:error, :forbidden} =
-             Relay.view_show(relay, device_key, %{
-               "sender_id" => "app:test",
-               "message_id" => "missing",
-               "target" => "message"
-             })
+    agent = %{kind: :device, person: person, key: device_key}
+    assert {:ok, %{"clients" => []}} = Focus.get(relay, agent)
+    assert {403, %{"error" => "forbidden"}} = show(relay, agent, "i999")
 
     push_on = owner_post("/devices/focus/#{device_key}/push", "enabled=on", cookie)
     assert DashboardReadHTTP.call(push_on, opts).status == 303
@@ -187,14 +184,8 @@ defmodule AttentionServer.DashboardBackendTest do
     assert %{see_focus: false, push_view: true} =
              :sys.get_state(restarted).store.engine.devices[device_key]
 
-    assert {:error, :forbidden} = Relay.focus_get(restarted, device_key)
-
-    assert {:error, {:not_found, "message_id"}} =
-             Relay.view_show(restarted, device_key, %{
-               "sender_id" => "app:test",
-               "message_id" => "missing",
-               "target" => "message"
-             })
+    assert {:error, :forbidden} = Focus.get(restarted, agent)
+    assert {404, %{"error" => "not_found"}} = show(restarted, agent, "i999")
   end
 
   @tag :tmp_dir
@@ -688,6 +679,23 @@ defmodule AttentionServer.DashboardBackendTest do
              {person, no_sender_key},
              MapSet.new()
            ) == MapSet.new()
+  end
+
+  # POST /v2/agent/show, run in-process for a trusted agent key.
+  defp show(relay, agent, item) do
+    conn =
+      Plug.Test.conn(
+        :post,
+        "/v2/agent/show",
+        JSON.encode!(%{"item_id" => item, "target" => "message"})
+      )
+      |> Plug.Conn.put_req_header("idempotency-key", "00000000-0000-4000-8000-000000000193")
+
+    conn =
+      AgentShow.show(conn, %Context{principal: agent, relay: relay, request_id: "dashboard-show"})
+
+    assert {:ok, body} = JSON.decode_line(conn.resp_body <> "\n")
+    {conn.status, body}
   end
 
   defp request(cookie) do

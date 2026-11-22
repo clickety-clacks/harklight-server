@@ -87,7 +87,7 @@ defmodule AttentionServer.ClientAPIFeedConvergenceTest do
           "text" => "Answer"
         })
 
-        {:ok, _} = Relay.origin_ack(relay, "origin", seq)
+        {:ok, _} = receipt(relay, seq, op(20))
       end,
       fn -> forward(relay, "four", 5, %{"thread" => "plan"}) end,
       fn ->
@@ -141,7 +141,7 @@ defmodule AttentionServer.ClientAPIFeedConvergenceTest do
         %{"feed_seq" => terminal} =
           relay |> feed_entries("terminal") |> Enum.find(&(&1["message_id"] == "two"))
 
-        {:ok, _} = Relay.origin_ack(relay, "origin", terminal)
+        {:ok, _} = receipt(relay, terminal, op(21))
 
         request(relay, "origin", %{
           "type" => "conversation_result",
@@ -182,6 +182,14 @@ defmodule AttentionServer.ClientAPIFeedConvergenceTest do
       end
     ]
   end
+
+  # The agent's receipt for a person turn or answer (POST .../receipt in v2).
+  defp receipt(relay, feed_seq, op_id),
+    do:
+      GenServer.call(
+        relay,
+        {:origin_ack2, "origin", feed_seq, %{"op_id" => op_id, "outcome" => "handed"}}
+      )
 
   defp feed_entries(relay, kind) do
     :sys.get_state(relay).store.engine.origin_feeds[{"A", "origin"}].entries

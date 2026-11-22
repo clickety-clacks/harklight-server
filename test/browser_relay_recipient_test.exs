@@ -1,10 +1,9 @@
 defmodule AttentionServer.BrowserRelayRecipientTest do
   use ExUnit.Case, async: false
 
-  alias AttentionServer.{DeviceIdentity, JSON, LegacyOriginWire, Relay, TLSFixtures}
+  alias AttentionServer.{BrowserRecipient, DeviceIdentity, JSON, Relay, TLSFixtures}
+  alias AttentionServer.ClientAPI.{Reads, Writes}
 
-  @recipient_one "00000000-0000-4000-8000-000000000001"
-  @recipient_two "00000000-0000-4000-8000-000000000002"
   @browser_session String.duplicate("s", 43)
 
   defp op(n),
@@ -15,7 +14,8 @@ defmodule AttentionServer.BrowserRelayRecipientTest do
   setup %{tmp_dir: dir} do
     certs = TLSFixtures.create!()
     owner_cert = TLSFixtures.certificate_der!(certs, "a1")
-    {:ok, relay} = Relay.start_link(store_path: Path.join(dir, "state.sqlite3"))
+    path = Path.join(dir, "state.sqlite3")
+    {:ok, relay} = Relay.start_link(store_path: path)
     {:ok, person} = Relay.operator_bootstrap(relay, owner_cert)
     {:ok, owner_key} = DeviceIdentity.from_certificate(owner_cert)
 
@@ -24,143 +24,36 @@ defmodule AttentionServer.BrowserRelayRecipientTest do
       File.rm_rf!(certs)
     end)
 
-    %{relay: relay, person: person, owner_key: owner_key}
+    %{relay: relay, path: path, person: person, owner_key: owner_key}
   end
 
-  test "each tab has its own recipient and replacement closes only the old connection", c do
-    assert {:ok, first} =
-             Relay.open_browser_recipient(
-               c.relay,
-               c.person,
-               c.owner_key,
-               1,
-               @browser_session,
-               @recipient_one,
-               self()
-             )
+  # The principal that the web origin's sign-in cookie resolves to
+  # (`ClientAPI.Auth.browser/2`) for a browser session.
+  defp browser(c, relay) do
+    assert {:ok, revision} = Relay.owner_revision(relay, c.person, c.owner_key)
 
-    assert {:ok, other_tab} =
-             Relay.open_browser_recipient(
-               c.relay,
-               c.person,
-               c.owner_key,
-               1,
-               @browser_session,
-               @recipient_two,
-               self()
-             )
-
-    assert {:ok, replacement} =
-             Relay.open_browser_recipient(
-               c.relay,
-               c.person,
-               c.owner_key,
-               1,
-               @browser_session,
-               @recipient_one,
-               self()
-             )
-
-    assert_receive {:browser_connection_replaced, ^first}
-    state = :sys.get_state(c.relay)
-    refute Map.has_key?(state.sessions, first)
-    assert Map.has_key?(state.sessions, other_tab)
-    assert Map.has_key?(state.sessions, replacement)
-    refute Map.has_key?(state.store.engine.devices, state.sessions[replacement].key)
-    assert map_size(state.focus_clients) == 0
-    assert map_size(state.browser_recipients) == 2
+    %{
+      kind: :browser,
+      person: c.person,
+      key: c.owner_key,
+      session_id: @browser_session,
+      owner_revision: revision
+    }
   end
 
-  test "browser frame allowlist serves view_get and refuses device-only frame types", c do
-    assert {:ok, session} =
-             Relay.open_browser_recipient(
-               c.relay,
-               c.person,
-               c.owner_key,
-               1,
-               @browser_session,
-               @recipient_one,
-               self()
-             )
+  # The browser recipient a client API v2 write from `session` acts as: one
+  # fixed recipient per session, derived from the session id.
+  defp browser_actor(person, session) do
+    <<a::48, _::4, b::12, _::2, c::62, _::binary>> =
+      :crypto.hash(:sha256, "client_api_v2:" <> session)
 
-    assert {:ok, [view_line]} =
-             Relay.session_request_line(
-               c.relay,
-               session,
-               JSON.encode!(%{"v" => 1, "type" => "view_get", "ref" => "browser-view"}) <>
-                 "\n"
-             )
+    <<p1::binary-8, p2::binary-4, p3::binary-4, p4::binary-4, p5::binary-12>> =
+      Base.encode16(<<a::48, 4::4, b::12, 2::2, c::62>>, case: :lower)
 
-    assert {:ok, %{"type" => "ok", "ref" => "browser-view", "list_items" => items}} =
-             JSON.decode_line(view_line)
-
-    assert is_list(items)
-
-    assert {:ok, [push_line]} =
-             Relay.session_request_line(
-               c.relay,
-               session,
-               JSON.encode!(%{"v" => 1, "type" => "push_register"}) <> "\n"
-             )
-
-    assert {:ok, %{"type" => "error", "reason" => "unknown_type"}} =
-             JSON.decode_line(push_line)
-
-    assert map_size(:sys.get_state(c.relay).store.engine.devices) == 0
+    BrowserRecipient.key(person, session, Enum.join([p1, p2, p3, p4, p5], "-"))
   end
 
-  test "browser file commands reuse the recipient's file scope", c do
-    assert {:ok, _session} =
-             Relay.open_browser_recipient(
-               c.relay,
-               c.person,
-               c.owner_key,
-               1,
-               @browser_session,
-               @recipient_one,
-               self()
-             )
-
-    assert {:ok,
-            %{
-              "type" => "ok",
-              "ref" => "limits",
-              "inline_decoded_bytes_per_entry" => inline_limit,
-              "upload_cap_bytes_per_file" => "none"
-            }} =
-             LegacyOriginWire.browser_command(c.relay, @browser_session, @recipient_one, %{
-               "v" => 1,
-               "type" => "file_limits",
-               "ref" => "limits"
-             })
-
-    assert inline_limit > 0
-
-    assert {:ok,
-            %{
-              "type" => "ok",
-              "ref" => "discard",
-              "state" => "discarded",
-              "discarded" => 0
-            }} =
-             LegacyOriginWire.browser_command(c.relay, @browser_session, @recipient_one, %{
-               "v" => 1,
-               "type" => "discard_uploads",
-               "ref" => "discard",
-               "op_id" => op(90),
-               "sender_id" => "app:test",
-               "message_id" => "browser-file",
-               "revision" => 1
-             })
-
-    assert {:error, :forbidden} =
-             LegacyOriginWire.browser_command(c.relay, @browser_session, @recipient_two, %{
-               "v" => 1,
-               "type" => "file_limits"
-             })
-  end
-
-  test "browser actors can open and answer a message with browser identity", c do
+  defp forward(c) do
     assert :ok = Relay.setup_device(c.relay, c.person, "origin")
     assert :ok = Relay.setup_sender(c.relay, "origin", "app:test")
 
@@ -183,75 +76,78 @@ defmodule AttentionServer.BrowserRelayRecipientTest do
              )
 
     assert {:ok, %{"type" => "ok"}} = JSON.decode_line(forward_line)
-
-    assert {:ok, revision} = Relay.owner_revision(c.relay, c.person, c.owner_key)
-
-    assert {:ok, session_id} =
-             Relay.open_browser_recipient(
-               c.relay,
-               c.person,
-               c.owner_key,
-               revision,
-               @browser_session,
-               @recipient_one,
-               self()
-             )
-
-    assert {:ok, [opened_line]} =
-             Relay.session_request_line(
-               c.relay,
-               session_id,
-               JSON.encode!(%{
-                 "v" => 1,
-                 "type" => "message_open",
-                 "op_id" => op(2),
-                 "sender_id" => "app:test",
-                 "message_id" => "browser-action",
-                 "request_revision" => 1
-               }) <> "\n"
-             )
-
-    assert {:ok, %{"type" => "ok", "opened" => true}} = JSON.decode_line(opened_line)
-
-    assert {:ok, [answered_line]} =
-             Relay.session_request_line(
-               c.relay,
-               session_id,
-               JSON.encode!(%{
-                 "type" => "answer_no_comment",
-                 "request_id" => "browser-action",
-                 "request_revision" => 1
-               }) <> "\n"
-             )
-
-    assert {:ok, %{"type" => "ok", "terminal_kind" => "no_comment"}} =
-             JSON.decode_line(answered_line)
-
-    terminal =
-      :sys.get_state(c.relay).store.engine.messages[{c.person, "app:test", "browser-action"}].terminal
-
-    assert terminal.actor_kind == :browser
+    browser = browser(c, c.relay)
+    assert {:ok, %{"items" => [%{"item_id" => item}]}} = Reads.inbox(c.relay, browser)
+    {browser, item}
   end
 
-  test "ending a server session closes its recipients and removes their state", c do
-    assert {:ok, session} =
-             Relay.open_browser_recipient(
-               c.relay,
-               c.person,
-               c.owner_key,
-               1,
-               @browser_session,
-               @recipient_one,
-               self()
-             )
+  defp terminal(relay, person),
+    do:
+      :sys.get_state(relay).store.engine.messages[{person, "app:test", "browser-action"}].terminal
+
+  test "a browser opens and answers as its session's derived browser actor, durably", c do
+    {browser, item} = forward(c)
+    actor = browser_actor(c.person, @browser_session)
+    assert BrowserRecipient.valid_for?(actor, c.person)
+
+    assert {:ok, 200, %{"item" => %{"seen" => true}}, false} =
+             Writes.seen(c.relay, browser, item, op(2))
+
+    answer_key = op(3)
+
+    assert {:ok, 200, answered, false} =
+             Writes.answer(c.relay, browser, item, 1, :no_comment, answer_key)
+
+    terminal = terminal(c.relay, c.person)
+    assert terminal.actor_kind == :browser
+    assert terminal.actor == actor
+    refute Map.has_key?(:sys.get_state(c.relay).store.engine.devices, actor)
+
+    # The same session retrying with the same key replays the committed answer.
+    assert {:ok, 200, ^answered, true} =
+             Writes.answer(c.relay, browser, item, 1, :no_comment, answer_key)
+
+    assert terminal(c.relay, c.person) == terminal
+
+    GenServer.stop(c.relay)
+    {:ok, restarted} = Relay.start_link(store_path: c.path)
+    on_exit(fn -> if Process.alive?(restarted), do: GenServer.stop(restarted) end)
+
+    assert terminal(restarted, c.person) == terminal
+    browser = browser(c, restarted)
+
+    assert {:ok, 200, ^answered, true} =
+             Writes.answer(restarted, browser, item, 1, :no_comment, answer_key)
+
+    assert terminal(restarted, c.person) == terminal
+  end
+
+  test "ending a browser session holds no Relay state for it; stored actor state goes at restart",
+       c do
+    {browser, item} = forward(c)
+    actor = browser_actor(c.person, @browser_session)
+
+    # Seen stores an operation receipt under the browser actor.
+    assert {:ok, 200, _, false} = Writes.seen(c.relay, browser, item, op(2))
+    assert {:ok, 200, _, false} = Writes.answer(c.relay, browser, item, 1, :no_comment, op(3))
+
+    assert Enum.any?(:sys.get_state(c.relay).store.engine.receipts, fn
+             {{_person, ^actor, _op}, _} -> true
+             _ -> false
+           end)
 
     assert :ok = Relay.end_browser_session(c.relay, @browser_session)
-
-    assert_receive {:attention_fenced, ^session}
     state = :sys.get_state(c.relay)
     assert state.sessions == %{}
-    assert state.browser_recipients == %{}
-    assert state.store.engine.devices == %{}
+    refute Map.has_key?(state.store.engine.devices, actor)
+
+    GenServer.stop(c.relay)
+    {:ok, restarted} = Relay.start_link(store_path: c.path)
+    on_exit(fn -> if Process.alive?(restarted), do: GenServer.stop(restarted) end)
+    engine = :sys.get_state(restarted).store.engine
+
+    refute Enum.any?(engine.receipts, fn {{_person, key, _op}, _} -> key == actor end)
+    assert terminal(restarted, c.person).actor == actor
   end
 
   test "browser file lookup checks the current owner revision without a tab recipient", c do

@@ -2,17 +2,19 @@ defmodule AttentionServer.ConversationFeedTest do
   use ExUnit.Case, async: false
 
   alias AttentionServer.{
+    AgentAPIInProcess,
     BounceDecision,
     BouncePolicy,
     Engine,
     JSON,
     LargeData,
-    LegacyOriginWire,
+    PreChangeLogStore,
     Relay,
     Store
   }
 
   alias AttentionServer.AgentChangeLog
+  alias AttentionServer.ClientAPI.Reads
   alias AttentionServer.AgentAPI.Advisories
   alias Exqlite.Sqlite3
   alias AttentionServer.Store.SnapshotEncoding
@@ -114,6 +116,47 @@ defmodule AttentionServer.ConversationFeedTest do
     response
   end
 
+  # The origin's view of its own message through client API v2: the agent
+  # message, its entries, and one agent feed batch (which records ACK1).
+  defp agent_item(relay, message_id, sender \\ "app:test"),
+    do: AgentAPIInProcess.item_id(relay, "A", sender, message_id)
+
+  defp agent_message(relay, message_id, key \\ "origin") do
+    assert {:ok, %{"message" => message}} =
+             AgentAPIInProcess.message(relay, "A", key, agent_item(relay, message_id))
+
+    message
+  end
+
+  defp agent_entries(relay, message_id, key \\ "origin") do
+    assert {:ok, %{"entries" => entries}} =
+             AgentAPIInProcess.entries(relay, "A", key, agent_item(relay, message_id))
+
+    entries
+  end
+
+  defp agent_feed(relay, key \\ "origin") do
+    assert {:ok, changes, false, _position} = AgentAPIInProcess.changes(relay, "A", key, 0)
+    changes
+  end
+
+  defp agent_write(relay, operation, message_id, params, body, n) do
+    target = Map.put(params, :item_id, agent_item(relay, message_id))
+    AgentAPIInProcess.write(relay, "A", "origin", operation, target, body, op(n))
+  end
+
+  # In-process reads keep large values as content-store references; the HTTP
+  # encoder streams them.
+  defp large_text(%LargeData.Ref{} = ref), do: LargeData.read!(ref)
+  defp large_text(value) when is_binary(value), do: value
+
+  defp origin_feed_entries(relay) do
+    feed =
+      Map.get(:sys.get_state(relay).store.engine.origin_feeds, {"A", "origin"}, %{entries: %{}})
+
+    feed.entries |> Enum.sort() |> Enum.map(fn {_seq, entry} -> entry end)
+  end
+
   defp session_request(relay, session, frame) do
     assert {:ok, lines} =
              Relay.session_request_line(
@@ -140,8 +183,7 @@ defmodule AttentionServer.ConversationFeedTest do
           {"COLD_PARENT_OS_PID", System.pid()},
           {"COLD_PERSON", "A"},
           {"COLD_ORIGIN", "origin"},
-          {"COLD_HANDLE", @handle},
-          {"COLD_SUPPORT_OP", op(92)}
+          {"COLD_HANDLE", @handle}
         ],
         stderr_to_stdout: true
       )
@@ -237,7 +279,7 @@ defmodule AttentionServer.ConversationFeedTest do
 
     assert %{"type" => "ok", "seq" => 1} = request(relay, "origin", forward)
     lifecycle_before = Relay.events(relay, "reader", 0)
-    origin_before = Relay.origin_feed(relay, "origin", 0)
+    origin_before = agent_entries(relay, "opened-on-any-device")
     conversation_before = Relay.conversation_events(relay, "reader", 0)
     state_before = :sys.get_state(relay).store.engine
 
@@ -270,7 +312,7 @@ defmodule AttentionServer.ConversationFeedTest do
     assert state_after.origin_feeds == state_before.origin_feeds
     assert state_after.cursors == state_before.cursors
     assert Relay.events(relay, "reader", 0) == lifecycle_before
-    assert Relay.origin_feed(relay, "origin", 0) == origin_before
+    assert agent_entries(relay, "opened-on-any-device") == origin_before
     assert Relay.conversation_events(relay, "reader", 0) == conversation_before
 
     assert request(relay, "reader", opened)["type"] == "ok"
@@ -289,7 +331,11 @@ defmodule AttentionServer.ConversationFeedTest do
     assert MapSet.size(:sys.get_state(restarted).store.engine.opened_revisions) == 1
     assert request(restarted, "reader", opened)["type"] == "ok"
     assert Relay.events(restarted, "reader", 0) == lifecycle_before
-    assert Relay.origin_feed(restarted, "origin", 0) == origin_before
+    assert agent_entries(restarted, "opened-on-any-device") == origin_before
+
+    assert :sys.get_state(restarted).store.engine.origin_feeds ==
+             state_before.origin_feeds
+
     GenServer.stop(restarted)
   end
 
@@ -346,19 +392,24 @@ defmodule AttentionServer.ConversationFeedTest do
                }
              })
 
-    assert {:ok, %{"listening_support" => %{"advisory_v1" => true}}} =
-             Relay.origin_support(relay, "origin", %{
-               "type" => "support",
-               "op_id" => op(971),
-               "session_handle" => @handle,
-               "route" => "claude-code",
-               "cli_version" => "test-only",
-               "unsupported_reason" => nil,
-               "advisory_v1" => true
-             })
+    # A 0.1 origin declared advisory support for its session; client API v2
+    # never writes that record. The stored declaration still makes the 0.1
+    # session's messages eligible, and v2 reads and acknowledges the advisory.
+    PreChangeLogStore.in_relay(relay, fn store ->
+      PreChangeLogStore.origin_support(store, "origin", %{
+        "type" => "support",
+        "op_id" => op(971),
+        "session_handle" => @handle,
+        "route" => "claude-code",
+        "cli_version" => "test-only",
+        "unsupported_reason" => nil,
+        "advisory_v1" => true
+      })
+    end)
 
-    assert :ok = Relay.origin_stream_attach(relay, "origin", @handle, self(), false, true)
-    assert {:ok, ordinary_before} = Relay.origin_feed(relay, "origin", 0)
+    ordinary_before = origin_feed_entries(relay)
+    entries_before = agent_entries(relay, "durable-advisory")
+    origin_high = :sys.get_state(relay).store.engine.origin_feeds[{"A", "origin"}].high
     state = :sys.get_state(relay)
     record = state.store.engine.messages[{"A", "app:test", "durable-advisory"}]
     due_at = record.accepted_at + 86_400_000
@@ -384,15 +435,18 @@ defmodule AttentionServer.ConversationFeedTest do
     :atomics.put(clock, 1, due_at + 25)
     generation = :sys.get_state(relay).bounce_deadline_generation
     send(relay, {:bounce_due, generation})
-    assert_receive {:origin_advisory_changed, @handle, 1}, 2_000
 
-    assert {:ok, first_fetch} = Relay.origin_advisory_feed(relay, "origin", @handle, 0)
-    assert first_fetch["cursor"] == 1
-    assert [advisory] = first_fetch["entries"]
+    # The due decision is appended on the session's own advisory cursor.
+    stored = :sys.get_state(relay).store.engine.advisory_feeds[{"A", "origin", @handle}]
+    assert stored.high == 1
+    assert stored.entries[1]["origin_cursor_at_decision"] == origin_high
+    assert origin_feed_entries(relay) == ordinary_before
+
+    assert %{"advisories" => [advisory]} = agent_message(relay, "durable-advisory")
     assert advisory["delivered"] == false
-    assert advisory["origin_cursor_at_decision"] == ordinary_before["cursor"]
-    assert {:ok, ordinary_after} = Relay.origin_feed(relay, "origin", 0)
-    assert ordinary_after == ordinary_before
+    assert advisory["decided_at_rev"] == decision_cursor
+    refute Map.has_key?(advisory, "origin_cursor_at_decision")
+    assert agent_entries(relay, "durable-advisory") == entries_before
 
     assert :sys.get_state(relay).store.engine.messages[{"A", "app:test", "durable-advisory"}].terminal ==
              nil
@@ -411,8 +465,10 @@ defmodule AttentionServer.ConversationFeedTest do
            ] =
              Advisories.for_message(store.engine, scope, message_key)
 
-    assert {:ok, first_ack} =
-             Relay.origin_advisory_ack(relay, "origin", @handle, advisory["advisory_id"])
+    ack = %{"advisory_id" => advisory_id}
+
+    assert {:ok, 200, first_ack, false} =
+             agent_write(relay, :advisory_ack, "durable-advisory", %{}, ack, 972)
 
     assert first_ack["delivered"] and not first_ack["already_delivered"]
     store = :sys.get_state(relay).store
@@ -420,10 +476,10 @@ defmodule AttentionServer.ConversationFeedTest do
     assert {:ok, [%{resource: {:message, ^message_key}}, %{resource: {:advisory, ^advisory_id}}],
             false, _} = AgentChangeLog.read(store, scope, before_ack, 10, @handle)
 
-    assert {:ok, fetched_after_ack} = Relay.origin_advisory_feed(relay, "origin", @handle, 0)
-    assert hd(fetched_after_ack["entries"])["delivered"]
-    assert {:ok, ordinary_after_ack} = Relay.origin_feed(relay, "origin", 0)
-    assert ordinary_after_ack == ordinary_before
+    assert %{"advisories" => [%{"delivered" => true}]} =
+             agent_message(relay, "durable-advisory")
+
+    assert origin_feed_entries(relay) == ordinary_before
 
     GenServer.stop(relay)
     assert {:ok, restarted} = Relay.start_link(opts)
@@ -437,15 +493,16 @@ defmodule AttentionServer.ConversationFeedTest do
            ] =
              Advisories.for_message(:sys.get_state(restarted).store.engine, scope, message_key)
 
-    assert {:ok, replayed} = Relay.origin_advisory_feed(restarted, "origin", @handle, 0)
-    assert replayed["cursor"] == 1
-    assert hd(replayed["entries"])["advisory_id"] == advisory["advisory_id"]
-    assert hd(replayed["entries"])["delivered"]
-    assert {:ok, ordinary_after_restart} = Relay.origin_feed(restarted, "origin", 0)
-    assert ordinary_after_restart == ordinary_before
+    assert %{"advisories" => [%{"advisory_id" => ^advisory_id, "delivered" => true}]} =
+             agent_message(restarted, "durable-advisory")
 
-    assert {:ok, duplicate_ack} =
-             Relay.origin_advisory_ack(restarted, "origin", @handle, advisory["advisory_id"])
+    assert :sys.get_state(restarted).store.engine.advisory_feeds[{"A", "origin", @handle}].high ==
+             1
+
+    assert origin_feed_entries(restarted) == ordinary_before
+
+    assert {:ok, 200, duplicate_ack, false} =
+             agent_write(restarted, :advisory_ack, "durable-advisory", %{}, ack, 973)
 
     assert duplicate_ack["delivered"] and duplicate_ack["already_delivered"]
     GenServer.stop(restarted)
@@ -488,10 +545,12 @@ defmodule AttentionServer.ConversationFeedTest do
                "answer" => nil
              })
 
-    assert {:ok, %{"entries" => [terminal]}} = Relay.origin_feed(relay, "origin", 1)
-    assert terminal["author"] == "agent"
-    assert terminal["terminal_state"] == "answered"
-    assert terminal["has_answer"] == true and Map.has_key?(terminal, "answer")
+    # The origin's v2 view has no author field: an agent's answer is told
+    # apart from a person's by carrying no delivery state.
+    assert %{"terminal" => terminal} = agent_message(relay, "agent-terminal")
+    assert terminal["state"] == "answered"
+    assert Map.has_key?(terminal, "answer") and is_nil(terminal["answer"])
+    refute Map.has_key?(terminal, "delivery")
     assert {:ok, [lifecycle], 2} = Relay.events(relay, "reader", 1)
     assert lifecycle["author"] == "agent"
     assert lifecycle["state"] == "answered"
@@ -499,8 +558,7 @@ defmodule AttentionServer.ConversationFeedTest do
 
     assert {:ok, restarted} = Relay.start_link(store_path: path, agent_fixture_mode: true)
 
-    assert {:ok, %{"entries" => [%{"author" => "agent"}]}} =
-             Relay.origin_feed(restarted, "origin", 1)
+    assert %{"terminal" => ^terminal} = agent_message(restarted, "agent-terminal")
 
     assert {:ok, [%{"author" => "agent", "state" => "answered"}], 2} =
              Relay.events(restarted, "reader", 1)
@@ -813,10 +871,10 @@ defmodule AttentionServer.ConversationFeedTest do
 
     assert regular_files(after_refusal.upload_dir) == stored_files
 
-    assert {:ok, %{"entries" => [_]}} = Relay.origin_feed(relay, "origin", 0)
+    assert agent_entries(relay, "file-request") == []
 
-    assert {:ok, %{"inline_decoded_bytes_per_entry" => 262_144}} =
-             Relay.origin_file_limits(relay, "origin")
+    assert {:ok, %{"limits" => %{"inline_decoded_bytes_per_entry" => 262_144}}} =
+             Reads.me(relay, "origin")
 
     GenServer.stop(relay)
     assert {:ok, restarted} = Relay.start_link(store_path: path)
@@ -880,11 +938,8 @@ defmodule AttentionServer.ConversationFeedTest do
     GenServer.stop(relay)
     assert {:ok, restarted} = Relay.start_link(store_path: path)
 
-    assert {:ok, %{"message" => %{"title" => restored_ref}}} =
-             Relay.origin_message_get(restarted, "origin", "app:test", "large-title", 1)
-
-    assert %AttentionServer.LargeData.Ref{} = restored_ref
-    assert AttentionServer.LargeData.read!(restored_ref) == title
+    assert %{"message" => %{"title" => restored}} = agent_message(restarted, "large-title")
+    assert large_text(restored) == title
     GenServer.stop(restarted)
   end
 
@@ -1044,23 +1099,13 @@ defmodule AttentionServer.ConversationFeedTest do
       %{state | store: %{state.store | engine: legacy_engine}}
     end)
 
-    assert {:ok, %{"message" => %{"title" => ^title_marker, "body" => ^body_marker}}} =
-             Relay.origin_message_get(
-               legacy_relay,
-               "origin",
-               "app:test",
-               "rollback-large",
-               1
-             )
+    legacy_messages = :sys.get_state(legacy_relay).store.engine.messages
 
-    assert {:ok, %{"message" => %{"title" => "Unrelated record", "body" => small_body}}} =
-             Relay.origin_message_get(
-               legacy_relay,
-               "origin",
-               "app:test",
-               "rollback-small",
-               1
-             )
+    assert %{"title" => ^title_marker, "body" => ^body_marker} =
+             legacy_messages[{"A", "app:test", "rollback-large"}].message
+
+    assert %{"title" => "Unrelated record", "body" => small_body} =
+             legacy_messages[{"A", "app:test", "rollback-small"}].message
 
     assert small_body == rollback_marker
 
@@ -1083,20 +1128,14 @@ defmodule AttentionServer.ConversationFeedTest do
 
     assert {:ok, upgraded} = Relay.start_link(store_path: path)
 
-    assert {:ok, %{"message" => %{"title" => title_ref, "body" => body_ref}}} =
-             Relay.origin_message_get(upgraded, "origin", "app:test", "rollback-large", 1)
+    assert %{"message" => %{"title" => title_value, "body" => body_value}} =
+             agent_message(upgraded, "rollback-large")
 
-    assert LargeData.read!(title_ref) == large_text
-    assert LargeData.read!(body_ref) == large_text
+    assert large_text(title_value) == large_text
+    assert large_text(body_value) == large_text
 
-    assert {:ok, %{"message" => %{"title" => "Unrelated record", "body" => ^rollback_marker}}} =
-             Relay.origin_message_get(
-               upgraded,
-               "origin",
-               "app:test",
-               "rollback-small",
-               1
-             )
+    assert %{"message" => %{"title" => "Unrelated record", "body" => ^rollback_marker}} =
+             agent_message(upgraded, "rollback-small")
 
     GenServer.stop(upgraded)
   end
@@ -1429,71 +1468,84 @@ defmodule AttentionServer.ConversationFeedTest do
                "files" => [file]
              })
 
-    assert {:ok, %{"entries" => [_, pending]}} = Relay.origin_feed(relay, "origin", 0)
-    assert pending["delivered"] == false
-    assert pending["file_transfers"] == %{}
-    assert pending["file_use"] == %{}
-    assert Base.decode64!(hd(pending["files"])["data_base64"]) == <<0, 1, 255>>
+    assert [pending] = agent_entries(relay, "file-turn")
+    assert pending["delivery"] == %{"delivered" => false, "acted" => false}
+    assert [%{"file_id" => file_id, "name" => "image.bin"}] = pending["files"]
+    assert {:ok, %{data: <<0, 1, 255>>}} = Reads.file(relay, "origin", file_id)
+    turn = %{entry_id: pending["entry_id"]}
+    transfer = %{"file_id" => file_id, "transfer" => "not_transferred", "reason" => "disk full"}
 
-    assert {:error, :file_transfers} = Relay.origin_ack(relay, "origin", 2)
+    # A report needs a delivered turn.
+    assert {:error, "not_found", _, _} =
+             agent_write(relay, :file_use, "file-turn", turn, transfer, 513)
 
-    transfers = [%{"name" => "image.bin", "status" => "not_transferred", "reason" => "disk full"}]
+    assert [_, _] = agent_feed(relay)
 
-    assert {:ok, %{"status" => "delivered", "file_transfers" => recorded}} =
-             Relay.origin_ack(relay, "origin", 2, transfers)
+    assert {:ok, 200, %{"transfer" => "not_transferred"}, false} =
+             agent_write(relay, :file_use, "file-turn", turn, transfer, 513)
 
-    assert recorded["image.bin"] == %{"status" => "not_transferred", "reason" => "disk full"}
+    assert {:ok, 200, %{"duplicate" => true}, false} =
+             agent_write(relay, :file_use, "file-turn", turn, transfer, 514)
 
-    assert {:ok, %{"status" => "already_delivered"}} =
-             Relay.origin_ack(relay, "origin", 2, transfers)
-
-    assert {:error, :transfer_conflict} =
-             Relay.origin_ack(relay, "origin", 2, [
-               %{"name" => "image.bin", "status" => "transferred"}
-             ])
-
-    assert {:ok, %{"entries" => [_, delivered]}} = Relay.origin_feed(relay, "origin", 0)
-    assert delivered["delivered"] == true
-    assert delivered["file_use"] == %{}
-
-    outcome = %{"status" => "unusable", "reason" => "not transferred"}
-
-    assert {:ok, %{"status" => "unusable"}} =
-             Relay.origin_file_use(relay, "origin", 2, "image.bin", outcome, op(513))
-
-    assert {:ok, %{"duplicate" => true}} =
-             Relay.origin_file_use(relay, "origin", 2, "image.bin", outcome, op(513))
-
-    assert {:error, :file_use_conflict} =
-             Relay.origin_file_use(
+    assert {:error, "already_closed", _, _} =
+             agent_write(
                relay,
-               "origin",
-               2,
-               "image.bin",
-               %{"status" => "used"},
-               op(514)
+               :file_use,
+               "file-turn",
+               turn,
+               %{"file_id" => file_id, "transfer" => "transferred"},
+               515
              )
 
-    assert {:ok, [discussion, delivery_ack, receipt, transfer, use], 5} =
+    assert [%{"delivery" => %{"delivered" => true}}] = agent_entries(relay, "file-turn")
+    use = %{"file_id" => file_id, "use" => "unusable", "reason" => "not transferred"}
+
+    assert {:ok, 200, %{"use" => "unusable"}, false} =
+             agent_write(relay, :file_use, "file-turn", turn, use, 516)
+
+    assert {:error, "already_closed", _, _} =
+             agent_write(
+               relay,
+               :file_use,
+               "file-turn",
+               turn,
+               %{"file_id" => file_id, "use" => "used"},
+               517
+             )
+
+    assert {:ok, [discussion, delivery_ack, transfer_fact, use_fact], 4} =
              Relay.conversation_events(relay, "reader", 0)
 
     assert delivery_ack["kind"] == "delivery_ack"
     assert delivery_ack["stage"] == "ack1"
     assert delivery_ack["event_id"] == discussion["event_id"]
 
-    assert Enum.map([discussion, receipt, transfer, use], & &1["kind"]) ==
-             ~w(discussion receipt file_transfer file_use)
+    assert Enum.map([discussion, transfer_fact, use_fact], & &1["kind"]) ==
+             ~w(discussion file_use file_use)
 
-    assert Enum.map([receipt, transfer, use], & &1["event_id"]) == ["2", "2", "2"]
-    assert transfer["file"] == "image.bin"
-    assert transfer["status"] == "not_transferred"
-    assert use["status"] == "unusable"
+    assert Enum.map([transfer_fact, use_fact], & &1["event_id"]) == ["2", "2"]
+    assert transfer_fact["file"] == "image.bin"
+    assert transfer_fact["status"] == "not_transferred"
+    assert use_fact["status"] == "unusable"
+
+    reports = [
+      %{
+        "file_id" => file_id,
+        "transfer" => "not_transferred",
+        "transfer_reason" => "disk full",
+        "use" => "unusable",
+        "use_reason" => "not transferred"
+      }
+    ]
+
+    assert [%{"delivery" => %{"file_uses" => ^reports}}] = agent_entries(relay, "file-turn")
 
     GenServer.stop(relay)
     assert {:ok, restarted} = Relay.start_link(store_path: path)
-    assert {:ok, %{"entries" => [_, replayed]}} = Relay.origin_feed(restarted, "origin", 0)
-    assert replayed["file_transfers"] == recorded
-    assert replayed["file_use"] == %{"image.bin" => outcome}
+
+    assert [%{"delivery" => %{"delivered" => true, "file_uses" => ^reports}}] =
+             agent_entries(restarted, "file-turn")
+
     GenServer.stop(restarted)
   end
 
@@ -1551,7 +1603,8 @@ defmodule AttentionServer.ConversationFeedTest do
     assert %{"type" => "ok", "seq" => 1, "duplicate" => true} =
              request(restarted, "origin", forward)
 
-    assert {:ok, %{"cursor" => 0, "entries" => []}} = Relay.origin_feed(restarted, "origin", 0)
+    assert agent_entries(restarted, "legacy-request") == []
+    assert origin_feed_entries(restarted) == []
     GenServer.stop(restarted)
 
     assert {:ok, again} = Store.open(path)
@@ -1608,14 +1661,10 @@ defmodule AttentionServer.ConversationFeedTest do
                "message" => message
              })
 
-    assert {:ok,
-            %{
-              "cursor" => 1,
-              "entries" => [%{"kind" => "revision", "author" => "origin", "op_id" => first_op}]
-            }} =
-             Relay.origin_feed(relay, "origin", 0)
-
-    assert first_op == op(1)
+    assert %{"session" => @handle, "revision" => 1} = sent = agent_message(relay, "request-1")
+    refute Map.has_key?(sent, "terminal")
+    assert agent_entries(relay, "request-1") == []
+    item = agent_item(relay, "request-1")
 
     assert %{"type" => "error", "reason" => "request_conflict"} =
              request(relay, "origin", %{
@@ -1634,82 +1683,57 @@ defmodule AttentionServer.ConversationFeedTest do
                "answer" => nil
              })
 
-    assert {:ok, %{"cursor" => 2, "entries" => [terminal]}} =
-             Relay.origin_feed(relay, "origin", 1)
-
-    assert terminal["kind"] == "terminal"
-    assert terminal["author"] == "person"
-    assert terminal["terminal_state"] == "answered"
-    assert terminal["has_answer"] == true
+    assert {:ok, [_, lifecycle], 2} = Relay.events(relay, "reader", 0)
+    assert %{"terminal" => terminal} = agent_message(relay, "request-1")
+    assert terminal["state"] == "answered"
     assert Map.has_key?(terminal, "answer") and is_nil(terminal["answer"])
-    assert {:ok, %{"cursor" => 0, "entries" => []}} = Relay.origin_feed(relay, "other", 0)
-    assert {:error, :not_found} = Relay.origin_ack(relay, "other", 2)
+    assert terminal["delivery"] == %{"delivered" => false, "acted" => false}
 
-    assert {:ok,
-            %{
-              "availability" => "not_listening",
-              "open_requests" => 0,
-              "pending_undelivered" => 1,
-              "pending_delivered_unacted" => 0
-            }} = Relay.origin_status(relay, "origin", @handle)
+    # Only its origin reads it.
+    assert {:error, :not_found} = AgentAPIInProcess.message(relay, "B", "other", item)
+    assert {:ok, [], false, _} = AgentAPIInProcess.changes(relay, "B", "other", 0)
 
-    assert {:error, :not_found} = Relay.origin_status(relay, "other", @handle)
+    assert {:error, "not_found", _, _} =
+             AgentAPIInProcess.write(
+               relay,
+               "B",
+               "other",
+               :answer_receipt,
+               %{item_id: item},
+               %{"outcome" => "handed"},
+               op(7)
+             )
 
-    assert {:ok, %{"status" => "delivered", "acted" => false}} =
-             Relay.origin_ack(relay, "origin", 2)
+    # The origin's v2 feed hands it the answer, which records ACK1 once.
+    assert [%{"kind" => "message", "data" => %{"terminal" => %{"state" => "answered"}}}] =
+             agent_feed(relay)
 
     assert {:ok, [], 2} = Relay.events(relay, "reader", 2)
-
-    assert {:ok, [delivery_ack, receipt_change], 2} =
-             Relay.conversation_events(relay, "reader", 0)
-
+    assert {:ok, [delivery_ack], 1} = Relay.conversation_events(relay, "reader", 0)
     assert delivery_ack["kind"] == "delivery_ack"
     assert delivery_ack["stage"] == "ack1"
-    assert delivery_ack["event_id"] == terminal["event_id"]
-    assert receipt_change["type"] == "conversation"
-    assert receipt_change["kind"] == "receipt"
-    assert receipt_change["event_id"] == terminal["event_id"]
-    assert receipt_change["request_revision"] == 1
-    assert receipt_change["delivered"] == true
-    refute Map.has_key?(receipt_change, "acted")
-    refute Map.has_key?(receipt_change, "answer")
+    assert delivery_ack["event_id"] == lifecycle["event_id"]
+    assert delivery_ack["request_revision"] == 1
+    refute Map.has_key?(delivery_ack, "answer")
+    assert {:ok, [^delivery_ack], 1} = Relay.conversation_events(relay, "origin", 0)
 
-    assert {:ok, [^delivery_ack, origin_receipt], 2} =
-             Relay.conversation_events(relay, "origin", 0)
+    assert [_] = agent_feed(relay)
+    assert {:ok, [], 1} = Relay.conversation_events(relay, "reader", 1)
 
-    assert origin_receipt["delivered"] == true
-    refute Map.has_key?(origin_receipt, "acted")
-    refute Map.has_key?(origin_receipt, "answer")
-
-    assert {:ok, %{"status" => "already_delivered", "acted" => false}} =
-             Relay.origin_ack(relay, "origin", 2)
-
-    assert {:ok, [], 2} = Relay.conversation_events(relay, "reader", 2)
-
-    assert {:ok,
-            %{
-              "pending_undelivered" => 0,
-              "pending_delivered_unacted" => 1
-            }} = Relay.origin_status(relay, "origin", @handle)
+    assert %{"terminal" => %{"delivery" => %{"delivered" => true, "acted" => false}}} =
+             agent_message(relay, "request-1")
 
     GenServer.stop(relay)
     assert {:ok, stored} = Store.open(path)
-
-    assert stored.engine.origin_sessions[{"A", "origin", @handle}].vendor_session_id ==
-             vendor_session_id
-
+    session = stored.engine.origin_sessions[{"A", "origin", @handle}]
+    assert session.vendor_session_id == vendor_session_id
+    assert session.support["route"] == "claude-code"
     assert :ok = Store.close(stored)
     assert {:ok, restarted} = Relay.start_link(store_path: path)
 
-    assert {:ok, %{"cursor" => 2, "entries" => [replayed]}} =
-             Relay.origin_feed(restarted, "origin", 1)
-
-    assert Map.drop(replayed, ~w(delivered acted)) == Map.drop(terminal, ~w(delivered acted))
-    assert replayed["delivered"] == true
-    assert replayed["acted"] == false
-
-    assert {:ok, %{"status" => "already_delivered", "acted" => false}} =
-             Relay.origin_ack(restarted, "origin", 2)
+    assert %{"terminal" => replayed} = agent_message(restarted, "request-1")
+    assert Map.drop(replayed, ["delivery"]) == Map.drop(terminal, ["delivery"])
+    assert replayed["delivery"] == %{"delivered" => true, "acted" => false}
 
     result = %{
       "type" => "conversation_result",
@@ -1726,16 +1750,11 @@ defmodule AttentionServer.ConversationFeedTest do
     assert %{"type" => "ok", "status" => "received", "duplicate" => true} =
              request(restarted, "origin", result)
 
-    assert {:ok,
-            %{
-              "entries" => [%{"acted" => true}, %{"kind" => "result", "op_id" => result_op}]
-            }} =
-             Relay.origin_feed(restarted, "origin", 1)
+    assert %{"terminal" => %{"delivery" => %{"acted" => true}}, "result" => result_state} =
+             agent_message(restarted, "request-1")
 
-    assert result_op == op(4)
-
-    assert {:ok, %{"entries" => [_, %{"in_reply_to" => "2"}]}} =
-             Relay.origin_feed(restarted, "origin", 1)
+    assert %{"status" => "received", "revision" => 1} = result_state
+    assert [%{"kind" => "result", "author" => "origin"}] = agent_entries(restarted, "request-1")
 
     assert {:ok, %{"source_status" => "source_reported", "status" => "received"}} =
              Engine.source_status(
@@ -1751,29 +1770,24 @@ defmodule AttentionServer.ConversationFeedTest do
     assert %{"type" => "error", "reason" => "receipt_conflict"} =
              request(restarted, "origin", %{result | "op_id" => op(6), "status" => "refused"})
 
-    assert {:ok, %{"cursor" => 4, "entries" => [%{"kind" => "result"}, %{"kind" => "result"}]}} =
-             Relay.origin_feed(restarted, "origin", 2)
+    assert [%{"kind" => "result"}, %{"kind" => "result"}] =
+             agent_entries(restarted, "request-1")
 
-    assert {:ok,
-            %{
-              "pending_undelivered" => 0,
-              "pending_delivered_unacted" => 0
-            }} = Relay.origin_status(restarted, "origin", @handle)
+    assert {:ok, 200, _, false} =
+             AgentAPIInProcess.write(
+               restarted,
+               "A",
+               "origin",
+               :session_end,
+               %{session: @handle},
+               %{},
+               op(8)
+             )
 
-    assert :ok = Relay.origin_session_gone(restarted, "origin", @handle)
-
-    assert {:ok, %{"availability" => "gone"}} =
-             Relay.origin_status(restarted, "origin", @handle)
-
-    assert {:ok, %{"listening_support" => %{"route" => "claude-code"}}} =
-             Relay.origin_status(restarted, "origin", @handle)
-
+    assert %{"availability" => %{"state" => "gone"}} = agent_message(restarted, "request-1")
     GenServer.stop(restarted)
     assert {:ok, again} = Relay.start_link(store_path: path)
-
-    assert {:ok, %{"availability" => "gone", "pending_delivered_unacted" => 0}} =
-             Relay.origin_status(again, "origin", @handle)
-
+    assert %{"availability" => %{"state" => "gone"}} = agent_message(again, "request-1")
     GenServer.stop(again)
   end
 
@@ -1854,25 +1868,25 @@ defmodule AttentionServer.ConversationFeedTest do
     assert acted_fact["event_id"] == "2"
     assert acted_fact["acting_event_id"] == "3"
 
-    assert {:ok, %{"cursor" => 3, "entries" => [discussion, own_reply]}} =
-             Relay.origin_feed(relay, "origin", 1)
-
-    assert discussion["kind"] == "discussion"
-    assert discussion["acted"] == true
-    assert discussion["delivered"] == false
+    assert [discussion, own_reply] = agent_entries(relay, "r1")
+    assert discussion["kind"] == "reply"
+    assert discussion["author"] == "person"
+    assert discussion["delivery"] == %{"acted" => true, "delivered" => false}
     assert own_reply["kind"] == "reply"
     assert own_reply["author"] == "origin"
-    assert own_reply["op_id"] == op(14)
-    assert own_reply["in_reply_to"] == "2"
+    assert own_reply["in_reply_to"] == discussion["entry_id"]
+    assert own_reply["text"] == "First the canary, then the full rollout"
 
-    assert {:ok, %{"status" => "delivered", "acted" => true}} =
-             Relay.origin_ack(relay, "origin", 2)
+    agent_feed(relay)
+
+    assert [%{"delivery" => %{"acted" => true, "delivered" => true}}, _] =
+             agent_entries(relay, "r1")
 
     GenServer.stop(relay)
     assert {:ok, restarted} = Relay.start_link(store_path: path)
 
-    assert {:ok, %{"entries" => [%{"acted" => true, "delivered" => true}, _]}} =
-             Relay.origin_feed(restarted, "origin", 1)
+    assert [%{"delivery" => %{"acted" => true, "delivered" => true}}, _] =
+             agent_entries(restarted, "r1")
 
     # Replies to one person event are not limited to one.
     assert %{"type" => "ok"} =
@@ -1882,10 +1896,10 @@ defmodule AttentionServer.ConversationFeedTest do
                  "text" => "And the rollback plan is ready"
              })
 
-    assert {:ok, %{"entries" => [%{"acted" => true}, _, second_reply]}} =
-             Relay.origin_feed(restarted, "origin", 1)
+    assert [%{"delivery" => %{"acted" => true}} = turn, _, second_reply] =
+             agent_entries(restarted, "r1")
 
-    assert second_reply["in_reply_to"] == "2"
+    assert second_reply["in_reply_to"] == turn["entry_id"]
     assert second_reply["text"] == "And the rollback plan is ready"
 
     GenServer.stop(restarted)
@@ -1977,16 +1991,24 @@ defmodule AttentionServer.ConversationFeedTest do
                "text" => "Still asking about the first wording"
              })
 
-    assert {:ok, %{"entries" => [_, old_discussion, revision, newer_discussion]}} =
-             Relay.origin_feed(relay, "origin", 0)
+    # The origin's v2 feed hands it both person turns (ACK1).
+    agent_feed(relay)
 
+    assert [old_discussion, revision, newer_discussion] =
+             agent_entries(relay, "revised-request")
+
+    assert old_discussion["author"] == "person"
     assert old_discussion["request_revision"] == 1
-    assert old_discussion["acted"] == true
+    assert old_discussion["delivery"] == %{"acted" => true, "delivered" => true}
+    assert revision["author"] == "origin"
     assert revision["request_revision"] == 2
-    assert revision["message"] == updated
-    assert revision["op_id"] == op(23)
-    assert revision["in_reply_to"] == "2"
+    assert revision["kind"] == "revision"
+    assert newer_discussion["author"] == "person"
     assert newer_discussion["request_revision"] == 1
+
+    assert %{"revision" => 2, "message" => current} = agent_message(relay, "revised-request")
+    assert current == Map.drop(updated, ["sender_id", "message_id"])
+    {:ok, [old_fact, _, _, newer_fact | _], _} = Relay.conversation_events(relay, "reader", 0)
 
     GenServer.stop(relay)
     assert {:ok, restarted} = Relay.start_link(store_path: path)
@@ -1997,8 +2019,8 @@ defmodule AttentionServer.ConversationFeedTest do
              Relay.conversation_events(restarted, "reader", 0)
 
     assert Enum.map([old_ack, new_ack], & &1["event_id"]) == [
-             old_discussion["event_id"],
-             newer_discussion["event_id"]
+             old_fact["event_id"],
+             newer_fact["event_id"]
            ]
 
     assert Enum.all?(
@@ -2029,13 +2051,13 @@ defmodule AttentionServer.ConversationFeedTest do
     assert %{"type" => "error", "reason" => "closed"} =
              request(restarted, "origin", %{revise | "op_id" => op(29), "base_revision" => 2})
 
-    assert {:ok, %{"entries" => [terminal]}} = Relay.origin_feed(restarted, "origin", 4)
-    assert terminal["terminal_state"] == "answered"
-    assert terminal["request_revision"] == 2
+    assert %{"revision" => 2, "terminal" => terminal} =
+             agent_message(restarted, "revised-request")
+
+    assert terminal["state"] == "answered"
     assert terminal["answer"] == "Yes"
     assert {:ok, [terminal_change], 2} = Relay.events(restarted, "reader", 1)
     assert terminal_change["type"] == "lifecycle"
-    assert terminal_change["event_id"] == terminal["event_id"]
     assert terminal_change["request_revision"] == 2
     GenServer.stop(restarted)
   end
@@ -2113,8 +2135,7 @@ defmodule AttentionServer.ConversationFeedTest do
                "request_revision" => 3
              })
 
-    assert {:ok, %{"entries" => before_terminal}} = Relay.origin_feed(relay, "origin", 0)
-    refute Enum.any?(before_terminal, &(&1["kind"] == "terminal"))
+    refute Map.has_key?(agent_message(relay, "no-comment-revision"), "terminal")
 
     assert %{"type" => "ok", "terminal_kind" => "no_comment"} =
              no_comment_request(relay, "reader", %{
@@ -2123,12 +2144,11 @@ defmodule AttentionServer.ConversationFeedTest do
                "request_revision" => 1
              })
 
-    assert {:ok, %{"entries" => entries}} = Relay.origin_feed(relay, "origin", 0)
-    terminal = List.last(entries)
-    assert terminal["kind"] == "terminal"
-    assert terminal["terminal_kind"] == "no_comment"
-    assert terminal["request_revision"] == 2
-    assert terminal["has_answer"] == false
+    assert %{"revision" => 2, "terminal" => terminal} =
+             agent_message(relay, "no-comment-revision")
+
+    assert terminal["state"] == "answered"
+    assert terminal["outcome"] == %{"kind" => "no_comment"}
     refute Map.has_key?(terminal, "answer")
 
     GenServer.stop(relay)
@@ -2177,19 +2197,13 @@ defmodule AttentionServer.ConversationFeedTest do
 
         assert %{"type" => "ok"} = discussion = request(relay, "reader", frame)
 
-        reply_frame = %{
-          "v" => 1,
-          "type" => "reply",
-          "op_id" => op(operation + 1),
-          "sender_id" => "app:test",
-          "message_id" => message_id,
-          "request_revision" => 1,
-          "in_reply_to" => discussion["event_id"],
-          "text" => "Already sent before answer",
-          "ref" => "existing-reply-#{message_id}"
+        reply_body = %{
+          "in_reply_to" => entry_id(relay, message_id, text),
+          "text" => "Already sent before answer"
         }
 
-        assert %{"type" => "ok"} = reply = LegacyOriginWire.command(relay, "origin", reply_frame)
+        assert {:ok, 200, %{"entry" => reply}, false} =
+                 agent_write(relay, :reply, message_id, %{}, reply_body, operation + 1)
 
         pending_frame = %{
           frame
@@ -2197,19 +2211,18 @@ defmodule AttentionServer.ConversationFeedTest do
             "text" => "Pending before answer"
         }
 
-        assert %{"type" => "ok"} = pending = request(relay, "reader", pending_frame)
+        assert %{"type" => "ok"} = request(relay, "reader", pending_frame)
 
         {message_id,
          %{
            frame: frame,
            event: discussion,
-           reply_frame: reply_frame,
+           reply_body: reply_body,
+           reply_op: operation + 1,
            reply: reply,
-           pending: pending
+           pending: entry_id(relay, message_id, "Pending before answer")
          }}
       end
-
-    assert :ok = Relay.origin_stream_attach(relay, "origin", @handle, self())
 
     answer =
       request(relay, "reader", %{
@@ -2223,9 +2236,6 @@ defmodule AttentionServer.ConversationFeedTest do
 
     assert answer["type"] == "ok"
 
-    assert_receive {:origin_state_changed, answer_seq}
-    assert is_integer(answer_seq)
-
     no_comment =
       no_comment_request(relay, "reader", %{
         "type" => "answer_no_comment",
@@ -2236,13 +2246,6 @@ defmodule AttentionServer.ConversationFeedTest do
     assert no_comment["type"] == "ok"
     assert no_comment["terminal_kind"] == "no_comment"
 
-    assert_receive {:origin_state_changed, no_comment_seq}
-    assert no_comment_seq > answer_seq
-
-    assert {:ok, status} = Relay.origin_status(relay, "origin", @handle)
-    assert status["open_requests"] == 0
-    assert status["open_chats"] == 2
-
     # The first answer settled each request, but chat stays open both ways.
     for {message_id, ref, person_op, agent_op, person_text, agent_text} <- [
           {"answered-chat", "answer", 804, 805, "Can we discuss that answer?",
@@ -2250,7 +2253,7 @@ defmodule AttentionServer.ConversationFeedTest do
           {"no-comment-chat", "no-comment", 806, 807, "Can I explain why I chose no comment?",
            "Of course; what would you like to explain?"}
         ] do
-      assert %{"v" => 1, "type" => "ok", "ref" => ref_back, "event_id" => event_id} =
+      assert %{"v" => 1, "type" => "ok", "ref" => ref_back} =
                request(relay, "reader", %{
                  "type" => "discussion",
                  "op_id" => op(person_op),
@@ -2263,38 +2266,33 @@ defmodule AttentionServer.ConversationFeedTest do
 
       assert ref_back == "person-#{ref}-ref"
 
-      assert %{"v" => 1, "type" => "ok"} =
-               LegacyOriginWire.command(relay, "origin", %{
-                 "v" => 1,
-                 "type" => "reply",
-                 "op_id" => op(agent_op),
-                 "ref" => "agent-#{ref}-ref",
-                 "sender_id" => "app:test",
-                 "message_id" => message_id,
-                 "request_revision" => 1,
-                 "in_reply_to" => prior_discussions[message_id].pending["event_id"],
-                 "text" => agent_text
-               })
+      assert {:ok, 200, _, false} =
+               agent_write(
+                 relay,
+                 :reply,
+                 message_id,
+                 %{},
+                 %{"in_reply_to" => prior_discussions[message_id].pending, "text" => agent_text},
+                 agent_op
+               )
 
       # The agent may answer the same chat message again; the terminal result
       # of the request is untouched.
-      assert %{"v" => 1, "type" => "ok"} =
-               LegacyOriginWire.command(relay, "origin", %{
-                 "v" => 1,
-                 "type" => "reply",
-                 "op_id" => op(agent_op + 100),
-                 "sender_id" => "app:test",
-                 "message_id" => message_id,
-                 "request_revision" => 1,
-                 "in_reply_to" => event_id,
-                 "text" => "A second reply to the same chat message"
-               })
+      assert {:ok, 200, _, false} =
+               agent_write(
+                 relay,
+                 :reply,
+                 message_id,
+                 %{},
+                 %{
+                   "in_reply_to" => entry_id(relay, message_id, person_text),
+                   "text" => "A second reply to the same chat message"
+                 },
+                 agent_op + 100
+               )
     end
 
-    assert {:ok, still_answered} = Relay.origin_status(relay, "origin", @handle)
-    assert still_answered["open_requests"] == 0
-
-    feed_before_refusals = Relay.origin_feed(relay, "origin", 0)
+    chats_before_refusals = chat_views(relay)
 
     assert %{
              "v" => 1,
@@ -2313,136 +2311,60 @@ defmodule AttentionServer.ConversationFeedTest do
                "text" => "This revision is invalid"
              })
 
-    assert %{
-             "v" => 1,
-             "type" => "error",
-             "reason" => "not_found",
-             "ref" => "missing-discussion-ref"
-           } =
-             LegacyOriginWire.command(relay, "origin", %{
-               "v" => 1,
-               "type" => "reply",
-               "op_id" => op(817),
-               "ref" => "missing-discussion-ref",
-               "sender_id" => "app:test",
-               "message_id" => "no-comment-chat",
-               "request_revision" => 1,
-               "in_reply_to" => "9999",
-               "text" => "This discussion does not exist"
-             })
+    assert {:error, "not_found", _, _} =
+             agent_write(
+               relay,
+               :reply,
+               "no-comment-chat",
+               %{},
+               %{"in_reply_to" => "e9999", "text" => "This discussion does not exist"},
+               817
+             )
 
-    assert Relay.origin_feed(relay, "origin", 0) == feed_before_refusals
+    assert chat_views(relay) == chats_before_refusals
 
-    for {_message_id, %{reply_frame: frame, reply: reply}} <- prior_discussions do
-      assert %{"type" => "ok", "duplicate" => true, "event_id" => event_id} =
-               LegacyOriginWire.command(relay, "origin", frame)
-
-      assert event_id == reply["event_id"]
+    for {message_id, %{reply_body: body, reply_op: n}} <- prior_discussions do
+      assert {:stored, 200, _} = agent_write(relay, :reply, message_id, %{}, body, n)
     end
 
-    assert Relay.origin_feed(relay, "origin", 0) == feed_before_refusals
-
-    {:ok, %{"entries" => answered_feed}} = feed_before_refusals
+    assert chat_views(relay) == chats_before_refusals
 
     for {message_id, operation} <- [{"answered-chat", 830}, {"no-comment-chat", 831}] do
-      terminal_entry =
-        Enum.find(answered_feed, fn entry ->
-          entry["kind"] == "terminal" and entry["message_id"] == message_id
-        end)
-
-      assert terminal_entry
-
-      assert %{
-               "v" => 1,
-               "type" => "ok",
-               "status" => "received",
-               "ref" => ref
-             } =
-               LegacyOriginWire.command(relay, "origin", %{
-                 "v" => 1,
-                 "type" => "result",
-                 "op_id" => op(operation),
-                 "ref" => "result-#{message_id}",
-                 "sender_id" => "app:test",
-                 "message_id" => message_id,
-                 "in_reply_to" => terminal_entry["event_id"],
-                 "status" => "received"
-               })
-
-      assert ref == "result-#{message_id}"
+      assert {:ok, 200, %{"entry" => %{"kind" => "result"}}, false} =
+               agent_write(relay, :result, message_id, %{}, %{"status" => "received"}, operation)
     end
 
-    assert {:ok, %{"entries" => entries}} = Relay.origin_feed(relay, "origin", 0)
+    assert %{"terminal" => answered} = agent_message(relay, "answered-chat")
+    assert answered["state"] == "answered"
+    assert answered["answer"] == "Yes"
+    assert %{"terminal" => skipped} = agent_message(relay, "no-comment-chat")
+    assert skipped["state"] == "answered"
+    assert skipped["outcome"] == %{"kind" => "no_comment"}
+    refute Map.has_key?(skipped, "answer")
 
-    assert Enum.map(entries, & &1["channel"]) == [
-             "reply",
-             "reply",
-             "chat",
-             "chat",
-             "chat",
-             "chat",
-             "chat",
-             "chat",
-             "reply",
-             "reply",
-             "chat",
-             "chat",
-             "chat",
-             "chat",
-             "chat",
-             "chat",
-             "reply",
-             "reply"
-           ]
+    texts = fn entries, author ->
+      for %{"kind" => "reply", "author" => ^author, "text" => text} <- entries, do: text
+    end
 
-    reply_entries = Enum.filter(entries, &(&1["channel"] == "reply"))
+    for {message_id, first, after_answer} <- [
+          {"answered-chat", "Before the answer", "Can we discuss that answer?"},
+          {"no-comment-chat", "Before No comment", "Can I explain why I chose no comment?"}
+        ] do
+      entries = agent_entries(relay, message_id)
+      # Chat entries are replies only; the terminal is the message's, and the
+      # result follows the chat.
+      assert Enum.map(entries, & &1["kind"]) == List.duplicate("reply", 6) ++ ["result"]
+      assert texts.(entries, "person") == [first, "Pending before answer", after_answer]
 
-    assert Enum.map(reply_entries, & &1["kind"]) == [
-             "revision",
-             "revision",
-             "terminal",
-             "terminal",
-             "result",
-             "result"
-           ]
-
-    terminal_entries = Enum.filter(reply_entries, &(&1["kind"] == "terminal"))
-
-    assert Enum.all?(terminal_entries, &(&1["terminal_state"] == "answered"))
-
-    assert Enum.find(terminal_entries, &(&1["message_id"] == "answered-chat"))["answer"] ==
-             "Yes"
-
-    no_comment = Enum.find(terminal_entries, &(&1["message_id"] == "no-comment-chat"))
-    assert no_comment["terminal_kind"] == "no_comment"
-    refute Map.has_key?(no_comment, "answer")
-
-    chat_entries = Enum.filter(entries, &(&1["channel"] == "chat"))
-
-    refute Enum.any?(
-             chat_entries,
-             &(&1["kind"] == "terminal" and &1["terminal_state"] == "answered")
-           )
-
-    assert Enum.all?(chat_entries, &(&1["kind"] in ["discussion", "reply"]))
-
-    assert Enum.map(Enum.filter(chat_entries, &(&1["kind"] == "discussion")), & &1["text"]) == [
-             "Before the answer",
-             "Pending before answer",
-             "Before No comment",
-             "Pending before answer",
-             "Can we discuss that answer?",
-             "Can I explain why I chose no comment?"
-           ]
-
-    assert Enum.map(Enum.filter(chat_entries, &(&1["kind"] == "reply")), & &1["text"]) == [
-             "Already sent before answer",
-             "Already sent before answer",
-             "Yes, here is more detail.",
-             "A second reply to the same chat message",
-             "Of course; what would you like to explain?",
-             "A second reply to the same chat message"
-           ]
+      assert texts.(entries, "origin") == [
+               "Already sent before answer",
+               if(message_id == "answered-chat",
+                 do: "Yes, here is more detail.",
+                 else: "Of course; what would you like to explain?"
+               ),
+               "A second reply to the same chat message"
+             ]
+    end
 
     assert {:ok, conversation_events, _high} = Relay.conversation_events(relay, "reader", 0)
     refute Enum.any?(conversation_events, &Map.has_key?(&1, "answer"))
@@ -2460,13 +2382,38 @@ defmodule AttentionServer.ConversationFeedTest do
              end)
     end
 
-    for {_message_id, %{reply: reply, reply_frame: frame}} <- prior_discussions do
+    for {_message_id, %{reply: reply}} <- prior_discussions do
       assert Enum.any?(conversation_events, fn entry ->
-               entry["event_id"] == reply["event_id"] and entry["text"] == frame["text"]
+               entry["kind"] == "reply" and entry["text"] == reply["text"]
              end)
     end
 
     GenServer.stop(relay)
+  end
+
+  # An open (or closed) `GET /v2/agent/changes?session=` feed of the origin.
+  defp agent_feed_activity(relay, action) do
+    feed = %{
+      relay: relay,
+      principal: %{kind: :device, person: "A", key: "origin"},
+      params: %{session: @handle}
+    }
+
+    :ok = AttentionServer.AgentAPI.FeedActivity.observe(feed, action)
+    _ = :sys.get_state(relay)
+    :ok
+  end
+
+  defp entry_id(relay, message_id, text) do
+    assert %{"entry_id" => id} =
+             Enum.find(agent_entries(relay, message_id), &(&1["text"] == text))
+
+    id
+  end
+
+  defp chat_views(relay) do
+    for id <- ["answered-chat", "no-comment-chat"],
+        do: {agent_message(relay, id), agent_entries(relay, id)}
   end
 
   test "answering one request leaves the chat of it and of its sibling open", %{
@@ -2512,22 +2459,20 @@ defmodule AttentionServer.ConversationFeedTest do
       "text" => "This sibling is still open"
     }
 
-    assert %{"type" => "ok"} =
-             sibling_discussion =
-             request(relay, "reader", sibling_discussion_frame)
+    assert %{"type" => "ok"} = request(relay, "reader", sibling_discussion_frame)
 
-    assert %{"type" => "ok", "ref" => "sibling-reply-ref"} =
-             LegacyOriginWire.command(relay, "origin", %{
-               "v" => 1,
-               "type" => "reply",
-               "op_id" => op(844),
-               "ref" => "sibling-reply-ref",
-               "sender_id" => "app:test",
-               "message_id" => "sibling",
-               "request_revision" => 1,
-               "in_reply_to" => sibling_discussion["event_id"],
-               "text" => "The sibling reply is still open"
-             })
+    assert {:ok, 200, _, false} =
+             agent_write(
+               relay,
+               :reply,
+               "sibling",
+               %{},
+               %{
+                 "in_reply_to" => entry_id(relay, "sibling", "This sibling is still open"),
+                 "text" => "The sibling reply is still open"
+               },
+               844
+             )
 
     assert %{"v" => 1, "type" => "ok", "ref" => "answered-ref"} =
              request(relay, "reader", %{
@@ -2540,9 +2485,14 @@ defmodule AttentionServer.ConversationFeedTest do
                "text" => "This request is answered"
              })
 
-    assert {:ok, status} = Relay.origin_status(relay, "origin", @handle)
-    assert status["open_requests"] == 1
-    assert status["open_chats"] == 2
+    assert %{"terminal" => %{"state" => "answered", "answer" => "Done"}} =
+             agent_message(relay, "answered")
+
+    refute Map.has_key?(agent_message(relay, "sibling"), "terminal")
+
+    assert Enum.map(agent_entries(relay, "answered"), & &1["text"]) == [
+             "This request is answered"
+           ]
 
     assert {:ok, history, _high} = Relay.conversation_events(relay, "reader", 0)
     assert Enum.any?(history, &(&1["text"] == "This sibling is still open"))
@@ -2658,19 +2608,17 @@ defmodule AttentionServer.ConversationFeedTest do
     refute Map.has_key?(origin_reference, "state")
     refute Map.has_key?(origin_reference, "retracted_at")
 
-    assert {:ok, %{"entries" => [_, discussion, terminal]}} =
-             Relay.origin_feed(relay, "origin", 0)
-
-    assert discussion["acted"] == true
-    assert terminal["kind"] == "terminal"
-    assert terminal["channel"] == "reply"
+    agent_feed(relay)
+    assert [discussion, terminal] = agent_entries(relay, "withdrawn")
+    assert discussion["delivery"] == %{"acted" => true, "delivered" => true}
+    assert terminal["kind"] == "lifecycle"
     assert terminal["author"] == "origin"
-    assert terminal["terminal_state"] == "retracted"
-    assert terminal["retracted_at"] == retracted_at
-    refute terminal["has_answer"]
-    refute Map.has_key?(terminal, "answer")
+    assert terminal["state"] == "retracted"
+    assert %{"terminal" => message_terminal} = agent_message(relay, "withdrawn")
+    assert message_terminal == %{"state" => "retracted", "at_ms" => retracted_at}
+    {:ok, [discussion_fact | _], _} = Relay.conversation_events(relay, "reader", 0)
     assert {:ok, [lifecycle], 2} = Relay.events(relay, "reader", 1)
-    assert lifecycle["event_id"] == terminal["event_id"]
+    terminal_event_id = lifecycle["event_id"]
     assert lifecycle["author"] == "origin"
     assert lifecycle["state"] == "cleared"
     assert lifecycle["terminal_reason"] == "retracted"
@@ -2681,15 +2629,15 @@ defmodule AttentionServer.ConversationFeedTest do
              Relay.conversation_events(relay, "reader", 0)
 
     assert delivery_ack["kind"] == "delivery_ack"
-    assert delivery_ack["event_id"] == discussion["event_id"]
+    assert delivery_ack["event_id"] == discussion_fact["event_id"]
     assert retraction["kind"] == "retraction"
     assert retraction["terminal_state"] == "retracted"
     assert retraction["retracted_at"] == retracted_at
-    assert retraction["event_id"] == terminal["event_id"]
+    assert retraction["event_id"] == terminal_event_id
     assert retraction["request_revision"] == 1
     assert retraction["session_handle"] == @handle
     assert acted["kind"] == "acted"
-    assert acted["acting_event_id"] == terminal["event_id"]
+    assert acted["acting_event_id"] == terminal_event_id
 
     assert %{"type" => "error", "reason" => "unknown_type"} =
              request(relay, "origin", %{
@@ -2740,13 +2688,9 @@ defmodule AttentionServer.ConversationFeedTest do
     assert {:ok, [_, %{"kind" => "retraction", "event_id" => retraction_id}, _, ^delivery_ack], 4} =
              Relay.conversation_events(restarted, "reader", 0)
 
-    assert retraction_id == terminal["event_id"]
-
-    assert {:ok, %{"entries" => [_, _, persisted_terminal]}} =
-             Relay.origin_feed(restarted, "origin", 0)
-
-    assert persisted_terminal["terminal_state"] == "retracted"
-    assert persisted_terminal["retracted_at"] == retracted_at
+    assert retraction_id == terminal_event_id
+    assert [_, ^terminal] = agent_entries(restarted, "withdrawn")
+    assert %{"terminal" => ^message_terminal} = agent_message(restarted, "withdrawn")
 
     assert %{
              "type" => "ok",
@@ -2855,9 +2799,13 @@ defmodule AttentionServer.ConversationFeedTest do
     assert %{"type" => "ok", "seq" => 2, "duplicate" => true} =
              request(relay, "origin", reply)
 
-    assert {:ok, %{"entries" => entries}} = Relay.origin_feed(relay, "origin", 0)
-    assert Enum.map(entries, & &1["kind"]) == ["revision", "discussion", "reply", "terminal"]
-    assert List.last(entries)["terminal_state"] == "retracted"
+    entries = agent_entries(relay, "discussion-reply")
+
+    assert Enum.map(entries, &{&1["kind"], &1["author"]}) ==
+             [{"reply", "person"}, {"reply", "origin"}, {"lifecycle", "origin"}]
+
+    assert List.last(entries)["state"] == "retracted"
+    assert %{"terminal" => %{"state" => "retracted"}} = agent_message(relay, "discussion-reply")
 
     # After the withdrawal the agent may still reply, and the person may still
     # write; the retraction stays as it was.
@@ -2867,9 +2815,14 @@ defmodule AttentionServer.ConversationFeedTest do
     assert %{"type" => "ok"} =
              request(relay, "reader", %{discussion | "op_id" => op(55), "text" => "Thanks"})
 
-    assert {:ok, %{"entries" => later}} = Relay.origin_feed(relay, "origin", 0)
-    assert Enum.at(later, 3)["terminal_state"] == "retracted"
-    assert Enum.count(later, &(&1["kind"] == "terminal")) == 1
+    later = agent_entries(relay, "discussion-reply")
+    assert Enum.take(later, 3) == entries
+
+    assert Enum.map(Enum.drop(later, 3), &{&1["author"], &1["text"]}) ==
+             [{"origin", "A late reply"}, {"person", "Thanks"}]
+
+    assert Enum.count(later, &(&1["kind"] == "lifecycle")) == 1
+    assert %{"terminal" => %{"state" => "retracted"}} = agent_message(relay, "discussion-reply")
 
     GenServer.stop(relay)
   end
@@ -2915,9 +2868,10 @@ defmodule AttentionServer.ConversationFeedTest do
     assert {:ok, [lifecycle], 2} = Relay.events(relay, "reader", 1)
     assert lifecycle["state"] == "answered"
 
-    assert {:ok, %{"entries" => [_, terminal]}} = Relay.origin_feed(relay, "origin", 0)
-    assert terminal["terminal_state"] == "answered"
+    assert %{"terminal" => terminal} = agent_message(relay, "answer-wins")
+    assert terminal["state"] == "answered"
     assert terminal["answer"] == "Done"
+    assert agent_entries(relay, "answer-wins") == []
     GenServer.stop(relay)
   end
 
@@ -2958,24 +2912,37 @@ defmodule AttentionServer.ConversationFeedTest do
     assert initial["listening_support"]["origin"] == "origin"
     assert is_integer(initial["listening_support"]["reported_at"])
 
-    assert :ok = Relay.origin_stream_attach(relay, "origin", @handle, self())
+    # The origin's open v2 agent feed for the session is what listens now.
+    agent_feed_activity(relay, :open)
     assert {:ok, [listening], 1} = Relay.conversation_events(relay, "reader", 0)
     assert listening["type"] == "conversation"
     assert listening["kind"] == "availability"
     assert listening["availability"] == "listening"
     assert listening["session_handle"] == @handle
+    assert listening["listening_support"]["route"] == "claude-code"
     refute Map.has_key?(listening, "message")
     assert {:ok, [origin_listening], 1} = Relay.conversation_events(relay, "origin", 0)
     assert origin_listening["availability"] == "listening"
     refute Map.has_key?(origin_listening, "message")
 
-    assert :ok = Relay.origin_stream_detach(relay, "origin", @handle, self())
+    agent_feed_activity(relay, :close)
     assert {:ok, [detached], 2} = Relay.conversation_events(relay, "reader", 1)
     assert detached["availability"] == "not_listening"
     assert is_integer(detached["last_detached_at"])
 
-    assert :ok = Relay.origin_session_gone(relay, "origin", @handle)
-    assert :ok = Relay.origin_session_gone(relay, "origin", @handle)
+    for n <- [52, 53] do
+      assert {:ok, 200, _, false} =
+               AgentAPIInProcess.write(
+                 relay,
+                 "A",
+                 "origin",
+                 :session_end,
+                 %{session: @handle},
+                 %{},
+                 op(n)
+               )
+    end
+
     assert {:ok, [gone], 3} = Relay.conversation_events(relay, "reader", 2)
     assert gone["availability"] == "gone"
     assert gone["request_revision"] == 1
@@ -2990,8 +2957,7 @@ defmodule AttentionServer.ConversationFeedTest do
     assert Enum.map(replayed, & &1["availability"]) ==
              ~w(not_listening listening not_listening gone)
 
-    assert {:ok, %{"availability" => "gone"}} =
-             Relay.origin_status(restarted, "origin", @handle)
+    assert %{"availability" => %{"state" => "gone"}} = agent_message(restarted, "availability")
 
     GenServer.stop(restarted)
   end
@@ -3024,7 +2990,7 @@ defmodule AttentionServer.ConversationFeedTest do
     {before_version, before_payload, before_checksum} = state_snapshot(path)
     assert :crypto.hash(:sha256, before_payload) == before_checksum
 
-    assert :ok = Relay.origin_stream_attach(relay, "origin", @handle, self())
+    agent_feed_activity(relay, :open)
     {after_version, after_payload, after_checksum} = state_snapshot(path)
 
     assert after_version == before_version + 1
@@ -3044,11 +3010,13 @@ defmodule AttentionServer.ConversationFeedTest do
 
     assert {:ok, [initial], 1} = Relay.events(restarted, "reader", 0)
     assert initial["availability"] == "not_listening"
-    assert {:ok, [replayed], 1} = Relay.conversation_events(restarted, "reader", 0)
-    assert replayed["availability"] == "listening"
 
-    assert {:ok, %{"availability" => "not_listening"}} =
-             Relay.origin_status(restarted, "origin", @handle)
+    # The listening fact replays; no feed is open after the restart, so the
+    # Relay records the session as not listening once.
+    assert {:ok, [replayed, reset], 2} = Relay.conversation_events(restarted, "reader", 0)
+    assert replayed == listening
+    assert reset["availability"] == "not_listening"
+    assert is_integer(reset["last_detached_at"])
 
     assert {:error, :person_exists} = Relay.setup_person(restarted, "B")
 
@@ -3058,7 +3026,7 @@ defmodule AttentionServer.ConversationFeedTest do
     GenServer.stop(restarted)
   end
 
-  test "support writes persist their receipt and replay after a cold reopen", %{
+  test "a stored 0.1 support record decodes on a cold reopen and still feeds availability", %{
     path: path
   } do
     assert {:ok, relay} = Relay.start_link(store_path: path)
@@ -3081,6 +3049,11 @@ defmodule AttentionServer.ConversationFeedTest do
 
     assert %{"type" => "ok", "seq" => 1} = request(relay, "origin", forward)
 
+    GenServer.stop(relay)
+
+    # A 0.1 origin declared listening support for its session; client API v2
+    # never writes one. The stored record decodes on a cold reopen and still
+    # feeds the session's availability facts.
     support = %{
       "type" => "support",
       "op_id" => op(92),
@@ -3090,42 +3063,22 @@ defmodule AttentionServer.ConversationFeedTest do
       "unsupported_reason" => nil
     }
 
-    {before_version, before_payload, before_checksum} = state_snapshot(path)
-    assert :crypto.hash(:sha256, before_payload) == before_checksum
-
-    assert {:error, :not_found} = Relay.origin_support(relay, "reader", support)
-
-    assert state_snapshot(path) == {before_version, before_payload, before_checksum}
-
-    assert {:ok, %{"listening_support" => %{"route" => "claude-code"} = declared}} =
-             Relay.origin_support(relay, "origin", support)
-
+    PreChangeLogStore.write(path, &PreChangeLogStore.origin_support(&1, "origin", support))
+    {:ok, store} = Store.open(path)
+    declared = store.engine.origin_sessions[{"A", "origin", @handle}].support
+    :ok = Store.close(store)
+    assert %{"route" => "claude-code", "origin" => "origin"} = declared
     assert is_integer(declared["reported_at"])
-    {support_version, support_payload, support_checksum} = state_snapshot(path)
-    assert support_version == before_version + 1
-    assert support_payload != before_payload
-    assert :crypto.hash(:sha256, support_payload) == support_checksum
 
-    assert :ok = Relay.origin_stream_attach(relay, "origin", @handle, self())
-    {attach_version, attach_payload, attach_checksum} = state_snapshot(path)
-    assert attach_version == support_version + 1
-    assert attach_payload != support_payload
-    assert :crypto.hash(:sha256, attach_payload) == attach_checksum
-
-    GenServer.stop(relay)
     cold_store_reopen(path)
     assert {:ok, restarted} = Relay.start_link(store_path: path)
 
-    assert {:ok, %{"listening_support" => ^declared}} =
-             Relay.origin_status(restarted, "origin", @handle)
+    assert :sys.get_state(restarted).store.engine.origin_sessions[{"A", "origin", @handle}].support ==
+             declared
 
-    assert {:ok, [supported, listening], 2} =
-             Relay.conversation_events(restarted, "reader", 0)
-
-    assert supported["kind"] == "availability"
-    assert supported["listening_support"] == declared
-    assert listening["availability"] == "listening"
-    assert listening["listening_support"] == declared
+    agent_feed_activity(restarted, :open)
+    assert {:ok, facts, _} = Relay.conversation_events(restarted, "reader", 0)
+    assert %{"availability" => "listening", "listening_support" => ^declared} = List.last(facts)
 
     duplicate_state = state_snapshot(path)
 
@@ -3134,14 +3087,7 @@ defmodule AttentionServer.ConversationFeedTest do
 
     assert state_snapshot(path) == duplicate_state
 
-    assert {:ok, %{"duplicate" => true, "listening_support" => ^declared}} =
-             Relay.origin_support(restarted, "origin", support)
-
-    assert state_snapshot(path) == duplicate_state
-
-    assert {:error, :operation_conflict} =
-             Relay.origin_support(restarted, "origin", %{support | "route" => "codex"})
-
+    {attach_version, attach_payload, _} = duplicate_state
     assert :ok = Relay.setup_person(restarted, "B")
     {folded_version, folded_payload, folded_checksum} = state_snapshot(path)
     assert folded_version > attach_version
@@ -3151,11 +3097,8 @@ defmodule AttentionServer.ConversationFeedTest do
     GenServer.stop(restarted)
     assert {:ok, folded_restart} = Relay.start_link(store_path: path)
 
-    assert {:ok, %{"duplicate" => true, "listening_support" => ^declared}} =
-             Relay.origin_support(folded_restart, "origin", support)
-
-    assert {:ok, %{"listening_support" => ^declared}} =
-             Relay.origin_status(folded_restart, "origin", @handle)
+    assert :sys.get_state(folded_restart).store.engine.origin_sessions[{"A", "origin", @handle}].support ==
+             declared
 
     GenServer.stop(folded_restart)
   end

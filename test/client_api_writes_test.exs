@@ -328,7 +328,7 @@ defmodule AttentionServer.ClientAPIWritesTest do
                })
 
       # The agent stops listening; chat stays open and the reply is held for it.
-      assert :ok = Relay.origin_session_gone(relay, "origin", @handle)
+      assert :ok = GenServer.call(relay, {:origin_session_gone, "origin", @handle, :agent_v2})
 
       for id <- ["one", "answered", "cleared", "retracted"] do
         item = item_id(relay, id)

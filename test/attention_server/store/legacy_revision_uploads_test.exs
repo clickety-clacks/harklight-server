@@ -62,10 +62,8 @@ defmodule AttentionServer.Store.LegacyRevisionUploadsTest do
     assert {:ok, %{id: ^id}, file_path} = Relay.fetch_file(relay, "reader", id)
     assert File.read!(file_path) == @bytes
 
-    discard = Map.take(attributes, ~w(op_id sender_id message_id revision))
-
-    assert {:ok, %{"state" => "committed", "discarded" => 0}} =
-             Relay.discard_uploads(relay, "origin", discard)
+    # The request references the upload, so it is committed and not discardable.
+    assert MapSet.member?(:sys.get_state(relay).upload_index.references_by_person["A"], id)
 
     assert :ok = GenServer.stop(relay)
     %{path: path, file_path: file_path, id: id}

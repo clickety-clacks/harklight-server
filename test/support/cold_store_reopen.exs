@@ -54,20 +54,9 @@ support_record =
 {:ok, relay} = AttentionServer.Relay.start_link(store_path: store_path)
 
 try do
-  {:ok, status} = AttentionServer.Relay.origin_status(relay, origin, handle)
-  ^support_record = status["listening_support"]
-
-  support = %{
-    "type" => "support",
-    "op_id" => System.fetch_env!("COLD_SUPPORT_OP"),
-    "session_handle" => handle,
-    "route" => "claude-code",
-    "cli_version" => "test-only",
-    "unsupported_reason" => nil
-  }
-
-  {:ok, %{"duplicate" => true, "listening_support" => ^support_record}} =
-    AttentionServer.Relay.origin_support(relay, origin, support)
+  # The Relay serves the decoded record unchanged.
+  ^support_record =
+    :sys.get_state(relay).store.engine.origin_sessions[{person, origin, handle}].support
 
   IO.puts("COLD_STORE_REOPEN_AND_USE_OK")
 after

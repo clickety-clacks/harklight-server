@@ -5,7 +5,7 @@ defmodule AttentionServer.ClientAPIFocusTest do
   use ExUnit.Case, async: false
 
   alias AttentionServer.{ChangeLog, JSON, Relay}
-  alias AttentionServer.ClientAPI.{Focus, Reads, Writes}
+  alias AttentionServer.ClientAPI.{AgentShow, Context, Focus, Reads, Writes}
 
   @handle "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
   @agent String.duplicate("e", 64)
@@ -77,17 +77,39 @@ defmodule AttentionServer.ClientAPIFocusTest do
     id
   end
 
+  # The agent's focus list, in today's identifiers, as GET /v2/agent/focus
+  # reads it before projecting.
   defp clients(relay) do
-    assert {:ok, %{"clients" => clients}} = Relay.focus_get(relay, @agent)
+    assert {:ok, clients} = Relay.agent_focus(:sys.get_state(relay), "A", @agent)
     clients
   end
 
-  defp push_view(relay, target \\ "message") do
-    Relay.view_show(relay, @agent, %{
-      "sender_id" => "app:test",
-      "message_id" => "one",
-      "target" => target
-    })
+  # POST /v2/agent/show for the item, run in-process for the trusted agent key.
+  # The request waits for a subscribed feed writer, so run it in a task when
+  # the test process is subscribed.
+  defp show(relay, item, target) do
+    key =
+      "00000000-0000-4000-8000-" <>
+        String.pad_leading("#{System.unique_integer([:positive])}", 12, "0")
+
+    conn =
+      Plug.Test.conn(
+        :post,
+        "/v2/agent/show",
+        JSON.encode!(%{"item_id" => item, "target" => target})
+      )
+      |> Plug.Conn.put_req_header("idempotency-key", key)
+
+    ctx = %Context{
+      principal: %{kind: :device, person: "A", key: @agent},
+      relay: relay,
+      request_id: "focus-show-test"
+    }
+
+    conn = AgentShow.show(conn, ctx)
+    assert conn.status == 200
+    assert {:ok, body} = JSON.decode_line(conn.resp_body <> "\n")
+    body
   end
 
   test "a focus write is today's focus report, in today's identifiers", ctx do
@@ -189,17 +211,27 @@ defmodule AttentionServer.ClientAPIFocusTest do
     :ok = Focus.subscribe_shows("reader")
 
     at(ctx, 5_000)
-    assert {:ok, %{"client_id" => "reader", "delivery" => "held"}} = push_view(relay, "chat")
+    request = Task.async(fn -> show(relay, item, "chat") end)
 
-    assert_receive {:client_api_show, "reader"}, 1_000
+    # The subscribed feed is offered the show; this one reports it held.
+    assert_receive {:client_api_show, "reader", show_id, result_ref}, 1_000
+    send(result_ref, {result_ref, :held})
+
+    assert %{"show_id" => ^show_id, "device_id" => "reader", "state" => "held"} =
+             Task.await(request)
 
     # The feed computes held_ms when it writes the event (round 11 r4 §4).
     live = Focus.pending_show(relay, "reader")
     at(ctx, 5_400)
     assert Focus.pending_show(relay, "reader")["held_ms"] == 400
 
-    assert %{"device_id" => "reader", "item_id" => ^item, "target" => "chat", "held_ms" => 0} =
-             live
+    assert %{
+             "show_id" => ^show_id,
+             "device_id" => "reader",
+             "item_id" => ^item,
+             "target" => "chat",
+             "held_ms" => 0
+           } = live
 
     at(ctx, 5_750)
 
@@ -213,8 +245,8 @@ defmodule AttentionServer.ClientAPIFocusTest do
 
     # A feed that closes unsubscribes; later shows are not sent to it.
     :ok = Focus.unsubscribe_shows("reader")
-    assert {:ok, _} = push_view(relay, "message")
-    refute_receive {:client_api_show, "reader"}, 200
+    assert %{"state" => "held"} = show(relay, item, "message")
+    refute_receive {:client_api_show, "reader", _, _}, 200
 
     assert {:ok, 200, %{"show" => %{"target" => "message"}}, false} =
              Writes.focus(relay, "reader", %{"screen" => "inbox", "ttl_s" => 120})
@@ -227,8 +259,8 @@ defmodule AttentionServer.ClientAPIFocusTest do
     assert {:ok, %{"item" => %{"seen" => false}}} = Reads.item(relay, "reader", item)
 
     # Only the latest show is held, and it survives the device leaving the list.
-    assert {:ok, _} = push_view(relay, "message")
-    assert {:ok, _} = push_view(relay, "chat")
+    assert %{"state" => "held"} = show(relay, item, "message")
+    assert %{"state" => "held"} = show(relay, item, "chat")
 
     assert {:ok, 200, _, false} =
              Writes.focus(relay, "reader", %{"screen" => "signed_out", "ttl_s" => 120})

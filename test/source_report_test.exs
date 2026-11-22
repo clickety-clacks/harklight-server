@@ -1,7 +1,7 @@
 defmodule AttentionServer.SourceReportTest do
   use ExUnit.Case, async: false
 
-  alias AttentionServer.{Engine, JSON, LegacyOriginWire, Relay, Store}
+  alias AttentionServer.{Engine, JSON, Relay, Store}
   alias Exqlite.Sqlite3
 
   setup do
@@ -32,14 +32,10 @@ defmodule AttentionServer.SourceReportTest do
       "00000000-0000-4000-8000-" <>
         (n |> Integer.to_string(16) |> String.downcase() |> String.pad_leading(12, "0"))
 
-  defp send_origin(relay, key, operation_id, value) do
-    LegacyOriginWire.command(relay, key, %{
-      "v" => 1,
-      "type" => "send",
-      "op_id" => operation_id,
-      "message" => value
-    })
-  end
+  # The origin's send is the request line's `forward`, as the protocol 0.1
+  # origin route mapped it.
+  defp send_origin(relay, key, operation_id, value),
+    do: request(relay, key, %{"type" => "forward", "op_id" => operation_id, "message" => value})
 
   defp message(id) do
     %{
