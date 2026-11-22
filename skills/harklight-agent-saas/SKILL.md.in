@@ -14,7 +14,7 @@ Harklight on iPhone does not use your website password. Instead, you invite the 
 
 The iPhone app is a public beta. Joining a hosted account from it, and receiving and answering messages in it, have not yet been confirmed end to end. The steps below follow the beta app and the website as they are built. If a screen does not match a step, stop there rather than looking for another way to connect.
 
-1. Sign in to [your Harklight account](https://app.harklight.net/account/sign-in), open [Devices](https://app.harklight.net/devices) and choose Create invitation. The Invitation ready page shows your account.
+1. Sign in to [your Harklight account](https://app.harklight.net/account/sign-in), open [Devices](https://app.harklight.net/devices) and choose Create invitation. The Invitation ready page shows your account and that the invitation has no expiry.
 2. Get the invitation onto your iPhone. Use Share invitation or Copy tappable link to send yourself the tappable invitation link, then tap it on the iPhone; it opens Harklight. If the link won't open, copy the Full invitation for Paste instead, open Harklight, paste it into Full invitation and choose Check invitation.
 3. On the Join screen, check that You join as shows your account, give the device a name if you like, and choose Join. Harklight shows an approval code and waits for approval. You can leave the app; it remembers the request.
 4. Back in Devices, under Waiting for approval, choose Review exact request for your iPhone. Check that Code on device matches the code on your iPhone and that Joins as shows your account, then choose Approve this exact device. If a Sender IDs field appears, leave it empty: the phone receives requests and needs no sender rights.
@@ -53,11 +53,11 @@ Start enrollment with the hosted service's connection settings:
 
 ```sh
 harklight-agent --identity-dir ./my-agent-identity --ca-file ./harklight-agent-ca.pem \
-  enroll start --connect app.harklight.net --name app.harklight.net \
-  --port 18444 --origin-port 18450 --label "My agent"
+  --device-port 18443 enroll start --connect app.harklight.net --name app.harklight.net \
+  --port 18444 --label "My agent"
 ```
 
-The CLI generates the identity locally and prints an approval code. Keep its directory and private key on the agent's computer. A pending code is not permission to send. Port 18444 is the enrollment route; port 18450 is the origin messaging route. The separate relay port is not a substitute for the origin port.
+The CLI generates the identity locally and prints an approval code. Keep its directory and private key on the agent's computer. A pending code is not permission to send. Port 18444 is the enrollment route; port 18443 is the device port, which serves client API v2.
 
 Open [Devices](https://app.harklight.net/devices) in the intended owner account. Select the waiting request with that exact code, check its label and identity, enter `app:my-agent` in Sender IDs and approve. Approval without a sender grant does not permit sending. If this is the wrong account, leave it unapproved and sign into the intended account first.
 

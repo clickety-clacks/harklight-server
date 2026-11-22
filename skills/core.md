@@ -67,7 +67,9 @@ Preserve the private journal and staged files across restarts. Its default is
 `~/.local/state/harklight-agent`. It keeps one feed cursor per scope (each
 session filter, plus a separate unfiltered scope), entries and operation
 recovery state for the enrolled device in SQLite. The first read of a scope
-takes a fresh baseline; a protocol 0.1 feed cursor is not converted.
+takes a fresh baseline; a protocol 0.1 feed cursor is not converted. Finish or
+abandon unresolved 0.1 operations with the 0.1 CLI before switching; old cursors
+are not used; pending enrollments survive.
 History has no retention limit; keep adequate disk space. Resetting this state
 is not a reply-retrieval or uncertain-send recovery procedure.
 
