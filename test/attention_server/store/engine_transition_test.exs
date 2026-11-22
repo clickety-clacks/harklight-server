@@ -10,6 +10,7 @@ defmodule AttentionServer.Store.EngineTransitionTest do
   @person "a"
   @origin String.duplicate("a", 64)
   @reader String.duplicate("b", 64)
+  @owner_person "00000000-0000-4000-8000-0000000000aa"
   @derived [
     :advisory_id_index,
     :bounce_deadline_index,
@@ -166,22 +167,28 @@ defmodule AttentionServer.Store.EngineTransitionTest do
     :ok = Store.close(reopened)
   end
 
-  test "direct cursor and conversation writers emit their touched records" do
-    engine = normalized_legacy_engine()
-    {engine, {:ok, _}} = Engine.request_line(engine, @origin, forward_line(), 100)
+  test "operator bootstrap and recovery report every touched record" do
+    owner = String.duplicate("c", 64)
+    recovered = String.duplicate("d", 64)
+    engine = Engine.new()
 
     {next, :ok, keys} =
       Engine.with_touches(engine, fn current ->
-        {:ok, current, _reply} = Engine.acknowledge(current, @reader, 1, 1)
-        {:ok, current} = Engine.open_conversation(current, @reader)
-        {:ok, current, _reply} = Engine.acknowledge_conversation(current, @reader, 0, 0)
+        {:ok, current} = Engine.operator_bootstrap(current, @owner_person, owner)
         {current, :ok}
       end)
 
     assert keys == full_diff(engine, next)
-    assert MapSet.member?(keys, {:row, :cursors, {@person, @reader}})
-    assert MapSet.member?(keys, {:member, :conversation_opened, {@person, @reader}})
-    assert MapSet.member?(keys, {:row, :conversation_cursors, {@person, @reader}})
+    assert MapSet.member?(keys, {:row, :owners, @owner_person})
+
+    {recovered_engine, :ok, keys} =
+      Engine.with_touches(next, fn current ->
+        {:ok, current} = Engine.operator_recover(current, @owner_person, recovered)
+        {current, :ok}
+      end)
+
+    assert keys == full_diff(next, recovered_engine)
+    assert MapSet.member?(keys, {:member, :retired_owner_keys, owner})
   end
 
   defp index_state(store) do

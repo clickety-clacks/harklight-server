@@ -71,7 +71,7 @@ defmodule AttentionServer.DeviceProgressTest do
     assert snapshot(path) == before
 
     {:ok, store} = Store.open(path)
-    {:ok, opened} = Engine.open_conversation(store.engine, "reader")
+    opened = Engine.put_member(store.engine, :conversation_opened, {"A", "reader"})
     {:ok, store} = Store.commit(store, opened, audit())
 
     store =
