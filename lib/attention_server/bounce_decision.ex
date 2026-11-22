@@ -141,10 +141,6 @@ defmodule AttentionServer.BounceDecision do
     end
   end
 
-  def advisory_supported?(%Engine{} = engine, person, origin, handle) do
-    match?({:ok, _}, supported_session(engine, person, origin, handle))
-  end
-
   def advisory_cursor(%Engine{} = engine, person, origin, handle) do
     Map.get(engine.advisory_feeds, {person, origin, handle}, empty_advisory_feed()).high
   end
@@ -284,50 +280,11 @@ defmodule AttentionServer.BounceDecision do
     end)
   end
 
-  def advisory_feed(%Engine{} = engine, key, handle, since) do
-    with {:ok, person} <- Engine.authorized_person(engine, key),
-         true <- Message.uuid_v4?(handle),
-         true <- is_integer(since) and since >= 0,
-         {:ok, _session} <- supported_session(engine, person, key, handle) do
-      feed = Map.get(engine.advisory_feeds, {person, key, handle}, empty_advisory_feed())
-
-      if since <= feed.high do
-        entries =
-          if since == feed.high do
-            []
-          else
-            Enum.map((since + 1)..feed.high, fn sequence ->
-              entry = Map.fetch!(feed.entries, sequence)
-
-              entry
-              |> Map.delete("decided_at_rev")
-              |> Map.put("delivered", MapSet.member?(feed.receipts, entry["advisory_id"]))
-            end)
-          end
-
-        {:ok,
-         %{
-           "advisory_v1" => true,
-           "session_handle" => handle,
-           "cursor" => feed.high,
-           "entries" => entries
-         }}
-      else
-        {:error, :invalid_cursor}
-      end
-    else
-      false -> {:error, :invalid_field}
-      {:error, :not_found} -> {:error, :not_found}
-      {:error, :forbidden} -> {:error, :forbidden}
-      _ -> {:error, :invalid_cursor}
-    end
-  end
-
-  def advisory_ack(%Engine{} = engine, key, handle, advisory_id, v2? \\ false) do
+  def advisory_ack(%Engine{} = engine, key, handle, advisory_id) do
     with {:ok, person} <- Engine.authorized_person(engine, key),
          true <- Message.uuid_v4?(handle),
          true <- Message.uuid_v4?(advisory_id),
-         {:ok, _session} <- advisory_ack_session(engine, person, key, handle, v2?) do
+         {:ok, _session} <- advisory_ack_session(engine, person, key, handle) do
       feed_key = {person, key, handle}
       feed = Map.get(engine.advisory_feeds, feed_key, empty_advisory_feed())
 
@@ -363,10 +320,7 @@ defmodule AttentionServer.BounceDecision do
     end
   end
 
-  defp advisory_ack_session(engine, person, key, handle, false),
-    do: supported_session(engine, person, key, handle)
-
-  defp advisory_ack_session(engine, person, key, handle, true),
+  defp advisory_ack_session(engine, person, key, handle),
     do: Map.fetch(engine.origin_sessions, {person, key, handle}) |> normalize_advisory_session()
 
   defp normalize_advisory_session({:ok, _} = session), do: session
@@ -612,19 +566,6 @@ defmodule AttentionServer.BounceDecision do
           _ ->
             :unsupported
         end
-    end
-  end
-
-  defp supported_session(engine, person, origin, handle) do
-    case Map.get(engine.origin_sessions, {person, origin, handle}) do
-      %{support: %{"advisory_v1" => true, "unsupported_reason" => nil}, gone: false} = session ->
-        {:ok, session}
-
-      nil ->
-        {:error, :not_found}
-
-      _ ->
-        {:error, :not_found}
     end
   end
 

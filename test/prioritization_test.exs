@@ -2608,7 +2608,7 @@ defmodule AttentionServer.PrioritizationTest do
     assert RouteBIndex.scored_reply_items(engine.route_b_index, "person-a") ==
              MapSet.new([published])
 
-    assert {next, [{"person-a", 3}]} = Engine.retain_reply_scores(engine, "person-a", [], true)
+    assert {next, [{"person-a", 3}]} = Engine.retain_reply_scores(engine, "person-a", [])
     assert next.reply_group_history[published] == %{score: 0.9, scores: %{}}
     assert next.reply_group_history[historical] == engine.reply_group_history[historical]
     assert next.reply_group_history[other] == engine.reply_group_history[other]
@@ -2637,7 +2637,7 @@ defmodule AttentionServer.PrioritizationTest do
         Enum.min(
           for _ <- 1..5 do
             {:reductions, start} = Process.info(self(), :reductions)
-            result = Engine.retain_reply_scores(engine, "person-a", entries, true)
+            result = Engine.retain_reply_scores(engine, "person-a", entries)
             {:reductions, finish} = Process.info(self(), :reductions)
             assert {_next, [{"person-a", 3}]} = result
             finish - start

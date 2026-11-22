@@ -2644,7 +2644,7 @@ defmodule AttentionServer.Relay do
 
   @doc false
   def apply_agent_advisory_ack(state, key, handle, advisory_id) do
-    case BounceDecision.advisory_ack(state.store.engine, key, handle, advisory_id, true) do
+    case BounceDecision.advisory_ack(state.store.engine, key, handle, advisory_id) do
       {:ok, next, reply} when next == state.store.engine ->
         {{:ok, reply}, state}
 
@@ -2838,12 +2838,7 @@ defmodule AttentionServer.Relay do
     engine_entries = Map.get(view, :engine_entries, Map.get(view, :entries, []))
 
     {next, projected_entries} =
-      Engine.retain_reply_scores(
-        state.store.engine,
-        person,
-        engine_entries,
-        state.store.change_log
-      )
+      Engine.retain_reply_scores(state.store.engine, person, engine_entries)
 
     audit = %{person: person, actor: "server", action: "reply_group_scores"}
 
