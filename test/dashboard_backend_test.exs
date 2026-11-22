@@ -197,10 +197,12 @@ defmodule AttentionServer.DashboardBackendTest do
              })
   end
 
-  test "configured self-host owner sees device metadata across persons; another owner sees only their own" do
+  @tag :tmp_dir
+  test "configured self-host owner sees device metadata across persons; another owner sees only their own",
+       %{tmp_dir: dir} do
     certs = TLSFixtures.create!()
     on_exit(fn -> File.rm_rf!(certs) end)
-    {:ok, relay} = Relay.start_link()
+    {:ok, relay} = Relay.start_link(store_path: Path.join(dir, "state.sqlite3"))
 
     owner_a = TLSFixtures.certificate_der!(certs, "a1")
     owner_b = TLSFixtures.certificate_der!(certs, "b1")
@@ -283,10 +285,12 @@ defmodule AttentionServer.DashboardBackendTest do
     assert (request(cookie_a) |> DashboardReadHTTP.call(opts)).status == 401
   end
 
-  test "one-use Relay owner link becomes a secure browser cookie and cannot be replayed" do
+  @tag :tmp_dir
+  test "one-use Relay owner link becomes a secure browser cookie and cannot be replayed",
+       %{tmp_dir: dir} do
     certs = TLSFixtures.create!()
     on_exit(fn -> File.rm_rf!(certs) end)
-    {:ok, relay} = Relay.start_link()
+    {:ok, relay} = Relay.start_link(store_path: Path.join(dir, "state.sqlite3"))
     owner_cert = TLSFixtures.certificate_der!(certs, "a1")
     {:ok, person} = Relay.operator_bootstrap(relay, owner_cert)
     {:ok, key} = DeviceIdentity.from_certificate(owner_cert)
@@ -330,10 +334,12 @@ defmodule AttentionServer.DashboardBackendTest do
              401
   end
 
-  test "signed-in owner confirms removal, sees revoked state, and the removed device is refused" do
+  @tag :tmp_dir
+  test "signed-in owner confirms removal, sees revoked state, and the removed device is refused",
+       %{tmp_dir: dir} do
     certs = TLSFixtures.create!()
     on_exit(fn -> File.rm_rf!(certs) end)
-    {:ok, relay} = Relay.start_link()
+    {:ok, relay} = Relay.start_link(store_path: Path.join(dir, "state.sqlite3"))
     owner_cert = TLSFixtures.certificate_der!(certs, "a1")
     {:ok, person} = Relay.operator_bootstrap(relay, owner_cert)
     {:ok, owner_key} = DeviceIdentity.from_certificate(owner_cert)
@@ -418,14 +424,18 @@ defmodule AttentionServer.DashboardBackendTest do
              Relay.request_line(relay, device_key, JSON.encode!(forward) <> "\n")
   end
 
-  test "signed-in owner preserves invitation approval and grants sender rights during CLI approval" do
+  @tag :tmp_dir
+  test "signed-in owner preserves invitation approval and grants sender rights during CLI approval",
+       %{tmp_dir: dir} do
     certs = TLSFixtures.create!()
     on_exit(fn -> File.rm_rf!(certs) end)
 
     {:ok, join} =
       GuidedJoin.configuration("relay.test", 18444, 18443, File.read!(Path.join(certs, "ca.pem")))
 
-    {:ok, relay} = Relay.start_link(join_configuration: join)
+    {:ok, relay} =
+      Relay.start_link(store_path: Path.join(dir, "state.sqlite3"), join_configuration: join)
+
     owner_cert = TLSFixtures.certificate_der!(certs, "a1")
     device_cert = TLSFixtures.certificate_der!(certs, "a2")
     {:ok, person} = Relay.operator_bootstrap(relay, owner_cert)

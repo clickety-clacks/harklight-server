@@ -10,10 +10,12 @@ defmodule AttentionServer.BrowserRelayRecipientTest do
   defp op(n),
     do: "00000000-0000-4000-8000-" <> String.pad_leading(Integer.to_string(n), 12, "0")
 
-  setup do
+  @moduletag :tmp_dir
+
+  setup %{tmp_dir: dir} do
     certs = TLSFixtures.create!()
     owner_cert = TLSFixtures.certificate_der!(certs, "a1")
-    {:ok, relay} = Relay.start_link()
+    {:ok, relay} = Relay.start_link(store_path: Path.join(dir, "state.sqlite3"))
     {:ok, person} = Relay.operator_bootstrap(relay, owner_cert)
     {:ok, owner_key} = DeviceIdentity.from_certificate(owner_cert)
 

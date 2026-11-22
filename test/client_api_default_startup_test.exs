@@ -1,8 +1,8 @@
 defmodule AttentionServer.ClientAPIDefaultStartupTest do
   # Server 0.2.0 serves client API v2 only: a supervised Server starts /v2,
   # both change logs and the v2 dashboard origin, whatever the feature-flags
-  # file says about `client_api_v2`. A Relay started directly, without the
-  # Server's value, keeps reading the feature-flags file as before.
+  # file says about `client_api_v2`. A Relay started directly has the change
+  # log on as well; it has no option or file setting that turns it off.
   use ExUnit.Case, async: false
 
   alias AttentionServer.{
@@ -11,6 +11,7 @@ defmodule AttentionServer.ClientAPIDefaultStartupTest do
     DashboardHTTPS,
     DeviceIdentity,
     JSON,
+    PreChangeLogStore,
     Relay,
     Server,
     TLSFixtures
@@ -38,11 +39,15 @@ defmodule AttentionServer.ClientAPIDefaultStartupTest do
       store_path = Path.join(ctx.dir, "relay.sqlite3")
       owner_der = TLSFixtures.certificate_der!(ctx.certs, "a1")
 
-      # The person exists before the first v2 start, as on an upgraded store.
-      {:ok, initial} = Relay.start_link(store_path: store_path)
-      {:ok, person} = Relay.operator_bootstrap(initial, owner_der)
-      refute :sys.get_state(initial).store.change_log
-      GenServer.stop(initial)
+      # The person exists before the first v2 start, as on a store upgraded
+      # from a Server before 0.2.0, which committed with the change log off.
+      person = "11111111-1111-4111-8111-111111111111"
+      {:ok, owner} = DeviceIdentity.from_certificate(owner_der)
+
+      PreChangeLogStore.write(
+        store_path,
+        &PreChangeLogStore.operator_bootstrap(&1, person, owner)
+      )
 
       skill = Path.join(ctx.dir, "SKILL.md")
       File.write!(skill, "# Harklight agent")
@@ -239,36 +244,35 @@ defmodule AttentionServer.ClientAPIDefaultStartupTest do
   end
 
   describe "a Relay started directly" do
-    test "with no option and no flags file keeps the change log off", ctx do
-      relay = start_relay(store_path: Path.join(ctx.dir, "direct.sqlite3"))
-      refute :sys.get_state(relay).store.change_log
-    end
-
-    test "with no option reads the flags file", ctx do
-      flags = Path.join(ctx.dir, "flags.json")
-      File.write!(flags, ~s({"client_api_v2":true}))
-
-      relay =
-        start_relay(store_path: Path.join(ctx.dir, "direct.sqlite3"), feature_flags_path: flags)
-
+    test "with no option and no flags file has the change log on", ctx do
+      path = Path.join(ctx.dir, "direct.sqlite3")
+      relay = start_relay(store_path: path)
       assert :sys.get_state(relay).store.change_log
+      GenServer.stop(relay)
+      assert "client_change_log_state" in tables(path)
+      assert "agent_change_log_state" in tables(path)
     end
 
-    test "with the value Server resolved uses it over the flags file", ctx do
+    test "keeps the change log on whatever a flags file or option says", ctx do
       flags = Path.join(ctx.dir, "flags.json")
-      File.write!(flags, ~s({"client_api_v2":true}))
+      File.write!(flags, ~s({"client_api_v2":false}))
 
-      off =
-        start_relay(
-          store_path: Path.join(ctx.dir, "off.sqlite3"),
-          feature_flags_path: flags,
-          client_api_v2: false
-        )
+      from_file =
+        start_relay(store_path: Path.join(ctx.dir, "file.sqlite3"), feature_flags_path: flags)
 
-      refute :sys.get_state(off).store.change_log
+      assert :sys.get_state(from_file).store.change_log
 
-      on = start_relay(store_path: Path.join(ctx.dir, "on.sqlite3"), client_api_v2: true)
-      assert :sys.get_state(on).store.change_log
+      from_option =
+        start_relay(store_path: Path.join(ctx.dir, "option.sqlite3"), client_api_v2: false)
+
+      assert :sys.get_state(from_option).store.change_log
+    end
+
+    test "with no store path does not start, because the change log needs a durable store" do
+      assert {:error, {:storage_unavailable, :not_durable}} =
+               GenServer.start(Relay, store_path: nil)
+
+      assert {:error, {:storage_unavailable, :not_durable}} = GenServer.start(Relay, [])
     end
   end
 
@@ -311,6 +315,18 @@ defmodule AttentionServer.ClientAPIDefaultStartupTest do
     Process.unlink(relay)
     on_exit(fn -> if Process.alive?(relay), do: GenServer.stop(relay) end)
     relay
+  end
+
+  defp tables(path) do
+    {:ok, db} = Exqlite.Sqlite3.open(path)
+
+    {:ok, stmt} =
+      Exqlite.Sqlite3.prepare(db, "SELECT name FROM sqlite_master WHERE type = 'table'")
+
+    {:ok, rows} = Exqlite.Sqlite3.fetch_all(db, stmt)
+    :ok = Exqlite.Sqlite3.release(db, stmt)
+    :ok = Exqlite.Sqlite3.close(db)
+    List.flatten(rows)
   end
 
   defp child?(server, id),

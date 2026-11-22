@@ -1,7 +1,7 @@
 defmodule AttentionServer.ClientAPIReadsTest do
   use ExUnit.Case, async: false
 
-  alias AttentionServer.{JSON, Relay}
+  alias AttentionServer.{JSON, PreChangeLogStore, Relay}
   alias AttentionServer.ClientAPI.Reads
   alias AttentionServer.ClientAPISchema, as: Schema
 
@@ -14,15 +14,11 @@ defmodule AttentionServer.ClientAPIReadsTest do
 
     File.mkdir_p!(dir)
     on_exit(fn -> File.rm_rf!(dir) end)
-    flags = Path.join(dir, "flags.json")
-    File.write!(flags, ~s({"client_api_v2":true}))
-    %{path: Path.join(dir, "state.sqlite3"), flags: flags}
+    %{path: Path.join(dir, "state.sqlite3")}
   end
 
-  defp start(path, flags) do
-    opts = [store_path: path, agent_fixture_mode: true]
-    opts = if flags, do: Keyword.put(opts, :feature_flags_path, flags), else: opts
-    assert {:ok, relay} = Relay.start_link(opts)
+  defp start(path) do
+    assert {:ok, relay} = Relay.start_link(store_path: path, agent_fixture_mode: true)
     relay
   end
 
@@ -37,7 +33,13 @@ defmodule AttentionServer.ClientAPIReadsTest do
   end
 
   defp forward(relay, id, operation, files \\ nil) do
-    frame = %{
+    frame = forward_frame(id, operation)
+    frame = if files, do: Map.put(frame, "files", files), else: frame
+    assert %{"type" => "ok"} = request(relay, "origin", frame)
+  end
+
+  defp forward_frame(id, operation) do
+    %{
       "type" => "forward",
       "op_id" => op(operation),
       "session_handle" => @handle,
@@ -48,27 +50,36 @@ defmodule AttentionServer.ClientAPIReadsTest do
         "title" => "Question #{id}"
       }
     }
-
-    frame = if files, do: Map.put(frame, "files", files), else: frame
-    assert %{"type" => "ok"} = request(relay, "origin", frame)
   end
 
-  defp discuss(relay, id, operation, text) do
-    assert %{"type" => "ok"} =
-             request(relay, "reader", %{
-               "type" => "discussion",
-               "op_id" => op(operation),
-               "sender_id" => "app:test",
-               "message_id" => id,
-               "request_revision" => 1,
-               "text" => text
-             })
+  defp discuss(relay, id, operation, text),
+    do: assert(%{"type" => "ok"} = request(relay, "reader", discuss_frame(id, operation, text)))
+
+  defp discuss_frame(id, operation, text) do
+    %{
+      "type" => "discussion",
+      "op_id" => op(operation),
+      "sender_id" => "app:test",
+      "message_id" => id,
+      "request_revision" => 1,
+      "text" => text
+    }
+  end
+
+  defp answer_frame(id, operation) do
+    %{
+      "type" => "answer",
+      "op_id" => op(operation),
+      "sender_id" => "app:test",
+      "message_id" => id,
+      "answer" => nil
+    }
   end
 
   @bytes :binary.copy(<<0, 255, 42, 10>>, 100)
 
-  defp scripted_relay(path, flags) do
-    relay = start(path, flags)
+  defp scripted_relay(path) do
+    relay = start(path)
     assert :ok = Relay.setup_person(relay, "A")
     assert :ok = Relay.setup_device(relay, "A", "origin")
     assert :ok = Relay.setup_device(relay, "A", "reader")
@@ -81,15 +92,7 @@ defmodule AttentionServer.ClientAPIReadsTest do
 
     for n <- 1..5, do: discuss(relay, "one", 10 + n, "Note #{n}")
 
-    assert %{"type" => "ok"} =
-             request(relay, "reader", %{
-               "type" => "answer",
-               "op_id" => op(20),
-               "sender_id" => "app:test",
-               "message_id" => "two",
-               "answer" => nil
-             })
-
+    assert %{"type" => "ok"} = request(relay, "reader", answer_frame("two", 20))
     relay
   end
 
@@ -110,8 +113,8 @@ defmodule AttentionServer.ClientAPIReadsTest do
     Enum.find_value(items, &(&1["message"]["message_id"] == message_id && &1["item_id"]))
   end
 
-  test "the inbox pages through every item in rank order", %{path: path, flags: flags} do
-    relay = scripted_relay(path, flags)
+  test "the inbox pages through every item in rank order", %{path: path} do
+    relay = scripted_relay(path)
     defs = Schema.contract_defs(@contract)
     assert {:ok, whole} = Reads.inbox(relay, "reader")
     assert Schema.errors(defs, "InboxPage", whole) == []
@@ -135,8 +138,8 @@ defmodule AttentionServer.ClientAPIReadsTest do
     GenServer.stop(relay)
   end
 
-  test "bad parameters and keys are refused with contract tokens", %{path: path, flags: flags} do
-    relay = scripted_relay(path, flags)
+  test "bad parameters and keys are refused with contract tokens", %{path: path} do
+    relay = scripted_relay(path)
 
     for limit <- ["0", "-1", "x", "1.5", ""] do
       assert {:error, :invalid_field, "limit"} = Reads.inbox(relay, "reader", %{"limit" => limit})
@@ -163,8 +166,8 @@ defmodule AttentionServer.ClientAPIReadsTest do
     GenServer.stop(relay)
   end
 
-  test "one item reads alone, as it appears in the inbox", %{path: path, flags: flags} do
-    relay = scripted_relay(path, flags)
+  test "one item reads alone, as it appears in the inbox", %{path: path} do
+    relay = scripted_relay(path)
     defs = Schema.contract_defs(@contract)
     assert {:ok, %{"items" => items}} = Reads.inbox(relay, "reader")
 
@@ -178,8 +181,8 @@ defmodule AttentionServer.ClientAPIReadsTest do
     GenServer.stop(relay)
   end
 
-  test "entries page backwards by position with before and limit", %{path: path, flags: flags} do
-    relay = scripted_relay(path, flags)
+  test "entries page backwards by position with before and limit", %{path: path} do
+    relay = scripted_relay(path)
     one = item_id(relay, "one")
 
     assert {:ok, %{"entries" => newest, "older" => true}} =
@@ -209,8 +212,8 @@ defmodule AttentionServer.ClientAPIReadsTest do
     GenServer.stop(relay)
   end
 
-  test "settings carry levels and an ETag over the resource alone", %{path: path, flags: flags} do
-    relay = scripted_relay(path, flags)
+  test "settings carry levels and an ETag over the resource alone", %{path: path} do
+    relay = scripted_relay(path)
     defs = Schema.contract_defs(@contract)
     assert {:ok, body} = Reads.settings(relay, "reader")
     assert Schema.errors(defs, "SettingsResponse", body) == []
@@ -224,8 +227,8 @@ defmodule AttentionServer.ClientAPIReadsTest do
     GenServer.stop(relay)
   end
 
-  test "an inline file reads by its file_id with its sha256", %{path: path, flags: flags} do
-    relay = scripted_relay(path, flags)
+  test "an inline file reads by its file_id with its sha256", %{path: path} do
+    relay = scripted_relay(path)
     file_item = item_id(relay, "file")
     assert {:ok, %{"item" => %{"files" => [ref]}}} = Reads.item(relay, "reader", file_item)
     sha256 = Base.encode16(:crypto.hash(:sha256, @bytes), case: :lower)
@@ -247,12 +250,31 @@ defmodule AttentionServer.ClientAPIReadsTest do
   end
 
   test "data written before the client API reads through it, seeded at rev 1",
-       %{path: path, flags: flags} do
-    relay = scripted_relay(path, nil)
-    assert {:error, :not_found} = Reads.inbox(relay, "reader")
-    GenServer.stop(relay)
+       %{path: path} do
+    # The same data, committed as a Server before 0.2.0 did, with the log off.
+    # The file item carries no file here, because the Relay stages those.
+    PreChangeLogStore.write(path, fn store ->
+      store =
+        store
+        |> PreChangeLogStore.setup_person("A")
+        |> PreChangeLogStore.setup_device("A", "origin")
+        |> PreChangeLogStore.setup_device("A", "reader")
+        |> PreChangeLogStore.setup_sender("origin", "app:test")
+        |> PreChangeLogStore.setup_person("B")
+        |> PreChangeLogStore.setup_device("B", "stranger")
 
-    relay = start(path, flags)
+      items = [{"one", 2}, {"two", 3}, {"three", 4}, {"four", 5}, {"file", 6}]
+      forwards = for {id, n} <- items, do: {"origin", forward_frame(id, n)}
+      notes = for n <- 1..5, do: {"reader", discuss_frame("one", 10 + n, "Note #{n}")}
+      frames = forwards ++ notes ++ [{"reader", answer_frame("two", 20)}]
+
+      Enum.reduce(frames, store, fn {key, frame}, store ->
+        assert {%{"type" => "ok"}, store} = PreChangeLogStore.request(store, key, frame)
+        store
+      end)
+    end)
+
+    relay = start(path)
     defs = Schema.contract_defs(@contract)
     assert {:ok, inbox} = Reads.inbox(relay, "reader")
     assert Schema.errors(defs, "InboxPage", inbox) == []
@@ -282,8 +304,8 @@ defmodule AttentionServer.ClientAPIReadsTest do
   end
 
   test "positions and revs follow the change log, and a folded receipt raises its entry's rev",
-       %{path: path, flags: flags} do
-    relay = scripted_relay(path, flags)
+       %{path: path} do
+    relay = scripted_relay(path)
     one = item_id(relay, "one")
     assert {:ok, %{"rev" => position, "entries" => entries}} = Reads.entries(relay, "reader", one)
     assert position > 0
@@ -311,8 +333,8 @@ defmodule AttentionServer.ClientAPIReadsTest do
     GenServer.stop(relay)
   end
 
-  test "any request revision reads, including the first", %{path: path, flags: flags} do
-    relay = scripted_relay(path, flags)
+  test "any request revision reads, including the first", %{path: path} do
+    relay = scripted_relay(path)
     defs = Schema.contract_defs(@contract)
     file_item = item_id(relay, "file")
     assert {:ok, body} = Reads.revision(relay, "reader", file_item, "1")
@@ -327,8 +349,8 @@ defmodule AttentionServer.ClientAPIReadsTest do
   end
 
   test "a browser session reads the same resources, as knocks, while its owner revision holds",
-       %{path: path, flags: flags} do
-    relay = scripted_relay(path, flags)
+       %{path: path} do
+    relay = scripted_relay(path)
 
     :sys.replace_state(relay, fn state ->
       engine = state.store.engine
@@ -365,8 +387,8 @@ defmodule AttentionServer.ClientAPIReadsTest do
   end
 
   test "an inline file whose stored data is gone answers storage_unavailable, and the relay lives",
-       %{path: path, flags: flags} do
-    relay = scripted_relay(path, flags)
+       %{path: path} do
+    relay = scripted_relay(path)
     file_item = item_id(relay, "file")
     assert {:ok, %{"item" => %{"files" => [ref]}}} = Reads.item(relay, "reader", file_item)
 
@@ -396,10 +418,9 @@ defmodule AttentionServer.ClientAPIReadsTest do
   end
 
   test "a person's items are found from their own sequence, not every person's", %{
-    path: path,
-    flags: flags
+    path: path
   } do
-    relay = scripted_relay(path, flags)
+    relay = scripted_relay(path)
     engine = :sys.get_state(relay).store.engine
     scanned = for {{"A", _, _} = key, _} <- engine.messages, do: key
 
@@ -415,8 +436,8 @@ defmodule AttentionServer.ClientAPIReadsTest do
   # did not move stay put, so paging across a change neither repeats nor skips
   # them, and anything that did move has a change after the first page.
   test "paging across a rank change neither repeats nor skips an unmoved item",
-       %{path: path, flags: flags} do
-    relay = scripted_relay(path, flags)
+       %{path: path} do
+    relay = scripted_relay(path)
     for n <- 1..4, do: forward(relay, "more-#{n}", 30 + n)
 
     assert {:ok, %{"items" => first, "next_page" => page, "rev" => first_rev}} =
@@ -451,10 +472,9 @@ defmodule AttentionServer.ClientAPIReadsTest do
   end
 
   test "a failing rank store answers storage_unavailable, not a recomputation", %{
-    path: path,
-    flags: flags
+    path: path
   } do
-    relay = scripted_relay(path, flags)
+    relay = scripted_relay(path)
     one = item_id(relay, "one")
     assert {:ok, _} = Reads.item(relay, "reader", one)
 

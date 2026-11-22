@@ -274,8 +274,9 @@ defmodule AttentionServer.EnrollmentReadbackTest do
     assert lifecycle["answer"] == "yes"
   end
 
-  test "owner-management fixture is unavailable on a normal Relay", %{relay: _relay} do
-    {:ok, normal} = Relay.start_link()
+  @tag :tmp_dir
+  test "owner-management fixture is unavailable on a normal Relay", %{tmp_dir: dir} do
+    {:ok, normal} = Relay.start_link(store_path: Path.join(dir, "normal.sqlite3"))
     assert :ok = Relay.setup_person(normal, "A")
     assert :ok = Relay.setup_device(normal, "A", key("a"))
 

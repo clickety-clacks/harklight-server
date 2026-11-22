@@ -192,8 +192,9 @@ defmodule AttentionServer.AgentChangeLog do
         end
 
       {:ok, [_stale]} ->
-        # Commits made with the flag off did not append rows. Invalidate
-        # existing cursors and give agents first seen while off a baseline.
+        # Commits made while the log was off (before Server 0.2.0) did not
+        # append rows. Invalidate existing cursors and give agents first seen
+        # meanwhile a baseline.
         with :ok <-
                run(
                  db,

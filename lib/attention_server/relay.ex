@@ -765,8 +765,7 @@ defmodule AttentionServer.Relay do
 
   @impl true
   def init(opts) do
-    case Store.open(Keyword.get(opts, :store_path))
-         |> client_api_v2_store(client_api_v2_option(opts)) do
+    case Store.open(Keyword.get(opts, :store_path)) |> enable_change_log() do
       {:ok, store} ->
         case startup_cleanup(store) do
           {:ok, store} ->
@@ -835,14 +834,8 @@ defmodule AttentionServer.Relay do
             state = initialize_client_ranks(state)
             state = reschedule_default_sweep(state, state.default_index)
             state = reschedule_bounce_sweep(state)
-            schedule_change_log_prune(state.store, 0)
-
-            state =
-              if state.store.change_log,
-                do: AttentionServer.AgentAPI.FeedActivity.reset(state),
-                else: state
-
-            {:ok, state}
+            schedule_change_log_prune(0)
+            {:ok, AttentionServer.AgentAPI.FeedActivity.reset(state)}
 
           error ->
             Store.close(store)
@@ -854,51 +847,31 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  # With the client_api_v2 flag on at startup, the store writes the change log
-  # in every commit. It is decided once, here, before any startup commit.
-  # Server always passes true; a Relay started directly without that option
-  # reads the feature-flags file, where an absent key stays off.
+  # The store writes the change log in every commit. It is turned on once,
+  # here, before any startup commit; a store that cannot keep it (one with no
+  # path) does not start.
   # Change-log rows older than the retention window are pruned daily; a cursor
   # older than the oldest retained row gets cursor_expired.
   @change_log_retention_ms 30 * 24 * 60 * 60 * 1_000
   @change_log_prune_interval_ms 24 * 60 * 60 * 1_000
   @client_rank_retry_ms 250
 
-  defp schedule_change_log_prune(%Store{change_log: true}, delay_ms),
+  defp schedule_change_log_prune(delay_ms),
     do: Process.send_after(self(), :change_log_prune, delay_ms)
 
-  defp schedule_change_log_prune(_store, _delay_ms), do: :ok
+  defp enable_change_log({:ok, store}) do
+    case Store.enable_change_log(store) do
+      {:ok, store} ->
+        {:ok, store}
 
-  defp client_api_v2_option(opts) do
-    case Keyword.fetch(opts, :client_api_v2) do
-      {:ok, enabled} when is_boolean(enabled) ->
-        enabled
-
-      _ ->
-        {flags, _warned} =
-          AttentionServer.FeatureFlags.read(Keyword.get(opts, :feature_flags_path), true)
-
-        Map.get(flags, "client_api_v2") == true
+      {:error, reason} ->
+        Diagnostics.failure(:server_startup, :configuration, reason, :unavailable)
+        Store.close(store)
+        {:error, {:storage_unavailable, reason}}
     end
   end
 
-  defp client_api_v2_store({:ok, store}, enabled?) do
-    if enabled? do
-      case Store.enable_change_log(store) do
-        {:ok, store} ->
-          {:ok, store}
-
-        {:error, reason} ->
-          Diagnostics.failure(:server_startup, :configuration, reason, :unavailable)
-          Store.close(store)
-          {:error, {:storage_unavailable, reason}}
-      end
-    else
-      {:ok, store}
-    end
-  end
-
-  defp client_api_v2_store(error, _enabled?), do: error
+  defp enable_change_log(error), do: error
 
   defp startup_cleanup(store) do
     actor_keys = browser_actor_keys(store.engine)
@@ -1299,7 +1272,7 @@ defmodule AttentionServer.Relay do
                   do: close_focus_streams(next, device_key),
                   else: next
 
-              if store.change_log and permission == :see and enabled do
+              if permission == :see and enabled do
                 AttentionServer.AgentAPI.Focus.notify_grant(person, device_key)
               end
 
@@ -1943,11 +1916,7 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  defp dispatch_call(
-         {:client_agent_answer, key, frame},
-         _from,
-         %{store: %{change_log: true}} = state
-       ) do
+  defp dispatch_call({:client_agent_answer, key, frame}, _from, state) do
     with {:ok, person, _id, _revision} <- Engine.agent_identity(state.store.engine, key),
          {:ok, next_engine, fields} <-
            Engine.client_agent_answer(state.store.engine, key, frame, state.clock.()) do
@@ -1960,9 +1929,6 @@ defmodule AttentionServer.Relay do
       error -> {:reply, error, state}
     end
   end
-
-  defp dispatch_call({:client_agent_answer, _key, _frame}, _from, state),
-    do: {:reply, {:error, :not_found}, state}
 
   defp dispatch_call({:owner_register_agent, person, owner_key, id, agent_key}, _from, state),
     do:
@@ -2928,11 +2894,7 @@ defmodule AttentionServer.Relay do
   end
 
   defp dispatch_call({:end_browser_session, browser_session_id}, _from, state) do
-    if state.store.change_log,
-      do:
-        AttentionServer.ChangeLog.notify_closing([
-          {{:browser_session, browser_session_id}, :revoked}
-        ])
+    AttentionServer.ChangeLog.notify_closing([{{:browser_session, browser_session_id}, :revoked}])
 
     state =
       state.sessions
@@ -3436,8 +3398,6 @@ defmodule AttentionServer.Relay do
     end)
   end
 
-  defp initialize_client_ranks(%{store: %Store{change_log: false}} = state), do: state
-
   defp initialize_client_ranks(state) do
     persist_client_ranks(state, Map.keys(state.store.engine.persons))
   end
@@ -3445,9 +3405,7 @@ defmodule AttentionServer.Relay do
   # Client API v2 ranks are computed once per change, here, and stored with
   # the change log, so reads page from the stored order. A person is ranked
   # when a commit changed their client resources or their priority view
-  # changed. Runs only while the change log is on.
-  defp rank_client_items(_before, %{store: %Store{change_log: false}} = next), do: next
-
+  # changed.
   defp rank_client_items(before, next) do
     views_changed =
       if before.priority_views === next.priority_views do
@@ -3561,7 +3519,7 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  defp dispatch_info({:agent_feed_activity, action, scope}, %{store: %{change_log: true}} = state) do
+  defp dispatch_info({:agent_feed_activity, action, scope}, state) do
     {:noreply, AttentionServer.AgentAPI.FeedActivity.handle_info(action, scope, state)}
   end
 
@@ -3578,7 +3536,7 @@ defmodule AttentionServer.Relay do
     relay = self()
     Task.start(fn -> AttentionServer.ClientAPI.Uploads.clean_discarded(relay) end)
 
-    schedule_change_log_prune(state.store, @change_log_prune_interval_ms)
+    schedule_change_log_prune(@change_log_prune_interval_ms)
 
     receipts =
       Map.reject(state.agent_show_receipts, fn {_, receipt} -> receipt.at_ms < before_ms end)
@@ -5983,13 +5941,8 @@ defmodule AttentionServer.Relay do
         |> Map.put(:message_order_suffixes, message_order_suffixes)
         |> Map.put(:view_rev, view_rev)
 
-      view =
-        if state.store.change_log do
-          index = AttentionServer.ClientAPI.Resources.index_reply_entries(view.replies)
-          Map.put(view, :reply_entries_by_item, index)
-        else
-          view
-        end
+      index = AttentionServer.ClientAPI.Resources.index_reply_entries(view.replies)
+      view = Map.put(view, :reply_entries_by_item, index)
 
       state
       |> Map.put(:priority_revision_counter, counter)
@@ -6906,7 +6859,7 @@ defmodule AttentionServer.Relay do
   end
 
   defp initial_delivery_availability(
-         %{store: %{change_log: true}} = state,
+         state,
          key,
          engine,
          %{"type" => "forward", "message" => message}

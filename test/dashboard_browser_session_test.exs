@@ -10,9 +10,11 @@ defmodule AttentionServer.DashboardBrowserSessionTest do
     TLSFixtures
   }
 
-  setup do
+  @moduletag :tmp_dir
+
+  setup %{tmp_dir: dir} do
     certs = TLSFixtures.create!()
-    {:ok, relay} = Relay.start_link()
+    {:ok, relay} = Relay.start_link(store_path: Path.join(dir, "state.sqlite3"))
     owner_cert = TLSFixtures.certificate_der!(certs, "a1")
     replacement = TLSFixtures.certificate_der!(certs, "a2")
     {:ok, person} = Relay.operator_bootstrap(relay, owner_cert)

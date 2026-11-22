@@ -30,7 +30,7 @@ defmodule AttentionServer.HeadlessToolTest do
     identity_dir = Path.join(dir, "new-device")
 
     assert {:ok, person} = OperatorTool.bootstrap(db_path, Path.join(certs, "a1.pem"))
-    {:ok, relay} = Relay.start_link(store_path: db_path, client_api_v2: true)
+    {:ok, relay} = Relay.start_link(store_path: db_path)
 
     {:ok, enrollment} =
       EnrollmentHTTPS.start_link(

@@ -4,8 +4,10 @@ defmodule AttentionServer.RelayTest do
   alias AttentionServer.{JSON, Relay}
   alias AttentionServer.JSON.DecimalToken
 
-  setup do
-    relay = start_supervised!({Relay, []})
+  @moduletag :tmp_dir
+
+  setup %{tmp_dir: dir} do
+    relay = start_supervised!({Relay, store_path: Path.join(dir, "state.sqlite3")})
     assert :ok = Relay.setup_person(relay, "A")
     assert :ok = Relay.setup_person(relay, "B")
     assert :ok = Relay.setup_device(relay, "A", "a1")

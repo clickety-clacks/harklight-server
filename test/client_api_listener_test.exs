@@ -1024,7 +1024,6 @@ defmodule AttentionServer.ClientAPIListenerTest do
       start_supervised!(
         {Relay,
          store_path: Path.join(dir, "web.sqlite3"),
-         client_api_v2: true,
          join_configuration: join,
          dashboard_origin: origin,
          enrollment_fixture_mode: true},

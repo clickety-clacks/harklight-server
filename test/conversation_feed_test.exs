@@ -291,9 +291,7 @@ defmodule AttentionServer.ConversationFeedTest do
     clock = :atomics.new(1, [])
     :atomics.put(clock, 1, System.system_time(:millisecond))
     clock_fn = fn -> :atomics.get(clock, 1) end
-    flags = path <> ".flags"
-    File.write!(flags, ~s({"client_api_v2":true}))
-    opts = [store_path: path, clock: clock_fn, feature_flags_path: flags]
+    opts = [store_path: path, clock: clock_fn]
     assert {:ok, relay} = Relay.start_link(opts)
     assert :ok = Relay.setup_person(relay, "A")
     assert :ok = Relay.setup_device(relay, "A", "origin")
@@ -1034,7 +1032,7 @@ defmodule AttentionServer.ConversationFeedTest do
 
     # The previous FORMAT29 reader loads these ordinary message strings directly.
     # Relay and Engine's message-read path is unchanged by this PR.
-    assert {:ok, legacy_relay} = Relay.start_link(store_path: nil)
+    assert {:ok, legacy_relay} = Relay.start_link(store_path: path <> ".reader")
     legacy_engine = persisted
 
     :sys.replace_state(legacy_relay, fn state ->
@@ -1201,30 +1199,31 @@ defmodule AttentionServer.ConversationFeedTest do
   test "FORMAT29 inline large title and body remain readable without a format migration", %{
     path: path
   } do
-    {:ok, relay} = Relay.start_link(store_path: nil)
-    assert :ok = Relay.setup_person(relay, "A")
-    assert :ok = Relay.setup_device(relay, "A", "origin")
-    assert :ok = Relay.setup_sender(relay, "origin", "app:test")
+    # The engine holds the large strings inline, as a FORMAT29 writer did.
+    {:ok, engine} = Engine.setup_person(Engine.new(), "A")
+    {:ok, engine} = Engine.setup_device(engine, "A", "origin")
+    {:ok, engine} = Engine.setup_sender(engine, "origin", "app:test")
 
     title = Base.encode64(:crypto.strong_rand_bytes(1_572_870))
     body = Base.encode64(:crypto.strong_rand_bytes(1_572_870))
 
-    assert %{"type" => "ok", "seq" => 1} =
-             request(relay, "origin", %{
-               "type" => "forward",
-               "op_id" => op(505),
-               "session_handle" => @handle,
-               "message" => %{
-                 "sender_id" => "app:test",
-                 "message_id" => "format29-large-data",
-                 "created_at" => 1,
-                 "title" => title,
-                 "body" => body
-               }
-             })
+    forward =
+      JSON.encode!(%{
+        "v" => 1,
+        "type" => "forward",
+        "op_id" => op(505),
+        "session_handle" => @handle,
+        "message" => %{
+          "sender_id" => "app:test",
+          "message_id" => "format29-large-data",
+          "created_at" => 1,
+          "title" => title,
+          "body" => body
+        }
+      }) <> "\n"
 
-    legacy_engine = :sys.get_state(relay).store.engine
-    GenServer.stop(relay)
+    {legacy_engine, {:ok, reply}} = Engine.request_line(engine, "origin", forward)
+    assert {:ok, %{"type" => "ok", "seq" => 1}} = JSON.decode_line(reply)
 
     {legacy_payload, _cache} = SnapshotEncoding.encode(legacy_engine, 29)
     assert byte_size(legacy_payload) > 2 * 1024 * 1024

@@ -23,7 +23,7 @@ defmodule AttentionServer.SelfSignedEnrollmentTest do
     on_exit(fn -> File.rm_rf!(dir) end)
 
     {:ok, relay} =
-      Relay.start_link(store_path: Path.join(dir, "relay.sqlite3"), client_api_v2: true)
+      Relay.start_link(store_path: Path.join(dir, "relay.sqlite3"))
 
     {:ok, web} =
       ClientAPI.Listener.start_link(
