@@ -44,21 +44,33 @@ defmodule AttentionServer.AgentChangeLog do
   Finds the agent resources changed by one engine transition. Store appends
   these rows in the same transaction as the engine and the person's log.
   """
-  def changes(%Engine{} = old, %Engine{} = next, changed) do
+  def changes(%Engine{} = old, %Engine{} = next, changed),
+    do: log_rows(next, changed, changed_sessions(old, next), advisory_changes(old, next))
+
+  @doc false
+  # `changes/3` from a keyed commit's touched addresses, carried in `changed`
+  # by `ChangeLog.changed_resources_touched/4`: ended or resumed sessions from
+  # the touched origin session rows, advisories from the touched advisory
+  # entries and receipts. The result equals `changes/3` for every complete
+  # touched set.
+  def changes_touched(%Engine{} = old, %Engine{} = next, %{touched: grouped} = changed) do
+    sessions = touched_sessions(old, next, Map.get(grouped, {:row, :origin_sessions}, []))
+    log_rows(next, changed, sessions, touched_advisories(old, next, grouped))
+  end
+
+  defp log_rows(next, changed, sessions, advisories) do
     entries =
       for {_, seq} = event <- changed.entries do
         %{key: key, payload: payload} = Map.fetch!(next.conversation_events, event)
         {seq, key, payload}
       end
 
-    advisories = advisory_changes(old, next)
-
     messages =
       [
         changed.messages,
         changed.bounce,
         changed.opened,
-        changed_sessions(old, next),
+        sessions,
         Enum.map(advisories, &elem(&1, 0)),
         for({_, key, payload} <- entries, answer_receipt?(next, key, payload), do: key)
       ]
@@ -120,7 +132,24 @@ defmodule AttentionServer.AgentChangeLog do
   defp changed_sessions(old, next) do
     old.origin_sessions
     |> changed_keys(next.origin_sessions)
-    |> Enum.flat_map(fn scope ->
+    |> session_messages(old, next)
+  end
+
+  # Like `changed_keys/2`, only sessions present in `next` count.
+  defp touched_sessions(old, next, scopes) do
+    scopes
+    |> Enum.filter(fn scope ->
+      case Map.fetch(next.origin_sessions, scope) do
+        {:ok, _} = current -> Map.fetch(old.origin_sessions, scope) !== current
+        :error -> false
+      end
+    end)
+    |> session_messages(old, next)
+  end
+
+  # A session that ends or resumes changes the availability of its messages.
+  defp session_messages(scopes, old, next) do
+    Enum.flat_map(scopes, fn scope ->
       was_gone = get_in(old.origin_sessions, [scope, :gone]) == true
       gone = get_in(next.origin_sessions, [scope, :gone]) == true
 
@@ -136,7 +165,7 @@ defmodule AttentionServer.AgentChangeLog do
     old.advisory_feeds
     |> changed_keys(next.advisory_feeds)
     |> Enum.sort()
-    |> Enum.flat_map(fn {person, agent, session} = key ->
+    |> Enum.flat_map(fn key ->
       case Map.get(next.advisory_feeds, key) do
         %{high: high, entries: entries, receipts: receipts} ->
           previous = Map.get(old.advisory_feeds, key, %{high: 0, receipts: MapSet.new()})
@@ -148,17 +177,53 @@ defmodule AttentionServer.AgentChangeLog do
 
           acknowledged = receipts |> MapSet.difference(previous.receipts) |> Enum.sort()
 
-          for id <- Enum.uniq(created ++ acknowledged),
-              seq = Map.fetch!(next.advisory_id_index, {key, id}),
-              %{"sender_id" => sender, "message_id" => message_id} <- [Map.fetch!(entries, seq)],
-              do:
-                {{person, sender, message_id},
-                 {{person, agent}, {:advisory, resource_id({:advisory, id}), session}}}
+          advisory_rows(next, key, entries, created ++ acknowledged)
 
         nil ->
           []
       end
     end)
+  end
+
+  # Advisory scopes in key order, as `advisory_changes/2`. An advisory is
+  # created by a touched entry past the previous high and acknowledged by a
+  # touched receipt that is new; untouched_change/3 has checked that every
+  # changed entry and receipt is touched.
+  defp touched_advisories(old, next, grouped) do
+    for({{:advisory, scope}, parts} <- grouped, do: {scope, parts})
+    |> Enum.sort()
+    |> Enum.flat_map(fn {key, parts} ->
+      case Map.get(next.advisory_feeds, key) do
+        %{high: high, entries: entries, receipts: receipts} ->
+          previous = Map.get(old.advisory_feeds, key, %{high: 0, receipts: MapSet.new()})
+
+          created =
+            for {:entry, seq} <- Enum.sort(parts),
+                is_integer(seq) and seq > previous.high and seq <= high,
+                %{"advisory_id" => id} <- [Map.get(entries, seq)],
+                do: id
+
+          acknowledged =
+            for {:receipt, id} <- parts,
+                MapSet.member?(receipts, id),
+                not MapSet.member?(previous.receipts, id),
+                do: id
+
+          advisory_rows(next, key, entries, created ++ Enum.sort(acknowledged))
+
+        nil ->
+          []
+      end
+    end)
+  end
+
+  defp advisory_rows(next, {person, agent, session} = key, entries, ids) do
+    for id <- Enum.uniq(ids),
+        seq = Map.fetch!(next.advisory_id_index, {key, id}),
+        %{"sender_id" => sender, "message_id" => message_id} <- [Map.fetch!(entries, seq)],
+        do:
+          {{person, sender, message_id},
+           {{person, agent}, {:advisory, resource_id({:advisory, id}), session}}}
   end
 
   defp changed_keys(old, next) when old === next, do: []

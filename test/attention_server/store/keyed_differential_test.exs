@@ -53,8 +53,13 @@ defmodule AttentionServer.Store.KeyedDifferentialTest do
 
     for step <- 0..(steps - 1) do
       backup(legacy_path, keyed_path)
+      # The keyed log runs, so every keyed commit also checks its touched
+      # change log against the whole-map one (keyed_validation: :both). The
+      # keyed commit validates first; the legacy commit finds its log before
+      # validating, which malformed mutations cannot survive.
       {:ok, legacy} = Store.open(legacy_path)
       {:ok, keyed} = Store.open(keyed_path, :keyed)
+      {:ok, keyed} = Store.enable_change_log(keyed)
       {kind, label, legacy_next, keyed_next, touched, responses} = proposal(legacy, keyed, step)
       detail = "step #{step}, #{inspect(label)}"
       assert responses == :same, detail
