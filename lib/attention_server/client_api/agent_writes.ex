@@ -633,9 +633,14 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
 
     with id when is_binary(id) <- event,
          {sequence, ""} <- Integer.parse(id),
-         %{"author" => "person", "kind" => "terminal", "terminal_seq" => ^seq} <-
+         %{"kind" => "terminal", "terminal_seq" => ^seq} = entry <-
            get_in(engine.origin_feeds, [{person, agent}, :entries, sequence]) do
-      {:ok, sequence}
+      # A receipt and a result follow a person's answer. Another author's
+      # answer (a registered agent's) is an answer, so not_answered does not
+      # apply; the operation is unsupported for it (contract addendum 8).
+      if entry["author"] == "person",
+        do: {:ok, sequence},
+        else: {:error, :unsupported}
     else
       _ -> {:error, :not_answered}
     end
