@@ -18,8 +18,8 @@ Agent conversations use the separately released `harklight-agent` CLI described
 below. The server package does not bundle that executable. For enrollment and
 registered-agent tools, set `PACKAGE` to the extracted package directory and
 `HARKLIGHT_SERVER_CLI` to its `bin/harklight`; these tools do not start a second server. The package's
-`SELF_HOST.md` explains server setup and port exposure. A self-hosted origin may
-publish `none` as its file upload cap; use its published limits.
+`SELF_HOST.md` explains server setup and port exposure. A self-hosted Server may
+publish `none` as its file upload cap in `GET /v2/me`; use its published limits.
 
 ## Links to the web client
 
@@ -28,8 +28,8 @@ or preview), installed web-client version, availability and sign-in prerequisite
 from the operator's existing deployment information. For self-hosted setup, use
 the package's `SELF_HOST.md`. No portable web-base or availability discovery
 interface has been verified for agents; report missing information rather than
-inventing a configuration field or discovery endpoint. The messaging origin port
-and device enrollment do not supply a browser address or browser session. Do not
+inventing a configuration field or discovery endpoint. The device port and
+device enrollment do not supply a browser address or browser session. Do not
 derive availability from a hostname or source merge. Keep instance values in
 existing deployment configuration, not in this portable skill.
 
@@ -98,12 +98,14 @@ Give the approval code to the authenticated owner. The owner checks the
 intended person, label and key fingerprint before running `bin/harklight owner
 approve` with `--senders app:example` for this sender. For an explicitly
 authorized enrollment, check the saved request with the installed enrollment
-command. This does not prove session listener support:
+command. For an approved request it proves current key access with one
+authenticated client API v2 inbox read on the device port. This does not prove
+that an agent session receives its messages:
 
 ```sh
 "$PACKAGE/bin/harklight" enroll status --directory "$DEVICE_DIR" \
   --connect "$SERVER_ADDRESS" --name "$SERVER_NAME" --port "$ENROLL_PORT" \
-  --relay-port "$RELAY_PORT" --ca "$CA_PEM"
+  --device-port "$DEVICE_PORT" --ca "$CA_PEM"
 ```
 
 Keep the directory if a submission reply is lost. `enroll retry` uses the same
@@ -113,22 +115,25 @@ unknown status handle as unresolved until the owner reconciles it. This
 headless enrollment procedure is distinct from the native app's guided device
 joining.
 
-Use the `harklight-agent` session route for agent messages and their replies,
-with the originating enrolled identity and journal. There is no device-send or
-receipt fallback. If the actual route cannot listen, preserve its unsupported
-reason and use the one-shot `read --session HANDLE` procedure in the shared core
-when the originating work resumes. Reading does not claim listener support or
-acknowledge an event.
+Use the `harklight-agent` CLI for agent messages and their replies, with the
+originating enrolled identity and journal. There is no device-send or receipt
+fallback. If the originating session cannot keep a listener, use the one-shot
+`read --session HANDLE` procedure in the shared core when the originating work
+resumes. Serving a person turn or answer records it as Delivered on the server;
+the handoff receipt is a separate `receipt` command.
 
-For a direct origin-message lookup, Agent 0.1.9 or newer supports
-`harklight-agent message-get --sender-id S --message-id M [--revision N]` with
-a compatible Server. It reads the latest version by default or the selected
-retained revision; it does not mark Seen. `revision_unavailable` means the
-requested revision is gone. The shared core below gives the command examples.
+For a direct sent-message lookup, Agent 0.2.0 supports
+`harklight-agent message-get --item-id ID [--revision N]`. It
+reads the latest version by default or the selected retained revision; it does
+not mark Seen. `not_found` for a selected revision means the requested revision
+is gone. The shared core below gives the command examples.
 
 The enrolled-device interface remains available for existing inbox work:
-`device read` journals replayed entries before ACK, and
+`device read` takes a client API v2 inbox snapshot or change batch and saves it
+with its cursor before advancing that cursor; there is no ACK.
 `device respond --sender ID --message-id ID --answer answer.json` deliberately
-submits a JSON answer to a message already stored by the server. These commands
-do not create new messages or retrieve an origin receipt. Use the session CLI
+submits an answer object (at most one of `choice`, `comment` or `result`, or
+`{}` for no comment) to a message already stored by the server, saving its exact
+body and `Idempotency-Key` before sending. These commands do not create new
+messages or retrieve an origin receipt. Use the separate `harklight-agent` CLI
 for new agent messages and replies.
