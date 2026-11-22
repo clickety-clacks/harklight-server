@@ -1,7 +1,7 @@
 defmodule AttentionServer.ClientAPIReadsTest do
   use ExUnit.Case, async: false
 
-  alias AttentionServer.{JSON, PreChangeLogStore, Relay}
+  alias AttentionServer.{AgentAPIInProcess, JSON, PreChangeLogStore, Relay}
   alias AttentionServer.ClientAPI.Reads
   alias AttentionServer.ClientAPISchema, as: Schema
 
@@ -316,12 +316,8 @@ defmodule AttentionServer.ClientAPIReadsTest do
 
     first = hd(entries)
 
-    %{"feed_seq" => feed_seq} =
-      :sys.get_state(relay).store.engine.origin_feeds[{"A", "origin"}].entries
-      |> Map.values()
-      |> Enum.find(&(&1["kind"] == "discussion" and &1["text"] == "Note 1"))
-
-    assert {:ok, _} = Relay.origin_ack(relay, "origin", feed_seq)
+    # The origin's agent feed delivers the turn (ACK1).
+    assert {:ok, _, _, _} = AgentAPIInProcess.changes(relay, "A", "origin")
 
     assert {:ok, %{"rev" => later, "entries" => [marked | _]}} =
              Reads.entries(relay, "reader", one)

@@ -1,7 +1,7 @@
 defmodule AttentionServer.ClientAPIResourcesTest do
   use ExUnit.Case, async: false
 
-  alias AttentionServer.{Engine, JSON, Placement, Relay}
+  alias AttentionServer.{Engine, JSON, Placement, PreChangeLogStore, Relay}
   alias AttentionServer.ClientAPI.Resources
   alias AttentionServer.ClientAPISchema, as: Schema
 
@@ -384,7 +384,8 @@ defmodule AttentionServer.ClientAPIResourcesTest do
         |> Map.values()
         |> Enum.filter(&(&1["kind"] == "discussion"))
 
-      assert {:ok, _} = Relay.origin_ack(relay, "origin", feed_seq)
+      # A protocol 0.1 origin's stored delivered receipt still marks the turn.
+      PreChangeLogStore.in_relay(relay, &PreChangeLogStore.origin_ack(&1, "origin", feed_seq))
       {engine, _view} = snapshot(relay)
 
       assert [%{"delivery" => %{"delivered" => true, "acted" => true}}] =
@@ -449,7 +450,12 @@ defmodule AttentionServer.ClientAPIResourcesTest do
         |> Map.values()
         |> Enum.find(&(&1["kind"] == "terminal" and &1["message_id"] == "answered"))
 
-      assert {:ok, _} = Relay.origin_ack(relay, "origin", terminal_seq)
+      assert {:ok, _} =
+               GenServer.call(
+                 relay,
+                 {:origin_ack2, "origin", terminal_seq,
+                  %{"op_id" => op(52), "outcome" => "handed"}}
+               )
 
       for {status, n} <- [{"received", 50}, {"applied", 51}] do
         assert %{"type" => "ok"} =

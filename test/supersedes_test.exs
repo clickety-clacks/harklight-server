@@ -1,7 +1,7 @@
 defmodule AttentionServer.SupersedesTest do
   use ExUnit.Case, async: false
 
-  alias AttentionServer.{JSON, Relay}
+  alias AttentionServer.{AgentAPIInProcess, JSON, Relay}
   alias AttentionServer.ClientAPI.Reads
 
   @first_session "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
@@ -58,6 +58,20 @@ defmodule AttentionServer.SupersedesTest do
     })
   end
 
+  # The origin's v2 agent feed: one changes batch from `cursor`.
+  defp agent_changes(relay, person, key, cursor) do
+    assert {:ok, changes, false, position} =
+             AgentAPIInProcess.changes(relay, person, key, cursor)
+
+    {changes, position}
+  end
+
+  defp agent_terminal(relay, person, key, id) do
+    item = AgentAPIInProcess.item_id(relay, person, "app:test", id)
+    assert {:ok, %{"message" => message}} = AgentAPIInProcess.message(relay, person, key, item)
+    {item, message["terminal"]}
+  end
+
   test "one send supersedes several requests, warns on odd ids, and reaches phones and origin feeds",
        %{path: path} do
     assert {:ok, relay} = Relay.start_link(store_path: path)
@@ -86,8 +100,7 @@ defmodule AttentionServer.SupersedesTest do
              })
 
     assert %{"seq" => 1} = send_request(relay, "other", @first_session, "m1", 5)
-    assert {:ok, %{"cursor" => first_feed_high}} = Relay.origin_feed(relay, "first", 0)
-    assert :ok = Relay.origin_stream_attach(relay, "first", @first_session, self())
+    {_, first_feed_position} = agent_changes(relay, "A", "first", 0)
 
     assert {:ok, phone_session} = Relay.open_session(relay, "phone")
 
@@ -134,8 +147,12 @@ defmodule AttentionServer.SupersedesTest do
       assert item["terminal"]["state"] == "superseded"
     end
 
-    assert_receive {:origin_state_changed, next_feed_high}
-    assert next_feed_high == first_feed_high + 1
+    # The superseding send reaches the superseded request's origin feed once.
+    {m1_item, _} = agent_terminal(relay, "A", "first", "m1")
+    {superseded, _} = agent_changes(relay, "A", "first", first_feed_position)
+
+    assert [%{"kind" => "message", "data" => %{"terminal" => %{"state" => "superseded"}}}] =
+             Enum.filter(superseded, &(&1["data"]["item_id"] == m1_item))
 
     assert %{"seq" => 5, "supersedes_warnings" => ^expected_warnings} =
              send_request(relay, "second", @second_session, "new", 6, %{
@@ -150,9 +167,7 @@ defmodule AttentionServer.SupersedesTest do
 
     refute Enum.any?(Enum.drop(events, 5), &Map.has_key?(&1, "terminal_reason"))
 
-    assert {:ok, %{"entries" => first_feed}} = Relay.origin_feed(relay, "first", 0)
-    assert List.last(first_feed)["terminal_state"] == "superseded"
-    assert List.last(first_feed)["message_id"] == "m1"
+    assert {_, %{"state" => "superseded"}} = agent_terminal(relay, "A", "first", "m1")
 
     assert %{"type" => "error", "reason" => "closed"} =
              request(relay, "phone", %{
@@ -223,33 +238,42 @@ defmodule AttentionServer.SupersedesTest do
     assert :ok = Relay.setup_sender(relay, "shared", "app:test")
 
     assert %{"seq" => 1} = send_request(relay, "shared", @first_session, "m1", 1)
-    assert :ok = Relay.origin_stream_attach(relay, "shared", @first_session, self())
-    assert {:ok, %{"cursor" => before}} = Relay.origin_feed(relay, "shared", 0)
+    {_, before} = agent_changes(relay, "A", "shared", 0)
 
     assert %{"seq" => 2} =
              send_request(relay, "shared", @second_session, "m3", 2, %{
                "supersedes" => ["m1"]
              })
 
-    assert_receive {:origin_state_changed, after_seq}
-    assert after_seq > before
-    assert {:ok, %{"entries" => entries}} = Relay.origin_feed(relay, "shared", before)
+    # The agent feed of the first session receives the superseded terminal.
+    {m1_item, terminal} = agent_terminal(relay, "A", "shared", "m1")
+    assert %{"state" => "superseded"} = terminal
+    {changes, after_position} = agent_changes(relay, "A", "shared", before)
+    assert after_position > before
 
-    assert %{
-             "kind" => "terminal",
-             "author" => "server",
-             "message_id" => "m1",
-             "session_handle" => @first_session,
-             "terminal_state" => "superseded",
-             "delivered" => false,
-             "feed_seq" => terminal_feed_seq
-           } = Enum.find(entries, &(&1["kind"] == "terminal"))
+    assert [%{"kind" => "message", "data" => %{"session" => @first_session} = m1}] =
+             Enum.filter(changes, &(&1["data"]["item_id"] == m1_item))
 
-    assert {:ok, %{"open_requests" => 0, "pending_undelivered" => 1}} =
-             Relay.origin_status(relay, "shared", @first_session)
+    assert m1["terminal"] == terminal
 
-    assert {:ok, %{"status" => "delivered"}} =
-             Relay.origin_ack(relay, "shared", terminal_feed_seq)
+    {first_only, _} =
+      AgentAPIInProcess.changes(relay, "A", "shared", before, session: @first_session)
+      |> then(fn {:ok, rows, false, position} -> {rows, position} end)
+
+    assert Enum.any?(first_only, &(&1["data"]["item_id"] == m1_item))
+
+    # The stored origin feed keeps the server-authored terminal, undelivered.
+    feed = :sys.get_state(relay).store.engine.origin_feeds[{"A", "shared"}]
+
+    assert [
+             %{
+               "author" => "server",
+               "message_id" => "m1",
+               "session_handle" => @first_session,
+               "terminal_state" => "superseded"
+             }
+           ] =
+             for({_, %{"kind" => "terminal"} = entry} <- feed.entries, do: entry)
 
     GenServer.stop(relay)
   end

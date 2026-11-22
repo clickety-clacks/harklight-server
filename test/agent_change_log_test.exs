@@ -1,7 +1,15 @@
 defmodule AttentionServer.AgentChangeLogTest do
   use ExUnit.Case, async: false
 
-  alias AttentionServer.{AgentChangeLog, ChangeLog, JSON, PreChangeLogStore, Relay}
+  alias AttentionServer.{
+    AgentAPIInProcess,
+    AgentChangeLog,
+    ChangeLog,
+    JSON,
+    PreChangeLogStore,
+    Relay
+  }
+
   alias AttentionServer.AgentAPI.FeedActivity
   alias Exqlite.Sqlite3
 
@@ -228,16 +236,16 @@ defmodule AttentionServer.AgentChangeLogTest do
     resource = {:entry, chat_seq}
     assert {:ok, first_rev} = stored(relay, &AgentChangeLog.rev(&1, scope, resource))
 
-    assert {:ok, %{"entries" => _}} = Relay.origin_feed(relay, "other", 0)
+    assert {:ok, _, false, _} = AgentAPIInProcess.changes(relay, "A", "other")
     assert {:ok, ^first_rev} = stored(relay, &AgentChangeLog.rev(&1, scope, resource))
-    assert {:ok, %{"entries" => _}} = Relay.origin_feed(relay, "origin", 0)
+    assert {:ok, _, false, _} = AgentAPIInProcess.changes(relay, "A", "origin")
     assert {:ok, updated_rev} = stored(relay, &AgentChangeLog.rev(&1, scope, resource))
     assert updated_rev > first_rev
 
     assert {:ok, rows, false, head} = read(relay, "origin")
     assert [%{resource: ^resource, rev: ^updated_rev}] = Enum.filter(rows, &(&1.kind == :entry))
 
-    assert {:ok, %{"entries" => _}} = Relay.origin_feed(relay, "origin", 0)
+    assert {:ok, _, false, _} = AgentAPIInProcess.changes(relay, "A", "origin")
     assert {:ok, [], false, ^head} = read(relay, "origin", head)
     GenServer.stop(relay)
   end
@@ -259,7 +267,7 @@ defmodule AttentionServer.AgentChangeLogTest do
 
     assert {:ok, _, false, answer_rev} = read(relay, "origin")
 
-    assert {:ok, %{"entries" => _}} = Relay.origin_feed(relay, "origin", 0)
+    assert {:ok, _, false, _} = AgentAPIInProcess.changes(relay, "A", "origin")
 
     resource = {:message, key("question")}
 
@@ -277,7 +285,15 @@ defmodule AttentionServer.AgentChangeLogTest do
     forward(relay, "origin", "unaffected", 2, @other_session)
     assert {:ok, _, false, previous} = read(relay, "origin")
 
-    assert :ok = Relay.origin_session_gone(relay, "origin", @session)
+    assert {:ok, 200, _, false} =
+             AgentAPIInProcess.write(
+               relay,
+               "A",
+               "origin",
+               :session_end,
+               %{session: @session},
+               %{}
+             )
 
     assert {:ok, rows, false, next} = read(relay, "origin", previous)
     assert [{"affected", rev}] = messages(rows)

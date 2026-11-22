@@ -84,7 +84,6 @@ defmodule AttentionServer.APNSPushTest do
     DeviceIdentity,
     Engine,
     JSON,
-    LegacyOriginWire,
     Relay,
     Server,
     TLSFixtures
@@ -1802,9 +1801,8 @@ defmodule AttentionServer.APNSPushTest do
 
   defp forward_test_message(relay, sender_key) do
     assert %{"type" => "ok", "seq" => 1} =
-             LegacyOriginWire.command(relay, sender_key, %{
-               "v" => 1,
-               "type" => "send",
+             request_frame(relay, sender_key, %{
+               "type" => "forward",
                "op_id" => op(3),
                "message" => %{
                  "sender_id" => "app:test",
@@ -1933,9 +1931,8 @@ defmodule AttentionServer.APNSPushTest do
       |> Map.merge(extra_fields)
 
     assert %{"type" => "ok", "seq" => 1} =
-             LegacyOriginWire.command(relay, sender_key, %{
-               "v" => 1,
-               "type" => "send",
+             request_frame(relay, sender_key, %{
+               "type" => "forward",
                "op_id" => op(operation),
                "message" => message
              })

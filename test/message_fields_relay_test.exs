@@ -1,7 +1,8 @@
 defmodule AttentionServer.MessageFieldsRelayTest do
   use ExUnit.Case, async: false
 
-  alias AttentionServer.{JSON, LegacyOriginWire, Placement, Relay}
+  alias AttentionServer.{AgentAPIInProcess, JSON, Placement, Relay}
+  alias AttentionServer.ClientAPI.AgentReads
 
   @handle "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 
@@ -41,24 +42,48 @@ defmodule AttentionServer.MessageFieldsRelayTest do
     assert :ok = Relay.setup_sender(relay, "origin", "app:test")
   end
 
-  defp await_terminal(relay, device, remaining \\ 100)
+  # What the origin reads of its own message: GET /v2/agent/messages/{id}.
+  # The v2 message carries its current revision's content without the
+  # sender and message identifiers, which it names outside the content.
+  defp origin_message(relay, message_id) do
+    item = AgentAPIInProcess.item_id(relay, "person-a", "app:test", message_id)
 
-  defp await_terminal(_relay, _device, 0), do: flunk("default terminal did not arrive")
+    assert {:ok, %{"message" => message}} =
+             AgentAPIInProcess.message(relay, "person-a", "origin", item)
 
-  defp await_terminal(relay, device, remaining) do
-    case Relay.origin_feed(relay, device, 0) do
-      {:ok, %{"entries" => entries}} ->
-        case Enum.find(entries, &(&1["kind"] == "terminal")) do
-          terminal when is_map(terminal) ->
-            terminal
+    message
+  end
 
-          nil ->
-            Process.sleep(50)
-            await_terminal(relay, device, remaining - 1)
-        end
+  defp origin_content(relay, message_id), do: origin_message(relay, message_id)["message"]
 
-      other ->
-        flunk("unexpected origin feed result: #{inspect(other)}")
+  # The origin's messages, newest first: GET /v2/agent/messages.
+  defp origin_messages(relay) do
+    principal = %{kind: :device, person: "person-a", key: "origin"}
+
+    assert {:ok, %{"messages" => messages}} =
+             GenServer.call(
+               relay,
+               {:client_api, AgentReads, {principal, {:messages, %{}}}},
+               :infinity
+             )
+
+    messages
+  end
+
+  defp without_ids(message), do: Map.drop(message, ~w(sender_id message_id))
+
+  defp await_terminal(relay, message_id, remaining \\ 100)
+
+  defp await_terminal(_relay, _message_id, 0), do: flunk("default terminal did not arrive")
+
+  defp await_terminal(relay, message_id, remaining) do
+    case origin_message(relay, message_id) do
+      %{"terminal" => terminal} when is_map(terminal) ->
+        terminal
+
+      _ ->
+        Process.sleep(50)
+        await_terminal(relay, message_id, remaining - 1)
     end
   end
 
@@ -138,8 +163,8 @@ defmodule AttentionServer.MessageFieldsRelayTest do
     assert {:ok, [delivery], 1} = Relay.events(relay, "reader", 0)
     assert delivery["message"] == typed
 
-    assert {:ok, %{"entries" => [feed_entry]}} = Relay.origin_feed(relay, "origin", 0)
-    assert feed_entry["message"] == typed
+    assert %{"revision" => 1, "message" => content} = origin_message(relay, "typed-request")
+    assert content == without_ids(typed)
 
     invalid_type = Map.put(%{typed | "message_id" => "bad-type"}, "message_type", "notice")
 
@@ -192,11 +217,10 @@ defmodule AttentionServer.MessageFieldsRelayTest do
     dropped_kind_delivery = Enum.find(events, &(&1["message"]["message_id"] == "bad-kind"))
     refute Map.has_key?(dropped_kind_delivery["message"], "message_kind")
 
-    assert {:ok, %{"entries" => entries}} = Relay.origin_feed(relay, "origin", 0)
-
-    assert Enum.map(entries, &get_in(&1, ["message", "message_id"])) == [
-             "typed-request",
-             "bad-kind"
+    # Only the two accepted sends are stored for the origin.
+    assert Enum.map(origin_messages(relay), & &1["legacy_message_id"]) == [
+             "bad-kind",
+             "typed-request"
            ]
 
     GenServer.stop(relay)
@@ -336,30 +360,17 @@ defmodule AttentionServer.MessageFieldsRelayTest do
     GenServer.stop(relay)
   end
 
-  test "duplicate UI/1 members degrade the screen on the origin send route", %{
-    path: path
-  } do
-    relay = start_relay(path)
-    setup_devices(relay)
-
+  # Protocol 0.1's origin send admitted duplicate members inside a UI/1
+  # document and degraded the screen. The v2 agent send body has no "type"
+  # member, so AgentWrites.json_body (JSON.decode_line_for_ui1_admission)
+  # refuses it as invalid JSON (400 invalid_field) and nothing is sent.
+  test "duplicate UI/1 members in a v2 agent send body are refused, not admitted" do
     raw =
-      ~s|{"v":1,"type":"send","op_id":"#{op(31)}","message":{"sender_id":"app:test","message_id":"duplicate-ui1","created_at":1,"title":"Choose","message_type":"request","answer_ui":{"schema":"attention-client.ui/1","schema":"attention-client.ui/1"}}}| <>
+      ~s|{"sender":"app:test","message":{"created_at":1,"title":"Choose","message_type":"request","answer_ui":{"schema":"attention-client.ui/1","schema":"attention-client.ui/1"}}}| <>
         "\n"
 
     assert {:error, :bad_frame} = JSON.decode_line(raw)
-    assert {:ok, request} = JSON.decode_line_for_ui1_admission(raw)
-
-    assert %{
-             "type" => "ok",
-             "field_warnings" => [%{"field" => "answer_ui", "detail" => detail}]
-           } = LegacyOriginWire.command(relay, "origin", request)
-
-    assert detail =~ "schema"
-    assert detail =~ "member names must be unique"
-    assert {:ok, [delivery], 1} = Relay.events(relay, "reader", 0)
-    assert delivery["message"]["answer_ui_unavailable"] == detail
-    assert delivery["message"]["answer_ui"]["schema"] == "attention-client.actions/1"
-    GenServer.stop(relay)
+    assert {:error, :bad_frame} = JSON.decode_line_for_ui1_admission(raw)
   end
 
   test "untyped UI/1 send checks the server-reencoded document at the size boundary", %{
@@ -511,8 +522,7 @@ defmodule AttentionServer.MessageFieldsRelayTest do
 
     assert detail =~ "requires"
 
-    assert {:ok, %{"entries" => entries}} = Relay.origin_feed(relay, "origin", 0)
-    revised = List.last(entries)["message"]
+    revised = origin_content(relay, "ui1-invalid-revision")
     assert revised["title"] == "Valid UI/1"
     assert revised["answer_ui"]["schema"] == "attention-client.actions/1"
     assert revised["answer_ui_unavailable"] == detail
@@ -601,12 +611,10 @@ defmodule AttentionServer.MessageFieldsRelayTest do
                "message" => revision |> Map.put("message_type", "notice")
              })
 
-    assert {:ok, %{"entries" => [_original_entry, revision_entry]}} =
-             Relay.origin_feed(relay, "origin", 0)
-
-    assert revision_entry["message"]["message_type"] == "request"
-    assert revision_entry["message"]["answer_ui"] == answer_ui
-    assert revision_entry["message"]["title"] == "Revised request"
+    assert %{"revision" => 2, "message" => current} = origin_message(relay, "typed-revision")
+    assert current["message_type"] == "request"
+    assert current["answer_ui"] == answer_ui
+    assert current["title"] == "Revised request"
 
     GenServer.stop(relay)
   end
@@ -723,8 +731,7 @@ defmodule AttentionServer.MessageFieldsRelayTest do
     assert detail =~ "attention-client.ui/1"
     assert detail =~ "at least one input"
 
-    assert {:ok, %{"entries" => entries}} = Relay.origin_feed(relay, "origin", 0)
-    revised = List.last(entries)["message"]
+    revised = origin_content(relay, "ui1-controls-on-revise")
     assert revised["message_type"] == "request"
     assert revised["answer_ui"]["schema"] == "attention-client.actions/1"
     assert revised["answer_ui_unavailable"] == detail
@@ -766,9 +773,9 @@ defmodule AttentionServer.MessageFieldsRelayTest do
                "message" => Map.put(original, "message_type", "notice")
              })
 
-    assert {:ok, %{"entries" => [entry]}} = Relay.origin_feed(relay, "origin", 0)
-    assert entry["message"] == original
-    refute Map.has_key?(entry["message"], "message_type")
+    assert %{"revision" => 1, "message" => content} = origin_message(relay, "untyped-revision")
+    assert content == without_ids(original)
+    refute Map.has_key?(content, "message_type")
 
     assert {:ok, [delivery], 1} = Relay.events(relay, "reader", 0)
     assert delivery["message"] == original
@@ -831,11 +838,9 @@ defmodule AttentionServer.MessageFieldsRelayTest do
                "message" => revised
              })
 
-    assert {:ok, %{"entries" => [_initial, revised_entry]}} =
-             Relay.origin_feed(relay, "origin", 0)
-
-    assert revised_entry["message"]["message_type"] == "request"
-    assert revised_entry["message"]["answer_ui"] == revised["answer_ui"]
+    assert %{"revision" => 2, "message" => current} = origin_message(relay, "typed-type-change")
+    assert current["message_type"] == "request"
+    assert current["answer_ui"] == revised["answer_ui"]
 
     GenServer.stop(relay)
   end
@@ -895,11 +900,13 @@ defmodule AttentionServer.MessageFieldsRelayTest do
                "message" => revised_message
              })
 
-    assert {:ok, %{"entries" => [_, revision]}} = Relay.origin_feed(relay, "origin", 0)
-    assert revision["kind"] == "revision"
+    assert %{"revision" => 2, "message" => current} = origin_message(relay, "revised-fields")
 
-    assert revision["message"] ==
-             revised_message |> Map.delete("choice_styles") |> Map.delete("message_kind")
+    assert current ==
+             revised_message
+             |> Map.delete("choice_styles")
+             |> Map.delete("message_kind")
+             |> without_ids()
 
     [view_entry] =
       relay
@@ -965,11 +972,17 @@ defmodule AttentionServer.MessageFieldsRelayTest do
                }
              })
 
-    terminal = await_terminal(restarted, "origin")
-    assert terminal["author"] == "server"
-    assert terminal["by"] == "default"
+    # The origin reads the default answer as a default outcome. A server
+    # terminal carries no delivery, which only a person's answer has.
+    terminal = await_terminal(restarted, "defaulted")
+    assert terminal["state"] == "answered"
+    assert terminal["outcome"] == %{"kind" => "default", "value" => "ship", "text" => "Later"}
     assert terminal["answer"] == "ship"
-    assert terminal["at"] >= default_at
+    assert terminal["at_ms"] >= default_at
+    refute Map.has_key?(terminal, "delivery")
+
+    terminal_seq =
+      :sys.get_state(restarted).store.engine.messages[{"person-a", "app:test", "defaulted"}].terminal.seq
 
     assert {:ok, events, 3} = Relay.events(restarted, "reader", 1)
     assert length(events) == 2
@@ -994,7 +1007,7 @@ defmodule AttentionServer.MessageFieldsRelayTest do
                "receipt_version" => 1,
                "sender_id" => "app:test",
                "message_id" => "defaulted",
-               "terminal_seq" => terminal["terminal_seq"]
+               "terminal_seq" => terminal_seq
              })
 
     GenServer.stop(restarted)

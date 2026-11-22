@@ -12,6 +12,7 @@ defmodule AttentionServer.PrioritizationTest do
     JevRanking,
     Message,
     Placement,
+    PreChangeLogStore,
     Relay,
     RouteBIndex,
     Store,
@@ -2652,10 +2653,11 @@ defmodule AttentionServer.PrioritizationTest do
       "unsupported_reason" => nil
     }
 
-    assert {:ok, %{"listening_support" => declared}} =
-             Relay.origin_support(relay, "device-a", support)
-
-    assert :ok = Relay.origin_stream_attach(relay, "device-a", op(2701), self())
+    # A protocol 0.1 origin's support record, as a 0.1 Server stored it.
+    PreChangeLogStore.in_relay(relay, &PreChangeLogStore.origin_support(&1, "device-a", support))
+    session_key = {"person-a", "device-a", op(2701)}
+    declared = :sys.get_state(relay).store.engine.origin_sessions[session_key].support
+    assert %{"route" => "claude-code"} = declared
 
     {support_version, support_payload, support_checksum} = persisted_snapshot(path)
     assert :crypto.hash(:sha256, support_payload) == support_checksum
@@ -2696,19 +2698,9 @@ defmodule AttentionServer.PrioritizationTest do
     restored = view_for(restarted, resumed_session)
     assert List.last(restored["list_items"]) == historical
 
-    assert {:ok, %{"listening_support" => ^declared, "availability" => "not_listening"}} =
-             Relay.origin_status(restarted, "device-a", op(2701))
-
-    assert {:ok, feed, _high} = Relay.conversation_events(restarted, "device-b", 0)
-    assert Enum.any?(feed, &(&1["listening_support"] == declared))
-    assert Enum.any?(feed, &(&1["availability"] == "listening"))
-
-    duplicate_state = persisted_snapshot(path)
-
-    assert {:ok, %{"duplicate" => true, "listening_support" => ^declared}} =
-             Relay.origin_support(restarted, "device-a", support)
-
-    assert persisted_snapshot(path) == duplicate_state
+    # The reply-history commits kept the stored support record.
+    assert :sys.get_state(restarted).store.engine.origin_sessions[session_key].support ==
+             declared
 
     next_reply_seq = add_reply(restarted, "reply-history", 2714)
 

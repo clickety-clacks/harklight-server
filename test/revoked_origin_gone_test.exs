@@ -50,18 +50,16 @@ defmodule AttentionServer.RevokedOriginGoneTest do
     response
   end
 
-  defp forward(relay, handle, message_id, operation, origin_listener? \\ false) do
-    route = if origin_listener?, do: "other", else: "claude-code"
-
+  defp forward(relay, handle, message_id, operation) do
     assert %{"type" => "ok"} =
              request(relay, "origin", %{
                "type" => "forward",
                "op_id" => op(operation),
                "session_handle" => handle,
-               "route" => route,
+               "route" => "claude-code",
                "cli_version" => "test-only",
                "unsupported_reason" => nil,
-               "origin_listener" => origin_listener?,
+               "origin_listener" => false,
                "message" => %{
                  "sender_id" => "app:test",
                  "message_id" => message_id,
@@ -78,7 +76,6 @@ defmodule AttentionServer.RevokedOriginGoneTest do
   } do
     forward(relay, @handle_a, "revoked-chat-a", 1)
     forward(relay, @handle_b, "revoked-chat-b", 2)
-    assert :ok = Relay.origin_stream_attach(relay, "origin", @handle_a, self())
 
     assert {:ok, _before, cursor} = Relay.conversation_events(relay, "reader", 0)
     assert :ok = Relay.owner_revoke_device(relay, person, owner_key, "origin")
@@ -108,45 +105,5 @@ defmodule AttentionServer.RevokedOriginGoneTest do
     assert {:ok, chat_events, _} = Relay.conversation_events(relay, "reader", next_cursor)
     assert Enum.any?(chat_events, &(&1["kind"] == "discussion"))
     refute Enum.any?(chat_events, &(&1["kind"] == "availability"))
-  end
-
-  test "detaching an origin stream after revocation does not crash the relay", %{
-    relay: relay,
-    person: person,
-    owner_key: owner_key
-  } do
-    forward(relay, @handle_a, "detach-after-revoke", 10)
-    assert :ok = Relay.origin_stream_attach(relay, "origin", @handle_a, self())
-    assert {:ok, _before, cursor} = Relay.conversation_events(relay, "reader", 0)
-    assert :ok = Relay.owner_revoke_device(relay, person, owner_key, "origin")
-    assert {:ok, [gone], revoked_cursor} = Relay.conversation_events(relay, "reader", cursor)
-    assert gone["kind"] == "availability"
-    assert gone["availability"] == "gone"
-
-    assert :ok = Relay.origin_stream_detach(relay, "origin", @handle_a, self())
-    assert Process.alive?(relay)
-
-    assert {:ok, [], ^revoked_cursor} =
-             Relay.conversation_events(relay, "reader", revoked_cursor)
-  end
-
-  test "detaching an origin-wide stream after revocation preserves the one gone notice", %{
-    relay: relay,
-    person: person,
-    owner_key: owner_key
-  } do
-    forward(relay, @handle_a, "origin-wide-detach-after-revoke", 20, true)
-    assert :ok = Relay.origin_stream_attach(relay, "origin", :origin, self())
-    assert {:ok, _before, cursor} = Relay.conversation_events(relay, "reader", 0)
-    assert :ok = Relay.owner_revoke_device(relay, person, owner_key, "origin")
-    assert {:ok, [gone], revoked_cursor} = Relay.conversation_events(relay, "reader", cursor)
-    assert gone["kind"] == "availability"
-    assert gone["availability"] == "gone"
-
-    assert :ok = Relay.origin_stream_detach(relay, "origin", :origin, self())
-    assert Process.alive?(relay)
-
-    assert {:ok, [], ^revoked_cursor} =
-             Relay.conversation_events(relay, "reader", revoked_cursor)
   end
 end

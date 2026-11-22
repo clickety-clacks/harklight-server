@@ -39,13 +39,6 @@ defmodule AttentionServer.ClientAPIFeedShowTest do
 
     forward(relay, "one", 1)
 
-    # The agent may push views, as an owner's switches allow.
-    :sys.replace_state(relay, fn state ->
-      engine = state.store.engine
-      device = %{engine.devices[@agent] | see_focus: true, push_view: true}
-      put_in(state.store.engine, %{engine | devices: Map.put(engine.devices, @agent, device)})
-    end)
-
     # A held show needs an accepted focus report from the device.
     assert {:ok, 200, _, false} =
              Writes.focus(relay, reader, %{"screen" => "inbox", "ttl_s" => 120})
@@ -89,14 +82,6 @@ defmodule AttentionServer.ClientAPIFeedShowTest do
     assert {:ok, %{"type" => "ok"}} = JSON.decode_line(line)
   end
 
-  defp push_view(relay, target) do
-    Relay.view_show(relay, @agent, %{
-      "sender_id" => "app:test",
-      "message_id" => "one",
-      "target" => target
-    })
-  end
-
   defp head(relay), do: elem(ChangeLog.head(:sys.get_state(relay).store, "A"), 1)
 
   # Reads events until a `show`, skipping heartbeats; returns the events seen.
@@ -128,9 +113,10 @@ defmodule AttentionServer.ClientAPIFeedShowTest do
     {agent, agent_feed} = await_open(agent, agent_feed)
     assert client_feed.status == 200 and agent_feed.status == 200
 
-    assert {:ok, %{"delivery" => "held"}} = push_view(ctx.relay, "chat")
+    response = Task.await(show_in_request(ctx))
+    assert %{"state" => "sent", "show_id" => id} = body(response)
     {_client, _client_feed, event, _prior} = until_show(client, client_feed)
-    assert %{event: "show", data: %{"target" => "chat"}} = event
+    assert %{event: "show", data: %{"show_id" => ^id, "target" => "chat"}} = event
     {_agent, _agent_feed, agent_events} = events(agent, agent_feed, 3)
     assert agent_events == List.duplicate(%{event: "heartbeat", data: %{}}, 3)
   end
@@ -174,17 +160,25 @@ defmodule AttentionServer.ClientAPIFeedShowTest do
 
   test "the stream writes only the current show when a newer show arrives before delivery", ctx do
     heartbeat_fast()
+    # Enroll the showing agent first: enrolling a device changes the item.
+    enable_show_origin(ctx)
     stream = pause_before_first_chunk(ctx)
-    assert {:ok, %{"delivery" => "held"}} = push_view(ctx.relay, "message")
-    assert {:ok, %{"delivery" => "held"}} = push_view(ctx.relay, "chat")
+    older = show_task(ctx, "00000000-0000-4000-8000-000000000021", "message")
+    older_id = await_held_show(ctx, nil)
+    newer = show_task(ctx, "00000000-0000-4000-8000-000000000022", "chat")
+    newer_id = await_held_show(ctx, older_id)
 
     send(stream.pid, :resume)
 
     assert_receive {:stream_chunk, "event: show\ndata: " <> data}, 1_000
-    assert {:ok, %{"target" => "chat"}} = JSON.decode_line(data)
+    assert {:ok, %{"show_id" => ^newer_id, "target" => "chat"}} = JSON.decode_line(data)
 
     assert_receive {:stream_chunk, next}, 1_000
     assert next == "event: heartbeat\ndata: {}\n\n"
+
+    # The superseded show was never written; its request reports it held.
+    assert %{"state" => "held", "show_id" => ^older_id} = body(Task.await(older))
+    assert %{"state" => "sent", "show_id" => ^newer_id} = body(Task.await(newer))
 
     assert :ok = Relay.revoke_device(ctx.relay, ctx.reader)
 
@@ -194,8 +188,10 @@ defmodule AttentionServer.ClientAPIFeedShowTest do
   end
 
   test "the stream closes without a show when the device is revoked before delivery", ctx do
+    enable_show_origin(ctx)
     stream = pause_before_first_chunk(ctx)
-    assert {:ok, %{"delivery" => "held"}} = push_view(ctx.relay, "chat")
+    request = show_task(ctx, "00000000-0000-4000-8000-000000000011", "chat")
+    await_held_show(ctx, nil)
     assert :ok = Relay.revoke_device(ctx.relay, ctx.reader)
 
     send(stream.pid, :resume)
@@ -204,12 +200,15 @@ defmodule AttentionServer.ClientAPIFeedShowTest do
     assert first == "event: closing\ndata: {\"reason\":\"revoked\"}\n\n"
     Task.await(stream)
     refute_received {:stream_chunk, "event: show\ndata: " <> _}
+    assert %{"state" => "held"} = body(Task.await(request))
   end
 
   test "signing out suppresses live delivery and preserves the held show", ctx do
     heartbeat_fast()
+    enable_show_origin(ctx)
     stream = pause_before_first_chunk(ctx)
-    assert {:ok, %{"delivery" => "held"}} = push_view(ctx.relay, "chat")
+    request = show_task(ctx, "00000000-0000-4000-8000-000000000011", "chat")
+    id = await_held_show(ctx, nil)
 
     assert {:ok, 200, signed_out, false} =
              Writes.focus(ctx.relay, ctx.reader, %{"screen" => "signed_out", "ttl_s" => 120})
@@ -219,45 +218,15 @@ defmodule AttentionServer.ClientAPIFeedShowTest do
 
     assert_receive {:stream_chunk, first}, 1_000
     assert first == "event: heartbeat\ndata: {}\n\n"
+    assert %{"state" => "held", "show_id" => ^id} = body(Task.await(request))
 
-    assert {:ok, 200, %{"show" => %{"target" => "chat"}}, false} =
+    assert {:ok, 200, %{"show" => %{"show_id" => ^id, "target" => "chat"}}, false} =
              Writes.focus(ctx.relay, ctx.reader, %{"screen" => "inbox", "ttl_s" => 120})
 
     assert :ok = Relay.revoke_device(ctx.relay, ctx.reader)
     assert_receive {:stream_chunk, "event: closing\ndata: {\"reason\":\"revoked\"}\n\n"}, 1_000
     Task.await(stream)
     refute_received {:stream_chunk, "event: show\ndata: " <> _}
-  end
-
-  test "a held show reaches the device's open feed as an id-less show event", ctx do
-    conn = connect(ctx.port, ctx.certs, "a1")
-    {conn, feed} = open_feed(conn, "?after=#{head(ctx.relay)}")
-    {conn, feed} = await_open(conn, feed)
-
-    sent_at = System.system_time(:millisecond)
-    assert {:ok, %{"delivery" => "held"}} = push_view(ctx.relay, "chat")
-    {_conn, _feed, show, _before} = until_show(conn, feed)
-
-    # No id: line, so Last-Event-ID never moves.
-    refute Map.has_key?(show, :id)
-
-    assert %{
-             "show_id" => "s" <> _,
-             "device_id" => device_id,
-             "item_id" => "i" <> _,
-             "target" => "chat",
-             "held_ms" => held_ms
-           } = show.data
-
-    assert device_id == ctx.reader
-    assert is_integer(held_ms) and held_ms >= 0
-    assert held_ms <= System.system_time(:millisecond) - sent_at + 50
-
-    # It is the same show the device's next focus write returns.
-    assert {:ok, 200, %{"show" => %{"show_id" => show_id}}, false} =
-             Writes.focus(ctx.relay, ctx.reader, %{"screen" => "inbox", "ttl_s" => 120})
-
-    assert show_id == show.data["show_id"]
   end
 
   test "the enrolled TLS route uses the push grant and delivers one id on focus and SSE", ctx do
@@ -296,9 +265,18 @@ defmodule AttentionServer.ClientAPIFeedShowTest do
 
     {reader_conn, feed, received, _} = until_show(reader_conn, feed)
 
-    assert %{event: "show", data: %{"show_id" => ^id, "target" => "chat", "held_ms" => age}} =
-             received
+    assert %{
+             event: "show",
+             data: %{
+               "show_id" => ^id,
+               "device_id" => ^reader,
+               "item_id" => ^item,
+               "target" => "chat",
+               "held_ms" => age
+             }
+           } = received
 
+    # No id: line, so Last-Event-ID never moves.
     refute Map.has_key?(received, :id)
     assert age >= 0
 
@@ -446,7 +424,11 @@ defmodule AttentionServer.ClientAPIFeedShowTest do
     writer
   end
 
-  defp show_in_request(ctx) do
+  defp show_in_request(ctx),
+    do: show_task(enable_show_origin(ctx), "00000000-0000-4000-8000-000000000011", "chat")
+
+  # Enrolls the a2 certificate as an agent that may push views.
+  defp enable_show_origin(ctx) do
     assert {:ok, origin} =
              Relay.setup_device_certificate(
                ctx.relay,
@@ -458,21 +440,31 @@ defmodule AttentionServer.ClientAPIFeedShowTest do
       put_in(state.store.engine.devices[origin].push_view, true)
     end)
 
+    ctx
+  end
+
+  # POST /v2/agent/show from a2 for the one item, in a task: the request waits
+  # for the device's feed writer to report the show.
+  defp show_task(ctx, key, target) do
     assert {:ok, %{"items" => [%{"item_id" => item}]}} =
              ClientAPI.Reads.inbox(ctx.relay, ctx.reader)
 
     Task.async(fn ->
       conn = connect(ctx.port, ctx.certs, "a2")
-
-      {conn, response} =
-        show_request(conn, "00000000-0000-4000-8000-000000000011", %{
-          "item_id" => item,
-          "target" => "chat"
-        })
-
+      {conn, response} = show_request(conn, key, %{"item_id" => item, "target" => target})
       Mint.HTTP.close(conn)
       response
     end)
+  end
+
+  # Waits until the reader's held show is a new one, and returns its id.
+  defp await_held_show(ctx, previous_id) do
+    Enum.find_value(1..200, fn _ ->
+      case :sys.get_state(ctx.relay).held_shows[ctx.reader] do
+        %{"show_id" => id} when id != previous_id -> id
+        _ -> Process.sleep(10) && nil
+      end
+    end) || flunk("no new held show")
   end
 
   test "a Plug chunk error reports held and keeps the focus fallback", ctx do
@@ -779,12 +771,14 @@ defmodule AttentionServer.ClientAPIFeedShowTest do
 
   test "a show is never in a batch and never replayed on resume", ctx do
     heartbeat_fast()
+    enable_show_origin(ctx)
     start = head(ctx.relay)
     conn = connect(ctx.port, ctx.certs, "a1")
     {conn, feed} = open_feed(conn, "?after=#{start}")
     {conn, feed} = await_open(conn, feed)
 
-    assert {:ok, _} = push_view(ctx.relay, "message")
+    show = show_task(ctx, "00000000-0000-4000-8000-000000000011", "message")
+    assert %{"state" => "sent"} = body(Task.await(show))
     {conn, _feed, _show, _} = until_show(conn, feed)
     Mint.HTTP.close(conn)
 

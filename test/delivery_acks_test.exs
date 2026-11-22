@@ -1,7 +1,7 @@
 defmodule AttentionServer.DeliveryAcksTest do
   use ExUnit.Case, async: false
 
-  alias AttentionServer.{Engine, JSON, LegacyOriginWire, Relay, Store}
+  alias AttentionServer.{AgentAPIInProcess, Engine, JSON, PreChangeLogStore, Relay, Store}
   alias Exqlite.Sqlite3
 
   @handle "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
@@ -67,34 +67,70 @@ defmodule AttentionServer.DeliveryAcksTest do
     reply["event_id"]
   end
 
+  # Client API v2 never records listening support. A store written by a 0.1
+  # origin carries it, and its "ack2" member sets ack2_expected on ACK1.
   defp support(relay, capable, n \\ 3) do
-    LegacyOriginWire.command(relay, "origin", %{
-      "v" => 1,
-      "type" => "support",
-      "op_id" => op(n),
-      "session_handle" => @handle,
-      "route" => "codex",
-      "cli_version" => "fixture",
-      "unsupported_reason" => nil,
-      "ack2" => capable
-    })
+    PreChangeLogStore.in_relay(
+      relay,
+      &PreChangeLogStore.origin_support(&1, "origin", %{
+        "type" => "support",
+        "op_id" => op(n),
+        "session_handle" => @handle,
+        "route" => "codex",
+        "cli_version" => "fixture",
+        "unsupported_reason" => nil,
+        "ack2" => capable
+      })
+    )
+
+    session = :sys.get_state(relay).store.engine.origin_sessions[{"person", "origin", @handle}]
+    assert session.support["ack2"] == capable
   end
 
-  defp ack2(relay, id, outcome, n, extra \\ %{}) do
-    LegacyOriginWire.command(
-      relay,
-      "origin",
-      Map.merge(
-        %{
-          "v" => 1,
-          "type" => "ack2",
-          "op_id" => op(n),
-          "event_id" => id,
-          "outcome" => outcome
-        },
-        extra
-      )
-    )
+  defp item(relay, id \\ "question"),
+    do: AgentAPIInProcess.item_id(relay, "person", "app:test", id)
+
+  # The v2 entry id of the person's chat turn on "question".
+  defp person_entry(relay) do
+    assert {:ok, %{"entries" => entries}} =
+             AgentAPIInProcess.entries(relay, "person", "origin", item(relay))
+
+    [%{"entry_id" => entry}] = Enum.filter(entries, &(&1["author"] == "person"))
+    entry
+  end
+
+  # `GET /v2/agent/changes` from `cursor`; ACK1 commits for what it returns.
+  defp changes(relay, cursor, opts \\ [], key \\ "origin"),
+    do: AgentAPIInProcess.changes(relay, "person", key, cursor, opts)
+
+  defp person_changes(changes),
+    do: Enum.filter(changes, &(&1["kind"] == "entry" and &1["data"]["author"] == "person"))
+
+  # `POST /v2/agent/messages/{id}/entries/{entry}/receipt` (ACK2) with
+  # Idempotency-Key op(n). The result is the response body, or the error token.
+  defp ack2(relay, entry, outcome, n, extra \\ %{}, person \\ "person", key \\ "origin") do
+    body = Map.put(extra, "outcome", outcome)
+    target = %{item_id: item(relay), entry_id: entry}
+    receipt(relay, person, key, :chat_receipt, target, body, n)
+  end
+
+  defp answer_receipt(relay, id, outcome, n) do
+    target = %{item_id: item(relay, id)}
+    receipt(relay, "person", "origin", :answer_receipt, target, %{"outcome" => outcome}, n)
+  end
+
+  defp receipt(relay, person, key, operation, target, body, n) do
+    case AgentAPIInProcess.write(relay, person, key, operation, target, body, op(n)) do
+      {:ok, 200, response, false} ->
+        response
+
+      {:stored, 200, encoded} ->
+        {:ok, %{"outcome" => outcome}} = JSON.decode_line(encoded <> "\n")
+        Map.put(outcome, "replayed", true)
+
+      {:error, token, _field, false} ->
+        %{"error" => token}
+    end
   end
 
   defp facts(relay, key \\ "phone") do
@@ -109,17 +145,21 @@ defmodule AttentionServer.DeliveryAcksTest do
     id = discussion(c.relay)
     assert [%{"delivery_acks" => true, "event_id" => ^id}] = facts(c.relay)
     assert delivery_facts(c.relay) == []
-    assert {:ok, %{"entries" => []}} = Relay.origin_feed(c.relay, "origin", 2)
-    assert {:error, :invalid_cursor} = Relay.origin_feed(c.relay, "origin", 3)
-    assert {:error, :forbidden} = Relay.origin_feed(c.relay, "unknown", 0)
+
+    # A batch that does not return the person entry records no ACK1.
+    assert {:ok, [%{"kind" => "message"}], true, message_rev} = changes(c.relay, 0, limit: 1)
+    assert {:ok, [], false, _} = changes(c.relay, message_rev + 1)
+    assert {:error, :cursor_expired} = changes(c.relay, message_rev + 10)
+    assert {:error, :unauthorized} = changes(c.relay, 0, [], "unknown")
     assert delivery_facts(c.relay) == []
 
-    assert %{"listening_support" => %{"ack2" => true}} = support(c.relay, true)
-    assert {:ok, %{"entries" => [entry]}} = Relay.origin_feed(c.relay, "origin", 1)
-    assert entry["event_id"] == id
-    assert entry["delivered"] == false
-    assert entry["acted"] == false
+    support(c.relay, true)
+    assert {:ok, rows, false, _} = changes(c.relay, message_rev)
+    assert [%{"data" => entry}] = person_changes(rows)
+    assert entry["entry_id"] == person_entry(c.relay)
+    assert entry["delivery"] == %{"delivered" => false, "acted" => false}
     assert [ack] = delivery_facts(c.relay)
+    assert ack["event_id"] == id
     assert ack["stage"] == "ack1"
     assert ack["ack2_expected"] == true
     assert ack["op_id"] == op(2)
@@ -131,50 +171,46 @@ defmodule AttentionServer.DeliveryAcksTest do
     assert delivery_facts(c.relay, "origin") == [ack]
     assert facts(c.relay, "stranger") == []
 
-    assert %{"type" => "ok"} = support(c.relay, false, 4)
-    assert {:ok, _} = Relay.origin_feed(c.relay, "origin", 0)
+    support(c.relay, false, 4)
+    assert {:ok, _, false, _} = changes(c.relay, 0)
     assert delivery_facts(c.relay) == [ack]
-    assert {:ok, %{"status" => "delivered"}} = Relay.origin_ack(c.relay, "origin", 2)
+
+    # A stored 0.1 delivered receipt is a separate fact from ACK1.
+    PreChangeLogStore.in_relay(c.relay, &PreChangeLogStore.origin_ack(&1, "origin", 2))
     assert Enum.count(facts(c.relay), &(&1["kind"] == "receipt")) == 1
     assert delivery_facts(c.relay) == [ack]
   end
 
-  test "legacy support makes ACK1 final and future support does not rewrite its snapshot", c do
-    id = discussion(c.relay)
-    assert {:ok, _} = Relay.origin_feed(c.relay, "origin", 1)
-    assert [%{"ack2_expected" => false} = ack] = delivery_facts(c.relay)
-    assert %{"type" => "ok"} = support(c.relay, true)
-    assert {:ok, _} = Relay.origin_feed(c.relay, "origin", 1)
-    assert delivery_facts(c.relay) == [ack]
-    assert %{"status" => "recorded", "stage_outcome" => "handed"} = ack2(c.relay, id, "handed", 4)
-    assert [^ack, %{"rerouted" => false}] = delivery_facts(c.relay)
-  end
-
   test "ACK2 implies consecutive ACK1 then ACK2 and first handed outcome is permanent", c do
-    id = discussion(c.relay)
-    assert %{"type" => "ok"} = support(c.relay, true)
+    discussion(c.relay)
+    support(c.relay, true)
+    entry = person_entry(c.relay)
     failed = %{"reason" => "No session is available", "agent" => "Reviewer"}
 
     assert %{"status" => "recorded", "stage_outcome" => "not_handed"} =
-             ack2(c.relay, id, "not_handed", 4, failed)
+             ack2(c.relay, entry, "not_handed", 4, failed)
 
     assert [first, second] = delivery_facts(c.relay)
     assert first["stage"] == "ack1"
+    assert first["ack2_expected"] == true
     assert second["stage"] == "ack2"
     assert second["conversation_seq"] == first["conversation_seq"] + 1
     assert second["acknowledger"]["agent"] == "Reviewer"
     refute Map.has_key?(second, "rerouted")
 
-    assert %{"duplicate" => true, "status" => "recorded"} =
-             ack2(c.relay, id, "not_handed", 4, failed)
+    assert %{"replayed" => true, "status" => "recorded"} =
+             ack2(c.relay, entry, "not_handed", 4, failed)
 
     assert %{"status" => "already_recorded"} =
-             ack2(c.relay, id, "not_handed", 5, %{"reason" => "Later reason"})
+             ack2(c.relay, entry, "not_handed", 5, %{"reason" => "Later reason"})
 
     assert delivery_facts(c.relay) == [first, second]
 
     assert %{"status" => "recorded", "stage_outcome" => "handed"} =
-             ack2(c.relay, id, "handed", 6, %{"agent" => "Alternate reviewer", "rerouted" => true})
+             ack2(c.relay, entry, "handed", 6, %{
+               "agent" => "Alternate reviewer",
+               "rerouted" => true
+             })
 
     assert [^first, ^second, handed] = delivery_facts(c.relay)
     assert handed["rerouted"] == true
@@ -182,53 +218,48 @@ defmodule AttentionServer.DeliveryAcksTest do
     refute Map.has_key?(handed, "reason")
 
     assert %{"status" => "already_recorded"} =
-             ack2(c.relay, id, "handed", 7, %{"agent" => "Different", "rerouted" => false})
+             ack2(c.relay, entry, "handed", 7, %{"agent" => "Different", "rerouted" => false})
 
     assert %{"status" => "superseded", "stage_outcome" => "handed"} =
-             ack2(c.relay, id, "not_handed", 8, failed)
+             ack2(c.relay, entry, "not_handed", 8, failed)
 
     assert delivery_facts(c.relay) == [first, second, handed]
     # Same operation retains its original result even after a newer outcome wins.
-    assert %{"duplicate" => true, "stage_outcome" => "not_handed"} =
-             ack2(c.relay, id, "not_handed", 4, failed)
+    assert %{"replayed" => true, "stage_outcome" => "not_handed"} =
+             ack2(c.relay, entry, "not_handed", 4, failed)
 
-    assert %{"type" => "error", "reason" => "operation_conflict"} = ack2(c.relay, id, "handed", 4)
+    assert %{"error" => "idempotency_conflict"} = ack2(c.relay, entry, "handed", 4)
     assert Enum.all?(facts(c.relay), &(&1["kind"] != "receipt"))
   end
 
   test "malformed ACK2 and wrong origin cannot create a delivery fact", c do
-    id = discussion(c.relay)
+    discussion(c.relay)
+    entry = person_entry(c.relay)
 
-    for {outcome, extra} <- [
-          {"invalid", %{}},
-          {"handed", %{"agent" => " "}},
-          {"handed", %{"rerouted" => "true"}},
-          {"handed", %{"reason" => "not permitted"}},
-          {"not_handed", %{}},
-          {"not_handed", %{"reason" => ""}},
-          {"not_handed", %{"reason" => "No route", "rerouted" => false}}
-        ] do
-      assert %{"type" => "error"} = ack2(c.relay, id, outcome, 4, extra)
+    for {{outcome, extra}, n} <-
+          Enum.with_index(
+            [
+              {"invalid", %{}},
+              {"handed", %{"agent" => " "}},
+              {"handed", %{"rerouted" => "true"}},
+              {"handed", %{"reason" => "not permitted"}},
+              {"not_handed", %{}},
+              {"not_handed", %{"reason" => ""}},
+              {"not_handed", %{"reason" => "No route", "rerouted" => false}}
+            ],
+            10
+          ) do
+      assert %{"error" => _} = ack2(c.relay, entry, outcome, n, extra)
     end
 
-    for bad_id <- ["1", "999", "02", 2] do
-      assert %{"type" => "error"} = ack2(c.relay, bad_id, "handed", 4)
+    for {bad_entry, n} <- Enum.with_index(["e999", "1", "e02", "e"], 20) do
+      assert %{"error" => "not_found"} = ack2(c.relay, bad_entry, "handed", n)
     end
 
-    for key <- ["phone", "stranger", "unknown"] do
-      assert %{"type" => "error"} =
-               LegacyOriginWire.command(c.relay, key, %{
-                 "v" => 1,
-                 "type" => "ack2",
-                 "op_id" => op(4),
-                 "event_id" => id,
-                 "outcome" => "handed"
-               })
-    end
-
-    assert %{"type" => "error"} = ack2(c.relay, id, "handed", 4, %{"op_id" => "not-a-uuid"})
+    assert %{"error" => "not_found"} = ack2(c.relay, entry, "handed", 30, %{}, "person", "phone")
+    assert %{"error" => _} = ack2(c.relay, entry, "handed", 31, %{}, "other", "stranger")
+    assert %{"error" => _} = ack2(c.relay, entry, "handed", 32, %{}, "person", "unknown")
     assert delivery_facts(c.relay) == []
-    assert %{"type" => "error"} = support(c.relay, "true")
   end
 
   test "answer and No comment ACKs retain exact terminal identity", c do
@@ -262,10 +293,15 @@ defmodule AttentionServer.DeliveryAcksTest do
           else: %{"type" => kind, "request_id" => id, "request_revision" => 1}
 
       assert %{"type" => "ok", "seq" => terminal_seq} = request(c.relay, "phone", frame)
-      assert {:ok, %{"entries" => entries}} = Relay.origin_feed(c.relay, "origin", 0)
-      terminal = Enum.find(entries, &(&1["message_id"] == id and &1["kind"] == "terminal"))
+
+      terminal =
+        Enum.find(
+          origin_feed_entries(c.relay),
+          &(&1["message_id"] == id and &1["kind"] == "terminal")
+        )
+
       assert terminal["author"] == "person"
-      assert %{"status" => "recorded"} = ack2(c.relay, terminal["event_id"], "handed", n + 2)
+      assert %{"status" => "recorded"} = answer_receipt(c.relay, id, "handed", n + 2)
       acks = Enum.filter(delivery_facts(c.relay), &(&1["message_id"] == id))
       assert length(acks) == 2
 
@@ -279,7 +315,8 @@ defmodule AttentionServer.DeliveryAcksTest do
   end
 
   test "feed and ACK2 facts roll back with failed durable commit, then survive restart", c do
-    id = discussion(c.relay)
+    discussion(c.relay)
+    entry = person_entry(c.relay)
     {:ok, db} = Sqlite3.open(c.path)
 
     :ok =
@@ -288,21 +325,20 @@ defmodule AttentionServer.DeliveryAcksTest do
         "CREATE TRIGGER block_ack BEFORE UPDATE ON relay_state BEGIN SELECT RAISE(ABORT, 'fixture'); END"
       )
 
-    assert {:error, :storage_unavailable} = Relay.origin_feed(c.relay, "origin", 1)
-
-    assert %{"type" => "error", "reason" => "storage_unavailable"} =
-             ack2(c.relay, id, "handed", 4)
+    assert {:error, :delivery_unavailable} = changes(c.relay, 0)
+    assert %{"error" => "storage_unavailable"} = ack2(c.relay, entry, "handed", 4)
 
     assert delivery_facts(c.relay) == []
     :ok = Sqlite3.execute(db, "DROP TRIGGER block_ack")
     :ok = Sqlite3.close(db)
-    assert %{"status" => "recorded"} = ack2(c.relay, id, "handed", 4)
+    assert %{"status" => "recorded"} = ack2(c.relay, entry, "handed", 4)
     expected = facts(c.relay)
+    assert [%{"stage" => "ack1"}, %{"stage" => "ack2"}] = delivery_facts(c.relay)
     stop_supervised!(Relay)
     restarted = start_supervised!({Relay, store_path: c.path})
     assert facts(restarted) == expected
-    assert %{"duplicate" => true, "status" => "recorded"} = ack2(restarted, id, "handed", 4)
-    assert {:ok, _} = Relay.origin_feed(restarted, "origin", 0)
+    assert %{"replayed" => true, "status" => "recorded"} = ack2(restarted, entry, "handed", 4)
+    assert {:ok, _, false, _} = changes(restarted, 0)
     assert facts(restarted) == expected
   end
 
@@ -336,15 +372,21 @@ defmodule AttentionServer.DeliveryAcksTest do
     {:ok, store} = Store.open(c.path)
     engine = store.engine
     engine = put_in(engine.devices["origin"].label, "Automation service")
-    {:ok, next, _} = Engine.deliver_origin_feed(engine, "origin", 0)
+    target = discussion_target(engine)
+    {:ok, next} = Engine.agent_feed_delivered(engine, "person", "origin", [target])
     {:ok, events, _} = Engine.conversation_events(next, "phone", 0)
     ack = Enum.find(events, &(&1["kind"] == "delivery_ack"))
     assert ack["acknowledger"] == %{"system" => "Automation service"}
 
-    # Preserve old origin feed eligibility for Seen; delivery stages use person-only eligibility.
+    # Delivery stages use person-only eligibility, in the agent feed's turn and
+    # in the stored origin feed entry ACK2 names.
+    {:entry, position} = target
+
     for author <- ["server", "agent", "origin"] do
+      turn = put_in(engine.conversation_events[{"person", position}].payload["author"], author)
+      assert {:ok, ^turn} = Engine.agent_feed_delivered(turn, "person", "origin", [target])
+
       changed = put_in(engine.origin_feeds[{"person", "origin"}].entries[2]["author"], author)
-      assert {:ok, ^changed, _} = Engine.deliver_origin_feed(changed, "origin", 0)
 
       assert {:error, _} =
                Engine.origin_ack2(changed, "origin", 2, %{
@@ -364,8 +406,8 @@ defmodule AttentionServer.DeliveryAcksTest do
     record = store.engine.messages[key]
     record = %{record | message: Map.delete(record.message, "display_name")}
     engine = %{store.engine | messages: Map.put(store.engine.messages, key, record)}
-    {:ok, next, %{"entries" => entries}} = Engine.deliver_origin_feed(engine, "origin", 1)
-    assert length(entries) == 1
+    target = discussion_target(engine)
+    {:ok, next} = Engine.agent_feed_delivered(engine, "person", "origin", [target])
     {:ok, [_, ack], _} = Engine.conversation_events(next, "phone", 0)
     assert ack["acknowledger"] == %{}
 
@@ -388,7 +430,7 @@ defmodule AttentionServer.DeliveryAcksTest do
       })
 
     engine = %{engine | messages: Map.put(engine.messages, key, record)}
-    {:ok, next, _} = Engine.deliver_origin_feed(engine, "origin", 1)
+    {:ok, next} = Engine.agent_feed_delivered(engine, "person", "origin", [target])
     {:ok, [_, ack], _} = Engine.conversation_events(next, "phone", 0)
     assert ack["acknowledger"] == %{"system" => "Committed name"}
     Store.close(store)
@@ -418,17 +460,18 @@ defmodule AttentionServer.DeliveryAcksTest do
         session
       end
 
-    id = discussion(relay)
+    discussion(relay)
 
-    assert %{"type" => "ok", "listening_support" => %{"ack2" => true}} = support(relay, true)
+    support(relay, true)
     assert delivery_facts(relay) == []
 
-    assert %{"type" => "ok", "entries" => [entry]} = feed(relay, 1)
-    assert entry["event_id"] == id
-    assert entry["delivered"] == false
+    assert {:ok, rows, false, _} = changes(relay, 0)
+    assert [%{"data" => entry}] = person_changes(rows)
+    assert entry["entry_id"] == person_entry(relay)
+    assert entry["delivery"]["delivered"] == false
 
-    assert %{"type" => "ok", "status" => "recorded", "stage_outcome" => "handed"} =
-             ack2(relay, id, "handed", 4, %{"agent" => "Reviewer"})
+    assert %{"status" => "recorded", "stage_outcome" => "handed"} =
+             ack2(relay, entry["entry_id"], "handed", 4, %{"agent" => "Reviewer"})
 
     expected = delivery_facts(relay)
 
@@ -473,19 +516,22 @@ defmodule AttentionServer.DeliveryAcksTest do
       end)
 
     assert Enum.filter(replay, &(&1["kind"] == "delivery_ack")) == expected
-
-    assert %{"entries" => [%{"delivered" => false, "acted" => false}]} = feed(relay, 1)
-
-    assert %{"status" => "delivered"} =
-             LegacyOriginWire.command(relay, "origin", %{
-               "v" => 1,
-               "type" => "ack",
-               "event_id" => id
-             })
-
-    assert Enum.count(facts(relay), &(&1["kind"] == "receipt")) == 1
   end
 
-  defp feed(relay, since),
-    do: LegacyOriginWire.command(relay, "origin", %{"v" => 1, "type" => "feed", "since" => since})
+  # The agent feed's delivery target for the person's chat turn on "question".
+  defp discussion_target(engine) do
+    [position] =
+      for {{"person", position}, %{payload: %{"kind" => "discussion", "author" => "person"}}} <-
+            engine.conversation_events,
+          do: position
+
+    {:entry, position}
+  end
+
+  # The origin's stored conversation feed, in feed order.
+  defp origin_feed_entries(relay) do
+    :sys.get_state(relay).store.engine.origin_feeds[{"person", "origin"}].entries
+    |> Enum.sort()
+    |> Enum.map(fn {_seq, entry} -> entry end)
+  end
 end

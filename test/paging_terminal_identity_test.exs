@@ -1,7 +1,7 @@
 defmodule AttentionServer.PagingTerminalIdentityTest do
   use ExUnit.Case, async: false
 
-  alias AttentionServer.{Engine, JSON, Relay, Store}
+  alias AttentionServer.{AgentAPIInProcess, Engine, JSON, PreChangeLogStore, Relay, Store}
 
   @handle "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 
@@ -29,7 +29,10 @@ defmodule AttentionServer.PagingTerminalIdentityTest do
       kind = unquote(kind)
       send = send_frame("terminal")
       assert %{"type" => "ok", "seq" => 1} = request(ctx.relay, "origin", send)
-      assert {:error, :not_found} = Relay.origin_ack(ctx.relay, "origin", 1)
+      item = AgentAPIInProcess.item_id(ctx.relay, "person", "app:test", "terminal")
+
+      assert {:error, "not_answered", nil, false} =
+               answer_receipt(ctx.relay, "person", "origin", item)
 
       assert %{"type" => "ok", "revision" => 2} =
                request(ctx.relay, "origin", %{
@@ -53,8 +56,9 @@ defmodule AttentionServer.PagingTerminalIdentityTest do
       assert %{"type" => "ok", "seq" => 2} =
                request(ctx.relay, terminal_actor, terminal_operation)
 
-      assert {:ok, %{"entries" => [initial, revised, terminal]}} =
-               Relay.origin_feed(ctx.relay, "origin", 0)
+      # The origin's v2 agent feed delivers the person's answer (ACK1).
+      assert {:ok, _changes, false, _} = AgentAPIInProcess.changes(ctx.relay, "person", "origin")
+      assert [initial, revised, terminal] = origin_feed_entries(ctx.relay)
 
       assert initial["kind"] == "revision"
       assert revised["request_revision"] == 2
@@ -62,11 +66,14 @@ defmodule AttentionServer.PagingTerminalIdentityTest do
       assert terminal["request_revision"] == 2
       assert terminal["author"] == terminal_author
       refute initial["event_id"] == terminal["event_id"]
-      assert {:error, :not_found} = Relay.origin_ack(ctx.relay, "outsider", 3)
+
+      assert {:error, "not_found", nil, false} =
+               answer_receipt(ctx.relay, "other-person", "outsider", item)
 
       if kind == "lifecycle" do
         # An origin-authored terminal is not an actionable receipt target.
-        assert {:error, :not_found} = Relay.origin_ack(ctx.relay, "origin", 3)
+        assert {:error, "not_answered", nil, false} =
+                 answer_receipt(ctx.relay, "person", "origin", item)
 
         for device <- ~w(origin reader second-reader) do
           assert {:ok, [revision], 1} = Relay.conversation_events(ctx.relay, device, 0)
@@ -74,7 +81,8 @@ defmodule AttentionServer.PagingTerminalIdentityTest do
           assert revision["request_revision"] == 2
         end
       else
-        assert {:ok, %{"status" => "delivered"}} = Relay.origin_ack(ctx.relay, "origin", 3)
+        assert {:ok, 200, %{"status" => "recorded"}, false} =
+                 answer_receipt(ctx.relay, "person", "origin", item)
 
         for device <- ~w(origin reader second-reader) do
           assert {:ok, [revision, delivery_ack, receipt], 3} =
@@ -85,14 +93,14 @@ defmodule AttentionServer.PagingTerminalIdentityTest do
           assert delivery_ack["kind"] == "delivery_ack"
           assert delivery_ack["stage"] == "ack1"
           assert delivery_ack["event_id"] == terminal["event_id"]
-          assert receipt["kind"] == "receipt"
+          assert receipt["kind"] == "delivery_ack"
+          assert receipt["stage"] == "ack2"
           assert receipt["event_id"] == terminal["event_id"]
           assert receipt["request_revision"] == 2
           assert receipt["session_handle"] == @handle
           assert receipt["sender_id"] == "app:test"
           assert receipt["message_id"] == "terminal"
           assert receipt["origin"] == "origin"
-          assert receipt["delivered"] == true
           refute Map.has_key?(receipt, "answer")
         end
       end
@@ -158,7 +166,8 @@ defmodule AttentionServer.PagingTerminalIdentityTest do
                "text" => "Which option?"
              })
 
-    assert {:ok, %{"status" => "delivered"}} = Relay.origin_ack(ctx.relay, "origin", 2)
+    # A 0.1 origin's delivered receipt, as a stored 0.1 store carries it.
+    PreChangeLogStore.in_relay(ctx.relay, &PreChangeLogStore.origin_ack(&1, "origin", 2))
 
     for device <- ~w(origin reader second-reader) do
       assert {:ok, [discussion, receipt], 2} = Relay.conversation_events(ctx.relay, device, 0)
@@ -209,6 +218,19 @@ defmodule AttentionServer.PagingTerminalIdentityTest do
 
     refute Map.has_key?(terminal, "event_id")
     refute Map.has_key?(terminal, "request_revision")
+  end
+
+  defp answer_receipt(relay, person, key, item),
+    do:
+      AgentAPIInProcess.write(relay, person, key, :answer_receipt, %{item_id: item}, %{
+        "outcome" => "handed"
+      })
+
+  # The origin's stored conversation feed, in feed order.
+  defp origin_feed_entries(relay) do
+    :sys.get_state(relay).store.engine.origin_feeds[{"person", "origin"}].entries
+    |> Enum.sort()
+    |> Enum.map(fn {_seq, entry} -> entry end)
   end
 
   defp stored_engine(ctx) do
