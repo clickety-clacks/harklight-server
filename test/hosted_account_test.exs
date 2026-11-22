@@ -1009,7 +1009,7 @@ defmodule AttentionServer.HostedAccountTest do
       refute own.resp_body =~ "/sign-out"
       sign_out = sign_out_post(plain, "https://www.example.com", "plain-session")
       assert sign_out.status == 303
-      assert Plug.Conn.get_resp_header(sign_out, "location") == ["/sign-in"]
+      assert Plug.Conn.get_resp_header(sign_out, "location") == ["/sign-in?signed_out=1"]
 
       # Hosted addresses given to a self-hosted listener change nothing.
       ignored =
