@@ -17,9 +17,10 @@ defmodule Mix.Tasks.Attention.Agent do
   `answer` (or `respond`) is `POST /v2/items/{item_id}/answer`. The answer file
   is an AnswerBody object: at most one of `choice` (an action `id`), `comment`
   or `result`, or `{}` to answer with no comment. `--request-revision` is the
-  item's `request_revision`. The exact body and an `Idempotency-Key`
-  (`--key UUID`, or a generated one) are saved under `operations/` in the agent
-  directory before anything is sent, and the answer needs typing ANSWER.
+  item's `request_revision`. The answer needs typing ANSWER; after that and
+  before anything is sent, the exact body and an `Idempotency-Key` (`--key
+  UUID`, or a generated one) are saved under `operations/` in the agent
+  directory. A cancelled answer saves nothing.
   Rerunning the same command resends the same body with the same key; the
   server replays a committed answer (`"replayed": true`) instead of writing a
   second one. Nothing is retried automatically, including after a

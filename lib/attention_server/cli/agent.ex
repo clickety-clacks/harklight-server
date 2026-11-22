@@ -17,9 +17,10 @@ defmodule AttentionServer.CLI.Agent do
   `answer` (or `respond`) is `POST /v2/items/{item_id}/answer`. The answer file
   is an AnswerBody object: at most one of `choice` (an action `id`), `comment`
   or `result`, or `{}` to answer with no comment. `--request-revision` is the
-  item's `request_revision`. The exact body and an `Idempotency-Key`
-  (`--key UUID`, or a generated one) are saved under `operations/` in the agent
-  directory before anything is sent, and the answer needs typing ANSWER.
+  item's `request_revision`. The answer needs typing ANSWER; after that and
+  before anything is sent, the exact body and an `Idempotency-Key` (`--key
+  UUID`, or a generated one) are saved under `operations/` in the agent
+  directory. A cancelled answer saves nothing.
   Rerunning the same command resends the same body with the same key; the
   server replays a committed answer (`"replayed": true`) instead of writing a
   second one. Nothing is retried automatically, including after a
@@ -114,6 +115,14 @@ defmodule AttentionServer.CLI.Agent do
             )
         )
 
+      {:error, {:operation_conflict, path}} ->
+        AttentionServer.CLI.error!(
+          "operation_conflict: an answer for this item and revision is already saved in " <>
+            "#{path} with a different body or key. Rerun with that saved answer to send or " <>
+            "replay it. Remove the file only if that answer was never sent; the server " <>
+            "keeps any answer it already committed."
+        )
+
       {:error, reason} ->
         AttentionServer.CLI.error!("agent request failed: #{inspect(reason)}")
     end
@@ -195,9 +204,11 @@ defmodule AttentionServer.CLI.Agent do
     body = Map.put(answer, "request_revision", revision)
     request = %{"target" => target_request(opts), "request_revision" => revision}
 
+    # Resolve and show the exact answer, confirm it, then journal it before
+    # the first request byte. A cancelled answer leaves nothing behind.
     with :ok <- HeadlessV2Write.existing_private_directory(directory),
-         {:ok, saved} <-
-           HeadlessV2Write.saved_answer(
+         {:ok, saved, state} <-
+           HeadlessV2Write.prepare_answer(
              directory,
              request,
              body,
@@ -219,7 +230,13 @@ defmodule AttentionServer.CLI.Agent do
       unless is_binary(typed) and String.trim(typed) == "ANSWER",
         do: AttentionServer.CLI.error!("answer cancelled")
 
-      HeadlessV2Write.post_answer(endpoint, identity, saved)
+      with {:ok, saved} <-
+             if(state == :new,
+               do: HeadlessV2Write.save_answer(directory, saved),
+               else: {:ok, saved}
+             ) do
+        HeadlessV2Write.post_answer(endpoint, identity, saved)
+      end
     end
   end
 

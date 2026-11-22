@@ -124,47 +124,67 @@ defmodule AttentionServer.CLIAgentV2Test do
     end
   end
 
-  test "answer journals the exact body and key before sending, then replays it", ctx do
+  test "answer confirms, then journals the exact body and key before sending, then replays it",
+       ctx do
     forward!(ctx.relay, "m1", "Choose", 1)
-    answer = answer_file!(ctx, %{})
+    args = answer_args(answer_file!(ctx, %{}))
 
-    args = [
-      "answer",
-      "--sender",
-      "app:test",
-      "--message",
-      "m1",
-      "--request-revision",
-      "1",
-      "--answer-file",
-      answer
-    ]
-
-    # Cancelling at the prompt: the journal already holds the exact request,
-    # and nothing reached the server.
+    # Cancelling at the prompt (or closed input) sends and saves nothing.
     assert_raise Mix.Error, ~r/answer cancelled/, fn -> run!(ctx, args, "no") end
-    # Closed input cancels too.
     assert_raise Mix.Error, ~r/answer cancelled/, fn -> run!(ctx, args, :eof) end
-    [journal] = journals(ctx)
+    assert journals(ctx) == []
 
-    assert %{"item_id" => item, "body" => %{"request_revision" => 1}, "idempotency_key" => key} =
-             journal
-
-    assert %{"item" => %{"terminal" => nil}} = run!(ctx, ["get", "--item-id", item])
+    # A corrected answer after a cancel goes through.
+    corrected = answer_args(answer_file!(ctx, %{"comment" => "corrected"}, "corrected.json"))
 
     assert %{
-             "rev" => _,
              "item" => %{"terminal" => %{"state" => "answered"}},
              "replayed" => false,
-             "idempotency_key" => ^key
-           } = run!(ctx, args, "ANSWER")
+             "idempotency_key" => key
+           } =
+             run!(ctx, corrected, "ANSWER")
 
-    assert %{"replayed" => true, "idempotency_key" => ^key} = run!(ctx, args, "ANSWER")
+    [journal] = journals(ctx)
+
+    assert %{
+             "body" => %{"comment" => "corrected", "request_revision" => 1},
+             "idempotency_key" => ^key
+           } = journal
+
+    assert %{"replayed" => true, "idempotency_key" => ^key} = run!(ctx, corrected, "ANSWER")
     assert [^journal] = journals(ctx)
 
-    changed = answer_file!(ctx, %{"comment" => "different"}, "changed.json")
-    changed_args = List.replace_at(args, -1, changed)
-    assert_raise Mix.Error, ~r/operation_conflict/, fn -> run!(ctx, changed_args, "ANSWER") end
+    # A different body for the same item and revision names the saved file.
+    error = assert_raise Mix.Error, fn -> run!(ctx, args, "ANSWER") end
+    assert error.message =~ "operation_conflict"
+    assert error.message =~ Path.join(ctx.agent_dir, "operations")
+  end
+
+  test "an answer journaled before a crash, with nothing sent, is sent with its saved key", ctx do
+    forward!(ctx.relay, "m1", "Choose", 1)
+
+    %{"items" => [%{"item_id" => item}]} =
+      run!(ctx, ["search", "--sender", "app:test", "--message", "m1"])
+
+    body = %{"request_revision" => 1}
+
+    request = %{
+      "target" => %{"sender_id" => "app:test", "message_id" => "m1"},
+      "request_revision" => 1
+    }
+
+    assert {:ok, prepared, :new} =
+             AttentionServer.HeadlessV2Write.prepare_answer(ctx.agent_dir, request, body, fn ->
+               {:ok, item, body}
+             end)
+
+    assert {:ok, saved} = AttentionServer.HeadlessV2Write.save_answer(ctx.agent_dir, prepared)
+    key = saved["idempotency_key"]
+    assert %{"item" => %{"terminal" => nil}} = run!(ctx, ["get", "--item-id", item])
+
+    args = answer_args(answer_file!(ctx, %{}))
+    assert %{"replayed" => false, "idempotency_key" => ^key} = run!(ctx, args, "ANSWER")
+    assert %{"replayed" => true, "idempotency_key" => ^key} = run!(ctx, args, "ANSWER")
   end
 
   test "an answer the grants do not cover is refused and its journal kept", ctx do
@@ -250,6 +270,19 @@ defmodule AttentionServer.CLIAgentV2Test do
   end
 
   # -- helpers ----------------------------------------------------------------
+
+  defp answer_args(file),
+    do: [
+      "answer",
+      "--sender",
+      "app:test",
+      "--message",
+      "m1",
+      "--request-revision",
+      "1",
+      "--answer-file",
+      file
+    ]
 
   defp run!(ctx, [command | args], input \\ nil) do
     if input, do: send(self(), {:mix_shell_input, :prompt, input})

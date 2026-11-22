@@ -29,7 +29,7 @@ defmodule AttentionServer.HeadlessV2Write do
   def answer_body?(_answer), do: false
 
   @doc """
-  The journal entry for `request`, created on first use.
+  The journal entry for `request`, created on first use and before sending.
 
   `request` names the answer (its digest is the journal file name). `body` is
   the exact body to send when it is already known locally, or `nil` when
@@ -38,45 +38,86 @@ defmodule AttentionServer.HeadlessV2Write do
   An existing entry whose body or key differs is an `:operation_conflict`.
   """
   def saved_answer(directory, request, body, resolve, key \\ nil) do
-    digest = hex(:crypto.hash(:sha256, JSON.encode!(request)))
-    path = Path.join([directory, "operations", "v2-" <> digest <> ".json"])
+    case prepare_answer(directory, request, body, resolve, key) do
+      {:ok, saved, :saved} -> {:ok, saved}
+      {:ok, saved, :new} -> simple_conflict(save_answer(directory, saved))
+      other -> simple_conflict(other)
+    end
+  end
+
+  @doc """
+  The answer to send for `request`, without writing anything: `{:ok, saved,
+  :saved}` for an existing journal entry, or `{:ok, saved, :new}` for a fresh
+  entry that `save_answer/2` must store before the first send. An existing
+  entry with another body or key is `{:error, {:operation_conflict, path}}`.
+  """
+  def prepare_answer(directory, request, body, resolve, key \\ nil) do
+    path = journal_path(directory, request)
 
     with :ok <- private_directory(Path.dirname(path)) do
       case read_json(path) do
-        {:ok,
-         %{
-           "request" => ^request,
-           "item_id" => id,
-           "body" => saved_body,
-           "idempotency_key" => saved_key
-         } =
-             saved}
-        when is_binary(id) and is_map(saved_body) and is_binary(saved_key) ->
-          if (is_nil(body) or body == saved_body) and (is_nil(key) or key == saved_key),
-            do: {:ok, saved},
-            else: {:error, :operation_conflict}
+        {:ok, %{"request" => ^request} = saved} ->
+          if journal_entry?(saved) and (is_nil(body) or body == saved["body"]) and
+               (is_nil(key) or key == saved["idempotency_key"]),
+             do: {:ok, saved, :saved},
+             else: {:error, {:operation_conflict, path}}
 
         {:error, :enoent} ->
           with {:ok, item_id, resolved_body} <- resolve.() do
-            saved = %{
-              "request" => request,
-              "item_id" => item_id,
-              "body" => resolved_body,
-              "idempotency_key" => key || uuid_v4()
-            }
-
-            case write_private(path, saved, :new) do
-              :ok -> {:ok, saved}
-              {:error, :eexist} -> saved_answer(directory, request, body, resolve, key)
-              other -> other
-            end
+            {:ok,
+             %{
+               "request" => request,
+               "item_id" => item_id,
+               "body" => resolved_body,
+               "idempotency_key" => key || uuid_v4()
+             }, :new}
           end
 
         _ ->
-          {:error, :operation_conflict}
+          {:error, {:operation_conflict, path}}
       end
     end
   end
+
+  @doc """
+  Store a fresh entry from `prepare_answer/5`. If another run stored the same
+  request first, its entry is used when the body matches.
+  """
+  def save_answer(directory, %{"request" => request, "body" => body} = saved) do
+    path = journal_path(directory, request)
+
+    case write_private(path, saved, :new) do
+      :ok ->
+        {:ok, saved}
+
+      {:error, :eexist} ->
+        case read_json(path) do
+          {:ok, %{"body" => ^body} = existing} ->
+            if journal_entry?(existing),
+              do: {:ok, existing},
+              else: {:error, {:operation_conflict, path}}
+
+          _ ->
+            {:error, {:operation_conflict, path}}
+        end
+
+      other ->
+        other
+    end
+  end
+
+  defp journal_path(directory, request) do
+    digest = hex(:crypto.hash(:sha256, JSON.encode!(request)))
+    Path.join([directory, "operations", "v2-" <> digest <> ".json"])
+  end
+
+  defp journal_entry?(%{"item_id" => id, "body" => body, "idempotency_key" => key}),
+    do: is_binary(id) and is_map(body) and is_binary(key)
+
+  defp journal_entry?(_), do: false
+
+  defp simple_conflict({:error, {:operation_conflict, _path}}), do: {:error, :operation_conflict}
+  defp simple_conflict(other), do: other
 
   @doc """
   Send a journaled answer once. The result carries `idempotency_key` and
