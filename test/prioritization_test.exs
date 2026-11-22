@@ -1134,24 +1134,12 @@ defmodule AttentionServer.PrioritizationTest do
     refute logs =~ key_path
   end
 
-  test "view fetch is complete, supports unchanged replies and works during a pending checkpoint",
-       %{path: path} do
+  test "view fetch is complete and supports unchanged replies", %{path: path} do
     relay = start_relay(path)
     setup_person(relay)
     forward(relay, 1, "older")
     forward(relay, 2, "newer", 200)
     assert {:ok, session} = Relay.open_websocket_session(relay, "device-b", nil, nil)
-
-    [start] =
-      session_request(relay, session, %{
-        "type" => "inbox_start",
-        "paging_version" => 1,
-        "startup_id" => "view-during-checkpoint",
-        "since" => 0,
-        "ref" => "start"
-      })
-
-    assert start["type"] == "ok"
 
     assert %{
              "type" => "ok",
@@ -1238,122 +1226,6 @@ defmodule AttentionServer.PrioritizationTest do
 
     latest = hd(session_request(relay, supporting, %{"type" => "view_get", "ref" => "latest"}))
     assert hd(notices)["view_rev"] == latest["view_rev"]
-    GenServer.stop(relay)
-  end
-
-  test "reordered snapshots page every waiting item before resolved items and retries are stable",
-       %{path: path} do
-    relay = start_relay(path)
-    setup_person(relay)
-
-    for n <- 1..28 do
-      deadline = if n <= 25, do: (30 - n) * 1_000, else: nil
-      forward(relay, n, "item-#{String.pad_leading(Integer.to_string(n), 2, "0")}", deadline)
-    end
-
-    resolved_ids = ["item-01", "item-03", "item-27"]
-
-    for {id, n} <- Enum.with_index(resolved_ids, 100) do
-      assert %{"type" => "ok"} =
-               request(relay, "device-a", %{
-                 "type" => "answer",
-                 "op_id" => op(n),
-                 "sender_id" => "app:test",
-                 "message_id" => id,
-                 "answer" => nil
-               })
-    end
-
-    assert {:ok, session} = Relay.open_websocket_session(relay, "device-b", nil, nil)
-
-    [first] =
-      session_request(relay, session, %{
-        "type" => "inbox_start",
-        "paging_version" => 1,
-        "startup_id" => "reordered-snapshot",
-        "since" => 0,
-        "ref" => "start"
-      })
-
-    assert first["type"] == "ok"
-    assert length(first["items"]) == 20
-
-    # A fetch remains available while the newly built snapshot awaits attach.
-    assert %{"type" => "ok", "entries" => _} =
-             hd(
-               session_request(relay, session, %{"type" => "view_get", "ref" => "checkpoint-view"})
-             )
-
-    retry_start =
-      session_request(relay, session, %{
-        "type" => "inbox_start",
-        "paging_version" => 1,
-        "startup_id" => "reordered-snapshot",
-        "since" => 0,
-        "ref" => "start-retry"
-      })
-      |> hd()
-
-    assert retry_start["snapshot_id"] == first["snapshot_id"]
-    assert retry_start["items"] == first["items"]
-
-    page_frame = %{
-      "type" => "inbox_page",
-      "paging_version" => 1,
-      "snapshot_id" => first["snapshot_id"],
-      "cursor" => first["next_cursor"],
-      "ref" => "page-2"
-    }
-
-    second = hd(session_request(relay, session, page_frame))
-    second_retry = hd(session_request(relay, session, page_frame))
-    assert second_retry["items"] == second["items"]
-
-    all_items = first["items"] ++ second["items"]
-    ids = Enum.map(all_items, & &1["acceptance"]["message_id"])
-    waiting_ids = Enum.reject(ids, &(&1 in resolved_ids))
-    resolved_page_ids = Enum.filter(ids, &(&1 in resolved_ids))
-
-    expected_waiting =
-      Enum.reject(
-        1..28,
-        &("item-#{String.pad_leading(Integer.to_string(&1), 2, "0")}" in resolved_ids)
-      )
-      |> Enum.sort(:desc)
-      |> Enum.map(&"item-#{String.pad_leading(Integer.to_string(&1), 2, "0")}")
-
-    assert waiting_ids == expected_waiting
-    assert resolved_page_ids == ["item-27", "item-03", "item-01"]
-    assert length(ids) == length(Enum.uniq(ids))
-
-    assert Enum.all?(
-             Enum.take(all_items, length(expected_waiting)),
-             &(not Map.has_key?(&1, "terminal"))
-           )
-
-    assert Enum.all?(
-             Enum.drop(all_items, length(expected_waiting)),
-             &Map.has_key?(&1, "terminal")
-           )
-
-    # Free ignores deadline rank and keeps the original newest acceptance first.
-    assert hd(ids) == "item-28"
-
-    engine = :sys.get_state(relay).store.engine
-
-    assert {:ok, incomplete_order, _receipts, _operation_ids, _high} =
-             Engine.inbox_snapshot(engine, "device-b", 0, [{"app:test", "item-25"}])
-
-    assert hd(incomplete_order) == {"app:test", "item-25"}
-
-    missing_waiting =
-      expected_waiting
-      |> Enum.reject(&(&1 == "item-25"))
-      |> Enum.sort_by(fn id -> -String.to_integer(String.trim_leading(id, "item-")) end)
-
-    assert Enum.slice(incomplete_order, 1, length(missing_waiting)) ==
-             Enum.map(missing_waiting, &{"app:test", &1})
-
     GenServer.stop(relay)
   end
 

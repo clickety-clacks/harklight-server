@@ -995,7 +995,8 @@ defmodule AttentionServer.ChangeLogTest do
     GenServer.stop(relay)
   end
 
-  # Every change-log and agent-log table, row for row, and the store version.
+  # Every change-log, agent-log and 0.1 paging table, row for row, and the
+  # store version.
   defp log_tables(path) do
     {:ok, db} = Sqlite3.open(path)
 
@@ -1010,7 +1011,8 @@ defmodule AttentionServer.ChangeLogTest do
       for [name] <-
             query.(
               "SELECT name FROM sqlite_master WHERE type = 'table' AND " <>
-                "(name LIKE 'client_%' OR name LIKE 'agent_%') ORDER BY name"
+                "(name LIKE 'client_%' OR name LIKE 'agent_%' OR name LIKE 'relay_inbox_%' " <>
+                "OR name = 'relay_device_progress') ORDER BY name"
             ),
           do: name
 
@@ -1021,9 +1023,11 @@ defmodule AttentionServer.ChangeLogTest do
   end
 
   # A store from 0.1.x (v0.1.49, then slice 3 builds) never had the change log
-  # on. The first 0.2.0 start seeds it and stores the ranking once; a second
-  # start must change nothing, so the one-time cursor reset of #254 never
-  # fires again and clients keep their cursors.
+  # on, and holds the 0.1 paging state: an accepted startup checkpoint, a
+  # startup left building, and device and conversation cursors. The first 0.2.0
+  # start seeds the log and stores the ranking once; a second start must change
+  # nothing, so the one-time cursor reset of #254 never fires again and clients
+  # keep their cursors.
   test "a store written with the log off is seeded once and a second start changes nothing",
        ctx do
     pre_log(ctx, fn store ->
@@ -1048,11 +1052,21 @@ defmodule AttentionServer.ChangeLogTest do
         "message_id" => "three",
         "answer" => "Done"
       })
+      |> PreChangeLogStore.paging_checkpoint("reader", "reader-startup")
+      |> PreChangeLogStore.acknowledge_conversation("reader", 1)
+      |> PreChangeLogStore.paging_building("origin", "origin-startup")
     end)
 
     assert tables(ctx.path) == []
+    seeded = log_tables(ctx.path)
+
+    assert [["reader-startup-snapshot", "accepted"], ["origin-startup-snapshot", "building"]] =
+             snapshot_status(ctx.path)
 
     relay = start(ctx)
+    engine = store(relay).engine
+    assert engine.cursors[{"A", "reader"}] == engine.persons["A"]
+    assert engine.conversation_cursors[{"A", "reader"}] == 1
     assert head(relay) == 1
     assert {:error, :cursor_expired} = log(relay, 0)
     assert {:ok, [], false, 1} = log(relay, 1)
@@ -1072,12 +1086,37 @@ defmodule AttentionServer.ChangeLogTest do
     assert first["client_change_log_epoch"] == []
     assert length(first["client_ranks"]) == 3
 
+    # Startup drops only the snapshot left building; the accepted paging state
+    # and the stored cursors are kept as they were.
+    assert [["reader-startup-snapshot", "accepted"]] = snapshot_status(ctx.path)
+    assert first["relay_device_progress"] == seeded["relay_device_progress"]
+
+    assert first["relay_inbox_item_pages"] ==
+             Enum.filter(seeded["relay_inbox_item_pages"], &("reader-startup-snapshot" in &1))
+
     relay = start(ctx)
+    assert store(relay).engine.cursors == engine.cursors
+    assert store(relay).engine.conversation_cursors == engine.conversation_cursors
     assert {:ok, [], false, ^cursor} = log(relay, cursor)
     assert {:ok, %{"rev" => ^cursor, "items" => ^items}} = Reads.inbox(relay, "reader")
     GenServer.stop(relay)
 
     assert log_tables(ctx.path) == first
+  end
+
+  defp snapshot_status(path) do
+    {:ok, db} = Sqlite3.open(path)
+
+    {:ok, stmt} =
+      Sqlite3.prepare(
+        db,
+        "SELECT snapshot_id, status FROM relay_inbox_snapshots ORDER BY status, snapshot_id"
+      )
+
+    {:ok, rows} = Sqlite3.fetch_all(db, stmt)
+    :ok = Sqlite3.release(db, stmt)
+    Sqlite3.close(db)
+    rows
   end
 
   # Per-change cost of storing a person's ranking (owner's gate: the rank hook

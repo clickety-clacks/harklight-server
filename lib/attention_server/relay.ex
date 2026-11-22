@@ -30,7 +30,6 @@ defmodule AttentionServer.Relay do
     Diagnostics,
     DeviceIdentity,
     Engine,
-    InboxPaging,
     JSON,
     Message,
     JevClient,
@@ -40,8 +39,7 @@ defmodule AttentionServer.Relay do
   }
 
   @browser_frame_types ~w(
-                          inbox_start inbox_page inbox_reconcile inbox_receipts
-                          inbox_checkpoint_ack inbox_attach conversation_open conversation_ack
+                          conversation_open conversation_ack
                           message_open answer answer_no_comment discussion conversation_read
                           view_get
                         )
@@ -793,8 +791,6 @@ defmodule AttentionServer.Relay do
               focus_streams: %{},
               focus_streams_by_person: %{},
               tls_listeners: %{},
-              inbox_builds: %{},
-              inbox_build_monitors: %{},
               applied_score_record:
                 AppliedScoreRecord.start(
                   Keyword.get(opts, :deployment_mode, :self_hosted),
@@ -2821,8 +2817,6 @@ defmodule AttentionServer.Relay do
           listener: listener,
           transport: transport,
           sync_mode: nil,
-          snapshot_id: nil,
-          replay_attach: nil,
           view_support: false,
           view_notice: nil,
           view_notice_due_at: nil,
@@ -2980,19 +2974,16 @@ defmodule AttentionServer.Relay do
   defp dispatch_call({:close_session, id}, _from, state),
     do: {:reply, :ok, drop_session(state, id)}
 
-  defp dispatch_call({:session_request_line, id, raw}, from, state),
-    do: session_request_line_call(state, id, raw, from)
+  defp dispatch_call({:session_request_line, id, raw}, _from, state),
+    do: session_request_line_call(state, id, raw)
 
-  defp dispatch_call({:session_request_file, id, path}, from, state) do
+  defp dispatch_call({:session_request_file, id, path}, _from, state) do
     with {:ok, session} <- active_session(state, id),
          {:ok, frame} <- JSON.decode_line_file(path),
          true <- is_map(frame) and not is_struct(frame) do
       try do
-        case session_request_frame_call(state, id, session, frame, from) do
-          {:reply, _reply, _next} = callback -> callback
-          {:noreply, _next} = callback -> callback
-          {reply, next} -> {:reply, reply, next}
-        end
+        {reply, next} = session_request_frame_call(state, id, session, frame)
+        {:reply, reply, next}
       after
         AttentionServer.LargeData.cleanup_transient_refs(frame)
       end
@@ -3010,11 +3001,11 @@ defmodule AttentionServer.Relay do
 
   defp dispatch_call(
          {:browser_session_request_line, browser_session_id, id, raw},
-         from,
+         _from,
          state
        ) do
     case browser_connection(state, browser_session_id, id) do
-      {:ok, _session} -> session_request_line_call(state, id, raw, from)
+      {:ok, _session} -> session_request_line_call(state, id, raw)
       {:error, :forbidden} -> {:reply, {:error, :session_ended}, drop_session(state, id)}
       {:error, reason} -> {:reply, {:error, reason}, state}
     end
@@ -3279,7 +3270,7 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  defp session_request_line_call(state, id, raw, from) do
+  defp session_request_line_call(state, id, raw) do
     with {:ok, session} <- active_session(state, id) do
       browser_type = browser_frame_type(raw)
 
@@ -3290,10 +3281,6 @@ defmodule AttentionServer.Relay do
 
         true ->
           case JSON.decode_line(raw) do
-            {:ok, %{"type" => "inbox_start"} = frame}
-            when session.transport in [:websocket, :browser] ->
-              inbox_start_call(state, id, session, frame, from)
-
             {:ok, %{"type" => "focus_report"} = frame} ->
               {reply, next} = focus_report_request(state, id, session, frame)
               {:reply, reply, next}
@@ -3312,27 +3299,15 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  defp session_request_frame_call(state, id, session, frame, from) do
+  defp session_request_frame_call(state, id, session, frame) do
     type = frame["type"]
 
     cond do
       session.transport == :browser and is_binary(type) and type not in @browser_frame_types ->
         {{:ok, [error_line(frame, "unknown_type")]}, state}
 
-      type == "inbox_start" and session.transport in [:websocket, :browser] ->
-        inbox_start_call(state, id, session, frame, from)
-
       type == "focus_report" ->
         focus_report_request(state, id, session, frame)
-
-      type in [
-        "inbox_page",
-        "inbox_reconcile",
-        "inbox_receipts",
-        "inbox_checkpoint_ack",
-        "inbox_attach"
-      ] ->
-        inbox_session_request(state, id, session, frame)
 
       type in [
         "resync",
@@ -3351,28 +3326,15 @@ defmodule AttentionServer.Relay do
       type in ["forward", "answer_receipt"] ->
         {{:ok, [error_line(frame, "unknown_type")]}, state}
 
-      session_mutation_state_value(state, session, frame) == :allowed and
-        not (not state.push_enabled and type in ["push_register", "push_remove", "push_status"]) and
-          not (not state.source_fixture_mode and type in ["source_bind", "source_result"]) ->
-        perform_request_frame(state, session.key, frame)
-        |> then(fn {reply, next} -> {wrap_line(reply), next} end)
+      not state.push_enabled and type in ["push_register", "push_remove", "push_status"] ->
+        {{:ok, [error_line(frame, "forbidden")]}, state}
+
+      not state.source_fixture_mode and type in ["source_bind", "source_result"] ->
+        {{:ok, [error_line(frame, "not_supported")]}, state}
 
       true ->
-        case session_mutation_state_value(state, session, frame) do
-          {:blocked, reason} ->
-            {{:ok, [error_line(frame, reason)]}, state}
-
-          _
-          when not state.push_enabled and type in ["push_register", "push_remove", "push_status"] ->
-            {{:ok, [error_line(frame, "forbidden")]}, state}
-
-          _ when not state.source_fixture_mode and type in ["source_bind", "source_result"] ->
-            {{:ok, [error_line(frame, "not_supported")]}, state}
-
-          _ ->
-            perform_request_frame(state, session.key, frame)
-            |> then(fn {reply, next} -> {wrap_line(reply), next} end)
-        end
+        perform_request_frame(state, session.key, frame)
+        |> then(fn {reply, next} -> {wrap_line(reply), next} end)
     end
   end
 
@@ -3380,14 +3342,8 @@ defmodule AttentionServer.Relay do
     session = %{session | levels_support: true}
     state = put_session(state, id, session)
 
-    case session_mutation_state_value(state, session, frame) do
-      {:blocked, reason} ->
-        {{:ok, [error_line(frame, reason)]}, state}
-
-      :allowed ->
-        perform_request_frame(state, session.key, frame)
-        |> then(fn {reply, next} -> {wrap_line(reply), next} end)
-    end
+    perform_request_frame(state, session.key, frame)
+    |> then(fn {reply, next} -> {wrap_line(reply), next} end)
   end
 
   @impl true
@@ -3680,115 +3636,52 @@ defmodule AttentionServer.Relay do
   end
 
   defp dispatch_info({:DOWN, monitor, :process, listener, reason}, state) do
-    case Map.pop(state.inbox_build_monitors, monitor) do
-      {nil, _monitors} ->
-        priority_job =
-          Enum.find(state.priority_jobs, fn {_person, job} -> job.monitor == monitor end)
+    priority_job =
+      Enum.find(state.priority_jobs, fn {_person, job} -> job.monitor == monitor end)
 
-        cond do
-          write = Enum.find(state.socket_writes, fn {_, write} -> write.monitor == monitor end) ->
-            {socket, _} = write
-            {:noreply, cancel_socket_write(state, socket, {:error, :closed})}
+    cond do
+      write = Enum.find(state.socket_writes, fn {_, write} -> write.monitor == monitor end) ->
+        {socket, _} = write
+        {:noreply, cancel_socket_write(state, socket, {:error, :closed})}
 
-          priority_job ->
-            {person, job} = priority_job
-            {:noreply, finish_priority_pass(state, person, job, {:error, :unavailable})}
+      priority_job ->
+        {person, job} = priority_job
+        {:noreply, finish_priority_pass(state, person, job, {:error, :unavailable})}
 
-          active =
-              Enum.find(state.active_uploads, fn {_lease, upload} ->
-                upload.monitor == monitor
-              end) ->
-            {lease, upload} = active
+      active =
+          Enum.find(state.active_uploads, fn {_lease, upload} ->
+            upload.monitor == monitor
+          end) ->
+        {lease, upload} = active
 
-            Diagnostics.failure(
-              :origin_https,
-              :upload_read,
-              reason,
-              :canceled,
-              Diagnostics.operation_id(upload)
-            )
+        Diagnostics.failure(
+          :origin_https,
+          :upload_read,
+          reason,
+          :canceled,
+          Diagnostics.operation_id(upload)
+        )
 
-            {:noreply, %{state | active_uploads: Map.delete(state.active_uploads, lease)}}
+        {:noreply, %{state | active_uploads: Map.delete(state.active_uploads, lease)}}
 
-          Map.get(state.tls_listeners, listener) == monitor ->
-            Diagnostics.failure(:device_relay, :server_terminate, reason, :unavailable)
-            {:noreply, unregister_listener(state, listener)}
+      Map.get(state.tls_listeners, listener) == monitor ->
+        Diagnostics.failure(:device_relay, :server_terminate, reason, :unavailable)
+        {:noreply, unregister_listener(state, listener)}
 
-          match?(%{monitor: ^monitor}, Map.get(state.focus_streams, listener)) ->
-            {:noreply, delete_focus_stream(state, listener)}
+      match?(%{monitor: ^monitor}, Map.get(state.focus_streams, listener)) ->
+        {:noreply, delete_focus_stream(state, listener)}
 
-          true ->
-            case Enum.find(state.origin_streams, fn {_, streams} ->
-                   Enum.any?(streams, &(&1.worker == listener and &1.monitor == monitor))
-                 end) do
-              {stream_key, _} ->
-                Diagnostics.failure(:origin_https, :stream_detach, reason, :closed)
-                {:noreply, detach_origin_stream(state, stream_key, listener)}
+      true ->
+        case Enum.find(state.origin_streams, fn {_, streams} ->
+               Enum.any?(streams, &(&1.worker == listener and &1.monitor == monitor))
+             end) do
+          {stream_key, _} ->
+            Diagnostics.failure(:origin_https, :stream_detach, reason, :closed)
+            {:noreply, detach_origin_stream(state, stream_key, listener)}
 
-              nil ->
-                {:noreply, state}
-            end
-        end
-
-      {build_key, monitors} ->
-        state = %{state | inbox_build_monitors: monitors}
-        {:noreply, fail_inbox_build(state, build_key, :snapshot_unavailable, false)}
-    end
-  end
-
-  defp dispatch_info({:inbox_snapshot_data, token, {:ok, counts}}, state) do
-    case inbox_build_by_token(state, token) do
-      {build_key, %{pid: pid} = build} ->
-        send(pid, {:inbox_snapshot_continue, token})
-        next = put_inbox_build(state, build_key, %{build | counts: counts})
-        {:noreply, next}
-
-      nil ->
-        {:noreply, state}
-    end
-  end
-
-  defp dispatch_info({:inbox_snapshot_data, token, {:error, reason}}, state) do
-    case inbox_build_by_token(state, token) do
-      {build_key, _build} ->
-        {:noreply, fail_inbox_build(state, build_key, reason, true)}
-
-      nil ->
-        {:noreply, state}
-    end
-  end
-
-  defp dispatch_info({:inbox_snapshot_chunk, token, kind, offset, values}, state) do
-    case inbox_build_by_token(state, token) do
-      {build_key, %{pid: pid, snapshot: snapshot}} ->
-        case Store.save_inbox_snapshot_chunk(state.store, snapshot, kind, offset, values) do
-          :ok ->
-            send(pid, {:inbox_snapshot_continue, token})
+          nil ->
             {:noreply, state}
-
-          {:error, reason} ->
-            send(pid, {:inbox_snapshot_abort, token, reason})
-            {:noreply, fail_inbox_build(state, build_key, reason, true)}
         end
-
-      nil ->
-        {:noreply, state}
-    end
-  end
-
-  defp dispatch_info({:inbox_snapshot_done, token}, state) do
-    case inbox_build_by_token(state, token) do
-      {build_key, build} ->
-        case Store.finish_inbox_snapshot(state.store, build.snapshot, build.counts) do
-          :ok ->
-            {:noreply, complete_inbox_build(state, build_key)}
-
-          {:error, reason} ->
-            {:noreply, fail_inbox_build(state, build_key, reason, true)}
-        end
-
-      nil ->
-        {:noreply, state}
     end
   end
 
@@ -4135,17 +4028,6 @@ defmodule AttentionServer.Relay do
     case JSON.decode_line(raw) do
       {:ok, %{"type" => type} = frame}
       when type in [
-             "inbox_start",
-             "inbox_page",
-             "inbox_reconcile",
-             "inbox_receipts",
-             "inbox_checkpoint_ack",
-             "inbox_attach"
-           ] ->
-        inbox_session_request(state, id, session, frame)
-
-      {:ok, %{"type" => type} = frame}
-      when type in [
              "resync",
              "ack",
              "conversation_open",
@@ -4163,14 +4045,8 @@ defmodule AttentionServer.Relay do
         {{:ok, [error_line(frame, "unknown_type")]}, state}
 
       _ ->
-        case session_mutation_state(state, session, raw) do
-          {:blocked, reason} ->
-            {{:ok, [error_line(raw, reason)]}, state}
-
-          :allowed ->
-            {reply, next} = request(state, session.key, raw)
-            {wrap_line(reply), next}
-        end
+        {reply, next} = request(state, session.key, raw)
+        {wrap_line(reply), next}
     end
   end
 
@@ -4196,8 +4072,6 @@ defmodule AttentionServer.Relay do
       listener: nil,
       transport: :browser,
       sync_mode: nil,
-      snapshot_id: nil,
-      replay_attach: nil,
       view_support: false,
       view_notice: nil,
       view_notice_due_at: nil,
@@ -4210,39 +4084,20 @@ defmodule AttentionServer.Relay do
   defp levels_session_request(state, id, session, raw) do
     session = %{session | levels_support: true}
     state = put_session(state, id, session)
-
-    case session_mutation_state(state, session, raw) do
-      {:blocked, reason} ->
-        {{:ok, [error_line(raw, reason)]}, state}
-
-      :allowed ->
-        {reply, next} = request(state, session.key, raw)
-        {wrap_line(reply), next}
-    end
+    {reply, next} = request(state, session.key, raw)
+    {wrap_line(reply), next}
   end
 
   defp special_request(state, id, session, frame) do
     case envelope_error(frame) do
       nil ->
         case frame["type"] do
-          "resync" when session.sync_mode == :paging ->
-            {{:ok, [error_line(frame, "sync_mode_conflict")]}, state}
-
           "resync" ->
             legacy_session = %{session | sync_mode: :legacy}
             resync(put_session(state, id, legacy_session), id, legacy_session, frame)
 
-          "ack" when session.sync_mode == :paging ->
-            case paging_ack_state(state, session) do
-              :ready -> ack(state, session, frame)
-              {:blocked, reason} -> {{:ok, [error_line(frame, reason)]}, state}
-            end
-
           "ack" ->
-            case session_mutation_state(state, session, JSON.encode!(frame)) do
-              {:blocked, reason} -> {{:ok, [error_line(frame, reason)]}, state}
-              :allowed -> ack(state, session, frame)
-            end
+            ack(state, session, frame)
 
           "conversation_open" ->
             case frame["bounded"] do
@@ -4273,553 +4128,6 @@ defmodule AttentionServer.Relay do
         {{:ok, [error_line(frame, reason, field)]}, state}
     end
   end
-
-  defp inbox_session_request(state, id, session, frame) do
-    cond do
-      session.transport not in [:websocket, :browser] ->
-        {{:ok, [error_line(frame, "unknown_type")]}, state}
-
-      session.sync_mode == :legacy ->
-        {{:ok, [error_line(frame, "sync_mode_conflict")]}, state}
-
-      true ->
-        paging_session = %{session | sync_mode: :paging}
-        state = put_session(state, id, paging_session)
-
-        case frame["type"] do
-          "inbox_start" -> inbox_start(state, id, paging_session, frame)
-          "inbox_page" -> inbox_page(state, id, paging_session, frame)
-          "inbox_reconcile" -> inbox_reconcile(state, id, paging_session, frame)
-          "inbox_receipts" -> inbox_receipts(state, id, paging_session, frame)
-          "inbox_checkpoint_ack" -> inbox_checkpoint_ack(state, id, paging_session, frame)
-          "inbox_attach" -> inbox_attach(state, id, paging_session, frame)
-        end
-    end
-  end
-
-  defp inbox_start_call(state, id, session, frame, from) do
-    cond do
-      session.ready or session.sync_mode == :legacy ->
-        {:reply, {:ok, [error_line(frame, "sync_mode_conflict")]}, state}
-
-      true ->
-        person = person_of(state.store.engine, session.key)
-        state = ensure_priority_view(state, person)
-        view_order = Enum.map(state.priority_views[person].entries, &Placement.identity/1)
-
-        case InboxPaging.start_plan(
-               state.store,
-               state.store.engine,
-               session.key,
-               frame,
-               view_order
-             ) do
-          {:ready, _snapshot} ->
-            {reply, next} = inbox_start(state, id, session, frame)
-            {:reply, reply, next}
-
-          {:build, plan} ->
-            begin_inbox_build(state, id, session, frame, from, plan)
-
-          {:building, snapshot} ->
-            key = inbox_build_key(snapshot)
-
-            case Map.get(state.inbox_builds, key) do
-              nil ->
-                case Store.discard_inbox_snapshot(state.store, snapshot) do
-                  :ok ->
-                    inbox_start_call(state, id, session, frame, from)
-
-                  {:error, reason} ->
-                    {reply, next} = paging_error(state, frame, reason)
-                    {:reply, reply, next}
-                end
-
-              build ->
-                join_inbox_build(state, id, session, frame, from, key, build)
-            end
-
-          {:error, reason} ->
-            {reply, next} = paging_error(state, frame, reason)
-            {:reply, reply, next}
-        end
-    end
-  end
-
-  defp begin_inbox_build(state, id, session, frame, from, plan) do
-    if session.snapshot_id do
-      {:reply, {:ok, [error_line(frame, "sync_mode_conflict")]}, state}
-    else
-      begin_inbox_build_without_snapshot(state, id, session, frame, from, plan)
-    end
-  end
-
-  defp begin_inbox_build_without_snapshot(state, id, session, frame, from, plan) do
-    case Store.begin_inbox_snapshot(state.store, plan) do
-      {:ok, snapshot} ->
-        build_key = inbox_build_key(snapshot)
-        token = make_ref()
-        parent = self()
-        engine = state.store.engine
-
-        snapshot_test_gate =
-          if state.enrollment_fixture_mode,
-            do: Map.get(state, :inbox_snapshot_test_gate),
-            else: nil
-
-        {pid, monitor} =
-          spawn_monitor(fn ->
-            inbox_snapshot_worker(parent, token, engine, session.key, plan, snapshot_test_gate)
-          end)
-
-        waiter = {from, id, frame}
-
-        build = %{
-          token: token,
-          pid: pid,
-          monitor: monitor,
-          snapshot: snapshot,
-          counts: nil,
-          waiters: [waiter]
-        }
-
-        updated = %{session | sync_mode: :paging, snapshot_id: snapshot.snapshot_id}
-
-        next =
-          state
-          |> put_session(id, updated)
-          |> put_inbox_build(build_key, build)
-          |> put_inbox_build_monitor(monitor, build_key)
-
-        {:noreply, next}
-
-      {:error, reason} ->
-        {reply, next} = paging_error(state, frame, reason)
-        {:reply, reply, next}
-    end
-  end
-
-  defp join_inbox_build(state, id, session, frame, from, build_key, build) do
-    if session.snapshot_id && session.snapshot_id != build.snapshot.snapshot_id do
-      {:reply, {:ok, [error_line(frame, "sync_mode_conflict")]}, state}
-    else
-      updated = %{session | sync_mode: :paging, snapshot_id: build.snapshot.snapshot_id}
-      waiter = {from, id, frame}
-      build = %{build | waiters: [waiter | build.waiters]}
-
-      next =
-        state
-        |> put_session(id, updated)
-        |> put_inbox_build(build_key, build)
-
-      {:noreply, next}
-    end
-  end
-
-  defp inbox_snapshot_worker(relay, token, engine, key, plan, test_gate) do
-    relay_monitor = Process.monitor(relay)
-
-    try do
-      case await_inbox_snapshot_test_gate(test_gate, relay_monitor, token) do
-        :ok ->
-          case InboxPaging.snapshot_data(engine, key, plan) do
-            {:ok, data} ->
-              counts = %{
-                items: length(data.items),
-                receipts: length(data.receipts),
-                operation_ids: length(data.operation_ids)
-              }
-
-              send(relay, {:inbox_snapshot_data, token, {:ok, counts}})
-
-              with :ok <- await_inbox_snapshot_continue(relay_monitor, token),
-                   :ok <- stream_snapshot_chunks(relay, relay_monitor, token, :items, data.items),
-                   :ok <-
-                     stream_snapshot_chunks(relay, relay_monitor, token, :receipts, data.receipts),
-                   :ok <-
-                     stream_snapshot_chunks(
-                       relay,
-                       relay_monitor,
-                       token,
-                       :operation_ids,
-                       data.operation_ids
-                     ) do
-                send(relay, {:inbox_snapshot_done, token})
-              else
-                {:error, reason} -> send(relay, {:inbox_snapshot_data, token, {:error, reason}})
-              end
-
-            {:error, reason} ->
-              send(relay, {:inbox_snapshot_data, token, {:error, reason}})
-          end
-
-        {:error, reason} ->
-          send(relay, {:inbox_snapshot_data, token, {:error, reason}})
-      end
-    rescue
-      _ -> send(relay, {:inbox_snapshot_data, token, {:error, :snapshot_unavailable}})
-    catch
-      _, _ -> send(relay, {:inbox_snapshot_data, token, {:error, :snapshot_unavailable}})
-    after
-      Process.demonitor(relay_monitor, [:flush])
-    end
-  end
-
-  defp await_inbox_snapshot_test_gate(nil, _relay_monitor, _token), do: :ok
-
-  defp await_inbox_snapshot_test_gate(test_gate, relay_monitor, token) when is_pid(test_gate) do
-    send(test_gate, {:inbox_snapshot_worker_waiting, self(), token})
-
-    receive do
-      {:continue_inbox_snapshot, ^token} -> :ok
-      {:DOWN, ^relay_monitor, :process, _relay, _reason} -> {:error, :relay_unavailable}
-    end
-  end
-
-  defp stream_snapshot_chunks(relay, relay_monitor, token, kind, values) do
-    values
-    |> Stream.chunk_every(20)
-    |> Enum.with_index()
-    |> Enum.reduce_while(:ok, fn {chunk, page}, :ok ->
-      send(relay, {:inbox_snapshot_chunk, token, kind, page * 20, chunk})
-
-      case await_inbox_snapshot_continue(relay_monitor, token) do
-        :ok -> {:cont, :ok}
-        error -> {:halt, error}
-      end
-    end)
-  end
-
-  defp await_inbox_snapshot_continue(relay_monitor, token) do
-    receive do
-      {:inbox_snapshot_continue, ^token} ->
-        :ok
-
-      {:inbox_snapshot_abort, ^token, reason} ->
-        {:error, reason}
-
-      {:DOWN, ^relay_monitor, :process, _relay, _reason} ->
-        {:error, :relay_unavailable}
-    end
-  end
-
-  defp complete_inbox_build(state, build_key) do
-    case Map.pop(state.inbox_builds, build_key) do
-      {nil, _builds} ->
-        state
-
-      {build, builds} ->
-        Process.demonitor(build.monitor, [:flush])
-
-        state = %{
-          state
-          | inbox_builds: builds,
-            inbox_build_monitors: Map.delete(state.inbox_build_monitors, build.monitor)
-        }
-
-        Enum.reduce(build.waiters, state, fn {from, id, frame}, acc ->
-          case Map.get(acc.sessions, id) do
-            nil ->
-              GenServer.reply(from, {:error, :forbidden})
-              acc
-
-            session ->
-              {reply, next} = inbox_start(acc, id, session, frame)
-              GenServer.reply(from, reply)
-              next
-          end
-        end)
-    end
-  end
-
-  defp fail_inbox_build(state, build_key, reason, notify_worker?) do
-    case Map.pop(state.inbox_builds, build_key) do
-      {nil, _builds} ->
-        state
-
-      {build, builds} ->
-        if notify_worker?, do: send(build.pid, {:inbox_snapshot_abort, build.token, reason})
-        Process.demonitor(build.monitor, [:flush])
-        _ = Store.discard_inbox_snapshot(state.store, build.snapshot)
-
-        state = %{
-          state
-          | inbox_builds: builds,
-            inbox_build_monitors: Map.delete(state.inbox_build_monitors, build.monitor)
-        }
-
-        Enum.reduce(build.waiters, state, fn {from, id, frame}, acc ->
-          acc = reset_building_session(acc, id, build.snapshot.snapshot_id)
-          {reply, next} = paging_error(acc, frame, reason)
-          GenServer.reply(from, reply)
-          next
-        end)
-    end
-  end
-
-  defp reset_building_session(state, id, snapshot_id) do
-    case Map.get(state.sessions, id) do
-      %{snapshot_id: ^snapshot_id} = session ->
-        put_session(state, id, %{session | sync_mode: nil, snapshot_id: nil})
-
-      _ ->
-        state
-    end
-  end
-
-  defp inbox_build_by_token(state, token) do
-    Enum.find_value(state.inbox_builds, fn {key, build} ->
-      if build.token == token, do: {key, build}
-    end)
-  end
-
-  defp inbox_build_key(snapshot),
-    do: {snapshot.person_id, snapshot.device_id, snapshot.startup_id}
-
-  defp put_inbox_build(state, key, build),
-    do: %{state | inbox_builds: Map.put(state.inbox_builds, key, build)}
-
-  defp put_inbox_build_monitor(state, monitor, key),
-    do: %{state | inbox_build_monitors: Map.put(state.inbox_build_monitors, monitor, key)}
-
-  defp inbox_start(state, id, session, frame) do
-    cond do
-      session.ready ->
-        {{:ok, [error_line(frame, "sync_mode_conflict")]}, state}
-
-      true ->
-        case InboxPaging.start(state.store, state.store.engine, session.key, frame) do
-          {:ok, reply, snapshot, _created?} ->
-            if session.snapshot_id && session.snapshot_id != snapshot.snapshot_id do
-              {{:ok, [error_line(frame, "sync_mode_conflict")]}, state}
-            else
-              updated = %{session | sync_mode: :paging, snapshot_id: snapshot.snapshot_id}
-              {{:ok, [line(reply)]}, put_session(state, id, updated)}
-            end
-
-          {:error, reason} ->
-            paging_error(state, frame, reason)
-        end
-    end
-  end
-
-  defp inbox_page(state, id, session, frame) do
-    with :ok <- session_snapshot(session, frame),
-         {:ok, reply, _snapshot} <-
-           InboxPaging.page(state.store, state.store.engine, session.key, frame) do
-      updated = %{session | sync_mode: :paging}
-      {{:ok, [line(reply)]}, put_session(state, id, updated)}
-    else
-      {:error, reason} -> paging_error(state, frame, reason)
-    end
-  end
-
-  defp inbox_reconcile(state, id, session, frame) do
-    with :ok <- session_snapshot(session, frame) do
-      case InboxPaging.reconcile(state.store, state.store.engine, session.key, frame) do
-        {:ok, reply, _snapshot, store, applied} ->
-          updated = %{session | sync_mode: :paging}
-          next_state = reconciled_state(state, store, session.key, applied)
-          {{:ok, [line(reply)]}, put_session(next_state, id, updated)}
-
-        {:error, reason, store, applied} ->
-          paging_error(reconciled_state(state, store, session.key, applied), frame, reason)
-
-        {:error, reason} ->
-          paging_error(state, frame, reason)
-      end
-    else
-      {:error, reason} -> paging_error(state, frame, reason)
-    end
-  end
-
-  # A reconciliation can now commit a No comment terminal. Preserve the same
-  # origin-feed and pending-view notifications as an ordinary device request.
-  defp reconciled_state(state, store, key, applied) do
-    next = %{state | store: store}
-
-    targets =
-      applied
-      |> Enum.map(&origin_feed_target(store.engine, key, &1))
-      |> Enum.uniq()
-
-    next =
-      Enum.reduce(targets, next, fn target, current ->
-        record_origin_feed_change(current, state.store.engine, store.engine, target)
-      end)
-
-    case Engine.authorized_person(state.store.engine, key) do
-      {:ok, person} ->
-        if pending_signature(state.store.engine, person) !=
-             pending_signature(store.engine, person),
-           do: pending_set_changed(next, person),
-           else: next
-
-      _ ->
-        next
-    end
-  end
-
-  defp inbox_receipts(state, id, session, frame) do
-    with :ok <- session_snapshot(session, frame),
-         {:ok, reply, _snapshot} <-
-           InboxPaging.receipts(state.store, state.store.engine, session.key, frame) do
-      updated = %{session | sync_mode: :paging}
-      {{:ok, [line(reply)]}, put_session(state, id, updated)}
-    else
-      {:error, reason} -> paging_error(state, frame, reason)
-    end
-  end
-
-  defp inbox_checkpoint_ack(state, id, session, frame) do
-    with :ok <- session_snapshot(session, frame),
-         {:ok, reply, store, _snapshot} <-
-           InboxPaging.checkpoint_ack(state.store, state.store.engine, session.key, frame) do
-      updated = %{session | sync_mode: :paging}
-      {{:ok, [line(reply)]}, put_session(%{state | store: store}, id, updated)}
-    else
-      {:error, reason, store} -> paging_error(%{state | store: store}, frame, reason)
-      {:error, reason} -> paging_error(state, frame, reason)
-    end
-  end
-
-  defp inbox_attach(state, id, session, frame) do
-    cond do
-      session.snapshot_id && session.snapshot_id != frame["snapshot_id"] ->
-        {{:ok, [error_line(frame, "invalid_snapshot")]}, state}
-
-      frame["mode"] == "replay" && is_map(session.replay_attach) ->
-        cached = session.replay_attach
-
-        if cached.snapshot_id == frame["snapshot_id"] and cached.since == frame["since"] do
-          {{:ok, replay_frames_with_ref(cached.frames, frame)}, state}
-        else
-          {{:ok, [error_line(frame, "sync_mode_conflict")]}, state}
-        end
-
-      true ->
-        case InboxPaging.attach(state.store, state.store.engine, session.key, frame) do
-          {:ok, %{reply: reply, events: events, barrier: barrier, since: since}, snapshot} ->
-            {resynced, state} = resynced_frame(state, barrier)
-
-            frames =
-              [line(reply)] ++
-                Enum.map(events, &line/1) ++
-                [line(resynced)]
-
-            updated = %{
-              session
-              | sync_mode: :paging,
-                snapshot_id: snapshot.snapshot_id,
-                contiguous: barrier,
-                stream_seq: barrier,
-                ready: true,
-                replay_attach: %{
-                  snapshot_id: snapshot.snapshot_id,
-                  since: since,
-                  frames: frames
-                }
-            }
-
-            {{:ok, frames}, put_session(state, id, updated)}
-
-          {:ok, reply, snapshot} when is_map(reply) ->
-            updated = %{session | sync_mode: :paging, snapshot_id: snapshot.snapshot_id}
-            {{:ok, [line(reply)]}, put_session(state, id, updated)}
-
-          {:error, reason} ->
-            paging_error(state, frame, reason)
-        end
-    end
-  end
-
-  defp session_snapshot(%{sync_mode: mode, snapshot_id: snapshot_id}, frame) do
-    if mode == :paging and is_binary(snapshot_id) and frame["snapshot_id"] == snapshot_id,
-      do: :ok,
-      else: {:error, :invalid_snapshot}
-  end
-
-  defp replay_frames_with_ref([first | rest], frame) do
-    case JSON.decode_line(first) do
-      {:ok, reply} ->
-        reply =
-          if is_binary(frame["ref"]),
-            do: Map.put(reply, "ref", frame["ref"]),
-            else: Map.delete(reply, "ref")
-
-        [line(reply) | rest]
-
-      _ ->
-        [first | rest]
-    end
-  end
-
-  defp replay_frames_with_ref(frames, _frame), do: frames
-
-  defp paging_ack_state(state, %{ready: true, snapshot_id: snapshot_id} = session)
-       when is_binary(snapshot_id) do
-    case Store.inbox_checkpoint_status(
-           state.store,
-           person_of(state.store.engine, session.key),
-           session.key,
-           snapshot_id
-         ) do
-      {:ok, %{status: "pending"}} -> {:blocked, "checkpoint_pending"}
-      {:ok, %{status: "building"}} -> {:blocked, "checkpoint_pending"}
-      {:ok, %{status: "accepted"}} -> :ready
-      {:ok, %{status: "replaced"}} -> {:blocked, "snapshot_replaced"}
-      {:error, reason} -> {:blocked, wire_reason(reason)}
-    end
-  end
-
-  defp paging_ack_state(_state, _session), do: {:blocked, "checkpoint_pending"}
-
-  defp session_mutation_state(state, session, raw) do
-    case JSON.decode_line(raw) do
-      {:ok, frame} when is_map(frame) ->
-        session_mutation_state_value(state, session, frame)
-
-      _ ->
-        :allowed
-    end
-  end
-
-  defp session_mutation_state_value(state, session, %{"type" => type}) when is_binary(type) do
-    if type in InboxPaging.mutation_types(),
-      do: pending_mutation_state(state, session),
-      else: :allowed
-  end
-
-  defp session_mutation_state_value(_state, _session, _frame), do: :allowed
-
-  defp pending_mutation_state(state, session) do
-    if session.sync_mode == :paging and is_binary(session.snapshot_id) do
-      case Store.inbox_checkpoint_status(
-             state.store,
-             person_of(state.store.engine, session.key),
-             session.key,
-             session.snapshot_id
-           ) do
-        {:ok, %{status: "pending"}} -> {:blocked, "checkpoint_pending"}
-        {:ok, %{status: "building"}} -> {:blocked, "checkpoint_pending"}
-        {:ok, %{status: status}} when status in ["accepted", "replaced"] -> :allowed
-        {:error, reason} -> {:blocked, wire_reason(reason)}
-        _ -> {:blocked, "snapshot_unavailable"}
-      end
-    else
-      :allowed
-    end
-  end
-
-  defp paging_error(state, frame, {:invalid_field, field}),
-    do: {{:ok, [error_line(frame, "invalid_field", field)]}, state}
-
-  defp paging_error(state, frame, reason),
-    do: {{:ok, [error_line(frame, wire_reason(reason))]}, state}
-
-  defp wire_reason(reason) when is_atom(reason), do: Atom.to_string(reason)
-  defp wire_reason({:invalid_field, _}), do: "invalid_field"
-  defp wire_reason(_), do: "storage_unavailable"
 
   defp resynced_frame(state, high) do
     {flags, warned} =
@@ -7883,16 +7191,6 @@ defmodule AttentionServer.Relay do
 
   defp cleanup_browser_recipient_state(state, actor_keys) do
     actor_keys = MapSet.new(actor_keys)
-
-    state =
-      state.inbox_builds
-      |> Enum.filter(fn {_key, build} ->
-        MapSet.member?(actor_keys, build.snapshot.device_id)
-      end)
-      |> Enum.reduce(state, fn {key, _build}, acc ->
-        fail_inbox_build(acc, key, :forbidden, true)
-      end)
-
     engine = discard_browser_actor_state(state.store.engine, actor_keys)
 
     case commit(state.store, engine, %{

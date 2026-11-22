@@ -2,6 +2,7 @@ defmodule AttentionServer.AccountAnswerReadSyncTest do
   use ExUnit.Case, async: false
 
   alias AttentionServer.{JSON, Relay}
+  alias AttentionServer.ClientAPI.Reads
 
   @handle "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 
@@ -226,34 +227,17 @@ defmodule AttentionServer.AccountAnswerReadSyncTest do
 
     refute Enum.any?(replay, &Map.has_key?(&1, "answer"))
 
-    assert {:ok, offline_page} = Relay.open_websocket_session(relay, "offline", nil, nil)
+    # The v2 inbox shows every device of the account the same outcomes, and
+    # another person's device none of them.
+    for device <- ["origin", "reader", "reader2", "offline"] do
+      assert {:ok, %{"items" => items}} = Reads.inbox(relay, device)
 
-    assert [%{"type" => "ok", "items" => items}] =
-             session_request(relay, offline_page, %{
-               "type" => "inbox_start",
-               "paging_version" => 1,
-               "startup_id" => "answer-outcome-page",
-               "since" => 0
-             })
-
-    page_outcomes =
-      Map.new(items, fn item ->
-        {item["acceptance"]["message_id"], item["terminal"]["answer_outcome"]}
-      end)
-
-    assert page_outcomes == outcomes
-    refute Enum.any?(items, &Map.has_key?(&1["terminal"], "answer"))
+      assert Map.new(items, &{&1["message"]["message_id"], &1["terminal"]["answer"]}) ==
+               outcomes
+    end
 
     assert {:ok, [], 0} = Relay.events(relay, "foreign", 0)
-    assert {:ok, foreign_page} = Relay.open_websocket_session(relay, "foreign", nil, nil)
-
-    assert [%{"type" => "ok", "items" => []}] =
-             session_request(relay, foreign_page, %{
-               "type" => "inbox_start",
-               "paging_version" => 1,
-               "startup_id" => "foreign-answer-page",
-               "since" => 0
-             })
+    assert {:ok, %{"items" => []}} = Reads.inbox(relay, "foreign")
 
     GenServer.stop(relay)
   end
