@@ -75,8 +75,6 @@ defmodule AttentionServer.OptionalStartupTest do
     refute_child(server, :enrollment_https)
     assert Server.port(server) > 0
     assert Server.owner_port(server) > 0
-    assert Server.agent_port(server) > 0
-    assert Server.origin_port(server) > 0
     assert is_pid(Server.relay(server))
   end
 
@@ -107,7 +105,7 @@ defmodule AttentionServer.OptionalStartupTest do
     ]
 
     server = start_server(Keyword.put(opts, :apns, apns))
-    core_ids = [:web_socket, :owner_tls, :agent_https, :origin_https]
+    core_ids = [:client_api, :owner_tls]
     original_core = child_pids(server, core_ids)
     relay = Server.relay(server)
     dispatcher = child_pid(server, :push_dispatcher)
@@ -127,8 +125,6 @@ defmodule AttentionServer.OptionalStartupTest do
     assert Map.fetch!(:sys.get_state(Server.relay(server)), :push_enabled)
     assert Server.port(server) > 0
     assert Server.owner_port(server) > 0
-    assert Server.agent_port(server) > 0
-    assert Server.origin_port(server) > 0
     assert Server.enroll_port(server) > 0
   end
 
@@ -146,8 +142,6 @@ defmodule AttentionServer.OptionalStartupTest do
       port: 0,
       enroll_port: 0,
       owner_port: 0,
-      agent_port: 0,
-      origin_port: 0,
       relay_name: String.to_atom("optional_startup_#{System.unique_integer([:positive])}")
     ]
   end
@@ -163,8 +157,6 @@ defmodule AttentionServer.OptionalStartupTest do
     assert Server.port(server) > 0
     assert Server.enroll_port(server) > 0
     assert Server.owner_port(server) > 0
-    assert Server.agent_port(server) > 0
-    assert Server.origin_port(server) > 0
     assert is_pid(Server.relay(server))
   end
 

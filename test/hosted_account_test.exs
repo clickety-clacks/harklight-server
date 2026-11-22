@@ -9,7 +9,7 @@ defmodule AttentionServer.HostedAccountTest do
     HostedRequests,
     JevClient,
     JSON,
-    OriginWire,
+    LegacyOriginWire,
     Placement,
     Relay,
     Server,
@@ -474,7 +474,7 @@ defmodule AttentionServer.HostedAccountTest do
                "reason" => "inactive_account",
                "ref" => "stopped-send"
              } =
-               OriginWire.command(relay, "alice-origin", %{
+               LegacyOriginWire.command(relay, "alice-origin", %{
                  "v" => 1,
                  "type" => "send",
                  "op_id" => relay_op(204),
@@ -489,7 +489,7 @@ defmodule AttentionServer.HostedAccountTest do
                })
 
       assert %{"type" => "error", "reason" => "inactive_account"} =
-               OriginWire.command(relay, "alice-origin", %{
+               LegacyOriginWire.command(relay, "alice-origin", %{
                  "v" => 1,
                  "type" => "revise",
                  "op_id" => relay_op(205),
@@ -507,7 +507,7 @@ defmodule AttentionServer.HostedAccountTest do
                })
 
       assert %{"type" => "error", "reason" => "inactive_account"} =
-               OriginWire.command(relay, "alice-origin", %{
+               LegacyOriginWire.command(relay, "alice-origin", %{
                  "v" => 1,
                  "type" => "reply",
                  "op_id" => relay_op(206),

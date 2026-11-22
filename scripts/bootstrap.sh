@@ -37,9 +37,9 @@ cli="$(cd -- "$(dirname -- "$0")" && pwd)/harklight"
   printf 'export ATTENTION_SERVER_CACERTFILE=%q\n' "$state_dir/tls/ca.pem"
   printf 'export ATTENTION_SERVER_JOIN_NAME=%q\n' "$hostname"
   printf 'export ATTENTION_SERVER_PORT=18443\nexport ATTENTION_SERVER_ENROLL_PORT=18444\n'
-  printf 'export ATTENTION_SERVER_OWNER_PORT=18445\nexport ATTENTION_SERVER_AGENT_PORT=18446\n'
+  printf 'export ATTENTION_SERVER_OWNER_PORT=18445\n'
   printf 'export ATTENTION_SERVER_BIND=127.0.0.1\nexport ATTENTION_SERVER_ENROLL_BIND=127.0.0.1\n'
-  printf 'export ATTENTION_SERVER_OWNER_BIND=127.0.0.1\nexport ATTENTION_SERVER_AGENT_BIND=127.0.0.1\n'
+  printf 'export ATTENTION_SERVER_OWNER_BIND=127.0.0.1\n'
 } > "$state_dir/server.env"
 echo "Owner bootstrapped; person ID saved in $state_dir/person-id"
 echo "Protect the state directory; share only tls/ca.pem as the client's trust root."

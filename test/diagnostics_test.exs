@@ -34,7 +34,7 @@ defmodule AttentionServer.DiagnosticsTest do
     log =
       capture_log(fn ->
         Diagnostics.failure(
-          :agent_https,
+          :client_api,
           :request_dispatch,
           {:arbitrary, "private text"},
           :failed,
@@ -53,14 +53,14 @@ defmodule AttentionServer.DiagnosticsTest do
     log =
       capture_log(fn ->
         Diagnostics.response_error(
-          :agent_https,
+          :client_api,
           :request_dispatch,
           %{"type" => "error", "reason" => "storage_unavailable"},
           operation_id
         )
       end)
 
-    assert log =~ "operation=agent_https"
+    assert log =~ "operation=client_api"
     assert log =~ "phase=request_dispatch"
     assert log =~ "cause=storage_unavailable"
     assert log =~ "outcome=outcome_unknown"

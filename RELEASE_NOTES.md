@@ -1,3 +1,18 @@
+# Harklight Server v0.2.0 (in preparation)
+
+The full notes are completed when the release is cut.
+
+## Compatibility
+
+Protocol 0.2. The device port serves client API v2 (`/v2`) only, and the
+Server runs no `/origin/v1` and no `/agent/v1` listener. Protocol 0.1 apps,
+agents and headless tools cannot connect to it, so a deployment moves to
+0.2.0 only after its agents and clients are on their 0.2 versions. The
+verified compatible versions of the app, web client and Harklight Agent are
+named here when the release is cut.
+
+---
+
 # Harklight Server v0.1.49
 
 ## Changes

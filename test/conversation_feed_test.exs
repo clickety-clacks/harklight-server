@@ -7,7 +7,7 @@ defmodule AttentionServer.ConversationFeedTest do
     Engine,
     JSON,
     LargeData,
-    OriginWire,
+    LegacyOriginWire,
     Relay,
     Store
   }
@@ -2185,7 +2185,7 @@ defmodule AttentionServer.ConversationFeedTest do
           "ref" => "existing-reply-#{message_id}"
         }
 
-        assert %{"type" => "ok"} = reply = OriginWire.command(relay, "origin", reply_frame)
+        assert %{"type" => "ok"} = reply = LegacyOriginWire.command(relay, "origin", reply_frame)
 
         pending_frame = %{
           frame
@@ -2260,7 +2260,7 @@ defmodule AttentionServer.ConversationFeedTest do
       assert ref_back == "person-#{ref}-ref"
 
       assert %{"v" => 1, "type" => "ok"} =
-               OriginWire.command(relay, "origin", %{
+               LegacyOriginWire.command(relay, "origin", %{
                  "v" => 1,
                  "type" => "reply",
                  "op_id" => op(agent_op),
@@ -2275,7 +2275,7 @@ defmodule AttentionServer.ConversationFeedTest do
       # The agent may answer the same chat message again; the terminal result
       # of the request is untouched.
       assert %{"v" => 1, "type" => "ok"} =
-               OriginWire.command(relay, "origin", %{
+               LegacyOriginWire.command(relay, "origin", %{
                  "v" => 1,
                  "type" => "reply",
                  "op_id" => op(agent_op + 100),
@@ -2315,7 +2315,7 @@ defmodule AttentionServer.ConversationFeedTest do
              "reason" => "not_found",
              "ref" => "missing-discussion-ref"
            } =
-             OriginWire.command(relay, "origin", %{
+             LegacyOriginWire.command(relay, "origin", %{
                "v" => 1,
                "type" => "reply",
                "op_id" => op(817),
@@ -2331,7 +2331,7 @@ defmodule AttentionServer.ConversationFeedTest do
 
     for {_message_id, %{reply_frame: frame, reply: reply}} <- prior_discussions do
       assert %{"type" => "ok", "duplicate" => true, "event_id" => event_id} =
-               OriginWire.command(relay, "origin", frame)
+               LegacyOriginWire.command(relay, "origin", frame)
 
       assert event_id == reply["event_id"]
     end
@@ -2354,7 +2354,7 @@ defmodule AttentionServer.ConversationFeedTest do
                "status" => "received",
                "ref" => ref
              } =
-               OriginWire.command(relay, "origin", %{
+               LegacyOriginWire.command(relay, "origin", %{
                  "v" => 1,
                  "type" => "result",
                  "op_id" => op(operation),
@@ -2513,7 +2513,7 @@ defmodule AttentionServer.ConversationFeedTest do
              request(relay, "reader", sibling_discussion_frame)
 
     assert %{"type" => "ok", "ref" => "sibling-reply-ref"} =
-             OriginWire.command(relay, "origin", %{
+             LegacyOriginWire.command(relay, "origin", %{
                "v" => 1,
                "type" => "reply",
                "op_id" => op(844),

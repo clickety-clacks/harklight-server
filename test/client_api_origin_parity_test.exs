@@ -1,0 +1,355 @@
+defmodule AttentionServer.ClientAPIOriginParityTest do
+  # Origin-side behaviors the retired /origin/v1 listener tests asserted,
+  # checked on client API v2 over the supervised device listener.
+  use ExUnit.Case, async: false
+
+  import ExUnit.CaptureLog
+
+  alias AttentionServer.{
+    AgentChangeLog,
+    ClientAPIFeedClient,
+    DeviceIdentity,
+    JSON,
+    Relay,
+    Server,
+    TLSFixtures
+  }
+
+  @agent_id "00000000-0000-4000-8000-0000000000a1"
+  @origin "parity-origin"
+  @session "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+
+  setup_all do
+    certs = TLSFixtures.create!()
+    TLSFixtures.make_self_signed_client!(certs, "parity-owner")
+    TLSFixtures.make_self_signed_client!(certs, "parity-agent")
+    TLSFixtures.make_self_signed_client!(certs, @origin)
+    on_exit(fn -> File.rm_rf!(certs) end)
+    %{certs: certs}
+  end
+
+  setup %{certs: certs} do
+    dir = Path.join(System.tmp_dir!(), "origin-parity-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(dir)
+    on_exit(fn -> File.rm_rf!(dir) end)
+
+    server =
+      start_supervised!(
+        {Server,
+         store_path: Path.join(dir, "relay.sqlite3"),
+         certfile: Path.join(certs, "server.pem"),
+         keyfile: Path.join(certs, "server.key"),
+         cacertfile: Path.join(certs, "ca.pem"),
+         port: 0,
+         enrollment_enabled: false,
+         ip: {127, 0, 0, 1}}
+      )
+
+    relay = Server.relay(server)
+    owner_der = TLSFixtures.certificate_der!(certs, "parity-owner")
+    assert {:ok, person} = Relay.operator_bootstrap(relay, owner_der)
+    assert {:ok, owner} = DeviceIdentity.from_certificate(owner_der)
+    assert :ok = Relay.setup_person(relay, "B")
+
+    keys =
+      Map.new([{@origin, person}, {"a2", person}, {"b1", "B"}], fn {name, account} ->
+        der = TLSFixtures.certificate_der!(certs, name)
+        assert {:ok, key} = Relay.setup_device_certificate(relay, account, der)
+        {name, key}
+      end)
+
+    assert :ok = Relay.setup_sender(relay, keys[@origin], "app:test")
+    assert :ok = Relay.setup_sender(relay, keys["b1"], "app:test")
+
+    %{
+      relay: relay,
+      person: person,
+      owner: owner,
+      keys: keys,
+      port: Server.port(server),
+      certs: certs
+    }
+  end
+
+  test "a send naming a sender the key is not granted is forbidden and stores nothing", ctx do
+    refused = send_message(ctx, @origin, 1, %{}, "app:ungranted")
+    assert_error(refused, 403, "forbidden")
+    assert messages(ctx) == []
+
+    # A sender granted to another account's key does not authorize this one.
+    assert :ok = Relay.setup_sender(ctx.relay, ctx.keys[@origin], "app:a-only")
+    assert_error(send_message(ctx, "b1", 2, %{}, "app:a-only"), 403, "forbidden")
+
+    sent = send_message(ctx, @origin, 3)
+    assert sent.status == 200
+    assert [{_person, "app:test", _id}] = messages(ctx)
+  end
+
+  test "an attached upload is readable within its account and not_found to another person",
+       ctx do
+    data = "upload-tier attachment bytes"
+    upload = upload(ctx, @origin, 1, data)
+    assert upload.status == 201
+    handle = decode(upload)["file_id"]
+
+    sent = send_message(ctx, @origin, 2, %{"file_ids" => [handle]})
+    assert sent.status == 200, sent.body
+    assert %{"message" => %{"files" => [%{"file_id" => download}]}} = decode(sent)
+    path = "/v2/files/" <> download
+
+    for name <- [@origin, "a2"] do
+      file = get(ctx, name, path)
+      assert file.status == 200
+      assert file.body == data
+    end
+
+    assert_error(get(ctx, "b1", path), 404, "not_found")
+    assert_error(get(ctx, "b1", "/v2/files/" <> handle), 404, "not_found")
+  end
+
+  test "the origin reads the exact person answer, choice and no comment, and an agent answer",
+       ctx do
+    actions = %{
+      "schema" => "attention-client.actions/1",
+      "actions" => [
+        %{"id" => "approve", "label" => "Approve", "kind" => "value", "value" => "approved"}
+      ]
+    }
+
+    text = "Exact person answer: \"quoted\" ✓"
+    comment = item_id(send_message(ctx, @origin, 1))
+    choice = item_id(send_message(ctx, @origin, 2, %{}, "app:test", %{"answer_ui" => actions}))
+    no_comment = item_id(send_message(ctx, @origin, 3))
+    by_agent = item_id(send_message(ctx, @origin, 4))
+
+    for {id, body, n} <- [
+          {comment, %{"comment" => text}, 5},
+          {choice, %{"choice" => "approve"}, 6},
+          {no_comment, %{}, 7}
+        ] do
+      answer =
+        request(ctx, "a2", "POST", answer_path(id), Map.put(body, "request_revision", 1), n)
+
+      assert answer.status == 200
+    end
+
+    register_agent(ctx)
+    agent_body = %{"request_revision" => 1, "comment" => "Agent answer"}
+    answered = request(ctx, "parity-agent", "POST", answer_path(by_agent), agent_body, 8)
+    assert answered.status == 200
+
+    assert %{
+             "state" => "answered",
+             "answer" => ^text,
+             "outcome" => %{"kind" => "reply", "text" => ^text}
+           } = person_terminal = origin_terminal(ctx, comment)
+
+    assert %{
+             "state" => "answered",
+             "answer" => "approved",
+             "outcome" => %{"kind" => "choice", "id" => "approve", "label" => "Approve"}
+           } = origin_terminal(ctx, choice)
+
+    assert %{"state" => "answered", "outcome" => %{"kind" => "no_comment"}} =
+             no_comment_terminal = origin_terminal(ctx, no_comment)
+
+    refute Map.has_key?(no_comment_terminal, "answer")
+
+    # The agent's answer reaches the origin as its text. Only a person's answer
+    # carries the origin's delivery facts.
+    assert %{
+             "state" => "answered",
+             "answer" => "Agent answer",
+             "outcome" => %{"kind" => "reply", "text" => "Agent answer"}
+           } = agent_terminal = origin_terminal(ctx, by_agent)
+
+    assert Map.has_key?(person_terminal, "delivery")
+    refute Map.has_key?(agent_terminal, "delivery")
+  end
+
+  test "simultaneous agent feeds of one key each receive a change and close independently",
+       ctx do
+    id = item_id(send_message(ctx, @origin, 1))
+    head = agent_head(ctx)
+    {first, first_feed} = open_agent_feed(ctx, head)
+    {second, second_feed} = open_agent_feed(ctx, head)
+
+    assert person_reply(ctx, id, 2).status == 200
+    {first, _first_feed, change} = next_change(first, first_feed)
+    {second, second_feed, same} = next_change(second, second_feed)
+    assert change.id > head
+    assert same == change
+
+    Mint.HTTP.close(first)
+    assert person_reply(ctx, id, 3).status == 200
+    {second, _second_feed, later} = next_change(second, second_feed)
+    assert later.id > change.id
+    Mint.HTTP.close(second)
+  end
+
+  test "owner revocation closes every agent feed of the origin key and refuses new TLS", ctx do
+    item_id(send_message(ctx, @origin, 1))
+    head = agent_head(ctx)
+    feeds = for _ <- 1..2, do: open_agent_feed(ctx, head)
+
+    assert :ok = Relay.owner_revoke_device(ctx.relay, ctx.person, ctx.owner, ctx.keys[@origin])
+
+    for {conn, feed} <- feeds do
+      {conn, feed, closing} = ClientAPIFeedClient.until_closing(conn, feed)
+      assert closing == %{event: "closing", data: %{"reason" => "revoked"}}
+      assert {_conn, %{done: true}} = ClientAPIFeedClient.drain(conn, feed)
+    end
+
+    assert tls_refused?(ctx, @origin)
+    assert get(ctx, "a2", "/v2/inbox").status == 200
+  end
+
+  defp register_agent(ctx) do
+    der = TLSFixtures.certificate_der!(ctx.certs, "parity-agent")
+    assert {:ok, agent} = DeviceIdentity.from_certificate(der)
+    assert :ok = Relay.owner_register_agent(ctx.relay, ctx.person, ctx.owner, @agent_id, agent)
+
+    assert :ok =
+             Relay.owner_replace_agent_grants(
+               ctx.relay,
+               ctx.person,
+               ctx.owner,
+               agent,
+               1,
+               ["app:test"],
+               ["app:test"]
+             )
+  end
+
+  defp messages(ctx), do: Map.keys(:sys.get_state(ctx.relay).store.engine.messages)
+
+  defp send_message(ctx, name, n, extra \\ %{}, sender \\ "app:test", content \\ %{}) do
+    message = Map.merge(%{"title" => "Message #{n}", "created_at" => n}, content)
+    body = Map.merge(%{"sender" => sender, "session" => @session, "message" => message}, extra)
+    request(ctx, name, "POST", "/v2/agent/messages", body, n)
+  end
+
+  defp item_id(response) do
+    assert response.status == 200
+    decode(response)["message"]["item_id"]
+  end
+
+  defp answer_path(id), do: "/v2/items/" <> id <> "/answer"
+
+  defp origin_terminal(ctx, id) do
+    response = get(ctx, @origin, "/v2/agent/messages/" <> id)
+    assert response.status == 200
+    decode(response)["message"]["terminal"]
+  end
+
+  defp person_reply(ctx, id, n),
+    do: request(ctx, "a2", "POST", "/v2/items/" <> id <> "/replies", %{"text" => "Turn #{n}"}, n)
+
+  defp agent_head(ctx) do
+    store = :sys.get_state(ctx.relay).store
+    assert {:ok, head} = AgentChangeLog.head(store, {ctx.person, ctx.keys[@origin]})
+    head
+  end
+
+  defp open_agent_feed(ctx, head) do
+    conn = ClientAPIFeedClient.connect(ctx.port, ctx.certs, @origin)
+    path = "/v2/agent/changes?after=#{head}"
+
+    assert {:ok, conn, ref} =
+             Mint.HTTP.request(conn, "GET", path, [{"accept", "text/event-stream"}], nil)
+
+    feed = %{ref: ref, buffer: "", status: nil, headers: [], done: false}
+    {conn, feed} = ClientAPIFeedClient.await_open(conn, feed)
+    assert feed.status == 200
+    {conn, feed}
+  end
+
+  defp next_change(conn, feed) do
+    case ClientAPIFeedClient.events(conn, feed, 1) do
+      {conn, feed, [%{id: _} = event]} -> {conn, feed, event}
+      {conn, feed, [_heartbeat_or_focus]} -> next_change(conn, feed)
+    end
+  end
+
+  defp upload(ctx, name, n, data) do
+    headers = [
+      {"content-type", "text/plain"},
+      {"content-length", Integer.to_string(byte_size(data))},
+      {"content-disposition", "attachment; filename*=UTF-8''fixture.txt"},
+      {"idempotency-key", op(n)}
+    ]
+
+    conn = ClientAPIFeedClient.connect(ctx.port, ctx.certs, name)
+    assert {:ok, conn, ref} = Mint.HTTP.request(conn, "POST", "/v2/files", headers, data)
+    {conn, response} = ClientAPIFeedClient.collect(conn, ref)
+    Mint.HTTP.close(conn)
+    response
+  end
+
+  defp request(ctx, name, method, path, body, n) do
+    headers = [{"content-type", "application/json"}, {"idempotency-key", op(n)}]
+    conn = ClientAPIFeedClient.connect(ctx.port, ctx.certs, name)
+    assert {:ok, conn, ref} = Mint.HTTP.request(conn, method, path, headers, JSON.encode!(body))
+    {conn, response} = ClientAPIFeedClient.collect(conn, ref)
+    Mint.HTTP.close(conn)
+    response
+  end
+
+  defp get(ctx, name, path) do
+    conn = ClientAPIFeedClient.connect(ctx.port, ctx.certs, name)
+    assert {:ok, conn, ref} = Mint.HTTP.request(conn, "GET", path, [], nil)
+    {conn, response} = ClientAPIFeedClient.collect(conn, ref)
+    Mint.HTTP.close(conn)
+    response
+  end
+
+  # A TLS 1.3 client may finish its side of the handshake before the server
+  # rejects the certificate, so refusal shows on connect or on the first read.
+  defp tls_refused?(ctx, name) do
+    capture_log(fn ->
+      result =
+        case Mint.HTTP.connect(:https, "127.0.0.1", ctx.port,
+               hostname: "relay.test",
+               protocols: [:http2],
+               mode: :passive,
+               transport_opts: [
+                 versions: [:"tlsv1.3"],
+                 cacertfile: Path.join(ctx.certs, "ca.pem"),
+                 certfile: Path.join(ctx.certs, "#{name}.pem"),
+                 keyfile: Path.join(ctx.certs, "#{name}.key"),
+                 server_name_indication: ~c"relay.test",
+                 timeout: 5_000
+               ]
+             ) do
+          {:error, _} ->
+            true
+
+          {:ok, conn} ->
+            case Mint.HTTP.request(conn, "GET", "/v2/me", [], nil) do
+              {:error, _, _} ->
+                true
+
+              {:ok, conn, _ref} ->
+                match?({:error, _, _, _}, Mint.HTTP.recv(conn, 0, 5_000))
+            end
+        end
+
+      send(self(), {:tls_refused, result})
+    end)
+
+    assert_received {:tls_refused, result}
+    result
+  end
+
+  defp assert_error(response, status, token) do
+    assert response.status == status
+    assert %{"error" => ^token} = decode(response)
+  end
+
+  defp decode(response) do
+    assert {:ok, body} = JSON.decode_line(response.body <> "\n")
+    body
+  end
+
+  defp op(n), do: "00000000-0000-4000-8000-#{String.pad_leading(Integer.to_string(n), 12, "0")}"
+end

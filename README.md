@@ -185,11 +185,8 @@ The existing informational Seen value action and request Reply controls pass
 through unchanged. Receiving-client ordering, styling and controls depend on
 the installed client; upgrading the server alone does not establish those UI changes.
 
-The origin API also supports a receipt-backed attachment update for an existing
-session handle. It stores or clears the provider session identifier on that same
-origin session; it does not transfer a session to another device or server, or
-prove that the provider session remains active. The conversation CLI is released
-separately and is not included in this server package.
+The conversation CLI is released separately and is not included in this server
+package.
 
 ## No comment and client compatibility
 
@@ -237,7 +234,9 @@ they do not establish real-device notification delivery.
 
 The existing runtime identifiers remain supported: Mix app `:attention_server`,
 namespace `AttentionServer`, `ATTENTION_SERVER_*` variables, `mix attention.*`,
-`bin/attention_server`, `/relay`, `attention-relay/1` and `/agent/v1`. Durable
+`bin/attention_server`, `/relay` and `attention-relay/1`. The protocol 0.1
+agent (`/agent/v1`) and origin (`/origin/v1`) listeners are retired; registered
+agents and the conversation CLI use client API v2 on the device port. Durable
 messages and operation receipts preserve first acceptance and exact retry
 semantics across restart. Tailnet access alone grants no person or sender rights.
 

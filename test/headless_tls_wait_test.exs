@@ -65,9 +65,9 @@ defmodule AttentionServer.HeadlessTLSWaitTest do
     Task.await(server, @delay_ms + 10_000)
   end
 
-  test "an agent HTTPS request receives a response that arrives after several seconds",
+  test "a client API v2 request receives a response that arrives after several seconds",
        %{certs: certs} do
-    body = ~s({"type":"ok","v":1})
+    body = ~s({"items":[]})
 
     {endpoint, server} =
       slow_server(
@@ -76,12 +76,11 @@ defmodule AttentionServer.HeadlessTLSWaitTest do
           "Content-Length: #{byte_size(body)}\r\nConnection: close\r\n\r\n" <> body
       )
 
-    assert {:ok, 200, %{"type" => "ok"}} =
-             HeadlessTLS.agent_https_request(
+    assert {:ok, 200, %{"items" => []}} =
+             HeadlessTLS.v2_get(
                endpoint,
-               Path.join(certs, "a1.pem"),
-               Path.join(certs, "a1.key"),
-               %{"type" => "search"}
+               {Path.join(certs, "a1.pem"), Path.join(certs, "a1.key")},
+               "/v2/search"
              )
 
     Task.await(server, @delay_ms + 10_000)

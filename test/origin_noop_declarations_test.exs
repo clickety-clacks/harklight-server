@@ -5,7 +5,7 @@ defmodule AttentionServer.OriginNoopDeclarationsTest do
   # declaration commits exactly as before, and retries stay coherent.
   use ExUnit.Case, async: false
 
-  alias AttentionServer.{JSON, OriginWire, Relay}
+  alias AttentionServer.{JSON, LegacyOriginWire, Relay}
 
   @handle "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
   defp op(n), do: "00000000-0000-4000-8000-#{String.pad_leading(to_string(n), 12, "0")}"
@@ -43,7 +43,7 @@ defmodule AttentionServer.OriginNoopDeclarationsTest do
   end
 
   defp support(relay, n, ack2) do
-    OriginWire.command(relay, "origin", %{
+    LegacyOriginWire.command(relay, "origin", %{
       "v" => 1,
       "type" => "support",
       "op_id" => op(n),
@@ -56,7 +56,7 @@ defmodule AttentionServer.OriginNoopDeclarationsTest do
   end
 
   defp attachment(relay, n, vendor, support \\ %{}) do
-    OriginWire.command(
+    LegacyOriginWire.command(
       relay,
       "origin",
       Map.merge(

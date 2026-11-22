@@ -181,32 +181,10 @@ defmodule AttentionServer.TLSRelayTest do
   end
 
   @tag :writer_isolation
-  test "a non-reading TLS peer does not delay another device or agent traffic", ctx do
+  test "a non-reading TLS peer does not delay another device's traffic", ctx do
     {peer, id, _socket, blocked, _writer} = blocked_session(ctx)
     {:ok, healthy} = connect(ctx.tls, ctx.certs, "b1")
     assert {[], %{"seq" => 0}} = resync(healthy)
-
-    {:ok, agent_key} =
-      DeviceIdentity.from_certificate(TLSFixtures.certificate_der!(ctx.certs, "unknown"))
-
-    assert :ok = Relay.setup_agent_fixture(ctx.relay, "B", op(703), agent_key, ["app:test"])
-    assert {:ok, "B", agent_id, _revision} = Relay.agent_identity(ctx.relay, agent_key)
-
-    {:ok, agent} =
-      AttentionServer.AgentTLS.start_link(
-        relay: ctx.relay,
-        certfile: Path.join(ctx.certs, "server.pem"),
-        keyfile: Path.join(ctx.certs, "server.key"),
-        cacertfile: Path.join(ctx.certs, "ca.pem")
-      )
-
-    on_exit(fn -> if Process.alive?(agent), do: GenServer.stop(agent) end)
-    {:ok, agent_peer} = connect(agent, ctx.certs, "unknown")
-    assert :ok = send_frame(agent_peer, %{"type" => "search"})
-    assert %{"type" => "search_result", "items" => []} = read_frame(agent_peer)
-    :ssl.close(agent_peer)
-
-    assert agent_id == op(703)
 
     assert %{"type" => "ok", "seq" => 1} =
              stored_request(ctx.relay, ctx.keys["b1"], %{

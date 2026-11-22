@@ -60,8 +60,6 @@ defmodule AttentionServer.ClientAPIDefaultStartupTest do
           port: 0,
           enroll_port: 0,
           owner_port: 0,
-          agent_port: 0,
-          origin_port: 0,
           join_name: "relay.test",
           dashboard: [
             port: dashboard_port,
@@ -110,8 +108,6 @@ defmodule AttentionServer.ClientAPIDefaultStartupTest do
       refute child?(ctx.server, :web_socket)
 
       assert Server.owner_port(ctx.server) > 0
-      assert Server.agent_port(ctx.server) > 0
-      assert Server.origin_port(ctx.server) > 0
       assert Server.enroll_port(ctx.server) > 0
 
       store = :sys.get_state(ctx.relay).store

@@ -19,16 +19,13 @@ defmodule AttentionServer.EnrolledLeafVerify do
        nil}
 
   # Retained exact SPKI admits only the enrollment listener's own-device cleanup.
-  # Revoked devices remain forbidden on every relay/owner/agent interface.
+  # Revoked devices remain forbidden on every device, owner and client API interface.
   def removal(relay),
     do:
       {fn _certificate, der, event, state -> verify(relay, :removal, der, event, state) end, nil}
 
   def owner(relay),
     do: {fn _certificate, der, event, state -> verify(relay, :owner, der, event, state) end, nil}
-
-  def agent(relay),
-    do: {fn _certificate, der, event, state -> verify(relay, :agent, der, event, state) end, nil}
 
   defp verify(relay, kind, der, {:bad_cert, :selfsigned_peer}, state) do
     with {:ok, key} <- DeviceIdentity.from_certificate(der),

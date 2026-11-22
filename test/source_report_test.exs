@@ -1,7 +1,7 @@
 defmodule AttentionServer.SourceReportTest do
   use ExUnit.Case, async: false
 
-  alias AttentionServer.{Engine, JSON, OriginWire, Relay, Store}
+  alias AttentionServer.{Engine, JSON, LegacyOriginWire, Relay, Store}
   alias Exqlite.Sqlite3
 
   setup do
@@ -33,7 +33,7 @@ defmodule AttentionServer.SourceReportTest do
         (n |> Integer.to_string(16) |> String.downcase() |> String.pad_leading(12, "0"))
 
   defp send_origin(relay, key, operation_id, value) do
-    OriginWire.command(relay, key, %{
+    LegacyOriginWire.command(relay, key, %{
       "v" => 1,
       "type" => "send",
       "op_id" => operation_id,

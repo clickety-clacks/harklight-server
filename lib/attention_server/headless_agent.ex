@@ -1,7 +1,7 @@
 defmodule AttentionServer.HeadlessAgent do
-  @moduledoc "Local service-key generation and one-request authenticated agent client."
+  @moduledoc "Local agent service-key generation and certificate fingerprints."
 
-  alias AttentionServer.{DeviceIdentity, HeadlessTLS}
+  alias AttentionServer.DeviceIdentity
 
   def create_identity(directory) when is_binary(directory) do
     with :ok <- File.mkdir(directory),
@@ -24,42 +24,6 @@ defmodule AttentionServer.HeadlessAgent do
       {:ok, fingerprint}
     else
       _ -> {:error, :invalid_certificate}
-    end
-  end
-
-  def request(directory, endpoint, request) do
-    certificate = Path.join(directory, "identity.pem")
-    key = Path.join(directory, "identity.key")
-
-    with {:ok, _fingerprint} <- fingerprint(certificate) do
-      wire =
-        request
-        |> Map.put("v", 1)
-        |> then(fn fields ->
-          if fields["type"] == "answer", do: Map.put(fields, "type", "respond"), else: fields
-        end)
-        |> then(fn fields ->
-          if Map.has_key?(fields, "contains"),
-            do: fields |> Map.put("text", fields["contains"]) |> Map.delete("contains"),
-            else: fields
-        end)
-
-      case HeadlessTLS.agent_https_request(endpoint, certificate, key, wire) do
-        {:ok, 200, %{"type" => "ok"} = response} ->
-          {:ok, response}
-
-        {:ok, 200, %{"type" => "error", "reason" => reason} = response} ->
-          {:error, {:application, reason, response}}
-
-        {:ok, 200, _} ->
-          {:error, :invalid_server_response}
-
-        {:ok, status, response} ->
-          {:error, {:http, status, response}}
-
-        error ->
-          error
-      end
     end
   end
 

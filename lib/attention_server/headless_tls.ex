@@ -9,8 +9,8 @@ defmodule AttentionServer.HeadlessTLS do
   alias AttentionServer.JSON
 
   @max_http 64 * 1024
-  # Agent replies carry whole messages; the page size stops at 4 MiB only after
-  # its first item, so one large message can exceed any small fixed size.
+  # v2 replies can carry whole messages, so one large message can exceed any
+  # small fixed size.
   @max_agent_http 64 * 1024 * 1024
 
   def certificate_lifecycle(certificate) do
@@ -112,46 +112,6 @@ defmodule AttentionServer.HeadlessTLS do
     end
   end
 
-  @doc "One authenticated agent request with a bounded JSON response."
-  def agent_request(endpoint, certificate, key, request) do
-    with {:ok, socket} <- connect(endpoint, {certificate, key}) do
-      try do
-        with :ok <- :ssl.send(socket, JSON.encode!(request) <> "\n"),
-             {:ok, line} <- read_agent_line(socket, <<>>),
-             {:ok, response} <- JSON.decode_line(line, 6 * 1024 * 1024) do
-          {:ok, response}
-        end
-      after
-        :ssl.close(socket)
-      end
-    end
-  end
-
-  @doc "One mutual-TLS G6 HTTPS request. The HTTP code is separate from application success."
-  def agent_https_request(endpoint, certificate, key, request) do
-    body = JSON.encode!(request)
-
-    with {:ok, socket} <- connect(endpoint, {certificate, key}) do
-      try do
-        with :ok <-
-               :ssl.send(socket, [
-                 "POST /agent/v1 HTTP/1.1\r\n",
-                 "Host: #{endpoint.name}\r\n",
-                 "Content-Type: application/json; charset=utf-8\r\n",
-                 "Content-Length: #{byte_size(body)}\r\n",
-                 "Connection: close\r\n\r\n",
-                 body
-               ]),
-             {:ok, response} <- read_http(socket, <<>>, @max_agent_http),
-             {:ok, status, value} <- decode_http(response, @max_agent_http) do
-          {:ok, status, value}
-        end
-      after
-        :ssl.close(socket)
-      end
-    end
-  end
-
   @doc """
   One mutual-TLS client API v2 `GET` over HTTP/1.1 with the device identity.
   Returns the HTTP status and the decoded JSON body; the status is separate
@@ -238,25 +198,6 @@ defmodule AttentionServer.HeadlessTLS do
 
       {:error, _conn, reason, _responses} ->
         {:error, reason}
-    end
-  end
-
-  defp read_agent_line(_socket, bytes) when byte_size(bytes) > 6 * 1024 * 1024,
-    do: {:error, :response_too_large}
-
-  defp read_agent_line(socket, bytes) do
-    case :binary.match(bytes, "\n") do
-      {index, 1} when index == byte_size(bytes) - 1 ->
-        {:ok, bytes}
-
-      {_, 1} ->
-        {:error, :invalid_response}
-
-      :nomatch ->
-        case :ssl.recv(socket, 0, :infinity) do
-          {:ok, chunk} -> read_agent_line(socket, bytes <> chunk)
-          error -> error
-        end
     end
   end
 

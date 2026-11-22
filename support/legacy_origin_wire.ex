@@ -1,7 +1,12 @@
-defmodule AttentionServer.OriginWire do
+defmodule AttentionServer.LegacyOriginWire do
   @moduledoc """
-  JSON command mapping for the certificate-authenticated request origin.
-  Caller identity comes only from TLS; a session handle routes, never authorizes.
+  Test driver for the retired protocol 0.1 origin command mapping.
+
+  The `/origin/v1` listener is gone; client API v2 is the only origin
+  transport. Mixed tests that still drive Relay's dormant origin entry points
+  call `command/3` and `browser_command/4` with a trusted key in place of a
+  TLS peer. Remove this module with those Relay entry points and the tests
+  that use it.
   """
 
   alias AttentionServer.{Diagnostics, JSON, Message, Relay}
@@ -385,48 +390,6 @@ defmodule AttentionServer.OriginWire do
     %{"v" => 1, "type" => "error", "reason" => reason}
     |> then(fn value -> if field, do: Map.put(value, "field", field), else: value end)
     |> maybe_ref(ref)
-  end
-
-  def http_response(status, value) do
-    body = JSON.encode!(value)
-
-    response(response_status(status, value), body, byte_size(body))
-  end
-
-  @doc false
-  def send_http_response(socket, status, value) do
-    size = JSON.encoded_size(value)
-    header = response(response_status(status, value), nil, size)
-
-    with :ok <- :ssl.send(socket, header) do
-      JSON.send_stream(socket, value)
-    end
-  end
-
-  defp response_status(200, %{"type" => "error", "reason" => "storage_unavailable"}), do: 503
-  defp response_status(status, _value), do: status
-
-  defp response(status, body, size) do
-    reason =
-      case status do
-        200 -> "OK"
-        400 -> "Bad Request"
-        403 -> "Forbidden"
-        404 -> "Not Found"
-        405 -> "Method Not Allowed"
-        409 -> "Conflict"
-        413 -> "Content Too Large"
-        503 -> "Service Unavailable"
-      end
-
-    [
-      "HTTP/1.1 #{status} #{reason}\r\n",
-      "Content-Type: application/json; charset=utf-8\r\n",
-      "Content-Length: #{size}\r\n",
-      "Cache-Control: no-store\r\n",
-      "Connection: close\r\n\r\n",
-      body || []
-    ]
   end
 
   defp maybe_ref(value, nil), do: value

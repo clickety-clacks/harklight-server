@@ -28,9 +28,6 @@ defmodule AttentionServer.SessionWriter do
     end)
   end
 
-  defp write(socket, {:raw, {:http, status, reply}}),
-    do: AttentionServer.AgentWire.send_http_response(socket, status, reply)
-
   defp write(socket, {:websocket, %AttentionServer.JSON.StreamedLine{} = line}),
     do: AttentionServer.WebSocketRelay.send_text_stream(socket, line)
 
