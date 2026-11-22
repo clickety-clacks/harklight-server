@@ -859,7 +859,7 @@ visible text. Its `attention` member changes:
 | `precondition_failed` | 412 | false | `If-Match` does not match. Also a superseded push `revision` (`stale_push_binding`). |
 | `cursor_expired` | 410 | false | `after` is older than retention |
 | `payload_too_large` | 413 | false | Body or file over the limit (`too_large`, `upload_cap_exceeded`) |
-| `unsupported` | 400 | false | The server does not serve this here: push with push disabled, or a reply, answer receipt or agent result on an item with no agent conversation |
+| `unsupported` | 400 | false | The server does not serve this here: push with push disabled, or a reply, answer receipt or agent result on an item with no agent conversation, or an answer receipt or agent result after a registered agent's answer |
 | `internal_error` | 500 | false | An unexpected server fault during request handling, projection, or rendering. Includes `Request-Id` and has no `Retry-After`. |
 | `retry_later` | 503 | true | Load shedding, with `Retry-After` |
 | `storage_unavailable` | 503 | true | The store could not commit, with `Retry-After` |
@@ -1411,7 +1411,10 @@ Writes return 200 unless the table says otherwise. Each response schema requires
 - **Result.** Applies to the current answer of a message with a session.
   A sessionless message answers `400 unsupported` before the answer-state
   check. Before an answer a session-bound item returns
-  `409 not_answered`. `received` can advance to `applied` or `refused`.
+  `409 not_answered`. A result follows a person's answer, including No
+  comment; after an answer by a registered agent it answers
+  `400 unsupported` (addendum 8). `received` can advance to `applied` or
+  `refused`.
   The first successful result marks the person's answer acted
   (`Engine.commit_conversation_result`). A conflicting result or a
   transition after a final result returns
@@ -1423,7 +1426,9 @@ Writes return 200 unless the table says otherwise. Each response schema requires
   receipt targets a person-authored chat turn of that item. A sessionless
   message answers `400 unsupported` before the answer-state check.
   An item with a session but without an answer gets `409 not_answered`
-  on its message receipt. Recording a handoff ensures Delivered first
+  on its message receipt; after an answer by a registered agent the message
+  receipt answers `400 unsupported`, as a receipt follows a person's answer
+  (addendum 8). Recording a handoff ensures Delivered first
   (`Engine.origin_ack2`). `not_handed`
   requires a non-blank reason and may advance to `handed`. A handoff
   already recorded as `handed` stays handed. The optional `agent` is

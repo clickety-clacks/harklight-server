@@ -1105,6 +1105,87 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
       end
     end
 
+    test "after a registered agent's answer the sender's receipt and result are unsupported",
+         ctx do
+      der = fn name -> TLSFixtures.certificate_der!(ctx.certs, name) end
+
+      for name <- ~w(ga-owner ga-sender ga-agent),
+          do: TLSFixtures.make_self_signed_client!(ctx.certs, name)
+
+      {:ok, person} = Relay.operator_bootstrap(ctx.relay, der.("ga-owner"))
+      {:ok, owner} = AttentionServer.DeviceIdentity.from_certificate(der.("ga-owner"))
+      {:ok, sender} = Relay.setup_device_certificate(ctx.relay, person, der.("ga-sender"))
+      assert :ok = Relay.setup_sender(ctx.relay, sender, "app:test")
+      {:ok, agent} = AttentionServer.DeviceIdentity.from_certificate(der.("ga-agent"))
+
+      assert :ok =
+               Relay.owner_register_agent(
+                 ctx.relay,
+                 person,
+                 owner,
+                 "00000000-0000-4000-8000-0000000000a1",
+                 agent
+               )
+
+      assert :ok =
+               Relay.owner_replace_agent_grants(
+                 ctx.relay,
+                 person,
+                 owner,
+                 agent,
+                 1,
+                 ["app:test"],
+                 [
+                   "app:test"
+                 ]
+               )
+
+      line =
+        JSON.encode!(%{
+          "v" => 1,
+          "type" => "forward",
+          "op_id" => op(21),
+          "session_handle" => @first_session,
+          "message" => %{
+            "sender_id" => "app:test",
+            "message_id" => "granted-answer",
+            "title" => "Granted",
+            "created_at" => 21
+          }
+        }) <> "\n"
+
+      assert {:ok, reply} = Relay.request_line(ctx.relay, sender, line)
+      assert {:ok, %{"type" => "ok", "seq" => seq}} = JSON.decode_line(reply)
+      id = Resources.item_id(%{accepted_seq: seq})
+
+      answer =
+        request(
+          ctx,
+          "ga-agent",
+          "POST",
+          "/v2/items/" <> id <> "/answer",
+          %{"request_revision" => 1},
+          22
+        )
+
+      assert answer.status == 200
+      path = "/v2/agent/messages/" <> id
+
+      # The item is answered, so not_answered does not apply; a receipt and a
+      # result follow only a person's answer (contract addendum 8).
+      assert_error(
+        request(ctx, "ga-sender", "POST", path <> "/receipt", %{"outcome" => "handed"}, 23),
+        400,
+        "unsupported"
+      )
+
+      assert_error(
+        request(ctx, "ga-sender", "POST", path <> "/result", %{"status" => "received"}, 24),
+        400,
+        "unsupported"
+      )
+    end
+
     test "answer receipt ensures delivery and a result marks the answer acted", ctx do
       id = forward(ctx, "a1", 1, @first_session)
       item = "/v2/agent/messages/" <> id
