@@ -158,9 +158,9 @@ defmodule AttentionServer.ConversationFeedTest do
     feed.entries |> Enum.sort() |> Enum.map(fn {_seq, entry} -> entry end)
   end
 
-  # A device's ordinary-feed ACK, as a 0.1 session stored it.
+  # A device's ordinary-feed ACK, as a 0.1 session stored it: its cursor.
   defp acknowledge(store, key, seq) do
-    {:ok, engine, _reply} = Engine.acknowledge(store.engine, key, seq, seq)
+    engine = %{store.engine | cursors: Map.put(store.engine.cursors, {"A", key}, seq)}
     {:ok, store} = Store.commit(store, engine, %{person: "A", actor: key, action: "cursor_ack"})
     store
   end

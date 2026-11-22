@@ -420,7 +420,7 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
 
     :sys.replace_state(ctx.relay, fn state ->
       {engine, positions} =
-        AttentionServer.Engine.retain_reply_scores(state.store.engine, "A", [reply], true)
+        AttentionServer.Engine.retain_reply_scores(state.store.engine, "A", [reply])
 
       assert {:ok, store} =
                AttentionServer.Store.commit(

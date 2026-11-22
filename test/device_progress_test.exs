@@ -47,8 +47,9 @@ defmodule AttentionServer.DeviceProgressTest do
 
   # Protocol 0.1 sessions no longer acknowledge progress through the Relay. A
   # cold Relay start and its replay reads leave the FORMAT29 snapshot alone,
-  # and the stored progress writer (opens and every ACK) still commits beside
-  # the snapshot, survives restart and folds into it on the next mutation.
+  # and the stored progress writer (opens and every cursor a 0.1 session
+  # stored) still commits beside the snapshot, survives restart and folds into
+  # it on the next mutation.
   test "cold replay and every ACK preserve the FORMAT29 snapshot and survive restart", %{
     path: path
   } do
@@ -75,25 +76,14 @@ defmodule AttentionServer.DeviceProgressTest do
 
     store =
       Enum.reduce(1..8, store, fn n, store ->
-        assert {:ok, next, %{"seq" => ^n}} = Engine.acknowledge(store.engine, "reader", n, 8)
-        {:ok, store} = Store.commit(store, next, audit())
-
-        assert {:ok, next, %{"conversation_seq" => ^n}} =
-                 Engine.acknowledge_conversation(store.engine, "reader", n, 8)
-
-        {:ok, store} = Store.commit(store, next, audit())
+        {:ok, store} = Store.commit(store, cursor(store.engine, n), audit())
+        {:ok, store} = Store.commit(store, conversation_cursor(store.engine, n), audit())
         store
       end)
 
     version = store.progress_version
-    {:ok, same, _} = Engine.acknowledge_conversation(store.engine, "reader", 8, 8)
-    {:ok, store} = Store.commit(store, same, audit())
+    {:ok, store} = Store.commit(store, conversation_cursor(store.engine, 8), audit())
     assert store.progress_version == version
-
-    for n <- [7, 9] do
-      assert {:error, :invalid_cursor} =
-               Engine.acknowledge_conversation(store.engine, "reader", n, 8)
-    end
 
     Store.close(store)
     assert snapshot(path) == before
@@ -119,9 +109,8 @@ defmodule AttentionServer.DeviceProgressTest do
   test "stale ACK and full-snapshot writers cannot overwrite accepted progress", %{path: path} do
     {:ok, first} = Store.open(path)
     {:ok, stale} = Store.open(path)
-    {:ok, next, _} = Engine.acknowledge_conversation(first.engine, "reader", 4, 8)
-    assert {:ok, accepted} = Store.commit(first, next, audit())
-    {:ok, late, _} = Engine.acknowledge_conversation(stale.engine, "reader", 3, 8)
+    assert {:ok, accepted} = Store.commit(first, conversation_cursor(first.engine, 4), audit())
+    late = conversation_cursor(stale.engine, 3)
     assert {:error, :storage_unavailable, _} = Store.commit(stale, late, audit())
     {:ok, full} = Engine.setup_sender(stale.engine, "origin", "app:late")
     assert {:error, :storage_unavailable, _} = Store.commit(stale, full, audit())
@@ -141,7 +130,7 @@ defmodule AttentionServer.DeviceProgressTest do
         "CREATE TRIGGER reject_progress BEFORE INSERT ON relay_device_progress BEGIN SELECT RAISE(ABORT, 'test failure'); END"
       )
 
-    {:ok, next, _} = Engine.acknowledge_conversation(store.engine, "reader", 4, 8)
+    next = conversation_cursor(store.engine, 4)
     assert {:error, :storage_unavailable, _} = Store.commit(store, next, audit())
     Store.close(store)
     {:ok, reopened} = Store.open(path)
@@ -153,8 +142,7 @@ defmodule AttentionServer.DeviceProgressTest do
     path: path
   } do
     {:ok, store} = Store.open(path)
-    {:ok, next, _} = Engine.acknowledge_conversation(store.engine, "reader", 6, 8)
-    {:ok, store} = Store.commit(store, next, audit())
+    {:ok, store} = Store.commit(store, conversation_cursor(store.engine, 6), audit())
     Store.close(store)
     as_format27(path)
 
@@ -169,16 +157,10 @@ defmodule AttentionServer.DeviceProgressTest do
     assert {:ok, 6} = RelayReaders.conversation_cursor(restarted, "reader")
     GenServer.stop(restarted)
 
-    # The migrated cursor is the floor for later progress.
+    # Later stored progress commits on top of the migrated cursor.
     {:ok, store} = Store.open(path)
-    assert {:ok, same, _} = Engine.acknowledge_conversation(store.engine, "reader", 6, 8)
-    assert same == store.engine
-
-    assert {:error, :invalid_cursor} =
-             Engine.acknowledge_conversation(store.engine, "reader", 5, 8)
-
-    assert {:ok, next, _} = Engine.acknowledge_conversation(store.engine, "reader", 8, 8)
-    {:ok, store} = Store.commit(store, next, audit())
+    assert store.engine.conversation_cursors[{"A", "reader"}] == 6
+    {:ok, store} = Store.commit(store, conversation_cursor(store.engine, 8), audit())
     Store.close(store)
     {:ok, reopened} = Store.open(path)
     assert reopened.engine.conversation_cursors[{"A", "reader"}] == 8
@@ -187,8 +169,7 @@ defmodule AttentionServer.DeviceProgressTest do
 
   test "failed migration preserves FORMAT27 snapshot and its ACK overlay for retry", %{path: path} do
     {:ok, store} = Store.open(path)
-    {:ok, next, _} = Engine.acknowledge_conversation(store.engine, "reader", 6, 8)
-    {:ok, store} = Store.commit(store, next, audit())
+    {:ok, store} = Store.commit(store, conversation_cursor(store.engine, 6), audit())
     Store.close(store)
     as_format27(path)
     before = snapshot(path)
@@ -239,6 +220,18 @@ defmodule AttentionServer.DeviceProgressTest do
   end
 
   defp audit, do: %{person: "A", actor: "reader", action: "test"}
+
+  # The reader's ordinary-feed and conversation cursors, as a 0.1 session
+  # stored them.
+  defp cursor(engine, seq),
+    do: %{engine | cursors: Map.put(engine.cursors, {"A", "reader"}, seq)}
+
+  defp conversation_cursor(engine, seq),
+    do: %{
+      engine
+      | conversation_cursors: Map.put(engine.conversation_cursors, {"A", "reader"}, seq)
+    }
+
   defp op(n), do: "00000000-0000-4000-8000-#{String.pad_leading(Integer.to_string(n), 12, "0")}"
 
   defp apply_frame(engine, key, frame) do

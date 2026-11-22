@@ -407,7 +407,7 @@ defmodule AttentionServer.BounceDecisionTest do
     assert BounceDecision.advisory_cursor(bounced, @person, @origin, @handle) == 1
   end
 
-  test "unsupported sessions retain due work; original-session fetch and ack stay separate" do
+  test "unsupported sessions retain due work; the original session's feed and ack stay separate" do
     {engine, _record} = fixture(supported?: false)
     selected = score(engine, 0.9, 1_050)
     due_at = selection(selected)["due_at_ms"]
@@ -430,13 +430,12 @@ defmodule AttentionServer.BounceDecisionTest do
     assert bounced.origin_feeds[origin_feed_key()].high == 1
     assert bounced.events == engine.events
 
-    assert {:ok, fetched} = BounceDecision.advisory_feed(bounced, @origin, @handle, 0)
-    assert fetched["advisory_v1"]
-    assert fetched["cursor"] == 1
-    assert [entry] = fetched["entries"]
+    feed = bounced.advisory_feeds[advisory_feed_key()]
+    assert feed.high == 1
+    assert [entry] = Map.values(feed.entries)
     assert entry["advisory_seq"] == 1
     assert entry["origin_cursor_at_decision"] == 1
-    assert entry["delivered"] == false
+    refute MapSet.member?(feed.receipts, entry["advisory_id"])
 
     assert entry["text"] =~
              "Harklight has no record that you saw this message. This notice concerns revision 1, using records available at #{due_at + 50}."
@@ -448,8 +447,6 @@ defmodule AttentionServer.BounceDecisionTest do
     rebuilt = BounceDecision.rebuild_indexes(%{bounced | advisory_id_index: %{}})
 
     assert rebuilt.advisory_id_index[{advisory_feed_key(), entry["advisory_id"]}] == 1
-
-    assert {:error, :invalid_cursor} = BounceDecision.advisory_feed(bounced, @origin, @handle, 2)
 
     assert {:error, :not_found} =
              BounceDecision.advisory_ack(
@@ -470,8 +467,11 @@ defmodule AttentionServer.BounceDecisionTest do
     assert duplicate_ack["delivered"] and duplicate_ack["already_delivered"]
     assert same == acked
 
-    assert {:ok, fetched_after_ack} = BounceDecision.advisory_feed(acked, @origin, @handle, 0)
-    assert hd(fetched_after_ack["entries"])["delivered"]
+    assert MapSet.member?(
+             acked.advisory_feeds[advisory_feed_key()].receipts,
+             entry["advisory_id"]
+           )
+
     assert BounceDecision.valid_state?(acked)
   end
 

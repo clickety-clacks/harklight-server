@@ -53,17 +53,9 @@ defmodule AttentionServer.Store.Persistence do
       when is_tuple(request) and
              elem(request, 0) in [
                :cursor,
-               :conversation_cursor,
-               :device_revoked?,
                :owner_identity,
                :agent_identity,
-               :events,
-               :conversation_events,
                :owner_revision,
-               :origin_file_limits,
-               :origin_message_get,
-               :origin_advisory_feed,
-               :origin_coverage,
                :owner_list_agents,
                :dashboard_inventory,
                :dashboard_levels

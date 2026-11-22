@@ -1,15 +1,7 @@
 defmodule AttentionServer.PagingTerminalIdentityTest do
   use ExUnit.Case, async: false
 
-  alias AttentionServer.{
-    AgentAPIInProcess,
-    Engine,
-    JSON,
-    PreChangeLogStore,
-    Relay,
-    RelayReaders,
-    Store
-  }
+  alias AttentionServer.{AgentAPIInProcess, JSON, PreChangeLogStore, Relay, RelayReaders}
 
   @handle "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 
@@ -114,50 +106,9 @@ defmodule AttentionServer.PagingTerminalIdentityTest do
       end
 
       assert {:ok, [reader_terminal], 2} = RelayReaders.events(ctx.relay, "reader", 1)
-      assert {:ok, [origin_terminal], 2} = RelayReaders.events(ctx.relay, "origin", 1)
+      assert {:ok, [_origin_terminal], 2} = RelayReaders.events(ctx.relay, "origin", 1)
       assert reader_terminal["event_id"] == terminal["event_id"]
       refute Map.has_key?(reader_terminal, "answer")
-
-      engine = stored_engine(ctx)
-      assert {:ok, frozen} = Engine.inbox_item(engine, "reader", {"app:test", "terminal"}, 1)
-      refute Map.has_key?(frozen, "terminal")
-
-      for device <- ~w(origin reader second-reader) do
-        assert {:ok, page} = Engine.inbox_item(engine, device, {"app:test", "terminal"}, 2)
-        assert page["acceptance"]["event_id"] == initial["event_id"]
-        assert page["acceptance"]["request_revision"] == 1
-        expected = if device == "origin", do: origin_terminal, else: reader_terminal
-        assert page["terminal"] == expected
-      end
-
-      assert {:error, :snapshot_unavailable} =
-               Engine.inbox_item(engine, "outsider", {"app:test", "terminal"}, 2)
-
-      assert {:ok, ^origin_terminal} = Engine.inbox_receipt(engine, "origin", 2)
-      assert {:error, :snapshot_unavailable} = Engine.inbox_receipt(engine, "reader", 2)
-
-      assert {:ok, %{"terminal" => ^origin_terminal}} =
-               Engine.reconcile_operation(engine, "origin", send, 2, true)
-
-      assert {:ok, frozen_send} = Engine.reconcile_operation(engine, "origin", send, 1, true)
-      refute Map.has_key?(frozen_send, "terminal")
-
-      if kind == "answer_no_comment" do
-        # The direct operation has no wire op_id. Paging has its own correlation.
-        refute Map.has_key?(terminal_operation, "op_id")
-        reconcile = Map.put(terminal_operation, "op_id", op(4))
-
-        assert {:ok, _, %{"status" => "committed", "terminal" => ^reader_terminal}} =
-                 Engine.reconcile_no_comment(engine, "reader", reconcile)
-      else
-        expected = if terminal_actor == "origin", do: origin_terminal, else: reader_terminal
-
-        assert {:ok, %{"status" => "committed", "terminal" => ^expected}} =
-                 Engine.reconcile_operation(engine, terminal_actor, terminal_operation, 2, true)
-
-        assert {:error, :snapshot_unavailable} =
-                 Engine.reconcile_operation(engine, terminal_actor, terminal_operation, 1, true)
-      end
     end
   end
 
@@ -201,10 +152,6 @@ defmodule AttentionServer.PagingTerminalIdentityTest do
     end
 
     assert {:ok, [], 0} = RelayReaders.conversation_events(ctx.relay, "outsider", 0)
-    engine = stored_engine(ctx)
-    assert {:ok, page} = Engine.inbox_item(engine, "second-reader", {"app:test", "discussion"}, 1)
-    assert page["acceptance"]["event_id"] == "1"
-    refute Map.has_key?(page, "terminal")
   end
 
   test "unbound terminal paging does not invent conversation identity", ctx do
@@ -221,11 +168,6 @@ defmodule AttentionServer.PagingTerminalIdentityTest do
              })
 
     assert {:ok, [terminal], 2} = RelayReaders.events(ctx.relay, "reader", 1)
-    engine = stored_engine(ctx)
-
-    assert {:ok, %{"terminal" => ^terminal}} =
-             Engine.inbox_item(engine, "reader", {"app:test", "legacy"}, 2)
-
     refute Map.has_key?(terminal, "event_id")
     refute Map.has_key?(terminal, "request_revision")
   end
@@ -241,14 +183,6 @@ defmodule AttentionServer.PagingTerminalIdentityTest do
     :sys.get_state(relay).store.engine.origin_feeds[{"person", "origin"}].entries
     |> Enum.sort()
     |> Enum.map(fn {_seq, entry} -> entry end)
-  end
-
-  defp stored_engine(ctx) do
-    GenServer.stop(ctx.relay)
-    assert {:ok, store} = Store.open(ctx.path)
-    engine = store.engine
-    assert :ok = Store.close(store)
-    engine
   end
 
   defp send_frame(id) do

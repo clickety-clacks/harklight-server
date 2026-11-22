@@ -122,25 +122,16 @@ defmodule AttentionServer.AgentMigrationTest do
     key = String.duplicate("a", 64)
     {:ok, engine} = Engine.setup_device(engine, "A", key)
 
-    attrs = %{
-      person_id: "A",
-      device_id: key,
-      startup_id: "format-17-startup",
-      snapshot_id: "format-17-snapshot",
-      since: 0,
-      high_water: 0,
-      cursor_secret: :crypto.strong_rand_bytes(32)
-    }
+    # A finished, not yet accepted 0.1 paging startup, as its tables stored it.
+    assert {:ok, stmt} =
+             Sqlite3.prepare(
+               store.db,
+               "INSERT INTO relay_inbox_snapshots (person_id, device_id, startup_id, snapshot_id, since_seq, high_water, status, item_count, receipt_count, operation_count, cursor_secret, receipt_next_offset, receipts_complete) VALUES (?, ?, 'format-17-startup', 'format-17-snapshot', 0, 0, 'pending', 0, 0, 0, ?, 0, 1)"
+             )
 
-    assert {:ok, snapshot} = Store.begin_inbox_snapshot(store, attrs)
-
-    assert :ok =
-             Store.finish_inbox_snapshot(store, snapshot, %{
-               items: 0,
-               receipts: 0,
-               operation_ids: 0
-             })
-
+    assert :ok = Sqlite3.bind(stmt, ["A", key, {:blob, :crypto.strong_rand_bytes(32)}])
+    assert :done = Sqlite3.step(store.db, stmt)
+    assert :ok = Sqlite3.release(store.db, stmt)
     assert :ok = Store.close(store)
 
     legacy_engine =
@@ -179,9 +170,15 @@ defmodule AttentionServer.AgentMigrationTest do
     assert migrated.version == 1
     assert migrated.engine.persons == %{"A" => 0}
 
-    assert {:ok, %{snapshot_id: "format-17-snapshot", high_water: 0, status: "pending"}} =
-             Store.inbox_startup(migrated, "A", key, "format-17-startup")
+    assert {:ok, stmt} =
+             Sqlite3.prepare(
+               migrated.db,
+               "SELECT snapshot_id, high_water, status FROM relay_inbox_snapshots WHERE person_id = ? AND device_id = ? AND startup_id = 'format-17-startup'"
+             )
 
+    assert :ok = Sqlite3.bind(stmt, ["A", key])
+    assert {:ok, [["format-17-snapshot", 0, "pending"]]} = Sqlite3.fetch_all(migrated.db, stmt)
+    assert :ok = Sqlite3.release(migrated.db, stmt)
     assert :ok = Store.close(migrated)
   end
 end

@@ -68,17 +68,6 @@ defmodule AttentionServer.ConversationFiles do
 
   def valid_stored?(_), do: false
 
-  def transfers_for(entry, reports) do
-    names = Map.get(entry, "files", []) |> Enum.map(& &1["name"])
-
-    cond do
-      names == [] and reports in [nil, []] -> {:ok, %{}}
-      not is_list(reports) -> {:error, :file_transfers}
-      length(reports) != length(names) -> {:error, :file_transfers}
-      true -> normalize_transfers(reports, MapSet.new(names), %{})
-    end
-  end
-
   def valid_transfer_state?(entry, transfers) when is_map(transfers) do
     names = Map.get(entry, "files", []) |> Enum.map(& &1["name"]) |> MapSet.new()
 
@@ -103,24 +92,6 @@ defmodule AttentionServer.ConversationFiles do
   @doc false
   def valid_transfer_report?(name, report),
     do: valid_transfer?(Map.put(report, "name", name))
-
-  defp normalize_transfers([], remaining, result) do
-    if MapSet.size(remaining) == 0, do: {:ok, result}, else: {:error, :file_transfers}
-  end
-
-  defp normalize_transfers([%{"name" => name} = report | rest], remaining, result) do
-    if MapSet.member?(remaining, name) and valid_transfer?(report) do
-      normalize_transfers(
-        rest,
-        MapSet.delete(remaining, name),
-        Map.put(result, name, Map.delete(report, "name"))
-      )
-    else
-      {:error, :file_transfers}
-    end
-  end
-
-  defp normalize_transfers(_, _, _), do: {:error, :file_transfers}
 
   defp valid_transfer?(%{"status" => "transferred"} = report),
     do: Enum.sort(Map.keys(report)) == ["name", "status"]
