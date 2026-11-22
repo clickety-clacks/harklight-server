@@ -203,19 +203,11 @@ defmodule AttentionServer.ChangeLog do
       |> Enum.concat()
       |> Enum.uniq()
 
-    items =
-      Enum.map(item_keys, fn {person, _, _} = key ->
-        kind = if Map.has_key?(next.messages, key), do: :item, else: :item_removed
-        {person, {kind, item_resource(key)}}
-      end)
-
-    entries =
-      Enum.map(changed.entries, fn {person, seq} -> {person, {:entry, entry_resource(seq)}} end)
-
     counts =
-      old.route_b_index.unresolved_count_by_person
-      |> changed_keys(next.route_b_index.unresolved_count_by_person)
-      |> Enum.map(&{&1, {:counts, "counts"}})
+      changed_keys(
+        old.route_b_index.unresolved_count_by_person,
+        next.route_b_index.unresolved_count_by_person
+      )
 
     settings =
       [
@@ -226,10 +218,197 @@ defmodule AttentionServer.ChangeLog do
       ]
       |> Enum.concat()
       |> Enum.uniq()
-      |> Enum.map(&{&1, {:settings, "settings"}})
+
+    log_rows(next, item_keys, changed.entries, counts, settings)
+  end
+
+  defp log_rows(next, item_keys, entry_keys, counts, settings) do
+    items =
+      Enum.map(item_keys, fn {person, _, _} = key ->
+        kind = if Map.has_key?(next.messages, key), do: :item, else: :item_removed
+        {person, {kind, item_resource(key)}}
+      end)
+
+    entries =
+      Enum.map(entry_keys, fn {person, seq} -> {person, {:entry, entry_resource(seq)}} end)
+
+    counts = Enum.map(counts, &{&1, {:counts, "counts"}})
+    settings = Enum.map(settings, &{&1, {:settings, "settings"}})
 
     (Enum.sort(items) ++ entries ++ counts ++ settings)
     |> Enum.group_by(fn {person, _row} -> person end, fn {_person, row} -> row end)
+  end
+
+  # -- the same diff from a keyed commit's touched addresses ------------------
+  #
+  # A keyed commit names every changed record by address, and
+  # `KeyedValidation.untouched_change/3` refuses a commit that changes a record
+  # it does not name. The functions below read only those addresses (plus the
+  # derived indexes their resources depend on), so their cost follows the
+  # change rather than the store. Their output equals the whole-map functions
+  # above for every complete touched set; `commit_log_mismatches/2` compares
+  # the two and the keyed store checks it in the test environment.
+
+  @doc false
+  # Touched addresses grouped by record kind: `{:row, field}`,
+  # `{:member, field}` and `{:advisory, scope}` map to their keys.
+  def group_touched(%MapSet{} = touched) do
+    Enum.reduce(touched, %{}, fn
+      {:row, field, key}, acc -> Map.update(acc, {:row, field}, [key], &[key | &1])
+      {:member, field, key}, acc -> Map.update(acc, {:member, field}, [key], &[key | &1])
+      {:advisory, scope, part}, acc -> Map.update(acc, {:advisory, scope}, [part], &[part | &1])
+      _, acc -> acc
+    end)
+  end
+
+  defp touched_rows(grouped, field), do: Map.get(grouped, {:row, field}, [])
+
+  # The touched keys whose value differs; `put_row` may over-report a touch.
+  defp touched_changes(keys, old, next),
+    do: Enum.reject(keys, &(Map.fetch(old, &1) === Map.fetch(next, &1)))
+
+  @doc false
+  # `changed_resources/3` from touched addresses. The result also carries the
+  # grouped addresses for `changes_touched/3`, `closings_touched/3` and
+  # `AgentChangeLog.changes_touched/3`.
+  def changed_resources_touched(
+        %Engine{} = old,
+        %Engine{} = next,
+        %MapSet{} = touched,
+        projected_entries \\ []
+      ) do
+    grouped = group_touched(touched)
+
+    messages =
+      grouped |> touched_rows(:messages) |> touched_changes(old.messages, next.messages)
+
+    entries =
+      grouped
+      |> touched_rows(:conversation_events)
+      |> touched_changes(old.conversation_events, next.conversation_events)
+
+    priority_entries =
+      AttentionServer.ReplyPriority.affected_entries(old, next, messages, entries)
+
+    entries =
+      (entries ++ priority_entries ++ projected_entries)
+      |> Enum.uniq()
+      |> Enum.filter(&Map.has_key?(next.conversation_events, &1))
+      |> Enum.sort()
+
+    opened =
+      for {person, sender, id, _revision} = member <-
+            Map.get(grouped, {:member, :opened_revisions}, []),
+          MapSet.member?(old.opened_revisions, member) !=
+            MapSet.member?(next.opened_revisions, member),
+          do: {person, sender, id}
+
+    %{
+      messages: messages,
+      bounce:
+        grouped
+        |> touched_rows(:bounce_revisions)
+        |> touched_changes(old.bounce_revisions, next.bounce_revisions),
+      opened: opened,
+      entries: entries,
+      touched: grouped
+    }
+  end
+
+  @doc false
+  # `changes/3` from touched addresses. Each derived resource expands from the
+  # records it depends on:
+  #
+  #   * chat read positions: the touched position's item;
+  #   * conversation summaries (latest entry, chat start, availability after a
+  #     session ends, file use): the item of each touched conversation event,
+  #     the only writer of `conversation_summary_by_item`;
+  #   * subscriptions: every item of the subscribing person, read through the
+  #     route index instead of a scan of all messages;
+  #   * counts: the person of each changed message, the only writer of
+  #     `unresolved_count_by_person`;
+  #   * settings: the person of each touched bounce level or push binding.
+  def changes_touched(%Engine{} = old, %Engine{} = next, %{touched: grouped} = changed) do
+    read_positions =
+      grouped
+      |> touched_rows(:chat_read_positions)
+      |> touched_changes(old.chat_read_positions, next.chat_read_positions)
+
+    summaries =
+      for(
+        seq_key <- touched_rows(grouped, :conversation_events),
+        %{key: item} <- [
+          Map.get(old.conversation_events, seq_key),
+          Map.get(next.conversation_events, seq_key)
+        ],
+        uniq: true,
+        do: item
+      )
+      |> touched_changes(
+        old.route_b_index.conversation_summary_by_item,
+        next.route_b_index.conversation_summary_by_item
+      )
+
+    subscribers =
+      grouped
+      |> touched_rows(:subscriptions)
+      |> touched_changes(old.subscriptions, next.subscriptions)
+      |> Enum.map(fn {person, _device} -> person end)
+      |> Enum.uniq()
+
+    item_keys =
+      [
+        changed.messages,
+        read_positions,
+        summaries,
+        changed.bounce,
+        changed.opened,
+        subscription_items(subscribers, next)
+      ]
+      |> Enum.concat()
+      |> Enum.uniq()
+
+    counts =
+      for(
+        {person, _, _} <- changed.messages,
+        uniq: true,
+        do: person
+      )
+      |> touched_changes(
+        old.route_b_index.unresolved_count_by_person,
+        next.route_b_index.unresolved_count_by_person
+      )
+
+    settings =
+      [
+        grouped
+        |> touched_rows(:bounce_levels)
+        |> touched_changes(old.bounce_levels, next.bounce_levels),
+        grouped
+        |> touched_rows(:push_bindings)
+        |> touched_changes(old.push_bindings, next.push_bindings)
+        |> Enum.map(fn {person, _device} -> person end)
+      ]
+      |> Enum.concat()
+      |> Enum.uniq()
+
+    log_rows(next, item_keys, changed.entries, counts, settings)
+  end
+
+  # The route index lists a person's items once keyed lookups are on, which a
+  # keyed store always enables at open.
+  defp subscription_items(persons, %{route_b_index: %{request_keys_by_id: lookup} = index})
+       when is_map(lookup),
+       do:
+         Enum.flat_map(
+           persons,
+           &Enum.to_list(AttentionServer.RouteBIndex.message_keys(index, &1))
+         )
+
+  defp subscription_items(persons, next) do
+    Enum.flat_map(persons, fn person ->
+      for {{^person, _, _} = key, _} <- next.messages, do: key
+    end)
   end
 
   defp changed_keys(old, next) when old === next, do: []
@@ -354,6 +533,40 @@ defmodule AttentionServer.ChangeLog do
     devices ++ agents ++ paused ++ owners
   end
 
+  @doc false
+  # `closings/2` from the touched device, agent, delivery state and owner rows.
+  # Each group is in key order; `closings/2` follows map order, which is the
+  # same for maps of up to 32 keys. Closing order carries no meaning.
+  def closings_touched(%Engine{} = old, %Engine{} = next, %{touched: grouped}) do
+    devices =
+      for key <- Enum.sort(touched_rows(grouped, :devices)),
+          {:ok, device} <- [Map.fetch(old.devices, key)],
+          not Map.get(device, :revoked, false),
+          match?(nil, Map.get(next.devices, key)) or
+            Map.get(Map.get(next.devices, key, %{}), :revoked, false),
+          do: {{:device, key}, :revoked}
+
+    agents =
+      for key <- Enum.sort(touched_rows(grouped, :agents)),
+          match?(%{revoked: false}, Map.get(old.agents, key)),
+          not match?(%{revoked: false}, Map.get(next.agents, key)),
+          do: {{:agent, key}, :revoked}
+
+    paused =
+      for person <- Enum.sort(touched_rows(grouped, :delivery_states)),
+          Map.get(next.delivery_states, person) == "STOPPED",
+          Map.get(old.delivery_states, person) != "STOPPED",
+          do: {{:person, person}, :account_paused}
+
+    owners =
+      for person <- Enum.sort(touched_rows(grouped, :owners)),
+          {:ok, owner} <- [Map.fetch(old.owners, person)],
+          Map.get(next.owners, person) != owner,
+          do: {{:owner, person}, :revoked}
+
+    devices ++ agents ++ paused ++ owners
+  end
+
   @doc """
   Tells every subscriber of each scope that its connections must end:
   `{:client_closing, scope, reason}`. Scopes are `{:device, key}`,
@@ -425,6 +638,65 @@ defmodule AttentionServer.ChangeLog do
       Enum.any?(engine.conversation_events, fn {{p, _}, _} -> p == person end) or
       Map.has_key?(engine.bounce_levels, person)
   end
+
+  @doc false
+  # `seeded?/2` in O(1) for a committed (valid) engine. Every message's
+  # accepted_seq is a delivery sequence, so a person with a message has
+  # `persons[p] > 0`, and the person's delivery events (exactly `persons[p]`
+  # of them, each naming one of the person's messages) exist only then.
+  # Conversation events likewise number `conversation_highs[p]` per person.
+  def seeded_from_highs?(%Engine{} = engine, person) do
+    Map.get(engine.persons, person, 0) > 0 or
+      Map.get(engine.conversation_highs, person, 0) > 0 or
+      Map.has_key?(engine.bounce_levels, person)
+  end
+
+  # -- one commit's log -------------------------------------------------------
+
+  @doc false
+  # The client and agent log rows of one commit `old -> next`, by whole-map
+  # comparison. The legacy store commit uses this.
+  def commit_log(%Engine{} = old, %Engine{} = next, projected_entries) do
+    changed = changed_resources(old, next, projected_entries)
+    pending = changes(old, next, changed)
+
+    %{
+      pending: pending,
+      seeded: Map.new(pending, fn {person, _} -> {person, seeded?(old, person)} end),
+      closings: closings(old, next),
+      created: new_resources(old, next, changed),
+      agent_pending: AttentionServer.AgentChangeLog.changes(old, next, changed)
+    }
+  end
+
+  @doc false
+  # `commit_log/3` for a keyed commit, from its complete touched addresses.
+  def commit_log_touched(%Engine{} = old, %Engine{} = next, %MapSet{} = touched, projected) do
+    changed = changed_resources_touched(old, next, touched, projected)
+    pending = changes_touched(old, next, changed)
+
+    %{
+      pending: pending,
+      seeded: Map.new(pending, fn {person, _} -> {person, seeded_from_highs?(old, person)} end),
+      closings: closings_touched(old, next, changed),
+      created: new_resources(old, next, changed),
+      agent_pending: AttentionServer.AgentChangeLog.changes_touched(old, next, changed)
+    }
+  end
+
+  @doc false
+  # The parts of two commit logs that differ, as `{part, touched, whole}`.
+  # Closings are compared as sets because their order carries no meaning.
+  def commit_log_mismatches(touched, whole) do
+    Enum.flat_map([:pending, :seeded, :closings, :created, :agent_pending], fn part ->
+      a = comparable(part, Map.fetch!(touched, part))
+      b = comparable(part, Map.fetch!(whole, part))
+      if a === b, do: [], else: [{part, a, b}]
+    end)
+  end
+
+  defp comparable(:closings, closings), do: Enum.sort(closings)
+  defp comparable(_part, value), do: value
 
   # -- schema and reconciliation ----------------------------------------------
 

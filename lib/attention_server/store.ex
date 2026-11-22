@@ -933,7 +933,7 @@ defmodule AttentionServer.Store do
            ),
          {:ok, prepared} <- KeyedReference.prepare(old, next, touched, store.upload_dir),
          {:ok, blob_owners} <- update_blob_owners(store.blob_owners, prepared) do
-      log = keyed_change_log(store, next, projected)
+      log = keyed_change_log(store, next, touched, projected)
 
       result =
         Persistence.run(fn ->
@@ -1440,22 +1440,37 @@ defmodule AttentionServer.Store do
     {:error, :storage_unavailable, store}
   end
 
-  defp keyed_change_log(%__MODULE__{change_log: false}, _next, _projected), do: nil
+  defp keyed_change_log(%__MODULE__{change_log: false}, _next, _touched, _projected), do: nil
 
-  defp keyed_change_log(store, next, projected) do
-    changed = AttentionServer.ChangeLog.changed_resources(store.engine, next, projected)
-    pending = AttentionServer.ChangeLog.changes(store.engine, next, changed)
+  # A keyed commit derives its log rows from the touched addresses, so the
+  # work follows the change. Under `keyed_validation: :both` (the test
+  # environment) the whole-map log is computed as well and any differing part
+  # raises, as keyed_validation/3 does for the validator. :full and
+  # :incremental use the touched rows alone.
+  defp keyed_change_log(store, next, touched, projected) do
+    log = AttentionServer.ChangeLog.commit_log_touched(store.engine, next, touched, projected)
 
-    %{
-      pending: pending,
-      seeded:
-        Map.new(pending, fn {person, _} ->
-          {person, AttentionServer.ChangeLog.seeded?(store.engine, person)}
-        end),
-      closings: AttentionServer.ChangeLog.closings(store.engine, next),
-      created: AttentionServer.ChangeLog.new_resources(store.engine, next, changed),
-      agent_pending: AttentionServer.AgentChangeLog.changes(store.engine, next, changed)
-    }
+    if Application.get_env(:attention_server, :keyed_validation, :full) == :both do
+      whole = AttentionServer.ChangeLog.commit_log(store.engine, next, projected)
+
+      case AttentionServer.ChangeLog.commit_log_mismatches(log, whole) do
+        [] ->
+          :ok
+
+        mismatches ->
+          raise "keyed change log mismatch in " <>
+                  Enum.map_join(mismatches, ", ", &inspect(elem(&1, 0))) <>
+                  ": " <>
+                  inspect(
+                    Enum.map(mismatches, fn {part, a, b} ->
+                      %{part: part, touched: a, whole: b}
+                    end),
+                    limit: 50
+                  ) <> " for touched #{inspect(Enum.sort(touched), limit: 50)}"
+      end
+    end
+
+    log
   end
 
   defp write_reference_delta(db, deleted_paths, reference_rows) do
@@ -1573,25 +1588,8 @@ defmodule AttentionServer.Store do
     # The change log's rows are found here, against the engine this process
     # already holds, and written in the snapshot's transaction.
     log =
-      if store.change_log do
-        changed =
-          AttentionServer.ChangeLog.changed_resources(store.engine, next, projected_entries)
-
-        pending = AttentionServer.ChangeLog.changes(store.engine, next, changed)
-
-        seeded =
-          Map.new(pending, fn {person, _} ->
-            {person, AttentionServer.ChangeLog.seeded?(store.engine, person)}
-          end)
-
-        %{
-          pending: pending,
-          seeded: seeded,
-          closings: AttentionServer.ChangeLog.closings(store.engine, next),
-          created: AttentionServer.ChangeLog.new_resources(store.engine, next, changed),
-          agent_pending: AttentionServer.AgentChangeLog.changes(store.engine, next, changed)
-        }
-      end
+      if store.change_log,
+        do: AttentionServer.ChangeLog.commit_log(store.engine, next, projected_entries)
 
     result =
       with {:ok, durable_next, persisted, index} <- prepare_large_data(store, next) do
