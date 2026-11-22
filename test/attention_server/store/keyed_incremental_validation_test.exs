@@ -1,6 +1,7 @@
 defmodule AttentionServer.Store.KeyedIncrementalValidationTest do
   # One proposal per full-validator check ported to per-address keyed
-  # validation (W3a; rows of the W3 validator inventory in the test names).
+  # validation (W3a row-local checks, W3b uniqueness index and dependents;
+  # rows of the W3 validator inventory in the test names).
   # Each proposal is refused by the whole-state check. It must be refused by
   # the per-address verdict for the stated reason, and committing it through
   # the keyed Store, which runs both validators in the test environment and
@@ -31,6 +32,13 @@ defmodule AttentionServer.Store.KeyedIncrementalValidationTest do
   @code "AAAAAAAAAA"
   @code2 "BBBBBBBBBB"
   @secret :binary.copy(<<7>>, 32)
+  @secret2 :binary.copy(<<9>>, 32)
+  @code3 "CCCCCCCCCC"
+  @agent_id2 "00000000-0000-4000-8000-0000000000a2"
+  @uuid_c1 "00000000-0000-4000-8000-0000000000c1"
+  @uuid_c2 "00000000-0000-4000-8000-0000000000c2"
+  @spare2 String.duplicate("1", 64)
+  @spare3 String.duplicate("2", 64)
 
   setup %{tmp_dir: directory} do
     path = Path.join(directory, "state.sqlite3")
@@ -87,7 +95,7 @@ defmodule AttentionServer.Store.KeyedIncrementalValidationTest do
     :ok = Store.close(staged)
     {:ok, store} = Store.open(path, :keyed)
     on_exit(fn -> Store.close(store) end)
-    %{store: store}
+    %{store: store, path: path}
   end
 
   test "the test environment runs both keyed validators", %{store: store} do
@@ -139,19 +147,19 @@ defmodule AttentionServer.Store.KeyedIncrementalValidationTest do
       )
     end
 
-    test "#6 a new device may not take an owner key (W3b fallback)", %{store: store} do
+    test "#6 a new device may not take an owner key", %{store: store} do
       refuse(
         store,
         &put_in(&1.devices[@owner_key], &1.devices[@reader]),
-        {:fallback, :owner_keys}
+        {:unique, :principal_key}
       )
     end
 
-    test "#7 owner keys are unique (W3b fallback)", %{store: store} do
+    test "#7 owner keys are unique", %{store: store} do
       refuse(
         store,
         &put_in(&1.owners[@other], %{key: @owner_key, revision: 1}),
-        {:fallback, :owner_keys}
+        {:unique, :principal_key}
       )
     end
 
@@ -165,7 +173,7 @@ defmodule AttentionServer.Store.KeyedIncrementalValidationTest do
       refuse(
         store,
         &put_in(&1.devices[@retired], &1.devices[@reader]),
-        {:fallback, :owner_keys}
+        {:unique, :principal_key}
       )
     end
 
@@ -189,19 +197,19 @@ defmodule AttentionServer.Store.KeyedIncrementalValidationTest do
       )
     end
 
-    test "#39 a new device may not take an agent key (W3b fallback)", %{store: store} do
+    test "#39 a new device may not take an agent key", %{store: store} do
       refuse(
         store,
         &put_in(&1.devices[@agent_key], &1.devices[@reader]),
-        {:fallback, :agent_keys}
+        {:unique, :principal_key}
       )
     end
 
-    test "#40 agents are unique by person and id (W3b fallback)", %{store: store} do
+    test "#40 agents are unique by person and id", %{store: store} do
       refuse(
         store,
         &put_in(&1.agents[@spare], &1.agents[@agent_key]),
-        {:fallback, :agent_ids}
+        {:unique, :agent_id}
       )
     end
   end
@@ -215,7 +223,7 @@ defmodule AttentionServer.Store.KeyedIncrementalValidationTest do
       )
     end
 
-    test "#10 pending secrets are unique (W3b fallback)", %{store: store} do
+    test "#10 pending secrets are unique", %{store: store} do
       refuse(
         store,
         fn engine ->
@@ -224,7 +232,7 @@ defmodule AttentionServer.Store.KeyedIncrementalValidationTest do
             | pending_enrollments: %{@code => pending_item(), @code2 => pending_item()}
           }
         end,
-        {:fallback, :pending_secrets}
+        {:unique, :pending_secret}
       )
     end
 
@@ -251,7 +259,7 @@ defmodule AttentionServer.Store.KeyedIncrementalValidationTest do
       assert {:error, :storage_unavailable, _} = Store.commit(store, {next, touched}, audit())
     end
 
-    test "#13 secrets are unique across pending and history (W3b fallback)", %{store: store} do
+    test "#13 secrets are unique across pending and history", %{store: store} do
       refuse(
         store,
         fn engine ->
@@ -261,7 +269,7 @@ defmodule AttentionServer.Store.KeyedIncrementalValidationTest do
               pending_history: %{@code2 => expired_receipt()}
           }
         end,
-        {:fallback, :pending_secrets}
+        {:unique, :pending_secret}
       )
     end
 
@@ -319,15 +327,15 @@ defmodule AttentionServer.Store.KeyedIncrementalValidationTest do
       )
     end
 
-    test "#18 removing the owner of a hosted account (W3b fallback)", %{store: store} do
-      refuse(store, &%{&1 | owners: %{}}, {:fallback, :hosted_accounts})
+    test "#18 removing the owner of a hosted account rechecks the account", %{store: store} do
+      refuse(store, &%{&1 | owners: %{}}, {:address, {:row, :hosted_accounts, "account"}})
     end
 
-    test "#19 one hosted account per person (W3b fallback)", %{store: store} do
+    test "#19 one hosted account per person", %{store: store} do
       refuse(
         store,
         &put_in(&1.hosted_accounts["second"], %{person: @person, label: nil, test: false}),
-        {:fallback, :hosted_accounts}
+        {:unique, :hosted_person}
       )
     end
 
@@ -365,7 +373,7 @@ defmodule AttentionServer.Store.KeyedIncrementalValidationTest do
       )
     end
 
-    test "#24 active push addresses are unique (W3b fallback)", %{store: store} do
+    test "#24 active push addresses are unique", %{store: store} do
       refuse(
         store,
         fn engine ->
@@ -377,11 +385,11 @@ defmodule AttentionServer.Store.KeyedIncrementalValidationTest do
               }
           }
         end,
-        {:fallback, :push_addresses}
+        {:unique, :push_address}
       )
     end
 
-    test "#23 revoking a device ends its active binding (W3b fallback)", %{store: store} do
+    test "#23 revoking a device rechecks its active binding", %{store: store} do
       binding = active_binding("00000000-0000-4000-8000-0000000000c1")
       engine = store.engine
       next = put_in(engine.push_bindings[{@person, @reader}], binding)
@@ -389,7 +397,11 @@ defmodule AttentionServer.Store.KeyedIncrementalValidationTest do
       assert :ok = Store.incremental_verdict(store, next, touched)
       assert {:ok, store} = Store.commit(store, {next, touched}, audit())
 
-      refuse(store, &put_in(&1.devices[@reader].revoked, true), {:fallback, :push_devices})
+      refuse(
+        store,
+        &put_in(&1.devices[@reader].revoked, true),
+        {:address, {:row, :push_bindings, {@person, @reader}}}
+      )
     end
   end
 
@@ -641,6 +653,320 @@ defmodule AttentionServer.Store.KeyedIncrementalValidationTest do
     end
   end
 
+  # W3b: the uniqueness index carried on the keyed Store and the dependents
+  # it names. Each invariant is broken from every side the inventory lists,
+  # starting from a committed state, so the conflict involves an untouched row.
+  describe "principal key space (#6, #7, #8, #39)" do
+    test "#7 an owner may not move onto another owner's key", %{store: store} do
+      store = accept(store, &put_in(&1.owners[@other], %{key: @spare, revision: 1}))
+      refuse(store, &put_in(&1.owners[@person].key, @spare), {:unique, :principal_key})
+      refuse(store, &put_in(&1.owners[@other].key, @owner_key), {:unique, :principal_key})
+    end
+
+    test "#6 an agent or retired key may not take an owner key", %{store: store} do
+      refuse(
+        store,
+        &put_in(&1.agents[@owner_key], %{&1.agents[@agent_key] | id: @agent_id2}),
+        {:unique, :principal_key}
+      )
+
+      refuse(
+        store,
+        &%{&1 | retired_owner_keys: MapSet.put(&1.retired_owner_keys, @owner_key)},
+        {:unique, :principal_key}
+      )
+    end
+
+    test "#6 an owner may not take an agent or retired key", %{store: store} do
+      refuse(
+        store,
+        &put_in(&1.owners[@other], %{key: @agent_key, revision: 1}),
+        {:address, {:row, :owners, @other}}
+      )
+
+      refuse(
+        store,
+        &put_in(&1.owners[@other], %{key: @retired, revision: 1}),
+        {:address, {:row, :owners, @other}}
+      )
+    end
+
+    test "#8 an agent may not take a retired key, nor a retired key a device's", %{
+      store: store
+    } do
+      refuse(
+        store,
+        &put_in(&1.agents[@retired], %{&1.agents[@agent_key] | id: @agent_id2}),
+        {:unique, :principal_key}
+      )
+
+      refuse(
+        store,
+        &%{&1 | retired_owner_keys: MapSet.put(&1.retired_owner_keys, @reader)},
+        {:address, {:member, :retired_owner_keys, @reader}}
+      )
+    end
+
+    test "#39 an agent may not take a device key", %{store: store} do
+      refuse(
+        store,
+        &put_in(&1.agents[@reader], %{&1.agents[@agent_key] | id: @agent_id2}),
+        {:address, {:row, :agents, @reader}}
+      )
+    end
+
+    test "a key released in the same commit may be reused", %{store: store} do
+      # Owner recovery: the old owner key retires as the new one takes over.
+      store =
+        accept(store, fn engine ->
+          %{
+            engine
+            | owners: %{@person => %{key: @spare, revision: 2}},
+              retired_owner_keys: MapSet.put(engine.retired_owner_keys, @owner_key)
+          }
+        end)
+
+      # The agent key moves to a device, and the agent may not return.
+      agent = store.engine.agents[@agent_key]
+
+      store =
+        accept(store, fn engine ->
+          %{
+            engine
+            | agents: Map.delete(engine.agents, @agent_key),
+              devices: Map.put(engine.devices, @agent_key, engine.devices[@reader])
+          }
+        end)
+
+      refuse(
+        store,
+        &put_in(&1.agents[@agent_key], agent),
+        {:address, {:row, :agents, @agent_key}}
+      )
+    end
+  end
+
+  describe "agents by person and id (#40)" do
+    test "an agent may not change its id onto another agent's", %{store: store} do
+      store =
+        accept(store, &put_in(&1.agents[@spare], %{&1.agents[@agent_key] | id: @agent_id2}))
+
+      refuse(store, &put_in(&1.agents[@spare].id, @agent_id), {:unique, :agent_id})
+      refuse(store, &put_in(&1.agents[@agent_key].id, @agent_id2), {:unique, :agent_id})
+    end
+
+    test "the same id under another person is accepted", %{store: store} do
+      accept(store, &put_in(&1.agents[@spare], %{&1.agents[@agent_key] | person: @other}))
+    end
+  end
+
+  describe "pending secrets (#10, #13)" do
+    test "#10 a new request may not reuse a pending secret", %{store: store} do
+      store = accept(store, &put_in(&1.pending_enrollments[@code], pending_item()))
+
+      refuse(
+        store,
+        &put_in(&1.pending_enrollments[@code2], pending_item()),
+        {:unique, :pending_secret}
+      )
+    end
+
+    test "#13 a request may not reuse a history secret, nor history a pending one", %{
+      store: store
+    } do
+      pending = accept(store, &put_in(&1.pending_enrollments[@code], pending_item()))
+
+      refuse(
+        pending,
+        &put_in(&1.pending_history[@code2], expired_receipt()),
+        {:unique, :pending_secret}
+      )
+
+      history = accept(pending, &put_in(&1.pending_enrollments[@code].secret_hash, @secret2))
+      history = accept(history, &put_in(&1.pending_history[@code2], expired_receipt()))
+
+      refuse(
+        history,
+        &put_in(&1.pending_enrollments[@code].secret_hash, @secret),
+        {:unique, :pending_secret}
+      )
+
+      refuse(
+        history,
+        &put_in(&1.pending_history[@code3], expired_receipt()),
+        {:unique, :pending_secret}
+      )
+    end
+
+    test "resolving a request into history keeps its secret", %{store: store} do
+      store = accept(store, &put_in(&1.pending_enrollments[@code], pending_item()))
+
+      accept(store, fn engine ->
+        %{
+          engine
+          | pending_enrollments: %{},
+            pending_history: %{@code => expired_receipt()}
+        }
+      end)
+    end
+  end
+
+  describe "hosted accounts (#18, #19)" do
+    test "#19 an account may not move to a person who has one", %{store: store} do
+      store =
+        accept(store, fn engine ->
+          engine
+          |> put_in([Access.key(:owners), @other], %{key: @spare, revision: 1})
+          |> put_in([Access.key(:hosted_accounts), "other"], %{
+            person: @other,
+            label: nil,
+            test: false
+          })
+        end)
+
+      refuse(
+        store,
+        &put_in(&1.hosted_accounts["other"].person, @person),
+        {:unique, :hosted_person}
+      )
+
+      refuse(
+        store,
+        &put_in(&1.hosted_accounts["account"].person, @other),
+        {:unique, :hosted_person}
+      )
+    end
+
+    test "#19 an account may be renamed", %{store: store} do
+      accept(store, fn engine ->
+        %{engine | hosted_accounts: %{"renamed" => engine.hosted_accounts["account"]}}
+      end)
+    end
+
+    test "#18 changing the owner key keeps the account; removing both is accepted", %{
+      store: store
+    } do
+      store = accept(store, &put_in(&1.owners[@person].key, @spare))
+      accept(store, &%{&1 | owners: %{}, hosted_accounts: %{}})
+    end
+  end
+
+  describe "push bindings (#23, #24)" do
+    test "#24 a binding may not take a committed active address", %{store: store} do
+      store =
+        accept(store, &put_in(&1.push_bindings[{@person, @reader}], active_binding(@uuid_c1)))
+
+      refuse(
+        store,
+        &put_in(&1.push_bindings[{@person, @origin}], active_binding(@uuid_c2)),
+        {:unique, :push_address}
+      )
+
+      # Once the first binding leaves the address, it is free.
+      store =
+        accept(store, fn engine ->
+          engine
+          |> put_in([Access.key(:push_bindings), {@person, @reader}], canceled_binding())
+          |> put_in([Access.key(:push_bindings), {@person, @origin}], active_binding(@uuid_c2))
+        end)
+
+      refuse(
+        store,
+        &put_in(&1.push_bindings[{@person, @reader}], active_binding(@uuid_c1)),
+        {:unique, :push_address}
+      )
+    end
+
+    test "#24 an address may move between bindings in one commit", %{store: store} do
+      store =
+        accept(store, &put_in(&1.push_bindings[{@person, @reader}], active_binding(@uuid_c1)))
+
+      accept(store, fn engine ->
+        engine
+        |> put_in(
+          [Access.key(:push_bindings), {@person, @reader}, :address],
+          String.duplicate("8", 64)
+        )
+        |> put_in([Access.key(:push_bindings), {@person, @origin}], active_binding(@uuid_c2))
+      end)
+    end
+
+    test "#23 a device may be revoked once its binding is inactive", %{store: store} do
+      store = accept(store, &put_in(&1.devices[@reader].revoked, true))
+
+      refuse(
+        store,
+        &put_in(&1.push_bindings[{@person, @reader}], active_binding(@uuid_c1)),
+        {:address, {:row, :push_bindings, {@person, @reader}}}
+      )
+    end
+  end
+
+  describe "upload removal (#36, #55)" do
+    test "removing an upload rechecks the revisions that reference it", %{store: store} do
+      store =
+        accept(store, fn engine ->
+          engine
+          |> put_in([Access.key(:uploads), @uuid], upload())
+          |> put_in([Access.key(:messages), @m1, :files_by_revision], %{1 => [upload_file()]})
+        end)
+
+      refuse(store, &%{&1 | uploads: %{}}, {:address, {:row, :messages, @m1}})
+      refuse(store, &put_in(&1.uploads[@uuid].size, 2), {:address, {:row, :messages, @m1}})
+    end
+  end
+
+  describe "carried uniqueness index" do
+    test "equals a cold rebuild after a sequence of keyed commits", %{store: store, path: path} do
+      store =
+        [
+          &put_in(&1.owners[@other], %{key: @spare, revision: 1}),
+          &put_in(&1.hosted_accounts["other"], %{person: @other, label: nil, test: false}),
+          &put_in(&1.pending_enrollments[@code], pending_item()),
+          &put_in(&1.push_bindings[{@person, @reader}], active_binding(@uuid_c1)),
+          &put_in(&1.agents[@spare2], %{&1.agents[@agent_key] | id: @agent_id2}),
+          fn engine ->
+            %{
+              engine
+              | pending_enrollments: %{},
+                pending_history: %{@code => expired_receipt()}
+            }
+          end,
+          &put_in(&1.push_bindings[{@person, @origin}], active_binding(@uuid_c2, "8")),
+          &put_in(&1.push_bindings[{@person, @reader}], canceled_binding()),
+          fn engine ->
+            %{
+              engine
+              | owners: %{engine.owners | @person => %{key: @spare3, revision: 2}},
+                retired_owner_keys: MapSet.put(engine.retired_owner_keys, @owner_key)
+            }
+          end,
+          &%{&1 | agents: Map.delete(&1.agents, @spare2)},
+          &%{&1 | hosted_accounts: Map.delete(&1.hosted_accounts, "other")},
+          &put_in(&1.devices[@reader].revoked, true)
+        ]
+        |> Enum.reduce(store, &accept(&2, &1))
+
+      carried = store.unique_index
+      assert carried == KeyedValidation.unique_index(store.engine)
+      assert Map.has_key?(carried, {:principal_key, @owner_key})
+      assert Map.has_key?(carried, {:principal_key, @spare3})
+      refute Map.has_key?(carried, {:principal_key, @spare2})
+      assert Map.has_key?(carried, {:pending_secret, @secret})
+      assert Map.has_key?(carried, {:push_address, String.duplicate("8", 64)})
+      refute Map.has_key?(carried, {:push_address, String.duplicate("9", 64)})
+      refute Map.has_key?(carried, {:hosted_person, @other})
+      assert Map.has_key?(carried, {:agent_id, {@person, @agent_id}})
+
+      :ok = Store.close(store)
+      {:ok, reopened} = Store.open(path, :keyed)
+      assert reopened.unique_index == carried
+      assert reopened.authority_index == store.authority_index
+      assert reopened.upload_links == store.upload_links
+      :ok = Store.close(reopened)
+    end
+  end
+
   describe "later-slice fallbacks" do
     test "#3 derived default index (W3c fallback)", %{store: store} do
       next = %{
@@ -660,6 +986,14 @@ defmodule AttentionServer.Store.KeyedIncrementalValidationTest do
     test "#30 bounce revision state (W3c fallback)", %{store: store} do
       refuse(store, &put_in(&1.bounce_revisions[@m1], %{}), {:fallback, :bounce_state})
     end
+  end
+
+  defp accept(store, mutate) do
+    next = mutate.(store.engine)
+    touched = codec_diff(store.engine, next)
+    assert :ok = Store.incremental_verdict(store, next, touched)
+    assert {:ok, store} = Store.commit(store, {next, touched}, audit())
+    store
   end
 
   defp refuse(store, mutate, expected) do
@@ -766,12 +1100,28 @@ defmodule AttentionServer.Store.KeyedIncrementalValidationTest do
     }
   end
 
-  defp active_binding(binding_id) do
+  defp upload do
+    %{
+      id: @uuid,
+      person: @person,
+      uploader: @reader,
+      op_id: @uuid,
+      sender_id: @sender,
+      message_id: "m1",
+      revision: 1,
+      name: "a.txt",
+      size: 1,
+      last_activity_ms: 1,
+      sha256: String.duplicate("0", 64)
+    }
+  end
+
+  defp active_binding(binding_id, digit \\ "9") do
     %{
       canceled_binding()
       | active: true,
         binding_id: binding_id,
-        address: String.duplicate("9", 64),
+        address: String.duplicate(digit, 64),
         profile_id: "harklight-sandbox",
         registered_at: 1,
         state: "ready"
