@@ -10,9 +10,6 @@ defmodule AttentionServer.EnrolledLeafVerify do
 
   alias AttentionServer.{DeviceIdentity, Relay}
 
-  def device(relay),
-    do: {fn _certificate, der, event, state -> verify(relay, :device, der, event, state) end, nil}
-
   def client_api(relay),
     do:
       {fn _certificate, der, event, state -> verify(relay, :client_api, der, event, state) end,

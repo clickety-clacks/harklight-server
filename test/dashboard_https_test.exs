@@ -79,7 +79,9 @@ defmodule AttentionServer.DashboardHTTPSTest do
     Process.unlink(listener)
     on_exit(fn -> if Process.alive?(listener), do: Supervisor.stop(listener) end)
 
-    {protocol, page} = send_https_with_alpn(certs, port)
+    # The listener offers HTTP/2 (for same-origin /v2) beside HTTP/1.1.
+    assert negotiated_protocol(certs, port, [<<"h2">>, <<"http/1.1">>]) == {:ok, <<"h2">>}
+    {protocol, page} = send_https_with_alpn(certs, port, [<<"http/1.1">>])
     assert protocol == {:ok, <<"http/1.1">>}
     assert page =~ "HTTP/1.1 200"
 
@@ -730,19 +732,15 @@ defmodule AttentionServer.DashboardHTTPSTest do
     end
   end
 
-  defp send_https_with_alpn(certs, port) do
-    {:ok, socket} =
-      :ssl.connect({127, 0, 0, 1}, port,
-        versions: [:"tlsv1.3"],
-        verify: :verify_peer,
-        cacertfile: String.to_charlist(Path.join(certs, "ca.pem")),
-        server_name_indication: ~c"relay.test",
-        alpn_advertised_protocols: [<<"h2">>, <<"http/1.1">>],
-        active: false,
-        mode: :binary,
-        packet: :raw
-      )
+  defp negotiated_protocol(certs, port, protocols) do
+    socket = alpn_connect(certs, port, protocols)
+    protocol = :ssl.negotiated_protocol(socket)
+    :ssl.close(socket)
+    protocol
+  end
 
+  defp send_https_with_alpn(certs, port, protocols) do
+    socket = alpn_connect(certs, port, protocols)
     protocol = :ssl.negotiated_protocol(socket)
 
     :ok =
@@ -754,6 +752,22 @@ defmodule AttentionServer.DashboardHTTPSTest do
     response = read_all(socket, <<>>)
     :ssl.close(socket)
     {protocol, response}
+  end
+
+  defp alpn_connect(certs, port, protocols) do
+    {:ok, socket} =
+      :ssl.connect({127, 0, 0, 1}, port,
+        versions: [:"tlsv1.3"],
+        verify: :verify_peer,
+        cacertfile: String.to_charlist(Path.join(certs, "ca.pem")),
+        server_name_indication: ~c"relay.test",
+        alpn_advertised_protocols: protocols,
+        active: false,
+        mode: :binary,
+        packet: :raw
+      )
+
+    socket
   end
 
   defp read_all(socket, acc) do

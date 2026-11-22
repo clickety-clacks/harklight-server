@@ -48,7 +48,7 @@ defmodule AttentionServer.ClientAPI.Writes do
   # long reply that today's path accepts is accepted here too. No new limit.
   @max_body_bytes 2 * 1024 * 1024
 
-  ## Routes (mounted by ClientAPI.Router behind client_api_v2)
+  ## Routes (mounted by ClientAPI.Router)
 
   @impl true
   def routes do

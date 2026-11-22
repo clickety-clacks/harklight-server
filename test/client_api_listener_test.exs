@@ -1,6 +1,5 @@
 defmodule AttentionServer.ClientAPIListenerTest do
-  # Client API v2 listener, router and authenticators (spec §2 and §6), behind
-  # the client_api_v2 flag.
+  # Client API v2 listener, router and authenticators (spec §2 and §6).
   use ExUnit.Case, async: false
 
   import ExUnit.CaptureLog
@@ -375,7 +374,7 @@ defmodule AttentionServer.ClientAPIListenerTest do
 
   describe "web origin" do
     setup ctx do
-      web_origin(ctx, client_api_v2: true)
+      web_origin(ctx, [])
     end
 
     test "browser and device resolve the same person for the same account", ctx do
@@ -482,7 +481,7 @@ defmodule AttentionServer.ClientAPIListenerTest do
 
   describe "owner-registered agents on the device port" do
     test "a registered agent reads the full view with empty grants", ctx do
-      {relay, person, owner, agent, port} = start_granted_agent(ctx, true, "granted")
+      {relay, person, owner, agent, port} = start_granted_agent(ctx, "granted")
       assert :ok = Relay.setup_device(relay, person, "fixture-origin")
 
       for {sender, id, n} <- [{"app:first", "first", 1}, {"app:second", "second", 2}] do
@@ -543,7 +542,7 @@ defmodule AttentionServer.ClientAPIListenerTest do
     end
 
     test "search keeps literal matching, exact filters, and newest-first paging", ctx do
-      {relay, person, owner, agent, port} = start_granted_agent(ctx, true, "granted-search")
+      {relay, person, owner, agent, port} = start_granted_agent(ctx, "granted-search")
       assert :ok = Relay.setup_device(relay, person, "fixture-origin")
       number = %JSON.DecimalToken{raw: "0.12345678901234567890123456789"}
       needle = number.raw
@@ -603,7 +602,7 @@ defmodule AttentionServer.ClientAPIListenerTest do
     end
 
     test "only senders matching both answer grants can be answered", ctx do
-      {relay, person, owner, agent, port} = start_granted_agent(ctx, true, "granted-answer")
+      {relay, person, owner, agent, port} = start_granted_agent(ctx, "granted-answer")
       assert :ok = Relay.setup_device(relay, person, "fixture-origin")
       forward_granted_fixture(relay, "app:team/first", "same", 1)
       forward_granted_fixture(relay, "app:team/second", "same", 2)
@@ -697,27 +696,10 @@ defmodule AttentionServer.ClientAPIListenerTest do
       assert :ok = Relay.owner_replace_agent_grants(relay, person, owner, agent, 4, [], [])
       assert {:ok, _conn, %{status: 403}} = request(conn, "POST", path, headers, body)
     end
-
-    test "the legacy device listener does not admit an agent certificate with the flag off",
-         ctx do
-      {_relay, _person, _owner, _agent, port} = start_granted_agent(ctx, false, "granted-off")
-
-      case raw_connect(ctx.certs, port, "granted-off") do
-        {:error, {:tls_alert, {:handshake_failure, _}}} ->
-          :ok
-
-        {:ok, socket} ->
-          assert {:error, {:tls_alert, {:handshake_failure, _}}} = :ssl.recv(socket, 0, 5_000)
-      end
-    end
   end
 
-  defp start_granted_agent(ctx, enabled, name) do
-    flags = Path.join(ctx.dir, "flags.json")
-    File.write!(flags, JSON.encode!(%{"client_api_v2" => enabled}))
-
-    server =
-      start_supervised!({Server, Keyword.put(server_opts(ctx), :feature_flags_path, flags)})
+  defp start_granted_agent(ctx, name) do
+    server = start_supervised!({Server, server_opts(ctx)})
 
     relay = Server.relay(server)
     owner_der = TLSFixtures.certificate_der!(ctx.certs, "a1")
@@ -770,10 +752,7 @@ defmodule AttentionServer.ClientAPIListenerTest do
 
   describe "push matching on the enrolled device listener" do
     setup ctx do
-      flags = flags_file(ctx.dir, true)
-
-      server =
-        start_supervised!({Server, Keyword.put(server_opts(ctx), :feature_flags_path, flags)})
+      server = start_supervised!({Server, server_opts(ctx)})
 
       relay = Server.relay(server)
       assert :ok = Relay.enable_push(relay)
@@ -963,7 +942,7 @@ defmodule AttentionServer.ClientAPIListenerTest do
     ctx =
       Map.merge(
         ctx,
-        web_origin(ctx, client_api_v2: true, client_api_routes: [ClientAPI.Reads])
+        web_origin(ctx, client_api_routes: [ClientAPI.Reads])
       )
 
     assert {:ok, conn} = browser_connect(ctx, :http1)
@@ -976,80 +955,24 @@ defmodule AttentionServer.ClientAPIListenerTest do
     refute Map.has_key?(json(settings)["settings"]["push"], "binding_id")
   end
 
-  describe "flag off" do
-    test "the web origin answers 404 on /v2 and stays HTTP/1.1 only", ctx do
-      ctx = Map.merge(ctx, web_origin(ctx, []))
-      assert {:error, _reason} = browser_connect(ctx, :http2)
-      assert {:ok, conn} = browser_connect(ctx, :http1)
+  test "the web origin serves /v2 over HTTP/2 and HTTP/1.1 with no flag option", ctx do
+    ctx = Map.merge(ctx, web_origin(ctx, []))
+    headers = [{"cookie", cookie(ctx.cookie)}]
 
-      conn =
-        Enum.reduce([[], [{"cookie", cookie(ctx.cookie)}]], conn, fn headers, conn ->
-          assert {:ok, conn, response} = request(conn, "GET", "/v2/whoami", headers)
-          assert response.status == 404
-          assert header(response, "request-id") == []
-          assert {:ok, conn, %{status: 404} = me} = request(conn, "GET", "/v2/me", headers)
-          assert header(me, "request-id") == []
-          conn
-        end)
-
+    for protocol <- [:http2, :http1] do
+      assert {:ok, conn} = browser_connect(ctx, protocol)
+      assert Mint.HTTP.protocol(conn) == protocol
+      assert {:ok, conn, response} = request(conn, "GET", "/v2/whoami", headers)
+      assert response.status == 200
+      assert json(response)["person"] == ctx.person
+      assert [_] = header(response, "request-id")
       assert {:ok, _conn, %{status: 200}} = request(conn, "GET", "/sign-in")
-    end
-
-    test "the web origin does not mount the upload discard route", ctx do
-      ctx = Map.merge(ctx, web_origin(ctx, []))
-      assert {:ok, conn} = browser_connect(ctx, :http1)
-      headers = [{"cookie", cookie(ctx.cookie)}]
-
-      assert {:ok, _conn, response} = request(conn, "DELETE", "/v2/files/fs-test", headers)
-      assert response.status == 404
-      assert header(response, "request-id") == []
-    end
-
-    test "the server starts today's /relay WebSocket and no /v2 listener", ctx do
-      flags = Path.join(ctx.dir, "flags.json")
-      File.write!(flags, ~s({"client_api_v2":false}))
-
-      server =
-        start_supervised!({Server, Keyword.put(server_opts(ctx), :feature_flags_path, flags)})
-
-      refute Server.client_api_v2?(server)
-      assert child?(server, :web_socket)
-      refute child?(server, :client_api)
-
-      relay = Server.relay(server)
-      assert :ok = Relay.setup_person(relay, "A")
-
-      assert {:ok, _} =
-               Relay.setup_device_certificate(
-                 relay,
-                 "A",
-                 TLSFixtures.certificate_der!(ctx.certs, "a1")
-               )
-
-      assert {:ok, socket} = raw_connect(ctx.certs, Server.port(server), "a1")
-
-      :ok =
-        :ssl.send(socket, [
-          "GET /relay HTTP/1.1\r\nHost: relay.test\r\nUpgrade: websocket\r\n",
-          "Connection: Upgrade\r\nSec-WebSocket-Version: 13\r\n",
-          "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n",
-          "Sec-WebSocket-Protocol: attention-relay/1\r\n\r\n"
-        ])
-
-      assert {:ok, reply} = :ssl.recv(socket, 0, 5_000)
-      assert reply =~ "101 Switching Protocols"
-      :ssl.close(socket)
     end
   end
 
-  test "flag on: the device port serves /v2 only, with no /relay WebSocket", ctx do
-    flags = Path.join(ctx.dir, "flags.json")
-    File.write!(flags, ~s({"client_api_v2":true}))
+  test "the device port serves /v2 only, with no /relay WebSocket", ctx do
+    server = start_supervised!({Server, server_opts(ctx)})
 
-    server =
-      start_supervised!({Server, Keyword.put(server_opts(ctx), :feature_flags_path, flags)})
-
-    assert Server.client_api_v2?(server)
     assert child?(server, :client_api)
     refute child?(server, :web_socket)
 
@@ -1101,7 +1024,7 @@ defmodule AttentionServer.ClientAPIListenerTest do
       start_supervised!(
         {Relay,
          store_path: Path.join(dir, "web.sqlite3"),
-         feature_flags_path: flags_file(dir, Keyword.get(extra, :client_api_v2, false)),
+         client_api_v2: true,
          join_configuration: join,
          dashboard_origin: origin,
          enrollment_fixture_mode: true},
@@ -1147,12 +1070,6 @@ defmodule AttentionServer.ClientAPIListenerTest do
       cookie: cookie,
       sessions: sessions
     }
-  end
-
-  defp flags_file(dir, on?) do
-    path = Path.join(dir, "web-flags.json")
-    File.write!(path, ~s({"client_api_v2":#{on?}}))
-    path
   end
 
   defp server_opts(%{dir: dir, certs: certs}) do

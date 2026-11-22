@@ -301,7 +301,6 @@ defmodule AttentionServer.ClientAPIFeedClosingTest do
          certfile: Path.join(certs, "server.pem"),
          keyfile: Path.join(certs, "server.key"),
          skill_path: skill_path,
-         client_api_v2: true,
          client_api_routes: [ClientAPI.Feed]
        ]}
     )

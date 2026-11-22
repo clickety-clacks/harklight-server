@@ -2,9 +2,9 @@
 
 `AttentionServer.ChangeLog` is the per-person change log behind
 [client-api-v2.md](client-api-v2.md). The other client API v2 components
-code against the functions below. It runs only while the `client_api_v2`
-feature flag is on at startup; with the flag off, the store is unchanged and
-nothing is written.
+code against the functions below. The Relay enables it at startup, and the
+supervised Server always does; a store whose log is not enabled is unchanged
+and nothing is written.
 
 ## Model
 

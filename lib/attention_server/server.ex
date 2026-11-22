@@ -5,9 +5,6 @@ defmodule AttentionServer.Server do
   The device port serves client API v2 (`/v2`) through `ClientAPI.Listener`,
   for devices and registered agents alike. Protocol 0.1 agent and origin
   listeners are retired; their former port options are ignored.
-  The temporary `client_api_v2` flag is on by default (read once at startup from
-  the feature-flags file, see docs/feature-flags.md); setting it to false starts
-  the retained `/relay` WebSocket instead. The two never run together.
 
   Certificate paths and a durable store path are explicit operator config.
   Production deployment remains separate work.
@@ -24,23 +21,14 @@ defmodule AttentionServer.Server do
     HostedHTTP,
     OwnerTLS,
     PushDispatcher,
-    Relay,
-    WebSocketRelay
+    Relay
   }
 
   def start_link(opts), do: Supervisor.start_link(__MODULE__, opts, Keyword.take(opts, [:name]))
 
   def relay(server), do: child(server, :relay)
 
-  def port(server) do
-    if client_api_v2?(server),
-      do: server |> child(:client_api) |> ClientAPI.Listener.port(),
-      else: server |> child(:web_socket) |> WebSocketRelay.port()
-  end
-
-  @doc "Whether this server started with the `client_api_v2` flag on."
-  def client_api_v2?(server),
-    do: Enum.any?(Supervisor.which_children(server), &match?({:client_api, _, _, _}, &1))
+  def port(server), do: server |> child(:client_api) |> ClientAPI.Listener.port()
 
   def enroll_port(server), do: server |> child(:enrollment_https) |> EnrollmentHTTPS.port()
   def owner_port(server), do: server |> child(:owner_tls) |> OwnerTLS.port()
@@ -88,7 +76,6 @@ defmodule AttentionServer.Server do
         hosted_configuration(opts, deployment_mode, upload_cap, public_origin)
 
       apns_opts = Keyword.get(opts, :apns)
-      client_api_v2 = client_api_v2_flag(Keyword.get(opts, :feature_flags_path))
 
       relay_opts = [
         name: relay_name,
@@ -97,7 +84,9 @@ defmodule AttentionServer.Server do
         deployment_mode: deployment_mode,
         jev_score_record_path: Keyword.get(opts, :jev_score_record_path),
         feature_flags_path: Keyword.get(opts, :feature_flags_path),
-        client_api_v2: client_api_v2,
+        # Both change logs are always on under the Server. Passed explicitly
+        # so a Relay never reads `client_api_v2` from the feature-flags file.
+        client_api_v2: true,
         upload_cap: upload_cap
       ]
 
@@ -133,7 +122,6 @@ defmodule AttentionServer.Server do
         if dashboard_opts do
           dashboard_opts
           |> Keyword.put(:deployment_mode, deployment_mode)
-          |> Keyword.put(:client_api_v2, client_api_v2)
           |> Keyword.put(:public_origin, public_origin)
           |> Keyword.put(:hosted_addresses, hosted_addresses)
           |> Keyword.put(
@@ -175,19 +163,9 @@ defmodule AttentionServer.Server do
         ip: Keyword.get(opts, :owner_ip, {127, 0, 0, 1})
       ]
 
-      device_listener =
-        if client_api_v2 do
-          Supervisor.child_spec(
-            {ClientAPI.Listener, web_opts},
-            id: :client_api
-          )
-        else
-          Supervisor.child_spec({WebSocketRelay, web_opts}, id: :web_socket)
-        end
-
       children = [
         Supervisor.child_spec({Relay, relay_opts}, id: :relay),
-        device_listener,
+        Supervisor.child_spec({ClientAPI.Listener, web_opts}, id: :client_api),
         Supervisor.child_spec({OwnerTLS, owner_opts}, id: :owner_tls)
       ]
 
@@ -198,7 +176,7 @@ defmodule AttentionServer.Server do
               optional_child_spec(
                 :push_dispatcher,
                 PushDispatcher,
-                [relay: relay_name, apns: apns_opts, bounded_attempts: client_api_v2],
+                [relay: relay_name, apns: apns_opts],
                 :apns_dispatch,
                 :configuration,
                 :worker
@@ -262,11 +240,8 @@ defmodule AttentionServer.Server do
       # Last, so it stops first: open change feeds get closing: server_shutdown
       # before the listeners carrying them stop.
       children =
-        if client_api_v2,
-          do:
-            children ++
-              [Supervisor.child_spec(ClientAPI.FeedShutdown, id: :client_api_feed_shutdown)],
-          else: children
+        children ++
+          [Supervisor.child_spec(ClientAPI.FeedShutdown, id: :client_api_feed_shutdown)]
 
       Supervisor.init(children, strategy: :rest_for_one)
     else
@@ -280,13 +255,6 @@ defmodule AttentionServer.Server do
     kind, reason ->
       Diagnostics.failure(:server_startup, :configuration, {kind, reason}, :unavailable)
       :erlang.raise(kind, reason, __STACKTRACE__)
-  end
-
-  # On unless the feature-flags file sets the key to false. Relay receives
-  # this resolved value, so both change logs follow the same choice.
-  defp client_api_v2_flag(feature_flags_path) do
-    {flags, _warned} = AttentionServer.FeatureFlags.read(feature_flags_path, true)
-    Map.get(flags, "client_api_v2", true) == true
   end
 
   defp normalize_deployment_mode(mode) when mode in [:self_hosted, :saas], do: mode

@@ -28,14 +28,8 @@ defmodule AttentionServer.SessionWriter do
     end)
   end
 
-  defp write(socket, {:websocket, %AttentionServer.JSON.StreamedLine{} = line}),
-    do: AttentionServer.WebSocketRelay.send_text_stream(socket, line)
-
   defp write(socket, {_transport, %AttentionServer.JSON.StreamedLine{} = line}),
     do: AttentionServer.JSON.send_stream(socket, line)
-
-  defp write(socket, {:websocket, bytes}),
-    do: :ssl.send(socket, AttentionServer.WebSocketRelay.encode_text(bytes))
 
   defp write(socket, {_transport, bytes}), do: :ssl.send(socket, bytes)
 
