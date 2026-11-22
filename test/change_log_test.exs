@@ -2,10 +2,13 @@ defmodule AttentionServer.ChangeLogTest do
   use ExUnit.Case, async: false
 
   alias AttentionServer.{ChangeLog, Engine, JSON, PreChangeLogStore, Relay}
-  alias AttentionServer.ClientAPI.{FeedStep, Reads}
+  alias AttentionServer.ClientAPI.{Context, FeedStep, Principal, Reads}
   alias Exqlite.Sqlite3
 
   @handle "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+  @seed_bytes :binary.copy(<<0, 1, 254, 255>>, 300)
+  # A file inline in a frame, as a protocol 0.1 client sent it.
+  @seed_file %{"name" => "seed.bin", "data_base64" => Base.encode64(@seed_bytes)}
 
   setup do
     dir = Path.join(System.tmp_dir!(), "change-log-#{System.unique_integer([:positive])}")
@@ -1079,7 +1082,7 @@ defmodule AttentionServer.ChangeLogTest do
       store
       |> pre_log_people()
       |> PreChangeLogStore.setup_person("B")
-      |> pre_log_forward("one", 2)
+      |> pre_log_request("origin", Map.put(forward_frame("one", 2), "files", [@seed_file]))
       |> pre_log_forward("two", 3)
       |> pre_log_forward("three", 4)
       |> pre_log_request("reader", %{
@@ -1121,6 +1124,12 @@ defmodule AttentionServer.ChangeLogTest do
     assert {:ok, %{"rev" => cursor, "items" => items}} = Reads.inbox(relay, "reader")
     assert length(items) == 3
 
+    # The 0.1 inline file reads and downloads over v2 as it was written.
+    assert [%{"file_id" => file_id, "name" => "seed.bin"}] =
+             Enum.find(items, &(&1["message"]["message_id"] == "one"))["files"]
+
+    assert download(relay, file_id) == @seed_bytes
+
     assert {:ok, stored, false} =
              paused(relay, fn -> ChangeLog.rank_page(store(relay), "A", nil, 100) end)
 
@@ -1147,9 +1156,28 @@ defmodule AttentionServer.ChangeLogTest do
     assert store(relay).engine.conversation_opened == engine.conversation_opened
     assert {:ok, [], false, ^cursor} = log(relay, cursor)
     assert {:ok, %{"rev" => ^cursor, "items" => ^items}} = Reads.inbox(relay, "reader")
+    assert download(relay, file_id) == @seed_bytes
     GenServer.stop(relay)
 
     assert log_tables(ctx.path) == first
+  end
+
+  defp download(relay, file_id) do
+    context = %Context{
+      principal: %Principal{person: "A", kind: :device, key: "reader"},
+      relay: relay,
+      request_id: "req-1",
+      params: %{file_id: file_id}
+    }
+
+    conn =
+      Plug.Test.conn(:get, "/v2/files/" <> file_id)
+      |> Plug.Conn.assign(:client_api_request_id, "req-1")
+      |> Reads.get_file(context)
+
+    assert conn.status == 200
+    assert Plug.Conn.get_resp_header(conn, "content-type") == ["application/octet-stream"]
+    conn.resp_body
   end
 
   defp snapshot_status(path) do

@@ -213,6 +213,63 @@ defmodule AttentionServer.ClientAPIReadRoutesTest do
     assert downloaded.resp_body == @bytes
   end
 
+  test "a reply's staged files above the inline threshold are uploads, served after restart",
+       ctx do
+    %{relay: relay, reader: reader, der: der} = ctx
+    first = :binary.copy(<<7, 0, 255, 1>>, 40_000)
+    second = :binary.copy(<<3, 9, 0, 254>>, 30_000)
+    assert byte_size(first) + byte_size(second) > AttentionServer.ConversationFiles.inline_limit()
+
+    handles =
+      for {name, bytes, n} <- [{"first.bin", first, 130}, {"second.bin", second, 131}] do
+        conn =
+          conn(:post, "/v2/files", bytes)
+          |> put_req_header("idempotency-key", op(n))
+          |> put_req_header("content-length", Integer.to_string(byte_size(bytes)))
+          |> put_req_header("content-disposition", "attachment; filename*=UTF-8''" <> name)
+          |> then(&file_request(relay, der, &1))
+
+        assert conn.status == 201
+        body(conn)["file_id"]
+      end
+
+    {:ok, %{"items" => items}} = Reads.inbox(relay, reader)
+    item = Enum.find(items, &(&1["message"]["message_id"] == "two"))
+
+    reply =
+      conn(
+        :post,
+        "/v2/items/" <> item["item_id"] <> "/replies",
+        JSON.encode!(%{"text" => "Two files", "file_ids" => handles})
+      )
+      |> put_req_header("content-type", "application/json")
+      |> put_req_header("idempotency-key", op(132))
+      |> then(&file_request(relay, der, &1))
+
+    assert reply.status == 200
+    assert [%{"file_id" => first_id}, %{"file_id" => second_id}] = body(reply)["entry"]["files"]
+
+    engine = :sys.get_state(relay).store.engine
+
+    assert [%{payload: %{"files" => stored}}] =
+             engine.conversation_events
+             |> Map.values()
+             |> Enum.filter(&match?(%{payload: %{"files" => [_ | _]}}, &1))
+
+    assert Enum.map(stored, &{&1["name"], &1["tier"]}) ==
+             [{"first.bin", "upload"}, {"second.bin", "upload"}]
+
+    assert Enum.all?(stored, &Map.has_key?(engine.uploads, &1["upload_id"]))
+    relay = restart_relay(ctx)
+
+    for {id, bytes} <- [{first_id, first}, {second_id, second}] do
+      downloaded = file_request(relay, der, conn(:get, "/v2/files/" <> id))
+      assert downloaded.status == 200
+      assert downloaded.resp_body == bytes
+      assert get_resp_header(downloaded, "content-type") == ["application/octet-stream"]
+    end
+  end
+
   test "discard cleanup retries after unlink failure on replay and after restart", ctx do
     %{relay: relay, der: der} = ctx
     store = :sys.get_state(relay).store

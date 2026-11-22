@@ -1424,6 +1424,33 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
     end
   end
 
+  # Two staged files with the same bytes under one name attach as one upload
+  # twice. Today's refusal names no field, and no message is sent.
+  test "a send naming two staged files under one name is refused", ctx do
+    handles =
+      for n <- [1, 2] do
+        assert %{"file_id" => handle} =
+                 contract(ctx, "FileCreated", upload(ctx, "a1", n, "same bytes"))
+
+        handle
+      end
+
+    refute Enum.at(handles, 0) == Enum.at(handles, 1)
+
+    body = %{
+      "sender" => "app:test",
+      "session" => @first_session,
+      "message" => %{"title" => "Twins", "created_at" => 1},
+      "file_ids" => handles
+    }
+
+    refused = request(ctx, "a1", "POST", "/v2/agent/messages", body, 3)
+    assert refused.status == 400
+    assert {:ok, %{"error" => "invalid_field"} = error} = JSON.decode_line(refused.body <> "\n")
+    refute Map.has_key?(error, "field")
+    assert :sys.get_state(ctx.relay).store.engine.messages == %{}
+  end
+
   defp upload(ctx, name, n, data) do
     headers = [
       {"content-type", "text/plain"},

@@ -92,6 +92,14 @@ defmodule AttentionServer.ConversationFeedTest do
 
   defp op(n), do: "00000000-0000-4000-8000-#{String.pad_leading(Integer.to_string(n), 12, "0")}"
 
+  defp regular_files(dir) do
+    dir
+    |> Path.join("**")
+    |> Path.wildcard(match_dot: true)
+    |> Enum.filter(&File.regular?/1)
+    |> Enum.sort()
+  end
+
   defp request(relay, key, frame) do
     assert {:ok, line} =
              Relay.request_line(relay, key, JSON.encode!(Map.put(frame, "v", 1)) <> "\n")
@@ -732,7 +740,8 @@ defmodule AttentionServer.ConversationFeedTest do
     GenServer.stop(relay)
   end
 
-  test "aggregate inline attachments above the threshold use the upload tier", %{path: path} do
+  test "inline attachments up to the threshold stay inline; above it the frame is refused",
+       %{path: path} do
     assert {:ok, relay} = Relay.start_link(store_path: path)
     assert :ok = Relay.setup_person(relay, "A")
     assert :ok = Relay.setup_device(relay, "A", "origin")
@@ -779,8 +788,12 @@ defmodule AttentionServer.ConversationFeedTest do
     assert byte_size(inline_bytes) < 262_144
     assert byte_size(overflow_bytes) < 262_144
     assert byte_size(inline_bytes) + byte_size(overflow_bytes) > 262_144
+    before = :sys.get_state(relay).store
+    stored_files = regular_files(before.upload_dir)
 
-    assert %{"type" => "ok"} =
+    # Protocol 0.1 staged the overflow as an upload. Nothing stages inline
+    # data now: the engine refuses the entry, and no upload row or file is left.
+    assert %{"type" => "error", "reason" => "invalid_field", "field" => "files"} =
              request(relay, "reader", %{
                "type" => "discussion",
                "op_id" => op(502),
@@ -794,21 +807,13 @@ defmodule AttentionServer.ConversationFeedTest do
                ]
              })
 
-    assert {:ok, %{"entries" => [_, pending]}} = Relay.origin_feed(relay, "origin", 0)
-    assert pending["delivered"] == false
-    assert [inline, uploaded] = pending["files"]
-    assert inline["tier"] == "inline"
-    assert Base.decode64!(inline["data_base64"]) == inline_bytes
-    assert inline["sha256"] == Base.encode16(:crypto.hash(:sha256, inline_bytes), case: :lower)
-    assert uploaded["tier"] == "upload"
-    assert uploaded["name"] == "overflow.bin"
-    assert uploaded["size"] == byte_size(overflow_bytes)
+    after_refusal = :sys.get_state(relay).store
+    assert after_refusal.engine == before.engine
+    assert after_refusal.engine.uploads == %{}
 
-    assert uploaded["sha256"] ==
-             Base.encode16(:crypto.hash(:sha256, overflow_bytes), case: :lower)
+    assert regular_files(after_refusal.upload_dir) == stored_files
 
-    assert {:ok, _upload, fetched_path} = Relay.fetch_file(relay, "origin", uploaded["upload_id"])
-    assert File.read!(fetched_path) == overflow_bytes
+    assert {:ok, %{"entries" => [_]}} = Relay.origin_feed(relay, "origin", 0)
 
     assert {:ok, %{"inline_decoded_bytes_per_entry" => 262_144}} =
              Relay.origin_file_limits(relay, "origin")
