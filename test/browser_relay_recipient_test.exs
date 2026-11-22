@@ -138,7 +138,6 @@ defmodule AttentionServer.BrowserRelayRecipientTest do
 
     assert :ok = Relay.end_browser_session(c.relay, @browser_session)
     state = :sys.get_state(c.relay)
-    assert state.sessions == %{}
     refute Map.has_key?(state.store.engine.devices, actor)
 
     GenServer.stop(c.relay)

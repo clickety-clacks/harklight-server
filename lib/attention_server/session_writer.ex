@@ -28,9 +28,6 @@ defmodule AttentionServer.SessionWriter do
     end)
   end
 
-  defp write(socket, {_transport, %AttentionServer.JSON.StreamedLine{} = line}),
-    do: AttentionServer.JSON.send_stream(socket, line)
-
   defp write(socket, {_transport, bytes}), do: :ssl.send(socket, bytes)
 
   def close(socket) do

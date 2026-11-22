@@ -1,7 +1,7 @@
 defmodule AttentionServer.ChatAfterTerminalTest do
   use ExUnit.Case, async: false
 
-  alias AttentionServer.{AgentAPIInProcess, JSON, Relay}
+  alias AttentionServer.{AgentAPIInProcess, JSON, Relay, RelayReaders}
   alias AttentionServer.AgentAPI.FeedActivity
 
   @handle "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
@@ -193,7 +193,7 @@ defmodule AttentionServer.ChatAfterTerminalTest do
            |> Enum.map(& &1["text"]) == ["One", "Two", "Three"]
 
     # The person event is recorded as acted on once.
-    assert {:ok, events, _high} = Relay.conversation_events(relay, "reader", 0)
+    assert {:ok, events, _high} = RelayReaders.conversation_events(relay, "reader", 0)
     assert Enum.count(events, &(&1["kind"] == "acted")) == 1
   end
 

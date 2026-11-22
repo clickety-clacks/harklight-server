@@ -85,6 +85,7 @@ defmodule AttentionServer.APNSPushTest do
     Engine,
     JSON,
     Relay,
+    RelayReaders,
     Server,
     TLSFixtures
   }
@@ -1727,7 +1728,7 @@ defmodule AttentionServer.APNSPushTest do
     assert_push_accepted(restarted_relay, slow_key, 2)
 
     assert {:ok, [%{"message_id" => "first-push"}], 1} =
-             Relay.events(restarted_relay, slow_key, 0)
+             RelayReaders.events(restarted_relay, slow_key, 0)
   end
 
   defp dispatch_stalled_attempt(state) do

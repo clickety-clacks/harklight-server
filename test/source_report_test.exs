@@ -1,7 +1,7 @@
 defmodule AttentionServer.SourceReportTest do
   use ExUnit.Case, async: false
 
-  alias AttentionServer.{Engine, JSON, Relay, Store}
+  alias AttentionServer.{Engine, JSON, Relay, RelayReaders, Store}
   alias Exqlite.Sqlite3
 
   setup do
@@ -379,7 +379,7 @@ defmodule AttentionServer.SourceReportTest do
     {:ok, restarted} =
       Relay.start_link(store_path: path, source_fixture_mode: true, agent_fixture_mode: true)
 
-    assert {:ok, [%{"message_id" => "legacy"}], 1} = Relay.events(restarted, "a1", 0)
+    assert {:ok, [%{"message_id" => "legacy"}], 1} = RelayReaders.events(restarted, "a1", 0)
 
     assert :ok =
              Relay.grant_source_report(

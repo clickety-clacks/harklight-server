@@ -1,7 +1,7 @@
 defmodule AttentionServer.RelayTest do
   use ExUnit.Case, async: true
 
-  alias AttentionServer.{JSON, Relay}
+  alias AttentionServer.{JSON, Relay, RelayReaders}
   alias AttentionServer.JSON.DecimalToken
 
   @moduletag :tmp_dir
@@ -66,15 +66,15 @@ defmodule AttentionServer.RelayTest do
                "ref" => "r1"
              })
 
-    assert {:ok, [origin], 1} = Relay.events(relay, "a1", 0)
+    assert {:ok, [origin], 1} = RelayReaders.events(relay, "a1", 0)
     assert Map.keys(origin) |> Enum.sort() == ~w(message_id origin sender_id seq type v)
     assert origin["origin"] == "a1"
     refute String.contains?(JSON.encode!(origin), "first")
 
-    assert {:ok, [remote], 1} = Relay.events(relay, "a2", 0)
+    assert {:ok, [remote], 1} = RelayReaders.events(relay, "a2", 0)
     assert remote["message"] == original
     assert remote["as"] == "knock"
-    assert {:ok, [], 0} = Relay.events(relay, "b1", 0)
+    assert {:ok, [], 0} = RelayReaders.events(relay, "b1", 0)
 
     assert %{"type" => "ok", "seq" => 1} =
              request(relay, "b1", %{
@@ -83,9 +83,9 @@ defmodule AttentionServer.RelayTest do
                "message" => %{original | "title" => "B secret"}
              })
 
-    assert {:ok, [b_origin], 1} = Relay.events(relay, "b1", 0)
+    assert {:ok, [b_origin], 1} = RelayReaders.events(relay, "b1", 0)
     assert b_origin["origin"] == "b1"
-    assert {:ok, [a_remote], 1} = Relay.events(relay, "a2", 0)
+    assert {:ok, [a_remote], 1} = RelayReaders.events(relay, "a2", 0)
     assert a_remote["message"]["title"] == "first"
   end
 
@@ -118,7 +118,7 @@ defmodule AttentionServer.RelayTest do
                "message" => %{message("other") | "sender_id" => "agentd://hostile/app"}
              })
 
-    assert {:ok, [_], 1} = Relay.events(relay, "a1", 0)
+    assert {:ok, [_], 1} = RelayReaders.events(relay, "a1", 0)
 
     # The earlier rejected operation was not reserved; granting this device
     # permits the same stable operation ID to succeed once.
@@ -162,7 +162,7 @@ defmodule AttentionServer.RelayTest do
                "message" => %{original | "title" => "changed"}
              })
 
-    assert {:ok, [remote], 1} = Relay.events(relay, "a2", 0)
+    assert {:ok, [remote], 1} = RelayReaders.events(relay, "a2", 0)
     assert remote["message"] == original
   end
 
@@ -188,12 +188,12 @@ defmodule AttentionServer.RelayTest do
                "answer" => nil
              })
 
-    assert {:ok, [_, origin_terminal], 2} = Relay.events(relay, "a1", 0)
+    assert {:ok, [_, origin_terminal], 2} = RelayReaders.events(relay, "a1", 0)
     assert Map.has_key?(origin_terminal, "answer")
     assert is_nil(origin_terminal["answer"])
     assert origin_terminal["by"] == "answer"
     refute Map.has_key?(origin_terminal, "terminal_actor")
-    assert {:ok, [_, remote_terminal], 2} = Relay.events(relay, "a2", 0)
+    assert {:ok, [_, remote_terminal], 2} = RelayReaders.events(relay, "a2", 0)
     refute Map.has_key?(remote_terminal, "answer")
 
     assert %{"type" => "ok", "seq" => 2, "duplicate" => true} =
@@ -250,7 +250,7 @@ defmodule AttentionServer.RelayTest do
                "message" => %{message() | "title" => "cannot reopen"}
              })
 
-    assert {:ok, [_, _], 2} = Relay.events(relay, "a1", 0)
+    assert {:ok, [_, _], 2} = RelayReaders.events(relay, "a1", 0)
 
     assert :ok = Relay.revoke_device(relay, "a2")
 
@@ -294,7 +294,7 @@ defmodule AttentionServer.RelayTest do
 
     assert Enum.sort(Enum.map(results, & &1["type"])) == ["error", "ok"]
     assert Enum.any?(results, &match?(%{"reason" => "closed"}, &1))
-    assert {:ok, [_, terminal], 2} = Relay.events(relay, "a1", 0)
+    assert {:ok, [_, terminal], 2} = RelayReaders.events(relay, "a1", 0)
     assert terminal["answer"] in ["X", "Y"]
   end
 
@@ -329,7 +329,7 @@ defmodule AttentionServer.RelayTest do
                "by" => "self-reported"
              })
 
-    assert {:ok, [_, result], 2} = Relay.events(relay, "a1", 0)
+    assert {:ok, [_, result], 2} = RelayReaders.events(relay, "a1", 0)
     assert result["state"] == "answered"
     refute Map.has_key?(result, "answer")
   end
@@ -339,7 +339,7 @@ defmodule AttentionServer.RelayTest do
   } do
     assert {:error, :forbidden} = Relay.request_line(relay, "unknown", "{oops}\n")
     assert :ok = Relay.revoke_device(relay, "a2")
-    assert {:error, :forbidden} = Relay.events(relay, "a2", 0)
+    assert {:error, :forbidden} = RelayReaders.events(relay, "a2", 0)
 
     for raw <- ["{oops}\n", "{}", "1.5\n", "{\"v\":1,\"v\":1}\n"] do
       assert {:ok, line} = Relay.request_line(relay, "a1", raw)
@@ -366,16 +366,13 @@ defmodule AttentionServer.RelayTest do
              request(relay, "a1", %{"type" => "resync", "since" => 0})
 
     assert %{"reason" => "unknown_type"} = request(relay, "a1", %{"type" => "invented"})
-    assert {:ok, [], 0} = Relay.events(relay, "a1", 0)
+    assert {:ok, [], 0} = RelayReaders.events(relay, "a1", 0)
   end
 
   # Protocol 0.1 paged startup (inbox_start through inbox_attach) is gone.
-  # Every path that still takes a device frame answers it as an unknown type
-  # and writes no paging state.
-  test "the 0.1 inbox paging frames are unknown types and store no snapshot", %{
-    relay: relay,
-    tmp_dir: dir
-  } do
+  # The remaining device line seam answers it as an unknown type and writes
+  # no paging state.
+  test "the 0.1 inbox paging frames are unknown types and store no snapshot", %{relay: relay} do
     refute Code.ensure_loaded?(AttentionServer.InboxPaging)
 
     frames = [
@@ -400,28 +397,13 @@ defmodule AttentionServer.RelayTest do
       }
     ]
 
-    assert {:ok, raw} = Relay.open_session(relay, "a1")
-    assert {:ok, websocket} = Relay.open_websocket_session(relay, "a2", nil, nil)
-    path = Path.join(dir, "frame.json")
-
     for frame <- frames do
       frame = Map.merge(frame, %{"v" => 1, "ref" => frame["type"]})
-      line = JSON.encode!(frame) <> "\n"
-      File.write!(path, line)
       ref = frame["ref"]
 
-      assert %{"type" => "error", "reason" => "unknown_type", "ref" => ^ref} =
-               request(relay, "a1", frame)
-
-      for {session, reply} <- [
-            {raw, Relay.session_request_line(relay, raw, line)},
-            {websocket, Relay.session_request_line(relay, websocket, line)},
-            {websocket, Relay.session_request_file(relay, websocket, path)}
-          ] do
-        assert {:ok, [reply_line]} = reply, inspect(session)
-
-        assert {:ok, %{"type" => "error", "reason" => "unknown_type", "ref" => ^ref}} =
-                 JSON.decode_line(reply_line)
+      for key <- ["a1", "a2"] do
+        assert %{"type" => "error", "reason" => "unknown_type", "ref" => ^ref} =
+                 request(relay, key, frame)
       end
     end
 
@@ -429,16 +411,13 @@ defmodule AttentionServer.RelayTest do
     refute Map.has_key?(state, :inbox_builds)
     refute Map.has_key?(state, :inbox_build_monitors)
     assert {:ok, nil} = AttentionServer.Store.inbox_startup(state.store, "A", "a2", "s")
-    assert {:ok, [], 0} = Relay.events(relay, "a1", 0)
+    assert {:ok, [], 0} = RelayReaders.events(relay, "a1", 0)
   end
 
-  # Protocol 0.1 Route B reads (inbox_list, conversation_page) are gone, and
-  # conversation_open no longer has a bounded form: the bounded member is
-  # ignored, as it was before Route B, so the open is the legacy one.
-  test "the 0.1 Route B frames are unknown types and a bounded open is the legacy open", %{
-    relay: relay,
-    tmp_dir: dir
-  } do
+  # Protocol 0.1 Route B reads (inbox_list, conversation_page) are gone; the
+  # remaining device line seam answers them as unknown types and changes
+  # nothing, and the priority view keeps no Route B order snapshot.
+  test "the 0.1 Route B frames are unknown types", %{relay: relay} do
     assert %{"type" => "ok"} =
              request(relay, "a1", %{"type" => "forward", "op_id" => op(1), "message" => message()})
 
@@ -447,58 +426,19 @@ defmodule AttentionServer.RelayTest do
       %{"type" => "conversation_page", "sender_id" => "app:test", "message_id" => "m"}
     ]
 
-    assert {:ok, raw} = Relay.open_session(relay, "a1")
-    assert {:ok, websocket} = Relay.open_websocket_session(relay, "a2", nil, nil)
-    path = Path.join(dir, "frame.json")
     before = :sys.get_state(relay).store.engine
 
     for frame <- frames do
       frame = Map.merge(frame, %{"v" => 1, "ref" => frame["type"]})
-      line = JSON.encode!(frame) <> "\n"
-      File.write!(path, line)
       ref = frame["ref"]
 
-      assert %{"type" => "error", "reason" => "unknown_type", "ref" => ^ref} =
-               request(relay, "a1", frame)
-
-      for {session, reply} <- [
-            {raw, Relay.session_request_line(relay, raw, line)},
-            {websocket, Relay.session_request_line(relay, websocket, line)},
-            {websocket, Relay.session_request_file(relay, websocket, path)}
-          ] do
-        assert {:ok, [reply_line]} = reply, inspect(session)
-
-        assert {:ok, %{"type" => "error", "reason" => "unknown_type", "ref" => ^ref}} =
-                 JSON.decode_line(reply_line)
+      for key <- ["a1", "a2"] do
+        assert %{"type" => "error", "reason" => "unknown_type", "ref" => ^ref} =
+                 request(relay, key, frame)
       end
     end
 
     assert :sys.get_state(relay).store.engine == before
-
-    for {session, bounded} <- [{raw, true}, {websocket, "yes"}] do
-      resync = JSON.encode!(%{"v" => 1, "type" => "resync", "since" => 0}) <> "\n"
-      assert {:ok, [_ok | _]} = Relay.session_request_line(relay, session, resync)
-
-      open =
-        JSON.encode!(%{
-          "v" => 1,
-          "type" => "conversation_open",
-          "since" => 0,
-          "bounded" => bounded
-        }) <>
-          "\n"
-
-      assert {:ok, [ok, resynced]} = Relay.session_request_line(relay, session, open)
-      assert {:ok, %{"type" => "ok"}} = JSON.decode_line(ok)
-
-      assert {:ok, %{"type" => "conversation_resynced", "chat_read_positions" => []} = resynced} =
-               JSON.decode_line(resynced)
-
-      refute Map.has_key?(resynced, "view_rev")
-      session_state = :sys.get_state(relay).sessions[session]
-      refute session_state.view_support
-      refute Map.has_key?(session_state, :sync_mode)
-    end
 
     view = :sys.get_state(relay).priority_views["A"]
     refute Map.has_key?(view, :message_order)

@@ -1,7 +1,7 @@
 defmodule AttentionServer.MessageFieldsRelayTest do
   use ExUnit.Case, async: false
 
-  alias AttentionServer.{AgentAPIInProcess, JSON, Placement, Relay}
+  alias AttentionServer.{AgentAPIInProcess, JSON, Placement, Relay, RelayReaders}
   alias AttentionServer.ClientAPI.AgentReads
 
   @handle "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
@@ -122,7 +122,7 @@ defmodule AttentionServer.MessageFieldsRelayTest do
                "message" => original
              })
 
-    assert {:ok, [delivery], 1} = Relay.events(relay, "reader", 0)
+    assert {:ok, [delivery], 1} = RelayReaders.events(relay, "reader", 0)
     assert delivery["type"] == "delivery"
     assert delivery["message"] == Map.delete(original, "choice_styles")
     GenServer.stop(relay)
@@ -160,7 +160,7 @@ defmodule AttentionServer.MessageFieldsRelayTest do
                "message" => typed
              })
 
-    assert {:ok, [delivery], 1} = Relay.events(relay, "reader", 0)
+    assert {:ok, [delivery], 1} = RelayReaders.events(relay, "reader", 0)
     assert delivery["message"] == typed
 
     assert %{"revision" => 1, "message" => content} = origin_message(relay, "typed-request")
@@ -213,7 +213,7 @@ defmodule AttentionServer.MessageFieldsRelayTest do
                "message" => invalid_kind
              })
 
-    assert {:ok, events, 2} = Relay.events(relay, "reader", 1)
+    assert {:ok, events, 2} = RelayReaders.events(relay, "reader", 1)
     dropped_kind_delivery = Enum.find(events, &(&1["message"]["message_id"] == "bad-kind"))
     refute Map.has_key?(dropped_kind_delivery["message"], "message_kind")
 
@@ -307,7 +307,7 @@ defmodule AttentionServer.MessageFieldsRelayTest do
     assert detail =~ "illustrations[0].primitives[0].file"
     assert detail =~ "missing.png"
     assert detail =~ "cover.png"
-    assert {:ok, [degraded], 1} = Relay.events(relay, "reader", 0)
+    assert {:ok, [degraded], 1} = RelayReaders.events(relay, "reader", 0)
 
     assert degraded["message"]["answer_ui"] == %{
              "schema" => "attention-client.actions/1",
@@ -355,7 +355,7 @@ defmodule AttentionServer.MessageFieldsRelayTest do
              })
 
     refute Map.has_key?(reply, "field_warnings")
-    assert {:ok, [_, _, delivery], 3} = Relay.events(relay, "reader", 0)
+    assert {:ok, [_, _, delivery], 3} = RelayReaders.events(relay, "reader", 0)
     assert delivery["message"] == valid_message
     GenServer.stop(relay)
   end
@@ -425,7 +425,7 @@ defmodule AttentionServer.MessageFieldsRelayTest do
 
     assert {:ok, response} = Relay.request_line(relay, "origin", raw)
     assert {:ok, %{"type" => "ok"}} = JSON.decode_line(response)
-    assert {:ok, [delivery], 1} = Relay.events(relay, "reader", 0)
+    assert {:ok, [delivery], 1} = RelayReaders.events(relay, "reader", 0)
     delivered_document = delivery["message"]["answer_ui"]
     assert byte_size(JSON.encode!(delivered_document)) == 65_536
     assert :ok = AttentionServer.UI1.validate(delivered_document, [])
@@ -469,7 +469,7 @@ defmodule AttentionServer.MessageFieldsRelayTest do
              })
 
     assert detail =~ "at least one input"
-    assert {:ok, [no_input_delivery], 1} = Relay.events(relay, "reader", 0)
+    assert {:ok, [no_input_delivery], 1} = RelayReaders.events(relay, "reader", 0)
     assert no_input_delivery["message"]["answer_ui"]["schema"] == "attention-client.actions/1"
     assert no_input_delivery["message"]["answer_ui_unavailable"] == detail
 
@@ -668,7 +668,7 @@ defmodule AttentionServer.MessageFieldsRelayTest do
                "answer" => "None of these; do something else"
              })
 
-    assert {:ok, [_, terminal], 2} = Relay.events(relay, "origin", 0)
+    assert {:ok, [_, terminal], 2} = RelayReaders.events(relay, "origin", 0)
     assert terminal["answer"] == "None of these; do something else"
     GenServer.stop(relay)
   end
@@ -777,7 +777,7 @@ defmodule AttentionServer.MessageFieldsRelayTest do
     assert content == without_ids(original)
     refute Map.has_key?(content, "message_type")
 
-    assert {:ok, [delivery], 1} = Relay.events(relay, "reader", 0)
+    assert {:ok, [delivery], 1} = RelayReaders.events(relay, "reader", 0)
     assert delivery["message"] == original
 
     GenServer.stop(relay)
@@ -984,7 +984,7 @@ defmodule AttentionServer.MessageFieldsRelayTest do
     terminal_seq =
       :sys.get_state(restarted).store.engine.messages[{"person-a", "app:test", "defaulted"}].terminal.seq
 
-    assert {:ok, events, 3} = Relay.events(restarted, "reader", 1)
+    assert {:ok, events, 3} = RelayReaders.events(restarted, "reader", 1)
     assert length(events) == 2
     unrelated_delivery = Enum.find(events, &(&1["type"] == "delivery"))
     lifecycle = Enum.find(events, &(&1["type"] == "lifecycle"))
@@ -1013,7 +1013,7 @@ defmodule AttentionServer.MessageFieldsRelayTest do
     GenServer.stop(restarted)
 
     second_restart = start_relay(path)
-    assert {:ok, [], 3} = Relay.events(second_restart, "reader", 3)
+    assert {:ok, [], 3} = RelayReaders.events(second_restart, "reader", 3)
     GenServer.stop(second_restart)
   end
 end

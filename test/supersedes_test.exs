@@ -1,7 +1,7 @@
 defmodule AttentionServer.SupersedesTest do
   use ExUnit.Case, async: false
 
-  alias AttentionServer.{AgentAPIInProcess, JSON, Relay}
+  alias AttentionServer.{AgentAPIInProcess, JSON, Relay, RelayReaders}
   alias AttentionServer.ClientAPI.Reads
 
   @first_session "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
@@ -24,20 +24,6 @@ defmodule AttentionServer.SupersedesTest do
 
     assert {:ok, response} = JSON.decode_line(line)
     response
-  end
-
-  defp session_request(relay, session, frame) do
-    assert {:ok, lines} =
-             Relay.session_request_line(
-               relay,
-               session,
-               JSON.encode!(Map.put(frame, "v", 1)) <> "\n"
-             )
-
-    Enum.map(lines, fn line ->
-      assert {:ok, response} = JSON.decode_line(line)
-      response
-    end)
   end
 
   defp send_request(relay, device, session, id, operation, extra \\ %{}) do
@@ -102,15 +88,8 @@ defmodule AttentionServer.SupersedesTest do
     assert %{"seq" => 1} = send_request(relay, "other", @first_session, "m1", 5)
     {_, first_feed_position} = agent_changes(relay, "A", "first", 0)
 
-    assert {:ok, phone_session} = Relay.open_session(relay, "phone")
-
-    assert [%{"type" => "ok"} | initial_replay] =
-             session_request(relay, phone_session, %{"type" => "resync", "since" => 0})
-
-    assert %{"type" => "resynced", "seq" => 4} = List.last(initial_replay)
-
-    assert [%{"type" => "ok", "seq" => 4}] =
-             session_request(relay, phone_session, %{"type" => "ack", "seq" => 4})
+    # The phone's replay reaches seq 4 before the superseding send.
+    assert {:ok, _initial_replay, 4} = RelayReaders.events(relay, "phone", 0)
 
     listed = ["m1", "m2", "answered", "missing", 7, "m1", "new"]
 
@@ -126,13 +105,8 @@ defmodule AttentionServer.SupersedesTest do
                "supersedes" => listed
              })
 
-    assert {:ok, live_lines} = Relay.session_drain(relay, phone_session)
-
-    live =
-      Enum.map(live_lines, fn line ->
-        assert {:ok, event} = JSON.decode_line(line)
-        event
-      end)
+    # The phone's live events after seq 4.
+    assert {:ok, live, 7} = RelayReaders.events(relay, "phone", 4)
 
     assert Enum.map(live, & &1["seq"]) == [5, 6, 7]
     assert hd(live)["message"]["supersedes"] == listed
@@ -159,7 +133,7 @@ defmodule AttentionServer.SupersedesTest do
                "supersedes" => listed
              })
 
-    assert {:ok, events, 7} = Relay.events(relay, "phone", 0)
+    assert {:ok, events, 7} = RelayReaders.events(relay, "phone", 0)
     assert Enum.at(events, 4)["message"]["supersedes"] == listed
 
     assert Enum.map(Enum.drop(events, 5), &{&1["message_id"], &1["state"]}) ==
@@ -205,29 +179,24 @@ defmodule AttentionServer.SupersedesTest do
                "supersedes" => "m1"
              })
 
-    assert {:ok, [_only_other_account_delivery], 1} = Relay.events(relay, "other", 0)
+    assert {:ok, [_only_other_account_delivery], 1} = RelayReaders.events(relay, "other", 0)
     GenServer.stop(relay)
 
     assert {:ok, restarted} = Relay.start_link(store_path: path)
-    assert {:ok, replayed, 9} = Relay.events(restarted, "phone", 0)
+    assert {:ok, replayed, 9} = RelayReaders.events(restarted, "phone", 0)
     assert Enum.at(replayed, 4)["message"]["supersedes"] == listed
 
     assert Enum.map(Enum.slice(replayed, 5, 2), &{&1["message_id"], &1["state"]}) ==
              [{"m1", "superseded"}, {"m2", "superseded"}]
 
-    assert {:ok, replay_session} = Relay.open_session(restarted, "phone")
-
-    assert [%{"type" => "ok"} | catchup] =
-             session_request(restarted, replay_session, %{"type" => "resync", "since" => 4})
-
-    assert Enum.map(Enum.take(catchup, 5), & &1["seq"]) == [5, 6, 7, 8, 9]
+    # Catch-up from seq 4 after the restart.
+    assert {:ok, catchup, 9} = RelayReaders.events(restarted, "phone", 4)
+    assert Enum.map(catchup, & &1["seq"]) == [5, 6, 7, 8, 9]
 
     assert Enum.map(Enum.slice(catchup, 1, 2), &{&1["message_id"], &1["state"]}) ==
              [{"m1", "superseded"}, {"m2", "superseded"}]
 
-    assert %{"type" => "resynced", "seq" => 9} = List.last(catchup)
-
-    assert {:ok, [_only_other_account_delivery], 1} = Relay.events(restarted, "other", 0)
+    assert {:ok, [_only_other_account_delivery], 1} = RelayReaders.events(restarted, "other", 0)
     GenServer.stop(restarted)
   end
 

@@ -2,7 +2,7 @@ defmodule AttentionServer.ChangeLogTest do
   use ExUnit.Case, async: false
 
   alias AttentionServer.{AgentAPIInProcess, ChangeLog, Engine, JSON, PreChangeLogStore, Relay}
-  alias AttentionServer.ClientAPI.{Context, FeedStep, Principal, Reads}
+  alias AttentionServer.ClientAPI.{Context, FeedStep, Principal, Reads, Resources}
   alias Exqlite.Sqlite3
 
   @handle "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
@@ -1154,6 +1154,13 @@ defmodule AttentionServer.ChangeLogTest do
 
     assert Enum.map(stored, &elem(&1, 0)) == Enum.map(items, & &1["item_id"])
     assert Map.new(stored) == Map.new(items, &{&1["item_id"], &1["rank"]})
+
+    # The stored ranks are exactly the rank hook's output for the priority
+    # view, which stays the rank input without the 0.1 view fields.
+    state = :sys.get_state(relay)
+    assert {:ok, keys} = paused(relay, fn -> ChangeLog.rank_keys(store(relay), "A") end)
+    ranks = Resources.ranks(state.store.engine, "A", state.priority_views["A"], keys)
+    assert as_json(ranks) == as_json(Map.new(stored))
     GenServer.stop(relay)
 
     first = log_tables(ctx.path)
@@ -1169,17 +1176,31 @@ defmodule AttentionServer.ChangeLogTest do
     assert first["relay_inbox_item_pages"] ==
              Enum.filter(seeded["relay_inbox_item_pages"], &("reader-startup-snapshot" in &1))
 
+    # The second start re-ranks from the rebuilt view: the stored ranks, the
+    # inbox order and the cursors are unchanged, and #254 does not fire again.
     relay = start(ctx)
     assert store(relay).engine.cursors == engine.cursors
     assert store(relay).engine.conversation_cursors == engine.conversation_cursors
     assert store(relay).engine.conversation_opened == engine.conversation_opened
     assert {:ok, [], false, ^cursor} = log(relay, cursor)
     assert {:ok, %{"rev" => ^cursor, "items" => ^items}} = Reads.inbox(relay, "reader")
+
+    assert {:ok, ^stored, false} =
+             paused(relay, fn -> ChangeLog.rank_page(store(relay), "A", nil, 100) end)
+
     assert download(relay, file_id) == @seed_bytes
     assert store(relay).engine.origin_sessions[{"A", "origin", @handle}].support == support
     GenServer.stop(relay)
 
-    assert log_tables(ctx.path) == first
+    second = log_tables(ctx.path)
+    assert second["client_ranks"] == first["client_ranks"]
+    assert second["client_change_log_epoch"] == []
+    assert second == first
+  end
+
+  defp as_json(value) do
+    assert {:ok, decoded} = JSON.decode_line(JSON.encode!(value) <> "\n")
+    decoded
   end
 
   defp download(relay, file_id) do

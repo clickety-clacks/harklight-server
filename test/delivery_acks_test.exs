@@ -1,7 +1,16 @@
 defmodule AttentionServer.DeliveryAcksTest do
   use ExUnit.Case, async: false
 
-  alias AttentionServer.{AgentAPIInProcess, Engine, JSON, PreChangeLogStore, Relay, Store}
+  alias AttentionServer.{
+    AgentAPIInProcess,
+    Engine,
+    JSON,
+    PreChangeLogStore,
+    Relay,
+    RelayReaders,
+    Store
+  }
+
   alias Exqlite.Sqlite3
 
   @handle "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
@@ -134,7 +143,7 @@ defmodule AttentionServer.DeliveryAcksTest do
   end
 
   defp facts(relay, key \\ "phone") do
-    {:ok, events, _} = Relay.conversation_events(relay, key, 0)
+    {:ok, events, _} = RelayReaders.conversation_events(relay, key, 0)
     events
   end
 
@@ -436,89 +445,6 @@ defmodule AttentionServer.DeliveryAcksTest do
     Store.close(store)
   end
 
-  test "origin feed and ACK2 produce live and catch-up facts for both device sessions", c do
-    relay = c.relay
-
-    sessions =
-      for device <- ["phone", "tablet"] do
-        {:ok, session} = Relay.open_session(relay, device)
-
-        {:ok, _} =
-          Relay.session_request_line(
-            relay,
-            session,
-            JSON.encode!(%{"v" => 1, "type" => "resync", "since" => 0}) <> "\n"
-          )
-
-        {:ok, _} =
-          Relay.session_request_line(
-            relay,
-            session,
-            JSON.encode!(%{"v" => 1, "type" => "conversation_open", "since" => 0}) <> "\n"
-          )
-
-        session
-      end
-
-    discussion(relay)
-
-    support(relay, true)
-    assert delivery_facts(relay) == []
-
-    assert {:ok, rows, false, _} = changes(relay, 0)
-    assert [%{"data" => entry}] = person_changes(rows)
-    assert entry["entry_id"] == person_entry(relay)
-    assert entry["delivery"]["delivered"] == false
-
-    assert %{"status" => "recorded", "stage_outcome" => "handed"} =
-             ack2(relay, entry["entry_id"], "handed", 4, %{"agent" => "Reviewer"})
-
-    expected = delivery_facts(relay)
-
-    assert [
-             %{"stage" => "ack1", "ack2_expected" => true},
-             %{"stage" => "ack2", "rerouted" => false}
-           ] = expected
-
-    for session <- sessions do
-      {:ok, lines} = Relay.session_drain(relay, session)
-
-      live =
-        Enum.map(lines, fn line ->
-          {:ok, frame} = JSON.decode_line(line)
-          frame
-        end)
-
-      assert Enum.filter(live, &(&1["kind"] == "delivery_ack")) == expected
-    end
-
-    # Explicit catch-up uses the same authoritative journal and does not touch Seen.
-    {:ok, catching_up} = Relay.open_session(relay, "tablet")
-
-    {:ok, _} =
-      Relay.session_request_line(
-        relay,
-        catching_up,
-        JSON.encode!(%{"v" => 1, "type" => "resync", "since" => 0}) <> "\n"
-      )
-
-    {:ok, lines} =
-      Relay.session_request_line(
-        relay,
-        catching_up,
-        JSON.encode!(%{"v" => 1, "type" => "conversation_open", "since" => 0}) <> "\n"
-      )
-
-    replay =
-      Enum.map(lines, fn line ->
-        {:ok, frame} = JSON.decode_line(line)
-        frame
-      end)
-
-    assert Enum.filter(replay, &(&1["kind"] == "delivery_ack")) == expected
-  end
-
-  # The agent feed's delivery target for the person's chat turn on "question".
   defp discussion_target(engine) do
     [position] =
       for {{"person", position}, %{payload: %{"kind" => "discussion", "author" => "person"}}} <-

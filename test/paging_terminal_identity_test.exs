@@ -1,7 +1,15 @@
 defmodule AttentionServer.PagingTerminalIdentityTest do
   use ExUnit.Case, async: false
 
-  alias AttentionServer.{AgentAPIInProcess, Engine, JSON, PreChangeLogStore, Relay, Store}
+  alias AttentionServer.{
+    AgentAPIInProcess,
+    Engine,
+    JSON,
+    PreChangeLogStore,
+    Relay,
+    RelayReaders,
+    Store
+  }
 
   @handle "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 
@@ -76,7 +84,7 @@ defmodule AttentionServer.PagingTerminalIdentityTest do
                  answer_receipt(ctx.relay, "person", "origin", item)
 
         for device <- ~w(origin reader second-reader) do
-          assert {:ok, [revision], 1} = Relay.conversation_events(ctx.relay, device, 0)
+          assert {:ok, [revision], 1} = RelayReaders.conversation_events(ctx.relay, device, 0)
           assert revision["kind"] == "revision"
           assert revision["request_revision"] == 2
         end
@@ -86,7 +94,7 @@ defmodule AttentionServer.PagingTerminalIdentityTest do
 
         for device <- ~w(origin reader second-reader) do
           assert {:ok, [revision, delivery_ack, receipt], 3} =
-                   Relay.conversation_events(ctx.relay, device, 0)
+                   RelayReaders.conversation_events(ctx.relay, device, 0)
 
           assert revision["kind"] == "revision"
           assert revision["request_revision"] == 2
@@ -105,8 +113,8 @@ defmodule AttentionServer.PagingTerminalIdentityTest do
         end
       end
 
-      assert {:ok, [reader_terminal], 2} = Relay.events(ctx.relay, "reader", 1)
-      assert {:ok, [origin_terminal], 2} = Relay.events(ctx.relay, "origin", 1)
+      assert {:ok, [reader_terminal], 2} = RelayReaders.events(ctx.relay, "reader", 1)
+      assert {:ok, [origin_terminal], 2} = RelayReaders.events(ctx.relay, "origin", 1)
       assert reader_terminal["event_id"] == terminal["event_id"]
       refute Map.has_key?(reader_terminal, "answer")
 
@@ -170,7 +178,9 @@ defmodule AttentionServer.PagingTerminalIdentityTest do
     PreChangeLogStore.in_relay(ctx.relay, &PreChangeLogStore.origin_ack(&1, "origin", 2))
 
     for device <- ~w(origin reader second-reader) do
-      assert {:ok, [discussion, receipt], 2} = Relay.conversation_events(ctx.relay, device, 0)
+      assert {:ok, [discussion, receipt], 2} =
+               RelayReaders.conversation_events(ctx.relay, device, 0)
+
       assert discussion["kind"] == "discussion"
       assert receipt["kind"] == "receipt"
       assert discussion["conversation_seq"] < receipt["conversation_seq"]
@@ -187,10 +197,10 @@ defmodule AttentionServer.PagingTerminalIdentityTest do
 
       # A later cursor intentionally omits its prior target: paging acceptance
       # alone does not reconstruct discussion history already acknowledged.
-      assert {:ok, [^receipt], 2} = Relay.conversation_events(ctx.relay, device, 1)
+      assert {:ok, [^receipt], 2} = RelayReaders.conversation_events(ctx.relay, device, 1)
     end
 
-    assert {:ok, [], 0} = Relay.conversation_events(ctx.relay, "outsider", 0)
+    assert {:ok, [], 0} = RelayReaders.conversation_events(ctx.relay, "outsider", 0)
     engine = stored_engine(ctx)
     assert {:ok, page} = Engine.inbox_item(engine, "second-reader", {"app:test", "discussion"}, 1)
     assert page["acceptance"]["event_id"] == "1"
@@ -210,7 +220,7 @@ defmodule AttentionServer.PagingTerminalIdentityTest do
                "answer" => nil
              })
 
-    assert {:ok, [terminal], 2} = Relay.events(ctx.relay, "reader", 1)
+    assert {:ok, [terminal], 2} = RelayReaders.events(ctx.relay, "reader", 1)
     engine = stored_engine(ctx)
 
     assert {:ok, %{"terminal" => ^terminal}} =

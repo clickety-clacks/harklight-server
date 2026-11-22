@@ -1,7 +1,7 @@
 defmodule AttentionServer.LevelsDeviceAccessTest do
   use ExUnit.Case, async: false
 
-  alias AttentionServer.{DeviceIdentity, JSON, Relay, TLSFixtures}
+  alias AttentionServer.{ChangeLog, DeviceIdentity, JSON, Relay, RelayReaders, TLSFixtures}
   alias Exqlite.Sqlite3
 
   @rows_a [
@@ -45,45 +45,45 @@ defmodule AttentionServer.LevelsDeviceAccessTest do
     relay
   end
 
-  defp session_request(relay, session, frame) do
-    assert {:ok, lines} = Relay.session_request_line(relay, session, raw(frame))
-
-    Enum.map(lines, fn line ->
-      assert {:ok, response} = JSON.decode_line(line)
-      response
-    end)
+  # The level frames reach the Engine through the Relay's request line, as
+  # client API v2 settings reads and writes do.
+  defp device_request(relay, key, frame) do
+    assert {:ok, line} = Relay.request_line(relay, key, raw(frame))
+    assert {:ok, response} = JSON.decode_line(line)
+    [response]
   end
 
-  defp session_drain(relay, session) do
-    assert {:ok, lines} = Relay.session_drain(relay, session)
+  # The person's change-log rows after `after_rev`, read with the Relay paused
+  # so its own writes stay off the shared SQLite connection.
+  defp log(relay, person, after_rev) do
+    :ok = :sys.suspend(relay)
 
-    Enum.map(lines, fn line ->
-      assert {:ok, response} = JSON.decode_line(line)
-      response
-    end)
+    try do
+      assert {:ok, rows, _more, head} =
+               ChangeLog.read(:sys.get_state(relay).store, person, after_rev, 500)
+
+      {rows, head}
+    after
+      :ok = :sys.resume(relay)
+    end
   end
 
-  defp connected_session(relay, key) do
-    assert {:ok, session} = Relay.open_session(relay, key)
+  defp head(relay, person), do: relay |> log(person, 0) |> elem(1)
 
-    assert Enum.any?(session_request(relay, session, %{"type" => "resync", "since" => 0}), fn
-             %{"type" => "resynced"} -> true
-             _ -> false
-           end)
-
-    session
+  defp settings_rows(relay, person, after_rev) do
+    relay |> log(person, after_rev) |> elem(0) |> Enum.filter(&(&1.kind == :settings))
   end
 
-  defp get_levels(relay, session, ref) do
+  defp get_levels(relay, key, ref) do
     assert [%{"type" => "ok", "ref" => ^ref, "levels" => levels}] =
-             session_request(relay, session, %{"type" => "levels_get", "ref" => ref})
+             device_request(relay, key, %{"type" => "levels_get", "ref" => ref})
 
     levels
   end
 
-  defp set_levels(relay, session, ref, operation, rows) do
+  defp set_levels(relay, key, ref, operation, rows) do
     [reply] =
-      session_request(relay, session, %{
+      device_request(relay, key, %{
         "type" => "levels_set",
         "ref" => ref,
         "op_id" => operation,
@@ -111,9 +111,9 @@ defmodule AttentionServer.LevelsDeviceAccessTest do
     assert :ok = Relay.setup_device(relay, "A", "a2")
     assert :ok = Relay.setup_device(relay, "B", "b1")
 
-    a1 = connected_session(relay, "a1")
-    a2 = connected_session(relay, "a2")
-    b1 = connected_session(relay, "b1")
+    a1 = "a1"
+    a2 = "a2"
+    b1 = "b1"
     op_a = op(1)
     op_b = op(3)
     op_c = op(4)
@@ -142,7 +142,7 @@ defmodule AttentionServer.LevelsDeviceAccessTest do
                "field" => "account_id"
              }
            ] =
-             session_request(relay, a1, %{
+             device_request(relay, a1, %{
                "type" => "levels_get",
                "ref" => "cross-account",
                "account_id" => "B"
@@ -185,7 +185,7 @@ defmodule AttentionServer.LevelsDeviceAccessTest do
                "field" => "account_id"
              }
            ] =
-             session_request(relay, a1, %{
+             device_request(relay, a1, %{
                "type" => "levels_set",
                "ref" => "save-cross-account",
                "op_id" => op(200),
@@ -205,8 +205,8 @@ defmodule AttentionServer.LevelsDeviceAccessTest do
 
     GenServer.stop(relay)
     restarted = start_relay(path)
-    restarted_a1 = connected_session(restarted, "a1")
-    restarted_b1 = connected_session(restarted, "b1")
+    restarted_a1 = "a1"
+    restarted_b1 = "b1"
 
     assert %{
              "type" => "ok",
@@ -229,14 +229,13 @@ defmodule AttentionServer.LevelsDeviceAccessTest do
 
     assert :sys.get_state(restarted).store.engine.bounce_levels["A"] == config_b
     assert defaults == get_levels(restarted, restarted_b1, "b-remains-default")
-    assert [] = session_drain(restarted, restarted_a1)
   end
 
   test "failed level commit leaves the table and operation receipt unchanged", %{path: path} do
     relay = start_relay(path)
     assert :ok = Relay.setup_person(relay, "A")
     assert :ok = Relay.setup_device(relay, "A", "a1")
-    session = connected_session(relay, "a1")
+    key = "a1"
     operation = op(300)
     db = :sys.get_state(relay).store.db
 
@@ -250,19 +249,19 @@ defmodule AttentionServer.LevelsDeviceAccessTest do
              "type" => "error",
              "ref" => "commit-fails",
              "reason" => "storage_unavailable"
-           } = set_levels(relay, session, "commit-fails", operation, @rows_b)
+           } = set_levels(relay, key, "commit-fails", operation, @rows_b)
 
-    assert default_levels() == get_levels(relay, session, "failed-save-kept-default")
+    assert default_levels() == get_levels(relay, key, "failed-save-kept-default")
 
     assert :ok = Sqlite3.execute(db, "DROP TRIGGER refuse_levels")
 
     assert %{"type" => "ok", "op_id" => ^operation, "levels" => levels} =
-             set_levels(relay, session, "retry-after-failure", operation, @rows_b)
+             set_levels(relay, key, "retry-after-failure", operation, @rows_b)
 
     assert levels == wire_rows(@rows_b)
   end
 
-  test "dashboard and device changes send coalesced hints only to same-account sessions that used levels",
+  test "dashboard and device level changes write a settings row only for that account",
        %{path: path} do
     certs = TLSFixtures.create!()
     on_exit(fn -> File.rm_rf!(certs) end)
@@ -277,102 +276,82 @@ defmodule AttentionServer.LevelsDeviceAccessTest do
     rows_b = @rows_b
     rows_c = @rows_c
 
-    for {person, device} <- [
-          {person_a, "a1"},
-          {person_a, "a2"},
-          {person_a, "legacy"},
-          {person_b, "b1"}
-        ] do
+    for {person, device} <- [{person_a, "a1"}, {person_a, "a2"}, {person_b, "b1"}] do
       assert :ok = Relay.setup_device(relay, person, device)
     end
 
-    a1 = connected_session(relay, "a1")
-    a2 = connected_session(relay, "a2")
-    legacy = connected_session(relay, "legacy")
-    b1 = connected_session(relay, "b1")
-
     defaults = default_levels()
-    assert defaults == get_levels(relay, a1, "a1-initial")
-    assert defaults == get_levels(relay, a2, "a2-initial")
-    assert defaults == get_levels(relay, b1, "b1-initial")
+    assert defaults == get_levels(relay, "a1", "a1-initial")
+    assert defaults == get_levels(relay, "a2", "a2-initial")
+    assert defaults == get_levels(relay, "b1", "b1-initial")
     assert {:error, :forbidden} = Relay.dashboard_levels(relay, person_a, "a1")
     assert {:error, :forbidden} = Relay.save_dashboard_levels(relay, person_a, "a1", @rows_a)
 
-    for session <- [a1, a2, legacy, b1], do: session_drain(relay, session)
-
     baseline = %{
-      events: Relay.events(relay, "a1", 0),
+      events: RelayReaders.events(relay, "a1", 0),
       ordinary_cursor: Relay.acknowledged_cursor(relay, "a1"),
-      conversation_events: Relay.conversation_events(relay, "a1", 0),
-      conversation_cursor: Relay.conversation_cursor(relay, "a1")
+      conversation_events: RelayReaders.conversation_events(relay, "a1", 0),
+      conversation_cursor: RelayReaders.conversation_cursor(relay, "a1")
     }
 
-    assert {:ok, %{"levels" => ^rows_a}} =
-             Relay.save_dashboard_levels(relay, person_a, owner_a, rows_a)
+    # Every device of the account reads its settings rows from one change log.
+    changed = fn change ->
+      a_head = head(relay, person_a)
+      b_head = head(relay, person_b)
+      change.()
+      {settings_rows(relay, person_a, a_head), settings_rows(relay, person_b, b_head)}
+    end
 
-    assert [%{"v" => 1, "type" => "levels_changed"}] = session_drain(relay, a1)
-    assert [%{"v" => 1, "type" => "levels_changed"}] = session_drain(relay, a2)
-    assert [] = session_drain(relay, legacy)
-    assert [] = session_drain(relay, b1)
+    assert {[%{resource_id: "settings"}], []} =
+             changed.(fn ->
+               assert {:ok, %{"levels" => ^rows_a}} =
+                        Relay.save_dashboard_levels(relay, person_a, owner_a, rows_a)
+             end)
 
-    assert {:ok, %{"levels" => ^rows_a}} =
-             Relay.save_dashboard_levels(relay, person_a, owner_a, rows_a)
+    assert {[], []} =
+             changed.(fn ->
+               assert {:ok, %{"levels" => ^rows_a}} =
+                        Relay.save_dashboard_levels(relay, person_a, owner_a, rows_a)
+             end)
 
-    assert [] = session_drain(relay, a1)
-    assert [] = session_drain(relay, a2)
+    assert {[%{resource_id: "settings"}], []} =
+             changed.(fn ->
+               assert %{"type" => "ok", "levels" => _} =
+                        set_levels(relay, "a1", "device-change", op(10), rows_b)
+             end)
 
-    assert %{"type" => "ok", "levels" => _} =
-             set_levels(relay, a1, "device-change", op(10), rows_b)
+    assert {[], []} =
+             changed.(fn ->
+               assert %{"type" => "ok", "op_id" => _, "levels" => _} =
+                        set_levels(relay, "a1", "device-noop", op(11), rows_b)
+             end)
 
-    assert [%{"v" => 1, "type" => "levels_changed"}] = session_drain(relay, a1)
-    assert [%{"v" => 1, "type" => "levels_changed"}] = session_drain(relay, a2)
-    assert [] = session_drain(relay, legacy)
-    assert [] = session_drain(relay, b1)
+    assert {[%{resource_id: "settings"}], []} =
+             changed.(fn ->
+               assert {:ok, %{"levels" => ^rows_c}} =
+                        Relay.save_dashboard_levels(relay, person_a, owner_a, rows_c)
+             end)
 
-    assert %{"type" => "ok", "op_id" => _, "levels" => _} =
-             set_levels(relay, a1, "device-noop", op(11), rows_b)
-
-    assert [] = session_drain(relay, a1)
-    assert [] = session_drain(relay, a2)
-
-    assert {:ok, %{"levels" => ^rows_c}} =
-             Relay.save_dashboard_levels(relay, person_a, owner_a, rows_c)
-
-    assert [%{"v" => 1, "type" => "levels_changed"}] = session_drain(relay, a1)
-    assert [%{"v" => 1, "type" => "levels_changed"}] = session_drain(relay, a2)
-    assert [] = session_drain(relay, legacy)
-    assert [] = session_drain(relay, b1)
-    assert [] = session_drain(relay, a1)
-    assert [] = session_drain(relay, a2)
-    assert get_levels(relay, a2, "dashboard-snapshot") == wire_rows(rows_c)
+    assert get_levels(relay, "a2", "dashboard-snapshot") == wire_rows(rows_c)
+    assert defaults == get_levels(relay, "b1", "b1-unchanged")
 
     after_changes = %{
-      events: Relay.events(relay, "a1", 0),
+      events: RelayReaders.events(relay, "a1", 0),
       ordinary_cursor: Relay.acknowledged_cursor(relay, "a1"),
-      conversation_events: Relay.conversation_events(relay, "a1", 0),
-      conversation_cursor: Relay.conversation_cursor(relay, "a1")
+      conversation_events: RelayReaders.conversation_events(relay, "a1", 0),
+      conversation_cursor: RelayReaders.conversation_cursor(relay, "a1")
     }
 
     assert after_changes == baseline
   end
 
-  test "revoked devices cannot keep reading or saving levels on a prior connection", %{path: path} do
+  test "revoked devices cannot keep reading or saving levels", %{path: path} do
     relay = start_relay(path)
     assert :ok = Relay.setup_person(relay, "A")
     assert :ok = Relay.setup_device(relay, "A", "a1")
-    session = connected_session(relay, "a1")
-    assert default_levels() == get_levels(relay, session, "before-revocation")
+    assert default_levels() == get_levels(relay, "a1", "before-revocation")
 
     assert :ok = Relay.revoke_device(relay, "a1")
-
-    assert {:error, session_error} =
-             Relay.session_request_line(
-               relay,
-               session,
-               raw(%{"type" => "levels_get", "ref" => "after-revocation"})
-             )
-
-    assert session_error in [:unknown_session, :forbidden]
 
     assert {:error, :forbidden} =
              Relay.request_line(relay, "a1", raw(%{"type" => "levels_get", "ref" => "direct"}))
@@ -389,6 +368,6 @@ defmodule AttentionServer.LevelsDeviceAccessTest do
                })
              )
 
-    assert {:error, :forbidden} = Relay.open_session(relay, "a1")
+    assert {:error, :forbidden} = Relay.device_person(relay, "a1")
   end
 end

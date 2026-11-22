@@ -12,6 +12,7 @@ defmodule AttentionServer.HostedAccountTest do
     JSON,
     Placement,
     Relay,
+    RelayReaders,
     Server,
     Store,
     TLSFixtures
@@ -529,10 +530,10 @@ defmodule AttentionServer.HostedAccountTest do
 
       assert relay_engine(relay) == stopped_engine
       assert {:ok, nil} = Relay.claim_push(relay, System.system_time(:millisecond) + 300_001)
-      assert {:ok, [delivery], 1} = Relay.events(relay, "alice-reader", 0)
+      assert {:ok, [delivery], 1} = RelayReaders.events(relay, "alice-reader", 0)
       assert delivery["message"]["message_id"] == "accepted-before-stop"
       assert {:ok, conversation_events, _high} =
-               Relay.conversation_events(relay, "alice-reader", 0)
+               RelayReaders.conversation_events(relay, "alice-reader", 0)
       assert Enum.any?(conversation_events, &(&1["kind"] == "discussion"))
       refute Enum.any?(conversation_events, &(&1["kind"] in ["reply", "acted"]))
 
