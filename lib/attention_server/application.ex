@@ -12,8 +12,12 @@ defmodule AttentionServer.Application do
 
     children =
       case Application.get_env(:attention_server, :server) do
-        nil -> [registry]
-        opts when is_list(opts) -> [registry, {AttentionServer.Server, opts}]
+        nil ->
+          [registry]
+
+        opts when is_list(opts) ->
+          _ = AttentionServer.RetiredSettings.notice()
+          [registry, {AttentionServer.Server, opts}]
       end
 
     # See https://hexdocs.pm/elixir/Supervisor.html

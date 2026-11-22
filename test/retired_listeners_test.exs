@@ -72,6 +72,32 @@ defmodule AttentionServer.RetiredListenersTest do
     end
   end
 
+  test "startup names each retired listener variable that is still set" do
+    env = %{
+      "ATTENTION_SERVER_AGENT_PORT" => "18446",
+      "ATTENTION_SERVER_ORIGIN_BIND" => "0.0.0.0",
+      "ATTENTION_SERVER_PORT" => "18443"
+    }
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert AttentionServer.RetiredSettings.notice(env) ==
+                 ["ATTENTION_SERVER_AGENT_PORT", "ATTENTION_SERVER_ORIGIN_BIND"]
+      end)
+
+    for name <- ["ATTENTION_SERVER_AGENT_PORT", "ATTENTION_SERVER_ORIGIN_BIND"] do
+      assert log =~
+               "event=harklight_config outcome=ignored setting=#{name} reason=retired_in_0.2.0"
+    end
+
+    refute log =~ "18446"
+    refute log =~ "ATTENTION_SERVER_PORT "
+
+    assert ExUnit.CaptureLog.capture_log(fn ->
+             assert [] = AttentionServer.RetiredSettings.notice(%{})
+           end) == ""
+  end
+
   test "retired port options start no agent or origin listener and bind neither port",
        %{certs: certs} do
     agent_port = free_port()
