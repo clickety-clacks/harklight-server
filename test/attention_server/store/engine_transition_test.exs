@@ -167,6 +167,19 @@ defmodule AttentionServer.Store.EngineTransitionTest do
     :ok = Store.close(reopened)
   end
 
+  test "sender grants report the grant row" do
+    engine = setup_engine(Engine.new())
+
+    {next, :ok, keys} =
+      Engine.with_touches(engine, fn current ->
+        {:ok, current} = Engine.setup_sender(current, @reader, "app:test/other")
+        {current, :ok}
+      end)
+
+    assert keys == full_diff(engine, next)
+    assert MapSet.member?(keys, {:row, :sender_grants, {@person, @reader}})
+  end
+
   test "operator bootstrap and recovery report every touched record" do
     owner = String.duplicate("c", 64)
     recovered = String.duplicate("d", 64)
@@ -281,59 +294,5 @@ defmodule AttentionServer.Store.EngineTransitionTest do
     }) <> "\n"
   end
 
-  defp full_diff(old, next) do
-    origin = origin_diff(old.origin_feeds, next.origin_feeds)
-
-    old
-    |> Map.from_struct()
-    |> Map.drop([:origin_feeds | @derived])
-    |> Enum.flat_map(fn {field, value} ->
-      current = Map.fetch!(next, field)
-
-      cond do
-        value === current ->
-          []
-
-        is_struct(value, MapSet) ->
-          for key <- MapSet.symmetric_difference(value, current), do: {:member, field, key}
-
-        is_map(value) ->
-          keys = MapSet.union(MapSet.new(Map.keys(value)), MapSet.new(Map.keys(current)))
-
-          for key <- keys,
-              Map.fetch(value, key) !== Map.fetch(current, key),
-              do: {:row, field, key}
-
-        true ->
-          [{:field, field}]
-      end
-    end)
-    |> Enum.concat(origin)
-    |> MapSet.new()
-  end
-
-  defp origin_diff(before, after_feeds) do
-    scopes = MapSet.union(MapSet.new(Map.keys(before)), MapSet.new(Map.keys(after_feeds)))
-
-    Enum.flat_map(scopes, fn scope ->
-      old = Map.get(before, scope, %{})
-      next = Map.get(after_feeds, scope, %{})
-
-      highs =
-        if Map.fetch(old, :high) == Map.fetch(next, :high),
-          do: [],
-          else: [{:origin_feed, scope, :high}]
-
-      old_entries = Map.get(old, :entries, %{})
-      next_entries = Map.get(next, :entries, %{})
-      keys = MapSet.union(MapSet.new(Map.keys(old_entries)), MapSet.new(Map.keys(next_entries)))
-
-      entries =
-        for key <- keys,
-            Map.fetch(old_entries, key) != Map.fetch(next_entries, key),
-            do: {:origin_feed, scope, {:entry, key}}
-
-      highs ++ entries
-    end)
-  end
+  defp full_diff(old, next), do: AttentionServer.TouchOracle.diff(old, next)
 end

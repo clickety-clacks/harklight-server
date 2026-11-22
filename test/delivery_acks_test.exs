@@ -376,6 +376,34 @@ defmodule AttentionServer.DeliveryAcksTest do
     assert [^old, %{"delivery_acks" => true}] = facts(restarted)
   end
 
+  test "ACK1 and ACK2 report every record they write", c do
+    discussion(c.relay)
+    {:ok, store} = Store.open(c.path)
+    engine = store.engine
+    target = discussion_target(engine)
+
+    {acked, :ok, keys} =
+      Engine.with_touches(engine, fn current ->
+        {:ok, current} = Engine.agent_feed_delivered(current, "person", "origin", [target])
+        {current, :ok}
+      end)
+
+    assert keys == AttentionServer.TouchOracle.diff(engine, acked)
+    assert Enum.any?(keys, &match?({:origin_feed, {"person", "origin"}, {:delivery_ack, _}}, &1))
+
+    {handed, :ok, keys} =
+      Engine.with_touches(acked, fn current ->
+        {:ok, current, _reply} =
+          Engine.origin_ack2(current, "origin", 2, %{"op_id" => op(9), "outcome" => "handed"})
+
+        {current, :ok}
+      end)
+
+    assert keys == AttentionServer.TouchOracle.diff(acked, handed)
+    assert Enum.any?(keys, &match?({:origin_feed, {"person", "origin"}, {:delivery_ack, _}}, &1))
+    Store.close(store)
+  end
+
   test "device label precedes sender display and server/agent entries never receive ACK1", c do
     discussion(c.relay)
     {:ok, store} = Store.open(c.path)
