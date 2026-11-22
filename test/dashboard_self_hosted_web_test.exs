@@ -148,7 +148,7 @@ defmodule AttentionServer.DashboardSelfHostedWebTest do
     assert {:ok,
             %{
               "accountUrl" => "",
-              "sessionEndedPath" => "/sign-in",
+              "sessionEndedPath" => "/sign-in?signed_out=1",
               "flags" => %{"webClient" => true, "attachments" => true, "answerForms" => true}
             } = config} = JSON.decode_line(response.resp_body <> "\n")
 
@@ -172,6 +172,16 @@ defmodule AttentionServer.DashboardSelfHostedWebTest do
     assert script.status == 200
     assert script.resp_body =~ ~s|location.replace("/inbox")|
     refute script.resp_body =~ ~s|location.replace("/devices")|
+
+    # After a sign-out the landing says so; a bad or missing link without that
+    # marker still reads as invalid.
+    assert script.resp_body =~ ~s|new URLSearchParams(location.search).has("signed_out")|
+    assert script.resp_body =~ ~s|signedOut&&token===""?"You are signed out."|
+    assert script.resp_body =~ "This sign-in link is invalid. Ask the owner for a new one."
+
+    landing = get("/sign-in?signed_out=1", nil, opts)
+    assert landing.status == 200
+    assert landing.resp_body =~ "bin/harklight owner browser-sign-in"
   end
 
   test "self-hosted sign-out validates the form, ends its session and returns to sign-in help", %{
@@ -181,7 +191,7 @@ defmodule AttentionServer.DashboardSelfHostedWebTest do
     response = sign_out("active", @origin, opts)
 
     assert response.status == 303
-    assert Plug.Conn.get_resp_header(response, "location") == ["/sign-in"]
+    assert Plug.Conn.get_resp_header(response, "location") == ["/sign-in?signed_out=1"]
     assert [cookie] = Plug.Conn.get_resp_header(response, "set-cookie")
     assert cookie =~ "__Host-harklight="
     assert cookie =~ "max-age=0"
@@ -189,7 +199,7 @@ defmodule AttentionServer.DashboardSelfHostedWebTest do
 
     no_session = sign_out(nil, @origin, opts)
     assert no_session.status == 303
-    assert Plug.Conn.get_resp_header(no_session, "location") == ["/sign-in"]
+    assert Plug.Conn.get_resp_header(no_session, "location") == ["/sign-in?signed_out=1"]
     assert Agent.get(state, & &1.ended) == ["active"]
 
     refused = sign_out("active", "https://elsewhere.example", opts)

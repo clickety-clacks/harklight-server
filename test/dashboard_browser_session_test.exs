@@ -121,7 +121,7 @@ defmodule AttentionServer.DashboardBrowserSessionTest do
         |> AttentionServer.DashboardReadHTTP.call(%{opts | hosted: false})
 
       assert plain.status == 303
-      assert Plug.Conn.get_resp_header(plain, "location") == ["/sign-in"]
+      assert Plug.Conn.get_resp_header(plain, "location") == ["/sign-in?signed_out=1"]
 
       response = post.(opts, "confirm=sign_out", origin, form_type)
       assert response.status == 303

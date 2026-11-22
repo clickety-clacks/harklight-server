@@ -26,6 +26,9 @@ defmodule AttentionServer.DashboardReadHTTP do
   @invite_cookie "__Host-harklight-invite"
   @invite_cookie_age 30 * 24 * 60 * 60
   @dashboard_csp "default-src 'none'; script-src 'self'; connect-src 'self'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'"
+  # Where a self-hosted browser lands after signing out or losing its session.
+  # The sign-in page shows that it is signed out instead of an invalid link.
+  @signed_out_path "/sign-in?signed_out=1"
   @web_client_csp "default-src 'none'; script-src 'self'; connect-src 'self'; " <>
                     "style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' blob: data:; " <>
                     "base-uri 'none'; frame-ancestors 'none'"
@@ -190,7 +193,9 @@ defmodule AttentionServer.DashboardReadHTTP do
         if session, do: backend_call(opts.backend, :end_session, session)
 
         location =
-          if opts.hosted, do: opts.hosted_addresses.sign_out || "/devices", else: "/sign-in"
+          if opts.hosted,
+            do: opts.hosted_addresses.sign_out || "/devices",
+            else: @signed_out_path
 
         conn
         |> delete_resp_cookie(@cookie, secure: true, http_only: true, same_site: "Lax", path: "/")
@@ -322,7 +327,7 @@ defmodule AttentionServer.DashboardReadHTTP do
        ) do
     config = %{
       "accountUrl" => "",
-      "sessionEndedPath" => "/sign-in",
+      "sessionEndedPath" => @signed_out_path,
       "flags" => %{"webClient" => true, "attachments" => true, "answerForms" => true}
     }
 
@@ -1100,7 +1105,7 @@ defmodule AttentionServer.DashboardReadHTTP do
 
   defp sign_in_script(conn, _opts) do
     script =
-      ~S|const status=document.getElementById("status");const token=location.hash.slice(1);history.replaceState(null,"",location.pathname);if(!/^hbs1_[0-9a-f]{64}$/.test(token)){status.textContent="This sign-in link is invalid. Ask the owner for a new one."}else{fetch("/sign-in",{method:"POST",headers:{"content-type":"text/plain"},credentials:"same-origin",body:token}).then(r=>{if(r.status===204){location.replace("/inbox")}else{status.textContent="This sign-in link is expired or already used. Ask the owner for a new one."}}).catch(()=>{status.textContent="The server could not be reached. Ask the owner for a new link if this one was used."})}|
+      ~S|const status=document.getElementById("status");const token=location.hash.slice(1);const signedOut=new URLSearchParams(location.search).has("signed_out");history.replaceState(null,"",location.pathname);if(!/^hbs1_[0-9a-f]{64}$/.test(token)){status.textContent=signedOut&&token===""?"You are signed out.":"This sign-in link is invalid. Ask the owner for a new one."}else{fetch("/sign-in",{method:"POST",headers:{"content-type":"text/plain"},credentials:"same-origin",body:token}).then(r=>{if(r.status===204){location.replace("/inbox")}else{status.textContent="This sign-in link is expired or already used. Ask the owner for a new one."}}).catch(()=>{status.textContent="The server could not be reached. Ask the owner for a new link if this one was used."})}|
 
     conn |> put_resp_content_type("text/javascript", "utf-8") |> send_resp(200, script)
   end
