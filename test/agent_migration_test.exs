@@ -1,7 +1,7 @@
 defmodule AttentionServer.AgentMigrationTest do
   use ExUnit.Case, async: false
 
-  alias AttentionServer.{Engine, InboxPaging, Store}
+  alias AttentionServer.{Engine, Store}
   alias Exqlite.Sqlite3
 
   test "format-eight fixture agent gains empty service grants and a durable cursor key once" do
@@ -179,24 +179,8 @@ defmodule AttentionServer.AgentMigrationTest do
     assert migrated.version == 1
     assert migrated.engine.persons == %{"A" => 0}
 
-    assert {:ok,
-            %{snapshot_id: "format-17-snapshot", high_water: 0, status: "pending"} =
-              migrated_snapshot} = Store.inbox_startup(migrated, "A", key, "format-17-startup")
-
-    frame = %{
-      "v" => 1,
-      "type" => "inbox_start",
-      "ref" => "format-17-restart",
-      "paging_version" => 1,
-      "startup_id" => "format-17-startup",
-      "since" => 0
-    }
-
-    assert {:ready, ^migrated_snapshot} =
-             InboxPaging.start_plan(migrated, migrated.engine, key, frame)
-
-    assert {:ok, %{"type" => "ok", "high_water" => 0, "items" => [], "next_cursor" => nil},
-            ^migrated_snapshot, false} = InboxPaging.start(migrated, migrated.engine, key, frame)
+    assert {:ok, %{snapshot_id: "format-17-snapshot", high_water: 0, status: "pending"}} =
+             Store.inbox_startup(migrated, "A", key, "format-17-startup")
 
     assert :ok = Store.close(migrated)
   end

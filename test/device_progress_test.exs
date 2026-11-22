@@ -103,56 +103,6 @@ defmodule AttentionServer.DeviceProgressTest do
     Store.close(folded)
   end
 
-  test "paged cold replay checkpoints preserve snapshot bytes and survive restart", %{path: path} do
-    before = snapshot(path)
-    {:ok, relay} = Relay.start_link(store_path: path)
-    {:ok, session} = Relay.open_websocket_session(relay, "reader", nil, nil)
-
-    [%{"type" => "ok", "snapshot_id" => id, "high_water" => 8, "items" => items}] =
-      request(relay, session, %{
-        "type" => "inbox_start",
-        "paging_version" => 1,
-        "startup_id" => "cold",
-        "since" => 0
-      })
-
-    assert length(items) == 8
-
-    frame = %{
-      "type" => "inbox_checkpoint_ack",
-      "paging_version" => 1,
-      "snapshot_id" => id,
-      "high_water" => 8,
-      "reconciled_batches" => [],
-      "pending_manifest_complete" => true
-    }
-
-    assert [%{"checkpoint_accepted" => true}] = request(relay, session, frame)
-
-    assert [%{"checkpoint_accepted" => true, "duplicate" => true}] =
-             request(relay, session, frame)
-
-    GenServer.stop(relay)
-    assert snapshot(path) == before
-    {:ok, restarted} = Relay.start_link(store_path: path)
-    assert {:ok, 8} = Relay.acknowledged_cursor(restarted, "reader")
-    {:ok, session} = Relay.open_websocket_session(restarted, "reader", nil, nil)
-
-    assert [%{"snapshot_id" => ^id}] =
-             request(restarted, session, %{
-               "type" => "inbox_start",
-               "paging_version" => 1,
-               "startup_id" => "cold",
-               "since" => 0
-             })
-
-    assert [%{"checkpoint_accepted" => true, "duplicate" => true}] =
-             request(restarted, session, frame)
-
-    GenServer.stop(restarted)
-    assert snapshot(path) == before
-  end
-
   test "stale ACK and full-snapshot writers cannot overwrite accepted progress", %{path: path} do
     {:ok, first} = Store.open(path)
     {:ok, stale} = Store.open(path)

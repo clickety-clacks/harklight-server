@@ -368,4 +368,67 @@ defmodule AttentionServer.RelayTest do
     assert %{"reason" => "unknown_type"} = request(relay, "a1", %{"type" => "invented"})
     assert {:ok, [], 0} = Relay.events(relay, "a1", 0)
   end
+
+  # Protocol 0.1 paged startup (inbox_start through inbox_attach) is gone.
+  # Every path that still takes a device frame answers it as an unknown type
+  # and writes no paging state.
+  test "the 0.1 inbox paging frames are unknown types and store no snapshot", %{
+    relay: relay,
+    tmp_dir: dir
+  } do
+    refute Code.ensure_loaded?(AttentionServer.InboxPaging)
+
+    frames = [
+      %{"type" => "inbox_start", "paging_version" => 1, "startup_id" => "s", "since" => 0},
+      %{"type" => "inbox_page", "paging_version" => 1, "snapshot_id" => "x", "cursor" => "c"},
+      %{"type" => "inbox_reconcile", "paging_version" => 1, "snapshot_id" => "x"},
+      %{"type" => "inbox_receipts", "paging_version" => 1, "snapshot_id" => "x"},
+      %{
+        "type" => "inbox_checkpoint_ack",
+        "paging_version" => 1,
+        "snapshot_id" => "x",
+        "high_water" => 0,
+        "reconciled_batches" => [],
+        "pending_manifest_complete" => true
+      },
+      %{
+        "type" => "inbox_attach",
+        "paging_version" => 1,
+        "snapshot_id" => "x",
+        "mode" => "replay",
+        "since" => 0
+      }
+    ]
+
+    assert {:ok, raw} = Relay.open_session(relay, "a1")
+    assert {:ok, websocket} = Relay.open_websocket_session(relay, "a2", nil, nil)
+    path = Path.join(dir, "frame.json")
+
+    for frame <- frames do
+      frame = Map.merge(frame, %{"v" => 1, "ref" => frame["type"]})
+      line = JSON.encode!(frame) <> "\n"
+      File.write!(path, line)
+      ref = frame["ref"]
+
+      assert %{"type" => "error", "reason" => "unknown_type", "ref" => ^ref} =
+               request(relay, "a1", frame)
+
+      for {session, reply} <- [
+            {raw, Relay.session_request_line(relay, raw, line)},
+            {websocket, Relay.session_request_line(relay, websocket, line)},
+            {websocket, Relay.session_request_file(relay, websocket, path)}
+          ] do
+        assert {:ok, [reply_line]} = reply, inspect(session)
+
+        assert {:ok, %{"type" => "error", "reason" => "unknown_type", "ref" => ^ref}} =
+                 JSON.decode_line(reply_line)
+      end
+    end
+
+    state = :sys.get_state(relay)
+    refute Map.has_key?(state, :inbox_builds)
+    refute Map.has_key?(state, :inbox_build_monitors)
+    assert {:ok, nil} = AttentionServer.Store.inbox_startup(state.store, "A", "a2", "s")
+    assert {:ok, [], 0} = Relay.events(relay, "a1", 0)
+  end
 end

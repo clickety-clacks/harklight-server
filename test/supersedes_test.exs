@@ -2,6 +2,7 @@ defmodule AttentionServer.SupersedesTest do
   use ExUnit.Case, async: false
 
   alias AttentionServer.{JSON, Relay}
+  alias AttentionServer.ClientAPI.Reads
 
   @first_session "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
   @second_session "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
@@ -126,19 +127,10 @@ defmodule AttentionServer.SupersedesTest do
     assert Enum.map(tl(live), &{&1["message_id"], &1["state"]}) ==
              [{"m1", "superseded"}, {"m2", "superseded"}]
 
-    assert {:ok, page_session} = Relay.open_websocket_session(relay, "phone", nil, nil)
-
-    assert [page] =
-             session_request(relay, page_session, %{
-               "type" => "inbox_start",
-               "paging_version" => 1,
-               "startup_id" => "supersedes-snapshot",
-               "since" => 0,
-               "ref" => "start"
-             })
+    assert {:ok, %{"items" => items}} = Reads.inbox(relay, "phone")
 
     for id <- ["m1", "m2"] do
-      item = Enum.find(page["items"], &(get_in(&1, ["acceptance", "message_id"]) == id))
+      item = Enum.find(items, &(&1["message"]["message_id"] == id))
       assert item["terminal"]["state"] == "superseded"
     end
 
