@@ -967,24 +967,15 @@ defmodule AttentionServer.Store.KeyedIncrementalValidationTest do
     end
   end
 
-  describe "later-slice fallbacks" do
-    test "#3 derived default index (W3c fallback)", %{store: store} do
-      next = %{
-        store.engine
-        | open_default_index: %{bad: 1},
-          delivery_states: %{@person => "STOPPED"}
-      }
-
-      assert_refused(
+  # W3c replaced the whole-state bounce and default-index fallbacks; the
+  # per-address bounce checks are in keyed_bounce_validation_test.exs.
+  describe "bounce state" do
+    test "#30 bounce revision state is checked per address", %{store: store} do
+      refuse(
         store,
-        next,
-        codec_diff(store.engine, next),
-        {:fallback, :open_default_index}
+        &put_in(&1.bounce_revisions[@m1], %{}),
+        {:address, {:row, :bounce_revisions, @m1}}
       )
-    end
-
-    test "#30 bounce revision state (W3c fallback)", %{store: store} do
-      refuse(store, &put_in(&1.bounce_revisions[@m1], %{}), {:fallback, :bounce_state})
     end
   end
 
