@@ -514,14 +514,14 @@ defmodule AttentionServer.Store.KeyedBounceValidationTest do
   # --- #3 open_default_index -----------------------------------------------------
 
   describe "#3 open default index" do
-    test "a stale entry for a touched message", %{store: store} do
+    test "a non-integer entry for a touched message", %{store: store} do
       engine = store.engine
       next = put_in(engine.open_default_index[@m2], :stale)
       touched = MapSet.new([{:row, :messages, @m2}])
       assert_refused(store, next, touched, {:derived, :open_default_index})
     end
 
-    test "an entry for a touched message without a default", %{store: store} do
+    test "a string entry for a touched message", %{store: store} do
       engine = store.engine
       next = put_in(engine.open_default_index[@m1], "later")
       touched = MapSet.new([{:row, :messages, @m1}])

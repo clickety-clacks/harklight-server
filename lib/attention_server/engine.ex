@@ -5104,10 +5104,7 @@ defmodule AttentionServer.Engine do
     put_row(engine, :messages, key, record)
   end
 
-  # When the open default of a message falls due: the open_default_index
-  # value for its key, or nil when it has none.
-  @doc false
-  def default_due_at(record) do
+  defp default_due_at(record) do
     if Map.get(record, :terminal) == nil do
       accepted_at = Map.get(record, :revision_accepted_at, Map.get(record, :accepted_at))
 

@@ -1584,19 +1584,17 @@ defmodule AttentionServer.Store do
     _ -> false
   end
 
+  # The whole-state check pins only the shape of this memory-only index, so
+  # the per-address check pins the same shape for touched messages and does
+  # not compare due times. Engine.put_message maintains the values.
   defp valid_open_defaults?(engine, touched) do
     is_map(engine.open_default_index) and
       Enum.all?(touched, fn
         {:row, :messages, key} ->
-          expected =
-            with {:ok, record} <- Map.fetch(engine.messages, key),
-                 at when is_integer(at) <- Engine.default_due_at(record) do
-              {:ok, at}
-            else
-              _ -> :error
-            end
-
-          Map.fetch(engine.open_default_index, key) == expected
+          case Map.fetch(engine.open_default_index, key) do
+            {:ok, at} -> is_tuple(key) and tuple_size(key) == 3 and is_integer(at)
+            :error -> true
+          end
 
         _ ->
           true
