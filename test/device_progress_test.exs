@@ -1,6 +1,7 @@
 defmodule AttentionServer.DeviceProgressTest do
   use ExUnit.Case, async: false
-  alias AttentionServer.{Engine, JSON, Relay, Store}
+
+  alias AttentionServer.{Engine, JSON, Relay, RelayReaders, Store}
   alias Exqlite.Sqlite3
 
   setup do
@@ -44,49 +45,61 @@ defmodule AttentionServer.DeviceProgressTest do
     %{path: path}
   end
 
+  # Protocol 0.1 sessions no longer acknowledge progress through the Relay. A
+  # cold Relay start and its replay reads leave the FORMAT29 snapshot alone,
+  # and the stored progress writer (opens and every ACK) still commits beside
+  # the snapshot, survives restart and folds into it on the next mutation.
   test "cold replay and every ACK preserve the FORMAT29 snapshot and survive restart", %{
     path: path
   } do
     before = snapshot(path)
     {:ok, relay} = Relay.start_link(store_path: path)
-    {:ok, session} = Relay.open_session(relay, "reader")
-    replay = request(relay, session, %{"type" => "resync", "since" => 0})
+    {:ok, replay, 8} = RelayReaders.events(relay, "reader", 0)
 
     assert Enum.map(Enum.filter(replay, &(&1["type"] == "delivery")), & &1["seq"]) ==
              Enum.to_list(1..8)
 
-    conversation = request(relay, session, %{"type" => "conversation_open", "since" => 0})
+    {:ok, conversation, 8} = RelayReaders.conversation_events(relay, "reader", 0)
 
     assert Enum.map(
              Enum.filter(conversation, &(&1["type"] == "conversation")),
              & &1["conversation_seq"]
            ) == Enum.to_list(1..8)
 
-    for n <- 1..8 do
-      assert [%{"type" => "ok", "seq" => ^n}] =
-               request(relay, session, %{"type" => "ack", "seq" => n})
+    GenServer.stop(relay)
+    assert snapshot(path) == before
 
-      assert [%{"type" => "ok", "conversation_seq" => ^n}] =
-               request(relay, session, %{"type" => "conversation_ack", "conversation_seq" => n})
-    end
+    {:ok, store} = Store.open(path)
+    {:ok, opened} = Engine.open_conversation(store.engine, "reader")
+    {:ok, store} = Store.commit(store, opened, audit())
 
-    version = :sys.get_state(relay).store.progress_version
+    store =
+      Enum.reduce(1..8, store, fn n, store ->
+        assert {:ok, next, %{"seq" => ^n}} = Engine.acknowledge(store.engine, "reader", n, 8)
+        {:ok, store} = Store.commit(store, next, audit())
 
-    assert [%{"type" => "ok"}] =
-             request(relay, session, %{"type" => "conversation_ack", "conversation_seq" => 8})
+        assert {:ok, next, %{"conversation_seq" => ^n}} =
+                 Engine.acknowledge_conversation(store.engine, "reader", n, 8)
 
-    assert :sys.get_state(relay).store.progress_version == version
+        {:ok, store} = Store.commit(store, next, audit())
+        store
+      end)
+
+    version = store.progress_version
+    {:ok, same, _} = Engine.acknowledge_conversation(store.engine, "reader", 8, 8)
+    {:ok, store} = Store.commit(store, same, audit())
+    assert store.progress_version == version
 
     for n <- [7, 9] do
-      assert [%{"type" => "error", "reason" => "invalid_cursor"}] =
-               request(relay, session, %{"type" => "conversation_ack", "conversation_seq" => n})
+      assert {:error, :invalid_cursor} =
+               Engine.acknowledge_conversation(store.engine, "reader", n, 8)
     end
 
-    GenServer.stop(relay)
+    Store.close(store)
     assert snapshot(path) == before
     {:ok, restarted} = Relay.start_link(store_path: path)
     assert {:ok, 8} = Relay.acknowledged_cursor(restarted, "reader")
-    assert {:ok, 8} = Relay.conversation_cursor(restarted, "reader")
+    assert {:ok, 8} = RelayReaders.conversation_cursor(restarted, "reader")
 
     assert MapSet.member?(
              :sys.get_state(restarted).store.engine.conversation_opened,
@@ -153,21 +166,23 @@ defmodule AttentionServer.DeviceProgressTest do
     [_, payload, _] = snapshot(path)
     assert {:attention_relay_state, 29, _} = :erlang.binary_to_term(payload)
     {:ok, restarted} = Relay.start_link(store_path: path)
-    assert {:ok, 6} = Relay.conversation_cursor(restarted, "reader")
-    {:ok, session} = Relay.open_session(restarted, "reader")
-    request(restarted, session, %{"type" => "resync", "since" => 0})
-    request(restarted, session, %{"type" => "conversation_open", "since" => 6})
-
-    assert [%{"type" => "ok"}] =
-             request(restarted, session, %{"type" => "conversation_ack", "conversation_seq" => 6})
-
-    assert [%{"reason" => "invalid_cursor"}] =
-             request(restarted, session, %{"type" => "conversation_ack", "conversation_seq" => 5})
-
-    assert [%{"type" => "ok"}] =
-             request(restarted, session, %{"type" => "conversation_ack", "conversation_seq" => 8})
-
+    assert {:ok, 6} = RelayReaders.conversation_cursor(restarted, "reader")
     GenServer.stop(restarted)
+
+    # The migrated cursor is the floor for later progress.
+    {:ok, store} = Store.open(path)
+    assert {:ok, same, _} = Engine.acknowledge_conversation(store.engine, "reader", 6, 8)
+    assert same == store.engine
+
+    assert {:error, :invalid_cursor} =
+             Engine.acknowledge_conversation(store.engine, "reader", 5, 8)
+
+    assert {:ok, next, _} = Engine.acknowledge_conversation(store.engine, "reader", 8, 8)
+    {:ok, store} = Store.commit(store, next, audit())
+    Store.close(store)
+    {:ok, reopened} = Store.open(path)
+    assert reopened.engine.conversation_cursors[{"A", "reader"}] == 8
+    Store.close(reopened)
   end
 
   test "failed migration preserves FORMAT27 snapshot and its ACK overlay for retry", %{path: path} do
@@ -232,15 +247,5 @@ defmodule AttentionServer.DeviceProgressTest do
 
     assert {:ok, %{"type" => "ok"}} = JSON.decode_line(line)
     next
-  end
-
-  defp request(relay, session, frame) do
-    {:ok, lines} =
-      Relay.session_request_line(relay, session, JSON.encode!(Map.put(frame, "v", 1)) <> "\n")
-
-    Enum.map(lines, fn line ->
-      {:ok, result} = JSON.decode_line(line)
-      result
-    end)
   end
 end

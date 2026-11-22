@@ -1,7 +1,7 @@
 defmodule AttentionServer.EnrollmentReadbackTest do
   use ExUnit.Case, async: false
 
-  alias AttentionServer.{JSON, Relay, Store}
+  alias AttentionServer.{JSON, Relay, RelayReaders, Store}
   alias Exqlite.Sqlite3
 
   defp key(char), do: String.duplicate(char, 64)
@@ -268,7 +268,7 @@ defmodule AttentionServer.EnrollmentReadbackTest do
                "terminal_seq" => 2
              })
 
-    assert {:ok, [delivery, lifecycle], 2} = Relay.events(relay, a1, 0)
+    assert {:ok, [delivery, lifecycle], 2} = RelayReaders.events(relay, a1, 0)
     assert delivery["message_id"] == "historical"
     assert lifecycle["message_id"] == "historical"
     assert lifecycle["answer"] == "yes"

@@ -10,6 +10,7 @@ defmodule AttentionServer.ConversationFeedTest do
     LargeData,
     PreChangeLogStore,
     Relay,
+    RelayReaders,
     Store
   }
 
@@ -157,18 +158,11 @@ defmodule AttentionServer.ConversationFeedTest do
     feed.entries |> Enum.sort() |> Enum.map(fn {_seq, entry} -> entry end)
   end
 
-  defp session_request(relay, session, frame) do
-    assert {:ok, lines} =
-             Relay.session_request_line(
-               relay,
-               session,
-               JSON.encode!(Map.put(frame, "v", 1)) <> "\n"
-             )
-
-    Enum.map(lines, fn line ->
-      assert {:ok, decoded} = JSON.decode_line(line)
-      decoded
-    end)
+  # A device's ordinary-feed ACK, as a 0.1 session stored it.
+  defp acknowledge(store, key, seq) do
+    {:ok, engine, _reply} = Engine.acknowledge(store.engine, key, seq, seq)
+    {:ok, store} = Store.commit(store, engine, %{person: "A", actor: key, action: "cursor_ack"})
+    store
   end
 
   defp cold_store_reopen(path) do
@@ -278,9 +272,9 @@ defmodule AttentionServer.ConversationFeedTest do
     }
 
     assert %{"type" => "ok", "seq" => 1} = request(relay, "origin", forward)
-    lifecycle_before = Relay.events(relay, "reader", 0)
+    lifecycle_before = RelayReaders.events(relay, "reader", 0)
     origin_before = agent_entries(relay, "opened-on-any-device")
-    conversation_before = Relay.conversation_events(relay, "reader", 0)
+    conversation_before = RelayReaders.conversation_events(relay, "reader", 0)
     state_before = :sys.get_state(relay).store.engine
 
     open_op_id = op(981)
@@ -311,9 +305,9 @@ defmodule AttentionServer.ConversationFeedTest do
     assert state_after.conversation_events == state_before.conversation_events
     assert state_after.origin_feeds == state_before.origin_feeds
     assert state_after.cursors == state_before.cursors
-    assert Relay.events(relay, "reader", 0) == lifecycle_before
+    assert RelayReaders.events(relay, "reader", 0) == lifecycle_before
     assert agent_entries(relay, "opened-on-any-device") == origin_before
-    assert Relay.conversation_events(relay, "reader", 0) == conversation_before
+    assert RelayReaders.conversation_events(relay, "reader", 0) == conversation_before
 
     assert request(relay, "reader", opened)["type"] == "ok"
 
@@ -330,7 +324,7 @@ defmodule AttentionServer.ConversationFeedTest do
 
     assert MapSet.size(:sys.get_state(restarted).store.engine.opened_revisions) == 1
     assert request(restarted, "reader", opened)["type"] == "ok"
-    assert Relay.events(restarted, "reader", 0) == lifecycle_before
+    assert RelayReaders.events(restarted, "reader", 0) == lifecycle_before
     assert agent_entries(restarted, "opened-on-any-device") == origin_before
 
     assert :sys.get_state(restarted).store.engine.origin_feeds ==
@@ -551,7 +545,7 @@ defmodule AttentionServer.ConversationFeedTest do
     assert terminal["state"] == "answered"
     assert Map.has_key?(terminal, "answer") and is_nil(terminal["answer"])
     refute Map.has_key?(terminal, "delivery")
-    assert {:ok, [lifecycle], 2} = Relay.events(relay, "reader", 1)
+    assert {:ok, [lifecycle], 2} = RelayReaders.events(relay, "reader", 1)
     assert lifecycle["author"] == "agent"
     assert lifecycle["state"] == "answered"
     GenServer.stop(relay)
@@ -561,12 +555,12 @@ defmodule AttentionServer.ConversationFeedTest do
     assert %{"terminal" => ^terminal} = agent_message(restarted, "agent-terminal")
 
     assert {:ok, [%{"author" => "agent", "state" => "answered"}], 2} =
-             Relay.events(restarted, "reader", 1)
+             RelayReaders.events(restarted, "reader", 1)
 
     GenServer.stop(restarted)
   end
 
-  test "legacy replay stays contiguous while a capable device replays and acknowledges separately",
+  test "the ordinary and conversation streams stay separate per device and replay after restart",
        %{
          path: path
        } do
@@ -602,65 +596,12 @@ defmodule AttentionServer.ConversationFeedTest do
                "text" => "More detail?"
              })
 
-    assert {:ok, [ordinary], 1} = Relay.events(relay, "old", 0)
+    assert {:ok, [ordinary], 1} = RelayReaders.events(relay, "old", 0)
     assert ordinary["type"] == "delivery"
-    assert {:ok, [conversation], 1} = Relay.conversation_events(relay, "new", 0)
+    assert {:ok, [conversation], 1} = RelayReaders.conversation_events(relay, "new", 0)
     assert conversation["conversation_seq"] == 1
     assert conversation["event_id"] == "2"
-    assert {:ok, [], 0} = Relay.conversation_events(relay, "other", 0)
-
-    assert {:ok, old_session} = Relay.open_session(relay, "old")
-
-    assert [
-             %{"type" => "ok"},
-             %{"type" => "delivery", "seq" => 1},
-             %{"type" => "resynced", "seq" => 1}
-           ] =
-             session_request(relay, old_session, %{"type" => "resync", "since" => 0})
-
-    assert [%{"type" => "ok", "seq" => 1}] =
-             session_request(relay, old_session, %{"type" => "ack", "seq" => 1})
-
-    assert [%{"type" => "error", "reason" => "conversation_open_required"}] =
-             session_request(relay, old_session, %{
-               "type" => "conversation_ack",
-               "conversation_seq" => 1
-             })
-
-    assert {:ok, new_session} = Relay.open_session(relay, "new")
-
-    assert [
-             %{"type" => "ok"},
-             %{"type" => "delivery", "seq" => 1},
-             %{"type" => "resynced", "seq" => 1}
-           ] =
-             session_request(relay, new_session, %{"type" => "resync", "since" => 0})
-
-    assert [%{"type" => "ok"}, %{"type" => "conversation_resynced", "conversation_seq" => 1}] =
-             session_request(relay, new_session, %{"type" => "conversation_open", "since" => 1})
-
-    assert [%{"type" => "error", "reason" => "invalid_cursor"}] =
-             session_request(relay, new_session, %{
-               "type" => "conversation_ack",
-               "conversation_seq" => 1
-             })
-
-    assert [
-             %{"type" => "ok"},
-             %{"type" => "conversation", "conversation_seq" => 1},
-             %{"type" => "conversation_resynced", "conversation_seq" => 1}
-           ] =
-             session_request(relay, new_session, %{"type" => "conversation_open", "since" => 0})
-
-    assert [%{"type" => "ok", "conversation_seq" => 1}] =
-             session_request(relay, new_session, %{
-               "type" => "conversation_ack",
-               "conversation_seq" => 1
-             })
-
-    assert {:ok, 1} = Relay.conversation_cursor(relay, "new")
-    assert {:ok, 0} = Relay.acknowledged_cursor(relay, "new")
-    assert {:ok, 1} = Relay.acknowledged_cursor(relay, "old")
+    assert {:ok, [], 0} = RelayReaders.conversation_events(relay, "other", 0)
 
     assert %{"type" => "ok", "seq" => 2} =
              request(relay, "old", %{
@@ -671,28 +612,28 @@ defmodule AttentionServer.ConversationFeedTest do
                "answer" => nil
              })
 
-    assert {:ok, [terminal_line]} = Relay.session_drain(relay, old_session)
-    assert {:ok, %{"type" => "lifecycle", "seq" => 2}} = JSON.decode_line(terminal_line)
+    assert {:ok, [_, %{"type" => "lifecycle", "seq" => 2}], 2} =
+             RelayReaders.events(relay, "old", 0)
 
-    assert {:ok, [new_terminal], 2} = Relay.events(relay, "new", 1)
+    assert {:ok, [new_terminal], 2} = RelayReaders.events(relay, "new", 1)
     assert new_terminal["type"] == "lifecycle"
     assert new_terminal["event_id"] == "3"
     assert new_terminal["author"] == "person"
     assert new_terminal["by"] == "answer"
-    assert {:ok, [], 1} = Relay.conversation_events(relay, "new", 1)
+    assert {:ok, [], 1} = RelayReaders.conversation_events(relay, "new", 1)
 
     GenServer.stop(relay)
     assert {:ok, restarted} = Relay.start_link(store_path: path)
-    assert {:ok, 1} = Relay.conversation_cursor(restarted, "new")
-    assert {:ok, [replayed], 1} = Relay.conversation_events(restarted, "new", 0)
+    assert {:ok, [replayed], 1} = RelayReaders.conversation_events(restarted, "new", 0)
     assert replayed["event_id"] == "2"
-    assert {:ok, [_, _], 2} = Relay.events(restarted, "old", 0)
+    assert {:ok, [_, _], 2} = RelayReaders.events(restarted, "old", 0)
     GenServer.stop(restarted)
   end
 
-  test "conversation wake reaches only opened devices and does not suppress a later new alert", %{
-    path: path
-  } do
+  test "a stored conversation wake reaches only opened devices and does not suppress a later new alert",
+       %{
+         path: path
+       } do
     assert {:ok, relay} = Relay.start_link(store_path: path, push_enabled: true)
     assert :ok = Relay.setup_person(relay, "A")
     assert :ok = Relay.setup_device(relay, "A", "origin")
@@ -713,20 +654,15 @@ defmodule AttentionServer.ConversationFeedTest do
                }
              })
 
+    # Stored 0.1 progress: both devices acknowledged the first request, and
+    # only "new" opened its conversation feed. Client API v2 writes neither.
+    PreChangeLogStore.in_relay(relay, fn store ->
+      store = acknowledge(store, "old", 1)
+      store = acknowledge(store, "new", 1)
+      PreChangeLogStore.open_conversation(store, "new")
+    end)
+
     for device <- ["old", "new"] do
-      assert {:ok, session} = Relay.open_session(relay, device)
-
-      assert [%{"type" => "ok"}, %{"type" => "delivery"}, %{"type" => "resynced"}] =
-               session_request(relay, session, %{"type" => "resync", "since" => 0})
-
-      assert [%{"type" => "ok", "seq" => 1}] =
-               session_request(relay, session, %{"type" => "ack", "seq" => 1})
-
-      if device == "new" do
-        assert [%{"type" => "ok"}, %{"type" => "conversation_resynced"}] =
-                 session_request(relay, session, %{"type" => "conversation_open", "since" => 0})
-      end
-
       assert %{"type" => "ok"} =
                request(relay, device, %{
                  "type" => "push_register",
@@ -832,10 +768,10 @@ defmodule AttentionServer.ConversationFeedTest do
              )
 
     assert %{"type" => "ok", "seq" => 1} = request(relay, "origin", send)
-    assert {:ok, [origin_delivery], 1} = Relay.events(relay, "origin", 0)
+    assert {:ok, [origin_delivery], 1} = RelayReaders.events(relay, "origin", 0)
     refute Map.has_key?(origin_delivery, "files")
 
-    assert {:ok, [recipient_delivery], 1} = Relay.events(relay, "reader", 0)
+    assert {:ok, [recipient_delivery], 1} = RelayReaders.events(relay, "reader", 0)
     assert [stored] = recipient_delivery["files"]
     assert Base.decode64!(stored["data_base64"]) == bytes
     assert stored["size"] == byte_size(bytes)
@@ -878,7 +814,7 @@ defmodule AttentionServer.ConversationFeedTest do
 
     GenServer.stop(relay)
     assert {:ok, restarted} = Relay.start_link(store_path: path)
-    assert {:ok, [replayed], 1} = Relay.events(restarted, "reader", 0)
+    assert {:ok, [replayed], 1} = RelayReaders.events(restarted, "reader", 0)
     assert replayed["files"] == recipient_delivery["files"]
 
     assert %{"type" => "ok", "seq" => 1, "duplicate" => true} =
@@ -1514,7 +1450,7 @@ defmodule AttentionServer.ConversationFeedTest do
              )
 
     assert {:ok, [discussion, delivery_ack, transfer_fact, use_fact], 4} =
-             Relay.conversation_events(relay, "reader", 0)
+             RelayReaders.conversation_events(relay, "reader", 0)
 
     assert delivery_ack["kind"] == "delivery_ack"
     assert delivery_ack["stage"] == "ack1"
@@ -1683,7 +1619,7 @@ defmodule AttentionServer.ConversationFeedTest do
                "answer" => nil
              })
 
-    assert {:ok, [_, lifecycle], 2} = Relay.events(relay, "reader", 0)
+    assert {:ok, [_, lifecycle], 2} = RelayReaders.events(relay, "reader", 0)
     assert %{"terminal" => terminal} = agent_message(relay, "request-1")
     assert terminal["state"] == "answered"
     assert Map.has_key?(terminal, "answer") and is_nil(terminal["answer"])
@@ -1708,17 +1644,17 @@ defmodule AttentionServer.ConversationFeedTest do
     assert [%{"kind" => "message", "data" => %{"terminal" => %{"state" => "answered"}}}] =
              agent_feed(relay)
 
-    assert {:ok, [], 2} = Relay.events(relay, "reader", 2)
-    assert {:ok, [delivery_ack], 1} = Relay.conversation_events(relay, "reader", 0)
+    assert {:ok, [], 2} = RelayReaders.events(relay, "reader", 2)
+    assert {:ok, [delivery_ack], 1} = RelayReaders.conversation_events(relay, "reader", 0)
     assert delivery_ack["kind"] == "delivery_ack"
     assert delivery_ack["stage"] == "ack1"
     assert delivery_ack["event_id"] == lifecycle["event_id"]
     assert delivery_ack["request_revision"] == 1
     refute Map.has_key?(delivery_ack, "answer")
-    assert {:ok, [^delivery_ack], 1} = Relay.conversation_events(relay, "origin", 0)
+    assert {:ok, [^delivery_ack], 1} = RelayReaders.conversation_events(relay, "origin", 0)
 
     assert [_] = agent_feed(relay)
-    assert {:ok, [], 1} = Relay.conversation_events(relay, "reader", 1)
+    assert {:ok, [], 1} = RelayReaders.conversation_events(relay, "reader", 1)
 
     assert %{"terminal" => %{"delivery" => %{"delivered" => true, "acted" => false}}} =
              agent_message(relay, "request-1")
@@ -1826,9 +1762,9 @@ defmodule AttentionServer.ConversationFeedTest do
                "text" => "Please explain the rollout plan"
              })
 
-    assert {:ok, [origin_change], 1} = Relay.conversation_events(relay, "origin", 0)
+    assert {:ok, [origin_change], 1} = RelayReaders.conversation_events(relay, "origin", 0)
     refute String.contains?(JSON.encode!(origin_change), "rollout plan")
-    assert {:ok, [recipient_change], 1} = Relay.conversation_events(relay, "reader", 0)
+    assert {:ok, [recipient_change], 1} = RelayReaders.conversation_events(relay, "reader", 0)
     assert recipient_change["text"] == "Please explain the rollout plan"
     assert recipient_change["event_id"] == "2"
 
@@ -1860,7 +1796,7 @@ defmodule AttentionServer.ConversationFeedTest do
              request(relay, "origin", reply)
 
     assert {:ok, [discussion_fact, reply_fact, acted_fact], 3} =
-             Relay.conversation_events(relay, "reader", 0)
+             RelayReaders.conversation_events(relay, "reader", 0)
 
     assert discussion_fact["event_id"] == "2"
     assert reply_fact["event_id"] == "3"
@@ -2008,15 +1944,17 @@ defmodule AttentionServer.ConversationFeedTest do
 
     assert %{"revision" => 2, "message" => current} = agent_message(relay, "revised-request")
     assert current == Map.drop(updated, ["sender_id", "message_id"])
-    {:ok, [old_fact, _, _, newer_fact | _], _} = Relay.conversation_events(relay, "reader", 0)
+
+    {:ok, [old_fact, _, _, newer_fact | _], _} =
+      RelayReaders.conversation_events(relay, "reader", 0)
 
     GenServer.stop(relay)
     assert {:ok, restarted} = Relay.start_link(store_path: path)
 
-    assert {:ok, [initial], 1} = Relay.events(restarted, "reader", 0)
+    assert {:ok, [initial], 1} = RelayReaders.events(restarted, "reader", 0)
 
     assert {:ok, [_, revised, acted, _, old_ack, new_ack], 6} =
-             Relay.conversation_events(restarted, "reader", 0)
+             RelayReaders.conversation_events(restarted, "reader", 0)
 
     assert Enum.map([old_ack, new_ack], & &1["event_id"]) == [
              old_fact["event_id"],
@@ -2056,7 +1994,7 @@ defmodule AttentionServer.ConversationFeedTest do
 
     assert terminal["state"] == "answered"
     assert terminal["answer"] == "Yes"
-    assert {:ok, [terminal_change], 2} = Relay.events(restarted, "reader", 1)
+    assert {:ok, [terminal_change], 2} = RelayReaders.events(restarted, "reader", 1)
     assert terminal_change["type"] == "lifecycle"
     assert terminal_change["request_revision"] == 2
     GenServer.stop(restarted)
@@ -2366,7 +2304,9 @@ defmodule AttentionServer.ConversationFeedTest do
              ]
     end
 
-    assert {:ok, conversation_events, _high} = Relay.conversation_events(relay, "reader", 0)
+    assert {:ok, conversation_events, _high} =
+             RelayReaders.conversation_events(relay, "reader", 0)
+
     refute Enum.any?(conversation_events, &Map.has_key?(&1, "answer"))
 
     for {_message_id, %{frame: frame, event: event}} <- prior_discussions do
@@ -2494,7 +2434,7 @@ defmodule AttentionServer.ConversationFeedTest do
              "This request is answered"
            ]
 
-    assert {:ok, history, _high} = Relay.conversation_events(relay, "reader", 0)
+    assert {:ok, history, _high} = RelayReaders.conversation_events(relay, "reader", 0)
     assert Enum.any?(history, &(&1["text"] == "This sibling is still open"))
     assert Enum.any?(history, &(&1["text"] == "The sibling reply is still open"))
 
@@ -2526,7 +2466,7 @@ defmodule AttentionServer.ConversationFeedTest do
                "message" => original
              })
 
-    assert {:ok, [acceptance], 1} = Relay.events(relay, "reader", 0)
+    assert {:ok, [acceptance], 1} = RelayReaders.events(relay, "reader", 0)
     assert acceptance["type"] == "delivery"
     assert acceptance["message"] == original
     refute Map.has_key?(acceptance, "state")
@@ -2591,7 +2531,7 @@ defmodule AttentionServer.ConversationFeedTest do
     assert %{"type" => "ok", "seq" => 1, "duplicate" => true} =
              request(relay, "reader", discussion)
 
-    assert {:ok, [page_delivery, lifecycle], 2} = Relay.events(relay, "reader", 0)
+    assert {:ok, [page_delivery, lifecycle], 2} = RelayReaders.events(relay, "reader", 0)
     assert page_delivery["seq"] == acceptance["seq"]
     assert page_delivery["request_revision"] == acceptance["request_revision"]
     assert page_delivery["session_handle"] == acceptance["session_handle"]
@@ -2599,10 +2539,10 @@ defmodule AttentionServer.ConversationFeedTest do
     assert page_delivery["state"] == "retracted"
     assert page_delivery["retracted_at"] == retracted_at
     assert lifecycle["seq"] == 2
-    assert {:ok, [snapshot_lifecycle], 2} = Relay.events(relay, "reader", 1)
+    assert {:ok, [snapshot_lifecycle], 2} = RelayReaders.events(relay, "reader", 1)
     assert snapshot_lifecycle == lifecycle
 
-    assert {:ok, [origin_reference | _], 2} = Relay.events(relay, "origin", 0)
+    assert {:ok, [origin_reference | _], 2} = RelayReaders.events(relay, "origin", 0)
     assert origin_reference["type"] == "delivery"
     refute Map.has_key?(origin_reference, "message")
     refute Map.has_key?(origin_reference, "state")
@@ -2616,8 +2556,8 @@ defmodule AttentionServer.ConversationFeedTest do
     assert terminal["state"] == "retracted"
     assert %{"terminal" => message_terminal} = agent_message(relay, "withdrawn")
     assert message_terminal == %{"state" => "retracted", "at_ms" => retracted_at}
-    {:ok, [discussion_fact | _], _} = Relay.conversation_events(relay, "reader", 0)
-    assert {:ok, [lifecycle], 2} = Relay.events(relay, "reader", 1)
+    {:ok, [discussion_fact | _], _} = RelayReaders.conversation_events(relay, "reader", 0)
+    assert {:ok, [lifecycle], 2} = RelayReaders.events(relay, "reader", 1)
     terminal_event_id = lifecycle["event_id"]
     assert lifecycle["author"] == "origin"
     assert lifecycle["state"] == "cleared"
@@ -2626,7 +2566,7 @@ defmodule AttentionServer.ConversationFeedTest do
     assert lifecycle["retracted_at"] == retracted_at
 
     assert {:ok, [_, retraction, acted, delivery_ack], 4} =
-             Relay.conversation_events(relay, "reader", 0)
+             RelayReaders.conversation_events(relay, "reader", 0)
 
     assert delivery_ack["kind"] == "delivery_ack"
     assert delivery_ack["event_id"] == discussion_fact["event_id"]
@@ -2679,14 +2619,14 @@ defmodule AttentionServer.ConversationFeedTest do
 
     GenServer.stop(relay)
     assert {:ok, restarted} = Relay.start_link(store_path: path)
-    assert {:ok, [replayed], 2} = Relay.events(restarted, "reader", 1)
+    assert {:ok, [replayed], 2} = RelayReaders.events(restarted, "reader", 1)
     assert replayed["state"] == "cleared"
     assert replayed["terminal_reason"] == "retracted"
     assert replayed["at"] == retracted_at
     assert replayed["retracted_at"] == retracted_at
 
     assert {:ok, [_, %{"kind" => "retraction", "event_id" => retraction_id}, _, ^delivery_ack], 4} =
-             Relay.conversation_events(restarted, "reader", 0)
+             RelayReaders.conversation_events(restarted, "reader", 0)
 
     assert retraction_id == terminal_event_id
     assert [_, ^terminal] = agent_entries(restarted, "withdrawn")
@@ -2723,7 +2663,7 @@ defmodule AttentionServer.ConversationFeedTest do
                "at" => 3
              })
 
-    assert {:ok, [ordinary_clear], 4} = Relay.events(restarted, "reader", 3)
+    assert {:ok, [ordinary_clear], 4} = RelayReaders.events(restarted, "reader", 3)
     assert ordinary_clear["state"] == "cleared"
     refute Map.has_key?(ordinary_clear, "terminal_reason")
     refute Map.has_key?(ordinary_clear, "retracted_at")
@@ -2865,7 +2805,7 @@ defmodule AttentionServer.ConversationFeedTest do
                "message_id" => "answer-wins"
              })
 
-    assert {:ok, [lifecycle], 2} = Relay.events(relay, "reader", 1)
+    assert {:ok, [lifecycle], 2} = RelayReaders.events(relay, "reader", 1)
     assert lifecycle["state"] == "answered"
 
     assert %{"terminal" => terminal} = agent_message(relay, "answer-wins")
@@ -2903,7 +2843,7 @@ defmodule AttentionServer.ConversationFeedTest do
                }
              })
 
-    assert {:ok, [initial], 1} = Relay.events(relay, "reader", 0)
+    assert {:ok, [initial], 1} = RelayReaders.events(relay, "reader", 0)
     assert initial["availability"] == "not_listening"
     assert initial["session_handle"] == @handle
     assert initial["request_revision"] == 1
@@ -2914,19 +2854,19 @@ defmodule AttentionServer.ConversationFeedTest do
 
     # The origin's open v2 agent feed for the session is what listens now.
     agent_feed_activity(relay, :open)
-    assert {:ok, [listening], 1} = Relay.conversation_events(relay, "reader", 0)
+    assert {:ok, [listening], 1} = RelayReaders.conversation_events(relay, "reader", 0)
     assert listening["type"] == "conversation"
     assert listening["kind"] == "availability"
     assert listening["availability"] == "listening"
     assert listening["session_handle"] == @handle
     assert listening["listening_support"]["route"] == "claude-code"
     refute Map.has_key?(listening, "message")
-    assert {:ok, [origin_listening], 1} = Relay.conversation_events(relay, "origin", 0)
+    assert {:ok, [origin_listening], 1} = RelayReaders.conversation_events(relay, "origin", 0)
     assert origin_listening["availability"] == "listening"
     refute Map.has_key?(origin_listening, "message")
 
     agent_feed_activity(relay, :close)
-    assert {:ok, [detached], 2} = Relay.conversation_events(relay, "reader", 1)
+    assert {:ok, [detached], 2} = RelayReaders.conversation_events(relay, "reader", 1)
     assert detached["availability"] == "not_listening"
     assert is_integer(detached["last_detached_at"])
 
@@ -2943,15 +2883,15 @@ defmodule AttentionServer.ConversationFeedTest do
                )
     end
 
-    assert {:ok, [gone], 3} = Relay.conversation_events(relay, "reader", 2)
+    assert {:ok, [gone], 3} = RelayReaders.conversation_events(relay, "reader", 2)
     assert gone["availability"] == "gone"
     assert gone["request_revision"] == 1
-    assert {:ok, [], 0} = Relay.events(relay, "other", 0)
+    assert {:ok, [], 0} = RelayReaders.events(relay, "other", 0)
 
     GenServer.stop(relay)
     assert {:ok, restarted} = Relay.start_link(store_path: path)
-    assert {:ok, [initial], 1} = Relay.events(restarted, "reader", 0)
-    assert {:ok, changes, 3} = Relay.conversation_events(restarted, "reader", 0)
+    assert {:ok, [initial], 1} = RelayReaders.events(restarted, "reader", 0)
+    assert {:ok, changes, 3} = RelayReaders.conversation_events(restarted, "reader", 0)
     replayed = [initial | changes]
 
     assert Enum.map(replayed, & &1["availability"]) ==
@@ -2996,7 +2936,7 @@ defmodule AttentionServer.ConversationFeedTest do
     assert after_version == before_version + 1
     assert after_payload != before_payload
     assert :crypto.hash(:sha256, after_payload) == after_checksum
-    assert {:ok, [listening], 1} = Relay.conversation_events(relay, "reader", 0)
+    assert {:ok, [listening], 1} = RelayReaders.conversation_events(relay, "reader", 0)
     assert listening["availability"] == "listening"
 
     assert :ok = Relay.setup_person(relay, "B")
@@ -3008,12 +2948,12 @@ defmodule AttentionServer.ConversationFeedTest do
     GenServer.stop(relay)
     assert {:ok, restarted} = Relay.start_link(store_path: path)
 
-    assert {:ok, [initial], 1} = Relay.events(restarted, "reader", 0)
+    assert {:ok, [initial], 1} = RelayReaders.events(restarted, "reader", 0)
     assert initial["availability"] == "not_listening"
 
     # The listening fact replays; no feed is open after the restart, so the
     # Relay records the session as not listening once.
-    assert {:ok, [replayed, reset], 2} = Relay.conversation_events(restarted, "reader", 0)
+    assert {:ok, [replayed, reset], 2} = RelayReaders.conversation_events(restarted, "reader", 0)
     assert replayed == listening
     assert reset["availability"] == "not_listening"
     assert is_integer(reset["last_detached_at"])
@@ -3077,7 +3017,7 @@ defmodule AttentionServer.ConversationFeedTest do
              declared
 
     agent_feed_activity(restarted, :open)
-    assert {:ok, facts, _} = Relay.conversation_events(restarted, "reader", 0)
+    assert {:ok, facts, _} = RelayReaders.conversation_events(restarted, "reader", 0)
     assert %{"availability" => "listening", "listening_support" => ^declared} = List.last(facts)
 
     duplicate_state = state_snapshot(path)

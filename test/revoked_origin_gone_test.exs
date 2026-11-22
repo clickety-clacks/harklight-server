@@ -1,7 +1,7 @@
 defmodule AttentionServer.RevokedOriginGoneTest do
   use ExUnit.Case, async: false
 
-  alias AttentionServer.{DeviceIdentity, JSON, Relay, TLSFixtures}
+  alias AttentionServer.{DeviceIdentity, JSON, Relay, RelayReaders, TLSFixtures}
 
   @handle_a "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
   @handle_b "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
@@ -77,10 +77,10 @@ defmodule AttentionServer.RevokedOriginGoneTest do
     forward(relay, @handle_a, "revoked-chat-a", 1)
     forward(relay, @handle_b, "revoked-chat-b", 2)
 
-    assert {:ok, _before, cursor} = Relay.conversation_events(relay, "reader", 0)
+    assert {:ok, _before, cursor} = RelayReaders.conversation_events(relay, "reader", 0)
     assert :ok = Relay.owner_revoke_device(relay, person, owner_key, "origin")
 
-    assert {:ok, changes, next_cursor} = Relay.conversation_events(relay, "reader", cursor)
+    assert {:ok, changes, next_cursor} = RelayReaders.conversation_events(relay, "reader", cursor)
     gone = Enum.filter(changes, &(&1["kind"] == "availability"))
 
     assert Enum.sort(Enum.map(gone, & &1["session_handle"])) ==
@@ -90,7 +90,9 @@ defmodule AttentionServer.RevokedOriginGoneTest do
     assert length(gone) == 2
 
     assert :ok = Relay.owner_revoke_device(relay, person, owner_key, "origin")
-    assert {:ok, [], ^next_cursor} = Relay.conversation_events(relay, "reader", next_cursor)
+
+    assert {:ok, [], ^next_cursor} =
+             RelayReaders.conversation_events(relay, "reader", next_cursor)
 
     assert %{"type" => "ok"} =
              request(relay, "reader", %{
@@ -102,7 +104,7 @@ defmodule AttentionServer.RevokedOriginGoneTest do
                "text" => "Can we discuss this?"
              })
 
-    assert {:ok, chat_events, _} = Relay.conversation_events(relay, "reader", next_cursor)
+    assert {:ok, chat_events, _} = RelayReaders.conversation_events(relay, "reader", next_cursor)
     assert Enum.any?(chat_events, &(&1["kind"] == "discussion"))
     refute Enum.any?(chat_events, &(&1["kind"] == "availability"))
   end

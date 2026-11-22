@@ -14,11 +14,13 @@ defmodule AttentionServer.PrioritizationTest do
     Placement,
     PreChangeLogStore,
     Relay,
+    RelayReaders,
     RouteBIndex,
     Store,
     TLSFixtures
   }
 
+  alias AttentionServer.ClientAPI.Reads
   alias Exqlite.Sqlite3
 
   @endpoint "https://api.typesafe.ai/v1/systemone"
@@ -61,22 +63,40 @@ defmodule AttentionServer.PrioritizationTest do
     reply
   end
 
-  defp session_request(relay, session, frame) do
-    assert {:ok, lines} = Relay.session_request_line(relay, session, raw(frame))
+  # The stored priority view, the rank input, in the string-keyed wire form
+  # the protocol 0.1 view fetch served, without its revision.
+  defp view_for(relay, person \\ "person-a") do
+    view =
+      :sys.get_state(relay).priority_views
+      |> Map.fetch!(person)
+      |> Map.take([:algorithm, :basis, :reason, :entries, :replies, :list_items])
+      |> Map.new(fn {key, value} -> {Atom.to_string(key), value} end)
 
-    Enum.map(lines, fn line ->
-      assert {:ok, reply} = JSON.decode_line(line)
-      reply
-    end)
+    assert {:ok, decoded} = JSON.decode_line(JSON.encode!(view) <> "\n")
+    decoded
   end
 
-  defp drain(relay, session) do
-    assert {:ok, lines} = Relay.session_drain(relay, session)
+  # The 0.1 view fetch rebuilt the view on read. A choice saved behind the
+  # Relay's back (configure_jev_choice) reaches the view the way the Relay
+  # publishes a Jev view it cannot rank yet: a pass that gives no scores
+  # publishes the fallback. Its retry timer is cancelled; each test drives
+  # its own later passes.
+  defp publish_fallback_view(relay, person \\ "person-a") do
+    job = start_synthetic_priority_pass(relay, person)
+    complete_synthetic_priority_pass(job, {:error, :unavailable})
 
-    Enum.map(lines, fn line ->
-      assert {:ok, reply} = JSON.decode_line(line)
-      reply
+    :sys.replace_state(relay, fn state ->
+      case Map.pop(state.priority_retry_timers, person) do
+        {%{ref: ref}, timers} ->
+          Process.cancel_timer(ref)
+          %{state | priority_retry_timers: timers}
+
+        {nil, _timers} ->
+          state
+      end
     end)
+
+    assert view_for(relay, person)["basis"] == "fallback"
   end
 
   defp start_relay(path, opts \\ []) do
@@ -136,7 +156,7 @@ defmodule AttentionServer.PrioritizationTest do
             receive do
               {:complete, result} ->
                 send(relay_pid, {:prioritization_result, person, sequence, generation, result})
-                barrier_result = Relay.events(relay_pid, "device-a", 0)
+                barrier_result = RelayReaders.events(relay_pid, "device-a", 0)
                 send(test_process, {:priority_result_handled, self(), barrier_result})
             end
           end)
@@ -246,8 +266,7 @@ defmodule AttentionServer.PrioritizationTest do
              })["type"] == "ok"
     end
 
-    assert {:ok, session} = Relay.open_session(relay, "device-b")
-    [view] = session_request(relay, session, %{"type" => "view_get", "ref" => "a1-view"})
+    view = view_for(relay)
     assert view["algorithm"] == "baseline"
     entries = view["entries"]
 
@@ -289,7 +308,8 @@ defmodule AttentionServer.PrioritizationTest do
     assert is_integer(BounceDecision.next_deadline(scored))
 
     configure_jev_choice(relay)
-    [fallback] = session_request(relay, session, %{"type" => "view_get", "ref" => "a1-fallback"})
+    publish_fallback_view(relay)
+    fallback = view_for(relay)
     assert fallback["basis"] == "fallback"
 
     assert Enum.map(
@@ -333,9 +353,9 @@ defmodule AttentionServer.PrioritizationTest do
              })["type"] == "ok"
     end
 
-    assert {:ok, session} = Relay.open_session(relay, "device-b")
     configure_jev_choice(relay)
-    [fallback] = session_request(relay, session, %{"type" => "view_get", "ref" => "a1-view"})
+    publish_fallback_view(relay)
+    fallback = view_for(relay)
     assert fallback["basis"] == "fallback"
 
     assert Enum.map(fallback["entries"], & &1["priority"]) == ["now", "normal", "low"]
@@ -348,7 +368,7 @@ defmodule AttentionServer.PrioritizationTest do
       {:ok, %{{"app:test", "C"} => 0.9, {"app:test", "B"} => 0.5, {"app:test", "A"} => 0.1}}
     )
 
-    [selected] = session_request(relay, session, %{"type" => "view_get", "ref" => "a1-view"})
+    selected = view_for(relay)
     assert selected["basis"] == "selected"
 
     assert Enum.map(selected["entries"], & &1["score"]) == [
@@ -365,7 +385,6 @@ defmodule AttentionServer.PrioritizationTest do
   } do
     relay = start_relay(path)
     setup_person(relay)
-    assert {:ok, session} = Relay.open_session(relay, "device-b")
     # Model an orphaned historical event: reply projection must not turn it
     # into an entry whose display metadata requires a missing parent.
     :sys.replace_state(relay, fn state ->
@@ -379,14 +398,19 @@ defmodule AttentionServer.PrioritizationTest do
       engine = %{
         engine
         | conversation_events: Map.put(engine.conversation_events, {"person-a", 1}, event),
-          conversation_highs: Map.put(engine.conversation_highs, "person-a", 1)
+          conversation_highs: Map.put(engine.conversation_highs, "person-a", 1),
+          algorithm_choices: Map.put(engine.algorithm_choices, "person-a", "jev-set")
       }
 
       %{state | store: %{state.store | engine: engine}}
     end)
 
-    [view] = session_request(relay, session, %{"type" => "view_get", "ref" => "orphan-view"})
-    assert view["type"] == "ok"
+    # The store refuses such an event, so it is held in memory only. A pass
+    # that cannot rank projects the view again over it.
+    job = start_synthetic_priority_pass(relay)
+    complete_synthetic_priority_pass(job, {:error, :unavailable})
+    view = view_for(relay)
+    assert view["basis"] == "fallback"
     assert view["entries"] == []
     assert view["replies"] == []
     assert Process.alive?(relay)
@@ -797,10 +821,8 @@ defmodule AttentionServer.PrioritizationTest do
     assert DashboardView.prioritization("Owner", settings) =~
              "Jev setup is incomplete; waiting items are in basic order."
 
-    assert {:ok, session} = Relay.open_websocket_session(relay, "device-a", nil, nil)
-
-    assert [%{"algorithm" => "jev-set", "basis" => "fallback", "entries" => entries}] =
-             session_request(relay, session, %{"type" => "view_get", "ref" => "unconfigured"})
+    assert %{"algorithm" => "jev-set", "basis" => "fallback", "entries" => entries} =
+             view_for(relay, person)
 
     assert Enum.map(entries, & &1["message_id"]) == ["earlier", "later"]
 
@@ -843,8 +865,7 @@ defmodule AttentionServer.PrioritizationTest do
       {:ok, %{{"app:test", "later"} => 1.0, {"app:test", "earlier"} => 0.0}}
     )
 
-    assert [%{"basis" => "selected", "entries" => selected_entries}] =
-             session_request(relay, session, %{"type" => "view_get", "ref" => "selected"})
+    assert %{"basis" => "selected", "entries" => selected_entries} = view_for(relay, person)
 
     assert Enum.map(selected_entries, & &1["message_id"]) == ["later", "earlier"]
 
@@ -866,13 +887,12 @@ defmodule AttentionServer.PrioritizationTest do
     assert DashboardView.prioritization("Owner", settings) =~
              "Waiting items are in basic order until Jev answers."
 
-    assert [%{"basis" => "fallback", "entries" => fallback_entries}] =
-             session_request(relay, session, %{"type" => "view_get", "ref" => "new-connection"})
+    assert %{"basis" => "fallback", "entries" => fallback_entries} = view_for(relay, person)
 
     assert Enum.map(fallback_entries, & &1["message_id"]) == ["earlier", "later"]
 
     version = :sys.get_state(relay).store.version
-    view_rev = :sys.get_state(relay).priority_views[person].view_rev
+    view = view_for(relay, person)
 
     assert {:ok, _} =
              Relay.save_dashboard_prioritization(
@@ -886,7 +906,7 @@ defmodule AttentionServer.PrioritizationTest do
              )
 
     assert :sys.get_state(relay).store.version == version
-    assert :sys.get_state(relay).priority_views[person].view_rev == view_rev
+    assert view_for(relay, person) == view
 
     GenServer.stop(relay)
     assert {:ok, persisted} = Store.open(path)
@@ -1135,20 +1155,17 @@ defmodule AttentionServer.PrioritizationTest do
     refute logs =~ key_path
   end
 
-  test "view fetch is complete and supports unchanged replies", %{path: path} do
+  test "a baseline view carries display priority and due time for each entry", %{path: path} do
     relay = start_relay(path)
     setup_person(relay)
     forward(relay, 1, "older")
     forward(relay, 2, "newer", 200)
-    assert {:ok, session} = Relay.open_websocket_session(relay, "device-b", nil, nil)
 
     assert %{
-             "type" => "ok",
              "algorithm" => "baseline",
              "basis" => "selected",
              "entries" => entries
-           } =
-             hd(session_request(relay, session, %{"type" => "view_get", "ref" => "view-1"}))
+           } = view_for(relay)
 
     assert entries == [
              %{
@@ -1160,73 +1177,6 @@ defmodule AttentionServer.PrioritizationTest do
              %{"sender_id" => "app:test", "message_id" => "older", "priority" => "normal"}
            ]
 
-    view_rev = :sys.get_state(relay).priority_views["person-a"].view_rev
-
-    assert %{"type" => "ok", "unchanged" => true, "view_rev" => ^view_rev} =
-             hd(
-               session_request(relay, session, %{
-                 "type" => "view_get",
-                 "ref" => "view-2",
-                 "known_view_rev" => view_rev
-               })
-             )
-
-    assert %{"type" => "error", "reason" => "invalid_field", "ref" => "view-bad"} =
-             hd(
-               session_request(relay, session, %{
-                 "type" => "view_get",
-                 "ref" => "view-bad",
-                 "unknown" => true
-               })
-             )
-
-    assert %{"type" => "error", "reason" => "unsupported_version", "ref" => "view-old"} =
-             hd(
-               session_request(relay, session, %{
-                 "v" => 2,
-                 "type" => "view_get",
-                 "ref" => "view-old"
-               })
-             )
-
-    GenServer.stop(relay)
-  end
-
-  test "ready sessions get one coalesced out-of-band view notice only after fetching a view", %{
-    path: path
-  } do
-    relay = start_relay(path)
-    setup_person(relay)
-
-    assert {:ok, supporting} = Relay.open_websocket_session(relay, "device-a", nil, nil)
-    assert {:ok, legacy} = Relay.open_websocket_session(relay, "device-b", nil, nil)
-
-    assert List.last(session_request(relay, supporting, %{"type" => "resync", "since" => 0}))[
-             "type"
-           ] ==
-             "resynced"
-
-    assert List.last(session_request(relay, legacy, %{"type" => "resync", "since" => 0}))["type"] ==
-             "resynced"
-
-    assert %{"type" => "ok", "algorithm" => "baseline"} =
-             hd(session_request(relay, supporting, %{"type" => "view_get", "ref" => "view"}))
-
-    forward(relay, 1, "first-new")
-    forward(relay, 2, "second-new")
-
-    supporting_frames = drain(relay, supporting)
-    legacy_frames = drain(relay, legacy)
-    notices = Enum.filter(supporting_frames, &(&1["type"] == "view_changed"))
-    assert length(notices) == 1
-    refute Map.has_key?(hd(notices), "seq")
-    refute Enum.any?(legacy_frames, &(&1["type"] == "view_changed"))
-
-    assert {:ok, events, 2} = Relay.events(relay, "device-a", 0)
-    assert Enum.map(events, & &1["seq"]) == [1, 2]
-
-    latest = hd(session_request(relay, supporting, %{"type" => "view_get", "ref" => "latest"}))
-    assert hd(notices)["view_rev"] == latest["view_rev"]
     GenServer.stop(relay)
   end
 
@@ -1253,26 +1203,14 @@ defmodule AttentionServer.PrioritizationTest do
              Store.commit(store, engine, %{person: "person-a", actor: "owner", action: "choice"})
 
     :sys.replace_state(relay, &%{&1 | store: saved})
+    publish_fallback_view(relay)
 
-    assert {:ok, session} = Relay.open_websocket_session(relay, "device-a", nil, nil)
-
-    assert %{"type" => "ok", "algorithm" => "jev-set", "basis" => "fallback", "entries" => []} =
-             hd(session_request(relay, session, %{"type" => "view_get", "ref" => "fallback"}))
+    assert %{"algorithm" => "jev-set", "basis" => "fallback", "entries" => []} = view_for(relay)
 
     forward(relay, 1, "while-unavailable")
 
-    assert %{
-             "type" => "ok",
-             "algorithm" => "jev-set",
-             "basis" => "fallback",
-             "entries" => entries
-           } =
-             hd(
-               session_request(relay, session, %{
-                 "type" => "view_get",
-                 "ref" => "fallback-after-intake"
-               })
-             )
+    assert %{"algorithm" => "jev-set", "basis" => "fallback", "entries" => entries} =
+             view_for(relay)
 
     assert Enum.map(entries, & &1["message_id"]) == ["while-unavailable"]
     GenServer.stop(relay)
@@ -1286,16 +1224,14 @@ defmodule AttentionServer.PrioritizationTest do
     forward(relay, 1, "older", 200)
     forward(relay, 2, "newer", 100)
     forward(relay, 3, "undated")
-    assert {:ok, session} = Relay.open_websocket_session(relay, "device-a", nil, nil)
-
     configure_jev_choice(relay)
+    publish_fallback_view(relay)
 
     assert %{
-             "type" => "ok",
              "algorithm" => "jev-set",
              "basis" => "fallback",
              "entries" => baseline_entries
-           } = hd(session_request(relay, session, %{"type" => "view_get", "ref" => "before"}))
+           } = view_for(relay)
 
     assert baseline_entries ==
              Enum.map(
@@ -1333,11 +1269,10 @@ defmodule AttentionServer.PrioritizationTest do
     complete_synthetic_priority_pass(job, {:ok, scores})
 
     assert %{
-             "type" => "ok",
              "algorithm" => "jev-set",
              "basis" => "selected",
              "entries" => selected_entries
-           } = hd(session_request(relay, session, %{"type" => "view_get", "ref" => "after"}))
+           } = view_for(relay)
 
     assert selected_entries == [
              %{
@@ -1367,7 +1302,7 @@ defmodule AttentionServer.PrioritizationTest do
     GenServer.stop(relay)
   end
 
-  test "a score-only change advances the view revision and returns the new number", %{
+  test "a score-only change publishes a new view with the new number", %{
     path: path,
     dir: dir
   } do
@@ -1376,28 +1311,18 @@ defmodule AttentionServer.PrioritizationTest do
     setup_person(relay)
     forward(relay, 1, "same-item")
     configure_jev_choice(relay)
-    assert {:ok, session} = Relay.open_websocket_session(relay, "device-a", nil, nil)
 
     job = start_synthetic_priority_pass(relay)
     complete_synthetic_priority_pass(job, {:ok, %{{"app:test", "same-item"} => 0.71}})
-    first = hd(session_request(relay, session, %{"type" => "view_get", "ref" => "first"}))
+    first = view_for(relay)
     assert first["basis"] == "selected"
 
     job = start_synthetic_priority_pass(relay)
     complete_synthetic_priority_pass(job, {:ok, %{{"app:test", "same-item"} => 0.72}})
 
-    second =
-      hd(
-        session_request(relay, session, %{
-          "type" => "view_get",
-          "ref" => "second",
-          "known_view_rev" => first["view_rev"]
-        })
-      )
-
+    second = view_for(relay)
     assert second["basis"] == "selected"
-    refute second["unchanged"]
-    refute second["view_rev"] == first["view_rev"]
+    refute second == first
 
     assert Enum.map(second["entries"], &Placement.identity/1) ==
              Enum.map(first["entries"], &Placement.identity/1)
@@ -1420,18 +1345,15 @@ defmodule AttentionServer.PrioritizationTest do
       setup_person(relay)
       forward(relay, 1, "older")
       forward(relay, 2, "newer")
-      assert {:ok, session} = Relay.open_websocket_session(relay, "device-a", nil, nil)
-
       configure_jev_choice(relay)
       job = start_synthetic_priority_pass(relay)
       complete_synthetic_priority_pass(job, result)
 
       assert %{
-               "type" => "ok",
                "algorithm" => "jev-set",
                "basis" => "fallback",
                "entries" => fallback_entries
-             } = hd(session_request(relay, session, %{"type" => "view_get", "ref" => "fallback"}))
+             } = view_for(relay)
 
       assert fallback_entries ==
                Enum.map(
@@ -1451,17 +1373,10 @@ defmodule AttentionServer.PrioritizationTest do
       forward(relay, 3, "arrived-after-pass")
 
       assert %{
-               "type" => "ok",
                "algorithm" => "jev-set",
                "basis" => "fallback",
                "entries" => updated_entries
-             } =
-               hd(
-                 session_request(relay, session, %{
-                   "type" => "view_get",
-                   "ref" => "after-intake"
-                 })
-               )
+             } = view_for(relay)
 
       assert updated_entries ==
                Enum.map(
@@ -1478,7 +1393,7 @@ defmodule AttentionServer.PrioritizationTest do
 
       assert Enum.all?(updated_entries, &(not Map.has_key?(&1, "reason")))
 
-      assert {:ok, events, 3} = Relay.events(relay, "device-a", 0)
+      assert {:ok, events, 3} = RelayReaders.events(relay, "device-a", 0)
       assert length(events) == 3
       assert Process.alive?(relay)
       GenServer.stop(relay)
@@ -1515,15 +1430,12 @@ defmodule AttentionServer.PrioritizationTest do
 
     restarted = start_relay(path)
     assert Process.alive?(restarted)
-    assert {:ok, session} = Relay.open_websocket_session(restarted, "device-a", nil, nil)
 
     assert %{
-             "type" => "ok",
              "algorithm" => "jev-set",
              "basis" => "fallback",
              "entries" => entries
-           } =
-             hd(session_request(restarted, session, %{"type" => "view_get", "ref" => "restart"}))
+           } = view_for(restarted)
 
     assert entries ==
              Enum.map(
@@ -1547,29 +1459,8 @@ defmodule AttentionServer.PrioritizationTest do
 
     forward(restarted, 4, "intake-after-restart")
     assert Process.alive?(restarted)
-    assert {:ok, events, 4} = Relay.events(restarted, "device-a", 0)
+    assert {:ok, events, 4} = RelayReaders.events(restarted, "device-a", 0)
     assert length(events) == 4
-    GenServer.stop(restarted)
-  end
-
-  test "a process restart gives the same view a new revision", %{path: path} do
-    relay = start_relay(path)
-    setup_person(relay)
-    forward(relay, 1, "same-view")
-    assert {:ok, first_session} = Relay.open_websocket_session(relay, "device-a", nil, nil)
-    first = hd(session_request(relay, first_session, %{"type" => "view_get", "ref" => "before"}))
-    GenServer.stop(relay)
-
-    restarted = start_relay(path)
-    assert {:ok, second_session} = Relay.open_websocket_session(restarted, "device-a", nil, nil)
-
-    second =
-      hd(session_request(restarted, second_session, %{"type" => "view_get", "ref" => "after"}))
-
-    assert first["algorithm"] == second["algorithm"]
-    assert first["basis"] == second["basis"]
-    assert first["entries"] == second["entries"]
-    refute first["view_rev"] == second["view_rev"]
     GenServer.stop(restarted)
   end
 
@@ -1684,8 +1575,8 @@ defmodule AttentionServer.PrioritizationTest do
 
     assert state.priority_views["person-a"].engine_entries == expected
 
-    assert {:ok, session} = Relay.open_session(relay, "device-a")
-    session_request(relay, session, %{"type" => "view_get", "ref" => "read-only"})
+    # A read appends no record and asks for no scoring.
+    assert {:ok, %{"items" => [_, _]}} = Reads.inbox(relay, "device-a")
     :sys.get_state(state.applied_score_record)
     assert File.read!(record_path) == JSON.encode!(%{row | "score" => 0.7}) <> "\n"
     refute_received {:scored_candidates, _}
@@ -1955,7 +1846,7 @@ defmodule AttentionServer.PrioritizationTest do
         end
 
         forward(relay, 2, "still-delivered")
-        assert {:ok, events, 2} = Relay.events(relay, "device-a", 0)
+        assert {:ok, events, 2} = RelayReaders.events(relay, "device-a", 0)
         assert length(events) == 2
       end)
 
@@ -1984,7 +1875,7 @@ defmodule AttentionServer.PrioritizationTest do
       complete_synthetic_priority_pass(job, {:ok, %{{"app:test", "entry"} => 0.7}})
       assert :sys.get_state(relay).priority_views["person-a"].basis == "selected"
       forward(relay, 2, "not-blocked")
-      assert {:ok, events, 2} = Relay.events(relay, "device-a", 0)
+      assert {:ok, events, 2} = RelayReaders.events(relay, "device-a", 0)
       assert length(events) == 2
     after
       :sys.resume(writer)
@@ -2057,7 +1948,7 @@ defmodule AttentionServer.PrioritizationTest do
     assert_receive {:ranking_waiting, first_worker}, 2_000
 
     forward(relay, 2, "accepted-while-ranking")
-    assert {:ok, events, 2} = Relay.events(relay, "device-a", 0)
+    assert {:ok, events, 2} = RelayReaders.events(relay, "device-a", 0)
     assert length(events) == 2
 
     assert_receive {:ranking_waiting, next_worker}, 2_000
@@ -2208,7 +2099,7 @@ defmodule AttentionServer.PrioritizationTest do
 
         # A synchronous request from this process is ordered after the injected
         # stale result, so the following state read observes its handling.
-        assert {:ok, _events, _high_water} = Relay.events(relay, "device-a", 0)
+        assert {:ok, _events, _high_water} = RelayReaders.events(relay, "device-a", 0)
         after_stale_result = :sys.get_state(relay)
 
         assert after_stale_result.priority_jobs["person-a"] == next_job
@@ -2273,9 +2164,6 @@ defmodule AttentionServer.PrioritizationTest do
                }
              })
 
-    {:ok, session} = Relay.open_session(relay, "device-b")
-    session_request(relay, session, %{"type" => "resync", "since" => 0})
-    session_request(relay, session, %{"type" => "view_get", "ref" => "before"})
     configure_jev_choice(relay)
 
     discussion =
@@ -2310,7 +2198,6 @@ defmodule AttentionServer.PrioritizationTest do
       end)
 
     assert state.store.engine.push_bindings == bindings
-    assert Enum.any?(drain(relay, session), &(&1["type"] == "view_changed"))
     assert [%{"message_id" => "chat"}] = state.priority_views["person-a"].entries
     engine = state.store.engine
     now = engine.push_bindings[{"person-a", "device-b"}].next_at
@@ -2352,12 +2239,7 @@ defmodule AttentionServer.PrioritizationTest do
       )
 
     setup_person(relay)
-    assert {:ok, session} = Relay.open_session(relay, "device-b")
-
-    view = fn ->
-      session_request(relay, session, %{"type" => "view_get", "ref" => "reply-view"})
-      |> Enum.find(&(&1["ref"] == "reply-view"))
-    end
+    view = fn -> view_for(relay) end
 
     assert %{"type" => "ok"} =
              request(relay, "device-a", %{
@@ -2388,7 +2270,7 @@ defmodule AttentionServer.PrioritizationTest do
       })
 
     assert discussion["type"] == "ok"
-    assert view.()["view_rev"] == initial["view_rev"]
+    assert view.() == initial
 
     reply_frame = %{
       "type" => "conversation_reply",
@@ -2407,9 +2289,9 @@ defmodule AttentionServer.PrioritizationTest do
     baseline = view.()
     assert baseline["replies"] == [Map.put(expected, "priority", "high")]
     assert baseline["entries"] == initial["entries"]
-    refute baseline["view_rev"] == initial["view_rev"]
+    refute baseline == initial
     assert Map.delete(request(relay, "device-a", reply_frame), "duplicate") == reply
-    assert view.()["view_rev"] == baseline["view_rev"]
+    assert view.() == baseline
 
     assert {:ok, terminal_line} =
              Relay.request_line(
@@ -2436,6 +2318,7 @@ defmodule AttentionServer.PrioritizationTest do
     assert pending["body"] == "Agent explanation"
     assert pending["urgency"] == "high"
     configure_jev_choice(relay)
+    publish_fallback_view(relay)
     before_score = view.()
     assert before_score["replies"] == [Map.put(expected, "priority", "high")]
     job = start_synthetic_priority_pass(relay)
@@ -2445,7 +2328,7 @@ defmodule AttentionServer.PrioritizationTest do
     assert scored_reply["score"] == %JSON.DecimalToken{raw: "0.1"}
     refute Map.has_key?(scored_reply, "priority")
     assert scored["entries"] == []
-    refute scored["view_rev"] == before_score["view_rev"]
+    refute scored == before_score
     writer = :sys.get_state(relay).applied_score_record
     :sys.get_state(writer)
     assert {:ok, row} = JSON.decode_line(File.read!(record_path))
@@ -2469,7 +2352,7 @@ defmodule AttentionServer.PrioritizationTest do
 
     after_read = view.()
     assert after_read["replies"] == []
-    refute after_read["view_rev"] == scored["view_rev"]
+    refute after_read == scored
     engine = :sys.get_state(relay).store.engine
     assert engine.messages[{"person-a", "app:test", "parent"}] == before_read
     assert Placement.ranking_items(engine, "person-a") == []
@@ -2498,8 +2381,7 @@ defmodule AttentionServer.PrioritizationTest do
         end
       )
 
-    {:ok, session} = Relay.open_session(restarted, "device-b")
-    assert view_for(restarted, session)["list_items"] == after_read["list_items"]
+    assert view_for(restarted)["list_items"] == after_read["list_items"]
     assert :sys.get_state(restarted).priority_jobs == %{}
     assert :sys.get_state(restarted).priority_timers == %{}
     refute_received :unexpected_history_scoring
@@ -2516,12 +2398,11 @@ defmodule AttentionServer.PrioritizationTest do
       use_synthetic_jev_key(dir)
       relay = start_relay(path, priority_evaluator: fn _ -> {:error, :unavailable} end)
       setup_person(relay)
-      {:ok, session} = Relay.open_session(relay, "device-b")
-      assert view_for(relay, session)["list_items"] == []
+      assert view_for(relay)["list_items"] == []
       forward_chat(relay, "history", 900)
       first = add_reply(relay, "history", 902)
       second = add_reply(relay, "history", 904)
-      baseline = view_for(relay, session)
+      baseline = view_for(relay)
       assert [group] = Enum.filter(baseline["list_items"], &(&1["kind"] == "reply"))
       assert group["unseen_count"] == 2
       assert group["conversation_seq"] == second
@@ -2529,7 +2410,8 @@ defmodule AttentionServer.PrioritizationTest do
       refute Map.has_key?(group, "score")
       refute Map.has_key?(group, "score_kind")
       configure_jev_choice(relay)
-      assert Enum.all?(view_for(relay, session)["replies"], &(not Map.has_key?(&1, "score")))
+      publish_fallback_view(relay)
+      assert Enum.all?(view_for(relay)["replies"], &(not Map.has_key?(&1, "score")))
       job = start_synthetic_priority_pass(relay)
 
       complete_synthetic_priority_pass(
@@ -2542,7 +2424,7 @@ defmodule AttentionServer.PrioritizationTest do
          }}
       )
 
-      scored = view_for(relay, session)
+      scored = view_for(relay)
       assert [%{"kind" => "reply"} = group, %{"kind" => "message"}] = scored["list_items"]
       assert group["score"] == %JSON.DecimalToken{raw: "0.9"}
       assert group["score_kind"] == "current"
@@ -2551,28 +2433,20 @@ defmodule AttentionServer.PrioritizationTest do
       assert Enum.map(scored["replies"], & &1["conversation_seq"]) == [first, second]
       assert [%{"message_id" => "history"}] = scored["entries"]
 
-      assert [%{"unchanged" => true} = unchanged] =
-               session_request(relay, session, %{
-                 "type" => "view_get",
-                 "ref" => "same",
-                 "known_view_rev" => scored["view_rev"]
-               })
-
-      refute Map.has_key?(unchanged, "list_items")
       parent = :sys.get_state(relay).store.engine.messages[{"person-a", "app:test", "history"}]
 
       if @partial_read do
         read_reply(relay, "history", first, 906)
-        partial = view_for(relay, session)
+        partial = view_for(relay)
         [row] = Enum.filter(partial["list_items"], &(&1["kind"] == "reply"))
         assert row["unseen_count"] == 1
         assert row["open_at_conversation_seq"] == second
         assert row["score"] == %JSON.DecimalToken{raw: "0.4"}
-        refute partial["view_rev"] == scored["view_rev"]
+        refute partial == scored
       end
 
       read_reply(relay, "history", second, 907)
-      seen = view_for(relay, session)
+      seen = view_for(relay)
       expected_score = if @partial_read, do: "0.4", else: "0.9"
       assert [%{"kind" => "message"}, %{"kind" => "reply"} = history] = seen["list_items"]
       assert history["unseen_count"] == 0
@@ -2588,18 +2462,16 @@ defmodule AttentionServer.PrioritizationTest do
       assert :sys.get_state(relay).applied_score_record == nil
       GenServer.stop(relay)
       restarted = start_relay(path, priority_evaluator: fn _ -> {:error, :unavailable} end)
-      {:ok, other_device} = Relay.open_session(restarted, "device-a")
-      restored = view_for(restarted, other_device)
+      restored = view_for(restarted)
       assert List.last(restored["list_items"]) == history
       assert restored["replies"] == []
-      refute restored["view_rev"] == seen["view_rev"]
 
       assert :sys.get_state(restarted).store.engine.chat_read_positions[
                {"person-a", "app:test", "history"}
              ] == second
 
       third = add_reply(restarted, "history", 908)
-      active = view_for(restarted, other_device)
+      active = view_for(restarted)
       [row] = Enum.filter(active["list_items"], &(&1["kind"] == "reply"))
       assert row["unseen_count"] == 1
       assert row["conversation_seq"] == third
@@ -2620,7 +2492,7 @@ defmodule AttentionServer.PrioritizationTest do
       assert {:ok, %{"type" => "ok"}} = JSON.decode_line(terminal)
 
       assert [%{"kind" => "reply", "unseen_count" => 1}, %{"kind" => "message"}] =
-               view_for(restarted, other_device)["list_items"]
+               view_for(restarted)["list_items"]
 
       assert [{"app:test", "history", ^third}] =
                Enum.map(
@@ -2637,8 +2509,7 @@ defmodule AttentionServer.PrioritizationTest do
       start_relay(path, priority_evaluator: fn _ -> {:error, :unavailable} end)
 
     setup_person(relay)
-    {:ok, session} = Relay.open_session(relay, "device-b")
-    assert view_for(relay, session)["list_items"] == []
+    assert view_for(relay)["list_items"] == []
 
     forward_chat(relay, "reply-history", 2700)
     reply_seq = add_reply(relay, "reply-history", 2702)
@@ -2670,7 +2541,7 @@ defmodule AttentionServer.PrioritizationTest do
     )
 
     [active] =
-      view_for(relay, session)["list_items"]
+      view_for(relay)["list_items"]
       |> Enum.filter(&(&1["kind"] == "reply"))
 
     assert active["score"] == %JSON.DecimalToken{raw: "0.9"}
@@ -2685,7 +2556,7 @@ defmodule AttentionServer.PrioritizationTest do
     read_reply(relay, "reply-history", reply_seq, 2712)
 
     [historical] =
-      view_for(relay, session)["list_items"]
+      view_for(relay)["list_items"]
       |> Enum.filter(&(&1["kind"] == "reply"))
 
     assert historical["unseen_count"] == 0
@@ -2694,8 +2565,7 @@ defmodule AttentionServer.PrioritizationTest do
 
     GenServer.stop(relay)
     restarted = start_relay(path, priority_evaluator: fn _ -> {:error, :unavailable} end)
-    {:ok, resumed_session} = Relay.open_session(restarted, "device-b")
-    restored = view_for(restarted, resumed_session)
+    restored = view_for(restarted)
     assert List.last(restored["list_items"]) == historical
 
     # The reply-history commits kept the stored support record.
@@ -2705,7 +2575,7 @@ defmodule AttentionServer.PrioritizationTest do
     next_reply_seq = add_reply(restarted, "reply-history", 2714)
 
     [reactivated] =
-      view_for(restarted, resumed_session)["list_items"]
+      view_for(restarted)["list_items"]
       |> Enum.filter(&(&1["kind"] == "reply"))
 
     assert reactivated["conversation_seq"] == next_reply_seq
@@ -2783,11 +2653,10 @@ defmodule AttentionServer.PrioritizationTest do
   } do
     relay = start_relay(path)
     setup_person(relay)
-    {:ok, session} = Relay.open_session(relay, "device-b")
     forward_chat(relay, "plain", 920)
     seq = add_reply(relay, "plain", 922)
     read_reply(relay, "plain", seq, 924)
-    before = view_for(relay, session)
+    before = view_for(relay)
 
     assert [%{"kind" => "message"}, %{"kind" => "reply", "unseen_count" => 0} = group] =
              before["list_items"]
@@ -2805,11 +2674,10 @@ defmodule AttentionServer.PrioritizationTest do
                "text" => "Another question"
              })
 
-    assert view_for(relay, session)["view_rev"] == before["view_rev"]
+    assert view_for(relay) == before
     GenServer.stop(relay)
     restarted = start_relay(path)
-    {:ok, session} = Relay.open_session(restarted, "device-b")
-    assert view_for(restarted, session)["list_items"] == before["list_items"]
+    assert view_for(restarted)["list_items"] == before["list_items"]
     assert :sys.get_state(restarted).priority_jobs == %{}
   end
 
@@ -2830,8 +2698,8 @@ defmodule AttentionServer.PrioritizationTest do
     forward_chat(relay, "failure", 940)
     seq = add_reply(relay, "failure", 942)
     configure_jev_choice(relay)
-    {:ok, session} = Relay.open_session(relay, "device-b")
-    before = view_for(relay, session)
+    publish_fallback_view(relay)
+    before = view_for(relay)
     state = :sys.get_state(relay)
 
     assert :ok =
@@ -2842,7 +2710,7 @@ defmodule AttentionServer.PrioritizationTest do
 
     job = start_synthetic_priority_pass(relay)
     complete_synthetic_priority_pass(job, {:ok, %{{"app:test", "failure", seq} => 0.9}})
-    assert view_for(relay, session)["list_items"] == before["list_items"]
+    assert view_for(relay)["list_items"] == before["list_items"]
     assert :sys.get_state(relay).store.engine.reply_group_history == %{}
     :sys.get_state(state.applied_score_record)
     assert not File.exists?(record_path) or File.read!(record_path) == ""
@@ -2882,10 +2750,9 @@ defmodule AttentionServer.PrioritizationTest do
     assert :ok = Sqlite3.release(db, stmt)
     assert :ok = Sqlite3.close(db)
     restarted = start_relay(path)
-    {:ok, session} = Relay.open_session(restarted, "device-b")
 
     assert [%{"kind" => "message"}, %{"kind" => "reply", "unseen_count" => 0} = group] =
-             view_for(restarted, session)["list_items"]
+             view_for(restarted)["list_items"]
 
     refute Map.has_key?(group, "score")
     assert group["conversation_seq"] == seq
@@ -2897,9 +2764,8 @@ defmodule AttentionServer.PrioritizationTest do
     GenServer.stop(restarted)
     again = start_relay(path)
     assert :sys.get_state(again).store.engine.free_order_highs == %{}
-    {:ok, session} = Relay.open_session(again, "device-b")
     add_reply(again, "legacy", 940)
-    [reply, parent] = view_for(again, session)["list_items"]
+    [reply, parent] = view_for(again)["list_items"]
     assert reply["free_section"] == %{"state" => "active", "group" => "common"}
     assert parent["free_section"] == %{"state" => "active", "group" => "earlier_messages"}
     assert :sys.get_state(again).store.engine.free_order_highs == %{"person-a" => 1}
@@ -3119,9 +2985,8 @@ defmodule AttentionServer.PrioritizationTest do
     forward_chat(relay, "older", 3000)
     seq = add_reply(relay, "older", 3002)
     forward_chat(relay, "newer", 3004)
-    {:ok, session} = Relay.open_session(relay, "device-b")
-    view = view_for(relay, session)
-    assert view["free_order_version"] == 1
+    view = view_for(relay)
+    assert view["algorithm"] == "baseline"
 
     assert Enum.map(view["list_items"], &{&1["kind"], &1["message_id"]}) ==
              [{"message", "newer"}, {"reply", "older"}, {"message", "older"}]
@@ -3131,22 +2996,21 @@ defmodule AttentionServer.PrioritizationTest do
     assert engine.messages[{"person-a", "app:test", "older"}].free_order == 1
     assert engine.conversation_events[{"person-a", seq}].free_order == 2
     forward_chat(relay, "older", 3000)
-    assert view_for(relay, session)["view_rev"] == view["view_rev"]
+    assert view_for(relay) == view
     read_reply(relay, "older", seq, 3006)
-    seen = view_for(relay, session)
+    seen = view_for(relay)
 
     assert List.last(seen["list_items"])["free_section"] ==
              %{"state" => "history", "group" => "common"}
 
-    refute seen["view_rev"] == view["view_rev"]
+    refute seen == view
     assert :sys.get_state(relay).store.engine.free_order_highs == engine.free_order_highs
     GenServer.stop(relay)
     restarted = start_relay(path)
-    {:ok, session} = Relay.open_session(restarted, "device-b")
-    assert view_for(restarted, session)["list_items"] == seen["list_items"]
+    assert view_for(restarted)["list_items"] == seen["list_items"]
     assert :sys.get_state(restarted).store.engine.free_order_highs == engine.free_order_highs
     add_reply(restarted, "older", 3008)
-    assert hd(view_for(restarted, session)["list_items"])["kind"] == "reply"
+    assert hd(view_for(restarted)["list_items"])["kind"] == "reply"
     assert :sys.get_state(restarted).store.engine.free_order_highs == %{"person-a" => 4}
   end
 
@@ -3231,11 +3095,6 @@ defmodule AttentionServer.PrioritizationTest do
   defp project_list(engine, person, entries) do
     {_, reply_summary} = Placement.ranking_projection(engine, person)
     Placement.list_items(engine, person, entries, reply_summary)
-  end
-
-  defp view_for(relay, session) do
-    session_request(relay, session, %{"type" => "view_get", "ref" => "groups"})
-    |> Enum.find(&(&1["ref"] == "groups"))
   end
 
   defp forward_chat(relay, id, n) do

@@ -1,8 +1,8 @@
 defmodule AttentionServer.AccountAnswerReadSyncTest do
   use ExUnit.Case, async: false
 
-  alias AttentionServer.{JSON, Relay}
-  alias AttentionServer.ClientAPI.Reads
+  alias AttentionServer.{JSON, Relay, RelayReaders}
+  alias AttentionServer.ClientAPI.{Reads, Resources}
 
   @handle "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 
@@ -31,27 +31,15 @@ defmodule AttentionServer.AccountAnswerReadSyncTest do
     response
   end
 
-  defp session_request(relay, session, frame) do
-    assert {:ok, lines} =
-             Relay.session_request_line(
-               relay,
-               session,
-               JSON.encode!(Map.put(frame, "v", 1)) <> "\n"
-             )
+  # The read position a device of the account reads in the v2 item.
+  defp read_position(relay, device, id) do
+    {:ok, item} =
+      Resources.item_id(:sys.get_state(relay).store.engine, {"A", "app:test", id})
 
-    Enum.map(lines, fn line ->
-      assert {:ok, response} = JSON.decode_line(line)
-      response
-    end)
-  end
+    assert {:ok, %{"item" => %{"chat" => %{"read_position" => position}}}} =
+             Reads.item(relay, device, item)
 
-  defp drain(relay, session) do
-    assert {:ok, lines} = Relay.session_drain(relay, session)
-
-    Enum.map(lines, fn line ->
-      assert {:ok, response} = JSON.decode_line(line)
-      response
-    end)
+    position
   end
 
   defp forward(relay, id, op_id) do
@@ -116,17 +104,10 @@ defmodule AttentionServer.AccountAnswerReadSyncTest do
     assert :ok = Relay.setup_device(relay, "B", "foreign")
     assert :ok = Relay.setup_sender(relay, "origin", "app:test")
 
-    assert {:ok, live} = Relay.open_session(relay, "reader2")
-
-    assert [%{"type" => "ok"}, %{"type" => "resynced", "seq" => 0}] =
-             session_request(relay, live, %{"type" => "resync", "since" => 0})
-
     forward(relay, "seen", 1)
 
-    assert Enum.any?(
-             drain(relay, live),
-             &(&1["type"] == "delivery" and &1["message_id"] == "seen")
-           )
+    assert {:ok, [%{"type" => "delivery", "message_id" => "seen"}], 1} =
+             RelayReaders.events(relay, "reader2", 0)
 
     assert %{"type" => "ok"} =
              request(relay, "reader", %{
@@ -138,29 +119,21 @@ defmodule AttentionServer.AccountAnswerReadSyncTest do
                "answer" => nil
              })
 
-    assert {:ok, [seen], 2} = Relay.events(relay, "reader2", 1)
+    assert {:ok, [seen], 2} = RelayReaders.events(relay, "reader2", 1)
     assert seen["answer_outcome"] == %{"kind" => "seen"}
     refute Map.has_key?(seen, "answer")
 
-    assert [
-             %{
-               "type" => "lifecycle",
-               "message_id" => "seen",
-               "answer_outcome" => %{"kind" => "seen"}
-             }
-           ] =
-             drain(relay, live)
+    assert seen["type"] == "lifecycle"
+    assert seen["message_id"] == "seen"
 
-    assert {:ok, [origin_seen], 2} = Relay.events(relay, "origin", 1)
+    assert {:ok, [origin_seen], 2} = RelayReaders.events(relay, "origin", 1)
     assert Map.has_key?(origin_seen, "answer")
     assert origin_seen["answer_outcome"] == seen["answer_outcome"]
 
     forward(relay, "reply", 3)
 
-    assert Enum.any?(
-             drain(relay, live),
-             &(&1["type"] == "delivery" and &1["message_id"] == "reply")
-           )
+    assert {:ok, [%{"type" => "delivery", "message_id" => "reply"}], 3} =
+             RelayReaders.events(relay, "reader2", 2)
 
     assert %{"type" => "ok"} =
              request(relay, "reader2", %{
@@ -172,25 +145,19 @@ defmodule AttentionServer.AccountAnswerReadSyncTest do
                "answer" => "On it, 5 min"
              })
 
-    assert {:ok, [reply], 4} = Relay.events(relay, "reader", 3)
+    assert {:ok, [reply], 4} = RelayReaders.events(relay, "reader", 3)
     assert reply["answer_outcome"] == %{"kind" => "reply", "text" => "On it, 5 min"}
     refute Map.has_key?(reply, "answer")
 
-    assert [
-             %{
-               "type" => "lifecycle",
-               "message_id" => "reply",
-               "answer_outcome" => %{"kind" => "reply", "text" => "On it, 5 min"}
-             }
-           ] =
-             drain(relay, live)
+    assert {:ok, [%{"type" => "lifecycle", "message_id" => "reply"} = reply2], 4} =
+             RelayReaders.events(relay, "reader2", 3)
+
+    assert reply2["answer_outcome"] == reply["answer_outcome"]
 
     forward(relay, "no-comment", 5)
 
-    assert Enum.any?(
-             drain(relay, live),
-             &(&1["type"] == "delivery" and &1["message_id"] == "no-comment")
-           )
+    assert {:ok, [%{"type" => "delivery", "message_id" => "no-comment"}], 5} =
+             RelayReaders.events(relay, "reader2", 4)
 
     assert %{"type" => "ok", "terminal_kind" => "no_comment"} =
              no_comment_request(relay, "reader", %{
@@ -199,21 +166,14 @@ defmodule AttentionServer.AccountAnswerReadSyncTest do
                "request_revision" => 1
              })
 
-    assert {:ok, [no_comment], 6} = Relay.events(relay, "reader2", 5)
+    assert {:ok, [no_comment], 6} = RelayReaders.events(relay, "reader2", 5)
     assert no_comment["answer_outcome"] == %{"kind" => "no_comment"}
     assert no_comment["terminal_kind"] == "no_comment"
 
-    assert [
-             %{
-               "type" => "lifecycle",
-               "message_id" => "no-comment",
-               "answer_outcome" => %{"kind" => "no_comment"}
-             }
-           ] =
-             drain(relay, live)
+    assert no_comment["type"] == "lifecycle"
+    assert no_comment["message_id"] == "no-comment"
 
-    assert {:ok, offline} = Relay.open_session(relay, "offline")
-    replay = session_request(relay, offline, %{"type" => "resync", "since" => 0})
+    assert {:ok, replay, 6} = RelayReaders.events(relay, "offline", 0)
 
     outcomes =
       replay
@@ -237,7 +197,7 @@ defmodule AttentionServer.AccountAnswerReadSyncTest do
                outcomes
     end
 
-    assert {:ok, [], 0} = Relay.events(relay, "foreign", 0)
+    assert {:ok, [], 0} = RelayReaders.events(relay, "foreign", 0)
     assert {:ok, %{"items" => []}} = Reads.inbox(relay, "foreign")
 
     GenServer.stop(relay)
@@ -277,25 +237,7 @@ defmodule AttentionServer.AccountAnswerReadSyncTest do
                "text" => "Here is the answer"
              })
 
-    assert {:ok, reader_session} = Relay.open_session(relay, "reader")
-
-    assert List.last(session_request(relay, reader_session, %{"type" => "resync", "since" => 0}))[
-             "type"
-           ] == "resynced"
-
-    assert {:ok, other_session} = Relay.open_session(relay, "reader2")
-
-    assert List.last(session_request(relay, other_session, %{"type" => "resync", "since" => 0}))[
-             "type"
-           ] == "resynced"
-
-    assert %{"type" => "conversation_resynced", "chat_read_positions" => []} =
-             List.last(
-               session_request(relay, other_session, %{
-                 "type" => "conversation_open",
-                 "since" => 0
-               })
-             )
+    assert read_position(relay, "reader2", "thread") == nil
 
     read = %{
       "type" => "conversation_read",
@@ -305,42 +247,36 @@ defmodule AttentionServer.AccountAnswerReadSyncTest do
       "read_through_conversation_seq" => 2
     }
 
-    assert [%{"type" => "error", "reason" => "not_found"}] =
-             session_request(relay, reader_session, %{
-               read
-               | "op_id" => op(15),
-                 "message_id" => "absent"
-             })
+    assert %{"type" => "error", "reason" => "not_found"} =
+             request(relay, "reader", %{read | "op_id" => op(15), "message_id" => "absent"})
 
     assert %{"type" => "error", "reason" => "not_person"} = request(relay, "origin", read)
     assert %{"type" => "error", "reason" => "not_found"} = request(relay, "foreign", read)
 
-    assert [
-             %{
-               "type" => "error",
-               "reason" => "invalid_field",
-               "field" => "read_through_conversation_seq"
-             }
-           ] =
-             session_request(relay, reader_session, %{
+    assert %{
+             "type" => "error",
+             "reason" => "invalid_field",
+             "field" => "read_through_conversation_seq"
+           } =
+             request(relay, "reader", %{
                read
                | "op_id" => op(16),
                  "read_through_conversation_seq" => 1
              })
 
-    assert [
-             %{
-               "type" => "ok",
-               "read_through_conversation_seq" => 2,
-               "seq" => read_seq,
-               "event_id" => event_id
-             }
-           ] = session_request(relay, reader_session, read)
+    assert %{
+             "type" => "ok",
+             "read_through_conversation_seq" => 2,
+             "seq" => read_seq,
+             "event_id" => event_id
+           } = request(relay, "reader", read)
 
     assert is_binary(event_id) and event_id != ""
 
-    assert {:ok, [read_line]} = Relay.session_drain(relay, other_session)
-    assert {:ok, event} = JSON.decode_line(read_line)
+    # Another device of the account gets the read position as a fact.
+    assert {:ok, [event], ^read_seq} =
+             RelayReaders.conversation_events(relay, "reader2", read_seq - 1)
+
     assert event["kind"] == "read_position"
     assert event["conversation_seq"] == read_seq
     assert event["event_id"] == event_id
@@ -348,41 +284,25 @@ defmodule AttentionServer.AccountAnswerReadSyncTest do
     refute Map.has_key?(event, "request_revision")
     refute Map.has_key?(event, "author")
 
-    assert [%{"type" => "ok", "duplicate" => true, "seq" => ^read_seq, "event_id" => ^event_id}] =
-             session_request(relay, reader_session, read)
+    assert %{"type" => "ok", "duplicate" => true, "seq" => ^read_seq, "event_id" => ^event_id} =
+             request(relay, "reader", read)
 
-    assert [%{"type" => "error", "reason" => "operation_conflict"}] =
-             session_request(relay, reader_session, %{read | "read_through_conversation_seq" => 1})
+    assert %{"type" => "error", "reason" => "operation_conflict"} =
+             request(relay, "reader", %{read | "read_through_conversation_seq" => 1})
+
+    assert read_position(relay, "reader2", "thread") == Resources.entry_id(2)
 
     GenServer.stop(relay)
     assert {:ok, restarted} = Relay.start_link(store_path: path)
 
     assert {:ok, [replayed], ^read_seq} =
-             Relay.conversation_events(restarted, "reader2", read_seq - 1)
+             RelayReaders.conversation_events(restarted, "reader2", read_seq - 1)
 
     assert replayed["event_id"] == event_id
-    assert {:ok, reopened} = Relay.open_session(restarted, "reader2")
+    assert read_position(restarted, "reader2", "thread") == Resources.entry_id(2)
 
-    assert List.last(session_request(restarted, reopened, %{"type" => "resync", "since" => 0}))[
-             "type"
-           ] == "resynced"
-
-    assert %{
-             "type" => "conversation_resynced",
-             "chat_read_positions" => [
-               %{
-                 "sender_id" => "app:test",
-                 "message_id" => "thread",
-                 "read_through_conversation_seq" => 2
-               }
-             ]
-           } =
-             List.last(
-               session_request(restarted, reopened, %{
-                 "type" => "conversation_open",
-                 "since" => read_seq
-               })
-             )
+    assert %{"type" => "ok", "duplicate" => true, "seq" => ^read_seq, "event_id" => ^event_id} =
+             request(restarted, "reader", read)
 
     GenServer.stop(restarted)
   end
@@ -424,30 +344,10 @@ defmodule AttentionServer.AccountAnswerReadSyncTest do
 
     refute Map.has_key?(no_op, "seq")
     refute Map.has_key?(no_op, "event_id")
-    assert {:ok, [], ^read_seq} = Relay.conversation_events(relay, "reader2", read_seq)
+    assert {:ok, [], ^read_seq} = RelayReaders.conversation_events(relay, "reader2", read_seq)
 
-    assert {:ok, second} = Relay.open_session(relay, "reader2")
-
-    assert List.last(session_request(relay, second, %{"type" => "resync", "since" => 0}))[
-             "type"
-           ] == "resynced"
-
-    assert %{
-             "type" => "conversation_resynced",
-             "chat_read_positions" => [
-               %{
-                 "sender_id" => "app:test",
-                 "message_id" => "alpha",
-                 "read_through_conversation_seq" => ^later_alpha
-               }
-             ]
-           } =
-             List.last(
-               session_request(relay, second, %{
-                 "type" => "conversation_open",
-                 "since" => read_seq
-               })
-             )
+    assert read_position(relay, "reader2", "alpha") == Resources.entry_id(later_alpha)
+    assert read_position(relay, "reader2", "beta") == nil
 
     assert %{"type" => "ok", "read_through_conversation_seq" => ^beta_reply} =
              request(relay, "reader", %{
@@ -458,24 +358,8 @@ defmodule AttentionServer.AccountAnswerReadSyncTest do
                "read_through_conversation_seq" => beta_reply
              })
 
-    assert {:ok, reopened} = Relay.open_session(relay, "reader2")
-
-    assert List.last(session_request(relay, reopened, %{"type" => "resync", "since" => 0}))[
-             "type"
-           ] == "resynced"
-
-    assert %{"type" => "conversation_resynced", "chat_read_positions" => positions} =
-             List.last(
-               session_request(relay, reopened, %{
-                 "type" => "conversation_open",
-                 "since" => read_seq + 1
-               })
-             )
-
-    assert Map.new(positions, &{&1["message_id"], &1["read_through_conversation_seq"]}) == %{
-             "alpha" => later_alpha,
-             "beta" => beta_reply
-           }
+    assert read_position(relay, "reader2", "alpha") == Resources.entry_id(later_alpha)
+    assert read_position(relay, "reader2", "beta") == Resources.entry_id(beta_reply)
 
     GenServer.stop(relay)
   end

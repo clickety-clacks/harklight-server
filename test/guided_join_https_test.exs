@@ -13,6 +13,8 @@ defmodule AttentionServer.GuidedJoinHTTPSTest do
     TLSFixtures
   }
 
+  alias AttentionServer.ClientAPI.Reads
+
   setup_all do
     certs = TLSFixtures.create!()
     TLSFixtures.make_self_signed_client!(certs, "self_device")
@@ -405,7 +407,7 @@ defmodule AttentionServer.GuidedJoinHTTPSTest do
     other_cert = TLSFixtures.certificate_der!(c.certs, "unknown")
     {:ok, key} = Relay.setup_device_certificate(c.relay, c.person, cert)
     {:ok, other_key} = Relay.setup_device_certificate(c.relay, c.other, other_cert)
-    {:ok, session} = Relay.open_session(c.relay, key)
+    assert {:ok, _} = Reads.me(c.relay, key)
     request = %{"expected_device_id" => key}
     assert {404, %{"error" => "not_found"}} = post(c, "/device/remove", request)
     assert {404, %{"error" => "not_found"}} = post(c, "/device/remove", request, :read, "unknown")
@@ -429,12 +431,8 @@ defmodule AttentionServer.GuidedJoinHTTPSTest do
     assert removed["enrollment_revision"] == 2
     assert {:error, :forbidden} = Relay.acknowledged_cursor(c.relay, key)
 
-    assert {:error, :unknown_session} =
-             Relay.session_request_line(
-               c.relay,
-               session,
-               JSON.encode!(%{"v" => 1, "type" => "resync", "since" => 0}) <> "\n"
-             )
+    # The removed device has no client API v2 principal any more.
+    assert {:error, :unauthorized} = Reads.me(c.relay, key)
 
     assert {:ok, _} = Relay.acknowledged_cursor(c.relay, other_key)
     {:ok, saved} = Store.open(c.path)
