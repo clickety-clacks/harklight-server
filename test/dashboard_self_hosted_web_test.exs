@@ -7,7 +7,7 @@ defmodule AttentionServer.DashboardSelfHostedWebTest do
   @web_commit "3434a38c86cd3069952cd67d9b0bf0650b86d224"
   @web_archive "harklight-web-3434a38c86cd3069952cd67d9b0bf0650b86d224.tar.gz"
   @web_archive_sha256 "563f1448b79b398abf5ace4fcb5411fed70d5b2eba01f2cdec2aeacfdeffbc5b"
-  @dashboard_csp "default-src 'none'; script-src 'self'; connect-src 'self'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'"
+  @dashboard_csp "default-src 'none'; script-src 'self'; connect-src 'self'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; frame-ancestors 'none'"
 
   defmodule Backend do
     def resolve_session(state, "active") do

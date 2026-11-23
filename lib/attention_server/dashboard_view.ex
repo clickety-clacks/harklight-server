@@ -1,5 +1,5 @@
 defmodule AttentionServer.DashboardView do
-  alias AttentionServer.JevClient
+  alias AttentionServer.{DashboardBrand, JevClient}
 
   @moduledoc """
   Render the person-scoped device page for an already authenticated browser session.
@@ -307,7 +307,9 @@ harklight-agent --identity-dir ./harklight-agent-identity \
     ~s(<li><span>#{label} · #{person}</span><span>Code on device: #{code}</span><span>#{review}</span></li>)
   end
 
-  defp closes(deadline) when is_integer(deadline), do: ~s(<p>Closes: #{escape(time(deadline))}</p>)
+  defp closes(deadline) when is_integer(deadline),
+    do: ~s(<p>Closes: #{escape(time(deadline))}</p>)
+
   defp closes(_), do: ""
 
   defp expiry(nil), do: "No expiry"
@@ -339,7 +341,7 @@ harklight-agent --identity-dir ./harklight-agent-identity \
         do: ~s(<a href="/prioritization">Prioritization</a>),
         else: ""
 
-    ~s(<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>#{escape(title)} · Harklight</title><style>#{css()}</style></head><body><div class="shell"><aside><strong>Harklight</strong><nav><a href="/devices">Devices</a><a href="/components">Components</a>#{prioritization_link}#{account_link}</nav><div class="account">#{escape(person_name)}#{sign_out}</div></aside><main>#{content}</main></div></body></html>)
+    ~s(<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>#{escape(title)} · Harklight</title>#{DashboardBrand.favicon()}<style>#{css()}</style></head><body><div class="shell"><aside>#{DashboardBrand.lockup()}<nav><a href="/devices">Devices</a><a href="/components">Components</a>#{prioritization_link}#{account_link}</nav><div class="account">#{escape(person_name)}#{sign_out}</div></aside><main>#{content}</main></div></body></html>)
   end
 
   defp css do

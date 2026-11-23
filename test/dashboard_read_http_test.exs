@@ -165,6 +165,34 @@ defmodule AttentionServer.DashboardReadHTTPTest do
     end
   end
 
+  test "owner and setup pages contain the packaged logo and tab icon", %{opts: opts} do
+    brand = Path.join(List.to_string(:code.priv_dir(:attention_server)), "dashboard/brand")
+    lockup = brand |> Path.join("harklight-navy.svg") |> File.read!() |> Base.encode64()
+    favicon = brand |> Path.join("favicon.svg") |> File.read!() |> Base.encode64()
+    hosted = %{opts | hosted: true}
+
+    for {mode, path, session, status, alt} <- [
+          {opts, "/devices", "member-session", 200, "Harklight"},
+          {hosted, "/components", "member-session", 200, "Harklight"},
+          {opts, "/devices", nil, 401, ""},
+          {opts, "/sign-in", nil, 200, ""},
+          {hosted, "/sign-in", nil, 200, ""},
+          {opts, "/join", nil, 200, ""},
+          {hosted, "/join", nil, 200, ""}
+        ] do
+      response = path |> secure_get(session) |> DashboardReadHTTP.call(mode)
+
+      assert response.status == status
+      assert response.resp_body =~ ~s(<img src="data:image/svg+xml;base64,#{lockup}" alt="#{alt}")
+
+      assert response.resp_body =~
+               ~s(<link rel="icon" type="image/svg+xml" href="data:image/svg+xml;base64,#{favicon}">)
+
+      [policy] = Plug.Conn.get_resp_header(response, "content-security-policy")
+      assert "img-src data:" in String.split(policy, "; ")
+    end
+  end
+
   test "levels JSON endpoints require the owner session and submit a complete table", %{
     opts: opts
   } do
