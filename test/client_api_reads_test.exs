@@ -1,9 +1,20 @@
 defmodule AttentionServer.ClientAPIReadsTest do
   use ExUnit.Case, async: false
 
-  alias AttentionServer.{AgentAPIInProcess, JSON, PreChangeLogStore, Relay}
-  alias AttentionServer.ClientAPI.Reads
+  alias AttentionServer.{
+    AgentAPIInProcess,
+    BounceDecision,
+    ChangeLog,
+    Engine,
+    JSON,
+    PreChangeLogStore,
+    Relay,
+    Store
+  }
+
+  alias AttentionServer.ClientAPI.{FeedStep, Reads}
   alias AttentionServer.ClientAPISchema, as: Schema
+  alias Exqlite.Sqlite3
 
   @handle "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
   @contract Path.expand("../docs/client-api-v2.md", __DIR__)
@@ -300,6 +311,78 @@ defmodule AttentionServer.ClientAPIReadsTest do
         else: assert(item["rev"] == 1)
     end
 
+    GenServer.stop(relay)
+  end
+
+  test "an older resolved message without an explicit revision survives inbox and feed catch-up",
+       %{path: path} do
+    key = {"A", "app:test", "legacy"}
+
+    PreChangeLogStore.write(path, fn store ->
+      store =
+        store
+        |> PreChangeLogStore.setup_person("A")
+        |> PreChangeLogStore.setup_device("A", "origin")
+        |> PreChangeLogStore.setup_device("A", "reader")
+        |> PreChangeLogStore.setup_sender("origin", "app:test")
+
+      frame = Map.delete(forward_frame("legacy", 1), "session_handle")
+      assert {%{"type" => "ok"}, store} = PreChangeLogStore.request(store, "origin", frame)
+
+      assert {%{"type" => "ok"}, store} =
+               PreChangeLogStore.request(store, "reader", answer_frame("legacy", 2))
+
+      record = Map.drop(store.engine.messages[key], [:revision, :revisions])
+
+      engine =
+        store.engine
+        |> Engine.put_row(:messages, key, record)
+        |> Engine.delete_row(:bounce_revisions, key)
+        |> BounceDecision.rebuild_indexes()
+
+      audit = %{person: "A", actor: "origin", action: "legacy_fixture"}
+      assert {:ok, store} = Store.commit(store, engine, audit)
+      store
+    end)
+
+    relay = start(path)
+    stored = :sys.get_state(relay).store.engine.messages[key]
+    refute Map.has_key?(stored, :revision)
+    principal = %{person: "A", kind: :device, key: "reader"}
+
+    # Record a change after the cutover seed so catch-up renders the saved item.
+    :sys.replace_state(relay, fn %{store: store} = state ->
+      assert {:ok, 1} = ChangeLog.head(store, "A")
+      pending = %{"A" => [{:item, ChangeLog.item_resource(key)}]}
+      assert :ok = Sqlite3.execute(store.db, "BEGIN IMMEDIATE")
+
+      assert {:ok, %{"A" => 2}} =
+               ChangeLog.append(store.db, pending, %{"A" => true}, store.version)
+
+      assert :ok = Sqlite3.execute(store.db, "COMMIT")
+      state
+    end)
+
+    assert {:ok, changes, false, 2} = FeedStep.read(relay, principal, 1, 100)
+
+    assert Enum.any?(changes, fn change ->
+             match?(
+               %{
+                 "kind" => "item",
+                 "data" => %{
+                   "request_revision" => 1,
+                   "message" => %{"message_id" => "legacy", "title" => "Question legacy"}
+                 }
+               },
+               change
+             )
+           end)
+
+    assert {:ok, %{"items" => [%{"request_revision" => 1, "message" => message}]}} =
+             Reads.inbox(relay, "reader")
+
+    assert message["message_id"] == "legacy"
+    assert :sys.get_state(relay).store.engine.messages[key] == stored
     GenServer.stop(relay)
   end
 

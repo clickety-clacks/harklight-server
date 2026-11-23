@@ -217,6 +217,7 @@ defmodule AttentionServer.ClientAPI.Resources do
 
   defp project_item(engine, {person, sender, _id} = key, rank) do
     record = Map.fetch!(engine.messages, key)
+    revision = Map.get(record, :revision, 1)
     summary = Map.get(engine.route_b_index.conversation_summary_by_item, key, %{})
     {reply, rank} = Map.pop(rank, "_reply")
     {thread, rank} = Map.pop(rank, "_thread")
@@ -224,9 +225,9 @@ defmodule AttentionServer.ClientAPI.Resources do
     %{
       "item_id" => item_id(record),
       "sender" => sender,
-      "request_revision" => record.revision,
+      "request_revision" => revision,
       "message" => record.message,
-      "files" => engine |> typed_files(item_files(record)),
+      "files" => engine |> typed_files(item_files(record, revision)),
       "seen" => seen?(engine, key, record),
       "chat" => chat(engine, key, record, summary, reply),
       "terminal" => terminal(record),
@@ -336,10 +337,10 @@ defmodule AttentionServer.ClientAPI.Resources do
 
   # The current revision's files, plus files of earlier revisions that the
   # current answer screen names (a revision keeps showing revision 1's images).
-  defp item_files(record) do
+  defp item_files(record, revision) do
     by_revision = Map.get(record, :files_by_revision, %{})
-    current = Map.get(by_revision, record.revision, [])
-    own = file_refs(current, "fi#{record.accepted_seq}.#{record.revision}.")
+    current = Map.get(by_revision, revision, [])
+    own = file_refs(current, "fi#{record.accepted_seq}.#{revision}.")
     present = MapSet.new(current, & &1["name"])
 
     referenced =
@@ -350,7 +351,7 @@ defmodule AttentionServer.ClientAPI.Resources do
 
     earlier =
       Enum.flat_map(Enum.uniq(referenced), fn name ->
-        (record.revision - 1)..1//-1
+        (revision - 1)..1//-1
         |> Enum.find_value([], fn n ->
           files = Map.get(by_revision, n, [])
 
