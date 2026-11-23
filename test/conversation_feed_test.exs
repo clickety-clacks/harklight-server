@@ -734,6 +734,74 @@ defmodule AttentionServer.ConversationFeedTest do
     GenServer.stop(relay)
   end
 
+  test "legacy reopen rejects a stored revision with a mismatched inline file digest", %{
+    path: path
+  } do
+    assert {:ok, relay} = Relay.start_link(store_path: path)
+    assert :ok = Relay.setup_person(relay, "A")
+    assert :ok = Relay.setup_device(relay, "A", "origin")
+    assert :ok = Relay.setup_sender(relay, "origin", "app:test")
+
+    message = %{
+      "sender_id" => "app:test",
+      "message_id" => "inline-file",
+      "created_at" => 1,
+      "title" => "Original request"
+    }
+
+    assert %{"type" => "ok"} =
+             request(relay, "origin", %{
+               "type" => "forward",
+               "op_id" => op(1),
+               "session_handle" => @handle,
+               "message" => message
+             })
+
+    bytes = <<0, 17, 250, 99>>
+    data = Base.encode64(bytes)
+    digest = Base.encode16(:crypto.hash(:sha256, bytes), case: :lower)
+
+    assert %{"type" => "ok", "revision" => 2} =
+             request(relay, "origin", %{
+               "type" => "conversation_revise",
+               "op_id" => op(2),
+               "sender_id" => "app:test",
+               "message_id" => "inline-file",
+               "base_revision" => 1,
+               "message" => %{message | "title" => "Revised request"},
+               "files" => [%{"name" => "inline.bin", "data_base64" => data}]
+             })
+
+    assert :ok = GenServer.stop(relay)
+
+    key = {"A", "app:test", "inline-file"}
+    assert {:ok, store} = Store.open(path)
+    engine = store.engine
+
+    assert [%{"tier" => "inline", "sha256" => ^digest, "data_base64" => ^data} = inline] =
+             engine.messages[key].files_by_revision[2]
+
+    assert :ok = Store.close(store)
+
+    # The inline bytes and SQLite checksum stay valid. Only the stored file
+    # digest in the message revision differs from the normalized attachment.
+    invalid =
+      put_in(engine.messages[key].files_by_revision[2], [
+        %{inline | "sha256" => String.duplicate("0", 64)}
+      ])
+
+    write_legacy_snapshot(path, invalid)
+
+    case Store.open(path) do
+      {:ok, unexpected} ->
+        assert :ok = Store.close(unexpected)
+        flunk("Store.open accepted a revision with a mismatched inline file digest")
+
+      error ->
+        assert error == {:error, {:storage_unavailable, {:error, :invalid_state}}}
+    end
+  end
+
   test "inline attachments up to the threshold stay inline; above it the frame is refused",
        %{path: path} do
     assert {:ok, relay} = Relay.start_link(store_path: path)
