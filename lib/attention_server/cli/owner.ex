@@ -467,7 +467,7 @@ defmodule AttentionServer.CLI.Owner do
   def run(_),
     do:
       AttentionServer.CLI.error!(
-        "use approve or a scoped owner change; see mix help attention.owner"
+        "use approve or a scoped owner change; see SELF_HOST.md"
       )
 
   defp get_endpoint!(options) do

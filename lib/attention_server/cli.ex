@@ -27,7 +27,7 @@ defmodule AttentionServer.CLI do
   def run(["device" | args]), do: AttentionServer.CLI.Device.run(args)
   def run(["agent" | args]), do: AttentionServer.CLI.Agent.run(args)
 
-  def run(["help"]),
+  def run([flag]) when flag in ["help", "--help", "-h"],
     do: IO.puts("harklight operator|enroll|owner|device|agent ...; see SELF_HOST.md")
 
   def run(_), do: error!("use harklight operator|enroll|owner|device|agent; see SELF_HOST.md")
