@@ -5,6 +5,10 @@ defmodule AttentionServer.CLI do
   with the historical Mix commands.
   """
 
+  defmodule CommandFailure do
+    defexception [:message]
+  end
+
   def main do
     args =
       System.fetch_env!("HARKLIGHT_CLI_ARGS")
@@ -15,6 +19,10 @@ defmodule AttentionServer.CLI do
     try do
       run(args)
     rescue
+      error in CommandFailure ->
+        IO.puts(:stderr, Exception.message(error))
+        System.halt(1)
+
       error in RuntimeError ->
         IO.puts(:stderr, Exception.message(error))
         System.halt(2)
@@ -40,7 +48,9 @@ defmodule AttentionServer.CLI do
   end
 
   def shell, do: Process.get(:harklight_cli_shell, AttentionServer.CLI.Shell)
-  def error!(message), do: raise(Process.get(:harklight_cli_error, RuntimeError), message)
+
+  def error!(message, default \\ RuntimeError),
+    do: raise(Process.get(:harklight_cli_error, default), message)
 
   def with_io(shell, error, fun) do
     old_shell = Process.get(:harklight_cli_shell)

@@ -41,9 +41,26 @@ defmodule AttentionServer.CLI.Operator do
       end
 
     case result do
-      {:ok, person} -> AttentionServer.CLI.shell().info(person)
-      :ok -> AttentionServer.CLI.shell().info("recovered")
-      {:error, reason} -> AttentionServer.CLI.error!("operator action failed: #{inspect(reason)}")
+      {:ok, person} ->
+        AttentionServer.CLI.shell().info(person)
+
+      :ok ->
+        AttentionServer.CLI.shell().info("recovered")
+
+      {:error, :store_open_failed} ->
+        AttentionServer.CLI.error!(
+          "Cannot open the local Harklight store. Check the --store path and permissions, then retry.",
+          AttentionServer.CLI.CommandFailure
+        )
+
+      {:error, :store_initialization_failed} ->
+        AttentionServer.CLI.error!(
+          "The local Harklight store opened, but startup could not initialize it. Check the startup diagnostics before retrying.",
+          AttentionServer.CLI.CommandFailure
+        )
+
+      {:error, reason} ->
+        AttentionServer.CLI.error!("operator action failed: #{inspect(reason)}")
     end
   end
 

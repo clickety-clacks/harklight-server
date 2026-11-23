@@ -1,7 +1,7 @@
 defmodule AttentionServer.OperatorToolTest do
   use ExUnit.Case, async: false
 
-  alias AttentionServer.{ChangeLog, DeviceIdentity, OperatorTool, Relay, TLSFixtures}
+  alias AttentionServer.{ChangeLog, DeviceIdentity, OperatorTool, Relay, Store, TLSFixtures}
 
   setup_all do
     certs = TLSFixtures.create!()
@@ -38,6 +38,72 @@ defmodule AttentionServer.OperatorToolTest do
              OperatorTool.recover(Path.join(dir, "separate.sqlite3"), person, first)
 
     GenServer.stop(relay)
+  end
+
+  @tag :tmp_dir
+  test "an unavailable store is returned without exiting the operator process", %{
+    certs: certs,
+    tmp_dir: dir
+  } do
+    cert = Path.join(certs, "a1.pem")
+    person = "00000000-0000-4000-8000-000000000001"
+    file = Path.join(dir, "regular-file")
+    File.write!(file, "not a directory")
+
+    for store <- [dir, Path.join(file, "relay.sqlite3")] do
+      assert {:error, :store_open_failed} = OperatorTool.bootstrap(store, cert)
+      assert {:error, :store_open_failed} = OperatorTool.recover(store, person, cert)
+    end
+  end
+
+  @tag :tmp_dir
+  test "the development operator task raises a Mix error on store-open failure", %{
+    certs: certs,
+    tmp_dir: dir
+  } do
+    cert = Path.join(certs, "a1.pem")
+    options = ["--store", dir, "--owner-cert", cert]
+    person = "00000000-0000-4000-8000-000000000001"
+
+    message =
+      "Cannot open the local Harklight store. Check the --store path and permissions, then retry."
+
+    assert_raise Mix.Error, message, fn ->
+      Mix.Tasks.Attention.Operator.run(["bootstrap" | options])
+    end
+
+    assert_raise Mix.Error, message, fn ->
+      Mix.Tasks.Attention.Operator.run(["recover", "--person", person | options])
+    end
+  end
+
+  @tag :tmp_dir
+  test "a writable store with an invalid change log fails after open", %{
+    certs: certs,
+    tmp_dir: dir
+  } do
+    path = Path.join(dir, "relay.sqlite3")
+    cert = Path.join(certs, "a1.pem")
+    person = "00000000-0000-4000-8000-000000000001"
+    assert {:ok, store} = Store.open(path)
+
+    assert :ok =
+             Exqlite.Sqlite3.execute(
+               store.db,
+               "CREATE TABLE client_change_log_state (placeholder INTEGER)"
+             )
+
+    assert :ok = Store.close(store)
+    assert {:ok, store} = Store.open(path)
+    assert {:error, _} = Store.enable_change_log(store)
+    assert :ok = Store.close(store)
+
+    assert {:error, :store_initialization_failed} = OperatorTool.bootstrap(path, cert)
+    assert {:error, :store_initialization_failed} = OperatorTool.recover(path, person, cert)
+
+    assert_raise Mix.Error, ~r/store opened, but startup could not initialize it/, fn ->
+      Mix.Tasks.Attention.Operator.run(["bootstrap", "--store", path, "--owner-cert", cert])
+    end
   end
 
   # The tool's Relay writes the change log like the Server's, so an owner
