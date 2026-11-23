@@ -132,5 +132,5 @@ defmodule AttentionServer.CLI.Enroll do
   end
 
   def run(_),
-    do: AttentionServer.CLI.error!("use start, retry or status; see mix help attention.enroll")
+    do: AttentionServer.CLI.error!("use start, retry or status; see SELF_HOST.md")
 end

@@ -48,5 +48,5 @@ defmodule AttentionServer.CLI.Operator do
   end
 
   def run(_),
-    do: AttentionServer.CLI.error!("use bootstrap or recover; see mix help attention.operator")
+    do: AttentionServer.CLI.error!("use bootstrap or recover; see SELF_HOST.md")
 end

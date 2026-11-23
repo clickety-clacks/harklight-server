@@ -58,9 +58,7 @@ defmodule AttentionServer.CLI.Agent do
         :ok
 
       flag ->
-        AttentionServer.CLI.error!(
-          "#{flag} was removed in Harklight 0.2; see mix help attention.agent"
-        )
+        AttentionServer.CLI.error!("#{flag} was removed in Harklight 0.2; see SELF_HOST.md")
     end
 
     {opts, rest, invalid} =
@@ -129,10 +127,7 @@ defmodule AttentionServer.CLI.Agent do
   end
 
   def run(_),
-    do:
-      AttentionServer.CLI.error!(
-        "use keygen, search, get, answer or respond; see mix help attention.agent"
-      )
+    do: AttentionServer.CLI.error!("use keygen, search, get, answer or respond; see SELF_HOST.md")
 
   defp command("search", opts, _directory, endpoint, identity) do
     query =

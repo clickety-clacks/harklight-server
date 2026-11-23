@@ -77,7 +77,7 @@ defmodule AttentionServer.CLI.Device do
   end
 
   def run(_),
-    do: AttentionServer.CLI.error!("use read or respond; see mix help attention.device")
+    do: AttentionServer.CLI.error!("use read or respond; see SELF_HOST.md")
 
   defp target!(options) do
     sender = Keyword.get(options, :sender) || AttentionServer.CLI.error!("--sender is required")
