@@ -486,15 +486,17 @@ process-readiness fails. After readiness, it does not automatically roll back;
 the optional owner agent-list probe is warning-only.
 
 Before the first v0.2.1 start, stop the server and take a complete private
-state backup, including the database and keys. After any v0.2.1 write,
-returning to v0.1.49 or another 0.1.x release requires stopping the server,
-restoring that pre-start backup and selecting that release, with its clients
-back on 0.1. The shared FORMAT29 number does not establish that 0.1.x can read
-state v0.2.0 has written, and changing only the code or release link does not
-restore compatibility. Restoring the backup loses every write since it was
-taken and cannot undo external notifications, bounces or agent deliveries.
-Preserve the backup and current state if restoration does not succeed. Do not
-assume recovery success or a recovery time. Keep backups and keys private.
+state backup, including the database and keys. To return to v0.2.0, stop
+v0.2.1, restore the backup taken under v0.2.0 before the v0.2.1 upgrade, and
+run v0.2.0 against that restored state. To return to a 0.1.x release, stop
+the server, restore a backup taken before the protocol 0.2 cutover that is
+compatible with the selected 0.1.x release, and run that release with its
+protocol 0.1 clients. The shared FORMAT29 number alone does not establish
+cross-version compatibility. Either restore loses every write made after
+its backup and cannot undo external notifications, bounces or agent
+deliveries. Preserve the backup and current state if restoration does not
+succeed. Do not assume recovery success or a recovery time. Keep backups
+and keys private.
 
 ## Build
 
