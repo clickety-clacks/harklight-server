@@ -4,6 +4,7 @@ defmodule AttentionServer.PrioritizationTest do
   alias AttentionServer.{
     BounceDecision,
     BouncePolicy,
+    ChangeLog,
     DashboardView,
     DeviceIdentity,
     Engine,
@@ -20,7 +21,7 @@ defmodule AttentionServer.PrioritizationTest do
     TLSFixtures
   }
 
-  alias AttentionServer.ClientAPI.Reads
+  alias AttentionServer.ClientAPI.{Reads, Resources}
   alias Exqlite.Sqlite3
 
   @endpoint "https://api.typesafe.ai/v1/systemone"
@@ -1924,6 +1925,79 @@ defmodule AttentionServer.PrioritizationTest do
       end)
 
     assert state.priority_views["person-a"].basis == "selected"
+  end
+
+  test "a deadline-only priority pass persists the reordered inbox without a Store commit", %{
+    dir: dir,
+    path: path
+  } do
+    use_synthetic_jev_key(dir)
+    now = 1_793_290_000_000
+    boundary = now + 10_000
+    {:ok, clock} = Agent.start_link(fn -> now end)
+    on_exit(fn -> if Process.alive?(clock), do: Agent.stop(clock) end)
+
+    evaluator = fn request ->
+      {:ok, %{"state" => %{"pending_items" => pending}}} = JSON.decode_line(request.body <> "\n")
+
+      near_deadline? =
+        Enum.any?(pending, &(is_number(&1["due_in_minutes"]) and &1["due_in_minutes"] < 60))
+
+      {:ok,
+       Map.new(request.candidates, fn
+         {"app:test", "deadline"} = id -> {id, if(near_deadline?, do: 0.3, else: 0.9)}
+         {"app:test", "steady"} = id -> {id, 0.6}
+       end)}
+    end
+
+    relay =
+      start_relay(path,
+        clock: fn -> Agent.get(clock, & &1) end,
+        priority_evaluator: evaluator
+      )
+
+    setup_person(relay)
+    forward(relay, 1, "deadline", boundary + 3_600_000)
+    configure_jev_choice(relay)
+    forward(relay, 2, "steady")
+
+    before =
+      await_state(relay, &match?(%{due: ^boundary}, &1.priority_deadline_timers["person-a"]))
+
+    assert Enum.map(before.priority_views["person-a"].entries, & &1["score"]) == [0.9, 0.6]
+    refute MapSet.member?(before.store.change_log_touched, "person-a")
+
+    assert {:ok, steady} =
+             Resources.item_id(before.store.engine, {"person-a", "app:test", "steady"})
+
+    assert {:ok, deadline} =
+             Resources.item_id(before.store.engine, {"person-a", "app:test", "deadline"})
+
+    assert {:ok, before_keys} = ChangeLog.rank_keys(before.store, "person-a")
+
+    assert {:ok, %{"items" => [%{"item_id" => ^deadline}, %{"item_id" => ^steady}]}} =
+             Reads.inbox(relay, "device-a")
+
+    assert before_keys[deadline] < before_keys[steady]
+
+    Agent.update(clock, fn _ -> boundary + 1_000 end)
+    send(relay, {:priority_deadline, "person-a", boundary})
+
+    after_pass =
+      await_state(relay, fn state ->
+        Enum.map(state.priority_views["person-a"].entries, & &1["score"]) == [0.6, 0.3]
+      end)
+
+    # Only the priority view changed. No normal change-log touch can trigger the rank write.
+    assert after_pass.store.version == before.store.version
+    assert after_pass.store.engine == before.store.engine
+    refute MapSet.member?(after_pass.store.change_log_touched, "person-a")
+
+    assert {:ok, keys} = ChangeLog.rank_keys(after_pass.store, "person-a")
+    assert keys[steady] < keys[deadline]
+
+    assert {:ok, %{"items" => [%{"item_id" => ^steady}, %{"item_id" => ^deadline}]}} =
+             Reads.inbox(relay, "device-a")
   end
 
   test "new input cancels a superseded ranking request while intake proceeds", %{
