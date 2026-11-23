@@ -2672,6 +2672,46 @@ defmodule AttentionServer.Engine do
     end
   end
 
+  @doc "Read an original send result within an authenticated account and device scope."
+  def committed_send_receipt(%__MODULE__{} = engine, {person, device, op} = scope) do
+    with true <- Message.uuid_v4?(op),
+         %{semantic: stored, reply: reply} when is_binary(stored) <- engine.receipts[scope],
+         {:ok,
+          %{
+            "type" => "forward",
+            "session_handle" => handle,
+            "message" => %{"sender_id" => sender, "message_id" => id}
+          } = semantic} <- JSON.decode_line(stored <> "\n"),
+         vendor = semantic["vendor_session_id"],
+         true <- Conversation.valid_session?(handle, vendor),
+         %{"seq" => seq, "revision" => 1, "session_handle" => ^handle}
+         when is_integer(seq) and seq > 0 and not is_map_key(reply, "duplicate") <- reply,
+         %{
+           origin: ^device,
+           send_op_id: ^op,
+           accepted_seq: ^seq,
+           session_handle: ^handle,
+           vendor_session_id: ^vendor,
+           revisions: %{1 => %{"sender_id" => ^sender, "message_id" => ^id}}
+         } <- engine.messages[{person, sender, id}],
+         %{vendor_session_id: ^vendor} <- engine.origin_sessions[{person, device, handle}] do
+      {:ok,
+       %{
+         "person_id" => person,
+         "device_id" => device,
+         "op_id" => op,
+         "sender_id" => sender,
+         "message_id" => id,
+         "session_handle" => handle,
+         "accepted_seq" => seq,
+         "original_revision" => 1,
+         "result" => reply
+       }}
+    else
+      _ -> {:error, :not_found}
+    end
+  end
+
   @doc "Internal source-status projection; ordinary device wire has no item lookup."
   def source_status(%__MODULE__{} = engine, person, sender, id) do
     case Map.get(engine.messages, {person, sender, id}) do

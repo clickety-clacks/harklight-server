@@ -17,7 +17,8 @@ defmodule AttentionServer.ClientAPI.AgentReads do
       {"GET", ["agent", "messages"], :messages},
       {"GET", ["agent", "messages", :item_id], :message},
       {"GET", ["agent", "messages", :item_id, "entries"], :entries},
-      {"GET", ["agent", "messages", :item_id, "revisions", :n], :revision}
+      {"GET", ["agent", "messages", :item_id, "revisions", :n], :revision},
+      {"GET", ["agent", "send-receipts", :op_id], :send_receipt}
     ]
   end
 
@@ -39,6 +40,10 @@ defmodule AttentionServer.ClientAPI.AgentReads do
     Reads.respond(conn, call(ctx, {:revision, ctx.params.item_id, ctx.params.n}))
   end
 
+  def send_receipt(conn, ctx) do
+    Reads.respond(conn, call(ctx, {:send_receipt, ctx.params.op_id}))
+  end
+
   defp call(%Context{principal: %{kind: :device} = principal, relay: relay}, request) do
     GenServer.call(relay, {:client_api, __MODULE__, {principal, request}}, :infinity)
   end
@@ -46,6 +51,23 @@ defmodule AttentionServer.ClientAPI.AgentReads do
   defp call(_ctx, _request), do: {:error, :forbidden}
 
   @doc false
+  def handle_call({%{person: person, key: key}, {:send_receipt, op}}, _from, state) do
+    engine = state.store.engine
+
+    result =
+      case Engine.authorized_person(engine, key) do
+        {:ok, ^person} ->
+          with {:ok, receipt} <- Engine.committed_send_receipt(engine, {person, key, op}) do
+            {:ok, %{"receipt" => receipt}}
+          end
+
+        _ ->
+          {:error, :forbidden}
+      end
+
+    {:reply, result, state}
+  end
+
   def handle_call({%{person: person, key: key}, request}, _from, state) do
     scope = {person, key}
 

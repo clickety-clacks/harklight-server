@@ -938,6 +938,15 @@ provides the file caps and retention window.
 | `GET /v2/agent/messages/{item_id}/entries?before=&limit=` | `AgentEntriesPage` |
 | `GET /v2/agent/messages/{item_id}/revisions/{n}` | `AgentRevisionResponse` |
 | `GET /v2/agent/focus` | `AgentFocus` |
+| `GET /v2/agent/send-receipts/{op_id}` | `CommittedSendReceiptResponse` |
+
+Use the original send operation UUID to retrieve its committed result with
+the original enrolled device. The Server checks the stored result against the
+original message acceptance and origin session. The accepted sequence and
+revision describe the original send, including after the message is revised.
+Missing, incomplete, conflicting, and out-of-scope receipts return
+`404 not_found`. Reading the receipt does not resend the message or record
+delivery progress.
 
 The following definitions extend the shared `$defs`. Read positions and
 resource versions use the agent's own log, independent of the person's log.
@@ -948,6 +957,26 @@ agents with existing data. Clients apply newer versions of each resource.
 {
   "$defs": {
     "AgentSession": { "type": "string", "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$" },
+    "CommittedSendReceiptResponse": {
+      "type": "object", "required": ["receipt"],
+      "properties": {
+        "receipt": {
+          "type": "object",
+          "required": ["person_id", "device_id", "op_id", "sender_id", "message_id", "session_handle", "accepted_seq", "original_revision", "result"],
+          "properties": {
+            "person_id": { "type": "string" },
+            "device_id": { "type": "string" },
+            "op_id": { "$ref": "#/$defs/AgentSession" },
+            "sender_id": { "type": "string" },
+            "message_id": { "type": "string" },
+            "session_handle": { "$ref": "#/$defs/AgentSession" },
+            "accepted_seq": { "type": "integer", "minimum": 1 },
+            "original_revision": { "const": 1 },
+            "result": { "type": "object", "description": "Original committed forward reply fields. The seq, revision and session_handle match the receipt." }
+          }
+        }
+      }
+    },
     "AgentTerminal": {
       "type": "object",
       "required": ["state", "at_ms"],

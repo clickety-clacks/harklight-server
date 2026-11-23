@@ -579,6 +579,111 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
     assert get(ctx, "a2", path <> "1").status == 404
   end
 
+  describe "committed send receipts" do
+    test "returns the original result for the origin after a revision without changing state",
+         ctx do
+      id = forward(ctx, "a1", 1, @first_session)
+      device = ctx.keys["a1"]
+      op_id = op(1)
+      path = "/v2/agent/send-receipts/" <> op_id
+
+      revised =
+        request(
+          ctx,
+          "a1",
+          "PUT",
+          "/v2/agent/messages/" <> id,
+          %{"message" => %{"title" => "Updated", "created_at" => 1}},
+          2,
+          [{"if-match", "1"}]
+        )
+
+      assert %{"message" => %{"revision" => 2}} = contract(ctx, "AgentWriteResult", revised)
+
+      before = :sys.get_state(ctx.relay).store
+      seq = before.engine.messages[{"A", "app:test", "item-1"}].accepted_seq
+
+      assert %{
+               "receipt" => %{
+                 "person_id" => "A",
+                 "device_id" => ^device,
+                 "op_id" => ^op_id,
+                 "sender_id" => "app:test",
+                 "message_id" => "item-1",
+                 "session_handle" => @first_session,
+                 "accepted_seq" => ^seq,
+                 "original_revision" => 1,
+                 "result" => %{"seq" => ^seq, "revision" => 1, "session_handle" => @first_session}
+               }
+             } = contract(ctx, "CommittedSendReceiptResponse", get(ctx, "a1", path))
+
+      assert_error(get(ctx, "a2", path), 404, "not_found")
+      assert_error(get(ctx, "b1", path), 404, "not_found")
+      assert_error(get(ctx, "a1", "/v2/agent/send-receipts/" <> op(2)), 404, "not_found")
+      assert_error(get(ctx, "a1", "/v2/agent/send-receipts/bad-id"), 404, "not_found")
+      assert :sys.get_state(ctx.relay).store == before
+
+      assert :ok = Relay.revoke_device(ctx.relay, device)
+      assert_error(get(ctx, "a1", path), 401, "unauthorized")
+    end
+
+    test "a native send is readable by its original idempotency key", ctx do
+      body = %{
+        "sender" => "app:test",
+        "session" => @first_session,
+        "message" => %{"title" => "Sent over v2", "created_at" => 1}
+      }
+
+      assert request(ctx, "a1", "POST", "/v2/agent/messages", body, 1).status == 200
+      before = :sys.get_state(ctx.relay).store
+      response = get(ctx, "a1", "/v2/agent/send-receipts/" <> op(1))
+      assert response.status == 200
+
+      assert %{"receipt" => %{"op_id" => id}} =
+               contract(ctx, "CommittedSendReceiptResponse", response)
+
+      assert id == op(1)
+      assert :sys.get_state(ctx.relay).store == before
+    end
+
+    test "refuses conflicting and incomplete stored evidence without changing state", ctx do
+      forward(ctx, "a1", 1, @first_session)
+      device = ctx.keys["a1"]
+      path = "/v2/agent/send-receipts/" <> op(1)
+      key = {"A", "app:test", "item-1"}
+      scope = {"A", device, op(1)}
+      session_key = {"A", device, @first_session}
+      original = :sys.get_state(ctx.relay).store.engine
+
+      for {label, engine} <- [
+            {"receipt absent", update_in(original.receipts, &Map.delete(&1, scope))},
+            {"result handle absent",
+             update_in(original.receipts[scope].reply, &Map.delete(&1, "session_handle"))},
+            {"result handle different",
+             put_in(original.receipts[scope].reply["session_handle"], @other_session)},
+            {"original result revision different",
+             put_in(original.receipts[scope].reply["revision"], 2)},
+            {"accepted sequence different",
+             update_in(original.messages[key].accepted_seq, &(&1 + 1))},
+            {"original revision absent", put_in(original.messages[key].revisions, %{})},
+            {"original message different",
+             put_in(original.messages[key].revisions[1]["message_id"], "other")},
+            {"original operation different", put_in(original.messages[key].send_op_id, op(2))},
+            {"origin device different", put_in(original.messages[key].origin, ctx.keys["a2"])},
+            {"origin session absent",
+             update_in(original.origin_sessions, &Map.delete(&1, session_key))},
+            {"origin session different",
+             put_in(original.origin_sessions[session_key].vendor_session_id, "other")}
+          ] do
+        state = :sys.replace_state(ctx.relay, &put_in(&1.store.engine, engine))
+        response = get(ctx, "a1", path)
+        assert response.status == 404, label
+        assert_error(response, 404, "not_found")
+        assert :sys.get_state(ctx.relay).store == state.store, label
+      end
+    end
+  end
+
   describe "agent message writes" do
     @describetag :agent_message_writes
 
