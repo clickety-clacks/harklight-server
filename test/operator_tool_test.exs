@@ -64,6 +64,7 @@ defmodule AttentionServer.OperatorToolTest do
     cert = Path.join(certs, "a1.pem")
     options = ["--store", dir, "--owner-cert", cert]
     person = "00000000-0000-4000-8000-000000000001"
+
     message =
       "Cannot open the local Harklight store. Check the --store path and permissions, then retry."
 
