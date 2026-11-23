@@ -169,7 +169,14 @@ defmodule AttentionServer.DashboardReadHTTPTest do
     brand = Path.join(List.to_string(:code.priv_dir(:attention_server)), "dashboard/brand")
     lockup = brand |> Path.join("harklight-navy.svg") |> File.read!() |> Base.encode64()
     favicon = brand |> Path.join("favicon.svg") |> File.read!() |> Base.encode64()
-    hosted = %{opts | hosted: true}
+    hosted =
+      DashboardReadHTTP.init(
+        backend: Backend,
+        skill_path: opts.skill_path,
+        skill_path_saas: opts.skill_path_saas,
+        skill_path_core: opts.skill_path_core,
+        hosted: true
+      )
 
     for {mode, path, session, status, alt} <- [
           {opts, "/devices", "member-session", 200, "Harklight"},
