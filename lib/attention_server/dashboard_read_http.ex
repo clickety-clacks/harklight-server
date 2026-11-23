@@ -20,12 +20,12 @@ defmodule AttentionServer.DashboardReadHTTP do
 
   import Plug.Conn
 
-  alias AttentionServer.{DashboardView, Diagnostics, JSON, Message}
+  alias AttentionServer.{DashboardBrand, DashboardView, Diagnostics, JSON, Message}
 
   @cookie "__Host-harklight"
   @invite_cookie "__Host-harklight-invite"
   @invite_cookie_age 30 * 24 * 60 * 60
-  @dashboard_csp "default-src 'none'; script-src 'self'; connect-src 'self'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'"
+  @dashboard_csp "default-src 'none'; script-src 'self'; connect-src 'self'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; frame-ancestors 'none'"
   # Where a self-hosted browser lands after signing out or losing its session.
   # The sign-in page shows that it is signed out instead of an invalid link.
   @signed_out_path "/sign-in?signed_out=1"
@@ -244,7 +244,7 @@ defmodule AttentionServer.DashboardReadHTTP do
   end
 
   defp self_hosted_sign_in_help_page do
-    ~s(<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Sign in · Harklight</title></head><body><main><h1>Sign in to Harklight</h1>#{self_hosted_sign_in_help_copy()}<p><a href="/sign-in">Open a sign-in link</a></p></main></body></html>)
+    ~s(<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Sign in · Harklight</title>#{DashboardBrand.favicon()}</head><body><main>#{DashboardBrand.lockup(decorative: true)}<h1>Sign in to Harklight</h1>#{self_hosted_sign_in_help_copy()}<p><a href="/sign-in">Open a sign-in link</a></p></main></body></html>)
   end
 
   defp self_hosted_sign_in_help_copy do
@@ -1091,7 +1091,7 @@ defmodule AttentionServer.DashboardReadHTTP do
     self_hosted_help = if opts.hosted, do: "", else: self_hosted_sign_in_help_copy()
 
     html =
-      ~s(<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Sign in · Harklight</title></head><body><main><h1>Sign in to Harklight</h1><p id="status">Checking your one-use link…</p>#{again}#{self_hosted_help}</main><script src="/sign-in.js" defer></script></body></html>)
+      ~s(<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Sign in · Harklight</title>#{DashboardBrand.favicon()}</head><body><main>#{DashboardBrand.lockup(decorative: true)}<h1>Sign in to Harklight</h1><p id="status">Checking your one-use link…</p>#{again}#{self_hosted_help}</main><script src="/sign-in.js" defer></script></body></html>)
 
     conn |> put_resp_content_type("text/html", "utf-8") |> send_resp(200, html)
   end
@@ -1188,14 +1188,14 @@ defmodule AttentionServer.DashboardReadHTTP do
 
   defp join_page(conn, %{hosted: true}) do
     html =
-      ~S|<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Join Harklight</title></head><body><main><h1>Join Harklight</h1><p id="join-status" role="status">Checking invitation…</p><noscript>This invitation needs JavaScript.</noscript><p id="join-details"></p><a id="open-harklight" hidden>Open in Harklight</a></main><script src="/join.js" defer></script></body></html>|
+      ~s|<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Join Harklight</title>#{DashboardBrand.favicon()}</head><body><main>#{DashboardBrand.lockup(decorative: true)}<h1>Join Harklight</h1><p id="join-status" role="status">Checking invitation…</p><noscript>This invitation needs JavaScript.</noscript><p id="join-details"></p><a id="open-harklight" hidden>Open in Harklight</a></main><script src="/join.js" defer></script></body></html>|
 
     conn |> put_resp_content_type("text/html", "utf-8") |> send_resp(200, html)
   end
 
   defp join_page(conn, _opts) do
     html =
-      ~S|<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Join Harklight</title></head><body><main><h1>Join Harklight</h1><p id="join-status" role="status">Checking invitation…</p><noscript>This invitation needs JavaScript. Ask the account owner for the full invitation link.</noscript><p id="join-details"></p><a id="open-harklight" hidden>Open in Harklight</a><p>Opening Harklight shows the account and trust details before you choose Join. The account owner must separately approve your exact device.</p></main><script src="/join.js" defer></script></body></html>|
+      ~s|<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Join Harklight</title>#{DashboardBrand.favicon()}</head><body><main>#{DashboardBrand.lockup(decorative: true)}<h1>Join Harklight</h1><p id="join-status" role="status">Checking invitation…</p><noscript>This invitation needs JavaScript. Ask the account owner for the full invitation link.</noscript><p id="join-details"></p><a id="open-harklight" hidden>Open in Harklight</a><p>Opening Harklight shows the account and trust details before you choose Join. The account owner must separately approve your exact device.</p></main><script src="/join.js" defer></script></body></html>|
 
     conn |> put_resp_content_type("text/html", "utf-8") |> send_resp(200, html)
   end
