@@ -1,28 +1,22 @@
-# Harklight Server v0.2.1
+# Harklight Server v0.2.2
 
-- **Packaged CLI help.** `bin/harklight --help` and `-h` show the same usage
-  as `bin/harklight help`. Subcommand usage errors and obsolete agent options
-  point to the bundled `SELF_HOST.md`.
-- **Keyed storage preparation.** Engine transitions report the records they
-  touch. Keyed commits validate changed records, including cross-record
-  constraints, bounce state and open-default entries. Full validation still
-  runs on keyed open and on irregular keyed transitions. Client and agent
-  change-log rows for keyed commits are derived from the touched records.
-  The detailed check for omitted touched records stays enabled. Tests compare
-  incremental validation and change logs against their full-state equivalents.
-  The packaged Server continues to open and write FORMAT29 through its existing
-  snapshot store. These changes do not activate the FORMAT30 keyed store.
+Local `bin/harklight operator bootstrap` and `operator recover` failures now
+tell you whether the store could not open or opened but could not finish
+initialization. Check the `--store` path and permissions for an open failure,
+or the startup diagnostics for an initialization failure. Both failures
+return exit status 1. Bad arguments still return 2, and successful commands
+return 0.
 
 ## Upgrade and recovery
 
-Upgrading from v0.2.0 keeps FORMAT29 and requires no format migration. The
-existing migration from supported FORMAT27 state to FORMAT29 remains available.
-Stop the old server, back up the complete private state, and start the new
-package with the existing configuration and identity. See `SELF_HOST.md` for
-the upgrade and backup-restoration procedure.
+The packaged Server still uses the FORMAT29 snapshot store. Upgrading from
+v0.2.1 requires no format migration. The existing startup migration from
+supported FORMAT27 stores to FORMAT29 remains available. Stop the old Server,
+back up the complete private state, and keep the existing configuration and
+identities. See `SELF_HOST.md` for upgrade and backup restoration.
 
-**Compatibility.** Harklight Server 0.2.1 uses protocol 0.2 and keeps the same
-client API and bundled web revision as Server 0.2.0. The compatibility baseline
-is Harklight app 0.2.0, bundled Harklight Web at commit `3434a38`, and Harklight
-Agent 0.2.0, exercised with Server 0.2.0. That client matrix was run on 0.2.0.
-Protocol 0.1 clients require upgrading to their protocol 0.2 versions.
+**Compatibility.** Harklight Server 0.2.2 uses protocol 0.2, with the same
+client API and bundled web revision as Server 0.2.1. The client compatibility
+baseline is Harklight app 0.2.0, bundled Harklight Web at commit `3434a38`, and
+Harklight Agent 0.2.0, exercised with Server 0.2.0. That client matrix was
+run on 0.2.0. Protocol 0.1 clients require upgrading to their protocol 0.2 versions.
