@@ -40,6 +40,22 @@ defmodule AttentionServer.OperatorToolTest do
     GenServer.stop(relay)
   end
 
+  @tag :tmp_dir
+  test "an unavailable store is returned without exiting the operator process", %{
+    certs: certs,
+    tmp_dir: dir
+  } do
+    cert = Path.join(certs, "a1.pem")
+    person = "00000000-0000-4000-8000-000000000001"
+    file = Path.join(dir, "regular-file")
+    File.write!(file, "not a directory")
+
+    for store <- [dir, Path.join(file, "relay.sqlite3")] do
+      assert {:error, :store_open_failed} = OperatorTool.bootstrap(store, cert)
+      assert {:error, :store_open_failed} = OperatorTool.recover(store, person, cert)
+    end
+  end
+
   # The tool's Relay writes the change log like the Server's, so an owner
   # recovery run while the Server is stopped does not expire clients' cursors.
   @tag :tmp_dir
