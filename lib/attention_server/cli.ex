@@ -48,6 +48,7 @@ defmodule AttentionServer.CLI do
   end
 
   def shell, do: Process.get(:harklight_cli_shell, AttentionServer.CLI.Shell)
+
   def error!(message, default \\ RuntimeError),
     do: raise(Process.get(:harklight_cli_error, default), message)
 
