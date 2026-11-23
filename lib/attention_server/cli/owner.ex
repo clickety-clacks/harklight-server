@@ -465,10 +465,7 @@ defmodule AttentionServer.CLI.Owner do
   end
 
   def run(_),
-    do:
-      AttentionServer.CLI.error!(
-        "use approve or a scoped owner change; see SELF_HOST.md"
-      )
+    do: AttentionServer.CLI.error!("use approve or a scoped owner change; see SELF_HOST.md")
 
   defp get_endpoint!(options) do
     case ToolEndpoint.from_options(options) do
