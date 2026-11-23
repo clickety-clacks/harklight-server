@@ -145,6 +145,46 @@ defmodule AttentionServer.ChatPushTest do
     assert_round_trip(engine)
   end
 
+  @tag :tmp_dir
+  test "grouped push excludes unresolved deliveries at or below the durable cursor", %{
+    tmp_dir: dir
+  } do
+    {engine, _} = register(setup_engine(), 1)
+
+    engine =
+      Enum.reduce(~w(older floor newer latest), engine, fn id, current ->
+        {next, _} = forward(current, id)
+        next
+      end)
+
+    path = Path.join(dir, "state.sqlite3")
+    audit = %{person: @person, actor: @reader, action: "test"}
+    assert {:ok, store} = Store.open(path, :legacy)
+    assert {:ok, store} = Store.commit(store, engine, audit)
+
+    # Store the legacy device's ACK separately from the pending push binding.
+    cursor = 2
+    acknowledged = Engine.put_row(store.engine, :cursors, {@person, @reader}, cursor)
+    assert {:ok, persisted} = Store.commit(store, acknowledged, audit)
+    assert persisted.progress_version > store.progress_version
+    assert :ok = Store.close(persisted)
+
+    assert {:ok, reopened} = Store.open(path, :legacy)
+    engine = reopened.engine
+    assert :ok = Store.close(reopened)
+    assert {:ok, ^cursor} = Engine.acknowledged_cursor(engine, @reader)
+    assert push_binding(engine).accepted_high == 0
+    assert push_binding(engine).pending_high == 4
+
+    floor_key = {@person, "app:test", "floor"}
+    assert %{kind: :delivery, key: ^floor_key} = engine.events[{@person, cursor}]
+    assert %{terminal: nil} = engine.messages[floor_key]
+    assert %{terminal: nil} = engine.messages[{@person, "app:test", "older"}]
+
+    assert {:ok, _claimed, claim} = Engine.claim_push(engine, due(engine))
+    assert claim.expanded == %{titles: ["Request newer", "Request latest"], total_count: 2}
+  end
+
   test "failed selected claims retain both streams and newer work survives chat success" do
     {engine, _} = register(setup_engine(), 1)
     {engine, _} = forward(engine, "one")
