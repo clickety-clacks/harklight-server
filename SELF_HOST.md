@@ -488,10 +488,10 @@ the optional owner agent-list probe is warning-only.
 Before the first v0.2.2 start, stop the server and take a complete private
 state backup, including the database and keys. To return to v0.2.1 or
 v0.2.0, stop v0.2.2, restore the backup taken under the release you ran
-before the upgrade, and run that same release against the restored state. To return to a 0.1.x release, stop
-the server, restore a backup taken before the protocol 0.2 cutover that is
-compatible with the selected 0.1.x release, and run that release with its
-protocol 0.1 clients. The shared FORMAT29 number alone does not establish
+before the upgrade, and run that same release against the restored state.
+To return to a 0.1.x release, stop the server, restore a backup taken before
+the protocol 0.2 cutover that is compatible with the selected 0.1.x release,
+and run that release with its protocol 0.1 clients. The shared FORMAT29 number alone does not establish
 cross-version compatibility. Either restore loses every write made after
 its backup and cannot undo external notifications, bounces or agent
 deliveries. Preserve the backup and current state if restoration does not
