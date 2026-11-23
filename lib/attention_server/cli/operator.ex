@@ -53,6 +53,12 @@ defmodule AttentionServer.CLI.Operator do
           AttentionServer.CLI.CommandFailure
         )
 
+      {:error, :store_initialization_failed} ->
+        AttentionServer.CLI.error!(
+          "The local Harklight store opened, but startup could not initialize it. Check the startup diagnostics before retrying.",
+          AttentionServer.CLI.CommandFailure
+        )
+
       {:error, reason} ->
         AttentionServer.CLI.error!("operator action failed: #{inspect(reason)}")
     end

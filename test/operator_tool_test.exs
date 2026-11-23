@@ -1,7 +1,7 @@
 defmodule AttentionServer.OperatorToolTest do
   use ExUnit.Case, async: false
 
-  alias AttentionServer.{ChangeLog, DeviceIdentity, OperatorTool, Relay, TLSFixtures}
+  alias AttentionServer.{ChangeLog, DeviceIdentity, OperatorTool, Relay, Store, TLSFixtures}
 
   setup_all do
     certs = TLSFixtures.create!()
@@ -74,6 +74,35 @@ defmodule AttentionServer.OperatorToolTest do
 
     assert_raise Mix.Error, message, fn ->
       Mix.Tasks.Attention.Operator.run(["recover", "--person", person | options])
+    end
+  end
+
+  @tag :tmp_dir
+  test "a writable store with an invalid change log fails after open", %{
+    certs: certs,
+    tmp_dir: dir
+  } do
+    path = Path.join(dir, "relay.sqlite3")
+    cert = Path.join(certs, "a1.pem")
+    person = "00000000-0000-4000-8000-000000000001"
+    assert {:ok, store} = Store.open(path)
+
+    assert :ok =
+             Exqlite.Sqlite3.execute(
+               store.db,
+               "CREATE TABLE client_change_log_state (placeholder INTEGER)"
+             )
+
+    assert :ok = Store.close(store)
+    assert {:ok, store} = Store.open(path)
+    assert {:error, _} = Store.enable_change_log(store)
+    assert :ok = Store.close(store)
+
+    assert {:error, :store_initialization_failed} = OperatorTool.bootstrap(path, cert)
+    assert {:error, :store_initialization_failed} = OperatorTool.recover(path, person, cert)
+
+    assert_raise Mix.Error, ~r/store opened, but startup could not initialize it/, fn ->
+      Mix.Tasks.Attention.Operator.run(["bootstrap", "--store", path, "--owner-cert", cert])
     end
   end
 

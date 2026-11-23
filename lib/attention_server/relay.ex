@@ -477,7 +477,7 @@ defmodule AttentionServer.Relay do
 
   @impl true
   def init(opts) do
-    case Store.open(Keyword.get(opts, :store_path)) |> enable_change_log() do
+    case open_startup_store(opts) do
       {:ok, store} ->
         case startup_cleanup(store) do
           {:ok, store} ->
@@ -541,7 +541,9 @@ defmodule AttentionServer.Relay do
 
           error ->
             Store.close(store)
-            {:stop, {:storage_unavailable, error}}
+
+            {:stop,
+             startup_reason(opts, :store_initialization_failed, {:storage_unavailable, error})}
         end
 
       {:error, reason} ->
@@ -561,7 +563,14 @@ defmodule AttentionServer.Relay do
   defp schedule_change_log_prune(delay_ms),
     do: Process.send_after(self(), :change_log_prune, delay_ms)
 
-  defp enable_change_log({:ok, store}) do
+  defp open_startup_store(opts) do
+    case Store.open(Keyword.get(opts, :store_path)) do
+      {:ok, store} -> enable_change_log(store, opts)
+      {:error, reason} -> {:error, startup_reason(opts, :store_open_failed, reason)}
+    end
+  end
+
+  defp enable_change_log(store, opts) do
     case Store.enable_change_log(store) do
       {:ok, store} ->
         {:ok, store}
@@ -569,11 +578,22 @@ defmodule AttentionServer.Relay do
       {:error, reason} ->
         Diagnostics.failure(:server_startup, :configuration, reason, :unavailable)
         Store.close(store)
-        {:error, {:storage_unavailable, reason}}
+
+        {:error,
+         startup_reason(opts, :store_initialization_failed, {:storage_unavailable, reason})}
     end
   end
 
-  defp enable_change_log(error), do: error
+  # The local operator CLI needs the phase without exposing internal reasons.
+  # Regular Relay callers keep their existing startup errors.
+  defp startup_reason(opts, phase, reason)
+       when reason == :storage_unavailable or
+              (is_tuple(reason) and tuple_size(reason) == 2 and
+                 elem(reason, 0) == :storage_unavailable) do
+    if Keyword.get(opts, :operator_startup_errors, false), do: phase, else: reason
+  end
+
+  defp startup_reason(_opts, _phase, reason), do: reason
 
   defp startup_cleanup(store) do
     actor_keys = browser_actor_keys(store.engine)

@@ -21,7 +21,8 @@ defmodule AttentionServer.OperatorTool do
   defp with_relay(store_path, certificate_path, action) do
     with {:ok, pem} <- File.read(certificate_path),
          {:ok, der} <- certificate_der(pem),
-         {:ok, relay} <- open_relay(store_path) do
+         {:ok, relay} <-
+           GenServer.start(Relay, store_path: store_path, operator_startup_errors: true) do
       # Link only after the store has opened so a startup failure is returned
       # to the CLI while a running relay keeps the operator's lifecycle.
       Process.link(relay)
@@ -31,15 +32,6 @@ defmodule AttentionServer.OperatorTool do
       after
         GenServer.stop(relay)
       end
-    end
-  end
-
-  defp open_relay(store_path) do
-    case GenServer.start(Relay, store_path: store_path) do
-      {:ok, relay} -> {:ok, relay}
-      {:error, :storage_unavailable} -> {:error, :store_open_failed}
-      {:error, {:storage_unavailable, _reason}} -> {:error, :store_open_failed}
-      {:error, _reason} = error -> error
     end
   end
 
