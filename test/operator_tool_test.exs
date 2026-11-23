@@ -56,6 +56,26 @@ defmodule AttentionServer.OperatorToolTest do
     end
   end
 
+  @tag :tmp_dir
+  test "the development operator task raises a Mix error on store-open failure", %{
+    certs: certs,
+    tmp_dir: dir
+  } do
+    cert = Path.join(certs, "a1.pem")
+    options = ["--store", dir, "--owner-cert", cert]
+    person = "00000000-0000-4000-8000-000000000001"
+    message =
+      "Cannot open the local Harklight store. Check the --store path and permissions, then retry."
+
+    assert_raise Mix.Error, message, fn ->
+      Mix.Tasks.Attention.Operator.run(["bootstrap" | options])
+    end
+
+    assert_raise Mix.Error, message, fn ->
+      Mix.Tasks.Attention.Operator.run(["recover", "--person", person | options])
+    end
+  end
+
   # The tool's Relay writes the change log like the Server's, so an owner
   # recovery run while the Server is stopped does not expire clients' cursors.
   @tag :tmp_dir

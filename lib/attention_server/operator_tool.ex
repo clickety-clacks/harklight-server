@@ -37,7 +37,9 @@ defmodule AttentionServer.OperatorTool do
   defp open_relay(store_path) do
     case GenServer.start(Relay, store_path: store_path) do
       {:ok, relay} -> {:ok, relay}
-      {:error, _reason} -> {:error, :store_open_failed}
+      {:error, :storage_unavailable} -> {:error, :store_open_failed}
+      {:error, {:storage_unavailable, _reason}} -> {:error, :store_open_failed}
+      {:error, _reason} = error -> error
     end
   end
 
