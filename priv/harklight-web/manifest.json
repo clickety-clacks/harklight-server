@@ -1,6 +1,6 @@
 {
-  "archive": "harklight-web-d12cff32fd29bd6138b15ae083115faff880c71d.tar.gz",
-  "archive_sha256": "71e3cc2a10d70f232d94f22f641b4128440a58d436326b84beb3b6a9b8d4bb7f",
+  "archive": "harklight-web-fad1f0e83c810605d83efe92d62182cc17382d2e.tar.gz",
+  "archive_sha256": "f26cfe66ea18d1dbb704b2993eb0e070cd2d64e1220e8aed02ffb0367ce28e3f",
   "repository": "clickety-clacks/harklight-web",
-  "source_commit": "d12cff32fd29bd6138b15ae083115faff880c71d"
+  "source_commit": "fad1f0e83c810605d83efe92d62182cc17382d2e"
 }
