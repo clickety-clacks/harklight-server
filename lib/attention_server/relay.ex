@@ -1686,7 +1686,7 @@ defmodule AttentionServer.Relay do
   defp dispatch_call({:owner_revoke_device, person, owner_key, device_key}, _from, state) do
     case Engine.owner_revoke_device(state.store.engine, person, owner_key, device_key) do
       {:ok, next_engine} ->
-        next_engine = revoke_origin_sessions(state, next_engine, person, device_key)
+        next_engine = revoke_origin_sessions(state, next_engine, person, device_key, :include_v2)
 
         case commit_device_removal(
                state,
@@ -3581,13 +3581,13 @@ defmodule AttentionServer.Relay do
     Enum.sort(handles)
   end
 
-  defp end_session_availability(state, next, {person, key, handle} = scope) do
+  defp end_session_availability(state, next, {person, key, handle} = scope, protocol \\ :all) do
     case Conversation.session_end_transition(state.store.engine, scope) do
       :unchanged ->
         next
 
       {:ended, detached_at} ->
-        Engine.origin_availability(next, person, key, handle, "gone", detached_at)
+        Engine.origin_availability(next, person, key, handle, "gone", detached_at, protocol)
     end
   end
 
@@ -3668,7 +3668,7 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  defp revoke_origin_sessions(state, engine, person, origin) do
+  defp revoke_origin_sessions(state, engine, person, origin, mode \\ :legacy) do
     engine.origin_sessions
     |> Enum.filter(fn {{session_person, session_origin, _handle}, _session} ->
       session_person == person and session_origin == origin
@@ -3681,14 +3681,21 @@ defmodule AttentionServer.Relay do
         {:ok, gone} ->
           current_status = origin_session_status(gone, key)
 
-          append_origin_availability_if_changed(
-            gone,
-            person,
-            origin,
-            handle,
-            previous,
-            current_status
-          )
+          # A v2 item can report availability without legacy listening support.
+          # Keep the legacy projection for other items sharing this session.
+          if mode == :include_v2 and
+               match?({:ok, %{"availability" => "unsupported"}}, current_status) do
+            end_session_availability(state, gone, key, :agent_v2)
+          else
+            append_origin_availability_if_changed(
+              gone,
+              person,
+              origin,
+              handle,
+              previous,
+              current_status
+            )
+          end
 
         _ ->
           current
