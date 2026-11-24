@@ -140,6 +140,10 @@ defmodule AttentionServer.Relay do
     |> verify_fetched_file()
   end
 
+  @doc false
+  def fetch_granted_agent_file(server, key, upload_id),
+    do: GenServer.call(server, {:fetch_granted_agent_file, key, upload_id}, :infinity)
+
   def browser_fetch_file(server, person, owner_key, owner_revision, upload_id) do
     GenServer.call(
       server,
@@ -1112,6 +1116,16 @@ defmodule AttentionServer.Relay do
   defp dispatch_call({:fetch_file, key, id}, _from, state) do
     case Engine.authorized_person(state.store.engine, key) do
       {:ok, person} ->
+        {:reply, fetched_file_for_person(state, person, id), state}
+
+      _ ->
+        {:reply, {:error, :not_found}, state}
+    end
+  end
+
+  defp dispatch_call({:fetch_granted_agent_file, key, id}, _from, state) do
+    case Engine.agent_identity(state.store.engine, key) do
+      {:ok, person, _id, _revision} ->
         {:reply, fetched_file_for_person(state, person, id), state}
 
       _ ->
@@ -2676,6 +2690,24 @@ defmodule AttentionServer.Relay do
     do: perform_request_frame(state, key, frame, sources)
 
   @doc false
+  def apply_account_retract(state, {person, _, _} = message_key, actor, frame) do
+    engine = state.store.engine
+    {next, reply} = Engine.request_account_retract(engine, actor, frame, state.clock.())
+    origin = engine.messages[message_key].origin
+
+    finish_request(
+      state,
+      actor,
+      next,
+      reply,
+      Diagnostics.operation_id(frame),
+      [{person, origin}],
+      "conversation_withdraw",
+      frame
+    )
+  end
+
+  @doc false
   def apply_agent_file_use(state, key, seq, name, outcome, op_id) do
     case Engine.origin_file_report(state.store.engine, key, seq, name, outcome, op_id) do
       {:ok, engine, reply} ->
@@ -4111,7 +4143,7 @@ defmodule AttentionServer.Relay do
     do: %{person: person_of(engine, key), actor: key, action: action}
 
   defp person_of(engine, key) do
-    case get_in(engine.devices, [key, :person]) do
+    case get_in(engine.devices, [key, :person]) || get_in(engine.agents, [key, :person]) do
       nil ->
         case BrowserRecipient.person(key) do
           {:ok, person} -> if(Map.has_key?(engine.persons, person), do: person, else: nil)

@@ -519,8 +519,7 @@ defmodule AttentionServer.ClientAPIListenerTest do
             {"PUT", "/v2/devices/me/focus"},
             {"DELETE", "/v2/files/anything"},
             {"POST", "/v2/agent/messages"},
-            {"GET", "/v2/settings"},
-            {"GET", "/v2/files/anything"}
+            {"GET", "/v2/settings"}
           ],
           conn,
           fn {method, path}, conn ->
@@ -539,6 +538,112 @@ defmodule AttentionServer.ClientAPIListenerTest do
       assert closing == %{event: "closing", data: %{"reason" => "revoked"}}
       {conn, %{done: true}} = ClientAPIFeedClient.drain(conn, feed)
       assert {:ok, _, %{status: 401}} = request(conn, "GET", "/v2/inbox")
+    end
+
+    test "a Granted Agent retracts an account item independently of its answer grants", ctx do
+      {relay, person, owner, agent, port} = start_granted_agent(ctx, "granted-retract")
+      assert :ok = Relay.setup_device(relay, person, "fixture-origin")
+      forward_granted_fixture(relay, "app:example", "legacy-id", 1)
+
+      ctx = Map.put(ctx, :port, port)
+      assert {:ok, conn} = device_connect(ctx, "granted-retract", :http2)
+
+      assert {:ok, conn, %{status: 200} = found} =
+               request(conn, "GET", "/v2/search?message_id=legacy-id")
+
+      assert %{"items" => [%{"item_id" => id, "seen" => false}]} = json(found)
+      path = "/v2/items/#{id}"
+      headers = [{"idempotency-key", "00000000-0000-4000-8000-000000000002"}]
+
+      assert {:ok, conn, %{status: 403}} =
+               request(conn, "POST", path <> "/answer", headers, ~s({"request_revision":1}))
+
+      retract = "/v2/agent/messages/#{id}/retract"
+      assert {:ok, conn, %{status: 200} = committed} = request(conn, "POST", retract, headers)
+
+      assert %{"message" => %{"terminal" => %{"state" => "retracted", "retracted_by" => actor}}} =
+               json(committed)
+
+      assert is_binary(actor) and actor != "" and actor != agent
+      assert {:ok, _conn, %{status: 200} = replay} = request(conn, "POST", retract, headers)
+      assert get_in(json(replay), ["message", "terminal", "retracted_by"]) == actor
+
+      assert :ok = Relay.owner_revoke_agent(relay, person, owner, agent)
+      assert {:ok, device} = device_connect(ctx, "a2", :http2)
+      assert {:ok, _device, %{status: 200} = item} = request(device, "GET", path)
+
+      assert %{
+               "item" => %{
+                 "seen" => false,
+                 "terminal" => %{"state" => "retracted", "retracted_by" => ^actor}
+               }
+             } = json(item)
+    end
+
+    test "a Granted Agent downloads retained account attachments", ctx do
+      {relay, person, _owner, _agent, port} = start_granted_agent(ctx, "granted-file")
+      origin = "fixture-origin"
+      assert :ok = Relay.setup_device(relay, person, origin)
+      assert :ok = Relay.setup_sender(relay, origin, "app:example")
+
+      frame = %{
+        "v" => 1,
+        "type" => "forward",
+        "op_id" => "00000000-0000-4000-8000-000000000001",
+        "session_handle" => "00000000-0000-4000-8000-000000000003",
+        "message" => %{
+          "sender_id" => "app:example",
+          "message_id" => "legacy-file",
+          "created_at" => 1,
+          "title" => "A retained attachment"
+        },
+        "files" => [%{"name" => "fixture.txt", "data_base64" => Base.encode64("fixture")}]
+      }
+
+      assert {:ok, accepted} = Relay.request_line(relay, origin, JSON.encode!(frame) <> "\n")
+      assert {:ok, %{"type" => "ok"}} = JSON.decode_line(accepted)
+      assert {:ok, conn} = device_connect(Map.put(ctx, :port, port), "granted-file", :http2)
+
+      assert {:ok, conn, %{status: 200} = found} =
+               request(conn, "GET", "/v2/search?message_id=legacy-file")
+
+      assert %{"items" => [%{"files" => [%{"file_id" => file}]}]} = json(found)
+
+      assert {:ok, _conn, %{status: 200, body: "fixture"}} =
+               request(conn, "GET", "/v2/files/#{file}")
+    end
+
+    test "Hosted accounts isolate account search, item read and retraction", ctx do
+      server = start_supervised!({Server, server_opts(ctx)})
+      relay = Server.relay(server)
+      assert {:ok, alpha} = Relay.hosted_account_create(relay, "synthetic-alpha")
+      assert {:ok, beta} = Relay.hosted_account_create(relay, "synthetic-beta")
+      assert :ok = Relay.setup_device(relay, alpha, "fixture-origin")
+      forward_granted_fixture(relay, "app:example", "alpha-id", 1)
+
+      for {name, person} <- [{"a2", alpha}, {"b1", beta}] do
+        assert {:ok, _} =
+                 Relay.setup_device_certificate(
+                   relay,
+                   person,
+                   TLSFixtures.certificate_der!(ctx.certs, name)
+                 )
+      end
+
+      ctx = Map.put(ctx, :port, Server.port(server))
+      assert {:ok, reader} = device_connect(ctx, "a2", :http2)
+      assert {:ok, stranger} = device_connect(ctx, "b1", :http2)
+      search = "/v2/search?message_id=alpha-id"
+      assert {:ok, reader, %{status: 200} = own} = request(reader, "GET", search)
+      assert %{"items" => [%{"item_id" => id, "seen" => false}]} = json(own)
+      assert {:ok, stranger, %{status: 200} = empty} = request(stranger, "GET", search)
+      assert %{"items" => []} = json(empty)
+      assert {:ok, stranger, %{status: 404}} = request(stranger, "GET", "/v2/items/#{id}")
+
+      retract = "/v2/agent/messages/#{id}/retract"
+      headers = [{"idempotency-key", "00000000-0000-4000-8000-000000000002"}]
+      assert {:ok, _stranger, %{status: 404}} = request(stranger, "POST", retract, headers)
+      assert {:ok, _reader, %{status: 200}} = request(reader, "POST", retract, headers)
     end
 
     test "search keeps literal matching, exact filters, and newest-first paging", ctx do

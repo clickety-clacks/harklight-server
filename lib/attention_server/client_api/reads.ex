@@ -52,7 +52,7 @@ defmodule AttentionServer.ClientAPI.Reads do
       {"GET", ["items", :item_id, "revisions", :n], :get_revision, granted_agent: true},
       {"GET", ["settings"], :get_settings},
       {"GET", ["me"], :get_me},
-      {"GET", ["files", :file_id], :get_file}
+      {"GET", ["files", :file_id], :get_file, granted_agent: true}
     ]
   end
 
@@ -63,9 +63,10 @@ defmodule AttentionServer.ClientAPI.Reads do
   end
 
   @doc false
-  def get_search(conn, %Context{principal: %{kind: :agent} = principal} = ctx) do
+  def get_search(conn, %Context{principal: %{kind: kind} = principal} = ctx)
+      when kind in [:agent, :device] do
     conn = fetch_query_params(conn)
-    params = query(conn, ~w(q sender message_id state limit page))
+    params = query(conn, ~w(q sender message_id state session limit page))
     respond(conn, search(ctx.relay, principal, params))
   end
 
@@ -257,6 +258,9 @@ defmodule AttentionServer.ClientAPI.Reads do
   defp fetch_upload(relay, %{kind: :device, key: key}, upload_id),
     do: Relay.fetch_file(relay, key, upload_id)
 
+  defp fetch_upload(relay, %{kind: :agent, key: key}, upload_id),
+    do: Relay.fetch_granted_agent_file(relay, key, upload_id)
+
   defp fetch_upload(relay, key, upload_id), do: Relay.fetch_file(relay, key, upload_id)
 
   defp file_result(size, sha256, source),
@@ -349,7 +353,8 @@ defmodule AttentionServer.ClientAPI.Reads do
   defp read({:search_snapshot, who}, state) do
     engine = state.store.engine
 
-    with {:ok, %{kind: :agent, person: person} = principal} <- principal(engine, who),
+    with {:ok, %{person: person, kind: kind} = principal} when kind in [:agent, :device] <-
+           principal(engine, who),
          :ok <- ChangeLog.ranks_available(state.store, person),
          {:ok, position} <- head(state, person) do
       {:ok, principal, Map.get(engine.persons, person, 0), position}
@@ -359,7 +364,8 @@ defmodule AttentionServer.ClientAPI.Reads do
   defp read({:search_candidates, who, position, sequence, filters}, state) do
     engine = state.store.engine
 
-    with {:ok, %{kind: :agent, person: person}} <- principal(engine, who),
+    with {:ok, %{person: person, kind: kind}} when kind in [:agent, :device] <-
+           principal(engine, who),
          :ok <- search_position(state, person, position) do
       {:ok, Search.candidates(engine, person, sequence, filters)}
     end
@@ -368,7 +374,8 @@ defmodule AttentionServer.ClientAPI.Reads do
   defp read({:search_items, who, position, matches}, state) do
     engine = state.store.engine
 
-    with {:ok, %{kind: :agent, person: person} = principal} <- principal(engine, who),
+    with {:ok, %{person: person, kind: kind} = principal} when kind in [:agent, :device] <-
+           principal(engine, who),
          :ok <- ChangeLog.ranks_available(state.store, person),
          :ok <- search_position(state, person, position) do
       context = %{engine: engine, store: state.store, view: view(state, person)}

@@ -70,6 +70,165 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
     }
   end
 
+  describe "account message access" do
+    test "an enrolled device searches all retained senders and pages within its own account",
+         ctx do
+      assert :ok = Relay.setup_sender(ctx.relay, ctx.keys["a2"], "app:second")
+      first = forward(ctx, "a1", 1, @first_session)
+
+      %{"seq" => seq} =
+        frame(ctx, "a2", %{
+          "type" => "forward",
+          "op_id" => op(2),
+          "message" => %{
+            "sender_id" => "app:second",
+            "message_id" => "second-id",
+            "title" => "Second sender",
+            "created_at" => 2
+          }
+        })
+
+      second = Resources.item_id(%{accepted_seq: seq})
+      path = "/v2/search?limit=1"
+      page = get(ctx, "a2", path)
+      assert page.status == 200
+
+      assert %{"items" => [%{"item_id" => ^second}], "next_page" => token} =
+               decode_response(page)
+
+      assert %{"items" => [%{"item_id" => ^first, "seen" => false}]} =
+               decode_response(get(ctx, "a2", path <> "&page=" <> token))
+
+      assert_error(get(ctx, "b1", path <> "&page=" <> token), 400, "invalid_field")
+
+      assert %{"items" => [%{"item_id" => ^first}]} =
+               decode_response(get(ctx, "a2", "/v2/search?message_id=item-1"))
+
+      assert %{"items" => []} = decode_response(get(ctx, "b1", "/v2/search?message_id=item-1"))
+    end
+
+    test "another enrolled device retracts an open message and can replay the receipt", ctx do
+      id = forward(ctx, "a1", 1, @first_session)
+      path = "/v2/agent/messages/#{id}/retract"
+      assert_error(request(ctx, "b1", "POST", path, %{}, 2), 404, "not_found")
+
+      result = request(ctx, "a2", "POST", path, %{}, 2)
+      assert result.status == 200
+
+      assert %{"message" => %{"terminal" => %{"state" => "retracted"}}} =
+               contract(ctx, "AgentRetractResult", result)
+
+      replay = request(ctx, "a2", "POST", path, %{}, 2)
+      assert replay.status == 200
+      assert {"idempotent-replayed", "true"} in replay.headers
+
+      assert %{"item" => %{"seen" => false, "terminal" => %{"state" => "retracted"}}} =
+               decode_response(get(ctx, "a1", "/v2/items/#{id}"))
+
+      assert %{"message" => %{"terminal" => %{"state" => "retracted"}}} =
+               decode_response(get(ctx, "a1", "/v2/agent/messages/#{id}"))
+
+      assert %{"changes" => origin_changes} =
+               decode_response(
+                 get(ctx, "a1", "/v2/agent/changes?after=0", [{"accept", "application/json"}])
+               )
+
+      assert Enum.any?(origin_changes, fn change ->
+               match?(
+                 %{"item_id" => ^id, "terminal" => %{"state" => "retracted", "retracted_by" => _}},
+                 change["data"]
+               )
+             end)
+
+      assert %{"messages" => []} =
+               decode_response(get(ctx, "a2", "/v2/agent/messages"))
+
+      assert_error(request(ctx, "a2", "POST", path, %{}, 3), 409, "already_retracted")
+    end
+
+    test "a retained legacy message from a revoked device remains readable and retractable",
+         ctx do
+      id = forward(ctx, "a1", 1, @first_session)
+      assert :ok = Relay.revoke_device(ctx.relay, ctx.keys["a1"])
+
+      assert %{"items" => [%{"item_id" => ^id}]} =
+               decode_response(get(ctx, "a2", "/v2/search?message_id=item-1"))
+
+      assert get(ctx, "a2", "/v2/items/#{id}/revisions/1").status == 200
+      assert request(ctx, "a2", "POST", "/v2/agent/messages/#{id}/retract", %{}, 2).status == 200
+    end
+
+    test "a foreign correlated retract leaves the terminal and chat unchanged", ctx do
+      id = forward(ctx, "a1", 1, @first_session)
+      entry_id = person_reply(ctx, id, 2)
+      item_path = "/v2/items/#{id}"
+      entries_path = "/v2/agent/messages/#{id}/entries"
+      before = decode_response(get(ctx, "a1", entries_path))
+      path = "/v2/agent/messages/#{id}/retract"
+
+      assert_error(
+        request(ctx, "a2", "POST", path, %{"in_reply_to" => entry_id}, 3),
+        404,
+        "not_found"
+      )
+
+      assert %{"item" => %{"terminal" => nil, "seen" => false}} =
+               decode_response(get(ctx, "a2", item_path))
+
+      assert decode_response(get(ctx, "a1", entries_path)) == before
+      assert request(ctx, "a2", "POST", path, %{}, 3).status == 200
+    end
+
+    test "a person answer and another device's retract settle the message once", ctx do
+      id = forward(ctx, "a1", 1, @first_session)
+      path = "/v2/items/#{id}"
+      retract_path = "/v2/agent/messages/#{id}/retract"
+      parent = self()
+
+      answer =
+        Task.async(fn ->
+          send(parent, {:ready, self()})
+
+          receive do
+            :start ->
+              request(ctx, "a2", "POST", path <> "/answer", %{"request_revision" => 1}, 2)
+          end
+        end)
+
+      retract =
+        Task.async(fn ->
+          send(parent, {:ready, self()})
+
+          receive do
+            :start -> request(ctx, "a2", "POST", retract_path, %{}, 3)
+          end
+        end)
+
+      for _ <- 1..2 do
+        assert_receive {:ready, _pid}, 1_000
+      end
+
+      send(answer.pid, :start)
+      send(retract.pid, :start)
+      answer_result = Task.await(answer)
+      retract_result = Task.await(retract)
+      assert Enum.sort([answer_result.status, retract_result.status]) == [200, 409]
+
+      assert %{"item" => %{"terminal" => %{"state" => state}}} =
+               decode_response(get(ctx, "a2", path))
+
+      case state do
+        "answered" ->
+          assert answer_result.status == 200
+          assert_error(retract_result, 409, "already_closed")
+
+        "retracted" ->
+          assert retract_result.status == 200
+          assert_error(answer_result, 409, "already_retracted")
+      end
+    end
+  end
+
   describe "delivery baseline" do
     @baseline "/v2/agent/delivery-baseline"
 

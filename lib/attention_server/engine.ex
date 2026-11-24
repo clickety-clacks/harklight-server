@@ -2074,6 +2074,25 @@ defmodule AttentionServer.Engine do
     end
   end
 
+  @doc false
+  def request_account_retract(engine, key, %{"type" => "conversation_withdraw"} = frame, now) do
+    case account_device_principal(engine, key) do
+      {:ok, principal} ->
+        request_value(engine, principal, Map.put(frame, :account_retract, true), now)
+
+      error ->
+        {engine, error}
+    end
+  end
+
+  @doc false
+  def account_device_principal(engine, key) do
+    case agent_identity(engine, key) do
+      {:ok, person, id, _revision} -> {:ok, %{person: person, key: key, id: id, kind: :agent}}
+      _ -> principal(engine, key)
+    end
+  end
+
   defp request_value(engine, principal, value, request_at) do
     swept = sweep_request_defaults(engine, principal.person, value, request_at)
     {next, frame} = handle_frame(swept, Map.put(principal, :request_at, request_at), value)
@@ -3723,7 +3742,8 @@ defmodule AttentionServer.Engine do
       nil ->
         failure("unknown_message")
 
-      %{origin: origin} when not answer? and origin != actor ->
+      %{origin: origin}
+      when not answer? and origin != actor and not is_map_key(frame, :account_retract) ->
         failure("not_origin")
 
       %{terminal: %{state: "retracted"} = terminal} when answer? ->
@@ -4710,7 +4730,7 @@ defmodule AttentionServer.Engine do
     end
   end
 
-  defp conversation_withdraw(engine, %{person: person, key: actor, kind: kind} = principal, frame) do
+  defp conversation_withdraw(engine, %{person: person, key: actor} = principal, frame) do
     with :ok <- valid_op(frame),
          :ok <- valid_global_id(frame) do
       semantic = Map.take(frame, ~w(type sender_id message_id in_reply_to))
@@ -4726,8 +4746,7 @@ defmodule AttentionServer.Engine do
           commit_conversation_withdraw(
             engine,
             person,
-            actor,
-            kind,
+            principal,
             frame,
             semantic,
             Map.get(principal, :request_at, System.system_time(:millisecond))
@@ -4738,12 +4757,26 @@ defmodule AttentionServer.Engine do
     end
   end
 
-  defp commit_conversation_withdraw(engine, person, actor, kind, frame, semantic, request_at) do
+  defp commit_conversation_withdraw(
+         engine,
+         person,
+         %{key: actor, kind: kind} = principal,
+         frame,
+         semantic,
+         request_at
+       ) do
     key = {person, frame["sender_id"], frame["message_id"]}
 
     case Map.get(engine.messages, key) do
-      %{origin: ^actor, session_handle: handle, terminal: nil}
-      when is_binary(handle) or (is_nil(handle) and frame.agent_api_v2 == true) ->
+      %{origin: origin} when origin != actor and not is_map_key(frame, :account_retract) ->
+        failure("not_origin")
+
+      %{origin: origin} when origin != actor and is_map_key(frame, "in_reply_to") ->
+        failure("not_origin")
+
+      %{session_handle: handle, terminal: nil}
+      when is_binary(handle) or is_map_key(frame, :account_retract) or
+             (is_nil(handle) and frame.agent_api_v2 == true) ->
         with {:ok, acted} <- maybe_act_person_entry(engine, person, actor, key, frame) do
           terminal_frame =
             frame
@@ -4755,7 +4788,7 @@ defmodule AttentionServer.Engine do
                  acted,
                  person,
                  actor,
-                 actor,
+                 Map.get(principal, :id, actor),
                  kind,
                  frame["op_id"],
                  semantic,
@@ -4792,11 +4825,8 @@ defmodule AttentionServer.Engine do
           {:error, reason} -> failure(Atom.to_string(reason))
         end
 
-      %{origin: ^actor, terminal: %{state: "retracted"} = terminal} ->
+      %{terminal: %{state: "retracted"} = terminal} ->
         failure("already_retracted", nil, retracted_terminal_snapshot(terminal))
-
-      %{origin: origin} when origin != actor ->
-        failure("not_origin")
 
       %{terminal: terminal} when not is_nil(terminal) ->
         failure("closed")

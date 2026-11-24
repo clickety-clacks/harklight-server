@@ -147,7 +147,8 @@ Schemas use JSON Schema 2020-12. `$ref`s point into the `$defs` below.
         "state": { "enum": ["answered", "cleared", "expired", "superseded", "retracted"] },
         "at_ms": { "$ref": "#/$defs/TimeMs" },
         "answer": { "$ref": "#/$defs/AnswerOutcome" },
-        "by_this_person": { "type": "boolean", "description": "Settled by any client of this person, not only this device" }
+        "by_this_person": { "type": "boolean", "description": "Settled by any client of this person, not only this device" },
+        "retracted_by": { "type": "string", "description": "Opaque account-local identifier of the authenticated retracting principal, when known" }
       }
     },
 
@@ -1002,7 +1003,8 @@ agents with existing data. Clients apply newer versions of each resource.
         "at_ms": { "$ref": "#/$defs/TimeMs" },
         "answer": { "description": "The raw stored answer, including an explicit null. Present exactly when an answer value was stored." },
         "outcome": { "$ref": "#/$defs/AnswerOutcome" },
-        "delivery": { "$ref": "#/$defs/AgentDelivery" }
+        "delivery": { "$ref": "#/$defs/AgentDelivery" },
+        "retracted_by": { "type": "string", "description": "Opaque account-local identifier of the authenticated retracting principal, when known" }
       }
     },
     "SentMessage": {
@@ -1435,14 +1437,19 @@ Writes return 200 unless the table says otherwise. Each response schema requires
   forms, the server validates retained IDs and applies the new revision
   and its complete attachment set atomically with the `If-Match` check.
   Other write routes accept upload handles only.
-- **Lifecycle and retract.** Only the item's originating key can use either
-  route. Both stamp the time on the server. Lifecycle
+- **Lifecycle and retract.** Lifecycle requires the item's originating key.
+  Any enrolled device or registered Granted Agent may retract an eligible
+  message in its authenticated account. Both routes stamp the time on the
+  server. Lifecycle
   follows the existing transition rules. A repeat retraction under a new
   key answers `409 already_retracted`. A closed message that refuses the
   transition answers `409 already_closed`. A malformed lifecycle action
   answers `400 invalid_field` with `field: "action"`. When retract names a
-  person entry in `in_reply_to`, it also marks that entry acted. Handoff
-  still uses the receipt endpoint.
+  person entry in `in_reply_to`, only the originating key may perform the
+  correlated retraction and mark that entry acted. An unauthorized
+  correlation refuses the entire write. Handoff still uses the receipt
+  endpoint. Retraction records the authenticated actor while the terminal
+  and lifecycle updates continue to reach the item's origin and the person.
 - **Replies.** Either side may reply any number of times in every item
   state, including after answer or retraction. If supplied, `in_reply_to`
   identifies a person-authored chat turn of this item. The server derives
@@ -1975,7 +1982,15 @@ applied as well. Round 4 wins where rounds conflict:
 
 No questions are open.
 
-## Granted agents
+## Account message reads and Granted Agents
+
+Enrolled device certificates, including the ordinary Agent CLI enrollment,
+can list and read retained messages in their authenticated account through
+the existing search, item, entry, revision and download routes. These reads
+record neither Seen nor Delivered and do not advance a subscription cursor.
+An exact message ID can be used without the sender. When it matches more
+than one item, choose the intended opaque item ID before reading or retracting
+a specific item.
 
 An agent registered by the person through owner registration uses its enrolled
 agent certificate on the device listener. Its client API principal is scoped
@@ -1990,7 +2005,9 @@ prefix when the pattern ends in `/`.
 | `GET /v2/inbox?limit=&page=` | `search` for listing | The person's `InboxPage` in §4. |
 | `GET /v2/items/{item_id}`, `GET /v2/items/{item_id}/entries`, `GET /v2/items/{item_id}/revisions/{n}` | `get` for the item | The person's item, entries or revision in §4. |
 | `GET /v2/changes?after=&limit=` | none | The person's batch or SSE change feed in §6. |
-| `GET /v2/search?q=&sender=&message_id=&state=&limit=&page=` | `search` | `SearchPage`, described below. |
+| `GET /v2/search?q=&sender=&message_id=&state=&session=&limit=&page=` | `search` | `SearchPage`, described below. |
+| `GET /v2/files/{file_id}` | file download | A retained attachment in the authenticated account. |
+| `POST /v2/agent/messages/{item_id}/retract` | `retract` | The account retraction in §9.2. |
 | `POST /v2/items/{item_id}/answer` | `respond` | The body, request revision precondition, idempotency and response in §5. An item outside the answer grants answers `403 forbidden`. |
 
 Other routes answer `403 forbidden`. The usual account pause, request
@@ -2014,7 +2031,8 @@ the current message body, including strings nested inside arrays and objects.
 Object keys and non-string scalars do not match. The maximum is 1,024 UTF-8
 bytes. Omit `q` to skip the text filter. Optional `sender` and `message_id`
 are exact matches. `sender` uses the existing sender ID grammar and
-`message_id` must be nonempty. Optional `state` is one of `open`, `answered`, `cleared`,
+`message_id` must be nonempty. Optional `session` matches a retained session
+UUIDv4 exactly. Optional `state` is one of `open`, `answered`, `cleared`,
 `expired`, `superseded` or `retracted`. All supplied filters must match.
 When both `sender` and `message_id` are supplied, an empty result answers
 `404 not_found`.
