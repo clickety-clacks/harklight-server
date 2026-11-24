@@ -3,6 +3,7 @@ defmodule AttentionServer.BounceDecision do
 
   alias AttentionServer.{BouncePolicy, Engine, Message}
 
+  @defaults_published_at_ms 1_794_925_014_000
   @no_record_sentence "Harklight has no record that you saw this message."
   @advisory_fields ~w(advisory_id advisory_seq accepted_at_ms author bounce_after_days due_at_ms evaluated_at_ms kind level_name message_id origin_cursor_at_decision request_revision sender_id session_handle text advisory_type)
 
@@ -266,33 +267,97 @@ defmodule AttentionServer.BounceDecision do
   end
 
   def rebuild_indexes(%Engine{} = engine) do
-    old_waiting = flatten_waiting(engine.bounce_waiting_routes)
+    waiting = flatten_waiting(engine.bounce_waiting_routes)
 
     engine = %{
       engine
       | bounce_deadline_index: :gb_trees.empty(),
-        bounce_waiting_routes: %{},
         bounce_discussed_messages: discussed_message_index(engine),
         bounce_origin_entries: origin_entry_index(engine),
         advisory_id_index: build_advisory_id_index(engine.advisory_feeds)
     }
 
+    for {key, state} <- engine.bounce_revisions, reduce: engine do
+      current ->
+        case current_pending(current, key, state.current_substantive_revision) do
+          {due_at, _record} ->
+            item = {key, state.current_substantive_revision}
+
+            if MapSet.member?(waiting, item),
+              do: current,
+              else: put_deadline(current, due_at, key, state.current_substantive_revision)
+
+          _ ->
+            current
+        end
+    end
+  end
+
+  def resume_decisions(%Engine{} = engine) do
     Enum.reduce(engine.bounce_revisions, engine, fn {key, state}, current ->
-      case current_pending(current, key, state.current_substantive_revision) do
-        {due_at, record} when is_integer(due_at) ->
-          item = {key, state.current_substantive_revision}
+      sub = state.current_substantive_revision
 
-          if MapSet.member?(old_waiting, item) and
-               route_status(current, key, record) != :supported do
-            defer_pending(current, key, state.current_substantive_revision)
-          else
-            put_deadline(current, due_at, key, state.current_substantive_revision)
-          end
-
-        _ ->
-          current
+      with %{qualified: true, accepted_at_ms: accepted, selection: selection}
+           when accepted > @defaults_published_at_ms <- state.revisions[sub],
+           %{"decision" => "suppressed", "reason" => "opened", "advisory_id" => nil} <- selection,
+           %{terminal: nil} = record <- current.messages[key],
+           true <- opened?(current, key, sub),
+           false <- item_notice_for_revision?(record, sub) do
+        update_selection(current, key, state, sub, selection, "pending", nil, nil)
+      else
+        _ -> resume_pending(current, key, state)
       end
     end)
+  end
+
+  defp item_notice_for_revision?(record, sub) do
+    Enum.any?(Map.get(record, "item_advisories", %{}), fn {_id, notice} ->
+      notice["request_revision"] == sub
+    end)
+  end
+
+  defp resume_pending(engine, key, state) do
+    case pending_revision(state) do
+      {sub, _due} ->
+        items = Map.get(engine.bounce_waiting_routes, waiting_key(engine, key), MapSet.new())
+
+        if MapSet.member?(items, {key, sub}) and
+             state.revisions[sub].accepted_at_ms > @defaults_published_at_ms,
+           do: put_revision_state(engine, key, state),
+           else: engine
+
+      nil ->
+        engine
+    end
+  end
+
+  def evaluate_before_open(%Engine{} = engine, key, sub, at) do
+    case current_pending(engine, key, sub) do
+      {due, _record} when due <= at -> evaluate_message(engine, key, sub, at)
+      _ -> engine
+    end
+  end
+
+  def remember_open_time(engine, key, sub, at) do
+    record = Map.fetch!(engine.messages, key)
+    opened = Map.get(record, "bounce_opened_at", %{})
+
+    if Map.has_key?(opened, sub),
+      do: engine,
+      else:
+        Engine.put_row(
+          engine,
+          :messages,
+          key,
+          Map.put(record, "bounce_opened_at", Map.put(opened, sub, at))
+        )
+  end
+
+  def notice_moot?(engine, key, sub) do
+    record = Map.fetch!(engine.messages, key)
+
+    not is_nil(record.terminal) or current_substantive(engine, key) != sub or
+      person_discussed?(engine, key)
   end
 
   def advisory_ack(%Engine{} = engine, key, handle, advisory_id) do
@@ -502,13 +567,14 @@ defmodule AttentionServer.BounceDecision do
   end
 
   defp evaluate_selection(engine, key, record, state, sub_revision, revision, selection, now_ms) do
-    reason = suppression_reason(engine, key, record, state, sub_revision, now_ms)
+    due = selection["due_at_ms"]
 
-    cond do
-      reason ->
-        update_selection(engine, key, state, sub_revision, selection, "suppressed", reason, nil)
+    opened =
+      opened?(engine, key, sub_revision) and
+        Map.get(Map.get(record, "bounce_opened_at", %{}), sub_revision, 0) < due
 
-      true ->
+    case suppression_reason(engine, key, record, revision, opened, due) do
+      nil when revision.accepted_at_ms <= @defaults_published_at_ms ->
         case route_status(engine, key, record) do
           :supported ->
             append_advisory(engine, key, state, sub_revision, revision, selection, now_ms)
@@ -516,21 +582,50 @@ defmodule AttentionServer.BounceDecision do
           _ ->
             defer_pending(engine, key, sub_revision)
         end
+
+      nil when opened ->
+        append_item_advisory(
+          engine,
+          key,
+          record,
+          state,
+          sub_revision,
+          revision,
+          selection,
+          now_ms,
+          "soft_bounce"
+        )
+
+      nil ->
+        if legacy_feed?(engine, key, record) and not opened?(engine, key, sub_revision),
+          do: append_advisory(engine, key, state, sub_revision, revision, selection, now_ms),
+          else:
+            append_item_advisory(
+              engine,
+              key,
+              record,
+              state,
+              sub_revision,
+              revision,
+              selection,
+              now_ms,
+              "unseen_interval_elapsed"
+            )
+
+      reason ->
+        update_selection(engine, key, state, sub_revision, selection, "suppressed", reason, nil)
     end
   end
 
-  defp suppression_reason(engine, key, record, state, sub_revision, now_ms) do
+  defp suppression_reason(engine, key, record, revision, opened, due) do
     cond do
-      state.current_substantive_revision != sub_revision ->
-        "superseded"
-
-      not Map.get(state.revisions[sub_revision], :qualified, false) ->
+      not revision.qualified ->
         "not_qualified"
 
       not is_nil(record.terminal) ->
         "terminal"
 
-      default_answer_due?(record, now_ms) ->
+      default_answer_due?(record, due) ->
         "default_answered"
 
       not Message.valid_message_type?(record.message["message_type"]) or
@@ -540,15 +635,54 @@ defmodule AttentionServer.BounceDecision do
       person_discussed?(engine, key) ->
         "person_discussion"
 
-      MapSet.member?(
-        engine.opened_revisions,
-        Tuple.insert_at(key, tuple_size(key), sub_revision)
-      ) ->
+      opened and revision.accepted_at_ms <= @defaults_published_at_ms ->
         "opened"
 
       true ->
         nil
     end
+  end
+
+  def opened?(engine, key, sub),
+    do: MapSet.member?(engine.opened_revisions, Tuple.insert_at(key, tuple_size(key), sub))
+
+  defp legacy_feed?(engine, {person, _, _}, record),
+    do: Map.has_key?(engine.origin_sessions, {person, record.origin, record.session_handle})
+
+  defp append_item_advisory(engine, key, record, state, sub, revision, selection, now_ms, kind) do
+    opened = kind == "soft_bounce"
+
+    notice = %{
+      "advisory_id" => uuid_v4(),
+      "advisory_type" => kind,
+      "author" => "server",
+      "request_revision" => sub,
+      "accepted_at_ms" => revision.accepted_at_ms,
+      "due_at_ms" => selection["due_at_ms"],
+      "evaluated_at_ms" => now_ms,
+      "level_name" => selection["level_name"],
+      "bounce_after_days" => selection["bounce_after_days"],
+      "text" => item_advisory_text(kind, sub, now_ms),
+      "delivered" => false
+    }
+
+    notices = Map.put(Map.get(record, "item_advisories", %{}), notice["advisory_id"], notice)
+    engine = Engine.put_row(engine, :messages, key, Map.put(record, "item_advisories", notices))
+
+    # The old reader does not project item advisories. It must still treat
+    # this revision's decision as final if it writes to this FORMAT29 store.
+    reason = if opened, do: "opened", else: "ineligible_message"
+    update_selection(engine, key, state, sub, selection, "suppressed", reason, nil)
+  end
+
+  defp item_advisory_text("unseen_interval_elapsed", sub, at) do
+    "The person had not opened this message when its bounce interval elapsed. " <>
+      "This notice concerns revision #{sub}, using records available at #{at}."
+  end
+
+  defp item_advisory_text("soft_bounce", sub, at) do
+    "The person opened this message and had not acted on it when its bounce interval elapsed. " <>
+      "It remains in their inbox. This notice concerns revision #{sub}, using records available at #{at}."
   end
 
   defp default_answer_due?(record, now_ms) do
@@ -755,17 +889,18 @@ defmodule AttentionServer.BounceDecision do
     end
   end
 
+  defp waiting_key(engine, {person, _, _} = key) do
+    case Map.get(engine.messages, key) do
+      record when is_map(record) ->
+        {person, Map.get(record, :origin), Map.get(record, :session_handle)}
+
+      _ ->
+        nil
+    end
+  end
+
   defp remove_waiting_route(engine, key, sub_revision) do
-    {person, _sender, _message_id} = key
-
-    session_key =
-      case Map.get(engine.messages, key) do
-        record when is_map(record) ->
-          {person, Map.get(record, :origin), Map.get(record, :session_handle)}
-
-        _ ->
-          nil
-      end
+    session_key = waiting_key(engine, key)
 
     case Map.get(engine.bounce_waiting_routes, session_key) do
       %MapSet{} = waiting ->

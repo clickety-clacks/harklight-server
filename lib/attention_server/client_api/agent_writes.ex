@@ -7,6 +7,8 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
 
   alias AttentionServer.{AgentChangeLog, ConversationFiles, Engine, JSON, Message, Relay}
 
+  alias AttentionServer.AgentAPI.Advisories
+
   alias AttentionServer.ClientAPI.{
     AgentResources,
     AgentShow,
@@ -265,10 +267,28 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
       with {:ok, rev} <- AgentChangeLog.head(state.store, scope),
            {:ok, message} <- replay_message(state, scope, key, receipt["include_message"]),
            {:ok, entry} <- replay_entry(state, scope, key, receipt["entry_position"]) do
-        {:ok, %{"rev" => rev} |> put_resource("message", message) |> put_resource("entry", entry)}
+        resources =
+          %{"rev" => rev}
+          |> put_resource("message", message)
+          |> put_resource("entry", entry)
+          |> refresh_advisory_ack(state.store.engine, scope, key, receipt["outcome"])
+
+        {:ok, resources}
       end
     end)
   end
+
+  defp refresh_advisory_ack(resources, engine, scope, key, %{"advisory_id" => id}) do
+    case Enum.find(Advisories.for_message(engine, scope, key), &(&1["advisory_id"] == id)) do
+      %{"moot" => true, "delivered" => delivered} ->
+        Map.merge(resources, %{"moot" => true, "delivered" => delivered})
+
+      _ ->
+        resources
+    end
+  end
+
+  defp refresh_advisory_ack(resources, _engine, _scope, _key, _outcome), do: resources
 
   defp replay_message(state, scope, key, true), do: AgentResources.message(state, scope, key)
   defp replay_message(_state, _scope, _key, false), do: {:ok, nil}
@@ -435,8 +455,8 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
     end
   end
 
-  defp apply_frame(state, agent, _operation, {:advisory_ack, session, id}, _op_id, _sources),
-    do: Relay.apply_agent_advisory_ack(state, agent, session, id)
+  defp apply_frame(state, agent, _operation, {:advisory_ack, item, id}, _op_id, _sources),
+    do: Relay.apply_agent_advisory_ack(state, item, agent, id)
 
   defp frame(_state, _scope, :session_end, %{session: session}, _op, _match, _body) do
     if Message.uuid_v4?(session),
@@ -582,23 +602,12 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
     end
   end
 
-  defp item_frame(state, {person, sender, message} = _key, record, :advisory_ack, _match, body) do
+  defp item_frame(_state, item, _record, :advisory_ack, _match, body) do
     id = body["advisory_id"]
-    session = record.session_handle
-    feed_key = {person, record.origin, session}
-    index = state.store.engine.advisory_id_index
 
-    if Message.uuid_v4?(id) do
-      with {:ok, sequence} <- Map.fetch(index, {feed_key, id}),
-           %{"sender_id" => ^sender, "message_id" => ^message} <-
-             get_in(state.store.engine.advisory_feeds, [feed_key, :entries, sequence]) do
-        {:ok, {:advisory_ack, session, id}, nil}
-      else
-        _ -> {:error, :not_found}
-      end
-    else
-      {:error, "invalid_field", "advisory_id"}
-    end
+    if Message.uuid_v4?(id),
+      do: {:ok, {:advisory_ack, item, id}, nil},
+      else: {:error, "invalid_field", "advisory_id"}
   end
 
   defp file_report(body, name) do
@@ -801,7 +810,12 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
     {message?, position, outcome} = receipt_fields(operation, fields, extras)
 
     with {:ok, rev} <- AgentChangeLog.head(state.store, scope),
-         {:ok, item_id} <- receipt_item(state, key, message? or is_integer(position)) do
+         {:ok, item_id} <-
+           receipt_item(
+             state,
+             key,
+             message? or is_integer(position) or operation == :advisory_ack
+           ) do
       {:ok,
        %{
          "agent_write" => 1,
@@ -830,7 +844,7 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
     do: {false, position, fields |> Map.take(~w(duplicate transfer use)) |> Map.put("file_id", file_id)}
 
   defp receipt_fields(:advisory_ack, fields, _extras),
-    do: {false, nil, Map.take(fields, ~w(advisory_id delivered already_delivered))}
+    do: {false, nil, Map.take(fields, ~w(advisory_id delivered already_delivered moot))}
 
   defp receipt_fields(:send, _fields, [_ | _] = warnings),
     do: {true, nil, %{"supersedes_warnings" => warnings}}

@@ -1731,9 +1731,14 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
     response
   end
 
-  for {opened, kind} <- [{false, "unseen_interval_elapsed"}, {true, "soft_bounce"}] do
+  for {scenario, opened, kind} <- [
+        {:unopened, false, "unseen_interval_elapsed"},
+        {:opened, true, "soft_bounce"},
+        {:ended, true, "soft_bounce"},
+        {:moot, true, "soft_bounce"}
+      ] do
     @tag :agent_advisory
-    test "lists and acknowledges the #{kind} advisory", ctx do
+    test "lists the #{kind} advisory for #{scenario}", ctx do
       alias AttentionServer.{BounceDecision, BouncePolicy, Store}
 
       :sys.replace_state(ctx.relay, fn state ->
@@ -1751,7 +1756,7 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
             action: "configure_fixture"
           })
 
-        %{state | store: store}
+        %{state | store: store, clock: fn -> 1_795_507_200_000 end}
       end)
 
       sent =
@@ -1822,6 +1827,11 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
                  })
       end
 
+      if unquote(scenario) == :ended do
+        path = "/v2/agent/sessions/#{@first_session}/end"
+        assert request(ctx, "a1", "POST", path, %{}, 10).status == 200
+      end
+
       commit_fixture.(&BounceDecision.evaluate_due(&1, at + 86_400_001))
 
       assert %{
@@ -1839,17 +1849,75 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
                ]
              } = decode_response(get(ctx, "a1", "/v2/agent/messages"))
 
+      assert %{"changes" => changes, "rev" => cursor} =
+               decode_response(get(ctx, "a1", "/v2/agent/changes?after=0"))
+
+      assert Enum.any?(changes, fn
+               %{"kind" => "advisory", "data" => %{"item_id" => ^id, "advisory" => notice}} ->
+                 notice["advisory_id"] == advisory_id and
+                   notice["advisory_type"] == unquote(kind) and
+                   notice["evaluated_at_ms"] == at + 86_400_001
+
+               _ ->
+                 false
+             end)
+
+      if unquote(scenario) == :ended do
+        assert %{"message" => %{"availability" => %{"state" => "gone"}}} =
+                 decode_response(get(ctx, "a1", "/v2/agent/messages/" <> id))
+      end
+
       path = "/v2/agent/messages/" <> id <> "/advisories/ack"
       body = %{"advisory_id" => advisory_id}
       assert_error(request(ctx, "a2", "POST", path, body, 2), 404, "not_found")
-      first = request(ctx, "a1", "POST", path, body, 2)
-      assert first.status == 200
 
-      assert %{"delivered" => true, "already_delivered" => false} =
-               contract(ctx, "AgentAdvisoryAckResult", first)
+      if unquote(scenario) == :moot do
+        assert %{"seq" => _} =
+                 frame(ctx, "a2", %{
+                   "type" => "answer",
+                   "op_id" => op(9),
+                   "sender_id" => sender,
+                   "message_id" => message_id,
+                   "answer" => %{"acknowledgment" => "seen"},
+                   "request_revision" => 1
+                 })
 
-      assert %{"already_delivered" => true} =
-               contract(ctx, "AgentAdvisoryAckResult", request(ctx, "a1", "POST", path, body, 3))
+        assert %{"messages" => [%{"advisories" => [notice]}]} =
+                 decode_response(get(ctx, "a1", "/v2/agent/messages"))
+
+        assert %{"advisory_id" => ^advisory_id, "moot" => true, "delivered" => false} = notice
+
+        assert %{"changes" => updates} =
+                 decode_response(get(ctx, "a1", "/v2/agent/changes?after=#{cursor}"))
+
+        assert Enum.any?(updates, fn
+                 %{"kind" => "advisory", "data" => %{"advisory" => updated}} ->
+                   updated["advisory_id"] == advisory_id and updated["moot"] == true
+
+                 _ ->
+                   false
+               end)
+
+        assert %{"advisory_id" => ^advisory_id, "moot" => true, "delivered" => false} =
+                 contract(
+                   ctx,
+                   "AgentAdvisoryAckResult",
+                   request(ctx, "a1", "POST", path, body, 2)
+                 )
+      else
+        first = request(ctx, "a1", "POST", path, body, 2)
+        assert first.status == 200
+
+        assert %{"delivered" => true, "already_delivered" => false} =
+                 contract(ctx, "AgentAdvisoryAckResult", first)
+
+        assert %{"already_delivered" => true} =
+                 contract(
+                   ctx,
+                   "AgentAdvisoryAckResult",
+                   request(ctx, "a1", "POST", path, body, 3)
+                 )
+      end
     end
   end
 

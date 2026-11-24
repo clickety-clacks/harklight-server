@@ -8,6 +8,7 @@ defmodule AttentionServer.AgentChangeLog do
   import AttentionServer.ChangeLog.SQLite, only: [all: 3, one: 3, run: 3]
 
   alias AttentionServer.{ChangeLog, Engine, RouteBIndex, Store}
+  alias AttentionServer.AgentAPI.Advisories
   alias Exqlite.Sqlite3
 
   @schema """
@@ -38,6 +39,23 @@ defmodule AttentionServer.AgentChangeLog do
     ON agent_changes (person_id, agent_key, session, rev) WHERE at_ms IS NOT NULL;
   CREATE INDEX IF NOT EXISTS agent_changes_by_age
     ON agent_changes (at_ms) WHERE at_ms IS NOT NULL;
+  -- The old FORMAT29 reader can page the original table without decoding
+  -- these resources, and shares the same monotonic position allocator.
+  CREATE TABLE IF NOT EXISTS agent_item_advisory_changes (
+    person_id TEXT NOT NULL,
+    agent_key TEXT NOT NULL,
+    resource_id TEXT NOT NULL,
+    rev INTEGER NOT NULL,
+    session TEXT,
+    at_ms INTEGER,
+    PRIMARY KEY (person_id, agent_key, resource_id)
+  ) WITHOUT ROWID;
+  CREATE INDEX IF NOT EXISTS agent_item_advisory_changes_by_rev
+    ON agent_item_advisory_changes (person_id, agent_key, rev) WHERE at_ms IS NOT NULL;
+  CREATE INDEX IF NOT EXISTS agent_item_advisory_changes_by_session
+    ON agent_item_advisory_changes (person_id, agent_key, session, rev) WHERE at_ms IS NOT NULL;
+  CREATE INDEX IF NOT EXISTS agent_item_advisory_changes_by_age
+    ON agent_item_advisory_changes (at_ms) WHERE at_ms IS NOT NULL;
   """
 
   @doc """
@@ -91,10 +109,45 @@ defmodule AttentionServer.AgentChangeLog do
       end)
       |> Enum.uniq()
 
-    advisory_rows = Enum.map(advisories, &elem(&1, 1))
+    advisory_rows =
+      (Enum.map(advisories, &elem(&1, 1)) ++ item_advisory_rows(old, next, changed, entries))
+      |> Enum.uniq()
+      |> Enum.sort()
 
     (messages ++ entries ++ advisory_rows)
     |> Enum.group_by(fn {agent, _row} -> agent end, fn {_agent, row} -> row end)
+  end
+
+  defp item_advisory_rows(old, next, changed, entries) do
+    keys =
+      (changed.messages ++ changed.bounce ++ Enum.map(entries, &elem(&1, 1)))
+      |> Enum.uniq()
+      |> Enum.sort()
+
+    for {person, _, _} = key <- keys,
+        %{origin: origin} = record <- [next.messages[key]],
+        scope = {person, origin},
+        before = Map.new(Advisories.for_message(old, scope, key), &{&1["advisory_id"], &1}),
+        notice <- Advisories.for_message(next, scope, key),
+        id = notice["advisory_id"],
+        Map.get(before, id) != notice,
+        reduce: [] do
+      results ->
+        if is_map_key(Map.get(record, "item_advisories", %{}), id) do
+          [
+            {scope, {:advisory, resource_id({:item_advisory, {key, id}}), record.session_handle}}
+            | results
+          ]
+        else
+          # The original feed already logs creation and acknowledgment. A
+          # terminal or later revision must also publish a same-ID update.
+          if before[id] && before[id]["moot"] != notice["moot"],
+            do: [
+              {scope, {:advisory, resource_id({:advisory, id}), record.session_handle}} | results
+            ],
+            else: results
+        end
+    end
   end
 
   # This evidence is person-facing. The agent's Delivered record already exists.
@@ -277,6 +330,7 @@ defmodule AttentionServer.AgentChangeLog do
                  []
                ),
              :ok <- run(db, "DELETE FROM agent_changes", []),
+             :ok <- run(db, "DELETE FROM agent_item_advisory_changes", []),
              :ok <- seed(db, engine) do
           run(db, "UPDATE agent_change_log_state SET store_version = ? WHERE id = 1", [version])
         end
@@ -349,10 +403,15 @@ defmodule AttentionServer.AgentChangeLog do
     Enum.reduce_while(rows, {:ok, head}, fn {_kind, resource_id, session}, {:ok, previous} ->
       rev = previous + 1
 
+      table =
+        if String.starts_with?(resource_id, "item-advisory:"),
+          do: "agent_item_advisory_changes",
+          else: "agent_changes"
+
       case run(
              db,
              """
-             INSERT INTO agent_changes VALUES (?, ?, ?, ?, ?, ?)
+             INSERT INTO #{table} VALUES (?, ?, ?, ?, ?, ?)
              ON CONFLICT (person_id, agent_key, resource_id) DO UPDATE SET
                rev = excluded.rev, session = excluded.session, at_ms = excluded.at_ms
              """,
@@ -431,27 +490,24 @@ defmodule AttentionServer.AgentChangeLog do
 
   def read(%Store{}, _scope, _after, _limit, _session), do: {:error, :disabled}
 
-  defp page(db, person, agent, after_rev, limit, nil) do
-    all(
-      db,
-      """
-      SELECT rev, resource_id, session FROM agent_changes
-      WHERE person_id = ? AND agent_key = ? AND rev > ? AND at_ms IS NOT NULL
-      ORDER BY rev LIMIT ?
-      """,
-      [person, agent, after_rev, limit]
-    )
-  end
-
   defp page(db, person, agent, after_rev, limit, session) do
+    {session_filter, params} =
+      case session do
+        nil -> {"", [person, agent, after_rev]}
+        _ -> {"AND session = ?", [person, agent, after_rev, session]}
+      end
+
     all(
       db,
       """
       SELECT rev, resource_id, session FROM agent_changes
-      WHERE person_id = ? AND agent_key = ? AND session = ? AND rev > ? AND at_ms IS NOT NULL
+      WHERE person_id = ? AND agent_key = ? AND rev > ? AND at_ms IS NOT NULL #{session_filter}
+      UNION ALL
+      SELECT rev, resource_id, session FROM agent_item_advisory_changes
+      WHERE person_id = ? AND agent_key = ? AND rev > ? AND at_ms IS NOT NULL #{session_filter}
       ORDER BY rev LIMIT ?
       """,
-      [person, agent, session, after_rev, limit]
+      params ++ params ++ [limit]
     )
   end
 
@@ -459,7 +515,16 @@ defmodule AttentionServer.AgentChangeLog do
   defp resource_id({:entry, seq}), do: ChangeLog.entry_resource(seq)
   defp resource_id({:advisory, id}), do: "advisory:" <> id
 
+  defp resource_id({:item_advisory, {key, id}}),
+    do: "item-advisory:" <> id <> ":" <> ChangeLog.item_resource(key)
+
   defp decode_resource(_person, "advisory:" <> id), do: {:advisory, id}
+
+  defp decode_resource(person, "item-advisory:" <> encoded) do
+    [id, item] = String.split(encoded, ":", parts: 2)
+    {:message, key} = decode_resource(person, item)
+    {:advisory, {key, id}}
+  end
 
   defp decode_resource(person, resource_id) do
     case ChangeLog.decode_resource(resource_id) do
@@ -474,17 +539,23 @@ defmodule AttentionServer.AgentChangeLog do
   still need in order to stamp snapshots.
   """
   def prune(db, before_ms) do
+    with :ok <- prune_table(db, "agent_changes", before_ms) do
+      prune_table(db, "agent_item_advisory_changes", before_ms)
+    end
+  end
+
+  defp prune_table(db, table, before_ms) do
     with {:ok, floors} <-
            all(
              db,
              """
-             SELECT person_id, agent_key, MAX(rev) FROM agent_changes
+             SELECT person_id, agent_key, MAX(rev) FROM #{table}
              WHERE at_ms < ? GROUP BY person_id, agent_key
              """,
              [before_ms]
            ),
          :ok <- raise_floors(db, floors) do
-      run(db, "UPDATE agent_changes SET at_ms = NULL, session = NULL WHERE at_ms < ?", [before_ms])
+      run(db, "UPDATE #{table} SET at_ms = NULL, session = NULL WHERE at_ms < ?", [before_ms])
     end
   end
 

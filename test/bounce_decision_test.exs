@@ -52,6 +52,7 @@ defmodule AttentionServer.BounceDecisionTest do
   defp fixture(opts \\ []) do
     configured? = Keyword.get(opts, :configured?, true)
     supported? = Keyword.get(opts, :supported?, true)
+    accepted_at = Keyword.get(opts, :accepted_at, @accepted_at)
     original_message = message()
     original_files = [attachment("upload-1")]
 
@@ -74,8 +75,8 @@ defmodule AttentionServer.BounceDecisionTest do
       message: original_message,
       origin: @origin,
       accepted_seq: 1,
-      accepted_at: @accepted_at,
-      revision_accepted_at: @accepted_at,
+      accepted_at: accepted_at,
+      revision_accepted_at: accepted_at,
       terminal: nil,
       session_handle: @handle,
       revision: 1,
@@ -389,6 +390,55 @@ defmodule AttentionServer.BounceDecisionTest do
     terminal = %{selected | messages: Map.put(selected.messages, key(), terminal_record)}
     terminal_at_due = BounceDecision.evaluate_due(terminal, due_at)
     assert selection(terminal_at_due)["reason"] == "terminal"
+  end
+
+  test "the upgrade cutoff is strict and a retained open marker can be reconsidered once" do
+    cutoff = 1_794_925_014_000
+
+    for accepted <- [cutoff, cutoff + 1] do
+      {engine, record} = fixture(accepted_at: accepted)
+      {:ok, opened, 1} = BounceDecision.record_open(engine, key(), record, 1)
+      selected = score(opened, 0.9, accepted)
+      due = selection(selected)["due_at_ms"]
+
+      # This is the old store's decision when an opened revision crossed its deadline.
+      historical =
+        put_in(selected.bounce_revisions[key()].revisions[1].selection, %{
+          selection(selected)
+          | "decision" => "suppressed",
+            "reason" => "opened"
+        })
+
+      decided =
+        historical
+        |> BounceDecision.rebuild_indexes()
+        |> BounceDecision.resume_decisions()
+        |> BounceDecision.evaluate_due(due)
+
+      notices = Map.get(decided.messages[key()], "item_advisories", %{})
+
+      if accepted == cutoff do
+        assert notices == %{}
+      else
+        assert [%{"advisory_type" => "soft_bounce"}] = Map.values(notices)
+      end
+
+      assert decided ==
+               decided
+               |> BounceDecision.resume_decisions()
+               |> BounceDecision.evaluate_due(due + 1)
+    end
+  end
+
+  test "a recorded late Open cannot turn an overdue unopened notice into a soft bounce" do
+    accepted = 1_794_925_014_001
+    {engine, record} = fixture(accepted_at: accepted)
+    {:ok, opened, 1} = BounceDecision.record_open(engine, key(), record, 1)
+    opened = BounceDecision.remember_open_time(opened, key(), 1, accepted + 300_000_000)
+    decided = score(opened, 0.9, accepted + 300_000_001)
+
+    assert [%{"advisory_type" => "unseen_interval_elapsed"}] =
+             Map.values(decided.messages[key()]["item_advisories"])
   end
 
   test "an undeclared session supports v2 advisories and leaves legacy messages pending" do
