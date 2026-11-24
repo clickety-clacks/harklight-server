@@ -773,6 +773,12 @@ What clients see:
 - The feed and batches are gap-free, but may skip intermediate states of a
   resource. Each resource appears at most once per catch-up, at its latest
   `rev`. Clients must not rely on seeing every intermediate state.
+- The person SSE backlog ends at the head captured by its first read.
+  Revisions committed after that position are live changes, even if they
+  commit while backlog pages are being sent. A newer revision can replace a
+  backlog row and arrive in the live stream. Each JSON request reads the
+  current log, so a later request can return a revision committed between
+  requests.
 - Chat turns are their own Entry resources, so no turn is ever skipped.
 - `item_removed` rows are kept as tombstones for the retention window.
 - A log row may have no client form (for example a read-position fact), but

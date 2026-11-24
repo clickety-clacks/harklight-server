@@ -306,6 +306,51 @@ defmodule AttentionServer.ClientAPIFeedClosingTest do
       end
     end
 
+    test "receipts committed between backlog pages arrive as live revisions", ctx do
+      item = forward(ctx, "backlog-handoff", 1, ctx.agent)
+      device = connect(ctx.port, ctx.certs, "b1")
+      path = "/v2/items/#{item}/replies"
+
+      {device, %{"entry" => first}} =
+        json_request(device, "POST", path, %{"text" => "First turn"}, 2)
+
+      device =
+        Enum.reduce(3..104, device, fn n, device ->
+          {device, _} = json_request(device, "POST", path, %{"text" => "Turn #{n}"}, n)
+          device
+        end)
+
+      {device, %{"entry" => late}} =
+        json_request(device, "POST", path, %{"text" => "Later backlog turn"}, 105)
+
+      {device, 200, %{"rev" => cutoff}} = batch(device, "?after=0")
+      {conn, feed, request} = gated_feed(ctx, "?after=0")
+
+      record_receipt(ctx, item, first["entry_id"], 106)
+      record_receipt(ctx, item, late["entry_id"], 107)
+      {device, 200, %{"rev" => last}} = batch(device, "?after=#{cutoff}")
+      send(request, :allow_stream_headers)
+
+      {conn, feed} = await_open(conn, feed)
+      assert feed.status == 200
+      {conn, _feed, events} = changes_through(conn, feed, last)
+      Enum.each([device, conn], &Mint.HTTP.close/1)
+
+      {backlog, live} = Enum.split_while(events, &(&1.id <= cutoff))
+      assert [%{id: rev}] = matching_entries(backlog, first["entry_id"])
+      assert rev == first["rev"]
+      assert matching_entries(backlog, late["entry_id"]) == []
+
+      for entry <- [first, late] do
+        assert [delivered, acted] = matching_entries(live, entry["entry_id"])
+        assert cutoff < delivered.id and delivered.id < acted.id
+        assert acted.data["delivery"] == %{"delivered" => true, "acted" => true}
+      end
+
+      ids = Enum.map(events, & &1.id)
+      assert ids == Enum.sort(Enum.uniq(ids))
+    end
+
     test "a caught-up stream still emits both live delivery rows from one commit", ctx do
       item = forward(ctx, "chat", 1, ctx.agent)
       device = connect(ctx.port, ctx.certs, "b1")
@@ -344,6 +389,69 @@ defmodule AttentionServer.ClientAPIFeedClosingTest do
   end
 
   ## Helpers
+
+  defp gated_feed(ctx, query) do
+    owner = self()
+    router = AttentionServer.ClientAPI.Router
+    opts = router.init(relay: ctx.relay, auth: :device)
+
+    plug = fn conn, _ ->
+      conn
+      |> Plug.Conn.register_before_send(fn conn ->
+        send(owner, {:initial_read_finished, self()})
+
+        receive do
+          :allow_stream_headers -> conn
+        after
+          5_000 -> raise "test did not release the response"
+        end
+      end)
+      |> router.call(opts)
+    end
+
+    listener =
+      start_supervised!(
+        {Bandit,
+         plug: plug,
+         scheme: :https,
+         ip: {127, 0, 0, 1},
+         port: 0,
+         certfile: Path.join(ctx.certs, "server.pem"),
+         keyfile: Path.join(ctx.certs, "server.key"),
+         startup_log: false,
+         thousand_island_options: [
+           transport_options: [
+             versions: [:"tlsv1.3"],
+             verify: :verify_peer,
+             verify_fun: AttentionServer.EnrolledLeafVerify.client_api(ctx.relay),
+             fail_if_no_peer_cert: true,
+             cacertfile: Path.join(ctx.certs, "ca.pem")
+           ]
+         ]},
+        id: make_ref()
+      )
+
+    port = ClientAPI.Listener.port(listener)
+    {conn, feed} = open_feed(connect(port, ctx.certs, "b1"), query)
+    assert_receive {:initial_read_finished, request}, 5_000
+    {conn, feed, request}
+  end
+
+  defp record_receipt(ctx, item, id, n) do
+    {agent, %{"status" => "recorded"}} =
+      json_request(
+        connect(ctx.port, ctx.certs, "a2"),
+        "POST",
+        "/v2/agent/messages/#{item}/entries/#{id}/receipt",
+        %{"outcome" => "handed"},
+        n
+      )
+
+    Mint.HTTP.close(agent)
+  end
+
+  defp matching_entries(events, id),
+    do: for(%{event: "entry", data: %{"entry_id" => ^id}} = event <- events, do: event)
 
   defp open(ctx, name) do
     conn = connect(ctx.port, ctx.certs, name)
