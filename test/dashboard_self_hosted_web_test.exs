@@ -4,10 +4,12 @@ defmodule AttentionServer.DashboardSelfHostedWebTest do
   alias AttentionServer.{DashboardReadHTTP, JSON}
 
   @origin "https://server.example.test:9443"
-  @web_commit "3434a38c86cd3069952cd67d9b0bf0650b86d224"
-  @web_archive "harklight-web-3434a38c86cd3069952cd67d9b0bf0650b86d224.tar.gz"
-  @web_archive_sha256 "563f1448b79b398abf5ace4fcb5411fed70d5b2eba01f2cdec2aeacfdeffbc5b"
+  @web_commit "f7b1f91a9c4210e0f45fc3d183fa81f434979dbf"
+  @web_archive "harklight-web-f7b1f91a9c4210e0f45fc3d183fa81f434979dbf.tar.gz"
+  @web_archive_sha256 "4665e6b173b43ab838304d74fa4e42634124edd3839f6ddbcc2799c4e917a4ff"
   @dashboard_csp "default-src 'none'; script-src 'self'; connect-src 'self'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; frame-ancestors 'none'"
+
+  @web_client_csp "default-src 'none'; script-src 'self'; connect-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' blob: data:; base-uri 'none'; frame-ancestors 'none'"
 
   defmodule Backend do
     def resolve_session(state, "active") do
@@ -92,6 +94,7 @@ defmodule AttentionServer.DashboardSelfHostedWebTest do
 
       assert response.status == 200
       assert response.resp_body == bytes
+      assert Plug.Conn.get_resp_header(response, "content-security-policy") == [@web_client_csp]
       assert Plug.Conn.get_resp_header(response, "content-type") == [content_type(relative_path)]
       assert Plug.Conn.get_resp_header(response, "cache-control") == ["no-store"]
     end)
@@ -107,7 +110,7 @@ defmodule AttentionServer.DashboardSelfHostedWebTest do
       assert response.resp_body == index
 
       assert Plug.Conn.get_resp_header(response, "content-security-policy") == [
-               "default-src 'none'; script-src 'self'; connect-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' blob: data:; base-uri 'none'; frame-ancestors 'none'"
+               @web_client_csp
              ]
     end
 
@@ -125,7 +128,7 @@ defmodule AttentionServer.DashboardSelfHostedWebTest do
       assert response.status == 200
 
       assert Plug.Conn.get_resp_header(response, "content-security-policy") == [
-               "default-src 'none'; script-src 'self'; connect-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' blob: data:; base-uri 'none'; frame-ancestors 'none'"
+               @web_client_csp
              ]
     end
   end
@@ -145,14 +148,13 @@ defmodule AttentionServer.DashboardSelfHostedWebTest do
              "default-src 'none'; script-src 'self'; connect-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' blob: data:; base-uri 'none'; frame-ancestors 'none'"
            ]
 
-    assert {:ok,
-            %{
-              "accountUrl" => "",
-              "sessionEndedPath" => "/sign-in?signed_out=1",
-              "flags" => %{"webClient" => true, "attachments" => true, "answerForms" => true}
-            } = config} = JSON.decode_line(response.resp_body <> "\n")
-
-    assert map_size(config) == 3
+    assert JSON.decode_line(response.resp_body <> "\n") ==
+             {:ok,
+              %{
+                "accountUrl" => "",
+                "sessionEndedPath" => "/sign-in?signed_out=1",
+                "flags" => %{"webClient" => true, "attachments" => true, "answerForms" => true}
+              }}
   end
 
   test "signed-out pages explain how to get a new link", %{opts: opts} do
@@ -259,6 +261,9 @@ defmodule AttentionServer.DashboardSelfHostedWebTest do
       ".woff2" -> "font/woff2"
       ".woff" -> "font/woff"
       ".map" -> "application/json"
+      ".svg" -> "image/svg+xml"
+      ".ico" -> "image/vnd.microsoft.icon"
+      ".png" -> "image/png"
     end
   end
 
