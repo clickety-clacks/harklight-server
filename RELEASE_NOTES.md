@@ -1,13 +1,3 @@
-# Unreleased
-
-The self-hosted dashboard bundles Harklight Web 0.2.1 (commit `f7b1f91`),
-with updated branding and a dedicated FYI inbox. The client enables the
-FYI inbox by default.
-
-**Compatibility.** The bundle uses the existing protocol 0.2 client API.
-The protocol compatibility baseline is Harklight app 0.2.0 and Harklight
-Agent 0.2.0.
-
 # Harklight Server v0.2.5
 
 When an owner revokes an enrolled device, affected open messages from its
