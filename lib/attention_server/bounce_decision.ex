@@ -129,12 +129,22 @@ defmodule AttentionServer.BounceDecision do
   # Progress still advances the substantive revision. Carry the person's
   # Seen flag through the existing opened marker, which bounces ignore for Progress.
   defp progress_only?(old_message, old_files, message, files) do
+    # The Agent refreshes created_at with progress. A timestamp edit alone
+    # still clears Seen.
+    progress_fields = ~w(progress created_at)
+
     Message.progress_message?(old_message) and Message.progress_message?(message) and
       old_files === files and
-      BouncePolicy.same_substance?(
-        Map.delete(old_message, "progress"),
+      not BouncePolicy.same_substance?(
+        Map.take(old_message, ["progress"]),
         [],
-        Map.delete(message, "progress"),
+        Map.take(message, ["progress"]),
+        []
+      ) and
+      BouncePolicy.same_substance?(
+        Map.drop(old_message, progress_fields),
+        [],
+        Map.drop(message, progress_fields),
         []
       )
   end
