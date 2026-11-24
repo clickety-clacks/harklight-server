@@ -1008,6 +1008,263 @@ defmodule AttentionServer.ClientAPIListenerTest do
     :ssl.close(socket)
   end
 
+  describe "Seen on Progress revisions" do
+    @describetag :progress_seen
+
+    setup ctx do
+      ctx =
+        Map.merge(
+          ctx,
+          web_origin(ctx, client_api_routes: [ClientAPI.Reads, ClientAPI.Writes, ClientAPI.Feed])
+        )
+
+      listener =
+        start_supervised!(
+          {ClientAPI.Listener,
+           relay: ctx.relay,
+           certfile: Path.join(ctx.certs, "server.pem"),
+           keyfile: Path.join(ctx.certs, "server.key"),
+           cacertfile: Path.join(ctx.certs, "ca.pem")}
+        )
+
+      {:ok, origin} =
+        DeviceIdentity.from_certificate(TLSFixtures.certificate_der!(ctx.certs, "a2"))
+
+      assert :ok = Relay.setup_sender(ctx.relay, origin, "app:test")
+
+      assert {:ok, _} =
+               Relay.setup_device_certificate(
+                 ctx.relay,
+                 ctx.person,
+                 TLSFixtures.certificate_der!(ctx.certs, "b1")
+               )
+
+      Map.put(ctx, :port, ClientAPI.Listener.port(listener))
+    end
+
+    for surface <- [:device, :browser, :agent] do
+      @tag surface: surface
+      test "#{surface} reads and streams keep Seen for progress-only revisions", ctx do
+        message = progress_message()
+        id = send_progress(ctx, message)
+        surface = ctx.surface
+
+        {path, changes, kind} =
+          case surface do
+            :agent -> {"/v2/agent/messages/#{id}", "/v2/agent/changes", "message"}
+            _ -> {"/v2/items/#{id}", "/v2/changes", "item"}
+          end
+
+        assert %{status: 200} = before = progress_request(ctx, surface, "GET", path)
+        assert json(before)[kind]["seen"] == false
+
+        seen_by = if surface == :browser, do: :browser, else: :device
+        assert %{status: 200} = opened = mark_progress_seen(ctx, seen_by, id)
+        assert json(opened)["item"]["seen"]
+
+        updates = [
+          {Map.put(message, "progress", %{"completed" => 1}), true},
+          {Map.put(message, "progress", %{"completed" => 2}), true},
+          {Map.merge(message, %{"title" => "Updated", "progress" => %{"completed" => 3}}), false},
+          {Map.merge(message, %{"title" => "Updated", "progress" => %{"completed" => 4}}), false}
+        ]
+
+        for {{update, seen}, revision} <- Enum.with_index(updates, 1) do
+          assert %{status: 200} = initial = progress_request(ctx, surface, "GET", changes)
+          cursor = json(initial)["rev"]
+          after_cursor = changes <> "?after=#{cursor}"
+
+          live = open_progress_feed(ctx, surface, after_cursor)
+          assert %{status: 200} = revised = revise_progress(ctx, id, revision, update)
+          assert json(revised)["message"]["revision"] == revision + 1
+
+          assert %{status: 200} = batch = progress_request(ctx, surface, "GET", after_cursor)
+          assert %{"changes" => rows, "more" => false} = json(batch)
+
+          assert %{"rev" => rev, "data" => projected} =
+                   Enum.find(rows, &(&1["kind"] == kind and &1["data"]["item_id"] == id))
+
+          for {conn, feed} <- [live, open_progress_feed(ctx, surface, after_cursor)] do
+            {conn, event} = progress_change_at(conn, feed, rev)
+            assert %{event: ^kind, id: ^rev, data: ^projected} = event
+            Mint.HTTP.close(conn)
+          end
+
+          assert %{status: 200} = item = progress_request(ctx, surface, "GET", path)
+          json_seen = [projected["seen"], json(item)[kind]["seen"]]
+
+          json_seen =
+            if kind == "item" do
+              assert %{status: 200} = inbox = progress_request(ctx, surface, "GET", "/v2/inbox")
+              assert %{"items" => [%{"item_id" => ^id, "seen" => inbox_seen}]} = json(inbox)
+              [inbox_seen | json_seen]
+            else
+              json_seen
+            end
+
+          assert json_seen == Enum.map(json_seen, fn _ -> seen end)
+        end
+      end
+    end
+
+    test "adding or removing progress, editing other content or files, and answering keep their existing effects",
+         ctx do
+      progress = progress_message()
+      fyi = Map.delete(progress, "progress")
+
+      file_headers = [
+        {"idempotency-key", progress_op()},
+        {"content-type", "text/plain"},
+        {"content-length", "4"},
+        {"content-disposition", "attachment; filename*=UTF-8''fixture.txt"}
+      ]
+
+      assert %{status: 201} =
+               upload =
+               progress_request(ctx, :agent, "POST", "/v2/files", file_headers, "file")
+
+      file = json(upload)["file_id"]
+
+      for {initial, revised, extra} <- [
+            {fyi, progress, %{}},
+            {progress, fyi, %{}},
+            {progress, Map.merge(progress, %{"body" => "New text", "progress" => 1}), %{}},
+            {progress, Map.put(progress, "progress", 1), %{"file_ids" => [file]}}
+          ] do
+        id = send_progress(ctx, initial)
+        path = "/v2/items/#{id}"
+        assert %{status: 200} = seen = mark_progress_seen(ctx, :device, id)
+        assert json(seen)["item"]["seen"]
+        assert %{status: 200} = revise_progress(ctx, id, 1, revised, extra)
+        assert %{status: 200} = read = progress_request(ctx, :device, "GET", path)
+        assert json(read)["item"]["seen"] == false
+      end
+
+      id = send_progress(ctx, progress)
+      headers = [{"idempotency-key", progress_op()}, {"content-type", "application/json"}]
+
+      assert %{status: 200} =
+               progress_request(
+                 ctx,
+                 :device,
+                 "POST",
+                 "/v2/items/#{id}/answer",
+                 headers,
+                 ~s({"request_revision":1,"choice":"seen"})
+               )
+
+      assert %{status: 409} =
+               refused = revise_progress(ctx, id, 1, Map.put(progress, "progress", 1))
+
+      assert json(refused)["error"] == "already_closed"
+    end
+  end
+
+  defp progress_message do
+    %{
+      "title" => "Working",
+      "created_at" => 1,
+      "message_type" => "fyi",
+      "progress" => nil,
+      "answer_ui" => %{
+        "schema" => "attention-client.actions/1",
+        "actions" => [
+          %{
+            "id" => "seen",
+            "label" => "Seen",
+            "kind" => "value",
+            "value" => %{"acknowledgment" => "seen"}
+          }
+        ]
+      }
+    }
+  end
+
+  defp send_progress(ctx, message) do
+    body = %{
+      "sender" => "app:test",
+      "session" => "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      "message" => message
+    }
+
+    assert %{status: 200} =
+             sent =
+             progress_write(ctx, "POST", "/v2/agent/messages", body, [])
+
+    json(sent)["message"]["item_id"]
+  end
+
+  defp revise_progress(ctx, id, revision, message, extra \\ %{}) do
+    progress_write(ctx, "PUT", "/v2/agent/messages/#{id}", Map.put(extra, "message", message), [
+      {"if-match", Integer.to_string(revision)}
+    ])
+  end
+
+  defp progress_write(ctx, method, path, body, headers) do
+    headers = [{"idempotency-key", progress_op()}, {"content-type", "application/json"} | headers]
+    progress_request(ctx, :agent, method, path, headers, JSON.encode!(body))
+  end
+
+  defp mark_progress_seen(ctx, surface, id) do
+    headers = [
+      {"content-type", "application/json"},
+      {"idempotency-key", progress_op()},
+      {"origin", ctx.origin}
+    ]
+
+    progress_request(ctx, surface, "POST", "/v2/items/#{id}/seen", headers)
+  end
+
+  defp progress_request(ctx, surface, method, path, headers \\ [], body \\ nil) do
+    {conn, auth} = progress_connection(ctx, surface)
+    assert {:ok, conn, response} = request(conn, method, path, auth ++ headers, body)
+    Mint.HTTP.close(conn)
+    response
+  end
+
+  defp progress_connection(ctx, :browser),
+    do: {ClientAPIFeedClient.connect(ctx.web_port, ctx.certs), [{"cookie", cookie(ctx.cookie)}]}
+
+  defp progress_connection(ctx, :device),
+    do: {ClientAPIFeedClient.connect(ctx.port, ctx.certs, "b1"), []}
+
+  defp progress_connection(ctx, :agent),
+    do: {ClientAPIFeedClient.connect(ctx.port, ctx.certs, "a2"), []}
+
+  defp open_progress_feed(ctx, surface, path) do
+    {conn, headers} = progress_connection(ctx, surface)
+
+    assert {:ok, conn, ref} =
+             Mint.HTTP.request(
+               conn,
+               "GET",
+               path,
+               [{"accept", "text/event-stream"} | headers],
+               nil
+             )
+
+    {conn, feed} =
+      ClientAPIFeedClient.await_open(conn, %{
+        ref: ref,
+        buffer: "",
+        status: nil,
+        headers: [],
+        done: false
+      })
+
+    assert feed.status == 200
+    {conn, feed}
+  end
+
+  defp progress_change_at(conn, feed, rev) do
+    case ClientAPIFeedClient.events(conn, feed, 1) do
+      {conn, _feed, [%{id: id} = event]} when id >= rev -> {conn, event}
+      {conn, feed, [_]} -> progress_change_at(conn, feed, rev)
+    end
+  end
+
+  defp progress_op, do: AttentionServer.ConversationFiles.new_upload_id()
+
   # -- web origin fixture ---------------------------------------------------
 
   defp web_origin(%{dir: dir, certs: certs}, extra) do
