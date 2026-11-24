@@ -69,7 +69,8 @@ defmodule AttentionServer.BounceDecision do
         revised_message,
         files,
         accepted_at,
-        conversation_seq
+        conversation_seq,
+        opts \\ []
       ) do
     state = Map.get(engine.bounce_revisions, key) || legacy_revision_state(record)
 
@@ -109,8 +110,32 @@ defmodule AttentionServer.BounceDecision do
             |> Map.put(sub_revision, current)
       }
 
-      {put_revision_state(engine, key, state), sub_revision, true}
+      engine = put_revision_state(engine, key, state)
+
+      engine =
+        if is_nil(Keyword.get(opts, :in_reply_to)) and
+             MapSet.member?(engine.opened_revisions, Tuple.append(key, previous_raw)) and
+             progress_only?(record.message, previous_files, revised_message, files) do
+          Engine.put_member(engine, :opened_revisions, Tuple.append(key, sub_revision))
+        else
+          engine
+        end
+
+      {engine, sub_revision, true}
     end
+  end
+
+  # Progress still advances the substantive revision. Carry the person's
+  # Seen flag through the existing opened marker, which bounces ignore for Progress.
+  defp progress_only?(old_message, old_files, message, files) do
+    Message.progress_message?(old_message) and Message.progress_message?(message) and
+      old_files === files and
+      BouncePolicy.same_substance?(
+        Map.delete(old_message, "progress"),
+        [],
+        Map.delete(message, "progress"),
+        []
+      )
   end
 
   def substantive_revision(%Engine{} = engine, key, record, raw_revision) do
