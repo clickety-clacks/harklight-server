@@ -304,7 +304,14 @@ defmodule AttentionServer.AgentChangeLogTest do
   test "open feeds and a recent batch cover sessions independently", ctx do
     relay = start(ctx)
     setup_people(relay)
-    forward(relay, "origin", "covered", 1, @session)
+    supported =
+      Map.merge(forward_frame("covered", 1, @session), %{
+        "route" => "claude-code",
+        "cli_version" => "fixture",
+        "unsupported_reason" => nil
+      })
+
+    assert %{"type" => "ok"} = request(relay, "origin", supported)
     forward(relay, "origin", "uncovered", 2, @other_session)
 
     scope = {"A", "origin", @session}
@@ -328,6 +335,13 @@ defmodule AttentionServer.AgentChangeLogTest do
              FeedActivity.item_availability(
                state.store.engine,
                key("covered"),
+               FeedActivity.activity(state)
+             )
+
+    assert %{"state" => "unsupported"} =
+             FeedActivity.item_availability(
+               state.store.engine,
+               key("uncovered"),
                FeedActivity.activity(state)
              )
 
