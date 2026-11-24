@@ -34,7 +34,7 @@ defmodule AttentionServer.AgentAPI.FeedActivity do
       %{origin: origin, session_handle: handle} = record when is_binary(handle) ->
         session = Map.get(engine.origin_sessions, {person, origin, handle})
         legacy = legacy_availability(engine, key, record)
-        {status, stamp, _} = published(session, record, legacy)
+        {status, stamp} = published(session, record, legacy)
         render(status, stamp)
 
       _ ->
@@ -44,9 +44,8 @@ defmodule AttentionServer.AgentAPI.FeedActivity do
 
   defp published(session, record, legacy) do
     case get_in(session, ["client_availability", record.accepted_seq]) do
-      {status, stamp, token} -> {status, stamp, token}
-      {status, stamp} -> {status, stamp, nil}
-      nil -> {baseline_status(record, legacy), legacy["last_detached_at"], nil}
+      {status, stamp} -> {status, stamp}
+      nil -> {baseline_status(record, legacy), legacy["last_detached_at"]}
     end
   end
 
@@ -93,33 +92,13 @@ defmodule AttentionServer.AgentAPI.FeedActivity do
       end
   end
 
-  def reset(state, rollback_token) do
-    token = if is_binary(rollback_token) and rollback_token != "", do: rollback_token
-    state = Map.put(state, :availability_rollback_token, token)
-
+  def reset(state) do
     keys =
       for {key, %{session_handle: handle}} <- state.store.engine.messages,
           is_binary(handle),
           do: key
 
-    if token do
-      # A rollback client may have read a different value at the current rev.
-      # Finish the bounded repair before the supervised HTTP listeners start.
-      keys
-      |> Stream.chunk_every(@projection_page_size)
-      |> Enum.reduce_while({:ok, state}, fn page, {:ok, state} ->
-        case apply_page(state, page) do
-          {:ok, updated} -> {:cont, {:ok, updated}}
-          {:error, _} = error -> {:halt, error}
-        end
-      end)
-      |> case do
-        {:ok, repaired} -> {:ok, Map.put(repaired, :availability_rollback_token, nil)}
-        error -> error
-      end
-    else
-      {:ok, enqueue(state, keys)}
-    end
+    enqueue(state, keys)
   end
 
   def refresh_session(state, scope) do
@@ -254,7 +233,7 @@ defmodule AttentionServer.AgentAPI.FeedActivity do
 
     result =
       Enum.reduce_while(keys, {:ok, store.engine, []}, fn key, {:ok, engine, changed} ->
-        case prepare_item(store, engine, key, activity, state.clock, state.availability_rollback_token) do
+        case prepare_item(store, engine, key, activity, state.clock) do
           {:ok, ^engine} -> {:cont, {:ok, engine, changed}}
           {:ok, updated, true} -> {:cont, {:ok, updated, [key | changed]}}
           error -> {:halt, error}
@@ -275,26 +254,24 @@ defmodule AttentionServer.AgentAPI.FeedActivity do
     end
   end
 
-  defp prepare_item(store, engine, {person, _, _} = key, activity, clock, token) do
+  defp prepare_item(store, engine, {person, _, _} = key, activity, clock) do
     with %{origin: origin, session_handle: handle} = record when is_binary(handle) <-
            Map.get(engine.messages, key),
          scope = {person, origin, handle},
          %{} = session <- Map.get(engine.origin_sessions, scope) do
       legacy = legacy_availability(engine, key, record)
       status = desired_status(engine, activity, scope, session, record, legacy)
-      {previous, stamp, applied_token} = published(session, record, legacy)
+      {previous, stamp} = published(session, record, legacy)
       prior = render(previous, stamp)
       legacy_state = render(baseline_status(record, legacy), legacy["last_detached_at"])
       rollback_mismatch? = is_binary(legacy["availability"]) and prior != legacy_state
-      forced? = is_binary(token) and token != applied_token and rollback_mismatch?
 
-      with {:ok, refresh?} <- refresh?(store, key, previous != status or forced?, rollback_mismatch?) do
+      with {:ok, refresh?} <- refresh?(store, key, previous != status, rollback_mismatch?) do
         if refresh? do
           detached_at =
             if previous == "listening" and status == "not_listening", do: clock.(), else: stamp
 
-          repaired_token = if is_binary(token), do: token, else: applied_token
-          item = {status, detached_at, repaired_token}
+          item = {status, detached_at}
           published = Map.get(session, "client_availability", %{})
 
           updated =

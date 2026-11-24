@@ -80,7 +80,6 @@ defmodule AttentionServer.Server do
       relay_opts = [
         name: relay_name,
         store_path: store_path,
-        availability_rollback_token: opts[:availability_rollback_token],
         push_enabled: false,
         deployment_mode: deployment_mode,
         jev_score_record_path: Keyword.get(opts, :jev_score_record_path),

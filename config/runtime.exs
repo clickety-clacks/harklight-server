@@ -143,7 +143,6 @@ if System.get_env("ATTENTION_SERVER_ENABLE") == "1" do
 
   server_opts = [
     store_path: System.fetch_env!("ATTENTION_SERVER_STORE_PATH"),
-    availability_rollback_token: System.get_env("ATTENTION_SERVER_AVAILABILITY_ROLLBACK_TOKEN"),
     certfile: System.fetch_env!("ATTENTION_SERVER_CERTFILE"),
     keyfile: System.fetch_env!("ATTENTION_SERVER_KEYFILE"),
     cacertfile: System.fetch_env!("ATTENTION_SERVER_CACERTFILE"),
