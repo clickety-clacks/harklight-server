@@ -5,6 +5,7 @@ defmodule AttentionServer.RevokedOriginGoneTest do
 
   @handle_a "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
   @handle_b "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+  @unsupported_handle "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
 
   setup_all do
     certs = TLSFixtures.create!()
@@ -50,7 +51,7 @@ defmodule AttentionServer.RevokedOriginGoneTest do
     response
   end
 
-  defp forward(relay, handle, message_id, operation) do
+  defp forward(relay, handle, message_id, operation, unsupported_reason \\ nil) do
     assert %{"type" => "ok"} =
              request(relay, "origin", %{
                "type" => "forward",
@@ -58,7 +59,7 @@ defmodule AttentionServer.RevokedOriginGoneTest do
                "session_handle" => handle,
                "route" => "claude-code",
                "cli_version" => "test-only",
-               "unsupported_reason" => nil,
+               "unsupported_reason" => unsupported_reason,
                "origin_listener" => false,
                "message" => %{
                  "sender_id" => "app:test",
@@ -76,6 +77,7 @@ defmodule AttentionServer.RevokedOriginGoneTest do
   } do
     forward(relay, @handle_a, "revoked-chat-a", 1)
     forward(relay, @handle_b, "revoked-chat-b", 2)
+    forward(relay, @unsupported_handle, "unsupported-chat", 4, "Legacy listening disabled")
 
     assert {:ok, _before, cursor} = RelayReaders.conversation_events(relay, "reader", 0)
     assert :ok = Relay.owner_revoke_device(relay, person, owner_key, "origin")

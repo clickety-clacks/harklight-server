@@ -7,6 +7,7 @@ defmodule AttentionServer.ClientAPIOriginParityTest do
 
   alias AttentionServer.{
     AgentChangeLog,
+    ChangeLog,
     ClientAPIFeedClient,
     DeviceIdentity,
     JSON,
@@ -18,6 +19,7 @@ defmodule AttentionServer.ClientAPIOriginParityTest do
   @agent_id "00000000-0000-4000-8000-0000000000a1"
   @origin "parity-origin"
   @session "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+  @ended_session "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
 
   setup_all do
     certs = TLSFixtures.create!()
@@ -33,17 +35,17 @@ defmodule AttentionServer.ClientAPIOriginParityTest do
     File.mkdir_p!(dir)
     on_exit(fn -> File.rm_rf!(dir) end)
 
-    server =
-      start_supervised!(
-        {Server,
-         store_path: Path.join(dir, "relay.sqlite3"),
-         certfile: Path.join(certs, "server.pem"),
-         keyfile: Path.join(certs, "server.key"),
-         cacertfile: Path.join(certs, "ca.pem"),
-         port: 0,
-         enrollment_enabled: false,
-         ip: {127, 0, 0, 1}}
-      )
+    server_opts = [
+      store_path: Path.join(dir, "relay.sqlite3"),
+      certfile: Path.join(certs, "server.pem"),
+      keyfile: Path.join(certs, "server.key"),
+      cacertfile: Path.join(certs, "ca.pem"),
+      port: 0,
+      enrollment_enabled: false,
+      ip: {127, 0, 0, 1}
+    ]
+
+    server = start_supervised!({Server, server_opts})
 
     relay = Server.relay(server)
     owner_der = TLSFixtures.certificate_der!(certs, "parity-owner")
@@ -62,6 +64,7 @@ defmodule AttentionServer.ClientAPIOriginParityTest do
     assert :ok = Relay.setup_sender(relay, keys["b1"], "app:test")
 
     %{
+      server_opts: server_opts,
       relay: relay,
       person: person,
       owner: owner,
@@ -187,8 +190,27 @@ defmodule AttentionServer.ClientAPIOriginParityTest do
     Mint.HTTP.close(second)
   end
 
-  test "owner revocation closes every agent feed of the origin key and refuses new TLS", ctx do
-    item_id(send_message(ctx, @origin, 1))
+  test "owner revocation closes feeds and records one durable gone entry per affected v2 item",
+       ctx do
+    first = item_id(send_message(ctx, @origin, 1))
+    second = item_id(send_message(ctx, @origin, 2))
+    ended = item_id(send_message(ctx, @origin, 3, %{"session" => @ended_session}))
+    assert :ok = Relay.setup_sender(ctx.relay, ctx.keys["a2"], "app:test")
+    other_origin = item_id(send_message(ctx, "a2", 4))
+    other_account = item_id(send_message(ctx, "b1", 5))
+    original_reply = person_reply(ctx, first, 7)
+    assert original_reply.status == 200
+    assert %{"entry" => %{"entry_id" => reply_id}} = decode(original_reply)
+
+    assert request(ctx, @origin, "POST", "/v2/agent/sessions/#{@ended_session}/end", %{}, 6).status ==
+             200
+
+    assert availability(ctx, "a2", first) != "gone"
+    assert availability(ctx, "a2", second) != "gone"
+    assert availability(ctx, "a2", ended) == "gone"
+
+    cursor = person_head(ctx, ctx.person)
+    other_cursor = person_head(ctx, "B")
     head = agent_head(ctx)
     feeds = for _ <- 1..2, do: open_agent_feed(ctx, head)
 
@@ -201,7 +223,64 @@ defmodule AttentionServer.ClientAPIOriginParityTest do
     end
 
     assert tls_refused?(ctx, @origin)
-    assert get(ctx, "a2", "/v2/inbox").status == 200
+    assert_gone_items(ctx, cursor, first, second, ended, other_origin)
+    assert gone_changes(ctx, "b1", other_cursor) == []
+    assert availability(ctx, "b1", other_account) != "gone"
+
+    assert :ok = Relay.owner_revoke_device(ctx.relay, ctx.person, ctx.owner, ctx.keys[@origin])
+    assert :ok = stop_supervised(Server)
+    server = start_supervised!({Server, ctx.server_opts})
+    reopened = %{ctx | relay: Server.relay(server), port: Server.port(server)}
+
+    assert tls_refused?(reopened, @origin)
+    assert_gone_items(reopened, cursor, first, second, ended, other_origin)
+
+    assert Enum.any?(
+             item_entries(reopened, first),
+             &match?(%{"kind" => "reply", "entry_id" => ^reply_id}, &1)
+           )
+
+    assert person_reply(reopened, first, 8).status == 200
+  end
+
+  defp assert_gone_items(ctx, cursor, first, second, ended, other_origin) do
+    assert gone_changes(ctx, "a2", cursor) == [first, second]
+
+    for id <- [first, second, ended] do
+      assert availability(ctx, "a2", id) == "gone"
+      assert [_entry] = Enum.filter(item_entries(ctx, id), &gone_entry?/1)
+    end
+
+    assert availability(ctx, "a2", other_origin) != "gone"
+  end
+
+  defp item_entries(ctx, id) do
+    response = get(ctx, "a2", "/v2/items/#{id}/entries")
+    assert response.status == 200
+    assert %{"entries" => entries} = decode(response)
+    entries
+  end
+
+  defp gone_changes(ctx, reader, cursor) do
+    response = get(ctx, reader, "/v2/changes?after=#{cursor}")
+    assert response.status == 200
+    assert %{"changes" => changes, "more" => false} = decode(response)
+    for %{"kind" => "entry", "data" => entry} <- changes, gone_entry?(entry), do: entry["item_id"]
+  end
+
+  defp gone_entry?(entry),
+    do: match?(%{"kind" => "availability", "availability" => %{"state" => "gone"}}, entry)
+
+  defp availability(ctx, reader, id) do
+    response = get(ctx, reader, "/v2/items/#{id}")
+    assert response.status == 200
+    assert %{"item" => %{"availability" => %{"state" => state}}} = decode(response)
+    state
+  end
+
+  defp person_head(ctx, person) do
+    assert {:ok, head} = ChangeLog.head(:sys.get_state(ctx.relay).store, person)
+    head
   end
 
   defp register_agent(ctx) do

@@ -2510,10 +2510,22 @@ defmodule AttentionServer.Engine do
   end
 
   @doc "A durable same-person availability change for open requests on one origin handle."
-  def origin_availability(%__MODULE__{} = engine, person, origin, handle, status, detached_at) do
+  def origin_availability(
+        %__MODULE__{} = engine,
+        person,
+        origin,
+        handle,
+        status,
+        detached_at,
+        protocol \\ :all
+      )
+      when protocol in [:all, :agent_v2] do
     requests =
       engine
       |> origin_availability_requests(person, origin, handle)
+      |> Enum.filter(fn {_, record} ->
+        protocol == :all or Map.get(record, :agent_api_v2, false)
+      end)
       |> Enum.sort_by(fn {_, record} -> record.accepted_seq end)
 
     write_origin_availability(
