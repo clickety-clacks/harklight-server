@@ -1842,6 +1842,9 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
       end
 
       commit_fixture.(&BounceDecision.evaluate_due(&1, at + 86_400_001))
+      # The score fixture writes the store directly, outside Relay's rank publication.
+      send(ctx.relay, :retry_client_ranks)
+      :sys.get_state(ctx.relay)
 
       assert %{
                "messages" => [
