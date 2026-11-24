@@ -1746,7 +1746,7 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
 
       :sys.replace_state(ctx.relay, fn state ->
         at = state.clock.()
-        levels = [%{"name" => "Urgent", "lower_bound" => 0, "bounce_after_days" => 1}]
+        levels = [%{"name" => "Urgent", "lower_bound" => 0, "bounce_after_days" => 0.5}]
         {:ok, normalized} = BouncePolicy.normalize_levels(levels)
 
         {:ok, configured, _} =
@@ -1821,19 +1821,59 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
 
       {:ok, before_due} = AgentChangeLog.head(:sys.get_state(ctx.relay).store, {person, ctx.keys["a1"]})
 
-      if unquote(scenario) == :late_open do
-        :sys.replace_state(ctx.relay, &%{&1 | clock: fn -> at + 86_400_001 end})
-      end
+      open = %{
+        "type" => "message_open",
+        "op_id" => op(2),
+        "sender_id" => sender,
+        "message_id" => message_id,
+        "request_revision" => 1
+      }
 
-      if unquote(opened) or unquote(scenario) == :late_open do
-        assert %{"opened" => true} =
-                 frame(ctx, "a2", %{
-                   "type" => "message_open",
-                   "op_id" => op(2),
-                   "sender_id" => sender,
-                   "message_id" => message_id,
-                   "request_revision" => 1
-                 })
+      case unquote(scenario) do
+        :late_open ->
+          forward(ctx, "a2", 20, @other_session)
+          :sys.replace_state(ctx.relay, &%{&1 | clock: fn -> at + 43_198_000 end})
+
+          # Opening another item arms the Relay's real timer for the pending FYI.
+          assert %{"opened" => true} =
+                   frame(ctx, "a1", %{
+                     "type" => "message_open",
+                     "op_id" => op(21),
+                     "sender_id" => "app:test",
+                     "message_id" => "item-20",
+                     "request_revision" => 1
+                   })
+
+          state = :sys.replace_state(ctx.relay, &%{&1 | clock: fn -> at + 43_200_001 end})
+          timer = state.bounce_deadline_timer
+          due = {:bounce_due, state.bounce_deadline_generation}
+          request = {:request_line, ctx.keys["a2"], JSON.encode!(Map.put(open, "v", 1)) <> "\n"}
+
+          :ok = :sys.suspend(ctx.relay)
+
+          request_id =
+            try do
+              request_id = :gen_server.send_request(ctx.relay, request)
+              remaining = Process.read_timer(timer)
+              assert is_integer(remaining)
+              Process.sleep(remaining + 50)
+
+              {:messages, queued} = Process.info(ctx.relay, :messages)
+              open_index = Enum.find_index(queued, &match?({:"$gen_call", _, ^request}, &1))
+              timer_index = Enum.find_index(queued, &(&1 == due))
+              assert is_integer(open_index) and is_integer(timer_index) and open_index < timer_index
+              request_id
+            after
+              :ok = :sys.resume(ctx.relay)
+            end
+
+          assert {:reply, {:ok, reply}} = :gen_server.wait_response(request_id, 1_000)
+          assert {:ok, %{"opened" => true}} = JSON.decode_line(reply)
+          # A call after the queued timer must still reach the original Relay.
+          assert %{bounce_deadline_timer: nil} = :sys.get_state(ctx.relay)
+
+        _ ->
+          if unquote(opened), do: assert(%{"opened" => true} = frame(ctx, "a2", open))
       end
 
       if unquote(scenario) == :ended do
@@ -1841,7 +1881,7 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
         assert request(ctx, "a1", "POST", path, %{}, 10).status == 200
       end
 
-      commit_fixture.(&BounceDecision.evaluate_due(&1, at + 86_400_001))
+      commit_fixture.(&BounceDecision.evaluate_due(&1, at + 43_200_001))
       # The score fixture writes the store directly, outside Relay's rank publication.
       send(ctx.relay, :retry_client_ranks)
       :sys.get_state(ctx.relay)
@@ -1876,7 +1916,7 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
                %{"kind" => "advisory", "data" => %{"item_id" => ^id, "advisory" => notice}} ->
                  notice["advisory_id"] == advisory_id and
                    notice["advisory_type"] == unquote(kind) and
-                   notice["evaluated_at_ms"] == at + 86_400_001
+                   notice["evaluated_at_ms"] == at + 43_200_001
 
                _ ->
                  false

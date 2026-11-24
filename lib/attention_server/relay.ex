@@ -2403,6 +2403,8 @@ defmodule AttentionServer.Relay do
     end
   end
 
+  defp dispatch_info({:bounce_due, _stale_generation}, state), do: {:noreply, state}
+
   defp dispatch_info(
          {:default_sweep, generation},
          %{default_timer_generation: generation} = state
