@@ -2,7 +2,7 @@
 
 Harklight brings messages and questions from your AI agents into one inbox on your iPhone, so you can read them and answer without opening a terminal. This guide connects an agent to your hosted Harklight account, sends a first message to your iPhone and shows how the agent picks up your answer. It also shows how to remove the agent's access.
 
-You need a Harklight account at [app.harklight.net](https://app.harklight.net/account/sign-in), an iPhone, and a Mac or Linux computer where your agent runs. The commands use Harklight Agent 0.2.0.
+You need a Harklight account at [app.harklight.net](https://app.harklight.net/account/sign-in), an iPhone, and a Mac or Linux computer where your agent runs. The commands use Harklight Agent 0.2.1.
 
 ## Get the Harklight app
 
@@ -24,16 +24,16 @@ An invitation does not expire, but it works only once and stops working if the a
 
 ## Install Harklight Agent
 
-Download Harklight Agent 0.2.0 and `SHA256SUMS` from the [0.2.0 release](https://github.com/clickety-clacks/harklight-agent/releases/tag/v0.2.0). Choose the archive for the computer running your agent:
+Download Harklight Agent 0.2.1 and `SHA256SUMS` from the [0.2.1 release](https://github.com/clickety-clacks/harklight-agent/releases/tag/v0.2.1). Choose the archive for the computer running your agent:
 
 | Computer | Archive |
 | --- | --- |
-| Mac with Apple silicon | `harklight-agent-0.2.0-aarch64-apple-darwin.tar.gz` |
-| Mac with Intel processor | `harklight-agent-0.2.0-x86_64-apple-darwin.tar.gz` |
-| Linux on x86_64 | `harklight-agent-0.2.0-x86_64-unknown-linux-gnu.tar.gz` |
-| Linux on arm64 | `harklight-agent-0.2.0-aarch64-unknown-linux-gnu.tar.gz` |
+| Mac with Apple silicon | `harklight-agent-0.2.1-aarch64-apple-darwin.tar.gz` |
+| Mac with Intel processor | `harklight-agent-0.2.1-x86_64-apple-darwin.tar.gz` |
+| Linux on x86_64 | `harklight-agent-0.2.1-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux on arm64 | `harklight-agent-0.2.1-aarch64-unknown-linux-gnu.tar.gz` |
 
-Verify the downloaded archive against `SHA256SUMS`. On macOS run `shasum -a 256 --check --ignore-missing SHA256SUMS` in the download directory; on Linux use `sha256sum --check --ignore-missing SHA256SUMS`. Continue only if your archive is reported OK. Extract it and install the included `harklight-agent` executable on your PATH using the included README. Run `harklight-agent --version` to confirm 0.2.0. Installing the CLI does not enroll an agent or start a listener.
+Verify the downloaded archive against `SHA256SUMS`. On macOS run `shasum -a 256 --check --ignore-missing SHA256SUMS` in the download directory; on Linux use `sha256sum --check --ignore-missing SHA256SUMS`. Continue only if your archive is reported OK. Extract it and install the included `harklight-agent` executable on your PATH using the included README. Run `harklight-agent --version` to confirm 0.2.1. Installing the CLI does not enroll an agent or start a listener.
 
 ## Enroll your agent
 
@@ -96,7 +96,7 @@ harklight-agent --identity-dir ./my-agent-identity --ca-file ./harklight-agent-c
   read --session "$HARKLIGHT_SESSION"
 ```
 
-`read` prints each change as a JSON line with its `kind`, `rev` and `data`, and ends with a `caught_up` line; the first read starts with a baseline of the conversation's current state. The service records your answer or chat message as Delivered when it serves it, but reading does not start background delivery. Keep the same enrolled identity and local conversation journal. Only after the original agent session has actually received your answer does `receipt` record that handoff; `HARKLIGHT_ITEM` is the original request's returned `item_id`. For a chat message, add `--entry-id` with its `entry_id`:
+`read` prints each change as a JSON line with its `kind`, `rev` and `data`, and ends with a `caught_up` line; the first read prints the waiting messages and answers for this conversation, then `caught_up`. The service records your answer or chat message as Delivered when it serves it, but reading does not start background delivery. Keep the same enrolled identity and local conversation journal. Only after the original agent session has actually received your answer does `receipt` record that handoff; `HARKLIGHT_ITEM` is the original request's returned `item_id`. For a chat message, add `--entry-id` with its `entry_id`:
 
 ```sh
 harklight-agent --identity-dir ./my-agent-identity --ca-file ./harklight-agent-ca.pem \
@@ -138,4 +138,4 @@ Keep the existing identity directory and journal when resolving an uncertain ope
 - Message not in the app's Inbox: check in Devices that your iPhone is approved in the same Harklight account that approved the agent. Do not re-send to resolve an unknown send outcome; use `retry --op-id` as above.
 - Missing sign-in session: sign in to the intended account again on the website. Do not treat sign-in, approval, committed sending, real receipt, actual reply handling or confirmed removal as interchangeable success states.
 
-The [Agent 0.2.0 README](https://github.com/clickety-clacks/harklight-agent/blob/v0.2.0/README.md) contains the enrollment and operation-retry reference.
+The [Agent 0.2.1 README](https://github.com/clickety-clacks/harklight-agent/blob/v0.2.1/README.md) contains the enrollment and operation-retry reference.
