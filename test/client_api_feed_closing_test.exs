@@ -1,7 +1,6 @@
 defmodule AttentionServer.ClientAPIFeedClosingTest do
-  # The change feed's server-initiated ends (docs/client-api-v2.md §6): an
-  # id-less `closing` event with `revoked`, `account_paused` or
-  # `server_shutdown`, for device and browser principals.
+  # The change feed over real HTTPS for device and browser principals
+  # (docs/client-api-v2.md §6): catch-up, live changes, and closing events.
   use ExUnit.Case, async: false
 
   import AttentionServer.ClientAPIFeedClient
@@ -18,6 +17,8 @@ defmodule AttentionServer.ClientAPIFeedClosingTest do
     Server,
     TLSFixtures
   }
+
+  alias AttentionServer.ClientAPI.Resources
 
   @handle "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 
@@ -215,7 +216,245 @@ defmodule AttentionServer.ClientAPIFeedClosingTest do
     end
   end
 
+  describe "person feed catch-up" do
+    setup ctx do
+      ctx = Map.merge(ctx, web_origin(ctx))
+      reader_cert = TLSFixtures.certificate_der!(ctx.certs, "b1")
+      assert {:ok, _} = Relay.setup_device_certificate(ctx.relay, ctx.person, reader_cert)
+      der = TLSFixtures.certificate_der!(ctx.certs, "a2")
+      assert {:ok, agent} = Relay.setup_device_certificate(ctx.relay, ctx.person, der)
+      assert :ok = Relay.setup_sender(ctx.relay, agent, "app:test")
+
+      listener =
+        start_supervised!(
+          {ClientAPI.Listener,
+           relay: ctx.relay,
+           certfile: Path.join(ctx.certs, "server.pem"),
+           keyfile: Path.join(ctx.certs, "server.key"),
+           cacertfile: Path.join(ctx.certs, "ca.pem")},
+          id: make_ref()
+        )
+
+      Map.merge(ctx, %{port: ClientAPI.Listener.port(listener), agent: agent})
+    end
+
+    for principal <- [:device, :browser], transport <- [:json, :sse] do
+      test "#{principal} #{transport} catch-up publishes one latest revision per entry", ctx do
+        {device, item, first, reply, removed} = catch_up_backlog(ctx)
+        path = "/v2/items/#{item}/entries?limit=200"
+        {device, %{"entries" => expected}} = json_request(device, "GET", path)
+        Mint.HTTP.close(device)
+        expected_entries = Map.new(expected, &{&1["entry_id"], &1})
+
+        assert %{"delivery" => %{"delivered" => true, "acted" => true}} =
+                 expected_entries[first["entry_id"]]
+
+        {conn, headers} =
+          case unquote(principal) do
+            :device -> {connect(ctx.port, ctx.certs, "b1"), []}
+            :browser -> {connect(ctx.web_port, ctx.certs), [cookie(ctx)]}
+          end
+
+        {conn, 200, batch} = batch(conn, "?after=0", headers)
+
+        changes =
+          case unquote(transport) do
+            :json ->
+              # The original fact is still a raw log row. Its page must
+              # advance even though the latest revision lies on a later page.
+              after_rev = first["rev"] - 1
+              {conn, 200, skipped} = batch(conn, "?after=#{after_rev}&limit=1", headers)
+              paged = paged_changes(conn, headers, 0, batch["rev"])
+              Mint.HTTP.close(conn)
+              assert paged == batch["changes"]
+              assert skipped == %{"changes" => [], "rev" => first["rev"], "more" => true}
+              batch["changes"]
+
+            :sse ->
+              {conn, feed} = open_feed(conn, "?after=999999", [{"last-event-id", "0"} | headers])
+              {conn, feed} = await_open(conn, feed)
+              assert feed.status == 200
+              {conn, _feed, events} = changes_through(conn, feed, batch["rev"])
+              Mint.HTTP.close(conn)
+
+              for event <- events do
+                %{"kind" => event.event, "rev" => event.id, "data" => event.data}
+              end
+          end
+
+        revs = Enum.map(changes, & &1["rev"])
+        assert revs == Enum.sort(Enum.uniq(revs))
+
+        entries = for %{"kind" => "entry", "data" => entry} <- changes, do: entry
+        assert length(entries) == length(expected)
+        assert Map.new(entries, &{&1["entry_id"], &1}) == expected_entries
+
+        assert [%{"chat" => %{"read_position" => ^reply, "unread_replies" => 0}}] =
+                 for(
+                   %{"kind" => "item", "data" => %{"item_id" => ^item} = row} <- changes,
+                   do: row
+                 )
+
+        assert [
+                 %{
+                   "kind" => "item_removed",
+                   "rev" => batch["rev"],
+                   "data" => %{"item_id" => removed}
+                 }
+               ] ==
+                 Enum.filter(changes, &(&1["kind"] == "item_removed"))
+      end
+    end
+
+    test "an Entry updated after a backlog page can appear once more at its new revision", ctx do
+      item = forward(ctx, "backlog-handoff", 1, ctx.agent)
+      device = connect(ctx.port, ctx.certs, "b1")
+      path = "/v2/items/#{item}/replies"
+
+      {device, %{"entry" => first}} =
+        json_request(device, "POST", path, %{"text" => "First turn"}, 2)
+
+      device =
+        Enum.reduce(3..104, device, fn n, device ->
+          {device, _} = json_request(device, "POST", path, %{"text" => "Turn #{n}"}, n)
+          device
+        end)
+
+      {device, _} = json_request(device, "POST", path, %{"text" => "Turn 105"}, 105)
+      {device, 200, first_page} = batch(device, "?after=0&limit=100")
+      assert first_page["more"]
+      assert Enum.any?(first_page["changes"], &(&1["data"]["entry_id"] == first["entry_id"]))
+
+      # Gate the response after the first serialized read, before page two.
+      {conn, feed, request} = gated_feed(ctx, "?after=0")
+      record_receipt(ctx, item, first["entry_id"], 106)
+      {device, 200, %{"rev" => last}} = batch(device, "?after=0")
+      send(request, :allow_stream_headers)
+
+      {conn, feed} = await_open(conn, feed)
+      assert feed.status == 200
+      {conn, _feed, events} = changes_through(conn, feed, last)
+      Enum.each([device, conn], &Mint.HTTP.close/1)
+
+      assert [original, latest] = matching_entries(events, first["entry_id"])
+      assert original.id == first["rev"]
+      assert latest.id == last
+      assert original.data["delivery"] == %{"delivered" => false, "acted" => false}
+      assert latest.data["delivery"] == %{"delivered" => true, "acted" => true}
+
+      ids = Enum.map(events, & &1.id)
+      assert ids == Enum.sort(Enum.uniq(ids))
+
+      turns =
+        for %{event: "entry", data: %{"author" => "person", "entry_id" => id}} <- events,
+            do: id
+
+      assert Enum.frequencies(turns)[first["entry_id"]] == 2
+      assert length(Enum.uniq(turns)) == 104
+      assert length(turns) == 105
+    end
+
+    test "a caught-up stream still emits both live delivery rows from one commit", ctx do
+      item = forward(ctx, "chat", 1, ctx.agent)
+      device = connect(ctx.port, ctx.certs, "b1")
+
+      {device, %{"entry" => entry}} =
+        json_request(device, "POST", "/v2/items/#{item}/replies", %{"text" => "A live turn"}, 2)
+
+      {conn, 200, %{"rev" => before}} = batch(connect(ctx.port, ctx.certs, "b1"), "")
+      {conn, feed} = open_feed(conn, "?after=#{before}")
+      {conn, feed} = await_open(conn, feed)
+      assert feed.status == 200
+
+      # A receipt without a prior agent feed read commits Delivered and Acted together.
+      id = entry["entry_id"]
+      path = "/v2/agent/messages/#{item}/entries/#{id}/receipt"
+
+      {agent, %{"status" => "recorded"}} =
+        json_request(
+          connect(ctx.port, ctx.certs, "a2"),
+          "POST",
+          path,
+          %{"outcome" => "handed"},
+          3
+        )
+
+      {device, 200, %{"rev" => after_receipt}} = batch(device, "?after=#{before}")
+      {conn, _feed, events} = changes_through(conn, feed, after_receipt)
+
+      assert [delivered, acted] =
+               for(%{event: "entry", data: %{"entry_id" => ^id}} = event <- events, do: event)
+
+      assert before < delivered.id and delivered.id < acted.id
+      assert acted.data["delivery"] == %{"delivered" => true, "acted" => true}
+      Enum.each([conn, device, agent], &Mint.HTTP.close/1)
+    end
+  end
+
   ## Helpers
+
+  defp gated_feed(ctx, query) do
+    owner = self()
+    router = AttentionServer.ClientAPI.Router
+    opts = router.init(relay: ctx.relay, auth: :device)
+
+    plug = fn conn, _ ->
+      conn
+      |> Plug.Conn.register_before_send(fn conn ->
+        send(owner, {:initial_read_finished, self()})
+
+        receive do
+          :allow_stream_headers -> conn
+        after
+          5_000 -> raise "test did not release the response"
+        end
+      end)
+      |> router.call(opts)
+    end
+
+    listener =
+      start_supervised!(
+        {Bandit,
+         plug: plug,
+         scheme: :https,
+         ip: {127, 0, 0, 1},
+         port: 0,
+         certfile: Path.join(ctx.certs, "server.pem"),
+         keyfile: Path.join(ctx.certs, "server.key"),
+         startup_log: false,
+         thousand_island_options: [
+           transport_options: [
+             versions: [:"tlsv1.3"],
+             verify: :verify_peer,
+             verify_fun: AttentionServer.EnrolledLeafVerify.client_api(ctx.relay),
+             fail_if_no_peer_cert: true,
+             cacertfile: Path.join(ctx.certs, "ca.pem")
+           ]
+         ]},
+        id: make_ref()
+      )
+
+    port = ClientAPI.Listener.port(listener)
+    {conn, feed} = open_feed(connect(port, ctx.certs, "b1"), query)
+    assert_receive {:initial_read_finished, request}, 5_000
+    {conn, feed, request}
+  end
+
+  defp record_receipt(ctx, item, id, n) do
+    {agent, %{"status" => "recorded"}} =
+      json_request(
+        connect(ctx.port, ctx.certs, "a2"),
+        "POST",
+        "/v2/agent/messages/#{item}/entries/#{id}/receipt",
+        %{"outcome" => "handed"},
+        n
+      )
+
+    Mint.HTTP.close(agent)
+  end
+
+  defp matching_entries(events, id),
+    do: for(%{event: "entry", data: %{"entry_id" => ^id}} = event <- events, do: event)
 
   defp open(ctx, name) do
     conn = connect(ctx.port, ctx.certs, name)
@@ -227,11 +466,11 @@ defmodule AttentionServer.ClientAPIFeedClosingTest do
 
   defp cookie(ctx), do: {"cookie", "__Host-harklight=#{ctx.cookie}"}
 
-  defp forward(ctx, id, n) do
+  defp forward(ctx, id, n, origin \\ "origin") do
     frame = %{
       "v" => 1,
       "type" => "forward",
-      "op_id" => "00000000-0000-4000-8000-" <> String.pad_leading("#{n}", 12, "0"),
+      "op_id" => op(n),
       "session_handle" => @handle,
       "message" => %{
         "sender_id" => "app:test",
@@ -241,8 +480,105 @@ defmodule AttentionServer.ClientAPIFeedClosingTest do
       }
     }
 
-    assert {:ok, line} = Relay.request_line(ctx.relay, "origin", JSON.encode!(frame) <> "\n")
-    assert {:ok, %{"type" => "ok"}} = JSON.decode_line(line)
+    assert {:ok, line} = Relay.request_line(ctx.relay, origin, JSON.encode!(frame) <> "\n")
+    assert {:ok, %{"type" => "ok", "seq" => seq}} = JSON.decode_line(line)
+    Resources.item_id(%{accepted_seq: seq})
+  end
+
+  defp op(n), do: "00000000-0000-4000-8000-" <> String.pad_leading("#{n}", 12, "0")
+
+  defp json_request(conn, method, path, body \\ nil, n \\ 0) do
+    {headers, data} =
+      if body,
+        do:
+          {[{"content-type", "application/json"}, {"idempotency-key", op(n)}], JSON.encode!(body)},
+        else: {[], nil}
+
+    {:ok, conn, ref} = Mint.HTTP.request(conn, method, path, headers, data)
+    {conn, response} = collect(conn, ref)
+    assert response.status == 200, response.body
+    assert {:ok, decoded} = JSON.decode_line(response.body <> "\n")
+    {conn, decoded}
+  end
+
+  defp catch_up_backlog(ctx) do
+    item = forward(ctx, "chat", 1, ctx.agent)
+    device = connect(ctx.port, ctx.certs, "b1")
+    agent = connect(ctx.port, ctx.certs, "a2")
+    replies = "/v2/items/#{item}/replies"
+
+    {device, %{"entry" => first}} =
+      json_request(device, "POST", replies, %{"text" => "First turn"}, 2)
+
+    # Split the first turn and its acknowledgments across SSE's 100 raw rows.
+    device =
+      Enum.reduce(3..104, device, fn n, device ->
+        {device, _} = json_request(device, "POST", replies, %{"text" => "Turn #{n}"}, n)
+        device
+      end)
+
+    id = first["entry_id"]
+    agent_item = "/v2/agent/messages/#{item}"
+
+    {agent,
+     %{
+       "changes" => [%{"kind" => "message"}, %{"kind" => "entry", "data" => %{"entry_id" => ^id}}]
+     }} =
+      json_request(agent, "GET", "/v2/agent/changes?after=0&limit=2")
+
+    {agent, %{"status" => "recorded"}} =
+      json_request(
+        agent,
+        "POST",
+        "#{agent_item}/entries/#{id}/receipt",
+        %{"outcome" => "handed"},
+        105
+      )
+
+    {agent, %{"entry" => %{"entry_id" => reply}}} =
+      json_request(
+        agent,
+        "POST",
+        "#{agent_item}/replies",
+        %{"text" => "Reply", "in_reply_to" => id},
+        106
+      )
+
+    {device, _} =
+      json_request(device, "PUT", "/v2/items/#{item}/read-position", %{"entry_id" => reply}, 107)
+
+    # End on a retained tombstone, seeded because no public write removes an item.
+    removed = forward(ctx, "removed", 108, ctx.agent)
+    seed_tombstone(ctx, "removed")
+    Mint.HTTP.close(agent)
+    {device, item, first, reply, removed}
+  end
+
+  defp seed_tombstone(ctx, message_id) do
+    key = {ctx.person, "app:test", message_id}
+    pending = %{ctx.person => [{:item_removed, ChangeLog.item_resource(key)}]}
+
+    :sys.replace_state(ctx.relay, fn %{store: store} = state ->
+      assert :ok = Exqlite.Sqlite3.execute(store.db, "BEGIN IMMEDIATE")
+      assert {:ok, _} = ChangeLog.append(store.db, pending, %{}, store.version)
+      assert :ok = Exqlite.Sqlite3.execute(store.db, "COMMIT")
+      update_in(state.store.engine.messages, &Map.delete(&1, key))
+    end)
+  end
+
+  defp paged_changes(conn, headers, after_rev, head) do
+    limit = 20
+    {conn, 200, page} = batch(conn, "?after=#{after_rev}&limit=#{limit}", headers)
+    assert page["rev"] > after_rev
+    assert length(page["changes"]) <= limit
+
+    if page["more"] do
+      assert page["rev"] < head
+      page["changes"] ++ paged_changes(conn, headers, page["rev"], head)
+    else
+      assert page["rev"] == head
+      page["changes"]
+    end
   end
 
   defp eventually(fun, tries \\ 50) do
@@ -276,6 +612,7 @@ defmodule AttentionServer.ClientAPIFeedClosingTest do
          store_path: Path.join(dir, "web.sqlite3"),
          join_configuration: join,
          dashboard_origin: origin,
+         agent_fixture_mode: true,
          enrollment_fixture_mode: true},
         restart: :temporary
       )
@@ -304,7 +641,7 @@ defmodule AttentionServer.ClientAPIFeedClosingTest do
     {:ok, credential} = Relay.owner_browser_sign_in_create(relay, person, owner_key)
     {:ok, cookie, _} = DashboardBrowserSession.redeem(sessions, credential["sign_in_token"])
 
-    %{relay: relay, web_port: port, cookie: cookie, sessions: sessions}
+    %{relay: relay, person: person, web_port: port, cookie: cookie, sessions: sessions}
   end
 
   defp available_port do

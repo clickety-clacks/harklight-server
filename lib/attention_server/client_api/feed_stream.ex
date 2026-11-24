@@ -85,6 +85,7 @@ defmodule AttentionServer.ClientAPI.FeedStream do
             ctx: ctx,
             source: source,
             cursor: cursor,
+            caught_up?: false,
             watcher: watcher,
             relay: monitor(ctx.relay),
             last_show_id: nil,
@@ -118,7 +119,7 @@ defmodule AttentionServer.ClientAPI.FeedStream do
 
   # Reads and sends pages until the feed has caught up with the log.
   defp pump(conn, state) do
-    case relay_step(fn -> state.source.read(state.ctx, state.cursor, @page) end) do
+    case relay_step(fn -> read_page(state) end) do
       {:ok, changes, more, position} ->
         send_page(conn, state, changes, more, position)
 
@@ -145,17 +146,25 @@ defmodule AttentionServer.ClientAPI.FeedStream do
     end
   end
 
+  defp read_page(%{source: FeedStep, caught_up?: true} = state),
+    do: FeedStep.read_live(state.ctx, state.cursor, @page)
+
+  defp read_page(state), do: state.source.read(state.ctx, state.cursor, @page)
+
   defp send_page(conn, state, changes, more, position) do
     case Projection.capture(fn -> send_changes(conn, changes) end) do
-      {:ok, conn} -> continue(conn, %{state | cursor: position}, more)
+      {:ok, conn} ->
+        continue(conn, %{state | cursor: position}, more)
+
       {:error, %Projection{} = fault} ->
         projection_closing(conn, state, fault)
 
-      {:error, _reason} -> finish(conn, state, "client_closed")
+      {:error, _reason} ->
+        finish(conn, state, "client_closed")
     end
   end
 
-  defp continue(conn, state, false), do: wait(conn, state)
+  defp continue(conn, state, false), do: wait(conn, %{state | caught_up?: true})
 
   defp continue(conn, state, true) do
     # Ready control messages must be serviced between pages even when writes
