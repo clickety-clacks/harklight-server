@@ -191,7 +191,8 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
 
           receive do
             :start ->
-              request(ctx, "a2", "POST", path <> "/answer", %{"request_revision" => 1}, 2)
+              body = %{"request_revision" => 1, "comment" => "Concurrent answer"}
+              request(ctx, "a2", "POST", path <> "/answer", body, 2)
           end
         end)
 
