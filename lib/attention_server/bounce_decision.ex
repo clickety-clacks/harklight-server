@@ -571,7 +571,8 @@ defmodule AttentionServer.BounceDecision do
 
     opened =
       opened?(engine, key, sub_revision) and
-        Map.get(Map.get(record, "bounce_opened_at", %{}), sub_revision, 0) < due
+        (revision.accepted_at_ms <= @defaults_published_at_ms or
+           Map.get(Map.get(record, "bounce_opened_at", %{}), sub_revision, 0) < due)
 
     case suppression_reason(engine, key, record, revision, opened, due) do
       nil when revision.accepted_at_ms <= @defaults_published_at_ms ->

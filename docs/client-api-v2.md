@@ -1622,7 +1622,7 @@ surfaces the paused feed for manual resume.
           }
         }
       },
-      "if": { "properties": { "advisory_type": { "const": "unseen_interval_elapsed" } } },
+      "if": { "properties": { "advisory_type": { "enum": ["unseen_interval_elapsed", "soft_bounce"] } } },
       "then": { "required": ["text", "accepted_at_ms", "due_at_ms", "evaluated_at_ms", "level_name", "bounce_after_days", "decided_at_rev"] },
       "else": { "required": ["status"] }
     },
@@ -1650,6 +1650,7 @@ surfaces the paused feed for manual resume.
 | `entry` | Full AgentEntry |
 | `advisory` / `unseen_interval_elapsed` or `soft_bounce` | Item and advisory ID, substantive request revision, accepted/due/evaluated times, priority level and interval, text, delivered state, optional moot status and `decided_at_rev` |
 | `advisory` / `possible_contradictions` | Item and advisory ID, request revision, check status, reason and unchecked count when incomplete, and warning and matched sender/message identifiers and titles when present (`Contradictions.result`) |
+| SSE `focus`, `heartbeat`, `closing` | Ephemeral, without an SSE ID |
 
 An eligible open message or FYI produces at most one bounce advisory per
 substantive revision. An unopened revision keeps the
@@ -1667,8 +1668,6 @@ handoff. The same ID remains visible with `moot: true` in message snapshots and
 as a versioned feed update after a real outcome, substantive replacement or
 qualifying person Chat. A stale acknowledgment of a moot advisory preserves
 the current delivered state. Revocation grants no access to another key.
-
-| SSE `focus`, `heartbeat`, `closing` | Ephemeral, without an SSE ID |
 
 - A filtered feed omits changes for messages outside the named session.
   Every feed still uses the agent-wide `rev`. A batch position can be later

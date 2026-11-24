@@ -441,6 +441,23 @@ defmodule AttentionServer.BounceDecisionTest do
              Map.values(decided.messages[key()]["item_advisories"])
   end
 
+  test "a pre-cutoff Open still suppresses a notice waiting on support" do
+    {engine, record} = fixture(supported?: false)
+    selected = score(engine, 0.9, @accepted_at)
+    due = selection(selected)["due_at_ms"]
+    waiting = BounceDecision.evaluate_due(selected, due)
+    assert selection(waiting)["decision"] == "pending"
+
+    {:ok, opened, 1} = BounceDecision.record_open(waiting, key(), record, 1)
+    opened = BounceDecision.remember_open_time(opened, key(), 1, due + 1)
+    supported = put_in(opened.origin_sessions[advisory_feed_key()].support["advisory_v1"], true)
+    resumed = BounceDecision.requeue_supported_session(supported, advisory_feed_key())
+    decided = BounceDecision.evaluate_due(resumed, due + 2)
+
+    assert selection(decided)["reason"] == "opened"
+    assert BounceDecision.advisory_cursor(decided, @person, @origin, @handle) == 0
+  end
+
   test "an undeclared session supports v2 advisories and leaves legacy messages pending" do
     {engine, _record} = fixture()
     engine = update_in(engine.origin_sessions[advisory_feed_key()], &Map.delete(&1, :support))

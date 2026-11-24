@@ -33,7 +33,7 @@ defmodule AttentionServer.ClientAPISchema do
 
   defp check(defs, schema, value, at) do
     known =
-      ~w(type required properties items enum const minimum maximum exclusiveMinimum minLength maxLength pattern description additionalProperties)
+      ~w(type required properties items enum const minimum maximum exclusiveMinimum minLength maxLength pattern description additionalProperties if then else)
 
     unknown = Map.keys(schema) -- known
     if unknown != [], do: raise("unsupported schema keywords #{inspect(unknown)} at #{at}")
@@ -43,8 +43,16 @@ defmodule AttentionServer.ClientAPISchema do
       const_errors(schema, value, at) ++
       bound_errors(schema, value, at) ++
       object_errors(defs, schema, value, at) ++
-      array_errors(defs, schema, value, at)
+      array_errors(defs, schema, value, at) ++
+      composed_errors(defs, schema, value, at)
   end
+
+  defp composed_errors(defs, %{"if" => condition} = schema, value, at) do
+    branch = if check(defs, condition, value, at) == [], do: "then", else: "else"
+    check(defs, Map.get(schema, branch, %{}), value, at)
+  end
+
+  defp composed_errors(_defs, _schema, _value, _at), do: []
 
   defp type_errors(%{"type" => type}, value, at) do
     ok =
@@ -94,7 +102,7 @@ defmodule AttentionServer.ClientAPISchema do
     end)
   end
 
-  defp object_errors(defs, %{"type" => "object"} = schema, value, at) when is_map(value) do
+  defp object_errors(defs, schema, value, at) when is_map(value) do
     properties = Map.get(schema, "properties")
 
     missing =
@@ -104,7 +112,7 @@ defmodule AttentionServer.ClientAPISchema do
 
     # An object schema without properties (message content) is passed through.
     undeclared =
-      if is_map(properties),
+      if is_map(properties) and schema["type"] == "object",
         do:
           for(
             field <- Map.keys(value) -- Map.keys(properties),

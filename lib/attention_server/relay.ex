@@ -4146,6 +4146,7 @@ defmodule AttentionServer.Relay do
              "forward",
              "answer",
              "lifecycle",
+             "message_open",
              "subscribe_remote",
              "source_bind",
              "source_result",

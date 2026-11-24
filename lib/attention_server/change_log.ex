@@ -190,7 +190,7 @@ defmodule AttentionServer.ChangeLog do
   def changes(%Engine{} = old, %Engine{} = next, changed) do
     item_keys =
       [
-        changed.messages,
+        Enum.filter(changed.messages, &person_message_changed?(old, next, &1)),
         changed_keys(old.chat_read_positions, next.chat_read_positions),
         changed_keys(
           old.route_b_index.conversation_summary_by_item,
@@ -220,6 +220,12 @@ defmodule AttentionServer.ChangeLog do
       |> Enum.uniq()
 
     log_rows(next, item_keys, changed.entries, counts, settings)
+  end
+
+  # Item-associated sender advisories are absent from the person projection.
+  defp person_message_changed?(old, next, key) do
+    Map.delete(Map.get(old.messages, key, %{}), "item_advisories") !=
+      Map.delete(Map.get(next.messages, key, %{}), "item_advisories")
   end
 
   defp log_rows(next, item_keys, entry_keys, counts, settings) do
@@ -358,7 +364,7 @@ defmodule AttentionServer.ChangeLog do
 
     item_keys =
       [
-        changed.messages,
+        Enum.filter(changed.messages, &person_message_changed?(old, next, &1)),
         read_positions,
         summaries,
         changed.bounce,

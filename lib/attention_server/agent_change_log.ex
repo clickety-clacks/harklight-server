@@ -83,6 +83,8 @@ defmodule AttentionServer.AgentChangeLog do
           not listener_confirmation_only?(old, event, payload),
           do: {seq, key, payload}
 
+    advisories = advisories ++ item_advisory_rows(old, next, changed, entries)
+
     messages =
       [
         changed.messages,
@@ -110,7 +112,7 @@ defmodule AttentionServer.AgentChangeLog do
       |> Enum.uniq()
 
     advisory_rows =
-      (Enum.map(advisories, &elem(&1, 1)) ++ item_advisory_rows(old, next, changed, entries))
+      Enum.map(advisories, &elem(&1, 1))
       |> Enum.uniq()
       |> Enum.sort()
 
@@ -135,7 +137,7 @@ defmodule AttentionServer.AgentChangeLog do
       results ->
         if is_map_key(Map.get(record, "item_advisories", %{}), id) do
           [
-            {scope, {:advisory, resource_id({:item_advisory, {key, id}}), record.session_handle}}
+            {key, {scope, {:advisory, resource_id({:item_advisory, {key, id}}), record.session_handle}}}
             | results
           ]
         else
@@ -143,7 +145,7 @@ defmodule AttentionServer.AgentChangeLog do
           # terminal or later revision must also publish a same-ID update.
           if before[id] && before[id]["moot"] != notice["moot"],
             do: [
-              {scope, {:advisory, resource_id({:advisory, id}), record.session_handle}} | results
+              {key, {scope, {:advisory, resource_id({:advisory, id}), record.session_handle}}} | results
             ],
             else: results
         end

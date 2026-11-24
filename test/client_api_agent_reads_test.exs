@@ -1735,7 +1735,10 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
         {:unopened, false, "unseen_interval_elapsed"},
         {:opened, true, "soft_bounce"},
         {:ended, true, "soft_bounce"},
-        {:moot, true, "soft_bounce"}
+        {:moot, true, "soft_bounce"},
+        {:chat_moot, false, "unseen_interval_elapsed"},
+        {:chat_moot, true, "soft_bounce"},
+        {:late_open, false, "unseen_interval_elapsed"}
       ] do
     @tag :agent_advisory
     test "lists the #{kind} advisory for #{scenario}", ctx do
@@ -1816,7 +1819,13 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
         )
       end)
 
-      if unquote(opened) do
+      {:ok, before_due} = AgentChangeLog.head(:sys.get_state(ctx.relay).store, {person, ctx.keys["a1"]})
+
+      if unquote(scenario) == :late_open do
+        :sys.replace_state(ctx.relay, &%{&1 | clock: fn -> at + 86_400_001 end})
+      end
+
+      if unquote(opened) or unquote(scenario) == :late_open do
         assert %{"opened" => true} =
                  frame(ctx, "a2", %{
                    "type" => "message_open",
@@ -1838,16 +1847,24 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
                "messages" => [
                  %{
                    "item_id" => ^id,
+                   "rev" => message_rev,
                    "advisories" => [
                      %{
                        "advisory_id" => advisory_id,
                        "advisory_type" => unquote(kind),
                        "delivered" => false
-                     }
+                     } = advisory
                    ]
                  }
                ]
              } = decode_response(get(ctx, "a1", "/v2/agent/messages"))
+
+      assert ClientAPISchema.errors(ctx.defs, "AgentAdvisory", advisory) == []
+
+      if unquote(scenario) == :late_open do
+        assert before_due > 0
+        assert advisory["decided_at_rev"] == before_due
+      end
 
       assert %{"changes" => changes, "rev" => cursor} =
                decode_response(get(ctx, "a1", "/v2/agent/changes?after=0"))
@@ -1871,52 +1888,81 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
       body = %{"advisory_id" => advisory_id}
       assert_error(request(ctx, "a2", "POST", path, body, 2), 404, "not_found")
 
-      if unquote(scenario) == :moot do
-        assert %{"seq" => _} =
-                 frame(ctx, "a2", %{
-                   "type" => "answer",
-                   "op_id" => op(9),
-                   "sender_id" => sender,
-                   "message_id" => message_id,
-                   "answer" => %{"acknowledgment" => "seen"},
-                   "request_revision" => 1
-                 })
+      case unquote(scenario) do
+        :chat_moot ->
+          person_reply(ctx, id, 9)
 
-        assert %{"messages" => [%{"advisories" => [notice]}]} =
-                 decode_response(get(ctx, "a1", "/v2/agent/messages"))
+          assert %{
+                   "message" => %{
+                     "rev" => after_chat,
+                     "advisories" => [%{"advisory_id" => ^advisory_id, "moot" => true}]
+                   }
+                 } = decode_response(get(ctx, "a1", "/v2/agent/messages/" <> id))
 
-        assert %{"advisory_id" => ^advisory_id, "moot" => true, "delivered" => false} = notice
+          assert after_chat > message_rev
 
-        assert %{"changes" => updates} =
-                 decode_response(get(ctx, "a1", "/v2/agent/changes?after=#{cursor}"))
+          for filter <- ["", "&session=#{@first_session}"] do
+            assert %{"changes" => updates} =
+                     decode_response(get(ctx, "a1", "/v2/agent/changes?after=#{cursor}" <> filter))
 
-        assert Enum.any?(updates, fn
-                 %{"kind" => "advisory", "data" => %{"advisory" => updated}} ->
-                   updated["advisory_id"] == advisory_id and updated["moot"] == true
+            assert Enum.any?(updates, fn
+                     %{"kind" => "advisory", "data" => %{"advisory" => updated}} ->
+                       updated["advisory_id"] == advisory_id and updated["moot"] == true
 
-                 _ ->
-                   false
-               end)
+                     _ ->
+                       false
+                   end)
+          end
 
-        assert %{"advisory_id" => ^advisory_id, "moot" => true, "delivered" => false} =
-                 contract(
-                   ctx,
-                   "AgentAdvisoryAckResult",
-                   request(ctx, "a1", "POST", path, body, 2)
-                 )
-      else
-        first = request(ctx, "a1", "POST", path, body, 2)
-        assert first.status == 200
+        :moot ->
+          assert %{"seq" => _} =
+                   frame(ctx, "a2", %{
+                     "type" => "answer",
+                     "op_id" => op(9),
+                     "sender_id" => sender,
+                     "message_id" => message_id,
+                     "answer" => %{"acknowledgment" => "seen"},
+                     "request_revision" => 1
+                   })
 
-        assert %{"delivered" => true, "already_delivered" => false} =
-                 contract(ctx, "AgentAdvisoryAckResult", first)
+          assert %{"messages" => [%{"advisories" => [notice]}]} =
+                   decode_response(get(ctx, "a1", "/v2/agent/messages"))
 
-        assert %{"already_delivered" => true} =
-                 contract(
-                   ctx,
-                   "AgentAdvisoryAckResult",
-                   request(ctx, "a1", "POST", path, body, 3)
-                 )
+          assert %{"advisory_id" => ^advisory_id, "moot" => true, "delivered" => false} = notice
+
+          assert %{"changes" => updates} =
+                   decode_response(get(ctx, "a1", "/v2/agent/changes?after=#{cursor}"))
+
+          assert Enum.any?(updates, fn
+                   %{"kind" => "advisory", "data" => %{"advisory" => updated}} ->
+                     updated["advisory_id"] == advisory_id and updated["moot"] == true
+
+                   _ ->
+                     false
+                 end)
+
+          assert %{"advisory_id" => ^advisory_id, "moot" => true, "delivered" => false} =
+                   contract(
+                     ctx,
+                     "AgentAdvisoryAckResult",
+                     request(ctx, "a1", "POST", path, body, 2)
+                   )
+
+        _ ->
+          {:ok, person_rev} = ChangeLog.head(:sys.get_state(ctx.relay).store, person)
+          first = request(ctx, "a1", "POST", path, body, 2)
+          assert {:ok, ^person_rev} = ChangeLog.head(:sys.get_state(ctx.relay).store, person)
+          assert first.status == 200
+
+          assert %{"delivered" => true, "already_delivered" => false} =
+                   contract(ctx, "AgentAdvisoryAckResult", first)
+
+          assert %{"already_delivered" => true} =
+                   contract(
+                     ctx,
+                     "AgentAdvisoryAckResult",
+                     request(ctx, "a1", "POST", path, body, 3)
+                   )
       end
     end
   end
