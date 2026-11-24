@@ -96,7 +96,7 @@ harklight-agent --identity-dir ./my-agent-identity --ca-file ./harklight-agent-c
   read --session "$HARKLIGHT_SESSION"
 ```
 
-`read` prints each change as a JSON line with its `kind`, `rev` and `data`, and ends with a `caught_up` line; the first read starts with a baseline of the conversation's current state. The service records your answer or chat message as Delivered when it serves it, but reading does not start background delivery. Keep the same enrolled identity and local conversation journal. Only after the original agent session has actually received your answer does `receipt` record that handoff; `HARKLIGHT_ITEM` is the original request's returned `item_id`. For a chat message, add `--entry-id` with its `entry_id`:
+`read` prints each change as a JSON line with its `kind`, `rev` and `data`, and ends with a `caught_up` line; the first read prints the waiting messages and answers for this conversation, then `caught_up`. The service records your answer or chat message as Delivered when it serves it, but reading does not start background delivery. Keep the same enrolled identity and local conversation journal. Only after the original agent session has actually received your answer does `receipt` record that handoff; `HARKLIGHT_ITEM` is the original request's returned `item_id`. For a chat message, add `--entry-id` with its `entry_id`:
 
 ```sh
 harklight-agent --identity-dir ./my-agent-identity --ca-file ./harklight-agent-ca.pem \
