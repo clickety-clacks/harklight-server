@@ -1,3 +1,9 @@
+# Harklight Server v0.2.9 (upcoming)
+
+## Upgrade and recovery
+
+After a rollback to an older Server and re-upgrade, a client may show a stale availability label until it changes.
+
 # Harklight Server v0.2.8
 
 An idle live feed over HTTP/2 now stays open. The Server closed such a

@@ -14,6 +14,7 @@ defmodule AttentionServer.RouteBIndex do
       entry_positions: %{},
       advisory_sequences: %{},
       messages_by_origin_session: %{},
+      v2_origin_sessions: MapSet.new(),
       request_keys_by_id: nil,
       source_bindings: nil,
       covered_sessions_by_origin: %{},
@@ -202,6 +203,7 @@ defmodule AttentionServer.RouteBIndex do
   def put_message(index, {person, sender, id} = key, previous, record) do
     index = put_request_key(index, key, previous)
     index = put_session_message(index, key, previous, record)
+    index = put_v2_session(index, key, record)
     index = put_agent_message(index, key, previous, record)
     index = put_pending_message(index, key, previous, record)
     previous_resolved? = match?(%{terminal: terminal} when not is_nil(terminal), previous)
@@ -488,6 +490,18 @@ defmodule AttentionServer.RouteBIndex do
        do: put_in(index.entry_positions[{key, id}], seq)
 
   defp put_entry_position(index, _key, _seq, _payload), do: index
+
+  def v2_session?(index, scope), do: MapSet.member?(index.v2_origin_sessions, scope)
+
+  defp put_v2_session(index, {person, _, _}, %{
+         agent_api_v2: true,
+         origin: origin,
+         session_handle: handle
+       })
+       when is_binary(handle),
+       do: update_in(index.v2_origin_sessions, &MapSet.put(&1, {person, origin, handle}))
+
+  defp put_v2_session(index, _, _), do: index
 
   # Message ownership and session are fixed at acceptance.
   defp put_session_message(

@@ -212,10 +212,12 @@ defmodule AttentionServer.ClientAPI.Resources do
   Rank from `ranks/4`.
   """
   def item(%Engine{} = engine, key, %{"key" => _} = rank) do
-    Projection.run(item_projection_key(engine, key), fn -> project_item(engine, key, rank) end)
+    Projection.run(item_projection_key(engine, key), fn ->
+      project_item(engine, key, rank)
+    end)
   end
 
-  defp project_item(engine, {person, sender, _id} = key, rank) do
+  defp project_item(engine, {_person, sender, _id} = key, rank) do
     record = Map.fetch!(engine.messages, key)
     revision = Map.get(record, :revision, 1)
     summary = Map.get(engine.route_b_index.conversation_summary_by_item, key, %{})
@@ -241,7 +243,7 @@ defmodule AttentionServer.ClientAPI.Resources do
     # Round 9: the effective group thread, so clients form today's thread rows
     # from adjacent items with the same (sender, thread).
     |> put_present("thread", thread)
-    |> put_present("availability", item_availability(engine, person, record, summary))
+    |> put_present("availability", AttentionServer.AgentAPI.FeedActivity.item_availability(engine, key))
     |> put_present("result", origin_result(record))
   end
 
@@ -386,21 +388,6 @@ defmodule AttentionServer.ClientAPI.Resources do
 
   defp optional_entry_id(seq) when is_integer(seq) and seq > 0, do: entry_id(seq)
   defp optional_entry_id(_), do: nil
-
-  defp item_availability(engine, person, record, summary) do
-    if is_binary(Map.get(record, :session_handle)) do
-      payload =
-        case Map.get(summary, :availability) do
-          %{payload: payload} ->
-            payload
-
-          _ ->
-            engine.events |> Map.get({person, record.accepted_seq}, %{}) |> Map.get(:payload, %{})
-        end
-
-      availability(payload)
-    end
-  end
 
   defp availability(%{"availability" => state} = payload)
        when state in ~w(listening not_listening gone unsupported) do

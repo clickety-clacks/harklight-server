@@ -863,6 +863,21 @@ defmodule AttentionServer.Store do
   """
   def commit(store, next, audit, projected_entries \\ [])
 
+  def commit(
+        %__MODULE__{mode: :keyed, change_log: true} = store,
+        %Engine{} = next,
+        %{item_refresh: keys} = audit,
+        []
+      ) do
+    touched =
+      for {person, _, _} = key <- keys, into: MapSet.new() do
+        %{origin: origin, session_handle: handle} = Map.fetch!(next.messages, key)
+        {:row, :origin_sessions, {person, origin, handle}}
+      end
+
+    commit(store, {next, touched}, audit)
+  end
+
   # A keyed store commits only the records named by the transition's touched
   # addresses. Callers that cannot supply them are refused.
   def commit(
@@ -901,6 +916,11 @@ defmodule AttentionServer.Store do
     end
   end
 
+  defp rank_change_persons(touched, _heads, %{item_refresh: _}), do: touched
+
+  defp rank_change_persons(touched, heads, _audit),
+    do: MapSet.union(touched, MapSet.new(Map.keys(heads)))
+
   # Keyed commits validate per address by default. Exceptional transitions
   # still use the whole-state validator, which also checks the state at open.
   defp commit_keyed(
@@ -931,7 +951,11 @@ defmodule AttentionServer.Store do
            ),
          {:ok, prepared} <- KeyedReference.prepare(old, next, touched, store.upload_dir),
          {:ok, blob_owners} <- update_blob_owners(store.blob_owners, prepared) do
-      log = keyed_change_log(store, next, touched, projected)
+      log =
+        case audit do
+          %{item_refresh: keys} -> AttentionServer.ChangeLog.refresh_items(old, keys)
+          _ -> keyed_change_log(store, next, touched, projected)
+        end
 
       result =
         Persistence.run(fn ->
@@ -962,8 +986,7 @@ defmodule AttentionServer.Store do
               authority_index: authority_index,
               unique_index: unique_index,
               blob_owners: blob_owners,
-              change_log_touched:
-                MapSet.union(store.change_log_touched, MapSet.new(Map.keys(heads)))
+              change_log_touched: rank_change_persons(store.change_log_touched, heads, audit)
           }
 
           Persistence.committed(committed)
@@ -1721,6 +1744,11 @@ defmodule AttentionServer.Store do
     end)
   end
 
+  # These pages only update the availability checkpoint on existing sessions.
+  # Full snapshot validation would traverse unrelated Items and their bodies.
+  defp do_commit(%__MODULE__{change_log: true} = store, next, %{item_refresh: _} = audit, []),
+    do: commit_durable(store, next, audit)
+
   defp do_commit(%__MODULE__{engine: old} = store, next, _audit, []) when old == next,
     do: {:ok, store}
 
@@ -1770,8 +1798,12 @@ defmodule AttentionServer.Store do
     # The change log's rows are found here, against the engine this process
     # already holds, and written in the snapshot's transaction.
     log =
-      if store.change_log,
-        do: AttentionServer.ChangeLog.commit_log(store.engine, next, projected_entries)
+      if store.change_log do
+        case audit do
+          %{item_refresh: keys} -> AttentionServer.ChangeLog.refresh_items(store.engine, keys)
+          _ -> AttentionServer.ChangeLog.commit_log(store.engine, next, projected_entries)
+        end
+      end
 
     result =
       with {:ok, durable_next, persisted, index} <- prepare_large_data(store, next) do
@@ -1810,8 +1842,7 @@ defmodule AttentionServer.Store do
              large_base: durable_next,
              large_persisted: persisted,
              large_index: index,
-             change_log_touched:
-               MapSet.union(store.change_log_touched, MapSet.new(Map.keys(heads)))
+             change_log_touched: rank_change_persons(store.change_log_touched, heads, audit)
          }}
 
       error ->

@@ -1501,7 +1501,7 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
                200
     end
 
-    test "ending a v2 session records gone for its open items", ctx do
+    test "ending a v2 session projects gone without adding history", ctx do
       body = %{
         "sender" => "app:test",
         "session" => @first_session,
@@ -1521,8 +1521,11 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
         contract(ctx, "AgentEntriesPage", get(ctx, "a1", route))["entries"]
       end
 
-      assert [%{"kind" => "availability", "availability" => %{"state" => "gone"}}] = entries.(id)
-      refute Enum.any?(entries.(other), &(&1["availability"]["state"] == "gone"))
+      assert %{"message" => %{"availability" => %{"state" => "gone"}}} =
+               contract(ctx, "SentMessageResponse", get(ctx, "a1", "/v2/agent/messages/#{id}"))
+
+      assert entries.(id) == []
+      assert entries.(other) == []
     end
   end
 
@@ -1597,13 +1600,13 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
         {:ok, dir} = Uploads.dir(state.store)
         path = Path.join(dir, "pre-owner-fixture")
         File.write!(path, "fixture")
-
         attrs = %{
           name: "legacy.txt",
           content_type: "text/plain",
           size: 7,
           sha256: :crypto.hash(:sha256, "fixture") |> Base.encode16(case: :lower)
         }
+
         {:ok, handle} = Uploads.stage(state.store, "A", attrs, path)
         send(test_pid, {:pre_owner_handle, handle})
         state

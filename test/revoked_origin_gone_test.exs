@@ -3,6 +3,8 @@ defmodule AttentionServer.RevokedOriginGoneTest do
 
   alias AttentionServer.{DeviceIdentity, JSON, Relay, RelayReaders, TLSFixtures}
 
+  alias AttentionServer.ClientAPI.Reads
+
   @handle_a "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
   @handle_b "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
   @unsupported_handle "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
@@ -70,7 +72,7 @@ defmodule AttentionServer.RevokedOriginGoneTest do
              })
   end
 
-  test "owner revocation retains one gone availability per open origin session and chat", %{
+  test "owner revocation publishes gone items and preserves chat history", %{
     relay: relay,
     person: person,
     owner_key: owner_key
@@ -82,19 +84,15 @@ defmodule AttentionServer.RevokedOriginGoneTest do
     assert {:ok, _before, cursor} = RelayReaders.conversation_events(relay, "reader", 0)
     assert :ok = Relay.owner_revoke_device(relay, person, owner_key, "origin")
 
-    assert {:ok, changes, next_cursor} = RelayReaders.conversation_events(relay, "reader", cursor)
-    gone = Enum.filter(changes, &(&1["kind"] == "availability"))
+    assert {:ok, [], ^cursor} = RelayReaders.conversation_events(relay, "reader", cursor)
 
-    assert Enum.sort(Enum.map(gone, & &1["session_handle"])) ==
-             Enum.sort([@handle_a, @handle_b])
-
-    assert Enum.all?(gone, &(&1["availability"] == "gone"))
-    assert length(gone) == 2
+    for id <- ~w(i1 i2 i3) do
+      assert {:ok, %{"item" => %{"availability" => %{"state" => "gone"}}}} =
+               Reads.item(relay, "reader", id)
+    end
 
     assert :ok = Relay.owner_revoke_device(relay, person, owner_key, "origin")
-
-    assert {:ok, [], ^next_cursor} =
-             RelayReaders.conversation_events(relay, "reader", next_cursor)
+    assert {:ok, [], ^cursor} = RelayReaders.conversation_events(relay, "reader", cursor)
 
     assert %{"type" => "ok"} =
              request(relay, "reader", %{
@@ -106,7 +104,7 @@ defmodule AttentionServer.RevokedOriginGoneTest do
                "text" => "Can we discuss this?"
              })
 
-    assert {:ok, chat_events, _} = RelayReaders.conversation_events(relay, "reader", next_cursor)
+    assert {:ok, chat_events, _} = RelayReaders.conversation_events(relay, "reader", cursor)
     assert Enum.any?(chat_events, &(&1["kind"] == "discussion"))
     refute Enum.any?(chat_events, &(&1["kind"] == "availability"))
   end

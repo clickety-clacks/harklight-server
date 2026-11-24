@@ -304,7 +304,14 @@ defmodule AttentionServer.AgentChangeLogTest do
   test "open feeds and a recent batch cover sessions independently", ctx do
     relay = start(ctx)
     setup_people(relay)
-    forward(relay, "origin", "covered", 1, @session)
+    supported =
+      Map.merge(forward_frame("covered", 1, @session), %{
+        "route" => "claude-code",
+        "cli_version" => "fixture",
+        "unsupported_reason" => nil
+      })
+
+    assert %{"type" => "ok"} = request(relay, "origin", supported)
     forward(relay, "origin", "uncovered", 2, @other_session)
 
     scope = {"A", "origin", @session}
@@ -324,13 +331,17 @@ defmodule AttentionServer.AgentChangeLogTest do
     assert FeedActivity.listening?(state, scope)
     refute FeedActivity.listening?(state, other)
 
-    assert get_in(state.store.engine.route_b_index, [
-             :conversation_summary_by_item,
-             key("covered"),
-             :availability,
-             :payload,
-             "availability"
-           ]) == "listening"
+    assert %{"state" => "listening"} =
+             FeedActivity.item_availability(
+               state.store.engine,
+               key("covered")
+             )
+
+    assert %{"state" => "unsupported"} =
+             FeedActivity.item_availability(
+               state.store.engine,
+               key("uncovered")
+             )
 
     FeedActivity.observe(feed, :batch)
     FeedActivity.observe(feed, :close)
@@ -350,13 +361,11 @@ defmodule AttentionServer.AgentChangeLogTest do
     state = :sys.get_state(relay)
     refute FeedActivity.listening?(state, scope)
 
-    assert get_in(state.store.engine.route_b_index, [
-             :conversation_summary_by_item,
-             key("covered"),
-             :availability,
-             :payload,
-             "availability"
-           ]) == "not_listening"
+    assert %{"state" => "not_listening"} =
+             FeedActivity.item_availability(
+               state.store.engine,
+               key("covered")
+             )
 
     GenServer.stop(relay)
   end
