@@ -29,17 +29,17 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
     File.mkdir_p!(dir)
     on_exit(fn -> File.rm_rf!(dir) end)
 
-    server =
-      start_supervised!(
-        {Server,
-         store_path: Path.join(dir, "relay.sqlite3"),
-         certfile: Path.join(certs, "server.pem"),
-         keyfile: Path.join(certs, "server.key"),
-         cacertfile: Path.join(certs, "ca.pem"),
-         port: 0,
-         enrollment_enabled: false,
-         ip: {127, 0, 0, 1}}
-      )
+    server_opts = [
+      store_path: Path.join(dir, "relay.sqlite3"),
+      certfile: Path.join(certs, "server.pem"),
+      keyfile: Path.join(certs, "server.key"),
+      cacertfile: Path.join(certs, "ca.pem"),
+      port: 0,
+      enrollment_enabled: false,
+      ip: {127, 0, 0, 1}
+    ]
+
+    server = start_supervised!({Server, server_opts})
 
     relay = Server.relay(server)
     assert :ok = Relay.setup_person(relay, "A")
@@ -61,7 +61,217 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
     assert :ok = Relay.setup_sender(relay, keys["a2"], "app:test")
     assert :ok = Relay.setup_sender(relay, keys["b1"], "app:test")
 
-    %{server: server, relay: relay, keys: keys, port: Server.port(server)}
+    %{
+      server: server,
+      server_opts: server_opts,
+      relay: relay,
+      keys: keys,
+      port: Server.port(server)
+    }
+  end
+
+  describe "delivery baseline" do
+    @baseline "/v2/agent/delivery-baseline"
+
+    test "pages pending terminal Chat and answers, and retries the served page", ctx do
+      item = forward(ctx, "a1", 1, @first_session)
+      entry = person_reply(ctx, item, 2)
+      outside = forward(ctx, "a1", 3, @other_session)
+      person_reply(ctx, outside, 4)
+
+      assert request(
+               ctx,
+               "a2",
+               "POST",
+               "/v2/items/#{item}/answer",
+               %{"request_revision" => 1, "comment" => "Answer after Chat"},
+               5
+             ).status == 200
+
+      entries = "/v2/items/#{item}/entries"
+
+      assert %{"entries" => [%{"delivery" => %{"delivered" => false}}]} =
+               decode_response(get(ctx, "a2", entries))
+
+      path = @baseline <> "?session=#{@first_session}&limit=1"
+      headers = [{"harklight-ack2", "true"}]
+      prepared = get(ctx, "a1", path, headers)
+      assert prepared.status == 200
+      assert List.keyfind(prepared.headers, "harklight-ack2", 0) == {"harklight-ack2", "true"}
+      assert %{"rev" => rev, "next_page" => page} = decode_response(prepared)
+
+      assert %{"entries" => [%{"delivery" => %{"delivered" => false}}]} =
+               decode_response(get(ctx, "a2", entries))
+
+      {first_path, first} = next_delivery_page(ctx, path, page, headers)
+
+      assert %{
+               "rev" => ^rev,
+               "changes" => [%{"kind" => "entry", "data" => %{"entry_id" => ^entry}}],
+               "next_page" => next
+             } = first
+
+      assert %{"entries" => [%{"delivery" => %{"delivered" => true, "ack2_expected" => true}}]} =
+               decode_response(get(ctx, "a2", entries))
+
+      assert :ok = stop_supervised(Server)
+      restarted = start_supervised!({Server, ctx.server_opts})
+
+      ctx = %{
+        ctx
+        | server: restarted,
+          relay: Server.relay(restarted),
+          port: Server.port(restarted)
+      }
+
+      assert %{"changes" => [%{"kind" => "entry", "data" => %{"entry_id" => ^entry}}]} =
+               decode_response(get(ctx, "a1", first_path, headers))
+
+      assert %{
+               "rev" => ^rev,
+               "changes" => [
+                 %{"kind" => "message", "data" => %{"item_id" => ^item, "terminal" => %{}}}
+               ]
+             } = last = elem(next_delivery_page(ctx, path, next, headers), 1)
+
+      if last["next_page"] do
+        assert {_path, %{"changes" => []} = tail} =
+                 next_delivery_page(ctx, path, last["next_page"], headers)
+
+        refute Map.has_key?(tail, "next_page")
+      end
+
+      assert %{"message" => %{"terminal" => %{"delivery" => %{"delivered" => true}}}} =
+               decode_response(get(ctx, "a1", "/v2/agent/messages/#{item}"))
+
+      receipt = "/v2/agent/messages/#{item}/entries/#{entry}/receipt"
+      assert request(ctx, "a1", "POST", receipt, %{"outcome" => "handed"}, 6).status == 200
+      assert %{"changes" => []} = decode_response(get(ctx, "a1", first_path, headers))
+
+      assert %{"next_page" => fresh} = decode_response(get(ctx, "a1", path, headers))
+
+      assert {_path, %{"changes" => []} = finished} =
+               next_delivery_page(ctx, path, fresh, headers)
+
+      refute Map.has_key?(finished, "next_page")
+    end
+
+    test "the attempt excludes concurrent arrivals and a new scoped attempt recovers them after expiry",
+         ctx do
+      item = forward(ctx, "a1", 1, @first_session)
+      first = person_reply(ctx, item, 2)
+      path = @baseline <> "?session=#{@first_session}"
+      assert %{"rev" => rev, "next_page" => page} = decode_response(get(ctx, "a1", path))
+
+      late = person_reply(ctx, item, 3)
+
+      assert {_path,
+              %{
+                "rev" => ^rev,
+                "changes" => [
+                  %{"kind" => "entry", "data" => %{"entry_id" => ^first}}
+                ]
+              }} = next_delivery_page(ctx, path, page, [])
+
+      assert %{"delivery" => %{"delivered" => false}} =
+               person_chat(ctx, "/v2/items/#{item}/entries", late)
+
+      assert {:ok, _} =
+               ClientAPIFeedClient.prune_changes(ctx.relay, System.system_time(:millisecond) + 1)
+
+      assert get(ctx, "a1", "/v2/agent/changes?after=#{rev}&session=#{@first_session}").status ==
+               410
+
+      assert %{"next_page" => next} = decode_response(get(ctx, "a1", path))
+
+      assert {_path,
+              %{
+                "changes" => [
+                  %{"kind" => "entry", "data" => %{"entry_id" => ^late}}
+                ]
+              }} = next_delivery_page(ctx, path, next, [])
+
+      assert %{"delivery" => %{"delivered" => true} = unknown} =
+               person_chat(ctx, "/v2/items/#{item}/entries", late)
+
+      refute Map.has_key?(unknown, "ack2_expected")
+      refute Map.has_key?(unknown, "legacy_caption")
+    end
+
+    test "a false declaration needs positive receipt and later declarations do not replace it",
+         ctx do
+      item = forward(ctx, "a1", 1, @first_session)
+      id = person_reply(ctx, item, 2)
+      path = "/v2/agent/changes?after=0&session=#{@first_session}"
+      read = "/v2/items/#{item}/entries"
+      confirm = "/v2/agent/messages/#{item}/entries/#{id}/listener-received"
+
+      response = get(ctx, "a1", path, [{"harklight-ack2", "false"}])
+      assert response.status == 200
+      assert List.keyfind(response.headers, "harklight-ack2", 0) == {"harklight-ack2", "false"}
+      conn = ClientAPIFeedClient.connect(ctx.port, ctx.certs, "a1")
+      headers = [{"accept", "text/event-stream"}, {"harklight-ack2", "true"}]
+      assert {:ok, conn, ref} = Mint.HTTP.request(conn, "GET", path, headers, nil)
+      feed = %{ref: ref, buffer: "", status: nil, headers: [], done: false}
+      {conn, feed} = ClientAPIFeedClient.await_open(conn, feed)
+      assert feed.status == 200
+      assert List.keyfind(feed.headers, "harklight-ack2", 0) == {"harklight-ack2", "true"}
+      Mint.HTTP.close(conn)
+
+      assert %{"rev" => before, "delivery" => pending} = person_chat(ctx, read, id)
+      assert pending == %{"delivered" => true, "acted" => false, "ack2_expected" => false}
+
+      assert request(ctx, "a2", "PUT", confirm, %{}, 3).status == 404
+      assert request(ctx, "a1", "PUT", confirm, %{}, 4).status == 204
+      assert %{"rev" => confirmed, "delivery" => confirmed_delivery} = person_chat(ctx, read, id)
+      assert confirmed > before
+      assert confirmed_delivery == Map.put(pending, "listener_received", true)
+      assert request(ctx, "a1", "PUT", confirm, %{}, 5).status == 204
+      assert %{"rev" => ^confirmed} = person_chat(ctx, read, id)
+
+      assert %{"features" => %{"handoff_captions" => true}} =
+               decode_response(get(ctx, "a2", "/v2/me"))
+    end
+
+    test "person delivery shows a receipt transition without conflating action and handoff",
+         ctx do
+      item = forward(ctx, "a1", 1, @first_session)
+      entry = person_reply(ctx, item, 2)
+      receipt = "/v2/agent/messages/#{item}/entries/#{entry}/receipt"
+      read = "/v2/items/#{item}/entries"
+
+      assert request(
+               ctx,
+               "a1",
+               "POST",
+               receipt,
+               %{"outcome" => "not_handed", "reason" => "Unavailable"},
+               3
+             ).status == 200
+
+      assert %{"entries" => [%{"rev" => before, "delivery" => delivery}]} =
+               decode_response(get(ctx, "a2", read))
+
+      assert %{"outcome" => "not_handed", "reason" => "Unavailable", "acted" => true} = delivery
+      refute Map.has_key?(delivery, "agent_acted")
+      refute Map.has_key?(delivery, "legacy_caption")
+
+      assert request(
+               ctx,
+               "a1",
+               "POST",
+               receipt,
+               %{"outcome" => "handed", "agent" => "Fixture", "rerouted" => true},
+               4
+             ).status == 200
+
+      assert %{"entries" => [%{"rev" => after_receipt, "delivery" => delivery}]} =
+               decode_response(get(ctx, "a2", read))
+
+      assert after_receipt > before
+      assert %{"outcome" => "handed", "agent" => "Fixture", "rerouted" => true} = delivery
+      refute Map.has_key?(delivery, "reason")
+    end
   end
 
   describe "a deterministic projection fault" do
@@ -1560,6 +1770,22 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
 
     assert %{"already_delivered" => true} =
              contract(ctx, "AgentAdvisoryAckResult", request(ctx, "a1", "POST", path, body, 3))
+  end
+
+  defp person_chat(ctx, path, id) do
+    %{"entries" => entries} = decode_response(get(ctx, "a2", path))
+    Enum.find(entries, &(&1["entry_id"] == id))
+  end
+
+  defp next_delivery_page(ctx, path, page, headers) do
+    page_path = path <> "&page=" <> URI.encode_www_form(page)
+    response = get(ctx, "a1", page_path, headers)
+    assert response.status == 200
+
+    case decode_response(response) do
+      %{"changes" => [], "next_page" => next} -> next_delivery_page(ctx, path, next, headers)
+      body -> {page_path, body}
+    end
   end
 
   defp person_reply(ctx, id, n) do

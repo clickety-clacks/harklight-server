@@ -197,6 +197,61 @@ defmodule AttentionServer.ClientAPIFeedClosingTest do
       assert Enum.map(events, & &1.id) == Enum.map(batch["changes"], & &1["rev"])
     end
 
+    test "the signed-in browser receives a Chat handoff outcome in its change feed", ctx do
+      person = :sys.get_state(ctx.relay).store.engine.devices["origin"].person
+      assert :ok = Relay.setup_device(ctx.relay, person, "reader")
+      forward(ctx, "chat", 1)
+
+      turn = %{
+        "v" => 1,
+        "type" => "discussion",
+        "sender_id" => "app:test",
+        "message_id" => "chat",
+        "request_revision" => 1,
+        "text" => "Chat from the person",
+        "op_id" => "00000000-0000-4000-8000-000000000002"
+      }
+
+      assert {:ok, line} = Relay.request_line(ctx.relay, "reader", JSON.encode_line(turn))
+      assert {:ok, %{"type" => "ok", "event_id" => event_id}} = JSON.decode_line(line)
+      conn = connect(ctx.web_port, ctx.certs)
+      {conn, 200, %{"rev" => before}} = batch(conn, "", [cookie(ctx)])
+
+      receipt = %{
+        "op_id" => "00000000-0000-4000-8000-000000000003",
+        "outcome" => "not_handed",
+        "reason" => "No consumer"
+      }
+
+      assert {:ok, %{"status" => "recorded"}} =
+               GenServer.call(
+                 ctx.relay,
+                 {:origin_ack2, "origin", String.to_integer(event_id), receipt}
+               )
+
+      {conn, 200, %{"changes" => changes}} = batch(conn, "?after=#{before}", [cookie(ctx)])
+
+      assert Enum.any?(changes, fn
+               %{
+                 "kind" => "entry",
+                 "data" => %{
+                   "delivery" =>
+                     %{
+                       "outcome" => "not_handed",
+                       "reason" => "No consumer",
+                       "acted" => true
+                     } = delivery
+                 }
+               } ->
+                 not Map.has_key?(delivery, "agent_acted")
+
+               _ ->
+                 false
+             end)
+
+      Mint.HTTP.close(conn)
+    end
+
     test "signing out ends the browser's feed with closing: revoked", ctx do
       conn = connect(ctx.web_port, ctx.certs)
       {conn, feed} = open_feed(conn, "", [cookie(ctx)])

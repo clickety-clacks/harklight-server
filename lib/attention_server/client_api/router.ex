@@ -99,6 +99,7 @@ defmodule AttentionServer.ClientAPI.Router do
     AttentionServer.ClientAPI.Writes,
     AttentionServer.ClientAPI.Feed,
     AttentionServer.AgentAPI.Feed,
+    AttentionServer.AgentAPI.DeliveryBaseline,
     AttentionServer.AgentAPI.Focus
   ]
 

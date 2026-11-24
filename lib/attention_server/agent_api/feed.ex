@@ -17,8 +17,9 @@ defmodule AttentionServer.AgentAPI.Feed do
 
     with {:ok, cursor} <- Feed.cursor(conn),
          {:ok, limit} <- Feed.limit(conn.query_params["limit"]),
-         {:ok, session} <- session(conn.query_params["session"]) do
-      ctx = %{ctx | params: Map.put(ctx.params, :session, session)}
+         {:ok, session} <- session(conn.query_params["session"]),
+         {:ok, ack2} <- capability(conn) do
+      ctx = %{ctx | params: Map.merge(ctx.params, %{session: session, ack2: ack2})}
 
       if Feed.event_stream?(conn),
         do: FeedStream.serve(conn, ctx, cursor, FeedStep),
@@ -33,7 +34,8 @@ defmodule AttentionServer.AgentAPI.Feed do
   defp batch(conn, ctx, cursor, limit) do
     case FeedStep.read(ctx, cursor, limit) do
       {:ok, changes, more, position} ->
-        conn = Feed.send_batch(conn, changes, more, position)
+        conn =
+          conn |> echo_capability(ctx.params.ack2) |> Feed.send_batch(changes, more, position)
 
         FeedActivity.observe(ctx, :batch)
 
@@ -44,11 +46,28 @@ defmodule AttentionServer.AgentAPI.Feed do
     end
   end
 
-  defp session(nil), do: {:ok, nil}
+  @doc false
+  def session(nil), do: {:ok, nil}
 
-  defp session(value) do
+  def session(value) do
     if Message.uuid_v4?(value), do: {:ok, value}, else: {:error, "session"}
   end
+
+  @doc false
+  def capability(conn) do
+    case get_req_header(conn, "harklight-ack2") do
+      [] -> {:ok, nil}
+      ["true"] -> {:ok, true}
+      ["false"] -> {:ok, false}
+      _ -> {:error, "harklight_ack2"}
+    end
+  end
+
+  @doc false
+  def echo_capability(conn, nil), do: conn
+
+  def echo_capability(conn, value),
+    do: put_resp_header(conn, "harklight-ack2", to_string(value))
 end
 
 defmodule AttentionServer.AgentAPI.FeedStep do
@@ -60,8 +79,12 @@ defmodule AttentionServer.AgentAPI.FeedStep do
 
   def scope(%{principal: %{person: person, key: key}}), do: {:agent, person, key}
 
-  def read(%{relay: relay, principal: principal, params: %{session: session}}, cursor, limit),
-    do: call(relay, {:read, principal, session, cursor, limit})
+  def read(
+        %{relay: relay, principal: principal, params: %{session: session} = params},
+        cursor,
+        limit
+      ),
+      do: call(relay, {:read, principal, session, cursor, limit, Map.get(params, :ack2)})
 
   def opened(ctx) do
     FeedActivity.observe(ctx, :open)
@@ -87,25 +110,30 @@ defmodule AttentionServer.AgentAPI.FeedStep do
   defp call(relay, request),
     do: GenServer.call(relay, {:client_api, __MODULE__, request}, :infinity)
 
-  def handle_call({:read, principal, session, cursor, limit}, _from, %{store: store} = state) do
+  def handle_call(
+        {:read, principal, session, cursor, limit, ack2},
+        _from,
+        %{store: store} = state
+      ) do
     with {:ok, agent, changes, more, position} <-
            read_rows(state, principal, session, cursor, limit),
          targets = Enum.flat_map(changes, &delivery_target/1),
-         {:ok, store} <- commit_delivery(store, agent, targets) do
+         {:ok, store} <- commit_delivery(store, agent, targets, ack2: ack2) do
       {:reply, {:ok, changes, more, position}, %{state | store: store}}
     else
       {:error, _} = error -> {:reply, error, state}
     end
   end
 
-  defp commit_delivery(store, _agent, []), do: {:ok, store}
+  @doc false
+  def commit_delivery(store, _agent, [], _opts), do: {:ok, store}
 
   # As in the legacy origin fetch, the page's cursor and payload are selected
   # before ACK1, but neither is returned until the receipt commit succeeds.
-  defp commit_delivery(store, {person, key}, targets) do
+  def commit_delivery(store, {person, key}, targets, opts) do
     targets = resolve_answers(store.engine, person, targets)
 
-    with {:ok, next} <- Engine.agent_feed_delivered(store.engine, person, key, targets),
+    with {:ok, next} <- Engine.agent_feed_delivered(store.engine, person, key, targets, opts),
          audit = delivery_audit(store.engine, next, person, key),
          {:ok, store} <- Store.commit(store, next, audit) do
       {:ok, store}
@@ -165,7 +193,8 @@ defmodule AttentionServer.AgentAPI.FeedStep do
     end)
   end
 
-  defp authorized(engine, %{kind: :device, person: person, key: key}) do
+  @doc false
+  def authorized(engine, %{kind: :device, person: person, key: key}) do
     case Engine.authorized_person(engine, key) do
       {:ok, ^person} ->
         if Map.get(engine.delivery_states, person) == "STOPPED",
@@ -177,7 +206,7 @@ defmodule AttentionServer.AgentAPI.FeedStep do
     end
   end
 
-  defp authorized(_engine, _principal), do: {:error, :unauthorized}
+  def authorized(_engine, _principal), do: {:error, :unauthorized}
 
   defp delivery_target(%{
          "kind" => "entry",

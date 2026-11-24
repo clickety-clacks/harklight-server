@@ -458,7 +458,10 @@ defmodule AttentionServer.ClientAPI.Reads do
           "state" =>
             if(Engine.delivery_stopped?(engine, principal.person), do: "paused", else: "active")
         },
-        "features" => Map.new(@client_features, &{&1, Map.get(flags, &1) == true}),
+        "features" =>
+          @client_features
+          |> Map.new(&{&1, Map.get(flags, &1) == true})
+          |> Map.put("handoff_captions", true),
         "limits" => %{
           "upload_cap_bytes_per_file" =>
             if(state.upload_cap == :none, do: "none", else: state.upload_cap),

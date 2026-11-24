@@ -217,10 +217,19 @@ Schemas use JSON Schema 2020-12. `$ref`s point into the `$defs` below.
         },
         "delivery": {
           "type": "object",
-          "description": "Receipts for a person-authored entry, folded in from today's receipt facts",
+          "description": "Delivery evidence for a person-authored Chat entry",
           "properties": {
             "delivered": { "type": "boolean" },
-            "acted": { "type": "boolean" }
+            "acted": { "type": "boolean" },
+            "outcome": { "enum": ["handed", "not_handed"] },
+            "reason": { "type": "string" },
+            "agent": { "type": "string" },
+            "rerouted": { "type": "boolean" },
+            "ack2_expected": { "type": "boolean" },
+            "listener_received": { "const": true },
+            "agent_seen": { "const": true },
+            "agent_acted": { "const": true },
+            "legacy_caption": { "const": true }
           }
         }
       }
@@ -291,7 +300,7 @@ Schemas use JSON Schema 2020-12. `$ref`s point into the `$defs` below.
         },
         "features": {
           "type": "object",
-          "description": "Server-controlled client features still behind a flag at 0.2 (§4)",
+          "description": "Server-controlled client features and optional capabilities (§4)",
           "additionalProperties": { "type": "boolean" }
         },
         "limits": {
@@ -452,9 +461,11 @@ Schemas use JSON Schema 2020-12. `$ref`s point into the `$defs` below.
 
     It is never inline on the web origin. `FileRef.content_type` carries the
     stored type, so the web client can build a typed blob to preview the file.
-- **`GET /v2/me` features.** It carries only the server-controlled client
-  features still behind a flag at 0.2. Today's three app flags are
-  classified as follows:
+- **`GET /v2/me` features.** `handoff_captions: true` advertises the
+  person Chat delivery evidence and historical projection in §5. Absent
+  or false uses the older App mapping. Refresh it with the current
+  Server/account's normal `/v2/me` lifecycle. Web uses a paired Server and
+  bundle. The Server-controlled app flags are classified as follows:
   - `progress_inbox`: on for everyone, so it is retired and not carried;
   - `server_matched_push_routing`: carried; off unless the operator turns it
     on;
@@ -576,10 +587,36 @@ Every write that succeeds answers `200`, or `201` for `POST /v2/files`, with a
 - **Replies** are accepted in every item state on an item with an agent
   conversation (`Chat.available`): open, answered, terminal, retracted but
   still visible, and while the agent is not listening. A reply to an agent
-  that is not listening is stored and delivered when the agent next reads.
+  that is not listening is stored and served on its next covering delivery
+  read, including a first read or expired-cursor recovery (§9.3).
   The API encodes no chat-closing rule, and availability is informational.
   On an item sent without a conversation (`Chat.available: false`), a reply
   is `400 unsupported`. `404` is only for items the person cannot see.
+- **Person Chat delivery.** `delivered` records Server service under §9.3.
+  Keep `acted` for existing readers. Neither proves a handoff. `outcome`
+  is absent until a handoff receipt reports `handed` or `not_handed`.
+  Include `reason`, `agent` and `rerouted` when backed by that receipt.
+  `reason` is agent-supplied text. Render it as plain text.
+  `not_handed` can advance to `handed`. Repeating an outcome or trying to
+  revert `handed` records no change. Project `agent_seen: true` only from a
+  persisted Seen receipt for that turn and `agent_acted: true` only from
+  independent persisted action for that turn. Leave either absent when no
+  such fact exists. A handoff receipt or a result on another turn supplies
+  neither. Answers and No comment retain their existing presentation.
+- **Caption evidence.** Before service use the existing availability
+  captions. After service use Sending until an explicit failure or
+  qualifying evidence. Preserve the genuine failure caption for gone or
+  unsupported conversations. Handed, same-turn Seen or independent
+  action, or a current agent reply correlated by `in_reply_to` qualifies for Delivered. Same-turn
+  evidence or the correlated reply takes precedence over `not_handed`
+  without changing it. Use the explicit reroute caption only for a handed
+  receipt with `rerouted: true` and an agent name. With
+  `ack2_expected: false`, `listener_received: true` also qualifies.
+  Time and wire `delivered` alone leave Sending. For a reliably identified
+  pre-contract served turn without an authoritative expectation or handoff
+  outcome, `legacy_caption: true` preserves its earlier caption until
+  qualifying evidence or an explicit outcome supplies the new mapping.
+  Newly served unknown turns omit it.
 - **Lifecycle** is not part of the client API. Terminal actions stay on the
   origin API. Their results are readable as `Item.terminal`, and a retraction
   also as a `lifecycle` entry.
@@ -780,6 +817,14 @@ What clients see:
   affected resource's row. A read position writes the item's row, so another
   device sees `Chat.read_position`, `unread_replies` and `reply_priority`
   change.
+- A person Chat delivery evidence change advances the Entry revision on
+  device and browser. Entry reads, write results, live changes and catch-up
+  use the same projection. Catch-up keeps the latest Entry revision across
+  the originating turn and its folded delivery facts. The first upgrade
+  to this projection can add historical evidence at an existing Entry
+  revision. When the App first sees `features.handoff_captions: true` for
+  the Server/account, refresh cached entries from the entries route and
+  replace the cached projection even at the same revision.
 
 The Server tests completeness by replaying the log, from empty and from a
 mid-log cursor, and comparing the result with a fresh snapshot.
@@ -1503,12 +1548,8 @@ Writes return 200 unless the table says otherwise. Each response schema requires
 
 The JSON and SSE transports follow §6, including batch limits,
 `Last-Event-ID` precedence, heartbeat at least every 25 seconds, and the
-closed `Closing.reason` list. The feed applies §6.1 compaction. On
-`410 cursor_expired` or a closing with `cursor_expired`, read all pages
-of `GET /v2/agent/messages` with the same session filter, rebuild each open
-item's entries and advisory state, then reopen at the first message page's
-position. On ordinary reconnect, send `Last-Event-ID`. A filtered feed
-can skip agent-wide revisions.
+closed `Closing.reason` list. The feed applies §6.1 compaction. On ordinary
+reconnect, send `Last-Event-ID`. A filtered feed can skip agent-wide revisions.
 
 The §7 projection error and client retry rules also apply to every agent
 request. A projection fault returns `500 internal_error` for an agent
@@ -1613,8 +1654,9 @@ surfaces the paused feed for manual resume.
   on sends without a session. The per-agent `rev` orders these changes
   against chat entries in commit order.
 - Delivered (`ack1`) means the server has durably committed a
-  person-authored chat entry or answer to a feed response for this agent.
-  The server records it once, before writing the JSON batch or SSE frame.
+  person-authored Chat entry or answer to a delivery response for this agent.
+  The server records it once, before writing a baseline page, JSON batch
+  or SSE frame.
   The agent reports the handoff outcome separately with a `handed` or
   `not_handed` receipt. Delivery and receipt changes update the same entry
   or message.
@@ -1637,6 +1679,88 @@ surfaces the paused feed for manual resume.
   The remaining feed continues.
 - Change-log verification replays the retained agent log from empty and
   compares the resulting sent-message map with a fresh paged read.
+
+#### Delivery baseline
+
+`GET /v2/agent/delivery-baseline?session=<session>&page=<token>&limit=<n>`
+
+Use this route when there is no applied checkpoint or the feed reports
+`cursor_expired`. With no `page`, it returns `{rev, next_page}`. This fixes
+the ordinary feed position `rev` and the pending enumeration's upper bound
+in one serialized step. It serves no work. Persist the returned token
+before requesting a delivery page. The token is opaque and scoped to this
+attempt, authenticated origin and session filter.
+
+- With `page`, return `{rev, changes, next_page?}` using the same `rev`.
+  `changes` contains pending person Chat as AgentEntry changes and pending
+  answers as SentMessage changes, using their existing stable IDs. An entry
+  or answer may have a resource revision at or below `rev`. Pages follow
+  the pending turns' original order within the origin. Use §6 batch limits.
+  Continue until `next_page` is absent, including after an empty page.
+  Tokens have bounded length and encode only the attempt, scope and fixed
+  bounds, plus the scan position. The Server holds no growing per-attempt
+  manifest. Retained work no longer visible or no longer present is
+  omitted and the page moves forward. When none remains, the page ends
+  without `next_page`.
+- Include all covered deliverable turns, including retained 0.1 turns and
+  Chat on answered or other terminal items where Chat is available.
+  Existing grants, visibility, withdrawal and file rules apply. Ordinary
+  message and entry reads still rebuild historical state and advisories
+  without recording Delivered or submitting history as pending work.
+- Record Delivered once before writing a page. Retry the same page token
+  on failure or partial commit, including across restarts. Retry makes
+  the same attempt's still-eligible work available by stable ID, even
+  after its first-serve commit. If receipt, handoff or action for that
+  turn has since been recorded, the page may show the current facts for
+  reconciliation and must treat it as an update instead of pending work.
+  A fresh attempt excludes earlier service from any path, including 0.2.5
+  changes and Agent 0.2.0 listen. Losing the saved token by deleting the
+  journal or moving without it loses retry access to work already served
+  by that attempt. Work never served remains pending.
+- Durably apply and deduplicate pending work by stable turn ID before
+  advancing a page or the baseline checkpoint, including a crash between
+  application and checkpoint. Catch up from `rev` to cover concurrent
+  arrivals. Reconcile subsequent ACK1-only changes without presenting
+  baseline-applied work again, and keep genuine later state changes.
+  If `rev` expired, finish applying the current attempt, then recover
+  still-pending work using a new attempt in the same scope before
+  advancing the checkpoint.
+- Agent 0.2.1 is required with the implementing Server for FIRST-2,
+  FIRST-3 and MIG-5. Agent 0.2.0 keeps its previous behavior, including
+  the missing Chat and absent Delivered marks in MIG-9/MIG-10. It skips
+  terminal-item entry reads on baseline and cannot consume the new
+  attempt. Agent 0.2.1 falls back to the earlier snapshot and feed
+  behavior only on `404 not_found` from the new route's preparation
+  request, the older Server's explicit unsupported-route result. Propagate
+  other errors and preserve an already-negotiated attempt.
+
+#### Receiving capability
+
+An Agent may send `Harklight-Ack2: true` or `Harklight-Ack2: false` on the
+delivery baseline and JSON or SSE change feed. It applies to this
+authenticated origin and the receiving sessions covered by the request.
+Use the same declaration on retries. A supporting Server echoes the
+accepted value on success, including SSE headers. A missing header or
+echo leaves capability unknown. Agent 0.2.1 `read/listen --ack2` declares
+true for a consumer that issues handoff receipts. False is an explicit
+declaration by a known incapable consumer. Standalone receipt commands
+declare nothing. Agent 0.2.0 sends no declaration.
+
+Snapshot the explicit value as `delivery.ack2_expected` at first serve of
+each person Chat turn, including retained turns first served here.
+Preserve authoritative per-turn legacy expectations and existing snapshots
+across retries. Record new-service provenance on every first-serve path
+even for unknown capability. A missing declaration leaves the member
+absent. A legacy false stored by default supplies no declaration.
+
+For a turn served with an explicit false snapshot, an authenticated
+consumer can confirm receipt after applying that exact turn with
+`PUT /v2/agent/messages/{item_id}/entries/{entry_id}/listener-received`
+and an empty JSON object. A successful confirmation returns `204`,
+is idempotent, and publishes `delivery.listener_received: true` as a
+person Entry update. The authenticated origin and the turn's receiving
+session must match the recorded service for that exact Chat turn. A transport write,
+elapsed time or a pre-write Delivered record supplies no confirmation.
 
 ### 9.4 Legacy commands
 

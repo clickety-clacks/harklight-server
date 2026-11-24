@@ -2272,13 +2272,13 @@ defmodule AttentionServer.Engine do
   end
 
   @doc "Records ACK1 for authorized conversation resources selected for a v2 feed response."
-  def agent_feed_delivered(%__MODULE__{} = engine, person, key, targets) do
+  def agent_feed_delivered(%__MODULE__{} = engine, person, key, targets, opts \\ []) do
     with {:ok, ^person} <- authorized_person(engine, key) do
       next =
         Enum.reduce(targets, engine, fn target, current ->
           case agent_delivery_target(current, person, key, target) do
             %{"author" => "person"} = entry ->
-              ensure_delivery_ack1(current, person, key, entry)
+              ensure_delivery_ack1(current, person, key, entry, opts)
 
             _ ->
               current
@@ -2400,18 +2400,46 @@ defmodule AttentionServer.Engine do
   defp delivery_ack_name?(value),
     do: is_binary(value) and String.valid?(value) and String.trim(value) != ""
 
-  defp ensure_delivery_ack1(engine, person, origin, entry) do
+  defp ensure_delivery_ack1(engine, person, origin, entry, opts \\ []) do
     if delivery_ack_fact(engine, person, origin, entry, :ack1) do
       engine
     else
-      session = Map.fetch!(engine.origin_sessions, {person, origin, entry["session_handle"]})
-      support = Map.get(session, :support) || %{}
-
       fact =
         delivery_ack_payload(engine, origin, entry, "ack1", nil)
-        |> Map.put("ack2_expected", support["ack2"] == true)
+        |> Map.put("r25_served", true)
+        |> put_delivery_option("delivery_baseline_attempt", opts[:attempt])
+        |> put_delivery_option(
+          "ack2_expected",
+          if(entry["kind"] == "discussion", do: opts[:ack2])
+        )
 
       append_delivery_ack(engine, person, origin, entry, :ack1, fact)
+    end
+  end
+
+  defp put_delivery_option(payload, _member, nil), do: payload
+  defp put_delivery_option(payload, member, value), do: Map.put(payload, member, value)
+
+  @doc false
+  def confirm_agent_listener_received(engine, person, origin, item, position) do
+    with %{key: ^item, payload: %{"kind" => "discussion"} = entry} <-
+           Map.get(engine.conversation_events, {person, position}),
+         %{origin: ^origin, session_handle: session} <- Map.get(engine.messages, item),
+         {seq, ""} <- Integer.parse(entry["event_id"]),
+         %{ack1: ack_seq} <-
+           get_in(engine.origin_feeds, [{person, origin}, :delivery_acks, seq]),
+         %{
+           payload: %{
+             "session_handle" => ^session,
+             "r25_served" => true,
+             "ack2_expected" => false
+           }
+         } =
+           ack <- Map.get(engine.conversation_events, {person, ack_seq}) do
+      updated = %{ack | payload: Map.put(ack.payload, "listener_received", true)}
+      {:ok, put_row(engine, :conversation_events, {person, ack_seq}, updated), ack_seq}
+    else
+      _ -> {:error, :unsupported}
     end
   end
 
@@ -5480,7 +5508,13 @@ defmodule AttentionServer.Engine do
           )
         )
       else
-        Map.merge(base, Map.drop(event.payload, ~w(sender_id message_id feed_seq)))
+        Map.merge(
+          base,
+          Map.drop(
+            event.payload,
+            ~w(sender_id message_id feed_seq r25_served delivery_baseline_attempt listener_received)
+          )
+        )
       end
     end
   end

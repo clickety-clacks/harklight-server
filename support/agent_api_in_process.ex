@@ -31,11 +31,13 @@ defmodule AttentionServer.AgentAPIInProcess do
 
   @doc "Reads one agent feed batch from `cursor`. Returns `{:ok, changes, more, position}`."
   def changes(relay, person, key, cursor \\ 0, opts \\ []) do
-    request =
-      {:read, principal(person, key), Keyword.get(opts, :session), cursor,
-       Keyword.get(opts, :limit, 1_000)}
+    context = %{
+      relay: relay,
+      principal: principal(person, key),
+      params: %{session: Keyword.get(opts, :session)}
+    }
 
-    GenServer.call(relay, {:client_api, FeedStep, request}, :infinity)
+    FeedStep.read(context, cursor, Keyword.get(opts, :limit, 1_000))
   end
 
   @doc """
