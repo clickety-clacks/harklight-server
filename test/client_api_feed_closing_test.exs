@@ -395,7 +395,8 @@ defmodule AttentionServer.ClientAPIFeedClosingTest do
       assert original.id == first["rev"]
       assert latest.id == last
       assert original.data["delivery"] == %{"delivered" => false, "acted" => false}
-      assert latest.data["delivery"] == %{"delivered" => true, "acted" => true}
+      assert %{"delivered" => true, "acted" => true, "outcome" => "handed"} =
+               latest.data["delivery"]
 
       ids = Enum.map(events, & &1.id)
       assert ids == Enum.sort(Enum.uniq(ids))
@@ -441,7 +442,8 @@ defmodule AttentionServer.ClientAPIFeedClosingTest do
                for(%{event: "entry", data: %{"entry_id" => ^id}} = event <- events, do: event)
 
       assert before < delivered.id and delivered.id < acted.id
-      assert acted.data["delivery"] == %{"delivered" => true, "acted" => true}
+      assert %{"delivered" => true, "acted" => true, "outcome" => "handed"} =
+               acted.data["delivery"]
       Enum.each([conn, device, agent], &Mint.HTTP.close/1)
     end
   end
