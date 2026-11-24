@@ -959,19 +959,6 @@ defmodule AttentionServer.ChangeLog do
 
   def read(%AttentionServer.Store{}, _person, _after, _limit), do: {:error, :disabled}
 
-  @doc false
-  def read_through(
-        %AttentionServer.Store{change_log: true, db: db, engine: engine},
-        person,
-        after_rev,
-        limit,
-        cutoff
-      ),
-      do: read_page(db, engine, person, after_rev, limit, {:through, cutoff})
-
-  def read_through(%AttentionServer.Store{}, _person, _after, _limit, _cutoff),
-    do: {:error, :disabled}
-
   def prune(%AttentionServer.Store{change_log: true, db: db}, before_ms),
     do: prune_rows(db, before_ms)
 
@@ -1390,20 +1377,13 @@ defmodule AttentionServer.ChangeLog do
           {:ok, [change], boolean(), position} | {:error, :cursor_expired | term()}
   def read(db, %Engine{} = engine, person, after_rev, limit)
       when is_integer(after_rev) and after_rev >= 0 and is_integer(limit) and limit > 0 do
-    with {:ok, rows, more, position, _cutoff} <-
-           read_page(db, engine, person, after_rev, limit, :current),
-         do: {:ok, rows, more, position}
-  end
-
-  defp read_page(db, engine, person, after_rev, limit, mode) do
     with {:ok, {head, floor, _seed}} <- load_meta(db, person, fn -> seeded?(engine, person) end),
          :ok <- servable(after_rev, floor, head),
-         cutoff = cutoff(mode, head),
          {:ok, rows} <-
            all(
              db,
-             "SELECT rev, kind, resource_id FROM client_changes WHERE person_id = ? AND rev > ? AND rev <= ? ORDER BY rev LIMIT ?",
-             [person, after_rev, cutoff, limit + 1]
+             "SELECT rev, kind, resource_id FROM client_changes WHERE person_id = ? AND rev > ? ORDER BY rev LIMIT ?",
+             [person, after_rev, limit + 1]
            ) do
       {page, rest} = Enum.split(rows, limit)
 
@@ -1412,19 +1392,10 @@ defmodule AttentionServer.ChangeLog do
           %{rev: rev, kind: Map.fetch!(@kind_atoms, kind), resource_id: resource_id}
         end)
 
-      position =
-        case {mode, rest, changes} do
-          {{:through, _}, [], _} -> cutoff
-          {_, _, []} -> after_rev
-          _ -> List.last(changes).rev
-        end
-
-      {:ok, changes, rest != [], position, cutoff}
+      position = if changes == [], do: after_rev, else: List.last(changes).rev
+      {:ok, changes, rest != [], position}
     end
   end
-
-  defp cutoff({:through, cutoff}, _head) when is_integer(cutoff), do: cutoff
-  defp cutoff(_mode, head), do: head
 
   defp servable(after_rev, floor, head) when after_rev >= floor and after_rev <= head, do: :ok
   defp servable(_after, _floor, _head), do: {:error, :cursor_expired}

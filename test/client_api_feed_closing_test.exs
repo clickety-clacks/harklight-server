@@ -306,7 +306,7 @@ defmodule AttentionServer.ClientAPIFeedClosingTest do
       end
     end
 
-    test "receipts committed between backlog pages arrive as live revisions", ctx do
+    test "an Entry updated after a backlog page can appear once more at its new revision", ctx do
       item = forward(ctx, "backlog-handoff", 1, ctx.agent)
       device = connect(ctx.port, ctx.certs, "b1")
       path = "/v2/items/#{item}/replies"
@@ -320,15 +320,15 @@ defmodule AttentionServer.ClientAPIFeedClosingTest do
           device
         end)
 
-      {device, %{"entry" => late}} =
-        json_request(device, "POST", path, %{"text" => "Later backlog turn"}, 105)
+      {device, _} = json_request(device, "POST", path, %{"text" => "Turn 105"}, 105)
+      {device, 200, first_page} = batch(device, "?after=0&limit=100")
+      assert first_page["more"]
+      assert Enum.any?(first_page["changes"], &(&1["data"]["entry_id"] == first["entry_id"]))
 
-      {device, 200, %{"rev" => cutoff}} = batch(device, "?after=0")
+      # Gate the response after the first serialized read, before page two.
       {conn, feed, request} = gated_feed(ctx, "?after=0")
-
       record_receipt(ctx, item, first["entry_id"], 106)
-      record_receipt(ctx, item, late["entry_id"], 107)
-      {device, 200, %{"rev" => last}} = batch(device, "?after=#{cutoff}")
+      {device, 200, %{"rev" => last}} = batch(device, "?after=0")
       send(request, :allow_stream_headers)
 
       {conn, feed} = await_open(conn, feed)
@@ -336,19 +336,22 @@ defmodule AttentionServer.ClientAPIFeedClosingTest do
       {conn, _feed, events} = changes_through(conn, feed, last)
       Enum.each([device, conn], &Mint.HTTP.close/1)
 
-      {backlog, live} = Enum.split_while(events, &(&1.id <= cutoff))
-      assert [%{id: rev}] = matching_entries(backlog, first["entry_id"])
-      assert rev == first["rev"]
-      assert matching_entries(backlog, late["entry_id"]) == []
-
-      for entry <- [first, late] do
-        assert [delivered, acted] = matching_entries(live, entry["entry_id"])
-        assert cutoff < delivered.id and delivered.id < acted.id
-        assert acted.data["delivery"] == %{"delivered" => true, "acted" => true}
-      end
+      assert [original, latest] = matching_entries(events, first["entry_id"])
+      assert original.id == first["rev"]
+      assert latest.id == last
+      assert original.data["delivery"] == %{"delivered" => false, "acted" => false}
+      assert latest.data["delivery"] == %{"delivered" => true, "acted" => true}
 
       ids = Enum.map(events, & &1.id)
       assert ids == Enum.sort(Enum.uniq(ids))
+
+      turns =
+        for %{event: "entry", data: %{"author" => "person", "entry_id" => id}} <- events,
+            do: id
+
+      assert Enum.frequencies(turns)[first["entry_id"]] == 2
+      assert length(Enum.uniq(turns)) == 104
+      assert length(turns) == 105
     end
 
     test "a caught-up stream still emits both live delivery rows from one commit", ctx do

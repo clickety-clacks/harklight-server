@@ -148,10 +148,6 @@ defmodule AttentionServer.ClientAPI.FeedStep do
     do: read_step(ctx.relay, ctx.principal, cursor, limit, :live)
 
   @doc false
-  def read_catch_up(ctx, cursor, limit, cutoff),
-    do: read_step(ctx.relay, ctx.principal, cursor, limit, {:through, cutoff})
-
-  @doc false
   def opened(_ctx), do: :ok
 
   @doc false
@@ -193,20 +189,16 @@ defmodule AttentionServer.ClientAPI.FeedStep do
     # connection opened before its access ended.
     with {:ok, _} <- authorized(state, principal),
          :ok <- ChangeLog.ranks_available(state.store, person),
-         {:ok, rows, more, position, cutoff} <- log_page(state.store, person, cursor, limit, mode) do
+         {:ok, rows, more, position} <- ChangeLog.read(state.store, person, cursor, limit) do
       context = %{
         engine: state.store.engine,
         store: state.store,
-        compact_entries?: mode != :live,
+        compact_entries?: mode == :catch_up,
         view: Map.get(Map.get(state, :priority_views, %{}), person)
       }
 
-      with {:ok, changes} <- Projection.capture(fn -> render_rows(context, principal, rows) end) do
-        case mode do
-          {:through, _} -> {:ok, changes, more, position, cutoff}
-          _ -> {:ok, changes, more, position}
-        end
-      end
+      with {:ok, changes} <- Projection.capture(fn -> render_rows(context, principal, rows) end),
+           do: {:ok, changes, more, position}
     else
       {:error, reason} when reason in [:cursor_expired, :unauthorized, :disabled] ->
         {:error, reason}
@@ -220,14 +212,6 @@ defmodule AttentionServer.ClientAPI.FeedStep do
     error ->
       Diagnostics.failure(:client_api, :stream_read, error, :failed)
       {:error, :storage_unavailable}
-  end
-
-  defp log_page(store, person, cursor, limit, {:through, cutoff}),
-    do: ChangeLog.read_through(store, person, cursor, limit, cutoff)
-
-  defp log_page(store, person, cursor, limit, _mode) do
-    with {:ok, rows, more, position} <- ChangeLog.read(store, person, cursor, limit),
-         do: {:ok, rows, more, position, nil}
   end
 
   defp authorized(state, principal) do

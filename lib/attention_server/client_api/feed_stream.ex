@@ -73,8 +73,8 @@ defmodule AttentionServer.ClientAPI.FeedStream do
   end
 
   defp open(conn, ctx, cursor, watcher, source) do
-    case first_read(source, ctx, cursor) do
-      {:ok, changes, more, position, cutoff} ->
+    case source.read(ctx, cursor, @page) do
+      {:ok, changes, more, position} ->
         subscribe_shows(ctx.principal, source)
         conn = start_stream(conn)
 
@@ -85,7 +85,7 @@ defmodule AttentionServer.ClientAPI.FeedStream do
             ctx: ctx,
             source: source,
             cursor: cursor,
-            cutoff: cutoff,
+            caught_up?: false,
             watcher: watcher,
             relay: monitor(ctx.relay),
             last_show_id: nil,
@@ -107,13 +107,6 @@ defmodule AttentionServer.ClientAPI.FeedStream do
       {:error, reason} ->
         Feed.send_read_error(conn, reason)
     end
-  end
-
-  defp first_read(FeedStep, ctx, cursor), do: FeedStep.read_catch_up(ctx, cursor, @page, nil)
-
-  defp first_read(source, ctx, cursor) do
-    with {:ok, changes, more, position} <- source.read(ctx, cursor, @page),
-         do: {:ok, changes, more, position, nil}
   end
 
   defp start_stream(conn) do
@@ -153,14 +146,8 @@ defmodule AttentionServer.ClientAPI.FeedStream do
     end
   end
 
-  defp read_page(%{source: FeedStep, cutoff: nil} = state),
+  defp read_page(%{source: FeedStep, caught_up?: true} = state),
     do: FeedStep.read_live(state.ctx, state.cursor, @page)
-
-  defp read_page(%{source: FeedStep} = state) do
-    with {:ok, changes, more, position, _cutoff} <-
-           FeedStep.read_catch_up(state.ctx, state.cursor, @page, state.cutoff),
-         do: {:ok, changes, more, position}
-  end
 
   defp read_page(state), do: state.source.read(state.ctx, state.cursor, @page)
 
@@ -177,7 +164,7 @@ defmodule AttentionServer.ClientAPI.FeedStream do
     end
   end
 
-  defp continue(conn, state, false), do: wait(conn, %{state | cutoff: nil})
+  defp continue(conn, state, false), do: wait(conn, %{state | caught_up?: true})
 
   defp continue(conn, state, true) do
     # Ready control messages must be serviced between pages even when writes
