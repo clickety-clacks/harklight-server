@@ -160,15 +160,20 @@ defmodule AttentionServer.AgentAPI.DeliveryBaseline do
   defp pending?(engine, {person, origin}, %{"feed_seq" => seq} = entry, attempt) do
     scope_key = {person, origin, seq}
     ack = Engine.delivery_ack_fact(engine, person, origin, entry, :ack1)
+    # File reports can create a receipt record seeded from ACK1 alone.
+    # That bookkeeping does not acknowledge application of the turn.
+    receipt = Map.get(engine.origin_receipts, scope_key)
+
+    settled =
+      (not is_nil(receipt) and receipt[:implicit_ack] != true) or
+        Map.has_key?(engine.origin_actions, scope_key)
 
     case ack do
       nil ->
-        not Map.has_key?(engine.origin_receipts, scope_key) and
-          not Map.has_key?(engine.origin_actions, scope_key)
+        not settled
 
       %{"delivery_baseline_attempt" => ^attempt} ->
-        not Map.has_key?(engine.origin_receipts, scope_key) and
-          not Map.has_key?(engine.origin_actions, scope_key) and
+        not settled and
           is_nil(Engine.delivery_ack_fact(engine, person, origin, entry, :ack2)) and
           ack["listener_received"] != true
 

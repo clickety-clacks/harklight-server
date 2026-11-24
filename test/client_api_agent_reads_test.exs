@@ -215,6 +215,41 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
       refute Map.has_key?(unknown, "legacy_caption")
     end
 
+    test "an attachment failure does not settle a saved baseline turn", ctx do
+      item = forward(ctx, "a1", 1, @first_session)
+      handle = contract(ctx, "FileCreated", upload(ctx, "a2", 2, "Attachment"))["file_id"]
+
+      posted =
+        request(
+          ctx,
+          "a2",
+          "POST",
+          "/v2/items/#{item}/replies",
+          %{"text" => "Chat with attachment", "file_ids" => [handle]},
+          3
+        )
+
+      assert %{"entry" => %{"entry_id" => id, "files" => [%{"file_id" => file}]}} =
+               contract(ctx, "WriteResult", posted)
+
+      path = @baseline <> "?session=#{@first_session}"
+      assert %{"next_page" => token} = decode_response(get(ctx, "a1", path))
+
+      assert {_, %{"changes" => [%{"data" => %{"entry_id" => ^id}}]}} =
+               next_delivery_page(ctx, path, token, [])
+
+      use = "/v2/agent/messages/#{item}/entries/#{id}/file-use"
+      body = %{"file_id" => file, "transfer" => "not_transferred", "reason" => "Read interrupted"}
+      assert request(ctx, "a1", "POST", use, body, 4).status == 200
+
+      assert :ok = stop_supervised(Server)
+      server = start_supervised!({Server, ctx.server_opts})
+      ctx = %{ctx | server: server, relay: Server.relay(server), port: Server.port(server)}
+
+      assert {_, %{"changes" => [%{"data" => %{"entry_id" => ^id}}]}} =
+               next_delivery_page(ctx, path, token, [])
+    end
+
     test "a false declaration needs positive receipt and later declarations do not replace it",
          ctx do
       item = forward(ctx, "a1", 1, @first_session)
