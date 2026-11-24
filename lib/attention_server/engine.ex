@@ -4572,7 +4572,8 @@ defmodule AttentionServer.Engine do
                     message,
                     files,
                     accepted_at,
-                    seq
+                    seq,
+                    in_reply_to: frame["in_reply_to"]
                   )
 
                 next =

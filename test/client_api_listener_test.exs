@@ -1058,18 +1058,22 @@ defmodule AttentionServer.ClientAPIListenerTest do
         assert %{status: 200} = before = progress_request(ctx, surface, "GET", path)
         assert json(before)[kind]["seen"] == false
 
-        seen_by = if surface == :browser, do: :browser, else: :device
-        assert %{status: 200} = opened = mark_progress_seen(ctx, seen_by, id)
-        assert json(opened)["item"]["seen"]
-
         updates = [
-          {Map.put(message, "progress", %{"completed" => 1}), true},
+          {Map.put(message, "progress", %{"completed" => 1}), false},
           {Map.put(message, "progress", %{"completed" => 2}), true},
-          {Map.merge(message, %{"title" => "Updated", "progress" => %{"completed" => 3}}), false},
-          {Map.merge(message, %{"title" => "Updated", "progress" => %{"completed" => 4}}), false}
+          {Map.put(message, "progress", %{"completed" => 2}), true},
+          {Map.put(message, "progress", %{"completed" => 3}), true},
+          {Map.merge(message, %{"title" => "Updated", "progress" => %{"completed" => 4}}), false},
+          {Map.merge(message, %{"title" => "Updated", "progress" => %{"completed" => 5}}), false}
         ]
 
         for {{update, seen}, revision} <- Enum.with_index(updates, 1) do
+          if revision == 2 do
+            seen_by = if surface == :browser, do: :browser, else: :device
+            assert %{status: 200} = opened = mark_progress_seen(ctx, seen_by, id)
+            assert json(opened)["item"]["seen"]
+          end
+
           assert %{status: 200} = initial = progress_request(ctx, surface, "GET", changes)
           cursor = json(initial)["rev"]
           after_cursor = changes <> "?after=#{cursor}"
@@ -1080,6 +1084,21 @@ defmodule AttentionServer.ClientAPIListenerTest do
 
           assert %{status: 200} = batch = progress_request(ctx, surface, "GET", after_cursor)
           assert %{"changes" => rows, "more" => false} = json(batch)
+          next_revision = revision + 1
+
+          assert Enum.any?(rows, fn row ->
+                   match?(
+                     %{
+                       "kind" => "entry",
+                       "data" => %{
+                         "kind" => "revision",
+                         "item_id" => ^id,
+                         "request_revision" => ^next_revision
+                       }
+                     },
+                     row
+                   )
+                 end)
 
           assert %{"rev" => rev, "data" => projected} =
                    Enum.find(rows, &(&1["kind"] == kind and &1["data"]["item_id"] == id))
@@ -1107,23 +1126,68 @@ defmodule AttentionServer.ClientAPIListenerTest do
       end
     end
 
+    test "a correlated progress revision clears Seen and acts on the reply", ctx do
+      message = progress_message()
+      id = send_progress(ctx, message)
+      headers = [{"idempotency-key", progress_op()}, {"content-type", "application/json"}]
+
+      assert %{status: 200} =
+               reply =
+               progress_request(
+                 ctx,
+                 :device,
+                 "POST",
+                 "/v2/items/#{id}/replies",
+                 headers,
+                 ~s({"text":"Please continue"})
+               )
+
+      entry = json(reply)["entry"]["entry_id"]
+      assert %{status: 200} = opened = mark_progress_seen(ctx, :device, id)
+      assert json(opened)["item"]["seen"]
+
+      assert %{status: 200} =
+               revised =
+               revise_progress(ctx, id, 1, Map.put(message, "progress", 1), %{
+                 "in_reply_to" => entry
+               })
+
+      assert %{
+               "message" => %{"revision" => 2, "seen" => false},
+               "entry" => %{"entry_id" => ^entry, "delivery" => %{"acted" => true}}
+             } = json(revised)
+    end
+
+    test "carrying an attachment keeps Seen but replacing it with identical bytes clears Seen",
+         ctx do
+      message = progress_message()
+      file = upload_progress_file(ctx)
+      replacement = upload_progress_file(ctx)
+      id = send_progress(ctx, message, %{"file_ids" => [file]})
+
+      assert %{status: 200} = opened = mark_progress_seen(ctx, :device, id)
+      assert json(opened)["item"]["seen"]
+
+      assert %{status: 200} =
+               carried = revise_progress(ctx, id, 1, Map.put(message, "progress", 1))
+
+      assert %{"message" => %{"revision" => 2, "seen" => true}} = json(carried)
+
+      assert %{status: 200} =
+               revised =
+               revise_progress(ctx, id, 2, Map.put(message, "progress", 2), %{
+                 "file_ids" => [replacement]
+               })
+
+      assert %{"message" => %{"revision" => 3, "seen" => false}} = json(revised)
+    end
+
     test "adding or removing progress, editing other content or files, and answering keep their existing effects",
          ctx do
       progress = progress_message()
       fyi = Map.delete(progress, "progress")
 
-      file_headers = [
-        {"idempotency-key", progress_op()},
-        {"content-type", "text/plain"},
-        {"content-length", "4"},
-        {"content-disposition", "attachment; filename*=UTF-8''fixture.txt"}
-      ]
-
-      assert %{status: 201} =
-               upload =
-               progress_request(ctx, :agent, "POST", "/v2/files", file_headers, "file")
-
-      file = json(upload)["file_id"]
+      file = upload_progress_file(ctx)
 
       for {initial, revised, extra} <- [
             {fyi, progress, %{}},
@@ -1180,7 +1244,22 @@ defmodule AttentionServer.ClientAPIListenerTest do
     }
   end
 
-  defp send_progress(ctx, message) do
+  defp upload_progress_file(ctx) do
+    file_headers = [
+      {"idempotency-key", progress_op()},
+      {"content-type", "text/plain"},
+      {"content-length", "4"},
+      {"content-disposition", "attachment; filename*=UTF-8''fixture.txt"}
+    ]
+
+    assert %{status: 201} =
+             upload =
+             progress_request(ctx, :agent, "POST", "/v2/files", file_headers, "file")
+
+    json(upload)["file_id"]
+  end
+
+  defp send_progress(ctx, message, extra \\ %{}) do
     body = %{
       "sender" => "app:test",
       "session" => "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
@@ -1189,7 +1268,7 @@ defmodule AttentionServer.ClientAPIListenerTest do
 
     assert %{status: 200} =
              sent =
-             progress_write(ctx, "POST", "/v2/agent/messages", body, [])
+             progress_write(ctx, "POST", "/v2/agent/messages", Map.merge(body, extra), [])
 
     json(sent)["message"]["item_id"]
   end
