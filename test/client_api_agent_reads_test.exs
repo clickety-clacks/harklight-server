@@ -1731,100 +1731,126 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
     response
   end
 
-  @tag :agent_advisory
-  test "acknowledges the retained advisory of the scoped sent message", ctx do
-    alias AttentionServer.{BounceDecision, BouncePolicy, Store}
+  for {opened, kind} <- [{false, "unseen_interval_elapsed"}, {true, "soft_bounce"}] do
+    @tag :agent_advisory
+    test "lists and acknowledges the #{kind} advisory", ctx do
+      alias AttentionServer.{BounceDecision, BouncePolicy, Store}
 
-    :sys.replace_state(ctx.relay, fn state ->
-      at = state.clock.()
-      levels = [%{"name" => "Urgent", "lower_bound" => 0, "bounce_after_days" => 1}]
-      {:ok, normalized} = BouncePolicy.normalize_levels(levels)
-
-      {:ok, configured, _} =
-        BounceDecision.configure_levels(state.store.engine, "A", normalized, at)
-
-      {:ok, store} =
-        Store.commit(state.store, configured, %{
-          person: "A",
-          actor: "fixture",
-          action: "configure_fixture"
-        })
-
-      %{state | store: store}
-    end)
-
-    id =
-      frame(ctx, "a1", %{
-        "type" => "forward",
-        "op_id" => op(1),
-        "session_handle" => @first_session,
-        "route" => "claude-code",
-        "cli_version" => "fixture",
-        "unsupported_reason" => nil,
-        "advisory_v1" => true,
-        "message" => %{
-          "sender_id" => "app:test",
-          "message_id" => "advisory-item",
-          "title" => "Needs attention",
-          "message_type" => "fyi",
-          "answer_ui" => %{
-            "schema" => "attention-client.actions/1",
-            "actions" => [
-              %{
-                "id" => "seen",
-                "label" => "Seen",
-                "kind" => "value",
-                "value" => %{"acknowledgment" => "seen"}
-              }
-            ]
-          },
-          "created_at" => 1
-        }
-      })
-      |> then(&Resources.item_id(%{accepted_seq: &1["seq"]}))
-
-    key = {"A", "app:test", "advisory-item"}
-
-    state =
       :sys.replace_state(ctx.relay, fn state ->
-        engine = state.store.engine
-        at = engine.messages[key].accepted_at
+        at = state.clock.()
+        levels = [%{"name" => "Urgent", "lower_bound" => 0, "bounce_after_days" => 1}]
+        {:ok, normalized} = BouncePolicy.normalize_levels(levels)
 
-        selected =
-          BounceDecision.record_scores(
-            engine,
-            "A",
-            [
-              %{"sender_id" => "app:test", "message_id" => "advisory-item", "score" => 0.9}
-            ],
-            at
-          )
-
-        next = BounceDecision.evaluate_due(selected, at + 86_400_001)
+        {:ok, configured, _} =
+          BounceDecision.configure_levels(state.store.engine, "A", normalized, at)
 
         {:ok, store} =
-          Store.commit(state.store, next, %{
+          Store.commit(state.store, configured, %{
             person: "A",
             actor: "fixture",
-            action: "advisory_fixture"
+            action: "configure_fixture"
           })
 
         %{state | store: store}
       end)
 
-    feed = state.store.engine.advisory_feeds[{"A", ctx.keys["a1"], @first_session}]
-    assert %{"advisory_id" => advisory_id} = feed.entries[1]
-    path = "/v2/agent/messages/" <> id <> "/advisories/ack"
-    body = %{"advisory_id" => advisory_id}
-    assert_error(request(ctx, "a2", "POST", path, body, 2), 404, "not_found")
-    first = request(ctx, "a1", "POST", path, body, 2)
-    assert first.status == 200
+      sent =
+        request(
+          ctx,
+          "a1",
+          "POST",
+          "/v2/agent/messages",
+          %{
+            "sender" => "app:test",
+            "session" => @first_session,
+            "message" => %{
+              "title" => "Needs attention",
+              "created_at" => 1,
+              "message_type" => "fyi",
+              "answer_ui" => %{
+                "schema" => "attention-client.actions/1",
+                "actions" => [
+                  %{
+                    "id" => "seen",
+                    "label" => "Seen",
+                    "kind" => "value",
+                    "value" => %{"acknowledgment" => "seen"}
+                  }
+                ]
+              }
+            }
+          },
+          1
+        )
 
-    assert %{"delivered" => true, "already_delivered" => false} =
-             contract(ctx, "AgentAdvisoryAckResult", first)
+      assert sent.status == 200
+      id = contract(ctx, "AgentSendResult", sent)["message"]["item_id"]
+      state = :sys.get_state(ctx.relay)
+      {:ok, {person, sender, message_id} = key} = Resources.item_key(state.store.engine, "A", id)
+      at = state.store.engine.messages[key].accepted_at
 
-    assert %{"already_delivered" => true} =
-             contract(ctx, "AgentAdvisoryAckResult", request(ctx, "a1", "POST", path, body, 3))
+      commit_fixture = fn transition ->
+        :sys.replace_state(ctx.relay, fn state ->
+          {:ok, store} =
+            Store.commit(state.store, transition.(state.store.engine), %{
+              person: person,
+              actor: "fixture",
+              action: "advisory_fixture"
+            })
+
+          %{state | store: store}
+        end)
+      end
+
+      commit_fixture.(fn engine ->
+        BounceDecision.record_scores(
+          engine,
+          person,
+          [%{"sender_id" => sender, "message_id" => message_id, "score" => 0.9}],
+          at
+        )
+      end)
+
+      if unquote(opened) do
+        assert %{"opened" => true} =
+                 frame(ctx, "a2", %{
+                   "type" => "message_open",
+                   "op_id" => op(2),
+                   "sender_id" => sender,
+                   "message_id" => message_id,
+                   "request_revision" => 1
+                 })
+      end
+
+      commit_fixture.(&BounceDecision.evaluate_due(&1, at + 86_400_001))
+
+      assert %{
+               "messages" => [
+                 %{
+                   "item_id" => ^id,
+                   "advisories" => [
+                     %{
+                       "advisory_id" => advisory_id,
+                       "advisory_type" => unquote(kind),
+                       "delivered" => false
+                     }
+                   ]
+                 }
+               ]
+             } = decode_response(get(ctx, "a1", "/v2/agent/messages"))
+
+      path = "/v2/agent/messages/" <> id <> "/advisories/ack"
+      body = %{"advisory_id" => advisory_id}
+      assert_error(request(ctx, "a2", "POST", path, body, 2), 404, "not_found")
+      first = request(ctx, "a1", "POST", path, body, 2)
+      assert first.status == 200
+
+      assert %{"delivered" => true, "already_delivered" => false} =
+               contract(ctx, "AgentAdvisoryAckResult", first)
+
+      assert %{"already_delivered" => true} =
+               contract(ctx, "AgentAdvisoryAckResult", request(ctx, "a1", "POST", path, body, 3))
+    end
   end
 
   defp normalize_delivery_replay(change) do
