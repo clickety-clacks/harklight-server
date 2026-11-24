@@ -4,9 +4,9 @@ defmodule AttentionServer.DashboardSelfHostedWebTest do
   alias AttentionServer.{DashboardReadHTTP, JSON}
 
   @origin "https://server.example.test:9443"
-  @web_commit "f7b1f91a9c4210e0f45fc3d183fa81f434979dbf"
-  @web_archive "harklight-web-f7b1f91a9c4210e0f45fc3d183fa81f434979dbf.tar.gz"
-  @web_archive_sha256 "4665e6b173b43ab838304d74fa4e42634124edd3839f6ddbcc2799c4e917a4ff"
+  @web_commit "d12cff32fd29bd6138b15ae083115faff880c71d"
+  @web_archive "harklight-web-d12cff32fd29bd6138b15ae083115faff880c71d.tar.gz"
+  @web_archive_sha256 "71e3cc2a10d70f232d94f22f641b4128440a58d436326b84beb3b6a9b8d4bb7f"
   @dashboard_csp "default-src 'none'; script-src 'self'; connect-src 'self'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; frame-ancestors 'none'"
 
   @web_client_csp "default-src 'none'; script-src 'self'; connect-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' blob: data:; base-uri 'none'; frame-ancestors 'none'"
