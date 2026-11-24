@@ -120,8 +120,7 @@ The `harklight-agent` command-line client sends requests and listens for
 request-bound replies. It is released separately from the server at
 <https://github.com/clickety-clacks/harklight-agent>. This Server works
 with Harklight Agent 0.2 releases. Agent 0.2.1 is the matching release, and 0.1
-Agent releases cannot connect. The Homebrew tap still carries a 0.1 release, so
-download the tarball for your platform and `SHA256SUMS` from the
+Agent releases cannot connect. Download the tarball for your platform and `SHA256SUMS` from the
 [release page](https://github.com/clickety-clacks/harklight-agent/releases/tag/v0.2.1),
 verify the checksum and put the binary on your `PATH`. Targets are
 `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-gnu` and

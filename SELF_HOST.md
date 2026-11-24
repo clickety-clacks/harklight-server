@@ -132,8 +132,7 @@ The `harklight-agent` conversation CLI is not part of this package. It is
 released from <https://github.com/clickety-clacks/harklight-agent>. This server
 works with Harklight Agent 0.2 releases. Agent 0.2.1 is the matching release,
 and 0.1 Agent releases cannot connect. Install it from that repository's
-release tarballs; the Homebrew tap still carries a 0.1 release. Installing it does not start a
-listener, install a vendor-session integration or create an identity. The
+release tarballs. Installing it does not start a listener, install a vendor-session integration or create an identity. The
 assembled `skills/harklight-agent` directory may be copied manually
 into an agent harness's configured skill directory; installation does not copy
 it there.
