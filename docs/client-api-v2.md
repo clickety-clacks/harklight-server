@@ -787,6 +787,7 @@ revoked elsewhere.
     (§5.1).
   - A feed that drops with no `closing` is recorded with initiator
     `os_network` or `unknown`, and reconnected with `Last-Event-ID`.
+- On a feed-level HTTP 500 with error internal_error, the native App and Web stop automatic feed recovery, report that updates are paused, and resume on user action. Background Agent and Tightbeam followers use the retry policy in §9.3.
 - **`after` older than retention:** `410` with an `Error` body whose `error` is
   `cursor_expired`, in both forms. After either a 410 or an SSE closing with
   this reason, read every page of `GET /v2/inbox`, set the cursor to the first
@@ -922,10 +923,7 @@ replay returns `internal_error`. If a committed push write failed before its
 original response could be captured, replay still returns `internal_error`.
 Read `GET /v2/settings` for the current binding.
 
-The app, web client, Agent CLI and integrations surface `internal_error`
-in context and record it in the Error Log. Copy details includes the
-`Request-Id`, operation and token. Clients retry only on user action or
-return to the foreground. The CLI can try again on the next invocation.
+internal_error (500, retryable: false): Server failed to complete the request. Keep the existing error body and report its request_id. For a feed-level error, recovery is consumer-specific (§6, §9.3). The background follower policy does not change the wire retryable member or authorize replay of writes.
 
 ## 8. Carried over from today, and dropped
 
@@ -1557,8 +1555,7 @@ reconnect, send `Last-Event-ID`. A filtered feed can skip agent-wide revisions.
 The §7 projection error and client retry rules also apply to every agent
 request. A projection fault returns `500 internal_error` for an agent
 batch or an id-less `closing` with reason `internal_error` for SSE.
-The server keeps the cursor before the failed change, and the agent
-surfaces the paused feed for manual resume.
+Agent listen --follow and the Tightbeam Harklight background follower retry feed-level HTTP 500 internal_error automatically with capped backoff, reporting the failure and resuming from the last applied checkpoint. A failed attempt does not advance that checkpoint. Single-shot read and listen --next return the error to the caller. This exception does not change typed authentication, authorization, revocation, account-paused, or cursor-expiry handling.
 
 ```json
 {
@@ -1752,6 +1749,37 @@ attempt, authenticated origin and session filter.
 - Ordinary feed resumes recover a failed write within change-log retention.
   Recovery after the ordinary feed cursor expires is tracked separately
   (wi_b7c0f768-7e65-46f1-84af-1272b6faa71a).
+
+##### Caller-owned pending baseline
+
+A caller that owns the applied checkpoint prepares a scoped attempt with
+`read --session S --pending --prepare` on Agent 0.2.4 or later. This prints
+`{"kind":"baseline_prepared","session":S,"rev":R,"token":T}` from the
+tokenless request, without service, a Delivered mark or an Agent journal
+write. Store the opaque token and its pinned revision before resuming.
+
+`read --session S --pending --resume T` serves that attempt's pages
+between `baseline` and `baseline_complete`. Retained pending person Chat
+and answers are included, including turns on closed items and migrated
+0.1-era turns. Rows have the same `kind`, `rev` and `data` projection as
+the feed. An answer is a message row with an answered terminal state.
+`pending:false` conveys receipt, action or an updated representation.
+Keep and apply any still-unapplied row regardless of that marker.
+
+Repeat the original token after interruption and apply by stable turn ID.
+The Agent reports a rejected token as `token_invalid` (exit 2), retaining
+the Server error reason. Server 0.2.8 rejects an invalid or out-of-scope
+page as `invalid_field` on `page`. A Server without the pending route is
+reported as unsupported (exit 5). The caller-owned command tries only the
+pending route. Commit R with the applied effects before forgetting T.
+Then follow with `--after R --on-expired exit` to receive a
+`cursor_expired` result on either transport and choose recovery explicitly.
+
+Use one owner per conversation. A reader that marks a turn Delivered
+before the pin excludes it from the attempt, and a later feed change
+above R is not guaranteed. Restoring the caller's database to before
+T was stored loses replay access for entries served under T. An
+unserved turn remains pending.
 
 #### Receiving capability
 
