@@ -54,7 +54,7 @@ defmodule AttentionServer.ClientAPI.FeedRenderer do
       Projection.run({:item, item_id}, fn ->
         {:ok,
          context.engine
-         |> Resources.item(key, rank)
+         |> Resources.item(key, rank, Map.get(context, :activity))
          |> Resources.stamp(rev)
          |> then(&Resources.render(:item, &1, principal))}
       end)

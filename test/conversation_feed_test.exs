@@ -2399,6 +2399,13 @@ defmodule AttentionServer.ConversationFeedTest do
     GenServer.stop(relay)
   end
 
+  defp item_availability(relay) do
+    assert {:ok, %{"item" => %{"availability" => availability}}} =
+             AttentionServer.ClientAPI.Reads.item(relay, "reader", "i1")
+
+    availability
+  end
+
   # An open (or closed) `GET /v2/agent/changes?session=` feed of the origin.
   defp agent_feed_activity(relay, action) do
     feed = %{
@@ -2883,7 +2890,7 @@ defmodule AttentionServer.ConversationFeedTest do
     GenServer.stop(relay)
   end
 
-  test "a person's open request replays current origin availability across stream loss and restart",
+  test "an open request reports live availability without adding conversation history",
        %{
          path: path
        } do
@@ -2920,23 +2927,16 @@ defmodule AttentionServer.ConversationFeedTest do
     assert initial["listening_support"]["origin"] == "origin"
     assert is_integer(initial["listening_support"]["reported_at"])
 
-    # The origin's open v2 agent feed for the session is what listens now.
     agent_feed_activity(relay, :open)
-    assert {:ok, [listening], 1} = RelayReaders.conversation_events(relay, "reader", 0)
-    assert listening["type"] == "conversation"
-    assert listening["kind"] == "availability"
-    assert listening["availability"] == "listening"
-    assert listening["session_handle"] == @handle
-    assert listening["listening_support"]["route"] == "claude-code"
-    refute Map.has_key?(listening, "message")
-    assert {:ok, [origin_listening], 1} = RelayReaders.conversation_events(relay, "origin", 0)
-    assert origin_listening["availability"] == "listening"
-    refute Map.has_key?(origin_listening, "message")
+    assert item_availability(relay) == %{"state" => "listening"}
+    assert {:ok, [], 0} = RelayReaders.conversation_events(relay, "reader", 0)
 
     agent_feed_activity(relay, :close)
-    assert {:ok, [detached], 2} = RelayReaders.conversation_events(relay, "reader", 1)
-    assert detached["availability"] == "not_listening"
-    assert is_integer(detached["last_detached_at"])
+
+    assert %{"state" => "not_listening", "last_detached_at_ms" => stamp} =
+             item_availability(relay)
+
+    assert is_integer(stamp)
 
     for n <- [52, 53] do
       assert {:ok, 200, _, false} =
@@ -2951,26 +2951,21 @@ defmodule AttentionServer.ConversationFeedTest do
                )
     end
 
-    assert {:ok, [gone], 3} = RelayReaders.conversation_events(relay, "reader", 2)
-    assert gone["availability"] == "gone"
-    assert gone["request_revision"] == 1
+    assert %{"state" => "gone"} = item_availability(relay)
     assert {:ok, [], 0} = RelayReaders.events(relay, "other", 0)
 
     GenServer.stop(relay)
     assert {:ok, restarted} = Relay.start_link(store_path: path)
     assert {:ok, [initial], 1} = RelayReaders.events(restarted, "reader", 0)
-    assert {:ok, changes, 3} = RelayReaders.conversation_events(restarted, "reader", 0)
-    replayed = [initial | changes]
-
-    assert Enum.map(replayed, & &1["availability"]) ==
-             ~w(not_listening listening not_listening gone)
+    assert {:ok, [], 0} = RelayReaders.conversation_events(restarted, "reader", 0)
+    assert %{"state" => "gone"} = item_availability(restarted)
 
     assert %{"availability" => %{"state" => "gone"}} = agent_message(restarted, "availability")
 
     GenServer.stop(restarted)
   end
 
-  test "availability snapshots persist and replay after process restart", %{
+  test "availability refreshes after restart without replaying chat history", %{
     path: path
   } do
     assert {:ok, relay} = Relay.start_link(store_path: path)
@@ -3004,8 +2999,8 @@ defmodule AttentionServer.ConversationFeedTest do
     assert after_version == before_version + 1
     assert after_payload != before_payload
     assert :crypto.hash(:sha256, after_payload) == after_checksum
-    assert {:ok, [listening], 1} = RelayReaders.conversation_events(relay, "reader", 0)
-    assert listening["availability"] == "listening"
+    assert item_availability(relay) == %{"state" => "listening"}
+    assert {:ok, [], 0} = RelayReaders.conversation_events(relay, "reader", 0)
 
     assert :ok = Relay.setup_person(relay, "B")
     {next_version, next_payload, next_checksum} = state_snapshot(path)
@@ -3019,12 +3014,12 @@ defmodule AttentionServer.ConversationFeedTest do
     assert {:ok, [initial], 1} = RelayReaders.events(restarted, "reader", 0)
     assert initial["availability"] == "not_listening"
 
-    # The listening fact replays; no feed is open after the restart, so the
-    # Relay records the session as not listening once.
-    assert {:ok, [replayed, reset], 2} = RelayReaders.conversation_events(restarted, "reader", 0)
-    assert replayed == listening
-    assert reset["availability"] == "not_listening"
-    assert is_integer(reset["last_detached_at"])
+    assert {:ok, [], 0} = RelayReaders.conversation_events(restarted, "reader", 0)
+
+    assert %{"state" => "not_listening", "last_detached_at_ms" => stamp} =
+             item_availability(restarted)
+
+    assert is_integer(stamp)
 
     assert {:error, :person_exists} = Relay.setup_person(restarted, "B")
 
@@ -3060,8 +3055,7 @@ defmodule AttentionServer.ConversationFeedTest do
     GenServer.stop(relay)
 
     # A 0.1 origin declared listening support for its session; client API v2
-    # never writes one. The stored record decodes on a cold reopen and still
-    # feeds the session's availability facts.
+    # never writes one. The stored record survives a cold reopen.
     support = %{
       "type" => "support",
       "op_id" => op(92),
@@ -3085,8 +3079,8 @@ defmodule AttentionServer.ConversationFeedTest do
              declared
 
     agent_feed_activity(restarted, :open)
-    assert {:ok, facts, _} = RelayReaders.conversation_events(restarted, "reader", 0)
-    assert %{"availability" => "listening", "listening_support" => ^declared} = List.last(facts)
+    assert item_availability(restarted) == %{"state" => "listening"}
+    assert {:ok, [], 0} = RelayReaders.conversation_events(restarted, "reader", 0)
 
     duplicate_state = state_snapshot(path)
 

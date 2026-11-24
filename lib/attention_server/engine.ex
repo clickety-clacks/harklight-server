@@ -2566,39 +2566,6 @@ defmodule AttentionServer.Engine do
     )
   end
 
-  @doc false
-  def agent_feed_availability(engine, {person, _, _} = scope, status, detached_at, keys) do
-    requests =
-      keys
-      |> open_availability_requests(engine)
-      |> Enum.reject(fn {key, record} ->
-        summary = Map.get(engine.route_b_index.conversation_summary_by_item, key, %{})
-
-        current =
-          case summary do
-            %{availability: %{payload: %{"availability" => available}}} -> available
-            _ -> get_in(engine.events, [{person, record.accepted_seq}, :payload, "availability"])
-          end
-
-        current == status
-      end)
-
-    write_origin_availability(
-      engine,
-      scope,
-      status,
-      detached_at,
-      requests,
-      %{"availability_source" => "agent_feed"}
-    )
-  end
-
-  defp open_availability_requests(keys, engine) do
-    for key <- keys,
-        %{terminal: nil} = record <- [Map.get(engine.messages, key)],
-        do: {key, record}
-  end
-
   defp write_origin_availability(
          engine,
          {person, origin, handle},

@@ -549,7 +549,7 @@ defmodule AttentionServer.ClientAPI.Reads do
 
   defp render_item(state, principal, item_key, rank) do
     state.store.engine
-    |> Resources.item(item_key, rank)
+    |> Resources.item(item_key, rank, AttentionServer.AgentAPI.FeedActivity.activity(state))
     |> Resources.stamp(rev(state, principal.person, ChangeLog.item_resource(item_key)))
     |> then(&Resources.render(:item, &1, principal))
   end

@@ -685,6 +685,13 @@ defmodule AttentionServer.ChangeLog do
   end
 
   @doc false
+  def refresh_items(engine, keys) do
+    pending = log_rows(engine, keys, [], [], [])
+    seeded = Map.new(pending, fn {person, _} -> {person, seeded_from_highs?(engine, person)} end)
+    %{pending: pending, seeded: seeded, closings: [], created: %{}, agent_pending: %{}}
+  end
+
+  @doc false
   # The parts of two commit logs that differ, as `{part, touched, whole}`.
   # Closings are compared as sets because their order carries no meaning.
   def commit_log_mismatches(touched, whole) do
@@ -866,12 +873,45 @@ defmodule AttentionServer.ChangeLog do
                  "ON CONFLICT (person_id, resource_id) DO UPDATE SET rev = excluded.rev",
                [person, resource_id, rev]
              ),
+           :ok <- stamp_item_writer(db, person, kind, resource_id, rev),
            :ok <- stamp_created(db, person, resource_id, now, created) do
         {:cont, {:ok, rev}}
       else
         error -> {:halt, error}
       end
     end)
+  end
+
+  # The marker lives only in the revision index. It is never a feed resource.
+  # An older server can write a newer Item rev without updating the marker.
+  defp stamp_item_writer(db, person, :item, resource_id, rev) do
+    run(
+      db,
+      "INSERT INTO client_resource_revs (person_id, resource_id, rev) VALUES (?, ?, ?) " <>
+        "ON CONFLICT (person_id, resource_id) DO UPDATE SET rev = excluded.rev",
+      [person, availability_writer(resource_id), rev]
+    )
+  end
+
+  defp stamp_item_writer(_, _, _, _, _), do: :ok
+
+  defp availability_writer(resource_id), do: "availability-writer:" <> resource_id
+
+  @doc false
+  def old_item_writer?(%AttentionServer.Store{db: db}, {person, _, _} = key) do
+    resource = item_resource(key)
+
+    case one(
+           db,
+           "SELECT item_rev.rev FROM client_resource_revs item_rev " <>
+             "LEFT JOIN client_resource_revs writer ON writer.person_id = item_rev.person_id " <>
+             "AND writer.resource_id = ? WHERE item_rev.person_id = ? AND item_rev.resource_id = ? " <>
+             "AND (writer.rev IS NULL OR item_rev.rev > writer.rev)",
+           [availability_writer(resource), person, resource]
+         ) do
+      {:ok, row} -> {:ok, row != nil}
+      error -> error
+    end
   end
 
   # A person's log starts on first use: at rev 1 with every existing resource

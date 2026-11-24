@@ -51,6 +51,11 @@ defmodule AttentionServer.Conversation do
     handle = record.session_handle
     session_key = {person, origin, handle}
 
+    engine =
+      if Map.get(record, :agent_api_v2),
+        do: reopen(engine, session_key, :accepted_send),
+        else: engine
+
     session =
       Map.get(engine.origin_sessions, session_key, %{
         vendor_session_id: record.vendor_session_id,
@@ -350,13 +355,22 @@ defmodule AttentionServer.Conversation do
     end
   end
 
-  @doc false
-  def session_end_transition(engine, scope) do
-    case Map.fetch!(engine.origin_sessions, scope) do
-      %{gone: true} -> :unchanged
-      %{last_detached_at: detached_at} -> {:ended, detached_at}
+  def reopened?(before, after_engine, scope) do
+    match?(%{gone: true}, Map.get(before.origin_sessions, scope)) and
+      match?(%{gone: false}, Map.get(after_engine.origin_sessions, scope))
+  end
+
+  def reopen(engine, {person, origin, handle} = scope, act)
+      when is_binary(handle) and act in [:accepted_send, :scoped_stream] do
+    with {:ok, ^person} <- Engine.authorized_person(engine, origin),
+         %{gone: true} = session <- Map.get(engine.origin_sessions, scope) do
+      Engine.put_row(engine, :origin_sessions, scope, %{session | gone: false})
+    else
+      _ -> engine
     end
   end
+
+  def reopen(engine, _, _), do: engine
 
   def mark_gone(engine, person, origin, handle) do
     key = {person, origin, handle}

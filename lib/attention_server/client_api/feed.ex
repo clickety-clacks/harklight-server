@@ -192,6 +192,7 @@ defmodule AttentionServer.ClientAPI.FeedStep do
          {:ok, rows, more, position} <- ChangeLog.read(state.store, person, cursor, limit) do
       context = %{
         engine: state.store.engine,
+        activity: AttentionServer.AgentAPI.FeedActivity.activity(state),
         store: state.store,
         compact_entries?: mode == :catch_up,
         view: Map.get(Map.get(state, :priority_views, %{}), person)

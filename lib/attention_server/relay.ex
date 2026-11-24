@@ -33,6 +33,7 @@ defmodule AttentionServer.Relay do
     JevClient,
     JevRanking,
     Placement,
+    RouteBIndex,
     Store
   }
 
@@ -1121,15 +1122,24 @@ defmodule AttentionServer.Relay do
     case Engine.origin_session_gone(state.store.engine, key, handle) do
       {:ok, next} ->
         {:ok, person} = Engine.authorized_person(next, key)
-        next = end_session_availability(state, next, {person, key, handle})
+        scope = {person, key, handle}
 
         case commit(
                state.store,
                next,
                audit(state.store.engine, key, "origin_session_gone")
              ) do
-          {:ok, store} -> {:reply, :ok, %{state | store: store}}
-          _ -> {:reply, {:error, :storage_unavailable}, state}
+          {:ok, store} ->
+            next =
+              AttentionServer.AgentAPI.FeedActivity.refresh_session(
+                %{state | store: store},
+                scope
+              )
+
+            {:reply, :ok, next}
+
+          _ ->
+            {:reply, {:error, :storage_unavailable}, state}
         end
 
       error ->
@@ -1576,7 +1586,7 @@ defmodule AttentionServer.Relay do
   defp dispatch_call({:device_remove, key}, _from, state) do
     case Engine.device_remove(state.store.engine, key) do
       {:ok, next, reply} ->
-        next = revoke_origin_sessions(state, next, reply["person_id"], key)
+        next = revoke_origin_sessions(next, reply["person_id"], key)
 
         case commit_device_removal(
                state,
@@ -1686,7 +1696,7 @@ defmodule AttentionServer.Relay do
   defp dispatch_call({:owner_revoke_device, person, owner_key, device_key}, _from, state) do
     case Engine.owner_revoke_device(state.store.engine, person, owner_key, device_key) do
       {:ok, next_engine} ->
-        next_engine = revoke_origin_sessions(state, next_engine, person, device_key, :include_v2)
+        next_engine = revoke_origin_sessions(next_engine, person, device_key)
 
         case commit_device_removal(
                state,
@@ -2012,7 +2022,7 @@ defmodule AttentionServer.Relay do
 
     case Engine.revoke_device(state.store.engine, key) do
       {:ok, next_engine} ->
-        next_engine = revoke_origin_sessions(state, next_engine, person, key)
+        next_engine = revoke_origin_sessions(next_engine, person, key)
 
         case commit_device_removal(
                state,
@@ -2718,6 +2728,29 @@ defmodule AttentionServer.Relay do
     )
   end
 
+  defp refresh_new_agent_session(
+         before,
+         next,
+         origin,
+         %{:agent_api_v2 => true, "type" => "forward", "session_handle" => handle}
+       )
+       when is_binary(handle) do
+    old = before.store.engine
+    engine = next.store.engine
+
+    with {:ok, person} <- Engine.authorized_person(engine, origin),
+         scope = {person, origin, handle},
+         true <-
+           Conversation.reopened?(old, engine, scope) or
+             not RouteBIndex.v2_session?(old.route_b_index, scope) do
+      AttentionServer.AgentAPI.FeedActivity.refresh_session(next, scope)
+    else
+      _ -> next
+    end
+  end
+
+  defp refresh_new_agent_session(_, next, _, _), do: next
+
   defp record_staged_reply_sources(engine, sources) when map_size(sources) == 0, do: engine
 
   defp record_staged_reply_sources(engine, sources) do
@@ -2779,7 +2812,7 @@ defmodule AttentionServer.Relay do
                 next_state
             end
 
-          {reply, next_state}
+          {reply, refresh_new_agent_session(state, next_state, key, original)}
 
         {:error, _, _} ->
           {{:ok, error_line(original, "storage_unavailable")}, state}
@@ -3581,16 +3614,6 @@ defmodule AttentionServer.Relay do
     Enum.sort(handles)
   end
 
-  defp end_session_availability(state, next, {person, key, handle} = scope, protocol \\ :all) do
-    case Conversation.session_end_transition(state.store.engine, scope) do
-      :unchanged ->
-        next
-
-      {:ended, detached_at} ->
-        Engine.origin_availability(next, person, key, handle, "gone", detached_at, protocol)
-    end
-  end
-
   # No origin stream attaches to a protocol 0.1 session handle any more, so the
   # legacy status of a stored session never reports a listener. Client API v2
   # sessions report availability through FeedActivity.
@@ -3657,10 +3680,24 @@ defmodule AttentionServer.Relay do
 
         case Store.delete_uploads(store, removed, audit) do
           {:ok, store} ->
-            {:ok, %{next | store: store}}
+            next =
+              AttentionServer.AgentAPI.FeedActivity.refresh_origin(
+                %{next | store: store},
+                person,
+                key
+              )
+
+            {:ok, next}
 
           {:error, reason, store} ->
-            {:error, reason, %{next | store: store}, :committed}
+            next =
+              AttentionServer.AgentAPI.FeedActivity.refresh_origin(
+                %{next | store: store},
+                person,
+                key
+              )
+
+            {:error, reason, next, :committed}
         end
 
       {:error, reason, _store} ->
@@ -3668,37 +3705,13 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  defp revoke_origin_sessions(state, engine, person, origin, mode \\ :legacy) do
-    engine.origin_sessions
-    |> Enum.filter(fn {{session_person, session_origin, _handle}, _session} ->
-      session_person == person and session_origin == origin
-    end)
-    |> Enum.sort_by(fn {{_session_person, _session_origin, handle}, _session} -> handle end)
-    |> Enum.reduce(engine, fn {{^person, ^origin, handle} = key, _session}, current ->
-      previous = origin_session_status(state.store.engine, key)
+  defp revoke_origin_sessions(engine, person, origin) do
+    index = engine.route_b_index
 
+    Enum.reduce(RouteBIndex.origin_sessions(index, person, origin), engine, fn handle, current ->
       case Conversation.mark_gone(current, person, origin, handle) do
-        {:ok, gone} ->
-          current_status = origin_session_status(gone, key)
-
-          # A v2 item can report availability without legacy listening support.
-          # Keep the legacy projection for other items sharing this session.
-          if mode == :include_v2 and
-               match?({:ok, %{"availability" => "unsupported"}}, current_status) do
-            end_session_availability(state, gone, key, :agent_v2)
-          else
-            append_origin_availability_if_changed(
-              gone,
-              person,
-              origin,
-              handle,
-              previous,
-              current_status
-            )
-          end
-
-        _ ->
-          current
+        {:ok, gone} -> gone
+        _ -> current
       end
     end)
   end
@@ -3803,9 +3816,14 @@ defmodule AttentionServer.Relay do
     with {:ok, person} <- Engine.authorized_person(engine, key),
          item = {person, message["sender_id"], message["message_id"]},
          false <- Map.has_key?(state.store.engine.messages, item),
-         %{agent_api_v2: true, origin: ^key, accepted_seq: seq, session_handle: session}
-         when is_binary(session) <- Map.get(engine.messages, item) do
-      listening = AttentionServer.AgentAPI.FeedActivity.listening?(state, {person, key, session})
+         %{agent_api_v2: true, origin: ^key, accepted_seq: seq, session_handle: handle}
+         when is_binary(handle) <- Map.get(engine.messages, item) do
+      activity = AttentionServer.AgentAPI.FeedActivity.activity(state)
+
+      listening =
+        AttentionServer.AgentAPI.FeedActivity.item_availability(engine, item, activity)["state"] ==
+          "listening"
+
       Engine.agent_feed_delivery_availability(engine, person, seq, listening)
     else
       _ -> with_initial_origin_availability(state, key, engine)

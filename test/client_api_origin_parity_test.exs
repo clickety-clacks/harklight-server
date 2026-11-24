@@ -181,16 +181,133 @@ defmodule AttentionServer.ClientAPIOriginParityTest do
     {first, _first_feed, change} = next_change(first, first_feed)
     {second, second_feed, same} = next_change(second, second_feed)
     assert change.id > head
-    assert same == change
+    assert same.data["entry_id"] == change.data["entry_id"]
+    assert same.data["text"] == change.data["text"]
 
     Mint.HTTP.close(first)
     assert person_reply(ctx, id, 3).status == 200
-    {second, _second_feed, later} = next_change(second, second_feed)
+    {second, _second_feed, later} = next_change(second, second_feed, "Turn 3")
     assert later.id > change.id
     Mint.HTTP.close(second)
   end
 
-  test "owner revocation closes feeds and records one durable gone entry per affected v2 item",
+  test "closed chats follow a scoped listener from a saved client position", ctx do
+    id = item_id(send_message(ctx, @origin, 1))
+
+    assert request(ctx, "a2", "POST", answer_path(id), %{"request_revision" => 1}, 2).status ==
+             200
+
+    cached = decode(get(ctx, "a2", "/v2/items/#{id}"))["item"]
+    assert cached["terminal"]["state"] == "answered"
+    assert cached["availability"]["state"] == "not_listening"
+    cursor = person_head(ctx, ctx.person)
+
+    {conn, _feed} = open_agent_feed(ctx, agent_head(ctx), @session)
+
+    try do
+      assert eventually(fn -> availability(ctx, "a2", id) == "listening" end)
+
+      assert %{"changes" => [%{"kind" => "item", "data" => refreshed}], "rev" => position} =
+               decode(get(ctx, "a2", "/v2/changes?after=#{cursor}"))
+
+      assert refreshed["rev"] > cached["rev"]
+      assert refreshed["availability"]["state"] == "listening"
+      assert Map.drop(refreshed, ~w(rev availability)) == Map.drop(cached, ~w(rev availability))
+
+      Mint.HTTP.close(conn)
+      assert eventually(fn -> availability(ctx, "a2", id) == "not_listening" end)
+
+      assert %{"changes" => [%{"kind" => "item", "data" => detached}]} =
+               decode(get(ctx, "a2", "/v2/changes?after=#{position}"))
+
+      assert detached["rev"] > refreshed["rev"]
+      assert detached["availability"]["state"] == "not_listening"
+    after
+      Mint.HTTP.close(conn)
+    end
+  end
+
+  test "only a new scoped SSE or accepted send reopens an ended session", ctx do
+    closed = item_id(send_message(ctx, @origin, 1))
+    open = item_id(send_message(ctx, @origin, 2))
+
+    assert request(ctx, "a2", "POST", answer_path(closed), %{"request_revision" => 1}, 3).status ==
+             200
+
+    end_path = "/v2/agent/sessions/#{@session}/end"
+    assert request(ctx, @origin, "POST", end_path, %{}, 4).status == 200
+    assert availability(ctx, "a2", closed) == "gone"
+    assert availability(ctx, "a2", open) == "gone"
+
+    head = agent_head(ctx)
+    broad_path = "/v2/agent/changes?after=#{head}"
+    scoped_path = broad_path <> "&session=#{@session}"
+    assert get(ctx, @origin, scoped_path).status == 200
+    assert get(ctx, @origin, broad_path).status == 200
+    {unscoped, _feed} = open_agent_feed(ctx, head)
+    assert item_id(send_message(ctx, @origin, 1)) == closed
+    assert :ok = Relay.setup_sender(ctx.relay, ctx.keys["a2"], "app:test")
+    assert send_message(ctx, "a2", 5).status == 200
+    assert availability(ctx, "a2", closed) == "gone"
+    assert availability(ctx, "a2", open) == "gone"
+    Mint.HTTP.close(unscoped)
+
+    {scoped, _feed} = open_agent_feed(ctx, head, @session)
+    assert eventually(fn -> availability(ctx, "a2", closed) == "listening" end)
+    assert availability(ctx, "a2", open) == "listening"
+
+    assert request(ctx, @origin, "POST", end_path, %{}, 6).status == 200
+    assert availability(ctx, "a2", closed) == "gone"
+    assert availability(ctx, "a2", open) == "gone"
+    Mint.HTTP.close(scoped)
+
+    assert send_message(ctx, @origin, 7).status == 200
+    assert availability(ctx, "a2", closed) == "listening"
+    assert :ok = stop_supervised(Server)
+    server = start_supervised!({Server, ctx.server_opts})
+    reopened = %{ctx | relay: Server.relay(server), port: Server.port(server)}
+    assert availability(reopened, "a2", closed) == "not_listening"
+    assert availability(reopened, "a2", open) == "not_listening"
+  end
+
+  test "overlapping coverage and lease renewal emit only effective changes", ctx do
+    id = item_id(send_message(ctx, @origin, 1))
+    head = agent_head(ctx)
+    path = "/v2/agent/changes?after=#{head}&session=#{@session}"
+    cursor = person_head(ctx, ctx.person)
+
+    assert get(ctx, @origin, path).status == 200
+    assert eventually(fn -> availability(ctx, "a2", id) == "listening" end)
+    active = person_head(ctx, ctx.person)
+    assert active == cursor + 1
+
+    assert get(ctx, @origin, path).status == 200
+    {conn, _feed} = open_agent_feed(ctx, head, @session)
+
+    scope = {ctx.person, ctx.keys[@origin], @session}
+    assert eventually(fn ->
+             get_in(:sys.get_state(ctx.relay), [:agent_feed_activity, :open, scope]) == 1
+           end)
+
+    state = :sys.get_state(ctx.relay)
+    {_, token} = state.agent_feed_activity.batches[scope]
+    send(ctx.relay, {:agent_feed_activity, {:expire, token}, scope})
+
+    assert availability(ctx, "a2", id) == "listening"
+    assert person_head(ctx, ctx.person) == active
+    Mint.HTTP.close(conn)
+    assert eventually(fn -> availability(ctx, "a2", id) == "not_listening" end)
+    assert person_head(ctx, ctx.person) == active + 1
+  end
+
+  defp eventually(check, attempts \\ 80)
+  defp eventually(check, 0), do: check.()
+
+  defp eventually(check, attempts) do
+    check.() or (Process.sleep(25) == :ok and eventually(check, attempts - 1))
+  end
+
+  test "owner revocation closes feeds and refreshes only affected v2 items",
        ctx do
     first = item_id(send_message(ctx, @origin, 1))
     second = item_id(send_message(ctx, @origin, 2))
@@ -244,11 +361,11 @@ defmodule AttentionServer.ClientAPIOriginParityTest do
   end
 
   defp assert_gone_items(ctx, cursor, first, second, ended, other_origin) do
-    assert gone_changes(ctx, "a2", cursor) == [first, second]
+    assert Enum.sort(gone_changes(ctx, "a2", cursor)) == Enum.sort([first, second])
 
     for id <- [first, second, ended] do
       assert availability(ctx, "a2", id) == "gone"
-      assert [_entry] = Enum.filter(item_entries(ctx, id), &gone_entry?/1)
+      refute Enum.any?(item_entries(ctx, id), &(&1["kind"] == "availability"))
     end
 
     assert availability(ctx, "a2", other_origin) != "gone"
@@ -265,11 +382,10 @@ defmodule AttentionServer.ClientAPIOriginParityTest do
     response = get(ctx, reader, "/v2/changes?after=#{cursor}")
     assert response.status == 200
     assert %{"changes" => changes, "more" => false} = decode(response)
-    for %{"kind" => "entry", "data" => entry} <- changes, gone_entry?(entry), do: entry["item_id"]
-  end
 
-  defp gone_entry?(entry),
-    do: match?(%{"kind" => "availability", "availability" => %{"state" => "gone"}}, entry)
+    for %{"kind" => "item", "data" => %{"availability" => %{"state" => "gone"}} = item} <- changes,
+        do: item["item_id"]
+  end
 
   defp availability(ctx, reader, id) do
     response = get(ctx, reader, "/v2/items/#{id}")
@@ -330,9 +446,9 @@ defmodule AttentionServer.ClientAPIOriginParityTest do
     head
   end
 
-  defp open_agent_feed(ctx, head) do
+  defp open_agent_feed(ctx, head, session \\ nil) do
     conn = ClientAPIFeedClient.connect(ctx.port, ctx.certs, @origin)
-    path = "/v2/agent/changes?after=#{head}"
+    path = "/v2/agent/changes?after=#{head}" <> if(session, do: "&session=#{session}", else: "")
 
     assert {:ok, conn, ref} =
              Mint.HTTP.request(conn, "GET", path, [{"accept", "text/event-stream"}], nil)
@@ -343,10 +459,14 @@ defmodule AttentionServer.ClientAPIOriginParityTest do
     {conn, feed}
   end
 
-  defp next_change(conn, feed) do
+  defp next_change(conn, feed, text \\ nil) do
     case ClientAPIFeedClient.events(conn, feed, 1) do
-      {conn, feed, [%{id: _} = event]} -> {conn, feed, event}
-      {conn, feed, [_heartbeat_or_focus]} -> next_change(conn, feed)
+      {conn, feed, [%{id: _, data: %{"text" => message}} = event]}
+      when is_nil(text) or text == message ->
+        {conn, feed, event}
+
+      {conn, feed, [_]} ->
+        next_change(conn, feed, text)
     end
   end
 

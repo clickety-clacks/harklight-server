@@ -361,6 +361,68 @@ defmodule AttentionServer.ClientAPIFeedClosingTest do
       end
     end
 
+    test "browser SSE and JSON replace an ended closed chat at a saved revision", ctx do
+      agent = connect(ctx.port, ctx.certs, "a2")
+
+      {agent, sent} =
+        json_request(
+          agent,
+          "POST",
+          "/v2/agent/messages",
+          %{
+            "sender" => "app:test",
+            "session" => @handle,
+            "message" => %{"title" => "Closed chat", "created_at" => 1}
+          },
+          1
+        )
+
+      item = sent["message"]["item_id"]
+
+      {agent, _} = json_request(agent, "POST", "/v2/agent/messages/#{item}/retract", %{}, 2)
+      {agent, ended} = json_request(agent, "POST", "/v2/agent/sessions/#{@handle}/end", %{}, 3)
+
+      headers = [cookie(ctx)]
+      browser = connect(ctx.web_port, ctx.certs)
+      {browser, 200, cached} = batch(browser, "?after=0", headers)
+
+      assert [%{"data" => %{"availability" => %{"state" => "gone"}} = gone}] =
+               Enum.filter(cached["changes"], &(&1["kind"] == "item"))
+
+      cursor = cached["rev"]
+      {browser, feed} = open_feed(browser, "?after=#{cursor}", headers)
+      {browser, feed} = await_open(browser, feed)
+      assert feed.status == 200
+
+      path = "/v2/agent/changes?session=#{@handle}&after=#{ended["rev"]}"
+
+      assert {:ok, agent, ref} =
+               Mint.HTTP.request(agent, "GET", path, [{"accept", "text/event-stream"}], nil)
+
+      agent_feed = %{ref: ref, buffer: "", status: nil, headers: [], done: false}
+      {agent, agent_feed} = await_open(agent, agent_feed)
+      assert agent_feed.status == 200
+
+      {browser, feed, [%{event: "item", id: rev, data: updated}]} = events(browser, feed, 1)
+      assert rev == updated["rev"] and rev > gone["rev"]
+      assert updated["availability"] == %{"state" => "listening"}
+      assert Map.drop(updated, ~w(rev availability)) == Map.drop(gone, ~w(rev availability))
+
+      json = connect(ctx.web_port, ctx.certs)
+      {json, 200, %{"changes" => [%{"kind" => "item", "rev" => latest_rev, "data" => latest}]}} =
+        batch(json, "?after=#{cursor}", headers)
+
+      if latest_rev > rev do
+        {browser, _, subsequent} = changes_through(browser, feed, latest_rev)
+        assert List.last(subsequent).data == latest
+        Mint.HTTP.close(browser)
+      else
+        assert latest == updated
+      end
+
+      Enum.each([agent, browser, json], &Mint.HTTP.close/1)
+    end
+
     test "an Entry updated after a backlog page can appear once more at its new revision", ctx do
       item = forward(ctx, "backlog-handoff", 1, ctx.agent)
       device = connect(ctx.port, ctx.certs, "b1")
