@@ -1693,9 +1693,13 @@ attempt, authenticated origin and session filter.
 
 - With `page`, return `{rev, changes, next_page?}` using the same `rev`.
   `changes` contains pending person Chat as AgentEntry changes and pending
-  answers as SentMessage changes, using their existing stable IDs. An entry
-  or answer may have a resource revision at or below `rev`. Pages follow
-  the pending turns' original order within the origin. Use §6 batch limits.
+  answers as SentMessage changes. A Chat turn is identified by its
+  `entry_id`. An answer is identified by origin, `item_id` and answer kind.
+  An item accepts only one terminal answer. Pending enumeration excludes
+  turns arriving above the fixed bound. A covered turn may render current
+  state at a resource revision above or below `rev`. Its resource revision
+  does not move the checkpoint. Pages follow the pending turns' original
+  order within the origin. Use §6 batch limits.
   Continue until `next_page` is absent, including after an empty page.
   Tokens have bounded length and encode only the attempt, scope and fixed
   bounds, plus the scan position. The Server holds no growing per-attempt
@@ -1710,7 +1714,9 @@ attempt, authenticated origin and session filter.
 - Record Delivered once before writing a page. Retry the same page token
   on failure or partial commit, including across restarts. Retry makes
   the same attempt's still-eligible work available by stable ID, even
-  after its first-serve commit. If receipt, handoff or action for that
+  after its first-serve commit. The original page-one token remains usable
+  after serving later pages or restarting, while the covered work remains
+  retained and the consumer has not acknowledged applying it. If receipt, handoff or action for that
   turn has since been recorded, the page may show the current facts for
   reconciliation and must treat it as an update instead of pending work.
   A fresh attempt excludes earlier service from any path, including 0.2.5
@@ -1720,19 +1726,29 @@ attempt, authenticated origin and session filter.
 - Durably apply and deduplicate pending work by stable turn ID before
   advancing a page or the baseline checkpoint, including a crash between
   application and checkpoint. Catch up from `rev` to cover concurrent
-  arrivals. Reconcile subsequent ACK1-only changes without presenting
-  baseline-applied work again, and keep genuine later state changes.
-  If `rev` expired, finish applying the current attempt, then recover
-  still-pending work using a new attempt in the same scope before
-  advancing the checkpoint.
-- Agent 0.2.1 is required with the implementing Server for FIRST-2,
-  FIRST-3 and MIG-5. Agent 0.2.0 keeps its previous behavior, including
+  arrivals. Baseline and feed changes use the same resource projection.
+  Suppress a replay only when the applied data at that stable identity
+  matches after ignoring revision and ACK1's Delivered bookkeeping.
+  Keep handoff outcomes, content, attachments and lifecycle changes.
+  An older replay never replaces a newer applied projection.
+  For Agent-owned checkpoints, save the applied projection and checkpoint
+  together. A caller-owned cursor acknowledges only when the same consumer
+  returns its covering applied cursor. Output and process exit do not
+  acknowledge it. If `rev` expired, finish applying the current attempt,
+  then recover still-pending work in the same scope before advancing.
+- Agent 0.2.1 `read` and `listen` use pending-only baseline output by default
+  on a supporting Server, with the existing boundary markers. Use explicit
+  message and entry reads to reconstruct history. Agent 0.2.1 is required
+  with the implementing Server for FIRST-2, FIRST-3 and MIG-5. Agent 0.2.0 keeps its previous behavior, including
   the missing Chat and absent Delivered marks in MIG-9/MIG-10. It skips
   terminal-item entry reads on baseline and cannot consume the new
   attempt. Agent 0.2.1 falls back to the earlier snapshot and feed
-  behavior only on `404 not_found` from the new route's preparation
-  request, the older Server's explicit unsupported-route result. Propagate
-  other errors and preserve an already-negotiated attempt.
+  behavior only on a typed, authenticated `404 not_found` from the
+  tokenless preparation request. Propagate other errors and preserve an
+  already-negotiated attempt.
+- Ordinary feed resumes recover a failed write within change-log retention.
+  Recovery after the ordinary feed cursor expires is tracked separately
+  (wi_b7c0f768-7e65-46f1-84af-1272b6faa71a).
 
 #### Receiving capability
 
@@ -1783,7 +1799,7 @@ elapsed time or a pre-write Delivered record supplies no confirmation.
 | `GET /v2/agent/changes` with optional `session` (agent spec r2 §4) | `feed`, change notices, session listen, coverage stream |
 | Automatic when the feed serves the turn (agent spec r2 §4) | `ack` (ACK1) |
 | `POST /v2/agent/messages/{item_id}/entries/{entry_id}/file-use` with `transfer` and reason when required | ACK1 attachment transfer reports (round 20 addendum 4) |
-| `GET /v2/agent/messages` | Baseline for a new or expired feed cursor |
+| `GET /v2/agent/delivery-baseline` | Pending work for a new or expired feed cursor |
 | Retired. Feed activity supplies availability (agent spec r2 §§0, 4) | `support`, `attachment_update`, `status`, `coverage` |
 | Retired. Feeds are independent (agent spec r2 §§0, 4) | Exclusive listener, reconnect takeover |
 | `advisory` changes on `GET /v2/agent/changes` (agent spec r2 §4) | `advisory_feed` |

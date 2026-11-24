@@ -144,8 +144,25 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
       assert %{"message" => %{"terminal" => %{"delivery" => %{"delivered" => true}}}} =
                decode_response(get(ctx, "a1", "/v2/agent/messages/#{item}"))
 
+      [baseline_chat] = first["changes"]
+      feed_path = "/v2/agent/changes?session=#{@first_session}"
+      assert %{"rev" => caught_up, "changes" => changes} =
+               decode_response(get(ctx, "a1", feed_path <> "&after=#{rev}"))
+
+      assert replay = Enum.find(changes, &(get_in(&1, ["data", "entry_id"]) == entry))
+      assert replay["rev"] > baseline_chat["rev"]
+      assert get_in(replay, ["data", "delivery", "delivered"]) == true
+      assert normalize_delivery_replay(replay) == normalize_delivery_replay(baseline_chat)
+
       receipt = "/v2/agent/messages/#{item}/entries/#{entry}/receipt"
       assert request(ctx, "a1", "POST", receipt, %{"outcome" => "handed"}, 6).status == 200
+
+      assert %{"changes" => changes} =
+               decode_response(get(ctx, "a1", feed_path <> "&after=#{caught_up}"))
+
+      assert updated = Enum.find(changes, &(get_in(&1, ["data", "entry_id"]) == entry))
+      assert get_in(updated, ["data", "delivery", "outcome"]) == "handed"
+      refute normalize_delivery_replay(updated) == normalize_delivery_replay(replay)
       assert %{"changes" => []} = decode_response(get(ctx, "a1", first_path, headers))
 
       assert %{"next_page" => fresh} = decode_response(get(ctx, "a1", path, headers))
@@ -1770,6 +1787,13 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
 
     assert %{"already_delivered" => true} =
              contract(ctx, "AgentAdvisoryAckResult", request(ctx, "a1", "POST", path, body, 3))
+  end
+
+  defp normalize_delivery_replay(change) do
+    change
+    |> Map.delete("rev")
+    |> update_in(["data"], &Map.delete(&1, "rev"))
+    |> update_in(["data", "delivery"], &Map.delete(&1, "delivered"))
   end
 
   defp person_chat(ctx, path, id) do
