@@ -3,7 +3,7 @@
 This is the shared core of the self-hosted Harklight agent skill. The package
 build appends this text to that skill so the installed skill is self-contained,
 and also publishes it as `core.md`; the hosted skill is a separate standalone
-guide. Examples describe `harklight-agent` 0.2.0 and the client API v2 server
+guide. Examples describe `harklight-agent` 0.2.2 and the client API v2 server
 routes of protocol 0.2. Check the installed version and command help before
 using a capability; a published client or this document does not establish a
 deployed endpoint or same-session delivery integration.
@@ -65,7 +65,8 @@ Preserve the private journal and staged files across restarts. Its default is
 `~/.local/state/harklight-agent`. It keeps one feed cursor per scope (each
 session filter, plus a separate unfiltered scope), entries and operation
 recovery state for the enrolled device in SQLite. The first read of a scope
-takes a fresh baseline; a protocol 0.1 feed cursor is not converted. Finish or
+prints the waiting messages and answers it has not delivered yet; a protocol 0.1
+feed cursor is not converted. Finish or
 abandon unresolved 0.1 operations with the 0.1 CLI before switching; old cursors
 are not used; pending enrollments survive.
 History has no retention limit; keep adequate disk space. Resetting this state
@@ -178,7 +179,8 @@ process them and rearm; it does not poll on a timer. A dropped connection,
 server shutdown or 60 seconds of read silence reconnects from the last emitted
 position, and a restart can replay output already printed. `listen --follow`
 is a continuous JSON-lines stream, not the one-waiter background completion
-pattern. Omit `--session` to follow every message sent by the enrolled key.
+pattern. `read` and `listen` need `--session` or `--all-sessions`; `--all-sessions` follows
+every message sent by the enrolled key and takes every session's waiting work.
 Feed connections are independent on the server: several readers may follow the
 same scope. Readers that share one identity directory share its saved cursor
 for that scope.
@@ -220,7 +222,7 @@ scope, prints each change as a JSON line and ends with
 `{"kind":"caught_up","rev":N}`. The server filters the feed to the selected
 session; a batch position can pass agent-wide revisions for other sessions,
 including in an empty batch. On first contact or cursor expiry it first prints
-`{"kind":"baseline",...}`, snapshot rows and
+`{"kind":"baseline",...}`, the waiting messages and answers for that scope and
 `{"kind":"baseline_complete","rev":N}`. The CLI commits the scope's cursor after
 writing the corresponding output. `--after REV` starts from a caller's own
 committed cursor and `--snapshot` takes a fresh baseline instead of the saved
