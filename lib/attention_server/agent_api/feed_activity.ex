@@ -22,23 +22,37 @@ defmodule AttentionServer.AgentAPI.FeedActivity do
   def listening?(state, scope),
     do: listening?(state.store.engine, activity(state), scope)
 
-  defp listening?(engine, activity, {person, origin, _} = scope) do
+  def listening?(engine, activity, {person, origin, _} = scope) do
     covered?(activity, scope) or
       (RouteBIndex.v2_session?(engine.route_b_index, scope) and
          covered?(activity, {person, origin, nil}))
   end
 
-  def item_availability(engine, {person, _, _} = key, activity) do
+  # Render only the availability committed with the Item's revision.
+  def item_availability(engine, {person, _, _} = key) do
     case Map.get(engine.messages, key) do
       %{origin: origin, session_handle: handle} = record when is_binary(handle) ->
-        scope = {person, origin, handle}
-        session = Map.get(engine.origin_sessions, scope)
+        session = Map.get(engine.origin_sessions, {person, origin, handle})
         legacy = legacy_availability(engine, key, record)
-        item_state(engine, activity, scope, session, record, legacy)
+        {status, stamp, _} = published(session, record, legacy)
+        render(status, stamp)
 
       _ ->
         nil
     end
+  end
+
+  defp published(session, record, legacy) do
+    case get_in(session, ["client_availability", record.accepted_seq]) do
+      {status, stamp, token} -> {status, stamp, token}
+      {status, stamp} -> {status, stamp, nil}
+      nil -> {baseline_status(record, legacy), legacy["last_detached_at"], nil}
+    end
+  end
+
+  defp baseline_status(record, legacy) do
+    legacy["availability"] ||
+      if(unsupported?(record, nil, legacy), do: "unsupported", else: "not_listening")
   end
 
   defp legacy_availability(engine, {person, _, _} = key, record) do
@@ -46,31 +60,25 @@ defmodule AttentionServer.AgentAPI.FeedActivity do
       get_in(engine.events, [{person, record.accepted_seq}, :payload]) || %{}
   end
 
-  defp item_state(engine, activity, {person, origin, _} = scope, session, record, legacy) do
-    status =
-      cond do
-        Map.get(session || %{}, :gone, false) or
-            Engine.authorized_person(engine, origin) != {:ok, person} ->
-          "gone"
+  defp desired_status(engine, activity, {person, origin, _} = scope, session, record, legacy) do
+    cond do
+      Map.get(session || %{}, :gone, false) or
+          Engine.authorized_person(engine, origin) != {:ok, person} ->
+        "gone"
 
-        unsupported?(record, session, legacy) ->
-          "unsupported"
+      unsupported?(record, session, legacy) ->
+        "unsupported"
 
-        listening?(engine, activity, scope) ->
-          "listening"
+      listening?(engine, activity, scope) ->
+        "listening"
 
-        true ->
-          "not_listening"
-      end
+      true ->
+        "not_listening"
+    end
+  end
 
-    published = get_in(session, ["client_availability", record.accepted_seq])
+  defp render(status, detached_at) do
     state = %{"state" => status}
-
-    detached_at =
-      case published do
-        {^status, stamp} -> stamp
-        _ -> legacy["last_detached_at"]
-      end
 
     if status != "listening" and is_integer(detached_at) and detached_at > 0,
       do: Map.put(state, "last_detached_at_ms", detached_at),
@@ -85,7 +93,10 @@ defmodule AttentionServer.AgentAPI.FeedActivity do
       end
   end
 
-  def reset(state) do
+  def reset(state, rollback_token) do
+    token = if is_binary(rollback_token) and rollback_token != "", do: rollback_token
+    state = Map.put(state, :availability_rollback_token, token)
+
     keys =
       for {key, %{session_handle: handle}} <- state.store.engine.messages,
           is_binary(handle),
@@ -226,7 +237,7 @@ defmodule AttentionServer.AgentAPI.FeedActivity do
 
     result =
       Enum.reduce_while(keys, {:ok, store.engine, []}, fn key, {:ok, engine, changed} ->
-        case prepare_item(store, engine, key, activity, state.clock) do
+        case prepare_item(store, engine, key, activity, state.clock, state.availability_rollback_token) do
           {:ok, ^engine} -> {:cont, {:ok, engine, changed}}
           {:ok, updated, true} -> {:cont, {:ok, updated, [key | changed]}}
           error -> {:halt, error}
@@ -247,30 +258,27 @@ defmodule AttentionServer.AgentAPI.FeedActivity do
     end
   end
 
-  defp prepare_item(store, engine, {person, _, _} = key, activity, clock) do
+  defp prepare_item(store, engine, {person, _, _} = key, activity, clock, token) do
     with %{origin: origin, session_handle: handle} = record when is_binary(handle) <-
            Map.get(engine.messages, key),
          scope = {person, origin, handle},
          %{} = session <- Map.get(engine.origin_sessions, scope) do
       legacy = legacy_availability(engine, key, record)
-      legacy_status = legacy["availability"]
-      current = item_state(engine, activity, scope, session, record, legacy)
-      status = current["state"]
-      published = Map.get(session, "client_availability", %{})
-      baseline =
-        legacy_status ||
-          if(unsupported?(record, session, legacy), do: "unsupported", else: "not_listening")
+      status = desired_status(engine, activity, scope, session, record, legacy)
+      {previous, stamp, applied_token} = published(session, record, legacy)
+      prior = render(previous, stamp)
+      legacy_state = render(baseline_status(record, legacy), legacy["last_detached_at"])
+      rollback_mismatch? = is_binary(legacy["availability"]) and prior != legacy_state
+      forced? = is_binary(token) and token != applied_token and rollback_mismatch?
 
-      {previous, stamp} = Map.get(published, record.accepted_seq, {baseline, nil})
-
-      with {:ok, refresh?} <- refresh?(store, key, previous, status, legacy_status) do
+      with {:ok, refresh?} <- refresh?(store, key, previous != status or forced?, rollback_mismatch?) do
         if refresh? do
           detached_at =
-            if previous == "listening" and status == "not_listening",
-              do: clock.(),
-              else: current["last_detached_at_ms"] || stamp
+            if previous == "listening" and status == "not_listening", do: clock.(), else: stamp
 
-          item = {status, detached_at}
+          repaired_token = if is_binary(token), do: token, else: applied_token
+          item = {status, detached_at, repaired_token}
+          published = Map.get(session, "client_availability", %{})
 
           updated =
             Map.put(session, "client_availability", Map.put(published, record.accepted_seq, item))
@@ -286,8 +294,7 @@ defmodule AttentionServer.AgentAPI.FeedActivity do
     end
   end
 
-  defp refresh?(_store, _key, previous, status, _) when previous != status, do: {:ok, true}
-  defp refresh?(_store, _key, _, status, legacy) when is_nil(legacy) or status == legacy,
-    do: {:ok, false}
-  defp refresh?(store, key, _, _, _), do: ChangeLog.old_item_writer?(store, key)
+  defp refresh?(_store, _key, true, _), do: {:ok, true}
+  defp refresh?(store, key, false, true), do: ChangeLog.old_item_writer?(store, key)
+  defp refresh?(_store, _key, false, false), do: {:ok, false}
 end

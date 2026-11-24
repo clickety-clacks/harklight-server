@@ -227,6 +227,33 @@ defmodule AttentionServer.ClientAPIOriginParityTest do
     end
   end
 
+  test "an inbox read between availability pages uses the committed Item revision", ctx do
+    id = item_id(send_message(ctx, @origin, 1))
+    cached = decode(get(ctx, "a2", "/v2/items/#{id}"))["item"]
+    key = :sys.get_state(ctx.relay).store.engine.messages |> Map.keys() |> hd()
+
+    # Hold this page pending as if an earlier page had yielded to HTTP.
+    :sys.replace_state(ctx.relay, &Map.put(&1, :agent_availability_jobs, MapSet.new([key])))
+    {conn, _feed} = open_agent_feed(ctx, agent_head(ctx))
+    scope = {ctx.person, ctx.keys[@origin], nil}
+
+    assert eventually(fn ->
+             get_in(:sys.get_state(ctx.relay), [:agent_feed_activity, :open, scope]) == 1
+           end)
+
+    inbox = decode(get(ctx, "a2", "/v2/inbox"))
+    assert [^cached] = inbox["items"]
+    Mint.HTTP.close(conn)
+
+    assert eventually(fn ->
+             is_nil(get_in(:sys.get_state(ctx.relay), [:agent_feed_activity, :open, scope]))
+           end)
+
+    send(ctx.relay, {:agent_feed_activity, :project, nil})
+    assert %{"changes" => []} = decode(get(ctx, "a2", "/v2/changes?after=#{inbox["rev"]}"))
+    assert cached == decode(get(ctx, "a2", "/v2/items/#{id}"))["item"]
+  end
+
   test "only a new scoped SSE or accepted send reopens an ended session", ctx do
     closed = item_id(send_message(ctx, @origin, 1))
     open = item_id(send_message(ctx, @origin, 2))

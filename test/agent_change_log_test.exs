@@ -334,15 +334,13 @@ defmodule AttentionServer.AgentChangeLogTest do
     assert %{"state" => "listening"} =
              FeedActivity.item_availability(
                state.store.engine,
-               key("covered"),
-               FeedActivity.activity(state)
+               key("covered")
              )
 
     assert %{"state" => "unsupported"} =
              FeedActivity.item_availability(
                state.store.engine,
-               key("uncovered"),
-               FeedActivity.activity(state)
+               key("uncovered")
              )
 
     FeedActivity.observe(feed, :batch)
@@ -366,8 +364,7 @@ defmodule AttentionServer.AgentChangeLogTest do
     assert %{"state" => "not_listening"} =
              FeedActivity.item_availability(
                state.store.engine,
-               key("covered"),
-               FeedActivity.activity(state)
+               key("covered")
              )
 
     GenServer.stop(relay)
