@@ -130,10 +130,9 @@ redeemed, and the joining device must get a new one.
 
 The `harklight-agent` conversation CLI is not part of this package. It is
 released from <https://github.com/clickety-clacks/harklight-agent>. This server
-requires Harklight Agent 0.2.0, which is published with it; 0.1 Agent releases
-cannot connect. Install it
-with `brew install clickety-clacks/tap/harklight-agent` or from that repository's
-release tarballs, as its README describes. Installing it does not start a
+works with Harklight Agent 0.2 releases. Agent 0.2.1 is the matching release,
+and 0.1 Agent releases cannot connect. Install it from that repository's
+release tarballs; the Homebrew tap still carries a 0.1 release. Installing it does not start a
 listener, install a vendor-session integration or create an identity. The
 assembled `skills/harklight-agent` directory may be copied manually
 into an agent harness's configured skill directory; installation does not copy
@@ -145,8 +144,8 @@ not the server owner's private key. Set `HARKLIGHT_IDENTITY_DIR` and
 trusted public CA. Its local journal is separate from server state; retain it
 for uncertain actions and exact retries. The package does not migrate or reset
 an agent's journal during server installation. Before switching an existing
-agent to 0.2.0, finish or abandon its unresolved 0.1 operations with the 0.1
-CLI; Agent 0.2.0 does not use 0.1 cursors, and its first read takes a fresh
+agent to 0.2, finish or abandon its unresolved 0.1 operations with the 0.1
+CLI; Agent 0.2 does not use 0.1 cursors, and its first read takes a fresh
 baseline. Pending enrollments survive. The CLI's README covers
 `send`, `listen`, `retry`, `retract` and file commands.
 
@@ -442,11 +441,11 @@ a database.
 
 Upgrading directly from 0.1.x to v0.2.8 also changes the protocol:
 
-- Have the 0.2 app, Harklight Agent 0.2.0 and any 0.2 headless tools ready for
+- Have the 0.2 app, Harklight Agent 0.2.1 and any 0.2 headless tools ready for
   every client before switching; 0.1 clients stop working when the server
   switches.
 - Finish or abandon unresolved 0.1 Agent operations with the 0.1 CLI before
-  switching an agent to 0.2.0.
+  switching an agent to 0.2.
 - After the first start, remove the retired agent and origin port and bind
   settings that the startup notices name, replace `--relay-port` with
   `--device-port` in scripts, and create new invitations to replace unused
