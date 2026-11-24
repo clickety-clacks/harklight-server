@@ -74,28 +74,28 @@ defmodule AttentionServer.ClientAPI.FeedRenderer do
   end
 
   defp render_row(:entry, {:entry, seq}, context, principal, rev) do
-    case Map.get(context.entries_by_fact, seq) do
-      nil ->
-        :skip
+    with %{} = entry <- Map.get(context.entries_by_fact, seq),
+         :ok <- keep_entry_row(context, principal.person, entry, seq, rev) do
+      at_ms =
+        case ChangeLog.created_at(
+               context.store,
+               principal.person,
+               ChangeLog.entry_resource(entry["position"])
+             ) do
+          {:ok, at_ms} -> at_ms
+          _ -> nil
+        end
 
-      entry ->
-        at_ms =
-          case ChangeLog.created_at(
-                 context.store,
-                 principal.person,
-                 ChangeLog.entry_resource(entry["position"])
-               ) do
-            {:ok, at_ms} -> at_ms
-            _ -> nil
-          end
-
-        Projection.run(Projection.change_key(entry), fn ->
-          {:ok,
-           entry
-           |> Resources.stamp(rev)
-           |> Resources.put_at(at_ms)
-           |> then(&Resources.render(:entry, &1, principal))}
-        end)
+      Projection.run(Projection.change_key(entry), fn ->
+        {:ok,
+         entry
+         |> Resources.stamp(rev)
+         |> Resources.put_at(at_ms)
+         |> then(&Resources.render(:entry, &1, principal))}
+      end)
+    else
+      nil -> :skip
+      result -> result
     end
   end
 
@@ -111,4 +111,26 @@ defmodule AttentionServer.ClientAPI.FeedRenderer do
   end
 
   defp render_row(_kind, _resource, _context, _principal, _rev), do: :skip
+
+  # The log compacts by fact sequence. Acknowledgments and the original turn
+  # can still resolve to the same Entry. Check every source's current rev,
+  # including sources on later pages, and let the raw rows drive the cursor.
+  defp keep_entry_row(%{compact_entries?: true, store: store}, person, entry, seq, rev) do
+    entry
+    |> Resources.entry_sources()
+    |> Enum.reduce_while(:ok, fn
+      ^seq, :ok ->
+        {:cont, :ok}
+
+      source, :ok ->
+        case ChangeLog.rev(store, person, ChangeLog.entry_resource(source)) do
+          {:ok, newer} when newer > rev -> {:halt, :skip}
+          {:ok, _} -> {:cont, :ok}
+          {:error, :not_found} -> {:cont, :ok}
+          {:error, _} -> {:halt, {:error, :storage_unavailable}}
+        end
+    end)
+  end
+
+  defp keep_entry_row(_context, _person, _entry, _seq, _rev), do: :ok
 end

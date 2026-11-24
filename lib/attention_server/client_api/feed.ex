@@ -123,9 +123,10 @@ end
 defmodule AttentionServer.ClientAPI.FeedStep do
   @moduledoc """
   The feed's read, in the Relay's serialized step. Change-log rows are read
-  and rendered from the same committed state, so each row shows its resource
-  as of its rev (docs/client-api-v2.md §6.1). Only the read and render run in
-  the Relay; the caller encodes and sends.
+  and rendered from the same committed state. Catch-up emits only the newest
+  row for each Entry, while the raw page still determines the continuation
+  position (docs/client-api-v2.md §6.1). Only the read and render run in the
+  Relay; the caller encodes and sends.
 
   Rows render through `ClientAPI.FeedRenderer` (replaceable in tests through
   the `:client_api_feed_renderer` application setting). A row with no wire
@@ -141,6 +142,10 @@ defmodule AttentionServer.ClientAPI.FeedStep do
 
   @doc false
   def read(ctx, cursor, limit), do: read(ctx.relay, ctx.principal, cursor, limit)
+
+  @doc false
+  def read_live(ctx, cursor, limit),
+    do: read_step(ctx.relay, ctx.principal, cursor, limit, :live)
 
   @doc false
   def opened(_ctx), do: :ok
@@ -160,21 +165,24 @@ defmodule AttentionServer.ClientAPI.FeedStep do
   | :disabled | :storage_unavailable}`.
   """
   def read(relay, principal, cursor, limit),
+    do: read_step(relay, principal, cursor, limit, :catch_up)
+
+  defp read_step(relay, principal, cursor, limit, mode),
     do:
       GenServer.call(
         relay,
-        {:client_api, __MODULE__, {:read, principal, cursor, limit}},
+        {:client_api, __MODULE__, {:read, principal, cursor, limit, mode}},
         # As the reads do: a busy Relay is waited for, not mistaken for a
         # stopped one. A Relay that exits still ends the call.
         :infinity
       )
 
   @doc false
-  def handle_call({:read, principal, cursor, limit}, _from, state) do
-    {:reply, read_rows(state, principal, cursor, limit), state}
+  def handle_call({:read, principal, cursor, limit, mode}, _from, state) do
+    {:reply, read_rows(state, principal, cursor, limit, mode), state}
   end
 
-  defp read_rows(state, principal, cursor, limit) do
+  defp read_rows(state, principal, cursor, limit, mode) do
     person = principal.person
 
     # A principal that no longer authenticates reads nothing, even on a
@@ -185,6 +193,7 @@ defmodule AttentionServer.ClientAPI.FeedStep do
       context = %{
         engine: state.store.engine,
         store: state.store,
+        compact_entries?: mode == :catch_up,
         view: Map.get(Map.get(state, :priority_views, %{}), person)
       }
 

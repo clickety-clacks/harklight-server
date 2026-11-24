@@ -807,9 +807,12 @@ resource's state as of N.
 
 What clients see:
 
-- The feed and batches are gap-free, but may skip intermediate states of a
-  resource. Each resource appears at most once per catch-up, at its latest
-  `rev`. Clients must not rely on seeing every intermediate state.
+- A catch-up page coalesces backlog rows for the same resource to its latest
+  eligible revision at that page's read boundary. If the resource changes
+  after that boundary, the new revision may appear on a later page or in
+  the live stream, in JSON or SSE. Revisions increase and the latest state
+  is eventually delivered. Unchanged state is not repeated because several
+  old log rows point at it.
 - Chat turns are their own Entry resources, so no turn is ever skipped.
 - `item_removed` rows are kept as tombstones for the retention window.
 - A log row may have no client form (for example a read-position fact), but
