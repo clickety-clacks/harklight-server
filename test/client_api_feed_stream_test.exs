@@ -44,7 +44,7 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
     %{certs: certs}
   end
 
-  setup %{certs: certs} do
+  setup %{certs: certs} = tags do
     dir = Path.join(System.tmp_dir!(), "harklight-sse-#{System.unique_integer([:positive])}")
     File.mkdir_p!(dir)
     on_exit(fn -> File.rm_rf!(dir) end)
@@ -62,6 +62,12 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
     assert {:ok, reader} =
              Relay.setup_device_certificate(relay, "A", TLSFixtures.certificate_der!(certs, "a1"))
 
+    timeout_opts =
+      case tags do
+        %{read_timeout: timeout} -> [read_timeout: timeout]
+        _ -> []
+      end
+
     listener =
       start_supervised!(
         {ClientAPI.Listener,
@@ -70,13 +76,14 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
            certfile: Path.join(certs, "server.pem"),
            keyfile: Path.join(certs, "server.key"),
            cacertfile: Path.join(certs, "ca.pem")
-         ]},
+         ] ++ timeout_opts},
         id: make_ref()
       )
 
     %{
       relay: relay,
       reader: reader,
+      listener: listener,
       port: ClientAPI.Listener.port(listener),
       certs: certs,
       dir: dir
@@ -1019,23 +1026,35 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
 
   ## Liveness
 
-  test "an idle feed sends id-less heartbeats and stays open", ctx do
-    Application.put_env(:attention_server, :client_api_feed_heartbeat_ms, 100)
-    on_exit(fn -> Application.delete_env(:attention_server, :client_api_feed_heartbeat_ms) end)
+  for protocol <- [:http2, :http1] do
+    @tag idle_feed: true, read_timeout: 500
+    test "an idle #{protocol} feed sends heartbeats past the read deadline", ctx do
+      Application.put_env(:attention_server, :client_api_feed_heartbeat_ms, 100)
+      on_exit(fn -> Application.delete_env(:attention_server, :client_api_feed_heartbeat_ms) end)
 
-    conn = connect(ctx)
-    {conn, feed} = open_feed(conn)
-    started = System.monotonic_time(:millisecond)
-    {conn, feed, beats} = events(conn, feed, 3)
-    elapsed = System.monotonic_time(:millisecond) - started
+      protocol = unquote(protocol)
+      conn = ClientAPIFeedClient.connect(ctx.port, ctx.certs, "a1", protocol)
+      assert Mint.HTTP.protocol(conn) == protocol
+      {conn, feed} = open_feed(conn)
 
-    assert beats == List.duplicate(%{event: "heartbeat", data: %{}}, 3)
-    assert elapsed >= 250 and elapsed < 2_000
+      # Mint acknowledges HTTP/2 settings during setup. This small response
+      # consumes too little receive credit to send any WINDOW_UPDATE frames.
+      {conn, feed, beats} = events(conn, feed, 12)
+      assert feed.status == 200
+      assert beats == List.duplicate(%{event: "heartbeat", data: %{}}, 12)
 
-    # A change still arrives on the same stream.
-    forward(ctx.relay, "m1", 1)
-    {_conn, _feed, changes} = changes_through(conn, feed, head(ctx))
-    assert Enum.all?(changes, &is_integer(&1.id))
+      forward(ctx.relay, "m1", 1)
+      {conn, _feed, changes} = changes_through(conn, feed, head(ctx))
+      assert Enum.all?(changes, &is_integer(&1.id))
+
+      pid = feed_pid(ctx)
+      assert {:ok, [connection_pid]} = ThousandIsland.connection_pids(ctx.listener)
+      feed_ref = Process.monitor(pid)
+      connection_ref = Process.monitor(connection_pid)
+      assert :ok = :ssl.close(Mint.HTTP.get_socket(conn))
+      assert_receive {:DOWN, ^feed_ref, :process, ^pid, _}, 5_000
+      assert_receive {:DOWN, ^connection_ref, :process, ^connection_pid, _}, 5_000
+    end
   end
 
   test "the default heartbeat is inside the contract's 25 s" do
