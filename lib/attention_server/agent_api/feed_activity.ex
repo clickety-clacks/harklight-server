@@ -102,7 +102,24 @@ defmodule AttentionServer.AgentAPI.FeedActivity do
           is_binary(handle),
           do: key
 
-    enqueue(state, keys)
+    if token do
+      # A rollback client may have read a different value at the current rev.
+      # Finish the bounded repair before the supervised HTTP listeners start.
+      keys
+      |> Stream.chunk_every(@projection_page_size)
+      |> Enum.reduce_while({:ok, state}, fn page, {:ok, state} ->
+        case apply_page(state, page) do
+          {:ok, updated} -> {:cont, {:ok, updated}}
+          {:error, _} = error -> {:halt, error}
+        end
+      end)
+      |> case do
+        {:ok, repaired} -> {:ok, Map.put(repaired, :availability_rollback_token, nil)}
+        error -> error
+      end
+    else
+      {:ok, enqueue(state, keys)}
+    end
   end
 
   def refresh_session(state, scope) do

@@ -538,8 +538,10 @@ defmodule AttentionServer.Relay do
             state = reschedule_default_sweep(state, state.default_index)
             state = reschedule_bounce_sweep(state)
             schedule_change_log_prune(0)
-            {:ok,
-             AttentionServer.AgentAPI.FeedActivity.reset(state, opts[:availability_rollback_token])}
+            case AttentionServer.AgentAPI.FeedActivity.reset(state, opts[:availability_rollback_token]) do
+              {:ok, state} -> {:ok, state}
+              {:error, reason} -> {:stop, {:availability_repair_failed, reason}}
+            end
 
           error ->
             Store.close(store)
