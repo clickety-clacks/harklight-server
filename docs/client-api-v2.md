@@ -1336,8 +1336,9 @@ Writes return 200 unless the table says otherwise. Each response schema requires
       "properties": {
         "rev": { "$ref": "#/$defs/Position" },
         "advisory_id": { "$ref": "#/$defs/OpaqueId" },
-        "delivered": { "const": true },
-        "already_delivered": { "type": "boolean" }
+        "delivered": { "type": "boolean" },
+        "already_delivered": { "type": "boolean" },
+        "moot": { "type": "boolean" }
       }
     },
     "AgentShowBody": {
@@ -1588,8 +1589,10 @@ Agent listen --follow and the Tightbeam Harklight background follower retry feed
       "required": ["advisory_id", "advisory_type", "request_revision"],
       "properties": {
         "advisory_id": { "$ref": "#/$defs/OpaqueId" },
-        "advisory_type": { "enum": ["unseen_interval_elapsed", "possible_contradictions"] },
+        "author": { "const": "server" },
+        "advisory_type": { "enum": ["unseen_interval_elapsed", "soft_bounce", "possible_contradictions"] },
         "delivered": { "type": "boolean" },
+        "moot": { "type": "boolean" },
         "request_revision": { "type": "integer", "minimum": 1 },
         "text": { "type": "string" },
         "accepted_at_ms": { "$ref": "#/$defs/TimeMs" },
@@ -1616,7 +1619,7 @@ Agent listen --follow and the Tightbeam Harklight background follower retry feed
           }
         }
       },
-      "if": { "properties": { "advisory_type": { "const": "unseen_interval_elapsed" } } },
+      "if": { "properties": { "advisory_type": { "enum": ["unseen_interval_elapsed", "soft_bounce"] } } },
       "then": { "required": ["text", "accepted_at_ms", "due_at_ms", "evaluated_at_ms", "level_name", "bounce_after_days", "decided_at_rev"] },
       "else": { "required": ["status"] }
     },
@@ -1642,9 +1645,26 @@ Agent listen --follow and the Tightbeam Harklight background follower retry feed
 |---|---|
 | `message` | Full SentMessage |
 | `entry` | Full AgentEntry |
-| `advisory` / `unseen_interval_elapsed` | Item and advisory ID, request revision, accepted/due/evaluated times, level, bounce interval, text, delivered state and `decided_at_rev` (replaces the origin cursor at decision; `BounceDecision.append_advisory`) |
+| `advisory` / `unseen_interval_elapsed` or `soft_bounce` | Item and advisory ID, substantive request revision, accepted/due/evaluated times, priority level and interval, text, delivered state, optional moot status and `decided_at_rev` |
 | `advisory` / `possible_contradictions` | Item and advisory ID, request revision, check status, reason and unchecked count when incomplete, and warning and matched sender/message identifiers and titles when present (`Contradictions.result`) |
 | SSE `focus`, `heartbeat`, `closing` | Ephemeral, without an SSE ID |
+
+An eligible open message or FYI produces at most one bounce advisory per
+substantive revision. An unopened revision keeps the
+`unseen_interval_elapsed` advisory; an opened, unanswered revision uses
+`soft_bounce`. The person still sees the same item. Progress and qualifying
+person-authored Chat suppress the advisory. Upgrade reconsiders opened
+revisions accepted strictly after 2026-11-17 14:16:54 UTC that qualified under
+their original policy. It preserves the prior decision for a revision that
+already had an advisory.
+
+The original enrolled key can page messages and acknowledge their advisories
+even if the session is ended or absent. Paging neither reopens a session nor
+marks delivery. Consumers explicitly acknowledge the advisory ID after durable
+handoff. The same ID remains visible with `moot: true` in message snapshots and
+as a versioned feed update after a real outcome, substantive replacement or
+qualifying person Chat. A stale acknowledgment of a moot advisory preserves
+the current delivered state. Revocation grants no access to another key.
 
 - A filtered feed omits changes for messages outside the named session.
   Every feed still uses the agent-wide `rev`. A batch position can be later

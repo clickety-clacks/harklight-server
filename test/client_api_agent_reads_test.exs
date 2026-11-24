@@ -1731,100 +1731,283 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
     response
   end
 
-  @tag :agent_advisory
-  test "acknowledges the retained advisory of the scoped sent message", ctx do
-    alias AttentionServer.{BounceDecision, BouncePolicy, Store}
+  for {scenario, opened, kind} <- [
+        {:unopened, false, "unseen_interval_elapsed"},
+        {:opened, true, "soft_bounce"},
+        {:ended, true, "soft_bounce"},
+        {:moot, true, "soft_bounce"},
+        {:chat_moot, false, "unseen_interval_elapsed"},
+        {:chat_moot, true, "soft_bounce"},
+        {:late_open, false, "unseen_interval_elapsed"}
+      ] do
+    @tag :agent_advisory
+    test "lists the #{kind} advisory for #{scenario}", ctx do
+      alias AttentionServer.{BounceDecision, BouncePolicy, Store}
 
-    :sys.replace_state(ctx.relay, fn state ->
-      at = state.clock.()
-      levels = [%{"name" => "Urgent", "lower_bound" => 0, "bounce_after_days" => 1}]
-      {:ok, normalized} = BouncePolicy.normalize_levels(levels)
-
-      {:ok, configured, _} =
-        BounceDecision.configure_levels(state.store.engine, "A", normalized, at)
-
-      {:ok, store} =
-        Store.commit(state.store, configured, %{
-          person: "A",
-          actor: "fixture",
-          action: "configure_fixture"
-        })
-
-      %{state | store: store}
-    end)
-
-    id =
-      frame(ctx, "a1", %{
-        "type" => "forward",
-        "op_id" => op(1),
-        "session_handle" => @first_session,
-        "route" => "claude-code",
-        "cli_version" => "fixture",
-        "unsupported_reason" => nil,
-        "advisory_v1" => true,
-        "message" => %{
-          "sender_id" => "app:test",
-          "message_id" => "advisory-item",
-          "title" => "Needs attention",
-          "message_type" => "fyi",
-          "answer_ui" => %{
-            "schema" => "attention-client.actions/1",
-            "actions" => [
-              %{
-                "id" => "seen",
-                "label" => "Seen",
-                "kind" => "value",
-                "value" => %{"acknowledgment" => "seen"}
-              }
-            ]
-          },
-          "created_at" => 1
-        }
-      })
-      |> then(&Resources.item_id(%{accepted_seq: &1["seq"]}))
-
-    key = {"A", "app:test", "advisory-item"}
-
-    state =
       :sys.replace_state(ctx.relay, fn state ->
-        engine = state.store.engine
-        at = engine.messages[key].accepted_at
+        at = state.clock.()
+        levels = [%{"name" => "Urgent", "lower_bound" => 0, "bounce_after_days" => 0.5}]
+        {:ok, normalized} = BouncePolicy.normalize_levels(levels)
 
-        selected =
-          BounceDecision.record_scores(
-            engine,
-            "A",
-            [
-              %{"sender_id" => "app:test", "message_id" => "advisory-item", "score" => 0.9}
-            ],
-            at
-          )
-
-        next = BounceDecision.evaluate_due(selected, at + 86_400_001)
+        {:ok, configured, _} =
+          BounceDecision.configure_levels(state.store.engine, "A", normalized, at)
 
         {:ok, store} =
-          Store.commit(state.store, next, %{
+          Store.commit(state.store, configured, %{
             person: "A",
             actor: "fixture",
-            action: "advisory_fixture"
+            action: "configure_fixture"
           })
 
-        %{state | store: store}
+        %{state | store: store, clock: fn -> 1_795_507_200_000 end}
       end)
 
-    feed = state.store.engine.advisory_feeds[{"A", ctx.keys["a1"], @first_session}]
-    assert %{"advisory_id" => advisory_id} = feed.entries[1]
-    path = "/v2/agent/messages/" <> id <> "/advisories/ack"
-    body = %{"advisory_id" => advisory_id}
-    assert_error(request(ctx, "a2", "POST", path, body, 2), 404, "not_found")
-    first = request(ctx, "a1", "POST", path, body, 2)
-    assert first.status == 200
+      sent =
+        request(
+          ctx,
+          "a1",
+          "POST",
+          "/v2/agent/messages",
+          %{
+            "sender" => "app:test",
+            "session" => @first_session,
+            "message" => %{
+              "title" => "Needs attention",
+              "created_at" => 1,
+              "message_type" => "fyi",
+              "answer_ui" => %{
+                "schema" => "attention-client.actions/1",
+                "actions" => [
+                  %{
+                    "id" => "seen",
+                    "label" => "Seen",
+                    "kind" => "value",
+                    "value" => %{"acknowledgment" => "seen"}
+                  }
+                ]
+              }
+            }
+          },
+          1
+        )
 
-    assert %{"delivered" => true, "already_delivered" => false} =
-             contract(ctx, "AgentAdvisoryAckResult", first)
+      assert sent.status == 200
+      id = contract(ctx, "AgentSendResult", sent)["message"]["item_id"]
+      state = :sys.get_state(ctx.relay)
+      {:ok, {person, sender, message_id} = key} = Resources.item_key(state.store.engine, "A", id)
+      at = state.store.engine.messages[key].accepted_at
 
-    assert %{"already_delivered" => true} =
-             contract(ctx, "AgentAdvisoryAckResult", request(ctx, "a1", "POST", path, body, 3))
+      commit_fixture = fn transition ->
+        :sys.replace_state(ctx.relay, fn state ->
+          {:ok, store} =
+            Store.commit(state.store, transition.(state.store.engine), %{
+              person: person,
+              actor: "fixture",
+              action: "advisory_fixture"
+            })
+
+          %{state | store: store}
+        end)
+      end
+
+      commit_fixture.(fn engine ->
+        BounceDecision.record_scores(
+          engine,
+          person,
+          [%{"sender_id" => sender, "message_id" => message_id, "score" => 0.9}],
+          at
+        )
+      end)
+
+      {:ok, before_due} = AgentChangeLog.head(:sys.get_state(ctx.relay).store, {person, ctx.keys["a1"]})
+
+      open = %{
+        "type" => "message_open",
+        "op_id" => op(2),
+        "sender_id" => sender,
+        "message_id" => message_id,
+        "request_revision" => 1
+      }
+
+      case unquote(scenario) do
+        :late_open ->
+          forward(ctx, "a2", 20, @other_session)
+          :sys.replace_state(ctx.relay, &%{&1 | clock: fn -> at + 43_198_000 end})
+
+          # Opening another item arms the Relay's real timer for the pending FYI.
+          assert %{"opened" => true} =
+                   frame(ctx, "a1", %{
+                     "type" => "message_open",
+                     "op_id" => op(21),
+                     "sender_id" => "app:test",
+                     "message_id" => "item-20",
+                     "request_revision" => 1
+                   })
+
+          state = :sys.replace_state(ctx.relay, &%{&1 | clock: fn -> at + 43_200_001 end})
+          timer = state.bounce_deadline_timer
+          due = {:bounce_due, state.bounce_deadline_generation}
+          request = {:request_line, ctx.keys["a2"], JSON.encode!(Map.put(open, "v", 1)) <> "\n"}
+
+          :ok = :sys.suspend(ctx.relay)
+
+          request_id =
+            try do
+              request_id = :gen_server.send_request(ctx.relay, request)
+              remaining = Process.read_timer(timer)
+              assert is_integer(remaining)
+              Process.sleep(remaining + 50)
+
+              {:messages, queued} = Process.info(ctx.relay, :messages)
+              open_index = Enum.find_index(queued, &match?({:"$gen_call", _, ^request}, &1))
+              timer_index = Enum.find_index(queued, &(&1 == due))
+              assert is_integer(open_index) and is_integer(timer_index) and open_index < timer_index
+              request_id
+            after
+              :ok = :sys.resume(ctx.relay)
+            end
+
+          assert {:reply, {:ok, reply}} = :gen_server.wait_response(request_id, 1_000)
+          assert {:ok, %{"opened" => true}} = JSON.decode_line(reply)
+          # A call after the queued timer must still reach the original Relay.
+          assert %{bounce_deadline_timer: nil} = :sys.get_state(ctx.relay)
+
+        _ ->
+          if unquote(opened), do: assert(%{"opened" => true} = frame(ctx, "a2", open))
+      end
+
+      if unquote(scenario) == :ended do
+        path = "/v2/agent/sessions/#{@first_session}/end"
+        assert request(ctx, "a1", "POST", path, %{}, 10).status == 200
+      end
+
+      commit_fixture.(&BounceDecision.evaluate_due(&1, at + 43_200_001))
+      # The score fixture writes the store directly, outside Relay's rank publication.
+      send(ctx.relay, :retry_client_ranks)
+      :sys.get_state(ctx.relay)
+
+      assert %{
+               "messages" => [
+                 %{
+                   "item_id" => ^id,
+                   "rev" => message_rev,
+                   "advisories" => [
+                     %{
+                       "advisory_id" => advisory_id,
+                       "advisory_type" => unquote(kind),
+                       "delivered" => false
+                     } = advisory
+                   ]
+                 }
+               ]
+             } = decode_response(get(ctx, "a1", "/v2/agent/messages"))
+
+      assert ClientAPISchema.errors(ctx.defs, "AgentAdvisory", advisory) == []
+
+      if unquote(scenario) == :late_open do
+        assert before_due > 0
+        assert advisory["decided_at_rev"] == before_due
+      end
+
+      assert %{"changes" => changes, "rev" => cursor} =
+               decode_response(get(ctx, "a1", "/v2/agent/changes?after=0"))
+
+      assert Enum.any?(changes, fn
+               %{"kind" => "advisory", "data" => %{"item_id" => ^id, "advisory" => notice}} ->
+                 notice["advisory_id"] == advisory_id and
+                   notice["advisory_type"] == unquote(kind) and
+                   notice["evaluated_at_ms"] == at + 43_200_001
+
+               _ ->
+                 false
+             end)
+
+      if unquote(scenario) == :ended do
+        assert %{"message" => %{"availability" => %{"state" => "gone"}}} =
+                 decode_response(get(ctx, "a1", "/v2/agent/messages/" <> id))
+      end
+
+      path = "/v2/agent/messages/" <> id <> "/advisories/ack"
+      body = %{"advisory_id" => advisory_id}
+      assert_error(request(ctx, "a2", "POST", path, body, 2), 404, "not_found")
+
+      case unquote(scenario) do
+        :chat_moot ->
+          person_reply(ctx, id, 9)
+
+          assert %{
+                   "message" => %{
+                     "rev" => after_chat,
+                     "advisories" => [%{"advisory_id" => ^advisory_id, "moot" => true}]
+                   }
+                 } = decode_response(get(ctx, "a1", "/v2/agent/messages/" <> id))
+
+          assert after_chat > message_rev
+
+          for filter <- ["", "&session=#{@first_session}"] do
+            assert %{"changes" => updates} =
+                     decode_response(get(ctx, "a1", "/v2/agent/changes?after=#{cursor}" <> filter))
+
+            assert Enum.any?(updates, fn
+                     %{"kind" => "advisory", "data" => %{"advisory" => updated}} ->
+                       updated["advisory_id"] == advisory_id and updated["moot"] == true
+
+                     _ ->
+                       false
+                   end)
+          end
+
+        :moot ->
+          assert %{"seq" => _} =
+                   frame(ctx, "a2", %{
+                     "type" => "answer",
+                     "op_id" => op(9),
+                     "sender_id" => sender,
+                     "message_id" => message_id,
+                     "answer" => %{"acknowledgment" => "seen"},
+                     "request_revision" => 1
+                   })
+
+          assert %{"messages" => [%{"advisories" => [notice]}]} =
+                   decode_response(get(ctx, "a1", "/v2/agent/messages"))
+
+          assert %{"advisory_id" => ^advisory_id, "moot" => true, "delivered" => false} = notice
+
+          assert %{"changes" => updates} =
+                   decode_response(get(ctx, "a1", "/v2/agent/changes?after=#{cursor}"))
+
+          assert Enum.any?(updates, fn
+                   %{"kind" => "advisory", "data" => %{"advisory" => updated}} ->
+                     updated["advisory_id"] == advisory_id and updated["moot"] == true
+
+                   _ ->
+                     false
+                 end)
+
+          assert %{"advisory_id" => ^advisory_id, "moot" => true, "delivered" => false} =
+                   contract(
+                     ctx,
+                     "AgentAdvisoryAckResult",
+                     request(ctx, "a1", "POST", path, body, 2)
+                   )
+
+        _ ->
+          {:ok, person_rev} = ChangeLog.head(:sys.get_state(ctx.relay).store, person)
+          first = request(ctx, "a1", "POST", path, body, 2)
+          assert {:ok, ^person_rev} = ChangeLog.head(:sys.get_state(ctx.relay).store, person)
+          assert first.status == 200
+
+          assert %{"delivered" => true, "already_delivered" => false} =
+                   contract(ctx, "AgentAdvisoryAckResult", first)
+
+          assert %{"already_delivered" => true} =
+                   contract(
+                     ctx,
+                     "AgentAdvisoryAckResult",
+                     request(ctx, "a1", "POST", path, body, 3)
+                   )
+      end
+    end
   end
 
   defp normalize_delivery_replay(change) do

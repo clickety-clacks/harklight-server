@@ -602,11 +602,26 @@ defmodule AttentionServer.Relay do
 
     with :ok <- Store.discard_building_inbox_snapshots(store),
          {:ok, store} <- commit_browser_cleanup(store, engine),
+         {:ok, store} <- resume_bounces(store),
          :ok <- Store.discard_browser_inbox_snapshots(store) do
       {:ok, store}
     else
       {:error, reason, _store} -> {:error, reason}
       error -> error
+    end
+  end
+
+  defp resume_bounces(store) do
+    engine = BounceDecision.resume_decisions(store.engine)
+
+    if engine == store.engine do
+      {:ok, store}
+    else
+      commit(store, engine, %{
+        person: "system",
+        actor: "bounce_decision",
+        action: "resume_bounces"
+      })
     end
   end
 
@@ -2388,6 +2403,8 @@ defmodule AttentionServer.Relay do
     end
   end
 
+  defp dispatch_info({:bounce_due, _stale_generation}, state), do: {:noreply, state}
+
   defp dispatch_info(
          {:default_sweep, generation},
          %{default_timer_generation: generation} = state
@@ -2673,8 +2690,13 @@ defmodule AttentionServer.Relay do
   end
 
   @doc false
-  def apply_agent_advisory_ack(state, key, handle, advisory_id) do
-    case BounceDecision.advisory_ack(state.store.engine, key, handle, advisory_id) do
+  def apply_agent_advisory_ack(state, {person, _, _} = item, key, advisory_id) do
+    case AttentionServer.AgentAPI.Advisories.acknowledge(
+           state.store.engine,
+           {person, key},
+           item,
+           advisory_id
+         ) do
       {:ok, next, reply} when next == state.store.engine ->
         {{:ok, reply}, state}
 
@@ -2777,15 +2799,9 @@ defmodule AttentionServer.Relay do
     if next_engine == state.store.engine do
       {reply, state}
     else
-      case commit(
-             state.store,
-             next_engine,
-             Map.put(
-               audit(state.store.engine, key, action),
-               :operation_id,
-               operation_id
-             )
-           ) do
+      audit = Map.put(audit(state.store.engine, key, action), :operation_id, operation_id)
+
+      case commit_request(state.store, next_engine, audit, original) do
         {:ok, store} ->
           next_state = %{state | store: store}
 
@@ -2794,6 +2810,9 @@ defmodule AttentionServer.Relay do
               {:ok, person} -> notify_coverage_change(next_state, state.store.engine, person, key)
               _ -> next_state
             end
+
+          next_state =
+            if action == "message_open", do: reschedule_bounce_sweep(next_state), else: next_state
 
           next_state =
             Enum.reduce(targets, next_state, fn target, current ->
@@ -2819,6 +2838,19 @@ defmodule AttentionServer.Relay do
       end
     end
   end
+
+  defp commit_request(store, next, %{action: "message_open", person: person} = audit, raw)
+       when is_binary(raw) do
+    with {:ok, %{"sender_id" => sender, "message_id" => id}} <- JSON.decode_line(raw),
+         {:ok, next} <-
+           AttentionServer.AgentAPI.Advisories.stamp_decisions(store, next, [{person, sender, id}]) do
+      commit(store, next, audit)
+    else
+      _ -> {:error, :storage_unavailable, store}
+    end
+  end
+
+  defp commit_request(store, next, audit, _original), do: commit(store, next, audit)
 
   defp initialize_priority_views(state) do
     Enum.reduce(Map.keys(state.store.engine.persons), state, fn person, current ->
@@ -4116,6 +4148,7 @@ defmodule AttentionServer.Relay do
              "forward",
              "answer",
              "lifecycle",
+             "message_open",
              "subscribe_remote",
              "source_bind",
              "source_result",

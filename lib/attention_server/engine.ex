@@ -3974,7 +3974,7 @@ defmodule AttentionServer.Engine do
     end
   end
 
-  defp message_open(engine, %{person: person, key: device, kind: kind}, frame)
+  defp message_open(engine, %{person: person, key: device, kind: kind} = principal, frame)
        when kind in [:device, :browser] do
     with :ok <- valid_op(frame),
          :ok <- valid_global_id(frame),
@@ -4006,13 +4006,34 @@ defmodule AttentionServer.Engine do
                    Map.get(record, :revisions, %{1 => record.message}),
                    frame["request_revision"]
                  ) do
+                sub =
+                  get_in(engine.bounce_revisions, [
+                    key,
+                    :raw_to_substantive,
+                    frame["request_revision"]
+                  ])
+
+                engine =
+                  BounceDecision.evaluate_before_open(engine, key, sub, principal.request_at)
+
                 case AttentionServer.BounceDecision.record_open(
                        engine,
                        key,
                        record,
                        frame["request_revision"]
                      ) do
-                  {:ok, next, _substantive_revision} ->
+                  {:ok, next, substantive_revision} ->
+                    next =
+                      if BounceDecision.opened?(engine, key, substantive_revision),
+                        do: next,
+                        else:
+                          BounceDecision.remember_open_time(
+                            next,
+                            key,
+                            substantive_revision,
+                            principal.request_at
+                          )
+
                     reply = %{
                       "op_id" => frame["op_id"],
                       "sender_id" => frame["sender_id"],

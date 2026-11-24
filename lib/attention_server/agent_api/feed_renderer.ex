@@ -45,6 +45,15 @@ defmodule AttentionServer.AgentAPI.FeedRenderer do
 
   defp render_row(
          %{store: %{engine: engine}},
+         scope,
+         %{resource: {:advisory, {item, id}}},
+         _entries
+       ) do
+    Advisories.item_change(engine, scope, item, id)
+  end
+
+  defp render_row(
+         %{store: %{engine: engine}},
          {person, key},
          %{resource: {:advisory, id}, session: session},
          _entries
