@@ -21,6 +21,7 @@ defmodule AttentionServer.DashboardHTTPS do
     DashboardBrowserSession,
     DashboardReadHTTP,
     Diagnostics,
+    HTTP2FeedHandler,
     Relay
   }
 
@@ -72,6 +73,7 @@ defmodule AttentionServer.DashboardHTTPS do
          port: Keyword.fetch!(opts, :port),
          certfile: Keyword.fetch!(opts, :certfile),
          keyfile: Keyword.fetch!(opts, :keyfile),
+         thousand_island_options: [handler_module: HTTP2FeedHandler],
          startup_log: false},
         id: :dashboard_listener
       )

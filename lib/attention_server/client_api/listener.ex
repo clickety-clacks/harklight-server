@@ -8,7 +8,7 @@ defmodule AttentionServer.ClientAPI.Listener do
   """
 
   alias AttentionServer.ClientAPI.Router
-  alias AttentionServer.EnrolledLeafVerify
+  alias AttentionServer.{EnrolledLeafVerify, HTTP2FeedHandler}
 
   def child_spec(opts) do
     %{
@@ -23,6 +23,7 @@ defmodule AttentionServer.ClientAPI.Listener do
   @doc """
   Options: `relay`, `certfile`, `keyfile`, `cacertfile`, `port` (default 0),
   `ip` (default loopback), and `routes` / `max_in_flight` for the router.
+  Tests can shorten the transport deadline with `read_timeout`.
   """
   def start_link(opts) do
     relay = Keyword.fetch!(opts, :relay)
@@ -36,18 +37,20 @@ defmodule AttentionServer.ClientAPI.Listener do
       certfile: Keyword.fetch!(opts, :certfile),
       keyfile: Keyword.fetch!(opts, :keyfile),
       startup_log: false,
-      thousand_island_options: [
-        transport_options: [
-          versions: [:"tlsv1.3"],
-          verify: :verify_peer,
-          verify_fun: EnrolledLeafVerify.client_api(relay),
-          fail_if_no_peer_cert: true,
-          cacertfile: Keyword.fetch!(opts, :cacertfile),
-          reuseaddr: true,
-          session_tickets: :disabled,
-          early_data: :disabled
-        ]
-      ]
+      thousand_island_options:
+        [
+          handler_module: HTTP2FeedHandler,
+          transport_options: [
+            versions: [:"tlsv1.3"],
+            verify: :verify_peer,
+            verify_fun: EnrolledLeafVerify.client_api(relay),
+            fail_if_no_peer_cert: true,
+            cacertfile: Keyword.fetch!(opts, :cacertfile),
+            reuseaddr: true,
+            session_tickets: :disabled,
+            early_data: :disabled
+          ]
+        ] ++ Keyword.take(opts, [:read_timeout])
     )
   end
 
