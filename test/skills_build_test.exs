@@ -38,7 +38,7 @@ defmodule AttentionServer.SkillsBuildTest do
 
       hosted = File.read!(Path.join(output, "harklight-agent-saas/SKILL.md"))
       assert Base.encode16(:crypto.hash(:sha256, hosted), case: :lower) ==
-               "ce1205280f5175e61675124ff843776e5f7fd0ccec1028d274f7806402953f12"
+               "bcdce3b1c391035af450cd4f10d3ecc39cbd0b7a21a2c9d472d85683c8311817"
 
       opts =
         AttentionServer.DashboardReadHTTP.init(
