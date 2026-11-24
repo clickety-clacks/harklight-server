@@ -1049,12 +1049,7 @@ defmodule AttentionServer.ClientAPIListenerTest do
         id = send_progress(ctx, message)
         surface = ctx.surface
 
-        {path, changes, kind} =
-          case surface do
-            :agent -> {"/v2/agent/messages/#{id}", "/v2/agent/changes", "message"}
-            _ -> {"/v2/items/#{id}", "/v2/changes", "item"}
-          end
-
+        {path, _changes, kind} = progress_paths(surface, id)
         assert %{status: 200} = before = progress_request(ctx, surface, "GET", path)
         assert json(before)[kind]["seen"] == false
 
@@ -1062,9 +1057,17 @@ defmodule AttentionServer.ClientAPIListenerTest do
           {Map.put(message, "progress", %{"completed" => 1}), false},
           {Map.put(message, "progress", %{"completed" => 2}), true},
           {Map.put(message, "progress", %{"completed" => 2}), true},
-          {Map.put(message, "progress", %{"completed" => 3}), true},
-          {Map.merge(message, %{"title" => "Updated", "progress" => %{"completed" => 4}}), false},
-          {Map.merge(message, %{"title" => "Updated", "progress" => %{"completed" => 5}}), false}
+          {Map.merge(message, %{"created_at" => 2, "progress" => %{"completed" => 3}}), true},
+          {Map.merge(message, %{
+             "created_at" => 3,
+             "title" => "Updated",
+             "progress" => %{"completed" => 4}
+           }), false},
+          {Map.merge(message, %{
+             "created_at" => 4,
+             "title" => "Updated",
+             "progress" => %{"completed" => 5}
+           }), false}
         ]
 
         for {{update, seen}, revision} <- Enum.with_index(updates, 1) do
@@ -1074,55 +1077,62 @@ defmodule AttentionServer.ClientAPIListenerTest do
             assert json(opened)["item"]["seen"]
           end
 
-          assert %{status: 200} = initial = progress_request(ctx, surface, "GET", changes)
-          cursor = json(initial)["rev"]
-          after_cursor = changes <> "?after=#{cursor}"
-
-          live = open_progress_feed(ctx, surface, after_cursor)
-          assert %{status: 200} = revised = revise_progress(ctx, id, revision, update)
-          assert json(revised)["message"]["revision"] == revision + 1
-
-          assert %{status: 200} = batch = progress_request(ctx, surface, "GET", after_cursor)
-          assert %{"changes" => rows, "more" => false} = json(batch)
-          next_revision = revision + 1
-
-          assert Enum.any?(rows, fn row ->
-                   match?(
-                     %{
-                       "kind" => "entry",
-                       "data" => %{
-                         "kind" => "revision",
-                         "item_id" => ^id,
-                         "request_revision" => ^next_revision
-                       }
-                     },
-                     row
-                   )
-                 end)
-
-          assert %{"rev" => rev, "data" => projected} =
-                   Enum.find(rows, &(&1["kind"] == kind and &1["data"]["item_id"] == id))
-
-          for {conn, feed} <- [live, open_progress_feed(ctx, surface, after_cursor)] do
-            {conn, event} = progress_change_at(conn, feed, rev)
-            assert %{event: ^kind, id: ^rev, data: ^projected} = event
-            Mint.HTTP.close(conn)
-          end
-
-          assert %{status: 200} = item = progress_request(ctx, surface, "GET", path)
-          json_seen = [projected["seen"], json(item)[kind]["seen"]]
-
-          json_seen =
-            if kind == "item" do
-              assert %{status: 200} = inbox = progress_request(ctx, surface, "GET", "/v2/inbox")
-              assert %{"items" => [%{"item_id" => ^id, "seen" => inbox_seen}]} = json(inbox)
-              [inbox_seen | json_seen]
-            else
-              json_seen
-            end
-
-          assert json_seen == Enum.map(json_seen, fn _ -> seen end)
+          assert_progress_change(ctx, surface, id, revision + 1, seen, fn ->
+            assert %{status: 200} = revised = revise_progress(ctx, id, revision, update)
+            assert json(revised)["message"]["revision"] == revision + 1
+          end)
         end
+      end
+    end
+
+    # Opt in with paths to checksum-verified releases or a local Agent build.
+    for binary <-
+          String.split(System.get_env("HARKLIGHT_PROGRESS_AGENT_BINARIES", ""), ":", trim: true),
+        surface <- [:device, :browser, :agent] do
+      @tag agent_binary: binary, surface: surface
+      test "#{surface} reads and streams keep Seen with #{Path.basename(Path.dirname(binary))}",
+           %{agent_binary: binary, surface: surface} = ctx do
+        run = progress_agent(ctx, binary)
+        file = Path.join(ctx.dir, "fixture.txt")
+        File.write!(file, "Progress attachment")
+
+        assert %{"item_id" => id, "session_handle" => session} =
+                 run.(
+                   ~w(send --session new --sender-id app:test --title Working --body Status
+                          --display-name Builder --progress 10 --progress-stage Initial --file) ++
+                     [file]
+                 )
+
+        assert %{status: 200} = opened = mark_progress_seen(ctx, :device, id)
+        assert json(opened)["item"]["seen"]
+        before = stored_progress(ctx)
+
+        assert_progress_change(ctx, surface, id, 2, true, fn ->
+          assert %{"op_id" => op, "response" => %{"message" => %{"revision" => 2}}} =
+                   run.(
+                     ~w(progress --session) ++
+                       [session, "--request", id] ++
+                       ~w(--percent 25 --stage Testing --note Passed)
+                   )
+
+          wire = progress_agent_wire(ctx, op)
+
+          assert %{"if_match" => "1", "method" => "put", "path" => ["agent", "messages", ^id]} =
+                   wire
+
+          assert %{"message" => message} = body = json(%{body: wire["body"]})
+          assert map_size(body) == 1
+          assert message["created_at"] > before.message["created_at"]
+          assert %{"percent" => 25, "stage" => "Testing"} = message["progress"]
+
+          assert Map.drop(message, ~w(created_at progress)) ==
+                   Map.drop(before.message, ~w(created_at progress sender_id message_id))
+
+          after_update = stored_progress(ctx)
+          assert after_update.message == Map.merge(before.message, message)
+          assert before.files_by_revision[1] == after_update.files_by_revision[2]
+          assert [%{}] = after_update.files_by_revision[2]
+        end)
       end
     end
 
@@ -1189,11 +1199,28 @@ defmodule AttentionServer.ClientAPIListenerTest do
 
       file = upload_progress_file(ctx)
 
+      updated = Map.merge(progress, %{"created_at" => 2, "progress" => 1})
+
+      request = %{
+        "message_type" => "request",
+        "answer_ui" => %{
+          "schema" => "attention-client.actions/1",
+          "actions" => [%{"id" => "reply", "label" => "Reply", "kind" => "text"}]
+        }
+      }
+
       for {initial, revised, extra} <- [
-            {fyi, progress, %{}},
-            {progress, fyi, %{}},
-            {progress, Map.merge(progress, %{"body" => "New text", "progress" => 1}), %{}},
-            {progress, Map.put(progress, "progress", 1), %{"file_ids" => [file]}}
+            {fyi, updated, %{}},
+            {progress, Map.delete(updated, "progress"), %{}},
+            {progress, Map.put(updated, "body", "New text"), %{}},
+            {progress, Map.put(updated, "display_name", "New sender name"), %{}},
+            {progress, Map.put(updated, "stake", "New stakes"), %{}},
+            {progress, Map.merge(updated, request), %{}},
+            {progress, updated, %{"file_ids" => [file]}},
+            {fyi, Map.put(fyi, "created_at", 2), %{}},
+            {progress, Map.put(progress, "created_at", 2), %{}},
+            {Map.put(progress, "progress", 1),
+             Map.put(updated, "progress", %JSON.DecimalToken{raw: "1.0"}), %{}}
           ] do
         id = send_progress(ctx, initial)
         path = "/v2/items/#{id}"
@@ -1222,6 +1249,120 @@ defmodule AttentionServer.ClientAPIListenerTest do
 
       assert json(refused)["error"] == "already_closed"
     end
+  end
+
+  defp progress_paths(:agent, id),
+    do: {"/v2/agent/messages/#{id}", "/v2/agent/changes", "message"}
+
+  defp progress_paths(_, id), do: {"/v2/items/#{id}", "/v2/changes", "item"}
+
+  defp assert_progress_change(ctx, surface, id, revision, seen, update) do
+    {path, changes, kind} = progress_paths(surface, id)
+    assert %{status: 200} = initial = progress_request(ctx, surface, "GET", changes)
+    cursor = json(initial)["rev"]
+    after_cursor = changes <> "?after=#{cursor}"
+
+    live = open_progress_feed(ctx, surface, after_cursor)
+    update.()
+
+    assert %{status: 200} = batch = progress_request(ctx, surface, "GET", after_cursor)
+    assert %{"changes" => rows, "more" => false} = json(batch)
+
+    assert Enum.any?(rows, fn row ->
+             match?(
+               %{
+                 "kind" => "entry",
+                 "data" => %{
+                   "kind" => "revision",
+                   "item_id" => ^id,
+                   "request_revision" => ^revision
+                 }
+               },
+               row
+             )
+           end)
+
+    assert %{"rev" => rev, "data" => projected} =
+             Enum.find(rows, &(&1["kind"] == kind and &1["data"]["item_id"] == id))
+
+    for {conn, feed} <- [live, open_progress_feed(ctx, surface, after_cursor)] do
+      {conn, event} = progress_change_at(conn, feed, rev)
+      assert %{event: ^kind, id: ^rev, data: ^projected} = event
+      Mint.HTTP.close(conn)
+    end
+
+    assert %{status: 200} = item = progress_request(ctx, surface, "GET", path)
+    assert [projected["seen"], json(item)[kind]["seen"]] == [seen, seen]
+
+    if kind == "item" do
+      assert %{status: 200} = inbox = progress_request(ctx, surface, "GET", "/v2/inbox")
+      assert %{"items" => [%{"item_id" => ^id, "seen" => ^seen}]} = json(inbox)
+    end
+  end
+
+  defp progress_agent(ctx, binary) do
+    identity = Path.join(ctx.dir, "agent-identity")
+    File.mkdir!(identity)
+    File.chmod!(identity, 0o700)
+    File.cp!(Path.join(ctx.certs, "a2.pem"), Path.join(identity, "identity.pem"))
+    File.cp!(Path.join(ctx.certs, "a2.key"), Path.join(identity, "identity.key"))
+    File.chmod!(Path.join(identity, "identity.key"), 0o600)
+
+    ca = Path.join(ctx.certs, "ca.pem")
+    ca_hash = Base.encode16(:crypto.hash(:sha256, File.read!(ca)), case: :lower)
+
+    File.write!(
+      Path.join(identity, "server.json"),
+      JSON.encode!(%{
+        "address" => "127.0.0.1",
+        "name" => "relay.test",
+        "port" => ctx.port,
+        "ca_sha256" => ca_hash
+      })
+    )
+
+    File.write!(Path.join(identity, "enrollment.json"), ~s({"device_id":"fixture-agent"}))
+
+    args = [
+      "--identity-dir",
+      identity,
+      "--ca-file",
+      ca,
+      "--device-port",
+      "#{ctx.port}",
+      "--state-dir",
+      Path.join(ctx.dir, "agent-state")
+    ]
+
+    fn command ->
+      assert {output, 0} =
+               System.cmd(binary, args ++ command,
+                 env: [{"NO_PROXY", "*"}, {"no_proxy", "*"}],
+                 stderr_to_stdout: true
+               )
+
+      json(%{body: output})
+    end
+  end
+
+  defp progress_agent_wire(ctx, op) do
+    alias Exqlite.Sqlite3
+    [path] = Path.wildcard(Path.join(ctx.dir, "agent-state/*/origin-feed.sqlite3"))
+    assert {:ok, db} = Sqlite3.open(path)
+    on_exit(fn -> Sqlite3.close(db) end)
+
+    assert {:ok, statement} =
+             Sqlite3.prepare(db, "SELECT payload FROM operations WHERE op_id = ?")
+
+    assert :ok = Sqlite3.bind(statement, [op])
+    assert {:row, [payload]} = Sqlite3.step(db, statement)
+    :ok = Sqlite3.release(db, statement)
+    json(%{body: payload})["prepared_request"]
+  end
+
+  defp stored_progress(ctx) do
+    [record] = Map.values(:sys.get_state(ctx.relay).store.engine.messages)
+    record
   end
 
   defp progress_message do
