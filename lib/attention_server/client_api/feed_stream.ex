@@ -76,7 +76,7 @@ defmodule AttentionServer.ClientAPI.FeedStream do
     case source.read(ctx, cursor, @page) do
       {:ok, changes, more, position} ->
         subscribe_shows(ctx.principal, source)
-        conn = start_stream(conn)
+        conn = conn |> echo_agent_capability(ctx, source) |> start_stream()
 
         send(watcher, {:feed_opened, self()})
 
@@ -108,6 +108,11 @@ defmodule AttentionServer.ClientAPI.FeedStream do
         Feed.send_read_error(conn, reason)
     end
   end
+
+  defp echo_agent_capability(conn, ctx, AttentionServer.AgentAPI.FeedStep),
+    do: AttentionServer.AgentAPI.Feed.echo_capability(conn, Map.get(ctx.params, :ack2))
+
+  defp echo_agent_capability(conn, _ctx, _source), do: conn
 
   defp start_stream(conn) do
     conn

@@ -447,6 +447,7 @@ defmodule AttentionServer.ClientAPIReadRoutesTest do
     assert body["account"] == %{"state" => "active"}
 
     assert body["features"] == %{
+             "handoff_captions" => true,
              "server_matched_push_routing" => false,
              "priority_level_editing" => false
            }
@@ -467,7 +468,11 @@ defmodule AttentionServer.ClientAPIReadRoutesTest do
     )
 
     assert %{"features" => features} = body(Reads.get_me(get("/v2/me"), ctx(ctx)))
-    assert features == %{"server_matched_push_routing" => false, "priority_level_editing" => true}
+    assert features == %{
+             "handoff_captions" => true,
+             "server_matched_push_routing" => false,
+             "priority_level_editing" => true
+           }
 
     :sys.replace_state(ctx.relay, fn state ->
       engine = state.store.engine

@@ -106,6 +106,7 @@ defmodule AttentionServer.FeatureFlagsTest do
 
   defp features(push_routing, level_editing),
     do: %{
+      "handoff_captions" => true,
       "server_matched_push_routing" => push_routing,
       "priority_level_editing" => level_editing
     }

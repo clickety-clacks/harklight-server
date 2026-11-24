@@ -1031,10 +1031,10 @@ defmodule AttentionServer.ClientAPI.Resources do
     # records the facts it is made of, so its rev can be the newest of theirs.
     folded =
       Enum.reduce(facts, %{}, fn {seq, payload}, acc ->
-        with {field, event_id} <- delivery_effect(payload),
+        with {event_id, evidence} <- delivery_effect(payload, engine, key, record),
              target when is_integer(target) <- Map.get(by_event_id, event_id) do
-          Map.update(acc, target, {%{field => true}, [seq]}, fn {marks, seqs} ->
-            {Map.put(marks, field, true), [seq | seqs]}
+          Map.update(acc, target, {evidence, [seq]}, fn {marks, seqs} ->
+            {Map.merge(marks, evidence), [seq | seqs]}
           end)
         else
           _ -> acc
@@ -1050,10 +1050,7 @@ defmodule AttentionServer.ClientAPI.Resources do
 
         %{"author" => "person"} = entry ->
           entry
-          |> Map.put("delivery", %{
-            "delivered" => Map.get(marks, "delivered", false),
-            "acted" => Map.get(marks, "acted", false)
-          })
+          |> Map.put("delivery", person_delivery(marks))
           |> Map.put(@sources, Enum.sort([seq | folded_seqs]))
           |> List.wrap()
 
@@ -1156,17 +1153,84 @@ defmodule AttentionServer.ClientAPI.Resources do
     end
   end
 
-  defp delivery_effect(%{"kind" => "receipt", "delivered" => true, "event_id" => id}),
-    do: {"delivered", id}
+  defp person_delivery(marks) do
+    receipt = Map.get(marks, :receipt, %{})
+    capability = Map.get(marks, :capability, %{})
 
-  defp delivery_effect(%{"kind" => "delivery_ack", "stage" => "ack1", "event_id" => id}),
-    do: {"delivered", id}
+    delivery =
+      marks
+      |> Map.take(~w(delivered acted agent_acted))
+      |> Map.put_new("delivered", false)
+      |> Map.put_new("acted", false)
+      |> Map.merge(receipt)
+      |> Map.merge(capability)
 
-  defp delivery_effect(%{"kind" => "delivery_ack", "stage" => "ack2", "event_id" => id}),
-    do: {"acted", id}
+    if delivery["delivered"] and not Map.has_key?(marks, :new_service) and
+         not Map.has_key?(delivery, "ack2_expected") and not Map.has_key?(delivery, "outcome"),
+       do: Map.put(delivery, "legacy_caption", true),
+       else: delivery
+  end
 
-  defp delivery_effect(%{"kind" => "acted", "event_id" => id}), do: {"acted", id}
-  defp delivery_effect(_), do: nil
+  defp delivery_effect(%{"kind" => "receipt", "delivered" => true, "event_id" => id}, _, _, _),
+    do: {id, %{"delivered" => true}}
+
+  defp delivery_effect(
+         %{"kind" => "delivery_ack", "stage" => "ack1", "event_id" => id} = ack,
+         _,
+         _,
+         _
+       ) do
+    marks =
+      case ack do
+        %{"r25_served" => true} ->
+          capability = Map.take(ack, ~w(ack2_expected listener_received))
+          %{"delivered" => true, :new_service => true, :capability => capability}
+
+        %{"ack2_expected" => true} ->
+          %{"delivered" => true, :capability => %{"ack2_expected" => true}}
+
+        _ ->
+          %{"delivered" => true}
+      end
+
+    {id, marks}
+  end
+
+  defp delivery_effect(
+         %{"kind" => "delivery_ack", "stage" => "ack2", "event_id" => id} = ack,
+         _,
+         _,
+         _
+       ) do
+    receipt =
+      ack
+      |> Map.take(~w(outcome reason rerouted))
+      |> put_present("agent", get_in(ack, ["acknowledger", "agent"]))
+
+    {id, %{"acted" => true, :receipt => receipt}}
+  end
+
+  defp delivery_effect(
+         %{"kind" => "acted", "event_id" => id} = act,
+         engine,
+         {person, _, _},
+         record
+       ) do
+    evidence =
+      with acting when is_binary(acting) <- act["acting_event_id"],
+           {seq, ""} <- Integer.parse(acting),
+           %{"kind" => kind} <-
+             get_in(engine.origin_feeds, [{person, record.origin}, :entries, seq]),
+           true <- kind in ["revision", "terminal"] do
+        %{"acted" => true, "agent_acted" => true}
+      else
+        _ -> %{"acted" => true}
+      end
+
+    {id, evidence}
+  end
+
+  defp delivery_effect(_, _, _, _), do: nil
 
   defp entry(item_id, record, seq, payload, context) do
     key = {:entry, entry_id(seq)}

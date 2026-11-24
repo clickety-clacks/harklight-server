@@ -226,6 +226,7 @@ defmodule AttentionServer.ClientAPIDefaultStartupTest do
         assert me.status == 200
 
         assert decode(me)["features"] == %{
+                 "handoff_captions" => true,
                  "server_matched_push_routing" => false,
                  "priority_level_editing" => false
                }

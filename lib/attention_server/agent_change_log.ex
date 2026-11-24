@@ -45,7 +45,7 @@ defmodule AttentionServer.AgentChangeLog do
   these rows in the same transaction as the engine and the person's log.
   """
   def changes(%Engine{} = old, %Engine{} = next, changed),
-    do: log_rows(next, changed, changed_sessions(old, next), advisory_changes(old, next))
+    do: log_rows(old, next, changed, changed_sessions(old, next), advisory_changes(old, next))
 
   @doc false
   # `changes/3` from a keyed commit's touched addresses, carried in `changed`
@@ -55,15 +55,15 @@ defmodule AttentionServer.AgentChangeLog do
   # touched set.
   def changes_touched(%Engine{} = old, %Engine{} = next, %{touched: grouped} = changed) do
     sessions = touched_sessions(old, next, Map.get(grouped, {:row, :origin_sessions}, []))
-    log_rows(next, changed, sessions, touched_advisories(old, next, grouped))
+    log_rows(old, next, changed, sessions, touched_advisories(old, next, grouped))
   end
 
-  defp log_rows(next, changed, sessions, advisories) do
+  defp log_rows(old, next, changed, sessions, advisories) do
     entries =
-      for {_, seq} = event <- changed.entries do
-        %{key: key, payload: payload} = Map.fetch!(next.conversation_events, event)
-        {seq, key, payload}
-      end
+      for {_, seq} = event <- changed.entries,
+          %{key: key, payload: payload} <- [Map.fetch!(next.conversation_events, event)],
+          not listener_confirmation_only?(old, event, payload),
+          do: {seq, key, payload}
 
     messages =
       [
@@ -96,6 +96,16 @@ defmodule AttentionServer.AgentChangeLog do
     (messages ++ entries ++ advisory_rows)
     |> Enum.group_by(fn {agent, _row} -> agent end, fn {_agent, row} -> row end)
   end
+
+  # This evidence is person-facing. The agent's Delivered record already exists.
+  defp listener_confirmation_only?(old, event, %{"listener_received" => true} = payload) do
+    case Map.get(old.conversation_events, event) do
+      %{payload: prior} -> prior == Map.delete(payload, "listener_received")
+      _ -> false
+    end
+  end
+
+  defp listener_confirmation_only?(_old, _event, _payload), do: false
 
   defp item_row(engine, {person, _, _} = key, kind, resource) do
     case Map.get(engine.messages, key) do

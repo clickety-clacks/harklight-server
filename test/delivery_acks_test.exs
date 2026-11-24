@@ -170,7 +170,8 @@ defmodule AttentionServer.DeliveryAcksTest do
     assert [ack] = delivery_facts(c.relay)
     assert ack["event_id"] == id
     assert ack["stage"] == "ack1"
-    assert ack["ack2_expected"] == true
+    # V2 feed reads without the capability header leave it unknown.
+    refute Map.has_key?(ack, "ack2_expected")
     assert ack["op_id"] == op(2)
     assert ack["session_handle"] == @handle
     assert ack["request_revision"] == 1
@@ -201,7 +202,8 @@ defmodule AttentionServer.DeliveryAcksTest do
 
     assert [first, second] = delivery_facts(c.relay)
     assert first["stage"] == "ack1"
-    assert first["ack2_expected"] == true
+    # A standalone receipt makes no capability declaration.
+    refute Map.has_key?(first, "ack2_expected")
     assert second["stage"] == "ack2"
     assert second["conversation_seq"] == first["conversation_seq"] + 1
     assert second["acknowledger"]["agent"] == "Reviewer"
