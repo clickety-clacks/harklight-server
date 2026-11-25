@@ -1,0 +1,133 @@
+name: FORMAT31 indexed conversion and startup at 50,000 messages
+
+on:
+  push:
+    branches: [server/format31-index-fixed]
+
+permissions:
+  contents: read
+
+jobs:
+  conversion:
+    runs-on: ubuntu-latest
+    timeout-minutes: 140
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - fixture: C
+            shape: '50000 500000 1300 0 400'
+          - fixture: L
+            shape: '50000 900000 1300 0 400'
+    env:
+      ATTENTION_SERVER_ENABLE: '0'
+      MIX_ENV: prod
+      ERL_FLAGS: '+S 2:2 +SDcpu 1 +SDio 1'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: '27.3.3'
+          elixir-version: '1.19.5'
+          version-type: strict
+      - run: mix deps.get --only prod
+      - run: mix compile
+      - name: Record query plans
+        run: |
+          mkdir -p "$RUNNER_TEMP/plans"
+          timeout 3m mix run --no-compile scripts/format31-rehearsal.exs index-plans > "$RUNNER_TEMP/plans/plan.log" 2>&1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: format31-index-plans-${{ matrix.fixture }}
+          path: ${{ runner.temp }}/plans/
+      - name: Write the synthetic fixture with the published prior package
+        env:
+          SHAPE: ${{ matrix.shape }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/measurements" "$RUNNER_TEMP/prior"
+          results="$RUNNER_TEMP/measurements"
+          git rev-parse HEAD HEAD^ >"$results/commits.txt"
+          awk '/^(MemTotal|MemAvailable):/' /proc/meminfo >"$results/capacity.txt"
+          df -Pk "$RUNNER_TEMP" | awk 'NR == 2 { print "disk_free_kib", $4 }' >>"$results/capacity.txt"
+          probe="$GITHUB_WORKSPACE/scripts/format31-rehearsal.exs"
+          echo "HARKLIGHT_PROBE=$probe" >>"$GITHUB_ENV"
+          archive=harklight-server-0.2.18-linux-x86_64.tar.gz
+          (
+            cd "$RUNNER_TEMP/prior"
+            release=https://github.com/clickety-clacks/harklight-server/releases/download/v0.2.18
+            curl --fail --silent --show-error --location --retry 3 --remote-name "$release/$archive"
+            curl --fail --silent --show-error --location --retry 3 --remote-name "$release/SHA256SUMS"
+            sha256sum --check --ignore-missing SHA256SUMS
+            tar -zxf "$archive"
+          ) >"$results/prior-package.log" 2>&1
+          prior="$RUNNER_TEMP/prior/harklight-server-0.2.18-linux-x86_64/bin/attention_server"
+          export HARKLIGHT_SHAPE="$SHAPE" HARKLIGHT_FIXTURE="$RUNNER_TEMP/seed" HARKLIGHT_PROBE="$probe"
+          run_prior() {
+            sudo systemd-run --quiet --wait --pipe --collect \
+              --property=MemoryMax=14G --property=MemorySwapMax=0 --uid="$(id -u)" \
+              --working-directory="$GITHUB_WORKSPACE" \
+              /usr/bin/env "ATTENTION_SERVER_ENABLE=0" "ERL_FLAGS=$ERL_FLAGS" \
+              "HARKLIGHT_FIXTURE=$HARKLIGHT_FIXTURE" "HARKLIGHT_PROBE=$HARKLIGHT_PROBE" \
+              "HARKLIGHT_SHAPE=$HARKLIGHT_SHAPE" timeout 30m "$prior" eval "$1"
+          }
+          run_prior 'System.argv(["seed", System.fetch_env!("HARKLIGHT_FIXTURE") | String.split(System.fetch_env!("HARKLIGHT_SHAPE"))]); Code.require_file(System.fetch_env!("HARKLIGHT_PROBE"))' \
+            >"$results/seed.log" 2>&1
+      - name: Exercise the converter at 2 GiB and measure the uncapped transaction
+        id: convert
+        run: |
+          results="$RUNNER_TEMP/measurements"
+          fixture="$RUNNER_TEMP/converted"
+          cp -a "$RUNNER_TEMP/seed" "$fixture"
+          timeout 3m mix run --no-compile "$HARKLIGHT_PROBE" inspect "$fixture" > "$results/snapshot.log" 2>&1
+          tar -cf "$RUNNER_TEMP/backup.tar" -C "$fixture" .
+          stat --printf='backup_bytes %s\n' "$RUNNER_TEMP/backup.tar" >> "$results/snapshot.log"
+          limited="$RUNNER_TEMP/limited"
+          cp -a "$RUNNER_TEMP/seed" "$limited"
+          status=0
+          sudo systemd-run --quiet --wait --pipe --collect \
+            --property=MemoryMax=2G --property=MemorySwapMax=0 --property=PrivateNetwork=yes \
+            --uid="$(id -u)" --working-directory="$GITHUB_WORKSPACE" \
+            /usr/bin/env "PATH=$PATH" "MIX_ENV=$MIX_ENV" "ERL_FLAGS=$ERL_FLAGS" \
+            ATTENTION_SERVER_ENABLE=0 "MIX_HOME=$HOME/.mix" \
+            timeout --kill-after=30s 18m mix run --no-compile "$HARKLIGHT_PROBE" calibrate-stopped "$limited" \
+            > "$results/capped.log" 2>&1 || status=$?
+          echo "exit=$status" >> "$results/capped.log"
+          if ((status != 0)); then
+            timeout 3m mix run --no-compile "$HARKLIGHT_PROBE" inspect "$limited" >> "$results/capped.log" 2>&1
+          fi
+          timeout --kill-after=30s 50m mix run --no-compile "$HARKLIGHT_PROBE" calibrate-stopped "$fixture" \
+            > "$results/conversion.log" 2>&1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: format31-index-phases-${{ matrix.fixture }}
+          path: ${{ runner.temp }}/measurements/
+
+      - name: Measure candidate and prior startup separately
+        if: steps.convert.outcome == 'success'
+        run: |
+          results="$RUNNER_TEMP/measurements"
+          status=0
+          timeout --kill-after=30s 30m mix run --no-compile "$HARKLIGHT_PROBE" measure "$RUNNER_TEMP/converted" \
+            > "$results/candidate.log" 2>&1 || status=$?
+          echo "exit=$status" >> "$results/candidate.log"
+          prior="$RUNNER_TEMP/prior/harklight-server-0.2.18-linux-x86_64/bin/attention_server"
+          status=0
+          sudo systemd-run --quiet --wait --pipe --collect \
+            --property=MemoryMax=14G --property=MemorySwapMax=0 --property=PrivateNetwork=yes \
+            --uid="$(id -u)" --working-directory="$GITHUB_WORKSPACE" \
+            /usr/bin/env ATTENTION_SERVER_ENABLE=0 "ERL_FLAGS=$ERL_FLAGS" \
+            "HARKLIGHT_FIXTURE=$RUNNER_TEMP/seed" "HARKLIGHT_PROBE=$HARKLIGHT_PROBE" \
+            timeout --kill-after=30s 30m "$prior" eval \
+              'System.argv(["measure", System.fetch_env!("HARKLIGHT_FIXTURE")]); Code.require_file(System.fetch_env!("HARKLIGHT_PROBE"))' \
+            > "$results/baseline.log" 2>&1 || status=$?
+          echo "exit=$status" >> "$results/baseline.log"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: format31-indexed-startup-${{ matrix.fixture }}
+          path: ${{ runner.temp }}/measurements/

@@ -324,6 +324,12 @@ defmodule AttentionServer.Store do
     convert_snapshot_store(path, preflight, fn _store, _engine, _generation -> {:ok, :converted} end)
   end
 
+  # Runs only on the isolated synthetic rehearsal branch.
+  def calibrate_stopped(path) do
+    true = File.regular?(Path.join(Path.dirname(path), "synthetic-format31"))
+    convert_snapshot_store(path, fn _db -> :ok end, fn _store, _engine, _generation -> {:ok, :converted} end)
+  end
+
   defp convert_snapshot_store(
          path,
          preflight \\ fn _db -> :ok end,
