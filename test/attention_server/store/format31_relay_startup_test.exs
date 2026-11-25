@@ -4,6 +4,7 @@ defmodule AttentionServer.Store.Format31RelayStartupTest do
   alias AttentionServer.{Engine, JSON, Relay, Store}
   alias AttentionServer.AgentAPI.FeedActivity
   alias AttentionServer.ClientAPI.Reads
+  alias AttentionServer.Store.{DerivedIndex, RecordTable}
   alias Exqlite.Sqlite3
 
   @moduletag :tmp_dir
@@ -111,7 +112,7 @@ defmodule AttentionServer.Store.Format31RelayStartupTest do
     assert :ok = GenServer.stop(relay)
   end
 
-  test "incremental derived rows agree with a generation rebuild through an inherited chain", %{tmp_dir: dir} do
+  test "stored records alone rebuild the incremental derived rows through an inherited chain", %{tmp_dir: dir} do
     path = Path.join(dir, "relay.sqlite3")
     assert {:ok, relay} = Relay.start_link(store_path: path)
     assert :ok = Relay.setup_person(relay, "person")
@@ -141,6 +142,8 @@ defmodule AttentionServer.Store.Format31RelayStartupTest do
 
     assert {:ok, db} = Sqlite3.open(path)
     assert :ok = Sqlite3.execute(db, "DELETE FROM relay_items; UPDATE relay_index_state SET generation = 0")
+    assert {:ok, generation} = RecordTable.generation(db)
+    assert :ok = DerivedIndex.ensure(db, generation)
     assert :ok = Sqlite3.close(db)
 
     assert {:ok, rebuilt} = Store.open(path, :keyed)
