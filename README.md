@@ -150,8 +150,8 @@ use `harklight-agent read --session HANDLE` when the originating work resumes;
 it reads once without acknowledging an event or promising future delivery.
 Enrolled-device `read` and `respond` remain available for requests already
 stored by the server; they do not create new messages or retrieve an origin
-receipt. Registered agent identities have separately granted
-search/get/respond access.
+receipt. Enrolled devices and registered agents can search and read within their
+account. Registered agents still need the applicable grants to respond.
 
 Agent search lists messages newest original acceptance first. Pass back its
 `next_page` with the same filters for the next page.

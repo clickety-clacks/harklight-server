@@ -96,8 +96,17 @@ defmodule AttentionServer.Conversation do
     |> append_entry(person, origin, entry)
   end
 
+  def retracted_by(person, %{state: "retracted", actor: actor, actor_kind: kind})
+      when is_binary(actor) and byte_size(actor) == 64 and kind in [:agent, :device] do
+    :crypto.hash(:sha256, :erlang.term_to_binary({person, kind, actor}))
+    |> Base.url_encode64(padding: false)
+  end
+
+  def retracted_by(_person, _terminal), do: nil
+
   def terminal_author(record, terminal) do
     cond do
+      terminal.state == "retracted" -> "origin"
       terminal.actor_kind == :server -> "server"
       terminal.actor_kind == :agent -> "agent"
       terminal.state == "superseded" -> "server"

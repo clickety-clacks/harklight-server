@@ -217,7 +217,7 @@ defmodule AttentionServer.ClientAPI.Resources do
     end)
   end
 
-  defp project_item(engine, {_person, sender, _id} = key, rank) do
+  defp project_item(engine, {person, sender, _id} = key, rank) do
     record = Map.fetch!(engine.messages, key)
     revision = Map.get(record, :revision, 1)
     summary = Map.get(engine.route_b_index.conversation_summary_by_item, key, %{})
@@ -232,7 +232,7 @@ defmodule AttentionServer.ClientAPI.Resources do
       "files" => engine |> typed_files(item_files(record, revision)),
       "seen" => seen?(engine, key, record),
       "chat" => chat(engine, key, record, summary, reply),
-      "terminal" => terminal(record),
+      "terminal" => terminal(person, record),
       "rank" => rank,
       @viewer => %{"origin" => record.origin}
     }
@@ -396,15 +396,16 @@ defmodule AttentionServer.ClientAPI.Resources do
 
   defp availability(_), do: nil
 
-  defp terminal(%{terminal: nil}), do: nil
+  defp terminal(_person, %{terminal: nil}), do: nil
 
-  defp terminal(%{terminal: %{state: state, at: at} = terminal} = record) do
+  defp terminal(person, %{terminal: %{state: state, at: at} = terminal} = record) do
     %{
       "state" => state,
       "at_ms" => at,
       "by_this_person" => Conversation.terminal_author(record, terminal) == "person"
     }
     |> put_present("answer", answer_outcome(record, terminal))
+    |> put_present("retracted_by", Conversation.retracted_by(person, terminal))
   end
 
   # Today's person-facing answer_outcome (contract rulings round 4, item 3).

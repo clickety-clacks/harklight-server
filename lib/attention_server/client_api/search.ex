@@ -11,9 +11,10 @@ defmodule AttentionServer.ClientAPI.Search do
     with :ok <- validate(params, "q", &(is_binary(&1) and byte_size(&1) <= 1_024)),
          :ok <- validate(params, "sender", &Message.sender_id?/1),
          :ok <- validate(params, "message_id", &Message.nonempty?/1),
+         :ok <- validate(params, "session", &Message.uuid_v4?/1),
          :ok <- validate(params, "state", &(&1 in @states)),
          {:ok, limit} <- limit(params["limit"]) do
-      {:ok, Map.take(params, ~w(q sender message_id state)), limit}
+      {:ok, Map.take(params, ~w(q sender message_id state session)), limit}
     end
   end
 
@@ -53,7 +54,7 @@ defmodule AttentionServer.ClientAPI.Search do
   def binding(principal, filters) do
     :crypto.hash(
       :sha256,
-      JSON.canonical([principal.person, principal.key, principal.id, filters])
+      JSON.canonical([principal.person, principal.key, Map.get(principal, :id), filters])
     )
   end
 
@@ -89,6 +90,7 @@ defmodule AttentionServer.ClientAPI.Search do
         %{accepted_seq: ^seq} = record <- [engine.messages[key]],
         is_nil(filters["sender"]) or sender == filters["sender"],
         is_nil(filters["message_id"]) or id == filters["message_id"],
+        is_nil(filters["session"]) or Map.get(record, :session_handle) == filters["session"],
         AgentAccess.state_matches?(record, filters["state"]) do
       {seq, key, if(filters["q"], do: record.message)}
     end

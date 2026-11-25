@@ -40,7 +40,7 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
     [
       {"POST", ["agent", "messages"], :send_message},
       {"PUT", ["agent", "messages", :item_id], :revise},
-      {"POST", ["agent", "messages", :item_id, "retract"], :retract},
+      {"POST", ["agent", "messages", :item_id, "retract"], :retract, granted_agent: true},
       {"POST", ["agent", "messages", :item_id, "lifecycle"], :lifecycle},
       {"POST", ["agent", "messages", :item_id, "replies"], :reply},
       {"POST", ["agent", "messages", :item_id, "result"], :result},
@@ -65,7 +65,7 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
   def advisory_ack(conn, ctx), do: request(conn, ctx, :advisory_ack)
 
   defp request(conn, ctx, operation) do
-    with :ok <- Writes.device_only(ctx.principal),
+    with :ok <- write_principal(ctx.principal, operation),
          {:ok, key} <- request_key(conn),
          {:ok, body, conn} <- json_body(conn, []),
          :ok <- Writes.only_members(body, Map.fetch!(@members, operation)) do
@@ -93,6 +93,9 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
       {:error, token, field} -> Errors.send_error(conn, token, field: field)
     end
   end
+
+  defp write_principal(%{kind: :agent}, :retract), do: :ok
+  defp write_principal(principal, _operation), do: Writes.device_only(principal)
 
   defp call(ctx, request),
     do: GenServer.call(ctx.relay, {:client_api, __MODULE__, request}, :infinity)
@@ -172,7 +175,7 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
     scope = {person, agent}
     receipt_scope = receipt_scope(scope)
 
-    case authorize(state, scope) do
+    case authorize(state, scope, operation) do
       :ok ->
         case lookup(state, receipt_scope, key) do
           {:ok, %{digest: ^digest, status: status, body: stored}} when is_binary(stored) ->
@@ -251,9 +254,11 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
       ) do
     scope = {person, agent}
 
+    operation = if receipt["account_retract"], do: :retract, else: :other
+
     result =
-      with :ok <- authorize(state, scope),
-           {:ok, key} <- AgentResources.own_item_key(state, scope, item) do
+      with :ok <- authorize(state, scope, operation),
+           {:ok, key} <- operation_item_key(state, scope, operation, item) do
         project_receipt(state, scope, key, receipt)
       end
 
@@ -263,10 +268,20 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
   defp project_receipt(_state, _scope, _key, %{"item_id" => nil}), do: {:ok, %{}}
 
   defp project_receipt(state, scope, key, receipt) do
+    projection_scope = receipt_projection_scope(state, scope, key, receipt)
+
     Projection.capture(fn ->
-      with {:ok, rev} <- AgentChangeLog.head(state.store, scope),
-           {:ok, message} <- replay_message(state, scope, key, receipt["include_message"]),
-           {:ok, entry} <- replay_entry(state, scope, key, receipt["entry_position"]) do
+      with {:ok, rev} <- AgentChangeLog.head(state.store, projection_scope),
+           {:ok, message} <-
+             replay_message(state, projection_scope, key, receipt["include_message"]),
+           {:ok, entry} <- replay_entry(state, projection_scope, key, receipt["entry_position"]) do
+        message =
+          if projection_scope != scope do
+            Map.delete(message, "advisories")
+          else
+            message
+          end
+
         resources =
           %{"rev" => rev}
           |> put_resource("message", message)
@@ -289,6 +304,11 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
   end
 
   defp refresh_advisory_ack(resources, _engine, _scope, _key, _outcome), do: resources
+
+  defp receipt_projection_scope(state, {person, _}, key, %{"account_retract" => true}),
+    do: {person, state.store.engine.messages[key].origin}
+
+  defp receipt_projection_scope(_state, scope, _key, _receipt), do: scope
 
   defp replay_message(state, scope, key, true), do: AgentResources.message(state, scope, key)
   defp replay_message(_state, _scope, _key, false), do: {:ok, nil}
@@ -367,9 +387,13 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
       else: {:error, "invalid_field", nil}
   end
 
-  defp authorize(state, {person, agent}) do
+  defp authorize(state, scope, operation \\ :other)
+
+  defp authorize(state, {person, agent}, operation) do
     with true <- state.store.change_log,
-         {:ok, ^person} <- Engine.authorized_person(state.store.engine, agent) do
+         {:ok, %{person: ^person, kind: kind}} <-
+           Engine.account_device_principal(state.store.engine, agent),
+         true <- kind == :device or (kind == :agent and operation == :retract) do
       if Engine.delivery_stopped?(state.store.engine, person),
         do: {:error, :account_paused},
         else: :ok
@@ -402,14 +426,15 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
                :ok <- distinct_upload_names(uploads) do
             staged = for {:staged, file} <- selected, do: file.file_id
             sources = Map.new(Enum.zip(Enum.map(uploads, & &1["upload_id"]), staged))
-            apply_frame(state, agent, operation, frame, op_id, sources)
+            apply_frame(state, agent, operation, frame, op_id, sources, message_key)
           else
             error -> {error, state}
           end
 
         response =
           with {:ok, fields} <- reply,
-               {:ok, receipt} <- committed_receipt(next, scope, operation, message_key, fields, extras),
+               {:ok, receipt} <-
+                 committed_receipt(next, scope, operation, message_key, fields, extras),
                :ok <- save(next, receipt_scope, key, digest, receipt),
                {:ok, resources} <- project_receipt(next, scope, message_key, receipt) do
             {:ok, 200, Map.merge(receipt["outcome"], resources), false}
@@ -424,13 +449,20 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
     end
   end
 
-  defp apply_frame(state, agent, operation, attributes, op_id, sources) when is_map(attributes) do
+  defp apply_frame(state, agent, :retract, attributes, op_id, _sources, key) do
+    frame = Map.merge(attributes, %{"v" => 1, "op_id" => op_id})
+    {reply, next} = Relay.apply_account_retract(state, key, agent, frame)
+    {decode_reply(reply, :retract), next}
+  end
+
+  defp apply_frame(state, agent, operation, attributes, op_id, sources, _key)
+       when is_map(attributes) do
     frame = Map.merge(attributes, %{"v" => 1, "op_id" => op_id, :agent_api_v2 => true})
     {reply, next} = Relay.apply_agent_frame(state, agent, frame, sources)
     {decode_reply(reply, operation), next}
   end
 
-  defp apply_frame(state, agent, _operation, {:receipt, sequence, body}, op_id, _sources) do
+  defp apply_frame(state, agent, _operation, {:receipt, sequence, body}, op_id, _sources, _key) do
     {:reply, reply, next} =
       Relay.apply_agent_command(
         state,
@@ -440,14 +472,22 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
     {reply, next}
   end
 
-  defp apply_frame(state, agent, _operation, {:session_end, session}, _op_id, _sources) do
+  defp apply_frame(state, agent, _operation, {:session_end, session}, _op_id, _sources, _key) do
     {:reply, reply, next} =
       Relay.apply_agent_command(state, {:origin_session_gone, agent, session, :agent_v2})
 
     {if(reply == :ok, do: {:ok, %{}}, else: reply), next}
   end
 
-  defp apply_frame(state, agent, _operation, {:file_use, sequence, name, outcome}, op_id, _sources) do
+  defp apply_frame(
+         state,
+         agent,
+         _operation,
+         {:file_use, sequence, name, outcome},
+         op_id,
+         _sources,
+         _key
+       ) do
     case Relay.apply_agent_file_use(state, agent, sequence, name, outcome, op_id) do
       {{:error, :file_use_conflict}, next} -> {{:error, :already_closed}, next}
       {{:error, :file_use}, next} -> {{:error, "invalid_field", "outcome"}, next}
@@ -455,7 +495,7 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
     end
   end
 
-  defp apply_frame(state, agent, _operation, {:advisory_ack, item, id}, _op_id, _sources),
+  defp apply_frame(state, agent, _operation, {:advisory_ack, item, id}, _op_id, _sources, _key),
     do: Relay.apply_agent_advisory_ack(state, item, agent, id)
 
   defp frame(_state, _scope, :session_end, %{session: session}, _op, _match, _body) do
@@ -491,8 +531,9 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
   end
 
   defp frame(state, scope, operation, %{item_id: item_id} = params, _op_id, match, body) do
-    with {:ok, {_, sender, id} = key} <- AgentResources.own_item_key(state, scope, item_id),
+    with {:ok, {_, sender, id} = key} <- operation_item_key(state, scope, operation, item_id),
          record = Map.fetch!(state.store.engine.messages, key),
+         :ok <- authorize_correlation(scope, record, operation, body),
          {:ok, fields, extras} <-
            item_frame(
              state,
@@ -511,6 +552,18 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
     end
   end
 
+  defp operation_item_key(state, {person, _}, :retract, id),
+    do: Resources.item_key(state.store.engine, person, id)
+
+  defp operation_item_key(state, scope, _operation, id),
+    do: AgentResources.own_item_key(state, scope, id)
+
+  defp authorize_correlation({_, actor}, %{origin: origin}, :retract, %{"in_reply_to" => _})
+       when actor != origin,
+       do: {:error, :not_found}
+
+  defp authorize_correlation(_scope, _record, _operation, _body), do: :ok
+
   defp item_frame(state, {_, sender, id} = key, record, :revise, match, body) do
     with :ok <- open(record),
          :ok <- if_match(match, record.revision),
@@ -522,6 +575,7 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
         "message" => Map.merge(message, %{"sender_id" => sender, "message_id" => id}),
         "base_revision" => record.revision
       }
+
       {:ok, Map.merge(frame, correlation), position}
     end
   end
@@ -809,7 +863,10 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
   defp committed_receipt(state, scope, operation, key, fields, extras) do
     {message?, position, outcome} = receipt_fields(operation, fields, extras)
 
-    with {:ok, rev} <- AgentChangeLog.head(state.store, scope),
+    receipt = if operation == :retract, do: %{"account_retract" => true}, else: %{}
+    projection_scope = receipt_projection_scope(state, scope, key, receipt)
+
+    with {:ok, rev} <- AgentChangeLog.head(state.store, projection_scope),
          {:ok, item_id} <-
            receipt_item(
              state,
@@ -817,13 +874,13 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
              message? or is_integer(position) or operation == :advisory_ack
            ) do
       {:ok,
-       %{
+       Map.merge(receipt, %{
          "agent_write" => 1,
          "item_id" => item_id,
          "include_message" => message?,
          "entry_position" => position,
          "outcome" => Map.put(outcome, "rev", rev)
-       }}
+       })}
     end
   end
 
@@ -841,7 +898,9 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
     do: {false, position, Map.take(fields, ~w(status stage_outcome))}
 
   defp receipt_fields(:file_use, fields, {position, file_id}),
-    do: {false, position, fields |> Map.take(~w(duplicate transfer use)) |> Map.put("file_id", file_id)}
+    do:
+      {false, position,
+       fields |> Map.take(~w(duplicate transfer use)) |> Map.put("file_id", file_id)}
 
   defp receipt_fields(:advisory_ack, fields, _extras),
     do: {false, nil, Map.take(fields, ~w(advisory_id delivered already_delivered moot))}

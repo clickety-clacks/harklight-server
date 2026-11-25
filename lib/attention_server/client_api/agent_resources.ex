@@ -181,6 +181,7 @@ defmodule AttentionServer.ClientAPI.AgentResources do
     base =
       %{"state" => terminal.state, "at_ms" => terminal.at}
       |> put("outcome", Resources.answer_outcome(record, terminal))
+      |> put("retracted_by", Conversation.retracted_by(person, terminal))
 
     base =
       if terminal.answer_present, do: Map.put(base, "answer", terminal.answer), else: base
