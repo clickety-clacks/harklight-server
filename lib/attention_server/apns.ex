@@ -16,16 +16,17 @@ defmodule AttentionServer.APNS do
   @key_id_pattern ~r/\A[A-Z0-9]{10}\z/
   @team_id_pattern ~r/\A[A-Z0-9]{10}\z/
   @p256_oid {1, 2, 840, 10045, 3, 1, 7}
+  @attention %{"v" => 2, "type" => "sync"}
   @alert_payload %{
     "aps" => %{
       "alert" => %{"title" => "Harklight", "body" => "New attention is ready."},
       "content-available" => 1
     },
-    "attention" => %{"v" => 1, "type" => "sync"}
+    "attention" => @attention
   }
   @background_payload %{
     "aps" => %{"content-available" => 1},
-    "attention" => %{"v" => 1, "type" => "sync"}
+    "attention" => @attention
   }
   @max_payload_bytes 4_096
   # Reserve the mandatory persisted 32-hex identity while fitting alert text.
@@ -287,19 +288,26 @@ defmodule AttentionServer.APNS do
 
   @doc false
   def request_payload(claim) do
-    claim
-    |> presentation_payload()
-    |> put_in(["attention", "server"], Map.fetch!(claim, :server))
-    |> AttentionServer.APNS.Expansion.add(claim)
+    unless valid_locator?(Map.get(claim, :locator)),
+      do: raise(ArgumentError, "invalid push locator")
+
+    payload =
+      claim
+      |> presentation_payload()
+      |> put_in(["attention", "server"], Map.fetch!(claim, :server))
+
+    if byte_size(JSON.encode!(payload)) > @max_payload_bytes,
+      do: raise(ArgumentError, "APNs payload exceeds the payload limit")
+
+    AttentionServer.APNS.Expansion.add(payload, claim)
   end
 
   defp presentation_payload(%{presentation: :background} = claim),
-    do: put_badge(@background_payload, Map.get(claim, :badge))
+    do: sync_payload(@background_payload, claim)
 
   defp presentation_payload(
          %{presentation: :alert, locator: %{"target" => "chat"} = locator} = claim
        ) do
-    unless valid_locator?(locator), do: raise(ArgumentError, "invalid chat locator")
     alert = claim.alert
 
     case fit_alert_payload(
@@ -324,8 +332,7 @@ defmodule AttentionServer.APNS do
          } = claim
        )
        when is_list(names) do
-    locator = Map.get(claim, :locator)
-    locator = if valid_locator?(locator), do: locator, else: nil
+    locator = claim.locator
 
     case fit_grouped_alert_payload(title, names, locator, Map.get(claim, :badge)) do
       {:ok, payload} ->
@@ -341,11 +348,10 @@ defmodule AttentionServer.APNS do
     preview_truncated? = Map.get(alert, "body_truncated", false)
     preserve_title? = Map.get(claim, :preserve_alert_title, false)
     preserve_body? = Map.get(claim, :preserve_alert_body, false)
-    locator = Map.get(claim, :locator)
-    locator = if valid_locator?(locator), do: locator, else: nil
+    locator = claim.locator
     badge = Map.get(claim, :badge)
 
-    case fit_alert_with_optional_locator(
+    case fit_alert_payload(
            title,
            body,
            preview_truncated?,
@@ -358,7 +364,7 @@ defmodule AttentionServer.APNS do
         payload
 
       :error when preserve_title? ->
-        case fit_alert_with_optional_locator(
+        case fit_alert_payload(
                @neutral_sender_label,
                body,
                preview_truncated?,
@@ -379,45 +385,12 @@ defmodule AttentionServer.APNS do
     end
   end
 
-  defp presentation_payload(claim), do: put_badge(@alert_payload, Map.get(claim, :badge))
+  defp presentation_payload(claim), do: sync_payload(@alert_payload, claim)
 
-  defp fit_alert_with_optional_locator(
-         title,
-         body,
-         preview_truncated?,
-         locator,
-         badge,
-         preserve_title?,
-         preserve_body?
-       ) do
-    case fit_alert_payload(
-           title,
-           body,
-           preview_truncated?,
-           locator,
-           badge,
-           preserve_title?,
-           preserve_body?
-         ) do
-      {:ok, payload} ->
-        {:ok, payload}
-
-      :error when not is_nil(locator) ->
-        Logger.warning("event=harklight_apns_tap_locator outcome=omitted_payload_limit")
-
-        fit_alert_payload(
-          title,
-          body,
-          preview_truncated?,
-          nil,
-          badge,
-          preserve_title?,
-          preserve_body?
-        )
-
-      :error ->
-        :error
-    end
+  defp sync_payload(payload, claim) do
+    payload
+    |> put_in(["attention", "locator"], claim.locator)
+    |> put_badge(Map.get(claim, :badge))
   end
 
   defp fit_grouped_alert_payload(title, names, locator, badge) do
@@ -548,7 +521,7 @@ defmodule AttentionServer.APNS do
   end
 
   defp alert_payload(title, body, locator, badge) do
-    attention = %{"v" => 1, "type" => "sync"}
+    attention = @attention
     attention = if locator, do: Map.put(attention, "locator", locator), else: attention
     alert = %{"title" => title}
     alert = if is_binary(body), do: Map.put(alert, "body", body), else: alert
@@ -630,21 +603,20 @@ defmodule AttentionServer.APNS do
 
   defp valid_locator?(
          %{
-           "v" => 1,
+           "v" => 2,
            "binding_id" => binding_id,
            "person_id" => person_id,
            "device_id" => device_id,
-           "sender_id" => sender_id,
-           "message_id" => message_id,
-           "acceptance_seq" => acceptance_seq
+           "item_id" => item_id,
+           "rev" => rev
          } = locator
        ) do
     valid_shape? =
-      map_size(locator) == 7 or (map_size(locator) == 8 and locator["target"] == "chat")
+      map_size(locator) == 6 or (map_size(locator) == 7 and locator["target"] == "chat")
 
     valid_shape? and AttentionServer.Message.uuid_v4?(binding_id) and
-      Enum.all?([person_id, device_id, sender_id, message_id], &valid_locator_id?/1) and
-      is_integer(acceptance_seq) and acceptance_seq > 0
+      Enum.all?([person_id, device_id, item_id], &valid_locator_id?/1) and
+      is_integer(rev) and rev > 0
   end
 
   defp valid_locator?(_), do: false

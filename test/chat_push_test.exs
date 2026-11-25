@@ -134,9 +134,8 @@ defmodule AttentionServer.ChatPushTest do
     assert chat.alert["title"] == "Agent two"
     assert chat.alert["body"] == "Latest reply"
     assert chat.locator["target"] == "chat"
-    assert chat.locator["message_id"] == "two"
-    assert chat.locator["acceptance_seq"] == 2
-    assert map_size(chat.locator) == 8
+    assert chat.locator["item_id"] == "i2"
+    assert map_size(chat.locator) == 6
     {:ok, engine} = Engine.finish_push(engine, chat, @accepted, now + 2)
     assert push_binding(engine).accepted_conversation_high == chat.conversation_high
     assert push_binding(engine).pending_conversation_high == 0
@@ -230,7 +229,7 @@ defmodule AttentionServer.ChatPushTest do
     assert newer_request.stream == :request
     {:ok, engine} = Engine.finish_push(engine, newer_request, @accepted, now + 2)
     {:ok, _, chat} = Engine.claim_push(engine, now + 2)
-    assert chat.locator["message_id"] == "one"
+    assert chat.locator["item_id"] == "i1"
     assert chat.alert["body"] == "Pending"
   end
 
@@ -258,7 +257,8 @@ defmodule AttentionServer.ChatPushTest do
     {:ok, engine, conversation} = Engine.claim_push(engine, now + 1)
     assert conversation.stream == :conversation
     assert conversation.presentation == :background
-    refute Map.has_key?(conversation, :locator)
+    assert conversation.locator["item_id"] == "i1"
+    refute Map.has_key?(conversation.locator, "target")
     {:ok, engine} = Engine.finish_push(engine, conversation, @accepted, now + 2)
     assert push_binding(engine).state == "ready"
   end

@@ -64,8 +64,7 @@ defmodule AttentionServer.PushAlertTest do
     assert claim.alert["title"] == "  Agent\nλ / name  "
     assert claim.preserve_alert_title
     assert claim.alert["body"] == "new work"
-    assert claim.locator["message_id"] == "latest"
-    assert claim.locator["acceptance_seq"] == high - 1
+    assert claim.locator["item_id"] == "i#{high - 1}"
     assert claim.badge == 1
   end
 
@@ -220,7 +219,7 @@ defmodule AttentionServer.PushAlertTest do
     }
   end
 
-  test "several new requests group into one push with a count, sender names and no locator" do
+  test "several new requests group into one push with a count, sender names and the newest item" do
     engine =
       engine_with_deliveries(
         [
@@ -235,7 +234,7 @@ defmodule AttentionServer.PushAlertTest do
     assert claim.presentation == :alert
     assert claim.high == 3
     assert claim.alert == %{"title" => "3 new requests", "body" => "Alice, app:beta"}
-    refute Map.has_key?(claim, :locator)
+    assert claim.locator["item_id"] == "i3"
     assert claim.badge == 3
   end
 

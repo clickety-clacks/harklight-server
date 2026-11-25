@@ -28,6 +28,8 @@ defmodule AttentionServer.Engine do
     SenderNames
   }
 
+  alias AttentionServer.ClientAPI.Resources
+
   @terminal_states ~w(answered cleared expired superseded)
   @pending_types ~w(resync ack push_register push_remove push_status)
   @push_claim_timeout_ms 30_000
@@ -149,6 +151,21 @@ defmodule AttentionServer.Engine do
             do: binding.pending_conversation_high,
             else: binding.accepted_conversation_high
 
+        item_key =
+          case {gathered, chat, stream} do
+            {[{key, _} | _], _, _} ->
+              key
+
+            {_, {key, _, _}, _} ->
+              key
+
+            {_, _, :request} ->
+              get_in(next.events, [{person, high}, :key])
+
+            {_, _, :conversation} ->
+              get_in(next.conversation_events, [{person, conversation_high}, :key])
+          end
+
         claim = %{
           server: engine.relay_instance_id,
           person: person,
@@ -166,6 +183,7 @@ defmodule AttentionServer.Engine do
               else: binding.pending_high > 0
             ),
           presentation: presentation,
+          locator: push_locator(next, item_key, person, device, binding.binding_id, chat),
           badge: inbox_badge(next, person),
           registered_at: binding.registered_at,
           claim_id: claim_id
@@ -177,16 +195,10 @@ defmodule AttentionServer.Engine do
               claim
 
             [selected] ->
-              claim =
-                claim
-                |> Map.put(:alert, push_alert(selected))
-                |> Map.put(:preserve_alert_title, true)
-                |> Map.put(:expanded, :single)
-
-              case push_locator(selected, person, device, binding.binding_id) do
-                nil -> claim
-                locator -> Map.put(claim, :locator, locator)
-              end
+              claim
+              |> Map.put(:alert, push_alert(selected))
+              |> Map.put(:preserve_alert_title, true)
+              |> Map.put(:expanded, :single)
 
             many ->
               {alert, names} = grouped_push_alert(many)
@@ -212,11 +224,6 @@ defmodule AttentionServer.Engine do
               claim
               |> Map.put(:alert, alert)
               |> Map.put(:expanded, :single)
-              |> Map.put(
-                :locator,
-                push_locator({key, record}, person, device, binding.binding_id)
-                |> Map.put("target", "chat")
-              )
 
             nil ->
               claim
@@ -5333,9 +5340,9 @@ defmodule AttentionServer.Engine do
     |> Enum.sort_by(fn {{_, seq}, _} -> seq end, :desc)
     |> Enum.find_value(fn {_, %{key: key, payload: payload}} ->
       case Map.get(engine.messages, key) do
-        %{origin: origin} = record when origin != device ->
-          if push_locator({key, record}, person, device, binding.binding_id),
-            do: {key, record, payload}
+        %{origin: origin, accepted_seq: seq} = record
+        when origin != device and is_integer(seq) and seq > 0 ->
+          {key, record, payload}
 
         _ ->
           nil
@@ -5411,26 +5418,25 @@ defmodule AttentionServer.Engine do
     end
   end
 
-  defp push_locator({{_, sender, message_id}, record}, person, device, binding_id) do
-    acceptance_seq = Map.get(record, :accepted_seq)
+  defp push_locator(_engine, nil, _person, _device, _binding_id, _chat), do: nil
 
-    if Message.uuid_v4?(binding_id) and
-         Enum.all?([person, device, sender, message_id], &valid_locator_id?/1) and
-         is_integer(acceptance_seq) and acceptance_seq > 0 do
-      %{
-        "v" => 1,
-        "binding_id" => binding_id,
-        "person_id" => person,
-        "device_id" => device,
-        "sender_id" => sender,
-        "message_id" => message_id,
-        "acceptance_seq" => acceptance_seq
-      }
+  defp push_locator(engine, key, person, device, binding_id, chat) do
+    case Resources.removed_item_id(engine, key) do
+      {:ok, item_id} ->
+        locator = %{
+          "v" => 2,
+          "binding_id" => binding_id,
+          "person_id" => person,
+          "device_id" => device,
+          "item_id" => item_id
+        }
+
+        if chat, do: Map.put(locator, "target", "chat"), else: locator
+
+      {:error, :not_found} ->
+        nil
     end
   end
-
-  defp valid_locator_id?(value),
-    do: is_binary(value) and byte_size(value) > 0 and String.valid?(value)
 
   defp take_graphemes(rest, 0, acc), do: {Enum.reverse(acc), rest}
 

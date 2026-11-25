@@ -7,13 +7,13 @@ defmodule AttentionServer.APNS.Expansion do
   @single "harklight.expanded.single.v1"
   @batch "harklight.expanded.batch.v1"
 
-  # Run only after legacy fitting and server insertion. Nothing here may refit
+  # Run only after payload fitting and server insertion. Nothing here may refit
   # the collapsed alert or remove any of its routing fields to make space.
   def add(payload, claim) do
     expand(payload, claim)
   rescue
     # Expansion is optional. A content/encoding failure must not turn an
-    # otherwise valid legacy notification into a failed provider request.
+    # otherwise valid notification into a failed provider request.
     _ -> payload
   end
 
