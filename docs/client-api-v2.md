@@ -486,7 +486,7 @@ Every write that succeeds answers `200`, or `201` for `POST /v2/files`, with a
 | `PUT /v2/settings/priority-levels` | `{"levels": [PriorityLevel]}` with `If-Match` |
 | `PUT /v2/devices/me/push` | `{"token": string, "environment": "production" \| "sandbox", "revision": int}` |
 | `DELETE /v2/devices/me/push` | none |
-| `PUT /v2/devices/me/focus` | `{"screen": "inbox" \| "message" \| "chat" \| "settings" \| "signed_out" \| "not_in_front", "item_id"?: OpaqueId, "visible_entry_id"?: OpaqueId, "ttl_s": int 1..3600}` (§5.1) |
+| `PUT /v2/devices/me/focus` | `{"screen": "inbox" \| "fyi" \| "message" \| "chat" \| "settings" \| "signed_out" \| "not_in_front", "item_id"?: OpaqueId, "visible_entry_id"?: OpaqueId, "ttl_s": int 1..3600}` (§5.1) |
 | `POST /v2/files` | Raw bytes with `Content-Type`, `Content-Length` and `Content-Disposition: attachment; filename*=UTF-8''<percent-encoded name>` |
 
 ```json
@@ -650,7 +650,8 @@ Focus reports and shows are device-only. Any enrolled device can read its
 account's focus and send a show to a viewer device on that account.
 
 - **`PUT /v2/devices/me/focus`** takes today's report fields:
-  - `screen`: today's set, including `not_in_front`;
+  - `screen`: `inbox`, `fyi`, `message`, `chat`, `settings`, `signed_out` or
+    `not_in_front`. The FYI list (`fyi`) counts as in front, like the inbox;
   - `item_id`: required for `message` and `chat`, absent for other screens;
   - `visible_entry_id`: optional for `chat`, absent for other screens;
   - `ttl_s`: an integer from 1 to 3600. Clients send 120 and refresh every
@@ -675,7 +676,10 @@ account's focus and send a show to a viewer device on that account.
   `held_ms` is its age when the Server writes it. Each show addresses exactly
   one device. An accepted show survives a `ttl_s` lapse without expiring.
   The server holds the latest show until consumption, replacement, device
-  removal or revocation, or server restart.
+  removal or revocation, or server restart. If the item becomes unavailable
+  after acceptance, the device still receives the standard Show envelope
+  with the original `item_id`. The envelope carries no item details. The
+  client can use the item lookup result to present an unavailable view.
 
   The device receives it in `WriteResult.show` on its next focus write, or
   while it holds an open SSE feed, as an id-less `event: show` with a `Show`
@@ -1123,7 +1127,7 @@ agents with existing data. Clients apply newer versions of each resource.
       "properties": {
         "device_id": { "$ref": "#/$defs/OpaqueId" },
         "device_name": { "type": "string" },
-        "screen": { "enum": ["inbox", "message", "chat", "settings", "signed_out", "not_in_front"] },
+        "screen": { "type": "string", "description": "Screen name, including inbox, fyi, message, chat, settings, signed_out and not_in_front." },
         "reported_at_ms": { "$ref": "#/$defs/TimeMs" },
         "in_front": { "type": "boolean" },
         "connected": { "type": "boolean" },
@@ -1162,7 +1166,8 @@ agents with existing data. Clients apply newer versions of each resource.
   A lapsed report ends listing and targetability immediately. The v2
   projection maps `client_id` to `device_id`, `reported_at` to
   `reported_at_ms`, `sender_id` plus `message_id` to `item_id`, and
-  `visible_event_id` to `visible_entry_id`.
+  `visible_event_id` to `visible_entry_id`. Clients should ignore screen
+  values they do not recognize.
 
 ### 9.2 Writes
 

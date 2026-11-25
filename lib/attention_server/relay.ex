@@ -4193,7 +4193,7 @@ defmodule AttentionServer.Relay do
         "screen" => focus.screen,
         "reported_at" => focus.reported_at,
         "in_front" =>
-          focus.connected and focus.screen in ["inbox", "message", "chat", "settings"],
+          focus.connected and focus.screen in ["inbox", "fyi", "message", "chat", "settings"],
         "connected" => focus.connected
       }
       |> maybe_focus_field(focus, :sender_id, "sender_id")
@@ -4371,7 +4371,7 @@ defmodule AttentionServer.Relay do
     reported_at =
       cond do
         is_nil(existing) -> now
-        changed and reported["screen"] in ["inbox", "message", "chat", "settings"] -> now
+        changed and reported["screen"] in ["inbox", "fyi", "message", "chat", "settings"] -> now
         true -> existing.reported_at
       end
 
@@ -4476,8 +4476,7 @@ defmodule AttentionServer.Relay do
 
   defp hold_show(state, client, request) do
     held = %{
-      "sender_id" => request["sender_id"],
-      "message_id" => request["message_id"],
+      "item_id" => request["item_id"],
       "target" => request["target"],
       "show_id" => Map.fetch!(request, :show_id),
       "accepted_at" => state.clock.()

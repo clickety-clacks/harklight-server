@@ -564,7 +564,7 @@ defmodule AttentionServer.ClientAPI.Writes do
 
       result =
         Projection.capture(fn ->
-          show = held && Focus.show(engine, key, held, state.clock.())
+          show = held && Focus.show(key, held, state.clock.())
           body = if show, do: %{"rev" => position, "show" => show}, else: %{"rev" => position}
           {:ok, 200, body}
         end)
@@ -1389,7 +1389,7 @@ defmodule AttentionServer.ClientAPI.Writes do
     end
   end
 
-  @focus_screens ~w(inbox message chat settings signed_out not_in_front)
+  @focus_screens ~w(inbox fyi message chat settings signed_out not_in_front)
 
   # Today's focus_report shape rules (focus spec r6 V2), with item_id for the
   # pair and visible_entry_id for visible_event_id.

@@ -168,7 +168,12 @@ defmodule AttentionServer.ClientAPI.AgentShow do
   defp create_show(state, person, agent, body, {show_id, result_ref, caller}, receipt_key, digest) do
     with {:ok, {^person, sender, message_id}} <-
            Resources.item_key(state.store.engine, person, body["item_id"]),
-         frame = %{"sender_id" => sender, "message_id" => message_id, "target" => body["target"]},
+         frame = %{
+           "item_id" => body["item_id"],
+           "sender_id" => sender,
+           "message_id" => message_id,
+           "target" => body["target"]
+         },
          frame = device_selector(frame, body),
          {{:ok, resolved}, next} <- Relay.apply_agent_show(state, agent, frame, show_id) do
       response = %{
