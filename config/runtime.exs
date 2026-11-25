@@ -49,6 +49,7 @@ if System.get_env("ATTENTION_SERVER_ENABLE") == "1" do
   production_key_path = System.get_env("ATTENTION_SERVER_APNS_PRODUCTION_KEY_PATH")
   production_key_id = System.get_env("ATTENTION_SERVER_APNS_PRODUCTION_KEY_ID")
   team_id = System.get_env("ATTENTION_SERVER_APNS_TEAM_ID")
+  push_relay_url = System.get_env("ATTENTION_SERVER_PUSH_RELAY_URL")
 
   sandbox_values = [sandbox_key_path, sandbox_key_id]
   production_values = [production_key_path, production_key_id]
@@ -300,6 +301,11 @@ if System.get_env("ATTENTION_SERVER_ENABLE") == "1" do
 
   server_opts =
     if dashboard, do: Keyword.put(server_opts, :dashboard, dashboard), else: server_opts
+
+  server_opts =
+    if push_relay_url not in [nil, ""],
+      do: Keyword.put(server_opts, :push_relay_url, push_relay_url),
+      else: server_opts
 
   config :attention_server,
          :server,

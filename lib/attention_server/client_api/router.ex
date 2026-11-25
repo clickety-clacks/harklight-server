@@ -353,13 +353,13 @@ end
 
 defmodule AttentionServer.ClientAPI.WebOrigin do
   @moduledoc """
-  The web origin's plug: `/v2` goes to the client API router. Every other path
-  goes to the dashboard unchanged.
+  The web origin's plug sends `/v2` to the client API router, `/push-relay`
+  to the push relay, and all other paths to the dashboard.
   """
 
   @behaviour Plug
 
-  alias AttentionServer.ClientAPI.Router
+  alias AttentionServer.{ClientAPI.Router, PushRelay}
 
   @impl Plug
   def init(opts) do
@@ -373,10 +373,23 @@ defmodule AttentionServer.ClientAPI.WebOrigin do
       |> Keyword.merge(Keyword.take(opts, [:routes, :max_in_flight]))
       |> Router.init()
 
-    %{dashboard: {dashboard, dashboard.init(dashboard_opts)}, client_api: client_api}
+    push_relay =
+      case Keyword.get(opts, :push_relay_dispatcher) do
+        nil -> nil
+        dispatcher -> PushRelay.init(dispatcher)
+      end
+
+    %{
+      dashboard: {dashboard, dashboard.init(dashboard_opts)},
+      client_api: client_api,
+      push_relay: push_relay
+    }
   end
 
   @impl Plug
+  def call(%Plug.Conn{path_info: ["push-relay" | _]} = conn, %{push_relay: push_relay}),
+    do: PushRelay.call(conn, push_relay)
+
   def call(%Plug.Conn{path_info: ["v2" | _]} = conn, %{client_api: client_api}),
     do: Router.call(conn, client_api)
 

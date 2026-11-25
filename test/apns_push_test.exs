@@ -85,6 +85,8 @@ defmodule AttentionServer.APNSPushTest do
     DeviceIdentity,
     Engine,
     JSON,
+    PushHTTP,
+    PushRelayClient,
     Relay,
     RelayReaders,
     Server,
@@ -100,7 +102,7 @@ defmodule AttentionServer.APNSPushTest do
   @test_server String.duplicate("a1", 16)
 
   setup_all do
-    certs = TLSFixtures.create!()
+    certs = TLSFixtures.create!(server_san: "DNS:relay.test,IP:127.0.0.1")
     on_exit(fn -> File.rm_rf!(certs) end)
     %{certs: certs}
   end
@@ -1544,6 +1546,268 @@ defmodule AttentionServer.APNSPushTest do
 
     assert {:ok, response} = Relay.request_line(relay, key, JSON.encode!(frame) <> "\n")
     assert {:ok, %{"type" => "error", "reason" => "forbidden"}} = JSON.decode_line(response)
+  end
+
+  test "self-hosted push registration, dispatch and retry use the hosted relay", ctx do
+    hosted = start_push_relay_server(ctx, "hosted", :saas, relay_apns_options(ctx))
+    url = "https://127.0.0.1:#{dashboard_port(hosted)}"
+
+    self_hosted =
+      start_test_server(
+        server_options(ctx.certs, Path.join(ctx.dir, "self-hosted.sqlite3")) ++
+          [
+            relay_name: :push_relay_self_hosted,
+            push_relay_url: url,
+            push_relay_cacerts: [ca_der(ctx.certs)]
+          ]
+      )
+
+    relay = Server.relay(self_hosted)
+    {sender_key, app_key} = setup_test_devices(relay, ctx.certs)
+
+    assert register_push(self_hosted, ctx.certs, "a2", @device_token, 1, op(31)).status == 200
+    Agent.update(ctx.provider_response, fn _ -> {429, [{"retry-after", "60"}], ""} end)
+
+    accept_test_delivery(relay, sender_key, 40, "relay-test-message")
+
+    assert_receive {:apns_request, "POST", path, headers, body}, 8_000
+    assert path == "/3/device/" <> @device_token
+    assert List.keyfind(headers, "apns-topic", 0) == {"apns-topic", "co.clicketyclacks.Harklight"}
+
+    assert {:ok, %{"aps" => aps, "attention" => attention}} = JSON.decode_line(body <> "\n")
+    assert aps["alert"] == %{"body" => "New message in Harklight"}
+    assert aps["mutable-content"] == 1
+    assert aps["badge"] == 1
+    assert attention == %{"v" => 2, "type" => "sync", "server" => Relay.push_server_id(relay)}
+
+    assert_push_settings_state(self_hosted, ctx.certs, "a2", "waiting_retry")
+    binding = stored_binding(relay, app_key)
+    assert binding.last_outcome["http_status"] == 429
+    assert binding.next_at >= binding.last_attempt_at + 60_000
+
+    # Move the retry clock forward through the same durable claim/finish path.
+    assert :ok = Supervisor.terminate_child(self_hosted, :push_dispatcher)
+    assert {:ok, claim} = Relay.claim_push(relay, binding.next_at)
+    client = PushRelayClient.prepare!(url, claim.server, [ca_der(ctx.certs)])
+    Agent.update(ctx.provider_response, fn _ -> {400, ~s({"reason":"BadDeviceToken"})} end)
+
+    {outcome, _key} = PushRelayClient.send(client, claim, nil)
+    assert outcome.state == "endpoint_invalid"
+    assert :ok = Relay.finish_push(relay, claim, outcome, binding.next_at)
+    assert_push_settings_state(self_hosted, ctx.certs, "a2", "endpoint_invalid")
+    refute Map.has_key?(push_settings(self_hosted, ctx.certs, "a2"), "binding_id")
+    assert stored_binding(relay, app_key).last_outcome["reason"] == "BadDeviceToken"
+  end
+
+  test "configured Apple keys take precedence over the push relay URL", ctx do
+    hosted = start_push_relay_server(ctx, "hosted", :saas, relay_apns_options(ctx))
+
+    log =
+      capture_log(fn ->
+        server =
+          start_test_server(
+            server_options(ctx.certs, Path.join(ctx.dir, "direct.sqlite3")) ++
+              [
+                relay_name: :push_relay_direct,
+                deployment_mode: :saas,
+                apns: apns_options(ctx),
+                push_relay_url: "https://127.0.0.1:#{dashboard_port(hosted)}",
+                push_relay_cacerts: [ca_der(ctx.certs)]
+              ]
+          )
+
+        relay = Server.relay(server)
+        {sender_key, app_key} = setup_test_devices(relay, ctx.certs)
+
+        assert register_push(server, ctx.certs, "a2", @device_token, 1, op(31)).status == 200
+        accept_test_delivery(relay, sender_key, 40, "direct-test-message")
+
+        assert_receive {:apns_request, "POST", _, _, body}, 8_000
+        assert {:ok, %{"aps" => %{"alert" => %{"title" => _}}}} = JSON.decode_line(body <> "\n")
+        refute body =~ "New message in Harklight"
+        assert_push_accepted(relay, app_key, 1)
+      end)
+
+    assert log =~ "feature=push_relay reason=direct_apns_configured"
+    refute log =~ "event=harklight_push_relay_registration"
+    refute log =~ @device_token
+  end
+
+  test "the relay routes bypass browser authentication, require a relay key and validate fields",
+       ctx do
+    no_keys = start_push_relay_server(ctx, "no-keys", :saas, nil)
+    self_hosted = start_push_relay_server(ctx, "direct", :self_hosted, apns_options(ctx))
+
+    for server <- [no_keys, self_hosted] do
+      assert {404, _} = relay_post(ctx, server, "servers", %{"server" => @test_server})
+    end
+
+    hosted = start_push_relay_server(ctx, "hosted", :saas, relay_apns_options(ctx))
+    browser = [{"origin", "https://other.example"}, {"cookie", "harklight_session=browser"}]
+
+    assert {201, %{"key" => key}} =
+             relay_post(ctx, hosted, "servers", %{"server" => @test_server}, browser)
+
+    push = %{"token" => @device_token, "environment" => "production", "kind" => "alert"}
+    assert {401, %{"error" => "unknown_key"}} = relay_post(ctx, hosted, "pushes", push, browser)
+
+    headers = [{"authorization", "Bearer " <> key} | browser]
+
+    for unsupported <- [
+          %{"body" => "private message text"},
+          %{"server" => String.duplicate("0", 32)},
+          %{"interruption_level" => "critical"},
+          %{"interruption_level" => "passive", "sound" => "default"},
+          %{"sound" => "custom"},
+          %{"badge" => -1}
+        ] do
+      assert {400, %{"error" => "unsupported"}} =
+               relay_post(ctx, hosted, "pushes", Map.merge(push, unsupported), headers)
+    end
+
+    assert {413, _} =
+             relay_post(
+               ctx,
+               hosted,
+               "pushes",
+               Map.put(push, "extra", String.duplicate("x", 4096)),
+               headers
+             )
+
+    refute_received {:apns_request, _, _, _, _}
+
+    for {options, expected_aps, expected_type} <- [
+          {%{"interruption_level" => "passive", "badge" => 2},
+           %{"interruption-level" => "passive", "badge" => 2}, "alert"},
+          {%{"sound" => "default"}, %{"sound" => "default"}, "alert"},
+          {%{"kind" => "background", "badge" => 0}, %{"badge" => 0}, "alert"},
+          {%{"kind" => "background"}, %{}, "background"}
+        ] do
+      assert {200, %{"apns_status" => 200}} =
+               relay_post(ctx, hosted, "pushes", Map.merge(push, options), headers)
+
+      assert_receive {:apns_request, "POST", _path, sent_headers, body}
+      assert jwt_key_id(sent_headers) == "TESTKEYID2"
+      assert List.keyfind(sent_headers, "apns-push-type", 0) == {"apns-push-type", expected_type}
+
+      assert {:ok, %{"aps" => aps, "attention" => %{"server" => @test_server}}} =
+               JSON.decode_line(body <> "\n")
+
+      assert Map.take(aps, ["badge", "interruption-level", "sound"]) == expected_aps
+
+      if options["kind"] == "background" do
+        assert aps == Map.put(expected_aps, "content-available", 1)
+      else
+        assert aps["alert"] == %{"body" => "New message in Harklight"}
+      end
+    end
+  end
+
+  test "a stale relay key is re-registered and a 410 preserves Apple's invalidation timestamp",
+       ctx do
+    first = start_push_relay_server(ctx, "first", :saas, relay_apns_options(ctx))
+    second = start_push_relay_server(ctx, "second", :saas, relay_apns_options(ctx))
+
+    assert {201, %{"key" => stale_key}} =
+             relay_post(ctx, first, "servers", %{"server" => @test_server})
+
+    config =
+      PushRelayClient.prepare!(
+        "https://127.0.0.1:#{dashboard_port(second)}",
+        @test_server,
+        [ca_der(ctx.certs)]
+      )
+
+    timestamp = System.system_time(:millisecond)
+    claim = Map.merge(dispatcher_claim(), %{server: @test_server, registered_at: timestamp})
+
+    Agent.update(ctx.provider_response, fn _ ->
+      {410, JSON.encode!(%{"reason" => "Unregistered", "timestamp" => timestamp})}
+    end)
+
+    {result, next_key} = PushRelayClient.send(config, claim, stale_key)
+    assert result.state == "endpoint_invalid"
+    assert result.invalidated_at_ms == timestamp
+    assert next_key != stale_key
+    assert String.starts_with?(next_key, "v1." <> @test_server <> ".")
+    assert_receive {:apns_request, "POST", _, _, _}
+    refute_received {:apns_request, _, _, _, _}
+  end
+
+  test "relay transport preserves quiet, audible and silent dispatcher claims", ctx do
+    hosted = start_push_relay_server(ctx, "options", :saas, relay_apns_options(ctx))
+
+    config =
+      PushRelayClient.prepare!(
+        "https://127.0.0.1:#{dashboard_port(hosted)}",
+        @test_server,
+        [ca_der(ctx.certs)]
+      )
+
+    assert {:ok, key} = PushRelayClient.register(config)
+
+    for {overrides, expected} <- [
+          {%{quiet: true}, %{"interruption-level" => "passive"}},
+          {%{quiet: false}, %{"sound" => "default"}},
+          {%{presentation: :background}, %{}}
+        ] do
+      claim = Map.merge(dispatcher_claim(), overrides)
+      assert {%{state: "provider_accepted"}, ^key} = PushRelayClient.send(config, claim, key)
+      assert_receive {:apns_request, "POST", _, _, body}
+      assert {:ok, %{"aps" => aps}} = JSON.decode_line(body <> "\n")
+      assert Map.take(aps, ["interruption-level", "sound"]) == expected
+    end
+  end
+
+  defp start_push_relay_server(ctx, name, mode, apns) do
+    opts =
+      server_options(ctx.certs, Path.join(ctx.dir, name <> ".sqlite3")) ++
+        [
+          relay_name: String.to_atom("push_relay_" <> name),
+          deployment_mode: mode,
+          public_base_url: "https://hosted.example",
+          dashboard: [port: 0, ip: {127, 0, 0, 1}, owner_person: "owner", skill_path: "unused"]
+        ]
+
+    start_test_server(if(apns, do: Keyword.put(opts, :apns, apns), else: opts))
+  end
+
+  defp relay_apns_options(ctx) do
+    opts = apns_options(ctx)
+
+    Keyword.put(opts, :profiles, %{
+      @provider_profile => Keyword.take(opts, [:key_path, :key_id]),
+      @production_profile => [key_path: ctx.production_key_path, key_id: "TESTKEYID2"]
+    })
+  end
+
+  defp dashboard_port(server) do
+    {_, dashboard, _, _} = List.keyfind(Supervisor.which_children(server), :dashboard_https, 0)
+    {_, bandit, _, _} = List.keyfind(Supervisor.which_children(dashboard), :dashboard_listener, 0)
+    {:ok, {_ip, port}} = ThousandIsland.listener_info(bandit)
+    port
+  end
+
+  defp relay_post(ctx, server, route, body, headers \\ []) do
+    {:ok, conn} =
+      Mint.HTTP.connect(:https, "127.0.0.1", dashboard_port(server),
+        mode: :passive,
+        transport_opts: [cacerts: [ca_der(ctx.certs)]]
+      )
+
+    {:ok, conn, ref} =
+      Mint.HTTP.request(
+        conn,
+        "POST",
+        "/push-relay/v1/" <> route,
+        [{"content-type", "application/json"} | headers],
+        JSON.encode!(body)
+      )
+
+    {:ok, conn, status, _headers, response} = PushHTTP.receive_response(conn, ref, 5_000)
+    Mint.HTTP.close(conn)
+    assert {:ok, value} = JSON.decode_line(response <> "\n")
+    {status, value}
   end
 
   defp assert_jwt_signature(key_path, dir, signing_input, signature) do

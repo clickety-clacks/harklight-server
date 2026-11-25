@@ -66,6 +66,7 @@ defmodule AttentionServer.DashboardHTTPS do
                  skill_path_saas: Keyword.get(opts, :skill_path_saas),
                  skill_path_core: Keyword.get(opts, :skill_path_core)},
               relay: relay,
+              push_relay_dispatcher: Keyword.get(opts, :push_relay_dispatcher),
               backend: {DashboardBackend, backend},
               expected_origin: Keyword.get(opts, :public_origin)
             ] ++ client_api_routes(opts)},

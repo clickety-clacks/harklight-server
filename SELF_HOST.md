@@ -275,11 +275,33 @@ agent’s computer. Run `harklight-agent setup FILE` there. Approve the displaye
 code with `harklight owner approve --code CODE --senders app:agent/`, using the
 same owner connection options.
 
-## Optional APNs notifications
+## iPhone notifications via the Harklight push relay
 
-APNs is disabled when all five APNs settings below are absent. The Sandbox
-profile keeps using its existing authorized P-256 signing key. Its path and key
-identifier stay in the existing settings:
+To enable notifications in the Harklight iPhone app, uncomment this line in
+`server.env` and restart Harklight Server. On an existing installation, add the
+line if it is missing.
+
+```sh
+export ATTENTION_SERVER_PUSH_RELAY_URL=https://app.harklight.net
+```
+
+The relay receives the APNs device token, its environment (production or
+sandbox), the push kind, the badge count, your Server's opaque ID and the source
+address. When applicable, it also receives the passive or default-sound setting
+for an alert. The relay keeps no push records or registrations. Operational logs
+include the Server ID, push kind, environment, Apple response status and duration.
+The relay never receives message text, titles or sender names. It sends a
+background wake or the fixed alert “New message in Harklight.” The app fetches
+messages directly from your Server.
+
+The relay is free under fair use and availability is best effort. Leaving the
+setting unset keeps push off unless you configure Apple keys for direct delivery.
+
+## Optional direct APNs notifications
+
+Configured Apple keys take precedence over the relay URL. The Sandbox profile
+uses its authorized P-256 signing key. Set its path and key identifier as
+follows:
 
 - `ATTENTION_SERVER_APNS_KEY_PATH`: absolute path to the protected Sandbox key.
 - `ATTENTION_SERVER_APNS_KEY_ID`: the Sandbox key's ten-character Apple key ID.

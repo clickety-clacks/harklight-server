@@ -31,7 +31,6 @@ defmodule AttentionServer.APNS do
   # Reserve the mandatory persisted 32-hex identity while fitting alert text.
   @server_field_bytes byte_size(~s(,"server":"00000000000000000000000000000000"))
   @neutral_sender_label "Sender"
-  @response_limit 16_384
   @connect_timeout 5_000
   @request_timeout 10_000
 
@@ -98,26 +97,31 @@ defmodule AttentionServer.APNS do
 
   def safe_reason?(reason), do: reason in @safe_reasons
 
-  def send(%{profiles: profiles} = config, claim, cached_tokens) do
-    now_ms = System.system_time(:millisecond)
+  def send(config, claim, cached_tokens) do
+    {response, next_tokens} = deliver(config, describe(claim), cached_tokens)
 
-    profile_id = Map.get(claim, :profile_id)
+    result =
+      case response do
+        {:ok, provider, report?} ->
+          result = response_outcome(provider, claim)
+          if report?, do: report_response(result, claim, :apns_dispatch), else: result
 
-    case Map.fetch(profiles, profile_id) do
-      {:ok, profile_config} ->
-        send_with_profile(config, profile_config, profile_id, claim, cached_tokens, now_ms)
+        {:error, :missing_profile} ->
+          Diagnostics.failure(
+            :apns_dispatch,
+            :configuration,
+            :invalid_configuration,
+            :unavailable,
+            claim.claim_id
+          )
 
-      :error ->
-        Diagnostics.failure(
-          :apns_dispatch,
-          :configuration,
-          :invalid_configuration,
-          :unavailable,
-          claim.claim_id
-        )
+          outcome("blocked_configuration", nil, nil, nil, 0, nil)
 
-        {outcome("blocked_configuration", nil, nil, nil, 0, nil), cached_tokens}
-    end
+        {:error, reason} ->
+          retry(reason, claim, :apns_dispatch)
+      end
+
+    {result, next_tokens}
   rescue
     error ->
       Diagnostics.failure(
@@ -131,77 +135,69 @@ defmodule AttentionServer.APNS do
       {outcome("blocked_configuration", nil, nil, uuid_v4(), 0, nil), cached_tokens}
   end
 
-  defp send_with_profile(config, profile_config, profile_id, claim, cached_tokens, now_ms) do
-    cached_tokens = if is_map(cached_tokens), do: cached_tokens, else: %{}
-    cached_profile_token = Map.get(cached_tokens, profile_id)
+  def deliver(%{profiles: profiles} = config, push, cached_tokens) do
+    case Map.fetch(profiles, push.profile_id) do
+      {:ok, profile} ->
+        cached_tokens = if is_map(cached_tokens), do: cached_tokens, else: %{}
+        deliver_with_profile(config, profile, push, cached_tokens)
 
-    {token, refreshed_profile_token} =
-      cached_token(profile_config, cached_profile_token, div(now_ms, 1_000))
-
-    next_cached_tokens = Map.put(cached_tokens, profile_id, refreshed_profile_token)
-    request_config = Map.put(profile_config, :endpoint, config.endpoint)
-    payload = request_payload(claim)
-
-    case request(request_config, claim, token, payload) do
-      {:ok, 403, _headers, body} ->
-        if apns_reason(body) == "ExpiredProviderToken" do
-          issued_at = div(System.system_time(:millisecond), 1_000)
-          fresh = provider_token(profile_config, issued_at)
-
-          case request(request_config, claim, fresh, payload) do
-            {:ok, status, headers, response_body} ->
-              result = response_outcome(status, headers, response_body, claim, now_ms)
-              profile_token = %{token: fresh, issued_at: issued_at}
-
-              {report_response(result, claim), Map.put(cached_tokens, profile_id, profile_token)}
-
-            {:error, reason} ->
-              Diagnostics.failure(
-                :apns_dispatch,
-                :push_request,
-                reason,
-                :retry,
-                claim.claim_id
-              )
-
-              profile_token = %{token: fresh, issued_at: issued_at}
-
-              {outcome("retry", nil, nil, uuid_v4(), 0, nil),
-               Map.put(cached_tokens, profile_id, profile_token)}
-          end
-        else
-          {response_outcome(403, [], body, claim, now_ms), next_cached_tokens}
-        end
-
-      {:ok, status, headers, body} ->
-        {report_response(response_outcome(status, headers, body, claim, now_ms), claim),
-         next_cached_tokens}
-
-      {:error, reason} ->
-        Diagnostics.failure(
-          :apns_dispatch,
-          :push_request,
-          reason,
-          :retry,
-          claim.claim_id
-        )
-
-        {outcome("retry", nil, nil, uuid_v4(), 0, nil), next_cached_tokens}
+      :error ->
+        {{:error, :missing_profile}, cached_tokens}
     end
   end
 
-  defp report_response(%{state: "provider_accepted"} = result, _claim), do: result
+  defp deliver_with_profile(config, profile, push, cached_tokens) do
+    profile_id = push.profile_id
+    request_config = Map.put(profile, :endpoint, config.endpoint)
+    now_s = System.system_time(:second)
+    {token, cached} = cached_token(profile, Map.get(cached_tokens, profile_id), now_s)
 
-  defp report_response(%{state: "retry", reason: reason} = result, claim) do
-    cause = if is_binary(reason), do: reason, else: Diagnostics.provider_cause(result.http_status)
-    Diagnostics.failure(:apns_dispatch, :push_request, cause, :retry, claim.claim_id)
+    {response, report?, cached} =
+      case request(request_config, push, token) do
+        {:ok, 403, _headers, body} = response ->
+          if apns_reason(body) == "ExpiredProviderToken" do
+            issued_at = System.system_time(:second)
+            fresh = provider_token(profile, issued_at)
+
+            {request(request_config, push, fresh), true, %{token: fresh, issued_at: issued_at}}
+          else
+            {response, false, cached}
+          end
+
+        response ->
+          {response, true, cached}
+      end
+
+    response =
+      case response do
+        {:ok, status, headers, body} ->
+          {:ok,
+           %{
+             status: status,
+             reason: apns_reason(body),
+             timestamp: response_timestamp(body),
+             retry_after_ms: retry_after_ms(headers)
+           }, report?}
+
+        {:error, _reason} = error ->
+          error
+      end
+
+    {response, Map.put(cached_tokens, profile_id, cached)}
+  end
+
+  def report_response(%{state: "provider_accepted"} = result, _claim, _operation), do: result
+
+  def report_response(result, claim, operation) do
+    cause = result.reason || Diagnostics.provider_cause(result.http_status)
+    outcome = if result.state == "retry", do: :retry, else: :rejected
+    Diagnostics.failure(operation, :push_request, cause, outcome, claim.claim_id)
     result
   end
 
-  defp report_response(%{reason: reason} = result, claim) do
-    cause = if is_binary(reason), do: reason, else: Diagnostics.provider_cause(result.http_status)
-    Diagnostics.failure(:apns_dispatch, :push_request, cause, :rejected, claim.claim_id)
-    result
+  def retry(reason, claim, operation, retry_after_ms \\ 0) do
+    Diagnostics.failure(operation, :push_request, reason, :retry, claim.claim_id)
+    outcome("retry", nil, nil, uuid_v4(), retry_after_ms, nil)
   end
 
   defp cached_token(_config, %{token: token, issued_at: issued_at} = cached, now_s)
@@ -227,11 +223,7 @@ defmodule AttentionServer.APNS do
   defp signature_pair({:"ECDSA-Sig-Value", r, s}), do: {r, s}
   defp signature_pair({r, s}), do: {r, s}
 
-  defp request(config, claim, token, payload) do
-    endpoint = endpoint(config, Map.get(claim, :profile_id))
-    request_id = uuid_v4()
-    path = "/3/device/" <> claim.address
-
+  def describe(claim) do
     # Apple ignores the badge on background pushes, so a badge-carrying sync
     # with no alert text goes as a silent alert-type push.
     {push_type, priority, collapse_id} =
@@ -251,13 +243,29 @@ defmodule AttentionServer.APNS do
           {"background", "5", "attention-terminal-sync"}
       end
 
+    %{
+      profile_id: Map.get(claim, :profile_id),
+      address: claim.address,
+      push_type: push_type,
+      priority: priority,
+      collapse_id: collapse_id,
+      payload:
+        if(Map.get(claim, :relayed), do: relay_payload(claim), else: request_payload(claim))
+    }
+  end
+
+  defp request(config, push, token) do
+    endpoint = endpoint(config, push.profile_id)
+    request_id = uuid_v4()
+    path = "/3/device/" <> push.address
+
     headers = [
       {"authorization", "bearer " <> token},
       {"content-type", "application/json"},
       {"apns-topic", config.topic},
-      {"apns-push-type", push_type},
-      {"apns-priority", priority},
-      {"apns-collapse-id", collapse_id},
+      {"apns-push-type", push.push_type},
+      {"apns-priority", push.priority},
+      {"apns-collapse-id", push.collapse_id},
       {"apns-id", request_id}
     ]
 
@@ -269,8 +277,9 @@ defmodule AttentionServer.APNS do
              transport_opts: [verify: :verify_peer, cacerts: endpoint.cacerts]
            ),
          {:ok, conn, ref} <-
-           Mint.HTTP2.request(conn, "POST", path, headers, JSON.encode!(payload)),
-         {:ok, conn, status, response_headers, body} <- receive_response(conn, ref) do
+           Mint.HTTP2.request(conn, "POST", path, headers, JSON.encode!(push.payload)),
+         {:ok, conn, status, response_headers, body} <-
+           AttentionServer.PushHTTP.receive_response(conn, ref, @request_timeout) do
       _ = Mint.HTTP2.close(conn)
       {:ok, status, response_headers, body}
     else
@@ -299,6 +308,27 @@ defmodule AttentionServer.APNS do
       do: raise(ArgumentError, "APNs payload exceeds the payload limit")
 
     AttentionServer.APNS.Expansion.add(payload, claim)
+  end
+
+  defp relay_payload(claim) do
+    aps = %{"content-available" => 1}
+
+    aps =
+      if claim.presentation == :alert do
+        aps
+        |> Map.merge(%{
+          "alert" => %{"body" => "New message in Harklight"},
+          "mutable-content" => 1
+        })
+        |> Map.merge(claim.alert_options)
+      else
+        aps
+      end
+
+    put_badge(
+      %{"aps" => aps, "attention" => %{"v" => 2, "type" => "sync", "server" => claim.server}},
+      Map.get(claim, :badge)
+    )
   end
 
   defp presentation_payload(%{presentation: :background} = claim),
@@ -634,91 +664,23 @@ defmodule AttentionServer.APNS do
 
   defp valid_endpoint?(_), do: false
 
-  defp receive_response(conn, ref) do
-    deadline = System.monotonic_time(:millisecond) + @request_timeout
-    receive_response(conn, ref, nil, [], <<>>, false, deadline)
-  end
-
-  defp receive_response(conn, ref, status, headers, body, too_large, deadline) do
-    timeout = max(deadline - System.monotonic_time(:millisecond), 0)
-
-    case Mint.HTTP2.recv(conn, 0, timeout) do
-      {:ok, next, events} ->
-        {status, headers, body, too_large, done?} =
-          Enum.reduce(events, {status, headers, body, too_large, false}, fn event,
-                                                                            {s, h, b, large, done} ->
-            case event do
-              {:status, ^ref, value} ->
-                {value, h, b, large, done}
-
-              {:headers, ^ref, value} ->
-                {s, value, b, large, done}
-
-              {:data, ^ref, value} when byte_size(b) + byte_size(value) <= @response_limit ->
-                {s, h, b <> value, large, done}
-
-              {:data, ^ref, _value} ->
-                {s, h, b, true, done}
-
-              {:done, ^ref} ->
-                {s, h, b, large, true}
-
-              _ ->
-                {s, h, b, large, done}
-            end
-          end)
-
-        if done? do
-          if is_integer(status) and not too_large,
-            do: {:ok, next, status, headers, body},
-            else: {:error, next, :invalid_response}
-        else
-          receive_response(next, ref, status, headers, body, too_large, deadline)
-        end
-
-      {:error, next, error, _responses} ->
-        {:error, next, error}
-
-      _ ->
-        {:error, conn, :invalid_response}
-    end
-  end
-
-  defp response_outcome(200, _headers, _body, _claim, _now_ms),
+  def response_outcome(%{status: 200}, _claim),
     do: outcome("provider_accepted", 200, nil, nil, 0, nil)
 
-  defp response_outcome(410, _headers, body, claim, _now_ms) do
-    case {apns_reason(body), response_timestamp(body)} do
-      {reason, timestamp}
+  def response_outcome(%{status: 410, reason: reason, timestamp: timestamp}, claim)
       when reason in ["Unregistered", "ExpiredToken"] and
-             is_integer(timestamp) and timestamp >= claim.registered_at ->
-        outcome("endpoint_invalid", 410, reason, nil, 0, timestamp)
+             is_integer(timestamp) and timestamp >= claim.registered_at,
+      do: outcome("endpoint_invalid", 410, reason, nil, 0, timestamp)
 
-      {reason, _timestamp} when reason in ["Unregistered", "ExpiredToken"] ->
-        outcome("blocked_configuration", 410, reason, nil, 0, nil)
+  def response_outcome(%{status: 400, reason: "BadDeviceToken"}, claim),
+    do: outcome("endpoint_invalid", 400, "BadDeviceToken", nil, 0, claim.registered_at)
 
-      {reason, _timestamp} ->
-        outcome("blocked_configuration", 410, reason, nil, 0, nil)
-    end
-  end
+  def response_outcome(%{status: status, reason: reason, retry_after_ms: retry_after_ms}, _claim)
+      when status == 429 or status in 500..599,
+      do: outcome("retry", status, reason, nil, retry_after_ms, nil)
 
-  defp response_outcome(400, _headers, body, claim, _now_ms) do
-    case apns_reason(body) do
-      "BadDeviceToken" ->
-        outcome("endpoint_invalid", 400, "BadDeviceToken", nil, 0, claim.registered_at)
-
-      reason ->
-        outcome("blocked_configuration", 400, reason, nil, 0, nil)
-    end
-  end
-
-  defp response_outcome(status, headers, body, _claim, now_ms)
-       when status == 429 or status in 500..599 do
-    outcome("retry", status, apns_reason(body), nil, retry_after_ms(headers, now_ms), nil)
-  end
-
-  defp response_outcome(status, _headers, body, _claim, _now_ms),
-    do: outcome("blocked_configuration", status, apns_reason(body), nil, 0, nil)
+  def response_outcome(%{status: status, reason: reason}, _claim),
+    do: outcome("blocked_configuration", status, reason, nil, 0, nil)
 
   defp apns_reason(body) do
     case JSON.decode_line(body <> "\n") do
@@ -740,7 +702,7 @@ defmodule AttentionServer.APNS do
     end
   end
 
-  defp retry_after_ms(headers, _now_ms) do
+  def retry_after_ms(headers) do
     case Enum.find_value(headers, fn {key, value} ->
            if String.downcase(key) == "retry-after", do: value
          end) do
