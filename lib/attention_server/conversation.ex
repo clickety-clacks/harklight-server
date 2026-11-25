@@ -521,7 +521,8 @@ defmodule AttentionServer.Conversation do
         %{"kind" => "terminal", "terminal_state" => "answered", "author" => author} = prior,
         %{@answer_baseline_attempt => attempt} = next
       )
-      when author != "person" and is_binary(attempt) and byte_size(attempt) == 22 do
+      when author in ["agent", "server"] and
+             (attempt == "feed" or (is_binary(attempt) and byte_size(attempt) == 22)) do
     not Map.has_key?(prior, @answer_baseline_attempt) and
       Map.delete(next, @answer_baseline_attempt) === prior
   end

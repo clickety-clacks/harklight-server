@@ -1727,7 +1727,7 @@ attempt, authenticated origin and session filter.
 - With `page`, return `{rev, changes, next_page?}` using the same `rev`.
   `changes` contains pending person Chat as AgentEntry changes and pending
   answers as SentMessage changes, whether answered by a person, a granted
-  agent, or the default. A Chat turn is identified by its
+  agent, or the default. A sender's own close-out is excluded. A Chat turn is identified by its
   `entry_id`. An answer is identified by origin, `item_id` and answer kind.
   An item accepts only one terminal answer. Pending enumeration excludes
   turns arriving above the fixed bound. A covered turn may render current
@@ -1753,12 +1753,11 @@ attempt, authenticated origin and session filter.
   retained and the consumer has not acknowledged applying it. If receipt, handoff or action for that
   turn has since been recorded, the page may show the current facts for
   reconciliation and must treat it as an update instead of pending work.
-  Granted-agent and default answers record baseline service without creating
-  person-visible Delivered evidence or adding a `delivery` member to their
-  AgentTerminal. A fresh baseline excludes those answers after their first
-  baseline service. Other delivery eligibility is unchanged.
-  For person Chat and answers, a fresh attempt excludes earlier service
-  from any path, including 0.2.5 changes and Agent 0.2.0 listen. Losing the saved token by deleting the
+  Granted-agent and default answers record service on the baseline and
+  ordinary feed without creating person-visible Delivered evidence or
+  adding a `delivery` member to their AgentTerminal. A fresh attempt excludes
+  earlier service on either path. Person Chat and answers also exclude
+  earlier service from older paths, including 0.2.5 changes and Agent 0.2.0 listen. Losing the saved token by deleting the
   journal or moving without it loses retry access to work already served
   by that attempt. Work never served remains pending.
 - Durably apply and deduplicate pending work by stable turn ID before

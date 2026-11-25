@@ -165,7 +165,13 @@ defmodule AttentionServer.AgentAPI.DeliveryBaseline do
   end
 
   defp baseline_entry?(%{"kind" => "discussion", "author" => "person"}), do: true
-  defp baseline_entry?(%{"kind" => "terminal", "terminal_state" => "answered"}), do: true
+  defp baseline_entry?(%{
+         "kind" => "terminal",
+         "terminal_state" => "answered",
+         "author" => author
+       })
+       when author in ["person", "agent", "server"],
+       do: true
   defp baseline_entry?(_entry), do: false
 
   defp pending?(engine, {person, origin}, %{"author" => "person", "feed_seq" => seq} = entry, attempt) do

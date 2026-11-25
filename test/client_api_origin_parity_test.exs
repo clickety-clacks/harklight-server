@@ -271,6 +271,64 @@ defmodule AttentionServer.ClientAPIOriginParityTest do
              decode(get(ctx, @origin, outside_path <> "&page=" <> outside_token))
   end
 
+  test "a sender's answered lifecycle close-out is excluded from pending baselines", ctx do
+    item = item_id(send_message(ctx, @origin, 10))
+
+    assert request(
+             ctx,
+             @origin,
+             "POST",
+             "/v2/agent/messages/#{item}/lifecycle",
+             %{"action" => "answered"},
+             11
+           ).status == 200
+
+    assert %{"state" => "answered"} = terminal = origin_terminal(ctx, item)
+    refute Map.has_key?(terminal, "outcome")
+
+    baseline = "/v2/agent/delivery-baseline?session=#{@session}"
+    assert %{"next_page" => token} = decode(get(ctx, @origin, baseline))
+    assert %{"changes" => []} = decode(get(ctx, @origin, baseline <> "&page=" <> token))
+  end
+
+  test "ordinary feed service excludes granted-agent and default answers from a fresh baseline",
+       ctx do
+    register_agent(ctx)
+    agent_answer = item_id(send_message(ctx, @origin, 10))
+
+    assert request(ctx, "parity-agent", "POST", answer_path(agent_answer),
+             %{"request_revision" => 1, "comment" => "Agent words"}, 11).status == 200
+
+    default =
+      item_id(send_message(ctx, @origin, 12, %{}, "app:test", %{
+        "answer_ui" => %{
+          "schema" => "attention-client.actions/1",
+          "actions" => [
+            %{"id" => "approve", "label" => "Approve", "kind" => "value", "value" => "approved"}
+          ]
+        },
+        "default" => %{"value" => "approved", "at" => System.system_time(:millisecond) + 2_000}
+      }))
+
+    assert %{"state" => "answered"} = await_default_answer(ctx, default, 250)
+    feed = "/v2/agent/changes?session=#{@session}&after=0"
+
+    assert %{"rev" => rev, "changes" => changes} = decode(get(ctx, @origin, feed))
+
+    received =
+      for %{"kind" => "message", "data" => %{"item_id" => id, "terminal" => terminal}} <- changes,
+          terminal["state"] == "answered" do
+        refute Map.has_key?(terminal, "delivery")
+        id
+      end
+
+    assert Enum.sort(received) == Enum.sort([agent_answer, default])
+    baseline = "/v2/agent/delivery-baseline?session=#{@session}"
+    assert %{"rev" => ^rev, "next_page" => token} = decode(get(ctx, @origin, baseline))
+    assert %{"rev" => ^rev, "changes" => []} =
+             decode(get(ctx, @origin, baseline <> "&page=" <> token))
+  end
+
   test "simultaneous agent feeds of one key each receive a change and close independently",
        ctx do
     id = item_id(send_message(ctx, @origin, 1))

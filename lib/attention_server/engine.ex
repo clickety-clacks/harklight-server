@@ -2301,9 +2301,9 @@ defmodule AttentionServer.Engine do
             %{"author" => "person"} = entry ->
               ensure_delivery_ack1(current, person, key, entry, opts)
 
-            %{"kind" => "terminal", "terminal_state" => "answered"} = entry
-            when is_binary(attempt) ->
-              Conversation.record_answer_baseline(current, {person, key}, entry, attempt)
+            %{"kind" => "terminal", "terminal_state" => "answered", "author" => author} = entry
+            when author in ["agent", "server"] ->
+              Conversation.record_answer_baseline(current, {person, key}, entry, attempt || "feed")
 
             _ ->
               current
