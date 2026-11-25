@@ -440,8 +440,7 @@ defmodule AttentionServer.BounceDecisionTest do
     assert [%{"advisory_type" => "unseen_interval_elapsed"}] =
              Map.values(decided.messages[key()]["item_advisories"])
 
-    assert BounceDecision.bounced(decided.messages[key()]) ==
-             %{"kind" => "full", "reason" => "unopened", "at_ms" => accepted + 300_000_001}
+    assert decided.messages[key()]["full_bounced_at_ms"] == accepted + 300_000_001
   end
 
   test "both bounce kinds wait for the selected default priority interval" do
@@ -477,10 +476,9 @@ defmodule AttentionServer.BounceDecisionTest do
         assert [%{"advisory_type" => "soft_bounce", "evaluated_at_ms" => ^due}] =
                  Map.values(decided.messages[key()]["item_advisories"])
 
-        assert BounceDecision.bounced(decided.messages[key()]) == nil
+        refute BounceDecision.fully_bounced?(decided.messages[key()])
       else
-        assert %{"kind" => "full", "at_ms" => ^due, "reason" => "unopened"} =
-                 BounceDecision.bounced(decided.messages[key()])
+        assert decided.messages[key()]["full_bounced_at_ms"] == due
 
         assert decided.advisory_feeds[advisory_feed_key()].entries[1]["evaluated_at_ms"] == due
       end

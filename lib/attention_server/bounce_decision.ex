@@ -10,11 +10,10 @@ defmodule AttentionServer.BounceDecision do
   def inbox_open?(%{terminal: nil} = record), do: not is_map_key(record, "full_bounced_at_ms")
   def inbox_open?(_record), do: false
 
-  def bounced(%{"full_bounced_at_ms" => at_ms, terminal: nil}) do
-    %{"kind" => "full", "at_ms" => at_ms, "reason" => "unopened"}
-  end
+  def fully_bounced?(%{"full_bounced_at_ms" => _}), do: true
+  def fully_bounced?(_record), do: false
 
-  def bounced(_record), do: nil
+  def person_visible?(record), do: is_map(record) and not fully_bounced?(record)
 
   def levels(%Engine{} = engine, person) do
     engine

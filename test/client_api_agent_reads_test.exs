@@ -1973,7 +1973,6 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
         {:opened, true, "soft_bounce"},
         {:ended, true, "soft_bounce"},
         {:moot, true, "soft_bounce"},
-        {:chat_moot, false, "unseen_interval_elapsed"},
         {:chat_moot, true, "soft_bounce"},
         {:late_open, false, "unseen_interval_elapsed"}
       ] do
@@ -2012,6 +2011,10 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
               "title" => "Needs attention",
               "created_at" => 1,
               "message_type" => "fyi",
+              "default" => %{
+                "value" => %{"acknowledgment" => "seen"},
+                "at" => 1_795_507_200_000 + 86_400_000
+              },
               "answer_ui" => %{
                 "schema" => "attention-client.actions/1",
                 "actions" => [
@@ -2058,6 +2061,17 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
 
       send(ctx.relay, :retry_client_ranks)
       :sys.get_state(ctx.relay)
+
+      if unquote(scenario) == :unopened do
+        response =
+          request(ctx, "a1", "POST", "/v2/agent/messages/#{id}/replies", %{"text" => "Context"}, 19)
+
+        assert response.status == 200, response.body
+        assert %{"entries" => [_ | _]} =
+                 decode_response(get(ctx, "a2", "/v2/items/#{id}/entries"))
+
+        assert :sys.get_state(ctx.relay).store.engine.open_default_index[key] == at + 86_400_000
+      end
 
       {:ok, before_due} =
         AgentChangeLog.head(:sys.get_state(ctx.relay).store, {person, ctx.keys["a1"]})
@@ -2133,42 +2147,37 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
       send(ctx.relay, {:bounce_due, state.bounce_deadline_generation})
       :sys.get_state(ctx.relay)
 
-      if unquote(scenario) in [:unopened, :opened] do
-        path = "/v2/items/#{id}"
-        assert %{"item" => item} = contract(ctx, "ItemResponse", get(ctx, "a2", path))
+      case unquote(scenario) do
+        :opened ->
+          assert %{"items" => [%{"rank" => %{"section" => "current"}} = item],
+                   "counts" => %{"unresolved" => 1}} = decode_response(get(ctx, "a2", "/v2/inbox"))
 
-        assert %{"items" => [^item], "counts" => counts} =
-                 decode_response(get(ctx, "a2", "/v2/inbox"))
-
-        if unquote(opened) do
-          assert item["rank"]["section"] == "current"
-          assert counts["unresolved"] == 1
           refute Map.has_key?(item, "bounced")
-        else
-          assert %{
-                   "terminal" => nil,
-                   "seen" => false,
-                   "bounced" => %{"kind" => "full", "at_ms" => ^due, "reason" => "unopened"},
-                   "rank" => %{"section" => "resolved"}
-                 } = item
 
-          assert counts["unresolved"] == 0
-          assert %{"items" => [^item]} = decode_response(get(ctx, "a2", "/v2/search?q=Needs"))
+        :unopened ->
+          path = "/v2/items/#{id}"
+          assert %{"items" => [], "counts" => %{"unresolved" => 0}} =
+                   decode_response(get(ctx, "a2", "/v2/inbox"))
 
-          assert %{"revision" => %{"message" => %{"title" => "Needs attention"}}} =
-                   decode_response(get(ctx, "a2", path <> "/revisions/1"))
+          assert %{"items" => []} = decode_response(get(ctx, "a2", "/v2/search?q=Needs"))
+
+          for suffix <- ["", "/revisions/1", "/entries"] do
+            assert_error(get(ctx, "a2", path <> suffix), 404, "not_found")
+          end
 
           assert %{"changes" => changes} =
                    decode_response(get(ctx, "a2", "/v2/changes?after=#{person_before_due}"))
 
-          assert Enum.any?(changes, &match?(%{"kind" => "item", "data" => ^item}, &1))
-          assert Enum.any?(
-                   changes,
-                   &match?(%{"kind" => "counts", "data" => %{"unresolved" => 0}}, &1)
-                 )
+          assert Enum.any?(changes, &match?(%{"kind" => "item_removed", "data" => %{"item_id" => ^id}}, &1))
+          assert Enum.any?(changes, &match?(%{"kind" => "counts", "data" => %{"unresolved" => 0}}, &1))
 
-          refute Enum.any?(changes, &(&1["kind"] == "item_removed"))
-        end
+          assert %{"changes" => replay} = decode_response(get(ctx, "a2", "/v2/changes?after=0"))
+          refute Enum.any?(replay, fn change ->
+            change["kind"] in ["item", "entry"] and change["data"]["item_id"] == id
+          end)
+
+        _ ->
+          :ok
       end
 
       assert %{
@@ -2186,6 +2195,12 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
                  }
                ]
              } = decode_response(get(ctx, "a1", "/v2/agent/messages"))
+
+      assert %{"message" => %{"advisories" => [open_advisory]} = agent_item} =
+               decode_response(get(ctx, "a1", "/v2/agent/messages/#{id}"))
+
+      assert is_nil(agent_item["terminal"])
+      refute open_advisory["moot"] == true
 
       assert ClientAPISchema.errors(ctx.defs, "AgentAdvisory", advisory) == []
 
@@ -2294,21 +2309,39 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
       end
 
       if unquote(scenario) == :unopened do
-        response =
-          request(
-            ctx,
-            "a2",
-            "POST",
-            "/v2/items/#{id}/answer",
-            %{"request_revision" => 1, "choice" => "seen"},
-            30
+        agent_path = "/v2/agent/messages/#{id}"
+        engine = :sys.get_state(ctx.relay).store.engine
+        refute Map.has_key?(engine.open_default_index, key)
+        assert AttentionServer.Engine.sweep_due_defaults(engine, at + 86_400_001) == engine
+
+        assert_error(
+          request(ctx, "a1", "POST", agent_path <> "/replies", %{"text" => "Follow-up"}, 30),
+          409,
+          "already_closed"
+        )
+
+        for {message, n} <- [
+              {%{"title" => "Revision", "created_at" => 1}, 31},
+              {%{"title" => "Progress", "created_at" => 1, "message_type" => "progress"}, 32}
+            ] do
+          assert_error(
+            request(ctx, "a1", "PUT", agent_path, %{"message" => message}, n, [{"if-match", "1"}]),
+            409,
+            "already_closed"
           )
+        end
 
-        assert %{"item" => %{"terminal" => %{"state" => "answered"}} = answered} =
-                 contract(ctx, "WriteResult", response)
+        assert request(ctx, "a1", "POST", agent_path <> "/retract", %{}, 33).status == 200
+        assert %{"message" => %{"terminal" => %{"state" => "retracted"}}} =
+                 decode_response(get(ctx, "a1", agent_path))
 
-        refute Map.has_key?(answered, "bounced")
-        assert %{"counts" => %{"unresolved" => 0}} = decode_response(get(ctx, "a2", "/v2/inbox"))
+        assert_error(get(ctx, "a2", "/v2/items/#{id}"), 404, "not_found")
+
+        assert %{"changes" => replay} = decode_response(get(ctx, "a2", "/v2/changes?after=0"))
+
+        refute Enum.any?(replay, fn change ->
+          change["kind"] in ["item", "entry"] and change["data"]["item_id"] == id
+        end)
       end
     end
   end
@@ -2478,7 +2511,6 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
         record = engine.messages[key]
         assert %{} = record.terminal
         assert Map.get(record, "item_advisories", %{}) == %{}
-        assert BounceDecision.bounced(record) == nil
         refute Map.has_key?(record, "full_bounced_at_ms")
 
         assert get_in(engine.bounce_revisions, [key, :revisions, 1, :selection, "reason"]) ==

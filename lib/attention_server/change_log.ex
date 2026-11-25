@@ -232,7 +232,10 @@ defmodule AttentionServer.ChangeLog do
   defp log_rows(next, item_keys, entry_keys, counts, settings) do
     items =
       Enum.map(item_keys, fn {person, _, _} = key ->
-        kind = if Map.has_key?(next.messages, key), do: :item, else: :item_removed
+        kind =
+          if AttentionServer.BounceDecision.person_visible?(next.messages[key]),
+            do: :item,
+            else: :item_removed
         {person, {kind, item_resource(key)}}
       end)
 
@@ -1235,7 +1238,7 @@ defmodule AttentionServer.ChangeLog do
   defp rank_changed_items(engine, person, item_ids) do
     item_ids
     |> Enum.flat_map(fn item_id ->
-      case AttentionServer.ClientAPI.Resources.item_key(engine, person, item_id) do
+      case AttentionServer.ClientAPI.Resources.person_item_key(engine, person, item_id) do
         {:ok, key} -> [item_resource(key)]
         _ -> []
       end

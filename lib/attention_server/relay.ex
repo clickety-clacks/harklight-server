@@ -2983,12 +2983,17 @@ defmodule AttentionServer.Relay do
   end
 
   defp publish_priority_view(state, person, view, previous, engine_entries, reply_summary) do
+    engine = state.store.engine
+
     engine_entries =
       Enum.reject(engine_entries, fn entry ->
-        not is_map_key(entry, "conversation_seq") and
-          BounceDecision.bounced(
-            state.store.engine.messages[{person, entry["sender_id"], entry["message_id"]}]
-          ) != nil
+        key = {person, entry["sender_id"], entry["message_id"]}
+        BounceDecision.fully_bounced?(engine.messages[key])
+      end)
+
+    reply_summary =
+      Map.reject(reply_summary, fn {{sender, id}, _} ->
+        BounceDecision.fully_bounced?(engine.messages[{person, sender, id}])
       end)
 
     {replies, messages} = Enum.split_with(engine_entries, &Map.has_key?(&1, "conversation_seq"))

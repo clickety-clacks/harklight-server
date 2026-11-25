@@ -565,7 +565,7 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
   defp authorize_correlation(_scope, _record, _operation, _body), do: :ok
 
   defp item_frame(state, {_, sender, id} = key, record, :revise, match, body) do
-    with :ok <- open(record),
+    with :ok <- open_revision(record),
          :ok <- if_match(match, record.revision),
          {:ok, message} <- content(body),
          :ok <- files(body),
@@ -596,6 +596,9 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
       %{} -> {:error, :already_closed}
     end
   end
+
+  defp item_frame(_state, _key, %{"full_bounced_at_ms" => _}, :reply, _match, _body),
+    do: {:error, :already_closed}
 
   defp item_frame(state, key, record, :reply, _match, body) do
     with true <- is_binary(record.session_handle),
@@ -721,6 +724,11 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
   end
 
   defp answer_target(_state, _key, _record), do: {:error, :not_answered}
+
+  defp open_revision(%{"full_bounced_at_ms" => _, terminal: nil}),
+    do: {:error, :already_closed}
+
+  defp open_revision(record), do: open(record)
 
   defp open(%{terminal: nil}), do: :ok
   defp open(%{terminal: %{state: "retracted"}}), do: {:error, :already_retracted}

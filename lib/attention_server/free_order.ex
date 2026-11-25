@@ -7,7 +7,7 @@ defmodule AttentionServer.FreeOrder do
   def list_items(engine, person, replies, summaries) do
     parents =
       engine.messages
-      |> Enum.filter(fn {{p, _, _}, _} -> p == person end)
+      |> Enum.filter(fn {{p, _, _}, record} -> p == person and BounceDecision.person_visible?(record) end)
       |> Enum.group_by(fn {{_, sender, id}, record} ->
         original = Map.get(record, :revisions, %{}) |> Map.get(1, record.message)
 

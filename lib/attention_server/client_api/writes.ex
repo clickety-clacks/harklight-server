@@ -902,7 +902,7 @@ defmodule AttentionServer.ClientAPI.Writes do
 
   defp frame(engine, principal, key, {:seen, item_id}) do
     with {:ok, {_person, sender, message_id} = message_key} <-
-           Resources.item_key(engine, principal.person, item_id) do
+           Resources.person_item_key(engine, principal.person, item_id) do
       %{revision: revision} = Map.fetch!(engine.messages, message_key)
 
       {:ok,
@@ -922,7 +922,7 @@ defmodule AttentionServer.ClientAPI.Writes do
     person = principal.person
 
     with {:ok, {_person, sender, message_id} = message_key} <-
-           Resources.item_key(engine, person, item_id),
+           Resources.person_item_key(engine, person, item_id),
          {:ok, seq} <- item_entry_seq(engine, person, message_key, entry_id) do
       current = Map.get(engine.chat_read_positions, message_key, 0)
 
@@ -950,7 +950,7 @@ defmodule AttentionServer.ClientAPI.Writes do
   # item the person cannot see.
   defp frame(engine, principal, key, {:reply, item_id, text, _file_ids}) do
     with {:ok, {_person, sender, message_id} = message_key} <-
-           Resources.item_key(engine, principal.person, item_id),
+           Resources.person_item_key(engine, principal.person, item_id),
          record = Map.fetch!(engine.messages, message_key),
          :ok <- has_conversation(record) do
       {:ok,
@@ -975,7 +975,7 @@ defmodule AttentionServer.ClientAPI.Writes do
          key,
          {:answer, item_id, revision, :no_comment}
        ) do
-    with {:ok, {_, sender, message_id}} <- Resources.item_key(engine, person, item_id) do
+    with {:ok, {_, sender, message_id}} <- Resources.person_item_key(engine, person, item_id) do
       {:ok,
        key
        |> answer_frame(sender, message_id, revision, nil)
@@ -985,7 +985,7 @@ defmodule AttentionServer.ClientAPI.Writes do
 
   defp frame(engine, principal, key, {:answer, item_id, revision, value}) do
     with {:ok, {_person, sender, message_id} = message_key} <-
-           Resources.item_key(engine, principal.person, item_id) do
+           Resources.person_item_key(engine, principal.person, item_id) do
       record = Map.fetch!(engine.messages, message_key)
 
       cond do
@@ -1206,7 +1206,7 @@ defmodule AttentionServer.ClientAPI.Writes do
          %{kind: :agent, person: person, key: key},
          {:answer, item_id, _, _}
        ) do
-    with {:ok, {^person, sender, _id}} <- Resources.item_key(engine, person, item_id),
+    with {:ok, {^person, sender, _id}} <- Resources.person_item_key(engine, person, item_id),
          {:ok, %{person: ^person}} <- Engine.client_agent_answer_scope(engine, key, sender) do
       {:ok, %{kind: :agent, person: person, engine_key: key}}
     end
@@ -1480,7 +1480,7 @@ defmodule AttentionServer.ClientAPI.Writes do
   end
 
   defp item_or_invalid(engine, person, item_id) do
-    case Resources.item_key(engine, person, item_id) do
+    case Resources.person_item_key(engine, person, item_id) do
       {:ok, key} -> {:ok, key}
       _ -> {:error, :invalid_field, "item_id"}
     end

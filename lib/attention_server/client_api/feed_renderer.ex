@@ -49,7 +49,8 @@ defmodule AttentionServer.ClientAPI.FeedRenderer do
   defp render_row(:item, {:item, {sender, message_id}}, context, principal, rev) do
     key = {principal.person, sender, message_id}
 
-    with {:ok, item_id} <- Resources.item_id(context.engine, key),
+    with true <- AttentionServer.BounceDecision.person_visible?(context.engine.messages[key]),
+         {:ok, item_id} <- Resources.item_id(context.engine, key),
          {:ok, rank} <- Reads.item_rank(context, principal.person, item_id) do
       Projection.run({:item, item_id}, fn ->
         {:ok,

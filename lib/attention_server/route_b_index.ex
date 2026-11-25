@@ -208,8 +208,8 @@ defmodule AttentionServer.RouteBIndex do
     index = put_v2_session(index, key, record)
     index = put_agent_message(index, key, previous, record)
     index = put_pending_message(index, key, previous, record)
-    previous_resolved? = not is_nil(previous) and not BounceDecision.inbox_open?(previous)
-    current_resolved? = not BounceDecision.inbox_open?(record)
+    previous_resolved? = visible_resolved?(previous)
+    current_resolved? = visible_resolved?(record)
 
     index =
       case {previous_resolved?, current_resolved?} do
@@ -239,6 +239,11 @@ defmodule AttentionServer.RouteBIndex do
       put_in(index, [:unresolved_count_by_person, person], count)
     end
   end
+
+  defp visible_resolved?(%{terminal: terminal} = record) when not is_nil(terminal),
+    do: BounceDecision.person_visible?(record)
+
+  defp visible_resolved?(_), do: false
 
   def pending_messages(index, person, high \\ nil),
     do: ordered_candidates(index.pending_messages_by_person, person, high)

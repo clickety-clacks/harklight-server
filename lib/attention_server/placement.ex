@@ -162,7 +162,11 @@ defmodule AttentionServer.Placement do
 
   defp reply_projection(engine, person) do
     {items, groups} =
-      Enum.reduce(engine.conversation_events, {[], %{}}, fn
+      engine.conversation_events
+      |> Stream.filter(fn {_seq, event} ->
+        BounceDecision.person_visible?(engine.messages[event.key])
+      end)
+      |> Enum.reduce({[], %{}}, fn
         {{^person, seq}, %{key: key, payload: %{"kind" => "reply", "author" => "origin"} = reply}},
         {items, groups} ->
           {_, sender, id} = key
@@ -280,7 +284,8 @@ defmodule AttentionServer.Placement do
     resolved =
       engine.messages
       |> Enum.filter(fn {{p, _, _}, record} ->
-        p == person and not BounceDecision.inbox_open?(record)
+        p == person and not is_nil(record.terminal) and
+          BounceDecision.person_visible?(record)
       end)
       |> Enum.sort_by(fn {{_, sender, id}, record} -> {-record.accepted_seq, sender, id} end)
       |> Enum.map(fn {{_, sender, id}, _} ->

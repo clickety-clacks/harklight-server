@@ -1,7 +1,7 @@
 defmodule AttentionServer.ClientAPI.Search do
   @moduledoc false
 
-  alias AttentionServer.{AgentAccess, JSON, Message}
+  alias AttentionServer.{AgentAccess, BounceDecision, JSON, Message}
 
   @states ~w(open answered cleared expired superseded retracted)
   @max_token_bytes 4_096
@@ -88,6 +88,7 @@ defmodule AttentionServer.ClientAPI.Search do
     for seq <- sequence,
         %{key: {^person, sender, id} = key} <- [engine.events[{person, seq}]],
         %{accepted_seq: ^seq} = record <- [engine.messages[key]],
+        BounceDecision.person_visible?(record),
         is_nil(filters["sender"]) or sender == filters["sender"],
         is_nil(filters["message_id"]) or id == filters["message_id"],
         is_nil(filters["session"]) or Map.get(record, :session_handle) == filters["session"],
