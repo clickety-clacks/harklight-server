@@ -9,11 +9,16 @@ account. Answering, lifecycle and other writes keep their earlier rules, and a
 correlated retraction that marks a Chat turn acted still belongs to the
 originating key.
 
+The bundled Harklight Web is 0.2.4. Each tab has its own FYI card and list:
+Inbox's hold the FYIs not marked Seen, and Replied's hold the Seen ones. An FYI
+that offers Seen counts as Seen only with that answer, so opening it elsewhere
+does not move it.
+
 ## Upgrade and recovery
 
 The Server continues to use FORMAT29, and upgrading from v0.2.0 through v0.2.10
 requires no store format migration. Follow the backup, upgrade, and recovery
-steps in `SELF_HOST.md`. The bundled Harklight Web is 0.2.3, as in v0.2.10.
+steps in `SELF_HOST.md`.
 
 After a rollback to an older Server and re-upgrade, a client may show a stale
 availability label until it changes, as in v0.2.9.
@@ -27,7 +32,7 @@ reports search and message-ID lookup as unsupported, and retracting another
 sender's message by item ID is refused. Harklight Agent 0.2.4 is
 the matching Agent release for everything else. Recovering waiting replies on an
 agent's first read needs Harklight Agent 0.2.1 or newer. Harklight app 0.2.0 and
-Harklight Web 0.2.3 are the client baseline. Protocol 0.1 clients require their
+Harklight Web 0.2.4 are the client baseline. Protocol 0.1 clients require their
 protocol 0.2 upgrades.
 
 # Harklight Server v0.2.10
