@@ -1,7 +1,7 @@
 defmodule AttentionServer.PushAlertTest do
   use ExUnit.Case, async: true
 
-  alias AttentionServer.{Engine, JSON}
+  alias AttentionServer.{APNS, Engine, JSON}
 
   test "selects the newest unresolved delivery as the alert trigger across a large gap" do
     person = "person-a"
@@ -219,6 +219,67 @@ defmodule AttentionServer.PushAlertTest do
     }
   end
 
+  test "only low and normal FYIs are passive with the default alert choice" do
+    for type <- ["fyi", "request", nil], urgency <- ["low", "normal", "high", "now", nil] do
+      message =
+        %{"message_type" => type, "urgency" => urgency}
+        |> Map.reject(fn {_field, value} -> is_nil(value) end)
+
+      engine = deliveries_with_messages([message])
+      assert {:ok, _, claim} = Engine.claim_push(engine, 1_000)
+      payload = push_payload(claim)
+
+      if type == "fyi" and urgency in ["low", "normal", nil] do
+        assert claim.quiet
+        assert payload["aps"]["interruption-level"] == "passive"
+        refute Map.has_key?(payload["aps"], "sound")
+      else
+        refute Map.has_key?(payload["aps"], "interruption-level")
+        assert payload["aps"]["sound"] == "default"
+      end
+
+      assert payload["aps"]["badge"] == 1
+      assert payload["aps"]["alert"] == claim.alert
+    end
+  end
+
+  test "grouped FYIs are passive unless one alerts, or the person wants all alerts" do
+    fyi = %{"message_type" => "fyi", "urgency" => "normal"}
+    request = %{"message_type" => "request", "urgency" => "low"}
+    engine = deliveries_with_messages([fyi, fyi])
+    assert {:ok, _, quiet} = Engine.claim_push(engine, 1_000)
+
+    engine = Map.put(engine, :alert_choices, %{@person => "all"})
+    assert {:ok, _, all} = Engine.claim_push(engine, 1_000)
+
+    passive = push_payload(quiet)
+    active = push_payload(all)
+    assert active["aps"]["sound"] == "default"
+    refute Map.has_key?(active["aps"], "interruption-level")
+    assert passive["aps"] == Map.put(Map.delete(active["aps"], "sound"), "interruption-level", "passive")
+    assert Map.delete(passive, "aps") == Map.delete(active, "aps")
+
+    assert {:ok, _, mixed} =
+             [request, fyi] |> deliveries_with_messages() |> Engine.claim_push(1_000)
+
+    refute Map.has_key?(push_payload(mixed)["aps"], "interruption-level")
+  end
+
+  defp deliveries_with_messages(messages) do
+    entries = Enum.map(1..length(messages), &{"app:test", "item-#{&1}", nil, nil})
+    engine = engine_with_deliveries(entries, %{})
+
+    records =
+      Map.new(engine.messages, fn {key, record} ->
+        message = Enum.at(messages, record.accepted_seq - 1)
+        {key, %{record | message: Map.merge(record.message, message)}}
+      end)
+
+    %{engine | messages: records}
+  end
+
+  defp push_payload(claim), do: APNS.request_payload(put_in(claim.locator["rev"], 1))
+
   test "several new requests group into one push with a count, sender names and the newest item" do
     engine =
       engine_with_deliveries(
@@ -390,7 +451,7 @@ defmodule AttentionServer.PushAlertTest do
     assert registered_binding.next_at == registered_binding.registered_at
   end
 
-  test "the first request is pushed at once and follow-ups within five minutes go out as one push" do
+  defp registered_push_engine do
     {:ok, engine} = Engine.setup_person(Engine.new(), @person)
     {:ok, engine} = Engine.setup_device(engine, @person, @device)
     {:ok, engine} = Engine.setup_device(engine, @person, @origin)
@@ -408,29 +469,81 @@ defmodule AttentionServer.PushAlertTest do
 
     {engine, {:ok, _reply}} = Engine.request_line(engine, @device, JSON.encode!(register) <> "\n")
 
-    forward = fn engine, id, op ->
+    forward = fn engine, id, op, fields, at ->
       frame = %{
         "v" => 1,
         "type" => "forward",
         "op_id" => "00000000-0000-4000-8000-0000000002" <> op,
-        "message" => %{
-          "sender_id" => "app:test",
-          "message_id" => id,
-          "created_at" => 1,
-          "title" => "Request #{id}"
-        }
+        "message" =>
+          Map.merge(
+            %{
+              "sender_id" => "app:test",
+              "message_id" => id,
+              "created_at" => 1,
+              "title" => "Request #{id}"
+            },
+            fields
+          )
       }
 
-      {engine, {:ok, reply}} = Engine.request_line(engine, @origin, JSON.encode!(frame) <> "\n")
+      {engine, {:ok, reply}} = Engine.request_line(engine, @origin, JSON.encode!(frame) <> "\n", at)
       {:ok, %{"seq" => seq}} = JSON.decode_line(reply)
       {engine, seq}
     end
+
+    {engine, forward}
+  end
+
+  test "an alerting delivery skips spacing behind a quiet delivery" do
+    for first_push <- [:sent, :in_flight, :queued] do
+      {engine, forward} = registered_push_engine()
+      now = System.system_time(:millisecond)
+
+      {engine, 1} = forward.(engine, "quiet", "01", %{"message_type" => "fyi"}, now)
+      accepted = %{state: "provider_accepted", http_status: 200}
+
+      {engine, first} =
+        case first_push do
+          :queued ->
+            {engine, nil}
+
+          _ ->
+            assert {:ok, engine, first} = Engine.claim_push(engine, now)
+            assert first.quiet
+
+            if first_push == :sent do
+              assert {:ok, engine} = Engine.finish_push(engine, first, accepted, now)
+              {engine, first}
+            else
+              {engine, first}
+            end
+        end
+
+      request_at = now + 60_000
+      {engine, 2} = forward.(engine, "question", "02", %{}, request_at)
+
+      engine =
+        if first_push == :in_flight do
+          assert {:ok, engine} = Engine.finish_push(engine, first, accepted, request_at)
+          engine
+        else
+          engine
+        end
+
+      assert {:ok, _, claim} = Engine.claim_push(engine, request_at)
+      assert claim.high == 2
+      refute Map.get(claim, :quiet)
+    end
+  end
+
+  test "the first request is pushed at once and follow-ups within five minutes go out as one push" do
+    {engine, forward} = registered_push_engine()
 
     binding = fn engine -> engine.push_bindings[{@person, @device}] end
 
     # The first unsent request is eligible immediately.
     before = System.system_time(:millisecond)
-    {engine, 1} = forward.(engine, "one", "01")
+    {engine, 1} = forward.(engine, "one", "01", %{}, System.system_time(:millisecond))
     after_first = System.system_time(:millisecond)
 
     opened = binding.(engine)
@@ -446,13 +559,13 @@ defmodule AttentionServer.PushAlertTest do
 
     # Requests arriving while it is in flight wait for the end of the window
     # that started with that push and join one push.
-    {engine, 2} = forward.(engine, "two", "02")
+    {engine, 2} = forward.(engine, "two", "02", %{}, System.system_time(:millisecond))
     window_end = claimed_at + 300_000
     in_flight = binding.(engine)
     assert in_flight.state == "sending"
     assert in_flight.next_at == window_end
 
-    {engine, 3} = forward.(engine, "three", "03")
+    {engine, 3} = forward.(engine, "three", "03", %{}, System.system_time(:millisecond))
     assert binding.(engine).next_at == window_end
     assert binding.(engine).pending_high == 3
 

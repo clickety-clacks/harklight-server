@@ -1244,7 +1244,7 @@ defmodule AttentionServer.ConversationFeedTest do
     assert :ok = Store.close(committed)
   end
 
-  test "FORMAT29 inline large title and body remain readable without a format migration", %{
+  test "FORMAT29 inline large title and body survive the FORMAT30 alert settings upgrade", %{
     path: path
   } do
     # The engine holds the large strings inline, as a FORMAT29 writer did.
@@ -1273,6 +1273,7 @@ defmodule AttentionServer.ConversationFeedTest do
     {legacy_engine, {:ok, reply}} = Engine.request_line(engine, "origin", forward)
     assert {:ok, %{"type" => "ok", "seq" => 1}} = JSON.decode_line(reply)
 
+    legacy_engine = Map.delete(legacy_engine, :alert_choices)
     {legacy_payload, _cache} = SnapshotEncoding.encode(legacy_engine, 29)
     assert byte_size(legacy_payload) > 2 * 1024 * 1024
 
@@ -1297,14 +1298,20 @@ defmodule AttentionServer.ConversationFeedTest do
     assert :ok = Sqlite3.release(db, stmt)
     assert :ok = Sqlite3.close(db)
 
-    before = state_snapshot(path)
     assert {:ok, reopened} = Store.open(path)
-    assert reopened.version == 0
+    assert reopened.version == 1
+    assert reopened.engine.alert_choices == %{}
+    assert {1, payload, _checksum} = state_snapshot(path)
+    assert {:attention_relay_state, 30, _} = :erlang.binary_to_term(payload, [:safe])
 
     record = reopened.engine.messages[{"A", "app:test", "format29-large-data"}]
     assert record.message["title"] == title
     assert record.message["body"] == body
-    assert state_snapshot(path) == before
+    assert :ok = Store.close(reopened)
+
+    assert {:ok, reopened} = Store.open(path)
+    assert reopened.version == 1
+    assert reopened.engine.alert_choices == %{}
     assert :ok = Store.close(reopened)
   end
 

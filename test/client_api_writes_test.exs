@@ -1081,6 +1081,9 @@ defmodule AttentionServer.ClientAPIWritesTest do
     assert {:ok, 200, _, false} =
              Writes.priority_levels(relay, "reader", @levels, settings_etag(relay, "reader"))
 
+    assert {:ok, 200, _, false} =
+             Writes.alerts(relay, "reader", "all", settings_etag(relay, "reader"))
+
     assert {:ok, 200, _, false} = Writes.push(relay, "reader", @token, "production", 1)
 
     state = :sys.get_state(relay)
@@ -1142,6 +1145,7 @@ defmodule AttentionServer.ClientAPIWritesTest do
           {_, "replies"} -> :post_replies
           {_, "read-position"} -> :put_read_position
           {_, "priority-levels"} -> :put_priority_levels
+          {_, "alerts"} -> :put_alerts
           {"PUT", "push"} -> :put_push
           {"DELETE", "push"} -> :delete_push
           {_, "files"} -> :post_files
@@ -1185,6 +1189,55 @@ defmodule AttentionServer.ClientAPIWritesTest do
 
       GenServer.stop(relay)
     end
+  end
+
+  test "alerts writes validate, replay, and sync across a person's devices", %{path: path} do
+    relay = scripted_relay(path)
+    assert :ok = Relay.setup_device(relay, "A", "second")
+    assert :ok = Relay.setup_person(relay, "B")
+    assert :ok = Relay.setup_device(relay, "B", "other")
+    tag = settings_etag(relay, "reader")
+    {:ok, before} = head(relay)
+    route = ["settings", "alerts"]
+    key = key()
+    headers = [{"if-match", tag}, {"idempotency-key", key}]
+    body = ~s({"alerts":"all"})
+
+    assert {400, %{"field" => "If-Match"}, _} = post(relay, route, body, [], "PUT")
+
+    for invalid <- [~s({"alerts":"none"}), ~s({"alerts":true}), "{}"] do
+      assert {400, %{"field" => "alerts"}, _} = post(relay, route, invalid, headers, "PUT")
+    end
+
+    assert {200, %{"settings" => %{"alerts" => "all"}} = first, _} =
+             post(relay, route, body, headers, "PUT")
+
+    assert {200, ^first, conn} = post(relay, route, body, headers, "PUT")
+    assert Plug.Conn.get_resp_header(conn, "idempotent-replayed") == ["true"]
+
+    assert {412, %{"error" => "precondition_failed"}, _} =
+             post(relay, route, ~s({"alerts":"important"}), [{"if-match", tag}], "PUT")
+
+    assert {:ok, %{"settings" => %{"alerts" => "important"}}} = Reads.settings(relay, "other")
+    assert {:ok, %{"settings" => %{"alerts" => "all"} = settings}} = Reads.settings(relay, "second")
+
+    state = :sys.get_state(relay)
+    context = %{engine: state.store.engine, store: state.store, view: state.priority_views["A"]}
+    assert [row] = changes_after(relay, before)
+    assert row.resource_id == "settings"
+    assert {:ok, ^settings} = FeedRenderer.render(context, "second", row)
+
+    assert {200, %{"settings" => %{"alerts" => "important"}}, _} =
+             post(
+               relay,
+               route,
+               ~s({"alerts":"important"}),
+               [{"if-match", settings_etag(relay, "reader")}],
+               "PUT"
+             )
+
+    assert :sys.get_state(relay).store.engine.alert_choices == %{}
+    GenServer.stop(relay)
   end
 
   test "priority levels need If-Match; push bodies are checked; browsers get 403",
