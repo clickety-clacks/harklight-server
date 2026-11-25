@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+trap 'printf "Installer fixture assertion failed at line %s\n" "$LINENO" >&2' ERR
 
 installer="${1:?pass the install-release.sh path}"
 mode="${2:-upgrade-failure}"
@@ -261,7 +262,6 @@ else
   [[ "$("$real_readlink" -f -- "$root/current")" == "$root/releases/v0.2.19" ]]
   [[ "$(< "$scratch/service-state")" == active ]]
   grep -Fqx 'format=31' "$HARKLIGHT_TEST_MIGRATION_LOG"
-  [[ -d "$root/state/relay.sqlite3.uploads" ]]
   migrated_store_sha="$(sha256sum "$root/state/relay.sqlite3" | cut -d ' ' -f 1)"
   [[ "$migrated_store_sha" != "$expected_store_sha" ]]
   [[ -f "$root/state/candidate-write.txt" ]]

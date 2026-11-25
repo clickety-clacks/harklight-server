@@ -329,16 +329,7 @@ defmodule AttentionServer.EnrollmentReadbackTest do
           end)
     }
 
-    payload = :erlang.term_to_binary({:attention_relay_state, 2, old}, [{:compressed, 6}])
-    assert {:ok, db} = Sqlite3.open(path)
-
-    assert {:ok, stmt} =
-             Sqlite3.prepare(db, "UPDATE relay_state SET payload = ?, checksum = ? WHERE id = 1")
-
-    assert :ok = Sqlite3.bind(stmt, [{:blob, payload}, {:blob, :crypto.hash(:sha256, payload)}])
-    assert :done = Sqlite3.step(db, stmt)
-    assert :ok = Sqlite3.release(db, stmt)
-    assert :ok = Sqlite3.close(db)
+    :ok = AttentionServer.PreChangeLogStore.snapshot_fixture(path, 2, fn _ -> old end)
 
     assert {:ok, migrated} = Store.open(path)
     assert migrated.version == before.version + 1

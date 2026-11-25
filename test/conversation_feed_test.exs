@@ -42,9 +42,19 @@ defmodule AttentionServer.ConversationFeedTest do
     alias AttentionServer.Store.RecordTable
     assert {:ok, db} = Sqlite3.open(path, mode: :readonly)
     assert {:ok, version} = RecordTable.generation(db)
-    assert {:ok, rows} = RecordTable.select(db, "SELECT key, payload, checksum FROM relay_records ORDER BY key")
+
+    assert {:ok, rows} =
+             RecordTable.select(
+               db,
+               "SELECT key, payload, checksum FROM relay_records ORDER BY key"
+             )
+
     assert :ok = Sqlite3.close(db)
-    assert Enum.all?(rows, fn [key, payload, checksum] -> :crypto.hash(:sha256, [key, payload]) == checksum end)
+
+    assert Enum.all?(rows, fn [key, payload, checksum] ->
+             :crypto.hash(:sha256, [key, payload]) == checksum
+           end)
+
     encoded = :erlang.term_to_binary(rows)
     {version, encoded, :crypto.hash(:sha256, encoded)}
   end
@@ -909,8 +919,14 @@ defmodule AttentionServer.ConversationFeedTest do
     address = {:row, :messages, {"A", "app:test", "large-title"}}
     key = AttentionServer.Store.RecordCodec.encode_key(address)
     assert {:ok, db} = Sqlite3.open(path, mode: :readonly)
+
     assert {:ok, [[payload, checksum]]} =
-             AttentionServer.Store.RecordTable.select(db, "SELECT payload, checksum FROM relay_records WHERE key = ?", [{:blob, key}])
+             AttentionServer.Store.RecordTable.select(
+               db,
+               "SELECT payload, checksum FROM relay_records WHERE key = ?",
+               [{:blob, key}]
+             )
+
     assert :ok = Sqlite3.close(db)
     assert :crypto.hash(:sha256, [key, payload]) == checksum
     assert byte_size(payload) < 65_536
@@ -1227,12 +1243,25 @@ defmodule AttentionServer.ConversationFeedTest do
     assert repaired.engine.messages[key].message["body"] == ref
     assert LargeData.read!(ref) == body
 
-    # Also exercise retirement through the snapshot commit path. A marker
+    # Also exercise retirement through the row commit path. A marker
     # remains in the durable state after the last registered reference goes.
     next = LargeData.persist_refs(repaired.engine)
     audit = %{person: "A", actor: "origin", action: "retain_marker"}
 
-    assert {:ok, committed} = Store.commit(repaired, next, audit)
+    alias AttentionServer.Store.RecordCodec
+
+    previous =
+      Map.new(RecordCodec.encode(repaired.engine), fn {key, payload, _} -> {key, payload} end)
+
+    touched =
+      for {key, payload, _} <- RecordCodec.encode(next),
+          previous[key] != payload,
+          into: MapSet.new() do
+        assert {:ok, address} = RecordCodec.decode_key(key)
+        address
+      end
+
+    assert {:ok, committed} = Store.commit(repaired, {next, touched}, audit)
     assert large_data_reference_rows(path) == []
     assert File.read(ref.path) == {:ok, body}
     assert :ok = Store.close(committed)
@@ -1607,7 +1636,7 @@ defmodule AttentionServer.ConversationFeedTest do
     GenServer.stop(restarted)
 
     assert {:ok, again} = Store.open(path)
-    assert again.version == prior_version + 1
+    assert again.version == prior_version + 2
     assert :ok = Store.close(again)
   end
 

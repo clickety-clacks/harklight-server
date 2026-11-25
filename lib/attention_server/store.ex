@@ -218,7 +218,8 @@ defmodule AttentionServer.Store do
     end
   end
 
-  def open(path, mode) when is_binary(path) and path != "" and mode in [:legacy, :keyed, :relay] do
+  def open(path, mode)
+      when is_binary(path) and path != "" and mode in [:legacy, :keyed, :relay] do
     with {:ok, store} <- open_store(path, mode), do: finish_open(store)
   end
 
@@ -282,10 +283,15 @@ defmodule AttentionServer.Store do
 
   def convert_stopped(path, budget, expected_format) when is_binary(path) and path != "" do
     preflight = &ConversionPreflight.check(&1, budget, expected_format)
+
     convert_legacy_store(path, preflight, fn _store, _engine, _generation -> {:ok, :converted} end)
   end
 
-  defp convert_legacy_store(path, preflight \\ fn _db -> :ok end, prepare \\ &prepare_keyed_conversion/3) do
+  defp convert_legacy_store(
+         path,
+         preflight \\ fn _db -> :ok end,
+         prepare \\ &prepare_keyed_conversion/3
+       ) do
     upload_dir = Path.expand(path) <> ".uploads"
 
     with {:ok, db} <- Sqlite3.open(path, mode: :readwrite) do
@@ -929,19 +935,31 @@ defmodule AttentionServer.Store do
   end
 
   defp relay_layout(db) do
-    case one(db, "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = 'relay_state'", []) do
-      {:ok, [0]} -> {:ok, :empty}
+    case one(
+           db,
+           "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = 'relay_state'",
+           []
+         ) do
+      {:ok, [0]} ->
+        {:ok, :empty}
+
       {:ok, [1]} ->
-        case one(db, """
-             SELECT EXISTS (SELECT 1 FROM relay_state WHERE id = 1),
-                    EXISTS (SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'relay_records')
-             """, []) do
+        case one(
+               db,
+               """
+               SELECT EXISTS (SELECT 1 FROM relay_state WHERE id = 1),
+                      EXISTS (SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'relay_records')
+               """,
+               []
+             ) do
           {:ok, [1, 1]} -> {:ok, :rows}
           {:ok, [1, 0]} -> {:ok, :snapshot}
           {:ok, [0, 0]} -> {:ok, :empty}
           error -> error
         end
-      error -> error
+
+      error ->
+        error
     end
   end
 
@@ -957,8 +975,12 @@ defmodule AttentionServer.Store do
 
   defp bootstrap_if_empty(db) do
     case relay_layout(db) do
-      {:ok, :rows} -> {:ok, :existing}
-      {:ok, :snapshot} -> {:error, :conversion_required}
+      {:ok, :rows} ->
+        {:ok, :existing}
+
+      {:ok, :snapshot} ->
+        {:error, :conversion_required}
+
       {:ok, :empty} ->
         engine = Engine.new()
 
@@ -966,7 +988,9 @@ defmodule AttentionServer.Store do
              :ok <- KeyedMigration.bootstrap(db, engine) do
           {:ok, engine}
         end
-      error -> error
+
+      error ->
+        error
     end
   end
 
@@ -1096,7 +1120,14 @@ defmodule AttentionServer.Store do
 
       case result do
         {:ok, {heads, agent_heads}} ->
-          prune_released_blobs(store.upload_dir, prepared.orphan_candidates, blob_owners, audit)
+          prune_released_blobs(
+            store.upload_dir,
+            prepared.orphan_candidates,
+            blob_owners,
+            prepared.engine,
+            audit
+          )
+
           AttentionServer.ChangeLog.notify(heads)
           AttentionServer.ChangeLog.notify(agent_heads)
           if log, do: AttentionServer.ChangeLog.notify_closing(log.closings)
@@ -1852,30 +1883,19 @@ defmodule AttentionServer.Store do
   # A blob whose last owning record was rewritten or removed in this commit
   # is deleted after the commit is durable. A failed unlink leaves an orphan
   # for the next open's cleanup.
-  defp prune_released_blobs(nil, _candidates, _owners, _audit), do: :ok
+  defp prune_released_blobs(nil, _candidates, _owners, _engine, _audit), do: :ok
 
-  defp prune_released_blobs(directory, candidates, owners, audit) do
-    candidates
-    |> Enum.uniq()
-    |> Enum.reject(&Map.has_key?(owners, &1))
-    |> Enum.each(fn id ->
-      case File.rm(Path.join(directory, id)) do
-        :ok ->
-          :ok
+  defp prune_released_blobs(directory, candidates, owners, engine, audit) do
+    released = candidates |> Enum.uniq() |> Enum.reject(&Map.has_key?(owners, &1))
+    result = LargeData.delete_released(directory, released, engine)
 
-        {:error, :enoent} ->
-          :ok
-
-        {:error, reason} ->
-          Diagnostics.failure(
-            :server_storage,
-            :large_data_delete,
-            reason,
-            :unavailable,
-            operation_id(audit)
-          )
-      end
-    end)
+    Diagnostics.result(
+      :server_storage,
+      :large_data_delete,
+      result,
+      :unavailable,
+      operation_id(audit)
+    )
   end
 
   # These pages only update the availability checkpoint on existing sessions.

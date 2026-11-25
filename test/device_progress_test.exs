@@ -1,7 +1,7 @@
 defmodule AttentionServer.DeviceProgressTest do
   use ExUnit.Case, async: false
 
-  alias AttentionServer.{Engine, JSON, Relay, RelayReaders, Store}
+  alias AttentionServer.{Engine, JSON, PreChangeLogStore, Relay, RelayReaders, Store}
   alias Exqlite.Sqlite3
 
   setup do
@@ -45,31 +45,12 @@ defmodule AttentionServer.DeviceProgressTest do
     %{path: path}
   end
 
-  # Protocol 0.1 sessions no longer acknowledge progress through the Relay. A
-  # cold Relay start and its replay reads leave the FORMAT30 snapshot alone,
-  # and the stored progress writer (opens and every cursor a 0.1 session
-  # stored) still commits beside the snapshot, survives restart and folds into
-  # it on the next mutation.
-  test "cold replay and every ACK preserve the FORMAT30 snapshot and survive restart", %{
+  # The old writer stores opens and ACK cursors beside the snapshot. The
+  # stopped-store conversion folds them into rows before serving replay.
+  test "the FORMAT30 progress overlay survives conversion and Relay replay", %{
     path: path
   } do
     before = snapshot(path)
-    {:ok, relay} = Relay.start_link(store_path: path)
-    {:ok, replay, 8} = RelayReaders.events(relay, "reader", 0)
-
-    assert Enum.map(Enum.filter(replay, &(&1["type"] == "delivery")), & &1["seq"]) ==
-             Enum.to_list(1..8)
-
-    {:ok, conversation, 8} = RelayReaders.conversation_events(relay, "reader", 0)
-
-    assert Enum.map(
-             Enum.filter(conversation, &(&1["type"] == "conversation")),
-             & &1["conversation_seq"]
-           ) == Enum.to_list(1..8)
-
-    GenServer.stop(relay)
-    assert snapshot(path) == before
-
     {:ok, store} = Store.open(path)
     opened = Engine.put_member(store.engine, :conversation_opened, {"A", "reader"})
     {:ok, store} = Store.commit(store, opened, audit())
@@ -87,7 +68,20 @@ defmodule AttentionServer.DeviceProgressTest do
 
     Store.close(store)
     assert snapshot(path) == before
+    :ok = PreChangeLogStore.convert_fixture(path)
     {:ok, restarted} = Relay.start_link(store_path: path)
+    {:ok, replay, 8} = RelayReaders.events(restarted, "reader", 0)
+
+    assert Enum.map(Enum.filter(replay, &(&1["type"] == "delivery")), & &1["seq"]) ==
+             Enum.to_list(1..8)
+
+    {:ok, conversation, 8} = RelayReaders.conversation_events(restarted, "reader", 0)
+
+    assert Enum.map(
+             Enum.filter(conversation, &(&1["type"] == "conversation")),
+             & &1["conversation_seq"]
+           ) == Enum.to_list(1..8)
+
     assert {:ok, 8} = Relay.acknowledged_cursor(restarted, "reader")
     assert {:ok, 8} = RelayReaders.conversation_cursor(restarted, "reader")
 
@@ -96,7 +90,7 @@ defmodule AttentionServer.DeviceProgressTest do
              {"A", "reader"}
            )
 
-    # A later ordinary mutation folds progress into the snapshot atomically.
+    # A subsequent row mutation retains the folded progress.
     :ok = Relay.setup_sender(restarted, "origin", "app:next")
     GenServer.stop(restarted)
     {:ok, folded} = Store.open(path)
@@ -153,14 +147,17 @@ defmodule AttentionServer.DeviceProgressTest do
     Store.close(migrated)
     [_, payload, _] = snapshot(path)
     assert {:attention_relay_state, 30, _} = :erlang.binary_to_term(payload)
+    :ok = PreChangeLogStore.convert_fixture(path)
     {:ok, restarted} = Relay.start_link(store_path: path)
     assert {:ok, 6} = RelayReaders.conversation_cursor(restarted, "reader")
     GenServer.stop(restarted)
 
     # Later stored progress commits on top of the migrated cursor.
-    {:ok, store} = Store.open(path)
+    {:ok, store} = Store.open(path, :keyed)
+    store = Store.track_relay_writes(store)
     assert store.engine.conversation_cursors[{"A", "reader"}] == 6
-    {:ok, store} = Store.commit(store, conversation_cursor(store.engine, 8), audit())
+    next = Engine.put_row(store.engine, :conversation_cursors, {"A", "reader"}, 8)
+    {:ok, store} = Store.commit(store, next, audit())
     Store.close(store)
     {:ok, reopened} = Store.open(path)
     assert reopened.engine.conversation_cursors[{"A", "reader"}] == 8

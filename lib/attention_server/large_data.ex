@@ -328,8 +328,13 @@ defmodule AttentionServer.LargeData do
 
     removed = for {id, _ref} <- refs(old_term), not Map.has_key?(retained, id), do: id
 
-    if Enum.all?(removed, &blob_id?/1) do
-      delete_files(directory, unmarked_blobs(removed, persisted))
+    delete_released(directory, removed, persisted)
+  end
+
+  @doc false
+  def delete_released(directory, ids, term) do
+    if Enum.all?(ids, &blob_id?/1) do
+      delete_files(directory, unmarked_blobs(ids, term))
     else
       {:error, :storage_unavailable}
     end

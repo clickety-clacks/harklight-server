@@ -1,14 +1,11 @@
 defmodule AttentionServer.LargeDataCommitOracleTest do
-  # Differential check of the incremental large-data commit path on real Relay
-  # operations: every state the Relay proposes to the store is captured before
-  # any large-data transformation, and the incremental result for that exact
-  # proposed state must equal the full path's result for it. Requested content,
-  # revisions and withdrawal are verified independently of both paths, and a
-  # failed snapshot write that would have changed the reference index must not
-  # advance the cache.
+  # Compare the row writer's large-data preparation with the full-state
+  # transformation on actual Relay proposals. Verify the committed references
+  # and bytes separately from both paths.
   use ExUnit.Case, async: false
 
-  alias AttentionServer.{JSON, LargeData, Relay, Store, TLSFixtures}
+  alias AttentionServer.{JSON, LargeData, PreChangeLogStore, Relay, Store, TLSFixtures}
+  alias AttentionServer.Store.KeyedReference
 
   @person "A"
 
@@ -119,32 +116,29 @@ defmodule AttentionServer.LargeDataCommitOracleTest do
     assert calls != []
 
     for {before, proposed} <- calls, before.db != nil do
-      {full_durable, full_persisted, full_rows} = full(proposed, before.upload_dir)
+      {full_durable, _full_persisted, _full_rows} = full(proposed, before.upload_dir)
 
-      if before.large_base do
-        assert {:ok, durable, persisted, index, _created} =
-                 LargeData.commit_incremental(
-                   proposed,
-                   before.large_base,
-                   before.large_persisted,
-                   before.large_index,
-                   before.upload_dir
-                 )
+      assert {:ok, prepared} =
+               KeyedReference.prepare(
+                 before.engine,
+                 proposed,
+                 proposed.touched_keys,
+                 before.upload_dir
+               )
 
-        assert durable == full_durable
-        assert persisted == full_persisted
-        assert LargeData.reference_index_rows(index) == full_rows
-        assert LargeData.reference_index_ids(index) == LargeData.refs(full_durable)
-      end
+      assert prepared.engine == full_durable
+
+      assert {:ok, owners} =
+               KeyedReference.update_blob_owners(before.blob_owners, prepared.blob_delta)
+
+      assert owners == KeyedReference.blob_owners(full_durable)
     end
 
-    if committed.large_base do
-      {_before, last} = List.last(calls)
-      {full_durable, full_persisted, full_rows} = full(last, committed.upload_dir)
-      assert committed.large_base == full_durable
-      assert committed.large_persisted == full_persisted
-      assert LargeData.reference_index_rows(committed.large_index) == full_rows
-    end
+    {_before, last} = List.last(calls)
+    {durable, _persisted, rows} = full(last, committed.upload_dir)
+    assert %{durable | touched_keys: MapSet.new()} == committed.engine
+    assert db_rows(String.trim_trailing(committed.upload_dir, ".uploads")) == rows
+    assert committed.blob_owners == KeyedReference.blob_owners(durable)
 
     committed
   end
@@ -209,7 +203,7 @@ defmodule AttentionServer.LargeDataCommitOracleTest do
              })
 
     store = assert_commits_equivalent(relay)
-    assert map_size(store.large_index) > 0
+    assert map_size(store.blob_owners) > 0
     assert_body(relay, "big", big1)
     assert %LargeData.Ref{} = record(relay, "big").message["body"]
 
@@ -270,12 +264,12 @@ defmodule AttentionServer.LargeDataCommitOracleTest do
     store = assert_commits_equivalent(relay)
     assert %{state: "retracted"} = record(relay, "big").terminal
 
-    for {_id, ref} <- LargeData.reference_index_ids(store.large_index) do
+    for {_id, ref} <- LargeData.refs(store.engine) do
       assert File.exists?(Path.join(store.upload_dir, ref.id))
     end
   end
 
-  test "a failed write that would change the index leaves the cache; a retry commits",
+  test "a failed row write leaves reference ownership unchanged and permits a retry",
        %{relay: relay, key: key, path: path} do
     original = large(9)
 
@@ -288,8 +282,8 @@ defmodule AttentionServer.LargeDataCommitOracleTest do
              })
 
     before = assert_commits_equivalent(relay)
-    assert map_size(before.large_index) > 0
-    {_path, {_row, old_ref}} = Enum.at(Enum.to_list(before.large_index), 0)
+    assert map_size(before.blob_owners) > 0
+    old_ref = record(relay, "big").message["body"]
     old_file = Path.join(before.upload_dir, old_ref.id)
     assert File.exists?(old_file)
 
@@ -313,21 +307,21 @@ defmodule AttentionServer.LargeDataCommitOracleTest do
     # The rejected proposal would have replaced the reference.
     [{store_before, proposed} | _] = drain_commits([])
 
-    assert {:ok, _durable, _persisted, candidate_index, _created} =
-             LargeData.commit_incremental(
+    assert {:ok, prepared} =
+             KeyedReference.prepare(
+               store_before.engine,
                proposed,
-               store_before.large_base,
-               store_before.large_persisted,
-               store_before.large_index,
+               proposed.touched_keys,
                store_before.upload_dir
              )
 
-    assert candidate_index != before.large_index
+    assert {:ok, owners} =
+             KeyedReference.update_blob_owners(store_before.blob_owners, prepared.blob_delta)
+
+    assert owners != before.blob_owners
 
     after_failure = :sys.get_state(relay).store
-    assert after_failure.large_base === before.large_base
-    assert after_failure.large_persisted === before.large_persisted
-    assert after_failure.large_index === before.large_index
+    assert after_failure.blob_owners === before.blob_owners
     assert after_failure.engine === before.engine
     assert after_failure.version == before.version
     assert File.exists?(old_file)
@@ -339,12 +333,11 @@ defmodule AttentionServer.LargeDataCommitOracleTest do
     assert %{"type" => "ok", "revision" => 2} = request(relay, key, revise)
     retried = assert_commits_equivalent(relay)
     assert retried.version == before.version + 1
-    assert retried.large_index != before.large_index
+    assert retried.blob_owners != before.blob_owners
     assert_body(relay, "big", replacement)
 
-    assert db_rows(path) == LargeData.reference_index_rows(retried.large_index)
-    retained_ids = LargeData.reference_index_ids(retried.large_index)
-    still_referenced = Map.has_key?(retained_ids, old_ref.id)
+    assert db_rows(path) == LargeData.persisted_references(retried.engine)
+    still_referenced = Map.has_key?(retried.blob_owners, old_ref.id)
     assert File.exists?(old_file) == still_referenced
 
     GenServer.stop(relay)
@@ -388,13 +381,14 @@ defmodule AttentionServer.LargeDataCommitOracleTest do
 
     audit = %{person: @person, actor: "test", action: "oracle"}
 
-    # The first snapshot commit after open takes the full path and seeds the cache.
-    {:ok, opened} = Store.open(path)
+    # Exercise the legacy writer that would still run before conversion.
+    :ok = PreChangeLogStore.snapshot_fixture(path)
+    {:ok, opened} = Store.open(path, :legacy)
     clock = opened.engine.pending_clock_high_water + 1
     first = %{opened.engine | pending_clock_high_water: clock}
     {:ok, seeded} = Store.commit(opened, first, audit)
     assert seeded.large_base != nil
-    proposed = %{captured | pending_clock_high_water: clock}
+    proposed = %{captured | pending_clock_high_water: clock, touched_keys: nil}
 
     assert {:ok, _durable, _persisted, candidate_index, _created} =
              LargeData.commit_incremental(

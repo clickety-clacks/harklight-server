@@ -349,16 +349,8 @@ defmodule AttentionServer.GuidedJoinTest do
     before = :sys.get_state(relay).store.engine
     GenServer.stop(relay)
     old = Map.delete(before, :join_invitations)
-    payload = :erlang.term_to_binary({:attention_relay_state, 11, old}, [{:compressed, 6}])
-    {:ok, db} = Exqlite.Sqlite3.open(path)
+    :ok = AttentionServer.PreChangeLogStore.snapshot_fixture(path, 11, fn _ -> old end)
 
-    {:ok, stmt} =
-      Exqlite.Sqlite3.prepare(db, "UPDATE relay_state SET payload = ?, checksum = ? WHERE id = 1")
-
-    :ok = Exqlite.Sqlite3.bind(stmt, [{:blob, payload}, {:blob, :crypto.hash(:sha256, payload)}])
-    :done = Exqlite.Sqlite3.step(db, stmt)
-    :ok = Exqlite.Sqlite3.release(db, stmt)
-    :ok = Exqlite.Sqlite3.close(db)
     {:ok, migrated} = Store.open(path)
     assert migrated.engine.owners == before.owners
     assert migrated.engine.devices == before.devices
@@ -481,7 +473,8 @@ defmodule AttentionServer.GuidedJoinTest do
     Store.close(restarted)
   end
 
-  test "device metadata is validated on durable snapshot acceptance, with no label length cap", c do
+  test "device metadata is validated on durable snapshot acceptance, with no label length cap",
+       c do
     {:ok, engine, _} = create(c)
     label = String.duplicate("x", 1_024)
 

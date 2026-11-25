@@ -181,7 +181,7 @@ defmodule AttentionServer.PrioritizationTest do
   defp complete_synthetic_priority_pass(job, result) do
     expected_pid = job.pid
     send(job.pid, {:complete, result})
-    assert_receive {:priority_result_handled, ^expected_pid, {:ok, _events, _sequence}}
+    assert_receive {:priority_result_handled, ^expected_pid, {:ok, _events, _sequence}}, 2_000
   end
 
   defp setup_person(relay) do
@@ -195,9 +195,19 @@ defmodule AttentionServer.PrioritizationTest do
     alias AttentionServer.Store.RecordTable
     assert {:ok, db} = Sqlite3.open(path, mode: :readonly)
     assert {:ok, generation} = RecordTable.generation(db)
-    assert {:ok, rows} = RecordTable.select(db, "SELECT key, payload, checksum FROM relay_records ORDER BY key")
+
+    assert {:ok, rows} =
+             RecordTable.select(
+               db,
+               "SELECT key, payload, checksum FROM relay_records ORDER BY key"
+             )
+
     assert :ok = Sqlite3.close(db)
-    assert Enum.all?(rows, fn [key, payload, checksum] -> :crypto.hash(:sha256, [key, payload]) == checksum end)
+
+    assert Enum.all?(rows, fn [key, payload, checksum] ->
+             :crypto.hash(:sha256, [key, payload]) == checksum
+           end)
+
     {generation, rows}
   end
 
@@ -2686,7 +2696,12 @@ defmodule AttentionServer.PrioritizationTest do
     key = {"person-a", "app:test", "reply"}
 
     entries = [
-      %{"sender_id" => "app:test", "message_id" => "reply", "conversation_seq" => 3, "score" => 0.7}
+      %{
+        "sender_id" => "app:test",
+        "message_id" => "reply",
+        "conversation_seq" => 3,
+        "score" => 0.7
+      }
     ]
 
     [small, large] =

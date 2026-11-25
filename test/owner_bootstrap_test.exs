@@ -64,15 +64,7 @@ defmodule AttentionServer.OwnerBootstrapTest do
     before = :sys.get_state(relay).store
     GenServer.stop(relay)
 
-    payload =
-      :erlang.term_to_binary({:attention_relay_state, 3, before.engine}, [{:compressed, 6}])
-
-    assert {:ok, db} = Sqlite3.open(path)
-    assert {:ok, stmt} = Sqlite3.prepare(db, "UPDATE relay_state SET payload = ?, checksum = ?")
-    assert :ok = Sqlite3.bind(stmt, [{:blob, payload}, {:blob, :crypto.hash(:sha256, payload)}])
-    assert :done = Sqlite3.step(db, stmt)
-    assert :ok = Sqlite3.release(db, stmt)
-    assert :ok = Sqlite3.close(db)
+    :ok = AttentionServer.PreChangeLogStore.snapshot_fixture(path, 3, fn _ -> before.engine end)
 
     assert {:ok, migrated} = Store.open(path)
     assert migrated.version == before.version + 1

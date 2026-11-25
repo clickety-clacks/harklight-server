@@ -2,7 +2,6 @@ defmodule AttentionServer.SourceReportTest do
   use ExUnit.Case, async: false
 
   alias AttentionServer.{Engine, JSON, Relay, RelayReaders, Store}
-  alias Exqlite.Sqlite3
 
   setup do
     dir =
@@ -341,16 +340,7 @@ defmodule AttentionServer.SourceReportTest do
           Map.update!(engine.messages, second_key, &Map.put(&1, :source_binding, duplicate))
     }
 
-    payload = :erlang.term_to_binary({:attention_relay_state, 2, corrupted}, [{:compressed, 6}])
-    assert {:ok, db} = Sqlite3.open(path)
-
-    assert {:ok, stmt} =
-             Sqlite3.prepare(db, "UPDATE relay_state SET payload = ?, checksum = ? WHERE id = 1")
-
-    assert :ok = Sqlite3.bind(stmt, [{:blob, payload}, {:blob, :crypto.hash(:sha256, payload)}])
-    assert :done = Sqlite3.step(db, stmt)
-    assert :ok = Sqlite3.release(db, stmt)
-    assert :ok = Sqlite3.close(db)
+    :ok = AttentionServer.PreChangeLogStore.snapshot_fixture(path, 2, fn _ -> corrupted end)
 
     assert {:error, {:storage_unavailable, {:error, :invalid_state}}} =
              Store.open(path)
@@ -365,16 +355,8 @@ defmodule AttentionServer.SourceReportTest do
     engine = :sys.get_state(relay).store.engine
     GenServer.stop(relay)
     legacy = engine |> Map.delete(:agents) |> Map.delete(:source_report_grants)
-    payload = :erlang.term_to_binary({:attention_relay_state, 1, legacy}, [{:compressed, 6}])
-    assert {:ok, db} = Sqlite3.open(path)
-
-    assert {:ok, stmt} =
-             Sqlite3.prepare(db, "UPDATE relay_state SET payload = ?, checksum = ? WHERE id = 1")
-
-    assert :ok = Sqlite3.bind(stmt, [{:blob, payload}, {:blob, :crypto.hash(:sha256, payload)}])
-    assert :done = Sqlite3.step(db, stmt)
-    assert :ok = Sqlite3.release(db, stmt)
-    assert :ok = Sqlite3.close(db)
+    :ok = AttentionServer.PreChangeLogStore.snapshot_fixture(path, 1, fn _ -> legacy end)
+    :ok = AttentionServer.PreChangeLogStore.convert_fixture(path)
 
     {:ok, restarted} =
       Relay.start_link(store_path: path, source_fixture_mode: true, agent_fixture_mode: true)

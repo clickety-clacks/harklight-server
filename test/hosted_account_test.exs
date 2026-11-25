@@ -312,15 +312,7 @@ defmodule AttentionServer.HostedAccountTest do
       old_engine = Map.delete(current.engine, :delivery_states)
       assert :ok = Store.close(current)
 
-      payload =
-        :erlang.term_to_binary({:attention_relay_state, 28, old_engine}, [{:compressed, 6}])
-
-      assert {:ok, db} = Sqlite3.open(path)
-      assert {:ok, stmt} = Sqlite3.prepare(db, "UPDATE relay_state SET payload = ?, checksum = ?")
-      assert :ok = Sqlite3.bind(stmt, [{:blob, payload}, {:blob, :crypto.hash(:sha256, payload)}])
-      assert :done = Sqlite3.step(db, stmt)
-      assert :ok = Sqlite3.release(db, stmt)
-      assert :ok = Sqlite3.close(db)
+      :ok = AttentionServer.PreChangeLogStore.snapshot_fixture(path, 28, fn _ -> old_engine end)
 
       assert {:ok, migrated} = Store.open(path)
       assert migrated.engine.delivery_states == %{}
@@ -406,16 +398,16 @@ defmodule AttentionServer.HostedAccountTest do
       relay = start_relay(certs, dir, dashboard_origin: @origin)
       assert {:ok, person} = Relay.hosted_account_create(relay, "acct-delivery-storage")
 
-      assert {:ok, db} = Sqlite3.open(Path.join(dir, "relay.sqlite3"))
+      :sys.replace_state(relay, fn state ->
+        assert :ok =
+                 Sqlite3.execute(
+                   state.store.db,
+                   "CREATE TRIGGER reject_delivery_state BEFORE UPDATE ON relay_record_generation " <>
+                     "BEGIN SELECT RAISE(ABORT, 'forced storage failure'); END;"
+                 )
 
-      assert :ok =
-               Sqlite3.execute(
-                 db,
-                 "CREATE TRIGGER reject_delivery_state BEFORE UPDATE ON relay_record_generation " <>
-                   "BEGIN SELECT RAISE(ABORT, 'forced storage failure'); END;"
-               )
-
-      assert :ok = Sqlite3.close(db)
+        state
+      end)
 
       assert {503, %{"error" => "storage_unavailable"}} =
                hosted_post(relay, "/delivery-state", %{
