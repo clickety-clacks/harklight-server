@@ -6,8 +6,8 @@ push keys, through the free Harklight push relay. To turn it on, uncomment
 existing installation) and restart the Server. The relay service opens
 separately from this release; until it is available, leave the line commented.
 SELF_HOST.md lists exactly what the relay receives and logs: never message
-text, titles or sender names. A relayed alert reads "New message in Harklight"
-and tapping it opens the Inbox. Apple keys, when configured, still take
+text, titles or sender names. A relayed alert reads "New message in Harklight";
+tapping it opens Harklight, which then catches up from your Server. Apple keys, when configured, still take
 precedence and keep full notification content.
 
 ## Upgrade and recovery
