@@ -117,6 +117,8 @@ defmodule AttentionServer.ClientAPIFeedShowTest do
     assert %{"state" => "sent", "show_id" => id} = body(response)
     {_client, _client_feed, event, _prior} = until_show(client, client_feed)
     assert %{event: "show", data: %{"show_id" => ^id, "target" => "chat"}} = event
+    {agent, agent_feed, [focus]} = events(agent, agent_feed, 1)
+    assert %{event: "focus", data: %{"focus" => %{"clients" => [_]}}} = focus
     {_agent, _agent_feed, agent_events} = events(agent, agent_feed, 3)
     assert agent_events == List.duplicate(%{event: "heartbeat", data: %{}}, 3)
   end
@@ -229,8 +231,91 @@ defmodule AttentionServer.ClientAPIFeedShowTest do
     refute_received {:stream_chunk, "event: show\ndata: " <> _}
   end
 
-  test "the enrolled TLS route uses the push grant and delivers one id on focus and SSE", ctx do
-    assert {:ok, origin} =
+  test "enrolled devices can read focus and show one view within their account", ctx do
+    assert {:ok, agent} =
+             Relay.setup_device_certificate(
+               ctx.relay,
+               "A",
+               TLSFixtures.certificate_der!(ctx.certs, "a2")
+             )
+
+    assert :ok = Relay.setup_person(ctx.relay, "B")
+
+    assert {:ok, other} =
+             Relay.setup_device_certificate(
+               ctx.relay,
+               "B",
+               TLSFixtures.certificate_der!(ctx.certs, "b1")
+             )
+
+    report = %{"screen" => "inbox", "ttl_s" => 120}
+    assert {:ok, 200, _, false} = Writes.focus(ctx.relay, agent, report)
+    assert {:ok, 200, _, false} = Writes.focus(ctx.relay, other, report)
+
+    assert {:ok, %{"items" => [%{"item_id" => item}]}} =
+             ClientAPI.Reads.inbox(ctx.relay, ctx.reader)
+
+    assert {:ok, before} = ClientAPI.Reads.item(ctx.relay, ctx.reader, item)
+    rev = head(ctx.relay)
+    key = "00000000-0000-4000-8000-000000000017"
+    request = %{"item_id" => item, "target" => "message"}
+
+    for {cert, target} <- [{"a2", ctx.reader}, {"a1", agent}] do
+      conn = connect(ctx.port, ctx.certs, cert)
+      {conn, focus} = get_focus(conn)
+      assert focus.status == 200
+
+      assert MapSet.new(Enum.map(body(focus)["clients"], & &1["device_id"])) ==
+               MapSet.new([ctx.reader, agent])
+
+      {conn, show} = show_request(conn, key, Map.put(request, "device_id", target))
+      assert show.status == 200
+      assert %{"device_id" => ^target, "show_id" => show_id} = body(show)
+
+      assert {:ok, 200, %{"show" => %{"show_id" => ^show_id}}, false} =
+               Writes.focus(ctx.relay, target, report)
+
+      {conn, foreign} =
+        show_request(
+          conn,
+          "00000000-0000-4000-8000-000000000018",
+          Map.put(request, "device_id", other)
+        )
+
+      assert foreign.status == 404
+      Mint.HTTP.close(conn)
+    end
+
+    conn = connect(ctx.port, ctx.certs, "b1")
+    {conn, focus} = get_focus(conn)
+    assert focus.status == 200
+    assert %{"clients" => [%{"device_id" => ^other}]} = body(focus)
+
+    {conn, foreign_item} = show_request(conn, key, Map.put(request, "device_id", other))
+    assert foreign_item.status == 404
+    Mint.HTTP.close(conn)
+
+    assert {:ok, ^before} = ClientAPI.Reads.item(ctx.relay, ctx.reader, item)
+    assert head(ctx.relay) == rev
+
+    focus_conn = connect(ctx.port, ctx.certs, "a2")
+    show_conn = connect(ctx.port, ctx.certs, "a2")
+    assert :ok = Relay.revoke_device(ctx.relay, agent)
+    {focus_conn, focus} = get_focus(focus_conn)
+    assert focus.status == 401
+    {show_conn, show} = show_request(show_conn, key, Map.put(request, "device_id", ctx.reader))
+    assert show.status == 401
+    Mint.HTTP.close(focus_conn)
+    Mint.HTTP.close(show_conn)
+  end
+
+  defp get_focus(conn) do
+    assert {:ok, conn, ref} = Mint.HTTP.request(conn, "GET", "/v2/agent/focus", [], nil)
+    collect(conn, ref)
+  end
+
+  test "the enrolled TLS route delivers one id on focus and SSE", ctx do
+    assert {:ok, _origin} =
              Relay.setup_device_certificate(
                ctx.relay,
                "A",
@@ -247,15 +332,6 @@ defmodule AttentionServer.ClientAPIFeedShowTest do
 
     request = %{"item_id" => item, "target" => "chat"}
     key = "00000000-0000-4000-8000-000000000007"
-
-    {origin_conn, refused} = show_request(origin_conn, key, request)
-    assert refused.status == 403
-    assert body(refused)["error"] == "forbidden"
-
-    # Enable only the existing push switch on the certificate used by the request.
-    :sys.replace_state(ctx.relay, fn state ->
-      put_in(state.store.engine.devices[origin].push_view, true)
-    end)
 
     rev = head(ctx.relay)
     {origin_conn, accepted} = show_request(origin_conn, key, request)
@@ -329,7 +405,6 @@ defmodule AttentionServer.ClientAPIFeedShowTest do
              )
 
     :sys.replace_state(ctx.relay, fn state ->
-      state = put_in(state.store.engine.devices[origin].push_view, true)
       put_in(state.store.engine.devices[ctx.reader][:label], "Reader’s Tablet")
     end)
 
@@ -429,16 +504,12 @@ defmodule AttentionServer.ClientAPIFeedShowTest do
 
   # Enrolls the a2 certificate as an agent that may push views.
   defp enable_show_origin(ctx) do
-    assert {:ok, origin} =
+    assert {:ok, _origin} =
              Relay.setup_device_certificate(
                ctx.relay,
                "A",
                TLSFixtures.certificate_der!(ctx.certs, "a2")
              )
-
-    :sys.replace_state(ctx.relay, fn state ->
-      put_in(state.store.engine.devices[origin].push_view, true)
-    end)
 
     ctx
   end
@@ -615,16 +686,12 @@ defmodule AttentionServer.ClientAPIFeedShowTest do
   end
 
   test "one TLS connection retrying an in-flight key produces one show", ctx do
-    assert {:ok, origin} =
+    assert {:ok, _origin} =
              Relay.setup_device_certificate(
                ctx.relay,
                "A",
                TLSFixtures.certificate_der!(ctx.certs, "a2")
              )
-
-    :sys.replace_state(ctx.relay, fn state ->
-      put_in(state.store.engine.devices[origin].push_view, true)
-    end)
 
     writer = controlled_writer(ctx, head(ctx.relay))
 

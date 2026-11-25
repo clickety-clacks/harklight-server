@@ -27,7 +27,6 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
     ChangeLog,
     ClientAPI,
     ClientAPIFeedClient,
-    DeviceIdentity,
     JSON,
     Relay,
     TLSFixtures
@@ -728,7 +727,7 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
       {conn, feed, [%{event: "message"} = event]} ->
         agent_messages(conn, feed, count - 1, [event | acc])
 
-      {conn, feed, [%{event: kind}]} when kind in ["heartbeat", "entry"] ->
+      {conn, feed, [%{event: kind}]} when kind in ["heartbeat", "entry", "focus"] ->
         agent_messages(conn, feed, count, acc)
     end
   end
@@ -917,16 +916,15 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
       {conn, feed, [%{event: "entry", data: %{"kind" => "reply", "author" => "person"}} = event]} ->
         {conn, feed, event}
 
-      {conn, feed, [%{event: kind}]} when kind in ["heartbeat", "message", "entry"] ->
+      {conn, feed, [%{event: kind}]} when kind in ["heartbeat", "message", "entry", "focus"] ->
         next_person_reply(conn, feed, attempts - 1)
     end
   end
 
-  test "a live agent feed starts and stops focus when its see grant changes", ctx do
+  test "an enrolled device gets a focus snapshot and changes on its agent feed", ctx do
     Application.put_env(:attention_server, :client_api_feed_heartbeat_ms, 80)
     on_exit(fn -> Application.delete_env(:attention_server, :client_api_feed_heartbeat_ms) end)
     owner_cert = TLSFixtures.certificate_der!(ctx.certs, "a2")
-    {:ok, owner} = DeviceIdentity.from_certificate(owner_cert)
     assert {:ok, person} = Relay.operator_bootstrap(ctx.relay, owner_cert)
 
     assert {:ok, agent} =
@@ -943,12 +941,6 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
     {conn, feed} = await_open(conn, feed)
     assert feed.status == 200
 
-    {conn, feed, [beat]} = events(conn, feed, 1)
-    assert beat == %{event: "heartbeat", data: %{}}
-
-    assert :ok =
-             Relay.save_dashboard_focus_permission(ctx.relay, person, owner, agent, :see, true)
-
     {conn, feed, focus} = next_focus(conn, feed, 10)
     assert focus == %{event: "focus", data: %{"focus" => %{"clients" => []}}}
 
@@ -964,15 +956,9 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
 
     refute Map.has_key?(focus, :id)
 
-    assert :ok =
-             Relay.save_dashboard_focus_permission(ctx.relay, person, owner, agent, :see, false)
-
-    assert {:ok, 200, _, false} =
-             Writes.focus(ctx.relay, principal, %{"screen" => "settings", "ttl_s" => 120})
-
-    {_conn, feed, beats} = events(conn, feed, 2)
-    assert beats == List.duplicate(%{event: "heartbeat", data: %{}}, 2)
-    refute feed.done
+    assert :ok = Relay.revoke_device(ctx.relay, agent)
+    {_conn, _feed, closing} = until_closing(conn, feed)
+    assert closing == %{event: "closing", data: %{"reason" => "revoked"}}
   end
 
   test "an agent storage failure closes the SSE feed and leaves Relay alive", ctx do

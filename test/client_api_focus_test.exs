@@ -59,14 +59,6 @@ defmodule AttentionServer.ClientAPIFocusTest do
                }
              })
 
-    # The agent may see focus and push views, as an owner's switches allow.
-    :sys.replace_state(relay, fn state ->
-      engine = state.store.engine
-      device = %{engine.devices[@agent] | see_focus: true, push_view: true}
-      devices = Map.put(engine.devices, @agent, device)
-      %{state | store: %{state.store | engine: %{engine | devices: devices}}}
-    end)
-
     relay
   end
 

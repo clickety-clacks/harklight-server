@@ -108,7 +108,7 @@ defmodule AttentionServer.ClientAPI.AgentShow do
     scope = Idempotency.agent_scope(person, agent)
     receipt_key = {scope, key}
 
-    with :ok <- permitted(state, person, agent, :push_view),
+    with :ok <- permitted(state, person, agent),
          {:ok, nil} <- lookup(state, scope, key) do
       create_show(state, person, agent, body, {show_id, result_ref, caller}, receipt_key, digest)
     else
@@ -234,13 +234,11 @@ defmodule AttentionServer.ClientAPI.AgentShow do
 
   defp valid_id?(id), do: is_binary(id) and byte_size(id) in 1..128
 
-  defp permitted(state, person, agent, permission) do
+  defp permitted(state, person, agent) do
     with true <- state.store.change_log,
-         {:ok, ^person} <- Engine.authorized_person(state.store.engine, agent),
+         %{person: ^person, revoked: false} <- Map.get(state.store.engine.devices, agent),
          false <- Engine.delivery_stopped?(state.store.engine, person) do
-      if get_in(state.store.engine.devices, [agent, permission]) == true,
-        do: :ok,
-        else: {:error, :forbidden}
+      :ok
     else
       true -> {:error, :account_paused}
       false -> {:error, :not_found}

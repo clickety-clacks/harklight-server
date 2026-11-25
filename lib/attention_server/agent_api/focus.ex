@@ -11,18 +11,6 @@ defmodule AttentionServer.AgentAPI.Focus do
 
   def snapshot(conn, ctx), do: Reads.respond(conn, get(ctx.relay, ctx.principal))
 
-  def notify_grant(person, key) do
-    registry = AttentionServer.ChangeLog.Registry
-
-    if Process.whereis(registry) do
-      Registry.dispatch(registry, {:agent, person, key}, fn watchers ->
-        for {pid, _} <- watchers, do: send(pid, :agent_focus_granted)
-      end)
-    end
-
-    :ok
-  end
-
   def get(relay, %{kind: :device, person: person, key: key}),
     do: GenServer.call(relay, {:client_api, __MODULE__, {:get, person, key}}, :infinity)
 

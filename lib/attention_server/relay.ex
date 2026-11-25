@@ -70,14 +70,6 @@ defmodule AttentionServer.Relay do
         :infinity
       )
 
-  def save_dashboard_focus_permission(server, person, owner_key, device_key, permission, enabled),
-    do:
-      GenServer.call(
-        server,
-        {:save_dashboard_focus_permission, person, owner_key, device_key, permission, enabled},
-        :infinity
-      )
-
   def dashboard_prioritization(server, person, owner_key, configured_owner_person),
     do:
       GenServer.call(
@@ -931,76 +923,6 @@ defmodule AttentionServer.Relay do
   end
 
   defp dispatch_call(
-         {:save_dashboard_focus_permission, person, key, device_key, permission, enabled},
-         _from,
-         state
-       )
-       when permission in [:see, :push] and is_boolean(enabled) do
-    device =
-      case Map.get(state.store.engine.devices, device_key) do
-        %{person: ^person, see_focus: see_focus, push_view: push_view} ->
-          {see_focus, push_view}
-
-        %{person: ^person} = device ->
-          {Map.get(device, :see_focus, false), Map.get(device, :push_view, false)}
-
-        _ ->
-          {false, false}
-      end
-
-    {see_focus, push_view} =
-      case permission do
-        :see -> {enabled, elem(device, 1)}
-        :push -> {elem(device, 0), enabled}
-      end
-
-    case Engine.owner_set_focus_permissions(
-           state.store.engine,
-           person,
-           key,
-           device_key,
-           see_focus,
-           push_view
-         ) do
-      {:ok, next_engine} ->
-        if next_engine == state.store.engine do
-          next =
-            if permission == :see and not enabled,
-              do: close_focus_streams(state, device_key),
-              else: state
-
-          {:reply, :ok, next}
-        else
-          case commit(
-                 state.store,
-                 next_engine,
-                 %{person: person, actor: key, action: "dashboard_focus_permission"}
-               ) do
-            {:ok, store} ->
-              next = %{state | store: store}
-
-              next =
-                if permission == :see and not enabled,
-                  do: close_focus_streams(next, device_key),
-                  else: next
-
-              if permission == :see and enabled do
-                AttentionServer.AgentAPI.Focus.notify_grant(person, device_key)
-              end
-
-              {:reply, :ok, next}
-
-            _ ->
-              {:reply, {:error, :storage_unavailable}, state}
-          end
-        end
-
-      {:error, reason} ->
-        {:reply, {:error, reason}, state}
-    end
-  end
-
-  defp dispatch_call(
          {:dashboard_prioritization, person, key, configured_owner_person},
          _from,
          state
@@ -1182,7 +1104,7 @@ defmodule AttentionServer.Relay do
     do: handler.handle_call(request, from, state)
 
   defp dispatch_call({:focus_stream_attach, key, worker}, _from, state) when is_pid(worker) do
-    case focus_authorized_person(state.store.engine, key, :see) do
+    case focus_device_person(state.store.engine, key) do
       {:ok, person} ->
         if existing = Map.get(state.focus_streams, worker) do
           Process.demonitor(existing.monitor, [:flush])
@@ -4219,24 +4141,18 @@ defmodule AttentionServer.Relay do
 
   @doc false
   def agent_focus(state, person, key) do
-    case focus_authorized_person(state.store.engine, key, :see) do
+    case focus_device_person(state.store.engine, key) do
       {:ok, ^person} -> {:ok, focus_list(state, person)}
       _ -> {:error, :forbidden}
     end
   end
 
-  defp focus_authorized_person(engine, key, permission) do
-    with {:ok, person} <- Engine.authorized_person(engine, key),
-         %{person: ^person, revoked: false} = device <- Map.get(engine.devices, key),
-         true <- Map.get(device, focus_permission_field(permission), false) do
-      {:ok, person}
-    else
+  defp focus_device_person(engine, key) do
+    case Map.get(engine.devices, key) do
+      %{person: person, revoked: false} -> {:ok, person}
       _ -> {:error, :forbidden}
     end
   end
-
-  defp focus_permission_field(:see), do: :see_focus
-  defp focus_permission_field(:push), do: :push_view
 
   defp focus_list(state, person) do
     client_keys =
@@ -4494,7 +4410,7 @@ defmodule AttentionServer.Relay do
     do: handle_view_show(state, key, Map.put(request, :show_id, show_id))
 
   defp handle_view_show(state, key, request) do
-    case focus_authorized_person(state.store.engine, key, :push) do
+    case focus_device_person(state.store.engine, key) do
       {:ok, person} -> validate_and_send_show(state, person, request)
       error -> {error, state}
     end

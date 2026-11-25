@@ -646,8 +646,8 @@ Every write that succeeds answers `200`, or `201` for `POST /v2/files`, with a
 
 ## 5.1 Focus and held shows
 
-Focus and push-a-view keep today's behavior (the focus spec as shipped).
-Only their transport changes, and they are device-only.
+Focus reports and shows are device-only. Any enrolled device can read its
+account's focus and send a show to a viewer device on that account.
 
 - **`PUT /v2/devices/me/focus`** takes today's report fields:
   - `screen`: today's set, including `not_in_front`;
@@ -666,16 +666,16 @@ Only their transport changes, and they are device-only.
   in-front screen. An unchanged refresh maintains liveness without changing
   rank or default-target order. A lapsed `ttl_s` ends focus, listing and
   targetability immediately, like today's
-  session end. A fresh accepted report restores them. A device is opted in to
-  shows only by an accepted focus report, and `signed_out` opts it out.
+  session end. A fresh accepted report restores listing and targetability.
+  An accepted report makes the device available to receive a show.
+  A `signed_out` report ends that availability.
 - **Held shows** are memory-only. They are **never change-log rows**, and
   nothing about focus or shows is stored. A show is
   `{show_id, device_id, item_id, target: "message" | "chat", held_ms}`, where
   `held_ms` is its age when the Server writes it. Each show addresses exactly
   one device. An accepted show survives a `ttl_s` lapse without expiring.
   The server holds the latest show until consumption, replacement, device
-  removal or revocation, or server restart. Turning off an agent's see or
-  push grant leaves accepted shows intact.
+  removal or revocation, or server restart.
 
   The device receives it in `WriteResult.show` on its next focus write, or
   while it holds an open SSE feed, as an id-less `event: show` with a `Show`
@@ -1157,12 +1157,10 @@ agents with existing data. Clients apply newer versions of each resource.
   Answers and other terminal actions are read from `SentMessage.terminal`.
   A message without a session has no agent conversation and returns an
   empty entry page.
-- Focus requires a see grant. The listing follows §5.1, with current devices
-  ordered by last focus activity and then by device ID. A lapsed report ends
-  listing and targetability immediately. See and push grants are independent
-  and off by default. Focus is scoped to the enrolled key's account. A
-  caller without the see grant receives `403 forbidden`. The v2 projection
-  maps today's `client_id` to `device_id`, `reported_at` to
+- **`GET /v2/agent/focus`** lists current focus for the enrolled device's
+  account (§5.1), ordered by last focus activity and then by device ID.
+  A lapsed report ends listing and targetability immediately. The v2
+  projection maps `client_id` to `device_id`, `reported_at` to
   `reported_at_ms`, `sender_id` plus `message_id` to `item_id`, and
   `visible_event_id` to `visible_entry_id`.
 
@@ -1509,16 +1507,15 @@ Writes return 200 unless the table says otherwise. Each response schema requires
 - **End session.** `404 not_found` for an unknown session of this enrolled
   key. Otherwise it marks the session gone for the person. The affected
   messages change availability on the feed and keep their conversations.
-- **Show.** A push grant is required (`403 forbidden` without it). The item
-  must be in the same account. The server resolves an explicit
-  `device_id` or `device_name` under the push grant alone. Supply at most
-  one of them. Name matching is case-insensitive and maps curly apostrophes
+- **Show.** An enrolled device can show an item from its account on one
+  viewer device in that account. Supply at most one of `device_id` and
+  `device_name`. Name matching is case-insensitive and maps curly apostrophes
   to straight apostrophes (`Relay.normalized_device_name`). With neither
   selector, the server chooses the most
   recently active listed device when the request is made. An unknown item
   or missing target device answers `404 not_found`. The response returns
   the resolved device name and delivery state. The state is `sent` when
-  the resolved target device is opted in and listed, its feed writer hands
+  the resolved target device is listed, its feed writer hands
   the ephemeral `show` frame to the device's open SSE stream, and
   `Plug.Conn.chunk` returns success. The handler waits for the writer's
   result up to the shared request timeout. Otherwise the state is `held`,
@@ -1704,10 +1701,8 @@ the current delivered state. Revocation grants no access to another key.
 - A person sees the agent or session as listening while there is a covering
   open feed, or a covering batch was fetched in the last 60 seconds. Chat
   is stored and delivered on the next read regardless of feed activity.
-- SSE may send `event: focus` with an `AgentFocusEvent` to a key with the
-  see grant. It has no `id:` line and is excluded from batches and replay.
-  Switching the see grant off stops focus events within 15 seconds.
-  The remaining feed continues.
+- SSE may send `event: focus` with an `AgentFocusEvent` for the enrolled
+  device's account. It has no `id:` line and is excluded from batches and replay.
 - Change-log verification replays the retained agent log from empty and
   compares the resulting sent-message map with a fresh paged read.
 
