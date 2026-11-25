@@ -81,11 +81,14 @@ defmodule AttentionServer.SkillsBuildTest do
             {[hosted_testflight_url: url], open},
             {[hosted_testflight_url: "https://example.com/join/test-invitation"], closed}
           ] do
-        assert_skill(
-          "/agent-skills/harklight-agent-saas/SKILL.md",
-          settings ++ testflight_settings,
-          before_app <> paragraph <> after_app
-        )
+        served_guide =
+          assert_skill(
+            "/agent-skills/harklight-agent-saas/SKILL.md",
+            settings ++ testflight_settings,
+            before_app <> paragraph <> after_app
+          )
+
+        refute served_guide =~ "public beta"
       end
     end
   end
@@ -101,5 +104,7 @@ defmodule AttentionServer.SkillsBuildTest do
     assert response.status == 200
     assert response.resp_body == expected
     assert Plug.Conn.get_resp_header(response, "content-type") == ["text/plain; charset=utf-8"]
+
+    response.resp_body
   end
 end
