@@ -1,3 +1,20 @@
+# Harklight Server v0.2.12
+
+The bundled Harklight Web is 0.2.5. It looks closer to the iPhone app, shows
+FYIs as their own rows with an ID tag, lets you change the sort, and closes the
+chat panel on narrow windows. It also reports the page you are on as focus, once
+a Server with the browser focus route is installed; until then it stops quietly.
+
+## Upgrade and recovery
+
+The Server continues to use FORMAT29, and upgrading from v0.2.0 through v0.2.11
+requires no store format migration. Follow the backup, upgrade, and recovery
+steps in `SELF_HOST.md`. The Server code is unchanged from v0.2.11.
+
+**Compatibility.** Harklight Server 0.2.12 uses protocol 0.2 and keeps the
+client API of v0.2.11. Harklight Agent 0.2.4 is the matching Agent release.
+Harklight app 0.2.0 and Harklight Web 0.2.5 are the client baseline.
+
 # Harklight Server v0.2.11
 
 Any enrolled device or registered Granted Agent can now search, read and
