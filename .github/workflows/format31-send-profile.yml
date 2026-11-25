@@ -16,6 +16,7 @@ jobs:
       matrix:
         runtime: [prior, candidate]
         fixture:
+          - { name: A, shape: '2400 100000 1300 300 400' }
           - { name: C, shape: '50000 500000 1300 0 400' }
     env:
       ATTENTION_SERVER_ENABLE: '0'
@@ -25,7 +26,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-          fetch-depth: 2
+          fetch-depth: 0
       - if: matrix.runtime == 'candidate'
         uses: erlef/setup-beam@v1
         with:
@@ -45,9 +46,10 @@ jobs:
         run: |
           results="$RUNNER_TEMP/measurements"
           mkdir -p "$results" "$RUNNER_TEMP/prior"
-          git rev-parse HEAD HEAD^^ > "$results/commits.txt"
+          implementation=8cefff7880b0e96b5d75e6e2ed5e387714c44e0e
+          git rev-parse HEAD "$implementation" > "$results/commits.txt"
           awk '/^(MemTotal|MemAvailable):/' /proc/meminfo > "$results/capacity.txt"
-          reference="$(git log -1 --format=%ct HEAD^)"
+          reference="$(git log -1 --format=%ct "$implementation")"
           probe="$GITHUB_WORKSPACE/scripts/format31-rehearsal.exs"
           fixture="$RUNNER_TEMP/fixture"
           archive=harklight-server-0.2.18-linux-x86_64.tar.gz
