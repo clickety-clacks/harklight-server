@@ -1217,6 +1217,16 @@ defmodule AttentionServer.ClientAPI.Resources do
 
   defp delivery_effect(_, _, _, _), do: nil
 
+  @doc false
+  def delivery_target(%{"kind" => "receipt", "delivered" => true, "event_id" => id}), do: id
+
+  def delivery_target(%{"kind" => "delivery_ack", "stage" => stage, "event_id" => id})
+      when stage in ["ack1", "ack2"],
+      do: id
+
+  def delivery_target(%{"kind" => "acted", "event_id" => id}), do: id
+  def delivery_target(_), do: nil
+
   defp entry(item_id, record, seq, payload, context) do
     key = {:entry, entry_id(seq)}
 

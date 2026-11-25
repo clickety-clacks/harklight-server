@@ -85,7 +85,7 @@ defmodule AttentionServer.OperatorToolTest do
     path = Path.join(dir, "relay.sqlite3")
     cert = Path.join(certs, "a1.pem")
     person = "00000000-0000-4000-8000-000000000001"
-    assert {:ok, store} = Store.open(path)
+    assert {:ok, store} = Store.open_relay(path)
 
     assert :ok =
              Exqlite.Sqlite3.execute(

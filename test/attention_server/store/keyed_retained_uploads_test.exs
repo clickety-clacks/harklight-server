@@ -69,6 +69,7 @@ defmodule AttentionServer.Store.KeyedRetainedUploadsTest do
     assert {:error, :not_found} = Relay.fetch_file(relay, "reader-b", id)
     assert File.read!(file) == @bytes
     assert :ok = GenServer.stop(relay)
+    :ok = AttentionServer.PreChangeLogStore.snapshot_fixture(path)
 
     %{path: path, upload_path: file, id: id}
   end

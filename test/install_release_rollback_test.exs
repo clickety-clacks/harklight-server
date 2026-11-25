@@ -13,7 +13,7 @@ defmodule AttentionServer.InstallReleaseRollbackTest do
 
     File.mkdir_p!(dir)
     store_path = Path.join(dir, "relay.sqlite3")
-    create_format30_store!(store_path)
+    create_format_30_store!(store_path)
     assert store_format(store_path) == 30
     on_exit(fn -> File.rm_rf!(dir) end)
 
@@ -33,6 +33,24 @@ defmodule AttentionServer.InstallReleaseRollbackTest do
 
     assert status == 0, output
     assert store_format(context.store_path) == 30
+  end
+
+  @tag timeout: 30_000
+  test "conversion failure restores the backup without starting the candidate", context do
+    {output, status} = run_installer("conversion-failure", context)
+
+    assert status == 0, output
+    assert sha256_file(context.store_path) == context.store_sha256
+  end
+
+  for mode <- ~w(interrupted-conversion interrupted-switch) do
+    @tag timeout: 30_000
+    test "an #{mode} retry retains the original snapshot backup", context do
+      {output, status} = run_installer(unquote(mode), context)
+
+      assert status == 0, output
+      assert sha256_file(context.store_path) == context.store_sha256
+    end
   end
 
   @tag timeout: 30_000
@@ -72,13 +90,12 @@ defmodule AttentionServer.InstallReleaseRollbackTest do
     )
   end
 
-  defp create_format30_store!(path) do
-    assert {:ok, initial} = Store.open(path)
+  defp create_format_30_store!(path) do
+    assert {:ok, initial} = Store.open(path, :snapshot)
     assert {:ok, engine} = Engine.setup_person(initial.engine, "person-a")
-    assert {:ok, seeded} =
-             Store.commit(initial, engine, %{person: "person-a", actor: "fixture", action: "seed"})
-
-    assert :ok = Store.close(seeded)
+    assert {:ok, committed} =
+             Store.commit(initial, engine, %{person: "person-a", actor: "operator", action: "fixture"})
+    assert :ok = Store.close(committed)
   end
 
   defp store_format(path) do

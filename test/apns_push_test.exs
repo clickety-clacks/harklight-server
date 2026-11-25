@@ -94,7 +94,6 @@ defmodule AttentionServer.APNSPushTest do
   }
 
   alias AttentionServer.PushDispatcher.Worker
-  alias Exqlite.Sqlite3
 
   @provider_profile "harklight-sandbox"
   @production_profile "harklight-production"
@@ -2260,36 +2259,19 @@ defmodule AttentionServer.APNSPushTest do
 
   # Make the queued push eligible immediately on a cold restart.
   defp make_queued_push_eligible(path) do
-    assert {:ok, db} = Sqlite3.open(path)
-    assert {:ok, select} = Sqlite3.prepare(db, "SELECT payload FROM relay_state WHERE id = 1")
-    assert {:row, [payload]} = Sqlite3.step(db, select)
-    assert :ok = Sqlite3.release(db, select)
+    assert :ok = AttentionServer.PreChangeLogStore.snapshot_fixture(path, 30, fn engine ->
+      past = System.system_time(:millisecond) - 1
 
-    {:attention_relay_state, _format, engine} = :erlang.binary_to_term(payload, [:safe])
-    past = System.system_time(:millisecond) - 1
+      bindings =
+        Map.new(engine.push_bindings, fn {key, binding} ->
+          next_at = if is_integer(binding.next_at), do: past, else: nil
+          {key, %{binding | next_at: next_at}}
+        end)
 
-    bindings =
-      Map.new(engine.push_bindings, fn {key, binding} ->
-        next_at = if is_integer(binding.next_at), do: past, else: nil
-        {key, %{binding | next_at: next_at}}
-      end)
+      %{engine | push_bindings: bindings}
+    end)
 
-    engine = %{engine | push_bindings: bindings}
-
-    payload = :erlang.term_to_binary({:attention_relay_state, 30, engine}, [{:compressed, 6}])
-
-    assert {:ok, update} =
-             Sqlite3.prepare(db, "UPDATE relay_state SET payload = ?, checksum = ? WHERE id = 1")
-
-    assert :ok =
-             Sqlite3.bind(update, [
-               {:blob, payload},
-               {:blob, :crypto.hash(:sha256, payload)}
-             ])
-
-    assert :done = Sqlite3.step(db, update)
-    assert :ok = Sqlite3.release(db, update)
-    assert :ok = Sqlite3.close(db)
+    assert :ok = AttentionServer.PreChangeLogStore.convert_fixture(path)
   end
 
   defp available_port do

@@ -1,45 +1,27 @@
 defmodule AttentionServer.Store.ClientDataMigration do
   @moduledoc false
 
-  alias AttentionServer.{Message, RouteBIndex}
+  alias AttentionServer.{Engine, Message}
 
   def prepare(engine) do
-    messages =
-      update_values(engine.messages, fn record ->
-        record = Map.update!(record, :message, &Message.type_seen_only/1)
+    {next, :ok, touched} =
+      Engine.with_touches(engine, fn tracked ->
+        next =
+          tracked
+          |> update_rows(:messages, &type_record/1)
+          |> update_rows(:conversation_events, &type_event/1)
+          |> type_origin_feed_revisions()
+          |> mark_chat_without_receipts()
 
-        case record do
-          %{revisions: revisions} ->
-            %{record | revisions: update_values(revisions, &Message.type_seen_only/1)}
-
-          _ ->
-            record
-        end
+        {next, :ok}
       end)
 
-    conversations =
-      update_values(engine.conversation_events, fn event ->
-        Map.update!(event, :payload, &type_revision/1)
-      end)
-
-    feeds =
-      update_values(engine.origin_feeds, fn feed ->
-        %{feed | entries: update_values(feed.entries, &type_revision/1)}
-      end)
-
-    %{
-      engine
-      | messages: messages,
-        conversation_events: mark_chat_without_receipts(engine, conversations),
-        origin_feeds: feeds
-    }
+    {next, touched}
   end
 
-  # An old transport receipt or ACK1 proved service but carried no handoff
-  # expectation. A newer service declaration or explicit outcome supersedes it.
-  defp mark_chat_without_receipts(engine, conversations) do
+  defp mark_chat_without_receipts(engine) do
     {legacy, authoritative} =
-      Enum.reduce(conversations, {MapSet.new(), MapSet.new()}, fn
+      Enum.reduce(engine.conversation_events, {MapSet.new(), MapSet.new()}, fn
         {_, %{key: key, payload: %{"event_id" => id} = payload}}, {old, known}
         when is_binary(id) ->
           target = {key, id}
@@ -50,23 +32,64 @@ defmodule AttentionServer.Store.ClientDataMigration do
             nil -> {old, known}
           end
 
-        _, acc ->
-          acc
+        _, acc -> acc
       end)
 
-    legacy
-    |> MapSet.difference(authoritative)
-    |> Enum.reduce(conversations, fn {{person, _, _} = key, id}, acc ->
-      seq = RouteBIndex.entry_position(engine.route_b_index, key, id)
+    targets = MapSet.difference(legacy, authoritative)
+    if MapSet.size(targets) == 0, do: engine, else: mark_chat_targets(engine, targets)
+  end
 
-      case Map.get(acc, {person, seq}) do
-        %{payload: %{"kind" => "discussion", "author" => "person"} = payload} = fact ->
-          Map.put(acc, {person, seq}, %{fact | payload: Map.put(payload, "receipt_expected", false)})
-
-        _ ->
+  # Stopped conversion has not enabled the agent feed's entry-position index.
+  # Match the affected identifiers directly against their stored Chat facts.
+  defp mark_chat_targets(engine, targets) do
+    Enum.reduce(engine.conversation_events, engine, fn
+      {position, %{key: key, payload: %{"kind" => "discussion", "author" => "person", "event_id" => id} = payload} = fact}, acc ->
+        if MapSet.member?(targets, {key, id}) do
+          updated = %{fact | payload: Map.put(payload, "receipt_expected", false)}
+          Engine.put_row(acc, :conversation_events, position, updated)
+        else
           acc
+        end
+
+      _, acc -> acc
+    end)
+  end
+
+  defp type_event(event), do: Map.update!(event, :payload, &type_revision/1)
+
+  defp type_record(record) do
+    record = Map.update!(record, :message, &Message.type_seen_only/1)
+
+    case record do
+      %{revisions: revisions} ->
+        %{record | revisions: update_values(revisions, &Message.type_seen_only/1)}
+
+      _ ->
+        record
+    end
+  end
+
+  defp update_rows(engine, field, update) do
+    Enum.reduce(Map.fetch!(engine, field), engine, fn {key, value}, acc ->
+      case update.(value) do
+        ^value -> acc
+        next -> Engine.put_row(acc, field, key, next)
       end
     end)
+  end
+
+  defp type_origin_feed_revisions(engine) do
+    for {scope, feed} <- engine.origin_feeds, {seq, entry} <- feed.entries, reduce: engine do
+      acc ->
+        case type_revision(entry) do
+          ^entry ->
+            acc
+
+          typed ->
+            put_in(acc.origin_feeds[scope].entries[seq], typed)
+            |> Engine.touch_fact({:origin_feed, scope, {:entry, seq}})
+        end
+    end
   end
 
   defp update_values(map, update) do

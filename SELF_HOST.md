@@ -446,6 +446,51 @@ second one. It carries no source ruling authority.
 
 ## Upgrade or rollback
 
+### Releases that write FORMAT31
+
+Check the release notes before upgrading. A FORMAT31 release writes individual
+SQLite records. Its normal startup creates a row store for a fresh install and
+requires a stopped-store conversion for existing FORMAT30 databases. For an
+older store, first upgrade to a published Harklight Server v0.2.16 through
+v0.2.20 release. Start that release to write FORMAT30, then stop it and follow
+the FORMAT31 upgrade steps.
+
+The packaged release installer stops the service and takes its full
+mutable-root backup before running the converter. It switches the release and
+starts the service only after conversion succeeds. On conversion failure it
+uses the same restore and prior-release startup as a failed candidate start.
+
+For a manual upgrade, stop the Server and take a complete private backup before
+running the new package's converter. The backup must include the SQLite file,
+any associated SQLite journal files, the uploads directory, configuration and
+keys. Keep it outside the writable state directory. Use the verified package:
+
+```sh
+ATTENTION_SERVER_ENABLE=0 /path/to/new-release/bin/harklight store convert-stopped \
+  /path/to/existing/state/relay.sqlite3
+```
+
+The converter checks host capacity before decoding the snapshot. If it reports
+`fit not established`, keep the Server stopped and preserve the backup. Copy
+the stopped state directory to a larger isolated Linux system with sufficient
+memory and disk. Run the same verified package and command against that copy.
+Copy the converted database and uploads back together before starting the
+new release with the existing configuration. A fit refusal on the larger
+system means the store is outside the measured limits. A refusal for an
+unsupported or unreadable header requires resolving the store version or
+recovering a readable backup before proceeding.
+
+Conversion is transactional. An interruption before commit leaves the old
+snapshot for a retry from the beginning. A retry that finds FORMAT31 skips
+conversion. Retry an interrupted install with the same verified release. The
+installer keeps the original snapshot backup through the retry and retains it
+after candidate readiness. Do not rerun bootstrap against converted or restored state. To
+return to the previous snapshot release, stop the Server, restore the complete
+pre-upgrade backup and run the release that wrote it. Restoring that backup
+discards every later write and leaves external deliveries in place.
+
+### Earlier releases that write snapshots
+
 For a manual upgrade, stop the old process and back up the complete private
 state directory, including the database and keys. Verify the package checksum
 and extract it into a separate versioned directory. Keep the state path, trust

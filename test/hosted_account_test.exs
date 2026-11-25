@@ -354,16 +354,16 @@ defmodule AttentionServer.HostedAccountTest do
       relay = start_relay(certs, dir, dashboard_origin: @origin)
       assert {:ok, person} = Relay.hosted_account_create(relay, "acct-delivery-storage")
 
-      assert {:ok, db} = Sqlite3.open(Path.join(dir, "relay.sqlite3"))
+      :sys.replace_state(relay, fn state ->
+        assert :ok =
+                 Sqlite3.execute(
+                   state.store.db,
+                   "CREATE TRIGGER reject_delivery_state BEFORE UPDATE ON relay_record_generation " <>
+                     "BEGIN SELECT RAISE(ABORT, 'forced storage failure'); END;"
+                 )
 
-      assert :ok =
-               Sqlite3.execute(
-                 db,
-                 "CREATE TRIGGER reject_delivery_state BEFORE UPDATE OF payload ON relay_state " <>
-                   "BEGIN SELECT RAISE(ABORT, 'forced storage failure'); END;"
-               )
-
-      assert :ok = Sqlite3.close(db)
+        state
+      end)
 
       assert {503, %{"error" => "storage_unavailable"}} =
                hosted_post(relay, "/delivery-state", %{

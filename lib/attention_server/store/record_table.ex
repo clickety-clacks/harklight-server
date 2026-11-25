@@ -1,6 +1,7 @@
 defmodule AttentionServer.Store.RecordTable do
   @moduledoc false
 
+  alias AttentionServer.Store.RecordCodec
   alias Exqlite.Sqlite3
 
   @schema """
@@ -11,8 +12,10 @@ defmodule AttentionServer.Store.RecordTable do
   CREATE TABLE relay_records (
     key BLOB PRIMARY KEY NOT NULL,
     payload BLOB NOT NULL,
-    checksum BLOB NOT NULL
+    checksum BLOB NOT NULL,
+    account INTEGER NOT NULL DEFAULT 0
   ) WITHOUT ROWID;
+  CREATE INDEX relay_records_account ON relay_records (key) WHERE account = 1;
   """
 
   # Called once, inside the format conversion transaction.
@@ -36,6 +39,30 @@ defmodule AttentionServer.Store.RecordTable do
     end
   end
 
+  # The consumer runs before the statement is released. It can stop early
+  # without retaining the remaining records or leaking the SQLite cursor.
+  def scan(db, consume) do
+    statement(db, "SELECT key, payload, checksum FROM relay_records", [], fn stmt ->
+      consume.(Stream.unfold(stmt, &next_row(db, &1, fn [key, payload, hash] -> {key, payload, hash} end)))
+    end)
+  end
+
+  def scan_keys(db, consume) do
+    statement(db, "SELECT key FROM relay_records", [], fn stmt ->
+      consume.(Stream.unfold(stmt, &next_row(db, &1, fn [key] -> key end)))
+    end)
+  end
+
+  defp next_row(_db, :done, _convert), do: nil
+
+  defp next_row(db, stmt, convert) do
+    case Sqlite3.step(db, stmt) do
+      {:row, values} -> {convert.(values), stmt}
+      :done -> nil
+      error -> {error, :done}
+    end
+  end
+
   # append receives this connection and the new generation and performs SQL
   # only. It must return {:ok, metadata} or {:error, reason}. Callers publish
   # the Engine and notify subscribers after commit returns success.
@@ -44,8 +71,12 @@ defmodule AttentionServer.Store.RecordTable do
   end
 
   def seed(db, generation, rows) do
+    with {:ok, _count} <- seed_count(db, generation, rows), do: :ok
+  end
+
+  def seed_count(db, generation, rows) do
     with :ok <- create(db, generation) do
-      write_records(db, Stream.map(rows, &{:put, &1}))
+      write_records(db, Stream.map(rows, &{:insert, &1}))
     end
   end
 
@@ -80,7 +111,7 @@ defmodule AttentionServer.Store.RecordTable do
              [expected_generation]
            ),
          :ok <- require_changed_generation(db),
-         :ok <- write_records(db, records),
+         {:ok, _count} <- write_records(db, records),
          {:ok, metadata} <- append_rows(append, db, expected_generation + 1) do
       {:ok, metadata}
     end
@@ -110,34 +141,56 @@ defmodule AttentionServer.Store.RecordTable do
   end
 
   defp write_records(db, records) do
-    Enum.reduce_while(records, :ok, fn record, :ok ->
+    Enum.reduce_while(records, {:ok, 0}, fn record, {:ok, count} ->
       case write_record(db, record) do
-        :ok -> {:cont, :ok}
+        :ok -> {:cont, {:ok, count + 1}}
         error -> {:halt, error}
       end
     end)
   end
 
-  defp write_record(db, {:put, {key, payload, checksum}}) do
-    run(
-      db,
-      """
-      INSERT INTO relay_records (key, payload, checksum) VALUES (?, ?, ?)
-      ON CONFLICT (key) DO UPDATE SET payload = excluded.payload, checksum = excluded.checksum
-      """,
-      [{:blob, key}, {:blob, payload}, {:blob, checksum}]
-    )
+  defp write_record(db, {:insert, {key, payload, checksum}}) do
+    account = case RecordCodec.decode_key(key) do
+      {:ok, address} -> if(RecordCodec.account?(address), do: 1, else: 0)
+      _ -> 0
+    end
+
+    run(db, "INSERT INTO relay_records (key, payload, checksum, account) VALUES (?, ?, ?, ?)", [
+      {:blob, key},
+      {:blob, payload},
+      {:blob, checksum},
+      account
+    ])
+  end
+
+  defp write_record(db, {:update, {key, payload, checksum}}) do
+    with :ok <-
+           run(db, "UPDATE relay_records SET payload = ?, checksum = ? WHERE key = ?", [
+             {:blob, payload},
+             {:blob, checksum},
+             {:blob, key}
+           ]),
+         do: require_record(db)
   end
 
   defp write_record(db, {:delete, key}) do
-    run(db, "DELETE FROM relay_records WHERE key = ?", [{:blob, key}])
+    with :ok <- run(db, "DELETE FROM relay_records WHERE key = ?", [{:blob, key}]),
+         do: require_record(db)
   end
 
-  defp select(db, sql) do
-    statement(db, sql, [], &Sqlite3.fetch_all(db, &1))
+  defp require_record(db) do
+    case Sqlite3.changes(db) do
+      {:ok, 1} -> :ok
+      {:ok, 0} -> {:error, :missing_record}
+      error -> error
+    end
   end
 
-  defp run(db, sql, params) do
+  def select(db, sql, params \\ []) do
+    statement(db, sql, params, &Sqlite3.fetch_all(db, &1))
+  end
+
+  def run(db, sql, params) do
     case statement(db, sql, params, &Sqlite3.step(db, &1)) do
       :done -> :ok
       error -> error

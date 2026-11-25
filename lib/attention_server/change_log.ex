@@ -724,16 +724,22 @@ defmodule AttentionServer.ChangeLog do
   holding an older cursor get `cursor_expired` and re-read a snapshot.
   """
   def enable(db, store_version) do
-    with :ok <- Enum.reduce_while(@schema, :ok, &create(db, &1, &2)),
-         :ok <- Sqlite3.execute(db, "BEGIN IMMEDIATE"),
-         :ok <- add_rank_projection_version(db),
-         :ok <- reconcile(db, store_version),
+    with :ok <- Sqlite3.execute(db, "BEGIN IMMEDIATE"),
+         :ok <- enable_in_transaction(db, store_version),
          :ok <- Sqlite3.execute(db, "COMMIT") do
       :ok
     else
       error ->
         _ = Sqlite3.execute(db, "ROLLBACK")
         error
+    end
+  end
+
+  @doc false
+  def enable_in_transaction(db, store_version) do
+    with :ok <- Enum.reduce_while(@schema, :ok, &create(db, &1, &2)),
+         :ok <- add_rank_projection_version(db) do
+      reconcile(db, store_version)
     end
   end
 
@@ -1245,6 +1251,18 @@ defmodule AttentionServer.ChangeLog do
   end
 
   @doc false
+  def ranks_available(
+        %AttentionServer.Store{mode: :keyed, change_log: true, db: db, change_log_touched: touched},
+        person
+      ) do
+    with false <- MapSet.member?(touched, person),
+         {:ok, true} <- ranked?(db, person) do
+      :ok
+    else
+      _ -> {:error, :storage_unavailable}
+    end
+  end
+
   def ranks_available(%AttentionServer.Store{change_log_touched: touched}, person) do
     if MapSet.member?(touched, person), do: {:error, :storage_unavailable}, else: :ok
   end
