@@ -435,6 +435,12 @@ or the recipient's setting is `"all"`.
   - `resolved`: settled items, newest first. Clients draw today's History
     heading here.
 
+  A full bounce removes the unopened item and its Chat from person reads,
+  including Inbox, History and search, and reduces the unresolved count.
+  Direct item, revision and entries reads and answer submissions return
+  `404 not_found`. A pending default answer is cancelled. A soft bounce leaves
+  the item where it is.
+
   `rank.key` orders items across and within sections. While the inbox is in
   free order, `current` items also carry `Rank.group` (`common`, which has no
   heading, or `earlier_messages`). Clients use `Rank.level` for the priority
@@ -849,6 +855,10 @@ What clients see:
   old log rows point at it.
 - Chat turns are their own Entry resources, so no turn is ever skipped.
 - `item_removed` rows are kept as tombstones for the retention window.
+- Full bounce uses the existing `item_removed` change with
+  `data: {"item_id": "<id>"}` in JSON and SSE. Clients remove the item and
+  its Chat from their local projection. An updated `counts` change carries
+  the reduced unresolved count. A soft bounce only notifies the sending agent.
 - A log row may have no client form (for example a read-position fact), but
   every client-visible effect of the fact it records also writes the
   affected resource's row. A read position writes the item's row, so another
@@ -1707,8 +1717,12 @@ Agent listen --follow and the Tightbeam Harklight background follower retry feed
 An eligible open message or FYI produces at most one bounce advisory per
 substantive revision. An unopened revision keeps the
 `unseen_interval_elapsed` advisory; an opened, unanswered revision uses
-`soft_bounce`. The person still sees the same item. Progress and qualifying
-person-authored Chat suppress the advisory. Upgrade reconsiders opened
+`soft_bounce`. The full bounce removes the item from person reads. The
+sending agent can still read the item and advisory with `terminal: null`.
+Reply, revise and progress writes to that item return `409 already_closed`.
+The agent can retract it or send a new message. A soft bounce leaves the
+person's item in place. Progress and qualifying person-authored Chat
+suppress the advisory. Upgrade reconsiders opened
 revisions accepted strictly after 2026-11-17 14:16:54 UTC that qualified under
 their original policy. It preserves the prior decision for a revision that
 already had an advisory.

@@ -1973,7 +1973,6 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
         {:opened, true, "soft_bounce"},
         {:ended, true, "soft_bounce"},
         {:moot, true, "soft_bounce"},
-        {:chat_moot, false, "unseen_interval_elapsed"},
         {:chat_moot, true, "soft_bounce"},
         {:late_open, false, "unseen_interval_elapsed"}
       ] do
@@ -2012,6 +2011,10 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
               "title" => "Needs attention",
               "created_at" => 1,
               "message_type" => "fyi",
+              "default" => %{
+                "value" => %{"acknowledgment" => "seen"},
+                "at" => 1_795_507_200_000 + 86_400_000
+              },
               "answer_ui" => %{
                 "schema" => "attention-client.actions/1",
                 "actions" => [
@@ -2056,7 +2059,28 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
         )
       end)
 
-      {:ok, before_due} = AgentChangeLog.head(:sys.get_state(ctx.relay).store, {person, ctx.keys["a1"]})
+      send(ctx.relay, :retry_client_ranks)
+      :sys.get_state(ctx.relay)
+
+      if unquote(scenario) == :unopened do
+        response =
+          request(ctx, "a1", "POST", "/v2/agent/messages/#{id}/replies", %{"text" => "Context"}, 19)
+
+        assert response.status == 200, response.body
+        assert %{"entries" => [_ | _]} =
+                 decode_response(get(ctx, "a2", "/v2/items/#{id}/entries"))
+
+        assert :sys.get_state(ctx.relay).store.engine.open_default_index[key] == at + 86_400_000
+      end
+
+      {:ok, before_due} =
+        AgentChangeLog.head(:sys.get_state(ctx.relay).store, {person, ctx.keys["a1"]})
+
+      assert %{"rev" => person_before_due, "items" => [before_item]} =
+               decode_response(get(ctx, "a2", "/v2/inbox"))
+
+      assert before_item["rank"]["section"] == "current"
+      refute Map.has_key?(before_item, "bounced")
 
       open = %{
         "type" => "message_open",
@@ -2118,10 +2142,50 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
         assert request(ctx, "a1", "POST", path, %{}, 10).status == 200
       end
 
-      commit_fixture.(&BounceDecision.evaluate_due(&1, at + 43_200_001))
-      # The score fixture writes the store directly, outside Relay's rank publication.
-      send(ctx.relay, :retry_client_ranks)
+      due = at + 43_200_001
+      state = :sys.replace_state(ctx.relay, &%{&1 | clock: fn -> due end})
+      send(ctx.relay, {:bounce_due, state.bounce_deadline_generation})
       :sys.get_state(ctx.relay)
+
+      case unquote(scenario) do
+        :opened ->
+          assert %{"items" => [%{"rank" => %{"section" => "current"}} = item],
+                   "counts" => %{"unresolved" => 1}} = decode_response(get(ctx, "a2", "/v2/inbox"))
+
+          refute Map.has_key?(item, "bounced")
+
+        :unopened ->
+          path = "/v2/items/#{id}"
+          assert %{"items" => [], "counts" => %{"unresolved" => 0}} =
+                   decode_response(get(ctx, "a2", "/v2/inbox"))
+
+          assert %{"items" => []} = decode_response(get(ctx, "a2", "/v2/search?q=Needs"))
+
+          for suffix <- ["", "/revisions/1", "/entries"] do
+            assert_error(get(ctx, "a2", path <> suffix), 404, "not_found")
+          end
+
+          for {answer, n} <- [{%{"choice" => "seen"}, 40}, {%{}, 41}] do
+            response =
+              request(ctx, "a2", "POST", path <> "/answer", Map.put(answer, "request_revision", 1), n)
+
+            assert_error(response, 404, "not_found")
+          end
+
+          assert %{"changes" => changes} =
+                   decode_response(get(ctx, "a2", "/v2/changes?after=#{person_before_due}"))
+
+          assert Enum.any?(changes, &match?(%{"kind" => "item_removed", "data" => %{"item_id" => ^id}}, &1))
+          assert Enum.any?(changes, &match?(%{"kind" => "counts", "data" => %{"unresolved" => 0}}, &1))
+
+          assert %{"changes" => replay} = decode_response(get(ctx, "a2", "/v2/changes?after=0"))
+          refute Enum.any?(replay, fn change ->
+            change["kind"] in ["item", "entry"] and change["data"]["item_id"] == id
+          end)
+
+        _ ->
+          :ok
+      end
 
       assert %{
                "messages" => [
@@ -2138,6 +2202,12 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
                  }
                ]
              } = decode_response(get(ctx, "a1", "/v2/agent/messages"))
+
+      assert %{"message" => %{"advisories" => [open_advisory]} = agent_item} =
+               decode_response(get(ctx, "a1", "/v2/agent/messages/#{id}"))
+
+      assert is_nil(agent_item["terminal"])
+      refute open_advisory["moot"] == true
 
       assert ClientAPISchema.errors(ctx.defs, "AgentAdvisory", advisory) == []
 
@@ -2244,6 +2314,42 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
                      request(ctx, "a1", "POST", path, body, 3)
                    )
       end
+
+      if unquote(scenario) == :unopened do
+        agent_path = "/v2/agent/messages/#{id}"
+        engine = :sys.get_state(ctx.relay).store.engine
+        refute Map.has_key?(engine.open_default_index, key)
+        assert AttentionServer.Engine.sweep_due_defaults(engine, at + 86_400_001) == engine
+
+        assert_error(
+          request(ctx, "a1", "POST", agent_path <> "/replies", %{"text" => "Follow-up"}, 30),
+          409,
+          "already_closed"
+        )
+
+        for {message, n} <- [
+              {%{"title" => "Revision", "created_at" => 1}, 31},
+              {%{"title" => "Progress", "created_at" => 1, "message_type" => "progress"}, 32}
+            ] do
+          assert_error(
+            request(ctx, "a1", "PUT", agent_path, %{"message" => message}, n, [{"if-match", "1"}]),
+            409,
+            "already_closed"
+          )
+        end
+
+        assert request(ctx, "a1", "POST", agent_path <> "/retract", %{}, 33).status == 200
+        assert %{"message" => %{"terminal" => %{"state" => "retracted"}}} =
+                 decode_response(get(ctx, "a1", agent_path))
+
+        assert_error(get(ctx, "a2", "/v2/items/#{id}"), 404, "not_found")
+
+        assert %{"changes" => replay} = decode_response(get(ctx, "a2", "/v2/changes?after=0"))
+
+        refute Enum.any?(replay, fn change ->
+          change["kind"] in ["item", "entry"] and change["data"]["item_id"] == id
+        end)
+      end
     end
   end
 
@@ -2257,6 +2363,169 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
   defp person_chat(ctx, path, id) do
     %{"entries" => entries} = decode_response(get(ctx, "a2", path))
     Enum.find(entries, &(&1["entry_id"] == id))
+  end
+
+  for opened? <- [false, true] do
+    @tag :agent_advisory
+    test "settling a message prevents a bounce (opened: #{opened?})", ctx do
+      alias AttentionServer.{BounceDecision, Store}
+
+      accepted = 1_795_507_200_000
+      close_at = accepted + 1_000
+      due = accepted + 43_200_000
+      :sys.replace_state(ctx.relay, &%{&1 | clock: fn -> accepted end})
+
+      items =
+        for {stop, n} <-
+              Enum.with_index(~w(answer no_comment seen retract supersede expiry default), 1) do
+          message = %{
+            "sender_id" => "app:test",
+            "message_id" => stop,
+            "title" => "Stop by #{stop}",
+            "created_at" => accepted,
+            "message_type" => if(stop == "seen", do: "fyi", else: "request")
+          }
+
+          message =
+            case stop do
+              "seen" ->
+                Map.put(message, "answer_ui", %{
+                  "schema" => "attention-client.actions/1",
+                  "actions" => [
+                    %{
+                      "id" => "seen",
+                      "label" => "Seen",
+                      "kind" => "value",
+                      "value" => %{"acknowledgment" => "seen"}
+                    }
+                  ]
+                })
+
+              "default" ->
+                Map.merge(message, %{
+                  "answer_ui" => %{
+                    "schema" => "attention-client.actions/1",
+                    "actions" => [
+                      %{
+                        "id" => "approve",
+                        "label" => "Approve",
+                        "kind" => "value",
+                        "value" => "approved"
+                      }
+                    ]
+                  },
+                  "default" => %{"value" => "approved", "at" => close_at}
+                })
+
+              _ ->
+                Map.put(message, "answer_ui", %{
+                  "schema" => "attention-client.actions/1",
+                  "actions" => [%{"id" => "reply", "label" => "Reply", "kind" => "text"}]
+                })
+            end
+
+          assert %{"seq" => seq} =
+                   frame(ctx, "a1", %{
+                     "type" => "forward",
+                     "op_id" => op(n),
+                     "session_handle" => @first_session,
+                     "message" => message
+                   })
+
+          {stop, n, Resources.item_id(%{accepted_seq: seq})}
+        end
+
+      :sys.replace_state(ctx.relay, fn state ->
+        scores =
+          for {stop, _, _} <- items,
+              do: %{"sender_id" => "app:test", "message_id" => stop, "score" => 0.9}
+
+        engine = BounceDecision.record_scores(state.store.engine, "A", scores, accepted)
+        assert BounceDecision.next_deadline(engine) == due
+
+        {:ok, store} =
+          Store.commit(state.store, engine, %{person: "A", actor: "fixture", action: "score"})
+
+        %{state | store: store}
+      end)
+
+      send(ctx.relay, :retry_client_ranks)
+      :sys.get_state(ctx.relay)
+
+      for {stop, n, id} <- items do
+        if unquote(opened?) do
+          assert request(ctx, "a2", "POST", "/v2/items/#{id}/seen", %{}, n + 10).status == 200
+        end
+
+        case stop do
+          "retract" ->
+            path = "/v2/agent/messages/#{id}/retract"
+            assert request(ctx, "a1", "POST", path, %{}, n + 20).status == 200
+
+          "supersede" ->
+            frame(ctx, "a1", %{
+              "type" => "forward",
+              "op_id" => op(n + 20),
+              "session_handle" => @first_session,
+              "message" => %{
+                "sender_id" => "app:test",
+                "message_id" => "replacement",
+                "title" => "Replacement",
+                "created_at" => accepted,
+                "supersedes" => [stop]
+              }
+            })
+
+          "expiry" ->
+            frame(ctx, "a1", %{
+              "type" => "lifecycle",
+              "op_id" => op(n + 20),
+              "sender_id" => "app:test",
+              "message_id" => stop,
+              "state" => "expired",
+              "at" => accepted
+            })
+
+          "default" ->
+            :ok
+
+          _ ->
+            answer =
+              case stop do
+                "answer" -> %{"comment" => "My answer"}
+                "seen" -> %{"choice" => "seen"}
+                "no_comment" -> %{}
+              end
+
+            path = "/v2/items/#{id}/answer"
+            body = Map.put(answer, "request_revision", 1)
+            response = request(ctx, "a2", "POST", path, body, n + 20)
+            assert response.status == 200, "#{stop}: #{response.body}"
+        end
+      end
+
+      state = :sys.replace_state(ctx.relay, &%{&1 | clock: fn -> close_at end})
+      send(ctx.relay, {:default_sweep, state.default_timer_generation})
+      state = :sys.replace_state(ctx.relay, &%{&1 | clock: fn -> due end})
+      send(ctx.relay, {:bounce_due, state.bounce_deadline_generation})
+
+      engine = :sys.get_state(ctx.relay).store.engine
+      assert BounceDecision.next_deadline(engine) == nil
+      assert engine.advisory_feeds == %{}
+
+      for {stop, _, id} <- items do
+        assert {:ok, key} = Resources.item_key(engine, "A", id)
+        record = engine.messages[key]
+        assert %{} = record.terminal
+        assert Map.get(record, "item_advisories", %{}) == %{}
+        refute Map.has_key?(record, "full_bounced_at_ms")
+
+        assert get_in(engine.bounce_revisions, [key, :revisions, 1, :selection, "reason"]) ==
+                 "terminal"
+
+        if stop == "default", do: assert(record.terminal.by == "default")
+      end
+    end
   end
 
   defmodule DroppingStream do

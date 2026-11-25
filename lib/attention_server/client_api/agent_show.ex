@@ -167,7 +167,7 @@ defmodule AttentionServer.ClientAPI.AgentShow do
 
   defp create_show(state, person, agent, body, {show_id, result_ref, caller}, receipt_key, digest) do
     with {:ok, {^person, sender, message_id}} <-
-           Resources.item_key(state.store.engine, person, body["item_id"]),
+           Resources.person_item_key(state.store.engine, person, body["item_id"]),
          frame = %{
            "item_id" => body["item_id"],
            "sender_id" => sender,

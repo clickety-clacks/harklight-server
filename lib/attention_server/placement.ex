@@ -9,8 +9,7 @@ end
 defmodule AttentionServer.Placement do
   @moduledoc false
 
-  alias AttentionServer.Engine
-  alias AttentionServer.Message
+  alias AttentionServer.{BounceDecision, Engine, Message}
   alias AttentionServer.Placement.{Baseline, JevSet}
 
   @algorithms %{"baseline" => Baseline, "jev-set" => JevSet}
@@ -123,7 +122,8 @@ defmodule AttentionServer.Placement do
   def items(%Engine{} = engine, person) do
     engine.messages
     |> Enum.flat_map(fn
-      {{^person, sender, id}, %{terminal: nil} = record} ->
+      {{^person, sender, id}, %{terminal: nil} = record}
+      when not is_map_key(record, "full_bounced_at_ms") ->
         message = record.message
         {placement_seq, group_thread} = inherited_placement(engine, {person, sender, id}, record)
 
@@ -162,7 +162,11 @@ defmodule AttentionServer.Placement do
 
   defp reply_projection(engine, person) do
     {items, groups} =
-      Enum.reduce(engine.conversation_events, {[], %{}}, fn
+      engine.conversation_events
+      |> Stream.reject(fn {_seq, event} ->
+        BounceDecision.fully_bounced?(engine.messages[event.key])
+      end)
+      |> Enum.reduce({[], %{}}, fn
         {{^person, seq}, %{key: key, payload: %{"kind" => "reply", "author" => "origin"} = reply}},
         {items, groups} ->
           {_, sender, id} = key
@@ -279,7 +283,10 @@ defmodule AttentionServer.Placement do
     # it, newest reply first; read time never participates in this ordering.
     resolved =
       engine.messages
-      |> Enum.filter(fn {{p, _, _}, record} -> p == person and record.terminal != nil end)
+      |> Enum.filter(fn {{p, _, _}, record} ->
+        p == person and not is_nil(record.terminal) and
+          BounceDecision.person_visible?(record)
+      end)
       |> Enum.sort_by(fn {{_, sender, id}, record} -> {-record.accepted_seq, sender, id} end)
       |> Enum.map(fn {{_, sender, id}, _} ->
         %{"kind" => "message", "sender_id" => sender, "message_id" => id}

@@ -107,6 +107,15 @@ defmodule AttentionServer.Store.KeyedBounceValidationTest do
       :ok = Store.close(store)
       assert {:ok, reopened} = Store.open(path, :keyed)
       assert reopened.engine.advisory_feeds == store.engine.advisory_feeds
+
+      for key <- [@m1, @m3] do
+        assert BounceDecision.fully_bounced?(reopened.engine.messages[key])
+
+        assert reopened.engine.messages[key].terminal == nil
+      end
+
+      assert reopened.engine.route_b_index.unresolved_count_by_person[@person] == 1
+      assert AttentionServer.RouteBIndex.push_badge(reopened.engine.route_b_index, @person) == 1
       :ok = Store.close(reopened)
     end
 
