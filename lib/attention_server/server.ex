@@ -115,12 +115,16 @@ defmodule AttentionServer.Server do
             relay_opts
         end
 
+      relay_opts =
+        maybe_add_join_configuration(relay_opts, opts, cacertfile)
+
       dashboard_opts =
         if dashboard_opts do
           dashboard_opts
           |> Keyword.put(:deployment_mode, deployment_mode)
           |> Keyword.put(:public_origin, public_origin)
           |> Keyword.put(:hosted_addresses, hosted_addresses)
+          |> Keyword.put(:invitations_configured, Keyword.has_key?(relay_opts, :join_configuration))
           |> Keyword.put(
             :hosted_testflight_url,
             if(deployment_mode == :saas,
@@ -129,9 +133,6 @@ defmodule AttentionServer.Server do
             )
           )
         end
-
-      relay_opts =
-        maybe_add_join_configuration(relay_opts, opts, cacertfile)
 
       web_opts = [
         relay: relay_name,

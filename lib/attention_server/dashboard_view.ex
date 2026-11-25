@@ -8,8 +8,6 @@ defmodule AttentionServer.DashboardView do
   does not decide account access or infer presence from enrollment.
   """
 
-  @hosted_agent_ca_sha256 "f9ddbf66433932d93f0947c9ec92db231b79d3d7b0e8a783e048b32790c5477d"
-
   @spec devices(String.t(), list(map()), list(map()), String.t() | nil, keyword()) :: String.t()
   def devices(person_name, devices, waiting, new_request_id \\ nil, chrome \\ [])
       when is_list(devices) and is_list(waiting) do
@@ -58,11 +56,15 @@ defmodule AttentionServer.DashboardView do
   def components(person_name, skill_version, skill_version_saas, chrome \\ []) do
     app_section = app_section(Keyword.get(chrome, :testflight_url))
 
-    hosted_connection_section =
-      if Keyword.get(chrome, :hosted) == true, do: hosted_connection_section(), else: ""
+    setup_instructions =
+      if Keyword.get(chrome, :hosted, false) or Keyword.get(chrome, :invitations_configured) do
+        ~s(<p>After installing, open <a href="/devices">Devices</a>, choose Create invitation, and copy the full link. Run the setup command with that link.</p><pre><code>harklight-agent setup 'harklight://join#…'</code></pre>)
+      else
+        ""
+      end
 
     cli_section =
-      ~s(<section><h2>Command-line agent</h2><div class="install-command"><pre id="install-command"><code>brew install <span class="brew-namespace">clickety-clacks</span>/<wbr>tap/<wbr>harklight-agent</code></pre><button class="button" id="copy-install-command" type="button" aria-controls="install-command">Copy install command</button><p class="copy-status" id="install-copy-status" role="status" aria-live="polite"></p></div><p><a href="https://github.com/clickety-clacks/harklight-agent/releases/latest">Prebuilt releases</a></p></section>)
+      ~s(<section><h2>Command-line agent</h2><div class="install-command"><pre id="install-command"><code>brew install <span class="brew-namespace">clickety-clacks</span>/<wbr>tap/<wbr>harklight-agent</code></pre><button class="button" id="copy-install-command" type="button" aria-controls="install-command">Copy install command</button><p class="copy-status" id="install-copy-status" role="status" aria-live="polite"></p></div>#{setup_instructions}<p><a href="https://github.com/clickety-clacks/harklight-agent/releases/latest">Prebuilt releases</a></p></section>)
 
     skill_section =
       skill_section("harklight-agent", skill_version, "/agent-skills/SKILL.md")
@@ -77,7 +79,6 @@ defmodule AttentionServer.DashboardView do
     body =
       ~s(<header class="page-head"><div><h1>Components</h1></div></header>) <>
         app_section <>
-        hosted_connection_section <>
         cli_section <>
         skill_section <>
         skill_section_saas <>
@@ -92,32 +93,6 @@ defmodule AttentionServer.DashboardView do
 
   defp app_section(url) when is_binary(url) do
     ~s(<section><h2>App</h2><p><a href="#{escape(url)}">Install Harklight for iPhone with TestFlight</a></p></section>)
-  end
-
-  defp hosted_connection_section do
-    path = Application.app_dir(:attention_server, "priv/harklight-production-agent-ca.pem")
-
-    with {:ok, pem} <- File.read(path),
-         true <- sha256_hex(pem) == @hosted_agent_ca_sha256 do
-      download =
-        "data:application/x-pem-file;base64," <> Base.encode64(pem)
-
-      ~s(<section><h2>Hosted Agent enrollment</h2><p>Use the Harklight Agent CLI to connect an agent to your hosted account. Each agent should have its own identity directory and an exact sender ID.</p><p><a href="#{escape(download)}" download="harklight-agent-ca.pem">Download the public CA certificate</a> and save it as <code>harklight-agent-ca.pem</code> beside the commands below. This link downloads the PEM file directly; do not decode a data URI.</p><ol><li>Run <code>enroll start</code> with a new private identity directory and the downloaded CA file. The Agent creates its device identity locally and displays an approval code.</li><li>In the owner dashboard, open <a href="/devices">Devices</a>, select the waiting device with the matching code, and approve it. To grant this agent sender access, enter <code>app:my-agent</code> in Sender IDs. Enrollment alone grants no sender access.</li><li>Run <code>enroll status</code> once with the same identity directory and CA file to confirm approval.</li></ol><pre><code>harklight-agent --identity-dir ./harklight-agent-identity \
-  --ca-file ./harklight-agent-ca.pem \
-  enroll start --connect app.harklight.net --name app.harklight.net \
-  --port 18444 --label "Work laptop" --origin-port 18450
-
-harklight-agent --identity-dir ./harklight-agent-identity \
-  --ca-file ./harklight-agent-ca.pem \
-  enroll status --connect app.harklight.net --name app.harklight.net --port 18444</code></pre><p>Port <code>18444</code> is used for enrollment; port <code>18450</code> is used for origin messaging.</p></section>)
-    else
-      _ ->
-        ~s(<section><h2>Hosted Agent connection</h2><p class="status">Not available yet</p></section>)
-    end
-  end
-
-  defp sha256_hex(bytes) do
-    Base.encode16(:crypto.hash(:sha256, bytes), case: :lower)
   end
 
   def prioritization(person_name, settings, message \\ nil, chrome \\ []) do

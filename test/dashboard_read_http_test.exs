@@ -425,6 +425,30 @@ defmodule AttentionServer.DashboardReadHTTPTest do
              "---\nname: harklight-agent\nversion: \"0.1.0\"\n---\n\n# Operate Harklight\n"
   end
 
+  test "components show invitation setup for Hosted and configured self-hosted servers", %{
+    opts: opts
+  } do
+    for options <- [[hosted: true], [invitations_configured: true]] do
+      configured =
+        DashboardReadHTTP.init([backend: Backend, skill_path: opts.skill_path] ++ options)
+
+      page = "/components" |> secure_get("member-session") |> DashboardReadHTTP.call(configured)
+
+      assert page.status == 200
+      assert page.resp_body =~ "brew install"
+      assert page.resp_body =~ "harklight-agent setup 'harklight://join#…'"
+      assert page.resp_body =~ ~s(<a href="/devices">Devices</a>, choose Create invitation)
+      refute page.resp_body =~ "--origin-port"
+      refute page.resp_body =~ "Download the public CA certificate"
+    end
+
+    page = "/components" |> secure_get("member-session") |> DashboardReadHTTP.call(opts)
+
+    assert page.status == 200
+    assert page.resp_body =~ "brew install"
+    refute page.resp_body =~ "harklight-agent setup"
+  end
+
   test "hosted components show the existing display label instead of the person UUID", %{
     opts: opts
   } do

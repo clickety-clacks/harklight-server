@@ -55,6 +55,7 @@ defmodule AttentionServer.DashboardReadHTTP do
       skill_path: skill_path,
       expected_origin: Keyword.get(opts, :expected_origin),
       hosted: hosted,
+      invitations_configured: Keyword.get(opts, :invitations_configured, false),
       hosted_addresses:
         if(hosted, do: hosted_addresses(Keyword.get(opts, :hosted_addresses)), else: %{}),
       hosted_testflight_url:
@@ -290,7 +291,7 @@ defmodule AttentionServer.DashboardReadHTTP do
       testflight_url: opts.hosted_testflight_url
     ]
 
-  defp chrome(_opts), do: [prioritization: true]
+  defp chrome(opts), do: [prioritization: true, invitations_configured: opts.invitations_configured]
 
   defp route(
          %{method: "GET", request_path: "/api/profile"} = conn,
