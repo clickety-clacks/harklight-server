@@ -13,6 +13,8 @@ defmodule AttentionServer.CLI.StoreConversion do
   def run(_), do: CLI.error!("use harklight store convert-stopped STORE_PATH")
 
   defp convert(path, expected_format) do
+    :ok = CLI.start_application!()
+
     with true <- File.regular?(path),
          {:ok, budget} <- ConversionCapacity.read(Path.expand(path)),
          {:ok, result} <- Store.convert_stopped(path, budget, expected_format) do

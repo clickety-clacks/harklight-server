@@ -20,6 +20,22 @@ defmodule AttentionServer.Store.KeyedMigrationTest do
     assert :ok = Store.close(store)
   end
 
+  test "the shipped fit envelope admits a small snapshot and guard makes conversion idempotent", %{
+    path: path,
+    store: store
+  } do
+    assert :ok = Store.close(store)
+    gib = 1024 * 1024 * 1024
+    budget = %{memory: 2 * gib, disk: 2 * gib, uploads: 4096}
+
+    assert {:error, :source_format_mismatch} = Store.convert_stopped(path, budget, 29)
+    assert {:ok, :converted} = Store.convert_stopped(path, budget, 30)
+    assert {:ok, :already_converted} = Store.convert_stopped(path, budget, 30)
+    assert {:ok, reopened} = Store.open(path, :keyed)
+    assert reopened.version == 1
+    assert :ok = Store.close(reopened)
+  end
+
   test "a killed converter rolls back seeded rows and a restart converts from the original anchor", %{
     path: path,
     store: store

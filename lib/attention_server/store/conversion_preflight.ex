@@ -8,8 +8,24 @@ defmodule AttentionServer.Store.ConversionPreflight do
   @prefix_bytes 256
   @prefix_overhead 32 * 1024 * 1024
 
-  # Replaced with the measured per-format envelopes by the conversion rehearsal.
-  @envelopes %{}
+  # The synthetic 2,400-message rehearsal included 99,999 conversation facts
+  # and 1,300 sessions. Use the worst capped or uncapped RSS for each format,
+  # rounded up with 20% headroom. Reserve 512 MiB for fixed startup work.
+  # Extra disk includes database growth plus the peak WAL, with 25% headroom.
+  @shape_a %{
+    memory_fixed: 512 * 1024 * 1024,
+    disk_fixed: 128 * 1024 * 1024,
+    disk_per_byte: 5,
+    revisions: 104_801,
+    changes: 69_166,
+    references: 0,
+    uploads: 4096
+  }
+  @envelopes %{
+    27 => Map.merge(@shape_a, %{expanded_bytes: 123_901_800, memory_per_byte: 17}),
+    29 => Map.merge(@shape_a, %{expanded_bytes: 123_901_822, memory_per_byte: 17}),
+    30 => Map.merge(@shape_a, %{expanded_bytes: 123_901_842, memory_per_byte: 19})
+  }
 
   def check(db, budget, expected_format, envelopes \\ @envelopes) do
     with {:ok, info} <- read(db, budget.memory, budget.disk),
