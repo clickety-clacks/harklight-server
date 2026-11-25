@@ -291,7 +291,7 @@ defmodule AttentionServer.DashboardReadHTTP do
       testflight_url: opts.hosted_testflight_url
     ]
 
-  defp chrome(_opts), do: [prioritization: true]
+  defp chrome(opts), do: [prioritization: true, invitations_configured: opts.invitations_configured]
 
   defp route(
          %{method: "GET", request_path: "/api/profile"} = conn,
@@ -688,7 +688,7 @@ defmodule AttentionServer.DashboardReadHTTP do
         display_name(principal),
         skill_version(opts.skill_path),
         skill_version(opts.skill_path_saas),
-        Keyword.put(chrome(opts), :invitations_configured, opts.invitations_configured)
+        chrome(opts)
       )
 
     conn

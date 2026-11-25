@@ -58,7 +58,7 @@ defmodule AttentionServer.DashboardView do
 
     setup_instructions =
       if Keyword.get(chrome, :hosted, false) or Keyword.get(chrome, :invitations_configured) do
-        ~s(<p>After installing, open <a href="/devices">Devices</a>, choose Create invitation, and copy the full link. Run the setup command with that link:</p><pre><code>harklight-agent setup 'harklight://join#…'</code></pre>)
+        ~s(<p>After installing, open <a href="/devices">Devices</a>, choose Create invitation, and copy the full link. Run the setup command with that link.</p><pre><code>harklight-agent setup 'harklight://join#…'</code></pre>)
       else
         ""
       end
