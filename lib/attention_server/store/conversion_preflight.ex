@@ -12,25 +12,47 @@ defmodule AttentionServer.Store.ConversionPreflight do
   # facts, 1,300 sessions and up to 43 references to 16 retained files.
   # Round the worst peak ratio up with 20% headroom and reserve 512 MiB.
   # Extra disk includes database growth and peak WAL with 25% headroom.
-  @envelope %{
-    expanded_bytes: 123_901_842,
+  @common_budget %{
     memory_fixed: 512 * 1024 * 1024,
-    memory_per_byte: 23,
     disk_fixed: 128 * 1024 * 1024,
-    disk_per_byte: 5,
+    disk_per_byte: 5
+  }
+  @shape_a Map.merge(@common_budget, %{
+    expanded_bytes: 123_901_842,
+    memory_per_byte: 23,
     revisions: 104_801,
     changes: 69_166,
     references: 43,
     uploads: 33_624_064
-  }
+  })
 
-  def check(db, budget, expected_format, envelope \\ @envelope) do
+  # Both 50,000-message fixtures fit with ten bytes per expanded byte and
+  # the fixed reserve. Budget each band at its upper end so a smaller
+  # payload can still carry the densest shape admitted in that band.
+  @large_budget Map.merge(@common_budget, %{memory_per_byte: 10, references: 0, uploads: 4096})
+  @envelopes [
+    @shape_a,
+    Map.merge(@large_budget, %{
+      expanded_bytes: 771_569_498,
+      bound_bytes: 771_569_498,
+      revisions: 600_000,
+      changes: 383_432
+    }),
+    Map.merge(@large_budget, %{
+      expanded_bytes: 1_232_830_635,
+      bound_bytes: 1_232_830_635,
+      revisions: 1_000_402,
+      changes: 650_100
+    })
+  ]
+
+  def check(db, budget, expected_format, envelopes \\ @envelopes) do
     with {:ok, info} <- read(db, budget.memory, budget.disk),
          :ok <- check_format(info.format, expected_format),
-         true <- info.expanded_bytes <= envelope.expanded_bytes,
-         :ok <- check_shape(db, budget.uploads, envelope),
+         %{} = envelope <- Enum.find(envelopes, &(info.expanded_bytes <= &1.expanded_bytes)),
          {memory, disk} <- upper_bound(info, envelope),
-         true <- memory <= budget.memory and disk <= budget.disk do
+         true <- memory <= budget.memory and disk <= budget.disk,
+         :ok <- check_shape(db, budget.uploads, envelope) do
       {:ok, info}
     else
       {:already_converted, _} = converted -> converted
@@ -43,10 +65,10 @@ defmodule AttentionServer.Store.ConversionPreflight do
   defp upper_bound(info, envelope) do
     # Coefficients are integer ratios rounded up from the worst rehearsal.
     # Keep the measured fixed margin in addition to that rounding.
-    {
-      envelope.memory_fixed + envelope.memory_per_byte * info.expanded_bytes,
-      envelope.disk_fixed + envelope.disk_per_byte * info.expanded_bytes
-    }
+    size = Map.get(envelope, :bound_bytes, info.expanded_bytes)
+
+    {envelope.memory_fixed + envelope.memory_per_byte * size,
+     envelope.disk_fixed + envelope.disk_per_byte * size}
   end
 
   defp check_format(actual, expected) when is_nil(expected) or actual == expected, do: :ok

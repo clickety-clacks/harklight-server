@@ -84,17 +84,17 @@ defmodule AttentionServer.Store.ConversionPreflightTest do
       revisions: 0, changes: 0, references: 0, uploads: 0
     }
 
-    assert {:ok, %{format: 30}} = ConversionPreflight.check(db, budget, 30, envelope)
+    assert {:ok, %{format: 30}} = ConversionPreflight.check(db, budget, 30, [envelope])
 
     assert {:error, :source_format_mismatch} =
-             ConversionPreflight.check(db, budget, 29, envelope)
+             ConversionPreflight.check(db, budget, 29, [envelope])
 
     assert {:error, :fit_not_established} =
-             ConversionPreflight.check(db, %{budget | memory: 48 * mib}, 30, envelope)
+             ConversionPreflight.check(db, %{budget | memory: 48 * mib}, 30, [envelope])
 
     :ok = Sqlite3.execute(db, "INSERT INTO agent_changes VALUES (1)")
 
-    assert {:error, :fit_not_established} = ConversionPreflight.check(db, budget, 30, envelope)
+    assert {:error, :fit_not_established} = ConversionPreflight.check(db, budget, 30, [envelope])
   end
 
   test "accepts the older atom tag encodings without loading an Engine" do
