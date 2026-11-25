@@ -405,7 +405,7 @@ origin-wide; the CLI selects pending output for that handle locally. Read does
 not acknowledge an event, enable listening or promise future delivery. Follow
 the shared core for matching the request and reporting an outcome.
 The enrolled-device `read` and `respond` commands remain available for messages
-already stored by the server. They do not create new messages or retrieve an
+already stored by the server. They do not create new messages or retrieve a
 handoff receipt. Existing messages and their replay events remain in server
 history.
 

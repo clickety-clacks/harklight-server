@@ -5,12 +5,12 @@ and its guidance. **It speaks only the 0.2 protocol.**
 
 - The Server opens FORMAT30 stores only (written by v0.2.16 and later). It
   refuses a FORMAT29 or older store with `unsupported_store_format` and leaves
-  it unchanged. To move an older store, first upgrade it with any release from
+  its data unchanged. To move an older store, first upgrade it with any release from
   v0.2.16 through v0.2.20, then install this one.
 - On first start, a one-time step tidies data kept from 0.1: a Seen-only
   message stored without a type becomes an FYI, and a chat reply whose only
-  delivery evidence came from 0.1 is shown as delivered with no receipt
-  expected, so no client shows it as still sending. It runs once and is
+  delivery evidence came from 0.1 is marked delivered with no receipt expected
+  (`receipt_expected: false`), replacing the old `legacy_caption` mark. It runs once and is
   recorded; later starts change nothing.
 - Old browser sign-in records and retired 0.1 settings handling are gone.
 - The served agent guides and the API and install documents no longer describe
@@ -27,9 +27,13 @@ above adds one recorded migration. Take a complete private backup before
 starting the new release. To return to an earlier release, follow the rollback
 steps in SELF_HOST.md.
 
-**Compatibility.** Harklight Server 0.2.21 uses protocol 0.2 with no API
-change. Harklight Agent 0.2.6 is the matching release. Harklight app 0.2.0 and
-Harklight Web 0.2.5 are the client baseline.
+**Compatibility.** Harklight Server 0.2.21 uses protocol 0.2. Chat delivery
+state no longer carries `legacy_caption`; old chat replies carry
+`receipt_expected: false` instead. Harklight Web 0.2.5 and the current
+Harklight app read only `legacy_caption`, so with them those old replies show
+as still sending. Install this release together with a Harklight Web and app
+that read `receipt_expected`; until then, stay on v0.2.20. Harklight Agent
+0.2.6 is the matching Agent release.
 
 # Harklight Server v0.2.20
 
