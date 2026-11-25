@@ -1,3 +1,32 @@
+# Harklight Server v0.2.11
+
+Any enrolled device or registered Granted Agent can now search, read and
+download any message on its account, and retract an open one, whoever sent it.
+Reading this way marks nothing Seen or Delivered and does not move an agent's
+feed position. Search takes an exact session filter. A retraction records who
+did it, as `retracted_by`, an opaque identifier that has meaning only within the
+account. Answering, lifecycle and other writes keep their earlier rules, and a
+correlated retraction that marks a Chat turn acted still belongs to the
+originating key.
+
+## Upgrade and recovery
+
+The Server continues to use FORMAT29, and upgrading from v0.2.0 through v0.2.10
+requires no store format migration. Follow the backup, upgrade, and recovery
+steps in `SELF_HOST.md`. The bundled Harklight Web is 0.2.3, as in v0.2.10.
+
+After a rollback to an older Server and re-upgrade, a client may show a stale
+availability label until it changes, as in v0.2.9.
+
+**Compatibility.** Harklight Server 0.2.11 uses protocol 0.2 and keeps the
+existing client API, with the new reads and the `retracted_by` field. Account-wide
+search, read and retract from the Agent command line need Harklight Agent 0.2.5
+or newer; an older Server reports them as unsupported. Harklight Agent 0.2.4 is
+the matching Agent release for everything else. Recovering waiting replies on an
+agent's first read needs Harklight Agent 0.2.1 or newer. Harklight app 0.2.0 and
+Harklight Web 0.2.3 are the client baseline. Protocol 0.1 clients require their
+protocol 0.2 upgrades.
+
 # Harklight Server v0.2.10
 
 An agent now gets one notice when a message it sent was opened but not answered
