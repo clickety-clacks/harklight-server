@@ -176,7 +176,7 @@ defmodule AttentionServer.Store.KeyedValidation do
         Conversation.valid_origin_entry?(seq, get_in(next.origin_feeds, [scope, :high]), entry)
 
       prior ->
-        prior === entry
+        prior === entry or Conversation.answer_baseline_mark?(prior, entry)
     end
   end
 
