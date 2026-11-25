@@ -285,17 +285,23 @@ line if it is missing.
 export ATTENTION_SERVER_PUSH_RELAY_URL=https://app.harklight.net
 ```
 
-The relay receives the APNs device token, its environment (production or
-sandbox), the push kind, the badge count, your Server's opaque ID and the source
-address. When applicable, it also receives the passive or default-sound setting
-for an alert. The relay keeps no push records or registrations. Operational logs
-include the Server ID, push kind, environment, Apple response status and duration.
-The relay never receives message text, titles or sender names. It sends a
-background wake or the fixed alert “New message in Harklight.” The app fetches
-messages directly from your Server.
+For each notification, the relay receives your iPhone's push token, the push
+kind (alert or background), the badge count when supplied, the push environment
+(production or sandbox), whether an alert plays a sound or arrives quietly when
+specified, your Server's random identifier, and the address it connects from.
+The relay never receives message text, titles or sender names. It stores none
+of this as push or registration records and uses the data only to ask Apple to
+deliver the notification. An alert reads “New message in Harklight,” and a
+background notification shows no alert. The relay writes one operational log
+line per push with the Server identifier, kind, environment, Apple response
+status, a recognized error reason when available, and duration. It also logs
+the Server identifier at registration. These lines never include the token.
+The system journal keeps these lines until it removes older entries to make
+space, with no fixed retention period. The web front end's access logs include
+the connecting address and are kept for 14 days.
 
-The relay is free under fair use and availability is best effort. Leaving the
-setting unset keeps push off unless you configure Apple keys for direct delivery.
+The relay is free and offered on fair use, with no guarantee of availability.
+We may stop serving a Server that abuses it.
 
 ## Optional direct APNs notifications
 
