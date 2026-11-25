@@ -228,6 +228,7 @@ Schemas use JSON Schema 2020-12. `$ref`s point into the `$defs` below.
             "rerouted": { "type": "boolean" },
             "ack2_expected": { "type": "boolean" },
             "listener_received": { "const": true },
+            "receipt_expected": { "const": false },
             "agent_seen": { "const": true },
             "agent_acted": { "const": true }
           }
@@ -619,7 +620,10 @@ Every write that succeeds answers `200`, or `201` for `POST /v2/files`, with a
   without changing it. Use the explicit reroute caption only for a handed
   receipt with `rerouted: true` and an agent name. With
   `ack2_expected: false`, `listener_received: true` also qualifies.
-  Time and wire `delivered` alone leave Sending.
+  Time and wire `delivered` alone leave Sending. A retained turn with
+  `receipt_expected: false` had old service evidence with no authoritative
+  receipt expectation or outcome. Hide its delivery caption until qualifying
+  evidence, a correlated reply, or an explicit outcome supplies one.
 - **Lifecycle** is not part of the client API. Terminal actions stay on the
   origin API. Their results are readable as `Item.terminal`, and a retraction
   also as a `lifecycle` entry.

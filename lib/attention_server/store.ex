@@ -185,14 +185,14 @@ defmodule AttentionServer.Store do
         {:ok, store}
 
       {:ok, nil} ->
-        {engine, entries} = ClientDataMigration.prepare(store.engine)
+        engine = ClientDataMigration.prepare(store.engine)
 
-        if engine == store.engine and entries == [] do
+        if engine == store.engine do
           with :ok <- record_data_migration(store.db, @client_data_migration), do: {:ok, store}
         else
           audit = %{person: "system", actor: "schema_migration", action: @client_data_migration}
 
-          case commit(store, engine, audit, entries) do
+          case commit(store, engine, audit) do
             {:ok, migrated} -> {:ok, migrated}
             {:error, reason, _} -> {:error, reason}
           end
@@ -202,6 +202,8 @@ defmodule AttentionServer.Store do
         error
     end
   end
+
+  def migrate_retained_client_data(%__MODULE__{}), do: {:error, :storage_unavailable}
 
   def open(nil), do: {:ok, %__MODULE__{db: nil, engine: Engine.new(), version: 0}}
 

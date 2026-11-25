@@ -370,8 +370,9 @@ releases. The server built from this source opens and writes FORMAT30
 snapshots only. For a store on an earlier format, first upgrade through
 v0.2.16–v0.2.20 using a release that supports the starting format. Verify
 the resulting FORMAT30 snapshot before switching to this package. On first
-start, retained Seen-only messages gain an explicit FYI type and old chat
-delivery captions use the evidence recorded for each turn.
+start, retained Seen-only messages gain an explicit FYI type. For old Chat
+turns with no recorded handoff expectation or outcome, updated clients omit
+the delivery caption until the turn receives qualifying evidence.
 Preserve the database, referenced files, trust root, owner and person.
 Messages, accounts, grants, enrolled devices and registered agents carry over.
 Every registered, non-revoked agent can read its account's messages.

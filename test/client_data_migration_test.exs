@@ -1,17 +1,18 @@
 defmodule AttentionServer.ClientDataMigrationTest do
   use ExUnit.Case, async: true
 
-  alias AttentionServer.{ChangeLog, PreChangeLogStore, Relay, Store}
+  alias AttentionServer.{ChangeLog, Engine, PreChangeLogStore, Relay, Store}
   alias AttentionServer.ClientAPI.Resources
   alias Exqlite.Sqlite3
 
   @moduletag :tmp_dir
   @key {"A", "app:test", "seen"}
   @session "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+  @discussion_feed_seq 2
   @seen %{
     "schema" => "attention-client.actions/1",
     "actions" => [
-      %{"id" => "seen", "label" => "Seen", "kind" => "value", "value" => %{"acknowledgment" => "seen"}}
+      %{"id" => "seen", "label" => "Mark as read", "kind" => "value", "value" => "seen-legacy"}
     ]
   }
 
@@ -52,12 +53,12 @@ defmodule AttentionServer.ClientDataMigrationTest do
           "text" => "Retained reply"
         })
 
-      [%{"feed_seq" => seq}] =
+      [%{"feed_seq" => @discussion_feed_seq}] =
         for entry <- Map.values(store.engine.origin_feeds[{"A", "origin"}].entries),
             entry["kind"] == "discussion",
             do: entry
 
-      PreChangeLogStore.origin_ack(store, "origin", seq)
+      PreChangeLogStore.origin_ack(store, "origin", @discussion_feed_seq)
     end)
 
     assert {:ok, before} = Store.open(path)
@@ -70,20 +71,26 @@ defmodule AttentionServer.ClientDataMigrationTest do
     after_start = :sys.get_state(relay).store
     record = after_start.engine.messages[@key]
     assert record.message["message_type"] == "fyi"
+    assert record.message["answer_ui"] == @seen
     assert record.revisions[1] == record.message
 
     assert %{"message" => %{"message_type" => "fyi"}} =
              after_start.engine.origin_feeds[{"A", "origin"}].entries[1]
 
-    assert [%{"delivery" => %{"delivered" => true, "acted" => false} = delivery}] =
+    assert [%{"entry_id" => entry_id, "delivery" => delivery}] =
              Enum.filter(Resources.entries(after_start.engine, @key), &(&1["author"] == "person"))
 
+    assert %{"delivered" => true, "acted" => false, "receipt_expected" => false} = delivery
     refute Map.has_key?(delivery, "legacy_caption")
     refute Map.has_key?(delivery, "outcome")
 
     assert after_start.engine.origin_receipts == before.engine.origin_receipts
     assert {:ok, next_head} = ChangeLog.head(after_start, "A")
     assert next_head > head
+    target_seq = entry_id |> String.trim_leading("e") |> String.to_integer()
+    target = ChangeLog.entry_resource(target_seq)
+    assert {:ok, changes, false, ^next_head} = ChangeLog.read(after_start, "A", head, 100)
+    assert Enum.any?(changes, &match?(%{kind: :entry, resource_id: ^target}, &1))
     assert {:ok, statement} = Sqlite3.prepare(after_start.db, "SELECT payload FROM relay_state")
     assert {:row, [payload]} = Sqlite3.step(after_start.db, statement)
     assert :ok = Sqlite3.release(after_start.db, statement)
@@ -95,6 +102,16 @@ defmodule AttentionServer.ClientDataMigrationTest do
     restarted = :sys.get_state(relay).store
     assert restarted.version == after_start.version
     assert {:ok, ^next_head} = ChangeLog.head(restarted, "A")
+
+    assert {:ok, with_receipt, _} =
+             Engine.origin_ack2(restarted.engine, "origin", @discussion_feed_seq, %{
+               "op_id" => "00000000-0000-4000-8000-000000000003",
+               "outcome" => "handed"
+             })
+
+    assert [%{"delivery" => %{"outcome" => "handed", "receipt_expected" => false}}] =
+             Enum.filter(Resources.entries(with_receipt, @key), &(&1["entry_id"] == entry_id))
+
     GenServer.stop(relay)
   end
 end

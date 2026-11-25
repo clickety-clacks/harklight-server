@@ -1037,8 +1037,11 @@ defmodule AttentionServer.ClientAPI.Resources do
           []
 
         %{"author" => "person"} = entry ->
+          delivery =
+            put_present(person_delivery(marks), "receipt_expected", payload["receipt_expected"])
+
           entry
-          |> Map.put("delivery", person_delivery(marks))
+          |> Map.put("delivery", delivery)
           |> Map.put(@sources, Enum.sort([seq | folded_seqs]))
           |> List.wrap()
 

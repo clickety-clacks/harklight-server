@@ -8,14 +8,14 @@ mode="${2:-upgrade-failure}"
   printf 'unknown test mode: %s\n' "$mode" >&2
   exit 1
 }
-source_store="${3:?pass a real pre-migration relay store}"
-expected_store_sha="${4:?pass the pre-migration relay store SHA-256}"
+source_store="${3:?pass a real pre-install relay store}"
+expected_store_sha="${4:?pass the pre-install relay store SHA-256}"
 app_ebin="${5:?pass the compiled application ebin directory}"
 erl_libs="${6:?pass the compiled dependency library directory}"
 migrator="${7:?pass the isolated store migration probe}"
 [[ -f "$source_store" && "$expected_store_sha" =~ ^[0-9a-f]{64}$ &&
    -d "$app_ebin" && -d "$erl_libs" && -f "$migrator" ]] || {
-  printf 'pre-migration store or compiled migration support is unavailable\n' >&2
+  printf 'pre-migration store or compiled startup support is unavailable\n' >&2
   exit 1
 }
 
@@ -127,7 +127,7 @@ case "$action" in
           printf 'candidate started before its backup existed\n' >&2
           exit 92
         }
-        # Exercise the real store opener after the installer backup exists.
+        # Exercise the real Server startup after the installer backup exists.
         ERL_LIBS="$HARKLIGHT_TEST_ERL_LIBS" elixir \
           -pa "$HARKLIGHT_TEST_APP_EBIN" "$HARKLIGHT_TEST_MIGRATOR"
         grep -qx 'format=30' "$HARKLIGHT_TEST_MIGRATION_LOG"
@@ -239,7 +239,7 @@ if [[ "$mode" == upgrade-failure ]]; then
   grep -Fqx 'start:v0.2.20' "$HARKLIGHT_TEST_ACTIONS"
   grep -Fq "|$home|$runner_temp" "$HARKLIGHT_TEST_LOG"
 
-  printf 'PASS: candidate migration failure restored the pre-install mutable root and serving prior release\n'
+  printf 'PASS: candidate readiness failure restored the pre-install mutable root and serving prior release\n'
   printf 'PASS: previous release files and candidate package remain; the candidate is no longer selected\n'
   printf 'PASS: inherited HOME and RUNNER_TEMP reached the service control calls unchanged\n'
 else

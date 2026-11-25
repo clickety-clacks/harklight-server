@@ -1,7 +1,7 @@
 defmodule AttentionServer.SourceReportTest do
   use ExUnit.Case, async: false
 
-  alias AttentionServer.{Engine, JSON, Relay, RelayReaders, Store}
+  alias AttentionServer.{Engine, JSON, Relay, Store}
   alias Exqlite.Sqlite3
 
   setup do

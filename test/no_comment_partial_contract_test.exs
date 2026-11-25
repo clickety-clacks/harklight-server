@@ -1,7 +1,7 @@
 defmodule AttentionServer.NoCommentPartialContractTest do
   use ExUnit.Case, async: true
 
-  alias AttentionServer.{BrowserRecipient, Engine, JSON, Store}
+  alias AttentionServer.{BrowserRecipient, Engine, Store}
 
   @person "synthetic-person"
   @key {@person, "app:test", "request"}
@@ -18,7 +18,7 @@ defmodule AttentionServer.NoCommentPartialContractTest do
 
     {:ok, engine} = Engine.setup_sender(engine, "origin", "app:test")
 
-    {engine, %{"type" => "ok"}} =
+    {engine, {:ok, _}} =
       request(engine, "origin", %{
         "type" => "forward",
         "op_id" => op(1),
@@ -32,7 +32,7 @@ defmodule AttentionServer.NoCommentPartialContractTest do
   test "first older No comment commits once, preserves binding and cannot reopen", %{
     engine: engine
   } do
-    {engine, %{"revision" => 2}} = request(engine, "origin", revise(1, 2))
+    {engine, {:ok, %{"revision" => 2}}} = request(engine, "origin", revise(1, 2))
     {engine, result} = no_comment(engine, "reader", 1)
     assert committed_seq(result) == engine.messages[@key].terminal.seq
     terminal = engine.messages[@key].terminal
@@ -49,7 +49,7 @@ defmodule AttentionServer.NoCommentPartialContractTest do
     assert committed_seq(retry) == terminal.seq
     assert duplicate?(retry)
     assert same == engine
-    {same, %{"reason" => "closed"}} = request(engine, "origin", revise(2, 4))
+    {same, {:error, "closed", _, _}} = request(engine, "origin", revise(2, 4))
     assert same == engine
     assert same.messages[@key].terminal == terminal
     assert same.messages[@key].revision == 2
@@ -57,15 +57,15 @@ defmodule AttentionServer.NoCommentPartialContractTest do
 
   test "invalid/future revisions and missing binding do not commit", %{engine: engine} do
     for revision <- [0, -1, nil, "1", 2] do
-      {same, result} = no_comment(engine, "reader", revision)
+      {same, {:error, reason, _, _}} = no_comment(engine, "reader", revision)
       assert same == engine
-      assert result["reason"] == if(revision == 2, do: "stale_revision", else: "invalid_field")
+      assert reason == if(revision == 2, do: "stale_revision", else: "invalid_field")
     end
 
     frame = %{nc(1) | "request_id" => "missing"}
-    {same, %{"reason" => "not_found"}} = request(engine, "reader", frame)
+    {same, {:error, "not_found", _, _}} = request(engine, "reader", frame)
     assert same == engine
-    assert {^engine, {:error, :forbidden}} = Engine.request_frame(engine, "unknown", nc(1), 1)
+    assert {^engine, {:error, :forbidden}} = Engine.request_command(engine, "unknown", nc(1), 1)
   end
 
   test "terminal refuses different devices but preserves direct retries", %{engine: engine} do
@@ -76,9 +76,8 @@ defmodule AttentionServer.NoCommentPartialContractTest do
     assert committed_seq(retry) == seq
     assert duplicate?(retry)
 
-    {same, refusal} = no_comment(engine, "other", 1)
+    {same, {:error, "closed", _, _}} = no_comment(engine, "other", 1)
     assert same == engine
-    assert refusal["reason"] == "closed"
   end
 
   test "request IDs remain person-scoped and ambiguous sender bindings are refused", %{
@@ -86,19 +85,19 @@ defmodule AttentionServer.NoCommentPartialContractTest do
   } do
     {:ok, engine} = Engine.setup_person(engine, "another-person")
     {:ok, engine} = Engine.setup_device(engine, "another-person", "outsider")
-    {same, %{"reason" => "not_found"}} = request(engine, "outsider", nc(1))
+    {same, {:error, "not_found", _, _}} = request(engine, "outsider", nc(1))
     assert same == engine
 
     {:ok, engine} = Engine.setup_sender(engine, "origin", "app:other")
 
-    {engine, %{"type" => "ok"}} =
+    {engine, {:ok, _}} =
       request(engine, "origin", %{
         "type" => "forward",
         "op_id" => op(2),
         "message" => %{message("Another sender's request") | "sender_id" => "app:other"}
       })
 
-    {same, %{"reason" => "not_found"}} = no_comment(engine, "reader", 1)
+    {same, {:error, "not_found", _, _}} = no_comment(engine, "reader", 1)
     assert same == engine
   end
 
@@ -123,22 +122,22 @@ defmodule AttentionServer.NoCommentPartialContractTest do
     {engine, _} = request(engine, "origin", revise(1, 2))
 
     for answer <- ["text", %{"choice" => "Yes"}] do
-      {same, %{"reason" => "stale_revision"}} = request(engine, "reader", answer(1, answer, 5))
+      {same, {:error, "stale_revision", _, _}} = request(engine, "reader", answer(1, answer, 5))
       assert same == engine
     end
 
-    {same, %{"reason" => "invalid_field"}} =
+    {same, {:error, "invalid_field", _, _}} =
       request(engine, "reader", Map.put(nc(1), "op_id", op(3)))
 
     assert same == engine
-    {engine, %{"type" => "ok"}} = request(engine, "reader", answer(2, "text", 5))
+    {engine, {:ok, _}} = request(engine, "reader", answer(2, "text", 5))
 
-    {same, %{"reason" => "operation_conflict"}} =
+    {same, {:error, "operation_conflict", _, _}} =
       request(engine, "reader", answer(2, "changed", 5))
 
     assert same == engine
 
-    {same, %{"reason" => "closed"}} = no_comment(engine, "reader", 1)
+    {same, {:error, "closed", _, _}} = no_comment(engine, "reader", 1)
     assert same == engine
   end
 
@@ -188,15 +187,10 @@ defmodule AttentionServer.NoCommentPartialContractTest do
       "request_revision" => revision
     }
 
-  defp committed_seq(%{"type" => "ok", "seq" => seq}), do: seq
-  defp duplicate?(result), do: result["duplicate"] == true
+  defp committed_seq({:ok, %{"seq" => seq}}), do: seq
+  defp duplicate?({:ok, result}), do: result["duplicate"] == true
 
-  defp request(engine, actor, frame) do
-    wire = if frame["type"] == "answer_no_comment", do: frame, else: Map.put(frame, "v", 1)
-    {next, {:ok, line}} = Engine.request_frame(engine, actor, wire, 10)
-    assert {:ok, result} = JSON.decode_line(line)
-    {next, result}
-  end
+  defp request(engine, actor, command), do: Engine.request_command(engine, actor, command, 10)
 
   defp message(title),
     do: %{
