@@ -99,9 +99,10 @@ defmodule AttentionServer.Store.DerivedIndex do
   @entry_kinds ~w(discussion reply revision)
 
   @fold_target """
-  (SELECT target.seq FROM relay_entries AS target
+  (SELECT target.seq FROM relay_entries AS target INDEXED BY relay_entries_event
    WHERE target.person = fact.person AND target.item = fact.item
-     AND target.event_id = fact.fold_event_id AND target.kind IN ('discussion', 'reply', 'revision')
+     AND target.event_id IS NOT NULL AND target.event_id = fact.fold_event_id
+     AND target.kind IN ('discussion', 'reply', 'revision')
    ORDER BY target.seq DESC LIMIT 1)
   """
 
@@ -111,8 +112,8 @@ defmodule AttentionServer.Store.DerivedIndex do
                 AND kind = 'reply' AND author = 'origin'),
   chat_started = EXISTS (SELECT 1 FROM relay_entries WHERE person = item.person AND item = item.seq
                          AND kind IN ('discussion', 'reply')),
-  availability_entry = (SELECT max(seq) FROM relay_entries WHERE person = item.person AND item = item.seq
-                        AND kind = 'availability'),
+  availability_entry = (SELECT max(seq) FROM relay_entries INDEXED BY relay_entries_item_kind
+                        WHERE person = item.person AND item = item.seq AND kind = 'availability'),
   discussed = EXISTS (SELECT 1 FROM relay_entries WHERE person = item.person AND item = item.seq
                       AND kind = 'discussion' AND author = 'person'),
   origin_revision = EXISTS (SELECT 1 FROM relay_feed WHERE person = item.person AND item = item.seq
