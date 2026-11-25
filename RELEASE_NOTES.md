@@ -2,9 +2,9 @@
 
 Fixes a case where an agent could miss a reply. When an agent's live listen
 stream stopped, the first person reply or agent answer written as the stream
-closed was counted as delivered even though nothing received it, so the
-agent's catch-up read (on first open, or after its cursor expired) left it out
-of every later catch-up read. Entries written a minute or more after the stream
+closed was counted as delivered even though nothing received it, so every
+later catch-up read by the agent (on first open, or after its cursor expired)
+left it out. Entries written a minute or more after the stream
 stopped, or after a Server restart, were not affected. The Server now keeps
 such an entry in the catch-up read until the agent reports receipt or handoff
 or acts on it. An agent may therefore see an entry it was already
