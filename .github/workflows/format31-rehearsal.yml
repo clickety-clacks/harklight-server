@@ -1,0 +1,105 @@
+name: FORMAT31 referenced-data conversion rehearsal
+
+on:
+  push:
+    branches: [server/format31-referenced-rehearsal]
+
+permissions:
+  contents: read
+
+jobs:
+  conversion:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      ATTENTION_SERVER_ENABLE: '0'
+      MIX_ENV: prod
+      ERL_FLAGS: '+S 2:2 +SDcpu 1 +SDio 1'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: '27.3.3'
+          elixir-version: '1.19.5'
+          version-type: strict
+      - run: mix deps.get --only prod
+      - run: mix compile
+      - name: Build synthetic fixture using the published snapshot writer
+        env:
+          SHAPE: '2400 100000 1300 300 400'
+        run: |
+          mkdir -p "$RUNNER_TEMP/measurements" "$RUNNER_TEMP/prior"
+          results="$RUNNER_TEMP/measurements"
+          git rev-parse HEAD HEAD^ >"$results/commits.txt"
+          awk '/^(MemTotal|MemAvailable):/' /proc/meminfo >"$results/capacity.txt"
+          df -Pk "$RUNNER_TEMP" | awk 'NR == 2 { print "disk_free_kib", $4 }' >>"$results/capacity.txt"
+          probe="$GITHUB_WORKSPACE/scripts/format31-rehearsal.exs"
+          echo "HARKLIGHT_PROBE=$probe" >>"$GITHUB_ENV"
+          archive=harklight-server-0.2.16-linux-x86_64.tar.gz
+          (
+            cd "$RUNNER_TEMP/prior"
+            release=https://github.com/clickety-clacks/harklight-server/releases/download/v0.2.16
+            curl --fail --silent --show-error --location --retry 3 --remote-name "$release/$archive"
+            curl --fail --silent --show-error --location --retry 3 --remote-name "$release/SHA256SUMS"
+            sha256sum --check --ignore-missing SHA256SUMS
+            tar -zxf "$archive"
+          ) >"$results/prior-package.log" 2>&1
+          prior="$RUNNER_TEMP/prior/harklight-server-0.2.16-linux-x86_64/bin/attention_server"
+          export HARKLIGHT_SHAPE="$SHAPE" HARKLIGHT_FIXTURE="$RUNNER_TEMP/seed" HARKLIGHT_PROBE="$probe"
+          timeout 20m "$prior" eval \
+            'System.argv(["seed", System.fetch_env!("HARKLIGHT_FIXTURE") | String.split(System.fetch_env!("HARKLIGHT_SHAPE"))]); Code.require_file(System.fetch_env!("HARKLIGHT_PROBE"))' \
+            >"$results/seed.log" 2>&1
+          files="$RUNNER_TEMP/seed/relay.sqlite3.uploads"
+          find "$files" -type f -print | wc -l > "$results/upload-files.txt"
+          du -sk "$files" | cut -f1 > "$results/upload-kib.txt"
+          test "$(cat "$results/upload-files.txt")" -ge 16
+      - name: Convert the referenced-data fixture and verify the retained files
+        run: |
+          results="$RUNNER_TEMP/measurements"
+          fixture="$RUNNER_TEMP/seed"
+          rehearsal() {
+            timeout 20m mix run --no-compile "$HARKLIGHT_PROBE" "$@"
+          }
+          for format in 29 30; do
+            cp -a "$fixture" "$RUNNER_TEMP/format$format"
+            input="$RUNNER_TEMP/format$format"
+            if [[ "$format" != 30 ]]; then
+              rehearsal variant "$input" "$format" >"$results/variant-$format.log" 2>&1
+            fi
+            rehearsal inspect "$input" >"$results/format-$format.log" 2>&1
+            tar -cf "$RUNNER_TEMP/backup.tar" -C "$input" .
+            stat --printf='backup_bytes %s\n' "$RUNNER_TEMP/backup.tar" >>"$results/format-$format.log"
+            rm -f "$RUNNER_TEMP/backup.tar"
+            cp -a "$input" "$RUNNER_TEMP/capped"
+            status=0
+            sudo systemd-run --quiet --wait --pipe --collect \
+              --property=MemoryMax=2G --property=MemorySwapMax=0 --uid="$(id -u)" \
+              --working-directory="$GITHUB_WORKSPACE" \
+              /usr/bin/env "PATH=$PATH" "MIX_ENV=$MIX_ENV" "ERL_FLAGS=$ERL_FLAGS" \
+              "ATTENTION_SERVER_ENABLE=0" "MIX_HOME=$HOME/.mix" \
+              timeout 15m mix run --no-compile "$HARKLIGHT_PROBE" convert "$RUNNER_TEMP/capped" \
+              >"$results/capped-$format.log" 2>&1 || status=$?
+            echo "exit=$status" >>"$results/capped-$format.log"
+            if ((status != 0)); then
+              rehearsal inspect "$RUNNER_TEMP/capped" >>"$results/capped-$format.log" 2>&1
+            fi
+            rm -rf -- "$RUNNER_TEMP/capped"
+            rehearsal convert "$input" >>"$results/format-$format.log" 2>&1
+            (
+              cd "$RUNNER_TEMP/seed/relay.sqlite3.uploads"
+              find . -type f -exec sha256sum {} + | sort
+            ) > "$results/before-files.sha256"
+            (
+              cd "$input/relay.sqlite3.uploads"
+              find . -type f -exec sha256sum {} + | sort
+            ) > "$results/after-format-$format-files.sha256"
+            diff -u "$results/before-files.sha256" "$results/after-format-$format-files.sha256"
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: format31-A-referenced-data
+          path: ${{ runner.temp }}/measurements/
