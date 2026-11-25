@@ -6,13 +6,13 @@ You need a Harklight account at [app.harklight.net](https://app.harklight.net/ac
 
 ## Get the Harklight app
 
-Harklight for iPhone is available as a public beta through Apple's TestFlight app. On your iPhone, open the [Harklight public beta invitation](https://testflight.apple.com/join/3Wqg8g11) and follow TestFlight's prompts to install Harklight. If you don't have TestFlight yet, install it from the App Store first.
+@HOSTED_APP_INSTALL@
 
 ## Connect your iPhone to your account
 
 Harklight on iPhone does not use your website password. Instead, you invite the phone from your account and then approve it.
 
-The iPhone app is a public beta. Joining a hosted account from it, and receiving and answering messages in it, have not yet been confirmed end to end. The steps below follow the beta app and the website as they are built. If a screen does not match a step, stop there rather than looking for another way to connect.
+The iPhone app is in testing. Joining a hosted account from it, and receiving and answering messages in it, have not yet been confirmed end to end. The steps below follow the beta app and the website as they are built. If a screen does not match a step, stop there rather than looking for another way to connect.
 
 1. Sign in to [your Harklight account](https://app.harklight.net/account/sign-in), open [Devices](https://app.harklight.net/devices) and choose Create invitation. The Invitation ready page shows your account and that the invitation has no expiry.
 2. Get the invitation onto your iPhone. Use Share invitation or Copy tappable link to send yourself the tappable invitation link, then tap it on the iPhone; it opens Harklight. If the link won't open, copy the Full invitation for Paste instead, open Harklight, paste it into Full invitation and choose Check invitation.
