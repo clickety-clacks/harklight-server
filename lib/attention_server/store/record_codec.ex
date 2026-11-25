@@ -28,15 +28,17 @@ defmodule AttentionServer.Store.RecordCodec do
 
   # Enumerate at boot or migration. Routine writes only call encode_row/2
   # for records named by the transition.
-  def encode(%Engine{} = engine) do
+  def encode(%Engine{} = engine, prepare \\ &Function.identity/1) do
+    encode = fn address, value -> encode_row(address, prepare.(value)) end
+
     fields =
       Stream.flat_map(@fields, fn {field, kind} ->
         value = Map.fetch!(engine, field)
 
         case kind do
-          :field -> [encode_row({:field, field}, value)]
-          :row -> Stream.map(value, fn {key, row} -> encode_row({:row, field, key}, row) end)
-          :member -> Stream.map(value, &encode_row({:member, field, &1}, true))
+          :field -> [encode.({:field, field}, value)]
+          :row -> Stream.map(value, fn {key, row} -> encode.({:row, field, key}, row) end)
+          :member -> Stream.map(value, &encode.({:member, field, &1}, true))
         end
       end)
 
@@ -44,28 +46,28 @@ defmodule AttentionServer.Store.RecordCodec do
       Stream.flat_map(engine.advisory_feeds, fn {scope, feed} ->
         entries =
           Stream.map(feed.entries, fn {seq, entry} ->
-            encode_row({:advisory, scope, {:entry, seq}}, entry)
+            encode.({:advisory, scope, {:entry, seq}}, entry)
           end)
 
         receipts =
-          Stream.map(feed.receipts, &encode_row({:advisory, scope, {:receipt, &1}}, true))
+          Stream.map(feed.receipts, &encode.({:advisory, scope, {:receipt, &1}}, true))
 
-        Stream.concat([[encode_row({:advisory, scope, :high}, feed.high)], entries, receipts])
+        Stream.concat([[encode.({:advisory, scope, :high}, feed.high)], entries, receipts])
       end)
 
     origins =
       Stream.flat_map(engine.origin_feeds, fn {scope, feed} ->
         entries =
           Stream.map(feed.entries, fn {seq, entry} ->
-            encode_row({:origin_feed, scope, {:entry, seq}}, entry)
+            encode.({:origin_feed, scope, {:entry, seq}}, entry)
           end)
 
         acks =
           Stream.map(Map.get(feed, :delivery_acks, %{}), fn {seq, ack} ->
-            encode_row({:origin_feed, scope, {:delivery_ack, seq}}, ack)
+            encode.({:origin_feed, scope, {:delivery_ack, seq}}, ack)
           end)
 
-        Stream.concat([[encode_row({:origin_feed, scope, :high}, feed.high)], entries, acks])
+        Stream.concat([[encode.({:origin_feed, scope, :high}, feed.high)], entries, acks])
       end)
 
     Stream.concat([fields, advisories, origins])
@@ -148,12 +150,14 @@ defmodule AttentionServer.Store.RecordCodec do
     end
   end
 
-  def matches_row?(engine, {key, payload, hash})
+  def matches_row?(engine, row, prepare \\ &Function.identity/1)
+
+  def matches_row?(engine, {key, payload, hash}, prepare)
       when is_binary(key) and is_binary(payload) and is_binary(hash) do
     with true <- hash == checksum(key, payload),
          {@record_version, address} <- :erlang.binary_to_term(key, [:safe]),
          {:ok, value} <- lookup(engine, address) do
-      :erlang.binary_to_term(payload, [:safe]) === value
+      :erlang.binary_to_term(payload, [:safe]) === prepare.(value)
     else
       _ -> false
     end
@@ -162,7 +166,7 @@ defmodule AttentionServer.Store.RecordCodec do
     KeyError -> false
   end
 
-  def matches_row?(_engine, _row), do: false
+  def matches_row?(_engine, _row, _prepare), do: false
 
   defp complete_feeds?(feeds),
     do: Enum.all?(feeds, fn {_scope, feed} -> not is_nil(feed.high) end)

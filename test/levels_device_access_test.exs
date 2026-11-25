@@ -242,7 +242,7 @@ defmodule AttentionServer.LevelsDeviceAccessTest do
     assert :ok =
              Sqlite3.execute(
                db,
-               "CREATE TRIGGER refuse_levels BEFORE UPDATE ON relay_state BEGIN SELECT RAISE(ABORT, 'blocked'); END"
+               "CREATE TRIGGER refuse_levels BEFORE UPDATE ON relay_record_generation BEGIN SELECT RAISE(ABORT, 'blocked'); END"
              )
 
     assert %{

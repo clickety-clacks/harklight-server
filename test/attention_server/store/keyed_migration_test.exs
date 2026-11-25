@@ -45,7 +45,7 @@ defmodule AttentionServer.Store.KeyedMigrationTest do
     warning =
       capture_log(fn ->
         assert {:error, {:storage_unavailable, {:error, :format31_requires_keyed_mode}}} =
-                 Store.open(path)
+                 Store.open(path, :legacy)
       end)
 
     assert warning =~ "FORMAT31"

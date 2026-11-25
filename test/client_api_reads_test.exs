@@ -29,6 +29,7 @@ defmodule AttentionServer.ClientAPIReadsTest do
   end
 
   defp start(path) do
+    :ok = PreChangeLogStore.convert_fixture(path)
     assert {:ok, relay} = Relay.start_link(store_path: path, agent_fixture_mode: true)
     relay
   end

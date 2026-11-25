@@ -281,19 +281,11 @@ defmodule AttentionServer.Store do
   end
 
   def convert_stopped(path, budget, expected_format) when is_binary(path) and path != "" do
-    case convert_legacy_store(path, &ConversionPreflight.check(&1, budget, expected_format)) do
-      {:ok, %__MODULE__{} = converted} ->
-        with :ok <- close(converted), do: {:ok, :converted}
-
-      {:ok, :already_converted} = result ->
-        result
-
-      error ->
-        error
-    end
+    preflight = &ConversionPreflight.check(&1, budget, expected_format)
+    convert_legacy_store(path, preflight, fn _store, _engine, _generation -> {:ok, :converted} end)
   end
 
-  defp convert_legacy_store(path, preflight \\ fn _db -> :ok end) do
+  defp convert_legacy_store(path, preflight \\ fn _db -> :ok end, prepare \\ &prepare_keyed_conversion/3) do
     upload_dir = Path.expand(path) <> ".uploads"
 
     with {:ok, db} <- Sqlite3.open(path, mode: :readwrite) do
@@ -301,15 +293,15 @@ defmodule AttentionServer.Store do
         result =
           RecordTable.transaction(db, fn ->
             case preflight.(db) do
-              :ok -> convert_locked(db, upload_dir)
-              {:ok, _info} -> convert_locked(db, upload_dir)
+              :ok -> convert_locked(db, upload_dir, prepare)
+              {:ok, _info} -> convert_locked(db, upload_dir, prepare)
               {:already_converted, 31} -> {:ok, :already_converted}
               error -> error
             end
           end)
 
         case result do
-          {:ok, :already_converted} = success ->
+          {:ok, result} = success when result in [:converted, :already_converted] ->
             _ = Sqlite3.close(db)
             success
 
@@ -331,7 +323,7 @@ defmodule AttentionServer.Store do
 
   # Normalise in memory so a failed install preserves the old anchor and
   # progress rows at their original generation.
-  defp convert_locked(db, upload_dir) do
+  defp convert_locked(db, upload_dir, prepare) do
     with :ok <- Sqlite3.execute(db, @schema),
          {:ok, legacy} <- load_or_create(db, upload_dir, :convert),
          {:ok, rows} <- load_large_data_references(db),
@@ -342,7 +334,7 @@ defmodule AttentionServer.Store do
         %{legacy | engine: engine},
         engine,
         legacy.version,
-        &prepare_keyed_conversion/3
+        prepare
       )
     end
   end
@@ -1092,10 +1084,11 @@ defmodule AttentionServer.Store do
       result =
         Persistence.run(fn ->
           RecordTable.commit(db, version, records, fn db, generation ->
-            with :ok <- DerivedIndex.commit(db, generation, derived),
+            with :ok <- DerivedIndex.write(db, derived),
                  :ok <- write_reference_delta(db, delete_paths, references),
                  :ok <- write_audit(db, audit),
-                 {:ok, heads, agent_heads} <- append_change_logs(db, log, generation) do
+                 {:ok, heads, agent_heads} <- append_change_logs(db, log, generation),
+                 :ok <- DerivedIndex.advance(db, generation) do
               {:ok, {heads, agent_heads}}
             end
           end)

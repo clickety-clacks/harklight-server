@@ -94,7 +94,6 @@ defmodule AttentionServer.APNSPushTest do
   }
 
   alias AttentionServer.PushDispatcher.Worker
-  alias Exqlite.Sqlite3
 
   @provider_profile "harklight-sandbox"
   @production_profile "harklight-production"
@@ -2271,78 +2270,32 @@ defmodule AttentionServer.APNSPushTest do
   end
 
   defp seed_legacy_provider_reason(path, reason) do
-    assert {:ok, db} = Sqlite3.open(path)
-    assert {:ok, select} = Sqlite3.prepare(db, "SELECT payload FROM relay_state WHERE id = 1")
-    assert {:row, [payload]} = Sqlite3.step(db, select)
-    assert :ok = Sqlite3.release(db, select)
-    assert :ok = Sqlite3.close(db)
+    :ok = AttentionServer.PreChangeLogStore.snapshot_fixture(path, 10, fn engine ->
+      {key, binding} =
+        Enum.find(engine.push_bindings, fn {_key, binding} -> binding.address == @device_token end)
 
-    {:attention_relay_state, _format, engine} = :erlang.binary_to_term(payload, [:safe])
+      put_in(engine.push_bindings[key], %{binding | last_outcome: Map.put(binding.last_outcome, "reason", reason)})
+    end)
 
-    {key, binding} =
-      Enum.find(engine.push_bindings, fn {_key, binding} -> binding.address == @device_token end)
-
-    old_outcome = Map.put(binding.last_outcome, "reason", reason)
-    old_binding = %{binding | last_outcome: old_outcome}
-    old_engine = %{engine | push_bindings: Map.put(engine.push_bindings, key, old_binding)}
-
-    legacy_payload =
-      :erlang.term_to_binary({:attention_relay_state, 10, old_engine}, [{:compressed, 6}])
-
-    assert {:ok, db} = Sqlite3.open(path)
-
-    assert {:ok, update} =
-             Sqlite3.prepare(
-               db,
-               "UPDATE relay_state SET payload = ?, checksum = ? WHERE id = 1"
-             )
-
-    assert :ok =
-             Sqlite3.bind(update, [
-               {:blob, legacy_payload},
-               {:blob, :crypto.hash(:sha256, legacy_payload)}
-             ])
-
-    assert :done = Sqlite3.step(db, update)
-    assert :ok = Sqlite3.release(db, update)
-    assert :ok = Sqlite3.close(db)
+    :ok = AttentionServer.PreChangeLogStore.convert_fixture(path)
   end
 
-  # Rewrites the persisted engine as a format-16 payload (no accepted_high) and
-  # moves the binding's send time into the past, as if the server had been down
-  # until the queued push was eligible.
+  # FORMAT16 did not store accepted_high. Move the queued push into the past,
+  # as if the server had been down until it was eligible.
   defp seed_legacy_push_format16_past_window(path) do
-    assert {:ok, db} = Sqlite3.open(path)
-    assert {:ok, select} = Sqlite3.prepare(db, "SELECT payload FROM relay_state WHERE id = 1")
-    assert {:row, [payload]} = Sqlite3.step(db, select)
-    assert :ok = Sqlite3.release(db, select)
+    :ok = AttentionServer.PreChangeLogStore.snapshot_fixture(path, 16, fn engine ->
+      past = System.system_time(:millisecond) - 1
 
-    {:attention_relay_state, _format, engine} = :erlang.binary_to_term(payload, [:safe])
-    past = System.system_time(:millisecond) - 1
+      bindings =
+        Map.new(engine.push_bindings, fn {key, binding} ->
+          next_at = if is_integer(binding.next_at), do: past, else: nil
+          {key, binding |> Map.delete(:accepted_high) |> Map.put(:next_at, next_at)}
+        end)
 
-    bindings =
-      Map.new(engine.push_bindings, fn {key, binding} ->
-        next_at = if is_integer(binding.next_at), do: past, else: nil
-        {key, binding |> Map.delete(:accepted_high) |> Map.put(:next_at, next_at)}
-      end)
+      %{engine | push_bindings: bindings}
+    end)
 
-    legacy = %{engine | push_bindings: bindings}
-
-    legacy_payload =
-      :erlang.term_to_binary({:attention_relay_state, 16, legacy}, [{:compressed, 6}])
-
-    assert {:ok, update} =
-             Sqlite3.prepare(db, "UPDATE relay_state SET payload = ?, checksum = ? WHERE id = 1")
-
-    assert :ok =
-             Sqlite3.bind(update, [
-               {:blob, legacy_payload},
-               {:blob, :crypto.hash(:sha256, legacy_payload)}
-             ])
-
-    assert :done = Sqlite3.step(db, update)
-    assert :ok = Sqlite3.release(db, update)
-    assert :ok = Sqlite3.close(db)
+    :ok = AttentionServer.PreChangeLogStore.convert_fixture(path)
   end
 
   defp available_port do

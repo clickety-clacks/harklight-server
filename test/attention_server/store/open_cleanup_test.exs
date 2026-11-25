@@ -39,6 +39,8 @@ defmodule AttentionServer.Store.OpenCleanupTest do
     test "a refused #{mode} open cannot prune a file while a writer holds the lock", %{path: path} do
       mode = unquote(mode)
 
+      if mode == :legacy, do: AttentionServer.PreChangeLogStore.snapshot_fixture(path)
+
       if mode == :keyed do
         assert {:ok, keyed} = Store.open(path, :keyed_cutover)
         assert :ok = Store.close(keyed)
@@ -96,6 +98,7 @@ defmodule AttentionServer.Store.OpenCleanupTest do
           assert :ok = Store.close(keyed)
           "UPDATE relay_record_generation SET generation = generation + 1 WHERE id = 1"
         else
+          :ok = AttentionServer.PreChangeLogStore.snapshot_fixture(path)
           "UPDATE relay_state SET version = version + 1 WHERE id = 1"
         end
 

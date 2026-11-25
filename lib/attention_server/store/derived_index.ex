@@ -195,14 +195,26 @@ defmodule AttentionServer.Store.DerivedIndex do
     end)
   end
 
-  def commit(db, generation, changes) do
+  def write(db, changes) do
     with {:ok, seeds} <- old_ancestors(db, changes.items),
          :ok <- each(changes.remove, &delete(db, &1)),
          :ok <- each(changes.add, &insert(db, &1)),
          :ok <- each(changes.folds, &refresh_fold(db, &1)),
-         :ok <- each(changes.items, &refresh_item(db, &1)),
-         :ok <- each(seeds, &refresh_liveness(db, &1)) do
-      RecordTable.run(db, "UPDATE relay_index_state SET generation = ? WHERE id = 1", [generation])
+         :ok <- each(changes.items, &refresh_item(db, &1)) do
+      each(seeds, &refresh_liveness(db, &1))
+    end
+  end
+
+  def advance(db, generation) do
+    with :ok <- RecordTable.run(db, """
+                UPDATE relay_index_state SET generation = ?
+                WHERE id = 1 AND generation = ? AND index_version = ? AND liveness_version = ?
+                """, [generation, generation - 1, @index_version, @liveness_version]),
+         {:ok, 1} <- Sqlite3.changes(db) do
+      :ok
+    else
+      {:ok, _} -> {:error, :stale_derived_indexes}
+      error -> error
     end
   end
 

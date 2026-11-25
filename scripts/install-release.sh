@@ -457,7 +457,7 @@ chmod 600 "$backup_tmp/INSTALL_INFO"
 mv -- "$backup_tmp" "$backup_final"
 backup_tmp=""
 
-if ! grep -Fqx "version=\${current_tag#v}" "$current_path/BUILD_INFO"; then
+if ! grep -Fqx "version=${current_tag#v}" "$current_path/BUILD_INFO"; then
   fail "previous release metadata differs from its selected version; release was not switched"
 fi
 

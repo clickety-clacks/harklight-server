@@ -10,13 +10,63 @@ defmodule AttentionServer.PreChangeLogStore do
   their row format), since the Server no longer has the code that wrote them.
   """
 
-  alias AttentionServer.{Conversation, Engine, JSON, RouteBIndex, Store}
+  alias AttentionServer.{Conversation, Engine, JSON, LargeData, RouteBIndex, Store}
+  alias AttentionServer.Store.RecordTable
   alias Exqlite.Sqlite3
 
   @doc "Opens `path` without the change logs, runs `fun` on the store, and closes it."
   def write(path, fun) do
     {:ok, %Store{change_log: false} = store} = Store.open(path)
+    store = Store.track_relay_writes(store)
     %Store{change_log: false} = store = fun.(store)
+    :ok = Store.close(store)
+  end
+
+  @doc "Convert a synthetic snapshot fixture before starting the production Relay."
+  def convert_fixture(path) do
+    if File.regular?(path) do
+      {:ok, db} = Sqlite3.open(path, mode: :readonly)
+      {:ok, [[row_store]]} = RecordTable.select(db, "SELECT EXISTS (SELECT 1 FROM sqlite_schema WHERE name = 'relay_records')")
+      :ok = Sqlite3.close(db)
+
+      if row_store == 0 do
+        {:ok, store} = Store.open(path, :keyed_cutover)
+        :ok = Store.close(store)
+      end
+    end
+
+    :ok
+  end
+
+  @doc "Write a historical snapshot fixture from a stopped synthetic row store."
+  def snapshot_fixture(path, format \\ 30, change \\ &Function.identity/1) do
+    {:ok, %{mode: :keyed} = store} = Store.open(path, :keyed)
+    persisted = store.engine |> change.() |> LargeData.persist_refs()
+    payload = :erlang.term_to_binary({:attention_relay_state, format, persisted}, compressed: 6)
+
+    {:ok, :snapshot} =
+      RecordTable.transaction(store.db, fn ->
+        :ok = Sqlite3.execute(store.db, """
+        DROP TABLE relay_records;
+        DROP TABLE relay_record_generation;
+        DROP TABLE relay_index_state;
+        DROP TABLE relay_items;
+        DROP TABLE relay_entries;
+        DROP TABLE relay_feed;
+        DROP TABLE relay_advisories;
+        DROP TABLE relay_sessions;
+        DROP TABLE relay_authority;
+        DROP TABLE relay_upload_refs;
+        DROP INDEX relay_large_data_refs_id;
+        """)
+
+        :ok = run(store.db, "UPDATE relay_state SET version = ?, payload = ?, checksum = ? WHERE id = 1", [
+          store.version, {:blob, payload}, {:blob, :crypto.hash(:sha256, payload)}
+        ])
+
+        {:ok, :snapshot}
+      end)
+
     :ok = Store.close(store)
   end
 
@@ -134,10 +184,7 @@ defmodule AttentionServer.PreChangeLogStore do
     person = person(store, key)
     true = seq >= Map.get(store.engine.conversation_cursors, {person, key}, 0)
 
-    engine = %{
-      store.engine
-      | conversation_cursors: Map.put(store.engine.conversation_cursors, {person, key}, seq)
-    }
+    engine = Engine.put_row(store.engine, :conversation_cursors, {person, key}, seq)
 
     audit = %{person: person, actor: key, action: "conversation_ack"}
     {:ok, store} = Store.commit(store, engine, audit)
@@ -174,16 +221,10 @@ defmodule AttentionServer.PreChangeLogStore do
         reply: %{"session_handle" => handle, "listening_support" => record}
       }
 
-      engine = %{
+      engine =
         engine
-        | origin_sessions:
-            Map.put(
-              engine.origin_sessions,
-              {person, key, handle},
-              Map.put(session, :support, record)
-            ),
-          receipts: Map.put(engine.receipts, {person, key, op_id}, receipt)
-      }
+        |> Engine.put_row(:origin_sessions, {person, key, handle}, Map.put(session, :support, record))
+        |> Engine.put_row(:receipts, {person, key, op_id}, receipt)
 
       commit(store, {:ok, engine}, %{person: person, actor: key, action: "origin_support"})
     end
@@ -223,20 +264,13 @@ defmodule AttentionServer.PreChangeLogStore do
     seq = Map.get(engine.conversation_highs, person, 0) + 1
     event = %{kind: :conversation, key: message_key, payload: payload}
 
-    engine = %{
-      engine
-      | origin_receipts: Map.put(engine.origin_receipts, {person, key, feed_seq}, receipt),
-        conversation_highs: Map.put(engine.conversation_highs, person, seq),
-        conversation_events: Map.put(engine.conversation_events, {person, seq}, event),
-        route_b_index:
-          RouteBIndex.put_conversation_event(
-            engine.route_b_index,
-            person,
-            seq,
-            message_key,
-            payload
-          )
-    }
+    index = RouteBIndex.put_conversation_event(engine.route_b_index, person, seq, message_key, payload)
+
+    engine =
+      %{engine | route_b_index: index}
+      |> Engine.put_row(:origin_receipts, {person, key, feed_seq}, receipt)
+      |> Engine.put_row(:conversation_highs, person, seq)
+      |> Engine.put_row(:conversation_events, {person, seq}, event)
 
     commit(store, {:ok, engine}, %{person: person, actor: key, action: "origin_ack"})
   end

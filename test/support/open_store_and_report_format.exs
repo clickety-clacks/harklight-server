@@ -3,7 +3,7 @@ alias Exqlite.Sqlite3
 
 {:ok, _started} = Application.ensure_all_started(:crypto)
 path = Path.join(System.fetch_env!("HARKLIGHT_TEST_ROOT"), "state/relay.sqlite3")
-{:ok, store} = Store.open(path)
+{:ok, store} = Store.open(path, :keyed_cutover)
 :ok = Store.close(store)
 
 {:ok, db} = Sqlite3.open(path)
@@ -11,7 +11,7 @@ path = Path.join(System.fetch_env!("HARKLIGHT_TEST_ROOT"), "state/relay.sqlite3"
 {:row, [payload]} = Sqlite3.step(db, statement)
 :ok = Sqlite3.release(db, statement)
 :ok = Sqlite3.close(db)
-{:attention_relay_state, format, _engine} = :erlang.binary_to_term(payload, [:safe])
+{:attention_relay_keyed_state, format, _codec} = :erlang.binary_to_term(payload, [:safe])
 
 File.write!(System.fetch_env!("HARKLIGHT_TEST_MIGRATION_LOG"), "format=#{format}\n")
 IO.puts("candidate store opened, migrated, and closed at format #{format}")

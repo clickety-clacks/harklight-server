@@ -324,16 +324,7 @@ defmodule AttentionServer.GuidedJoinHTTPSTest do
     stop_supervised(EnrollmentHTTPS)
     stop_supervised(OwnerTLS)
     stop_supervised(Relay)
-    payload = :erlang.term_to_binary({:attention_relay_state, 15, old}, [{:compressed, 6}])
-    {:ok, db} = Exqlite.Sqlite3.open(c.path)
-
-    {:ok, stmt} =
-      Exqlite.Sqlite3.prepare(db, "UPDATE relay_state SET payload = ?, checksum = ? WHERE id = 1")
-
-    :ok = Exqlite.Sqlite3.bind(stmt, [{:blob, payload}, {:blob, :crypto.hash(:sha256, payload)}])
-    :done = Exqlite.Sqlite3.step(db, stmt)
-    :ok = Exqlite.Sqlite3.release(db, stmt)
-    :ok = Exqlite.Sqlite3.close(db)
+    :ok = AttentionServer.PreChangeLogStore.snapshot_fixture(c.path, 15, fn _ -> old end)
 
     {:ok, migrated} = Store.open(c.path)
     recovered = migrated.engine.pending_enrollments[code]
@@ -344,6 +335,7 @@ defmodule AttentionServer.GuidedJoinHTTPSTest do
     assert migrated.engine.pending_history == %{}
     Store.close(migrated)
 
+    :ok = AttentionServer.PreChangeLogStore.convert_fixture(c.path)
     {:ok, resumed_relay} = Relay.start_link(store_path: c.path, join_configuration: c.config)
     on_exit(fn -> if Process.alive?(resumed_relay), do: GenServer.stop(resumed_relay) end)
 
@@ -490,12 +482,11 @@ defmodule AttentionServer.GuidedJoinHTTPSTest do
       |> Map.delete("device_url")
       |> Map.put("relay_url", "wss://#{host}:#{port}/relay")
 
-    next = put_in(engine.join_invitations[hash].configuration, v1)
-
-    assert {:ok, store} =
-             Store.commit(store, next, %{person: c.person, actor: "test", action: "v1_invite"})
-
-    Store.close(store)
+    assert :ok = Store.close(store)
+    :ok = AttentionServer.PreChangeLogStore.snapshot_fixture(c.path, 30, fn engine ->
+      put_in(engine.join_invitations[hash].configuration, v1)
+    end)
+    :ok = AttentionServer.PreChangeLogStore.convert_fixture(c.path)
 
     relay = start_supervised!({Relay, store_path: c.path, join_configuration: c.config})
 

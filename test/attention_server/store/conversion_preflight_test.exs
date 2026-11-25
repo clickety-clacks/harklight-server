@@ -62,6 +62,41 @@ defmodule AttentionServer.Store.ConversionPreflightTest do
     end
   end
 
+  test "an envelope can refuse a format mismatch, an over-budget decode, or an out-of-shape store" do
+    {:ok, db} = Sqlite3.open(":memory:")
+    on_exit(fn -> Sqlite3.close(db) end)
+    :ok = Sqlite3.execute(db, "CREATE TABLE relay_state (id INTEGER PRIMARY KEY, payload BLOB)")
+    :ok = Sqlite3.execute(db, "CREATE TABLE agent_changes (id INTEGER PRIMARY KEY)")
+
+    payload = :erlang.term_to_binary({:attention_relay_state, 30, %{body: :binary.copy("synthetic", 20_000)}}, compressed: 6)
+    {:ok, stmt} = Sqlite3.prepare(db, "INSERT INTO relay_state VALUES (1, ?)")
+    :ok = Sqlite3.bind(stmt, [{:blob, payload}])
+    :done = Sqlite3.step(db, stmt)
+    :ok = Sqlite3.release(db, stmt)
+
+    mib = 1024 * 1024
+    budget = %{memory: 128 * mib, disk: 128 * mib, uploads: 0}
+
+    envelope = %{
+      expanded_bytes: mib,
+      memory_fixed: 64 * mib, memory_per_byte: 32,
+      disk_fixed: 64 * mib, disk_per_byte: 3,
+      revisions: 0, changes: 0, references: 0, uploads: 0
+    }
+
+    assert {:ok, %{format: 30}} = ConversionPreflight.check(db, budget, 30, %{30 => envelope})
+
+    assert {:error, :source_format_mismatch} =
+             ConversionPreflight.check(db, budget, 29, %{30 => envelope})
+
+    assert {:error, :fit_not_established} =
+             ConversionPreflight.check(db, %{budget | memory: 48 * mib}, 30, %{30 => envelope})
+
+    :ok = Sqlite3.execute(db, "INSERT INTO agent_changes VALUES (1)")
+
+    assert {:error, :fit_not_established} = ConversionPreflight.check(db, budget, 30, %{30 => envelope})
+  end
+
   test "accepts the older atom tag encodings without loading an Engine" do
     tag = "attention_relay_state"
     size = byte_size(tag)

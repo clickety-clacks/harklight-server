@@ -411,7 +411,7 @@ defmodule AttentionServer.HostedAccountTest do
       assert :ok =
                Sqlite3.execute(
                  db,
-                 "CREATE TRIGGER reject_delivery_state BEFORE UPDATE OF payload ON relay_state " <>
+                 "CREATE TRIGGER reject_delivery_state BEFORE UPDATE ON relay_record_generation " <>
                    "BEGIN SELECT RAISE(ABORT, 'forced storage failure'); END;"
                )
 

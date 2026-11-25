@@ -7,7 +7,7 @@ defmodule AttentionServer.CLIHelpTest do
   test "top-level help aliases show the packaged usage" do
     for flag <- ["help", "--help", "-h"] do
       assert capture_io(fn -> assert :ok = CLI.run([flag]) end) ==
-               "harklight operator|enroll|owner|device|agent ...; see SELF_HOST.md\n"
+               "harklight operator|enroll|owner|device|agent|store ...; see SELF_HOST.md\n"
     end
   end
 

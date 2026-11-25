@@ -28,15 +28,15 @@ defmodule AttentionServer.Store.KeyedMigration do
 
   def convert_locked(%Store{db: db} = store, engine, version, prepare) do
     engine = split_item_availability(engine)
-    persisted = LargeData.persist_refs(engine)
     generation = version + 1
+    rows = RecordCodec.encode(engine, &LargeData.persist_refs/1)
 
     with :ok <- verify_previous_progress(store),
          :ok <- Store.verify_retained_uploads(store),
          :ok <- large_data_index(db),
-         {:ok, count} <- RecordTable.seed_count(db, generation, RecordCodec.encode(persisted)),
-         :ok <- verify_records(db, persisted, count),
-         :ok <- DerivedIndex.create(db, generation, persisted),
+         {:ok, count} <- RecordTable.seed_count(db, generation, rows),
+         :ok <- DerivedIndex.create(db, generation, engine),
+         :ok <- verify_records(db, engine, count),
          {:ok, prepared} <- prepare.(store, engine, generation),
          :ok <- write_anchor(db, version, generation),
          :ok <- advance_current_logs(db, version, generation),
@@ -114,7 +114,7 @@ defmodule AttentionServer.Store.KeyedMigration do
     result =
       RecordTable.scan(db, fn rows ->
         Enum.reduce_while(rows, 0, fn row, verified ->
-          if RecordCodec.matches_row?(expected, row),
+          if RecordCodec.matches_row?(expected, row, &LargeData.persist_refs/1),
             do: {:cont, verified + 1},
             else: {:halt, :mismatch}
         end)

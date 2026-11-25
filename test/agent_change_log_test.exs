@@ -418,6 +418,7 @@ defmodule AttentionServer.AgentChangeLogTest do
   end
 
   defp start(ctx) do
+    :ok = PreChangeLogStore.convert_fixture(ctx.path)
     assert {:ok, relay} = Relay.start_link(store_path: ctx.path, agent_fixture_mode: true)
     relay
   end

@@ -191,20 +191,14 @@ defmodule AttentionServer.PrioritizationTest do
     assert :ok = Relay.setup_sender(relay, "device-a", "app:test")
   end
 
-  defp persisted_snapshot(path) do
-    assert {:ok, db} = Sqlite3.open(path)
-
-    assert {:ok, state_stmt} =
-             Sqlite3.prepare(
-               db,
-               "SELECT version, payload, checksum FROM relay_state WHERE id = 1"
-             )
-
-    assert {:row, [version, payload, checksum]} = Sqlite3.step(db, state_stmt)
-    assert :ok = Sqlite3.release(db, state_stmt)
-
+  defp persisted_rows(path) do
+    alias AttentionServer.Store.RecordTable
+    assert {:ok, db} = Sqlite3.open(path, mode: :readonly)
+    assert {:ok, generation} = RecordTable.generation(db)
+    assert {:ok, rows} = RecordTable.select(db, "SELECT key, payload, checksum FROM relay_records ORDER BY key")
     assert :ok = Sqlite3.close(db)
-    {version, payload, checksum}
+    assert Enum.all?(rows, fn [key, payload, checksum] -> :crypto.hash(:sha256, [key, payload]) == checksum end)
+    {generation, rows}
   end
 
   defp forward(relay, n, id, deadline \\ nil, body \\ nil) do
@@ -2604,8 +2598,7 @@ defmodule AttentionServer.PrioritizationTest do
     declared = :sys.get_state(relay).store.engine.origin_sessions[session_key].support
     assert %{"route" => "claude-code"} = declared
 
-    {support_version, support_payload, support_checksum} = persisted_snapshot(path)
-    assert :crypto.hash(:sha256, support_payload) == support_checksum
+    {support_version, support_rows} = persisted_rows(path)
 
     job = start_synthetic_priority_pass(relay)
 
@@ -2621,11 +2614,10 @@ defmodule AttentionServer.PrioritizationTest do
     assert active["score"] == %JSON.DecimalToken{raw: "0.9"}
     assert active["score_kind"] == "current"
 
-    {reply_version, reply_payload, reply_checksum} = persisted_snapshot(path)
+    {reply_version, reply_rows} = persisted_rows(path)
 
     assert reply_version == support_version + 1
-    assert reply_payload != support_payload
-    assert :crypto.hash(:sha256, reply_payload) == reply_checksum
+    assert reply_rows != support_rows
 
     read_reply(relay, "reply-history", reply_seq, 2712)
 
@@ -2779,7 +2771,7 @@ defmodule AttentionServer.PrioritizationTest do
     assert :ok =
              Sqlite3.execute(
                state.store.db,
-               "CREATE TRIGGER reject_history BEFORE UPDATE ON relay_state BEGIN SELECT RAISE(ABORT, 'synthetic storage failure'); END"
+               "CREATE TRIGGER reject_history BEFORE UPDATE ON relay_record_generation BEGIN SELECT RAISE(ABORT, 'synthetic storage failure'); END"
              )
 
     job = start_synthetic_priority_pass(relay)
@@ -2816,13 +2808,8 @@ defmodule AttentionServer.PrioritizationTest do
       )
 
     GenServer.stop(relay)
-    payload = :erlang.term_to_binary({:attention_relay_state, 24, old_engine}, [{:compressed, 6}])
-    assert {:ok, db} = Sqlite3.open(path)
-    assert {:ok, stmt} = Sqlite3.prepare(db, "UPDATE relay_state SET payload = ?, checksum = ?")
-    assert :ok = Sqlite3.bind(stmt, [{:blob, payload}, {:blob, :crypto.hash(:sha256, payload)}])
-    assert :done = Sqlite3.step(db, stmt)
-    assert :ok = Sqlite3.release(db, stmt)
-    assert :ok = Sqlite3.close(db)
+    :ok = PreChangeLogStore.snapshot_fixture(path, 24, fn _ -> old_engine end)
+    :ok = PreChangeLogStore.convert_fixture(path)
     restarted = start_relay(path)
 
     assert [%{"kind" => "message"}, %{"kind" => "reply", "unseen_count" => 0} = group] =
@@ -3026,7 +3013,7 @@ defmodule AttentionServer.PrioritizationTest do
     assert :ok =
              Sqlite3.execute(
                state.store.db,
-               "CREATE TRIGGER reject_arrival BEFORE UPDATE ON relay_state BEGIN SELECT RAISE(ABORT, 'synthetic storage failure'); END"
+               "CREATE TRIGGER reject_arrival BEFORE UPDATE ON relay_record_generation BEGIN SELECT RAISE(ABORT, 'synthetic storage failure'); END"
              )
 
     frame = %{
