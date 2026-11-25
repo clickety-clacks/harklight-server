@@ -17,10 +17,6 @@ stage="$(mktemp -d)"
 trap 'rm -rf -- "$stage"' EXIT
 name="harklight-server-$version-linux-x86_64"
 mix release attention_server --path "$stage/$name" --overwrite
-mkdir -p "$stage/$name/lib/attention_server-$version/priv"
-cc -Os -DSQLITE_OMIT_LOAD_EXTENSION -I deps/exqlite/c_src \
-  support/snapshot_prefix.c deps/exqlite/c_src/sqlite3.c -pthread -lm \
-  -o "$stage/$name/lib/attention_server-$version/priv/snapshot-prefix"
 install -m 755 scripts/harklight "$stage/$name/bin/harklight"
 install -m 755 scripts/bootstrap.sh "$stage/$name/bin/harklight-bootstrap"
 install -m 755 scripts/install-release.sh "$stage/$name/bin/harklight-release-install"

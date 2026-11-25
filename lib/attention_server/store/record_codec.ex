@@ -96,6 +96,31 @@ defmodule AttentionServer.Store.RecordCodec do
 
   def encode_key(address), do: :erlang.term_to_binary({@record_version, address}, @term_options)
 
+  def decode_key(key) when is_binary(key) do
+    case :erlang.binary_to_term(key, [:safe]) do
+      {@record_version, address} -> {:ok, address}
+      _ -> {:error, :invalid_state}
+    end
+  rescue
+    ArgumentError -> {:error, :invalid_state}
+  end
+
+  def account?({:field, _}), do: true
+  def account?({:origin_feed, _, :high}), do: true
+  def account?({:member, _, _}), do: true
+
+  def account?({:row, field, _}) do
+    field in [
+      :persons, :owners, :pending_enrollments, :pending_history, :join_invitations,
+      :browser_sign_ins, :maintainer_grants, :devices, :agents, :sender_grants,
+      :source_report_grants, :enrollment_read_grants, :free_order_highs, :conversation_highs,
+      :conversation_cursors, :subscriptions, :cursors, :hosted_accounts, :delivery_states,
+      :algorithm_choices, :alert_choices, :push_bindings, :bounce_levels
+    ]
+  end
+
+  def account?(_), do: false
+
   def encode_row(address, value) do
     key = encode_key(address)
     payload = :erlang.term_to_binary(value, [:compressed | @term_options])

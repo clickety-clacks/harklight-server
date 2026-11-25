@@ -2,6 +2,31 @@ defmodule AttentionServer.Store.ConversionPreflightTest do
   use ExUnit.Case, async: true
 
   alias AttentionServer.Store.ConversionPreflight
+  alias Exqlite.Sqlite3
+
+  test "checks the SQLite payload length before reading its prefix" do
+    {:ok, db} = Sqlite3.open(":memory:")
+    on_exit(fn -> Sqlite3.close(db) end)
+    :ok = Sqlite3.execute(db, "CREATE TABLE relay_state (id INTEGER PRIMARY KEY, payload BLOB)")
+    :ok = Sqlite3.execute(db, "INSERT INTO relay_state VALUES (1, zeroblob(8388608))")
+
+    assert {:error, :fit_not_established} =
+             ConversionPreflight.read(db, 8 * 1024 * 1024)
+
+    assert {:error, :unsupported_snapshot} =
+             ConversionPreflight.read(db, 128 * 1024 * 1024)
+
+    payload = :erlang.term_to_binary({:attention_relay_state, 30, %{}}, compressed: 6)
+    {:ok, stmt} = Sqlite3.prepare(db, "UPDATE relay_state SET payload = ? WHERE id = 1")
+    :ok = Sqlite3.bind(stmt, [{:blob, payload}])
+    :done = Sqlite3.step(db, stmt)
+    :ok = Sqlite3.release(db, stmt)
+
+    assert {:ok, %{format: 30, stored_bytes: length}} =
+             ConversionPreflight.read(db, 128 * 1024 * 1024)
+
+    assert length == byte_size(payload)
+  end
 
   test "reports the compressed snapshot length and expanded length from six bytes" do
     # A sentinel body ensures this test never passes by inflating the snapshot.

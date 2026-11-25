@@ -26,6 +26,7 @@ defmodule AttentionServer.Store do
   alias Exqlite.Sqlite3
 
   alias AttentionServer.Store.{
+    DerivedIndex,
     KeyedMigration,
     KeyedReference,
     KeyedValidation,
@@ -185,13 +186,8 @@ defmodule AttentionServer.Store do
     {:error, :invalid_store_path}
   end
 
-  def open_relay(path) when is_binary(path) and path not in ["", ":memory:"] do
-    if File.exists?(path) do
-      with {:ok, mode} <- cutover_mode(path), do: open(path, mode)
-    else
-      open(path)
-    end
-  end
+  def open_relay(path) when is_binary(path) and path not in ["", ":memory:"],
+    do: open(path, :relay)
 
   def open_relay(path), do: open(path)
 
@@ -215,7 +211,7 @@ defmodule AttentionServer.Store do
     end
   end
 
-  def open(path, mode) when is_binary(path) and path != "" and mode in [:legacy, :keyed] do
+  def open(path, mode) when is_binary(path) and path != "" and mode in [:legacy, :keyed, :relay] do
     with {:ok, store} <- open_store(path, mode), do: finish_open(store)
   end
 
@@ -226,7 +222,9 @@ defmodule AttentionServer.Store do
       {:ok, db} ->
         case initialize(db, upload_dir, mode) do
           {:ok, engine, version} ->
-            case finalize_open(db, upload_dir, engine, version, mode) do
+            store_mode = if mode == :relay, do: :keyed, else: mode
+
+            case finalize_open(db, upload_dir, engine, version, store_mode) do
               {:ok, store} ->
                 {:ok, store}
 
@@ -240,6 +238,10 @@ defmodule AttentionServer.Store do
                 _ = Sqlite3.close(db)
                 {:error, :storage_unavailable}
             end
+
+          {:error, :conversion_required} = error ->
+            _ = Sqlite3.close(db)
+            error
 
           error ->
             Diagnostics.failure(:server_storage, :store_open, error, :unavailable)
@@ -877,10 +879,21 @@ defmodule AttentionServer.Store do
     end
   end
 
+  defp initialize(db, upload_dir, :relay) do
+    with {:ok, kind} <- relay_layout(db) do
+      case kind do
+        :rows -> initialize(db, upload_dir, :keyed)
+        :snapshot -> {:error, :conversion_required}
+        :empty -> initialize_new_relay(db, upload_dir)
+      end
+    end
+  end
+
   defp initialize(db, _upload_dir, :keyed) do
     with {:ok, engine, generation} <- KeyedMigration.load(db),
          {:ok, engine} <- validate_keyed_engine(engine),
-         :ok <- set_durability(db) do
+         :ok <- set_durability(db),
+         :ok <- DerivedIndex.ensure(db, generation, engine) do
       {:ok, engine, generation}
     end
   end
@@ -890,6 +903,48 @@ defmodule AttentionServer.Store do
     if valid_state?(engine), do: {:ok, engine}, else: {:error, :invalid_state}
   rescue
     _ -> {:error, :invalid_state}
+  end
+
+  defp relay_layout(db) do
+    case one(db, "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = 'relay_state'", []) do
+      {:ok, [0]} -> {:ok, :empty}
+      {:ok, [1]} ->
+        case one(db, """
+             SELECT EXISTS (SELECT 1 FROM relay_state WHERE id = 1),
+                    EXISTS (SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'relay_records')
+             """, []) do
+          {:ok, [1, 1]} -> {:ok, :rows}
+          {:ok, [1, 0]} -> {:ok, :snapshot}
+          {:ok, [0, 0]} -> {:ok, :empty}
+          error -> error
+        end
+      error -> error
+    end
+  end
+
+  defp initialize_new_relay(db, upload_dir) do
+    with :ok <- set_durability(db) do
+      case RecordTable.transaction(db, fn -> bootstrap_if_empty(db) end) do
+        {:ok, :existing} -> initialize(db, upload_dir, :keyed)
+        {:ok, engine} -> {:ok, engine, 0}
+        error -> error
+      end
+    end
+  end
+
+  defp bootstrap_if_empty(db) do
+    case relay_layout(db) do
+      {:ok, :rows} -> {:ok, :existing}
+      {:ok, :snapshot} -> {:error, :conversion_required}
+      {:ok, :empty} ->
+        engine = Engine.new()
+
+        with :ok <- Sqlite3.execute(db, @schema),
+             :ok <- KeyedMigration.bootstrap(db, engine) do
+          {:ok, engine}
+        end
+      error -> error
+    end
   end
 
   defp set_durability(db),
@@ -1001,11 +1056,13 @@ defmodule AttentionServer.Store do
         end
 
       %{records: records, delete_paths: delete_paths, reference_rows: references} = prepared
+      derived = DerivedIndex.changes(old, next, touched)
 
       result =
         Persistence.run(fn ->
           RecordTable.commit(db, version, records, fn db, generation ->
-            with :ok <- write_reference_delta(db, delete_paths, references),
+            with :ok <- DerivedIndex.commit(db, generation, derived),
+                 :ok <- write_reference_delta(db, delete_paths, references),
                  :ok <- write_audit(db, audit),
                  {:ok, heads, agent_heads} <- append_change_logs(db, log, generation) do
               {:ok, {heads, agent_heads}}

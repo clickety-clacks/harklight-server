@@ -1,6 +1,7 @@
 defmodule AttentionServer.Store.RecordTable do
   @moduledoc false
 
+  alias AttentionServer.Store.RecordCodec
   alias Exqlite.Sqlite3
 
   @schema """
@@ -11,8 +12,10 @@ defmodule AttentionServer.Store.RecordTable do
   CREATE TABLE relay_records (
     key BLOB PRIMARY KEY NOT NULL,
     payload BLOB NOT NULL,
-    checksum BLOB NOT NULL
+    checksum BLOB NOT NULL,
+    account INTEGER NOT NULL DEFAULT 0
   ) WITHOUT ROWID;
+  CREATE INDEX relay_records_account ON relay_records (key) WHERE account = 1;
   """
 
   # Called once, inside the format conversion transaction.
@@ -40,15 +43,21 @@ defmodule AttentionServer.Store.RecordTable do
   # without retaining the remaining records or leaking the SQLite cursor.
   def scan(db, consume) do
     statement(db, "SELECT key, payload, checksum FROM relay_records", [], fn stmt ->
-      consume.(Stream.unfold(stmt, &next_row(db, &1)))
+      consume.(Stream.unfold(stmt, &next_row(db, &1, fn [key, payload, hash] -> {key, payload, hash} end)))
     end)
   end
 
-  defp next_row(_db, :done), do: nil
+  def scan_keys(db, consume) do
+    statement(db, "SELECT key FROM relay_records", [], fn stmt ->
+      consume.(Stream.unfold(stmt, &next_row(db, &1, fn [key] -> key end)))
+    end)
+  end
 
-  defp next_row(db, stmt) do
+  defp next_row(_db, :done, _convert), do: nil
+
+  defp next_row(db, stmt, convert) do
     case Sqlite3.step(db, stmt) do
-      {:row, [key, payload, hash]} -> {{key, payload, hash}, stmt}
+      {:row, values} -> {convert.(values), stmt}
       :done -> nil
       error -> {error, :done}
     end
@@ -141,10 +150,16 @@ defmodule AttentionServer.Store.RecordTable do
   end
 
   defp write_record(db, {:insert, {key, payload, checksum}}) do
-    run(db, "INSERT INTO relay_records (key, payload, checksum) VALUES (?, ?, ?)", [
+    account = case RecordCodec.decode_key(key) do
+      {:ok, address} -> if(RecordCodec.account?(address), do: 1, else: 0)
+      _ -> 0
+    end
+
+    run(db, "INSERT INTO relay_records (key, payload, checksum, account) VALUES (?, ?, ?, ?)", [
       {:blob, key},
       {:blob, payload},
-      {:blob, checksum}
+      {:blob, checksum},
+      account
     ])
   end
 
@@ -171,11 +186,11 @@ defmodule AttentionServer.Store.RecordTable do
     end
   end
 
-  defp select(db, sql) do
-    statement(db, sql, [], &Sqlite3.fetch_all(db, &1))
+  def select(db, sql, params \\ []) do
+    statement(db, sql, params, &Sqlite3.fetch_all(db, &1))
   end
 
-  defp run(db, sql, params) do
+  def run(db, sql, params) do
     case statement(db, sql, params, &Sqlite3.step(db, &1)) do
       :done -> :ok
       error -> error

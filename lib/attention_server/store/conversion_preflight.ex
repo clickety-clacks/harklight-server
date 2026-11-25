@@ -1,23 +1,40 @@
 defmodule AttentionServer.Store.ConversionPreflight do
   @moduledoc false
 
+  alias AttentionServer.Store.RecordTable
+
   @snapshot_formats [27, 29, 30]
   @row_format 31
+  @prefix_bytes 256
+  @prefix_overhead 32 * 1024 * 1024
 
-  # SQL substr returns a small result but can materialize the entire SQLite BLOB.
-  # The packaged reader uses SQLite's incremental BLOB API.
-  def read(path, executable \\ Application.app_dir(:attention_server, "priv/snapshot-prefix")) do
-    with {<<stored_bytes::32, prefix::binary>>, 0} <- System.cmd(executable, [path]),
-         {:ok, sizes} <- snapshot_sizes(stored_bytes, prefix) do
+  # SQLite can materialize the whole BLOB for substr. length reads its size
+  # without doing so. The caller holds the conversion transaction across read.
+  def read(db, available_bytes) when is_integer(available_bytes) do
+    with {:ok, [[stored_bytes]]} when is_integer(stored_bytes) <-
+           RecordTable.select(db, "SELECT length(payload) FROM relay_state WHERE id = 1"),
+         true <- stored_bytes + @prefix_overhead <= available_bytes,
+         {:ok, [[prefix]]} <-
+           RecordTable.select(db, "SELECT substr(payload, 1, ?) FROM relay_state WHERE id = 1", [
+             @prefix_bytes
+           ]) do
+      inspect_prefix(stored_bytes, prefix)
+    else
+      false -> {:error, :fit_not_established}
+      _ -> {:error, :unsupported_snapshot}
+    end
+  end
+
+  defp inspect_prefix(stored_bytes, prefix) do
+    with {:ok, sizes} <- snapshot_sizes(stored_bytes, prefix) do
       case snapshot_format(prefix) do
         {:ok, format} -> {:ok, Map.put(sizes, :format, format)}
-        other -> other
+        {:already_converted, _} = converted -> converted
+        {:error, _} -> {:error, :unsupported_snapshot}
       end
     else
-      _ -> {:error, :fit_not_established}
+      {:error, _} -> {:error, :unsupported_snapshot}
     end
-  rescue
-    ErlangError -> {:error, :fit_not_established}
   end
 
   def snapshot_sizes(stored_bytes, <<131, 80, expanded_bytes::32, _::binary>>)

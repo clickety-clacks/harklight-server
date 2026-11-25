@@ -2,10 +2,22 @@ defmodule AttentionServer.Store.KeyedMigration do
   @moduledoc false
 
   alias AttentionServer.{LargeData, Store}
-  alias AttentionServer.Store.{RecordCodec, RecordTable}
+  alias AttentionServer.Store.{DerivedIndex, RecordCodec, RecordTable}
   alias Exqlite.Sqlite3
 
   @format 31
+
+  def bootstrap(db, engine) do
+    payload = encode_anchor()
+
+    with :ok <- large_data_index(db),
+         :ok <- RecordTable.seed(db, 0, RecordCodec.encode(engine)),
+         :ok <- DerivedIndex.create(db, 0, engine) do
+      RecordTable.run(db, "INSERT INTO relay_state (id, version, payload, checksum) VALUES (1, 0, ?, ?)", [
+        {:blob, payload}, {:blob, :crypto.hash(:sha256, payload)}
+      ])
+    end
+  end
 
   # Prepare the validated in-memory readback before committing the anchor.
   # Runtime selection of the converter belongs to the guarded Store opener.
@@ -21,13 +33,10 @@ defmodule AttentionServer.Store.KeyedMigration do
 
     with :ok <- verify_previous_progress(store),
          :ok <- Store.verify_retained_uploads(store),
-         :ok <-
-           Sqlite3.execute(
-             db,
-             "CREATE INDEX relay_large_data_refs_id ON relay_large_data_refs (id)"
-           ),
+         :ok <- large_data_index(db),
          {:ok, count} <- RecordTable.seed_count(db, generation, RecordCodec.encode(persisted)),
          :ok <- verify_records(db, persisted, count),
+         :ok <- DerivedIndex.create(db, generation, persisted),
          {:ok, prepared} <- prepare.(store, engine, generation),
          :ok <- write_anchor(db, version, generation),
          :ok <- advance_current_logs(db, version, generation),
@@ -134,8 +143,7 @@ defmodule AttentionServer.Store.KeyedMigration do
   end
 
   defp write_anchor(db, previous, generation) do
-    payload =
-      :erlang.term_to_binary({:attention_relay_keyed_state, @format, RecordCodec.identity()})
+    payload = encode_anchor()
 
     params = [generation, {:blob, payload}, {:blob, :crypto.hash(:sha256, payload)}, previous]
 
@@ -153,6 +161,13 @@ defmodule AttentionServer.Store.KeyedMigration do
       error -> error
     end
   end
+
+  defp encode_anchor do
+    :erlang.term_to_binary({:attention_relay_keyed_state, @format, RecordCodec.identity()})
+  end
+
+  defp large_data_index(db),
+    do: Sqlite3.execute(db, "CREATE INDEX relay_large_data_refs_id ON relay_large_data_refs (id)")
 
   # Conversion preserves the facts and feed rows. Only logs already current
   # at the legacy snapshot generation can follow its new generation.

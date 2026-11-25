@@ -218,11 +218,11 @@ defmodule AttentionServer.Store.KeyedValidation do
     end)
   end
 
-  defp source_key(%{source_binding: binding}) when is_map(binding) do
+  def source_key(%{source_binding: binding}) when is_map(binding) do
     {binding["source_instance_id"], binding["request_id"], binding["request_revision"]}
   end
 
-  defp source_key(_), do: nil
+  def source_key(_), do: nil
 
   @authority_rows [
     :messages,
@@ -324,6 +324,11 @@ defmodule AttentionServer.Store.KeyedValidation do
       if MapSet.size(next) == 0, do: Map.delete(acc, owner), else: Map.put(acc, owner, next)
     end)
   end
+
+  def record_authority(engine, {:origin_feed, scope, :high}),
+    do: authority_owners(engine, {:row, :origin_feeds, scope})
+
+  def record_authority(engine, address), do: authority_owners(engine, address)
 
   defp authority_owners(engine, {:row, :messages, {person, _, _} = key}) do
     case Map.get(engine.messages, key) do
@@ -634,6 +639,10 @@ defmodule AttentionServer.Store.KeyedValidation do
   end
 
   defp entry_upload_ids(nil), do: []
+
+  def record_uploads({:origin_feed, _, {:entry, _}}, entry), do: entry_upload_ids(entry)
+  def record_uploads({:row, :messages, _}, record), do: revision_upload_ids(record)
+  def record_uploads(_, _), do: []
 
   defp entry_upload_ids(entry) do
     for %{"tier" => "upload", "upload_id" => id} <- Map.get(entry, "files", []), do: id

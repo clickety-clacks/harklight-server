@@ -1245,6 +1245,18 @@ defmodule AttentionServer.ChangeLog do
   end
 
   @doc false
+  def ranks_available(
+        %AttentionServer.Store{mode: :keyed, change_log: true, db: db, change_log_touched: touched},
+        person
+      ) do
+    with false <- MapSet.member?(touched, person),
+         {:ok, true} <- ranked?(db, person) do
+      :ok
+    else
+      _ -> {:error, :storage_unavailable}
+    end
+  end
+
   def ranks_available(%AttentionServer.Store{change_log_touched: touched}, person) do
     if MapSet.member?(touched, person), do: {:error, :storage_unavailable}, else: :ok
   end

@@ -836,6 +836,9 @@ defmodule AttentionServer.BounceDecision do
 
   defp pending_revision(_), do: nil
 
+  @doc false
+  def pending_selection?(state), do: not is_nil(pending_revision(state))
+
   defp put_revision_state(engine, key, state) do
     old_state = Map.get(engine.bounce_revisions, key)
     engine = remove_revision_index(engine, key, old_state)
