@@ -357,10 +357,10 @@ survive restart.
 For a manual upgrade of an existing installation, stop the old server and back
 up the full private state before upgrading. The release installer makes one
 full mutable-root backup after stopping the service and before switching
-releases. Harklight Server v0.2.16 writes FORMAT29, like the earlier 0.2
-releases and published v0.1.43, v0.1.44, v0.1.45, v0.1.48 and v0.1.49.
-From FORMAT29 state written by any of those releases, v0.2.16 runs no store
-migration. From supported FORMAT27 state, including state written by the
+releases. Harklight Server v0.2.16 writes FORMAT30. From FORMAT29 state,
+written by v0.2.0 through v0.2.15 and published v0.1.43, v0.1.44, v0.1.45,
+v0.1.48 and v0.1.49, first start upgrades the store to FORMAT30 (see below);
+a FORMAT29 release cannot open the upgraded store. From supported FORMAT27 state, including state written by the
 published v0.1.35 through v0.1.42 maintenance packages (for example v0.1.38),
 startup applies the FORMAT28 device-focus defaults and FORMAT29
 hosted-delivery-state initialization in order, preserving existing values and
@@ -374,7 +374,7 @@ registered, non-revoked agent can read all messages on the account it is
 registered to, regardless of sender. Sender filters select search results only;
 they do not limit access. Answering still requires both a matching read grant
 and a matching respond grant. Preserve the trust root, person and sender
-grants; do not repeat bootstrap. The shared FORMAT29 number does not establish
+grants; do not repeat bootstrap. A 0.1.x release cannot read FORMAT30 state; nothing establishes
 that a 0.1.x release can read state v0.2.16 has written; changing only the code
 or release link is not a safe downgrade.
 
@@ -452,10 +452,10 @@ state directory, including the database and keys, before the first start of a
 v0.2.16 package. Verify the package checksum and extract into a different
 versioned directory. Keep the state path, trust root, owner/person and
 configuration. Start with the existing `server.env`; do not rerun bootstrap.
-From v0.2.2 or other FORMAT29 state, v0.2.16 runs no store migration. From
+From v0.2.2 or other FORMAT29 state, v0.2.16 upgrades the store to FORMAT30. From
 supported FORMAT27 state, first start applies the FORMAT28 device-focus
-defaults and FORMAT29 hosted-delivery-state initialization in order. The
-resulting store is FORMAT29. There is no hot upgrade; only one server may own
+defaults and FORMAT29 hosted-delivery-state initialization in order, then the
+FORMAT30 alert-choice step. The resulting store is FORMAT30. There is no hot upgrade; only one server may own
 a database.
 
 Upgrading directly from 0.1.x to v0.2.16 also changes the protocol:
@@ -519,8 +519,8 @@ stop v0.2.16, restore the backup taken under the release you ran before
 the upgrade, and run that same release against the restored state.
 To return to a 0.1.x release, stop the server, restore a backup taken before
 the protocol 0.2 cutover that is compatible with the selected 0.1.x release,
-and run that release with its protocol 0.1 clients. The shared FORMAT29 number alone does not establish
-cross-version compatibility. Either restore loses every write made after
+and run that release with its protocol 0.1 clients. Neither older release can
+open the FORMAT30 state this release writes. Either restore loses every write made after
 its backup and cannot undo external notifications, bounces or agent
 deliveries.
 

@@ -13,7 +13,7 @@ through Harklight.
 
 ## Install the server
 
-For the FORMAT29 v0.2.16 server package, use the release page below after
+For the FORMAT30 v0.2.16 server package, use the release page below after
 publication to download the Linux x86_64 archive, `SHA256SUMS` and
 `SELF_HOST.md`. Verify the checksum before extraction:
 
@@ -42,9 +42,10 @@ and what to do before switching.
 State, owner/device identities, trust roots and sender grants live outside the
 versioned package. Run one server per database. Keep private keys and backups
 private; do not repeat bootstrap over an existing installation. This source,
-v0.2.16, writes FORMAT29, like the published v0.1.43, v0.1.44, v0.1.45, v0.1.48
-and v0.1.49 releases. From FORMAT29 state written by v0.1.49 or another of
-those releases, v0.2.16 runs no store migration. From supported FORMAT27 state,
+v0.2.16, writes FORMAT30. From FORMAT29 state, written by v0.2.0 through v0.2.15
+and by the published v0.1.43, v0.1.44, v0.1.45, v0.1.48 and v0.1.49 releases,
+first start upgrades the store to FORMAT30, which adds the per-person alert
+choice; a FORMAT29 release cannot open the upgraded store. From supported FORMAT27 state,
 including state written by the published v0.1.35 through v0.1.42 maintenance
 packages (for example v0.1.38), startup applies the FORMAT28 device-focus
 defaults and FORMAT29 hosted-delivery-state initialization in order, preserving
@@ -69,8 +70,8 @@ installation.
 
 After any v0.2.16 write, returning to v0.1.49 or another 0.1.x release requires
 stopping the server, restoring the pre-start backup and selecting that
-release, with its clients back on 0.1. The shared FORMAT29 number does not
-establish that 0.1.x can read state v0.2.16 has written; changing only the code
+release, with its clients back on 0.1. A 0.1.x release cannot
+read the FORMAT30 state v0.2.16 has written; changing only the code
 or release link is not a safe downgrade. This restore loses every write made
 since the backup and cannot undo external notifications, bounces or agent
 deliveries. Do not assume recovery success or a recovery time.
