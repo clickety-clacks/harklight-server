@@ -132,23 +132,6 @@ defmodule Format31Rehearsal do
   end
 
 
-  def run(["variant", dir, format]) do
-    synthetic!(dir)
-    format = String.to_integer(format)
-    true = format in [27, 29]
-    {:ok, db} = Sqlite3.open(path(dir))
-    [[payload]] = query(db, "SELECT payload FROM relay_state WHERE id = 1")
-    {:attention_relay_state, 30, engine} = :erlang.binary_to_term(payload)
-    engine = Map.delete(engine, :alert_choices)
-    engine = if format == 27, do: Map.delete(engine, :delivery_states), else: engine
-    payload = :erlang.term_to_binary({:attention_relay_state, format, engine}, compressed: 6)
-    {:ok, stmt} = Sqlite3.prepare(db, "UPDATE relay_state SET payload = ?, checksum = ? WHERE id = 1")
-    :ok = Sqlite3.bind(stmt, [{:blob, payload}, {:blob, :crypto.hash(:sha256, payload)}])
-    :done = Sqlite3.step(db, stmt)
-    :ok = Sqlite3.release(db, stmt)
-    :ok = Sqlite3.close(db)
-  end
-
   def run(["convert", dir]) do
     synthetic!(dir)
     before = File.stat!(path(dir)).size

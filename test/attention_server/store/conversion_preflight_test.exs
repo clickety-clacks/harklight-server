@@ -55,10 +55,10 @@ defmodule AttentionServer.Store.ConversionPreflightTest do
   end
 
   test "reads the revision from the snapshot's own compressed or uncompressed prefix" do
-    for format <- [27, 29, 30], flags <- [[], [{:compressed, 6}]] do
-      term = {:attention_relay_state, format, %{history: :binary.copy("synthetic", 10_000)}}
+    for flags <- [[], [{:compressed, 6}]] do
+      term = {:attention_relay_state, 30, %{history: :binary.copy("synthetic", 10_000)}}
       payload = :erlang.term_to_binary(term, flags)
-      assert {:ok, ^format} = ConversionPreflight.snapshot_format(payload)
+      assert {:ok, 30} = ConversionPreflight.snapshot_format(payload)
     end
   end
 
@@ -84,17 +84,17 @@ defmodule AttentionServer.Store.ConversionPreflightTest do
       revisions: 0, changes: 0, references: 0, uploads: 0
     }
 
-    assert {:ok, %{format: 30}} = ConversionPreflight.check(db, budget, 30, %{30 => envelope})
+    assert {:ok, %{format: 30}} = ConversionPreflight.check(db, budget, 30, envelope)
 
     assert {:error, :source_format_mismatch} =
-             ConversionPreflight.check(db, budget, 29, %{30 => envelope})
+             ConversionPreflight.check(db, budget, 29, envelope)
 
     assert {:error, :fit_not_established} =
-             ConversionPreflight.check(db, %{budget | memory: 48 * mib}, 30, %{30 => envelope})
+             ConversionPreflight.check(db, %{budget | memory: 48 * mib}, 30, envelope)
 
     :ok = Sqlite3.execute(db, "INSERT INTO agent_changes VALUES (1)")
 
-    assert {:error, :fit_not_established} = ConversionPreflight.check(db, budget, 30, %{30 => envelope})
+    assert {:error, :fit_not_established} = ConversionPreflight.check(db, budget, 30, envelope)
   end
 
   test "accepts the older atom tag encodings without loading an Engine" do
@@ -127,20 +127,21 @@ defmodule AttentionServer.Store.ConversionPreflightTest do
 
     budget = %{memory: 4 * 1024 * 1024 * 1024, disk: 4 * 1024 * 1024 * 1024, uploads: 33_624_064}
 
-    for format <- [29, 30] do
-      put_snapshot_header(db, format)
-      assert {:ok, %{format: ^format}} = ConversionPreflight.check(db, budget, format)
+    put_snapshot_header(db, 30)
+    assert {:ok, %{format: 30}} = ConversionPreflight.check(db, budget, 30)
 
-      assert {:error, :fit_not_established} =
-               ConversionPreflight.check(db, %{budget | uploads: budget.uploads + 1}, format)
+    assert {:error, :fit_not_established} =
+             ConversionPreflight.check(db, %{budget | uploads: budget.uploads + 1}, 30)
 
-      :ok = Sqlite3.execute(db, "INSERT INTO relay_large_data_refs VALUES (44)")
-      assert {:error, :fit_not_established} = ConversionPreflight.check(db, budget, format)
-      :ok = Sqlite3.execute(db, "DELETE FROM relay_large_data_refs WHERE id = 44")
+    :ok = Sqlite3.execute(db, "INSERT INTO relay_large_data_refs VALUES (44)")
+    assert {:error, :fit_not_established} = ConversionPreflight.check(db, budget, 30)
+  end
+
+  test "rejects retired snapshot formats before decoding the store" do
+    for format <- [27, 29], flags <- [[], [{:compressed, 6}]] do
+      payload = :erlang.term_to_binary({:attention_relay_state, format, %{}}, flags)
+      assert {:error, :fit_not_established} = ConversionPreflight.snapshot_format(payload)
     end
-
-    put_snapshot_header(db, 27)
-    assert {:error, :fit_not_established} = ConversionPreflight.check(db, budget, 27)
   end
 
   test "skips a store that already has a FORMAT31 row anchor" do

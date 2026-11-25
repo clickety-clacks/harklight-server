@@ -481,12 +481,15 @@ second one. It carries no source ruling authority.
 
 Check the release notes before upgrading. A FORMAT31 release writes individual
 SQLite records. Its normal startup creates a row store for a fresh install and
-requires a stopped-store conversion for existing FORMAT27, FORMAT29, or
-FORMAT30 databases. The packaged release installer stops the service and takes
-its full mutable-root backup before running the converter. It switches the
-release and starts the service only after conversion succeeds. On conversion
-failure it uses the same restore and prior-release startup as a failed
-candidate start.
+requires a stopped-store conversion for existing FORMAT30 databases. For an
+older store, first upgrade to a published Harklight Server v0.2.16 through
+v0.2.20 release. Start that release to write FORMAT30, then stop it and follow
+the FORMAT31 upgrade steps.
+
+The packaged release installer stops the service and takes its full
+mutable-root backup before running the converter. It switches the release and
+starts the service only after conversion succeeds. On conversion failure it
+uses the same restore and prior-release startup as a failed candidate start.
 
 For a manual upgrade, stop the Server and take a complete private backup before
 running the new package's converter. The backup must include the SQLite file,

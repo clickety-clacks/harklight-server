@@ -3,39 +3,30 @@ defmodule AttentionServer.Store.ConversionPreflight do
 
   alias AttentionServer.Store.RecordTable
 
-  @snapshot_formats [27, 29, 30]
+  @snapshot_format 30
   @row_format 31
   @prefix_bytes 256
   @prefix_overhead 32 * 1024 * 1024
 
-  # The synthetic 2,400-message rehearsal included 99,999 conversation facts
-  # and 1,300 sessions. Use the worst capped or uncapped RSS for each format,
-  # rounded up with 20% headroom. Reserve 512 MiB for fixed startup work.
-  # Extra disk includes database growth plus the peak WAL, with 25% headroom.
-  @shape_a %{
+  # The 2,400-message FORMAT30 rehearsal included 99,999 conversation
+  # facts, 1,300 sessions and up to 43 references to 16 retained files.
+  # Round the worst peak ratio up with 20% headroom and reserve 512 MiB.
+  # Extra disk includes database growth and peak WAL with 25% headroom.
+  @envelope %{
+    expanded_bytes: 123_901_842,
     memory_fixed: 512 * 1024 * 1024,
+    memory_per_byte: 23,
     disk_fixed: 128 * 1024 * 1024,
     disk_per_byte: 5,
     revisions: 104_801,
     changes: 69_166,
-    references: 0,
-    uploads: 4096
+    references: 43,
+    uploads: 33_624_064
   }
 
-  # FORMAT29 and FORMAT30 were also rehearsed with 43 references to 16
-  # retained files. Use the higher peak from that shape for both admission
-  # bounds. SQL counts can reject an unmeasured shape, not lower its bound.
-  @retained_shape_a Map.merge(@shape_a, %{references: 43, uploads: 33_624_064})
-  @envelopes %{
-    27 => Map.merge(@shape_a, %{expanded_bytes: 123_901_800, memory_per_byte: 17}),
-    29 => Map.merge(@retained_shape_a, %{expanded_bytes: 123_901_822, memory_per_byte: 27}),
-    30 => Map.merge(@retained_shape_a, %{expanded_bytes: 123_901_842, memory_per_byte: 23})
-  }
-
-  def check(db, budget, expected_format, envelopes \\ @envelopes) do
+  def check(db, budget, expected_format, envelope \\ @envelope) do
     with {:ok, info} <- read(db, budget.memory, budget.disk),
          :ok <- check_format(info.format, expected_format),
-         {:ok, envelope} <- Map.fetch(envelopes, info.format),
          true <- info.expanded_bytes <= envelope.expanded_bytes,
          :ok <- check_shape(db, budget.uploads, envelope),
          {memory, disk} <- upper_bound(info, envelope),
@@ -181,9 +172,9 @@ defmodule AttentionServer.Store.ConversionPreflight do
 
   defp parse_tag(bytes, size) do
     case bytes do
-      <<"attention_relay_state", 97, format, _::binary>>
-      when size == byte_size("attention_relay_state") and format in @snapshot_formats ->
-        {:ok, format}
+      <<"attention_relay_state", 97, @snapshot_format, _::binary>>
+      when size == byte_size("attention_relay_state") ->
+        {:ok, @snapshot_format}
 
       <<"attention_relay_keyed_state", 97, @row_format, _::binary>>
       when size == byte_size("attention_relay_keyed_state") ->
