@@ -14,6 +14,11 @@ defmodule AttentionServer.PushDispatcher do
 
   def apple_config(dispatcher), do: GenServer.call(dispatcher, :apple_config)
 
+  def apple_token(dispatcher, profile_id, rejected_token) do
+    rejected_fingerprint = rejected_token && :crypto.hash(:sha256, rejected_token)
+    GenServer.call(dispatcher, {:apple_token, profile_id, rejected_fingerprint})
+  end
+
   @impl true
   def init(opts) do
     Process.flag(:trap_exit, true)
@@ -21,6 +26,7 @@ defmodule AttentionServer.PushDispatcher do
     state = %{
       opts: opts,
       prepared_apns: nil,
+      provider_tokens: %{},
       child: nil,
       retry_attempt: 0,
       stable_timer: nil
@@ -32,8 +38,27 @@ defmodule AttentionServer.PushDispatcher do
   @impl true
   def handle_call(:apple_config, _from, state), do: {:reply, state.prepared_apns, state}
 
+  def handle_call({:apple_token, profile_id, rejected_fingerprint}, _from, state) do
+    %{prepared_apns: %{profiles: profiles}, provider_tokens: tokens} = state
+    cached = Map.get(tokens, profile_id)
+
+    # Only provider authorization is shared. The outbound Apple request is
+    # made in the caller, independently of the direct push worker.
+    rejected_token =
+      if cached && rejected_fingerprint &&
+           rejected_fingerprint == :crypto.hash(:sha256, cached.token),
+        do: cached.token
+
+    {token, cached} =
+      APNS.provider_authorization(Map.fetch!(profiles, profile_id), cached, rejected_token)
+
+    {:reply, token, %{state | provider_tokens: Map.put(tokens, profile_id, cached)}}
+  end
+
   @impl true
-  def format_status(status), do: Map.update!(status, :state, &Map.delete(&1, :prepared_apns))
+  def format_status(status) do
+    Map.update!(status, :state, &Map.drop(&1, [:prepared_apns, :provider_tokens]))
+  end
 
   @impl true
   def handle_info(:start_dispatcher, %{child: nil} = state) do
@@ -65,7 +90,14 @@ defmodule AttentionServer.PushDispatcher do
     case safe_start_worker(state.opts) do
       {:ok, child, apns} when is_pid(child) ->
         stable_timer = Process.send_after(self(), {:reset_retry_attempt, child}, @stable_interval)
-        %{state | child: child, stable_timer: stable_timer, prepared_apns: apns}
+
+        %{
+          state
+          | child: child,
+            stable_timer: stable_timer,
+            prepared_apns: apns,
+            provider_tokens: %{}
+        }
 
       {:error, reason} ->
         schedule_retry(state, reason)

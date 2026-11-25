@@ -1746,17 +1746,40 @@ defmodule AttentionServer.APNSPushTest do
 
     assert {:ok, key} = PushRelayClient.register(config)
 
-    for {overrides, expected} <- [
-          {%{quiet: true}, %{"interruption-level" => "passive"}},
-          {%{quiet: false}, %{"sound" => "default"}},
-          {%{presentation: :background}, %{}}
-        ] do
-      claim = Map.merge(dispatcher_claim(), overrides)
-      assert {%{state: "provider_accepted"}, ^key} = PushRelayClient.send(config, claim, key)
-      assert_receive {:apns_request, "POST", _, _, body}
-      assert {:ok, %{"aps" => aps}} = JSON.decode_line(body <> "\n")
-      assert Map.take(aps, ["interruption-level", "sound"]) == expected
-    end
+    tokens =
+      for {overrides, expected} <- [
+            {%{quiet: true}, %{"interruption-level" => "passive"}},
+            {%{quiet: false}, %{"sound" => "default"}},
+            {%{presentation: :background}, %{}}
+          ] do
+        claim = Map.merge(dispatcher_claim(), overrides)
+        assert {%{state: "provider_accepted"}, ^key} = PushRelayClient.send(config, claim, key)
+        assert_receive {:apns_request, "POST", _, headers, body}
+        assert {:ok, %{"aps" => aps}} = JSON.decode_line(body <> "\n")
+        assert Map.take(aps, ["interruption-level", "sound"]) == expected
+        List.keyfind(headers, "authorization", 0)
+      end
+
+    assert [original] = Enum.uniq(tokens)
+
+    sends = :atomics.new(1, [])
+
+    Agent.update(ctx.provider_response, fn _ ->
+      fn _path ->
+        case :atomics.add_get(sends, 1, 1) do
+          1 -> {403, ~s({"reason":"ExpiredProviderToken"})}
+          2 -> {200, ""}
+        end
+      end
+    end)
+
+    assert {%{state: "provider_accepted"}, ^key} =
+             PushRelayClient.send(config, dispatcher_claim(), key)
+
+    assert_receive {:apns_request, "POST", _, first_headers, _}
+    assert_receive {:apns_request, "POST", _, next_headers, _}
+    assert List.keyfind(first_headers, "authorization", 0) == original
+    refute List.keyfind(next_headers, "authorization", 0) == original
   end
 
   defp start_push_relay_server(ctx, name, mode, apns) do

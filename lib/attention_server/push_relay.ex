@@ -21,13 +21,13 @@ defmodule AttentionServer.PushRelay do
       when route in ["servers", "pushes"] and not is_nil(state) do
     case PushDispatcher.apple_config(state.dispatcher) do
       nil -> error(conn, 404, "not_found")
-      apns -> dispatch(conn, route, state.secret, apns)
+      apns -> dispatch(conn, route, state, apns)
     end
   end
 
   def call(conn, _state), do: error(conn, 404, "not_found")
 
-  defp dispatch(conn, "servers", secret, _apns) do
+  defp dispatch(conn, "servers", %{secret: secret}, _apns) do
     with_request(conn, fn conn, request ->
       case request do
         %{"server" => server} when is_binary(server) and map_size(request) == 1 ->
@@ -44,12 +44,12 @@ defmodule AttentionServer.PushRelay do
     end)
   end
 
-  defp dispatch(conn, "pushes", secret, apns) do
-    case verified_server(conn, secret) do
+  defp dispatch(conn, "pushes", state, apns) do
+    case verified_server(conn, state.secret) do
       {:ok, server} ->
         with_request(conn, fn conn, request ->
           case claim(request, server) do
-            {:ok, claim} -> deliver(conn, claim, apns)
+            {:ok, claim} -> deliver(conn, claim, apns, state.dispatcher)
             {:error, reason} -> error(conn, 400, reason)
           end
         end)
@@ -138,9 +138,9 @@ defmodule AttentionServer.PushRelay do
     end
   end
 
-  defp deliver(conn, claim, apns) do
+  defp deliver(conn, claim, apns, dispatcher) do
     started_at = System.monotonic_time(:millisecond)
-    response = delivery_response(apns, claim)
+    response = delivery_response(apns, claim, dispatcher)
     elapsed = System.monotonic_time(:millisecond) - started_at
 
     {status, reason} =
@@ -173,8 +173,10 @@ defmodule AttentionServer.PushRelay do
     end
   end
 
-  defp delivery_response(apns, claim) do
-    case APNS.deliver(apns, APNS.describe(claim), nil) do
+  defp delivery_response(apns, claim, dispatcher) do
+    token = fn profile, rejected -> PushDispatcher.apple_token(dispatcher, profile, rejected) end
+
+    case APNS.deliver(apns, APNS.describe(claim), token) do
       {{:ok, reply, _report?}, _tokens} -> {:ok, reply}
       {{:error, cause}, _tokens} -> {:error, cause}
     end

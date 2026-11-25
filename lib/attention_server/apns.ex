@@ -138,8 +138,10 @@ defmodule AttentionServer.APNS do
   def deliver(%{profiles: profiles} = config, push, cached_tokens) do
     case Map.fetch(profiles, push.profile_id) do
       {:ok, profile} ->
-        cached_tokens = if is_map(cached_tokens), do: cached_tokens, else: %{}
-        deliver_with_profile(config, profile, push, cached_tokens)
+        tokens =
+          if is_map(cached_tokens) or is_function(cached_tokens, 2), do: cached_tokens, else: %{}
+
+        deliver_with_profile(config, profile, push, tokens)
 
       :error ->
         {{:error, :missing_profile}, cached_tokens}
@@ -149,23 +151,20 @@ defmodule AttentionServer.APNS do
   defp deliver_with_profile(config, profile, push, cached_tokens) do
     profile_id = push.profile_id
     request_config = Map.put(profile, :endpoint, config.endpoint)
-    now_s = System.system_time(:second)
-    {token, cached} = cached_token(profile, Map.get(cached_tokens, profile_id), now_s)
+    {token, tokens} = authorization(profile, profile_id, cached_tokens, nil)
 
-    {response, report?, cached} =
+    {response, report?, tokens} =
       case request(request_config, push, token) do
         {:ok, 403, _headers, body} = response ->
           if apns_reason(body) == "ExpiredProviderToken" do
-            issued_at = System.system_time(:second)
-            fresh = provider_token(profile, issued_at)
-
-            {request(request_config, push, fresh), true, %{token: fresh, issued_at: issued_at}}
+            {fresh, tokens} = authorization(profile, profile_id, tokens, token)
+            {request(request_config, push, fresh), true, tokens}
           else
-            {response, false, cached}
+            {response, false, tokens}
           end
 
         response ->
-          {response, true, cached}
+          {response, true, tokens}
       end
 
     response =
@@ -183,8 +182,23 @@ defmodule AttentionServer.APNS do
           error
       end
 
-    {response, Map.put(cached_tokens, profile_id, cached)}
+    {response, tokens}
   end
+
+  defp authorization(_profile, profile_id, fetch, rejected_token) when is_function(fetch, 2),
+    do: {fetch.(profile_id, rejected_token), fetch}
+
+  defp authorization(profile, profile_id, tokens, rejected_token) do
+    {token, cached} = provider_authorization(profile, Map.get(tokens, profile_id), rejected_token)
+    {token, Map.put(tokens, profile_id, cached)}
+  end
+
+  def provider_authorization(profile, %{token: token}, rejected_token)
+      when token == rejected_token and is_binary(token),
+      do: provider_authorization(profile, nil, nil)
+
+  def provider_authorization(profile, cached, _rejected_token),
+    do: cached_token(profile, cached, System.system_time(:second))
 
   def report_response(%{state: "provider_accepted"} = result, _claim, _operation), do: result
 
