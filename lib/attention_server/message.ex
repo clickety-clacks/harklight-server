@@ -115,6 +115,22 @@ defmodule AttentionServer.Message do
 
   def validate_typed_message(_), do: :ok
 
+  @doc false
+  def request_for_alert?(%{"message_type" => "request"}), do: true
+  def request_for_alert?(%{"message_type" => _}), do: false
+
+  def request_for_alert?(%{"answer_ui" => %{"schema" => @actions_schema, "actions" => actions}})
+      when is_list(actions) do
+    Enum.any?(actions, fn action ->
+      not seen_action?(action) and match?({:ok, _}, validate_action(action, 1, MapSet.new()))
+    end)
+  end
+
+  def request_for_alert?(%{"answer_ui" => %{"schema" => @ui_schema, "inputs" => [_ | _]}}),
+    do: true
+
+  def request_for_alert?(_), do: false
+
   def valid_message_kind?(value), do: value in @message_kinds
   def valid_message_type?(value), do: value in @message_types
 

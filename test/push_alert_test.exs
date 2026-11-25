@@ -219,7 +219,7 @@ defmodule AttentionServer.PushAlertTest do
     }
   end
 
-  test "only low and normal FYIs are passive with the default alert choice" do
+  test "FYIs and untyped messages without reply controls are passive at low or normal urgency" do
     for type <- ["fyi", "request", nil], urgency <- ["low", "normal", "high", "now", nil] do
       message =
         %{"message_type" => type, "urgency" => urgency}
@@ -229,7 +229,7 @@ defmodule AttentionServer.PushAlertTest do
       assert {:ok, _, claim} = Engine.claim_push(engine, 1_000)
       payload = push_payload(claim)
 
-      if type == "fyi" and urgency in ["low", "normal", nil] do
+      if type in ["fyi", nil] and urgency in ["low", "normal", nil] do
         assert claim.quiet
         assert payload["aps"]["interruption-level"] == "passive"
         refute Map.has_key?(payload["aps"], "sound")
@@ -241,6 +241,23 @@ defmodule AttentionServer.PushAlertTest do
       assert payload["aps"]["badge"] == 1
       assert payload["aps"]["alert"] == Map.take(claim.alert, ["title", "body"])
     end
+  end
+
+  test "an untyped message with a reply control alerts at normal urgency" do
+    engine = deliveries_with_messages([legacy_reply()])
+    assert {:ok, _, claim} = Engine.claim_push(engine, 1_000)
+    aps = push_payload(claim)["aps"]
+    assert aps["sound"] == "default"
+    refute Map.has_key?(aps, "interruption-level")
+  end
+
+  defp legacy_reply do
+    %{
+      "answer_ui" => %{
+        "schema" => "attention-client.actions/1",
+        "actions" => [%{"id" => "reply", "label" => "Reply", "kind" => "text"}]
+      }
+    }
   end
 
   test "grouped FYIs are passive unless one alerts, or the person wants all alerts" do
@@ -540,7 +557,7 @@ defmodule AttentionServer.PushAlertTest do
         end
 
       request_at = now + 60_000
-      {engine, 2} = forward.(engine, "question", "02", %{}, request_at)
+      {engine, 2} = forward.(engine, "question", "02", legacy_reply(), request_at)
 
       engine =
         if first_push == :in_flight do
@@ -563,7 +580,8 @@ defmodule AttentionServer.PushAlertTest do
 
     # The first unsent request is eligible immediately.
     before = System.system_time(:millisecond)
-    {engine, 1} = forward.(engine, "one", "01", %{}, System.system_time(:millisecond))
+    {engine, 1} =
+      forward.(engine, "one", "01", legacy_reply(), System.system_time(:millisecond))
     after_first = System.system_time(:millisecond)
 
     opened = binding.(engine)
@@ -579,13 +597,15 @@ defmodule AttentionServer.PushAlertTest do
 
     # Requests arriving while it is in flight wait for the end of the window
     # that started with that push and join one push.
-    {engine, 2} = forward.(engine, "two", "02", %{}, System.system_time(:millisecond))
+    {engine, 2} =
+      forward.(engine, "two", "02", legacy_reply(), System.system_time(:millisecond))
     window_end = claimed_at + 300_000
     in_flight = binding.(engine)
     assert in_flight.state == "sending"
     assert in_flight.next_at == window_end
 
-    {engine, 3} = forward.(engine, "three", "03", %{}, System.system_time(:millisecond))
+    {engine, 3} =
+      forward.(engine, "three", "03", legacy_reply(), System.system_time(:millisecond))
     assert binding.(engine).next_at == window_end
     assert binding.(engine).pending_high == 3
 

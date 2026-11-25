@@ -832,7 +832,11 @@ defmodule AttentionServer.APNSPushTest do
       "apns-delivery",
       %{
         "body" => "  bounded   preview\nfrom sender  ",
-        "display_name" => "  Agent\nλ / name  "
+        "display_name" => "  Agent\nλ / name  ",
+        "answer_ui" => %{
+          "schema" => "attention-client.actions/1",
+          "actions" => [%{"id" => "reply", "label" => "Reply", "kind" => "text"}]
+        }
       }
     )
 

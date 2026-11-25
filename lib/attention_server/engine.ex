@@ -5249,7 +5249,7 @@ defmodule AttentionServer.Engine do
     # A revision can edit importance, but the push is about the accepted delivery.
     message = get_in(record, [:revisions, 1]) || record.message
 
-    alert_choice(engine, person) == "all" or message["message_type"] != "fyi" or
+    alert_choice(engine, person) == "all" or Message.request_for_alert?(message) or
       Message.effective_urgency(message) in ["high", "now"]
   end
 
