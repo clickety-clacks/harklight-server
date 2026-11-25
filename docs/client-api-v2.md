@@ -1716,7 +1716,9 @@ the current delivered state. Revocation grants no access to another key.
 `GET /v2/agent/delivery-baseline?session=<session>&page=<token>&limit=<n>`
 
 Use this route when there is no applied checkpoint or the feed reports
-`cursor_expired`. With no `page`, it returns `{rev, next_page}`. This fixes
+`cursor_expired`. With no `page`, it returns `{rev, next_page, answers}`.
+The additive `answers: "all"` marks support for answers from every author.
+Older Servers omit the member. Preparing fixes
 the ordinary feed position `rev` and the pending enumeration's upper bound
 in one serialized step. It serves no work. Persist the returned token
 before requesting a delivery page. The token is opaque and scoped to this
@@ -1724,7 +1726,8 @@ attempt, authenticated origin and session filter.
 
 - With `page`, return `{rev, changes, next_page?}` using the same `rev`.
   `changes` contains pending person Chat as AgentEntry changes and pending
-  answers as SentMessage changes. A Chat turn is identified by its
+  answers as SentMessage changes, whether answered by a person, a granted
+  agent, or the default. A Chat turn is identified by its
   `entry_id`. An answer is identified by origin, `item_id` and answer kind.
   An item accepts only one terminal answer. Pending enumeration excludes
   turns arriving above the fixed bound. A covered turn may render current
@@ -1750,8 +1753,12 @@ attempt, authenticated origin and session filter.
   retained and the consumer has not acknowledged applying it. If receipt, handoff or action for that
   turn has since been recorded, the page may show the current facts for
   reconciliation and must treat it as an update instead of pending work.
-  A fresh attempt excludes earlier service from any path, including 0.2.5
-  changes and Agent 0.2.0 listen. Losing the saved token by deleting the
+  Granted-agent and default answers record baseline service without creating
+  person-visible Delivered evidence or adding a `delivery` member to their
+  AgentTerminal. A fresh baseline excludes those answers after their first
+  baseline service. Other delivery eligibility is unchanged.
+  For person Chat and answers, a fresh attempt excludes earlier service
+  from any path, including 0.2.5 changes and Agent 0.2.0 listen. Losing the saved token by deleting the
   journal or moving without it loses retry access to work already served
   by that attempt. Work never served remains pending.
 - Durably apply and deduplicate pending work by stable turn ID before
@@ -1787,11 +1794,13 @@ A caller that owns the applied checkpoint prepares a scoped attempt with
 `read --session S --pending --prepare` on Agent 0.2.4 or later. This prints
 `{"kind":"baseline_prepared","session":S,"rev":R,"token":T}` from the
 tokenless request, without service, a Delivered mark or an Agent journal
-write. Store the opaque token and its pinned revision before resuming.
+write. A supporting Agent includes the Server's string `answers` member
+when present. Store the opaque token and its pinned revision before resuming.
 
 `read --session S --pending --resume T` serves that attempt's pages
 between `baseline` and `baseline_complete`. Retained pending person Chat
-and answers are included, including turns on closed items and migrated
+and answers by a person, a granted agent, or the default are included,
+including turns on closed items and migrated
 0.1-era turns. Rows have the same `kind`, `rev` and `data` projection as
 the feed. An answer is a message row with an answered terminal state.
 `pending:false` conveys receipt, action or an updated representation.

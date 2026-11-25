@@ -1,7 +1,7 @@
 defmodule AttentionServer.Conversation do
   @moduledoc """
-  Durable origin feed for request-bound conversations. Entries are immutable;
-  delivery and action facts live separately so replay never changes a turn.
+  Durable origin feed for request-bound conversations. Turn data is immutable.
+  Delivery facts and private baseline service metadata do not change the turn.
   """
 
   alias AttentionServer.{ConversationFiles, Engine, Message}
@@ -494,6 +494,39 @@ defmodule AttentionServer.Conversation do
   rescue
     _ -> false
   end
+
+  # Keep non-person answer service on the retained origin-feed record.
+  # It does not create an ACK1, a conversation fact or a change-log revision.
+  @answer_baseline_attempt "answer_baseline_attempt"
+
+  @doc false
+  def answer_baseline_attempt(entry), do: Map.get(entry, @answer_baseline_attempt)
+
+  @doc false
+  def record_answer_baseline(engine, scope, %{"feed_seq" => seq} = entry, attempt) do
+    case answer_baseline_attempt(entry) do
+      nil ->
+        updated = Map.put(entry, @answer_baseline_attempt, attempt)
+
+        put_in(engine.origin_feeds[scope].entries[seq], updated)
+        |> Engine.touch_fact({:origin_feed, scope, {:entry, seq}})
+
+      _ ->
+        engine
+    end
+  end
+
+  @doc false
+  def answer_baseline_mark?(
+        %{"kind" => "terminal", "terminal_state" => "answered", "author" => author} = prior,
+        %{@answer_baseline_attempt => attempt} = next
+      )
+      when author != "person" and is_binary(attempt) and byte_size(attempt) == 22 do
+    not Map.has_key?(prior, @answer_baseline_attempt) and
+      Map.delete(next, @answer_baseline_attempt) === prior
+  end
+
+  def answer_baseline_mark?(_, _), do: false
 
   @doc false
   def valid_origin_entry?(seq, high, entry) when is_map(entry) do

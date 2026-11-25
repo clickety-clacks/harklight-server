@@ -2290,14 +2290,20 @@ defmodule AttentionServer.Engine do
     end
   end
 
-  @doc "Records ACK1 for authorized conversation resources selected for a v2 feed response."
+  @doc "Records service of authorized conversation resources selected for a v2 feed response."
   def agent_feed_delivered(%__MODULE__{} = engine, person, key, targets, opts \\ []) do
+    attempt = opts[:attempt]
+
     with {:ok, ^person} <- authorized_person(engine, key) do
       next =
         Enum.reduce(targets, engine, fn target, current ->
           case agent_delivery_target(current, person, key, target) do
             %{"author" => "person"} = entry ->
               ensure_delivery_ack1(current, person, key, entry, opts)
+
+            %{"kind" => "terminal", "terminal_state" => "answered"} = entry
+            when is_binary(attempt) ->
+              Conversation.record_answer_baseline(current, {person, key}, entry, attempt)
 
             _ ->
               current

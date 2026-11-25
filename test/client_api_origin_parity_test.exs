@@ -213,11 +213,23 @@ defmodule AttentionServer.ClientAPIOriginParityTest do
     assert request(ctx, @origin, "POST", "/v2/agent/messages/#{retracted}/retract", %{}, 36).status == 200
 
     ids = [default | Map.keys(expected)]
+
+    for {id, n} <- Enum.with_index(ids, 50) do
+      assert request(ctx, "a2", "POST", "/v2/items/#{id}/seen", %{}, n).status == 200
+    end
+
     before = Map.new(ids, &{&1, origin_terminal(ctx, &1)})
-    person_before = Map.new(ids, &{&1, decode(get(ctx, "a2", "/v2/items/#{&1}"))})
+    person_answer = fn ctx, id ->
+      get(ctx, "a2", "/v2/items/#{id}")
+      |> decode()
+      |> Map.fetch!("item")
+      |> Map.take(["terminal", "seen"])
+    end
+
+    person_before = Map.new(ids, &{&1, person_answer.(ctx, &1)})
     path = "/v2/agent/delivery-baseline?session=#{@session}"
 
-    assert %{"rev" => rev, "next_page" => token} = decode(get(ctx, @origin, path))
+    assert %{"rev" => rev, "next_page" => token, "answers" => "all"} = decode(get(ctx, @origin, path))
     page_path = path <> "&page=" <> token
     assert %{"rev" => ^rev, "changes" => changes} = page = decode(get(ctx, @origin, page_path))
 
@@ -242,7 +254,7 @@ defmodule AttentionServer.ClientAPIOriginParityTest do
 
     for id <- ids do
       assert origin_terminal(ctx, id) == before[id]
-      assert decode(get(ctx, "a2", "/v2/items/#{id}")) == person_before[id]
+      assert person_answer.(ctx, id) == person_before[id]
     end
 
     for {id, n} <- Enum.with_index(Map.keys(expected), 40) do

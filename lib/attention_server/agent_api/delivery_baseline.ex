@@ -5,7 +5,7 @@ defmodule AttentionServer.AgentAPI.DeliveryBaseline do
 
   import Plug.Conn
 
-  alias AttentionServer.{AgentChangeLog, Engine, JSON, RouteBIndex, Store}
+  alias AttentionServer.{AgentChangeLog, Conversation, Engine, JSON, RouteBIndex, Store}
   alias AttentionServer.AgentAPI.{Feed, FeedActivity, FeedStep}
   alias AttentionServer.ClientAPI.{AgentResources, Errors, Projection, Resources}
   alias AttentionServer.ClientAPI.Feed, as: PersonFeed
@@ -88,7 +88,13 @@ defmodule AttentionServer.AgentAPI.DeliveryBaseline do
       bound = get_in(store.engine.origin_feeds, [scope, :high]) || 0
       attempt = :crypto.strong_rand_bytes(16) |> Base.url_encode64(padding: false)
       page = %{attempt: attempt, bound: bound, position: 0, rev: rev}
-      {:ok, {:ok, %{"rev" => rev, "next_page" => encode(page, scope, session, ack2)}}, store}
+      body = %{
+        "rev" => rev,
+        "next_page" => encode(page, scope, session, ack2),
+        "answers" => "all"
+      }
+
+      {:ok, {:ok, body}, store}
     end
   end
 
@@ -140,7 +146,8 @@ defmodule AttentionServer.AgentAPI.DeliveryBaseline do
 
     Enum.reduce_while((page.position + 1)..stop//1, {:ok, [], []}, fn seq,
                                                                       {:ok, changes, targets} ->
-      with %{"author" => "person", "session_handle" => handle} = entry <- Map.get(entries, seq),
+      with %{"session_handle" => handle} = entry <- Map.get(entries, seq),
+           true <- baseline_entry?(entry),
            true <- is_nil(session) or session == handle,
            true <- pending?(engine, scope, entry, page.attempt),
            {:ok, change, target} <- render(state, scope, entry) do
@@ -157,7 +164,11 @@ defmodule AttentionServer.AgentAPI.DeliveryBaseline do
     end
   end
 
-  defp pending?(engine, {person, origin}, %{"feed_seq" => seq} = entry, attempt) do
+  defp baseline_entry?(%{"kind" => "discussion", "author" => "person"}), do: true
+  defp baseline_entry?(%{"kind" => "terminal", "terminal_state" => "answered"}), do: true
+  defp baseline_entry?(_entry), do: false
+
+  defp pending?(engine, {person, origin}, %{"author" => "person", "feed_seq" => seq} = entry, attempt) do
     scope_key = {person, origin, seq}
     ack = Engine.delivery_ack_fact(engine, person, origin, entry, :ack1)
     # File reports can create a receipt record seeded from ACK1 alone.
@@ -179,6 +190,14 @@ defmodule AttentionServer.AgentAPI.DeliveryBaseline do
 
       _ ->
         false
+    end
+  end
+
+  defp pending?(_engine, _scope, entry, attempt) do
+    case Conversation.answer_baseline_attempt(entry) do
+      nil -> true
+      ^attempt -> true
+      _ -> false
     end
   end
 
