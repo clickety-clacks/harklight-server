@@ -151,7 +151,13 @@ defmodule AttentionServer.DashboardReadHTTP do
 
       conn.method == "GET" and
           conn.request_path == "/agent-skills/harklight-agent-saas/SKILL.md" ->
-        serve_skill_file(conn, opts.skill_path_saas)
+        serve_skill_file(conn, opts.skill_path_saas, fn skill ->
+          String.replace(
+            skill,
+            "@HOSTED_APP_INSTALL@",
+            hosted_app_install(opts.hosted_testflight_url)
+          )
+        end)
 
       conn.method == "GET" and conn.request_path == "/agent-skills/harklight/SKILL.md" ->
         serve_skill_file(conn, opts.skill_path_harklight)
@@ -751,7 +757,19 @@ defmodule AttentionServer.DashboardReadHTTP do
   defp prioritization_error(:storage_unavailable), do: "The server could not save these settings."
   defp prioritization_error(_), do: "The server could not update prioritization settings."
 
-  defp serve_skill_file(conn, skill_path) do
+  defp hosted_app_install(nil) do
+    "Harklight for iPhone is in testing and is not yet open to everyone. " <>
+      "To ask for access, contact the Harklight team; testers receive an invitation through Apple's TestFlight app. " <>
+      "If you don't have TestFlight yet, install it from the App Store first."
+  end
+
+  defp hosted_app_install(url) do
+    "Harklight for iPhone is available through Apple's TestFlight app. " <>
+      "On your iPhone, open the [Harklight TestFlight invitation](<#{url}>) and follow TestFlight's prompts to install Harklight. " <>
+      "If you don't have TestFlight yet, install it from the App Store first."
+  end
+
+  defp serve_skill_file(conn, skill_path, render \\ &Function.identity/1) do
     case Diagnostics.result(
            :dashboard_http,
            :request_read,
@@ -761,7 +779,7 @@ defmodule AttentionServer.DashboardReadHTTP do
       {:ok, skill} ->
         conn
         |> put_resp_content_type("text/plain", "utf-8")
-        |> send_resp(200, skill)
+        |> send_resp(200, render.(skill))
 
       _ ->
         send_resp(conn, 503, "Skill unavailable")

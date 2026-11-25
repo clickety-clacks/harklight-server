@@ -1,7 +1,7 @@
 defmodule AttentionServer.SkillsBuildTest do
   use ExUnit.Case, async: true
 
-  test "the package builds both skills from the shared core and serves the Hosted guide unchanged" do
+  test "the package builds shared-core skills and the Hosted guide follows the TestFlight setting" do
     root = Path.expand("..", __DIR__)
 
     scratch =
@@ -46,30 +46,59 @@ defmodule AttentionServer.SkillsBuildTest do
       assert length(:binary.matches(harklight, core)) == 1
 
       hosted = File.read!(Path.join(output, "harklight-agent-saas/SKILL.md"))
-      assert Base.encode16(:crypto.hash(:sha256, hosted), case: :lower) ==
-               "2ddaf293177a437fcf82647c74e2a4cb6f61314e4678834adaf0c67bf8629c75"
+      assert hosted == File.read!(Path.join(root, "skills/harklight-agent-saas/SKILL.md.in"))
+      assert [before_app, after_app] = String.split(hosted, "@HOSTED_APP_INSTALL@")
 
-      opts =
-        AttentionServer.DashboardReadHTTP.init(
-          backend: __MODULE__,
-          skill_path: Path.join(output, "harklight-agent/SKILL.md")
-        )
+      settings = [
+        backend: __MODULE__,
+        hosted: true,
+        skill_path: Path.join(output, "harklight-agent/SKILL.md")
+      ]
 
-      for {path, expected} <- [
-            {"/agent-skills/harklight/SKILL.md", harklight},
-            {"/agent-skills/harklight-agent-saas/SKILL.md", hosted}
+      assert_skill("/agent-skills/harklight/SKILL.md", settings, harklight)
+
+      url =
+        URI.to_string(%URI{
+          scheme: "https",
+          host: "testflight.apple.com",
+          path: "/join/test-invitation",
+          query: "source=guide&platform=iphone"
+        })
+
+      closed =
+        "Harklight for iPhone is in testing and is not yet open to everyone. " <>
+          "To ask for access, contact the Harklight team; testers receive an invitation through Apple's TestFlight app. " <>
+          "If you don't have TestFlight yet, install it from the App Store first."
+
+      open =
+        "Harklight for iPhone is available through Apple's TestFlight app. " <>
+          "On your iPhone, open the [Harklight TestFlight invitation](<#{url}>) and follow TestFlight's prompts to install Harklight. " <>
+          "If you don't have TestFlight yet, install it from the App Store first."
+
+      for {testflight_settings, paragraph} <- [
+            {[], closed},
+            {[hosted_testflight_url: url], open},
+            {[hosted_testflight_url: "https://example.com/join/test-invitation"], closed}
           ] do
-        response =
-          Plug.Test.conn(:get, path)
-          |> Map.put(:scheme, :https)
-          |> AttentionServer.DashboardReadHTTP.call(opts)
-
-        assert response.status == 200
-        assert response.resp_body == expected
-
-        assert Plug.Conn.get_resp_header(response, "content-type") ==
-                 ["text/plain; charset=utf-8"]
+        assert_skill(
+          "/agent-skills/harklight-agent-saas/SKILL.md",
+          settings ++ testflight_settings,
+          before_app <> paragraph <> after_app
+        )
       end
     end
+  end
+
+  defp assert_skill(path, settings, expected) do
+    opts = AttentionServer.DashboardReadHTTP.init(settings)
+
+    response =
+      Plug.Test.conn(:get, path)
+      |> Map.put(:scheme, :https)
+      |> AttentionServer.DashboardReadHTTP.call(opts)
+
+    assert response.status == 200
+    assert response.resp_body == expected
+    assert Plug.Conn.get_resp_header(response, "content-type") == ["text/plain; charset=utf-8"]
   end
 end
