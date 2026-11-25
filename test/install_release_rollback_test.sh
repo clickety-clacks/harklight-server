@@ -27,10 +27,10 @@ fake_bin="$scratch/fake-bin"
 home="$scratch/home"
 runner_temp="$scratch/runner-temp"
 root="$home/.local/share/harklight-server"
-release_old="$root/releases/v0.1.10"
+release_old="$root/releases/v0.2.20"
 package_root="$scratch/installer-package"
-archive_stage="$scratch/archive-stage/harklight-server-0.1.12-linux-x86_64"
-archive="$scratch/harklight-server-0.1.12-linux-x86_64.tar.gz"
+archive_stage="$scratch/archive-stage/harklight-server-0.2.21-linux-x86_64"
+archive="$scratch/harklight-server-0.2.21-linux-x86_64.tar.gz"
 sums="$scratch/SHA256SUMS"
 guide="$scratch/SELF_HOST.md"
 mkdir -p "$fake_bin" "$runner_temp" "$root/bin" "$root/state/tls" "$root/state/owner" \
@@ -46,10 +46,10 @@ printf 'person-test\n' > "$root/state/person-id"
 printf 'launcher\n' > "$root/bin/start-server"
 chmod 755 "$root/bin/start-server"
 
-printf 'version=0.1.10\nsource_commit=%040d\nsource_status=\n' 0 > "$release_old/BUILD_INFO"
+printf 'version=0.2.20\nsource_commit=%040d\nsource_status=\n' 0 > "$release_old/BUILD_INFO"
 printf 'beam\n' > "$release_old/erts-15.2.7/bin/beam.smp"
 chmod 755 "$release_old/erts-15.2.7/bin/beam.smp"
-ln -s releases/v0.1.10 "$root/current"
+ln -s releases/v0.2.20 "$root/current"
 
 cat > "$release_old/bin/harklight" <<'OLD_HARKLIGHT'
 #!/usr/bin/env bash
@@ -69,7 +69,7 @@ printf 'beam\n' > "$archive_stage/erts-15.2.7/bin/beam.smp"
 chmod 755 "$archive_stage/erts-15.2.7/bin/beam.smp"
 printf 'server\n' > "$archive_stage/bin/attention_server"
 chmod 755 "$archive_stage/bin/attention_server"
-printf 'version=0.1.12\nsource_commit=0123456789abcdef0123456789abcdef01234567\nsource_status=\n' \
+printf 'version=0.2.21\nsource_commit=0123456789abcdef0123456789abcdef01234567\nsource_status=\n' \
   > "$archive_stage/BUILD_INFO"
 printf 'Harklight Server release guide\n' > "$archive_stage/SELF_HOST.md"
 cp "$archive_stage/SELF_HOST.md" "$guide"
@@ -79,7 +79,7 @@ cp "$installer" "$package_root/bin/harklight-release-install"
 chmod 755 "$package_root/bin/harklight-release-install"
 
 mkdir -p "$scratch/archive-stage"
-tar -czf "$archive" -C "$scratch/archive-stage" harklight-server-0.1.12-linux-x86_64
+tar -czf "$archive" -C "$scratch/archive-stage" harklight-server-0.2.21-linux-x86_64
 archive_sha256="$(sha256sum "$archive" | cut -d ' ' -f 1)"
 printf '%s  %s\n' "$archive_sha256" "$(basename "$archive")" > "$sums"
 
@@ -119,9 +119,9 @@ case "$action" in
   start)
     current="$("$REAL_READLINK" -f -- "$HARKLIGHT_TEST_ROOT/current")"
     case "$current" in
-      */releases/v0.1.12)
+      */releases/v0.2.21)
         shopt -s nullglob
-        backups=("$HARKLIGHT_TEST_ROOT"/backups/*-v0.1.10-to-v0.1.12-*)
+        backups=("$HARKLIGHT_TEST_ROOT"/backups/*-v0.2.20-to-v0.2.21-*)
         shopt -u nullglob
         [[ ${#backups[@]} == 1 && -f "${backups[0]}/private-root.tar" ]] || {
           printf 'candidate started before its backup existed\n' >&2
@@ -132,19 +132,19 @@ case "$action" in
           -pa "$HARKLIGHT_TEST_APP_EBIN" "$HARKLIGHT_TEST_MIGRATOR"
         grep -qx 'format=30' "$HARKLIGHT_TEST_MIGRATION_LOG"
         printf 'candidate-only\n' > "$HARKLIGHT_TEST_ROOT/state/candidate-write.txt"
-        printf 'start:v0.1.12\n' >> "$HARKLIGHT_TEST_ACTIONS"
+        printf 'start:v0.2.21\n' >> "$HARKLIGHT_TEST_ACTIONS"
         if [[ "$HARKLIGHT_TEST_MODE" == upgrade-failure ]]; then
           printf 'inactive\n' > "$HARKLIGHT_TEST_STATUS"
           exit 0
         fi
         ;;
-      */releases/v0.1.10)
+      */releases/v0.2.20)
         actual="$(sha256sum "$HARKLIGHT_TEST_ROOT/state/relay.sqlite3" | cut -d ' ' -f 1)"
         [[ "$actual" == "$HARKLIGHT_TEST_EXPECTED_STORE_SHA" ]] || {
           printf 'prior release started against a non-restored store\n' >&2
           exit 93
         }
-        printf 'start:v0.1.10\n' >> "$HARKLIGHT_TEST_ACTIONS"
+        printf 'start:v0.2.20\n' >> "$HARKLIGHT_TEST_ACTIONS"
         ;;
       *)
         printf 'unexpected selected release: %s\n' "$current" >&2
@@ -197,7 +197,7 @@ export REAL_READLINK="$real_readlink"
 
 set +e
 output="$(
-  HARKLIGHT_RELEASE_TAG=v0.1.12 \
+  HARKLIGHT_RELEASE_TAG=v0.2.21 \
   HARKLIGHT_SOURCE_COMMIT=0123456789abcdef0123456789abcdef01234567 \
   HARKLIGHT_ARCHIVE_SHA256="$archive_sha256" \
   HARKLIGHT_ARCHIVE_PATH="$archive" \
@@ -213,7 +213,7 @@ if [[ "$mode" == upgrade-failure ]]; then
   [[ "$output" == *'upgrade failed: candidate process did not become active under the selected package within 30 seconds'* ]] || {
     printf 'missing failed-upgrade report\n%s\n' "$output" >&2; exit 1;
   }
-  [[ "$output" == *'restored the pre-install mutable root'* && "$output" == *'prior release v0.1.10, which is serving'* ]] || {
+  [[ "$output" == *'restored the pre-install mutable root'* && "$output" == *'prior release v0.2.20, which is serving'* ]] || {
     printf 'missing restored prior-release report\n%s\n' "$output" >&2; exit 1;
   }
   [[ "$output" == *'candidate writes since the backup may have been lost'* ]] || {
@@ -225,18 +225,18 @@ if [[ "$mode" == upgrade-failure ]]; then
   [[ "$restored_store_sha" == "$expected_store_sha" ]]
   [[ ! -e "$root/state/relay.sqlite3.uploads" ]]
   [[ ! -e "$root/state/candidate-write.txt" ]]
-  [[ -d "$release_old" && -d "$root/releases/v0.1.12" ]]
+  [[ -d "$release_old" && -d "$root/releases/v0.2.21" ]]
 
   shopt -s nullglob
-  backups=("$root"/backups/*-v0.1.10-to-v0.1.12-*)
+  backups=("$root"/backups/*-v0.2.20-to-v0.2.21-*)
   shopt -u nullglob
   [[ ${#backups[@]} == 1 && -f "${backups[0]}/private-root.tar" ]]
   tar -tf "${backups[0]}/private-root.tar" | grep -Fqx './state/relay.sqlite3'
   backup_store_sha="$(tar -xOf "${backups[0]}/private-root.tar" ./state/relay.sqlite3 | sha256sum | cut -d ' ' -f 1)"
   [[ "$backup_store_sha" == "$expected_store_sha" ]]
   grep -Fqx 'format=30' "$HARKLIGHT_TEST_MIGRATION_LOG"
-  grep -Fqx 'start:v0.1.12' "$HARKLIGHT_TEST_ACTIONS"
-  grep -Fqx 'start:v0.1.10' "$HARKLIGHT_TEST_ACTIONS"
+  grep -Fqx 'start:v0.2.21' "$HARKLIGHT_TEST_ACTIONS"
+  grep -Fqx 'start:v0.2.20' "$HARKLIGHT_TEST_ACTIONS"
   grep -Fq "|$home|$runner_temp" "$HARKLIGHT_TEST_LOG"
 
   printf 'PASS: candidate migration failure restored the pre-install mutable root and serving prior release\n'
@@ -248,16 +248,16 @@ else
     printf 'missing optional-route warning\n%s\n' "$output" >&2; exit 1;
   }
   [[ "$output" == *'is running under the selected package'* ]]
-  [[ "$("$real_readlink" -f -- "$root/current")" == "$root/releases/v0.1.12" ]]
+  [[ "$("$real_readlink" -f -- "$root/current")" == "$root/releases/v0.2.21" ]]
   [[ "$(< "$scratch/service-state")" == active ]]
   grep -Fqx 'format=30' "$HARKLIGHT_TEST_MIGRATION_LOG"
   [[ -d "$root/state/relay.sqlite3.uploads" ]]
   migrated_store_sha="$(sha256sum "$root/state/relay.sqlite3" | cut -d ' ' -f 1)"
   [[ "$migrated_store_sha" != "$expected_store_sha" ]]
   [[ -f "$root/state/candidate-write.txt" ]]
-  [[ -d "$release_old" && -d "$root/releases/v0.1.12" ]]
-  grep -Fq 'start:v0.1.12' "$HARKLIGHT_TEST_ACTIONS"
-  ! grep -Fq 'start:v0.1.10' "$HARKLIGHT_TEST_ACTIONS"
+  [[ -d "$release_old" && -d "$root/releases/v0.2.21" ]]
+  grep -Fq 'start:v0.2.21' "$HARKLIGHT_TEST_ACTIONS"
+  ! grep -Fq 'start:v0.2.20' "$HARKLIGHT_TEST_ACTIONS"
   grep -Fq "|$home|$runner_temp" "$HARKLIGHT_TEST_LOG"
 
   printf 'PASS: unavailable owner agent-list route is reported without blocking other server functionality\n'

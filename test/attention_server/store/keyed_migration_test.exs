@@ -1,8 +1,6 @@
 defmodule AttentionServer.Store.KeyedMigrationTest do
   use ExUnit.Case, async: true
 
-  import ExUnit.CaptureLog
-
   alias AttentionServer.{Engine, Store}
   alias AttentionServer.Store.{KeyedMigration, RecordCodec, RecordTable}
   alias Exqlite.Sqlite3
@@ -34,7 +32,7 @@ defmodule AttentionServer.Store.KeyedMigrationTest do
     assert :ok = Store.close(store)
   end
 
-  test "legacy startup names FORMAT30 and leaves the converted database intact", %{
+  test "snapshot startup refuses a keyed store and leaves it intact", %{
     path: path,
     store: store
   } do
@@ -42,14 +40,9 @@ defmodule AttentionServer.Store.KeyedMigrationTest do
     assert :ok = Store.close(store)
     before_refusal = File.read!(path)
 
-    warning =
-      capture_log(fn ->
-        assert {:error, {:storage_unavailable, {:error, :format30_requires_keyed_mode}}} =
-                 Store.open(path)
-      end)
+    assert {:error, {:storage_unavailable, {:error, :format30_requires_keyed_mode}}} =
+             Store.open(path)
 
-    assert warning =~ "FORMAT30"
-    assert warning =~ "restore the pre-upgrade backup"
     assert File.read!(path) == before_refusal
   end
 

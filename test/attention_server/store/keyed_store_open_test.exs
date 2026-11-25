@@ -22,7 +22,7 @@ defmodule AttentionServer.Store.KeyedStoreOpenTest do
 
     assert {:error, {:storage_unavailable, {:error, :not_keyed}}} = Store.open(path, :keyed)
     assert {:ok, default} = Store.open(path)
-    assert default.mode == :legacy
+    assert default.mode == :snapshot
     assert {:error, :not_keyed} = KeyedMigration.load(default.db)
     assert :ok = Store.close(default)
 

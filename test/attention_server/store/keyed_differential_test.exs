@@ -21,7 +21,7 @@ defmodule AttentionServer.Store.KeyedDifferentialTest do
 
   @tag :tmp_dir
   test "alert choices commit and reopen in both storage modes", %{tmp_dir: directory} do
-    for mode <- [:legacy, :keyed] do
+    for mode <- [:snapshot, :keyed] do
       path = Path.join(directory, "#{mode}.sqlite3")
       {:ok, legacy} = Store.open(path)
       {:ok, engine} = Engine.setup_person(legacy.engine, @person)

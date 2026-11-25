@@ -158,7 +158,7 @@ defmodule AttentionServer.ChatPushTest do
 
     path = Path.join(dir, "state.sqlite3")
     audit = %{person: @person, actor: @reader, action: "test"}
-    assert {:ok, store} = Store.open(path, :legacy)
+    assert {:ok, store} = Store.open(path, :snapshot)
     assert {:ok, store} = Store.commit(store, engine, audit)
 
     # Store the legacy device's ACK separately from the pending push binding.
@@ -168,7 +168,7 @@ defmodule AttentionServer.ChatPushTest do
     assert persisted.progress_version > store.progress_version
     assert :ok = Store.close(persisted)
 
-    assert {:ok, reopened} = Store.open(path, :legacy)
+    assert {:ok, reopened} = Store.open(path, :snapshot)
     engine = reopened.engine
     assert :ok = Store.close(reopened)
     assert {:ok, ^cursor} = Engine.acknowledged_cursor(engine, @reader)

@@ -15,11 +15,8 @@ Provider acceptance does not prove notification display or a person's reply.
 
 ## Protocol 0.2
 
-This package speaks protocol 0.2 only. The device port serves client API v2
-(`/v2`) over mutual TLS, and the server runs no `/origin/v1` or `/agent/v1`
-listener. Protocol 0.1 apps, agents and headless tools cannot connect, so move
-an installation to 0.2.20 only after its agents and clients are on their 0.2
-versions. Harklight Agent 0.2.6 is the matching Agent release.
+The device port serves client API v2 (`/v2`) over mutual TLS. For agents,
+use Harklight Agent 0.2.6 or a later compatible release.
 
 No comment is an answer with none of `choice`, `comment` or `result`, sent with
 the displayed `request_revision`. A stale revision is refused without answering
@@ -121,18 +118,12 @@ certificate hostname in --name. Enrollment uses 18444, owner management 18445,
 and the device client API https://HOSTNAME:18443/v2, which registered agents
 use too. An app or headless device must enroll its exact key and present it over
 mutual TLS on the device port, which serves client API v2 (protocol 0.2) only.
-The protocol 0.1 `/relay` WebSocket (attention-relay/1) is removed, so 0.1.x
-apps cannot connect. Invitations carry the device port's address as
-`device_url`; an unused invitation created before the upgrade to 0.2.0 is not
-redeemed, and the joining device must get a new one.
+Invitations carry the device port's address as `device_url`.
 
 ## Agent conversation CLI
 
 The `harklight-agent` conversation CLI is not part of this package. It is
-released from <https://github.com/clickety-clacks/harklight-agent>. This server
-works with Harklight Agent 0.2 releases. Agent 0.2.6 is the matching release,
-and 0.1 Agent releases cannot connect. Install it from that repository's
-release tarballs. Installing it does not start a listener, install a vendor-session integration or create an identity. The
+released from <https://github.com/clickety-clacks/harklight-agent>. Use a compatible release from that repository's release tarballs. Installing it does not start a listener, install a vendor-session integration or create an identity. The
 assembled `skills/harklight-agent` directory may be copied manually
 into an agent harness's configured skill directory; installation does not copy
 it there.
@@ -142,10 +133,7 @@ not the server owner's private key. Set `HARKLIGHT_IDENTITY_DIR` and
 `HARKLIGHT_CA_FILE` to that device's existing private identity directory and
 trusted public CA. Its local journal is separate from server state; retain it
 for uncertain actions and exact retries. The package does not migrate or reset
-an agent's journal during server installation. Before switching an existing
-agent to 0.2, finish or abandon its unresolved 0.1 operations with the 0.1
-CLI; Agent 0.2 does not use 0.1 cursors, and its first read takes a fresh
-baseline. Pending enrollments survive. The CLI's README covers
+an agent's journal during server installation. The CLI's README covers
 `send`, `listen`, `retry`, `retract` and file commands.
 
 The CLI sends and listens over client API v2 on the device port, with the same
@@ -153,15 +141,6 @@ server certificate and enrolled-device authentication; there is no separate
 origin port. Agent 0.2 on an existing identity takes the device port from
 `--device-port` or `HARKLIGHT_DEVICE_PORT`; new enrollments save it. An upgrade
 alone does not establish actual agent listening.
-
-The protocol 0.1 agent (`/agent/v1`, 18446) and origin (`/origin/v1`) listeners
-are retired. The server no longer reads `ATTENTION_SERVER_AGENT_PORT`,
-`ATTENTION_SERVER_AGENT_BIND`, `ATTENTION_SERVER_ORIGIN_PORT` or
-`ATTENTION_SERVER_ORIGIN_BIND`; an existing `server.env` that still sets them
-starts normally, binds neither port and logs one
-`event=harklight_config outcome=ignored setting=NAME reason=retired_in_0.2.0`
-notice for each that is still set, without its value. Remove them when
-convenient.
 
 `ATTENTION_SERVER_DEPLOYMENT_MODE` defaults to `self_hosted`.
 `ATTENTION_SERVER_UPLOAD_CAP_BYTES` defaults to `none` for self-hosting or may be
@@ -387,26 +366,16 @@ survive restart.
 For a manual upgrade of an existing installation, stop the old server and back
 up the full private state before upgrading. The release installer makes one
 full mutable-root backup after stopping the service and before switching
-releases. Harklight Server v0.2.20 writes FORMAT30, as v0.2.16 through v0.2.19 did; from their state it changes no store format. From FORMAT29 state,
-written by v0.2.0 through v0.2.15 and published v0.1.43, v0.1.44, v0.1.45,
-v0.1.48 and v0.1.49, first start upgrades the store to FORMAT30 (see below);
-a FORMAT29 release cannot open the upgraded store. From supported FORMAT27 state, including state written by the
-published v0.1.35 through v0.1.42 maintenance packages (for example v0.1.38),
-startup applies the FORMAT28 device-focus defaults and FORMAT29
-hosted-delivery-state initialization in order, preserving existing values and
-filling only missing values. FORMAT29 large message data is kept in private
-files with durable database references. On first start from a pre-0.2 installation, the Server builds the client API
-v2 change feed and stored ranks from existing data. A cursor issued before
-that initialization expires once and the client reloads a snapshot. An upgrade
-from an existing 0.2 release does not require this protocol cutover again. Messages,
-accounts, grants, enrolled devices and registered agents carry over. Every
-registered, non-revoked agent can read all messages on the account it is
-registered to, regardless of sender. Sender filters select search results only;
-they do not limit access. Answering still requires both a matching read grant
-and a matching respond grant. Preserve the trust root, person and sender
-grants; do not repeat bootstrap. A 0.1.x release cannot read FORMAT30 state; nothing establishes
-that a 0.1.x release can read state v0.2.20 has written; changing only the code
-or release link is not a safe downgrade.
+releases. The server built from this source opens and writes FORMAT30
+snapshots only. For a store on an earlier format, first upgrade through
+v0.2.16–v0.2.20 using a release that supports the starting format. Verify
+the resulting FORMAT30 snapshot before switching to this package. On first
+start, retained Seen-only messages gain an explicit FYI type and old chat
+delivery captions use the evidence recorded for each turn.
+Preserve the database, referenced files, trust root, owner and person.
+Messages, accounts, grants, enrolled devices and registered agents carry over.
+Every registered, non-revoked agent can read its account's messages.
+Answering requires both a matching read grant and a matching respond grant.
 
 Starting a server with APNs configured can dispatch existing queued work. The
 release installer does not inspect, clear, or mark provider work delivered. It
@@ -478,37 +447,10 @@ second one. It carries no source ruling authority.
 ## Upgrade or rollback
 
 For a manual upgrade, stop the old process and back up the complete private
-state directory, including the database and keys, before the first start of a
-v0.2.20 package. Verify the package checksum and extract into a different
-versioned directory. Keep the state path, trust root, owner/person and
-configuration. Start with the existing `server.env`; do not rerun bootstrap.
-From v0.2.16 through v0.2.19 FORMAT30 state, v0.2.20 starts without a store upgrade. From v0.2.2 or other FORMAT29 state, v0.2.20 upgrades the store to FORMAT30. From
-supported FORMAT27 state, first start applies the FORMAT28 device-focus
-defaults and FORMAT29 hosted-delivery-state initialization in order, then the
-FORMAT30 alert-choice step. The resulting store is FORMAT30. There is no hot upgrade; only one server may own
-a database.
-
-Upgrading directly from 0.1.x to v0.2.20 also changes the protocol:
-
-- Have the 0.2 app, Harklight Agent 0.2.6 and any 0.2 headless tools ready for
-  every client before switching; 0.1 clients stop working when the server
-  switches.
-- Finish or abandon unresolved 0.1 Agent operations with the 0.1 CLI before
-  switching an agent to 0.2.
-- After the first start, remove the retired agent and origin port and bind
-  settings that the startup notices name, replace `--relay-port` with
-  `--device-port` in scripts, and create new invitations to replace unused
-  ones.
-
-### Releases with quiet-by-default alerts
-
-The first start of a release with quiet-by-default alerts upgrades a FORMAT29
-snapshot to FORMAT30. Existing accounts use the `important` alert choice until
-the recipient changes it. Take a complete private backup with the old Server
-stopped before starting the upgrade. A FORMAT29 release cannot open the
-upgraded snapshot. To roll back, stop the new Server, restore the pre-upgrade
-backup, and start the release that wrote it. This discards every write after
-the backup and cannot undo notifications or other external deliveries.
+state directory, including the database and keys. Verify the package checksum
+and extract it into a separate versioned directory. Keep the state path, trust
+root, owner/person and configuration. Start with the existing `server.env`.
+Bootstrap is for a fresh installation. Only one server may own the database.
 
 The release installer stops the service and confirms the process has stopped,
 then creates one full mutable-root backup before switching `current`. If backup
@@ -543,17 +485,10 @@ The installer attempts backup restoration only when candidate start or
 process-readiness fails. After readiness, it does not automatically roll back;
 the optional owner agent-list probe is warning-only.
 
-Before the first v0.2.20 start, stop the server and take a complete private
-state backup, including the database and keys. To return to v0.2.16 through
-v0.2.19, stop v0.2.20 and start that release against the same state; no
-restore is needed and no writes are lost. To return to a FORMAT29 0.2 release
-(v0.2.0 through v0.2.15), stop v0.2.20, restore the backup taken under the
-release you ran before the upgrade, and run that same release against the
-restored state. To return to a 0.1.x release, stop the server, restore a backup
-taken before the protocol 0.2 cutover that is compatible with the selected 0.1.x
-release, and run that release with its protocol 0.1 clients. Neither a FORMAT29
-0.2 release nor a 0.1.x release can open the FORMAT30 state this release writes.
-Either restore loses every write made after its backup and cannot undo external
+For a manual rollback, stop the server, restore the complete backup taken
+with the prior release stopped, and run that release against the restored
+state. A shared format number alone does not establish downgrade compatibility.
+Restoration loses every write made after the backup and cannot undo external
 notifications, bounces or agent deliveries.
 
 Restoring an older backup after the server has served clients also repeats

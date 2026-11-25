@@ -229,8 +229,7 @@ Schemas use JSON Schema 2020-12. `$ref`s point into the `$defs` below.
             "ack2_expected": { "type": "boolean" },
             "listener_received": { "const": true },
             "agent_seen": { "const": true },
-            "agent_acted": { "const": true },
-            "legacy_caption": { "const": true }
+            "agent_acted": { "const": true }
           }
         }
       }
@@ -620,11 +619,7 @@ Every write that succeeds answers `200`, or `201` for `POST /v2/files`, with a
   without changing it. Use the explicit reroute caption only for a handed
   receipt with `rerouted: true` and an agent name. With
   `ack2_expected: false`, `listener_received: true` also qualifies.
-  Time and wire `delivered` alone leave Sending. For a reliably identified
-  pre-contract served turn without an authoritative expectation or handoff
-  outcome, `legacy_caption: true` preserves its earlier caption until
-  qualifying evidence or an explicit outcome supplies the new mapping.
-  Newly served unknown turns omit it.
+  Time and wire `delivered` alone leave Sending.
 - **Lifecycle** is not part of the client API. Terminal actions stay on the
   origin API. Their results are readable as `Item.terminal`, and a retraction
   also as a `lifecycle` entry.
@@ -1051,7 +1046,7 @@ agents with existing data. Clients apply newer versions of each resource.
         "rev": { "$ref": "#/$defs/Rev" },
         "sender": { "type": "string" },
         "session": { "$ref": "#/$defs/AgentSession" },
-        "legacy_message_id": { "type": "string", "description": "Agent-chosen message_id carried over from before cut-over" },
+        "legacy_message_id": { "type": "string", "description": "Stored message ID for pre-cutover Agent messages" },
         "revision": { "type": "integer", "minimum": 1 },
         "message": { "type": "object", "description": "Current admitted sender content" },
         "files": { "type": "array", "items": { "$ref": "#/$defs/FileRef" } },
@@ -1175,10 +1170,10 @@ agents with existing data. Clients apply newer versions of each resource.
 - The message list includes retained terminal messages. It sorts by original
   acceptance, newest first, with a stable tie-breaker. Pass back the opaque
   `next_page` as `page` with the same filters. The last page omits `next_page`.
-  `sender` and `legacy_message_id` are exact-match filters. The latter
-  matches only pre-cut-over messages. Agents can use the two filters
-  together to resolve their old references to `item_id`. The
-  `session` filter is a UUIDv4. Malformed filters answer `400 invalid_field`
+  The `sender` and `session` filters match exactly, and `session` is a UUIDv4.
+  The `legacy_message_id` filter matches the stored ID on pre-cutover Agent
+  messages. Use the opaque `item_id` from each message for subsequent requests.
+  Malformed filters answer `400 invalid_field`
   with the field. Message pages contain up to 50 messages.
   A token binds the account, key and filters. Pages report their observed
   position, and may see edits made after page one.
@@ -1775,7 +1770,7 @@ attempt, authenticated origin and session filter.
   manifest. Retained work no longer visible or no longer present is
   omitted and the page moves forward. When none remains, the page ends
   without `next_page`.
-- Include all covered deliverable turns, including retained 0.1 turns and
+- Include all covered deliverable turns, including
   Chat on answered or other terminal items where Chat is available.
   Existing grants, visibility, withdrawal and file rules apply. Ordinary
   message and entry reads still rebuild historical state and advisories
@@ -1839,8 +1834,7 @@ when present. Store the opaque token and its pinned revision before resuming.
 `read --session S --pending --resume T` serves that attempt's pages
 between `baseline` and `baseline_complete`. Retained pending person Chat
 and answers by a person, a granted agent, or the default are included,
-including turns on closed items and migrated
-0.1-era turns. Rows have the same `kind`, `rev` and `data` projection as
+including retained turns on closed items. Rows have the same `kind`, `rev` and `data` projection as
 the feed. An answer is a message row with an answered terminal state.
 `pending:false` conveys receipt, action or an updated representation.
 Keep and apply any still-unapplied row regardless of that marker.
@@ -1887,39 +1881,6 @@ is idempotent, and publishes `delivery.listener_received: true` as a
 person Entry update. The authenticated origin and the turn's receiving
 session must match the recorded service for that exact Chat turn. A transport write,
 elapsed time or a pre-write Delivered record supplies no confirmation.
-
-### 9.4 Legacy commands
-
-| v2 route or disposition | Legacy command or surface |
-|---|---|
-| `POST /v2/agent/messages` | `send` |
-| `PUT /v2/agent/messages/{item_id}` | `revise`, including progress |
-| `POST /v2/agent/messages/{item_id}/retract` (round 19) | `withdraw`, `retract` |
-| `POST /v2/agent/messages/{item_id}/lifecycle` | `lifecycle` |
-| `POST /v2/agent/messages/{item_id}/replies` | `reply` |
-| `POST /v2/agent/messages/{item_id}/result` | `result` |
-| `POST /v2/agent/messages/{item_id}/receipt` for an answer, or `POST /v2/agent/messages/{item_id}/entries/{entry_id}/receipt` for a chat turn (round 20) | `ack2` |
-| `POST /v2/agent/messages/{item_id}/entries/{entry_id}/file-use` (round 20) | `file_use` |
-| `POST /v2/agent/sessions/{session}/end` | `session_end` |
-| `POST /v2/files` | `upload` |
-| `GET /v2/files/{file_id}` | File fetch |
-| `DELETE /v2/files/{file_id}` | `discard_uploads` |
-| `GET /v2/me` (agent spec r2 §1) | `file_limits` |
-| `GET /v2/agent/messages/{item_id}`, or `GET /v2/agent/messages/{item_id}/revisions/{n}` for a selected revision | `message_get` |
-| `GET /v2/agent/changes` with optional `session` (agent spec r2 §4) | `feed`, change notices, session listen, coverage stream |
-| Automatic when the feed serves the turn (agent spec r2 §4) | `ack` (ACK1) |
-| `POST /v2/agent/messages/{item_id}/entries/{entry_id}/file-use` with `transfer` and reason when required | ACK1 attachment transfer reports (round 20 addendum 4) |
-| `GET /v2/agent/delivery-baseline` | Pending work for a new or expired feed cursor |
-| Retired. Feed activity supplies availability (agent spec r2 §§0, 4) | `support`, `attachment_update`, `status`, `coverage` |
-| Retired. Feeds are independent (agent spec r2 §§0, 4) | Exclusive listener, reconnect takeover |
-| `advisory` changes on `GET /v2/agent/changes` (agent spec r2 §4) | `advisory_feed` |
-| `POST /v2/agent/messages/{item_id}/advisories/ack` (round 20) | `advisory_ack` |
-| `GET /v2/agent/focus` (round 19) | `focus_get` |
-| Ephemeral `focus` on the agent SSE feed (round 19) | Focus stream |
-| `POST /v2/agent/show` (rounds 19–20) | `view_show` |
-| Client item and entry reads, or `GET /v2/search` for the exact legacy sender and ID pair (rounds 19–20) | Granted-agent `get` |
-| `GET /v2/search` (rounds 19–20) | Granted-agent `search` |
-| `POST /v2/items/{item_id}/answer` (rounds 19–20) | Granted-agent `respond` |
 
 A message read can carry a present-null raw answer. The matching outcome
 below identifies a structured result.
@@ -2052,35 +2013,33 @@ sender requires both the owner's read and reply patterns to match it, as in
 the existing answer path. A pattern matches an exact sender, or a sender
 prefix when the pattern ends in `/`.
 
-| Request | Legacy command | Behavior |
-|---|---|---|
-| `GET /v2/inbox?limit=&page=` | `search` for listing | The person's `InboxPage` in §4. |
-| `GET /v2/items/{item_id}`, `GET /v2/items/{item_id}/entries`, `GET /v2/items/{item_id}/revisions/{n}` | `get` for the item | The person's item, entries or revision in §4. |
-| `GET /v2/changes?after=&limit=` | none | The person's batch or SSE change feed in §6. |
-| `GET /v2/search?q=&sender=&message_id=&state=&session=&limit=&page=` | `search` | `SearchPage`, described below. |
-| `GET /v2/files/{file_id}` | file download | A retained attachment in the authenticated account. |
-| `POST /v2/agent/messages/{item_id}/retract` | `retract` | The account retraction in §9.2. |
-| `POST /v2/items/{item_id}/answer` | `respond` | The body, request revision precondition, idempotency and response in §5. An item outside the answer grants answers `403 forbidden`. |
+| Request | Behavior |
+|---|---|
+| `GET /v2/inbox?limit=&page=` | The person's `InboxPage` in §4. |
+| `GET /v2/items/{item_id}`, `GET /v2/items/{item_id}/entries`, `GET /v2/items/{item_id}/revisions/{n}` | The person's item, entries or revision in §4. |
+| `GET /v2/changes?after=&limit=` | The person's batch or SSE change feed in §6. |
+| `GET /v2/search?q=&sender=&message_id=&state=&session=&limit=&page=` | `SearchPage`, described below. |
+| `GET /v2/files/{file_id}` | A retained attachment in the authenticated account. |
+| `POST /v2/agent/messages/{item_id}/retract` | The account retraction in §9.2. |
+| `POST /v2/items/{item_id}/answer` | The body, request revision precondition, idempotency and response in §5. An item outside the answer grants answers `403 forbidden`. |
 
 Other routes answer `403 forbidden`. The usual account pause, request
 identifiers and error rules apply. Items and entries use the same shapes
 as client reads, rendered for the requesting agent. Device-only ephemeral
 events are unavailable to this principal.
 
-Clients with a legacy sender and message ID recover the opaque `item_id`
-using `GET /v2/search?sender=<sender_id>&message_id=<message_id>`. Use that
-ID for item reads and answers. For answers, the current `request_revision`
-replaces `acceptance_seq`. Supply the intention's UUIDv4 in `Idempotency-Key`
-in place of `op_id`. `WriteResult.item.terminal` carries the settled outcome,
-and `WriteResult.rev` reports the person's change-log position. Together
-they replace the legacy `relay_outcome` and `terminal_seq`. The response does
-not echo an `operation_id`. A replay is marked by `Idempotent-Replayed`.
+Account search can resolve an exact sender and stored message ID to the opaque
+`item_id`. Use that ID for item reads and answers. Submit answers with the
+current `request_revision` and a UUIDv4 in `Idempotency-Key`.
+`WriteResult.item.terminal` carries the settled outcome and `WriteResult.rev`
+reports the person's change-log position. A replay is marked by
+`Idempotent-Replayed`.
 
 ### Search
 
 Account-capable search includes the response header `Harklight-Account-Search: 1` for admitted device and Granted Agent requests.
 
-`q` replaces the legacy `text` field (`contains` internally). It is an optional case-sensitive literal substring of any string value in
+`q` is an optional case-sensitive literal substring of any string value in
 the current message body, including strings nested inside arrays and objects.
 Object keys and non-string scalars do not match. The maximum is 1,024 UTF-8
 bytes. Omit `q` to skip the text filter. Optional `sender` and `message_id`
@@ -2116,12 +2075,9 @@ that response. A later page can reflect intervening edits. Apply each Item's
 }
 ```
 
-Repeat the search filters with the opaque `next_page` token. It replaces
-the legacy search cursor and binds the filter values, enrolled key, agent
-and person. The client can change `limit` between pages. Grant changes leave
+Repeat the search filters with the opaque `next_page` token. The token binds
+the filter values, enrolled key, agent and person. The client can change `limit` between pages. Grant changes leave
 the token valid. Search page tokens are ASCII and have their own 4,096-byte
 limit.
 Invalid filters and invalid tokens answer `400 invalid_field`, naming the
 query parameter, such as `page`. An absent `next_page` marks the end.
-
-Legacy references for these rules are [search validation and matching](https://github.com/clickety-clacks/harklight-server/blob/f46aa03dc48017e4c81ee3f3c58a820231a162dd/lib/attention_server/agent_access.ex#L128-L236), [wire field and response mapping](https://github.com/clickety-clacks/harklight-server/blob/f46aa03dc48017e4c81ee3f3c58a820231a162dd/lib/attention_server/agent_wire.ex#L26-L83), and [answer grants](https://github.com/clickety-clacks/harklight-server/blob/f46aa03dc48017e4c81ee3f3c58a820231a162dd/lib/attention_server/engine.ex#L1133-L1175).

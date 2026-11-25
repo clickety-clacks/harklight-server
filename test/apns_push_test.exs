@@ -847,7 +847,7 @@ defmodule AttentionServer.APNSPushTest do
     refute_receive {:apns_request, _, _, _}, 100
 
     assert :ok = Supervisor.stop(first_server)
-    seed_legacy_push_format16_past_window(store_path)
+    make_queued_push_eligible(store_path)
 
     {:ok, server} = Server.start_link(server_options(certs, store_path) ++ [apns: apns])
     Process.unlink(server)
@@ -1224,18 +1224,6 @@ defmodule AttentionServer.APNSPushTest do
     refute Map.has_key?(binding.last_outcome, "reason")
     refute inspect(binding.last_outcome) =~ @device_token
     refute v2(server, certs, "a2", "GET", "/v2/settings").body =~ @device_token
-
-    assert :ok = Supervisor.stop(server)
-
-    seed_legacy_provider_reason(store_path, @device_token)
-
-    server = start_apns_server(ctx, store_path)
-    relay = Server.relay(server)
-    settings = v2(server, certs, "a2", "GET", "/v2/settings")
-
-    assert json(settings)["settings"]["push"]["state"] == "blocked_configuration"
-    refute settings.body =~ @device_token
-    refute Map.has_key?(stored_binding(relay, app_key).last_outcome, "reason")
 
     assert :ok = Supervisor.stop(server)
   end
@@ -2270,48 +2258,8 @@ defmodule AttentionServer.APNSPushTest do
     outcome
   end
 
-  defp seed_legacy_provider_reason(path, reason) do
-    assert {:ok, db} = Sqlite3.open(path)
-    assert {:ok, select} = Sqlite3.prepare(db, "SELECT payload FROM relay_state WHERE id = 1")
-    assert {:row, [payload]} = Sqlite3.step(db, select)
-    assert :ok = Sqlite3.release(db, select)
-    assert :ok = Sqlite3.close(db)
-
-    {:attention_relay_state, _format, engine} = :erlang.binary_to_term(payload, [:safe])
-
-    {key, binding} =
-      Enum.find(engine.push_bindings, fn {_key, binding} -> binding.address == @device_token end)
-
-    old_outcome = Map.put(binding.last_outcome, "reason", reason)
-    old_binding = %{binding | last_outcome: old_outcome}
-    old_engine = %{engine | push_bindings: Map.put(engine.push_bindings, key, old_binding)}
-
-    legacy_payload =
-      :erlang.term_to_binary({:attention_relay_state, 10, old_engine}, [{:compressed, 6}])
-
-    assert {:ok, db} = Sqlite3.open(path)
-
-    assert {:ok, update} =
-             Sqlite3.prepare(
-               db,
-               "UPDATE relay_state SET payload = ?, checksum = ? WHERE id = 1"
-             )
-
-    assert :ok =
-             Sqlite3.bind(update, [
-               {:blob, legacy_payload},
-               {:blob, :crypto.hash(:sha256, legacy_payload)}
-             ])
-
-    assert :done = Sqlite3.step(db, update)
-    assert :ok = Sqlite3.release(db, update)
-    assert :ok = Sqlite3.close(db)
-  end
-
-  # Rewrites the persisted engine as a format-16 payload (no accepted_high) and
-  # moves the binding's send time into the past, as if the server had been down
-  # until the queued push was eligible.
-  defp seed_legacy_push_format16_past_window(path) do
+  # Make the queued push eligible immediately on a cold restart.
+  defp make_queued_push_eligible(path) do
     assert {:ok, db} = Sqlite3.open(path)
     assert {:ok, select} = Sqlite3.prepare(db, "SELECT payload FROM relay_state WHERE id = 1")
     assert {:row, [payload]} = Sqlite3.step(db, select)
@@ -2323,21 +2271,20 @@ defmodule AttentionServer.APNSPushTest do
     bindings =
       Map.new(engine.push_bindings, fn {key, binding} ->
         next_at = if is_integer(binding.next_at), do: past, else: nil
-        {key, binding |> Map.delete(:accepted_high) |> Map.put(:next_at, next_at)}
+        {key, %{binding | next_at: next_at}}
       end)
 
-    legacy = %{engine | push_bindings: bindings}
+    engine = %{engine | push_bindings: bindings}
 
-    legacy_payload =
-      :erlang.term_to_binary({:attention_relay_state, 16, legacy}, [{:compressed, 6}])
+    payload = :erlang.term_to_binary({:attention_relay_state, 30, engine}, [{:compressed, 6}])
 
     assert {:ok, update} =
              Sqlite3.prepare(db, "UPDATE relay_state SET payload = ?, checksum = ? WHERE id = 1")
 
     assert :ok =
              Sqlite3.bind(update, [
-               {:blob, legacy_payload},
-               {:blob, :crypto.hash(:sha256, legacy_payload)}
+               {:blob, payload},
+               {:blob, :crypto.hash(:sha256, payload)}
              ])
 
     assert :done = Sqlite3.step(db, update)

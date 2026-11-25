@@ -303,48 +303,6 @@ defmodule AttentionServer.InvitationHandoffTest do
     assert map_size(:sys.get_state(c.relay).store.engine.join_invitations) == 1
   end
 
-  test "format14 invitation survives request-ID migration without changing its bearer or grants",
-       c do
-    path = Path.join(c.dir, "legacy.sqlite3")
-    {:ok, empty} = Store.open(path)
-    Store.close(empty)
-    {:ok, engine} = Engine.operator_bootstrap(Engine.new(), @person, @owner)
-    token = :crypto.strong_rand_bytes(32)
-    hash = :crypto.hash(:sha256, token)
-    {:ok, engine, invitation} = GuidedJoin.create(engine, @person, @owner, hash, c.config)
-    legacy_invitation = Map.delete(invitation, :request_id)
-    legacy = %{engine | join_invitations: %{hash => legacy_invitation}}
-    payload = :erlang.term_to_binary({:attention_relay_state, 14, legacy}, [{:compressed, 6}])
-    {:ok, db} = Exqlite.Sqlite3.open(path)
-
-    {:ok, stmt} =
-      Exqlite.Sqlite3.prepare(db, "UPDATE relay_state SET payload=?, checksum=? WHERE id=1")
-
-    :ok = Exqlite.Sqlite3.bind(stmt, [{:blob, payload}, {:blob, :crypto.hash(:sha256, payload)}])
-    :done = Exqlite.Sqlite3.step(db, stmt)
-    :ok = Exqlite.Sqlite3.release(db, stmt)
-    :ok = Exqlite.Sqlite3.close(db)
-    {:ok, loaded} = Store.open(path)
-    assert Map.delete(loaded.engine.join_invitations[hash], :request_id) == legacy_invitation
-    assert loaded.engine.owners == legacy.owners
-    assert loaded.engine.sender_grants == legacy.sender_grants
-
-    assert {:ok, pending, %{"state" => "pending"}} =
-             GuidedJoin.redeem(
-               loaded.engine,
-               hash,
-               TLSFixtures.certificate_der!(c.certs, "a2"),
-               "legacy joining device",
-               :crypto.hash(:sha256, "legacy-status"),
-               "ABCDEFGH23",
-               c.config
-             )
-
-    assert pending.pending_enrollments["ABCDEFGH23"].person == @person
-    assert pending.sender_grants == %{}
-    Store.close(loaded)
-  end
-
   defp create(c),
     do:
       InvitationHandoff.create(
