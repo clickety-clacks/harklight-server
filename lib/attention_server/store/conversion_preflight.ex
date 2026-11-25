@@ -24,7 +24,7 @@ defmodule AttentionServer.Store.ConversionPreflight do
   @envelopes %{
     27 => Map.merge(@shape_a, %{expanded_bytes: 123_901_800, memory_per_byte: 17}),
     29 => Map.merge(@shape_a, %{expanded_bytes: 123_901_822, memory_per_byte: 17}),
-    30 => Map.merge(@shape_a, %{expanded_bytes: 123_901_842, memory_per_byte: 19})
+    30 => Map.merge(@shape_a, %{expanded_bytes: 123_901_842, memory_per_byte: 20})
   }
 
   def check(db, budget, expected_format, envelopes \\ @envelopes) do
@@ -60,8 +60,9 @@ defmodule AttentionServer.Store.ConversionPreflight do
     with {:ok, revisions} <- count_rows(db, "client_resource_revs"),
          {:ok, changes} <- count_rows(db, "agent_changes"),
          {:ok, references} <- count_rows(db, "relay_large_data_refs"),
-         true <- revisions <= envelope.revisions and changes <= envelope.changes and
-           references <= envelope.references do
+         true <-
+           revisions <= envelope.revisions and changes <= envelope.changes and
+             references <= envelope.references do
       :ok
     else
       _ -> {:error, :fit_not_established}
@@ -71,12 +72,17 @@ defmodule AttentionServer.Store.ConversionPreflight do
   defp check_shape(_db, _uploads, _envelope), do: {:error, :fit_not_established}
 
   defp count_rows(db, table) do
-    with {:ok, [[exists]]} <- RecordTable.select(db, """
-         SELECT EXISTS (SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?)
-         """, [table]) do
+    with {:ok, [[exists]]} <-
+           RecordTable.select(
+             db,
+             """
+             SELECT EXISTS (SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?)
+             """,
+             [table]
+           ) do
       if exists == 1 do
         with {:ok, [[count]]} <- RecordTable.select(db, "SELECT count(*) FROM #{table}"),
-          do: {:ok, count}
+             do: {:ok, count}
       else
         {:ok, 0}
       end
@@ -94,24 +100,43 @@ defmodule AttentionServer.Store.ConversionPreflight do
            RecordTable.select(db, "SELECT substr(payload, 1, ?) FROM relay_state WHERE id = 1", [
              @prefix_bytes
            ]) do
-      inspect_prefix(stored_bytes, prefix)
+      inspect_prefix(db, stored_bytes, prefix)
     else
       false -> {:error, :fit_not_established}
       _ -> {:error, :unsupported_snapshot}
     end
   end
 
-  defp inspect_prefix(stored_bytes, prefix) do
+  defp inspect_prefix(db, stored_bytes, prefix) do
     with {:ok, sizes} <- snapshot_sizes(stored_bytes, prefix) do
       case snapshot_format(prefix) do
         {:ok, format} -> {:ok, Map.put(sizes, :format, format)}
-        {:already_converted, _} = converted -> converted
+        {:already_converted, _} -> confirm_row_anchor(db, stored_bytes, prefix)
         {:error, _} -> {:error, :unsupported_snapshot}
       end
     else
       {:error, _} -> {:error, :unsupported_snapshot}
     end
   end
+
+  defp confirm_row_anchor(db, stored_bytes, prefix) when stored_bytes == byte_size(prefix) do
+    with {:ok, [[checksum]]} <-
+           RecordTable.select(db, "SELECT checksum FROM relay_state WHERE id = 1"),
+         true <- :crypto.hash(:sha256, prefix) == checksum,
+         {:ok, [[3]]} <-
+           RecordTable.select(db, """
+           SELECT count(*) FROM sqlite_schema WHERE type = 'table'
+             AND name IN ('relay_records', 'relay_record_generation', 'relay_index_state')
+           """),
+         {:ok, _} <- RecordTable.generation(db),
+         {:ok, [[1]]} <- RecordTable.select(db, "SELECT id FROM relay_index_state WHERE id = 1") do
+      {:already_converted, @row_format}
+    else
+      _ -> {:error, :unsupported_snapshot}
+    end
+  end
+
+  defp confirm_row_anchor(_db, _stored_bytes, _prefix), do: {:error, :unsupported_snapshot}
 
   def snapshot_sizes(stored_bytes, <<131, 80, expanded_bytes::32, _::binary>>)
       when expanded_bytes > 0 and stored_bytes > 6 do
