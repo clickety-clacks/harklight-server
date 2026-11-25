@@ -449,6 +449,9 @@ defmodule AttentionServer.Relay do
     do: GenServer.call(server, {:request_staged_reply, verified_key, frame, sources}, :infinity)
 
   @doc false
+  def push_server_id(server), do: GenServer.call(server, :push_server_id, :infinity)
+
+  @doc false
   def claim_push(server, now_ms), do: GenServer.call(server, {:claim_push, now_ms}, :infinity)
 
   @doc false
@@ -858,6 +861,9 @@ defmodule AttentionServer.Relay do
       {:error, reason} -> {:reply, {:error, reason}, state}
     end
   end
+
+  defp dispatch_call(:push_server_id, _from, state),
+    do: {:reply, state.store.engine.relay_instance_id, state}
 
   defp dispatch_call(:enable_push, _from, state),
     do: {:reply, :ok, %{state | push_enabled: true}}

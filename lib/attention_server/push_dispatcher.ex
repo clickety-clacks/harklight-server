@@ -3,14 +3,21 @@ defmodule AttentionServer.PushDispatcher do
 
   use GenServer
 
-  alias AttentionServer.Diagnostics
+  alias AttentionServer.{APNS, Diagnostics}
 
   @initial_retry_interval 250
   @maximum_retry_interval 30_000
   @maximum_backoff_exponent 7
   @stable_interval 30_000
 
-  def start_link(opts), do: GenServer.start_link(__MODULE__, opts)
+  def start_link(opts), do: GenServer.start_link(__MODULE__, opts, Keyword.take(opts, [:name]))
+
+  def apple_config(dispatcher), do: GenServer.call(dispatcher, :apple_config)
+
+  def apple_token(dispatcher, profile_id, rejected_token) do
+    rejected_fingerprint = rejected_token && :crypto.hash(:sha256, rejected_token)
+    GenServer.call(dispatcher, {:apple_token, profile_id, rejected_fingerprint})
+  end
 
   @impl true
   def init(opts) do
@@ -18,12 +25,39 @@ defmodule AttentionServer.PushDispatcher do
 
     state = %{
       opts: opts,
+      prepared_apns: nil,
+      provider_tokens: %{},
       child: nil,
       retry_attempt: 0,
       stable_timer: nil
     }
 
     {:ok, start_dispatcher(state)}
+  end
+
+  @impl true
+  def handle_call(:apple_config, _from, state), do: {:reply, state.prepared_apns, state}
+
+  def handle_call({:apple_token, profile_id, rejected_fingerprint}, _from, state) do
+    %{prepared_apns: %{profiles: profiles}, provider_tokens: tokens} = state
+    cached = Map.get(tokens, profile_id)
+
+    # Only provider authorization is shared. The outbound Apple request is
+    # made in the caller, independently of the direct push worker.
+    rejected_token =
+      if cached && rejected_fingerprint &&
+           rejected_fingerprint == :crypto.hash(:sha256, cached.token),
+         do: cached.token
+
+    {token, cached} =
+      APNS.provider_authorization(Map.fetch!(profiles, profile_id), cached, rejected_token)
+
+    {:reply, token, %{state | provider_tokens: Map.put(tokens, profile_id, cached)}}
+  end
+
+  @impl true
+  def format_status(status) do
+    Map.update!(status, :state, &Map.drop(&1, [:prepared_apns, :provider_tokens]))
   end
 
   @impl true
@@ -54,9 +88,16 @@ defmodule AttentionServer.PushDispatcher do
 
   defp start_dispatcher(state) do
     case safe_start_worker(state.opts) do
-      {:ok, child} when is_pid(child) ->
+      {:ok, child, apns} when is_pid(child) ->
         stable_timer = Process.send_after(self(), {:reset_retry_attempt, child}, @stable_interval)
-        %{state | child: child, stable_timer: stable_timer}
+
+        %{
+          state
+          | child: child,
+            stable_timer: stable_timer,
+            prepared_apns: apns,
+            provider_tokens: %{}
+        }
 
       {:error, reason} ->
         schedule_retry(state, reason)
@@ -70,7 +111,18 @@ defmodule AttentionServer.PushDispatcher do
   end
 
   defp safe_start_worker(opts) do
-    AttentionServer.PushDispatcher.Worker.start_link(opts)
+    apns =
+      case Keyword.fetch(opts, :apns) do
+        {:ok, config} -> APNS.prepare!(config)
+        :error -> nil
+      end
+
+    opts = Keyword.put(opts, :prepared_apns, apns)
+
+    case AttentionServer.PushDispatcher.Worker.start_link(opts) do
+      {:ok, worker} -> {:ok, worker, apns}
+      other -> other
+    end
   rescue
     error ->
       {:error, error}
@@ -80,7 +132,8 @@ defmodule AttentionServer.PushDispatcher do
   end
 
   defp schedule_retry(state, reason) do
-    Diagnostics.failure(:apns_dispatch, :configuration, reason, :retry)
+    operation = if state.opts[:push_relay_url], do: :push_relay, else: :apns_dispatch
+    Diagnostics.failure(operation, :configuration, reason, :retry)
     delay = retry_interval(state.retry_attempt)
     Process.send_after(self(), :start_dispatcher, delay)
 
@@ -107,7 +160,7 @@ defmodule AttentionServer.PushDispatcher.Worker do
 
   require Logger
 
-  alias AttentionServer.{APNS, Diagnostics, Relay}
+  alias AttentionServer.{APNS, Diagnostics, PushRelayClient, Relay}
 
   @idle_interval 1_000
   # Provisional until the bounded path records real provider attempt durations.
@@ -118,39 +171,85 @@ defmodule AttentionServer.PushDispatcher.Worker do
   @impl true
   def init(opts) do
     relay = Keyword.fetch!(opts, :relay)
-    apns_opts = Keyword.fetch!(opts, :apns)
-    apns = APNS.prepare!(apns_opts)
+    {transport, send_push, operation, attempt_timeout_ms} = transport(opts, relay)
     :ok = Relay.enable_push(relay)
 
     state = %{
       relay: relay,
-      apns: apns,
-      apns_send: Keyword.get(opts, :apns_send, &APNS.send/3),
-      attempt_timeout_ms:
-        Keyword.get(apns_opts, :attempt_timeout_ms, @default_attempt_timeout_ms),
+      apns: transport,
+      apns_send: send_push,
+      operation: operation,
+      attempt_timeout_ms: attempt_timeout_ms,
       cached_token: nil
     }
 
-    send(self(), :dispatch)
-    {:ok, state}
+    if operation == :push_relay do
+      {:ok, state, {:continue, :register}}
+    else
+      send(self(), :dispatch)
+      {:ok, state}
+    end
   rescue
     error ->
-      Diagnostics.failure(:apns_dispatch, :configuration, error, :unavailable)
-      {:stop, :invalid_apns_configuration}
+      operation = if opts[:push_relay_url], do: :push_relay, else: :apns_dispatch
+      Diagnostics.failure(operation, :configuration, error, :unavailable)
+
+      reason =
+        if operation == :apns_dispatch,
+          do: :invalid_apns_configuration,
+          else: :invalid_push_relay_configuration
+
+      {:stop, reason}
+  end
+
+  defp transport(opts, relay) do
+    case Keyword.fetch(opts, :apns) do
+      {:ok, apns_opts} ->
+        apns = Keyword.get_lazy(opts, :prepared_apns, fn -> APNS.prepare!(apns_opts) end)
+
+        {apns, Keyword.get(opts, :apns_send, &APNS.send/3), :apns_dispatch,
+         Keyword.get(apns_opts, :attempt_timeout_ms, @default_attempt_timeout_ms)}
+
+      :error ->
+        url = Keyword.fetch!(opts, :push_relay_url)
+
+        config =
+          PushRelayClient.prepare!(url, Relay.push_server_id(relay), opts[:push_relay_cacerts])
+
+        {config, &PushRelayClient.send/3, :push_relay, @default_attempt_timeout_ms}
+    end
+  end
+
+  @impl true
+  def handle_continue(:register, state) do
+    cached_token =
+      case PushRelayClient.register(state.apns) do
+        {:ok, key} ->
+          key
+
+        {:error, cause, _delay} ->
+          Diagnostics.failure(:push_relay, :configuration, cause, :retry)
+          nil
+      end
+
+    send(self(), :dispatch)
+    {:noreply, %{state | cached_token: cached_token}}
   end
 
   @impl true
   def handle_info(:dispatch, state) do
     now_ms = System.system_time(:millisecond)
 
-    case relay_call(:push_claim, nil, fn -> Relay.claim_push(state.relay, now_ms) end) do
+    case relay_call(state.operation, :push_claim, nil, fn ->
+           Relay.claim_push(state.relay, now_ms)
+         end) do
       {:ok, nil} ->
         schedule(@idle_interval, state)
 
       {:ok, claim} ->
         {outcome, cached_token} = send_attempt(state, claim)
 
-        case relay_call(:push_finish, claim.claim_id, fn ->
+        case relay_call(state.operation, :push_finish, claim.claim_id, fn ->
                Relay.finish_push(state.relay, claim, outcome, System.system_time(:millisecond))
              end) do
           :ok ->
@@ -158,7 +257,7 @@ defmodule AttentionServer.PushDispatcher.Worker do
 
           {:error, reason} ->
             Diagnostics.failure(
-              :apns_dispatch,
+              state.operation,
               :push_finish,
               reason,
               :retry,
@@ -167,7 +266,7 @@ defmodule AttentionServer.PushDispatcher.Worker do
 
           other ->
             Diagnostics.failure(
-              :apns_dispatch,
+              state.operation,
               :push_finish,
               other,
               :retry,
@@ -179,11 +278,11 @@ defmodule AttentionServer.PushDispatcher.Worker do
         {:noreply, %{state | cached_token: cached_token}}
 
       {:error, reason} ->
-        Diagnostics.failure(:apns_dispatch, :push_claim, reason, :retry)
+        Diagnostics.failure(state.operation, :push_claim, reason, :retry)
         schedule(@idle_interval, state)
 
       other ->
-        Diagnostics.failure(:apns_dispatch, :push_claim, other, :retry)
+        Diagnostics.failure(state.operation, :push_claim, other, :retry)
         schedule(@idle_interval, state)
     end
   end
@@ -206,12 +305,13 @@ defmodule AttentionServer.PushDispatcher.Worker do
 
         nil ->
           _ = Task.shutdown(task, :brutal_kill)
-          Diagnostics.failure(:apns_dispatch, :push_request, :timeout, :retry, claim.claim_id)
+          Diagnostics.failure(state.operation, :push_request, :timeout, :retry, claim.claim_id)
           {{%{state: "retry"}, state.cached_token}, "timeout"}
       end
 
     duration_ms = System.monotonic_time(:millisecond) - started_at
-    Logger.info("event=harklight_apns_attempt duration_ms=#{duration_ms} outcome=#{outcome}")
+    event = if state.operation == :push_relay, do: "push_relay_attempt", else: "apns_attempt"
+    Logger.info("event=harklight_#{event} duration_ms=#{duration_ms} outcome=#{outcome}")
     result
   end
 
@@ -220,15 +320,15 @@ defmodule AttentionServer.PushDispatcher.Worker do
     {:noreply, state}
   end
 
-  defp relay_call(phase, operation_id, fun) do
+  defp relay_call(operation, phase, operation_id, fun) do
     fun.()
   rescue
     error ->
-      Diagnostics.failure(:apns_dispatch, phase, error, :outcome_unknown, operation_id)
+      Diagnostics.failure(operation, phase, error, :outcome_unknown, operation_id)
       reraise error, __STACKTRACE__
   catch
     kind, reason ->
-      Diagnostics.failure(:apns_dispatch, phase, reason, :outcome_unknown, operation_id)
+      Diagnostics.failure(operation, phase, reason, :outcome_unknown, operation_id)
       :erlang.raise(kind, reason, __STACKTRACE__)
   end
 end

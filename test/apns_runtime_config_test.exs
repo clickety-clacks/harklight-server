@@ -18,6 +18,7 @@ defmodule AttentionServer.APNSRuntimeConfigTest do
     "ATTENTION_SERVER_APNS_KEY_PATH" => "/protected/sandbox-key",
     "ATTENTION_SERVER_APNS_KEY_ID" => "SANDBOX001",
     "ATTENTION_SERVER_APNS_TEAM_ID" => "TESTTEAMID",
+    "ATTENTION_SERVER_PUSH_RELAY_URL" => nil,
     "ATTENTION_SERVER_APNS_ATTEMPT_TIMEOUT_MS" => nil,
     "ATTENTION_SERVER_APNS_PRODUCTION_KEY_PATH" => nil,
     "ATTENTION_SERVER_APNS_PRODUCTION_KEY_ID" => nil,
@@ -120,6 +121,31 @@ defmodule AttentionServer.APNSRuntimeConfigTest do
 
       with_env(%{variable => "0"}, fn ->
         refute Keyword.has_key?(runtime_apns_config(), :attempt_timeout_ms)
+      end)
+    end)
+  end
+
+  test "push relay URL is opt-in and read independently of Apple keys", %{certs: certs} do
+    with_env(@server_env, fn ->
+      refute Keyword.has_key?(runtime_server_opts(certs), :push_relay_url)
+
+      with_env(%{"ATTENTION_SERVER_PUSH_RELAY_URL" => "https://relay.example"}, fn ->
+        opts = runtime_server_opts(certs)
+        assert opts[:push_relay_url] == "https://relay.example"
+        assert opts[:apns][:team_id] == "TESTTEAMID"
+
+        with_env(
+          %{
+            "ATTENTION_SERVER_APNS_KEY_PATH" => nil,
+            "ATTENTION_SERVER_APNS_KEY_ID" => nil,
+            "ATTENTION_SERVER_APNS_TEAM_ID" => nil
+          },
+          fn ->
+            opts = runtime_server_opts(certs)
+            refute Keyword.has_key?(opts, :apns)
+            assert opts[:push_relay_url] == "https://relay.example"
+          end
+        )
       end)
     end)
   end

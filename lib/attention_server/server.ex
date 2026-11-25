@@ -76,6 +76,26 @@ defmodule AttentionServer.Server do
         hosted_configuration(opts, deployment_mode, upload_cap, public_origin)
 
       apns_opts = Keyword.get(opts, :apns)
+      push_relay_url = Keyword.get(opts, :push_relay_url)
+      dispatcher_name = {:global, {PushDispatcher, relay_name}}
+
+      dispatcher =
+        cond do
+          apns_opts ->
+            if push_relay_url, do: optional_warning("push_relay", "direct_apns_configured")
+            {:apns_dispatch, [name: dispatcher_name, relay: relay_name, apns: apns_opts]}
+
+          push_relay_url ->
+            {:push_relay,
+             [
+               relay: relay_name,
+               push_relay_url: push_relay_url,
+               push_relay_cacerts: Keyword.get(opts, :push_relay_cacerts)
+             ]}
+
+          true ->
+            nil
+        end
 
       relay_opts = [
         name: relay_name,
@@ -122,6 +142,10 @@ defmodule AttentionServer.Server do
         if dashboard_opts do
           dashboard_opts
           |> Keyword.put(:deployment_mode, deployment_mode)
+          |> Keyword.put(
+            :push_relay_dispatcher,
+            if(deployment_mode == :saas and apns_opts != nil, do: dispatcher_name)
+          )
           |> Keyword.put(:public_origin, public_origin)
           |> Keyword.put(:hosted_addresses, hosted_addresses)
           |> Keyword.put(:invitations_configured, Keyword.has_key?(relay_opts, :join_configuration))
@@ -168,14 +192,16 @@ defmodule AttentionServer.Server do
       ]
 
       children =
-        if apns_opts do
+        if dispatcher do
+          {operation, dispatcher_opts} = dispatcher
+
           children ++
             [
               optional_child_spec(
                 :push_dispatcher,
                 PushDispatcher,
-                [relay: relay_name, apns: apns_opts],
-                :apns_dispatch,
+                dispatcher_opts,
+                operation,
                 :configuration,
                 :worker
               )

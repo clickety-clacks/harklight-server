@@ -275,11 +275,39 @@ agent’s computer. Run `harklight-agent setup FILE` there. Approve the displaye
 code with `harklight owner approve --code CODE --senders app:agent/`, using the
 same owner connection options.
 
-## Optional APNs notifications
+## iPhone notifications via the Harklight push relay
 
-APNs is disabled when all five APNs settings below are absent. The Sandbox
-profile keeps using its existing authorized P-256 signing key. Its path and key
-identifier stay in the existing settings:
+To enable notifications in the Harklight iPhone app, uncomment this line in
+`server.env` and restart Harklight Server. On an existing installation, add the
+line if it is missing.
+
+```sh
+export ATTENTION_SERVER_PUSH_RELAY_URL=https://app.harklight.net
+```
+
+For each notification, the relay receives your iPhone's push token, the push
+kind (alert or background), the badge count when supplied, the push environment
+(production or sandbox), whether an alert plays a sound or arrives quietly when
+specified, your Server's random identifier, and the address it connects from.
+The relay never receives message text, titles or sender names. It stores none
+of this as push or registration records and uses the data only to ask Apple to
+deliver the notification. An alert reads “New message in Harklight,” and a
+background notification shows no alert. The relay writes one operational log
+line per push with the Server identifier, kind, environment, Apple response
+status, a recognized error reason when available, and duration. It also logs
+the Server identifier at registration. These lines never include the token.
+The system journal keeps these lines until it removes older entries to make
+space, with no fixed retention period. The web front end's access logs include
+the connecting address and are kept for 14 days.
+
+The relay is free and offered on fair use, with no guarantee of availability.
+We may stop serving a Server that abuses it.
+
+## Optional direct APNs notifications
+
+Configured Apple keys take precedence over the relay URL. The Sandbox profile
+uses its authorized P-256 signing key. Set its path and key identifier as
+follows:
 
 - `ATTENTION_SERVER_APNS_KEY_PATH`: absolute path to the protected Sandbox key.
 - `ATTENTION_SERVER_APNS_KEY_ID`: the Sandbox key's ten-character Apple key ID.
