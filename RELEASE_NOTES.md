@@ -1,3 +1,24 @@
+# Harklight Server v0.2.22
+
+Bundles Harklight Web 0.2.6 (source edd52181, archive SHA-256
+e4dcfd6d2ad364bb39923c68b77c00366d3d5788a50da5e4763d3cf5677236dd). Web 0.2.6
+reads the delivery state `receipt_expected: false` that v0.2.21 introduced: an
+old chat reply with no receipt evidence shows no delivery caption instead of
+"Sending…". It still reads the older shapes. Everything else is as in v0.2.21.
+
+## Upgrade and recovery
+
+As in v0.2.21: the Server opens FORMAT30 stores only, and its one-time step
+runs on the first start of v0.2.21 or later. Take a complete private backup
+before starting the new release. To return to an earlier release, follow the
+rollback steps in SELF_HOST.md.
+
+**Compatibility.** Harklight Server 0.2.22 speaks only the 0.2 protocol. The
+packaged web client handles `receipt_expected`. For the iPhone app, install
+this release together with an app build that reads `receipt_expected`; older
+builds show those old replies as still sending. Harklight Agent 0.2.6 is the
+matching Agent release.
+
 # Harklight Server v0.2.21
 
 This release removes the Server's remaining handling of the old 0.1 protocol
