@@ -287,6 +287,12 @@ defmodule AttentionServer.Store do
     convert_legacy_store(path, preflight, fn _store, _engine, _generation -> {:ok, :converted} end)
   end
 
+  # Isolated synthetic calibration only. This code stays on the rehearsal branch.
+  def calibrate_stopped(path) do
+    true = File.regular?(Path.join(Path.dirname(path), "synthetic-format31"))
+    convert_legacy_store(path, fn _db -> :ok end, fn _store, _engine, _generation -> {:ok, :converted} end)
+  end
+
   defp convert_legacy_store(
          path,
          preflight \\ fn _db -> :ok end,
