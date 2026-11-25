@@ -19,6 +19,49 @@ defmodule AttentionServer.Store.KeyedDifferentialTest do
     end
   end
 
+  @tag :tmp_dir
+  test "alert choices commit and reopen in both storage modes", %{tmp_dir: directory} do
+    for mode <- [:legacy, :keyed] do
+      path = Path.join(directory, "#{mode}.sqlite3")
+      {:ok, legacy} = Store.open(path)
+      {:ok, engine} = Engine.setup_person(legacy.engine, @person)
+      {:ok, engine} = Engine.setup_device(engine, @person, @reader)
+      {:ok, legacy} = Store.commit(legacy, engine, audit("setup"))
+      assert :ok = Store.close(legacy)
+
+      if mode == :keyed do
+        assert {:ok, keyed} = Store.open(path, :keyed_cutover)
+        assert :ok = Store.close(keyed)
+      end
+
+      for {alerts, n} <- [{"all", 1}, {"important", 2}] do
+        assert {:ok, store} = Store.open(path, mode)
+        assert {:ok, store} = Store.enable_change_log(store)
+
+        frame = %{
+          "v" => 1,
+          "type" => "alerts_set",
+          "ref" => "client_api_v2",
+          "op_id" => "00000000-0000-4000-8000-00000000000#{n}",
+          "alerts" => alerts
+        }
+
+        {next, {:ok, reply}, touched} =
+          Engine.request_line_with_touches(store.engine, @reader, JSON.encode_line(frame), 1_000)
+
+        assert {:ok, %{"alerts" => ^alerts}} = JSON.decode_line(reply)
+        assert MapSet.member?(touched, {:row, :alert_choices, @person})
+        transition = if mode == :keyed, do: {next, touched}, else: next
+        assert {:ok, committed} = Store.commit(store, transition, audit("alerts"))
+        assert :ok = Store.close(committed)
+
+        assert {:ok, reopened} = Store.open(path, mode)
+        assert Engine.alert_choice(reopened.engine, @person) == alerts
+        assert :ok = Store.close(reopened)
+      end
+    end
+  end
+
   test "the touch oracle requires the old address when a record is rekeyed" do
     old_key = {@person, @sender, "old"}
     new_key = {@person, @sender, "new"}
@@ -239,7 +282,14 @@ defmodule AttentionServer.Store.KeyedDifferentialTest do
 
   defp mutation(legacy, keyed) do
     engine = keyed.engine
-    fields = engine |> Map.from_struct() |> Map.drop(@derived) |> Map.keys() |> Enum.sort()
+    # Keep the seeded mutation sequences stable. Alert choice writes are
+    # exercised directly above, including removal of the keyed row.
+    fields =
+      engine
+      |> Map.from_struct()
+      |> Map.drop([:alert_choices | @derived])
+      |> Map.keys()
+      |> Enum.sort()
     choice = :rand.uniform()
 
     {label, fun} =
