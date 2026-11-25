@@ -457,6 +457,15 @@ chmod 600 "$backup_tmp/INSTALL_INFO"
 mv -- "$backup_tmp" "$backup_final"
 backup_tmp=""
 
+if ! grep -Fqx "version=\${current_tag#v}" "$current_path/BUILD_INFO"; then
+  fail "previous release metadata differs from its selected version; release was not switched"
+fi
+
+if ! ATTENTION_SERVER_ENABLE=0 "$target/bin/harklight" store convert-stopped \
+  "$state/relay.sqlite3" --from-release "$current_tag"; then
+  rollback_failed_upgrade "stopped-store FORMAT31 conversion failed"
+fi
+
 current_link="$root/.current-$HARKLIGHT_RELEASE_TAG.$$"
 ln -s "releases/$HARKLIGHT_RELEASE_TAG" "$current_link"
 mv -Tf -- "$current_link" "$root/current"

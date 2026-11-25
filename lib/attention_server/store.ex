@@ -26,6 +26,7 @@ defmodule AttentionServer.Store do
   alias Exqlite.Sqlite3
 
   alias AttentionServer.Store.{
+    ConversionPreflight,
     DerivedIndex,
     KeyedMigration,
     KeyedReference,
@@ -155,8 +156,6 @@ defmodule AttentionServer.Store do
   );
   """
 
-  def open(nil), do: {:ok, %__MODULE__{db: nil, engine: Engine.new(), version: 0}}
-
   @doc """
   Turns on the client API v2 change log for this durable store: creates its
   tables, reconciles it with the snapshot, and from then on writes its rows in
@@ -174,12 +173,20 @@ defmodule AttentionServer.Store do
     end
   end
 
+  def open(nil), do: {:ok, %__MODULE__{db: nil, engine: Engine.new(), version: 0}}
+
   def open(":memory:") do
     Diagnostics.failure(:server_storage, :store_open, :invalid_store_path, :unavailable)
     {:error, :invalid_store_path}
   end
 
-  def open(path) when is_binary(path) and path != "", do: open(path, :legacy)
+  def open(path) when is_binary(path) and path != "" do
+    if File.exists?(path) do
+      with {:ok, mode} <- cutover_mode(path), do: open(path, mode)
+    else
+      open(path, :legacy)
+    end
+  end
 
   def open(_) do
     Diagnostics.failure(:server_storage, :store_open, :invalid_store_path, :unavailable)
@@ -273,33 +280,39 @@ defmodule AttentionServer.Store do
     end
   end
 
-  defp convert_legacy_store(path) do
+  def convert_stopped(path, budget, expected_format) when is_binary(path) and path != "" do
+    case convert_legacy_store(path, &ConversionPreflight.check(&1, budget, expected_format)) do
+      {:ok, %__MODULE__{} = converted} ->
+        with :ok <- close(converted), do: {:ok, :converted}
+
+      {:ok, :already_converted} = result ->
+        result
+
+      error ->
+        error
+    end
+  end
+
+  defp convert_legacy_store(path, preflight \\ fn _db -> :ok end) do
     upload_dir = Path.expand(path) <> ".uploads"
 
     with {:ok, db} <- Sqlite3.open(path, mode: :readwrite) do
       try do
         result =
           RecordTable.transaction(db, fn ->
-            # Normalise in memory so a failed install leaves the old anchor,
-            # source version and progress rows in their original generation.
-            with :ok <- Sqlite3.execute(db, @schema),
-                 {:ok, legacy} <- load_or_create(db, upload_dir, :convert),
-                 {:ok, rows} <- load_large_data_references(db),
-                 {:ok, engine} <- attach_conversion_refs(legacy.engine, upload_dir, rows),
-                 :ok <- LargeData.verify_all(engine),
-                 :ok <- write_large_data_references(db, LargeData.persisted_references(engine)) do
-              legacy = %{legacy | engine: engine}
-
-              KeyedMigration.convert_locked(
-                legacy,
-                engine,
-                legacy.version,
-                &prepare_keyed_conversion/3
-              )
+            case preflight.(db) do
+              :ok -> convert_locked(db, upload_dir)
+              {:ok, _info} -> convert_locked(db, upload_dir)
+              {:already_converted, 31} -> {:ok, :already_converted}
+              error -> error
             end
           end)
 
         case result do
+          {:ok, :already_converted} = success ->
+            _ = Sqlite3.close(db)
+            success
+
           {:ok, _} = success ->
             success
 
@@ -313,6 +326,24 @@ defmodule AttentionServer.Store do
           _ = Sqlite3.close(db)
           :erlang.raise(kind, reason, __STACKTRACE__)
       end
+    end
+  end
+
+  # Normalise in memory so a failed install preserves the old anchor and
+  # progress rows at their original generation.
+  defp convert_locked(db, upload_dir) do
+    with :ok <- Sqlite3.execute(db, @schema),
+         {:ok, legacy} <- load_or_create(db, upload_dir, :convert),
+         {:ok, rows} <- load_large_data_references(db),
+         {:ok, engine} <- attach_conversion_refs(legacy.engine, upload_dir, rows),
+         :ok <- LargeData.verify_all(engine),
+         :ok <- write_large_data_references(db, LargeData.persisted_references(engine)) do
+      KeyedMigration.convert_locked(
+        %{legacy | engine: engine},
+        engine,
+        legacy.version,
+        &prepare_keyed_conversion/3
+      )
     end
   end
 

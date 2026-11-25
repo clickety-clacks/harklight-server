@@ -8,12 +8,72 @@ defmodule AttentionServer.Store.ConversionPreflight do
   @prefix_bytes 256
   @prefix_overhead 32 * 1024 * 1024
 
+  # Replaced with the measured per-format envelopes by the conversion rehearsal.
+  @envelopes %{}
+
+  def check(db, budget, expected_format, envelopes \\ @envelopes) do
+    with {:ok, info} <- read(db, budget.memory, budget.disk),
+         :ok <- check_format(info.format, expected_format),
+         {:ok, envelope} <- Map.fetch(envelopes, info.format),
+         true <- info.expanded_bytes <= envelope.expanded_bytes,
+         :ok <- check_shape(db, budget.uploads, envelope),
+         {memory, disk} <- upper_bound(info, envelope),
+         true <- memory <= budget.memory and disk <= budget.disk do
+      {:ok, info}
+    else
+      {:already_converted, _} = converted -> converted
+      {:error, :unsupported_snapshot} = error -> error
+      {:error, :source_format_mismatch} = error -> error
+      _ -> {:error, :fit_not_established}
+    end
+  end
+
+  defp upper_bound(info, envelope) do
+    # Coefficients are integer ratios rounded up from the worst rehearsal.
+    # Keep the measured fixed margin in addition to that rounding.
+    {
+      envelope.memory_fixed + envelope.memory_per_byte * info.expanded_bytes,
+      envelope.disk_fixed + envelope.disk_per_byte * info.expanded_bytes
+    }
+  end
+
+  defp check_format(actual, expected) when is_nil(expected) or actual == expected, do: :ok
+  defp check_format(_, _), do: {:error, :source_format_mismatch}
+
+  defp check_shape(db, uploads, envelope) when uploads <= envelope.uploads do
+    with {:ok, revisions} <- count_rows(db, "client_resource_revs"),
+         {:ok, changes} <- count_rows(db, "agent_changes"),
+         {:ok, references} <- count_rows(db, "relay_large_data_refs"),
+         true <- revisions <= envelope.revisions and changes <= envelope.changes and
+           references <= envelope.references do
+      :ok
+    else
+      _ -> {:error, :fit_not_established}
+    end
+  end
+
+  defp check_shape(_db, _uploads, _envelope), do: {:error, :fit_not_established}
+
+  defp count_rows(db, table) do
+    with {:ok, [[exists]]} <- RecordTable.select(db, """
+         SELECT EXISTS (SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?)
+         """, [table]) do
+      if exists == 1 do
+        with {:ok, [[count]]} <- RecordTable.select(db, "SELECT count(*) FROM #{table}"),
+          do: {:ok, count}
+      else
+        {:ok, 0}
+      end
+    end
+  end
+
   # SQLite can materialize the whole BLOB for substr. length reads its size
   # without doing so. The caller holds the conversion transaction across read.
-  def read(db, available_bytes) when is_integer(available_bytes) do
+  def read(db, available_bytes, disk_bytes)
+      when is_integer(available_bytes) and is_integer(disk_bytes) do
     with {:ok, [[stored_bytes]]} when is_integer(stored_bytes) <-
            RecordTable.select(db, "SELECT length(payload) FROM relay_state WHERE id = 1"),
-         true <- stored_bytes + @prefix_overhead <= available_bytes,
+         true <- stored_bytes + @prefix_overhead <= min(available_bytes, disk_bytes),
          {:ok, [[prefix]]} <-
            RecordTable.select(db, "SELECT substr(payload, 1, ?) FROM relay_state WHERE id = 1", [
              @prefix_bytes

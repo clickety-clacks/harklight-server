@@ -638,11 +638,11 @@ defmodule AttentionServer.Store.KeyedValidation do
     end)
   end
 
-  defp entry_upload_ids(nil), do: []
-
   def record_uploads({:origin_feed, _, {:entry, _}}, entry), do: entry_upload_ids(entry)
   def record_uploads({:row, :messages, _}, record), do: revision_upload_ids(record)
   def record_uploads(_, _), do: []
+
+  defp entry_upload_ids(nil), do: []
 
   defp entry_upload_ids(entry) do
     for %{"tier" => "upload", "upload_id" => id} <- Map.get(entry, "files", []), do: id
@@ -806,7 +806,11 @@ defmodule AttentionServer.Store.KeyedValidation do
 
     Enum.reduce_while(facts, :ok, fn
       {_fact, same, same}, :ok -> {:cont, :ok}
-      {fact, _, _}, :ok -> {:halt, first_untouched([fact], &{kind, scope, &1}, touched)}
+      {fact, _, _}, :ok ->
+        case first_untouched([fact], &{kind, scope, &1}, touched) do
+          :ok -> {:cont, :ok}
+          error -> {:halt, error}
+        end
     end)
   end
 

@@ -2738,12 +2738,10 @@ defmodule AttentionServer.Relay do
   defp record_staged_reply_sources(engine, sources) when map_size(sources) == 0, do: engine
 
   defp record_staged_reply_sources(engine, sources) do
-    uploads =
-      Enum.reduce(sources, engine.uploads, fn {upload_id, file_id}, uploads ->
-        Map.update!(uploads, upload_id, &Map.put_new(&1, :staged_file_id, file_id))
-      end)
-
-    %{engine | uploads: uploads}
+    Enum.reduce(sources, engine, fn {upload_id, file_id}, state ->
+      upload = Map.fetch!(state.uploads, upload_id)
+      Engine.put_row(state, :uploads, upload_id, Map.put_new(upload, :staged_file_id, file_id))
+    end)
   end
 
   defp request_success?({:ok, %JSON.StreamedLine{value: %{"type" => "ok"}}}), do: true

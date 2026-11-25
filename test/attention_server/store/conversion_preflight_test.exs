@@ -11,10 +11,13 @@ defmodule AttentionServer.Store.ConversionPreflightTest do
     :ok = Sqlite3.execute(db, "INSERT INTO relay_state VALUES (1, zeroblob(8388608))")
 
     assert {:error, :fit_not_established} =
-             ConversionPreflight.read(db, 8 * 1024 * 1024)
+             ConversionPreflight.read(db, 8 * 1024 * 1024, 128 * 1024 * 1024)
+
+    assert {:error, :fit_not_established} =
+             ConversionPreflight.read(db, 128 * 1024 * 1024, 8 * 1024 * 1024)
 
     assert {:error, :unsupported_snapshot} =
-             ConversionPreflight.read(db, 128 * 1024 * 1024)
+             ConversionPreflight.read(db, 128 * 1024 * 1024, 128 * 1024 * 1024)
 
     payload = :erlang.term_to_binary({:attention_relay_state, 30, %{}}, compressed: 6)
     {:ok, stmt} = Sqlite3.prepare(db, "UPDATE relay_state SET payload = ? WHERE id = 1")
@@ -23,7 +26,7 @@ defmodule AttentionServer.Store.ConversionPreflightTest do
     :ok = Sqlite3.release(db, stmt)
 
     assert {:ok, %{format: 30, stored_bytes: length}} =
-             ConversionPreflight.read(db, 128 * 1024 * 1024)
+             ConversionPreflight.read(db, 128 * 1024 * 1024, 128 * 1024 * 1024)
 
     assert length == byte_size(payload)
   end
