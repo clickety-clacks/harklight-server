@@ -2,16 +2,17 @@ defmodule AttentionServer.PlacementTest do
   use ExUnit.Case, async: true
 
   alias AttentionServer.Placement
+  alias AttentionServer.Placement.JevSet
 
   test "retained placement preserves order and scores with subquadratic list construction" do
-    smaller = placement_reductions(6_000)
-    larger = placement_reductions(12_000)
+    smaller = placement_words(6_000)
+    larger = placement_words(12_000)
 
     assert larger < smaller * 3,
-           "doubling the retained items increased reductions from #{smaller} to #{larger}"
+           "doubling the retained items increased allocated words from #{smaller} to #{larger}"
   end
 
-  defp placement_reductions(count) do
+  defp placement_words(count) do
     items =
       for sequence <- 1..count do
         %{
@@ -22,11 +23,19 @@ defmodule AttentionServer.PlacementTest do
       end
 
     previous = Enum.map(items, &Placement.entry(Map.put(&1, :score, 0.75)))
-    {:reductions, before} = Process.info(self(), :reductions)
-    retained = Placement.place("jev-set", items, previous, nil)
-    {:reductions, after_placement} = Process.info(self(), :reductions)
+    trace = :trace.session_create(:retained_placement_allocations, self(), [])
+    target = {JevSet, :retained_place, 2}
+    pid = self()
 
-    assert retained == previous
-    after_placement - before
+    try do
+      Code.ensure_loaded!(JevSet)
+      assert :trace.function(trace, target, true, [:call_memory]) == 1
+      assert :trace.process(trace, pid, true, [:call]) == 1
+      assert Placement.place("jev-set", items, previous, nil) == previous
+      assert {:call_memory, [{^pid, 1, words}]} = :trace.info(trace, target, :call_memory)
+      words
+    after
+      :trace.session_destroy(trace)
+    end
   end
 end

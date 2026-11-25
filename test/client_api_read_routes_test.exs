@@ -6,7 +6,7 @@ defmodule AttentionServer.ClientAPIReadRoutesTest do
   import Plug.Test
   import Plug.Conn
 
-  alias AttentionServer.{JSON, Relay, TLSFixtures}
+  alias AttentionServer.{ChangeLog, JSON, Relay, TLSFixtures}
   alias AttentionServer.ClientAPI.{Context, Principal, Reads, Router, Uploads}
 
   @handle "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
@@ -178,6 +178,27 @@ defmodule AttentionServer.ClientAPIReadRoutesTest do
 
     assert invalid.status == 400
     assert body(invalid)["field"] == "Idempotency-Key"
+  end
+
+  test "Inbox batches item revision reads while preserving their stamps", %{relay: relay, reader: reader} do
+    trace = :trace.session_create(:inbox_revision_reads, self(), [])
+    target = {ChangeLog, :rev, 3}
+
+    items =
+      try do
+        assert :trace.function(trace, target, true, [:call_time]) == 1
+        assert :trace.process(trace, relay, true, [:call]) == 1
+        assert {:ok, %{"items" => items}} = Reads.inbox(relay, reader)
+        assert length(items) == 3
+        assert {:call_time, []} = :trace.info(trace, target, :call_time)
+        items
+      after
+        :trace.session_destroy(trace)
+      end
+
+    for %{"item_id" => id, "rev" => rev} <- items do
+      assert {:ok, %{"item" => %{"rev" => ^rev}}} = Reads.item(relay, reader, id)
+    end
   end
 
   test "discard refuses an attached upload without affecting the downloadable file", ctx do
