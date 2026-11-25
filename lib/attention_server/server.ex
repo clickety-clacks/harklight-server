@@ -3,8 +3,7 @@ defmodule AttentionServer.Server do
   Opt-in supervised Relay, device listener and separate owner TLS listener.
 
   The device port serves client API v2 (`/v2`) through `ClientAPI.Listener`,
-  for devices and registered agents alike. Protocol 0.1 agent and origin
-  listeners are retired; their former port options are ignored.
+  for devices and registered agents alike.
 
   Certificate paths and a durable store path are explicit operator config.
   Production deployment remains separate work.

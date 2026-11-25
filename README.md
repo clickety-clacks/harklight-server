@@ -68,8 +68,8 @@ withdrawn or superseded): the person can keep writing and the agent can keep
 replying, more than once to the same chat message. A chat message to an agent
 that is not listening is accepted and delivered when the agent next listens.
 
-Configurable score-based priority levels and unseen-message advisories first
-shipped in v0.1.30. When a request reaches its configured unseen interval, the
+Priority levels can set an unseen interval for requests. When a request
+reaches that interval, the
 server adds an advisory to the originating agent session asking whether the
 request is still valid and worth resending and whether its importance should be
 raised. It does not automatically resend the request or change its priority.

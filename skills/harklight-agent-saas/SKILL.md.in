@@ -20,7 +20,7 @@ The iPhone app is in testing. Joining a hosted account from it, and receiving an
 4. Back in Devices, under Waiting for approval, choose Review exact request for your iPhone. Check that Code on device matches the code on your iPhone and that Joins as shows your account, then choose Approve this exact device. If a Sender IDs field appears, leave it empty: the phone receives requests and needs no sender rights.
 5. Harklight shows Connected. Choose Continue, then choose whether to turn on notifications. Without them you still see requests when you open Harklight. Requests for your account show up in the Inbox.
 
-An invitation does not expire, but it works only once and stops working if the account owner's authority changes. An unused invitation created before the service moved to Harklight 0.2 is refused, and its link page asks for a new invitation. In either case, create a new invitation in Devices.
+An invitation works once and stops working if the account owner's authority changes. If the link page refuses an invitation, create a new one in Devices.
 
 ## Install Harklight Agent
 

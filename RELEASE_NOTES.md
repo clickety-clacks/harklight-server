@@ -1,3 +1,7 @@
+# Harklight Server v0.2.21
+
+**Compatibility.** This release speaks only the 0.2 protocol.
+
 # Harklight Server v0.2.20
 
 For hosted servers, the agent setup guide served at
@@ -104,8 +108,7 @@ For connecting an agent, the server now serves a Harklight skill for Claude Code
 and Codex at `/agent-skills/harklight/SKILL.md`, listed first on the Components
 page. The Components page and the Invitation page show `harklight-agent setup`
 with the invitation link; that command arrives in the next Harklight Agent
-release. The Components page no longer shows the retired agent enrollment
-command with `--origin-port`.
+release.
 
 ## Upgrade and recovery
 
@@ -250,8 +253,7 @@ reports search and message-ID lookup as unsupported, and retracting another
 sender's message by item ID is refused. Harklight Agent 0.2.4 is
 the matching Agent release for everything else. Recovering waiting replies on an
 agent's first read needs Harklight Agent 0.2.1 or newer. Harklight app 0.2.0 and
-Harklight Web 0.2.4 are the client baseline. Protocol 0.1 clients require their
-protocol 0.2 upgrades.
+Harklight Web 0.2.4 are the client baseline.
 
 # Harklight Server v0.2.10
 
@@ -288,8 +290,7 @@ availability label until it changes, as in v0.2.9.
 keeps the rest of the client API. Harklight Agent 0.2.3 is the matching Agent release.
 Recovering waiting replies on an agent's first read needs Harklight Agent 0.2.1
 or newer; Agent 0.2.0 keeps its earlier first-read behavior. Harklight app 0.2.0
-and Harklight Web 0.2.3 are the client baseline. Protocol 0.1 clients require
-their protocol 0.2 upgrades.
+and Harklight Web 0.2.3 are the client baseline.
 
 # Harklight Server v0.2.9
 
@@ -331,8 +332,7 @@ skip replies and lose later writes.
 existing client API. Harklight Agent 0.2.3 is the matching Agent release.
 Recovering waiting replies on an agent's first read needs Harklight Agent 0.2.1
 or newer; Agent 0.2.0 keeps its earlier first-read behavior. Harklight app 0.2.0
-and Harklight Web 0.2.3 are the client baseline. Protocol 0.1 clients require
-their protocol 0.2 upgrades.
+and Harklight Web 0.2.3 are the client baseline.
 
 # Harklight Server v0.2.8
 
