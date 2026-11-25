@@ -28,13 +28,13 @@ defmodule AttentionServer.Store.KeyedMigrationTest do
     row = RecordCodec.encode_row({:field, :pending_clock_high_water}, 12)
 
     assert {:ok, :saved} =
-             RecordTable.commit(store.db, 1, [{:put, row}], fn _, _ -> {:ok, :saved} end)
+             RecordTable.commit(store.db, 1, [{:update, row}], fn _, _ -> {:ok, :saved} end)
 
     assert {:ok, %{pending_clock_high_water: 12}, 2} = KeyedMigration.load(store.db)
     assert :ok = Store.close(store)
   end
 
-  test "legacy startup names FORMAT30 and leaves the converted database intact", %{
+  test "legacy startup names FORMAT31 and leaves the converted database intact", %{
     path: path,
     store: store
   } do
@@ -44,11 +44,11 @@ defmodule AttentionServer.Store.KeyedMigrationTest do
 
     warning =
       capture_log(fn ->
-        assert {:error, {:storage_unavailable, {:error, :format30_requires_keyed_mode}}} =
+        assert {:error, {:storage_unavailable, {:error, :format31_requires_keyed_mode}}} =
                  Store.open(path)
       end)
 
-    assert warning =~ "FORMAT30"
+    assert warning =~ "FORMAT31"
     assert warning =~ "restore the pre-upgrade backup"
     assert File.read!(path) == before_refusal
   end
@@ -167,7 +167,7 @@ defmodule AttentionServer.Store.KeyedMigrationTest do
   end
 
   defp stage_keyed(db, engine, identity) do
-    payload = :erlang.term_to_binary({:attention_relay_keyed_state, 30, identity})
+    payload = :erlang.term_to_binary({:attention_relay_keyed_state, 31, identity})
     digest = :crypto.hash(:sha256, payload)
 
     RecordTable.transaction(db, fn ->

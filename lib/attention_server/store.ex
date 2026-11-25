@@ -185,6 +185,22 @@ defmodule AttentionServer.Store do
     {:error, :invalid_store_path}
   end
 
+  def open_relay(path) when is_binary(path) and path not in ["", ":memory:"] do
+    if File.exists?(path) do
+      with {:ok, mode} <- cutover_mode(path), do: open(path, mode)
+    else
+      open(path)
+    end
+  end
+
+  def open_relay(path), do: open(path)
+
+  def track_relay_writes(%__MODULE__{mode: :keyed} = store) do
+    put_in(store.engine.touched_keys, MapSet.new())
+  end
+
+  def track_relay_writes(store), do: store
+
   def open(path, :keyed_cutover)
       when is_binary(path) and path != "" and path != ":memory:" do
     case cutover_mode(path) do
@@ -192,10 +208,7 @@ defmodule AttentionServer.Store do
         open(path, :keyed)
 
       {:ok, :legacy} ->
-        with {:ok, legacy} <- open_store(path, :legacy),
-             {:ok, keyed} <- convert_legacy_store(legacy) do
-          finish_open(keyed)
-        end
+        with {:ok, keyed} <- convert_legacy_store(path), do: finish_open(keyed)
 
       error ->
         error
@@ -258,35 +271,62 @@ defmodule AttentionServer.Store do
     end
   end
 
-  defp convert_legacy_store(legacy) do
-    case KeyedMigration.convert_store(legacy, &prepare_keyed_conversion/3) do
-      {:ok, _} = converted ->
-        converted
+  defp convert_legacy_store(path) do
+    upload_dir = Path.expand(path) <> ".uploads"
 
-      error ->
-        _ = close(legacy)
-        error
+    with {:ok, db} <- Sqlite3.open(path, mode: :readwrite) do
+      try do
+        result =
+          RecordTable.transaction(db, fn ->
+            # Normalise in memory so a failed install leaves the old anchor,
+            # source version and progress rows in their original generation.
+            with :ok <- Sqlite3.execute(db, @schema),
+                 {:ok, legacy} <- load_or_create(db, upload_dir, :convert),
+                 {:ok, rows} <- load_large_data_references(db),
+                 {:ok, engine} <- attach_conversion_refs(legacy.engine, upload_dir, rows),
+                 :ok <- LargeData.verify_all(engine),
+                 :ok <- write_large_data_references(db, LargeData.persisted_references(engine)) do
+              legacy = %{legacy | engine: engine}
+
+              KeyedMigration.convert_locked(
+                legacy,
+                engine,
+                legacy.version,
+                &prepare_keyed_conversion/3
+              )
+            end
+          end)
+
+        case result do
+          {:ok, _} = success ->
+            success
+
+          error ->
+            Diagnostics.failure(:server_storage, :store_open, error, :unavailable)
+            _ = Sqlite3.close(db)
+            error
+        end
+      catch
+        kind, reason ->
+          _ = Sqlite3.close(db)
+          :erlang.raise(kind, reason, __STACKTRACE__)
+      end
     end
-  catch
-    kind, reason ->
-      _ = close(legacy)
-      :erlang.raise(kind, reason, __STACKTRACE__)
   end
 
-  defp prepare_keyed_conversion(legacy, decoded, generation) do
-    with {:ok, engine} <- validate_keyed_engine(decoded),
-         engine = rebuild_open_indexes(engine),
-         {:ok, rows} <- load_large_data_references(legacy.db),
-         {:ok, engine} <- LargeData.attach_paths(engine, legacy.upload_dir, rows),
-         :ok <- LargeData.verify_all(engine) do
-      finalize_mode(%__MODULE__{
-        db: legacy.db,
-        upload_dir: legacy.upload_dir,
-        engine: engine,
-        version: generation,
-        mode: :keyed
-      })
-    end
+  defp attach_conversion_refs(engine, _directory, []), do: {:ok, engine}
+
+  defp attach_conversion_refs(engine, directory, rows),
+    do: LargeData.attach_paths(engine, directory, rows)
+
+  defp prepare_keyed_conversion(legacy, engine, generation) do
+    finalize_mode(%__MODULE__{
+      db: legacy.db,
+      upload_dir: legacy.upload_dir,
+      engine: rebuild_open_indexes(engine),
+      version: generation,
+      mode: :keyed
+    })
   end
 
   defp finalize_open(db, upload_dir, engine, version, mode) do
@@ -862,16 +902,21 @@ defmodule AttentionServer.Store do
   def commit(store, next, audit, projected_entries \\ [])
 
   def commit(
+        %__MODULE__{mode: :keyed} = store,
+        %Engine{touched_keys: %MapSet{} = touched} = next,
+        audit,
+        projected_entries
+      ) do
+    commit(store, {%{next | touched_keys: MapSet.new()}, touched}, audit, projected_entries)
+  end
+
+  def commit(
         %__MODULE__{mode: :keyed, change_log: true} = store,
         %Engine{} = next,
         %{item_refresh: keys} = audit,
         []
       ) do
-    touched =
-      for {person, _, _} = key <- keys, into: MapSet.new() do
-        %{origin: origin, session_handle: handle} = Map.fetch!(next.messages, key)
-        {:row, :origin_sessions, {person, origin, handle}}
-      end
+    touched = MapSet.new(keys, &{:row, :item_availability, &1})
 
     commit(store, {next, touched}, audit)
   end
@@ -955,10 +1000,12 @@ defmodule AttentionServer.Store do
           _ -> keyed_change_log(store, next, touched, projected)
         end
 
+      %{records: records, delete_paths: delete_paths, reference_rows: references} = prepared
+
       result =
         Persistence.run(fn ->
-          RecordTable.commit(db, version, prepared.records, fn db, generation ->
-            with :ok <- write_reference_delta(db, prepared.delete_paths, prepared.reference_rows),
+          RecordTable.commit(db, version, records, fn db, generation ->
+            with :ok <- write_reference_delta(db, delete_paths, references),
                  :ok <- write_audit(db, audit),
                  {:ok, heads, agent_heads} <- append_change_logs(db, log, generation) do
               {:ok, {heads, agent_heads}}
@@ -1469,6 +1516,7 @@ defmodule AttentionServer.Store do
     :alert_choices,
     :push_bindings,
     :origin_sessions,
+    :item_availability,
     :origin_receipts,
     :origin_actions,
     :bounce_levels,
@@ -1527,6 +1575,9 @@ defmodule AttentionServer.Store do
 
   defp valid_keyed_row?(engine, :origin_sessions, key, session),
     do: Conversation.valid_origin_session?(engine, key, session)
+
+  defp valid_keyed_row?(engine, :item_availability, key, value),
+    do: valid_item_availability?(engine, key, value)
 
   defp valid_keyed_row?(engine, :origin_receipts, key, receipt),
     do: Conversation.valid_origin_receipt?(engine, key, receipt)
@@ -2056,8 +2107,11 @@ defmodule AttentionServer.Store do
     end
   end
 
-  defp load_or_create(db, upload_dir) do
+  defp load_or_create(db, upload_dir, purpose \\ :open) do
     case one(db, "SELECT version, payload, checksum FROM relay_state WHERE id = 1", []) do
+      {:ok, nil} when purpose == :convert ->
+        {:error, :invalid_state}
+
       {:ok, nil} ->
         engine = Engine.new()
         payload = Persistence.run(fn -> encode_state(engine) end)
@@ -2098,12 +2152,12 @@ defmodule AttentionServer.Store do
             _ = RecordCodec.identity()
 
             case :erlang.binary_to_term(payload, [:safe]) do
-              {:attention_relay_keyed_state, 30, _identity} ->
+              {:attention_relay_keyed_state, 31, _identity} ->
                 Logger.error(
-                  "Harklight Store uses FORMAT30. To run Harklight 0.1.x, restore the pre-upgrade backup."
+                  "Harklight Store uses FORMAT31 rows. To run a snapshot release, restore the pre-upgrade backup."
                 )
 
-                {:error, :format30_requires_keyed_mode}
+                {:error, :format31_requires_keyed_mode}
 
               {:attention_relay_state, format, %Engine{} = stored}
               when format in [
@@ -2253,6 +2307,9 @@ defmodule AttentionServer.Store do
                   cond do
                     not valid_state?(engine) ->
                       {:error, :invalid_state}
+
+                    purpose == :convert ->
+                      {:ok, %{original_store | engine: engine}}
 
                     format == @format_version and
                         same_state_except_bounce_indexes?(engine, original) ->
@@ -2703,6 +2760,14 @@ defmodule AttentionServer.Store do
     %{engine | pending_enrollments: pending, pending_history: history}
   end
 
+  defp valid_item_availability?(engine, key, {status, stamp})
+       when status in ["listening", "not_listening", "unsupported", "gone"] do
+    match?(%{session_handle: handle} when is_binary(handle), Map.get(engine.messages, key)) and
+      (is_nil(stamp) or (is_integer(stamp) and stamp > 0))
+  end
+
+  defp valid_item_availability?(_engine, _key, _value), do: false
+
   # The durable hot path checks bounce index containers without rescanning their
   # retained rows. Store open performs the full cross-map bounce validation.
   defp valid_state?(%Engine{} = engine), do: valid_state?(engine, :full)
@@ -2728,6 +2793,9 @@ defmodule AttentionServer.Store do
         valid_alert_choices?(engine) and
         valid_push_bindings?(engine) and
         AttentionServer.Conversation.valid_state?(engine) and
+        Enum.all?(engine.item_availability, fn {key, value} ->
+          valid_item_availability?(engine, key, value)
+        end) and
         BounceDecision.valid_state?(engine, bounce_validation) and
         valid_uploads?(engine) and
         valid_upload_references?(engine) and

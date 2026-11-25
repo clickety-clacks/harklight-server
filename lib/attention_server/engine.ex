@@ -65,6 +65,7 @@ defmodule AttentionServer.Engine do
             receipts: %{},
             origin_feeds: %{},
             origin_sessions: %{},
+            item_availability: %{},
             origin_receipts: %{},
             origin_actions: %{},
             uploads: %{},
@@ -2321,7 +2322,12 @@ defmodule AttentionServer.Engine do
 
             %{"kind" => "terminal", "terminal_state" => "answered", "author" => author} = entry
             when author in ["agent", "server"] ->
-              Conversation.record_answer_baseline(current, {person, key}, entry, attempt || "feed")
+              Conversation.record_answer_baseline(
+                current,
+                {person, key},
+                entry,
+                attempt || "feed"
+              )
 
             _ ->
               current

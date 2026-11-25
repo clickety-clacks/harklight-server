@@ -30,6 +30,8 @@ defmodule AttentionServer.Store.KeyedWriterCoverageTest do
   @classification %{
     {:open, 1} => :lifecycle,
     {:open, 2} => :lifecycle,
+    {:open_relay, 1} => :lifecycle,
+    {:track_relay_writes, 1} => :lifecycle,
     {:close, 1} => :lifecycle,
     {:enable_change_log, 1} => :side_table,
     {:commit, 3} => :keyed_writer,

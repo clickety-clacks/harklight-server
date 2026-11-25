@@ -1,41 +1,65 @@
 defmodule AttentionServer.Store.KeyedMigration do
   @moduledoc false
 
-  alias AttentionServer.{Conversation, LargeData, Store}
+  alias AttentionServer.{LargeData, Store}
   alias AttentionServer.Store.{RecordCodec, RecordTable}
   alias Exqlite.Sqlite3
 
-  @format 30
+  @format 31
 
   # Prepare the validated in-memory readback before committing the anchor.
   # Runtime selection of the converter belongs to the guarded Store opener.
   def convert_store(%Store{db: db, engine: engine, version: version} = store, prepare)
       when is_function(prepare, 3) do
+    RecordTable.transaction(db, fn -> convert_locked(store, engine, version, prepare) end)
+  end
+
+  def convert_locked(%Store{db: db} = store, engine, version, prepare) do
+    engine = split_item_availability(engine)
     persisted = LargeData.persist_refs(engine)
-    expected = canonical(persisted)
     generation = version + 1
 
-    RecordTable.transaction(db, fn ->
-      with :ok <- verify_previous_progress(store),
-           :ok <- Store.verify_retained_uploads(store),
-           :ok <-
-             Sqlite3.execute(
-               db,
-               "CREATE INDEX relay_large_data_refs_id ON relay_large_data_refs (id)"
-             ),
-           :ok <- RecordTable.seed(db, generation, RecordCodec.encode(persisted)),
-           {:ok, restored} <- read_records(db),
-           true <- canonical(restored) === expected,
-           {:ok, prepared} <- prepare.(store, restored, generation),
-           :ok <- write_anchor(db, version, generation),
-           :ok <- advance_current_logs(db, version, generation),
-           :ok <- Sqlite3.execute(db, "DELETE FROM relay_device_progress") do
-        {:ok, prepared}
-      else
-        false -> {:error, :migration_readback_mismatch}
-        error -> error
-      end
-    end)
+    with :ok <- verify_previous_progress(store),
+         :ok <- Store.verify_retained_uploads(store),
+         :ok <-
+           Sqlite3.execute(
+             db,
+             "CREATE INDEX relay_large_data_refs_id ON relay_large_data_refs (id)"
+           ),
+         {:ok, count} <- RecordTable.seed_count(db, generation, RecordCodec.encode(persisted)),
+         :ok <- verify_records(db, persisted, count),
+         {:ok, prepared} <- prepare.(store, engine, generation),
+         :ok <- write_anchor(db, version, generation),
+         :ok <- advance_current_logs(db, version, generation),
+         :ok <- Sqlite3.execute(db, "DELETE FROM relay_device_progress") do
+      {:ok, prepared}
+    end
+  end
+
+  defp split_item_availability(engine) do
+    availability =
+      Enum.reduce(engine.messages, engine.item_availability, fn
+        {{person, _, _} = key, %{origin: origin, session_handle: handle, accepted_seq: seq}}, rows
+        when is_binary(handle) ->
+          case get_in(engine.origin_sessions, [
+                 {person, origin, handle},
+                 "client_availability",
+                 seq
+               ]) do
+            nil -> rows
+            published -> Map.put(rows, key, published)
+          end
+
+        _, rows ->
+          rows
+      end)
+
+    sessions =
+      Map.new(engine.origin_sessions, fn {key, session} ->
+        {key, Map.delete(session, "client_availability")}
+      end)
+
+    %{engine | origin_sessions: sessions, item_availability: availability}
   end
 
   def load(db) do
@@ -75,15 +99,22 @@ defmodule AttentionServer.Store.KeyedMigration do
 
   defp check_identity(_, _), do: {:error, :unsupported_record_codec}
 
-  defp read_records(db) do
-    with {:ok, rows} <- RecordTable.rows(db), do: RecordCodec.decode(rows)
-  end
+  defp read_records(db), do: RecordTable.scan(db, &RecordCodec.decode/1)
 
-  defp canonical(engine) do
-    engine
-    |> Conversation.index_origin_feeds()
-    |> Map.from_struct()
-    |> Map.drop(RecordCodec.derived_fields())
+  defp verify_records(db, expected, count) do
+    result =
+      RecordTable.scan(db, fn rows ->
+        Enum.reduce_while(rows, 0, fn row, verified ->
+          if RecordCodec.matches_row?(expected, row),
+            do: {:cont, verified + 1},
+            else: {:halt, :mismatch}
+        end)
+      end)
+
+    case result do
+      ^count -> :ok
+      _ -> {:error, :migration_readback_mismatch}
+    end
   end
 
   defp verify_previous_progress(store) do

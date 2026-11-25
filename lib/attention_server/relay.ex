@@ -564,8 +564,8 @@ defmodule AttentionServer.Relay do
     do: Process.send_after(self(), :change_log_prune, delay_ms)
 
   defp open_startup_store(opts) do
-    case Store.open(Keyword.get(opts, :store_path)) do
-      {:ok, store} -> enable_change_log(store, opts)
+    case Store.open_relay(Keyword.get(opts, :store_path)) do
+      {:ok, store} -> enable_change_log(Store.track_relay_writes(store), opts)
       {:error, reason} -> {:error, startup_reason(opts, :store_open_failed, reason)}
     end
   end
@@ -3278,7 +3278,11 @@ defmodule AttentionServer.Relay do
     audit = %{person: "system", actor: "bounce_decision", action: action}
 
     with {:ok, next_engine} <-
-           AttentionServer.AgentAPI.Advisories.stamp_decisions(state.store, next_engine, changed_keys),
+           AttentionServer.AgentAPI.Advisories.stamp_decisions(
+             state.store,
+             next_engine,
+             changed_keys
+           ),
          {:ok, store} <- commit(state.store, next_engine, audit) do
       {:ok, reschedule_bounce_sweep(%{state | store: store})}
     else
@@ -3651,7 +3655,7 @@ defmodule AttentionServer.Relay do
           not MapSet.member?(references, id),
           do: id
 
-    next_engine = %{next_engine | uploads: Map.drop(next_engine.uploads, abandoned_ids)}
+    next_engine = Enum.reduce(abandoned_ids, next_engine, &Engine.delete_row(&2, :uploads, &1))
     audit = %{person: person, actor: actor, action: action}
 
     case commit(state.store, next_engine, audit) do
@@ -3788,7 +3792,12 @@ defmodule AttentionServer.Relay do
         end
       )
 
-    %{state | store: %{state.store | engine: engine}} |> reschedule_bounce_sweep()
+    audit = %{person: person, actor: origin, action: "bounce_requeue"}
+
+    case commit(state.store, engine, audit) do
+      {:ok, store} -> reschedule_bounce_sweep(%{state | store: store})
+      {:error, _, _} -> state
+    end
   end
 
   defp notify_coverage_change(state, old_engine, person, origin) do
@@ -4230,7 +4239,12 @@ defmodule AttentionServer.Relay do
     case Map.get(engine.devices, key) do
       %{person: ^person, revoked: false} = device ->
         label = Map.get(device, :label)
-        label = if is_binary(label) and label != "", do: label, else: "Device " <> String.slice(key, 0, 8)
+
+        label =
+          if is_binary(label) and label != "",
+            do: label,
+            else: "Device " <> String.slice(key, 0, 8)
+
         {key, label, :device}
 
       _ ->
@@ -4544,25 +4558,27 @@ defmodule AttentionServer.Relay do
   defp discard_browser_actor_state(engine, actor_keys) do
     actor_keys = MapSet.new(actor_keys)
 
-    %{
-      engine
-      | cursors:
-          Map.reject(engine.cursors, fn {{_person, actor}, _seq} ->
-            MapSet.member?(actor_keys, actor)
-          end),
-        conversation_cursors:
-          Map.reject(engine.conversation_cursors, fn {{_person, actor}, _seq} ->
-            MapSet.member?(actor_keys, actor)
-          end),
-        conversation_opened:
-          MapSet.filter(engine.conversation_opened, fn {_person, actor} ->
-            not MapSet.member?(actor_keys, actor)
-          end),
-        receipts:
-          Map.reject(engine.receipts, fn {{_person, actor, _op_id}, _receipt} ->
-            MapSet.member?(actor_keys, actor)
-          end)
-    }
+    cursors =
+      Map.reject(engine.cursors, fn {{_, actor}, _} -> MapSet.member?(actor_keys, actor) end)
+
+    conversation_cursors =
+      Map.reject(engine.conversation_cursors, fn {{_, actor}, _} ->
+        MapSet.member?(actor_keys, actor)
+      end)
+
+    opened =
+      MapSet.filter(engine.conversation_opened, fn {_, actor} ->
+        not MapSet.member?(actor_keys, actor)
+      end)
+
+    receipts =
+      Map.reject(engine.receipts, fn {{_, actor, _}, _} -> MapSet.member?(actor_keys, actor) end)
+
+    engine
+    |> Engine.replace_rows(:cursors, cursors)
+    |> Engine.replace_rows(:conversation_cursors, conversation_cursors)
+    |> Engine.replace_members(:conversation_opened, opened)
+    |> Engine.replace_rows(:receipts, receipts)
   end
 
   defp upload_reply(upload, duplicate) do

@@ -123,6 +123,22 @@ defmodule AttentionServer.Store.RecordCodec do
     end
   end
 
+  def matches_row?(engine, {key, payload, hash})
+      when is_binary(key) and is_binary(payload) and is_binary(hash) do
+    with true <- hash == checksum(key, payload),
+         {@record_version, address} <- :erlang.binary_to_term(key, [:safe]),
+         {:ok, value} <- lookup(engine, address) do
+      :erlang.binary_to_term(payload, [:safe]) === value
+    else
+      _ -> false
+    end
+  rescue
+    ArgumentError -> false
+    KeyError -> false
+  end
+
+  def matches_row?(_engine, _row), do: false
+
   defp complete_feeds?(feeds),
     do: Enum.all?(feeds, fn {_scope, feed} -> not is_nil(feed.high) end)
 
