@@ -1,0 +1,78 @@
+name: FORMAT31 exact candidate startup and latency
+
+on:
+  push:
+    branches: [server/format31-final-checks]
+
+permissions:
+  contents: read
+
+jobs:
+  conversion:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      ATTENTION_SERVER_ENABLE: '0'
+      MIX_ENV: prod
+      ERL_FLAGS: '+S 2:2 +SDcpu 1 +SDio 1'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: '27.3.3'
+          elixir-version: '1.19.5'
+          version-type: strict
+      - run: mix deps.get --only prod
+      - run: mix compile
+      - name: Build synthetic fixture and measure the published prior package
+        env:
+          SHAPE: '2400 100000 1300 300 400'
+        run: |
+          mkdir -p "$RUNNER_TEMP/measurements" "$RUNNER_TEMP/prior"
+          results="$RUNNER_TEMP/measurements"
+          git rev-parse HEAD HEAD^ >"$results/commits.txt"
+          awk '/^(MemTotal|MemAvailable):/' /proc/meminfo >"$results/capacity.txt"
+          df -Pk "$RUNNER_TEMP" | awk 'NR == 2 { print "disk_free_kib", $4 }' >>"$results/capacity.txt"
+          probe="$GITHUB_WORKSPACE/scripts/format31-rehearsal.exs"
+          echo "HARKLIGHT_PROBE=$probe" >>"$GITHUB_ENV"
+          archive=harklight-server-0.2.16-linux-x86_64.tar.gz
+          (
+            cd "$RUNNER_TEMP/prior"
+            release=https://github.com/clickety-clacks/harklight-server/releases/download/v0.2.16
+            curl --fail --silent --show-error --location --retry 3 --remote-name "$release/$archive"
+            curl --fail --silent --show-error --location --retry 3 --remote-name "$release/SHA256SUMS"
+            sha256sum --check --ignore-missing SHA256SUMS
+            tar -zxf "$archive"
+          ) >"$results/prior-package.log" 2>&1
+          prior="$RUNNER_TEMP/prior/harklight-server-0.2.16-linux-x86_64/bin/attention_server"
+          export HARKLIGHT_SHAPE="$SHAPE" HARKLIGHT_FIXTURE="$RUNNER_TEMP/seed" HARKLIGHT_PROBE="$probe"
+          timeout 20m "$prior" eval \
+            'System.argv(["seed", System.fetch_env!("HARKLIGHT_FIXTURE") | String.split(System.fetch_env!("HARKLIGHT_SHAPE"))]); Code.require_file(System.fetch_env!("HARKLIGHT_PROBE"))' \
+            >"$results/seed.log" 2>&1
+          cp -a "$RUNNER_TEMP/seed" "$RUNNER_TEMP/baseline"
+          export HARKLIGHT_FIXTURE="$RUNNER_TEMP/baseline"
+          set +e
+          timeout 20m "$prior" eval \
+            'System.argv(["measure", System.fetch_env!("HARKLIGHT_FIXTURE")]); Code.require_file(System.fetch_env!("HARKLIGHT_PROBE"))' \
+            >"$results/baseline.log" 2>&1
+          echo "exit=$?" >>"$results/baseline.log"
+      - name: Convert the same synthetic fixture and measure after startup drains
+        run: |
+          results="$RUNNER_TEMP/measurements"
+          fixture="$RUNNER_TEMP/seed"
+          timeout 3m mix run --no-compile "$HARKLIGHT_PROBE" inspect "$fixture" >"$results/candidate-inspect.log" 2>&1
+          candidate="$RUNNER_TEMP/candidate"
+          mix release attention_server --path "$candidate" >"$results/candidate-build.log" 2>&1
+          install -m 755 scripts/harklight "$candidate/bin/harklight"
+          /usr/bin/time -f 'elapsed_s=%e maximum_rss_kib=%M' timeout --kill-after=30s 20m \
+            "$candidate/bin/harklight" store convert-stopped "$fixture/relay.sqlite3" --from-release v0.2.16 \
+            >"$results/candidate-convert.log" 2>&1
+          timeout --kill-after=30s 20m mix run --no-compile "$HARKLIGHT_PROBE" measure "$fixture" >"$results/candidate-measure.log" 2>&1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: format31-A-settled
+          path: ${{ runner.temp }}/measurements/

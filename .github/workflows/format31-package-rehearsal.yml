@@ -1,0 +1,58 @@
+name: FORMAT31 package upgrade and rollback rehearsal
+
+on:
+  push:
+    branches: [server/format31-final-checks]
+
+permissions:
+  contents: read
+
+jobs:
+  package-roundtrip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      ATTENTION_SERVER_ENABLE: '0'
+      MIX_ENV: prod
+      ERL_FLAGS: '+S 2:2 +SDcpu 1 +SDio 1'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: '27.3.3'
+          elixir-version: '1.19.5'
+          version-type: strict
+      - name: Build the exact implementation package
+        run: |
+          results="$RUNNER_TEMP/format31-results"
+          mkdir -p "$results/candidate-dist"
+          cp scripts/format31-package-roundtrip.sh scripts/format31-package-fixture.exs "$RUNNER_TEMP/"
+          source_commit="$(git rev-parse HEAD^)"
+          git checkout --detach "$source_commit"
+          git rev-parse HEAD > "$results/implementation.txt"
+          scripts/build-package.sh "$results/candidate-dist" > "$results/build.log" 2>&1
+          cp "$results/candidate-dist/SHA256SUMS" "$results/package-sha256.txt"
+      - name: Rehearse installed upgrades and forced rollback from published v0.2.16
+        run: |
+          results="$RUNNER_TEMP/format31-results"
+          failed=0
+          for specification in 0.2.16:30; do
+            version="${specification%:*}"
+            format="${specification#*:}"
+            if ! bash "$RUNNER_TEMP/format31-package-roundtrip.sh" "$(cat "$results/implementation.txt")" \
+                "$RUNNER_TEMP/format31-package-fixture.exs" "$version" "$format" "$results" \
+                > "$results/prior-$format.log" 2>&1; then
+              failed=1
+            fi
+          done
+          exit "$failed"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: format31-package-roundtrip
+          path: |
+            ${{ runner.temp }}/format31-results/*.log
+            ${{ runner.temp }}/format31-results/*.txt
