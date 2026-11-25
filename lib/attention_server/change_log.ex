@@ -220,7 +220,7 @@ defmodule AttentionServer.ChangeLog do
       |> Enum.concat()
       |> Enum.uniq()
 
-    log_rows(next, item_keys, changed.entries, counts, settings)
+    log_rows(old, next, item_keys, changed.entries, counts, settings)
   end
 
   # Item-associated sender advisories are absent from the person projection.
@@ -229,15 +229,13 @@ defmodule AttentionServer.ChangeLog do
       Map.delete(Map.get(next.messages, key, %{}), "item_advisories")
   end
 
-  defp log_rows(next, item_keys, entry_keys, counts, settings) do
+  defp log_rows(old, next, item_keys, entry_keys, counts, settings) do
     items =
-      Enum.map(item_keys, fn {person, _, _} = key ->
-        kind =
-          if AttentionServer.BounceDecision.person_visible?(next.messages[key]),
-            do: :item,
-            else: :item_removed
-        {person, {kind, item_resource(key)}}
-      end)
+      for {person, _, _} = key <- item_keys,
+          visible? = AttentionServer.BounceDecision.person_visible?(next.messages[key]),
+          visible? or AttentionServer.BounceDecision.person_visible?(old.messages[key]) do
+        {person, {if(visible?, do: :item, else: :item_removed), item_resource(key)}}
+      end
 
     entries =
       Enum.map(entry_keys, fn {person, seq} -> {person, {:entry, entry_resource(seq)}} end)
@@ -405,7 +403,7 @@ defmodule AttentionServer.ChangeLog do
       |> Enum.concat()
       |> Enum.uniq()
 
-    log_rows(next, item_keys, changed.entries, counts, settings)
+    log_rows(old, next, item_keys, changed.entries, counts, settings)
   end
 
   # The route index lists a person's items once keyed lookups are on, which a
@@ -699,7 +697,7 @@ defmodule AttentionServer.ChangeLog do
 
   @doc false
   def refresh_items(engine, keys) do
-    pending = log_rows(engine, keys, [], [], [])
+    pending = log_rows(engine, engine, keys, [], [], [])
     seeded = Map.new(pending, fn {person, _} -> {person, seeded_from_highs?(engine, person)} end)
     %{pending: pending, seeded: seeded, closings: [], created: %{}, agent_pending: %{}}
   end
