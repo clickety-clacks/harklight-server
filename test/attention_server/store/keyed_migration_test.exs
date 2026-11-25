@@ -1,6 +1,8 @@
 defmodule AttentionServer.Store.KeyedMigrationTest do
   use ExUnit.Case, async: true
 
+  import ExUnit.CaptureLog
+
   alias AttentionServer.{Engine, Store}
   alias AttentionServer.Store.{KeyedMigration, RecordCodec, RecordTable}
   alias Exqlite.Sqlite3

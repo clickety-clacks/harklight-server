@@ -179,24 +179,18 @@ defmodule AttentionServer.Store do
   end
 
   @doc false
-  def migrate_retained_client_data(%__MODULE__{change_log: true} = store) do
-    case one(store.db, "SELECT name FROM relay_data_migrations WHERE name = ?", [
-           @client_data_migration
-         ]) do
+  def migrate_retained_client_data(%__MODULE__{mode: :snapshot, change_log: true} = store) do
+    case retained_data_migration(store.db) do
       {:ok, [@client_data_migration]} ->
         {:ok, store}
 
       {:ok, nil} ->
-        {engine, entries, touched} = ClientDataMigration.prepare(store.engine)
+        {engine, touched} = ClientDataMigration.prepare(store.engine)
 
-        if MapSet.size(touched) == 0 and entries == [] do
+        if MapSet.size(touched) == 0 do
           with :ok <- record_data_migration(store.db, @client_data_migration), do: {:ok, store}
         else
-          audit = %{person: "system", actor: "schema_migration", action: @client_data_migration}
-
-          next = if store.mode == :keyed, do: {engine, touched}, else: engine
-
-          case commit(store, next, audit, entries) do
+          case commit(store, engine, retained_data_audit()) do
             {:ok, migrated} -> {:ok, migrated}
             {:error, reason, _} -> {:error, reason}
           end
@@ -206,6 +200,15 @@ defmodule AttentionServer.Store do
         error
     end
   end
+
+  def migrate_retained_client_data(%__MODULE__{}), do: {:error, :storage_unavailable}
+
+  defp retained_data_migration(db) do
+    one(db, "SELECT name FROM relay_data_migrations WHERE name = ?", [@client_data_migration])
+  end
+
+  defp retained_data_audit,
+    do: %{person: "system", actor: "schema_migration", action: @client_data_migration}
 
   def open(nil), do: {:ok, %__MODULE__{db: nil, engine: Engine.new(), version: 0}}
 
@@ -376,14 +379,52 @@ defmodule AttentionServer.Store do
          :ok <- KeyedMigration.report_stage(:snapshot_loaded),
          {:ok, rows} <- load_large_data_references(db),
          {:ok, engine} <- attach_conversion_refs(legacy.engine, upload_dir, rows),
-         :ok <- LargeData.verify_all(engine),
-         :ok <- write_large_data_references(db, LargeData.persisted_references(engine)) do
+         {:ok, legacy} <- prepare_cutover_client_data(%{legacy | engine: engine}),
+         :ok <- LargeData.verify_all(legacy.engine),
+         :ok <- write_large_data_references(db, LargeData.persisted_references(legacy.engine)) do
       KeyedMigration.convert_locked(
-        %{legacy | engine: engine},
-        engine,
+        legacy,
+        legacy.engine,
         legacy.version,
         prepare
       )
+    end
+  end
+
+  # The cutover owns the transaction. Prepare the retained data before writing
+  # records so its changes, log entries and marker roll back with the anchor.
+  defp prepare_cutover_client_data(%__MODULE__{db: db} = snapshot) do
+    case retained_data_migration(db) do
+      {:ok, [@client_data_migration]} ->
+        {:ok, snapshot}
+
+      {:ok, nil} ->
+        {engine, touched} = ClientDataMigration.prepare(snapshot.engine)
+
+        with :ok <- record_cutover_client_changes(snapshot, engine, touched),
+             :ok <- record_data_migration(db, @client_data_migration) do
+          {:ok, %{snapshot | engine: engine}}
+        end
+
+      error ->
+        error
+    end
+  end
+
+  defp record_cutover_client_changes(%__MODULE__{db: db, version: version} = snapshot, engine, touched) do
+    if MapSet.size(touched) == 0 do
+      :ok
+    else
+      before = AttentionServer.RouteBIndex.enable_agent_feed(snapshot.engine)
+      next = %{engine | route_b_index: before.route_b_index}
+      log = AttentionServer.ChangeLog.commit_log_touched(before, next, touched, [])
+
+      with :ok <- AttentionServer.ChangeLog.enable_in_transaction(db, version),
+           :ok <- AttentionServer.AgentChangeLog.enable_in_transaction(db, before, version),
+           :ok <- write_audit(db, retained_data_audit()),
+           {:ok, _, _} <- append_change_logs(db, log, version + 1) do
+        :ok
+      end
     end
   end
 
@@ -1155,7 +1196,6 @@ defmodule AttentionServer.Store do
                    :ok <- write_reference_delta(db, delete_paths, references),
                    :ok <- write_audit(db, audit),
                    {:ok, heads, agent_heads} <- append_change_logs(db, log, generation),
-                   :ok <- record_committed_migration(db, audit),
                    :ok <- DerivedIndex.advance(db, generation) do
                 {:ok, {heads, agent_heads}}
               end

@@ -13,7 +13,6 @@ defmodule AttentionServer.InvitationHandoffTest do
     JSON,
     OwnerTLS,
     Relay,
-    Store,
     TLSFixtures
   }
 

@@ -70,8 +70,6 @@ defmodule AttentionServer.PendingRetentionTest do
              Relay.pending_status(restarted, request.status_secret)
   end
 
-  defp code(index), do: Base.encode32(<<index::40>>, padding: false) <> "AA"
-  defp secret_hash(index), do: :crypto.hash(:sha256, <<index::32>>)
 
   defp temp_path(label) do
     dir = Path.join(System.tmp_dir!(), "attention-#{label}-#{System.unique_integer([:positive])}")

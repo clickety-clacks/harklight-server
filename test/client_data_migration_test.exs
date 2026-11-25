@@ -1,7 +1,7 @@
 defmodule AttentionServer.ClientDataMigrationTest do
   use ExUnit.Case, async: true
 
-  alias AttentionServer.{ChangeLog, PreChangeLogStore, Relay, Store}
+  alias AttentionServer.{ChangeLog, Engine, PreChangeLogStore, Relay, Store}
   alias AttentionServer.ClientAPI.Resources
   alias AttentionServer.Store.RecordTable
   alias Exqlite.Sqlite3
@@ -9,80 +9,93 @@ defmodule AttentionServer.ClientDataMigrationTest do
   @moduletag :tmp_dir
   @key {"A", "app:test", "seen"}
   @session "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+  @discussion_feed_seq 2
   @seen %{
     "schema" => "attention-client.actions/1",
     "actions" => [
-      %{"id" => "seen", "label" => "Seen", "kind" => "value", "value" => %{"acknowledgment" => "seen"}}
+      %{"id" => "seen", "label" => "Mark as read", "kind" => "value", "value" => "seen-legacy"}
     ]
   }
 
-  test "FORMAT31 startup retries an atomic retained-data migration and then skips it", %{
+  @budget %{memory: 4 * 1024 * 1024 * 1024, disk: 4 * 1024 * 1024 * 1024, uploads: 0}
+
+  test "stopped conversion rewrites retained data atomically before the Relay serves it", %{
     tmp_dir: directory
   } do
     path = Path.join(directory, "relay.sqlite3")
-
     seed_retained_snapshot(path)
-
-    assert {:ok, before} = Store.open(path)
+    assert {:ok, before} = Store.open(path, :snapshot)
     assert {:ok, before} = Store.enable_change_log(before)
     assert before.engine.messages[@key].message["message_type"] == nil
     assert {:ok, head} = ChangeLog.head(before, "A")
-    assert :ok = Store.close(before)
-    assert :ok = PreChangeLogStore.convert_fixture(path)
 
-    assert {:ok, staged} = Store.open(path, :keyed)
-    assert {:ok, staged} = Store.enable_change_log(staged)
-    assert {:ok, ^head} = ChangeLog.head(staged, "A")
-    assert :ok = Sqlite3.execute(staged.db, """
+    assert :ok = Sqlite3.execute(before.db, """
     CREATE TRIGGER refuse_migration_marker BEFORE INSERT ON relay_data_migrations
     BEGIN SELECT RAISE(ABORT, 'synthetic migration marker refusal'); END
     """)
 
-    assert {:error, _} = Store.migrate_retained_client_data(staged)
-    assert {:ok, []} = RecordTable.select(staged.db, "SELECT name FROM relay_data_migrations")
-    assert RecordTable.generation(staged.db) == {:ok, staged.version}
-    assert {:ok, ^head} = ChangeLog.head(staged, "A")
-    assert :ok = Sqlite3.execute(staged.db, "DROP TRIGGER refuse_migration_marker")
-    assert :ok = Store.close(staged)
+    assert :ok = Store.close(before)
+    original = File.read!(path)
+    assert {:error, _} = Store.convert_stopped(path, @budget, 30)
+    assert File.read!(path) == original
 
-    assert {:ok, reopened} = Store.open(path, :keyed)
-    assert reopened.engine.messages[@key].message["message_type"] == nil
-    assert :ok = Store.close(reopened)
+    assert {:ok, snapshot} = Store.open(path, :snapshot)
+    assert {:ok, snapshot} = Store.enable_change_log(snapshot)
+    assert {:ok, ^head} = ChangeLog.head(snapshot, "A")
+    assert {:ok, []} = RecordTable.select(snapshot.db, "SELECT name FROM relay_data_migrations")
+    assert snapshot.engine.messages[@key].message["message_type"] == nil
+    assert :ok = Sqlite3.execute(snapshot.db, "DROP TRIGGER refuse_migration_marker")
+    assert :ok = Store.close(snapshot)
 
-    assert {:ok, relay} = Relay.start_link(store_path: path)
-    after_start = :sys.get_state(relay).store
-    record = after_start.engine.messages[@key]
+    assert {:ok, :converted} = Store.convert_stopped(path, @budget, 30)
+    assert {:ok, :already_converted} = Store.convert_stopped(path, @budget, 30)
+    assert {:ok, converted} = Store.open(path, :keyed)
+    record = converted.engine.messages[@key]
     assert record.message["message_type"] == "fyi"
+    assert record.message["answer_ui"] == @seen
     assert record.revisions[1] == record.message
 
     assert %{"message" => %{"message_type" => "fyi"}} =
-             after_start.engine.origin_feeds[{"A", "origin"}].entries[1]
+             converted.engine.origin_feeds[{"A", "origin"}].entries[1]
 
-    assert [%{"delivery" => %{"delivered" => true, "acted" => false} = delivery}] =
-             Enum.filter(Resources.entries(after_start.engine, @key), &(&1["author"] == "person"))
+    assert [%{"entry_id" => entry_id, "delivery" => delivery}] =
+             Enum.filter(Resources.entries(converted.engine, @key), &(&1["author"] == "person"))
 
+    assert %{"delivered" => true, "acted" => false, "receipt_expected" => false} = delivery
     refute Map.has_key?(delivery, "legacy_caption")
     refute Map.has_key?(delivery, "outcome")
 
-    assert after_start.engine.origin_receipts == before.engine.origin_receipts
-    assert {:ok, next_head} = ChangeLog.head(after_start, "A")
-    assert next_head > head
+    seq = entry_id |> String.trim_leading("e") |> String.to_integer()
+    assert converted.engine.conversation_events[{"A", seq}].payload["receipt_expected"] == false
+    assert converted.engine.origin_receipts == before.engine.origin_receipts
     assert {:ok, [["retained_client_data_v1"]]} =
-             RecordTable.select(after_start.db, "SELECT name FROM relay_data_migrations")
-    assert {:ok, statement} = Sqlite3.prepare(after_start.db, "SELECT payload FROM relay_state")
-    assert {:row, [payload]} = Sqlite3.step(after_start.db, statement)
-    assert :ok = Sqlite3.release(after_start.db, statement)
-    assert {:attention_relay_keyed_state, 31, _} = :erlang.binary_to_term(payload, [:safe])
-    assert {:ok, persisted, _} = AttentionServer.Store.KeyedMigration.load(after_start.db)
-    assert persisted.messages[@key].message["message_type"] == "fyi"
-    GenServer.stop(relay)
+             RecordTable.select(converted.db, "SELECT name FROM relay_data_migrations")
+
+    assert {:ok, converted} = Store.enable_change_log(converted)
+    assert {:ok, next_head} = ChangeLog.head(converted, "A")
+    assert next_head > head
+    target = ChangeLog.entry_resource(seq)
+    assert {:ok, changes, false, ^next_head} = ChangeLog.read(converted, "A", head, 100)
+    assert Enum.any?(changes, &match?(%{kind: :entry, resource_id: ^target}, &1))
+    assert :ok = Store.close(converted)
 
     assert {:ok, relay} = Relay.start_link(store_path: path)
     restarted = :sys.get_state(relay).store
-    assert restarted.version == after_start.version
+    assert restarted.version == converted.version
     assert {:ok, ^next_head} = ChangeLog.head(restarted, "A")
+
+    assert {:ok, with_receipt, _} =
+             Engine.origin_ack2(restarted.engine, "origin", @discussion_feed_seq, %{
+               "op_id" => "00000000-0000-4000-8000-000000000003",
+               "outcome" => "handed"
+             })
+
+    assert [%{"delivery" => %{"outcome" => "handed", "receipt_expected" => false}}] =
+             Enum.filter(Resources.entries(with_receipt, @key), &(&1["entry_id"] == entry_id))
+
     GenServer.stop(relay)
   end
+
   test "FORMAT31 cutover preserves a marker already committed in FORMAT30", %{tmp_dir: directory} do
     path = Path.join(directory, "relay.sqlite3")
     seed_retained_snapshot(path)
@@ -93,7 +106,7 @@ defmodule AttentionServer.ClientDataMigrationTest do
     assert {:ok, head} = ChangeLog.head(migrated, "A")
     assert :ok = Store.close(migrated)
 
-    assert :ok = PreChangeLogStore.convert_fixture(path)
+    assert {:ok, :converted} = Store.convert_stopped(path, @budget, 30)
     assert {:ok, converted} = Store.open(path, :keyed)
     assert {:ok, [["retained_client_data_v1"]]} =
              RecordTable.select(converted.db, "SELECT name FROM relay_data_migrations")
@@ -141,13 +154,12 @@ defmodule AttentionServer.ClientDataMigrationTest do
           "text" => "Retained reply"
         })
 
-      [%{"feed_seq" => seq}] =
+      [%{"feed_seq" => @discussion_feed_seq}] =
         for entry <- Map.values(store.engine.origin_feeds[{"A", "origin"}].entries),
             entry["kind"] == "discussion",
             do: entry
 
-      PreChangeLogStore.origin_ack(store, "origin", seq)
+      PreChangeLogStore.origin_ack(store, "origin", @discussion_feed_seq)
     end)
   end
-
 end

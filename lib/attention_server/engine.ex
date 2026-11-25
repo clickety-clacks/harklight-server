@@ -4729,8 +4729,14 @@ defmodule AttentionServer.Engine do
   end
 
   defp effective_revised_message(stored, revised) do
+    # An inferred historical FYI may have a noncanonical Seen action. Its
+    # original action remains usable, and untyped edits retain their admission rules.
+    carry_type? =
+      Map.has_key?(stored, "message_type") and
+        (stored["message_type"] != "fyi" or Message.validate_typed_message(stored) == :ok)
+
     revised =
-      if not Map.has_key?(revised, "message_type") and Map.has_key?(stored, "message_type"),
+      if not Map.has_key?(revised, "message_type") and carry_type?,
         do: Map.put(revised, "message_type", stored["message_type"]),
         else: revised
 

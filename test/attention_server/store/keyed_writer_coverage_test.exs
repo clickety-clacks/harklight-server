@@ -35,6 +35,7 @@ defmodule AttentionServer.Store.KeyedWriterCoverageTest do
     {:track_relay_writes, 1} => :lifecycle,
     {:close, 1} => :lifecycle,
     {:enable_change_log, 1} => :side_table,
+    {:migrate_retained_client_data, 1} => :keyed_refused,
     {:commit, 3} => :keyed_writer,
     {:commit, 4} => :keyed_writer,
     {:put_published_upload, 2} => :keyed_writer,
@@ -261,7 +262,9 @@ defmodule AttentionServer.Store.KeyedWriterCoverageTest do
     assert :ok = Store.close(reopened)
   end
 
-  defp refusal_probes, do: %{}
+  defp refusal_probes do
+    %{{:migrate_retained_client_data, 1} => &Store.migrate_retained_client_data/1}
+  end
 
   defp writer_probes(id) do
     %{

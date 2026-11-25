@@ -604,7 +604,6 @@ defmodule AttentionServer.Relay do
 
     with :ok <- Store.discard_building_inbox_snapshots(store),
          {:ok, store} <- commit_browser_cleanup(store, engine),
-         {:ok, store} <- Store.migrate_retained_client_data(store),
          {:ok, store} <- resume_bounces(store),
          :ok <- Store.discard_browser_inbox_snapshots(store) do
       {:ok, store}
