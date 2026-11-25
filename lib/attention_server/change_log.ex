@@ -231,11 +231,18 @@ defmodule AttentionServer.ChangeLog do
 
   defp log_rows(old, next, item_keys, entry_keys, counts, settings) do
     items =
-      for {person, _, _} = key <- item_keys,
-          visible? = AttentionServer.BounceDecision.person_visible?(next.messages[key]),
-          visible? or AttentionServer.BounceDecision.person_visible?(old.messages[key]) do
-        {person, {if(visible?, do: :item, else: :item_removed), item_resource(key)}}
-      end
+      Enum.flat_map(item_keys, fn {person, _, _} = key ->
+        cond do
+          AttentionServer.BounceDecision.person_visible?(next.messages[key]) ->
+            [{person, {:item, item_resource(key)}}]
+
+          AttentionServer.BounceDecision.person_visible?(old.messages[key]) ->
+            [{person, {:item_removed, item_resource(key)}}]
+
+          true ->
+            []
+        end
+      end)
 
     entries =
       Enum.map(entry_keys, fn {person, seq} -> {person, {:entry, entry_resource(seq)}} end)
