@@ -47,7 +47,7 @@ defmodule AttentionServer.PushDispatcher do
     rejected_token =
       if cached && rejected_fingerprint &&
            rejected_fingerprint == :crypto.hash(:sha256, cached.token),
-        do: cached.token
+         do: cached.token
 
     {token, cached} =
       APNS.provider_authorization(Map.fetch!(profiles, profile_id), cached, rejected_token)

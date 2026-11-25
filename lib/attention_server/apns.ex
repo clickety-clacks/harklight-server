@@ -340,7 +340,7 @@ defmodule AttentionServer.APNS do
       end
 
     put_badge(
-      %{"aps" => aps, "attention" => %{"v" => 2, "type" => "sync", "server" => claim.server}},
+      %{"aps" => aps, "attention" => Map.put(@attention, "server", claim.server)},
       Map.get(claim, :badge)
     )
   end

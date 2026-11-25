@@ -1568,7 +1568,20 @@ defmodule AttentionServer.APNSPushTest do
     assert register_push(self_hosted, ctx.certs, "a2", @device_token, 1, op(31)).status == 200
     Agent.update(ctx.provider_response, fn _ -> {429, [{"retry-after", "60"}], ""} end)
 
-    accept_test_delivery(relay, sender_key, 40, "relay-test-message")
+    accept_test_delivery(relay, sender_key, 40, "relay-test-message", %{
+      "message_type" => "fyi",
+      "answer_ui" => %{
+        "schema" => "attention-client.actions/1",
+        "actions" => [
+          %{
+            "id" => "seen",
+            "label" => "Seen",
+            "kind" => "value",
+            "value" => %{"acknowledgment" => "seen"}
+          }
+        ]
+      }
+    })
 
     assert_receive {:apns_request, "POST", path, headers, body}, 8_000
     assert path == "/3/device/" <> @device_token
@@ -1578,6 +1591,8 @@ defmodule AttentionServer.APNSPushTest do
     assert aps["alert"] == %{"body" => "New message in Harklight"}
     assert aps["mutable-content"] == 1
     assert aps["badge"] == 1
+    assert aps["interruption-level"] == "passive"
+    refute Map.has_key?(aps, "sound")
     assert attention == %{"v" => 2, "type" => "sync", "server" => Relay.push_server_id(relay)}
 
     assert_push_settings_state(self_hosted, ctx.certs, "a2", "waiting_retry")
@@ -1688,7 +1703,14 @@ defmodule AttentionServer.APNSPushTest do
 
       assert_receive {:apns_request, "POST", _path, sent_headers, body}
       assert jwt_key_id(sent_headers) == "TESTKEYID2"
-      assert List.keyfind(sent_headers, "apns-push-type", 0) == {"apns-push-type", expected_type}
+      request_headers = Map.new(sent_headers)
+      assert request_headers["apns-push-type"] == expected_type
+      assert request_headers["apns-priority"] == if(expected_type == "alert", do: "10", else: "5")
+
+      expected_collapse =
+        if options["kind"] == "background", do: "attention-terminal-sync", else: "attention-sync"
+
+      assert request_headers["apns-collapse-id"] == expected_collapse
 
       assert {:ok, %{"aps" => aps, "attention" => %{"server" => @test_server}}} =
                JSON.decode_line(body <> "\n")
