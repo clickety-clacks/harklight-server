@@ -237,10 +237,14 @@ defmodule AttentionServer.ClientAPIOriginParityTest do
     assert length(changes) == length(ids)
     for %{"kind" => "message", "data" => %{"item_id" => id, "terminal" => terminal}} <- changes do
       assert terminal == before[id]
-      assert terminal["state"] == "answered"
+      assert %{"state" => "answered", "at_ms" => at_ms} = terminal
+      assert is_integer(at_ms) and at_ms > 0
       refute Map.has_key?(terminal, "delivery")
       if kind = expected[id], do: assert(terminal["outcome"]["kind"] == kind)
     end
+
+    # The consumer identifies a replay by item ID, terminal state and at_ms.
+    assert decode(get(ctx, @origin, page_path)) == page
 
     for _ <- 1..3 do
       assert %{"rev" => ^rev, "next_page" => fresh} = decode(get(ctx, @origin, path))
