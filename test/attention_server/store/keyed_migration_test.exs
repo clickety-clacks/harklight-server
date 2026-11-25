@@ -36,44 +36,63 @@ defmodule AttentionServer.Store.KeyedMigrationTest do
     assert :ok = Store.close(reopened)
   end
 
-  test "a killed converter rolls back seeded rows and a restart converts from the original anchor", %{
-    path: path,
-    store: store
-  } do
-    assert {:ok, engine} = Engine.setup_person(store.engine, "reader")
-    assert {:ok, legacy} = Store.commit(store, engine, %{person: "reader", actor: "fixture", action: "seed"})
-    assert {:ok, original} = RecordTable.select(legacy.db, "SELECT version, checksum FROM relay_state")
-    assert :ok = Store.close(legacy)
+  for stage <- ~w(preflight_passed snapshot_loaded records_written indexes_written records_verified anchor_written committed)a do
+    test "a killed converter recovers at #{stage}", %{path: path, store: store} do
+      stage = unquote(stage)
+      assert {:ok, engine} = Engine.setup_person(store.engine, "reader")
+      audit = %{person: "reader", actor: "fixture", action: "seed"}
+      assert {:ok, legacy} = Store.commit(store, engine, audit)
+      assert {:ok, original} = RecordTable.select(legacy.db, "SELECT version, checksum FROM relay_state")
+      assert :ok = Store.close(legacy)
 
-    parent = self()
-
-    {worker, monitor} =
-      spawn_monitor(fn ->
-        {:ok, legacy} = Store.open(path, :legacy)
-
-        KeyedMigration.convert_store(legacy, fn _store, _engine, _generation ->
-          send(parent, {self(), :readback_complete})
-
-          receive do
-            :continue -> {:ok, :finished}
-          end
-        end)
+      gib = 1024 * 1024 * 1024
+      budget = %{memory: 2 * gib, disk: 2 * gib, uploads: 4096}
+      {worker, monitor} = spawn_monitor(fn ->
+        receive do
+          :start -> Store.convert_stopped(path, budget, 30)
+        end
       end)
 
-    on_exit(fn -> if Process.alive?(worker), do: Process.exit(worker, :kill) end)
-    assert_receive {^worker, :readback_complete}, 5_000
-    Process.exit(worker, :kill)
-    assert_receive {:DOWN, ^monitor, :process, ^worker, :killed}
+      handler = {__MODULE__, make_ref()}
+      event = [:harklight, :store, :conversion, stage]
+      assert :ok = :telemetry.attach(handler, event, &__MODULE__.pause_converter/4, {worker, self()})
 
-    assert {:ok, db} = Sqlite3.open(path)
-    assert {:ok, ^original} = RecordTable.select(db, "SELECT version, checksum FROM relay_state")
-    assert {:ok, []} = RecordTable.select(db, "SELECT name FROM sqlite_schema WHERE name = 'relay_records'")
-    assert :ok = Sqlite3.close(db)
+      on_exit(fn ->
+        :telemetry.detach(handler)
+        if Process.alive?(worker), do: Process.exit(worker, :kill)
+      end)
 
-    assert {:ok, converted} = Store.open(path, :keyed_cutover)
-    assert converted.engine.persons == %{"reader" => 0}
-    assert :ok = Store.close(converted)
+      send(worker, :start)
+      assert_receive {^worker, ^stage}, 5_000
+      Process.exit(worker, :kill)
+      assert_receive {:DOWN, ^monitor, :process, ^worker, :killed}, 2_000
+
+      if stage == :committed do
+        assert {:ok, :already_converted} = Store.convert_stopped(path, budget, 30)
+      else
+        assert {:ok, db} = Sqlite3.open(path)
+        assert {:ok, ^original} = RecordTable.select(db, "SELECT version, checksum FROM relay_state")
+        assert {:ok, []} = RecordTable.select(db, "SELECT name FROM sqlite_schema WHERE name = 'relay_records'")
+        assert :ok = Sqlite3.close(db)
+        assert {:ok, :converted} = Store.convert_stopped(path, budget, 30)
+      end
+
+      assert {:ok, converted} = Store.open(path, :keyed)
+      assert converted.engine.persons == %{"reader" => 0}
+      assert :ok = Store.close(converted)
+    end
   end
+
+  def pause_converter([:harklight, :store, :conversion, stage], _measurement, _metadata, {worker, observer})
+      when worker == self() do
+    send(observer, {worker, stage})
+
+    receive do
+      :continue -> :ok
+    end
+  end
+
+  def pause_converter(_event, _measurement, _metadata, _config), do: :ok
 
   test "reads verified keyed records at their current generation", %{store: store} do
     assert {:ok, engine} = Engine.setup_person(store.engine, "reader")

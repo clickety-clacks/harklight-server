@@ -191,6 +191,9 @@ defmodule Format31Rehearsal do
 
     report(:startup_return, %{elapsed_us: micros, memory: memory()})
     Process.sleep(30_000)
+    report(:startup_30s, %{memory: memory()})
+    await_quiet_startup(relay, System.monotonic_time(:millisecond) + 600_000)
+    Process.sleep(2_000)
     report(:startup_rest, %{memory: memory()})
 
     {inbox_us, {:ok, _}} = :timer.tc(fn -> Reads.inbox(relay, @reader, %{"limit" => "50"}) end)
@@ -198,6 +201,44 @@ defmodule Format31Rehearsal do
     report(:view_latency_us, %{inbox: inbox_us, first_replied_page: replied_us})
     measure_sends(relay)
     :ok = GenServer.stop(relay, :normal, 60_000)
+  end
+
+  defp await_quiet_startup(relay, deadline) do
+    observer = self()
+
+    try do
+      :sys.replace_state(relay, fn state ->
+        next_bounce = BounceDecision.next_deadline(state.store.engine)
+
+        pending = %{
+          priority: map_size(state.priority_jobs) + map_size(state.priority_timers) +
+            map_size(state.priority_retry_timers) + map_size(state.priority_queued),
+          availability: MapSet.size(Map.get(state, :agent_availability_jobs, MapSet.new())),
+          overdue_bounce: is_integer(next_bounce) and next_bounce <= state.clock.(),
+          rank_retry: not is_nil(state.client_rank_retry)
+        }
+
+        send(observer, {:startup_pending, pending})
+        throw(:startup_sampled)
+      end, 120_000)
+    catch
+      :error, {:callback_failed, _, {:throw, :startup_sampled}} -> :ok
+    end
+
+    receive do
+      {:startup_pending, %{priority: 0, availability: 0, overdue_bounce: false, rank_retry: false} = pending} ->
+        report(:startup_drained, pending)
+
+      {:startup_pending, pending} ->
+        if System.monotonic_time(:millisecond) >= deadline do
+          raise "synthetic startup still has pending work: #{inspect(pending)}"
+        end
+
+        Process.sleep(500)
+        await_quiet_startup(relay, deadline)
+    after
+      5_000 -> raise "synthetic startup sample was not received"
+    end
   end
 
   defp first_reply(relay, params) do

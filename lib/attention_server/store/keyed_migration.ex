@@ -7,6 +7,10 @@ defmodule AttentionServer.Store.KeyedMigration do
 
   @format 31
 
+  def report_stage(stage) do
+    :telemetry.execute([:harklight, :store, :conversion, stage], %{time: System.monotonic_time()}, %{})
+  end
+
   def bootstrap(db, engine) do
     payload = encode_anchor()
 
@@ -35,12 +39,16 @@ defmodule AttentionServer.Store.KeyedMigration do
          :ok <- Store.verify_retained_uploads(store),
          :ok <- large_data_index(db),
          {:ok, count} <- RecordTable.seed_count(db, generation, rows),
+         :ok <- report_stage(:records_written),
          :ok <- DerivedIndex.create(db, generation, engine),
+         :ok <- report_stage(:indexes_written),
          :ok <- verify_records(db, engine, count),
+         :ok <- report_stage(:records_verified),
          {:ok, prepared} <- prepare.(store, engine, generation),
          :ok <- write_anchor(db, version, generation),
          :ok <- advance_current_logs(db, version, generation),
-         :ok <- Sqlite3.execute(db, "DELETE FROM relay_device_progress") do
+         :ok <- Sqlite3.execute(db, "DELETE FROM relay_device_progress"),
+         :ok <- report_stage(:anchor_written) do
       {:ok, prepared}
     end
   end

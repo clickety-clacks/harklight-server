@@ -307,11 +307,17 @@ defmodule AttentionServer.Store do
           end)
 
         case result do
-          {:ok, result} = success when result in [:converted, :already_converted] ->
+          {:ok, :already_converted} = success ->
+            _ = Sqlite3.close(db)
+            success
+
+          {:ok, :converted} = success ->
+            :ok = KeyedMigration.report_stage(:committed)
             _ = Sqlite3.close(db)
             success
 
           {:ok, _} = success ->
+            :ok = KeyedMigration.report_stage(:committed)
             success
 
           error ->
@@ -330,8 +336,10 @@ defmodule AttentionServer.Store do
   # Normalise in memory so a failed install preserves the old anchor and
   # progress rows at their original generation.
   defp convert_locked(db, upload_dir, prepare) do
-    with :ok <- Sqlite3.execute(db, @schema),
+    with :ok <- KeyedMigration.report_stage(:preflight_passed),
+         :ok <- Sqlite3.execute(db, @schema),
          {:ok, legacy} <- load_or_create(db, upload_dir, :convert),
+         :ok <- KeyedMigration.report_stage(:snapshot_loaded),
          {:ok, rows} <- load_large_data_references(db),
          {:ok, engine} <- attach_conversion_refs(legacy.engine, upload_dir, rows),
          :ok <- LargeData.verify_all(engine),
@@ -1107,15 +1115,22 @@ defmodule AttentionServer.Store do
 
       result =
         Persistence.run(fn ->
-          RecordTable.commit(db, version, records, fn db, generation ->
-            with :ok <- DerivedIndex.write(db, derived),
-                 :ok <- write_reference_delta(db, delete_paths, references),
-                 :ok <- write_audit(db, audit),
-                 {:ok, heads, agent_heads} <- append_change_logs(db, log, generation),
-                 :ok <- DerivedIndex.advance(db, generation) do
-              {:ok, {heads, agent_heads}}
-            end
-          end)
+          result =
+            RecordTable.commit(db, version, records, fn db, generation ->
+              with :ok <- DerivedIndex.write(db, derived),
+                   :ok <- write_reference_delta(db, delete_paths, references),
+                   :ok <- write_audit(db, audit),
+                   {:ok, heads, agent_heads} <- append_change_logs(db, log, generation),
+                   :ok <- DerivedIndex.advance(db, generation) do
+                {:ok, {heads, agent_heads}}
+              end
+            end)
+
+          if match?({:ok, _}, result) do
+            :telemetry.execute([:harklight, :store, :commit, :committed], %{generation: version + 1}, %{})
+          end
+
+          result
         end)
 
       case result do

@@ -185,6 +185,60 @@ defmodule AttentionServer.Store.Format31RelayStartupTest do
     end
   end
 
+  test "a killed worker after COMMIT leaves one send across Relay restart and retry", %{tmp_dir: dir} do
+    path = Path.join(dir, "relay.sqlite3")
+    assert {:ok, relay} = Relay.start_link(store_path: path)
+    Process.unlink(relay)
+    monitor = Process.monitor(relay)
+    assert :ok = Relay.setup_person(relay, "person")
+    assert :ok = Relay.setup_device(relay, "person", "origin")
+    assert :ok = Relay.setup_sender(relay, "origin", "app:test")
+
+    observer = self()
+    handler = {__MODULE__, make_ref()}
+    event = [:harklight, :store, :commit, :committed]
+    assert :ok = :telemetry.attach(handler, event, &__MODULE__.pause_worker/4, {relay, observer})
+
+    on_exit(fn ->
+      :telemetry.detach(handler)
+      if Process.alive?(relay), do: Process.exit(relay, :kill)
+    end)
+
+    spawn(fn ->
+      try do
+        send(observer, {:reply, issue(relay, forward_frame(), 30)})
+      catch
+        :exit, _ -> send(observer, :reply_lost)
+      end
+    end)
+
+    assert_receive {:committed, worker}, 5_000
+    Process.exit(worker, :kill)
+    assert_receive {:DOWN, ^monitor, :process, ^relay, :killed}, 2_000
+    assert_receive :reply_lost
+
+    assert {:ok, restarted} = Relay.start_link(store_path: path)
+    assert %{"type" => "ok", "seq" => 1, "duplicate" => true} = issue(restarted, forward_frame(), 30)
+    assert {:ok, %{"items" => [%{"item_id" => "i1"}]}} = Reads.inbox(restarted, "origin")
+    assert :ok = GenServer.stop(restarted)
+
+    assert {:ok, cold} = Store.open(path, :keyed)
+    assert [[1]] = query(cold, "SELECT count(*) FROM relay_items WHERE live = 1")
+    assert :ok = Store.close(cold)
+  end
+
+  def pause_worker(_event, _measurement, _metadata, {relay, observer}) do
+    {:links, links} = Process.info(self(), :links)
+
+    if relay in links do
+      send(observer, {:committed, self()})
+
+      receive do
+        :continue -> :ok
+      end
+    end
+  end
+
   defp issue(relay, frame, n) do
     id = "00000000-0000-4000-8000-" <> String.pad_leading(Integer.to_string(n), 12, "0")
     frame = Map.merge(frame, %{"op_id" => id, "v" => 1})
