@@ -483,7 +483,7 @@ defmodule AttentionServer.Placement.JevSet do
         end
       end)
 
-    {retained, placed} =
+    {retained_reversed, placed} =
       Enum.reduce(previous, {[], MapSet.new()}, fn entry, {retained, placed} ->
         identity = Placement.identity(entry)
 
@@ -491,12 +491,12 @@ defmodule AttentionServer.Placement.JevSet do
           Map.has_key?(items_by_identity, identity) ->
             item = Map.fetch!(items_by_identity, identity)
 
-            {retained ++ [with_score(item, entry["score"])], MapSet.put(placed, item.identity)}
+            {[with_score(item, entry["score"]) | retained], MapSet.put(placed, item.identity)}
 
           Map.has_key?(replacements_by_target, identity) ->
             item = Map.fetch!(replacements_by_target, identity)
 
-            {retained ++ [with_score(item, entry["score"])], MapSet.put(placed, item.identity)}
+            {[with_score(item, entry["score"]) | retained], MapSet.put(placed, item.identity)}
 
           true ->
             {retained, placed}
@@ -506,7 +506,7 @@ defmodule AttentionServer.Placement.JevSet do
     new_entries =
       Enum.filter(baseline, &(not MapSet.member?(placed, Placement.identity(&1))))
 
-    retained ++ new_entries
+    Enum.reverse(retained_reversed, new_entries)
   end
 
   defp valid_score?(value), do: is_number(value) and value >= 0 and value <= 1
