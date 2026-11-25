@@ -120,8 +120,8 @@ a historical approval does not override revocation.
 
 Owner decline uses `type: "pending_decline"`, `approval_code`,
 `expected_device_id` (SPKI) and `expected_expires_at` alongside `v` and
-`person_id`. Existing `pending_approve` has the same exact binding and must use
-`sender_grants: []` for guided requests.
+`person_id`. Existing `pending_approve` has the same exact binding and accepts the
+owner’s optional `sender_grants` for guided requests.
 
 ## Requester cancellation and own-device removal
 

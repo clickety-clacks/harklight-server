@@ -1,7 +1,7 @@
 defmodule AttentionServer.SkillsBuildTest do
   use ExUnit.Case, async: true
 
-  test "the package preserves the reviewed hosted guide independently of the shared core" do
+  test "the package builds both skills from the shared core and serves the Hosted guide unchanged" do
     root = Path.expand("..", __DIR__)
 
     scratch =
@@ -15,6 +15,7 @@ defmodule AttentionServer.SkillsBuildTest do
       Path.join(scratch, "scripts/build-skills.sh")
     )
 
+    File.cp!(Path.join(root, "mix.exs"), Path.join(scratch, "mix.exs"))
     File.cp_r!(Path.join(root, "skills"), Path.join(scratch, "skills"))
     output = Path.join(scratch, "output")
 
@@ -25,6 +26,7 @@ defmodule AttentionServer.SkillsBuildTest do
       assert Enum.sort(Path.wildcard(Path.join(output, "**/*.md"))) ==
                Enum.sort([
                  Path.join(output, "core.md"),
+                 Path.join(output, "harklight/SKILL.md"),
                  Path.join(output, "harklight-agent/SKILL.md"),
                  Path.join(output, "harklight-agent-saas/SKILL.md")
                ])
@@ -36,9 +38,16 @@ defmodule AttentionServer.SkillsBuildTest do
       assert String.ends_with?(assembled, core)
       assert length(:binary.matches(assembled, core)) == 1
 
+      harklight = File.read!(Path.join(output, "harklight/SKILL.md"))
+      server_version = Application.spec(:attention_server, :vsn)
+      assert String.starts_with?(harklight, "---\nname: harklight\nversion: \"#{server_version}\"\n")
+      assert harklight =~ "description:"
+      assert String.ends_with?(harklight, core)
+      assert length(:binary.matches(harklight, core)) == 1
+
       hosted = File.read!(Path.join(output, "harklight-agent-saas/SKILL.md"))
       assert Base.encode16(:crypto.hash(:sha256, hosted), case: :lower) ==
-               "bcdce3b1c391035af450cd4f10d3ecc39cbd0b7a21a2c9d472d85683c8311817"
+               "2ddaf293177a437fcf82647c74e2a4cb6f61314e4678834adaf0c67bf8629c75"
 
       opts =
         AttentionServer.DashboardReadHTTP.init(
@@ -46,15 +55,21 @@ defmodule AttentionServer.SkillsBuildTest do
           skill_path: Path.join(output, "harklight-agent/SKILL.md")
         )
 
-      response =
-        Plug.Test.conn(:get, "/agent-skills/harklight-agent-saas/SKILL.md")
-        |> Map.put(:scheme, :https)
-        |> AttentionServer.DashboardReadHTTP.call(opts)
+      for {path, expected} <- [
+            {"/agent-skills/harklight/SKILL.md", harklight},
+            {"/agent-skills/harklight-agent-saas/SKILL.md", hosted}
+          ] do
+        response =
+          Plug.Test.conn(:get, path)
+          |> Map.put(:scheme, :https)
+          |> AttentionServer.DashboardReadHTTP.call(opts)
 
-      assert response.status == 200
-      assert response.resp_body == hosted
-      assert Plug.Conn.get_resp_header(response, "content-type") ==
-               ["text/plain; charset=utf-8"]
+        assert response.status == 200
+        assert response.resp_body == expected
+
+        assert Plug.Conn.get_resp_header(response, "content-type") ==
+                 ["text/plain; charset=utf-8"]
+      end
     end
   end
 end

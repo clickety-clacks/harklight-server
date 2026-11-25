@@ -89,7 +89,7 @@ defmodule AttentionServer.DashboardViewTest do
   end
 
   test "the components page shows the packaged skill version and no invented app link" do
-    html = DashboardView.components("Dana", {:ok, "0.1.0"}, {:ok, "0.2.0"})
+    html = DashboardView.components("Dana", {:ok, "0.1.0"}, {:ok, "0.2.0"}, {:ok, "0.3.0"})
 
     assert html =~ "v0.1.0"
     assert html =~ ~s(<p class="status version">v0.1.0</p>)
@@ -102,7 +102,7 @@ defmodule AttentionServer.DashboardViewTest do
   end
 
   test "the components page presents a wrapped, copyable install command" do
-    html = DashboardView.components("Dana", {:ok, "0.1.0"}, {:ok, "0.2.0"})
+    html = DashboardView.components("Dana", {:ok, "0.1.0"}, {:ok, "0.2.0"}, {:ok, "0.3.0"})
 
     assert html =~
              ~s(<pre id="install-command"><code>brew install <span class="brew-namespace">clickety-clacks</span>/<wbr>tap/<wbr>harklight-agent</code></pre>)
@@ -124,7 +124,7 @@ defmodule AttentionServer.DashboardViewTest do
   end
 
   test "the components page links to the published CLI release" do
-    html = DashboardView.components("Dana", {:ok, "0.1.0"}, {:ok, "0.2.0"})
+    html = DashboardView.components("Dana", {:ok, "0.1.0"}, {:ok, "0.2.0"}, {:ok, "0.3.0"})
 
     assert html =~
              ~s(href="https://github.com/clickety-clacks/harklight-agent/releases/latest")
@@ -132,8 +132,12 @@ defmodule AttentionServer.DashboardViewTest do
     refute html =~ "Homebrew formula"
   end
 
-  test "the components page documents both shipped skills with their own version and link" do
-    html = DashboardView.components("Dana", {:ok, "0.1.0"}, {:ok, "0.2.0"})
+  test "the components page lists the coding-agent skill first with the existing guides below" do
+    html = DashboardView.components("Dana", {:ok, "0.1.0"}, {:ok, "0.2.0"}, {:ok, "0.3.0"})
+
+    assert html =~ ~r{Agent skill: harklight</h2>.*Agent skill: harklight-agent</h2>}s
+    assert html =~ "v0.3.0"
+    assert html =~ ~s(href="/agent-skills/harklight/SKILL.md")
 
     assert html =~ "Agent skill: harklight-agent</h2>"
     assert html =~ "v0.1.0"
@@ -145,23 +149,24 @@ defmodule AttentionServer.DashboardViewTest do
     assert html =~ ~s(href="/agent-skills/core.md")
   end
 
-  test "the components page tolerates a skill version lookup failure for either skill independently" do
-    html = DashboardView.components("Dana", :error, {:ok, "0.2.0"})
+  test "the components page tolerates independent skill version lookup failures" do
+    html = DashboardView.components("Dana", :error, {:ok, "0.2.0"}, :error)
 
     refute html =~ "v0.1.0"
     assert html =~ "v0.2.0"
 
-    html = DashboardView.components("Dana", {:ok, "0.1.0"}, :error)
+    html = DashboardView.components("Dana", {:ok, "0.1.0"}, :error, :error)
 
     assert html =~ "v0.1.0"
     refute html =~ "v0.2.0"
   end
 
-  test "the components page tolerates both skill version lookups failing" do
-    html = DashboardView.components("Dana", :error, :error)
+  test "the components page tolerates all skill version lookups failing" do
+    html = DashboardView.components("Dana", :error, :error, :error)
 
     refute html =~ ~s(<h2>Agent skill: harklight-agent</h2><p class="status">v)
     refute html =~ ~s(<h2>Agent skill: harklight-agent-saas</h2><p class="status">v)
+    refute html =~ ~s(<h2>Agent skill: harklight</h2><p class="status">v)
   end
 
   test "a non-expiring invitation is labeled clearly" do

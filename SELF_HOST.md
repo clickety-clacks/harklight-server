@@ -195,15 +195,16 @@ The dashboard has its own HTTPS port and defaults to loopback binding.
   `skills/harklight-agent/SKILL.md` path, so existing `server.env` files remain
   valid after an upgrade.
 
-Both self-contained skills are served without signing in, at
-`/agent-skills/SKILL.md` (self-hosted) and
-`/agent-skills/harklight-agent-saas/SKILL.md` (hosted). The shared core is served
-at `/agent-skills/core.md`, derived from the same package's `skills/core.md`.
-The signed-in Components page links all three and shows each skill's version.
-The old send-and-listen file is replaced by the core copied into both skills at
-build time. The former `ATTENTION_SERVER_DASHBOARD_SKILL_PATH_SEND_LISTEN`
-setting is no longer used; the optional SaaS path defaults from the primary
-skill path without requiring an environment change.
+The dashboard serves the two skills, Hosted guide and shared core without
+requiring sign-in. The signed-in **Components** page links to all four.
+
+- `/agent-skills/harklight/SKILL.md` serves the Claude Code and Codex skill.
+- `/agent-skills/SKILL.md` serves the self-hosted operator skill.
+- `/agent-skills/harklight-agent-saas/SKILL.md` serves the Hosted guide.
+- `/agent-skills/core.md` serves the shared conversation core.
+
+The coding-agent skill and shared core are located relative to the configured
+operator skill path.
 
 For access from another machine, set `ATTENTION_SERVER_DASHBOARD_BIND` to the
 server's permitted interface and arrange routing. Optional
@@ -254,6 +255,25 @@ ranking; a write failure is ignored and logged once per server process. There
 is no rotation or retention job. It records existing applied scores only and
 never triggers scoring. Reused scores with unchanged values and model are not
 appended again while they remain in the applied set during the same server run.
+
+## Connect Claude Code or Codex
+
+Set `ATTENTION_SERVER_JOIN_NAME` to the Server DNS name clients validate. Use
+an Agent CLI release that includes `setup`. On the computer running Claude Code
+or Codex, install the CLI with `brew install clickety-clacks/tap/harklight-agent`.
+
+1. In the dashboard, open **Devices** and choose **Create invitation**. Copy
+   the **On a computer** command and run it on the agent’s computer.
+2. In **Devices**, review the pending request, match the approval code printed
+   by `setup`, and enter `app:agent/` in **Sender IDs** before approving.
+3. Answer the test question in your Harklight Inbox. Then ask Claude Code or
+   Codex to send you a question through Harklight.
+
+With the owner CLI, use `harklight owner invite --output FILE` with your usual
+owner connection options and transfer the private invitation file to the
+agent’s computer. Run `harklight-agent setup FILE` there. Approve the displayed
+code with `harklight owner approve --code CODE --senders app:agent/`, using the
+same owner connection options.
 
 ## Optional APNs notifications
 

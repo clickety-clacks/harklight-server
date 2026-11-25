@@ -283,6 +283,14 @@ defmodule AttentionServer.DashboardHTTPSTest do
     assert invitation =~ ~s(<form action="/devices/invitation/new" method="post">)
     refute invitation =~ ~s(<form action="/devices/add" method="post">)
     assert [_, link] = Regex.run(~r/value="(harklight:\/\/join#[^"]+)"/, invitation)
+    assert invitation =~ ~s(<label for="agent-setup-command">On a computer</label>)
+
+    assert invitation =~
+             ~s(id="agent-setup-command" readonly value="harklight-agent setup &#39;#{link}&#39;")
+
+    assert invitation =~
+             ~s(id="copy-agent-setup" type="button" aria-controls="agent-setup-command")
+
     "harklight://join#" <> encoded = link
 
     {:ok, payload} =
@@ -349,6 +357,8 @@ defmodule AttentionServer.DashboardHTTPSTest do
       ])
 
     assert share_script =~ "HTTP/1.1 200"
+    assert share_script =~ ~s(["copy-agent-setup", setup, "Setup command copied.")
+    assert share_script =~ "navigator.clipboard.writeText(field.value)"
     refute share_script =~ payload["invite_token"]
 
     unsigned_script =
@@ -470,6 +480,39 @@ defmodule AttentionServer.DashboardHTTPSTest do
 
     assert refused_approval =~ "HTTP/1.1 409"
     assert {:ok, ^pending} = Relay.owner_pending_lookup(relay, person, key, approval_code)
+
+    review =
+      send_https(certs, port, [
+        "GET /devices/waiting/#{approval_code} HTTP/1.1\r\n",
+        "Host: relay.test:#{port}\r\n",
+        "Cookie: __Host-harklight=#{cookie}\r\nConnection: close\r\n\r\n"
+      ])
+
+    assert review =~ "HTTP/1.1 200"
+    assert review =~ ~s(placeholder="app:agent/")
+    assert review =~ "An ID ending in / covers every ID that begins with it."
+
+    approval =
+      URI.encode_query(%{
+        "key" => pending.key,
+        "deadline" => pending.expires_at || "",
+        "senders" => " app:agent/, app:example "
+      })
+
+    approved =
+      send_https(certs, port, [
+        "POST /devices/waiting/#{approval_code}/approve HTTP/1.1\r\n",
+        "Host: relay.test:#{port}\r\nOrigin: https://relay.test:#{port}\r\n",
+        "Content-Type: application/x-www-form-urlencoded\r\n",
+        "Cookie: __Host-harklight=#{cookie}\r\n",
+        "Content-Length: #{byte_size(approval)}\r\nConnection: close\r\n\r\n",
+        approval
+      ])
+
+    assert approved =~ "HTTP/1.1 303"
+
+    assert :sys.get_state(relay).store.engine.sender_grants[{person, pending.key}] ==
+             MapSet.new(["app:agent/", "app:example"])
 
     assert {410, _} = resolve_join(certs, port, payload["invite_token"])
 
