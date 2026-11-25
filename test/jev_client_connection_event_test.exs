@@ -104,7 +104,8 @@ defmodule AttentionServer.JevClientConnectionEventTest do
     assert {:ok, _client_hello} = :gen_tcp.recv(socket, 0, 2_000)
 
     assert Task.await(task, 2_000) == {:error, :unavailable}
-    assert {:error, :closed} = :gen_tcp.recv(socket, 0, 2_000)
+    assert :ok = :inet.setopts(socket, active: true)
+    assert_receive {:tcp_closed, ^socket}, 2_000
   end
 
   defp call(port, timeout \\ 30_000) do
