@@ -1,3 +1,34 @@
+# Harklight Server v0.2.24
+
+A message that is never opened now leaves the person's lists when its bounce
+time is reached (by priority: Urgent 12 hours, High 1 day, Normal 3 days, Low
+7 days, or the account's own levels). It disappears from the Inbox, search,
+history, the badge and counts; clients are told through the existing
+`item_removed` change, and opening or answering it directly answers
+`404 not_found`. A pending default answer on it is cancelled.
+
+The sending agent is still told: its view keeps the message open with a bounce
+notice saying it was never opened, so the agent can decide whether to ask
+again. Replies, revisions and progress on a bounced message are refused as on
+an ended message; withdrawing it still works. A message that was opened but
+not answered is unchanged: it stays in the Inbox and the agent is told it
+hasn't been acted on. Answering, No comment, Seen, withdrawing, replacing,
+expiry or a default answer before the bounce time stops both.
+
+Released Harklight Web (0.2.5, 0.2.6) and Harklight app builds already remove a
+message on `item_removed`, so no client update is needed.
+
+## Upgrade and recovery
+
+As in v0.2.21 through v0.2.23: FORMAT30 stores only, no new store change. Take
+a complete private backup before starting the new release. To return to an
+earlier release, follow the rollback steps in SELF_HOST.md.
+
+**Compatibility.** Harklight Server 0.2.24 speaks only the 0.2 protocol and
+bundles Harklight Web 0.2.6. As with v0.2.21, install it together with an
+iPhone app build that reads `receipt_expected`. Harklight Agent 0.2.6 and 0.2.7
+work with it.
+
 # Harklight Server v0.2.23
 
 Hosted servers can now rank waiting messages with Jev, the model-assisted
