@@ -510,7 +510,9 @@ recovering a readable backup before proceeding.
 
 Conversion is transactional. An interruption before commit leaves the old
 snapshot for a retry from the beginning. A retry that finds FORMAT31 skips
-conversion. Do not rerun bootstrap against converted or restored state. To
+conversion. Retry an interrupted install with the same verified release. The
+installer keeps the original snapshot backup through the retry and retains it
+after candidate readiness. Do not rerun bootstrap against converted or restored state. To
 return to the previous snapshot release, stop the Server, restore the complete
 pre-upgrade backup and run the release that wrote it. Restoring that backup
 discards every later write and leaves external deliveries in place.

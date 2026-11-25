@@ -43,6 +43,16 @@ defmodule AttentionServer.InstallReleaseRollbackTest do
     assert sha256_file(context.store_path) == context.store_sha256
   end
 
+  for mode <- ~w(interrupted-conversion interrupted-switch) do
+    @tag timeout: 30_000
+    test "an #{mode} retry retains the original snapshot backup", context do
+      {output, status} = run_installer(unquote(mode), context)
+
+      assert status == 0, output
+      assert sha256_file(context.store_path) == context.store_sha256
+    end
+  end
+
   @tag timeout: 30_000
   test "an unavailable optional owner route does not block other server functionality", context do
     {output, status} = run_installer("optional-route", context)

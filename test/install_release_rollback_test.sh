@@ -5,7 +5,8 @@ trap 'printf "Installer fixture assertion failed at line %s\n" "$LINENO" >&2' ER
 installer="${1:?pass the install-release.sh path}"
 mode="${2:-upgrade-failure}"
 [[ -f "$installer" ]] || { printf 'installer is missing\n' >&2; exit 1; }
-[[ "$mode" == upgrade-failure || "$mode" == optional-route || "$mode" == conversion-failure ]] || {
+[[ "$mode" == upgrade-failure || "$mode" == optional-route || "$mode" == conversion-failure ||
+   "$mode" == interrupted-conversion || "$mode" == interrupted-switch ]] || {
   printf 'unknown test mode: %s\n' "$mode" >&2
   exit 1
 }
@@ -76,6 +77,11 @@ backups=("$HARKLIGHT_TEST_ROOT"/backups/*-v0.2.16-to-v0.2.19-*)
 ERL_LIBS="$HARKLIGHT_TEST_ERL_LIBS" elixir \
   -pa "$HARKLIGHT_TEST_APP_EBIN" "$HARKLIGHT_TEST_MIGRATOR"
 grep -qx 'format=31' "$HARKLIGHT_TEST_MIGRATION_LOG"
+if [[ "$HARKLIGHT_TEST_MODE" == interrupted-conversion && ! -f "$HARKLIGHT_TEST_INTERRUPTED" ]]; then
+  touch "$HARKLIGHT_TEST_INTERRUPTED"
+  kill -KILL "$PPID"
+  exit 0
+fi
 [[ "$HARKLIGHT_TEST_MODE" != conversion-failure ]]
 CANDIDATE_HARKLIGHT
 chmod 755 "$archive_stage/bin/harklight"
@@ -136,9 +142,14 @@ case "$action" in
       */releases/v0.2.19)
         # Conversion must have completed before the service starts.
         grep -qx 'format=31' "$HARKLIGHT_TEST_MIGRATION_LOG"
+        if [[ "$HARKLIGHT_TEST_MODE" == interrupted-switch && ! -f "$HARKLIGHT_TEST_INTERRUPTED" ]]; then
+          touch "$HARKLIGHT_TEST_INTERRUPTED"
+          kill -KILL "$PPID"
+          exit 0
+        fi
         printf 'candidate-only\n' > "$HARKLIGHT_TEST_ROOT/state/candidate-write.txt"
         printf 'start:v0.2.19\n' >> "$HARKLIGHT_TEST_ACTIONS"
-        if [[ "$HARKLIGHT_TEST_MODE" == upgrade-failure ]]; then
+        if [[ "$HARKLIGHT_TEST_MODE" != optional-route ]]; then
           printf 'inactive\n' > "$HARKLIGHT_TEST_STATUS"
           exit 0
         fi
@@ -197,11 +208,11 @@ export HARKLIGHT_TEST_APP_EBIN="$app_ebin"
 export HARKLIGHT_TEST_ERL_LIBS="$erl_libs"
 export HARKLIGHT_TEST_MIGRATOR="$migrator"
 export HARKLIGHT_TEST_MIGRATION_LOG="$scratch/candidate-migration.log"
+export HARKLIGHT_TEST_INTERRUPTED="$scratch/installer-interrupted"
 export REAL_READLINK="$real_readlink"
 : > "$HARKLIGHT_TEST_ACTIONS"
 
-set +e
-output="$(
+invoke_installer() {
   HARKLIGHT_RELEASE_TAG=v0.2.19 \
   HARKLIGHT_SOURCE_COMMIT=0123456789abcdef0123456789abcdef01234567 \
   HARKLIGHT_ARCHIVE_SHA256="$archive_sha256" \
@@ -209,11 +220,26 @@ output="$(
   HARKLIGHT_CHECKSUMS_PATH="$sums" \
   HARKLIGHT_GUIDE_PATH="$guide" \
     "$package_root/bin/harklight-release-install" 2>&1
-)"
+}
+
+if [[ "$mode" == interrupted-* ]]; then
+  set +e
+  output="$(invoke_installer)"
+  status=$?
+  set -e
+  [[ "$status" == 137 && -f "$HARKLIGHT_TEST_INTERRUPTED" ]] || {
+    printf 'Expected a killed installer, got %s\n%s\n' "$status" "$output" >&2; exit 1;
+  }
+  [[ -f "$root/backups/.pending-conversion" ]]
+  [[ "$(< "$scratch/service-state")" == inactive ]]
+fi
+
+set +e
+output="$(invoke_installer)"
 status=$?
 set -e
 
-if [[ "$mode" == upgrade-failure || "$mode" == conversion-failure ]]; then
+if [[ "$mode" != optional-route ]]; then
   [[ "$status" == 1 ]] || { printf 'expected installer exit 1, got %s\n%s\n' "$status" "$output" >&2; exit 1; }
   if [[ "$mode" == conversion-failure ]]; then
     expected_failure='upgrade failed: stopped-store FORMAT31 conversion failed'
@@ -235,6 +261,7 @@ if [[ "$mode" == upgrade-failure || "$mode" == conversion-failure ]]; then
   [[ "$(< "$scratch/service-state")" == active ]]
   restored_store_sha="$(sha256sum "$root/state/relay.sqlite3" | cut -d ' ' -f 1)"
   [[ "$restored_store_sha" == "$expected_store_sha" ]]
+  [[ ! -e "$root/backups/.pending-conversion" ]]
   [[ ! -e "$root/state/relay.sqlite3.uploads" ]]
   [[ ! -e "$root/state/candidate-write.txt" ]]
   [[ -d "$release_old" && -d "$root/releases/v0.2.19" ]]
@@ -261,6 +288,7 @@ else
   [[ "$output" == *'is running under the selected package'* ]]
   [[ "$("$real_readlink" -f -- "$root/current")" == "$root/releases/v0.2.19" ]]
   [[ "$(< "$scratch/service-state")" == active ]]
+  [[ ! -e "$root/backups/.pending-conversion" ]]
   grep -Fqx 'format=31' "$HARKLIGHT_TEST_MIGRATION_LOG"
   migrated_store_sha="$(sha256sum "$root/state/relay.sqlite3" | cut -d ' ' -f 1)"
   [[ "$migrated_store_sha" != "$expected_store_sha" ]]

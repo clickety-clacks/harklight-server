@@ -20,6 +20,45 @@ defmodule AttentionServer.Store.KeyedMigrationTest do
     assert :ok = Store.close(store)
   end
 
+  test "a killed converter rolls back seeded rows and a restart converts from the original anchor", %{
+    path: path,
+    store: store
+  } do
+    assert {:ok, engine} = Engine.setup_person(store.engine, "reader")
+    assert {:ok, legacy} = Store.commit(store, engine, %{person: "reader", actor: "fixture", action: "seed"})
+    assert {:ok, original} = RecordTable.select(legacy.db, "SELECT version, checksum FROM relay_state")
+    assert :ok = Store.close(legacy)
+
+    parent = self()
+
+    {worker, monitor} =
+      spawn_monitor(fn ->
+        {:ok, legacy} = Store.open(path, :legacy)
+
+        KeyedMigration.convert_store(legacy, fn _store, _engine, _generation ->
+          send(parent, {self(), :readback_complete})
+
+          receive do
+            :continue -> {:ok, :finished}
+          end
+        end)
+      end)
+
+    on_exit(fn -> if Process.alive?(worker), do: Process.exit(worker, :kill) end)
+    assert_receive {^worker, :readback_complete}, 5_000
+    Process.exit(worker, :kill)
+    assert_receive {:DOWN, ^monitor, :process, ^worker, :killed}
+
+    assert {:ok, db} = Sqlite3.open(path)
+    assert {:ok, ^original} = RecordTable.select(db, "SELECT version, checksum FROM relay_state")
+    assert {:ok, []} = RecordTable.select(db, "SELECT name FROM sqlite_schema WHERE name = 'relay_records'")
+    assert :ok = Sqlite3.close(db)
+
+    assert {:ok, converted} = Store.open(path, :keyed_cutover)
+    assert converted.engine.persons == %{"reader" => 0}
+    assert :ok = Store.close(converted)
+  end
+
   test "reads verified keyed records at their current generation", %{store: store} do
     assert {:ok, engine} = Engine.setup_person(store.engine, "reader")
     assert {:ok, 1} = stage_keyed(store.db, engine, RecordCodec.identity())

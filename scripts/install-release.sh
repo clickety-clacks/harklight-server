@@ -25,7 +25,7 @@ archive_name="harklight-server-$release_version-linux-x86_64.tar.gz"
 archive="$HARKLIGHT_ARCHIVE_PATH"
 sums="$HARKLIGHT_CHECKSUMS_PATH"
 guide="$HARKLIGHT_GUIDE_PATH"
-for command in chmod cmp date flock grep ln mkdir mktemp mv python3 readlink rm rmdir sleep systemctl tar; do
+for command in chmod cmp date flock grep ln mkdir mktemp mv python3 readlink rm rmdir sed sleep systemctl tar; do
   command -v "$command" >/dev/null || fail "required host command is unavailable"
 done
 
@@ -84,6 +84,9 @@ was_active=0
 switched=0
 staging=""
 backup_tmp=""
+backup_final=""
+pending_tmp=""
+pending_backup="$root/backups/.pending-conversion"
 restore_tmp=""
 current_link=""
 current_link_target=""
@@ -99,7 +102,8 @@ case "$current_path" in
   *) fail "current release points outside the Harklight releases directory" ;;
 esac
 current_tag="${current_path##*/}"
-[[ "$current_tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || fail "current release tag is invalid"
+release_tag_pattern='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+[[ "$current_tag" =~ $release_tag_pattern ]] || fail "current release tag is invalid"
 [[ -d "$current_path" && -f "$current_path/BUILD_INFO" ]] || fail "current release package is incomplete"
 
 is_newer_version() {
@@ -297,6 +301,7 @@ rollback_failed_upgrade() {
   if ! restore_preinstall_root; then
     fail "upgrade failed: $cause; restoring the pre-install mutable root from the retained backup did not complete; the prior release was not started and the service remains stopped; the current root may be partial, and candidate writes since the backup may be retained or partially lost"
   fi
+  rm -f -- "$pending_backup"
 
   if ! systemctl --user start "$unit"; then
     if ! systemctl --user stop "$unit" || ! service_is_stopped; then
@@ -328,9 +333,11 @@ cleanup() {
   local result=$?
   if [[ -n "$staging" && -d "$staging" ]]; then rm -rf -- "$staging"; fi
   if [[ -n "$backup_tmp" && -d "$backup_tmp" ]]; then rm -rf -- "$backup_tmp"; fi
+  if [[ -n "$pending_tmp" ]]; then rm -f -- "$pending_tmp"; fi
   if [[ -n "$restore_tmp" && -d "$restore_tmp" ]]; then rm -rf -- "$restore_tmp"; fi
   if [[ -n "$current_link" && -L "$current_link" ]]; then rm -f -- "$current_link"; fi
-  if ((was_active && !switched && !previous_resume_attempted)) && service_is_stopped; then
+  if ((was_active && !switched && !previous_resume_attempted)) &&
+    [[ ! -f "$pending_backup" ]] && service_is_stopped; then
     if ! resume_previous; then
       printf 'Previous Harklight service could not be restarted and verified.\n' >&2
     fi
@@ -339,6 +346,34 @@ cleanup() {
 }
 
 trap cleanup EXIT
+
+read_pending_backup() {
+  local backup_name info previous_tag previous_link
+  backup_name="$(< "$pending_backup")"
+  [[ "$backup_name" =~ ^[0-9]{8}T[0-9]{6}Z-[a-zA-Z0-9.-]+$ ]] || return 1
+  backup_final="$root/backups/$backup_name"
+  info="$backup_final/INSTALL_INFO"
+  [[ -f "$backup_final/private-root.tar" && -f "$info" ]] || return 1
+  grep -Fqx "to=$HARKLIGHT_RELEASE_TAG" "$info" || return 1
+  grep -Fqx "source_commit=$HARKLIGHT_SOURCE_COMMIT" "$info" || return 1
+  grep -Fqx "archive_sha256=$HARKLIGHT_ARCHIVE_SHA256" "$info" || return 1
+
+  previous_tag="$(sed -n 's/^from=//p' "$info")"
+  previous_link="$(sed -n 's/^from_link=//p' "$info")"
+  [[ "$previous_tag" =~ $release_tag_pattern && -n "$previous_link" ]] || return 1
+  [[ -f "$releases/$previous_tag/BUILD_INFO" ]] || return 1
+  [[ "$current_tag" == "$previous_tag" || "$current_tag" == "$HARKLIGHT_RELEASE_TAG" ]] || return 1
+
+  if [[ "$current_tag" == "$HARKLIGHT_RELEASE_TAG" ]]; then switched=1; fi
+  current_tag="$previous_tag"
+  current_path="$releases/$previous_tag"
+  current_link_target="$previous_link"
+}
+
+if [[ -f "$pending_backup" ]]; then
+  read_pending_backup ||
+    fail "an interrupted conversion has a retained backup for a different or incomplete release; retry the original verified release or restore its backup"
+fi
 
 if [[ -e "$target" ]]; then
   install_info_matches "$target" || fail "bytes for an existing release tag cannot be replaced"
@@ -375,7 +410,8 @@ EOF
   staging=""
 fi
 
-if [[ "$current_tag" == "$HARKLIGHT_RELEASE_TAG" ]] && install_info_matches "$target"; then
+if [[ -z "$backup_final" && "$current_tag" == "$HARKLIGHT_RELEASE_TAG" ]] &&
+  install_info_matches "$target"; then
   if systemctl --user is-active --quiet "$unit"; then
     ready=0
     for _ in {1..30}; do
@@ -420,6 +456,15 @@ if [[ "$current_tag" == "$HARKLIGHT_RELEASE_TAG" ]] && install_info_matches "$ta
   exit 0
 fi
 
+if ((switched)) && package_process_ready "$target"; then
+  rm -f -- "$pending_backup"
+  warn_unavailable_owner_route "$target"
+  printf 'Harklight release tuple %s@%s source=%s archive_sha256=%s resumed under the selected package.\n' \
+    'clickety-clacks/harklight-server' "$HARKLIGHT_RELEASE_TAG" "$HARKLIGHT_SOURCE_COMMIT" "$HARKLIGHT_ARCHIVE_SHA256"
+  printf 'State backup retained.\n'
+  exit 0
+fi
+
 initial_service_state="$(systemctl --user show --property=ActiveState --value "$unit" 2>/dev/null)" ||
   fail "server service state is unavailable; release was not switched"
 initial_service_pid="$(systemctl --user show --property=MainPID --value "$unit" 2>/dev/null)" ||
@@ -434,43 +479,55 @@ if ! systemctl --user stop "$unit" || ! service_is_stopped; then
   fail "server service stop was not confirmed; release was not switched; service state: $(service_condition)"
 fi
 
-backup_tmp="$(mktemp -d "$root/backups/.harklight-backup.XXXXXX")"
-backup_id="${backup_tmp##*.}"
-backup_final="$root/backups/$(date -u +%Y%m%dT%H%M%SZ)-$current_tag-to-$HARKLIGHT_RELEASE_TAG-$backup_id"
-if ! tar --exclude='./releases' --exclude='./backups' --exclude='./.release-install.lock' \
-  -cf "$backup_tmp/private-root.tar" -C "$root" .; then
-  rm -rf -- "$backup_tmp"
-  backup_tmp=""
-  if ((was_active)) && ! resume_previous; then
-    fail "full backup failed and previous service restart is unconfirmed; service state: $(service_condition)"
-  fi
-  fail "full private state backup failed; release was not switched"
-fi
-chmod 600 "$backup_tmp/private-root.tar"
-cat >"$backup_tmp/INSTALL_INFO" <<EOF
-from=$current_tag
-to=$HARKLIGHT_RELEASE_TAG
-source_commit=$HARKLIGHT_SOURCE_COMMIT
-archive_sha256=$HARKLIGHT_ARCHIVE_SHA256
-EOF
-chmod 600 "$backup_tmp/INSTALL_INFO"
-mv -- "$backup_tmp" "$backup_final"
-backup_tmp=""
-
 if ! grep -Fqx "version=${current_tag#v}" "$current_path/BUILD_INFO"; then
   fail "previous release metadata differs from its selected version; release was not switched"
 fi
 
-if ! ATTENTION_SERVER_ENABLE=0 "$target/bin/harklight" store convert-stopped \
-  "$state/relay.sqlite3" --from-release "$current_tag"; then
-  rollback_failed_upgrade "stopped-store FORMAT31 conversion failed"
+if [[ -z "$backup_final" ]]; then
+  backup_tmp="$(mktemp -d "$root/backups/.harklight-backup.XXXXXX")"
+  backup_id="${backup_tmp##*.}"
+  backup_final="$root/backups/$(date -u +%Y%m%dT%H%M%SZ)-$current_tag-to-$HARKLIGHT_RELEASE_TAG-$backup_id"
+  if ! tar --exclude='./releases' --exclude='./backups' --exclude='./.release-install.lock' \
+    -cf "$backup_tmp/private-root.tar" -C "$root" .; then
+    rm -rf -- "$backup_tmp"
+    backup_tmp=""
+    if ((was_active)) && ! resume_previous; then
+      fail "full backup failed and previous service restart is unconfirmed; service state: $(service_condition)"
+    fi
+    fail "full private state backup failed; release was not switched"
+  fi
+  chmod 600 "$backup_tmp/private-root.tar"
+  cat >"$backup_tmp/INSTALL_INFO" <<EOF
+from=$current_tag
+from_link=$current_link_target
+to=$HARKLIGHT_RELEASE_TAG
+source_commit=$HARKLIGHT_SOURCE_COMMIT
+archive_sha256=$HARKLIGHT_ARCHIVE_SHA256
+EOF
+  chmod 600 "$backup_tmp/INSTALL_INFO"
+  mv -- "$backup_tmp" "$backup_final"
+  backup_tmp=""
+
+  # The previous release cannot read a converted store. Persist the original
+  # archive before conversion so an interrupted install can still restore it.
+  pending_tmp="$(mktemp "$root/backups/.pending-conversion.XXXXXX")"
+  printf '%s\n' "${backup_final##*/}" > "$pending_tmp"
+  mv -Tf -- "$pending_tmp" "$pending_backup"
+  pending_tmp=""
 fi
 
-current_link="$root/.current-$HARKLIGHT_RELEASE_TAG.$$"
-ln -s "releases/$HARKLIGHT_RELEASE_TAG" "$current_link"
-mv -Tf -- "$current_link" "$root/current"
-current_link=""
-switched=1
+if ((!switched)); then
+  if ! ATTENTION_SERVER_ENABLE=0 "$target/bin/harklight" store convert-stopped \
+    "$state/relay.sqlite3" --from-release "$current_tag"; then
+    rollback_failed_upgrade "stopped-store FORMAT31 conversion failed"
+  fi
+
+  current_link="$root/.current-$HARKLIGHT_RELEASE_TAG.$$"
+  ln -s "releases/$HARKLIGHT_RELEASE_TAG" "$current_link"
+  mv -Tf -- "$current_link" "$root/current"
+  current_link=""
+  switched=1
+fi
 
 if ! systemctl --user start "$unit"; then
   rollback_failed_upgrade "candidate start failed"
@@ -488,6 +545,7 @@ if ((ready == 0)); then
   rollback_failed_upgrade "candidate process did not become active under the selected package within 30 seconds"
 fi
 
+rm -f -- "$pending_backup"
 warn_unavailable_owner_route "$target"
 
 printf 'Harklight release tuple %s@%s source=%s archive_sha256=%s is running under the selected package.\n' \
