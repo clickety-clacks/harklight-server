@@ -325,71 +325,6 @@ defmodule AttentionServer.GuidedJoinTest do
     Store.close(stored)
   end
 
-  test "existing owner, sender and manual request survive migration without gaining invite authority",
-       c do
-    path = database_path()
-    {:ok, relay} = Relay.start_link(store_path: path)
-    {:ok, person} = Relay.operator_bootstrap(relay, c.owner)
-    {:ok, pending} = Relay.pending_enroll(relay, c.device, "existing sender")
-
-    {:ok, _} =
-      Relay.owner_pending_approve(
-        relay,
-        person,
-        c.owner_key,
-        pending.approval_code,
-        c.device_key,
-        pending.expires_at,
-        ["app:keep"]
-      )
-
-    {:ok, manual} =
-      Relay.pending_enroll(relay, TLSFixtures.certificate_der!(c.certs, "unknown"), "manual")
-
-    before = :sys.get_state(relay).store.engine
-    GenServer.stop(relay)
-    old = Map.delete(before, :join_invitations)
-    payload = :erlang.term_to_binary({:attention_relay_state, 11, old}, [{:compressed, 6}])
-    {:ok, db} = Exqlite.Sqlite3.open(path)
-
-    {:ok, stmt} =
-      Exqlite.Sqlite3.prepare(db, "UPDATE relay_state SET payload = ?, checksum = ? WHERE id = 1")
-
-    :ok = Exqlite.Sqlite3.bind(stmt, [{:blob, payload}, {:blob, :crypto.hash(:sha256, payload)}])
-    :done = Exqlite.Sqlite3.step(db, stmt)
-    :ok = Exqlite.Sqlite3.release(db, stmt)
-    :ok = Exqlite.Sqlite3.close(db)
-    {:ok, migrated} = Store.open(path)
-    assert migrated.engine.owners == before.owners
-    assert migrated.engine.devices == before.devices
-    assert migrated.engine.sender_grants == before.sender_grants
-
-    assert migrated.engine.pending_enrollments ==
-             Map.new(before.pending_enrollments, fn {code, item} ->
-               {code, Map.put_new(item, :joined, false)}
-             end)
-
-    assert migrated.engine.pending_history == before.pending_history
-    assert migrated.engine.join_invitations == %{}
-
-    assert {:ok, %{"state" => "pending"}} =
-             Engine.pending_status(
-               migrated.engine,
-               :crypto.hash(:sha256, Base.decode16!(manual.status_secret, case: :lower))
-             )
-
-    assert {:ok, _, _} =
-             GuidedJoin.create(
-               migrated.engine,
-               person,
-               c.owner_key,
-               c.token_hash,
-               c.config
-             )
-
-    Store.close(migrated)
-  end
-
   test "approved device label and enrollment time outlive retry and revocation",
        c do
     {:ok, engine, _} = create(c)
@@ -449,36 +384,6 @@ defmodule AttentionServer.GuidedJoinTest do
     {:ok, reloaded} = Store.open(path)
     assert reloaded.engine.devices[key] == removed.devices[key]
     Store.close(reloaded)
-  end
-
-  test "legacy devices migrate to unknown metadata without inventing or changing authority", c do
-    path = database_path()
-    {:ok, engine} = Engine.setup_device(c.engine, @person, c.device_key)
-    old_record = Map.drop(engine.devices[c.device_key], [:label, :enrolled_at])
-    legacy = %{engine | devices: %{c.device_key => old_record}}
-    {:ok, store} = Store.open(path)
-    Store.close(store)
-    payload = :erlang.term_to_binary({:attention_relay_state, 12, legacy}, [{:compressed, 6}])
-    {:ok, db} = Exqlite.Sqlite3.open(path)
-
-    {:ok, stmt} =
-      Exqlite.Sqlite3.prepare(db, "UPDATE relay_state SET payload = ?, checksum = ? WHERE id = 1")
-
-    :ok = Exqlite.Sqlite3.bind(stmt, [{:blob, payload}, {:blob, :crypto.hash(:sha256, payload)}])
-    :done = Exqlite.Sqlite3.step(db, stmt)
-    :ok = Exqlite.Sqlite3.release(db, stmt)
-    :ok = Exqlite.Sqlite3.close(db)
-    {:ok, migrated} = Store.open(path)
-    record = migrated.engine.devices[c.device_key]
-    assert record.label == nil
-    assert record.enrolled_at == nil
-    assert Map.drop(record, [:label, :enrolled_at]) == old_record
-    assert migrated.engine.owners == legacy.owners
-    assert migrated.engine.sender_grants == legacy.sender_grants
-    Store.close(migrated)
-    {:ok, restarted} = Store.open(path)
-    assert restarted.engine.devices[c.device_key] == record
-    Store.close(restarted)
   end
 
   test "device metadata is validated on durable snapshot acceptance, with no label length cap", c do

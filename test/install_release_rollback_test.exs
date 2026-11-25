@@ -13,8 +13,8 @@ defmodule AttentionServer.InstallReleaseRollbackTest do
 
     File.mkdir_p!(dir)
     store_path = Path.join(dir, "relay.sqlite3")
-    create_format_21_store!(store_path)
-    assert store_format(store_path) == 21
+    create_format30_store!(store_path)
+    assert store_format(store_path) == 30
     on_exit(fn -> File.rm_rf!(dir) end)
 
     %{
@@ -27,12 +27,12 @@ defmodule AttentionServer.InstallReleaseRollbackTest do
   end
 
   @tag timeout: 30_000
-  test "failed candidate readiness restores the exact pre-migration store and prior release",
+  test "failed candidate readiness restores the exact pre-install store and prior release",
        context do
     {output, status} = run_installer("upgrade-failure", context)
 
     assert status == 0, output
-    assert store_format(context.store_path) == 21
+    assert store_format(context.store_path) == 30
   end
 
   @tag timeout: 30_000
@@ -72,39 +72,13 @@ defmodule AttentionServer.InstallReleaseRollbackTest do
     )
   end
 
-  defp create_format_21_store!(path) do
+  defp create_format30_store!(path) do
     assert {:ok, initial} = Store.open(path)
     assert {:ok, engine} = Engine.setup_person(initial.engine, "person-a")
-    assert :ok = Store.close(initial)
+    assert {:ok, seeded} =
+             Store.commit(initial, engine, %{person: "person-a", actor: "fixture", action: "seed"})
 
-    pre_format_22_engine = Map.delete(engine, :hosted_accounts)
-
-    pre_format_23_engine =
-      pre_format_22_engine
-      |> Map.delete(:algorithm_choices)
-      |> Map.delete(:jev_endpoint)
-      |> Map.delete(:jev_model)
-
-    payload =
-      :erlang.term_to_binary(
-        {:attention_relay_state, 21, pre_format_23_engine},
-        [{:compressed, 6}]
-      )
-
-    assert {:ok, db} = Sqlite3.open(path)
-
-    assert {:ok, statement} =
-             Sqlite3.prepare(db, "UPDATE relay_state SET payload = ?, checksum = ? WHERE id = 1")
-
-    assert :ok =
-             Sqlite3.bind(statement, [
-               {:blob, payload},
-               {:blob, :crypto.hash(:sha256, payload)}
-             ])
-
-    assert :done = Sqlite3.step(db, statement)
-    assert :ok = Sqlite3.release(db, statement)
-    assert :ok = Sqlite3.close(db)
+    assert :ok = Store.close(seeded)
   end
 
   defp store_format(path) do

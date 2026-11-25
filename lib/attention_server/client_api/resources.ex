@@ -1037,8 +1037,11 @@ defmodule AttentionServer.ClientAPI.Resources do
           []
 
         %{"author" => "person"} = entry ->
+          delivery =
+            put_present(person_delivery(marks), "receipt_expected", payload["receipt_expected"])
+
           entry
-          |> Map.put("delivery", person_delivery(marks))
+          |> Map.put("delivery", delivery)
           |> Map.put(@sources, Enum.sort([seq | folded_seqs]))
           |> List.wrap()
 
@@ -1145,18 +1148,12 @@ defmodule AttentionServer.ClientAPI.Resources do
     receipt = Map.get(marks, :receipt, %{})
     capability = Map.get(marks, :capability, %{})
 
-    delivery =
-      marks
-      |> Map.take(~w(delivered acted agent_acted))
-      |> Map.put_new("delivered", false)
-      |> Map.put_new("acted", false)
-      |> Map.merge(receipt)
-      |> Map.merge(capability)
-
-    if delivery["delivered"] and not Map.has_key?(marks, :new_service) and
-         not Map.has_key?(delivery, "ack2_expected") and not Map.has_key?(delivery, "outcome"),
-       do: Map.put(delivery, "legacy_caption", true),
-       else: delivery
+    marks
+    |> Map.take(~w(delivered acted agent_acted))
+    |> Map.put_new("delivered", false)
+    |> Map.put_new("acted", false)
+    |> Map.merge(receipt)
+    |> Map.merge(capability)
   end
 
   defp delivery_effect(%{"kind" => "receipt", "delivered" => true, "event_id" => id}, _, _, _),
@@ -1172,7 +1169,7 @@ defmodule AttentionServer.ClientAPI.Resources do
       case ack do
         %{"r25_served" => true} ->
           capability = Map.take(ack, ~w(ack2_expected listener_received))
-          %{"delivered" => true, :new_service => true, :capability => capability}
+          %{"delivered" => true, :capability => capability}
 
         %{"ack2_expected" => true} ->
           %{"delivered" => true, :capability => %{"ack2_expected" => true}}

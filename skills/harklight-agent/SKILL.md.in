@@ -115,11 +115,9 @@ unknown status handle as unresolved until the owner reconciles it. This
 headless enrollment procedure is distinct from the native app's guided device
 joining.
 
-Use the `harklight-agent` CLI for agent messages and their replies, with the
-originating enrolled identity and journal. There is no device-send or receipt
-fallback. If the originating session cannot keep a listener, use the one-shot
-`read --session HANDLE` procedure in the shared core when the originating work
-resumes. Serving a person turn or answer records it as Delivered on the server;
+Use the `harklight-agent` CLI for agent messages and replies, with the enrolled
+device identity and its journal. If the agent session cannot keep a listener,
+run `read --session HANDLE` once when that work resumes. Serving a person turn or answer records it as Delivered on the server;
 the handoff receipt is a separate `receipt` command.
 
 For a direct sent-message lookup, Agent 0.2.0 supports
@@ -134,6 +132,5 @@ with its cursor before advancing that cursor; there is no ACK.
 `device respond --sender ID --message-id ID --answer answer.json` deliberately
 submits an answer object (at most one of `choice`, `comment` or `result`, or
 `{}` for no comment) to a message already stored by the server, saving its exact
-body and `Idempotency-Key` before sending. These commands do not create new
-messages or retrieve an origin receipt. Use the separate `harklight-agent` CLI
-for new agent messages and replies.
+body and `Idempotency-Key` before sending. Use the separate `harklight-agent` CLI
+to send new messages, read replies, and record handoff receipts.

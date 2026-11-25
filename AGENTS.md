@@ -29,12 +29,6 @@ Their authors reconcile and retarget them without resetting, stashing or
 discarding someone else's work. Do not delete an existing branch until its
 remaining work has an accepted home.
 
-The existing `release/0.1.35.x` branch is temporarily retained only for emergency
-repairs to the currently installed release. An urgent repair may land there
-first and be ported promptly to `main`; the transition must not delay it. Retire
-that branch once `main` contains its fixes and the operator can move to a release
-from `main`. This exception does not authorize new feature work on maintenance.
-
 ## Large features behind a feature flag
 
 A feature too large for one short-lived PR lands in small reviewed slices with
@@ -98,9 +92,8 @@ publishing need no additional human approval. Fix a bad release on `main` and
 ship a new release; do not patch a deployment by hand.
 
 End every release's notes with a **Compatibility** paragraph. Name the protocol
-version (0.1 or 0.2) and list the verified compatible versions of Harklight
-Server, the app, the web client, and Harklight Agent. For releases using
-protocol 0.1, state that protocol 0.2 supersedes it.
+version and list the verified compatible versions of Harklight Server, the
+app, the web client, and Harklight Agent.
 
 The intended process is CI publishing releases, but this repository currently
 has no automatic release-building or publishing workflow. Implementing that

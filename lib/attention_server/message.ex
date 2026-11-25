@@ -140,6 +140,18 @@ defmodule AttentionServer.Message do
 
   def progress_message?(_), do: false
 
+  @doc false
+  def type_seen_only(%{
+        "answer_ui" => %{
+          "schema" => @actions_schema,
+          "actions" => [%{"id" => "seen", "kind" => "value", "value" => value}]
+        }
+      } = message)
+      when not is_nil(value),
+      do: Map.put_new(message, "message_type", "fyi")
+
+  def type_seen_only(message), do: message
+
   defp validate_fyi(message) do
     if Map.get(message, "answer_ui") == @seen_descriptor do
       :ok

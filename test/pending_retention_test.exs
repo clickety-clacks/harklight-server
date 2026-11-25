@@ -1,8 +1,7 @@
 defmodule AttentionServer.PendingRetentionTest do
   use ExUnit.Case, async: false
 
-  alias AttentionServer.{Engine, Relay, Store, TLSFixtures}
-  alias Exqlite.Sqlite3
+  alias AttentionServer.{Relay, TLSFixtures}
 
   setup_all do
     certs = TLSFixtures.create!()
@@ -71,70 +70,6 @@ defmodule AttentionServer.PendingRetentionTest do
              Relay.pending_status(restarted, request.status_secret)
   end
 
-  test "format-six snapshot migrates its stored pending deadlines once", %{certs: certs} do
-    path = temp_path("migration")
-    {:ok, store} = Store.open(path)
-    assert :ok = Store.close(store)
-
-    certificate = TLSFixtures.certificate_der!(certs, "a2")
-
-    {:ok, pending} =
-      Engine.pending_enroll(
-        store.engine,
-        certificate,
-        "old pending",
-        code(77),
-        secret_hash(77)
-      )
-
-    old_item =
-      pending.pending_enrollments[code(77)]
-      |> Map.put(:expires_at, 86_400_001)
-      |> Map.delete(:status_expires_at)
-    old_pending = %{pending | pending_enrollments: %{code(77) => old_item}}
-
-    payload =
-      :erlang.term_to_binary({:attention_relay_state, 6, old_pending}, [{:compressed, 6}])
-
-    assert {:ok, db} = Sqlite3.open(path)
-
-    assert {:ok, statement} =
-             Sqlite3.prepare(db, "UPDATE relay_state SET payload = ?, checksum = ?")
-
-    assert :ok =
-             Sqlite3.bind(statement, [{:blob, payload}, {:blob, :crypto.hash(:sha256, payload)}])
-
-    assert :done = Sqlite3.step(db, statement)
-    assert :ok = Sqlite3.release(db, statement)
-    assert :ok = Sqlite3.close(db)
-
-    assert {:ok, migrated} = Store.open(path)
-    assert migrated.engine.pending_history == %{}
-
-    assert migrated.engine.pending_enrollments[code(77)].status_expires_at ==
-             old_item.expires_at + 86_400_000
-
-    assert migrated.version == store.version + 1
-    assert :ok = Store.close(migrated)
-    assert {:ok, again} = Store.open(path)
-    assert again.version == migrated.version
-    assert :ok = Store.close(again)
-
-    assert {:ok, db} = Sqlite3.open(path)
-
-    assert {:ok, statement} =
-             Sqlite3.prepare(
-               db,
-               "SELECT actor_id, action FROM relay_audit ORDER BY id DESC LIMIT 1"
-             )
-
-    assert {:row, ["schema_migration", "pending_v8_readback_init"]} = Sqlite3.step(db, statement)
-    assert :ok = Sqlite3.release(db, statement)
-    assert :ok = Sqlite3.close(db)
-  end
-
-  defp code(index), do: Base.encode32(<<index::40>>, padding: false) <> "AA"
-  defp secret_hash(index), do: :crypto.hash(:sha256, <<index::32>>)
 
   defp temp_path(label) do
     dir = Path.join(System.tmp_dir!(), "attention-#{label}-#{System.unique_integer([:positive])}")

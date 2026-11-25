@@ -9,9 +9,6 @@ defmodule AttentionServer.HeadlessDevice do
   a fresh snapshot. `respond` resolves `--sender`/`--message-id` to the item
   delivered to this device, stores the exact answer body with a fresh
   `Idempotency-Key`, and only then sends `POST /v2/items/{item_id}/answer`.
-
-  Files a protocol 0.1 tool left in the directory (`cursor.json`, `events/`,
-  and `operations/` entries without the `v2-` prefix) are never read.
   """
 
   import Bitwise

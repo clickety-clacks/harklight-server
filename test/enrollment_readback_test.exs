@@ -306,14 +306,11 @@ defmodule AttentionServer.EnrollmentReadbackTest do
     GenServer.stop(normal)
   end
 
-  test "legacy retained enrollment records get one durable attributable revision migration", %{
+  test "FORMAT30 rejects devices and agents missing their enrollment revision", %{
     relay: relay,
     path: path
   } do
-    agent_id = uuid(30)
-    agent_key = key("e")
-    assert :ok = Relay.setup_agent_fixture(relay, "A", agent_id, agent_key, ["app:test"])
-    assert :ok = Relay.revoke_agent_fixture(relay, agent_key)
+    assert :ok = Relay.setup_agent_fixture(relay, "A", uuid(30), key("e"), ["app:test"])
     before = :sys.get_state(relay).store
     GenServer.stop(relay)
 
@@ -329,42 +326,7 @@ defmodule AttentionServer.EnrollmentReadbackTest do
           end)
     }
 
-    payload = :erlang.term_to_binary({:attention_relay_state, 2, old}, [{:compressed, 6}])
-    assert {:ok, db} = Sqlite3.open(path)
-
-    assert {:ok, stmt} =
-             Sqlite3.prepare(db, "UPDATE relay_state SET payload = ?, checksum = ? WHERE id = 1")
-
-    assert :ok = Sqlite3.bind(stmt, [{:blob, payload}, {:blob, :crypto.hash(:sha256, payload)}])
-    assert :done = Sqlite3.step(db, stmt)
-    assert :ok = Sqlite3.release(db, stmt)
-    assert :ok = Sqlite3.close(db)
-
-    assert {:ok, migrated} = Store.open(path)
-    assert migrated.version == before.version + 1
-    assert migrated.engine.devices[key("a")].enrollment_revision == 1
-    assert migrated.engine.agents[agent_key].revoked == true
-    assert migrated.engine.agents[agent_key].enrollment_revision == 1
-    assert :ok = Store.close(migrated)
-
-    assert {:ok, again} = Store.open(path)
-    assert again.version == migrated.version
-    assert :ok = Store.close(again)
-
-    assert {:ok, db} = Sqlite3.open(path)
-
-    assert {:ok, stmt} =
-             Sqlite3.prepare(
-               db,
-               "SELECT actor_id, action FROM relay_audit ORDER BY id DESC LIMIT 1"
-             )
-
-    assert {:row, ["schema_migration", "enrollment_revision_init"]} = Sqlite3.step(db, stmt)
-    assert :ok = Sqlite3.release(db, stmt)
-    assert :ok = Sqlite3.close(db)
-
-    # A current-format snapshot must not silently repair a missing revision.
-    malformed = :erlang.term_to_binary({:attention_relay_state, 3, old}, [{:compressed, 6}])
+    malformed = :erlang.term_to_binary({:attention_relay_state, 30, old}, [{:compressed, 6}])
     assert {:ok, db} = Sqlite3.open(path)
 
     assert {:ok, stmt} =

@@ -115,7 +115,7 @@ defmodule AttentionServer.ClientAPIDefaultStartupTest do
 
       store = :sys.get_state(ctx.relay).store
       assert store.change_log
-      assert store.mode == :legacy
+      assert store.mode == :snapshot
 
       response = get(ctx, "b1", "/v2/inbox")
       assert response.status == 200

@@ -1,10 +1,10 @@
-alias AttentionServer.Store
+alias AttentionServer.Relay
 alias Exqlite.Sqlite3
 
 {:ok, _started} = Application.ensure_all_started(:crypto)
 path = Path.join(System.fetch_env!("HARKLIGHT_TEST_ROOT"), "state/relay.sqlite3")
-{:ok, store} = Store.open(path)
-:ok = Store.close(store)
+{:ok, relay} = Relay.start_link(store_path: path)
+:ok = GenServer.stop(relay)
 
 {:ok, db} = Sqlite3.open(path)
 {:ok, statement} = Sqlite3.prepare(db, "SELECT payload FROM relay_state WHERE id = 1")

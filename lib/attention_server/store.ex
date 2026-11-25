@@ -26,6 +26,7 @@ defmodule AttentionServer.Store do
   alias Exqlite.Sqlite3
 
   alias AttentionServer.Store.{
+    ClientDataMigration,
     KeyedMigration,
     KeyedReference,
     KeyedValidation,
@@ -36,6 +37,7 @@ defmodule AttentionServer.Store do
   }
 
   @format_version 30
+  @client_data_migration "retained_client_data_v1"
   # `large_base` is the durable engine of the last snapshot commit,
   # `large_persisted` its persisted form and `large_index` its large-data
   # reference rows. A commit reuses them for every unchanged subterm.
@@ -47,7 +49,7 @@ defmodule AttentionServer.Store do
     :large_base,
     :large_persisted,
     :large_index,
-    mode: :legacy,
+    mode: :snapshot,
     source_bindings: %{},
     upload_links: %{},
     authority_index: %{},
@@ -63,6 +65,9 @@ defmodule AttentionServer.Store do
   @progress_fields [:cursors, :conversation_cursors, :conversation_opened]
 
   @schema """
+  CREATE TABLE IF NOT EXISTS relay_data_migrations (
+    name TEXT PRIMARY KEY NOT NULL
+  );
   CREATE TABLE IF NOT EXISTS relay_device_progress (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     snapshot_version INTEGER NOT NULL,
@@ -154,8 +159,6 @@ defmodule AttentionServer.Store do
   );
   """
 
-  def open(nil), do: {:ok, %__MODULE__{db: nil, engine: Engine.new(), version: 0}}
-
   @doc """
   Turns on the client API v2 change log for this durable store: creates its
   tables, reconciles it with the snapshot, and from then on writes its rows in
@@ -173,12 +176,43 @@ defmodule AttentionServer.Store do
     end
   end
 
+  @doc false
+  def migrate_retained_client_data(%__MODULE__{mode: :snapshot, change_log: true} = store) do
+    case one(store.db, "SELECT name FROM relay_data_migrations WHERE name = ?", [
+           @client_data_migration
+         ]) do
+      {:ok, [@client_data_migration]} ->
+        {:ok, store}
+
+      {:ok, nil} ->
+        engine = ClientDataMigration.prepare(store.engine)
+
+        if engine == store.engine do
+          with :ok <- record_data_migration(store.db, @client_data_migration), do: {:ok, store}
+        else
+          audit = %{person: "system", actor: "schema_migration", action: @client_data_migration}
+
+          case commit(store, engine, audit) do
+            {:ok, migrated} -> {:ok, migrated}
+            {:error, reason, _} -> {:error, reason}
+          end
+        end
+
+      error ->
+        error
+    end
+  end
+
+  def migrate_retained_client_data(%__MODULE__{}), do: {:error, :storage_unavailable}
+
+  def open(nil), do: {:ok, %__MODULE__{db: nil, engine: Engine.new(), version: 0}}
+
   def open(":memory:") do
     Diagnostics.failure(:server_storage, :store_open, :invalid_store_path, :unavailable)
     {:error, :invalid_store_path}
   end
 
-  def open(path) when is_binary(path) and path != "", do: open(path, :legacy)
+  def open(path) when is_binary(path) and path != "", do: open(path, :snapshot)
 
   def open(_) do
     Diagnostics.failure(:server_storage, :store_open, :invalid_store_path, :unavailable)
@@ -191,9 +225,9 @@ defmodule AttentionServer.Store do
       {:ok, :keyed} ->
         open(path, :keyed)
 
-      {:ok, :legacy} ->
-        with {:ok, legacy} <- open_store(path, :legacy),
-             {:ok, keyed} <- convert_legacy_store(legacy) do
+      {:ok, :snapshot} ->
+        with {:ok, snapshot} <- open_store(path, :snapshot),
+             {:ok, keyed} <- convert_snapshot_store(snapshot) do
           finish_open(keyed)
         end
 
@@ -202,7 +236,7 @@ defmodule AttentionServer.Store do
     end
   end
 
-  def open(path, mode) when is_binary(path) and path != "" and mode in [:legacy, :keyed] do
+  def open(path, mode) when is_binary(path) and path != "" and mode in [:snapshot, :keyed] do
     with {:ok, store} <- open_store(path, mode), do: finish_open(store)
   end
 
@@ -249,7 +283,7 @@ defmodule AttentionServer.Store do
                []
              ) do
           {:ok, [1]} -> {:ok, :keyed}
-          {:ok, nil} -> {:ok, :legacy}
+          {:ok, nil} -> {:ok, :snapshot}
           error -> error
         end
       after
@@ -258,18 +292,18 @@ defmodule AttentionServer.Store do
     end
   end
 
-  defp convert_legacy_store(legacy) do
-    case KeyedMigration.convert_store(legacy, &prepare_keyed_conversion/3) do
+  defp convert_snapshot_store(snapshot) do
+    case KeyedMigration.convert_store(snapshot, &prepare_keyed_conversion/3) do
       {:ok, _} = converted ->
         converted
 
       error ->
-        _ = close(legacy)
+        _ = close(snapshot)
         error
     end
   catch
     kind, reason ->
-      _ = close(legacy)
+      _ = close(snapshot)
       :erlang.raise(kind, reason, __STACKTRACE__)
   end
 
@@ -370,7 +404,7 @@ defmodule AttentionServer.Store do
      }}
   end
 
-  defp finalize_mode(%__MODULE__{mode: :legacy} = store) do
+  defp finalize_mode(%__MODULE__{mode: :snapshot} = store) do
     with {:ok, store} <- load_progress(store) do
       persisted = LargeData.persist_refs(store.engine)
 
@@ -830,7 +864,7 @@ defmodule AttentionServer.Store do
     discard_inbox_snapshots_matching(db, "device_id LIKE 'browser:%'", [])
   end
 
-  defp initialize(db, upload_dir, :legacy) do
+  defp initialize(db, upload_dir, :snapshot) do
     with :ok <- set_durability(db),
          :ok <- Sqlite3.execute(db, @schema) do
       load_or_create(db, upload_dir)
@@ -1919,10 +1953,19 @@ defmodule AttentionServer.Store do
              [audit.person, audit.actor, audit.action, System.system_time(:millisecond)]
            ),
          {:ok, heads, agent_heads} <- append_change_logs(db, log, version + 1),
+         :ok <- record_snapshot_migration(db, audit),
          :ok <- Sqlite3.execute(db, "COMMIT") do
       {:ok, heads, agent_heads}
     end
   end
+
+  defp record_snapshot_migration(db, %{actor: "schema_migration", action: @client_data_migration}),
+    do: record_data_migration(db, @client_data_migration)
+
+  defp record_snapshot_migration(_db, _audit), do: :ok
+
+  defp record_data_migration(db, name),
+    do: run(db, "INSERT OR IGNORE INTO relay_data_migrations (name) VALUES (?)", [name])
 
   defp append_change_logs(_db, nil, _version), do: {:ok, %{}, %{}}
 
@@ -2099,205 +2142,13 @@ defmodule AttentionServer.Store do
 
             case :erlang.binary_to_term(payload, [:safe]) do
               {:attention_relay_keyed_state, 30, _identity} ->
-                Logger.error(
-                  "Harklight Store uses FORMAT30. To run Harklight 0.1.x, restore the pre-upgrade backup."
-                )
-
                 {:error, :format30_requires_keyed_mode}
 
-              {:attention_relay_state, format, %Engine{} = stored}
-              when format in [
-                     1,
-                     2,
-                     3,
-                     4,
-                     5,
-                     6,
-                     8,
-                     9,
-                     10,
-                     11,
-                     12,
-                     13,
-                     14,
-                     15,
-                     16,
-                     17,
-                     18,
-                     19,
-                     20,
-                     21,
-                     22,
-                     23,
-                     24,
-                     25,
-                     26,
-                     27,
-                     28,
-                     29,
-                     @format_version
-                   ] ->
-                original = struct(Engine, Map.from_struct(stored))
+              {:attention_relay_state, @format_version, %Engine{} = stored} ->
+                load_format30(db, version, stored)
 
-                # A FORMAT27 store can have newer durable ACKs in the progress
-                # table. Load them before normalization advances the snapshot
-                # generation, and fold them into that same migration transaction.
-                with {:ok, original_store} <-
-                       load_progress(%__MODULE__{
-                         db: db,
-                         engine: original,
-                         version: version,
-                         upload_dir: upload_dir
-                       }) do
-                  original = original_store.engine
-
-                  engine =
-                    original
-                    |> then(fn state ->
-                      if format < 3, do: normalize_enrollments(state), else: state
-                    end)
-                    |> then(fn state ->
-                      if format < 8, do: normalize_pending_v8(state), else: state
-                    end)
-                    |> then(fn state ->
-                      if format < 9, do: normalize_agents_v9(state), else: state
-                    end)
-                    |> then(fn state ->
-                      if format < 10, do: normalize_push_v10(state), else: state
-                    end)
-                    |> then(fn state ->
-                      if format < 11, do: normalize_push_reasons_v11(state), else: state
-                    end)
-                    |> then(fn state ->
-                      if format < 13, do: normalize_device_metadata(state), else: state
-                    end)
-                    |> then(fn state ->
-                      if format < 15 do
-                        invitations =
-                          Map.new(state.join_invitations, fn {hash, item} ->
-                            {hash, Map.put_new(item, :request_id, nil)}
-                          end)
-
-                        %{state | join_invitations: invitations}
-                      else
-                        state
-                      end
-                    end)
-                    |> then(fn state ->
-                      if format < 16, do: normalize_resumable_pending(state), else: state
-                    end)
-                    |> then(fn state ->
-                      if format < 17, do: normalize_push_presentation(state), else: state
-                    end)
-                    |> then(fn state ->
-                      if format < 19, do: normalize_conversation_push(state), else: state
-                    end)
-                    |> then(fn state ->
-                      if format < 20, do: Map.put(state, :uploads, %{}), else: state
-                    end)
-                    |> then(fn state ->
-                      if format < 21 do
-                        now = System.system_time(:millisecond)
-
-                        uploads =
-                          Map.new(state.uploads, fn {id, upload} ->
-                            {id, Map.put_new(upload, :last_activity_ms, now)}
-                          end)
-
-                        %{state | uploads: uploads}
-                      else
-                        state
-                      end
-                    end)
-                    |> then(fn state ->
-                      if format < 22, do: Map.put(state, :hosted_accounts, %{}), else: state
-                    end)
-                    |> then(fn state ->
-                      if format < 23 do
-                        %{state | algorithm_choices: %{}, jev_endpoint: nil, jev_model: nil}
-                      else
-                        state
-                      end
-                    end)
-                    |> then(fn state ->
-                      if format < 24, do: %{state | chat_read_positions: %{}}, else: state
-                    end)
-                    |> then(fn state ->
-                      if format < 26 do
-                        %{
-                          state
-                          | bounce_levels: %{},
-                            bounce_revisions: %{},
-                            opened_revisions: MapSet.new(),
-                            advisory_feeds: %{}
-                        }
-                      else
-                        state
-                      end
-                    end)
-                    |> then(fn state ->
-                      if format < 28, do: normalize_device_focus_permissions(state), else: state
-                    end)
-                    |> then(fn state ->
-                      if format < 29, do: Map.put(state, :delivery_states, %{}), else: state
-                    end)
-                    |> then(fn state ->
-                      if format < 30, do: Map.put(state, :alert_choices, %{}), else: state
-                    end)
-
-                  engine =
-                    engine
-                    |> BounceDecision.rebuild_indexes()
-                    |> Engine.rebuild_route_b_index()
-
-                  cond do
-                    not valid_state?(engine) ->
-                      {:error, :invalid_state}
-
-                    format == @format_version and
-                        same_state_except_bounce_indexes?(engine, original) ->
-                      {:ok, engine, version}
-
-                    true ->
-                      case commit_durable(
-                             original_store,
-                             engine,
-                             %{
-                               person: "system",
-                               actor: "schema_migration",
-                               action:
-                                 cond do
-                                   format < 3 -> "enrollment_revision_init"
-                                   format < 4 -> "owner_state_init"
-                                   format < 5 -> "pending_state_init"
-                                   format < 6 -> "maintainer_state_init"
-                                   format < 7 -> "pending_v8_readback_init"
-                                   format < 9 -> "agent_authority_init"
-                                   format < 10 -> "push_state_init"
-                                   format < 11 -> "push_reason_sanitize"
-                                   format < 12 -> "join_invitation_init"
-                                   format < 13 -> "device_metadata_init"
-                                   format < 14 -> "browser_sign_in_init"
-                                   format < 15 -> "invitation_request_init"
-                                   format < 16 -> "resumable_pending_init"
-                                   format < 17 -> "push_presentation_init"
-                                   format < 18 -> "conversation_feed_init"
-                                   format < 23 -> "prioritization_init"
-                                   format < 24 -> "chat_read_positions_init"
-                                   format < 26 -> "bounce_state_init"
-                                   format < 27 -> "bounce_schedule_index_init"
-                                   format < 28 -> "device_focus_permissions_init"
-                                   format < 29 -> "hosted_delivery_state_init"
-                                   format < 30 -> "alert_choices_init"
-                                   true -> "state_format"
-                                 end
-                             }
-                           ) do
-                        {:ok, migrated} -> {:ok, migrated.engine, migrated.version}
-                        _ -> {:error, :migration_failed}
-                      end
-                  end
-                end
+              {:attention_relay_state, format, %Engine{}} when is_integer(format) ->
+                {:error, {:unsupported_store_format, format}}
 
               _ ->
                 {:error, :invalid_state}
@@ -2313,6 +2164,21 @@ defmodule AttentionServer.Store do
 
       error ->
         error
+    end
+  end
+
+  defp load_format30(db, version, stored) do
+    original = struct(Engine, Map.from_struct(stored))
+
+    with {:ok, store} <- load_progress(%__MODULE__{db: db, engine: original, version: version}) do
+      engine =
+        store.engine
+        |> BrowserSignIn.normalize_snapshot_records()
+        |> BounceDecision.rebuild_indexes()
+        |> Engine.rebuild_route_b_index()
+
+      # The next successful snapshot write persists the current token shape.
+      if valid_state?(engine), do: {:ok, engine, version}, else: {:error, :invalid_state}
     end
   end
 
@@ -2507,204 +2373,7 @@ defmodule AttentionServer.Store do
     ])
   end
 
-  defp normalize_enrollments(engine) do
-    devices =
-      Map.new(engine.devices, fn {key, record} ->
-        {key, Map.put_new(record, :enrollment_revision, 1)}
-      end)
 
-    agents =
-      Map.new(engine.agents, fn {key, record} ->
-        {key, Map.put_new(record, :enrollment_revision, 1)}
-      end)
-
-    %{engine | devices: devices, agents: agents}
-  end
-
-  defp normalize_device_metadata(engine) do
-    devices =
-      Map.new(engine.devices, fn {key, record} ->
-        {key, record |> Map.put_new(:label, nil) |> Map.put_new(:enrolled_at, nil)}
-      end)
-
-    %{engine | devices: devices}
-  end
-
-  defp normalize_device_focus_permissions(engine) do
-    devices =
-      Map.new(engine.devices, fn {key, record} ->
-        {key, record |> Map.put_new(:see_focus, false) |> Map.put_new(:push_view, false)}
-      end)
-
-    %{engine | devices: devices}
-  end
-
-  defp normalize_agents_v9(engine) do
-    agents =
-      Map.new(engine.agents, fn {key, record} ->
-        migrated =
-          record
-          |> Map.put_new(:read_grants, MapSet.new())
-          |> Map.put_new(:respond_grants, MapSet.new())
-          |> Map.put_new(:grant_revision, 1)
-          |> Map.put_new(:granted_by, nil)
-
-        history = [
-          %{
-            revision: 1,
-            actor: nil,
-            read_grants: migrated.read_grants,
-            respond_grants: migrated.respond_grants,
-            revoked: migrated.revoked,
-            action: "fixture_migration",
-            at_ms: System.system_time(:millisecond)
-          }
-        ]
-
-        {key, Map.put_new(migrated, :grant_history, history)}
-      end)
-
-    %{engine | agents: agents, agent_cursor_key: :crypto.strong_rand_bytes(32)}
-  end
-
-  defp normalize_push_v10(engine),
-    do: %{engine | push_bindings: Map.get(engine, :push_bindings, %{})}
-
-  defp normalize_push_reasons_v11(engine) do
-    bindings =
-      Map.new(engine.push_bindings, fn {key, binding} ->
-        case Map.get(binding, :last_outcome) do
-          outcome when is_map(outcome) ->
-            sanitized =
-              case Map.fetch(outcome, "reason") do
-                {:ok, reason} ->
-                  if APNS.safe_reason?(reason), do: outcome, else: Map.delete(outcome, "reason")
-
-                :error ->
-                  outcome
-              end
-
-            {key, Map.put(binding, :last_outcome, sanitized)}
-
-          _ ->
-            {key, binding}
-        end
-      end)
-
-    %{engine | push_bindings: bindings}
-  end
-
-  defp normalize_push_presentation(engine) do
-    bindings =
-      Map.new(engine.push_bindings, fn {{person, _device} = key, binding} ->
-        # Completed old hints have no pending presentation to preserve. For an
-        # in-flight old hint, retain the unresolved-delivery alert possibility.
-        accepted_high =
-          if binding.pending_high == 0,
-            do: engine.persons[person],
-            else: Map.get(engine.cursors, key, 0)
-
-        {key, Map.put(binding, :accepted_high, accepted_high)}
-      end)
-
-    %{engine | push_bindings: bindings}
-  end
-
-  defp normalize_conversation_push(engine) do
-    bindings =
-      Map.new(engine.push_bindings, fn {key, binding} ->
-        {key,
-         binding
-         |> Map.put_new(:pending_conversation_high, 0)
-         |> Map.put_new(:accepted_conversation_high, 0)
-         |> Map.put_new(:claim_conversation_high, nil)}
-      end)
-
-    %{engine | push_bindings: bindings}
-  end
-
-  # Reviewed format-six snapshots predate bounded S8 readback. Keep their
-  # immutable request deadline and conservatively deny old approval retries
-  # because their approving owner key was never recorded.
-  defp normalize_pending_v8(engine) do
-    pending =
-      Map.new(engine.pending_enrollments, fn {code, item} ->
-        {code,
-         item
-         |> Map.put(:status_expires_at, item.expires_at + 86_400_000)
-         |> then(fn request ->
-           if request.state == :approved,
-             do: Map.put(request, :approved_by, nil),
-             else: request
-         end)}
-      end)
-
-    %{engine | pending_enrollments: pending, pending_history: %{}}
-  end
-
-  # A legacy expired receipt lacks person and certificate. Recover person only
-  # from one exact consumed invitation; resume must supply the same-SPKI cert.
-  defp normalize_resumable_pending(engine) do
-    pending =
-      Map.new(engine.pending_enrollments, fn {code, item} ->
-        {code,
-         item
-         |> Map.put_new(:request_generation, 1)
-         |> Map.put_new(:joined, item.state == :pending and not is_nil(item.person))}
-      end)
-
-    {pending, history} =
-      Enum.reduce(engine.pending_history, {pending, %{}}, fn {code, item}, {current, past} ->
-        matches =
-          Enum.filter(engine.join_invitations, fn {_hash, invite} ->
-            invite.code == code and invite.key == item.key and
-              invite.secret_hash == item.secret_hash and
-              Map.has_key?(engine.persons, invite.person)
-          end)
-
-        key_unbound? =
-          not Map.has_key?(engine.devices, item.key) and
-            not Map.has_key?(engine.agents, item.key) and
-            not MapSet.member?(engine.retired_owner_keys, item.key) and
-            not Enum.any?(engine.owners, fn {_person, owner} -> owner.key == item.key end) and
-            not Enum.any?(current, fn {_pending_code, pending_item} ->
-              pending_item.key == item.key
-            end)
-
-        case {item.state, matches, key_unbound?} do
-          {:expired, [{_hash, invite}], true} ->
-            recovered = %{
-              state: :pending,
-              person: invite.person,
-              key: item.key,
-              certificate: nil,
-              legacy_recovery: true,
-              label: "New device",
-              secret_hash: item.secret_hash,
-              expires_at: item.expires_at,
-              status_expires_at: item.status_expires_at,
-              request_generation: 1,
-              joined: true
-            }
-
-            {Map.put(current, code, recovered), past}
-
-          {:approved, [{_hash, _invite}], _} ->
-            {current, Map.put(past, code, Map.put(item, :joined, true))}
-
-          {state, [{_hash, _invite}], _} when state in [:cancelled, :declined] ->
-            {current, Map.put(past, code, Map.put(item, :joined, true))}
-
-          _ ->
-            {current, Map.put(past, code, item)}
-        end
-      end)
-
-    %{engine | pending_enrollments: pending, pending_history: history}
-  end
-
-  # The durable hot path checks bounce index containers without rescanning their
-  # retained rows. Store open performs the full cross-map bounce validation.
   defp valid_state?(%Engine{} = engine), do: valid_state?(engine, :full)
 
   defp valid_state?(%Engine{} = engine, bounce_validation) do
@@ -2791,18 +2460,6 @@ defmodule AttentionServer.Store do
 
   defp valid_state?(_, _), do: false
   defp valid_state?(_), do: false
-
-  defp same_state_except_bounce_indexes?(loaded, stored) do
-    %{
-      loaded
-      | bounce_deadline_index: stored.bounce_deadline_index,
-        bounce_waiting_routes: stored.bounce_waiting_routes,
-        bounce_discussed_messages: stored.bounce_discussed_messages,
-        bounce_origin_entries: stored.bounce_origin_entries,
-        advisory_id_index: stored.advisory_id_index,
-        route_b_index: stored.route_b_index
-    } == stored
-  end
 
   defp valid_prioritization?(engine) do
     is_map(engine.algorithm_choices) and

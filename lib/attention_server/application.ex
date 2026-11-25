@@ -16,7 +16,6 @@ defmodule AttentionServer.Application do
           [registry]
 
         opts when is_list(opts) ->
-          _ = AttentionServer.RetiredSettings.notice()
           [registry, {AttentionServer.Server, opts}]
       end
 

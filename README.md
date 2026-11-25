@@ -32,34 +32,23 @@ The package does not install a service, configure the tailnet or expose ports.
 Release publication does not install the server; installation is a separate
 manual action.
 
-v0.2.20 speaks protocol 0.2 only: the app, the packaged web client, Harklight
-Agent 0.2 and the packaged tools use client API v2 (`/v2`) on the device
-port. Protocol 0.1 apps, agents and headless tools cannot connect, so move a
-deployment to 0.2.20 only after its agents and clients are on their 0.2
-versions. See [RELEASE_NOTES.md](RELEASE_NOTES.md) for what changes for owners
-and what to do before switching.
+The app, packaged web client, Harklight Agent and packaged tools use client
+API v2 (`/v2`) on the device port. See [RELEASE_NOTES.md](RELEASE_NOTES.md)
+for the compatibility of published packages.
 
 State, owner/device identities, trust roots and sender grants live outside the
-versioned package. Run one server per database. Keep private keys and backups
-private; do not repeat bootstrap over an existing installation. This source,
-v0.2.20, writes FORMAT30, as v0.2.16 through v0.2.19 did; from their state it
-changes no store format. From FORMAT29 state, written by v0.2.0 through v0.2.15
-and by the published v0.1.43, v0.1.44, v0.1.45, v0.1.48 and v0.1.49 releases,
-first start upgrades the store to FORMAT30, which adds the per-person alert
-choice; a FORMAT29 release cannot open the upgraded store. From supported FORMAT27 state,
-including state written by the published v0.1.35 through v0.1.42 maintenance
-packages (for example v0.1.38), startup applies the FORMAT28 device-focus
-defaults and FORMAT29 hosted-delivery-state initialization in order, preserving
-existing values and filling only missing values. FORMAT29 large message data is
-stored in private files with durable database references. Messages, accounts,
-grants, enrolled devices and registered agents carry over; a device enrolled on
-0.1 keeps its certificate. Unused invitations created before the upgrade are
-not redeemed and must be issued again. Every registered, non-revoked agent can
-read all messages on the account it is registered to, regardless of sender.
-Sender filters select search results only; they do not limit access. Answering
-still requires both a matching read grant and a matching respond grant.
+versioned package. Run one server per database and keep private backups. The
+server built from this source opens and writes FORMAT30 snapshots only.
+FORMAT30 was introduced in v0.2.16. To move a store on FORMAT29 or earlier,
+upgrade through v0.2.16–v0.2.20 using a release that supports the source
+format, then verify it writes FORMAT30 before switching. Preserve the
+state path, private files and trust root, and keep the existing owner identity.
 
-Before the first v0.2.20 start, stop the server and retain a complete private
+Every registered, non-revoked agent can read the account's messages regardless
+of sender. Sender filters select search results. Answering requires both a
+matching read grant and a matching respond grant.
+
+Before upgrading, stop the server and retain a complete private
 state backup. The release installer also takes one full private-root backup
 while the service is stopped and before switching releases. It attempts to
 restore this snapshot if the candidate start or process-readiness check fails.
@@ -69,13 +58,9 @@ and leave the service stopped. A successful isolated rehearsal is evidence for
 the tested archive and sequence, not a guarantee of recovery in every
 installation.
 
-After any v0.2.20 write, returning to v0.1.49 or another 0.1.x release requires
-stopping the server, restoring the pre-start backup and selecting that
-release, with its clients back on 0.1. A 0.1.x release cannot
-read the FORMAT30 state v0.2.20 has written; changing only the code
-or release link is not a safe downgrade. This restore loses every write made
-since the backup and cannot undo external notifications, bounces or agent
-deliveries. Do not assume recovery success or a recovery time.
+Restoring a backup loses every write made after it and cannot undo external
+notifications, bounces or agent deliveries. See [SELF_HOST.md](SELF_HOST.md)
+for backup and rollback details.
 
 The first answer settles a request, and a second answer is refused. Chat on the
 request stays open after any outcome (answered, No comment, cleared, expired,
@@ -83,8 +68,8 @@ withdrawn or superseded): the person can keep writing and the agent can keep
 replying, more than once to the same chat message. A chat message to an agent
 that is not listening is accepted and delivered when the agent next listens.
 
-Configurable score-based priority levels and unseen-message advisories first
-shipped in v0.1.30. When a request reaches its configured unseen interval, the
+Priority levels can set an unseen interval for requests. When a request
+reaches that interval, the
 server adds an advisory to the originating agent session asking whether the
 request is still valid and worth resending and whether its importance should be
 raised. It does not automatically resend the request or change its priority.
@@ -119,15 +104,15 @@ serves the coding-agent skill at `/agent-skills/harklight/SKILL.md`.
 The `harklight-agent` command-line client sends requests and listens for
 request-bound replies. It is released separately from the server at
 <https://github.com/clickety-clacks/harklight-agent>. This Server works
-with Harklight Agent 0.2 releases. Agent 0.2.6 is the matching release, and 0.1
-Agent releases cannot connect. Download the tarball for your platform and `SHA256SUMS` from the
-[release page](https://github.com/clickety-clacks/harklight-agent/releases/tag/v0.2.6),
+with Harklight Agent 0.2.6 or a later compatible release.
+Download the tarball for your platform and `SHA256SUMS` from the
+[Agent releases page](https://github.com/clickety-clacks/harklight-agent/releases),
 verify the checksum and put the binary on your `PATH`. Targets are
 `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-gnu` and
 `aarch64-unknown-linux-gnu`:
 
 ```sh
-v=0.2.1 t=x86_64-unknown-linux-gnu
+v=VERSION t=x86_64-unknown-linux-gnu
 base="https://github.com/clickety-clacks/harklight-agent/releases/download/v$v"
 curl -fLO "$base/harklight-agent-$v-$t.tar.gz"
 curl -fLO "$base/SHA256SUMS"
@@ -136,12 +121,9 @@ tar -xzf "harklight-agent-$v-$t.tar.gz"
 install -m 755 "harklight-agent-$v-$t/harklight-agent" ~/.local/bin/
 ```
 
-`harklight-agent --version` prints `harklight-agent 0.2.1`. The
-[shared conversation core](skills/core.md) describes
-its commands and message format. Before switching an existing agent, finish
-or abandon its unresolved 0.1 operations with the 0.1 CLI; Agent 0.2 does
-not use 0.1 cursors, and pending enrollments survive. An existing identity
-takes the device port from `--device-port` or `HARKLIGHT_DEVICE_PORT`.
+Use the [shared conversation core](skills/core.md) for Agent commands and
+message formats. An existing identity takes the device port from
+`--device-port` or `HARKLIGHT_DEVICE_PORT`.
 
 Agents send new messages through the authenticated
 [`harklight-agent` session route](skills/core.md). Keep the originating session,
@@ -166,9 +148,7 @@ package.
 
 No comment is an answer with none of `choice`, `comment` or `result`, sent
 with the displayed `request_revision`. A stale revision is refused without
-answering the request. Clients use client API v2; protocol 0.1 app builds
-cannot connect to this server, and upgrading the server does not update the
-app.
+answering the request. Clients use client API v2.
 
 ## Device joining and notifications
 
@@ -206,10 +186,8 @@ they do not establish real-device notification delivery.
 
 The existing runtime identifiers remain supported: Mix app `:attention_server`,
 namespace `AttentionServer`, `ATTENTION_SERVER_*` variables, `mix attention.*`
-and `bin/attention_server`. The protocol 0.1 device WebSocket (`/relay`,
-`attention-relay/1`), agent (`/agent/v1`) and origin (`/origin/v1`) listeners
-are retired; devices, registered agents and the conversation CLI use client
-API v2 on the device port. Durable
+and `bin/attention_server`. Devices, registered agents and the conversation
+CLI use client API v2 on the device port. Durable
 messages and operation receipts preserve first acceptance and exact retry
 semantics across restart. Tailnet access alone grants no person or sender rights.
 

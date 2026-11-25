@@ -711,54 +711,6 @@ defmodule AttentionServer.PrioritizationTest do
     assert {:ok, ^selected} = Engine.set_algorithm_choice(selected, "person-a", "jev-set")
   end
 
-  test "format 22 migrates with baseline defaults and persists as format 30", %{path: path} do
-    assert {:ok, initial} = Store.open(path)
-    assert {:ok, engine} = Engine.setup_person(initial.engine, "person-a")
-    assert :ok = Store.close(initial)
-
-    old_engine =
-      engine
-      |> Map.delete(:algorithm_choices)
-      |> Map.delete(:jev_endpoint)
-      |> Map.delete(:jev_model)
-      |> Map.delete(:open_default_index)
-      |> Map.delete(:bounce_levels)
-      |> Map.delete(:bounce_revisions)
-      |> Map.delete(:opened_revisions)
-      |> Map.delete(:advisory_feeds)
-      |> Map.delete(:delivery_states)
-
-    payload = :erlang.term_to_binary({:attention_relay_state, 22, old_engine}, [{:compressed, 6}])
-    assert {:ok, db} = Sqlite3.open(path)
-    assert {:ok, stmt} = Sqlite3.prepare(db, "UPDATE relay_state SET payload = ?, checksum = ?")
-    assert :ok = Sqlite3.bind(stmt, [{:blob, payload}, {:blob, :crypto.hash(:sha256, payload)}])
-    assert :done = Sqlite3.step(db, stmt)
-    assert :ok = Sqlite3.release(db, stmt)
-    assert :ok = Sqlite3.close(db)
-
-    assert {:ok, migrated} = Store.open(path)
-    assert migrated.engine.algorithm_choices == %{}
-    assert migrated.engine.jev_endpoint == nil
-    assert migrated.engine.jev_model == nil
-    assert Placement.choice(migrated.engine, "person-a") == "baseline"
-    assert migrated.engine.bounce_levels == %{}
-    assert migrated.engine.bounce_revisions == %{}
-    assert migrated.engine.opened_revisions == MapSet.new()
-    assert migrated.engine.advisory_feeds == %{}
-    assert :ok = Store.close(migrated)
-
-    assert {:ok, db} = Sqlite3.open(path)
-    assert {:ok, select} = Sqlite3.prepare(db, "SELECT payload FROM relay_state WHERE id = 1")
-    assert {:row, [saved_payload]} = Sqlite3.step(db, select)
-    assert :ok = Sqlite3.release(db, select)
-    assert :ok = Sqlite3.close(db)
-
-    assert {:attention_relay_state, 30, saved_engine} =
-             :erlang.binary_to_term(saved_payload, [:safe])
-
-    refute Map.has_key?(saved_engine, :open_default_index)
-  end
-
   test "choice and Jev connection persist without storing a key path or bytes", %{path: path} do
     assert {:ok, store} = Store.open(path)
     assert {:ok, engine} = Engine.setup_person(store.engine, "person-a")
@@ -2789,60 +2741,6 @@ defmodule AttentionServer.PrioritizationTest do
     :sys.get_state(state.applied_score_record)
     assert not File.exists?(record_path) or File.read!(record_path) == ""
     assert :ok = Sqlite3.execute(state.store.db, "DROP TRIGGER reject_history")
-  end
-
-  test "pre-history format 24 restores existing chats without inventing scores", %{path: path} do
-    relay = start_relay(path)
-    setup_person(relay)
-    forward_chat(relay, "legacy", 930)
-    seq = add_reply(relay, "legacy", 932)
-    read_reply(relay, "legacy", seq, 934)
-
-    old_engine =
-      :sys.get_state(relay).store.engine
-      |> Map.delete(:reply_group_history)
-      |> Map.delete(:free_order_highs)
-      |> Map.update!(
-        :messages,
-        &Map.new(&1, fn {key, record} ->
-          {key, Map.delete(record, :free_order)}
-        end)
-      )
-      |> Map.update!(
-        :conversation_events,
-        &Map.new(&1, fn {key, event} ->
-          {key, Map.delete(event, :free_order)}
-        end)
-      )
-
-    GenServer.stop(relay)
-    payload = :erlang.term_to_binary({:attention_relay_state, 24, old_engine}, [{:compressed, 6}])
-    assert {:ok, db} = Sqlite3.open(path)
-    assert {:ok, stmt} = Sqlite3.prepare(db, "UPDATE relay_state SET payload = ?, checksum = ?")
-    assert :ok = Sqlite3.bind(stmt, [{:blob, payload}, {:blob, :crypto.hash(:sha256, payload)}])
-    assert :done = Sqlite3.step(db, stmt)
-    assert :ok = Sqlite3.release(db, stmt)
-    assert :ok = Sqlite3.close(db)
-    restarted = start_relay(path)
-
-    assert [%{"kind" => "message"}, %{"kind" => "reply", "unseen_count" => 0} = group] =
-             view_for(restarted)["list_items"]
-
-    refute Map.has_key?(group, "score")
-    assert group["conversation_seq"] == seq
-    engine = :sys.get_state(restarted).store.engine
-    assert engine.reply_group_history == %{}
-    assert engine.free_order_highs == %{}
-    assert group["free_section"] == %{"state" => "history", "group" => "earlier_chat_replies"}
-    refute Map.has_key?(engine.messages[{"person-a", "app:test", "legacy"}], :free_order)
-    GenServer.stop(restarted)
-    again = start_relay(path)
-    assert :sys.get_state(again).store.engine.free_order_highs == %{}
-    add_reply(again, "legacy", 940)
-    [reply, parent] = view_for(again)["list_items"]
-    assert reply["free_section"] == %{"state" => "active", "group" => "common"}
-    assert parent["free_section"] == %{"state" => "active", "group" => "earlier_messages"}
-    assert :sys.get_state(again).store.engine.free_order_highs == %{"person-a" => 1}
   end
 
   test "mixed projection keeps message threads intact and historical reply chronology stable" do
