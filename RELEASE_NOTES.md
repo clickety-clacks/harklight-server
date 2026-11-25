@@ -1,3 +1,34 @@
+# Harklight Server v0.2.14
+
+Any enrolled device on an account, an agent's identity as well as a phone, can
+now read that account's focus (which screen and message each device has in
+front) and push a view of a message to one of the account's devices. The
+separate permission these needed is gone. Showing a message never marks it
+Seen and never answers it. Nothing crosses accounts.
+
+A focus report can say the FYI list is in front, with screen `fyi`. A view
+pushed while the device is away and whose message disappears before delivery
+still arrives, carrying the original item ID, so the app can say it is no longer
+available. A new push naming a message that does not exist is still refused.
+
+A signed-in browser session can now report focus too, with a name it supplies,
+and appears in focus reads with kind `browser`. Browsers do not receive pushed
+views. Harklight Web 0.2.5 reports focus once it runs against this Server.
+
+## Upgrade and recovery
+
+The Server continues to use FORMAT29, and upgrading from v0.2.0 through v0.2.13
+requires no store format migration. Follow the backup, upgrade, and recovery
+steps in `SELF_HOST.md`. The bundled Harklight Web is 0.2.5, as in v0.2.13.
+Focus is kept in memory only.
+
+**Compatibility.** Harklight Server 0.2.14 uses protocol 0.2 and keeps the client
+API, adding the `fyi` focus screen, the `browser` focus kind, and browser focus
+reports. Clients ignore values they do not know. Harklight Agent 0.2.5 is the
+matching Agent release; `harklight-agent focus` and `show` from Agents 0.2.0 to
+0.2.5 now work under an ordinary enrolled identity. Harklight app 0.2.0 and
+Harklight Web 0.2.5 are the client baseline.
+
 # Harklight Server v0.2.13
 
 An agent's first read of a conversation, and the caller-owned pending read, now
