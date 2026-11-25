@@ -21,9 +21,12 @@ defmodule AttentionServer.AgentAPI.Feed do
          {:ok, ack2} <- capability(conn) do
       ctx = %{ctx | params: Map.merge(ctx.params, %{session: session, ack2: ack2})}
 
-      if Feed.event_stream?(conn),
-        do: FeedStream.serve(conn, ctx, cursor, FeedStep),
-        else: batch(conn, ctx, cursor, limit)
+      if Feed.event_stream?(conn) do
+        stream_ctx = %{ctx | params: Map.put(ctx.params, :stream, true)}
+        FeedStream.serve(conn, stream_ctx, cursor, FeedStep)
+      else
+        batch(conn, ctx, cursor, limit)
+      end
     else
       {:error, field} -> Errors.send_error(conn, "invalid_field", field: field)
     end
@@ -84,7 +87,12 @@ defmodule AttentionServer.AgentAPI.FeedStep do
         cursor,
         limit
       ),
-      do: call(relay, {:read, principal, session, cursor, limit, Map.get(params, :ack2)})
+      do:
+        call(
+          relay,
+          {:read, principal, session, cursor, limit,
+           Keyword.new(Map.take(params, [:ack2, :stream]))}
+        )
 
   def opened(ctx) do
     FeedActivity.observe(ctx, :open)
@@ -111,14 +119,14 @@ defmodule AttentionServer.AgentAPI.FeedStep do
     do: GenServer.call(relay, {:client_api, __MODULE__, request}, :infinity)
 
   def handle_call(
-        {:read, principal, session, cursor, limit, ack2},
+        {:read, principal, session, cursor, limit, opts},
         _from,
         %{store: store} = state
       ) do
     with {:ok, agent, changes, more, position} <-
            read_rows(state, principal, session, cursor, limit),
          targets = Enum.flat_map(changes, &delivery_target/1),
-         {:ok, store} <- commit_delivery(store, agent, targets, ack2: ack2) do
+         {:ok, store} <- commit_delivery(store, agent, targets, opts) do
       {:reply, {:ok, changes, more, position}, %{state | store: store}}
     else
       {:error, _} = error -> {:reply, error, state}
