@@ -875,8 +875,6 @@ visible text. Its `attention` member changes:
 - `item_id` and `rev` name the change that caused the push.
 - `sender_id`, `message_id` and `acceptance_seq` are dropped.
 - `target` is present only for a chat push, as today.
-- A grouped alert may omit `locator` to fit more complete sender names
-  within the APNs payload limit.
 - The app matches the push `server`, `person_id`, and `device_id` to
   `/v2/me` and the push `binding_id` to `Settings.push.binding_id`.
   A mismatch is ignored and recorded in the Error Log. After all four IDs

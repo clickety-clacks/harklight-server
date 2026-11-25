@@ -2,7 +2,6 @@ defmodule AttentionServer.APNS do
   @moduledoc false
 
   alias AttentionServer.{Diagnostics, JSON}
-  require Logger
 
   @sandbox_host "api.sandbox.push.apple.com"
   @production_host "api.push.apple.com"
@@ -394,33 +393,9 @@ defmodule AttentionServer.APNS do
   end
 
   defp fit_grouped_alert_payload(title, names, locator, badge) do
-    candidates =
-      [
-        {fit_grouped_names(title, names, locator, badge), not is_nil(locator)},
-        {fit_grouped_names(title, names, nil, badge), false}
-      ]
-      |> Enum.uniq_by(fn {result, has_locator?} -> {result, has_locator?} end)
-      |> Enum.filter(fn {result, _has_locator?} -> match?({:ok, _, _}, result) end)
-
-    case Enum.max_by(
-           candidates,
-           fn {{:ok, _payload, shown_count}, has_locator?} ->
-             {shown_count, has_locator?}
-           end,
-           fn -> nil end
-         ) do
-      {{:ok, payload, _shown_count}, has_locator?} ->
-        if not is_nil(locator) and not has_locator? do
-          Logger.warning("event=harklight_apns_tap_locator outcome=omitted_payload_limit")
-        end
-
-        {:ok, payload}
-
-      nil ->
-        case fit_grouped_names("Harklight", names, nil, badge) do
-          {:ok, payload, _shown_count} -> {:ok, payload}
-          :error -> :error
-        end
+    case fit_grouped_names(title, names, locator, badge) do
+      {:ok, _payload} = fit -> fit
+      :error -> fit_grouped_names("Harklight", names, locator, badge)
     end
   end
 
@@ -432,7 +407,7 @@ defmodule AttentionServer.APNS do
     if payload_size(initial_payload) > @max_payload_bytes do
       :error
     else
-      {shown_reversed, payload} =
+      {_shown_reversed, payload} =
         Enum.reduce_while(names, {[], initial_payload}, fn name, {shown_reversed, _payload} ->
           shown = Enum.reverse([name | shown_reversed])
           remaining = total_names - length(shown)
@@ -456,7 +431,7 @@ defmodule AttentionServer.APNS do
           end
         end)
 
-      {:ok, payload, length(shown_reversed)}
+      {:ok, payload}
     end
   end
 
@@ -521,15 +496,13 @@ defmodule AttentionServer.APNS do
   end
 
   defp alert_payload(title, body, locator, badge) do
-    attention = @attention
-    attention = if locator, do: Map.put(attention, "locator", locator), else: attention
     alert = %{"title" => title}
     alert = if is_binary(body), do: Map.put(alert, "body", body), else: alert
 
     put_badge(
       %{
         "aps" => %{"alert" => alert, "content-available" => 1},
-        "attention" => attention
+        "attention" => Map.put(@attention, "locator", locator)
       },
       badge
     )

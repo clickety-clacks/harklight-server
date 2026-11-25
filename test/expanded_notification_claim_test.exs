@@ -123,18 +123,25 @@ defmodule AttentionServer.ExpandedNotificationClaimTest do
     assert_sync(payload, engine, "i1")
   end
 
-  test "grouped fitting can omit the whole locator to keep more complete names" do
+  test "grouped fitting preserves the locator when the first name cannot fit" do
     engine = engine(["First", "Second"])
     {:ok, _next, claim} = claim_push(engine)
     long = String.duplicate("a", 3_900)
     payload = APNS.request_payload(%{claim | grouped_alert_names: [long, "Small"]})
 
-    assert payload["aps"]["alert"]["body"] == long <> ", Small"
+    assert payload["aps"]["alert"]["body"] == "2 senders"
+    assert_sync(payload, engine, "i2")
+  end
 
-    assert Map.delete(payload["attention"], "expanded") ==
-             %{"v" => 2, "type" => "sync", "server" => engine.relay_instance_id}
+  test "grouped fitting shows a complete name and counts names displaced by the locator" do
+    engine = engine(["First", "Second"])
+    {:ok, _next, claim} = claim_push(engine)
+    first = String.duplicate("名", 650)
+    second = String.duplicate("界", 650)
+    payload = APNS.request_payload(%{claim | grouped_alert_names: [first, second]})
 
-    assert byte_size(AttentionServer.JSON.encode!(payload)) <= 4_096
+    assert payload["aps"]["alert"]["body"] == first <> ", and 1 more"
+    assert_sync(payload, engine, "i2")
   end
 
   defp claim_push(engine) do
