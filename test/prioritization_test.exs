@@ -338,10 +338,12 @@ defmodule AttentionServer.PrioritizationTest do
   } do
     use_synthetic_jev_key(dir)
     test_process = self()
+    record_path = Path.join(dir, "hosted-scores.jsonl")
 
     relay =
       start_relay(path,
         deployment_mode: :saas,
+        jev_score_record_path: record_path,
         jev_endpoint: "https://provider.example.test",
         jev_model: "test-model",
         priority_evaluator: fn request ->
@@ -383,6 +385,9 @@ defmodule AttentionServer.PrioritizationTest do
       state = await_state(relay, &(&1.priority_views[person].basis == "selected"))
       assert [%{"message_id" => ^message, "score" => 0.75}] = state.priority_views[person].entries
     end
+
+    assert :sys.get_state(relay).applied_score_record == nil
+    refute File.exists?(record_path)
   end
 
   test "Jev selected views remain score-only after fallback display priorities", %{
@@ -1786,27 +1791,19 @@ defmodule AttentionServer.PrioritizationTest do
     assert Enum.map(Enum.take(rows, -2), & &1["model"]) == ["jev-other", "jev-other"]
   end
 
-  test "unset path and hosted deployment never start or write a score record", %{dir: dir} do
+  test "self-hosted ranking leaves the score record off when no path is set", %{dir: dir, path: path} do
     use_synthetic_jev_key(dir)
+    relay = start_relay(path)
+    setup_person(relay)
+    forward(relay, 1, "entry")
+    configure_jev_choice(relay)
 
-    for {mode, record_path} <- [{:self_hosted, nil}, {:saas, Path.join(dir, "hosted.jsonl")}] do
-      relay =
-        start_relay(Path.join(dir, "#{mode}.sqlite3"),
-          deployment_mode: mode,
-          jev_score_record_path: record_path
-        )
+    job = start_synthetic_priority_pass(relay)
+    complete_synthetic_priority_pass(job, {:ok, %{{"app:test", "entry"} => 0.7}})
 
-      setup_person(relay)
-      forward(relay, 1, "entry")
-      configure_jev_choice(relay)
-      job = start_synthetic_priority_pass(relay)
-      complete_synthetic_priority_pass(job, {:ok, %{{"app:test", "entry"} => 0.7}})
-      state = :sys.get_state(relay)
-      assert state.applied_score_record == nil
-      assert state.priority_views["person-a"].basis == "selected"
-    end
-
-    refute File.exists?(Path.join(dir, "hosted.jsonl"))
+    state = :sys.get_state(relay)
+    assert state.applied_score_record == nil
+    assert state.priority_views["person-a"].basis == "selected"
   end
 
   test "discarded scoring results do not produce records", %{dir: dir, path: path} do
