@@ -133,6 +133,20 @@ defmodule AttentionServer.Store.RecordCodec do
   # major requires rekeying before point writes are allowed.
   def identity, do: {@record_version, List.to_string(:erlang.system_info(:otp_release))}
 
+  def decode_row({key, payload, hash})
+      when is_binary(key) and is_binary(payload) and is_binary(hash) do
+    with true <- hash == checksum(key, payload),
+         {:ok, address} <- decode_key(key) do
+      {:ok, address, :erlang.binary_to_term(payload, [:safe])}
+    else
+      _ -> {:error, :invalid_state}
+    end
+  rescue
+    ArgumentError -> {:error, :invalid_state}
+  end
+
+  def decode_row(_), do: {:error, :invalid_state}
+
   def decode(records) do
     :ok = StoredTerms.load_atoms()
 
@@ -150,14 +164,10 @@ defmodule AttentionServer.Store.RecordCodec do
     end
   end
 
-  def matches_row?(engine, row, prepare \\ &Function.identity/1)
-
-  def matches_row?(engine, {key, payload, hash}, prepare)
-      when is_binary(key) and is_binary(payload) and is_binary(hash) do
-    with true <- hash == checksum(key, payload),
-         {@record_version, address} <- :erlang.binary_to_term(key, [:safe]),
+  def matches_row?(engine, row, prepare \\ &Function.identity/1) do
+    with {:ok, address, actual} <- decode_row(row),
          {:ok, value} <- lookup(engine, address) do
-      :erlang.binary_to_term(payload, [:safe]) === prepare.(value)
+      actual === prepare.(value)
     else
       _ -> false
     end
@@ -166,16 +176,11 @@ defmodule AttentionServer.Store.RecordCodec do
     KeyError -> false
   end
 
-  def matches_row?(_engine, _row, _prepare), do: false
-
   defp complete_feeds?(feeds),
     do: Enum.all?(feeds, fn {_scope, feed} -> not is_nil(feed.high) end)
 
-  defp load_record({key, payload, hash}, {engine, required})
-       when is_binary(key) and is_binary(payload) and is_binary(hash) do
-    with true <- hash == checksum(key, payload),
-         {@record_version, address} <- :erlang.binary_to_term(key, [:safe]),
-         value <- :erlang.binary_to_term(payload, [:safe]),
+  defp load_record(row, {engine, required}) do
+    with {:ok, address, value} <- decode_row(row),
          {:ok, next, needed} <- insert(engine, required, address, value) do
       {:cont, {next, needed}}
     else
@@ -184,8 +189,6 @@ defmodule AttentionServer.Store.RecordCodec do
   rescue
     ArgumentError -> {:halt, :invalid}
   end
-
-  defp load_record(_, _), do: {:halt, :invalid}
 
   defp insert(engine, required, {:field, field}, value) do
     if MapSet.member?(required, field) do

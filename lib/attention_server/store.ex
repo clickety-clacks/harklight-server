@@ -930,7 +930,7 @@ defmodule AttentionServer.Store do
     with {:ok, engine, generation} <- KeyedMigration.load(db),
          {:ok, engine} <- validate_keyed_engine(engine),
          :ok <- set_durability(db),
-         :ok <- DerivedIndex.ensure(db, generation, engine) do
+         :ok <- DerivedIndex.ensure(db, generation) do
       {:ok, engine, generation}
     end
   end

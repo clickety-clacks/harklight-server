@@ -122,10 +122,10 @@ defmodule AttentionServer.Store.DerivedIndex do
 
   @base_live "(state IS NULL OR coalesce(last_reply, 0) > read_position OR bounce_pending = 1)"
 
-  def create(db, generation, engine) do
+  def create(db, generation) do
     with :ok <- Sqlite3.execute(db, @schema),
-         :ok <- seed_items(db, engine),
-         :ok <- seed_records(db, engine),
+         :ok <- seed_items(db),
+         :ok <- seed_records(db),
          :ok <-
            Sqlite3.execute(
              db,
@@ -141,7 +141,7 @@ defmodule AttentionServer.Store.DerivedIndex do
     end
   end
 
-  def ensure(db, generation, engine) do
+  def ensure(db, generation) do
     case RecordTable.select(db, "SELECT index_version, liveness_version, generation FROM relay_index_state WHERE id = 1") do
       {:ok, [[@index_version, @liveness_version, ^generation]]} ->
         :ok
@@ -150,18 +150,18 @@ defmodule AttentionServer.Store.DerivedIndex do
         {:error, {:unsupported_derived_indexes, index, live}}
 
       {:ok, _} ->
-        rebuild(db, generation, engine)
+        rebuild(db, generation)
 
       error ->
         error
     end
   end
 
-  defp rebuild(db, generation, engine) do
+  defp rebuild(db, generation) do
     RecordTable.transaction(db, fn ->
       with {:ok, ^generation} <- RecordTable.generation(db),
            :ok <- each(@tables, &Sqlite3.execute(db, "DROP TABLE #{&1}")),
-           :ok <- create(db, generation, engine) do
+           :ok <- create(db, generation) do
         {:ok, :rebuilt}
       else
         {:ok, _} -> {:error, :stale_generation}
@@ -218,32 +218,87 @@ defmodule AttentionServer.Store.DerivedIndex do
     end
   end
 
-  defp seed_items(db, engine) do
-    scan_addresses(db, fn
-      {:row, :messages, key} -> each(item_row(engine, key).rows, &insert(db, &1))
-      _ -> :ok
-    end)
-  end
-
-  defp seed_records(db, engine) do
-    scan_addresses(db, fn address ->
-      rows =
-        case address do
-          {:row, field, _} when field in @item_facts -> empty()
-          address -> primary_rows(engine, address)
-        end
-
-      each(rows.rows ++ links(engine, address), &insert(db, &1))
-    end)
-  end
-
-  defp scan_addresses(db, consume) do
+  # Item identities must exist before resolving records that refer to them.
+  # Later passes stream the stored values and hold one decoded record at a time.
+  defp seed_items(db) do
     RecordTable.scan_keys(db, fn keys ->
-      each(keys, fn key ->
-        with {:ok, address} <- RecordCodec.decode_key(key), do: consume.(address)
+      each(keys, fn
+        key when is_binary(key) ->
+          with {:ok, address} <- RecordCodec.decode_key(key), do: seed_item(db, address)
+
+        error ->
+          error
       end)
     end)
+  catch
+    {:derived_seed_error, error} -> error
   end
+
+  defp seed_item(db, {:row, :messages, {person, _, _} = key} = address) do
+    record = stored_value(db, address)
+    values = item_fields(key, record) ++ [nil, 0, 0, 0]
+    insert(db, {"relay_items", [person, record.accepted_seq], values})
+  end
+
+  defp seed_item(_db, _address), do: :ok
+
+  defp seed_records(db) do
+    lookup = &stored_value(db, &1)
+    item_position = &stored_item_position(db, &1)
+
+    RecordTable.scan(db, fn rows ->
+      each(rows, fn row ->
+        with {:ok, address, value} <- RecordCodec.decode_row(row),
+             :ok <- seed_primary(db, address, value, lookup, item_position) do
+          each(links(address, value), &insert(db, &1))
+        end
+      end)
+    end)
+  catch
+    {:derived_seed_error, error} -> error
+  end
+
+  defp seed_primary(db, {:row, :messages, {person, _, _} = key}, value, lookup, item_position) do
+    RecordTable.run(db, """
+    UPDATE relay_items SET inherits_from = ?, read_position = ?, bounce_pending = ?, listening = ?
+    WHERE person = ? AND seq = ?
+    """, item_facts(key, value, lookup, item_position) ++ [person, value.accepted_seq])
+  end
+
+  defp seed_primary(db, address, value, lookup, item_position) do
+    rows = primary_rows(address, value, lookup, item_position)
+    each(rows.rows, &insert(db, &1))
+  end
+
+  defp stored_value(db, address) do
+    key = RecordCodec.encode_key(address)
+
+    case RecordTable.select(db, "SELECT payload, checksum FROM relay_records WHERE key = ?", [{:blob, key}]) do
+      {:ok, []} ->
+        nil
+
+      {:ok, [[payload, checksum]]} ->
+        case RecordCodec.decode_row({key, payload, checksum}) do
+          {:ok, ^address, value} -> value
+          error -> throw({:derived_seed_error, error})
+        end
+
+      error ->
+        throw({:derived_seed_error, error})
+    end
+  end
+
+  defp stored_item_position(db, {person, sender, message_id}) do
+    case RecordTable.select(db, "SELECT seq FROM relay_items WHERE person = ? AND sender = ? AND message_id = ?", [
+           person, sender, message_id
+         ]) do
+      {:ok, [[seq]]} -> seq
+      {:ok, []} -> nil
+      error -> throw({:derived_seed_error, error})
+    end
+  end
+
+  defp stored_item_position(_db, nil), do: nil
 
   defp derived_address({:row, field, key}) when field in @item_facts, do: {:row, :messages, key}
 
@@ -254,102 +309,94 @@ defmodule AttentionServer.Store.DerivedIndex do
   defp derived_address(address), do: address
 
   defp row_changes(engine, address) do
-    rows = primary_rows(engine, address)
-    %{rows | rows: rows.rows ++ links(engine, address)}
-  end
-
-  defp primary_rows(engine, {:row, :messages, key}), do: item_row(engine, key)
-
-  defp primary_rows(engine, {:row, :conversation_events, {person, seq}}) do
-    with %{key: key, payload: payload} <- Map.get(engine.conversation_events, {person, seq}),
-         item when is_integer(item) <- item_position(engine, key) do
-      kind = payload["kind"]
-      event = payload["event_id"]
-      target = Resources.delivery_target(payload)
-      fold = if kind in @entry_kinds, do: event, else: target
-
-      row("relay_entries", [person, seq], [item, kind, payload["author"], event, nil, target],
-        {person, item}, if(is_binary(fold), do: {person, item, fold}))
-    else
-      _ -> empty()
-    end
-  end
-
-  defp primary_rows(engine, {:origin_feed, {person, origin} = scope, {:entry, seq}}) do
-    case get_in(engine.origin_feeds, [scope, :entries, seq]) do
-      nil -> empty()
-      entry ->
-        item = entry_position(engine, person, entry)
-        facts = {person, origin, seq}
-
-        row("relay_feed", [person, origin, seq], [
-          entry["session_handle"], item, entry["kind"], entry["author"],
-          flag(Conversation.actionable?(entry)), flag(DeliveryBaseline.baseline_entry?(entry)),
-          receipt_level(Map.get(engine.origin_receipts, facts)),
-          flag(Map.has_key?(engine.origin_actions, facts)), Conversation.answer_baseline_attempt(entry)
-        ], if(item, do: {person, item}))
-    end
-  end
-
-  defp primary_rows(engine, {:advisory, {person, origin, session} = scope, {:entry, seq}}) do
-    case get_in(engine.advisory_feeds, [scope, :entries, seq]) do
-      nil -> empty()
-      entry ->
-        row("relay_advisories", [person, origin, session, seq], [
-          entry_position(engine, person, entry), entry["advisory_id"]
-        ])
-    end
-  end
-
-  defp primary_rows(engine, {:row, :origin_sessions, {person, origin, session} = scope}) do
-    case Map.get(engine.origin_sessions, scope) do
-      nil -> empty()
-      data ->
-        row("relay_sessions", [person, origin, session], [
-          flag(data.gone), flag(get_in(data, [:support, "origin_listener"]) == true)
-        ])
-    end
-  end
-
-  defp primary_rows(_engine, _address), do: empty()
-
-  defp item_row(engine, {person, sender, id} = key) do
-    case Map.get(engine.messages, key) do
-      nil -> empty()
-      record ->
-        seq = record.accepted_seq
-        source = KeyedValidation.source_key(record)
-        parent = item_position(engine, Map.get(record, :placement_origin_target))
-        listening = match?({"listening", _}, Map.get(engine.item_availability, key))
-
-        row("relay_items", [person, seq], [
-          sender, id, get_in(record, [:terminal, :state]), record.origin, record.session_handle,
-          flag(Map.get(record, :agent_api_v2) == true), if(source, do: blob(source)), parent,
-          Map.get(engine.chat_read_positions, key, 0),
-          flag(BounceDecision.pending_selection?(Map.get(engine.bounce_revisions, key))),
-          flag(listening)
-        ], {person, seq})
-    end
-  end
-
-  defp links(engine, address) do
-    key = {:blob, RecordCodec.encode_key(address)}
-    owners = KeyedValidation.record_authority(engine, address) |> Enum.uniq()
-
-    uploads =
+    lookup = fn address ->
       case RecordCodec.lookup(engine, address) do
-        {:ok, value} -> KeyedValidation.record_uploads(address, value) |> Enum.uniq()
-        :error -> []
+        {:ok, value} -> value
+        :error -> nil
       end
+    end
+
+    case RecordCodec.lookup(engine, address) do
+      {:ok, value} ->
+        item_position = &get_in(engine.messages, [&1, :accepted_seq])
+        rows = primary_rows(address, value, lookup, item_position)
+        %{rows | rows: rows.rows ++ links(address, value)}
+
+      :error ->
+        empty()
+    end
+  end
+
+  defp primary_rows({:row, :messages, {person, _, _} = key}, record, lookup, item_position) do
+    seq = record.accepted_seq
+    values = item_fields(key, record) ++ item_facts(key, record, lookup, item_position)
+    row("relay_items", [person, seq], values, {person, seq})
+  end
+
+  defp primary_rows({:row, :conversation_events, {person, seq}}, %{key: key, payload: payload}, _, item_position) do
+    case item_position.(key) do
+      item when is_integer(item) ->
+        kind = payload["kind"]
+        event = payload["event_id"]
+        target = Resources.delivery_target(payload)
+        fold = if kind in @entry_kinds, do: event, else: target
+
+        row("relay_entries", [person, seq], [item, kind, payload["author"], event, nil, target],
+          {person, item}, if(is_binary(fold), do: {person, item, fold}))
+
+      _ ->
+        empty()
+    end
+  end
+
+  defp primary_rows({:origin_feed, {person, origin}, {:entry, seq}}, entry, lookup, item_position) do
+    item = item_position.({person, entry["sender_id"], entry["message_id"]})
+    facts = {person, origin, seq}
+
+    row("relay_feed", [person, origin, seq], [
+      entry["session_handle"], item, entry["kind"], entry["author"],
+      flag(Conversation.actionable?(entry)), flag(DeliveryBaseline.baseline_entry?(entry)),
+      receipt_level(lookup.({:row, :origin_receipts, facts})),
+      flag(not is_nil(lookup.({:row, :origin_actions, facts}))), Conversation.answer_baseline_attempt(entry)
+    ], if(item, do: {person, item}))
+  end
+
+  defp primary_rows({:advisory, {person, origin, session}, {:entry, seq}}, entry, _, item_position) do
+    item = item_position.({person, entry["sender_id"], entry["message_id"]})
+    row("relay_advisories", [person, origin, session, seq], [item, entry["advisory_id"]])
+  end
+
+  defp primary_rows({:row, :origin_sessions, {person, origin, session}}, data, _, _) do
+    row("relay_sessions", [person, origin, session], [
+      flag(data.gone), flag(get_in(data, [:support, "origin_listener"]) == true)
+    ])
+  end
+
+  defp primary_rows(_, _, _, _), do: empty()
+
+  defp item_fields({_person, sender, id}, record) do
+    source = KeyedValidation.source_key(record)
+
+    [sender, id, get_in(record, [:terminal, :state]), record.origin, record.session_handle,
+     flag(Map.get(record, :agent_api_v2) == true), if(source, do: blob(source))]
+  end
+
+  defp item_facts(key, record, lookup, item_position) do
+    parent = item_position.(Map.get(record, :placement_origin_target))
+    listening = match?({"listening", _}, lookup.({:row, :item_availability, key}))
+
+    [parent, lookup.({:row, :chat_read_positions, key}) || 0,
+     flag(BounceDecision.pending_selection?(lookup.({:row, :bounce_revisions, key}))), flag(listening)]
+  end
+
+  defp links(address, value) do
+    key = {:blob, RecordCodec.encode_key(address)}
+    owners = KeyedValidation.record_authority(address, value) |> Enum.uniq()
+    uploads = KeyedValidation.record_uploads(address, value) |> Enum.uniq()
 
     Enum.map(owners, &{"relay_authority", [blob(&1), key], []}) ++
       Enum.map(uploads, &{"relay_upload_refs", [&1, key], []})
   end
-
-  defp item_position(engine, key), do: get_in(engine.messages, [key, :accepted_seq])
-
-  defp entry_position(engine, person, entry),
-    do: item_position(engine, {person, entry["sender_id"], entry["message_id"]})
 
   defp receipt_level(nil), do: 0
   defp receipt_level(%{implicit_ack: true}), do: 1

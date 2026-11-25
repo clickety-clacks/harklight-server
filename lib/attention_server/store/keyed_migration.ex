@@ -16,7 +16,7 @@ defmodule AttentionServer.Store.KeyedMigration do
 
     with :ok <- large_data_index(db),
          :ok <- RecordTable.seed(db, 0, RecordCodec.encode(engine)),
-         :ok <- DerivedIndex.create(db, 0, engine) do
+         :ok <- DerivedIndex.create(db, 0) do
       RecordTable.run(db, "INSERT INTO relay_state (id, version, payload, checksum) VALUES (1, 0, ?, ?)", [
         {:blob, payload}, {:blob, :crypto.hash(:sha256, payload)}
       ])
@@ -40,7 +40,7 @@ defmodule AttentionServer.Store.KeyedMigration do
          :ok <- large_data_index(db),
          {:ok, count} <- RecordTable.seed_count(db, generation, rows),
          :ok <- report_stage(:records_written),
-         :ok <- DerivedIndex.create(db, generation, engine),
+         :ok <- DerivedIndex.create(db, generation),
          :ok <- report_stage(:indexes_written),
          :ok <- verify_records(db, engine, count),
          :ok <- report_stage(:records_verified),
