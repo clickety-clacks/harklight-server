@@ -933,7 +933,7 @@ defmodule AttentionServer.ClientAPI.Writes do
         through ->
           {:ok,
            %{
-                 "type" => "conversation_read",
+             "type" => "conversation_read",
              "op_id" => op_id(key),
              "sender_id" => sender,
              "message_id" => message_id,
