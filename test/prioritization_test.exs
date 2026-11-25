@@ -332,6 +332,59 @@ defmodule AttentionServer.PrioritizationTest do
            ).advisory_feeds == fallback_engine.advisory_feeds
   end
 
+  test "Hosted accounts rank independently using the configured connection", %{
+    path: path,
+    dir: dir
+  } do
+    use_synthetic_jev_key(dir)
+    test_process = self()
+
+    relay =
+      start_relay(path,
+        deployment_mode: :saas,
+        jev_endpoint: "https://provider.example.test",
+        jev_model: "test-model",
+        priority_evaluator: fn request ->
+          send(test_process, {:hosted_jev_request, request})
+          {:ok, Map.new(request.candidates, &{&1, 0.75})}
+        end
+      )
+
+    assert {:ok, alice} = Relay.hosted_account_create(relay, "alice-account")
+    assert {:ok, bob} = Relay.hosted_account_create(relay, "bob-account")
+
+    for {person, device, message, n} <-
+          [{alice, "alice-device", "alice-message", 1}, {bob, "bob-device", "bob-message", 2}] do
+      assert :ok = Relay.setup_device(relay, person, device)
+      assert :ok = Relay.setup_sender(relay, device, "app:test")
+
+      assert %{"type" => "ok"} =
+               request(relay, device, %{
+                 "type" => "forward",
+                 "op_id" => op(n),
+                 "message" => %{
+                   "sender_id" => "app:test",
+                   "message_id" => message,
+                   "title" => message,
+                   "created_at" => n
+                 }
+               })
+    end
+
+    for {person, message} <- [{alice, "alice-message"}, {bob, "bob-message"}] do
+      assert_receive {:hosted_jev_request,
+                      %{
+                        model: "test-model",
+                        uri: %{host: "provider.example.test"},
+                        candidates: [{"app:test", ^message}]
+                      }},
+                     2_000
+
+      state = await_state(relay, &(&1.priority_views[person].basis == "selected"))
+      assert [%{"message_id" => ^message, "score" => 0.75}] = state.priority_views[person].entries
+    end
+  end
+
   test "Jev selected views remain score-only after fallback display priorities", %{
     path: path,
     dir: dir

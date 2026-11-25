@@ -1,11 +1,14 @@
 defmodule AttentionServer.APNSRuntimeConfigTest do
   use ExUnit.Case, async: false
 
-  alias AttentionServer.{Server, TLSFixtures}
+  alias AttentionServer.{Relay, Server, TLSFixtures}
 
   @config Path.expand("../config/runtime.exs", __DIR__)
   @server_env %{
     "ATTENTION_SERVER_ENABLE" => "1",
+    "ATTENTION_SERVER_JEV_ENDPOINT" => nil,
+    "ATTENTION_SERVER_JEV_MODEL" => nil,
+    "ATTENTION_SERVER_JEV_KEY_PATH" => nil,
     "ATTENTION_SERVER_JEV_SCORE_RECORD_PATH" => nil,
     "ATTENTION_SERVER_FEATURE_FLAGS_PATH" => nil,
     "ATTENTION_SERVER_STORE_PATH" => "/tmp/harklight-config-test/relay.sqlite3",
@@ -64,6 +67,48 @@ defmodule AttentionServer.APNSRuntimeConfigTest do
         assert :sys.get_state(writer).path == "/unused/scores.jsonl"
       end
     )
+  end
+
+  test "Hosted uses the startup Jev connection for new and existing accounts", %{certs: certs} do
+    env =
+      Map.merge(@server_env, %{
+        "ATTENTION_SERVER_DEPLOYMENT_MODE" => "saas",
+        "ATTENTION_SERVER_JEV_ENDPOINT" => "https://provider.example.test",
+        "ATTENTION_SERVER_JEV_MODEL" => "test-model",
+        "ATTENTION_SERVER_JEV_KEY_PATH" => "/unused/test-jev-key"
+      })
+
+    with_env(env, fn ->
+      opts = runtime_server_opts(certs)
+      assert opts[:jev_endpoint] == "https://provider.example.test"
+      assert opts[:jev_model] == "test-model"
+
+      server = start_server(Keyword.drop(opts, [:jev_endpoint, :jev_model]))
+      relay = Server.relay(server)
+      assert {:ok, existing} = Relay.hosted_account_create(relay, "existing-account")
+      assert :sys.get_state(relay).priority_views[existing].algorithm == "baseline"
+      Supervisor.stop(server)
+
+      server = start_server(opts)
+      relay = Server.relay(server)
+      assert {:ok, new} = Relay.hosted_account_create(relay, "new-account")
+
+      state = :sys.get_state(relay)
+      assert state.hosted_jev_connection == {"https://provider.example.test", "test-model"}
+      assert state.store.engine.jev_endpoint == nil
+      assert %{algorithm: "jev-set", basis: "fallback"} = state.priority_views[existing]
+      assert %{algorithm: "jev-set", basis: "fallback"} = state.priority_views[new]
+
+      assert {:ok, %{algorithm_id: "baseline"}} =
+               Relay.hosted_set_algorithm(relay, existing, "baseline")
+
+      Supervisor.stop(server)
+
+      server = start_server(opts)
+      relay = Server.relay(server)
+      assert %{algorithm: "baseline"} = :sys.get_state(relay).priority_views[existing]
+      assert %{algorithm: "jev-set"} = :sys.get_state(relay).priority_views[new]
+    end)
   end
 
   test "optional feature flag path reaches the relay without reading it at startup", %{

@@ -4,6 +4,7 @@ defmodule AttentionServer.JevClient do
   alias AttentionServer.{JSON, LargeData}
 
   @key_path_env "ATTENTION_SERVER_JEV_KEY_PATH"
+  @request_timeout 30_000
   @response_limit 4 * 1024 * 1024
   @request_limit 8 * 1024 * 1024
   @request_budget 48_000
@@ -16,6 +17,8 @@ defmodule AttentionServer.JevClient do
     "Emergency: immediate attention is needed to prevent serious harm, a production outage, or an imminent consequential deadline."
   ]
   @maximum_score length(@criteria) - 1
+
+  def key_configured?, do: System.get_env(@key_path_env) not in [nil, ""]
 
   def key_status do
     case read_key() do
@@ -204,16 +207,21 @@ defmodule AttentionServer.JevClient do
     |> DateTime.to_iso8601()
   end
 
-  def evaluate(%{uri: uri, body: body, candidates: candidates, question_identities: identities}) do
+  def evaluate(request, timeout \\ @request_timeout)
+
+  def evaluate(
+        %{uri: uri, body: body, candidates: candidates, question_identities: identities},
+        timeout
+      ) do
     with {:ok, key} <- read_key(),
-         {:ok, response} <- post(uri, body, key) do
+         {:ok, response} <- bounded_post(uri, body, key, timeout) do
       rank_response(response, identities, candidates)
     else
       _ -> {:error, :unavailable}
     end
   end
 
-  def evaluate(_), do: {:error, :unavailable}
+  def evaluate(_, _), do: {:error, :unavailable}
 
   def rank_response(body, question_identities, candidates)
       when is_list(candidates) and is_map(question_identities) do
@@ -295,6 +303,17 @@ defmodule AttentionServer.JevClient do
       {:ok, %{uri | path: if(uri.path in [nil, ""], do: "/v1/systemone", else: uri.path)}}
     else
       {:error, :invalid_endpoint}
+    end
+  end
+
+  # The socket belongs to this linked task. One deadline covers connection,
+  # upload and the entire response, even when a peer keeps the connection open.
+  defp bounded_post(uri, body, key, timeout) do
+    task = Task.async(fn -> post(uri, body, key) end)
+
+    case Task.yield(task, timeout) || Task.shutdown(task, :brutal_kill) do
+      {:ok, result} -> result
+      _ -> {:error, :unavailable}
     end
   end
 

@@ -486,6 +486,7 @@ defmodule AttentionServer.Relay do
           {:ok, store} ->
             state = %{
               store: store,
+              hosted_jev_connection: hosted_jev_connection(opts),
               feature_flags_path: Keyword.get(opts, :feature_flags_path),
               feature_flags_warned: false,
               clock: Keyword.get(opts, :clock, fn -> System.system_time(:millisecond) end),
@@ -2836,13 +2837,50 @@ defmodule AttentionServer.Relay do
 
   defp commit_request(store, next, audit, _original), do: commit(store, next, audit)
 
+  defp hosted_jev_connection(opts) do
+    if Keyword.get(opts, :deployment_mode) == :saas do
+      with true <- JevClient.key_configured?(),
+           {:ok, endpoint} when is_binary(endpoint) <-
+             normalize_endpoint(Keyword.get(opts, :jev_endpoint)),
+           {:ok, model} when is_binary(model) <- normalize_model(Keyword.get(opts, :jev_model)) do
+        {endpoint, model}
+      else
+        _ -> {nil, nil}
+      end
+    end
+  end
+
+  defp jev_connection(%{hosted_jev_connection: connection}) when is_tuple(connection),
+    do: connection
+
+  defp jev_connection(%{store: %{engine: engine}}),
+    do: {engine.jev_endpoint, engine.jev_model}
+
+  defp jev_ready?(state) do
+    {endpoint, model} = jev_connection(state)
+    JevClient.connection_ready?(endpoint, model)
+  end
+
+  defp priority_default(state, person) do
+    if match?({endpoint, _model} when is_binary(endpoint), state.hosted_jev_connection) and
+         Engine.hosted_account(state.store.engine, person) do
+      "jev-set"
+    else
+      "baseline"
+    end
+  end
+
+  defp priority_choice(state, person) do
+    Placement.choice(state.store.engine, person, priority_default(state, person))
+  end
+
   defp initialize_priority_views(state) do
     Enum.reduce(Map.keys(state.store.engine.persons), state, fn person, current ->
       current = ensure_priority_view(current, person)
       engine = current.store.engine
 
-      if Placement.reassess(engine, person, nil) == :whole_set and
-           JevClient.connection_ready?(engine.jev_endpoint, engine.jev_model) and
+      if Placement.reassess(engine, person, nil, priority_choice(current, person)) == :whole_set and
+           jev_ready?(current) and
            Placement.ranking_items(engine, person) != [] do
         schedule_priority_pass(current, person)
       else
@@ -2853,7 +2891,7 @@ defmodule AttentionServer.Relay do
 
   defp ensure_priority_view(state, person) do
     engine = state.store.engine
-    choice = Placement.choice(engine, person)
+    choice = priority_choice(state, person)
     {items, reply_summary} = Placement.ranking_projection(engine, person)
     previous = Map.get(state.priority_views, person)
 
@@ -2866,7 +2904,7 @@ defmodule AttentionServer.Relay do
             entries: Placement.place(choice, items, [], nil)
           }
 
-        not JevClient.connection_ready?(engine.jev_endpoint, engine.jev_model) ->
+        not jev_ready?(state) ->
           fallback_view(items)
 
         match?(%{algorithm: "jev-set", basis: "selected"}, previous) ->
@@ -2949,13 +2987,19 @@ defmodule AttentionServer.Relay do
       |> Map.put(:replies, Enum.sort_by(replies, & &1["conversation_seq"]))
       |> Map.put(
         :list_items,
-        Placement.list_items(state.store.engine, person, engine_entries, reply_summary)
+        Placement.list_items(
+          state.store.engine,
+          person,
+          engine_entries,
+          reply_summary,
+          view.algorithm
+        )
       )
 
     # Baseline entries follow the list order. Ranks read the entries through
     # message_entries_by_identity, where the first entry for an identity wins.
     shown =
-      if Placement.choice(state.store.engine, person) == "baseline" do
+      if view.algorithm == "baseline" do
         entries_by_id = Map.new(messages, &{Placement.identity(&1), &1})
 
         ordered_messages =
@@ -3032,8 +3076,8 @@ defmodule AttentionServer.Relay do
     previous_entries =
       if is_map(previous), do: Map.get(previous, :engine_entries, previous.entries), else: []
 
-    if Placement.reassess(engine, person, previous_entries) == :whole_set and
-         JevClient.connection_ready?(engine.jev_endpoint, engine.jev_model) and
+    if Placement.reassess(engine, person, previous_entries, priority_choice(state, person)) ==
+         :whole_set and jev_ready?(state) and
          Placement.ranking_items(engine, person) != [] do
       schedule_priority_pass(state, person)
     else
@@ -3050,8 +3094,8 @@ defmodule AttentionServer.Relay do
     previous_entries =
       if is_map(previous), do: Map.get(previous, :engine_entries, previous.entries), else: []
 
-    if Placement.reassess(engine, person, previous_entries) == :whole_set and
-         JevClient.connection_ready?(engine.jev_endpoint, engine.jev_model) and
+    if Placement.reassess(engine, person, previous_entries, priority_choice(state, person)) ==
+         :whole_set and jev_ready?(state) and
          Placement.ranking_items(engine, person) != [] do
       schedule_priority_pass(state, person)
     else
@@ -3091,8 +3135,7 @@ defmodule AttentionServer.Relay do
     generation = Map.fetch!(state.priority_generations, person)
     engine = state.store.engine
 
-    if Placement.choice(engine, person) == "jev-set" and
-         JevClient.connection_ready?(engine.jev_endpoint, engine.jev_model) and
+    if priority_choice(state, person) == "jev-set" and jev_ready?(state) and
          Placement.ranking_items(engine, person) != [] do
       ref =
         Process.send_after(
@@ -3118,13 +3161,13 @@ defmodule AttentionServer.Relay do
       Map.get(state.priority_generations, person, 0) != generation ->
         state
 
-      Placement.choice(engine, person) != "jev-set" ->
+      priority_choice(state, person) != "jev-set" ->
         state
 
       Map.has_key?(state.priority_jobs, person) ->
         %{state | priority_queued: Map.put(state.priority_queued, person, generation)}
 
-      not JevClient.connection_ready?(engine.jev_endpoint, engine.jev_model) ->
+      not jev_ready?(state) ->
         state |> clear_priority_cache(person) |> set_fallback_priority_view(person)
 
       true ->
@@ -3135,11 +3178,12 @@ defmodule AttentionServer.Relay do
         cache_epoch = Map.get(state.priority_cache_epochs, person, 0)
         now = state.clock.()
         evaluator = state.priority_evaluator
+        {endpoint, model} = jev_connection(state)
 
         {pid, monitor} =
           spawn_monitor(fn ->
             result =
-              JevRanking.run(items, cache, engine.jev_endpoint, engine.jev_model, now, evaluator)
+              JevRanking.run(items, cache, endpoint, model, now, evaluator)
 
             send(parent, {:prioritization_result, person, sequence, generation, result})
           end)
@@ -3154,8 +3198,8 @@ defmodule AttentionServer.Relay do
                 sequence: sequence,
                 generation: generation,
                 cache_epoch: cache_epoch,
-                endpoint: engine.jev_endpoint,
-                model: engine.jev_model
+                endpoint: endpoint,
+                model: model
               })
         }
     end
@@ -3167,15 +3211,17 @@ defmodule AttentionServer.Relay do
     engine = state.store.engine
     generation = Map.get(state.priority_generations, person, 0)
 
+    {endpoint, model} = jev_connection(state)
+
     same_connection? =
-      Placement.choice(engine, person) == "jev-set" and
-        Map.get(job, :endpoint, engine.jev_endpoint) == engine.jev_endpoint and
-        Map.get(job, :model, engine.jev_model) == engine.jev_model and
+      priority_choice(state, person) == "jev-set" and
+        Map.get(job, :endpoint, endpoint) == endpoint and
+        Map.get(job, :model, model) == model and
         Map.get(job, :cache_epoch, Map.get(state.priority_cache_epochs, person, 0)) ==
           Map.get(state.priority_cache_epochs, person, 0)
 
     ready? =
-      same_connection? and JevClient.connection_ready?(engine.jev_endpoint, engine.jev_model)
+      same_connection? and jev_ready?(state)
 
     current? = generation == job.generation and ready?
 
@@ -3235,8 +3281,8 @@ defmodule AttentionServer.Relay do
           ready? and is_map(result) and Map.has_key?(result, :cache) ->
             %{state | priority_caches: Map.put(state.priority_caches, person, result.cache)}
 
-          generation == job.generation and Placement.choice(engine, person) == "jev-set" and
-              not JevClient.connection_ready?(engine.jev_endpoint, engine.jev_model) ->
+          generation == job.generation and priority_choice(state, person) == "jev-set" and
+              not jev_ready?(state) ->
             state |> clear_priority_cache(person) |> set_fallback_priority_view(person)
 
           true ->
@@ -3570,11 +3616,16 @@ defmodule AttentionServer.Relay do
       state.deployment_mode != :saas or is_nil(Engine.hosted_account(engine, person)) ->
         {:error, :not_hosted, state}
 
-      Placement.choice(engine, person) == algorithm ->
+      priority_choice(state, person) == algorithm ->
         {:ok, ensure_priority_view(state, person)}
 
       true ->
-        case Engine.set_algorithm_choice(engine, person, algorithm) do
+        case Engine.set_algorithm_choice(
+               engine,
+               person,
+               algorithm,
+               priority_default(state, person)
+             ) do
           {:ok, ^engine} ->
             {:ok, state}
 

@@ -93,7 +93,21 @@ defmodule AttentionServer.JevClientConnectionEventTest do
     assert Task.await(task, 2_000) == {:error, :unavailable}
   end
 
-  defp call(port) do
+  @tag timeout: 10_000
+  test "an open peer that stalls TLS cannot hold the provider call indefinitely" do
+    {:ok, listener} = :gen_tcp.listen(0, [:binary, active: false, ip: {127, 0, 0, 1}])
+    {:ok, {_, port}} = :inet.sockname(listener)
+    on_exit(fn -> :gen_tcp.close(listener) end)
+
+    task = Task.async(fn -> call(port, 1_000) end)
+    assert {:ok, socket} = :gen_tcp.accept(listener, 2_000)
+    assert {:ok, _client_hello} = :gen_tcp.recv(socket, 0, 2_000)
+
+    assert Task.await(task, 2_000) == {:error, :unavailable}
+    assert {:error, :closed} = :gen_tcp.recv(socket, 0, 2_000)
+  end
+
+  defp call(port, timeout \\ 30_000) do
     item = %{
       identity: {"app:test", "connection-event"},
       message: %{"title" => "Synthetic peer close"}
@@ -102,6 +116,6 @@ defmodule AttentionServer.JevClientConnectionEventTest do
     {:ok, request} =
       JevClient.compose([item], "https://localhost:#{port}/v1/systemone", "test-model")
 
-    JevClient.evaluate(request)
+    JevClient.evaluate(request, timeout)
   end
 end

@@ -786,10 +786,12 @@ defmodule AttentionServer.Engine do
   end
 
   @doc false
-  def set_algorithm_choice(%__MODULE__{} = engine, person, algorithm)
+  def set_algorithm_choice(engine, person, algorithm, default \\ "baseline")
+
+  def set_algorithm_choice(%__MODULE__{} = engine, person, algorithm, default)
       when algorithm in ["baseline", "jev-set"] do
     if Map.has_key?(engine.persons, person) do
-      if Map.get(engine.algorithm_choices, person, "baseline") == algorithm do
+      if Map.get(engine.algorithm_choices, person, default) == algorithm do
         {:ok, engine}
       else
         {:ok, put_row(engine, :algorithm_choices, person, algorithm)}
@@ -799,7 +801,8 @@ defmodule AttentionServer.Engine do
     end
   end
 
-  def set_algorithm_choice(%__MODULE__{}, _person, _algorithm), do: {:error, :unknown_algorithm}
+  def set_algorithm_choice(%__MODULE__{}, _person, _algorithm, _default),
+    do: {:error, :unknown_algorithm}
 
   @doc false
   def set_jev_connection(%__MODULE__{} = engine, endpoint, model) do
