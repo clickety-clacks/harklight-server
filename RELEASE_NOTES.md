@@ -1,3 +1,22 @@
+# Harklight Server v0.2.16
+
+Requests, chat replies, and messages marked High or Urgent alert the phone
+with the standard iOS sound and vibration. Other messages arrive quietly
+and still appear in Notification Center, the Inbox, and the badge. The
+recipient can choose to receive all alerts. A quiet delivery does not hold
+back the first alerting delivery in a five-minute window.
+
+## Upgrade and recovery
+
+First start upgrades a FORMAT29 snapshot to FORMAT30 and uses the quiet
+default for existing people. Take a complete private backup before starting
+the new release. To return to a FORMAT29 release, stop the new Server and
+restore that backup before starting the older release. The restore discards
+subsequent writes and cannot undo notifications already delivered.
+
+**Compatibility.** The Server continues to use protocol 0.2. Existing
+Harklight Agent releases do not need to send any new fields.
+
 # Harklight Server v0.2.15
 
 iPhone notifications now carry the version 2 sync payload that the Harklight

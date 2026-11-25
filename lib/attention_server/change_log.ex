@@ -212,6 +212,7 @@ defmodule AttentionServer.ChangeLog do
     settings =
       [
         changed_keys(old.bounce_levels, next.bounce_levels),
+        changed_keys(old.alert_choices, next.alert_choices),
         old.push_bindings
         |> changed_keys(next.push_bindings)
         |> Enum.map(fn {person, _device} -> person end)
@@ -390,6 +391,9 @@ defmodule AttentionServer.ChangeLog do
         grouped
         |> touched_rows(:bounce_levels)
         |> touched_changes(old.bounce_levels, next.bounce_levels),
+        grouped
+        |> touched_rows(:alert_choices)
+        |> touched_changes(old.alert_choices, next.alert_choices),
         grouped
         |> touched_rows(:push_bindings)
         |> touched_changes(old.push_bindings, next.push_bindings)
@@ -642,7 +646,7 @@ defmodule AttentionServer.ChangeLog do
   def seeded?(%Engine{} = engine, person) do
     Enum.any?(engine.messages, fn {{p, _, _}, _} -> p == person end) or
       Enum.any?(engine.conversation_events, fn {{p, _}, _} -> p == person end) or
-      Map.has_key?(engine.bounce_levels, person)
+      Map.has_key?(engine.bounce_levels, person) or Map.has_key?(engine.alert_choices, person)
   end
 
   @doc false
@@ -654,7 +658,7 @@ defmodule AttentionServer.ChangeLog do
   def seeded_from_highs?(%Engine{} = engine, person) do
     Map.get(engine.persons, person, 0) > 0 or
       Map.get(engine.conversation_highs, person, 0) > 0 or
-      Map.has_key?(engine.bounce_levels, person)
+      Map.has_key?(engine.bounce_levels, person) or Map.has_key?(engine.alert_choices, person)
   end
 
   # -- one commit's log -------------------------------------------------------

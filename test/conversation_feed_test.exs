@@ -62,7 +62,7 @@ defmodule AttentionServer.ConversationFeedTest do
   end
 
   defp write_legacy_snapshot(path, engine) do
-    {payload, _cache} = SnapshotEncoding.encode(engine, 29)
+    {payload, _cache} = SnapshotEncoding.encode(engine, 30)
     {version, _old_payload, _checksum} = state_snapshot(path)
     assert {:ok, db} = Sqlite3.open(path)
 
@@ -918,7 +918,7 @@ defmodule AttentionServer.ConversationFeedTest do
     {_, committed_payload, _} = state_snapshot(path)
     assert byte_size(committed_payload) - byte_size(before_payload) < 65_536
 
-    assert {:attention_relay_state, 29, persisted} =
+    assert {:attention_relay_state, 30, persisted} =
              :erlang.binary_to_term(committed_payload, [:safe])
 
     persisted_record = persisted.messages[{"A", "app:test", "large-title"}]
@@ -1023,7 +1023,7 @@ defmodule AttentionServer.ConversationFeedTest do
     end
   end
 
-  test "a legacy FORMAT29 reader sees an honest marker, serves unrelated records, and re-upgrade restores full content",
+  test "a reader without the external data sees an honest marker and serves unrelated records",
        %{path: path} do
     assert {:ok, relay} = Relay.start_link(store_path: path)
     assert :ok = Relay.setup_person(relay, "A")
@@ -1076,7 +1076,7 @@ defmodule AttentionServer.ConversationFeedTest do
     GenServer.stop(relay)
 
     {_, payload, _} = state_snapshot(path)
-    assert {:attention_relay_state, 29, persisted} = :erlang.binary_to_term(payload, [:safe])
+    assert {:attention_relay_state, 30, persisted} = :erlang.binary_to_term(payload, [:safe])
     large_record = persisted.messages[{"A", "app:test", "rollback-large"}]
     title_marker = large_record.message["title"]
     body_marker = large_record.message["body"]
@@ -1094,8 +1094,7 @@ defmodule AttentionServer.ConversationFeedTest do
 
     assert Enum.all?(saved_files, fn {_id, bytes} -> bytes == large_text end)
 
-    # The previous FORMAT29 reader loads these ordinary message strings directly.
-    # Relay and Engine's message-read path is unchanged by this PR.
+    # Without the external data, Relay can still read these ordinary message strings.
     assert {:ok, legacy_relay} = Relay.start_link(store_path: path <> ".reader")
     legacy_engine = persisted
 

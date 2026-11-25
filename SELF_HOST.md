@@ -450,6 +450,16 @@ Upgrading directly from 0.1.x to v0.2.15 also changes the protocol:
   `--device-port` in scripts, and create new invitations to replace unused
   ones.
 
+### Releases with quiet-by-default alerts
+
+The first start of a release with quiet-by-default alerts upgrades a FORMAT29
+snapshot to FORMAT30. Existing accounts use the `important` alert choice until
+the recipient changes it. Take a complete private backup with the old Server
+stopped before starting the upgrade. A FORMAT29 release cannot open the
+upgraded snapshot. To roll back, stop the new Server, restore the pre-upgrade
+backup, and start the release that wrote it. This discards every write after
+the backup and cannot undo notifications or other external deliveries.
+
 The release installer stops the service and confirms the process has stopped,
 then creates one full mutable-root backup before switching `current`. If backup
 creation fails, it attempts to resume the prior service and does not switch the

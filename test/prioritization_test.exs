@@ -753,7 +753,7 @@ defmodule AttentionServer.PrioritizationTest do
     assert :ok = Sqlite3.release(db, select)
     assert :ok = Sqlite3.close(db)
 
-    assert {:attention_relay_state, 29, saved_engine} =
+    assert {:attention_relay_state, 30, saved_engine} =
              :erlang.binary_to_term(saved_payload, [:safe])
 
     refute Map.has_key?(saved_engine, :open_default_index)

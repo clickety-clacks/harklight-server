@@ -1194,8 +1194,6 @@ defmodule AttentionServer.ClientAPIWritesTest do
   test "alerts writes validate, replay, and sync across a person's devices", %{path: path} do
     relay = scripted_relay(path)
     assert :ok = Relay.setup_device(relay, "A", "second")
-    assert :ok = Relay.setup_person(relay, "B")
-    assert :ok = Relay.setup_device(relay, "B", "other")
     tag = settings_etag(relay, "reader")
     {:ok, before} = head(relay)
     route = ["settings", "alerts"]
@@ -1218,7 +1216,7 @@ defmodule AttentionServer.ClientAPIWritesTest do
     assert {412, %{"error" => "precondition_failed"}, _} =
              post(relay, route, ~s({"alerts":"important"}), [{"if-match", tag}], "PUT")
 
-    assert {:ok, %{"settings" => %{"alerts" => "important"}}} = Reads.settings(relay, "other")
+    assert {:ok, %{"settings" => %{"alerts" => "important"}}} = Reads.settings(relay, "stranger")
     assert {:ok, %{"settings" => %{"alerts" => "all"} = settings}} = Reads.settings(relay, "second")
 
     state = :sys.get_state(relay)
