@@ -295,7 +295,33 @@ defmodule AttentionServer.ClientAPIOriginParityTest do
     assert %{"changes" => []} = decode(get(ctx, @origin, baseline <> "&page=" <> token))
   end
 
-  test "ordinary feed service excludes granted-agent and default answers from a fresh baseline",
+  test "an unconfirmed stream leaves a granted-agent answer pending for a fresh baseline",
+       ctx do
+    register_agent(ctx)
+    item = item_id(send_message(ctx, @origin, 10))
+    {conn, feed} = open_agent_feed(ctx, agent_head(ctx), @session)
+
+    assert request(
+             ctx,
+             "parity-agent",
+             "POST",
+             answer_path(item),
+             %{"request_revision" => 1, "comment" => "Agent words"},
+             11
+           ).status == 200
+
+    {conn, _feed, answer} = next_answer(conn, feed)
+    assert %{event: "message", data: %{"item_id" => ^item}} = answer
+    Mint.HTTP.close(conn)
+
+    baseline = "/v2/agent/delivery-baseline?session=#{@session}"
+    assert %{"next_page" => token} = decode(get(ctx, @origin, baseline))
+
+    assert %{"changes" => [%{"kind" => "message", "data" => %{"item_id" => ^item}}]} =
+             decode(get(ctx, @origin, baseline <> "&page=" <> token))
+  end
+
+  test "a JSON feed batch excludes granted-agent and default answers from a fresh baseline",
        ctx do
     register_agent(ctx)
     agent_answer = item_id(send_message(ctx, @origin, 10))
@@ -668,6 +694,17 @@ defmodule AttentionServer.ClientAPIOriginParityTest do
 
       {conn, feed, [_]} ->
         next_change(conn, feed, text)
+    end
+  end
+
+  defp next_answer(conn, feed) do
+    case ClientAPIFeedClient.events(conn, feed, 1) do
+      {conn, feed,
+       [%{event: "message", data: %{"terminal" => %{"state" => "answered"}}} = answer]} ->
+        {conn, feed, answer}
+
+      {conn, feed, [_]} ->
+        next_answer(conn, feed)
     end
   end
 

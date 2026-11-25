@@ -2312,6 +2312,7 @@ defmodule AttentionServer.Engine do
   @doc "Records service of authorized conversation resources selected for a v2 feed response."
   def agent_feed_delivered(%__MODULE__{} = engine, person, key, targets, opts \\ []) do
     attempt = opts[:attempt]
+    stream? = opts[:stream] == true
 
     with {:ok, ^person} <- authorized_person(engine, key) do
       next =
@@ -2320,8 +2321,10 @@ defmodule AttentionServer.Engine do
             %{"author" => "person"} = entry ->
               ensure_delivery_ack1(current, person, key, entry, opts)
 
+            # Non-person answers have no ACK1. Selection for a stream must
+            # leave them available to a pending baseline.
             %{"kind" => "terminal", "terminal_state" => "answered", "author" => author} = entry
-            when author in ["agent", "server"] ->
+            when author in ["agent", "server"] and not stream? ->
               Conversation.record_answer_baseline(
                 current,
                 {person, key},
@@ -2456,6 +2459,7 @@ defmodule AttentionServer.Engine do
       fact =
         delivery_ack_payload(engine, origin, entry, "ack1", nil)
         |> Map.put("r25_served", true)
+        |> put_delivery_option("stream_served", opts[:stream])
         |> put_delivery_option("delivery_baseline_attempt", opts[:attempt])
         |> put_delivery_option(
           "ack2_expected",
@@ -5642,7 +5646,7 @@ defmodule AttentionServer.Engine do
           base,
           Map.drop(
             event.payload,
-            ~w(sender_id message_id feed_seq r25_served delivery_baseline_attempt listener_received)
+            ~w(sender_id message_id feed_seq r25_served stream_served delivery_baseline_attempt listener_received)
           )
         )
       end

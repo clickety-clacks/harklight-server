@@ -175,7 +175,12 @@ defmodule AttentionServer.AgentAPI.DeliveryBaseline do
        do: true
   def baseline_entry?(_entry), do: false
 
-  defp pending?(engine, {person, origin}, %{"author" => "person", "feed_seq" => seq} = entry, attempt) do
+  defp pending?(
+         engine,
+         {person, origin},
+         %{"author" => "person", "feed_seq" => seq} = entry,
+         attempt
+       ) do
     scope_key = {person, origin, seq}
     ack = Engine.delivery_ack_fact(engine, person, origin, entry, :ack1)
     # File reports can create a receipt record seeded from ACK1 alone.
@@ -190,13 +195,11 @@ defmodule AttentionServer.AgentAPI.DeliveryBaseline do
       nil ->
         not settled
 
-      %{"delivery_baseline_attempt" => ^attempt} ->
-        not settled and
+      ack ->
+        (ack["stream_served"] == true or ack["delivery_baseline_attempt"] == attempt) and
+          not settled and
           is_nil(Engine.delivery_ack_fact(engine, person, origin, entry, :ack2)) and
           ack["listener_received"] != true
-
-      _ ->
-        false
     end
   end
 

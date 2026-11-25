@@ -1,3 +1,28 @@
+# Harklight Server v0.2.19
+
+Fixes a case where an agent could miss a reply. When an agent's live listen
+stream stopped, the first person reply or agent answer written as the stream
+closed was counted as delivered even though nothing received it, so every
+later catch-up read by the agent (on first open, or after its cursor expired)
+left it out. Entries written a minute or more after the stream
+stopped, or after a Server restart, were not affected. The Server now keeps
+such an entry in the catch-up read until the agent reports receipt or handoff
+or acts on it. An agent may therefore see an entry it was already
+streamed again on a fresh catch-up; it is the same turn with the same ID.
+
+## Upgrade and recovery
+
+From v0.2.16, v0.2.17 or v0.2.18 this release changes no store format: the
+store stays FORMAT30. From FORMAT29 state, first start upgrades the store to
+FORMAT30 as in v0.2.16. Take a complete private backup before starting the new
+release. To return to v0.2.16, v0.2.17 or v0.2.18, stop the new Server and
+start that release against the same state; to return to a FORMAT29 release,
+restore the backup taken under that release.
+
+**Compatibility.** Harklight Server 0.2.19 uses protocol 0.2 with no API
+change. Harklight Agent 0.2.6 is the matching release. Harklight app 0.2.0 and
+Harklight Web 0.2.5 are the client baseline.
+
 # Harklight Server v0.2.18
 
 The Server uses much less memory while saving. It used to keep a compressed
