@@ -112,6 +112,7 @@ defmodule Format31Rehearsal do
         %{"sender_id" => @sender, "message_id" => "item-#{i}", "score" => 0.9}
       end
 
+    engine = mark_long_chats_read(engine, messages, active, discussions, now + exchanges + 1)
     engine = BounceDecision.record_scores(engine, @person, scores, now)
     deadline = BounceDecision.next_deadline(engine)
     {:ok, store} =
@@ -125,6 +126,7 @@ defmodule Format31Rehearsal do
       fyis: Enum.count(engine.messages, fn {_, record} -> record.message["message_type"] == "fyi" end),
       pending_messages: Enum.count(engine.messages, fn {_, record} -> is_nil(record.terminal) end),
       revised_messages: Enum.count(engine.messages, fn {_, record} -> record.revision > 1 end),
+      chat_read_positions: map_size(engine.chat_read_positions),
       bounce_due: deadline
     })
   end
@@ -248,6 +250,22 @@ defmodule Format31Rehearsal do
   end
 
   defp path(dir), do: Path.join(dir, "relay.sqlite3")
+
+  defp mark_long_chats_read(engine, messages, active, discussions, now) when discussions >= 900_000 do
+    Enum.reduce((messages - active + 1)..messages, engine, fn i, state ->
+      id = "item-#{i}"
+      key = {@person, @sender, id}
+      position = state.route_b_index.conversation_summary_by_item[key].latest_origin_reply_seq
+
+      transition(state, @reader, %{
+        "type" => "conversation_read", "op_id" => uuid(5_000_000 + i),
+        "sender_id" => @sender, "message_id" => id,
+        "read_through_conversation_seq" => position
+      }, now)
+    end)
+  end
+
+  defp mark_long_chats_read(engine, _messages, _active, _discussions, _now), do: engine
 
   defp uuid(i) do
     "00000000-0000-4000-8000-" <> String.pad_leading(Integer.to_string(i), 12, "0")
