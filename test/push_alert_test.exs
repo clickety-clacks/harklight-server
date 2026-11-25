@@ -256,7 +256,10 @@ defmodule AttentionServer.PushAlertTest do
     active = push_payload(all)
     assert active["aps"]["sound"] == "default"
     refute Map.has_key?(active["aps"], "interruption-level")
-    assert passive["aps"] == Map.put(Map.delete(active["aps"], "sound"), "interruption-level", "passive")
+
+    assert passive["aps"] ==
+             Map.put(Map.delete(active["aps"], "sound"), "interruption-level", "passive")
+
     assert Map.delete(passive, "aps") == Map.delete(active, "aps")
 
     assert {:ok, _, mixed} =
@@ -486,7 +489,9 @@ defmodule AttentionServer.PushAlertTest do
           )
       }
 
-      {engine, {:ok, reply}} = Engine.request_line(engine, @origin, JSON.encode!(frame) <> "\n", at)
+      {engine, {:ok, reply}} =
+        Engine.request_line(engine, @origin, JSON.encode!(frame) <> "\n", at)
+
       {:ok, %{"seq" => seq}} = JSON.decode_line(reply)
       {engine, seq}
     end
@@ -504,7 +509,12 @@ defmodule AttentionServer.PushAlertTest do
         "answer_ui" => %{
           "schema" => "attention-client.actions/1",
           "actions" => [
-            %{"id" => "seen", "label" => "Seen", "kind" => "value", "value" => %{"acknowledgment" => "seen"}}
+            %{
+              "id" => "seen",
+              "label" => "Seen",
+              "kind" => "value",
+              "value" => %{"acknowledgment" => "seen"}
+            }
           ]
         }
       }

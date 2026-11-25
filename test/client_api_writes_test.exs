@@ -1217,7 +1217,9 @@ defmodule AttentionServer.ClientAPIWritesTest do
              post(relay, route, ~s({"alerts":"important"}), [{"if-match", tag}], "PUT")
 
     assert {:ok, %{"settings" => %{"alerts" => "important"}}} = Reads.settings(relay, "stranger")
-    assert {:ok, %{"settings" => %{"alerts" => "all"} = settings}} = Reads.settings(relay, "second")
+
+    assert {:ok, %{"settings" => %{"alerts" => "all"} = settings}} =
+             Reads.settings(relay, "second")
 
     state = :sys.get_state(relay)
     context = %{engine: state.store.engine, store: state.store, view: state.priority_views["A"]}

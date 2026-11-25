@@ -191,9 +191,10 @@ defmodule AttentionServer.Engine do
         }
 
         claim =
-          if gathered != [] and Enum.all?(gathered, fn {_key, record} ->
-               not alerts?(next, person, record)
-             end) do
+          if gathered != [] and
+               Enum.all?(gathered, fn {_key, record} ->
+                 not alerts?(next, person, record)
+               end) do
             Map.put(claim, :quiet, true)
           else
             claim
