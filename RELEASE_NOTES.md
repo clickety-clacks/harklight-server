@@ -1,3 +1,25 @@
+# Harklight Server v0.2.15
+
+iPhone notifications now carry the version 2 sync payload that the Harklight
+app expects. Before this release the app ignored what a notification carried:
+iOS still showed the alert and badge, but a background notification did not make
+the app sync, no banner appeared while the app was open, and tapping a
+notification opened the app where it was rather than the message. Now a
+notification names the item and the revision to catch up to, and tapping it
+opens the message, or its chat for a chat reply. A grouped notification keeps
+that link and shows fewer sender names when space is short.
+
+## Upgrade and recovery
+
+The Server continues to use FORMAT29, and upgrading from v0.2.0 through v0.2.14
+requires no store format migration. Follow the backup, upgrade, and recovery
+steps in `SELF_HOST.md`. The bundled Harklight Web is 0.2.5, as in v0.2.14.
+
+**Compatibility.** Harklight Server 0.2.15 uses protocol 0.2. The push payload
+is the one described in the client API (§6.2). Harklight Agent 0.2.5 is the
+matching Agent release. Harklight app 0.2.0 and Harklight Web 0.2.5 are the
+client baseline.
+
 # Harklight Server v0.2.14
 
 Any enrolled device on an account, an agent's identity as well as a phone, can
