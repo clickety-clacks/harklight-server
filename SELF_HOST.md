@@ -544,15 +544,17 @@ process-readiness fails. After readiness, it does not automatically roll back;
 the optional owner agent-list probe is warning-only.
 
 Before the first v0.2.20 start, stop the server and take a complete private
-state backup, including the database and keys. To return to an earlier 0.2 release,
-stop v0.2.20, restore the backup taken under the release you ran before
-the upgrade, and run that same release against the restored state.
-To return to a 0.1.x release, stop the server, restore a backup taken before
-the protocol 0.2 cutover that is compatible with the selected 0.1.x release,
-and run that release with its protocol 0.1 clients. Neither older release can
-open the FORMAT30 state this release writes. Either restore loses every write made after
-its backup and cannot undo external notifications, bounces or agent
-deliveries.
+state backup, including the database and keys. To return to v0.2.16 through
+v0.2.19, stop v0.2.20 and start that release against the same state; no
+restore is needed and no writes are lost. To return to a FORMAT29 0.2 release
+(v0.2.0 through v0.2.15), stop v0.2.20, restore the backup taken under the
+release you ran before the upgrade, and run that same release against the
+restored state. To return to a 0.1.x release, stop the server, restore a backup
+taken before the protocol 0.2 cutover that is compatible with the selected 0.1.x
+release, and run that release with its protocol 0.1 clients. Neither a FORMAT29
+0.2 release nor a 0.1.x release can open the FORMAT30 state this release writes.
+Either restore loses every write made after its backup and cannot undo external
+notifications, bounces or agent deliveries.
 
 Restoring an older backup after the server has served clients also repeats
 message IDs and feed positions. Apps and agents that already read past those
