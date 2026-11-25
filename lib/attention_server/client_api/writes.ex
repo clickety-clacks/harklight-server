@@ -327,7 +327,7 @@ defmodule AttentionServer.ClientAPI.Writes do
   end
 
   @doc "Replace the person's alert choice with the same precondition as priority levels."
-  def alerts(relay, who, alerts, if_match, idempotency_key \ nil) do
+  def alerts(relay, who, alerts, if_match, idempotency_key \\ nil) do
     write(relay, who, idempotency_key, {:alerts, alerts, if_match}, %{
       method: "PUT",
       path: ["settings", "alerts"],

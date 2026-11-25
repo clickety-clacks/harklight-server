@@ -5281,7 +5281,7 @@ defmodule AttentionServer.Engine do
     end
   end
 
-  defp queue_push_hint(engine, person, high, delivery \ nil) do
+  defp queue_push_hint(engine, person, high, delivery \\ nil) do
     now_ms = if delivery, do: delivery.accepted_at, else: System.system_time(:millisecond)
 
     immediate? =
