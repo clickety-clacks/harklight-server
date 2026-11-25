@@ -636,9 +636,9 @@ Every write that succeeds answers `200`, or `201` for `POST /v2/files`, with a
     are UUIDv4 values minted once per intent by one client, so this is not a
     production pattern, and nothing defends against it.
 - **`PUT /v2/devices/me/push`** is supported when the Server has Apple push
-  keys or a [push relay URL](push-relay.md) configured. Both transports use
-  the same registration request and response. Without either configuration,
-  registration answers `400 unsupported`.
+  keys configured; without them, registration answers `400 unsupported`. A
+  later release adds the [push relay](push-relay.md) as a second transport
+  with the same registration request and response.
 - **`DELETE /v2/devices/me/push`** answers `200` with `WriteResult` carrying
   `settings`.
 - A keyed push PUT or DELETE replays its original response for that device,
@@ -852,9 +852,11 @@ mid-log cursor, and comparing the result with a fresh snapshot.
 
 ## 6.2 Push payload
 
-A 0.2 push keeps the APNs alert, badge and background form. An alert may
-carry the fixed body “New message in Harklight”. The `attention` member
-uses the following form, with an optional `locator`.
+A 0.2 push keeps the APNs alert, badge and background form. The `attention`
+member uses the following form. A Server sending directly to Apple always
+includes the `locator`; pushes delivered through the planned [push
+relay](push-relay.md), in a later release, omit it and may carry the fixed
+alert body “New message in Harklight”.
 
 ```json
 {
@@ -886,7 +888,7 @@ uses the following form, with an optional `locator`.
   A mismatch is ignored and recorded in the Error Log. After all four IDs
   match, the app does nothing if its durable cursor is at or past `rev`.
   Otherwise it fetches a JSON batch from its cursor.
-- Without a locator, the app matches `attention.server` to the active
+- Without a locator (relay pushes, in a later release), the app matches `attention.server` to the active
   enrollment's Server identity from `GET /v2/me`. A matching v2 `sync` push
   triggers the usual v2 catch-up from the app's saved cursor (§6). Tapping
   a locator-less alert opens the Inbox without navigating to an item.

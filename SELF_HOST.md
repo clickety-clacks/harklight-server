@@ -1,6 +1,6 @@
 # Harklight Server self-hosted installation
 
-Version: **0.2.14**. Package target: **Linux x86_64, glibc 2.39 or newer**, with OpenSSL 3 shared libraries and libstdc++6 (built on Ubuntu 24.04). The package bundles
+Version: **0.2.15**. Package target: **Linux x86_64, glibc 2.39 or newer**, with OpenSSL 3 shared libraries and libstdc++6 (built on Ubuntu 24.04). The package bundles
 Erlang/OTP and Elixir bytecode; users need no Mix, Hex, source checkout or
 Erlang installation. It needs Bash, OpenSSL CLI, tar and the platform libraries
 listed in BUILD_INFO. This is a single-process self-hosted server cut.
@@ -18,7 +18,7 @@ Provider acceptance does not prove notification display or a person's reply.
 This package speaks protocol 0.2 only. The device port serves client API v2
 (`/v2`) over mutual TLS, and the server runs no `/origin/v1` or `/agent/v1`
 listener. Protocol 0.1 apps, agents and headless tools cannot connect, so move
-an installation to 0.2.14 only after its agents and clients are on their 0.2
+an installation to 0.2.15 only after its agents and clients are on their 0.2
 versions. Harklight Agent 0.2.5 is the matching Agent release.
 
 No comment is an answer with none of `choice`, `comment` or `result`, sent with
@@ -28,9 +28,9 @@ the request; a valid current-revision answer commits a payload-free
 
 ## Download and verify
 
-After publication, download the v0.2.14 release from
-clickety-clacks/harklight-server, tag v0.2.14. Get
-harklight-server-0.2.14-linux-x86_64.tar.gz, SHA256SUMS and SELF_HOST.md from
+After publication, download the v0.2.15 release from
+clickety-clacks/harklight-server, tag v0.2.15. Get
+harklight-server-0.2.15-linux-x86_64.tar.gz, SHA256SUMS and SELF_HOST.md from
 that release. Run sha256sum -c SHA256SUMS and extract into an operator-owned
 versioned directory. BUILD_INFO identifies the source commit, build host,
 toolchain, source status and native dependencies.
@@ -43,7 +43,7 @@ runtime/dependency notices remain in their shipped distribution files.
 Choose the DNS hostname clients will validate. For a same-machine preview,
 localhost works. Install into a directory you own and run:
 
-    PACKAGE="$PWD/harklight-server-0.2.14-linux-x86_64"
+    PACKAGE="$PWD/harklight-server-0.2.15-linux-x86_64"
     STATE="$HOME/.local/share/harklight-server"
     "$PACKAGE/bin/harklight-bootstrap" "$STATE" localhost
     cat "$STATE/person-id"
@@ -337,9 +337,9 @@ survive restart.
 For a manual upgrade of an existing installation, stop the old server and back
 up the full private state before upgrading. The release installer makes one
 full mutable-root backup after stopping the service and before switching
-releases. Harklight Server v0.2.14 writes FORMAT29, like the earlier 0.2
+releases. Harklight Server v0.2.15 writes FORMAT29, like the earlier 0.2
 releases and published v0.1.43, v0.1.44, v0.1.45, v0.1.48 and v0.1.49.
-From FORMAT29 state written by any of those releases, v0.2.14 runs no store
+From FORMAT29 state written by any of those releases, v0.2.15 runs no store
 migration. From supported FORMAT27 state, including state written by the
 published v0.1.35 through v0.1.42 maintenance packages (for example v0.1.38),
 startup applies the FORMAT28 device-focus defaults and FORMAT29
@@ -355,7 +355,7 @@ registered to, regardless of sender. Sender filters select search results only;
 they do not limit access. Answering still requires both a matching read grant
 and a matching respond grant. Preserve the trust root, person and sender
 grants; do not repeat bootstrap. The shared FORMAT29 number does not establish
-that a 0.1.x release can read state v0.2.14 has written; changing only the code
+that a 0.1.x release can read state v0.2.15 has written; changing only the code
 or release link is not a safe downgrade.
 
 Starting a server with APNs configured can dispatch existing queued work. The
@@ -429,16 +429,16 @@ second one. It carries no source ruling authority.
 
 For a manual upgrade, stop the old process and back up the complete private
 state directory, including the database and keys, before the first start of a
-v0.2.14 package. Verify the package checksum and extract into a different
+v0.2.15 package. Verify the package checksum and extract into a different
 versioned directory. Keep the state path, trust root, owner/person and
 configuration. Start with the existing `server.env`; do not rerun bootstrap.
-From v0.2.2 or other FORMAT29 state, v0.2.14 runs no store migration. From
+From v0.2.2 or other FORMAT29 state, v0.2.15 runs no store migration. From
 supported FORMAT27 state, first start applies the FORMAT28 device-focus
 defaults and FORMAT29 hosted-delivery-state initialization in order. The
 resulting store is FORMAT29. There is no hot upgrade; only one server may own
 a database.
 
-Upgrading directly from 0.1.x to v0.2.14 also changes the protocol:
+Upgrading directly from 0.1.x to v0.2.15 also changes the protocol:
 
 - Have the 0.2 app, Harklight Agent 0.2.5 and any 0.2 headless tools ready for
   every client before switching; 0.1 clients stop working when the server
@@ -483,9 +483,9 @@ The installer attempts backup restoration only when candidate start or
 process-readiness fails. After readiness, it does not automatically roll back;
 the optional owner agent-list probe is warning-only.
 
-Before the first v0.2.14 start, stop the server and take a complete private
+Before the first v0.2.15 start, stop the server and take a complete private
 state backup, including the database and keys. To return to an earlier 0.2 release,
-stop v0.2.14, restore the backup taken under the release you ran before
+stop v0.2.15, restore the backup taken under the release you ran before
 the upgrade, and run that same release against the restored state.
 To return to a 0.1.x release, stop the server, restore a backup taken before
 the protocol 0.2 cutover that is compatible with the selected 0.1.x release,

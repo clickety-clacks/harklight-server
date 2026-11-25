@@ -1,5 +1,9 @@
 # Harklight push relay contract
 
+**Status: planned.** No released Server includes the relay yet; this describes
+the contract it will implement. Until then, iPhone notifications need Apple push
+keys configured on the Server.
+
 The relay lets a self-hosted Server deliver APNs pushes for a registered
 device. The app fetches its messages directly from its own Server.
 
