@@ -41,7 +41,7 @@ cli="$(cd -- "$(dirname -- "$0")" && pwd)/harklight"
   printf 'export ATTENTION_SERVER_BIND=127.0.0.1\nexport ATTENTION_SERVER_ENROLL_BIND=127.0.0.1\n'
   printf 'export ATTENTION_SERVER_OWNER_BIND=127.0.0.1\n'
   printf '\n# Uncomment to receive iPhone notifications through the Harklight push relay.\n'
-  printf '# Shares the APNs token, environment, kind, badge, Server ID and source address.\n'
+  printf '# Shares APNs token, environment, kind, badge, sound/quiet choice, Server ID and source address.\n'
   printf '# export ATTENTION_SERVER_PUSH_RELAY_URL=https://app.harklight.net\n'
 } > "$state_dir/server.env"
 echo "Owner bootstrapped; person ID saved in $state_dir/person-id"
