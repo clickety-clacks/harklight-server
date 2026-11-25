@@ -374,9 +374,7 @@ defmodule AttentionServer.Store do
     with {:ok, store} <- load_progress(store) do
       persisted = LargeData.persist_refs(store.engine)
 
-      {_payload, cache} =
-        Persistence.run(fn -> SnapshotEncoding.encode(persisted, @format_version) end)
-
+      {_payload, cache} = SnapshotEncoding.encode(persisted, @format_version)
       {:ok, %{store | encoding_cache: cache}}
     end
   end
@@ -1786,18 +1784,7 @@ defmodule AttentionServer.Store do
          audit,
          projected_entries \\ []
        ) do
-    # Large-data preparation runs here, against the previous durable base this
-    # process already holds, so only changed subterms are walked and nothing
-    # large is copied to or from the worker. The worker needs the generation and
-    # connection, not a second copy of the old engine. The caller keeps its
-    # committed snapshot until this returns.
-    generation = %{
-      store
-      | engine: nil,
-        large_base: nil,
-        large_persisted: nil,
-        large_index: nil
-    }
+    generation = Map.take(store, [:db, :version, :progress_version])
 
     # The change log's rows are found here, against the engine this process
     # already holds, and written in the snapshot's transaction.
@@ -1811,22 +1798,19 @@ defmodule AttentionServer.Store do
 
     result =
       with {:ok, durable_next, persisted, index} <- prepare_large_data(store, next) do
-        old_ids =
-          if store.large_index,
-            do: LargeData.reference_index_ids(store.large_index),
-            else: LargeData.refs(store.engine)
+        # The cache shares records and compressed fragments with this process's
+        # previous snapshot. A task would flatten those terms on the way in
+        # and copy a full replacement cache back. Only the encoded binary and
+        # transaction inputs need to reach the worker.
+        {payload, cache} =
+          SnapshotEncoding.encode(persisted, @format_version, store.encoding_cache)
 
-        next_ids = LargeData.reference_index_ids(index)
         rows = LargeData.reference_index_rows(index)
 
-        case Persistence.run(fn ->
-               persist_snapshot(generation, persisted, rows, audit, old_ids, next_ids, log)
-             end) do
-          {:ok, cache, heads, agent_heads} ->
-            {:ok, cache, heads, agent_heads, durable_next, persisted, index}
-
-          error ->
-            error
+        with {:ok, heads, agent_heads} <-
+               Persistence.run(fn -> persist_snapshot(generation, payload, rows, audit, log) end) do
+          cleanup_snapshot_blobs(store, index, persisted, audit)
+          {:ok, cache, heads, agent_heads, durable_next, persisted, index}
         end
       end
 
@@ -1888,19 +1872,36 @@ defmodule AttentionServer.Store do
     end
   end
 
-  defp persist_snapshot(
-         %{db: db, version: version, upload_dir: upload_dir} = store,
-         persisted,
-         reference_rows,
-         audit,
-         old_ids,
-         next_ids,
-         log
-       ) do
-    with {payload, cache} <-
-           SnapshotEncoding.encode(persisted, @format_version, store.encoding_cache),
-         checksum = :crypto.hash(:sha256, payload),
-         :ok <- Sqlite3.execute(db, "BEGIN IMMEDIATE"),
+  defp cleanup_snapshot_blobs(%{upload_dir: dir} = store, index, persisted, audit)
+       when is_binary(dir) do
+    old_ids =
+      if store.large_index,
+        do: LargeData.reference_index_ids(store.large_index),
+        else: LargeData.refs(store.engine)
+
+    next_ids = LargeData.reference_index_ids(index)
+
+    case LargeData.delete_unreferenced(dir, old_ids, next_ids, persisted) do
+      :ok ->
+        :ok
+
+      error ->
+        Diagnostics.failure(
+          :server_storage,
+          :large_data_delete,
+          error,
+          :unavailable,
+          operation_id(audit)
+        )
+    end
+  end
+
+  defp cleanup_snapshot_blobs(_store, _index, _persisted, _audit), do: :ok
+
+  defp persist_snapshot(%{db: db, version: version} = store, payload, reference_rows, audit, log) do
+    checksum = :crypto.hash(:sha256, payload)
+
+    with :ok <- Sqlite3.execute(db, "BEGIN IMMEDIATE"),
          :ok <- check_progress_version(store),
          :ok <- write_large_data_references(db, reference_rows),
          :ok <-
@@ -1919,23 +1920,7 @@ defmodule AttentionServer.Store do
            ),
          {:ok, heads, agent_heads} <- append_change_logs(db, log, version + 1),
          :ok <- Sqlite3.execute(db, "COMMIT") do
-      if is_binary(upload_dir) do
-        case LargeData.delete_unreferenced(upload_dir, old_ids, next_ids, persisted) do
-          :ok ->
-            :ok
-
-          error ->
-            Diagnostics.failure(
-              :server_storage,
-              :large_data_delete,
-              error,
-              :unavailable,
-              operation_id(audit)
-            )
-        end
-      end
-
-      {:ok, cache, heads, agent_heads}
+      {:ok, heads, agent_heads}
     end
   end
 
