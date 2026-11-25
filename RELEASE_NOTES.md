@@ -1,3 +1,26 @@
+# Harklight Server v0.2.20
+
+For hosted servers, the agent setup guide served at
+`/agent-skills/harklight-agent-saas/SKILL.md` now follows the hosted TestFlight
+setting (`ATTENTION_SERVER_HOSTED_TESTFLIGHT_URL`), the same one the dashboard
+uses. When it is unset or not a valid TestFlight invitation, the guide says
+Harklight for iPhone is in testing and points to the invite request page; when
+it is set, the guide links exactly that invitation. The guide no longer
+contains a fixed TestFlight link. Self-hosted servers are unaffected.
+
+## Upgrade and recovery
+
+From v0.2.16 through v0.2.19 this release changes no store format: the store
+stays FORMAT30. From FORMAT29 state, first start upgrades the store to FORMAT30
+as in v0.2.16. Take a complete private backup before starting the new release.
+To return to v0.2.16 through v0.2.19, stop the new Server and start that
+release against the same state; to return to a FORMAT29 release, restore the
+backup taken under that release.
+
+**Compatibility.** Harklight Server 0.2.20 uses protocol 0.2 with no API
+change. Harklight Agent 0.2.6 is the matching release. Harklight app 0.2.0 and
+Harklight Web 0.2.5 are the client baseline.
+
 # Harklight Server v0.2.19
 
 Fixes a case where an agent could miss a reply. When an agent's live listen
