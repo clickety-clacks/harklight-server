@@ -323,31 +323,36 @@ defmodule AttentionServer.ClientAPI.Reads do
          {:ok, limit} <- limit(params),
          {:ok, after_key} <- page(params),
          :ok <- ChangeLog.ranks_available(state.store, principal.person),
-         {:ok, _} <- head(state, principal.person) do
+         {:ok, position} <- head(state, principal.person) do
       person = principal.person
       {shown, more?} = rank_page(state, person, after_key, limit)
 
-      items =
+      rows =
         Enum.flat_map(shown, fn {item_id, rank} ->
           case Resources.item_key(engine, person, item_id) do
-            {:ok, item_key} -> [render_item(state, principal, item_key, rank)]
+            {:ok, item_key} -> [{item_key, rank, ChangeLog.item_resource(item_key)}]
             _ -> []
           end
         end)
 
-      {:ok, position} = head(state, person)
+      case ChangeLog.page_revisions(state.store, person, Enum.map(rows, &elem(&1, 2))) do
+        {:ok, revisions} ->
+          items =
+            Enum.map(rows, fn {key, rank, id} ->
+              render_item_at_revision(engine, principal, key, rank, Map.fetch!(revisions, id))
+            end)
 
-      body = %{
-        "rev" => position,
-        "items" => items,
-        "counts" => Resources.counts(engine, person)
-      }
+          body = %{"rev" => position, "items" => items, "counts" => Resources.counts(engine, person)}
 
-      if more? do
-        {_item_id, %{"key" => last_key}} = List.last(shown)
-        {:ok, Map.put(body, "next_page", "p" <> Base.url_encode64(last_key, padding: false))}
-      else
-        {:ok, body}
+          if more? do
+            {_item_id, %{"key" => last_key}} = List.last(shown)
+            {:ok, Map.put(body, "next_page", "p" <> Base.url_encode64(last_key, padding: false))}
+          else
+            {:ok, body}
+          end
+
+        _ ->
+          {:error, :storage_unavailable}
       end
     end
   end
@@ -557,9 +562,14 @@ defmodule AttentionServer.ClientAPI.Reads do
   end
 
   defp render_item(state, principal, item_key, rank) do
-    state.store.engine
+    revision = rev(state, principal.person, ChangeLog.item_resource(item_key))
+    render_item_at_revision(state.store.engine, principal, item_key, rank, revision)
+  end
+
+  defp render_item_at_revision(engine, principal, item_key, rank, revision) do
+    engine
     |> Resources.item(item_key, rank)
-    |> Resources.stamp(rev(state, principal.person, ChangeLog.item_resource(item_key)))
+    |> Resources.stamp(revision)
     |> then(&Resources.render(:item, &1, principal))
   end
 

@@ -1005,6 +1005,29 @@ defmodule AttentionServer.ChangeLog do
 
   def rev(%AttentionServer.Store{}, _person, _resource_id), do: {:error, :disabled}
 
+  @doc false
+  def page_revisions(%AttentionServer.Store{change_log: true}, _person, []), do: {:ok, %{}}
+
+  def page_revisions(%AttentionServer.Store{change_log: true, db: db, engine: engine}, person, ids) do
+    placeholders = Enum.map_join(ids, ", ", fn _ -> "?" end)
+
+    with {:ok, rows} <-
+           all(db, """
+           SELECT resource_id, rev FROM client_resource_revs
+           WHERE person_id = ? AND resource_id IN (#{placeholders})
+           """, [person | ids]) do
+      revisions = Map.new(rows, fn [id, rev] -> {id, rev} end)
+
+      if map_size(revisions) == length(ids) do
+        {:ok, revisions}
+      else
+        with {:ok, {_head, _floor, seed}} <- load_meta(db, person, fn -> seeded?(engine, person) end) do
+          {:ok, Map.new(ids, fn id -> {id, Map.get(revisions, id, max(seed, 1))} end)}
+        end
+      end
+    end
+  end
+
   def read(
         %AttentionServer.Store{change_log: true, db: db, engine: engine},
         person,

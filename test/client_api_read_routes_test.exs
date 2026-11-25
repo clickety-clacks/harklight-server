@@ -196,9 +196,9 @@ defmodule AttentionServer.ClientAPIReadRoutesTest do
         :trace.session_destroy(trace)
       end
 
-    for %{"item_id" => id, "rev" => rev} <- items do
+    Enum.each(items, fn %{"item_id" => id, "rev" => rev} ->
       assert {:ok, %{"item" => %{"rev" => ^rev}}} = Reads.item(relay, reader, id)
-    end
+    end)
   end
 
   test "discard refuses an attached upload without affecting the downloadable file", ctx do
