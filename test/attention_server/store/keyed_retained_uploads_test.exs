@@ -173,9 +173,9 @@ defmodule AttentionServer.Store.KeyedRetainedUploadsTest do
   defp remove_upload_metadata(path, id) do
     with_db(path, fn db ->
       assert [[payload]] = query(db, "SELECT payload FROM relay_state WHERE id = 1")
-      {:attention_relay_state, 29, engine} = :erlang.binary_to_term(payload, [:safe])
+      {:attention_relay_state, 30, engine} = :erlang.binary_to_term(payload, [:safe])
       engine = %{engine | uploads: Map.delete(engine.uploads, id)}
-      next = :erlang.term_to_binary({:attention_relay_state, 29, engine})
+      next = :erlang.term_to_binary({:attention_relay_state, 30, engine})
       assert {:ok, stmt} = Sqlite3.prepare(db, "UPDATE relay_state SET payload = ?, checksum = ?")
 
       try do

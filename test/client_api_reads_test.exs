@@ -228,6 +228,7 @@ defmodule AttentionServer.ClientAPIReadsTest do
     defs = Schema.contract_defs(@contract)
     assert {:ok, body} = Reads.settings(relay, "reader")
     assert Schema.errors(defs, "SettingsResponse", body) == []
+    assert body["settings"]["alerts"] == "important"
     assert body["settings"]["push"] == %{"state" => "unconfigured", "revision" => 0}
 
     etag = Reads.etag(body["settings"])

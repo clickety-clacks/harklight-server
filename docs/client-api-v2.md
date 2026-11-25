@@ -49,7 +49,7 @@ It is the only client protocol in Server 0.2.x.
 | `Idempotent-Replayed: true` | response | The stored response of an earlier request with the same key and digest. Nothing was applied. |
 | `ETag` | response | On `GET` resources and on `GET /v2/settings`. On files, it is the quoted sha256. |
 | `If-None-Match` | request | On `GET`. A match answers `304` with no body. |
-| `If-Match` | request | Required on `PUT /v2/settings/priority-levels`. A mismatch answers `412 precondition_failed`. |
+| `If-Match` | request | Required on `PUT /v2/settings/priority-levels` and `PUT /v2/settings/alerts`. A mismatch answers `412 precondition_failed`. |
 | `Retry-After` | response | Seconds. On every `503`. |
 | `Last-Event-ID` | request | On the feed. Takes precedence over `?after`. |
 
@@ -248,10 +248,11 @@ Schemas use JSON Schema 2020-12. `$ref`s point into the `$defs` below.
 
     "Settings": {
       "type": "object",
-      "required": ["rev", "priority_levels", "push"],
+      "required": ["rev", "priority_levels", "push", "alerts"],
       "properties": {
         "rev": { "$ref": "#/$defs/Rev" },
         "priority_levels": { "type": "array", "items": { "$ref": "#/$defs/PriorityLevel" } },
+        "alerts": { "enum": ["important", "all"] },
         "push": {
           "type": "object",
           "description": "This device's push binding. Browsers get state unconfigured.",
@@ -340,6 +341,11 @@ Schemas use JSON Schema 2020-12. `$ref`s point into the `$defs` below.
   }
 }
 ```
+
+`Settings.alerts` is per person and defaults to `"important"`. A message
+alerts its recipient if it is a request (including a legacy untyped message
+with reply controls), the sender's urgency at delivery is `high` or `now`,
+or the recipient's setting is `"all"`.
 
 ## 4. Reads
 
@@ -484,6 +490,7 @@ Every write that succeeds answers `200`, or `201` for `POST /v2/files`, with a
 | `POST /v2/items/{item_id}/replies` | `{"text": string, "file_ids"?: [OpaqueId]}` |
 | `POST /v2/items/{item_id}/answer` | `{"request_revision": int}` plus at most one of `"choice": string`, `"comment": string`, `"result": any JSON value` |
 | `PUT /v2/settings/priority-levels` | `{"levels": [PriorityLevel]}` with `If-Match` |
+| `PUT /v2/settings/alerts` | `{"alerts": "important" \| "all"}` with `If-Match` |
 | `PUT /v2/devices/me/push` | `{"token": string, "environment": "production" \| "sandbox", "revision": int}` |
 | `DELETE /v2/devices/me/push` | none |
 | `PUT /v2/devices/me/focus` | `{"screen": "inbox" \| "fyi" \| "message" \| "chat" \| "settings" \| "signed_out" \| "not_in_front", "item_id"?: OpaqueId, "visible_entry_id"?: OpaqueId, "device_name"?: string, "ttl_s": int 1..3600}` (§5.1) |
@@ -892,6 +899,12 @@ alert body “New message in Harklight”.
   enrollment's Server identity from `GET /v2/me`. A matching v2 `sync` push
   triggers the usual v2 catch-up from the app's saved cursor (§6). Tapping
   a locator-less alert opens the Inbox without navigating to an item.
+
+A push that gathers one or more messages carries `aps.interruption-level`
+set to `"passive"` and omits `aps.sound` when none of them alerts the
+recipient. Every other alert push, including a Chat-reply push, carries
+`aps.sound` set to `"default"` and omits `aps.interruption-level`.
+Silent sync pushes omit both members.
 
 ## 7. Errors
 

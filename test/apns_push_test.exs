@@ -382,6 +382,7 @@ defmodule AttentionServer.APNSPushTest do
       deadline_at: now + 60_000,
       registered_at: now,
       presentation: :alert,
+      quiet: true,
       alert: %{
         "title" => String.duplicate("名", 5_000),
         "body" => body_preview,
@@ -398,9 +399,20 @@ defmodule AttentionServer.APNSPushTest do
     assert {:ok, %{"aps" => %{"alert" => %{"body" => ^body_preview, "title" => title}}} = payload} =
              JSON.decode_line(body <> "\n")
 
+    assert payload["aps"]["interruption-level"] == "passive"
+    refute Map.has_key?(payload["aps"], "sound")
     assert String.ends_with?(title, "…")
     assert payload["attention"]["server"] == @test_server
     assert payload["attention"]["locator"] == locator
+
+    loud_claim = Map.delete(claim, :quiet)
+    {loud_outcome, _cached_token} = APNS.send(config, loud_claim, nil)
+    assert loud_outcome.state == "provider_accepted"
+    assert_receive {:apns_request, "POST", _path, _headers, loud_body}, 12_000
+    assert byte_size(loud_body) <= 4_096
+    assert {:ok, loud_payload} = JSON.decode_line(loud_body <> "\n")
+    assert loud_payload["aps"]["sound"] == "default"
+    refute Map.has_key?(loud_payload["aps"], "interruption-level")
   end
 
   test "chat alerts preserve their target through fitting and use a separate collapse id", ctx do
@@ -416,6 +428,8 @@ defmodule AttentionServer.APNSPushTest do
     assert payload["attention"]["locator"] == claim.locator
     assert payload["aps"]["content-available"] == 1
     assert payload["aps"]["badge"] == 2
+    assert payload["aps"]["sound"] == "default"
+    refute Map.has_key?(payload["aps"], "interruption-level")
     assert String.ends_with?(payload["aps"]["alert"]["title"], "…")
 
     ordinary = %{claim | locator: Map.delete(claim.locator, "target")}
@@ -818,7 +832,11 @@ defmodule AttentionServer.APNSPushTest do
       "apns-delivery",
       %{
         "body" => "  bounded   preview\nfrom sender  ",
-        "display_name" => "  Agent\nλ / name  "
+        "display_name" => "  Agent\nλ / name  ",
+        "answer_ui" => %{
+          "schema" => "attention-client.actions/1",
+          "actions" => [%{"id" => "reply", "label" => "Reply", "kind" => "text"}]
+        }
       }
     )
 
@@ -858,7 +876,8 @@ defmodule AttentionServer.APNSPushTest do
                },
                "category" => "harklight.expanded.single.v1",
                "badge" => 1,
-               "content-available" => 1
+               "content-available" => 1,
+               "sound" => "default"
              },
              "attention" => %{
                "v" => 2,
@@ -1354,6 +1373,7 @@ defmodule AttentionServer.APNSPushTest do
     assert terminal.high == 3
     assert terminal.presentation == :background
     assert terminal.badge == 1
+    assert APNS.request_payload(terminal)["aps"] == %{"content-available" => 1, "badge" => 1}
   end
 
   test "Progress is omitted from the existing APNs badge but ordinary progress fields count",

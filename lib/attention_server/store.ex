@@ -35,7 +35,7 @@ defmodule AttentionServer.Store do
     SnapshotEncoding
   }
 
-  @format_version 29
+  @format_version 30
   # `large_base` is the durable engine of the last snapshot commit,
   # `large_persisted` its persisted form and `large_index` its large-data
   # reference rows. A commit reuses them for every unchanged subterm.
@@ -1468,6 +1468,7 @@ defmodule AttentionServer.Store do
     :hosted_accounts,
     :delivery_states,
     :algorithm_choices,
+    :alert_choices,
     :push_bindings,
     :origin_sessions,
     :origin_receipts,
@@ -1519,6 +1520,9 @@ defmodule AttentionServer.Store do
 
   defp valid_keyed_row?(engine, :algorithm_choices, person, choice),
     do: valid_algorithm_choice?(engine, person, choice)
+
+  defp valid_keyed_row?(engine, :alert_choices, person, choice),
+    do: valid_alert_choice?(engine, person, choice)
 
   defp valid_keyed_row?(engine, :push_bindings, key, binding),
     do: valid_push_binding_row?(engine, key, binding)
@@ -2145,7 +2149,8 @@ defmodule AttentionServer.Store do
                      26,
                      27,
                      28,
-                     29
+                     29,
+                     @format_version
                    ] ->
                 original = struct(Engine, Map.from_struct(stored))
 
@@ -2251,6 +2256,9 @@ defmodule AttentionServer.Store do
                     |> then(fn state ->
                       if format < 29, do: Map.put(state, :delivery_states, %{}), else: state
                     end)
+                    |> then(fn state ->
+                      if format < 30, do: Map.put(state, :alert_choices, %{}), else: state
+                    end)
 
                   engine =
                     engine
@@ -2295,6 +2303,7 @@ defmodule AttentionServer.Store do
                                    format < 27 -> "bounce_schedule_index_init"
                                    format < 28 -> "device_focus_permissions_init"
                                    format < 29 -> "hosted_delivery_state_init"
+                                   format < 30 -> "alert_choices_init"
                                    true -> "state_format"
                                  end
                              }
@@ -2731,6 +2740,7 @@ defmodule AttentionServer.Store do
         valid_hosted_accounts?(engine) and
         valid_delivery_states?(engine) and
         valid_prioritization?(engine) and
+        valid_alert_choices?(engine) and
         valid_push_bindings?(engine) and
         AttentionServer.Conversation.valid_state?(engine) and
         BounceDecision.valid_state?(engine, bounce_validation) and
@@ -2819,6 +2829,16 @@ defmodule AttentionServer.Store do
 
   defp valid_algorithm_choice?(engine, person, choice),
     do: Map.has_key?(engine.persons, person) and choice in ["baseline", "jev-set"]
+
+  defp valid_alert_choices?(engine) do
+    is_map(engine.alert_choices) and
+      Enum.all?(engine.alert_choices, fn {person, choice} ->
+        valid_alert_choice?(engine, person, choice)
+      end)
+  end
+
+  defp valid_alert_choice?(engine, person, choice),
+    do: Map.has_key?(engine.persons, person) and choice == "all"
 
   defp valid_jev_endpoint?(endpoint),
     do: is_nil(endpoint) or AttentionServer.JevClient.valid_endpoint?(endpoint)

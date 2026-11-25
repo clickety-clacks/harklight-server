@@ -1333,6 +1333,7 @@ defmodule AttentionServer.ClientAPI.Resources do
 
     %{
       "priority_levels" => BounceDecision.levels(engine, person),
+      "alerts" => Engine.alert_choice(engine, person),
       @viewer => %{"push" => push}
     }
   end

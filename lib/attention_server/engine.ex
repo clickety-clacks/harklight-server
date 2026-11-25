@@ -75,6 +75,7 @@ defmodule AttentionServer.Engine do
             hosted_accounts: %{},
             delivery_states: %{},
             algorithm_choices: %{},
+            alert_choices: %{},
             jev_endpoint: nil,
             jev_model: nil,
             push_bindings: %{},
@@ -188,6 +189,16 @@ defmodule AttentionServer.Engine do
           registered_at: binding.registered_at,
           claim_id: claim_id
         }
+
+        claim =
+          if gathered != [] and
+               Enum.all?(gathered, fn {_key, record} ->
+                 not alerts?(next, person, record)
+               end) do
+            Map.put(claim, :quiet, true)
+          else
+            claim
+          end
 
         claim =
           case gathered do
@@ -2830,6 +2841,9 @@ defmodule AttentionServer.Engine do
   defp dispatch(engine, principal, %{"type" => "levels_set"} = frame),
     do: levels_set(engine, principal, frame)
 
+  defp dispatch(engine, principal, %{"type" => "alerts_set"} = frame),
+    do: alerts_set(engine, principal, frame)
+
   defp dispatch(engine, principal, %{"type" => "discussion"} = frame),
     do: discussion(engine, principal, frame)
 
@@ -2881,7 +2895,7 @@ defmodule AttentionServer.Engine do
   defp dispatch(_engine, _principal, _frame), do: failure("unknown_type")
 
   defp levels_get(engine, %{person: person}, frame) do
-    with :ok <- valid_levels_fields(frame, ~w(v type ref)) do
+    with :ok <- valid_settings_fields(frame, ~w(v type ref)) do
       {:ok, engine, %{"levels" => BounceDecision.levels(engine, person)}}
     else
       {:error, field} -> failure("invalid_field", field)
@@ -2889,7 +2903,7 @@ defmodule AttentionServer.Engine do
   end
 
   defp levels_set(engine, %{person: person, key: device, request_at: now_ms}, frame) do
-    with :ok <- valid_levels_fields(frame, ~w(v type ref op_id levels)),
+    with :ok <- valid_settings_fields(frame, ~w(v type ref op_id levels)),
          :ok <- valid_op(frame),
          {:ok, levels} <- BouncePolicy.normalize_levels(frame["levels"]) do
       semantic = levels_semantic(levels)
@@ -2923,7 +2937,37 @@ defmodule AttentionServer.Engine do
     end
   end
 
-  defp valid_levels_fields(frame, expected) do
+  defp alerts_set(engine, %{person: person, key: device}, frame) do
+    with :ok <- valid_settings_fields(frame, ~w(v type ref op_id alerts)),
+         :ok <- valid_op(frame),
+         alerts when alerts in ["important", "all"] <- frame["alerts"] do
+      op = frame["op_id"]
+      semantic = %{"type" => "alerts_set", "alerts" => alerts}
+
+      case receipt(engine, person, device, op, semantic) do
+        {:duplicate, reply} ->
+          {:ok, engine, reply}
+
+        :conflict ->
+          failure("operation_conflict")
+
+        :missing ->
+          next =
+            case alerts do
+              "all" -> put_row(engine, :alert_choices, person, "all")
+              "important" -> delete_row(engine, :alert_choices, person)
+            end
+
+          reply = %{"op_id" => op, "alerts" => alerts}
+          {:ok, save_receipt(next, person, device, op, semantic, reply), reply}
+      end
+    else
+      {:error, field} -> failure("invalid_field", field)
+      _ -> failure("invalid_field", "alerts")
+    end
+  end
+
+  defp valid_settings_fields(frame, expected) do
     selectors = ~w(person_id device_id agent_id principal_id origin actor account_id)
 
     with nil <- Enum.find(selectors, &Map.has_key?(frame, &1)),
@@ -3497,7 +3541,7 @@ defmodule AttentionServer.Engine do
           |> put_message(key, record)
           |> BounceDecision.record_initial(key, record)
           |> put_event(person, seq, :delivery, key)
-          |> queue_push_hint(person, seq)
+          |> queue_push_hint(person, seq, record)
 
         next =
           if record.session_handle do
@@ -5198,8 +5242,52 @@ defmodule AttentionServer.Engine do
 
   defp push_open_at(_binding, now_ms), do: now_ms
 
-  defp queue_push_hint(engine, person, high) do
-    now_ms = System.system_time(:millisecond)
+  def alert_choice(%__MODULE__{} = engine, person),
+    do: Map.get(engine.alert_choices, person, "important")
+
+  defp alerts?(engine, person, record) do
+    # A revision can edit importance, but the push is about the accepted delivery.
+    message = get_in(record, [:revisions, 1]) || record.message
+
+    alert_choice(engine, person) == "all" or Message.request_for_alert?(message) or
+      Message.effective_urgency(message) in ["high", "now"]
+  end
+
+  defp recent_alerting_delivery?(engine, person, seq, cutoff) do
+    # Walk this person's delivery sequence backwards through the open window.
+    # Lifecycle events are not deliveries and do not start a new window.
+    if seq > 1 do
+      Enum.reduce_while((seq - 1)..1//-1, false, fn prior_seq, _found ->
+        case engine.events[{person, prior_seq}] do
+          %{kind: :delivery, key: key} ->
+            record = Map.fetch!(engine.messages, key)
+
+            case Map.get(record, :accepted_at) do
+              accepted_at when is_integer(accepted_at) and accepted_at <= cutoff ->
+                {:halt, false}
+
+              accepted_at when is_integer(accepted_at) ->
+                if alerts?(engine, person, record), do: {:halt, true}, else: {:cont, false}
+
+              _ ->
+                {:cont, false}
+            end
+
+          _ ->
+            {:cont, false}
+        end
+      end)
+    else
+      false
+    end
+  end
+
+  defp queue_push_hint(engine, person, high, delivery \\ nil) do
+    now_ms = if delivery, do: delivery.accepted_at, else: System.system_time(:millisecond)
+
+    immediate? =
+      not is_nil(delivery) and alerts?(engine, person, delivery) and
+        not recent_alerting_delivery?(engine, person, high, now_ms - @push_window_ms)
 
     bindings =
       Map.new(engine.push_bindings, fn
@@ -5212,13 +5300,18 @@ defmodule AttentionServer.Engine do
             # five minutes of the last push, or during an in-flight push, wait
             # for the end of that window and go out as one push.
             opens_window? =
-              fresh or
+              immediate? or fresh or
                 (binding.state == "sending" and high > binding.pending_high and
                    is_nil(binding.next_at))
 
             deadline_at = if opens_window?, do: now_ms, else: binding.deadline_at
 
-            next_at = if opens_window?, do: push_open_at(binding, now_ms), else: binding.next_at
+            next_at =
+              cond do
+                immediate? -> min(binding.next_at || now_ms, now_ms)
+                opens_window? -> push_open_at(binding, now_ms)
+                true -> binding.next_at
+              end
 
             state =
               cond do

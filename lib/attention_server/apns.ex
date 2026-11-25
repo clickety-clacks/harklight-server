@@ -314,7 +314,7 @@ defmodule AttentionServer.APNS do
            alert["body"],
            Map.get(alert, "body_truncated", false),
            locator,
-           Map.get(claim, :badge),
+           alert_aps(claim),
            false,
            false
          ) do
@@ -333,7 +333,7 @@ defmodule AttentionServer.APNS do
        when is_list(names) do
     locator = claim.locator
 
-    case fit_grouped_alert_payload(title, names, locator, Map.get(claim, :badge)) do
+    case fit_grouped_alert_payload(title, names, locator, alert_aps(claim)) do
       {:ok, payload} ->
         payload
 
@@ -348,14 +348,14 @@ defmodule AttentionServer.APNS do
     preserve_title? = Map.get(claim, :preserve_alert_title, false)
     preserve_body? = Map.get(claim, :preserve_alert_body, false)
     locator = claim.locator
-    badge = Map.get(claim, :badge)
+    aps = alert_aps(claim)
 
     case fit_alert_payload(
            title,
            body,
            preview_truncated?,
            locator,
-           badge,
+           aps,
            preserve_title?,
            preserve_body?
          ) do
@@ -368,7 +368,7 @@ defmodule AttentionServer.APNS do
                body,
                preview_truncated?,
                locator,
-               badge,
+               aps,
                false,
                false
              ) do
@@ -384,7 +384,19 @@ defmodule AttentionServer.APNS do
     end
   end
 
-  defp presentation_payload(claim), do: sync_payload(@alert_payload, claim)
+  defp presentation_payload(claim) do
+    @alert_payload
+    |> Map.put("aps", alert_aps(claim))
+    |> sync_payload(claim)
+  end
+
+  defp alert_aps(claim) do
+    %{"aps" => aps} = put_badge(@alert_payload, Map.get(claim, :badge))
+
+    if Map.get(claim, :quiet, false),
+      do: Map.put(aps, "interruption-level", "passive"),
+      else: Map.put(aps, "sound", "default")
+  end
 
   defp sync_payload(payload, claim) do
     payload
@@ -392,17 +404,17 @@ defmodule AttentionServer.APNS do
     |> put_badge(Map.get(claim, :badge))
   end
 
-  defp fit_grouped_alert_payload(title, names, locator, badge) do
-    case fit_grouped_names(title, names, locator, badge) do
+  defp fit_grouped_alert_payload(title, names, locator, aps) do
+    case fit_grouped_names(title, names, locator, aps) do
       {:ok, _payload} = fit -> fit
-      :error -> fit_grouped_names("Harklight", names, locator, badge)
+      :error -> fit_grouped_names("Harklight", names, locator, aps)
     end
   end
 
-  defp fit_grouped_names(title, names, locator, badge) do
+  defp fit_grouped_names(title, names, locator, aps) do
     total_names = length(names)
     initial_body = grouped_alert_body([], total_names)
-    initial_payload = alert_payload(title, initial_body, locator, badge)
+    initial_payload = alert_payload(title, initial_body, locator, aps)
 
     if payload_size(initial_payload) > @max_payload_bytes do
       :error
@@ -412,7 +424,7 @@ defmodule AttentionServer.APNS do
           shown = Enum.reverse([name | shown_reversed])
           remaining = total_names - length(shown)
           body = grouped_alert_body(shown, remaining)
-          candidate = alert_payload(title, body, locator, badge)
+          candidate = alert_payload(title, body, locator, aps)
 
           if payload_size(candidate) <= @max_payload_bytes do
             {:cont, {[name | shown_reversed], candidate}}
@@ -426,7 +438,7 @@ defmodule AttentionServer.APNS do
                   total_names - length(shown_reversed)
                 ),
                 locator,
-                badge
+                aps
               )}}
           end
         end)
@@ -447,31 +459,31 @@ defmodule AttentionServer.APNS do
          body,
          preview_truncated?,
          locator,
-         badge,
+         aps,
          preserve_title?,
          preserve_body?
        ) do
-    payload = alert_payload(title, body, locator, badge)
+    payload = alert_payload(title, body, locator, aps)
 
     if payload_size(payload) <= @max_payload_bytes do
       {:ok, payload}
     else
       body_fit =
         if is_binary(body) and not preserve_body?,
-          do: fit_body(title, body, preview_truncated?, locator, badge),
+          do: fit_body(title, body, preview_truncated?, locator, aps),
           else: :error
 
       case body_fit do
         {:ok, bounded_body} ->
-          {:ok, alert_payload(title, bounded_body, locator, badge)}
+          {:ok, alert_payload(title, bounded_body, locator, aps)}
 
         :error ->
           title_fit =
-            if preserve_title?, do: :error, else: fit_title(title, body, locator, badge)
+            if preserve_title?, do: :error, else: fit_title(title, body, locator, aps)
 
           case title_fit do
             {:ok, bounded_title} ->
-              {:ok, alert_payload(bounded_title, body, locator, badge)}
+              {:ok, alert_payload(bounded_title, body, locator, aps)}
 
             :error ->
               fallback_body =
@@ -480,11 +492,11 @@ defmodule AttentionServer.APNS do
               fallback_title_fit =
                 if preserve_title?,
                   do: :error,
-                  else: fit_title(title, fallback_body, locator, badge)
+                  else: fit_title(title, fallback_body, locator, aps)
 
               case fallback_title_fit do
                 {:ok, bounded_title} ->
-                  payload = alert_payload(bounded_title, fallback_body, locator, badge)
+                  payload = alert_payload(bounded_title, fallback_body, locator, aps)
                   if payload_size(payload) <= @max_payload_bytes, do: {:ok, payload}, else: :error
 
                 :error ->
@@ -495,17 +507,11 @@ defmodule AttentionServer.APNS do
     end
   end
 
-  defp alert_payload(title, body, locator, badge) do
+  defp alert_payload(title, body, locator, aps) do
     alert = %{"title" => title}
     alert = if is_binary(body), do: Map.put(alert, "body", body), else: alert
 
-    put_badge(
-      %{
-        "aps" => %{"alert" => alert, "content-available" => 1},
-        "attention" => Map.put(@attention, "locator", locator)
-      },
-      badge
-    )
+    %{"aps" => Map.put(aps, "alert", alert), "attention" => Map.put(@attention, "locator", locator)}
   end
 
   # The standard APNs badge field carries the recipient's Inbox count. Claims
@@ -515,7 +521,7 @@ defmodule AttentionServer.APNS do
 
   defp put_badge(payload, _badge), do: payload
 
-  defp fit_body(title, body, preview_truncated?, locator, badge) do
+  defp fit_body(title, body, preview_truncated?, locator, aps) do
     body_graphemes = String.graphemes(body)
 
     retained_graphemes =
@@ -533,19 +539,19 @@ defmodule AttentionServer.APNS do
           true -> (Enum.take(retained_graphemes, count) ++ ["…"]) |> Enum.join()
         end
 
-      if payload_size(alert_payload(title, candidate, locator, badge)) <= @max_payload_bytes,
+      if payload_size(alert_payload(title, candidate, locator, aps)) <= @max_payload_bytes,
         do: {:ok, candidate},
         else: :too_large
     end)
   end
 
-  defp fit_title(title, body, locator, badge) do
+  defp fit_title(title, body, locator, aps) do
     title_graphemes = String.graphemes(title)
 
     case largest_fitting_prefix(length(title_graphemes), fn count ->
            candidate = (Enum.take(title_graphemes, count) ++ ["…"]) |> Enum.join()
 
-           if payload_size(alert_payload(candidate, body, locator, badge)) <= @max_payload_bytes,
+           if payload_size(alert_payload(candidate, body, locator, aps)) <= @max_payload_bytes,
              do: {:ok, candidate},
              else: :too_large
          end) do

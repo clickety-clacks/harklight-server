@@ -58,6 +58,7 @@ defmodule AttentionServer.ClientAPI.Writes do
       {"POST", ["items", :item_id, "replies"], :post_replies},
       {"POST", ["items", :item_id, "answer"], :post_answer, granted_agent: true},
       {"PUT", ["settings", "priority-levels"], :put_priority_levels},
+      {"PUT", ["settings", "alerts"], :put_alerts},
       {"PUT", ["devices", "me", "push"], :put_push},
       {"DELETE", ["devices", "me", "push"], :delete_push},
       {"POST", ["files"], :post_files},
@@ -127,6 +128,20 @@ defmodule AttentionServer.ClientAPI.Writes do
          :ok <- only_members(body, ["levels"]),
          {:ok, levels} <- list_member(body, "levels") do
       respond(conn, priority_levels(ctx.relay, ctx.principal, levels, if_match, key))
+    else
+      {:error, token, field, conn} -> Errors.send_error(conn, token, field: field)
+      {:error, token, field} -> Errors.send_error(conn, token, field: field)
+    end
+  end
+
+  @doc false
+  def put_alerts(conn, %Context{} = ctx) do
+    with {:ok, key} <- optional_key(conn),
+         {:ok, if_match} <- if_match(conn),
+         {:ok, body, conn} <- json_body(conn),
+         :ok <- only_members(body, ["alerts"]),
+         {:ok, alerts} <- string_member(body, "alerts") do
+      respond(conn, alerts(ctx.relay, ctx.principal, alerts, if_match, key))
     else
       {:error, token, field, conn} -> Errors.send_error(conn, token, field: field)
       {:error, token, field} -> Errors.send_error(conn, token, field: field)
@@ -308,6 +323,15 @@ defmodule AttentionServer.ClientAPI.Writes do
       method: "PUT",
       path: ["settings", "priority-levels"],
       body: %{"levels" => levels, "if_match" => if_match}
+    })
+  end
+
+  @doc "Replace the person's alert choice with the same precondition as priority levels."
+  def alerts(relay, who, alerts, if_match, idempotency_key \\ nil) do
+    write(relay, who, idempotency_key, {:alerts, alerts, if_match}, %{
+      method: "PUT",
+      path: ["settings", "alerts"],
+      body: %{"alerts" => alerts, "if_match" => if_match}
     })
   end
 
@@ -793,7 +817,7 @@ defmodule AttentionServer.ClientAPI.Writes do
   end
 
   defp render(operation, who, _person, _reply, from, state)
-       when operation == :remove_push or elem(operation, 0) in [:priority_levels, :push] do
+       when operation == :remove_push or elem(operation, 0) in [:priority_levels, :alerts, :push] do
     case Reads.handle_call({:settings, who}, from, state) do
       {:reply, {:ok, body}, _state} -> {:ok, 200, body}
       {:reply, error, _state} -> error
@@ -851,7 +875,8 @@ defmodule AttentionServer.ClientAPI.Writes do
 
   # If-Match is compared with the ETag of the Settings this principal reads
   # now, the same value GET /v2/settings sends.
-  defp precondition(state, who, _principal, {:priority_levels, _levels, if_match}) do
+  defp precondition(state, who, _principal, {kind, _value, if_match})
+       when kind in [:priority_levels, :alerts] do
     case Reads.handle_call({:settings, who}, nil, state) do
       {:reply, {:ok, %{"settings" => settings}}, _state} ->
         Projection.capture(fn ->
@@ -1009,6 +1034,17 @@ defmodule AttentionServer.ClientAPI.Writes do
        "ref" => "client_api_v2",
        "op_id" => op_id(key),
        "levels" => levels
+     }}
+  end
+
+  defp frame(_engine, _principal, key, {:alerts, alerts, _if_match}) do
+    {:ok,
+     %{
+       "v" => 1,
+       "type" => "alerts_set",
+       "ref" => "client_api_v2",
+       "op_id" => op_id(key),
+       "alerts" => alerts
      }}
   end
 

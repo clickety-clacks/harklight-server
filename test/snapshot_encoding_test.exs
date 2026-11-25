@@ -8,23 +8,23 @@ defmodule AttentionServer.Store.SnapshotEncodingTest do
       |> Map.from_struct()
       |> Map.drop([:open_default_index, :advisory_id_index, :route_b_index, :touched_keys])
 
-    {:attention_relay_state, 29, Map.put(persisted, :__struct__, Engine)}
+    {:attention_relay_state, 30, Map.put(persisted, :__struct__, Engine)}
   end
 
-  test "cached independent blocks decode as ordinary FORMAT29 ETF across record mutations" do
+  test "cached independent blocks decode as ordinary FORMAT30 ETF across record mutations" do
     engine = Engine.new()
     {:ok, engine} = Engine.setup_person(engine, "person")
     {:ok, engine} = Engine.setup_device(engine, "person", "device")
-    {payload, cache} = SnapshotEncoding.encode(engine, 29)
+    {payload, cache} = SnapshotEncoding.encode(engine, 30)
     assert :erlang.binary_to_term(payload, [:safe]) == expected(engine)
 
     {:ok, next} = Engine.setup_device(engine, "person", "second")
-    {changed, next_cache} = SnapshotEncoding.encode(next, 29, cache)
+    {changed, next_cache} = SnapshotEncoding.encode(next, 30, cache)
     assert :erlang.binary_to_term(changed, [:safe]) == expected(next)
     assert next_cache.persons === cache.persons
 
     {:ok, next} = Engine.revoke_device(next, "device")
-    {changed, _cache} = SnapshotEncoding.encode(next, 29, next_cache)
+    {changed, _cache} = SnapshotEncoding.encode(next, 30, next_cache)
     assert :erlang.binary_to_term(changed, [:safe]) == expected(next)
   end
 
@@ -35,23 +35,24 @@ defmodule AttentionServer.Store.SnapshotEncodingTest do
     }
 
     engine = %{Engine.new() | messages: %{{"p", "s", "m"} => opaque}}
-    {payload, cache} = SnapshotEncoding.encode(engine, 29)
+    {payload, cache} = SnapshotEncoding.encode(engine, 30)
     assert :erlang.binary_to_term(payload) == expected(engine)
     next = %{engine | messages: Map.put(engine.messages, {"p", "s", "n"}, %{text: "new"})}
-    {payload, cache} = SnapshotEncoding.encode(next, 29, cache)
+    {payload, cache} = SnapshotEncoding.encode(next, 30, cache)
     assert :erlang.binary_to_term(payload) == expected(next)
     next = %{next | messages: Map.delete(next.messages, {"p", "s", "m"})}
-    {payload, _cache} = SnapshotEncoding.encode(next, 29, cache)
+    {payload, _cache} = SnapshotEncoding.encode(next, 30, cache)
     assert :erlang.binary_to_term(payload) == expected(next)
   end
 
-  test "FORMAT29 preserves delivery state and focus permissions, excluding transient fields" do
+  test "FORMAT30 preserves alert choices, delivery state and focus permissions, excluding transient fields" do
     {:ok, engine} = Engine.setup_person(Engine.new(), "person")
     {:ok, engine} = Engine.setup_device(engine, "person", "device")
 
     engine = %{
       engine
-      | delivery_states: %{"person" => "STOPPED"},
+      | alert_choices: %{"person" => "all"},
+        delivery_states: %{"person" => "STOPPED"},
         devices:
           Map.update!(
             engine.devices,
@@ -62,8 +63,9 @@ defmodule AttentionServer.Store.SnapshotEncodingTest do
         touched_keys: MapSet.new([{:row, :devices, "device"}])
     }
 
-    {payload, _cache} = SnapshotEncoding.encode(engine, 29)
-    assert {:attention_relay_state, 29, persisted} = :erlang.binary_to_term(payload, [:safe])
+    {payload, _cache} = SnapshotEncoding.encode(engine, 30)
+    assert {:attention_relay_state, 30, persisted} = :erlang.binary_to_term(payload, [:safe])
+    assert persisted.alert_choices == %{"person" => "all"}
     assert persisted.delivery_states == %{"person" => "STOPPED"}
     assert persisted.devices["device"].see_focus
     assert persisted.devices["device"].push_view
@@ -75,19 +77,19 @@ defmodule AttentionServer.Store.SnapshotEncodingTest do
     key = {"person", "origin"}
     entry = %{"text" => :crypto.strong_rand_bytes(100_000), "delivered" => false}
     engine = %{Engine.new() | origin_feeds: %{key => %{high: 1, entries: %{1 => entry}}}}
-    {payload, cache} = SnapshotEncoding.encode(engine, 29)
+    {payload, cache} = SnapshotEncoding.encode(engine, 30)
     assert :erlang.binary_to_term(payload) == expected(engine)
 
     next = put_in(engine.origin_feeds[key], %{high: 2, entries: %{1 => entry, 2 => entry}})
-    {payload, cache} = SnapshotEncoding.encode(next, 29, cache)
+    {payload, cache} = SnapshotEncoding.encode(next, 30, cache)
     assert :erlang.binary_to_term(payload) == expected(next)
 
     next = put_in(next.origin_feeds[key].entries[1]["delivered"], true)
-    {payload, cache} = SnapshotEncoding.encode(next, 29, cache)
+    {payload, cache} = SnapshotEncoding.encode(next, 30, cache)
     assert :erlang.binary_to_term(payload) == expected(next)
 
     next = %{next | origin_feeds: %{}}
-    {payload, _} = SnapshotEncoding.encode(next, 29, cache)
+    {payload, _} = SnapshotEncoding.encode(next, 30, cache)
     assert :erlang.binary_to_term(payload) == expected(next)
   end
 end
