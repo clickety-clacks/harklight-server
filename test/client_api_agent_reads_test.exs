@@ -12,7 +12,8 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
     TLSFixtures
   }
 
-  alias AttentionServer.ClientAPI.Resources
+  alias AttentionServer.AgentAPI.Feed, as: AgentFeed
+  alias AttentionServer.ClientAPI.{Context, Resources}
 
   @first_session "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
   @other_session "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
@@ -411,6 +412,89 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
 
       assert {_, %{"changes" => [%{"data" => %{"entry_id" => ^id}}]}} =
                next_delivery_page(ctx, path, token, [])
+    end
+
+    test "a person answer lost at the stream write is pending after the cursor expires", ctx do
+      item = forward(ctx, "a1", 1, @first_session)
+      path = @baseline <> "?session=#{@first_session}"
+      assert %{"rev" => cursor} = decode_response(get(ctx, "a1", path))
+      stream = open_dropping_stream(ctx, cursor, "Answer near disconnect")
+
+      assert request(
+               ctx,
+               "a2",
+               "POST",
+               "/v2/items/#{item}/answer",
+               %{"request_revision" => 1, "comment" => "Answer near disconnect"},
+               2
+             ).status == 200
+
+      assert_receive :stream_write_dropped, 2_000
+      assert %{status: 200} = Task.await(stream)
+
+      assert {:ok, _} =
+               ClientAPIFeedClient.prune_changes(ctx.relay, System.system_time(:millisecond) + 1)
+
+      assert get(ctx, "a1", "/v2/agent/changes?session=#{@first_session}&after=#{cursor}").status ==
+               410
+
+      assert %{"next_page" => page} = decode_response(get(ctx, "a1", path))
+
+      assert {_,
+              %{
+                "changes" => [
+                  %{
+                    "kind" => "message",
+                    "data" => %{
+                      "item_id" => ^item,
+                      "terminal" => %{"state" => "answered"}
+                    }
+                  }
+                ]
+              }} = next_delivery_page(ctx, path, page, [])
+
+      receipt = "/v2/agent/messages/#{item}/receipt"
+      assert request(ctx, "a1", "POST", receipt, %{"outcome" => "handed"}, 3).status == 200
+      assert %{"next_page" => fresh} = decode_response(get(ctx, "a1", path))
+      assert {_, %{"changes" => []}} = next_delivery_page(ctx, path, fresh, [])
+    end
+
+    test "a person reply lost at stream stop is pending across restart", ctx do
+      item = forward(ctx, "a1", 1, @first_session)
+      path = @baseline <> "?session=#{@first_session}"
+      assert %{"rev" => cursor} = decode_response(get(ctx, "a1", path))
+      stream = open_dropping_stream(ctx, cursor, "Reply near disconnect")
+
+      reply =
+        request(
+          ctx,
+          "a2",
+          "POST",
+          "/v2/items/#{item}/replies",
+          %{"text" => "Reply near disconnect"},
+          2
+        )
+
+      assert %{"entry" => %{"entry_id" => id}} = contract(ctx, "WriteResult", reply)
+      assert_receive :stream_write_dropped, 2_000
+      assert %{status: 200} = Task.await(stream)
+
+      assert %{"delivery" => %{"delivered" => true}} =
+               person_chat(ctx, "/v2/items/#{item}/entries", id)
+
+      assert :ok = stop_supervised(Server)
+      server = start_supervised!({Server, ctx.server_opts})
+      ctx = %{ctx | server: server, relay: Server.relay(server), port: Server.port(server)}
+
+      assert %{"next_page" => page} = decode_response(get(ctx, "a1", path))
+
+      assert {_, %{"changes" => [%{"kind" => "entry", "data" => %{"entry_id" => ^id}}]}} =
+               next_delivery_page(ctx, path, page, [])
+
+      confirm = "/v2/agent/messages/#{item}/entries/#{id}/listener-received"
+      assert request(ctx, "a1", "PUT", confirm, %{}, 3).status == 204
+      assert %{"next_page" => fresh} = decode_response(get(ctx, "a1", path))
+      assert {_, %{"changes" => []}} = next_delivery_page(ctx, path, fresh, [])
     end
 
     test "a false declaration needs positive receipt and later declarations do not replace it",
@@ -2173,6 +2257,48 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
   defp person_chat(ctx, path, id) do
     %{"entries" => entries} = decode_response(get(ctx, "a2", path))
     Enum.find(entries, &(&1["entry_id"] == id))
+  end
+
+  defmodule DroppingStream do
+    def send_chunked({test, _} = adapter, 200, _headers) do
+      send(test, :stream_opened)
+      {:ok, "", adapter}
+    end
+
+    def chunk({test, text}, data) do
+      if String.contains?(IO.iodata_to_binary(data), text) do
+        send(test, :stream_write_dropped)
+        {:error, :closed}
+      else
+        :ok
+      end
+    end
+  end
+
+  defp open_dropping_stream(ctx, cursor, text) do
+    test = self()
+
+    stream =
+      Task.async(fn ->
+        path = "/v2/agent/changes?session=#{@first_session}&after=#{cursor}"
+
+        conn =
+          :get
+          |> Plug.Test.conn(path)
+          |> Plug.Conn.put_req_header("accept", "text/event-stream")
+          |> Plug.Conn.put_req_header("harklight-ack2", "false")
+
+        stream_ctx = %Context{
+          principal: %{kind: :device, person: "A", key: ctx.keys["a1"]},
+          relay: ctx.relay,
+          request_id: "dropping-agent-feed"
+        }
+
+        AgentFeed.changes(%{conn | adapter: {DroppingStream, {test, text}}}, stream_ctx)
+      end)
+
+    assert_receive :stream_opened, 2_000
+    stream
   end
 
   defp next_delivery_page(ctx, path, page, headers) do

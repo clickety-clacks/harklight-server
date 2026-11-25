@@ -1788,11 +1788,16 @@ attempt, authenticated origin and session filter.
   retained and the consumer has not acknowledged applying it. If receipt, handoff or action for that
   turn has since been recorded, the page may show the current facts for
   reconciliation and must treat it as an update instead of pending work.
-  Granted-agent and default answers record service on the baseline and
-  ordinary feed without creating person-visible Delivered evidence or
-  adding a `delivery` member to their AgentTerminal. A fresh attempt excludes
-  earlier service on either path. Person Chat and answers also exclude
-  earlier service from older paths, including 0.2.5 changes and Agent 0.2.0 listen. Losing the saved token by deleting the
+  Person Chat and answers first selected for SSE remain pending until the
+  server records a receipt, handoff, or action for that turn. A stream
+  write can fail after Delivered is committed, so a fresh attempt can
+  recover the same stable turn ID even when the stream's cursor expired.
+  Granted-agent and default answers record service on a baseline page or
+  JSON batch without creating person-visible Delivered evidence or adding
+  a `delivery` member to their AgentTerminal. Selection for SSE leaves
+  these answers pending. A fresh attempt excludes earlier baseline or
+  JSON batch service and respects historical delivery records that do not
+  distinguish the two feed transports. Losing the saved token by deleting the
   journal or moving without it loses retry access to work already served
   by that attempt. Work never served remains pending.
 - Durably apply and deduplicate pending work by stable turn ID before
