@@ -868,13 +868,16 @@ defmodule AttentionServer.Relay do
         {:reply, {:ok, claim}, state}
 
       {:ok, next_engine, claim} ->
-        case commit(state.store, next_engine, %{
-               person: if(claim, do: claim.person, else: "system"),
-               actor: "apns_dispatcher",
-               action: "push_claim"
-             }) do
-          {:ok, store} -> {:reply, {:ok, claim}, %{state | store: store}}
-          {:error, _, _} -> {:reply, {:error, :storage_unavailable}, state}
+        with {:ok, claim} <- put_push_revision(state.store, claim),
+             {:ok, store} <-
+               commit(state.store, next_engine, %{
+                 person: if(claim, do: claim.person, else: "system"),
+                 actor: "apns_dispatcher",
+                 action: "push_claim"
+               }) do
+          {:reply, {:ok, claim}, %{state | store: store}}
+        else
+          _ -> {:reply, {:error, :storage_unavailable}, state}
         end
     end
   end
@@ -3927,6 +3930,21 @@ defmodule AttentionServer.Relay do
 
     %{state | bounce_deadline_timer: timer, bounce_deadline_generation: generation}
   end
+
+  defp put_push_revision(_store, nil), do: {:ok, nil}
+
+  defp put_push_revision(store, %{person: person, locator: locator} = claim)
+       when is_map(locator) do
+    # Relay serializes the claim with the writes that queued it. The committed
+    # person head covers every coalesced change, including entry and count rows
+    # that can follow the item row in the same write.
+    case ChangeLog.head(store, person) do
+      {:ok, rev} when rev > 0 -> {:ok, put_in(claim.locator["rev"], rev)}
+      _ -> {:error, :storage_unavailable}
+    end
+  end
+
+  defp put_push_revision(_store, _claim), do: {:error, :storage_unavailable}
 
   defp commit(store, next, audit) do
     result = Store.commit(store, next, audit)
