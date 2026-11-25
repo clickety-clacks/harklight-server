@@ -21,11 +21,11 @@ defmodule AttentionServer.Store.Format31RelayStartupTest do
 
   test "Relay startup leaves a legacy store for the stopped-store converter", %{tmp_dir: dir} do
     path = Path.join(dir, "relay.sqlite3")
-    assert {:ok, store} = Store.open(path, :legacy)
+    assert {:ok, store} = Store.open(path, :snapshot)
     original = snapshot_anchor(store)
     assert :ok = Store.close(store)
     assert {:error, :conversion_required} = Store.open_relay(path)
-    assert {:ok, store} = Store.open(path, :legacy)
+    assert {:ok, store} = Store.open(path, :snapshot)
     assert snapshot_anchor(store) == original
     assert :ok = Store.close(store)
   end
@@ -35,7 +35,7 @@ defmodule AttentionServer.Store.Format31RelayStartupTest do
   } do
     path = Path.join(directory, "relay.sqlite3")
 
-    assert {:ok, legacy} = Store.open(path, :legacy)
+    assert {:ok, legacy} = Store.open(path, :snapshot)
     assert {:ok, engine} = Engine.setup_person(legacy.engine, "person")
     assert {:ok, engine} = Engine.setup_device(engine, "person", "origin")
     audit = %{person: "person", actor: "origin", action: "test_fixture"}
@@ -62,7 +62,7 @@ defmodule AttentionServer.Store.Format31RelayStartupTest do
 
   test "cutover moves published availability without changing its rendering", %{tmp_dir: dir} do
     path = Path.join(dir, "relay.sqlite3")
-    assert {:ok, store} = Store.open(path, :legacy)
+    assert {:ok, store} = Store.open(path, :snapshot)
     assert {:ok, engine} = Engine.setup_person(store.engine, "person")
     assert {:ok, engine} = Engine.setup_device(engine, "person", "origin")
     assert {:ok, engine} = Engine.setup_sender(engine, "origin", "app:test")
@@ -92,7 +92,7 @@ defmodule AttentionServer.Store.Format31RelayStartupTest do
     tmp_dir: dir
   } do
     path = Path.join(dir, "relay.sqlite3")
-    assert {:ok, store} = Store.open(path, :legacy)
+    assert {:ok, store} = Store.open(path, :snapshot)
     assert {:ok, engine} = Engine.setup_person(store.engine, "person")
     assert {:ok, engine} = Engine.setup_device(engine, "person", "origin")
     audit = %{person: "person", actor: "origin", action: "test_fixture"}

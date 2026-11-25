@@ -450,16 +450,16 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
   end
 
   defp apply_frame(state, agent, :retract, attributes, op_id, _sources, key) do
-    frame = Map.merge(attributes, %{"v" => 1, "op_id" => op_id})
+    frame = Map.merge(attributes, %{"op_id" => op_id})
     {reply, next} = Relay.apply_account_retract(state, key, agent, frame)
-    {decode_reply(reply, :retract), next}
+    {command_result(reply, :retract), next}
   end
 
   defp apply_frame(state, agent, operation, attributes, op_id, sources, _key)
        when is_map(attributes) do
-    frame = Map.merge(attributes, %{"v" => 1, "op_id" => op_id, :agent_api_v2 => true})
-    {reply, next} = Relay.apply_agent_frame(state, agent, frame, sources)
-    {decode_reply(reply, operation), next}
+    frame = Map.merge(attributes, %{"op_id" => op_id, :agent_api_v2 => true})
+    {reply, next} = Relay.apply_agent_command(state, agent, frame, sources)
+    {command_result(reply, operation), next}
   end
 
   defp apply_frame(state, agent, _operation, {:receipt, sequence, body}, op_id, _sources, _key) do
@@ -793,10 +793,10 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
             |> Enum.uniq()
             |> Enum.reduce({[], []}, fn id, {targets, warnings} ->
               case AgentResources.own_item_key(state, scope, id) do
-                {:ok, {_, ^sender, legacy_id} = key} ->
+                {:ok, {_, ^sender, stored_message_id} = key} ->
                   if state.store.engine.messages[key].terminal,
                     do: {targets, [%{"item_id" => id, "reason" => "closed"} | warnings]},
-                    else: {[legacy_id | targets], warnings}
+                    else: {[stored_message_id | targets], warnings}
 
                 _ ->
                   {targets, [%{"item_id" => id, "reason" => "unknown"} | warnings]}
@@ -813,20 +813,15 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
     end
   end
 
-  defp decode_reply({:ok, line}, operation) do
-    case JSON.decode_line(line) do
-      {:ok, %{"type" => "ok"} = response} ->
-        {:ok, response}
+  defp command_result({:ok, fields}, _operation), do: {:ok, fields}
 
-      {:ok, %{"type" => "error", "reason" => reason} = response} ->
-        {:error, engine_error(reason, operation), response["field"]}
+  defp command_result({:error, {:typed_message, _code, reason}, field, _terminal}, operation),
+    do: {:error, engine_error(reason, operation), field}
 
-      _ ->
-        {:error, :storage_unavailable}
-    end
-  end
+  defp command_result({:error, reason, field, _terminal}, operation),
+    do: {:error, engine_error(reason, operation), field}
 
-  defp decode_reply(_, _), do: {:error, :storage_unavailable}
+  defp command_result(_, _), do: {:error, :storage_unavailable}
 
   defp engine_error("sender_not_authorized", _), do: "forbidden"
   defp engine_error("closed", _), do: "already_closed"

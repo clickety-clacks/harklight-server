@@ -1963,32 +1963,34 @@ defmodule AttentionServer.Engine do
     end
   end
 
-  @doc """
-  Handles one newline-terminated JSON request from a previously verified peer.
-  Inactive/unknown keys are refused before parsing, as TLS admission would do.
-  """
-  def request_line(%__MODULE__{} = engine, key, raw) do
-    request_line(engine, key, raw, System.system_time(:millisecond))
-  end
-
-  def request_line(%__MODULE__{} = engine, key, raw, request_at) when is_integer(request_at) do
-    with {:ok, principal} <- principal(engine, key) do
-      case JSON.decode_line_for_ui1_admission(raw) do
-        {:ok, value} ->
-          request_value(engine, principal, value, request_at)
-
-        {:error, :bad_frame} ->
-          {engine,
-           {:ok, JSON.encode!(%{"v" => 1, "type" => "error", "reason" => "bad_frame"}) <> "\n"}}
-      end
-    else
-      _ -> {engine, {:error, :forbidden}}
+  if Mix.env() == :test do
+    @doc """
+    Handles one newline-terminated JSON request from a previously verified peer.
+    Inactive/unknown keys are refused before parsing, as TLS admission would do.
+    """
+    def request_line(%__MODULE__{} = engine, key, raw) do
+      request_line(engine, key, raw, System.system_time(:millisecond))
     end
-  end
 
-  @doc false
-  def request_line_with_touches(%__MODULE__{} = engine, key, raw, request_at) do
-    with_touches(engine, &request_line(&1, key, raw, request_at))
+    def request_line(%__MODULE__{} = engine, key, raw, request_at) when is_integer(request_at) do
+      with {:ok, principal} <- principal(engine, key) do
+        case JSON.decode_line_for_ui1_admission(raw) do
+          {:ok, value} ->
+            request_value(engine, principal, value, request_at)
+
+          {:error, :bad_frame} ->
+            {engine,
+             {:ok, JSON.encode!(%{"v" => 1, "type" => "error", "reason" => "bad_frame"}) <> "\n"}}
+        end
+      else
+        _ -> {engine, {:error, :forbidden}}
+      end
+    end
+
+    @doc false
+    def request_line_with_touches(%__MODULE__{} = engine, key, raw, request_at) do
+      with_touches(engine, &request_line(&1, key, raw, request_at))
+    end
   end
 
   @doc false
@@ -2084,23 +2086,32 @@ defmodule AttentionServer.Engine do
   end
 
   @doc false
-  def request_frame(%__MODULE__{} = engine, key, value, request_at)
-      when is_integer(request_at) do
+  def request_command(%__MODULE__{} = engine, key, command, request_at) do
     with {:ok, principal} <- principal(engine, key) do
-      request_value(engine, principal, value, request_at)
+      run_command(engine, principal, command, request_at)
     else
       _ -> {engine, {:error, :forbidden}}
     end
   end
 
   @doc false
-  def request_account_retract(engine, key, %{"type" => "conversation_withdraw"} = frame, now) do
+  def request_account_retract(engine, key, %{"type" => "conversation_withdraw"} = command, now) do
     case account_device_principal(engine, key) do
       {:ok, principal} ->
-        request_value(engine, principal, Map.put(frame, :account_retract, true), now)
+        run_command(engine, principal, Map.put(command, :account_retract, true), now)
 
       error ->
         {engine, error}
+    end
+  end
+
+  defp run_command(engine, principal, command, request_at) do
+    engine = sweep_request_defaults(engine, principal.person, command, request_at)
+    principal = Map.put(principal, :request_at, request_at)
+
+    case dispatch(engine, principal, command) do
+      {:ok, next, fields} -> {next, {:ok, fields}}
+      {:error, reason, field, terminal} -> {engine, {:error, reason, field, terminal}}
     end
   end
 
@@ -2112,10 +2123,12 @@ defmodule AttentionServer.Engine do
     end
   end
 
-  defp request_value(engine, principal, value, request_at) do
-    swept = sweep_request_defaults(engine, principal.person, value, request_at)
-    {next, frame} = handle_frame(swept, Map.put(principal, :request_at, request_at), value)
-    {next, {:ok, JSON.encode_line(frame)}}
+  if Mix.env() == :test do
+    defp request_value(engine, principal, value, request_at) do
+      swept = sweep_request_defaults(engine, principal.person, value, request_at)
+      {next, frame} = handle_frame(swept, Map.put(principal, :request_at, request_at), value)
+      {next, {:ok, JSON.encode_line(frame)}}
+    end
   end
 
   @doc "Commits every due open default using the supplied server time."
@@ -2781,61 +2794,49 @@ defmodule AttentionServer.Engine do
     end
   end
 
-  defp handle_frame(engine, _principal, value) when not is_map(value) or is_struct(value),
-    do: {engine, %{"v" => 1, "type" => "error", "reason" => "bad_frame"}}
+  if Mix.env() == :test do
+    defp handle_frame(engine, _principal, value) when not is_map(value) or is_struct(value),
+      do: {engine, %{"v" => 1, "type" => "error", "reason" => "bad_frame"}}
 
-  # No comment stays payload-free and is bound to the revision displayed by the app.
-  # Resolve its request against the authenticated person's retained messages.
-  defp handle_frame(engine, principal, %{"type" => "answer_no_comment"} = frame) do
-    expected = ["request_id", "request_revision", "type"]
-
-    cond do
-      not Map.has_key?(frame, "request_revision") ->
-        {engine, error("invalid_field", nil, "request_revision")}
-
-      Enum.sort(Map.keys(frame)) != expected ->
-        {engine, error("invalid_field", nil)}
-
-      not (is_integer(frame["request_revision"]) and frame["request_revision"] > 0) ->
-        {engine, error("invalid_field", nil, "request_revision")}
-
-      true ->
-        case answer_no_comment(
-               engine,
-               principal,
-               frame["request_id"],
-               frame["request_revision"]
-             ) do
-          {:ok, next, fields} -> {next, Map.merge(base("ok", nil), fields)}
-          {:error, reason, field, terminal} -> {engine, error(reason, nil, field, terminal)}
-        end
+    # No comment stays payload-free and is bound to the revision displayed by the app.
+    # Resolve its request against the authenticated person's retained messages.
+    defp handle_frame(engine, principal, %{"type" => "answer_no_comment"} = frame) do
+      case dispatch(engine, principal, frame) do
+        {:ok, next, fields} -> {next, Map.merge(base("ok", nil), fields)}
+        {:error, reason, field, terminal} -> {engine, error(reason, nil, field, terminal)}
+      end
     end
-  end
 
-  defp handle_frame(engine, principal, frame) do
-    ref = Map.get(frame, "ref")
+    defp handle_frame(engine, principal, frame) do
+      ref = Map.get(frame, "ref")
 
-    cond do
-      Map.has_key?(frame, "ref") and not is_binary(ref) ->
-        {engine, error("invalid_field", nil, "ref")}
+      cond do
+        Map.has_key?(frame, "ref") and not is_binary(ref) ->
+          {engine, error("invalid_field", nil, "ref")}
 
-      frame["v"] != 1 or not is_integer(frame["v"]) ->
-        {engine, error("unsupported_version", ref)}
+        frame["v"] != 1 or not is_integer(frame["v"]) ->
+          {engine, error("unsupported_version", ref)}
 
-      not is_binary(frame["type"]) ->
-        {engine, error("invalid_field", ref, "type")}
+        not is_binary(frame["type"]) ->
+          {engine, error("invalid_field", ref, "type")}
 
-      true ->
-        case dispatch(engine, principal, frame) do
-          {:ok, next, fields} ->
-            {next, Map.merge(base("ok", ref), fields)}
+        true ->
+          command =
+            if frame["type"] in ["levels_get", "levels_set", "alerts_set"],
+              do: Map.drop(frame, ["v", "ref"]),
+              else: frame
 
-          {:error, {:typed_message, code, reason}, field, terminal} ->
-            {engine, error(reason, ref, field, terminal) |> Map.put("code", code)}
+          case dispatch(engine, principal, command) do
+            {:ok, next, fields} ->
+              {next, Map.merge(base("ok", ref), fields)}
 
-          {:error, reason, field, terminal} ->
-            {engine, error(reason, ref, field, terminal)}
-        end
+            {:error, {:typed_message, code, reason}, field, terminal} ->
+              {engine, error(reason, ref, field, terminal) |> Map.put("code", code)}
+
+            {:error, reason, field, terminal} ->
+              {engine, error(reason, ref, field, terminal)}
+          end
+      end
     end
   end
 
@@ -2872,6 +2873,24 @@ defmodule AttentionServer.Engine do
   defp dispatch(engine, principal, %{"type" => "conversation_result"} = frame),
     do: conversation_result(engine, principal, frame)
 
+  defp dispatch(engine, principal, %{"type" => "answer_no_comment"} = command) do
+    expected = ["request_id", "request_revision", "type"]
+
+    cond do
+      not Map.has_key?(command, "request_revision") ->
+        failure("invalid_field", "request_revision")
+
+      Enum.sort(Map.keys(command)) != expected ->
+        failure("invalid_field")
+
+      not (is_integer(command["request_revision"]) and command["request_revision"] > 0) ->
+        failure("invalid_field", "request_revision")
+
+      true ->
+        answer_no_comment(engine, principal, command["request_id"], command["request_revision"])
+    end
+  end
+
   defp dispatch(engine, principal, %{"type" => "answer"} = frame),
     do: terminal(engine, principal, frame, true)
 
@@ -2905,7 +2924,7 @@ defmodule AttentionServer.Engine do
   defp dispatch(_engine, _principal, _frame), do: failure("unknown_type")
 
   defp levels_get(engine, %{person: person}, frame) do
-    with :ok <- valid_settings_fields(frame, ~w(v type ref)) do
+    with :ok <- valid_settings_fields(frame, ~w(type)) do
       {:ok, engine, %{"levels" => BounceDecision.levels(engine, person)}}
     else
       {:error, field} -> failure("invalid_field", field)
@@ -2913,7 +2932,7 @@ defmodule AttentionServer.Engine do
   end
 
   defp levels_set(engine, %{person: person, key: device, request_at: now_ms}, frame) do
-    with :ok <- valid_settings_fields(frame, ~w(v type ref op_id levels)),
+    with :ok <- valid_settings_fields(frame, ~w(type op_id levels)),
          :ok <- valid_op(frame),
          {:ok, levels} <- BouncePolicy.normalize_levels(frame["levels"]) do
       semantic = levels_semantic(levels)
@@ -2948,7 +2967,7 @@ defmodule AttentionServer.Engine do
   end
 
   defp alerts_set(engine, %{person: person, key: device}, frame) do
-    with :ok <- valid_settings_fields(frame, ~w(v type ref op_id alerts)),
+    with :ok <- valid_settings_fields(frame, ~w(type op_id alerts)),
          :ok <- valid_op(frame),
          alerts when alerts in ["important", "all"] <- frame["alerts"] do
       op = frame["op_id"]
@@ -3449,6 +3468,8 @@ defmodule AttentionServer.Engine do
           else
             {message, screen_warnings} =
               Message.admit_answer_ui(message, Enum.map(files, & &1["name"]))
+
+            message = if frame[:agent_api_v2], do: Message.type_seen_only(message), else: message
 
             commit_forward(
               engine,
@@ -4596,6 +4617,9 @@ defmodule AttentionServer.Engine do
                 {message, normalized_warnings} =
                   Message.normalize_optional_fields(revised_message, accepted_at)
 
+                message =
+                  if frame[:agent_api_v2], do: Message.type_seen_only(message), else: message
+
                 field_warnings = normalized_warnings ++ screen_warnings
 
                 updated =
@@ -5727,20 +5751,22 @@ defmodule AttentionServer.Engine do
     %{"state" => "retracted", "retracted_at" => at, "terminal_seq" => seq}
   end
 
-  defp base(type, nil), do: %{"v" => 1, "type" => type}
-  defp base(type, ref), do: %{"v" => 1, "type" => type, "ref" => ref}
+  if Mix.env() == :test do
+    defp base(type, nil), do: %{"v" => 1, "type" => type}
+    defp base(type, ref), do: %{"v" => 1, "type" => type, "ref" => ref}
 
-  defp error(reason, ref, field \\ nil, terminal \\ nil) do
-    base("error", ref)
-    |> Map.put("reason", reason)
-    |> then(fn frame -> if field, do: Map.put(frame, "field", field), else: frame end)
-    |> then(fn frame ->
-      case terminal do
-        %{"current_revision" => _} -> Map.merge(frame, terminal)
-        nil -> frame
-        _ -> Map.put(frame, "terminal", terminal)
-      end
-    end)
+    defp error(reason, ref, field \\ nil, terminal \\ nil) do
+      base("error", ref)
+      |> Map.put("reason", reason)
+      |> then(fn frame -> if field, do: Map.put(frame, "field", field), else: frame end)
+      |> then(fn frame ->
+        case terminal do
+          %{"current_revision" => _} -> Map.merge(frame, terminal)
+          nil -> frame
+          _ -> Map.put(frame, "terminal", terminal)
+        end
+      end)
+    end
   end
 
   defp failure(reason, field \\ nil, terminal \\ nil), do: {:error, reason, field, terminal}

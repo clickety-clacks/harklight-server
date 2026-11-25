@@ -383,7 +383,7 @@ defmodule AttentionServer.LargeDataCommitOracleTest do
 
     # Exercise the legacy writer that would still run before conversion.
     :ok = PreChangeLogStore.snapshot_fixture(path)
-    {:ok, opened} = Store.open(path, :legacy)
+    {:ok, opened} = Store.open(path, :snapshot)
     clock = opened.engine.pending_clock_high_water + 1
     first = %{opened.engine | pending_clock_high_water: clock}
     {:ok, seeded} = Store.commit(opened, first, audit)

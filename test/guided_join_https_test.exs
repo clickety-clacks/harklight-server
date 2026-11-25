@@ -289,69 +289,6 @@ defmodule AttentionServer.GuidedJoinHTTPSTest do
              Relay.owner_pending_approve(restarted, c.person, owner_key, code, key, deadline, [])
   end
 
-  test "format-15 expired history is recovered as a waiting request only when its consumed invitation proves the original person",
-       c do
-    {:ok, owner_key} =
-      DeviceIdentity.from_certificate(TLSFixtures.certificate_der!(c.certs, "a1"))
-
-    cert = TLSFixtures.certificate_der!(c.certs, "a2")
-    {:ok, key} = DeviceIdentity.from_certificate(cert)
-    {:ok, invitation} = Relay.owner_invite_create(c.relay, c.person, owner_key)
-    secret = String.duplicate("9", 64)
-
-    {:ok, reply} =
-      Relay.invited_enroll(c.relay, invitation["invite_token"], cert, "phone", secret)
-
-    code = reply["approval_code"]
-    engine = :sys.get_state(c.relay).store.engine
-    item = engine.pending_enrollments[code]
-    past = System.system_time(:millisecond) - 1
-
-    old = %{
-      engine
-      | pending_enrollments: %{},
-        pending_history: %{
-          code => %{
-            state: :expired,
-            key: key,
-            secret_hash: item.secret_hash,
-            expires_at: past,
-            status_expires_at: past + 86_400_000
-          }
-        }
-    }
-
-    stop_supervised(EnrollmentHTTPS)
-    stop_supervised(OwnerTLS)
-    stop_supervised(Relay)
-    :ok = AttentionServer.PreChangeLogStore.snapshot_fixture(c.path, 15, fn _ -> old end)
-
-    {:ok, migrated} = Store.open(c.path)
-    recovered = migrated.engine.pending_enrollments[code]
-    assert recovered.person == c.person
-    assert recovered.key == key
-    assert recovered.certificate == nil
-    assert recovered.request_generation == 1
-    assert migrated.engine.pending_history == %{}
-    Store.close(migrated)
-
-    :ok = AttentionServer.PreChangeLogStore.convert_fixture(c.path)
-    {:ok, resumed_relay} = Relay.start_link(store_path: c.path, join_configuration: c.config)
-    on_exit(fn -> if Process.alive?(resumed_relay), do: GenServer.stop(resumed_relay) end)
-
-    assert {:ok, %{"state" => "pending", "person_id" => person, "request_generation" => 1}} =
-             Relay.pending_resume(resumed_relay, secret, cert)
-
-    assert person == c.person
-
-    assert {:error, :not_found} =
-             Relay.pending_resume(
-               resumed_relay,
-               secret,
-               TLSFixtures.certificate_der!(c.certs, "b1")
-             )
-  end
-
   test "serialized approval/cancel race has one durable truthful result", c do
     {:ok, owner_key} =
       DeviceIdentity.from_certificate(TLSFixtures.certificate_der!(c.certs, "a1"))

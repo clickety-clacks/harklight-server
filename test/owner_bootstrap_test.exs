@@ -1,8 +1,7 @@
 defmodule AttentionServer.OwnerBootstrapTest do
   use ExUnit.Case, async: false
 
-  alias AttentionServer.{DeviceIdentity, Message, Relay, Store, TLSFixtures}
-  alias Exqlite.Sqlite3
+  alias AttentionServer.{DeviceIdentity, Message, Relay, TLSFixtures}
 
   setup_all do
     certs = TLSFixtures.create!()
@@ -58,33 +57,4 @@ defmodule AttentionServer.OwnerBootstrapTest do
     GenServer.stop(restarted)
   end
 
-  test "format-three state gains empty owner state in one attributable migration", %{path: path} do
-    {:ok, relay} = Relay.start_link(store_path: path)
-    assert :ok = Relay.setup_person(relay, "legacy")
-    before = :sys.get_state(relay).store
-    GenServer.stop(relay)
-
-    :ok = AttentionServer.PreChangeLogStore.snapshot_fixture(path, 3, fn _ -> before.engine end)
-
-    assert {:ok, migrated} = Store.open(path)
-    assert migrated.version == before.version + 1
-    assert migrated.engine.owners == %{}
-    assert migrated.engine.retired_owner_keys == MapSet.new()
-    assert :ok = Store.close(migrated)
-    assert {:ok, again} = Store.open(path)
-    assert again.version == migrated.version
-    assert :ok = Store.close(again)
-
-    assert {:ok, db} = Sqlite3.open(path)
-
-    assert {:ok, stmt} =
-             Sqlite3.prepare(
-               db,
-               "SELECT actor_id, action FROM relay_audit ORDER BY id DESC LIMIT 1"
-             )
-
-    assert {:row, ["schema_migration", "owner_state_init"]} = Sqlite3.step(db, stmt)
-    assert :ok = Sqlite3.release(db, stmt)
-    assert :ok = Sqlite3.close(db)
-  end
 end

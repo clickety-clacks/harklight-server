@@ -26,9 +26,8 @@ defmodule AttentionServer.BrowserSignIn do
          true <- is_integer(now) and now >= 0 do
       tokens =
         Map.reject(engine.browser_sign_ins, fn {_, item} ->
-          not is_nil(Map.get(item, :consumed_at)) or
-            Engine.owner_revision(engine, item.person, item.owner_key) !=
-              {:ok, item.owner_revision}
+          Engine.owner_revision(engine, item.person, item.owner_key) !=
+            {:ok, item.owner_revision}
         end)
 
       cond do
@@ -61,20 +60,16 @@ defmodule AttentionServer.BrowserSignIn do
     with item when is_map(item) <- Map.get(engine.browser_sign_ins, hash),
          {:ok, revision} <- Engine.owner_revision(engine, item.person, item.owner_key),
          true <- revision == item.owner_revision do
-      if is_nil(Map.get(item, :consumed_at)) do
-        next = Engine.delete_row(engine, :browser_sign_ins, hash)
+      next = Engine.delete_row(engine, :browser_sign_ins, hash)
 
-        principal = %{
-          person_id: item.person,
-          owner_key: item.owner_key,
-          owner_revision: item.owner_revision,
-          scope: :person_owner
-        }
+      principal = %{
+        person_id: item.person,
+        owner_key: item.owner_key,
+        owner_revision: item.owner_revision,
+        scope: :person_owner
+      }
 
-        {:ok, next, principal}
-      else
-        {:error, :used}
-      end
+      {:ok, next, principal}
     else
       _ -> {:error, :invalid_sign_in}
     end
@@ -89,29 +84,52 @@ defmodule AttentionServer.BrowserSignIn do
       end)
   end
 
-  # Records keep the stored shape; older ones carry a deadline that is no longer
-  # enforced, current ones carry nil.
+  # FORMAT30 snapshots may still contain records from before consumption
+  # deleted the token. Keep usable links and remove spent tokens.
   @doc false
-  def valid_record?(engine, hash, record) when is_map(record) do
-    person = Map.get(record, :person)
-    owner_key = Map.get(record, :owner_key)
-    owner_revision = Map.get(record, :owner_revision)
-    issued_at = Map.get(record, :issued_at)
-    expires_at = Map.get(record, :expires_at)
-    retain_until = Map.get(record, :retain_until)
-    consumed_at = Map.get(record, :consumed_at)
+  def normalize_snapshot_records(engine) when is_map(engine.browser_sign_ins) do
+    tokens =
+      Enum.reduce(engine.browser_sign_ins, %{}, fn
+        {hash, %{retain_until: retain, expires_at: expires, consumed_at: consumed} = record}, acc
+        when map_size(record) == 7 and is_integer(retain) and is_integer(expires) and
+               retain > expires ->
+          current = Map.drop(record, [:retain_until, :consumed_at])
 
-    current? = map_size(record) == 5
+          cond do
+            not valid_record?(engine, hash, current) ->
+              Map.put(acc, hash, record)
 
-    legacy? =
-      map_size(record) == 7 and is_integer(retain_until) and is_integer(expires_at) and
-        retain_until > expires_at and
-        (is_nil(consumed_at) or (is_integer(consumed_at) and consumed_at >= issued_at))
+            is_nil(consumed) ->
+              Map.put(acc, hash, current)
 
+            is_integer(consumed) and consumed >= current.issued_at ->
+              acc
+
+            true ->
+              Map.put(acc, hash, record)
+          end
+
+        {hash, record}, acc ->
+          Map.put(acc, hash, record)
+      end)
+
+    %{engine | browser_sign_ins: tokens}
+  end
+
+  def normalize_snapshot_records(engine), do: engine
+
+  @doc false
+  def valid_record?(engine, hash, %{
+        person: person,
+        owner_key: owner_key,
+        owner_revision: owner_revision,
+        issued_at: issued_at,
+        expires_at: expires_at
+      } = record)
+      when map_size(record) == 5 do
     hash?(hash) and Map.has_key?(engine.persons, person) and key?(owner_key) and
       is_integer(owner_revision) and owner_revision > 0 and is_integer(issued_at) and
-      issued_at >= 0 and (is_nil(expires_at) or is_integer(expires_at)) and
-      (current? or legacy?)
+      issued_at >= 0 and (is_nil(expires_at) or is_integer(expires_at))
   end
 
   def valid_record?(_engine, _hash, _record), do: false

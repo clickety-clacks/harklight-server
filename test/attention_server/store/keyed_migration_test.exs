@@ -1,8 +1,6 @@
 defmodule AttentionServer.Store.KeyedMigrationTest do
   use ExUnit.Case, async: true
 
-  import ExUnit.CaptureLog
-
   alias AttentionServer.{Engine, Store}
   alias AttentionServer.Store.{KeyedMigration, RecordCodec, RecordTable}
   alias Exqlite.Sqlite3
@@ -199,7 +197,7 @@ defmodule AttentionServer.Store.KeyedMigrationTest do
     warning =
       capture_log(fn ->
         assert {:error, {:storage_unavailable, {:error, :format31_requires_keyed_mode}}} =
-                 Store.open(path, :legacy)
+                 Store.open(path, :snapshot)
       end)
 
     assert warning =~ "FORMAT31"

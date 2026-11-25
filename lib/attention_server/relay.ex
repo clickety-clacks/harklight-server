@@ -2,7 +2,7 @@ defmodule AttentionServer.Relay do
   @moduledoc """
   Serialized relay core with an optional durable SQLite store.
 
-  `request_line/3` retains the first slice's trusted-key test seam. Devices
+  Authenticated client commands are applied directly to the engine. Devices
   reach the Relay through client API v2 (`ClientAPI.Listener`); the Relay
   keeps no device sessions.
   """
@@ -28,7 +28,6 @@ defmodule AttentionServer.Relay do
     Diagnostics,
     DeviceIdentity,
     Engine,
-    JSON,
     Message,
     JevClient,
     JevRanking,
@@ -36,6 +35,8 @@ defmodule AttentionServer.Relay do
     RouteBIndex,
     Store
   }
+
+  alias AttentionServer.JSON, warn: false
 
   def start_link(opts \\ []) do
     GenServer.start_link(__MODULE__, opts, Keyword.take(opts, [:name]))
@@ -441,12 +442,14 @@ defmodule AttentionServer.Relay do
   def revoke_enrollment_read_fixture(server, person, grant_id),
     do: GenServer.call(server, {:revoke_enrollment_read_fixture, person, grant_id}, :infinity)
 
-  def request_line(server, verified_key, line),
-    do: GenServer.call(server, {:request_line, verified_key, line}, :infinity)
+  if Mix.env() == :test do
+    def request_line(server, verified_key, line),
+      do: GenServer.call(server, {:request_line, verified_key, line}, :infinity)
+  end
 
   @doc false
-  def request_staged_reply(server, verified_key, frame, sources),
-    do: GenServer.call(server, {:request_staged_reply, verified_key, frame, sources}, :infinity)
+  def apply_client_command(server, key, command, sources),
+    do: GenServer.call(server, {:client_command, key, command, sources}, :infinity)
 
   @doc false
   def push_server_id(server), do: GenServer.call(server, :push_server_id, :infinity)
@@ -601,6 +604,7 @@ defmodule AttentionServer.Relay do
 
     with :ok <- Store.discard_building_inbox_snapshots(store),
          {:ok, store} <- commit_browser_cleanup(store, engine),
+         {:ok, store} <- Store.migrate_retained_client_data(store),
          {:ok, store} <- resume_bounces(store),
          :ok <- Store.discard_browser_inbox_snapshots(store) do
       {:ok, store}
@@ -843,22 +847,25 @@ defmodule AttentionServer.Relay do
     AttentionServer.Store.Persistence.with_reads(state.store, reader, fun)
   end
 
-  defp dispatch_call({:request_line, key, raw}, _from, state) do
-    {reply, next} = request(state, key, raw)
-    {:reply, reply, next}
+  if Mix.env() == :test do
+    defp dispatch_call({:request_line, key, raw}, _from, state) do
+      {reply, next} = request(state, key, raw)
+      {:reply, reply, next}
+    end
   end
 
   defp dispatch_call(
-         {:request_staged_reply, key, %{"type" => "discussion"} = frame, sources},
+         {:client_command, key, command, sources},
          _from,
          state
        ) do
     with {:ok, person} <- Engine.authorized_person(state.store.engine, key),
+         :ok <- client_command_enabled(state, command),
          :ok <- verify_staged_reply_sources(state.store, person, sources) do
-      {reply, next} = perform_request_frame(state, key, frame, sources)
+      {reply, next} = perform_command(state, key, command, sources)
       {:reply, reply, next}
     else
-      {:error, reason} -> {:reply, {:error, reason}, state}
+      error -> {:reply, error, state}
     end
   end
 
@@ -2547,77 +2554,79 @@ defmodule AttentionServer.Relay do
     {:ok, lease, %{state | active_uploads: active}}
   end
 
-  defp request(state, key, raw) do
-    case Engine.authorized_person(state.store.engine, key) do
-      {:ok, _person} ->
-        cond do
-          not state.push_enabled and push_request?(raw) ->
-            {{:ok, error_line(raw, "forbidden")}, state}
+  if Mix.env() == :test do
+    defp request(state, key, raw) do
+      case Engine.authorized_person(state.store.engine, key) do
+        {:ok, _person} ->
+          cond do
+            not state.push_enabled and push_request?(raw) ->
+              {{:ok, error_line(raw, "forbidden")}, state}
 
-          not state.source_fixture_mode and source_report_request?(raw) ->
-            {{:ok, error_line(raw, "not_supported")}, state}
+            not state.source_fixture_mode and source_report_request?(raw) ->
+              {{:ok, error_line(raw, "not_supported")}, state}
 
-          true ->
-            perform_request_line(state, key, raw)
-        end
-
-      _ ->
-        {{:error, :forbidden}, state}
-    end
-  end
-
-  defp source_report_request?(raw) do
-    case JSON.decode_line(raw) do
-      {:ok, %{"type" => type}} when type in ["source_bind", "source_result"] -> true
-      _ -> false
-    end
-  end
-
-  defp push_request?(raw) do
-    case JSON.decode_line(raw) do
-      {:ok, %{"type" => type}} when type in ["push_register", "push_remove", "push_status"] ->
-        true
-
-      _ ->
-        false
-    end
-  end
-
-  defp perform_request_line(state, key, raw) do
-    {next_engine, reply} = Engine.request_line(state.store.engine, key, raw, state.clock.())
-    next_engine = with_coverage_availability(state, key, next_engine)
-    next_engine = with_initial_origin_availability(state, key, next_engine)
-
-    operation_id =
-      case JSON.decode_line(raw) do
-        {:ok, request} when is_map(request) -> Diagnostics.operation_id(request)
-        _ -> nil
-      end
-
-    targets =
-      case JSON.decode_line(raw) do
-        {:ok, request} when is_map(request) ->
-          origin_feed_targets(state.store.engine, next_engine, key, request)
+            true ->
+              perform_request_line(state, key, raw)
+          end
 
         _ ->
-          []
+          {{:error, :forbidden}, state}
       end
+    end
 
-    finish_request(
-      state,
-      key,
-      next_engine,
-      reply,
-      operation_id,
-      targets,
-      request_action(raw),
-      raw
-    )
+    defp source_report_request?(raw) do
+      case JSON.decode_line(raw) do
+        {:ok, %{"type" => type}} when type in ["source_bind", "source_result"] -> true
+        _ -> false
+      end
+    end
+
+    defp push_request?(raw) do
+      case JSON.decode_line(raw) do
+        {:ok, %{"type" => type}} when type in ["push_register", "push_remove", "push_status"] ->
+          true
+
+        _ ->
+          false
+      end
+    end
+
+    defp perform_request_line(state, key, raw) do
+      {next_engine, reply} = Engine.request_line(state.store.engine, key, raw, state.clock.())
+      next_engine = with_coverage_availability(state, key, next_engine)
+      next_engine = with_initial_origin_availability(state, key, next_engine)
+
+      operation_id =
+        case JSON.decode_line(raw) do
+          {:ok, request} when is_map(request) -> Diagnostics.operation_id(request)
+          _ -> nil
+        end
+
+      targets =
+        case JSON.decode_line(raw) do
+          {:ok, request} when is_map(request) ->
+            origin_feed_targets(state.store.engine, next_engine, key, request)
+
+          _ ->
+            []
+        end
+
+      finish_request(
+        state,
+        key,
+        next_engine,
+        reply,
+        operation_id,
+        targets,
+        request_action(raw),
+        raw
+      )
+    end
   end
 
   @doc false
-  def apply_agent_frame(state, key, frame, sources),
-    do: perform_request_frame(state, key, frame, sources)
+  def apply_agent_command(state, key, command, sources),
+    do: perform_command(state, key, command, sources)
 
   @doc false
   def apply_account_retract(state, {person, _, _} = message_key, actor, frame) do
@@ -2687,18 +2696,24 @@ defmodule AttentionServer.Relay do
     end)
   end
 
-  defp perform_request_frame(state, key, frame, staged_sources) do
-    {next_engine, reply} = Engine.request_frame(state.store.engine, key, frame, state.clock.())
+  defp client_command_enabled(%{push_enabled: false}, %{"type" => type})
+       when type in ["push_register", "push_remove"],
+       do: {:error, "forbidden", nil, nil}
+
+  defp client_command_enabled(_state, _command), do: :ok
+
+  defp perform_command(state, key, command, staged_sources) do
+    {next_engine, reply} = Engine.request_command(state.store.engine, key, command, state.clock.())
 
     next_engine =
-      if request_success?(reply),
+      if match?({:ok, _}, reply),
         do: record_staged_reply_sources(next_engine, staged_sources),
         else: next_engine
 
     next_engine = with_coverage_availability(state, key, next_engine)
-    next_engine = initial_delivery_availability(state, key, next_engine, frame)
-    operation_id = Diagnostics.operation_id(frame)
-    targets = origin_feed_targets(state.store.engine, next_engine, key, frame)
+    next_engine = initial_delivery_availability(state, key, next_engine, command)
+    operation_id = Diagnostics.operation_id(command)
+    targets = origin_feed_targets(state.store.engine, next_engine, key, command)
 
     finish_request(
       state,
@@ -2707,8 +2722,8 @@ defmodule AttentionServer.Relay do
       reply,
       operation_id,
       targets,
-      frame["type"] || "relay_request",
-      frame
+      command["type"] || "relay_request",
+      command
     )
   end
 
@@ -2743,17 +2758,6 @@ defmodule AttentionServer.Relay do
       Engine.put_row(state, :uploads, upload_id, Map.put_new(upload, :staged_file_id, file_id))
     end)
   end
-
-  defp request_success?({:ok, %JSON.StreamedLine{value: %{"type" => "ok"}}}), do: true
-
-  defp request_success?({:ok, line}) when is_binary(line) do
-    case JSON.decode_line(line) do
-      {:ok, %{"type" => "ok"}} -> true
-      _ -> false
-    end
-  end
-
-  defp request_success?(_), do: false
 
   defp finish_request(state, key, next_engine, reply, operation_id, targets, action, original) do
     if next_engine == state.store.engine do
@@ -2794,15 +2798,33 @@ defmodule AttentionServer.Relay do
           {reply, refresh_new_agent_session(state, next_state, key, original)}
 
         {:error, _, _} ->
-          {{:ok, error_line(original, "storage_unavailable")}, state}
+          {storage_failure(original), state}
       end
     end
   end
 
-  defp commit_request(store, next, %{action: "message_open", person: person} = audit, raw)
-       when is_binary(raw) do
-    with {:ok, %{"sender_id" => sender, "message_id" => id}} <- JSON.decode_line(raw),
-         {:ok, next} <-
+  if Mix.env() == :test do
+    defp storage_failure(raw) when is_binary(raw),
+      do: {:ok, error_line(raw, "storage_unavailable")}
+  end
+
+  defp storage_failure(_command), do: {:error, "storage_unavailable", nil, nil}
+
+  if Mix.env() == :test do
+    defp commit_request(store, next, %{action: "message_open"} = audit, raw)
+         when is_binary(raw) do
+      case JSON.decode_line(raw) do
+        {:ok, command} -> commit_request(store, next, audit, command)
+        _ -> {:error, :storage_unavailable, store}
+      end
+    end
+  end
+
+  defp commit_request(store, next, %{action: "message_open", person: person} = audit, %{
+         "sender_id" => sender,
+         "message_id" => id
+       }) do
+    with {:ok, next} <-
            AttentionServer.AgentAPI.Advisories.stamp_decisions(store, next, [{person, sender, id}]) do
       commit(store, next, audit)
     else
@@ -4125,49 +4147,51 @@ defmodule AttentionServer.Relay do
     )
   end
 
-  defp request_action(raw) do
-    case JSON.decode_line(raw) do
-      {:ok, %{"type" => type}}
-      when type in [
-             "forward",
-             "answer",
-             "lifecycle",
-             "message_open",
-             "subscribe_remote",
-             "source_bind",
-             "source_result",
-             "push_register",
-             "push_remove"
-           ] ->
-        type
+  if Mix.env() == :test do
+    defp request_action(raw) do
+      case JSON.decode_line(raw) do
+        {:ok, %{"type" => type}}
+        when type in [
+               "forward",
+               "answer",
+               "lifecycle",
+               "message_open",
+               "subscribe_remote",
+               "source_bind",
+               "source_result",
+               "push_register",
+               "push_remove"
+             ] ->
+          type
 
-      _ ->
-        "relay_request"
+        _ ->
+          "relay_request"
+      end
     end
-  end
 
-  defp error_line(%{} = frame, reason, field) do
-    base("error", frame)
-    |> Map.put("reason", reason)
-    |> then(fn result -> if field, do: Map.put(result, "field", field), else: result end)
-    |> line()
-  end
-
-  defp error_line(%{} = frame, reason), do: error_line(frame, reason, nil)
-
-  defp error_line(raw, reason) when is_binary(raw) do
-    case JSON.decode_line(raw) do
-      {:ok, %{} = frame} -> error_line(frame, reason)
-      _ -> error_line(%{}, reason)
+    defp error_line(%{} = frame, reason, field) do
+      base("error", frame)
+      |> Map.put("reason", reason)
+      |> then(fn result -> if field, do: Map.put(result, "field", field), else: result end)
+      |> line()
     end
-  end
 
-  defp base(type, frame) do
-    result = %{"v" => 1, "type" => type}
-    if is_binary(Map.get(frame, "ref")), do: Map.put(result, "ref", frame["ref"]), else: result
-  end
+    defp error_line(%{} = frame, reason), do: error_line(frame, reason, nil)
 
-  defp line(frame), do: JSON.encode_line(frame)
+    defp error_line(raw, reason) when is_binary(raw) do
+      case JSON.decode_line(raw) do
+        {:ok, %{} = frame} -> error_line(frame, reason)
+        _ -> error_line(%{}, reason)
+      end
+    end
+
+    defp base(type, frame) do
+      result = %{"v" => 1, "type" => type}
+      if is_binary(Map.get(frame, "ref")), do: Map.put(result, "ref", frame["ref"]), else: result
+    end
+
+    defp line(frame), do: JSON.encode_line(frame)
+  end
 
   @doc false
   def agent_focus(state, person, key) do

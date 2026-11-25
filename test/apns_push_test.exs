@@ -846,7 +846,7 @@ defmodule AttentionServer.APNSPushTest do
     refute_receive {:apns_request, _, _, _}, 100
 
     assert :ok = Supervisor.stop(first_server)
-    seed_legacy_push_format16_past_window(store_path)
+    make_queued_push_eligible(store_path)
 
     {:ok, server} = Server.start_link(server_options(certs, store_path) ++ [apns: apns])
     Process.unlink(server)
@@ -1223,18 +1223,6 @@ defmodule AttentionServer.APNSPushTest do
     refute Map.has_key?(binding.last_outcome, "reason")
     refute inspect(binding.last_outcome) =~ @device_token
     refute v2(server, certs, "a2", "GET", "/v2/settings").body =~ @device_token
-
-    assert :ok = Supervisor.stop(server)
-
-    seed_legacy_provider_reason(store_path, @device_token)
-
-    server = start_apns_server(ctx, store_path)
-    relay = Server.relay(server)
-    settings = v2(server, certs, "a2", "GET", "/v2/settings")
-
-    assert json(settings)["settings"]["push"]["state"] == "blocked_configuration"
-    refute settings.body =~ @device_token
-    refute Map.has_key?(stored_binding(relay, app_key).last_outcome, "reason")
 
     assert :ok = Supervisor.stop(server)
   end
@@ -2269,33 +2257,21 @@ defmodule AttentionServer.APNSPushTest do
     outcome
   end
 
-  defp seed_legacy_provider_reason(path, reason) do
-    :ok = AttentionServer.PreChangeLogStore.snapshot_fixture(path, 10, fn engine ->
-      {key, binding} =
-        Enum.find(engine.push_bindings, fn {_key, binding} -> binding.address == @device_token end)
-
-      put_in(engine.push_bindings[key], %{binding | last_outcome: Map.put(binding.last_outcome, "reason", reason)})
-    end)
-
-    :ok = AttentionServer.PreChangeLogStore.convert_fixture(path)
-  end
-
-  # FORMAT16 did not store accepted_high. Move the queued push into the past,
-  # as if the server had been down until it was eligible.
-  defp seed_legacy_push_format16_past_window(path) do
-    :ok = AttentionServer.PreChangeLogStore.snapshot_fixture(path, 16, fn engine ->
+  # Make the queued push eligible immediately on a cold restart.
+  defp make_queued_push_eligible(path) do
+    assert :ok = AttentionServer.PreChangeLogStore.snapshot_fixture(path, 30, fn engine ->
       past = System.system_time(:millisecond) - 1
 
       bindings =
         Map.new(engine.push_bindings, fn {key, binding} ->
           next_at = if is_integer(binding.next_at), do: past, else: nil
-          {key, binding |> Map.delete(:accepted_high) |> Map.put(:next_at, next_at)}
+          {key, %{binding | next_at: next_at}}
         end)
 
       %{engine | push_bindings: bindings}
     end)
 
-    :ok = AttentionServer.PreChangeLogStore.convert_fixture(path)
+    assert :ok = AttentionServer.PreChangeLogStore.convert_fixture(path)
   end
 
   defp available_port do

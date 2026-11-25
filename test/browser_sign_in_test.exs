@@ -214,14 +214,21 @@ defmodule AttentionServer.BrowserSignInTest do
     assert :sys.get_state(relay).store.engine.sender_grants == %{}
   end
 
-  test "older snapshots gain no login credential while retaining owner/device/invitation state",
-       c do
+  test "FORMAT30 preserves unused sign-in links and discards spent tokens", c do
     path = database_path()
-    {:ok, store} = Store.open(path)
-    Store.close(store)
-    {:ok, device_engine} = Engine.setup_device(c.engine, @person, @device)
-    legacy = Map.drop(device_engine, [:browser_sign_ins, :browser_sign_in_clock_high_water])
-    payload = :erlang.term_to_binary({:attention_relay_state, 13, legacy}, [{:compressed, 6}])
+    assert {:ok, store} = Store.open(path)
+    assert :ok = Store.close(store)
+
+    assert {:ok, engine, record} = BrowserSignIn.issue(c.engine, @person, @owner, c.hash, 100)
+    spent = :crypto.hash(:sha256, "spent")
+    prior = %{record | expires_at: 200} |> Map.merge(%{retain_until: 300, consumed_at: nil})
+
+    old_engine = %{
+      engine
+      | browser_sign_ins: %{c.hash => prior, spent => %{prior | consumed_at: 150}}
+    }
+
+    payload = :erlang.term_to_binary({:attention_relay_state, 30, old_engine}, [:compressed])
     {:ok, db} = Exqlite.Sqlite3.open(path)
 
     {:ok, stmt} =
@@ -231,14 +238,22 @@ defmodule AttentionServer.BrowserSignInTest do
     :done = Exqlite.Sqlite3.step(db, stmt)
     :ok = Exqlite.Sqlite3.release(db, stmt)
     :ok = Exqlite.Sqlite3.close(db)
-    {:ok, migrated} = Store.open(path)
-    assert migrated.engine.browser_sign_ins == %{}
-    assert migrated.engine.browser_sign_in_clock_high_water == 0
+    assert {:ok, reopened} = Store.open(path)
+    assert reopened.version == store.version
+    assert reopened.engine.owners == engine.owners
+    assert reopened.engine.browser_sign_ins == %{c.hash => %{record | expires_at: 200}}
+    assert {:error, :invalid_sign_in} = BrowserSignIn.consume(reopened.engine, spent)
 
-    assert Map.drop(migrated.engine, [:browser_sign_ins, :browser_sign_in_clock_high_water]) ==
-             legacy
+    assert {:ok, next, %{person_id: @person, owner_key: @owner}} =
+             BrowserSignIn.consume(reopened.engine, c.hash)
 
-    Store.close(migrated)
+    assert {:ok, committed} =
+             Store.commit(reopened, next, %{person: @person, actor: @owner, action: "sign_in"})
+
+    assert :ok = Store.close(committed)
+    assert {:ok, reopened} = Store.open(path)
+    assert reopened.engine.browser_sign_ins == %{}
+    assert :ok = Store.close(reopened)
   end
 
   defp database_path do

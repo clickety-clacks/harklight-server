@@ -340,47 +340,10 @@ defmodule AttentionServer.SourceReportTest do
           Map.update!(engine.messages, second_key, &Map.put(&1, :source_binding, duplicate))
     }
 
-    :ok = AttentionServer.PreChangeLogStore.snapshot_fixture(path, 2, fn _ -> corrupted end)
+    :ok = AttentionServer.PreChangeLogStore.snapshot_fixture(path, 30, fn _ -> corrupted end)
 
     assert {:error, {:storage_unavailable, {:error, :invalid_state}}} =
              Store.open(path)
   end
 
-  test "format-one SQLite snapshot preserves stored messages and source report fields", %{
-    relay: relay,
-    path: path
-  } do
-    assert %{"seq" => 1, "type" => "ok"} = send_origin(relay, "a1", op(40), message("legacy"))
-
-    engine = :sys.get_state(relay).store.engine
-    GenServer.stop(relay)
-    legacy = engine |> Map.delete(:agents) |> Map.delete(:source_report_grants)
-    :ok = AttentionServer.PreChangeLogStore.snapshot_fixture(path, 1, fn _ -> legacy end)
-    :ok = AttentionServer.PreChangeLogStore.convert_fixture(path)
-
-    {:ok, restarted} =
-      Relay.start_link(store_path: path, source_fixture_mode: true, agent_fixture_mode: true)
-
-    assert {:ok, [%{"message_id" => "legacy"}], 1} = RelayReaders.events(restarted, "a1", 0)
-
-    assert :ok =
-             Relay.grant_source_report(
-               restarted,
-               "A",
-               "a1",
-               "source-A",
-               ["app:test"],
-               "owner-fixture"
-             )
-
-    GenServer.stop(restarted)
-
-    {:ok, again} =
-      Relay.start_link(store_path: path, source_fixture_mode: true, agent_fixture_mode: true)
-
-    assert :sys.get_state(again).store.engine.source_report_grants[{"A", "a1", "source-A"}].revoked ==
-             false
-
-    GenServer.stop(again)
-  end
 end

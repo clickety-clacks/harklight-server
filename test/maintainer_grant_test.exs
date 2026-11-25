@@ -2,49 +2,11 @@ defmodule AttentionServer.MaintainerGrantTest do
   use ExUnit.Case, async: false
 
   alias AttentionServer.{DeviceIdentity, HeadlessOwner, HeadlessTLS, OwnerTLS, Relay, TLSFixtures}
-  alias Exqlite.Sqlite3
 
   setup_all do
     certs = TLSFixtures.create!()
     on_exit(fn -> File.rm_rf!(certs) end)
     %{certs: certs}
-  end
-
-  test "format-five snapshot gains empty maintainer foundation with one audit migration" do
-    dir =
-      Path.join(
-        System.tmp_dir!(),
-        "attention-maintainer-migration-#{System.unique_integer([:positive])}"
-      )
-
-    File.mkdir_p!(dir)
-    on_exit(fn -> File.rm_rf!(dir) end)
-    path = Path.join(dir, "relay.sqlite3")
-    {:ok, relay} = Relay.start_link(store_path: path)
-    before = :sys.get_state(relay).store
-    GenServer.stop(relay)
-
-    :ok = AttentionServer.PreChangeLogStore.snapshot_fixture(path, 5, fn _ -> before.engine end)
-
-    assert {:ok, migrated} = AttentionServer.Store.open(path)
-    assert migrated.version == before.version + 1
-    assert migrated.engine.maintainer_grants == %{}
-    assert :ok = AttentionServer.Store.close(migrated)
-
-    assert {:ok, again} = AttentionServer.Store.open(path)
-    assert again.version == migrated.version
-    assert :ok = AttentionServer.Store.close(again)
-    assert {:ok, db} = Sqlite3.open(path)
-
-    assert {:ok, stmt} =
-             Sqlite3.prepare(
-               db,
-               "SELECT actor_id, action FROM relay_audit ORDER BY id DESC LIMIT 1"
-             )
-
-    assert {:row, ["schema_migration", "maintainer_state_init"]} = Sqlite3.step(db, stmt)
-    assert :ok = Sqlite3.release(db, stmt)
-    assert :ok = Sqlite3.close(db)
   end
 
   test "owner creates and revokes durable inert grant; cross-person access and exercise stay denied",

@@ -275,50 +275,6 @@ defmodule AttentionServer.HostedAccountTest do
   end
 
   describe "store format" do
-    test "earlier state gains an empty hosted account table", %{dir: dir} do
-      path = Path.join(dir, "relay.sqlite3")
-      {:ok, initial} = Store.open(path)
-      assert :ok = Store.close(initial)
-
-      {:ok, engine} = Engine.setup_person(initial.engine, "A")
-      old_engine = Map.delete(engine, :hosted_accounts)
-
-      payload =
-        :erlang.term_to_binary({:attention_relay_state, 21, old_engine}, [{:compressed, 6}])
-
-      assert {:ok, db} = Sqlite3.open(path)
-      assert {:ok, stmt} = Sqlite3.prepare(db, "UPDATE relay_state SET payload = ?, checksum = ?")
-      assert :ok = Sqlite3.bind(stmt, [{:blob, payload}, {:blob, :crypto.hash(:sha256, payload)}])
-      assert :done = Sqlite3.step(db, stmt)
-      assert :ok = Sqlite3.release(db, stmt)
-      assert :ok = Sqlite3.close(db)
-
-      assert {:ok, migrated} = Store.open(path)
-      assert migrated.engine.hosted_accounts == %{}
-      assert migrated.engine.persons == %{"A" => 0}
-      assert :ok = Store.close(migrated)
-    end
-
-    test "format 28 hosted state defaults to restored after migration", %{
-      certs: certs,
-      dir: dir
-    } do
-      path = Path.join(dir, "relay.sqlite3")
-      relay = start_relay(certs, dir, dashboard_origin: @origin)
-      assert {:ok, person} = Relay.hosted_account_create(relay, "acct-format-28")
-      GenServer.stop(relay)
-
-      {:ok, current} = Store.open(path)
-      old_engine = Map.delete(current.engine, :delivery_states)
-      assert :ok = Store.close(current)
-
-      :ok = AttentionServer.PreChangeLogStore.snapshot_fixture(path, 28, fn _ -> old_engine end)
-
-      assert {:ok, migrated} = Store.open(path)
-      assert migrated.engine.delivery_states == %{}
-      refute Engine.delivery_stopped?(migrated.engine, person)
-      assert :ok = Store.close(migrated)
-    end
   end
 
   describe "hosted delivery state" do

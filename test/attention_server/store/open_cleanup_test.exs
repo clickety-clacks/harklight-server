@@ -35,11 +35,11 @@ defmodule AttentionServer.Store.OpenCleanupTest do
     %{path: path}
   end
 
-  for mode <- [:legacy, :keyed, :keyed_cutover] do
+  for mode <- [:snapshot, :keyed, :keyed_cutover] do
     test "a refused #{mode} open cannot prune a file while a writer holds the lock", %{path: path} do
       mode = unquote(mode)
 
-      if mode == :legacy, do: AttentionServer.PreChangeLogStore.snapshot_fixture(path)
+      if mode == :snapshot, do: AttentionServer.PreChangeLogStore.snapshot_fixture(path)
 
       if mode == :keyed do
         assert {:ok, keyed} = Store.open(path, :keyed_cutover)
@@ -86,7 +86,7 @@ defmodule AttentionServer.Store.OpenCleanupTest do
     end
   end
 
-  for mode <- [:legacy, :keyed] do
+  for mode <- [:snapshot, :keyed] do
     test "a #{mode} open whose generation moves before cleanup is refused and prunes nothing", %{
       path: path
     } do

@@ -22,7 +22,7 @@ defmodule AttentionServer.Store.KeyedStoreOpenTest do
 
     assert {:error, {:storage_unavailable, {:error, :not_keyed}}} = Store.open(path, :keyed)
     assert {:ok, default} = Store.open(path)
-    assert default.mode == :legacy
+    assert default.mode == :snapshot
     assert {:error, :not_keyed} = KeyedMigration.load(default.db)
     assert :ok = Store.close(default)
 
@@ -39,7 +39,7 @@ defmodule AttentionServer.Store.KeyedStoreOpenTest do
     assert :ok = Store.close(keyed)
 
     assert {:error, {:storage_unavailable, {:error, :format31_requires_keyed_mode}}} =
-             Store.open(path, :legacy)
+             Store.open(path, :snapshot)
 
     for mode <- [:keyed, :keyed_cutover] do
       assert {:ok, reopened} = Store.open(path, mode)

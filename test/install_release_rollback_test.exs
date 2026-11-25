@@ -27,7 +27,7 @@ defmodule AttentionServer.InstallReleaseRollbackTest do
   end
 
   @tag timeout: 30_000
-  test "failed candidate readiness restores the exact pre-migration store and prior release",
+  test "failed candidate readiness restores the exact pre-install store and prior release",
        context do
     {output, status} = run_installer("upgrade-failure", context)
 
@@ -91,7 +91,7 @@ defmodule AttentionServer.InstallReleaseRollbackTest do
   end
 
   defp create_format_30_store!(path) do
-    assert {:ok, initial} = Store.open(path, :legacy)
+    assert {:ok, initial} = Store.open(path, :snapshot)
     assert {:ok, engine} = Engine.setup_person(initial.engine, "person-a")
     assert {:ok, committed} =
              Store.commit(initial, engine, %{person: "person-a", actor: "operator", action: "fixture"})

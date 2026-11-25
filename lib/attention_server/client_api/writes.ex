@@ -423,28 +423,20 @@ defmodule AttentionServer.ClientAPI.Writes do
   defp result({:error, token, field}, replayed?),
     do: {:error, to_string(token), field, replayed?}
 
-  defp apply_frame(relay, engine_key, frame, []) do
-    relay
-    |> Relay.request_line(engine_key, JSON.encode!(frame) <> "\n")
-    |> apply_reply()
-  end
-
-  defp apply_frame(relay, engine_key, frame, staged) do
+  defp apply_frame(relay, engine_key, command, staged) do
     sources =
-      Map.new(Enum.zip(frame["files"], staged), fn {file, source} ->
+      Map.new(Enum.zip(Map.get(command, "files", []), staged), fn {file, source} ->
         {file["upload_id"], source.file_id}
       end)
 
-    relay |> Relay.request_staged_reply(engine_key, frame, sources) |> apply_reply()
+    relay |> Relay.apply_client_command(engine_key, command, sources) |> apply_reply()
   end
 
-  defp apply_reply({:ok, line}) do
-    case JSON.decode_line(line) do
-      {:ok, %{"type" => "ok"} = reply} -> {:ok, reply}
-      {:ok, %{"type" => "error", "reason" => reason} = reply} -> refusal(reason, reply)
-      _ -> {:error, "retry_later"}
-    end
-  end
+  defp apply_reply({:ok, fields}), do: {:ok, fields}
+  defp apply_reply({:error, {:typed_message, _code, reason}, field, _terminal}),
+    do: refusal(reason, %{"field" => field})
+
+  defp apply_reply({:error, reason, field, _terminal}), do: refusal(reason, %{"field" => field})
 
   defp apply_reply({:error, :forbidden}), do: {:error, "unauthorized"}
   defp apply_reply({:error, :not_found}), do: {:error, "invalid_field", "file_ids"}
@@ -915,7 +907,6 @@ defmodule AttentionServer.ClientAPI.Writes do
 
       {:ok,
        %{
-         "v" => 1,
          "type" => "message_open",
          "op_id" => op_id(key),
          "sender_id" => sender,
@@ -942,8 +933,7 @@ defmodule AttentionServer.ClientAPI.Writes do
         through ->
           {:ok,
            %{
-             "v" => 1,
-             "type" => "conversation_read",
+                 "type" => "conversation_read",
              "op_id" => op_id(key),
              "sender_id" => sender,
              "message_id" => message_id,
@@ -965,7 +955,6 @@ defmodule AttentionServer.ClientAPI.Writes do
          :ok <- has_conversation(record) do
       {:ok,
        %{
-         "v" => 1,
          "type" => "discussion",
          "op_id" => op_id(key),
          "sender_id" => sender,
@@ -1029,9 +1018,7 @@ defmodule AttentionServer.ClientAPI.Writes do
   defp frame(_engine, _principal, key, {:priority_levels, levels, _if_match}) do
     {:ok,
      %{
-       "v" => 1,
        "type" => "levels_set",
-       "ref" => "client_api_v2",
        "op_id" => op_id(key),
        "levels" => levels
      }}
@@ -1040,9 +1027,7 @@ defmodule AttentionServer.ClientAPI.Writes do
   defp frame(_engine, _principal, key, {:alerts, alerts, _if_match}) do
     {:ok,
      %{
-       "v" => 1,
        "type" => "alerts_set",
-       "ref" => "client_api_v2",
        "op_id" => op_id(key),
        "alerts" => alerts
      }}
@@ -1068,7 +1053,7 @@ defmodule AttentionServer.ClientAPI.Writes do
     case Map.get(engine.push_bindings, {principal.person, principal.engine_key}) do
       %{revision: current, binding_id: id} when is_binary(id) ->
         {:ok,
-         %{"v" => 1, "type" => "push_remove", "op_id" => op_id(key), "revision" => current + 1}}
+         %{"type" => "push_remove", "op_id" => op_id(key), "revision" => current + 1}}
 
       _ ->
         {:ok, :unchanged}
@@ -1084,7 +1069,6 @@ defmodule AttentionServer.ClientAPI.Writes do
   defp push_frame(key, token, environment, revision) do
     {:ok,
      %{
-       "v" => 1,
        "type" => "push_register",
        "op_id" => op_id(key),
        "revision" => revision,
@@ -1102,7 +1086,6 @@ defmodule AttentionServer.ClientAPI.Writes do
 
   defp answer_frame(key, sender, message_id, revision, answer) do
     %{
-      "v" => 1,
       "type" => "answer",
       "op_id" => op_id(key),
       "sender_id" => sender,
