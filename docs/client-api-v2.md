@@ -1035,7 +1035,7 @@ provides the file caps and retention window.
 
 | Request | Response body |
 |---|---|
-| `GET /v2/agent/messages?page=&session=&sender=&legacy_message_id=` | `SentMessagesPage` |
+| `GET /v2/agent/messages?page=&session=&sender=` | `SentMessagesPage` |
 | `GET /v2/agent/messages/{item_id}` | `SentMessageResponse` |
 | `GET /v2/agent/messages/{item_id}/entries?before=&limit=` | `AgentEntriesPage` |
 | `GET /v2/agent/messages/{item_id}/revisions/{n}` | `AgentRevisionResponse` |
@@ -1070,7 +1070,6 @@ agents with existing data. Clients apply newer versions of each resource.
         "rev": { "$ref": "#/$defs/Rev" },
         "sender": { "type": "string" },
         "session": { "$ref": "#/$defs/AgentSession" },
-        "legacy_message_id": { "type": "string", "description": "Stored message ID for pre-cutover Agent messages" },
         "revision": { "type": "integer", "minimum": 1 },
         "message": { "type": "object", "description": "Current admitted sender content" },
         "files": { "type": "array", "items": { "$ref": "#/$defs/FileRef" } },
@@ -1196,8 +1195,7 @@ agents with existing data. Clients apply newer versions of each resource.
   acceptance, newest first, with a stable tie-breaker. Pass back the opaque
   `next_page` as `page` with the same filters. The last page omits `next_page`.
   The `sender` and `session` filters match exactly, and `session` is a UUIDv4.
-  The `legacy_message_id` filter matches the stored ID on pre-cutover Agent
-  messages. Use the opaque `item_id` from each message for subsequent requests.
+  Use the opaque `item_id` from each message for subsequent requests.
   Malformed filters answer `400 invalid_field`
   with the field. Message pages contain up to 50 messages.
   A token binds the account, key and filters. Pages report their observed

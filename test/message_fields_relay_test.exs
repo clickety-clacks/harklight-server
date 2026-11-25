@@ -218,10 +218,7 @@ defmodule AttentionServer.MessageFieldsRelayTest do
     refute Map.has_key?(dropped_kind_delivery["message"], "message_kind")
 
     # Only the two accepted sends are stored for the origin.
-    assert Enum.map(origin_messages(relay), & &1["legacy_message_id"]) == [
-             "bad-kind",
-             "typed-request"
-           ]
+    assert Enum.map(origin_messages(relay), & &1["item_id"]) == ["i2", "i1"]
 
     GenServer.stop(relay)
   end

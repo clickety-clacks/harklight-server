@@ -357,7 +357,7 @@ defmodule AttentionServer.RouteBIndex do
 
   defp put_agent_message(
          %{agent_feed?: true} = index,
-         {person, sender, id} = key,
+         {person, sender, _id} = key,
          nil,
          %{origin: agent} = record
        )
@@ -369,11 +369,6 @@ defmodule AttentionServer.RouteBIndex do
         session when is_binary(session) -> [{"session", session} | dimensions]
         _ -> dimensions
       end
-
-    dimensions =
-      if Map.get(record, :agent_api_v2, false),
-        do: dimensions,
-        else: [{"legacy_message_id", id} | dimensions]
 
     filters =
       Enum.reduce(dimensions, [%{}], fn {name, value}, sets ->

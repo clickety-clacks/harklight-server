@@ -11,7 +11,7 @@ defmodule AttentionServer.ClientAPI.AgentResources do
     end
   end
 
-  def message(state, {person, agent} = scope, {person, sender, id} = key) do
+  def message(state, {person, agent} = scope, {person, sender, _id} = key) do
     engine = state.store.engine
 
     with {:ok, record} <- own_record(engine, scope, key),
@@ -31,7 +31,6 @@ defmodule AttentionServer.ClientAPI.AgentResources do
          }
          |> put("session", Map.get(record, :session_handle))
          |> put("created_at_ms", Map.get(record, :accepted_at))
-         |> put("legacy_message_id", if(!Map.get(record, :agent_api_v2, false), do: id))
          |> put("terminal", terminal(engine, scope, record))
          |> put("availability", availability(engine, person, agent, record))
          |> put("advisories", advisories(engine, scope, key))
