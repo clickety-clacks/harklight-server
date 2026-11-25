@@ -213,11 +213,9 @@ defmodule AttentionServer.ClientAPI.Writes do
 
   @doc false
   def put_focus(conn, %Context{} = ctx) do
-    with :ok <- device_only(ctx.principal),
-         {:ok, _key} <- optional_key(conn),
-         {:ok, body, conn} <- json_body(conn),
-         {:ok, report} <- focus_report(body) do
-      respond(conn, focus(ctx.relay, ctx.principal, report))
+    with {:ok, _key} <- optional_key(conn),
+         {:ok, body, conn} <- json_body(conn) do
+      respond(conn, focus(ctx.relay, ctx.principal, body))
     else
       {:error, token, field, conn} -> Errors.send_error(conn, token, field: field)
       {:error, token, field} -> Errors.send_error(conn, token, field: field)
@@ -232,7 +230,9 @@ defmodule AttentionServer.ClientAPI.Writes do
   `"visible_entry_id"`. Answers `{rev, show?}` with the device's held show.
   """
   def focus(relay, who, report) do
-    case focus_report(report) do
+    browser? = match?(%{kind: :browser}, who)
+
+    case focus_report(report, browser?) do
       {:ok, report} -> result(call(relay, {:focus, who, report}), false)
       {:error, token, field} -> {:error, token, field, false}
     end
@@ -547,10 +547,9 @@ defmodule AttentionServer.ClientAPI.Writes do
     engine = state.store.engine
 
     with {:ok, principal} <- principal(engine, who),
-         :ok <- if(principal.kind == :device, do: :ok, else: {:error, :forbidden}),
          {:ok, position} <- position(state, principal.person),
          {:ok, reported} <- reported_focus(engine, principal.person, report) do
-      key = principal.engine_key
+      {key, browser} = focus_reporter(who, principal, report)
 
       {held, next} =
         if report["screen"] == "signed_out" do
@@ -559,7 +558,10 @@ defmodule AttentionServer.ClientAPI.Writes do
           # One lapse timer per device: a renewal cancels the previous one.
           Focus.cancel_lapse(get_in(state.focus_clients, [key, :client_api_token]))
           token = Focus.schedule_lapse(self(), key, report["ttl_s"] * 1000)
-          AttentionServer.Relay.client_api_focus(state, {:report, key, reported, token})
+          AttentionServer.Relay.client_api_focus(
+            state,
+            {:report, key, principal.person, browser, reported, token}
+          )
         end
 
       result =
@@ -1393,12 +1395,14 @@ defmodule AttentionServer.ClientAPI.Writes do
 
   # Today's focus_report shape rules (focus spec r6 V2), with item_id for the
   # pair and visible_entry_id for visible_event_id.
-  defp focus_report(body) do
+  defp focus_report(body, browser?) do
     screen = body["screen"]
     pair? = screen in ["message", "chat"]
+    fields = ~w(screen item_id visible_entry_id ttl_s)
+    fields = if browser?, do: ["device_name" | fields], else: fields
 
     cond do
-      member = Enum.find(Map.keys(body), &(&1 not in ~w(screen item_id visible_entry_id ttl_s))) ->
+      member = Enum.find(Map.keys(body), &(&1 not in fields)) ->
         {:error, "invalid_field", member}
 
       screen not in @focus_screens ->
@@ -1417,10 +1421,24 @@ defmodule AttentionServer.ClientAPI.Writes do
       not (is_integer(body["ttl_s"]) and body["ttl_s"] in 1..3600) ->
         {:error, "invalid_field", "ttl_s"}
 
+      browser? and (screen != "signed_out" or Map.has_key?(body, "device_name")) and
+          not focus_device_name?(body["device_name"]) ->
+        {:error, "invalid_field", "device_name"}
+
       true ->
         {:ok, body}
     end
   end
+
+  defp focus_device_name?(name),
+    do: is_binary(name) and byte_size(name) in 1..128 and String.trim(name) != ""
+
+  defp focus_reporter(%{kind: :browser} = who, _principal, report) do
+    browser = %{owner: who.key, revision: who.owner_revision, name: report["device_name"]}
+    {{:browser, who.session_id}, browser}
+  end
+
+  defp focus_reporter(_who, principal, _report), do: {principal.engine_key, nil}
 
   # The report in today's identifiers, which the origin focus APIs read.
   defp reported_focus(engine, person, report) do

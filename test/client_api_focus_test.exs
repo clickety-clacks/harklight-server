@@ -309,7 +309,7 @@ defmodule AttentionServer.ClientAPIFocusTest do
              Writes.focus(relay, "reader", %{"screen" => "inbox", "ttl_s" => 120})
   end
 
-  test "bad reports keep their field names; browsers are forbidden", ctx do
+  test "bad reports keep their field names", ctx do
     relay = relay(ctx)
     item = item_id(relay)
 
@@ -331,7 +331,10 @@ defmodule AttentionServer.ClientAPIFocusTest do
     end
 
     assert clients(relay) == []
+  end
 
+  test "browser focus is session-scoped, expires, and can never receive a show", ctx do
+    relay = relay(ctx)
     browser = %{
       kind: :browser,
       person: "A",
@@ -341,12 +344,42 @@ defmodule AttentionServer.ClientAPIFocusTest do
     }
 
     :sys.replace_state(relay, fn state ->
-      engine = state.store.engine
-      owners = Map.put(engine.owners, "A", %{key: browser.key, revision: 4})
-      %{state | store: %{state.store | engine: %{engine | owners: owners}}}
+      put_in(state.store.engine.owners["A"], %{key: browser.key, revision: 4})
     end)
 
-    assert {:error, "forbidden", nil, false} =
-             Writes.focus(relay, browser, %{"screen" => "inbox", "ttl_s" => 60})
+    second = %{browser | session_id: "s2"}
+    report = %{"screen" => "inbox", "device_name" => "Web, Safari", "ttl_s" => 60}
+
+    assert {:error, "invalid_field", "device_name", false} =
+             Writes.focus(relay, browser, Map.put(report, "device_name", String.duplicate("x", 129)))
+
+    assert {:error, "invalid_field", "device_name", false} =
+             Writes.focus(relay, "reader", report)
+
+    assert {:ok, 200, %{"rev" => _}, false} = Writes.focus(relay, browser, report)
+    assert [%{"kind" => "browser", "client_id" => one}] = clients(relay)
+    assert one != browser.session_id
+
+    renamed = %{report | "device_name" => "Web, other tab"}
+    assert {:ok, 200, _, false} = Writes.focus(relay, browser, renamed)
+    assert [%{"client_id" => ^one, "device_name" => "Web, other tab"}] = clients(relay)
+
+    assert {:ok, 200, _, false} = Writes.focus(relay, second, report)
+    assert length(clients(relay)) == 2
+    state = :sys.get_state(relay)
+    assert {:error, :forbidden} = Relay.agent_focus(state, "B", @agent)
+    assert %{"error" => "not_found"} = show(relay, item_id(relay), "message", 404)
+
+    assert :ok = Relay.end_browser_session(relay, browser.session_id)
+    assert [%{"kind" => "browser", "device_name" => "Web, Safari"}] = clients(relay)
+    assert {:ok, 200, _, false} = Writes.focus(relay, second, %{"screen" => "signed_out", "ttl_s" => 60})
+    assert clients(relay) == []
+
+    assert {:ok, 200, _, false} = Writes.focus(relay, second, %{report | "ttl_s" => 1})
+    assert [%{"kind" => "browser"}] = clients(relay)
+    state = :sys.get_state(relay)
+    {:lapse, timer_id, _} = state.focus_clients[{:browser, "s2"}].client_api_token
+    assert :ok = Focus.lapse(relay, {:browser, "s2"}, {:lapse, timer_id})
+    assert clients(relay) == []
   end
 end
