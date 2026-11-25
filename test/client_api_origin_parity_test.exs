@@ -170,6 +170,95 @@ defmodule AttentionServer.ClientAPIOriginParityTest do
     refute Map.has_key?(agent_terminal, "delivery")
   end
 
+  test "pending baselines serve non-person answers once without publishing delivery facts", ctx do
+    register_agent(ctx)
+
+    actions = %{
+      "schema" => "attention-client.actions/1",
+      "actions" => [
+        %{"id" => "approve", "label" => "Approve", "kind" => "value", "value" => "approved"},
+        %{"id" => "seen", "label" => "Seen", "kind" => "value",
+          "value" => %{"acknowledgment" => "seen"}}
+      ]
+    }
+
+    expected =
+      for {n, answer, kind} <- [
+            {10, %{"choice" => "approve"}, "choice"},
+            {11, %{"comment" => "Agent words"}, "reply"},
+            {12, %{}, "no_comment"},
+            {13, %{"choice" => "seen"}, "seen"}
+          ], into: %{} do
+        id = item_id(send_message(ctx, @origin, n, %{}, "app:test", %{"answer_ui" => actions}))
+        body = Map.put(answer, "request_revision", 1)
+        assert request(ctx, "parity-agent", "POST", answer_path(id), body, n + 20).status == 200
+        {id, kind}
+      end
+
+    default_at = System.system_time(:millisecond) + 2_000
+
+    default = item_id(send_message(ctx, @origin, 14, %{}, "app:test", %{
+      "answer_ui" => actions,
+      "default" => %{"value" => "approved", "at" => default_at}
+    }))
+
+    default_terminal = await_default_answer(ctx, default, 250)
+    assert %{"state" => "answered", "outcome" => %{"kind" => "default"}} = default_terminal
+
+    outside = item_id(send_message(ctx, @origin, 15, %{"session" => @ended_session}))
+    assert request(ctx, "parity-agent", "POST", answer_path(outside),
+             %{"request_revision" => 1}, 35).status == 200
+
+    retracted = item_id(send_message(ctx, @origin, 16))
+    assert request(ctx, @origin, "POST", "/v2/agent/messages/#{retracted}/retract", %{}, 36).status == 200
+
+    ids = [default | Map.keys(expected)]
+    before = Map.new(ids, &{&1, origin_terminal(ctx, &1)})
+    person_before = Map.new(ids, &{&1, decode(get(ctx, "a2", "/v2/items/#{&1}"))})
+    path = "/v2/agent/delivery-baseline?session=#{@session}"
+
+    assert %{"rev" => rev, "next_page" => token} = decode(get(ctx, @origin, path))
+    page_path = path <> "&page=" <> token
+    assert %{"rev" => ^rev, "changes" => changes} = page = decode(get(ctx, @origin, page_path))
+
+    assert MapSet.new(Enum.map(changes, &get_in(&1, ["data", "item_id"]))) == MapSet.new(ids)
+    assert length(changes) == length(ids)
+    for %{"kind" => "message", "data" => %{"item_id" => id, "terminal" => terminal}} <- changes do
+      assert terminal == before[id]
+      assert terminal["state"] == "answered"
+      refute Map.has_key?(terminal, "delivery")
+      if kind = expected[id], do: assert(terminal["outcome"]["kind"] == kind)
+    end
+
+    for _ <- 1..3 do
+      assert %{"rev" => ^rev, "next_page" => fresh} = decode(get(ctx, @origin, path))
+      assert %{"changes" => []} = decode(get(ctx, @origin, path <> "&page=" <> fresh))
+    end
+
+    assert :ok = stop_supervised(Server)
+    restarted = start_supervised!({Server, ctx.server_opts})
+    ctx = %{ctx | relay: Server.relay(restarted), port: Server.port(restarted)}
+    assert decode(get(ctx, @origin, page_path)) == page
+
+    for id <- ids do
+      assert origin_terminal(ctx, id) == before[id]
+      assert decode(get(ctx, "a2", "/v2/items/#{id}")) == person_before[id]
+    end
+
+    for {id, n} <- Enum.with_index(Map.keys(expected), 40) do
+      path = "/v2/agent/messages/#{id}"
+      assert_error(request(ctx, @origin, "POST", path <> "/receipt", %{"outcome" => "handed"}, n * 2),
+        400, "unsupported")
+      assert_error(request(ctx, @origin, "POST", path <> "/result", %{"status" => "received"}, n * 2 + 1),
+        400, "unsupported")
+    end
+
+    outside_path = "/v2/agent/delivery-baseline?session=#{@ended_session}"
+    assert %{"next_page" => outside_token} = decode(get(ctx, @origin, outside_path))
+    assert %{"changes" => [%{"data" => %{"item_id" => ^outside}}]} =
+             decode(get(ctx, @origin, outside_path <> "&page=" <> outside_token))
+  end
+
   test "simultaneous agent feeds of one key each receive a change and close independently",
        ctx do
     id = item_id(send_message(ctx, @origin, 1))
@@ -424,6 +513,17 @@ defmodule AttentionServer.ClientAPIOriginParityTest do
   defp person_head(ctx, person) do
     assert {:ok, head} = ChangeLog.head(:sys.get_state(ctx.relay).store, person)
     head
+  end
+
+  defp await_default_answer(ctx, id, retries) do
+    case origin_terminal(ctx, id) do
+      nil when retries > 0 ->
+        Process.sleep(20)
+        await_default_answer(ctx, id, retries - 1)
+
+      terminal ->
+        terminal
+    end
   end
 
   defp register_agent(ctx) do
