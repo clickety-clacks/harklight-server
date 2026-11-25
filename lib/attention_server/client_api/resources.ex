@@ -236,6 +236,7 @@ defmodule AttentionServer.ClientAPI.Resources do
       "rank" => rank,
       @viewer => %{"origin" => record.origin}
     }
+    |> put_present("bounced", BounceDecision.bounced(record))
     # Round 8: arrival (today's free-order counter) orders the new-messages
     # area; created_at_ms is display only and absent when the record has none.
     |> put_present("created_at_ms", time_ms(Map.get(record, :accepted_at)))
@@ -647,9 +648,11 @@ defmodule AttentionServer.ClientAPI.Resources do
     |> item_keys(person)
     |> Enum.map(&{&1, Map.fetch!(engine.messages, &1)})
     |> Enum.reject(fn {_key, record} -> MapSet.member?(listed_items, item_id(record)) end)
-    |> Enum.sort_by(fn {_key, record} -> {not is_nil(record.terminal), -record.accepted_seq} end)
+    |> Enum.sort_by(fn {_key, record} ->
+      {not BounceDecision.inbox_open?(record), -record.accepted_seq}
+    end)
     |> Enum.map(fn {key, record} ->
-      section = if is_nil(record.terminal), do: "current", else: "resolved"
+      section = if BounceDecision.inbox_open?(record), do: "current", else: "resolved"
       {:item, item_id(record), key, section, nil}
     end)
   end
@@ -679,6 +682,9 @@ defmodule AttentionServer.ClientAPI.Resources do
   end
 
   defp listed_units(_engine, _person, _view), do: {[], 0}
+
+  defp list_unit(%{"kind" => "message"}, id, key, %{"full_bounced_at_ms" => _}),
+    do: {:ok, {:item, id, key, "resolved", nil}}
 
   defp list_unit(%{"kind" => "message"} = row, id, key, record) do
     {section, group} =

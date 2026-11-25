@@ -98,6 +98,16 @@ Schemas use JSON Schema 2020-12. `$ref`s point into the `$defs` below.
         "chat": { "$ref": "#/$defs/Chat" },
         "availability": { "$ref": "#/$defs/Availability" },
         "terminal": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/Terminal" }] },
+        "bounced": {
+          "type": "object",
+          "description": "Present for a full-bounced item while it has no terminal outcome",
+          "required": ["kind", "at_ms", "reason"],
+          "properties": {
+            "kind": { "const": "full" },
+            "at_ms": { "$ref": "#/$defs/TimeMs" },
+            "reason": { "const": "unopened" }
+          }
+        },
         "result": { "$ref": "#/$defs/OriginResult" },
         "rank": { "$ref": "#/$defs/Rank" }
       }
@@ -432,8 +442,16 @@ or the recipient's setting is `"all"`.
   (`Placement.list_items`):
   - `current`: items still waiting on the person, in today's ranked or free
     order;
-  - `resolved`: settled items, newest first. Clients draw today's History
-    heading here.
+  - `resolved`: settled and full-bounced items, newest first. Clients draw
+    today's History heading here.
+
+  A full bounce moves the unopened item out of the active Inbox and into
+  History. The item has `bounced.kind: "full"`, `bounced.reason: "unopened"`
+  and the Unix millisecond time of the bounce in `bounced.at_ms`. Its
+  `terminal` stays null. History is included in `GET /v2/inbox` pages, and
+  the same item remains searchable, directly readable and answerable. It
+  leaves the unresolved count. Soft bounce leaves the item in place and
+  adds no `bounced` field.
 
   `rank.key` orders items across and within sections. While the inbox is in
   free order, `current` items also carry `Rank.group` (`common`, which has no
@@ -849,6 +867,9 @@ What clients see:
   old log rows point at it.
 - Chat turns are their own Entry resources, so no turn is ever skipped.
 - `item_removed` rows are kept as tombstones for the retention window.
+- A full bounce is an `item` upsert with `bounced` and `rank.section:
+  "resolved"`, and updates the unresolved count. Apply the upsert to move
+  the item to History. Soft bounces only notify the sending agent.
 - A log row may have no client form (for example a read-position fact), but
   every client-visible effect of the fact it records also writes the
   affected resource's row. A read position writes the item's row, so another
@@ -1707,7 +1728,8 @@ Agent listen --follow and the Tightbeam Harklight background follower retry feed
 An eligible open message or FYI produces at most one bounce advisory per
 substantive revision. An unopened revision keeps the
 `unseen_interval_elapsed` advisory; an opened, unanswered revision uses
-`soft_bounce`. The person still sees the same item. Progress and qualifying
+`soft_bounce`. The unopened item moves to History, and an opened item
+stays in place. Progress and qualifying
 person-authored Chat suppress the advisory. Upgrade reconsiders opened
 revisions accepted strictly after 2026-11-17 14:16:54 UTC that qualified under
 their original policy. It preserves the prior decision for a revision that

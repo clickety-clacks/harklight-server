@@ -1,6 +1,8 @@
 defmodule AttentionServer.RouteBIndex do
   @moduledoc false
 
+  alias AttentionServer.BounceDecision
+
   def new do
     %{
       resolved_messages_by_person: %{},
@@ -206,8 +208,8 @@ defmodule AttentionServer.RouteBIndex do
     index = put_v2_session(index, key, record)
     index = put_agent_message(index, key, previous, record)
     index = put_pending_message(index, key, previous, record)
-    previous_resolved? = match?(%{terminal: terminal} when not is_nil(terminal), previous)
-    current_resolved? = not is_nil(record.terminal)
+    previous_resolved? = not is_nil(previous) and not BounceDecision.inbox_open?(previous)
+    current_resolved? = not BounceDecision.inbox_open?(record)
 
     index =
       case {previous_resolved?, current_resolved?} do
@@ -276,8 +278,8 @@ defmodule AttentionServer.RouteBIndex do
   defp put_pending_message(%{request_keys_by_id: nil} = index, _key, _old, _new), do: index
 
   defp put_pending_message(index, {person, _, _} = key, old, new) do
-    old_open? = match?(%{terminal: nil}, old)
-    new_open? = is_nil(new.terminal)
+    old_open? = BounceDecision.inbox_open?(old)
+    new_open? = BounceDecision.inbox_open?(new)
 
     index =
       if old_open? == new_open? do
@@ -309,8 +311,12 @@ defmodule AttentionServer.RouteBIndex do
     end
   end
 
-  defp counts_for_badge(%{terminal: nil, message: message}),
-    do: if(AttentionServer.Message.progress_message?(message), do: 0, else: 1)
+  defp counts_for_badge(%{message: message} = record) do
+    if BounceDecision.inbox_open?(record) and
+         not AttentionServer.Message.progress_message?(message),
+       do: 1,
+       else: 0
+  end
 
   defp counts_for_badge(_), do: 0
 
@@ -521,8 +527,8 @@ defmodule AttentionServer.RouteBIndex do
   defp put_session_message(index, _key, _previous, _record), do: index
 
   defp unresolved_delta(previous, record) do
-    previous_unresolved? = match?(%{terminal: nil}, previous)
-    current_unresolved? = match?(%{terminal: nil}, record)
+    previous_unresolved? = BounceDecision.inbox_open?(previous)
+    current_unresolved? = BounceDecision.inbox_open?(record)
 
     cond do
       current_unresolved? and not previous_unresolved? -> 1

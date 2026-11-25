@@ -1,7 +1,7 @@
 defmodule AttentionServer.FreeOrder do
   @moduledoc false
 
-  alias AttentionServer.Message
+  alias AttentionServer.{BounceDecision, Message}
 
   # Sort units, then flatten: reply rows never split a parent thread.
   def list_items(engine, person, replies, summaries) do
@@ -11,15 +11,17 @@ defmodule AttentionServer.FreeOrder do
       |> Enum.group_by(fn {{_, sender, id}, record} ->
         original = Map.get(record, :revisions, %{}) |> Map.get(1, record.message)
 
-        case {record.terminal, Map.get(record, :group_thread, Message.valid_thread(original))} do
-          {nil, thread} when is_binary(thread) -> {:thread, sender, thread}
+        thread = Map.get(record, :group_thread, Message.valid_thread(original))
+
+        case BounceDecision.inbox_open?(record) and is_binary(thread) do
+          true -> {:thread, sender, thread}
           _ -> {:message, sender, id}
         end
       end)
       |> Enum.map(fn {_, members} ->
         members = Enum.sort_by(members, &parent_order/1)
         [{{_, sender, id}, anchor} | _] = members
-        state = if anchor.terminal == nil, do: "active", else: "history"
+        state = if BounceDecision.inbox_open?(anchor), do: "active", else: "history"
         common = Map.get(anchor, :free_order)
         group = if common, do: "common", else: "earlier_messages"
 

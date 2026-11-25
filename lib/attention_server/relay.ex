@@ -2346,7 +2346,14 @@ defmodule AttentionServer.Relay do
     else
       case persist_bounce_decision(state, old_engine, next_engine, changed_keys, "bounce_due") do
         {:ok, next_state} ->
-          {:noreply, next_state}
+          people =
+            for {person, _, _} = key <- changed_keys,
+                BounceDecision.inbox_open?(old_engine.messages[key]),
+                not BounceDecision.inbox_open?(next_engine.messages[key]),
+                uniq: true,
+                do: person
+
+          {:noreply, Enum.reduce(people, next_state, &pending_set_changed(&2, &1))}
 
         {:error, reason} ->
           Diagnostics.failure(:bounce_schedule, :decision_commit, reason, :unavailable)
@@ -2976,6 +2983,14 @@ defmodule AttentionServer.Relay do
   end
 
   defp publish_priority_view(state, person, view, previous, engine_entries, reply_summary) do
+    engine_entries =
+      Enum.reject(engine_entries, fn entry ->
+        not is_map_key(entry, "conversation_seq") and
+          BounceDecision.bounced(
+            state.store.engine.messages[{person, entry["sender_id"], entry["message_id"]}]
+          ) != nil
+      end)
+
     {replies, messages} = Enum.split_with(engine_entries, &Map.has_key?(&1, "conversation_seq"))
 
     shown =

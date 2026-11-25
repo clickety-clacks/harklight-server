@@ -4661,7 +4661,7 @@ defmodule AttentionServer.Engine do
                   %{"seq" => seq, "event_id" => feed_entry["event_id"], "revision" => revision}
                   |> put_field_warnings(field_warnings)
 
-                {next, _substantive_revision, _changed?} =
+                {next, _substantive_revision, changed?} =
                   BounceDecision.record_revision(
                     next,
                     key,
@@ -4673,6 +4673,9 @@ defmodule AttentionServer.Engine do
                     seq,
                     in_reply_to: frame["in_reply_to"]
                   )
+
+                updated =
+                  if changed?, do: Map.delete(updated, "full_bounced_at_ms"), else: updated
 
                 next =
                   next
@@ -5243,7 +5246,8 @@ defmodule AttentionServer.Engine do
     {put_row(engine, :conversation_highs, person, seq), seq}
   end
 
-  defp put_message(engine, key, record) do
+  @doc false
+  def put_message(engine, key, record) do
     previous = Map.get(engine.messages, key)
 
     open_default_index =
@@ -5482,12 +5486,11 @@ defmodule AttentionServer.Engine do
     end)
   end
 
-  # The recipient's Inbox count as the server sees it: accepted requests with
-  # no explicit action yet. Retracted and answered items are resolved.
+  # The recipient's active Inbox count excludes settled and full-bounced items.
   defp inbox_badge(engine, person) do
     Enum.count(engine.messages, fn
-      {{^person, _sender, _id}, %{terminal: nil, message: message}} ->
-        not Message.progress_message?(message)
+      {{^person, _sender, _id}, %{message: message} = record} ->
+        BounceDecision.inbox_open?(record) and not Message.progress_message?(message)
 
       _ ->
         false
