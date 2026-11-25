@@ -48,7 +48,7 @@ defmodule AttentionServer.DashboardReadHTTP do
     hosted = Keyword.get(opts, :hosted, false) == true
 
     skill_path_saas =
-      Keyword.get(opts, :skill_path_saas) || saas_skill_path(skill_path)
+      Keyword.get(opts, :skill_path_saas) || sibling_skill_path(skill_path, "harklight-agent-saas")
 
     %{
       backend: backend,
@@ -74,18 +74,15 @@ defmodule AttentionServer.DashboardReadHTTP do
           cache_control_for_etags: "no-store"
         ),
       skill_path_saas: skill_path_saas,
+      skill_path_harklight: sibling_skill_path(skill_path, "harklight"),
       skill_path_core:
         Keyword.get(opts, :skill_path_core) ||
           Path.join(Path.dirname(Path.dirname(skill_path)), "core.md")
     }
   end
 
-  defp saas_skill_path(skill_path) do
-    Path.join([
-      Path.dirname(Path.dirname(skill_path)),
-      "harklight-agent-saas",
-      "SKILL.md"
-    ])
+  defp sibling_skill_path(skill_path, name) do
+    Path.join([Path.dirname(Path.dirname(skill_path)), name, "SKILL.md"])
   end
 
   defp hosted_addresses(addresses) when is_map(addresses) do
@@ -155,6 +152,9 @@ defmodule AttentionServer.DashboardReadHTTP do
       conn.method == "GET" and
           conn.request_path == "/agent-skills/harklight-agent-saas/SKILL.md" ->
         serve_skill_file(conn, opts.skill_path_saas)
+
+      conn.method == "GET" and conn.request_path == "/agent-skills/harklight/SKILL.md" ->
+        serve_skill_file(conn, opts.skill_path_harklight)
 
       conn.method == "GET" and conn.request_path == "/agent-skills/core.md" ->
         serve_skill_file(conn, opts.skill_path_core)
@@ -657,7 +657,12 @@ defmodule AttentionServer.DashboardReadHTTP do
                  backend_call(opts.backend, :review_pending, {principal, code}),
                true <- not Map.has_key?(fields, "senders") or action == "approve",
                operation <- if(action == "approve", do: :approve_pending, else: :decline_pending),
-               senders <- String.split(Map.get(fields, "senders", ""), ",", trim: true),
+               senders <-
+                 fields
+                 |> Map.get("senders", "")
+                 |> String.split(",", trim: true)
+                 |> Enum.map(&String.trim/1)
+                 |> Enum.reject(&(&1 == "")),
                arguments <-
                  if(action == "approve",
                    do: {principal, code, key, deadline, senders},
@@ -688,6 +693,7 @@ defmodule AttentionServer.DashboardReadHTTP do
         display_name(principal),
         skill_version(opts.skill_path),
         skill_version(opts.skill_path_saas),
+        skill_version(opts.skill_path_harklight),
         chrome(opts)
       )
 
@@ -1073,10 +1079,9 @@ defmodule AttentionServer.DashboardReadHTTP do
     const full = document.getElementById("join-link");
     const status = document.getElementById("share-status");
     const share = document.getElementById("share-invitation");
-    const copy = document.getElementById("copy-invitation");
-    const copyFull = document.getElementById("copy-full-invitation");
+    const setup = document.getElementById("agent-setup-command");
 
-    if (link && full && status && share && copy && copyFull) {
+    if (link && status && share) {
       if (!navigator.share || (navigator.canShare && !navigator.canShare({text: link.value}))) {
         share.hidden = true;
       }
@@ -1091,26 +1096,26 @@ defmodule AttentionServer.DashboardReadHTTP do
             : "Sharing unavailable.";
         }
       });
+    }
 
-      copy.addEventListener("click", async () => {
-        try {
-          await navigator.clipboard.writeText(link.value);
-          status.textContent = "Tappable invitation copied.";
-        } catch (_error) {
-          link.focus();
-          link.select();
-          status.textContent = "Automatic copy is unavailable. The tappable link is selected.";
-        }
-      });
+    const copyFields = [
+      ["copy-invitation", link, "Tappable invitation copied.", "tappable link"],
+      ["copy-full-invitation", full, "Full invitation copied.", "full link"],
+      ["copy-agent-setup", setup, "Setup command copied.", "setup command"]
+    ];
 
-      copyFull.addEventListener("click", async () => {
+    for (const [id, field, copied, label] of copyFields) {
+      const button = document.getElementById(id);
+      if (!button || !field || !status) continue;
+
+      button.addEventListener("click", async () => {
         try {
-          await navigator.clipboard.writeText(full.value);
-          status.textContent = "Full invitation copied.";
+          await navigator.clipboard.writeText(field.value);
+          status.textContent = copied;
         } catch (_error) {
-          full.focus();
-          full.select();
-          status.textContent = "Automatic copy is unavailable. The full link is selected.";
+          field.focus();
+          field.select();
+          status.textContent = `Automatic copy is unavailable. The ${label} is selected.`;
         }
       });
     }

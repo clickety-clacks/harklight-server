@@ -51,9 +51,10 @@ defmodule AttentionServer.DashboardView do
           String.t(),
           {:ok, String.t()} | :error,
           {:ok, String.t()} | :error,
+          {:ok, String.t()} | :error,
           keyword()
         ) :: String.t()
-  def components(person_name, skill_version, skill_version_saas, chrome \\ []) do
+  def components(person_name, skill_version, skill_version_saas, skill_version_harklight, chrome \\ []) do
     app_section = app_section(Keyword.get(chrome, :testflight_url))
 
     setup_instructions =
@@ -76,13 +77,17 @@ defmodule AttentionServer.DashboardView do
         "/agent-skills/harklight-agent-saas/SKILL.md"
       )
 
+    coding_agent_skill_section =
+      skill_section("harklight", skill_version_harklight, "/agent-skills/harklight/SKILL.md")
+
     body =
       ~s(<header class="page-head"><div><h1>Components</h1></div></header>) <>
         app_section <>
         cli_section <>
+        coding_agent_skill_section <>
         skill_section <>
         skill_section_saas <>
-        ~s(<section><h2>Shared conversation core</h2><p>The self-hosted agent skill includes this core; the hosted guide is complete on its own.</p><p><a href="/agent-skills/core.md">Read shared core</a></p></section>) <>
+        ~s(<section><h2>Shared conversation core</h2><p>The Harklight and self-hosted agent skills include this core.</p><p><a href="/agent-skills/core.md">Read shared core</a></p></section>) <>
         ~s(<script src="/components.js" defer></script>)
 
     layout(person_name, "Components", body, chrome)
@@ -163,7 +168,9 @@ defmodule AttentionServer.DashboardView do
   end
 
   def invitation(person, invitation, new_request_id, chrome \\ []) do
-    link = escape(invitation["join_url"] || "")
+    join_url = invitation["join_url"] || ""
+    link = escape(join_url)
+    setup_command = escape("harklight-agent setup '#{join_url}'")
     tappable = escape(invitation["tappable_url"] || "")
     deadline = escape(expiry(invitation["expires_at"]))
     server = escape(invitation["server_name"] || "unknown server")
@@ -171,7 +178,7 @@ defmodule AttentionServer.DashboardView do
 
     body =
       ~s(<h1>Invitation ready</h1>) <>
-        ~s(<section><p>Destination: <strong>#{server}</strong> &mdash; #{enrollment}</p><p>Account: <strong>#{escape(person)}</strong></p><p>Expires: <strong>#{deadline}</strong></p><label for="tappable-link">Tappable invitation link</label><input id="tappable-link" readonly value="#{tappable}" style="width:100%"><p><button class="button" id="share-invitation" type="button">Share invitation</button> <button class="button" id="copy-invitation" type="button">Copy tappable link</button></p><label for="join-link">Full invitation for Paste</label><input id="join-link" readonly value="#{link}" style="width:100%"><p><button class="button" id="copy-full-invitation" type="button">Copy full link</button></p><p id="share-status" role="status" aria-live="polite"></p></section>) <>
+        ~s(<section><p>Destination: <strong>#{server}</strong> &mdash; #{enrollment}</p><p>Account: <strong>#{escape(person)}</strong></p><p>Expires: <strong>#{deadline}</strong></p><label for="tappable-link">Tappable invitation link</label><input id="tappable-link" readonly value="#{tappable}" style="width:100%"><p><button class="button" id="share-invitation" type="button">Share invitation</button> <button class="button" id="copy-invitation" type="button">Copy tappable link</button></p><label for="join-link">Full invitation for Paste</label><input id="join-link" readonly value="#{link}" style="width:100%"><p><button class="button" id="copy-full-invitation" type="button">Copy full link</button></p><label for="agent-setup-command">On a computer</label><input id="agent-setup-command" readonly value="#{setup_command}" style="width:100%"><p><button class="button" id="copy-agent-setup" type="button" aria-controls="agent-setup-command">Copy setup command</button></p><p id="share-status" role="status" aria-live="polite"></p></section>) <>
         ~s(#{new_invitation_form(new_request_id)}<p><a href="/devices">Back to devices</a></p><script src="/invitation-share.js" defer></script>)
 
     layout(person, "Invitation ready", body, chrome)
@@ -217,7 +224,7 @@ defmodule AttentionServer.DashboardView do
   defp action_form(code, action, key, deadline, label, grant_senders? \\ false) do
     sender_field =
       if grant_senders? do
-        ~s|<label for="senders">Sender IDs (optional, comma-separated)</label><input id="senders" name="senders" type="text" autocomplete="off" placeholder="app:tightbeam/codex"><p>The approved device may send as these exact IDs.</p>|
+        ~s|<label for="senders">Sender IDs (optional, comma-separated)</label><input id="senders" name="senders" type="text" autocomplete="off" placeholder="app:agent/"><p>The approved device may send as these IDs. An ID ending in / covers every ID that begins with it.</p>|
       else
         ""
       end

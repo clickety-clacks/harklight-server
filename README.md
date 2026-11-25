@@ -93,26 +93,24 @@ The server/device CLI is `$PACKAGE/bin/harklight`.
 
 ## Send a request and read its reply
 
-The package ships three guidance files: `skills/harklight-agent/SKILL.md` for
-self-hosted agents, `skills/harklight-agent-saas/SKILL.md` for hosted agents, and
-`skills/core.md`. Both skills contain the shared core and can be copied alone
-into a harness's configured skill directory. Installation does not copy them
-automatically or grant credentials.
+The package ships these guidance files.
 
-The [self-hosted source](skills/harklight-agent/SKILL.md.in) and
-[hosted source](skills/harklight-agent-saas/SKILL.md.in) contain only their
-mode-specific instructions. [The core](skills/core.md) is authored once. Build
-the same three files without building or starting the server:
+- `skills/harklight/SKILL.md` is the Claude Code and Codex skill installed by
+  `harklight-agent setup`.
+- `skills/harklight-agent/SKILL.md` is the self-hosted operator skill.
+- `skills/harklight-agent-saas/SKILL.md` is the standalone Hosted guide.
+- `skills/core.md` is the shared conversation core included in both skills.
+
+Edit the corresponding templates under `skills/` and the shared core. The
+release package assembles them automatically. To build the files without
+starting the Server, run the assembly script.
 
 ```sh
 scripts/build-skills.sh dist/skills
 ```
 
-The release package invokes this assembly automatically. Edit the source
-files, not generated copies. The generated SaaS skill ships in the server
-archive and can be served at `/agent-skills/harklight-agent-saas/SKILL.md` by a
-configured dashboard; repository availability does not establish publication
-at a hosted service's address.
+A configured dashboard links the guidance files from **Components** and
+serves the coding-agent skill at `/agent-skills/harklight/SKILL.md`.
 
 ### Get the agent CLI
 
@@ -173,7 +171,7 @@ app.
 ## Device joining and notifications
 
 The optional HTTPS owner dashboard creates person-bound one-use invitations,
-reviews the current code and key and approves devices without sender rights.
+reviews the current code and key and approves devices with optional sender grants.
 The app keeps its own private key. A pending approval does not expire, and
 starting again with the same key returns the same waiting request and code;
 denial, cancellation and revocation remain terminal. See

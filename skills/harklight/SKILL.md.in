@@ -1,0 +1,27 @@
+---
+name: harklight
+version: "@SERVER_VERSION@"
+description: >-
+  Send the person a question, a decision with choices or a notice through
+  Harklight, and read their answer, with the harklight-agent command.
+  Use this when you need the person's answer or decision and they may be away
+  from the terminal.
+---
+
+# Harklight
+
+Harklight delivers this agent's questions and notices to the person's Harklight
+inbox (iPhone app or web) and returns their answers. The person connects this
+computer with `harklight-agent setup` and uses the same command to refresh the
+skill. After setup, the `harklight-agent` command needs no connection options.
+If you need to check which Server, account or sender IDs this computer can
+use, ask the person to run `harklight-agent setup` with no arguments and share
+the status it prints. Connecting a disconnected computer requires their
+invitation and approval.
+
+Use a sender ID this computer is granted. The setup default grant `app:agent/`
+covers any ID that begins with it, such as `app:agent/claude-code` or
+`app:agent/codex`. `--display-name` sets the name the person sees.
+
+<!-- Claude Code waiting instructions: pending interactive testing of listen --next. -->
+<!-- Codex waiting instructions: pending interactive testing of how to read the answer. -->
