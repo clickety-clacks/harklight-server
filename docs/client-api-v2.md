@@ -446,6 +446,11 @@ or the recipient's setting is `"all"`.
   use baseline order while waiting or when no usable scores are available.
   Clients continue to order by `rank.key` as it changes.
 
+  The Hosted component's authenticated `POST /algorithm` endpoint accepts
+  the algorithm selected by Server startup settings. A request for a
+  different algorithm returns HTTP 409 with
+  `{"error":"algorithm_managed_by_server"}`.
+
   An item with an agent chat reply carries `Chat.reply_group` and
   `Chat.reply_rank_key` even when all replies are read. The key places the
   reply row among item rows in `Rank.key`'s space. Its presence identifies a
