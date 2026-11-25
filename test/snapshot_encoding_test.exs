@@ -1,6 +1,7 @@
 defmodule AttentionServer.Store.SnapshotEncodingTest do
   use ExUnit.Case, async: true
-  alias AttentionServer.{Engine, Store.SnapshotEncoding}
+  alias AttentionServer.{Engine, Store, Store.SnapshotEncoding}
+  alias Exqlite.Sqlite3
 
   defp expected(engine) do
     persisted =
@@ -43,6 +44,28 @@ defmodule AttentionServer.Store.SnapshotEncodingTest do
     next = %{next | messages: Map.delete(next.messages, {"p", "s", "m"})}
     {payload, _cache} = SnapshotEncoding.encode(next, 30, cache)
     assert :erlang.binary_to_term(payload) == expected(next)
+  end
+
+  @tag :tmp_dir
+  test "the snapshot opener rejects earlier and future formats", %{tmp_dir: directory} do
+    path = Path.join(directory, "state.sqlite3")
+    assert {:ok, store} = Store.open(path)
+
+    for format <- [1, 29, 31] do
+      {payload, _cache} = SnapshotEncoding.encode(store.engine, format)
+      checksum = :crypto.hash(:sha256, payload)
+      assert {:ok, statement} =
+               Sqlite3.prepare(store.db, "UPDATE relay_state SET payload = ?, checksum = ?")
+
+      assert :ok = Sqlite3.bind(statement, [{:blob, payload}, {:blob, checksum}])
+      assert :done = Sqlite3.step(store.db, statement)
+      assert :ok = Sqlite3.release(store.db, statement)
+
+      assert {:error, {:storage_unavailable, {:error, {:unsupported_store_format, ^format}}}} =
+               Store.open(path)
+    end
+
+    assert :ok = Store.close(store)
   end
 
   test "FORMAT30 preserves alert choices, delivery state and focus permissions, excluding transient fields" do
