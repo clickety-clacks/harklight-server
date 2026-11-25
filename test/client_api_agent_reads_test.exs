@@ -2165,6 +2165,13 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
             assert_error(get(ctx, "a2", path <> suffix), 404, "not_found")
           end
 
+          for {answer, n} <- [{%{"choice" => "seen"}, 40}, {%{}, 41}] do
+            response =
+              request(ctx, "a2", "POST", path <> "/answer", Map.put(answer, "request_revision", 1), n)
+
+            assert_error(response, 404, "not_found")
+          end
+
           assert %{"changes" => changes} =
                    decode_response(get(ctx, "a2", "/v2/changes?after=#{person_before_due}"))
 

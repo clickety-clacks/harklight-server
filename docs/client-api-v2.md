@@ -437,8 +437,9 @@ or the recipient's setting is `"all"`.
 
   A full bounce removes the unopened item and its Chat from person reads,
   including Inbox, History and search, and reduces the unresolved count.
-  Direct item, revision and entries reads return `404 not_found`. A pending
-  default answer is cancelled. A soft bounce leaves the item where it is.
+  Direct item, revision and entries reads and answer submissions return
+  `404 not_found`. A pending default answer is cancelled. A soft bounce leaves
+  the item where it is.
 
   `rank.key` orders items across and within sections. While the inbox is in
   free order, `current` items also carry `Rank.group` (`common`, which has no
