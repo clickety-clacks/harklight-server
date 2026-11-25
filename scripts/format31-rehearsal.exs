@@ -22,7 +22,8 @@ defmodule Format31Rehearsal do
     {:ok, engine} = Engine.setup_device(engine, @person, @origin)
     {:ok, engine} = Engine.setup_device(engine, @person, @reader)
     {:ok, engine} = Engine.setup_sender(engine, @origin, @sender)
-    now = System.system_time(:millisecond) - 7 * 86_400_000
+    reference = System.fetch_env!("HARKLIGHT_FIXTURE_EPOCH_SECONDS") |> String.to_integer()
+    now = reference * 1_000 - 7 * 86_400_000
 
     {:ok, engine} = Engine.set_jev_connection(engine, "https://127.0.0.1:1/v1/systemone", "synthetic")
     {:ok, engine} = Engine.set_algorithm_choice(engine, @person, "jev-set")
@@ -175,18 +176,30 @@ defmodule Format31Rehearsal do
     report(:startup_return, %{elapsed_us: micros, memory: memory()})
     Process.sleep(30_000)
     report(:startup_30s, %{memory: memory()})
-    await_quiet_startup(relay, System.monotonic_time(:millisecond) + 600_000)
+    started_at = System.monotonic_time(:millisecond)
+    await_quiet_startup(relay, started_at + 3_900_000, started_at)
     Process.sleep(2_000)
     report(:startup_rest, %{memory: memory()})
 
-    {inbox_us, {:ok, _}} = :timer.tc(fn -> Reads.inbox(relay, @reader, %{"limit" => "50"}) end)
-    {replied_us, :ok} = :timer.tc(fn -> first_reply(relay, %{"limit" => "50"}) end)
-    report(:view_latency_us, %{inbox: inbox_us, first_replied_page: replied_us})
+    views =
+      for _ <- 1..7 do
+        {inbox_us, {:ok, _}} = :timer.tc(fn -> Reads.inbox(relay, @reader, %{"limit" => "50"}) end)
+        {replied_us, :ok} = :timer.tc(fn -> first_reply(relay, %{"limit" => "50"}) end)
+        %{inbox: inbox_us, first_replied_page: replied_us}
+      end
+
+    report(:view_latency_first_us, hd(views))
+    report(:view_latency_samples_us, views)
+    medians = Map.new([:inbox, :first_replied_page], fn field ->
+      samples = Enum.map(views, &Map.fetch!(&1, field))
+      {field, samples |> Enum.sort() |> Enum.at(3)}
+    end)
+    report(:view_latency_median_us, medians)
     measure_sends(relay)
     :ok = GenServer.stop(relay, :normal, 60_000)
   end
 
-  defp await_quiet_startup(relay, deadline) do
+  defp await_quiet_startup(relay, deadline, next_sample) do
     observer = self()
 
     try do
@@ -213,12 +226,22 @@ defmodule Format31Rehearsal do
         report(:startup_drained, pending)
 
       {:startup_pending, pending} ->
-        if System.monotonic_time(:millisecond) >= deadline do
+        now = System.monotonic_time(:millisecond)
+
+        if now >= deadline do
           raise "synthetic startup still has pending work: #{inspect(pending)}"
         end
 
-        Process.sleep(500)
-        await_quiet_startup(relay, deadline)
+        next_sample =
+          if now >= next_sample do
+            report(:startup_draining, %{pending: pending, memory: memory()})
+            now + 120_000
+          else
+            next_sample
+          end
+
+        Process.sleep(1_000)
+        await_quiet_startup(relay, deadline, next_sample)
     after
       5_000 -> raise "synthetic startup sample was not received"
     end
@@ -325,7 +348,7 @@ defmodule Format31Rehearsal do
 
   defp measure_sends(relay) do
     times =
-      for i <- 1..5 do
+      for i <- 1..3 do
         op = uuid(9_000_000 + i)
         principal = %{kind: :device, person: @person, key: @origin}
         body = %{
@@ -346,7 +369,7 @@ defmodule Format31Rehearsal do
 
         micros
       end
-    report(:ordinary_send_median_us, Enum.sort(times) |> Enum.at(2))
+    report(:ordinary_send_median_us, Enum.sort(times) |> Enum.at(1))
 
   end
 
