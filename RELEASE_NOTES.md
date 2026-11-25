@@ -6,6 +6,13 @@ and still appear in Notification Center, the Inbox, and the badge. The
 recipient can choose to receive all alerts. A quiet delivery does not hold
 back the first alerting delivery in a five-minute window.
 
+For connecting an agent, the server now serves a Harklight skill for Claude Code
+and Codex at `/agent-skills/harklight/SKILL.md`, listed first on the Components
+page. The Components page and the Invitation page show `harklight-agent setup`
+with the invitation link; that command arrives in the next Harklight Agent
+release. The Components page no longer shows the retired agent enrollment
+command with `--origin-port`.
+
 ## Upgrade and recovery
 
 First start upgrades a FORMAT29 snapshot to FORMAT30 and uses the quiet
@@ -14,8 +21,11 @@ the new release. To return to a FORMAT29 release, stop the new Server and
 restore that backup before starting the older release. The restore discards
 subsequent writes and cannot undo notifications already delivered.
 
-**Compatibility.** The Server continues to use protocol 0.2. Existing
-Harklight Agent releases do not need to send any new fields.
+**Compatibility.** Harklight Server 0.2.16 uses protocol 0.2 and adds
+`Settings.alerts` (`important` by default, or `all`) and `PUT /v2/settings/alerts`.
+Existing Harklight Agent releases do not need to send any new fields; Harklight
+Agent 0.2.5 is the matching release until the setup release. Harklight app 0.2.0
+and Harklight Web 0.2.5 are the client baseline.
 
 # Harklight Server v0.2.15
 
