@@ -163,8 +163,8 @@ defmodule AttentionServer.Placement do
   defp reply_projection(engine, person) do
     {items, groups} =
       engine.conversation_events
-      |> Stream.filter(fn {_seq, event} ->
-        BounceDecision.person_visible?(engine.messages[event.key])
+      |> Stream.reject(fn {_seq, event} ->
+        BounceDecision.fully_bounced?(engine.messages[event.key])
       end)
       |> Enum.reduce({[], %{}}, fn
         {{^person, seq}, %{key: key, payload: %{"kind" => "reply", "author" => "origin"} = reply}},
