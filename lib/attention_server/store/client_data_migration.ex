@@ -1,7 +1,7 @@
 defmodule AttentionServer.Store.ClientDataMigration do
   @moduledoc false
 
-  alias AttentionServer.{Engine, Message, RouteBIndex}
+  alias AttentionServer.{Engine, Message}
 
   def prepare(engine) do
     {next, :ok, touched} =
@@ -35,18 +35,23 @@ defmodule AttentionServer.Store.ClientDataMigration do
         _, acc -> acc
       end)
 
-    legacy
-    |> MapSet.difference(authoritative)
-    |> Enum.reduce(engine, fn {{person, _, _} = key, id}, acc ->
-      seq = RouteBIndex.entry_position(engine.route_b_index, key, id)
+    targets = MapSet.difference(legacy, authoritative)
+    if MapSet.size(targets) == 0, do: engine, else: mark_chat_targets(engine, targets)
+  end
 
-      case Map.get(acc.conversation_events, {person, seq}) do
-        %{payload: %{"kind" => "discussion", "author" => "person"} = payload} = fact ->
+  # Stopped conversion has not enabled the agent feed's entry-position index.
+  # Match the affected identifiers directly against their stored Chat facts.
+  defp mark_chat_targets(engine, targets) do
+    Enum.reduce(engine.conversation_events, engine, fn
+      {position, %{key: key, payload: %{"kind" => "discussion", "author" => "person", "event_id" => id} = payload} = fact}, acc ->
+        if MapSet.member?(targets, {key, id}) do
           updated = %{fact | payload: Map.put(payload, "receipt_expected", false)}
-          Engine.put_row(acc, :conversation_events, {person, seq}, updated)
+          Engine.put_row(acc, :conversation_events, position, updated)
+        else
+          acc
+        end
 
-        _ -> acc
-      end
+      _, acc -> acc
     end)
   end
 

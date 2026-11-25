@@ -1587,9 +1587,7 @@ Writes return 200 unless the table says otherwise. Each response schema requires
   agent's idempotency scope with other agent writes, so a different request
   under its key answers `409 idempotency_conflict`. Revocation or removal
   of the destination discards its pending show. A restart clears held shows
-  and show receipts. See the legacy
-  [push authorization and target ordering](https://github.com/clickety-clacks/harklight-server/blob/2af46b992e6b86abdf48d2339a615378f1c485b4/lib/attention_server/relay.ex#L7451-L7510)
-  and [show validation and delivery](https://github.com/clickety-clacks/harklight-server/blob/2af46b992e6b86abdf48d2339a615378f1c485b4/lib/attention_server/relay.ex#L7819-L7923).
+  and show receipts.
 
 ### 9.3 Agent change feed
 

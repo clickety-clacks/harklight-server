@@ -1,10 +1,8 @@
 # Person-bound owner browser sign-in seam
 
-This source supplies owner issuance and durable one-use authentication for the
-approved W1 host-page flow. HTTP/UI, link construction, browser cookies and
-session storage remain the dashboard owner's responsibility. The published
-v0.1.2 binary predates this source. No live listener, deployment, bootstrap link
-or provider traffic is added here.
+The owner issues a one-use link to sign in to the self-hosted dashboard for
+the person they manage. The dashboard creates a browser session after
+redeeming the link. See [SELF_HOST.md](SELF_HOST.md) for setup.
 
 ## Issuance
 
@@ -32,12 +30,10 @@ saves a configured sign-in URL in a new private file. Keep that file and link
 out of logs and generic status metadata; share it only with the intended
 owner. No public token-issuance endpoint or resolver is constructed here.
 
-Only a purpose-separated SHA-256 hash is persisted, alongside person, issuer
-key/revision, issuance time and consumption. At the next issuance, spent
-records and records from a retired owner key/revision are reclaimed.
-Reclaimed tokens return `invalid_sign_in` and cannot authenticate again; a
-retained spent token returns `used`. Issuance refuses stale/currently invalid
-owner authority and cannot change device, invitation, sender or person grants.
+The store contains a purpose-separated SHA-256 hash, the person and issuer
+key and revision, and the issuance time. Consuming a token deletes its
+record. Issuance removes records for superseded owners and requires current
+owner authority.
 
 ## Authentication and consume
 
@@ -51,9 +47,8 @@ before releasing this authenticated principal. Concurrent/restarted consumers
 cannot receive it twice; a stale database writer returns storage failure
 instead of an authenticated principal.
 
-Refusals are `{:error, :invalid_sign_in}` for malformed, unknown or retired-issuer
-tokens, and `{:error, :used}` for an already consumed token whose issuer remains current.
-No refusal discloses person/device metadata. Database failure returns
+Malformed, unknown, already consumed and retired-issuer tokens return
+`{:error, :invalid_sign_in}`. Database failure returns
 `{:error, :storage_unavailable}`.
 
 The `hbs1_` format and hash purpose are distinct from invitation and enrollment
@@ -75,15 +70,11 @@ separate authority model. Hosted own-device-only access remains the HTTP/session
 owner's scope; this self-hosted person-owner token is not a hosted login grant.
 
 A token stays consumed even if the HTTP/session response is lost or session
-creation fails afterward. Recovery uses a fresh owner-issued sign-in token;
-retrying a used token does not mint another session. The token snapshot and a
-separate session database are not an atomic transaction. The HTTP/session owner
-must present the actual failure and recovery state to the person. Adding the
-first bootstrap-issued host-page link is later work, not implicit issuance.
+creation fails afterward. Recovery uses a fresh owner-issued sign-in token. The token deletion and
+browser-session creation are separate operations.
 
 ## Durable upgrade
 
-Older snapshots initialize an empty sign-in map and clock floor, preserving
-existing persons, owners, devices, invitations and sender grants. Before any
-future authorized live upgrade, keep the stopped backup: older binaries cannot
-read the newer format. This source work does not mutate the live store or APNs.
+Upgrading a FORMAT30 store preserves unused sign-in links and keeps consumed
+links unusable. Follow [SELF_HOST.md](SELF_HOST.md#upgrade-or-rollback) for
+backup and recovery.

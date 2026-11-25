@@ -68,10 +68,8 @@ defmodule AttentionServer.Store.Format31RelayStartupTest do
     assert {:ok, engine} = Engine.setup_sender(engine, "origin", "app:test")
     session = "00000000-0000-4000-8000-000000000001"
 
-    frame = forward_frame()
-
-    {engine, {:ok, reply}} = Engine.request_frame(engine, "origin", frame, 1)
-    assert {:ok, %{"type" => "ok", "seq" => 1}} = JSON.decode_line(reply)
+    command = Map.delete(forward_frame(), "v")
+    assert {engine, {:ok, %{"seq" => 1}}} = Engine.request_command(engine, "origin", command, 1)
     key = {"person", "app:test", "item"}
     scope = {"person", "origin", session}
     engine = put_in(engine.origin_sessions[scope]["client_availability"], %{1 => {"listening", nil}})

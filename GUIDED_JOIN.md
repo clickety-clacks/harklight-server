@@ -1,7 +1,8 @@
 # Guided join server foundation
 
-The v0.1.5 server package includes these owner invitation, status and recovery
-commands. See SELF_HOST.md for installation and dashboard setup.
+The Server package includes the owner invitation, enrollment status and
+recovery commands described here. See [SELF_HOST.md](SELF_HOST.md) for
+installation and dashboard setup.
 
 The authenticated owner creates a person-bound invitation. The app keeps its
 fresh device private key and submits a public certificate. Redemption creates a
@@ -180,39 +181,15 @@ its connection indicator stays Unknown without a real presence signal.
 
 ## Durable upgrade boundary
 
-This release, v0.1.45, writes FORMAT29. From supported FORMAT27 state,
-including state written by the published v0.1.35 through v0.1.42 maintenance
-packages (for example v0.1.38), first start applies
-the FORMAT28 device-focus defaults and FORMAT29 hosted-delivery-state
-initialization in order, preserving existing values and filling only missing
-values. The final migrated store is FORMAT29; a separately persisted
-intermediate FORMAT28 state is not established. Large message data is held in
-private files with durable database references. An older compatible FORMAT29
-release that does not understand a reference shows an explicit newer-server
-marker for that content, continues to serve other data and preserves the
-referenced files; a compatible upgrade restores full reads.
+This release opens and writes FORMAT30 snapshots. See
+[SELF_HOST.md](SELF_HOST.md#upgrade-or-rollback) for supported upgrade paths,
+backup, and recovery. Keep the complete stopped state directory, including
+private files referenced by the database.
 
-Every registered, non-revoked agent can read all messages on its account,
-regardless of sender. Sender filters select search results only; they do not
-limit access. New registrations need no per-sender read grant for reads.
-Answering still requires both a matching read grant and a matching respond
-grant; response behavior is unchanged. After a Reply or No comment, new chat on
-that request is closed and earlier messages remain readable. Agents without
-the matching Agent C1 behavior receive the existing generic closed refusal.
-Published FORMAT27 packages, including v0.1.38 and v0.1.42, cannot read
-FORMAT29; changing the code back alone does not restore compatibility. From
-FORMAT29 state written by v0.1.43 or v0.1.44, v0.1.45 runs no migration. Do not
-install v0.1.43: revising a message whose body is stored as large message data stops
-its relay process; v0.1.44 and later fix this.
-
-Before the first v0.1.45 start, stop the server and take a complete private-state
-backup. After any v0.1.45 write, returning to a published FORMAT27 package such
-as v0.1.38 or v0.1.42 requires stopping the server, restoring that pre-start
-backup and selecting that package. This loses every write made since the backup and cannot undo external
-notifications, bounces or agent deliveries. The installer behavior and recovery
-limits are in SELF_HOST.md; consult the exact archive's rehearsal record, and do
-not assume recovery success or a recovery time. Older package formats are
-summarized in SELF_HOST.md.
+Every registered, non-revoked agent can read its account's messages. Sender
+filters select search results. Answering requires both a matching read grant
+and a matching respond grant. An answer or No comment closes the request
+while the conversation remains available for chat.
 
 Score-based priority levels can set an unseen interval for each level. When
 that interval elapses, the server adds an advisory to the originating agent
@@ -271,5 +248,5 @@ An unconfirmed transport/result failure returns `state: unconfirmed` with the
 same request UUID and an instruction to retry that action; it is not an
 invitation proof. Explicit refused, used and capacity results name the
 available recovery. A deliberate new invitation uses a fresh request UUID.
-The legacy private-file command remains available for diagnostic compatibility.
+The private-file command remains available for diagnostics.
 Creating a handoff result does not send a notification or approve enrollment.

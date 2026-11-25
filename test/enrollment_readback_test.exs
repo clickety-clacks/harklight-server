@@ -2,7 +2,6 @@ defmodule AttentionServer.EnrollmentReadbackTest do
   use ExUnit.Case, async: false
 
   alias AttentionServer.{JSON, Relay, RelayReaders, Store}
-  alias Exqlite.Sqlite3
 
   defp key(char), do: String.duplicate(char, 64)
 
@@ -326,18 +325,7 @@ defmodule AttentionServer.EnrollmentReadbackTest do
           end)
     }
 
-    malformed = :erlang.term_to_binary({:attention_relay_state, 30, old}, [{:compressed, 6}])
-    assert {:ok, db} = Sqlite3.open(path)
-
-    assert {:ok, stmt} =
-             Sqlite3.prepare(db, "UPDATE relay_state SET payload = ?, checksum = ? WHERE id = 1")
-
-    assert :ok =
-             Sqlite3.bind(stmt, [{:blob, malformed}, {:blob, :crypto.hash(:sha256, malformed)}])
-
-    assert :done = Sqlite3.step(db, stmt)
-    assert :ok = Sqlite3.release(db, stmt)
-    assert :ok = Sqlite3.close(db)
+    assert :ok = AttentionServer.PreChangeLogStore.snapshot_fixture(path, 30, fn _ -> old end)
     assert {:error, {:storage_unavailable, {:error, :invalid_state}}} = Store.open(path)
   end
 end

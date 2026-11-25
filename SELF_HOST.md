@@ -137,10 +137,9 @@ an agent's journal during server installation. The CLI's README covers
 `send`, `listen`, `retry`, `retract` and file commands.
 
 The CLI sends and listens over client API v2 on the device port, with the same
-server certificate and enrolled-device authentication; there is no separate
-origin port. Agent 0.2 on an existing identity takes the device port from
-`--device-port` or `HARKLIGHT_DEVICE_PORT`; new enrollments save it. An upgrade
-alone does not establish actual agent listening.
+server certificate and enrolled-device authentication. For an existing identity,
+set the device port with `--device-port` or `HARKLIGHT_DEVICE_PORT` when needed.
+New enrollments save the port.
 
 `ATTENTION_SERVER_DEPLOYMENT_MODE` defaults to `self_hosted`.
 `ATTENTION_SERVER_UPLOAD_CAP_BYTES` defaults to `none` for self-hosting or may be
@@ -345,7 +344,7 @@ order, followed by a count of the remaining names. No name in a payload is
 altered, truncated or ellipsized; the fitter may shorten other text. The phone
 may clip its display. There is no name-input cap or validation, name rejection,
 or silent notification drop because a name does not fit. The full original
-name remains unchanged in the message, history and origin feed.
+name remains unchanged in the message, history and agent feed.
 The independent `sender_id` and message ID remain the identities used for
 authentication, grants and navigation.
 This requires the server release implementing the display-name field and
@@ -407,7 +406,7 @@ not acknowledge an event, enable listening or promise future delivery. Follow
 the shared core for matching the request and reporting an outcome.
 The enrolled-device `read` and `respond` commands remain available for messages
 already stored by the server. They do not create new messages or retrieve an
-origin receipt. Existing messages and their replay events remain in server
+handoff receipt. Existing messages and their replay events remain in server
 history.
 
 Use an enrolled device with read/respond access to see its person's stored
