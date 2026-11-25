@@ -1,3 +1,35 @@
+# Harklight Server v0.2.23
+
+Hosted servers can now rank waiting messages with Jev, the model-assisted
+ranking that self-hosted servers set up on the Prioritization page. A hosted
+Server takes the Jev endpoint and model from its startup settings, with the
+existing key-file setting; when all three are set, Jev ranking is on for every
+hosted account, and when they are not, every account uses the basic order. A
+hosted account can no longer choose its own ranking: `POST /algorithm` answers
+409 `algorithm_managed_by_server` for a choice that differs from the Server's
+policy. Self-hosted servers keep using the dashboard connection and ignore the
+startup Jev settings.
+
+Every Jev request now has a 30-second limit covering connect, send and
+receive. Before, a request that never answered could stall ranking; intake,
+delivery and notifications were never held up. When Jev fails or times out,
+waiting items stay in the basic order and ranking retries with growing gaps.
+
+Jev requests send message content for ranking: titles, bodies, sender and
+message IDs, stated stake, urgency and deadline, and the parent message for an
+unseen chat reply.
+
+## Upgrade and recovery
+
+As in v0.2.21 and v0.2.22: FORMAT30 stores only, and no new store change. Take
+a complete private backup before starting the new release. To return to an
+earlier release, follow the rollback steps in SELF_HOST.md.
+
+**Compatibility.** Harklight Server 0.2.23 speaks only the 0.2 protocol and
+bundles Harklight Web 0.2.6. As with v0.2.21, install it together with an
+iPhone app build that reads `receipt_expected`. Harklight Agent 0.2.6 and 0.2.7
+work with it.
+
 # Harklight Server v0.2.22
 
 Bundles Harklight Web 0.2.6 (source edd52181, archive SHA-256
