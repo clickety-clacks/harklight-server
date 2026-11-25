@@ -10,9 +10,9 @@ correlated retraction that marks a Chat turn acted still belongs to the
 originating key.
 
 The bundled Harklight Web is 0.2.4. Each tab has its own FYI card and list:
-Inbox's hold the FYIs not marked Seen, and Replied's hold the Seen ones. An FYI
-that offers Seen counts as Seen only with that answer, so opening it elsewhere
-does not move it.
+Inbox's hold the FYIs not marked Seen, and Replied's hold the Seen ones. Opening
+an ordinary FYI does not move it: it counts as Seen only once the Seen answer is
+given. A Progress FYI also counts as Seen once it has been opened or marked Seen.
 
 ## Upgrade and recovery
 
