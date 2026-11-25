@@ -872,7 +872,8 @@ defmodule AttentionServer.APNSPushTest do
                },
                "category" => "harklight.expanded.single.v1",
                "badge" => 1,
-               "content-available" => 1
+               "content-available" => 1,
+               "sound" => "default"
              },
              "attention" => %{
                "v" => 2,

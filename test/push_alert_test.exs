@@ -239,7 +239,7 @@ defmodule AttentionServer.PushAlertTest do
       end
 
       assert payload["aps"]["badge"] == 1
-      assert payload["aps"]["alert"] == claim.alert
+      assert payload["aps"]["alert"] == Map.take(claim.alert, ["title", "body"])
     end
   end
 
@@ -499,7 +499,17 @@ defmodule AttentionServer.PushAlertTest do
       {engine, forward} = registered_push_engine()
       now = System.system_time(:millisecond)
 
-      {engine, 1} = forward.(engine, "quiet", "01", %{"message_type" => "fyi"}, now)
+      fyi = %{
+        "message_type" => "fyi",
+        "answer_ui" => %{
+          "schema" => "attention-client.actions/1",
+          "actions" => [
+            %{"id" => "seen", "label" => "Seen", "kind" => "value", "value" => %{"acknowledgment" => "seen"}}
+          ]
+        }
+      }
+
+      {engine, 1} = forward.(engine, "quiet", "01", fyi, now)
       accepted = %{state: "provider_accepted", http_status: 200}
 
       {engine, first} =
