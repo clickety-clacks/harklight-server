@@ -13,15 +13,15 @@ through Harklight.
 
 ## Install the server
 
-For the FORMAT30 v0.2.20 server package, use the release page below after
+For the FORMAT30 v0.2.21 server package, use the release page below after
 publication to download the Linux x86_64 archive, `SHA256SUMS` and
 `SELF_HOST.md`. Verify the checksum before extraction:
 
-[v0.2.20 release](https://github.com/clickety-clacks/harklight-server/releases/tag/v0.2.20)
+[v0.2.21 release](https://github.com/clickety-clacks/harklight-server/releases/tag/v0.2.21)
 
 ```sh
 sha256sum -c SHA256SUMS
-tar -xzf harklight-server-0.2.20-linux-x86_64.tar.gz
+tar -xzf harklight-server-0.2.21-linux-x86_64.tar.gz
 ```
 
 Follow [SELF_HOST.md](SELF_HOST.md) for a fresh installation, tailnet routing,
@@ -131,7 +131,7 @@ enrolled identity and journal to receive replies. If that route cannot listen,
 use `harklight-agent read --session HANDLE` when the originating work resumes;
 it reads once without acknowledging an event or promising future delivery.
 Enrolled-device `read` and `respond` remain available for requests already
-stored by the server; they do not create new messages or retrieve an origin
+stored by the server; they do not create new messages or retrieve a delivery
 receipt. Enrolled devices and registered agents can search and read within their
 account. Registered agents still need the applicable grants to respond.
 
