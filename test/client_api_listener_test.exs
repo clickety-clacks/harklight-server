@@ -544,6 +544,8 @@ defmodule AttentionServer.ClientAPIListenerTest do
       {relay, person, owner, agent, port} = start_granted_agent(ctx, "granted-retract")
       assert :ok = Relay.setup_device(relay, person, "fixture-origin")
       forward_granted_fixture(relay, "app:example", "legacy-id", 1)
+      forward_granted_fixture(relay, "app:example", "device-retract", 3)
+      forward_granted_fixture(relay, "app:example", "still-open", 4)
 
       ctx = Map.put(ctx, :port, port)
       assert {:ok, conn} = device_connect(ctx, "granted-retract", :http2)
@@ -551,6 +553,7 @@ defmodule AttentionServer.ClientAPIListenerTest do
       assert {:ok, conn, %{status: 200} = found} =
                request(conn, "GET", "/v2/search?message_id=legacy-id")
 
+      assert {"harklight-account-search", "1"} in found.headers
       assert %{"items" => [%{"item_id" => id, "seen" => false}]} = json(found)
       path = "/v2/items/#{id}"
       headers = [{"idempotency-key", "00000000-0000-4000-8000-000000000002"}]
@@ -567,6 +570,18 @@ defmodule AttentionServer.ClientAPIListenerTest do
       assert is_binary(actor) and actor != "" and actor != agent
       assert {:ok, _conn, %{status: 200} = replay} = request(conn, "POST", retract, headers)
       assert get_in(json(replay), ["message", "terminal", "retracted_by"]) == actor
+
+      assert {:ok, device} = device_connect(ctx, "a2", :http2)
+      assert {:ok, device, %{status: 200} = inbox} = request(device, "GET", "/v2/inbox")
+      items = Map.new(json(inbox)["items"], &{&1["message"]["message_id"], &1})
+      assert items["legacy-id"]["rank"]["section"] == "resolved"
+      assert items["still-open"]["rank"]["section"] == "current"
+      device_item = items["device-retract"]["item_id"]
+      device_retract = "/v2/agent/messages/#{device_item}/retract"
+      assert {:ok, device, %{status: 200}} = request(device, "POST", device_retract, headers)
+      assert {:ok, _, %{status: 200} = inbox} = request(device, "GET", "/v2/inbox")
+      items = Map.new(json(inbox)["items"], &{&1["message"]["message_id"], &1})
+      assert items["device-retract"]["rank"]["section"] == items["legacy-id"]["rank"]["section"]
 
       assert :ok = Relay.owner_revoke_agent(relay, person, owner, agent)
       assert {:ok, device} = device_connect(ctx, "a2", :http2)

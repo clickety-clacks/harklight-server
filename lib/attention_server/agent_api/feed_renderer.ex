@@ -31,8 +31,8 @@ defmodule AttentionServer.AgentAPI.FeedRenderer do
 
   defp render_row(state, scope, %{resource: {:message, key}, rev: rev}, _entries) do
     case AgentResources.message(state, scope, key) do
-      {:ok, %{"rev" => ^rev} = message} ->
-        {:ok, AgentResources.with_retracting_actor(message, state, key)}
+      {:ok, %{"rev" => ^rev}} = rendered ->
+        rendered
 
       _ ->
         {:error, :storage_unavailable}

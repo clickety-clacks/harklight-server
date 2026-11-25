@@ -125,8 +125,11 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
       assert %{"item" => %{"seen" => false, "terminal" => %{"state" => "retracted"}}} =
                decode_response(get(ctx, "a1", "/v2/items/#{id}"))
 
-      assert %{"message" => %{"terminal" => %{"state" => "retracted"}}} =
+      assert %{"message" => %{"terminal" => %{"state" => "retracted", "retracted_by" => actor}}} =
                decode_response(get(ctx, "a1", "/v2/agent/messages/#{id}"))
+
+      assert %{"messages" => [%{"item_id" => ^id, "terminal" => %{"retracted_by" => ^actor}}]} =
+               decode_response(get(ctx, "a1", "/v2/agent/messages"))
 
       assert %{"changes" => origin_changes} =
                decode_response(

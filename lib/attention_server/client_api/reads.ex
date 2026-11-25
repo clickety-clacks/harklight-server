@@ -67,7 +67,9 @@ defmodule AttentionServer.ClientAPI.Reads do
       when kind in [:agent, :device] do
     conn = fetch_query_params(conn)
     params = query(conn, ~w(q sender message_id state session limit page))
-    respond(conn, search(ctx.relay, principal, params))
+    conn
+    |> Plug.Conn.put_resp_header("harklight-account-search", "1")
+    |> respond(search(ctx.relay, principal, params))
   end
 
   def get_search(conn, %Context{}), do: Errors.send_error(conn, "not_found")

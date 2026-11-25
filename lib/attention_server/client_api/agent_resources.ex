@@ -40,15 +40,6 @@ defmodule AttentionServer.ClientAPI.AgentResources do
     end
   end
 
-  def with_retracting_actor(message, state, {person, _, _} = key) do
-    terminal = state.store.engine.messages[key].terminal
-
-    case Conversation.retracted_by(person, terminal) do
-      nil -> message
-      actor -> put_in(message, ["terminal", "retracted_by"], actor)
-    end
-  end
-
   def revision(state, key, n) do
     with {:ok, revision} <- Resources.revision(state.store.engine, key, n) do
       {:ok, Map.update!(revision, "message", &Map.drop(&1, ["sender_id", "message_id"]))}
@@ -190,6 +181,7 @@ defmodule AttentionServer.ClientAPI.AgentResources do
     base =
       %{"state" => terminal.state, "at_ms" => terminal.at}
       |> put("outcome", Resources.answer_outcome(record, terminal))
+      |> put("retracted_by", Conversation.retracted_by(person, terminal))
 
     base =
       if terminal.answer_present, do: Map.put(base, "answer", terminal.answer), else: base

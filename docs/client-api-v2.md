@@ -197,7 +197,7 @@ Schemas use JSON Schema 2020-12. `$ref`s point into the `$defs` below.
         "item_id": { "$ref": "#/$defs/OpaqueId" },
         "rev": { "$ref": "#/$defs/Rev" },
         "position": { "type": "integer", "minimum": 1, "description": "Creation order, unique per person, compared only within an item; not dense (gaps are normal). Never changes." },
-        "kind": { "enum": ["reply", "lifecycle", "revision", "availability", "result"], "description": "lifecycle is only the origin's retraction fact; a revision entry (request revision 2 and later) marks that a revision happened; a result entry is one origin result fact. The answer outcome is Item.terminal, not an entry." },
+        "kind": { "enum": ["reply", "lifecycle", "revision", "availability", "result"], "description": "lifecycle is a retraction fact labeled origin for subscription compatibility, including a retraction by another account principal; a revision entry (request revision 2 and later) marks that a revision happened; a result entry is one origin result fact. The answer outcome is Item.terminal, not an entry." },
         "author": { "enum": ["person", "origin", "server"] },
         "at_ms": { "$ref": "#/$defs/TimeMs", "description": "Absent on entries from before the cut-over; every entry created by 0.2 carries it" },
         "request_revision": { "type": "integer", "minimum": 1 },
@@ -901,7 +901,7 @@ visible text. Its `attention` member changes:
 | `not_found` | 404 | false | Unknown or invisible item, entry or file (`unknown_message`, `not_found`) |
 | `stale_request` | 409 | false | `request_revision` is behind the item (`stale_revision`) |
 | `already_answered` | 409 | false | Only on `/answer`: the item's `terminal` is already set (`closed`) |
-| `already_retracted` | 409 | false | The origin retracted the item (`retracted`); also an agent revise or retract on that item |
+| `already_retracted` | 409 | false | The item was retracted (`retracted`); also an agent revise or retract on that item |
 | `already_closed` | 409 | false | An upload discard targets an attached handle. Lifecycle targets a terminal item. Revise or retract targets a terminal item whose state is other than retracted. A correlated revise targets an already-acted turn. A result conflicts or attempts a transition after a final result, or a file-use report conflicts (§5, §9.2). |
 | `not_answered` | 409 | false | The agent tried to record a result before an answer |
 | `idempotency_conflict` | 409 | false | Same key, different request (`operation_conflict`) |
@@ -1450,6 +1450,10 @@ Writes return 200 unless the table says otherwise. Each response schema requires
   correlation refuses the entire write. Handoff still uses the receipt
   endpoint. Retraction records the authenticated actor while the terminal
   and lifecycle updates continue to reach the item's origin and the person.
+  For a foreign retract, `AgentRetractResult.rev` is the origin's agent-log
+  position. `retracted_by` identifies an actor within the account only. It
+  cannot be looked up through another route or used to identify that actor
+  in another account.
 - **Replies.** Either side may reply any number of times in every item
   state, including after answer or retraction. If supplied, `in_reply_to`
   identifies a person-authored chat turn of this item. The server derives
@@ -2025,6 +2029,8 @@ they replace the legacy `relay_outcome` and `terminal_seq`. The response does
 not echo an `operation_id`. A replay is marked by `Idempotent-Replayed`.
 
 ### Search
+
+Account-capable search includes the response header `Harklight-Account-Search: 1` for admitted device and Granted Agent requests.
 
 `q` replaces the legacy `text` field (`contains` internally). It is an optional case-sensitive literal substring of any string value in
 the current message body, including strings nested inside arrays and objects.

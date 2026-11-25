@@ -276,9 +276,8 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
              replay_message(state, projection_scope, key, receipt["include_message"]),
            {:ok, entry} <- replay_entry(state, projection_scope, key, receipt["entry_position"]) do
         message =
-          if receipt["account_retract"] do
-            message = AgentResources.with_retracting_actor(message, state, key)
-            if projection_scope != scope, do: Map.delete(message, "advisories"), else: message
+          if projection_scope != scope do
+            Map.delete(message, "advisories")
           else
             message
           end

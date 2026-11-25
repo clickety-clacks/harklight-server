@@ -2852,8 +2852,8 @@ defmodule AttentionServer.Relay do
             end)
 
           next_state =
-            case Engine.authorized_person(state.store.engine, key) do
-              {:ok, person} ->
+            case Engine.account_device_principal(state.store.engine, key) do
+              {:ok, %{person: person}} ->
                 if pending_signature(state.store.engine, person) !=
                      pending_signature(next_engine, person),
                    do: pending_set_changed(next_state, person),
