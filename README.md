@@ -13,15 +13,15 @@ through Harklight.
 
 ## Install the server
 
-For the FORMAT30 v0.2.23 server package, use the release page below after
+For the FORMAT30 v0.2.24 server package, use the release page below after
 publication to download the Linux x86_64 archive, `SHA256SUMS` and
 `SELF_HOST.md`. Verify the checksum before extraction:
 
-[v0.2.23 release](https://github.com/clickety-clacks/harklight-server/releases/tag/v0.2.23)
+[v0.2.24 release](https://github.com/clickety-clacks/harklight-server/releases/tag/v0.2.24)
 
 ```sh
 sha256sum -c SHA256SUMS
-tar -xzf harklight-server-0.2.23-linux-x86_64.tar.gz
+tar -xzf harklight-server-0.2.24-linux-x86_64.tar.gz
 ```
 
 Follow [SELF_HOST.md](SELF_HOST.md) for a fresh installation, tailnet routing,
