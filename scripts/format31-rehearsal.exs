@@ -37,6 +37,13 @@ defmodule Format31Rehearsal do
       Enum.reduce(1..messages, engine, fn i, engine ->
         frame = Map.put(forward(i, sessions), :agent_api_v2, true)
         frame =
+          if i <= 16 do
+            body = :binary.copy(<<64 + i>>, 2 * 1024 * 1024 + i)
+            put_in(frame, ["message", "body"], body)
+          else
+            frame
+          end
+        frame =
           if i > messages - fyis do
             ui = %{"schema" => "attention-client.actions/1", "actions" => [
               %{"id" => "seen", "label" => "Seen", "kind" => "value", "value" => %{"acknowledgment" => "seen"}}
@@ -176,6 +183,9 @@ defmodule Format31Rehearsal do
     {:ok, sizes} = ConversionPreflight.snapshot_sizes(length, prefix)
     {:ok, format} = ConversionPreflight.snapshot_format(prefix)
     report(:snapshot, Map.put(sizes, :format, format))
+    for table <- ~w(client_resource_revs agent_changes relay_large_data_refs) do
+      report(:source_rows, %{table: table, count: query(db, "SELECT count(*) FROM " <> table)})
+    end
     :ok = Sqlite3.close(db)
   end
 
