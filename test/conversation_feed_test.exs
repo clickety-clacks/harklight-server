@@ -1303,14 +1303,14 @@ defmodule AttentionServer.ConversationFeedTest do
     assert {1, payload, _checksum} = state_snapshot(path)
     assert {:attention_relay_state, 30, _} = :erlang.binary_to_term(payload, [:safe])
 
-    record = reopened.engine.messages[{"A", "app:test", "format29-large-data"}]
-    assert record.message["title"] == title
-    assert record.message["body"] == body
     assert :ok = Store.close(reopened)
 
     assert {:ok, reopened} = Store.open(path)
     assert reopened.version == 1
     assert reopened.engine.alert_choices == %{}
+    record = reopened.engine.messages[{"A", "app:test", "format29-large-data"}]
+    assert LargeData.read!(record.message["title"]) == title
+    assert LargeData.read!(record.message["body"]) == body
     assert :ok = Store.close(reopened)
   end
 
