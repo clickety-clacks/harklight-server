@@ -60,6 +60,7 @@ defmodule AttentionServer.DashboardHTTPS do
                  skill_path: Keyword.fetch!(opts, :skill_path),
                  expected_origin: Keyword.get(opts, :public_origin),
                  hosted: hosted?,
+                 invitations_configured: Keyword.get(opts, :invitations_configured, false),
                  hosted_addresses: Keyword.get(opts, :hosted_addresses, %{}),
                  hosted_testflight_url: Keyword.get(opts, :hosted_testflight_url),
                  skill_path_saas: Keyword.get(opts, :skill_path_saas),

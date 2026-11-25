@@ -55,6 +55,7 @@ defmodule AttentionServer.DashboardReadHTTP do
       skill_path: skill_path,
       expected_origin: Keyword.get(opts, :expected_origin),
       hosted: hosted,
+      invitations_configured: Keyword.get(opts, :invitations_configured, false),
       hosted_addresses:
         if(hosted, do: hosted_addresses(Keyword.get(opts, :hosted_addresses)), else: %{}),
       hosted_testflight_url:
@@ -687,7 +688,7 @@ defmodule AttentionServer.DashboardReadHTTP do
         display_name(principal),
         skill_version(opts.skill_path),
         skill_version(opts.skill_path_saas),
-        chrome(opts)
+        Keyword.put(chrome(opts), :invitations_configured, opts.invitations_configured)
       )
 
     conn
