@@ -26,9 +26,11 @@ defmodule AttentionServer.Placement do
     end
   end
 
-  def reassess(%Engine{} = engine, person, previous) do
-    case algorithm(choice(engine, person)) do
-      nil -> :none
+  def reassess(%Engine{} = engine, person, previous, selected \\ nil) do
+    case algorithm(selected || choice(engine, person)) do
+      nil ->
+        :none
+
       implementation ->
         implementation.reassess(ranking_message_items(engine, person), previous || [])
     end
@@ -220,10 +222,10 @@ defmodule AttentionServer.Placement do
   # The engine's mixed order supplies group positions; choose the highest
   # scored unseen member, then collapse the chat and group message threads.
   # Reply references carry no thread, so they cannot split a message block.
-  def list_items(engine, person, engine_entries, reply_summary) do
+  def list_items(engine, person, engine_entries, reply_summary, selected \\ nil) do
     groups = reply_groups(engine, person, engine_entries, reply_summary)
 
-    if choice(engine, person) == "baseline" do
+    if (selected || choice(engine, person)) == "baseline" do
       AttentionServer.FreeOrder.list_items(engine, person, groups, reply_summary)
     else
       ranked_list_items(engine, person, engine_entries, groups)

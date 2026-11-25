@@ -8,9 +8,7 @@ defmodule AttentionServer.HostedAccountTest do
     Engine,
     GuidedJoin,
     HostedRequests,
-    JevClient,
     JSON,
-    Placement,
     Relay,
     RelayReaders,
     Server,
@@ -620,9 +618,7 @@ defmodule AttentionServer.HostedAccountTest do
       assert {404, _} = post(port, "/other", %{})
     end
 
-    test "sets a per-account algorithm and treats the current choice as a no-op", %{
-      server: server
-    } do
+    test "Hosted algorithm requests cannot override Server settings", %{server: server} do
       relay = Server.relay(server)
       assert {:ok, person} = Relay.hosted_account_create(relay, "acct-priority")
       version = :sys.get_state(relay).store.version
@@ -633,15 +629,11 @@ defmodule AttentionServer.HostedAccountTest do
                  "algorithm_id" => "baseline"
                })
 
-      assert :sys.get_state(relay).store.version == version
-
-      assert {200, %{"person_id" => ^person, "algorithm_id" => "baseline"}} =
+      assert {409, %{"error" => "algorithm_managed_by_server"}} =
                hosted_post(relay, "/algorithm", %{
                  "person_id" => person,
-                 "algorithm_id" => "baseline"
+                 "algorithm_id" => "jev-set"
                })
-
-      assert :sys.get_state(relay).store.version == version
 
       assert {400, %{"error" => "unknown_algorithm"}} =
                hosted_post(relay, "/algorithm", %{
@@ -655,85 +647,7 @@ defmodule AttentionServer.HostedAccountTest do
                  "algorithm_id" => "baseline"
                })
 
-      assert {200,
-              %{
-                "person_id" => ^person,
-                "algorithm_id" => "jev-set",
-                "status" => "waiting"
-              }} =
-               hosted_post(relay, "/algorithm", %{
-                 "person_id" => person,
-                 "algorithm_id" => "jev-set"
-               })
-
-      assert Placement.choice(:sys.get_state(relay).store.engine, person) == "jev-set"
-
-      assert %{algorithm: "jev-set", basis: "fallback", entries: []} =
-               :sys.get_state(relay).priority_views[person]
-
-      saved_version = :sys.get_state(relay).store.version
-
-      assert {200, %{"status" => "waiting"}} =
-               hosted_post(relay, "/algorithm", %{
-                 "person_id" => person,
-                 "algorithm_id" => "jev-set"
-               })
-
-      assert :sys.get_state(relay).store.version == saved_version
-    end
-
-    test "saves a hosted plan choice while a configured connection has no response", %{
-      server: server,
-      dir: dir
-    } do
-      relay = Server.relay(server)
-      assert {:ok, person} = Relay.hosted_account_create(relay, "acct-priority-jev")
-      key_path = Path.join(dir, "jev.key")
-      File.write!(key_path, "private-test-key")
-      previous_key_path = System.get_env("ATTENTION_SERVER_JEV_KEY_PATH")
-      System.put_env("ATTENTION_SERVER_JEV_KEY_PATH", key_path)
-
-      on_exit(fn ->
-        if is_binary(previous_key_path),
-          do: System.put_env("ATTENTION_SERVER_JEV_KEY_PATH", previous_key_path),
-          else: System.delete_env("ATTENTION_SERVER_JEV_KEY_PATH")
-      end)
-
-      state = :sys.get_state(relay)
-
-      assert {:ok, engine} =
-               Engine.set_jev_connection(
-                 state.store.engine,
-                 "https://api.typesafe.ai/v1/systemone",
-                 "jev-latest"
-               )
-
-      assert {:ok, store} =
-               Store.commit(state.store, engine, %{
-                 person: person,
-                 actor: "test",
-                 action: "settings"
-               })
-
-      :sys.replace_state(relay, &%{&1 | store: store})
-
-      assert JevClient.key_status() == "readable"
-
-      assert {200,
-              %{
-                "person_id" => ^person,
-                "algorithm_id" => "jev-set",
-                "status" => "waiting"
-              }} =
-               hosted_post(relay, "/algorithm", %{
-                 "person_id" => person,
-                 "algorithm_id" => "jev-set"
-               })
-
-      assert Placement.choice(:sys.get_state(relay).store.engine, person) == "jev-set"
-
-      assert %{algorithm: "jev-set", basis: "fallback"} =
-               :sys.get_state(relay).priority_views[person]
+      assert :sys.get_state(relay).store.version == version
     end
 
     test "the public base address, not the listener's own, is the dashboard origin", %{

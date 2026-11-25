@@ -149,6 +149,32 @@ configured value are refused individually. The package elects no production
 SaaS cap. These settings need deliberate configuration; installation leaves the
 protected environment unchanged.
 
+### Hosted inbox prioritization
+
+For a Server running in `saas` mode, set these variables in its private
+startup environment:
+
+| Variable | Value |
+| --- | --- |
+| `ATTENTION_SERVER_JEV_ENDPOINT` | HTTPS System One endpoint, such as `https://api.typesafe.ai/v1/systemone`. A URL without a path uses `/v1/systemone`. |
+| `ATTENTION_SERVER_JEV_MODEL` | Model name or alias available to the provider account. |
+| `ATTENTION_SERVER_JEV_KEY_PATH` | Absolute path to a protected file containing the Hosted deployment's provider key. |
+
+In `saas` mode the Server uses the startup endpoint and model and ignores
+any dashboard connection or algorithm choices saved in the store. In
+`self_hosted` mode it uses the connection saved on the Prioritization
+dashboard and ignores the startup endpoint and model. Both modes use
+`ATTENTION_SERVER_JEV_KEY_PATH` for the provider key.
+
+Restart the Server to change the Hosted endpoint or model. With these settings,
+Jev ranks each existing and new Hosted account separately. Missing or invalid
+connection settings select baseline order for every Hosted account. The
+authenticated Hosted component's `POST /algorithm` accepts the configured
+algorithm and returns `409 algorithm_managed_by_server` for a different one.
+An unreadable key or unavailable provider yields baseline order when no
+usable scores are available. Provider requests have a 30-second total
+timeout per batch. Delivery and push continue independently of ranking.
+
 ## Optional self-hosted device dashboard
 
 The dashboard shows device status and agent skill guidance. A signed-in person
@@ -221,7 +247,8 @@ accepts or displays the path or key. The owner can save the model-assisted
 choice before its HTTPS endpoint, model or key file is ready. Waiting items
 remain in basic order until setup is complete and an ordering response arrives;
 the page shows whether setup is incomplete or the server is waiting for an
-answer. Intake, delivery and push continue normally.
+answer. Each provider request has a 30-second total timeout. Intake, delivery
+and push continue normally.
 
 Optional private applied-score record: set `ATTENTION_SERVER_JEV_SCORE_RECORD_PATH`
 in private `server.env` to a file in an existing private directory writable by
