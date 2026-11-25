@@ -111,6 +111,38 @@ defmodule AttentionServer.Store.ConversionPreflightTest do
     end
   end
 
+  test "admits retained data only within the measured source-format limits" do
+    {:ok, db} = Sqlite3.open(":memory:")
+    on_exit(fn -> Sqlite3.close(db) end)
+
+    :ok = Sqlite3.execute(db, """
+    CREATE TABLE relay_state (id INTEGER PRIMARY KEY, payload BLOB);
+    CREATE TABLE relay_large_data_refs (id INTEGER PRIMARY KEY);
+    WITH RECURSIVE ids(id) AS (
+      VALUES (1)
+      UNION ALL
+      SELECT id + 1 FROM ids WHERE id < 43
+    ) INSERT INTO relay_large_data_refs SELECT id FROM ids;
+    """)
+
+    budget = %{memory: 4 * 1024 ** 3, disk: 4 * 1024 ** 3, uploads: 33_624_064}
+
+    for format <- [29, 30] do
+      put_snapshot_header(db, format)
+      assert {:ok, %{format: ^format}} = ConversionPreflight.check(db, budget, format)
+
+      assert {:error, :fit_not_established} =
+               ConversionPreflight.check(db, %{budget | uploads: budget.uploads + 1}, format)
+
+      :ok = Sqlite3.execute(db, "INSERT INTO relay_large_data_refs VALUES (44)")
+      assert {:error, :fit_not_established} = ConversionPreflight.check(db, budget, format)
+      :ok = Sqlite3.execute(db, "DELETE FROM relay_large_data_refs WHERE id = 44")
+    end
+
+    put_snapshot_header(db, 27)
+    assert {:error, :fit_not_established} = ConversionPreflight.check(db, budget, 27)
+  end
+
   test "skips a store that already has a FORMAT31 row anchor" do
     payload = :erlang.term_to_binary({:attention_relay_keyed_state, 31, {:fixture, 27}})
 
@@ -124,6 +156,18 @@ defmodule AttentionServer.Store.ConversionPreflightTest do
           <<131, 80, 100_000_000::32, 0, 0, 0>>
         ] do
       assert {:error, :fit_not_established} = ConversionPreflight.snapshot_format(payload)
+    end
+  end
+
+  defp put_snapshot_header(db, format) do
+    payload = :erlang.term_to_binary({:attention_relay_state, format, %{}})
+    {:ok, stmt} = Sqlite3.prepare(db, "INSERT OR REPLACE INTO relay_state VALUES (1, ?)")
+
+    try do
+      :ok = Sqlite3.bind(stmt, [{:blob, payload}])
+      :done = Sqlite3.step(db, stmt)
+    after
+      :ok = Sqlite3.release(db, stmt)
     end
   end
 end
