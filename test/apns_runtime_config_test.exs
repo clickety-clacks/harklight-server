@@ -99,15 +99,15 @@ defmodule AttentionServer.APNSRuntimeConfigTest do
       assert %{algorithm: "jev-set", basis: "fallback"} = state.priority_views[existing]
       assert %{algorithm: "jev-set", basis: "fallback"} = state.priority_views[new]
 
-      assert {:ok, %{algorithm_id: "baseline"}} =
+      assert {:error, :algorithm_managed_by_server} =
                Relay.hosted_set_algorithm(relay, existing, "baseline")
 
       Supervisor.stop(server)
 
-      server = start_server(opts)
+      server = start_server(Keyword.delete(opts, :jev_model))
       relay = Server.relay(server)
       assert %{algorithm: "baseline"} = :sys.get_state(relay).priority_views[existing]
-      assert %{algorithm: "jev-set"} = :sys.get_state(relay).priority_views[new]
+      assert %{algorithm: "baseline"} = :sys.get_state(relay).priority_views[new]
     end)
   end
 

@@ -2861,7 +2861,7 @@ defmodule AttentionServer.Relay do
     JevClient.connection_ready?(endpoint, model)
   end
 
-  defp priority_default(state, person) do
+  defp priority_choice(%{deployment_mode: :saas} = state, person) do
     if match?({endpoint, _model} when is_binary(endpoint), state.hosted_jev_connection) and
          Engine.hosted_account(state.store.engine, person) do
       "jev-set"
@@ -2870,9 +2870,7 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  defp priority_choice(state, person) do
-    Placement.choice(state.store.engine, person, priority_default(state, person))
-  end
+  defp priority_choice(state, person), do: Placement.choice(state.store.engine, person)
 
   defp initialize_priority_views(state) do
     Enum.reduce(Map.keys(state.store.engine.persons), state, fn person, current ->
@@ -3620,31 +3618,7 @@ defmodule AttentionServer.Relay do
         {:ok, ensure_priority_view(state, person)}
 
       true ->
-        case Engine.set_algorithm_choice(
-               engine,
-               person,
-               algorithm,
-               priority_default(state, person)
-             ) do
-          {:ok, ^engine} ->
-            {:ok, state}
-
-          {:ok, changed} ->
-            case commit(state.store, changed, %{
-                   person: person,
-                   actor: "hosted_component",
-                   action: "hosted_algorithm"
-                 }) do
-              {:ok, store} -> {:ok, priority_settings_changed(%{state | store: store}, person)}
-              {:error, _, _} -> {:error, :storage_unavailable, state}
-            end
-
-          {:error, :not_found} ->
-            {:error, :not_hosted, state}
-
-          {:error, reason} ->
-            {:error, reason, state}
-        end
+        {:error, :algorithm_managed_by_server, state}
     end
   end
 

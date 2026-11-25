@@ -441,8 +441,8 @@ or the recipient's setting is `"all"`.
   mark when present, otherwise compare `Rank.score` with the settings levels
   when present. If neither field is present, draw no mark.
 
-  A Hosted Server with a configured Jev connection defaults to model-assisted
-  order for each account. The Server computes scores asynchronously and can
+  A Hosted Server with a configured Jev connection uses model-assisted order
+  for each account. The Server computes scores asynchronously and can
   use baseline order while waiting or when no usable scores are available.
   Clients continue to order by `rank.key` as it changes.
 

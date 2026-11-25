@@ -117,8 +117,8 @@ defmodule AttentionServer.Placement do
 
   defp group_key(_), do: nil
 
-  def choice(%Engine{} = engine, person, default \\ "baseline"),
-    do: Map.get(engine.algorithm_choices, person, default)
+  def choice(%Engine{} = engine, person),
+    do: Map.get(engine.algorithm_choices, person, "baseline")
 
   def items(%Engine{} = engine, person) do
     engine.messages
