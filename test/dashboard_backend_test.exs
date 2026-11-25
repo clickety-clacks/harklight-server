@@ -555,7 +555,7 @@ defmodule AttentionServer.DashboardBackendTest do
     assert cli_review.resp_body =~ "CLI workstation"
     assert cli_review.resp_body =~ "Approve this exact device"
     assert cli_review.resp_body =~ ~s(name="senders")
-    assert cli_review.resp_body =~ "app:tightbeam/codex"
+    assert cli_review.resp_body =~ ~s(placeholder="app:agent/")
     assert cli_review.resp_body =~ "comma-separated"
 
     sender = "app:tightbeam/codex"
