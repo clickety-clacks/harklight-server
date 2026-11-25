@@ -1,6 +1,6 @@
 # Harklight Server self-hosted installation
 
-Version: **0.2.20**. Package target: **Linux x86_64, glibc 2.39 or newer**, with OpenSSL 3 shared libraries and libstdc++6 (built on Ubuntu 24.04). The package bundles
+Version: **0.2.21**. Package target: **Linux x86_64, glibc 2.39 or newer**, with OpenSSL 3 shared libraries and libstdc++6 (built on Ubuntu 24.04). The package bundles
 Erlang/OTP and Elixir bytecode; users need no Mix, Hex, source checkout or
 Erlang installation. It needs Bash, OpenSSL CLI, tar and the platform libraries
 listed in BUILD_INFO. This is a single-process self-hosted server cut.
@@ -25,9 +25,9 @@ the request; a valid current-revision answer commits a payload-free
 
 ## Download and verify
 
-After publication, download the v0.2.20 release from
-clickety-clacks/harklight-server, tag v0.2.20. Get
-harklight-server-0.2.20-linux-x86_64.tar.gz, SHA256SUMS and SELF_HOST.md from
+After publication, download the v0.2.21 release from
+clickety-clacks/harklight-server, tag v0.2.21. Get
+harklight-server-0.2.21-linux-x86_64.tar.gz, SHA256SUMS and SELF_HOST.md from
 that release. Run sha256sum -c SHA256SUMS and extract into an operator-owned
 versioned directory. BUILD_INFO identifies the source commit, build host,
 toolchain, source status and native dependencies.
@@ -40,7 +40,7 @@ runtime/dependency notices remain in their shipped distribution files.
 Choose the DNS hostname clients will validate. For a same-machine preview,
 localhost works. Install into a directory you own and run:
 
-    PACKAGE="$PWD/harklight-server-0.2.20-linux-x86_64"
+    PACKAGE="$PWD/harklight-server-0.2.21-linux-x86_64"
     STATE="$HOME/.local/share/harklight-server"
     "$PACKAGE/bin/harklight-bootstrap" "$STATE" localhost
     cat "$STATE/person-id"
@@ -405,7 +405,7 @@ origin-wide; the CLI selects pending output for that handle locally. Read does
 not acknowledge an event, enable listening or promise future delivery. Follow
 the shared core for matching the request and reporting an outcome.
 The enrolled-device `read` and `respond` commands remain available for messages
-already stored by the server. They do not create new messages or retrieve an
+already stored by the server. They do not create new messages or retrieve a
 handoff receipt. Existing messages and their replay events remain in server
 history.
 
