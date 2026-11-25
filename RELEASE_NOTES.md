@@ -1,3 +1,28 @@
+# Harklight Server v0.2.17
+
+A self-hosted Server can now deliver iPhone notifications without its own Apple
+push keys, through the free Harklight push relay. To turn it on, uncomment
+`ATTENTION_SERVER_PUSH_RELAY_URL` in `server.env` (or add the line on an
+existing installation) and restart the Server. The relay service opens
+separately from this release; until it is available, leave the line commented.
+SELF_HOST.md lists exactly what the relay receives and logs: never message
+text, titles or sender names. A relayed alert reads "New message in Harklight"
+and tapping it opens the Inbox. Apple keys, when configured, still take
+precedence and keep full notification content.
+
+## Upgrade and recovery
+
+From v0.2.16 this release changes no store format: the store stays FORMAT30.
+From FORMAT29 state, first start upgrades the store to FORMAT30 as in v0.2.16.
+Take a complete private backup before starting the new release. To return to
+v0.2.16, stop the new Server and start v0.2.16 against the same state; to
+return to a FORMAT29 release, restore the backup taken under that release.
+
+**Compatibility.** Harklight Server 0.2.17 uses protocol 0.2. With the relay
+configured, `PUT /v2/devices/me/push` succeeds without Apple keys. Harklight
+Agent 0.2.6 is the matching release. Harklight app 0.2.0 and Harklight Web
+0.2.5 are the client baseline.
+
 # Harklight Server v0.2.16
 
 Requests, chat replies, and messages marked High or Urgent alert the phone
