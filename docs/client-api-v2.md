@@ -486,7 +486,7 @@ Every write that succeeds answers `200`, or `201` for `POST /v2/files`, with a
 | `PUT /v2/settings/priority-levels` | `{"levels": [PriorityLevel]}` with `If-Match` |
 | `PUT /v2/devices/me/push` | `{"token": string, "environment": "production" \| "sandbox", "revision": int}` |
 | `DELETE /v2/devices/me/push` | none |
-| `PUT /v2/devices/me/focus` | `{"screen": "inbox" \| "fyi" \| "message" \| "chat" \| "settings" \| "signed_out" \| "not_in_front", "item_id"?: OpaqueId, "visible_entry_id"?: OpaqueId, "ttl_s": int 1..3600}` (§5.1) |
+| `PUT /v2/devices/me/focus` | `{"screen": "inbox" \| "fyi" \| "message" \| "chat" \| "settings" \| "signed_out" \| "not_in_front", "item_id"?: OpaqueId, "visible_entry_id"?: OpaqueId, "device_name"?: string, "ttl_s": int 1..3600}` (§5.1) |
 | `POST /v2/files` | Raw bytes with `Content-Type`, `Content-Length` and `Content-Disposition: attachment; filename*=UTF-8''<percent-encoded name>` |
 
 ```json
@@ -642,12 +642,13 @@ Every write that succeeds answers `200`, or `201` for `POST /v2/files`, with a
   `GET /v2/settings` for the current binding. A key from a legacy compact
   push receipt returns `409 idempotency_conflict` because the receipt has
   no original response. The current binding is unchanged.
-- **`/v2/devices/me/*`** paths answer `403` to a browser principal.
+- **`/v2/devices/me/*`** paths other than the Focus report answer `403` to a browser principal.
 
 ## 5.1 Focus and held shows
 
-Focus reports and shows are device-only. Any enrolled device can read its
-account's focus and send a show to a viewer device on that account.
+Enrolled devices and signed-in browsers can report focus. Enrolled devices
+can read their account's focus and send a Show to an enrolled viewer on that
+account.
 
 - **`PUT /v2/devices/me/focus`** takes today's report fields:
   - `screen`: `inbox`, `fyi`, `message`, `chat`, `settings`, `signed_out` or
@@ -655,7 +656,14 @@ account's focus and send a show to a viewer device on that account.
   - `item_id`: required for `message` and `chat`, absent for other screens;
   - `visible_entry_id`: optional for `chat`, absent for other screens;
   - `ttl_s`: an integer from 1 to 3600. Clients send 120 and refresh every
-    60 s while in front.
+    60 s while in front;
+  - `device_name`: required for browser reports except `signed_out`. Use a
+    non-blank display name of at most 128 UTF-8 bytes. Device reports omit it.
+
+  Each browser sign-in session has one focus reporter. Multiple tabs on the
+  same sign-in update that reporter. Its opaque focus ID is stable for the
+  session. Signing out, an ended session or a lapse of the report removes it.
+  Browser viewers do not receive Shows. A browser focus write returns `rev`.
 
   Report screen changes and send `not_in_front` on backgrounding. Debounce
   changes within a screen by one second and renew within `ttl_s` while in
@@ -1127,6 +1135,7 @@ agents with existing data. Clients apply newer versions of each resource.
       "properties": {
         "device_id": { "$ref": "#/$defs/OpaqueId" },
         "device_name": { "type": "string" },
+        "kind": { "const": "browser", "description": "Present for a signed-in browser focus reporter." },
         "screen": { "type": "string", "description": "Screen name, including inbox, fyi, message, chat, settings, signed_out and not_in_front." },
         "reported_at_ms": { "$ref": "#/$defs/TimeMs" },
         "in_front": { "type": "boolean" },
@@ -1167,7 +1176,9 @@ agents with existing data. Clients apply newer versions of each resource.
   projection maps `client_id` to `device_id`, `reported_at` to
   `reported_at_ms`, `sender_id` plus `message_id` to `item_id`, and
   `visible_event_id` to `visible_entry_id`. Clients should ignore screen
-  values they do not recognize.
+  values they do not recognize. Browser records carry `kind: "browser"`,
+  a session-scoped opaque `device_id`, and the browser's reported name.
+  The browser ID cannot be used as a Show target.
 
 ### 9.2 Writes
 
@@ -1925,7 +1936,7 @@ The delivery owner's rulings on this draft are applied above:
    - time-driven moves (due dates, bounce) are `item` events at the moment they
      take effect.
 4. **Push** is APNs only. `stale_push_binding` answers `412`, and browsers get
-   `403` on `/v2/devices/me/*`.
+   `403` on `/v2/devices/me/*` apart from the Focus report.
 5. **`forbidden`** is a 403 and is not retryable.
 6. **`closing`** has no `id:` line, never appears in a JSON batch and never
    moves the cursor.

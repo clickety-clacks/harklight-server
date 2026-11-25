@@ -1075,6 +1075,28 @@ defmodule AttentionServer.ClientAPIListenerTest do
     refute Map.has_key?(json(settings)["settings"]["push"], "binding_id")
   end
 
+  test "the web origin accepts a signed-in browser focus report until sign-out", ctx do
+    ctx = Map.merge(ctx, web_origin(ctx, client_api_routes: [ClientAPI.Writes]))
+    assert {:ok, conn} = browser_connect(ctx, :http2)
+    headers = [{"cookie", cookie(ctx.cookie)}, {"origin", ctx.origin}]
+    report = JSON.encode!(%{"screen" => "fyi", "device_name" => "Web, Safari", "ttl_s" => 120})
+    route = "/v2/devices/me/focus"
+
+    assert {:ok, conn, %{status: 200} = response} = request(conn, "PUT", route, headers, report)
+    assert %{"rev" => _} = json(response)
+    refute Map.has_key?(json(response), "show")
+
+    {:ok, key} = DeviceIdentity.from_certificate(TLSFixtures.certificate_der!(ctx.certs, "a2"))
+    who = %{kind: :device, key: key, person: ctx.person}
+    focus = AttentionServer.AgentAPI.Focus
+    assert {:ok, %{"clients" => [%{"kind" => "browser", "screen" => "fyi"}]}} =
+             focus.get(ctx.relay, who)
+
+    assert :ok = DashboardBrowserSession.end_session(ctx.sessions, ctx.cookie)
+    assert {:ok, %{"clients" => []}} = focus.get(ctx.relay, who)
+    assert {:ok, _, %{status: 401}} = request(conn, "PUT", route, headers, report)
+  end
+
   test "the web origin serves /v2 over HTTP/2 and HTTP/1.1 with no flag option", ctx do
     ctx = Map.merge(ctx, web_origin(ctx, []))
     headers = [{"cookie", cookie(ctx.cookie)}]

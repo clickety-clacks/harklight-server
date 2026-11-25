@@ -38,7 +38,7 @@ defmodule AttentionServer.AgentAPI.Focus do
   defp project(engine, person, client) do
     base =
       client
-      |> Map.take(~w(device_name screen in_front connected))
+      |> Map.take(~w(device_name screen in_front connected kind))
       |> Map.put("device_id", client["client_id"])
       |> Map.put("reported_at_ms", client["reported_at"])
 

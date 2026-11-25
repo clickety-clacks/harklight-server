@@ -2000,11 +2000,10 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  # Signing a browser out closes its v2 feeds. No Relay state is keyed by the
-  # browser session; stored v2 browser actor state is discarded at startup.
+  # Signing a browser out closes its v2 feeds and ends its focus report.
   defp dispatch_call({:end_browser_session, browser_session_id}, _from, state) do
     AttentionServer.ChangeLog.notify_closing([{{:browser_session, browser_session_id}, :revoked}])
-    {:reply, :ok, state}
+    {:reply, :ok, end_focus(state, {:browser, browser_session_id})}
   end
 
   # Each frame is released under current authority. A released write belongs
@@ -4169,38 +4168,50 @@ defmodule AttentionServer.Relay do
 
   defp focus_list(engine, focus_clients, person) do
     focus_clients
-    |> Enum.filter(fn {key, focus} ->
-      case Map.get(engine.devices, key) do
-        %{person: ^person, revoked: false} ->
-          focus.connected
+    |> Enum.flat_map(fn {key, focus} ->
+      with true <- focus.connected,
+           {id, label, kind} <- focus_client_identity(engine, person, key, focus) do
+        client =
+          %{
+            "client_id" => id,
+            "device_name" => label,
+            "screen" => focus.screen,
+            "reported_at" => focus.reported_at,
+            "in_front" => focus.screen in ["inbox", "fyi", "message", "chat", "settings"],
+            "connected" => true
+          }
+          |> maybe_focus_field(focus, :sender_id, "sender_id")
+          |> maybe_focus_field(focus, :message_id, "message_id")
+          |> maybe_focus_field(focus, :visible_event_id, "visible_event_id")
 
-        _ ->
-          false
+        [if(kind == :browser, do: Map.put(client, "kind", "browser"), else: client)]
+      else
+        _ -> []
       end
     end)
-    |> Enum.map(fn {key, focus} ->
-      device = Map.fetch!(engine.devices, key)
-
-      label =
-        case Map.get(device, :label) do
-          value when is_binary(value) and value != "" -> value
-          _ -> "Device " <> String.slice(key, 0, 8)
-        end
-
-      %{
-        "client_id" => key,
-        "device_name" => label,
-        "screen" => focus.screen,
-        "reported_at" => focus.reported_at,
-        "in_front" =>
-          focus.connected and focus.screen in ["inbox", "fyi", "message", "chat", "settings"],
-        "connected" => focus.connected
-      }
-      |> maybe_focus_field(focus, :sender_id, "sender_id")
-      |> maybe_focus_field(focus, :message_id, "message_id")
-      |> maybe_focus_field(focus, :visible_event_id, "visible_event_id")
-    end)
     |> Enum.sort_by(fn client -> {-client["reported_at"], client["client_id"]} end)
+  end
+
+  defp focus_client_identity(engine, person, {:browser, session_id}, %{
+         browser: %{owner: owner, revision: revision, name: label},
+         person: person
+       }) do
+    if Engine.owner_revision(engine, person, owner) == {:ok, revision} do
+      id = "browser-" <> Base.url_encode64(:crypto.hash(:sha256, session_id), padding: false)
+      {id, label, :browser}
+    end
+  end
+
+  defp focus_client_identity(engine, person, key, _focus) do
+    case Map.get(engine.devices, key) do
+      %{person: ^person, revoked: false} = device ->
+        label = Map.get(device, :label)
+        label = if is_binary(label) and label != "", do: label, else: "Device " <> String.slice(key, 0, 8)
+        {key, label, :device}
+
+      _ ->
+        nil
+    end
   end
 
   defp maybe_focus_field(client, focus, source, target) do
@@ -4231,9 +4242,11 @@ defmodule AttentionServer.Relay do
     state
   end
 
-  defp end_focus(state, device_key) do
-    person = person_for_device(state.store.engine, device_key)
-    next = delete_focus_client(state, device_key)
+  defp end_focus(state, key) do
+    existing = Map.get(state.focus_clients, key, %{})
+    person = existing[:person]
+    AttentionServer.ClientAPI.Focus.cancel_lapse(existing[:client_api_token])
+    next = delete_focus_client(state, key)
     if person, do: notify_focus_change(state, next, person), else: next
   end
 
@@ -4362,9 +4375,8 @@ defmodule AttentionServer.Relay do
   # takes the device's held show; a lapse of its ttl, or signed_out, ends
   # focus as today's disconnect does.
   # Returns {held_show | nil, state}.
-  def client_api_focus(state, {:report, key, reported, token}) do
+  def client_api_focus(state, {:report, key, person, browser, reported, token}) do
     now = state.clock.()
-    person = person_for_device(state.store.engine, key)
     existing = Map.get(state.focus_clients, key)
     changed = is_nil(existing) or focus_fields(existing) != reported
 
@@ -4378,7 +4390,7 @@ defmodule AttentionServer.Relay do
     focus =
       reported
       |> Map.new(fn {name, value} -> {String.to_existing_atom(name), value} end)
-      |> Map.merge(%{reported_at: reported_at, person: person, connected: true})
+      |> Map.merge(%{reported_at: reported_at, person: person, connected: true, browser: browser})
       |> Map.put(:client_api_token, token)
 
     next = put_focus_client(state, key, focus)
@@ -4446,7 +4458,7 @@ defmodule AttentionServer.Relay do
         {{:error, {:not_found, "message_id"}}, state}
 
       true ->
-        clients = focus_list(state, person)
+        clients = Enum.reject(focus_list(state, person), &(&1["kind"] == "browser"))
 
         target =
           cond do
