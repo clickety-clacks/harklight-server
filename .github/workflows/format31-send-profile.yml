@@ -1,8 +1,8 @@
-name: FORMAT31 settled 50,000-message startup and interaction
+name: FORMAT31 ordinary-send phase profile
 
 on:
   push:
-    branches: [server/format31-large-latency]
+    branches: [server/format31-send-profile]
 
 permissions:
   contents: read
@@ -17,7 +17,6 @@ jobs:
         runtime: [prior, candidate]
         fixture:
           - { name: C, shape: '50000 500000 1300 0 400' }
-          - { name: L, shape: '50000 900000 1300 0 400' }
     env:
       ATTENTION_SERVER_ENABLE: '0'
       MIX_ENV: prod
@@ -46,7 +45,7 @@ jobs:
         run: |
           results="$RUNNER_TEMP/measurements"
           mkdir -p "$results" "$RUNNER_TEMP/prior"
-          git rev-parse HEAD HEAD^ > "$results/commits.txt"
+          git rev-parse HEAD HEAD^^ > "$results/commits.txt"
           awk '/^(MemTotal|MemAvailable):/' /proc/meminfo > "$results/capacity.txt"
           reference="$(git log -1 --format=%ct HEAD^)"
           probe="$GITHUB_WORKSPACE/scripts/format31-rehearsal.exs"
@@ -81,9 +80,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: format31-settled-seed-${{ matrix.fixture.name }}-${{ matrix.runtime }}
+          name: format31-profile-seed-${{ matrix.fixture.name }}-${{ matrix.runtime }}
           path: ${{ runner.temp }}/measurements/
-      - name: Measure through a drained startup and three ordinary sends
+      - name: Profile one ordinary send after startup drains
         env:
           RUNTIME: ${{ matrix.runtime }}
         run: |
@@ -104,5 +103,5 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: format31-settled-${{ matrix.fixture.name }}-${{ matrix.runtime }}
+          name: format31-profile-${{ matrix.fixture.name }}-${{ matrix.runtime }}
           path: ${{ runner.temp }}/measurements/

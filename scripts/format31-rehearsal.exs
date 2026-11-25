@@ -184,7 +184,7 @@ defmodule Format31Rehearsal do
     {inbox_us, {:ok, _}} = :timer.tc(fn -> Reads.inbox(relay, @reader, %{"limit" => "50"}) end)
     {replied_us, :ok} = :timer.tc(fn -> first_reply(relay, %{"limit" => "50"}) end)
     report(:view_latency_us, %{inbox: inbox_us, first_replied_page: replied_us})
-    measure_sends(relay)
+    profile_send(relay)
     :ok = GenServer.stop(relay, :normal, 60_000)
   end
 
@@ -335,9 +335,70 @@ defmodule Format31Rehearsal do
     {next, result}
   end
 
+  defp profile_send(relay) do
+    modules = [
+      {Relay, [handle_call: 3, rank_client_items: 2, store_client_ranks: 2, commit: 3]},
+      {AgentWrites, [handle_call: 3, apply_operation: 11, apply_frame: 7]},
+      {Store, [commit: 4, commit_keyed: 5, keyed_validation: 3, keyed_change_log: 4, append_change_logs: 3]},
+      {AttentionServer.ChangeLog, [commit_log: 3, commit_log_touched: 4, put_ranks: 4, write_ranks: 5]},
+      {AttentionServer.ClientAPI.Resources, [ranks: 4, rank_keys: 2]},
+      {AttentionServer.Store.KeyedValidation, [untouched_change: 3, sequences: 3]},
+      {AttentionServer.Store.KeyedReference, [prepare: 4]},
+      {AttentionServer.Store.RecordTable, [commit: 4]},
+      {AttentionServer.Store.DerivedIndex, [changes: 3, write: 2]},
+      {AttentionServer.Store.Persistence, [run: 1]}
+    ]
+
+    functions =
+      for {module, entries} <- modules, Code.ensure_loaded?(module), {name, arity} <- entries,
+          do: {module, name, arity}
+
+    for mfa <- functions, do: :erlang.trace_pattern(mfa, true, [:call_time])
+
+    :erlang.trace(relay, true, [:call, :set_on_spawn])
+    sampler = spawn_link(fn -> sample_send_stack(relay, %{}) end)
+    measure_sends(relay)
+    :erlang.trace(relay, false, [:all])
+    send(sampler, {:finish, self()})
+
+    receive do
+      {:send_stacks, counts} ->
+        for {stack, samples} <- Enum.sort_by(counts, fn {_, n} -> -n end) do
+          report(:send_stack, %{frames: stack, samples: samples})
+        end
+    after
+      5_000 -> raise "send stack sampler stalled"
+    end
+
+    for mfa <- functions, {:call_time, counters} <- [:erlang.trace_info(mfa, :call_time)],
+        is_list(counters), counters != [] do
+      {calls, time} =
+        Enum.reduce(counters, {0, 0}, fn {_pid, count, seconds, micros}, {calls, time} ->
+          {calls + count, time + seconds * 1_000_000 + micros}
+        end)
+
+      report(:send_phase, %{function: mfa, calls: calls, call_time_us: time})
+    end
+  end
+
+  defp sample_send_stack(relay, counts) do
+    receive do
+      {:finish, caller} -> send(caller, {:send_stacks, counts})
+    after
+      1000 ->
+        {:current_stacktrace, frames} = Process.info(relay, :current_stacktrace)
+        stack =
+          Enum.take(frames, 7)
+          |> Enum.map(fn {module, name, args, _} ->
+            {module, name, if(is_list(args), do: length(args), else: args)}
+          end)
+        sample_send_stack(relay, Map.update(counts, stack, 1, &(&1 + 1)))
+    end
+  end
+
   defp measure_sends(relay) do
     times =
-      for i <- 1..3 do
+      for i <- 1..1 do
         op = uuid(9_000_000 + i)
         principal = %{kind: :device, person: @person, key: @origin}
         body = %{
@@ -358,7 +419,7 @@ defmodule Format31Rehearsal do
 
         micros
       end
-    report(:ordinary_send_median_us, Enum.sort(times) |> Enum.at(1))
+    true = length(times) == 1
 
   end
 
