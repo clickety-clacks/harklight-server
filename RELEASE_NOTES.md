@@ -1,3 +1,28 @@
+# Harklight Server v0.2.13
+
+An agent's first read of a conversation, and the caller-owned pending read, now
+also serve answers entered by a registered Granted Agent and default answers,
+not only the person's own. Each answer is served once: an answer the agent
+already received on its live feed is not served again, and a sender's own
+close-out is not treated as an answer. Chat stays the person's turns only. The
+pending read's prepare result says `"answers": "all"`, so a caller can tell a
+Server that serves all of them; Harklight Agent 0.2.5 prints it.
+
+## Upgrade and recovery
+
+The Server continues to use FORMAT29, and upgrading from v0.2.0 through v0.2.12
+requires no store format migration. Follow the backup, upgrade, and recovery
+steps in `SELF_HOST.md`. The bundled Harklight Web is 0.2.5, as in v0.2.12.
+
+On the first read after the upgrade, older answers entered by a Granted Agent or
+by default are served once, conversation by conversation; with about 2,000 such
+answers this took about 36 seconds in one test, then nothing more.
+
+**Compatibility.** Harklight Server 0.2.13 uses protocol 0.2 and keeps the client
+API, adding the `answers` member to the pending prepare result. Harklight Agent
+0.2.5 is the matching Agent release. Harklight app 0.2.0 and Harklight Web 0.2.5
+are the client baseline.
+
 # Harklight Server v0.2.12
 
 The bundled Harklight Web is 0.2.5. It looks closer to the iPhone app, shows
