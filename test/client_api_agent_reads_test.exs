@@ -874,7 +874,7 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
   end
 
   @tag :agent_focus
-  test "focus requires see permission and lists only eligible account devices", ctx do
+  test "focus lists only eligible devices on the enrolled account", ctx do
     id = forward(ctx, "a1", 1, @first_session)
     report = %{"screen" => "message", "item_id" => id, "ttl_s" => 120}
     assert request(ctx, "a2", "PUT", "/v2/devices/me/focus", report, 2).status == 200
@@ -889,12 +889,6 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
            ).status == 200
 
     route = "/v2/agent/focus"
-    assert_error(get(ctx, "a1", route), 403, "forbidden")
-
-    :sys.replace_state(ctx.relay, fn state ->
-      put_in(state.store.engine.devices[ctx.keys["a1"]].see_focus, true)
-    end)
-
     key = ctx.keys["a2"]
     snapshot = contract(ctx, "AgentFocus", get(ctx, "a1", route))
 
@@ -923,10 +917,6 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
     id = forward(ctx, "a1", 1, @first_session)
     report = %{"screen" => "message", "item_id" => id, "ttl_s" => 120}
     assert request(ctx, "a2", "PUT", "/v2/devices/me/focus", report, 2).status == 200
-
-    :sys.replace_state(ctx.relay, fn state ->
-      put_in(state.store.engine.devices[ctx.keys["a1"]].see_focus, true)
-    end)
 
     on_exit(fn -> Application.delete_env(:attention_server, :client_api_projection_fault) end)
 

@@ -25,7 +25,6 @@ defmodule AttentionServer.FocusRelayTest do
 
     owner_certificate = TLSFixtures.certificate_der!(certs, "a1")
     {:ok, person} = Relay.operator_bootstrap(relay, owner_certificate)
-    {:ok, owner_key} = DeviceIdentity.from_certificate(owner_certificate)
 
     tablet = String.duplicate("c", 64)
     agent = String.duplicate("e", 64)
@@ -35,9 +34,6 @@ defmodule AttentionServer.FocusRelayTest do
     :ok = Relay.setup_device(relay, person, tablet)
     :ok = Relay.setup_device(relay, person, agent)
     :ok = Relay.setup_sender(relay, phone, "app:test")
-
-    :ok = Relay.save_dashboard_focus_permission(relay, person, owner_key, agent, :see, true)
-    :ok = Relay.save_dashboard_focus_permission(relay, person, owner_key, agent, :push, true)
 
     assert {:ok, message_line} =
              Relay.request_line(
@@ -187,8 +183,6 @@ defmodule AttentionServer.FocusRelayTest do
     agent = String.duplicate("f", 64)
     :ok = Relay.setup_device(relay, person, agent)
     :ok = Relay.setup_sender(relay, client, "app:test")
-    :ok = Relay.save_dashboard_focus_permission(relay, person, owner_key, agent, :see, true)
-    :ok = Relay.save_dashboard_focus_permission(relay, person, owner_key, agent, :push, true)
 
     assert {:ok, message_line} =
              Relay.request_line(

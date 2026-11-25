@@ -22,7 +22,7 @@ defmodule AttentionServer.ClientAPI.Focus do
   computes the show's age (round 11 r4 §4).
   """
 
-  alias AttentionServer.ClientAPI.{Projection, Reads, Resources, Writes}
+  alias AttentionServer.ClientAPI.{Projection, Reads, Writes}
 
   @registry AttentionServer.ChangeLog.Registry
 
@@ -78,7 +78,7 @@ defmodule AttentionServer.ClientAPI.Focus do
           with %{client_api_token: _} <- Map.get(state.focus_clients, key),
                %{} = held <- Map.get(state.held_shows, key) do
             Projection.capture(fn ->
-              show(engine, key, held, state.clock.())
+              show(key, held, state.clock.())
             end)
           else
             _ -> nil
@@ -91,25 +91,19 @@ defmodule AttentionServer.ClientAPI.Focus do
     {:reply, data, state}
   end
 
-  @doc "The wire form of a held show for `device_key`, or nil if its item is gone."
-  def show(engine, device_key, %{"accepted_at" => accepted_at} = held, now) do
-    with %{person: person} <- Map.get(engine.devices, device_key),
-         {:ok, item_id} <-
-           Resources.item_id(engine, {person, held["sender_id"], held["message_id"]}) do
-      Projection.run({:item, item_id}, fn ->
-        Projection.probe({:show_projection, item_id})
+  @doc "The wire form of an accepted show, even if its item has been removed."
+  def show(device_key, %{"accepted_at" => accepted_at, "item_id" => item_id} = held, now) do
+    Projection.run({:item, item_id}, fn ->
+      Projection.probe({:show_projection, item_id})
 
-        %{
-          "show_id" => Map.fetch!(held, "show_id"),
-          "device_id" => device_key,
-          "item_id" => item_id,
-          "target" => held["target"],
-          "held_ms" => max(now - accepted_at, 0)
-        }
-      end)
-    else
-      _ -> nil
-    end
+      %{
+        "show_id" => Map.fetch!(held, "show_id"),
+        "device_id" => device_key,
+        "item_id" => item_id,
+        "target" => held["target"],
+        "held_ms" => max(now - accepted_at, 0)
+      }
+    end)
   end
 
   @doc false

@@ -491,10 +491,6 @@ defmodule AttentionServer.ClientAPI.FeedStream do
       :focus_forbidden ->
         watching(%{w | focus_pending: false})
 
-      :agent_focus_granted ->
-        if w.opened, do: w.source.focus_granted(w.ctx)
-        watching(w)
-
       {:feed_focus_woken, ^feed} ->
         if w.focus_pending do
           send(feed, {:feed_focus, self()})

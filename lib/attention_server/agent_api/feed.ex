@@ -88,10 +88,10 @@ defmodule AttentionServer.AgentAPI.FeedStep do
 
   def opened(ctx) do
     FeedActivity.observe(ctx, :open)
-    focus_granted(ctx)
+    attach_focus(ctx)
   end
 
-  def focus_granted(%{relay: relay, principal: %{key: key}}) do
+  defp attach_focus(%{relay: relay, principal: %{key: key}}) do
     case Relay.focus_stream_attach(relay, key, self()) do
       {:ok, data} -> send(self(), {:focus_change, data})
       _ -> :ok

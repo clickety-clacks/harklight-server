@@ -59,14 +59,6 @@ defmodule AttentionServer.ClientAPIFocusTest do
                }
              })
 
-    # The agent may see focus and push views, as an owner's switches allow.
-    :sys.replace_state(relay, fn state ->
-      engine = state.store.engine
-      device = %{engine.devices[@agent] | see_focus: true, push_view: true}
-      devices = Map.put(engine.devices, @agent, device)
-      %{state | store: %{state.store | engine: %{engine | devices: devices}}}
-    end)
-
     relay
   end
 
@@ -87,7 +79,7 @@ defmodule AttentionServer.ClientAPIFocusTest do
   # POST /v2/agent/show for the item, run in-process for the trusted agent key.
   # The request waits for a subscribed feed writer, so run it in a task when
   # the test process is subscribed.
-  defp show(relay, item, target) do
+  defp show(relay, item, target, status \\ 200) do
     key =
       "00000000-0000-4000-8000-" <>
         String.pad_leading("#{System.unique_integer([:positive])}", 12, "0")
@@ -107,9 +99,57 @@ defmodule AttentionServer.ClientAPIFocusTest do
     }
 
     conn = AgentShow.show(conn, ctx)
-    assert conn.status == 200
+    assert conn.status == status
     assert {:ok, body} = JSON.decode_line(conn.resp_body <> "\n")
     body
+  end
+
+  test "the FYI list is foreground focus without item references", ctx do
+    relay = relay(ctx)
+    assert {:ok, 200, _, false} =
+             Writes.focus(relay, "reader", %{"screen" => "inbox", "ttl_s" => 120})
+
+    at(ctx, 2_000)
+    report = %{"screen" => "fyi", "ttl_s" => 120}
+    assert {:ok, 200, _, false} = Writes.focus(relay, "reader", report)
+
+    assert [%{"screen" => "fyi", "in_front" => true, "reported_at" => 2_000} = focus] =
+             clients(relay)
+    refute Map.has_key?(focus, "message_id")
+
+    assert {:error, "invalid_field", "item_id", false} =
+             Writes.focus(relay, "reader", Map.put(report, "item_id", item_id(relay)))
+
+    assert {:error, "invalid_field", "visible_entry_id", false} =
+             Writes.focus(relay, "reader", Map.put(report, "visible_entry_id", "e1"))
+  end
+
+  test "an accepted show carries its original item id after the item is removed", ctx do
+    relay = relay(ctx)
+    item = item_id(relay)
+    report = %{"screen" => "inbox", "ttl_s" => 120}
+    assert {:ok, 200, _, false} = Writes.focus(relay, "reader", report)
+    assert %{"show_id" => id, "state" => "held"} = show(relay, item, "message")
+
+    :sys.replace_state(relay, fn state ->
+      update_in(state.store.engine.messages, &Map.delete(&1, {"A", "app:test", "one"}))
+    end)
+
+    assert {:error, :not_found} = Reads.item(relay, "reader", item)
+    assert %{"show_id" => ^id, "item_id" => ^item} =
+             Focus.pending_show(relay, %{kind: :device, key: "reader", person: "A"})
+
+    assert {:ok, 200, %{"show" => envelope}, false} = Writes.focus(relay, "reader", report)
+    assert envelope == %{
+      "device_id" => "reader",
+      "show_id" => id,
+      "item_id" => item,
+      "target" => "message",
+      "held_ms" => 0
+    }
+    assert {:ok, 200, %{"rev" => _} = response, false} = Writes.focus(relay, "reader", report)
+    refute Map.has_key?(response, "show")
+    assert %{"error" => "not_found"} = show(relay, item, "message", 404)
   end
 
   test "a focus write is today's focus report, in today's identifiers", ctx do
