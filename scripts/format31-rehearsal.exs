@@ -181,13 +181,7 @@ defmodule Format31Rehearsal do
 
   def run(["measure", dir]) do
     synthetic!(dir)
-    key_path = Path.join(dir, "synthetic-jev")
-    File.write!(key_path, "synthetic-rehearsal-offline")
-    System.put_env("ATTENTION_SERVER_JEV_KEY_PATH", key_path)
-    evaluator = fn request -> {:ok, Map.new(request.candidates, &{&1, 0.9})} end
-
-    {micros, {:ok, relay}} =
-      :timer.tc(fn -> Relay.start_link(store_path: path(dir), name: @relay, priority_evaluator: evaluator) end)
+    {micros, {:ok, relay}} = :timer.tc(fn -> start_relay(dir) end)
 
     report(:startup_return, %{elapsed_us: micros, memory: memory()})
     Process.sleep(30_000)
@@ -201,6 +195,136 @@ defmodule Format31Rehearsal do
     report(:view_latency_us, %{inbox: inbox_us, first_replied_page: replied_us})
     measure_sends(relay)
     :ok = GenServer.stop(relay, :normal, 60_000)
+  end
+
+  def run(["writes", dir]) do
+    synthetic!(dir)
+    {:ok, relay} = start_relay(dir)
+    target = 9_800_000
+    id = "item-#{target}"
+    frame = forward(target, 1300)
+    {:ok, db} = persisted_connection(relay)
+    attach_write_counters(db)
+    wal = path(dir) <> "-wal"
+
+    sample_commit(relay, db, wal, :send, fn -> invoke(relay, @origin, frame) end)
+
+    %{"event_id" => entry} = invoke(relay, @reader, %{
+      "type" => "discussion", "op_id" => uuid(target + 1), "sender_id" => @sender,
+      "message_id" => id, "request_revision" => 1, "text" => "Please confirm the follow-up."
+    })
+
+    sample_commit(relay, db, wal, :reply, fn ->
+      invoke(relay, @origin, %{
+        "type" => "conversation_reply", "op_id" => uuid(target + 2), "sender_id" => @sender,
+        "message_id" => id, "request_revision" => 1, "in_reply_to" => String.to_integer(entry),
+        "text" => "I checked the follow-up and confirmed the result."
+      })
+    end)
+
+    sample_commit(relay, db, wal, :revision, fn ->
+      invoke(relay, @origin, %{
+        "type" => "conversation_revise", "op_id" => uuid(target + 3), "sender_id" => @sender,
+        "message_id" => id, "base_revision" => 1,
+        "message" => Map.put(frame["message"], "title", "Revised synthetic follow-up")
+      })
+    end)
+
+    :ok = GenServer.stop(relay, :normal, 60_000)
+  end
+
+  defp start_relay(dir) do
+    key_path = Path.join(dir, "synthetic-jev")
+    File.write!(key_path, "synthetic-rehearsal-offline")
+    System.put_env("ATTENTION_SERVER_JEV_KEY_PATH", key_path)
+    evaluator = fn request -> {:ok, Map.new(request.candidates, &{&1, 0.9})} end
+    Relay.start_link(store_path: path(dir), name: @relay, priority_evaluator: evaluator)
+  end
+
+  defp invoke(relay, actor, frame) do
+    {:ok, response} = Relay.request_line(relay, actor, JSON.encode_line(Map.put_new(frame, "v", 1)))
+    {:ok, %{"type" => "ok"} = result} = JSON.decode_line(response)
+    result
+  end
+
+  defp persisted_connection(relay) do
+    observer = self()
+    try do
+      :sys.replace_state(relay, fn state ->
+        send(observer, {:connection, state.store.db})
+        throw(:connection_read)
+      end, 120_000)
+    catch
+      :error, {:callback_failed, _, {:throw, :connection_read}} -> :ok
+    end
+
+    receive do
+      {:connection, db} -> {:ok, db}
+    after
+      5_000 -> raise "missing fixture connection"
+    end
+  end
+
+  defp attach_write_counters(db) do
+    :ok = Sqlite3.execute(db, "CREATE TEMP TABLE rehearsal_writes (name TEXT NOT NULL)")
+
+    for table <- ~w(relay_records relay_items relay_entries relay_feed relay_advisories
+                    relay_sessions relay_authority relay_upload_refs relay_audit
+                    relay_large_data_refs client_changes client_resource_revs agent_changes),
+        action <- ~w(INSERT UPDATE DELETE) do
+      name = table <> "." <> String.downcase(action)
+      :ok = Sqlite3.execute(db, """
+      CREATE TEMP TRIGGER rehearsal_#{table}_#{action} AFTER #{action} ON main.#{table}
+      BEGIN INSERT INTO rehearsal_writes VALUES ('#{name}'); END
+      """)
+    end
+  end
+
+  defp sample_commit(relay, db, wal, operation, invoke) do
+    await_quiet_startup(relay, System.monotonic_time(:millisecond) + 600_000)
+    [[0, _, _]] = query(db, "PRAGMA wal_checkpoint(TRUNCATE)")
+    :ok = Sqlite3.execute(db, "DELETE FROM rehearsal_writes")
+    event = [:harklight, :store, :commit, :committed]
+    observer = self()
+    handler = {__MODULE__, make_ref()}
+
+    :ok = :telemetry.attach(handler, event, fn _, _, _, _ ->
+      counts = query(db, "SELECT name, count(*) FROM rehearsal_writes GROUP BY name")
+      send(observer, {handler, counts, File.stat!(wal).size})
+    end, nil)
+
+    rss_before = memory()["VmRSS"]
+    sampler = spawn_link(fn -> sample_rss(observer, rss_before) end)
+
+    try do
+      {elapsed, _} = :timer.tc(invoke)
+      send(sampler, :finish)
+
+      receive do
+        {^handler, counts, wal_bytes} ->
+          receive do
+            {:rss_peak, peak} ->
+              report(:write_amplification, %{operation: operation, elapsed_us: elapsed,
+                row_writes: Map.new(counts, fn [name, count] -> {name, count} end),
+                wal_bytes: wal_bytes, rss_before_bytes: rss_before, rss_sampled_peak_bytes: peak})
+          after
+            5_000 -> raise "missing sampled RSS for #{operation}"
+          end
+      after
+        5_000 -> raise "missing commit sample for #{operation}"
+      end
+    after
+      :telemetry.detach(handler)
+    end
+  end
+
+  defp sample_rss(parent, peak) do
+    peak = max(peak, memory()["VmRSS"])
+    receive do
+      :finish -> send(parent, {:rss_peak, peak})
+    after
+      10 -> sample_rss(parent, peak)
+    end
   end
 
   defp await_quiet_startup(relay, deadline) do
