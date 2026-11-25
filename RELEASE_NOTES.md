@@ -1,3 +1,24 @@
+# Harklight Server v0.2.18
+
+The Server uses much less memory while saving. It used to keep a compressed
+copy of every message's saved form in memory, about 13 KB per message; it now
+keeps only the parts it can reuse, about 1 KB per message. In tests with 2,000
+messages, peak memory during a run of writes fell from about 1.7 GB to under
+300 MB, and those writes finished much sooner. Saved data is unchanged.
+
+## Upgrade and recovery
+
+From v0.2.16 or v0.2.17 this release changes no store format: the store stays
+FORMAT30. From FORMAT29 state, first start upgrades the store to FORMAT30 as in
+v0.2.16. Take a complete private backup before starting the new release. To
+return to v0.2.16 or v0.2.17, stop the new Server and start that release
+against the same state; to return to a FORMAT29 release, restore the backup
+taken under that release.
+
+**Compatibility.** Harklight Server 0.2.18 uses protocol 0.2 with no API
+change. Harklight Agent 0.2.6 is the matching release. Harklight app 0.2.0 and
+Harklight Web 0.2.5 are the client baseline.
+
 # Harklight Server v0.2.17
 
 A self-hosted Server can now deliver iPhone notifications without its own Apple
