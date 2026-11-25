@@ -125,7 +125,7 @@ defmodule AttentionServer.Store.ConversionPreflightTest do
     ) INSERT INTO relay_large_data_refs SELECT id FROM ids;
     """)
 
-    budget = %{memory: 4 * 1024 ** 3, disk: 4 * 1024 ** 3, uploads: 33_624_064}
+    budget = %{memory: 4 * 1024 * 1024 * 1024, disk: 4 * 1024 * 1024 * 1024, uploads: 33_624_064}
 
     for format <- [29, 30] do
       put_snapshot_header(db, format)

@@ -21,10 +21,15 @@ defmodule AttentionServer.Store.ConversionPreflight do
     references: 0,
     uploads: 4096
   }
+
+  # FORMAT29 and FORMAT30 were also rehearsed with 43 references to 16
+  # retained files. Use the higher peak from that shape for both admission
+  # bounds. SQL counts can reject an unmeasured shape, not lower its bound.
+  @retained_shape_a Map.merge(@shape_a, %{references: 43, uploads: 33_624_064})
   @envelopes %{
     27 => Map.merge(@shape_a, %{expanded_bytes: 123_901_800, memory_per_byte: 17}),
-    29 => Map.merge(@shape_a, %{expanded_bytes: 123_901_822, memory_per_byte: 17}),
-    30 => Map.merge(@shape_a, %{expanded_bytes: 123_901_842, memory_per_byte: 20})
+    29 => Map.merge(@retained_shape_a, %{expanded_bytes: 123_901_822, memory_per_byte: 27}),
+    30 => Map.merge(@retained_shape_a, %{expanded_bytes: 123_901_842, memory_per_byte: 23})
   }
 
   def check(db, budget, expected_format, envelopes \\ @envelopes) do
