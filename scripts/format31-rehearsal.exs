@@ -162,6 +162,46 @@ defmodule Format31Rehearsal do
     :ok = Sqlite3.close(db)
   end
 
+  def run(["calibrate-stopped", dir]) do
+    synthetic!(dir)
+    database = path(dir)
+    parent = self()
+    sampler = spawn_link(fn -> sample_wal(database <> "-wal", parent, 0) end)
+    before = File.stat!(database).size
+    began = System.monotonic_time(:millisecond)
+    events =
+      for phase <- ~w(preflight_passed snapshot_loaded records_written indexes_written records_verified anchor_written committed)a do
+        [:harklight, :store, :conversion, phase]
+      end
+
+    :ok = :telemetry.attach_many({__MODULE__, :calibrate}, events, fn name, _, _, _ ->
+      report(:phase, %{name: List.last(name), elapsed_ms: System.monotonic_time(:millisecond) - began,
+        memory: memory()})
+    end, nil)
+
+    {elapsed, {:ok, :converted}} = :timer.tc(fn -> Store.calibrate_stopped(database) end)
+    send(sampler, :finish)
+    peak_wal = receive do {:wal_peak, bytes} -> bytes after 5_000 -> raise "missing WAL sample" end
+    report(:conversion, %{elapsed_us: elapsed, file_before_bytes: before,
+      wal_peak_bytes: peak_wal, memory: memory(), file_after_bytes: File.stat!(database).size})
+
+    {:ok, db} = Sqlite3.open(database, mode: :readonly)
+    for table <- ~w(relay_records relay_items relay_entries relay_feed relay_advisories relay_sessions
+                    relay_authority relay_upload_refs relay_large_data_refs client_resource_revs agent_changes) do
+      [[count]] = query(db, "SELECT count(*) FROM " <> table)
+      report(:rows, %{table: table, count: count})
+    end
+    :ok = Sqlite3.close(db)
+  end
+
+  def run(["index-plans"]) do
+    alias AttentionServer.Store.{DerivedIndex, RecordTable}
+    {:ok, db} = Sqlite3.open(":memory:")
+    :ok = RecordTable.create(db, 0)
+    :ok = DerivedIndex.create(db, 0)
+    :ok = Sqlite3.close(db)
+  end
+
   def run(["measure", dir]) do
     synthetic!(dir)
     key_path = Path.join(dir, "synthetic-jev")

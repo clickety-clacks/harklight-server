@@ -124,14 +124,15 @@ defmodule AttentionServer.Store.DerivedIndex do
 
   def create(db, generation) do
     with :ok <- Sqlite3.execute(db, @schema),
-         :ok <- seed_items(db),
-         :ok <- seed_records(db),
+         :ok <- timed(:seed_items, fn -> seed_items(db) end),
+         :ok <- timed(:seed_records, fn -> seed_records(db) end),
          :ok <-
-           Sqlite3.execute(
+           traced_sql(
              db,
+             :folds,
              "UPDATE relay_entries AS fact SET folds_into = #{@fold_target} WHERE fold_event_id IS NOT NULL"
            ),
-         :ok <- Sqlite3.execute(db, "UPDATE relay_items AS item SET #{@item_summary}"),
+         :ok <- traced_sql(db, :summaries, "UPDATE relay_items AS item SET #{@item_summary}"),
          :ok <- seed_liveness(db) do
       RecordTable.run(db, "INSERT INTO relay_index_state VALUES (1, ?, ?, ?)", [
         @index_version,
@@ -139,6 +140,19 @@ defmodule AttentionServer.Store.DerivedIndex do
         generation
       ])
     end
+  end
+
+  defp timed(phase, run) do
+    IO.puts("derive_begin #{phase}")
+    {micros, result} = :timer.tc(run)
+    IO.puts("derive_end #{phase} #{micros}")
+    result
+  end
+
+  defp traced_sql(db, phase, sql) do
+    {:ok, plan} = RecordTable.select(db, "EXPLAIN QUERY PLAN " <> sql)
+    IO.puts("derive_plan #{phase} #{inspect(plan, width: :infinity)}")
+    timed(phase, fn -> Sqlite3.execute(db, sql) end)
   end
 
   def ensure(db, generation) do
@@ -247,7 +261,8 @@ defmodule AttentionServer.Store.DerivedIndex do
     item_position = &stored_item_position(db, &1)
 
     RecordTable.scan(db, fn rows ->
-      each(rows, fn row ->
+      each(Stream.with_index(rows, 1), fn {row, number} ->
+        if rem(number, 100_000) == 0, do: IO.puts("derive_rows #{number}")
         with {:ok, address, value} <- RecordCodec.decode_row(row),
              :ok <- seed_primary(db, address, value, lookup, item_position) do
           each(links(address, value), &insert(db, &1))
@@ -453,7 +468,7 @@ defmodule AttentionServer.Store.DerivedIndex do
   end
 
   defp seed_liveness(db) do
-    Sqlite3.execute(db, """
+    traced_sql(db, :liveness, """
     WITH RECURSIVE live(person, seq) AS (
       SELECT person, seq FROM relay_items WHERE #{@base_live}
       UNION
