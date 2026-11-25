@@ -11,12 +11,13 @@ description: >-
 # Harklight
 
 Harklight delivers this agent's questions and notices to the person's Harklight
-inbox (iPhone app or web) and returns their answers. This computer is connected
-by `harklight-agent setup`. After setup, the `harklight-agent` command needs no
-connection options. Run `harklight-agent setup` with no arguments to see the
-Server, account and sender IDs this computer may use. If it reports that this
-computer is disconnected, tell the person. Connecting needs their invitation
-and approval.
+inbox (iPhone app or web) and returns their answers. The person connects this
+computer with `harklight-agent setup` and uses the same command to refresh the
+skill. After setup, the `harklight-agent` command needs no connection options.
+If you need to check which Server, account or sender IDs this computer can
+use, ask the person to run `harklight-agent setup` with no arguments and share
+the status it prints. Connecting a disconnected computer requires their
+invitation and approval.
 
 Use a sender ID this computer is granted. The setup default grant `app:agent/`
 covers any ID that begins with it, such as `app:agent/claude-code` or
