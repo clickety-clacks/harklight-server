@@ -300,7 +300,12 @@ rollback_failed_upgrade() {
   fi
 
   if ((switched)) && target_supports_auth; then
-    fail "upgrade failed: $cause; the auth-capable candidate may have served; its package and latest state remain selected and stopped, and the pre-install backup was retained"
+    # The selected state is now the base for repair forward. Retire the
+    # interrupted-conversion pointer without changing that state or its backup.
+    if ! mv -T -- "$pending_backup" "$backup_final/PRESERVED_STATE"; then
+      fail "upgrade failed: $cause; the candidate is stopped and its state and backup were retained, but repair-forward bookkeeping could not be saved"
+    fi
+    fail "upgrade failed: $cause; the auth-capable candidate may have served; its package and latest state remain selected and stopped, and the pre-install backup was retained; install a compatible newer release to repair forward"
   fi
 
   if ! restore_preinstall_root; then

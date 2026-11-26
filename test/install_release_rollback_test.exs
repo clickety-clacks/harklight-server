@@ -54,7 +54,7 @@ defmodule AttentionServer.InstallReleaseRollbackTest do
   end
 
   @tag timeout: 30_000
-  test "failed auth-capable readiness preserves the selected package and its writes", context do
+  test "a compatible repair release preserves writes after failed auth-capable readiness", context do
     {output, status} = run_installer("auth-start-failure", context)
 
     assert status == 0, output

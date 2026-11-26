@@ -159,6 +159,10 @@ case "$action" in
           exit 0
         fi
         ;;
+      */releases/v0.2.22)
+        [[ -f "$HARKLIGHT_TEST_ROOT/state/candidate-write.txt" ]]
+        printf 'start:v0.2.22\n' >> "$HARKLIGHT_TEST_ACTIONS"
+        ;;
       */releases/v0.2.20)
         actual="$(sha256sum "$HARKLIGHT_TEST_ROOT/state/relay.sqlite3" | cut -d ' ' -f 1)"
         [[ "$actual" == "$HARKLIGHT_TEST_EXPECTED_STORE_SHA" ]] || {
@@ -218,7 +222,7 @@ export REAL_READLINK="$real_readlink"
 : > "$HARKLIGHT_TEST_ACTIONS"
 
 invoke_installer() {
-  HARKLIGHT_RELEASE_TAG=v0.2.21 \
+  HARKLIGHT_RELEASE_TAG="${1:-v0.2.21}" \
   HARKLIGHT_SOURCE_COMMIT=0123456789abcdef0123456789abcdef01234567 \
   HARKLIGHT_ARCHIVE_SHA256="$archive_sha256" \
   HARKLIGHT_ARCHIVE_PATH="$archive" \
@@ -249,11 +253,56 @@ if [[ "$mode" == auth-start-failure ]]; then
   [[ "$output" == *'auth-capable candidate may have served'* ]]
   [[ "$(readlink "$root/current")" == releases/v0.2.21 ]]
   [[ "$(< "$scratch/service-state")" == inactive ]]
-  [[ -f "$root/state/candidate-write.txt" && -f "$root/backups/.pending-conversion" ]]
+  [[ -f "$root/state/candidate-write.txt" && ! -e "$root/backups/.pending-conversion" ]]
   grep -Fqx 'start:v0.2.21' "$HARKLIGHT_TEST_ACTIONS"
   ! grep -Fqx 'start:v0.2.20' "$HARKLIGHT_TEST_ACTIONS"
   [[ -x "$root/bin/harklight-check-store" && -x "$root/bin/start-server-unchecked" ]]
-  printf 'PASS: auth candidate readiness failure retained the selected package, writes and backup\n'
+
+  original_backups=("$root"/backups/*-v0.2.20-to-v0.2.21-*)
+  original_backup="${original_backups[0]}"
+  [[ ${#original_backups[@]} == 1 && -f "$original_backup/PRESERVED_STATE" ]]
+  backup_sha="$(sha256sum "$original_backup/private-root.tar" | cut -d ' ' -f 1)"
+
+  python3 - "$root/state/relay.sqlite3" <<'PYTHON'
+import sqlite3
+import sys
+
+with sqlite3.connect(sys.argv[1]) as db:
+    db.executescript("""
+      CREATE TABLE harklight_auth_schema (
+        id INTEGER PRIMARY KEY, minimum_generation INTEGER, device_certificates_disabled INTEGER
+      );
+      INSERT INTO harklight_auth_schema VALUES (1, 1, 0);
+      CREATE TABLE repair_fixture (write_value TEXT);
+      INSERT INTO repair_fixture VALUES ('candidate-era write');
+    """)
+PYTHON
+  candidate_store_sha="$(sha256sum "$root/state/relay.sqlite3" | cut -d ' ' -f 1)"
+
+  archive_stage="$scratch/archive-stage/harklight-server-0.2.22-linux-x86_64"
+  cp -a "$root/releases/v0.2.21" "$archive_stage"
+  rm "$archive_stage/INSTALL_INFO"
+  sed -i 's/^version=0.2.21$/version=0.2.22/' "$archive_stage/BUILD_INFO"
+  cp "$archive_stage/BUILD_INFO" "$package_root/BUILD_INFO"
+  cat > "$archive_stage/bin/harklight" <<'REPAIR_HARKLIGHT'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ $# == 5 && "$1" == store && "$2" == convert-stopped && "$4" == --from-release && "$5" == v0.2.21 ]]
+[[ "$(readlink "$HARKLIGHT_TEST_ROOT/current")" == releases/v0.2.21 ]]
+REPAIR_HARKLIGHT
+  archive="$scratch/harklight-server-0.2.22-linux-x86_64.tar.gz"
+  tar -czf "$archive" -C "$scratch/archive-stage" "$(basename "$archive_stage")"
+  archive_sha256="$(sha256sum "$archive" | cut -d ' ' -f 1)"
+  printf '%s  %s\n' "$archive_sha256" "$(basename "$archive")" > "$sums"
+
+  output="$(invoke_installer v0.2.22)" || { printf '%s\n' "$output" >&2; exit 1; }
+  [[ "$(readlink "$root/current")" == releases/v0.2.22 ]]
+  [[ "$(< "$scratch/service-state")" == active ]]
+  [[ -f "$root/state/candidate-write.txt" && ! -e "$root/backups/.pending-conversion" ]]
+  [[ "$(sha256sum "$root/state/relay.sqlite3" | cut -d ' ' -f 1)" == "$candidate_store_sha" ]]
+  [[ "$(sha256sum "$original_backup/private-root.tar" | cut -d ' ' -f 1)" == "$backup_sha" ]]
+  ! grep -Fqx 'start:v0.2.20' "$HARKLIGHT_TEST_ACTIONS"
+  printf 'PASS: compatible repair release preserved candidate writes and the original backup\n'
 elif [[ "$mode" != optional-route ]]; then
   [[ "$status" == 1 ]] || { printf 'expected installer exit 1, got %s\n%s\n' "$status" "$output" >&2; exit 1; }
   if [[ "$mode" == conversion-failure ]]; then
