@@ -246,7 +246,8 @@ defmodule AttentionServer.Store do
   sidecars, and no normal startup or migration work runs.
   """
   def read_stopped_engine(path) when is_binary(path) do
-    dir = Path.join(System.tmp_dir!(), "harklight-preview-" <> Base.url_encode64(:crypto.strong_rand_bytes(16), padding: false))
+    suffix = Base.url_encode64(:crypto.strong_rand_bytes(16), padding: false)
+    dir = Path.join(System.tmp_dir!(), "harklight-preview-" <> suffix)
 
     with :ok <- File.mkdir(dir) do
       try do

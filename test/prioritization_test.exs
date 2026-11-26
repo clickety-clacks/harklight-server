@@ -361,6 +361,9 @@ defmodule AttentionServer.PrioritizationTest do
 
     assert File.read!(path) == original
     assert Enum.sort(File.ls!(Path.dirname(path))) == files
+    File.write!(path <> "-wal", "uncheckpointed")
+    assert Store.read_stopped_engine(path) == {:error, :store_not_checkpointed}
+    File.rm!(path <> "-wal")
 
     due = accepted + 259_200_000
     opts = [clock: fn -> due end]

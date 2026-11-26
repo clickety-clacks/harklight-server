@@ -77,8 +77,10 @@ defmodule AttentionServer.CLI.Operator do
   defp bounce_preview(path) do
     with {:ok, cutoff} <- BouncePolicy.cutoff(),
          {:ok, engine} <- Store.read_stopped_engine(path) do
-      {_ignored, _keys, counts} = BounceDecision.startup(engine, System.system_time(:millisecond), cutoff)
-      AttentionServer.CLI.shell().info(JSON.encode!(Map.take(counts, [:full, :soft])))
+      {_ignored, _keys, counts} =
+        BounceDecision.startup(engine, System.system_time(:millisecond), cutoff)
+
+      AttentionServer.CLI.shell().info(JSON.encode!(%{"full" => counts.full, "soft" => counts.soft}))
     else
       {:error, :invalid_bounce_cutoff} ->
         AttentionServer.CLI.error!("ATTENTION_SERVER_BOUNCE_NOT_BEFORE must be an RFC 3339 UTC timestamp")

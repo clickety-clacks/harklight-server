@@ -125,6 +125,9 @@ defmodule AttentionServer.Store.KeyedBounceValidationTest do
       assert reopened.engine.route_b_index.unresolved_count_by_person[@person] == 1
       assert AttentionServer.RouteBIndex.push_badge(reopened.engine.route_b_index, @person) == 1
       :ok = Store.close(reopened)
+
+      assert {:ok, preview_engine} = Store.read_stopped_engine(path)
+      assert preview_engine.advisory_feeds == store.engine.advisory_feeds
     end
 
     test "a due revision in a supported session bounces directly", %{store: store} do
