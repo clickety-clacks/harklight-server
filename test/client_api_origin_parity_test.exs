@@ -124,6 +124,17 @@ defmodule AttentionServer.ClientAPIOriginParityTest do
     sent = send_message(ctx, @origin, 102)
     assert sent.status == 200
     assert decode(sent)["message"]["recipient_reach"] == "none"
+
+    id = item_id(sent)
+    retract_path = "/v2/agent/messages/" <> id <> "/retract"
+    retracted = request(ctx, @origin, "POST", retract_path, %{}, 103)
+    assert item_id(retracted) == id
+    refute Map.has_key?(decode(retracted)["message"], "recipient_reach")
+
+    replayed_retract = request(ctx, @origin, "POST", retract_path, %{}, 103)
+    assert item_id(replayed_retract) == id
+    assert {"idempotent-replayed", "true"} in replayed_retract.headers
+    refute Map.has_key?(decode(replayed_retract)["message"], "recipient_reach")
   end
 
   test "an attached upload is readable within its account and not_found to another person",
