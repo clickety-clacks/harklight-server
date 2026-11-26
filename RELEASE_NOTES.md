@@ -1,3 +1,25 @@
+# Harklight Server v0.2.31
+
+Bundles Harklight Web 0.2.7 (source 500550aa, archive SHA-256
+45ea669f38c88bd37fa55503ad669ca64c3c3fbd33d465dd55b26f138992fba7). Web 0.2.7
+can show shared messages addressed to several named people, but only on a
+Server that advertises the feature. This release doesn't advertise it, so the
+shared-message screens stay inactive. Web 0.2.7 also changes how it pages while
+catching up after a reset: it finishes the catch-up before loading more.
+
+## Upgrade and recovery
+
+FORMAT31, as in v0.2.26 through v0.2.30: an existing FORMAT30 store is
+converted once with the Server stopped; a FORMAT29 or older store must first be
+upgraded through v0.2.16 to v0.2.20. Once a hosted notice has been written,
+earlier FORMAT31 builds can't open the store. To go back, restore the complete
+pre-upgrade backup and run the release that wrote it; this discards every
+write made since the backup.
+
+**Compatibility.** Harklight Server 0.2.31 speaks only the 0.2 protocol, with
+no API change. Install it together with an iPhone app build that reads
+`receipt_expected`. Harklight Agent 0.2.6 through 0.2.8 work with it.
+
 # Harklight Server v0.2.30
 
 Hosted servers can send a person a Harklight message from the system itself,
