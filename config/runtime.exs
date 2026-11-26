@@ -157,7 +157,13 @@ if System.get_env("ATTENTION_SERVER_ENABLE") == "1" do
     jev_model: System.get_env("ATTENTION_SERVER_JEV_MODEL"),
     jev_score_record_path: System.get_env("ATTENTION_SERVER_JEV_SCORE_RECORD_PATH"),
     feature_flags_path: System.get_env("ATTENTION_SERVER_FEATURE_FLAGS_PATH"),
-    upload_cap: upload_cap
+    upload_cap: upload_cap,
+    sign_in_s1: System.get_env("ATTENTION_SERVER_SIGN_IN_S1") == "1",
+    native_passkeys: System.get_env("ATTENTION_SERVER_NATIVE_PASSKEYS") == "1",
+    auth_migration_devices:
+      System.get_env("ATTENTION_SERVER_AUTH_MIGRATION_DEVICES", "")
+      |> String.split(",", trim: true)
+      |> Enum.map(&String.trim/1)
   ]
 
   server_opts =
