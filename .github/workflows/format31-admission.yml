@@ -1,0 +1,131 @@
+name: FORMAT31 exact-head packaged admission at 50,000 messages
+
+on:
+  push:
+    branches: [server/format31-final-admission]
+
+permissions:
+  contents: read
+
+jobs:
+  conversion:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - fixture: C
+            shape: '50000 500000 1300 0 400'
+          - fixture: L
+            shape: '50000 900000 1300 0 400'
+    env:
+      ATTENTION_SERVER_ENABLE: '0'
+      MIX_ENV: prod
+      ERL_FLAGS: '+S 2:2 +SDcpu 1 +SDio 1'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: '27.3.3'
+          elixir-version: '1.19.5'
+          version-type: strict
+      - run: mix deps.get --only prod
+      - run: mix compile
+      - name: Write the synthetic fixture with the published prior package
+        env:
+          SHAPE: ${{ matrix.shape }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/measurements" "$RUNNER_TEMP/prior"
+          results="$RUNNER_TEMP/measurements"
+          git rev-parse HEAD HEAD^ >"$results/commits.txt"
+          awk '/^(MemTotal|MemAvailable):/' /proc/meminfo >"$results/capacity.txt"
+          df -Pk "$RUNNER_TEMP" | awk 'NR == 2 { print "disk_free_kib", $4 }' >>"$results/capacity.txt"
+          probe="$GITHUB_WORKSPACE/scripts/format31-rehearsal.exs"
+          echo "HARKLIGHT_PROBE=$probe" >>"$GITHUB_ENV"
+          archive=harklight-server-0.2.18-linux-x86_64.tar.gz
+          (
+            cd "$RUNNER_TEMP/prior"
+            release=https://github.com/clickety-clacks/harklight-server/releases/download/v0.2.18
+            curl --fail --silent --show-error --location --retry 3 --remote-name "$release/$archive"
+            curl --fail --silent --show-error --location --retry 3 --remote-name "$release/SHA256SUMS"
+            sha256sum --check --ignore-missing SHA256SUMS
+            tar -zxf "$archive"
+          ) >"$results/prior-package.log" 2>&1
+          prior="$RUNNER_TEMP/prior/harklight-server-0.2.18-linux-x86_64/bin/attention_server"
+          export HARKLIGHT_SHAPE="$SHAPE" HARKLIGHT_FIXTURE="$RUNNER_TEMP/seed" HARKLIGHT_PROBE="$probe"
+          run_prior() {
+            sudo systemd-run --quiet --wait --pipe --collect \
+              --property=MemoryMax=14G --property=MemorySwapMax=0 --uid="$(id -u)" \
+              --working-directory="$GITHUB_WORKSPACE" \
+              /usr/bin/env "ATTENTION_SERVER_ENABLE=0" "ERL_FLAGS=$ERL_FLAGS" \
+              "HARKLIGHT_FIXTURE=$HARKLIGHT_FIXTURE" "HARKLIGHT_PROBE=$HARKLIGHT_PROBE" \
+              "HARKLIGHT_SHAPE=$HARKLIGHT_SHAPE" timeout 30m "$prior" eval "$1"
+          }
+          run_prior 'System.argv(["seed", System.fetch_env!("HARKLIGHT_FIXTURE") | String.split(System.fetch_env!("HARKLIGHT_SHAPE"))]); Code.require_file(System.fetch_env!("HARKLIGHT_PROBE"))' \
+            >"$results/seed.log" 2>&1
+      - name: Check the packaged budget on the same synthetic source at 2 GiB and 14 GiB
+        run: |
+          results="$RUNNER_TEMP/measurements"
+          fixture="$RUNNER_TEMP/seed"
+          store="$fixture/relay.sqlite3"
+          export HARKLIGHT_REHEARSAL_DB="$store"
+          timeout 3m mix run --no-compile "$HARKLIGHT_PROBE" inspect "$fixture" > "$results/snapshot.log" 2>&1
+          mix run --no-compile -e '
+            {:ok, db} = Exqlite.Sqlite3.open(System.fetch_env!("HARKLIGHT_REHEARSAL_DB"), mode: :readonly)
+            for table <- ~w(client_resource_revs agent_changes relay_large_data_refs) do
+              {:ok, [[count]]} = AttentionServer.Store.RecordTable.select(db, "SELECT count(*) FROM " <> table)
+              IO.puts("#{table} #{count}")
+            end
+            :ok = Exqlite.Sqlite3.close(db)
+          ' > "$results/source-counts.log" 2>&1
+          if [[ -d "$store.uploads" ]]; then
+            du -sk "$store.uploads" | awk '{print "upload_kib", $1}' >> "$results/source-counts.log"
+          else
+            echo "upload_kib 0" >> "$results/source-counts.log"
+          fi
+          tar -cf "$RUNNER_TEMP/backup.tar" -C "$fixture" .
+          stat --printf='backup_bytes %s\n' "$RUNNER_TEMP/backup.tar" >> "$results/snapshot.log"
+
+          candidate="$RUNNER_TEMP/candidate"
+          mix release attention_server --path "$candidate" > "$results/candidate-build.log" 2>&1
+          install -m 755 scripts/harklight "$candidate/bin/harklight"
+
+          run_capped() {
+            local memory_limit="$1"
+            shift
+            sudo systemd-run --quiet --wait --pipe --collect \
+              --property=MemoryMax="$memory_limit" --property=MemorySwapMax=0 --property=PrivateNetwork=yes \
+              --uid="$(id -u)" --working-directory="$GITHUB_WORKSPACE" \
+              /usr/bin/env "ERL_FLAGS=$ERL_FLAGS" ATTENTION_SERVER_ENABLE=0 \
+              /usr/bin/time -f 'elapsed_s=%e maximum_rss_kib=%M' timeout --kill-after=30s 18m \
+              "$candidate/bin/harklight" store convert-stopped "$@" --from-release v0.2.18
+          }
+
+          original="$(sha256sum "$store" | cut -d ' ' -f 1)"
+          if run_capped 2G "$store" > "$results/refused.log" 2>&1; then
+            echo "Unexpected 2 GiB conversion."
+            exit 1
+          fi
+          grep -F 'fit not established' "$results/refused.log"
+          test "$(sha256sum "$store" | cut -d ' ' -f 1)" = "$original"
+          echo "pass: source SHA-256 unchanged" >> "$results/refused.log"
+
+          mkdir -p "$RUNNER_TEMP/offhost"
+          tar -xf "$RUNNER_TEMP/backup.tar" -C "$RUNNER_TEMP/offhost"
+          transferred="$RUNNER_TEMP/offhost/relay.sqlite3"
+          test "$(sha256sum "$transferred" | cut -d ' ' -f 1)" = "$original"
+
+          run_capped 14G "$transferred" > "$results/converted.log" 2>&1
+          grep -F 'Converted stopped Harklight store to FORMAT31' "$results/converted.log"
+          run_capped 14G "$transferred" > "$results/retry.log" 2>&1
+          grep -F 'already uses FORMAT31' "$results/retry.log"
+          stat --printf='final_database_bytes %s\n' "$transferred" >> "$results/converted.log"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: format31-packaged-admission-${{ matrix.fixture }}
+          path: ${{ runner.temp }}/measurements/
