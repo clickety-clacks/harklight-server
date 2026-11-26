@@ -1813,6 +1813,8 @@ defmodule AttentionServer.Store do
     :source_report_grants,
     :enrollment_read_grants,
     :messages,
+    :shared_messages,
+    :shared_recipients,
     :free_order_highs,
     :conversation_highs,
     :chat_read_positions,
@@ -1904,6 +1906,12 @@ defmodule AttentionServer.Store do
     do:
       valid_item?(engine, key, record) and
         valid_arrival?(record, Map.get(engine.free_order_highs, person, 0))
+
+  defp valid_keyed_row?(engine, :shared_messages, key, record),
+    do: AttentionServer.SharedMessages.valid_message?(engine, key, record)
+
+  defp valid_keyed_row?(engine, :shared_recipients, key, record),
+    do: AttentionServer.SharedMessages.valid_recipient?(engine, key, record)
 
   defp valid_keyed_row?(engine, :free_order_highs, person, high),
     do: valid_order_high?(engine, person, high)
@@ -2718,6 +2726,12 @@ defmodule AttentionServer.Store do
         end) and
         Enum.all?(engine.local_organizations, fn {key, members} ->
           Engine.valid_local_organization?(engine, key, members)
+        end) and
+        Enum.all?(engine.shared_messages, fn {key, record} ->
+          AttentionServer.SharedMessages.valid_message?(engine, key, record)
+        end) and
+        Enum.all?(engine.shared_recipients, fn {key, record} ->
+          AttentionServer.SharedMessages.valid_recipient?(engine, key, record)
         end) and
         valid_delivery_states?(engine) and
         valid_prioritization?(engine) and

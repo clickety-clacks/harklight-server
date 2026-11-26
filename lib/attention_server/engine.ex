@@ -54,6 +54,8 @@ defmodule AttentionServer.Engine do
             agents: %{},
             sender_grants: %{},
             messages: %{},
+            shared_messages: %{},
+            shared_recipients: %{},
             open_default_index: %{},
             events: %{},
             free_order_highs: %{},
