@@ -224,7 +224,7 @@ defmodule AttentionServer.NativeSignInTest do
     assert signed_in.resp_cookies["__Host-harklight"].http_only
     assert DashboardReadHTTP.call(browser_request, dashboard).status == 401
 
-    request = late_request(relay, dashboard, dir, person, owner, device, der)
+    {request, bearer} = late_request(relay, dashboard, dir, person, owner, device, der)
     result = post("/v2/auth/sign-in", request) |> Router.call(router)
     assert result.status == 200
     assert %{"old_device" => "attached", "device_id" => ^device, "duplicate" => false} = json(result)
@@ -232,13 +232,31 @@ defmodule AttentionServer.NativeSignInTest do
     assert %{"old_device" => "attached", "device_id" => ^device, "duplicate" => true} = json(retry)
     assert {:error, :unauthorized} = Relay.certificate_device_person(relay, device)
 
-    :ok = Relay.revoke_device(relay, device)
-    removed = late_request(relay, dashboard, dir, person, owner, device, der)
+    device_request =
+      Plug.Test.conn(:get, "/v2/me")
+      |> Plug.Conn.put_req_header("authorization", "Bearer " <> bearer)
+
+    assert Router.call(device_request, router).status == 200
+    cookie = signed_in.resp_cookies["__Host-harklight"].value
+
+    remove =
+      Plug.Test.conn(:post, "/devices/remove/" <> device, "confirm=remove")
+      |> Map.put(:scheme, :https)
+      |> Map.put(:port, 443)
+      |> Plug.Conn.put_req_header("content-type", "application/x-www-form-urlencoded")
+      |> Plug.Conn.put_req_header("origin", origin)
+      |> Plug.Conn.put_req_header("cookie", "__Host-harklight=" <> cookie)
+      |> DashboardReadHTTP.call(dashboard)
+
+    assert remove.status == 303
+    assert Router.call(device_request, router).status == 401
+
+    {removed, _bearer} = late_request(relay, dashboard, dir, person, owner, device, der)
     response = post("/v2/auth/sign-in", removed) |> Router.call(router)
     assert %{"old_device" => "removed", "device_id" => replacement} = json(response)
     refute replacement == device
 
-    unknown = late_request(relay, dashboard, dir, person, owner, device, der)
+    {unknown, _bearer} = late_request(relay, dashboard, dir, person, owner, device, der)
     unknown = put_in(unknown["old_proof"]["signature"], BrowserAuth.new_secret())
     response = post("/v2/auth/sign-in", unknown) |> Router.call(router)
     assert %{"old_device" => "unknown", "device_id" => fresh} = json(response)
@@ -259,9 +277,9 @@ defmodule AttentionServer.NativeSignInTest do
     {key, signature} = proof(dir, bytes)
     old = %{"device_id" => device, "public_key" => Base.url_encode64(der, padding: false),
             "signature" => sign(dir, bytes, "legacy")}
-    %{"transaction" => transaction, "verifier" => verifier, "public_key" => key,
-      "session_hash" => hash, "signature" => signature, "label" => "Test phone",
-      "old_proof" => old}
+    {%{"transaction" => transaction, "verifier" => verifier, "public_key" => key,
+       "session_hash" => hash, "signature" => signature, "label" => "Test phone",
+       "old_proof" => old}, bearer}
   end
 
   defp local_code_post(body) do
