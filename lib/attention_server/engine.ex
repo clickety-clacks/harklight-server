@@ -59,6 +59,7 @@ defmodule AttentionServer.Engine do
             shared_recipients: %{},
             shared_entries: %{},
             shared_seen: %{},
+            shared_answers: %{},
             open_default_index: %{},
             events: %{},
             free_order_highs: %{},

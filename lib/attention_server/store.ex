@@ -22,6 +22,7 @@ defmodule AttentionServer.Store do
     Engine,
     GuidedJoin,
     LargeData,
+    SharedAnswers,
     SharedMessages
   }
 
@@ -1829,6 +1830,7 @@ defmodule AttentionServer.Store do
     :shared_recipients,
     :shared_entries,
     :shared_seen,
+    :shared_answers,
     :free_order_highs,
     :conversation_highs,
     :chat_read_positions,
@@ -1935,6 +1937,9 @@ defmodule AttentionServer.Store do
 
   defp valid_keyed_row?(engine, :shared_seen, key, record),
     do: SharedMessages.valid_seen?(engine, key, record)
+
+  defp valid_keyed_row?(engine, :shared_answers, key, record),
+    do: SharedAnswers.valid?(engine, key, record)
 
   defp valid_keyed_row?(engine, :free_order_highs, person, high),
     do: valid_order_high?(engine, person, high)
@@ -2139,6 +2144,12 @@ defmodule AttentionServer.Store do
           do: inbox_log,
           else: AgentChangeLog.append_shared_entry(inbox_log, {record.sender_person, record.sender_key}, entry.id, session)
 
+      :answer ->
+        shared_answer_log(log, engine, record, chat.answer_id)
+
+      :shared_answer_receipt ->
+        AgentChangeLog.append_shared_answer(log, {record.sender_person, record.sender_key}, chat.answer_id, session)
+
       :seen ->
         log =
           Enum.reduce(SharedMessages.live_recipients(engine, id), log, fn person, acc ->
@@ -2158,7 +2169,31 @@ defmodule AttentionServer.Store do
     end
   end
 
+  defp shared_chat_log(log, engine, %{shared_default_answers: ids}) do
+    Enum.reduce(ids, log, fn id, acc ->
+      answer = Map.fetch!(engine.shared_answers, id)
+      shared_answer_log(acc, engine, Map.fetch!(engine.shared_messages, answer.shared_id), id)
+    end)
+  end
+
   defp shared_chat_log(log, _engine, _audit), do: log
+
+  defp shared_answer_log(log, engine, record, answer_id) do
+    log =
+      Enum.reduce(SharedMessages.live_recipients(engine, record.id), log, fn person, acc ->
+        AttentionServer.ChangeLog.append_shared_freeze(acc, person, record.id)
+      end)
+
+    if Map.has_key?(record, :sender_frozen_revision) do
+      log
+    else
+      scope = {record.sender_person, record.sender_key}
+      session = record["session"]
+      log
+      |> AgentChangeLog.append_shared_message(scope, record.id, session)
+      |> AgentChangeLog.append_shared_answer(scope, answer_id, session)
+    end
+  end
 
   defp write_shared_chat_receipt(store, engine, %{shared_chat: %{key: key} = chat})
        when is_binary(key) do
@@ -2887,6 +2922,9 @@ defmodule AttentionServer.Store do
         end) and
         Enum.all?(engine.shared_seen, fn {key, record} ->
           SharedMessages.valid_seen?(engine, key, record)
+        end) and
+        Enum.all?(engine.shared_answers, fn {key, record} ->
+          SharedAnswers.valid?(engine, key, record)
         end) and
         valid_delivery_states?(engine) and
         valid_prioritization?(engine) and

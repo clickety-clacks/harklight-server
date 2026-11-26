@@ -1,7 +1,7 @@
 defmodule AttentionServer.SharedMessagesTest do
   use ExUnit.Case, async: true
 
-  alias AttentionServer.{AgentChangeLog, Engine, SharedMessages, Store}
+  alias AttentionServer.{AgentChangeLog, Engine, SharedAnswers, SharedMessages, Store}
   alias AttentionServer.ClientAPI.Idempotency
   alias Exqlite.Sqlite3
 
@@ -110,6 +110,39 @@ defmodule AttentionServer.SharedMessagesTest do
              SharedMessages.create(engine, attrs(:first), [@other, @third], nil)
 
     assert Map.keys(updated.shared_recipients) == [{"shared-a", @other}]
+  end
+
+  test "only everyone mode creates a system default for each unsettled recipient" do
+    engine = people(Engine.new())
+    assert {:ok, engine} =
+             Engine.replace_hosted_organization(engine, "org", [@sender, @other, @third], @organization)
+
+    message = %{
+      "title" => "Date", "default" => %{"at" => 100, "value" => "Thursday"},
+      "answer_ui" => %{"actions" => [%{"id" => "thursday", "kind" => "value",
+                                       "value" => "Thursday", "label" => "Thursday"}]}
+    }
+
+    attrs = Map.merge(attrs(:everyone), %{:message => message, "created_at_ms" => 1})
+    assert {:ok, engine, open, _} = SharedMessages.create(engine, attrs, [@other, @third], nil)
+    named = %{attrs | id: "named", answer_policy: {:named, [@other]}}
+    assert {:ok, engine, _, _} = SharedMessages.create(engine, named, [@other, @third], nil)
+
+    assert SharedAnswers.next_default(engine) == 100
+    assert {^engine, []} = SharedAnswers.apply_defaults(engine, 99)
+    recipient = engine.shared_recipients[{open.id, @other}]
+    assert {:ok, engine, _} =
+             SharedAnswers.answer(engine, open, recipient, @other, 1, {:comment, "Manual"}, 90)
+
+    assert {updated, [default_id]} = SharedAnswers.apply_defaults(engine, 100)
+    answer = updated.shared_answers[default_id]
+    assert answer.person == @third
+    assert %{"kind" => "server"} = answer.speaker
+    assert %{"kind" => "default", "value" => "Thursday"} = answer.outcome
+    assert %{"by_this_person" => false} = SharedAnswers.person_terminal(answer, @third)
+    assert {:ok, _} = Map.fetch(updated.shared_recipients, {"named", @third})
+    refute Map.has_key?(updated.shared_recipients[{"named", @third}], :answer_id)
+    assert SharedAnswers.next_default(updated) == nil
   end
 
   defp people(engine) do

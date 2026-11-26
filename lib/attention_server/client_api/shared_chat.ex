@@ -1,7 +1,7 @@
 defmodule AttentionServer.ClientAPI.SharedChat do
   @moduledoc false
 
-  alias AttentionServer.{AgentChangeLog, ChangeLog, Engine, SharedMessages, Store}
+  alias AttentionServer.{AgentChangeLog, ChangeLog, Engine, SharedAnswers, SharedMessages, Store}
   alias AttentionServer.ClientAPI.{Errors, Idempotency, PeopleProfiles, Reads, SharedCapability, Writes}
 
   def respond(conn, ctx, direction, operation, body, key) do
@@ -10,7 +10,12 @@ defmodule AttentionServer.ClientAPI.SharedChat do
         digest = Idempotency.digest(conn.method, conn.path_info, body)
         request = {ctx.principal, ctx.params, direction, operation, body, key, digest}
         result = GenServer.call(ctx.relay, {:client_api, __MODULE__, request}, :infinity)
-        Writes.respond(conn, result)
+        case result do
+          {:answer_conflict, terminal} ->
+            Errors.send_error(conn, "already_answered", details: %{"terminal" => terminal})
+          _ ->
+            Writes.respond(conn, result)
+        end
 
       {:ok, _} -> Errors.send_error(conn, "not_found")
       {:error, token, field} -> Errors.send_error(conn, token, field: field)
@@ -78,6 +83,7 @@ defmodule AttentionServer.ClientAPI.SharedChat do
          {:ok, response} <- result(store, store.engine, chat) do
       {:reply, {:ok, 200, response, false}, %{state | store: store}}
     else
+      {:answer_conflict, _} = conflict -> {:reply, conflict, state}
       error -> {:reply, reply_error(error), state}
     end
   end
@@ -108,6 +114,26 @@ defmodule AttentionServer.ClientAPI.SharedChat do
          attrs = %{id: id, at_ms: chat.now, text: text, notify_person_id: notify, speaker: speaker},
          {:ok, next, _entry} <- SharedMessages.reply(engine, record, author, attrs) do
       {:ok, next, Map.put(chat, :entry_id, id)}
+    end
+  end
+
+  defp transition(engine, record, recipient, _params, %{"request_revision" => revision} = body,
+         %{operation: :answer} = chat) do
+    with {:ok, value} <- Writes.answer_value(body),
+         {:ok, next, answer_id} <-
+           SharedAnswers.answer(engine, record, recipient, chat.person, revision, value, chat.now) do
+      {:ok, next, Map.put(chat, :answer_id, answer_id)}
+    end
+  end
+
+  defp transition(engine, record, _recipient, %{answer_id: id}, body, %{operation: :shared_answer_receipt} = chat) do
+    with {:ok, handoff} <- handoff(body),
+         %{shared_id: shared_id} = answer when shared_id == record.id <- engine.shared_answers[id],
+         {:ok, next, outcome} <- SharedAnswers.receipt(engine, answer, handoff) do
+      {:ok, next, Map.merge(chat, %{answer_id: id, outcome: outcome})}
+    else
+      result when is_nil(result) or is_map(result) -> {:error, :not_found}
+      error -> error
     end
   end
 
@@ -181,7 +207,7 @@ defmodule AttentionServer.ClientAPI.SharedChat do
 
   @doc false
   def result(store, engine, %{direction: :person, operation: operation} = chat)
-      when operation in [:read_position, :seen] do
+      when operation in [:read_position, :seen, :answer] do
     record = engine.shared_messages[chat.message_id]
     recipient = engine.shared_recipients[{record.id, chat.person}]
     alias AttentionServer.ChangeLog, as: Log
@@ -199,6 +225,17 @@ defmodule AttentionServer.ClientAPI.SharedChat do
     with {:ok, head} <- ChangeLog.head(store, chat.person),
          {:ok, rev} <- ChangeLog.rev(store, chat.person, ChangeLog.shared_entry_resource(id)) do
       {:ok, %{"rev" => head, "entry" => SharedMessages.person_entry(recipient, chat.person, entry, rev)}}
+    end
+  end
+
+  def result(store, engine, %{direction: :sender, answer_id: id} = chat) do
+    answer = engine.shared_answers[id]
+    record = engine.shared_messages[answer.shared_id]
+    scope = {record.sender_person, record.sender_key}
+
+    with {:ok, head} <- AgentChangeLog.head(store, scope) do
+      body = %{"rev" => head, "terminal" => SharedAnswers.sender_terminal(answer)}
+      {:ok, Map.merge(body, chat.outcome)}
     end
   end
 

@@ -33,6 +33,7 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
     reply: ~w(text file_ids in_reply_to),
     result: ~w(status),
     answer_receipt: ~w(outcome reason agent rerouted),
+    shared_answer_receipt: ~w(outcome reason agent rerouted),
     chat_receipt: ~w(outcome reason agent rerouted),
     file_use: ~w(file_id transfer use reason),
     advisory_ack: ~w(advisory_id),
@@ -50,6 +51,7 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
       {"POST", ["agent", "messages", :item_id, "replies"], :reply},
       {"POST", ["agent", "messages", :item_id, "result"], :result},
       {"POST", ["agent", "messages", :item_id, "receipt"], :answer_receipt},
+      {"POST", ["agent", "messages", :item_id, "answers", :answer_id, "receipt"], :shared_answer_receipt},
       {"POST", ["agent", "messages", :item_id, "entries", :entry_id, "receipt"], :chat_receipt},
       {"POST", ["agent", "sessions", :session, "end"], :session_end},
       {"POST", ["agent", "messages", :item_id, "entries", :entry_id, "file-use"], :file_use},
@@ -65,6 +67,7 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
   def reply(conn, ctx), do: request(conn, ctx, :reply)
   def result(conn, ctx), do: request(conn, ctx, :result)
   def answer_receipt(conn, ctx), do: request(conn, ctx, :answer_receipt)
+  def shared_answer_receipt(conn, ctx), do: request(conn, ctx, :shared_answer_receipt)
   def chat_receipt(conn, ctx), do: request(conn, ctx, :chat_receipt)
   def session_end(conn, ctx), do: request(conn, ctx, :session_end)
   def file_use(conn, ctx), do: request(conn, ctx, :file_use)
@@ -100,11 +103,11 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
   end
 
   defp dispatch_write(conn, %{params: %{item_id: "shared_" <> _}} = ctx, operation, key, body)
-       when operation in [:reply, :chat_receipt],
+       when operation in [:reply, :chat_receipt, :shared_answer_receipt],
        do: SharedChat.respond(conn, ctx, :sender, operation, body, key)
 
   defp dispatch_write(conn, %{params: %{item_id: "shared_" <> _ = id}} = ctx,
-         operation, key, body) when operation in [:revise, :retract, :chat_close] do
+         operation, key, body) when operation in [:revise, :retract, :chat_close, :lifecycle] do
     case SharedCapability.parse(conn) do
       {:ok, %{shared?: true}} ->
         match = get_req_header(conn, "if-match")
@@ -120,7 +123,8 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
     end
   end
 
-  defp dispatch_write(conn, _ctx, :chat_close, _key, _body),
+  defp dispatch_write(conn, _ctx, operation, _key, _body)
+       when operation in [:chat_close, :shared_answer_receipt],
     do: Errors.send_error(conn, "not_found")
 
   defp dispatch_write(conn, ctx, operation, key, body) do
@@ -652,7 +656,7 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
          :ok <- shared_content_valid(message) do
       files = if Map.has_key?(body, "file_ids"), do: [], else: Map.get(record, :files, [])
       {message, _diagnostics} = Message.admit_answer_ui(message, Enum.map(files, & &1["name"]))
-      SharedMessages.revise(state.store.engine, record, record.revision, message, files)
+      SharedMessages.revise(state.store.engine, record, record.revision, message, files, state.clock.())
     end
   end
 
@@ -660,6 +664,14 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
     with :ok <- Writes.only_members(body, []),
       do: SharedMessages.close_chat(state.store.engine, record)
   end
+
+  defp shared_mutation(state, record, :lifecycle, _match, %{"action" => "cleared"} = body) do
+    with :ok <- Writes.only_members(body, ["action"]),
+      do: SharedMessages.clear_answers(state.store.engine, record, state.clock.())
+  end
+
+  defp shared_mutation(_state, _record, :lifecycle, _match, _body),
+    do: {:error, "unsupported", "action"}
 
   defp shared_mutation(state, record, :retract, _match, body) do
     with :ok <- Writes.only_members(body, []),

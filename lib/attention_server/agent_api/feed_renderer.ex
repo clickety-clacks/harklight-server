@@ -1,7 +1,7 @@
 defmodule AttentionServer.AgentAPI.FeedRenderer do
   @moduledoc false
 
-  alias AttentionServer.{Engine, SharedMessages}
+  alias AttentionServer.{Engine, SharedAnswers, SharedMessages}
   alias AttentionServer.AgentAPI.Advisories
   alias AttentionServer.ClientAPI.{AgentResources, Projection}
 
@@ -33,10 +33,22 @@ defmodule AttentionServer.AgentAPI.FeedRenderer do
           :shared_message -> %{row | kind: :message}
           :shared_entry -> %{row | kind: :entry}
           :shared_seen -> %{row | kind: :seen}
+          :shared_answer -> %{row | kind: :answer}
           _ -> row
         end
       {projected_row, render_row(state, scope, row, entries)}
     end)
+  end
+
+  defp render_row(%{store: %{engine: engine}}, {person, origin},
+         %{resource: {:shared_answer, id}}, _entries) do
+    with %{shared_id: message_id} = answer <- engine.shared_answers[id],
+         %{sender_person: ^person, sender_key: ^origin} = record <- engine.shared_messages[message_id],
+         true <- Engine.shared_sender_allowed?(engine, person, origin, record.sender_id) do
+      {:ok, SharedAnswers.event(answer)}
+    else
+      _ -> :skip
+    end
   end
 
   defp render_row(%{store: %{engine: engine}}, {person, origin},

@@ -9,6 +9,8 @@ defmodule AttentionServer.Relay do
 
   use GenServer
   require Logger
+  alias AttentionServer.SharedAnswers
+
   @default_sweep_retry_ms 1_000
   @max_timer_delay_ms 4_294_967_295
   @prioritization_debounce_ms 250
@@ -857,10 +859,10 @@ defmodule AttentionServer.Relay do
           {:noreply, enqueue_socket_write(next, socket, authority, frames, completion, from)}
 
         {:reply, reply, next} ->
-          {:reply, reply, fence_socket_writes(rank_client_items(state, next))}
+          {:reply, reply, finalize_server_step(state, next)}
 
         {:noreply, next} ->
-          {:noreply, fence_socket_writes(rank_client_items(state, next))}
+          {:noreply, finalize_server_step(state, next)}
       end
     end)
   end
@@ -2254,8 +2256,24 @@ defmodule AttentionServer.Relay do
   def handle_info(message, state) do
     with_persistence_reads(state, fn ->
       {:noreply, next} = dispatch_info(message, state)
-      {:noreply, fence_socket_writes(rank_client_items(state, next))}
+      {:noreply, finalize_server_step(state, next)}
     end)
+  end
+
+  defp finalize_server_step(before, next) do
+    old = before.store.engine
+    current = next.store.engine
+
+    next =
+      if next.shared_messages and
+           (old.shared_messages != current.shared_messages or
+              old.shared_recipients != current.shared_recipients) do
+        reschedule_default_sweep(next, Engine.default_index(current))
+      else
+        next
+      end
+
+    fence_socket_writes(rank_client_items(before, next))
   end
 
   defp initialize_client_ranks(state) do
@@ -2456,6 +2474,8 @@ defmodule AttentionServer.Relay do
       |> Map.new()
 
     next_engine = Engine.sweep_due_defaults(old_engine, now_ms, due_index)
+    {next_engine, shared_ids} =
+      if state.shared_messages, do: SharedAnswers.apply_defaults(next_engine, now_ms), else: {next_engine, []}
 
     if next_engine == old_engine do
       if map_size(due_index) == 0,
@@ -2465,7 +2485,8 @@ defmodule AttentionServer.Relay do
       case commit(state.store, next_engine, %{
              person: "system",
              actor: "default_answer",
-             action: "default_answer_sweep"
+             action: "default_answer_sweep",
+             shared_default_answers: shared_ids
            }) do
         {:ok, store} ->
           next_state = %{state | store: store}
@@ -4042,7 +4063,10 @@ defmodule AttentionServer.Relay do
         default_timer_generation: generation
     }
 
-    case Enum.min(index |> Map.values(), &<=/2, fn -> nil end) do
+    legacy = Enum.min(Map.values(index), fn -> nil end)
+    shared = if state.shared_messages, do: SharedAnswers.next_default(state.store.engine)
+
+    case Enum.min(Enum.reject([legacy, shared], &is_nil/1), fn -> nil end) do
       at when is_integer(at) ->
         delay = min(max(at - state.clock.(), 0), @max_timer_delay_ms)
         timer = Process.send_after(self(), {:default_sweep, generation}, delay)

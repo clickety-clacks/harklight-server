@@ -5,7 +5,7 @@ defmodule AttentionServer.AgentAPI.DeliveryBaseline do
 
   import Plug.Conn
 
-  alias AttentionServer.{AgentChangeLog, Conversation, Engine, JSON, RouteBIndex, SharedMessages, Store}
+  alias AttentionServer.{AgentChangeLog, Conversation, Engine, JSON, RouteBIndex, SharedAnswers, SharedMessages, Store}
   alias AttentionServer.AgentAPI.{Feed, FeedActivity, FeedStep}
   alias AttentionServer.ClientAPI.{AgentResources, Errors, Projection, Reads, Resources, SharedCapability, SharedContinuation}
   alias AttentionServer.ClientAPI.Feed, as: PersonFeed
@@ -203,28 +203,39 @@ defmodule AttentionServer.AgentAPI.DeliveryBaseline do
   defp shared_page(%{store: store}, {person, origin} = scope, session, page, _stop, limit, true) do
     engine = store.engine
 
-    candidates =
-      for %{
-            shared_id: id, author: {:person, _}, id: entry_id, position: position
-          } = entry <- Map.values(engine.shared_entries),
+    replies =
+      for %{shared_id: id, author: {:person, _}, id: entry_id, position: position} = entry <- Map.values(engine.shared_entries),
           not Map.has_key?(entry, :handoff),
           %{sender_person: ^person, sender_key: ^origin} = record <- [engine.shared_messages[id]],
-          is_nil(session) or record["session"] == session,
-          Engine.shared_sender_allowed?(engine, person, origin, record.sender_id),
+          visible?(engine, scope, record, session),
           is_nil(Map.get(record, :sender_frozen_entry_high)) or position <= record.sender_frozen_entry_high,
           {:ok, rev} <- [AgentChangeLog.rev(store, scope, {:shared_entry, entry_id})],
           rev > page.shared_after and rev <= page.rev,
-          do: {rev, record, entry}
+          do: {rev, change("entry", SharedMessages.sender_entry(record, entry, rev)), {:shared_entry, entry.id}}
 
-    {selected, more} = candidates |> Enum.sort_by(&elem(&1, 0)) |> Enum.split(limit)
-    changes = for {rev, record, entry} <- selected, do: change("entry", SharedMessages.sender_entry(record, entry, rev))
-    targets = for {_rev, _record, entry} <- selected, do: {:shared_entry, entry.id}
+    answers =
+      for %{shared_id: id, id: answer_id} = answer <- Map.values(engine.shared_answers),
+          not Map.has_key?(answer, :handoff),
+          %{sender_person: ^person, sender_key: ^origin} = record <- [engine.shared_messages[id]],
+          visible?(engine, scope, record, session),
+          {:ok, rev} <- [AgentChangeLog.rev(store, scope, {:shared_answer, answer_id})],
+          rev > page.shared_after and rev <= page.rev,
+          do: {rev, %{"kind" => "answer", "rev" => rev, "data" => SharedAnswers.event(answer)}, {:shared_answer, answer_id}}
+
+    {selected, more} = (replies ++ answers) |> Enum.sort_by(&elem(&1, 0)) |> Enum.split(limit)
+    changes = for {_rev, change, _target} <- selected, do: change
+    targets = for {_rev, _change, target} <- selected, do: target
     after_rev = case List.last(selected) do
       {rev, _, _} -> rev
       nil -> page.shared_after
     end
 
     {:ok, changes, targets, after_rev, more != []}
+  end
+
+  defp visible?(engine, {person, origin}, record, session) do
+    (is_nil(session) or record["session"] == session) and
+      Engine.shared_sender_allowed?(engine, person, origin, record.sender_id)
   end
 
   @doc false

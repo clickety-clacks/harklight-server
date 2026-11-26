@@ -98,7 +98,7 @@ defmodule AttentionServer.ClientAPI.Errors do
     body =
       %{"error" => token, "retryable" => retryable, "request_id" => request_id(conn)}
       |> maybe_put("field", Keyword.get(opts, :field))
-      |> Map.merge(Map.take(Keyword.get(opts, :details, %{}), ~w(organization_ids recipients)))
+      |> Map.merge(Map.take(Keyword.get(opts, :details, %{}), ~w(organization_ids recipients terminal)))
 
     conn =
       if status == 503 do

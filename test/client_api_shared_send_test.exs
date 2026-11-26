@@ -411,6 +411,109 @@ defmodule AttentionServer.ClientAPISharedSendTest do
              Enum.filter(changes, &(&1["kind"] == "seen"))
   end
 
+  test "one first answer settles the request, survives replay and leaves Chat open", ctx do
+    server = start_supervised!({Server, [shared_messages: true] ++ ctx.server_opts})
+    relay = Server.relay(server)
+    {sender, first, second} = people(ctx, relay)
+    assert :ok = Relay.replace_hosted_organization(relay, "org", [sender, first, second])
+    headers = [{"harklight-features", "shared_messages"}]
+    baseline_path = "/v2/agent/delivery-baseline"
+    assert {200, %{"rev" => before, "continuation" => token}, _} =
+             get_request(ctx, server, "a1", baseline_path, headers)
+
+    assert {200, %{"message" => %{"item_id" => id}}, _} =
+             send_request(ctx, server, @key, body([first, second]), true)
+
+    {first_path, second_path} = recipient_paths(relay, id, first, second)
+    body = %{"request_revision" => 1, "comment" => "Thursday"}
+
+    replies =
+      [{first, "a2", first_path}, {second, "b1", second_path}]
+      |> Task.async_stream(fn {person, device, path} ->
+        {person, device, path,
+         write_request(ctx, server, device, "POST", path <> "/answer", @another_key, body, headers)}
+      end)
+      |> Enum.map(fn {:ok, result} -> result end)
+
+    assert {answerer, device, path, {200, saved, _}} = Enum.find(replies, &(elem(elem(&1, 3), 0) == 200))
+    assert %{"item" => %{"terminal" => %{"answer_id" => answer_id, "by_this_person" => true},
+                         "shared" => %{"chat_writable" => true}}} = saved
+    assert {_, other_device, other_path,
+            {409, %{"error" => "already_answered",
+                    "terminal" => %{"answer_id" => ^answer_id, "by_this_person" => false,
+                                    "speaker" => %{"id" => ^answerer}}}, _}} =
+             Enum.find(replies, &(elem(elem(&1, 3), 0) == 409))
+
+    assert {200, ^saved, response_headers} =
+             write_request(ctx, server, device, "POST", path <> "/answer", @another_key, body, headers)
+    assert {"idempotent-replayed", "true"} in response_headers
+
+    chat_key = op_key(3)
+    assert {200, %{"entry" => %{"shared_entry_id" => after_answer}}, _} =
+             write_request(ctx, server, other_device, "POST", other_path <> "/replies",
+               chat_key, %{"text" => "Can we confirm?"}, headers)
+
+    assert {200, %{"changes" => changes}, _} =
+             get_request(ctx, server, "a1", "/v2/agent/changes?after=#{before}",
+               [{"harklight-continuation", token} | headers])
+    assert [%{"data" => %{"answer_id" => ^answer_id, "request_revision" => 1,
+                         "terminal" => %{"speaker" => %{"id" => ^answerer}}}}] =
+             Enum.filter(changes, &(&1["kind"] == "answer"))
+    assert Enum.any?(changes, &match?(%{"kind" => "entry", "data" => %{"entry_id" => ^after_answer}}, &1))
+
+    assert {200, %{"next_page" => page}, _} = get_request(ctx, server, "a1", baseline_path, headers)
+    assert {200, %{"changes" => [%{"kind" => "answer", "data" => %{"answer_id" => ^answer_id}},
+                                %{"kind" => "entry", "data" => %{"entry_id" => ^after_answer}}]}, _} =
+             get_request(ctx, server, "a1", baseline_path <> "?page=" <> page, headers)
+
+    receipt = "/v2/agent/messages/" <> id <> "/answers/" <> answer_id <> "/receipt"
+    handoff = %{"outcome" => "handed"}
+    assert {200, %{"status" => "recorded", "stage_outcome" => "handed"} = acknowledged, _} =
+             write_request(ctx, server, "a1", "POST", receipt, op_key(4), handoff, headers)
+    assert {200, ^acknowledged, replay_headers} =
+             write_request(ctx, server, "a1", "POST", receipt, op_key(4), handoff, headers)
+    assert {"idempotent-replayed", "true"} in replay_headers
+  end
+
+  test "named and everyone policies preserve decision authority and personal answers", ctx do
+    server = start_supervised!({Server, [shared_messages: true] ++ ctx.server_opts})
+    relay = Server.relay(server)
+    {sender, first, second} = people(ctx, relay)
+    assert :ok = Relay.replace_hosted_organization(relay, "org", [sender, first, second])
+    headers = [{"harklight-features", "shared_messages"}]
+
+    named = Map.put(body([first, second]), "answer_policy", %{"kind" => "named", "people" => [first]})
+    assert {200, %{"message" => %{"item_id" => named_id}}, _} =
+             send_request(ctx, server, @key, named, true)
+    {named_first, named_second} = recipient_paths(relay, named_id, first, second)
+
+    answer = %{"request_revision" => 1, "comment" => "Accepted"}
+    assert {403, %{"error" => "forbidden"}, _} =
+             write_request(ctx, server, "b1", "POST", named_second <> "/answer", @another_key, answer, headers)
+    assert {200, %{"item" => %{"terminal" => %{"speaker" => %{"id" => ^first}}}}, _} =
+             write_request(ctx, server, "a2", "POST", named_first <> "/answer", @another_key, answer, headers)
+
+    everyone = Map.put(body([first, second]), "answer_policy", %{"kind" => "everyone"})
+    assert {200, %{"message" => %{"item_id" => everyone_id}}, _} =
+             send_request(ctx, server, op_key(3), everyone, true)
+    {everyone_first, everyone_second} = recipient_paths(relay, everyone_id, first, second)
+
+    assert {200, %{"item" => %{"terminal" => %{"by_this_person" => true}}}, _} =
+             write_request(ctx, server, "a2", "POST", everyone_first <> "/answer", op_key(4), answer, headers)
+    assert {200, %{"item" => %{"terminal" => nil,
+                              "shared" => %{"can_answer" => true, "answers" => [%{"person_id" => ^first}]}}}, _} =
+             get_request(ctx, server, "b1", everyone_second, headers)
+
+    clear_path = "/v2/agent/messages/" <> everyone_id <> "/lifecycle"
+    assert {200, %{"message" => %{"terminal" => %{"state" => "cleared"}}}, _} =
+             write_request(ctx, server, "a1", "POST", clear_path, op_key(5), %{"action" => "cleared"}, headers)
+    assert {200, %{"item" => %{"terminal" => %{"state" => "answered"}}}, _} =
+             get_request(ctx, server, "a2", everyone_first, headers)
+    assert {200, %{"item" => %{"terminal" => %{"state" => "cleared", "by_this_person" => false},
+                              "shared" => %{"chat_writable" => true}}}, _} =
+             get_request(ctx, server, "b1", everyone_second, headers)
+  end
+
   test "the default-off setting refuses the path while preserving legacy sends", ctx do
     server = start_supervised!({Server, ctx.server_opts})
     relay = Server.relay(server)
@@ -433,6 +536,15 @@ defmodule AttentionServer.ClientAPISharedSendTest do
     body = %{"display_name" => name, "handle" => handle}
 
     GenServer.call(relay, {:client_api, AttentionServer.ClientAPI.PeopleProfiles, {principal, body}})
+  end
+
+  defp recipient_paths(relay, id, first, second) do
+    rows = :sys.get_state(relay).store.engine.shared_recipients
+    {"/v2/items/" <> rows[{id, first}].item_id, "/v2/items/" <> rows[{id, second}].item_id}
+  end
+
+  defp op_key(number) do
+    "10000000-0000-4000-8000-" <> String.pad_leading(to_string(number), 12, "0")
   end
 
   defp people(ctx, relay) do

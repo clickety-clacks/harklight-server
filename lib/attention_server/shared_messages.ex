@@ -1,7 +1,7 @@
 defmodule AttentionServer.SharedMessages do
   @moduledoc false
 
-  alias AttentionServer.{BounceDecision, Engine}
+  alias AttentionServer.{BounceDecision, Engine, SharedAnswers}
   alias AttentionServer.ClientAPI.{PeopleProfiles, SharedAttachments}
 
   def organizations(%Engine{} = engine, person) do
@@ -151,8 +151,10 @@ defmodule AttentionServer.SharedMessages do
     prefix <> Base.url_encode64(hash, padding: false)
   end
 
-  def revise(%Engine{} = engine, record, revision, message, files) do
+  def revise(%Engine{} = engine, record, revision, message, files, now) do
     with :ok <- writable_sender(record),
+         true <- not Map.has_key?(record, :answer_id) and not Map.has_key?(record, :terminal) ||
+                   {:error, :already_closed},
          true <- record.revision == revision || {:error, :precondition_failed} do
       history = Map.get(record, :history, %{})
       previous = Map.take(record, [:revision, :message]) |> Map.put(:files, Map.get(record, :files, []))
@@ -160,6 +162,7 @@ defmodule AttentionServer.SharedMessages do
         record
         |> Map.put(:history, Map.put(history, revision, previous))
         |> Map.put(:revision, revision + 1)
+        |> Map.put(:revision_accepted_at_ms, now)
         |> Map.put(:message, message)
         |> Map.put(:files, files)
 
@@ -191,6 +194,16 @@ defmodule AttentionServer.SharedMessages do
       {:ok, Engine.put_row(engine, :shared_messages, record.id, %{record | chat_open: false})}
     end
   end
+
+  def clear_answers(%Engine{} = engine, %{answer_policy: :everyone} = record, now) do
+    with :ok <- writable_sender(record),
+         true <- not Map.has_key?(record, :terminal) || {:error, :already_closed} do
+      updated = Map.put(record, :terminal, %{"state" => "cleared", "at_ms" => now})
+      {:ok, Engine.put_row(engine, :shared_messages, record.id, updated)}
+    end
+  end
+
+  def clear_answers(_engine, _record, _now), do: {:error, :unsupported}
 
   def retract(%Engine{} = engine, record, now) do
     with :ok <- writable_sender(record) do
@@ -386,6 +399,7 @@ defmodule AttentionServer.SharedMessages do
             cutoff = %{revision: record.revision, members: roster, terminal: Map.get(record, :terminal),
                        entry_high: Map.get(record, :entry_high, 0),
                        delivery: frozen_delivery(snapshot, record, person)}
+            cutoff = Map.merge(cutoff, SharedAnswers.freeze_person(snapshot, record, recipient))
             {Engine.put_row(next, :shared_recipients, key, Map.put(recipient, :frozen, cutoff)), roster}
 
           nil -> {next, roster}
@@ -397,7 +411,9 @@ defmodule AttentionServer.SharedMessages do
         Engine.put_row(engine, :shared_messages, id,
           Map.merge(record, %{sender_frozen_revision: record.revision, sender_frozen_terminal: Map.get(record, :terminal),
                               sender_frozen_entry_high: Map.get(record, :entry_high, 0),
-                              sender_frozen_seen: sender_seen?(snapshot, record)})),
+                              sender_frozen_seen: sender_seen?(snapshot, record),
+                              sender_frozen_answer_id: Map.get(record, :answer_id),
+                              sender_frozen_answers: SharedAnswers.answer_ids(snapshot, record)})),
 
       else: engine
   end
@@ -432,9 +448,9 @@ defmodule AttentionServer.SharedMessages do
 
     shared =
       Enum.count(for_person(engine, person), fn {message, recipient} ->
-        not Map.has_key?(recipient, :frozen) and not Map.has_key?(message, :terminal) and
-          not is_nil(message.answer_policy) and
-          MapSet.member?(affiliations, message.organization_id)
+        not Map.has_key?(recipient, :frozen) and
+          MapSet.member?(affiliations, message.organization_id) and
+          SharedAnswers.available?(engine, message, recipient, person)
       end)
 
     %{"unresolved" => individual + shared}
@@ -458,17 +474,10 @@ defmodule AttentionServer.SharedMessages do
     record = historical_record(record, frozen && frozen.revision)
     record = if frozen, do: replace_terminal(record, frozen.terminal), else: record
 
-    open? =
-      is_nil(frozen) and record.chat_open and
-        MapSet.member?(organizations(engine, person), record.organization_id)
-
-    can_answer =
-      open? and
-        case record.answer_policy do
-          nil -> false
-          {:named, people} -> person in people
-          _ -> true
-        end
+    active? = is_nil(frozen) and MapSet.member?(organizations(engine, person), record.organization_id)
+    open? = active? and record.chat_open
+    can_answer = active? and SharedAnswers.available?(engine, record, recipient, person)
+    answers = SharedAnswers.person_projection(engine, record, recipient, person)
 
     members = if frozen, do: frozen.members, else: visible_members(engine, record.id)
 
@@ -481,15 +490,15 @@ defmodule AttentionServer.SharedMessages do
       "files" => SharedAttachments.wire(Map.get(record, :files, [])),
       "seen" => recipient.seen_revision == record.revision,
       "chat" => chat_state(engine, record, recipient, person),
-      "rank" => %{"key" => recipient.item_id, "section" => if(not is_nil(frozen) or Map.has_key?(record, :terminal), do: "resolved", else: "current")},
-      "terminal" => Map.get(record, :terminal),
+      "rank" => %{"key" => recipient.item_id, "section" => if(not is_nil(frozen) or not is_nil(answers.terminal), do: "resolved", else: "current")},
+      "terminal" => answers.terminal,
       "shared" => %{
         "shared_id" => record.id,
         "answer_policy" => answer_policy(record.answer_policy),
         "chat_writable" => open?,
         "can_answer" => can_answer,
         "members" => members,
-        "answers" => []
+        "answers" => answers.answers
       }
     }
     |> Map.merge(Map.take(record, ["created_at_ms"]))
@@ -557,6 +566,7 @@ defmodule AttentionServer.SharedMessages do
     frozen = Map.get(record, :sender_frozen_revision)
     record = historical_record(record, frozen)
     record = if frozen, do: replace_terminal(record, record.sender_frozen_terminal), else: record
+    answers = SharedAnswers.sender_projection(engine, record)
 
     %{
       "item_id" => record.id,
@@ -571,11 +581,11 @@ defmodule AttentionServer.SharedMessages do
         "organization_id" => record.organization_id,
         "answer_policy" => answer_policy(record.answer_policy),
         "chat_open" => is_nil(frozen) and record.chat_open,
-        "answers" => []
+        "answers" => answers.answers
       }
     }
     |> Map.merge(Map.take(record, ["session", "created_at_ms"]))
-    |> maybe_terminal(record)
+    |> maybe_terminal(answers.terminal)
   end
 
   defp sender_seen?(engine, record) do
@@ -587,8 +597,8 @@ defmodule AttentionServer.SharedMessages do
   defp replace_terminal(record, nil), do: Map.delete(record, :terminal)
   defp replace_terminal(record, terminal), do: Map.put(record, :terminal, terminal)
 
-  defp maybe_terminal(wire, %{terminal: terminal}), do: Map.put(wire, "terminal", terminal)
-  defp maybe_terminal(wire, _record), do: wire
+  defp maybe_terminal(wire, nil), do: wire
+  defp maybe_terminal(wire, terminal), do: Map.put(wire, "terminal", terminal)
 
   defp answer_policy(nil), do: nil
   defp answer_policy({:named, people}), do: %{"kind" => "named", "people" => people}

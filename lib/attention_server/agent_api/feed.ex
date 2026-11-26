@@ -78,7 +78,7 @@ end
 defmodule AttentionServer.AgentAPI.FeedStep do
   @moduledoc false
 
-  alias AttentionServer.{AgentChangeLog, Diagnostics, Engine, Relay, SharedMessages, Store}
+  alias AttentionServer.{AgentChangeLog, Diagnostics, Engine, Relay, SharedAnswers, SharedMessages, Store}
   alias AttentionServer.AgentAPI.{FeedActivity, FeedRenderer, Focus}
   alias AttentionServer.ClientAPI.{FeedStep, Projection, Reads, Resources, SharedContinuation}
 
@@ -141,11 +141,15 @@ defmodule AttentionServer.AgentAPI.FeedStep do
   # As in the legacy origin fetch, the page's cursor and payload are selected
   # before ACK1, but neither is returned until the receipt commit succeeds.
   def commit_delivery(store, {person, key} = scope, targets, opts) do
-    {shared, legacy} = Enum.split_with(targets, &match?({:shared_entry, _}, &1))
+    {shared, legacy} = Enum.split_with(targets, fn {kind, _} -> kind in [:shared_entry, :shared_answer] end)
 
     with {:ok, store} <- commit_legacy_delivery(store, scope, legacy, opts) do
-      ids = Enum.map(shared, fn {:shared_entry, id} -> id end)
-      updated = SharedMessages.mark_served(store.engine, ids)
+      entries = for {:shared_entry, id} <- shared, do: id
+      answers = for {:shared_answer, id} <- shared, do: id
+      updated =
+        store.engine
+        |> SharedMessages.mark_served(entries)
+        |> SharedAnswers.mark_served(answers)
 
       case if(updated == store.engine, do: {:ok, store}, else: Store.commit(store, updated, %{person: person, actor: key, action: "shared_chat_served"})) do
         {:ok, committed} -> {:ok, committed}
@@ -250,6 +254,10 @@ defmodule AttentionServer.AgentAPI.FeedStep do
   end
 
   def authorized(_engine, _principal), do: {:error, :unauthorized}
+
+  defp delivery_target(%{"kind" => "answer", "data" => %{"answer_id" => id,
+                           "terminal" => %{"delivery" => %{"delivered" => false}}}}),
+    do: [{:shared_answer, id}]
 
   defp delivery_target(%{"data" => %{"shared_entry_id" => id, "author" => "person",
                            "delivery" => %{"delivered" => false}}}),
