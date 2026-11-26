@@ -6,6 +6,7 @@ defmodule AttentionServer.ClientAPI.AgentReads do
   import Plug.Conn, only: [fetch_query_params: 1]
 
   alias AttentionServer.{AgentChangeLog, Engine, Message, RouteBIndex}
+  alias AttentionServer.AgentAPI.RecipientReach
   alias AttentionServer.ClientAPI.{AgentResources, Context, Projection, Reads}
 
   @page_size 50
@@ -97,6 +98,7 @@ defmodule AttentionServer.ClientAPI.AgentReads do
   defp read({:message, item_id}, state, scope, head) do
     with {:ok, key} <- AgentResources.own_item_key(state, scope, item_id),
          {:ok, message} <- AgentResources.message(state, scope, key) do
+      message = RecipientReach.add(message, state, scope)
       {:ok, %{"rev" => head, "message" => message}}
     end
   end

@@ -1079,7 +1079,8 @@ agents with existing data. Clients apply newer versions of each resource.
         "seen": { "type": "boolean", "description": "Mark Seen recorded for the current substantive revision" },
         "result": { "$ref": "#/$defs/OriginResult" },
         "availability": { "$ref": "#/$defs/Availability" },
-        "advisories": { "type": "array", "items": { "$ref": "#/$defs/AgentAdvisory" } }
+        "advisories": { "type": "array", "items": { "$ref": "#/$defs/AgentAdvisory" } },
+        "recipient_reach": { "enum": ["reachable", "none"] }
       }
     },
     "AgentEntry": {
@@ -1243,6 +1244,15 @@ agents with existing data. Clients apply newer versions of each resource.
 | `DELETE /v2/files/{file_id}` | None | No body (204) |
 
 Writes return 200 unless the table says otherwise. Each response schema requires the resources listed for its route.
+
+With shared sign-in active, the successful send and single-message read may
+include `message.recipient_reach`. `reachable` means the account has an eligible
+person device or valid browser session. `none` means it has neither. Offline
+devices with eligible credentials and signed-in browsers count. Sender
+credentials and Agent feed activity do not count. An absent or unknown value
+provides no determination. Reach describes current eligibility, including on
+send replay. It leaves the acceptance of the write and the Agent reply
+`availability` field independent.
 
 ```json
 {

@@ -27,7 +27,8 @@ defmodule AttentionServer.MixProject do
       {:exqlite, "0.39.0"},
       {:mint, "~> 1.11.0"},
       {:plug, "~> 1.20.0"},
-      {:bandit, "~> 1.14.1"}
+      {:bandit, "~> 1.14.1"},
+      {:wax_, "~> 0.7.0"}
     ]
   end
 end

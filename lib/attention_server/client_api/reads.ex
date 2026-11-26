@@ -482,7 +482,8 @@ defmodule AttentionServer.ClientAPI.Reads do
         "features" =>
           @client_features
           |> Map.new(&{&1, Map.get(flags, &1) == true})
-          |> Map.put("handoff_captions", true),
+          |> Map.put("handoff_captions", true)
+          |> migration_feature(state, key),
         "limits" => %{
           "upload_cap_bytes_per_file" =>
             if(state.upload_cap == :none, do: "none", else: state.upload_cap),
@@ -538,6 +539,21 @@ defmodule AttentionServer.ClientAPI.Reads do
       Resources.file_source(engine, person, file_id)
     end)
   end
+
+  defp migration_feature(features, state, %{kind: :device, session_id: nil, person: person, key: id}) do
+    case state.store do
+      %{auth_schema: %{device_certificates_disabled: false}, db: db}
+      when state.deployment_mode == :self_hosted ->
+        if AttentionServer.DeviceMigration.eligible?(db, person, id),
+          do: Map.put(features, "auth_migration", true),
+          else: features
+
+      _ ->
+        features
+    end
+  end
+
+  defp migration_feature(features, _state, _principal), do: features
 
   defp enrollment_ids(%{kind: :device, person: person, key: device}),
     do: %{"person_id" => person, "device_id" => device}

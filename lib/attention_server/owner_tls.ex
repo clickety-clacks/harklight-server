@@ -242,6 +242,17 @@ defmodule AttentionServer.OwnerTLS do
 
   defp dispatch(relay, person, key, %{"v" => 1, "person_id" => person} = request) do
     case request do
+      %{"type" => "sign_in_code_create"} ->
+        if fields?(request, ~w(v type person_id)) do
+          case owner_result(request, Relay.owner_sign_in_code(relay, person, key)) do
+            {:ok, credential} -> %{"ok" => true, "sign_in_code" => credential}
+            {:error, :storage_unavailable} -> %{"error" => "unavailable"}
+            _ -> not_found()
+          end
+        else
+          invalid()
+        end
+
       %{"type" => "browser_sign_in_create"} ->
         if fields?(request, ~w(v type person_id)) do
           case owner_result(request, Relay.owner_browser_sign_in_create(relay, person, key)) do

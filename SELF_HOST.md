@@ -110,8 +110,8 @@ The package does not configure Tailscale, expose a public Internet endpoint
 or turn tailnet membership into enrollment or response authority.
 
 Copy the public tls/ca.pem to headless senders over your chosen trusted
-channel. For the native app, use an owner-created invitation from the dashboard
-below: it carries the configured destination and pinned public CA. The app keeps
+channel. Before S1 is enabled, the legacy native app uses an owner-created
+invitation from the dashboard below: it carries the configured destination and pinned public CA. The app keeps
 its own private device key; never transfer an owner or CA private key to it.
 For headless commands use the tailnet IP in --connect and the exact
 certificate hostname in --name. Enrollment uses 18444, owner management 18445,
@@ -202,6 +202,41 @@ An unreadable key or unavailable provider yields baseline order when no
 usable scores are available. Provider requests have a 30-second total
 timeout per batch. Delivery and push continue independently of ranking.
 
+## S1 sign-in for the app and browser
+
+When S1 is enabled, people use the Server's normal trusted HTTPS origin.
+Set `ATTENTION_SERVER_PUBLIC_BASE_URL` to that exact origin and configure
+the dashboard listener with the certificate and private key for it. A
+Tailscale HTTPS certificate for the configured name is one option. The app
+and browser validate that certificate in their usual platform trust store.
+
+Use the existing owner TLS connection to run `harklight owner sign-in-code`
+with the owner connection options and the target person's ID. Give the
+person only the displayed code. It works once within ten minutes. An owner
+can also issue a code from the signed-in **Devices** page. The person enters
+it on the selected Server or in the app. A signed-in browser can set up a
+passkey from **Devices**. App passkey availability follows real-device
+acceptance.
+
+An S1 sign-in session survives Server restart. The browser's own cookie
+retention determines how long it survives browser close and reopen.
+Browser sign-out ends that browser session. Removing a phone from
+**Devices** ends that phone's sessions and delivery binding.
+
+For the overlap, the existing people-device certificate transport is
+available only to the designated self-hosted installations. The rest use
+the S1 HTTPS sign-in door. Owner and registered agent certificate
+connections continue on their existing endpoints.
+
+The managed installer and launcher check the package's relay format and
+auth generation before startup. A pre-S1 FORMAT31 package can open an
+upgraded store if started directly outside the managed launcher, but
+cannot enforce S1 session state or certificate denial. Return to a
+pre-S1 package only by stopping the Server and restoring the complete
+pre-upgrade backup. This discards every later write. For recoverable startup
+failures after the candidate may have served, use an auth-compatible repair
+release against the preserved store.
+
 ## Optional self-hosted device dashboard
 
 The dashboard shows device status and agent skill guidance. A signed-in person
@@ -244,8 +279,8 @@ select a separate browser-trusted TLS certificate; otherwise the server's
 existing certificate and key are used. Opening the page does not grant sender
 or device authority.
 
-After the server is running, the current owner can issue a one-use sign-in
-link over its authenticated owner TLS channel. The command saves the bearer
+Before S1 is enabled, the current owner can issue a one-use sign-in link
+over its authenticated owner TLS channel. The command saves the bearer
 link in a new private file; share it only with the intended owner and remove
 the file when no longer needed. A used link needs a fresh one.
 

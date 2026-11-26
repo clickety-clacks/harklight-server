@@ -38,7 +38,7 @@ for application in "$stage/$name"/lib/*; do
 done
 {
   printf 'product=Harklight Server\nversion=%s\n' "$version"
-  printf 'relay_store_format=31\nauth_generation=0\n'
+  printf 'relay_store_format=31\nauth_generation=1\n'
   printf 'source_commit=%s\n' "$(git rev-parse HEAD)"
   printf 'source_status=%s\n' "$(git status --porcelain)"
   printf 'build_system=%s\n' "$(uname -srvmo)"
