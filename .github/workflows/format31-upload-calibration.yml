@@ -1,0 +1,146 @@
+name: FORMAT31 upload-heavy admission calibration
+
+on:
+  push:
+    branches: [server/format31-upload-calibration]
+
+permissions:
+  contents: read
+
+jobs:
+  conversion:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - fixture: M
+            shape: '2400 145000 1300 300 400'
+          - fixture: C
+            shape: '50000 500000 1300 0 400'
+          - fixture: L
+            shape: '50000 900000 1300 0 400'
+    env:
+      ATTENTION_SERVER_ENABLE: '0'
+      MIX_ENV: prod
+      ERL_FLAGS: '+S 2:2 +SDcpu 1 +SDio 1'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: '27.3.3'
+          elixir-version: '1.19.5'
+          version-type: strict
+      - run: mix deps.get --only prod
+      - run: mix compile
+      - name: Write the synthetic fixture with the published prior package
+        env:
+          SHAPE: ${{ matrix.shape }}
+          HARKLIGHT_FIXTURE_KIND: ${{ matrix.fixture }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/measurements" "$RUNNER_TEMP/prior"
+          results="$RUNNER_TEMP/measurements"
+          git rev-parse HEAD HEAD^ >"$results/commits.txt"
+          awk '/^(MemTotal|MemAvailable):/' /proc/meminfo >"$results/capacity.txt"
+          df -Pk "$RUNNER_TEMP" | awk 'NR == 2 { print "disk_free_kib", $4 }' >>"$results/capacity.txt"
+          probe="$GITHUB_WORKSPACE/scripts/format31-rehearsal.exs"
+          echo "HARKLIGHT_PROBE=$probe" >>"$GITHUB_ENV"
+          archive=harklight-server-0.2.18-linux-x86_64.tar.gz
+          (
+            cd "$RUNNER_TEMP/prior"
+            release=https://github.com/clickety-clacks/harklight-server/releases/download/v0.2.18
+            curl --fail --silent --show-error --location --retry 3 --remote-name "$release/$archive"
+            curl --fail --silent --show-error --location --retry 3 --remote-name "$release/SHA256SUMS"
+            sha256sum --check --ignore-missing SHA256SUMS
+            tar -zxf "$archive"
+          ) >"$results/prior-package.log" 2>&1
+          prior="$RUNNER_TEMP/prior/harklight-server-0.2.18-linux-x86_64/bin/attention_server"
+          export HARKLIGHT_SHAPE="$SHAPE" HARKLIGHT_FIXTURE="$RUNNER_TEMP/seed" HARKLIGHT_PROBE="$probe"
+          run_prior() {
+            sudo systemd-run --quiet --wait --pipe --collect \
+              --property=MemoryMax=14G --property=MemorySwapMax=0 --uid="$(id -u)" \
+              --working-directory="$GITHUB_WORKSPACE" \
+              /usr/bin/env "ATTENTION_SERVER_ENABLE=0" "ERL_FLAGS=$ERL_FLAGS" \
+              "HARKLIGHT_FIXTURE=$HARKLIGHT_FIXTURE" "HARKLIGHT_PROBE=$HARKLIGHT_PROBE" \
+              "HARKLIGHT_SHAPE=$HARKLIGHT_SHAPE" "HARKLIGHT_FIXTURE_KIND=$HARKLIGHT_FIXTURE_KIND" timeout 30m "$prior" eval "$1"
+          }
+          run_prior 'System.argv(["seed", System.fetch_env!("HARKLIGHT_FIXTURE") | String.split(System.fetch_env!("HARKLIGHT_SHAPE"))]); Code.require_file(System.fetch_env!("HARKLIGHT_PROBE"))' \
+            >"$results/seed.log" 2>&1
+      - name: Measure the synthetic size, published refusal, and conversion
+        env:
+          FIXTURE_KIND: ${{ matrix.fixture }}
+        run: |
+          results="$RUNNER_TEMP/measurements"
+          fixture="$RUNNER_TEMP/seed"
+          store="$fixture/relay.sqlite3"
+          export HARKLIGHT_REHEARSAL_DB="$store"
+          python3 - "$store" "$FIXTURE_KIND" > "$results/source-counts.log" <<'PY'
+          from pathlib import Path
+          import random
+          import sqlite3
+          import sys
+
+          store, shape = Path(sys.argv[1]), sys.argv[2]
+          uploads = Path(str(store) + ".uploads")
+          uploads.mkdir(exist_ok=True)
+          db = sqlite3.connect(store)
+          if shape == "M":
+              db.execute("PRAGMA journal_mode=DELETE")
+              db.execute("CREATE TABLE synthetic_freelist (payload BLOB)")
+              db.executemany("INSERT INTO synthetic_freelist VALUES (zeroblob(?))", [(8 << 20,)] * 390)
+              db.commit()
+              db.execute("DROP TABLE synthetic_freelist")
+              db.commit()
+          else:
+              rng = random.Random(20261126)
+              for index, size in enumerate([2 << 20, 6 << 20], 1):
+                  name = f"00000000-0000-4000-8000-{index + 12000000:012d}"
+                  (uploads / name).write_bytes(rng.randbytes(size))
+          for table in ("client_resource_revs", "agent_changes", "relay_large_data_refs"):
+              if db.execute("SELECT 1 FROM sqlite_schema WHERE name=? AND type='table'", (table,)).fetchone():
+                  value = db.execute("SELECT count(*) FROM " + table).fetchone()[0]
+              else:
+                  value = 0
+              print(table, value)
+          for pragma in ("page_count", "page_size", "freelist_count"):
+              print(pragma, db.execute("PRAGMA " + pragma).fetchone()[0])
+          db.close()
+          print("database_before_bytes", store.stat().st_size)
+          print("upload_logical_bytes", sum(path.stat().st_size for path in uploads.iterdir()))
+          print("upload_files", len(list(uploads.iterdir())))
+          PY
+          du -sk "$store.uploads" | awk '{print "upload_allocated_bytes", $1 * 1024}' >> "$results/source-counts.log"
+          timeout 3m mix run --no-compile "$HARKLIGHT_PROBE" inspect "$fixture" > "$results/snapshot.log" 2>&1
+          sha256sum "$store" "$store.uploads/"* > "$results/before.sha256"
+          candidate="$RUNNER_TEMP/candidate"
+          mix release attention_server --path "$candidate" > "$results/candidate-build.log" 2>&1
+          install -m 755 scripts/harklight "$candidate/bin/harklight"
+
+          run_isolated() {
+            sudo systemd-run --quiet --wait --pipe --collect \
+              --property=MemoryMax=14G --property=MemorySwapMax=0 --property=PrivateNetwork=yes \
+              --uid="$(id -u)" --working-directory="$GITHUB_WORKSPACE" \
+              /usr/bin/env "PATH=$PATH" "MIX_ENV=$MIX_ENV" "MIX_HOME=$HOME/.mix" \
+              "ERL_FLAGS=$ERL_FLAGS" ATTENTION_SERVER_ENABLE=0 \
+              /usr/bin/time -f 'elapsed_s=%e maximum_rss_kib=%M' timeout --kill-after=30s 18m "$@"
+          }
+          if run_isolated "$candidate/bin/harklight" store convert-stopped "$store" --from-release v0.2.18 > "$results/refused.log" 2>&1; then
+            echo "Unexpected admission by the original limit."
+            exit 1
+          fi
+          grep -F 'fit not established' "$results/refused.log"
+          sha256sum --check "$results/before.sha256" > "$results/refusal-checksums.log"
+
+          run_isolated mix run --no-compile "$HARKLIGHT_PROBE" calibrate-uploads "$fixture" > "$results/conversion.log" 2>&1
+          tail -n +2 "$results/before.sha256" | sha256sum --check > "$results/converted-uploads.log"
+          run_isolated "$candidate/bin/harklight" store convert-stopped "$store" --from-release v0.2.18 > "$results/retry.log" 2>&1
+          grep -F 'already uses FORMAT31' "$results/retry.log"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: format31-upload-calibration-${{ matrix.fixture }}
+          path: ${{ runner.temp }}/measurements/
