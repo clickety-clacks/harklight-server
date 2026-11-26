@@ -271,8 +271,8 @@ or Codex, install the CLI with `brew install clickety-clacks/tap/harklight-agent
    the **On a computer** command and run it on the agent’s computer.
 2. In **Devices**, review the pending request, match the approval code printed
    by `setup`, and enter `app:agent/` in **Sender IDs** before approving.
-3. Answer the test question in your Harklight attention list. Then ask Claude
-   Code or Codex to send you a question through Harklight.
+3. Open Harklight and answer the test question. Then ask Claude Code or Codex
+   to send you a question through Harklight.
 
 With the owner CLI, use `harklight owner invite --output FILE` with your usual
 owner connection options and transfer the private invitation file to the
