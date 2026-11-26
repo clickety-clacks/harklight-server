@@ -561,13 +561,9 @@ defmodule AttentionServer.ClientAPI.Writes do
   def handle_call({:discard_file, who, file_id, key, digest}, _from, state) do
     reply =
       with {:ok, principal} <- principal(state.store.engine, who) do
+        retained? = not is_nil(app_receipt(state, who, principal, key, digest, :discard_file))
         discard_staged_upload(
-          state,
-          principal.person,
-          file_id,
-          key,
-          digest,
-          discard_owner(principal)
+          state, principal.person, file_id, key, digest, discard_owner(principal), retained?
         )
       end
 
@@ -755,11 +751,11 @@ defmodule AttentionServer.ClientAPI.Writes do
   defp discard_owner(_principal), do: nil
 
   @doc "Discard within Relay after the caller has authorized the principal."
-  def discard_staged_upload(state, person, file_id, key, digest, owner \\ nil) do
+  def discard_staged_upload(state, person, file_id, key, digest, owner \\ nil, retained? \\ false) do
     with {:ok, nil} <- stored(state, person, key, digest, nil, nil),
          :ok <- Uploads.verify_discard_owner(state.store, file_id, owner),
          false <- Relay.staged_upload_attached?(state, person, file_id),
-         :ok <- Uploads.discard(state.store, person, file_id, key, digest) do
+         :ok <- Uploads.discard(state.store, person, file_id, key, digest, retained?) do
       {:ok, 204, %{}}
     else
       true -> {:error, :already_closed}
