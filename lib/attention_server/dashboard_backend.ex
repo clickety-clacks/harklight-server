@@ -34,6 +34,9 @@ defmodule AttentionServer.DashboardBackend do
   def redeem_owner_code(%__MODULE__{relay: relay}, {code, transaction}),
     do: Relay.redeem_owner_code(relay, code, transaction)
 
+  def local_passkey(%__MODULE__{relay: relay}, {operation, payload}),
+    do: Relay.local_passkey(relay, operation, payload)
+
   def list_devices(%__MODULE__{} = backend, %{person_id: person, owner_key: key} = principal) do
     case Relay.dashboard_inventory(backend.relay, person, key, backend.configured_owner_person) do
       {:ok, snapshot} ->

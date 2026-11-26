@@ -40,7 +40,7 @@ defmodule AttentionServer.DashboardView do
 
     sign_in_action =
       if Keyword.get(chrome, :local_sign_in_code, false) do
-        ~s(<form action="/devices/sign-in-code" method="post"><input type="hidden" name="confirm" value="create_code"><button class="button" type="submit">Create one-time code</button></form>)
+        ~s(<form action="/devices/sign-in-code" method="post"><input type="hidden" name="confirm" value="create_code"><button class="button" type="submit">Create one-time code</button></form><p><a href="/devices/passkey">Set up a passkey</a></p>)
       else
         ""
       end

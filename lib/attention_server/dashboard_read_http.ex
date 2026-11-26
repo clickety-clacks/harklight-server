@@ -142,6 +142,25 @@ defmodule AttentionServer.DashboardReadHTTP do
           send_resp(conn, 404, "")
         end
 
+      conn.method == "GET" and conn.request_path == "/sign-in/passkey.js" ->
+        if local_code_available?(opts) do
+          conn |> put_resp_content_type("text/javascript", "utf-8") |> send_resp(200, LocalSignInPage.passkey_script())
+        else
+          send_resp(conn, 404, "")
+        end
+
+      conn.method == "POST" and conn.request_path == "/sign-in/passkey/options" ->
+        local_passkey_request(conn, opts, :assertion_options)
+
+      conn.method == "POST" and conn.request_path == "/sign-in/passkey/finish" ->
+        local_passkey_request(conn, opts, :assertion_finish)
+
+      conn.method == "POST" and conn.request_path == "/devices/passkey/options" ->
+        local_passkey_request(fetch_cookies(conn), opts, :registration_options)
+
+      conn.method == "POST" and conn.request_path == "/devices/passkey/finish" ->
+        local_passkey_request(fetch_cookies(conn), opts, :registration_finish)
+
       conn.method == "POST" and conn.request_path == "/sign-in/code" ->
         redeem_local_code(conn, opts)
 
@@ -394,6 +413,14 @@ defmodule AttentionServer.DashboardReadHTTP do
          _principal
        ),
        do: serve_web_static(conn, opts)
+
+  defp route(%{method: "GET", request_path: "/devices/passkey"} = conn, opts, _principal) do
+    if local_code_available?(opts) do
+      conn |> put_resp_content_type("text/html", "utf-8") |> send_resp(200, LocalSignInPage.setup_html())
+    else
+      send_resp(conn, 404, "")
+    end
+  end
 
   defp route(%{method: "POST", request_path: "/devices/sign-in-code"} = conn, opts, principal) do
     if local_code_available?(opts) do
@@ -1370,6 +1397,39 @@ defmodule AttentionServer.DashboardReadHTTP do
   end
 
   defp local_code_available?(_opts), do: false
+
+  defp local_passkey_request(conn, opts, operation) do
+    if local_code_available?(opts) do
+      with true <- get_req_header(conn, "origin") == [expected_origin(conn, opts)],
+           [content_type] <- get_req_header(conn, "content-type"),
+           true <- json_content_type?(content_type),
+           {:ok, raw, conn} <- read_body(conn, length: 16_384, read_length: 16_384),
+           {:ok, request} when is_map(request) <- JSON.decode_line(raw <> "\n") do
+        payload =
+          if operation in [:registration_options, :registration_finish],
+            do: {Map.get(conn.req_cookies, @cookie), request},
+            else: request
+
+        case backend_call(opts.backend, :local_passkey, {operation, payload}) do
+          {:ok, %{cookie: cookie, method: method}} ->
+            conn |> BrowserAuth.put_cookie(cookie, true) |> send_levels_json(%{"method" => method}, 200)
+
+          {:ok, result} ->
+            send_levels_json(conn, result, 200)
+
+          {:error, :invalid_passkey} ->
+            send_levels_json(conn, %{"error" => "unauthorized"}, 401)
+
+          _ ->
+            send_levels_json(conn, %{"error" => "storage_unavailable"}, 503)
+        end
+      else
+        _ -> send_levels_json(conn, %{"error" => "invalid_request"}, 400)
+      end
+    else
+      send_resp(conn, 404, "")
+    end
+  end
 
   defp redeem_local_code(conn, opts) do
     if local_code_available?(opts) do

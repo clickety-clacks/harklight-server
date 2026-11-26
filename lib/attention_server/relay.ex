@@ -35,6 +35,7 @@ defmodule AttentionServer.Relay do
     NativeSignIn,
     JevClient,
     JevRanking,
+    LocalPasskeys,
     LocalSignIn,
     Placement,
     RouteBIndex,
@@ -263,6 +264,9 @@ defmodule AttentionServer.Relay do
 
   def redeem_owner_code(server, code, transaction),
     do: GenServer.call(server, {:redeem_owner_code, code, transaction}, :infinity)
+
+  def local_passkey(server, operation, payload),
+    do: GenServer.call(server, {:local_passkey, operation, payload}, :infinity)
 
   def redeem_browser_fragment(server, token, session_hash),
     do: GenServer.call(server, {:redeem_browser_fragment, token, session_hash}, :infinity)
@@ -1343,6 +1347,16 @@ defmodule AttentionServer.Relay do
       {:error, reason} ->
         {:reply, {:error, reason}, state}
     end
+  end
+
+  defp dispatch_call({:local_passkey, operation, payload}, _from, state) do
+    result =
+      case {state.deployment_mode, state.store} do
+        {:self_hosted, %{auth_schema: %{}}} -> local_passkey_operation(state, operation, payload)
+        _ -> {:error, :disabled}
+      end
+
+    {:reply, result, state}
   end
 
   defp dispatch_call({:owner_sign_in_code, person, key}, _from, state) do
@@ -4518,6 +4532,33 @@ defmodule AttentionServer.Relay do
   end
 
   defp put_push_revision(_store, _claim), do: {:error, :storage_unavailable}
+
+  defp local_passkey_operation(state, :assertion_options, _request),
+    do: LocalPasskeys.assertion_options(state.store.db, state.dashboard_origin, state.clock.())
+
+  defp local_passkey_operation(state, :assertion_finish, request),
+    do: LocalPasskeys.authenticate(state.store.db, state.store.engine, request, state.clock.())
+
+  defp local_passkey_operation(state, operation, {cookie, request})
+       when operation in [:registration_options, :registration_finish] and is_binary(cookie) do
+    hash = BrowserAuth.hash(cookie)
+
+    with {:ok, %{person: person, key: key, revision: revision} = principal} <-
+           BrowserAuth.session(state.store.db, hash),
+         {:ok, ^revision} <- Engine.owner_revision(state.store.engine, person, key) do
+      case operation do
+        :registration_options ->
+          LocalPasskeys.registration_options(state.store.db, state.dashboard_origin, hash, person, state.clock.())
+
+        :registration_finish ->
+          LocalPasskeys.register(state.store.db, hash, principal, request, state.clock.())
+      end
+    else
+      _ -> {:error, :invalid_passkey}
+    end
+  end
+
+  defp local_passkey_operation(_state, _operation, _request), do: {:error, :invalid_passkey}
 
   defp consume_browser_fragment(state, token, session_hash) do
     with {:ok, hash} <- AttentionServer.BrowserSignIn.token_hash(token),
