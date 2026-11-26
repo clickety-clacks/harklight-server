@@ -497,12 +497,13 @@ ATTENTION_SERVER_ENABLE=0 /path/to/new-release/bin/harklight store convert-stopp
 ```
 
 The converter checks host capacity before decoding the snapshot. If it reports
-`fit not established`, keep the Server stopped and preserve the backup. Copy
-the stopped state directory to a larger isolated Linux system with sufficient
-memory and disk. Run the same verified package and command against that copy.
+`fit not established`, keep the Server stopped and preserve the backup. For
+insufficient memory or free disk, copy the stopped state directory to a larger
+isolated Linux system and run the same verified package against that copy.
 Copy the converted database and uploads back together before starting the
-new release with the existing configuration. A fit refusal on the larger
-system means the store is outside the measured limits. A refusal for an
+new release with the existing configuration. A store above a calibrated size
+or row limit needs a verified conversion path for that shape. Report the
+measured value and the limit shown by the converter. A refusal for an
 unsupported or unreadable header requires resolving the store version or
 recovering a readable backup before proceeding.
 
