@@ -1702,6 +1702,9 @@ defmodule AttentionServer.Relay do
            {:ok, ^person} <- Engine.authorized_person(engine, device) do
         {:ok, Map.put(session, :hash, hash)}
       else
+        {:error, reason} when reason not in [:unauthorized, :forbidden] ->
+          {:error, :storage_unavailable}
+
         _ -> {:error, :unauthorized}
       end
 

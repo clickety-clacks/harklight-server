@@ -115,6 +115,9 @@ defmodule AttentionServer.ClientAPI.Auth do
         with {:ok, %{device_id: device, person_id: person, hash: hash, pending: pending}} <-
                Relay.native_session(relay, secret) do
           {:ok, %Principal{kind: :device, key: device, person: person, session_id: hash, pending: pending}}
+        else
+          {:error, :storage_unavailable} -> {:error, :unavailable}
+          _ -> {:error, :unauthorized}
         end
 
       _ ->

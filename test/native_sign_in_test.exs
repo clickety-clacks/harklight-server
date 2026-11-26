@@ -88,6 +88,22 @@ defmodule AttentionServer.NativeSignInTest do
 
     assert Router.call(request, router).status == 200
 
+    :sys.replace_state(restarted, fn state ->
+      :ok = Sqlite3.execute(state.store.db, "ALTER TABLE harklight_device_sessions RENAME TO temporarily_hidden")
+      state
+    end)
+
+    unavailable = Router.call(request, router)
+    assert unavailable.status == 503
+    assert %{"error" => "retry_later", "retryable" => true} = json(unavailable)
+
+    :sys.replace_state(restarted, fn state ->
+      :ok = Sqlite3.execute(state.store.db, "ALTER TABLE temporarily_hidden RENAME TO harklight_device_sessions")
+      state
+    end)
+
+    assert Router.call(request, router).status == 200
+
     assert request
            |> Plug.Conn.put_req_header("cookie", "__Host-harklight=ambiguous")
            |> Router.call(router)
