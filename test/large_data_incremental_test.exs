@@ -56,6 +56,24 @@ defmodule AttentionServer.LargeDataIncrementalTest do
     }
   end
 
+  test "attachment restoration keeps unrelated maps shared and rebinds retained references", %{dir: dir} do
+    history = Map.new(1..1_000, fn id -> {id, %{"body" => "inline #{id}"}} end)
+    inline = %{history: history}
+    assert {:ok, unchanged} = LargeData.attach_paths(inline, dir, [])
+    assert :erts_debug.same(unchanged, inline)
+
+    {durable, persisted, rows} = full(%{history: history, content: [%{"body" => big(1)}]}, dir)
+    assert {:ok, restored} = LargeData.attach_paths(persisted, dir, rows)
+    assert restored == durable
+    assert :erts_debug.same(restored.history, history)
+
+    moved = Path.join(dir, "new")
+    assert {:ok, rebound} = LargeData.attach_paths(durable, moved, [])
+    [ref] = Map.values(LargeData.refs(rebound))
+    assert ref.path == Path.join(moved, ref.id)
+    assert :erts_debug.same(rebound.history, history)
+  end
+
   test "an unchanged state reuses the base without walking it", %{dir: dir} do
     {durable, persisted, index} = base(initial(), dir)
 
