@@ -39,7 +39,8 @@ mix run --no-compile scripts/relay-memory.exs measure "$scratch/fixture" 1600 10
 Pass the desired final message count, discussion event count, and session count
 to `seed`. The fixture contains 20 fewer messages so `measure` can add the
 last 20 through the Relay. It then repeats 750 existing operations, cursor
-reads and bounded v2 Inbox reads, and records RSS after a 15-second idle period.
+reads and bounded requests to `GET /v2/inbox`. It records RSS after a 15-second
+idle period.
 The script measures a forced major GC separately and reports process, ETS,
 binary, and field sizes. A flattened field size counts shared subterms for
 each reference and serves as an upper bound for copied heap terms.

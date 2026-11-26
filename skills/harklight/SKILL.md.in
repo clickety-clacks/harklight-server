@@ -10,10 +10,10 @@ description: >-
 
 # Harklight
 
-Harklight delivers this agent's questions and notices to the person's Harklight
-inbox (iPhone app or web) and returns their answers. The person connects this
-computer with `harklight-agent setup` and uses the same command to refresh the
-skill. After setup, the `harklight-agent` command needs no connection options.
+Harklight is an attention-based UI that shows this agent's questions and notices
+in the person's attention list (iPhone app or web) and returns their answers.
+The person connects this computer with `harklight-agent setup` and uses the
+same command to refresh the skill. After setup, the `harklight-agent` command needs no connection options.
 If you need to check which Server, account or sender IDs this computer can
 use, ask the person to run `harklight-agent setup` with no arguments and share
 the status it prints. Connecting a disconnected computer requires their
