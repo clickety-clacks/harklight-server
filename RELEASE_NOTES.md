@@ -3,8 +3,9 @@
 Bundles Harklight Web 0.2.7 (source 500550aa, archive SHA-256
 45ea669f38c88bd37fa55503ad669ca64c3c3fbd33d465dd55b26f138992fba7). Web 0.2.7
 can show shared messages addressed to several named people, but only on a
-Server that advertises the feature. This release doesn't advertise it yet, so
-the web client behaves exactly as 0.2.6. Nothing else changes.
+Server that advertises the feature. This release doesn't advertise it, so the
+shared-message screens stay inactive. Web 0.2.7 also changes how it pages while
+catching up after a reset: it finishes the catch-up before loading more.
 
 ## Upgrade and recovery
 
