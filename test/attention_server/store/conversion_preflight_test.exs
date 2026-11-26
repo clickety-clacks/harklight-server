@@ -165,9 +165,9 @@ defmodule AttentionServer.Store.ConversionPreflightTest do
     assert {:error, {:fit_not_established, :memory, _, _}} =
              ConversionPreflight.check(db, %{generous | memory: 7 * gib}, 30)
 
-    for size <- [771_569_498, 1_232_830_635] do
+    for {size, ratio} <- [{771_569_498, 13}, {1_232_830_635, 10}] do
       put_large_header(db, size)
-      memory = 512 * 1024 * 1024 + 10 * size
+      memory = 512 * 1024 * 1024 + ratio * size
       disk = 128 * 1024 * 1024 + 5 * size
       exact = %{generous | memory: memory, disk: disk}
       assert {:ok, %{expanded_bytes: ^size}} = ConversionPreflight.check(db, exact, 30)
@@ -177,6 +177,12 @@ defmodule AttentionServer.Store.ConversionPreflightTest do
 
       assert {:error, {:fit_not_established, :disk, ^disk, _}} =
                ConversionPreflight.check(db, %{exact | disk: disk - 1}, 30)
+
+      assert {:ok, %{expanded_bytes: ^size}} =
+               ConversionPreflight.check(db, %{exact | uploads: 8_392_704}, 30)
+
+      assert {:error, {:fit_not_established, :upload_bytes, 8_392_705, 8_392_704}} =
+               ConversionPreflight.check(db, %{exact | uploads: 8_392_705}, 30)
     end
 
     :ok = Sqlite3.execute(db, "INSERT INTO relay_large_data_refs VALUES (1)")

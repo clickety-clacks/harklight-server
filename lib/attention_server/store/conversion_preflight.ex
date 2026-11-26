@@ -37,22 +37,25 @@ defmodule AttentionServer.Store.ConversionPreflight do
   }
   @shape_fields [:upload_bytes, :client_resource_revs, :agent_changes, :large_data_references]
 
-  # Both 50,000-message fixtures fit with ten bytes per expanded byte and
-  # the fixed reserve. Budget each band at its upper end so a smaller
-  # payload can still carry the densest shape admitted in that band.
-  @large_budget Map.merge(@common_budget, %{memory_per_byte: 10, references: 0, uploads: 4096})
+  # Both 50,000-message fixtures were rehearsed with this upload allocation
+  # and no retained large-data references. Round each measured memory ratio
+  # up with 20% headroom and apply the fixed reserve. Budget each band at its
+  # upper end so smaller payloads can still carry its densest admitted shape.
+  @large_budget Map.merge(@common_budget, %{references: 0, uploads: 8_392_704})
   @envelopes [
     @shape_a,
     Map.put(@shape_a_extension, :extension, true),
     Map.merge(@large_budget, %{
       expanded_bytes: 771_569_498,
       bound_bytes: 771_569_498,
+      memory_per_byte: 13,
       revisions: 600_000,
       changes: 383_432
     }),
     Map.merge(@large_budget, %{
       expanded_bytes: 1_232_830_635,
       bound_bytes: 1_232_830_635,
+      memory_per_byte: 10,
       revisions: 1_000_402,
       changes: 650_100
     })
