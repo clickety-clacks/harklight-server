@@ -1195,7 +1195,7 @@ defmodule AttentionServer.Store do
     projected_entries = if store.change_log, do: projected_entries, else: []
 
     cond do
-      MapSet.size(touched) > 0 or projected_entries != [] ->
+      MapSet.size(touched) > 0 or projected_entries != [] or Map.has_key?(audit, :native_redemption) ->
         commit_keyed(store, next, touched, audit, projected_entries)
 
       KeyedValidation.untouched_change(store.engine, next, touched) == :ok ->
@@ -2087,7 +2087,8 @@ defmodule AttentionServer.Store do
   defp do_commit(%__MODULE__{change_log: true} = store, next, %{item_refresh: _} = audit, []),
     do: commit_durable(store, next, audit)
 
-  defp do_commit(%__MODULE__{engine: old} = store, next, _audit, []) when old == next,
+  defp do_commit(%__MODULE__{engine: old} = store, next, audit, [])
+       when old == next and not is_map_key(audit, :native_redemption),
     do: {:ok, store}
 
   defp do_commit(%__MODULE__{db: nil} = store, next, _audit, _projected_entries),

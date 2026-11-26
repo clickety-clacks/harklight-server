@@ -1,7 +1,7 @@
 defmodule AttentionServer.NativeSignIn do
   @moduledoc false
 
-  alias AttentionServer.{BrowserAuth, DeviceProof, Engine}
+  alias AttentionServer.{BrowserAuth, DeviceMigration, DeviceProof, Engine, JSON}
   alias AttentionServer.Store.RecordTable
   alias Exqlite.Sqlite3
 
@@ -19,7 +19,9 @@ defmodule AttentionServer.NativeSignIn do
     redeemed_device TEXT,
     redeemed_session TEXT,
     redeemed_key TEXT,
-    redeemed_label TEXT
+    redeemed_label TEXT,
+    redeemed_old_proof TEXT,
+    old_device_result TEXT
   );
   CREATE INDEX harklight_native_transactions_expiry
     ON harklight_native_transactions (expires_ms);
@@ -106,27 +108,34 @@ defmodule AttentionServer.NativeSignIn do
     end
   end
 
-  def prepare_redemption(db, engine, %{"verifier" => verifier} = request, now) do
+  def prepare_redemption(db, engine, %{"verifier" => verifier} = request, now, mode) do
     with true <- DeviceProof.secret?(verifier),
          {:ok, proof} <- proof(request, "transaction"),
-         {:ok, [[person, method, expires, device, redeemed_hash, redeemed_key, redeemed_label]]} <-
+         {:ok, old_proof} <- old_proof(request, mode),
+         {:ok, [[person, method, expires, device, redeemed_hash, redeemed_key, redeemed_label,
+                 redeemed_old_proof, old_device_result]]} <-
            RecordTable.select(
              db,
              """
              SELECT person_id, method, authorized_until_ms, redeemed_device, redeemed_session,
-                    redeemed_key, redeemed_label
+                    redeemed_key, redeemed_label, redeemed_old_proof, old_device_result
              FROM harklight_native_transactions
              WHERE transaction_id = ? AND verifier_hash = ? AND person_id IS NOT NULL
              """,
              [proof.reference, DeviceProof.digest(verifier)]
            ) do
-      if device do
-        duplicate(db, person, method, device, proof.hash, proof.key, proof.label,
-          {redeemed_hash, redeemed_key, redeemed_label})
-      else
-        if expires > now,
-          do: prepare_device(engine, proof.reference, person, method, proof.hash, proof.key, proof.label, now),
-          else: {:error, :unauthorized}
+      proof = Map.put(proof, :old_digest, old_proof && DeviceProof.digest(JSON.canonical(old_proof)))
+
+      cond do
+        device ->
+          duplicate(db, person, method, device, proof,
+            {redeemed_hash, redeemed_key, redeemed_label, redeemed_old_proof}, old_device_result)
+
+        expires > now ->
+          prepare_device(db, engine, person, method, proof, old_proof, now)
+
+        true ->
+          {:error, :unauthorized}
       end
     else
       false -> {:error, :invalid_request}
@@ -135,55 +144,105 @@ defmodule AttentionServer.NativeSignIn do
     end
   end
 
-  def prepare_redemption(_, _, _, _), do: {:error, :invalid_request}
+  def prepare_redemption(_, _, _, _, _), do: {:error, :invalid_request}
 
-  defp duplicate(db, person, method, device, hash, key, label, {hash, key, label}) do
+  defp old_proof(%{"old_proof" => %{"device_id" => id, "public_key" => key, "signature" => signature} = proof}, :self_hosted)
+       when is_binary(id) and is_binary(key) and is_binary(signature) and map_size(proof) == 3 do
+    if DeviceProof.hash?(id), do: {:ok, proof}, else: {:error, :invalid_request}
+  end
+
+  defp old_proof(%{"old_proof" => _}, _), do: {:error, :invalid_request}
+  defp old_proof(_, _), do: {:ok, nil}
+
+  defp duplicate(db, person, method, device, %{hash: hash, key: key, label: label, old_digest: digest},
+         {hash, key, label, digest}, old_device) do
     case lookup_session(db, hash) do
       {:ok, %{device_id: ^device, person_id: ^person}} ->
-        {:ok, result(person, device, method, true)}
+        {:ok, with_old_device(result(person, device, method, true), old_device)}
 
       _ ->
         {:error, :unauthorized}
     end
   end
 
-  defp duplicate(_, _, _, _, _, _, _, _), do: {:error, :unauthorized}
+  defp duplicate(_, _, _, _, _, _, _), do: {:error, :unauthorized}
 
-  defp prepare_device(engine, transaction, person, method, hash, key, label, now) do
+  defp prepare_device(db, engine, person, method, proof, old_proof, now) do
+    old_device = old_device_status(engine, person, method, proof, old_proof)
+
+    with {:ok, next, device, status} <- recipient(engine, person, proof.label, old_device),
+         {:ok, previous} <- device_session_hash(db, device) do
+      redemption = Map.merge(proof, %{person: person, device: device, old_device: status,
+                                      previous: previous, now: now})
+      response = with_old_device(result(person, device, method, false), status)
+      {:ok, next, redemption, response}
+    end
+  end
+
+  defp old_device_status(_engine, _person, _method, _proof, nil), do: nil
+
+  defp old_device_status(engine, person, method, proof,
+         %{"device_id" => id, "public_key" => public_key, "signature" => signature})
+       when method in ["owner_code", "passkey"] do
+    with {:ok, key} <- DeviceProof.legacy_key(public_key, id),
+         true <- DeviceProof.verify(key, DeviceProof.sign_in_bytes(proof.reference, proof.hash), signature),
+         %{person: ^person, revoked: revoked} <- engine.devices[id] do
+      if revoked, do: "removed", else: {:attached, id}
+    else
+      _ -> "unknown"
+    end
+  end
+
+  defp old_device_status(_, _, _, _, _), do: "unknown"
+
+  defp recipient(engine, _person, _label, {:attached, device}),
+    do: {:ok, engine, device, "attached"}
+
+  defp recipient(engine, person, label, status) do
     device = :crypto.strong_rand_bytes(32) |> Base.encode16(case: :lower)
 
     with {:ok, next} <- Engine.setup_device(engine, person, device) do
       next = Engine.put_row(next, :devices, device, %{next.devices[device] | label: label})
-      redemption = %{reference: transaction, person: person, device: device, hash: hash,
-                     key: key, label: label, now: now}
-      {:ok, next, redemption, result(person, device, method, false)}
+      {:ok, next, device, status}
     end
   end
+
+  defp with_old_device(result, nil), do: result
+  defp with_old_device(result, status), do: Map.put(result, "old_device", status)
 
   def result(person, device, method, duplicate),
     do: %{"person_id" => person, "device_id" => device, "method" => method, "duplicate" => duplicate}
 
   def commit_redemption(db, redemption) do
     %{reference: transaction, person: person, device: device, hash: hash,
-      key: key, label: label, now: now} = redemption
+      key: key, label: label, now: now, old_digest: old_digest, old_device: old_device} = redemption
 
     with :ok <-
            RecordTable.run(
              db,
              """
              UPDATE harklight_native_transactions
-             SET redeemed_device = ?, redeemed_session = ?, redeemed_key = ?, redeemed_label = ?
+             SET redeemed_device = ?, redeemed_session = ?, redeemed_key = ?, redeemed_label = ?,
+                 redeemed_old_proof = ?, old_device_result = ?
              WHERE transaction_id = ? AND redeemed_device IS NULL
              """,
-             [device, hash, key, label, transaction]
+             [device, hash, key, label, old_digest, old_device, transaction]
            ),
-         {:ok, 1} <- Sqlite3.changes(db) do
+         {:ok, 1} <- Sqlite3.changes(db),
+         :ok <- replace_recovered_session(db, person, device, old_device) do
       add_session(db, hash, device, person, key, now, false)
     else
       {:ok, 0} -> {:error, :unauthorized}
       error -> error
     end
   end
+
+  defp replace_recovered_session(db, person, device, "attached") do
+    with :ok <- remove_device_sessions(db, person, device),
+         do: DeviceMigration.set_phase(db, device, "activated")
+  end
+
+  defp replace_recovered_session(_, _, _, _), do: :ok
 
   def add_session(db, hash, device, person, key, now, pending?) do
     RecordTable.run(

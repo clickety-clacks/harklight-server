@@ -1567,12 +1567,7 @@ defmodule AttentionServer.Relay do
   defp dispatch_call({:redeem_native_transaction, request}, _from, state) do
     case state.store do
       %{auth_schema: %{}, db: db, engine: engine} ->
-        result =
-          if Map.has_key?(request, "old_proof") do
-            {:error, :invalid_request}
-          else
-            NativeSignIn.prepare_redemption(db, engine, request, state.clock.())
-          end
+        result = NativeSignIn.prepare_redemption(db, engine, request, state.clock.(), state.deployment_mode)
 
         case result do
           {:ok, next, redemption, response} ->
@@ -1584,7 +1579,10 @@ defmodule AttentionServer.Relay do
             }
 
             case commit(state.store, next, audit) do
-              {:ok, store} -> {:reply, {:ok, response}, %{state | store: store}}
+              {:ok, store} ->
+                notify_native_recovery(redemption)
+                {:reply, {:ok, response}, %{state | store: store}}
+
               _ -> {:reply, {:error, :storage_unavailable}, state}
             end
 
@@ -4016,6 +4014,14 @@ defmodule AttentionServer.Relay do
         engine
     end
   end
+
+  defp notify_native_recovery(%{old_device: "attached", device: device, previous: previous}) do
+    closed = [{{:device_certificate, device}, :revoked}]
+    closed = if previous, do: [{{:device_session, previous}, :revoked} | closed], else: closed
+    ChangeLog.notify_closing(closed)
+  end
+
+  defp notify_native_recovery(_), do: :ok
 
   defp authorize_device_management(state, %{kind: :browser, person: person, key: key, owner_revision: revision}) do
     case Engine.owner_revision(state.store.engine, person, key) do
