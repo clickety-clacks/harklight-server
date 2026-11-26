@@ -58,7 +58,10 @@ defmodule AttentionServer.BounceDecision do
       raw_revision: 1,
       accepted_at_ms: accepted_at,
       qualified: qualifies_initial_delivery?(config, accepted_seq),
-      selection: nil
+      selection:
+        if(BouncePolicy.eligible_at?(accepted_at),
+          do: basic_selection(engine, person, record.message, accepted_at)
+        )
     }
 
     state = %{
@@ -106,7 +109,10 @@ defmodule AttentionServer.BounceDecision do
         raw_revision: raw_revision,
         accepted_at_ms: accepted_at,
         qualified: qualifies_revision?(config, conversation_seq),
-        selection: nil
+        selection:
+          if(BouncePolicy.eligible_at?(record.accepted_at),
+            do: basic_selection(engine, elem(key, 0), revised_message, accepted_at)
+          )
       }
 
       state = %{
@@ -200,6 +206,7 @@ defmodule AttentionServer.BounceDecision do
         %{"score" => score} = entry, {current, keys}
         when not is_map_key(entry, "conversation_seq") ->
           key = {person, entry["sender_id"], entry["message_id"]}
+          current = evaluate_due_for_keys(current, [key], now_ms)
           {record_score(current, key, score), [key | keys]}
 
         _, acc ->
@@ -467,40 +474,157 @@ defmodule AttentionServer.BounceDecision do
       "increased importance warrants raising its priority."
   end
 
-  defp record_score(engine, {person, sender, message_id} = key, score)
-       when is_binary(sender) and is_binary(message_id) do
-    with %{message: message} = record <- Map.get(engine.messages, key),
-         true <- Message.valid_message_type?(message["message_type"]),
-         false <- Message.progress_message?(message),
-         levels when is_list(levels) <- effective_levels(engine, person),
-         state <- Map.get(engine.bounce_revisions, key) || legacy_revision_state(record),
-         sub_revision when is_integer(sub_revision) <- state.current_substantive_revision,
-         %{qualified: true, selection: nil} = revision <- Map.get(state.revisions, sub_revision),
-         {:ok, selected} <- BouncePolicy.select_level(levels, score) do
-      due_at =
-        if is_integer(selected["interval_ms"]),
-          do: revision.accepted_at_ms + selected["interval_ms"],
-          else: nil
+  # Use the same thresholds as the default ranking bands to map basic urgency
+  # into the account's level table, including custom names and disabled levels.
+  defp basic_selection(engine, person, message, accepted_at) do
+    score =
+      case Message.effective_urgency(message) do
+        "now" -> 0.8
+        "high" -> 0.6
+        "normal" -> 0.3
+        "low" -> 0
+      end
 
-      selection = %{
-        "level_name" => selected["name"],
-        "bounce_after_days" => selected["bounce_after_days"],
-        "interval_ms" => selected["interval_ms"],
-        "due_at_ms" => due_at,
-        "decision" => if(is_nil(due_at), do: "disabled", else: "pending"),
+    if eligible_message?(message), do: select(engine, person, score, accepted_at)
+  end
+
+  defp eligible_message?(message) do
+    Message.valid_message_type?(message["message_type"]) and not Message.progress_message?(message)
+  end
+
+  defp select(engine, person, score, accepted_at) do
+    with levels when is_list(levels) <- effective_levels(engine, person),
+         {:ok, level} <- BouncePolicy.select_level(levels, score) do
+      interval = level["interval_ms"]
+
+      %{
+        "level_name" => level["name"],
+        "bounce_after_days" => level["bounce_after_days"],
+        "interval_ms" => interval,
+        "due_at_ms" => if(is_integer(interval), do: accepted_at + interval),
+        "decision" => if(is_nil(interval), do: "disabled", else: "pending"),
         "advisory_id" => nil,
         "reason" => nil
       }
+    else
+      _ -> nil
+    end
+  end
 
-      updated_revision = %{revision | selection: selection}
-      updated = %{state | revisions: Map.put(state.revisions, sub_revision, updated_revision)}
-      put_revision_state(engine, key, updated)
+  defp record_score(engine, {person, sender, message_id} = key, score)
+       when is_binary(sender) and is_binary(message_id) do
+    with %{message: message} = record <- engine.messages[key],
+         true <- inbox_open?(record) and eligible_message?(message),
+         true <- BouncePolicy.eligible_at?(record.accepted_at),
+         %{current_substantive_revision: sub} = state <- engine.bounce_revisions[key],
+         %{qualified: true, selection: prior} = revision <- state.revisions[sub],
+         true <- is_nil(prior) or prior["decision"] in ["pending", "disabled"],
+         %{} = selection <- select(engine, person, score, revision.accepted_at_ms),
+         true <- selection != prior do
+      put_selection(engine, key, state, sub, %{revision | selection: selection})
     else
       _ -> engine
     end
   end
 
   defp record_score(engine, _key, _score), do: engine
+
+  defp put_selection(engine, key, state, sub, revision) do
+    put_revision_state(engine, key, %{state | revisions: Map.put(state.revisions, sub, revision)})
+  end
+
+  # Startup and the offline preview use the same transition. Preview discards
+  # the result, including any generated advisories, without committing it.
+  def startup(%Engine{} = engine, now_ms, cutoff) do
+    {scheduled, added} =
+      engine
+      |> apply_cutoff(cutoff)
+      |> resume_decisions()
+      |> backfill(cutoff)
+
+    {decided, due} = evaluate_due_with_changes(scheduled, now_ms)
+
+    counts =
+      Enum.reduce(due, %{full: 0, soft: 0}, fn key, counts ->
+        before = engine.messages[key]
+        after_record = decided.messages[key]
+
+        cond do
+          not fully_bounced?(before) and fully_bounced?(after_record) ->
+            Map.update!(counts, :full, &(&1 + 1))
+
+          new_soft_advisory?(before, after_record) ->
+            Map.update!(counts, :soft, &(&1 + 1))
+
+          true ->
+            counts
+        end
+      end)
+
+    backfilled_full = Enum.count(added, &fully_bounced?(decided.messages[&1]))
+    {decided, due, Map.merge(counts, %{backfilled: length(added), backfilled_full: backfilled_full})}
+  end
+
+  defp new_soft_advisory?(before, after_record) do
+    notices = Map.get(before, "item_advisories", %{})
+
+    Enum.any?(Map.get(after_record, "item_advisories", %{}), fn {id, notice} ->
+      notice["advisory_type"] == "soft_bounce" and not Map.has_key?(notices, id)
+    end)
+  end
+
+  defp apply_cutoff(engine, nil), do: engine
+
+  defp apply_cutoff(engine, cutoff) do
+    Enum.reduce(engine.bounce_revisions, engine, fn {key, state}, current ->
+      sub = state.current_substantive_revision
+      revision = state.revisions[sub]
+      record = engine.messages[key]
+
+      if record.accepted_at < cutoff and
+           (pending_revision(state) != nil or
+              (resumable_open?(revision) and not item_notice_for_revision?(record, sub))) do
+        put_selection(current, key, state, sub, %{revision | selection: nil})
+      else
+        current
+      end
+    end)
+  end
+
+  defp resumable_open?(%{accepted_at_ms: accepted, selection: %{"decision" => "suppressed", "reason" => "opened"}}),
+    do: accepted > @defaults_published_at_ms
+
+  defp resumable_open?(_revision), do: false
+
+  defp backfill(engine, cutoff) do
+    Enum.reduce(engine.messages, {engine, []}, fn
+      {{person, _, _} = key, record}, {current, keys} ->
+        with true <- inbox_open?(record) and eligible_message?(record.message),
+             true <- BouncePolicy.eligible_at?(record.accepted_at, cutoff),
+             stored = current.bounce_revisions[key],
+             state = stored || legacy_revision_state(record),
+             sub = state.current_substantive_revision,
+             %{selection: nil} = revision <- state.revisions[sub],
+             accepted =
+               if(stored,
+                 do: revision.accepted_at_ms,
+                 else: Map.get(record, :revision_accepted_at, record.accepted_at)
+               ),
+             %{} = selection <- basic_selection(current, person, record.message, accepted) do
+          current =
+            if accepted <= @defaults_published_at_ms do
+              Engine.put_row(current, :messages, key, Map.put(record, "bounce_backfilled_revision", sub))
+            else
+              current
+            end
+
+          updated = %{revision | accepted_at_ms: accepted, qualified: true, selection: selection}
+          {put_selection(current, key, state, sub, updated), [key | keys]}
+        else
+          _ -> {current, keys}
+        end
+    end)
+  end
 
   defp evaluate_due_from_index(engine, now_ms, changed_keys) do
     case :gb_trees.is_empty(engine.bounce_deadline_index) do
@@ -587,13 +711,16 @@ defmodule AttentionServer.BounceDecision do
   defp evaluate_selection(engine, key, record, state, sub_revision, revision, selection, now_ms) do
     due = selection["due_at_ms"]
 
-    opened =
-      opened?(engine, key, sub_revision) and
-        (revision.accepted_at_ms <= @defaults_published_at_ms or
-           Map.get(Map.get(record, "bounce_opened_at", %{}), sub_revision, 0) < due)
+    legacy? =
+      revision.accepted_at_ms <= @defaults_published_at_ms and
+        record["bounce_backfilled_revision"] != sub_revision
 
-    case suppression_reason(engine, key, record, revision, opened, due) do
-      nil when revision.accepted_at_ms <= @defaults_published_at_ms ->
+    # A new or moved deadline can already be in the past. A recorded open
+    # still proves the recipient opened the message before this decision.
+    opened = Enum.any?(state.revisions, fn {sub, _} -> opened?(engine, key, sub) end)
+
+    case suppression_reason(engine, key, record, revision, legacy? and opened, due) do
+      nil when legacy? ->
         case route_status(engine, key, record) do
           :supported ->
             append_advisory(engine, key, state, sub_revision, revision, selection, now_ms)
@@ -616,7 +743,7 @@ defmodule AttentionServer.BounceDecision do
         )
 
       nil ->
-        if legacy_feed?(engine, key, record) and not opened?(engine, key, sub_revision),
+        if legacy_feed?(engine, key, record),
           do: append_advisory(engine, key, state, sub_revision, revision, selection, now_ms),
           else:
             append_item_advisory(
@@ -636,7 +763,7 @@ defmodule AttentionServer.BounceDecision do
     end
   end
 
-  defp suppression_reason(engine, key, record, revision, opened, due) do
+  defp suppression_reason(engine, key, record, revision, legacy_opened?, due) do
     cond do
       not revision.qualified ->
         "not_qualified"
@@ -654,7 +781,7 @@ defmodule AttentionServer.BounceDecision do
       person_discussed?(engine, key) ->
         "person_discussion"
 
-      opened and revision.accepted_at_ms <= @defaults_published_at_ms ->
+      legacy_opened? ->
         "opened"
 
       true ->
@@ -705,7 +832,7 @@ defmodule AttentionServer.BounceDecision do
   end
 
   defp item_advisory_text("soft_bounce", sub, at) do
-    "The person opened this message and had not acted on it when its bounce interval elapsed. " <>
+    "The person had opened this message and had not acted on it when the server evaluated the bounce. " <>
       "It remains in their inbox. This notice concerns revision #{sub}, using records available at #{at}."
   end
 
@@ -1262,9 +1389,8 @@ defmodule AttentionServer.BounceDecision do
   defp put_configuration(engine, person, config),
     do: Engine.put_row(engine, :bounce_levels, person, config)
 
-  # Defaults apply to newly accepted deliveries and revisions. Existing stored
-  # qualification flags (including legacy false values) remain unchanged, so
-  # reading defaults never backfills retained messages.
+  # Reading the levels has no side effects. Backfill runs once per missing
+  # selection when the relay opens a store.
   defp effective_levels(engine, person) do
     case Map.get(engine.bounce_levels, person) do
       nil -> BouncePolicy.default_levels()

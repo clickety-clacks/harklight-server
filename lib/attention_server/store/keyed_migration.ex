@@ -79,14 +79,18 @@ defmodule AttentionServer.Store.KeyedMigration do
     %{engine | origin_sessions: sessions, item_availability: availability}
   end
 
-  def load(db) do
+  def load(db), do: load(db, [@format])
+
+  def load_preview(db), do: load(db, [30, @format])
+
+  defp load(db, formats) do
     # Load the codec's identity atom before decoding the anchor with :safe.
     supported_identity = RecordCodec.identity()
 
     with {:ok, [[version, payload, checksum]]} <-
            query(db, "SELECT version, payload, checksum FROM relay_state WHERE id = 1", []),
          true <- :crypto.hash(:sha256, payload) == checksum,
-         {:ok, identity} <- decode_anchor(payload),
+         {:ok, identity} <- decode_anchor(payload, formats),
          :ok <- check_identity(identity, supported_identity),
          {:ok, generation} <- RecordTable.generation(db),
          true <- generation >= version,
@@ -99,10 +103,11 @@ defmodule AttentionServer.Store.KeyedMigration do
     end
   end
 
-  defp decode_anchor(payload) do
+  defp decode_anchor(payload, formats) do
     case :erlang.binary_to_term(payload, [:safe]) do
-      {:attention_relay_keyed_state, @format, identity} -> {:ok, identity}
-      {:attention_relay_keyed_state, _, _} -> {:error, :unsupported_keyed_format}
+      {:attention_relay_keyed_state, format, identity} ->
+        if format in formats, do: {:ok, identity}, else: {:error, :unsupported_keyed_format}
+
       _ -> {:error, :not_keyed}
     end
   rescue

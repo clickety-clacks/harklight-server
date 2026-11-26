@@ -230,7 +230,7 @@ defmodule AttentionServer.PrioritizationTest do
              })
   end
 
-  test "baseline display priority passes effective urgency through without scoring or bounce", %{
+  test "basic order and Jev fallback schedule bounce from effective urgency", %{
     path: path
   } do
     relay = start_relay(path)
@@ -291,26 +291,16 @@ defmodule AttentionServer.PrioritizationTest do
 
     engine = state.store.engine
     refute Map.has_key?(engine.bounce_levels, "person-a")
-    assert engine.bounce_revisions[{"person-a", "app:test", "C"}].revisions[1].qualified
-    unscored = BounceDecision.record_scores(engine, "person-a", entries, 1_000)
-    assert BounceDecision.next_deadline(unscored) == nil
 
-    after_time =
-      BounceDecision.evaluate_due(unscored, System.system_time(:millisecond) + 30 * 86_400_000)
+    for {id, level, hours} <- [{"A", "Low", 168}, {"B", "Normal", 72},
+                               {"C", "Urgent", 12}, {"default", "Normal", 72}] do
+      key = {"person-a", "app:test", id}
+      revision = engine.bounce_revisions[key].revisions[1]
+      assert revision.selection["level_name"] == level
+      assert revision.selection["due_at_ms"] == revision.accepted_at_ms + hours * 3_600_000
+    end
 
-    assert BounceDecision.next_deadline(after_time) == nil
-    assert after_time.advisory_feeds == engine.advisory_feeds
-    # Positive control: the same eligible item receives a bounce interval only
-    # when it receives an actual score, not the display priority above.
-    scored =
-      BounceDecision.record_scores(
-        engine,
-        "person-a",
-        [%{"sender_id" => "app:test", "message_id" => "C", "score" => 0.9}],
-        1_000
-      )
-
-    assert is_integer(BounceDecision.next_deadline(scored))
+    assert is_reference(state.bounce_deadline_timer)
 
     configure_jev_choice(relay)
     publish_fallback_view(relay)
@@ -328,12 +318,128 @@ defmodule AttentionServer.PrioritizationTest do
     fallback_unscored =
       BounceDecision.record_scores(fallback_engine, "person-a", fallback["entries"], 1_000)
 
-    assert BounceDecision.next_deadline(fallback_unscored) == nil
+    assert BounceDecision.next_deadline(fallback_unscored) == BounceDecision.next_deadline(engine)
+  end
 
-    assert BounceDecision.evaluate_due(
-             fallback_unscored,
-             System.system_time(:millisecond) + 30 * 86_400_000
-           ).advisory_feeds == fallback_engine.advisory_feeds
+  test "startup backfills retained unscored items, bounces overdue items and logs once", %{path: path} do
+    accepted = 1_794_900_000_000
+    relay = start_relay(path, clock: fn -> accepted end)
+    setup_person(relay)
+
+    assert %{"type" => "ok"} =
+             request(relay, "device-a", %{
+               "type" => "forward",
+               "op_id" => op(1),
+               "message" => %{
+                 "sender_id" => "app:test",
+                 "message_id" => "retained",
+                 "title" => "Retained",
+                 "created_at" => accepted,
+                 "message_type" => "fyi",
+                 "answer_ui" => %{
+                   "schema" => "attention-client.actions/1",
+                   "actions" => [%{"id" => "seen", "label" => "Seen", "kind" => "value",
+                                    "value" => %{"acknowledgment" => "seen"}}]
+                 }
+               }
+             })
+
+    key = {"person-a", "app:test", "retained"}
+    GenServer.stop(relay)
+
+    {:ok, store} = Store.open(path)
+    legacy =
+      store.engine
+      |> put_in([Access.key(:bounce_revisions), key, :revisions, 1, :selection], nil)
+      |> BounceDecision.rebuild_indexes()
+
+    {:ok, store} = Store.commit(store, legacy, %{person: "person-a", actor: "fixture", action: "legacy"})
+    :ok = Store.close(store)
+
+    original = File.read!(path)
+    files = File.ls!(Path.dirname(path)) |> Enum.sort()
+
+    assert ExUnit.CaptureIO.capture_io(fn ->
+             AttentionServer.CLI.Operator.run(["bounce-preview", "--store", path])
+           end) == ~s({"full":1,"soft":0}\n)
+
+    assert File.read!(path) == original
+    assert Enum.sort(File.ls!(Path.dirname(path))) == files
+    File.write!(path <> "-wal", "uncheckpointed")
+    assert Store.read_stopped_engine(path) == {:error, :store_not_checkpointed}
+    File.rm!(path <> "-wal")
+
+    due = accepted + 259_200_000
+    opts = [clock: fn -> due end]
+
+    log = ExUnit.CaptureLog.capture_log(fn ->
+      restarted = start_relay(path, opts)
+      engine = :sys.get_state(restarted).store.engine
+      assert engine.messages[key]["full_bounced_at_ms"] == due
+      GenServer.stop(restarted)
+    end)
+
+    assert log =~ "event=harklight_bounce_backfill selections=1 overdue_full_bounces=1"
+
+    log = ExUnit.CaptureLog.capture_log(fn ->
+      restarted = start_relay(path, opts)
+      assert :sys.get_state(restarted).store.engine.messages[key]["full_bounced_at_ms"] == due
+    end)
+
+    refute log =~ "harklight_bounce_backfill"
+  end
+
+  test "an exact UTC cutoff excludes older deliveries and can be cleared", %{path: path} do
+    setting = "ATTENTION_SERVER_BOUNCE_NOT_BEFORE"
+    on_exit(fn -> System.delete_env(setting) end)
+    System.put_env(setting, "2026-11-17T14:16:54Z")
+    assert {:ok, 1_794_925_014_000 = cutoff} = BouncePolicy.cutoff()
+    relay = start_relay(path, clock: fn -> cutoff - 1 end)
+    setup_person(relay)
+
+    for {id, at, n} <- [{"before", cutoff - 1, 1}, {"equal", cutoff, 2}] do
+      :sys.replace_state(relay, &%{&1 | clock: fn -> at end})
+
+      assert %{"type" => "ok"} =
+               request(relay, "device-a", %{
+                 "type" => "forward",
+                 "op_id" => op(n),
+                 "message" => %{
+                   "sender_id" => "app:test",
+                   "message_id" => id,
+                   "title" => id,
+                   "created_at" => at,
+                   "message_type" => "fyi",
+                   "answer_ui" => %{
+                     "schema" => "attention-client.actions/1",
+                     "actions" => [%{"id" => "seen", "label" => "Seen", "kind" => "value",
+                                      "value" => %{"acknowledgment" => "seen"}}]
+                   }
+                 }
+               })
+    end
+
+    engine = :sys.get_state(relay).store.engine
+    older = {"person-a", "app:test", "before"}
+    boundary = {"person-a", "app:test", "equal"}
+    assert engine.bounce_revisions[older].revisions[1].selection == nil
+    assert engine.bounce_revisions[boundary].revisions[1].selection["due_at_ms"] ==
+             cutoff + 259_200_000
+
+    retained =
+      engine
+      |> put_in([Access.key(:bounce_revisions), boundary, :revisions, 1, :selection], nil)
+      |> BounceDecision.rebuild_indexes()
+
+    now_ms = cutoff + 259_200_000
+    {_, _, counts} = BounceDecision.startup(retained, now_ms, cutoff)
+    assert %{full: 1, soft: 0, backfilled: 1} = counts
+
+    {_, _, counts} = BounceDecision.startup(retained, now_ms, nil)
+    assert %{full: 2, soft: 0, backfilled: 2} = counts
+
+    System.put_env(setting, "2026-11-17")
+    assert BouncePolicy.cutoff() == {:error, :invalid_bounce_cutoff}
   end
 
   test "Hosted accounts rank independently using the configured connection", %{
@@ -372,7 +478,13 @@ defmodule AttentionServer.PrioritizationTest do
                    "sender_id" => "app:test",
                    "message_id" => message,
                    "title" => message,
-                   "created_at" => n
+                   "created_at" => n,
+                   "message_type" => "fyi",
+                   "answer_ui" => %{
+                     "schema" => "attention-client.actions/1",
+                     "actions" => [%{"id" => "seen", "label" => "Seen", "kind" => "value",
+                                      "value" => %{"acknowledgment" => "seen"}}]
+                   }
                  }
                })
     end
@@ -388,6 +500,9 @@ defmodule AttentionServer.PrioritizationTest do
 
       state = await_state(relay, &(&1.priority_views[person].basis == "selected"))
       assert [%{"message_id" => ^message, "score" => 0.75}] = state.priority_views[person].entries
+      revision = state.store.engine.bounce_revisions[{person, "app:test", message}].revisions[1]
+      assert revision.selection["level_name"] == "High"
+      assert revision.selection["due_at_ms"] == revision.accepted_at_ms + 86_400_000
     end
 
     assert :sys.get_state(relay).applied_score_record == nil
@@ -1702,7 +1817,9 @@ defmodule AttentionServer.PrioritizationTest do
         "fixed-bounce-selection"
       })
 
-    assert persisted_bounce.revisions[1].selection == selection
+    rescored = persisted_bounce.revisions[1].selection
+    assert rescored["level_name"] == "Urgent"
+    assert rescored["due_at_ms"] == record.accepted_at + 345_600_000
 
     GenServer.stop(relay)
     restarted = start_relay(path, priority_evaluator: fn _ -> {:error, :unavailable} end)
@@ -1713,7 +1830,7 @@ defmodule AttentionServer.PrioritizationTest do
         {"person-a", "app:test", "fixed-bounce-selection"}
       )
 
-    assert restarted_bounce.revisions[1].selection == selection
+    assert restarted_bounce.revisions[1].selection == rescored
   end
 
   test "later arrivals and cache-only passes do not re-record unchanged scores", %{

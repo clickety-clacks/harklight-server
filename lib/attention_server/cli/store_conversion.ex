@@ -37,7 +37,7 @@ defmodule AttentionServer.CLI.StoreConversion do
 
   defp source_format("v0.2." <> minor) do
     case Integer.parse(minor) do
-      {n, ""} when n in 16..24 -> 30
+      {n, ""} when n in 16..25 -> 30
       _ -> :unsupported
     end
   end

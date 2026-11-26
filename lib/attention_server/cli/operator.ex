@@ -8,7 +8,14 @@ defmodule AttentionServer.CLI.Operator do
   This command uses local database custody. It never uploads a private key.
   """
 
-  alias AttentionServer.OperatorTool
+  alias AttentionServer.{BounceDecision, BouncePolicy, JSON, OperatorTool, Store}
+
+  def run(["bounce-preview" | args]) do
+    case OptionParser.parse(args, strict: [store: :string]) do
+      {[store: path], [], []} -> bounce_preview(path)
+      _ -> AttentionServer.CLI.error!("use harklight operator bounce-preview --store PATH")
+    end
+  end
 
   def run([command | args]) when command in ["bootstrap", "recover"] do
     {options, rest, invalid} =
@@ -65,5 +72,25 @@ defmodule AttentionServer.CLI.Operator do
   end
 
   def run(_),
-    do: AttentionServer.CLI.error!("use bootstrap or recover; see SELF_HOST.md")
+    do: AttentionServer.CLI.error!("use bootstrap, recover or bounce-preview; see SELF_HOST.md")
+
+  defp bounce_preview(path) do
+    with {:ok, cutoff} <- BouncePolicy.cutoff(),
+         {:ok, engine} <- Store.read_stopped_engine(path) do
+      {_ignored, _keys, counts} =
+        BounceDecision.startup(engine, System.system_time(:millisecond), cutoff)
+
+      AttentionServer.CLI.shell().info(JSON.encode!(%{"full" => counts.full, "soft" => counts.soft}))
+    else
+      {:error, :invalid_bounce_cutoff} ->
+        AttentionServer.CLI.error!("ATTENTION_SERVER_BOUNCE_NOT_BEFORE must be an RFC 3339 UTC timestamp")
+
+      {:error, :store_not_checkpointed} ->
+        AttentionServer.CLI.error!("Stop Harklight Server cleanly before previewing this store")
+
+      {:error, reason} ->
+        AttentionServer.CLI.error!("cannot preview the stopped FORMAT30 store: #{inspect(reason)}")
+    end
+  end
+
 end

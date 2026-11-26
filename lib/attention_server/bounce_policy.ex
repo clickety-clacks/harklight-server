@@ -14,6 +14,34 @@ defmodule AttentionServer.BouncePolicy do
     %{"name" => "Urgent", "lower_bound" => 0.8, "bounce_after_days" => 0.5}
   ]
 
+  @cutoff_env "ATTENTION_SERVER_BOUNCE_NOT_BEFORE"
+
+  def cutoff do
+    case System.get_env(@cutoff_env) do
+      nil -> {:ok, nil}
+      "" -> {:ok, nil}
+      value -> parse_cutoff(value)
+    end
+  end
+
+  defp parse_cutoff(value) do
+    with true <- String.ends_with?(value, ["Z", "+00:00"]),
+         {:ok, instant, 0} <- DateTime.from_iso8601(value) do
+      {:ok, -Integer.floor_div(-DateTime.to_unix(instant, :microsecond), 1_000)}
+    else
+      _ -> {:error, :invalid_bounce_cutoff}
+    end
+  end
+
+  def eligible_at?(accepted_at, cutoff), do: is_nil(cutoff) or accepted_at >= cutoff
+
+  def eligible_at?(accepted_at) do
+    case cutoff() do
+      {:ok, cutoff} -> eligible_at?(accepted_at, cutoff)
+      {:error, _} -> false
+    end
+  end
+
   def default_levels do
     {:ok, levels} = normalize_levels(@default_level_rows)
     levels

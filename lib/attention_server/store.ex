@@ -260,6 +260,61 @@ defmodule AttentionServer.Store do
     with {:ok, store} <- open_store(path, mode), do: finish_open(store)
   end
 
+  @doc """
+  Reads a stopped, checkpointed FORMAT30 or FORMAT31 store without opening
+  the original with SQLite. A disposable private copy contains any SQLite
+  sidecars, and no normal startup or migration work runs.
+  """
+  def read_stopped_engine(path) when is_binary(path) do
+    suffix = Base.url_encode64(:crypto.strong_rand_bytes(16), padding: false)
+    dir = Path.join(System.tmp_dir!(), "harklight-preview-" <> suffix)
+
+    with :ok <- File.mkdir(dir) do
+      try do
+        copy = Path.join(dir, "preview.sqlite3")
+
+        with :ok <- File.chmod(dir, 0o700),
+             :ok <- require_checkpoint(path),
+             :ok <- File.cp(path, copy),
+             :ok <- require_checkpoint(path),
+             {:ok, db} <- Sqlite3.open(copy, mode: :readonly) do
+          try do
+            read_preview_engine(db)
+          after
+            Sqlite3.close(db)
+          end
+        end
+      after
+        File.rm_rf(dir)
+      end
+    end
+  end
+
+  defp require_checkpoint(path) do
+    Enum.reduce_while(["-wal", "-journal"], :ok, fn suffix, :ok ->
+      case File.stat(path <> suffix) do
+        {:error, :enoent} -> {:cont, :ok}
+        {:ok, %{size: 0}} -> {:cont, :ok}
+        {:ok, _} -> {:halt, {:error, :store_not_checkpointed}}
+        error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp read_preview_engine(db) do
+    case one(db, "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'relay_records'", []) do
+      {:ok, [1]} ->
+        with {:ok, decoded, _generation} <- KeyedMigration.load_preview(db),
+             do: validate_keyed_engine(decoded)
+
+      {:ok, nil} ->
+        with {:ok, engine, _version} <- load_or_create(db, nil, :preview), do: {:ok, engine}
+
+      error ->
+        error
+    end
+  end
+
   defp open_store(path, mode) do
     upload_dir = Path.expand(path) <> ".uploads"
 
@@ -2311,10 +2366,7 @@ defmodule AttentionServer.Store do
 
   defp load_or_create(db, upload_dir, purpose \\ :open) do
     case one(db, "SELECT version, payload, checksum FROM relay_state WHERE id = 1", []) do
-      {:ok, nil} when purpose == :convert ->
-        {:error, :invalid_state}
-
-      {:ok, nil} ->
+      {:ok, nil} when purpose == :open ->
         engine = Engine.new()
         payload = Persistence.run(fn -> encode_state(engine) end)
 
@@ -2329,6 +2381,9 @@ defmodule AttentionServer.Store do
                ) do
           load_or_create(db, upload_dir)
         end
+
+      {:ok, nil} ->
+        {:error, :invalid_state}
 
       {:ok, [version, payload, checksum]} when is_integer(version) and is_binary(payload) ->
         if :crypto.hash(:sha256, payload) == checksum do
