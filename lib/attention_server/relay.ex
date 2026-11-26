@@ -47,6 +47,10 @@ defmodule AttentionServer.Relay do
   def setup_device(server, person, key),
     do: GenServer.call(server, {:setup_device, person, key}, :infinity)
 
+  @doc false
+  def operator_organization_member(server, person, member?),
+    do: GenServer.call(server, {:operator_organization_member, person, member?}, :infinity)
+
   @doc "Local-operator bootstrap from a public owner certificate; no network caller uses this API."
   def operator_bootstrap(server, certificate_der) do
     with {:ok, key} <- DeviceIdentity.from_certificate(certificate_der),
@@ -1845,25 +1849,35 @@ defmodule AttentionServer.Relay do
   defp dispatch_call({:operator_bootstrap, key}, _from, state) do
     person = random_uuid_v4()
 
-    case Engine.operator_bootstrap(state.store.engine, person, key) do
-      {:ok, next_engine} ->
-        case commit(state.store, next_engine, %{
-               person: person,
-               actor: "local_operator",
-               action: "owner_bootstrap"
-             }) do
-          {:ok, store} ->
-            next_state = ensure_priority_view_if_missing(%{state | store: store}, person)
-            {:reply, {:ok, person}, next_state}
+    with {:ok, next_engine} <- Engine.operator_bootstrap(state.store.engine, person, key),
+         {:ok, next_engine} <- Engine.set_local_organization_member(next_engine, person, true) do
+      case commit(state.store, next_engine, %{
+             person: person,
+             actor: "local_operator",
+             action: "owner_bootstrap"
+           }) do
+        {:ok, store} ->
+          next_state = ensure_priority_view_if_missing(%{state | store: store}, person)
+          {:reply, {:ok, person}, next_state}
 
-          {:error, _, _} ->
-            {:reply, {:error, :storage_unavailable}, state}
-        end
-
+        {:error, _, _} ->
+          {:reply, {:error, :storage_unavailable}, state}
+      end
+    else
       {:error, reason} ->
         {:reply, {:error, reason}, state}
     end
   end
+
+  defp dispatch_call({:operator_organization_member, person, member?}, _from, state),
+    do:
+      setup(
+        state,
+        Engine.set_local_organization_member(state.store.engine, person, member?),
+        person,
+        "local_operator",
+        if(member?, do: "organization_member_add", else: "organization_member_remove")
+      )
 
   defp dispatch_call({:operator_recover, person, key}, _from, state),
     do:

@@ -104,6 +104,23 @@ defmodule AttentionServer.HostedAccountTest do
       GenServer.stop(relay)
     end
 
+    test "local operator manages only local organization affiliations", %{certs: certs, dir: dir} do
+      relay = start_relay(certs, dir, [])
+      assert {:ok, person} = Relay.operator_bootstrap(relay, TLSFixtures.certificate_der!(certs, "a1"))
+      assert {:ok, hosted} = Relay.hosted_account_create(relay, "acct-external")
+
+      assert :sys.get_state(relay).store.engine.local_organizations.default == MapSet.new([person])
+      assert {:error, :unknown_local_person} = Relay.operator_organization_member(relay, hosted, true)
+      assert :ok = Relay.operator_organization_member(relay, person, false)
+      assert :ok = GenServer.stop(relay)
+
+      relay = start_relay(certs, dir, [])
+      assert :sys.get_state(relay).store.engine.local_organizations.default == MapSet.new()
+      assert :ok = Relay.operator_organization_member(relay, person, true)
+      assert :sys.get_state(relay).store.engine.local_organizations.default == MapSet.new([person])
+      assert :ok = GenServer.stop(relay)
+    end
+
     test "an operator-created owner has an empty inbox", %{certs: certs, dir: dir} do
       relay = start_relay(certs, dir, [])
       owner_certificate = TLSFixtures.certificate_der!(certs, "a1")

@@ -76,6 +76,7 @@ defmodule AttentionServer.Engine do
             cursors: %{},
             hosted_accounts: %{},
             hosted_organizations: %{},
+            local_organizations: %{},
             delivery_states: %{},
             algorithm_choices: %{},
             alert_choices: %{},
@@ -734,6 +735,31 @@ defmodule AttentionServer.Engine do
         end
     end
   end
+
+  @doc false
+  def set_local_organization_member(%__MODULE__{} = engine, person, member?)
+      when is_boolean(member?) do
+    if Map.has_key?(engine.owners, person) and is_nil(hosted_account(engine, person)) do
+      members =
+        Map.get_lazy(engine.local_organizations, :default, fn ->
+          hosted_people = MapSet.new(Map.values(engine.hosted_accounts), & &1.person)
+          MapSet.difference(MapSet.new(Map.keys(engine.owners)), hosted_people)
+        end)
+
+      members = if member?, do: MapSet.put(members, person), else: MapSet.delete(members, person)
+      {:ok, put_row(engine, :local_organizations, :default, members)}
+    else
+      {:error, :unknown_local_person}
+    end
+  end
+
+  @doc false
+  def valid_local_organization?(%__MODULE__{} = engine, :default, %MapSet{} = members) do
+    hosted_people = MapSet.new(Map.values(engine.hosted_accounts), & &1.person)
+    MapSet.disjoint?(members, hosted_people) and Enum.all?(members, &Map.has_key?(engine.owners, &1))
+  end
+
+  def valid_local_organization?(_, _, _), do: false
 
   @doc false
   def replace_hosted_organization(%__MODULE__{} = engine, ref, people, id)
