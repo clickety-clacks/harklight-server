@@ -137,6 +137,9 @@ defmodule AttentionServer.DashboardReadHTTP do
       conn.method == "POST" and conn.request_path == "/sign-in" ->
         redeem_sign_in(conn, opts)
 
+      conn.method == "POST" and conn.request_path == "/sign-out" ->
+        sign_out(fetch_cookies(conn), opts)
+
       conn.method == "GET" and conn.request_path == "/join" ->
         join_page(conn, opts)
 
@@ -194,7 +197,9 @@ defmodule AttentionServer.DashboardReadHTTP do
     end
   end
 
-  defp sign_out(conn, opts, session) do
+  defp sign_out(conn, opts) do
+    session = Map.get(conn.req_cookies, @cookie)
+
     case form(conn, opts, ~w(confirm)) do
       {:ok, %{"confirm" => "sign_out"}, conn} ->
         result = if session, do: backend_call(opts.backend, :end_session, session), else: :ok
@@ -218,16 +223,6 @@ defmodule AttentionServer.DashboardReadHTTP do
   end
 
   defp complete_sign_out(conn, _opts, _error), do: send_resp(conn, 503, "Sign out unavailable")
-
-  # Sign-out still completes the hosted half when the Server cookie is absent or expired.
-  defp no_session(
-         %{method: "POST", request_path: "/sign-out"} = conn,
-         %{hosted: true} = opts
-       ),
-       do: sign_out(conn, opts, nil)
-
-  defp no_session(%{method: "POST", request_path: "/sign-out"} = conn, opts),
-    do: sign_out(conn, opts, nil)
 
   # A hosted deployment sends a browser with no usable dashboard session to its
   # sign-in page for other requests.
@@ -540,16 +535,6 @@ defmodule AttentionServer.DashboardReadHTTP do
       {_, _, conn} ->
         send_resp(conn, 403, "Prioritization settings refused")
     end
-  end
-
-  # End this browser's dashboard session. Hosted mode completes its account
-  # sign-out through the configured address; self-hosted returns to local help.
-  defp route(
-         %{method: "POST", request_path: "/sign-out"} = conn,
-         opts,
-         _principal
-       ) do
-    sign_out(conn, opts, Map.get(conn.req_cookies, @cookie))
   end
 
   defp route(%{method: "GET", request_path: "/devices/add"} = conn, _opts, _principal) do
