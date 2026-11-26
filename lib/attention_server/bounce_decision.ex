@@ -58,7 +58,10 @@ defmodule AttentionServer.BounceDecision do
       raw_revision: 1,
       accepted_at_ms: accepted_at,
       qualified: qualifies_initial_delivery?(config, accepted_seq),
-      selection: basic_selection(engine, person, record.message, accepted_at)
+      selection:
+        if(BouncePolicy.eligible_at?(accepted_at),
+          do: basic_selection(engine, person, record.message, accepted_at)
+        )
     }
 
     state = %{
@@ -106,7 +109,10 @@ defmodule AttentionServer.BounceDecision do
         raw_revision: raw_revision,
         accepted_at_ms: accepted_at,
         qualified: qualifies_revision?(config, conversation_seq),
-        selection: basic_selection(engine, elem(key, 0), revised_message, accepted_at)
+        selection:
+          if(BouncePolicy.eligible_at?(record.accepted_at),
+            do: basic_selection(engine, elem(key, 0), revised_message, accepted_at)
+          )
       }
 
       state = %{
@@ -509,6 +515,7 @@ defmodule AttentionServer.BounceDecision do
        when is_binary(sender) and is_binary(message_id) do
     with %{message: message} = record <- engine.messages[key],
          true <- inbox_open?(record) and eligible_message?(message),
+         true <- BouncePolicy.eligible_at?(record.accepted_at),
          %{current_substantive_revision: sub} = state <- engine.bounce_revisions[key],
          %{qualified: true, selection: prior} = revision <- state.revisions[sub],
          true <- is_nil(prior) or prior["decision"] in ["pending", "disabled"],
@@ -526,38 +533,97 @@ defmodule AttentionServer.BounceDecision do
     put_revision_state(engine, key, %{state | revisions: Map.put(state.revisions, sub, revision)})
   end
 
-  def backfill(%Engine{} = engine, now_ms) do
-    {next, keys} =
-      Enum.reduce(engine.messages, {engine, []}, fn
-        {{person, _, _} = key, record}, {current, keys} ->
-          with true <- inbox_open?(record) and eligible_message?(record.message),
-               stored = current.bounce_revisions[key],
-               state = stored || legacy_revision_state(record),
-               sub = state.current_substantive_revision,
-               %{selection: nil} = revision <- state.revisions[sub],
-               accepted =
-                 if(stored,
-                   do: revision.accepted_at_ms,
-                   else: Map.get(record, :revision_accepted_at, record.accepted_at)
-                 ),
-               %{} = selection <- basic_selection(current, person, record.message, accepted) do
-            current =
-              if accepted <= @defaults_published_at_ms do
-                Engine.put_row(current, :messages, key, Map.put(record, "bounce_backfilled_revision", sub))
-              else
-                current
-              end
+  # Startup and the offline preview use the same transition. Preview discards
+  # the result, including any generated advisories, without committing it.
+  def startup(%Engine{} = engine, now_ms, cutoff) do
+    {scheduled, added} =
+      engine
+      |> apply_cutoff(cutoff)
+      |> resume_decisions()
+      |> backfill(cutoff)
 
-            updated = %{revision | accepted_at_ms: accepted, qualified: true, selection: selection}
-            {put_selection(current, key, state, sub, updated), [key | keys]}
-          else
-            _ -> {current, keys}
-          end
+    {decided, due} = evaluate_due_with_changes(scheduled, now_ms)
+
+    counts =
+      Enum.reduce(due, %{full: 0, soft: 0}, fn key, counts ->
+        before = engine.messages[key]
+        after_record = decided.messages[key]
+
+        cond do
+          not fully_bounced?(before) and fully_bounced?(after_record) ->
+            Map.update!(counts, :full, &(&1 + 1))
+
+          new_soft_advisory?(before, after_record) ->
+            Map.update!(counts, :soft, &(&1 + 1))
+
+          true ->
+            counts
+        end
       end)
 
-    decided = evaluate_due_for_keys(next, keys, now_ms)
-    count = Enum.count(keys, &fully_bounced?(decided.messages[&1]))
-    {decided, keys, count}
+    backfilled_full = Enum.count(added, &fully_bounced?(decided.messages[&1]))
+    {decided, due, Map.merge(counts, %{backfilled: length(added), backfilled_full: backfilled_full})}
+  end
+
+  defp new_soft_advisory?(before, after_record) do
+    notices = Map.get(before, "item_advisories", %{})
+
+    Enum.any?(Map.get(after_record, "item_advisories", %{}), fn {id, notice} ->
+      notice["advisory_type"] == "soft_bounce" and not Map.has_key?(notices, id)
+    end)
+  end
+
+  defp apply_cutoff(engine, nil), do: engine
+
+  defp apply_cutoff(engine, cutoff) do
+    Enum.reduce(engine.bounce_revisions, engine, fn {key, state}, current ->
+      sub = state.current_substantive_revision
+      revision = state.revisions[sub]
+      record = engine.messages[key]
+
+      if record.accepted_at < cutoff and
+           (pending_revision(state) != nil or
+              (resumable_open?(revision) and not item_notice_for_revision?(record, sub))) do
+        put_selection(current, key, state, sub, %{revision | selection: nil})
+      else
+        current
+      end
+    end)
+  end
+
+  defp resumable_open?(%{accepted_at_ms: accepted, selection: %{"decision" => "suppressed", "reason" => "opened"}}),
+    do: accepted > @defaults_published_at_ms
+
+  defp resumable_open?(_revision), do: false
+
+  defp backfill(engine, cutoff) do
+    Enum.reduce(engine.messages, {engine, []}, fn
+      {{person, _, _} = key, record}, {current, keys} ->
+        with true <- inbox_open?(record) and eligible_message?(record.message),
+             true <- BouncePolicy.eligible_at?(record.accepted_at, cutoff),
+             stored = current.bounce_revisions[key],
+             state = stored || legacy_revision_state(record),
+             sub = state.current_substantive_revision,
+             %{selection: nil} = revision <- state.revisions[sub],
+             accepted =
+               if(stored,
+                 do: revision.accepted_at_ms,
+                 else: Map.get(record, :revision_accepted_at, record.accepted_at)
+               ),
+             %{} = selection <- basic_selection(current, person, record.message, accepted) do
+          current =
+            if accepted <= @defaults_published_at_ms do
+              Engine.put_row(current, :messages, key, Map.put(record, "bounce_backfilled_revision", sub))
+            else
+              current
+            end
+
+          updated = %{revision | accepted_at_ms: accepted, qualified: true, selection: selection}
+          {put_selection(current, key, state, sub, updated), [key | keys]}
+        else
+          _ -> {current, keys}
+        end
+    end)
   end
 
   defp evaluate_due_from_index(engine, now_ms, changed_keys) do

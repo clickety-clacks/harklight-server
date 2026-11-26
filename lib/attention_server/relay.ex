@@ -480,11 +480,11 @@ defmodule AttentionServer.Relay do
 
   @impl true
   def init(opts) do
-    case open_startup_store(opts) do
-      {:ok, store} ->
+    case startup_store_with_cutoff(opts) do
+      {:ok, store, cutoff} ->
         clock = Keyword.get(opts, :clock, fn -> System.system_time(:millisecond) end)
 
-        case startup_cleanup(store, clock.()) do
+        case startup_cleanup(store, clock.(), cutoff) do
           {:ok, store} ->
             state = %{
               store: store,
@@ -557,6 +557,13 @@ defmodule AttentionServer.Relay do
     end
   end
 
+  defp startup_store_with_cutoff(opts) do
+    with {:ok, cutoff} <- AttentionServer.BouncePolicy.cutoff(),
+         {:ok, store} <- open_startup_store(opts) do
+      {:ok, store, cutoff}
+    end
+  end
+
   # The store writes the change log in every commit. It is turned on once,
   # here, before any startup commit; a store that cannot keep it (one with no
   # path) does not start.
@@ -601,14 +608,14 @@ defmodule AttentionServer.Relay do
 
   defp startup_reason(_opts, _phase, reason), do: reason
 
-  defp startup_cleanup(store, now_ms) do
+  defp startup_cleanup(store, now_ms, cutoff) do
     actor_keys = browser_actor_keys(store.engine)
     engine = discard_browser_actor_state(store.engine, actor_keys)
 
     with :ok <- Store.discard_building_inbox_snapshots(store),
          {:ok, store} <- commit_browser_cleanup(store, engine),
          {:ok, store} <- Store.migrate_retained_client_data(store),
-         {:ok, store} <- resume_bounces(store, now_ms),
+         {:ok, store} <- resume_bounces(store, now_ms, cutoff),
          :ok <- Store.discard_browser_inbox_snapshots(store) do
       {:ok, store}
     else
@@ -617,8 +624,8 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  defp resume_bounces(store, now_ms) do
-    {engine, keys, count} = store.engine |> BounceDecision.resume_decisions() |> BounceDecision.backfill(now_ms)
+  defp resume_bounces(store, now_ms, cutoff) do
+    {engine, keys, counts} = BounceDecision.startup(store.engine, now_ms, cutoff)
 
     if engine == store.engine do
       {:ok, store}
@@ -627,8 +634,10 @@ defmodule AttentionServer.Relay do
 
       with {:ok, engine} <- AttentionServer.AgentAPI.Advisories.stamp_decisions(store, engine, keys),
            {:ok, updated} <- commit(store, engine, audit) do
-        if keys != [] do
-          Logger.info("event=harklight_bounce_backfill selections=#{length(keys)} overdue_full_bounces=#{count}")
+        if counts.backfilled > 0 do
+          Logger.info(
+            "event=harklight_bounce_backfill selections=#{counts.backfilled} overdue_full_bounces=#{counts.backfilled_full}"
+          )
         end
 
         {:ok, updated}

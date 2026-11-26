@@ -481,6 +481,23 @@ defmodule AttentionServer.BounceDecisionTest do
     end
   end
 
+  test "startup preview counts overdue soft bounces separately and honors the cutoff" do
+    accepted = 1_795_507_200_000
+    {engine, record} = fixture(configured?: false, accepted_at: accepted)
+    {:ok, engine, 1} = BounceDecision.record_open(engine, key(), record, 1)
+    due = accepted + 259_200_000
+
+    {_, _, counts} = BounceDecision.startup(engine, due, accepted)
+    assert %{full: 0, soft: 1} = counts
+
+    {excluded, [], counts} = BounceDecision.startup(engine, due, accepted + 1)
+    assert %{full: 0, soft: 0} = counts
+    assert BounceDecision.next_deadline(excluded) == nil
+
+    {_, _, counts} = BounceDecision.startup(excluded, due, nil)
+    assert %{full: 0, soft: 1, backfilled: 1} = counts
+  end
+
   test "a pre-cutoff Open still suppresses a notice waiting on support" do
     {engine, record} = fixture(supported?: false)
     selected = score(engine, 0.9, @accepted_at)

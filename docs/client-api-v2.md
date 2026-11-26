@@ -1728,6 +1728,9 @@ On first startup with this policy, eligible open revisions with no
 stored selection are scheduled from their original acceptance time.
 Overdue bounces are evaluated on startup. The server logs the number
 of selections it backfilled and the number of overdue full bounces.
+An optional server cutoff excludes messages accepted strictly before it,
+including from startup backfill. The cutoff uses the original message
+acceptance time even after revision.
 
 An unopened revision keeps the
 `unseen_interval_elapsed` advisory; an opened, unanswered revision uses

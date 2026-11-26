@@ -352,6 +352,16 @@ defmodule AttentionServer.PrioritizationTest do
     {:ok, store} = Store.commit(store, legacy, %{person: "person-a", actor: "fixture", action: "legacy"})
     :ok = Store.close(store)
 
+    original = File.read!(path)
+    files = File.ls!(Path.dirname(path)) |> Enum.sort()
+
+    assert ExUnit.CaptureIO.capture_io(fn ->
+             AttentionServer.CLI.Operator.run(["bounce-preview", "--store", path])
+           end) == ~s({"full":1,"soft":0}\n)
+
+    assert File.read!(path) == original
+    assert Enum.sort(File.ls!(Path.dirname(path))) == files
+
     due = accepted + 259_200_000
     opts = [clock: fn -> due end]
 
@@ -370,6 +380,59 @@ defmodule AttentionServer.PrioritizationTest do
     end)
 
     refute log =~ "harklight_bounce_backfill"
+  end
+
+  test "an exact UTC cutoff excludes older deliveries and can be cleared", %{path: path} do
+    setting = "ATTENTION_SERVER_BOUNCE_NOT_BEFORE"
+    on_exit(fn -> System.delete_env(setting) end)
+    System.put_env(setting, "2026-11-17T14:16:54Z")
+    assert {:ok, 1_794_925_014_000 = cutoff} = BouncePolicy.cutoff()
+    relay = start_relay(path, clock: fn -> cutoff - 1 end)
+    setup_person(relay)
+
+    for {id, at, n} <- [{"before", cutoff - 1, 1}, {"equal", cutoff, 2}] do
+      :sys.replace_state(relay, &%{&1 | clock: fn -> at end})
+
+      assert %{"type" => "ok"} =
+               request(relay, "device-a", %{
+                 "type" => "forward",
+                 "op_id" => op(n),
+                 "message" => %{
+                   "sender_id" => "app:test",
+                   "message_id" => id,
+                   "title" => id,
+                   "created_at" => at,
+                   "message_type" => "fyi",
+                   "answer_ui" => %{
+                     "schema" => "attention-client.actions/1",
+                     "actions" => [%{"id" => "seen", "label" => "Seen", "kind" => "value",
+                                      "value" => %{"acknowledgment" => "seen"}}]
+                   }
+                 }
+               })
+    end
+
+    engine = :sys.get_state(relay).store.engine
+    older = {"person-a", "app:test", "before"}
+    boundary = {"person-a", "app:test", "equal"}
+    assert engine.bounce_revisions[older].revisions[1].selection == nil
+    assert engine.bounce_revisions[boundary].revisions[1].selection["due_at_ms"] ==
+             cutoff + 259_200_000
+
+    retained =
+      engine
+      |> put_in([Access.key(:bounce_revisions), boundary, :revisions, 1, :selection], nil)
+      |> BounceDecision.rebuild_indexes()
+
+    now_ms = cutoff + 259_200_000
+    {_, _, counts} = BounceDecision.startup(retained, now_ms, cutoff)
+    assert %{full: 1, soft: 0, backfilled: 1} = counts
+
+    {_, _, counts} = BounceDecision.startup(retained, now_ms, nil)
+    assert %{full: 2, soft: 0, backfilled: 2} = counts
+
+    System.put_env(setting, "2026-11-17")
+    assert BouncePolicy.cutoff() == {:error, :invalid_bounce_cutoff}
   end
 
   test "Hosted accounts rank independently using the configured connection", %{
