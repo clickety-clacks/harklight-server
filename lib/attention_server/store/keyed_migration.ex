@@ -144,7 +144,7 @@ defmodule AttentionServer.Store.KeyedMigration do
   defp check_identity(_, _), do: {:error, :unsupported_record_codec}
 
   defp read_records(db) do
-    Code.ensure_loaded!(AttentionServer.SharedPush)
+    Enum.each([AttentionServer.SharedPush, AttentionServer.SharedReminders], &Code.ensure_loaded!/1)
     RecordTable.scan(db, &RecordCodec.decode/1)
   end
 

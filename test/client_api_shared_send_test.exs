@@ -552,6 +552,51 @@ defmodule AttentionServer.ClientAPISharedSendTest do
     assert {:ok, nil} = Relay.claim_push(relay, now)
   end
 
+  test "due reminders group unseen people and preserve the separate opened reminder", ctx do
+    server = start_supervised!({Server, [shared_messages: true] ++ ctx.server_opts})
+    relay = Server.relay(server)
+    {sender, first, second} = people(ctx, relay)
+    assert :ok = Relay.replace_hosted_organization(relay, "org", [sender, first, second])
+    headers = [{"harklight-features", "shared_messages"}]
+    baseline = "/v2/agent/delivery-baseline"
+    assert {200, %{"rev" => prior, "continuation" => token}, _} =
+             get_request(ctx, server, "a1", baseline, headers)
+    assert {200, %{"message" => %{"item_id" => room}}, _} =
+             send_request(ctx, server, @key, body([sender, first, second]), true)
+    {first_path, second_path} = recipient_paths(relay, room, first, second)
+    assert {200, _, _} =
+             write_request(ctx, server, "a2", "POST", first_path <> "/seen", op_key(62),
+               %{"request_revision" => 1}, headers)
+    engine = :sys.get_state(relay).store.engine
+    due = AttentionServer.SharedReminders.next_deadline(engine)
+    assert is_integer(due)
+    state = :sys.replace_state(relay, &%{&1 | clock: fn -> due end})
+    send(relay, {:bounce_due, state.bounce_deadline_generation})
+    state = :sys.get_state(relay)
+    assert AttentionServer.SharedReminders.next_deadline(state.store.engine) == nil
+
+    sender_path = "/v2/agent/messages/" <> room
+    assert {200, %{"message" => %{"advisories" => advisories}}, _} =
+             get_request(ctx, server, "a1", sender_path, headers)
+    by_reason = Map.new(advisories, &{&1["advisory_type"], &1})
+    assert %{"people" => [%{"id" => ^first}]} = by_reason["soft_bounce"]
+    assert %{"people" => unseen, "advisory_id" => advisory_id} = by_reason["unseen_interval_elapsed"]
+    assert MapSet.new(unseen, & &1["id"]) == MapSet.new([sender, second])
+    assert {200, %{"item" => %{"rank" => %{"section" => "resolved"}}}, _} =
+             get_request(ctx, server, "b1", second_path, headers)
+
+    assert {200, %{"changes" => changes}, _} =
+             get_request(ctx, server, "a1", "/v2/agent/changes?after=#{prior}",
+               [{"harklight-continuation", token} | headers])
+    assert Enum.count(changes, &(&1["kind"] == "advisory")) == 2
+    ack = %{"advisory_id" => advisory_id}
+    assert {200, %{"advisory_id" => ^advisory_id, "rev" => _, "delivered" => true} = acknowledged, _} =
+             write_request(ctx, server, "a1", "POST", sender_path <> "/advisories/ack", op_key(63), ack, headers)
+    assert {200, ^acknowledged, replay} =
+             write_request(ctx, server, "a1", "POST", sender_path <> "/advisories/ack", op_key(63), ack, headers)
+    assert {"idempotent-replayed", "true"} in replay
+  end
+
   test "Seen is per person and revision, with one attributed Agent event", ctx do
     server = start_supervised!({Server, [shared_messages: true] ++ ctx.server_opts})
     relay = Server.relay(server)

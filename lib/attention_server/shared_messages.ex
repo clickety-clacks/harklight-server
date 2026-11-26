@@ -1,7 +1,7 @@
 defmodule AttentionServer.SharedMessages do
   @moduledoc false
 
-  alias AttentionServer.{BounceDecision, Engine, SharedAnswers}
+  alias AttentionServer.{BounceDecision, Engine, SharedAnswers, SharedReminders}
   alias AttentionServer.ClientAPI.{PeopleProfiles, SharedAttachments}
 
   def organizations(%Engine{} = engine, person) do
@@ -455,7 +455,7 @@ defmodule AttentionServer.SharedMessages do
       Enum.count(for_person(engine, person), fn {message, recipient} ->
         not Map.has_key?(recipient, :frozen) and
           MapSet.member?(affiliations, message.organization_id) and
-          SharedAnswers.available?(engine, message, recipient, person)
+          not SharedReminders.bounced?(recipient) and SharedAnswers.available?(engine, message, recipient, person)
       end)
 
     %{"unresolved" => individual + shared}
@@ -473,7 +473,7 @@ defmodule AttentionServer.SharedMessages do
 
   defp request_attention?(engine, record, recipient, person) do
     not AttentionServer.Message.progress_message?(record.message) and
-      SharedAnswers.available?(engine, record, recipient, person)
+      not SharedReminders.bounced?(recipient) and SharedAnswers.available?(engine, record, recipient, person)
   end
 
   defp unread_chat?(engine, record, recipient, person) do
@@ -517,7 +517,7 @@ defmodule AttentionServer.SharedMessages do
       "files" => SharedAttachments.wire(Map.get(record, :files, [])),
       "seen" => recipient.seen_revision == record.revision,
       "chat" => chat_state(engine, record, recipient, person),
-      "rank" => %{"key" => recipient.item_id, "section" => if(not is_nil(frozen) or not is_nil(answers.terminal), do: "resolved", else: "current")},
+      "rank" => %{"key" => recipient.item_id, "section" => if(not is_nil(frozen) or not is_nil(answers.terminal) or SharedReminders.bounced?(recipient), do: "resolved", else: "current")},
       "terminal" => answers.terminal,
       "shared" => %{
         "shared_id" => record.id,
@@ -613,7 +613,11 @@ defmodule AttentionServer.SharedMessages do
     }
     |> Map.merge(Map.take(record, ["session", "created_at_ms"]))
     |> maybe_terminal(answers.terminal)
+    |> put_advisories(SharedReminders.advisory_projection(engine, record))
   end
+
+  defp put_advisories(wire, []), do: wire
+  defp put_advisories(wire, advisories), do: Map.put(wire, "advisories", advisories)
 
   defp sender_seen?(engine, record) do
     Enum.any?(live_recipients(engine, record.id), fn person ->
@@ -652,10 +656,12 @@ defmodule AttentionServer.SharedMessages do
 
   def valid_message?(_, _, _), do: false
 
-  def valid_recipient?(%Engine{} = engine, {shared_id, person}, %{item_id: item, seen_revision: seen}) do
+  def valid_recipient?(%Engine{} = engine, {shared_id, person}, %{item_id: item, seen_revision: seen} = recipient) do
     if Map.has_key?(engine.persons, person) and item == local_item_id(shared_id, person) do
       case Map.get(engine.shared_messages, shared_id) do
-        %{revision: revision} -> is_nil(seen) or (is_integer(seen) and seen in 1..revision)
+        %{revision: revision} ->
+          (is_nil(seen) or (is_integer(seen) and seen in 1..revision)) and
+            SharedReminders.valid_recipient?(recipient, revision)
         _ -> false
       end
     else

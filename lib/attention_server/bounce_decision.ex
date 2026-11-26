@@ -22,6 +22,11 @@ defmodule AttentionServer.BounceDecision do
     |> BouncePolicy.public_levels()
   end
 
+  def shared_selection(engine, person, message, at) do
+    message = Map.put_new(message, "message_type", "request")
+    if BouncePolicy.eligible_at?(at), do: basic_selection(engine, person, message, at)
+  end
+
   def configure_levels(%Engine{} = engine, person, levels, now_ms)
       when is_binary(person) and is_list(levels) and is_integer(now_ms) do
     case Map.get(engine.bounce_levels, person) do

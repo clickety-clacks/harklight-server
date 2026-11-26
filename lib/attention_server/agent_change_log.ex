@@ -391,6 +391,12 @@ defmodule AttentionServer.AgentChangeLog do
     update_in(log.agent_pending, &Map.update(&1, scope, [row], fn rows -> rows ++ [row] end))
   end
 
+  @doc false
+  def append_shared_advisory(log, scope, message_id, advisory_id, session) do
+    row = {:shared_advisory, resource_id({:shared_advisory, {message_id, advisory_id}}), session}
+    update_in(log.agent_pending, &Map.update(&1, scope, [row], fn rows -> rows ++ [row] end))
+  end
+
   @doc "Appends the pending changes inside the store's snapshot transaction."
   def append(db, pending, version) do
     now = System.system_time(:millisecond)
@@ -547,6 +553,7 @@ defmodule AttentionServer.AgentChangeLog do
   end
 
   defp resource_id({:shared_answer, id}), do: "shared-answer:" <> id
+  defp resource_id({:shared_advisory, {id, advisory}}), do: "shared-advisory:" <> id <> ":" <> advisory
   defp resource_id({:shared_seen, id}), do: "shared-seen:" <> id
   defp resource_id({:shared_entry, id}), do: "shared-entry:" <> id
   defp resource_id({:shared_message, id}), do: "shared-message:" <> id
@@ -558,6 +565,13 @@ defmodule AttentionServer.AgentChangeLog do
     do: "item-advisory:" <> id <> ":" <> ChangeLog.item_resource(key)
 
   defp decode_resource(_person, "shared-answer:" <> id), do: {:shared_answer, id}
+  defp decode_resource(_person, "shared-advisory:" <> encoded) do
+    case String.split(encoded, ":", parts: 2) do
+      [id, advisory] -> {:shared_advisory, {id, advisory}}
+      _ -> :invalid
+    end
+  end
+
   defp decode_resource(_person, "shared-seen:" <> id), do: {:shared_seen, id}
   defp decode_resource(_person, "shared-entry:" <> id), do: {:shared_entry, id}
   defp decode_resource(_person, "shared-message:" <> id), do: {:shared_message, id}
