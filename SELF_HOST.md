@@ -1,6 +1,6 @@
 # Harklight Server self-hosted installation
 
-Version: **0.2.33**. Package target: **Linux x86_64, glibc 2.39 or newer**, with OpenSSL 3 shared libraries and libstdc++6 (built on Ubuntu 24.04). The package bundles
+Version: **0.2.34**. Package target: **Linux x86_64, glibc 2.39 or newer**, with OpenSSL 3 shared libraries and libstdc++6 (built on Ubuntu 24.04). The package bundles
 Erlang/OTP and Elixir bytecode; users need no Mix, Hex, source checkout or
 Erlang installation. It needs Bash, OpenSSL CLI, tar and the platform libraries
 listed in BUILD_INFO. This is a single-process self-hosted server cut.
@@ -25,9 +25,9 @@ the request; a valid current-revision answer commits a payload-free
 
 ## Download and verify
 
-After publication, download the v0.2.33 release from
-clickety-clacks/harklight-server, tag v0.2.33. Get
-harklight-server-0.2.33-linux-x86_64.tar.gz, SHA256SUMS and SELF_HOST.md from
+After publication, download the v0.2.34 release from
+clickety-clacks/harklight-server, tag v0.2.34. Get
+harklight-server-0.2.34-linux-x86_64.tar.gz, SHA256SUMS and SELF_HOST.md from
 that release. Run sha256sum -c SHA256SUMS and extract into an operator-owned
 versioned directory. BUILD_INFO identifies the source commit, build host,
 toolchain, source status and native dependencies.
@@ -40,7 +40,7 @@ runtime/dependency notices remain in their shipped distribution files.
 Choose the DNS hostname clients will validate. For a same-machine preview,
 localhost works. Install into a directory you own and run:
 
-    PACKAGE="$PWD/harklight-server-0.2.33-linux-x86_64"
+    PACKAGE="$PWD/harklight-server-0.2.34-linux-x86_64"
     STATE="$HOME/.local/share/harklight-server"
     "$PACKAGE/bin/harklight-bootstrap" "$STATE" localhost
     cat "$STATE/person-id"
@@ -219,7 +219,7 @@ S1 is off by default. Before the first activation on a self-hosted Server:
 2. Stop the Server and make a complete private backup of the stopped,
    checkpointed database, uploads, configuration and keys. Keep the backup
    outside the writable state directory. The managed installer takes a
-   stopped backup before switching a package. If you installed 0.2.33 earlier
+   stopped backup before switching a package. If you installed 0.2.34 earlier
    with S1 off, take a fresh stopped backup before enabling S1. That captures
    the writes made since installation.
 3. Edit the private `server.env`. Set the exact trusted HTTPS origin, including
