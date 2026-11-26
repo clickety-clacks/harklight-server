@@ -208,6 +208,28 @@ defmodule AttentionServer.NativeSignInTest do
     assert signed_in.resp_cookies["__Host-harklight"].http_only
     assert DashboardReadHTTP.call(browser_request, dashboard).status == 401
 
+    request = late_request(relay, dashboard, dir, person, owner, device, der)
+    result = post("/v2/auth/sign-in", request) |> Router.call(router)
+    assert result.status == 200
+    assert %{"old_device" => "attached", "device_id" => ^device, "duplicate" => false} = json(result)
+    retry = post("/v2/auth/sign-in", request) |> Router.call(router)
+    assert %{"old_device" => "attached", "device_id" => ^device, "duplicate" => true} = json(retry)
+    assert {:error, :unauthorized} = Relay.certificate_device_person(relay, device)
+
+    :ok = Relay.revoke_device(relay, device)
+    removed = late_request(relay, dashboard, dir, person, owner, device, der)
+    response = post("/v2/auth/sign-in", removed) |> Router.call(router)
+    assert %{"old_device" => "removed", "device_id" => replacement} = json(response)
+    refute replacement == device
+
+    unknown = late_request(relay, dashboard, dir, person, owner, device, der)
+    unknown = put_in(unknown["old_proof"]["signature"], BrowserAuth.new_secret())
+    response = post("/v2/auth/sign-in", unknown) |> Router.call(router)
+    assert %{"old_device" => "unknown", "device_id" => fresh} = json(response)
+    refute fresh in [device, replacement]
+  end
+
+  defp late_request(relay, dashboard, dir, person, owner, device, der) do
     verifier = BrowserAuth.new_secret()
     bearer = BrowserAuth.new_secret()
     hash = DeviceProof.digest(bearer)
@@ -221,16 +243,9 @@ defmodule AttentionServer.NativeSignInTest do
     {key, signature} = proof(dir, bytes)
     old = %{"device_id" => device, "public_key" => Base.url_encode64(der, padding: false),
             "signature" => sign(dir, bytes, "legacy")}
-    request = %{"transaction" => transaction, "verifier" => verifier, "public_key" => key,
-                "session_hash" => hash, "signature" => signature, "label" => "Test phone",
-                "old_proof" => old}
-
-    result = post("/v2/auth/sign-in", request) |> Router.call(router)
-    assert result.status == 200
-    assert %{"old_device" => "attached", "device_id" => ^device, "duplicate" => false} = json(result)
-    retry = post("/v2/auth/sign-in", request) |> Router.call(router)
-    assert %{"old_device" => "attached", "device_id" => ^device, "duplicate" => true} = json(retry)
-    assert {:error, :unauthorized} = Relay.certificate_device_person(relay, device)
+    %{"transaction" => transaction, "verifier" => verifier, "public_key" => key,
+      "session_hash" => hash, "signature" => signature, "label" => "Test phone",
+      "old_proof" => old}
   end
 
   defp local_code_post(body) do
