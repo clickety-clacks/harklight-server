@@ -239,6 +239,93 @@ defmodule AttentionServer.ClientAPISharedSendTest do
              get_request(ctx, server, "b1", active_path, authority)
   end
 
+  test "shared Chat is replayable and recoverable with a stable speaker and receipt", ctx do
+    server = start_supervised!({Server, [shared_messages: true] ++ ctx.server_opts})
+    relay = Server.relay(server)
+    {sender, first, second} = people(ctx, relay)
+    assert :ok = Relay.replace_hosted_organization(relay, "org", [sender, first, second])
+    headers = [{"harklight-features", "shared_messages"}]
+    baseline_path = "/v2/agent/delivery-baseline"
+
+    assert {200, %{"rev" => before, "continuation" => continuation}, _} =
+             get_request(ctx, server, "a1", baseline_path, headers)
+
+    assert {200, %{"message" => %{"item_id" => id}}, _} =
+             send_request(ctx, server, @key, body([first, second]), true)
+
+    engine = :sys.get_state(relay).store.engine
+    first_path = "/v2/items/" <> engine.shared_recipients[{id, first}].item_id
+    second_path = "/v2/items/" <> engine.shared_recipients[{id, second}].item_id
+    sender_path = "/v2/agent/messages/" <> id
+    text = %{"text" => "Thursday works."}
+
+    assert {200, %{"entry" => %{"entry_id" => own_id, "shared_entry_id" => turn}} = accepted, _} =
+             write_request(ctx, server, "a2", "POST", first_path <> "/replies", @another_key, text, headers)
+
+    assert {200, ^accepted, replay_headers} =
+             write_request(ctx, server, "a2", "POST", first_path <> "/replies", @another_key, text, headers)
+
+    assert {"idempotent-replayed", "true"} in replay_headers
+
+    assert {200, %{"entries" => [%{"entry_id" => local_id, "shared_entry_id" => ^turn,
+                                   "speaker" => %{"kind" => "person", "id" => ^first}}]}, _} =
+             get_request(ctx, server, "b1", second_path <> "/entries", headers)
+
+    assert own_id != local_id
+
+    assert {200, %{"item" => %{"chat" => %{"unread_replies" => 1, "last_origin_reply" => nil}}}, _} =
+             get_request(ctx, server, "b1", second_path, headers)
+
+    assert {200, %{"item" => %{"chat" => %{"unread_replies" => 0, "read_position" => ^local_id}}}, _} =
+             write_request(ctx, server, "b1", "PUT", second_path <> "/read-position", @another_key,
+               %{"entry_id" => local_id}, headers)
+
+    receipt_key = "10000000-0000-4000-8000-000000000009"
+    receipt_path = sender_path <> "/entries/" <> turn <> "/receipt"
+    receipt = %{"outcome" => "handed"}
+
+    assert {409, %{"error" => "not_answered"}, _} =
+             write_request(ctx, server, "a1", "POST", receipt_path, receipt_key, receipt, headers)
+
+    feed_headers = [{"harklight-continuation", continuation} | headers]
+    feed_path = "/v2/agent/changes?after=#{before}"
+
+    assert {200, %{"changes" => changes}, _} = get_request(ctx, server, "a1", feed_path, feed_headers)
+    assert Enum.any?(changes, &match?(%{"kind" => "entry", "data" => %{"entry_id" => ^turn}}, &1))
+
+    assert {200, %{"shared_events" => true, "next_page" => page}, _} =
+             get_request(ctx, server, "a1", baseline_path, headers)
+
+    assert {200, %{"changes" => [%{"kind" => "entry", "data" => %{"entry_id" => ^turn,
+                         "request_revision" => 1, "speaker" => %{"id" => ^first}}}]}, _} =
+             get_request(ctx, server, "a1", baseline_path <> "?page=" <> page, headers)
+
+    assert {200, %{"status" => "recorded", "stage_outcome" => "handed"} = recorded, _} =
+             write_request(ctx, server, "a1", "POST", receipt_path, receipt_key, receipt, headers)
+
+    assert {200, ^recorded, headers_replay} =
+             write_request(ctx, server, "a1", "POST", receipt_path, receipt_key, receipt, headers)
+    assert {"idempotent-replayed", "true"} in headers_replay
+
+    assert {200, %{"changes" => []}, _} =
+             get_request(ctx, server, "a1", baseline_path <> "?page=" <> page, headers)
+
+    assert :ok = Relay.replace_hosted_organization(relay, "org", [sender, second])
+    reply_key = "10000000-0000-4000-8000-000000000010"
+
+    assert {200, %{"entry" => %{"entry_id" => sender_turn, "speaker" => %{"kind" => "sender"}}}, _} =
+             write_request(ctx, server, "a1", "POST", sender_path <> "/replies", reply_key,
+               %{"text" => "Thanks", "notify_person_id" => second}, headers)
+
+    assert {200, %{"entries" => [%{"shared_entry_id" => ^turn}]}, _} =
+             get_request(ctx, server, "a2", first_path <> "/entries", headers)
+
+    assert {200, %{"entries" => [%{"shared_entry_id" => ^turn}, %{"shared_entry_id" => ^sender_turn}]}, _} =
+             get_request(ctx, server, "b1", second_path <> "/entries", headers)
+
+    assert {200, %{"changes" => []}, _} = get_request(ctx, server, "a1", feed_path, [])
+  end
+
   test "the default-off setting refuses the path while preserving legacy sends", ctx do
     server = start_supervised!({Server, ctx.server_opts})
     relay = Server.relay(server)

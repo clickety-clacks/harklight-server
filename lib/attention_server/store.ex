@@ -1269,6 +1269,7 @@ defmodule AttentionServer.Store do
         |> shared_send_log(next, audit)
         |> shared_mutation_log(next, audit)
         |> shared_freeze_log(old, next, touched)
+        |> shared_chat_log(next, audit)
       %{records: records, delete_paths: delete_paths, reference_rows: references} = prepared
       derived = DerivedIndex.changes(old, next, touched)
 
@@ -1281,6 +1282,7 @@ defmodule AttentionServer.Store do
                    :ok <- write_audit(db, audit),
                    {:ok, heads, agent_heads} <- append_change_logs(db, log, generation),
                    :ok <- write_shared_send_receipt(store, next, audit),
+                   :ok <- write_shared_chat_receipt(store, next, audit),
                    :ok <- DerivedIndex.advance(db, generation) do
                 {:ok, {heads, agent_heads}}
               end
@@ -1825,6 +1827,7 @@ defmodule AttentionServer.Store do
     :messages,
     :shared_messages,
     :shared_recipients,
+    :shared_entries,
     :free_order_highs,
     :conversation_highs,
     :chat_read_positions,
@@ -1925,6 +1928,9 @@ defmodule AttentionServer.Store do
 
   defp valid_keyed_row?(engine, :shared_recipients, key, record),
     do: AttentionServer.SharedMessages.valid_recipient?(engine, key, record)
+
+  defp valid_keyed_row?(engine, :shared_entries, key, record),
+    do: SharedMessages.valid_entry?(engine, key, record)
 
   defp valid_keyed_row?(engine, :free_order_highs, person, high),
     do: valid_order_high?(engine, person, high)
@@ -2112,6 +2118,42 @@ defmodule AttentionServer.Store do
         acc
     end)
   end
+
+  defp shared_chat_log(log, engine, %{shared_chat: %{operation: operation, message_id: id} = chat}) do
+    record = Map.fetch!(engine.shared_messages, id)
+    session = Map.get(record, "session")
+
+    case operation do
+      :reply ->
+        entry = Map.fetch!(engine.shared_entries, chat.entry_id)
+        inbox_log =
+          Enum.reduce(SharedMessages.live_recipients(engine, id), log, fn person, acc ->
+            AttentionServer.ChangeLog.append_shared_entry(acc, person, id, entry.id)
+          end)
+
+        if Map.has_key?(record, :sender_frozen_revision),
+          do: inbox_log,
+          else: AgentChangeLog.append_shared_entry(inbox_log, {record.sender_person, record.sender_key}, entry.id, session)
+
+      :read_position ->
+        AttentionServer.ChangeLog.append_shared_freeze(log, chat.person, id)
+
+      :chat_receipt ->
+        entry = Map.fetch!(engine.shared_entries, chat.entry_id)
+        AgentChangeLog.append_shared_entry(log, {record.sender_person, record.sender_key}, entry.id, session)
+    end
+  end
+
+  defp shared_chat_log(log, _engine, _audit), do: log
+
+  defp write_shared_chat_receipt(store, engine, %{shared_chat: %{key: key} = chat})
+       when is_binary(key) do
+    with {:ok, wire} <- AttentionServer.ClientAPI.SharedChat.result(store, engine, chat) do
+      Idempotency.save(store, chat.receipt_scope, key, chat.digest, 200, wire)
+    end
+  end
+
+  defp write_shared_chat_receipt(_store, _engine, _audit), do: :ok
 
   defp write_shared_send_receipt(store, engine, %{
          shared_send_receipt: {{person, origin} = scope, key, digest, id, outcomes}
@@ -2825,6 +2867,9 @@ defmodule AttentionServer.Store do
         end) and
         Enum.all?(engine.shared_recipients, fn {key, record} ->
           AttentionServer.SharedMessages.valid_recipient?(engine, key, record)
+        end) and
+        Enum.all?(engine.shared_entries, fn {key, record} ->
+          SharedMessages.valid_entry?(engine, key, record)
         end) and
         valid_delivery_states?(engine) and
         valid_prioritization?(engine) and

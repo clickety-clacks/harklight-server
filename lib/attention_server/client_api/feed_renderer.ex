@@ -87,6 +87,17 @@ defmodule AttentionServer.ClientAPI.FeedRenderer do
     end
   end
 
+  defp render_row(:entry, {:shared_entry, id}, %{shared?: true, engine: engine}, principal, rev) do
+    with %{shared_id: message_id, position: position} = entry <- engine.shared_entries[id],
+         %{} = recipient <- Map.get(engine.shared_recipients, {message_id, principal.person}),
+         cutoff = get_in(recipient, [:frozen, :entry_high]),
+         true <- is_nil(cutoff) or position <= cutoff do
+      {:ok, SharedMessages.person_entry(recipient, principal.person, entry, rev)}
+    else
+      _ -> :skip
+    end
+  end
+
   defp render_row(:entry, {:entry, seq}, context, principal, rev) do
     with %{} = entry <- Map.get(context.entries_by_fact, seq),
          true <- visible_entry?(context.engine, principal, entry),

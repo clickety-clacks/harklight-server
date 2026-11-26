@@ -121,6 +121,7 @@ defmodule AttentionServer.ChangeLog do
 
   @doc false
   def shared_item_resource(id), do: "shared-item:" <> id
+  def shared_entry_resource(id), do: "shared-entry:" <> id
 
   @doc false
   def append_shared_send(log, id, outcomes) do
@@ -138,6 +139,13 @@ defmodule AttentionServer.ChangeLog do
   def append_shared_freeze(log, person, id) do
     rows = [{:item, shared_item_resource(id)}, {:counts, "shared-counts"}]
     update_in(log.pending, &Map.update(&1, person, rows, fn existing -> existing ++ rows end))
+  end
+
+  @doc false
+  def append_shared_entry(log, person, message_id, entry_id) do
+    log = append_shared_freeze(log, person, message_id)
+    row = {:entry, shared_entry_resource(entry_id)}
+    update_in(log.pending, &Map.update!(&1, person, fn existing -> existing ++ [row] end))
   end
 
   @doc "The log's resource ID for an item, from its engine key."
@@ -165,6 +173,7 @@ defmodule AttentionServer.ChangeLog do
     end
   end
 
+  def decode_resource("shared-entry:" <> id), do: {:shared_entry, id}
   def decode_resource("shared-item:" <> id), do: {:shared_item, id}
   def decode_resource("shared-counts"), do: :shared_counts
   def decode_resource("counts"), do: :counts

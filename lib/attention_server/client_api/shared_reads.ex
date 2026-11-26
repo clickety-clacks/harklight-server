@@ -49,9 +49,22 @@ defmodule AttentionServer.ClientAPI.SharedReads do
       cutoff = get_in(recipient, [:frozen, :revision])
       historical = SharedMessages.historical_record(message, cutoff)
 
-      resource(action, head, historical, fn ->
-        {"item", SharedMessages.person_item(store.engine, person, message, recipient, rev)}
-      end)
+      case action do
+        {:entries, params} ->
+          high = get_in(recipient, [:frozen, :entry_high])
+          entries = SharedMessages.entries(store.engine, message, high)
+
+          page_entries(entries, params, head, fn entry ->
+            with {:ok, rev} <- ChangeLog.rev(store, person, ChangeLog.shared_entry_resource(entry.id)) do
+              {:ok, SharedMessages.person_entry(recipient, person, entry, rev)}
+            end
+          end, &SharedMessages.recipient_entry_id(&1.id, person))
+
+        action ->
+          resource(action, head, historical, fn ->
+            {"item", SharedMessages.person_item(store.engine, person, message, recipient, rev)}
+          end)
+      end
     end
   end
 
@@ -63,7 +76,20 @@ defmodule AttentionServer.ClientAPI.SharedReads do
          {:ok, head} <- AgentChangeLog.head(store, scope),
          {:ok, rev} <- AgentChangeLog.rev(store, scope, {:shared_message, id}) do
       historical = SharedMessages.historical_record(message, Map.get(message, :sender_frozen_revision))
-      resource(action, head, historical, fn -> {"message", SharedMessages.sender_message(message, rev)} end)
+      case action do
+        {:entries, params} ->
+          high = Map.get(message, :sender_frozen_entry_high)
+          entries = SharedMessages.entries(store.engine, message, high)
+
+          page_entries(entries, params, head, fn entry ->
+            with {:ok, rev} <- AgentChangeLog.rev(store, scope, {:shared_entry, entry.id}) do
+              {:ok, SharedMessages.sender_entry(message, entry, rev)}
+            end
+          end, & &1.id)
+
+        action ->
+          resource(action, head, historical, fn -> {"message", SharedMessages.sender_message(message, rev)} end)
+      end
     else
       result when result in [nil, false] -> {:error, :not_found}
       %{} -> {:error, :not_found}
@@ -86,10 +112,31 @@ defmodule AttentionServer.ClientAPI.SharedReads do
     end
   end
 
-  defp resource({:entries, params}, head, _record, _render) do
-    with {:ok, _limit} <- Reads.limit(params),
-         true <- is_nil(params["before"]) || {:error, :not_found} do
-      {:ok, %{"rev" => head, "entries" => [], "older" => false}}
+  defp page_entries(entries, params, head, render, id_of) do
+    with {:ok, limit} <- Reads.limit(params),
+         {:ok, before} <- before(entries, params["before"], id_of) do
+      eligible = if before, do: Enum.take_while(entries, &(&1.position < before)), else: entries
+      page = Enum.take(eligible, -limit)
+
+      Enum.reduce_while(page, {:ok, []}, fn entry, {:ok, rendered} ->
+        case render.(entry) do
+          {:ok, wire} -> {:cont, {:ok, [wire | rendered]}}
+          error -> {:halt, error}
+        end
+      end)
+      |> case do
+        {:ok, rendered} ->
+          {:ok, %{"rev" => head, "entries" => Enum.reverse(rendered), "older" => length(eligible) > limit}}
+        error -> error
+      end
+    end
+  end
+
+  defp before(_entries, nil, _id_of), do: {:ok, nil}
+  defp before(entries, id, id_of) do
+    case Enum.find(entries, &(id_of.(&1) == id)) do
+      %{position: position} -> {:ok, position}
+      nil -> {:error, :not_found}
     end
   end
 end

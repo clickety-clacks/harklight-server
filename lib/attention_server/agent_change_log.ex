@@ -373,6 +373,12 @@ defmodule AttentionServer.AgentChangeLog do
     update_in(log.agent_pending, &Map.update(&1, {person, key}, [row], fn rows -> rows ++ [row] end))
   end
 
+  @doc false
+  def append_shared_entry(log, {person, key}, entry_id, session) do
+    row = {:shared_entry, resource_id({:shared_entry, entry_id}), session}
+    update_in(log.agent_pending, &Map.update(&1, {person, key}, [row], fn rows -> rows ++ [row] end))
+  end
+
   @doc "Appends the pending changes inside the store's snapshot transaction."
   def append(db, pending, version) do
     now = System.system_time(:millisecond)
@@ -512,7 +518,7 @@ defmodule AttentionServer.AgentChangeLog do
         _ -> {"AND session = ?", [person, agent, after_rev, session]}
       end
 
-    feature_filter = if shared?, do: "", else: "AND resource_id NOT LIKE 'shared-message:%'"
+    feature_filter = if shared?, do: "", else: "AND resource_id NOT LIKE 'shared-%'"
 
     all(
       db,
@@ -528,6 +534,7 @@ defmodule AttentionServer.AgentChangeLog do
     )
   end
 
+  defp resource_id({:shared_entry, id}), do: "shared-entry:" <> id
   defp resource_id({:shared_message, id}), do: "shared-message:" <> id
   defp resource_id({:message, key}), do: ChangeLog.item_resource(key)
   defp resource_id({:entry, seq}), do: ChangeLog.entry_resource(seq)
@@ -536,6 +543,7 @@ defmodule AttentionServer.AgentChangeLog do
   defp resource_id({:item_advisory, {key, id}}),
     do: "item-advisory:" <> id <> ":" <> ChangeLog.item_resource(key)
 
+  defp decode_resource(_person, "shared-entry:" <> id), do: {:shared_entry, id}
   defp decode_resource(_person, "shared-message:" <> id), do: {:shared_message, id}
 
   defp decode_resource(_person, "advisory:" <> id), do: {:advisory, id}

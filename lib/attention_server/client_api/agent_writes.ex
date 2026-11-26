@@ -17,6 +17,7 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
     Projection,
     Resources,
     SharedCapability,
+    SharedChat,
     Uploads,
     Writes
   }
@@ -96,6 +97,10 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
         Errors.send_error(conn, "invalid_field", field: "features")
     end
   end
+
+  defp dispatch_write(conn, %{params: %{item_id: "shared_" <> _}} = ctx, operation, key, body)
+       when operation in [:reply, :chat_receipt],
+       do: SharedChat.respond(conn, ctx, :sender, operation, body, key)
 
   defp dispatch_write(conn, %{params: %{item_id: "shared_" <> _ = id}} = ctx,
          operation, key, body) when operation in [:revise, :retract, :chat_close] do

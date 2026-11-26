@@ -5,7 +5,7 @@ defmodule AttentionServer.AgentAPI.DeliveryBaseline do
 
   import Plug.Conn
 
-  alias AttentionServer.{AgentChangeLog, Conversation, Engine, JSON, RouteBIndex, Store}
+  alias AttentionServer.{AgentChangeLog, Conversation, Engine, JSON, RouteBIndex, SharedMessages, Store}
   alias AttentionServer.AgentAPI.{Feed, FeedActivity, FeedStep}
   alias AttentionServer.ClientAPI.{AgentResources, Errors, Projection, Reads, Resources, SharedCapability, SharedContinuation}
   alias AttentionServer.ClientAPI.Feed, as: PersonFeed
@@ -93,7 +93,7 @@ defmodule AttentionServer.AgentAPI.DeliveryBaseline do
          {:ok, rev} <- AgentChangeLog.head(store, scope) do
       bound = get_in(store.engine.origin_feeds, [scope, :high]) || 0
       attempt = :crypto.strong_rand_bytes(16) |> Base.url_encode64(padding: false)
-      page = %{attempt: attempt, bound: bound, position: 0, rev: rev}
+      page = %{attempt: attempt, bound: bound, position: 0, rev: rev, shared_after: 0}
       body = %{
         "rev" => rev,
         "next_page" => encode(page, scope, session, ack2, capability.shared?),
@@ -111,14 +111,19 @@ defmodule AttentionServer.AgentAPI.DeliveryBaseline do
          {:ok, page} <- decode(token, scope, session, ack2, capability.shared?),
          stop = min(page.position + limit, page.bound),
          {:ok, changes, targets} <- page_changes(state, scope, session, page, stop),
+         {:ok, shared, shared_targets, shared_after, shared_more?} <-
+           shared_page(state, scope, session, page, stop, limit - length(changes), capability.shared?),
          {:ok, store} <-
-           FeedStep.commit_delivery(store, scope, targets, ack2: ack2, attempt: page.attempt) do
-      body = %{"rev" => page.rev, "changes" => changes}
+           FeedStep.commit_delivery(store, scope, targets ++ shared_targets, ack2: ack2, attempt: page.attempt) do
+      body = %{"rev" => page.rev, "changes" => changes ++ shared}
 
       body =
-        if stop < page.bound,
-          do: Map.put(body, "next_page", encode(%{page | position: stop}, scope, session, ack2, capability.shared?)),
-          else: body
+        if stop < page.bound or shared_more? do
+          token = encode(%{page | position: stop, shared_after: shared_after}, scope, session, ack2, capability.shared?)
+          Map.put(body, "next_page", token)
+        else
+          body
+        end
 
       {:ok, {:ok, body}, store}
     end
@@ -189,6 +194,37 @@ defmodule AttentionServer.AgentAPI.DeliveryBaseline do
       {:ok, changes, targets} -> {:ok, Enum.reverse(changes), Enum.reverse(targets)}
       error -> error
     end
+  end
+
+  defp shared_page(_state, _scope, _session, page, stop, _limit, enabled?)
+       when not enabled? or stop < page.bound,
+       do: {:ok, [], [], page.shared_after, false}
+
+  defp shared_page(%{store: store}, {person, origin} = scope, session, page, _stop, limit, true) do
+    engine = store.engine
+
+    candidates =
+      for %{
+            shared_id: id, author: {:person, _}, id: entry_id, position: position
+          } = entry <- Map.values(engine.shared_entries),
+          not Map.has_key?(entry, :handoff),
+          %{sender_person: ^person, sender_key: ^origin} = record <- [engine.shared_messages[id]],
+          is_nil(session) or record["session"] == session,
+          Engine.shared_sender_allowed?(engine, person, origin, record.sender_id),
+          is_nil(Map.get(record, :sender_frozen_entry_high)) or position <= record.sender_frozen_entry_high,
+          {:ok, rev} <- [AgentChangeLog.rev(store, scope, {:shared_entry, entry_id})],
+          rev > page.shared_after and rev <= page.rev,
+          do: {rev, record, entry}
+
+    {selected, more} = candidates |> Enum.sort_by(&elem(&1, 0)) |> Enum.split(limit)
+    changes = for {rev, record, entry} <- selected, do: change("entry", SharedMessages.sender_entry(record, entry, rev))
+    targets = for {_rev, _record, entry} <- selected, do: {:shared_entry, entry.id}
+    after_rev = case List.last(selected) do
+      {rev, _, _} -> rev
+      nil -> page.shared_after
+    end
+
+    {:ok, changes, targets, after_rev, more != []}
   end
 
   @doc false
@@ -272,9 +308,10 @@ defmodule AttentionServer.AgentAPI.DeliveryBaseline do
   defp change(kind, %{"rev" => rev} = data), do: %{"kind" => kind, "rev" => rev, "data" => data}
 
   defp encode(page, scope, session, ack2, shared?) do
-    [page_version(shared?), binding(scope, session, ack2, shared?), page.attempt, page.bound, page.position, page.rev]
-    |> JSON.encode!()
-    |> Base.url_encode64(padding: false)
+    payload = [page_version(shared?), binding(scope, session, ack2, shared?),
+               page.attempt, page.bound, page.position, page.rev]
+    payload = if shared?, do: payload ++ [page.shared_after], else: payload
+    payload |> JSON.encode!() |> Base.url_encode64(padding: false)
   end
 
   defp decode(token, scope, session, ack2, shared?)
@@ -283,18 +320,24 @@ defmodule AttentionServer.AgentAPI.DeliveryBaseline do
     version = page_version(shared?)
 
     with {:ok, raw} <- Base.url_decode64(token, padding: false),
-         {:ok, [^version, ^binding, attempt, bound, position, rev]} <- JSON.decode_line(raw <> "\n"),
+         {:ok, [^version, ^binding, attempt, bound, position, rev | tail]} <- JSON.decode_line(raw <> "\n"),
          true <- is_binary(attempt) and byte_size(attempt) == 22,
          true <- is_integer(position) and position >= 0,
          true <- is_integer(bound) and bound >= position,
-         true <- is_integer(rev) and rev >= 0 do
-      {:ok, %{attempt: attempt, bound: bound, position: position, rev: rev}}
+         true <- is_integer(rev) and rev >= 0,
+         {:ok, shared_after} <- shared_after(tail, shared?, rev) do
+      {:ok, %{attempt: attempt, bound: bound, position: position, rev: rev, shared_after: shared_after}}
     else
       _ -> invalid_page(token, shared?)
     end
   end
 
   defp decode(token, _scope, _session, _ack2, shared?), do: invalid_page(token, shared?)
+
+  defp shared_after([], false, _), do: {:ok, 0}
+  defp shared_after([after_rev], true, rev) when is_integer(after_rev) and after_rev >= 0 and after_rev <= rev,
+    do: {:ok, after_rev}
+  defp shared_after(_, _, _), do: :error
 
   defp page_version(true), do: 2
   defp page_version(false), do: 1

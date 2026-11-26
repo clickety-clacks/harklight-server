@@ -141,6 +141,157 @@ defmodule AttentionServer.SharedMessages do
         do: person
   end
 
+  def reply(%Engine{} = engine, record, author, attrs) do
+    with :ok <- replyable(record),
+         :ok <- notify_target(engine, record.id, attrs[:notify_person_id]) do
+      position = Map.get(record, :entry_high, 0) + 1
+
+      entry =
+        Map.merge(attrs, %{
+          shared_id: record.id,
+          position: position,
+          request_revision: record.revision,
+          author: author
+        })
+
+      next =
+        engine
+        |> Engine.put_row(:shared_messages, record.id, Map.put(record, :entry_high, position))
+        |> Engine.put_row(:shared_entries, entry.id, entry)
+
+      {:ok, next, entry}
+    end
+  end
+
+  def read_position(engine, record, person, recipient, local_entry_id) do
+    with false <- Map.has_key?(recipient, :frozen),
+         %{} = entry <-
+           Enum.find(entries(engine, record), &(recipient_entry_id(&1.id, person) == local_entry_id)) do
+      prior = Map.get(recipient, :read_position, 0)
+      next = Map.put(recipient, :read_position, max(prior, entry.position))
+      {:ok, Engine.put_row(engine, :shared_recipients, {record.id, person}, next)}
+    else
+      true -> {:error, :forbidden}
+      _ -> {:error, :not_found}
+    end
+  end
+
+  def replyable(%{terminal: %{"state" => "retracted"}}), do: {:error, :already_retracted}
+  def replyable(%{chat_open: false}), do: {:error, :already_closed}
+  def replyable(_record), do: :ok
+
+  defp notify_target(_engine, _id, nil), do: :ok
+
+  defp notify_target(engine, id, person) do
+    if person in live_recipients(engine, id),
+      do: :ok,
+      else: {:error, :invalid_field, "notify_person_id"}
+  end
+
+  def entries(engine, record, cutoff \\ nil) do
+    high = cutoff || Map.get(record, :entry_high, 0)
+
+    engine.shared_entries
+    |> Map.values()
+    |> Enum.filter(&(&1.shared_id == record.id and &1.position <= high))
+    |> Enum.sort_by(& &1.position)
+  end
+
+  def person_entry(recipient, person, entry, rev) do
+    entry =
+      case get_in(recipient, [:frozen, :delivery]) do
+        %{} = delivery ->
+          entry |> Map.drop([:served, :handoff]) |> Map.merge(Map.get(delivery, entry.id, %{}))
+        nil -> entry
+      end
+
+    entry_wire(recipient.item_id, recipient_entry_id(entry.id, person), entry, rev)
+    |> add_person_delivery(entry, person)
+  end
+
+  def sender_entry(record, entry, rev) do
+    entry_wire(record.id, entry.id, entry, rev)
+    |> add_sender_delivery(entry)
+  end
+
+  defp entry_wire(item_id, entry_id, entry, rev) do
+    %{
+      "item_id" => item_id, "entry_id" => entry_id, "shared_entry_id" => entry.id,
+      "rev" => rev, "position" => entry.position, "kind" => "reply",
+      "author" => entry_author(entry.author), "speaker" => entry.speaker,
+      "request_revision" => entry.request_revision, "at_ms" => entry.at_ms,
+      "text" => entry.text, "files" => []
+    }
+  end
+
+  defp entry_author({:person, _}), do: "person"
+  defp entry_author(:sender), do: "origin"
+
+  def recipient_entry_id(id, person) do
+    hash = :crypto.hash(:sha256, :erlang.term_to_binary({id, person}))
+    "shared-entry_" <> Base.url_encode64(hash, padding: false)
+  end
+
+  defp add_person_delivery(wire, %{author: {:person, person}} = entry, person),
+    do: add_sender_delivery(wire, entry)
+
+  defp add_person_delivery(wire, _entry, _recipient), do: wire
+
+  defp add_sender_delivery(wire, %{author: {:person, _}} = entry) do
+    delivery = %{"delivered" => Map.get(entry, :served, false)}
+    delivery = Map.merge(delivery, Map.get(entry, :handoff, %{}))
+    Map.put(wire, "delivery", delivery)
+  end
+
+  defp add_sender_delivery(wire, _entry), do: wire
+
+  def mark_served(engine, ids) do
+    Enum.reduce(ids, engine, fn id, next ->
+      case Map.get(next.shared_entries, id) do
+        %{author: {:person, _}} = entry ->
+          Engine.put_row(next, :shared_entries, id, Map.put(entry, :served, true))
+        _ -> next
+      end
+    end)
+  end
+
+  def receipt(engine, %{author: {:person, _}, served: true} = entry, handoff) do
+    prior = Map.get(entry, :handoff)
+
+    {status, effective} =
+      cond do
+        is_nil(prior) -> {"recorded", handoff}
+        prior == handoff -> {"already_recorded", prior}
+        prior["outcome"] == "handed" -> {"superseded", prior}
+        handoff["outcome"] == "handed" -> {"recorded", handoff}
+        true -> {"superseded", prior}
+      end
+
+    next = Engine.put_row(engine, :shared_entries, entry.id, Map.put(entry, :handoff, effective))
+    {:ok, next, %{"status" => status, "stage_outcome" => effective["outcome"]}}
+  end
+
+  def receipt(_engine, %{author: {:person, _}}, _handoff), do: {:error, :not_answered}
+  def receipt(_engine, _entry, _handoff), do: {:error, :not_found}
+
+  def valid_entry?(%Engine{} = engine, id, %{
+        id: id, shared_id: shared_id, position: position, request_revision: revision,
+        at_ms: at_ms, text: text, author: author, speaker: speaker
+      }) do
+    case Map.get(engine.shared_messages, shared_id) do
+      %{entry_high: high, revision: current} ->
+        is_binary(id) and position in 1..high and revision in 1..current and
+          is_integer(at_ms) and is_binary(text) and is_map(speaker) and valid_author?(engine, author)
+      _ -> false
+    end
+  end
+
+  def valid_entry?(_, _, _), do: false
+
+  defp valid_author?(_engine, :sender), do: true
+  defp valid_author?(engine, {:person, person}), do: Map.has_key?(engine.persons, person)
+  defp valid_author?(_engine, _author), do: false
+
   def freeze_departures(%Engine{} = engine, organization, departing) do
     Enum.reduce(engine.shared_messages, engine, fn
       {id, %{organization_id: ^organization} = record}, next ->
@@ -160,7 +311,9 @@ defmodule AttentionServer.SharedMessages do
           %{frozen: _} -> {next, roster}
           %{} = recipient ->
             roster = roster || visible_members(snapshot, id)
-            cutoff = %{revision: record.revision, members: roster, terminal: Map.get(record, :terminal)}
+            cutoff = %{revision: record.revision, members: roster, terminal: Map.get(record, :terminal),
+                       entry_high: Map.get(record, :entry_high, 0),
+                       delivery: frozen_delivery(snapshot, record, person)}
             {Engine.put_row(next, :shared_recipients, key, Map.put(recipient, :frozen, cutoff)), roster}
 
           nil -> {next, roster}
@@ -170,9 +323,16 @@ defmodule AttentionServer.SharedMessages do
     if MapSet.member?(departing, record.sender_person) and not Map.has_key?(record, :sender_frozen_revision),
       do:
         Engine.put_row(engine, :shared_messages, id,
-          Map.merge(record, %{sender_frozen_revision: record.revision, sender_frozen_terminal: Map.get(record, :terminal)})),
+          Map.merge(record, %{sender_frozen_revision: record.revision, sender_frozen_terminal: Map.get(record, :terminal),
+                              sender_frozen_entry_high: Map.get(record, :entry_high, 0)})),
 
       else: engine
+  end
+
+  defp frozen_delivery(engine, record, person) do
+    for %{author: {:person, ^person}} = entry <- entries(engine, record),
+        into: %{},
+        do: {entry.id, Map.take(entry, [:served, :handoff])}
   end
 
   def retained_history?(engine, person) do
@@ -247,7 +407,7 @@ defmodule AttentionServer.SharedMessages do
       "message" => record.message,
       "files" => [],
       "seen" => recipient.seen_revision == record.revision,
-      "chat" => %{"available" => true, "started" => false, "unread_replies" => 0, "read_position" => nil},
+      "chat" => chat_state(engine, record, recipient, person),
       "rank" => %{"key" => recipient.item_id, "section" => if(not is_nil(frozen) or Map.has_key?(record, :terminal), do: "resolved", else: "current")},
       "terminal" => Map.get(record, :terminal),
       "shared" => %{
@@ -260,6 +420,31 @@ defmodule AttentionServer.SharedMessages do
       }
     }
     |> Map.merge(Map.take(record, ["created_at_ms"]))
+  end
+
+  defp chat_state(engine, record, recipient, person) do
+    cutoff = get_in(recipient, [:frozen, :entry_high])
+    entries = entries(engine, record, cutoff)
+    read = Map.get(recipient, :read_position, 0)
+
+    unread = Enum.count(entries, &(&1.position > read and &1.author != {:person, person}))
+    last_read = Enum.find(entries, &(&1.position == read))
+    last_origin = Enum.find(Enum.reverse(entries), &(&1.author == :sender))
+
+    chat = %{
+      "available" => true, "started" => entries != [], "unread_replies" => unread,
+      "read_position" => if(last_read, do: recipient_entry_id(last_read.id, person)),
+      "last_origin_reply" => if(last_origin, do: recipient_entry_id(last_origin.id, person))
+    }
+
+    if last_origin do
+      Map.merge(chat, %{
+        "reply_group" => nil, "reply_rank_key" => recipient.item_id,
+        "reply_priority" => %{"level" => "normal"}
+      })
+    else
+      chat
+    end
   end
 
   defp visible_members(engine, shared_id) do

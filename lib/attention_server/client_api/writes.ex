@@ -41,6 +41,7 @@ defmodule AttentionServer.ClientAPI.Writes do
     Projection,
     Reads,
     Resources,
+    SharedChat,
     Uploads
   }
 
@@ -79,6 +80,18 @@ defmodule AttentionServer.ClientAPI.Writes do
     end
   end
 
+  def put_read_position(conn, %Context{params: %{item_id: "shared_" <> _}} = ctx) do
+    with {:ok, key} <- optional_key(conn),
+         {:ok, body, conn} <- json_body(conn),
+         :ok <- only_members(body, ["entry_id"]),
+         {:ok, _} <- string_member(body, "entry_id") do
+      SharedChat.respond(conn, ctx, :person, :read_position, body, key)
+    else
+      {:error, token, field, response} -> Errors.send_error(response, token, field: field)
+      {:error, token, field} -> Errors.send_error(conn, token, field: field)
+    end
+  end
+
   @doc false
   def put_read_position(conn, %Context{} = ctx) do
     with {:ok, key} <- optional_key(conn),
@@ -88,6 +101,16 @@ defmodule AttentionServer.ClientAPI.Writes do
       respond(conn, read_position(ctx.relay, ctx.principal, ctx.params.item_id, entry_id, key))
     else
       {:error, token, field, conn} -> Errors.send_error(conn, token, field: field)
+      {:error, token, field} -> Errors.send_error(conn, token, field: field)
+    end
+  end
+
+  def post_replies(conn, %Context{params: %{item_id: "shared_" <> _}} = ctx) do
+    with {:ok, key} <- required_key(conn),
+         {:ok, body, conn} <- json_body(conn) do
+      SharedChat.respond(conn, ctx, :person, :reply, body, key)
+    else
+      {:error, token, field, response} -> Errors.send_error(response, token, field: field)
       {:error, token, field} -> Errors.send_error(conn, token, field: field)
     end
   end

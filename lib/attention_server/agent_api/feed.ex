@@ -78,7 +78,7 @@ end
 defmodule AttentionServer.AgentAPI.FeedStep do
   @moduledoc false
 
-  alias AttentionServer.{AgentChangeLog, Diagnostics, Engine, Relay, Store}
+  alias AttentionServer.{AgentChangeLog, Diagnostics, Engine, Relay, SharedMessages, Store}
   alias AttentionServer.AgentAPI.{FeedActivity, FeedRenderer, Focus}
   alias AttentionServer.ClientAPI.{FeedStep, Projection, Reads, Resources, SharedContinuation}
 
@@ -140,7 +140,23 @@ defmodule AttentionServer.AgentAPI.FeedStep do
 
   # As in the legacy origin fetch, the page's cursor and payload are selected
   # before ACK1, but neither is returned until the receipt commit succeeds.
-  def commit_delivery(store, {person, key}, targets, opts) do
+  def commit_delivery(store, {person, key} = scope, targets, opts) do
+    {shared, legacy} = Enum.split_with(targets, &match?({:shared_entry, _}, &1))
+
+    with {:ok, store} <- commit_legacy_delivery(store, scope, legacy, opts) do
+      ids = Enum.map(shared, fn {:shared_entry, id} -> id end)
+      updated = SharedMessages.mark_served(store.engine, ids)
+
+      case if(updated == store.engine, do: {:ok, store}, else: Store.commit(store, updated, %{person: person, actor: key, action: "shared_chat_served"})) do
+        {:ok, committed} -> {:ok, committed}
+        {:error, reason, _} -> delivery_failure(reason)
+      end
+    end
+  end
+
+  defp commit_legacy_delivery(store, _scope, [], _opts), do: {:ok, store}
+
+  defp commit_legacy_delivery(store, {person, key}, targets, opts) do
     targets = resolve_answers(store.engine, person, targets)
 
     with {:ok, next} <- Engine.agent_feed_delivered(store.engine, person, key, targets, opts),
@@ -234,6 +250,12 @@ defmodule AttentionServer.AgentAPI.FeedStep do
   end
 
   def authorized(_engine, _principal), do: {:error, :unauthorized}
+
+  defp delivery_target(%{"data" => %{"shared_entry_id" => id, "author" => "person",
+                           "delivery" => %{"delivered" => false}}}),
+    do: [{:shared_entry, id}]
+
+  defp delivery_target(%{"data" => %{"shared_entry_id" => _}}), do: []
 
   defp delivery_target(%{
          "kind" => "entry",

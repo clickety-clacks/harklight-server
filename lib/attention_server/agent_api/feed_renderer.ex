@@ -28,7 +28,12 @@ defmodule AttentionServer.AgentAPI.FeedRenderer do
       |> Map.new()
 
     Enum.map(rows, fn row ->
-      projected_row = if row.kind == :shared_message, do: %{row | kind: :message}, else: row
+      projected_row =
+        case row.kind do
+          :shared_message -> %{row | kind: :message}
+          :shared_entry -> %{row | kind: :entry}
+          _ -> row
+        end
       {projected_row, render_row(state, scope, row, entries)}
     end)
   end
@@ -38,6 +43,19 @@ defmodule AttentionServer.AgentAPI.FeedRenderer do
     with %{sender_person: ^person, sender_key: ^origin} = record <- engine.shared_messages[id],
          true <- Engine.shared_sender_allowed?(engine, person, origin, record.sender_id) do
       {:ok, SharedMessages.sender_message(record, rev)}
+    else
+      _ -> :skip
+    end
+  end
+
+  defp render_row(%{store: %{engine: engine}}, {person, origin},
+         %{resource: {:shared_entry, id}, rev: rev}, _entries) do
+    with %{shared_id: shared_id, position: position} = entry <- engine.shared_entries[id],
+         %{sender_person: ^person, sender_key: ^origin} = record <- engine.shared_messages[shared_id],
+         true <- Engine.shared_sender_allowed?(engine, person, origin, record.sender_id),
+         cutoff = Map.get(record, :sender_frozen_entry_high),
+         true <- is_nil(cutoff) or position <= cutoff do
+      {:ok, SharedMessages.sender_entry(record, entry, rev)}
     else
       _ -> :skip
     end
