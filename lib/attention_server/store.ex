@@ -3263,7 +3263,8 @@ defmodule AttentionServer.Store do
     claim_conversation_high = Map.get(binding, :claim_conversation_high)
     claim_at = Map.get(binding, :claim_at)
 
-    is_boolean(active) and is_integer(revision) and revision > 0 and
+    is_boolean(active) and is_boolean(Map.get(binding, :shared_messages, false)) and
+      is_integer(revision) and revision > 0 and
       revision < 9_223_372_036_854_775_808 and
       state in ~w(ready queued sending waiting_retry blocked_configuration expired canceled endpoint_invalid) and
       is_integer(pending_high) and pending_high >= 0 and pending_high <= engine.persons[person] and

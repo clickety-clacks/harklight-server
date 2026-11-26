@@ -298,6 +298,11 @@ defmodule AttentionServer.Engine do
         "address_sha256" => Base.encode16(:crypto.hash(:sha256, address), case: :lower)
       }
 
+      semantic =
+        if frame[:shared_messages] == true,
+          do: Map.put(semantic, "features", ["shared_messages"]),
+          else: semantic
+
       case receipt(engine, person, device, frame["op_id"], semantic) do
         {:duplicate, reply} ->
           {:ok, engine, Map.put(reply, "profile_id", frame["profile_id"])}
@@ -389,6 +394,11 @@ defmodule AttentionServer.Engine do
           else
             binding
           end
+
+        binding =
+          if frame[:shared_messages] == true,
+            do: Map.put(binding, :shared_messages, true),
+            else: Map.delete(binding, :shared_messages)
 
         reply = %{
           "revision" => revision,

@@ -438,6 +438,56 @@ defmodule AttentionServer.ClientAPISharedSendTest do
     handle
   end
 
+  test "push capability belongs to one binding revision, including downgrade and token rebind", ctx do
+    server = start_supervised!({Server, [shared_messages: true] ++ ctx.server_opts})
+    relay = Server.relay(server)
+    {sender, first, _second} = people(ctx, relay)
+    assert :ok = Relay.enable_push(relay)
+    assert {:ok, sibling} =
+             Relay.setup_device_certificate(relay, first, TLSFixtures.certificate_der!(ctx.certs, "unknown"))
+    assert {:ok, opted_in} =
+             AttentionServer.DeviceIdentity.from_certificate(TLSFixtures.certificate_der!(ctx.certs, "a2"))
+
+    path = "/v2/devices/me/push"
+    token = String.duplicate("ab", 32)
+    registration = %{"token" => token, "environment" => "production", "revision" => 1}
+    feature_registration = Map.put(registration, "features", ["shared_messages"])
+    assert {400, %{"error" => "unsupported"}, _} =
+             write_request(ctx, server, "a2", "PUT", path, op_key(30), feature_registration, [])
+
+    assert :ok = Relay.replace_hosted_organization(relay, "org", [sender, first])
+    assert {200, shared_result, _} =
+             write_request(ctx, server, "a2", "PUT", path, op_key(30), feature_registration, [])
+    assert {200, ^shared_result, replay_headers} =
+             write_request(ctx, server, "a2", "PUT", path, op_key(30), feature_registration, [])
+    assert {"idempotent-replayed", "true"} in replay_headers
+    assert {409, %{"error" => "idempotency_conflict"}, _} =
+             write_request(ctx, server, "a2", "PUT", path, op_key(30), registration, [])
+    assert {412, %{"error" => "precondition_failed"}, _} =
+             write_request(ctx, server, "a2", "PUT", path, op_key(31), registration, [])
+
+    legacy = %{registration | "token" => String.duplicate("cd", 32)}
+    assert {200, _, _} = write_request(ctx, server, "unknown", "PUT", path, op_key(32), legacy, [])
+    bindings = :sys.get_state(relay).store.engine.push_bindings
+    assert bindings[{first, opted_in}].shared_messages
+    refute bindings[{first, sibling}][:shared_messages]
+
+    assert {200, _, _} =
+             write_request(ctx, server, "a2", "PUT", path, op_key(33), %{registration | "revision" => 2}, [])
+    refute :sys.get_state(relay).store.engine.push_bindings[{first, opted_in}][:shared_messages]
+
+    assert {200, _, _} =
+             write_request(ctx, server, "a2", "PUT", path, op_key(34), %{feature_registration | "revision" => 3}, [])
+    assert {200, _, _} =
+             write_request(ctx, server, "unknown", "PUT", path, op_key(35), %{registration | "revision" => 2}, [])
+
+    bindings = :sys.get_state(relay).store.engine.push_bindings
+    refute bindings[{first, opted_in}].active
+    refute bindings[{first, opted_in}][:shared_messages]
+    assert bindings[{first, sibling}].active
+    refute bindings[{first, sibling}][:shared_messages]
+  end
+
   test "Seen is per person and revision, with one attributed Agent event", ctx do
     server = start_supervised!({Server, [shared_messages: true] ++ ctx.server_opts})
     relay = Server.relay(server)
