@@ -92,7 +92,7 @@ printf 'server\n' > "$archive_stage/bin/attention_server"
 chmod 755 "$archive_stage/bin/attention_server"
 auth_generation=0
 if [[ "$mode" == auth-start-failure ]]; then auth_generation=1; fi
-printf 'version=0.2.21\nrelay_store_format=31\nauth_generation=%s\nsource_commit=0123456789abcdef0123456789abcdef01234567\nsource_status=\n' \
+printf 'version=0.2.21\nrelay_store_format=32\nauth_generation=%s\nsource_commit=0123456789abcdef0123456789abcdef01234567\nsource_status=\n' \
   "$auth_generation" > "$archive_stage/BUILD_INFO"
 printf 'Harklight Server release guide\n' > "$archive_stage/SELF_HOST.md"
 cp "$archive_stage/SELF_HOST.md" "$guide"
