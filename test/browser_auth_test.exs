@@ -6,7 +6,6 @@ defmodule AttentionServer.BrowserAuthTest do
   alias Exqlite.Sqlite3
 
   @moduletag :tmp_dir
-  @session_token "fixture-hosted-session-token"
   @origin "https://account.example.test"
 
   setup %{tmp_dir: dir} do
@@ -32,7 +31,6 @@ defmodule AttentionServer.BrowserAuthTest do
       "method" => "apple"
     }
 
-    assert request(relay, "/session-grants", issue, "other").status == 401
     issued = request(relay, "/session-grants", issue)
     assert issued.status == 200
     assert {:ok, %{"grant" => grant}} = JSON.decode_line(issued.resp_body <> "\n")
@@ -85,9 +83,24 @@ defmodule AttentionServer.BrowserAuthTest do
     assert person == c.person
   end
 
-  defp request(relay, path, body, token \\ @session_token) do
+  test "self-hosted mode refuses the Hosted grant routes", c do
+    {:ok, relay} = Relay.start_link(Keyword.put(c.opts, :deployment_mode, :self_hosted))
+
+    assert request(relay, "/session-grants", %{
+             "purpose" => "browser",
+             "person_id" => c.person,
+             "transaction" => "transaction",
+             "method" => "apple"
+           }).status == 404
+
+    assert request(relay, "/session-grants/redeem", %{
+             "grant" => "grant",
+             "transaction" => "transaction"
+           }).status == 404
+  end
+
+  defp request(relay, path, body) do
     Plug.Test.conn(:post, path, JSON.encode!(body))
-    |> Plug.Conn.put_req_header("authorization", "Bearer " <> token)
-    |> HostedRequests.call(HostedRequests.init(relay: relay, session_token: @session_token))
+    |> HostedRequests.call(HostedRequests.init(relay: relay))
   end
 end

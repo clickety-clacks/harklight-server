@@ -14,8 +14,7 @@ defmodule AttentionServer.HostedRequests do
   @max_body 4 * 1024
 
   @impl Plug
-  def init(opts),
-    do: %{relay: Keyword.fetch!(opts, :relay), session_token: Keyword.get(opts, :session_token)}
+  def init(opts), do: %{relay: Keyword.fetch!(opts, :relay)}
 
   @impl Plug
   def call(conn, opts) do
@@ -25,10 +24,10 @@ defmodule AttentionServer.HostedRequests do
       {"POST", "/accounts"} -> with_request(conn, &create_account(&1, &2, opts))
       {"POST", "/algorithm"} -> with_request(conn, &set_algorithm(&1, &2, opts))
       {"POST", "/session-grants"} ->
-        with_session_request(conn, opts, &create_session_grant/3)
+        with_request(conn, &create_session_grant(&1, &2, opts))
 
       {"POST", "/session-grants/redeem"} ->
-        with_session_request(conn, opts, &redeem_session_grant/3)
+        with_request(conn, &redeem_session_grant(&1, &2, opts))
       {"POST", "/sign-in-links"} -> with_request(conn, &create_sign_in_link(&1, &2, opts))
       {"POST", "/delivery-state"} -> with_request(conn, &set_delivery_state(&1, &2, opts))
       {"POST", "/test-reset"} -> with_request(conn, &test_reset(&1, &2, opts))
@@ -47,18 +46,6 @@ defmodule AttentionServer.HostedRequests do
       {:error, :invalid_account_ref} -> json(conn, 400, %{"error" => "invalid_account_ref"})
       {:error, :storage_unavailable} -> json(conn, 503, %{"error" => "storage_unavailable"})
       {:error, reason} -> json(conn, 500, %{"error" => to_string(reason)})
-    end
-  end
-
-  defp with_session_request(conn, opts, handler) do
-    case opts.session_token do
-      token when is_binary(token) and byte_size(token) > 0 ->
-        if get_req_header(conn, "authorization") == ["Bearer " <> token],
-          do: with_request(conn, &handler.(&1, &2, opts)),
-          else: json(conn, 401, %{"error" => "unauthorized"})
-
-      _ ->
-        send_resp(conn, 404, "")
     end
   end
 

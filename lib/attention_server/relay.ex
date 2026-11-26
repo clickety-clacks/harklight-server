@@ -1411,12 +1411,14 @@ defmodule AttentionServer.Relay do
 
   defp dispatch_call({:hosted_browser_grant, person, transaction, method}, _from, state) do
     result =
-      with %{auth_schema: %{}, db: db, engine: engine} <- state.store,
+      with :saas <- state.deployment_mode,
+           %{auth_schema: %{}, db: db, engine: engine} <- state.store,
            {:ok, _record} <- hosted_record(engine, person),
            key when is_binary(key) <- Engine.hosted_owner_key(engine, person),
            {:ok, revision} <- Engine.owner_revision(engine, person, key) do
         BrowserAuth.issue_hosted(db, transaction, person, key, revision, method, state.clock.())
       else
+        :self_hosted -> {:error, :disabled}
         %Store{auth_schema: nil} -> {:error, :disabled}
         _ -> {:error, :not_hosted}
       end
@@ -1426,8 +1428,8 @@ defmodule AttentionServer.Relay do
 
   defp dispatch_call({:redeem_hosted_browser_grant, grant, transaction}, _from, state) do
     result =
-      case state.store do
-        %{auth_schema: %{}, db: db, engine: engine} ->
+      case {state.deployment_mode, state.store} do
+        {:saas, %{auth_schema: %{}, db: db, engine: engine}} ->
           BrowserAuth.redeem_hosted(db, engine, grant, transaction, state.clock.())
 
         _ ->
