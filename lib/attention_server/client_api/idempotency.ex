@@ -32,6 +32,7 @@ defmodule AttentionServer.ClientAPI.Idempotency do
   """
 
   alias AttentionServer.{JSON, Message}
+  alias AttentionServer.Store.RecordTable
   alias Exqlite.Sqlite3
 
   @retention_ms 30 * 24 * 60 * 60 * 1000
@@ -50,6 +51,70 @@ defmodule AttentionServer.ClientAPI.Idempotency do
     """,
     "CREATE INDEX IF NOT EXISTS client_idempotency_at ON client_idempotency (at_ms)"
   ]
+
+  @retained_schema """
+  CREATE TABLE harklight_app_receipts (
+    person_id TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    digest TEXT NOT NULL,
+    status INTEGER NOT NULL,
+    body BLOB NOT NULL,
+    at_ms INTEGER NOT NULL,
+    original_response INTEGER NOT NULL CHECK (original_response IN (0, 1)),
+    PRIMARY KEY (person_id, idempotency_key)
+  );
+  """
+
+  # Called only inside the auth upgrade transaction. The agent scope namespace
+  # is produced by agent_scope/2. Legacy receipts carry compact evidence.
+  @doc false
+  def retain_person_receipts(db) do
+    with :ok <- ensure(db),
+         :ok <- Sqlite3.execute(db, @retained_schema) do
+      Sqlite3.execute(db, """
+      INSERT INTO harklight_app_receipts
+        (person_id, idempotency_key, digest, status, body, at_ms, original_response)
+      SELECT person_id, idempotency_key, digest, status, body, at_ms, 0
+      FROM client_idempotency
+      WHERE substr(person_id, 1, 6) <> 'agent:'
+      """)
+    end
+  end
+
+  @doc false
+  def lookup_retained(db, person, key) do
+    sql = """
+    SELECT digest, status, body, original_response FROM harklight_app_receipts
+    WHERE person_id = ? AND idempotency_key = ?
+    """
+
+    case RecordTable.select(db, sql, [person, key]) do
+      {:ok, []} ->
+        {:ok, nil}
+
+      {:ok, [[digest, status, body, original]]} ->
+        {:ok, %{digest: digest, status: status, body: body, original_response: original == 1}}
+
+      error ->
+        error
+    end
+  end
+
+  # The caller saves this alongside the accepted operation in the same
+  # transaction. The initial committed response remains authoritative.
+  @doc false
+  def save_retained(db, person, key, digest, status, body) do
+    RecordTable.run(
+      db,
+      """
+      INSERT INTO harklight_app_receipts
+        (person_id, idempotency_key, digest, status, body, at_ms, original_response)
+      VALUES (?, ?, ?, ?, ?, ?, 1)
+      ON CONFLICT (person_id, idempotency_key) DO NOTHING
+      """,
+      [person, key, digest, status, JSON.encode!(body), now()]
+    )
+  end
 
   @type receipt :: %{digest: String.t(), status: pos_integer(), body: map()}
 
