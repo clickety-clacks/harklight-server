@@ -1,7 +1,7 @@
 defmodule AttentionServer.SharedMessages do
   @moduledoc false
 
-  alias AttentionServer.Engine
+  alias AttentionServer.{BounceDecision, Engine}
   alias AttentionServer.ClientAPI.{PeopleProfiles, SharedAttachments}
 
   def organizations(%Engine{} = engine, person) do
@@ -98,6 +98,59 @@ defmodule AttentionServer.SharedMessages do
     "shared_" <> Base.url_encode64(digest, padding: false)
   end
 
+  def seen(%Engine{} = engine, record, person, recipient, revision, now) do
+    cond do
+      revision != record.revision ->
+        {:error, :stale_request}
+
+      recipient.seen_revision == revision ->
+        {:ok, engine, nil}
+
+      true ->
+        id = stable_fact_id("seen_", {record.id, person, revision})
+        event = %{
+          id: id, shared_id: record.id, person: person, request_revision: revision,
+          at_ms: now, speaker: PeopleProfiles.speaker(engine, person)
+        }
+
+        row = Map.merge(recipient, %{seen_revision: revision, seen_at_ms: now})
+
+        next =
+          engine
+          |> Engine.put_row(:shared_recipients, {record.id, person}, row)
+          |> Engine.put_row(:shared_seen, id, event)
+
+        {:ok, next, id}
+    end
+  end
+
+  def seen_event(event) do
+    %{
+      "item_id" => event.shared_id, "event_id" => event.id,
+      "request_revision" => event.request_revision, "at_ms" => event.at_ms,
+      "speaker" => event.speaker
+    }
+  end
+
+  def valid_seen?(%Engine{} = engine, id, %{
+        id: id, shared_id: shared_id, person: person, request_revision: revision,
+        at_ms: at, speaker: %{"kind" => "person", "id" => person}
+      }) do
+    case engine.shared_messages[shared_id] do
+      %{revision: current} ->
+        is_binary(id) and revision in 1..current and is_integer(at) and
+          Map.has_key?(engine.shared_recipients, {shared_id, person})
+      nil -> false
+    end
+  end
+
+  def valid_seen?(_, _, _), do: false
+
+  defp stable_fact_id(prefix, value) do
+    hash = :crypto.hash(:sha256, :erlang.term_to_binary(value))
+    prefix <> Base.url_encode64(hash, padding: false)
+  end
+
   def revise(%Engine{} = engine, record, revision, message, files) do
     with :ok <- writable_sender(record),
          true <- record.revision == revision || {:error, :precondition_failed} do
@@ -110,7 +163,25 @@ defmodule AttentionServer.SharedMessages do
         |> Map.put(:message, message)
         |> Map.put(:files, files)
 
-      {:ok, Engine.put_row(engine, :shared_messages, record.id, updated)}
+      next = Engine.put_row(engine, :shared_messages, record.id, updated)
+      {:ok, carry_seen(next, record, updated)}
+    end
+  end
+
+  defp carry_seen(engine, previous, updated) do
+    files = Map.get(previous, :files, [])
+
+    if BounceDecision.progress_only?(previous.message, files, updated.message, Map.get(updated, :files, [])) do
+      Enum.reduce(live_recipients(engine, previous.id), engine, fn person, next ->
+        key = {previous.id, person}
+        case next.shared_recipients[key] do
+          %{seen_revision: revision} = row when revision == previous.revision ->
+            Engine.put_row(next, :shared_recipients, key, %{row | seen_revision: updated.revision})
+          _ -> next
+        end
+      end)
+    else
+      engine
     end
   end
 
@@ -325,7 +396,8 @@ defmodule AttentionServer.SharedMessages do
       do:
         Engine.put_row(engine, :shared_messages, id,
           Map.merge(record, %{sender_frozen_revision: record.revision, sender_frozen_terminal: Map.get(record, :terminal),
-                              sender_frozen_entry_high: Map.get(record, :entry_high, 0)})),
+                              sender_frozen_entry_high: Map.get(record, :entry_high, 0),
+                              sender_frozen_seen: sender_seen?(snapshot, record)})),
 
       else: engine
   end
@@ -452,11 +524,13 @@ defmodule AttentionServer.SharedMessages do
     engine.shared_recipients
       |> Enum.flat_map(fn
         {{id, member}, state} when id == shared_id ->
+          current = engine.shared_messages[id].revision
+          seen? = state.seen_revision == current
           [
             %{
               "person" => PeopleProfiles.speaker(engine, member),
-              "seen_revision" => state.seen_revision,
-              "seen_at_ms" => Map.get(state, :seen_at_ms)
+              "seen_revision" => if(seen?, do: current),
+              "seen_at_ms" => if(seen?, do: Map.get(state, :seen_at_ms))
             }
           ]
 
@@ -479,7 +553,7 @@ defmodule AttentionServer.SharedMessages do
       "files" => SharedAttachments.wire(Map.get(record, :files, []))}
   end
 
-  def sender_message(record, rev) do
+  def sender_message(engine, record, rev) do
     frozen = Map.get(record, :sender_frozen_revision)
     record = historical_record(record, frozen)
     record = if frozen, do: replace_terminal(record, record.sender_frozen_terminal), else: record
@@ -491,7 +565,7 @@ defmodule AttentionServer.SharedMessages do
       "revision" => record.revision,
       "message" => record.message,
       "files" => SharedAttachments.wire(Map.get(record, :files, [])),
-      "seen" => false,
+      "seen" => if(frozen, do: record.sender_frozen_seen, else: sender_seen?(engine, record)),
       "shared" => %{
         "shared_id" => record.id,
         "organization_id" => record.organization_id,
@@ -502,6 +576,12 @@ defmodule AttentionServer.SharedMessages do
     }
     |> Map.merge(Map.take(record, ["session", "created_at_ms"]))
     |> maybe_terminal(record)
+  end
+
+  defp sender_seen?(engine, record) do
+    Enum.any?(live_recipients(engine, record.id), fn person ->
+      engine.shared_recipients[{record.id, person}].seen_revision == record.revision
+    end)
   end
 
   defp replace_terminal(record, nil), do: Map.delete(record, :terminal)

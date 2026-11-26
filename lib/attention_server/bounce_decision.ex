@@ -143,7 +143,8 @@ defmodule AttentionServer.BounceDecision do
 
   # Progress still advances the substantive revision. Carry the person's
   # Seen flag through the existing opened marker, which bounces ignore for Progress.
-  defp progress_only?(old_message, old_files, message, files) do
+  @doc false
+  def progress_only?(old_message, old_files, message, files) do
     # The Agent refreshes created_at with progress. A timestamp edit alone
     # still clears Seen.
     progress_fields = ~w(progress created_at)

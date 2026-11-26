@@ -630,7 +630,7 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
       result =
         with {:ok, head} <- AgentChangeLog.head(store, scope),
              {:ok, rev} <- AgentChangeLog.rev(store, scope, {:shared_message, record.id}) do
-          body = %{"rev" => head, "message" => SharedMessages.sender_message(next.shared_messages[record.id], rev)}
+          body = %{"rev" => head, "message" => SharedMessages.sender_message(next, next.shared_messages[record.id], rev)}
           {:ok, 200, body, false}
         end
 

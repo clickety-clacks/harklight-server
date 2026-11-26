@@ -111,6 +111,13 @@ defmodule AttentionServer.ClientAPI.SharedChat do
     end
   end
 
+  defp transition(engine, record, recipient, _params, %{"request_revision" => revision}, %{operation: :seen} = chat)
+       when is_integer(revision) and revision > 0 do
+    with {:ok, next, event_id} <-
+           SharedMessages.seen(engine, record, chat.person, recipient, revision, chat.now),
+      do: {:ok, next, Map.put(chat, :event_id, event_id)}
+  end
+
   defp transition(engine, record, recipient, _params, %{"entry_id" => entry}, %{operation: :read_position} = chat) do
     with {:ok, next} <- SharedMessages.read_position(engine, record, chat.person, recipient, entry),
       do: {:ok, next, chat}
@@ -173,7 +180,8 @@ defmodule AttentionServer.ClientAPI.SharedChat do
   defp commit_chat(store, _old, updated, audit), do: Store.commit(store, updated, audit)
 
   @doc false
-  def result(store, engine, %{direction: :person, operation: :read_position} = chat) do
+  def result(store, engine, %{direction: :person, operation: operation} = chat)
+      when operation in [:read_position, :seen] do
     record = engine.shared_messages[chat.message_id]
     recipient = engine.shared_recipients[{record.id, chat.person}]
     alias AttentionServer.ChangeLog, as: Log

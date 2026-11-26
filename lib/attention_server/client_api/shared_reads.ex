@@ -88,7 +88,7 @@ defmodule AttentionServer.ClientAPI.SharedReads do
           end, & &1.id)
 
         action ->
-          resource(action, head, historical, fn -> {"message", SharedMessages.sender_message(message, rev)} end)
+          resource(action, head, historical, fn -> {"message", SharedMessages.sender_message(store.engine, message, rev)} end)
       end
     else
       result when result in [nil, false] -> {:error, :not_found}

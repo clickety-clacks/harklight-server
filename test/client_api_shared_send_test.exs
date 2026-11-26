@@ -367,6 +367,50 @@ defmodule AttentionServer.ClientAPISharedSendTest do
     assert %{status: 404} = raw_request(ctx, server, "b1", "GET", path, opt_in, nil)
   end
 
+  test "Seen is per person and revision, with one attributed Agent event", ctx do
+    server = start_supervised!({Server, [shared_messages: true] ++ ctx.server_opts})
+    relay = Server.relay(server)
+    {sender, first, second} = people(ctx, relay)
+    assert :ok = Relay.replace_hosted_organization(relay, "org", [sender, first, second])
+    headers = [{"harklight-features", "shared_messages"}]
+
+    assert {200, %{"rev" => before, "continuation" => continuation}, _} =
+             get_request(ctx, server, "a1", "/v2/agent/delivery-baseline", headers)
+
+    assert {200, %{"message" => %{"item_id" => id}}, _} =
+             send_request(ctx, server, @key, body([first, second]), true)
+
+    engine = :sys.get_state(relay).store.engine
+    first_path = "/v2/items/" <> engine.shared_recipients[{id, first}].item_id
+    second_path = "/v2/items/" <> engine.shared_recipients[{id, second}].item_id
+
+    assert {409, %{"error" => "stale_request"}, _} =
+             write_request(ctx, server, "a2", "POST", first_path <> "/seen", @another_key,
+               %{"request_revision" => 2}, headers)
+
+    seen = %{"request_revision" => 1}
+    assert {200, %{"item" => %{"seen" => true}}, _} =
+             write_request(ctx, server, "a2", "POST", first_path <> "/seen", @another_key, seen, headers)
+
+    retry_key = "10000000-0000-4000-8000-000000000003"
+    assert {200, _, _} =
+             write_request(ctx, server, "a2", "POST", first_path <> "/seen", retry_key, seen, headers)
+
+    assert {200, %{"item" => %{"seen" => false, "shared" => %{"members" => members}}}, _} =
+             get_request(ctx, server, "b1", second_path, headers)
+
+    assert Enum.any?(members, &match?(%{"person" => %{"id" => ^first}, "seen_revision" => 1}, &1))
+    assert {200, %{"message" => %{"seen" => true}}, _} =
+             get_request(ctx, server, "a1", "/v2/agent/messages/" <> id, headers)
+
+    assert {200, %{"changes" => changes}, _} =
+             get_request(ctx, server, "a1", "/v2/agent/changes?after=#{before}",
+               [{"harklight-continuation", continuation} | headers])
+
+    assert [%{"data" => %{"request_revision" => 1, "speaker" => %{"id" => ^first}}}] =
+             Enum.filter(changes, &(&1["kind"] == "seen"))
+  end
+
   test "the default-off setting refuses the path while preserving legacy sends", ctx do
     server = start_supervised!({Server, ctx.server_opts})
     relay = Server.relay(server)

@@ -69,6 +69,18 @@ defmodule AttentionServer.ClientAPI.Writes do
   end
 
   @doc false
+  def post_seen(conn, %Context{params: %{item_id: "shared_" <> _}} = ctx) do
+    with {:ok, key} <- required_key(conn),
+         {:ok, body, conn} <- json_body(conn),
+         :ok <- only_members(body, ["request_revision"]),
+         {:ok, _revision} <- request_revision(body) do
+      SharedChat.respond(conn, ctx, :person, :seen, body, key)
+    else
+      {:error, token, field, response} -> Errors.send_error(response, token, field: field)
+      {:error, token, field} -> Errors.send_error(conn, token, field: field)
+    end
+  end
+
   def post_seen(conn, %Context{} = ctx) do
     with {:ok, key} <- required_key(conn),
          {:ok, body, conn} <- json_body(conn),

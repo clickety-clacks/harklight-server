@@ -1828,6 +1828,7 @@ defmodule AttentionServer.Store do
     :shared_messages,
     :shared_recipients,
     :shared_entries,
+    :shared_seen,
     :free_order_highs,
     :conversation_highs,
     :chat_read_positions,
@@ -1931,6 +1932,9 @@ defmodule AttentionServer.Store do
 
   defp valid_keyed_row?(engine, :shared_entries, key, record),
     do: SharedMessages.valid_entry?(engine, key, record)
+
+  defp valid_keyed_row?(engine, :shared_seen, key, record),
+    do: SharedMessages.valid_seen?(engine, key, record)
 
   defp valid_keyed_row?(engine, :free_order_highs, person, high),
     do: valid_order_high?(engine, person, high)
@@ -2135,6 +2139,16 @@ defmodule AttentionServer.Store do
           do: inbox_log,
           else: AgentChangeLog.append_shared_entry(inbox_log, {record.sender_person, record.sender_key}, entry.id, session)
 
+      :seen ->
+        log =
+          Enum.reduce(SharedMessages.live_recipients(engine, id), log, fn person, acc ->
+            AttentionServer.ChangeLog.append_shared_freeze(acc, person, id)
+          end)
+
+        if Map.has_key?(record, :sender_frozen_revision),
+          do: log,
+          else: AgentChangeLog.append_shared_seen(log, {record.sender_person, record.sender_key}, chat.event_id, session)
+
       :read_position ->
         AttentionServer.ChangeLog.append_shared_freeze(log, chat.person, id)
 
@@ -2164,7 +2178,7 @@ defmodule AttentionServer.Store do
          {:ok, resource_rev} <- AgentChangeLog.rev(store, scope, {:shared_message, id}) do
       body = %{
         "rev" => rev,
-        "message" => SharedMessages.sender_message(record, resource_rev),
+        "message" => SharedMessages.sender_message(engine, record, resource_rev),
         "recipients" => outcomes
       }
 
@@ -2182,7 +2196,7 @@ defmodule AttentionServer.Store do
 
     with {:ok, rev} <- AgentChangeLog.head(store, scope),
          {:ok, resource_rev} <- AgentChangeLog.rev(store, scope, {:shared_message, id}) do
-      body = %{"rev" => rev, "message" => SharedMessages.sender_message(record, resource_rev)}
+      body = %{"rev" => rev, "message" => SharedMessages.sender_message(engine, record, resource_rev)}
       Idempotency.save(store, Idempotency.agent_scope(person, origin), key, digest, 200, body)
     end
   end
@@ -2870,6 +2884,9 @@ defmodule AttentionServer.Store do
         end) and
         Enum.all?(engine.shared_entries, fn {key, record} ->
           SharedMessages.valid_entry?(engine, key, record)
+        end) and
+        Enum.all?(engine.shared_seen, fn {key, record} ->
+          SharedMessages.valid_seen?(engine, key, record)
         end) and
         valid_delivery_states?(engine) and
         valid_prioritization?(engine) and
