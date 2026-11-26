@@ -154,6 +154,32 @@ defmodule AttentionServer.HostedAccountTest do
       assert :ok = GenServer.stop(relay)
     end
 
+    test "first shared self-hosted startup affiliates existing local owners only", %{certs: certs, dir: dir} do
+      path = Path.join(dir, "relay.sqlite3")
+      person = "10000000-0000-4000-8000-000000000001"
+      hosted = "10000000-0000-4000-8000-000000000002"
+      assert {:ok, store} = Store.open_relay(path)
+      {engine, :ok, touched} =
+        Engine.with_touches(store.engine, fn engine ->
+          {:ok, engine} = Engine.operator_bootstrap(engine, person, String.duplicate("a", 64))
+          {:ok, engine, _} = Engine.hosted_account_create(engine, "hosted", false, hosted, String.duplicate("b", 64))
+          {engine, :ok}
+        end)
+
+      audit = %{person: person, actor: "fixture", action: "existing_owner"}
+      assert {:ok, store} = Store.commit(store, {engine, touched}, audit)
+      assert :ok = Store.close(store)
+
+      relay = start_relay(certs, dir, shared_messages: true)
+      assert :sys.get_state(relay).store.engine.local_organizations.default == MapSet.new([person])
+      assert :ok = Relay.operator_organization_member(relay, person, false)
+      assert :ok = GenServer.stop(relay)
+
+      relay = start_relay(certs, dir, shared_messages: true)
+      assert :sys.get_state(relay).store.engine.local_organizations.default == MapSet.new()
+      assert :ok = GenServer.stop(relay)
+    end
+
     test "a newly created hosted owner has an empty inbox", %{certs: certs, dir: dir} do
       relay = start_relay(certs, dir, dashboard_origin: @origin)
       assert {:ok, person} = Relay.hosted_account_create(relay, "acct-empty-inbox")

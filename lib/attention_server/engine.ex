@@ -836,10 +836,7 @@ defmodule AttentionServer.Engine do
       when is_boolean(member?) do
     if Map.has_key?(engine.owners, person) and is_nil(hosted_account(engine, person)) do
       members =
-        Map.get_lazy(engine.local_organizations, :default, fn ->
-          hosted_people = MapSet.new(Map.values(engine.hosted_accounts), & &1.person)
-          MapSet.difference(MapSet.new(Map.keys(engine.owners)), hosted_people)
-        end)
+        Map.get_lazy(engine.local_organizations, :default, fn -> local_organization_defaults(engine) end)
 
       next_members = if member?, do: MapSet.put(members, person), else: MapSet.delete(members, person)
       departing = MapSet.difference(members, next_members)
@@ -851,6 +848,18 @@ defmodule AttentionServer.Engine do
     else
       {:error, :unknown_local_person}
     end
+  end
+
+  @doc false
+  def initialize_local_organization(engine) do
+    if Map.has_key?(engine.local_organizations, :default),
+      do: engine,
+      else: put_row(engine, :local_organizations, :default, local_organization_defaults(engine))
+  end
+
+  defp local_organization_defaults(engine) do
+    hosted_people = MapSet.new(Map.values(engine.hosted_accounts), & &1.person)
+    MapSet.difference(MapSet.new(Map.keys(engine.owners)), hosted_people)
   end
 
   @doc false

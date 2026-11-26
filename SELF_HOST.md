@@ -142,6 +142,12 @@ set the device port with `--device-port` or `HARKLIGHT_DEVICE_PORT` when needed.
 New enrollments save the port.
 
 `ATTENTION_SERVER_DEPLOYMENT_MODE` defaults to `self_hosted`.
+Shared messaging is off by default. A self-hosted operator can enable it with
+`ATTENTION_SERVER_SHARED_MESSAGES=1` and can also enable groups with
+`ATTENTION_SERVER_GROUPS=1`. On first enablement, existing local owners form
+the default organization. Later owner-tool changes to affiliation persist.
+Hosted groups remain off until the Hosted component enables them after
+business membership and consent are ready.
 `ATTENTION_SERVER_UPLOAD_CAP_BYTES` defaults to `none` for self-hosting or may be
 a positive integer. The cap is optional in `saas` mode too: without it, the
 server starts uncapped and logs one startup notice; with it, uploads over the

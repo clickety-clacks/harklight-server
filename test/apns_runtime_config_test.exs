@@ -26,6 +26,8 @@ defmodule AttentionServer.APNSRuntimeConfigTest do
     "ATTENTION_SERVER_APNS_PRODUCTION_KEY_PATH" => nil,
     "ATTENTION_SERVER_APNS_PRODUCTION_KEY_ID" => nil,
     "ATTENTION_SERVER_DEPLOYMENT_MODE" => nil,
+    "ATTENTION_SERVER_SHARED_MESSAGES" => nil,
+    "ATTENTION_SERVER_GROUPS" => nil,
     "ATTENTION_SERVER_UPLOAD_CAP_BYTES" => nil,
     "ATTENTION_SERVER_PUBLIC_BASE_URL" => nil,
     "ATTENTION_SERVER_HOSTED_PORT" => nil,
@@ -50,6 +52,28 @@ defmodule AttentionServer.APNSRuntimeConfigTest do
     certs = TLSFixtures.create!()
     on_exit(fn -> File.rm_rf!(certs) end)
     %{certs: certs}
+  end
+
+  test "groups require explicit shared messaging and group startup settings", %{certs: certs} do
+    for mode <- ["self_hosted", "saas"],
+        {shared, groups, expected_shared, expected_groups} <- [
+          {nil, nil, false, false},
+          {nil, "1", false, false},
+          {"1", nil, true, false},
+          {"1", "1", true, true}
+        ] do
+      env = Map.merge(@server_env, %{
+        "ATTENTION_SERVER_DEPLOYMENT_MODE" => mode,
+        "ATTENTION_SERVER_SHARED_MESSAGES" => shared,
+        "ATTENTION_SERVER_GROUPS" => groups
+      })
+
+      with_env(env, fn ->
+        opts = runtime_server_opts(certs)
+        assert opts[:shared_messages] == expected_shared
+        assert opts[:groups] == expected_groups
+      end)
+    end
   end
 
   test "optional score record path reaches the self-hosted relay", %{certs: certs} do

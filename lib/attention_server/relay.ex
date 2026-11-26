@@ -509,7 +509,11 @@ defmodule AttentionServer.Relay do
       {:ok, store, cutoff} ->
         clock = Keyword.get(opts, :clock, fn -> System.system_time(:millisecond) end)
 
-        case startup_cleanup(store, clock.(), cutoff) do
+        initialized =
+          with {:ok, cleaned} <- startup_cleanup(store, clock.(), cutoff),
+               do: initialize_shared_affiliation(cleaned, opts)
+
+        case initialized do
           {:ok, store} ->
             state = %{
               store: store,
@@ -581,6 +585,22 @@ defmodule AttentionServer.Relay do
 
       {:error, reason} ->
         {:stop, reason}
+    end
+  end
+
+  defp initialize_shared_affiliation(store, opts) do
+    if store.mode == :keyed and Keyword.get(opts, :shared_messages) == true and
+         Keyword.get(opts, :deployment_mode, :self_hosted) == :self_hosted and
+         not Map.has_key?(store.engine.local_organizations, :default) do
+      next = Engine.initialize_local_organization(store.engine)
+      audit = %{person: "system", actor: "local_operator", action: "initialize_local_organization"}
+
+      case Store.commit(store, next, audit) do
+        {:ok, initialized} -> {:ok, initialized}
+        {:error, reason, _} -> {:error, reason}
+      end
+    else
+      {:ok, store}
     end
   end
 
