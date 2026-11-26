@@ -156,6 +156,15 @@ defmodule AttentionServer.ClientAPI.Router do
   defp stream?(:nomatch), do: false
 
   defp authenticated(
+         %{method: "GET"} = conn,
+         %{auth: {:browser, _, _}, relay: relay},
+         ["auth", "methods"],
+         _route,
+         _request_id
+       ),
+       do: AttentionServer.ClientAPI.SignIn.methods(conn, relay)
+
+  defp authenticated(
          %{method: "POST"} = conn,
          %{auth: {:browser, _, _}, relay: relay},
          ["auth", "transactions"],

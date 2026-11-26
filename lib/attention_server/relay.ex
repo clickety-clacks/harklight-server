@@ -268,6 +268,9 @@ defmodule AttentionServer.Relay do
   def redeem_hosted_browser_grant(server, grant, transaction),
     do: GenServer.call(server, {:redeem_hosted_browser_grant, grant, transaction}, :infinity)
 
+  def native_sign_in_methods(server),
+    do: GenServer.call(server, :native_sign_in_methods, :infinity)
+
   def create_native_transaction(server, verifier_hash),
     do: GenServer.call(server, {:create_native_transaction, verifier_hash}, :infinity)
 
@@ -1421,6 +1424,17 @@ defmodule AttentionServer.Relay do
       {:error, _, _} -> {:reply, {:error, :storage_unavailable}, state}
       _ -> {:reply, {:error, :not_created}, state}
     end
+  end
+
+  defp dispatch_call(:native_sign_in_methods, _from, state) do
+    methods =
+      case {state.store.auth_schema, state.deployment_mode} do
+        {%{}, :saas} -> {:ok, ~w(google apple email_code)}
+        {%{}, :self_hosted} -> {:ok, ~w(owner_code)}
+        _ -> {:error, :disabled}
+      end
+
+    {:reply, methods, state}
   end
 
   defp dispatch_call({:create_native_transaction, verifier_hash}, _from, state) do

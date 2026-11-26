@@ -8,6 +8,17 @@ defmodule AttentionServer.ClientAPI.SignIn do
 
   @request_limit 4 * 1024
 
+  def methods(conn, relay) do
+    conn = put_resp_header(conn, "cache-control", "no-store")
+
+    case Relay.native_sign_in_methods(relay) do
+      {:ok, methods} -> Errors.send_json(conn, 200, %{"methods" => methods})
+      error -> send_failure(conn, error)
+    end
+  catch
+    :exit, _ -> Errors.send_error(conn, "retry_later")
+  end
+
   def create_transaction(conn, relay) do
     handle_json(conn, fn
       conn, %{"verifier_hash" => hash} ->

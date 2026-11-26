@@ -22,6 +22,10 @@ defmodule AttentionServer.NativeSignInTest do
 
     {:ok, relay} = Relay.start_link(opts)
     router = Router.init(relay: relay, auth: {:browser, nil, "https://example.test"})
+    discovery = Plug.Test.conn(:get, "/v2/auth/methods") |> Router.call(router)
+    assert discovery.status == 200
+    assert json(discovery) == %{"methods" => ~w(google apple email_code)}
+
     verifier = BrowserAuth.new_secret()
     bearer = BrowserAuth.new_secret()
 
