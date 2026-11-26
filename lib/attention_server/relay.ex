@@ -1329,8 +1329,12 @@ defmodule AttentionServer.Relay do
                actor: "hosted_component",
                action: "hosted_notice"
              }) do
-          {:ok, store} -> {:reply, {:ok, result}, %{state | store: store}}
-          {:error, _, _} -> {:reply, {:error, :storage_unavailable}, state}
+          {:ok, store} ->
+            next_state = refresh_pending_set(state, %{state | store: store}, person)
+            {:reply, {:ok, result}, next_state}
+
+          {:error, _, _} ->
+            {:reply, {:error, :storage_unavailable}, state}
         end
 
       {:ok, _engine, duplicate} ->
@@ -2837,10 +2841,7 @@ defmodule AttentionServer.Relay do
           next_state =
             case Engine.account_device_principal(state.store.engine, key) do
               {:ok, %{person: person}} ->
-                if pending_signature(state.store.engine, person) !=
-                     pending_signature(next_engine, person),
-                   do: pending_set_changed(next_state, person),
-                   else: next_state
+                refresh_pending_set(state, next_state, person)
 
               _ ->
                 next_state
@@ -3118,6 +3119,12 @@ defmodule AttentionServer.Relay do
 
       Map.put(state, :priority_views, Map.put(state.priority_views, person, view))
     end
+  end
+
+  defp refresh_pending_set(previous, next, person) do
+    if pending_signature(previous.store.engine, person) != pending_signature(next.store.engine, person),
+      do: pending_set_changed(next, person),
+      else: next
   end
 
   defp pending_signature(engine, person) do
