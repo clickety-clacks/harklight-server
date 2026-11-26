@@ -17,7 +17,8 @@ defmodule Format31Rehearsal do
     :ok = File.mkdir(dir)
     :ok = File.write!(Path.join(dir, "synthetic-format31"), "")
     {:ok, store} = Store.open(path(dir))
-    {:ok, store} = Store.enable_change_log(store)
+    low_log = System.get_env("HARKLIGHT_FIXTURE_KIND") == "M"
+    {:ok, store} = if low_log, do: {:ok, store}, else: Store.enable_change_log(store)
     {:ok, engine} = Engine.setup_person(store.engine, @person)
     {:ok, engine} = Engine.setup_device(engine, @person, @origin)
     {:ok, engine} = Engine.setup_device(engine, @person, @reader)
@@ -114,6 +115,7 @@ defmodule Format31Rehearsal do
 
     engine = mark_long_chats_read(engine, messages, active, discussions, now + exchanges + 1)
     engine = BounceDecision.record_scores(engine, @person, scores, now)
+    engine = if low_log, do: add_small_uploads(engine, path(dir) <> ".uploads", now), else: engine
     deadline = BounceDecision.next_deadline(engine)
     {:ok, store} =
       Store.commit(store, engine, %{person: @person, actor: @origin, action: "startup_benchmark_seed"})
@@ -131,6 +133,20 @@ defmodule Format31Rehearsal do
     })
   end
 
+
+  def run(["calibrate-uploads", dir]) do
+    synthetic!(dir)
+    database = path(dir)
+    {:ok, budget} = AttentionServer.Store.ConversionCapacity.read(database)
+    report(:measured_budget, budget)
+    true = budget.uploads >= 170_000
+
+    {elapsed, {:ok, :converted}} =
+      :timer.tc(fn -> Store.convert_stopped(database, %{budget | uploads: 0}, 30) end)
+
+    report(:conversion, %{elapsed_us: elapsed, file_after_bytes: File.stat!(database).size,
+      memory: memory()})
+  end
 
   def run(["convert", dir]) do
     synthetic!(dir)
@@ -350,6 +366,24 @@ defmodule Format31Rehearsal do
 
   end
 
+
+  defp add_small_uploads(engine, directory, now) do
+    :ok = File.mkdir_p(directory)
+    :rand.seed(:exsss, {40, 11, 26})
+
+    [{10_101_001, 96 * 1024}, {10_101_002, 192 * 1024}]
+    |> Enum.reduce(engine, fn {sequence, size}, acc ->
+      id = uuid(sequence)
+      bytes = :rand.bytes(size)
+      :ok = File.write(Path.join(directory, id), bytes)
+
+      upload = %{id: id, person: @person, uploader: @origin, op_id: uuid(sequence + 10),
+        sender_id: @sender, message_id: "item-2400", revision: 1,
+        name: "synthetic-attachment-#{sequence}.bin", size: size, last_activity_ms: now,
+        sha256: Base.encode16(:crypto.hash(:sha256, bytes), case: :lower)}
+      Engine.put_row(acc, :uploads, id, upload)
+    end)
+  end
 
   defp report(label, data), do: IO.puts("#{label} #{inspect(data, width: :infinity)}")
 end
