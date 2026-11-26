@@ -93,20 +93,19 @@ defmodule AttentionServer.GroupsTest do
     assert :ok = Store.close(reopened)
   end
 
-  test "joining after the cutoff cannot create a reminder for an older message" do
-    name = "ATTENTION_SERVER_BOUNCE_NOT_BEFORE"
-    previous = System.get_env(name)
-    on_exit(fn -> if previous, do: System.put_env(name, previous), else: System.delete_env(name) end)
-
+  test "a late join cannot schedule reminders for a message accepted before the cutoff and revised after it" do
     now = System.system_time(:millisecond)
     accepted = now - 60_000
-    System.put_env(name, now |> DateTime.from_unix!(:millisecond) |> DateTime.to_iso8601())
+    set_cutoff(now)
     engine = local_people(Engine.new())
     assert {:ok, engine, _} = Groups.create(engine, @group, @manager, "Planning")
     assert {:ok, engine, _, _} = Groups.invite(engine, @group, @manager, @invitee, @invitation)
     attrs = Map.put(attrs("old"), "created_at_ms", accepted)
-    assert {:ok, engine, _, _} =
+    assert {:ok, engine, record, _} =
              SharedMessages.create(engine, attrs, [@manager], engine.relay_instance_id)
+
+    assert {:ok, engine} =
+             SharedMessages.revise(engine, record, 1, %{"title" => "New plans"}, [], now + 1)
 
     {joined, :ok, touched} =
       Engine.with_touches(engine, fn engine ->
@@ -114,10 +113,48 @@ defmodule AttentionServer.GroupsTest do
         {joined, :ok}
       end)
 
-    {scheduled, _} = SharedReminders.schedule(engine, joined, touched, now + 1)
+    {scheduled, _} = SharedReminders.schedule(engine, joined, touched, now + 2)
     assert %{seen_revision: nil} = recipient = scheduled.shared_recipients[{"old", @invitee}]
     refute Map.has_key?(recipient, :reminder)
     assert {^scheduled, [], []} = SharedReminders.evaluate_due(scheduled, now + 10 * 86_400_000, true)
+  end
+
+  test "a late join keeps the substantive revision's three-day reminder deadline" do
+    day = 86_400_000
+    accepted = System.system_time(:millisecond)
+    revised_at = accepted + div(day, 2)
+    set_cutoff(accepted - 1)
+    engine = local_people(Engine.new())
+    assert {:ok, engine, _} = Groups.create(engine, @group, @manager, "Planning")
+    assert {:ok, engine, _, _} = Groups.invite(engine, @group, @manager, @invitee, @invitation)
+    attrs = Map.put(attrs("open"), "created_at_ms", accepted)
+    assert {:ok, engine, record, _} =
+             SharedMessages.create(engine, attrs, [@manager], engine.relay_instance_id)
+    assert {:ok, engine} =
+             SharedMessages.revise(engine, record, 1, %{"title" => "New plans"}, [], revised_at)
+
+    {joined, :ok, touched} =
+      Engine.with_touches(engine, fn state ->
+        {:ok, joined, _} = Groups.respond(state, @invitation, @invitee, true)
+        {joined, :ok}
+      end)
+
+    {scheduled, _} = SharedReminders.schedule(engine, joined, touched, revised_at + day)
+    due = revised_at + 3 * day
+    assert %{revision: 2, accepted_at_ms: ^revised_at, selection: %{"due_at_ms" => ^due}} =
+             scheduled.shared_recipients[{"open", @invitee}].reminder
+    assert {^scheduled, [], []} = SharedReminders.evaluate_due(scheduled, due - 1, true)
+    assert {evaluated, [{"open", advisory_id}], [{"open", @invitee}]} =
+             SharedReminders.evaluate_due(scheduled, due, true)
+    assert %{"accepted_at_ms" => ^revised_at, "due_at_ms" => ^due, "bounce_after_days" => 3} =
+             evaluated.shared_messages["open"].shared_advisories[advisory_id]
+  end
+
+  defp set_cutoff(at) do
+    name = "ATTENTION_SERVER_BOUNCE_NOT_BEFORE"
+    previous = System.get_env(name)
+    on_exit(fn -> if previous, do: System.put_env(name, previous), else: System.delete_env(name) end)
+    System.put_env(name, at |> DateTime.from_unix!(:millisecond) |> DateTime.to_iso8601())
   end
 
   test "restarting with groups disabled leaves a due group default unsettled", %{tmp_dir: dir} do

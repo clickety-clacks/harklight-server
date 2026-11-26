@@ -832,7 +832,7 @@ defmodule AttentionServer.ClientAPISharedSendTest do
     assert {:ok, nil} = Relay.claim_push(relay, now)
   end
 
-  test "a new cutoff suppresses persisted reminders after Server restart", ctx do
+  test "restart applies the cutoff to original acceptance even after a substantive revision", ctx do
     opts = [shared_messages: true] ++ ctx.server_opts
     server = start_supervised!({Server, opts})
     relay = Server.relay(server)
@@ -842,9 +842,18 @@ defmodule AttentionServer.ClientAPISharedSendTest do
              send_request(ctx, server, @key, body([first]), true)
     engine = :sys.get_state(relay).store.engine
     %{"created_at_ms" => accepted} = engine.shared_messages[room]
-    due = AttentionServer.SharedReminders.next_deadline(engine)
-    assert is_integer(due)
-    set_cutoff(accepted + 1)
+    revised_at = accepted + 60_000
+    :sys.replace_state(relay, &%{&1 | clock: fn -> revised_at end})
+    headers = [{"harklight-features", "shared_messages"}, {"if-match", "1"}]
+    patch = %{"message" => %{"title" => "Revised launch", "created_at" => 2}}
+    assert {200, %{"message" => %{"revision" => 2}}, _} =
+             write_request(ctx, server, "a1", "PUT", "/v2/agent/messages/" <> room, @another_key, patch, headers)
+
+    engine = :sys.get_state(relay).store.engine
+    due = revised_at + 3 * 86_400_000
+    assert %{revision: 2, accepted_at_ms: ^revised_at, selection: %{"due_at_ms" => ^due}} =
+             engine.shared_recipients[{room, first}].reminder
+    set_cutoff(accepted + 30_000)
     assert :ok = stop_supervised(Server)
 
     restarted = start_supervised!({Server, opts})

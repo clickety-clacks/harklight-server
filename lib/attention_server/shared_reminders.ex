@@ -52,15 +52,15 @@ defmodule AttentionServer.SharedReminders do
     record = engine.shared_messages[id]
     recipient = engine.shared_recipients[key]
 
-    authoritative_at = SharedMessages.substantive_accepted_at(record) || now
-    personal_start = max(now, authoritative_at)
+    original_at = record["created_at_ms"] || now
+    substantive_at = SharedMessages.substantive_accepted_at(record) || original_at
 
     updated =
       with true <- eligible?(engine, record, recipient, person),
-           true <- BouncePolicy.eligible_at?(authoritative_at),
+           true <- BouncePolicy.eligible_at?(original_at),
            %{"decision" => "pending"} = selection <-
-             BounceDecision.shared_selection(engine, person, record.message, personal_start) do
-        Map.put(recipient, :reminder, %{revision: record.revision, accepted_at_ms: authoritative_at, selection: selection})
+             BounceDecision.shared_selection(engine, person, record.message, substantive_at) do
+        Map.put(recipient, :reminder, %{revision: record.revision, accepted_at_ms: substantive_at, selection: selection})
       else
         _ -> Map.delete(recipient, :reminder)
       end
@@ -183,8 +183,8 @@ defmodule AttentionServer.SharedReminders do
             not Map.has_key?(reminder, :outcome),
             record = engine.shared_messages[id],
             groups? or not Map.has_key?(record, :group_id),
-            accepted = SharedMessages.substantive_accepted_at(record) || reminder.accepted_at_ms,
-            BouncePolicy.eligible_at?(accepted, cutoff),
+            original_at = record["created_at_ms"] || reminder.accepted_at_ms,
+            BouncePolicy.eligible_at?(original_at, cutoff),
             eligible?(engine, record, recipient, person),
             do: {id, person, record, recipient, reminder}
 
