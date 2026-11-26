@@ -24,7 +24,7 @@ defmodule AttentionServer.ClientAPI.Feed do
   import Plug.Conn
 
   alias AttentionServer.JSON
-  alias AttentionServer.ClientAPI.{Context, Errors, FeedStep, FeedStream, Projection}
+  alias AttentionServer.ClientAPI.{Context, Errors, FeedStep, FeedStream, Projection, SharedCapability}
 
   @max_limit 500
 
@@ -33,13 +33,19 @@ defmodule AttentionServer.ClientAPI.Feed do
 
   def changes(conn, %Context{} = ctx) do
     conn = fetch_query_params(conn)
+    sse? = event_stream?(conn)
+    mode = if sse?, do: :person_sse, else: :headers
 
-    with {:ok, cursor} <- cursor(conn),
+    with {:ok, capability} <- SharedCapability.parse(conn, mode),
+         {:ok, cursor} <- cursor(conn),
          {:ok, limit} <- limit(conn.query_params["limit"]) do
-      if event_stream?(conn),
+      ctx = %{ctx | principal: Map.put(ctx.principal, :shared_capability, capability)}
+
+      if sse?,
         do: FeedStream.serve(conn, ctx, cursor),
         else: batch(conn, ctx, cursor, limit)
     else
+      {:error, "invalid_field", field} -> Errors.send_error(conn, "invalid_field", field: field)
       {:error, field} -> Errors.send_error(conn, "invalid_field", field: field)
     end
   end
@@ -112,6 +118,7 @@ defmodule AttentionServer.ClientAPI.Feed do
   end
 
   @doc false
+  def send_read_error(conn, :unsupported), do: Errors.send_error(conn, "unsupported")
   def send_read_error(conn, :cursor_expired), do: Errors.send_error(conn, "cursor_expired")
   def send_read_error(conn, :account_paused), do: Errors.send_error(conn, "account_paused")
   def send_read_error(conn, :unauthorized), do: Errors.send_error(conn, "unauthorized")
@@ -134,8 +141,8 @@ defmodule AttentionServer.ClientAPI.FeedStep do
   cursor and never takes down the Relay.
   """
 
-  alias AttentionServer.{ChangeLog, Diagnostics}
-  alias AttentionServer.ClientAPI.{FeedRenderer, Projection, Reads}
+  alias AttentionServer.{ChangeLog, Diagnostics, SharedMessages}
+  alias AttentionServer.ClientAPI.{FeedRenderer, Projection, Reads, SharedContinuation}
 
   @doc false
   def scope(ctx), do: ctx.principal.person
@@ -185,11 +192,13 @@ defmodule AttentionServer.ClientAPI.FeedStep do
     # A principal that no longer authenticates reads nothing, even on a
     # connection opened before its access ended.
     with {:ok, _} <- authorized(state, principal),
+         :ok <- validate_capability(state, principal, cursor),
          :ok <- ChangeLog.ranks_available(state.store, person),
          {:ok, rows, more, position} <- ChangeLog.read(state.store, person, cursor, limit) do
       context = %{
         engine: state.store.engine,
         store: state.store,
+        shared?: shared?(principal),
         compact_entries?: mode == :catch_up,
         view: Map.get(Map.get(state, :priority_views, %{}), person)
       }
@@ -197,7 +206,7 @@ defmodule AttentionServer.ClientAPI.FeedStep do
       with {:ok, changes} <- Projection.capture(fn -> render_rows(context, principal, rows) end),
            do: {:ok, changes, more, position}
     else
-      {:error, reason} when reason in [:cursor_expired, :unauthorized, :disabled] ->
+      {:error, reason} when reason in [:cursor_expired, :unauthorized, :disabled, :unsupported] ->
         {:error, reason}
 
       # Any other failure of the store is a storage failure to the client.
@@ -210,6 +219,25 @@ defmodule AttentionServer.ClientAPI.FeedStep do
       Diagnostics.failure(:client_api, :stream_read, error, :failed)
       {:error, :storage_unavailable}
   end
+
+  defp validate_capability(state, %{shared_capability: %{shared?: true, continuation: token}} = principal, cursor) do
+    engine = state.store.engine
+
+    if state.shared_messages and MapSet.size(SharedMessages.organizations(engine, principal.person)) > 0 do
+      SharedContinuation.validate(token, engine.agent_cursor_key, principal, :person_changes, %{}, cursor, state.clock.())
+    else
+      {:error, :unsupported}
+    end
+  end
+
+  defp validate_capability(_state, %{shared_capability: %{continuation: token}}, _cursor)
+       when is_binary(token),
+       do: {:error, :cursor_expired}
+
+  defp validate_capability(_state, _principal, _cursor), do: :ok
+
+  defp shared?(%{shared_capability: %{shared?: true}}), do: true
+  defp shared?(_principal), do: false
 
   defp authorized(state, principal) do
     case Reads.client_principal(state.store.engine, principal) do

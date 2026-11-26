@@ -97,6 +97,95 @@ defmodule AttentionServer.SharedMessages do
     "shared_" <> Base.url_encode64(digest, padding: false)
   end
 
+  def for_person(engine, person) do
+    for {{id, ^person}, recipient} <- engine.shared_recipients,
+        record = Map.get(engine.shared_messages, id),
+        not is_nil(record),
+        do: {record, recipient}
+  end
+
+  def counts(engine, person) do
+    %{"unresolved" => individual} = AttentionServer.ClientAPI.Resources.counts(engine, person)
+    affiliations = organizations(engine, person)
+
+    shared =
+      Enum.count(for_person(engine, person), fn {message, _recipient} ->
+        not is_nil(message.answer_policy) and
+          MapSet.member?(affiliations, message.organization_id)
+      end)
+
+    %{"unresolved" => individual + shared}
+  end
+
+  def recipient_message(engine, person, item_id) do
+    Enum.find_value(engine.shared_recipients, {:error, :not_found}, fn
+      {{shared_id, ^person}, %{item_id: ^item_id} = recipient} ->
+        case Map.fetch(engine.shared_messages, shared_id) do
+          {:ok, record} -> {:ok, record, recipient}
+          :error -> {:error, :not_found}
+        end
+
+      _ ->
+        nil
+    end)
+  end
+
+  def person_item(engine, person, record, recipient, rev) do
+    open? =
+      record.chat_open and MapSet.member?(organizations(engine, person), record.organization_id)
+
+    can_answer =
+      open? and
+        case record.answer_policy do
+          nil -> false
+          {:named, people} -> person in people
+          _ -> true
+        end
+
+    members =
+      engine.shared_recipients
+      |> Enum.flat_map(fn
+        {{id, member}, state} when id == record.id ->
+          [
+            %{
+              "person" => %{"kind" => "person", "id" => member, "display_name" => "Harklight person"},
+              "seen_revision" => state.seen_revision,
+              "seen_at_ms" => Map.get(state, :seen_at_ms)
+            }
+          ]
+
+        _ ->
+          []
+      end)
+      |> Enum.sort_by(& &1["person"]["id"])
+
+    %{
+      "item_id" => recipient.item_id,
+      "rev" => rev,
+      "sender" => record.sender_id,
+      "request_revision" => record.revision,
+      "message" => record.message,
+      "files" => [],
+      "seen" => recipient.seen_revision == record.revision,
+      "chat" => %{"available" => true, "started" => false, "unread_replies" => 0, "read_position" => nil},
+      "rank" => %{"key" => recipient.item_id, "section" => "current"},
+      "terminal" => nil,
+      "shared" => %{
+        "shared_id" => record.id,
+        "answer_policy" => answer_policy(record.answer_policy),
+        "chat_writable" => open?,
+        "can_answer" => can_answer,
+        "members" => members,
+        "answers" => []
+      }
+    }
+    |> Map.merge(Map.take(record, ["created_at_ms"]))
+  end
+
+  def revision(record) do
+    %{"request_revision" => record.revision, "message" => record.message, "files" => []}
+  end
+
   def sender_message(record, rev) do
     %{
       "item_id" => record.id,

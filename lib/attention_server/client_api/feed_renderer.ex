@@ -8,7 +8,7 @@ defmodule AttentionServer.ClientAPI.FeedRenderer do
   read-position fact, or a principal that no longer authenticates, is skipped.
   """
 
-  alias AttentionServer.{AgentAccess, ChangeLog}
+  alias AttentionServer.{AgentAccess, ChangeLog, SharedMessages}
   alias AttentionServer.ClientAPI.{Projection, Reads, Resources}
 
   @doc """
@@ -43,6 +43,15 @@ defmodule AttentionServer.ClientAPI.FeedRenderer do
 
       _ ->
         Enum.map(rows, &{&1, :skip})
+    end
+  end
+
+  defp render_row(:item, {:shared_item, id}, %{shared?: true, engine: engine}, principal, rev) do
+    with %{id: ^id} = record <- Map.get(engine.shared_messages, id),
+         %{} = recipient <- Map.get(engine.shared_recipients, {id, principal.person}) do
+      {:ok, SharedMessages.person_item(engine, principal.person, record, recipient, rev)}
+    else
+      _ -> :skip
     end
   end
 
@@ -104,6 +113,10 @@ defmodule AttentionServer.ClientAPI.FeedRenderer do
       result -> result
     end
   end
+
+  defp render_row(:counts, resource, %{shared?: true, engine: engine}, principal, _rev)
+       when resource in [:counts, :shared_counts],
+       do: {:ok, SharedMessages.counts(engine, principal.person)}
 
   defp render_row(:counts, :counts, context, principal, _rev),
     do: {:ok, Resources.counts(context.engine, principal.person)}

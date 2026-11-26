@@ -36,6 +36,13 @@ defmodule AttentionServer.ClientAPISharedSendTest do
     assert :ok = Relay.replace_hosted_organization(relay, "org-a", [sender, first, second])
     assert :ok = Relay.replace_hosted_organization(relay, "org-b", [sender, first, second])
 
+    headers = [{"harklight-features", "shared_messages"}]
+    assert {200, %{"features" => %{"shared_messages" => true}}, _} =
+             get_request(ctx, server, "a2", "/v2/me", [])
+
+    assert {200, %{"items" => [], "rev" => baseline, "continuation" => continuation}, _} =
+             get_request(ctx, server, "a2", "/v2/inbox", headers)
+
     assert {409, %{"error" => "organization_required", "organization_ids" => ids}, _} =
              send_request(ctx, server, @key, body, true)
 
@@ -51,6 +58,40 @@ defmodule AttentionServer.ClientAPISharedSendTest do
                %{"person_id" => ^second, "status" => "reached"}
              ]
            } = committed
+
+    item_id = :sys.get_state(relay).store.engine.shared_recipients[{id, first}].item_id
+    path = "/v2/items/" <> item_id
+    headers = [{"harklight-features", "shared_messages"}]
+
+    assert {200, %{"item" => %{"item_id" => ^item_id, "shared" => %{"shared_id" => ^id}}}, _} =
+             get_request(ctx, server, "a2", path, headers)
+
+    assert {404, _, _} = get_request(ctx, server, "a2", path, [])
+    assert {404, _, _} = get_request(ctx, server, "b1", path, headers)
+
+    assert {200, %{"revision" => %{"request_revision" => 1}}, _} =
+             get_request(ctx, server, "a2", path <> "/revisions/1", headers)
+
+    assert {200, %{"entries" => [], "older" => false}, _} =
+             get_request(ctx, server, "a2", path <> "/entries", headers)
+
+    assert {200, %{"message" => %{"item_id" => ^id}}, _} =
+             get_request(ctx, server, "a1", "/v2/agent/messages/" <> id, headers)
+
+    feed_path = "/v2/changes?after=#{baseline}"
+    feed_headers = [{"harklight-continuation", continuation} | headers]
+
+    assert {200, %{"changes" => changes}, _} =
+             get_request(ctx, server, "a2", feed_path, feed_headers)
+
+    assert Enum.any?(changes, &match?(%{"kind" => "item", "data" => %{"item_id" => ^item_id}}, &1))
+    assert {410, %{"error" => "cursor_expired"}, _} =
+             get_request(ctx, server, "b1", feed_path, feed_headers)
+
+    assert {200, %{"items" => [%{"item_id" => ^item_id}]}, _} =
+             get_request(ctx, server, "a2", "/v2/inbox", headers)
+
+    assert {200, %{"items" => []}, _} = get_request(ctx, server, "a2", "/v2/inbox", [])
 
     assert :ok = Relay.delete_hosted_organization(relay, "org-a")
     assert :ok = Relay.delete_hosted_organization(relay, "org-b")
@@ -111,6 +152,15 @@ defmodule AttentionServer.ClientAPISharedSendTest do
       "message" => %{"title" => "Launch", "created_at" => 1},
       "recipients" => %{"kind" => "people", "people" => recipients}
     }
+  end
+
+  defp get_request(ctx, server, device, path, headers) do
+    conn = ClientAPIFeedClient.connect(Server.port(server), ctx.certs, device)
+    assert {:ok, conn, ref} = Mint.HTTP.request(conn, "GET", path, headers, nil)
+    {conn, response} = ClientAPIFeedClient.collect(conn, ref)
+    Mint.HTTP.close(conn)
+    assert {:ok, decoded} = JSON.decode_line(response.body <> "\n")
+    {response.status, decoded, response.headers}
   end
 
   defp send_request(ctx, server, key, body, shared?) do

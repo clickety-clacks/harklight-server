@@ -1,0 +1,90 @@
+defmodule AttentionServer.ClientAPI.SharedReads do
+  @moduledoc false
+
+  alias AttentionServer.{AgentChangeLog, ChangeLog, Engine, SharedMessages}
+  alias AttentionServer.ClientAPI.{Reads, SharedCapability}
+
+  def respond(conn, ctx, direction, action, fallback) do
+    case SharedCapability.parse(conn) do
+      {:ok, %{shared?: false}} ->
+        fallback.()
+
+      {:ok, %{shared?: true}} ->
+        id = ctx.params.item_id
+
+        result =
+          GenServer.call(
+            ctx.relay,
+            {:client_api, __MODULE__, {ctx.principal, direction, action, id}},
+            :infinity
+          )
+
+        case result do
+          :legacy -> fallback.()
+          _ -> Reads.respond(conn, result)
+        end
+
+      error ->
+        Reads.respond(conn, error)
+    end
+  end
+
+  @doc false
+  def handle_call({who, direction, action, id}, _from, state) do
+    result =
+      with {:ok, principal} <- Reads.client_principal(state.store.engine, who),
+           true <- state.shared_messages || {:error, :unsupported} do
+        if String.starts_with?(id, "shared_"),
+          do: read(state.store, principal, direction, action, id),
+          else: :legacy
+      end
+
+    {:reply, result, state}
+  end
+
+  defp read(store, %{person: person}, :person, action, id) do
+    with {:ok, message, recipient} <- SharedMessages.recipient_message(store.engine, person, id),
+         {:ok, head} <- ChangeLog.head(store, person),
+         {:ok, rev} <- ChangeLog.rev(store, person, ChangeLog.shared_item_resource(message.id)) do
+      resource(action, head, message, fn ->
+        {"item", SharedMessages.person_item(store.engine, person, message, recipient, rev)}
+      end)
+    end
+  end
+
+  defp read(store, %{kind: :device, person: person, key: origin}, :sender, action, id) do
+    scope = {person, origin}
+
+    with %{sender_person: ^person, sender_key: ^origin} = message <- store.engine.shared_messages[id],
+         true <- Engine.shared_sender_allowed?(store.engine, person, origin, message.sender_id),
+         {:ok, head} <- AgentChangeLog.head(store, scope),
+         {:ok, rev} <- AgentChangeLog.rev(store, scope, {:shared_message, id}) do
+      resource(action, head, message, fn -> {"message", SharedMessages.sender_message(message, rev)} end)
+    else
+      result when result in [nil, false] -> {:error, :not_found}
+      %{} -> {:error, :not_found}
+      error -> error
+    end
+  end
+
+  defp read(_store, _principal, _direction, _action, _id), do: {:error, :not_found}
+
+  defp resource(:summary, head, _record, render) do
+    {field, value} = render.()
+    {:ok, %{"rev" => head, field => value}}
+  end
+
+  defp resource({:revision, n}, head, record, _render) do
+    with {:ok, revision} <- Reads.revision_number(n),
+         true <- revision == record.revision || {:error, :not_found} do
+      {:ok, %{"rev" => head, "revision" => SharedMessages.revision(record)}}
+    end
+  end
+
+  defp resource({:entries, params}, head, _record, _render) do
+    with {:ok, _limit} <- Reads.limit(params),
+         true <- is_nil(params["before"]) || {:error, :not_found} do
+      {:ok, %{"rev" => head, "entries" => [], "older" => false}}
+    end
+  end
+end

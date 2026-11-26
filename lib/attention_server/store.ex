@@ -2060,9 +2060,11 @@ defmodule AttentionServer.Store do
     end)
   end
 
-  defp shared_send_log(log, engine, %{shared_send_receipt: {scope, _, _, id, _}}) do
+  defp shared_send_log(log, engine, %{shared_send_receipt: {scope, _, _, id, outcomes}}) do
     session = Map.get(Map.fetch!(engine.shared_messages, id), "session")
-    AgentChangeLog.append_shared_message(log, scope, id, session)
+    log
+    |> AgentChangeLog.append_shared_message(scope, id, session)
+    |> AttentionServer.ChangeLog.append_shared_send(id, outcomes)
   end
 
   defp shared_send_log(log, _engine, _audit), do: log
