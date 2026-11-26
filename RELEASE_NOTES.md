@@ -1,3 +1,34 @@
+# Harklight Server v0.2.26
+
+The Server now keeps its data as individual records (store FORMAT31) instead
+of one large snapshot, so it uses much less memory at rest and sends far
+faster on big stores. On test stores of 500,000 to 900,000 events, memory at
+rest fell by about 35 to 45 percent and a typical send went from about two and
+a half minutes to 16 to 32 seconds; small stores also got faster. Peak memory
+at startup fell on every store tested.
+
+## Upgrade and recovery
+
+**This release changes the store format.** An existing FORMAT30 store
+(v0.2.16 through v0.2.25) is converted once, with the Server stopped, before
+the first start. The packaged installer stops the service, takes its full
+backup, converts, and starts the new release only if conversion succeeds; on
+failure it restores the backup and starts the previous release. For a manual
+upgrade, take a complete private backup and run `harklight store
+convert-stopped` as described in SELF_HOST.md. The converter first checks that
+the host has room; if it reports `fit not established`, convert a copy on a
+larger machine. Conversion is all-or-nothing and can be retried. A FORMAT29 or
+older store must first be upgraded through v0.2.16 to v0.2.20.
+
+v0.2.25 and earlier cannot open a FORMAT31 store. To go back, stop the Server,
+restore the complete pre-upgrade backup and run the release that wrote it;
+this discards every write made since the backup.
+
+**Compatibility.** Harklight Server 0.2.26 speaks only the 0.2 protocol, with
+no API change, and bundles Harklight Web 0.2.6. As with v0.2.21, install it
+together with an iPhone app build that reads `receipt_expected`. Harklight
+Agent 0.2.6 and 0.2.7 work with it.
+
 # Harklight Server v0.2.25
 
 Bounces now work on every Server, with or without Jev ranking. In v0.2.24 a
