@@ -13,15 +13,15 @@ through Harklight.
 
 ## Install the server
 
-For the FORMAT30 v0.2.25 server package, use the release page below after
+For the FORMAT31 v0.2.26 server package, use the release page below after
 publication to download the Linux x86_64 archive, `SHA256SUMS` and
 `SELF_HOST.md`. Verify the checksum before extraction:
 
-[v0.2.25 release](https://github.com/clickety-clacks/harklight-server/releases/tag/v0.2.25)
+[v0.2.26 release](https://github.com/clickety-clacks/harklight-server/releases/tag/v0.2.26)
 
 ```sh
 sha256sum -c SHA256SUMS
-tar -xzf harklight-server-0.2.25-linux-x86_64.tar.gz
+tar -xzf harklight-server-0.2.26-linux-x86_64.tar.gz
 ```
 
 Follow [SELF_HOST.md](SELF_HOST.md) for a fresh installation, tailnet routing,
@@ -38,10 +38,12 @@ for the compatibility of published packages.
 
 State, owner/device identities, trust roots and sender grants live outside the
 versioned package. Run one server per database and keep private backups. The
-server built from this source opens and writes FORMAT30 snapshots only.
-FORMAT30 was introduced in v0.2.16. To move a store on FORMAT29 or earlier,
-upgrade through v0.2.16–v0.2.20 using a release that supports the source
-format, then verify it writes FORMAT30 before switching. Preserve the
+server built from this source writes FORMAT31, a store of individual records.
+An existing FORMAT30 store (written by v0.2.16 through v0.2.25) is converted
+once, with the Server stopped, before the first start; see
+[SELF_HOST.md](SELF_HOST.md#releases-that-write-format31). To move a store on
+FORMAT29 or earlier, first upgrade through v0.2.16–v0.2.20 so it writes
+FORMAT30, then convert it. Preserve the
 state path, private files and trust root, and keep the existing owner identity.
 
 Every registered, non-revoked agent can read the account's messages regardless
