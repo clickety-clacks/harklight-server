@@ -3,8 +3,11 @@ defmodule AttentionServer.HostedHTTP do
   Loopback-only plain HTTP interface for the hosted account component.
 
   It runs only in `saas` deployment mode on a port the operator pins, and is
-  meant to be reached by the hosted component on the same machine.
-  S1 session grants use the same dedicated loopback interface.
+  meant to be reached by the hosted component on the same machine; it carries
+  no credential of its own. The hosted component can create accounts, issue
+  sign-in links, configure account state, and deliver an FYI to a local
+  person. The test reset is scoped to the designated test account.
+  S1 session grants use this same interface.
   """
 
   use Supervisor

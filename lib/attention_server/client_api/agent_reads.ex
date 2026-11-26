@@ -137,7 +137,7 @@ defmodule AttentionServer.ClientAPI.AgentReads do
       valid =
         case name do
           "session" -> Message.uuid_v4?(value)
-          "sender" -> Message.sender_id?(value)
+          "sender" -> Message.sender_id?(value) and value != Message.hosted_notice_sender()
           "legacy_message_id" -> Message.nonempty?(value)
         end
 

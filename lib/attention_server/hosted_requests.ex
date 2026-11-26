@@ -21,23 +21,62 @@ defmodule AttentionServer.HostedRequests do
     conn = put_resp_header(conn, "cache-control", "no-store")
 
     case {conn.method, conn.request_path} do
-      {"POST", "/accounts"} -> with_request(conn, &create_account(&1, &2, opts))
-      {"POST", "/algorithm"} -> with_request(conn, &set_algorithm(&1, &2, opts))
+      {"POST", "/accounts"} ->
+        with_request(conn, &create_account(&1, &2, opts))
+
+      {"POST", "/algorithm"} ->
+        with_request(conn, &set_algorithm(&1, &2, opts))
+
       {"POST", "/session-grants"} ->
         with_request(conn, &create_session_grant(&1, &2, opts))
 
       {"POST", "/session-grants/redeem"} ->
         with_request(conn, &redeem_session_grant(&1, &2, opts))
-      {"POST", "/sign-in-links"} -> with_request(conn, &create_sign_in_link(&1, &2, opts))
-      {"POST", "/delivery-state"} -> with_request(conn, &set_delivery_state(&1, &2, opts))
-      {"POST", "/test-reset"} -> with_request(conn, &test_reset(&1, &2, opts))
-      {"POST", _} -> send_resp(conn, 404, "")
-      _ -> send_resp(conn, 405, "")
+
+      {"POST", "/sign-in-links"} ->
+        with_request(conn, &create_sign_in_link(&1, &2, opts))
+
+      {"POST", "/delivery-state"} ->
+        with_request(conn, &set_delivery_state(&1, &2, opts))
+
+      {"POST", "/test-reset"} ->
+        with_request(conn, &test_reset(&1, &2, opts))
+
+      {"POST", _} ->
+        case conn.path_info do
+          ["persons", person, "notices"] ->
+            with_request(conn, &create_notice(&1, &2, opts.relay, person))
+
+          _ ->
+            send_resp(conn, 404, "")
+        end
+
+      _ ->
+        send_resp(conn, 405, "")
     end
   rescue
     error ->
       Diagnostics.failure(:hosted_http, :request_dispatch, error, :outcome_unknown)
       reraise error, __STACKTRACE__
+  end
+
+  defp create_notice(conn, request, relay, person) do
+    case Relay.hosted_notice(relay, person, request) do
+      {:ok, %{item_id: item_id, created: created}} ->
+        json(conn, 200, %{"item_id" => item_id, "created" => created})
+
+      {:error, :invalid_notice} ->
+        json(conn, 400, %{"error" => "invalid_notice"})
+
+      {:error, :unknown_person} ->
+        json(conn, 404, %{"error" => "unknown_person"})
+
+      {:error, :key_conflict} ->
+        json(conn, 409, %{"error" => "key_conflict"})
+
+      {:error, :storage_unavailable} ->
+        json(conn, 503, %{"error" => "storage_unavailable"})
+    end
   end
 
   defp create_account(conn, request, opts) do

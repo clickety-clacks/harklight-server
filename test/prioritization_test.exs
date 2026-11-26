@@ -510,6 +510,38 @@ defmodule AttentionServer.PrioritizationTest do
     refute File.exists?(record_path)
   end
 
+  test "a hosted notice refreshes the priority view and schedules a Jev pass", %{
+    path: path,
+    dir: dir
+  } do
+    use_synthetic_jev_key(dir)
+    test_process = self()
+
+    relay =
+      start_relay(path,
+        deployment_mode: :saas,
+        jev_endpoint: "https://provider.example.test",
+        jev_model: "test-model",
+        priority_evaluator: fn request ->
+          send(test_process, {:notice_jev_request, request.candidates})
+          {:ok, Map.new(request.candidates, &{&1, 0.75})}
+        end
+      )
+
+    assert {:ok, person} = Relay.hosted_account_create(relay, "notice-account")
+    sender = Message.hosted_notice_sender()
+    notice = %{"title" => "Trial ending", "body" => "Your trial expires soon.", "key" => "trial"}
+
+    assert {:ok, %{item_id: id, created: true}} = Relay.hosted_notice(relay, person, notice)
+    assert [%{"sender_id" => ^sender}] = view_for(relay, person)["entries"]
+    assert_receive {:notice_jev_request, [{^sender, message_id}]}, 2_000
+    state = await_state(relay, &(&1.priority_views[person].basis == "selected"))
+    assert [%{"message_id" => ^message_id, "score" => 0.75}] = state.priority_views[person].entries
+
+    assert {:ok, %{item_id: ^id, created: false}} = Relay.hosted_notice(relay, person, notice)
+    assert :sys.get_state(relay).priority_generations == state.priority_generations
+  end
+
   test "Jev selected views remain score-only after fallback display priorities", %{
     path: path,
     dir: dir

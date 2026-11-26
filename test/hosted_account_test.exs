@@ -618,6 +618,171 @@ defmodule AttentionServer.HostedAccountTest do
       assert {404, _} = post(port, "/other", %{})
     end
 
+    test "notices use normal FYI delivery and persist a receipt scoped to the person", %{
+      port: port,
+      server: server
+    } do
+      assert {200, %{"person_id" => alice}} =
+               post(port, "/accounts", %{"account_ref" => "notice-alice"})
+
+      assert {200, %{"person_id" => bob}} =
+               post(port, "/accounts", %{"account_ref" => "notice-bob"})
+
+      path = "/persons/#{alice}/notices"
+
+      notice = %{
+        "title" => "Trial ending",
+        "body" => "Your trial expires soon.",
+        "key" => "trial"
+      }
+
+      url = "https://app.example.test/account"
+      linked_notice = Map.put(notice, "link", url)
+      relay = Server.relay(server)
+
+      assert :ok = Relay.setup_device(relay, alice, "alice-reader")
+      assert :ok = Relay.setup_device(relay, bob, "bob-reader")
+      assert :ok = Relay.enable_push(relay)
+
+      assert %{"type" => "ok"} =
+               relay_request(relay, "alice-reader", %{
+                 "type" => "push_register",
+                 "op_id" => relay_op(301),
+                 "revision" => 1,
+                 "profile_id" => "harklight-sandbox",
+                 "address_kind" => "apns_token",
+                 "address" => String.duplicate("ab", 32)
+               })
+
+      results =
+        1..2
+        |> Task.async_stream(fn _ -> post(port, path, linked_notice) end)
+        |> Enum.map(fn {:ok, result} -> result end)
+
+      assert [{200, %{"item_id" => id, "created" => false}}, {200, %{"created" => true}}] =
+               Enum.sort_by(results, fn {_, result} -> result["created"] end)
+
+      assert {200, %{"item_id" => id, "created" => true}} in results
+
+      assert {:ok, %{"item" => %{"item_id" => ^id, "message" => message}}} =
+               ClientAPI.Reads.item(relay, "alice-reader", id)
+
+      expected_body = "Your trial expires soon.\n\n" <> url
+
+      assert %{
+               "sender_id" => "app:harklight/notices",
+               "display_name" => "Harklight",
+               "message_type" => "fyi",
+               "title" => "Trial ending",
+               "body" => ^expected_body
+             } = message
+
+      assert {:error, :not_found} = ClientAPI.Reads.item(relay, "bob-reader", id)
+
+      engine = relay_engine(relay)
+      assert engine.push_bindings[{alice, "alice-reader"}].pending_high == 1
+      assert engine.persons[alice] == 1
+
+      assert {409, _} = post(port, path, notice)
+      assert {409, _} = post(port, path, %{linked_notice | "body" => "Different body"})
+      assert {404, _} = post(port, "/persons/unknown/notices", notice)
+
+      for invalid <- [
+            Map.delete(notice, "key"),
+            %{notice | "title" => " "},
+            %{notice | "body" => nil},
+            Map.put(notice, "link", "http://app.example.test"),
+            Map.put(notice, "link", "https:///account"),
+            Map.put(notice, "person_id", bob),
+            Map.put(notice, "sender_id", "app:other")
+          ] do
+        assert {400, _} = post(port, path, invalid)
+      end
+
+      assert :ok = Supervisor.terminate_child(server, :relay)
+      assert {:ok, restarted} = Supervisor.restart_child(server, :relay)
+      assert {200, %{"item_id" => ^id, "created" => false}} = post(port, path, linked_notice)
+      assert relay_engine(restarted).persons[alice] == 1
+
+      assert {:ok, 200, %{"item" => %{"seen" => true}}, false} =
+               ClientAPI.Writes.seen(restarted, "alice-reader", id, relay_op(303))
+
+      assert {200, %{"item_id" => ^id, "created" => false}} = post(port, path, linked_notice)
+      assert {200, %{"created" => true}} = post(port, "/persons/#{bob}/notices", notice)
+
+      assert {:error, :forbidden} =
+               Relay.setup_sender(restarted, "alice-reader", "app:harklight/notices")
+
+      assert :ok = Relay.setup_sender(restarted, "alice-reader", "app:harklight/")
+
+      assert %{"type" => "error", "reason" => "sender_not_authorized"} =
+               relay_request(restarted, "alice-reader", %{
+                 "type" => "forward",
+                 "op_id" => relay_op(302),
+                 "message" => %{message | "message_id" => "forged"}
+               })
+    end
+
+    test "agents cannot read, search for, or receive grants for the system sender", %{
+      port: port,
+      server: server
+    } do
+      relay = Server.relay(server)
+      sender = AttentionServer.Message.hosted_notice_sender()
+      agent_key = String.duplicate("a", 64)
+
+      assert {200, %{"person_id" => person}} =
+               post(port, "/accounts", %{"account_ref" => "notice-agent"})
+
+      assert {200, %{"item_id" => item_id}} =
+               post(port, "/persons/#{person}/notices", %{
+                 "title" => "Trial ending",
+                 "body" => "Your trial expires soon.",
+                 "key" => "trial"
+               })
+
+      owner = Engine.hosted_owner_key(relay_engine(relay), person)
+      assert :ok = Relay.owner_register_agent(relay, person, owner, relay_op(311), agent_key)
+
+      assert {:error, :stale_or_invalid_grant} =
+               Relay.owner_replace_agent_grants(relay, person, owner, agent_key, 1, [sender], [])
+
+      assert {:error, :stale_or_invalid_grant} =
+               Relay.owner_replace_agent_grants(relay, person, owner, agent_key, 1, [], [sender])
+
+      assert :ok =
+               Relay.owner_replace_agent_grants(
+                 relay,
+                 person,
+                 owner,
+                 agent_key,
+                 1,
+                 ["app:harklight/"],
+                 ["app:harklight/"]
+               )
+
+      assert {:error, :forbidden} =
+               Engine.client_agent_answer_scope(relay_engine(relay), agent_key, sender)
+
+      agent = %{kind: :agent, person: person, key: agent_key}
+      assert {:ok, %{"items" => []}} = ClientAPI.Reads.inbox(relay, agent)
+      assert {:error, :not_found} = ClientAPI.Reads.item(relay, agent, item_id)
+      assert {:error, :not_found} = ClientAPI.Reads.entries(relay, agent, item_id)
+      assert {:error, :not_found} = ClientAPI.Reads.revision(relay, agent, item_id, "1")
+
+      ctx = %ClientAPI.Context{principal: agent, relay: relay, request_id: "notice-search"}
+      search = ClientAPI.Reads.get_search(Plug.Test.conn(:get, "/v2/search"), ctx)
+      assert search.status == 200
+      assert {:ok, %{"items" => []}} = JSON.decode_line(search.resp_body <> "\n")
+
+      conn = Plug.Test.conn(:get, "/v2/search?" <> URI.encode_query(%{"sender" => sender}))
+      assert ClientAPI.Reads.get_search(conn, ctx).status == 400
+
+      assert {:ok, changes, false, _} = ClientAPI.FeedStep.read(relay, agent, 0, 100)
+      refute inspect(changes) =~ sender
+      refute inspect(changes) =~ "Trial ending"
+    end
+
     test "Hosted algorithm requests cannot override Server settings", %{server: server} do
       relay = Server.relay(server)
       assert {:ok, person} = Relay.hosted_account_create(relay, "acct-priority")

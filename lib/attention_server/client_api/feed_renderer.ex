@@ -8,7 +8,7 @@ defmodule AttentionServer.ClientAPI.FeedRenderer do
   read-position fact, or a principal that no longer authenticates, is skipped.
   """
 
-  alias AttentionServer.ChangeLog
+  alias AttentionServer.{AgentAccess, ChangeLog}
   alias AttentionServer.ClientAPI.{Projection, Reads, Resources}
 
   @doc """
@@ -49,7 +49,8 @@ defmodule AttentionServer.ClientAPI.FeedRenderer do
   defp render_row(:item, {:item, {sender, message_id}}, context, principal, rev) do
     key = {principal.person, sender, message_id}
 
-    with true <- AttentionServer.BounceDecision.person_visible?(context.engine.messages[key]),
+    with true <- AgentAccess.visible_sender?(principal, sender),
+         true <- AttentionServer.BounceDecision.person_visible?(context.engine.messages[key]),
          {:ok, item_id} <- Resources.item_id(context.engine, key),
          {:ok, rank} <- Reads.item_rank(context, principal.person, item_id) do
       Projection.run({:item, item_id}, fn ->
@@ -68,14 +69,18 @@ defmodule AttentionServer.ClientAPI.FeedRenderer do
   end
 
   defp render_row(:item_removed, {:item, {sender, message_id}}, context, principal, _rev) do
-    case Resources.removed_item_id(context.engine, {principal.person, sender, message_id}) do
-      {:ok, item_id} -> {:ok, %{"item_id" => item_id}}
+    with true <- AgentAccess.visible_sender?(principal, sender),
+         {:ok, item_id} <-
+           Resources.removed_item_id(context.engine, {principal.person, sender, message_id}) do
+      {:ok, %{"item_id" => item_id}}
+    else
       _ -> :skip
     end
   end
 
   defp render_row(:entry, {:entry, seq}, context, principal, rev) do
     with %{} = entry <- Map.get(context.entries_by_fact, seq),
+         true <- visible_entry?(context.engine, principal, entry),
          :ok <- keep_entry_row(context, principal.person, entry, seq, rev) do
       at_ms =
         case ChangeLog.created_at(
@@ -95,7 +100,7 @@ defmodule AttentionServer.ClientAPI.FeedRenderer do
          |> then(&Resources.render(:entry, &1, principal))}
       end)
     else
-      nil -> :skip
+      absent when absent in [nil, false] -> :skip
       result -> result
     end
   end
@@ -112,6 +117,15 @@ defmodule AttentionServer.ClientAPI.FeedRenderer do
   end
 
   defp render_row(_kind, _resource, _context, _principal, _rev), do: :skip
+
+  defp visible_entry?(engine, %{kind: :agent} = principal, entry) do
+    case Resources.item_key(engine, principal.person, entry["item_id"]) do
+      {:ok, {_, sender, _}} -> AgentAccess.visible_sender?(principal, sender)
+      _ -> false
+    end
+  end
+
+  defp visible_entry?(_engine, _principal, _entry), do: true
 
   # The log compacts by fact sequence. Acknowledgments and the original turn
   # can still resolve to the same Entry. Check every source's current rev,

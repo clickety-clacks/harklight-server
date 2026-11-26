@@ -1,6 +1,6 @@
 # Harklight Server self-hosted installation
 
-Version: **0.2.28**. Package target: **Linux x86_64, glibc 2.39 or newer**, with OpenSSL 3 shared libraries and libstdc++6 (built on Ubuntu 24.04). The package bundles
+Version: **0.2.30**. Package target: **Linux x86_64, glibc 2.39 or newer**, with OpenSSL 3 shared libraries and libstdc++6 (built on Ubuntu 24.04). The package bundles
 Erlang/OTP and Elixir bytecode; users need no Mix, Hex, source checkout or
 Erlang installation. It needs Bash, OpenSSL CLI, tar and the platform libraries
 listed in BUILD_INFO. This is a single-process self-hosted server cut.
@@ -25,9 +25,9 @@ the request; a valid current-revision answer commits a payload-free
 
 ## Download and verify
 
-After publication, download the v0.2.28 release from
-clickety-clacks/harklight-server, tag v0.2.28. Get
-harklight-server-0.2.28-linux-x86_64.tar.gz, SHA256SUMS and SELF_HOST.md from
+After publication, download the v0.2.30 release from
+clickety-clacks/harklight-server, tag v0.2.30. Get
+harklight-server-0.2.30-linux-x86_64.tar.gz, SHA256SUMS and SELF_HOST.md from
 that release. Run sha256sum -c SHA256SUMS and extract into an operator-owned
 versioned directory. BUILD_INFO identifies the source commit, build host,
 toolchain, source status and native dependencies.
@@ -40,7 +40,7 @@ runtime/dependency notices remain in their shipped distribution files.
 Choose the DNS hostname clients will validate. For a same-machine preview,
 localhost works. Install into a directory you own and run:
 
-    PACKAGE="$PWD/harklight-server-0.2.28-linux-x86_64"
+    PACKAGE="$PWD/harklight-server-0.2.30-linux-x86_64"
     STATE="$HOME/.local/share/harklight-server"
     "$PACKAGE/bin/harklight-bootstrap" "$STATE" localhost
     cat "$STATE/person-id"
@@ -148,6 +148,33 @@ server starts uncapped and logs one startup notice; with it, uploads over the
 configured value are refused individually. The package elects no production
 SaaS cap. These settings need deliberate configuration; installation leaves the
 protected environment unchanged.
+
+### Hosted loopback interface
+
+In `saas` mode, `ATTENTION_SERVER_HOSTED_PORT` enables the private HTTP
+listener on `127.0.0.1` used by the Hosted sign-in component. The listener
+trusts local access, as for `POST /accounts` and `POST /sign-in-links`.
+
+`POST /persons/{person_id}/notices` delivers an FYI from **Harklight**
+(`app:harklight/notices`) to an existing person on this Server. It accepts a
+JSON object with a nonblank `title`, a string `body`, a nonblank `key`, and an
+optional absolute HTTPS `link`. When supplied, the URL appears on its own
+line after the message body. The request uses the listener's 4 KiB body limit.
+
+A successful response is `200 {"item_id":"i1","created":true}`. Repeating the
+same key and content for the same person returns the original item ID with
+`"created":false`. Keys are independent across people. Changed content for an
+existing key returns `409`. Invalid input returns `400`, oversized requests
+return `413`, and an unknown person returns `404`. Delivery uses the normal
+attention-based delivery and push behavior for an FYI. An unopened notice can
+full-bounce without producing a sender advisory. The system sender is reserved
+and its notices are visible to the recipient's clients. Agents cannot read
+these notices or receive grants for the system sender.
+
+**FORMAT31 rollback.** Once this Server writes a hosted notice, earlier
+FORMAT31 builds cannot open the store. Rolling back to one of those builds
+requires restoring the complete pre-upgrade backup and loses all writes made
+after that backup.
 
 ### Hosted attention list prioritization
 
