@@ -143,7 +143,10 @@ defmodule AttentionServer.Store.KeyedMigration do
 
   defp check_identity(_, _), do: {:error, :unsupported_record_codec}
 
-  defp read_records(db), do: RecordTable.scan(db, &RecordCodec.decode/1)
+  defp read_records(db) do
+    Code.ensure_loaded!(AttentionServer.SharedPush)
+    RecordTable.scan(db, &RecordCodec.decode/1)
+  end
 
   defp verify_records(db, expected, count) do
     result =

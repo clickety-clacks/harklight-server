@@ -506,6 +506,52 @@ defmodule AttentionServer.ClientAPISharedSendTest do
     refute bindings[{first, sibling}][:shared_messages]
   end
 
+  test "shared pushes survive restart and drop claimed alerts on departure", ctx do
+    opts = [shared_messages: true] ++ ctx.server_opts
+    server = start_supervised!({Server, opts})
+    relay = Server.relay(server)
+    {sender, first, second} = people(ctx, relay)
+    assert :ok = Relay.replace_hosted_organization(relay, "org", [sender, first, second])
+    assert :ok = Relay.enable_push(relay)
+    headers = [{"harklight-features", "shared_messages"}]
+    path = "/v2/devices/me/push"
+    registration = %{"token" => String.duplicate("ab", 32), "environment" => "production",
+                     "revision" => 1, "features" => ["shared_messages"]}
+    assert {200, _, _} =
+             write_request(ctx, server, "a2", "PUT", path, op_key(52), registration, [])
+    legacy = registration |> Map.delete("features") |> Map.put("token", String.duplicate("cd", 32))
+    assert {200, _, _} =
+             write_request(ctx, server, "b1", "PUT", path, op_key(53), legacy, [])
+
+    assert {200, %{"message" => %{"item_id" => room}}, _} =
+             send_request(ctx, server, @key, body([first, second]), true)
+    assert :ok = stop_supervised(Server)
+    server = start_supervised!({Server, opts})
+    relay = Server.relay(server)
+    {first_path, second_path} = recipient_paths(relay, room, first, second)
+    first_item = List.last(String.split(first_path, "/"))
+
+    now = System.system_time(:millisecond) + 1_000
+    assert {:ok, %{stream: :shared, badge: 1, person: ^first, locator: %{"item_id" => ^first_item}} = request} =
+             Relay.claim_push(relay, now)
+    assert {:ok, %{locator: %{"item_id" => ^first_item}, badge: 1}} = Relay.refresh_push_claim(relay, request)
+    assert :ok = Relay.finish_push(relay, request, %{state: "provider_accepted"}, now)
+    assert {:ok, nil} = Relay.claim_push(relay, now)
+
+    assert {200, _, _} =
+             write_request(ctx, server, "b1", "POST", second_path <> "/replies", op_key(54),
+               %{"text" => "Shared reply"}, headers)
+    assert {:ok, %{stream: :shared, badge: 1, locator: %{"target" => "chat", "item_id" => ^first_item}} = chat} =
+             Relay.claim_push(relay, now)
+    assert {:ok, %{locator: %{"target" => "chat", "item_id" => ^first_item}}} = Relay.refresh_push_claim(relay, chat)
+    assert %{"attention" => %{"locator" => %{"target" => "chat"}}} = AttentionServer.APNS.request_payload(chat)
+
+    assert :ok = Relay.replace_hosted_organization(relay, "org", [sender, second])
+    assert :skip = Relay.refresh_push_claim(relay, chat)
+    assert :ok = Relay.finish_push(relay, chat, %{state: "suppressed"}, now)
+    assert {:ok, nil} = Relay.claim_push(relay, now)
+  end
+
   test "Seen is per person and revision, with one attributed Agent event", ctx do
     server = start_supervised!({Server, [shared_messages: true] ++ ctx.server_opts})
     relay = Server.relay(server)

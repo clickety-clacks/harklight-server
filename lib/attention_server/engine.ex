@@ -26,7 +26,8 @@ defmodule AttentionServer.Engine do
     Message,
     RouteBIndex,
     SenderNames,
-    SharedMessages
+    SharedMessages,
+    SharedPush
   }
 
   alias AttentionServer.ClientAPI.Resources
@@ -128,7 +129,7 @@ defmodule AttentionServer.Engine do
       next.push_bindings
       |> Enum.filter(fn {{person, _device}, binding} ->
         not delivery_stopped?(next, person) and binding.active and
-          (binding.pending_high > 0 or binding.pending_conversation_high > 0) and
+          push_pending?(binding) and
           binding.state in ["queued", "waiting_retry"] and
           is_integer(binding.next_at) and binding.next_at <= now_ms
       end)
@@ -143,7 +144,12 @@ defmodule AttentionServer.Engine do
 
       {{person, device} = key, binding} ->
         claim_id = uuid_v4()
-        stream = if binding.pending_high > 0, do: :request, else: :conversation
+        stream =
+          cond do
+            binding.pending_high > 0 -> :request
+            binding.pending_conversation_high > 0 -> :conversation
+            true -> :shared
+          end
 
         gathered =
           if stream == :request,
@@ -176,6 +182,8 @@ defmodule AttentionServer.Engine do
 
             {_, _, :conversation} ->
               get_in(next.conversation_events, [{person, conversation_high}, :key])
+
+            {_, _, :shared} -> nil
           end
 
         claim = %{
@@ -190,10 +198,11 @@ defmodule AttentionServer.Engine do
           conversation_high: conversation_high,
           stream: stream,
           remainder_due:
-            if(stream == :request,
-              do: binding.pending_conversation_high > 0,
-              else: binding.pending_high > 0
-            ),
+            case stream do
+              :request -> binding.pending_conversation_high > 0 or SharedPush.pending?(binding)
+              :conversation -> SharedPush.pending?(binding)
+              :shared -> false
+            end,
           presentation: presentation,
           locator: push_locator(next, item_key, person, device, binding.binding_id, chat),
           badge: binding_badge(next, person, binding),
@@ -251,6 +260,16 @@ defmodule AttentionServer.Engine do
               claim
           end
 
+        claim =
+          if Map.get(binding, :shared_messages, false),
+            do: Map.put(claim, :revalidate_shared?, true),
+            else: claim
+
+        claim =
+          if stream == :shared,
+            do: shared_push_claim(next, binding, Map.put(claim, :shared_work, SharedPush.pending(binding))),
+            else: claim
+
         claimed = %{
           binding
           | state: "sending",
@@ -263,7 +282,63 @@ defmodule AttentionServer.Engine do
             next_at: nil
         }
 
+        claimed = if stream == :shared, do: Map.put(claimed, :claim_shared, true), else: claimed
         {:ok, put_row(next, :push_bindings, key, claimed), claim}
+    end
+  end
+
+  def push_pending?(binding) do
+    binding.pending_high > 0 or binding.pending_conversation_high > 0 or SharedPush.pending?(binding)
+  end
+
+  def refresh_push_claim(engine, claim, shared?, groups?) do
+    case engine.push_bindings[{claim.person, claim.device}] do
+      %{active: true, revision: revision, binding_id: id, claim_id: claim_id} = binding
+      when revision == claim.revision and id == claim.binding_id and claim_id == claim.claim_id ->
+        binding = if shared?, do: binding, else: Map.delete(binding, :shared_messages)
+        binding = if groups?, do: binding, else: Map.delete(binding, :groups)
+
+        cond do
+          delivery_stopped?(engine, claim.person) -> :skip
+          claim.stream == :shared and not Map.get(binding, :shared_messages, false) -> :skip
+          claim.stream == :shared ->
+            work =
+              Map.filter(claim.shared_work, fn {room, value} ->
+                SharedPush.pending(binding)[room] == value and
+                  SharedPush.deliverable?(engine, claim.person, binding, room)
+              end)
+            if work == %{}, do: :skip, else: {:ok, shared_push_claim(engine, binding, %{claim | shared_work: work})}
+
+          true ->
+            {:ok, %{claim | badge: binding_badge(engine, claim.person, binding)}}
+        end
+
+      _ ->
+        :skip
+    end
+  end
+
+  defp shared_push_claim(engine, binding, claim) do
+    base =
+      claim
+      |> Map.drop([:alert, :expanded, :preserve_alert_title])
+      |> Map.merge(%{presentation: :background, locator: nil, badge: binding_badge(engine, claim.person, binding)})
+
+    case SharedPush.target(engine, claim.person, binding, claim.shared_work) do
+      nil ->
+        base
+
+      target ->
+        locator = %{
+          "v" => 2, "binding_id" => binding.binding_id, "person_id" => claim.person,
+          "device_id" => claim.device, "item_id" => target.item_id
+        }
+        locator = if target.chat?, do: Map.put(locator, "target", "chat"), else: locator
+        text = if is_binary(target.text), do: target.text, else: LargeData.preview(target.text, 161)
+        {preview, truncated?} = push_preview(text || "")
+        alert = %{"title" => target.title, "body" => preview, "body_truncated" => truncated?}
+        Map.merge(base, %{presentation: :alert, locator: locator, alert: alert,
+                          expanded: :single, preserve_alert_title: true})
     end
   end
 
@@ -382,7 +457,8 @@ defmodule AttentionServer.Engine do
                old.profile_id == frame["profile_id"] do
             # Same authorized endpoint: a registration refresh is not a read
             # or provider acceptance, and must not discard either stream.
-            pending? = old.pending_high > 0 or old.pending_conversation_high > 0
+            pending? = old.pending_high > 0 or old.pending_conversation_high > 0 or
+              (frame[:shared_messages] == true and SharedPush.pending?(old))
 
             old
             |> clear_push_claim()
@@ -399,7 +475,7 @@ defmodule AttentionServer.Engine do
         binding =
           if frame[:shared_messages] == true,
             do: Map.put(binding, :shared_messages, true),
-            else: Map.delete(binding, :shared_messages)
+            else: Map.drop(binding, [:shared_messages, :pending_shared])
 
         reply = %{
           "revision" => revision,
@@ -562,8 +638,15 @@ defmodule AttentionServer.Engine do
   end
 
   defp clear_push_claim(binding) do
-    %{binding | claim_id: nil, claim_high: nil, claim_conversation_high: nil, claim_at: nil}
+    binding = %{binding | claim_id: nil, claim_high: nil, claim_conversation_high: nil, claim_at: nil}
+    Map.delete(binding, :claim_shared)
   end
+
+  defp finish_push_binding(binding, %{stream: :shared} = claim, %{state: "suppressed"}, now_ms),
+    do: complete_push(binding, claim, now_ms)
+
+  defp finish_push_binding(binding, _claim, %{state: "suppressed"}, now_ms),
+    do: clear_push_claim(%{binding | state: "waiting_retry", next_at: now_ms})
 
   defp finish_push_binding(binding, claim, outcome, now_ms) do
     state = Map.get(outcome, :state)
@@ -582,55 +665,13 @@ defmodule AttentionServer.Engine do
 
     case state do
       "provider_accepted" ->
-        request? = claim.stream == :request
-
-        base = %{
-          base
-          | accepted_high:
-              if(request?,
-                do: max(binding.accepted_high, claim.high),
-                else: binding.accepted_high
-              ),
-            accepted_conversation_high:
-              if(request?,
-                do: binding.accepted_conversation_high,
-                else: max(binding.accepted_conversation_high, claim.conversation_high)
-              ),
-            pending_high:
-              if(request? and binding.pending_high <= claim.high,
-                do: 0,
-                else: binding.pending_high
-              ),
-            pending_conversation_high:
-              if(not request? and binding.pending_conversation_high <= claim.conversation_high,
-                do: 0,
-                else: binding.pending_conversation_high
-              )
-        }
-
-        if base.pending_high == 0 and base.pending_conversation_high == 0 do
-          clear_push_claim(%{
-            base
-            | state: "ready",
-              deadline_at: nil,
-              next_at: nil
-          })
-        else
-          clear_push_claim(%{
-            base
-            | state: "queued",
-              next_at:
-                if(claim.remainder_due,
-                  do: now_ms,
-                  else: binding.next_at || now_ms + @push_window_ms
-                )
-          })
-        end
+        complete_push(base, claim, now_ms)
 
       "endpoint_invalid" ->
         invalidated_at = Map.get(outcome, :invalidated_at_ms)
 
         if is_integer(invalidated_at) and invalidated_at >= binding.registered_at do
+          base = Map.delete(base, :pending_shared)
           clear_push_claim(%{
             base
             | active: false,
@@ -646,6 +687,7 @@ defmodule AttentionServer.Engine do
         end
 
       "expired" ->
+        base = Map.delete(base, :pending_shared)
         clear_push_claim(%{
           base
           | state: "expired",
@@ -660,6 +702,28 @@ defmodule AttentionServer.Engine do
 
       _ ->
         blocked_push(base, now_ms)
+    end
+  end
+
+  defp complete_push(binding, claim, now_ms) do
+    binding =
+      case claim.stream do
+        :shared -> SharedPush.accepted(binding, claim)
+        :request ->
+          %{binding | accepted_high: max(binding.accepted_high, claim.high),
+                      pending_high: if(binding.pending_high <= claim.high, do: 0, else: binding.pending_high)}
+        :conversation ->
+          %{binding | accepted_conversation_high: max(binding.accepted_conversation_high, claim.conversation_high),
+                      pending_conversation_high:
+                        if(binding.pending_conversation_high <= claim.conversation_high,
+                           do: 0, else: binding.pending_conversation_high)}
+      end
+
+    if push_pending?(binding) do
+      next = if claim.remainder_due, do: now_ms, else: binding.next_at || now_ms + @push_window_ms
+      clear_push_claim(%{binding | state: "queued", next_at: next})
+    else
+      clear_push_claim(%{binding | state: "ready", deadline_at: nil, next_at: nil})
     end
   end
 
