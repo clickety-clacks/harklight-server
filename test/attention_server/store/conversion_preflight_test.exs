@@ -161,7 +161,7 @@ defmodule AttentionServer.Store.ConversionPreflightTest do
 
     # The admission code reads only the header and enough output to identify
     # the term. These fixtures declare measured sizes without allocating them.
-    put_large_header(db, 123_901_843)
+    put_large_header(db, 141_033_504)
     assert {:error, {:fit_not_established, :memory, _, _}} =
              ConversionPreflight.check(db, %{generous | memory: 7 * gib}, 30)
 
@@ -187,6 +187,34 @@ defmodule AttentionServer.Store.ConversionPreflightTest do
     put_large_header(db, 1_232_830_636)
     assert {:error, {:fit_not_established, :expanded_snapshot, 1_232_830_636, 1_232_830_635}} =
              ConversionPreflight.check(db, generous, 30)
+  end
+
+  test "the measured small extension admits mid-size snapshots without excluding denser stores" do
+    {:ok, db} = Sqlite3.open(":memory:")
+    on_exit(fn -> Sqlite3.close(db) end)
+    :ok = Sqlite3.execute(db, """
+    CREATE TABLE relay_state (id INTEGER PRIMARY KEY, payload BLOB);
+    CREATE TABLE agent_changes (id INTEGER PRIMARY KEY);
+    WITH RECURSIVE ids(id) AS (
+      VALUES (1)
+      UNION ALL
+      SELECT id + 1 FROM ids WHERE id < 79166
+    ) INSERT INTO agent_changes SELECT id FROM ids;
+    """)
+
+    size = 137_000_000
+    put_large_header(db, size)
+    memory = 512 * 1024 * 1024 + 23 * size
+    budget = %{memory: memory, disk: 4 * 1024 * 1024 * 1024, uploads: 256 * 1024}
+    assert {:ok, %{expanded_bytes: ^size}} = ConversionPreflight.check(db, budget, 30)
+
+    :ok = Sqlite3.execute(db, "INSERT INTO agent_changes VALUES (79167)")
+    assert {:error, {:fit_not_established, :memory, _, ^memory}} =
+             ConversionPreflight.check(db, budget, 30)
+
+    ample = 14 * 1024 * 1024 * 1024
+    assert {:ok, %{expanded_bytes: ^size}} =
+             ConversionPreflight.check(db, %{budget | memory: ample, disk: ample}, 30)
   end
 
   test "skips a store that already has a FORMAT31 row anchor" do

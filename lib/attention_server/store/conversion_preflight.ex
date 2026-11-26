@@ -26,12 +26,24 @@ defmodule AttentionServer.Store.ConversionPreflight do
     uploads: 33_624_064
   })
 
+  # The retained-data extension was rehearsed with these counts and the
+  # original coefficients under a 4 GiB limit. Keep the original large band
+  # available for denser snapshots in this new interval.
+  @shape_a_extension %{
+    @shape_a
+    | expanded_bytes: 141_033_503,
+      revisions: 119_801,
+      changes: 79_166
+  }
+  @shape_fields [:upload_bytes, :client_resource_revs, :agent_changes, :large_data_references]
+
   # Both 50,000-message fixtures fit with ten bytes per expanded byte and
   # the fixed reserve. Budget each band at its upper end so a smaller
   # payload can still carry the densest shape admitted in that band.
   @large_budget Map.merge(@common_budget, %{memory_per_byte: 10, references: 0, uploads: 4096})
   @envelopes [
     @shape_a,
+    Map.put(@shape_a_extension, :extension, true),
     Map.merge(@large_budget, %{
       expanded_bytes: 771_569_498,
       bound_bytes: 771_569_498,
@@ -49,23 +61,41 @@ defmodule AttentionServer.Store.ConversionPreflight do
   def check(db, budget, expected_format, envelopes \\ @envelopes) do
     with {:ok, info} <- read(db, budget.memory, budget.disk),
          :ok <- check_format(info.format, expected_format),
-         {:ok, envelope} <- select_envelope(info.expanded_bytes, envelopes),
-         {memory, disk} <- upper_bound(info, envelope),
-         :ok <- within_limit(memory, budget.memory, :memory),
-         :ok <- within_limit(disk, budget.disk, :disk),
-         :ok <- check_shape(db, budget.uploads, envelope) do
+         :ok <- check_envelopes(db, info, budget, envelopes) do
       {:ok, info}
     end
   end
 
-  defp select_envelope(expanded, envelopes) do
-    case Enum.find(envelopes, &(expanded <= &1.expanded_bytes)) do
-      nil ->
+  defp check_envelopes(db, info, budget, envelopes) do
+    expanded = info.expanded_bytes
+
+    case Enum.drop_while(envelopes, &(expanded > &1.expanded_bytes)) do
+      [] ->
         limit = envelopes |> Enum.map(& &1.expanded_bytes) |> Enum.max(fn -> 0 end)
         within_limit(expanded, limit, :expanded_snapshot)
 
-      envelope ->
-        {:ok, envelope}
+      [%{extension: true} = extension, larger | _] ->
+        case check_envelope(db, info, budget, extension) do
+          {:error, {:fit_not_established, field, _, _}} = refused when field in @shape_fields ->
+            case check_envelope(db, info, budget, larger) do
+              {:error, {:fit_not_established, field, _, _}} when field in @shape_fields -> refused
+              result -> result
+            end
+
+          result -> result
+        end
+
+      [envelope | _] ->
+        check_envelope(db, info, budget, envelope)
+    end
+  end
+
+  defp check_envelope(db, info, budget, envelope) do
+    {memory, disk} = upper_bound(info, envelope)
+
+    with :ok <- within_limit(memory, budget.memory, :memory),
+         :ok <- within_limit(disk, budget.disk, :disk) do
+      check_shape(db, budget.uploads, envelope)
     end
   end
 
