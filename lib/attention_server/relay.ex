@@ -266,6 +266,12 @@ defmodule AttentionServer.Relay do
   owner key is held by the server and never leaves it; the hosted side gets only
   the person identifier.
   """
+  def replace_hosted_organization(server, ref, people),
+    do: GenServer.call(server, {:replace_hosted_organization, ref, people}, :infinity)
+
+  def delete_hosted_organization(server, ref),
+    do: GenServer.call(server, {:delete_hosted_organization, ref}, :infinity)
+
   def hosted_account_create(server, account_ref),
     do: GenServer.call(server, {:hosted_account_create, account_ref}, :infinity)
 
@@ -1272,6 +1278,16 @@ defmodule AttentionServer.Relay do
       {:ok, response, next} -> {:reply, {:ok, response}, next}
       {:error, reason} -> {:reply, {:error, reason}, state}
     end
+  end
+
+  defp dispatch_call({:replace_hosted_organization, ref, people}, _from, state) do
+    result = Engine.replace_hosted_organization(state.store.engine, ref, people, random_uuid_v4())
+    commit_hosted_organization(state, result, "hosted_organization_replace")
+  end
+
+  defp dispatch_call({:delete_hosted_organization, ref}, _from, state) do
+    result = Engine.delete_hosted_organization(state.store.engine, ref)
+    commit_hosted_organization(state, result, "hosted_organization_delete")
   end
 
   defp dispatch_call({:hosted_account_create, account_ref}, _from, state) do
@@ -4075,6 +4091,18 @@ defmodule AttentionServer.Relay do
   end
 
   defp put_push_revision(_store, _claim), do: {:error, :storage_unavailable}
+
+  defp commit_hosted_organization(state, {:ok, next}, action) do
+    audit = %{person: "system", actor: "hosted_component", action: action}
+
+    case commit(state.store, next, audit) do
+      {:ok, store} -> {:reply, :ok, %{state | store: store}}
+      _ -> {:reply, {:error, :storage_unavailable}, state}
+    end
+  end
+
+  defp commit_hosted_organization(state, {:error, reason}, _action),
+    do: {:reply, {:error, reason}, state}
 
   defp commit(store, next, audit) do
     result = Store.commit(store, next, audit)

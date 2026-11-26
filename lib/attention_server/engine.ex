@@ -75,6 +75,7 @@ defmodule AttentionServer.Engine do
             subscriptions: %{},
             cursors: %{},
             hosted_accounts: %{},
+            hosted_organizations: %{},
             delivery_states: %{},
             algorithm_choices: %{},
             alert_choices: %{},
@@ -733,6 +734,36 @@ defmodule AttentionServer.Engine do
         end
     end
   end
+
+  @doc false
+  def replace_hosted_organization(%__MODULE__{} = engine, ref, people, id)
+      when is_list(people) do
+    record = %{id: get_in(engine.hosted_organizations, [ref, :id]) || id, members: MapSet.new(people)}
+
+    cond do
+      not hosted_account_ref?(ref) -> {:error, :invalid_organization}
+      not valid_hosted_organization?(engine, ref, record) -> {:error, :invalid_members}
+      true -> {:ok, put_row(engine, :hosted_organizations, ref, record)}
+    end
+  end
+
+  def replace_hosted_organization(%__MODULE__{}, _ref, _people, _id),
+    do: {:error, :invalid_members}
+
+  @doc false
+  def delete_hosted_organization(%__MODULE__{} = engine, ref) do
+    if hosted_account_ref?(ref),
+      do: {:ok, delete_row(engine, :hosted_organizations, ref)},
+      else: {:error, :invalid_organization}
+  end
+
+  @doc false
+  def valid_hosted_organization?(%__MODULE__{} = engine, ref, %{id: id, members: %MapSet{} = members}) do
+    hosted_people = MapSet.new(Map.values(engine.hosted_accounts), & &1.person)
+    hosted_account_ref?(ref) and Message.uuid_v4?(id) and MapSet.subset?(members, hosted_people)
+  end
+
+  def valid_hosted_organization?(_, _, _), do: false
 
   @doc "Record the readable label the hosted side supplies for a hosted person."
   def hosted_account_label(%__MODULE__{} = engine, person, label) do

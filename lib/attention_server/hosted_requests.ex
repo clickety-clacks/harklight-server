@@ -20,33 +20,23 @@ defmodule AttentionServer.HostedRequests do
   def call(conn, opts) do
     conn = put_resp_header(conn, "cache-control", "no-store")
 
-    case {conn.method, conn.request_path} do
-      {"POST", "/accounts"} ->
-        with_request(conn, &create_account(&1, &2, opts))
+    case {conn.method, conn.request_path, conn.path_info} do
+      {"PUT", _, ["organizations", ref, "members"]} ->
+        with_request(conn, &replace_organization(&1, &2, opts, ref))
 
-      {"POST", "/algorithm"} ->
-        with_request(conn, &set_algorithm(&1, &2, opts))
+      {"DELETE", _, ["organizations", ref]} ->
+        organization_response(conn, Relay.delete_hosted_organization(opts.relay, ref))
 
-      {"POST", "/sign-in-links"} ->
-        with_request(conn, &create_sign_in_link(&1, &2, opts))
+      {"POST", "/accounts", _} -> with_request(conn, &create_account(&1, &2, opts))
+      {"POST", "/algorithm", _} -> with_request(conn, &set_algorithm(&1, &2, opts))
+      {"POST", "/sign-in-links", _} -> with_request(conn, &create_sign_in_link(&1, &2, opts))
+      {"POST", "/delivery-state", _} -> with_request(conn, &set_delivery_state(&1, &2, opts))
+      {"POST", "/test-reset", _} -> with_request(conn, &test_reset(&1, &2, opts))
+      {"POST", _, ["persons", person, "notices"]} ->
+        with_request(conn, &create_notice(&1, &2, opts.relay, person))
 
-      {"POST", "/delivery-state"} ->
-        with_request(conn, &set_delivery_state(&1, &2, opts))
-
-      {"POST", "/test-reset"} ->
-        with_request(conn, &test_reset(&1, &2, opts))
-
-      {"POST", _} ->
-        case conn.path_info do
-          ["persons", person, "notices"] ->
-            with_request(conn, &create_notice(&1, &2, opts.relay, person))
-
-          _ ->
-            send_resp(conn, 404, "")
-        end
-
-      _ ->
-        send_resp(conn, 405, "")
+      {"POST", _, _} -> send_resp(conn, 404, "")
+      _ -> send_resp(conn, 405, "")
     end
   rescue
     error ->
@@ -72,6 +62,23 @@ defmodule AttentionServer.HostedRequests do
         json(conn, 503, %{"error" => "storage_unavailable"})
     end
   end
+
+  defp replace_organization(conn, %{"person_ids" => people} = request, opts, ref)
+       when map_size(request) == 1 do
+    organization_response(conn, Relay.replace_hosted_organization(opts.relay, ref, people))
+  end
+
+  defp replace_organization(conn, _request, _opts, _ref),
+    do: json(conn, 400, %{"error" => "invalid_members"})
+
+  defp organization_response(conn, :ok), do: send_resp(conn, 204, "")
+
+  defp organization_response(conn, {:error, reason})
+       when reason in [:invalid_organization, :invalid_members],
+       do: json(conn, 400, %{"error" => to_string(reason)})
+
+  defp organization_response(conn, {:error, :storage_unavailable}),
+    do: json(conn, 503, %{"error" => "storage_unavailable"})
 
   defp create_account(conn, request, opts) do
     case Relay.hosted_account_create(opts.relay, Map.get(request, "account_ref")) do

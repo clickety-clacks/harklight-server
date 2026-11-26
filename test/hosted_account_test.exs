@@ -47,6 +47,46 @@ defmodule AttentionServer.HostedAccountTest do
   end
 
   describe "hosted accounts in the relay" do
+    test "organization rosters replace atomically and survive restart", %{certs: certs, dir: dir} do
+      relay = start_relay(certs, dir, [])
+      assert {:ok, alice} = Relay.hosted_account_create(relay, "acct-alice")
+      assert {:ok, bob} = Relay.hosted_account_create(relay, "acct-bob")
+
+      opts = HostedRequests.init(relay: relay)
+      body = JSON.encode!(%{"person_ids" => [alice, bob]})
+
+      assert %{status: 204} =
+               :put
+               |> Plug.Test.conn("/organizations/business-a/members", body)
+               |> HostedRequests.call(opts)
+      assert :ok = Relay.replace_hosted_organization(relay, "business-b", [alice])
+      before = :sys.get_state(relay).store
+
+      assert :ok = Relay.replace_hosted_organization(relay, "business-a", [bob, alice, alice])
+      assert :sys.get_state(relay).store.version == before.version
+      assert {:error, :invalid_members} =
+               Relay.replace_hosted_organization(relay, "business-a", [bob, "unknown"])
+
+      assert :ok = Relay.replace_hosted_organization(relay, "business-a", [bob])
+      assert :ok = GenServer.stop(relay)
+      relay = start_relay(certs, dir, [])
+      rosters = :sys.get_state(relay).store.engine.hosted_organizations
+      assert rosters["business-a"].id == before.engine.hosted_organizations["business-a"].id
+      assert rosters["business-a"].members == MapSet.new([bob])
+      assert rosters["business-b"].members == MapSet.new([alice])
+
+      opts = HostedRequests.init(relay: relay)
+
+      assert %{status: 204} =
+               :delete
+               |> Plug.Test.conn("/organizations/business-a")
+               |> HostedRequests.call(opts)
+
+      assert :ok = Relay.delete_hosted_organization(relay, "business-a")
+      refute Map.has_key?(:sys.get_state(relay).store.engine.hosted_organizations, "business-a")
+      assert :ok = GenServer.stop(relay)
+    end
+
     test "a newly created hosted owner has an empty inbox", %{certs: certs, dir: dir} do
       relay = start_relay(certs, dir, dashboard_origin: @origin)
       assert {:ok, person} = Relay.hosted_account_create(relay, "acct-empty-inbox")

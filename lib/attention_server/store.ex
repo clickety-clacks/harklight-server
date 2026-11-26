@@ -1791,6 +1791,7 @@ defmodule AttentionServer.Store do
     :browser_sign_ins,
     :maintainer_grants,
     :hosted_accounts,
+    :hosted_organizations,
     :delivery_states,
     :algorithm_choices,
     :alert_choices,
@@ -1840,6 +1841,9 @@ defmodule AttentionServer.Store do
 
   defp valid_keyed_row?(engine, :hosted_accounts, ref, record),
     do: valid_hosted_account?(engine, ref, record)
+
+  defp valid_keyed_row?(engine, :hosted_organizations, ref, record),
+    do: Engine.valid_hosted_organization?(engine, ref, record)
 
   defp valid_keyed_row?(engine, :delivery_states, person, state),
     do: valid_delivery_state?(engine, person, state)
@@ -2705,6 +2709,9 @@ defmodule AttentionServer.Store do
         BrowserSignIn.valid_state?(engine) and
         valid_maintainers?(engine) and
         valid_hosted_accounts?(engine) and
+        Enum.all?(engine.hosted_organizations, fn {ref, record} ->
+          Engine.valid_hosted_organization?(engine, ref, record)
+        end) and
         valid_delivery_states?(engine) and
         valid_prioritization?(engine) and
         valid_alert_choices?(engine) and
