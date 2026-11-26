@@ -41,9 +41,9 @@ client, but is not a message or conversation route. Server routes are rooted at
 paths without a trailing slash rather than assuming the server accepts the
 client parser's looser spelling.
 
-For example, given the synthetic browser origin `https://inbox.example.test:9443`,
-the entry links are `https://inbox.example.test:9443/inbox` and
-`https://inbox.example.test:9443/settings`. Construct these with a URL resolver
+For example, given the synthetic browser origin `https://harklight.example.test:9443`,
+the entry links are `https://harklight.example.test:9443/inbox` and
+`https://harklight.example.test:9443/settings`. Construct these with a URL resolver
 using the verified origin and fixed path, preserving its scheme, host and port.
 These routes take no message, sender, person, recipient or session identifiers.
 Do not append an identifier as a path segment, query parameter or fragment: the
@@ -99,7 +99,7 @@ intended person, label and key fingerprint before running `bin/harklight owner
 approve` with `--senders app:example` for this sender. For an explicitly
 authorized enrollment, check the saved request with the installed enrollment
 command. For an approved request it proves current key access with one
-authenticated client API v2 inbox read on the device port. This does not prove
+authenticated `GET /v2/inbox` request on the device port. This does not prove
 that an agent session receives its messages:
 
 ```sh
@@ -126,8 +126,8 @@ reads the latest version by default or the selected retained revision; it does
 not mark Seen. `not_found` for a selected revision means the requested revision
 is gone. The shared core below gives the command examples.
 
-The enrolled-device interface remains available for existing inbox work:
-`device read` takes a client API v2 inbox snapshot or change batch and saves it
+The enrolled-device interface can read the attention list and answer stored messages:
+`device read` takes an attention list snapshot or change batch and saves it
 with its cursor before advancing that cursor; there is no ACK.
 `device respond --sender ID --message-id ID --answer answer.json` deliberately
 submits an answer object (at most one of `choice`, `comment` or `result`, or

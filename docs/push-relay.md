@@ -50,7 +50,7 @@ example, a passive alert request is:
 - `token`, `environment` and `kind` are required. Use the device's registered
   APNs environment (`production` or `sandbox`) and a kind of `alert` or
   `background`.
-- `badge` is optional and carries the Inbox count as a non-negative integer.
+- `badge` is optional and carries the attention list count as a non-negative integer.
 - The optional alert presentation fields are `interruption_level` (only
   `"passive"`) and `sound` (only `"default"`). A passive alert carries
   `interruption_level` and omits `sound`. An alert with sound carries

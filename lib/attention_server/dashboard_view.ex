@@ -81,7 +81,7 @@ defmodule AttentionServer.DashboardView do
       skill_section("harklight", skill_version_harklight, "/agent-skills/harklight/SKILL.md")
 
     body =
-      ~s(<header class="page-head"><div><h1>Components</h1></div></header>) <>
+      ~s(<header class="page-head"><div><h1>Components</h1><p>Harklight is an attention-based UI for messages and requests from your agents.</p></div></header>) <>
         app_section <>
         cli_section <>
         coding_agent_skill_section <>

@@ -180,10 +180,10 @@ Schemas use JSON Schema 2020-12. `$ref`s point into the `$defs` below.
       "type": "object",
       "required": ["key", "section"],
       "properties": {
-        "key": { "type": "string", "description": "Sort ascending, byte-wise, to get the server's inbox order across and within sections" },
+        "key": { "type": "string", "description": "Sort ascending, byte-wise, to get the server's attention list order across and within sections" },
         "section": { "enum": ["current", "resolved"], "description": "Draw a heading where it changes; resolved takes today's History heading (closed list, §4)" },
-        "group": { "enum": ["common", "earlier_messages"], "description": "Only for current items while the inbox is in free order; common has no heading" },
-        "level": { "$ref": "#/$defs/PriorityLevel4", "description": "Present only when the inbox view entry carries priority, in baseline and fallback views. Omitted under a selected JEV ranking and for progress FYIs." },
+        "group": { "enum": ["common", "earlier_messages"], "description": "Only for current items while the attention list is in free order; common has no heading" },
+        "level": { "$ref": "#/$defs/PriorityLevel4", "description": "Present only when the attention list entry carries priority, in baseline and fallback views. Omitted under a selected JEV ranking and for progress FYIs." },
         "score": { "type": "number", "description": "Present for current items wherever today's priority view has it" },
         "due_at_ms": { "$ref": "#/$defs/TimeMs", "description": "Present wherever today's priority view has it" }
       }
@@ -417,7 +417,7 @@ or the recipient's setting is `"all"`.
 }
 ```
 
-- `limit` on the inbox defaults to 50, with a maximum of 200. On entries it
+- `limit` on `GET /v2/inbox` defaults to 50, with a maximum of 200. On entries it
   defaults to 50, with a maximum of 200. A larger value is served as the
   maximum. A non-positive or non-integer value is `400 invalid_field` with
   `field: "limit"`.
@@ -426,9 +426,9 @@ or the recipient's setting is `"all"`.
   `before` entry. `before` is an `entry_id`. An upsert raises an entry's `rev`
   but never changes its `position`. Clients sort entries by `position` and
   version-gate them by `rev`.
-- The inbox pages through every item the person can see, terminal ones
-  included, in rank order. `next_page` is absent on the last page.
-- **Sections** are a closed list taken from today's inbox order
+- `GET /v2/inbox` pages through every item the person can see, including
+  settled items, in rank order. `next_page` is absent on the last page.
+- **Sections** are a closed list taken from the attention list order
   (`Placement.list_items`):
   - `current`: items still waiting on the person, in today's ranked or free
     order;
@@ -436,12 +436,12 @@ or the recipient's setting is `"all"`.
     heading here.
 
   A full bounce removes the unopened item and its Chat from person reads,
-  including Inbox, History and search, and reduces the unresolved count.
+  including the attention list, History and search, and reduces the unresolved count.
   Direct item, revision and entries reads and answer submissions return
   `404 not_found`. A pending default answer is cancelled. A soft bounce leaves
   the item where it is.
 
-  `rank.key` orders items across and within sections. While the inbox is in
+  `rank.key` orders items across and within sections. While the attention list is in
   free order, `current` items also carry `Rank.group` (`common`, which has no
   heading, or `earlier_messages`). Clients use `Rank.level` for the priority
   mark when present, otherwise compare `Rank.score` with the settings levels
@@ -678,7 +678,7 @@ account.
 
 - **`PUT /v2/devices/me/focus`** takes today's report fields:
   - `screen`: `inbox`, `fyi`, `message`, `chat`, `settings`, `signed_out` or
-    `not_in_front`. The FYI list (`fyi`) counts as in front, like the inbox;
+    `not_in_front`. The FYI list (`fyi`) counts as in front, like the attention list;
   - `item_id`: required for `message` and `chat`, absent for other screens;
   - `visible_entry_id`: optional for `chat`, absent for other screens;
   - `ttl_s`: an integer from 1 to 3600. Clients send 120 and refresh every
@@ -695,7 +695,7 @@ account.
   changes within a screen by one second and renew within `ttl_s` while in
   front. Send IDs only, keep network and disk work off the main thread, and
   avoid reporting per scroll frame. Clients serialize focus writes per
-  device. With one `PUT` in flight, the latest report replaces any queued one.
+  device. With one `PUT` in flight, the latest report replaces any report waiting to be sent.
 
   Its `reported_at` rule is today's: the first report, or a change to an
   in-front screen. An unchanged refresh maintains liveness without changing
@@ -916,7 +916,7 @@ omit it and may carry the fixed alert body “New message in Harklight”.
 - Without a locator, the app matches `attention.server` to the active
   enrollment's Server identity from `GET /v2/me`. A matching v2 `sync` push
   triggers the usual v2 catch-up from the app's saved cursor (§6). Tapping
-  a locator-less alert opens the Inbox without navigating to an item.
+  a locator-less alert opens the attention list without navigating to an item.
 
 A push that gathers one or more messages carries `aps.interruption-level`
 set to `"passive"` and omits `aps.sound` when none of them alerts the
@@ -984,7 +984,7 @@ internal_error (500, retryable: false): Server failed to complete the request. K
 ## 8. Carried over from today, and dropped
 
 - **Carried:**
-  - inbox row content, renamed: `opened` becomes `seen`,
+  - attention list row content, renamed: `opened` becomes `seen`,
     `chat_started`/`chat_read_position` become `chat`, `origin_result` becomes
     `result`, and `priority_view` becomes `rank`;
   - terminal state, availability, files and `as`;
@@ -992,7 +992,7 @@ internal_error (500, retryable: false): Server failed to complete the request. K
     availability changes, with delivery receipts folded into
     `Entry.delivery`;
   - the answer outcome, as `Terminal.answer`;
-  - today's inbox sections and unread-reply counts, as `Rank.section` and
+  - the attention list sections and unread-reply counts, as `Rank.section` and
     `Chat.unread_replies`;
   - priority levels and push status.
 - **Dropped from client resources:**
@@ -1179,7 +1179,7 @@ agents with existing data. Clients apply newer versions of each resource.
         "device_id": { "$ref": "#/$defs/OpaqueId" },
         "device_name": { "type": "string" },
         "kind": { "const": "browser", "description": "Present for a signed-in browser focus reporter." },
-        "screen": { "type": "string", "description": "Screen name, including inbox, fyi, message, chat, settings, signed_out and not_in_front." },
+        "screen": { "type": "string", "description": "Screen name, including `inbox`, `fyi`, `message`, `chat`, `settings`, `signed_out` and `not_in_front`." },
         "reported_at_ms": { "$ref": "#/$defs/TimeMs" },
         "in_front": { "type": "boolean" },
         "connected": { "type": "boolean" },
@@ -2009,7 +2009,7 @@ applied as well. Round 4 wins where rounds conflict:
   - the heartbeat is an id-less `heartbeat` event;
   - paused accounts get `account_paused`;
   - a device revoked while its connection is open gets `401`.
-- **Inbox:** `Rank.section`, `Chat.unread_replies`, `Item.created_at_ms` and
+- **Attention list:** `Rank.section`, `Chat.unread_replies`, `Item.created_at_ms` and
   push state `expired`.
 - **`GET /v2/me`:** `account`, `features`, and `limits` (upload cap, inline
   budget, the published UI/1 caps and the 30-day retention).
