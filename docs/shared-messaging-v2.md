@@ -81,10 +81,15 @@ An opted-in `POST /v2/agent/messages` extends SendMessageBody with:
 Each selector and policy is a closed object. Send admits one selector only.
 Normalize duplicates to the first appearance before delivery; original body
 digest still controls idempotency. An absent recipients field selects the existing
-individual send shape; answer_policy alone is invalid. The Server stores an explicit organization affiliation per person. The
+individual send shape; answer_policy alone is invalid. The Server stores explicit person-to-organization affiliations. The
 authenticated agent’s existing registration and send right for the sender ID
-authorize recipients affiliated with the same organization on that Server.
-Check both sender and recipient affiliations in the send transaction.
+authorize recipients when the sender and every recipient share one
+organization on that Server. Resolve and record one organization for each
+shared send, and check all affiliations in the send transaction. A send
+spanning multiple organizations is refused. If the sender and every named
+recipient share more than one possible organization, the Step 1 path
+refuses with the same typed error until an explicit organization selector
+is agreed. A group has exactly one organization.
 Any unknown or out-of-organization recipient returns
 `403 recipient_refused` with the standard error fields and
 `retryable:false`. The entire send fails before delivery, message creation,
@@ -93,8 +98,14 @@ in this error. Once all targets are authorized, report delivery availability
 as `{person_id:OpaqueId,status:"reached"|"unreachable"}`.
 
 On Hosted, business membership established by the seats component is
-authoritative. The component provisions affiliation add/remove over its
-authenticated Server interface. Without that affiliation, a Hosted person
+authoritative. A person may belong to several organizations. Over the
+authenticated Hosted loopback interface,
+`PUT /organizations/{business_ref}/members` accepts
+`{person_ids:[OpaqueId,...]}` and idempotently replaces accepted member and
+admin affiliations for that business. Hosted sends the full set after changes
+and during reconciliation. `DELETE /organizations/{business_ref}` removes
+that business’s affiliations. Business type does not change affiliation;
+existing seat and entitlement rules still govern delivery. Without that affiliation, a Hosted person
 cannot use the shared send path. On a self-hosted Server, its owner manages
 the one default organization with owner tooling. People the owner sets up
 join that organization by default, with owner-controlled add and remove.
@@ -102,9 +113,9 @@ The Server uses this explicit relation and never matches names or emails.
 The feature is available only where authoritative affiliation is enforced
 and the authenticated person belongs to an organization. Ineligible
 connections receive `400 unsupported` on shared sends. Legacy individual
-account boundaries remain. The provisioning wire and effects of later
-affiliation removal on active shared projections require agreement before
-activation. Group departures already have the history boundary below.
+account boundaries remain. Removing affiliation immediately ends live access to that organization’s
+shared messages and groups and freezes existing authorized history through
+the removal transaction, using the same cutoff as group departure.
 
 With zero reached return `422 no_recipients` with the standard error envelope, retryable false, plus those outcomes for an
 explicit people selector. If a named decider is otherwise eligible but
