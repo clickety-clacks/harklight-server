@@ -461,6 +461,28 @@ defmodule AttentionServer.SharedMessages do
     %{"unresolved" => individual + shared}
   end
 
+  def badge_count(engine, person) do
+    affiliations = organizations(engine, person)
+
+    Enum.count(for_person(engine, person), fn {record, recipient} ->
+      not Map.has_key?(recipient, :frozen) and
+        MapSet.member?(affiliations, record.organization_id) and
+        (request_attention?(engine, record, recipient, person) or unread_chat?(engine, record, recipient, person))
+    end)
+  end
+
+  defp request_attention?(engine, record, recipient, person) do
+    not AttentionServer.Message.progress_message?(record.message) and
+      SharedAnswers.available?(engine, record, recipient, person)
+  end
+
+  defp unread_chat?(engine, record, recipient, person) do
+    read = Map.get(recipient, :read_position, 0)
+    Enum.any?(entries(engine, record), &unread_entry?(&1, person, read))
+  end
+
+  defp unread_entry?(entry, person, read), do: entry.position > read and entry.author != {:person, person}
+
   def recipient_message(engine, person, item_id) do
     Enum.find_value(engine.shared_recipients, {:error, :not_found}, fn
       {{shared_id, ^person}, %{item_id: ^item_id} = recipient} ->
@@ -514,7 +536,7 @@ defmodule AttentionServer.SharedMessages do
     entries = entries(engine, record, cutoff)
     read = Map.get(recipient, :read_position, 0)
 
-    unread = Enum.count(entries, &(&1.position > read and &1.author != {:person, person}))
+    unread = Enum.count(entries, &unread_entry?(&1, person, read))
     last_read = Enum.find(entries, &(&1.position == read))
     last_origin = Enum.find(Enum.reverse(entries), &(&1.author == :sender))
 

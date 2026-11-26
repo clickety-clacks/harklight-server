@@ -472,6 +472,24 @@ defmodule AttentionServer.ClientAPISharedSendTest do
     assert bindings[{first, opted_in}].shared_messages
     refute bindings[{first, sibling}][:shared_messages]
 
+    assert {200, _, _} = send_request(ctx, server, @key, body([first]), true)
+
+    assert :ok = Relay.setup_sender(relay, opted_in, "app:individual")
+    individual = %{
+      "sender" => "app:individual",
+      "message" => %{"title" => "Individual request", "created_at" => 1}
+    }
+    assert {200, _, _} =
+             write_request(ctx, server, "a2", "POST", "/v2/agent/messages", op_key(36), individual, [])
+
+    now = System.system_time(:millisecond) + 1_000
+    claims = for _ <- 1..2 do
+      assert {:ok, %{device: device, badge: badge} = claim} = Relay.claim_push(relay, now)
+      assert :ok = Relay.finish_push(relay, claim, %{state: "provider_accepted"}, now)
+      {device, badge}
+    end
+    assert Map.new(claims) == %{opted_in => 2, sibling => 1}
+
     assert {200, _, _} =
              write_request(ctx, server, "a2", "PUT", path, op_key(33), %{registration | "revision" => 2}, [])
     refute :sys.get_state(relay).store.engine.push_bindings[{first, opted_in}][:shared_messages]

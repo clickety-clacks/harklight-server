@@ -25,7 +25,8 @@ defmodule AttentionServer.Engine do
     LargeData,
     Message,
     RouteBIndex,
-    SenderNames
+    SenderNames,
+    SharedMessages
   }
 
   alias AttentionServer.ClientAPI.Resources
@@ -195,7 +196,7 @@ defmodule AttentionServer.Engine do
             ),
           presentation: presentation,
           locator: push_locator(next, item_key, person, device, binding.binding_id, chat),
-          badge: inbox_badge(next, person),
+          badge: binding_badge(next, person, binding),
           registered_at: binding.registered_at,
           claim_id: claim_id
         }
@@ -5679,6 +5680,14 @@ defmodule AttentionServer.Engine do
           nil
       end
     end)
+  end
+
+  defp binding_badge(engine, person, binding) do
+    individual = inbox_badge(engine, person)
+
+    if Map.get(binding, :shared_messages, false),
+      do: individual + SharedMessages.badge_count(engine, person),
+      else: individual
   end
 
   # The recipient's active Inbox count excludes settled and full-bounced items.
