@@ -10,10 +10,10 @@ defmodule AttentionServer.Store.ConversionPreflightTest do
     :ok = Sqlite3.execute(db, "CREATE TABLE relay_state (id INTEGER PRIMARY KEY, payload BLOB)")
     :ok = Sqlite3.execute(db, "INSERT INTO relay_state VALUES (1, zeroblob(8388608))")
 
-    assert {:error, :fit_not_established} =
+    assert {:error, {:fit_not_established, :prefix_memory, 41_943_040, 8_388_608}} =
              ConversionPreflight.read(db, 8 * 1024 * 1024, 128 * 1024 * 1024)
 
-    assert {:error, :fit_not_established} =
+    assert {:error, {:fit_not_established, :prefix_disk, 41_943_040, 8_388_608}} =
              ConversionPreflight.read(db, 128 * 1024 * 1024, 8 * 1024 * 1024)
 
     assert {:error, :unsupported_snapshot} =
@@ -89,12 +89,15 @@ defmodule AttentionServer.Store.ConversionPreflightTest do
     assert {:error, :source_format_mismatch} =
              ConversionPreflight.check(db, budget, 29, [envelope])
 
-    assert {:error, :fit_not_established} =
+    assert {:error, {:fit_not_established, :memory, required, available}} =
              ConversionPreflight.check(db, %{budget | memory: 48 * mib}, 30, [envelope])
+
+    assert required > available && available == 48 * mib
 
     :ok = Sqlite3.execute(db, "INSERT INTO agent_changes VALUES (1)")
 
-    assert {:error, :fit_not_established} = ConversionPreflight.check(db, budget, 30, [envelope])
+    assert {:error, {:fit_not_established, :agent_changes, 1, 0}} =
+             ConversionPreflight.check(db, budget, 30, [envelope])
   end
 
   test "accepts the older atom tag encodings without loading an Engine" do
@@ -130,11 +133,12 @@ defmodule AttentionServer.Store.ConversionPreflightTest do
     put_snapshot_header(db, 30)
     assert {:ok, %{format: 30}} = ConversionPreflight.check(db, budget, 30)
 
-    assert {:error, :fit_not_established} =
+    assert {:error, {:fit_not_established, :upload_bytes, 33_624_065, 33_624_064}} =
              ConversionPreflight.check(db, %{budget | uploads: budget.uploads + 1}, 30)
 
     :ok = Sqlite3.execute(db, "INSERT INTO relay_large_data_refs VALUES (44)")
-    assert {:error, :fit_not_established} = ConversionPreflight.check(db, budget, 30)
+    assert {:error, {:fit_not_established, :large_data_references, 44, 43}} =
+             ConversionPreflight.check(db, budget, 30)
   end
 
   test "rejects retired snapshot formats before decoding the store" do
@@ -153,34 +157,70 @@ defmodule AttentionServer.Store.ConversionPreflightTest do
     """)
 
     gib = 1024 * 1024 * 1024
-    generous = %{memory: 14 * gib, disk: 14 * gib, uploads: 0}
+    generous = %{memory: 14 * gib, disk: 14 * gib, uploads: 169_939}
 
     # The admission code reads only the header and enough output to identify
     # the term. These fixtures declare measured sizes without allocating them.
-    put_large_header(db, 123_901_843)
-    assert {:error, :fit_not_established} =
+    put_large_header(db, 141_033_504)
+    assert {:error, {:fit_not_established, :memory, _, _}} =
              ConversionPreflight.check(db, %{generous | memory: 7 * gib}, 30)
 
-    for size <- [771_569_498, 1_232_830_635] do
+    for {size, ratio} <- [{771_569_498, 13}, {1_232_830_635, 10}] do
       put_large_header(db, size)
-      memory = 512 * 1024 * 1024 + 10 * size
+      memory = 512 * 1024 * 1024 + ratio * size
       disk = 128 * 1024 * 1024 + 5 * size
       exact = %{generous | memory: memory, disk: disk}
       assert {:ok, %{expanded_bytes: ^size}} = ConversionPreflight.check(db, exact, 30)
 
-      assert {:error, :fit_not_established} =
+      assert {:error, {:fit_not_established, :memory, ^memory, _}} =
                ConversionPreflight.check(db, %{exact | memory: memory - 1}, 30)
 
-      assert {:error, :fit_not_established} =
+      assert {:error, {:fit_not_established, :disk, ^disk, _}} =
                ConversionPreflight.check(db, %{exact | disk: disk - 1}, 30)
+
+      assert {:ok, %{expanded_bytes: ^size}} =
+               ConversionPreflight.check(db, %{exact | uploads: 8_392_704}, 30)
+
+      assert {:error, {:fit_not_established, :upload_bytes, 8_392_705, 8_392_704}} =
+               ConversionPreflight.check(db, %{exact | uploads: 8_392_705}, 30)
     end
 
     :ok = Sqlite3.execute(db, "INSERT INTO relay_large_data_refs VALUES (1)")
-    assert {:error, :fit_not_established} = ConversionPreflight.check(db, generous, 30)
+    assert {:error, {:fit_not_established, :large_data_references, 1, 0}} =
+             ConversionPreflight.check(db, generous, 30)
     :ok = Sqlite3.execute(db, "DELETE FROM relay_large_data_refs")
 
     put_large_header(db, 1_232_830_636)
-    assert {:error, :fit_not_established} = ConversionPreflight.check(db, generous, 30)
+    assert {:error, {:fit_not_established, :expanded_snapshot, 1_232_830_636, 1_232_830_635}} =
+             ConversionPreflight.check(db, generous, 30)
+  end
+
+  test "the measured small extension admits mid-size snapshots without excluding denser stores" do
+    {:ok, db} = Sqlite3.open(":memory:")
+    on_exit(fn -> Sqlite3.close(db) end)
+    :ok = Sqlite3.execute(db, """
+    CREATE TABLE relay_state (id INTEGER PRIMARY KEY, payload BLOB);
+    CREATE TABLE agent_changes (id INTEGER PRIMARY KEY);
+    WITH RECURSIVE ids(id) AS (
+      VALUES (1)
+      UNION ALL
+      SELECT id + 1 FROM ids WHERE id < 79166
+    ) INSERT INTO agent_changes SELECT id FROM ids;
+    """)
+
+    size = 137_000_000
+    put_large_header(db, size)
+    memory = 512 * 1024 * 1024 + 23 * size
+    budget = %{memory: memory, disk: 4 * 1024 * 1024 * 1024, uploads: 256 * 1024}
+    assert {:ok, %{expanded_bytes: ^size}} = ConversionPreflight.check(db, budget, 30)
+
+    :ok = Sqlite3.execute(db, "INSERT INTO agent_changes VALUES (79167)")
+    assert {:error, {:fit_not_established, :memory, _, ^memory}} =
+             ConversionPreflight.check(db, budget, 30)
+
+    ample = 14 * 1024 * 1024 * 1024
+    assert {:ok, %{expanded_bytes: ^size}} =
+             ConversionPreflight.check(db, %{budget | memory: ample, disk: ample}, 30)
   end
 
   test "skips a store that already has a FORMAT31 row anchor" do

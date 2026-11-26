@@ -1,3 +1,16 @@
+# Harklight Server v0.2.27
+
+The stopped-store converter accepts more allocated upload data in the
+larger, measured FORMAT30 snapshot ranges. The format remains FORMAT31.
+If conversion cannot establish a fit, it reports the failed limit and the
+measured value. A memory or disk shortage still calls for an isolated
+off-host conversion. A store outside the calibrated limits needs a
+verified path for that shape.
+
+**Compatibility.** Harklight Server 0.2.27 speaks only protocol 0.2 and
+bundles Harklight Web 0.2.6. Use an iPhone app build that reads
+`receipt_expected`. Harklight Agent 0.2.6 and 0.2.7 remain compatible.
+
 # Harklight Server v0.2.26
 
 The Server now keeps its data as individual records (store FORMAT31) instead

@@ -2,15 +2,18 @@ defmodule AttentionServer.Store.ConversionCapacity do
   @moduledoc false
 
   def read(path) do
-    with {:ok, host} <- host_memory(),
-         {:ok, memory} <- cgroup_memory(host),
-         {:ok, disk} <- disk_available(Path.dirname(path)),
-         {:ok, uploads} <- upload_bytes(path <> ".uploads") do
+    with {:ok, host} <- measured(host_memory(), :host_memory),
+         {:ok, memory} <- measured(cgroup_memory(host), :cgroup_memory),
+         {:ok, disk} <- measured(disk_available(Path.dirname(path)), :disk),
+         {:ok, uploads} <- measured(upload_bytes(path <> ".uploads"), :upload_bytes) do
       {:ok, %{memory: memory, disk: disk, uploads: uploads}}
-    else
-      _ -> {:error, :fit_not_established}
     end
   end
+
+  defp measured({:ok, _} = result, _field), do: result
+
+  defp measured(_result, field),
+    do: {:error, {:fit_not_established, :measurement_unavailable, field}}
 
   defp host_memory do
     with {:ok, contents} <- File.read("/proc/meminfo"),

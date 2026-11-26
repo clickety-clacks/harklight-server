@@ -1,6 +1,6 @@
 # Harklight Server self-hosted installation
 
-Version: **0.2.26**. Package target: **Linux x86_64, glibc 2.39 or newer**, with OpenSSL 3 shared libraries and libstdc++6 (built on Ubuntu 24.04). The package bundles
+Version: **0.2.27**. Package target: **Linux x86_64, glibc 2.39 or newer**, with OpenSSL 3 shared libraries and libstdc++6 (built on Ubuntu 24.04). The package bundles
 Erlang/OTP and Elixir bytecode; users need no Mix, Hex, source checkout or
 Erlang installation. It needs Bash, OpenSSL CLI, tar and the platform libraries
 listed in BUILD_INFO. This is a single-process self-hosted server cut.
@@ -25,9 +25,9 @@ the request; a valid current-revision answer commits a payload-free
 
 ## Download and verify
 
-After publication, download the v0.2.26 release from
-clickety-clacks/harklight-server, tag v0.2.26. Get
-harklight-server-0.2.26-linux-x86_64.tar.gz, SHA256SUMS and SELF_HOST.md from
+After publication, download the v0.2.27 release from
+clickety-clacks/harklight-server, tag v0.2.27. Get
+harklight-server-0.2.27-linux-x86_64.tar.gz, SHA256SUMS and SELF_HOST.md from
 that release. Run sha256sum -c SHA256SUMS and extract into an operator-owned
 versioned directory. BUILD_INFO identifies the source commit, build host,
 toolchain, source status and native dependencies.
@@ -40,7 +40,7 @@ runtime/dependency notices remain in their shipped distribution files.
 Choose the DNS hostname clients will validate. For a same-machine preview,
 localhost works. Install into a directory you own and run:
 
-    PACKAGE="$PWD/harklight-server-0.2.26-linux-x86_64"
+    PACKAGE="$PWD/harklight-server-0.2.27-linux-x86_64"
     STATE="$HOME/.local/share/harklight-server"
     "$PACKAGE/bin/harklight-bootstrap" "$STATE" localhost
     cat "$STATE/person-id"
@@ -497,12 +497,13 @@ ATTENTION_SERVER_ENABLE=0 /path/to/new-release/bin/harklight store convert-stopp
 ```
 
 The converter checks host capacity before decoding the snapshot. If it reports
-`fit not established`, keep the Server stopped and preserve the backup. Copy
-the stopped state directory to a larger isolated Linux system with sufficient
-memory and disk. Run the same verified package and command against that copy.
+`fit not established`, keep the Server stopped and preserve the backup. For
+insufficient memory or free disk, copy the stopped state directory to a larger
+isolated Linux system and run the same verified package against that copy.
 Copy the converted database and uploads back together before starting the
-new release with the existing configuration. A fit refusal on the larger
-system means the store is outside the measured limits. A refusal for an
+new release with the existing configuration. A store above a calibrated size
+or row limit needs a verified conversion path for that shape. Report the
+measured value and the limit shown by the converter. A refusal for an
 unsupported or unreadable header requires resolving the store version or
 recovering a readable backup before proceeding.
 

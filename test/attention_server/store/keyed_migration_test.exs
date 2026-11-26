@@ -55,7 +55,7 @@ defmodule AttentionServer.Store.KeyedMigrationTest do
     oversized = <<131, 80, 1_000_000_000::32, :zlib.compress(term)::binary>>
 
     for {payload, reason} <- [
-          {oversized, :fit_not_established},
+          {oversized, {:fit_not_established, :memory, 12_865_177_262, 2_147_483_648}},
           {<<131, 80, 8::32, 0, 0, 0>>, :unsupported_snapshot}
         ] do
       assert {:ok, legacy} = Sqlite3.open(path)

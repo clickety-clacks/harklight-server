@@ -26,21 +26,36 @@ defmodule AttentionServer.Store.ConversionPreflight do
     uploads: 33_624_064
   })
 
-  # Both 50,000-message fixtures fit with ten bytes per expanded byte and
-  # the fixed reserve. Budget each band at its upper end so a smaller
-  # payload can still carry the densest shape admitted in that band.
-  @large_budget Map.merge(@common_budget, %{memory_per_byte: 10, references: 0, uploads: 4096})
+  # The retained-data extension was rehearsed with these counts and the
+  # original coefficients under a 4 GiB limit. Keep the original large band
+  # available for denser snapshots in this new interval.
+  @shape_a_extension %{
+    @shape_a
+    | expanded_bytes: 141_033_503,
+      revisions: 119_801,
+      changes: 79_166
+  }
+  @shape_fields [:upload_bytes, :client_resource_revs, :agent_changes, :large_data_references]
+
+  # Both 50,000-message fixtures were rehearsed with this upload allocation
+  # and no retained large-data references. Round each measured memory ratio
+  # up with 20% headroom and apply the fixed reserve. Budget each band at its
+  # upper end so smaller payloads can still carry its densest admitted shape.
+  @large_budget Map.merge(@common_budget, %{references: 0, uploads: 8_392_704})
   @envelopes [
     @shape_a,
+    Map.put(@shape_a_extension, :extension, true),
     Map.merge(@large_budget, %{
       expanded_bytes: 771_569_498,
       bound_bytes: 771_569_498,
+      memory_per_byte: 13,
       revisions: 600_000,
       changes: 383_432
     }),
     Map.merge(@large_budget, %{
       expanded_bytes: 1_232_830_635,
       bound_bytes: 1_232_830_635,
+      memory_per_byte: 10,
       revisions: 1_000_402,
       changes: 650_100
     })
@@ -49,18 +64,48 @@ defmodule AttentionServer.Store.ConversionPreflight do
   def check(db, budget, expected_format, envelopes \\ @envelopes) do
     with {:ok, info} <- read(db, budget.memory, budget.disk),
          :ok <- check_format(info.format, expected_format),
-         %{} = envelope <- Enum.find(envelopes, &(info.expanded_bytes <= &1.expanded_bytes)),
-         {memory, disk} <- upper_bound(info, envelope),
-         true <- memory <= budget.memory and disk <= budget.disk,
-         :ok <- check_shape(db, budget.uploads, envelope) do
+         :ok <- check_envelopes(db, info, budget, envelopes) do
       {:ok, info}
-    else
-      {:already_converted, _} = converted -> converted
-      {:error, :unsupported_snapshot} = error -> error
-      {:error, :source_format_mismatch} = error -> error
-      _ -> {:error, :fit_not_established}
     end
   end
+
+  defp check_envelopes(db, info, budget, envelopes) do
+    expanded = info.expanded_bytes
+
+    case Enum.drop_while(envelopes, &(expanded > &1.expanded_bytes)) do
+      [] ->
+        limit = envelopes |> Enum.map(& &1.expanded_bytes) |> Enum.max(fn -> 0 end)
+        within_limit(expanded, limit, :expanded_snapshot)
+
+      [%{extension: true} = extension, larger | _] ->
+        case check_envelope(db, info, budget, extension) do
+          {:error, {:fit_not_established, field, _, _}} = refused when field in @shape_fields ->
+            case check_envelope(db, info, budget, larger) do
+              {:error, {:fit_not_established, field, _, _}} when field in @shape_fields -> refused
+              result -> result
+            end
+
+          result -> result
+        end
+
+      [envelope | _] ->
+        check_envelope(db, info, budget, envelope)
+    end
+  end
+
+  defp check_envelope(db, info, budget, envelope) do
+    {memory, disk} = upper_bound(info, envelope)
+
+    with :ok <- within_limit(memory, budget.memory, :memory),
+         :ok <- within_limit(disk, budget.disk, :disk) do
+      check_shape(db, budget.uploads, envelope)
+    end
+  end
+
+  defp within_limit(value, limit, _field) when value <= limit, do: :ok
+
+  defp within_limit(value, limit, field),
+    do: {:error, {:fit_not_established, field, value, limit}}
 
   defp upper_bound(info, envelope) do
     # Coefficients are integer ratios rounded up from the worst rehearsal.
@@ -74,20 +119,20 @@ defmodule AttentionServer.Store.ConversionPreflight do
   defp check_format(actual, expected) when is_nil(expected) or actual == expected, do: :ok
   defp check_format(_, _), do: {:error, :source_format_mismatch}
 
-  defp check_shape(db, uploads, envelope) when uploads <= envelope.uploads do
-    with {:ok, revisions} <- count_rows(db, "client_resource_revs"),
-         {:ok, changes} <- count_rows(db, "agent_changes"),
-         {:ok, references} <- count_rows(db, "relay_large_data_refs"),
-         true <-
-           revisions <= envelope.revisions and changes <= envelope.changes and
-             references <= envelope.references do
-      :ok
-    else
-      _ -> {:error, :fit_not_established}
+  defp check_shape(db, uploads, envelope) do
+    with :ok <- within_limit(uploads, envelope.uploads, :upload_bytes),
+         :ok <- check_count(db, "client_resource_revs", envelope.revisions, :client_resource_revs),
+         :ok <- check_count(db, "agent_changes", envelope.changes, :agent_changes) do
+      check_count(db, "relay_large_data_refs", envelope.references, :large_data_references)
     end
   end
 
-  defp check_shape(_db, _uploads, _envelope), do: {:error, :fit_not_established}
+  defp check_count(db, table, limit, field) do
+    case count_rows(db, table) do
+      {:ok, count} -> within_limit(count, limit, field)
+      _ -> {:error, {:fit_not_established, :measurement_unavailable, field}}
+    end
+  end
 
   defp count_rows(db, table) do
     with {:ok, [[exists]]} <-
@@ -113,14 +158,15 @@ defmodule AttentionServer.Store.ConversionPreflight do
       when is_integer(available_bytes) and is_integer(disk_bytes) do
     with {:ok, [[stored_bytes]]} when is_integer(stored_bytes) <-
            RecordTable.select(db, "SELECT length(payload) FROM relay_state WHERE id = 1"),
-         true <- stored_bytes + @prefix_overhead <= min(available_bytes, disk_bytes),
+         :ok <- within_limit(stored_bytes + @prefix_overhead, available_bytes, :prefix_memory),
+         :ok <- within_limit(stored_bytes + @prefix_overhead, disk_bytes, :prefix_disk),
          {:ok, [[prefix]]} <-
            RecordTable.select(db, "SELECT substr(payload, 1, ?) FROM relay_state WHERE id = 1", [
              @prefix_bytes
            ]) do
       inspect_prefix(db, stored_bytes, prefix)
     else
-      false -> {:error, :fit_not_established}
+      {:error, {:fit_not_established, _, _, _}} = error -> error
       _ -> {:error, :unsupported_snapshot}
     end
   end
