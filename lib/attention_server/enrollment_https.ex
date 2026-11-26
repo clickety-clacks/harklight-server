@@ -190,8 +190,12 @@ defmodule AttentionServer.EnrollmentHTTPS do
               {status, response, Diagnostics.operation_id(body)}
 
             {:ok, path, body} ->
-              {status, response} = dispatch(relay, path, body)
-              {status, response, Diagnostics.operation_id(body)}
+              if Relay.legacy_device_enrollment?(relay) do
+                {status, response} = dispatch(relay, path, body)
+                {status, response, Diagnostics.operation_id(body)}
+              else
+                {404, %{"error" => "not_found"}, nil}
+              end
 
             {:error, :not_found} ->
               {404, %{"error" => "not_found"}, nil}

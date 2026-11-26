@@ -41,7 +41,7 @@ defmodule AttentionServer.EnrolledLeafVerify do
 
   defp verify(_relay, _kind, _der, _, _state), do: {:fail, :invalid_certificate}
 
-  defp active?(relay, :device, key), do: match?({:ok, _}, Relay.acknowledged_cursor(relay, key))
+  defp active?(relay, :device, key), do: match?({:ok, _}, Relay.certificate_device_person(relay, key))
 
   defp active?(relay, :client_api, key),
     do: active?(relay, :device, key) or active?(relay, :agent, key)
