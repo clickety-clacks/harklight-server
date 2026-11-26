@@ -353,7 +353,8 @@ defmodule AttentionServer.PrioritizationTest do
       |> put_in([Access.key(:bounce_revisions), key, :revisions, 1, :selection], nil)
       |> BounceDecision.rebuild_indexes()
 
-    {:ok, store} = Store.commit(store, legacy, %{person: "person-a", actor: "fixture", action: "legacy"})
+    touched = MapSet.new([{:row, :bounce_revisions, key}])
+    {:ok, store} = Store.commit(store, {legacy, touched}, %{person: "person-a", actor: "fixture", action: "legacy"})
     :ok = Store.close(store)
 
     original = File.read!(path)

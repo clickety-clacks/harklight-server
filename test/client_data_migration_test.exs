@@ -81,8 +81,8 @@ defmodule AttentionServer.ClientDataMigrationTest do
 
     assert {:ok, relay} = Relay.start_link(store_path: path)
     restarted = :sys.get_state(relay).store
-    assert restarted.version == converted.version
-    assert {:ok, ^next_head} = ChangeLog.head(restarted, "A")
+    assert {:ok, rows, false, _} = ChangeLog.read(restarted, "A", next_head, 100)
+    refute Enum.any?(rows, &match?(%{kind: :entry, resource_id: ^target}, &1))
 
     assert {:ok, with_receipt, _} =
              Engine.origin_ack2(restarted.engine, "origin", @discussion_feed_seq, %{
@@ -111,13 +111,19 @@ defmodule AttentionServer.ClientDataMigrationTest do
     assert {:ok, [["retained_client_data_v1"]]} =
              RecordTable.select(converted.db, "SELECT name FROM relay_data_migrations")
 
-    version = converted.version
+    [{seq, entry}] =
+      for {{"A", seq}, %{payload: %{"receipt_expected" => false}} = entry} <-
+            converted.engine.conversation_events,
+          do: {seq, entry}
+
+    target = ChangeLog.entry_resource(seq)
     assert :ok = Store.close(converted)
 
     assert {:ok, relay} = Relay.start_link(store_path: path)
     restarted = :sys.get_state(relay).store
-    assert restarted.version == version
-    assert {:ok, ^head} = ChangeLog.head(restarted, "A")
+    assert restarted.engine.conversation_events[{"A", seq}] == entry
+    assert {:ok, rows, false, _} = ChangeLog.read(restarted, "A", head, 100)
+    refute Enum.any?(rows, &match?(%{kind: :entry, resource_id: ^target}, &1))
     GenServer.stop(relay)
   end
 

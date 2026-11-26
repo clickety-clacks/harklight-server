@@ -115,7 +115,7 @@ defmodule AttentionServer.Store.KeyedIncrementalValidationTest do
     address = {:row, :item_availability, @m1}
     touched = MapSet.new([address])
 
-    valid = put_in(store.engine.item_availability[@m1], {"not_listening", nil})
+    valid = Engine.put_row(store.engine, :item_availability, @m1, {"not_listening", nil})
     assert :ok = KeyedValidation.preflight(store.engine, valid, touched)
     assert :ok = Store.incremental_verdict(store, valid, touched)
 
