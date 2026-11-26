@@ -793,7 +793,7 @@ defmodule AttentionServer.BounceDecision do
     do: MapSet.member?(engine.opened_revisions, Tuple.insert_at(key, tuple_size(key), sub))
 
   defp legacy_feed?(engine, {person, _, _}, record),
-    do: Map.has_key?(engine.origin_sessions, {person, record.origin, record.session_handle})
+    do: Map.has_key?(engine.origin_sessions, {person, record.origin, Map.get(record, :session_handle)})
 
   defp append_item_advisory(engine, key, record, state, sub, revision, selection, now_ms, kind) do
     opened = kind == "soft_bounce"
@@ -1475,10 +1475,9 @@ defmodule AttentionServer.BounceDecision do
   def valid_revision_state?(engine, {person, sender, message_id} = key, state) do
     record = Map.get(engine.messages, key)
 
-    map_size_ok =
-      match?(%{revision: revision} when is_integer(revision) and revision > 0, record)
+    raw_count = if is_map(record), do: Map.get(record, :revision, 1)
 
-    map_size_ok and Map.has_key?(engine.persons, person) and Message.sender_id?(sender) and
+    is_integer(raw_count) and raw_count > 0 and Map.has_key?(engine.persons, person) and Message.sender_id?(sender) and
       is_binary(message_id) and message_id != "" and is_map(state) and
       Map.keys(state) |> Enum.sort() ==
         [:current_substantive_revision, :raw_to_substantive, :revisions] and
@@ -1486,12 +1485,12 @@ defmodule AttentionServer.BounceDecision do
       state.current_substantive_revision > 0 and
       state.current_substantive_revision <= map_size(state.revisions) and
       is_map(state.raw_to_substantive) and is_map(state.revisions) and
-      map_size(state.raw_to_substantive) == record.revision and
-      Enum.all?(1..record.revision, fn raw_revision ->
+      map_size(state.raw_to_substantive) == raw_count and
+      Enum.all?(1..raw_count, fn raw_revision ->
         sub_revision = Map.get(state.raw_to_substantive, raw_revision)
         is_integer(sub_revision) and Map.has_key?(state.revisions, sub_revision)
       end) and
-      Map.get(state.raw_to_substantive, record.revision) == state.current_substantive_revision and
+      Map.get(state.raw_to_substantive, raw_count) == state.current_substantive_revision and
       Enum.all?(state.revisions, fn {sub_revision, revision} ->
         is_integer(sub_revision) and sub_revision > 0 and is_map(revision) and
           Map.keys(revision) |> Enum.sort() == [

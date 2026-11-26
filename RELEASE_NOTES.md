@@ -1,3 +1,13 @@
+# Harklight Server v0.2.28
+
+Stopped FORMAT30 conversion now accepts historical messages whose records omit
+a session handle or explicit first revision. These messages stay sessionless
+after conversion. The store format remains FORMAT31.
+
+**Compatibility.** Harklight Server 0.2.28 speaks only protocol 0.2 and
+bundles Harklight Web 0.2.6. Use an iPhone app build that reads
+`receipt_expected`. Harklight Agent 0.2.6 and 0.2.7 remain compatible.
+
 # Harklight Server v0.2.27
 
 The stopped-store converter accepts more allocated upload data in the
