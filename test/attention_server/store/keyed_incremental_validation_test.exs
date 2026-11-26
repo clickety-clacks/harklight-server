@@ -111,6 +111,22 @@ defmodule AttentionServer.Store.KeyedIncrementalValidationTest do
     assert {:ok, _} = Store.commit(store, {next, touched}, audit())
   end
 
+  test "item availability uses the per-row validator", %{store: store} do
+    address = {:row, :item_availability, @m1}
+    touched = MapSet.new([address])
+
+    valid = put_in(store.engine.item_availability[@m1], {"not_listening", nil})
+    assert :ok = KeyedValidation.preflight(store.engine, valid, touched)
+    assert :ok = Store.incremental_verdict(store, valid, touched)
+
+    invalid = put_in(valid.item_availability[@m1], {"other", nil})
+    assert {:error, {:address, ^address}} = Store.incremental_verdict(store, invalid, touched)
+
+    no_session = put_in(valid.messages[@m1].session_handle, nil)
+    message_touched = MapSet.new([{:row, :messages, @m1}])
+    assert {:error, {:address, ^address}} = Store.incremental_verdict(%{store | engine: valid}, no_session, message_touched)
+  end
+
   describe "scalar fields" do
     test "#1 relay instance id", %{store: store} do
       refuse(store, &%{&1 | relay_instance_id: "xyz"}, {:address, {:field, :relay_instance_id}})
