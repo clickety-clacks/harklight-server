@@ -1,3 +1,63 @@
+# Harklight Server v0.2.34
+
+A sender can address one message and one Chat to several named people in the
+same organization. Each person keeps their own attention and reminders.
+Participants can see who opened the current revision and who answered.
+The first answer counts by default. A sender can designate one person to
+answer a decision while the other participants can still contribute to Chat.
+
+Self-hosted people can manage named groups, accept invitations, mute group
+notifications and leave. Agents with existing send rights can address groups
+in their organization. New members see the current message and earlier
+Chat in open conversations. Departing members retain read-only history
+through the time they left.
+
+## Enable people and groups
+
+Both features are off by default. Add the following to the self-hosted
+Server's private `server.env` and restart the Server:
+
+```sh
+export ATTENTION_SERVER_SHARED_MESSAGES=1
+export ATTENTION_SERVER_GROUPS=1
+```
+
+Use just `export ATTENTION_SERVER_SHARED_MESSAGES=1` to enable shared messages
+to named people. On first enablement the existing local owners form the
+default organization. Later owner changes to affiliation persist. With both
+settings unset, individual sends, Chat, replies, reminders and bounces
+continue as before. Installation leaves the private settings in place.
+
+## Upgrade to FORMAT32
+
+FORMAT32 applies with the features off or on. The packaged installer stops
+the Server and takes a full backup of its private root, including the
+checkpointed database and matching uploads, before conversion. The one-time
+FORMAT31 conversion updates the format marker in one transaction and keeps
+the stored rows and feed positions.
+
+The packaged rehearsal started with published v0.2.33 and verified retained
+messages, S1 sign-in state, a saved write receipt and backup restoration.
+The stopped converter took about half a second on a one-message rehearsal
+store, including command startup. The measurement excludes backup and restart. Larger installations can
+take a different amount of time.
+
+## Roll back
+
+The previous release refuses a FORMAT32 store. To return to it, stop the
+Server, restore the full pre-upgrade backup with its matching uploads,
+configuration and launcher, and start the previous release. Restoring the
+backup discards all later writes. Messages and notifications already
+delivered remain delivered.
+
+**Compatibility.** Protocol 0.2. Harklight Agent 0.2.9 and later can use
+the shared send options on Servers that advertise support. Compatible iPhone
+app builds use feature discovery to show shared messages. Bundled Harklight
+Web 0.2.7 can display named shared messages when the Server advertises them.
+Clients without shared-message support continue to receive individual
+messages. Hosted keeps groups off until its Terms and Privacy text is
+updated and the Hosted rollout enables groups.
+
 # Harklight Server v0.2.33
 
 With S1 active, an account owner can again enroll a new full Agent using the

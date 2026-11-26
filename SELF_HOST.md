@@ -1,6 +1,6 @@
 # Harklight Server self-hosted installation
 
-Version: **0.2.33**. Package target: **Linux x86_64, glibc 2.39 or newer**, with OpenSSL 3 shared libraries and libstdc++6 (built on Ubuntu 24.04). The package bundles
+Version: **0.2.34**. Package target: **Linux x86_64, glibc 2.39 or newer**, with OpenSSL 3 shared libraries and libstdc++6 (built on Ubuntu 24.04). The package bundles
 Erlang/OTP and Elixir bytecode; users need no Mix, Hex, source checkout or
 Erlang installation. It needs Bash, OpenSSL CLI, tar and the platform libraries
 listed in BUILD_INFO. This is a single-process self-hosted server cut.
@@ -25,9 +25,9 @@ the request; a valid current-revision answer commits a payload-free
 
 ## Download and verify
 
-After publication, download the v0.2.33 release from
-clickety-clacks/harklight-server, tag v0.2.33. Get
-harklight-server-0.2.33-linux-x86_64.tar.gz, SHA256SUMS and SELF_HOST.md from
+After publication, download the v0.2.34 release from
+clickety-clacks/harklight-server, tag v0.2.34. Get
+harklight-server-0.2.34-linux-x86_64.tar.gz, SHA256SUMS and SELF_HOST.md from
 that release. Run sha256sum -c SHA256SUMS and extract into an operator-owned
 versioned directory. BUILD_INFO identifies the source commit, build host,
 toolchain, source status and native dependencies.
@@ -40,7 +40,7 @@ runtime/dependency notices remain in their shipped distribution files.
 Choose the DNS hostname clients will validate. For a same-machine preview,
 localhost works. Install into a directory you own and run:
 
-    PACKAGE="$PWD/harklight-server-0.2.33-linux-x86_64"
+    PACKAGE="$PWD/harklight-server-0.2.34-linux-x86_64"
     STATE="$HOME/.local/share/harklight-server"
     "$PACKAGE/bin/harklight-bootstrap" "$STATE" localhost
     cat "$STATE/person-id"
@@ -143,10 +143,11 @@ set the device port with `--device-port` or `HARKLIGHT_DEVICE_PORT` when needed.
 New enrollments save the port.
 
 `ATTENTION_SERVER_DEPLOYMENT_MODE` defaults to `self_hosted`.
-Shared messaging is off by default. A self-hosted operator can enable it with
-`ATTENTION_SERVER_SHARED_MESSAGES=1` and can also enable groups with
-`ATTENTION_SERVER_GROUPS=1`. On first enablement, existing local owners form
-the default organization. Later owner-tool changes to affiliation persist.
+Shared messaging is off by default. In the private `server.env`, add
+`export ATTENTION_SERVER_SHARED_MESSAGES=1` to enable it and
+`export ATTENTION_SERVER_GROUPS=1` to enable groups as well. On first
+enablement, existing local owners form the default organization. Later
+owner-tool changes to affiliation persist.
 Hosted groups remain off until the Hosted component enables them after
 business membership and consent are ready.
 `ATTENTION_SERVER_UPLOAD_CAP_BYTES` defaults to `none` for self-hosting or may be
@@ -219,7 +220,7 @@ S1 is off by default. Before the first activation on a self-hosted Server:
 2. Stop the Server and make a complete private backup of the stopped,
    checkpointed database, uploads, configuration and keys. Keep the backup
    outside the writable state directory. The managed installer takes a
-   stopped backup before switching a package. If you installed 0.2.33 earlier
+   stopped backup before switching a package. If you installed 0.2.34 earlier
    with S1 off, take a fresh stopped backup before enabling S1. That captures
    the writes made since installation.
 3. Edit the private `server.env`. Set the exact trusted HTTPS origin, including
@@ -239,7 +240,7 @@ S1 is off by default. Before the first activation on a self-hosted Server:
    outside isolated App passkey acceptance.
 4. Start through the managed launcher. Use the packaged installer if switching
    releases. The first S1 start records the roster and auth generation 1 in
-   the existing FORMAT31 database. Later starts use the recorded roster.
+   the existing database. Later starts use the recorded roster.
    Removing the activation setting after that start leaves S1 active.
 
 Use the existing owner TLS connection to run `harklight owner sign-in-code`
