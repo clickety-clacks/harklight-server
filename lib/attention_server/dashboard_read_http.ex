@@ -1149,10 +1149,12 @@ defmodule AttentionServer.DashboardReadHTTP do
   defp sign_in_get(conn, opts) do
     if local_code_available?(opts) do
       {:ok, methods} = backend_call(opts.backend, :local_methods, nil)
+      conn = fetch_query_params(conn)
+      signed_out? = conn.query_params["signed_out"] == "1"
 
       conn
       |> put_resp_content_type("text/html", "utf-8")
-      |> send_resp(200, LocalSignInPage.html("passkey" in methods))
+      |> send_resp(200, LocalSignInPage.html("passkey" in methods, signed_out?))
     else
       sign_in_page(conn, opts)
     end

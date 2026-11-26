@@ -8,6 +8,30 @@ defmodule AttentionServer.NativeSignInTest do
 
   @moduletag :tmp_dir
 
+  test "active self-hosted sign-in displays the signed-out status only on the signed-out landing",
+       %{tmp_dir: dir} do
+    origin = "https://local.example.test"
+    path = Path.join(dir, "signed-out.sqlite3")
+    {:ok, store} = Store.open_relay(path)
+    assert {:ok, %{minimum_generation: 1}} = AuthSchema.initialize(store.db)
+    :ok = Store.close(store)
+
+    {:ok, relay} = Relay.start_link(store_path: path, dashboard_origin: origin)
+    {_browser, dashboard, _router} = local_routes(relay, nil, origin)
+
+    for {path, status} <- [
+          {"/sign-in", ""},
+          {"/sign-in?signed_out=1", "You are signed out."}
+        ] do
+      request = %{Plug.Test.conn(:get, path) | scheme: :https, port: 443}
+      response = DashboardReadHTTP.call(request, dashboard)
+
+      assert response.status == 200
+      assert response.resp_body =~ ~s(<p id="sign-in-status" role="status">#{status}</p>)
+      assert response.resp_body =~ ~s(id="owner-code")
+    end
+  end
+
   test "Hosted native sign-in forwards the transaction to the issuer and keeps the browser overlap",
        %{tmp_dir: dir} do
     path = Path.join(dir, "hosted-entry.sqlite3")

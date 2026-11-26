@@ -3,7 +3,9 @@ defmodule AttentionServer.LocalSignInPage do
 
   alias AttentionServer.DashboardBrand
 
-  def html(native_passkeys?) do
+  def html(native_passkeys?, signed_out?) do
+    status = if signed_out?, do: "You are signed out.", else: ""
+
     """
     <!doctype html>
     <html lang="en">
@@ -39,7 +41,7 @@ defmodule AttentionServer.LocalSignInPage do
             <button type="button" id="use-preference">Use my remembered preference</button>
           </div>
         </form>
-        <p id="sign-in-status" role="status"></p>
+        <p id="sign-in-status" role="status">#{status}</p>
         <noscript>Enable JavaScript to sign in.</noscript>
       </main>
       <script src="/sign-in/code.js" defer></script>

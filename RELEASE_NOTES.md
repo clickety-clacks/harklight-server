@@ -12,6 +12,8 @@ A Hosted browser sign-in transaction can create one Server session. Once a
 grant is redeemed, the Server refuses further grants and redemptions for
 that transaction.
 
+On self-hosted servers, `/sign-in?signed_out=1` shows the signed-out confirmation again.
+
 The release keeps FORMAT31 and auth generation 1. Follow the S1 backup and
 recovery steps below, including a stopped backup before first activation.
 
