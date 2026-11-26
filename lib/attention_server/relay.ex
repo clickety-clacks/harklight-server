@@ -30,6 +30,7 @@ defmodule AttentionServer.Relay do
     DeviceIdentity,
     Engine,
     Message,
+    NativeSignIn,
     JevClient,
     JevRanking,
     Placement,
@@ -265,6 +266,12 @@ defmodule AttentionServer.Relay do
 
   def redeem_hosted_browser_grant(server, grant, transaction),
     do: GenServer.call(server, {:redeem_hosted_browser_grant, grant, transaction}, :infinity)
+
+  def create_native_transaction(server, verifier_hash),
+    do: GenServer.call(server, {:create_native_transaction, verifier_hash}, :infinity)
+
+  def authorize_hosted_native_transaction(server, person, transaction, method),
+    do: GenServer.call(server, {:authorize_hosted_native_transaction, person, transaction, method}, :infinity)
 
   def owner_invite_create(server, person, owner_key),
     do: GenServer.call(server, {:owner_invite_create, person, owner_key}, :infinity)
@@ -1407,6 +1414,29 @@ defmodule AttentionServer.Relay do
       {:error, _, _} -> {:reply, {:error, :storage_unavailable}, state}
       _ -> {:reply, {:error, :not_created}, state}
     end
+  end
+
+  defp dispatch_call({:create_native_transaction, verifier_hash}, _from, state) do
+    result =
+      case state.store do
+        %{auth_schema: %{}, db: db} -> NativeSignIn.begin(db, verifier_hash, state.clock.())
+        _ -> {:error, :disabled}
+      end
+
+    {:reply, result, state}
+  end
+
+  defp dispatch_call({:authorize_hosted_native_transaction, person, transaction, method}, _from, state) do
+    result =
+      with %{auth_schema: %{}, db: db, engine: engine} <- state.store,
+           {:ok, _record} <- hosted_record(engine, person) do
+        NativeSignIn.authorize_hosted(db, transaction, person, method, state.clock.())
+      else
+        %Store{auth_schema: nil} -> {:error, :disabled}
+        error -> error
+      end
+
+    {:reply, result, state}
   end
 
   defp dispatch_call({:hosted_browser_grant, person, transaction, method}, _from, state) do

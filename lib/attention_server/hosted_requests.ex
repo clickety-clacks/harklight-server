@@ -63,6 +63,21 @@ defmodule AttentionServer.HostedRequests do
     end
   end
 
+  defp create_session_grant(
+         conn,
+         %{"purpose" => "app", "person_id" => person, "transaction" => transaction, "method" => method},
+         opts
+       ) do
+    case Relay.authorize_hosted_native_transaction(opts.relay, person, transaction, method) do
+      {:ok, reference} -> json(conn, 200, %{"transaction" => reference})
+      {:error, :invalid_request} -> json(conn, 400, %{"error" => "invalid_request"})
+      {:error, :invalid_sign_in} -> json(conn, 401, %{"error" => "unauthorized"})
+      {:error, :not_hosted} -> json(conn, 404, %{"error" => "unknown_person"})
+      {:error, :disabled} -> send_resp(conn, 404, "")
+      _ -> json(conn, 503, %{"error" => "storage_unavailable"})
+    end
+  end
+
   defp create_session_grant(conn, _, _opts), do: json(conn, 400, %{"error" => "invalid_request"})
 
   defp redeem_session_grant(conn, %{"grant" => grant, "transaction" => transaction}, opts) do

@@ -3,6 +3,7 @@ defmodule AttentionServer.Store.AuthSchema do
 
   alias AttentionServer.BrowserAuth
   alias AttentionServer.ClientAPI.Idempotency
+  alias AttentionServer.NativeSignIn
   alias AttentionServer.Store.RecordTable
   alias Exqlite.Sqlite3
 
@@ -47,6 +48,7 @@ defmodule AttentionServer.Store.AuthSchema do
     with :ok <- Sqlite3.execute(db, @schema),
          :ok <- Idempotency.retain_person_receipts(db),
          :ok <- BrowserAuth.create_tables(db),
+         :ok <- NativeSignIn.create_tables(db),
          :ok <-
            RecordTable.run(
              db,
