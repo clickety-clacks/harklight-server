@@ -65,4 +65,27 @@ defmodule AttentionServer.SignInActivationTest do
     assert {:error, :not_found} = Relay.device_remove(denied, @overlap)
     refute Relay.legacy_device_enrollment?(denied)
   end
+
+  test "the in-place FORMAT31 conversion retains the auth generation and person receipts",
+       %{tmp_dir: dir} do
+    path = Path.join(dir, "converted.sqlite3")
+    {:ok, store} = Store.open(path, :snapshot)
+    {:ok, engine} = Engine.operator_bootstrap(store.engine, @person, @owner)
+    {:ok, engine} = Engine.setup_device(engine, @person, @overlap)
+    {:ok, store} = Store.commit(store, engine, %{person: @person, actor: @owner, action: "fixture"})
+    receipt_store = %{store | change_log: true}
+    idem = AttentionServer.ClientAPI.Idempotency
+    assert :ok = idem.save(receipt_store, @person, "old-key", "digest", 200, %{"settings" => true})
+    assert {:ok, %{minimum_generation: 1}} = AuthSchema.initialize(store.db, store.engine, [@overlap])
+    assert :ok = Sqlite3.execute(store.db, "UPDATE harklight_auth_schema SET device_certificates_disabled = 1")
+    :ok = Store.close(store)
+
+    {:ok, converted} = Store.open(path, :keyed_cutover)
+    assert converted.mode == :keyed
+    assert converted.auth_schema == %{minimum_generation: 1, device_certificates_disabled: true}
+    assert {:ok, %{digest: "digest", status: 200}} = idem.lookup_retained(converted.db, @person, "old-key")
+    assert {:ok, @person, "legacy"} = AttentionServer.DeviceMigration.phase(converted.db, @overlap)
+    :ok = Store.close(converted)
+  end
+
 end
