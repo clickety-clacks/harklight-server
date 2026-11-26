@@ -50,11 +50,18 @@ defmodule AttentionServer.BrowserAuth do
              """
              INSERT INTO harklight_browser_grants
                (grant_hash, transaction_id, person_id, owner_key, owner_revision, method, expires_ms)
-             VALUES (?, ?, ?, ?, ?, ?, ?)
+             SELECT ?, ?, ?, ?, ?, ?, ?
+             WHERE NOT EXISTS (
+               SELECT 1 FROM harklight_browser_grants WHERE transaction_id = ? AND expires_ms = 0
+             )
              """,
-             [grant_hash, transaction, person, key, revision, method, now + @grant_lifetime_ms]
-           ) do
+             [grant_hash, transaction, person, key, revision, method, now + @grant_lifetime_ms, transaction]
+           ),
+         {:ok, 1} <- Sqlite3.changes(db) do
       {:ok, grant}
+    else
+      {:ok, 0} -> {:error, :invalid_sign_in}
+      error -> error
     end
   end
 
@@ -72,11 +79,14 @@ defmodule AttentionServer.BrowserAuth do
                SELECT person_id, owner_key, owner_revision, method
                FROM harklight_browser_grants
                WHERE grant_hash = ? AND transaction_id = ? AND expires_ms > ?
+                 AND NOT EXISTS (
+                   SELECT 1 FROM harklight_browser_grants WHERE transaction_id = ? AND expires_ms = 0
+                 )
                """,
-               [grant_hash, transaction, now]
+               [grant_hash, transaction, now, transaction]
              ),
            {:ok, ^revision} <- AttentionServer.Engine.owner_revision(engine, person, key),
-           :ok <- RecordTable.run(db, "DELETE FROM harklight_browser_grants WHERE grant_hash = ?", [grant_hash]) do
+           :ok <- consume_transaction(db, transaction, grant_hash) do
         cookie = new_secret()
 
         with :ok <- add_session(db, hash(cookie), person, key, revision, "hosted"),
@@ -90,6 +100,22 @@ defmodule AttentionServer.BrowserAuth do
   end
 
   def redeem_hosted(_, _, _, _, _), do: {:error, :invalid_sign_in}
+
+  # Keep one durable spent reference and retire any grants issued before it was used.
+  defp consume_transaction(db, transaction, grant_hash) do
+    with :ok <-
+           RecordTable.run(
+             db,
+             "UPDATE harklight_browser_grants SET expires_ms = 0 WHERE grant_hash = ?",
+             [grant_hash]
+           ) do
+      RecordTable.run(
+        db,
+        "DELETE FROM harklight_browser_grants WHERE transaction_id = ? AND grant_hash != ?",
+        [transaction, grant_hash]
+      )
+    end
+  end
 
   # The caller may compose session issuance with relay changes in the same transaction.
   def add_session(db, hash, person, key, revision, issuer) do

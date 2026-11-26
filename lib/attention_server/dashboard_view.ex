@@ -29,13 +29,16 @@ defmodule AttentionServer.DashboardView do
           ~s(<section><h2>Devices</h2><table><thead><tr><th>Device</th><th>Person</th><th>Status</th><th>Connection</th><th>Action</th></tr></thead><tbody>#{rows}</tbody></table><p class="note">Enrolled means the device's key was approved. It does not say whether the device is reachable. Connection is unknown until the server has a supported presence reading.</p></section>)
       end
 
+    agent_only? = Keyword.get(chrome, :agent_enrollment_only, false)
+    invitation_label = if agent_only?, do: "Create Agent invitation", else: "Create invitation"
+
     invitation_action =
       if is_binary(new_request_id) do
         ~s(<p>This browser cannot recover an earlier invitation because its request identity is missing. Another invitation could leave an earlier link active. Create a new invitation only if needed.</p>) <>
-          new_invitation_form(new_request_id, "Create a new invitation")
+          new_invitation_form(new_request_id, if(agent_only?, do: invitation_label, else: "Create a new invitation"))
       else
-        ~s(<p>If the last response was lost, Create invitation retrieves that same link while it is unused and active.</p>) <>
-          invitation_form("Create invitation")
+        ~s(<p>If the last response was lost, #{invitation_label} retrieves that same link while it is unused and active.</p>) <>
+          invitation_form(invitation_label)
       end
 
     sign_in_action =
@@ -206,9 +209,12 @@ defmodule AttentionServer.DashboardView do
     label = escape(request[:label] || "New device")
     escaped_code = escape(code)
     escaped_key = escape(key)
+    agent_only? = Keyword.get(chrome, :agent_enrollment_only, false)
+    heading = if agent_only?, do: "Approve this Agent?", else: "Approve this device?"
+    approval = if agent_only?, do: "Approve this exact Agent", else: "Approve this exact device"
 
     body =
-      ~s(<h1>Approve this device?</h1>) <>
+      ~s(<h1>#{heading}</h1>) <>
         ~s(<section><p>Device: #{label}</p><p>Joins as: #{escape(person)}</p><p>Code on device: <strong>#{escaped_code}</strong></p>#{closes(deadline)}<details><summary>Exact device key</summary><code>#{escaped_key}</code></details></section>) <>
         ~s(<section>) <>
         action_form(
@@ -216,8 +222,8 @@ defmodule AttentionServer.DashboardView do
           "approve",
           key,
           deadline,
-          "Approve this exact device",
-          true
+          approval,
+          if(agent_only?, do: :required, else: :optional)
         ) <>
         action_form(code, "decline", key, deadline, "Decline") <>
         ~s(</section><p><a href="/devices">Back to devices</a></p>)
@@ -237,10 +243,12 @@ defmodule AttentionServer.DashboardView do
     layout(person, "Remove device", body, chrome)
   end
 
-  defp action_form(code, action, key, deadline, label, grant_senders? \\ false) do
+  defp action_form(code, action, key, deadline, label, sender_requirement \\ nil) do
     sender_field =
-      if grant_senders? do
-        ~s|<label for="senders">Sender IDs (optional, comma-separated)</label><input id="senders" name="senders" type="text" autocomplete="off" placeholder="app:agent/"><p>The approved device may send as these IDs. An ID ending in / covers every ID that begins with it.</p>|
+      if sender_requirement do
+        required = if sender_requirement == :required, do: " required", else: ""
+        qualifier = if sender_requirement == :required, do: "required", else: "optional"
+        ~s|<label for="senders">Sender IDs (#{qualifier}, comma-separated)</label><input id="senders" name="senders" type="text" autocomplete="off" placeholder="app:agent/"#{required}><p>The approved device may send as these IDs. An ID ending in / covers every ID that begins with it.</p>|
       else
         ""
       end
