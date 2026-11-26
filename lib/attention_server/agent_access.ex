@@ -6,13 +6,17 @@ defmodule AttentionServer.AgentAccess do
 
   alias AttentionServer.{JSON, LargeData, Message}
 
+  @hosted_notice_sender Message.hosted_notice_sender()
+
   def valid_patterns?(patterns) do
     is_list(patterns) and length(patterns) <= 100 and
       length(Enum.uniq(patterns)) == length(patterns) and
       Enum.all?(patterns, fn pattern ->
-        is_binary(pattern) and Message.sender_id?(pattern)
+        Message.sender_id?(pattern) and pattern != @hosted_notice_sender
       end)
   end
+
+  def allowed?(_patterns, @hosted_notice_sender), do: false
 
   def allowed?(patterns, sender) when is_binary(sender) do
     Enum.any?(patterns, fn pattern ->

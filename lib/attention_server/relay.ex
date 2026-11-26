@@ -277,6 +277,9 @@ defmodule AttentionServer.Relay do
   def hosted_sign_in_create(server, person, label),
     do: GenServer.call(server, {:hosted_sign_in_create, person, label}, :infinity)
 
+  def hosted_notice(server, person, request),
+    do: GenServer.call(server, {:hosted_notice, person, request}, :infinity)
+
   def hosted_set_algorithm(server, person, algorithm),
     do: GenServer.call(server, {:hosted_set_algorithm, person, algorithm}, :infinity)
 
@@ -1317,6 +1320,29 @@ defmodule AttentionServer.Relay do
       _ -> {:reply, {:error, :not_hosted}, state}
     end
   end
+
+  defp dispatch_call({:hosted_notice, person, request}, _from, %{deployment_mode: :saas} = state) do
+    case Engine.hosted_notice(state.store.engine, person, request, state.clock.()) do
+      {:ok, next, %{created: true} = result} ->
+        case commit(state.store, next, %{
+               person: person,
+               actor: "hosted_component",
+               action: "hosted_notice"
+             }) do
+          {:ok, store} -> {:reply, {:ok, result}, %{state | store: store}}
+          {:error, _, _} -> {:reply, {:error, :storage_unavailable}, state}
+        end
+
+      {:ok, _engine, duplicate} ->
+        {:reply, {:ok, duplicate}, state}
+
+      {:error, _} = error ->
+        {:reply, error, state}
+    end
+  end
+
+  defp dispatch_call({:hosted_notice, _person, _request}, _from, state),
+    do: {:reply, {:error, :unknown_person}, state}
 
   defp dispatch_call({:hosted_set_algorithm, person, algorithm}, _from, state) do
     case set_hosted_algorithm(state, person, algorithm) do

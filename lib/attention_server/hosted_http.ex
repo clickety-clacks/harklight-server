@@ -4,11 +4,9 @@ defmodule AttentionServer.HostedHTTP do
 
   It runs only in `saas` deployment mode on a port the operator pins, and is
   meant to be reached by the hosted component on the same machine; it carries
-  no credential of its own. Three bounded JSON posts exist: create or find the
-  person for an account, issue a sign-in link for that person, and put the one
-  designated test account into a named product state. Nothing here reads or
-  changes another person's data: every call acts through the server-held owner
-  key of the one hosted person it names.
+  no credential of its own. The hosted component can create accounts, issue
+  sign-in links, configure account state, and deliver an FYI to a local
+  person. The test reset is scoped to the designated test account.
   """
 
   use Supervisor
