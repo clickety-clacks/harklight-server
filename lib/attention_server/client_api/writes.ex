@@ -670,7 +670,41 @@ defmodule AttentionServer.ClientAPI.Writes do
 
   defp stored(_state, _person, nil, _digest, _who, _from), do: {:ok, nil}
 
-  defp stored(state, person, key, digest, who, from) do
+  defp stored(%{store: %{auth_schema: %{}, db: db}} = state, person, key, digest, who, from)
+       when not is_map(who) or not is_map_key(who, :kind) or who.kind != :agent do
+    case Idempotency.lookup_retained(db, person, key) do
+      {:ok, nil} ->
+        stored_recent(state, person, key, digest, who, from)
+
+      {:ok, %{digest: ^digest, status: status, body: encoded, original_response: original?}} ->
+        case JSON.decode_line(encoded <> "\n") do
+          {:ok, body} when is_map(body) ->
+            if original?, do: {:replay, status, body}, else: retained_replay(body, status, who, person, from, state)
+
+          _ ->
+            {:error, :storage_unavailable}
+        end
+
+      {:ok, _other} ->
+        {:error, :idempotency_conflict}
+
+      {:error, _} ->
+        {:error, :storage_unavailable}
+    end
+  end
+
+  defp stored(state, person, key, digest, who, from),
+    do: stored_recent(state, person, key, digest, who, from)
+
+  defp retained_replay(receipt, status, who, person, from, state) do
+    case Projection.capture(fn -> replay(receipt, who, person, from, state) end) do
+      {:ok, body} -> {:replay, status, body}
+      {:error, :idempotency_conflict} = error -> error
+      _ -> {:replay, 202, %{"code" => "accepted_reconcile"}}
+    end
+  end
+
+  defp stored_recent(state, person, key, digest, who, from) do
     case Idempotency.lookup(state.store, person, key) do
       {:ok, nil} ->
         {:ok, nil}
