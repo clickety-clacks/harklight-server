@@ -1,3 +1,40 @@
+# Harklight Server v0.2.25
+
+Bounces now work on every Server, with or without Jev ranking. In v0.2.24 a
+message got its bounce time only after Jev scored it, so with Jev off nothing
+bounced. Now every message gets its bounce time when it arrives, from the
+priority it already has: the sender's stated urgency, or Normal when missing.
+The account's own levels apply if set, otherwise Urgent 12 hours, High 1 day,
+Normal 3 days, Low 7 days. A later Jev score can change the level; the time is
+counted from arrival.
+
+On first start, open messages that have no bounce time yet get one, so a
+never-opened message already past its time bounces then. A message that was
+opened at any point only ever soft-bounces (the agent is told; it stays in the
+Inbox), however its time was set or moved.
+
+New setting `ATTENTION_SERVER_BOUNCE_NOT_BEFORE` (an RFC 3339 UTC time, for
+example `2026-11-17T14:16:54Z`): messages that arrived before it never get a
+bounce time, including on first start. Unset means no cutoff.
+
+New offline command `harklight operator bounce-preview --store PATH`: with the
+Server stopped, it counts how many open messages would fully bounce and how
+many would soft-bounce at first start, honouring the cutoff. It reads a
+temporary copy and never changes the store. See SELF_HOST.md.
+
+## Upgrade and recovery
+
+As in v0.2.21 through v0.2.24: FORMAT30 stores only, no new store change. Run
+`bounce-preview` before upgrading if you want to know what will bounce. Take a
+complete private backup before starting the new release. Returning to v0.2.23
+or earlier shows fully bounced messages as open again. To return to an earlier
+release, follow the rollback steps in SELF_HOST.md.
+
+**Compatibility.** Harklight Server 0.2.25 speaks only the 0.2 protocol and
+bundles Harklight Web 0.2.6. As with v0.2.21, install it together with an
+iPhone app build that reads `receipt_expected`. Harklight Agent 0.2.6 and 0.2.7
+work with it.
+
 # Harklight Server v0.2.24
 
 A message that is never opened now leaves the person's lists when its bounce
