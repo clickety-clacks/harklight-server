@@ -102,6 +102,25 @@ defmodule AttentionServer.ClientAPI.Auth do
     _ -> {:error, :unauthorized}
   end
 
+  def web(conn, backend, relay) do
+    conn = Plug.Conn.fetch_cookies(conn)
+    cookie = Map.get(conn.req_cookies, @cookie)
+
+    case {cookie, Plug.Conn.get_req_header(conn, "authorization")} do
+      {_, []} ->
+        browser(conn, backend)
+
+      {nil, ["Bearer " <> secret]} ->
+        with {:ok, %{device_id: device, person_id: person, hash: hash}} <-
+               Relay.native_session(relay, secret) do
+          {:ok, %Principal{kind: :device, key: device, person: person, session_id: hash}}
+        end
+
+      _ ->
+        {:error, :unauthorized}
+    end
+  end
+
   @doc """
   Whether a browser request may proceed past the origin check. Reads pass.
   Writes need the exact web origin (`expected_origin`, or the request's own

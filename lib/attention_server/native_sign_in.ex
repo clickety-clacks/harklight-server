@@ -1,7 +1,7 @@
 defmodule AttentionServer.NativeSignIn do
   @moduledoc false
 
-  alias AttentionServer.BrowserAuth
+  alias AttentionServer.{BrowserAuth, DeviceProof, Engine}
   alias AttentionServer.Store.RecordTable
   alias Exqlite.Sqlite3
 
@@ -15,16 +15,28 @@ defmodule AttentionServer.NativeSignIn do
     expires_ms INTEGER NOT NULL,
     person_id TEXT,
     method TEXT,
-    authorized_until_ms INTEGER
+    authorized_until_ms INTEGER,
+    redeemed_device TEXT,
+    redeemed_session TEXT,
+    redeemed_key TEXT,
+    redeemed_label TEXT
   );
   CREATE INDEX harklight_native_transactions_expiry
     ON harklight_native_transactions (expires_ms);
+  CREATE TABLE harklight_device_sessions (
+    session_hash TEXT PRIMARY KEY NOT NULL,
+    device_id TEXT NOT NULL UNIQUE,
+    person_id TEXT NOT NULL,
+    public_key TEXT NOT NULL,
+    signed_in_at_ms INTEGER NOT NULL,
+    pending INTEGER NOT NULL CHECK (pending IN (0, 1))
+  );
   """
 
   def create_tables(db), do: Sqlite3.execute(db, @schema)
 
   def begin(db, verifier_hash, now) do
-    if lowercase_hash?(verifier_hash) do
+    if DeviceProof.hash?(verifier_hash) do
       reference = BrowserAuth.new_secret()
 
       with :ok <-
@@ -32,7 +44,7 @@ defmodule AttentionServer.NativeSignIn do
                db,
                """
                DELETE FROM harklight_native_transactions
-               WHERE expires_ms <= ? AND COALESCE(authorized_until_ms, 0) <= ?
+               WHERE redeemed_device IS NULL AND expires_ms <= ? AND COALESCE(authorized_until_ms, 0) <= ?
                """,
                [now, now]
              ),
@@ -78,8 +90,130 @@ defmodule AttentionServer.NativeSignIn do
 
   defp authorize(_, _, _, _, _), do: {:error, :invalid_request}
 
-  defp lowercase_hash?(value) when is_binary(value) and byte_size(value) == 64,
-    do: match?({:ok, _}, Base.decode16(value, case: :lower))
+  def prepare_redemption(
+        db,
+        engine,
+        %{
+          "transaction" => reference,
+          "verifier" => verifier,
+          "public_key" => public_key,
+          "label" => label,
+          "session_hash" => session_hash,
+          "signature" => signature
+        },
+        now
+      ) do
+    with true <- DeviceProof.secret?(reference) and DeviceProof.secret?(verifier),
+         true <- DeviceProof.hash?(session_hash),
+         true <- is_binary(label) and String.valid?(label) and byte_size(label) in 1..160,
+         {:ok, key} <- DeviceProof.native_key(public_key) do
+      bytes = DeviceProof.sign_in_bytes(reference, session_hash)
 
-  defp lowercase_hash?(_), do: false
+      with true <- DeviceProof.verify(key, bytes, signature),
+           {:ok, [[person, method, expires, device, redeemed_hash, redeemed_key, redeemed_label]]} <-
+             RecordTable.select(
+               db,
+               """
+               SELECT person_id, method, authorized_until_ms, redeemed_device, redeemed_session,
+                      redeemed_key, redeemed_label
+               FROM harklight_native_transactions
+               WHERE transaction_id = ? AND verifier_hash = ? AND person_id IS NOT NULL
+               """,
+               [reference, DeviceProof.digest(verifier)]
+             ) do
+        if device do
+          duplicate(db, person, method, device, session_hash, public_key, label,
+            {redeemed_hash, redeemed_key, redeemed_label})
+        else
+          if expires > now,
+            do: prepare_device(engine, reference, person, method, session_hash, public_key, label, now),
+            else: {:error, :unauthorized}
+        end
+      else
+        false -> {:error, :unauthorized}
+        {:ok, []} -> {:error, :unauthorized}
+        error -> error
+      end
+    else
+      _ -> {:error, :invalid_request}
+    end
+  end
+
+  def prepare_redemption(_, _, _, _), do: {:error, :invalid_request}
+
+  defp duplicate(db, person, method, device, hash, key, label, {hash, key, label}) do
+    case lookup_session(db, hash) do
+      {:ok, %{device_id: ^device, person_id: ^person}} ->
+        {:ok, result(person, device, method, true)}
+
+      _ ->
+        {:error, :unauthorized}
+    end
+  end
+
+  defp duplicate(_, _, _, _, _, _, _, _), do: {:error, :unauthorized}
+
+  defp prepare_device(engine, transaction, person, method, hash, key, label, now) do
+    device = :crypto.strong_rand_bytes(32) |> Base.encode16(case: :lower)
+
+    with {:ok, next} <- Engine.setup_device(engine, person, device) do
+      next = Engine.put_row(next, :devices, device, %{next.devices[device] | label: label})
+      redemption = %{reference: transaction, person: person, device: device, hash: hash,
+                     key: key, label: label, now: now}
+      {:ok, next, redemption, result(person, device, method, false)}
+    end
+  end
+
+  defp result(person, device, method, duplicate),
+    do: %{"person_id" => person, "device_id" => device, "method" => method, "duplicate" => duplicate}
+
+  def commit_redemption(db, redemption) do
+    %{reference: transaction, person: person, device: device, hash: hash,
+      key: key, label: label, now: now} = redemption
+
+    with :ok <-
+           RecordTable.run(
+             db,
+             """
+             UPDATE harklight_native_transactions
+             SET redeemed_device = ?, redeemed_session = ?, redeemed_key = ?, redeemed_label = ?
+             WHERE transaction_id = ? AND redeemed_device IS NULL
+             """,
+             [device, hash, key, label, transaction]
+           ),
+         {:ok, 1} <- Sqlite3.changes(db) do
+      RecordTable.run(
+        db,
+        """
+        INSERT INTO harklight_device_sessions
+          (session_hash, device_id, person_id, public_key, signed_in_at_ms, pending)
+        VALUES (?, ?, ?, ?, ?, 0)
+        """,
+        [hash, device, person, key, now]
+      )
+    else
+      {:ok, 0} -> {:error, :unauthorized}
+      error -> error
+    end
+  end
+
+  def lookup_session(db, hash) do
+    with {:ok, rows} <-
+           RecordTable.select(
+             db,
+             """
+             SELECT device_id, person_id, public_key, pending FROM harklight_device_sessions
+             WHERE session_hash = ?
+             """,
+             [hash]
+           ) do
+      case rows do
+        [[device, person, key, pending]] ->
+          {:ok, %{device_id: device, person_id: person, public_key: key, pending: pending == 1}}
+
+        [] ->
+          {:error, :unauthorized}
+      end
+    end
+  end
 end

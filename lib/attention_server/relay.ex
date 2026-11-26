@@ -28,6 +28,7 @@ defmodule AttentionServer.Relay do
     DashboardInventory,
     Diagnostics,
     DeviceIdentity,
+    DeviceProof,
     Engine,
     Message,
     NativeSignIn,
@@ -269,6 +270,12 @@ defmodule AttentionServer.Relay do
 
   def create_native_transaction(server, verifier_hash),
     do: GenServer.call(server, {:create_native_transaction, verifier_hash}, :infinity)
+
+  def redeem_native_transaction(server, request),
+    do: GenServer.call(server, {:redeem_native_transaction, request}, :infinity)
+
+  def native_session(server, bearer),
+    do: GenServer.call(server, {:native_session, bearer}, :infinity)
 
   def authorize_hosted_native_transaction(server, person, transaction, method),
     do: GenServer.call(server, {:authorize_hosted_native_transaction, person, transaction, method}, :infinity)
@@ -1426,12 +1433,69 @@ defmodule AttentionServer.Relay do
     {:reply, result, state}
   end
 
-  defp dispatch_call({:authorize_hosted_native_transaction, person, transaction, method}, _from, state) do
+  defp dispatch_call({:redeem_native_transaction, request}, _from, state) do
+    case state.store do
+      %{auth_schema: %{}, db: db, engine: engine} ->
+        result =
+          if Map.has_key?(request, "old_proof") do
+            {:error, :invalid_request}
+          else
+            NativeSignIn.prepare_redemption(db, engine, request, state.clock.())
+          end
+
+        case result do
+          {:ok, next, redemption, response} ->
+            audit = %{
+              person: redemption.person,
+              actor: redemption.device,
+              action: "native_sign_in",
+              native_redemption: redemption
+            }
+
+            case commit(state.store, next, audit) do
+              {:ok, store} -> {:reply, {:ok, response}, %{state | store: store}}
+              _ -> {:reply, {:error, :storage_unavailable}, state}
+            end
+
+          {:ok, %{"person_id" => person, "device_id" => device} = response} ->
+            case Engine.authorized_person(engine, device) do
+              {:ok, ^person} -> {:reply, {:ok, response}, state}
+              _ -> {:reply, {:error, :unauthorized}, state}
+            end
+
+          error ->
+            {:reply, error, state}
+        end
+
+      _ ->
+        {:reply, {:error, :disabled}, state}
+    end
+  end
+
+  defp dispatch_call({:native_session, bearer}, _from, state) do
     result =
       with %{auth_schema: %{}, db: db, engine: engine} <- state.store,
+           true <- DeviceProof.secret?(bearer),
+           hash = DeviceProof.digest(bearer),
+           {:ok, %{device_id: device, person_id: person} = session} <-
+             NativeSignIn.lookup_session(db, hash),
+           {:ok, ^person} <- Engine.authorized_person(engine, device) do
+        {:ok, Map.put(session, :hash, hash)}
+      else
+        _ -> {:error, :unauthorized}
+      end
+
+    {:reply, result, state}
+  end
+
+  defp dispatch_call({:authorize_hosted_native_transaction, person, transaction, method}, _from, state) do
+    result =
+      with :saas <- state.deployment_mode,
+           %{auth_schema: %{}, db: db, engine: engine} <- state.store,
            {:ok, _record} <- hosted_record(engine, person) do
         NativeSignIn.authorize_hosted(db, transaction, person, method, state.clock.())
       else
+        :self_hosted -> {:error, :disabled}
         %Store{auth_schema: nil} -> {:error, :disabled}
         error -> error
       end
