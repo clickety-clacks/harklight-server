@@ -2,7 +2,7 @@ defmodule AttentionServer.SharedMessages do
   @moduledoc false
 
   alias AttentionServer.Engine
-  alias AttentionServer.ClientAPI.PeopleProfiles
+  alias AttentionServer.ClientAPI.{PeopleProfiles, SharedAttachments}
 
   def organizations(%Engine{} = engine, person) do
     hosted =
@@ -98,16 +98,17 @@ defmodule AttentionServer.SharedMessages do
     "shared_" <> Base.url_encode64(digest, padding: false)
   end
 
-  def revise(%Engine{} = engine, record, revision, message) do
+  def revise(%Engine{} = engine, record, revision, message, files) do
     with :ok <- writable_sender(record),
          true <- record.revision == revision || {:error, :precondition_failed} do
       history = Map.get(record, :history, %{})
-      previous = Map.take(record, [:revision, :message])
+      previous = Map.take(record, [:revision, :message]) |> Map.put(:files, Map.get(record, :files, []))
       updated =
         record
         |> Map.put(:history, Map.put(history, revision, previous))
         |> Map.put(:revision, revision + 1)
         |> Map.put(:message, message)
+        |> Map.put(:files, files)
 
       {:ok, Engine.put_row(engine, :shared_messages, record.id, updated)}
     end
@@ -405,7 +406,7 @@ defmodule AttentionServer.SharedMessages do
       "sender" => record.sender_id,
       "request_revision" => record.revision,
       "message" => record.message,
-      "files" => [],
+      "files" => SharedAttachments.wire(Map.get(record, :files, [])),
       "seen" => recipient.seen_revision == record.revision,
       "chat" => chat_state(engine, record, recipient, person),
       "rank" => %{"key" => recipient.item_id, "section" => if(not is_nil(frozen) or Map.has_key?(record, :terminal), do: "resolved", else: "current")},
@@ -470,11 +471,12 @@ defmodule AttentionServer.SharedMessages do
 
   def historical_record(record, revision) do
     historical = record |> Map.fetch!(:history) |> Map.fetch!(revision)
-    record |> Map.drop([:terminal]) |> Map.merge(historical)
+    record |> Map.drop([:terminal, :files]) |> Map.merge(historical)
   end
 
   def revision(record) do
-    %{"request_revision" => record.revision, "message" => record.message, "files" => []}
+    %{"request_revision" => record.revision, "message" => record.message,
+      "files" => SharedAttachments.wire(Map.get(record, :files, []))}
   end
 
   def sender_message(record, rev) do
@@ -488,7 +490,7 @@ defmodule AttentionServer.SharedMessages do
       "sender" => record.sender_id,
       "revision" => record.revision,
       "message" => record.message,
-      "files" => [],
+      "files" => SharedAttachments.wire(Map.get(record, :files, [])),
       "seen" => false,
       "shared" => %{
         "shared_id" => record.id,
@@ -525,7 +527,9 @@ defmodule AttentionServer.SharedMessages do
       }) do
     is_binary(id) and is_binary(organization) and Map.has_key?(engine.persons, person) and
       is_binary(key) and AttentionServer.Message.sender_id?(sender) and
-      is_map(message) and is_integer(revision) and revision > 0 and is_boolean(chat_open) and
+      is_map(message) and
+      Enum.all?(SharedAttachments.upload_ids(engine.shared_messages[id]), &Map.has_key?(engine.uploads, &1)) and
+      is_integer(revision) and revision > 0 and is_boolean(chat_open) and
       valid_policy?(policy)
   end
 

@@ -532,8 +532,14 @@ defmodule AttentionServer.Store.KeyedValidation do
           add_upload_links(index, {:origin_feed, scope, {:entry, seq}}, entry_upload_ids(entry))
       end
 
-    Enum.reduce(engine.messages, index, fn {key, record}, index ->
-      add_upload_links(index, {:row, :messages, key}, revision_upload_ids(record))
+    index =
+      Enum.reduce(engine.messages, index, fn {key, record}, index ->
+        add_upload_links(index, {:row, :messages, key}, revision_upload_ids(record))
+      end)
+
+    Enum.reduce(engine.shared_messages, index, fn {key, record}, index ->
+      ids = AttentionServer.ClientAPI.SharedAttachments.upload_ids(record)
+      add_upload_links(index, {:row, :shared_messages, key}, ids)
     end)
   end
 
@@ -551,6 +557,12 @@ defmodule AttentionServer.Store.KeyedValidation do
           before_ids = revision_upload_ids(Map.get(old.messages, key))
           after_ids = revision_upload_ids(Map.get(next.messages, key))
 
+          {update_upload_links(index, address, before_ids, after_ids),
+           MapSet.put(changed, address), uploads}
+
+        {:row, :shared_messages, key} = address, {index, changed, uploads} ->
+          before_ids = record_uploads(address, Map.get(old.shared_messages, key))
+          after_ids = record_uploads(address, Map.get(next.shared_messages, key))
           {update_upload_links(index, address, before_ids, after_ids),
            MapSet.put(changed, address), uploads}
 
@@ -583,6 +595,8 @@ defmodule AttentionServer.Store.KeyedValidation do
 
   def record_uploads({:origin_feed, _, {:entry, _}}, entry), do: entry_upload_ids(entry)
   def record_uploads({:row, :messages, _}, record), do: revision_upload_ids(record)
+  def record_uploads({:row, :shared_messages, _}, record),
+    do: AttentionServer.ClientAPI.SharedAttachments.upload_ids(record)
   def record_uploads(_, _), do: []
 
   defp entry_upload_ids(nil), do: []

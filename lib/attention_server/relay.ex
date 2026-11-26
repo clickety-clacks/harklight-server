@@ -4846,6 +4846,9 @@ defmodule AttentionServer.Relay do
     end
   end
 
+  @doc false
+  def refresh_shared_upload_index(state), do: %{state | upload_index: build_upload_index(state.store.engine)}
+
   defp build_upload_index(engine) do
     empty = %{
       references_by_person: %{},
@@ -4866,6 +4869,12 @@ defmodule AttentionServer.Relay do
           end)
 
         add_upload_references(index, person, ids)
+      end)
+
+    references =
+      Enum.reduce(engine.shared_messages, references, fn {_id, record}, index ->
+        ids = AttentionServer.ClientAPI.SharedAttachments.upload_ids(record)
+        add_upload_references(index, record.sender_person, ids)
       end)
 
     Enum.reduce(engine.uploads, references, fn {_id, upload}, index ->

@@ -16,6 +16,7 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
     Idempotency,
     Projection,
     Resources,
+    SharedAttachments,
     SharedCapability,
     SharedChat,
     Uploads,
@@ -85,7 +86,7 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
       ["shared_messages"] ->
         digest = write_digest(conn, get_req_header(conn, "if-match"), body)
 
-        case call(ctx, {:shared_send, ctx.principal, key, digest, body}) do
+        case send_with_files(ctx, key, digest, body) do
           {:shared_error, token, details} -> Errors.send_error(conn, token, details: details)
           result -> Writes.respond(conn, replay_success(ctx, result))
         end
@@ -140,6 +141,30 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
       {:error, token, field} -> Errors.send_error(conn, token, field: field)
     end
   end
+
+  defp send_with_files(ctx, key, digest, %{"file_ids" => [_ | _]} = body) do
+    request = {:prepare_shared_files, ctx.principal, key, digest, body}
+
+    case call(ctx, request) do
+      {:ok, dir, files} ->
+        case SharedAttachments.stage(dir, files) do
+          {:ok, staged} ->
+            try do
+              call(ctx, {:shared_send, ctx.principal, key, digest, body, staged})
+            after
+              SharedAttachments.discard(staged)
+            end
+
+          error -> refusal(error)
+        end
+
+      other ->
+        other
+    end
+  end
+
+  defp send_with_files(ctx, key, digest, body),
+    do: call(ctx, {:shared_send, ctx.principal, key, digest, body, []})
 
   defp write_digest(conn, precondition, body) do
     Idempotency.digest(conn.method, conn.path_info, %{"body" => body, "if_match" => precondition})
@@ -217,12 +242,37 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
   end
 
   @doc false
-  def handle_call({:shared_send, %{person: person, key: origin}, key, digest, body}, _from, state) do
+  def handle_call({:prepare_shared_files, %{person: person, key: origin}, key, digest, body}, _from, state) do
+    scope = {person, origin}
+    engine = state.store.engine
+
+    result =
+      with true <- state.shared_messages and state.store.mode == :keyed || {:error, :unsupported},
+           :ok <- authorize(state, scope, :send),
+           {:ok, nil} <- lookup(state, receipt_scope(scope), key),
+           :ok <- shared_send_fields(body),
+           {:ok, people, org} <- shared_recipients(body["recipients"]),
+           true <- Engine.shared_sender_allowed?(engine, person, origin, body["sender"]) ||
+                     {:error, :forbidden},
+           {:ok, _} <- SharedMessages.select_organization(engine, person, people, org),
+           {:ok, files} <- SharedAttachments.prepare(state.store, scope, body["file_ids"],
+             shared_id(scope, key), body["sender"], key, state.clock.()) do
+        {:ok, state.store.upload_dir, files}
+      else
+        {:ok, %{digest: ^digest, status: status, body: stored}} -> {:stored, status, stored}
+        {:ok, %{}} -> refusal({:error, :idempotency_conflict})
+        error -> shared_send_refusal(error)
+      end
+
+    {:reply, result, state}
+  end
+
+  def handle_call({:shared_send, %{person: person, key: origin}, key, digest, body, staged}, _from, state) do
     scope = {person, origin}
 
     if state.shared_messages and state.store.mode == :keyed do
       case authorize(state, scope, :send) do
-        :ok -> shared_send(state, scope, key, digest, body)
+        :ok -> shared_send(state, scope, key, digest, body, staged)
         error -> {:reply, refusal(error), state}
       end
     else
@@ -483,7 +533,7 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
       else: {:error, "invalid_field", nil}
   end
 
-  defp shared_send(state, scope, key, digest, body) do
+  defp shared_send(state, scope, key, digest, body, staged) do
     case lookup(state, receipt_scope(scope), key) do
       {:ok, %{digest: ^digest, status: status, body: stored}} ->
         {:reply, {:stored, status, stored}, state}
@@ -492,14 +542,14 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
         {:reply, refusal({:error, :idempotency_conflict}), state}
 
       {:ok, nil} ->
-        admit_shared_send(state, scope, key, digest, body)
+        admit_shared_send(state, scope, key, digest, body, staged)
 
       error ->
         {:reply, refusal(error), state}
     end
   end
 
-  defp admit_shared_send(state, {person, origin} = scope, key, digest, body) do
+  defp admit_shared_send(state, {person, origin} = scope, key, digest, body, staged) do
     engine = state.store.engine
     sender = body["sender"]
 
@@ -513,7 +563,8 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
          id <- shared_id(scope, key),
          message <- Map.merge(message, %{"sender_id" => sender, "message_id" => id}),
          :ok <- shared_content_valid(message) do
-      {message, _diagnostics} = Message.admit_answer_ui(message, [])
+      files = SharedAttachments.references(staged)
+      {message, _diagnostics} = Message.admit_answer_ui(message, Enum.map(files, & &1["name"]))
       attrs = %{
         :id => id,
         :sender_person => person,
@@ -521,12 +572,13 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
         :sender_id => sender,
         :message => message,
         :answer_policy => policy,
+        :files => files,
         "created_at_ms" => state.clock.()
       }
       attrs = Map.merge(attrs, Map.take(body, ["session"]))
       case SharedMessages.create(engine, attrs, people, org) do
         {:ok, next, _record, outcomes} ->
-          commit_shared_send(state, next, scope, key, digest, id, outcomes)
+          commit_shared_send(state, next, scope, key, digest, id, outcomes, staged)
 
         error ->
           {:reply, shared_send_refusal(error), state}
@@ -536,24 +588,35 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
     end
   end
 
-  defp commit_shared_send(state, transition, {person, origin} = scope, key, digest, id, outcomes) do
+  defp commit_shared_send(state, transition, {person, origin} = scope, key, digest, id, outcomes, staged) do
     audit = %{
       person: person, actor: origin, action: "shared_message_send",
       shared_send_receipt: {scope, key, digest, id, wire_outcomes(outcomes)}
     }
 
-    case Store.commit(state.store, transition, audit) do
-      {:ok, store} ->
-        reply =
-          case Idempotency.lookup(store, receipt_scope(scope), key) do
-            {:ok, %{body: body}} -> {:ok, 200, body, false}
-            _ -> refusal({:error, :storage_unavailable})
-          end
+    case SharedAttachments.publish(state.store, staged) do
+      {:ok, published} ->
+        transition = SharedAttachments.attach(transition, published)
 
-        {:reply, reply, %{state | store: store}}
+        case Store.commit(state.store, transition, audit) do
+          {:ok, store} ->
+            reply =
+              case Idempotency.lookup(store, receipt_scope(scope), key) do
+                {:ok, %{body: body}} -> {:ok, 200, body, false}
+                _ -> refusal({:error, :storage_unavailable})
+              end
 
-      _ ->
-        {:reply, refusal({:error, :storage_unavailable}), state}
+            next = %{state | store: store}
+            next = if published == [], do: next, else: Relay.refresh_shared_upload_index(next)
+            {:reply, reply, next}
+
+          _ ->
+            SharedAttachments.discard(published)
+            {:reply, refusal({:error, :storage_unavailable}), state}
+        end
+
+      error ->
+        {:reply, refusal(error), state}
     end
   end
 
@@ -587,8 +650,9 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
                    {:error, "invalid_field", "message_type"},
          message <- Map.merge(message, %{"sender_id" => record.sender_id, "message_id" => record.id}),
          :ok <- shared_content_valid(message) do
-      {message, _diagnostics} = Message.admit_answer_ui(message, [])
-      SharedMessages.revise(state.store.engine, record, record.revision, message)
+      files = if Map.has_key?(body, "file_ids"), do: [], else: Map.get(record, :files, [])
+      {message, _diagnostics} = Message.admit_answer_ui(message, Enum.map(files, & &1["name"]))
+      SharedMessages.revise(state.store.engine, record, record.revision, message, files)
     end
   end
 
@@ -605,11 +669,7 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
   defp shared_send_fields(body) do
     with :ok <- Writes.only_members(body, ~w(sender session message file_ids recipients answer_policy)),
          true <- Message.sender_id?(body["sender"]) || {:error, "invalid_field", "sender"},
-         :ok <- files(body) do
-      if Map.get(body, "file_ids", []) == [],
-        do: :ok,
-        else: {:error, "unsupported", "file_ids"}
-    end
+         do: files(body)
   end
 
   defp shared_recipients(%{"kind" => "people", "people" => people} = selector) do

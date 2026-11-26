@@ -33,7 +33,7 @@ defmodule AttentionServer.ClientAPI.Reads do
     UI1
   }
 
-  alias AttentionServer.ClientAPI.{Context, Errors, PeopleProfiles, Projection, Resources, Search, SharedCapability, SharedContinuation, SharedReads}
+  alias AttentionServer.ClientAPI.{Context, Errors, PeopleProfiles, Projection, Resources, Search, SharedAttachments, SharedCapability, SharedContinuation, SharedReads}
 
   # The client features still behind an operator flag at 0.2 (contract §4).
   @client_features ~w(server_matched_push_routing priority_level_editing)
@@ -150,7 +150,7 @@ defmodule AttentionServer.ClientAPI.Reads do
 
   @doc false
   def get_file(conn, %Context{} = ctx) do
-    case file(ctx.relay, ctx.principal, ctx.params.file_id) do
+    case file_result_for_request(conn, ctx) do
       {:ok, file} ->
         tag = file_etag(file)
 
@@ -174,6 +174,16 @@ defmodule AttentionServer.ClientAPI.Reads do
         respond(conn, error)
     end
   end
+
+  defp file_result_for_request(conn, %{params: %{file_id: "shared-file_" <> _ = id}} = ctx) do
+    case SharedCapability.parse(conn) do
+      {:ok, %{shared?: true}} -> SharedAttachments.download(ctx.relay, ctx.principal, id)
+      {:ok, _} -> {:error, :not_found}
+      error -> error
+    end
+  end
+
+  defp file_result_for_request(_conn, ctx), do: file(ctx.relay, ctx.principal, ctx.params.file_id)
 
   # Round 18: a browser gets a file exactly as today's browser download, an
   # attachment of application/octet-stream, so the web origin never renders

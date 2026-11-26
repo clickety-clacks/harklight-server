@@ -326,6 +326,47 @@ defmodule AttentionServer.ClientAPISharedSendTest do
     assert {200, %{"changes" => []}, _} = get_request(ctx, server, "a1", feed_path, [])
   end
 
+  test "shared attachments have one durable copy and retain the frozen recipient access", ctx do
+    server = start_supervised!({Server, [shared_messages: true] ++ ctx.server_opts})
+    relay = Server.relay(server)
+    {sender, first, second} = people(ctx, relay)
+    assert :ok = Relay.replace_hosted_organization(relay, "org", [sender, first, second])
+    opt_in = [{"harklight-features", "shared_messages"}]
+    bytes = "shared attachment contents"
+    headers = [
+      {"content-type", "text/plain"},
+      {"content-disposition", "attachment; filename*=UTF-8''scope.txt"},
+      {"idempotency-key", @another_key}
+    ]
+
+    assert %{status: 201, body: staged} = raw_request(ctx, server, "a1", "POST", "/v2/files", headers, bytes)
+    assert {:ok, %{"file_id" => handle}} = JSON.decode_line(staged <> "\n")
+    body = Map.put(body([first]), "file_ids", [handle])
+
+    assert {200, %{"message" => %{"item_id" => id, "files" => [%{"file_id" => file_id, "name" => "scope.txt"}]}}, _} =
+             send_request(ctx, server, @key, body, true)
+
+    store = :sys.get_state(relay).store
+    assert map_size(store.engine.uploads) == 1
+    [upload] = Map.values(store.engine.uploads)
+    assert upload.staged_file_id == handle
+
+    path = "/v2/files/" <> file_id
+    assert %{status: 200, body: ^bytes} = raw_request(ctx, server, "a2", "GET", path, opt_in, nil)
+    assert %{status: 404} = raw_request(ctx, server, "a2", "GET", path, [], nil)
+    assert %{status: 404} = raw_request(ctx, server, "b1", "GET", path, opt_in, nil)
+    assert %{status: 200, body: ^bytes} = raw_request(ctx, server, "a1", "GET", path, opt_in, nil)
+    assert :ok = Relay.replace_hosted_organization(relay, "org", [sender, second])
+    revision = %{"message" => %{"title" => "Clear attachment", "created_at" => 2}, "file_ids" => []}
+    revision_key = "10000000-0000-4000-8000-000000000006"
+    assert {200, %{"message" => %{"files" => [], "revision" => 2}}, _} =
+             write_request(ctx, server, "a1", "PUT", "/v2/agent/messages/" <> id, revision_key,
+               revision, [{"if-match", "1"} | opt_in])
+
+    assert %{status: 200, body: ^bytes} = raw_request(ctx, server, "a2", "GET", path, opt_in, nil)
+    assert %{status: 404} = raw_request(ctx, server, "b1", "GET", path, opt_in, nil)
+  end
+
   test "the default-off setting refuses the path while preserving legacy sends", ctx do
     server = start_supervised!({Server, ctx.server_opts})
     relay = Server.relay(server)
@@ -370,6 +411,14 @@ defmodule AttentionServer.ClientAPISharedSendTest do
       "message" => %{"title" => "Launch", "created_at" => 1},
       "recipients" => %{"kind" => "people", "people" => recipients}
     }
+  end
+
+  defp raw_request(ctx, server, device, method, path, headers, body) do
+    conn = ClientAPIFeedClient.connect(Server.port(server), ctx.certs, device)
+    assert {:ok, conn, ref} = Mint.HTTP.request(conn, method, path, headers, body)
+    {conn, response} = ClientAPIFeedClient.collect(conn, ref)
+    Mint.HTTP.close(conn)
+    response
   end
 
   defp get_request(ctx, server, device, path, headers) do

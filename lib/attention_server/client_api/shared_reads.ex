@@ -42,7 +42,7 @@ defmodule AttentionServer.ClientAPI.SharedReads do
     {:reply, result, state}
   end
 
-  defp read(store, %{person: person}, :person, action, id) do
+  defp read(store, %{kind: kind, person: person}, :person, action, id) when kind in [:device, :browser] do
     with {:ok, message, recipient} <- SharedMessages.recipient_message(store.engine, person, id),
          {:ok, head} <- ChangeLog.head(store, person),
          {:ok, rev} <- ChangeLog.rev(store, person, ChangeLog.shared_item_resource(message.id)) do
