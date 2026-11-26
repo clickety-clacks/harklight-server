@@ -832,7 +832,7 @@ defmodule AttentionServer.BounceDecision do
   end
 
   defp item_advisory_text("soft_bounce", sub, at) do
-    "The person opened this message and had not acted on it when its bounce interval elapsed. " <>
+    "The person had opened this message and had not acted on it when the server evaluated the bounce. " <>
       "It remains in their inbox. This notice concerns revision #{sub}, using records available at #{at}."
   end
 
