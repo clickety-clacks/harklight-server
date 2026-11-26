@@ -70,8 +70,8 @@ defmodule AttentionServer.SharedMessagesTest do
     assert {:ok, [], false, 1} = AgentChangeLog.read(restored, {@sender, "sender-key"}, 0, 10, nil)
 
     assert first.item_id != second.item_id
-    assert Map.keys(first) |> Enum.sort() == [:item_id, :seen_revision]
-    assert Map.keys(second) |> Enum.sort() == [:item_id, :seen_revision]
+    assert Map.keys(first) |> Enum.sort() == [:item_id, :reminder, :seen_revision]
+    assert Map.keys(second) |> Enum.sort() == [:item_id, :reminder, :seen_revision]
     assert :ok = Store.close(restored)
   end
 

@@ -2307,7 +2307,9 @@ defmodule AttentionServer.Relay do
       if next.shared_messages and
            (old.shared_messages != current.shared_messages or
               old.shared_recipients != current.shared_recipients) do
-        reschedule_default_sweep(next, Engine.default_index(current))
+        next
+        |> reschedule_default_sweep(Engine.default_index(current))
+        |> reschedule_bounce_sweep()
       else
         next
       end
@@ -2472,28 +2474,13 @@ defmodule AttentionServer.Relay do
          %{bounce_deadline_generation: generation} = state
        ) do
     state = %{state | bounce_deadline_timer: nil}
-    old_engine = state.store.engine
     now_ms = state.clock.()
-    {next_engine, changed_keys} = BounceDecision.evaluate_due_with_changes(old_engine, now_ms)
 
-    if changed_keys == [] do
-      {:noreply, reschedule_bounce_sweep(state)}
-    else
-      case persist_bounce_decision(state, old_engine, next_engine, changed_keys, "bounce_due") do
-        {:ok, next_state} ->
-          people =
-            for {person, _, _} = key <- changed_keys,
-                BounceDecision.inbox_open?(old_engine.messages[key]),
-                not BounceDecision.inbox_open?(next_engine.messages[key]),
-                uniq: true,
-                do: person
-
-          {:noreply, Enum.reduce(people, next_state, &pending_set_changed(&2, &1))}
-
-        {:error, reason} ->
-          Diagnostics.failure(:bounce_schedule, :decision_commit, reason, :unavailable)
-          {:noreply, schedule_bounce_retry(state)}
-      end
+    case sweep_shared_reminders(state, now_ms) do
+      {:ok, state} -> sweep_individual_bounces(state, now_ms)
+      {:error, reason} ->
+        Diagnostics.failure(:bounce_schedule, :decision_commit, reason, :unavailable)
+        {:noreply, schedule_bounce_retry(state)}
     end
   end
 
@@ -4122,6 +4109,64 @@ defmodule AttentionServer.Relay do
     %{state | default_timer: timer, default_timer_generation: generation}
   end
 
+  defp sweep_shared_reminders(%{shared_messages: false} = state, _now_ms), do: {:ok, state}
+
+  defp sweep_shared_reminders(state, now_ms) do
+    {next, notices, changed} = AttentionServer.SharedReminders.evaluate_due(state.store.engine, now_ms, state.groups)
+
+    if changed == [] do
+      {:ok, state}
+    else
+      audit = %{person: "system", actor: "shared_reminders", action: "shared_reminder_due",
+                shared_reminders: notices, shared_reminder_recipients: changed}
+      with {:ok, next} <- stamp_shared_reminders(state.store, next, notices),
+           {:ok, store} <- commit(state.store, next, audit) do
+        {:ok, %{state | store: store}}
+      else
+        {:error, reason, _} -> {:error, reason}
+        {:error, _} = error -> error
+      end
+    end
+  end
+
+  defp stamp_shared_reminders(store, engine, notices) do
+    Enum.reduce_while(notices, {:ok, engine}, fn {id, advisory}, {:ok, current} ->
+      record = current.shared_messages[id]
+
+      case AttentionServer.AgentChangeLog.head(store, {record.sender_person, record.sender_key}) do
+        {:ok, rev} ->
+          record = put_in(record[:shared_advisories][advisory]["decided_at_rev"], rev)
+          {:cont, {:ok, Engine.put_row(current, :shared_messages, id, record)}}
+        error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp sweep_individual_bounces(state, now_ms) do
+    old_engine = state.store.engine
+    {next_engine, changed_keys} = BounceDecision.evaluate_due_with_changes(old_engine, now_ms)
+
+    if changed_keys == [] do
+      {:noreply, reschedule_bounce_sweep(state)}
+    else
+      case persist_bounce_decision(state, old_engine, next_engine, changed_keys, "bounce_due") do
+        {:ok, next_state} ->
+          people =
+            for {person, _, _} = key <- changed_keys,
+                BounceDecision.inbox_open?(old_engine.messages[key]),
+                not BounceDecision.inbox_open?(next_engine.messages[key]),
+                uniq: true,
+                do: person
+
+          {:noreply, Enum.reduce(people, next_state, &pending_set_changed(&2, &1))}
+
+        {:error, reason} ->
+          Diagnostics.failure(:bounce_schedule, :decision_commit, reason, :unavailable)
+          {:noreply, schedule_bounce_retry(state)}
+      end
+    end
+  end
+
   defp reschedule_bounce_sweep(state) do
     if is_reference(state.bounce_deadline_timer),
       do: Process.cancel_timer(state.bounce_deadline_timer)
@@ -4134,7 +4179,11 @@ defmodule AttentionServer.Relay do
         bounce_deadline_generation: generation
     }
 
-    case BounceDecision.next_deadline(state.store.engine) do
+    engine = state.store.engine
+    legacy = BounceDecision.next_deadline(engine)
+    shared = if state.shared_messages, do: AttentionServer.SharedReminders.next_deadline(engine, state.groups)
+
+    case Enum.min(Enum.reject([legacy, shared], &is_nil/1), fn -> nil end) do
       due_at when is_integer(due_at) ->
         delay = min(max(due_at - state.clock.(), 0), @max_timer_delay_ms)
         timer = Process.send_after(self(), {:bounce_due, generation}, delay)

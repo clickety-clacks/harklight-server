@@ -1,7 +1,7 @@
 defmodule AttentionServer.SharedPush do
   @moduledoc false
 
-  alias AttentionServer.{ConversationFiles, Engine, Message, SharedAnswers, SharedMessages}
+  alias AttentionServer.{ConversationFiles, Engine, Message, SharedAnswers, SharedMessages, SharedReminders}
 
   def pending(binding), do: Map.get(binding, :pending_shared, %{})
   def pending?(binding), do: map_size(pending(binding)) > 0
@@ -72,6 +72,11 @@ defmodule AttentionServer.SharedPush do
 
       %{shared_chat: %{operation: :read_position, person: person, message_id: id}} ->
         Map.put_new(changed, {person, id}, :badge)
+
+      %{shared_reminder_recipients: recipients} ->
+        Enum.reduce(recipients, changed, fn {id, person}, acc ->
+          Map.put_new(acc, {person, id}, :badge)
+        end)
 
       %{shared_default_answers: ids} ->
         Enum.reduce(ids, changed, &badge_changes(&2, engine, engine.shared_answers[&1].shared_id))
@@ -258,7 +263,7 @@ defmodule AttentionServer.SharedPush do
   defp alertable?(engine, record, recipient, person) do
     message = record.message
 
-    not Message.progress_message?(message) and not Map.has_key?(record, :terminal) and
+    not Message.progress_message?(message) and not SharedReminders.bounced?(recipient) and not Map.has_key?(record, :terminal) and
       (SharedAnswers.available?(engine, record, recipient, person) or
          (is_nil(record.answer_policy) and
             (Engine.alert_choice(engine, person) == "all" or Message.effective_urgency(message) in ["high", "now"])))

@@ -1,7 +1,7 @@
 defmodule AttentionServer.ClientAPI.SharedChat do
   @moduledoc false
 
-  alias AttentionServer.{AgentChangeLog, ChangeLog, Engine, Relay, SharedAnswers, SharedMessages}
+  alias AttentionServer.{AgentChangeLog, ChangeLog, Engine, Relay, SharedAnswers, SharedMessages, SharedReminders}
   alias AttentionServer.ClientAPI.{Errors, Idempotency, PeopleProfiles, Reads, SharedAttachments, SharedCapability, Writes}
 
   def respond(conn, ctx, direction, operation, body, key) do
@@ -170,6 +170,14 @@ defmodule AttentionServer.ClientAPI.SharedChat do
     end
   end
 
+  defp transition(engine, record, _recipient, _params, %{"advisory_id" => id} = body,
+         %{operation: :advisory_ack} = chat) do
+    with :ok <- Writes.only_members(body, ["advisory_id"]),
+         {:ok, next, result} <- SharedReminders.acknowledge(engine, record, id) do
+      {:ok, next, Map.merge(chat, %{advisory_id: id, outcome: result})}
+    end
+  end
+
   defp transition(engine, record, _recipient, %{answer_id: id}, body, %{operation: :shared_answer_receipt} = chat) do
     with {:ok, handoff} <- handoff(body),
          %{shared_id: shared_id} = answer when shared_id == record.id <- engine.shared_answers[id],
@@ -270,6 +278,12 @@ defmodule AttentionServer.ClientAPI.SharedChat do
     with {:ok, head} <- ChangeLog.head(store, chat.person),
          {:ok, rev} <- ChangeLog.rev(store, chat.person, ChangeLog.shared_entry_resource(id)) do
       {:ok, %{"rev" => head, "entry" => SharedMessages.person_entry(recipient, chat.person, entry, rev)}}
+    end
+  end
+
+  def result(store, _engine, %{direction: :sender, operation: :advisory_ack} = chat) do
+    with {:ok, head} <- AgentChangeLog.head(store, {chat.person, chat.actor}) do
+      {:ok, Map.put(chat.outcome, "rev", head)}
     end
   end
 

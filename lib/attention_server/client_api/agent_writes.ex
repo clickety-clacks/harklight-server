@@ -109,7 +109,7 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
   end
 
   defp dispatch_write(conn, %{params: %{item_id: "shared_" <> _}} = ctx, operation, key, body)
-       when operation in [:reply, :chat_receipt, :shared_answer_receipt],
+       when operation in [:reply, :chat_receipt, :shared_answer_receipt, :advisory_ack],
        do: SharedChat.respond(conn, ctx, :sender, operation, body, key)
 
   defp dispatch_write(conn, %{params: %{item_id: "shared_" <> _ = id}} = ctx,

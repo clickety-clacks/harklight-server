@@ -1239,6 +1239,7 @@ defmodule AttentionServer.Store do
          projected
        ) do
     old = store.engine
+    {next, touched} = AttentionServer.SharedReminders.schedule(old, next, touched, System.system_time(:millisecond))
     {next, touched} = AttentionServer.SharedPush.enqueue(old, next, touched, audit)
     items = for {:row, :messages, key} <- touched, do: key
 
@@ -1273,6 +1274,7 @@ defmodule AttentionServer.Store do
         |> shared_freeze_log(old, next, touched)
         |> group_roster_log(old, next, touched)
         |> shared_chat_log(next, audit)
+        |> shared_reminder_log(next, audit)
       %{records: records, delete_paths: delete_paths, reference_rows: references} = prepared
       derived = DerivedIndex.changes(old, next, touched)
 
@@ -2190,6 +2192,21 @@ defmodule AttentionServer.Store do
     |> MapSet.new()
   end
 
+  defp shared_reminder_log(log, engine, %{shared_reminders: notices, shared_reminder_recipients: recipients}) do
+    log =
+      Enum.reduce(recipients, log, fn {id, person}, acc ->
+        shared_item_change(acc, engine, person, id)
+      end)
+
+    Enum.reduce(notices, log, fn {id, advisory}, acc ->
+      record = Map.fetch!(engine.shared_messages, id)
+      AgentChangeLog.append_shared_advisory(acc, {record.sender_person, record.sender_key},
+        id, advisory, record["session"])
+    end)
+  end
+
+  defp shared_reminder_log(log, _engine, _audit), do: log
+
   defp shared_chat_log(log, engine, %{shared_chat: %{operation: operation, message_id: id} = chat}) do
     record = Map.fetch!(engine.shared_messages, id)
     session = Map.get(record, "session")
@@ -2211,6 +2228,10 @@ defmodule AttentionServer.Store do
 
       :shared_answer_receipt ->
         AgentChangeLog.append_shared_answer(log, {record.sender_person, record.sender_key}, chat.answer_id, session)
+
+      :advisory_ack ->
+        AgentChangeLog.append_shared_advisory(log, {record.sender_person, record.sender_key},
+          record.id, chat.advisory_id, session)
 
       :seen ->
         log =
