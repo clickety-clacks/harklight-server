@@ -25,12 +25,13 @@ archive_name="harklight-server-$release_version-linux-x86_64.tar.gz"
 archive="$HARKLIGHT_ARCHIVE_PATH"
 sums="$HARKLIGHT_CHECKSUMS_PATH"
 guide="$HARKLIGHT_GUIDE_PATH"
-for command in chmod cmp date flock grep ln mkdir mktemp mv python3 readlink rm rmdir sed sleep systemctl tar; do
+for command in chmod cmp date flock grep install ln mkdir mktemp mv python3 readlink rm rmdir sed sleep systemctl tar; do
   command -v "$command" >/dev/null || fail "required host command is unavailable"
 done
 
 [[ -f "$archive" && -f "$sums" && -f "$guide" ]] || fail "selected release assets are unavailable"
 [[ -f "$package_root/BUILD_INFO" && -f "$package_root/SELF_HOST.md" ]] || fail "verified package metadata is unavailable"
+[[ -f "$package_root/bin/harklight-check-store" ]] || fail "verified store compatibility checker is unavailable"
 cmp -s "$package_root/SELF_HOST.md" "$guide" || fail "package guide differs from its release asset"
 
 python3 - "$archive" "$sums" "$archive_name" "$HARKLIGHT_ARCHIVE_SHA256" <<'PY'
@@ -410,6 +411,38 @@ EOF
   staging=""
 fi
 
+check_target_store() {
+  python3 "$package_root/bin/harklight-check-store" "$state/relay.sqlite3" "$target/BUILD_INFO" "$@"
+}
+
+install_checked_launcher() {
+  local launcher="$root/bin/start-server"
+  local previous="$root/bin/start-server-unchecked"
+  [[ -f "$package_root/bin/harklight-start-server-checked" ]] || return 1
+
+  if [[ ! -e "$previous" ]]; then
+    install -m 755 "$launcher" "$previous" || return 1
+  fi
+
+  local staged
+  staged="$(mktemp -d "$root/bin/.checked-launcher.XXXXXX")" || return 1
+  if install -m 755 "$package_root/bin/harklight-check-store" "$staged/harklight-check-store" &&
+    install -m 755 "$package_root/bin/harklight-start-server-checked" "$staged/start-server" &&
+    mv -Tf -- "$staged/harklight-check-store" "$root/bin/harklight-check-store" &&
+    mv -Tf -- "$staged/start-server" "$launcher"; then
+    rmdir "$staged"
+  else
+    rm -rf -- "$staged"
+    return 1
+  fi
+}
+
+if ((switched)) || [[ "$current_tag" == "$HARKLIGHT_RELEASE_TAG" ]]; then
+  check_target_store || fail "selected release cannot start with the existing store"
+else
+  check_target_store --allow-conversion || fail "selected release cannot upgrade the existing store"
+fi
+
 if [[ -z "$backup_final" && "$current_tag" == "$HARKLIGHT_RELEASE_TAG" ]] &&
   install_info_matches "$target"; then
   if systemctl --user is-active --quiet "$unit"; then
@@ -520,6 +553,15 @@ if ((!switched)); then
   if ! ATTENTION_SERVER_ENABLE=0 "$target/bin/harklight" store convert-stopped \
     "$state/relay.sqlite3" --from-release "$current_tag"; then
     rollback_failed_upgrade "stopped-store FORMAT31 conversion failed"
+  fi
+
+  if ! check_target_store; then
+    rollback_failed_upgrade "the converted store is incompatible with the selected release"
+  fi
+
+  if grep -Eq '^auth_generation=[1-9][0-9]*$' "$target/BUILD_INFO" &&
+    ! install_checked_launcher; then
+    rollback_failed_upgrade "could not install the managed store compatibility launcher"
   fi
 
   current_link="$root/.current-$HARKLIGHT_RELEASE_TAG.$$"

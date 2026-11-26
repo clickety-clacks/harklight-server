@@ -89,12 +89,13 @@ printf 'beam\n' > "$archive_stage/erts-15.2.7/bin/beam.smp"
 chmod 755 "$archive_stage/erts-15.2.7/bin/beam.smp"
 printf 'server\n' > "$archive_stage/bin/attention_server"
 chmod 755 "$archive_stage/bin/attention_server"
-printf 'version=0.2.21\nsource_commit=0123456789abcdef0123456789abcdef01234567\nsource_status=\n' \
+printf 'version=0.2.21\nrelay_store_format=31\nauth_generation=0\nsource_commit=0123456789abcdef0123456789abcdef01234567\nsource_status=\n' \
   > "$archive_stage/BUILD_INFO"
 printf 'Harklight Server release guide\n' > "$archive_stage/SELF_HOST.md"
 cp "$archive_stage/SELF_HOST.md" "$guide"
 cp "$guide" "$package_root/SELF_HOST.md"
 cp "$archive_stage/BUILD_INFO" "$package_root/BUILD_INFO"
+cp "$(dirname "$installer")/check-store-compatibility.py" "$package_root/bin/harklight-check-store"
 cp "$installer" "$package_root/bin/harklight-release-install"
 chmod 755 "$package_root/bin/harklight-release-install"
 
