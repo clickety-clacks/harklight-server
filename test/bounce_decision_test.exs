@@ -132,19 +132,15 @@ defmodule AttentionServer.BounceDecisionTest do
     end
   end
 
-  test "defaults are read without storing a table and leave unscored messages inert" do
+  test "defaults schedule an unscored message without storing a table" do
     {engine, _record} = fixture(configured?: false)
     refute Map.has_key?(engine.bounce_levels, @person)
 
     assert BounceDecision.levels(engine, @person) ==
              BouncePolicy.public_levels(BouncePolicy.default_levels())
 
-    assert selection(engine) == nil
-    assert BounceDecision.next_deadline(engine) == nil
-
-    still_unscored = BounceDecision.evaluate_due(engine, @accepted_at + 14 * 86_400_000)
-    assert selection(still_unscored) == nil
-    assert BounceDecision.advisory_cursor(still_unscored, @person, @origin, @handle) == 0
+    assert selection(engine)["level_name"] == "Normal"
+    assert BounceDecision.next_deadline(engine) == @accepted_at + 259_200_000
 
     selected = score(engine, %AttentionServer.JSON.DecimalToken{raw: "0.8"}, @accepted_at + 1)
 
@@ -184,7 +180,7 @@ defmodule AttentionServer.BounceDecisionTest do
   test "pre-default retained messages stay ineligible while later revisions qualify" do
     {engine, record} = fixture(configured?: false)
     state = engine.bounce_revisions[key()]
-    revision = %{state.revisions[1] | qualified: false}
+    revision = %{state.revisions[1] | qualified: false, selection: nil}
     retained_state = %{state | revisions: Map.put(state.revisions, 1, revision)}
 
     retained = %{
@@ -242,7 +238,7 @@ defmodule AttentionServer.BounceDecisionTest do
     refute Map.has_key?(legacy.bounce_levels, @person)
   end
 
-  test "first applied score fixes an inclusive level and acceptance-based deadline" do
+  test "a score uses the inclusive level and can reset a pending acceptance-based deadline" do
     {engine, _record} = fixture()
 
     assert BounceDecision.levels(engine, @person) ==
@@ -264,8 +260,8 @@ defmodule AttentionServer.BounceDecisionTest do
     {:ok, edited, _} = BounceDecision.configure_levels(selected, @person, updated_levels, 4_000)
     rescored = score(edited, 0.9, 9_000)
 
-    assert selection(rescored) == selection(selected)
-    assert BounceDecision.next_deadline(rescored) == @accepted_at + 194_400_000
+    assert selection(rescored)["level_name"] == "Urgent"
+    assert BounceDecision.next_deadline(rescored) == @accepted_at + 604_800_000
   end
 
   test "Progress gets no score deadline and a later marker suppresses a pending advisory" do
@@ -360,9 +356,8 @@ defmodule AttentionServer.BounceDecisionTest do
         conversation_highs: Map.put(engine.conversation_highs, @person, 2)
     }
 
-    replayed = score(engine, 0.4, 10_000)
-    assert replayed.bounce_revisions[key()].raw_to_substantive[3] == 2
-    assert selection(replayed, 2)["due_at_ms"] == second_due
+    assert engine.bounce_revisions[key()].raw_to_substantive[3] == 2
+    assert selection(engine, 2)["due_at_ms"] == second_due
   end
 
   test "due decisions suppress opened, discussed and terminal messages" do

@@ -482,14 +482,16 @@ defmodule AttentionServer.Relay do
   def init(opts) do
     case open_startup_store(opts) do
       {:ok, store} ->
-        case startup_cleanup(store) do
+        clock = Keyword.get(opts, :clock, fn -> System.system_time(:millisecond) end)
+
+        case startup_cleanup(store, clock.()) do
           {:ok, store} ->
             state = %{
               store: store,
               hosted_jev_connection: hosted_jev_connection(opts),
               feature_flags_path: Keyword.get(opts, :feature_flags_path),
               feature_flags_warned: false,
-              clock: Keyword.get(opts, :clock, fn -> System.system_time(:millisecond) end),
+              clock: clock,
               default_index: Engine.default_index(store.engine),
               default_timer: nil,
               default_timer_generation: 0,
@@ -599,14 +601,14 @@ defmodule AttentionServer.Relay do
 
   defp startup_reason(_opts, _phase, reason), do: reason
 
-  defp startup_cleanup(store) do
+  defp startup_cleanup(store, now_ms) do
     actor_keys = browser_actor_keys(store.engine)
     engine = discard_browser_actor_state(store.engine, actor_keys)
 
     with :ok <- Store.discard_building_inbox_snapshots(store),
          {:ok, store} <- commit_browser_cleanup(store, engine),
          {:ok, store} <- Store.migrate_retained_client_data(store),
-         {:ok, store} <- resume_bounces(store),
+         {:ok, store} <- resume_bounces(store, now_ms),
          :ok <- Store.discard_browser_inbox_snapshots(store) do
       {:ok, store}
     else
@@ -615,17 +617,22 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  defp resume_bounces(store) do
-    engine = BounceDecision.resume_decisions(store.engine)
+  defp resume_bounces(store, now_ms) do
+    {engine, keys, count} = store.engine |> BounceDecision.resume_decisions() |> BounceDecision.backfill(now_ms)
 
     if engine == store.engine do
       {:ok, store}
     else
-      commit(store, engine, %{
-        person: "system",
-        actor: "bounce_decision",
-        action: "resume_bounces"
-      })
+      audit = %{person: "system", actor: "bounce_decision", action: "resume_bounces"}
+
+      with {:ok, engine} <- AttentionServer.AgentAPI.Advisories.stamp_decisions(store, engine, keys),
+           {:ok, updated} <- commit(store, engine, audit) do
+        if keys != [] do
+          Logger.info("event=harklight_bounce_backfill selections=#{length(keys)} overdue_full_bounces=#{count}")
+        end
+
+        {:ok, updated}
+      end
     end
   end
 
@@ -2328,6 +2335,8 @@ defmodule AttentionServer.Relay do
     {:noreply, %{state | agent_show_receipts: receipts}}
   end
 
+  defp dispatch_info(:refresh_bounce_sweep, state), do: {:noreply, reschedule_bounce_sweep(state)}
+
   defp dispatch_info(:refresh_default_sweep_index, state) do
     {:noreply, reschedule_default_sweep(state, Engine.default_index(state.store.engine))}
   end
@@ -4024,6 +4033,11 @@ defmodule AttentionServer.Relay do
 
     if match?({:ok, _}, result) and store.engine.messages != next.messages do
       send(self(), :refresh_default_sweep_index)
+    end
+
+    if match?({:ok, _}, result) and
+         BounceDecision.next_deadline(store.engine) != BounceDecision.next_deadline(next) do
+      send(self(), :refresh_bounce_sweep)
     end
 
     result
