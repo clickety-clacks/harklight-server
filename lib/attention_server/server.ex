@@ -252,7 +252,12 @@ defmodule AttentionServer.Server do
               optional_child_spec(
                 :hosted_http,
                 HostedHTTP,
-                [relay: relay_name, port: hosted_port, ip: {127, 0, 0, 1}],
+                [
+                  relay: relay_name,
+                  port: hosted_port,
+                  ip: {127, 0, 0, 1},
+                  session_token: Keyword.get(opts, :hosted_session_token)
+                ],
                 :hosted_http,
                 :listener_start,
                 :supervisor

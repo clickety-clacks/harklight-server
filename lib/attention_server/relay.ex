@@ -18,6 +18,7 @@ defmodule AttentionServer.Relay do
 
   alias AttentionServer.{
     AppliedScoreRecord,
+    BrowserAuth,
     BrowserRecipient,
     BounceDecision,
     BouncePolicy,
@@ -252,6 +253,18 @@ defmodule AttentionServer.Relay do
   @doc "Authenticate a bearer once, returning its stored person-owner principal only after commit."
   def consume_browser_sign_in(server, token),
     do: GenServer.call(server, {:consume_browser_sign_in, token}, :infinity)
+
+  def redeem_browser_fragment(server, token, session_hash),
+    do: GenServer.call(server, {:redeem_browser_fragment, token, session_hash}, :infinity)
+
+  def browser_session(server, hash),
+    do: GenServer.call(server, {:browser_session, hash}, :infinity)
+
+  def hosted_browser_grant(server, person, transaction, method),
+    do: GenServer.call(server, {:hosted_browser_grant, person, transaction, method}, :infinity)
+
+  def redeem_hosted_browser_grant(server, grant, transaction),
+    do: GenServer.call(server, {:redeem_hosted_browser_grant, grant, transaction}, :infinity)
 
   def owner_invite_create(server, person, owner_key),
     do: GenServer.call(server, {:owner_invite_create, person, owner_key}, :infinity)
@@ -1396,30 +1409,53 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  defp dispatch_call({:consume_browser_sign_in, token}, _from, state) do
-    with {:ok, hash} <- AttentionServer.BrowserSignIn.token_hash(token) do
-      case AttentionServer.BrowserSignIn.consume(state.store.engine, hash) do
-        {:ok, next, principal} ->
-          case commit(state.store, next, %{
-                 person: principal.person_id,
-                 actor: principal.owner_key,
-                 action: "browser_sign_in_consume"
-               }) do
-            {:ok, committed} ->
-              principal = with_hosted_label(principal, :display_name, next)
-              {:reply, {:ok, principal}, %{state | store: committed}}
-
-            _ ->
-              {:reply, {:error, :storage_unavailable}, state}
-          end
-
-        error ->
-          {:reply, error, state}
+  defp dispatch_call({:hosted_browser_grant, person, transaction, method}, _from, state) do
+    result =
+      with %{auth_schema: %{}, db: db, engine: engine} <- state.store,
+           {:ok, _record} <- hosted_record(engine, person),
+           key when is_binary(key) <- Engine.hosted_owner_key(engine, person),
+           {:ok, revision} <- Engine.owner_revision(engine, person, key) do
+        BrowserAuth.issue_hosted(db, transaction, person, key, revision, method, state.clock.())
+      else
+        %Store{auth_schema: nil} -> {:error, :disabled}
+        _ -> {:error, :not_hosted}
       end
-    else
-      _ -> {:reply, {:error, :invalid_sign_in}, state}
-    end
+
+    {:reply, result, state}
   end
+
+  defp dispatch_call({:redeem_hosted_browser_grant, grant, transaction}, _from, state) do
+    result =
+      case state.store do
+        %{auth_schema: %{}, db: db, engine: engine} ->
+          BrowserAuth.redeem_hosted(db, engine, grant, transaction, state.clock.())
+
+        _ ->
+          {:error, :disabled}
+      end
+
+    {:reply, result, state}
+  end
+
+  defp dispatch_call({:browser_session, hash}, _from, state) do
+    result =
+      with %{auth_schema: %{}, db: db, engine: engine} <- state.store,
+           {:ok, %{person: person, key: key, revision: revision} = session} <-
+             BrowserAuth.session(db, hash),
+           {:ok, ^revision} <- Engine.owner_revision(engine, person, key) do
+        {:ok, with_hosted_label(session, :display_name, engine, person)}
+      else
+        _ -> {:error, :invalid_session}
+      end
+
+    {:reply, result, state}
+  end
+
+  defp dispatch_call({:consume_browser_sign_in, token}, _from, state),
+    do: consume_browser_fragment(state, token, nil)
+
+  defp dispatch_call({:redeem_browser_fragment, token, hash}, _from, state),
+    do: consume_browser_fragment(state, token, hash)
 
   defp dispatch_call({:owner_invite_create, person, owner}, _from, state) do
     token = :crypto.strong_rand_bytes(32)
@@ -2034,8 +2070,21 @@ defmodule AttentionServer.Relay do
 
   # Signing a browser out closes its v2 feeds and ends its focus report.
   defp dispatch_call({:end_browser_session, browser_session_id}, _from, state) do
-    AttentionServer.ChangeLog.notify_closing([{{:browser_session, browser_session_id}, :revoked}])
-    {:reply, :ok, end_focus(state, {:browser, browser_session_id})}
+    result =
+      case state.store do
+        %{auth_schema: %{}, db: db} when is_binary(browser_session_id) ->
+          BrowserAuth.remove_session(db, browser_session_id)
+        _ -> :ok
+      end
+
+    case result do
+      :ok ->
+        AttentionServer.ChangeLog.notify_closing([{{:browser_session, browser_session_id}, :revoked}])
+        {:reply, :ok, end_focus(state, {:browser, browser_session_id})}
+
+      _ ->
+        {:reply, {:error, :storage_unavailable}, state}
+    end
   end
 
   # Each frame is released under current authority. A released write belongs
@@ -4042,6 +4091,39 @@ defmodule AttentionServer.Relay do
   end
 
   defp put_push_revision(_store, _claim), do: {:error, :storage_unavailable}
+
+  defp consume_browser_fragment(state, token, session_hash) do
+    with {:ok, hash} <- AttentionServer.BrowserSignIn.token_hash(token),
+         {:ok, next, principal} <- AttentionServer.BrowserSignIn.consume(state.store.engine, hash),
+         {:ok, audit} <- browser_fragment_audit(state, principal, session_hash) do
+      case commit(state.store, next, audit) do
+        {:ok, committed} ->
+          principal = with_hosted_label(principal, :display_name, next)
+          principal = if Map.has_key?(audit, :browser_session), do: Map.put(principal, :persistent, true), else: principal
+          {:reply, {:ok, principal}, %{state | store: committed}}
+
+        _ ->
+          {:reply, {:error, :storage_unavailable}, state}
+      end
+    else
+      _ -> {:reply, {:error, :invalid_sign_in}, state}
+    end
+  end
+
+  defp browser_fragment_audit(state, principal, hash) do
+    audit = %{person: principal.person_id, actor: principal.owner_key, action: "browser_sign_in_consume"}
+
+    case {state.store.auth_schema, state.deployment_mode, hash} do
+      {nil, _, _} ->
+        {:ok, audit}
+
+      {%{}, :saas, hash} when is_binary(hash) and byte_size(hash) == 32 ->
+        {:ok, Map.put(audit, :browser_session, {hash, principal.owner_revision, "hosted"})}
+
+      _ ->
+        {:error, :invalid_sign_in}
+    end
+  end
 
   defp commit(store, next, audit) do
     result = Store.commit(store, next, audit)

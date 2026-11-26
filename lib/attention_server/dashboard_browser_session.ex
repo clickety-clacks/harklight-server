@@ -1,15 +1,14 @@
 defmodule AttentionServer.DashboardBrowserSession do
   @moduledoc """
-  In-memory browser cookies after Relay consumes a durable one-use sign-in token.
+  Browser sessions resolved through Relay, with volatile sessions for the pre-S1 path.
 
   The injected consumer returns only a committed owner principal and issuer
-  revision. This process never issues, stores, or reuses sign-in links. Every
-  cookie read rechecks current owner authority; restart drops all cookies.
+  revision. Every cookie read rechecks current owner authority.
   """
 
   use GenServer
 
-  alias AttentionServer.{Diagnostics, Relay}
+  alias AttentionServer.{BrowserAuth, Diagnostics, Relay}
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, Keyword.take(opts, [:name]))
   def redeem(server, token), do: GenServer.call(server, {:redeem, token}, :infinity)
@@ -25,7 +24,7 @@ defmodule AttentionServer.DashboardBrowserSession do
     {:ok,
      %{
        relay: Keyword.fetch!(opts, :relay),
-       consume: Keyword.fetch!(opts, :consume),
+       consume: Keyword.get(opts, :consume),
        sessions: %{}
      }}
   end
@@ -55,8 +54,10 @@ defmodule AttentionServer.DashboardBrowserSession do
 
   def handle_call({:end_session, cookie}, _from, state) do
     session_hash = digest(cookie)
-    end_browser_session(state.relay, session_hash)
-    {:reply, :ok, %{state | sessions: Map.delete(state.sessions, session_hash)}}
+    case end_browser_session(state.relay, session_hash) do
+      :ok -> {:reply, :ok, %{state | sessions: Map.delete(state.sessions, session_hash)}}
+      error -> {:reply, error, state}
+    end
   end
 
   def handle_call({:browser_context, cookie}, _from, state) do
@@ -101,6 +102,12 @@ defmodule AttentionServer.DashboardBrowserSession do
             {:error, :invalid_session, state}
         end
 
+      _ when is_binary(session_hash) ->
+        case Relay.browser_session(state.relay, session_hash) do
+          {:ok, session} -> {:ok, session_hash, session, state}
+          _ -> {:error, :invalid_session, state}
+        end
+
       _ ->
         {:error, :invalid_session, state}
     end
@@ -118,25 +125,37 @@ defmodule AttentionServer.DashboardBrowserSession do
 
       {:error, reason} ->
         Diagnostics.failure(:dashboard_http, :session_end, reason, :unavailable)
-        :ok
+        {:error, :storage_unavailable}
 
       other ->
         Diagnostics.failure(:dashboard_http, :session_end, other, :unavailable)
-        :ok
+        {:error, :storage_unavailable}
     end
   catch
     :exit, reason ->
       Diagnostics.failure(:dashboard_http, :session_end, reason, :unavailable)
-      :ok
+      {:error, :storage_unavailable}
   end
 
   defp consume_and_mint(state, token) do
+    cookie = BrowserAuth.new_secret()
+
+    result =
+      if state.consume do
+        state.consume.(token)
+      else
+        Relay.redeem_browser_fragment(state.relay, token, digest(cookie))
+      end
+
     case Diagnostics.result(
            :dashboard_http,
            :request_dispatch,
-           state.consume.(token),
+           result,
            :rejected
          ) do
+      {:ok, %{persistent: true}} ->
+        {:reply, {:ok, cookie, :persistent}, state}
+
       {:ok,
        %{person_id: person, owner_key: key, owner_revision: revision, scope: :person_owner} =
            principal} ->
@@ -147,7 +166,6 @@ defmodule AttentionServer.DashboardBrowserSession do
                :rejected
              ) do
           {:ok, ^revision} ->
-            cookie = :crypto.strong_rand_bytes(32) |> Base.url_encode64(padding: false)
             session = %{person: person, key: key, revision: revision}
 
             session =

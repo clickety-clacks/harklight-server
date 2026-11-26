@@ -3,12 +3,9 @@ defmodule AttentionServer.HostedHTTP do
   Loopback-only plain HTTP interface for the hosted account component.
 
   It runs only in `saas` deployment mode on a port the operator pins, and is
-  meant to be reached by the hosted component on the same machine; it carries
-  no credential of its own. Three bounded JSON posts exist: create or find the
-  person for an account, issue a sign-in link for that person, and put the one
-  designated test account into a named product state. Nothing here reads or
-  changes another person's data: every call acts through the server-held owner
-  key of the one hosted person it names.
+  meant to be reached by the hosted component on the same machine. The shared
+  Hosted session token authorizes the S1 session-grant routes. Existing
+  account and overlap routes preserve their original loopback contract.
   """
 
   use Supervisor
@@ -36,7 +33,9 @@ defmodule AttentionServer.HostedHTTP do
     children = [
       Supervisor.child_spec(
         {Bandit,
-         plug: {HostedRequests, relay: Keyword.fetch!(opts, :relay)},
+         plug:
+           {HostedRequests,
+            relay: Keyword.fetch!(opts, :relay), session_token: Keyword.get(opts, :session_token)},
          scheme: :http,
          ip: Keyword.fetch!(opts, :ip),
          port: Keyword.fetch!(opts, :port),

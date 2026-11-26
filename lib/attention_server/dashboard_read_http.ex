@@ -20,7 +20,7 @@ defmodule AttentionServer.DashboardReadHTTP do
 
   import Plug.Conn
 
-  alias AttentionServer.{DashboardBrand, DashboardView, Diagnostics, JSON, Message}
+  alias AttentionServer.{BrowserAuth, DashboardBrand, DashboardView, Diagnostics, JSON, Message}
 
   @cookie "__Host-harklight"
   @invite_cookie "__Host-harklight-invite"
@@ -197,22 +197,27 @@ defmodule AttentionServer.DashboardReadHTTP do
   defp sign_out(conn, opts, session) do
     case form(conn, opts, ~w(confirm)) do
       {:ok, %{"confirm" => "sign_out"}, conn} ->
-        if session, do: backend_call(opts.backend, :end_session, session)
-
-        location =
-          if opts.hosted,
-            do: opts.hosted_addresses.sign_out || "/devices",
-            else: @signed_out_path
-
-        conn
-        |> delete_resp_cookie(@cookie, secure: true, http_only: true, same_site: "Lax", path: "/")
-        |> put_resp_header("location", location)
-        |> send_resp(303, "")
+        result = if session, do: backend_call(opts.backend, :end_session, session), else: :ok
+        complete_sign_out(conn, opts, result)
 
       {_, _, conn} ->
         send_resp(conn, 403, "Sign out refused")
     end
   end
+
+  defp complete_sign_out(conn, opts, :ok) do
+    location =
+      if opts.hosted,
+        do: opts.hosted_addresses.sign_out || "/devices",
+        else: @signed_out_path
+
+    conn
+    |> delete_resp_cookie(@cookie, secure: true, http_only: true, same_site: "Lax", path: "/")
+    |> put_resp_header("location", location)
+    |> send_resp(303, "")
+  end
+
+  defp complete_sign_out(conn, _opts, _error), do: send_resp(conn, 503, "Sign out unavailable")
 
   # Sign-out still completes the hosted half when the Server cookie is absent or expired.
   defp no_session(
@@ -1331,14 +1336,9 @@ defmodule AttentionServer.DashboardReadHTTP do
       case read_body(conn, length: 256, read_length: 256) do
         {:ok, token, conn} when byte_size(token) == 69 ->
           case backend_call(opts.backend, :redeem_sign_in, token) do
-            {:ok, cookie, _expires_at} ->
+            {:ok, cookie, persistence} ->
               conn
-              |> put_resp_cookie(@cookie, cookie,
-                secure: true,
-                http_only: true,
-                same_site: "Lax",
-                path: "/"
-              )
+              |> BrowserAuth.put_cookie(cookie, persistence == :persistent)
               |> send_resp(204, "")
 
             _ ->

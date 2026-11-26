@@ -14,6 +14,7 @@ defmodule AttentionServer.Store do
   alias AttentionServer.{
     APNS,
     BrowserRecipient,
+    BrowserAuth,
     BounceDecision,
     BrowserSignIn,
     Conversation,
@@ -1270,6 +1271,7 @@ defmodule AttentionServer.Store do
               with :ok <- DerivedIndex.write(db, derived),
                    :ok <- write_reference_delta(db, delete_paths, references),
                    :ok <- write_audit(db, audit),
+                   :ok <- write_browser_session(db, audit),
                    {:ok, heads, agent_heads} <- append_change_logs(db, log, generation),
                    :ok <- DerivedIndex.advance(db, generation) do
                 {:ok, {heads, agent_heads}}
@@ -2038,6 +2040,11 @@ defmodule AttentionServer.Store do
     end)
   end
 
+  defp write_browser_session(db, %{person: person, actor: owner, browser_session: {hash, revision, issuer}}),
+    do: BrowserAuth.add_session(db, hash, person, owner, revision, issuer)
+
+  defp write_browser_session(_db, _audit), do: :ok
+
   defp write_audit(db, audit) do
     run(db, "INSERT INTO relay_audit (person_id, actor_id, action, at_ms) VALUES (?, ?, ?, ?)", [
       audit.person,
@@ -2239,6 +2246,7 @@ defmodule AttentionServer.Store do
            ),
          {:ok, heads, agent_heads} <- append_change_logs(db, log, version + 1),
          :ok <- record_committed_migration(db, audit),
+         :ok <- write_browser_session(db, audit),
          :ok <- Sqlite3.execute(db, "COMMIT") do
       {:ok, heads, agent_heads}
     end

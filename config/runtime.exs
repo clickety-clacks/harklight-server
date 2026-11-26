@@ -216,6 +216,7 @@ if System.get_env("ATTENTION_SERVER_ENABLE") == "1" do
           server_opts
           |> Keyword.put(:hosted_port, port)
           |> Keyword.put(:hosted_test_account, hosted_test_account)
+          |> Keyword.put(:hosted_session_token, System.get_env("HARKLIGHT_HOSTED_SESSION_TOKEN"))
 
         :not_set ->
           server_opts
