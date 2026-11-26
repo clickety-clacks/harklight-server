@@ -23,6 +23,7 @@ defmodule AttentionServer.Store do
     LargeData
   }
 
+  alias AttentionServer.ClientAPI.Idempotency
   alias Exqlite.Sqlite3
 
   alias AttentionServer.Store.{
@@ -1272,6 +1273,7 @@ defmodule AttentionServer.Store do
                    :ok <- write_reference_delta(db, delete_paths, references),
                    :ok <- write_audit(db, audit),
                    {:ok, heads, agent_heads} <- append_change_logs(db, log, generation),
+                   :ok <- write_shared_send_receipt(store, audit),
                    :ok <- DerivedIndex.advance(db, generation) do
                 {:ok, {heads, agent_heads}}
               end
@@ -2054,6 +2056,11 @@ defmodule AttentionServer.Store do
       end
     end)
   end
+
+  defp write_shared_send_receipt(store, %{shared_send_receipt: {scope, key, digest, body}}),
+    do: Idempotency.save(store, scope, key, digest, 200, body)
+
+  defp write_shared_send_receipt(_store, _audit), do: :ok
 
   defp write_audit(db, audit) do
     run(db, "INSERT INTO relay_audit (person_id, actor_id, action, at_ms) VALUES (?, ?, ?, ?)", [

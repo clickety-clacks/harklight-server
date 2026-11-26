@@ -2,6 +2,8 @@ defmodule AttentionServer.SharedMessagesTest do
   use ExUnit.Case, async: true
 
   alias AttentionServer.{Engine, SharedMessages, Store}
+  alias AttentionServer.ClientAPI.Idempotency
+  alias Exqlite.Sqlite3
 
   @moduletag :tmp_dir
 
@@ -14,6 +16,7 @@ defmodule AttentionServer.SharedMessagesTest do
   test "one durable message record references distinct personal rows", %{tmp_dir: dir} do
     path = Path.join(dir, "relay.sqlite3")
     assert {:ok, store} = Store.open_relay(path)
+    assert {:ok, store} = Store.enable_change_log(store)
 
     {engine, :ok, touched} =
       Engine.with_touches(store.engine, fn initial ->
@@ -27,9 +30,28 @@ defmodule AttentionServer.SharedMessagesTest do
         {engine, :ok}
       end)
 
-    assert {:ok, store} =
-             Store.commit(store, {engine, touched}, %{person: @sender, actor: "fixture", action: "send"})
+    scope = Idempotency.agent_scope(@sender, "sender-key")
+    key = "30000000-0000-4000-8000-000000000001"
+    body = %{"rev" => 0, "organization_id" => @organization, "item_id" => "shared-a"}
+    receipt = {scope, key, "request-digest", body}
+    audit = %{person: @sender, actor: "fixture", action: "send", shared_send_receipt: receipt}
+    assert {:ok, nil} = Idempotency.lookup(store, scope, key)
 
+    assert :ok =
+             Sqlite3.execute(store.db, """
+             CREATE TEMP TRIGGER refuse_shared_receipt BEFORE INSERT ON client_idempotency
+             BEGIN SELECT RAISE(ABORT, 'receipt failpoint'); END
+             """)
+
+    assert {:error, :storage_unavailable, ^store} = Store.commit(store, {engine, touched}, audit)
+    assert {:ok, nil} = Idempotency.lookup(store, scope, key)
+    assert {:ok, rolled_back} = Store.open_relay(path)
+    assert rolled_back.engine.shared_messages == %{}
+    assert rolled_back.engine.shared_recipients == %{}
+    assert :ok = Store.close(rolled_back)
+
+    assert :ok = Sqlite3.execute(store.db, "DROP TRIGGER refuse_shared_receipt")
+    assert {:ok, store} = Store.commit(store, {engine, touched}, audit)
     assert :ok = Store.close(store)
     assert {:ok, restored} = Store.open_relay(path)
     assert [{"shared-a", %{message: %{"title" => "Launch"}}}] =
@@ -37,6 +59,10 @@ defmodule AttentionServer.SharedMessagesTest do
 
     assert %{{"shared-a", @other} => first, {"shared-a", @third} => second} =
              restored.engine.shared_recipients
+
+    assert {:ok, restored} = Store.enable_change_log(restored)
+    assert {:ok, %{body: ^body, digest: "request-digest", status: 200}} =
+             Idempotency.lookup(restored, scope, key)
 
     assert first.item_id != second.item_id
     assert Map.keys(first) |> Enum.sort() == [:item_id, :seen_revision]
