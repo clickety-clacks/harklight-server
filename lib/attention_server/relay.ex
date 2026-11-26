@@ -1326,6 +1326,13 @@ defmodule AttentionServer.Relay do
     {:reply, result, state}
   end
 
+  defp dispatch_call(
+         {:pending_enroll, _certificate, _label},
+         _from,
+         %{deployment_mode: :saas, store: %{auth_schema: %{}}} = state
+       ),
+       do: {:reply, {:error, :not_found}, state}
+
   defp dispatch_call({:pending_enroll, certificate_der, label}, _from, state) do
     case generate_pending(state.store.engine, certificate_der, label, 8) do
       {:ok, next_engine, code, secret} ->
@@ -2018,16 +2025,21 @@ defmodule AttentionServer.Relay do
        ) do
     now_ms = System.system_time(:millisecond)
 
-    case Engine.pending_approve(
-           state.store.engine,
-           person,
-           key,
-           code,
-           expected_key,
-           expected_expires_at,
-           senders,
-           now_ms
-         ) do
+    result =
+      with :ok <- authorize_enrollment_account(state, person, code) do
+        Engine.pending_approve(
+          state.store.engine,
+          person,
+          key,
+          code,
+          expected_key,
+          expected_expires_at,
+          senders,
+          now_ms
+        )
+      end
+
+    case result do
       {:ok, next_engine, device_key} ->
         case commit(state.store, next_engine, %{
                person: person,
@@ -4182,6 +4194,19 @@ defmodule AttentionServer.Relay do
   end
 
   defp enrollment_status(_store, status), do: status
+
+  defp authorize_enrollment_account(
+         %{deployment_mode: :saas, store: %{auth_schema: %{}, engine: engine}},
+         person,
+         code
+       ) do
+    case engine.pending_enrollments[code] || engine.pending_history[code] do
+      %{person: ^person, joined: true} -> :ok
+      _ -> {:error, :not_found}
+    end
+  end
+
+  defp authorize_enrollment_account(_state, _person, _code), do: :ok
 
   defp sender_certificate?(db, engine, person, key) do
     grants = Map.get(engine.sender_grants, {person, key}, MapSet.new())

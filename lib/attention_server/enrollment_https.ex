@@ -418,6 +418,7 @@ defmodule AttentionServer.EnrollmentHTTPS do
       {:error, :capacity} -> {503, %{"error" => "capacity"}}
       {:error, :key_pending} -> {409, %{"error" => "key_pending"}}
       {:error, :key_in_use} -> {409, %{"error" => "key_in_use"}}
+      {:error, :not_found} -> {404, %{"error" => "not_found"}}
       {:error, :storage_unavailable} -> {503, %{"error" => "unavailable"}}
       _ -> {400, %{"error" => "invalid_request"}}
     end

@@ -35,12 +35,24 @@ defmodule AttentionServer.GuidedJoinHTTPSTest do
     {:ok, config} =
       GuidedJoin.configuration("relay.test", 18444, 18443, File.read!(Path.join(certs, "ca.pem")))
 
+    mode = Map.get(certs_context, :mode, :self_hosted)
+
+    legacy_pending =
+      if mode == :saas do
+        certificate = TLSFixtures.certificate_der!(certs, "self_device")
+        {:ok, key} = DeviceIdentity.from_certificate(certificate)
+        {:ok, previous} = Relay.start_link(store_path: path, deployment_mode: mode)
+        {:ok, pending} = Relay.pending_enroll(previous, certificate, "Legacy pending requester")
+        :ok = GenServer.stop(previous)
+        Map.put(pending, :key, key)
+      end
+
     relay =
       start_supervised!(
         {Relay,
          store_path: path,
          join_configuration: config,
-         deployment_mode: Map.get(certs_context, :mode, :self_hosted),
+         deployment_mode: mode,
          sign_in_s1: Map.has_key?(certs_context, :mode)}
       )
     {:ok, person} = Relay.operator_bootstrap(relay, TLSFixtures.certificate_der!(certs, "a1"))
@@ -71,6 +83,7 @@ defmodule AttentionServer.GuidedJoinHTTPSTest do
       relay: relay,
       owner: owner,
       listener: listener,
+      legacy_pending: legacy_pending,
       person: person,
       other: other
     }
@@ -117,15 +130,14 @@ defmodule AttentionServer.GuidedJoinHTTPSTest do
     request_id = "00000000-0000-4000-8000-000000000001"
     {:ok, invitation} = DashboardBackend.create_invitation(backend, {browser_owner, request_id})
     {request, approval} = request_agent_enrollment(c, invitation, "a2")
-    path = "/devices/waiting/" <> approval["approval_code"] <> "/approve"
-
     fields = %{
       "key" => approval["expected_device_id"],
       "deadline" => "",
       "senders" => ""
     }
 
-    approve = fn fields ->
+    approve = fn code, fields ->
+      path = "/devices/waiting/" <> code <> "/approve"
       %{Plug.Test.conn(:post, path, URI.encode_query(fields)) | scheme: :https, port: 443}
       |> Plug.Conn.put_req_header("origin", origin)
       |> Plug.Conn.put_req_header("content-type", "application/x-www-form-urlencoded")
@@ -133,11 +145,27 @@ defmodule AttentionServer.GuidedJoinHTTPSTest do
       |> DashboardReadHTTP.call(dashboard)
     end
 
-    assert approve.(fields).status == 409
+    anonymous_request = %{
+      "public_certificate" => request["public_certificate"],
+      "label" => "Unassigned requester"
+    }
+
+    assert {404, %{"error" => "not_found"}} = post(c, "/enroll", anonymous_request)
+
+    old_fields = %{
+      "key" => c.legacy_pending.key,
+      "deadline" => to_string(c.legacy_pending.expires_at),
+      "senders" => "app:fixture"
+    }
+
+    assert approve.(c.legacy_pending.approval_code, old_fields).status == 409
+    assert {:error, :unauthorized} = Relay.certificate_device_person(c.relay, c.legacy_pending.key)
+
+    assert approve.(approval["approval_code"], fields).status == 409
     assert {:error, :unauthorized} =
              Relay.certificate_device_person(c.relay, approval["expected_device_id"])
 
-    assert approve.(%{fields | "senders" => "app:fixture"}).status == 303
+    assert approve.(approval["approval_code"], %{fields | "senders" => "app:fixture"}).status == 303
     assert_agent_enrollment(c, request, person, approval["expected_device_id"])
   end
 

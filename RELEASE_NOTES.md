@@ -3,7 +3,8 @@
 With S1 active, an account owner can again enroll a new full Agent using the
 existing invitation and `harklight-agent setup`. Use Devices to create an Agent
 invitation and approve the exact key with at least one sender ID. Self-hosted
-owners can also use the owner CLI. Hosted owners approve from their signed-in
+owners can also use the owner CLI. Hosted enrollment requires an invitation
+from the approving account. Hosted owners approve from their signed-in
 dashboard. With no sender ID, approval cannot issue a legacy device
 credential. New phones and iPads continue to use shared sign-in.
 
