@@ -412,7 +412,8 @@ defmodule AttentionServer.Store do
               case preflight.(db) do
                 :ok -> convert_locked(db, upload_dir, prepare_with_auth)
                 {:ok, _info} -> convert_locked(db, upload_dir, prepare_with_auth)
-                {:already_converted, 31} -> {:ok, :already_converted}
+                {:already_converted, 31} -> KeyedMigration.upgrade_anchor(db)
+                {:already_converted, 32} -> {:ok, :already_converted}
                 error -> error
               end
             end
