@@ -30,6 +30,7 @@ defmodule AttentionServer.Engine do
 
   alias AttentionServer.ClientAPI.Resources
 
+  @hosted_notice_sender Message.hosted_notice_sender()
   @terminal_states ~w(answered cleared expired superseded)
   @pending_types ~w(resync ack push_register push_remove push_status)
   @push_claim_timeout_ms 30_000
@@ -1046,7 +1047,7 @@ defmodule AttentionServer.Engine do
     with {:ok, _} <- owner_revision(engine, person, owner_key),
          %{person: ^person, revoked: false} = agent <- Map.get(engine.agents, key),
          true <- expected_revision == agent.grant_revision,
-         true <- AgentAccess.valid_patterns?(read) and AgentAccess.valid_patterns?(respond) do
+         true <- AgentAccess.grantable_patterns?(read) and AgentAccess.grantable_patterns?(respond) do
       next_revision = agent.grant_revision + 1
       read_set = MapSet.new(read)
       respond_set = MapSet.new(respond)
@@ -1635,7 +1636,7 @@ defmodule AttentionServer.Engine do
   def owner_grant_sender(%__MODULE__{} = engine, person, owner_key, device_key, pattern) do
     with {:ok, _revision} <- owner_revision(engine, person, owner_key),
          %{person: ^person, revoked: false} <- Map.get(engine.devices, device_key),
-         true <- Message.sender_id?(pattern) do
+         true <- Message.sender_id?(pattern) and pattern != @hosted_notice_sender do
       setup_sender(engine, device_key, pattern)
     else
       {:error, :forbidden} -> {:error, :forbidden}
@@ -1733,7 +1734,7 @@ defmodule AttentionServer.Engine do
         {:error, :id_in_use}
 
       not (is_list(sender_ids) and sender_ids != [] and
-               Enum.all?(sender_ids, &Message.sender_id?/1)) ->
+               Enum.all?(sender_ids, &(Message.sender_id?(&1) and &1 != @hosted_notice_sender))) ->
         {:error, :invalid_senders}
 
       true ->
@@ -1785,7 +1786,7 @@ defmodule AttentionServer.Engine do
 
   def setup_sender(%__MODULE__{} = engine, key, pattern) do
     with {:ok, %{person: person}} <- principal(engine, key),
-         true <- Message.sender_id?(pattern) do
+         true <- Message.sender_id?(pattern) and pattern != @hosted_notice_sender do
       grants =
         Map.update(
           engine.sender_grants,
@@ -3428,6 +3429,77 @@ defmodule AttentionServer.Engine do
   end
 
   defp valid_sender_ids(_), do: {:error, "sender_ids"}
+
+  @doc false
+  def hosted_notice(engine, person, request, now) do
+    with {:ok, key, content} <- hosted_notice_content(request),
+         true <- Map.has_key?(engine.persons, person) do
+      sender = @hosted_notice_sender
+
+      case receipt(engine, person, sender, key, content) do
+        {:duplicate, %{"seq" => seq}} ->
+          {:ok, engine, %{item_id: Resources.item_id(%{accepted_seq: seq}), created: false}}
+
+        :conflict ->
+          {:error, :key_conflict}
+
+        :missing ->
+          id = uuid_v4()
+
+          body =
+            case content["link"] do
+              nil -> content["body"]
+              link -> content["body"] <> "\n\n" <> link
+            end
+
+          message = %{
+            "sender_id" => sender,
+            "message_id" => id,
+            "display_name" => "Harklight",
+            "message_type" => "fyi",
+            "answer_ui" => Message.seen_descriptor(),
+            "created_at" => now,
+            "title" => content["title"],
+            "body" => body
+          }
+
+          {:ok, next, %{"seq" => seq}} =
+            commit_forward(engine, person, sender, key, content, message, %{}, [], nil, now, [])
+
+          {:ok, next, %{item_id: Resources.item_id(%{accepted_seq: seq}), created: true}}
+      end
+    else
+      false -> {:error, :unknown_person}
+      {:error, :invalid_notice} = error -> error
+    end
+  end
+
+  defp hosted_notice_content(%{"title" => title, "body" => body, "key" => key} = request)
+       when is_binary(body) do
+    valid_link? =
+      case Map.fetch(request, "link") do
+        :error ->
+          true
+
+        {:ok, link} when is_binary(link) ->
+          case URI.new(link) do
+            {:ok, %URI{scheme: "https", host: host}} when is_binary(host) and host != "" -> true
+            _ -> false
+          end
+
+        _ ->
+          false
+      end
+
+    if SenderNames.nonblank?(title) and SenderNames.nonblank?(key) and valid_link? and
+         Enum.all?(Map.keys(request), &(&1 in ~w(title body link key))) do
+      {:ok, key, Map.take(request, ~w(title body link))}
+    else
+      {:error, :invalid_notice}
+    end
+  end
+
+  defp hosted_notice_content(_), do: {:error, :invalid_notice}
 
   defp forward(engine, %{person: person, key: device} = principal, frame) do
     original_message = Map.get(frame, "message")
@@ -5222,6 +5294,8 @@ defmodule AttentionServer.Engine do
 
     if is_binary(Map.get(frame, "by")), do: Map.put(base, "by", frame["by"]), else: base
   end
+
+  defp sender_allowed?(_engine, _person, _device, @hosted_notice_sender), do: false
 
   defp sender_allowed?(engine, person, device, sender) do
     engine.sender_grants

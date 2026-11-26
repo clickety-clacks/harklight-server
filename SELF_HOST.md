@@ -149,6 +149,33 @@ configured value are refused individually. The package elects no production
 SaaS cap. These settings need deliberate configuration; installation leaves the
 protected environment unchanged.
 
+### Hosted loopback interface
+
+In `saas` mode, `ATTENTION_SERVER_HOSTED_PORT` enables the private HTTP
+listener on `127.0.0.1` used by the Hosted sign-in component. The listener
+trusts local access, as for `POST /accounts` and `POST /sign-in-links`.
+
+`POST /persons/{person_id}/notices` delivers an FYI from **Harklight**
+(`app:harklight/notices`) to an existing person on this Server. It accepts a
+JSON object with a nonblank `title`, a string `body`, a nonblank `key`, and an
+optional absolute HTTPS `link`. When supplied, the URL appears on its own
+line after the message body. The request uses the listener's 4 KiB body limit.
+
+A successful response is `200 {"item_id":"i1","created":true}`. Repeating the
+same key and content for the same person returns the original item ID with
+`"created":false`. Keys are independent across people. Changed content for an
+existing key returns `409`. Invalid input returns `400`, oversized requests
+return `413`, and an unknown person returns `404`. Delivery uses the normal
+attention-based delivery and push behavior for an FYI. An unopened notice can
+full-bounce without producing a sender advisory. The system sender is reserved
+and its notices are visible to the recipient's clients. Agents cannot read
+these notices or receive grants for the system sender.
+
+**FORMAT31 rollback.** Once this Server writes a hosted notice, earlier
+FORMAT31 builds cannot open the store. Rolling back to one of those builds
+requires restoring the complete pre-upgrade backup and loses all writes made
+after that backup.
+
 ### Hosted attention list prioritization
 
 For a Server running in `saas` mode, set these variables in its private

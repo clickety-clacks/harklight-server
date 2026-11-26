@@ -21,6 +21,7 @@ defmodule AttentionServer.ClientAPI.Reads do
   import Plug.Conn
 
   alias AttentionServer.{
+    AgentAccess,
     ChangeLog,
     ConversationFiles,
     Engine,
@@ -75,7 +76,8 @@ defmodule AttentionServer.ClientAPI.Reads do
   def get_search(conn, %Context{}), do: Errors.send_error(conn, "not_found")
 
   defp search(relay, who, params) do
-    with {:ok, filters, limit} <- Search.query(params),
+    with :ok <- visible_search_sender(who, params),
+         {:ok, filters, limit} <- Search.query(params),
          {:ok, principal, current_high, position} <- call(relay, {:search_snapshot, who}),
          binding = Search.binding(principal, filters),
          {:ok, high, before} <- Search.position(params["page"], current_high, binding),
@@ -86,6 +88,12 @@ defmodule AttentionServer.ClientAPI.Reads do
          {:ok, items} <- call(relay, {:search_items, who, position, matches}) do
       Search.response(position, items, filters, %{limit: limit, high: high, binding: binding})
     end
+  end
+
+  defp visible_search_sender(who, params) do
+    if AgentAccess.visible_sender?(who, params["sender"]),
+      do: :ok,
+      else: {:error, :invalid_field, "sender"}
   end
 
   @doc false
@@ -328,7 +336,7 @@ defmodule AttentionServer.ClientAPI.Reads do
 
       rows =
         Enum.flat_map(shown, fn {item_id, rank} ->
-          case Resources.person_item_key(engine, person, item_id) do
+          case visible_item_key(engine, principal, item_id) do
             {:ok, item_key} -> [{item_key, rank, ChangeLog.item_resource(item_key)}]
             _ -> []
           end
@@ -370,10 +378,10 @@ defmodule AttentionServer.ClientAPI.Reads do
   defp read({:search_candidates, who, position, sequence, filters}, state) do
     engine = state.store.engine
 
-    with {:ok, %{person: person, kind: kind}} when kind in [:agent, :device] <-
+    with {:ok, %{person: person, kind: kind} = principal} when kind in [:agent, :device] <-
            principal(engine, who),
          :ok <- search_position(state, person, position) do
-      {:ok, Search.candidates(engine, person, sequence, filters)}
+      {:ok, Search.candidates(engine, principal, sequence, filters)}
     end
   end
 
@@ -404,7 +412,7 @@ defmodule AttentionServer.ClientAPI.Reads do
     engine = state.store.engine
 
     with {:ok, principal} <- principal(engine, key),
-         {:ok, item_key} <- Resources.person_item_key(engine, principal.person, item_id),
+         {:ok, item_key} <- visible_item_key(engine, principal, item_id),
          :ok <- ChangeLog.ranks_available(state.store, principal.person),
          {:ok, position} <- head(state, principal.person),
          context = %{engine: engine, store: state.store, view: view(state, principal.person)},
@@ -421,7 +429,7 @@ defmodule AttentionServer.ClientAPI.Reads do
     engine = state.store.engine
 
     with {:ok, principal} <- principal(engine, key),
-         {:ok, item_key} <- Resources.person_item_key(engine, principal.person, item_id),
+         {:ok, item_key} <- visible_item_key(engine, principal, item_id),
          {:ok, n} <- revision_number(n),
          {:ok, revision} <- Resources.revision(engine, item_key, n),
          {:ok, position} <- head(state, principal.person) do
@@ -433,7 +441,7 @@ defmodule AttentionServer.ClientAPI.Reads do
     engine = state.store.engine
 
     with {:ok, principal} <- principal(engine, key),
-         {:ok, item_key} <- Resources.person_item_key(engine, principal.person, item_id),
+         {:ok, item_key} <- visible_item_key(engine, principal, item_id),
          {:ok, limit} <- limit(params),
          {:ok, position} <- head(state, principal.person) do
       all = Resources.entries(engine, item_key, Map.get(state.priority_views, principal.person))
@@ -512,6 +520,15 @@ defmodule AttentionServer.ClientAPI.Reads do
         {:upload, upload_id} -> {:ok, {:upload, upload_id}}
         {:inline, file} -> inline_file(file)
       end
+    end
+  end
+
+  defp visible_item_key(engine, principal, item_id) do
+    with {:ok, {_, sender, _} = key} <- Resources.person_item_key(engine, principal.person, item_id),
+         true <- AgentAccess.visible_sender?(principal, sender) do
+      {:ok, key}
+    else
+      _ -> {:error, :not_found}
     end
   end
 
