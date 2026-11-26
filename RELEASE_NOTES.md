@@ -1,3 +1,23 @@
+# Harklight Server v0.2.29
+
+Harklight is described as an attention-based UI. The served agent guides, the
+install and API documents and the dashboard text no longer call it an inbox or
+a queue, and directions point to screens without naming their labels. The
+notice an agent gets when a message hasn't been acted on is reworded the same
+way; its fields are unchanged. API paths and field names are unchanged.
+
+## Upgrade and recovery
+
+As in v0.2.26 through v0.2.28: FORMAT31. An existing FORMAT30 store is
+converted once, with the Server stopped, before the first start (see
+SELF_HOST.md); a store already on FORMAT31 needs nothing. To go back, restore
+the complete pre-upgrade backup and run the release that wrote it.
+
+**Compatibility.** Harklight Server 0.2.29 speaks only the 0.2 protocol, with
+no API change, and bundles Harklight Web 0.2.6. Install it together with an
+iPhone app build that reads `receipt_expected`. Harklight Agent 0.2.6 and 0.2.7
+work with it.
+
 # Harklight Server v0.2.28
 
 Stopped FORMAT30 conversion now accepts historical messages whose records omit
