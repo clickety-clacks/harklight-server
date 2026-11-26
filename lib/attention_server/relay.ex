@@ -20,6 +20,7 @@ defmodule AttentionServer.Relay do
 
   alias AttentionServer.{
     AppliedScoreRecord,
+    BrowserAuth,
     BrowserRecipient,
     BounceDecision,
     BouncePolicy,
@@ -29,10 +30,15 @@ defmodule AttentionServer.Relay do
     DashboardInventory,
     Diagnostics,
     DeviceIdentity,
+    DeviceMigration,
+    DeviceProof,
     Engine,
     Message,
+    NativeSignIn,
     JevClient,
     JevRanking,
+    LocalPasskeys,
+    LocalSignIn,
     Placement,
     RouteBIndex,
     Store
@@ -243,6 +249,9 @@ defmodule AttentionServer.Relay do
     do: GenServer.call(server, {:device_remove, verified_key}, :infinity)
 
   # Only cleanup TLS admission uses this retained identity; it grants no relay access.
+  def legacy_device_enrollment?(server),
+    do: GenServer.call(server, :legacy_device_enrollment?, :infinity)
+
   def removal_identity(server, key),
     do: GenServer.call(server, {:removal_identity, key}, :infinity)
 
@@ -258,6 +267,51 @@ defmodule AttentionServer.Relay do
   @doc "Authenticate a bearer once, returning its stored person-owner principal only after commit."
   def consume_browser_sign_in(server, token),
     do: GenServer.call(server, {:consume_browser_sign_in, token}, :infinity)
+
+  def owner_sign_in_code(server, person, key),
+    do: GenServer.call(server, {:owner_sign_in_code, person, key}, :infinity)
+
+  def redeem_owner_code(server, code, transaction),
+    do: GenServer.call(server, {:redeem_owner_code, code, transaction}, :infinity)
+
+  def local_passkey(server, operation, payload),
+    do: GenServer.call(server, {:local_passkey, operation, payload}, :infinity)
+
+  def redeem_browser_fragment(server, token, session_hash),
+    do: GenServer.call(server, {:redeem_browser_fragment, token, session_hash}, :infinity)
+
+  def browser_session(server, hash),
+    do: GenServer.call(server, {:browser_session, hash}, :infinity)
+
+  def hosted_browser_grant(server, person, transaction, method),
+    do: GenServer.call(server, {:hosted_browser_grant, person, transaction, method}, :infinity)
+
+  def redeem_hosted_browser_grant(server, grant, transaction),
+    do: GenServer.call(server, {:redeem_hosted_browser_grant, grant, transaction}, :infinity)
+
+  def certificate_device_person(server, key),
+    do: GenServer.call(server, {:certificate_device_person, key}, :infinity)
+
+  def migration_grant(server, principal),
+    do: GenServer.call(server, {:migration_grant, principal}, :infinity)
+
+  def finish_migration(server, principal, signature),
+    do: GenServer.call(server, {:finish_migration, principal, signature}, :infinity)
+
+  def native_sign_in_methods(server),
+    do: GenServer.call(server, :native_sign_in_methods, :infinity)
+
+  def create_native_transaction(server, verifier_hash),
+    do: GenServer.call(server, {:create_native_transaction, verifier_hash}, :infinity)
+
+  def redeem_native_transaction(server, request),
+    do: GenServer.call(server, {:redeem_native_transaction, request}, :infinity)
+
+  def native_session(server, bearer),
+    do: GenServer.call(server, {:native_session, bearer}, :infinity)
+
+  def authorize_hosted_native_transaction(server, person, transaction, method),
+    do: GenServer.call(server, {:authorize_hosted_native_transaction, person, transaction, method}, :infinity)
 
   def owner_invite_create(server, person, owner_key),
     do: GenServer.call(server, {:owner_invite_create, person, owner_key}, :infinity)
@@ -463,8 +517,8 @@ defmodule AttentionServer.Relay do
   end
 
   @doc false
-  def apply_client_command(server, key, command, sources),
-    do: GenServer.call(server, {:client_command, key, command, sources}, :infinity)
+  def apply_client_command(server, key, command, sources, durable \\ nil),
+    do: GenServer.call(server, {:client_command, key, command, sources, durable}, :infinity)
 
   @doc false
   def push_server_id(server), do: GenServer.call(server, :push_server_id, :infinity)
@@ -553,6 +607,7 @@ defmodule AttentionServer.Relay do
               sender_names: Keyword.get(opts, :sender_names, %{}),
               join_configuration: Keyword.get(opts, :join_configuration),
               dashboard_origin: Keyword.get(opts, :dashboard_origin),
+              native_passkeys: Keyword.get(opts, :native_passkeys, false),
               hosted_test_account: Keyword.get(opts, :hosted_test_account),
               deployment_mode: Keyword.get(opts, :deployment_mode, :self_hosted),
               upload_cap: Keyword.get(opts, :upload_cap, :none)
@@ -598,8 +653,36 @@ defmodule AttentionServer.Relay do
 
   defp open_startup_store(opts) do
     case Store.open_relay(Keyword.get(opts, :store_path)) do
-      {:ok, store} -> enable_change_log(Store.track_relay_writes(store), opts)
+      {:ok, store} -> initialize_store(Store.track_relay_writes(store), opts)
       {:error, reason} -> {:error, startup_reason(opts, :store_open_failed, reason)}
+    end
+  end
+
+  defp initialize_store(store, opts) do
+    result =
+      if Keyword.get(opts, :sign_in_s1, false) do
+        mode = Keyword.get(opts, :deployment_mode, :self_hosted)
+        devices = Keyword.get(opts, :auth_migration_devices, [])
+
+        cond do
+          mode == :saas and devices != [] ->
+            {:error, :hosted_auth_migration_not_supported}
+
+          Enum.uniq(devices) != devices ->
+            {:error, :duplicate_auth_migration_device}
+
+          true ->
+            Store.activate_auth(store, mode, devices)
+        end
+      else
+        {:ok, store}
+      end
+
+    case result do
+      {:ok, ready} -> enable_change_log(ready, opts)
+      {:error, reason} ->
+        Store.close(store)
+        {:error, startup_reason(opts, :store_initialization_failed, {:storage_unavailable, reason})}
     end
   end
 
@@ -891,16 +974,19 @@ defmodule AttentionServer.Relay do
   end
 
   defp dispatch_call(
-         {:client_command, key, command, sources},
+         {:client_command, key, command, sources, durable},
          _from,
          state
        ) do
     with {:ok, person} <- Engine.authorized_person(state.store.engine, key),
+         {:ok, nil} <- before_app_command(state, durable),
          :ok <- client_command_enabled(state, command),
          :ok <- verify_staged_reply_sources(state.store, person, sources) do
-      {reply, next} = perform_command(state, key, command, sources)
-      {:reply, reply, next}
+      {reply, next} = perform_command(state, key, command, sources, durable)
+      {:reply, committed_app_response(next, durable, reply), next}
     else
+      {:replay, status, body} -> {:reply, {:retained, status, body, true}, state}
+      {:error, :idempotency_conflict} -> {:reply, {:error, "operation_conflict", nil, nil}, state}
       error -> {:reply, error, state}
     end
   end
@@ -1294,6 +1380,45 @@ defmodule AttentionServer.Relay do
     end
   end
 
+  defp dispatch_call({:local_passkey, operation, payload}, _from, state) do
+    result =
+      case {state.deployment_mode, state.store} do
+        {:self_hosted, %{auth_schema: %{}}} -> local_passkey_operation(state, operation, payload)
+        _ -> {:error, :disabled}
+      end
+
+    {:reply, result, state}
+  end
+
+  defp dispatch_call({:owner_sign_in_code, person, key}, _from, state) do
+    result =
+      case {state.deployment_mode, state.store} do
+        {:self_hosted, %{auth_schema: %{}, db: db, engine: engine}} ->
+          LocalSignIn.issue(db, engine, person, key, state.clock.())
+
+        _ ->
+          {:error, :disabled}
+      end
+
+    {:reply, result, state}
+  end
+
+  defp dispatch_call({:redeem_owner_code, code, transaction}, _from, state) do
+    result =
+      case {state.deployment_mode, state.store} do
+        {:self_hosted, %{auth_schema: %{}, db: db, engine: engine}} ->
+          LocalSignIn.redeem(db, engine, code, transaction, state.clock.())
+
+        _ ->
+          {:error, :disabled}
+      end
+
+    {:reply, result, state}
+  end
+
+  defp dispatch_call({:owner_browser_sign_in_create, _, _}, _from, %{store: %{auth_schema: %{}}} = state),
+    do: {:reply, {:error, :not_found}, state}
+
   defp dispatch_call({:owner_browser_sign_in_create, person, owner}, _from, state) do
     case issue_browser_sign_in(state, state.store.engine, person, owner, owner) do
       {:ok, response, next} -> {:reply, {:ok, response}, next}
@@ -1463,30 +1588,229 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  defp dispatch_call({:consume_browser_sign_in, token}, _from, state) do
-    with {:ok, hash} <- AttentionServer.BrowserSignIn.token_hash(token) do
-      case AttentionServer.BrowserSignIn.consume(state.store.engine, hash) do
-        {:ok, next, principal} ->
-          case commit(state.store, next, %{
-                 person: principal.person_id,
-                 actor: principal.owner_key,
-                 action: "browser_sign_in_consume"
-               }) do
-            {:ok, committed} ->
-              principal = with_hosted_label(principal, :display_name, next)
-              {:reply, {:ok, principal}, %{state | store: committed}}
+  defp dispatch_call({:certificate_device_person, key}, _from, state) do
+    result =
+      case state.store do
+        %{auth_schema: nil, engine: engine} ->
+          Engine.authorized_person(engine, key)
 
-            _ ->
-              {:reply, {:error, :storage_unavailable}, state}
+        %{auth_schema: schema, db: db, engine: engine} ->
+          with %{person: person, revoked: false} <- engine.devices[key],
+               true <- certificate_device_allowed?(state.deployment_mode, schema, db, engine, person, key) do
+            {:ok, person}
+          else
+            _ -> {:error, :unauthorized}
           end
-
-        error ->
-          {:reply, error, state}
       end
-    else
-      _ -> {:reply, {:error, :invalid_sign_in}, state}
+
+    {:reply, result, state}
+  end
+
+  defp dispatch_call({:migration_grant, principal}, _from, state) do
+    result =
+      with %{kind: :device, session_id: nil, key: key, person: person} <- principal,
+           %{auth_schema: %{device_certificates_disabled: false}, db: db, engine: engine} <- state.store,
+           :self_hosted <- state.deployment_mode,
+           %{person: ^person, revoked: false} <- engine.devices[key],
+           "https://" <> _ = origin <- state.dashboard_origin do
+        DeviceMigration.issue(db, person, key, origin, state.clock.())
+      else
+        _ -> {:error, :unauthorized}
+      end
+
+    {:reply, result, state}
+  end
+
+  defp dispatch_call({:finish_migration, principal, signature}, _from, state) do
+    result =
+      with %{kind: :device, session_id: hash} when is_binary(hash) <- principal,
+           %{auth_schema: %{device_certificates_disabled: false}, db: db, engine: engine} <- state.store,
+           :self_hosted <- state.deployment_mode do
+        DeviceMigration.activate(db, engine, hash, signature)
+      else
+        _ -> {:error, :unauthorized}
+      end
+
+    case result do
+      {:ok, device, true} ->
+        ChangeLog.notify_closing([{{:device_certificate, device}, :revoked}])
+        {:reply, :ok, state}
+
+      {:ok, _, false} -> {:reply, :ok, state}
+      error -> {:reply, error, state}
     end
   end
+
+  defp dispatch_call({:redeem_native_transaction, %{"token" => _} = request}, _from, state) do
+    result =
+      with :self_hosted <- state.deployment_mode,
+           %{auth_schema: %{device_certificates_disabled: false}, db: db, engine: engine} <-
+             state.store do
+        DeviceMigration.redeem(db, engine, request, state.clock.())
+      else
+        _ -> {:error, :unauthorized}
+      end
+
+    case result do
+      {:ok, response, previous} ->
+        if previous, do: ChangeLog.notify_closing([{{:device_session, previous}, :revoked}])
+        {:reply, {:ok, response}, state}
+
+      error ->
+        {:reply, error, state}
+    end
+  end
+
+  defp dispatch_call(:native_sign_in_methods, _from, state) do
+    methods =
+      case {state.store.auth_schema, state.deployment_mode} do
+        {%{}, :saas} -> {:ok, ~w(google apple email_code)}
+        {%{}, :self_hosted} -> {:ok, ~w(owner_code)}
+        _ -> {:error, :disabled}
+      end
+
+    methods =
+      case methods do
+        {:ok, available} when state.native_passkeys -> {:ok, available ++ ["passkey"]}
+        result -> result
+      end
+
+    {:reply, methods, state}
+  end
+
+  defp dispatch_call({:create_native_transaction, verifier_hash}, _from, state) do
+    result =
+      case state.store do
+        %{auth_schema: %{}, db: db} -> NativeSignIn.begin(db, verifier_hash, state.clock.())
+        _ -> {:error, :disabled}
+      end
+
+    {:reply, result, state}
+  end
+
+  defp dispatch_call({:redeem_native_transaction, request}, _from, state) do
+    case state.store do
+      %{auth_schema: %{}, db: db, engine: engine} ->
+        result = NativeSignIn.prepare_redemption(db, engine, request, state.clock.(), state.deployment_mode)
+
+        case result do
+          {:ok, next, redemption, response} ->
+            audit = %{
+              person: redemption.person,
+              actor: redemption.device,
+              action: "native_sign_in",
+              native_redemption: redemption
+            }
+
+            case commit(state.store, next, audit) do
+              {:ok, store} ->
+                notify_native_recovery(redemption)
+                {:reply, {:ok, response}, %{state | store: store}}
+
+              _ -> {:reply, {:error, :storage_unavailable}, state}
+            end
+
+          {:ok, %{"person_id" => person, "device_id" => device} = response} ->
+            case Engine.authorized_person(engine, device) do
+              {:ok, ^person} -> {:reply, {:ok, response}, state}
+              _ -> {:reply, {:error, :unauthorized}, state}
+            end
+
+          error ->
+            {:reply, error, state}
+        end
+
+      _ ->
+        {:reply, {:error, :disabled}, state}
+    end
+  end
+
+  defp dispatch_call({:native_session, bearer}, _from, state) do
+    result =
+      with %{auth_schema: %{}, db: db, engine: engine} <- state.store,
+           true <- DeviceProof.secret?(bearer),
+           hash = DeviceProof.digest(bearer),
+           {:ok, %{device_id: device, person_id: person} = session} <-
+             NativeSignIn.lookup_session(db, hash),
+           {:ok, ^person} <- Engine.authorized_person(engine, device) do
+        {:ok, Map.put(session, :hash, hash)}
+      else
+        {:error, reason} when reason not in [:unauthorized, :forbidden] ->
+          {:error, :storage_unavailable}
+
+        _ -> {:error, :unauthorized}
+      end
+
+    {:reply, result, state}
+  end
+
+  defp dispatch_call({:authorize_hosted_native_transaction, person, transaction, method}, _from, state) do
+    result =
+      with :saas <- state.deployment_mode,
+           %{auth_schema: %{}, db: db, engine: engine} <- state.store,
+           {:ok, _record} <- hosted_record(engine, person) do
+        NativeSignIn.authorize_hosted(db, transaction, person, method, state.clock.())
+      else
+        :self_hosted -> {:error, :disabled}
+        %Store{auth_schema: nil} -> {:error, :disabled}
+        error -> error
+      end
+
+    {:reply, result, state}
+  end
+
+  defp dispatch_call({:hosted_browser_grant, person, transaction, method}, _from, state) do
+    result =
+      with :saas <- state.deployment_mode,
+           %{auth_schema: %{}, db: db, engine: engine} <- state.store,
+           {:ok, _record} <- hosted_record(engine, person),
+           key when is_binary(key) <- Engine.hosted_owner_key(engine, person),
+           {:ok, revision} <- Engine.owner_revision(engine, person, key) do
+        BrowserAuth.issue_hosted(db, transaction, person, key, revision, method, state.clock.())
+      else
+        :self_hosted -> {:error, :disabled}
+        %Store{auth_schema: nil} -> {:error, :disabled}
+        _ -> {:error, :not_hosted}
+      end
+
+    {:reply, result, state}
+  end
+
+  defp dispatch_call({:redeem_hosted_browser_grant, grant, transaction}, _from, state) do
+    result =
+      case {state.deployment_mode, state.store} do
+        {:saas, %{auth_schema: %{}, db: db, engine: engine}} ->
+          BrowserAuth.redeem_hosted(db, engine, grant, transaction, state.clock.())
+
+        _ ->
+          {:error, :disabled}
+      end
+
+    {:reply, result, state}
+  end
+
+  defp dispatch_call({:browser_session, hash}, _from, state) do
+    result =
+      with %{auth_schema: %{}, db: db, engine: engine} <- state.store,
+           {:ok, %{person: person, key: key, revision: revision} = session} <-
+             BrowserAuth.session(db, hash),
+           {:ok, ^revision} <- Engine.owner_revision(engine, person, key) do
+        {:ok, with_hosted_label(session, :display_name, engine, person)}
+      else
+        {:error, reason} when reason not in [:invalid_session, :forbidden] ->
+          {:error, :storage_unavailable}
+
+        _ -> {:error, :invalid_session}
+      end
+
+    {:reply, result, state}
+  end
+
+  defp dispatch_call({:consume_browser_sign_in, token}, _from, state),
+    do: consume_browser_fragment(state, token, nil)
+
+  defp dispatch_call({:redeem_browser_fragment, token, hash}, _from, state),
+    do: consume_browser_fragment(state, token, hash)
 
   defp dispatch_call({:owner_invite_create, person, owner}, _from, state) do
     token = :crypto.strong_rand_bytes(32)
@@ -1623,43 +1947,48 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  defp dispatch_call({:removal_identity, key}, _from, state) do
-    reply =
-      case Map.get(state.store.engine.devices, key) do
-        %{person: person} -> {:ok, person}
-        _ -> {:error, :not_found}
-      end
+  defp dispatch_call(:legacy_device_enrollment?, _from, state),
+    do: {:reply, is_nil(state.store.auth_schema), state}
 
-    {:reply, reply, state}
+  defp dispatch_call({:removal_identity, key}, _from, state),
+    do: {:reply, legacy_removal_identity(state, key), state}
+
+  defp dispatch_call({:client_devices, principal, operation}, _from, state) do
+    with %Store{auth_schema: %{}} <- state.store,
+         :ok <- authorize_device_management(state, principal) do
+      manage_devices(state, principal, operation)
+    else
+      %Store{} -> {:reply, {:error, :disabled}, state}
+      error -> {:reply, error, state}
+    end
   end
 
   defp dispatch_call({:device_remove, key}, _from, state) do
-    case Engine.device_remove(state.store.engine, key) do
-      {:ok, next, reply} ->
-        next = revoke_origin_sessions(next, reply["person_id"], key)
+    with {:ok, _person} <- legacy_removal_identity(state, key),
+         {:ok, next, reply} <- Engine.device_remove(state.store.engine, key) do
+      next = revoke_origin_sessions(next, reply["person_id"], key)
 
-        case commit_device_removal(
-               state,
-               next,
-               reply["person_id"],
-               key,
-               key,
-               "device_self_remove"
-             ) do
-          {:ok, next} ->
-            next = remove_focus_device(next, key, reply["person_id"])
-            {:reply, {:ok, reply}, next}
+      case commit_device_removal(
+             state,
+             next,
+             reply["person_id"],
+             key,
+             key,
+             "device_self_remove"
+           ) do
+        {:ok, next} ->
+          next = remove_focus_device(next, key, reply["person_id"])
+          {:reply, {:ok, reply}, next}
 
-          {:error, _, next, :committed} ->
-            next = remove_focus_device(next, key, reply["person_id"])
-            {:reply, {:error, :storage_unavailable}, next}
+        {:error, _, next, :committed} ->
+          next = remove_focus_device(next, key, reply["person_id"])
+          {:reply, {:error, :storage_unavailable}, next}
 
-          {:error, _, _, :not_committed} ->
-            {:reply, {:error, :storage_unavailable}, state}
-        end
-
-      error ->
-        {:reply, error, state}
+        {:error, _, _, :not_committed} ->
+          {:reply, {:error, :storage_unavailable}, state}
+      end
+    else
+      error -> {:reply, error, state}
     end
   end
 
@@ -2111,8 +2440,21 @@ defmodule AttentionServer.Relay do
 
   # Signing a browser out closes its v2 feeds and ends its focus report.
   defp dispatch_call({:end_browser_session, browser_session_id}, _from, state) do
-    AttentionServer.ChangeLog.notify_closing([{{:browser_session, browser_session_id}, :revoked}])
-    {:reply, :ok, end_focus(state, {:browser, browser_session_id})}
+    result =
+      case state.store do
+        %{auth_schema: %{}, db: db} when is_binary(browser_session_id) ->
+          BrowserAuth.remove_session(db, browser_session_id)
+        _ -> :ok
+      end
+
+    case result do
+      :ok ->
+        AttentionServer.ChangeLog.notify_closing([{{:browser_session, browser_session_id}, :revoked}])
+        {:reply, :ok, end_focus(state, {:browser, browser_session_id})}
+
+      _ ->
+        {:reply, {:error, :storage_unavailable}, state}
+    end
   end
 
   # Each frame is released under current authority. A released write belongs
@@ -2810,7 +3152,7 @@ defmodule AttentionServer.Relay do
 
   defp client_command_enabled(_state, _command), do: :ok
 
-  defp perform_command(state, key, command, staged_sources) do
+  defp perform_command(state, key, command, staged_sources, durable \\ nil) do
     {next_engine, reply} = Engine.request_command(state.store.engine, key, command, state.clock.())
 
     next_engine =
@@ -2831,7 +3173,8 @@ defmodule AttentionServer.Relay do
       operation_id,
       targets,
       command["type"] || "relay_request",
-      command
+      command,
+      app_receipt_capture(state, durable, reply)
     )
   end
 
@@ -2867,11 +3210,53 @@ defmodule AttentionServer.Relay do
     end)
   end
 
-  defp finish_request(state, key, next_engine, reply, operation_id, targets, action, original) do
-    if next_engine == state.store.engine do
+  defp before_app_command(_state, nil), do: {:ok, nil}
+
+  defp before_app_command(state, receipt),
+    do: AttentionServer.ClientAPI.Writes.lookup_app_receipt(state, receipt)
+
+  defp committed_app_response(_state, nil, reply), do: reply
+
+  defp committed_app_response(state, receipt, reply) do
+    with {:ok, %{digest: digest, body: encoded, status: status, original_response: true}} <-
+           AttentionServer.ClientAPI.Idempotency.lookup_retained(state.store.db, receipt.person, receipt.key),
+         true <- digest == receipt.digest,
+         {:ok, body} <- JSON.decode_line(encoded <> "\n") do
+      {:retained, status, body, false}
+    else
+      _ -> reply
+    end
+  end
+
+  defp app_receipt_capture(_state, nil, _reply), do: nil
+
+  defp app_receipt_capture(state, durable, reply) do
+    if match?({:ok, _}, reply) or match?({:error, _, _, terminal} when is_map(terminal), reply) do
+      fn store ->
+        snapshot = %{state | store: store}
+
+        with {:ok, status, body} <-
+               AttentionServer.ClientAPI.Writes.materialize_app_receipt(durable, reply, snapshot),
+             :ok <-
+               AttentionServer.ClientAPI.Idempotency.save_retained(
+                 store.db, durable.person, durable.key, durable.digest, status, body
+               ) do
+          :ok
+        else
+          {:error, _} = error -> error
+          _ -> {:error, :receipt_unavailable}
+        end
+      end
+    end
+  end
+
+  defp finish_request(state, key, next_engine, reply, operation_id, targets, action, original,
+         receipt_capture \\ nil) do
+    if next_engine == state.store.engine and is_nil(receipt_capture) do
       {reply, state}
     else
       audit = Map.put(audit(state.store.engine, key, action), :operation_id, operation_id)
+      audit = if receipt_capture, do: Map.put(audit, :app_receipt_capture, receipt_capture), else: audit
 
       case commit_request(state.store, next_engine, audit, original) do
         {:ok, store} ->
@@ -3814,6 +4199,114 @@ defmodule AttentionServer.Relay do
     end
   end
 
+  defp certificate_device_allowed?(mode, schema, db, engine, person, key) do
+    case DeviceMigration.phase(db, key) do
+      {:ok, ^person, phase} when phase in ["legacy", "pending"] ->
+        mode == :self_hosted and not schema.device_certificates_disabled
+
+      {:error, :unknown_device} ->
+        # The published Agent CLI enrolled as a device and received sender grants.
+        # A phone on the migration roster follows its phase even if it has grants.
+        grants = Map.get(engine.sender_grants, {person, key}, MapSet.new())
+        # Off-roster recovery commits a native session. Removing that session also revokes
+        # the device or atomically replaces the session, so the certificate cannot return.
+        MapSet.size(grants) > 0 and NativeSignIn.device_session_hash(db, key) == {:ok, nil}
+
+      _ ->
+        false
+    end
+  end
+
+  defp legacy_removal_identity(state, key) do
+    case {state.deployment_mode, state.store.auth_schema, state.store.engine.devices[key]} do
+      {_, nil, %{person: person}} ->
+        {:ok, person}
+
+      {:self_hosted, %{device_certificates_disabled: false}, %{person: person, revoked: false}} ->
+        if DeviceMigration.eligible?(state.store.db, person, key),
+          do: {:ok, person},
+          else: {:error, :not_found}
+
+      _ ->
+        {:error, :not_found}
+    end
+  end
+
+  defp notify_native_recovery(%{old_device: "attached", device: device, previous: previous}) do
+    closed = [{{:device_certificate, device}, :revoked}]
+    closed = if previous, do: [{{:device_session, previous}, :revoked} | closed], else: closed
+    ChangeLog.notify_closing(closed)
+  end
+
+  defp notify_native_recovery(_), do: :ok
+
+  defp authorize_device_management(state, %{kind: :browser, person: person, key: key, owner_revision: revision}) do
+    case Engine.owner_revision(state.store.engine, person, key) do
+      {:ok, ^revision} -> :ok
+      _ -> {:error, :unauthorized}
+    end
+  end
+
+  defp authorize_device_management(state, %{kind: :device, person: person, key: key, session_id: hash})
+       when is_binary(hash) do
+    with {:ok, %{device_id: ^key, person_id: ^person, pending: false}} <-
+           NativeSignIn.lookup_session(state.store.db, hash),
+         {:ok, ^person} <- Engine.authorized_person(state.store.engine, key) do
+      :ok
+    else
+      _ -> {:error, :unauthorized}
+    end
+  end
+
+  defp authorize_device_management(_state, _principal), do: {:error, :forbidden}
+
+  defp manage_devices(state, principal, :list) do
+    person = principal.person
+
+    result =
+      with {:ok, signed_in} <- NativeSignIn.signed_in_devices(state.store.db, person) do
+        devices =
+          for {id, %{person: ^person, revoked: false} = device} <- state.store.engine.devices do
+            %{
+              "device_id" => id,
+              "label" => Map.get(device, :label),
+              "signed_in_at" => Map.get(signed_in, id),
+              "current" => principal.kind == :device and principal.key == id
+            }
+          end
+
+        {:ok, Enum.sort_by(devices, & &1["device_id"])}
+      end
+
+    {:reply, result, state}
+  end
+
+  defp manage_devices(state, %{person: person}, {:known, device}) do
+    {:reply, {:ok, match?(%{person: ^person}, state.store.engine.devices[device])}, state}
+  end
+
+  defp manage_devices(state, %{kind: :device, key: device} = principal, :sign_out),
+    do: manage_devices(state, principal, {:remove, device})
+
+  defp manage_devices(state, _principal, :sign_out),
+    do: {:reply, {:error, :forbidden}, state}
+
+  defp manage_devices(state, %{person: person, key: actor}, {:remove, device}) do
+    with %{person: ^person} <- state.store.engine.devices[device],
+         {:ok, next_engine} <- Engine.revoke_device(state.store.engine, device) do
+      next_engine = revoke_origin_sessions(next_engine, person, device)
+
+      case commit_device_removal(state, next_engine, person, device, actor, "client_device_remove") do
+        {:ok, next} -> {:reply, :ok, remove_focus_device(next, device, person)}
+        {:error, _, next, :committed} ->
+          {:reply, {:error, :storage_unavailable}, remove_focus_device(next, device, person)}
+        {:error, _, _, :not_committed} -> {:reply, {:error, :storage_unavailable}, state}
+      end
+    else
+      _ -> {:reply, {:error, :not_found}, state}
+    end
+  end
+
   defp commit_device_removal(state, next_engine, person, key, actor, action) do
     engine = state.store.engine
     references = Map.get(state.upload_index.references_by_person, person, MapSet.new())
@@ -3825,6 +4318,7 @@ defmodule AttentionServer.Relay do
 
     next_engine = Enum.reduce(abandoned_ids, next_engine, &Engine.delete_row(&2, :uploads, &1))
     audit = %{person: person, actor: actor, action: action}
+    audit = if state.store.auth_schema, do: Map.put(audit, :auth_device_removal, key), else: audit
 
     case commit(state.store, next_engine, audit) do
       {:ok, store} ->
@@ -4206,6 +4700,73 @@ defmodule AttentionServer.Relay do
 
   defp commit_hosted_organization(state, {:error, reason}, _action),
     do: {:reply, {:error, reason}, state}
+
+  defp local_passkey_operation(state, :assertion_options, request) do
+    transaction = Map.get(request, "transaction")
+
+    if is_nil(transaction) or state.native_passkeys do
+      LocalPasskeys.assertion_options(state.store.db, state.dashboard_origin, transaction, state.clock.())
+    else
+      {:error, :invalid_passkey}
+    end
+  end
+
+  defp local_passkey_operation(state, :assertion_finish, request),
+    do: LocalPasskeys.authenticate(state.store.db, state.store.engine, request, state.clock.(), state.native_passkeys)
+
+  defp local_passkey_operation(state, operation, {cookie, request})
+       when operation in [:registration_options, :registration_finish] and is_binary(cookie) do
+    hash = BrowserAuth.hash(cookie)
+
+    with {:ok, %{person: person, key: key, revision: revision} = principal} <-
+           BrowserAuth.session(state.store.db, hash),
+         {:ok, ^revision} <- Engine.owner_revision(state.store.engine, person, key) do
+      case operation do
+        :registration_options ->
+          LocalPasskeys.registration_options(state.store.db, state.dashboard_origin, hash, person, state.clock.())
+
+        :registration_finish ->
+          LocalPasskeys.register(state.store.db, hash, principal, request, state.clock.())
+      end
+    else
+      _ -> {:error, :invalid_passkey}
+    end
+  end
+
+  defp local_passkey_operation(_state, _operation, _request), do: {:error, :invalid_passkey}
+
+  defp consume_browser_fragment(state, token, session_hash) do
+    with {:ok, hash} <- AttentionServer.BrowserSignIn.token_hash(token),
+         {:ok, next, principal} <- AttentionServer.BrowserSignIn.consume(state.store.engine, hash),
+         {:ok, audit} <- browser_fragment_audit(state, principal, session_hash) do
+      case commit(state.store, next, audit) do
+        {:ok, committed} ->
+          principal = with_hosted_label(principal, :display_name, next)
+          principal = if Map.has_key?(audit, :browser_session), do: Map.put(principal, :persistent, true), else: principal
+          {:reply, {:ok, principal}, %{state | store: committed}}
+
+        _ ->
+          {:reply, {:error, :storage_unavailable}, state}
+      end
+    else
+      _ -> {:reply, {:error, :invalid_sign_in}, state}
+    end
+  end
+
+  defp browser_fragment_audit(state, principal, hash) do
+    audit = %{person: principal.person_id, actor: principal.owner_key, action: "browser_sign_in_consume"}
+
+    case {state.store.auth_schema, state.deployment_mode, hash} do
+      {nil, _, _} ->
+        {:ok, audit}
+
+      {%{}, :saas, hash} when is_binary(hash) and byte_size(hash) == 32 ->
+        {:ok, Map.put(audit, :browser_session, {hash, principal.owner_revision, "hosted"})}
+
+      _ ->
+        {:error, :invalid_sign_in}
+    end
+  end
 
   defp commit(store, next, audit) do
     result = Store.commit(store, next, audit)

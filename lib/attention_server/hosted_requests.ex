@@ -9,7 +9,7 @@ defmodule AttentionServer.HostedRequests do
 
   import Plug.Conn
 
-  alias AttentionServer.{Diagnostics, JSON, Relay}
+  alias AttentionServer.{BrowserAuth, Diagnostics, JSON, Relay}
 
   @max_body 4 * 1024
 
@@ -34,6 +34,12 @@ defmodule AttentionServer.HostedRequests do
       {"POST", "/test-reset", _} -> with_request(conn, &test_reset(&1, &2, opts))
       {"POST", _, ["persons", person, "notices"]} ->
         with_request(conn, &create_notice(&1, &2, opts.relay, person))
+
+      {"POST", "/session-grants", _} ->
+        with_request(conn, &create_session_grant(&1, &2, opts))
+
+      {"POST", "/session-grants/redeem", _} ->
+        with_request(conn, &redeem_session_grant(&1, &2, opts))
 
       {"POST", _, _} -> send_resp(conn, 404, "")
       _ -> send_resp(conn, 405, "")
@@ -88,6 +94,55 @@ defmodule AttentionServer.HostedRequests do
       {:error, reason} -> json(conn, 500, %{"error" => to_string(reason)})
     end
   end
+
+  defp create_session_grant(
+         conn,
+         %{"purpose" => "browser", "person_id" => person, "transaction" => transaction, "method" => method},
+         opts
+       ) do
+    case Relay.hosted_browser_grant(opts.relay, person, transaction, method) do
+      {:ok, grant} -> json(conn, 200, %{"grant" => grant})
+      {:error, :invalid_request} -> json(conn, 400, %{"error" => "invalid_request"})
+      {:error, :not_hosted} -> json(conn, 404, %{"error" => "unknown_person"})
+      {:error, :disabled} -> send_resp(conn, 404, "")
+      _ -> json(conn, 503, %{"error" => "storage_unavailable"})
+    end
+  end
+
+  defp create_session_grant(
+         conn,
+         %{"purpose" => "app", "person_id" => person, "transaction" => transaction, "method" => method},
+         opts
+       ) do
+    case Relay.authorize_hosted_native_transaction(opts.relay, person, transaction, method) do
+      {:ok, reference} -> json(conn, 200, %{"transaction" => reference})
+      {:error, :invalid_request} -> json(conn, 400, %{"error" => "invalid_request"})
+      {:error, :invalid_sign_in} -> json(conn, 401, %{"error" => "unauthorized"})
+      {:error, :not_hosted} -> json(conn, 404, %{"error" => "unknown_person"})
+      {:error, :disabled} -> send_resp(conn, 404, "")
+      _ -> json(conn, 503, %{"error" => "storage_unavailable"})
+    end
+  end
+
+  defp create_session_grant(conn, _, _opts), do: json(conn, 400, %{"error" => "invalid_request"})
+
+  defp redeem_session_grant(conn, %{"grant" => grant, "transaction" => transaction}, opts) do
+    case Relay.redeem_hosted_browser_grant(opts.relay, grant, transaction) do
+      {:ok, %{cookie: cookie, method: method}} ->
+        conn |> BrowserAuth.put_cookie(cookie, true) |> json(200, %{"method" => method})
+
+      {:error, :invalid_sign_in} ->
+        json(conn, 401, %{"error" => "unauthorized"})
+
+      {:error, :disabled} ->
+        send_resp(conn, 404, "")
+
+      _ ->
+        json(conn, 503, %{"error" => "storage_unavailable"})
+    end
+  end
+
+  defp redeem_session_grant(conn, _, _opts), do: json(conn, 400, %{"error" => "invalid_request"})
 
   defp create_sign_in_link(conn, request, opts) do
     person = Map.get(request, "person_id")

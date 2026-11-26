@@ -1123,6 +1123,100 @@ defmodule AttentionServer.ClientAPIWritesTest do
     GenServer.stop(relay)
   end
 
+  test "S1 checks retained reply receipts before expired attachment references", %{path: path} do
+    relay = scripted_relay(path)
+    item = item_id(relay, "one")
+    route = ["items", item, "replies"]
+    committed_key = key()
+    missing_result_key = key()
+
+    assert {201, %{"file_id" => file}, _} =
+             send_file(relay, "old bytes", [{"idempotency-key", key()}])
+
+    payload = %{"text" => "Original", "file_ids" => [file]}
+    body = JSON.encode!(payload)
+    assert {200, %{"entry" => %{"entry_id" => entry}}, _} =
+             post(relay, route, body, [{"idempotency-key", committed_key}])
+
+    :ok = GenServer.stop(relay)
+    {:ok, store} = AttentionServer.Store.open_relay(path)
+    store = %{store | change_log: true}
+    digest = AttentionServer.ClientAPI.Idempotency.digest("POST", route, payload)
+
+    assert :ok = AttentionServer.ClientAPI.Idempotency.save(
+      store, "A", missing_result_key, digest, 200, %{"item_id" => item, "entry_seq" => 9_999_999}
+    )
+    assert :ok = Exqlite.Sqlite3.execute(store.db, "UPDATE client_idempotency SET at_ms = 1")
+    assert :ok = Exqlite.Sqlite3.execute(store.db, "DELETE FROM client_staged_files")
+    assert {:ok, %{minimum_generation: 1}} = AttentionServer.Store.AuthSchema.initialize(store.db)
+    assert :ok = AttentionServer.Store.close(store)
+
+    relay = start(path)
+    assert {:ok, before} = head(relay)
+    assert {200, %{"entry" => %{"entry_id" => ^entry}}, replay} =
+             post(relay, route, body, [{"idempotency-key", committed_key}])
+    assert Plug.Conn.get_resp_header(replay, "idempotent-replayed") == ["true"]
+
+    assert {400, %{"error" => "invalid_field", "field" => "file_ids", "retryable" => false}, refused} =
+             post(relay, route, body, [{"idempotency-key", key()}])
+    assert Plug.Conn.get_resp_header(refused, "idempotent-replayed") == []
+
+    assert {202, %{"code" => "accepted_reconcile"}, reconcile} =
+             post(relay, route, body, [{"idempotency-key", missing_result_key}])
+    assert Plug.Conn.get_resp_header(reconcile, "idempotent-replayed") == ["true"]
+    assert {:ok, ^before} = head(relay)
+    GenServer.stop(relay)
+  end
+
+  test "S1 app receipt and reply commit together, and a marked retry can replace only its files",
+       %{path: path} do
+    relay = scripted_relay(path)
+    item = item_id(relay, "one")
+    route = ["items", item, "replies"]
+    idempotency_key = key()
+    headers = [{"idempotency-key", idempotency_key}]
+    marked = [{"harklight-queued-retry", "true"} | headers]
+    :ok = GenServer.stop(relay)
+
+    {:ok, store} = AttentionServer.Store.open_relay(path)
+    assert {:ok, %{minimum_generation: 1}} =
+             AttentionServer.Store.AuthSchema.initialize(store.db, store.engine, ["reader"])
+    :ok = AttentionServer.Store.close(store)
+    relay = start(path)
+
+    assert {400, %{"field" => "file_ids"}, _} =
+             post(relay, route, JSON.encode!(%{"text" => "Same reply", "file_ids" => ["fs-obsolete"]}), headers)
+    assert {409, %{"error" => "idempotency_conflict"}, _} =
+             post(relay, route, JSON.encode!(%{"text" => "Changed reply"}), marked)
+
+    assert {201, %{"file_id" => file}, _} = send_file(relay, "new bytes", [{"idempotency-key", key()}])
+    body = JSON.encode!(%{"text" => "Same reply", "file_ids" => [file]})
+    assert {409, %{"error" => "idempotency_conflict"}, _} = post(relay, route, body, headers)
+
+    :sys.replace_state(relay, fn state ->
+      :ok = Exqlite.Sqlite3.execute(state.store.db, """
+      CREATE TRIGGER reject_new_app_receipt BEFORE INSERT ON harklight_app_receipts
+      BEGIN SELECT RAISE(ABORT, 'fixture refused app receipt'); END;
+      """)
+      state
+    end)
+
+    assert {503, %{"error" => "storage_unavailable"}, _} = post(relay, route, body, marked)
+    assert {:ok, %{"entries" => entries}} = Reads.entries(relay, "reader", item)
+    refute Enum.any?(entries, &(&1["text"] == "Same reply"))
+
+    :sys.replace_state(relay, fn state ->
+      :ok = Exqlite.Sqlite3.execute(state.store.db, "DROP TRIGGER reject_new_app_receipt")
+      state
+    end)
+
+    assert {200, original, _} = post(relay, route, body, marked)
+    assert {:ok, 200, _, false} = Writes.reply(relay, "reader", item, "Later reply", key())
+    assert {200, ^original, replay} = post(relay, route, body, marked)
+    assert Plug.Conn.get_resp_header(replay, "idempotent-replayed") == ["true"]
+    :ok = GenServer.stop(relay)
+  end
+
   describe "HTTP" do
     defp post(relay, path_info, body, headers, method \\ "POST", principal \\ nil) do
       conn =
