@@ -12,6 +12,7 @@ defmodule AttentionServer.Store do
   require Logger
 
   alias AttentionServer.{
+    AgentChangeLog,
     APNS,
     BrowserRecipient,
     BounceDecision,
@@ -20,7 +21,8 @@ defmodule AttentionServer.Store do
     Diagnostics,
     Engine,
     GuidedJoin,
-    LargeData
+    LargeData,
+    SharedMessages
   }
 
   alias AttentionServer.ClientAPI.Idempotency
@@ -1262,6 +1264,7 @@ defmodule AttentionServer.Store do
           _ -> keyed_change_log(store, next, touched, projected)
         end
 
+      log = shared_send_log(log, next, audit)
       %{records: records, delete_paths: delete_paths, reference_rows: references} = prepared
       derived = DerivedIndex.changes(old, next, touched)
 
@@ -1273,7 +1276,7 @@ defmodule AttentionServer.Store do
                    :ok <- write_reference_delta(db, delete_paths, references),
                    :ok <- write_audit(db, audit),
                    {:ok, heads, agent_heads} <- append_change_logs(db, log, generation),
-                   :ok <- write_shared_send_receipt(store, audit),
+                   :ok <- write_shared_send_receipt(store, next, audit),
                    :ok <- DerivedIndex.advance(db, generation) do
                 {:ok, {heads, agent_heads}}
               end
@@ -2057,10 +2060,31 @@ defmodule AttentionServer.Store do
     end)
   end
 
-  defp write_shared_send_receipt(store, %{shared_send_receipt: {scope, key, digest, body}}),
-    do: Idempotency.save(store, scope, key, digest, 200, body)
+  defp shared_send_log(log, engine, %{shared_send_receipt: {scope, _, _, id, _}}) do
+    session = Map.get(Map.fetch!(engine.shared_messages, id), "session")
+    AgentChangeLog.append_shared_message(log, scope, id, session)
+  end
 
-  defp write_shared_send_receipt(_store, _audit), do: :ok
+  defp shared_send_log(log, _engine, _audit), do: log
+
+  defp write_shared_send_receipt(store, engine, %{
+         shared_send_receipt: {{person, origin} = scope, key, digest, id, outcomes}
+       }) do
+    record = Map.fetch!(engine.shared_messages, id)
+
+    with {:ok, rev} <- AgentChangeLog.head(store, scope),
+         {:ok, resource_rev} <- AgentChangeLog.rev(store, scope, {:shared_message, id}) do
+      body = %{
+        "rev" => rev,
+        "message" => SharedMessages.sender_message(record, resource_rev),
+        "recipients" => outcomes
+      }
+
+      Idempotency.save(store, Idempotency.agent_scope(person, origin), key, digest, 200, body)
+    end
+  end
+
+  defp write_shared_send_receipt(_store, _engine, _audit), do: :ok
 
   defp write_audit(db, audit) do
     run(db, "INSERT INTO relay_audit (person_id, actor_id, action, at_ms) VALUES (?, ?, ?, ?)", [

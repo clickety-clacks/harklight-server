@@ -503,6 +503,7 @@ defmodule AttentionServer.Relay do
               store: store,
               hosted_jev_connection: hosted_jev_connection(opts),
               feature_flags_path: Keyword.get(opts, :feature_flags_path),
+              shared_messages: Keyword.get(opts, :shared_messages, false) == true,
               feature_flags_warned: false,
               clock: clock,
               default_index: Engine.default_index(store.engine),

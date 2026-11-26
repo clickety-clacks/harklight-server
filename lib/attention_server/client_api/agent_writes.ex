@@ -5,7 +5,7 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
 
   import Plug.Conn, only: [get_req_header: 2, read_body: 1]
 
-  alias AttentionServer.{AgentChangeLog, ConversationFiles, Engine, JSON, Message, Relay}
+  alias AttentionServer.{AgentChangeLog, ConversationFiles, Engine, JSON, Message, Relay, SharedMessages, Store}
 
   alias AttentionServer.AgentAPI.Advisories
 
@@ -67,19 +67,38 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
   defp request(conn, ctx, operation) do
     with :ok <- write_principal(ctx.principal, operation),
          {:ok, key} <- request_key(conn),
-         {:ok, body, conn} <- json_body(conn, []),
-         :ok <- Writes.only_members(body, Map.fetch!(@members, operation)) do
+         {:ok, body, conn} <- json_body(conn, []) do
+      dispatch_write(conn, ctx, operation, key, body)
+    else
+      {:error, token, field, response} -> Errors.send_error(response, token, field: field)
+      {:error, token, field} -> Errors.send_error(conn, token, field: field)
+    end
+  end
+
+  defp dispatch_write(conn, ctx, :send, key, %{"recipients" => _} = body) do
+    case get_req_header(conn, "harklight-features") do
+      ["shared_messages"] ->
+        digest = write_digest(conn, get_req_header(conn, "if-match"), body)
+
+        case call(ctx, {:shared_send, ctx.principal, key, digest, body}) do
+          {:shared_error, token, details} -> Errors.send_error(conn, token, details: details)
+          result -> Writes.respond(conn, replay_success(ctx, result))
+        end
+
+      [] ->
+        Errors.send_error(conn, "unsupported")
+
+      _ ->
+        Errors.send_error(conn, "invalid_field", field: "features")
+    end
+  end
+
+  defp dispatch_write(conn, ctx, operation, key, body) do
+    with :ok <- Writes.only_members(body, Map.fetch!(@members, operation)) do
       precondition = get_req_header(conn, "if-match")
-      target = ctx.params
-
-      digest =
-        Idempotency.digest(conn.method, conn.path_info, %{
-          "body" => body,
-          "if_match" => precondition
-        })
-
+      digest = write_digest(conn, precondition, body)
       op_id = key || ConversationFiles.new_upload_id()
-      input = {ctx.principal, operation, target, key, digest, precondition, body}
+      input = {ctx.principal, operation, ctx.params, key, digest, precondition, body}
 
       result =
         case prepare_uploads(ctx, input, op_id) do
@@ -89,9 +108,12 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
 
       Writes.respond(conn, replay_success(ctx, result))
     else
-      {:error, token, field, response} -> Errors.send_error(response, token, field: field)
       {:error, token, field} -> Errors.send_error(conn, token, field: field)
     end
+  end
+
+  defp write_digest(conn, precondition, body) do
+    Idempotency.digest(conn.method, conn.path_info, %{"body" => body, "if_match" => precondition})
   end
 
   defp write_principal(%{kind: :agent}, :retract), do: :ok
@@ -166,6 +188,19 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
   end
 
   @doc false
+  def handle_call({:shared_send, %{person: person, key: origin}, key, digest, body}, _from, state) do
+    scope = {person, origin}
+
+    if state.shared_messages and state.store.mode == :keyed do
+      case authorize(state, scope, :send) do
+        :ok -> shared_send(state, scope, key, digest, body)
+        error -> {:reply, refusal(error), state}
+      end
+    else
+      {:reply, refusal({:error, :unsupported}), state}
+    end
+  end
+
   def handle_call(
         {:execute, {%{person: person, key: agent}, operation, item_id, key, digest, match, body},
          op_id, uploads},
@@ -385,6 +420,157 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
     if length(Enum.uniq(names)) == length(names),
       do: :ok,
       else: {:error, "invalid_field", nil}
+  end
+
+  defp shared_send(state, scope, key, digest, body) do
+    case lookup(state, receipt_scope(scope), key) do
+      {:ok, %{digest: ^digest, status: status, body: stored}} ->
+        {:reply, {:stored, status, stored}, state}
+
+      {:ok, %{}} ->
+        {:reply, refusal({:error, :idempotency_conflict}), state}
+
+      {:ok, nil} ->
+        admit_shared_send(state, scope, key, digest, body)
+
+      error ->
+        {:reply, refusal(error), state}
+    end
+  end
+
+  defp admit_shared_send(state, {person, origin} = scope, key, digest, body) do
+    engine = state.store.engine
+    sender = body["sender"]
+
+    with :ok <- shared_send_fields(body),
+         {:ok, people, org} <- shared_recipients(body["recipients"]),
+         {:ok, message} <- content(body),
+         :ok <- session(body),
+         true <- Engine.shared_sender_allowed?(engine, person, origin, sender) ||
+                   {:error, :forbidden},
+         {:ok, policy} <- shared_answer_policy(message, body),
+         id <- shared_id(scope, key),
+         message <- Map.merge(message, %{"sender_id" => sender, "message_id" => id}),
+         :ok <- shared_content_valid(message) do
+      {message, _diagnostics} = Message.admit_answer_ui(message, [])
+      attrs = %{
+        :id => id,
+        :sender_person => person,
+        :sender_key => origin,
+        :sender_id => sender,
+        :message => message,
+        :answer_policy => policy,
+        "created_at_ms" => state.clock.()
+      }
+      attrs = Map.merge(attrs, Map.take(body, ["session"]))
+      case SharedMessages.create(engine, attrs, people, org) do
+        {:ok, next, _record, outcomes} ->
+          commit_shared_send(state, next, scope, key, digest, id, outcomes)
+
+        error ->
+          {:reply, shared_send_refusal(error), state}
+      end
+    else
+      error -> {:reply, shared_send_refusal(error), state}
+    end
+  end
+
+  defp commit_shared_send(state, transition, {person, origin} = scope, key, digest, id, outcomes) do
+    audit = %{
+      person: person, actor: origin, action: "shared_message_send",
+      shared_send_receipt: {scope, key, digest, id, wire_outcomes(outcomes)}
+    }
+
+    case Store.commit(state.store, transition, audit) do
+      {:ok, store} ->
+        reply =
+          case Idempotency.lookup(store, receipt_scope(scope), key) do
+            {:ok, %{body: body}} -> {:ok, 200, body, false}
+            _ -> refusal({:error, :storage_unavailable})
+          end
+
+        {:reply, reply, %{state | store: store}}
+
+      _ ->
+        {:reply, refusal({:error, :storage_unavailable}), state}
+    end
+  end
+
+  defp shared_send_fields(body) do
+    with :ok <- Writes.only_members(body, ~w(sender session message file_ids recipients answer_policy)),
+         true <- Message.sender_id?(body["sender"]) || {:error, "invalid_field", "sender"},
+         :ok <- files(body) do
+      if Map.get(body, "file_ids", []) == [],
+        do: :ok,
+        else: {:error, "unsupported", "file_ids"}
+    end
+  end
+
+  defp shared_recipients(%{"kind" => "people", "people" => people} = selector) do
+    organization = selector["organization_id"]
+
+    with :ok <- Writes.only_members(selector, ~w(kind people organization_id)),
+         true <- is_list(people) and people != [] and Enum.all?(people, &opaque_id?/1),
+         true <- not Map.has_key?(selector, "organization_id") or opaque_id?(organization) do
+      {:ok, people, organization}
+    else
+      _ -> {:error, "invalid_field", "recipients"}
+    end
+  end
+
+  defp shared_recipients(%{"kind" => "group"}), do: {:error, :not_found}
+  defp shared_recipients(_), do: {:error, "invalid_field", "recipients"}
+
+  defp opaque_id?(value), do: is_binary(value) and byte_size(value) in 1..128
+
+  defp shared_answer_policy(%{"message_type" => "fyi"}, body) do
+    if Map.has_key?(body, "answer_policy"),
+      do: {:error, "invalid_field", "answer_policy"},
+      else: {:ok, nil}
+  end
+
+  defp shared_answer_policy(_message, body) do
+    case Map.get(body, "answer_policy", %{"kind" => "first"}) do
+      %{"kind" => "first"} = policy when map_size(policy) == 1 -> {:ok, :first}
+      %{"kind" => "everyone"} = policy when map_size(policy) == 1 -> {:ok, :everyone}
+      %{"kind" => "named", "people" => people} = policy when map_size(policy) == 2 ->
+        if is_list(people) and people != [] and Enum.all?(people, &opaque_id?/1),
+          do: {:ok, {:named, Enum.uniq(people)}},
+          else: {:error, "invalid_field", "answer_policy"}
+
+      _ -> {:error, "invalid_field", "answer_policy"}
+    end
+  end
+
+  defp shared_content_valid(message) do
+    with :ok <- Message.validate(message),
+         :ok <- Message.validate_present_message_type(message),
+         :ok <- Message.validate_typed_message(message) do
+      :ok
+    else
+      {:error, field} when is_binary(field) -> {:error, "invalid_field", field}
+      {:error, _} -> {:error, "invalid_field", "message"}
+    end
+  end
+
+  defp shared_send_refusal({:error, :organization_required, ids}),
+    do: {:shared_error, "organization_required", %{"organization_ids" => ids}}
+
+  defp shared_send_refusal({:error, reason, outcomes})
+       when reason in [:no_recipients, :decider_unreachable],
+       do: {:shared_error, Atom.to_string(reason), %{"recipients" => wire_outcomes(outcomes)}}
+
+  defp shared_send_refusal({:error, :invalid_deciders}),
+    do: refusal({:error, "invalid_field", "answer_policy"})
+
+  defp shared_send_refusal(error), do: refusal(error)
+
+  defp wire_outcomes(outcomes),
+    do: Enum.map(outcomes, fn {id, status} -> %{"person_id" => id, "status" => Atom.to_string(status)} end)
+
+  defp shared_id(scope, key) do
+    hash = :crypto.hash(:sha256, :erlang.term_to_binary({scope, key}))
+    "shared_" <> Base.url_encode64(hash, padding: false)
   end
 
   defp authorize(state, scope, operation \\ :other)

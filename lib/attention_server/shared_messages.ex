@@ -97,6 +97,30 @@ defmodule AttentionServer.SharedMessages do
     "shared_" <> Base.url_encode64(digest, padding: false)
   end
 
+  def sender_message(record, rev) do
+    %{
+      "item_id" => record.id,
+      "rev" => rev,
+      "sender" => record.sender_id,
+      "revision" => record.revision,
+      "message" => record.message,
+      "files" => [],
+      "seen" => false,
+      "shared" => %{
+        "shared_id" => record.id,
+        "organization_id" => record.organization_id,
+        "answer_policy" => answer_policy(record.answer_policy),
+        "chat_open" => record.chat_open,
+        "answers" => []
+      }
+    }
+    |> Map.merge(Map.take(record, ["session", "created_at_ms"]))
+  end
+
+  defp answer_policy(nil), do: nil
+  defp answer_policy({:named, people}), do: %{"kind" => "named", "people" => people}
+  defp answer_policy(policy), do: %{"kind" => Atom.to_string(policy)}
+
   def valid_message?(%Engine{} = engine, id, %{
         id: id,
         organization_id: organization,

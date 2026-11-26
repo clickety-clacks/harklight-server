@@ -105,6 +105,7 @@ defmodule AttentionServer.Server do
         jev_model: Keyword.get(opts, :jev_model),
         jev_score_record_path: Keyword.get(opts, :jev_score_record_path),
         feature_flags_path: Keyword.get(opts, :feature_flags_path),
+        shared_messages: Keyword.get(opts, :shared_messages, false),
         upload_cap: upload_cap
       ]
 

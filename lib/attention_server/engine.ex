@@ -5354,6 +5354,10 @@ defmodule AttentionServer.Engine do
     if is_binary(Map.get(frame, "by")), do: Map.put(base, "by", frame["by"]), else: base
   end
 
+  @doc false
+  def shared_sender_allowed?(%__MODULE__{} = engine, person, device, sender),
+    do: sender_allowed?(engine, person, device, sender)
+
   defp sender_allowed?(_engine, _person, _device, @hosted_notice_sender), do: false
 
   defp sender_allowed?(engine, person, device, sender) do

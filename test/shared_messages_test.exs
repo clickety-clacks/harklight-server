@@ -1,7 +1,7 @@
 defmodule AttentionServer.SharedMessagesTest do
   use ExUnit.Case, async: true
 
-  alias AttentionServer.{Engine, SharedMessages, Store}
+  alias AttentionServer.{AgentChangeLog, Engine, SharedMessages, Store}
   alias AttentionServer.ClientAPI.Idempotency
   alias Exqlite.Sqlite3
 
@@ -32,8 +32,8 @@ defmodule AttentionServer.SharedMessagesTest do
 
     scope = Idempotency.agent_scope(@sender, "sender-key")
     key = "30000000-0000-4000-8000-000000000001"
-    body = %{"rev" => 0, "organization_id" => @organization, "item_id" => "shared-a"}
-    receipt = {scope, key, "request-digest", body}
+    outcomes = for person <- [@other, @third], do: %{"person_id" => person, "status" => "reached"}
+    receipt = {{@sender, "sender-key"}, key, "request-digest", "shared-a", outcomes}
     audit = %{person: @sender, actor: "fixture", action: "send", shared_send_receipt: receipt}
     assert {:ok, nil} = Idempotency.lookup(store, scope, key)
 
@@ -61,8 +61,13 @@ defmodule AttentionServer.SharedMessagesTest do
              restored.engine.shared_recipients
 
     assert {:ok, restored} = Store.enable_change_log(restored)
-    assert {:ok, %{body: ^body, digest: "request-digest", status: 200}} =
+    assert {:ok, %{body: body, digest: "request-digest", status: 200}} =
              Idempotency.lookup(restored, scope, key)
+    assert %{"rev" => 1, "message" => %{"rev" => 1, "item_id" => "shared-a",
+             "shared" => %{"organization_id" => @organization}}, "recipients" => ^outcomes} = body
+    assert {:ok, [%{resource: {:shared_message, "shared-a"}, rev: 1}], false, 1} =
+             AgentChangeLog.read(restored, {@sender, "sender-key"}, 0, 10, nil, true)
+    assert {:ok, [], false, 1} = AgentChangeLog.read(restored, {@sender, "sender-key"}, 0, 10, nil)
 
     assert first.item_id != second.item_id
     assert Map.keys(first) |> Enum.sort() == [:item_id, :seen_revision]
