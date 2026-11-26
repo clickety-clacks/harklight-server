@@ -15,6 +15,43 @@ defmodule AttentionServer.BounceDecisionTest do
     %{"name" => "Urgent", "lower_bound" => 0.8, "bounce_after_days" => 2.25}
   ]
 
+  test "system notices can full bounce without creating any sender advisories" do
+    now = 1_800_000_000_000
+    sender = AttentionServer.Message.hosted_notice_sender()
+    {:ok, engine} = Engine.setup_person(Engine.new(), @person)
+
+    {:ok, levels} =
+      BouncePolicy.normalize_levels([
+        %{"name" => "Routine", "lower_bound" => 0, "bounce_after_days" => 1}
+      ])
+
+    {:ok, engine, _} = BounceDecision.configure_levels(engine, @person, levels, now)
+    notice = %{"title" => "Trial ending", "body" => "Your trial expires soon.", "key" => "opened"}
+    {:ok, engine, _} = Engine.hosted_notice(engine, @person, notice, now)
+    {:ok, engine, _} = Engine.hosted_notice(engine, @person, %{notice | "key" => "unopened"}, now)
+
+    %{key: opened} = engine.events[{@person, 1}]
+    %{key: unopened} = engine.events[{@person, 2}]
+    {:ok, engine, 1} = BounceDecision.record_open(engine, opened, engine.messages[opened], 1)
+
+    due = now + 86_400_000
+    engine = BounceDecision.evaluate_due(engine, due)
+
+    assert BounceDecision.inbox_open?(engine.messages[opened])
+    assert BounceDecision.fully_bounced?(engine.messages[unopened])
+    refute BounceDecision.person_visible?(engine.messages[unopened])
+
+    for key <- [opened, unopened] do
+      refute Map.has_key?(engine.messages[key], "item_advisories")
+    end
+
+    assert engine.advisory_feeds == %{}
+    assert engine.origin_feeds == %{}
+    assert engine.bounce_waiting_routes == %{}
+    assert BounceDecision.advisory_cursor(engine, @person, sender, nil) == 0
+    assert BounceDecision.next_deadline(BounceDecision.resume_decisions(engine)) == nil
+  end
+
   defp key, do: {@person, @sender, @message_id}
   defp origin_feed_key, do: {@person, @origin}
   defp advisory_feed_key, do: {@person, @origin, @handle}

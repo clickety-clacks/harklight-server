@@ -26,6 +26,7 @@ defmodule AttentionServer.Store do
   alias Exqlite.Sqlite3
 
   alias AttentionServer.Store.{
+    AuthSchema,
     ClientDataMigration,
     ConversionPreflight,
     DerivedIndex,
@@ -51,6 +52,7 @@ defmodule AttentionServer.Store do
     :large_base,
     :large_persisted,
     :large_index,
+    :auth_schema,
     mode: :snapshot,
     source_bindings: %{},
     upload_links: %{},
@@ -320,13 +322,19 @@ defmodule AttentionServer.Store do
 
     case Sqlite3.open(path) do
       {:ok, db} ->
-        case initialize(db, upload_dir, mode) do
-          {:ok, engine, version} ->
+        initialized =
+          with {:ok, auth_schema} <- AuthSchema.read(db),
+               {:ok, engine, version} <- initialize(db, upload_dir, mode) do
+            {:ok, auth_schema, engine, version}
+          end
+
+        case initialized do
+          {:ok, auth_schema, engine, version} ->
             store_mode = if mode == :relay, do: :keyed, else: mode
 
             case finalize_open(db, upload_dir, engine, version, store_mode) do
               {:ok, store} ->
-                {:ok, store}
+                {:ok, %{store | auth_schema: auth_schema}}
 
               {:error, reason} ->
                 Diagnostics.failure(:server_storage, :store_open, reason, :unavailable)
@@ -390,12 +398,23 @@ defmodule AttentionServer.Store do
       try do
         result =
           RecordTable.transaction(db, fn ->
-            case preflight.(db) do
-              :ok -> convert_locked(db, upload_dir, prepare)
-              {:ok, _info} -> convert_locked(db, upload_dir, prepare)
-              {:already_converted, 31} -> KeyedMigration.upgrade_anchor(db)
-              {:already_converted, 32} -> {:ok, :already_converted}
-              error -> error
+            with {:ok, auth_schema} <- AuthSchema.read(db) do
+              prepare_with_auth = fn store, engine, generation ->
+                case prepare.(store, engine, generation) do
+                  {:ok, %__MODULE__{} = converted} ->
+                    {:ok, %{converted | auth_schema: auth_schema}}
+
+                  result ->
+                    result
+                end
+              end
+
+              case preflight.(db) do
+                :ok -> convert_locked(db, upload_dir, prepare_with_auth)
+                {:ok, _info} -> convert_locked(db, upload_dir, prepare_with_auth)
+                {:already_converted, 31} -> {:ok, :already_converted}
+                error -> error
+              end
             end
           end)
 
@@ -1862,7 +1881,7 @@ defmodule AttentionServer.Store do
     do: valid_conversation_cursor?(engine, key, seq)
 
   defp valid_keyed_row?(engine, :receipts, {person, key, _op}, _receipt),
-    do: actor_owns?(engine, person, key)
+    do: receipt_actor?(engine, person, key)
 
   defp valid_keyed_row?(engine, :source_report_grants, key, grant),
     do: valid_source_report_grant?(engine, key, grant)
@@ -2733,7 +2752,7 @@ defmodule AttentionServer.Store do
           owns_or_browser?(engine, person, key)
         end) and
         Enum.all?(engine.receipts, fn {{person, key, _op}, _} ->
-          actor_owns?(engine, person, key)
+          receipt_actor?(engine, person, key)
         end) and
         Enum.all?(engine.source_report_grants, fn {key, grant} ->
           valid_source_report_grant?(engine, key, grant)
@@ -2899,7 +2918,8 @@ defmodule AttentionServer.Store do
   end
 
   defp valid_item?(engine, {person, sender, id} = key, record) do
-    owns?(engine, person, record.origin) and
+    (owns?(engine, person, record.origin) or
+       (record.origin == sender and system_notice_actor?(engine, person, sender))) and
       record.message["sender_id"] == sender and record.message["message_id"] == id and
       valid_seq?(engine, person, record.accepted_seq) and
       valid_conversation_record?(engine, key, record) and valid_origin_result?(record) and
@@ -3363,6 +3383,14 @@ defmodule AttentionServer.Store do
     do:
       owns?(engine, person, key) or
         (Map.has_key?(engine.persons, person) and BrowserRecipient.valid_for?(key, person))
+
+  defp system_notice_actor?(engine, person, key),
+    do:
+      key == AttentionServer.Message.hosted_notice_sender() and
+        Map.has_key?(engine.persons, person)
+
+  defp receipt_actor?(engine, person, key),
+    do: system_notice_actor?(engine, person, key) or actor_owns?(engine, person, key)
 
   defp actor_owns?(engine, person, key),
     do:
