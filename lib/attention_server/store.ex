@@ -26,6 +26,7 @@ defmodule AttentionServer.Store do
   alias Exqlite.Sqlite3
 
   alias AttentionServer.Store.{
+    AuthSchema,
     ClientDataMigration,
     ConversionPreflight,
     DerivedIndex,
@@ -51,6 +52,7 @@ defmodule AttentionServer.Store do
     :large_base,
     :large_persisted,
     :large_index,
+    :auth_schema,
     mode: :snapshot,
     source_bindings: %{},
     upload_links: %{},
@@ -320,13 +322,19 @@ defmodule AttentionServer.Store do
 
     case Sqlite3.open(path) do
       {:ok, db} ->
-        case initialize(db, upload_dir, mode) do
-          {:ok, engine, version} ->
+        initialized =
+          with {:ok, auth_schema} <- AuthSchema.read(db),
+               {:ok, engine, version} <- initialize(db, upload_dir, mode) do
+            {:ok, auth_schema, engine, version}
+          end
+
+        case initialized do
+          {:ok, auth_schema, engine, version} ->
             store_mode = if mode == :relay, do: :keyed, else: mode
 
             case finalize_open(db, upload_dir, engine, version, store_mode) do
               {:ok, store} ->
-                {:ok, store}
+                {:ok, %{store | auth_schema: auth_schema}}
 
               {:error, reason} ->
                 Diagnostics.failure(:server_storage, :store_open, reason, :unavailable)
@@ -390,11 +398,23 @@ defmodule AttentionServer.Store do
       try do
         result =
           RecordTable.transaction(db, fn ->
-            case preflight.(db) do
-              :ok -> convert_locked(db, upload_dir, prepare)
-              {:ok, _info} -> convert_locked(db, upload_dir, prepare)
-              {:already_converted, 31} -> {:ok, :already_converted}
-              error -> error
+            with {:ok, auth_schema} <- AuthSchema.read(db) do
+              prepare_with_auth = fn store, engine, generation ->
+                case prepare.(store, engine, generation) do
+                  {:ok, %__MODULE__{} = converted} ->
+                    {:ok, %{converted | auth_schema: auth_schema}}
+
+                  result ->
+                    result
+                end
+              end
+
+              case preflight.(db) do
+                :ok -> convert_locked(db, upload_dir, prepare_with_auth)
+                {:ok, _info} -> convert_locked(db, upload_dir, prepare_with_auth)
+                {:already_converted, 31} -> {:ok, :already_converted}
+                error -> error
+              end
             end
           end)
 
