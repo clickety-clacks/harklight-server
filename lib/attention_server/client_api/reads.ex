@@ -322,7 +322,6 @@ defmodule AttentionServer.ClientAPI.Reads do
     with {:ok, principal} <- principal(engine, key),
          {:ok, limit} <- limit(params),
          {:ok, after_key} <- page(params),
-         :ok <- ChangeLog.ranks_available(state.store, principal.person),
          {:ok, position} <- head(state, principal.person) do
       person = principal.person
       {shown, more?} = rank_page(state, person, after_key, limit)
@@ -630,7 +629,7 @@ defmodule AttentionServer.ClientAPI.Reads do
       {:ok, page, more?} ->
         {page, more?}
 
-      {:error, :none} ->
+      {:error, :none} when state.store.mode != :keyed ->
         case computed_ranks(state.store.engine, state.store, view(state, person), person) do
           {:ok, ranks} ->
             candidates =

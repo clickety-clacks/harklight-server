@@ -1303,9 +1303,10 @@ defmodule AttentionServer.ChangeLog do
   ascending rank-key order: `{:ok, [{item_id, rank}], more}`. `{:error, :none}`
   until the person's ranking has first been stored.
   """
-  def rank_page(%AttentionServer.Store{change_log: true, db: db}, person, after_key, limit)
+  def rank_page(%AttentionServer.Store{change_log: true, db: db, change_log_touched: touched}, person, after_key, limit)
       when (is_nil(after_key) or is_binary(after_key)) and is_integer(limit) and limit > 0 do
-    with {:ok, true} <- ranked?(db, person),
+    with false <- MapSet.member?(touched, person),
+         {:ok, true} <- ranked?(db, person),
          {:ok, rows} <-
            all(
              db,
@@ -1316,6 +1317,7 @@ defmodule AttentionServer.ChangeLog do
       {page, rest} = Enum.split(rows, limit)
       {:ok, Enum.map(page, fn [item_id, json] -> {item_id, decode_rank(json)} end), rest != []}
     else
+      true -> {:error, :storage_unavailable}
       {:ok, false} -> {:error, :none}
       error -> error
     end
