@@ -65,6 +65,11 @@ defmodule AttentionServer.NativeSignInTest do
            |> Router.call(router)
            |> Map.fetch!(:status) == 401
 
+    wrong_session = %{request | "session_hash" => DeviceProof.digest(BrowserAuth.new_secret())}
+    refused = post("/v2/auth/sign-in", wrong_session) |> Router.call(router)
+    assert refused.status == 401
+    assert %{"error" => "unauthorized"} = json(refused)
+
     signed_in = post("/v2/auth/sign-in", request) |> Router.call(router)
     assert signed_in.status == 200
     assert %{"device_id" => device, "duplicate" => false, "person_id" => ^person, "method" => "google"} =
