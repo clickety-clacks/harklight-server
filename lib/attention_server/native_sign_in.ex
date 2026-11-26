@@ -197,6 +197,25 @@ defmodule AttentionServer.NativeSignIn do
     end
   end
 
+  def signed_in_devices(db, person) do
+    with {:ok, rows} <-
+           RecordTable.select(
+             db,
+             "SELECT device_id, signed_in_at_ms FROM harklight_device_sessions WHERE person_id = ?",
+             [person]
+           ) do
+      {:ok, Map.new(rows, fn [id, time] -> {id, time} end)}
+    end
+  end
+
+  def remove_device_sessions(db, person, device) do
+    RecordTable.run(
+      db,
+      "DELETE FROM harklight_device_sessions WHERE person_id = ? AND device_id = ?",
+      [person, device]
+    )
+  end
+
   def lookup_session(db, hash) do
     with {:ok, rows} <-
            RecordTable.select(

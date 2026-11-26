@@ -1742,6 +1742,16 @@ defmodule AttentionServer.Relay do
     {:reply, reply, state}
   end
 
+  defp dispatch_call({:client_devices, principal, operation}, _from, state) do
+    with %Store{auth_schema: %{}} <- state.store,
+         :ok <- authorize_device_management(state, principal) do
+      manage_devices(state, principal, operation)
+    else
+      %Store{} -> {:reply, {:error, :disabled}, state}
+      error -> {:reply, error, state}
+    end
+  end
+
   defp dispatch_call({:device_remove, key}, _from, state) do
     case Engine.device_remove(state.store.engine, key) do
       {:ok, next, reply} ->
@@ -3920,6 +3930,73 @@ defmodule AttentionServer.Relay do
     end
   end
 
+  defp authorize_device_management(state, %{kind: :browser, person: person, key: key, owner_revision: revision}) do
+    case Engine.owner_revision(state.store.engine, person, key) do
+      {:ok, ^revision} -> :ok
+      _ -> {:error, :unauthorized}
+    end
+  end
+
+  defp authorize_device_management(state, %{kind: :device, person: person, key: key, session_id: hash})
+       when is_binary(hash) do
+    with {:ok, %{device_id: ^key, person_id: ^person, pending: false}} <-
+           NativeSignIn.lookup_session(state.store.db, hash),
+         {:ok, ^person} <- Engine.authorized_person(state.store.engine, key) do
+      :ok
+    else
+      _ -> {:error, :unauthorized}
+    end
+  end
+
+  defp authorize_device_management(_state, _principal), do: {:error, :forbidden}
+
+  defp manage_devices(state, principal, :list) do
+    person = principal.person
+
+    result =
+      with {:ok, signed_in} <- NativeSignIn.signed_in_devices(state.store.db, person) do
+        devices =
+          for {id, %{person: ^person, revoked: false} = device} <- state.store.engine.devices do
+            %{
+              "device_id" => id,
+              "label" => Map.get(device, :label),
+              "signed_in_at" => Map.get(signed_in, id),
+              "current" => principal.kind == :device and principal.key == id
+            }
+          end
+
+        {:ok, Enum.sort_by(devices, & &1["device_id"])}
+      end
+
+    {:reply, result, state}
+  end
+
+  defp manage_devices(state, %{person: person}, {:known, device}) do
+    {:reply, {:ok, match?(%{person: ^person}, state.store.engine.devices[device])}, state}
+  end
+
+  defp manage_devices(state, %{kind: :device, key: device} = principal, :sign_out),
+    do: manage_devices(state, principal, {:remove, device})
+
+  defp manage_devices(state, _principal, :sign_out),
+    do: {:reply, {:error, :forbidden}, state}
+
+  defp manage_devices(state, %{person: person, key: actor}, {:remove, device}) do
+    with %{person: ^person} <- state.store.engine.devices[device],
+         {:ok, next_engine} <- Engine.revoke_device(state.store.engine, device) do
+      next_engine = revoke_origin_sessions(next_engine, person, device)
+
+      case commit_device_removal(state, next_engine, person, device, actor, "client_device_remove") do
+        {:ok, next} -> {:reply, :ok, remove_focus_device(next, device, person)}
+        {:error, _, next, :committed} ->
+          {:reply, {:error, :storage_unavailable}, remove_focus_device(next, device, person)}
+        {:error, _, _, :not_committed} -> {:reply, {:error, :storage_unavailable}, state}
+      end
+    else
+      _ -> {:reply, {:error, :not_found}, state}
+    end
+  end
+
   defp commit_device_removal(state, next_engine, person, key, actor, action) do
     engine = state.store.engine
     references = Map.get(state.upload_index.references_by_person, person, MapSet.new())
@@ -3931,6 +4008,7 @@ defmodule AttentionServer.Relay do
 
     next_engine = Enum.reduce(abandoned_ids, next_engine, &Engine.delete_row(&2, :uploads, &1))
     audit = %{person: person, actor: actor, action: action}
+    audit = if state.store.auth_schema, do: Map.put(audit, :auth_device_removal, key), else: audit
 
     case commit(state.store, next_engine, audit) do
       {:ok, store} ->

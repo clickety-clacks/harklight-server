@@ -2047,6 +2047,9 @@ defmodule AttentionServer.Store do
   defp write_auth_changes(db, %{native_redemption: redemption}),
     do: NativeSignIn.commit_redemption(db, redemption)
 
+  defp write_auth_changes(db, %{person: person, auth_device_removal: device}),
+    do: NativeSignIn.remove_device_sessions(db, person, device)
+
   defp write_auth_changes(_db, _audit), do: :ok
 
   defp write_audit(db, audit) do

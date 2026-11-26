@@ -87,6 +87,23 @@ defmodule AttentionServer.NativeSignInTest do
            |> Plug.Conn.put_req_header("cookie", "__Host-harklight=ambiguous")
            |> Router.call(router)
            |> Map.fetch!(:status) == 401
+
+    devices =
+      Plug.Test.conn(:get, "/v2/devices")
+      |> Plug.Conn.put_req_header("authorization", "Bearer " <> bearer)
+      |> Router.call(router)
+
+    assert %{"devices" => [%{"device_id" => ^device, "current" => true, "signed_in_at" => time}]} =
+             json(devices)
+    assert is_integer(time) and time > 0
+
+    sign_out =
+      Plug.Test.conn(:post, "/v2/auth/sign-out")
+      |> Plug.Conn.put_req_header("authorization", "Bearer " <> bearer)
+      |> Router.call(router)
+
+    assert sign_out.status == 204
+    assert Router.call(request, router).status == 401
   end
 
   defp proof(dir, bytes) do
