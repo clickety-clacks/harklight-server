@@ -80,7 +80,7 @@ defmodule AttentionServer.AgentAPI.FeedStep do
 
   alias AttentionServer.{AgentChangeLog, Diagnostics, Engine, Relay, SharedAnswers, SharedMessages, Store}
   alias AttentionServer.AgentAPI.{FeedActivity, FeedRenderer, Focus}
-  alias AttentionServer.ClientAPI.{FeedStep, Projection, Reads, Resources, SharedContinuation}
+  alias AttentionServer.ClientAPI.{FeedStep, Projection, Resources, SharedCapability, SharedContinuation}
 
   def scope(%{principal: %{person: person, key: key}}), do: {:agent, person, key}
 
@@ -197,7 +197,7 @@ defmodule AttentionServer.AgentAPI.FeedStep do
          :ok <- validate_capability(state, principal, session, cursor, capability),
          {:ok, rows, more, position} <-
            AgentChangeLog.read(store, agent, cursor, limit, session, match?(%{shared?: true}, capability)),
-         {:ok, changes} <- render_changes(state, principal, rows) do
+         {:ok, changes} <- render_changes(Map.put(state, :shared_projection, capability), principal, rows) do
       {:ok, agent, changes, more, position}
     else
       {:error, %Projection{}} = error ->
@@ -217,10 +217,10 @@ defmodule AttentionServer.AgentAPI.FeedStep do
       {:error, :storage_unavailable}
   end
 
-  defp validate_capability(state, principal, session, cursor, %{shared?: true, continuation: token}) do
-    if Reads.shared_readable?(state, principal.person) do
+  defp validate_capability(state, principal, session, cursor, %{shared?: true, continuation: token} = capability) do
+    if SharedCapability.readable?(state, principal.person, capability) do
       SharedContinuation.validate(token, state.store.engine.agent_cursor_key, principal,
-        :agent_changes, %{session: session}, cursor, state.clock.())
+        :agent_changes, SharedCapability.scope(capability, %{session: session}), cursor, state.clock.())
     else
       {:error, :unsupported}
     end

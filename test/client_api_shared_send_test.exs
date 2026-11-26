@@ -45,6 +45,69 @@ defmodule AttentionServer.ClientAPISharedSendTest do
              write_request(ctx, server, "a1", "POST", "/v2/groups", op_key(40), create, options)
     group = "/v2/groups/" <> group_id
 
+    assert {200, %{"features" => %{"shared_messages" => true, "groups" => true}}, _} =
+             get_request(ctx, server, "a1", "/v2/me", [])
+    shared_only = [{"harklight-features", "shared_messages"}]
+    assert {200, %{"rev" => before, "continuation" => token}, _} =
+             get_request(ctx, server, "a1", "/v2/inbox", options)
+    assert {200, %{"continuation" => shared_token}, _} =
+             get_request(ctx, server, "a1", "/v2/inbox", shared_only)
+    assert {410, %{"error" => "cursor_expired"}, _} =
+             get_request(ctx, server, "a1", "/v2/changes?after=#{before}",
+               [{"harklight-continuation", shared_token} | options])
+    sse = [{"accept", "text/event-stream"} | options]
+    event_path = "/v2/changes?after=#{before}&features=shared_messages%2Cgroups&continuation=#{shared_token}"
+    assert {410, %{"error" => "cursor_expired"}, _} = get_request(ctx, server, "a1", event_path, sse)
+    assert {400, %{"error" => "invalid_field", "field" => "features"}, _} =
+             get_request(ctx, server, "a1", event_path <> "&features=shared_messages%2Cgroups", sse)
+
+    assert {:ok, actor} =
+             AttentionServer.DeviceIdentity.from_certificate(TLSFixtures.certificate_der!(ctx.certs, "b1"))
+    assert :ok = Relay.setup_sender(relay, actor, "app:group")
+    bytes = "Shared group file"
+    upload_headers = [
+      {"content-type", "text/plain"},
+      {"content-disposition", "attachment; filename*=UTF-8''group.txt"},
+      {"idempotency-key", op_key(50)}
+    ]
+    assert %{status: 201, body: staged} =
+             raw_request(ctx, server, "b1", "POST", "/v2/files", upload_headers, bytes)
+    assert {:ok, %{"file_id" => handle}} = JSON.decode_line(staged <> "\n")
+    send = %{"sender" => "app:group", "message" => %{"title" => "Shared planning", "created_at" => 1},
+             "file_ids" => [handle], "recipients" => %{"kind" => "group", "name" => "planning"}}
+    assert {404, %{"error" => "not_found"}, _} =
+             write_request(ctx, server, "b1", "POST", "/v2/agent/messages", op_key(47), send, shared_only)
+    assert {200, %{"message" => %{"item_id" => room, "shared" => %{"group" => %{"id" => ^group_id}},
+                                  "files" => [%{"file_id" => file_id}]},
+                   "recipients" => %{"group_id" => ^group_id, "kind" => "group"}} = sent, _} =
+             write_request(ctx, server, "b1", "POST", "/v2/agent/messages", op_key(47), send, options)
+    sender_path = "/v2/agent/messages/" <> room
+    baseline_path = "/v2/agent/delivery-baseline"
+    assert {200, %{"shared_events" => true, "next_page" => group_page}, _} =
+             get_request(ctx, server, "b1", baseline_path, options)
+    assert {410, %{"error" => "cursor_expired"}, _} =
+             get_request(ctx, server, "b1", baseline_path <> "?page=" <> group_page, shared_only)
+    assert {404, _, _} = get_request(ctx, server, "b1", sender_path, shared_only)
+    download = "/v2/files/" <> file_id
+    assert %{status: 404} = raw_request(ctx, server, "a1", "GET", download, shared_only, nil)
+    assert %{status: 404} = raw_request(ctx, server, "a2", "GET", download, options, nil)
+    assert %{status: 200, body: ^bytes} = raw_request(ctx, server, "a1", "GET", download, options, nil)
+    assert {200, %{"entry" => _}, _} =
+             write_request(ctx, server, "b1", "POST", sender_path <> "/replies", op_key(48),
+               %{"text" => "Before the invitation."}, options)
+    assert {200, %{"items" => [], "counts" => %{"unresolved" => 0}}, _} =
+             get_request(ctx, server, "a1", "/v2/inbox", shared_only)
+    assert {200, %{"items" => [%{"item_id" => manager_item}], "counts" => %{"unresolved" => 1}}, _} =
+             get_request(ctx, server, "a1", "/v2/inbox", options)
+    assert {404, _, _} = get_request(ctx, server, "a1", "/v2/items/" <> manager_item, shared_only)
+    assert {200, %{"changes" => []}, _} =
+             get_request(ctx, server, "a1", "/v2/changes?after=#{before}",
+               [{"harklight-continuation", shared_token} | shared_only])
+    assert {200, %{"changes" => group_changes}, _} =
+             get_request(ctx, server, "a1", "/v2/changes?after=#{before}",
+               [{"harklight-continuation", token} | options])
+    assert Enum.any?(group_changes, &match?(%{"kind" => "entry"}, &1))
+
     assert {200, %{"invitation" => %{"id" => invitation}}, _} =
              write_request(ctx, server, "a1", "POST", group <> "/invitations", op_key(41),
                %{"person_id" => invitee}, options)
@@ -59,6 +122,25 @@ defmodule AttentionServer.ClientAPISharedSendTest do
     assert {200, ^accepted, replay_headers} =
              write_request(ctx, server, "a2", "POST", accept, op_key(43), %{}, options)
     assert {"idempotent-replayed", "true"} in replay_headers
+    assert {200, ^sent, send_replay} =
+             write_request(ctx, server, "b1", "POST", "/v2/agent/messages", op_key(47), send, options)
+    assert {"idempotent-replayed", "true"} in send_replay
+    assert {200, %{"items" => [%{"item_id" => invitee_item}]}, _} =
+             get_request(ctx, server, "a2", "/v2/inbox", options)
+    assert {200, %{"entries" => [%{"text" => "Before the invitation."}]}, _} =
+             get_request(ctx, server, "a2", "/v2/items/" <> invitee_item <> "/entries", options)
+    assert %{status: 200, body: ^bytes} = raw_request(ctx, server, "a2", "GET", download, options, nil)
+
+    assert {200, %{"entry" => %{"shared_entry_id" => turn}}, _} =
+             write_request(ctx, server, "a2", "POST", "/v2/items/" <> invitee_item <> "/replies",
+               op_key(51), %{"text" => "New member reply."}, options)
+    assert {200, %{"next_page" => named_page}, _} = get_request(ctx, server, "b1", baseline_path, shared_only)
+    assert {200, %{"changes" => []}, _} =
+             get_request(ctx, server, "b1", baseline_path <> "?page=" <> named_page, shared_only)
+    assert {200, %{"next_page" => new_page}, _} = get_request(ctx, server, "b1", baseline_path, options)
+    assert {200, %{"changes" => [%{"kind" => "entry", "data" => %{"entry_id" => ^turn}}]}, _} =
+             get_request(ctx, server, "b1", baseline_path <> "?page=" <> new_page, options)
+
     assert {200, %{"groups" => [%{"id" => ^group_id} = discovery]}, _} =
              get_request(ctx, server, "a2", "/v2/agent/groups", options)
     refute Map.has_key?(discovery, "members")
@@ -77,6 +159,13 @@ defmodule AttentionServer.ClientAPISharedSendTest do
     assert {200, %{"groups" => [%{"member" => false, "members" => [%{"id" => ^invitee}]}]}, _} =
              get_request(ctx, server, "a1", "/v2/groups", options)
     assert {200, %{"groups" => []}, _} = get_request(ctx, server, "a1", "/v2/agent/groups", options)
+    assert {200, %{"entry" => _}, _} =
+             write_request(ctx, server, "b1", "POST", sender_path <> "/replies", op_key(49),
+               %{"text" => "After departure."}, options)
+    assert {200, %{"entries" => [%{"text" => "Before the invitation."}, %{"text" => "New member reply."}]}, _} =
+             get_request(ctx, server, "a1", "/v2/items/" <> manager_item <> "/entries", options)
+    assert {200, %{"entries" => [%{}, %{}, %{}]}, _} =
+             get_request(ctx, server, "a2", "/v2/items/" <> invitee_item <> "/entries", options)
   end
 
   test "shared send binds one organization, commits once and replays the original result", ctx do

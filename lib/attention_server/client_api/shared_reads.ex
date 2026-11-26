@@ -9,13 +9,13 @@ defmodule AttentionServer.ClientAPI.SharedReads do
       {:ok, %{shared?: false}} ->
         fallback.()
 
-      {:ok, %{shared?: true}} ->
+      {:ok, %{shared?: true} = capability} ->
         id = ctx.params.item_id
 
         result =
           GenServer.call(
             ctx.relay,
-            {:client_api, __MODULE__, {ctx.principal, direction, action, id}},
+            {:client_api, __MODULE__, {ctx.principal, direction, action, id, capability}},
             :infinity
           )
 
@@ -24,26 +24,27 @@ defmodule AttentionServer.ClientAPI.SharedReads do
           _ -> Reads.respond(conn, result)
         end
 
-      error ->
-        Reads.respond(conn, error)
+      {:error, token, field} ->
+        AttentionServer.ClientAPI.Errors.send_error(conn, token, field: field)
     end
   end
 
   @doc false
-  def handle_call({who, direction, action, id}, _from, state) do
+  def handle_call({who, direction, action, id, capability}, _from, state) do
     result =
       with {:ok, principal} <- Reads.client_principal(state.store.engine, who),
-           true <- Reads.shared_readable?(state, principal.person) || {:error, :unsupported} do
+           true <- SharedCapability.readable?(state, principal.person, capability) || {:error, :unsupported} do
         if String.starts_with?(id, "shared_"),
-          do: read(state.store, principal, direction, action, id),
+          do: read(state.store, principal, direction, action, id, capability),
           else: :legacy
       end
 
     {:reply, result, state}
   end
 
-  defp read(store, %{kind: kind, person: person}, :person, action, id) when kind in [:device, :browser] do
+  defp read(store, %{kind: kind, person: person}, :person, action, id, capability) when kind in [:device, :browser] do
     with {:ok, message, recipient} <- SharedMessages.recipient_message(store.engine, person, id),
+         true <- SharedCapability.visible?(message, capability) || {:error, :not_found},
          {:ok, head} <- ChangeLog.head(store, person),
          {:ok, rev} <- ChangeLog.rev(store, person, ChangeLog.shared_item_resource(message.id)) do
       cutoff = get_in(recipient, [:frozen, :revision])
@@ -55,8 +56,11 @@ defmodule AttentionServer.ClientAPI.SharedReads do
           entries = SharedMessages.entries(store.engine, message, high)
 
           page_entries(entries, params, head, fn entry ->
-            with {:ok, rev} <- ChangeLog.rev(store, person, ChangeLog.shared_entry_resource(entry.id)) do
-              {:ok, SharedMessages.person_entry(recipient, person, entry, rev)}
+            case ChangeLog.rev(store, person, ChangeLog.shared_entry_resource(entry.id)) do
+              {:ok, entry_rev} -> {:ok, SharedMessages.person_entry(recipient, person, entry, entry_rev)}
+              {:error, :not_found} when is_map_key(message, :group_id) ->
+                {:ok, SharedMessages.person_entry(recipient, person, entry, rev)}
+              error -> error
             end
           end, &SharedMessages.recipient_entry_id(&1.id, person))
 
@@ -68,10 +72,11 @@ defmodule AttentionServer.ClientAPI.SharedReads do
     end
   end
 
-  defp read(store, %{kind: :device, person: person, key: origin}, :sender, action, id) do
+  defp read(store, %{kind: :device, person: person, key: origin}, :sender, action, id, capability) do
     scope = {person, origin}
 
     with %{sender_person: ^person, sender_key: ^origin} = message <- store.engine.shared_messages[id],
+         true <- SharedCapability.visible?(message, capability),
          true <- Engine.shared_sender_allowed?(store.engine, person, origin, message.sender_id),
          {:ok, head} <- AgentChangeLog.head(store, scope),
          {:ok, rev} <- AgentChangeLog.rev(store, scope, {:shared_message, id}) do
@@ -97,7 +102,7 @@ defmodule AttentionServer.ClientAPI.SharedReads do
     end
   end
 
-  defp read(_store, _principal, _direction, _action, _id), do: {:error, :not_found}
+  defp read(_store, _principal, _direction, _action, _id, _capability), do: {:error, :not_found}
 
   defp resource(:summary, head, _record, render) do
     {field, value} = render.()

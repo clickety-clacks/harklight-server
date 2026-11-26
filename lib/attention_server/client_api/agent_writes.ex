@@ -5,7 +5,7 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
 
   import Plug.Conn, only: [get_req_header: 2, read_body: 1]
 
-  alias AttentionServer.{AgentChangeLog, ConversationFiles, Engine, JSON, Message, Relay, SharedMessages, Store}
+  alias AttentionServer.{AgentChangeLog, ConversationFiles, Engine, Groups, JSON, Message, Relay, SharedMessages, Store}
 
   alias AttentionServer.AgentAPI.Advisories
 
@@ -13,6 +13,7 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
     AgentResources,
     AgentShow,
     Errors,
+    GroupRoutes,
     Idempotency,
     Projection,
     Resources,
@@ -84,21 +85,26 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
     end
   end
 
-  defp dispatch_write(conn, ctx, :send, key, %{"recipients" => _} = body) do
-    case get_req_header(conn, "harklight-features") do
-      ["shared_messages"] ->
+  defp dispatch_write(conn, ctx, :send, key, %{"recipients" => selector} = body) do
+    group? = match?(%{"kind" => "group"}, selector)
+
+    case SharedCapability.parse(conn) do
+      {:ok, %{groups?: false}} when group? ->
+        Errors.send_error(conn, "not_found")
+
+      {:ok, %{shared?: true} = capability} ->
         digest = write_digest(conn, get_req_header(conn, "if-match"), body)
 
-        case send_with_files(ctx, key, digest, body) do
+        case send_with_files(ctx, key, digest, body, capability) do
           {:shared_error, token, details} -> Errors.send_error(conn, token, details: details)
           result -> Writes.respond(conn, replay_success(ctx, result))
         end
 
-      [] ->
+      {:ok, _} ->
         Errors.send_error(conn, "unsupported")
 
-      _ ->
-        Errors.send_error(conn, "invalid_field", field: "features")
+      {:error, token, field} ->
+        Errors.send_error(conn, token, field: field)
     end
   end
 
@@ -109,10 +115,10 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
   defp dispatch_write(conn, %{params: %{item_id: "shared_" <> _ = id}} = ctx,
          operation, key, body) when operation in [:revise, :retract, :chat_close, :lifecycle] do
     case SharedCapability.parse(conn) do
-      {:ok, %{shared?: true}} ->
+      {:ok, %{shared?: true} = capability} ->
         match = get_req_header(conn, "if-match")
         digest = write_digest(conn, match, body)
-        request = {:shared_mutation, ctx.principal, key, digest, id, operation, match, body}
+        request = {:shared_mutation, ctx.principal, key, digest, id, operation, match, body, capability}
         Writes.respond(conn, replay_success(ctx, call(ctx, request)))
 
       {:ok, _} ->
@@ -146,15 +152,15 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
     end
   end
 
-  defp send_with_files(ctx, key, digest, %{"file_ids" => [_ | _]} = body) do
-    request = {:prepare_shared_files, ctx.principal, key, digest, body}
+  defp send_with_files(ctx, key, digest, %{"file_ids" => [_ | _]} = body, capability) do
+    request = {:prepare_shared_files, ctx.principal, key, digest, body, capability}
 
     case call(ctx, request) do
       {:ok, dir, files} ->
         case SharedAttachments.stage(dir, files) do
           {:ok, staged} ->
             try do
-              call(ctx, {:shared_send, ctx.principal, key, digest, body, staged})
+              call(ctx, {:shared_send, ctx.principal, key, digest, body, staged, capability})
             after
               SharedAttachments.discard(staged)
             end
@@ -167,8 +173,8 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
     end
   end
 
-  defp send_with_files(ctx, key, digest, body),
-    do: call(ctx, {:shared_send, ctx.principal, key, digest, body, []})
+  defp send_with_files(ctx, key, digest, body, capability),
+    do: call(ctx, {:shared_send, ctx.principal, key, digest, body, [], capability})
 
   defp write_digest(conn, precondition, body) do
     Idempotency.digest(conn.method, conn.path_info, %{"body" => body, "if_match" => precondition})
@@ -246,16 +252,16 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
   end
 
   @doc false
-  def handle_call({:prepare_shared_files, %{person: person, key: origin}, key, digest, body}, _from, state) do
+  def handle_call({:prepare_shared_files, %{person: person, key: origin}, key, digest, body, capability}, _from, state) do
     scope = {person, origin}
     engine = state.store.engine
 
     result =
-      with true <- state.shared_messages and state.store.mode == :keyed || {:error, :unsupported},
+      with :ok <- shared_send_gate(state, person, body["recipients"], capability),
            :ok <- authorize(state, scope, :send),
            {:ok, nil} <- lookup(state, receipt_scope(scope), key),
            :ok <- shared_send_fields(body),
-           {:ok, people, org} <- shared_recipients(body["recipients"]),
+           {:ok, people, org, _group} <- shared_recipients(state, person, body["recipients"]),
            true <- Engine.shared_sender_allowed?(engine, person, origin, body["sender"]) ||
                      {:error, :forbidden},
            {:ok, _} <- SharedMessages.select_organization(engine, person, people, org),
@@ -271,27 +277,26 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
     {:reply, result, state}
   end
 
-  def handle_call({:shared_send, %{person: person, key: origin}, key, digest, body, staged}, _from, state) do
+  def handle_call({:shared_send, %{person: person, key: origin}, key, digest, body, staged, capability}, _from, state) do
     scope = {person, origin}
 
-    if state.shared_messages and state.store.mode == :keyed do
-      case authorize(state, scope, :send) do
-        :ok -> shared_send(state, scope, key, digest, body, staged)
-        error -> {:reply, refusal(error), state}
-      end
+    with :ok <- shared_send_gate(state, person, body["recipients"], capability),
+         :ok <- authorize(state, scope, :send) do
+      shared_send(state, scope, key, digest, body, staged)
     else
-      {:reply, refusal({:error, :unsupported}), state}
+      error -> {:reply, refusal(error), state}
     end
   end
 
-  def handle_call({:shared_mutation, %{person: person, key: origin}, key, digest, id, operation, match, body},
+  def handle_call({:shared_mutation, %{person: person, key: origin}, key, digest, id, operation, match, body, capability},
         _from, state) do
     scope = {person, origin}
 
-    with true <- state.shared_messages || {:error, :unsupported},
+    with true <- SharedCapability.readable?(state, person, capability) || {:error, :unsupported},
          :ok <- authorize(state, scope, operation),
          %{sender_person: ^person, sender_key: ^origin} = record <-
            state.store.engine.shared_messages[id],
+         true <- SharedCapability.visible?(record, capability) || {:error, :not_found},
          true <- Engine.shared_sender_allowed?(state.store.engine, person, origin, record.sender_id) ||
                    {:error, :not_found} do
       case lookup(state, receipt_scope(scope), key) do
@@ -558,7 +563,7 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
     sender = body["sender"]
 
     with :ok <- shared_send_fields(body),
-         {:ok, people, org} <- shared_recipients(body["recipients"]),
+         {:ok, people, org, group} <- shared_recipients(state, person, body["recipients"]),
          {:ok, message} <- content(body),
          :ok <- session(body),
          true <- Engine.shared_sender_allowed?(engine, person, origin, sender) ||
@@ -580,9 +585,13 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
         "created_at_ms" => state.clock.()
       }
       attrs = Map.merge(attrs, Map.take(body, ["session"]))
+      attrs = if group, do: Map.merge(attrs, %{group_id: group.id, group_name: group.name}), else: attrs
       case SharedMessages.create(engine, attrs, people, org) do
         {:ok, next, _record, outcomes} ->
-          commit_shared_send(state, next, scope, key, digest, id, outcomes, staged)
+          commit_shared_send(state, next, scope, key, digest, id, send_receipt(group, outcomes), staged)
+
+        {:error, reason, _outcomes} when not is_nil(group) and reason in [:no_recipients, :decider_unreachable] ->
+          {:reply, refusal({:error, reason}), state}
 
         error ->
           {:reply, shared_send_refusal(error), state}
@@ -592,10 +601,10 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
     end
   end
 
-  defp commit_shared_send(state, transition, {person, origin} = scope, key, digest, id, outcomes, staged) do
+  defp commit_shared_send(state, transition, {person, origin} = scope, key, digest, id, recipients, staged) do
     audit = %{
       person: person, actor: origin, action: "shared_message_send",
-      shared_send_receipt: {scope, key, digest, id, wire_outcomes(outcomes)}
+      shared_send_receipt: {scope, key, digest, id, recipients}
     }
 
     case SharedAttachments.publish(state.store, staged) do
@@ -684,20 +693,37 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
          do: files(body)
   end
 
-  defp shared_recipients(%{"kind" => "people", "people" => people} = selector) do
+  defp shared_recipients(_state, _person, %{"kind" => "people", "people" => people} = selector) do
     organization = selector["organization_id"]
 
     with :ok <- Writes.only_members(selector, ~w(kind people organization_id)),
          true <- is_list(people) and people != [] and Enum.all?(people, &opaque_id?/1),
          true <- not Map.has_key?(selector, "organization_id") or opaque_id?(organization) do
-      {:ok, people, organization}
+      {:ok, people, organization, nil}
     else
       _ -> {:error, "invalid_field", "recipients"}
     end
   end
 
-  defp shared_recipients(%{"kind" => "group"}), do: {:error, :not_found}
-  defp shared_recipients(_), do: {:error, "invalid_field", "recipients"}
+  defp shared_recipients(state, person, %{"kind" => "group"} = selector) do
+    with {:ok, group} <- Groups.posting_group(state.store.engine, person, state.deployment_mode, selector) do
+      {:ok, Enum.sort(Map.keys(group.members)), group.organization_id, group}
+    end
+  end
+
+  defp shared_recipients(_state, _person, _selector), do: {:error, "invalid_field", "recipients"}
+
+  defp shared_send_gate(state, person, %{"kind" => "group"}, %{groups?: true}), do: GroupRoutes.available(state, person)
+  defp shared_send_gate(_state, _person, %{"kind" => "group"}, _capability), do: {:error, :not_found}
+
+  defp shared_send_gate(%{shared_messages: true, store: %{mode: :keyed}} = state, _person, _, capability) do
+    if Map.get(capability, :groups?, false) and not state.groups, do: {:error, :unsupported}, else: :ok
+  end
+
+  defp shared_send_gate(_state, _person, _selector, _capability), do: {:error, :unsupported}
+
+  defp send_receipt(nil, outcomes), do: wire_outcomes(outcomes)
+  defp send_receipt(group, _outcomes), do: %{"kind" => "group", "group_id" => group.id}
 
   defp opaque_id?(value), do: is_binary(value) and byte_size(value) in 1..128
 

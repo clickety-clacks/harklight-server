@@ -142,7 +142,7 @@ defmodule AttentionServer.ClientAPI.FeedStep do
   """
 
   alias AttentionServer.{ChangeLog, Diagnostics}
-  alias AttentionServer.ClientAPI.{FeedRenderer, Projection, Reads, SharedContinuation}
+  alias AttentionServer.ClientAPI.{FeedRenderer, Projection, Reads, SharedCapability, SharedContinuation}
 
   @doc false
   def scope(ctx), do: ctx.principal.person
@@ -199,6 +199,7 @@ defmodule AttentionServer.ClientAPI.FeedStep do
         engine: state.store.engine,
         store: state.store,
         shared?: shared?(principal),
+        capability: Map.get(principal, :shared_capability),
         compact_entries?: mode == :catch_up,
         view: Map.get(Map.get(state, :priority_views, %{}), person)
       }
@@ -220,11 +221,12 @@ defmodule AttentionServer.ClientAPI.FeedStep do
       {:error, :storage_unavailable}
   end
 
-  defp validate_capability(state, %{shared_capability: %{shared?: true, continuation: token}} = principal, cursor) do
+  defp validate_capability(state, %{shared_capability: %{shared?: true, continuation: token} = capability} = principal, cursor) do
     engine = state.store.engine
 
-    if Reads.shared_readable?(state, principal.person) do
-      SharedContinuation.validate(token, engine.agent_cursor_key, principal, :person_changes, %{}, cursor, state.clock.())
+    if SharedCapability.readable?(state, principal.person, capability) do
+      scope = SharedCapability.scope(capability, %{})
+      SharedContinuation.validate(token, engine.agent_cursor_key, principal, :person_changes, scope, cursor, state.clock.())
     else
       {:error, :unsupported}
     end

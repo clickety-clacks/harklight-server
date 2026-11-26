@@ -116,7 +116,6 @@ defmodule AttentionServer.Store.KeyedMigration do
          :ok <- check_identity(identity, supported_identity),
          {:ok, generation} <- RecordTable.generation(db),
          true <- generation >= version,
-         {:module, AttentionServer.Groups} <- Code.ensure_loaded(AttentionServer.Groups),
          {:ok, engine} <- read_records(db) do
       {:ok, engine, generation}
     else
@@ -144,7 +143,12 @@ defmodule AttentionServer.Store.KeyedMigration do
 
   defp check_identity(_, _), do: {:error, :unsupported_record_codec}
 
-  defp read_records(db), do: RecordTable.scan(db, &RecordCodec.decode/1)
+  defp read_records(db) do
+    # Safe term decoding requires the modules that define the persisted schema.
+    Enum.each([AttentionServer.Groups, AttentionServer.SharedMessages, AttentionServer.SharedAnswers],
+      &Code.ensure_loaded!/1)
+    RecordTable.scan(db, &RecordCodec.decode/1)
+  end
 
   defp verify_records(db, expected, count) do
     result =

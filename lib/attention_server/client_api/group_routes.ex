@@ -69,7 +69,7 @@ defmodule AttentionServer.ClientAPI.GroupRoutes do
   defp call(relay, request), do: GenServer.call(relay, {:client_api, __MODULE__, request}, :infinity)
 
   defp capability(conn) do
-    case SharedCapability.parse_groups(conn) do
+    case SharedCapability.parse(conn) do
       {:ok, %{groups?: true}} -> :ok
       {:ok, _} -> {:error, :not_found}
       error -> error

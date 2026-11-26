@@ -6,9 +6,9 @@ defmodule AttentionServer.ClientAPI.SharedChat do
 
   def respond(conn, ctx, direction, operation, body, key) do
     case SharedCapability.parse(conn) do
-      {:ok, %{shared?: true}} ->
+      {:ok, %{shared?: true} = capability} ->
         digest = Idempotency.digest(conn.method, conn.path_info, body)
-        request = {ctx.principal, ctx.params, direction, operation, body, key, digest}
+        request = {ctx.principal, ctx.params, direction, operation, body, key, digest, capability}
         result = GenServer.call(ctx.relay, {:client_api, __MODULE__, request}, :infinity)
         case result do
           {:answer_conflict, terminal} ->
@@ -23,12 +23,13 @@ defmodule AttentionServer.ClientAPI.SharedChat do
   end
 
   @doc false
-  def handle_call({who, params, direction, operation, body, key, digest}, _from, state) do
+  def handle_call({who, params, direction, operation, body, key, digest, capability}, _from, state) do
     engine = state.store.engine
 
     with {:ok, principal} <- Reads.client_principal(engine, who),
-         true <- Reads.shared_readable?(state, principal.person) || {:error, :unsupported},
+         true <- SharedCapability.readable?(state, principal.person, capability) || {:error, :unsupported},
          {:ok, record, recipient} <- locate(engine, principal, direction, params.item_id),
+         true <- SharedCapability.visible?(record, capability) || {:error, :not_found},
          scope = wire_scope(principal, direction),
          {:ok, stored} <- lookup(state.store, scope, key) do
       case stored do

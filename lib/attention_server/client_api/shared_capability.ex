@@ -3,13 +3,16 @@ defmodule AttentionServer.ClientAPI.SharedCapability do
 
   import Plug.Conn, only: [get_req_header: 2]
 
-  # Group endpoints use this parser while shared projections are integrated.
-  def parse_groups(conn) do
-    with {:ok, features} <- value(conn, [], "harklight-features", "features", &flags/1),
-         {:ok, continuation} <- value(conn, [], "harklight-continuation", "continuation") do
+  def parse(conn, mode \\ :headers) do
+    query = query_fields(conn, mode)
+
+    with {:ok, features} <- value(conn, query, "harklight-features", "features", &flags/1),
+         {:ok, continuation} <- value(conn, query, "harklight-continuation", "continuation") do
       {:ok, %{shared?: "shared_messages" in features, groups?: "groups" in features,
               continuation: continuation}}
     end
+  rescue
+    ArgumentError -> {:error, "invalid_field", "features"}
   end
 
   defp flags(value) do
@@ -20,19 +23,17 @@ defmodule AttentionServer.ClientAPI.SharedCapability do
     end
   end
 
-  def parse(conn, mode \\ :headers) do
-    query = query_fields(conn, mode)
+  def scope(%{groups?: true}, filters), do: Map.put(filters, :groups, true)
+  def scope(_capability, filters), do: filters
 
-    with {:ok, feature} <- value(conn, query, "harklight-features", "features"),
-         {:ok, continuation} <- value(conn, query, "harklight-continuation", "continuation"),
-         true <- feature in [nil, "shared_messages"] do
-      {:ok, %{shared?: feature == "shared_messages", continuation: continuation}}
-    else
-      false -> {:error, "invalid_field", "features"}
-      error -> error
-    end
-  rescue
-    ArgumentError -> {:error, "invalid_field", "features"}
+  def visible?(%{group_id: _}, %{groups?: true}), do: true
+  def visible?(%{group_id: _}, _capability), do: false
+  def visible?(%{}, _capability), do: true
+  def visible?(_record, _capability), do: false
+
+  def readable?(state, person, capability) do
+    AttentionServer.ClientAPI.Reads.shared_readable?(state, person) and
+      (not match?(%{groups?: true}, capability) or Map.get(state, :groups, false))
   end
 
   defp query_fields(conn, :person_sse) do

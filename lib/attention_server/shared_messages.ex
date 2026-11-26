@@ -2,7 +2,7 @@ defmodule AttentionServer.SharedMessages do
   @moduledoc false
 
   alias AttentionServer.{BounceDecision, Engine, SharedAnswers}
-  alias AttentionServer.ClientAPI.{PeopleProfiles, SharedAttachments}
+  alias AttentionServer.ClientAPI.{PeopleProfiles, SharedAttachments, SharedCapability}
 
   def organizations(%Engine{} = engine, person) do
     hosted =
@@ -417,6 +417,7 @@ defmodule AttentionServer.SharedMessages do
           Map.merge(record, %{sender_frozen_revision: record.revision, sender_frozen_terminal: Map.get(record, :terminal),
                               sender_frozen_entry_high: Map.get(record, :entry_high, 0),
                               sender_frozen_seen: sender_seen?(snapshot, record),
+                              sender_frozen_group: group_identity(snapshot, record),
                               sender_frozen_answer_id: Map.get(record, :answer_id),
                               sender_frozen_answers: SharedAnswers.answer_ids(snapshot, record)})),
 
@@ -448,7 +449,8 @@ defmodule AttentionServer.SharedMessages do
           members: members,
           terminal: Map.get(record, :terminal),
           entry_high: Map.get(record, :entry_high, 0),
-          delivery: frozen_delivery(snapshot, record, person)
+          delivery: frozen_delivery(snapshot, record, person),
+          group: group_identity(snapshot, record)
         }
 
         cutoff = Map.merge(cutoff, SharedAnswers.freeze_person(snapshot, record, recipient))
@@ -476,19 +478,19 @@ defmodule AttentionServer.SharedMessages do
       end)
   end
 
-  def for_person(engine, person) do
+  def for_person(engine, person, capability \\ %{}) do
     for {{id, ^person}, recipient} <- engine.shared_recipients,
         record = Map.get(engine.shared_messages, id),
-        not is_nil(record),
+        SharedCapability.visible?(record, capability),
         do: {record, recipient}
   end
 
-  def counts(engine, person) do
+  def counts(engine, person, capability \\ %{}) do
     %{"unresolved" => individual} = AttentionServer.ClientAPI.Resources.counts(engine, person)
     affiliations = organizations(engine, person)
 
     shared =
-      Enum.count(for_person(engine, person), fn {message, recipient} ->
+      Enum.count(for_person(engine, person, capability), fn {message, recipient} ->
         not Map.has_key?(recipient, :frozen) and
           MapSet.member?(affiliations, message.organization_id) and
           SharedAnswers.available?(engine, message, recipient, person)
@@ -543,6 +545,7 @@ defmodule AttentionServer.SharedMessages do
       }
     }
     |> Map.merge(Map.take(record, ["created_at_ms"]))
+    |> maybe_group(if(frozen, do: Map.get(frozen, :group) || group_identity(engine, record), else: group_identity(engine, record)))
   end
 
   defp chat_state(engine, record, recipient, person) do
@@ -627,7 +630,23 @@ defmodule AttentionServer.SharedMessages do
     }
     |> Map.merge(Map.take(record, ["session", "created_at_ms"]))
     |> maybe_terminal(answers.terminal)
+    |> maybe_group(if(frozen, do: Map.get(record, :sender_frozen_group), else: group_identity(engine, record)))
   end
+
+  defp maybe_group(wire, nil), do: wire
+  defp maybe_group(wire, group), do: put_in(wire, ["shared", "group"], group)
+
+  defp group_identity(engine, %{group_id: id} = record) do
+    name =
+      case engine.groups[id] do
+        %{name: name} -> name
+        nil -> Map.get(record, :group_name)
+      end
+
+    %{"id" => id, "name" => name}
+  end
+
+  defp group_identity(_engine, _record), do: nil
 
   defp sender_seen?(engine, record) do
     Enum.any?(live_recipients(engine, record.id), fn person ->

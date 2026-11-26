@@ -189,6 +189,33 @@ defmodule AttentionServer.Groups do
     end)
   end
 
+  def posting_group(engine, person, _deployment, %{"kind" => "group", "group_id" => id} = selector)
+      when is_binary(id) and map_size(selector) == 2,
+      do: authorize_post(engine, person, engine.groups[id])
+
+  def posting_group(engine, person, :self_hosted, %{"kind" => "group", "name" => name} = selector)
+      when is_binary(name) and map_size(selector) == 2 do
+    group =
+      Enum.find(Map.values(engine.groups), fn group ->
+        is_nil(group.hosted_ref) and group.organization_id == engine.relay_instance_id and
+          name_key(group.name) == name_key(String.trim(name))
+      end)
+
+    authorize_post(engine, person, group)
+  end
+
+  def posting_group(_engine, _person, :saas, %{"kind" => "group", "name" => _}),
+    do: {:error, :not_found}
+
+  def posting_group(_engine, _person, _deployment, _selector),
+    do: {:error, :invalid_field, "recipients"}
+
+  defp authorize_post(engine, person, %{organization_id: organization} = group) do
+    with :ok <- affiliated(engine, organization, person), do: {:ok, group}
+  end
+
+  defp authorize_post(_engine, _person, nil), do: {:error, :not_found}
+
   def visible(engine, person) do
     organizations = SharedMessages.organizations(engine, person)
 

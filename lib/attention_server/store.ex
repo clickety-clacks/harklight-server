@@ -2093,11 +2093,22 @@ defmodule AttentionServer.Store do
     end)
   end
 
+  defp shared_item_change(log, engine, person, id) do
+    group? = Map.has_key?(engine.shared_messages[id], :group_id)
+    AttentionServer.ChangeLog.append_shared_freeze(log, person, id, group?)
+  end
+
   defp shared_send_log(log, engine, %{shared_send_receipt: {scope, _, _, id, outcomes}}) do
     session = Map.get(Map.fetch!(engine.shared_messages, id), "session")
-    log
-    |> AgentChangeLog.append_shared_message(scope, id, session)
-    |> AttentionServer.ChangeLog.append_shared_send(id, outcomes)
+    log = AgentChangeLog.append_shared_message(log, scope, id, session)
+
+    case outcomes do
+      %{"kind" => "group"} ->
+        Enum.reduce(SharedMessages.live_recipients(engine, id), log, &shared_item_change(&2, engine, &1, id))
+
+      _ ->
+        AttentionServer.ChangeLog.append_shared_send(log, id, outcomes)
+    end
   end
 
   defp shared_send_log(log, _engine, _audit), do: log
@@ -2107,7 +2118,7 @@ defmodule AttentionServer.Store do
     log = AgentChangeLog.append_shared_message(log, scope, id, session)
 
     Enum.reduce(SharedMessages.live_recipients(engine, id), log, fn person, acc ->
-      AttentionServer.ChangeLog.append_shared_freeze(acc, person, id)
+      shared_item_change(acc, engine, person, id)
     end)
   end
 
@@ -2120,7 +2131,7 @@ defmodule AttentionServer.Store do
       {:row, :shared_recipients, {id, person} = key}, acc ->
         case {old.shared_recipients[key], next.shared_recipients[key]} do
           {%{frozen: _}, _} -> acc
-          {%{}, %{frozen: _}} -> AttentionServer.ChangeLog.append_shared_freeze(acc, person, id)
+          {%{}, %{frozen: _}} -> shared_item_change(acc, next, person, id)
           _ -> acc
         end
 
@@ -2159,7 +2170,7 @@ defmodule AttentionServer.Store do
       {id, %{group_id: group}}, acc ->
         if MapSet.member?(roster_changes, group) do
           Enum.reduce(SharedMessages.live_recipients(next, id), acc, fn person, changes ->
-            AttentionServer.ChangeLog.append_shared_freeze(changes, person, id)
+            shared_item_change(changes, next, person, id)
           end)
         else
           acc
@@ -2187,7 +2198,7 @@ defmodule AttentionServer.Store do
         entry = Map.fetch!(engine.shared_entries, chat.entry_id)
         inbox_log =
           Enum.reduce(SharedMessages.live_recipients(engine, id), log, fn person, acc ->
-            AttentionServer.ChangeLog.append_shared_entry(acc, person, id, entry.id)
+            AttentionServer.ChangeLog.append_shared_entry(acc, person, id, entry.id, Map.has_key?(record, :group_id))
           end)
 
         if Map.has_key?(record, :sender_frozen_revision),
@@ -2203,7 +2214,7 @@ defmodule AttentionServer.Store do
       :seen ->
         log =
           Enum.reduce(SharedMessages.live_recipients(engine, id), log, fn person, acc ->
-            AttentionServer.ChangeLog.append_shared_freeze(acc, person, id)
+            shared_item_change(acc, engine, person, id)
           end)
 
         if Map.has_key?(record, :sender_frozen_revision),
@@ -2211,7 +2222,7 @@ defmodule AttentionServer.Store do
           else: AgentChangeLog.append_shared_seen(log, {record.sender_person, record.sender_key}, chat.event_id, session)
 
       :read_position ->
-        AttentionServer.ChangeLog.append_shared_freeze(log, chat.person, id)
+        shared_item_change(log, engine, chat.person, id)
 
       :chat_receipt ->
         entry = Map.fetch!(engine.shared_entries, chat.entry_id)
@@ -2231,7 +2242,7 @@ defmodule AttentionServer.Store do
   defp shared_answer_log(log, engine, record, answer_id) do
     log =
       Enum.reduce(SharedMessages.live_recipients(engine, record.id), log, fn person, acc ->
-        AttentionServer.ChangeLog.append_shared_freeze(acc, person, record.id)
+        shared_item_change(acc, engine, person, record.id)
       end)
 
     if Map.has_key?(record, :sender_frozen_revision) do

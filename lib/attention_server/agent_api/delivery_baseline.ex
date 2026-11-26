@@ -7,7 +7,7 @@ defmodule AttentionServer.AgentAPI.DeliveryBaseline do
 
   alias AttentionServer.{AgentChangeLog, Conversation, Engine, JSON, RouteBIndex, SharedAnswers, SharedMessages, Store}
   alias AttentionServer.AgentAPI.{Feed, FeedActivity, FeedStep}
-  alias AttentionServer.ClientAPI.{AgentResources, Errors, Projection, Reads, Resources, SharedCapability, SharedContinuation}
+  alias AttentionServer.ClientAPI.{AgentResources, Errors, Projection, Resources, SharedCapability, SharedContinuation}
   alias AttentionServer.ClientAPI.Feed, as: PersonFeed
 
   @max_token 512
@@ -96,11 +96,11 @@ defmodule AttentionServer.AgentAPI.DeliveryBaseline do
       page = %{attempt: attempt, bound: bound, position: 0, rev: rev, shared_after: 0}
       body = %{
         "rev" => rev,
-        "next_page" => encode(page, scope, session, ack2, capability.shared?),
+        "next_page" => encode(page, scope, session, ack2, mode(capability)),
         "answers" => "all"
       }
 
-      body = maybe_shared_baseline(body, state, principal, session, capability.shared?)
+      body = maybe_shared_baseline(body, state, principal, session, capability)
       {:ok, {:ok, body}, store}
     end
   end
@@ -108,18 +108,18 @@ defmodule AttentionServer.AgentAPI.DeliveryBaseline do
   defp apply_request(%{store: store} = state, scope, principal,
          {:baseline, session, ack2, token, limit, capability}) do
     with :ok <- baseline_capability(state, principal, capability),
-         {:ok, page} <- decode(token, scope, session, ack2, capability.shared?),
+         {:ok, page} <- decode(token, scope, session, ack2, mode(capability)),
          stop = min(page.position + limit, page.bound),
          {:ok, changes, targets} <- page_changes(state, scope, session, page, stop),
          {:ok, shared, shared_targets, shared_after, shared_more?} <-
-           shared_page(state, scope, session, page, stop, limit - length(changes), capability.shared?),
+           shared_page(state, scope, session, page, stop, limit - length(changes), capability),
          {:ok, store} <-
            FeedStep.commit_delivery(store, scope, targets ++ shared_targets, ack2: ack2, attempt: page.attempt) do
       body = %{"rev" => page.rev, "changes" => changes ++ shared}
 
       body =
         if stop < page.bound or shared_more? do
-          token = encode(%{page | position: stop, shared_after: shared_after}, scope, session, ack2, capability.shared?)
+          token = encode(%{page | position: stop, shared_after: shared_after}, scope, session, ack2, mode(capability))
           Map.put(body, "next_page", token)
         else
           body
@@ -156,8 +156,8 @@ defmodule AttentionServer.AgentAPI.DeliveryBaseline do
     end
   end
 
-  defp baseline_capability(state, principal, %{shared?: true}) do
-    if Reads.shared_readable?(state, principal.person), do: :ok, else: {:error, :unsupported}
+  defp baseline_capability(state, principal, %{shared?: true} = capability) do
+    if SharedCapability.readable?(state, principal.person, capability), do: :ok, else: {:error, :unsupported}
   end
 
   defp baseline_capability(_state, _principal, %{continuation: token}) when is_binary(token),
@@ -165,13 +165,13 @@ defmodule AttentionServer.AgentAPI.DeliveryBaseline do
 
   defp baseline_capability(_state, _principal, _capability), do: :ok
 
-  defp maybe_shared_baseline(body, state, principal, session, true) do
+  defp maybe_shared_baseline(body, state, principal, session, %{shared?: true} = capability) do
     token = SharedContinuation.issue(state.store.engine.agent_cursor_key, principal,
-      :agent_changes, %{session: session}, body["rev"], state.clock.())
+      :agent_changes, SharedCapability.scope(capability, %{session: session}), body["rev"], state.clock.())
     Map.merge(body, %{"shared_events" => true, "continuation" => token})
   end
 
-  defp maybe_shared_baseline(body, _state, _principal, _session, false), do: body
+  defp maybe_shared_baseline(body, _state, _principal, _session, _capability), do: body
 
   defp page_changes(%{store: %{engine: engine}} = state, scope, session, page, stop) do
     entries = get_in(engine.origin_feeds, [scope, :entries]) || %{}
@@ -196,18 +196,18 @@ defmodule AttentionServer.AgentAPI.DeliveryBaseline do
     end
   end
 
-  defp shared_page(_state, _scope, _session, page, stop, _limit, enabled?)
+  defp shared_page(_state, _scope, _session, page, stop, _limit, %{shared?: enabled?})
        when not enabled? or stop < page.bound,
        do: {:ok, [], [], page.shared_after, false}
 
-  defp shared_page(%{store: store}, {person, origin} = scope, session, page, _stop, limit, true) do
+  defp shared_page(%{store: store}, {person, origin} = scope, session, page, _stop, limit, %{shared?: true} = capability) do
     engine = store.engine
 
     replies =
       for %{shared_id: id, author: {:person, _}, id: entry_id, position: position} = entry <- Map.values(engine.shared_entries),
           not Map.has_key?(entry, :handoff),
           %{sender_person: ^person, sender_key: ^origin} = record <- [engine.shared_messages[id]],
-          visible?(engine, scope, record, session),
+          visible?(engine, scope, record, session, capability),
           is_nil(Map.get(record, :sender_frozen_entry_high)) or position <= record.sender_frozen_entry_high,
           {:ok, rev} <- [AgentChangeLog.rev(store, scope, {:shared_entry, entry_id})],
           rev > page.shared_after and rev <= page.rev,
@@ -217,7 +217,7 @@ defmodule AttentionServer.AgentAPI.DeliveryBaseline do
       for %{shared_id: id, id: answer_id} = answer <- Map.values(engine.shared_answers),
           not Map.has_key?(answer, :handoff),
           %{sender_person: ^person, sender_key: ^origin} = record <- [engine.shared_messages[id]],
-          visible?(engine, scope, record, session),
+          visible?(engine, scope, record, session, capability),
           {:ok, rev} <- [AgentChangeLog.rev(store, scope, {:shared_answer, answer_id})],
           rev > page.shared_after and rev <= page.rev,
           do: {rev, %{"kind" => "answer", "rev" => rev, "data" => SharedAnswers.event(answer)}, {:shared_answer, answer_id}}
@@ -233,8 +233,8 @@ defmodule AttentionServer.AgentAPI.DeliveryBaseline do
     {:ok, changes, targets, after_rev, more != []}
   end
 
-  defp visible?(engine, {person, origin}, record, session) do
-    (is_nil(session) or record["session"] == session) and
+  defp visible?(engine, {person, origin}, record, session, capability) do
+    SharedCapability.visible?(record, capability) and (is_nil(session) or record["session"] == session) and
       Engine.shared_sender_allowed?(engine, person, origin, record.sender_id)
   end
 
@@ -318,17 +318,17 @@ defmodule AttentionServer.AgentAPI.DeliveryBaseline do
 
   defp change(kind, %{"rev" => rev} = data), do: %{"kind" => kind, "rev" => rev, "data" => data}
 
-  defp encode(page, scope, session, ack2, shared?) do
-    payload = [page_version(shared?), binding(scope, session, ack2, shared?),
+  defp encode(page, scope, session, ack2, mode) do
+    payload = [page_version(mode), binding(scope, session, ack2, mode),
                page.attempt, page.bound, page.position, page.rev]
-    payload = if shared?, do: payload ++ [page.shared_after], else: payload
+    payload = if mode == :legacy, do: payload, else: payload ++ [page.shared_after]
     payload |> JSON.encode!() |> Base.url_encode64(padding: false)
   end
 
-  defp decode(token, scope, session, ack2, shared?)
+  defp decode(token, scope, session, ack2, mode)
        when is_binary(token) and byte_size(token) <= @max_token do
-    binding = binding(scope, session, ack2, shared?)
-    version = page_version(shared?)
+    binding = binding(scope, session, ack2, mode)
+    version = page_version(mode)
 
     with {:ok, raw} <- Base.url_decode64(token, padding: false),
          {:ok, [^version, ^binding, attempt, bound, position, rev | tail]} <- JSON.decode_line(raw <> "\n"),
@@ -336,36 +336,42 @@ defmodule AttentionServer.AgentAPI.DeliveryBaseline do
          true <- is_integer(position) and position >= 0,
          true <- is_integer(bound) and bound >= position,
          true <- is_integer(rev) and rev >= 0,
-         {:ok, shared_after} <- shared_after(tail, shared?, rev) do
+         {:ok, shared_after} <- shared_after(tail, mode, rev) do
       {:ok, %{attempt: attempt, bound: bound, position: position, rev: rev, shared_after: shared_after}}
     else
-      _ -> invalid_page(token, shared?)
+      _ -> invalid_page(token, mode)
     end
   end
 
-  defp decode(token, _scope, _session, _ack2, shared?), do: invalid_page(token, shared?)
+  defp decode(token, _scope, _session, _ack2, mode), do: invalid_page(token, mode)
 
-  defp shared_after([], false, _), do: {:ok, 0}
-  defp shared_after([after_rev], true, rev) when is_integer(after_rev) and after_rev >= 0 and after_rev <= rev,
+  defp shared_after([], :legacy, _), do: {:ok, 0}
+  defp shared_after([after_rev], mode, rev) when mode in [:shared_messages, :groups] and is_integer(after_rev) and after_rev >= 0 and after_rev <= rev,
     do: {:ok, after_rev}
   defp shared_after(_, _, _), do: :error
 
-  defp page_version(true), do: 2
-  defp page_version(false), do: 1
+  defp mode(%{groups?: true}), do: :groups
+  defp mode(%{shared?: true}), do: :shared_messages
+  defp mode(_), do: :legacy
 
-  defp invalid_page(_token, true), do: {:error, :cursor_expired}
-  defp invalid_page(token, false) when is_binary(token) do
+  defp page_version(:groups), do: 3
+  defp page_version(:shared_messages), do: 2
+  defp page_version(:legacy), do: 1
+
+  defp invalid_page(_token, mode) when mode in [:shared_messages, :groups], do: {:error, :cursor_expired}
+  defp invalid_page(token, :legacy) when is_binary(token) do
     with {:ok, raw} <- Base.url_decode64(token, padding: false),
-         {:ok, [2 | _]} <- JSON.decode_line(raw <> "\n") do
+         {:ok, [version | _]} <- JSON.decode_line(raw <> "\n"),
+         true <- version in [2, 3] do
       {:error, :cursor_expired}
     else
       _ -> {:error, "page"}
     end
   end
-  defp invalid_page(_token, false), do: {:error, "page"}
+  defp invalid_page(_token, :legacy), do: {:error, "page"}
 
-  defp binding(scope, session, ack2, shared?) do
-    values = if shared?, do: {scope, session, ack2, :shared_messages}, else: {scope, session, ack2}
+  defp binding(scope, session, ack2, mode) do
+    values = if mode == :legacy, do: {scope, session, ack2}, else: {scope, session, ack2, mode}
 
     :sha256
     |> :crypto.hash(:erlang.term_to_binary(values))

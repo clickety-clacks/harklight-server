@@ -2,7 +2,7 @@ defmodule AttentionServer.ClientAPI.SharedAttachments do
   @moduledoc false
 
   alias AttentionServer.{ConversationFiles, Engine, SharedMessages, Store}
-  alias AttentionServer.ClientAPI.{Reads, Uploads}
+  alias AttentionServer.ClientAPI.{Reads, SharedCapability, Uploads}
 
   # Fetch staging metadata under the serialized sender identity, but transfer
   # the bytes in the connection process. A lost response can safely replay the
@@ -82,19 +82,20 @@ defmodule AttentionServer.ClientAPI.SharedAttachments do
 
   def wire(files), do: Enum.map(files, &Map.delete(&1, "upload_id"))
 
-  def download(relay, principal, "shared-file_" <> upload_id) do
-    GenServer.call(relay, {:client_api, __MODULE__, {principal, upload_id}}, :infinity)
+  def download(relay, principal, "shared-file_" <> upload_id, capability) do
+    GenServer.call(relay, {:client_api, __MODULE__, {principal, upload_id, capability}}, :infinity)
   end
 
   @doc false
-  def handle_call({who, upload_id}, _from, state) do
+  def handle_call({who, upload_id, capability}, _from, state) do
     engine = state.store.engine
 
     result =
       with {:ok, principal} <- Reads.client_principal(engine, who),
-           true <- Reads.shared_readable?(state, principal.person) || {:error, :unsupported},
+           true <- SharedCapability.readable?(state, principal.person, capability) || {:error, :unsupported},
            %{message_id: message_id} = upload <- engine.uploads[upload_id],
            %{} = record <- engine.shared_messages[message_id],
+           true <- SharedCapability.visible?(record, capability) || {:error, :not_found},
            {:ok, high} <- allowed_revision(engine, principal, record),
            true <- visible_upload?(record, upload, high) || {:error, :not_found},
            {:ok, path} <- Store.get_upload(state.store, upload_id) do

@@ -69,8 +69,8 @@ defmodule AttentionServer.ClientAPI.Reads do
           do: respond(conn, {:error, :cursor_expired}),
           else: respond(conn, inbox(ctx.relay, ctx.principal, params))
 
-      {:ok, %{shared?: true}} ->
-        respond(conn, call(ctx.relay, {:shared_inbox, ctx.principal, params}))
+      {:ok, %{shared?: true} = capability} ->
+        respond(conn, call(ctx.relay, {:shared_inbox, ctx.principal, params, capability}))
 
       error ->
         respond(conn, error)
@@ -142,7 +142,8 @@ defmodule AttentionServer.ClientAPI.Reads do
   @doc false
   def get_me(conn, %Context{} = ctx) do
     case SharedCapability.parse(conn) do
-      {:ok, %{shared?: true}} -> respond(conn, call(ctx.relay, {:me_profile, ctx.principal}))
+      {:ok, %{shared?: true} = capability} ->
+        respond(conn, call(ctx.relay, {:me_profile, ctx.principal, capability}))
       {:ok, %{shared?: false}} -> respond(conn, me(ctx.relay, ctx.principal))
       error -> respond(conn, error)
     end
@@ -177,7 +178,8 @@ defmodule AttentionServer.ClientAPI.Reads do
 
   defp file_result_for_request(conn, %{params: %{file_id: "shared-file_" <> _ = id}} = ctx) do
     case SharedCapability.parse(conn) do
-      {:ok, %{shared?: true}} -> SharedAttachments.download(ctx.relay, ctx.principal, id)
+      {:ok, %{shared?: true} = capability} ->
+        SharedAttachments.download(ctx.relay, ctx.principal, id, capability)
       {:ok, _} -> {:error, :not_found}
       error -> error
     end
@@ -228,10 +230,10 @@ defmodule AttentionServer.ClientAPI.Reads do
     do: Errors.projection_error(conn, fault)
 
   def respond(conn, {:error, token}, _etag_of),
-    do: Errors.send_error(conn, Atom.to_string(token))
+    do: Errors.send_error(conn, to_string(token))
 
   def respond(conn, {:error, token, field}, _etag_of),
-    do: Errors.send_error(conn, Atom.to_string(token), field: field)
+    do: Errors.send_error(conn, to_string(token), field: field)
 
   # If-None-Match uses the weak comparison (RFC 9110 §13.1.2).
   defp not_modified?(conn, tag) do
@@ -350,9 +352,11 @@ defmodule AttentionServer.ClientAPI.Reads do
     end
   end
 
-  def handle_call({:me_profile, who}, from, state) do
+  def handle_call({:me_profile, who}, from, state), do: handle_call({:me_profile, who, %{}}, from, state)
+
+  def handle_call({:me_profile, who, capability}, from, state) do
     with {:ok, %{person: person}} <- principal(state.store.engine, who),
-         true <- shared_readable?(state, person) || {:error, :unsupported} do
+         true <- SharedCapability.readable?(state, person, capability) || {:error, :unsupported} do
       case handle_call({:me, who}, from, state) do
         {:reply, {:ok, body}, next} ->
           profile = PeopleProfiles.for_person(next.store.engine, person)
@@ -377,31 +381,31 @@ defmodule AttentionServer.ClientAPI.Reads do
     {:reply, reply, state}
   end
 
-  defp read({:shared_inbox, who, params}, state) do
+  defp read({:shared_inbox, who, params, capability}, state) do
     engine = state.store.engine
 
     with {:ok, %{person: person} = principal} <- principal(engine, who),
-         true <- shared_readable?(state, person) || {:error, :unsupported},
+         true <- SharedCapability.readable?(state, person, capability) || {:error, :unsupported},
          {:ok, limit} <- limit(params),
          {:ok, position} <- head(state, person),
-         {:ok, offset} <- shared_page(state, who, params["page"], limit, position),
+         {:ok, offset} <- shared_page(state, who, params["page"], limit, position, capability),
          {:ok, count} <- ChangeLog.rank_count(state.store, person),
          {:ok, individual} <- shared_individual_page(state, principal, offset, min(limit, max(count - offset, 0))),
-         {:ok, shared} <- shared_person_page(state, person, max(offset - count, 0), limit - length(individual)) do
+         {:ok, shared} <- shared_person_page(state, person, max(offset - count, 0), limit - length(individual), capability) do
       items = individual ++ shared
       next_offset = offset + min(limit, max(count - offset, 0)) + length(shared)
-      total = count + length(SharedMessages.for_person(engine, person))
+      total = count + length(SharedMessages.for_person(engine, person, capability))
 
       body = %{
         "rev" => position,
         "items" => items,
-        "counts" => SharedMessages.counts(engine, person),
+        "counts" => SharedMessages.counts(engine, person, capability),
         "continuation" =>
-          SharedContinuation.issue(engine.agent_cursor_key, who, :person_changes, %{}, position, state.clock.())
+          SharedContinuation.issue(engine.agent_cursor_key, who, :person_changes, SharedCapability.scope(capability, %{}), position, state.clock.())
       }
 
       if next_offset < total do
-        scope = %{offset: next_offset, limit: limit, head: position}
+        scope = SharedCapability.scope(capability, %{offset: next_offset, limit: limit, head: position})
         token = SharedContinuation.issue(engine.agent_cursor_key, who, :person_snapshot, scope, position, state.clock.())
         {:ok, Map.put(body, "next_page", "s.#{next_offset}.#{token}")}
       else
@@ -588,6 +592,11 @@ defmodule AttentionServer.ClientAPI.Reads do
           response
         end
 
+      response =
+        if AttentionServer.ClientAPI.GroupRoutes.available(state, principal.person) == :ok,
+          do: put_in(response, ["features", "groups"], true),
+          else: response
+
       {:ok, with_sender_names(response, engine, principal)}
     end
   end
@@ -619,12 +628,12 @@ defmodule AttentionServer.ClientAPI.Reads do
     end
   end
 
-  defp shared_page(_state, _who, nil, _limit, _head), do: {:ok, 0}
+  defp shared_page(_state, _who, nil, _limit, _head, _capability), do: {:ok, 0}
 
-  defp shared_page(state, who, page, limit, head) do
+  defp shared_page(state, who, page, limit, head, capability) do
     with ["s", offset, token] <- String.split(page, ".", parts: 3),
          {offset, ""} when offset >= 0 <- Integer.parse(offset),
-         scope = %{offset: offset, limit: limit, head: head},
+         scope = SharedCapability.scope(capability, %{offset: offset, limit: limit, head: head}),
          :ok <-
            SharedContinuation.validate(token, state.store.engine.agent_cursor_key, who,
              :person_snapshot, scope, head, state.clock.()) do
@@ -652,14 +661,14 @@ defmodule AttentionServer.ClientAPI.Reads do
     end
   end
 
-  defp shared_person_page(_state, _person, _offset, 0), do: {:ok, []}
+  defp shared_person_page(_state, _person, _offset, 0, _capability), do: {:ok, []}
 
-  defp shared_person_page(state, person, offset, limit) do
+  defp shared_person_page(state, person, offset, limit, capability) do
     engine = state.store.engine
 
     rows =
       engine
-      |> SharedMessages.for_person(person)
+      |> SharedMessages.for_person(person, capability)
       |> Enum.sort_by(fn {_, recipient} -> recipient.item_id end)
       |> Enum.slice(offset, limit)
 

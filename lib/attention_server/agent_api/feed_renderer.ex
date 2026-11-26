@@ -40,10 +40,11 @@ defmodule AttentionServer.AgentAPI.FeedRenderer do
     end)
   end
 
-  defp render_row(%{store: %{engine: engine}}, {person, origin},
+  defp render_row(%{store: %{engine: engine}} = state, {person, origin},
          %{resource: {:shared_answer, id}}, _entries) do
     with %{shared_id: message_id} = answer <- engine.shared_answers[id],
          %{sender_person: ^person, sender_key: ^origin} = record <- engine.shared_messages[message_id],
+         true <- shared_visible?(state, record),
          true <- Engine.shared_sender_allowed?(engine, person, origin, record.sender_id) do
       {:ok, SharedAnswers.event(answer)}
     else
@@ -51,10 +52,11 @@ defmodule AttentionServer.AgentAPI.FeedRenderer do
     end
   end
 
-  defp render_row(%{store: %{engine: engine}}, {person, origin},
+  defp render_row(%{store: %{engine: engine}} = state, {person, origin},
          %{resource: {:shared_seen, id}}, _entries) do
     with %{shared_id: message_id} = event <- engine.shared_seen[id],
          %{sender_person: ^person, sender_key: ^origin} = record <- engine.shared_messages[message_id],
+         true <- shared_visible?(state, record),
          true <- Engine.shared_sender_allowed?(engine, person, origin, record.sender_id) do
       {:ok, SharedMessages.seen_event(event)}
     else
@@ -62,9 +64,10 @@ defmodule AttentionServer.AgentAPI.FeedRenderer do
     end
   end
 
-  defp render_row(%{store: %{engine: engine}}, {person, origin},
+  defp render_row(%{store: %{engine: engine}} = state, {person, origin},
          %{resource: {:shared_message, id}, rev: rev}, _entries) do
     with %{sender_person: ^person, sender_key: ^origin} = record <- engine.shared_messages[id],
+         true <- shared_visible?(state, record),
          true <- Engine.shared_sender_allowed?(engine, person, origin, record.sender_id) do
       {:ok, SharedMessages.sender_message(engine, record, rev)}
     else
@@ -72,10 +75,11 @@ defmodule AttentionServer.AgentAPI.FeedRenderer do
     end
   end
 
-  defp render_row(%{store: %{engine: engine}}, {person, origin},
+  defp render_row(%{store: %{engine: engine}} = state, {person, origin},
          %{resource: {:shared_entry, id}, rev: rev}, _entries) do
     with %{shared_id: shared_id, position: position} = entry <- engine.shared_entries[id],
          %{sender_person: ^person, sender_key: ^origin} = record <- engine.shared_messages[shared_id],
+         true <- shared_visible?(state, record),
          true <- Engine.shared_sender_allowed?(engine, person, origin, record.sender_id),
          cutoff = Map.get(record, :sender_frozen_entry_high),
          true <- is_nil(cutoff) or position <= cutoff do
@@ -119,4 +123,8 @@ defmodule AttentionServer.AgentAPI.FeedRenderer do
        ) do
     Advisories.change(engine, {person, key, session}, id)
   end
+
+  defp shared_visible?(state, record),
+    do: AttentionServer.ClientAPI.SharedCapability.visible?(record, Map.get(state, :shared_projection))
+
 end

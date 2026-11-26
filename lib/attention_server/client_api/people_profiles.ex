@@ -10,9 +10,9 @@ defmodule AttentionServer.ClientAPI.PeopleProfiles do
   def routes, do: [{"PATCH", ["me", "profile"], :patch_profile}]
 
   def patch_profile(conn, ctx) do
-    with {:ok, %{shared?: true}} <- SharedCapability.parse(conn),
+    with {:ok, %{shared?: true} = capability} <- SharedCapability.parse(conn),
          {:ok, body, conn} <- AgentWrites.json_body(conn, []),
-         result <- GenServer.call(ctx.relay, {:client_api, __MODULE__, {ctx.principal, body}}, :infinity) do
+         result <- GenServer.call(ctx.relay, {:client_api, __MODULE__, {ctx.principal, body, capability}}, :infinity) do
       Reads.respond(conn, result)
     else
       {:ok, %{shared?: false}} -> Errors.send_error(conn, "unsupported")
@@ -22,11 +22,14 @@ defmodule AttentionServer.ClientAPI.PeopleProfiles do
   end
 
   @doc false
-  def handle_call({who, body}, from, state) do
+  def handle_call({who, body}, from, state), do: handle_call({who, body, %{}}, from, state)
+
+  def handle_call({who, body, capability}, from, state) do
     engine = state.store.engine
 
     with {:ok, principal} <- Reads.client_principal(engine, who),
-         true <- Reads.shared_available?(state, principal.person) || {:error, :unsupported},
+         true <- Reads.shared_available?(state, principal.person) and
+                   SharedCapability.readable?(state, principal.person, capability) || {:error, :unsupported},
          {:ok, _} <- Engine.owner_revision(engine, principal.person, who.key),
          {:ok, profile} <- checked_profile(body),
          :ok <- available_handle(engine, principal.person, profile) do
