@@ -28,7 +28,7 @@ defmodule AttentionServer.SignInActivationTest do
     :ok = GenServer.stop(relay)
 
     failed = options ++ [sign_in_s1: true, auth_migration_devices: ["unknown"]]
-    assert {:error, _} = Relay.start_link(failed)
+    assert {:error, _} = GenServer.start(Relay, failed)
 
     {:ok, store} = Store.open_relay(path)
     assert {:ok, nil} = AuthSchema.read(store.db)
