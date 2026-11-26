@@ -41,6 +41,7 @@ defmodule AttentionServer.Engine do
             relay_instance_id: nil,
             agent_cursor_key: nil,
             persons: %{},
+            people_profiles: %{},
             owners: %{},
             retired_owner_keys: MapSet.new(),
             pending_enrollments: %{},
@@ -748,8 +749,13 @@ defmodule AttentionServer.Engine do
           MapSet.difference(MapSet.new(Map.keys(engine.owners)), hosted_people)
         end)
 
-      members = if member?, do: MapSet.put(members, person), else: MapSet.delete(members, person)
-      {:ok, put_row(engine, :local_organizations, :default, members)}
+      next_members = if member?, do: MapSet.put(members, person), else: MapSet.delete(members, person)
+      departing = MapSet.difference(members, next_members)
+
+      {:ok,
+       engine
+       |> freeze_shared_departures(engine.relay_instance_id, departing)
+       |> put_row(:local_organizations, :default, next_members)}
     else
       {:error, :unknown_local_person}
     end
@@ -771,7 +777,13 @@ defmodule AttentionServer.Engine do
     cond do
       not hosted_account_ref?(ref) -> {:error, :invalid_organization}
       not valid_hosted_organization?(engine, ref, record) -> {:error, :invalid_members}
-      true -> {:ok, put_row(engine, :hosted_organizations, ref, record)}
+      true ->
+        previous = get_in(engine.hosted_organizations, [ref, :members]) || MapSet.new()
+        departing = MapSet.difference(previous, record.members)
+        {:ok,
+         engine
+         |> freeze_shared_departures(record.id, departing)
+         |> put_row(:hosted_organizations, ref, record)}
     end
   end
 
@@ -780,9 +792,26 @@ defmodule AttentionServer.Engine do
 
   @doc false
   def delete_hosted_organization(%__MODULE__{} = engine, ref) do
-    if hosted_account_ref?(ref),
-      do: {:ok, delete_row(engine, :hosted_organizations, ref)},
-      else: {:error, :invalid_organization}
+    if hosted_account_ref?(ref) do
+      next =
+        case engine.hosted_organizations[ref] do
+          %{id: id, members: people} ->
+            engine |> freeze_shared_departures(id, people) |> delete_row(:hosted_organizations, ref)
+
+          nil ->
+            engine
+        end
+
+      {:ok, next}
+    else
+      {:error, :invalid_organization}
+    end
+  end
+
+  defp freeze_shared_departures(engine, organization, departing) do
+    if MapSet.size(departing) == 0,
+      do: engine,
+      else: AttentionServer.SharedMessages.freeze_departures(engine, organization, departing)
   end
 
   @doc false

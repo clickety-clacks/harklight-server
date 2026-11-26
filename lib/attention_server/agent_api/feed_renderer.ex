@@ -1,6 +1,7 @@
 defmodule AttentionServer.AgentAPI.FeedRenderer do
   @moduledoc false
 
+  alias AttentionServer.{Engine, SharedMessages}
   alias AttentionServer.AgentAPI.Advisories
   alias AttentionServer.ClientAPI.{AgentResources, Projection}
 
@@ -26,7 +27,20 @@ defmodule AttentionServer.AgentAPI.FeedRenderer do
       end)
       |> Map.new()
 
-    Enum.map(rows, fn row -> {row, render_row(state, scope, row, entries)} end)
+    Enum.map(rows, fn row ->
+      projected_row = if row.kind == :shared_message, do: %{row | kind: :message}, else: row
+      {projected_row, render_row(state, scope, row, entries)}
+    end)
+  end
+
+  defp render_row(%{store: %{engine: engine}}, {person, origin},
+         %{resource: {:shared_message, id}, rev: rev}, _entries) do
+    with %{sender_person: ^person, sender_key: ^origin} = record <- engine.shared_messages[id],
+         true <- Engine.shared_sender_allowed?(engine, person, origin, record.sender_id) do
+      {:ok, SharedMessages.sender_message(record, rev)}
+    else
+      _ -> :skip
+    end
   end
 
   defp render_row(state, scope, %{resource: {:message, key}, rev: rev}, _entries) do

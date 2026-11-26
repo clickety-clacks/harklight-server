@@ -141,7 +141,7 @@ defmodule AttentionServer.ClientAPI.FeedStep do
   cursor and never takes down the Relay.
   """
 
-  alias AttentionServer.{ChangeLog, Diagnostics, SharedMessages}
+  alias AttentionServer.{ChangeLog, Diagnostics}
   alias AttentionServer.ClientAPI.{FeedRenderer, Projection, Reads, SharedContinuation}
 
   @doc false
@@ -223,7 +223,7 @@ defmodule AttentionServer.ClientAPI.FeedStep do
   defp validate_capability(state, %{shared_capability: %{shared?: true, continuation: token}} = principal, cursor) do
     engine = state.store.engine
 
-    if state.shared_messages and MapSet.size(SharedMessages.organizations(engine, principal.person)) > 0 do
+    if Reads.shared_readable?(state, principal.person) do
       SharedContinuation.validate(token, engine.agent_cursor_key, principal, :person_changes, %{}, cursor, state.clock.())
     else
       {:error, :unsupported}

@@ -16,6 +16,7 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
     Idempotency,
     Projection,
     Resources,
+    SharedCapability,
     Uploads,
     Writes
   }
@@ -25,6 +26,7 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
     send: ~w(sender session message file_ids supersedes),
     revise: ~w(message file_ids in_reply_to),
     retract: ~w(in_reply_to),
+    chat_close: [],
     lifecycle: ~w(action),
     reply: ~w(text file_ids in_reply_to),
     result: ~w(status),
@@ -42,6 +44,7 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
       {"PUT", ["agent", "messages", :item_id], :revise},
       {"POST", ["agent", "messages", :item_id, "retract"], :retract, granted_agent: true},
       {"POST", ["agent", "messages", :item_id, "lifecycle"], :lifecycle},
+      {"POST", ["agent", "messages", :item_id, "chat", "close"], :chat_close},
       {"POST", ["agent", "messages", :item_id, "replies"], :reply},
       {"POST", ["agent", "messages", :item_id, "result"], :result},
       {"POST", ["agent", "messages", :item_id, "receipt"], :answer_receipt},
@@ -56,6 +59,7 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
   def revise(conn, ctx), do: request(conn, ctx, :revise)
   def retract(conn, ctx), do: request(conn, ctx, :retract)
   def lifecycle(conn, ctx), do: request(conn, ctx, :lifecycle)
+  def chat_close(conn, ctx), do: request(conn, ctx, :chat_close)
   def reply(conn, ctx), do: request(conn, ctx, :reply)
   def result(conn, ctx), do: request(conn, ctx, :result)
   def answer_receipt(conn, ctx), do: request(conn, ctx, :answer_receipt)
@@ -92,6 +96,26 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
         Errors.send_error(conn, "invalid_field", field: "features")
     end
   end
+
+  defp dispatch_write(conn, %{params: %{item_id: "shared_" <> _ = id}} = ctx,
+         operation, key, body) when operation in [:revise, :retract, :chat_close] do
+    case SharedCapability.parse(conn) do
+      {:ok, %{shared?: true}} ->
+        match = get_req_header(conn, "if-match")
+        digest = write_digest(conn, match, body)
+        request = {:shared_mutation, ctx.principal, key, digest, id, operation, match, body}
+        Writes.respond(conn, replay_success(ctx, call(ctx, request)))
+
+      {:ok, _} ->
+        Errors.send_error(conn, "not_found")
+
+      {:error, token, field} ->
+        Errors.send_error(conn, token, field: field)
+    end
+  end
+
+  defp dispatch_write(conn, _ctx, :chat_close, _key, _body),
+    do: Errors.send_error(conn, "not_found")
 
   defp dispatch_write(conn, ctx, operation, key, body) do
     with :ok <- Writes.only_members(body, Map.fetch!(@members, operation)) do
@@ -198,6 +222,38 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
       end
     else
       {:reply, refusal({:error, :unsupported}), state}
+    end
+  end
+
+  def handle_call({:shared_mutation, %{person: person, key: origin}, key, digest, id, operation, match, body},
+        _from, state) do
+    scope = {person, origin}
+
+    with true <- state.shared_messages || {:error, :unsupported},
+         :ok <- authorize(state, scope, operation),
+         %{sender_person: ^person, sender_key: ^origin} = record <-
+           state.store.engine.shared_messages[id],
+         true <- Engine.shared_sender_allowed?(state.store.engine, person, origin, record.sender_id) ||
+                   {:error, :not_found} do
+      case lookup(state, receipt_scope(scope), key) do
+        {:ok, %{digest: ^digest, status: status, body: stored}} ->
+          {:reply, {:stored, status, stored}, state}
+
+        {:ok, %{}} ->
+          {:reply, refusal({:error, :idempotency_conflict}), state}
+
+        {:ok, nil} ->
+          apply_shared_mutation(state, scope, record, key, digest, operation, match, body)
+
+        error ->
+          {:reply, refusal(error), state}
+      end
+    else
+      result when is_nil(result) or is_map(result) ->
+        {:reply, refusal({:error, :not_found}), state}
+
+      error ->
+        {:reply, refusal(error), state}
     end
   end
 
@@ -494,6 +550,51 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
       _ ->
         {:reply, refusal({:error, :storage_unavailable}), state}
     end
+  end
+
+  defp apply_shared_mutation(state, {person, origin} = scope, record, key, digest, operation, match, body) do
+    with {:ok, next} <- shared_mutation(state, record, operation, match, body),
+         audit = %{
+           person: person, actor: origin, action: "shared_message_" <> Atom.to_string(operation),
+           shared_mutation_receipt: {scope, key, digest, record.id}
+         },
+         {:ok, store} <- Store.commit(state.store, next, audit) do
+      result =
+        with {:ok, head} <- AgentChangeLog.head(store, scope),
+             {:ok, rev} <- AgentChangeLog.rev(store, scope, {:shared_message, record.id}) do
+          body = %{"rev" => head, "message" => SharedMessages.sender_message(next.shared_messages[record.id], rev)}
+          {:ok, 200, body, false}
+        end
+
+      {:reply, result, %{state | store: store}}
+    else
+      error -> {:reply, refusal(error), state}
+    end
+  end
+
+  defp shared_mutation(state, record, :revise, match, body) do
+    with :ok <- Writes.only_members(body, ~w(message file_ids)),
+         :ok <- files(body),
+         true <- Map.get(body, "file_ids", []) == [] || {:error, "unsupported", "file_ids"},
+         :ok <- if_match(match, record.revision),
+         {:ok, message} <- content(body),
+         true <- (is_nil(record.answer_policy) == (message["message_type"] == "fyi")) ||
+                   {:error, "invalid_field", "message_type"},
+         message <- Map.merge(message, %{"sender_id" => record.sender_id, "message_id" => record.id}),
+         :ok <- shared_content_valid(message) do
+      {message, _diagnostics} = Message.admit_answer_ui(message, [])
+      SharedMessages.revise(state.store.engine, record, record.revision, message)
+    end
+  end
+
+  defp shared_mutation(state, record, :chat_close, _match, body) do
+    with :ok <- Writes.only_members(body, []),
+      do: SharedMessages.close_chat(state.store.engine, record)
+  end
+
+  defp shared_mutation(state, record, :retract, _match, body) do
+    with :ok <- Writes.only_members(body, []),
+      do: SharedMessages.retract(state.store.engine, record, state.clock.())
   end
 
   defp shared_send_fields(body) do

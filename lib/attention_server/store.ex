@@ -1264,7 +1264,11 @@ defmodule AttentionServer.Store do
           _ -> keyed_change_log(store, next, touched, projected)
         end
 
-      log = shared_send_log(log, next, audit)
+      log =
+        log
+        |> shared_send_log(next, audit)
+        |> shared_mutation_log(next, audit)
+        |> shared_freeze_log(old, next, touched)
       %{records: records, delete_paths: delete_paths, reference_rows: references} = prepared
       derived = DerivedIndex.changes(old, next, touched)
 
@@ -1790,6 +1794,7 @@ defmodule AttentionServer.Store do
 
   @keyed_row_fields [
     :owners,
+    :people_profiles,
     :pending_enrollments,
     :pending_history,
     :join_invitations,
@@ -1829,6 +1834,9 @@ defmodule AttentionServer.Store do
   defp keyed_row_field?(field), do: field in @keyed_row_fields
 
   defp valid_keyed_row?(engine, :owners, person, owner), do: valid_owner?(engine, person, owner)
+
+  defp valid_keyed_row?(engine, :people_profiles, person, profile),
+    do: Map.has_key?(engine.persons, person) and AttentionServer.ClientAPI.PeopleProfiles.valid?(profile)
 
   defp valid_keyed_row?(engine, :pending_enrollments, code, item),
     do: not Map.has_key?(engine.pending_history, code) and valid_pending_item?(engine, code, item)
@@ -2069,6 +2077,42 @@ defmodule AttentionServer.Store do
 
   defp shared_send_log(log, _engine, _audit), do: log
 
+  defp shared_mutation_log(log, engine, %{shared_mutation_receipt: {scope, _, _, id}}) do
+    session = Map.get(Map.fetch!(engine.shared_messages, id), "session")
+    log = AgentChangeLog.append_shared_message(log, scope, id, session)
+
+    Enum.reduce(SharedMessages.live_recipients(engine, id), log, fn person, acc ->
+      AttentionServer.ChangeLog.append_shared_freeze(acc, person, id)
+    end)
+  end
+
+  defp shared_mutation_log(log, _engine, _audit), do: log
+
+  defp shared_freeze_log(nil, _old, _next, _touched), do: nil
+
+  defp shared_freeze_log(log, old, next, touched) do
+    Enum.reduce(touched, log, fn
+      {:row, :shared_recipients, {id, person} = key}, acc ->
+        case {old.shared_recipients[key], next.shared_recipients[key]} do
+          {%{frozen: _}, _} -> acc
+          {%{}, %{frozen: _}} -> AttentionServer.ChangeLog.append_shared_freeze(acc, person, id)
+          _ -> acc
+        end
+
+      {:row, :shared_messages, id}, acc ->
+        case {old.shared_messages[id], next.shared_messages[id]} do
+          {%{sender_frozen_revision: _}, _} -> acc
+          {%{}, %{sender_frozen_revision: _, sender_person: person, sender_key: key} = record} ->
+            AgentChangeLog.append_shared_message(acc, {person, key}, id, Map.get(record, "session"))
+
+          _ -> acc
+        end
+
+      _, acc ->
+        acc
+    end)
+  end
+
   defp write_shared_send_receipt(store, engine, %{
          shared_send_receipt: {{person, origin} = scope, key, digest, id, outcomes}
        }) do
@@ -2082,6 +2126,21 @@ defmodule AttentionServer.Store do
         "recipients" => outcomes
       }
 
+      Idempotency.save(store, Idempotency.agent_scope(person, origin), key, digest, 200, body)
+    end
+  end
+
+  defp write_shared_send_receipt(_store, _engine, %{shared_mutation_receipt: {_, nil, _, _}}),
+    do: :ok
+
+  defp write_shared_send_receipt(store, engine, %{
+         shared_mutation_receipt: {{person, origin} = scope, key, digest, id}
+       }) do
+    record = Map.fetch!(engine.shared_messages, id)
+
+    with {:ok, rev} <- AgentChangeLog.head(store, scope),
+         {:ok, resource_rev} <- AgentChangeLog.rev(store, scope, {:shared_message, id}) do
+      body = %{"rev" => rev, "message" => SharedMessages.sender_message(record, resource_rev)}
       Idempotency.save(store, Idempotency.agent_scope(person, origin), key, digest, 200, body)
     end
   end
@@ -2748,6 +2807,7 @@ defmodule AttentionServer.Store do
           is_binary(person) and is_integer(high) and high >= 0
         end) and
         valid_owners?(engine) and
+        valid_people_profiles?(engine) and
         valid_pending?(engine) and
         valid_pending_history?(engine) and
         GuidedJoin.valid_state?(engine) and
@@ -3403,6 +3463,16 @@ defmodule AttentionServer.Store do
       ((is_nil(grant.revoked_at) and is_nil(grant.revoked_by)) or
          (is_integer(grant.revoked_at) and grant.revoked_at >= grant.granted_at and
             hex_key?(grant.revoked_by)))
+  end
+
+  defp valid_people_profiles?(engine) do
+    profiles = engine.people_profiles
+    handles = MapSet.new(Map.values(profiles), & &1["handle"])
+
+    MapSet.size(handles) == map_size(profiles) and
+      Enum.all?(profiles, fn {person, profile} ->
+        valid_keyed_row?(engine, :people_profiles, person, profile)
+      end)
   end
 
   defp valid_hosted_accounts?(engine) do

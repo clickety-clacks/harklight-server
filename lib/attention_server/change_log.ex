@@ -134,6 +134,12 @@ defmodule AttentionServer.ChangeLog do
     end)
   end
 
+  @doc false
+  def append_shared_freeze(log, person, id) do
+    rows = [{:item, shared_item_resource(id)}, {:counts, "shared-counts"}]
+    update_in(log.pending, &Map.update(&1, person, rows, fn existing -> existing ++ rows end))
+  end
+
   @doc "The log's resource ID for an item, from its engine key."
   def item_resource({_person, sender, message_id}),
     do: "item:" <> Base.url_encode64(JSON.encode!([sender, message_id]), padding: false)

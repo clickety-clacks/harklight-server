@@ -33,7 +33,7 @@ defmodule AttentionServer.ClientAPI.SharedReads do
   def handle_call({who, direction, action, id}, _from, state) do
     result =
       with {:ok, principal} <- Reads.client_principal(state.store.engine, who),
-           true <- state.shared_messages || {:error, :unsupported} do
+           true <- Reads.shared_readable?(state, principal.person) || {:error, :unsupported} do
         if String.starts_with?(id, "shared_"),
           do: read(state.store, principal, direction, action, id),
           else: :legacy
@@ -46,7 +46,10 @@ defmodule AttentionServer.ClientAPI.SharedReads do
     with {:ok, message, recipient} <- SharedMessages.recipient_message(store.engine, person, id),
          {:ok, head} <- ChangeLog.head(store, person),
          {:ok, rev} <- ChangeLog.rev(store, person, ChangeLog.shared_item_resource(message.id)) do
-      resource(action, head, message, fn ->
+      cutoff = get_in(recipient, [:frozen, :revision])
+      historical = SharedMessages.historical_record(message, cutoff)
+
+      resource(action, head, historical, fn ->
         {"item", SharedMessages.person_item(store.engine, person, message, recipient, rev)}
       end)
     end
@@ -59,7 +62,8 @@ defmodule AttentionServer.ClientAPI.SharedReads do
          true <- Engine.shared_sender_allowed?(store.engine, person, origin, message.sender_id),
          {:ok, head} <- AgentChangeLog.head(store, scope),
          {:ok, rev} <- AgentChangeLog.rev(store, scope, {:shared_message, id}) do
-      resource(action, head, message, fn -> {"message", SharedMessages.sender_message(message, rev)} end)
+      historical = SharedMessages.historical_record(message, Map.get(message, :sender_frozen_revision))
+      resource(action, head, historical, fn -> {"message", SharedMessages.sender_message(message, rev)} end)
     else
       result when result in [nil, false] -> {:error, :not_found}
       %{} -> {:error, :not_found}
@@ -76,8 +80,9 @@ defmodule AttentionServer.ClientAPI.SharedReads do
 
   defp resource({:revision, n}, head, record, _render) do
     with {:ok, revision} <- Reads.revision_number(n),
-         true <- revision == record.revision || {:error, :not_found} do
-      {:ok, %{"rev" => head, "revision" => SharedMessages.revision(record)}}
+         true <- revision <= record.revision || {:error, :not_found} do
+      historical = SharedMessages.historical_record(record, revision)
+      {:ok, %{"rev" => head, "revision" => SharedMessages.revision(historical)}}
     end
   end
 

@@ -7,7 +7,7 @@ defmodule AttentionServer.AgentAPI.DeliveryBaseline do
 
   alias AttentionServer.{AgentChangeLog, Conversation, Engine, JSON, RouteBIndex, Store}
   alias AttentionServer.AgentAPI.{Feed, FeedActivity, FeedStep}
-  alias AttentionServer.ClientAPI.{AgentResources, Errors, Projection, Resources}
+  alias AttentionServer.ClientAPI.{AgentResources, Errors, Projection, Reads, Resources, SharedCapability, SharedContinuation}
   alias AttentionServer.ClientAPI.Feed, as: PersonFeed
 
   @max_token 512
@@ -25,10 +25,11 @@ defmodule AttentionServer.AgentAPI.DeliveryBaseline do
     conn = fetch_query_params(conn)
     page = conn.query_params["page"]
 
-    with {:ok, session} <- Feed.session(conn.query_params["session"]),
+    with {:ok, capability} <- SharedCapability.parse(conn),
+         {:ok, session} <- Feed.session(conn.query_params["session"]),
          {:ok, ack2} <- Feed.capability(conn),
          {:ok, limit} <- PersonFeed.limit(conn.query_params["limit"]),
-         {:ok, body} <- call(ctx, {:baseline, session, ack2, page, limit}) do
+         {:ok, body} <- call(ctx, {:baseline, session, ack2, page, limit, capability}) do
       ctx = %{ctx | params: Map.put(ctx.params, :session, session)}
       if page, do: FeedActivity.observe(ctx, :batch)
 
@@ -37,6 +38,9 @@ defmodule AttentionServer.AgentAPI.DeliveryBaseline do
       |> put_resp_header("cache-control", "no-store")
       |> Errors.send_json(200, body)
     else
+      {:error, "invalid_field", field} ->
+        Errors.send_error(conn, "invalid_field", field: field)
+
       {:error, field} when is_binary(field) ->
         Errors.send_error(conn, "invalid_field", field: field)
 
@@ -74,7 +78,7 @@ defmodule AttentionServer.AgentAPI.DeliveryBaseline do
   def handle_call({principal, request}, _from, state) do
     result =
       with {:ok, scope} <- FeedStep.authorized(state.store.engine, principal) do
-        Projection.capture(fn -> apply_request(state, scope, request) end)
+        Projection.capture(fn -> apply_request(state, scope, principal, request) end)
       end
 
     case result do
@@ -83,23 +87,28 @@ defmodule AttentionServer.AgentAPI.DeliveryBaseline do
     end
   end
 
-  defp apply_request(%{store: store}, scope, {:baseline, session, ack2, nil, _limit}) do
-    with {:ok, rev} <- AgentChangeLog.head(store, scope) do
+  defp apply_request(%{store: store} = state, scope, principal,
+         {:baseline, session, ack2, nil, _limit, capability}) do
+    with :ok <- baseline_capability(state, principal, capability),
+         {:ok, rev} <- AgentChangeLog.head(store, scope) do
       bound = get_in(store.engine.origin_feeds, [scope, :high]) || 0
       attempt = :crypto.strong_rand_bytes(16) |> Base.url_encode64(padding: false)
       page = %{attempt: attempt, bound: bound, position: 0, rev: rev}
       body = %{
         "rev" => rev,
-        "next_page" => encode(page, scope, session, ack2),
+        "next_page" => encode(page, scope, session, ack2, capability.shared?),
         "answers" => "all"
       }
 
+      body = maybe_shared_baseline(body, state, principal, session, capability.shared?)
       {:ok, {:ok, body}, store}
     end
   end
 
-  defp apply_request(%{store: store} = state, scope, {:baseline, session, ack2, token, limit}) do
-    with {:ok, page} <- decode(token, scope, session, ack2),
+  defp apply_request(%{store: store} = state, scope, principal,
+         {:baseline, session, ack2, token, limit, capability}) do
+    with :ok <- baseline_capability(state, principal, capability),
+         {:ok, page} <- decode(token, scope, session, ack2, capability.shared?),
          stop = min(page.position + limit, page.bound),
          {:ok, changes, targets} <- page_changes(state, scope, session, page, stop),
          {:ok, store} <-
@@ -108,7 +117,7 @@ defmodule AttentionServer.AgentAPI.DeliveryBaseline do
 
       body =
         if stop < page.bound,
-          do: Map.put(body, "next_page", encode(%{page | position: stop}, scope, session, ack2)),
+          do: Map.put(body, "next_page", encode(%{page | position: stop}, scope, session, ack2, capability.shared?)),
           else: body
 
       {:ok, {:ok, body}, store}
@@ -118,6 +127,7 @@ defmodule AttentionServer.AgentAPI.DeliveryBaseline do
   defp apply_request(
          %{store: store} = state,
          {person, origin} = scope,
+         _principal,
          {:listener_received, item_id, entry_id}
        ) do
     with {:ok, item} <- AgentResources.own_item_key(state, scope, item_id),
@@ -140,6 +150,23 @@ defmodule AttentionServer.AgentAPI.DeliveryBaseline do
       {:error, _} = error -> error
     end
   end
+
+  defp baseline_capability(state, principal, %{shared?: true}) do
+    if Reads.shared_readable?(state, principal.person), do: :ok, else: {:error, :unsupported}
+  end
+
+  defp baseline_capability(_state, _principal, %{continuation: token}) when is_binary(token),
+    do: {:error, :cursor_expired}
+
+  defp baseline_capability(_state, _principal, _capability), do: :ok
+
+  defp maybe_shared_baseline(body, state, principal, session, true) do
+    token = SharedContinuation.issue(state.store.engine.agent_cursor_key, principal,
+      :agent_changes, %{session: session}, body["rev"], state.clock.())
+    Map.merge(body, %{"shared_events" => true, "continuation" => token})
+  end
+
+  defp maybe_shared_baseline(body, _state, _principal, _session, false), do: body
 
   defp page_changes(%{store: %{engine: engine}} = state, scope, session, page, stop) do
     entries = get_in(engine.origin_feeds, [scope, :entries]) || %{}
@@ -244,33 +271,50 @@ defmodule AttentionServer.AgentAPI.DeliveryBaseline do
 
   defp change(kind, %{"rev" => rev} = data), do: %{"kind" => kind, "rev" => rev, "data" => data}
 
-  defp encode(page, scope, session, ack2) do
-    [1, binding(scope, session, ack2), page.attempt, page.bound, page.position, page.rev]
+  defp encode(page, scope, session, ack2, shared?) do
+    [page_version(shared?), binding(scope, session, ack2, shared?), page.attempt, page.bound, page.position, page.rev]
     |> JSON.encode!()
     |> Base.url_encode64(padding: false)
   end
 
-  defp decode(token, scope, session, ack2)
+  defp decode(token, scope, session, ack2, shared?)
        when is_binary(token) and byte_size(token) <= @max_token do
-    binding = binding(scope, session, ack2)
+    binding = binding(scope, session, ack2, shared?)
+    version = page_version(shared?)
 
     with {:ok, raw} <- Base.url_decode64(token, padding: false),
-         {:ok, [1, ^binding, attempt, bound, position, rev]} <- JSON.decode_line(raw <> "\n"),
+         {:ok, [^version, ^binding, attempt, bound, position, rev]} <- JSON.decode_line(raw <> "\n"),
          true <- is_binary(attempt) and byte_size(attempt) == 22,
          true <- is_integer(position) and position >= 0,
          true <- is_integer(bound) and bound >= position,
          true <- is_integer(rev) and rev >= 0 do
       {:ok, %{attempt: attempt, bound: bound, position: position, rev: rev}}
     else
-      _ -> {:error, "page"}
+      _ -> invalid_page(token, shared?)
     end
   end
 
-  defp decode(_token, _scope, _session, _ack2), do: {:error, "page"}
+  defp decode(token, _scope, _session, _ack2, shared?), do: invalid_page(token, shared?)
 
-  defp binding(scope, session, ack2) do
+  defp page_version(true), do: 2
+  defp page_version(false), do: 1
+
+  defp invalid_page(_token, true), do: {:error, :cursor_expired}
+  defp invalid_page(token, false) when is_binary(token) do
+    with {:ok, raw} <- Base.url_decode64(token, padding: false),
+         {:ok, [2 | _]} <- JSON.decode_line(raw <> "\n") do
+      {:error, :cursor_expired}
+    else
+      _ -> {:error, "page"}
+    end
+  end
+  defp invalid_page(_token, false), do: {:error, "page"}
+
+  defp binding(scope, session, ack2, shared?) do
+    values = if shared?, do: {scope, session, ack2, :shared_messages}, else: {scope, session, ack2}
+
     :sha256
-    |> :crypto.hash(:erlang.term_to_binary({scope, session, ack2}))
+    |> :crypto.hash(:erlang.term_to_binary(values))
     |> Base.url_encode64(padding: false)
   end
 end

@@ -113,7 +113,7 @@ defmodule AttentionServer.Store.RecordCodec do
 
   def account?({:row, field, _}) do
     field in [
-      :persons, :owners, :pending_enrollments, :pending_history, :join_invitations,
+      :persons, :people_profiles, :owners, :pending_enrollments, :pending_history, :join_invitations,
       :browser_sign_ins, :maintainer_grants, :devices, :agents, :sender_grants,
       :source_report_grants, :enrollment_read_grants, :free_order_highs, :conversation_highs,
       :conversation_cursors, :subscriptions, :cursors, :hosted_accounts, :hosted_organizations,

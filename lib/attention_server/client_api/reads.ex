@@ -33,7 +33,7 @@ defmodule AttentionServer.ClientAPI.Reads do
     UI1
   }
 
-  alias AttentionServer.ClientAPI.{Context, Errors, Projection, Resources, Search, SharedCapability, SharedContinuation, SharedReads}
+  alias AttentionServer.ClientAPI.{Context, Errors, PeopleProfiles, Projection, Resources, Search, SharedCapability, SharedContinuation, SharedReads}
 
   # The client features still behind an operator flag at 0.2 (contract §4).
   @client_features ~w(server_matched_push_routing priority_level_editing)
@@ -140,7 +140,13 @@ defmodule AttentionServer.ClientAPI.Reads do
     do: respond(conn, settings(ctx.relay, ctx.principal), &etag(&1["settings"]))
 
   @doc false
-  def get_me(conn, %Context{} = ctx), do: respond(conn, me(ctx.relay, ctx.principal))
+  def get_me(conn, %Context{} = ctx) do
+    case SharedCapability.parse(conn) do
+      {:ok, %{shared?: true}} -> respond(conn, call(ctx.relay, {:me_profile, ctx.principal}))
+      {:ok, %{shared?: false}} -> respond(conn, me(ctx.relay, ctx.principal))
+      error -> respond(conn, error)
+    end
+  end
 
   @doc false
   def get_file(conn, %Context{} = ctx) do
@@ -334,6 +340,22 @@ defmodule AttentionServer.ClientAPI.Reads do
     end
   end
 
+  def handle_call({:me_profile, who}, from, state) do
+    with {:ok, %{person: person}} <- principal(state.store.engine, who),
+         true <- shared_readable?(state, person) || {:error, :unsupported} do
+      case handle_call({:me, who}, from, state) do
+        {:reply, {:ok, body}, next} ->
+          profile = PeopleProfiles.for_person(next.store.engine, person)
+          {:reply, {:ok, put_in(body, ["principal", "profile"], profile)}, next}
+
+        other ->
+          other
+      end
+    else
+      error -> {:reply, error, state}
+    end
+  end
+
   def handle_call(request, _from, state) do
     reply =
       try do
@@ -349,7 +371,7 @@ defmodule AttentionServer.ClientAPI.Reads do
     engine = state.store.engine
 
     with {:ok, %{person: person} = principal} <- principal(engine, who),
-         true <- shared_available?(state, person) || {:error, :unsupported},
+         true <- shared_readable?(state, person) || {:error, :unsupported},
          {:ok, limit} <- limit(params),
          {:ok, position} <- head(state, person),
          {:ok, offset} <- shared_page(state, who, params["page"], limit, position),
@@ -646,6 +668,12 @@ defmodule AttentionServer.ClientAPI.Reads do
   def shared_available?(state, person) do
     state.shared_messages and
       MapSet.size(SharedMessages.organizations(state.store.engine, person)) > 0
+  end
+
+  @doc false
+  def shared_readable?(state, person) do
+    state.shared_messages and
+      (shared_available?(state, person) or SharedMessages.retained_history?(state.store.engine, person))
   end
 
   defp visible_item_key(engine, principal, item_id) do

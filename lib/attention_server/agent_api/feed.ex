@@ -6,7 +6,7 @@ defmodule AttentionServer.AgentAPI.Feed do
   import Plug.Conn
 
   alias AttentionServer.AgentAPI.{FeedActivity, FeedStep}
-  alias AttentionServer.ClientAPI.{Errors, Feed, FeedStream}
+  alias AttentionServer.ClientAPI.{Errors, Feed, FeedStream, SharedCapability}
   alias AttentionServer.Message
 
   @impl true
@@ -15,11 +15,12 @@ defmodule AttentionServer.AgentAPI.Feed do
   def changes(conn, %{principal: %{kind: :device}} = ctx) do
     conn = fetch_query_params(conn)
 
-    with {:ok, cursor} <- Feed.cursor(conn),
+    with {:ok, shared} <- SharedCapability.parse(conn),
+         {:ok, cursor} <- Feed.cursor(conn),
          {:ok, limit} <- Feed.limit(conn.query_params["limit"]),
          {:ok, session} <- session(conn.query_params["session"]),
          {:ok, ack2} <- capability(conn) do
-      ctx = %{ctx | params: Map.merge(ctx.params, %{session: session, ack2: ack2})}
+      ctx = %{ctx | params: Map.merge(ctx.params, %{session: session, ack2: ack2, shared_capability: shared})}
 
       if Feed.event_stream?(conn) do
         stream_ctx = %{ctx | params: Map.put(ctx.params, :stream, true)}
@@ -28,6 +29,7 @@ defmodule AttentionServer.AgentAPI.Feed do
         batch(conn, ctx, cursor, limit)
       end
     else
+      {:error, "invalid_field", field} -> Errors.send_error(conn, "invalid_field", field: field)
       {:error, field} -> Errors.send_error(conn, "invalid_field", field: field)
     end
   end
@@ -78,7 +80,7 @@ defmodule AttentionServer.AgentAPI.FeedStep do
 
   alias AttentionServer.{AgentChangeLog, Diagnostics, Engine, Relay, Store}
   alias AttentionServer.AgentAPI.{FeedActivity, FeedRenderer, Focus}
-  alias AttentionServer.ClientAPI.{FeedStep, Projection, Resources}
+  alias AttentionServer.ClientAPI.{FeedStep, Projection, Reads, Resources, SharedContinuation}
 
   def scope(%{principal: %{person: person, key: key}}), do: {:agent, person, key}
 
@@ -91,7 +93,7 @@ defmodule AttentionServer.AgentAPI.FeedStep do
         call(
           relay,
           {:read, principal, session, cursor, limit,
-           Keyword.new(Map.take(params, [:ack2, :stream]))}
+           Keyword.new(Map.take(params, [:ack2, :stream, :shared_capability]))}
         )
 
   def opened(ctx) do
@@ -124,7 +126,7 @@ defmodule AttentionServer.AgentAPI.FeedStep do
         %{store: store} = state
       ) do
     with {:ok, agent, changes, more, position} <-
-           read_rows(state, principal, session, cursor, limit),
+           read_rows(state, principal, session, cursor, limit, opts[:shared_capability]),
          targets = Enum.flat_map(changes, &delivery_target/1),
          {:ok, store} <- commit_delivery(store, agent, targets, opts) do
       {:reply, {:ok, changes, more, position}, %{state | store: store}}
@@ -170,9 +172,11 @@ defmodule AttentionServer.AgentAPI.FeedStep do
     {:error, :delivery_unavailable}
   end
 
-  defp read_rows(%{store: store} = state, principal, session, cursor, limit) do
+  defp read_rows(%{store: store} = state, principal, session, cursor, limit, capability) do
     with {:ok, agent} <- authorized(store.engine, principal),
-         {:ok, rows, more, position} <- AgentChangeLog.read(store, agent, cursor, limit, session),
+         :ok <- validate_capability(state, principal, session, cursor, capability),
+         {:ok, rows, more, position} <-
+           AgentChangeLog.read(store, agent, cursor, limit, session, match?(%{shared?: true}, capability)),
          {:ok, changes} <- render_changes(state, principal, rows) do
       {:ok, agent, changes, more, position}
     else
@@ -180,7 +184,7 @@ defmodule AttentionServer.AgentAPI.FeedStep do
         error
 
       {:error, reason}
-      when reason in [:cursor_expired, :account_paused, :unauthorized, :disabled] ->
+      when reason in [:cursor_expired, :account_paused, :unauthorized, :disabled, :unsupported] ->
         {:error, reason}
 
       {:error, reason} ->
@@ -192,6 +196,21 @@ defmodule AttentionServer.AgentAPI.FeedStep do
       Diagnostics.failure(:client_api, :stream_read, error, :failed)
       {:error, :storage_unavailable}
   end
+
+  defp validate_capability(state, principal, session, cursor, %{shared?: true, continuation: token}) do
+    if Reads.shared_readable?(state, principal.person) do
+      SharedContinuation.validate(token, state.store.engine.agent_cursor_key, principal,
+        :agent_changes, %{session: session}, cursor, state.clock.())
+    else
+      {:error, :unsupported}
+    end
+  end
+
+  defp validate_capability(_state, _principal, _session, _cursor, %{continuation: token})
+       when is_binary(token),
+       do: {:error, :cursor_expired}
+
+  defp validate_capability(_state, _principal, _session, _cursor, _capability), do: :ok
 
   defp render_changes(state, principal, rows) do
     Projection.capture(fn ->
