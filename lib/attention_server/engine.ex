@@ -55,6 +55,7 @@ defmodule AttentionServer.Engine do
             agents: %{},
             sender_grants: %{},
             messages: %{},
+            groups: %{},
             shared_messages: %{},
             shared_recipients: %{},
             shared_entries: %{},
@@ -799,7 +800,10 @@ defmodule AttentionServer.Engine do
       next =
         case engine.hosted_organizations[ref] do
           %{id: id, members: people} ->
-            engine |> freeze_shared_departures(id, people) |> delete_row(:hosted_organizations, ref)
+            engine
+            |> freeze_shared_departures(id, people)
+            |> AttentionServer.Groups.delete_hosted(ref)
+            |> delete_row(:hosted_organizations, ref)
 
           nil ->
             engine
@@ -814,7 +818,10 @@ defmodule AttentionServer.Engine do
   defp freeze_shared_departures(engine, organization, departing) do
     if MapSet.size(departing) == 0,
       do: engine,
-      else: AttentionServer.SharedMessages.freeze_departures(engine, organization, departing)
+      else:
+        engine
+        |> AttentionServer.SharedMessages.freeze_departures(organization, departing)
+        |> AttentionServer.Groups.remove_affiliations(organization, departing)
   end
 
   @doc false

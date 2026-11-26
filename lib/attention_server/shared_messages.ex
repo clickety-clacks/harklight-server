@@ -387,24 +387,29 @@ defmodule AttentionServer.SharedMessages do
     end)
   end
 
+  def change_group_membership(%Engine{} = engine, group_id, departing, joining) do
+    Enum.reduce(engine.shared_messages, engine, fn
+      {id, %{group_id: ^group_id} = record}, next ->
+        next = freeze_recipients(engine, next, id, record, departing)
+
+        if record.chat_open, do: join_open_group(next, id, joining), else: next
+
+      _, next ->
+        next
+    end)
+  end
+
+  defp join_open_group(engine, id, joining) do
+    Enum.reduce(joining, engine, fn person, next ->
+      key = {id, person}
+      initial = %{item_id: local_item_id(id, person), seen_revision: nil}
+      recipient = Map.get(next.shared_recipients, key, initial)
+      Engine.put_row(next, :shared_recipients, key, Map.delete(recipient, :frozen))
+    end)
+  end
+
   defp freeze_message(snapshot, engine, id, record, departing) do
-    {engine, _members} =
-      Enum.reduce(departing, {engine, nil}, fn person, {next, roster} ->
-        key = {id, person}
-
-        case Map.get(snapshot.shared_recipients, key) do
-          %{frozen: _} -> {next, roster}
-          %{} = recipient ->
-            roster = roster || visible_members(snapshot, id)
-            cutoff = %{revision: record.revision, members: roster, terminal: Map.get(record, :terminal),
-                       entry_high: Map.get(record, :entry_high, 0),
-                       delivery: frozen_delivery(snapshot, record, person)}
-            cutoff = Map.merge(cutoff, SharedAnswers.freeze_person(snapshot, record, recipient))
-            {Engine.put_row(next, :shared_recipients, key, Map.put(recipient, :frozen, cutoff)), roster}
-
-          nil -> {next, roster}
-        end
-      end)
+    engine = freeze_recipients(snapshot, engine, id, record, departing)
 
     if MapSet.member?(departing, record.sender_person) and not Map.has_key?(record, :sender_frozen_revision),
       do:
@@ -416,6 +421,42 @@ defmodule AttentionServer.SharedMessages do
                               sender_frozen_answers: SharedAnswers.answer_ids(snapshot, record)})),
 
       else: engine
+  end
+
+  defp freeze_recipients(snapshot, engine, id, record, departing) do
+    if MapSet.size(departing) == 0 do
+      engine
+    else
+      members = visible_members(snapshot, id)
+
+      Enum.reduce(departing, engine, fn person, next ->
+        freeze_recipient(snapshot, next, id, record, person, members)
+      end)
+    end
+  end
+
+  defp freeze_recipient(snapshot, engine, id, record, person, members) do
+    key = {id, person}
+
+    case snapshot.shared_recipients[key] do
+      %{frozen: _} ->
+        engine
+
+      %{} = recipient ->
+        cutoff = %{
+          revision: record.revision,
+          members: members,
+          terminal: Map.get(record, :terminal),
+          entry_high: Map.get(record, :entry_high, 0),
+          delivery: frozen_delivery(snapshot, record, person)
+        }
+
+        cutoff = Map.merge(cutoff, SharedAnswers.freeze_person(snapshot, record, recipient))
+        Engine.put_row(engine, :shared_recipients, key, Map.put(recipient, :frozen, cutoff))
+
+      nil ->
+        engine
+    end
   end
 
   defp frozen_delivery(engine, record, person) do

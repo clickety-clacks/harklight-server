@@ -1270,6 +1270,7 @@ defmodule AttentionServer.Store do
         |> shared_send_log(next, audit)
         |> shared_mutation_log(next, audit)
         |> shared_freeze_log(old, next, touched)
+        |> group_roster_log(old, next, touched)
         |> shared_chat_log(next, audit)
       %{records: records, delete_paths: delete_paths, reference_rows: references} = prepared
       derived = DerivedIndex.changes(old, next, touched)
@@ -1826,6 +1827,7 @@ defmodule AttentionServer.Store do
     :source_report_grants,
     :enrollment_read_grants,
     :messages,
+    :groups,
     :shared_messages,
     :shared_recipients,
     :shared_entries,
@@ -1925,6 +1927,9 @@ defmodule AttentionServer.Store do
     do:
       valid_item?(engine, key, record) and
         valid_arrival?(record, Map.get(engine.free_order_highs, person, 0))
+
+  defp valid_keyed_row?(engine, :groups, key, record),
+    do: AttentionServer.Groups.valid?(engine, key, record)
 
   defp valid_keyed_row?(engine, :shared_messages, key, record),
     do: AttentionServer.SharedMessages.valid_message?(engine, key, record)
@@ -2126,6 +2131,46 @@ defmodule AttentionServer.Store do
       _, acc ->
         acc
     end)
+  end
+
+  defp group_roster_log(nil, _old, _next, _touched), do: nil
+
+  defp group_roster_log(log, old, next, touched) do
+    roster_changes =
+      for {:row, :groups, id} <- touched,
+          group_members(old, id) != group_members(next, id),
+          into: MapSet.new(),
+          do: id
+
+    if MapSet.size(roster_changes) == 0 do
+      log
+    else
+      append_group_roster_changes(log, next, roster_changes)
+    end
+  end
+
+  defp append_group_roster_changes(log, next, roster_changes) do
+    Enum.reduce(next.shared_messages, log, fn
+      {id, %{group_id: group}}, acc ->
+        if MapSet.member?(roster_changes, group) do
+          Enum.reduce(SharedMessages.live_recipients(next, id), acc, fn person, changes ->
+            AttentionServer.ChangeLog.append_shared_freeze(changes, person, id)
+          end)
+        else
+          acc
+        end
+
+      _, acc ->
+        acc
+    end)
+  end
+
+  defp group_members(engine, id) do
+    engine.groups
+    |> Map.get(id, %{members: %{}})
+    |> Map.fetch!(:members)
+    |> Map.keys()
+    |> MapSet.new()
   end
 
   defp shared_chat_log(log, engine, %{shared_chat: %{operation: operation, message_id: id} = chat}) do
@@ -2910,6 +2955,9 @@ defmodule AttentionServer.Store do
         end) and
         Enum.all?(engine.local_organizations, fn {key, members} ->
           Engine.valid_local_organization?(engine, key, members)
+        end) and
+        Enum.all?(engine.groups, fn {key, record} ->
+          AttentionServer.Groups.valid?(engine, key, record)
         end) and
         Enum.all?(engine.shared_messages, fn {key, record} ->
           AttentionServer.SharedMessages.valid_message?(engine, key, record)

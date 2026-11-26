@@ -117,7 +117,7 @@ defmodule AttentionServer.Store.RecordCodec do
       :browser_sign_ins, :maintainer_grants, :devices, :agents, :sender_grants,
       :source_report_grants, :enrollment_read_grants, :free_order_highs, :conversation_highs,
       :conversation_cursors, :subscriptions, :cursors, :hosted_accounts, :hosted_organizations,
-      :local_organizations, :delivery_states,
+      :local_organizations, :groups, :delivery_states,
       :algorithm_choices, :alert_choices, :push_bindings, :bounce_levels
     ]
   end

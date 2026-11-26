@@ -116,6 +116,7 @@ defmodule AttentionServer.Store.KeyedMigration do
          :ok <- check_identity(identity, supported_identity),
          {:ok, generation} <- RecordTable.generation(db),
          true <- generation >= version,
+         {:module, AttentionServer.Groups} <- Code.ensure_loaded(AttentionServer.Groups),
          {:ok, engine} <- read_records(db) do
       {:ok, engine, generation}
     else
