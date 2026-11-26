@@ -49,18 +49,30 @@ defmodule AttentionServer.Store.ConversionPreflight do
   def check(db, budget, expected_format, envelopes \\ @envelopes) do
     with {:ok, info} <- read(db, budget.memory, budget.disk),
          :ok <- check_format(info.format, expected_format),
-         %{} = envelope <- Enum.find(envelopes, &(info.expanded_bytes <= &1.expanded_bytes)),
+         {:ok, envelope} <- select_envelope(info.expanded_bytes, envelopes),
          {memory, disk} <- upper_bound(info, envelope),
-         true <- memory <= budget.memory and disk <= budget.disk,
+         :ok <- within_limit(memory, budget.memory, :memory),
+         :ok <- within_limit(disk, budget.disk, :disk),
          :ok <- check_shape(db, budget.uploads, envelope) do
       {:ok, info}
-    else
-      {:already_converted, _} = converted -> converted
-      {:error, :unsupported_snapshot} = error -> error
-      {:error, :source_format_mismatch} = error -> error
-      _ -> {:error, :fit_not_established}
     end
   end
+
+  defp select_envelope(expanded, envelopes) do
+    case Enum.find(envelopes, &(expanded <= &1.expanded_bytes)) do
+      nil ->
+        limit = envelopes |> Enum.map(& &1.expanded_bytes) |> Enum.max(fn -> 0 end)
+        within_limit(expanded, limit, :expanded_snapshot)
+
+      envelope ->
+        {:ok, envelope}
+    end
+  end
+
+  defp within_limit(value, limit, _field) when value <= limit, do: :ok
+
+  defp within_limit(value, limit, field),
+    do: {:error, {:fit_not_established, field, value, limit}}
 
   defp upper_bound(info, envelope) do
     # Coefficients are integer ratios rounded up from the worst rehearsal.
@@ -74,20 +86,20 @@ defmodule AttentionServer.Store.ConversionPreflight do
   defp check_format(actual, expected) when is_nil(expected) or actual == expected, do: :ok
   defp check_format(_, _), do: {:error, :source_format_mismatch}
 
-  defp check_shape(db, uploads, envelope) when uploads <= envelope.uploads do
-    with {:ok, revisions} <- count_rows(db, "client_resource_revs"),
-         {:ok, changes} <- count_rows(db, "agent_changes"),
-         {:ok, references} <- count_rows(db, "relay_large_data_refs"),
-         true <-
-           revisions <= envelope.revisions and changes <= envelope.changes and
-             references <= envelope.references do
-      :ok
-    else
-      _ -> {:error, :fit_not_established}
+  defp check_shape(db, uploads, envelope) do
+    with :ok <- within_limit(uploads, envelope.uploads, :upload_bytes),
+         :ok <- check_count(db, "client_resource_revs", envelope.revisions, :client_resource_revs),
+         :ok <- check_count(db, "agent_changes", envelope.changes, :agent_changes) do
+      check_count(db, "relay_large_data_refs", envelope.references, :large_data_references)
     end
   end
 
-  defp check_shape(_db, _uploads, _envelope), do: {:error, :fit_not_established}
+  defp check_count(db, table, limit, field) do
+    case count_rows(db, table) do
+      {:ok, count} -> within_limit(count, limit, field)
+      _ -> {:error, {:fit_not_established, :measurement_unavailable, field}}
+    end
+  end
 
   defp count_rows(db, table) do
     with {:ok, [[exists]]} <-
@@ -113,14 +125,15 @@ defmodule AttentionServer.Store.ConversionPreflight do
       when is_integer(available_bytes) and is_integer(disk_bytes) do
     with {:ok, [[stored_bytes]]} when is_integer(stored_bytes) <-
            RecordTable.select(db, "SELECT length(payload) FROM relay_state WHERE id = 1"),
-         true <- stored_bytes + @prefix_overhead <= min(available_bytes, disk_bytes),
+         :ok <- within_limit(stored_bytes + @prefix_overhead, available_bytes, :prefix_memory),
+         :ok <- within_limit(stored_bytes + @prefix_overhead, disk_bytes, :prefix_disk),
          {:ok, [[prefix]]} <-
            RecordTable.select(db, "SELECT substr(payload, 1, ?) FROM relay_state WHERE id = 1", [
              @prefix_bytes
            ]) do
       inspect_prefix(db, stored_bytes, prefix)
     else
-      false -> {:error, :fit_not_established}
+      {:error, {:fit_not_established, _, _, _}} = error -> error
       _ -> {:error, :unsupported_snapshot}
     end
   end

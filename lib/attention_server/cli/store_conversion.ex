@@ -4,6 +4,27 @@ defmodule AttentionServer.CLI.StoreConversion do
   alias AttentionServer.{CLI, Store}
   alias AttentionServer.Store.ConversionCapacity
 
+  @capacity_labels %{
+    prefix_memory: "memory for the snapshot header probe",
+    prefix_disk: "free disk for the snapshot header probe",
+    memory: "conversion memory",
+    disk: "extra conversion disk space"
+  }
+
+  @shape_labels %{
+    expanded_snapshot: {"expanded snapshot size", "bytes"},
+    upload_bytes: {"allocated upload directory size", "bytes"},
+    client_resource_revs: {"client resource revisions", "rows"},
+    agent_changes: {"agent changes", "rows"},
+    large_data_references: {"large-data references", "rows"}
+  }
+
+  @measurement_labels %{
+    host_memory: "available host memory",
+    cgroup_memory: "available cgroup memory",
+    disk: "available disk space"
+  }
+
   def run(["convert-stopped", path]), do: convert(path, nil)
 
   def run(["convert-stopped", path, "--from-release", release]) do
@@ -24,8 +45,11 @@ defmodule AttentionServer.CLI.StoreConversion do
       end
     else
       false -> CLI.error!("The stopped Harklight store file is missing.")
-      {:error, :fit_not_established} ->
-        CLI.error!("Conversion fit not established. Keep the stopped-store backup and use the documented off-host conversion procedure.")
+      {:error, {:fit_not_established, _, _, _} = failure} ->
+        CLI.error!(fit_failure(failure))
+      {:error, {:fit_not_established, :measurement_unavailable, field}} ->
+        label = @measurement_labels[field] || elem(Map.fetch!(@shape_labels, field), 0)
+        CLI.error!("Conversion fit not established. Could not measure #{label}. Keep the stopped-store backup.")
       {:error, :source_format_mismatch} ->
         CLI.error!("The store format differs from the verified previous release. The store was left unchanged.")
       {:error, :unsupported_snapshot} ->
@@ -33,6 +57,20 @@ defmodule AttentionServer.CLI.StoreConversion do
       {:error, _reason} ->
         CLI.error!("Could not convert the stopped Harklight store. Keep the stopped-store backup and check the storage diagnostics.")
     end
+  end
+
+  defp fit_failure({:fit_not_established, field, needed, available}) when is_map_key(@capacity_labels, field) do
+    label = Map.fetch!(@capacity_labels, field)
+
+    "Conversion fit not established. Required #{label} is #{needed} bytes, with #{available} bytes available. " <>
+      "Keep the stopped-store backup and use the documented off-host conversion procedure."
+  end
+
+  defp fit_failure({:fit_not_established, field, actual, limit}) do
+    {label, unit} = Map.fetch!(@shape_labels, field)
+
+    "Conversion fit not established. The #{label} is #{actual} #{unit}, above the calibrated limit of #{limit} #{unit}. " <>
+      "Keep the stopped-store backup and report the failed limit before converting."
   end
 
   defp source_format("v0.2." <> minor) do
