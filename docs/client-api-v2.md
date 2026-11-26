@@ -1732,9 +1732,11 @@ An optional server cutoff excludes messages accepted strictly before it,
 including from startup backfill. The cutoff uses the original message
 acceptance time even after revision.
 
-An unopened revision keeps the
-`unseen_interval_elapsed` advisory; an opened, unanswered revision uses
-`soft_bounce`. The full bounce removes the item from person reads. The
+An item that has never been opened can full-bounce with the
+`unseen_interval_elapsed` advisory. If the recipient already opened the
+item when the server evaluates the bounce, it can only soft-bounce,
+including when backfill or a Jev score sets a deadline in the past.
+The full bounce removes the item from person reads. The
 sending agent can still read the item and advisory with `terminal: null`.
 Reply, revise and progress writes to that item return `409 already_closed`.
 The agent can retract it or send a new message. A soft bounce leaves the

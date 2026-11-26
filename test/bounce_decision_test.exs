@@ -53,7 +53,7 @@ defmodule AttentionServer.BounceDecisionTest do
     configured? = Keyword.get(opts, :configured?, true)
     supported? = Keyword.get(opts, :supported?, true)
     accepted_at = Keyword.get(opts, :accepted_at, @accepted_at)
-    original_message = message()
+    original_message = Keyword.get(opts, :message, message())
     original_files = [attachment("upload-1")]
 
     {:ok, engine} = Engine.setup_person(Engine.new(), @person)
@@ -426,17 +426,43 @@ defmodule AttentionServer.BounceDecisionTest do
     end
   end
 
-  test "a recorded late Open cannot turn an overdue unopened notice into a soft bounce" do
-    accepted = 1_794_925_014_001
-    {engine, record} = fixture(accepted_at: accepted)
-    {:ok, opened, 1} = BounceDecision.record_open(engine, key(), record, 1)
-    opened = BounceDecision.remember_open_time(opened, key(), 1, accepted + 300_000_000)
-    decided = score(opened, 0.9, accepted + 300_000_001)
+  test "an applied score cannot full-bounce a Low item opened before the score" do
+    accepted = 1_795_507_200_000
+    low = Map.put(message(), "urgency", "low")
+    {engine, record} = fixture(configured?: false, accepted_at: accepted, message: low)
+    assert BounceDecision.next_deadline(engine) == accepted + 604_800_000
 
-    assert [%{"advisory_type" => "unseen_interval_elapsed"}] =
+    opened_at = accepted + 172_800_000
+    {:ok, engine, 1} = BounceDecision.record_open(engine, key(), record, 1)
+    engine = BounceDecision.remember_open_time(engine, key(), 1, opened_at)
+    decided = score(engine, 0.9, opened_at + 1)
+    urgent_due = accepted + 43_200_000
+
+    assert [%{"advisory_type" => "soft_bounce", "due_at_ms" => ^urgent_due}] =
              Map.values(decided.messages[key()]["item_advisories"])
 
-    assert decided.messages[key()]["full_bounced_at_ms"] == accepted + 300_000_001
+    assert BounceDecision.inbox_open?(decided.messages[key()])
+  end
+
+  test "backfill soft-bounces an item opened after its newly assigned deadline" do
+    accepted = 1_795_507_200_000
+    {engine, record} = fixture(configured?: false, accepted_at: accepted)
+    legacy =
+      engine
+      |> put_in([Access.key(:bounce_revisions), key(), :revisions, 1, :selection], nil)
+      |> BounceDecision.rebuild_indexes()
+
+    opened_at = accepted + 345_600_000
+    {:ok, legacy, 1} = BounceDecision.record_open(legacy, key(), record, 1)
+    legacy = BounceDecision.remember_open_time(legacy, key(), 1, opened_at)
+    {decided, _, counts} = BounceDecision.startup(legacy, opened_at + 1, nil)
+    normal_due = accepted + 259_200_000
+
+    assert %{full: 0, soft: 1, backfilled: 1} = counts
+    assert [%{"advisory_type" => "soft_bounce", "due_at_ms" => ^normal_due}] =
+             Map.values(decided.messages[key()]["item_advisories"])
+
+    assert BounceDecision.inbox_open?(decided.messages[key()])
   end
 
   test "both bounce kinds wait for the selected default priority interval" do
@@ -485,6 +511,7 @@ defmodule AttentionServer.BounceDecisionTest do
     accepted = 1_795_507_200_000
     {engine, record} = fixture(configured?: false, accepted_at: accepted)
     {:ok, engine, 1} = BounceDecision.record_open(engine, key(), record, 1)
+    engine = BounceDecision.remember_open_time(engine, key(), 1, accepted + 3_600_000)
     due = accepted + 259_200_000
 
     {_, _, counts} = BounceDecision.startup(engine, due, accepted)

@@ -715,10 +715,9 @@ defmodule AttentionServer.BounceDecision do
       revision.accepted_at_ms <= @defaults_published_at_ms and
         record["bounce_backfilled_revision"] != sub_revision
 
-    opened =
-      opened?(engine, key, sub_revision) and
-        (legacy? or
-           Map.get(Map.get(record, "bounce_opened_at", %{}), sub_revision, 0) < due)
+    # A new or moved deadline can already be in the past. A recorded open
+    # still proves the recipient opened the message before this decision.
+    opened = Enum.any?(state.revisions, fn {sub, _} -> opened?(engine, key, sub) end)
 
     case suppression_reason(engine, key, record, revision, legacy? and opened, due) do
       nil when legacy? ->
@@ -744,7 +743,7 @@ defmodule AttentionServer.BounceDecision do
         )
 
       nil ->
-        if legacy_feed?(engine, key, record) and not opened?(engine, key, sub_revision),
+        if legacy_feed?(engine, key, record),
           do: append_advisory(engine, key, state, sub_revision, revision, selection, now_ms),
           else:
             append_item_advisory(
