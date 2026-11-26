@@ -139,6 +139,7 @@ defmodule AttentionServer.HostedRequests do
     case Relay.hosted_browser_grant(opts.relay, person, transaction, method) do
       {:ok, grant} -> json(conn, 200, %{"grant" => grant})
       {:error, :invalid_request} -> json(conn, 400, %{"error" => "invalid_request"})
+      {:error, :invalid_sign_in} -> json(conn, 401, %{"error" => "unauthorized"})
       {:error, :not_hosted} -> json(conn, 404, %{"error" => "unknown_person"})
       {:error, :disabled} -> send_resp(conn, 404, "")
       _ -> json(conn, 503, %{"error" => "storage_unavailable"})
