@@ -1353,6 +1353,13 @@ defmodule AttentionServer.Relay do
     {:reply, result, state}
   end
 
+  defp dispatch_call(
+         {:pending_enroll, _certificate, _label},
+         _from,
+         %{deployment_mode: :saas, store: %{auth_schema: %{}}} = state
+       ),
+       do: {:reply, {:error, :not_found}, state}
+
   defp dispatch_call({:pending_enroll, certificate_der, label}, _from, state) do
     case generate_pending(state.store.engine, certificate_der, label, 8) do
       {:ok, next_engine, code, secret} ->
@@ -1909,12 +1916,16 @@ defmodule AttentionServer.Relay do
              8
            ) do
         {:ok, next, response} ->
-          case commit(state.store, next, %{
-                 person: next.join_invitations[hash].person,
-                 actor: "invited_submitter",
-                 action: "invited_pending_enrollment"
-               }) do
-            {:ok, committed} -> {:reply, {:ok, response}, %{state | store: committed}}
+          with {:ok, response} <- enrollment_status(state.store, {:ok, response}),
+               {:ok, committed} <-
+                 commit(state.store, next, %{
+                   person: next.join_invitations[hash].person,
+                   actor: "invited_submitter",
+                   action: "invited_pending_enrollment"
+                 }) do
+            {:reply, {:ok, response}, %{state | store: committed}}
+          else
+            {:error, :not_found} -> {:reply, {:error, :refused}, state}
             _ -> {:reply, {:error, :storage_unavailable}, state}
           end
 
@@ -2013,7 +2024,8 @@ defmodule AttentionServer.Relay do
     with {:ok, secret} <- Base.decode16(secret_hex, case: :lower),
          true <- byte_size(secret) == 32 do
       hash = :crypto.hash(:sha256, secret)
-      {:reply, Engine.pending_status(state.store.engine, hash), state}
+      result = enrollment_status(state.store, Engine.pending_status(state.store.engine, hash))
+      {:reply, result, state}
     else
       _ -> {:reply, {:error, :not_found}, state}
     end
@@ -2037,22 +2049,34 @@ defmodule AttentionServer.Relay do
     do: {:reply, Engine.pending_lookup(state.store.engine, person, key, code), state}
 
   defp dispatch_call(
+         {:owner_pending_approve, _person, _owner, _code, _key, _deadline, []},
+         _from,
+         %{store: %{auth_schema: %{}}} = state
+       ),
+       do: {:reply, {:error, :invalid_senders}, state}
+
+  defp dispatch_call(
          {:owner_pending_approve, person, key, code, expected_key, expected_expires_at, senders},
          _from,
          state
        ) do
     now_ms = System.system_time(:millisecond)
 
-    case Engine.pending_approve(
-           state.store.engine,
-           person,
-           key,
-           code,
-           expected_key,
-           expected_expires_at,
-           senders,
-           now_ms
-         ) do
+    result =
+      with :ok <- authorize_enrollment_account(state, person, code) do
+        Engine.pending_approve(
+          state.store.engine,
+          person,
+          key,
+          code,
+          expected_key,
+          expected_expires_at,
+          senders,
+          now_ms
+        )
+      end
+
+    case result do
       {:ok, next_engine, device_key} ->
         case commit(state.store, next_engine, %{
                person: person,
@@ -4205,16 +4229,43 @@ defmodule AttentionServer.Relay do
         mode == :self_hosted and not schema.device_certificates_disabled
 
       {:error, :unknown_device} ->
-        # The published Agent CLI enrolled as a device and received sender grants.
-        # A phone on the migration roster follows its phase even if it has grants.
-        grants = Map.get(engine.sender_grants, {person, key}, MapSet.new())
-        # Off-roster recovery commits a native session. Removing that session also revokes
-        # the device or atomically replaces the session, so the certificate cannot return.
-        MapSet.size(grants) > 0 and NativeSignIn.device_session_hash(db, key) == {:ok, nil}
+        sender_certificate?(db, engine, person, key)
 
       _ ->
         false
     end
+  end
+
+  defp enrollment_status(
+         %{auth_schema: %{}, db: db, engine: engine},
+         {:ok, %{"state" => "approved", "person_id" => person, "device_id" => key}} = status
+       ) do
+    if DeviceMigration.phase(db, key) == {:error, :unknown_device} and
+         sender_certificate?(db, engine, person, key),
+       do: status,
+       else: {:error, :not_found}
+  end
+
+  defp enrollment_status(_store, status), do: status
+
+  defp authorize_enrollment_account(
+         %{deployment_mode: :saas, store: %{auth_schema: %{}, engine: engine}},
+         person,
+         code
+       ) do
+    case engine.pending_enrollments[code] || engine.pending_history[code] do
+      %{person: ^person, joined: true} -> :ok
+      _ -> {:error, :not_found}
+    end
+  end
+
+  defp authorize_enrollment_account(_state, _person, _code), do: :ok
+
+  defp sender_certificate?(db, engine, person, key) do
+    grants = Map.get(engine.sender_grants, {person, key}, MapSet.new())
+    # Late recovery replaces the certificate with a native session. Its removal
+    # revokes the device or atomically replaces the session.
+    MapSet.size(grants) > 0 and NativeSignIn.device_session_hash(db, key) == {:ok, nil}
   end
 
   defp legacy_removal_identity(state, key) do

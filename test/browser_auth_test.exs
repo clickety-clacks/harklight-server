@@ -36,6 +36,10 @@ defmodule AttentionServer.BrowserAuthTest do
     assert {:ok, %{"grant" => grant}} = JSON.decode_line(issued.resp_body <> "\n")
     redeem = %{"grant" => grant, "transaction" => "current-transaction"}
 
+    retried_issue = request(relay, "/session-grants", issue)
+    assert retried_issue.status == 200
+    assert {:ok, %{"grant" => retry_grant}} = JSON.decode_line(retried_issue.resp_body <> "\n")
+
     assert request(relay, "/session-grants/redeem", %{redeem | "transaction" => "other"}).status ==
              401
 
@@ -51,9 +55,15 @@ defmodule AttentionServer.BrowserAuthTest do
     refute header =~ "; domain="
     assert ["__Host-harklight=" <> cookie | _] = String.split(header, ";")
     assert request(relay, "/session-grants/redeem", redeem).status == 401
+    assert request(relay, "/session-grants/redeem", %{redeem | "grant" => retry_grant}).status == 401
+    assert request(relay, "/session-grants", issue).status == 401
     :ok = GenServer.stop(relay)
 
     {:ok, restarted} = Relay.start_link(c.opts)
+    reissue = request(restarted, "/session-grants", issue)
+    assert reissue.status == 401
+    assert {:ok, %{"error" => "unauthorized"}} = JSON.decode_line(reissue.resp_body <> "\n")
+    assert request(restarted, "/session-grants", %{issue | "transaction" => "fresh"}).status == 200
     {:ok, browser} = DashboardBrowserSession.start_link(relay: restarted)
     assert {:ok, %{person_id: person}} = DashboardBrowserSession.resolve(browser, cookie)
     assert person == c.person
