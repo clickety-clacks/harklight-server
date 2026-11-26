@@ -10,6 +10,7 @@ defmodule AttentionServer.SignInActivationTest do
   @owner String.duplicate("a", 64)
   @overlap String.duplicate("b", 64)
   @other String.duplicate("c", 64)
+  @sender String.duplicate("d", 64)
   @origin "https://local.example.test"
 
   test "enabling S1 retires local grants and seeds only the designated devices", %{tmp_dir: dir} do
@@ -19,6 +20,9 @@ defmodule AttentionServer.SignInActivationTest do
     {:ok, engine} = Engine.operator_bootstrap(store.engine, @person, @owner)
     {:ok, engine} = Engine.setup_device(engine, @person, @overlap)
     {:ok, engine} = Engine.setup_device(engine, @person, @other)
+    {:ok, engine} = Engine.setup_device(engine, @person, @sender)
+    {:ok, engine} = Engine.setup_sender(engine, @overlap, "app:fixture")
+    {:ok, engine} = Engine.setup_sender(engine, @sender, "app:fixture")
     {:ok, store} = Store.commit(store, engine, %{person: @person, actor: @owner, action: "fixture"})
     :ok = Store.close(store)
 
@@ -40,6 +44,7 @@ defmodule AttentionServer.SignInActivationTest do
     {:ok, relay} = Relay.start_link(enabled)
     assert {:ok, ["owner_code"]} = Relay.native_sign_in_methods(relay)
     assert {:ok, @person} = Relay.certificate_device_person(relay, @overlap)
+    assert {:ok, @person} = Relay.certificate_device_person(relay, @sender)
     assert {:error, :unauthorized} = Relay.certificate_device_person(relay, @other)
     assert {:error, :invalid_sign_in} = Relay.consume_browser_sign_in(relay, old_grant)
     :ok = GenServer.stop(relay)
@@ -61,9 +66,12 @@ defmodule AttentionServer.SignInActivationTest do
     :ok = Sqlite3.close(db)
     {:ok, denied} = Relay.start_link(options)
     assert {:error, :unauthorized} = Relay.certificate_device_person(denied, @overlap)
+    assert {:ok, @person} = Relay.certificate_device_person(denied, @sender)
     assert {:error, :not_found} = Relay.removal_identity(denied, @overlap)
     assert {:error, :not_found} = Relay.device_remove(denied, @overlap)
     refute Relay.legacy_device_enrollment?(denied)
+    assert :ok = Relay.owner_revoke_sender(denied, @person, @owner, @sender, "app:fixture")
+    assert {:error, :unauthorized} = Relay.certificate_device_person(denied, @sender)
   end
 
   test "the in-place FORMAT31 conversion retains the auth generation and person receipts",

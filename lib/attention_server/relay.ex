@@ -1557,17 +1557,13 @@ defmodule AttentionServer.Relay do
         %{auth_schema: nil, engine: engine} ->
           Engine.authorized_person(engine, key)
 
-        %{auth_schema: %{device_certificates_disabled: false}, db: db, engine: engine}
-        when state.deployment_mode == :self_hosted ->
+        %{auth_schema: schema, db: db, engine: engine} ->
           with %{person: person, revoked: false} <- engine.devices[key],
-               true <- DeviceMigration.eligible?(db, person, key) do
+               true <- certificate_device_allowed?(state.deployment_mode, schema, db, engine, person, key) do
             {:ok, person}
           else
             _ -> {:error, :unauthorized}
           end
-
-        _ ->
-          {:error, :unauthorized}
       end
 
     {:reply, result, state}
@@ -4147,6 +4143,22 @@ defmodule AttentionServer.Relay do
 
       _ ->
         engine
+    end
+  end
+
+  defp certificate_device_allowed?(mode, schema, db, engine, person, key) do
+    case DeviceMigration.phase(db, key) do
+      {:ok, ^person, phase} when phase in ["legacy", "pending"] ->
+        mode == :self_hosted and not schema.device_certificates_disabled
+
+      {:error, :unknown_device} ->
+        # The published Agent CLI enrolled as a device and received sender grants.
+        # A phone on the migration roster follows its phase even if it has grants.
+        grants = Map.get(engine.sender_grants, {person, key}, MapSet.new())
+        MapSet.size(grants) > 0
+
+      _ ->
+        false
     end
   end
 
