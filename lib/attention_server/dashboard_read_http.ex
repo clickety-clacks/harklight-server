@@ -20,7 +20,7 @@ defmodule AttentionServer.DashboardReadHTTP do
 
   import Plug.Conn
 
-  alias AttentionServer.{BrowserAuth, DashboardBrand, DashboardView, Diagnostics, JSON, LocalSignInPage, Message}
+  alias AttentionServer.{BrowserAuth, DashboardBrand, DashboardView, DeviceProof, Diagnostics, JSON, LocalSignInPage, Message}
 
   @cookie "__Host-harklight"
   @invite_cookie "__Host-harklight-invite"
@@ -129,12 +129,7 @@ defmodule AttentionServer.DashboardReadHTTP do
         send_resp(conn, 403, "HTTPS required")
 
       conn.method == "GET" and conn.request_path == "/sign-in" ->
-        if local_code_available?(opts) do
-          {:ok, methods} = backend_call(opts.backend, :local_methods, nil)
-          conn |> put_resp_content_type("text/html", "utf-8") |> send_resp(200, LocalSignInPage.html("passkey" in methods))
-        else
-          sign_in_page(conn, opts)
-        end
+        sign_in_get(conn, opts)
 
       conn.method == "GET" and conn.request_path == "/sign-in/code.js" ->
         if local_code_available?(opts) do
@@ -1124,6 +1119,40 @@ defmodule AttentionServer.DashboardReadHTTP do
 
       _ ->
         false
+    end
+  end
+
+  defp sign_in_get(conn, %{hosted: true, hosted_addresses: %{sign_in: url}, backend: {module, _}} = opts)
+       when is_binary(url) do
+    conn = fetch_query_params(conn)
+
+    with %{"return" => "app", "transaction" => transaction} <- conn.query_params,
+         true <- DeviceProof.secret?(transaction),
+         true <- Code.ensure_loaded?(module) and function_exported?(module, :local_methods, 2),
+         {:ok, methods} <- backend_call(opts.backend, :local_methods, nil),
+         true <- "email_code" in methods do
+      uri = URI.parse(url)
+      query = URI.decode_query(uri.query || "")
+      query = Map.merge(query, %{"return" => "app", "transaction" => transaction})
+      method = conn.query_params["method"]
+      query = if method in methods, do: Map.put(query, "method", method), else: query
+
+      location = URI.to_string(%{uri | query: URI.encode_query(query)})
+      conn |> put_resp_header("location", location) |> send_resp(303, "")
+    else
+      _ -> sign_in_page(conn, opts)
+    end
+  end
+
+  defp sign_in_get(conn, opts) do
+    if local_code_available?(opts) do
+      {:ok, methods} = backend_call(opts.backend, :local_methods, nil)
+
+      conn
+      |> put_resp_content_type("text/html", "utf-8")
+      |> send_resp(200, LocalSignInPage.html("passkey" in methods))
+    else
+      sign_in_page(conn, opts)
     end
   end
 

@@ -8,6 +8,48 @@ defmodule AttentionServer.NativeSignInTest do
 
   @moduletag :tmp_dir
 
+  test "Hosted native sign-in forwards the transaction to the issuer and keeps the browser overlap",
+       %{tmp_dir: dir} do
+    path = Path.join(dir, "hosted-entry.sqlite3")
+    opts = [store_path: path, deployment_mode: :saas]
+    issuer = "https://example.test/account/sign-in?source=server"
+    {:ok, relay} = Relay.start_link(opts)
+    transaction = BrowserAuth.new_secret()
+
+    assert DashboardReadHTTP.call(hosted_entry(transaction), hosted_dashboard(relay, issuer)).status == 200
+    :ok = GenServer.stop(relay)
+
+    {:ok, db} = Sqlite3.open(path)
+    assert {:ok, %{minimum_generation: 1}} = AuthSchema.initialize(db)
+    :ok = Sqlite3.close(db)
+
+    {:ok, relay} = Relay.start_link(opts)
+    {:ok, transaction} = Relay.create_native_transaction(relay, DeviceProof.digest(BrowserAuth.new_secret()))
+    dashboard = hosted_dashboard(relay, issuer)
+    redirect = DashboardReadHTTP.call(hosted_entry(transaction), dashboard)
+    assert redirect.status == 303
+    assert [location] = Plug.Conn.get_resp_header(redirect, "location")
+    uri = URI.parse(location)
+    assert uri.host == "example.test"
+    assert uri.path == "/account/sign-in"
+
+    assert URI.decode_query(uri.query) == %{
+             "source" => "server",
+             "return" => "app",
+             "transaction" => transaction,
+             "method" => "apple"
+           }
+
+    invalid = DashboardReadHTTP.call(hosted_entry("invalid"), dashboard)
+    assert invalid.status == 200
+    assert Plug.Conn.get_resp_header(invalid, "location") == []
+
+    plain = %{Plug.Test.conn(:get, "/sign-in") | scheme: :https, port: 443}
+    fragment_page = DashboardReadHTTP.call(plain, dashboard)
+    assert fragment_page.status == 200
+    assert fragment_page.resp_body =~ ~s(src="/sign-in.js")
+  end
+
   test "native redemption binds verifier and proof and resumes the same device after restart",
        %{tmp_dir: dir} do
     path = Path.join(dir, "relay.sqlite3")
@@ -281,6 +323,21 @@ defmodule AttentionServer.NativeSignInTest do
       DashboardReadHTTP.init(backend: backend, skill_path: __ENV__.file, expected_origin: origin)
 
     {browser, dashboard, Router.init(relay: relay, auth: {:browser, backend, origin})}
+  end
+
+  defp hosted_dashboard(relay, issuer) do
+    DashboardReadHTTP.init(
+      backend: {DashboardBackend, %DashboardBackend{relay: relay}},
+      skill_path: __ENV__.file,
+      expected_origin: "https://example.test",
+      hosted: true,
+      hosted_addresses: %{sign_in: issuer}
+    )
+  end
+
+  defp hosted_entry(transaction) do
+    query = URI.encode_query(%{"return" => "app", "transaction" => transaction, "method" => "apple"})
+    %{Plug.Test.conn(:get, "/sign-in?" <> query) | scheme: :https, port: 443}
   end
 
   defp late_request(relay, dashboard, dir, person, owner, device, der) do
