@@ -61,8 +61,9 @@ defmodule AttentionServer.AgentAPI.Advisories do
   def for_message(engine, {person, key}, {person, _, _} = item) do
     case Map.get(engine.messages, item) do
       %{origin: ^key} = record ->
+        # FORMAT30 also accepts historical messages with no session field.
         legacy =
-          case Map.get(engine.advisory_feeds, {person, key, record.session_handle}) do
+          case Map.get(engine.advisory_feeds, {person, key, Map.get(record, :session_handle)}) do
             %{entries: entries, receipts: receipts} ->
               engine.route_b_index
               |> RouteBIndex.advisory_sequences(item)
@@ -133,7 +134,7 @@ defmodule AttentionServer.AgentAPI.Advisories do
           {:ok, next, %{"advisory_id" => id, "already_delivered" => false, "delivered" => true}}
 
         true ->
-          BounceDecision.advisory_ack(engine, origin, record.session_handle, id)
+          BounceDecision.advisory_ack(engine, origin, Map.get(record, :session_handle), id)
       end
     else
       _ -> {:error, :not_found}

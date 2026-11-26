@@ -127,6 +127,98 @@ defmodule AttentionServer.ClientDataMigrationTest do
     GenServer.stop(relay)
   end
 
+  test "stopped conversion preserves sessionless historical messages with or without the marker", %{
+    tmp_dir: directory
+  } do
+    for marker_present <- [false, true] do
+      path = Path.join(directory, "legacy-#{marker_present}.sqlite3")
+      seed_sessionless_snapshot(path, marker_present)
+      assert {:ok, snapshot} = Store.open(path, :snapshot)
+      old_record = snapshot.engine.messages[@key]
+      refute Map.has_key?(old_record, :session_handle)
+      refute Map.has_key?(old_record, :revision)
+      assert :ok = Store.close(snapshot)
+
+      assert {:ok, :converted} = Store.convert_stopped(path, @budget, 30)
+      assert {:ok, :already_converted} = Store.convert_stopped(path, @budget, 30)
+      assert {:ok, converted} = Store.open(path, :keyed)
+
+      assert converted.engine.messages[@key] ==
+               put_in(old_record.message["message_type"], "fyi")
+
+      assert {:ok, [[nil]]} =
+               RecordTable.select(converted.db, "SELECT session FROM relay_items")
+
+      assert {:ok, [["retained_client_data_v1"]]} =
+               RecordTable.select(converted.db, "SELECT name FROM relay_data_migrations")
+
+      if not marker_present do
+        assert {:ok, [[nil]]} =
+                 RecordTable.select(converted.db, "SELECT session FROM agent_changes")
+      end
+
+      assert :ok = Store.close(converted)
+
+      now = old_record.accepted_at + 8 * 24 * 60 * 60 * 1000
+      assert {:ok, relay} = Relay.start_link(store_path: path, clock: fn -> now end)
+      restarted = :sys.get_state(relay).store
+      assert restarted.engine.origin_sessions == %{}
+      refute Map.has_key?(restarted.engine.messages[@key], :session_handle)
+      assert :ok = GenServer.stop(relay)
+    end
+  end
+
+  defp seed_sessionless_snapshot(path, marker_present) do
+    PreChangeLogStore.write(path, fn store ->
+      store =
+        store
+        |> PreChangeLogStore.setup_person("A")
+        |> PreChangeLogStore.setup_device("A", "origin")
+        |> PreChangeLogStore.setup_sender("origin", "app:test")
+
+      {%{"type" => "ok"}, store} =
+        PreChangeLogStore.request(store, "origin", %{
+          "type" => "forward",
+          "op_id" => "00000000-0000-4000-8000-000000000001",
+          "message" => %{
+            "sender_id" => "app:test",
+            "message_id" => "seen",
+            "created_at" => 1,
+            "title" => "Historical sessionless FYI",
+            "answer_ui" => @seen
+          }
+        })
+
+      store
+    end)
+
+    if marker_present do
+      assert {:ok, store} = Store.open(path, :snapshot)
+      assert {:ok, store} = Store.enable_change_log(store)
+      assert {:ok, store} = Store.migrate_retained_client_data(store)
+      assert :ok = Store.close(store)
+    end
+
+    assert {:ok, store} = Store.open(path, :snapshot)
+    record = legacy_record(store.engine.messages[@key])
+
+    engine = %{
+      store.engine
+      | messages: Map.put(store.engine.messages, @key, record),
+        bounce_revisions: Map.delete(store.engine.bounce_revisions, @key)
+    }
+
+    assert {:ok, store} = Store.commit(store, engine, %{person: "A", actor: "origin", action: "fixture"})
+    assert :ok = Store.close(store)
+  end
+
+  defp legacy_record(record) do
+    Map.drop(record, [
+      :session_handle, :vendor_session_id, :revision, :revisions, :files_by_revision,
+      :revision_accepted_at
+    ])
+  end
+
   defp seed_retained_snapshot(path) do
     PreChangeLogStore.write(path, fn store ->
       store =

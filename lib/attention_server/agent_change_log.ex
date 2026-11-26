@@ -129,6 +129,7 @@ defmodule AttentionServer.AgentChangeLog do
     for {person, _, _} = key <- keys,
         %{origin: origin} = record <- [next.messages[key]],
         scope = {person, origin},
+        session = Map.get(record, :session_handle),
         before = Map.new(Advisories.for_message(old, scope, key), &{&1["advisory_id"], &1}),
         notice <- Advisories.for_message(next, scope, key),
         id = notice["advisory_id"],
@@ -137,7 +138,7 @@ defmodule AttentionServer.AgentChangeLog do
       results ->
         if is_map_key(Map.get(record, "item_advisories", %{}), id) do
           [
-            {key, {scope, {:advisory, resource_id({:item_advisory, {key, id}}), record.session_handle}}}
+            {key, {scope, {:advisory, resource_id({:item_advisory, {key, id}}), session}}}
             | results
           ]
         else
@@ -145,7 +146,7 @@ defmodule AttentionServer.AgentChangeLog do
           # terminal or later revision must also publish a same-ID update.
           if before[id] && before[id]["moot"] != notice["moot"],
             do: [
-              {key, {scope, {:advisory, resource_id({:advisory, id}), record.session_handle}}} | results
+              {key, {scope, {:advisory, resource_id({:advisory, id}), session}}} | results
             ],
             else: results
         end

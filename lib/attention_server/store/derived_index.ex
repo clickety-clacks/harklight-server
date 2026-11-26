@@ -378,7 +378,7 @@ defmodule AttentionServer.Store.DerivedIndex do
   defp item_fields({_person, sender, id}, record) do
     source = KeyedValidation.source_key(record)
 
-    [sender, id, get_in(record, [:terminal, :state]), record.origin, record.session_handle,
+    [sender, id, get_in(record, [:terminal, :state]), record.origin, Map.get(record, :session_handle),
      flag(Map.get(record, :agent_api_v2) == true), if(source, do: blob(source))]
   end
 
