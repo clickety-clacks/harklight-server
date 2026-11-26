@@ -91,7 +91,7 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
 
         case send_with_files(ctx, key, digest, body) do
           {:shared_error, token, details} -> Errors.send_error(conn, token, details: details)
-          result -> Writes.respond(conn, replay_success(ctx, result))
+          result -> Writes.respond(conn, replay_success(ctx, :send, result))
         end
 
       [] ->
@@ -113,7 +113,7 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
         match = get_req_header(conn, "if-match")
         digest = write_digest(conn, match, body)
         request = {:shared_mutation, ctx.principal, key, digest, id, operation, match, body}
-        Writes.respond(conn, replay_success(ctx, call(ctx, request)))
+        Writes.respond(conn, replay_success(ctx, operation, call(ctx, request)))
 
       {:ok, _} ->
         Errors.send_error(conn, "not_found")
