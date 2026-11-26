@@ -1,7 +1,7 @@
 defmodule AttentionServer.Store.AuthSchema do
   @moduledoc false
 
-  alias AttentionServer.{BrowserAuth, DeviceMigration}
+  alias AttentionServer.{BrowserAuth, DeviceMigration, LocalSignIn}
   alias AttentionServer.ClientAPI.Idempotency
   alias AttentionServer.NativeSignIn
   alias AttentionServer.Store.RecordTable
@@ -50,6 +50,7 @@ defmodule AttentionServer.Store.AuthSchema do
          :ok <- BrowserAuth.create_tables(db),
          :ok <- NativeSignIn.create_tables(db),
          :ok <- DeviceMigration.create_tables(db),
+         :ok <- LocalSignIn.create_tables(db),
          :ok <- DeviceMigration.seed(db, engine, devices),
          :ok <-
            RecordTable.run(

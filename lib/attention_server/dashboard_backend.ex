@@ -24,6 +24,16 @@ defmodule AttentionServer.DashboardBackend do
   def browser_context(%__MODULE__{sessions: sessions}, cookie),
     do: DashboardBrowserSession.context(sessions, cookie)
 
+  def local_code_available(%__MODULE__{relay: relay}, _context) do
+    match?({:ok, ["owner_code"]}, Relay.native_sign_in_methods(relay))
+  end
+
+  def issue_owner_code(%__MODULE__{relay: relay}, %{person_id: person, owner_key: key}),
+    do: Relay.owner_sign_in_code(relay, person, key)
+
+  def redeem_owner_code(%__MODULE__{relay: relay}, {code, transaction}),
+    do: Relay.redeem_owner_code(relay, code, transaction)
+
   def list_devices(%__MODULE__{} = backend, %{person_id: person, owner_key: key} = principal) do
     case Relay.dashboard_inventory(backend.relay, person, key, backend.configured_owner_person) do
       {:ok, snapshot} ->

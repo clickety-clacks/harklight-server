@@ -71,6 +71,8 @@ defmodule AttentionServer.NativeSignIn do
 
   def authorize_hosted(_, _, _, _, _), do: {:error, :invalid_request}
 
+  def authorize_local_code(db, ref, person, now), do: authorize(db, ref, person, "owner_code", now)
+
   defp authorize(db, ref, person, method, now) when is_binary(ref) and byte_size(ref) == 43 do
     with :ok <-
            RecordTable.run(

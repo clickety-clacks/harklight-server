@@ -20,7 +20,7 @@ defmodule AttentionServer.DashboardReadHTTP do
 
   import Plug.Conn
 
-  alias AttentionServer.{BrowserAuth, DashboardBrand, DashboardView, Diagnostics, JSON, Message}
+  alias AttentionServer.{BrowserAuth, DashboardBrand, DashboardView, Diagnostics, JSON, LocalSignInPage, Message}
 
   @cookie "__Host-harklight"
   @invite_cookie "__Host-harklight-invite"
@@ -129,7 +129,21 @@ defmodule AttentionServer.DashboardReadHTTP do
         send_resp(conn, 403, "HTTPS required")
 
       conn.method == "GET" and conn.request_path == "/sign-in" ->
-        sign_in_page(conn, opts)
+        if local_code_available?(opts) do
+          conn |> put_resp_content_type("text/html", "utf-8") |> send_resp(200, LocalSignInPage.html())
+        else
+          sign_in_page(conn, opts)
+        end
+
+      conn.method == "GET" and conn.request_path == "/sign-in/code.js" ->
+        if local_code_available?(opts) do
+          conn |> put_resp_content_type("text/javascript", "utf-8") |> send_resp(200, LocalSignInPage.script())
+        else
+          send_resp(conn, 404, "")
+        end
+
+      conn.method == "POST" and conn.request_path == "/sign-in/code" ->
+        redeem_local_code(conn, opts)
 
       conn.method == "GET" and conn.request_path == "/sign-in.js" ->
         sign_in_script(conn, opts)
@@ -233,13 +247,19 @@ defmodule AttentionServer.DashboardReadHTTP do
     |> send_resp(303, "")
   end
 
-  defp no_session(conn, %{hosted: false}) do
-    if self_hosted_page_request?(conn.request_path) do
-      conn
-      |> put_resp_content_type("text/html", "utf-8")
-      |> send_resp(401, self_hosted_sign_in_help_page())
-    else
-      send_resp(conn, 401, "Sign in to view your devices")
+  defp no_session(conn, %{hosted: false} = opts) do
+    cond do
+      conn.method == "GET" and self_hosted_page_request?(conn.request_path) and
+          local_code_available?(opts) ->
+        conn |> put_resp_header("location", "/sign-in") |> send_resp(303, "")
+
+      self_hosted_page_request?(conn.request_path) ->
+        conn
+        |> put_resp_content_type("text/html", "utf-8")
+        |> send_resp(401, self_hosted_sign_in_help_page())
+
+      true ->
+        send_resp(conn, 401, "Sign in to view your devices")
     end
   end
 
@@ -297,7 +317,15 @@ defmodule AttentionServer.DashboardReadHTTP do
       testflight_url: opts.hosted_testflight_url
     ]
 
-  defp chrome(opts), do: [prioritization: true, invitations_configured: opts.invitations_configured]
+  defp chrome(opts) do
+    local_code? = local_code_available?(opts)
+    [
+      prioritization: true,
+      invitations_configured: opts.invitations_configured,
+      sign_out: local_code?,
+      local_sign_in_code: local_code?
+    ]
+  end
 
   defp route(
          %{method: "GET", request_path: "/api/profile"} = conn,
@@ -365,6 +393,28 @@ defmodule AttentionServer.DashboardReadHTTP do
          _principal
        ),
        do: serve_web_static(conn, opts)
+
+  defp route(%{method: "POST", request_path: "/devices/sign-in-code"} = conn, opts, principal) do
+    if local_code_available?(opts) do
+      case form(conn, opts, ~w(confirm)) do
+        {:ok, %{"confirm" => "create_code"}, conn} ->
+          case backend_call(opts.backend, :issue_owner_code, principal) do
+            {:ok, %{"code" => code}} ->
+              conn
+              |> put_resp_content_type("text/html", "utf-8")
+              |> send_resp(200, DashboardView.one_time_code(display_name(principal), code, chrome(opts)))
+
+            _ ->
+              send_resp(conn, 503, "One-time code unavailable")
+          end
+
+        _ ->
+          send_resp(conn, 403, "One-time code request refused")
+      end
+    else
+      send_resp(conn, 404, "")
+    end
+  end
 
   defp route(%{method: "GET", request_path: "/devices"} = conn, opts, principal) do
     case backend_call(opts.backend, :list_devices, principal) do
@@ -1312,6 +1362,58 @@ defmodule AttentionServer.DashboardReadHTTP do
       _ -> send_resp(conn, 400, "Invalid invitation request")
     end
   end
+
+  defp local_code_available?(%{hosted: false, backend: {module, _}} = opts) do
+    Code.ensure_loaded?(module) and function_exported?(module, :local_code_available, 2) and
+      backend_call(opts.backend, :local_code_available, nil) == true
+  end
+
+  defp local_code_available?(_opts), do: false
+
+  defp redeem_local_code(conn, opts) do
+    if local_code_available?(opts) do
+      with [content_type] <- get_req_header(conn, "content-type"),
+           true <- json_content_type?(content_type),
+           {:ok, raw, conn} <- read_body(conn, length: 1024, read_length: 1024),
+           {:ok, %{"code" => code} = request} when is_binary(code) <- JSON.decode_line(raw <> "\n"),
+           {:ok, transaction} <- local_code_context(conn, opts, request) do
+        case backend_call(opts.backend, :redeem_owner_code, {code, transaction}) do
+          {:ok, %{cookie: cookie, method: method}} ->
+            conn |> BrowserAuth.put_cookie(cookie, true) |> send_levels_json(%{"method" => method}, 200)
+
+          {:ok, %{transaction: reference}} ->
+            send_levels_json(conn, %{"transaction" => reference}, 200)
+
+          {:error, :invalid_sign_in} ->
+            send_levels_json(conn, %{"error" => "unauthorized"}, 401)
+
+          _ ->
+            send_levels_json(conn, %{"error" => "storage_unavailable"}, 503)
+        end
+      else
+        _ -> send_levels_json(conn, %{"error" => "invalid_request"}, 400)
+      end
+    else
+      send_resp(conn, 404, "")
+    end
+  end
+
+  defp local_code_context(conn, opts, %{"code" => _} = request) when map_size(request) == 1 do
+    if get_req_header(conn, "origin") == [expected_origin(conn, opts)],
+      do: {:ok, nil},
+      else: {:error, :origin}
+  end
+
+  defp local_code_context(conn, opts, %{"transaction" => ref} = request)
+       when is_binary(ref) and map_size(request) == 2 do
+    case get_req_header(conn, "origin") do
+      [] -> {:ok, ref}
+      [origin] -> if origin == expected_origin(conn, opts), do: {:ok, ref}, else: {:error, :origin}
+      _ -> {:error, :origin}
+    end
+  end
+
+  defp local_code_context(_, _, _), do: {:error, :invalid_request}
 
   defp redeem_sign_in(conn, opts) do
     if get_req_header(conn, "origin") != [expected_origin(conn, opts)] or

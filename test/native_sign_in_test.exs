@@ -1,7 +1,7 @@
 defmodule AttentionServer.NativeSignInTest do
   use ExUnit.Case, async: true
 
-  alias AttentionServer.{BrowserAuth, DeviceProof, HostedRequests, JSON, Relay, Store}
+  alias AttentionServer.{BrowserAuth, DashboardBackend, DashboardBrowserSession, DashboardReadHTTP, DeviceProof, Engine, HostedRequests, JSON, Relay, Store}
   alias AttentionServer.ClientAPI.Router
   alias AttentionServer.Store.AuthSchema
   alias Exqlite.Sqlite3
@@ -162,6 +162,77 @@ defmodule AttentionServer.NativeSignInTest do
     assert {:ok, %{pending: false}} = Relay.native_session(relay, new_bearer)
     assert {:error, :unauthorized} = Relay.certificate_device_person(relay, device)
     assert {:error, :already_migrated} = Relay.redeem_native_transaction(relay, unused_request)
+  end
+
+  test "local owner codes are one-use and late RSA proof reattaches the same active recipient",
+       %{tmp_dir: dir} do
+    origin = "https://local.example.test"
+    path = Path.join(dir, "local.sqlite3")
+    opts = [store_path: path, deployment_mode: :self_hosted, dashboard_origin: origin]
+    person = "00000000-0000-4000-8000-000000000001"
+    owner = String.duplicate("a", 64)
+    private = Path.join(dir, "legacy.pem")
+    public = Path.join(dir, "legacy.der")
+    assert {_, 0} = System.cmd("openssl", ["genpkey", "-algorithm", "RSA", "-pkeyopt", "rsa_keygen_bits:2048", "-out", private], stderr_to_stdout: true)
+    assert {_, 0} = System.cmd("openssl", ["pkey", "-in", private, "-pubout", "-outform", "DER", "-out", public])
+    der = File.read!(public)
+    device = DeviceProof.digest(der)
+
+    {:ok, store} = Store.open_relay(path)
+    store = Store.track_relay_writes(store)
+    {:ok, engine} = Engine.operator_bootstrap(store.engine, person, owner)
+    {:ok, engine} = Engine.setup_device(engine, person, device)
+    {:ok, store} = Store.commit(store, engine, %{person: person, actor: owner, action: "fixture"})
+    assert {:ok, %{minimum_generation: 1}} = AuthSchema.initialize(store.db, store.engine, [device])
+    :ok = Store.close(store)
+
+    {:ok, relay} = Relay.start_link(opts)
+    {:ok, browser} = DashboardBrowserSession.start_link(relay: relay)
+    backend = %DashboardBackend{relay: relay, sessions: browser, configured_owner_person: person}
+    dashboard = DashboardReadHTTP.init(backend: {DashboardBackend, backend}, skill_path: __ENV__.file, expected_origin: origin)
+    router = Router.init(relay: relay, auth: {:browser, {DashboardBackend, backend}, origin})
+
+    assert {:ok, %{"code" => browser_code}} = Relay.owner_sign_in_code(relay, person, owner)
+    browser_request =
+      local_code_post(%{"code" => browser_code})
+      |> Plug.Conn.put_req_header("origin", origin)
+
+    signed_in = DashboardReadHTTP.call(browser_request, dashboard)
+    assert signed_in.status == 200
+    assert json(signed_in) == %{"method" => "owner_code"}
+    assert signed_in.resp_cookies["__Host-harklight"].http_only
+    assert DashboardReadHTTP.call(browser_request, dashboard).status == 401
+
+    verifier = BrowserAuth.new_secret()
+    bearer = BrowserAuth.new_secret()
+    hash = DeviceProof.digest(bearer)
+    assert {:ok, transaction} = Relay.create_native_transaction(relay, DeviceProof.digest(verifier))
+    assert {:ok, %{"code" => code}} = Relay.owner_sign_in_code(relay, person, owner)
+    direct = local_code_post(%{"code" => code, "transaction" => transaction})
+    assert DashboardReadHTTP.call(direct, dashboard).status == 200
+    assert DashboardReadHTTP.call(direct, dashboard).status == 401
+
+    bytes = DeviceProof.sign_in_bytes(transaction, hash)
+    {key, signature} = proof(dir, bytes)
+    old = %{"device_id" => device, "public_key" => Base.url_encode64(der, padding: false),
+            "signature" => sign(dir, bytes, "legacy")}
+    request = %{"transaction" => transaction, "verifier" => verifier, "public_key" => key,
+                "session_hash" => hash, "signature" => signature, "label" => "Test phone",
+                "old_proof" => old}
+
+    result = post("/v2/auth/sign-in", request) |> Router.call(router)
+    assert result.status == 200
+    assert %{"old_device" => "attached", "device_id" => ^device, "duplicate" => false} = json(result)
+    retry = post("/v2/auth/sign-in", request) |> Router.call(router)
+    assert %{"old_device" => "attached", "device_id" => ^device, "duplicate" => true} = json(retry)
+    assert {:error, :unauthorized} = Relay.certificate_device_person(relay, device)
+  end
+
+  defp local_code_post(body) do
+    post("/sign-in/code", body)
+    |> Map.put(:scheme, :https)
+    |> Map.put(:port, 443)
+    |> Plug.Conn.put_req_header("content-type", "application/json")
   end
 
   defp migration_request(dir, token, hash) do

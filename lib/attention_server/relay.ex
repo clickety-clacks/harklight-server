@@ -35,6 +35,7 @@ defmodule AttentionServer.Relay do
     NativeSignIn,
     JevClient,
     JevRanking,
+    LocalSignIn,
     Placement,
     RouteBIndex,
     Store
@@ -256,6 +257,12 @@ defmodule AttentionServer.Relay do
   @doc "Authenticate a bearer once, returning its stored person-owner principal only after commit."
   def consume_browser_sign_in(server, token),
     do: GenServer.call(server, {:consume_browser_sign_in, token}, :infinity)
+
+  def owner_sign_in_code(server, person, key),
+    do: GenServer.call(server, {:owner_sign_in_code, person, key}, :infinity)
+
+  def redeem_owner_code(server, code, transaction),
+    do: GenServer.call(server, {:redeem_owner_code, code, transaction}, :infinity)
 
   def redeem_browser_fragment(server, token, session_hash),
     do: GenServer.call(server, {:redeem_browser_fragment, token, session_hash}, :infinity)
@@ -1306,6 +1313,35 @@ defmodule AttentionServer.Relay do
         {:reply, {:error, reason}, state}
     end
   end
+
+  defp dispatch_call({:owner_sign_in_code, person, key}, _from, state) do
+    result =
+      case {state.deployment_mode, state.store} do
+        {:self_hosted, %{auth_schema: %{}, db: db, engine: engine}} ->
+          LocalSignIn.issue(db, engine, person, key, state.clock.())
+
+        _ ->
+          {:error, :disabled}
+      end
+
+    {:reply, result, state}
+  end
+
+  defp dispatch_call({:redeem_owner_code, code, transaction}, _from, state) do
+    result =
+      case {state.deployment_mode, state.store} do
+        {:self_hosted, %{auth_schema: %{}, db: db, engine: engine}} ->
+          LocalSignIn.redeem(db, engine, code, transaction, state.clock.())
+
+        _ ->
+          {:error, :disabled}
+      end
+
+    {:reply, result, state}
+  end
+
+  defp dispatch_call({:owner_browser_sign_in_create, _, _}, _from, %{store: %{auth_schema: %{}}} = state),
+    do: {:reply, {:error, :not_found}, state}
 
   defp dispatch_call({:owner_browser_sign_in_create, person, owner}, _from, state) do
     case issue_browser_sign_in(state, state.store.engine, person, owner, owner) do

@@ -9,6 +9,9 @@ defmodule AttentionServer.HeadlessOwner do
   def browser_sign_in(endpoint, certificate, key, person),
     do: request(endpoint, certificate, key, person, %{"type" => "browser_sign_in_create"})
 
+  def sign_in_code(endpoint, certificate, key, person),
+    do: request(endpoint, certificate, key, person, %{"type" => "sign_in_code_create"})
+
   def invite(endpoint, certificate, key, person),
     do: request(endpoint, certificate, key, person, %{"type" => "invite_create"})
 
