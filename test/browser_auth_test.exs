@@ -1,7 +1,7 @@
 defmodule AttentionServer.BrowserAuthTest do
   use ExUnit.Case, async: true
 
-  alias AttentionServer.{DashboardBrowserSession, HostedRequests, JSON, Relay}
+  alias AttentionServer.{DashboardBackend, DashboardBrowserSession, DashboardReadHTTP, HostedRequests, JSON, Relay}
   alias AttentionServer.Store.AuthSchema
   alias Exqlite.Sqlite3
 
@@ -79,6 +79,47 @@ defmodule AttentionServer.BrowserAuthTest do
 
     {:ok, restarted} = Relay.start_link(c.opts)
     {:ok, browser} = DashboardBrowserSession.start_link(relay: restarted)
+    assert {:ok, %{person_id: person}} = DashboardBrowserSession.resolve(browser, cookie)
+    assert person == c.person
+  end
+
+  test "Hosted page preserves the cookie when a durable lookup fails", c do
+    {:ok, relay} = Relay.start_link(c.opts)
+    assert {:ok, grant} = Relay.hosted_browser_grant(relay, c.person, "transaction", "google")
+    assert {:ok, %{cookie: cookie}} = Relay.redeem_hosted_browser_grant(relay, grant, "transaction")
+    {:ok, browser} = DashboardBrowserSession.start_link(relay: relay)
+    backend = %DashboardBackend{relay: relay, sessions: browser}
+
+    opts =
+      DashboardReadHTTP.init(
+        backend: {DashboardBackend, backend},
+        skill_path: __ENV__.file,
+        hosted: true,
+        expected_origin: @origin,
+        hosted_addresses: %{sign_in: @origin <> "/account/sign-in"}
+      )
+
+    :sys.replace_state(relay, fn state ->
+      :ok = Sqlite3.execute(state.store.db, "ALTER TABLE harklight_browser_sessions RENAME TO temporarily_hidden")
+      state
+    end)
+
+    response =
+      Plug.Test.conn(:get, "/devices")
+      |> Map.put(:scheme, :https)
+      |> Map.put(:port, 443)
+      |> Plug.Conn.put_req_header("cookie", "__Host-harklight=" <> cookie)
+      |> DashboardReadHTTP.call(opts)
+
+    assert response.status == 503
+    assert Plug.Conn.get_resp_header(response, "location") == []
+    refute Map.has_key?(response.resp_cookies, "__Host-harklight")
+
+    :sys.replace_state(relay, fn state ->
+      :ok = Sqlite3.execute(state.store.db, "ALTER TABLE temporarily_hidden RENAME TO harklight_browser_sessions")
+      state
+    end)
+
     assert {:ok, %{person_id: person}} = DashboardBrowserSession.resolve(browser, cookie)
     assert person == c.person
   end
