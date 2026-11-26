@@ -24,6 +24,61 @@ defmodule AttentionServer.ClientAPISharedSendTest do
     %{certs: certs, server_opts: server_opts}
   end
 
+  test "people manage accepted group membership and Agents only see their own joined group IDs", ctx do
+    server = start_supervised!({Server, [shared_messages: true, groups: true] ++ ctx.server_opts})
+    relay = Server.relay(server)
+    [manager, invitee, outsider] =
+      for {owner, device} <- [{"expired", "a1"}, {"future", "a2"}, {"unknown", "b1"}] do
+        {:ok, person} = Relay.operator_bootstrap(relay, TLSFixtures.certificate_der!(ctx.certs, owner))
+        {:ok, _key} =
+          Relay.setup_device_certificate(relay, person, TLSFixtures.certificate_der!(ctx.certs, device))
+        person
+      end
+
+    options = [{"harklight-features", "groups, shared_messages"}]
+    assert {404, _, _} = get_request(ctx, server, "a1", "/v2/groups", [])
+    assert {200, %{"groups" => [], "invitations" => []}, _} =
+             get_request(ctx, server, "a1", "/v2/groups", options)
+
+    create = %{"name" => "Planning"}
+    assert {200, %{"group" => %{"id" => group_id, "manager" => %{"id" => ^manager}, "member" => true}}, _} =
+             write_request(ctx, server, "a1", "POST", "/v2/groups", op_key(40), create, options)
+    group = "/v2/groups/" <> group_id
+
+    assert {200, %{"invitation" => %{"id" => invitation}}, _} =
+             write_request(ctx, server, "a1", "POST", group <> "/invitations", op_key(41),
+               %{"person_id" => invitee}, options)
+    accept = "/v2/group-invitations/" <> invitation <> "/accept"
+    assert {404, _, _} = write_request(ctx, server, "b1", "POST", accept, op_key(42), %{}, options)
+    assert {200, %{"groups" => [], "invitations" => [%{"id" => ^invitation}]}, _} =
+             get_request(ctx, server, "a2", "/v2/groups", options)
+    assert {200, %{"groups" => []}, _} = get_request(ctx, server, "a2", "/v2/agent/groups", options)
+
+    assert {200, %{"group" => %{"id" => ^group_id, "member" => true}} = accepted, _} =
+             write_request(ctx, server, "a2", "POST", accept, op_key(43), %{}, options)
+    assert {200, ^accepted, replay_headers} =
+             write_request(ctx, server, "a2", "POST", accept, op_key(43), %{}, options)
+    assert {"idempotent-replayed", "true"} in replay_headers
+    assert {200, %{"groups" => [%{"id" => ^group_id} = discovery]}, _} =
+             get_request(ctx, server, "a2", "/v2/agent/groups", options)
+    refute Map.has_key?(discovery, "members")
+    assert {200, %{"groups" => []}, _} = get_request(ctx, server, "b1", "/v2/agent/groups", options)
+    assert outsider != invitee
+
+    assert {404, _, _} =
+             write_request(ctx, server, "a2", "PATCH", group, op_key(44), %{"name" => "New name"}, options)
+    assert {200, %{"group" => %{"muted" => true}}, _} =
+             write_request(ctx, server, "a2", "PUT", group <> "/mute", op_key(45), %{"muted" => true}, options)
+    assert {200, %{"groups" => [%{"muted" => false}]}, _} =
+             get_request(ctx, server, "a1", "/v2/groups", options)
+
+    assert {200, %{"rev" => _}, _} =
+             write_request(ctx, server, "a1", "POST", group <> "/leave", op_key(46), %{}, options)
+    assert {200, %{"groups" => [%{"member" => false, "members" => [%{"id" => ^invitee}]}]}, _} =
+             get_request(ctx, server, "a1", "/v2/groups", options)
+    assert {200, %{"groups" => []}, _} = get_request(ctx, server, "a1", "/v2/agent/groups", options)
+  end
+
   test "shared send binds one organization, commits once and replays the original result", ctx do
     server = start_supervised!({Server, [shared_messages: true] ++ ctx.server_opts})
     relay = Server.relay(server)

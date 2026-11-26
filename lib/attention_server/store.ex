@@ -1285,6 +1285,7 @@ defmodule AttentionServer.Store do
                    {:ok, heads, agent_heads} <- append_change_logs(db, log, generation),
                    :ok <- write_shared_send_receipt(store, next, audit),
                    :ok <- write_shared_chat_receipt(store, next, audit),
+                   :ok <- write_group_receipt(store, next, audit),
                    :ok <- DerivedIndex.advance(db, generation) do
                 {:ok, {heads, agent_heads}}
               end
@@ -2243,6 +2244,11 @@ defmodule AttentionServer.Store do
       |> AgentChangeLog.append_shared_answer(scope, answer_id, session)
     end
   end
+
+  defp write_group_receipt(store, engine, %{group_receipt: receipt}),
+    do: AttentionServer.ClientAPI.GroupRoutes.save_receipt(store, engine, receipt)
+
+  defp write_group_receipt(_store, _engine, _audit), do: :ok
 
   defp write_shared_chat_receipt(store, engine, %{shared_chat: %{key: key} = chat})
        when is_binary(key) do

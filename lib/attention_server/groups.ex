@@ -189,6 +189,29 @@ defmodule AttentionServer.Groups do
     end)
   end
 
+  def visible(engine, person) do
+    organizations = SharedMessages.organizations(engine, person)
+
+    engine.groups
+    |> Map.values()
+    |> Enum.filter(fn group ->
+      MapSet.member?(organizations, group.organization_id) and
+        (group.manager == person or Map.has_key?(group.members, person))
+    end)
+    |> Enum.sort_by(&{name_key(&1.name), &1.id})
+  end
+
+  def invitations(engine, person) do
+    organizations = SharedMessages.organizations(engine, person)
+
+    engine.groups
+    |> Map.values()
+    |> Enum.filter(fn group ->
+      MapSet.member?(organizations, group.organization_id) and Map.has_key?(group.invitations, person)
+    end)
+    |> Enum.sort_by(&{name_key(&1.name), &1.id})
+  end
+
   def member_group(engine, id, person) do
     with %{members: members, organization_id: organization} = group <- engine.groups[id],
          true <- Map.has_key?(members, person),

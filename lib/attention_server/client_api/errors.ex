@@ -32,6 +32,8 @@ defmodule AttentionServer.ClientAPI.Errors do
     "not_answered" => {409, false},
     "idempotency_conflict" => {409, false},
     "organization_required" => {409, false},
+    "group_name_conflict" => {409, false},
+    "already_member" => {409, false},
     "cursor_expired" => {410, false},
     "precondition_failed" => {412, false},
     "payload_too_large" => {413, false},
