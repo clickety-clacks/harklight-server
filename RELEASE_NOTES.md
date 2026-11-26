@@ -1,3 +1,97 @@
+# Harklight Server v0.2.32
+
+This is the sign-in overlap release. With S1 active, a self-hosted owner can
+issue a one-time code from Devices or with `harklight owner sign-in-code`.
+Use the code to sign in in a browser or in an S1-capable iPhone app. A signed-in
+browser can also set up a passkey from Devices for future browser sign-ins.
+Passkey sign-in in the app sheet is off by default.
+
+On Hosted, an app request to `/sign-in?return=app&transaction=…` redirects to
+the configured issuer with the transaction and any supported method selection.
+The Hosted issuer provides the sign-in methods. Legacy Hosted browser
+sign-in still works during the issuer transition. Self-hosted one-use browser
+sign-in links are retired when S1 is activated.
+
+Browser sessions persist across Server restarts. The first upgrade can require
+a fresh browser sign-in. The app uses a persistent bearer session on the
+HTTPS origin after S1 sign-in. Devices lists installations and lets the owner
+revoke a phone and end its sessions. Browser sign-out ends that browser
+session. The listed self-hosted phones keep using their existing certificates
+until they complete migration or are removed. Existing Agent sender
+certificates, grants and the device listener continue to work.
+
+With S1 active, `POST /v2/agent/messages` and
+`GET /v2/agent/messages/{item_id}` can return `message.recipient_reach`.
+`reachable` means an eligible device or signed-in browser can receive the
+message. `none` means there is no eligible recipient. A successful send
+still returns HTTP 200 and keeps the message for a later sign-in. Send replay
+reports current reach. The existing `availability` field continues to describe
+the sending Agent's reply feed.
+
+## Settings
+
+- `ATTENTION_SERVER_SIGN_IN_S1=1` activates S1 at startup. It is off by
+  default. Once activated, the store retains its auth generation across
+  restarts, even if the setting is removed.
+- Before the first S1 start on self-hosted, set
+  `ATTENTION_SERVER_AUTH_MIGRATION_DEVICES` to the comma-separated IDs of the
+  existing phones and iPads that need certificate overlap. Leave it empty on
+  Hosted. The roster is recorded at activation.
+- Use the existing dashboard listener settings and
+  `ATTENTION_SERVER_PUBLIC_BASE_URL` for the trusted HTTPS sign-in origin.
+  Hosted uses the existing `ATTENTION_SERVER_HOSTED_SIGN_IN_URL` for the issuer.
+- Leave `ATTENTION_SERVER_NATIVE_PASSKEYS` unset for ordinary use. Setting it
+  to `1` enables the app-sheet passkey offer for isolated acceptance.
+  Self-hosted browser passkeys are available with S1 active.
+
+## Upgrade and recovery
+
+Use the packaged release installer and its checked launcher. The installer
+stops the service and takes a complete private-root backup before switching
+packages. The stopped SQLite store must be checkpointed. The relay format
+stays FORMAT31. On first S1 activation the Server adds sign-in tables and
+records minimum auth generation 1 in the same database. If you installed
+the package earlier with S1 off, take a fresh stopped backup before enabling it.
+
+A direct launch of v0.2.31 can open the upgraded FORMAT31 store, but it ignores
+the S1 auth tables and cannot enforce its sessions or certificate denials.
+The managed installer and launcher check both the relay format and auth
+generation and refuse v0.2.31 against that store. If a switched auth-capable
+candidate fails, the installer stops it and preserves the current state and
+the original backup so an auth-compatible release can repair forward. To
+return to v0.2.31, stop the Server and restore the complete pre-upgrade backup,
+including the database and its referenced files. That discards every later
+write, including Agent updates.
+
+**Compatibility.** Harklight Server 0.2.32 uses protocol 0.2 and bundles
+unchanged Harklight Web 0.2.7. iPhone builds 361 and 362 can continue with
+certificate sign-in on devices included in the overlap roster. Use an
+S1-capable app build for native session sign-in. Harklight Agent 0.2.6 and
+newer remain compatible. Agent 0.2.10 prints “No one will get this” when the
+Server reports `recipient_reach: none`.
+
+# Harklight Server v0.2.31
+
+Bundles Harklight Web 0.2.7 (source 500550aa, archive SHA-256
+45ea669f38c88bd37fa55503ad669ca64c3c3fbd33d465dd55b26f138992fba7). Web 0.2.7
+can show shared messages addressed to several named people, but only on a
+Server that advertises the feature. This release doesn't advertise it, so the
+shared-message screens stay inactive. Web 0.2.7 also changes how it pages while
+catching up after a reset: it finishes the catch-up before loading more.
+
+## Upgrade and recovery
+
+FORMAT31, as in v0.2.26 through v0.2.30: an existing FORMAT30 store is
+converted once with the Server stopped; a FORMAT29 or older store must first be
+upgraded through v0.2.16 to v0.2.20. Once a hosted notice has been written,
+earlier FORMAT31 builds can't open the store. To go back, restore the complete
+pre-upgrade backup and run the release that wrote it; this discards every
+write made since the backup.
+
+**Compatibility.** Harklight Server 0.2.31 speaks only the 0.2 protocol, with
+no API change. Install it together with an iPhone app build that reads
+`receipt_expected`. Harklight Agent 0.2.6 through 0.2.8 work with it.
+
 # Harklight Server v0.2.30
 
 Hosted servers can send a person a Harklight message from the system itself,

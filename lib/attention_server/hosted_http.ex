@@ -7,6 +7,7 @@ defmodule AttentionServer.HostedHTTP do
   no credential of its own. The hosted component can create accounts, issue
   sign-in links, configure account state, and deliver an FYI to a local
   person. The test reset is scoped to the designated test account.
+  S1 session grants use this same interface.
   """
 
   use Supervisor

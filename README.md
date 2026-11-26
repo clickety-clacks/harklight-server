@@ -13,15 +13,15 @@ through Harklight.
 
 ## Install the server
 
-For the FORMAT31 v0.2.30 server package, use the release page below after
+For the FORMAT31 v0.2.32 server package, use the release page below after
 publication to download the Linux x86_64 archive, `SHA256SUMS` and
 `SELF_HOST.md`. Verify the checksum before extraction:
 
-[v0.2.30 release](https://github.com/clickety-clacks/harklight-server/releases/tag/v0.2.30)
+[v0.2.32 release](https://github.com/clickety-clacks/harklight-server/releases/tag/v0.2.32)
 
 ```sh
 sha256sum -c SHA256SUMS
-tar -xzf harklight-server-0.2.30-linux-x86_64.tar.gz
+tar -xzf harklight-server-0.2.32-linux-x86_64.tar.gz
 ```
 
 Follow [SELF_HOST.md](SELF_HOST.md) for a fresh installation, tailnet routing,
@@ -33,7 +33,9 @@ Release publication does not install the server; installation is a separate
 manual action.
 
 The app, packaged web client, Harklight Agent and packaged tools use client
-API v2 (`/v2`) on the device port. See [RELEASE_NOTES.md](RELEASE_NOTES.md)
+API v2 (`/v2`). With shared sign-in active, browser and app sessions use the
+HTTPS web origin. Harklight Agent and overlapping device certificates continue
+to use the device listener. See [RELEASE_NOTES.md](RELEASE_NOTES.md)
 for the compatibility of published packages.
 
 State, owner/device identities, trust roots and sender grants live outside the
@@ -52,8 +54,10 @@ matching read grant and a matching respond grant.
 
 Before upgrading, stop the server and retain a complete private
 state backup. The release installer also takes one full private-root backup
-while the service is stopped and before switching releases. It attempts to
-restore this snapshot if the candidate start or process-readiness check fails.
+while the service is stopped and before switching releases. If a switched
+auth-capable candidate fails to start or become ready, the installer stops it
+and preserves the current state and the backup for repair with a compatible
+release.
 The optional owner agent-list check is warning-only and does not trigger a
 rollback; there is no automatic rollback after readiness. Recovery can fail
 and leave the service stopped. A successful isolated rehearsal is evidence for

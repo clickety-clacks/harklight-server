@@ -38,11 +38,27 @@ defmodule AttentionServer.DashboardView do
           invitation_form("Create invitation")
       end
 
+    sign_in_action =
+      if Keyword.get(chrome, :local_sign_in_code, false) do
+        ~s(<form action="/devices/sign-in-code" method="post"><input type="hidden" name="confirm" value="create_code"><button class="button" type="submit">Create one-time code</button></form><p><a href="/devices/passkey">Set up a passkey</a></p>)
+      else
+        ""
+      end
+
     layout(
       person_name,
       "Devices",
-      ~s(<header class="page-head"><div><h1>Devices</h1><p>Devices approved to receive requests.</p></div>#{invitation_action}</header>) <>
+      ~s(<header class="page-head"><div><h1>Devices</h1><p>Devices approved to receive requests.</p></div>#{sign_in_action}#{invitation_action}</header>) <>
         body,
+      chrome
+    )
+  end
+
+  def one_time_code(person_name, code, chrome) do
+    layout(
+      person_name,
+      "One-time code",
+      ~s(<h1>One-time code</h1><p>Use this code within ten minutes.</p><p><code>#{escape(code)}</code></p><p><a href="/devices">Back to Devices</a></p>),
       chrome
     )
   end
