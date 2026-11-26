@@ -83,11 +83,13 @@ defmodule AttentionServer.Store.KeyedMigration do
   # The caller owns the stopped-store conversion transaction. FORMAT32 adds
   # empty keyed collections, so existing row and feed generations stay put.
   def upgrade_anchor(db) do
+    supported_identity = RecordCodec.identity()
+
     with {:ok, [[version, payload, checksum]]} <-
            query(db, "SELECT version, payload, checksum FROM relay_state WHERE id = 1", []),
          true <- :crypto.hash(:sha256, payload) == checksum,
          {:ok, identity} <- decode_anchor(payload, [@previous_format]),
-         :ok <- check_identity(identity, RecordCodec.identity()),
+         :ok <- check_identity(identity, supported_identity),
          {:ok, generation} <- RecordTable.generation(db),
          true <- generation >= version,
          :ok <- write_anchor(db, version, version) do
