@@ -2037,30 +2037,8 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
       {:ok, {person, sender, message_id} = key} = Resources.item_key(state.store.engine, "A", id)
       at = state.store.engine.messages[key].accepted_at
 
-      commit_fixture = fn transition ->
-        :sys.replace_state(ctx.relay, fn state ->
-          {:ok, store} =
-            Store.commit(state.store, transition.(state.store.engine), %{
-              person: person,
-              actor: "fixture",
-              action: "advisory_fixture"
-            })
-
-          %{state | store: store}
-        end)
-      end
-
-      commit_fixture.(fn engine ->
-        BounceDecision.record_scores(
-          engine,
-          person,
-          [%{"sender_id" => sender, "message_id" => message_id, "score" => 0.9}],
-          at
-        )
-      end)
-
-      send(ctx.relay, :retry_client_ranks)
-      :sys.get_state(ctx.relay)
+      assert BounceDecision.next_deadline(state.store.engine) == at + 43_200_000
+      assert is_reference(state.bounce_deadline_timer)
 
       if unquote(scenario) == :unopened do
         response =

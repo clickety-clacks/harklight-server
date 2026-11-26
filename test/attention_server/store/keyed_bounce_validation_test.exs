@@ -53,6 +53,14 @@ defmodule AttentionServer.Store.KeyedBounceValidationTest do
         engine
       end)
 
+    # Recreate retained pre-priority rows so these tests drive the original
+    # score, deferral, and migration paths from an unselected revision.
+    engine =
+      Enum.reduce([@m1, @m2, @m3], engine, fn key, current ->
+        put_in(current.bounce_revisions[key].revisions[1].selection, nil)
+      end)
+      |> BounceDecision.rebuild_indexes()
+
     {:ok, legacy} = Store.commit(legacy, engine, audit())
     :ok = Store.close(legacy)
     {:ok, staged} = Store.open(path, :keyed_cutover)

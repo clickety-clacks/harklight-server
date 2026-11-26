@@ -1747,7 +1747,9 @@ defmodule AttentionServer.PrioritizationTest do
         "fixed-bounce-selection"
       })
 
-    assert persisted_bounce.revisions[1].selection == selection
+    rescored = persisted_bounce.revisions[1].selection
+    assert rescored["level_name"] == "Urgent"
+    assert rescored["due_at_ms"] == record.accepted_at + 345_600_000
 
     GenServer.stop(relay)
     restarted = start_relay(path, priority_evaluator: fn _ -> {:error, :unavailable} end)
@@ -1758,7 +1760,7 @@ defmodule AttentionServer.PrioritizationTest do
         {"person-a", "app:test", "fixed-bounce-selection"}
       )
 
-    assert restarted_bounce.revisions[1].selection == selection
+    assert restarted_bounce.revisions[1].selection == rescored
   end
 
   test "later arrivals and cache-only passes do not re-record unchanged scores", %{

@@ -187,6 +187,7 @@ defmodule AttentionServer.BounceDecisionTest do
       engine
       | bounce_revisions: Map.put(engine.bounce_revisions, key(), retained_state)
     }
+    |> BounceDecision.rebuild_indexes()
 
     assert BounceDecision.levels(retained, @person) ==
              BouncePolicy.public_levels(BouncePolicy.default_levels())
@@ -270,7 +271,7 @@ defmodule AttentionServer.BounceDecisionTest do
     progress_record = %{record | message: progress_message, revisions: %{1 => progress_message}}
     marked = %{engine | messages: Map.put(engine.messages, key(), progress_record)}
 
-    scored_marked = score(marked, 0.9, 1_050)
+    scored_marked = marked |> BounceDecision.record_initial(key(), progress_record) |> score(0.9, 1_050)
     assert selection(scored_marked) == nil
     assert BounceDecision.next_deadline(scored_marked) == nil
 
