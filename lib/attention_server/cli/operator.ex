@@ -17,6 +17,28 @@ defmodule AttentionServer.CLI.Operator do
     end
   end
 
+  def run([command | args]) when command in ["organization-add", "organization-remove"] do
+    {options, rest, invalid} = OptionParser.parse(args, strict: [store: :string, person: :string])
+
+    with [] <- rest,
+         [] <- invalid,
+         2 <- length(options),
+         {:ok, store} <- Keyword.fetch(options, :store),
+         {:ok, person} <- Keyword.fetch(options, :person) do
+      AttentionServer.CLI.start_application!()
+
+      case OperatorTool.organization_member(store, person, command == "organization-add") do
+        :ok -> AttentionServer.CLI.shell().info(person)
+        {:error, reason} -> AttentionServer.CLI.error!("operator action failed: #{inspect(reason)}")
+      end
+    else
+      _ ->
+        AttentionServer.CLI.error!(
+          "use harklight operator organization-add|organization-remove --store PATH --person ID"
+        )
+    end
+  end
+
   def run([command | args]) when command in ["bootstrap", "recover"] do
     {options, rest, invalid} =
       OptionParser.parse(args, strict: [store: :string, owner_cert: :string, person: :string])

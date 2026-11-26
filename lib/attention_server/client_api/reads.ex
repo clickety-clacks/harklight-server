@@ -29,10 +29,11 @@ defmodule AttentionServer.ClientAPI.Reads do
     JSON,
     LargeData,
     Relay,
+    SharedMessages,
     UI1
   }
 
-  alias AttentionServer.ClientAPI.{Context, Errors, Projection, Resources, Search}
+  alias AttentionServer.ClientAPI.{Context, Errors, PeopleProfiles, Projection, Resources, Search, SharedAttachments, SharedCapability, SharedContinuation, SharedReads}
 
   # The client features still behind an operator flag at 0.2 (contract §4).
   @client_features ~w(server_matched_push_routing priority_level_editing)
@@ -60,7 +61,20 @@ defmodule AttentionServer.ClientAPI.Reads do
   @doc false
   def get_inbox(conn, %Context{} = ctx) do
     conn = fetch_query_params(conn)
-    respond(conn, inbox(ctx.relay, ctx.principal, query(conn, ~w(limit page))))
+    params = query(conn, ~w(limit page))
+
+    case SharedCapability.parse(conn) do
+      {:ok, %{shared?: false}} ->
+        if String.starts_with?(params["page"] || "", "s."),
+          do: respond(conn, {:error, :cursor_expired}),
+          else: respond(conn, inbox(ctx.relay, ctx.principal, params))
+
+      {:ok, %{shared?: true} = capability} ->
+        respond(conn, call(ctx.relay, {:shared_inbox, ctx.principal, params, capability}))
+
+      error ->
+        respond(conn, error)
+    end
   end
 
   @doc false
@@ -97,33 +111,47 @@ defmodule AttentionServer.ClientAPI.Reads do
   end
 
   @doc false
-  def get_item(conn, %Context{} = ctx),
-    do: respond(conn, item(ctx.relay, ctx.principal, ctx.params.item_id))
+  def get_item(conn, %Context{} = ctx) do
+    SharedReads.respond(conn, ctx, :person, :summary, fn ->
+      respond(conn, item(ctx.relay, ctx.principal, ctx.params.item_id))
+    end)
+  end
 
   @doc false
   def get_entries(conn, %Context{} = ctx) do
     conn = fetch_query_params(conn)
 
-    respond(
-      conn,
-      entries(ctx.relay, ctx.principal, ctx.params.item_id, query(conn, ~w(before limit)))
-    )
+    params = query(conn, ~w(before limit))
+
+    SharedReads.respond(conn, ctx, :person, {:entries, params}, fn ->
+      respond(conn, entries(ctx.relay, ctx.principal, ctx.params.item_id, params))
+    end)
   end
 
   @doc false
-  def get_revision(conn, %Context{} = ctx),
-    do: respond(conn, revision(ctx.relay, ctx.principal, ctx.params.item_id, ctx.params.n))
+  def get_revision(conn, %Context{} = ctx) do
+    SharedReads.respond(conn, ctx, :person, {:revision, ctx.params.n}, fn ->
+      respond(conn, revision(ctx.relay, ctx.principal, ctx.params.item_id, ctx.params.n))
+    end)
+  end
 
   @doc false
   def get_settings(conn, %Context{} = ctx),
     do: respond(conn, settings(ctx.relay, ctx.principal), &etag(&1["settings"]))
 
   @doc false
-  def get_me(conn, %Context{} = ctx), do: respond(conn, me(ctx.relay, ctx.principal))
+  def get_me(conn, %Context{} = ctx) do
+    case SharedCapability.parse(conn) do
+      {:ok, %{shared?: true} = capability} ->
+        respond(conn, call(ctx.relay, {:me_profile, ctx.principal, capability}))
+      {:ok, %{shared?: false}} -> respond(conn, me(ctx.relay, ctx.principal))
+      error -> respond(conn, error)
+    end
+  end
 
   @doc false
   def get_file(conn, %Context{} = ctx) do
-    case file(ctx.relay, ctx.principal, ctx.params.file_id) do
+    case file_result_for_request(conn, ctx) do
       {:ok, file} ->
         tag = file_etag(file)
 
@@ -147,6 +175,17 @@ defmodule AttentionServer.ClientAPI.Reads do
         respond(conn, error)
     end
   end
+
+  defp file_result_for_request(conn, %{params: %{file_id: "shared-file_" <> _ = id}} = ctx) do
+    case SharedCapability.parse(conn) do
+      {:ok, %{shared?: true} = capability} ->
+        SharedAttachments.download(ctx.relay, ctx.principal, id, capability)
+      {:ok, _} -> {:error, :not_found}
+      error -> error
+    end
+  end
+
+  defp file_result_for_request(_conn, ctx), do: file(ctx.relay, ctx.principal, ctx.params.file_id)
 
   # Round 18: a browser gets a file exactly as today's browser download, an
   # attachment of application/octet-stream, so the web origin never renders
@@ -191,10 +230,10 @@ defmodule AttentionServer.ClientAPI.Reads do
     do: Errors.projection_error(conn, fault)
 
   def respond(conn, {:error, token}, _etag_of),
-    do: Errors.send_error(conn, Atom.to_string(token))
+    do: Errors.send_error(conn, to_string(token))
 
   def respond(conn, {:error, token, field}, _etag_of),
-    do: Errors.send_error(conn, Atom.to_string(token), field: field)
+    do: Errors.send_error(conn, to_string(token), field: field)
 
   # If-None-Match uses the weak comparison (RFC 9110 §13.1.2).
   defp not_modified?(conn, tag) do
@@ -313,6 +352,24 @@ defmodule AttentionServer.ClientAPI.Reads do
     end
   end
 
+  def handle_call({:me_profile, who}, from, state), do: handle_call({:me_profile, who, %{}}, from, state)
+
+  def handle_call({:me_profile, who, capability}, from, state) do
+    with {:ok, %{person: person}} <- principal(state.store.engine, who),
+         true <- SharedCapability.readable?(state, person, capability) || {:error, :unsupported} do
+      case handle_call({:me, who}, from, state) do
+        {:reply, {:ok, body}, next} ->
+          profile = PeopleProfiles.for_person(next.store.engine, person)
+          {:reply, {:ok, put_in(body, ["principal", "profile"], profile)}, next}
+
+        other ->
+          other
+      end
+    else
+      error -> {:reply, error, state}
+    end
+  end
+
   def handle_call(request, _from, state) do
     reply =
       try do
@@ -322,6 +379,39 @@ defmodule AttentionServer.ClientAPI.Reads do
       end
 
     {:reply, reply, state}
+  end
+
+  defp read({:shared_inbox, who, params, capability}, state) do
+    engine = state.store.engine
+
+    with {:ok, %{person: person} = principal} <- principal(engine, who),
+         true <- SharedCapability.readable?(state, person, capability) || {:error, :unsupported},
+         {:ok, limit} <- limit(params),
+         {:ok, position} <- head(state, person),
+         {:ok, offset} <- shared_page(state, who, params["page"], limit, position, capability),
+         {:ok, count} <- ChangeLog.rank_count(state.store, person),
+         {:ok, individual} <- shared_individual_page(state, principal, offset, min(limit, max(count - offset, 0))),
+         {:ok, shared} <- shared_person_page(state, person, max(offset - count, 0), limit - length(individual), capability) do
+      items = individual ++ shared
+      next_offset = offset + min(limit, max(count - offset, 0)) + length(shared)
+      total = count + length(SharedMessages.for_person(engine, person, capability))
+
+      body = %{
+        "rev" => position,
+        "items" => items,
+        "counts" => SharedMessages.counts(engine, person, capability),
+        "continuation" =>
+          SharedContinuation.issue(engine.agent_cursor_key, who, :person_changes, SharedCapability.scope(capability, %{}), position, state.clock.())
+      }
+
+      if next_offset < total do
+        scope = SharedCapability.scope(capability, %{offset: next_offset, limit: limit, head: position})
+        token = SharedContinuation.issue(engine.agent_cursor_key, who, :person_snapshot, scope, position, state.clock.())
+        {:ok, Map.put(body, "next_page", "s.#{next_offset}.#{token}")}
+      else
+        {:ok, body}
+      end
+    end
   end
 
   defp read({:inbox, key, params}, state) do
@@ -493,6 +583,21 @@ defmodule AttentionServer.ClientAPI.Reads do
         }
       }
 
+      response =
+        if shared_available?(state, principal.person) do
+          ids = engine |> SharedMessages.organizations(principal.person) |> Enum.sort()
+          response
+          |> put_in(["features", "shared_messages"], true)
+          |> put_in(["principal", "organization_ids"], ids)
+        else
+          response
+        end
+
+      response =
+        if AttentionServer.ClientAPI.GroupRoutes.available(state, principal.person) == :ok,
+          do: put_in(response, ["features", "groups"], true),
+          else: response
+
       {:ok, with_sender_names(response, engine, principal)}
     end
   end
@@ -522,6 +627,73 @@ defmodule AttentionServer.ClientAPI.Reads do
         {:inline, file} -> inline_file(file)
       end
     end
+  end
+
+  defp shared_page(_state, _who, nil, _limit, _head, _capability), do: {:ok, 0}
+
+  defp shared_page(state, who, page, limit, head, capability) do
+    with ["s", offset, token] <- String.split(page, ".", parts: 3),
+         {offset, ""} when offset >= 0 <- Integer.parse(offset),
+         scope = SharedCapability.scope(capability, %{offset: offset, limit: limit, head: head}),
+         :ok <-
+           SharedContinuation.validate(token, state.store.engine.agent_cursor_key, who,
+             :person_snapshot, scope, head, state.clock.()) do
+      {:ok, offset}
+    else
+      _ -> {:error, :cursor_expired}
+    end
+  end
+
+  defp shared_individual_page(_state, _principal, _offset, 0), do: {:ok, []}
+
+  defp shared_individual_page(state, principal, offset, limit) do
+    engine = state.store.engine
+
+    with {:ok, rows, _} <- ChangeLog.rank_page(state.store, principal.person, {:offset, offset}, limit) do
+      items =
+        Enum.flat_map(rows, fn {id, rank} ->
+          case visible_item_key(engine, principal, id) do
+            {:ok, key} -> [render_item(state, principal, key, rank)]
+            _ -> []
+          end
+        end)
+
+      {:ok, items}
+    end
+  end
+
+  defp shared_person_page(_state, _person, _offset, 0, _capability), do: {:ok, []}
+
+  defp shared_person_page(state, person, offset, limit, capability) do
+    engine = state.store.engine
+
+    rows =
+      engine
+      |> SharedMessages.for_person(person, capability)
+      |> Enum.sort_by(fn {_, recipient} -> recipient.item_id end)
+      |> Enum.slice(offset, limit)
+
+    resources = Enum.map(rows, fn {record, _} -> ChangeLog.shared_item_resource(record.id) end)
+
+    with {:ok, revisions} <- ChangeLog.page_revisions(state.store, person, resources) do
+      {:ok,
+       Enum.map(rows, fn {record, recipient} ->
+         rev = Map.fetch!(revisions, ChangeLog.shared_item_resource(record.id))
+         SharedMessages.person_item(engine, person, record, recipient, rev)
+       end)}
+    end
+  end
+
+  @doc false
+  def shared_available?(state, person) do
+    state.shared_messages and
+      MapSet.size(SharedMessages.organizations(state.store.engine, person)) > 0
+  end
+
+  @doc false
+  def shared_readable?(state, person) do
+    state.shared_messages and
+      (shared_available?(state, person) or SharedMessages.retained_history?(state.store.engine, person))
   end
 
   defp visible_item_key(engine, principal, item_id) do

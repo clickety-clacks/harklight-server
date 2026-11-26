@@ -48,8 +48,8 @@ defmodule AttentionServer.CLI.StoreConversion do
 
   defp convert_store(path, budget, expected_format) do
     case Store.convert_stopped(path, budget, expected_format) do
-      {:ok, :converted} -> IO.puts("Converted stopped Harklight store to FORMAT31.")
-      {:ok, :already_converted} -> IO.puts("The stopped Harklight store already uses FORMAT31.")
+      {:ok, :converted} -> IO.puts("Converted stopped Harklight store to FORMAT32.")
+      {:ok, :already_converted} -> IO.puts("The stopped Harklight store already uses FORMAT32.")
       {:error, {:fit_not_established, _, _, _} = failure} ->
         CLI.error!(with_effective_memory(fit_failure(failure), budget.memory))
       {:error, {:fit_not_established, :measurement_unavailable, field}} ->

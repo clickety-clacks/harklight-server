@@ -119,6 +119,36 @@ defmodule AttentionServer.ChangeLog do
 
   # -- resource identifiers ---------------------------------------------------
 
+  @doc false
+  def shared_item_resource(id), do: "shared-item:" <> id
+  def shared_entry_resource(id), do: "shared-entry:" <> id
+
+  @doc false
+  def append_shared_send(log, id, outcomes) do
+    Enum.reduce(outcomes, log, fn
+      %{"person_id" => person, "status" => "reached"}, acc ->
+        rows = [{:item, shared_item_resource(id)}, {:counts, "shared-counts"}]
+        update_in(acc.pending, &Map.update(&1, person, rows, fn existing -> existing ++ rows end))
+
+      _, acc ->
+        acc
+    end)
+  end
+
+  @doc false
+  def append_shared_freeze(log, person, id, group? \\ false) do
+    counts = if group?, do: "group-counts", else: "shared-counts"
+    rows = [{:item, shared_item_resource(id)}, {:counts, counts}]
+    update_in(log.pending, &Map.update(&1, person, rows, fn existing -> existing ++ rows end))
+  end
+
+  @doc false
+  def append_shared_entry(log, person, message_id, entry_id, group? \\ false) do
+    log = append_shared_freeze(log, person, message_id, group?)
+    row = {:entry, shared_entry_resource(entry_id)}
+    update_in(log.pending, &Map.update!(&1, person, fn existing -> existing ++ [row] end))
+  end
+
   @doc "The log's resource ID for an item, from its engine key."
   def item_resource({_person, sender, message_id}),
     do: "item:" <> Base.url_encode64(JSON.encode!([sender, message_id]), padding: false)
@@ -144,6 +174,10 @@ defmodule AttentionServer.ChangeLog do
     end
   end
 
+  def decode_resource("shared-entry:" <> id), do: {:shared_entry, id}
+  def decode_resource("shared-item:" <> id), do: {:shared_item, id}
+  def decode_resource("shared-counts"), do: :shared_counts
+  def decode_resource("group-counts"), do: :group_counts
   def decode_resource("counts"), do: :counts
   def decode_resource("settings"), do: :settings
   def decode_resource(_), do: :error
@@ -1333,7 +1367,32 @@ defmodule AttentionServer.ChangeLog do
     end
   end
 
+  def rank_page(%AttentionServer.Store{change_log: true, db: db, change_log_touched: touched}, person, {:offset, offset}, limit)
+      when is_integer(offset) and offset >= 0 and is_integer(limit) and limit > 0 do
+    with false <- MapSet.member?(touched, person),
+         {:ok, true} <- ranked?(db, person),
+         {:ok, rows} <-
+           all(
+             db,
+             "SELECT item_id, rank_json FROM client_ranks WHERE person_id = ? ORDER BY rank_key LIMIT ? OFFSET ?",
+             [person, limit + 1, offset]
+           ) do
+      {page, rest} = Enum.split(rows, limit)
+      {:ok, Enum.map(page, fn [item_id, json] -> {item_id, decode_rank(json)} end), rest != []}
+    else
+      true -> {:error, :storage_unavailable}
+      {:ok, false} -> {:error, :none}
+      error -> error
+    end
+  end
+
   def rank_page(%AttentionServer.Store{}, _person, _after_key, _limit), do: {:error, :disabled}
+
+  @doc false
+  def rank_count(%AttentionServer.Store{change_log: true, db: db}, person) do
+    with {:ok, [count]} <- one(db, "SELECT COUNT(*) FROM client_ranks WHERE person_id = ?", [person]),
+      do: {:ok, count}
+  end
 
   @doc "One item's stored rank."
   def rank(%AttentionServer.Store{change_log: true, db: db}, person, item_id) do

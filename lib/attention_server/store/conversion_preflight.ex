@@ -4,7 +4,8 @@ defmodule AttentionServer.Store.ConversionPreflight do
   alias AttentionServer.Store.RecordTable
 
   @snapshot_format 30
-  @row_format 31
+  @previous_row_format 31
+  @row_format 32
   @prefix_bytes 256
   @prefix_overhead 32 * 1024 * 1024
 
@@ -175,7 +176,7 @@ defmodule AttentionServer.Store.ConversionPreflight do
     with {:ok, sizes} <- snapshot_sizes(stored_bytes, prefix) do
       case snapshot_format(prefix) do
         {:ok, format} -> {:ok, Map.put(sizes, :format, format)}
-        {:already_converted, _} -> confirm_row_anchor(db, stored_bytes, prefix)
+        {:already_converted, format} -> confirm_row_anchor(db, stored_bytes, prefix, format)
         {:error, _} -> {:error, :unsupported_snapshot}
       end
     else
@@ -183,7 +184,7 @@ defmodule AttentionServer.Store.ConversionPreflight do
     end
   end
 
-  defp confirm_row_anchor(db, stored_bytes, prefix) when stored_bytes == byte_size(prefix) do
+  defp confirm_row_anchor(db, stored_bytes, prefix, format) when stored_bytes == byte_size(prefix) do
     with {:ok, [[checksum]]} <-
            RecordTable.select(db, "SELECT checksum FROM relay_state WHERE id = 1"),
          true <- :crypto.hash(:sha256, prefix) == checksum,
@@ -194,13 +195,13 @@ defmodule AttentionServer.Store.ConversionPreflight do
            """),
          {:ok, _} <- RecordTable.generation(db),
          {:ok, [[1]]} <- RecordTable.select(db, "SELECT id FROM relay_index_state WHERE id = 1") do
-      {:already_converted, @row_format}
+      {:already_converted, format}
     else
       _ -> {:error, :unsupported_snapshot}
     end
   end
 
-  defp confirm_row_anchor(_db, _stored_bytes, _prefix), do: {:error, :unsupported_snapshot}
+  defp confirm_row_anchor(_db, _stored_bytes, _prefix, _format), do: {:error, :unsupported_snapshot}
 
   def snapshot_sizes(stored_bytes, <<131, 80, expanded_bytes::32, _::binary>>)
       when expanded_bytes > 0 and stored_bytes > 6 do
@@ -244,9 +245,10 @@ defmodule AttentionServer.Store.ConversionPreflight do
       when size == byte_size("attention_relay_state") ->
         {:ok, @snapshot_format}
 
-      <<"attention_relay_keyed_state", 97, @row_format, _::binary>>
-      when size == byte_size("attention_relay_keyed_state") ->
-        {:already_converted, @row_format}
+      <<"attention_relay_keyed_state", 97, format, _::binary>>
+      when size == byte_size("attention_relay_keyed_state") and
+             format in [@previous_row_format, @row_format] ->
+        {:already_converted, format}
 
       _ ->
         {:error, :fit_not_established}

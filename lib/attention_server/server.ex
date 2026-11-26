@@ -108,6 +108,8 @@ defmodule AttentionServer.Server do
         jev_model: Keyword.get(opts, :jev_model),
         jev_score_record_path: Keyword.get(opts, :jev_score_record_path),
         feature_flags_path: Keyword.get(opts, :feature_flags_path),
+        shared_messages: Keyword.get(opts, :shared_messages, false),
+        groups: Keyword.get(opts, :groups, false),
         upload_cap: upload_cap
       ]
 
@@ -255,7 +257,8 @@ defmodule AttentionServer.Server do
               optional_child_spec(
                 :hosted_http,
                 HostedHTTP,
-                [relay: relay_name, port: hosted_port, ip: {127, 0, 0, 1}],
+                [relay: relay_name, port: hosted_port, ip: {127, 0, 0, 1},
+                 groups: Keyword.get(opts, :groups) == true and Keyword.get(opts, :shared_messages) == true],
                 :hosted_http,
                 :listener_start,
                 :supervisor

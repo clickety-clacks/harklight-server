@@ -77,7 +77,7 @@ backups=("$HARKLIGHT_TEST_ROOT"/backups/*-v0.2.20-to-v0.2.21-*)
 [[ ${#backups[@]} == 1 && -f "${backups[0]}/private-root.tar" ]]
 ERL_LIBS="$HARKLIGHT_TEST_ERL_LIBS" elixir \
   -pa "$HARKLIGHT_TEST_APP_EBIN" "$HARKLIGHT_TEST_MIGRATOR"
-grep -qx 'format=31' "$HARKLIGHT_TEST_MIGRATION_LOG"
+grep -qx 'format=32' "$HARKLIGHT_TEST_MIGRATION_LOG"
 if [[ "$HARKLIGHT_TEST_MODE" == interrupted-conversion && ! -f "$HARKLIGHT_TEST_INTERRUPTED" ]]; then
   touch "$HARKLIGHT_TEST_INTERRUPTED"
   kill -KILL "$PPID"
@@ -92,7 +92,7 @@ printf 'server\n' > "$archive_stage/bin/attention_server"
 chmod 755 "$archive_stage/bin/attention_server"
 auth_generation=0
 if [[ "$mode" == auth-start-failure ]]; then auth_generation=1; fi
-printf 'version=0.2.21\nrelay_store_format=31\nauth_generation=%s\nsource_commit=0123456789abcdef0123456789abcdef01234567\nsource_status=\n' \
+printf 'version=0.2.21\nrelay_store_format=32\nauth_generation=%s\nsource_commit=0123456789abcdef0123456789abcdef01234567\nsource_status=\n' \
   "$auth_generation" > "$archive_stage/BUILD_INFO"
 printf 'Harklight Server release guide\n' > "$archive_stage/SELF_HOST.md"
 cp "$archive_stage/SELF_HOST.md" "$guide"
@@ -146,7 +146,7 @@ case "$action" in
     case "$current" in
       */releases/v0.2.21)
         # Conversion must have completed before the service starts.
-        grep -qx 'format=31' "$HARKLIGHT_TEST_MIGRATION_LOG"
+        grep -qx 'format=32' "$HARKLIGHT_TEST_MIGRATION_LOG"
         if [[ "$HARKLIGHT_TEST_MODE" == interrupted-switch && ! -f "$HARKLIGHT_TEST_INTERRUPTED" ]]; then
           touch "$HARKLIGHT_TEST_INTERRUPTED"
           kill -KILL "$PPID"
@@ -306,7 +306,7 @@ REPAIR_HARKLIGHT
 elif [[ "$mode" != optional-route ]]; then
   [[ "$status" == 1 ]] || { printf 'expected installer exit 1, got %s\n%s\n' "$status" "$output" >&2; exit 1; }
   if [[ "$mode" == conversion-failure ]]; then
-    expected_failure='upgrade failed: stopped-store FORMAT31 conversion failed'
+    expected_failure='upgrade failed: stopped-store row conversion failed'
     ! grep -Fqx 'start:v0.2.21' "$HARKLIGHT_TEST_ACTIONS"
   else
     expected_failure='upgrade failed: candidate process did not become active under the selected package within 30 seconds'
@@ -337,7 +337,7 @@ elif [[ "$mode" != optional-route ]]; then
   tar -tf "${backups[0]}/private-root.tar" | grep -Fqx './state/relay.sqlite3'
   backup_store_sha="$(tar -xOf "${backups[0]}/private-root.tar" ./state/relay.sqlite3 | sha256sum | cut -d ' ' -f 1)"
   [[ "$backup_store_sha" == "$expected_store_sha" ]]
-  grep -Fqx 'format=31' "$HARKLIGHT_TEST_MIGRATION_LOG"
+  grep -Fqx 'format=32' "$HARKLIGHT_TEST_MIGRATION_LOG"
   grep -Fqx 'start:v0.2.20' "$HARKLIGHT_TEST_ACTIONS"
   grep -Fq "|$home|$runner_temp" "$HARKLIGHT_TEST_LOG"
 
@@ -353,7 +353,7 @@ else
   [[ "$("$real_readlink" -f -- "$root/current")" == "$root/releases/v0.2.21" ]]
   [[ "$(< "$scratch/service-state")" == active ]]
   [[ ! -e "$root/backups/.pending-conversion" ]]
-  grep -Fqx 'format=31' "$HARKLIGHT_TEST_MIGRATION_LOG"
+  grep -Fqx 'format=32' "$HARKLIGHT_TEST_MIGRATION_LOG"
   migrated_store_sha="$(sha256sum "$root/state/relay.sqlite3" | cut -d ' ' -f 1)"
   [[ "$migrated_store_sha" != "$expected_store_sha" ]]
   [[ -f "$root/state/candidate-write.txt" ]]

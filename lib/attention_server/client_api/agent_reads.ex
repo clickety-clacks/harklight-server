@@ -7,7 +7,7 @@ defmodule AttentionServer.ClientAPI.AgentReads do
 
   alias AttentionServer.{AgentChangeLog, Engine, Message, RouteBIndex}
   alias AttentionServer.AgentAPI.RecipientReach
-  alias AttentionServer.ClientAPI.{AgentResources, Context, Projection, Reads}
+  alias AttentionServer.ClientAPI.{AgentResources, Context, Projection, Reads, SharedReads}
 
   @page_size 50
   @filters ~w(session sender legacy_message_id)
@@ -28,16 +28,22 @@ defmodule AttentionServer.ClientAPI.AgentReads do
   end
 
   def message(conn, ctx) do
-    Reads.respond(conn, call(ctx, {:message, ctx.params.item_id}), &Reads.etag(&1["message"]))
+    SharedReads.respond(conn, ctx, :sender, :summary, fn ->
+      Reads.respond(conn, call(ctx, {:message, ctx.params.item_id}), &Reads.etag(&1["message"]))
+    end)
   end
 
   def entries(conn, ctx) do
     conn = fetch_query_params(conn)
-    Reads.respond(conn, call(ctx, {:entries, ctx.params.item_id, conn.query_params}))
+    SharedReads.respond(conn, ctx, :sender, {:entries, conn.query_params}, fn ->
+      Reads.respond(conn, call(ctx, {:entries, ctx.params.item_id, conn.query_params}))
+    end)
   end
 
   def revision(conn, ctx) do
-    Reads.respond(conn, call(ctx, {:revision, ctx.params.item_id, ctx.params.n}))
+    SharedReads.respond(conn, ctx, :sender, {:revision, ctx.params.n}, fn ->
+      Reads.respond(conn, call(ctx, {:revision, ctx.params.item_id, ctx.params.n}))
+    end)
   end
 
   defp call(%Context{principal: %{kind: :device} = principal, relay: relay}, request) do

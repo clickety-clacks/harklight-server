@@ -25,7 +25,9 @@ defmodule AttentionServer.Engine do
     LargeData,
     Message,
     RouteBIndex,
-    SenderNames
+    SenderNames,
+    SharedMessages,
+    SharedPush
   }
 
   alias AttentionServer.ClientAPI.Resources
@@ -41,6 +43,7 @@ defmodule AttentionServer.Engine do
             relay_instance_id: nil,
             agent_cursor_key: nil,
             persons: %{},
+            people_profiles: %{},
             owners: %{},
             retired_owner_keys: MapSet.new(),
             pending_enrollments: %{},
@@ -54,6 +57,13 @@ defmodule AttentionServer.Engine do
             agents: %{},
             sender_grants: %{},
             messages: %{},
+            groups: %{},
+            hosted_group_refs: %{},
+            shared_messages: %{},
+            shared_recipients: %{},
+            shared_entries: %{},
+            shared_seen: %{},
+            shared_answers: %{},
             open_default_index: %{},
             events: %{},
             free_order_highs: %{},
@@ -75,6 +85,8 @@ defmodule AttentionServer.Engine do
             subscriptions: %{},
             cursors: %{},
             hosted_accounts: %{},
+            hosted_organizations: %{},
+            local_organizations: %{},
             delivery_states: %{},
             algorithm_choices: %{},
             alert_choices: %{},
@@ -119,7 +131,7 @@ defmodule AttentionServer.Engine do
       next.push_bindings
       |> Enum.filter(fn {{person, _device}, binding} ->
         not delivery_stopped?(next, person) and binding.active and
-          (binding.pending_high > 0 or binding.pending_conversation_high > 0) and
+          push_pending?(binding) and
           binding.state in ["queued", "waiting_retry"] and
           is_integer(binding.next_at) and binding.next_at <= now_ms
       end)
@@ -134,7 +146,12 @@ defmodule AttentionServer.Engine do
 
       {{person, device} = key, binding} ->
         claim_id = uuid_v4()
-        stream = if binding.pending_high > 0, do: :request, else: :conversation
+        stream =
+          cond do
+            binding.pending_high > 0 -> :request
+            binding.pending_conversation_high > 0 -> :conversation
+            true -> :shared
+          end
 
         gathered =
           if stream == :request,
@@ -167,6 +184,8 @@ defmodule AttentionServer.Engine do
 
             {_, _, :conversation} ->
               get_in(next.conversation_events, [{person, conversation_high}, :key])
+
+            {_, _, :shared} -> nil
           end
 
         claim = %{
@@ -181,13 +200,14 @@ defmodule AttentionServer.Engine do
           conversation_high: conversation_high,
           stream: stream,
           remainder_due:
-            if(stream == :request,
-              do: binding.pending_conversation_high > 0,
-              else: binding.pending_high > 0
-            ),
+            case stream do
+              :request -> binding.pending_conversation_high > 0 or SharedPush.pending?(binding)
+              :conversation -> SharedPush.pending?(binding)
+              :shared -> false
+            end,
           presentation: presentation,
           locator: push_locator(next, item_key, person, device, binding.binding_id, chat),
-          badge: inbox_badge(next, person),
+          badge: binding_badge(next, person, binding),
           registered_at: binding.registered_at,
           claim_id: claim_id
         }
@@ -242,6 +262,16 @@ defmodule AttentionServer.Engine do
               claim
           end
 
+        claim =
+          if Map.get(binding, :shared_messages, false),
+            do: Map.put(claim, :revalidate_shared?, true),
+            else: claim
+
+        claim =
+          if stream == :shared,
+            do: shared_push_claim(next, binding, Map.put(claim, :shared_work, SharedPush.pending(binding))),
+            else: claim
+
         claimed = %{
           binding
           | state: "sending",
@@ -254,7 +284,63 @@ defmodule AttentionServer.Engine do
             next_at: nil
         }
 
+        claimed = if stream == :shared, do: Map.put(claimed, :claim_shared, true), else: claimed
         {:ok, put_row(next, :push_bindings, key, claimed), claim}
+    end
+  end
+
+  def push_pending?(binding) do
+    binding.pending_high > 0 or binding.pending_conversation_high > 0 or SharedPush.pending?(binding)
+  end
+
+  def refresh_push_claim(engine, claim, shared?, groups?) do
+    case engine.push_bindings[{claim.person, claim.device}] do
+      %{active: true, revision: revision, binding_id: id, claim_id: claim_id} = binding
+      when revision == claim.revision and id == claim.binding_id and claim_id == claim.claim_id ->
+        binding = if shared?, do: binding, else: Map.delete(binding, :shared_messages)
+        binding = if groups?, do: binding, else: Map.delete(binding, :groups)
+
+        cond do
+          delivery_stopped?(engine, claim.person) -> :skip
+          claim.stream == :shared and not Map.get(binding, :shared_messages, false) -> :skip
+          claim.stream == :shared ->
+            work =
+              Map.filter(claim.shared_work, fn {room, value} ->
+                SharedPush.pending(binding)[room] == value and
+                  SharedPush.deliverable_work?(engine, claim.person, binding, room, value)
+              end)
+            if work == %{}, do: :skip, else: {:ok, shared_push_claim(engine, binding, %{claim | shared_work: work})}
+
+          true ->
+            {:ok, %{claim | badge: binding_badge(engine, claim.person, binding)}}
+        end
+
+      _ ->
+        :skip
+    end
+  end
+
+  defp shared_push_claim(engine, binding, claim) do
+    base =
+      claim
+      |> Map.drop([:alert, :expanded, :preserve_alert_title])
+      |> Map.merge(%{presentation: :background, locator: nil, badge: binding_badge(engine, claim.person, binding)})
+
+    case SharedPush.target(engine, claim.person, binding, claim.shared_work) do
+      nil ->
+        base
+
+      target ->
+        locator = %{
+          "v" => 2, "binding_id" => binding.binding_id, "person_id" => claim.person,
+          "device_id" => claim.device, "item_id" => target.item_id
+        }
+        locator = if target.chat?, do: Map.put(locator, "target", "chat"), else: locator
+        text = if is_binary(target.text), do: target.text, else: LargeData.preview(target.text, 161)
+        {preview, truncated?} = push_preview(text || "")
+        alert = %{"title" => target.title, "body" => preview, "body_truncated" => truncated?}
+        Map.merge(base, %{presentation: :alert, locator: locator, alert: alert,
+                          expanded: :single, preserve_alert_title: true})
     end
   end
 
@@ -289,6 +375,13 @@ defmodule AttentionServer.Engine do
         "address_kind" => "apns_token",
         "address_sha256" => Base.encode16(:crypto.hash(:sha256, address), case: :lower)
       }
+
+      semantic =
+        cond do
+          frame[:groups] == true -> Map.put(semantic, "features", ["groups", "shared_messages"])
+          frame[:shared_messages] == true -> Map.put(semantic, "features", ["shared_messages"])
+          true -> semantic
+        end
 
       case receipt(engine, person, device, frame["op_id"], semantic) do
         {:duplicate, reply} ->
@@ -368,7 +461,9 @@ defmodule AttentionServer.Engine do
                old.profile_id == frame["profile_id"] do
             # Same authorized endpoint: a registration refresh is not a read
             # or provider acceptance, and must not discard either stream.
-            pending? = old.pending_high > 0 or old.pending_conversation_high > 0
+            pending? = old.pending_high > 0 or old.pending_conversation_high > 0 or
+              (frame[:shared_messages] == true and
+                 SharedPush.pending_for_scope?(engine, old, frame[:groups] == true))
 
             old
             |> clear_push_claim()
@@ -380,6 +475,20 @@ defmodule AttentionServer.Engine do
             })
           else
             binding
+          end
+
+        binding =
+          if frame[:shared_messages] == true,
+            do: Map.put(binding, :shared_messages, true),
+            else: Map.drop(binding, [:shared_messages, :pending_shared])
+
+        binding =
+          if frame[:groups] == true do
+            Map.put(binding, :groups, true)
+          else
+            binding
+            |> Map.delete(:groups)
+            |> SharedPush.retain_named(engine)
           end
 
         reply = %{
@@ -543,8 +652,15 @@ defmodule AttentionServer.Engine do
   end
 
   defp clear_push_claim(binding) do
-    %{binding | claim_id: nil, claim_high: nil, claim_conversation_high: nil, claim_at: nil}
+    binding = %{binding | claim_id: nil, claim_high: nil, claim_conversation_high: nil, claim_at: nil}
+    Map.delete(binding, :claim_shared)
   end
+
+  defp finish_push_binding(binding, %{stream: :shared} = claim, %{state: "suppressed"}, now_ms),
+    do: complete_push(binding, claim, now_ms)
+
+  defp finish_push_binding(binding, _claim, %{state: "suppressed"}, now_ms),
+    do: clear_push_claim(%{binding | state: "waiting_retry", next_at: now_ms})
 
   defp finish_push_binding(binding, claim, outcome, now_ms) do
     state = Map.get(outcome, :state)
@@ -563,55 +679,13 @@ defmodule AttentionServer.Engine do
 
     case state do
       "provider_accepted" ->
-        request? = claim.stream == :request
-
-        base = %{
-          base
-          | accepted_high:
-              if(request?,
-                do: max(binding.accepted_high, claim.high),
-                else: binding.accepted_high
-              ),
-            accepted_conversation_high:
-              if(request?,
-                do: binding.accepted_conversation_high,
-                else: max(binding.accepted_conversation_high, claim.conversation_high)
-              ),
-            pending_high:
-              if(request? and binding.pending_high <= claim.high,
-                do: 0,
-                else: binding.pending_high
-              ),
-            pending_conversation_high:
-              if(not request? and binding.pending_conversation_high <= claim.conversation_high,
-                do: 0,
-                else: binding.pending_conversation_high
-              )
-        }
-
-        if base.pending_high == 0 and base.pending_conversation_high == 0 do
-          clear_push_claim(%{
-            base
-            | state: "ready",
-              deadline_at: nil,
-              next_at: nil
-          })
-        else
-          clear_push_claim(%{
-            base
-            | state: "queued",
-              next_at:
-                if(claim.remainder_due,
-                  do: now_ms,
-                  else: binding.next_at || now_ms + @push_window_ms
-                )
-          })
-        end
+        complete_push(base, claim, now_ms)
 
       "endpoint_invalid" ->
         invalidated_at = Map.get(outcome, :invalidated_at_ms)
 
         if is_integer(invalidated_at) and invalidated_at >= binding.registered_at do
+          base = Map.delete(base, :pending_shared)
           clear_push_claim(%{
             base
             | active: false,
@@ -627,6 +701,7 @@ defmodule AttentionServer.Engine do
         end
 
       "expired" ->
+        base = Map.delete(base, :pending_shared)
         clear_push_claim(%{
           base
           | state: "expired",
@@ -641,6 +716,28 @@ defmodule AttentionServer.Engine do
 
       _ ->
         blocked_push(base, now_ms)
+    end
+  end
+
+  defp complete_push(binding, claim, now_ms) do
+    binding =
+      case claim.stream do
+        :shared -> SharedPush.accepted(binding, claim)
+        :request ->
+          %{binding | accepted_high: max(binding.accepted_high, claim.high),
+                      pending_high: if(binding.pending_high <= claim.high, do: 0, else: binding.pending_high)}
+        :conversation ->
+          %{binding | accepted_conversation_high: max(binding.accepted_conversation_high, claim.conversation_high),
+                      pending_conversation_high:
+                        if(binding.pending_conversation_high <= claim.conversation_high,
+                           do: 0, else: binding.pending_conversation_high)}
+      end
+
+    if push_pending?(binding) do
+      next = if claim.remainder_due, do: now_ms, else: binding.next_at || now_ms + @push_window_ms
+      clear_push_claim(%{binding | state: "queued", next_at: next})
+    else
+      clear_push_claim(%{binding | state: "ready", deadline_at: nil, next_at: nil})
     end
   end
 
@@ -733,6 +830,104 @@ defmodule AttentionServer.Engine do
         end
     end
   end
+
+  @doc false
+  def set_local_organization_member(%__MODULE__{} = engine, person, member?)
+      when is_boolean(member?) do
+    if Map.has_key?(engine.owners, person) and is_nil(hosted_account(engine, person)) do
+      members =
+        Map.get_lazy(engine.local_organizations, :default, fn -> local_organization_defaults(engine) end)
+
+      next_members = if member?, do: MapSet.put(members, person), else: MapSet.delete(members, person)
+      departing = MapSet.difference(members, next_members)
+
+      {:ok,
+       engine
+       |> freeze_shared_departures(engine.relay_instance_id, departing)
+       |> put_row(:local_organizations, :default, next_members)}
+    else
+      {:error, :unknown_local_person}
+    end
+  end
+
+  @doc false
+  def initialize_local_organization(engine) do
+    if Map.has_key?(engine.local_organizations, :default),
+      do: engine,
+      else: put_row(engine, :local_organizations, :default, local_organization_defaults(engine))
+  end
+
+  defp local_organization_defaults(engine) do
+    hosted_people = MapSet.new(Map.values(engine.hosted_accounts), & &1.person)
+    MapSet.difference(MapSet.new(Map.keys(engine.owners)), hosted_people)
+  end
+
+  @doc false
+  def valid_local_organization?(%__MODULE__{} = engine, :default, %MapSet{} = members) do
+    hosted_people = MapSet.new(Map.values(engine.hosted_accounts), & &1.person)
+    MapSet.disjoint?(members, hosted_people) and Enum.all?(members, &Map.has_key?(engine.owners, &1))
+  end
+
+  def valid_local_organization?(_, _, _), do: false
+
+  @doc false
+  def replace_hosted_organization(%__MODULE__{} = engine, ref, people, id)
+      when is_list(people) do
+    record = %{id: get_in(engine.hosted_organizations, [ref, :id]) || id, members: MapSet.new(people)}
+
+    cond do
+      not hosted_account_ref?(ref) -> {:error, :invalid_organization}
+      not valid_hosted_organization?(engine, ref, record) -> {:error, :invalid_members}
+      true ->
+        previous = get_in(engine.hosted_organizations, [ref, :members]) || MapSet.new()
+        departing = MapSet.difference(previous, record.members)
+        {:ok,
+         engine
+         |> freeze_shared_departures(record.id, departing)
+         |> put_row(:hosted_organizations, ref, record)}
+    end
+  end
+
+  def replace_hosted_organization(%__MODULE__{}, _ref, _people, _id),
+    do: {:error, :invalid_members}
+
+  @doc false
+  def delete_hosted_organization(%__MODULE__{} = engine, ref) do
+    if hosted_account_ref?(ref) do
+      next =
+        case engine.hosted_organizations[ref] do
+          %{id: id, members: people} ->
+            engine
+            |> freeze_shared_departures(id, people)
+            |> AttentionServer.Groups.delete_hosted_business(ref)
+            |> delete_row(:hosted_organizations, ref)
+
+          nil ->
+            engine
+        end
+
+      {:ok, next}
+    else
+      {:error, :invalid_organization}
+    end
+  end
+
+  defp freeze_shared_departures(engine, organization, departing) do
+    if MapSet.size(departing) == 0,
+      do: engine,
+      else:
+        engine
+        |> AttentionServer.SharedMessages.freeze_departures(organization, departing)
+        |> AttentionServer.Groups.remove_affiliations(organization, departing)
+  end
+
+  @doc false
+  def valid_hosted_organization?(%__MODULE__{} = engine, ref, %{id: id, members: %MapSet{} = members}) do
+    hosted_people = MapSet.new(Map.values(engine.hosted_accounts), & &1.person)
+    hosted_account_ref?(ref) and Message.uuid_v4?(id) and MapSet.subset?(members, hosted_people)
+  end
+
+  def valid_hosted_organization?(_, _, _), do: false
 
   @doc "Record the readable label the hosted side supplies for a hosted person."
   def hosted_account_label(%__MODULE__{} = engine, person, label) do
@@ -5295,6 +5490,10 @@ defmodule AttentionServer.Engine do
     if is_binary(Map.get(frame, "by")), do: Map.put(base, "by", frame["by"]), else: base
   end
 
+  @doc false
+  def shared_sender_allowed?(%__MODULE__{} = engine, person, device, sender),
+    do: sender_allowed?(engine, person, device, sender)
+
   defp sender_allowed?(_engine, _person, _device, @hosted_notice_sender), do: false
 
   defp sender_allowed?(engine, person, device, sender) do
@@ -5574,6 +5773,14 @@ defmodule AttentionServer.Engine do
           nil
       end
     end)
+  end
+
+  defp binding_badge(engine, person, binding) do
+    individual = inbox_badge(engine, person)
+
+    if Map.get(binding, :shared_messages, false),
+      do: individual + SharedMessages.badge_count(engine, person, %{groups?: Map.get(binding, :groups, false)}),
+      else: individual
   end
 
   # The recipient's active Inbox count excludes settled and full-bounced items.

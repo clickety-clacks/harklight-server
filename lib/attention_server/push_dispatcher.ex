@@ -247,7 +247,7 @@ defmodule AttentionServer.PushDispatcher.Worker do
         schedule(@idle_interval, state)
 
       {:ok, claim} ->
-        {outcome, cached_token} = send_attempt(state, claim)
+        {outcome, cached_token} = deliver_claim(state, claim)
 
         case relay_call(state.operation, :push_finish, claim.claim_id, fn ->
                Relay.finish_push(state.relay, claim, outcome, System.system_time(:millisecond))
@@ -291,6 +291,16 @@ defmodule AttentionServer.PushDispatcher.Worker do
   def format_status(status) do
     Map.update!(status, :state, &Map.drop(&1, [:cached_token, :apns]))
   end
+
+  defp deliver_claim(state, %{revalidate_shared?: true} = claim) do
+    case Relay.refresh_push_claim(state.relay, claim) do
+      {:ok, current} -> send_attempt(state, current)
+      :skip -> {%{state: "suppressed"}, state.cached_token}
+      {:error, _} -> {%{state: "retry"}, state.cached_token}
+    end
+  end
+
+  defp deliver_claim(state, claim), do: send_attempt(state, claim)
 
   defp send_attempt(state, claim) do
     # The linked task owns the passive Mint connection. Stop it before handing

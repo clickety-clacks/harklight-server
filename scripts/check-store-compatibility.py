@@ -9,6 +9,18 @@ import sqlite3
 import sys
 
 
+def row_store_format(db):
+    row = db.execute("SELECT payload FROM relay_state WHERE id = 1").fetchone()
+    # The uncompressed Erlang anchor is a three-tuple whose first member is
+    # the keyed-state atom and whose second is a small integer format number.
+    atom = b"attention_relay_keyed_state"
+    for atom_header in (b"d\x00", b"v\x00", b"s", b"w"):
+        prefix = b"\x83h\x03" + atom_header + bytes([len(atom)]) + atom + b"a"
+        if row and isinstance(row[0], bytes) and row[0].startswith(prefix) and len(row[0]) > len(prefix):
+            return row[0][len(prefix)]
+    raise ValueError("The row store has invalid format metadata.")
+
+
 def package_support(build_info):
     values = {}
     for line in build_info.read_text(encoding="utf-8").splitlines():
@@ -33,12 +45,15 @@ def check(store, build_info, allow_conversion=False):
         keyed = tables & {"relay_records", "relay_record_generation"}
         if keyed == {"relay_records", "relay_record_generation"}:
             if db.execute("SELECT generation FROM relay_record_generation WHERE id = 1").fetchone() is None:
-                raise ValueError("The FORMAT31 generation row is missing.")
-            if package_format != 31:
-                raise ValueError("The selected package does not declare FORMAT31 support.")
+                raise ValueError("The row store generation is missing.")
+            store_format = row_store_format(db)
+            if store_format not in (31, 32):
+                raise ValueError("The row store format is unsupported.")
+            if package_format != store_format and not (allow_conversion and (store_format, package_format) == (31, 32)):
+                raise ValueError(f"The selected package does not declare FORMAT{store_format} support.")
         elif keyed or "relay_state" not in tables:
             raise ValueError("The store layout is incomplete or unsupported.")
-        elif not allow_conversion or package_format != 31:
+        elif not allow_conversion or package_format not in (31, 32):
             raise ValueError("The store must be converted before this package starts.")
 
         if "harklight_auth_schema" not in tables:

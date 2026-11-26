@@ -22,6 +22,11 @@ defmodule AttentionServer.BounceDecision do
     |> BouncePolicy.public_levels()
   end
 
+  def shared_selection(engine, person, message, substantive_at) do
+    message = Map.put_new(message, "message_type", "request")
+    basic_selection(engine, person, message, substantive_at)
+  end
+
   def configure_levels(%Engine{} = engine, person, levels, now_ms)
       when is_binary(person) and is_list(levels) and is_integer(now_ms) do
     case Map.get(engine.bounce_levels, person) do
@@ -143,7 +148,8 @@ defmodule AttentionServer.BounceDecision do
 
   # Progress still advances the substantive revision. Carry the person's
   # Seen flag through the existing opened marker, which bounces ignore for Progress.
-  defp progress_only?(old_message, old_files, message, files) do
+  @doc false
+  def progress_only?(old_message, old_files, message, files) do
     # The Agent refreshes created_at with progress. A timestamp edit alone
     # still clears Seen.
     progress_fields = ~w(progress created_at)

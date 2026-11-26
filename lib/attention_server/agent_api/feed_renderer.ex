@@ -1,6 +1,7 @@
 defmodule AttentionServer.AgentAPI.FeedRenderer do
   @moduledoc false
 
+  alias AttentionServer.{Engine, SharedAnswers, SharedMessages, SharedReminders}
   alias AttentionServer.AgentAPI.Advisories
   alias AttentionServer.ClientAPI.{AgentResources, Projection}
 
@@ -26,7 +27,79 @@ defmodule AttentionServer.AgentAPI.FeedRenderer do
       end)
       |> Map.new()
 
-    Enum.map(rows, fn row -> {row, render_row(state, scope, row, entries)} end)
+    Enum.map(rows, fn row ->
+      projected_row =
+        case row.kind do
+          :shared_message -> %{row | kind: :message}
+          :shared_entry -> %{row | kind: :entry}
+          :shared_seen -> %{row | kind: :seen}
+          :shared_answer -> %{row | kind: :answer}
+          :shared_advisory -> %{row | kind: :advisory}
+          _ -> row
+        end
+      {projected_row, render_row(state, scope, row, entries)}
+    end)
+  end
+
+  defp render_row(%{store: %{engine: engine}} = state, {person, origin},
+         %{resource: {:shared_advisory, {id, advisory_id}}}, _entries) do
+    with %{sender_person: ^person, sender_key: ^origin} = record <- engine.shared_messages[id],
+         true <- shared_visible?(state, record),
+         true <- Engine.shared_sender_allowed?(engine, person, origin, record.sender_id),
+         %{} = advisory <- get_in(record, [:shared_advisories, advisory_id]) do
+      {:ok, %{"item_id" => id, "advisory" => SharedReminders.wire(engine, record, advisory)}}
+    else
+      _ -> :skip
+    end
+  end
+
+  defp render_row(%{store: %{engine: engine}} = state, {person, origin},
+         %{resource: {:shared_answer, id}}, _entries) do
+    with %{shared_id: message_id} = answer <- engine.shared_answers[id],
+         %{sender_person: ^person, sender_key: ^origin} = record <- engine.shared_messages[message_id],
+         true <- shared_visible?(state, record),
+         true <- Engine.shared_sender_allowed?(engine, person, origin, record.sender_id) do
+      {:ok, SharedAnswers.event(answer)}
+    else
+      _ -> :skip
+    end
+  end
+
+  defp render_row(%{store: %{engine: engine}} = state, {person, origin},
+         %{resource: {:shared_seen, id}}, _entries) do
+    with %{shared_id: message_id} = event <- engine.shared_seen[id],
+         %{sender_person: ^person, sender_key: ^origin} = record <- engine.shared_messages[message_id],
+         true <- shared_visible?(state, record),
+         true <- Engine.shared_sender_allowed?(engine, person, origin, record.sender_id) do
+      {:ok, SharedMessages.seen_event(event)}
+    else
+      _ -> :skip
+    end
+  end
+
+  defp render_row(%{store: %{engine: engine}} = state, {person, origin},
+         %{resource: {:shared_message, id}, rev: rev}, _entries) do
+    with %{sender_person: ^person, sender_key: ^origin} = record <- engine.shared_messages[id],
+         true <- shared_visible?(state, record),
+         true <- Engine.shared_sender_allowed?(engine, person, origin, record.sender_id) do
+      {:ok, SharedMessages.sender_message(engine, record, rev)}
+    else
+      _ -> :skip
+    end
+  end
+
+  defp render_row(%{store: %{engine: engine}} = state, {person, origin},
+         %{resource: {:shared_entry, id}, rev: rev}, _entries) do
+    with %{shared_id: shared_id, position: position} = entry <- engine.shared_entries[id],
+         %{sender_person: ^person, sender_key: ^origin} = record <- engine.shared_messages[shared_id],
+         true <- shared_visible?(state, record),
+         true <- Engine.shared_sender_allowed?(engine, person, origin, record.sender_id),
+         cutoff = Map.get(record, :sender_frozen_entry_high),
+         true <- is_nil(cutoff) or position <= cutoff do
+      {:ok, SharedMessages.sender_entry(record, entry, rev)}
+    else
+      _ -> :skip
+    end
   end
 
   defp render_row(state, scope, %{resource: {:message, key}, rev: rev}, _entries) do
@@ -63,4 +136,8 @@ defmodule AttentionServer.AgentAPI.FeedRenderer do
        ) do
     Advisories.change(engine, {person, key, session}, id)
   end
+
+  defp shared_visible?(state, record),
+    do: AttentionServer.ClientAPI.SharedCapability.visible?(record, Map.get(state, :shared_projection))
+
 end

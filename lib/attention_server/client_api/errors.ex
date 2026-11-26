@@ -23,6 +23,7 @@ defmodule AttentionServer.ClientAPI.Errors do
     "unauthorized" => {401, false},
     "already_migrated" => {401, false},
     "forbidden" => {403, false},
+    "recipient_refused" => {403, false},
     "account_paused" => {403, false},
     "not_found" => {404, false},
     "stale_request" => {409, false},
@@ -31,9 +32,14 @@ defmodule AttentionServer.ClientAPI.Errors do
     "already_closed" => {409, false},
     "not_answered" => {409, false},
     "idempotency_conflict" => {409, false},
+    "organization_required" => {409, false},
+    "group_name_conflict" => {409, false},
+    "already_member" => {409, false},
     "cursor_expired" => {410, false},
     "precondition_failed" => {412, false},
     "payload_too_large" => {413, false},
+    "no_recipients" => {422, false},
+    "decider_unreachable" => {422, false},
     "internal_error" => {500, false},
     "retry_later" => {503, true},
     "storage_unavailable" => {503, true}
@@ -95,6 +101,7 @@ defmodule AttentionServer.ClientAPI.Errors do
     body =
       %{"error" => token, "retryable" => retryable, "request_id" => request_id(conn)}
       |> maybe_put("field", Keyword.get(opts, :field))
+      |> Map.merge(Map.take(Keyword.get(opts, :details, %{}), ~w(organization_ids recipients terminal)))
 
     conn =
       if status == 503 do

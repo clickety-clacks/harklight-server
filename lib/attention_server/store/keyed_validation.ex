@@ -532,8 +532,17 @@ defmodule AttentionServer.Store.KeyedValidation do
           add_upload_links(index, {:origin_feed, scope, {:entry, seq}}, entry_upload_ids(entry))
       end
 
-    Enum.reduce(engine.messages, index, fn {key, record}, index ->
-      add_upload_links(index, {:row, :messages, key}, revision_upload_ids(record))
+    index =
+      Enum.reduce(engine.messages, index, fn {key, record}, index ->
+        add_upload_links(index, {:row, :messages, key}, revision_upload_ids(record))
+      end)
+
+    [:shared_messages, :shared_entries]
+    |> Enum.reduce(index, fn field, index ->
+      Enum.reduce(Map.fetch!(engine, field), index, fn {key, record}, index ->
+        address = {:row, field, key}
+        add_upload_links(index, address, record_uploads(address, record))
+      end)
     end)
   end
 
@@ -551,6 +560,13 @@ defmodule AttentionServer.Store.KeyedValidation do
           before_ids = revision_upload_ids(Map.get(old.messages, key))
           after_ids = revision_upload_ids(Map.get(next.messages, key))
 
+          {update_upload_links(index, address, before_ids, after_ids),
+           MapSet.put(changed, address), uploads}
+
+        {:row, field, key} = address, {index, changed, uploads}
+        when field in [:shared_messages, :shared_entries] ->
+          before_ids = record_uploads(address, get_in(old, [Access.key(field), key]))
+          after_ids = record_uploads(address, get_in(next, [Access.key(field), key]))
           {update_upload_links(index, address, before_ids, after_ids),
            MapSet.put(changed, address), uploads}
 
@@ -583,6 +599,11 @@ defmodule AttentionServer.Store.KeyedValidation do
 
   def record_uploads({:origin_feed, _, {:entry, _}}, entry), do: entry_upload_ids(entry)
   def record_uploads({:row, :messages, _}, record), do: revision_upload_ids(record)
+  def record_uploads({:row, :shared_messages, _}, record),
+    do: AttentionServer.ClientAPI.SharedAttachments.upload_ids(record)
+  def record_uploads({:row, :shared_entries, _}, entry),
+    do: AttentionServer.ClientAPI.SharedAttachments.entry_upload_ids(entry)
+
   def record_uploads(_, _), do: []
 
   defp entry_upload_ids(nil), do: []

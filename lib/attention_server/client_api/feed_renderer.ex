@@ -8,7 +8,7 @@ defmodule AttentionServer.ClientAPI.FeedRenderer do
   read-position fact, or a principal that no longer authenticates, is skipped.
   """
 
-  alias AttentionServer.{AgentAccess, ChangeLog}
+  alias AttentionServer.{AgentAccess, ChangeLog, SharedMessages}
   alias AttentionServer.ClientAPI.{Projection, Reads, Resources}
 
   @doc """
@@ -46,6 +46,16 @@ defmodule AttentionServer.ClientAPI.FeedRenderer do
     end
   end
 
+  defp render_row(:item, {:shared_item, id}, %{shared?: true, engine: engine} = context, principal, rev) do
+    with %{id: ^id} = record <- Map.get(engine.shared_messages, id),
+         true <- visible_shared?(context, record),
+         %{} = recipient <- Map.get(engine.shared_recipients, {id, principal.person}) do
+      {:ok, SharedMessages.person_item(engine, principal.person, record, recipient, rev)}
+    else
+      _ -> :skip
+    end
+  end
+
   defp render_row(:item, {:item, {sender, message_id}}, context, principal, rev) do
     key = {principal.person, sender, message_id}
 
@@ -78,6 +88,18 @@ defmodule AttentionServer.ClientAPI.FeedRenderer do
     end
   end
 
+  defp render_row(:entry, {:shared_entry, id}, %{shared?: true, engine: engine} = context, principal, rev) do
+    with %{shared_id: message_id, position: position} = entry <- engine.shared_entries[id],
+         true <- visible_shared?(context, engine.shared_messages[message_id]),
+         %{} = recipient <- Map.get(engine.shared_recipients, {message_id, principal.person}),
+         cutoff = get_in(recipient, [:frozen, :entry_high]),
+         true <- is_nil(cutoff) or position <= cutoff do
+      {:ok, SharedMessages.person_entry(recipient, principal.person, entry, rev)}
+    else
+      _ -> :skip
+    end
+  end
+
   defp render_row(:entry, {:entry, seq}, context, principal, rev) do
     with %{} = entry <- Map.get(context.entries_by_fact, seq),
          true <- visible_entry?(context.engine, principal, entry),
@@ -105,6 +127,13 @@ defmodule AttentionServer.ClientAPI.FeedRenderer do
     end
   end
 
+  defp render_row(:counts, :group_counts, %{capability: %{groups?: true} = capability, engine: engine}, principal, _rev),
+    do: {:ok, SharedMessages.counts(engine, principal.person, capability)}
+
+  defp render_row(:counts, resource, %{shared?: true, engine: engine} = context, principal, _rev)
+       when resource in [:counts, :shared_counts],
+       do: {:ok, SharedMessages.counts(engine, principal.person, Map.get(context, :capability))}
+
   defp render_row(:counts, :counts, context, principal, _rev),
     do: {:ok, Resources.counts(context.engine, principal.person)}
 
@@ -117,6 +146,9 @@ defmodule AttentionServer.ClientAPI.FeedRenderer do
   end
 
   defp render_row(_kind, _resource, _context, _principal, _rev), do: :skip
+
+  defp visible_shared?(context, record),
+    do: AttentionServer.ClientAPI.SharedCapability.visible?(record, Map.get(context, :capability))
 
   defp visible_entry?(engine, %{kind: :agent} = principal, entry) do
     case Resources.item_key(engine, principal.person, entry["item_id"]) do

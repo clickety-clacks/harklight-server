@@ -18,17 +18,26 @@ defmodule AttentionServer.OperatorTool do
         Relay.operator_recover(relay, person, der)
       end)
 
+  def organization_member(store_path, person, member?) do
+    with_relay(store_path, &Relay.operator_organization_member(&1, person, member?))
+  end
+
   defp with_relay(store_path, certificate_path, action) do
     with {:ok, pem} <- File.read(certificate_path),
-         {:ok, der} <- certificate_der(pem),
-         {:ok, relay} <-
+         {:ok, der} <- certificate_der(pem) do
+      with_relay(store_path, &action.(&1, der))
+    end
+  end
+
+  defp with_relay(store_path, action) do
+    with {:ok, relay} <-
            GenServer.start(Relay, store_path: store_path, operator_startup_errors: true) do
       # Link only after the store has opened so a startup failure is returned
       # to the CLI while a running relay keeps the operator's lifecycle.
       Process.link(relay)
 
       try do
-        action.(relay, der)
+        action.(relay)
       after
         GenServer.stop(relay)
       end

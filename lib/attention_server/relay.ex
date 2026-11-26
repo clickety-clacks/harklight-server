@@ -9,6 +9,8 @@ defmodule AttentionServer.Relay do
 
   use GenServer
   require Logger
+  alias AttentionServer.SharedAnswers
+
   @default_sweep_retry_ms 1_000
   @max_timer_delay_ms 4_294_967_295
   @prioritization_debounce_ms 250
@@ -52,6 +54,10 @@ defmodule AttentionServer.Relay do
 
   def setup_device(server, person, key),
     do: GenServer.call(server, {:setup_device, person, key}, :infinity)
+
+  @doc false
+  def operator_organization_member(server, person, member?),
+    do: GenServer.call(server, {:operator_organization_member, person, member?}, :infinity)
 
   @doc "Local-operator bootstrap from a public owner certificate; no network caller uses this API."
   def operator_bootstrap(server, certificate_der) do
@@ -320,6 +326,18 @@ defmodule AttentionServer.Relay do
   owner key is held by the server and never leaves it; the hosted side gets only
   the person identifier.
   """
+  def replace_hosted_organization(server, ref, people),
+    do: GenServer.call(server, {:replace_hosted_organization, ref, people}, :infinity)
+
+  def delete_hosted_organization(server, ref),
+    do: GenServer.call(server, {:delete_hosted_organization, ref}, :infinity)
+
+  def replace_hosted_group(server, ref, name, people, version),
+    do: GenServer.call(server, {:replace_hosted_group, ref, name, people, version}, :infinity)
+
+  def delete_hosted_group(server, ref),
+    do: GenServer.call(server, {:delete_hosted_group, ref}, :infinity)
+
   def hosted_account_create(server, account_ref),
     do: GenServer.call(server, {:hosted_account_create, account_ref}, :infinity)
 
@@ -515,6 +533,10 @@ defmodule AttentionServer.Relay do
   def claim_push(server, now_ms), do: GenServer.call(server, {:claim_push, now_ms}, :infinity)
 
   @doc false
+  def refresh_push_claim(server, claim),
+    do: GenServer.call(server, {:refresh_push_claim, claim}, :infinity)
+
+  @doc false
   def enable_push(server), do: GenServer.call(server, :enable_push, :infinity)
 
   @doc false
@@ -541,12 +563,18 @@ defmodule AttentionServer.Relay do
       {:ok, store, cutoff} ->
         clock = Keyword.get(opts, :clock, fn -> System.system_time(:millisecond) end)
 
-        case startup_cleanup(store, clock.(), cutoff) do
+        initialized =
+          with {:ok, cleaned} <- startup_cleanup(store, clock.(), cutoff),
+               do: initialize_shared_affiliation(cleaned, opts)
+
+        case initialized do
           {:ok, store} ->
             state = %{
               store: store,
               hosted_jev_connection: hosted_jev_connection(opts),
               feature_flags_path: Keyword.get(opts, :feature_flags_path),
+              shared_messages: Keyword.get(opts, :shared_messages, false) == true,
+              groups: Keyword.get(opts, :groups, false) == true,
               feature_flags_warned: false,
               clock: clock,
               default_index: Engine.default_index(store.engine),
@@ -612,6 +640,22 @@ defmodule AttentionServer.Relay do
 
       {:error, reason} ->
         {:stop, reason}
+    end
+  end
+
+  defp initialize_shared_affiliation(store, opts) do
+    if store.mode == :keyed and Keyword.get(opts, :shared_messages) == true and
+         Keyword.get(opts, :deployment_mode, :self_hosted) == :self_hosted and
+         not Map.has_key?(store.engine.local_organizations, :default) do
+      next = Engine.initialize_local_organization(store.engine)
+      audit = %{person: "system", actor: "local_operator", action: "initialize_local_organization"}
+
+      case Store.commit(store, next, audit) do
+        {:ok, initialized} -> {:ok, initialized}
+        {:error, reason, _} -> {:error, reason}
+      end
+    else
+      {:ok, store}
     end
   end
 
@@ -929,10 +973,10 @@ defmodule AttentionServer.Relay do
           {:noreply, enqueue_socket_write(next, socket, authority, frames, completion, from)}
 
         {:reply, reply, next} ->
-          {:reply, reply, fence_socket_writes(rank_client_items(state, next))}
+          {:reply, reply, finalize_server_step(state, next)}
 
         {:noreply, next} ->
-          {:noreply, fence_socket_writes(rank_client_items(state, next))}
+          {:noreply, finalize_server_step(state, next)}
       end
     end)
   end
@@ -998,6 +1042,16 @@ defmodule AttentionServer.Relay do
           _ -> {:reply, {:error, :storage_unavailable}, state}
         end
     end
+  end
+
+  defp dispatch_call({:refresh_push_claim, claim}, _from, state) do
+    result =
+      case Engine.refresh_push_claim(state.store.engine, claim, state.shared_messages, Map.get(state, :groups, false)) do
+        {:ok, refreshed} -> put_push_revision(state.store, refreshed)
+        :skip -> :skip
+      end
+
+    {:reply, result, state}
   end
 
   defp dispatch_call({:finish_push, claim, outcome, now_ms}, _from, state)
@@ -1405,6 +1459,34 @@ defmodule AttentionServer.Relay do
       {:error, reason} -> {:reply, {:error, reason}, state}
     end
   end
+
+  defp dispatch_call({:replace_hosted_organization, ref, people}, _from, state) do
+    result = Engine.replace_hosted_organization(state.store.engine, ref, people, random_uuid_v4())
+    commit_hosted_organization(state, result, "hosted_organization_replace")
+  end
+
+  defp dispatch_call({:delete_hosted_organization, ref}, _from, state) do
+    result = Engine.delete_hosted_organization(state.store.engine, ref)
+    commit_hosted_organization(state, result, "hosted_organization_delete")
+  end
+
+  defp dispatch_call({:replace_hosted_group, ref, name, people, version}, _from,
+         %{deployment_mode: :saas, groups: true, shared_messages: true, store: %{mode: :keyed}} = state) do
+    result = AttentionServer.Groups.replace_hosted(state.store.engine, ref, random_uuid_v4(), name, people, version)
+    commit_hosted_group(state, result, "hosted_group_replace")
+  end
+
+  defp dispatch_call({:replace_hosted_group, _, _, _, _}, _from, state),
+    do: {:reply, {:error, :not_found}, state}
+
+  defp dispatch_call({:delete_hosted_group, ref}, _from,
+         %{deployment_mode: :saas, groups: true, shared_messages: true, store: %{mode: :keyed}} = state) do
+    result = AttentionServer.Groups.delete_hosted(state.store.engine, ref)
+    commit_hosted_organization(state, result, "hosted_group_delete")
+  end
+
+  defp dispatch_call({:delete_hosted_group, _}, _from, state),
+    do: {:reply, {:error, :not_found}, state}
 
   defp dispatch_call({:hosted_account_create, account_ref}, _from, state) do
     engine = state.store.engine
@@ -2182,25 +2264,35 @@ defmodule AttentionServer.Relay do
   defp dispatch_call({:operator_bootstrap, key}, _from, state) do
     person = random_uuid_v4()
 
-    case Engine.operator_bootstrap(state.store.engine, person, key) do
-      {:ok, next_engine} ->
-        case commit(state.store, next_engine, %{
-               person: person,
-               actor: "local_operator",
-               action: "owner_bootstrap"
-             }) do
-          {:ok, store} ->
-            next_state = ensure_priority_view_if_missing(%{state | store: store}, person)
-            {:reply, {:ok, person}, next_state}
+    with {:ok, next_engine} <- Engine.operator_bootstrap(state.store.engine, person, key),
+         {:ok, next_engine} <- Engine.set_local_organization_member(next_engine, person, true) do
+      case commit(state.store, next_engine, %{
+             person: person,
+             actor: "local_operator",
+             action: "owner_bootstrap"
+           }) do
+        {:ok, store} ->
+          next_state = ensure_priority_view_if_missing(%{state | store: store}, person)
+          {:reply, {:ok, person}, next_state}
 
-          {:error, _, _} ->
-            {:reply, {:error, :storage_unavailable}, state}
-        end
-
+        {:error, _, _} ->
+          {:reply, {:error, :storage_unavailable}, state}
+      end
+    else
       {:error, reason} ->
         {:reply, {:error, reason}, state}
     end
   end
+
+  defp dispatch_call({:operator_organization_member, person, member?}, _from, state),
+    do:
+      setup(
+        state,
+        Engine.set_local_organization_member(state.store.engine, person, member?),
+        person,
+        "local_operator",
+        if(member?, do: "organization_member_add", else: "organization_member_remove")
+      )
 
   defp dispatch_call({:operator_recover, person, key}, _from, state),
     do:
@@ -2589,8 +2681,26 @@ defmodule AttentionServer.Relay do
   def handle_info(message, state) do
     with_persistence_reads(state, fn ->
       {:noreply, next} = dispatch_info(message, state)
-      {:noreply, fence_socket_writes(rank_client_items(state, next))}
+      {:noreply, finalize_server_step(state, next)}
     end)
+  end
+
+  defp finalize_server_step(before, next) do
+    old = before.store.engine
+    current = next.store.engine
+
+    next =
+      if next.shared_messages and
+           (old.shared_messages != current.shared_messages or
+              old.shared_recipients != current.shared_recipients) do
+        next
+        |> reschedule_default_sweep(Engine.default_index(current))
+        |> reschedule_bounce_sweep()
+      else
+        next
+      end
+
+    fence_socket_writes(rank_client_items(before, next))
   end
 
   defp initialize_client_ranks(state) do
@@ -2750,28 +2860,13 @@ defmodule AttentionServer.Relay do
          %{bounce_deadline_generation: generation} = state
        ) do
     state = %{state | bounce_deadline_timer: nil}
-    old_engine = state.store.engine
     now_ms = state.clock.()
-    {next_engine, changed_keys} = BounceDecision.evaluate_due_with_changes(old_engine, now_ms)
 
-    if changed_keys == [] do
-      {:noreply, reschedule_bounce_sweep(state)}
-    else
-      case persist_bounce_decision(state, old_engine, next_engine, changed_keys, "bounce_due") do
-        {:ok, next_state} ->
-          people =
-            for {person, _, _} = key <- changed_keys,
-                BounceDecision.inbox_open?(old_engine.messages[key]),
-                not BounceDecision.inbox_open?(next_engine.messages[key]),
-                uniq: true,
-                do: person
-
-          {:noreply, Enum.reduce(people, next_state, &pending_set_changed(&2, &1))}
-
-        {:error, reason} ->
-          Diagnostics.failure(:bounce_schedule, :decision_commit, reason, :unavailable)
-          {:noreply, schedule_bounce_retry(state)}
-      end
+    case sweep_shared_reminders(state, now_ms) do
+      {:ok, state} -> sweep_individual_bounces(state, now_ms)
+      {:error, reason} ->
+        Diagnostics.failure(:bounce_schedule, :decision_commit, reason, :unavailable)
+        {:noreply, schedule_bounce_retry(state)}
     end
   end
 
@@ -2791,6 +2886,8 @@ defmodule AttentionServer.Relay do
       |> Map.new()
 
     next_engine = Engine.sweep_due_defaults(old_engine, now_ms, due_index)
+    {next_engine, shared_ids} =
+      if state.shared_messages, do: SharedAnswers.apply_defaults(next_engine, now_ms, state.groups), else: {next_engine, []}
 
     if next_engine == old_engine do
       if map_size(due_index) == 0,
@@ -2800,7 +2897,8 @@ defmodule AttentionServer.Relay do
       case commit(state.store, next_engine, %{
              person: "system",
              actor: "default_answer",
-             action: "default_answer_sweep"
+             action: "default_answer_sweep",
+             shared_default_answers: shared_ids
            }) do
         {:ok, store} ->
           next_state = %{state | store: store}
@@ -4556,7 +4654,10 @@ defmodule AttentionServer.Relay do
         default_timer_generation: generation
     }
 
-    case Enum.min(index |> Map.values(), &<=/2, fn -> nil end) do
+    legacy = Enum.min(Map.values(index), fn -> nil end)
+    shared = if state.shared_messages, do: SharedAnswers.next_default(state.store.engine, state.groups)
+
+    case Enum.min(Enum.reject([legacy, shared], &is_nil/1), fn -> nil end) do
       at when is_integer(at) ->
         delay = min(max(at - state.clock.(), 0), @max_timer_delay_ms)
         timer = Process.send_after(self(), {:default_sweep, generation}, delay)
@@ -4573,6 +4674,64 @@ defmodule AttentionServer.Relay do
     %{state | default_timer: timer, default_timer_generation: generation}
   end
 
+  defp sweep_shared_reminders(%{shared_messages: false} = state, _now_ms), do: {:ok, state}
+
+  defp sweep_shared_reminders(state, now_ms) do
+    {next, notices, changed} = AttentionServer.SharedReminders.evaluate_due(state.store.engine, now_ms, state.groups)
+
+    if changed == [] do
+      {:ok, state}
+    else
+      audit = %{person: "system", actor: "shared_reminders", action: "shared_reminder_due",
+                shared_reminders: notices, shared_reminder_recipients: changed}
+      with {:ok, next} <- stamp_shared_reminders(state.store, next, notices),
+           {:ok, store} <- commit(state.store, next, audit) do
+        {:ok, %{state | store: store}}
+      else
+        {:error, reason, _} -> {:error, reason}
+        {:error, _} = error -> error
+      end
+    end
+  end
+
+  defp stamp_shared_reminders(store, engine, notices) do
+    Enum.reduce_while(notices, {:ok, engine}, fn {id, advisory}, {:ok, current} ->
+      record = current.shared_messages[id]
+
+      case AttentionServer.AgentChangeLog.head(store, {record.sender_person, record.sender_key}) do
+        {:ok, rev} ->
+          record = put_in(record[:shared_advisories][advisory]["decided_at_rev"], rev)
+          {:cont, {:ok, Engine.put_row(current, :shared_messages, id, record)}}
+        error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp sweep_individual_bounces(state, now_ms) do
+    old_engine = state.store.engine
+    {next_engine, changed_keys} = BounceDecision.evaluate_due_with_changes(old_engine, now_ms)
+
+    if changed_keys == [] do
+      {:noreply, reschedule_bounce_sweep(state)}
+    else
+      case persist_bounce_decision(state, old_engine, next_engine, changed_keys, "bounce_due") do
+        {:ok, next_state} ->
+          people =
+            for {person, _, _} = key <- changed_keys,
+                BounceDecision.inbox_open?(old_engine.messages[key]),
+                not BounceDecision.inbox_open?(next_engine.messages[key]),
+                uniq: true,
+                do: person
+
+          {:noreply, Enum.reduce(people, next_state, &pending_set_changed(&2, &1))}
+
+        {:error, reason} ->
+          Diagnostics.failure(:bounce_schedule, :decision_commit, reason, :unavailable)
+          {:noreply, schedule_bounce_retry(state)}
+      end
+    end
+  end
+
   defp reschedule_bounce_sweep(state) do
     if is_reference(state.bounce_deadline_timer),
       do: Process.cancel_timer(state.bounce_deadline_timer)
@@ -4585,7 +4744,11 @@ defmodule AttentionServer.Relay do
         bounce_deadline_generation: generation
     }
 
-    case BounceDecision.next_deadline(state.store.engine) do
+    engine = state.store.engine
+    legacy = BounceDecision.next_deadline(engine)
+    shared = if state.shared_messages, do: AttentionServer.SharedReminders.next_deadline(engine, state.groups)
+
+    case Enum.min(Enum.reject([legacy, shared], &is_nil/1), fn -> nil end) do
       due_at when is_integer(due_at) ->
         delay = min(max(due_at - state.clock.(), 0), @max_timer_delay_ms)
         timer = Process.send_after(self(), {:bounce_due, generation}, delay)
@@ -4607,6 +4770,7 @@ defmodule AttentionServer.Relay do
   end
 
   defp put_push_revision(_store, nil), do: {:ok, nil}
+  defp put_push_revision(_store, %{locator: nil, stream: :shared} = claim), do: {:ok, claim}
 
   defp put_push_revision(store, %{person: person, locator: locator} = claim)
        when is_map(locator) do
@@ -4620,6 +4784,28 @@ defmodule AttentionServer.Relay do
   end
 
   defp put_push_revision(_store, _claim), do: {:error, :storage_unavailable}
+
+  defp commit_hosted_group(state, {:ok, next, result}, action) do
+    case commit_hosted_organization(state, {:ok, next}, action) do
+      {:reply, :ok, updated} -> {:reply, {:ok, result}, updated}
+      error -> error
+    end
+  end
+
+  defp commit_hosted_group(state, {:error, reason}, _action),
+    do: {:reply, {:error, reason}, state}
+
+  defp commit_hosted_organization(state, {:ok, next}, action) do
+    audit = %{person: "system", actor: "hosted_component", action: action}
+
+    case commit(state.store, next, audit) do
+      {:ok, store} -> {:reply, :ok, %{state | store: store}}
+      _ -> {:reply, {:error, :storage_unavailable}, state}
+    end
+  end
+
+  defp commit_hosted_organization(state, {:error, reason}, _action),
+    do: {:reply, {:error, reason}, state}
 
   defp local_passkey_operation(state, :assertion_options, request) do
     transaction = Map.get(request, "transaction")
@@ -5415,6 +5601,9 @@ defmodule AttentionServer.Relay do
     end
   end
 
+  @doc false
+  def refresh_shared_upload_index(state), do: %{state | upload_index: build_upload_index(state.store.engine)}
+
   defp build_upload_index(engine) do
     empty = %{
       references_by_person: %{},
@@ -5435,6 +5624,21 @@ defmodule AttentionServer.Relay do
           end)
 
         add_upload_references(index, person, ids)
+      end)
+
+    references =
+      Enum.reduce(engine.shared_messages, references, fn {_id, record}, index ->
+        ids = AttentionServer.ClientAPI.SharedAttachments.upload_ids(record)
+        add_upload_references(index, record.sender_person, ids)
+      end)
+
+    references =
+      Enum.reduce(engine.shared_entries, references, fn {_id, entry}, index ->
+        ids = AttentionServer.ClientAPI.SharedAttachments.entry_upload_ids(entry)
+        Enum.reduce(ids, index, fn id, acc ->
+          upload = Map.fetch!(engine.uploads, id)
+          add_upload_references(acc, upload.person, MapSet.new([id]))
+        end)
       end)
 
     Enum.reduce(engine.uploads, references, fn {_id, upload}, index ->

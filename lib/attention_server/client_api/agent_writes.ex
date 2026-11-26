@@ -5,7 +5,7 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
 
   import Plug.Conn, only: [get_req_header: 2, read_body: 1]
 
-  alias AttentionServer.{AgentChangeLog, ConversationFiles, Engine, JSON, Message, Relay}
+  alias AttentionServer.{AgentChangeLog, ConversationFiles, Engine, Groups, JSON, Message, Relay, SharedMessages}
 
   alias AttentionServer.AgentAPI.{Advisories, RecipientReach}
 
@@ -13,9 +13,13 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
     AgentResources,
     AgentShow,
     Errors,
+    GroupRoutes,
     Idempotency,
     Projection,
     Resources,
+    SharedAttachments,
+    SharedCapability,
+    SharedChat,
     Uploads,
     Writes
   }
@@ -25,10 +29,12 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
     send: ~w(sender session message file_ids supersedes),
     revise: ~w(message file_ids in_reply_to),
     retract: ~w(in_reply_to),
+    chat_close: [],
     lifecycle: ~w(action),
     reply: ~w(text file_ids in_reply_to),
     result: ~w(status),
     answer_receipt: ~w(outcome reason agent rerouted),
+    shared_answer_receipt: ~w(outcome reason agent rerouted),
     chat_receipt: ~w(outcome reason agent rerouted),
     file_use: ~w(file_id transfer use reason),
     advisory_ack: ~w(advisory_id),
@@ -42,9 +48,11 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
       {"PUT", ["agent", "messages", :item_id], :revise},
       {"POST", ["agent", "messages", :item_id, "retract"], :retract, granted_agent: true},
       {"POST", ["agent", "messages", :item_id, "lifecycle"], :lifecycle},
+      {"POST", ["agent", "messages", :item_id, "chat", "close"], :chat_close},
       {"POST", ["agent", "messages", :item_id, "replies"], :reply},
       {"POST", ["agent", "messages", :item_id, "result"], :result},
       {"POST", ["agent", "messages", :item_id, "receipt"], :answer_receipt},
+      {"POST", ["agent", "messages", :item_id, "answers", :answer_id, "receipt"], :shared_answer_receipt},
       {"POST", ["agent", "messages", :item_id, "entries", :entry_id, "receipt"], :chat_receipt},
       {"POST", ["agent", "sessions", :session, "end"], :session_end},
       {"POST", ["agent", "messages", :item_id, "entries", :entry_id, "file-use"], :file_use},
@@ -56,9 +64,11 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
   def revise(conn, ctx), do: request(conn, ctx, :revise)
   def retract(conn, ctx), do: request(conn, ctx, :retract)
   def lifecycle(conn, ctx), do: request(conn, ctx, :lifecycle)
+  def chat_close(conn, ctx), do: request(conn, ctx, :chat_close)
   def reply(conn, ctx), do: request(conn, ctx, :reply)
   def result(conn, ctx), do: request(conn, ctx, :result)
   def answer_receipt(conn, ctx), do: request(conn, ctx, :answer_receipt)
+  def shared_answer_receipt(conn, ctx), do: request(conn, ctx, :shared_answer_receipt)
   def chat_receipt(conn, ctx), do: request(conn, ctx, :chat_receipt)
   def session_end(conn, ctx), do: request(conn, ctx, :session_end)
   def file_use(conn, ctx), do: request(conn, ctx, :file_use)
@@ -67,19 +77,68 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
   defp request(conn, ctx, operation) do
     with :ok <- write_principal(ctx.principal, operation),
          {:ok, key} <- request_key(conn),
-         {:ok, body, conn} <- json_body(conn, []),
-         :ok <- Writes.only_members(body, Map.fetch!(@members, operation)) do
+         {:ok, body, conn} <- json_body(conn, []) do
+      dispatch_write(conn, ctx, operation, key, body)
+    else
+      {:error, token, field, response} -> Errors.send_error(response, token, field: field)
+      {:error, token, field} -> Errors.send_error(conn, token, field: field)
+    end
+  end
+
+  defp dispatch_write(conn, ctx, :send, key, %{"recipients" => selector} = body) do
+    group? = match?(%{"kind" => "group"}, selector)
+
+    case SharedCapability.parse(conn) do
+      {:ok, %{groups?: false}} when group? ->
+        Errors.send_error(conn, "not_found")
+
+      {:ok, %{shared?: true} = capability} ->
+        digest = write_digest(conn, get_req_header(conn, "if-match"), body)
+
+        case send_with_files(ctx, key, digest, body, capability) do
+          {:shared_error, token, details} -> Errors.send_error(conn, token, details: details)
+          result -> Writes.respond(conn, replay_success(ctx, :send, result))
+        end
+
+      {:ok, _} ->
+        Errors.send_error(conn, "unsupported")
+
+      {:error, token, field} ->
+        Errors.send_error(conn, token, field: field)
+    end
+  end
+
+  defp dispatch_write(conn, %{params: %{item_id: "shared_" <> _}} = ctx, operation, key, body)
+       when operation in [:reply, :chat_receipt, :shared_answer_receipt, :advisory_ack],
+       do: SharedChat.respond(conn, ctx, :sender, operation, body, key)
+
+  defp dispatch_write(conn, %{params: %{item_id: "shared_" <> _ = id}} = ctx,
+         operation, key, body) when operation in [:revise, :retract, :chat_close, :lifecycle] do
+    case SharedCapability.parse(conn) do
+      {:ok, %{shared?: true} = capability} ->
+        match = get_req_header(conn, "if-match")
+        digest = write_digest(conn, match, body)
+        request = {:shared_mutation, ctx.principal, key, digest, id, operation, match, body, capability}
+        Writes.respond(conn, replay_success(ctx, operation, mutate_with_files(ctx, request)))
+
+      {:ok, _} ->
+        Errors.send_error(conn, "not_found")
+
+      {:error, token, field} ->
+        Errors.send_error(conn, token, field: field)
+    end
+  end
+
+  defp dispatch_write(conn, _ctx, operation, _key, _body)
+       when operation in [:chat_close, :shared_answer_receipt],
+    do: Errors.send_error(conn, "not_found")
+
+  defp dispatch_write(conn, ctx, operation, key, body) do
+    with :ok <- Writes.only_members(body, Map.fetch!(@members, operation)) do
       precondition = get_req_header(conn, "if-match")
-      target = ctx.params
-
-      digest =
-        Idempotency.digest(conn.method, conn.path_info, %{
-          "body" => body,
-          "if_match" => precondition
-        })
-
+      digest = write_digest(conn, precondition, body)
       op_id = key || ConversationFiles.new_upload_id()
-      input = {ctx.principal, operation, target, key, digest, precondition, body}
+      input = {ctx.principal, operation, ctx.params, key, digest, precondition, body}
 
       result =
         case prepare_uploads(ctx, input, op_id) do
@@ -89,9 +148,43 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
 
       Writes.respond(conn, replay_success(ctx, operation, result))
     else
-      {:error, token, field, response} -> Errors.send_error(response, token, field: field)
       {:error, token, field} -> Errors.send_error(conn, token, field: field)
     end
+  end
+
+  defp mutate_with_files(ctx, {:shared_mutation, _, _, _, _, :revise, _, %{"file_ids" => [_ | _]}, _capability} = request) do
+    case call(ctx, {:prepare_shared_revision, request}) do
+      {:ok, dir, files} ->
+        result = SharedAttachments.stage_and_apply(dir, files, &call(ctx, Tuple.append(request, &1)))
+        if match?({:error, _}, result), do: refusal(result), else: result
+
+      reply -> reply
+    end
+  end
+
+  defp mutate_with_files(ctx, request), do: call(ctx, Tuple.append(request, []))
+
+  defp send_with_files(ctx, key, digest, %{"file_ids" => [_ | _]} = body, capability) do
+    request = {:prepare_shared_files, ctx.principal, key, digest, body, capability}
+
+    case call(ctx, request) do
+      {:ok, dir, files} ->
+        case SharedAttachments.stage_and_apply(dir, files,
+               &call(ctx, {:shared_send, ctx.principal, key, digest, body, &1, capability})) do
+          {:error, _} = error -> refusal(error)
+          result -> result
+        end
+
+      other ->
+        other
+    end
+  end
+
+  defp send_with_files(ctx, key, digest, body, capability),
+    do: call(ctx, {:shared_send, ctx.principal, key, digest, body, [], capability})
+
+  defp write_digest(conn, precondition, body) do
+    Idempotency.digest(conn.method, conn.path_info, %{"body" => body, "if_match" => precondition})
   end
 
   defp write_principal(%{kind: :agent}, :retract), do: :ok
@@ -166,6 +259,88 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
   end
 
   @doc false
+  def handle_call({:prepare_shared_files, %{person: person, key: origin}, key, digest, body, capability}, _from, state) do
+    scope = {person, origin}
+    engine = state.store.engine
+
+    result =
+      with :ok <- authorize_shared_send(state, scope, body, capability),
+           {:ok, nil} <- lookup(state, receipt_scope(scope), key),
+           {:ok, people, org, _group} <- shared_recipients(state, person, body["recipients"]),
+           {:ok, _} <- SharedMessages.select_organization(engine, person, people, org),
+           {:ok, files} <- SharedAttachments.prepare(state.store, scope, body["file_ids"],
+             shared_id(scope, key), body["sender"], key, state.clock.()) do
+        {:ok, state.store.upload_dir, files}
+      else
+        {:ok, %{digest: ^digest, status: status, body: stored}} -> {:stored, status, stored}
+        {:ok, %{}} -> refusal({:error, :idempotency_conflict})
+        error -> shared_send_refusal(error)
+      end
+
+    {:reply, result, state}
+  end
+
+  def handle_call({:shared_send, %{person: person, key: origin}, key, digest, body, staged, capability}, _from, state) do
+    scope = {person, origin}
+
+    with :ok <- authorize_shared_send(state, scope, body, capability) do
+      shared_send(state, scope, key, digest, body, staged)
+    else
+      error -> {:reply, refusal(error), state}
+    end
+  end
+
+  def handle_call({:prepare_shared_revision,
+         {:shared_mutation, %{person: person, key: origin}, key, digest, id, :revise, match, body, capability}}, _from, state) do
+    scope = {person, origin}
+
+    result =
+      with {:ok, record} <- shared_mutation_record(state, scope, id, :revise, capability),
+           {:ok, nil} <- lookup(state, receipt_scope(scope), key),
+           :ok <- files(body),
+           :ok <- if_match(match, record.revision),
+           current = MapSet.new(Map.get(record, :files, []), & &1["file_id"]),
+           new_ids = Enum.reject(body["file_ids"], &MapSet.member?(current, &1)),
+           attrs = %{message_id: id, sender: record.sender_id, revision: record.revision + 1,
+                     op_id: key || ConversationFiles.new_upload_id(), now: state.clock.(), kind: "agent"},
+           {:ok, prepared} <- SharedAttachments.prepare(state.store, scope, new_ids, attrs) do
+        {:ok, state.store.upload_dir, prepared}
+      else
+        {:ok, %{digest: ^digest, status: status, body: stored}} -> {:stored, status, stored}
+        {:ok, %{}} -> refusal({:error, :idempotency_conflict})
+        error -> refusal(error)
+      end
+
+    {:reply, result, state}
+  end
+
+  def handle_call({:shared_mutation, %{person: person, key: origin}, key, digest, id, operation, match, body, capability, staged},
+        _from, state) do
+    scope = {person, origin}
+
+    with {:ok, record} <- shared_mutation_record(state, scope, id, operation, capability) do
+      case lookup(state, receipt_scope(scope), key) do
+        {:ok, %{digest: ^digest, status: status, body: stored}} ->
+          {:reply, {:stored, status, stored}, state}
+
+        {:ok, %{}} ->
+          {:reply, refusal({:error, :idempotency_conflict}), state}
+
+        {:ok, nil} ->
+          apply_shared_mutation(state, scope, record, key, digest, operation, match, body, staged)
+
+        error ->
+          {:reply, refusal(error), state}
+      end
+    else
+      result when is_nil(result) or is_map(result) ->
+        {:reply, refusal({:error, :not_found}), state}
+
+      error ->
+        {:reply, refusal(error), state}
+    end
+  end
+
   def handle_call(
         {:execute, {%{person: person, key: agent}, operation, item_id, key, digest, match, body},
          op_id, uploads},
@@ -393,6 +568,271 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
     if length(Enum.uniq(names)) == length(names),
       do: :ok,
       else: {:error, "invalid_field", nil}
+  end
+
+  defp authorize_shared_send(state, {person, origin} = scope, body, capability) do
+    with :ok <- shared_send_gate(state, person, body["recipients"], capability),
+         :ok <- authorize(state, scope, :send),
+         :ok <- shared_send_fields(body),
+         true <- Engine.shared_sender_allowed?(state.store.engine, person, origin, body["sender"]) ||
+                   {:error, :forbidden} do
+      :ok
+    end
+  end
+
+  defp shared_send(state, scope, key, digest, body, staged) do
+    case lookup(state, receipt_scope(scope), key) do
+      {:ok, %{digest: ^digest, status: status, body: stored}} ->
+        {:reply, {:stored, status, stored}, state}
+
+      {:ok, %{}} ->
+        {:reply, refusal({:error, :idempotency_conflict}), state}
+
+      {:ok, nil} ->
+        admit_shared_send(state, scope, key, digest, body, staged)
+
+      error ->
+        {:reply, refusal(error), state}
+    end
+  end
+
+  defp admit_shared_send(state, {person, origin} = scope, key, digest, body, staged) do
+    engine = state.store.engine
+    sender = body["sender"]
+
+    with {:ok, people, org, group} <- shared_recipients(state, person, body["recipients"]),
+         {:ok, message} <- content(body),
+         :ok <- session(body),
+         {:ok, policy} <- shared_answer_policy(message, body),
+         id <- shared_id(scope, key),
+         message <- Map.merge(message, %{"sender_id" => sender, "message_id" => id}),
+         :ok <- shared_content_valid(message) do
+      files = SharedAttachments.references(staged)
+      {message, _diagnostics} = Message.admit_answer_ui(message, Enum.map(files, & &1["name"]))
+      attrs = %{
+        :id => id,
+        :sender_person => person,
+        :sender_key => origin,
+        :sender_id => sender,
+        :message => message,
+        :answer_policy => policy,
+        :files => files,
+        "created_at_ms" => state.clock.()
+      }
+      attrs = Map.merge(attrs, Map.take(body, ["session"]))
+      attrs = if group, do: Map.merge(attrs, %{group_id: group.id, group_name: group.name}), else: attrs
+      case SharedMessages.create(engine, attrs, people, org) do
+        {:ok, next, _record, outcomes} ->
+          commit_shared_send(state, next, scope, key, digest, id, send_receipt(group, outcomes), staged)
+
+        {:error, reason, _outcomes} when not is_nil(group) and reason in [:no_recipients, :decider_unreachable] ->
+          {:reply, refusal({:error, reason}), state}
+
+        error ->
+          {:reply, shared_send_refusal(error), state}
+      end
+    else
+      error -> {:reply, shared_send_refusal(error), state}
+    end
+  end
+
+  defp commit_shared_send(state, transition, {person, origin} = scope, key, digest, id, recipients, staged) do
+    audit = %{
+      person: person, actor: origin, action: "shared_message_send",
+      shared_send_receipt: {scope, key, digest, id, recipients}
+    }
+
+    case SharedAttachments.commit(state.store, transition, audit, staged) do
+      {:ok, store} ->
+        reply =
+          case Idempotency.lookup(store, receipt_scope(scope), key) do
+            {:ok, %{body: body}} -> {:ok, 200, body, false}
+            _ -> refusal({:error, :storage_unavailable})
+          end
+
+        next = %{state | store: store}
+        next = if staged == [], do: next, else: Relay.refresh_shared_upload_index(next)
+        {:reply, reply, next}
+
+      error ->
+        {:reply, refusal(error), state}
+    end
+  end
+
+  defp shared_mutation_record(state, {person, origin} = scope, id, operation, capability) do
+    engine = state.store.engine
+
+    with true <- SharedCapability.readable?(state, person, capability) || {:error, :unsupported},
+         :ok <- authorize(state, scope, operation),
+         %{sender_person: ^person, sender_key: ^origin} = record <- engine.shared_messages[id],
+         true <- SharedCapability.visible?(record, capability) || {:error, :not_found},
+         true <- Engine.shared_sender_allowed?(engine, person, origin, record.sender_id) ||
+                   {:error, :not_found} do
+      {:ok, record}
+    else
+      result when is_nil(result) or is_map(result) -> {:error, :not_found}
+      error -> error
+    end
+  end
+
+  defp apply_shared_mutation(state, {person, origin} = scope, record, key, digest, operation, match, body, staged) do
+    with {:ok, next} <- shared_mutation(state, record, operation, match, body, staged),
+         audit = %{
+           person: person, actor: origin, action: "shared_message_" <> Atom.to_string(operation),
+           shared_mutation_receipt: {scope, key, digest, record.id}
+         },
+         {:ok, store} <- SharedAttachments.commit(state.store, next, audit, staged) do
+      result =
+        with {:ok, head} <- AgentChangeLog.head(store, scope),
+             {:ok, rev} <- AgentChangeLog.rev(store, scope, {:shared_message, record.id}) do
+          body = %{"rev" => head, "message" => SharedMessages.sender_message(store.engine, store.engine.shared_messages[record.id], rev)}
+          {:ok, 200, body, false}
+        end
+
+      next = %{state | store: store}
+      next = if staged == [], do: next, else: Relay.refresh_shared_upload_index(next)
+      {:reply, result, next}
+    else
+      error -> {:reply, refusal(error), state}
+    end
+  end
+
+  defp shared_mutation(state, record, :revise, match, body, staged) do
+    with :ok <- Writes.only_members(body, ~w(message file_ids)),
+         :ok <- files(body),
+         :ok <- if_match(match, record.revision),
+         {:ok, message} <- content(body),
+         true <- (is_nil(record.answer_policy) == (message["message_type"] == "fyi")) ||
+                   {:error, "invalid_field", "message_type"},
+         message <- Map.merge(message, %{"sender_id" => record.sender_id, "message_id" => record.id}),
+         :ok <- shared_content_valid(message),
+         {:ok, files} <- revision_files(record, body, staged) do
+      {message, _diagnostics} = Message.admit_answer_ui(message, Enum.map(files, & &1["name"]))
+      SharedMessages.revise(state.store.engine, record, record.revision, message, files, state.clock.())
+    end
+  end
+
+  defp shared_mutation(state, record, :chat_close, _match, body, _staged) do
+    with :ok <- Writes.only_members(body, []),
+      do: SharedMessages.close_chat(state.store.engine, record)
+  end
+
+  defp shared_mutation(state, record, :lifecycle, _match, %{"action" => "cleared"} = body, _staged) do
+    with :ok <- Writes.only_members(body, ["action"]),
+      do: SharedMessages.clear_answers(state.store.engine, record, state.clock.())
+  end
+
+  defp shared_mutation(_state, _record, :lifecycle, _match, _body, _staged),
+    do: {:error, "unsupported", "action"}
+
+  defp shared_mutation(state, record, :retract, _match, body, _staged) do
+    with :ok <- Writes.only_members(body, []),
+      do: SharedMessages.retract(state.store.engine, record, state.clock.())
+  end
+
+  defp revision_files(record, %{"file_ids" => ids}, staged) do
+    current = Map.new(Map.get(record, :files, []), &{&1["file_id"], &1})
+    new = Map.new(Enum.zip(staged, SharedAttachments.references(staged)), fn {{meta, _}, ref} ->
+      {meta.staged_file_id, ref}
+    end)
+    available = Map.merge(current, new)
+    files = Enum.map(ids, &Map.get(available, &1))
+
+    if Enum.all?(files, &is_map/1) and distinct_upload_names(files) == :ok,
+      do: {:ok, files},
+      else: {:error, :invalid_field, "file_ids"}
+  end
+
+  defp revision_files(record, _body, _staged), do: {:ok, Map.get(record, :files, [])}
+
+  defp shared_send_fields(body) do
+    with :ok <- Writes.only_members(body, ~w(sender session message file_ids recipients answer_policy)),
+         true <- Message.sender_id?(body["sender"]) || {:error, "invalid_field", "sender"},
+         do: files(body)
+  end
+
+  defp shared_recipients(_state, _person, %{"kind" => "people", "people" => people} = selector) do
+    organization = selector["organization_id"]
+
+    with :ok <- Writes.only_members(selector, ~w(kind people organization_id)),
+         true <- is_list(people) and people != [] and Enum.all?(people, &opaque_id?/1),
+         true <- not Map.has_key?(selector, "organization_id") or opaque_id?(organization) do
+      {:ok, people, organization, nil}
+    else
+      _ -> {:error, "invalid_field", "recipients"}
+    end
+  end
+
+  defp shared_recipients(state, person, %{"kind" => "group"} = selector) do
+    with {:ok, group} <- Groups.posting_group(state.store.engine, person, state.deployment_mode, selector) do
+      {:ok, Enum.sort(Map.keys(group.members)), group.organization_id, group}
+    end
+  end
+
+  defp shared_recipients(_state, _person, _selector), do: {:error, "invalid_field", "recipients"}
+
+  defp shared_send_gate(state, person, %{"kind" => "group"}, %{groups?: true}), do: GroupRoutes.available(state, person)
+  defp shared_send_gate(_state, _person, %{"kind" => "group"}, _capability), do: {:error, :not_found}
+
+  defp shared_send_gate(%{shared_messages: true, store: %{mode: :keyed}} = state, _person, _, capability) do
+    if Map.get(capability, :groups?, false) and not state.groups, do: {:error, :unsupported}, else: :ok
+  end
+
+  defp shared_send_gate(_state, _person, _selector, _capability), do: {:error, :unsupported}
+
+  defp send_receipt(nil, outcomes), do: wire_outcomes(outcomes)
+  defp send_receipt(group, _outcomes), do: %{"kind" => "group", "group_id" => group.id}
+
+  defp opaque_id?(value), do: is_binary(value) and byte_size(value) in 1..128
+
+  defp shared_answer_policy(%{"message_type" => "fyi"}, body) do
+    if Map.has_key?(body, "answer_policy"),
+      do: {:error, "invalid_field", "answer_policy"},
+      else: {:ok, nil}
+  end
+
+  defp shared_answer_policy(_message, body) do
+    case Map.get(body, "answer_policy", %{"kind" => "first"}) do
+      %{"kind" => "first"} = policy when map_size(policy) == 1 -> {:ok, :first}
+      %{"kind" => "everyone"} = policy when map_size(policy) == 1 -> {:ok, :everyone}
+      %{"kind" => "named", "people" => people} = policy when map_size(policy) == 2 ->
+        if is_list(people) and people != [] and Enum.all?(people, &opaque_id?/1),
+          do: {:ok, {:named, Enum.uniq(people)}},
+          else: {:error, "invalid_field", "answer_policy"}
+
+      _ -> {:error, "invalid_field", "answer_policy"}
+    end
+  end
+
+  defp shared_content_valid(message) do
+    with :ok <- Message.validate(message),
+         :ok <- Message.validate_present_message_type(message),
+         :ok <- Message.validate_typed_message(message) do
+      :ok
+    else
+      {:error, field} when is_binary(field) -> {:error, "invalid_field", field}
+      {:error, _} -> {:error, "invalid_field", "message"}
+    end
+  end
+
+  defp shared_send_refusal({:error, :organization_required, ids}),
+    do: {:shared_error, "organization_required", %{"organization_ids" => ids}}
+
+  defp shared_send_refusal({:error, reason, outcomes})
+       when reason in [:no_recipients, :decider_unreachable],
+       do: {:shared_error, Atom.to_string(reason), %{"recipients" => wire_outcomes(outcomes)}}
+
+  defp shared_send_refusal({:error, :invalid_deciders}),
+    do: refusal({:error, "invalid_field", "answer_policy"})
+
+  defp shared_send_refusal(error), do: refusal(error)
+
+  defp wire_outcomes(outcomes),
+    do: Enum.map(outcomes, fn {id, status} -> %{"person_id" => id, "status" => Atom.to_string(status)} end)
+
+  defp shared_id(scope, key) do
+    hash = :crypto.hash(:sha256, :erlang.term_to_binary({scope, key}))
+    "shared_" <> Base.url_encode64(hash, padding: false)
   end
 
   defp authorize(state, scope, operation \\ :other)

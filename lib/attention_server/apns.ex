@@ -310,7 +310,7 @@ defmodule AttentionServer.APNS do
 
   @doc false
   def request_payload(claim) do
-    unless valid_locator?(Map.get(claim, :locator)),
+    unless valid_push_locator?(claim),
       do: raise(ArgumentError, "invalid push locator")
 
     payload =
@@ -441,6 +441,9 @@ defmodule AttentionServer.APNS do
       do: Map.put(aps, "interruption-level", "passive"),
       else: Map.put(aps, "sound", "default")
   end
+
+  defp sync_payload(payload, %{locator: nil} = claim),
+    do: put_badge(payload, Map.get(claim, :badge))
 
   defp sync_payload(payload, claim) do
     payload
@@ -623,6 +626,12 @@ defmodule AttentionServer.APNS do
   end
 
   defp payload_size(payload), do: byte_size(JSON.encode!(payload)) + @server_field_bytes
+
+  defp valid_push_locator?(%{stream: :shared, presentation: :background, locator: nil, badge: badge})
+       when is_integer(badge) and badge >= 0,
+       do: true
+
+  defp valid_push_locator?(claim), do: valid_locator?(Map.get(claim, :locator))
 
   defp valid_locator?(
          %{

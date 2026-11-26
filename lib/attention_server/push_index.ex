@@ -98,7 +98,7 @@ defmodule AttentionServer.PushIndex do
 
   defp queued_at(%{state: state, next_at: at} = binding)
        when state in ["queued", "waiting_retry"] and is_integer(at) do
-    if binding.pending_high > 0 or binding.pending_conversation_high > 0, do: at
+    if AttentionServer.Engine.push_pending?(binding), do: at
   end
 
   defp queued_at(_), do: nil

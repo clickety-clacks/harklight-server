@@ -1,20 +1,20 @@
-defmodule AttentionServer.Store.Format31RelayStartupTest do
+defmodule AttentionServer.Store.RowRelayStartupTest do
   use ExUnit.Case, async: true
 
   alias AttentionServer.{Engine, JSON, Relay, Store}
   alias AttentionServer.AgentAPI.FeedActivity
   alias AttentionServer.ClientAPI.Reads
-  alias AttentionServer.Store.{DerivedIndex, RecordTable}
+  alias AttentionServer.Store.{DerivedIndex, KeyedMigration, RecordCodec, RecordTable}
   alias Exqlite.Sqlite3
 
   @moduletag :tmp_dir
 
-  test "a fresh Relay starts with a FORMAT31 anchor and no legacy snapshot", %{tmp_dir: dir} do
+  test "a fresh Relay starts with a FORMAT32 anchor and no legacy snapshot", %{tmp_dir: dir} do
     path = Path.join(dir, "relay.sqlite3")
     assert {:ok, relay} = Relay.start_link(store_path: path)
     assert :ok = GenServer.stop(relay)
     assert {:ok, store} = Store.open(path, :keyed)
-    assert {:attention_relay_keyed_state, 31, _} = snapshot_anchor(store)
+    assert {:attention_relay_keyed_state, 32, _} = snapshot_anchor(store)
     assert [[1, 1, 0]] = query(store, "SELECT index_version, liveness_version, generation FROM relay_index_state")
     assert :ok = Store.close(store)
   end
@@ -43,7 +43,7 @@ defmodule AttentionServer.Store.Format31RelayStartupTest do
     assert :ok = Store.close(legacy)
 
     assert {:ok, converted} = Store.open(path, :keyed_cutover)
-    assert {:attention_relay_keyed_state, 31, _} = snapshot_anchor(converted)
+    assert {:attention_relay_keyed_state, 32, _} = snapshot_anchor(converted)
     assert :ok = Store.close(converted)
 
     assert {:ok, relay} = Relay.start_link(store_path: path)
@@ -55,9 +55,86 @@ defmodule AttentionServer.Store.Format31RelayStartupTest do
 
     assert {:ok, cold} = Store.open(path, :keyed)
     assert cold.engine.sender_grants[{"person", "origin"}] == MapSet.new(["app:test"])
-    assert {:attention_relay_keyed_state, 31, _} = snapshot_anchor(cold)
+    assert {:attention_relay_keyed_state, 32, _} = snapshot_anchor(cold)
     assert [["person", 1, nil, 1]] = query(cold, "SELECT person, seq, state, live FROM relay_items")
     assert :ok = Store.close(cold)
+  end
+
+  test "cold FORMAT31 upgrade preserves populated records and feed generations", %{tmp_dir: dir} do
+    path = Path.join(dir, "relay.sqlite3")
+    assert {:ok, relay} = Relay.start_link(store_path: path)
+    assert :ok = Relay.setup_person(relay, "person")
+    assert :ok = Relay.setup_device(relay, "person", "origin")
+    assert :ok = Relay.setup_sender(relay, "origin", "app:test")
+    assert {:ok, response} =
+             Relay.request_line(relay, "origin", JSON.encode!(forward_frame()) <> "\n")
+
+    assert {:ok, %{"type" => "ok", "seq" => 1}} = JSON.decode_line(response)
+    assert :ok = GenServer.stop(relay)
+
+    assert {:ok, store} = Store.open(path, :keyed)
+    assert map_size(store.engine.messages) == 1
+    before = store.engine
+    generation = store.version
+    assert generation > 0
+
+    client_generation = query(store, "SELECT store_version FROM client_change_log_state")
+    agent_generation = query(store, "SELECT store_version FROM agent_change_log_state")
+    assert [[client_version]] = client_generation
+    assert [[agent_version]] = agent_generation
+    assert client_version > 0 and agent_version > 0
+    client_changes = query(store, "SELECT * FROM client_changes ORDER BY person_id, rev")
+    agent_changes = query(store, "SELECT * FROM agent_changes ORDER BY person_id, agent_key, rev")
+    payload = :erlang.term_to_binary({:attention_relay_keyed_state, 31, RecordCodec.identity()})
+    checksum = :crypto.hash(:sha256, payload)
+
+    assert :ok =
+             RecordTable.run(
+               store.db,
+               "UPDATE relay_state SET payload = ?, checksum = ? WHERE id = 1",
+               [{:blob, payload}, {:blob, checksum}]
+             )
+
+    assert {:error, :before_commit} =
+             RecordTable.transaction(store.db, fn ->
+               assert {:ok, :converted} = KeyedMigration.upgrade_anchor(store.db)
+               assert {:attention_relay_keyed_state, 32, _} = snapshot_anchor(store)
+               {:error, :before_commit}
+             end)
+
+    assert [[^payload, ^checksum]] = query(store, "SELECT payload, checksum FROM relay_state")
+    assert :ok = Store.close(store)
+
+    script = """
+    false = :code.is_loaded(AttentionServer.Store.RecordCodec)
+    path = System.fetch_env!("HARKLIGHT_COLD_UPGRADE_PATH")
+    budget = %{memory: 1024 * 1024 * 1024, disk: 1024 * 1024 * 1024}
+    {:ok, :converted} = AttentionServer.Store.convert_stopped(path, budget, 31)
+    """
+
+    {output, status} =
+      System.cmd("mix", ["run", "--no-start", "--no-compile", "-e", script],
+        env: [
+          {"MIX_ENV", "test"},
+          {"ERL_FLAGS", "+S 2:2"},
+          {"ATTENTION_SERVER_ENABLE", "0"},
+          {"HARKLIGHT_COLD_UPGRADE_PATH", path}
+        ],
+        stderr_to_stdout: true
+      )
+
+    assert status == 0, output
+    budget = %{memory: 1024 * 1024 * 1024, disk: 1024 * 1024 * 1024}
+    assert {:ok, :already_converted} = Store.convert_stopped(path, budget, 31)
+    assert {:ok, upgraded} = Store.open(path, :keyed)
+    assert {:attention_relay_keyed_state, 32, _} = snapshot_anchor(upgraded)
+    assert upgraded.version == generation
+    assert upgraded.engine == before
+    assert query(upgraded, "SELECT store_version FROM client_change_log_state") == client_generation
+    assert query(upgraded, "SELECT store_version FROM agent_change_log_state") == agent_generation
+    assert query(upgraded, "SELECT * FROM client_changes ORDER BY person_id, rev") == client_changes
+    assert query(upgraded, "SELECT * FROM agent_changes ORDER BY person_id, agent_key, rev") == agent_changes
+    assert :ok = Store.close(upgraded)
   end
 
   test "cutover moves published availability without changing its rendering", %{tmp_dir: dir} do

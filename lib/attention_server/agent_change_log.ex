@@ -367,6 +367,36 @@ defmodule AttentionServer.AgentChangeLog do
     end)
   end
 
+  @doc false
+  def append_shared_message(log, {person, key}, id, session) do
+    row = {:shared_message, resource_id({:shared_message, id}), session}
+    update_in(log.agent_pending, &Map.update(&1, {person, key}, [row], fn rows -> rows ++ [row] end))
+  end
+
+  @doc false
+  def append_shared_entry(log, {person, key}, entry_id, session) do
+    row = {:shared_entry, resource_id({:shared_entry, entry_id}), session}
+    update_in(log.agent_pending, &Map.update(&1, {person, key}, [row], fn rows -> rows ++ [row] end))
+  end
+
+  @doc false
+  def append_shared_seen(log, scope, id, session) do
+    row = {:shared_seen, resource_id({:shared_seen, id}), session}
+    update_in(log.agent_pending, &Map.update(&1, scope, [row], fn rows -> rows ++ [row] end))
+  end
+
+  @doc false
+  def append_shared_answer(log, scope, id, session) do
+    row = {:shared_answer, resource_id({:shared_answer, id}), session}
+    update_in(log.agent_pending, &Map.update(&1, scope, [row], fn rows -> rows ++ [row] end))
+  end
+
+  @doc false
+  def append_shared_advisory(log, scope, message_id, advisory_id, session) do
+    row = {:shared_advisory, resource_id({:shared_advisory, {message_id, advisory_id}}), session}
+    update_in(log.agent_pending, &Map.update(&1, scope, [row], fn rows -> rows ++ [row] end))
+  end
+
   @doc "Appends the pending changes inside the store's snapshot transaction."
   def append(db, pending, version) do
     now = System.system_time(:millisecond)
@@ -474,10 +504,12 @@ defmodule AttentionServer.AgentChangeLog do
   def rev(%Store{}, _scope, _resource), do: {:error, :disabled}
 
   @doc "Reads one bounded page, advancing across sessions even when no row matches."
-  def read(%Store{change_log: true, db: db}, {person, agent} = scope, after_rev, limit, session) do
+  def read(store, scope, after_rev, limit, session, shared? \\ false)
+
+  def read(%Store{change_log: true, db: db}, {person, agent} = scope, after_rev, limit, session, shared?) do
     with {:ok, {head, floor, _}} <- meta(db, scope),
          true <- after_rev >= floor and after_rev <= head,
-         {:ok, rows} <- page(db, person, agent, after_rev, limit + 1, session) do
+         {:ok, rows} <- page(db, person, agent, after_rev, limit + 1, session, shared?) do
       {page, rest} = Enum.split(rows, limit)
 
       changes =
@@ -495,20 +527,22 @@ defmodule AttentionServer.AgentChangeLog do
     end
   end
 
-  def read(%Store{}, _scope, _after, _limit, _session), do: {:error, :disabled}
+  def read(%Store{}, _scope, _after, _limit, _session, _shared?), do: {:error, :disabled}
 
-  defp page(db, person, agent, after_rev, limit, session) do
+  defp page(db, person, agent, after_rev, limit, session, shared?) do
     {session_filter, params} =
       case session do
         nil -> {"", [person, agent, after_rev]}
         _ -> {"AND session = ?", [person, agent, after_rev, session]}
       end
 
+    feature_filter = if shared?, do: "", else: "AND resource_id NOT LIKE 'shared-%'"
+
     all(
       db,
       """
       SELECT rev, resource_id, session FROM agent_changes
-      WHERE person_id = ? AND agent_key = ? AND rev > ? AND at_ms IS NOT NULL #{session_filter}
+      WHERE person_id = ? AND agent_key = ? AND rev > ? AND at_ms IS NOT NULL #{session_filter} #{feature_filter}
       UNION ALL
       SELECT rev, resource_id, session FROM agent_item_advisory_changes
       WHERE person_id = ? AND agent_key = ? AND rev > ? AND at_ms IS NOT NULL #{session_filter}
@@ -518,12 +552,29 @@ defmodule AttentionServer.AgentChangeLog do
     )
   end
 
+  defp resource_id({:shared_answer, id}), do: "shared-answer:" <> id
+  defp resource_id({:shared_advisory, {id, advisory}}), do: "shared-advisory:" <> id <> ":" <> advisory
+  defp resource_id({:shared_seen, id}), do: "shared-seen:" <> id
+  defp resource_id({:shared_entry, id}), do: "shared-entry:" <> id
+  defp resource_id({:shared_message, id}), do: "shared-message:" <> id
   defp resource_id({:message, key}), do: ChangeLog.item_resource(key)
   defp resource_id({:entry, seq}), do: ChangeLog.entry_resource(seq)
   defp resource_id({:advisory, id}), do: "advisory:" <> id
 
   defp resource_id({:item_advisory, {key, id}}),
     do: "item-advisory:" <> id <> ":" <> ChangeLog.item_resource(key)
+
+  defp decode_resource(_person, "shared-answer:" <> id), do: {:shared_answer, id}
+  defp decode_resource(_person, "shared-advisory:" <> encoded) do
+    case String.split(encoded, ":", parts: 2) do
+      [id, advisory] -> {:shared_advisory, {id, advisory}}
+      _ -> :invalid
+    end
+  end
+
+  defp decode_resource(_person, "shared-seen:" <> id), do: {:shared_seen, id}
+  defp decode_resource(_person, "shared-entry:" <> id), do: {:shared_entry, id}
+  defp decode_resource(_person, "shared-message:" <> id), do: {:shared_message, id}
 
   defp decode_resource(_person, "advisory:" <> id), do: {:advisory, id}
 
