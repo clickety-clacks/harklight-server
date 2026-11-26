@@ -3039,6 +3039,7 @@ defmodule AttentionServer.Store do
       is_binary(upload.message_id) and upload.message_id != "" and
       is_integer(upload.revision) and upload.revision > 0 and
       Map.get(upload, :uploader_kind) in [nil, "agent", "client"] and
+      (is_nil(upload[:shared_entry_id]) or is_binary(upload[:shared_entry_id])) and
       AttentionServer.ConversationFiles.valid_name?(upload.name) and
       is_integer(upload.size) and upload.size >= 0 and
       is_integer(upload.last_activity_ms) and upload.last_activity_ms >= 0 and

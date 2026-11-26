@@ -305,7 +305,7 @@ defmodule AttentionServer.SharedMessages do
       "rev" => rev, "position" => entry.position, "kind" => "reply",
       "author" => entry_author(entry.author), "speaker" => entry.speaker,
       "request_revision" => entry.request_revision, "at_ms" => entry.at_ms,
-      "text" => entry.text, "files" => []
+      "text" => entry.text, "files" => SharedAttachments.wire(Map.get(entry, :files, []))
     }
   end
 
@@ -363,10 +363,15 @@ defmodule AttentionServer.SharedMessages do
         id: id, shared_id: shared_id, position: position, request_revision: revision,
         at_ms: at_ms, text: text, author: author, speaker: speaker
       }) do
+    entry = engine.shared_entries[id]
+
     case Map.get(engine.shared_messages, shared_id) do
       %{entry_high: high, revision: current} ->
         is_binary(id) and position in 1..high and revision in 1..current and
-          is_integer(at_ms) and is_binary(text) and is_map(speaker) and valid_author?(engine, author)
+          is_integer(at_ms) and is_binary(text) and is_map(speaker) and valid_author?(engine, author) and
+          Enum.all?(SharedAttachments.entry_upload_ids(entry), fn upload_id ->
+            match?(%{message_id: ^shared_id, shared_entry_id: ^id}, engine.uploads[upload_id])
+          end)
       _ -> false
     end
   end

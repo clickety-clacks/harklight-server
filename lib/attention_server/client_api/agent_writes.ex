@@ -5,7 +5,7 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
 
   import Plug.Conn, only: [get_req_header: 2, read_body: 1]
 
-  alias AttentionServer.{AgentChangeLog, ConversationFiles, Engine, JSON, Message, Relay, SharedMessages, Store}
+  alias AttentionServer.{AgentChangeLog, ConversationFiles, Engine, JSON, Message, Relay, SharedMessages}
 
   alias AttentionServer.AgentAPI.Advisories
 
@@ -113,7 +113,7 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
         match = get_req_header(conn, "if-match")
         digest = write_digest(conn, match, body)
         request = {:shared_mutation, ctx.principal, key, digest, id, operation, match, body}
-        Writes.respond(conn, replay_success(ctx, call(ctx, request)))
+        Writes.respond(conn, replay_success(ctx, mutate_with_files(ctx, request)))
 
       {:ok, _} ->
         Errors.send_error(conn, "not_found")
@@ -146,20 +146,27 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
     end
   end
 
+  defp mutate_with_files(ctx, {:shared_mutation, _, _, _, _, :revise, _, %{"file_ids" => [_ | _]}} = request) do
+    case call(ctx, {:prepare_shared_revision, request}) do
+      {:ok, dir, files} ->
+        result = SharedAttachments.stage_and_apply(dir, files, &call(ctx, Tuple.append(request, &1)))
+        if match?({:error, _}, result), do: refusal(result), else: result
+
+      reply -> reply
+    end
+  end
+
+  defp mutate_with_files(ctx, request), do: call(ctx, Tuple.append(request, []))
+
   defp send_with_files(ctx, key, digest, %{"file_ids" => [_ | _]} = body) do
     request = {:prepare_shared_files, ctx.principal, key, digest, body}
 
     case call(ctx, request) do
       {:ok, dir, files} ->
-        case SharedAttachments.stage(dir, files) do
-          {:ok, staged} ->
-            try do
-              call(ctx, {:shared_send, ctx.principal, key, digest, body, staged})
-            after
-              SharedAttachments.discard(staged)
-            end
-
-          error -> refusal(error)
+        case SharedAttachments.stage_and_apply(dir, files,
+               &call(ctx, {:shared_send, ctx.principal, key, digest, body, &1})) do
+          {:error, _} = error -> refusal(error)
+          result -> result
         end
 
       other ->
@@ -284,16 +291,35 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
     end
   end
 
-  def handle_call({:shared_mutation, %{person: person, key: origin}, key, digest, id, operation, match, body},
+  def handle_call({:prepare_shared_revision,
+         {:shared_mutation, %{person: person, key: origin}, key, digest, id, :revise, match, body}}, _from, state) do
+    scope = {person, origin}
+
+    result =
+      with {:ok, record} <- shared_mutation_record(state, scope, id, :revise),
+           {:ok, nil} <- lookup(state, receipt_scope(scope), key),
+           :ok <- files(body),
+           :ok <- if_match(match, record.revision),
+           current = MapSet.new(Map.get(record, :files, []), & &1["file_id"]),
+           new_ids = Enum.reject(body["file_ids"], &MapSet.member?(current, &1)),
+           attrs = %{message_id: id, sender: record.sender_id, revision: record.revision + 1,
+                     op_id: key || ConversationFiles.new_upload_id(), now: state.clock.(), kind: "agent"},
+           {:ok, prepared} <- SharedAttachments.prepare(state.store, scope, new_ids, attrs) do
+        {:ok, state.store.upload_dir, prepared}
+      else
+        {:ok, %{digest: ^digest, status: status, body: stored}} -> {:stored, status, stored}
+        {:ok, %{}} -> refusal({:error, :idempotency_conflict})
+        error -> refusal(error)
+      end
+
+    {:reply, result, state}
+  end
+
+  def handle_call({:shared_mutation, %{person: person, key: origin}, key, digest, id, operation, match, body, staged},
         _from, state) do
     scope = {person, origin}
 
-    with true <- state.shared_messages || {:error, :unsupported},
-         :ok <- authorize(state, scope, operation),
-         %{sender_person: ^person, sender_key: ^origin} = record <-
-           state.store.engine.shared_messages[id],
-         true <- Engine.shared_sender_allowed?(state.store.engine, person, origin, record.sender_id) ||
-                   {:error, :not_found} do
+    with {:ok, record} <- shared_mutation_record(state, scope, id, operation) do
       case lookup(state, receipt_scope(scope), key) do
         {:ok, %{digest: ^digest, status: status, body: stored}} ->
           {:reply, {:stored, status, stored}, state}
@@ -302,7 +328,7 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
           {:reply, refusal({:error, :idempotency_conflict}), state}
 
         {:ok, nil} ->
-          apply_shared_mutation(state, scope, record, key, digest, operation, match, body)
+          apply_shared_mutation(state, scope, record, key, digest, operation, match, body, staged)
 
         error ->
           {:reply, refusal(error), state}
@@ -598,85 +624,107 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
       shared_send_receipt: {scope, key, digest, id, wire_outcomes(outcomes)}
     }
 
-    case SharedAttachments.publish(state.store, staged) do
-      {:ok, published} ->
-        transition = SharedAttachments.attach(transition, published)
+    case SharedAttachments.commit(state.store, transition, audit, staged) do
+      {:ok, store} ->
+        reply =
+          case Idempotency.lookup(store, receipt_scope(scope), key) do
+            {:ok, %{body: body}} -> {:ok, 200, body, false}
+            _ -> refusal({:error, :storage_unavailable})
+          end
 
-        case Store.commit(state.store, transition, audit) do
-          {:ok, store} ->
-            reply =
-              case Idempotency.lookup(store, receipt_scope(scope), key) do
-                {:ok, %{body: body}} -> {:ok, 200, body, false}
-                _ -> refusal({:error, :storage_unavailable})
-              end
-
-            next = %{state | store: store}
-            next = if published == [], do: next, else: Relay.refresh_shared_upload_index(next)
-            {:reply, reply, next}
-
-          _ ->
-            SharedAttachments.discard(published)
-            {:reply, refusal({:error, :storage_unavailable}), state}
-        end
+        next = %{state | store: store}
+        next = if staged == [], do: next, else: Relay.refresh_shared_upload_index(next)
+        {:reply, reply, next}
 
       error ->
         {:reply, refusal(error), state}
     end
   end
 
-  defp apply_shared_mutation(state, {person, origin} = scope, record, key, digest, operation, match, body) do
-    with {:ok, next} <- shared_mutation(state, record, operation, match, body),
+  defp shared_mutation_record(state, {person, origin} = scope, id, operation) do
+    engine = state.store.engine
+
+    with true <- state.shared_messages || {:error, :unsupported},
+         :ok <- authorize(state, scope, operation),
+         %{sender_person: ^person, sender_key: ^origin} = record <- engine.shared_messages[id],
+         true <- Engine.shared_sender_allowed?(engine, person, origin, record.sender_id) ||
+                   {:error, :not_found} do
+      {:ok, record}
+    else
+      result when is_nil(result) or is_map(result) -> {:error, :not_found}
+      error -> error
+    end
+  end
+
+  defp apply_shared_mutation(state, {person, origin} = scope, record, key, digest, operation, match, body, staged) do
+    with {:ok, next} <- shared_mutation(state, record, operation, match, body, staged),
          audit = %{
            person: person, actor: origin, action: "shared_message_" <> Atom.to_string(operation),
            shared_mutation_receipt: {scope, key, digest, record.id}
          },
-         {:ok, store} <- Store.commit(state.store, next, audit) do
+         {:ok, store} <- SharedAttachments.commit(state.store, next, audit, staged) do
       result =
         with {:ok, head} <- AgentChangeLog.head(store, scope),
              {:ok, rev} <- AgentChangeLog.rev(store, scope, {:shared_message, record.id}) do
-          body = %{"rev" => head, "message" => SharedMessages.sender_message(next, next.shared_messages[record.id], rev)}
+          body = %{"rev" => head, "message" => SharedMessages.sender_message(store.engine, store.engine.shared_messages[record.id], rev)}
           {:ok, 200, body, false}
         end
 
-      {:reply, result, %{state | store: store}}
+      next = %{state | store: store}
+      next = if staged == [], do: next, else: Relay.refresh_shared_upload_index(next)
+      {:reply, result, next}
     else
       error -> {:reply, refusal(error), state}
     end
   end
 
-  defp shared_mutation(state, record, :revise, match, body) do
+  defp shared_mutation(state, record, :revise, match, body, staged) do
     with :ok <- Writes.only_members(body, ~w(message file_ids)),
          :ok <- files(body),
-         true <- Map.get(body, "file_ids", []) == [] || {:error, "unsupported", "file_ids"},
          :ok <- if_match(match, record.revision),
          {:ok, message} <- content(body),
          true <- (is_nil(record.answer_policy) == (message["message_type"] == "fyi")) ||
                    {:error, "invalid_field", "message_type"},
          message <- Map.merge(message, %{"sender_id" => record.sender_id, "message_id" => record.id}),
-         :ok <- shared_content_valid(message) do
-      files = if Map.has_key?(body, "file_ids"), do: [], else: Map.get(record, :files, [])
+         :ok <- shared_content_valid(message),
+         {:ok, files} <- revision_files(record, body, staged) do
       {message, _diagnostics} = Message.admit_answer_ui(message, Enum.map(files, & &1["name"]))
       SharedMessages.revise(state.store.engine, record, record.revision, message, files, state.clock.())
     end
   end
 
-  defp shared_mutation(state, record, :chat_close, _match, body) do
+  defp shared_mutation(state, record, :chat_close, _match, body, _staged) do
     with :ok <- Writes.only_members(body, []),
       do: SharedMessages.close_chat(state.store.engine, record)
   end
 
-  defp shared_mutation(state, record, :lifecycle, _match, %{"action" => "cleared"} = body) do
+  defp shared_mutation(state, record, :lifecycle, _match, %{"action" => "cleared"} = body, _staged) do
     with :ok <- Writes.only_members(body, ["action"]),
       do: SharedMessages.clear_answers(state.store.engine, record, state.clock.())
   end
 
-  defp shared_mutation(_state, _record, :lifecycle, _match, _body),
+  defp shared_mutation(_state, _record, :lifecycle, _match, _body, _staged),
     do: {:error, "unsupported", "action"}
 
-  defp shared_mutation(state, record, :retract, _match, body) do
+  defp shared_mutation(state, record, :retract, _match, body, _staged) do
     with :ok <- Writes.only_members(body, []),
       do: SharedMessages.retract(state.store.engine, record, state.clock.())
   end
+
+  defp revision_files(record, %{"file_ids" => ids}, staged) do
+    current = Map.new(Map.get(record, :files, []), &{&1["file_id"], &1})
+    new = Map.new(Enum.zip(staged, SharedAttachments.references(staged)), fn {{meta, _}, ref} ->
+      {meta.staged_file_id, ref}
+    end)
+    available = Map.merge(current, new)
+    files = Enum.map(ids, &Map.get(available, &1))
+
+    if Enum.all?(files, &is_map/1) and distinct_upload_names(files) == :ok,
+      do: {:ok, files},
+      else: {:error, :invalid_field, "file_ids"}
+  end
+
+  defp revision_files(record, _body, _staged), do: {:ok, Map.get(record, :files, [])}
 
   defp shared_send_fields(body) do
     with :ok <- Writes.only_members(body, ~w(sender session message file_ids recipients answer_policy)),

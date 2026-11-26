@@ -4901,6 +4901,15 @@ defmodule AttentionServer.Relay do
         add_upload_references(index, record.sender_person, ids)
       end)
 
+    references =
+      Enum.reduce(engine.shared_entries, references, fn {_id, entry}, index ->
+        ids = AttentionServer.ClientAPI.SharedAttachments.entry_upload_ids(entry)
+        Enum.reduce(ids, index, fn id, acc ->
+          upload = Map.fetch!(engine.uploads, id)
+          add_upload_references(acc, upload.person, MapSet.new([id]))
+        end)
+      end)
+
     Enum.reduce(engine.uploads, references, fn {_id, upload}, index ->
       add_upload_to_index(index, upload, engine)
     end)

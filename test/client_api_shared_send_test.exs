@@ -367,6 +367,77 @@ defmodule AttentionServer.ClientAPISharedSendTest do
     assert %{status: 404} = raw_request(ctx, server, "b1", "GET", path, opt_in, nil)
   end
 
+  test "revision and Chat attachments survive replay and use separate departure fences", ctx do
+    server = start_supervised!({Server, [shared_messages: true] ++ ctx.server_opts})
+    relay = Server.relay(server)
+    {sender, first, second} = people(ctx, relay)
+    assert :ok = Relay.replace_hosted_organization(relay, "org", [sender, first, second])
+    opt_in = [{"harklight-features", "shared_messages"}]
+
+    assert {200, %{"message" => %{"item_id" => id}}, _} =
+             send_request(ctx, server, @key, body([first, second]), true)
+
+    sender_path = "/v2/agent/messages/" <> id
+    revision_bytes = "new revision attachment"
+    handle = stage_attachment(ctx, server, "a1", 20, "revision.txt", revision_bytes)
+    revision = %{"message" => %{"title" => "Updated", "created_at" => 2}, "file_ids" => [handle]}
+    revise_headers = [{"if-match", "1"} | opt_in]
+    assert {200, %{"message" => %{"revision" => 2, "files" => [%{"file_id" => file_id}]}}
+                = revision_result, _} =
+             write_request(ctx, server, "a1", "PUT", sender_path, op_key(21), revision, revise_headers)
+    assert {200, ^revision_result, replay_headers} =
+             write_request(ctx, server, "a1", "PUT", sender_path, op_key(21), revision, revise_headers)
+    assert {"idempotent-replayed", "true"} in replay_headers
+    assert %{status: 200, body: ^revision_bytes} =
+             raw_request(ctx, server, "a2", "GET", "/v2/files/" <> file_id, opt_in, nil)
+
+    {first_path, second_path} = recipient_paths(relay, id, first, second)
+    person_bytes = "first chat attachment"
+    person_handle = stage_attachment(ctx, server, "a2", 22, "prior.txt", person_bytes)
+    reply_body = %{"text" => "Before departure", "file_ids" => [person_handle]}
+    assert {200, %{"entry" => %{"files" => [%{"file_id" => prior_id}]}} = reply_result, _} =
+             write_request(ctx, server, "a2", "POST", first_path <> "/replies", op_key(23), reply_body, opt_in)
+    assert {200, ^reply_result, headers} =
+             write_request(ctx, server, "a2", "POST", first_path <> "/replies", op_key(23), reply_body, opt_in)
+    assert {"idempotent-replayed", "true"} in headers
+    assert %{status: 200, body: ^person_bytes} =
+             raw_request(ctx, server, "a1", "GET", "/v2/files/" <> prior_id, opt_in, nil)
+
+    assert :ok = Relay.replace_hosted_organization(relay, "org", [sender, second])
+    later_bytes = "second chat attachment"
+    later_handle = stage_attachment(ctx, server, "a1", 24, "later.txt", later_bytes)
+    later_body = %{"text" => "After departure", "file_ids" => [later_handle]}
+    assert {200, %{"entry" => %{"request_revision" => 2, "files" => [%{"file_id" => later_id}]}}, _} =
+             write_request(ctx, server, "a1", "POST", sender_path <> "/replies", op_key(25), later_body, opt_in)
+
+    assert %{status: 200, body: ^person_bytes} =
+             raw_request(ctx, server, "a2", "GET", "/v2/files/" <> prior_id, opt_in, nil)
+    assert %{status: 404} = raw_request(ctx, server, "a2", "GET", "/v2/files/" <> later_id, opt_in, nil)
+    assert %{status: 404} = raw_request(ctx, server, "b1", "GET", "/v2/files/" <> later_id, [], nil)
+    assert %{status: 200, body: ^later_bytes} =
+             raw_request(ctx, server, "b1", "GET", "/v2/files/" <> later_id, opt_in, nil)
+    assert {200, _, _} = get_request(ctx, server, "b1", second_path, opt_in)
+
+    assert map_size(:sys.get_state(relay).store.engine.uploads) == 3
+    assert :ok = stop_supervised(Server)
+    restarted = start_supervised!({Server, [shared_messages: true] ++ ctx.server_opts})
+    assert %{status: 200, body: ^later_bytes} =
+             raw_request(ctx, restarted, "b1", "GET", "/v2/files/" <> later_id, opt_in, nil)
+    assert %{status: 404} =
+             raw_request(ctx, restarted, "a2", "GET", "/v2/files/" <> later_id, opt_in, nil)
+  end
+
+  defp stage_attachment(ctx, server, device, key, name, bytes) do
+    headers = [
+      {"content-type", "text/plain"},
+      {"content-disposition", "attachment; filename*=UTF-8''" <> name},
+      {"idempotency-key", op_key(key)}
+    ]
+    assert %{status: 201, body: staged} = raw_request(ctx, server, device, "POST", "/v2/files", headers, bytes)
+    assert {:ok, %{"file_id" => handle}} = JSON.decode_line(staged <> "\n")
+    handle
+  end
+
   test "Seen is per person and revision, with one attributed Agent event", ctx do
     server = start_supervised!({Server, [shared_messages: true] ++ ctx.server_opts})
     relay = Server.relay(server)
