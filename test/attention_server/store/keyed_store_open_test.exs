@@ -38,8 +38,8 @@ defmodule AttentionServer.Store.KeyedStoreOpenTest do
     assert {:error, :storage_unavailable, ^keyed} = Store.commit(keyed, proposal, audit)
     assert :ok = Store.close(keyed)
 
-    assert {:error, {:storage_unavailable, {:error, :format30_requires_keyed_mode}}} =
-             Store.open(path)
+    assert {:error, {:storage_unavailable, {:error, :format31_requires_keyed_mode}}} =
+             Store.open(path, :snapshot)
 
     for mode <- [:keyed, :keyed_cutover] do
       assert {:ok, reopened} = Store.open(path, mode)

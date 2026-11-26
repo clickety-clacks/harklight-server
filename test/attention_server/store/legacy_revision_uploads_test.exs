@@ -66,6 +66,7 @@ defmodule AttentionServer.Store.LegacyRevisionUploadsTest do
     assert MapSet.member?(:sys.get_state(relay).upload_index.references_by_person["A"], id)
 
     assert :ok = GenServer.stop(relay)
+    :ok = AttentionServer.PreChangeLogStore.snapshot_fixture(path)
     %{path: path, file_path: file_path, id: id}
   end
 

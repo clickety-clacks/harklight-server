@@ -1,8 +1,7 @@
 defmodule AttentionServer.SourceReportTest do
   use ExUnit.Case, async: false
 
-  alias AttentionServer.{Engine, JSON, Relay, Store}
-  alias Exqlite.Sqlite3
+  alias AttentionServer.{Engine, JSON, Relay, RelayReaders, Store}
 
   setup do
     dir =
@@ -341,16 +340,7 @@ defmodule AttentionServer.SourceReportTest do
           Map.update!(engine.messages, second_key, &Map.put(&1, :source_binding, duplicate))
     }
 
-    payload = :erlang.term_to_binary({:attention_relay_state, 30, corrupted}, [{:compressed, 6}])
-    assert {:ok, db} = Sqlite3.open(path)
-
-    assert {:ok, stmt} =
-             Sqlite3.prepare(db, "UPDATE relay_state SET payload = ?, checksum = ? WHERE id = 1")
-
-    assert :ok = Sqlite3.bind(stmt, [{:blob, payload}, {:blob, :crypto.hash(:sha256, payload)}])
-    assert :done = Sqlite3.step(db, stmt)
-    assert :ok = Sqlite3.release(db, stmt)
-    assert :ok = Sqlite3.close(db)
+    :ok = AttentionServer.PreChangeLogStore.snapshot_fixture(path, 30, fn _ -> corrupted end)
 
     assert {:error, {:storage_unavailable, {:error, :invalid_state}}} =
              Store.open(path)

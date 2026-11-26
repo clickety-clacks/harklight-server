@@ -9,7 +9,8 @@ defmodule AttentionServer.Store.KeyedBounceValidationTest do
   use ExUnit.Case, async: true
 
   alias AttentionServer.{BounceDecision, Engine, JSON, LargeData, Store}
-  alias AttentionServer.Store.RecordCodec
+  alias AttentionServer.Store.{RecordCodec, RecordTable}
+  alias Exqlite.Sqlite3
 
   @moduletag :tmp_dir
   @moduletag :capture_log
@@ -126,8 +127,26 @@ defmodule AttentionServer.Store.KeyedBounceValidationTest do
       assert AttentionServer.RouteBIndex.push_badge(reopened.engine.route_b_index, @person) == 1
       :ok = Store.close(reopened)
 
+      original = File.read!(path)
+      files = File.ls!(Path.dirname(path)) |> Enum.sort()
       assert {:ok, preview_engine} = Store.read_stopped_engine(path)
       assert preview_engine.advisory_feeds == store.engine.advisory_feeds
+      assert File.read!(path) == original
+      assert Enum.sort(File.ls!(Path.dirname(path))) == files
+
+      # Preview also reads the same record encoding behind a FORMAT30 anchor.
+      {:ok, db} = Sqlite3.open(path)
+      payload = :erlang.term_to_binary({:attention_relay_keyed_state, 30, RecordCodec.identity()})
+      checksum = :crypto.hash(:sha256, payload)
+      assert :ok = RecordTable.run(db, "UPDATE relay_state SET payload = ?, checksum = ? WHERE id = 1", [
+        {:blob, payload}, {:blob, checksum}
+      ])
+      assert :ok = Sqlite3.close(db)
+
+      original = File.read!(path)
+      assert {:ok, preview_engine} = Store.read_stopped_engine(path)
+      assert preview_engine.advisory_feeds == store.engine.advisory_feeds
+      assert File.read!(path) == original
     end
 
     test "a due revision in a supported session bounces directly", %{store: store} do

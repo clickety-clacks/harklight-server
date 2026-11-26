@@ -28,7 +28,7 @@ defmodule AttentionServer.Store.RecordTableTest do
     old = Engine.new()
     next = put_in(old.messages[@item], %{origin: "agent", session_handle: "session"})
 
-    records = [{:put, {"key", "value", "hash"}}]
+    records = [{:insert, {"key", "value", "hash"}}]
     person_heads = %{"person" => 1}
     agent_heads = %{{:agent, "person", "agent"} => 1}
 
@@ -50,7 +50,7 @@ defmodule AttentionServer.Store.RecordTableTest do
 
   test "rejects a stale generation without running side writes", %{db: db} do
     assert {:error, :stale_generation} =
-             RecordTable.commit(db, 8, [{:put, {"missed", "row", "hash"}}], fn _, _ ->
+             RecordTable.commit(db, 8, [{:insert, {"missed", "row", "hash"}}], fn _, _ ->
                flunk("side writes ran on a stale generation")
              end)
 
@@ -69,7 +69,7 @@ defmodule AttentionServer.Store.RecordTableTest do
     next = put_in(old.messages[@item], %{origin: "agent", session_handle: "session"})
 
     assert {:error, _} =
-             RecordTable.commit(db, 9, [{:put, {"key", "pending", "hash"}}], appends(old, next))
+             RecordTable.commit(db, 9, [{:insert, {"key", "pending", "hash"}}], appends(old, next))
 
     assert_versions(db, 9)
     assert {:ok, []} = RecordTable.rows(db)
@@ -80,7 +80,7 @@ defmodule AttentionServer.Store.RecordTableTest do
 
   test "bare SQL success produces an error and rolls back", %{db: db} do
     assert {:error, :invalid_append_result} =
-             RecordTable.commit(db, 9, [{:put, {"key", "pending", "hash"}}], fn db, _ ->
+             RecordTable.commit(db, 9, [{:insert, {"key", "pending", "hash"}}], fn db, _ ->
                Sqlite3.execute(db, "INSERT INTO audit VALUES (10)")
              end)
 

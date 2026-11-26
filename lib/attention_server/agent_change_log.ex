@@ -300,8 +300,7 @@ defmodule AttentionServer.AgentChangeLog do
   @doc "Enables the log at startup, seeding only agents with retained messages."
   def enable(db, engine, version) do
     with :ok <- Sqlite3.execute(db, "BEGIN IMMEDIATE"),
-         :ok <- Sqlite3.execute(db, @schema),
-         :ok <- reconcile(db, engine, version),
+         :ok <- enable_in_transaction(db, engine, version),
          :ok <- Sqlite3.execute(db, "COMMIT") do
       :ok
     else
@@ -309,6 +308,11 @@ defmodule AttentionServer.AgentChangeLog do
         _ = Sqlite3.execute(db, "ROLLBACK")
         error
     end
+  end
+
+  @doc false
+  def enable_in_transaction(db, engine, version) do
+    with :ok <- Sqlite3.execute(db, @schema), do: reconcile(db, engine, version)
   end
 
   defp reconcile(db, engine, version) do

@@ -1,51 +1,96 @@
 defmodule AttentionServer.Store.KeyedMigration do
   @moduledoc false
 
-  alias AttentionServer.{Conversation, LargeData, Store}
-  alias AttentionServer.Store.{RecordCodec, RecordTable}
+  alias AttentionServer.{LargeData, Store}
+  alias AttentionServer.Store.{DerivedIndex, RecordCodec, RecordTable}
   alias Exqlite.Sqlite3
 
-  @format 30
+  @format 31
+
+  def report_stage(stage) do
+    :telemetry.execute([:harklight, :store, :conversion, stage], %{time: System.monotonic_time()}, %{})
+  end
+
+  def bootstrap(db, engine) do
+    payload = encode_anchor()
+
+    with :ok <- large_data_index(db),
+         :ok <- RecordTable.seed(db, 0, RecordCodec.encode(engine)),
+         :ok <- DerivedIndex.create(db, 0) do
+      RecordTable.run(db, "INSERT INTO relay_state (id, version, payload, checksum) VALUES (1, 0, ?, ?)", [
+        {:blob, payload}, {:blob, :crypto.hash(:sha256, payload)}
+      ])
+    end
+  end
 
   # Prepare the validated in-memory readback before committing the anchor.
   # Runtime selection of the converter belongs to the guarded Store opener.
   def convert_store(%Store{db: db, engine: engine, version: version} = store, prepare)
       when is_function(prepare, 3) do
-    persisted = LargeData.persist_refs(engine)
-    expected = canonical(persisted)
-    generation = version + 1
-
-    RecordTable.transaction(db, fn ->
-      with :ok <- verify_previous_progress(store),
-           :ok <- Store.verify_retained_uploads(store),
-           :ok <-
-             Sqlite3.execute(
-               db,
-               "CREATE INDEX relay_large_data_refs_id ON relay_large_data_refs (id)"
-             ),
-           :ok <- RecordTable.seed(db, generation, RecordCodec.encode(persisted)),
-           {:ok, restored} <- read_records(db),
-           true <- canonical(restored) === expected,
-           {:ok, prepared} <- prepare.(store, restored, generation),
-           :ok <- write_anchor(db, version, generation),
-           :ok <- advance_current_logs(db, version, generation),
-           :ok <- Sqlite3.execute(db, "DELETE FROM relay_device_progress") do
-        {:ok, prepared}
-      else
-        false -> {:error, :migration_readback_mismatch}
-        error -> error
-      end
-    end)
+    RecordTable.transaction(db, fn -> convert_locked(store, engine, version, prepare) end)
   end
 
-  def load(db) do
+  def convert_locked(%Store{db: db} = store, engine, version, prepare) do
+    engine = split_item_availability(engine)
+    generation = version + 1
+    rows = RecordCodec.encode(engine, &LargeData.persist_refs/1)
+
+    with :ok <- verify_previous_progress(store),
+         :ok <- Store.verify_retained_uploads(store),
+         :ok <- large_data_index(db),
+         {:ok, count} <- RecordTable.seed_count(db, generation, rows),
+         :ok <- report_stage(:records_written),
+         :ok <- DerivedIndex.create(db, generation),
+         :ok <- report_stage(:indexes_written),
+         :ok <- verify_records(db, engine, count),
+         :ok <- report_stage(:records_verified),
+         {:ok, prepared} <- prepare.(store, engine, generation),
+         :ok <- write_anchor(db, version, generation),
+         :ok <- advance_current_logs(db, version, generation),
+         :ok <- Sqlite3.execute(db, "DELETE FROM relay_device_progress"),
+         :ok <- report_stage(:anchor_written) do
+      {:ok, prepared}
+    end
+  end
+
+  defp split_item_availability(engine) do
+    availability =
+      Enum.reduce(engine.messages, engine.item_availability, fn
+        {{person, _, _} = key, %{origin: origin, session_handle: handle, accepted_seq: seq}}, rows
+        when is_binary(handle) ->
+          case get_in(engine.origin_sessions, [
+                 {person, origin, handle},
+                 "client_availability",
+                 seq
+               ]) do
+            nil -> rows
+            published -> Map.put(rows, key, published)
+          end
+
+        _, rows ->
+          rows
+      end)
+
+    sessions =
+      Map.new(engine.origin_sessions, fn {key, session} ->
+        {key, Map.delete(session, "client_availability")}
+      end)
+
+    %{engine | origin_sessions: sessions, item_availability: availability}
+  end
+
+  def load(db), do: load(db, [@format])
+
+  def load_preview(db), do: load(db, [30, @format])
+
+  defp load(db, formats) do
     # Load the codec's identity atom before decoding the anchor with :safe.
     supported_identity = RecordCodec.identity()
 
     with {:ok, [[version, payload, checksum]]} <-
            query(db, "SELECT version, payload, checksum FROM relay_state WHERE id = 1", []),
          true <- :crypto.hash(:sha256, payload) == checksum,
-         {:ok, identity} <- decode_anchor(payload),
+         {:ok, identity} <- decode_anchor(payload, formats),
          :ok <- check_identity(identity, supported_identity),
          {:ok, generation} <- RecordTable.generation(db),
          true <- generation >= version,
@@ -58,10 +103,11 @@ defmodule AttentionServer.Store.KeyedMigration do
     end
   end
 
-  defp decode_anchor(payload) do
+  defp decode_anchor(payload, formats) do
     case :erlang.binary_to_term(payload, [:safe]) do
-      {:attention_relay_keyed_state, @format, identity} -> {:ok, identity}
-      {:attention_relay_keyed_state, _, _} -> {:error, :unsupported_keyed_format}
+      {:attention_relay_keyed_state, format, identity} ->
+        if format in formats, do: {:ok, identity}, else: {:error, :unsupported_keyed_format}
+
       _ -> {:error, :not_keyed}
     end
   rescue
@@ -75,15 +121,22 @@ defmodule AttentionServer.Store.KeyedMigration do
 
   defp check_identity(_, _), do: {:error, :unsupported_record_codec}
 
-  defp read_records(db) do
-    with {:ok, rows} <- RecordTable.rows(db), do: RecordCodec.decode(rows)
-  end
+  defp read_records(db), do: RecordTable.scan(db, &RecordCodec.decode/1)
 
-  defp canonical(engine) do
-    engine
-    |> Conversation.index_origin_feeds()
-    |> Map.from_struct()
-    |> Map.drop(RecordCodec.derived_fields())
+  defp verify_records(db, expected, count) do
+    result =
+      RecordTable.scan(db, fn rows ->
+        Enum.reduce_while(rows, 0, fn row, verified ->
+          if RecordCodec.matches_row?(expected, row, &LargeData.persist_refs/1),
+            do: {:cont, verified + 1},
+            else: {:halt, :mismatch}
+        end)
+      end)
+
+    case result do
+      ^count -> :ok
+      _ -> {:error, :migration_readback_mismatch}
+    end
   end
 
   defp verify_previous_progress(store) do
@@ -103,8 +156,7 @@ defmodule AttentionServer.Store.KeyedMigration do
   end
 
   defp write_anchor(db, previous, generation) do
-    payload =
-      :erlang.term_to_binary({:attention_relay_keyed_state, @format, RecordCodec.identity()})
+    payload = encode_anchor()
 
     params = [generation, {:blob, payload}, {:blob, :crypto.hash(:sha256, payload)}, previous]
 
@@ -122,6 +174,13 @@ defmodule AttentionServer.Store.KeyedMigration do
       error -> error
     end
   end
+
+  defp encode_anchor do
+    :erlang.term_to_binary({:attention_relay_keyed_state, @format, RecordCodec.identity()})
+  end
+
+  defp large_data_index(db),
+    do: Sqlite3.execute(db, "CREATE INDEX relay_large_data_refs_id ON relay_large_data_refs (id)")
 
   # Conversion preserves the facts and feed rows. Only logs already current
   # at the legacy snapshot generation can follow its new generation.

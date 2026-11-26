@@ -37,7 +37,7 @@ defmodule AttentionServer.Store.KeyedReference do
     Enum.reduce_while(touched, {:ok, changes}, fn address, {:ok, changes} ->
       previous = refs_at(old, address)
 
-      case prepare_record(changes, address, directory) do
+      case prepare_record(changes, RecordCodec.lookup(old, address), address, directory) do
         {:ok, updated} ->
           rows = refs_at(updated.engine, address)
           deleted = Enum.map(previous, &hd/1)
@@ -72,11 +72,12 @@ defmodule AttentionServer.Store.KeyedReference do
     end
   end
 
-  defp prepare_record(changes, address, directory) do
+  defp prepare_record(changes, before, address, directory) do
     case RecordCodec.lookup(changes.engine, address) do
       {:ok, value} ->
         with {:ok, durable, created} <- LargeData.externalize(value, directory) do
           row = RecordCodec.encode_row(address, LargeData.persist_refs(durable))
+          operation = if before == :error, do: :insert, else: :update
 
           engine =
             if value === durable,
@@ -87,10 +88,13 @@ defmodule AttentionServer.Store.KeyedReference do
            %{
              changes
              | engine: engine,
-               records: [{:put, row} | changes.records],
+               records: [{operation, row} | changes.records],
                created: created ++ changes.created
            }}
         end
+
+      :error when before == :error ->
+        {:ok, changes}
 
       :error ->
         {:ok,

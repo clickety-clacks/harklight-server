@@ -35,7 +35,7 @@ defmodule AttentionServer.Store.KeyedValidation do
 
   @pair_keys [:conversation_cursors, :cursors, :push_bindings, :sender_grants, :subscriptions]
   @ordered_keys [:events, :conversation_events]
-  @item_keys [:bounce_revisions, :chat_read_positions, :messages, :reply_group_history]
+  @item_keys [:bounce_revisions, :chat_read_positions, :item_availability, :messages, :reply_group_history]
   @actor_keys [:origin_sessions, :receipts, :source_report_grants]
   @origin_seq_keys [:origin_actions, :origin_receipts]
 
@@ -218,11 +218,11 @@ defmodule AttentionServer.Store.KeyedValidation do
     end)
   end
 
-  defp source_key(%{source_binding: binding}) when is_map(binding) do
+  def source_key(%{source_binding: binding}) when is_map(binding) do
     {binding["source_instance_id"], binding["request_id"], binding["request_revision"]}
   end
 
-  defp source_key(_), do: nil
+  def source_key(_), do: nil
 
   @authority_rows [
     :messages,
@@ -325,142 +325,90 @@ defmodule AttentionServer.Store.KeyedValidation do
     end)
   end
 
-  defp authority_owners(engine, {:row, :messages, {person, _, _} = key}) do
-    case Map.get(engine.messages, key) do
-      nil ->
-        []
+  defp authority_owners(engine, {:row, :origin_feeds, scope}),
+    do: authority_owners(engine, {:origin_feed, scope, :high})
 
-      record ->
-        actors = [record.origin, get_in(record, [:terminal, :actor])] |> Enum.reject(&is_nil/1)
-        [{:person, person} | Enum.map(actors, &{:actor, &1})]
+  defp authority_owners(engine, address) do
+    case RecordCodec.lookup(engine, address) do
+      {:ok, value} -> record_authority(address, value)
+      :error -> []
     end
   end
 
-  defp authority_owners(engine, {:row, :uploads, id}) do
-    case Map.get(engine.uploads, id) do
-      nil ->
-        []
-
-      upload ->
-        [
-          {:person, upload.person},
-          {:actor, upload.uploader},
-          {:scope, :uploads, {upload.person, upload.uploader}}
-        ]
-    end
+  def record_authority({:row, :messages, {person, _, _}}, record) do
+    actors = [record.origin, get_in(record, [:terminal, :actor])] |> Enum.reject(&is_nil/1)
+    [{:person, person} | Enum.map(actors, &{:actor, &1})]
   end
 
-  defp authority_owners(engine, {:row, :receipts, {person, actor, _} = key}) do
-    if Map.has_key?(engine.receipts, key), do: [{:person, person}, {:actor, actor}], else: []
+  def record_authority({:row, :uploads, _}, upload) do
+    [
+      {:person, upload.person},
+      {:actor, upload.uploader},
+      {:scope, :uploads, {upload.person, upload.uploader}}
+    ]
   end
 
-  defp authority_owners(engine, {:row, :owners, person}) do
-    if Map.has_key?(engine.owners, person), do: [{:person, person}], else: []
-  end
+  def record_authority({:row, :maintainer_grants, _}, %{target_person: target, grantee_person: grantee}),
+    do: [{:person, target}, {:person, grantee}]
 
-  defp authority_owners(engine, {:row, field, person})
-       when field in [
-              :delivery_states,
-              :algorithm_choices,
-              :alert_choices,
-              :free_order_highs,
-              :bounce_levels
-            ] do
-    if Map.has_key?(Map.fetch!(engine, field), person), do: [{:person, person}], else: []
-  end
+  def record_authority(
+        {:row, :enrollment_read_grants, _},
+        %{person: person, connector: key, target: %{"key_fingerprint" => target}}
+      ),
+      do: [{:person, person}, {:actor, key}, {:actor, target}]
 
-  defp authority_owners(engine, {:row, :maintainer_grants, id}) do
-    case Map.get(engine.maintainer_grants, id) do
-      %{target_person: target, grantee_person: grantee} -> [{:person, target}, {:person, grantee}]
-      _ -> []
-    end
-  end
+  def record_authority({:row, field, _}, %{person: person})
+      when field in [:hosted_accounts, :devices, :agents],
+      do: [{:person, person}]
 
-  defp authority_owners(engine, {:row, :enrollment_read_grants, id}) do
-    case Map.get(engine.enrollment_read_grants, id) do
-      %{person: person, connector: key, target: %{"key_fingerprint" => target}} ->
-        [{:person, person}, {:actor, key}, {:actor, target}]
+  def record_authority({:row, field, _}, %{state: :approved, key: key, person: person})
+      when field in [:pending_enrollments, :pending_history],
+      do: [{:person, person}, {:actor, key}]
 
-      _ ->
-        []
-    end
-  end
+  def record_authority({:row, field, _}, %{person: person})
+      when field in [:pending_enrollments, :pending_history] and is_binary(person),
+      do: [{:person, person}]
 
-  defp authority_owners(engine, {:row, :hosted_accounts, ref}) do
-    case Map.get(engine.hosted_accounts, ref) do
-      %{person: person} -> [{:person, person}]
-      _ -> []
-    end
-  end
+  def record_authority({:row, field, _}, %{person: person, code: code})
+      when field in [:browser_sign_ins, :join_invitations] and is_binary(code),
+      do: [{:person, person}, {:scope, field, person}, {:scope, :invitation_code, code}]
 
-  defp authority_owners(engine, {:row, field, key}) when field in [:devices, :agents] do
-    case Map.get(Map.fetch!(engine, field), key) do
-      %{person: person} -> [{:person, person}]
-      _ -> []
-    end
-  end
+  def record_authority({:row, field, _}, %{person: person})
+      when field in [:browser_sign_ins, :join_invitations],
+      do: [{:person, person}, {:scope, field, person}]
 
-  defp authority_owners(engine, {:row, field, code})
-       when field in [:pending_enrollments, :pending_history] do
-    case Map.get(Map.fetch!(engine, field), code) do
-      %{state: :approved, key: key, person: person} -> [{:person, person}, {:actor, key}]
-      %{person: person} when is_binary(person) -> [{:person, person}]
-      _ -> []
-    end
-  end
+  def record_authority({:row, field, person}, _)
+      when field in [
+             :owners,
+             :delivery_states,
+             :algorithm_choices,
+             :alert_choices,
+             :free_order_highs,
+             :bounce_levels
+           ],
+      do: [{:person, person}]
 
-  defp authority_owners(engine, {:row, field, token})
-       when field in [:browser_sign_ins, :join_invitations] do
-    case Map.get(Map.fetch!(engine, field), token) do
-      %{person: person, code: code} when is_binary(code) ->
-        [{:person, person}, {:scope, field, person}, {:scope, :invitation_code, code}]
+  def record_authority({:row, field, {person, actor}}, _)
+      when field in [:sender_grants, :subscriptions, :push_bindings, :cursors, :conversation_cursors],
+      do: [{:person, person}, {:actor, actor}]
 
-      %{person: person} ->
-        [{:person, person}, {:scope, field, person}]
+  def record_authority({:row, field, {person, actor, _}}, _)
+      when field in [:receipts, :source_report_grants],
+      do: [{:person, person}, {:actor, actor}]
 
-      _ ->
-        []
-    end
-  end
+  def record_authority({:row, :origin_sessions, {person, actor, _}}, _),
+    do: [{:person, person}, {:actor, actor}, {:scope, :origin_sessions, {person, actor}}]
 
-  defp authority_owners(engine, {:row, field, {person, actor} = key})
-       when field in [
-              :sender_grants,
-              :subscriptions,
-              :push_bindings,
-              :cursors,
-              :conversation_cursors,
-              :origin_feeds
-            ] do
-    row_owners(engine, field, key, person, actor)
-  end
+  def record_authority({:origin_feed, {person, actor}, :high}, _),
+    do: [{:person, person}, {:actor, actor}]
 
-  defp authority_owners(engine, {:row, :source_report_grants, {person, actor, _} = key}) do
-    row_owners(engine, :source_report_grants, key, person, actor)
-  end
+  def record_authority({:member, :conversation_opened, {person, actor}}, true),
+    do: [{:person, person}, {:actor, actor}]
 
-  defp authority_owners(engine, {:row, :origin_sessions, {person, actor, _} = key}) do
-    if Map.has_key?(engine.origin_sessions, key),
-      do: [{:person, person}, {:actor, actor}, {:scope, :origin_sessions, {person, actor}}],
-      else: []
-  end
-
-  defp authority_owners(engine, {:member, :conversation_opened, {person, actor} = key}) do
-    if MapSet.member?(engine.conversation_opened, key),
-      do: [{:person, person}, {:actor, actor}],
-      else: []
-  end
-
-  defp authority_owners(_engine, _address), do: []
+  def record_authority(_, _), do: []
 
   defp authority_address({:origin_feed, scope, _}), do: {:row, :origin_feeds, scope}
   defp authority_address(address), do: address
-
-  defp row_owners(engine, field, key, person, actor) do
-    if Map.has_key?(Map.fetch!(engine, field), key),
-      do: [{:person, person}, {:actor, actor}],
-      else: []
-  end
 
   # Values the full validator requires to be carried by one row at most, as
   # {namespace, value} => addresses carrying it (inventory rows in brackets):
@@ -633,6 +581,10 @@ defmodule AttentionServer.Store.KeyedValidation do
     end)
   end
 
+  def record_uploads({:origin_feed, _, {:entry, _}}, entry), do: entry_upload_ids(entry)
+  def record_uploads({:row, :messages, _}, record), do: revision_upload_ids(record)
+  def record_uploads(_, _), do: []
+
   defp entry_upload_ids(nil), do: []
 
   defp entry_upload_ids(entry) do
@@ -797,7 +749,11 @@ defmodule AttentionServer.Store.KeyedValidation do
 
     Enum.reduce_while(facts, :ok, fn
       {_fact, same, same}, :ok -> {:cont, :ok}
-      {fact, _, _}, :ok -> {:halt, first_untouched([fact], &{kind, scope, &1}, touched)}
+      {fact, _, _}, :ok ->
+        case first_untouched([fact], &{kind, scope, &1}, touched) do
+          :ok -> {:cont, :ok}
+          error -> {:halt, error}
+        end
     end)
   end
 

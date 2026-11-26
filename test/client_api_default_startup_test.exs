@@ -49,6 +49,8 @@ defmodule AttentionServer.ClientAPIDefaultStartupTest do
         &PreChangeLogStore.operator_bootstrap(&1, person, owner)
       )
 
+      :ok = PreChangeLogStore.convert_fixture(store_path)
+
       skill = Path.join(ctx.dir, "SKILL.md")
       File.write!(skill, "# Harklight agent")
       relay_name = String.to_atom("default_startup_#{System.unique_integer([:positive])}")
@@ -115,7 +117,7 @@ defmodule AttentionServer.ClientAPIDefaultStartupTest do
 
       store = :sys.get_state(ctx.relay).store
       assert store.change_log
-      assert store.mode == :snapshot
+      assert store.mode == :keyed
 
       response = get(ctx, "b1", "/v2/inbox")
       assert response.status == 200

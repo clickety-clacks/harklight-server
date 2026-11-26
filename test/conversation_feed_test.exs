@@ -38,6 +38,27 @@ defmodule AttentionServer.ConversationFeedTest do
     {version, payload, checksum}
   end
 
+  defp row_state(path) do
+    alias AttentionServer.Store.RecordTable
+    assert {:ok, db} = Sqlite3.open(path, mode: :readonly)
+    assert {:ok, version} = RecordTable.generation(db)
+
+    assert {:ok, rows} =
+             RecordTable.select(
+               db,
+               "SELECT key, payload, checksum FROM relay_records ORDER BY key"
+             )
+
+    assert :ok = Sqlite3.close(db)
+
+    assert Enum.all?(rows, fn [key, payload, checksum] ->
+             :crypto.hash(:sha256, [key, payload]) == checksum
+           end)
+
+    encoded = :erlang.term_to_binary(rows)
+    {version, encoded, :crypto.hash(:sha256, encoded)}
+  end
+
   defp large_data_reference_rows(path) do
     assert {:ok, db} = Sqlite3.open(path)
 
@@ -62,26 +83,7 @@ defmodule AttentionServer.ConversationFeedTest do
   end
 
   defp write_legacy_snapshot(path, engine) do
-    {payload, _cache} = SnapshotEncoding.encode(engine, 30)
-    {version, _old_payload, _checksum} = state_snapshot(path)
-    assert {:ok, db} = Sqlite3.open(path)
-
-    assert {:ok, stmt} =
-             Sqlite3.prepare(
-               db,
-               "UPDATE relay_state SET version = ?, payload = ?, checksum = ? WHERE id = 1"
-             )
-
-    assert :ok =
-             Sqlite3.bind(stmt, [
-               version + 1,
-               {:blob, payload},
-               {:blob, :crypto.hash(:sha256, payload)}
-             ])
-
-    assert :done = Sqlite3.step(db, stmt)
-    assert :ok = Sqlite3.release(db, stmt)
-    assert :ok = Sqlite3.close(db)
+    :ok = PreChangeLogStore.snapshot_fixture(path, 30, fn _ -> engine end)
   end
 
   setup do
@@ -160,7 +162,7 @@ defmodule AttentionServer.ConversationFeedTest do
 
   # A device's ordinary-feed ACK, as a 0.1 session stored it: its cursor.
   defp acknowledge(store, key, seq) do
-    engine = %{store.engine | cursors: Map.put(store.engine.cursors, {"A", key}, seq)}
+    engine = Engine.put_row(store.engine, :cursors, {"A", key}, seq)
     {:ok, store} = Store.commit(store, engine, %{person: "A", actor: key, action: "cursor_ack"})
     store
   end
@@ -900,7 +902,6 @@ defmodule AttentionServer.ConversationFeedTest do
     title = Base.encode64(:crypto.strong_rand_bytes(1_572_870))
     assert byte_size(title) > 2 * 1024 * 1024
     title_hash = Base.encode16(:crypto.hash(:sha256, title), case: :lower)
-    {_, before_payload, _} = state_snapshot(path)
 
     assert %{"type" => "ok", "seq" => 1} =
              request(relay, "origin", %{
@@ -915,13 +916,21 @@ defmodule AttentionServer.ConversationFeedTest do
                }
              })
 
-    {_, committed_payload, _} = state_snapshot(path)
-    assert byte_size(committed_payload) - byte_size(before_payload) < 65_536
+    address = {:row, :messages, {"A", "app:test", "large-title"}}
+    key = AttentionServer.Store.RecordCodec.encode_key(address)
+    assert {:ok, db} = Sqlite3.open(path, mode: :readonly)
 
-    assert {:attention_relay_state, 30, persisted} =
-             :erlang.binary_to_term(committed_payload, [:safe])
+    assert {:ok, [[payload, checksum]]} =
+             AttentionServer.Store.RecordTable.select(
+               db,
+               "SELECT payload, checksum FROM relay_records WHERE key = ?",
+               [{:blob, key}]
+             )
 
-    persisted_record = persisted.messages[{"A", "app:test", "large-title"}]
+    assert :ok = Sqlite3.close(db)
+    assert :crypto.hash(:sha256, [key, payload]) == checksum
+    assert byte_size(payload) < 65_536
+    persisted_record = :erlang.binary_to_term(payload, [:safe])
     persisted_title = persisted_record.message["title"]
     assert is_binary(persisted_title)
     assert persisted_title =~ "Full content requires a newer Harklight Server"
@@ -1075,8 +1084,9 @@ defmodule AttentionServer.ConversationFeedTest do
 
     GenServer.stop(relay)
 
-    {_, payload, _} = state_snapshot(path)
-    assert {:attention_relay_state, 30, persisted} = :erlang.binary_to_term(payload, [:safe])
+    assert {:ok, durable} = Store.open(path, :keyed)
+    persisted = LargeData.persist_refs(durable.engine)
+    assert :ok = Store.close(durable)
     large_record = persisted.messages[{"A", "app:test", "rollback-large"}]
     title_marker = large_record.message["title"]
     body_marker = large_record.message["body"]
@@ -1129,6 +1139,7 @@ defmodule AttentionServer.ConversationFeedTest do
              {id, File.read!(Path.join(data_dir, id))}
            end) == saved_files
 
+    :ok = PreChangeLogStore.convert_fixture(path)
     assert {:ok, upgraded} = Relay.start_link(store_path: path)
 
     assert %{"message" => %{"title" => title_value, "body" => body_value}} =
@@ -1232,12 +1243,25 @@ defmodule AttentionServer.ConversationFeedTest do
     assert repaired.engine.messages[key].message["body"] == ref
     assert LargeData.read!(ref) == body
 
-    # Also exercise retirement through the snapshot commit path. A marker
+    # Also exercise retirement through the row commit path. A marker
     # remains in the durable state after the last registered reference goes.
     next = LargeData.persist_refs(repaired.engine)
     audit = %{person: "A", actor: "origin", action: "retain_marker"}
 
-    assert {:ok, committed} = Store.commit(repaired, next, audit)
+    alias AttentionServer.Store.RecordCodec
+
+    previous =
+      Map.new(RecordCodec.encode(repaired.engine), fn {key, payload, _} -> {key, payload} end)
+
+    touched =
+      for {key, payload, _} <- RecordCodec.encode(next),
+          previous[key] != payload,
+          into: MapSet.new() do
+        assert {:ok, address} = RecordCodec.decode_key(key)
+        address
+      end
+
+    assert {:ok, committed} = Store.commit(repaired, {next, touched}, audit)
     assert large_data_reference_rows(path) == []
     assert File.read(ref.path) == {:ok, body}
     assert :ok = Store.close(committed)
@@ -1255,7 +1279,7 @@ defmodule AttentionServer.ConversationFeedTest do
     :ok =
       Sqlite3.execute(
         db,
-        "CREATE TRIGGER reject_large_commit BEFORE UPDATE ON relay_state BEGIN SELECT RAISE(ABORT, 'simulated commit boundary'); END"
+        "CREATE TRIGGER reject_large_commit BEFORE UPDATE ON relay_record_generation BEGIN SELECT RAISE(ABORT, 'simulated commit boundary'); END"
       )
 
     :ok = Sqlite3.close(db)
@@ -1278,8 +1302,7 @@ defmodule AttentionServer.ConversationFeedTest do
     assert :sys.get_state(relay).store.engine.messages == %{}
     assert large_data_reference_rows(path) == []
     data_dir = Path.expand(path) <> ".uploads"
-    assert [orphan] = File.ls!(data_dir)
-    assert Regex.match?(~r/\A[0-9a-f]{64}\z/, orphan)
+    assert File.ls!(data_dir) == []
     GenServer.stop(relay)
 
     {:ok, db} = Sqlite3.open(path)
@@ -2862,11 +2885,11 @@ defmodule AttentionServer.ConversationFeedTest do
                }
              })
 
-    {before_version, before_payload, before_checksum} = state_snapshot(path)
+    {before_version, before_payload, before_checksum} = row_state(path)
     assert :crypto.hash(:sha256, before_payload) == before_checksum
 
     agent_feed_activity(relay, :open)
-    {after_version, after_payload, after_checksum} = state_snapshot(path)
+    {after_version, after_payload, after_checksum} = row_state(path)
 
     assert after_version == before_version + 1
     assert after_payload != before_payload
@@ -2875,7 +2898,7 @@ defmodule AttentionServer.ConversationFeedTest do
     assert {:ok, [], 0} = RelayReaders.conversation_events(relay, "reader", 0)
 
     assert :ok = Relay.setup_person(relay, "B")
-    {next_version, next_payload, next_checksum} = state_snapshot(path)
+    {next_version, next_payload, next_checksum} = row_state(path)
     assert next_version == after_version + 1
     assert next_payload != after_payload
     assert :crypto.hash(:sha256, next_payload) == next_checksum
@@ -2895,7 +2918,7 @@ defmodule AttentionServer.ConversationFeedTest do
 
     assert {:error, :person_exists} = Relay.setup_person(restarted, "B")
 
-    {_version, restored_payload, restored_checksum} = state_snapshot(path)
+    {_version, restored_payload, restored_checksum} = row_state(path)
     assert :crypto.hash(:sha256, restored_payload) == restored_checksum
 
     GenServer.stop(restarted)
@@ -2954,16 +2977,16 @@ defmodule AttentionServer.ConversationFeedTest do
     assert item_availability(restarted) == %{"state" => "listening"}
     assert {:ok, [], 0} = RelayReaders.conversation_events(restarted, "reader", 0)
 
-    duplicate_state = state_snapshot(path)
+    duplicate_state = row_state(path)
 
     assert %{"type" => "ok", "seq" => 1, "duplicate" => true} =
              request(restarted, "origin", forward)
 
-    assert state_snapshot(path) == duplicate_state
+    assert row_state(path) == duplicate_state
 
     {attach_version, attach_payload, _} = duplicate_state
     assert :ok = Relay.setup_person(restarted, "B")
-    {folded_version, folded_payload, folded_checksum} = state_snapshot(path)
+    {folded_version, folded_payload, folded_checksum} = row_state(path)
     assert folded_version > attach_version
     assert folded_payload != attach_payload
     assert :crypto.hash(:sha256, folded_payload) == folded_checksum

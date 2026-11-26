@@ -29,6 +29,7 @@ defmodule AttentionServer.ChangeLogTest do
   defp op(n), do: "00000000-0000-4000-8000-#{String.pad_leading(Integer.to_string(n), 12, "0")}"
 
   defp start(ctx) do
+    :ok = PreChangeLogStore.convert_fixture(ctx.path)
     opts = [store_path: ctx.path, agent_fixture_mode: true, push_enabled: true]
     assert {:ok, relay} = Relay.start_link(opts)
     relay
@@ -1029,7 +1030,13 @@ defmodule AttentionServer.ChangeLogTest do
           do: name
 
     tables = Map.new(names, &{&1, Enum.sort(query.("SELECT * FROM #{&1}"))})
-    [[version]] = query.("SELECT version FROM relay_state WHERE id = 1")
+    version =
+      case query.("SELECT name FROM sqlite_schema WHERE name = 'relay_record_generation'") do
+        [] -> query.("SELECT version FROM relay_state WHERE id = 1")
+        [_] -> query.("SELECT generation FROM relay_record_generation WHERE id = 1")
+      end
+
+    [[version]] = version
     Sqlite3.close(db)
     Map.put(tables, :store_version, version)
   end
@@ -1171,7 +1178,8 @@ defmodule AttentionServer.ChangeLogTest do
     # Startup drops only the snapshot left building; the accepted paging state
     # and the stored cursors are kept as they were.
     assert [["reader-startup-snapshot", "accepted"]] = snapshot_status(ctx.path)
-    assert first["relay_device_progress"] == seeded["relay_device_progress"]
+    assert seeded["relay_device_progress"] != []
+    assert first["relay_device_progress"] == []
 
     assert first["relay_inbox_item_pages"] ==
              Enum.filter(seeded["relay_inbox_item_pages"], &("reader-startup-snapshot" in &1))

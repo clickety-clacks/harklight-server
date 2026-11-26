@@ -65,6 +65,7 @@ defmodule AttentionServer.Engine do
             receipts: %{},
             origin_feeds: %{},
             origin_sessions: %{},
+            item_availability: %{},
             origin_receipts: %{},
             origin_actions: %{},
             uploads: %{},

@@ -1,6 +1,8 @@
 defmodule AttentionServer.Store.KeyedMigrationTest do
   use ExUnit.Case, async: true
 
+  import ExUnit.CaptureLog
+
   alias AttentionServer.{Engine, Store}
   alias AttentionServer.Store.{KeyedMigration, RecordCodec, RecordTable}
   alias Exqlite.Sqlite3
@@ -18,6 +20,160 @@ defmodule AttentionServer.Store.KeyedMigrationTest do
     assert :ok = Store.close(store)
   end
 
+  test "the shipped fit envelope admits a small snapshot and guard makes conversion idempotent",
+       %{
+         path: path,
+         store: store
+       } do
+    assert :ok = Store.close(store)
+    gib = 1024 * 1024 * 1024
+    budget = %{memory: 2 * gib, disk: 2 * gib, uploads: 4096}
+
+    assert {:error, :source_format_mismatch} = Store.convert_stopped(path, budget, 29)
+    assert {:ok, :converted} = Store.convert_stopped(path, budget, 30)
+    assert {:ok, :already_converted} = Store.convert_stopped(path, budget, 30)
+    assert {:ok, reopened} = Store.open(path, :keyed)
+    assert reopened.version == 1
+    assert :ok = Store.close(reopened)
+  end
+
+  test "the stopped converter refuses a keyed-looking anchor without its row tables", %{
+    path: path,
+    store: store
+  } do
+    payload = :erlang.term_to_binary({:attention_relay_keyed_state, 31, RecordCodec.identity()})
+    write_fixture_payload(store, payload)
+
+    assert {:error, :unsupported_snapshot} = Store.convert_stopped(path, conversion_budget(), 30)
+  end
+
+  test "the stopped converter refuses oversized or unreadable snapshots before decoding", %{
+    path: path,
+    store: store
+  } do
+    <<131, term::binary>> = :erlang.term_to_binary({:attention_relay_state, 30, %{}})
+    oversized = <<131, 80, 1_000_000_000::32, :zlib.compress(term)::binary>>
+
+    for {payload, reason} <- [
+          {oversized, :fit_not_established},
+          {<<131, 80, 8::32, 0, 0, 0>>, :unsupported_snapshot}
+        ] do
+      assert {:ok, legacy} = Sqlite3.open(path)
+      write_fixture_payload(%{store | db: legacy}, payload)
+      assert {:error, ^reason} = Store.convert_stopped(path, conversion_budget(), 30)
+      assert {:ok, db} = Sqlite3.open(path)
+      assert {:ok, [[^payload]]} = RecordTable.select(db, "SELECT payload FROM relay_state")
+
+      assert {:ok, []} =
+               RecordTable.select(
+                 db,
+                 "SELECT name FROM sqlite_schema WHERE name = 'relay_records'"
+               )
+
+      assert :ok = Sqlite3.close(db)
+    end
+
+    assert :ok = Store.close(store)
+  end
+
+  defp write_fixture_payload(store, payload) do
+    assert :ok =
+             RecordTable.run(
+               store.db,
+               "UPDATE relay_state SET payload = ?, checksum = ? WHERE id = 1",
+               [
+                 {:blob, payload},
+                 {:blob, :crypto.hash(:sha256, payload)}
+               ]
+             )
+
+    assert :ok = Store.close(store)
+  end
+
+  defp conversion_budget do
+    gib = 1024 * 1024 * 1024
+    %{memory: 2 * gib, disk: 2 * gib, uploads: 4096}
+  end
+
+  for stage <-
+        ~w(preflight_passed snapshot_loaded records_written indexes_written records_verified anchor_written committed)a do
+    test "a killed converter recovers at #{stage}", %{path: path, store: store} do
+      stage = unquote(stage)
+      assert {:ok, engine} = Engine.setup_person(store.engine, "reader")
+      audit = %{person: "reader", actor: "fixture", action: "seed"}
+      assert {:ok, legacy} = Store.commit(store, engine, audit)
+
+      assert {:ok, original} =
+               RecordTable.select(legacy.db, "SELECT version, checksum FROM relay_state")
+
+      assert :ok = Store.close(legacy)
+
+      gib = 1024 * 1024 * 1024
+      budget = %{memory: 2 * gib, disk: 2 * gib, uploads: 4096}
+
+      {worker, monitor} =
+        spawn_monitor(fn ->
+          receive do
+            :start -> Store.convert_stopped(path, budget, 30)
+          end
+        end)
+
+      handler = {__MODULE__, make_ref()}
+      event = [:harklight, :store, :conversion, stage]
+
+      assert :ok =
+               :telemetry.attach(handler, event, &__MODULE__.pause_converter/4, {worker, self()})
+
+      on_exit(fn ->
+        :telemetry.detach(handler)
+        if Process.alive?(worker), do: Process.exit(worker, :kill)
+      end)
+
+      send(worker, :start)
+      assert_receive {^worker, ^stage}, 5_000
+      Process.exit(worker, :kill)
+      assert_receive {:DOWN, ^monitor, :process, ^worker, :killed}, 2_000
+
+      if stage == :committed do
+        assert {:ok, :already_converted} = Store.convert_stopped(path, budget, 30)
+      else
+        assert {:ok, db} = Sqlite3.open(path)
+
+        assert {:ok, ^original} =
+                 RecordTable.select(db, "SELECT version, checksum FROM relay_state")
+
+        assert {:ok, []} =
+                 RecordTable.select(
+                   db,
+                   "SELECT name FROM sqlite_schema WHERE name = 'relay_records'"
+                 )
+
+        assert :ok = Sqlite3.close(db)
+        assert {:ok, :converted} = Store.convert_stopped(path, budget, 30)
+      end
+
+      assert {:ok, converted} = Store.open(path, :keyed)
+      assert converted.engine.persons == %{"reader" => 0}
+      assert :ok = Store.close(converted)
+    end
+  end
+
+  def pause_converter(
+        [:harklight, :store, :conversion, stage],
+        _measurement,
+        _metadata,
+        {worker, observer}
+      )
+      when worker == self() do
+    send(observer, {worker, stage})
+
+    receive do
+      :continue -> :ok
+    end
+  end
+
+  def pause_converter(_event, _measurement, _metadata, _config), do: :ok
+
   test "reads verified keyed records at their current generation", %{store: store} do
     assert {:ok, engine} = Engine.setup_person(store.engine, "reader")
     assert {:ok, 1} = stage_keyed(store.db, engine, RecordCodec.identity())
@@ -26,13 +182,13 @@ defmodule AttentionServer.Store.KeyedMigrationTest do
     row = RecordCodec.encode_row({:field, :pending_clock_high_water}, 12)
 
     assert {:ok, :saved} =
-             RecordTable.commit(store.db, 1, [{:put, row}], fn _, _ -> {:ok, :saved} end)
+             RecordTable.commit(store.db, 1, [{:update, row}], fn _, _ -> {:ok, :saved} end)
 
     assert {:ok, %{pending_clock_high_water: 12}, 2} = KeyedMigration.load(store.db)
     assert :ok = Store.close(store)
   end
 
-  test "snapshot startup refuses a keyed store and leaves it intact", %{
+  test "legacy startup names FORMAT31 and leaves the converted database intact", %{
     path: path,
     store: store
   } do
@@ -40,9 +196,14 @@ defmodule AttentionServer.Store.KeyedMigrationTest do
     assert :ok = Store.close(store)
     before_refusal = File.read!(path)
 
-    assert {:error, {:storage_unavailable, {:error, :format30_requires_keyed_mode}}} =
-             Store.open(path)
+    warning =
+      capture_log(fn ->
+        assert {:error, {:storage_unavailable, {:error, :format31_requires_keyed_mode}}} =
+                 Store.open(path, :snapshot)
+      end)
 
+    assert warning =~ "FORMAT31"
+    assert warning =~ "restore the pre-upgrade backup"
     assert File.read!(path) == before_refusal
   end
 
@@ -160,7 +321,7 @@ defmodule AttentionServer.Store.KeyedMigrationTest do
   end
 
   defp stage_keyed(db, engine, identity) do
-    payload = :erlang.term_to_binary({:attention_relay_keyed_state, 30, identity})
+    payload = :erlang.term_to_binary({:attention_relay_keyed_state, 31, identity})
     digest = :crypto.hash(:sha256, payload)
 
     RecordTable.transaction(db, fn ->

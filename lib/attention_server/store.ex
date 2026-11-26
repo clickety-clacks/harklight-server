@@ -27,6 +27,8 @@ defmodule AttentionServer.Store do
 
   alias AttentionServer.Store.{
     ClientDataMigration,
+    ConversionPreflight,
+    DerivedIndex,
     KeyedMigration,
     KeyedReference,
     KeyedValidation,
@@ -178,21 +180,17 @@ defmodule AttentionServer.Store do
 
   @doc false
   def migrate_retained_client_data(%__MODULE__{mode: :snapshot, change_log: true} = store) do
-    case one(store.db, "SELECT name FROM relay_data_migrations WHERE name = ?", [
-           @client_data_migration
-         ]) do
+    case retained_data_migration(store.db) do
       {:ok, [@client_data_migration]} ->
         {:ok, store}
 
       {:ok, nil} ->
-        engine = ClientDataMigration.prepare(store.engine)
+        {engine, touched} = ClientDataMigration.prepare(store.engine)
 
-        if engine == store.engine do
+        if MapSet.size(touched) == 0 do
           with :ok <- record_data_migration(store.db, @client_data_migration), do: {:ok, store}
         else
-          audit = %{person: "system", actor: "schema_migration", action: @client_data_migration}
-
-          case commit(store, engine, audit) do
+          case commit(store, engine, retained_data_audit()) do
             {:ok, migrated} -> {:ok, migrated}
             {:error, reason, _} -> {:error, reason}
           end
@@ -205,6 +203,13 @@ defmodule AttentionServer.Store do
 
   def migrate_retained_client_data(%__MODULE__{}), do: {:error, :storage_unavailable}
 
+  defp retained_data_migration(db) do
+    one(db, "SELECT name FROM relay_data_migrations WHERE name = ?", [@client_data_migration])
+  end
+
+  defp retained_data_audit,
+    do: %{person: "system", actor: "schema_migration", action: @client_data_migration}
+
   def open(nil), do: {:ok, %__MODULE__{db: nil, engine: Engine.new(), version: 0}}
 
   def open(":memory:") do
@@ -212,12 +217,29 @@ defmodule AttentionServer.Store do
     {:error, :invalid_store_path}
   end
 
-  def open(path) when is_binary(path) and path != "", do: open(path, :snapshot)
+  def open(path) when is_binary(path) and path != "" do
+    if File.exists?(path) do
+      with {:ok, mode} <- cutover_mode(path), do: open(path, mode)
+    else
+      open(path, :snapshot)
+    end
+  end
 
   def open(_) do
     Diagnostics.failure(:server_storage, :store_open, :invalid_store_path, :unavailable)
     {:error, :invalid_store_path}
   end
+
+  def open_relay(path) when is_binary(path) and path not in ["", ":memory:"],
+    do: open(path, :relay)
+
+  def open_relay(path), do: open(path)
+
+  def track_relay_writes(%__MODULE__{mode: :keyed} = store) do
+    put_in(store.engine.touched_keys, MapSet.new())
+  end
+
+  def track_relay_writes(store), do: store
 
   def open(path, :keyed_cutover)
       when is_binary(path) and path != "" and path != ":memory:" do
@@ -226,22 +248,20 @@ defmodule AttentionServer.Store do
         open(path, :keyed)
 
       {:ok, :snapshot} ->
-        with {:ok, snapshot} <- open_store(path, :snapshot),
-             {:ok, keyed} <- convert_snapshot_store(snapshot) do
-          finish_open(keyed)
-        end
+        with {:ok, keyed} <- convert_snapshot_store(path), do: finish_open(keyed)
 
       error ->
         error
     end
   end
 
-  def open(path, mode) when is_binary(path) and path != "" and mode in [:snapshot, :keyed] do
+  def open(path, mode)
+      when is_binary(path) and path != "" and mode in [:snapshot, :keyed, :relay] do
     with {:ok, store} <- open_store(path, mode), do: finish_open(store)
   end
 
   @doc """
-  Reads the engine of a stopped, checkpointed FORMAT30 store without opening
+  Reads a stopped, checkpointed FORMAT30 or FORMAT31 store without opening
   the original with SQLite. A disposable private copy contains any SQLite
   sidecars, and no normal startup or migration work runs.
   """
@@ -284,11 +304,11 @@ defmodule AttentionServer.Store do
   defp read_preview_engine(db) do
     case one(db, "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'relay_records'", []) do
       {:ok, [1]} ->
-        with {:ok, decoded, _generation} <- KeyedMigration.load(db),
+        with {:ok, decoded, _generation} <- KeyedMigration.load_preview(db),
              do: validate_keyed_engine(decoded)
 
       {:ok, nil} ->
-        with {:ok, engine, _version} <- load_or_create(db, nil, false), do: {:ok, engine}
+        with {:ok, engine, _version} <- load_or_create(db, nil, :preview), do: {:ok, engine}
 
       error ->
         error
@@ -302,7 +322,9 @@ defmodule AttentionServer.Store do
       {:ok, db} ->
         case initialize(db, upload_dir, mode) do
           {:ok, engine, version} ->
-            case finalize_open(db, upload_dir, engine, version, mode) do
+            store_mode = if mode == :relay, do: :keyed, else: mode
+
+            case finalize_open(db, upload_dir, engine, version, store_mode) do
               {:ok, store} ->
                 {:ok, store}
 
@@ -316,6 +338,10 @@ defmodule AttentionServer.Store do
                 _ = Sqlite3.close(db)
                 {:error, :storage_unavailable}
             end
+
+          {:error, :conversion_required} = error ->
+            _ = Sqlite3.close(db)
+            error
 
           error ->
             Diagnostics.failure(:server_storage, :store_open, error, :unavailable)
@@ -347,35 +373,129 @@ defmodule AttentionServer.Store do
     end
   end
 
-  defp convert_snapshot_store(snapshot) do
-    case KeyedMigration.convert_store(snapshot, &prepare_keyed_conversion/3) do
-      {:ok, _} = converted ->
-        converted
+  def convert_stopped(path, budget, expected_format) when is_binary(path) and path != "" do
+    preflight = &ConversionPreflight.check(&1, budget, expected_format)
 
-      error ->
-        _ = close(snapshot)
-        error
-    end
-  catch
-    kind, reason ->
-      _ = close(snapshot)
-      :erlang.raise(kind, reason, __STACKTRACE__)
+    convert_snapshot_store(path, preflight, fn _store, _engine, _generation -> {:ok, :converted} end)
   end
 
-  defp prepare_keyed_conversion(legacy, decoded, generation) do
-    with {:ok, engine} <- validate_keyed_engine(decoded),
-         engine = rebuild_open_indexes(engine),
-         {:ok, rows} <- load_large_data_references(legacy.db),
-         {:ok, engine} <- LargeData.attach_paths(engine, legacy.upload_dir, rows),
-         :ok <- LargeData.verify_all(engine) do
-      finalize_mode(%__MODULE__{
-        db: legacy.db,
-        upload_dir: legacy.upload_dir,
-        engine: engine,
-        version: generation,
-        mode: :keyed
-      })
+  defp convert_snapshot_store(
+         path,
+         preflight \\ fn _db -> :ok end,
+         prepare \\ &prepare_keyed_conversion/3
+       ) do
+    upload_dir = Path.expand(path) <> ".uploads"
+
+    with {:ok, db} <- Sqlite3.open(path, mode: :readwrite) do
+      try do
+        result =
+          RecordTable.transaction(db, fn ->
+            case preflight.(db) do
+              :ok -> convert_locked(db, upload_dir, prepare)
+              {:ok, _info} -> convert_locked(db, upload_dir, prepare)
+              {:already_converted, 31} -> {:ok, :already_converted}
+              error -> error
+            end
+          end)
+
+        case result do
+          {:ok, :already_converted} = success ->
+            _ = Sqlite3.close(db)
+            success
+
+          {:ok, :converted} = success ->
+            :ok = KeyedMigration.report_stage(:committed)
+            _ = Sqlite3.close(db)
+            success
+
+          {:ok, _} = success ->
+            :ok = KeyedMigration.report_stage(:committed)
+            success
+
+          error ->
+            Diagnostics.failure(:server_storage, :store_open, error, :unavailable)
+            _ = Sqlite3.close(db)
+            error
+        end
+      catch
+        kind, reason ->
+          _ = Sqlite3.close(db)
+          :erlang.raise(kind, reason, __STACKTRACE__)
+      end
     end
+  end
+
+  # Normalise in memory so a failed install preserves the old anchor and
+  # progress rows at their original generation.
+  defp convert_locked(db, upload_dir, prepare) do
+    with :ok <- KeyedMigration.report_stage(:preflight_passed),
+         :ok <- Sqlite3.execute(db, @schema),
+         {:ok, legacy} <- load_or_create(db, upload_dir, :convert),
+         :ok <- KeyedMigration.report_stage(:snapshot_loaded),
+         {:ok, rows} <- load_large_data_references(db),
+         {:ok, engine} <- attach_conversion_refs(legacy.engine, upload_dir, rows),
+         {:ok, legacy} <- prepare_cutover_client_data(%{legacy | engine: engine}),
+         :ok <- LargeData.verify_all(legacy.engine),
+         :ok <- write_large_data_references(db, LargeData.persisted_references(legacy.engine)) do
+      KeyedMigration.convert_locked(
+        legacy,
+        legacy.engine,
+        legacy.version,
+        prepare
+      )
+    end
+  end
+
+  # The cutover owns the transaction. Prepare the retained data before writing
+  # records so its changes, log entries and marker roll back with the anchor.
+  defp prepare_cutover_client_data(%__MODULE__{db: db} = snapshot) do
+    case retained_data_migration(db) do
+      {:ok, [@client_data_migration]} ->
+        {:ok, snapshot}
+
+      {:ok, nil} ->
+        {engine, touched} = ClientDataMigration.prepare(snapshot.engine)
+
+        with :ok <- record_cutover_client_changes(snapshot, engine, touched),
+             :ok <- record_data_migration(db, @client_data_migration) do
+          {:ok, %{snapshot | engine: engine}}
+        end
+
+      error ->
+        error
+    end
+  end
+
+  defp record_cutover_client_changes(%__MODULE__{db: db, version: version} = snapshot, engine, touched) do
+    if MapSet.size(touched) == 0 do
+      :ok
+    else
+      before = AttentionServer.RouteBIndex.enable_agent_feed(snapshot.engine)
+      next = %{engine | route_b_index: before.route_b_index}
+      log = AttentionServer.ChangeLog.commit_log_touched(before, next, touched, [])
+
+      with :ok <- AttentionServer.ChangeLog.enable_in_transaction(db, version),
+           :ok <- AttentionServer.AgentChangeLog.enable_in_transaction(db, before, version),
+           :ok <- write_audit(db, retained_data_audit()),
+           {:ok, _, _} <- append_change_logs(db, log, version + 1) do
+        :ok
+      end
+    end
+  end
+
+  defp attach_conversion_refs(engine, _directory, []), do: {:ok, engine}
+
+  defp attach_conversion_refs(engine, directory, rows),
+    do: LargeData.attach_paths(engine, directory, rows)
+
+  defp prepare_keyed_conversion(legacy, engine, generation) do
+    finalize_mode(%__MODULE__{
+      db: legacy.db,
+      upload_dir: legacy.upload_dir,
+      engine: rebuild_open_indexes(engine),
+      version: generation,
+      mode: :keyed
+    })
   end
 
   defp finalize_open(db, upload_dir, engine, version, mode) do
@@ -926,10 +1046,21 @@ defmodule AttentionServer.Store do
     end
   end
 
+  defp initialize(db, upload_dir, :relay) do
+    with {:ok, kind} <- relay_layout(db) do
+      case kind do
+        :rows -> initialize(db, upload_dir, :keyed)
+        :snapshot -> {:error, :conversion_required}
+        :empty -> initialize_new_relay(db, upload_dir)
+      end
+    end
+  end
+
   defp initialize(db, _upload_dir, :keyed) do
     with {:ok, engine, generation} <- KeyedMigration.load(db),
          {:ok, engine} <- validate_keyed_engine(engine),
-         :ok <- set_durability(db) do
+         :ok <- set_durability(db),
+         :ok <- DerivedIndex.ensure(db, generation) do
       {:ok, engine, generation}
     end
   end
@@ -939,6 +1070,66 @@ defmodule AttentionServer.Store do
     if valid_state?(engine), do: {:ok, engine}, else: {:error, :invalid_state}
   rescue
     _ -> {:error, :invalid_state}
+  end
+
+  defp relay_layout(db) do
+    case one(
+           db,
+           "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = 'relay_state'",
+           []
+         ) do
+      {:ok, [0]} ->
+        {:ok, :empty}
+
+      {:ok, [1]} ->
+        case one(
+               db,
+               """
+               SELECT EXISTS (SELECT 1 FROM relay_state WHERE id = 1),
+                      EXISTS (SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'relay_records')
+               """,
+               []
+             ) do
+          {:ok, [1, 1]} -> {:ok, :rows}
+          {:ok, [1, 0]} -> {:ok, :snapshot}
+          {:ok, [0, 0]} -> {:ok, :empty}
+          error -> error
+        end
+
+      error ->
+        error
+    end
+  end
+
+  defp initialize_new_relay(db, upload_dir) do
+    with :ok <- set_durability(db) do
+      case RecordTable.transaction(db, fn -> bootstrap_if_empty(db) end) do
+        {:ok, :existing} -> initialize(db, upload_dir, :keyed)
+        {:ok, engine} -> {:ok, engine, 0}
+        error -> error
+      end
+    end
+  end
+
+  defp bootstrap_if_empty(db) do
+    case relay_layout(db) do
+      {:ok, :rows} ->
+        {:ok, :existing}
+
+      {:ok, :snapshot} ->
+        {:error, :conversion_required}
+
+      {:ok, :empty} ->
+        engine = Engine.new()
+
+        with :ok <- Sqlite3.execute(db, @schema),
+             :ok <- KeyedMigration.bootstrap(db, engine) do
+          {:ok, engine}
+        end
+
+      error ->
+        error
+    end
   end
 
   defp set_durability(db),
@@ -951,16 +1142,21 @@ defmodule AttentionServer.Store do
   def commit(store, next, audit, projected_entries \\ [])
 
   def commit(
+        %__MODULE__{mode: :keyed} = store,
+        %Engine{touched_keys: %MapSet{} = touched} = next,
+        audit,
+        projected_entries
+      ) do
+    commit(store, {%{next | touched_keys: MapSet.new()}, touched}, audit, projected_entries)
+  end
+
+  def commit(
         %__MODULE__{mode: :keyed, change_log: true} = store,
         %Engine{} = next,
         %{item_refresh: keys} = audit,
         []
       ) do
-    touched =
-      for {person, _, _} = key <- keys, into: MapSet.new() do
-        %{origin: origin, session_handle: handle} = Map.fetch!(next.messages, key)
-        {:row, :origin_sessions, {person, origin, handle}}
-      end
+    touched = MapSet.new(keys, &{:row, :item_availability, &1})
 
     commit(store, {next, touched}, audit)
   end
@@ -1044,20 +1240,39 @@ defmodule AttentionServer.Store do
           _ -> keyed_change_log(store, next, touched, projected)
         end
 
+      %{records: records, delete_paths: delete_paths, reference_rows: references} = prepared
+      derived = DerivedIndex.changes(old, next, touched)
+
       result =
         Persistence.run(fn ->
-          RecordTable.commit(db, version, prepared.records, fn db, generation ->
-            with :ok <- write_reference_delta(db, prepared.delete_paths, prepared.reference_rows),
-                 :ok <- write_audit(db, audit),
-                 {:ok, heads, agent_heads} <- append_change_logs(db, log, generation) do
-              {:ok, {heads, agent_heads}}
-            end
-          end)
+          result =
+            RecordTable.commit(db, version, records, fn db, generation ->
+              with :ok <- DerivedIndex.write(db, derived),
+                   :ok <- write_reference_delta(db, delete_paths, references),
+                   :ok <- write_audit(db, audit),
+                   {:ok, heads, agent_heads} <- append_change_logs(db, log, generation),
+                   :ok <- DerivedIndex.advance(db, generation) do
+                {:ok, {heads, agent_heads}}
+              end
+            end)
+
+          if match?({:ok, _}, result) do
+            :telemetry.execute([:harklight, :store, :commit, :committed], %{generation: version + 1}, %{})
+          end
+
+          result
         end)
 
       case result do
         {:ok, {heads, agent_heads}} ->
-          prune_released_blobs(store.upload_dir, prepared.orphan_candidates, blob_owners, audit)
+          prune_released_blobs(
+            store.upload_dir,
+            prepared.orphan_candidates,
+            blob_owners,
+            prepared.engine,
+            audit
+          )
+
           AttentionServer.ChangeLog.notify(heads)
           AttentionServer.ChangeLog.notify(agent_heads)
           if log, do: AttentionServer.ChangeLog.notify_closing(log.closings)
@@ -1411,6 +1626,8 @@ defmodule AttentionServer.Store do
 
   defp local_dependents({:row, :persons, person}), do: [{:row, :conversation_highs, person}]
 
+  defp local_dependents({:row, :messages, key}), do: [{:row, :item_availability, key}]
+
   defp local_dependents({:row, :chat_read_positions, key}),
     do: [{:row, :reply_group_history, key}]
 
@@ -1558,6 +1775,7 @@ defmodule AttentionServer.Store do
     :alert_choices,
     :push_bindings,
     :origin_sessions,
+    :item_availability,
     :origin_receipts,
     :origin_actions,
     :bounce_levels,
@@ -1616,6 +1834,9 @@ defmodule AttentionServer.Store do
 
   defp valid_keyed_row?(engine, :origin_sessions, key, session),
     do: Conversation.valid_origin_session?(engine, key, session)
+
+  defp valid_keyed_row?(engine, :item_availability, key, value),
+    do: valid_item_availability?(engine, key, value)
 
   defp valid_keyed_row?(engine, :origin_receipts, key, receipt),
     do: Conversation.valid_origin_receipt?(engine, key, receipt)
@@ -1809,30 +2030,19 @@ defmodule AttentionServer.Store do
   # A blob whose last owning record was rewritten or removed in this commit
   # is deleted after the commit is durable. A failed unlink leaves an orphan
   # for the next open's cleanup.
-  defp prune_released_blobs(nil, _candidates, _owners, _audit), do: :ok
+  defp prune_released_blobs(nil, _candidates, _owners, _engine, _audit), do: :ok
 
-  defp prune_released_blobs(directory, candidates, owners, audit) do
-    candidates
-    |> Enum.uniq()
-    |> Enum.reject(&Map.has_key?(owners, &1))
-    |> Enum.each(fn id ->
-      case File.rm(Path.join(directory, id)) do
-        :ok ->
-          :ok
+  defp prune_released_blobs(directory, candidates, owners, engine, audit) do
+    released = candidates |> Enum.uniq() |> Enum.reject(&Map.has_key?(owners, &1))
+    result = LargeData.delete_released(directory, released, engine)
 
-        {:error, :enoent} ->
-          :ok
-
-        {:error, reason} ->
-          Diagnostics.failure(
-            :server_storage,
-            :large_data_delete,
-            reason,
-            :unavailable,
-            operation_id(audit)
-          )
-      end
-    end)
+    Diagnostics.result(
+      :server_storage,
+      :large_data_delete,
+      result,
+      :unavailable,
+      operation_id(audit)
+    )
   end
 
   # These pages only update the availability checkpoint on existing sessions.
@@ -2008,16 +2218,16 @@ defmodule AttentionServer.Store do
              [audit.person, audit.actor, audit.action, System.system_time(:millisecond)]
            ),
          {:ok, heads, agent_heads} <- append_change_logs(db, log, version + 1),
-         :ok <- record_snapshot_migration(db, audit),
+         :ok <- record_committed_migration(db, audit),
          :ok <- Sqlite3.execute(db, "COMMIT") do
       {:ok, heads, agent_heads}
     end
   end
 
-  defp record_snapshot_migration(db, %{actor: "schema_migration", action: @client_data_migration}),
+  defp record_committed_migration(db, %{actor: "schema_migration", action: @client_data_migration}),
     do: record_data_migration(db, @client_data_migration)
 
-  defp record_snapshot_migration(_db, _audit), do: :ok
+  defp record_committed_migration(_db, _audit), do: :ok
 
   defp record_data_migration(db, name),
     do: run(db, "INSERT OR IGNORE INTO relay_data_migrations (name) VALUES (?)", [name])
@@ -2154,9 +2364,9 @@ defmodule AttentionServer.Store do
     end
   end
 
-  defp load_or_create(db, upload_dir, create? \\ true) do
+  defp load_or_create(db, upload_dir, purpose \\ :open) do
     case one(db, "SELECT version, payload, checksum FROM relay_state WHERE id = 1", []) do
-      {:ok, nil} when create? ->
+      {:ok, nil} when purpose == :open ->
         engine = Engine.new()
         payload = Persistence.run(fn -> encode_state(engine) end)
 
@@ -2199,11 +2409,15 @@ defmodule AttentionServer.Store do
             _ = RecordCodec.identity()
 
             case :erlang.binary_to_term(payload, [:safe]) do
-              {:attention_relay_keyed_state, 30, _identity} ->
-                {:error, :format30_requires_keyed_mode}
+              {:attention_relay_keyed_state, 31, _identity} ->
+                Logger.error(
+                  "Harklight Store uses FORMAT31 rows. To run a snapshot release, restore the pre-upgrade backup."
+                )
+
+                {:error, :format31_requires_keyed_mode}
 
               {:attention_relay_state, @format_version, %Engine{} = stored} ->
-                load_format30(db, version, stored)
+                load_format30(db, upload_dir, version, stored, purpose)
 
               {:attention_relay_state, format, %Engine{}} when is_integer(format) ->
                 {:error, {:unsupported_store_format, format}}
@@ -2225,18 +2439,21 @@ defmodule AttentionServer.Store do
     end
   end
 
-  defp load_format30(db, version, stored) do
+  defp load_format30(db, upload_dir, version, stored, purpose) do
     original = struct(Engine, Map.from_struct(stored))
 
-    with {:ok, store} <- load_progress(%__MODULE__{db: db, engine: original, version: version}) do
+    with {:ok, store} <- load_progress(%__MODULE__{db: db, engine: original, version: version, upload_dir: upload_dir}) do
       engine =
         store.engine
         |> BrowserSignIn.normalize_snapshot_records()
         |> BounceDecision.rebuild_indexes()
         |> Engine.rebuild_route_b_index()
 
-      # The next successful snapshot write persists the current token shape.
-      if valid_state?(engine), do: {:ok, engine, version}, else: {:error, :invalid_state}
+      cond do
+        not valid_state?(engine) -> {:error, :invalid_state}
+        purpose == :convert -> {:ok, %{store | engine: engine}}
+        true -> {:ok, engine, version}
+      end
     end
   end
 
@@ -2432,6 +2649,16 @@ defmodule AttentionServer.Store do
   end
 
 
+  defp valid_item_availability?(engine, key, {status, stamp})
+       when status in ["listening", "not_listening", "unsupported", "gone"] do
+    match?(%{session_handle: handle} when is_binary(handle), Map.get(engine.messages, key)) and
+      (is_nil(stamp) or (is_integer(stamp) and stamp > 0))
+  end
+
+  defp valid_item_availability?(_engine, _key, _value), do: false
+
+  # The durable hot path checks bounce index containers without rescanning their
+  # retained rows. Store open performs the full cross-map bounce validation.
   defp valid_state?(%Engine{} = engine), do: valid_state?(engine, :full)
 
   defp valid_state?(%Engine{} = engine, bounce_validation) do
@@ -2455,6 +2682,9 @@ defmodule AttentionServer.Store do
         valid_alert_choices?(engine) and
         valid_push_bindings?(engine) and
         AttentionServer.Conversation.valid_state?(engine) and
+        Enum.all?(engine.item_availability, fn {key, value} ->
+          valid_item_availability?(engine, key, value)
+        end) and
         BounceDecision.valid_state?(engine, bounce_validation) and
         valid_uploads?(engine) and
         valid_upload_references?(engine) and

@@ -25,7 +25,7 @@ defmodule AttentionServer.Store.KeyedReferenceTest do
     assert :ok = LargeData.verify(ref)
     assert changes.reference_rows == LargeData.persisted_references(changes.engine)
 
-    assert [{:put, {_, persisted, _}}] = changes.records
+    assert [{:insert, {_, persisted, _}}] = changes.records
 
     assert :erlang.binary_to_term(persisted, [:safe]) ==
              LargeData.persist_refs(changes.engine.messages[key])
@@ -44,7 +44,7 @@ defmodule AttentionServer.Store.KeyedReferenceTest do
     assert {:ok, change} = KeyedReference.prepare(old, next, addresses, directory)
     assert change.reference_rows == LargeData.persisted_references(next)
     assert change.delete_paths == Enum.map(LargeData.persisted_references(old), &hd/1)
-    assert Enum.sort(Enum.map(change.records, &elem(&1, 0))) == [:delete, :put]
+    assert Enum.sort(Enum.map(change.records, &elem(&1, 0))) == [:delete, :insert]
 
     assert_raise FunctionClauseError, fn ->
       KeyedReference.prepare(

@@ -732,16 +732,22 @@ defmodule AttentionServer.ChangeLog do
   holding an older cursor get `cursor_expired` and re-read a snapshot.
   """
   def enable(db, store_version) do
-    with :ok <- Enum.reduce_while(@schema, :ok, &create(db, &1, &2)),
-         :ok <- Sqlite3.execute(db, "BEGIN IMMEDIATE"),
-         :ok <- add_rank_projection_version(db),
-         :ok <- reconcile(db, store_version),
+    with :ok <- Sqlite3.execute(db, "BEGIN IMMEDIATE"),
+         :ok <- enable_in_transaction(db, store_version),
          :ok <- Sqlite3.execute(db, "COMMIT") do
       :ok
     else
       error ->
         _ = Sqlite3.execute(db, "ROLLBACK")
         error
+    end
+  end
+
+  @doc false
+  def enable_in_transaction(db, store_version) do
+    with :ok <- Enum.reduce_while(@schema, :ok, &create(db, &1, &2)),
+         :ok <- add_rank_projection_version(db) do
+      reconcile(db, store_version)
     end
   end
 
@@ -1007,6 +1013,29 @@ defmodule AttentionServer.ChangeLog do
 
   def rev(%AttentionServer.Store{}, _person, _resource_id), do: {:error, :disabled}
 
+  @doc false
+  def page_revisions(%AttentionServer.Store{change_log: true}, _person, []), do: {:ok, %{}}
+
+  def page_revisions(%AttentionServer.Store{change_log: true, db: db, engine: engine}, person, ids) do
+    placeholders = Enum.map_join(ids, ", ", fn _ -> "?" end)
+
+    with {:ok, rows} <-
+           all(db, """
+           SELECT resource_id, rev FROM client_resource_revs
+           WHERE person_id = ? AND resource_id IN (#{placeholders})
+           """, [person | ids]) do
+      revisions = Map.new(rows, fn [id, rev] -> {id, rev} end)
+
+      if map_size(revisions) == length(ids) do
+        {:ok, revisions}
+      else
+        with {:ok, {_head, _floor, seed}} <- load_meta(db, person, fn -> seeded?(engine, person) end) do
+          {:ok, Map.new(ids, fn id -> {id, Map.get(revisions, id, max(seed, 1))} end)}
+        end
+      end
+    end
+  end
+
   def read(
         %AttentionServer.Store{change_log: true, db: db, engine: engine},
         person,
@@ -1253,6 +1282,18 @@ defmodule AttentionServer.ChangeLog do
   end
 
   @doc false
+  def ranks_available(
+        %AttentionServer.Store{mode: :keyed, change_log: true, db: db, change_log_touched: touched},
+        person
+      ) do
+    with false <- MapSet.member?(touched, person),
+         {:ok, true} <- ranked?(db, person) do
+      :ok
+    else
+      _ -> {:error, :storage_unavailable}
+    end
+  end
+
   def ranks_available(%AttentionServer.Store{change_log_touched: touched}, person) do
     if MapSet.member?(touched, person), do: {:error, :storage_unavailable}, else: :ok
   end
@@ -1262,9 +1303,10 @@ defmodule AttentionServer.ChangeLog do
   ascending rank-key order: `{:ok, [{item_id, rank}], more}`. `{:error, :none}`
   until the person's ranking has first been stored.
   """
-  def rank_page(%AttentionServer.Store{change_log: true, db: db}, person, after_key, limit)
+  def rank_page(%AttentionServer.Store{change_log: true, db: db, change_log_touched: touched}, person, after_key, limit)
       when (is_nil(after_key) or is_binary(after_key)) and is_integer(limit) and limit > 0 do
-    with {:ok, true} <- ranked?(db, person),
+    with false <- MapSet.member?(touched, person),
+         {:ok, true} <- ranked?(db, person),
          {:ok, rows} <-
            all(
              db,
@@ -1275,6 +1317,7 @@ defmodule AttentionServer.ChangeLog do
       {page, rest} = Enum.split(rows, limit)
       {:ok, Enum.map(page, fn [item_id, json] -> {item_id, decode_rank(json)} end), rest != []}
     else
+      true -> {:error, :storage_unavailable}
       {:ok, false} -> {:error, :none}
       error -> error
     end

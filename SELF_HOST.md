@@ -392,11 +392,10 @@ survive restart.
 For a manual upgrade of an existing installation, stop the old server and back
 up the full private state before upgrading. The release installer makes one
 full mutable-root backup after stopping the service and before switching
-releases. The server built from this source opens and writes FORMAT30
-snapshots only. For a store on an earlier format, first upgrade through
-v0.2.16–v0.2.20 using a release that supports the starting format. Verify
-the resulting FORMAT30 snapshot before switching to this package. On first
-start, retained Seen-only messages gain an explicit FYI type. For old Chat
+releases. Follow the [FORMAT31 upgrade steps](#releases-that-write-format31)
+before starting this build on a FORMAT30 store. For an earlier store, follow
+the bridge upgrade described there. Retained Seen-only messages gain an
+explicit FYI type during migration. For old Chat
 turns with no recorded handoff expectation or outcome, updated clients omit
 the delivery caption until the turn receives qualifying evidence.
 Preserve the database, referenced files, trust root, owner and person.
@@ -472,6 +471,51 @@ and rerunning the same command replays a committed answer instead of writing a
 second one. It carries no source ruling authority.
 
 ## Upgrade or rollback
+
+### Releases that write FORMAT31
+
+Check the release notes before upgrading. A FORMAT31 release writes individual
+SQLite records. Its normal startup creates a row store for a fresh install and
+requires a stopped-store conversion for existing FORMAT30 databases. For an
+older store, first upgrade to a published Harklight Server v0.2.16 through
+v0.2.20 release. Start that release to write FORMAT30, then stop it and follow
+the FORMAT31 upgrade steps.
+
+The packaged release installer stops the service and takes its full
+mutable-root backup before running the converter. It switches the release and
+starts the service only after conversion succeeds. On conversion failure it
+uses the same restore and prior-release startup as a failed candidate start.
+
+For a manual upgrade, stop the Server and take a complete private backup before
+running the new package's converter. The backup must include the SQLite file,
+any associated SQLite journal files, the uploads directory, configuration and
+keys. Keep it outside the writable state directory. Use the verified package:
+
+```sh
+ATTENTION_SERVER_ENABLE=0 /path/to/new-release/bin/harklight store convert-stopped \
+  /path/to/existing/state/relay.sqlite3
+```
+
+The converter checks host capacity before decoding the snapshot. If it reports
+`fit not established`, keep the Server stopped and preserve the backup. Copy
+the stopped state directory to a larger isolated Linux system with sufficient
+memory and disk. Run the same verified package and command against that copy.
+Copy the converted database and uploads back together before starting the
+new release with the existing configuration. A fit refusal on the larger
+system means the store is outside the measured limits. A refusal for an
+unsupported or unreadable header requires resolving the store version or
+recovering a readable backup before proceeding.
+
+Conversion is transactional. An interruption before commit leaves the old
+snapshot for a retry from the beginning. A retry that finds FORMAT31 skips
+conversion. Retry an interrupted install with the same verified release. The
+installer keeps the original snapshot backup through the retry and retains it
+after candidate readiness. Do not rerun bootstrap against converted or restored state. To
+return to the previous snapshot release, stop the Server, restore the complete
+pre-upgrade backup and run the release that wrote it. Restoring that backup
+discards every later write and leaves external deliveries in place.
+
+### Earlier releases that write snapshots
 
 For a manual upgrade, stop the old process and back up the complete private
 state directory, including the database and keys. Verify the package checksum

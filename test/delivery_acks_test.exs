@@ -333,7 +333,7 @@ defmodule AttentionServer.DeliveryAcksTest do
     :ok =
       Sqlite3.execute(
         db,
-        "CREATE TRIGGER block_ack BEFORE UPDATE ON relay_state BEGIN SELECT RAISE(ABORT, 'fixture'); END"
+        "CREATE TRIGGER block_ack BEFORE UPDATE ON relay_record_generation BEGIN SELECT RAISE(ABORT, 'fixture'); END"
       )
 
     assert {:error, :delivery_unavailable} = changes(c.relay, 0)
@@ -356,21 +356,15 @@ defmodule AttentionServer.DeliveryAcksTest do
   test "pre-upgrade discussion has no marker synthesized on replay", c do
     discussion(c.relay)
     stop_supervised!(Relay)
-    {:ok, store} = Store.open(c.path)
-
-    events =
-      Map.new(store.engine.conversation_events, fn {key, event} ->
+    :ok = PreChangeLogStore.snapshot_fixture(c.path, 30, fn engine ->
+      events = Map.new(engine.conversation_events, fn {key, event} ->
         {key, %{event | payload: Map.delete(event.payload, "delivery_acks")}}
       end)
 
-    {:ok, store} =
-      Store.commit(store, %{store.engine | conversation_events: events}, %{
-        person: "person",
-        actor: "phone",
-        action: "fixture"
-      })
+      %{engine | conversation_events: events}
+    end)
 
-    :ok = Store.close(store)
+    :ok = PreChangeLogStore.convert_fixture(c.path)
     restarted = start_supervised!({Relay, store_path: c.path})
     assert [old] = facts(restarted)
     refute Map.has_key?(old, "delivery_acks")

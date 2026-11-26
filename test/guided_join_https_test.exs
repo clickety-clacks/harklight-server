@@ -419,12 +419,11 @@ defmodule AttentionServer.GuidedJoinHTTPSTest do
       |> Map.delete("device_url")
       |> Map.put("relay_url", "wss://#{host}:#{port}/relay")
 
-    next = put_in(engine.join_invitations[hash].configuration, v1)
-
-    assert {:ok, store} =
-             Store.commit(store, next, %{person: c.person, actor: "test", action: "v1_invite"})
-
-    Store.close(store)
+    assert :ok = Store.close(store)
+    :ok = AttentionServer.PreChangeLogStore.snapshot_fixture(c.path, 30, fn engine ->
+      put_in(engine.join_invitations[hash].configuration, v1)
+    end)
+    :ok = AttentionServer.PreChangeLogStore.convert_fixture(c.path)
 
     relay = start_supervised!({Relay, store_path: c.path, join_configuration: c.config})
 
