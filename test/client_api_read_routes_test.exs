@@ -183,14 +183,17 @@ defmodule AttentionServer.ClientAPIReadRoutesTest do
   test "Inbox batches item revision reads while preserving their stamps", %{relay: relay, reader: reader} do
     trace = :trace.session_create(:inbox_revision_reads, self(), [])
     target = {ChangeLog, :rev, 3}
+    availability = {ChangeLog, :ranked?, 2}
 
     items =
       try do
         assert :trace.function(trace, target, true, [:call_time]) == 1
+        assert :trace.function(trace, availability, true, [:call_time]) == 1
         assert :trace.process(trace, relay, true, [:call]) == 1
         assert {:ok, %{"items" => items}} = Reads.inbox(relay, reader)
         assert length(items) == 3
         assert {:call_time, []} = :trace.info(trace, target, :call_time)
+        assert {:call_time, [{^relay, 1, _, _}]} = :trace.info(trace, availability, :call_time)
         items
       after
         :trace.session_destroy(trace)
