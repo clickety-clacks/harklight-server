@@ -518,6 +518,33 @@ state. A shared format number alone does not establish downgrade compatibility.
 Restoration loses every write made after the backup and cannot undo external
 notifications, bounces or agent deliveries.
 
+### Preview automatic bounces before an upgrade
+
+Set `ATTENTION_SERVER_BOUNCE_NOT_BEFORE` to an RFC 3339 UTC instant, for example
+`2026-11-17T14:16:54Z`, to exclude messages accepted strictly before that
+instant. An unset value applies no cutoff. The setting takes effect when
+the server starts. If the cutoff moves earlier or is cleared, eligible open
+messages without a selection are scheduled from their original acceptance
+time and may bounce immediately.
+
+After a clean stop of the current server, use the new package's CLI before
+installing it. Pass the same cutoff planned for startup, or omit the setting
+for an unrestricted preview.
+
+```sh
+ATTENTION_SERVER_BOUNCE_NOT_BEFORE=2026-11-17T14:16:54Z \
+  /path/to/new-package/bin/harklight operator bounce-preview --store /path/to/relay.sqlite3
+```
+
+The command prints JSON with separate `full` and `soft` counts for all
+accounts in the stopped store, using their configured levels or defaults.
+A full bounce removes an unopened item from person views. A soft bounce
+notifies the sender while the item stays in place. The preview reads the
+stopped store through a private temporary copy and does not start the server,
+write to the original database, or deliver advisories. The command refuses
+to count a store with a nonempty SQLite WAL or rollback journal. The actual
+counts can change if additional deadlines pass before startup.
+
 Restoring an older backup after the server has served clients also repeats
 message IDs and feed positions. Apps and agents that already read past those
 positions can skip new replies. Treat such a

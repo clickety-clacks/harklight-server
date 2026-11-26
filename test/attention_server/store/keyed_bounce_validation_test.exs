@@ -53,6 +53,14 @@ defmodule AttentionServer.Store.KeyedBounceValidationTest do
         engine
       end)
 
+    # Recreate retained pre-priority rows so these tests drive the original
+    # score, deferral, and migration paths from an unselected revision.
+    engine =
+      Enum.reduce([@m1, @m2, @m3], engine, fn key, current ->
+        put_in(current.bounce_revisions[key].revisions[1].selection, nil)
+      end)
+      |> BounceDecision.rebuild_indexes()
+
     {:ok, legacy} = Store.commit(legacy, engine, audit())
     :ok = Store.close(legacy)
     {:ok, staged} = Store.open(path, :keyed_cutover)
@@ -117,6 +125,9 @@ defmodule AttentionServer.Store.KeyedBounceValidationTest do
       assert reopened.engine.route_b_index.unresolved_count_by_person[@person] == 1
       assert AttentionServer.RouteBIndex.push_badge(reopened.engine.route_b_index, @person) == 1
       :ok = Store.close(reopened)
+
+      assert {:ok, preview_engine} = Store.read_stopped_engine(path)
+      assert preview_engine.advisory_feeds == store.engine.advisory_feeds
     end
 
     test "a due revision in a supported session bounces directly", %{store: store} do

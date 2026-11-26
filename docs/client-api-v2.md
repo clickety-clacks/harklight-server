@@ -1715,9 +1715,28 @@ Agent listen --follow and the Tightbeam Harklight background follower retry feed
 | SSE `focus`, `heartbeat`, `closing` | Ephemeral, without an SSE ID |
 
 An eligible open message or FYI produces at most one bounce advisory per
-substantive revision. An unopened revision keeps the
-`unseen_interval_elapsed` advisory; an opened, unanswered revision uses
-`soft_bounce`. The full bounce removes the item from person reads. The
+substantive revision. At acceptance, the server schedules the bounce using
+the sender's urgency, with Normal for missing or invalid urgency. The
+default intervals are Urgent 12 hours, High 1 day, Normal 3 days, and Low
+7 days. The corresponding score thresholds (0.8, 0.6, 0.3, and 0) select a
+level from the account's table when configured. A level with a null interval
+disables the bounce. When Jev supplies a score before the decision, the
+server can change the level and recomputes the deadline from the
+substantive revision's acceptance time.
+
+On first startup with this policy, eligible open revisions with no
+stored selection are scheduled from their original acceptance time.
+Overdue bounces are evaluated on startup. The server logs the number
+of selections it backfilled and the number of overdue full bounces.
+An optional server cutoff excludes messages accepted strictly before it,
+including from startup backfill. The cutoff uses the original message
+acceptance time even after revision.
+
+An item that has never been opened can full-bounce with the
+`unseen_interval_elapsed` advisory. If the recipient already opened the
+item when the server evaluates the bounce, it can only soft-bounce,
+including when backfill or a Jev score sets a deadline in the past.
+The full bounce removes the item from person reads. The
 sending agent can still read the item and advisory with `terminal: null`.
 Reply, revise and progress writes to that item return `409 already_closed`.
 The agent can retract it or send a new message. A soft bounce leaves the
