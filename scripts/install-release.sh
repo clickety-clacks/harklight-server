@@ -519,7 +519,7 @@ fi
 if ((!switched)); then
   if ! ATTENTION_SERVER_ENABLE=0 "$target/bin/harklight" store convert-stopped \
     "$state/relay.sqlite3" --from-release "$current_tag"; then
-    rollback_failed_upgrade "stopped-store FORMAT31 conversion failed"
+    rollback_failed_upgrade "stopped-store row conversion failed"
   fi
 
   current_link="$root/.current-$HARKLIGHT_RELEASE_TAG.$$"

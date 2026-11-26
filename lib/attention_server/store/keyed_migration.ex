@@ -5,7 +5,8 @@ defmodule AttentionServer.Store.KeyedMigration do
   alias AttentionServer.Store.{DerivedIndex, RecordCodec, RecordTable}
   alias Exqlite.Sqlite3
 
-  @format 31
+  @previous_format 31
+  @format 32
 
   def report_stage(stage) do
     :telemetry.execute([:harklight, :store, :conversion, stage], %{time: System.monotonic_time()}, %{})
@@ -79,9 +80,28 @@ defmodule AttentionServer.Store.KeyedMigration do
     %{engine | origin_sessions: sessions, item_availability: availability}
   end
 
+  # The caller owns the stopped-store conversion transaction. FORMAT32 adds
+  # empty keyed collections, so existing row and feed generations stay put.
+  def upgrade_anchor(db) do
+    with {:ok, [[version, payload, checksum]]} <-
+           query(db, "SELECT version, payload, checksum FROM relay_state WHERE id = 1", []),
+         true <- :crypto.hash(:sha256, payload) == checksum,
+         {:ok, identity} <- decode_anchor(payload, [@previous_format]),
+         :ok <- check_identity(identity, RecordCodec.identity()),
+         {:ok, generation} <- RecordTable.generation(db),
+         true <- generation >= version,
+         :ok <- write_anchor(db, version, version) do
+      {:ok, :converted}
+    else
+      false -> {:error, :invalid_state}
+      {:ok, _} -> {:error, :invalid_state}
+      error -> error
+    end
+  end
+
   def load(db), do: load(db, [@format])
 
-  def load_preview(db), do: load(db, [30, @format])
+  def load_preview(db), do: load(db, [30, @previous_format, @format])
 
   defp load(db, formats) do
     # Load the codec's identity atom before decoding the anchor with :safe.

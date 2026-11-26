@@ -261,7 +261,7 @@ defmodule AttentionServer.Store do
   end
 
   @doc """
-  Reads a stopped, checkpointed FORMAT30 or FORMAT31 store without opening
+  Reads a stopped, checkpointed FORMAT30, FORMAT31 or FORMAT32 store without opening
   the original with SQLite. A disposable private copy contains any SQLite
   sidecars, and no normal startup or migration work runs.
   """
@@ -393,7 +393,8 @@ defmodule AttentionServer.Store do
             case preflight.(db) do
               :ok -> convert_locked(db, upload_dir, prepare)
               {:ok, _info} -> convert_locked(db, upload_dir, prepare)
-              {:already_converted, 31} -> {:ok, :already_converted}
+              {:already_converted, 31} -> KeyedMigration.upgrade_anchor(db)
+              {:already_converted, 32} -> {:ok, :already_converted}
               error -> error
             end
           end)
@@ -2409,6 +2410,13 @@ defmodule AttentionServer.Store do
             _ = RecordCodec.identity()
 
             case :erlang.binary_to_term(payload, [:safe]) do
+              {:attention_relay_keyed_state, 32, _identity} ->
+                Logger.error(
+                  "Harklight Store uses FORMAT32 rows. To run an older release, restore the pre-upgrade backup."
+                )
+
+                {:error, :format32_requires_keyed_mode}
+
               {:attention_relay_keyed_state, 31, _identity} ->
                 Logger.error(
                   "Harklight Store uses FORMAT31 rows. To run a snapshot release, restore the pre-upgrade backup."

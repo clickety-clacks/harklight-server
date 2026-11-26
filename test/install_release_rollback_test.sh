@@ -242,7 +242,7 @@ set -e
 if [[ "$mode" != optional-route ]]; then
   [[ "$status" == 1 ]] || { printf 'expected installer exit 1, got %s\n%s\n' "$status" "$output" >&2; exit 1; }
   if [[ "$mode" == conversion-failure ]]; then
-    expected_failure='upgrade failed: stopped-store FORMAT31 conversion failed'
+    expected_failure='upgrade failed: stopped-store row conversion failed'
     ! grep -Fqx 'start:v0.2.21' "$HARKLIGHT_TEST_ACTIONS"
   else
     expected_failure='upgrade failed: candidate process did not become active under the selected package within 30 seconds'

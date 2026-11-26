@@ -472,6 +472,23 @@ second one. It carries no source ruling authority.
 
 ## Upgrade or rollback
 
+### Releases that write FORMAT32
+
+For an upgrade from FORMAT31, stop the Server and keep a checkpointed backup
+of its private state, including the database and matching uploads directory.
+The installer takes and retains that backup before it runs the stopped-store
+converter. The converter verifies the row-store marker, codec and generation, then
+changes the format marker and checksum in one transaction. It preserves existing rows and
+feed positions. A retry after the transaction commits recognizes FORMAT32
+and skips the conversion. Supported FORMAT30 databases still go through
+the snapshot conversion described below, including its capacity checks.
+
+A FORMAT31 binary cannot open FORMAT32. To roll back, stop the Server,
+restore the pre-upgrade state and uploads together, and restart the previous
+release. A code or symlink change alone cannot restore the old format.
+Restoring the backup loses writes made since the backup. External
+deliveries that already occurred cannot be undone.
+
 ### Releases that write FORMAT31
 
 Check the release notes before upgrading. A FORMAT31 release writes individual
