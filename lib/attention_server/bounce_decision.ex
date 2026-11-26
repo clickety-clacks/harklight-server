@@ -3,6 +3,7 @@ defmodule AttentionServer.BounceDecision do
 
   alias AttentionServer.{BouncePolicy, Engine, Message}
 
+  @hosted_notice_sender Message.hosted_notice_sender()
   @defaults_published_at_ms 1_794_925_014_000
   @no_record_sentence "Harklight has no record that you saw this message."
   @advisory_fields ~w(advisory_id advisory_seq accepted_at_ms author bounce_after_days due_at_ms evaluated_at_ms kind level_name message_id origin_cursor_at_decision request_revision sender_id session_handle text advisory_type)
@@ -325,7 +326,8 @@ defmodule AttentionServer.BounceDecision do
       with %{qualified: true, accepted_at_ms: accepted, selection: selection}
            when accepted > @defaults_published_at_ms <- state.revisions[sub],
            %{"decision" => "suppressed", "reason" => "opened", "advisory_id" => nil} <- selection,
-           %{terminal: nil} = record <- current.messages[key],
+           %{terminal: nil, origin: origin} = record when origin != @hosted_notice_sender <-
+             current.messages[key],
            true <- opened?(current, key, sub),
            false <- item_notice_for_revision?(record, sub) do
         update_selection(current, key, state, sub, selection, "pending", nil, nil)
@@ -583,7 +585,8 @@ defmodule AttentionServer.BounceDecision do
 
       if record.accepted_at < cutoff and
            (pending_revision(state) != nil or
-              (resumable_open?(revision) and not item_notice_for_revision?(record, sub))) do
+              (record.origin != @hosted_notice_sender and resumable_open?(revision) and
+                 not item_notice_for_revision?(record, sub))) do
         put_selection(current, key, state, sub, %{revision | selection: nil})
       else
         current
@@ -720,6 +723,11 @@ defmodule AttentionServer.BounceDecision do
     opened = Enum.any?(state.revisions, fn {sub, _} -> opened?(engine, key, sub) end)
 
     case suppression_reason(engine, key, record, revision, legacy? and opened, due) do
+      nil when record.origin == @hosted_notice_sender ->
+        reason = if opened, do: "opened", else: "ineligible_message"
+        engine = if opened, do: engine, else: full_bounce(engine, key, record, now_ms)
+        update_selection(engine, key, state, sub_revision, selection, "suppressed", reason, nil)
+
       nil when legacy? ->
         case route_status(engine, key, record) do
           :supported ->

@@ -84,11 +84,12 @@ defmodule AttentionServer.ClientAPI.Search do
     end
   end
 
-  def candidates(engine, person, sequence, filters) do
+  def candidates(engine, %{person: person} = principal, sequence, filters) do
     for seq <- sequence,
         %{key: {^person, sender, id} = key} <- [engine.events[{person, seq}]],
         %{accepted_seq: ^seq} = record <- [engine.messages[key]],
         BounceDecision.person_visible?(record),
+        AgentAccess.visible_sender?(principal, sender),
         is_nil(filters["sender"]) or sender == filters["sender"],
         is_nil(filters["message_id"]) or id == filters["message_id"],
         is_nil(filters["session"]) or Map.get(record, :session_handle) == filters["session"],

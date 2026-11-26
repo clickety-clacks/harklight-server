@@ -25,6 +25,11 @@ defmodule AttentionServer.Message do
   @request_needs_ui1_controls_reason ~s(message_type "request" with attention-client.ui/1 answer_ui needs at least one input in "inputs")
   @request_has_seen_reason ~s(message_type "request" cannot carry the Seen action: remove the action with id "seen", or send as message_type "fyi" with only the Seen descriptor)
 
+  @hosted_notice_sender "app:harklight/notices"
+
+  def hosted_notice_sender, do: @hosted_notice_sender
+  def seen_descriptor, do: @seen_descriptor
+
   def sender_id?(value) when is_binary(value) do
     case String.split(value, ":", parts: 2) do
       [namespace, rest] ->
