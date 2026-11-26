@@ -5,8 +5,39 @@ defmodule AttentionServer.ClientAPI.SignIn do
 
   alias AttentionServer.{JSON, Relay}
   alias AttentionServer.ClientAPI.Errors
+  @behaviour AttentionServer.ClientAPI.Routes
 
   @request_limit 4 * 1024
+
+  @impl true
+  def routes do
+    [
+      {"POST", ["auth", "migration-grants"], :migration_grant},
+      {"POST", ["auth", "migration-complete"], :migration_complete}
+    ]
+  end
+
+  def migration_grant(conn, ctx) do
+    conn = put_resp_header(conn, "cache-control", "no-store")
+
+    case Relay.migration_grant(ctx.relay, ctx.principal) do
+      {:ok, grant} -> Errors.send_json(conn, 200, grant)
+      error -> send_failure(conn, error)
+    end
+  end
+
+  def migration_complete(conn, ctx) do
+    handle_json(conn, fn
+      conn, %{"signature" => signature} when is_binary(signature) ->
+        case Relay.finish_migration(ctx.relay, ctx.principal, signature) do
+          :ok -> send_resp(conn, 204, "")
+          error -> send_failure(conn, error)
+        end
+
+      conn, _ ->
+        Errors.send_error(conn, "invalid_field", field: "signature")
+    end)
+  end
 
   def methods(conn, relay) do
     conn = put_resp_header(conn, "cache-control", "no-store")
@@ -65,5 +96,6 @@ defmodule AttentionServer.ClientAPI.SignIn do
   defp send_failure(conn, {:error, :disabled}), do: Errors.send_error(conn, "not_found")
   defp send_failure(conn, {:error, :invalid_request}), do: Errors.send_error(conn, "invalid_field")
   defp send_failure(conn, {:error, :unauthorized}), do: Errors.send_error(conn, "unauthorized")
+  defp send_failure(conn, {:error, :already_migrated}), do: Errors.send_error(conn, "already_migrated")
   defp send_failure(conn, _), do: Errors.send_error(conn, "storage_unavailable")
 end

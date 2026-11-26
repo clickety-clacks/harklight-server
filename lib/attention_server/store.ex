@@ -18,6 +18,7 @@ defmodule AttentionServer.Store do
     BounceDecision,
     BrowserSignIn,
     Conversation,
+    DeviceMigration,
     Diagnostics,
     Engine,
     GuidedJoin,
@@ -2047,8 +2048,10 @@ defmodule AttentionServer.Store do
   defp write_auth_changes(db, %{native_redemption: redemption}),
     do: NativeSignIn.commit_redemption(db, redemption)
 
-  defp write_auth_changes(db, %{person: person, auth_device_removal: device}),
-    do: NativeSignIn.remove_device_sessions(db, person, device)
+  defp write_auth_changes(db, %{person: person, auth_device_removal: device}) do
+    with :ok <- NativeSignIn.remove_device_sessions(db, person, device),
+         do: DeviceMigration.set_phase(db, device, "removed")
+  end
 
   defp write_auth_changes(_db, _audit), do: :ok
 

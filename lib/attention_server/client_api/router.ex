@@ -94,6 +94,7 @@ defmodule AttentionServer.ClientAPI.Router do
   @route_modules [
     AttentionServer.ClientAPI.Reads,
     AttentionServer.ClientAPI.Devices,
+    AttentionServer.ClientAPI.SignIn,
     AttentionServer.ClientAPI.AgentReads,
     AttentionServer.ClientAPI.AgentShow,
     AttentionServer.ClientAPI.AgentWrites,
@@ -195,6 +196,9 @@ defmodule AttentionServer.ClientAPI.Router do
           paused ->
             Errors.send_error(conn, "account_paused")
 
+          not pending_allowed?(conn.method, segments, principal) ->
+            Errors.send_error(conn, "forbidden")
+
           not principal_allowed?(principal, route) or not origin_ok?(conn, opts.auth, principal) ->
             Errors.send_error(conn, "forbidden")
 
@@ -236,6 +240,10 @@ defmodule AttentionServer.ClientAPI.Router do
   catch
     :exit, _reason -> :unavailable
   end
+
+  defp pending_allowed?("POST", ["auth", "migration-complete"], _principal), do: true
+  defp pending_allowed?(method, _segments, %{pending: true}), do: method in ["GET", "HEAD"]
+  defp pending_allowed?(_method, _segments, _principal), do: true
 
   defp principal_allowed?(%{kind: :agent}, {:ok, _, _, _, route_opts}),
     do: Keyword.get(route_opts, :granted_agent, false)

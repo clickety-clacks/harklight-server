@@ -17,7 +17,7 @@ defmodule AttentionServer.ClientAPI.Principal do
   """
 
   @enforce_keys [:person, :kind, :key]
-  defstruct [:person, :kind, :key, :session_id, :owner_revision]
+  defstruct [:person, :kind, :key, :session_id, :owner_revision, pending: false]
 
   @type t :: %__MODULE__{
           person: String.t(),
@@ -58,7 +58,7 @@ defmodule AttentionServer.ClientAPI.Auth do
   end
 
   defp enrolled_principal(relay, key) do
-    case Relay.device_person(relay, key) do
+    case Relay.certificate_device_person(relay, key) do
       {:ok, person} when is_binary(person) ->
         {:ok, %Principal{person: person, kind: :device, key: key}}
 
@@ -111,9 +111,9 @@ defmodule AttentionServer.ClientAPI.Auth do
         browser(conn, backend)
 
       {nil, ["Bearer " <> secret]} ->
-        with {:ok, %{device_id: device, person_id: person, hash: hash}} <-
+        with {:ok, %{device_id: device, person_id: person, hash: hash, pending: pending}} <-
                Relay.native_session(relay, secret) do
-          {:ok, %Principal{kind: :device, key: device, person: person, session_id: hash}}
+          {:ok, %Principal{kind: :device, key: device, person: person, session_id: hash, pending: pending}}
         end
 
       _ ->

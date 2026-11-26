@@ -28,6 +28,7 @@ defmodule AttentionServer.Relay do
     DashboardInventory,
     Diagnostics,
     DeviceIdentity,
+    DeviceMigration,
     DeviceProof,
     Engine,
     Message,
@@ -267,6 +268,15 @@ defmodule AttentionServer.Relay do
 
   def redeem_hosted_browser_grant(server, grant, transaction),
     do: GenServer.call(server, {:redeem_hosted_browser_grant, grant, transaction}, :infinity)
+
+  def certificate_device_person(server, key),
+    do: GenServer.call(server, {:certificate_device_person, key}, :infinity)
+
+  def migration_grant(server, principal),
+    do: GenServer.call(server, {:migration_grant, principal}, :infinity)
+
+  def finish_migration(server, principal, signature),
+    do: GenServer.call(server, {:finish_migration, principal, signature}, :infinity)
 
   def native_sign_in_methods(server),
     do: GenServer.call(server, :native_sign_in_methods, :infinity)
@@ -1453,6 +1463,83 @@ defmodule AttentionServer.Relay do
       {:error, reason} -> {:reply, {:error, reason}, state}
       {:error, _, _} -> {:reply, {:error, :storage_unavailable}, state}
       _ -> {:reply, {:error, :not_created}, state}
+    end
+  end
+
+  defp dispatch_call({:certificate_device_person, key}, _from, state) do
+    result =
+      case state.store do
+        %{auth_schema: nil, engine: engine} ->
+          Engine.authorized_person(engine, key)
+
+        %{auth_schema: %{device_certificates_disabled: false}, db: db, engine: engine}
+        when state.deployment_mode == :self_hosted ->
+          with %{person: person, revoked: false} <- engine.devices[key],
+               true <- DeviceMigration.eligible?(db, person, key) do
+            {:ok, person}
+          else
+            _ -> {:error, :unauthorized}
+          end
+
+        _ ->
+          {:error, :unauthorized}
+      end
+
+    {:reply, result, state}
+  end
+
+  defp dispatch_call({:migration_grant, principal}, _from, state) do
+    result =
+      with %{kind: :device, session_id: nil, key: key, person: person} <- principal,
+           %{auth_schema: %{device_certificates_disabled: false}, db: db, engine: engine} <- state.store,
+           :self_hosted <- state.deployment_mode,
+           %{person: ^person, revoked: false} <- engine.devices[key],
+           "https://" <> _ = origin <- state.dashboard_origin do
+        DeviceMigration.issue(db, person, key, origin, state.clock.())
+      else
+        _ -> {:error, :unauthorized}
+      end
+
+    {:reply, result, state}
+  end
+
+  defp dispatch_call({:finish_migration, principal, signature}, _from, state) do
+    result =
+      with %{kind: :device, session_id: hash} when is_binary(hash) <- principal,
+           %{auth_schema: %{device_certificates_disabled: false}, db: db, engine: engine} <- state.store,
+           :self_hosted <- state.deployment_mode do
+        DeviceMigration.activate(db, engine, hash, signature)
+      else
+        _ -> {:error, :unauthorized}
+      end
+
+    case result do
+      {:ok, device, true} ->
+        ChangeLog.notify_closing([{{:device_certificate, device}, :revoked}])
+        {:reply, :ok, state}
+
+      {:ok, _, false} -> {:reply, :ok, state}
+      error -> {:reply, error, state}
+    end
+  end
+
+  defp dispatch_call({:redeem_native_transaction, %{"token" => _} = request}, _from, state) do
+    result =
+      with :self_hosted <- state.deployment_mode,
+           %{auth_schema: %{device_certificates_disabled: false}, db: db, engine: engine} <-
+             state.store do
+        DeviceMigration.redeem(db, engine, request, state.clock.())
+      else
+        _ -> {:error, :unauthorized}
+      end
+
+    case result do
+      {:ok, response, previous} ->
+        if previous, do: ChangeLog.notify_closing([{{:device_session, previous}, :revoked}])
+        {:reply, {:ok, response}, state}
+
+      error ->
+        {:reply, error, state}
     end
   end
 

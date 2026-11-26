@@ -1,7 +1,7 @@
 defmodule AttentionServer.NativeSignInTest do
   use ExUnit.Case, async: true
 
-  alias AttentionServer.{BrowserAuth, DeviceProof, HostedRequests, JSON, Relay}
+  alias AttentionServer.{BrowserAuth, DeviceProof, HostedRequests, JSON, Relay, Store}
   alias AttentionServer.ClientAPI.Router
   alias AttentionServer.Store.AuthSchema
   alias Exqlite.Sqlite3
@@ -106,17 +106,91 @@ defmodule AttentionServer.NativeSignInTest do
     assert Router.call(request, router).status == 401
   end
 
-  defp proof(dir, bytes) do
-    private = Path.join(dir, "private.pem")
-    public = Path.join(dir, "public.der")
-    input = Path.join(dir, "proof-input")
-    signature = Path.join(dir, "proof.der")
-    File.write!(input, bytes)
+  test "pending replacement preserves its recipient and activation permanently ends certificate access",
+       %{tmp_dir: dir} do
+    path = Path.join(dir, "overlap.sqlite3")
+    origin = "https://phone.example.test"
+    opts = [store_path: path, deployment_mode: :self_hosted, dashboard_origin: origin]
+    person = "operator-person"
+    device = String.duplicate("a", 64)
+
+    {:ok, initial} = Relay.start_link(opts)
+    assert :ok = Relay.setup_person(initial, person)
+    assert :ok = Relay.setup_device(initial, person, device)
+    :ok = GenServer.stop(initial)
+
+    {:ok, store} = Store.open_relay(path)
+    assert {:ok, %{minimum_generation: 1}} = AuthSchema.initialize(store.db, store.engine, [device])
+    :ok = Store.close(store)
+
+    {:ok, relay} = Relay.start_link(opts)
+    legacy = %AttentionServer.ClientAPI.Principal{person: person, key: device, kind: :device}
+    assert {:ok, ^person} = Relay.certificate_device_person(relay, device)
+    assert {:ok, %{"features" => %{"auth_migration" => true}}} =
+             AttentionServer.ClientAPI.Reads.me(relay, legacy)
+
+    assert {:ok, %{"origin" => ^origin, "token" => first}} = Relay.migration_grant(relay, legacy)
+    assert {:ok, %{"token" => replacement}} = Relay.migration_grant(relay, legacy)
+    assert {:ok, %{"token" => unused}} = Relay.migration_grant(relay, legacy)
+
+    bearer = BrowserAuth.new_secret()
+    initial_hash = DeviceProof.digest(bearer)
+    initial_request = migration_request(dir, first, initial_hash)
+    assert {:ok, %{"device_id" => ^device, "duplicate" => false, "method" => nil}} =
+             Relay.redeem_native_transaction(relay, initial_request)
+    assert {:ok, %{pending: true}} = Relay.native_session(relay, bearer)
+    assert {:ok, ^person} = Relay.certificate_device_person(relay, device)
+
+    new_bearer = BrowserAuth.new_secret()
+    new_hash = DeviceProof.digest(new_bearer)
+    replacement_request = migration_request(dir, replacement, new_hash)
+    unused_request = migration_request(dir, unused, DeviceProof.digest(BrowserAuth.new_secret()))
+    assert {:ok, %{"device_id" => ^device, "duplicate" => false}} =
+             Relay.redeem_native_transaction(relay, replacement_request)
+    assert {:error, :unauthorized} = Relay.native_session(relay, bearer)
+    assert {:ok, %{"device_id" => ^device, "duplicate" => true}} =
+             Relay.redeem_native_transaction(relay, initial_request)
+
+    router = Router.init(relay: relay, auth: {:browser, nil, origin})
+    authenticated = fn conn -> Plug.Conn.put_req_header(conn, "authorization", "Bearer " <> new_bearer) end
+    assert post("/v2/auth/sign-out", %{}) |> authenticated.() |> Router.call(router) |> Map.fetch!(:status) == 403
+
+    signature = sign(dir, DeviceProof.activation_bytes(new_hash), replacement)
+    complete = post("/v2/auth/migration-complete", %{"signature" => signature}) |> authenticated.()
+    assert Router.call(complete, router).status == 204
+    assert Router.call(complete, router).status == 204
+    assert {:ok, %{pending: false}} = Relay.native_session(relay, new_bearer)
+    assert {:error, :unauthorized} = Relay.certificate_device_person(relay, device)
+    assert {:error, :already_migrated} = Relay.redeem_native_transaction(relay, unused_request)
+  end
+
+  defp migration_request(dir, token, hash) do
+    {key, signature} = proof(dir, DeviceProof.sign_in_bytes(token, hash), token)
+
+    %{
+      "token" => token,
+      "public_key" => key,
+      "label" => "Test phone",
+      "session_hash" => hash,
+      "signature" => signature
+    }
+  end
+
+  defp proof(dir, bytes, id \\ "native") do
+    private = Path.join(dir, id <> ".pem")
+    public = Path.join(dir, id <> ".public.der")
     assert {_, 0} = System.cmd("openssl", ["genpkey", "-algorithm", "EC", "-pkeyopt", "ec_paramgen_curve:P-256", "-out", private])
     assert {_, 0} = System.cmd("openssl", ["pkey", "-in", private, "-pubout", "-outform", "DER", "-out", public])
+    {Base.url_encode64(File.read!(public), padding: false), sign(dir, bytes, id)}
+  end
+
+  defp sign(dir, bytes, id) do
+    private = Path.join(dir, id <> ".pem")
+    input = Path.join(dir, id <> ".input")
+    signature = Path.join(dir, id <> ".signature.der")
+    File.write!(input, bytes)
     assert {_, 0} = System.cmd("openssl", ["dgst", "-sha256", "-sign", private, "-out", signature, input])
-    {Base.url_encode64(File.read!(public), padding: false),
-     Base.url_encode64(File.read!(signature), padding: false)}
+    Base.url_encode64(File.read!(signature), padding: false)
   end
 
   defp post(path, body), do: Plug.Test.conn(:post, path, JSON.encode!(body))

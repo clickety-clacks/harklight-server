@@ -90,52 +90,48 @@ defmodule AttentionServer.NativeSignIn do
 
   defp authorize(_, _, _, _, _), do: {:error, :invalid_request}
 
-  def prepare_redemption(
-        db,
-        engine,
-        %{
-          "transaction" => reference,
-          "verifier" => verifier,
-          "public_key" => public_key,
-          "label" => label,
-          "session_hash" => session_hash,
-          "signature" => signature
-        },
-        now
-      ) do
-    with true <- DeviceProof.secret?(reference) and DeviceProof.secret?(verifier),
-         true <- DeviceProof.hash?(session_hash),
+  def proof(request, reference_field) do
+    with %{^reference_field => reference, "public_key" => public_key, "label" => label,
+           "session_hash" => session_hash, "signature" => signature} <- request,
+         true <- DeviceProof.secret?(reference) and DeviceProof.hash?(session_hash),
          true <- is_binary(label) and String.valid?(label) and byte_size(label) in 1..160,
          {:ok, key} <- DeviceProof.native_key(public_key) do
-      bytes = DeviceProof.sign_in_bytes(reference, session_hash)
-
-      with true <- DeviceProof.verify(key, bytes, signature),
-           {:ok, [[person, method, expires, device, redeemed_hash, redeemed_key, redeemed_label]]} <-
-             RecordTable.select(
-               db,
-               """
-               SELECT person_id, method, authorized_until_ms, redeemed_device, redeemed_session,
-                      redeemed_key, redeemed_label
-               FROM harklight_native_transactions
-               WHERE transaction_id = ? AND verifier_hash = ? AND person_id IS NOT NULL
-               """,
-               [reference, DeviceProof.digest(verifier)]
-             ) do
-        if device do
-          duplicate(db, person, method, device, session_hash, public_key, label,
-            {redeemed_hash, redeemed_key, redeemed_label})
-        else
-          if expires > now,
-            do: prepare_device(engine, reference, person, method, session_hash, public_key, label, now),
-            else: {:error, :unauthorized}
-        end
+      if DeviceProof.verify(key, DeviceProof.sign_in_bytes(reference, session_hash), signature) do
+        {:ok, %{reference: reference, key: public_key, label: label, hash: session_hash}}
       else
-        false -> {:error, :unauthorized}
-        {:ok, []} -> {:error, :unauthorized}
-        error -> error
+        {:error, :unauthorized}
       end
     else
       _ -> {:error, :invalid_request}
+    end
+  end
+
+  def prepare_redemption(db, engine, %{"verifier" => verifier} = request, now) do
+    with true <- DeviceProof.secret?(verifier),
+         {:ok, proof} <- proof(request, "transaction"),
+         {:ok, [[person, method, expires, device, redeemed_hash, redeemed_key, redeemed_label]]} <-
+           RecordTable.select(
+             db,
+             """
+             SELECT person_id, method, authorized_until_ms, redeemed_device, redeemed_session,
+                    redeemed_key, redeemed_label
+             FROM harklight_native_transactions
+             WHERE transaction_id = ? AND verifier_hash = ? AND person_id IS NOT NULL
+             """,
+             [proof.reference, DeviceProof.digest(verifier)]
+           ) do
+      if device do
+        duplicate(db, person, method, device, proof.hash, proof.key, proof.label,
+          {redeemed_hash, redeemed_key, redeemed_label})
+      else
+        if expires > now,
+          do: prepare_device(engine, proof.reference, person, method, proof.hash, proof.key, proof.label, now),
+          else: {:error, :unauthorized}
+      end
+    else
+      false -> {:error, :invalid_request}
+      {:ok, []} -> {:error, :unauthorized}
+      error -> error
     end
   end
 
@@ -164,7 +160,7 @@ defmodule AttentionServer.NativeSignIn do
     end
   end
 
-  defp result(person, device, method, duplicate),
+  def result(person, device, method, duplicate),
     do: %{"person_id" => person, "device_id" => device, "method" => method, "duplicate" => duplicate}
 
   def commit_redemption(db, redemption) do
@@ -182,17 +178,33 @@ defmodule AttentionServer.NativeSignIn do
              [device, hash, key, label, transaction]
            ),
          {:ok, 1} <- Sqlite3.changes(db) do
-      RecordTable.run(
-        db,
-        """
-        INSERT INTO harklight_device_sessions
-          (session_hash, device_id, person_id, public_key, signed_in_at_ms, pending)
-        VALUES (?, ?, ?, ?, ?, 0)
-        """,
-        [hash, device, person, key, now]
-      )
+      add_session(db, hash, device, person, key, now, false)
     else
       {:ok, 0} -> {:error, :unauthorized}
+      error -> error
+    end
+  end
+
+  def add_session(db, hash, device, person, key, now, pending?) do
+    RecordTable.run(
+      db,
+      """
+      INSERT INTO harklight_device_sessions
+        (session_hash, device_id, person_id, public_key, signed_in_at_ms, pending)
+      VALUES (?, ?, ?, ?, ?, ?)
+      """,
+      [hash, device, person, key, now, if(pending?, do: 1, else: 0)]
+    )
+  end
+
+  def device_session_hash(db, device) do
+    case RecordTable.select(
+           db,
+           "SELECT session_hash FROM harklight_device_sessions WHERE device_id = ?",
+           [device]
+         ) do
+      {:ok, [[hash]]} -> {:ok, hash}
+      {:ok, []} -> {:ok, nil}
       error -> error
     end
   end
