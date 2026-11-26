@@ -7,6 +7,10 @@ owners can also use the owner CLI. Hosted owners approve from their signed-in
 dashboard. With no sender ID, approval cannot issue a legacy device
 credential. New phones and iPads continue to use shared sign-in.
 
+A Hosted browser sign-in transaction can create one Server session. Once a
+grant is redeemed, the Server refuses further grants and redemptions for
+that transaction.
+
 The release keeps FORMAT31 and auth generation 1. Follow the S1 backup and
 recovery steps below, including a stopped backup before first activation.
 
