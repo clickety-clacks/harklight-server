@@ -61,7 +61,13 @@ features member is part of the request bound to that revision. Project
 badge counts, alert candidates, target and locator from the binding’s
 visible items, including mixed and badge-only pushes. A legacy binding
 never receives a shared target or a count increment attributable to one.
-Enforce the binding revision and visibility again at delivery.
+Enforce the binding revision and visibility again at delivery. Count one
+badge unit per visible shared item with eligible open request attention or
+unread Chat, including when both reasons apply. Settlement removes the
+open-request reason and preserves unread Chat eligibility. Use the viewing
+person’s local read position and exclude their own replies. Other-person
+Chat alerts use the existing `target=chat` push envelope with the recipient’s
+local item locator. Legacy item and binding badge behavior is unchanged.
 
 Use `Me.server.id` to scope identities across Server instances. Bind public
 person profiles to the existing person ID. Owner-authorized
