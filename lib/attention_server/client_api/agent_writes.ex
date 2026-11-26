@@ -7,7 +7,7 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
 
   alias AttentionServer.{AgentChangeLog, ConversationFiles, Engine, Groups, JSON, Message, Relay, SharedMessages}
 
-  alias AttentionServer.AgentAPI.Advisories
+  alias AttentionServer.AgentAPI.{Advisories, RecipientReach}
 
   alias AttentionServer.ClientAPI.{
     AgentResources,
@@ -146,7 +146,7 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
           error -> refusal(error)
         end
 
-      Writes.respond(conn, replay_success(ctx, result))
+      Writes.respond(conn, replay_success(ctx, operation, result))
     else
       {:error, token, field} -> Errors.send_error(conn, token, field: field)
     end
@@ -193,10 +193,10 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
   defp call(ctx, request),
     do: GenServer.call(ctx.relay, {:client_api, __MODULE__, request}, :infinity)
 
-  defp replay_success(ctx, {:stored, status, encoded}) do
+  defp replay_success(ctx, operation, {:stored, status, encoded}) do
     case JSON.decode_line(encoded <> "\n") do
       {:ok, receipt} when is_map(receipt) ->
-        case replay_body(ctx, receipt) do
+        case replay_body(ctx, operation, receipt) do
           {:ok, body} -> {:ok, status, body, true}
           error -> refusal(error)
         end
@@ -206,19 +206,19 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
     end
   end
 
-  defp replay_success(_ctx, result), do: result
+  defp replay_success(_ctx, _operation, result), do: result
 
-  defp replay_body(_ctx, %{"agent_write" => 1, "item_id" => nil, "outcome" => outcome}),
+  defp replay_body(_ctx, _operation, %{"agent_write" => 1, "item_id" => nil, "outcome" => outcome}),
     do: {:ok, outcome}
 
-  defp replay_body(ctx, %{"agent_write" => 1, "outcome" => outcome} = receipt) do
-    with {:ok, resources} <- call(ctx, {:replay_resources, ctx.principal, receipt}) do
+  defp replay_body(ctx, operation, %{"agent_write" => 1, "outcome" => outcome} = receipt) do
+    with {:ok, resources} <- call(ctx, {:replay_resources, ctx.principal, operation, receipt}) do
       {:ok, Map.merge(outcome, resources)}
     end
   end
 
   # Earlier versions stored the full success. Decode it in the HTTP process.
-  defp replay_body(_ctx, body), do: {:ok, body}
+  defp replay_body(_ctx, _operation, body), do: {:ok, body}
 
   defp prepare_uploads(ctx, {_, _, _, _, _, _, %{"file_ids" => [_ | _]}} = input, op_id) do
     case call(ctx, {:prepare_uploads, input, op_id}) do
@@ -423,7 +423,8 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
   end
 
   def handle_call(
-        {:replay_resources, %{person: person, key: agent}, %{"item_id" => item} = receipt},
+        {:replay_resources, %{person: person, key: agent}, request_operation,
+         %{"item_id" => item} = receipt},
         _from,
         state
       ) do
@@ -434,21 +435,21 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
     result =
       with :ok <- authorize(state, scope, operation),
            {:ok, key} <- operation_item_key(state, scope, operation, item) do
-        project_receipt(state, scope, key, receipt)
+        project_receipt(state, scope, key, request_operation, receipt)
       end
 
     {:reply, result, state}
   end
 
-  defp project_receipt(_state, _scope, _key, %{"item_id" => nil}), do: {:ok, %{}}
+  defp project_receipt(_state, _scope, _key, _operation, %{"item_id" => nil}), do: {:ok, %{}}
 
-  defp project_receipt(state, scope, key, receipt) do
+  defp project_receipt(state, scope, key, operation, receipt) do
     projection_scope = receipt_projection_scope(state, scope, key, receipt)
 
     Projection.capture(fn ->
       with {:ok, rev} <- AgentChangeLog.head(state.store, projection_scope),
            {:ok, message} <-
-             replay_message(state, projection_scope, key, receipt["include_message"]),
+             replay_message(state, projection_scope, key, operation, receipt["include_message"]),
            {:ok, entry} <- replay_entry(state, projection_scope, key, receipt["entry_position"]) do
         message =
           if projection_scope != scope do
@@ -485,8 +486,15 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
 
   defp receipt_projection_scope(_state, scope, _key, _receipt), do: scope
 
-  defp replay_message(state, scope, key, true), do: AgentResources.message(state, scope, key)
-  defp replay_message(_state, _scope, _key, false), do: {:ok, nil}
+  defp replay_message(state, scope, key, :send, true) do
+    with {:ok, message} <- AgentResources.message(state, scope, key),
+         do: {:ok, RecipientReach.add(message, state, scope)}
+  end
+
+  defp replay_message(state, scope, key, _operation, true),
+    do: AgentResources.message(state, scope, key)
+
+  defp replay_message(_state, _scope, _key, _operation, false), do: {:ok, nil}
 
   defp replay_entry(_state, _scope, _key, nil), do: {:ok, nil}
   defp replay_entry(state, scope, key, position), do: AgentResources.entry(state, scope, key, position)
@@ -876,7 +884,7 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
                {:ok, receipt} <-
                  committed_receipt(next, scope, operation, message_key, fields, extras),
                :ok <- save(next, receipt_scope, key, digest, receipt),
-               {:ok, resources} <- project_receipt(next, scope, message_key, receipt) do
+               {:ok, resources} <- project_receipt(next, scope, message_key, operation, receipt) do
             {:ok, 200, Map.merge(receipt["outcome"], resources), false}
           else
             error -> refusal(error)

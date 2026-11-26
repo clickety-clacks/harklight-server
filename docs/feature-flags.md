@@ -12,6 +12,10 @@ machine names and user identifiers out of this register.
 | `ATTENTION_SERVER_SHARED_MESSAGES=1` or Server startup option `shared_messages: true` | Enable shared messaging where the Server has an authoritative organization | Harklight Server maintainers | wi_29a0d5b3-ed6d-499a-8f3a-429a58a69244 | Off | Shared messaging is available in a published release with supported discovery and client projections |
 | `ATTENTION_SERVER_GROUPS=1` or Server startup option `groups: true` | Enable Harklight groups when shared messaging is also enabled. Hosted group exposure is controlled by the hosted component rollout | Harklight Server maintainers | wi_29a0d5b3-ed6d-499a-8f3a-429a58a69244 | Off | Group provisioning, client discovery and entitlement behavior are accepted in a published release |
 
+| `ATTENTION_SERVER_SIGN_IN_S1=1` | Activate durable sign-in before the Server accepts traffic. A store already activated retains its auth generation on restart. | Harklight Server maintainers | wi_a080b661-df8a-414c-89f6-7fd006746149 | Off | After the S1 release is accepted and the gate is removed |
+
+| `ATTENTION_SERVER_NATIVE_PASSKEYS=1` | Offer passkey sign-in in app sheets. Use only in an isolated acceptance fixture until the supported real-phone flow is verified. | Harklight Server maintainers | wi_a080b661-df8a-414c-89f6-7fd006746149 | Off | After the supported App passkey paths are accepted |
+
 The whole-server `ATTENTION_SERVER_ENABLE` startup switch and permanent operator
 configuration are not temporary feature flags. This register does not declare
 flags for unmerged work; authors add actual flags with their implementation.

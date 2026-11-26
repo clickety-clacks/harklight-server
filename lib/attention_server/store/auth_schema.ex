@@ -1,7 +1,9 @@
 defmodule AttentionServer.Store.AuthSchema do
   @moduledoc false
 
+  alias AttentionServer.{BrowserAuth, DeviceMigration, LocalPasskeys, LocalSignIn}
   alias AttentionServer.ClientAPI.Idempotency
+  alias AttentionServer.NativeSignIn
   alias AttentionServer.Store.RecordTable
   alias Exqlite.Sqlite3
 
@@ -33,18 +35,26 @@ defmodule AttentionServer.Store.AuthSchema do
 
   # This runs under the startup writer before the legacy receipt pruner or any
   # request can run. A restart must not import the later browser-only receipts.
-  def initialize(db) do
-    RecordTable.transaction(db, fn ->
-      case read(db) do
-        {:ok, nil} -> initialize_generation(db)
-        result -> result
-      end
-    end)
+  def initialize(db, engine \\ nil, devices \\ []) do
+    RecordTable.transaction(db, fn -> initialize_in_transaction(db, engine, devices) end)
   end
 
-  defp initialize_generation(db) do
+  def initialize_in_transaction(db, engine, devices) do
+    case read(db) do
+      {:ok, nil} -> initialize_generation(db, engine, devices)
+      result -> result
+    end
+  end
+
+  defp initialize_generation(db, engine, devices) do
     with :ok <- Sqlite3.execute(db, @schema),
          :ok <- Idempotency.retain_person_receipts(db),
+         :ok <- BrowserAuth.create_tables(db),
+         :ok <- NativeSignIn.create_tables(db),
+         :ok <- DeviceMigration.create_tables(db),
+         :ok <- LocalSignIn.create_tables(db),
+         :ok <- LocalPasskeys.create_tables(db),
+         :ok <- DeviceMigration.seed(db, engine, devices),
          :ok <-
            RecordTable.run(
              db,

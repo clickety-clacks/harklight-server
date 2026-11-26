@@ -88,6 +88,55 @@ defmodule AttentionServer.ClientAPIOriginParityTest do
     assert [{_person, "app:test", _id}] = messages(ctx)
   end
 
+  test "S1 Agent send and read report current person reach through last-device removal", ctx do
+    baseline = send_message(ctx, @origin, 100)
+    assert baseline.status == 200
+    refute Map.has_key?(decode(baseline)["message"], "recipient_reach")
+    assert :ok = stop_supervised(Server)
+
+    s1_opts =
+      Keyword.merge(ctx.server_opts,
+        public_base_url: "https://fixture.example.test",
+        sign_in_s1: true,
+        auth_migration_devices: [ctx.keys["a2"]]
+      )
+
+    server = start_supervised!({Server, s1_opts})
+    ctx = %{ctx | relay: Server.relay(server), port: Server.port(server)}
+    sent = send_message(ctx, @origin, 101)
+    id = item_id(sent)
+    path = "/v2/agent/messages/" <> id
+    assert decode(sent)["message"]["recipient_reach"] == "reachable"
+
+    assert :ok = Relay.revoke_device(ctx.relay, ctx.keys["a2"])
+    replay = send_message(ctx, @origin, 101)
+    assert item_id(replay) == id
+    assert decode(replay)["message"]["recipient_reach"] == "none"
+    assert decode(get(ctx, @origin, path))["message"]["recipient_reach"] == "none"
+
+    assert {:ok, %{"code" => code}} = Relay.owner_sign_in_code(ctx.relay, ctx.person, ctx.owner)
+    assert {:ok, %{cookie: cookie}} = Relay.redeem_owner_code(ctx.relay, code, nil)
+    assert decode(get(ctx, @origin, path))["message"]["recipient_reach"] == "reachable"
+
+    assert :ok = Relay.end_browser_session(ctx.relay, AttentionServer.BrowserAuth.hash(cookie))
+    assert decode(get(ctx, @origin, path))["message"]["recipient_reach"] == "none"
+
+    sent = send_message(ctx, @origin, 102)
+    assert sent.status == 200
+    assert decode(sent)["message"]["recipient_reach"] == "none"
+
+    id = item_id(sent)
+    retract_path = "/v2/agent/messages/" <> id <> "/retract"
+    retracted = request(ctx, @origin, "POST", retract_path, %{}, 103)
+    assert item_id(retracted) == id
+    refute Map.has_key?(decode(retracted)["message"], "recipient_reach")
+
+    replayed_retract = request(ctx, @origin, "POST", retract_path, %{}, 103)
+    assert item_id(replayed_retract) == id
+    assert {"idempotent-replayed", "true"} in replayed_retract.headers
+    refute Map.has_key?(decode(replayed_retract)["message"], "recipient_reach")
+  end
+
   test "an attached upload is readable within its account and not_found to another person",
        ctx do
     data = "upload-tier attachment bytes"

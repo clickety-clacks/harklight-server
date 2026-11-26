@@ -17,7 +17,7 @@ defmodule AttentionServer.ClientAPI.Principal do
   """
 
   @enforce_keys [:person, :kind, :key]
-  defstruct [:person, :kind, :key, :session_id, :owner_revision]
+  defstruct [:person, :kind, :key, :session_id, :owner_revision, :request_id, pending: false]
 
   @type t :: %__MODULE__{
           person: String.t(),
@@ -58,7 +58,7 @@ defmodule AttentionServer.ClientAPI.Auth do
   end
 
   defp enrolled_principal(relay, key) do
-    case Relay.device_person(relay, key) do
+    case Relay.certificate_device_person(relay, key) do
       {:ok, person} when is_binary(person) ->
         {:ok, %Principal{person: person, kind: :device, key: key}}
 
@@ -79,7 +79,7 @@ defmodule AttentionServer.ClientAPI.Auth do
   `backend` is the web origin's dashboard backend (`{module, context}` or a
   module), which resolves the sign-in cookie.
   """
-  @spec browser(Plug.Conn.t(), term()) :: {:ok, Principal.t()} | {:error, :unauthorized}
+  @spec browser(Plug.Conn.t(), term()) :: {:ok, Principal.t()} | {:error, :unauthorized | :unavailable}
   def browser(conn, backend) do
     conn = Plug.Conn.fetch_cookies(conn)
 
@@ -96,10 +96,33 @@ defmodule AttentionServer.ClientAPI.Auth do
          owner_revision: revision
        }}
     else
+      {:error, :storage_unavailable} -> {:error, :unavailable}
       _ -> {:error, :unauthorized}
     end
   rescue
     _ -> {:error, :unauthorized}
+  end
+
+  def web(conn, backend, relay) do
+    conn = Plug.Conn.fetch_cookies(conn)
+    cookie = Map.get(conn.req_cookies, @cookie)
+
+    case {cookie, Plug.Conn.get_req_header(conn, "authorization")} do
+      {_, []} ->
+        browser(conn, backend)
+
+      {nil, ["Bearer " <> secret]} ->
+        with {:ok, %{device_id: device, person_id: person, hash: hash, pending: pending}} <-
+               Relay.native_session(relay, secret) do
+          {:ok, %Principal{kind: :device, key: device, person: person, session_id: hash, pending: pending}}
+        else
+          {:error, :storage_unavailable} -> {:error, :unavailable}
+          _ -> {:error, :unauthorized}
+        end
+
+      _ ->
+        {:error, :unauthorized}
+    end
   end
 
   @doc """

@@ -640,8 +640,8 @@ defmodule AttentionServer.ChangeLog do
   The calling process (a feed) is told `{:client_closing, scope, reason}` when
   its principal is revoked, its browser session ends or its account is paused.
   """
-  def subscribe_closing(%{kind: :device, key: key, person: person}),
-    do: register_closing([{:device, key}, {:person, person}])
+  def subscribe_closing(%{kind: :device, key: key, person: person} = principal),
+    do: register_closing(device_closing_scopes(principal, key, person))
 
   def subscribe_closing(%{kind: :agent, key: key, person: person}),
     do: register_closing([{:agent, key}, {:person, person}])
@@ -664,8 +664,8 @@ defmodule AttentionServer.ChangeLog do
   Ends `subscribe_closing/1` for the calling process, which may serve later
   requests on the same connection.
   """
-  def unsubscribe_closing(%{kind: :device, key: key, person: person}),
-    do: unregister_closing([{:device, key}, {:person, person}])
+  def unsubscribe_closing(%{kind: :device, key: key, person: person} = principal),
+    do: unregister_closing(device_closing_scopes(principal, key, person))
 
   def unsubscribe_closing(%{kind: :agent, key: key, person: person}),
     do: unregister_closing([{:agent, key}, {:person, person}])
@@ -677,6 +677,16 @@ defmodule AttentionServer.ChangeLog do
     unregister_closing(
       [{:browser_session, session_id}, {:owner, person}, {:person, person}] ++ device
     )
+  end
+
+  defp device_closing_scopes(principal, key, person) do
+    credential =
+      case Map.get(principal, :session_id) do
+        nil -> {:device_certificate, key}
+        hash -> {:device_session, hash}
+      end
+
+    [{:device, key}, {:person, person}, credential]
   end
 
   defp unregister_closing(scopes) do

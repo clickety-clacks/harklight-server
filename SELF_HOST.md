@@ -1,6 +1,6 @@
 # Harklight Server self-hosted installation
 
-Version: **0.2.30**. Package target: **Linux x86_64, glibc 2.39 or newer**, with OpenSSL 3 shared libraries and libstdc++6 (built on Ubuntu 24.04). The package bundles
+Version: **0.2.32**. Package target: **Linux x86_64, glibc 2.39 or newer**, with OpenSSL 3 shared libraries and libstdc++6 (built on Ubuntu 24.04). The package bundles
 Erlang/OTP and Elixir bytecode; users need no Mix, Hex, source checkout or
 Erlang installation. It needs Bash, OpenSSL CLI, tar and the platform libraries
 listed in BUILD_INFO. This is a single-process self-hosted server cut.
@@ -25,9 +25,9 @@ the request; a valid current-revision answer commits a payload-free
 
 ## Download and verify
 
-After publication, download the v0.2.30 release from
-clickety-clacks/harklight-server, tag v0.2.30. Get
-harklight-server-0.2.30-linux-x86_64.tar.gz, SHA256SUMS and SELF_HOST.md from
+After publication, download the v0.2.32 release from
+clickety-clacks/harklight-server, tag v0.2.32. Get
+harklight-server-0.2.32-linux-x86_64.tar.gz, SHA256SUMS and SELF_HOST.md from
 that release. Run sha256sum -c SHA256SUMS and extract into an operator-owned
 versioned directory. BUILD_INFO identifies the source commit, build host,
 toolchain, source status and native dependencies.
@@ -40,7 +40,7 @@ runtime/dependency notices remain in their shipped distribution files.
 Choose the DNS hostname clients will validate. For a same-machine preview,
 localhost works. Install into a directory you own and run:
 
-    PACKAGE="$PWD/harklight-server-0.2.30-linux-x86_64"
+    PACKAGE="$PWD/harklight-server-0.2.32-linux-x86_64"
     STATE="$HOME/.local/share/harklight-server"
     "$PACKAGE/bin/harklight-bootstrap" "$STATE" localhost
     cat "$STATE/person-id"
@@ -110,15 +110,16 @@ The package does not configure Tailscale, expose a public Internet endpoint
 or turn tailnet membership into enrollment or response authority.
 
 Copy the public tls/ca.pem to headless senders over your chosen trusted
-channel. For the native app, use an owner-created invitation from the dashboard
-below: it carries the configured destination and pinned public CA. The app keeps
+channel. Before S1 is enabled, the legacy native app uses an owner-created
+invitation from the dashboard below: it carries the configured destination and pinned public CA. The app keeps
 its own private device key; never transfer an owner or CA private key to it.
 For headless commands use the tailnet IP in --connect and the exact
 certificate hostname in --name. Enrollment uses 18444, owner management 18445,
-and the device client API https://HOSTNAME:18443/v2, which registered agents
-use too. An app or headless device must enroll its exact key and present it over
-mutual TLS on the device port, which serves client API v2 (protocol 0.2) only.
-Invitations carry the device port's address as `device_url`.
+and the device client API https://HOSTNAME:18443/v2. Headless senders and
+registered agents use mutual TLS on that port. The app uses it before S1 and
+on designated devices during the S1 overlap. After S1 sign-in, the app uses
+a bearer session on the trusted HTTPS origin. Legacy invitations carry the
+device port's address as `device_url`.
 
 ## Agent conversation CLI
 
@@ -208,6 +209,63 @@ An unreadable key or unavailable provider yields baseline order when no
 usable scores are available. Provider requests have a 30-second total
 timeout per batch. Delivery and push continue independently of ranking.
 
+## S1 sign-in for the app and browser
+
+S1 is off by default. Before the first activation on a self-hosted Server:
+
+1. Collect the exact IDs of existing phones and iPads that need certificate
+   overlap. Each device's authenticated `GET /v2/me` reports its ID in
+   `principal.device_id`.
+2. Stop the Server and make a complete private backup of the stopped,
+   checkpointed database, uploads, configuration and keys. Keep the backup
+   outside the writable state directory. The managed installer takes a
+   stopped backup before switching a package. If you installed 0.2.32 earlier
+   with S1 off, take a fresh stopped backup before enabling S1. That captures
+   the writes made since installation.
+3. Edit the private `server.env`. Set the exact trusted HTTPS origin, including
+   a non-default port when used. Configure the dashboard listener below with
+   a certificate and private key for that origin. The app and browser use
+   their normal platform trust store. A Tailscale HTTPS certificate for the
+   configured name is one option.
+
+   ```sh
+   export ATTENTION_SERVER_PUBLIC_BASE_URL=https://sign-in.example.net:18447
+   export ATTENTION_SERVER_AUTH_MIGRATION_DEVICES='<first-device-id>,<second-device-id>'
+   export ATTENTION_SERVER_SIGN_IN_S1=1
+   ```
+
+   Replace the placeholders with the collected IDs, or leave the roster empty
+   if no device needs overlap. Leave `ATTENTION_SERVER_NATIVE_PASSKEYS` unset
+   outside isolated App passkey acceptance.
+4. Start through the managed launcher. Use the packaged installer if switching
+   releases. The first S1 start records the roster and auth generation 1 in
+   the existing FORMAT31 database. Later starts use the recorded roster.
+   Removing the activation setting after that start leaves S1 active.
+
+Use the existing owner TLS connection to run `harklight owner sign-in-code`
+with the owner connection options and the target person's ID. Give the
+person only the displayed code. It works once within ten minutes. An owner
+can also issue a code from the signed-in **Devices** page. The person enters
+it on the selected Server or in the app. A signed-in browser can set up a
+passkey from **Devices**. App passkey availability follows real-device
+acceptance.
+
+An S1 sign-in session survives Server restart. The browser's own cookie
+retention determines how long it survives browser close and reopen.
+Browser sign-out ends that browser session. Removing a phone from
+**Devices** ends that phone's sessions and delivery binding.
+
+For the overlap, the existing people-device certificate transport is
+available only to the designated self-hosted installations. The rest use
+the S1 HTTPS sign-in door. Owner and registered agent certificate
+connections continue on their existing endpoints.
+
+The managed installer and launcher check the package's relay format and auth
+generation before startup. A direct launch of v0.2.31 can open an upgraded
+FORMAT31 store and ignores S1 session state and certificate denial. The
+managed checks refuse v0.2.31 against that store. For recovery, follow the
+[S1 upgrade and rollback steps](#upgrading-and-rolling-back-s1).
+
 ## Optional self-hosted device dashboard
 
 The dashboard shows device status and agent skill guidance. A signed-in person
@@ -250,8 +308,8 @@ select a separate browser-trusted TLS certificate; otherwise the server's
 existing certificate and key are used. Opening the page does not grant sender
 or device authority.
 
-After the server is running, the current owner can issue a one-use sign-in
-link over its authenticated owner TLS channel. The command saves the bearer
+Before S1 is enabled, the current owner can issue a one-use sign-in link
+over its authenticated owner TLS channel. The command saves the bearer
 link in a new private file; share it only with the intended owner and remove
 the file when no longer needed. A used link needs a fresh one.
 
@@ -521,6 +579,25 @@ restore the pre-upgrade state and uploads together, and restart the previous
 release. A code or symlink change alone cannot restore the old format.
 Restoring the backup loses writes made since the backup. External
 deliveries that already occurred cannot be undone.
+
+### Upgrading and rolling back S1
+
+Take a stopped, checkpointed backup before first S1 activation, including when
+enabling it after an earlier package install. Keep the full private state and
+configuration together.
+
+If the managed installer fails during conversion or compatibility checking
+before it switches releases, it attempts to restore the pre-install backup
+and restart the prior release. If recovery fails, keep the backup and follow
+the reported service state.
+
+If startup or readiness fails after the installer switches to an auth-capable
+candidate, it tries to stop the candidate. Once stopped, the selected package,
+latest state and original backup are retained. Repair forward with a
+compatible newer release against the preserved state. After S1 has written
+the store, returning to a pre-S1 release requires stopping the Server and
+restoring the complete pre-activation backup with its corresponding package.
+Restoration discards every later write and leaves external deliveries in place.
 
 ### Releases that write FORMAT31
 
