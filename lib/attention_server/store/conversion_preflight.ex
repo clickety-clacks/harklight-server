@@ -18,10 +18,10 @@ defmodule AttentionServer.Store.ConversionPreflight do
     disk_per_byte: 5
   }
   @shape_a Map.merge(@common_budget, %{
-    expanded_bytes: 123_901_842,
+    expanded_bytes: 147_000_000,
     memory_per_byte: 23,
-    revisions: 104_801,
-    changes: 69_166,
+    revisions: 150_000,
+    changes: 95_000,
     references: 43,
     uploads: 33_624_064
   })

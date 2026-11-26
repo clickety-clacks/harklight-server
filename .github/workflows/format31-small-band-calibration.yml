@@ -1,0 +1,110 @@
+name: FORMAT31 small-band retained-data calibration
+
+on:
+  push:
+    branches: [server/format31-small-band-calibration]
+
+permissions:
+  contents: read
+
+jobs:
+  conversion:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      ATTENTION_SERVER_ENABLE: '0'
+      MIX_ENV: prod
+      ERL_FLAGS: '+S 2:2 +SDcpu 1 +SDio 1'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: '27.3.3'
+          elixir-version: '1.19.5'
+          version-type: strict
+      - run: mix deps.get --only prod
+      - run: mix compile
+      - name: Build synthetic fixture using the published snapshot writer
+        env:
+          SHAPE: '2400 115000 1300 300 400'
+        run: |
+          mkdir -p "$RUNNER_TEMP/measurements" "$RUNNER_TEMP/prior"
+          results="$RUNNER_TEMP/measurements"
+          git rev-parse HEAD HEAD^ >"$results/commits.txt"
+          awk '/^(MemTotal|MemAvailable):/' /proc/meminfo >"$results/capacity.txt"
+          df -Pk "$RUNNER_TEMP" | awk 'NR == 2 { print "disk_free_kib", $4 }' >>"$results/capacity.txt"
+          probe="$GITHUB_WORKSPACE/scripts/format31-rehearsal.exs"
+          echo "HARKLIGHT_PROBE=$probe" >>"$GITHUB_ENV"
+          archive=harklight-server-0.2.16-linux-x86_64.tar.gz
+          (
+            cd "$RUNNER_TEMP/prior"
+            release=https://github.com/clickety-clacks/harklight-server/releases/download/v0.2.16
+            curl --fail --silent --show-error --location --retry 3 --remote-name "$release/$archive"
+            curl --fail --silent --show-error --location --retry 3 --remote-name "$release/SHA256SUMS"
+            sha256sum --check --ignore-missing SHA256SUMS
+            tar -zxf "$archive"
+          ) >"$results/prior-package.log" 2>&1
+          prior="$RUNNER_TEMP/prior/harklight-server-0.2.16-linux-x86_64/bin/attention_server"
+          export HARKLIGHT_SHAPE="$SHAPE" HARKLIGHT_FIXTURE="$RUNNER_TEMP/seed" HARKLIGHT_PROBE="$probe"
+          timeout 20m "$prior" eval \
+            'System.argv(["seed", System.fetch_env!("HARKLIGHT_FIXTURE") | String.split(System.fetch_env!("HARKLIGHT_SHAPE"))]); Code.require_file(System.fetch_env!("HARKLIGHT_PROBE"))' \
+            >"$results/seed.log" 2>&1
+          files="$RUNNER_TEMP/seed/relay.sqlite3.uploads"
+          find "$files" -type f -print | wc -l > "$results/upload-files.txt"
+          du -sk "$files" | cut -f1 > "$results/upload-kib.txt"
+          test "$(cat "$results/upload-files.txt")" -ge 16
+      - name: Check guard refusal at 2 GiB and packaged conversion at 4 GiB
+        run: |
+          results="$RUNNER_TEMP/measurements"
+          candidate="$RUNNER_TEMP/candidate"
+          mix release attention_server --path "$candidate" > "$results/candidate-build.log" 2>&1
+          install -m 755 scripts/harklight "$candidate/bin/harklight"
+          (
+            cd "$RUNNER_TEMP/seed/relay.sqlite3.uploads"
+            find . -type f -exec sha256sum {} + | sort
+          ) > "$results/before-files.sha256"
+          run_capped() {
+            local limit="$1"
+            shift
+            sudo systemd-run --quiet --wait --pipe --collect \
+              --property=MemoryMax="$limit" --property=MemorySwapMax=0 --property=PrivateNetwork=yes \
+              --uid="$(id -u)" --working-directory="$GITHUB_WORKSPACE" \
+              /usr/bin/env "PATH=$PATH" "ERL_FLAGS=$ERL_FLAGS" ATTENTION_SERVER_ENABLE=0 \
+              /usr/bin/time -f 'maximum_rss_kib=%M' "$candidate/bin/harklight" "$@"
+          }
+          fixture="$RUNNER_TEMP/seed"
+          store="$fixture/relay.sqlite3"
+          python3 - "$store" > "$results/source-shape.log" <<'PY'
+          import sqlite3
+          import sys
+          db = sqlite3.connect("file:" + sys.argv[1] + "?mode=ro", uri=True)
+          size, prefix = db.execute("SELECT length(payload), substr(payload,1,6) FROM relay_state WHERE id=1").fetchone()
+          assert prefix[:2] == b"\x83\x50"
+          print("stored_bytes", size)
+          print("expanded_bytes", int.from_bytes(prefix[2:], "big"))
+          for table in ("client_resource_revs", "agent_changes", "relay_large_data_refs"):
+              print(table, db.execute("SELECT count(*) FROM " + table).fetchone()[0])
+          db.close()
+          PY
+          du -sk "$store.uploads" | awk '{print "upload_allocated_bytes", $1 * 1024}' >> "$results/source-shape.log"
+          original="$(sha256sum "$store")"
+          if run_capped 2G store convert-stopped "$store" --from-release v0.2.16 > "$results/refusal.log" 2>&1; then
+            echo "Unexpected admission under the 2 GiB cap."
+            exit 1
+          fi
+          grep -F 'fit not established' "$results/refusal.log"
+          test "$(sha256sum "$store")" = "$original"
+          run_capped 4G store convert-stopped "$store" --from-release v0.2.16 > "$results/conversion.log" 2>&1
+          grep -F 'Converted stopped Harklight store to FORMAT31' "$results/conversion.log"
+          (
+            cd "$store.uploads"
+            sha256sum --check "$results/before-files.sha256"
+          ) > "$results/upload-checksums.log"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: format31-small-band-calibration
+          path: ${{ runner.temp }}/measurements/
