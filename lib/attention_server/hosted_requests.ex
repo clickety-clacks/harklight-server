@@ -14,7 +14,7 @@ defmodule AttentionServer.HostedRequests do
   @max_body 4 * 1024
 
   @impl Plug
-  def init(opts), do: %{relay: Keyword.fetch!(opts, :relay)}
+  def init(opts), do: %{relay: Keyword.fetch!(opts, :relay), groups: Keyword.get(opts, :groups, false) == true}
 
   @impl Plug
   def call(conn, opts) do
@@ -26,6 +26,15 @@ defmodule AttentionServer.HostedRequests do
 
       {"DELETE", _, ["organizations", ref]} ->
         organization_response(conn, Relay.delete_hosted_organization(opts.relay, ref))
+
+      {"PUT", _, ["organizations", business, "groups", group]} when opts.groups ->
+        with_request(conn, &replace_group(&1, &2, opts.relay, {business, group}))
+
+      {"DELETE", _, ["organizations", business, "groups", group]} when opts.groups ->
+        group_response(conn, Relay.delete_hosted_group(opts.relay, {business, group}))
+
+      {_, _, ["organizations", _, "groups" | _]} ->
+        send_resp(conn, 404, "")
 
       {"POST", "/accounts", _} -> with_request(conn, &create_account(&1, &2, opts))
       {"POST", "/algorithm", _} -> with_request(conn, &set_algorithm(&1, &2, opts))
@@ -79,6 +88,33 @@ defmodule AttentionServer.HostedRequests do
 
   defp organization_response(conn, {:error, :storage_unavailable}),
     do: json(conn, 503, %{"error" => "storage_unavailable"})
+
+  defp replace_group(conn, %{"name" => name, "person_ids" => people, "version" => version} = body, relay, ref)
+       when map_size(body) == 3 do
+    group_response(conn, Relay.replace_hosted_group(relay, ref, name, people, version))
+  end
+
+  defp replace_group(conn, _body, _relay, _ref),
+    do: group_response(conn, {:error, :invalid_group})
+
+  defp group_response(conn, {:ok, %{group_id: id, rev: rev}}),
+    do: json(conn, 200, %{"group_id" => id, "rev" => rev})
+
+  defp group_response(conn, :ok), do: send_resp(conn, 204, "")
+  defp group_response(conn, {:error, :not_found}), do: send_resp(conn, 404, "")
+
+  defp group_response(conn, {:error, reason}) do
+    status =
+      case reason do
+        :group_deleted -> 410
+        :not_affiliated -> 422
+        error when error in [:stale_version, :version_conflict] -> 409
+        :storage_unavailable -> 503
+        _ -> 400
+      end
+
+    json(conn, status, %{"error" => to_string(reason)})
+  end
 
   defp create_account(conn, request, opts) do
     case Relay.hosted_account_create(opts.relay, Map.get(request, "account_ref")) do

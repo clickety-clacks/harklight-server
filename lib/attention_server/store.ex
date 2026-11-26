@@ -1828,6 +1828,7 @@ defmodule AttentionServer.Store do
     :enrollment_read_grants,
     :messages,
     :groups,
+    :hosted_group_refs,
     :shared_messages,
     :shared_recipients,
     :shared_entries,
@@ -1927,6 +1928,9 @@ defmodule AttentionServer.Store do
     do:
       valid_item?(engine, key, record) and
         valid_arrival?(record, Map.get(engine.free_order_highs, person, 0))
+
+  defp valid_keyed_row?(engine, :hosted_group_refs, key, record),
+    do: AttentionServer.Groups.valid_hosted_ref?(engine, key, record)
 
   defp valid_keyed_row?(engine, :groups, key, record),
     do: AttentionServer.Groups.valid?(engine, key, record)
@@ -2955,6 +2959,9 @@ defmodule AttentionServer.Store do
         end) and
         Enum.all?(engine.local_organizations, fn {key, members} ->
           Engine.valid_local_organization?(engine, key, members)
+        end) and
+        Enum.all?(engine.hosted_group_refs, fn {key, record} ->
+          AttentionServer.Groups.valid_hosted_ref?(engine, key, record)
         end) and
         Enum.all?(engine.groups, fn {key, record} ->
           AttentionServer.Groups.valid?(engine, key, record)

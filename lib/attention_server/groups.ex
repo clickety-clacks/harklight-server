@@ -71,34 +71,110 @@ defmodule AttentionServer.Groups do
     end
   end
 
-  def replace_hosted(engine, ref, id, raw_name, people) do
-    with %{id: organization, members: eligible} <- engine.hosted_organizations[ref],
+  def replace_hosted(engine, {business, group_ref} = ref, id, raw_name, people, version)
+      when is_list(people) and is_integer(version) and version >= 0 do
+    with true <- valid_ref?(business) and valid_ref?(group_ref) || {:error, :invalid_group},
+         :ok <- not_deleted(engine, ref),
          {:ok, name} <- normalize_name(raw_name),
-         true <- Enum.all?(people, &MapSet.member?(eligible, &1)) do
+         proposed = %{name: name, roster: MapSet.new(people)},
+         {:ok, prior} <- compare_hosted_version(engine, ref, proposed, version),
+         %{id: organization, members: eligible} <- engine.hosted_organizations[business],
+         true <- MapSet.subset?(proposed.roster, eligible) || {:error, :not_affiliated} do
       group =
-        hosted_group(engine, ref) ||
-          %{id: id, organization_id: organization, name: name, manager: nil,
-            members: %{}, invitations: %{}, hosted_ref: ref}
+        case prior do
+          %{group_id: existing} -> Map.fetch!(engine.groups, existing)
+          nil ->
+            %{id: id, organization_id: organization, name: name, manager: nil,
+              members: %{}, invitations: %{}, hosted_ref: ref}
+        end
 
       members = Map.new(people, &{&1, Map.get(group.members, &1, false)})
-      next = replace_members(engine, %{group | name: name}, members)
-      {:ok, next, next.groups[group.id]}
+      rev = if prior, do: prior.rev + 1, else: 1
+      row = Map.merge(proposed, %{group_id: group.id, version: version, rev: rev})
+
+      next =
+        engine
+        |> replace_members(%{group | name: name}, members)
+        |> Engine.put_row(:hosted_group_refs, ref, row)
+
+      {:ok, next, receipt(row)}
     else
+      {:replayed, row} -> {:ok, engine, receipt(row)}
       nil -> {:error, :not_found}
-      false -> {:error, :invalid_members}
       error -> error
     end
   end
 
-  def delete_hosted(engine, ref) do
-    case hosted_group(engine, ref) do
-      nil -> engine
-      group ->
-        engine
-        |> replace_members(group, %{})
-        |> Engine.delete_row(:groups, group.id)
+  def replace_hosted(_engine, _ref, _id, _name, _people, _version), do: {:error, :invalid_group}
+
+  def delete_hosted(engine, {business, group_ref} = ref) do
+    cond do
+      not valid_ref?(business) or not valid_ref?(group_ref) -> {:error, :invalid_group}
+      engine.hosted_group_refs[ref] == :deleted -> {:ok, engine}
+      not Map.has_key?(engine.hosted_organizations, business) -> {:error, :not_found}
+      true -> {:ok, tombstone(engine, ref)}
     end
   end
+
+  def delete_hosted_business(engine, business) do
+    Enum.reduce(engine.hosted_group_refs, engine, fn
+      {{^business, _} = ref, %{}}, next -> tombstone(next, ref)
+      _, next -> next
+    end)
+  end
+
+  defp tombstone(engine, ref) do
+    engine =
+      case engine.hosted_group_refs[ref] do
+        %{group_id: id} ->
+          engine
+          |> replace_members(Map.fetch!(engine.groups, id), %{})
+          |> Engine.delete_row(:groups, id)
+
+        nil ->
+          engine
+      end
+
+    Engine.put_row(engine, :hosted_group_refs, ref, :deleted)
+  end
+
+  defp not_deleted(engine, ref) do
+    if engine.hosted_group_refs[ref] == :deleted, do: {:error, :group_deleted}, else: :ok
+  end
+
+  defp compare_hosted_version(engine, ref, content, version) do
+    case engine.hosted_group_refs[ref] do
+      %{version: applied} when applied > version -> {:error, :stale_version}
+      %{version: ^version} = prior ->
+        if Map.take(prior, [:name, :roster]) == content,
+          do: {:replayed, prior},
+          else: {:error, :version_conflict}
+
+      prior -> {:ok, prior}
+    end
+  end
+
+  defp receipt(row), do: %{group_id: row.group_id, rev: row.rev}
+
+  def valid_hosted_ref?(_engine, {business, ref}, :deleted),
+    do: valid_ref?(business) and valid_ref?(ref)
+
+  def valid_hosted_ref?(engine, {business, ref} = address, %{
+        group_id: id, version: version, name: name, roster: %MapSet{} = roster, rev: rev
+      }) do
+    group = engine.groups[id]
+    valid_ref?(business) and valid_ref?(ref) and
+      match?(%{hosted_ref: ^address, name: ^name}, group) and
+      is_integer(version) and version >= 0 and is_integer(rev) and rev > 0 and
+      Enum.all?(roster, &Map.has_key?(engine.persons, &1))
+  end
+
+  def valid_hosted_ref?(_, _, _), do: false
+
+  defp valid_ref?(ref) when is_binary(ref) and byte_size(ref) > 0,
+    do: String.valid?(ref) and not String.contains?(ref, "/") and not Regex.match?(~r/[\s\p{C}]/u, ref)
+
+  defp valid_ref?(_), do: false
 
   def remove_affiliations(engine, organization, departing) do
     people = MapSet.to_list(departing)
@@ -143,8 +219,9 @@ defmodule AttentionServer.Groups do
   defp valid_custody?(engine, organization, manager, nil, _invitations),
     do: organization == engine.relay_instance_id and Map.has_key?(engine.persons, manager)
 
-  defp valid_custody?(engine, organization, nil, ref, invitations),
-    do: get_in(engine.hosted_organizations, [ref, :id]) == organization and map_size(invitations) == 0
+  defp valid_custody?(engine, organization, nil, {business, _} = ref, invitations),
+    do: get_in(engine.hosted_organizations, [business, :id]) == organization and
+      match?(%{group_id: _}, engine.hosted_group_refs[ref]) and map_size(invitations) == 0
 
   defp valid_custody?(_, _, _, _), do: false
 
@@ -175,9 +252,6 @@ defmodule AttentionServer.Groups do
     end
   end
 
-  defp hosted_group(engine, ref),
-    do: Enum.find(Map.values(engine.groups), &(&1.hosted_ref == ref))
-
   defp affiliated(engine, organization, person) do
     if MapSet.member?(SharedMessages.organizations(engine, person), organization),
       do: :ok,
@@ -187,7 +261,7 @@ defmodule AttentionServer.Groups do
   defp normalize_name(name) when is_binary(name) do
     case String.trim(name) do
       "" -> {:error, :invalid_name}
-      name -> {:ok, name}
+      name -> {:ok, String.normalize(name, :nfc)}
     end
   end
 

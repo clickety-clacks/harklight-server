@@ -278,6 +278,12 @@ defmodule AttentionServer.Relay do
   def delete_hosted_organization(server, ref),
     do: GenServer.call(server, {:delete_hosted_organization, ref}, :infinity)
 
+  def replace_hosted_group(server, ref, name, people, version),
+    do: GenServer.call(server, {:replace_hosted_group, ref, name, people, version}, :infinity)
+
+  def delete_hosted_group(server, ref),
+    do: GenServer.call(server, {:delete_hosted_group, ref}, :infinity)
+
   def hosted_account_create(server, account_ref),
     do: GenServer.call(server, {:hosted_account_create, account_ref}, :infinity)
 
@@ -506,6 +512,7 @@ defmodule AttentionServer.Relay do
               hosted_jev_connection: hosted_jev_connection(opts),
               feature_flags_path: Keyword.get(opts, :feature_flags_path),
               shared_messages: Keyword.get(opts, :shared_messages, false) == true,
+              groups: Keyword.get(opts, :groups, false) == true,
               feature_flags_warned: false,
               clock: clock,
               default_index: Engine.default_index(store.engine),
@@ -1296,6 +1303,24 @@ defmodule AttentionServer.Relay do
     result = Engine.delete_hosted_organization(state.store.engine, ref)
     commit_hosted_organization(state, result, "hosted_organization_delete")
   end
+
+  defp dispatch_call({:replace_hosted_group, ref, name, people, version}, _from,
+         %{deployment_mode: :saas, groups: true, shared_messages: true, store: %{mode: :keyed}} = state) do
+    result = AttentionServer.Groups.replace_hosted(state.store.engine, ref, random_uuid_v4(), name, people, version)
+    commit_hosted_group(state, result, "hosted_group_replace")
+  end
+
+  defp dispatch_call({:replace_hosted_group, _, _, _, _}, _from, state),
+    do: {:reply, {:error, :not_found}, state}
+
+  defp dispatch_call({:delete_hosted_group, ref}, _from,
+         %{deployment_mode: :saas, groups: true, shared_messages: true, store: %{mode: :keyed}} = state) do
+    result = AttentionServer.Groups.delete_hosted(state.store.engine, ref)
+    commit_hosted_organization(state, result, "hosted_group_delete")
+  end
+
+  defp dispatch_call({:delete_hosted_group, _}, _from, state),
+    do: {:reply, {:error, :not_found}, state}
 
   defp dispatch_call({:hosted_account_create, account_ref}, _from, state) do
     engine = state.store.engine
@@ -4130,6 +4155,16 @@ defmodule AttentionServer.Relay do
   end
 
   defp put_push_revision(_store, _claim), do: {:error, :storage_unavailable}
+
+  defp commit_hosted_group(state, {:ok, next, result}, action) do
+    case commit_hosted_organization(state, {:ok, next}, action) do
+      {:reply, :ok, updated} -> {:reply, {:ok, result}, updated}
+      error -> error
+    end
+  end
+
+  defp commit_hosted_group(state, {:error, reason}, _action),
+    do: {:reply, {:error, reason}, state}
 
   defp commit_hosted_organization(state, {:ok, next}, action) do
     audit = %{person: "system", actor: "hosted_component", action: action}

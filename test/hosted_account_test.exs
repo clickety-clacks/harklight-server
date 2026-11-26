@@ -46,6 +46,23 @@ defmodule AttentionServer.HostedAccountTest do
     relay
   end
 
+  defp hosted_group_request(relay, method, path, body, enabled? \\ true) do
+    response =
+      method
+      |> Plug.Test.conn(path, JSON.encode!(body))
+      |> HostedRequests.call(HostedRequests.init(relay: relay, groups: enabled?))
+
+    decoded =
+      case response.resp_body do
+        "" -> ""
+        body ->
+          {:ok, decoded} = JSON.decode_line(body <> "\n")
+          decoded
+      end
+
+    {response.status, decoded}
+  end
+
   describe "hosted accounts in the relay" do
     test "organization rosters replace atomically and survive restart", %{certs: certs, dir: dir} do
       relay = start_relay(certs, dir, [])
@@ -84,6 +101,56 @@ defmodule AttentionServer.HostedAccountTest do
 
       assert :ok = Relay.delete_hosted_organization(relay, "business-a")
       refute Map.has_key?(:sys.get_state(relay).store.engine.hosted_organizations, "business-a")
+      assert :ok = GenServer.stop(relay)
+    end
+
+    test "versioned Hosted groups reject delayed rosters and retain tombstones", %{certs: certs, dir: dir} do
+      relay_opts = [deployment_mode: :saas, shared_messages: true, groups: true]
+      relay = start_relay(certs, dir, relay_opts)
+      assert {:ok, alice} = Relay.hosted_account_create(relay, "acct-alice")
+      assert {:ok, bob} = Relay.hosted_account_create(relay, "acct-bob")
+      assert :ok = Relay.replace_hosted_organization(relay, "business-a", [alice, bob])
+
+      path = "/organizations/business-a/groups/first"
+      initial = %{"name" => "Planning", "person_ids" => [alice, bob], "version" => 1}
+      assert {404, ""} = hosted_group_request(relay, :put, path, initial, false)
+      assert {200, %{"group_id" => first, "rev" => 1} = initial_result} =
+               hosted_group_request(relay, :put, path, initial)
+
+      assert :ok = Relay.replace_hosted_organization(relay, "business-a", [alice])
+      version_before_replay = :sys.get_state(relay).store.version
+      assert {200, ^initial_result} =
+               hosted_group_request(relay, :put, path, %{initial | "person_ids" => [bob, alice, alice]})
+      store = :sys.get_state(relay).store
+      assert store.version == version_before_replay
+      assert store.engine.groups[first].members == %{alice => false}
+
+      assert {409, %{"error" => "version_conflict"}} =
+               hosted_group_request(relay, :put, path, %{initial | "person_ids" => [alice]})
+      assert {422, %{"error" => "not_affiliated"}} =
+               hosted_group_request(relay, :put, path, %{initial | "version" => 2})
+      assert {200, %{"group_id" => ^first, "rev" => 2}} =
+               hosted_group_request(relay, :put, path,
+                 %{initial | "version" => 2, "name" => "Renamed", "person_ids" => [alice]})
+      assert {409, %{"error" => "stale_version"}} = hosted_group_request(relay, :put, path, initial)
+
+      second_path = "/organizations/business-a/groups/second"
+      consent = %{"name" => "Second group", "person_ids" => [alice], "version" => 1}
+      assert {200, %{"group_id" => second}} = hosted_group_request(relay, :put, second_path, consent)
+      assert first != second
+      assert {204, ""} = hosted_group_request(relay, :delete, path, %{})
+      assert {204, ""} = hosted_group_request(relay, :delete, path, %{})
+      assert :ok = Relay.delete_hosted_organization(relay, "business-a")
+      assert :ok = GenServer.stop(relay)
+
+      relay = start_relay(certs, dir, relay_opts)
+      assert {410, %{"error" => "group_deleted"}} = hosted_group_request(relay, :put, path, initial)
+      assert {410, %{"error" => "group_deleted"}} = hosted_group_request(relay, :put, second_path, consent)
+      assert {204, ""} = hosted_group_request(relay, :delete, second_path, %{})
+      assert :ok = Relay.replace_hosted_organization(relay, "business-a", [alice])
+      third_path = "/organizations/business-a/groups/third"
+      assert {200, %{"group_id" => third, "rev" => 1}} = hosted_group_request(relay, :put, third_path, consent)
+      refute third in [first, second]
       assert :ok = GenServer.stop(relay)
     end
 

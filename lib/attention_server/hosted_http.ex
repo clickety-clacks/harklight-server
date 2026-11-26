@@ -34,7 +34,7 @@ defmodule AttentionServer.HostedHTTP do
     children = [
       Supervisor.child_spec(
         {Bandit,
-         plug: {HostedRequests, relay: Keyword.fetch!(opts, :relay)},
+         plug: {HostedRequests, relay: Keyword.fetch!(opts, :relay), groups: Keyword.get(opts, :groups, false)},
          scheme: :http,
          ip: Keyword.fetch!(opts, :ip),
          port: Keyword.fetch!(opts, :port),

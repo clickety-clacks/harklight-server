@@ -56,6 +56,7 @@ defmodule AttentionServer.Engine do
             sender_grants: %{},
             messages: %{},
             groups: %{},
+            hosted_group_refs: %{},
             shared_messages: %{},
             shared_recipients: %{},
             shared_entries: %{},
@@ -802,7 +803,7 @@ defmodule AttentionServer.Engine do
           %{id: id, members: people} ->
             engine
             |> freeze_shared_departures(id, people)
-            |> AttentionServer.Groups.delete_hosted(ref)
+            |> AttentionServer.Groups.delete_hosted_business(ref)
             |> delete_row(:hosted_organizations, ref)
 
           nil ->

@@ -69,11 +69,12 @@ defmodule AttentionServer.GroupsTest do
       Engine.with_touches(store.engine, fn original ->
         {:ok, engine, _} = Engine.hosted_account_create(original, "member", false, @invitee, String.duplicate("a", 64))
         {:ok, engine} = Engine.replace_hosted_organization(engine, "business", [@invitee], @organization)
-        assert {:error, :invalid_members} = Groups.replace_hosted(engine, "business", @group, "Business", [@other])
-        {:ok, engine, _} = Groups.replace_hosted(engine, "business", @group, "Business", [@invitee])
+        assert {:error, :not_affiliated} = Groups.replace_hosted(engine, {"business", "default"}, @group, "Business", [@other], 1)
+        {:ok, engine, _} = Groups.replace_hosted(engine, {"business", "default"}, @group, "Business", [@invitee], 1)
         {:ok, engine, _} = Groups.mute(engine, @group, @invitee, true)
-        {:ok, engine, %{id: @group, members: %{@invitee => true}}} =
-          Groups.replace_hosted(engine, "business", @other, "Business", [@invitee])
+        {:ok, engine, %{group_id: @group, rev: 1}} =
+          Groups.replace_hosted(engine, {"business", "default"}, @other, "Business", [@invitee], 1)
+        assert engine.groups[@group].members == %{@invitee => true}
 
         {engine, :ok}
       end)
@@ -88,6 +89,7 @@ defmodule AttentionServer.GroupsTest do
     assert engine.groups[@group].members == %{}
     assert {:ok, engine} = Engine.delete_hosted_organization(engine, "business")
     assert engine.groups == %{}
+    assert engine.hosted_group_refs[{"business", "default"}] == :deleted
     assert :ok = Store.close(reopened)
   end
 
