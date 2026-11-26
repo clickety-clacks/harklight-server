@@ -93,6 +93,8 @@ defmodule AttentionServer.ClientAPI.Router do
   # Components add their route module here: C3 reads, C4 writes, C5 the feed.
   @route_modules [
     AttentionServer.ClientAPI.Reads,
+    AttentionServer.ClientAPI.Devices,
+    AttentionServer.ClientAPI.SignIn,
     AttentionServer.ClientAPI.AgentReads,
     AttentionServer.ClientAPI.AgentShow,
     AttentionServer.ClientAPI.AgentWrites,
@@ -155,6 +157,33 @@ defmodule AttentionServer.ClientAPI.Router do
 
   defp stream?(:nomatch), do: false
 
+  defp authenticated(
+         %{method: "GET"} = conn,
+         %{auth: {:browser, _, _}, relay: relay},
+         ["auth", "methods"],
+         _route,
+         _request_id
+       ),
+       do: AttentionServer.ClientAPI.SignIn.methods(conn, relay)
+
+  defp authenticated(
+         %{method: "POST"} = conn,
+         %{auth: {:browser, _, _}, relay: relay},
+         ["auth", "transactions"],
+         _route,
+         _request_id
+       ),
+       do: AttentionServer.ClientAPI.SignIn.create_transaction(conn, relay)
+
+  defp authenticated(
+         %{method: "POST"} = conn,
+         %{auth: {:browser, _, _}, relay: relay},
+         ["auth", "sign-in"],
+         _route,
+         _request_id
+       ),
+       do: AttentionServer.ClientAPI.SignIn.redeem(conn, relay)
+
   defp authenticated(conn, opts, segments, route, request_id) do
     case authenticate(conn, opts) do
       {:ok, principal} ->
@@ -167,12 +196,15 @@ defmodule AttentionServer.ClientAPI.Router do
           paused ->
             Errors.send_error(conn, "account_paused")
 
-          not principal_allowed?(principal, route) or not origin_ok?(conn, opts.auth) ->
+          not pending_allowed?(conn.method, segments, principal) ->
+            Errors.send_error(conn, "forbidden")
+
+          not principal_allowed?(principal, route) or not origin_ok?(conn, opts.auth, principal) ->
             Errors.send_error(conn, "forbidden")
 
           true ->
             dispatch(conn, opts, route, %Context{
-              principal: principal,
+              principal: Map.put(principal, :request_id, request_id),
               relay: opts.relay,
               request_id: request_id
             })
@@ -194,8 +226,8 @@ defmodule AttentionServer.ClientAPI.Router do
     :exit, _reason -> {:error, :unavailable}
   end
 
-  defp authenticate(conn, %{auth: {:browser, backend, _origin}}) do
-    Auth.browser(conn, backend)
+  defp authenticate(conn, %{auth: {:browser, backend, _origin}, relay: relay}) do
+    Auth.web(conn, backend, relay)
   catch
     :exit, _reason -> {:error, :unavailable}
   end
@@ -209,14 +241,20 @@ defmodule AttentionServer.ClientAPI.Router do
     :exit, _reason -> :unavailable
   end
 
+  defp pending_allowed?("POST", ["auth", "migration-complete"], _principal), do: true
+  defp pending_allowed?(method, _segments, %{pending: true}), do: method in ["GET", "HEAD"]
+  defp pending_allowed?(_method, _segments, _principal), do: true
+
   defp principal_allowed?(%{kind: :agent}, {:ok, _, _, _, route_opts}),
     do: Keyword.get(route_opts, :granted_agent, false)
 
   defp principal_allowed?(%{kind: :agent}, :nomatch), do: false
   defp principal_allowed?(_principal, _route), do: true
 
-  defp origin_ok?(conn, {:browser, _backend, origin}), do: Auth.browser_origin_ok?(conn, origin)
-  defp origin_ok?(_conn, :device), do: true
+  defp origin_ok?(conn, {:browser, _backend, origin}, %{kind: :browser}),
+    do: Auth.browser_origin_ok?(conn, origin)
+
+  defp origin_ok?(_conn, _auth, _principal), do: true
 
   # A device whose enrollment ended while its connection was open: refuse, and
   # end an HTTP/1.1 connection so the next attempt meets the TLS handshake.

@@ -13,7 +13,8 @@ defmodule AttentionServer.CLI.Owner do
 
   * `revoke-device --device SPKI` (requires typing `REVOKE`)
   * `invite --output /private/directory/invitation.json` (30-minute configured-trust invitation)
-  * `browser-sign-in --output /private/directory/sign-in-link.txt` (10-minute one-use host-page link)
+  * `sign-in-code` (displays a one-use code valid for ten minutes)
+  * `browser-sign-in --output /private/directory/sign-in-link.txt` (pre-S1 only)
   * `decline --code CODE` (requires typing `DECLINE` for the stored exact request)
   * `grant-sender --device SPKI --sender ID`
   * `revoke-sender --device SPKI --sender ID`
@@ -31,7 +32,7 @@ defmodule AttentionServer.CLI.Owner do
 
   alias AttentionServer.{HeadlessAgent, HeadlessOwner, HeadlessTLS, ToolEndpoint}
 
-  def run([command | args]) when command in ["invite", "browser-sign-in", "decline"] do
+  def run([command | args]) when command in ["invite", "browser-sign-in", "sign-in-code", "decline"] do
     {options, rest, invalid} =
       OptionParser.parse(args,
         strict: [
@@ -74,6 +75,18 @@ defmodule AttentionServer.CLI.Owner do
         # Explicit sensitive product result; shell status/log output never receives the URL.
         IO.puts(AttentionServer.InvitationHandoff.encode_result(result))
         result
+
+      command == "sign-in-code" ->
+        if Keyword.has_key?(options, :code) or Keyword.has_key?(options, :output),
+          do: AttentionServer.CLI.error!("sign-in-code displays its result without extra options")
+
+        case HeadlessOwner.sign_in_code(endpoint, certificate, key, person) do
+          {:ok, %{"sign_in_code" => %{"code" => code}}} when is_binary(code) ->
+            AttentionServer.CLI.shell().info("One-time code: #{code}")
+
+          _ ->
+            AttentionServer.CLI.error!("one-time code unavailable")
+        end
 
       command in ["invite", "browser-sign-in"] ->
         path = required!(options, :output)

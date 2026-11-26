@@ -63,6 +63,13 @@ defmodule AttentionServer.ClientAPI.Idempotency do
     original_response INTEGER NOT NULL CHECK (original_response IN (0, 1)),
     PRIMARY KEY (person_id, idempotency_key)
   );
+  CREATE TABLE harklight_app_reply_intents (
+    person_id TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    request_digest TEXT NOT NULL,
+    intent_digest TEXT NOT NULL,
+    PRIMARY KEY (person_id, idempotency_key)
+  );
   """
 
   # Called only inside the auth upgrade transaction. The agent scope namespace
@@ -114,6 +121,34 @@ defmodule AttentionServer.ClientAPI.Idempotency do
       """,
       [person, key, digest, status, JSON.encode!(body), now()]
     )
+  end
+
+  @doc false
+  def accept_app_reply_attempt(db, person, key, digest, intent, marked?) do
+    with :ok <-
+           RecordTable.run(
+             db,
+             """
+             INSERT INTO harklight_app_reply_intents VALUES (?, ?, ?, ?)
+             ON CONFLICT (person_id, idempotency_key) DO NOTHING
+             """,
+             [person, key, digest, intent]
+           ),
+         {:ok, [[original_digest, original_intent]]} <-
+           RecordTable.select(
+             db,
+             """
+             SELECT request_digest, intent_digest FROM harklight_app_reply_intents
+             WHERE person_id = ? AND idempotency_key = ?
+             """,
+             [person, key]
+           ) do
+      if digest == original_digest or (marked? and intent == original_intent),
+        do: :ok,
+        else: {:error, :idempotency_conflict}
+    else
+      _ -> {:error, :storage_unavailable}
+    end
   end
 
   @type receipt :: %{digest: String.t(), status: pos_integer(), body: map()}

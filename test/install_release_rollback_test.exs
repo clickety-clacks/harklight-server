@@ -54,6 +54,14 @@ defmodule AttentionServer.InstallReleaseRollbackTest do
   end
 
   @tag timeout: 30_000
+  test "a compatible repair release preserves writes after failed auth-capable readiness", context do
+    {output, status} = run_installer("auth-start-failure", context)
+
+    assert status == 0, output
+    assert sha256_file(context.store_path) == context.store_sha256
+  end
+
+  @tag timeout: 30_000
   test "an unavailable optional owner route does not block other server functionality", context do
     {output, status} = run_installer("optional-route", context)
 
