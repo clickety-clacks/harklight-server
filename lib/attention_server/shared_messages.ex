@@ -305,7 +305,7 @@ defmodule AttentionServer.SharedMessages do
       "rev" => rev, "position" => entry.position, "kind" => "reply",
       "author" => entry_author(entry.author), "speaker" => entry.speaker,
       "request_revision" => entry.request_revision, "at_ms" => entry.at_ms,
-      "text" => entry.text, "files" => []
+      "text" => entry.text, "files" => SharedAttachments.wire(Map.get(entry, :files, []))
     }
   end
 
@@ -363,10 +363,15 @@ defmodule AttentionServer.SharedMessages do
         id: id, shared_id: shared_id, position: position, request_revision: revision,
         at_ms: at_ms, text: text, author: author, speaker: speaker
       }) do
+    entry = engine.shared_entries[id]
+
     case Map.get(engine.shared_messages, shared_id) do
       %{entry_high: high, revision: current} ->
         is_binary(id) and position in 1..high and revision in 1..current and
-          is_integer(at_ms) and is_binary(text) and is_map(speaker) and valid_author?(engine, author)
+          is_integer(at_ms) and is_binary(text) and is_map(speaker) and valid_author?(engine, author) and
+          Enum.all?(SharedAttachments.entry_upload_ids(entry), fn upload_id ->
+            match?(%{message_id: ^shared_id, shared_entry_id: ^id}, engine.uploads[upload_id])
+          end)
       _ -> false
     end
   end
@@ -499,6 +504,28 @@ defmodule AttentionServer.SharedMessages do
     %{"unresolved" => individual + shared}
   end
 
+  def badge_count(engine, person, capability \\ %{}) do
+    affiliations = organizations(engine, person)
+
+    Enum.count(for_person(engine, person, capability), fn {record, recipient} ->
+      not Map.has_key?(recipient, :frozen) and
+        MapSet.member?(affiliations, record.organization_id) and
+        (request_attention?(engine, record, recipient, person) or unread_chat?(engine, record, recipient, person))
+    end)
+  end
+
+  defp request_attention?(engine, record, recipient, person) do
+    not AttentionServer.Message.progress_message?(record.message) and
+      SharedAnswers.available?(engine, record, recipient, person)
+  end
+
+  defp unread_chat?(engine, record, recipient, person) do
+    read = Map.get(recipient, :read_position, 0)
+    Enum.any?(entries(engine, record), &unread_entry?(&1, person, read))
+  end
+
+  defp unread_entry?(entry, person, read), do: entry.position > read and entry.author != {:person, person}
+
   def recipient_message(engine, person, item_id) do
     Enum.find_value(engine.shared_recipients, {:error, :not_found}, fn
       {{shared_id, ^person}, %{item_id: ^item_id} = recipient} ->
@@ -553,7 +580,7 @@ defmodule AttentionServer.SharedMessages do
     entries = entries(engine, record, cutoff)
     read = Map.get(recipient, :read_position, 0)
 
-    unread = Enum.count(entries, &(&1.position > read and &1.author != {:person, person}))
+    unread = Enum.count(entries, &unread_entry?(&1, person, read))
     last_read = Enum.find(entries, &(&1.position == read))
     last_origin = Enum.find(Enum.reverse(entries), &(&1.author == :sender))
 

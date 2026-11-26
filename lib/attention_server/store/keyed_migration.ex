@@ -145,7 +145,7 @@ defmodule AttentionServer.Store.KeyedMigration do
 
   defp read_records(db) do
     # Safe term decoding requires the modules that define the persisted schema.
-    Enum.each([AttentionServer.Groups, AttentionServer.SharedMessages, AttentionServer.SharedAnswers],
+    Enum.each([AttentionServer.Groups, AttentionServer.SharedMessages, AttentionServer.SharedAnswers, AttentionServer.SharedPush],
       &Code.ensure_loaded!/1)
     RecordTable.scan(db, &RecordCodec.decode/1)
   end

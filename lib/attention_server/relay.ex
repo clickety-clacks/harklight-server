@@ -479,6 +479,10 @@ defmodule AttentionServer.Relay do
   def claim_push(server, now_ms), do: GenServer.call(server, {:claim_push, now_ms}, :infinity)
 
   @doc false
+  def refresh_push_claim(server, claim),
+    do: GenServer.call(server, {:refresh_push_claim, claim}, :infinity)
+
+  @doc false
   def enable_push(server), do: GenServer.call(server, :enable_push, :infinity)
 
   @doc false
@@ -932,6 +936,16 @@ defmodule AttentionServer.Relay do
           _ -> {:reply, {:error, :storage_unavailable}, state}
         end
     end
+  end
+
+  defp dispatch_call({:refresh_push_claim, claim}, _from, state) do
+    result =
+      case Engine.refresh_push_claim(state.store.engine, claim, state.shared_messages, Map.get(state, :groups, false)) do
+        {:ok, refreshed} -> put_push_revision(state.store, refreshed)
+        :skip -> :skip
+      end
+
+    {:reply, result, state}
   end
 
   defp dispatch_call({:finish_push, claim, outcome, now_ms}, _from, state)
@@ -4142,6 +4156,7 @@ defmodule AttentionServer.Relay do
   end
 
   defp put_push_revision(_store, nil), do: {:ok, nil}
+  defp put_push_revision(_store, %{locator: nil, stream: :shared} = claim), do: {:ok, claim}
 
   defp put_push_revision(store, %{person: person, locator: locator} = claim)
        when is_map(locator) do
@@ -4934,6 +4949,15 @@ defmodule AttentionServer.Relay do
       Enum.reduce(engine.shared_messages, references, fn {_id, record}, index ->
         ids = AttentionServer.ClientAPI.SharedAttachments.upload_ids(record)
         add_upload_references(index, record.sender_person, ids)
+      end)
+
+    references =
+      Enum.reduce(engine.shared_entries, references, fn {_id, entry}, index ->
+        ids = AttentionServer.ClientAPI.SharedAttachments.entry_upload_ids(entry)
+        Enum.reduce(ids, index, fn id, acc ->
+          upload = Map.fetch!(engine.uploads, id)
+          add_upload_references(acc, upload.person, MapSet.new([id]))
+        end)
       end)
 
     Enum.reduce(engine.uploads, references, fn {_id, upload}, index ->

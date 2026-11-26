@@ -201,16 +201,29 @@ defmodule AttentionServer.ClientAPI.Writes do
     with :ok <- device_only(ctx.principal),
          {:ok, key} <- optional_key(conn),
          {:ok, body, conn} <- json_body(conn),
-         :ok <- only_members(body, ["token", "environment", "revision"]),
+         :ok <- only_members(body, ["token", "environment", "revision", "features"]),
          {:ok, token} <- string_member(body, "token"),
          {:ok, environment} <- environment(body),
-         {:ok, revision} <- push_revision(body) do
-      respond(conn, push(ctx.relay, ctx.principal, token, environment, revision, key))
+         {:ok, revision} <- push_revision(body),
+         {:ok, features} <- push_features(body) do
+      respond(conn, push(ctx.relay, ctx.principal, token, environment, revision, key, features))
     else
       {:error, token, field, conn} -> Errors.send_error(conn, token, field: field)
       {:error, token, field} -> Errors.send_error(conn, token, field: field)
     end
   end
+
+  defp push_features(%{"features" => features}) when is_list(features) do
+    case Enum.sort(features) do
+      ["groups", "shared_messages"] = normalized -> {:ok, normalized}
+      ["shared_messages"] = normalized -> {:ok, normalized}
+      [] -> {:ok, []}
+      _ -> {:error, "invalid_field", "features"}
+    end
+  end
+
+  defp push_features(%{"features" => _}), do: {:error, "invalid_field", "features"}
+  defp push_features(_body), do: {:ok, nil}
 
   @doc false
   def delete_push(conn, %Context{} = ctx) do
@@ -393,15 +406,20 @@ defmodule AttentionServer.ClientAPI.Writes do
   current binding's is `412 precondition_failed`.
   """
   def push(relay, who, token, environment, revision, idempotency_key \\ nil) do
-    write(relay, who, idempotency_key, {:push, token, environment, revision}, %{
+    push(relay, who, token, environment, revision, idempotency_key, nil)
+  end
+
+  def push(relay, who, token, environment, revision, idempotency_key, features) do
+    body = %{
+      "token" => token, "environment" => environment, "revision" => revision,
+      "receipt_version" => @push_receipt_version
+    }
+    body = if is_nil(features), do: body, else: Map.put(body, "features", features)
+
+    write(relay, who, idempotency_key, {:push, token, environment, revision, features}, %{
       method: "PUT",
       path: ["devices", "me", "push"],
-      body: %{
-        "token" => token,
-        "environment" => environment,
-        "revision" => revision,
-        "receipt_version" => @push_receipt_version
-      }
+      body: body
     })
   end
 
@@ -937,11 +955,21 @@ defmodule AttentionServer.ClientAPI.Writes do
     cond do
       principal.kind != :device -> {:error, :forbidden}
       not Map.get(state, :push_enabled, false) -> {:error, :unsupported}
+      shared_push?(operation) and not Reads.shared_available?(state, principal.person) ->
+        {:error, :unsupported, "features"}
+      group_push?(operation) and not Map.get(state, :groups, false) ->
+        {:error, :unsupported, "features"}
       true -> :ok
     end
   end
 
   defp precondition(_state, _who, _principal, _operation), do: :ok
+
+  defp shared_push?({:push, _, _, _, features}) when is_list(features), do: "shared_messages" in features
+  defp shared_push?(_operation), do: false
+
+  defp group_push?({:push, _, _, _, features}) when is_list(features), do: "groups" in features
+  defp group_push?(_operation), do: false
 
   defp if_match_tags(value),
     do: value |> String.split(",") |> Enum.map(&String.trim/1)
@@ -1083,15 +1111,20 @@ defmodule AttentionServer.ClientAPI.Writes do
 
   # PUT is idempotent: the same binding at the same revision is an unchanged
   # success, so a retry after a lost response is not a stale 412.
-  defp frame(engine, principal, key, {:push, token, environment, revision}) do
+  defp frame(engine, principal, key, {:push, token, environment, revision, _features} = operation) do
+    shared? = shared_push?(operation)
+    groups? = group_push?(operation)
+
     case Map.get(engine.push_bindings, {principal.person, principal.engine_key}) do
-      %{revision: ^revision, active: true, address: address, profile_id: profile_id} ->
-        if address == String.downcase(token) and profile_id == "harklight-" <> environment,
+      %{revision: ^revision, active: true, address: address, profile_id: profile_id} = binding ->
+        if address == String.downcase(token) and profile_id == "harklight-" <> environment and
+             Map.get(binding, :shared_messages, false) == shared? and
+             Map.get(binding, :groups, false) == groups?,
           do: {:ok, :unchanged},
-          else: push_frame(key, token, environment, revision)
+          else: push_frame(key, token, environment, revision, shared?, groups?)
 
       _ ->
-        push_frame(key, token, environment, revision)
+        push_frame(key, token, environment, revision, shared?, groups?)
     end
   end
 
@@ -1114,16 +1147,17 @@ defmodule AttentionServer.ClientAPI.Writes do
     if is_binary(Map.get(record, :session_handle)), do: :ok, else: {:error, :unsupported}
   end
 
-  defp push_frame(key, token, environment, revision) do
-    {:ok,
-     %{
-       "type" => "push_register",
-       "op_id" => op_id(key),
-       "revision" => revision,
-       "address_kind" => "apns_token",
-       "address" => token,
-       "profile_id" => "harklight-" <> environment
-     }}
+  defp push_frame(key, token, environment, revision, shared?, groups?) do
+    frame = %{
+      "type" => "push_register",
+      "op_id" => op_id(key),
+      "revision" => revision,
+      "address_kind" => "apns_token",
+      "address" => token,
+      "profile_id" => "harklight-" <> environment
+    }
+    frame = if shared?, do: Map.put(frame, :shared_messages, true), else: frame
+    {:ok, if(groups?, do: Map.put(frame, :groups, true), else: frame)}
   end
 
   # Which answer path stored the value, so a UI/1 result and a plain-text

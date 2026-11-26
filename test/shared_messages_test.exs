@@ -145,6 +145,39 @@ defmodule AttentionServer.SharedMessagesTest do
     assert SharedAnswers.next_default(updated) == nil
   end
 
+  test "push counts one unit for request attention or another person's unread Chat" do
+    engine = people(Engine.new())
+    assert {:ok, engine} =
+             Engine.replace_hosted_organization(engine, "org", [@sender, @other, @third], @organization)
+    assert {:ok, engine, room, _} =
+             SharedMessages.create(engine, attrs(:first), [@other, @third], nil)
+    assert SharedMessages.badge_count(engine, @other) == 1
+
+    entry = %{id: "turn", at_ms: 10, text: "Advice", speaker: %{"kind" => "person", "id" => @other}}
+    assert {:ok, engine, _} = SharedMessages.reply(engine, room, {:person, @other}, entry)
+    assert SharedMessages.badge_count(engine, @third) == 1
+
+    room = engine.shared_messages[room.id]
+    recipient = engine.shared_recipients[{room.id, @other}]
+    assert {:ok, engine, _} =
+             SharedAnswers.answer(engine, room, recipient, @other, 1, {:comment, "Accepted"}, 11)
+    assert SharedMessages.badge_count(engine, @other) == 0
+    assert SharedMessages.badge_count(engine, @third) == 1
+
+    room = engine.shared_messages[room.id]
+    recipient = engine.shared_recipients[{room.id, @third}]
+    local_entry = SharedMessages.recipient_entry_id("turn", @third)
+    assert {:ok, engine} = SharedMessages.read_position(engine, room, @third, recipient, local_entry)
+    assert SharedMessages.badge_count(engine, @third) == 0
+
+    assert {:ok, engine, _} =
+             SharedMessages.reply(engine, room, :sender, %{entry | id: "later", at_ms: 12})
+    assert SharedMessages.badge_count(engine, @third) == 1
+    assert {:ok, engine} =
+             Engine.replace_hosted_organization(engine, "org", [@sender, @other], @organization)
+    assert SharedMessages.badge_count(engine, @third) == 0
+  end
+
   defp people(engine) do
     Enum.zip([@sender, @other, @third], ["a", "b", "c"])
     |> Enum.reduce(engine, fn {person, letter}, acc ->

@@ -48,7 +48,7 @@ defmodule AttentionServer.ClientAPISharedSendTest do
     assert {200, %{"features" => %{"shared_messages" => true, "groups" => true}}, _} =
              get_request(ctx, server, "a1", "/v2/me", [])
     shared_only = [{"harklight-features", "shared_messages"}]
-    assert {200, %{"rev" => before, "continuation" => token}, _} =
+    assert {200, %{"rev" => before}, _} =
              get_request(ctx, server, "a1", "/v2/inbox", options)
     assert {200, %{"continuation" => shared_token}, _} =
              get_request(ctx, server, "a1", "/v2/inbox", shared_only)
@@ -64,6 +64,18 @@ defmodule AttentionServer.ClientAPISharedSendTest do
     assert {:ok, actor} =
              AttentionServer.DeviceIdentity.from_certificate(TLSFixtures.certificate_der!(ctx.certs, "b1"))
     assert :ok = Relay.setup_sender(relay, actor, "app:group")
+    assert :ok = Relay.enable_push(relay)
+    registration = %{"token" => String.duplicate("ab", 32), "environment" => "production",
+                     "revision" => 1, "features" => ["shared_messages", "groups"]}
+    push_path = "/v2/devices/me/push"
+    assert {200, _, _} = write_request(ctx, server, "a1", "PUT", push_path, op_key(73), registration, [])
+    named_only = %{registration | "token" => String.duplicate("cd", 32), "features" => ["shared_messages"]}
+    assert {200, _, _} = write_request(ctx, server, "a2", "PUT", push_path, op_key(74), named_only, [])
+    assert {200, %{"rev" => before, "continuation" => token}, _} =
+             get_request(ctx, server, "a1", "/v2/inbox", options)
+    assert {200, %{"continuation" => shared_token}, _} =
+             get_request(ctx, server, "a1", "/v2/inbox", shared_only)
+
     bytes = "Shared group file"
     upload_headers = [
       {"content-type", "text/plain"},
@@ -82,6 +94,10 @@ defmodule AttentionServer.ClientAPISharedSendTest do
                    "recipients" => %{"group_id" => ^group_id, "kind" => "group"}} = sent, _} =
              write_request(ctx, server, "b1", "POST", "/v2/agent/messages", op_key(47), send, options)
     sender_path = "/v2/agent/messages/" <> room
+    now = System.system_time(:millisecond) + 5_000
+    assert {:ok, %{person: ^manager, badge: 1, presentation: :alert} = group_alert} = Relay.claim_push(relay, now)
+    assert :ok = Relay.finish_push(relay, group_alert, %{state: "provider_accepted"}, now)
+
     baseline_path = "/v2/agent/delivery-baseline"
     assert {200, %{"shared_events" => true, "next_page" => group_page}, _} =
              get_request(ctx, server, "b1", baseline_path, options)
@@ -95,14 +111,24 @@ defmodule AttentionServer.ClientAPISharedSendTest do
     assert {200, %{"entry" => _}, _} =
              write_request(ctx, server, "b1", "POST", sender_path <> "/replies", op_key(48),
                %{"text" => "Before the invitation."}, options)
+    assert {:ok, %{person: ^manager, locator: %{"target" => "chat"}} = chat_alert} = Relay.claim_push(relay, now)
+    assert {200, _, _} =
+             write_request(ctx, server, "a1", "PUT", group <> "/mute", op_key(75), %{"muted" => true}, options)
+    assert :skip = Relay.refresh_push_claim(relay, chat_alert)
+    assert :ok = Relay.finish_push(relay, chat_alert, %{state: "suppressed"}, now)
+    assert {200, _, _} =
+             write_request(ctx, server, "a1", "PUT", group <> "/mute", op_key(76), %{"muted" => false}, options)
+    assert {:ok, nil} = Relay.claim_push(relay, now)
+
     assert {200, %{"items" => [], "counts" => %{"unresolved" => 0}}, _} =
              get_request(ctx, server, "a1", "/v2/inbox", shared_only)
     assert {200, %{"items" => [%{"item_id" => manager_item}], "counts" => %{"unresolved" => 1}}, _} =
              get_request(ctx, server, "a1", "/v2/inbox", options)
     assert {404, _, _} = get_request(ctx, server, "a1", "/v2/items/" <> manager_item, shared_only)
-    assert {200, %{"changes" => []}, _} =
+    assert {200, %{"changes" => shared_changes}, _} =
              get_request(ctx, server, "a1", "/v2/changes?after=#{before}",
                [{"harklight-continuation", shared_token} | shared_only])
+    assert Enum.all?(shared_changes, &match?(%{"kind" => "settings"}, &1))
     assert {200, %{"changes" => group_changes}, _} =
              get_request(ctx, server, "a1", "/v2/changes?after=#{before}",
                [{"harklight-continuation", token} | options])
@@ -509,6 +535,191 @@ defmodule AttentionServer.ClientAPISharedSendTest do
 
     assert %{status: 200, body: ^bytes} = raw_request(ctx, server, "a2", "GET", path, opt_in, nil)
     assert %{status: 404} = raw_request(ctx, server, "b1", "GET", path, opt_in, nil)
+  end
+
+  test "revision and Chat attachments survive replay and use separate departure fences", ctx do
+    server = start_supervised!({Server, [shared_messages: true] ++ ctx.server_opts})
+    relay = Server.relay(server)
+    {sender, first, second} = people(ctx, relay)
+    assert :ok = Relay.replace_hosted_organization(relay, "org", [sender, first, second])
+    opt_in = [{"harklight-features", "shared_messages"}]
+
+    assert {200, %{"message" => %{"item_id" => id}}, _} =
+             send_request(ctx, server, @key, body([first, second]), true)
+
+    sender_path = "/v2/agent/messages/" <> id
+    revision_bytes = "new revision attachment"
+    handle = stage_attachment(ctx, server, "a1", 20, "revision.txt", revision_bytes)
+    revision = %{"message" => %{"title" => "Updated", "created_at" => 2}, "file_ids" => [handle]}
+    revise_headers = [{"if-match", "1"} | opt_in]
+    assert {200, %{"message" => %{"revision" => 2, "files" => [%{"file_id" => file_id}]}}
+                = revision_result, _} =
+             write_request(ctx, server, "a1", "PUT", sender_path, op_key(21), revision, revise_headers)
+    assert {200, ^revision_result, replay_headers} =
+             write_request(ctx, server, "a1", "PUT", sender_path, op_key(21), revision, revise_headers)
+    assert {"idempotent-replayed", "true"} in replay_headers
+    assert %{status: 200, body: ^revision_bytes} =
+             raw_request(ctx, server, "a2", "GET", "/v2/files/" <> file_id, opt_in, nil)
+
+    {first_path, second_path} = recipient_paths(relay, id, first, second)
+    person_bytes = "first chat attachment"
+    person_handle = stage_attachment(ctx, server, "a2", 22, "prior.txt", person_bytes)
+    reply_body = %{"text" => "Before departure", "file_ids" => [person_handle]}
+    assert {200, %{"entry" => %{"files" => [%{"file_id" => prior_id}]}} = reply_result, _} =
+             write_request(ctx, server, "a2", "POST", first_path <> "/replies", op_key(23), reply_body, opt_in)
+    assert {200, ^reply_result, headers} =
+             write_request(ctx, server, "a2", "POST", first_path <> "/replies", op_key(23), reply_body, opt_in)
+    assert {"idempotent-replayed", "true"} in headers
+    assert %{status: 200, body: ^person_bytes} =
+             raw_request(ctx, server, "a1", "GET", "/v2/files/" <> prior_id, opt_in, nil)
+
+    assert :ok = Relay.replace_hosted_organization(relay, "org", [sender, second])
+    later_bytes = "second chat attachment"
+    later_handle = stage_attachment(ctx, server, "a1", 24, "later.txt", later_bytes)
+    later_body = %{"text" => "After departure", "file_ids" => [later_handle]}
+    assert {200, %{"entry" => %{"request_revision" => 2, "files" => [%{"file_id" => later_id}]}}, _} =
+             write_request(ctx, server, "a1", "POST", sender_path <> "/replies", op_key(25), later_body, opt_in)
+
+    assert %{status: 200, body: ^person_bytes} =
+             raw_request(ctx, server, "a2", "GET", "/v2/files/" <> prior_id, opt_in, nil)
+    assert %{status: 404} = raw_request(ctx, server, "a2", "GET", "/v2/files/" <> later_id, opt_in, nil)
+    assert %{status: 404} = raw_request(ctx, server, "b1", "GET", "/v2/files/" <> later_id, [], nil)
+    assert %{status: 200, body: ^later_bytes} =
+             raw_request(ctx, server, "b1", "GET", "/v2/files/" <> later_id, opt_in, nil)
+    assert {200, _, _} = get_request(ctx, server, "b1", second_path, opt_in)
+
+    assert map_size(:sys.get_state(relay).store.engine.uploads) == 3
+    assert :ok = stop_supervised(Server)
+    restarted = start_supervised!({Server, [shared_messages: true] ++ ctx.server_opts})
+    assert %{status: 200, body: ^later_bytes} =
+             raw_request(ctx, restarted, "b1", "GET", "/v2/files/" <> later_id, opt_in, nil)
+    assert %{status: 404} =
+             raw_request(ctx, restarted, "a2", "GET", "/v2/files/" <> later_id, opt_in, nil)
+  end
+
+  defp stage_attachment(ctx, server, device, key, name, bytes) do
+    headers = [
+      {"content-type", "text/plain"},
+      {"content-disposition", "attachment; filename*=UTF-8''" <> name},
+      {"idempotency-key", op_key(key)}
+    ]
+    assert %{status: 201, body: staged} = raw_request(ctx, server, device, "POST", "/v2/files", headers, bytes)
+    assert {:ok, %{"file_id" => handle}} = JSON.decode_line(staged <> "\n")
+    handle
+  end
+
+  test "push capability belongs to one binding revision, including downgrade and token rebind", ctx do
+    server = start_supervised!({Server, [shared_messages: true] ++ ctx.server_opts})
+    relay = Server.relay(server)
+    {sender, first, _second} = people(ctx, relay)
+    assert :ok = Relay.enable_push(relay)
+    assert {:ok, sibling} =
+             Relay.setup_device_certificate(relay, first, TLSFixtures.certificate_der!(ctx.certs, "unknown"))
+    assert {:ok, opted_in} =
+             AttentionServer.DeviceIdentity.from_certificate(TLSFixtures.certificate_der!(ctx.certs, "a2"))
+
+    path = "/v2/devices/me/push"
+    token = String.duplicate("ab", 32)
+    registration = %{"token" => token, "environment" => "production", "revision" => 1}
+    feature_registration = Map.put(registration, "features", ["shared_messages"])
+    assert {400, %{"error" => "unsupported"}, _} =
+             write_request(ctx, server, "a2", "PUT", path, op_key(30), feature_registration, [])
+
+    assert :ok = Relay.replace_hosted_organization(relay, "org", [sender, first])
+    assert {200, shared_result, _} =
+             write_request(ctx, server, "a2", "PUT", path, op_key(30), feature_registration, [])
+    assert {200, ^shared_result, replay_headers} =
+             write_request(ctx, server, "a2", "PUT", path, op_key(30), feature_registration, [])
+    assert {"idempotent-replayed", "true"} in replay_headers
+    assert {409, %{"error" => "idempotency_conflict"}, _} =
+             write_request(ctx, server, "a2", "PUT", path, op_key(30), registration, [])
+    assert {412, %{"error" => "precondition_failed"}, _} =
+             write_request(ctx, server, "a2", "PUT", path, op_key(31), registration, [])
+
+    legacy = %{registration | "token" => String.duplicate("cd", 32)}
+    assert {200, _, _} = write_request(ctx, server, "unknown", "PUT", path, op_key(32), legacy, [])
+    bindings = :sys.get_state(relay).store.engine.push_bindings
+    assert bindings[{first, opted_in}].shared_messages
+    refute bindings[{first, sibling}][:shared_messages]
+
+    assert {200, _, _} = send_request(ctx, server, @key, body([first]), true)
+
+    assert :ok = Relay.setup_sender(relay, opted_in, "app:individual")
+    individual = %{
+      "sender" => "app:individual",
+      "message" => %{"title" => "Individual request", "created_at" => 1}
+    }
+    assert {200, _, _} =
+             write_request(ctx, server, "a2", "POST", "/v2/agent/messages", op_key(36), individual, [])
+
+    now = System.system_time(:millisecond) + 1_000
+    claims = for _ <- 1..2 do
+      assert {:ok, %{device: device, badge: badge} = claim} = Relay.claim_push(relay, now)
+      assert :ok = Relay.finish_push(relay, claim, %{state: "provider_accepted"}, now)
+      {device, badge}
+    end
+    assert Map.new(claims) == %{opted_in => 2, sibling => 1}
+
+    assert {200, _, _} =
+             write_request(ctx, server, "a2", "PUT", path, op_key(33), %{registration | "revision" => 2}, [])
+    refute :sys.get_state(relay).store.engine.push_bindings[{first, opted_in}][:shared_messages]
+
+    assert {200, _, _} =
+             write_request(ctx, server, "a2", "PUT", path, op_key(34), %{feature_registration | "revision" => 3}, [])
+    assert {200, _, _} =
+             write_request(ctx, server, "unknown", "PUT", path, op_key(35), %{registration | "revision" => 2}, [])
+
+    bindings = :sys.get_state(relay).store.engine.push_bindings
+    refute bindings[{first, opted_in}].active
+    refute bindings[{first, opted_in}][:shared_messages]
+    assert bindings[{first, sibling}].active
+    refute bindings[{first, sibling}][:shared_messages]
+  end
+
+  test "shared pushes survive restart and drop claimed alerts on departure", ctx do
+    opts = [shared_messages: true] ++ ctx.server_opts
+    server = start_supervised!({Server, opts})
+    relay = Server.relay(server)
+    {sender, first, second} = people(ctx, relay)
+    assert :ok = Relay.replace_hosted_organization(relay, "org", [sender, first, second])
+    assert :ok = Relay.enable_push(relay)
+    headers = [{"harklight-features", "shared_messages"}]
+    path = "/v2/devices/me/push"
+    registration = %{"token" => String.duplicate("ab", 32), "environment" => "production",
+                     "revision" => 1, "features" => ["shared_messages"]}
+    assert {200, _, _} =
+             write_request(ctx, server, "a2", "PUT", path, op_key(52), registration, [])
+    legacy = registration |> Map.delete("features") |> Map.put("token", String.duplicate("cd", 32))
+    assert {200, _, _} =
+             write_request(ctx, server, "b1", "PUT", path, op_key(53), legacy, [])
+
+    assert {200, %{"message" => %{"item_id" => room}}, _} =
+             send_request(ctx, server, @key, body([first, second]), true)
+    assert :ok = stop_supervised(Server)
+    server = start_supervised!({Server, opts})
+    relay = Server.relay(server)
+    {first_path, second_path} = recipient_paths(relay, room, first, second)
+    first_item = List.last(String.split(first_path, "/"))
+
+    now = System.system_time(:millisecond) + 1_000
+    assert {:ok, %{stream: :shared, badge: 1, person: ^first, locator: %{"item_id" => ^first_item}} = request} =
+             Relay.claim_push(relay, now)
+    assert {:ok, %{locator: %{"item_id" => ^first_item}, badge: 1}} = Relay.refresh_push_claim(relay, request)
+    assert :ok = Relay.finish_push(relay, request, %{state: "provider_accepted"}, now)
+    assert {:ok, nil} = Relay.claim_push(relay, now)
+
+    assert {200, _, _} =
+             write_request(ctx, server, "b1", "POST", second_path <> "/replies", op_key(54),
+               %{"text" => "Shared reply"}, headers)
+    assert {:ok, %{stream: :shared, badge: 1, locator: %{"target" => "chat", "item_id" => ^first_item}} = chat} =
+             Relay.claim_push(relay, now)
+    assert {:ok, %{locator: %{"target" => "chat", "item_id" => ^first_item}}} = Relay.refresh_push_claim(relay, chat)
+    assert %{"attention" => %{"locator" => %{"target" => "chat"}}} = AttentionServer.APNS.request_payload(chat)
+
+    assert :ok = Relay.replace_hosted_organization(relay, "org", [sender, second])
+    assert :skip = Relay.refresh_push_claim(relay, chat)
+    assert :ok = Relay.finish_push(relay, chat, %{state: "suppressed"}, now)
+    assert {:ok, nil} = Relay.claim_push(relay, now)
   end
 
   test "Seen is per person and revision, with one attributed Agent event", ctx do

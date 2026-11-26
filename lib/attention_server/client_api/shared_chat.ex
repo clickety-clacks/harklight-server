@@ -1,15 +1,15 @@
 defmodule AttentionServer.ClientAPI.SharedChat do
   @moduledoc false
 
-  alias AttentionServer.{AgentChangeLog, ChangeLog, Engine, SharedAnswers, SharedMessages, Store}
-  alias AttentionServer.ClientAPI.{Errors, Idempotency, PeopleProfiles, Reads, SharedCapability, Writes}
+  alias AttentionServer.{AgentChangeLog, ChangeLog, Engine, Relay, SharedAnswers, SharedMessages}
+  alias AttentionServer.ClientAPI.{Errors, Idempotency, PeopleProfiles, Reads, SharedAttachments, SharedCapability, Writes}
 
   def respond(conn, ctx, direction, operation, body, key) do
     case SharedCapability.parse(conn) do
       {:ok, %{shared?: true} = capability} ->
         digest = Idempotency.digest(conn.method, conn.path_info, body)
         request = {ctx.principal, ctx.params, direction, operation, body, key, digest, capability}
-        result = GenServer.call(ctx.relay, {:client_api, __MODULE__, request}, :infinity)
+        result = execute(ctx.relay, request)
         case result do
           {:answer_conflict, terminal} ->
             Errors.send_error(conn, "already_answered", details: %{"terminal" => terminal})
@@ -22,8 +22,26 @@ defmodule AttentionServer.ClientAPI.SharedChat do
     end
   end
 
+  defp execute(relay, {_, _, _, :reply, %{"file_ids" => [_ | _]}, _, _, _} = request) do
+    case call(relay, {:prepare, request}) do
+      {:ok, dir, files} ->
+        case SharedAttachments.stage_and_apply(dir, files, &call(relay, {:apply, request, &1})) do
+          {:error, _} = error -> reply_error(error)
+          result -> result
+        end
+
+      result -> result
+    end
+  end
+
+  defp execute(relay, request), do: call(relay, {:apply, request, []})
+
+  defp call(relay, request), do: GenServer.call(relay, {:client_api, __MODULE__, request}, :infinity)
+
   @doc false
-  def handle_call({who, params, direction, operation, body, key, digest, capability}, _from, state) do
+  def handle_call({:prepare, request}, from, state), do: handle_call({:apply, request, :prepare}, from, state)
+
+  def handle_call({:apply, {who, params, direction, operation, body, key, digest, capability}, staged}, _from, state) do
     engine = state.store.engine
 
     with {:ok, principal} <- Reads.client_principal(engine, who),
@@ -46,7 +64,7 @@ defmodule AttentionServer.ClientAPI.SharedChat do
             message_id: record.id, now: state.clock.()
           }
 
-          apply_chat(state, record, recipient, params, body, chat)
+          apply_chat(state, record, recipient, params, body, chat, staged)
       end
     else
       error -> {:reply, reply_error(error), state}
@@ -73,16 +91,40 @@ defmodule AttentionServer.ClientAPI.SharedChat do
   defp lookup(_store, _scope, nil), do: {:ok, nil}
   defp lookup(store, scope, key), do: Idempotency.lookup(store, scope, key)
 
-  defp apply_chat(state, record, recipient, params, body, chat) do
+  defp apply_chat(state, record, recipient, _params, body, chat, :prepare) do
+    kind = if chat.direction == :sender, do: "agent", else: "client"
+    attrs = %{message_id: record.id, sender: record.sender_id, revision: record.revision,
+              op_id: chat.key, now: chat.now, kind: kind}
+
+    result =
+      with :ok <- room_authority(state.store.engine, chat, record, recipient),
+           :ok <- SharedMessages.replyable(record),
+           :ok <- SharedAttachments.validate_ids(body["file_ids"]),
+           {:ok, prepared} <- SharedAttachments.prepare(state.store, {chat.person, chat.actor}, body["file_ids"], attrs) do
+        {:ok, state.store.upload_dir, prepared}
+      else
+        error -> reply_error(error)
+      end
+
+    {:reply, result, state}
+  end
+
+  defp apply_chat(state, record, recipient, params, body, chat, staged) do
     engine = state.store.engine
+    staged = Enum.map(staged, fn {metadata, path} ->
+      {Map.merge(metadata, %{revision: record.revision, shared_entry_id: entry_id(chat)}), path}
+    end)
+    chat = if staged == [], do: chat, else: Map.put(chat, :files, SharedAttachments.references(staged))
 
     with :ok <- room_authority(engine, chat, record, recipient),
          {:ok, next, chat} <- transition(engine, record, recipient, params, body, chat),
          audit = %{person: chat.person, actor: chat.actor, action: "shared_chat_" <> Atom.to_string(chat.operation),
                    shared_chat: chat},
-         {:ok, store} <- commit_chat(state.store, engine, next, audit),
+         {:ok, store} <- commit_chat(state.store, engine, next, audit, staged),
          {:ok, response} <- result(store, store.engine, chat) do
-      {:reply, {:ok, 200, response, false}, %{state | store: store}}
+      next = %{state | store: store}
+      next = if staged == [], do: next, else: Relay.refresh_shared_upload_index(next)
+      {:reply, {:ok, 200, response, false}, next}
     else
       {:answer_conflict, _} = conflict -> {:reply, conflict, state}
       error -> {:reply, reply_error(error), state}
@@ -107,12 +149,13 @@ defmodule AttentionServer.ClientAPI.SharedChat do
     with :ok <- Writes.only_members(body, allowed),
          text = body["text"],
          true <- (is_binary(text) and byte_size(text) > 0) || {:error, :invalid_field, "text"},
-         true <- Map.get(body, "file_ids", []) == [] || {:error, "unsupported", "file_ids"},
+         :ok <- SharedAttachments.validate_ids(Map.get(body, "file_ids", [])),
          notify = body["notify_person_id"],
          true <- is_nil(notify) or is_binary(notify) || {:error, "invalid_field", "notify_person_id"},
          {author, speaker} = speaker(engine, record, chat),
          id = entry_id(chat),
-         attrs = %{id: id, at_ms: chat.now, text: text, notify_person_id: notify, speaker: speaker},
+         attrs = %{id: id, at_ms: chat.now, text: text, notify_person_id: notify, speaker: speaker,
+                   files: Map.get(chat, :files, [])},
          {:ok, next, _entry} <- SharedMessages.reply(engine, record, author, attrs) do
       {:ok, next, Map.put(chat, :entry_id, id)}
     end
@@ -194,7 +237,7 @@ defmodule AttentionServer.ClientAPI.SharedChat do
   defp entry_id(chat), do: "se_" <> digest_id({chat.receipt_scope, chat.key})
   defp digest_id(value), do: :crypto.hash(:sha256, :erlang.term_to_binary(value)) |> Base.url_encode64(padding: false)
 
-  defp commit_chat(store, engine, engine, %{shared_chat: chat}) do
+  defp commit_chat(store, engine, engine, %{shared_chat: chat}, []) do
     if is_binary(chat.key) do
       with {:ok, body} <- result(store, engine, chat),
            :ok <- Idempotency.save(store, chat.receipt_scope, chat.key, chat.digest, 200, body),
@@ -204,7 +247,8 @@ defmodule AttentionServer.ClientAPI.SharedChat do
     end
   end
 
-  defp commit_chat(store, _old, updated, audit), do: Store.commit(store, updated, audit)
+  defp commit_chat(store, _old, updated, audit, staged),
+    do: SharedAttachments.commit(store, updated, audit, staged)
 
   @doc false
   def result(store, engine, %{direction: :person, operation: operation} = chat)

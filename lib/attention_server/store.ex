@@ -1239,6 +1239,7 @@ defmodule AttentionServer.Store do
          projected
        ) do
     old = store.engine
+    {next, touched} = AttentionServer.SharedPush.enqueue(old, next, touched, audit)
     items = for {:row, :messages, key} <- touched, do: key
 
     with :ok <- KeyedValidation.untouched_change(old, next, touched),
@@ -3111,6 +3112,7 @@ defmodule AttentionServer.Store do
       is_binary(upload.message_id) and upload.message_id != "" and
       is_integer(upload.revision) and upload.revision > 0 and
       Map.get(upload, :uploader_kind) in [nil, "agent", "client"] and
+      (is_nil(upload[:shared_entry_id]) or is_binary(upload[:shared_entry_id])) and
       AttentionServer.ConversationFiles.valid_name?(upload.name) and
       is_integer(upload.size) and upload.size >= 0 and
       is_integer(upload.last_activity_ms) and upload.last_activity_ms >= 0 and
@@ -3334,7 +3336,9 @@ defmodule AttentionServer.Store do
     claim_conversation_high = Map.get(binding, :claim_conversation_high)
     claim_at = Map.get(binding, :claim_at)
 
-    is_boolean(active) and is_integer(revision) and revision > 0 and
+    is_boolean(active) and is_boolean(Map.get(binding, :shared_messages, false)) and
+      AttentionServer.SharedPush.valid?(binding) and
+      is_integer(revision) and revision > 0 and
       revision < 9_223_372_036_854_775_808 and
       state in ~w(ready queued sending waiting_retry blocked_configuration expired canceled endpoint_invalid) and
       is_integer(pending_high) and pending_high >= 0 and pending_high <= engine.persons[person] and
@@ -3348,7 +3352,7 @@ defmodule AttentionServer.Store do
       (is_nil(next_at) or is_integer(next_at)) and
       is_integer(attempt_count) and attempt_count >= 0 and
       (is_nil(binding.last_attempt_at) or is_integer(binding.last_attempt_at)) and
-      valid_push_claim?(state, claim_id, claim_high, claim_conversation_high, claim_at) and
+      valid_push_claim?(state, claim_id, claim_high, claim_conversation_high, claim_at, Map.get(binding, :claim_shared, false)) and
       valid_push_outcome?(Map.get(binding, :last_outcome)) and
       if(active,
         do:
@@ -3372,13 +3376,13 @@ defmodule AttentionServer.Store do
     _ -> false
   end
 
-  defp valid_push_claim?("sending", claim_id, claim_high, claim_conversation_high, claim_at),
+  defp valid_push_claim?("sending", claim_id, claim_high, claim_conversation_high, claim_at, shared?),
     do:
       AttentionServer.Message.uuid_v4?(claim_id) and is_integer(claim_high) and claim_high >= 0 and
         is_integer(claim_conversation_high) and claim_conversation_high >= 0 and
-        (claim_high > 0 or claim_conversation_high > 0) and is_integer(claim_at)
+        (claim_high > 0 or claim_conversation_high > 0 or shared?) and is_integer(claim_at)
 
-  defp valid_push_claim?(_state, claim_id, claim_high, claim_conversation_high, claim_at),
+  defp valid_push_claim?(_state, claim_id, claim_high, claim_conversation_high, claim_at, _shared?),
     do:
       is_nil(claim_id) and is_nil(claim_high) and is_nil(claim_conversation_high) and
         is_nil(claim_at)

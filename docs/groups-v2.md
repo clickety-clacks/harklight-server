@@ -23,6 +23,12 @@ An explicit unavailable opt-in returns 400 `unsupported`. Capability changes
 require a fresh baseline. Last-Event-ID precedence and 410 recovery remain
 as specified in the shared messaging v2 contract.
 
+Push opt-in is per device. The existing push registration body accepts
+`features: ["shared_messages","groups"]` in either order for group
+notifications. A shared-only binding gets no group alerts or badge count.
+Registration revision, replay, downgrade and token rebind follow the
+shared-message contract. Mute cancels a waiting group alert for that person.
+
 ## Self-hosted management
 
 Person routes use the existing authenticated person principal and existing

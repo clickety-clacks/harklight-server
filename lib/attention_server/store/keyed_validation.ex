@@ -537,9 +537,12 @@ defmodule AttentionServer.Store.KeyedValidation do
         add_upload_links(index, {:row, :messages, key}, revision_upload_ids(record))
       end)
 
-    Enum.reduce(engine.shared_messages, index, fn {key, record}, index ->
-      ids = AttentionServer.ClientAPI.SharedAttachments.upload_ids(record)
-      add_upload_links(index, {:row, :shared_messages, key}, ids)
+    [:shared_messages, :shared_entries]
+    |> Enum.reduce(index, fn field, index ->
+      Enum.reduce(Map.fetch!(engine, field), index, fn {key, record}, index ->
+        address = {:row, field, key}
+        add_upload_links(index, address, record_uploads(address, record))
+      end)
     end)
   end
 
@@ -560,9 +563,10 @@ defmodule AttentionServer.Store.KeyedValidation do
           {update_upload_links(index, address, before_ids, after_ids),
            MapSet.put(changed, address), uploads}
 
-        {:row, :shared_messages, key} = address, {index, changed, uploads} ->
-          before_ids = record_uploads(address, Map.get(old.shared_messages, key))
-          after_ids = record_uploads(address, Map.get(next.shared_messages, key))
+        {:row, field, key} = address, {index, changed, uploads}
+        when field in [:shared_messages, :shared_entries] ->
+          before_ids = record_uploads(address, get_in(old, [Access.key(field), key]))
+          after_ids = record_uploads(address, get_in(next, [Access.key(field), key]))
           {update_upload_links(index, address, before_ids, after_ids),
            MapSet.put(changed, address), uploads}
 
@@ -597,6 +601,9 @@ defmodule AttentionServer.Store.KeyedValidation do
   def record_uploads({:row, :messages, _}, record), do: revision_upload_ids(record)
   def record_uploads({:row, :shared_messages, _}, record),
     do: AttentionServer.ClientAPI.SharedAttachments.upload_ids(record)
+  def record_uploads({:row, :shared_entries, _}, entry),
+    do: AttentionServer.ClientAPI.SharedAttachments.entry_upload_ids(entry)
+
   def record_uploads(_, _), do: []
 
   defp entry_upload_ids(nil), do: []
