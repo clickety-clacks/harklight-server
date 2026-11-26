@@ -13,7 +13,7 @@ defmodule AttentionServer.SharedPush do
       (not Map.get(binding, :groups, false) or Map.get(binding, :shared_messages, false)) and
       (map_size(work) == 0 or (binding.active and Map.get(binding, :shared_messages, false))) and
       Enum.all?(work, fn
-        {id, {stamp, :badge}} -> is_binary(id) and is_binary(stamp)
+        {id, {stamp, hint}} when hint in [:badge, :departure_badge] -> is_binary(id) and is_binary(stamp)
         {id, {stamp, {:request, revision}}} ->
           is_binary(id) and is_binary(stamp) and is_integer(revision) and revision > 0
         {id, {stamp, {:chat, entry}}} ->
@@ -50,7 +50,8 @@ defmodule AttentionServer.SharedPush do
       Enum.reduce(touched, %{}, fn
         {:row, :shared_recipients, {id, person} = key}, changes ->
           case {old.shared_recipients[key], engine.shared_recipients[key]} do
-            {_, %{frozen: _}} -> Map.put(changes, {person, id}, :remove)
+            {%{frozen: _}, %{frozen: _}} -> changes
+            {_, %{frozen: _}} -> Map.put(changes, {person, id}, :departure_badge)
             {nil, %{}} -> request_hint(changes, engine, person, id)
             {%{frozen: _}, %{}} -> request_hint(changes, engine, person, id)
             _ -> changes
@@ -145,7 +146,10 @@ defmodule AttentionServer.SharedPush do
       {{person, _} = key, %{active: true, shared_messages: true} = binding}, next ->
         work =
           Enum.reduce(Map.get(by_person, person, []), pending(binding), fn
-            {{_, id}, :remove}, work -> Map.delete(work, id)
+            {{_, id}, :departure_badge}, work ->
+              if binding_visible?(binding, engine.shared_messages[id]),
+                do: Map.put(work, id, {stamp, :departure_badge}),
+                else: Map.delete(work, id)
             {{_, id}, hint}, work ->
               if deliverable?(engine, person, binding, id),
                 do: put_hint(work, id, stamp, hint),
@@ -176,6 +180,8 @@ defmodule AttentionServer.SharedPush do
       binding = if map_size(work) == 0, do: Map.delete(binding, :pending_shared), else: Map.put(binding, :pending_shared, work)
 
       cond do
+        binding.state == "sending" and Enum.any?(work, fn {_, {_, hint}} -> hint == :departure_badge end) ->
+          %{binding | next_at: binding.next_at || now}
         binding.state in ["sending", "blocked_configuration"] -> binding
         map_size(work) > 0 ->
           %{binding | state: "queued", next_at: binding.next_at || now,
@@ -209,6 +215,12 @@ defmodule AttentionServer.SharedPush do
     end)
     |> Enum.max_by(&{&1.at, &1.item_id}, fn -> nil end)
   end
+
+  def deliverable_work?(engine, _person, binding, id, {_, :departure_badge}),
+    do: binding_visible?(binding, engine.shared_messages[id])
+
+  def deliverable_work?(engine, person, binding, id, _work),
+    do: deliverable?(engine, person, binding, id)
 
   def deliverable?(engine, person, binding, id) do
     with %{organization_id: organization} = record <- engine.shared_messages[id],

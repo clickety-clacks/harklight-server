@@ -2521,7 +2521,7 @@ defmodule AttentionServer.Relay do
 
     next_engine = Engine.sweep_due_defaults(old_engine, now_ms, due_index)
     {next_engine, shared_ids} =
-      if state.shared_messages, do: SharedAnswers.apply_defaults(next_engine, now_ms), else: {next_engine, []}
+      if state.shared_messages, do: SharedAnswers.apply_defaults(next_engine, now_ms, state.groups), else: {next_engine, []}
 
     if next_engine == old_engine do
       if map_size(due_index) == 0,
@@ -4110,7 +4110,7 @@ defmodule AttentionServer.Relay do
     }
 
     legacy = Enum.min(Map.values(index), fn -> nil end)
-    shared = if state.shared_messages, do: SharedAnswers.next_default(state.store.engine)
+    shared = if state.shared_messages, do: SharedAnswers.next_default(state.store.engine, state.groups)
 
     case Enum.min(Enum.reject([legacy, shared], &is_nil/1), fn -> nil end) do
       at when is_integer(at) ->

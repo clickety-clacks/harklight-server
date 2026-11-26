@@ -1,7 +1,7 @@
 defmodule AttentionServer.SharedReminders do
   @moduledoc false
 
-  alias AttentionServer.{BounceDecision, ConversationFiles, Engine, SharedAnswers, SharedMessages}
+  alias AttentionServer.{BounceDecision, BouncePolicy, ConversationFiles, Engine, SharedAnswers, SharedMessages}
   alias AttentionServer.ClientAPI.PeopleProfiles
 
   def schedule(old, engine, touched, now) do
@@ -52,25 +52,21 @@ defmodule AttentionServer.SharedReminders do
     record = engine.shared_messages[id]
     recipient = engine.shared_recipients[key]
 
-    recipient =
-      if eligible?(engine, record, recipient, person) do
-        accepted = accepted_at(record, now)
+    authoritative_at = SharedMessages.substantive_accepted_at(record) || now
+    personal_start = max(now, authoritative_at)
 
-        case BounceDecision.shared_selection(engine, person, record.message, accepted) do
-          %{"decision" => "pending"} = selection ->
-            Map.put(recipient, :reminder, %{revision: record.revision, accepted_at_ms: accepted, selection: selection})
-          _ ->
-            Map.delete(recipient, :reminder)
-        end
+    updated =
+      with true <- eligible?(engine, record, recipient, person),
+           true <- BouncePolicy.eligible_at?(authoritative_at),
+           %{"decision" => "pending"} = selection <-
+             BounceDecision.shared_selection(engine, person, record.message, personal_start) do
+        Map.put(recipient, :reminder, %{revision: record.revision, accepted_at_ms: authoritative_at, selection: selection})
       else
-        Map.delete(recipient, :reminder)
+        _ -> Map.delete(recipient, :reminder)
       end
 
-    Engine.put_row(engine, :shared_recipients, key, recipient)
+    Engine.put_row(engine, :shared_recipients, key, updated)
   end
-
-  defp accepted_at(record, now),
-    do: max(now, Map.get(record, :revision_accepted_at_ms, record["created_at_ms"] || now))
 
   def next_deadline(engine, groups? \\ false) do
     engine
@@ -181,12 +177,20 @@ defmodule AttentionServer.SharedReminders do
   def bounced?(recipient), do: match?(%{reminder: %{outcome: :unseen_interval_elapsed}}, recipient)
 
   defp outstanding(engine, groups?) do
-    for {{id, person}, %{reminder: reminder} = recipient} <- engine.shared_recipients,
-        not Map.has_key?(reminder, :outcome),
-        record = engine.shared_messages[id],
-        groups? or not Map.has_key?(record, :group_id),
-        eligible?(engine, record, recipient, person),
-        do: {id, person, record, recipient, reminder}
+    case BouncePolicy.cutoff() do
+      {:ok, cutoff} ->
+        for {{id, person}, %{reminder: reminder} = recipient} <- engine.shared_recipients,
+            not Map.has_key?(reminder, :outcome),
+            record = engine.shared_messages[id],
+            groups? or not Map.has_key?(record, :group_id),
+            accepted = SharedMessages.substantive_accepted_at(record) || reminder.accepted_at_ms,
+            BouncePolicy.eligible_at?(accepted, cutoff),
+            eligible?(engine, record, recipient, person),
+            do: {id, person, record, recipient, reminder}
+
+      {:error, _} ->
+        []
+    end
   end
 
   defp eligible?(engine, record, recipient, person) do

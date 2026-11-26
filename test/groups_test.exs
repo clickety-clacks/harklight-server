@@ -1,7 +1,7 @@
 defmodule AttentionServer.GroupsTest do
-  use ExUnit.Case, async: true
+  use ExUnit.Case, async: false
 
-  alias AttentionServer.{Engine, Groups, SharedMessages, Store}
+  alias AttentionServer.{Engine, Groups, Relay, SharedAnswers, SharedMessages, SharedReminders, Store}
 
   @moduletag :tmp_dir
   @manager "10000000-0000-4000-8000-000000000001"
@@ -91,6 +91,68 @@ defmodule AttentionServer.GroupsTest do
     assert engine.groups == %{}
     assert engine.hosted_group_refs[{"business", "default"}] == :deleted
     assert :ok = Store.close(reopened)
+  end
+
+  test "joining after the cutoff cannot create a reminder for an older message" do
+    name = "ATTENTION_SERVER_BOUNCE_NOT_BEFORE"
+    previous = System.get_env(name)
+    on_exit(fn -> if previous, do: System.put_env(name, previous), else: System.delete_env(name) end)
+
+    now = System.system_time(:millisecond)
+    accepted = now - 60_000
+    System.put_env(name, now |> DateTime.from_unix!(:millisecond) |> DateTime.to_iso8601())
+    engine = local_people(Engine.new())
+    assert {:ok, engine, _} = Groups.create(engine, @group, @manager, "Planning")
+    assert {:ok, engine, _, _} = Groups.invite(engine, @group, @manager, @invitee, @invitation)
+    attrs = Map.put(attrs("old"), "created_at_ms", accepted)
+    assert {:ok, engine, _, _} =
+             SharedMessages.create(engine, attrs, [@manager], engine.relay_instance_id)
+
+    {joined, :ok, touched} =
+      Engine.with_touches(engine, fn engine ->
+        {:ok, joined, _} = Groups.respond(engine, @invitation, @invitee, true)
+        {joined, :ok}
+      end)
+
+    {scheduled, _} = SharedReminders.schedule(engine, joined, touched, now + 1)
+    assert %{seen_revision: nil} = recipient = scheduled.shared_recipients[{"old", @invitee}]
+    refute Map.has_key?(recipient, :reminder)
+    assert {^scheduled, [], []} = SharedReminders.evaluate_due(scheduled, now + 10 * 86_400_000, true)
+  end
+
+  test "restarting with groups disabled leaves a due group default unsettled", %{tmp_dir: dir} do
+    path = Path.join(dir, "relay.sqlite3")
+    assert {:ok, store} = Store.open_relay(path)
+    now = System.system_time(:millisecond)
+    due = now + 60_000
+    {next, :ok, touched} =
+      Engine.with_touches(store.engine, fn initial ->
+        engine = local_people(initial)
+        {:ok, engine, _} = Groups.create(engine, @group, @manager, "Planning")
+        message = %{
+          "title" => "Date",
+          "default" => %{"at" => due, "value" => "Thursday"},
+          "answer_ui" => %{"actions" => [%{"id" => "thursday", "kind" => "value", "value" => "Thursday"}]}
+        }
+        fields = Map.merge(attrs("group-default"), %{:message => message, :answer_policy => :everyone, "created_at_ms" => now})
+        {:ok, engine, _, _} = SharedMessages.create(engine, fields, [@manager], engine.relay_instance_id)
+        {engine, :ok}
+      end)
+
+    assert {:ok, store} = Store.commit(store, {next, touched}, %{person: @manager, actor: "fixture", action: "group_default"})
+    assert :ok = Store.close(store)
+    assert {:ok, enabled} = Relay.start_link(store_path: path, shared_messages: true, groups: true)
+    assert is_reference(:sys.get_state(enabled).default_timer)
+    assert :ok = GenServer.stop(enabled)
+
+    assert {:ok, disabled} = Relay.start_link(store_path: path, shared_messages: true, groups: false)
+    state = :sys.replace_state(disabled, &%{&1 | clock: fn -> due end})
+    assert is_nil(state.default_timer)
+    send(disabled, {:default_sweep, state.default_timer_generation})
+    engine = :sys.get_state(disabled).store.engine
+    assert engine.shared_answers == %{}
+    assert SharedAnswers.next_default(engine, true) == due
+    assert :ok = GenServer.stop(disabled)
   end
 
   defp local_people(engine) do

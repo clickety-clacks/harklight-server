@@ -158,35 +158,38 @@ defmodule AttentionServer.SharedMessages do
          true <- record.revision == revision || {:error, :precondition_failed} do
       history = Map.get(record, :history, %{})
       previous = Map.take(record, [:revision, :message]) |> Map.put(:files, Map.get(record, :files, []))
+      progress? = BounceDecision.progress_only?(record.message, previous.files, message, files)
+      substantive_at = if progress?, do: substantive_accepted_at(record) || now, else: now
+
       updated =
         record
         |> Map.put(:history, Map.put(history, revision, previous))
         |> Map.put(:revision, revision + 1)
         |> Map.put(:revision_accepted_at_ms, now)
+        |> Map.put(:substantive_accepted_at_ms, substantive_at)
         |> Map.put(:message, message)
         |> Map.put(:files, files)
 
       next = Engine.put_row(engine, :shared_messages, record.id, updated)
-      {:ok, carry_seen(next, record, updated)}
+      {:ok, carry_seen(next, record, updated, progress?)}
     end
   end
 
-  defp carry_seen(engine, previous, updated) do
-    files = Map.get(previous, :files, [])
+  def substantive_accepted_at(record),
+    do: Map.get(record, :substantive_accepted_at_ms) || Map.get(record, :revision_accepted_at_ms) || record["created_at_ms"]
 
-    if BounceDecision.progress_only?(previous.message, files, updated.message, Map.get(updated, :files, [])) do
-      Enum.reduce(live_recipients(engine, previous.id), engine, fn person, next ->
-        key = {previous.id, person}
-        case next.shared_recipients[key] do
-          %{seen_revision: revision} = row when revision == previous.revision ->
-            Engine.put_row(next, :shared_recipients, key, %{row | seen_revision: updated.revision})
-          _ -> next
-        end
-      end)
-    else
-      engine
-    end
+  defp carry_seen(engine, previous, updated, true) do
+    Enum.reduce(live_recipients(engine, previous.id), engine, fn person, next ->
+      key = {previous.id, person}
+      case next.shared_recipients[key] do
+        %{seen_revision: revision} = row when revision == previous.revision ->
+          Engine.put_row(next, :shared_recipients, key, %{row | seen_revision: updated.revision})
+        _ -> next
+      end
+    end)
   end
+
+  defp carry_seen(engine, _previous, _updated, false), do: engine
 
   def close_chat(%Engine{} = engine, record) do
     with :ok <- writable_sender(record),

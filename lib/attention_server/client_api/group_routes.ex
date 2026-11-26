@@ -110,7 +110,7 @@ defmodule AttentionServer.ClientAPI.GroupRoutes do
     else
       {:ok, %{digest: ^digest, body: reply}} -> {:reply, {:ok, reply, true}, state}
       {:ok, %{}} -> {:reply, {:error, :idempotency_conflict}, state}
-      {:error, _, _} -> {:reply, {:error, :storage_unavailable}, state}
+      {:error, _reason, %Store{}} -> {:reply, {:error, :storage_unavailable}, state}
       error -> {:reply, error, state}
     end
   end
@@ -185,6 +185,9 @@ defmodule AttentionServer.ClientAPI.GroupRoutes do
 
   defp apply_operation(engine, person, :mute, %{group_id: id}, %{"muted" => muted?}) when is_boolean(muted?),
     do: group_result(Groups.mute(engine, id, person, muted?))
+
+  defp apply_operation(_engine, _person, :mute, _params, _body),
+    do: {:error, :invalid_field, "muted"}
 
   defp apply_operation(_engine, _person, _operation, _params, _body),
     do: {:error, :invalid_field, "body"}

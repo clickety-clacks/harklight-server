@@ -307,7 +307,7 @@ defmodule AttentionServer.Engine do
             work =
               Map.filter(claim.shared_work, fn {room, value} ->
                 SharedPush.pending(binding)[room] == value and
-                  SharedPush.deliverable?(engine, claim.person, binding, room)
+                  SharedPush.deliverable_work?(engine, claim.person, binding, room, value)
               end)
             if work == %{}, do: :skip, else: {:ok, shared_push_claim(engine, binding, %{claim | shared_work: work})}
 

@@ -40,10 +40,14 @@ defmodule AttentionServer.ClientAPISharedSendTest do
     assert {200, %{"groups" => [], "invitations" => []}, _} =
              get_request(ctx, server, "a1", "/v2/groups", options)
 
+    assert {400, %{"error" => "invalid_field", "field" => "name"}, _} =
+             write_request(ctx, server, "a1", "POST", "/v2/groups", op_key(84), %{"name" => " "}, options)
     create = %{"name" => "Planning"}
     assert {200, %{"group" => %{"id" => group_id, "manager" => %{"id" => ^manager}, "member" => true}}, _} =
              write_request(ctx, server, "a1", "POST", "/v2/groups", op_key(40), create, options)
     group = "/v2/groups/" <> group_id
+    assert {400, %{"error" => "invalid_field", "field" => "muted"}, _} =
+             write_request(ctx, server, "a1", "PUT", group <> "/mute", op_key(85), %{"muted" => "yes"}, options)
 
     assert {200, %{"features" => %{"shared_messages" => true, "groups" => true}}, _} =
              get_request(ctx, server, "a1", "/v2/me", [])
@@ -215,6 +219,59 @@ defmodule AttentionServer.ClientAPISharedSendTest do
     assert {200, %{"changes" => []}, _} =
              get_request(ctx, server, "b1", "/v2/agent/changes?after=#{prior}",
                [{"harklight-continuation", agent_shared_token} | shared_only])
+  end
+
+  test "revoked sender grant blocks shared receipt replay with or without staged files", ctx do
+    server = start_supervised!({Server, [shared_messages: true] ++ ctx.server_opts})
+    relay = Server.relay(server)
+    {sender, first, second} = people(ctx, relay)
+    assert :ok = Relay.replace_hosted_organization(relay, "org", [sender, first, second])
+    plain = body([first])
+    handle = stage_attachment(ctx, server, "a1", 80, "message.txt", "fixture")
+    with_file = Map.put(plain, "file_ids", [handle])
+    assert {200, _, _} = send_request(ctx, server, @key, plain, true)
+    assert {200, _, _} = send_request(ctx, server, @another_key, with_file, true)
+
+    owner = AttentionServer.Engine.hosted_owner_key(:sys.get_state(relay).store.engine, sender)
+    assert {:ok, device} =
+             AttentionServer.DeviceIdentity.from_certificate(TLSFixtures.certificate_der!(ctx.certs, "a1"))
+    assert :ok = Relay.owner_revoke_sender(relay, sender, owner, device, "app:test")
+    assert {:ok, ^sender} = Relay.device_person(relay, device)
+    assert {403, %{"error" => "forbidden"}, _} = send_request(ctx, server, @key, plain, true)
+    assert {403, %{"error" => "forbidden"}, _} = send_request(ctx, server, @another_key, with_file, true)
+  end
+
+  test "retained terminal uses the same retraction and clear projection after departure", ctx do
+    server = start_supervised!({Server, [shared_messages: true] ++ ctx.server_opts})
+    relay = Server.relay(server)
+    {sender, first, second} = people(ctx, relay)
+    assert :ok = Relay.replace_hosted_organization(relay, "org", [sender, first, second])
+    headers = [{"harklight-features", "shared_messages"}]
+    recipients = body([first, second])
+    assert {200, %{"message" => %{"item_id" => retracted}}, _} =
+             send_request(ctx, server, @key, recipients, true)
+    {first_path, _} = recipient_paths(relay, retracted, first, second)
+    answer = %{"request_revision" => 1, "comment" => "Done"}
+    assert {200, _, _} = write_request(ctx, server, "a2", "POST", first_path <> "/answer", op_key(81), answer, headers)
+    assert {200, _, _} =
+             write_request(ctx, server, "a1", "POST", "/v2/agent/messages/" <> retracted <> "/retract", op_key(82), %{}, headers)
+
+    assert {200, %{"message" => %{"item_id" => cleared}}, _} =
+             send_request(ctx, server, @another_key, Map.put(recipients, "answer_policy", %{"kind" => "everyone"}), true)
+    {clear_path, _} = recipient_paths(relay, cleared, first, second)
+    assert {200, _, _} =
+             write_request(ctx, server, "a1", "POST", "/v2/agent/messages/" <> cleared <> "/lifecycle",
+               op_key(83), %{"action" => "cleared"}, headers)
+    assert {200, %{"item" => %{"terminal" => %{"state" => "retracted"} = retracted_terminal}}, _} =
+             get_request(ctx, server, "a2", first_path, headers)
+    assert {200, %{"item" => %{"terminal" => %{"state" => "cleared", "by_this_person" => false} = cleared_terminal}}, _} =
+             get_request(ctx, server, "a2", clear_path, headers)
+
+    assert :ok = Relay.replace_hosted_organization(relay, "org", [sender, second])
+    assert {200, %{"item" => %{"terminal" => ^retracted_terminal}}, _} =
+             get_request(ctx, server, "a2", first_path, headers)
+    assert {200, %{"item" => %{"terminal" => ^cleared_terminal}}, _} =
+             get_request(ctx, server, "a2", clear_path, headers)
   end
 
   test "shared send binds one organization, commits once and replays the original result", ctx do
@@ -742,7 +799,69 @@ defmodule AttentionServer.ClientAPISharedSendTest do
     assert :ok = Relay.replace_hosted_organization(relay, "org", [sender, second])
     assert :skip = Relay.refresh_push_claim(relay, chat)
     assert :ok = Relay.finish_push(relay, chat, %{state: "suppressed"}, now)
+    assert_departure_badge(relay, first, now)
+  end
+
+  test "departure clears a badge even when the original alert is already accepted", ctx do
+    server = start_supervised!({Server, [shared_messages: true] ++ ctx.server_opts})
+    relay = Server.relay(server)
+    {sender, first, second} = people(ctx, relay)
+    assert :ok = Relay.replace_hosted_organization(relay, "org", [sender, first, second])
+    assert :ok = Relay.enable_push(relay)
+    binding = %{"token" => String.duplicate("ab", 32), "environment" => "production",
+                "revision" => 1, "features" => ["shared_messages"]}
+    assert {200, _, _} =
+             write_request(ctx, server, "a2", "PUT", "/v2/devices/me/push", op_key(86), binding, [])
+    assert {200, _, _} = send_request(ctx, server, @key, body([first]), true)
+    now = System.system_time(:millisecond) + 1_000
+    assert {:ok, %{badge: 1, presentation: :alert} = request} = Relay.claim_push(relay, now)
+    assert :ok = Relay.finish_push(relay, request, %{state: "provider_accepted"}, now)
     assert {:ok, nil} = Relay.claim_push(relay, now)
+
+    assert :ok = Relay.replace_hosted_organization(relay, "org", [sender, second])
+    assert_departure_badge(relay, first, now)
+  end
+
+  defp assert_departure_badge(relay, person, now) do
+    assert {:ok, %{stream: :shared, person: ^person, badge: 0, presentation: :background,
+                   locator: nil} = refresh} = Relay.claim_push(relay, now)
+    assert {:ok, current} = Relay.refresh_push_claim(relay, refresh)
+    assert %{"aps" => %{"badge" => 0}, "attention" => data} = AttentionServer.APNS.request_payload(current)
+    refute Map.has_key?(data, "locator")
+    assert :ok = Relay.finish_push(relay, refresh, %{state: "provider_accepted"}, now)
+    assert {:ok, nil} = Relay.claim_push(relay, now)
+  end
+
+  test "a new cutoff suppresses persisted reminders after Server restart", ctx do
+    opts = [shared_messages: true] ++ ctx.server_opts
+    server = start_supervised!({Server, opts})
+    relay = Server.relay(server)
+    {sender, first, second} = people(ctx, relay)
+    assert :ok = Relay.replace_hosted_organization(relay, "org", [sender, first, second])
+    assert {200, %{"message" => %{"item_id" => room}}, _} =
+             send_request(ctx, server, @key, body([first]), true)
+    engine = :sys.get_state(relay).store.engine
+    %{"created_at_ms" => accepted} = engine.shared_messages[room]
+    due = AttentionServer.SharedReminders.next_deadline(engine)
+    assert is_integer(due)
+    set_cutoff(accepted + 1)
+    assert :ok = stop_supervised(Server)
+
+    restarted = start_supervised!({Server, opts})
+    relay = Server.relay(restarted)
+    assert :sys.get_state(relay).bounce_deadline_timer == nil
+    state = :sys.replace_state(relay, &%{&1 | clock: fn -> due end})
+    send(relay, {:bounce_due, state.bounce_deadline_generation})
+    engine = :sys.get_state(relay).store.engine
+    refute Map.has_key?(engine.shared_recipients[{room, first}].reminder, :outcome)
+    refute Map.has_key?(engine.shared_messages[room], :shared_advisories)
+  end
+
+  defp set_cutoff(at) do
+    env = "ATTENTION_SERVER_BOUNCE_NOT_BEFORE"
+    previous = System.get_env(env)
+    on_exit(fn -> if previous, do: System.put_env(env, previous), else: System.delete_env(env) end)
+    System.put_env(env, at |> DateTime.from_unix!(:millisecond) |> DateTime.to_iso8601())
   end
 
   test "due reminders group unseen people and preserve the separate opened reminder", ctx do

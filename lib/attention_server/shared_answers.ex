@@ -27,16 +27,16 @@ defmodule AttentionServer.SharedAnswers do
     end
   end
 
-  def next_default(engine) do
+  def next_default(engine, groups? \\ false) do
     engine
-    |> pending_defaults()
+    |> pending_defaults(groups?)
     |> Enum.map(fn {_, _, _, default} -> default.at end)
     |> Enum.min(fn -> nil end)
   end
 
-  def apply_defaults(engine, now) do
+  def apply_defaults(engine, now, groups? \\ false) do
     engine
-    |> pending_defaults()
+    |> pending_defaults(groups?)
     |> Enum.filter(fn {_, _, _, default} -> default.at <= now end)
     |> Enum.reduce({engine, []}, fn {record, recipient, person, default}, {next, ids} ->
       id = answer_id(record.id, person, record.revision)
@@ -52,10 +52,11 @@ defmodule AttentionServer.SharedAnswers do
     end)
   end
 
-  defp pending_defaults(engine) do
+  defp pending_defaults(engine, groups?) do
     for {{message_id, person}, recipient} <- engine.shared_recipients,
         not Map.has_key?(recipient, :frozen),
         %{answer_policy: :everyone} = record <- [engine.shared_messages[message_id]],
+        groups? or not Map.has_key?(record, :group_id),
         available?(engine, record, recipient, person),
         accepted = Map.get(record, :revision_accepted_at_ms, record["created_at_ms"]),
         %{at: _} = default <- [Message.default_answer(record.message, accepted)],
@@ -91,18 +92,12 @@ defmodule AttentionServer.SharedAnswers do
   def person_projection(engine, record, recipient, person) do
     case Map.get(recipient, :frozen) do
       %{answers: answers, effective_answer_id: id} ->
-        %{terminal: terminal_for_person(engine, id, person, record),
+        %{terminal: terminal_for_person(record, engine.shared_answers[id], person),
           answers: projected_answers(engine, answers, {:person, person})}
 
       _ ->
         answer = resolved_answer(engine, record, recipient)
-        terminal =
-          cond do
-            get_in(record, [:terminal, "state"]) == "retracted" -> record.terminal
-            answer -> person_terminal(answer, person)
-            true -> Map.get(record, :terminal)
-          end
-        terminal = if terminal && terminal["state"] == "cleared", do: Map.put(terminal, "by_this_person", false), else: terminal
+        terminal = terminal_for_person(record, answer, person)
         %{terminal: terminal, answers: projected_answers(engine, answer_ids(engine, record), {:person, person})}
     end
   end
@@ -153,12 +148,15 @@ defmodule AttentionServer.SharedAnswers do
     end)
   end
 
-  defp terminal_for_person(engine, id, person, record) do
-    case engine.shared_answers[id] do
-      nil -> Map.get(record, :terminal)
-      answer -> person_terminal(answer, person)
-    end
-  end
+  defp terminal_for_person(%{terminal: %{"state" => "retracted"} = terminal}, _answer, _person),
+    do: terminal
+
+  defp terminal_for_person(_record, %{} = answer, person), do: person_terminal(answer, person)
+
+  defp terminal_for_person(%{terminal: %{"state" => "cleared"} = terminal}, nil, _person),
+    do: Map.put(terminal, "by_this_person", false)
+
+  defp terminal_for_person(record, nil, _person), do: Map.get(record, :terminal)
 
   def person_terminal(answer, viewer) do
     %{

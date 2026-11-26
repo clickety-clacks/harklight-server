@@ -264,13 +264,9 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
     engine = state.store.engine
 
     result =
-      with :ok <- shared_send_gate(state, person, body["recipients"], capability),
-           :ok <- authorize(state, scope, :send),
+      with :ok <- authorize_shared_send(state, scope, body, capability),
            {:ok, nil} <- lookup(state, receipt_scope(scope), key),
-           :ok <- shared_send_fields(body),
            {:ok, people, org, _group} <- shared_recipients(state, person, body["recipients"]),
-           true <- Engine.shared_sender_allowed?(engine, person, origin, body["sender"]) ||
-                     {:error, :forbidden},
            {:ok, _} <- SharedMessages.select_organization(engine, person, people, org),
            {:ok, files} <- SharedAttachments.prepare(state.store, scope, body["file_ids"],
              shared_id(scope, key), body["sender"], key, state.clock.()) do
@@ -287,8 +283,7 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
   def handle_call({:shared_send, %{person: person, key: origin}, key, digest, body, staged, capability}, _from, state) do
     scope = {person, origin}
 
-    with :ok <- shared_send_gate(state, person, body["recipients"], capability),
-         :ok <- authorize(state, scope, :send) do
+    with :ok <- authorize_shared_send(state, scope, body, capability) do
       shared_send(state, scope, key, digest, body, staged)
     else
       error -> {:reply, refusal(error), state}
@@ -567,6 +562,16 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
       else: {:error, "invalid_field", nil}
   end
 
+  defp authorize_shared_send(state, {person, origin} = scope, body, capability) do
+    with :ok <- shared_send_gate(state, person, body["recipients"], capability),
+         :ok <- authorize(state, scope, :send),
+         :ok <- shared_send_fields(body),
+         true <- Engine.shared_sender_allowed?(state.store.engine, person, origin, body["sender"]) ||
+                   {:error, :forbidden} do
+      :ok
+    end
+  end
+
   defp shared_send(state, scope, key, digest, body, staged) do
     case lookup(state, receipt_scope(scope), key) do
       {:ok, %{digest: ^digest, status: status, body: stored}} ->
@@ -587,12 +592,9 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
     engine = state.store.engine
     sender = body["sender"]
 
-    with :ok <- shared_send_fields(body),
-         {:ok, people, org, group} <- shared_recipients(state, person, body["recipients"]),
+    with {:ok, people, org, group} <- shared_recipients(state, person, body["recipients"]),
          {:ok, message} <- content(body),
          :ok <- session(body),
-         true <- Engine.shared_sender_allowed?(engine, person, origin, sender) ||
-                   {:error, :forbidden},
          {:ok, policy} <- shared_answer_policy(message, body),
          id <- shared_id(scope, key),
          message <- Map.merge(message, %{"sender_id" => sender, "message_id" => id}),
