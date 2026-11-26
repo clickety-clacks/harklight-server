@@ -7,7 +7,7 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
 
   alias AttentionServer.{AgentChangeLog, ConversationFiles, Engine, JSON, Message, Relay}
 
-  alias AttentionServer.AgentAPI.Advisories
+  alias AttentionServer.AgentAPI.{Advisories, RecipientReach}
 
   alias AttentionServer.ClientAPI.{
     AgentResources,
@@ -310,7 +310,11 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
 
   defp receipt_projection_scope(_state, scope, _key, _receipt), do: scope
 
-  defp replay_message(state, scope, key, true), do: AgentResources.message(state, scope, key)
+  defp replay_message(state, scope, key, true) do
+    with {:ok, message} <- AgentResources.message(state, scope, key),
+         do: {:ok, RecipientReach.add(message, state, scope)}
+  end
+
   defp replay_message(_state, _scope, _key, false), do: {:ok, nil}
 
   defp replay_entry(_state, _scope, _key, nil), do: {:ok, nil}
