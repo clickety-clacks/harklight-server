@@ -1,3 +1,27 @@
+# Harklight Server v0.2.30
+
+Hosted servers can send a person a Harklight message from the system itself,
+for example to tell a team's admin that a subscription is about to expire. On
+the hosted loopback interface, `POST /persons/{person_id}/notices` with
+`{title, body, link, key}` delivers one FYI from a sender shown as Harklight,
+with normal delivery, ranking and notifications. A repeat with the same key
+returns the original; the same key with different content is refused. It works
+only on hosted servers and never crosses accounts. Agents can't be granted,
+read or search that sender, and a notice that bounces sends no agent notice.
+
+## Upgrade and recovery
+
+FORMAT31, as in v0.2.26 through v0.2.29: an existing FORMAT30 store is
+converted once with the Server stopped; a FORMAT29 or older store must first be
+upgraded through v0.2.16 to v0.2.20. **Once a hosted notice has been written,
+earlier FORMAT31 builds can't open the store.** To go back, restore the
+complete pre-upgrade backup and run the release that wrote it; this discards
+every write made since the backup.
+
+**Compatibility.** Harklight Server 0.2.30 speaks only the 0.2 protocol and
+bundles Harklight Web 0.2.6. Install it together with an iPhone app build that
+reads `receipt_expected`. Harklight Agent 0.2.6 and 0.2.7 work with it.
+
 # Harklight Server v0.2.29
 
 Harklight is described as an attention-based UI. The served agent guides, the
