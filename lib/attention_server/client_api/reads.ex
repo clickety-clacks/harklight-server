@@ -329,7 +329,7 @@ defmodule AttentionServer.ClientAPI.Reads do
 
       rows =
         Enum.flat_map(shown, fn {item_id, rank} ->
-          case Resources.item_key(engine, person, item_id) do
+          case Resources.person_item_key(engine, person, item_id) do
             {:ok, item_key} -> [{item_key, rank, ChangeLog.item_resource(item_key)}]
             _ -> []
           end
@@ -405,7 +405,7 @@ defmodule AttentionServer.ClientAPI.Reads do
     engine = state.store.engine
 
     with {:ok, principal} <- principal(engine, key),
-         {:ok, item_key} <- Resources.item_key(engine, principal.person, item_id),
+         {:ok, item_key} <- Resources.person_item_key(engine, principal.person, item_id),
          :ok <- ChangeLog.ranks_available(state.store, principal.person),
          {:ok, position} <- head(state, principal.person),
          context = %{engine: engine, store: state.store, view: view(state, principal.person)},
@@ -422,7 +422,7 @@ defmodule AttentionServer.ClientAPI.Reads do
     engine = state.store.engine
 
     with {:ok, principal} <- principal(engine, key),
-         {:ok, item_key} <- Resources.item_key(engine, principal.person, item_id),
+         {:ok, item_key} <- Resources.person_item_key(engine, principal.person, item_id),
          {:ok, n} <- revision_number(n),
          {:ok, revision} <- Resources.revision(engine, item_key, n),
          {:ok, position} <- head(state, principal.person) do
@@ -434,7 +434,7 @@ defmodule AttentionServer.ClientAPI.Reads do
     engine = state.store.engine
 
     with {:ok, principal} <- principal(engine, key),
-         {:ok, item_key} <- Resources.item_key(engine, principal.person, item_id),
+         {:ok, item_key} <- Resources.person_item_key(engine, principal.person, item_id),
          {:ok, limit} <- limit(params),
          {:ok, position} <- head(state, principal.person) do
       all = Resources.entries(engine, item_key, Map.get(state.priority_views, principal.person))

@@ -153,6 +153,8 @@ if System.get_env("ATTENTION_SERVER_ENABLE") == "1" do
     owner_ip: bind.("ATTENTION_SERVER_OWNER_BIND"),
     join_name: System.get_env("ATTENTION_SERVER_JOIN_NAME"),
     deployment_mode: deployment_mode,
+    jev_endpoint: System.get_env("ATTENTION_SERVER_JEV_ENDPOINT"),
+    jev_model: System.get_env("ATTENTION_SERVER_JEV_MODEL"),
     jev_score_record_path: System.get_env("ATTENTION_SERVER_JEV_SCORE_RECORD_PATH"),
     feature_flags_path: System.get_env("ATTENTION_SERVER_FEATURE_FLAGS_PATH"),
     upload_cap: upload_cap

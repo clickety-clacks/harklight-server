@@ -96,6 +96,16 @@ defmodule AttentionServer.ClientAPI.Resources do
 
   def item_key(_engine, _person, _item_id), do: {:error, :not_found}
 
+  @doc false
+  def person_item_key(engine, person, id) do
+    with {:ok, key} <- item_key(engine, person, id),
+         true <- BounceDecision.person_visible?(engine.messages[key]) do
+      {:ok, key}
+    else
+      _ -> {:error, :not_found}
+    end
+  end
+
   @doc "The opaque `entry_id` of a conversation fact."
   def entry_id(seq) when is_integer(seq) and seq > 0, do: "e" <> Integer.to_string(seq)
 
@@ -203,7 +213,8 @@ defmodule AttentionServer.ClientAPI.Resources do
 
     for seq <- 1..high//1,
         %{key: {^person, _, _} = key} <- [Map.get(engine.events, {person, seq})],
-        match?(%{accepted_seq: ^seq}, Map.get(engine.messages, key)),
+        %{accepted_seq: ^seq} = record <- [Map.get(engine.messages, key)],
+        BounceDecision.person_visible?(record),
         do: key
   end
 
@@ -647,9 +658,11 @@ defmodule AttentionServer.ClientAPI.Resources do
     |> item_keys(person)
     |> Enum.map(&{&1, Map.fetch!(engine.messages, &1)})
     |> Enum.reject(fn {_key, record} -> MapSet.member?(listed_items, item_id(record)) end)
-    |> Enum.sort_by(fn {_key, record} -> {not is_nil(record.terminal), -record.accepted_seq} end)
+    |> Enum.sort_by(fn {_key, record} ->
+      {not BounceDecision.inbox_open?(record), -record.accepted_seq}
+    end)
     |> Enum.map(fn {key, record} ->
-      section = if is_nil(record.terminal), do: "current", else: "resolved"
+      section = if BounceDecision.inbox_open?(record), do: "current", else: "resolved"
       {:item, item_id(record), key, section, nil}
     end)
   end
@@ -665,6 +678,7 @@ defmodule AttentionServer.ClientAPI.Resources do
         with %{"sender_id" => sender, "message_id" => message_id} <- row,
              key = {person, sender, message_id},
              %{accepted_seq: _} = record <- Map.get(engine.messages, key),
+             BounceDecision.person_visible?(record),
              {:ok, unit} <- list_unit(row, item_id(record), key, record),
              id = unit_id(unit),
              false <- MapSet.member?(seen, id) do
@@ -1068,7 +1082,7 @@ defmodule AttentionServer.ClientAPI.Resources do
     |> Enum.uniq()
     |> Enum.group_by(fn seq ->
       case Map.get(engine.conversation_events, {person, seq}) do
-        %{key: {^person, _, _} = key} -> if Map.has_key?(engine.messages, key), do: key
+        %{key: {^person, _, _} = key} -> if BounceDecision.person_visible?(engine.messages[key]), do: key
         _ -> nil
       end
     end)
@@ -1092,7 +1106,7 @@ defmodule AttentionServer.ClientAPI.Resources do
   def entry_for_fact(%Engine{} = engine, person, seq, view \\ nil) do
     case Map.get(engine.conversation_events, {person, seq}) do
       %{key: {^person, _, _} = key} ->
-        if Map.has_key?(engine.messages, key),
+        if BounceDecision.person_visible?(engine.messages[key]),
           do: engine |> entries(key, view) |> Enum.find(&(seq in &1[@sources])),
           else: nil
 

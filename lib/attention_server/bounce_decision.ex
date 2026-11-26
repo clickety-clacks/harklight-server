@@ -7,6 +7,14 @@ defmodule AttentionServer.BounceDecision do
   @no_record_sentence "Harklight has no record that you saw this message."
   @advisory_fields ~w(advisory_id advisory_seq accepted_at_ms author bounce_after_days due_at_ms evaluated_at_ms kind level_name message_id origin_cursor_at_decision request_revision sender_id session_handle text advisory_type)
 
+  def inbox_open?(%{terminal: nil} = record), do: not is_map_key(record, "full_bounced_at_ms")
+  def inbox_open?(_record), do: false
+
+  def fully_bounced?(%{"full_bounced_at_ms" => _}), do: true
+  def fully_bounced?(_record), do: false
+
+  def person_visible?(record), do: is_map(record) and not fully_bounced?(record)
+
   def levels(%Engine{} = engine, person) do
     engine
     |> effective_levels(person)
@@ -678,7 +686,12 @@ defmodule AttentionServer.BounceDecision do
     }
 
     notices = Map.put(Map.get(record, "item_advisories", %{}), notice["advisory_id"], notice)
-    engine = Engine.put_row(engine, :messages, key, Map.put(record, "item_advisories", notices))
+    record = Map.put(record, "item_advisories", notices)
+
+    engine =
+      if opened,
+        do: Engine.put_row(engine, :messages, key, record),
+        else: full_bounce(engine, key, record, now_ms)
 
     # The old reader does not project item advisories. It must still treat
     # this revision's decision as final if it writes to this FORMAT29 store.
@@ -792,8 +805,13 @@ defmodule AttentionServer.BounceDecision do
       |> Engine.touch_fact({:advisory, feed_key, :high})
       |> Engine.touch_fact({:advisory, feed_key, {:entry, sequence}})
 
-    update_selection(engine, key, state, sub_revision, selection, "bounced", nil, advisory_id)
+    engine
+    |> full_bounce(key, record, now_ms)
+    |> update_selection(key, state, sub_revision, selection, "bounced", nil, advisory_id)
   end
+
+  defp full_bounce(engine, key, record, now_ms),
+    do: Engine.put_message(engine, key, Map.put(record, "full_bounced_at_ms", now_ms))
 
   defp update_selection(
          engine,

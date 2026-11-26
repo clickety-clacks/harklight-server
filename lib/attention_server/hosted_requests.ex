@@ -77,6 +77,9 @@ defmodule AttentionServer.HostedRequests do
       {:error, :unknown_algorithm} ->
         json(conn, 400, %{"error" => "unknown_algorithm"})
 
+      {:error, :algorithm_managed_by_server} ->
+        json(conn, 409, %{"error" => "algorithm_managed_by_server"})
+
       {:error, :not_hosted} ->
         json(conn, 404, %{"error" => "unknown_person"})
 

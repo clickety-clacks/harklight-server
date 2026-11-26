@@ -2218,7 +2218,8 @@ defmodule AttentionServer.Engine do
     end)
   end
 
-  defp due_default?(%{terminal: nil} = record, now_ms) do
+  defp due_default?(%{terminal: nil} = record, now_ms)
+       when not is_map_key(record, "full_bounced_at_ms") do
     accepted_at = Map.get(record, :revision_accepted_at, Map.get(record, :accepted_at))
 
     case Message.default_answer(record.message, accepted_at) do
@@ -3665,7 +3666,8 @@ defmodule AttentionServer.Engine do
                     nil ->
                       {state, [%{"message_id" => id, "reason" => "unknown"} | warnings], seen}
 
-                    %{terminal: terminal} when not is_nil(terminal) ->
+                    %{terminal: terminal} = record
+                    when not is_nil(terminal) or is_map_key(record, "full_bounced_at_ms") ->
                       {state, [%{"message_id" => id, "reason" => "closed"} | warnings], seen}
 
                     record ->
@@ -3834,6 +3836,12 @@ defmodule AttentionServer.Engine do
       when not answer? and origin != actor and not is_map_key(frame, :account_retract) ->
         failure("not_origin")
 
+      %{"full_bounced_at_ms" => _} when answer? ->
+        failure("unknown_message")
+
+      %{"full_bounced_at_ms" => _} when :erlang.map_get("state", frame) != "retracted" ->
+        failure("closed")
+
       %{terminal: %{state: "retracted"} = terminal} when answer? ->
         failure("retracted", nil, retracted_terminal_snapshot(terminal))
 
@@ -3935,6 +3943,7 @@ defmodule AttentionServer.Engine do
     if kind in [:device, :browser] and Message.nonempty?(request_id) do
       matches =
         for {{^person, _sender, ^request_id} = key, record} <- engine.messages,
+            BounceDecision.person_visible?(record),
             do: {key, record}
 
       case matches do
@@ -4344,7 +4353,7 @@ defmodule AttentionServer.Engine do
 
     case Map.get(engine.messages, key) do
       %{session_handle: handle, origin: origin} = record
-      when is_binary(handle) and actor != origin ->
+      when is_binary(handle) and actor != origin and not is_map_key(record, "full_bounced_at_ms") ->
         if frame["request_revision"] <= record.revision do
           {next, seq} = next_conversation_seq(engine, person)
 
@@ -4413,6 +4422,9 @@ defmodule AttentionServer.Engine do
     case Map.get(engine.messages, key) do
       %{origin: origin} when origin != actor ->
         failure("not_origin")
+
+      %{"full_bounced_at_ms" => _} ->
+        failure("closed")
 
       %{origin: ^actor, session_handle: handle} when is_binary(handle) ->
         revision = frame["request_revision"]
@@ -4593,6 +4605,9 @@ defmodule AttentionServer.Engine do
     key = {person, frame["sender_id"], frame["message_id"]}
 
     case Map.get(engine.messages, key) do
+      %{"full_bounced_at_ms" => _, origin: ^actor} ->
+        failure("closed")
+
       %{origin: ^actor, session_handle: handle, terminal: nil} = record
       when is_binary(handle) ->
         revised_message = effective_revised_message(record.message, frame["message"])
@@ -5244,7 +5259,8 @@ defmodule AttentionServer.Engine do
     {put_row(engine, :conversation_highs, person, seq), seq}
   end
 
-  defp put_message(engine, key, record) do
+  @doc false
+  def put_message(engine, key, record) do
     previous = Map.get(engine.messages, key)
 
     open_default_index =
@@ -5261,7 +5277,7 @@ defmodule AttentionServer.Engine do
   end
 
   defp default_due_at(record) do
-    if Map.get(record, :terminal) == nil do
+    if BounceDecision.inbox_open?(record) do
       accepted_at = Map.get(record, :revision_accepted_at, Map.get(record, :accepted_at))
 
       case Message.default_answer(Map.get(record, :message), accepted_at) do
@@ -5447,7 +5463,9 @@ defmodule AttentionServer.Engine do
         case Map.get(engine.events, {person, seq}) do
           %{kind: :delivery, key: key} ->
             case Map.get(engine.messages, key) do
-              %{terminal: nil} = record -> [{key, record}]
+              %{terminal: nil} = record when not is_map_key(record, "full_bounced_at_ms") ->
+                [{key, record}]
+
               _ -> []
             end
 
@@ -5474,7 +5492,8 @@ defmodule AttentionServer.Engine do
     |> Enum.find_value(fn {_, %{key: key, payload: payload}} ->
       case Map.get(engine.messages, key) do
         %{origin: origin, accepted_seq: seq} = record
-        when origin != device and is_integer(seq) and seq > 0 ->
+        when origin != device and is_integer(seq) and seq > 0 and
+               not is_map_key(record, "full_bounced_at_ms") ->
           {key, record, payload}
 
         _ ->
@@ -5483,12 +5502,11 @@ defmodule AttentionServer.Engine do
     end)
   end
 
-  # The recipient's Inbox count as the server sees it: accepted requests with
-  # no explicit action yet. Retracted and answered items are resolved.
+  # The recipient's active Inbox count excludes settled and full-bounced items.
   defp inbox_badge(engine, person) do
     Enum.count(engine.messages, fn
-      {{^person, _sender, _id}, %{terminal: nil, message: message}} ->
-        not Message.progress_message?(message)
+      {{^person, _sender, _id}, %{message: message} = record} ->
+        BounceDecision.inbox_open?(record) and not Message.progress_message?(message)
 
       _ ->
         false

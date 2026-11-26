@@ -1,6 +1,6 @@
 # Harklight Server self-hosted installation
 
-Version: **0.2.22**. Package target: **Linux x86_64, glibc 2.39 or newer**, with OpenSSL 3 shared libraries and libstdc++6 (built on Ubuntu 24.04). The package bundles
+Version: **0.2.24**. Package target: **Linux x86_64, glibc 2.39 or newer**, with OpenSSL 3 shared libraries and libstdc++6 (built on Ubuntu 24.04). The package bundles
 Erlang/OTP and Elixir bytecode; users need no Mix, Hex, source checkout or
 Erlang installation. It needs Bash, OpenSSL CLI, tar and the platform libraries
 listed in BUILD_INFO. This is a single-process self-hosted server cut.
@@ -25,9 +25,9 @@ the request; a valid current-revision answer commits a payload-free
 
 ## Download and verify
 
-After publication, download the v0.2.22 release from
-clickety-clacks/harklight-server, tag v0.2.22. Get
-harklight-server-0.2.22-linux-x86_64.tar.gz, SHA256SUMS and SELF_HOST.md from
+After publication, download the v0.2.24 release from
+clickety-clacks/harklight-server, tag v0.2.24. Get
+harklight-server-0.2.24-linux-x86_64.tar.gz, SHA256SUMS and SELF_HOST.md from
 that release. Run sha256sum -c SHA256SUMS and extract into an operator-owned
 versioned directory. BUILD_INFO identifies the source commit, build host,
 toolchain, source status and native dependencies.
@@ -40,7 +40,7 @@ runtime/dependency notices remain in their shipped distribution files.
 Choose the DNS hostname clients will validate. For a same-machine preview,
 localhost works. Install into a directory you own and run:
 
-    PACKAGE="$PWD/harklight-server-0.2.22-linux-x86_64"
+    PACKAGE="$PWD/harklight-server-0.2.24-linux-x86_64"
     STATE="$HOME/.local/share/harklight-server"
     "$PACKAGE/bin/harklight-bootstrap" "$STATE" localhost
     cat "$STATE/person-id"
@@ -149,6 +149,32 @@ configured value are refused individually. The package elects no production
 SaaS cap. These settings need deliberate configuration; installation leaves the
 protected environment unchanged.
 
+### Hosted inbox prioritization
+
+For a Server running in `saas` mode, set these variables in its private
+startup environment:
+
+| Variable | Value |
+| --- | --- |
+| `ATTENTION_SERVER_JEV_ENDPOINT` | HTTPS System One endpoint, such as `https://api.typesafe.ai/v1/systemone`. A URL without a path uses `/v1/systemone`. |
+| `ATTENTION_SERVER_JEV_MODEL` | Model name or alias available to the provider account. |
+| `ATTENTION_SERVER_JEV_KEY_PATH` | Absolute path to a protected file containing the Hosted deployment's provider key. |
+
+In `saas` mode the Server uses the startup endpoint and model and ignores
+any dashboard connection or algorithm choices saved in the store. In
+`self_hosted` mode it uses the connection saved on the Prioritization
+dashboard and ignores the startup endpoint and model. Both modes use
+`ATTENTION_SERVER_JEV_KEY_PATH` for the provider key.
+
+Restart the Server to change the Hosted endpoint or model. With these settings,
+Jev ranks each existing and new Hosted account separately. Missing or invalid
+connection settings select baseline order for every Hosted account. The
+authenticated Hosted component's `POST /algorithm` accepts the configured
+algorithm and returns `409 algorithm_managed_by_server` for a different one.
+An unreadable key or unavailable provider yields baseline order when no
+usable scores are available. Provider requests have a 30-second total
+timeout per batch. Delivery and push continue independently of ranking.
+
 ## Optional self-hosted device dashboard
 
 The dashboard shows device status and agent skill guidance. A signed-in person
@@ -221,7 +247,8 @@ accepts or displays the path or key. The owner can save the model-assisted
 choice before its HTTPS endpoint, model or key file is ready. Waiting items
 remain in basic order until setup is complete and an ordering response arrives;
 the page shows whether setup is incomplete or the server is waiting for an
-answer. Intake, delivery and push continue normally.
+answer. Each provider request has a 30-second total timeout. Intake, delivery
+and push continue normally.
 
 Optional private applied-score record: set `ATTENTION_SERVER_JEV_SCORE_RECORD_PATH`
 in private `server.env` to a file in an existing private directory writable by
@@ -365,11 +392,10 @@ survive restart.
 For a manual upgrade of an existing installation, stop the old server and back
 up the full private state before upgrading. The release installer makes one
 full mutable-root backup after stopping the service and before switching
-releases. The server built from this source opens and writes FORMAT30
-snapshots only. For a store on an earlier format, first upgrade through
-v0.2.16–v0.2.20 using a release that supports the starting format. Verify
-the resulting FORMAT30 snapshot before switching to this package. On first
-start, retained Seen-only messages gain an explicit FYI type. For old Chat
+releases. Follow the [FORMAT31 upgrade steps](#releases-that-write-format31)
+before starting this build on a FORMAT30 store. For an earlier store, follow
+the bridge upgrade described there. Retained Seen-only messages gain an
+explicit FYI type during migration. For old Chat
 turns with no recorded handoff expectation or outcome, updated clients omit
 the delivery caption until the turn receives qualifying evidence.
 Preserve the database, referenced files, trust root, owner and person.

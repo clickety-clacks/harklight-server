@@ -439,6 +439,50 @@ defmodule AttentionServer.BounceDecisionTest do
 
     assert [%{"advisory_type" => "unseen_interval_elapsed"}] =
              Map.values(decided.messages[key()]["item_advisories"])
+
+    assert decided.messages[key()]["full_bounced_at_ms"] == accepted + 300_000_001
+  end
+
+  test "both bounce kinds wait for the selected default priority interval" do
+    accepted = 1_794_925_014_001
+
+    for {level, value, hours} <- [
+          {"Urgent", 0.8, 12},
+          {"High", 0.6, 24},
+          {"Normal", 0.3, 72},
+          {"Low", 0.1, 168}
+        ],
+        opened? <- [false, true] do
+      {engine, record} = fixture(configured?: false, accepted_at: accepted)
+
+      engine =
+        if opened? do
+          {:ok, opened, 1} = BounceDecision.record_open(engine, key(), record, 1)
+          opened
+        else
+          engine
+        end
+
+      selected = score(engine, value, accepted)
+      due = accepted + hours * 3_600_000
+      assert %{"level_name" => ^level, "due_at_ms" => ^due} = selection(selected)
+      assert BounceDecision.evaluate_due(selected, due - 1) == selected
+
+      decided = BounceDecision.evaluate_due(selected, due)
+      assert decided.messages[key()].terminal == nil
+      assert BounceDecision.evaluate_due(decided, due + 1) == decided
+
+      if opened? do
+        assert [%{"advisory_type" => "soft_bounce", "evaluated_at_ms" => ^due}] =
+                 Map.values(decided.messages[key()]["item_advisories"])
+
+        refute BounceDecision.fully_bounced?(decided.messages[key()])
+      else
+        assert decided.messages[key()]["full_bounced_at_ms"] == due
+
+        assert decided.advisory_feeds[advisory_feed_key()].entries[1]["evaluated_at_ms"] == due
+      end
+    end
   end
 
   test "a pre-cutoff Open still suppresses a notice waiting on support" do
