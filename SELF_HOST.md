@@ -149,7 +149,7 @@ configured value are refused individually. The package elects no production
 SaaS cap. These settings need deliberate configuration; installation leaves the
 protected environment unchanged.
 
-### Hosted inbox prioritization
+### Hosted attention list prioritization
 
 For a Server running in `saas` mode, set these variables in its private
 startup environment:
@@ -271,8 +271,8 @@ or Codex, install the CLI with `brew install clickety-clacks/tap/harklight-agent
    the **On a computer** command and run it on the agent’s computer.
 2. In **Devices**, review the pending request, match the approval code printed
    by `setup`, and enter `app:agent/` in **Sender IDs** before approving.
-3. Answer the test question in your Harklight Inbox. Then ask Claude Code or
-   Codex to send you a question through Harklight.
+3. Answer the test question in your Harklight attention list. Then ask Claude
+   Code or Codex to send you a question through Harklight.
 
 With the owner CLI, use `harklight owner invite --output FILE` with your usual
 owner connection options and transfer the private invitation file to the
@@ -357,7 +357,7 @@ attempt's elapsed milliseconds and outcome as `harklight_apns_attempt` to inform
 future tuning.
 
 When the deadline expires, the Server stops the attempt, keeps the notification
-queued for the existing retry schedule, and moves on to other eligible devices.
+on the existing retry schedule, and moves on to other eligible devices.
 APNs may have accepted the interrupted request, so a retry can produce a
 duplicate alert. The message stays in the durable store.
 
@@ -403,7 +403,7 @@ Messages, accounts, grants, enrolled devices and registered agents carry over.
 Every registered, non-revoked agent can read its account's messages.
 Answering requires both a matching read grant and a matching respond grant.
 
-Starting a server with APNs configured can dispatch existing queued work. The
+Starting a server with APNs configured can send pending notifications. The
 release installer does not inspect, clear, or mark provider work delivered. It
 stops the sole writer, retains a private archive of the mutable deployment root,
 and starts the verified package against the same external state and
@@ -449,8 +449,8 @@ provide the exact sender and message ID:
     printf '%s\n' '{"choice":"continue"}' > answer.json
     "$PACKAGE/bin/harklight" device respond --directory "$HOME/.local/share/harklight-receiver" --connect "$SERVER_ADDRESS" --name "$SERVER_NAME" --port "$DEVICE_PORT" --ca "$CA_PEM" --sender app:example --message-id request-1 --answer answer.json
 
-The read command stores the inbox snapshot, and later change batches, before
-advancing its cursor; it acknowledges nothing. A response is deliberate and
+The read command stores the attention list snapshot and subsequent change
+batches before advancing its cursor. It acknowledges nothing. A response is deliberate and
 terminal; it does not execute a source action or authorize external operations.
 Use a supported answer UI when reading through the native app. Unknown UI
 remains unsupported.

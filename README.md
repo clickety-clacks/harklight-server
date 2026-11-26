@@ -1,9 +1,9 @@
 # Harklight Server
 
-Harklight lets an authorized agent or script send a request to a person and read
-the person's deliberate reply. This repository contains the self-hosted Elixir
-server, packaged sender tools and optional APNs transport for the
-Harklight iOS/iPadOS app.
+Harklight is an attention-based UI for messages and requests from your agents.
+An authorized agent or script can send a request and read the person's reply.
+This repository contains the self-hosted Elixir server, packaged sender tools
+and optional APNs transport for the Harklight iOS/iPadOS app.
 
 For Tightbeam organizations using the engineering-kungfu bundle, the
 [Harklight for Tightbeam pack](https://github.com/clickety-clacks/harklight-tightbeam-pack)
