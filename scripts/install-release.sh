@@ -299,6 +299,10 @@ rollback_failed_upgrade() {
     fail "upgrade failed: $cause; the candidate could not be confirmed stopped, so the pre-install backup was retained and no rollback was started; candidate writes since the backup were not restored and may still be changing; service state: $(service_condition)"
   fi
 
+  if ((switched)) && target_supports_auth; then
+    fail "upgrade failed: $cause; the auth-capable candidate may have served; its package and latest state remain selected and stopped, and the pre-install backup was retained"
+  fi
+
   if ! restore_preinstall_root; then
     fail "upgrade failed: $cause; restoring the pre-install mutable root from the retained backup did not complete; the prior release was not started and the service remains stopped; the current root may be partial, and candidate writes since the backup may be retained or partially lost"
   fi
@@ -411,6 +415,10 @@ EOF
   staging=""
 fi
 
+target_supports_auth() {
+  grep -Eq '^auth_generation=[1-9][0-9]*$' "$target/BUILD_INFO"
+}
+
 check_target_store() {
   python3 "$package_root/bin/harklight-check-store" "$state/relay.sqlite3" "$target/BUILD_INFO" "$@"
 }
@@ -517,6 +525,11 @@ if ! grep -Fqx "version=${current_tag#v}" "$current_path/BUILD_INFO"; then
 fi
 
 if [[ -z "$backup_final" ]]; then
+  if target_supports_auth &&
+    [[ -s "$state/relay.sqlite3-wal" || -s "$state/relay.sqlite3-journal" ]]; then
+    fail "the stopped store is not checkpointed; release was not switched"
+  fi
+
   backup_tmp="$(mktemp -d "$root/backups/.harklight-backup.XXXXXX")"
   backup_id="${backup_tmp##*.}"
   backup_final="$root/backups/$(date -u +%Y%m%dT%H%M%SZ)-$current_tag-to-$HARKLIGHT_RELEASE_TAG-$backup_id"
@@ -559,8 +572,7 @@ if ((!switched)); then
     rollback_failed_upgrade "the converted store is incompatible with the selected release"
   fi
 
-  if grep -Eq '^auth_generation=[1-9][0-9]*$' "$target/BUILD_INFO" &&
-    ! install_checked_launcher; then
+  if target_supports_auth && ! install_checked_launcher; then
     rollback_failed_upgrade "could not install the managed store compatibility launcher"
   fi
 

@@ -6,7 +6,8 @@ installer="${1:?pass the install-release.sh path}"
 mode="${2:-upgrade-failure}"
 [[ -f "$installer" ]] || { printf 'installer is missing\n' >&2; exit 1; }
 [[ "$mode" == upgrade-failure || "$mode" == optional-route || "$mode" == conversion-failure ||
-   "$mode" == interrupted-conversion || "$mode" == interrupted-switch ]] || {
+   "$mode" == interrupted-conversion || "$mode" == interrupted-switch ||
+   "$mode" == auth-start-failure ]] || {
   printf 'unknown test mode: %s\n' "$mode" >&2
   exit 1
 }
@@ -89,13 +90,16 @@ printf 'beam\n' > "$archive_stage/erts-15.2.7/bin/beam.smp"
 chmod 755 "$archive_stage/erts-15.2.7/bin/beam.smp"
 printf 'server\n' > "$archive_stage/bin/attention_server"
 chmod 755 "$archive_stage/bin/attention_server"
-printf 'version=0.2.21\nrelay_store_format=31\nauth_generation=0\nsource_commit=0123456789abcdef0123456789abcdef01234567\nsource_status=\n' \
-  > "$archive_stage/BUILD_INFO"
+auth_generation=0
+if [[ "$mode" == auth-start-failure ]]; then auth_generation=1; fi
+printf 'version=0.2.21\nrelay_store_format=31\nauth_generation=%s\nsource_commit=0123456789abcdef0123456789abcdef01234567\nsource_status=\n' \
+  "$auth_generation" > "$archive_stage/BUILD_INFO"
 printf 'Harklight Server release guide\n' > "$archive_stage/SELF_HOST.md"
 cp "$archive_stage/SELF_HOST.md" "$guide"
 cp "$guide" "$package_root/SELF_HOST.md"
 cp "$archive_stage/BUILD_INFO" "$package_root/BUILD_INFO"
 cp "$(dirname "$installer")/check-store-compatibility.py" "$package_root/bin/harklight-check-store"
+cp "$(dirname "$installer")/start-server-checked.sh" "$package_root/bin/harklight-start-server-checked"
 cp "$installer" "$package_root/bin/harklight-release-install"
 chmod 755 "$package_root/bin/harklight-release-install"
 
@@ -240,7 +244,17 @@ output="$(invoke_installer)"
 status=$?
 set -e
 
-if [[ "$mode" != optional-route ]]; then
+if [[ "$mode" == auth-start-failure ]]; then
+  [[ "$status" == 1 ]] || { printf '%s\n' "$output" >&2; exit 1; }
+  [[ "$output" == *'auth-capable candidate may have served'* ]]
+  [[ "$(readlink "$root/current")" == releases/v0.2.21 ]]
+  [[ "$(< "$scratch/service-state")" == inactive ]]
+  [[ -f "$root/state/candidate-write.txt" && -f "$root/backups/.pending-conversion" ]]
+  grep -Fqx 'start:v0.2.21' "$HARKLIGHT_TEST_ACTIONS"
+  ! grep -Fqx 'start:v0.2.20' "$HARKLIGHT_TEST_ACTIONS"
+  [[ -x "$root/bin/harklight-check-store" && -x "$root/bin/start-server-unchecked" ]]
+  printf 'PASS: auth candidate readiness failure retained the selected package, writes and backup\n'
+elif [[ "$mode" != optional-route ]]; then
   [[ "$status" == 1 ]] || { printf 'expected installer exit 1, got %s\n%s\n' "$status" "$output" >&2; exit 1; }
   if [[ "$mode" == conversion-failure ]]; then
     expected_failure='upgrade failed: stopped-store FORMAT31 conversion failed'
