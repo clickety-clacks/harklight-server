@@ -1585,6 +1585,9 @@ defmodule AttentionServer.Relay do
            {:ok, ^revision} <- Engine.owner_revision(engine, person, key) do
         {:ok, with_hosted_label(session, :display_name, engine, person)}
       else
+        {:error, reason} when reason not in [:invalid_session, :forbidden] ->
+          {:error, :storage_unavailable}
+
         _ -> {:error, :invalid_session}
       end
 
