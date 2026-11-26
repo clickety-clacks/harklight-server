@@ -25,12 +25,13 @@ archive_name="harklight-server-$release_version-linux-x86_64.tar.gz"
 archive="$HARKLIGHT_ARCHIVE_PATH"
 sums="$HARKLIGHT_CHECKSUMS_PATH"
 guide="$HARKLIGHT_GUIDE_PATH"
-for command in chmod cmp date flock grep ln mkdir mktemp mv python3 readlink rm rmdir sed sleep systemctl tar; do
+for command in chmod cmp date flock grep install ln mkdir mktemp mv python3 readlink rm rmdir sed sleep systemctl tar; do
   command -v "$command" >/dev/null || fail "required host command is unavailable"
 done
 
 [[ -f "$archive" && -f "$sums" && -f "$guide" ]] || fail "selected release assets are unavailable"
 [[ -f "$package_root/BUILD_INFO" && -f "$package_root/SELF_HOST.md" ]] || fail "verified package metadata is unavailable"
+[[ -f "$package_root/bin/harklight-check-store" ]] || fail "verified store compatibility checker is unavailable"
 cmp -s "$package_root/SELF_HOST.md" "$guide" || fail "package guide differs from its release asset"
 
 python3 - "$archive" "$sums" "$archive_name" "$HARKLIGHT_ARCHIVE_SHA256" <<'PY'
@@ -298,6 +299,15 @@ rollback_failed_upgrade() {
     fail "upgrade failed: $cause; the candidate could not be confirmed stopped, so the pre-install backup was retained and no rollback was started; candidate writes since the backup were not restored and may still be changing; service state: $(service_condition)"
   fi
 
+  if ((switched)) && target_supports_auth; then
+    # The selected state is now the base for repair forward. Retire the
+    # interrupted-conversion pointer without changing that state or its backup.
+    if ! mv -T -- "$pending_backup" "$backup_final/PRESERVED_STATE"; then
+      fail "upgrade failed: $cause; the candidate is stopped and its state and backup were retained, but repair-forward bookkeeping could not be saved"
+    fi
+    fail "upgrade failed: $cause; the auth-capable candidate may have served; its package and latest state remain selected and stopped, and the pre-install backup was retained; install a compatible newer release to repair forward"
+  fi
+
   if ! restore_preinstall_root; then
     fail "upgrade failed: $cause; restoring the pre-install mutable root from the retained backup did not complete; the prior release was not started and the service remains stopped; the current root may be partial, and candidate writes since the backup may be retained or partially lost"
   fi
@@ -410,6 +420,42 @@ EOF
   staging=""
 fi
 
+target_supports_auth() {
+  grep -Eq '^auth_generation=[1-9][0-9]*$' "$target/BUILD_INFO"
+}
+
+check_target_store() {
+  python3 "$package_root/bin/harklight-check-store" "$state/relay.sqlite3" "$target/BUILD_INFO" "$@"
+}
+
+install_checked_launcher() {
+  local launcher="$root/bin/start-server"
+  local previous="$root/bin/start-server-unchecked"
+  [[ -f "$package_root/bin/harklight-start-server-checked" ]] || return 1
+
+  if [[ ! -e "$previous" ]]; then
+    install -m 755 "$launcher" "$previous" || return 1
+  fi
+
+  local staged
+  staged="$(mktemp -d "$root/bin/.checked-launcher.XXXXXX")" || return 1
+  if install -m 755 "$package_root/bin/harklight-check-store" "$staged/harklight-check-store" &&
+    install -m 755 "$package_root/bin/harklight-start-server-checked" "$staged/start-server" &&
+    mv -Tf -- "$staged/harklight-check-store" "$root/bin/harklight-check-store" &&
+    mv -Tf -- "$staged/start-server" "$launcher"; then
+    rmdir "$staged"
+  else
+    rm -rf -- "$staged"
+    return 1
+  fi
+}
+
+if ((switched)) || [[ "$current_tag" == "$HARKLIGHT_RELEASE_TAG" ]]; then
+  check_target_store || fail "selected release cannot start with the existing store"
+else
+  check_target_store --allow-conversion || fail "selected release cannot upgrade the existing store"
+fi
+
 if [[ -z "$backup_final" && "$current_tag" == "$HARKLIGHT_RELEASE_TAG" ]] &&
   install_info_matches "$target"; then
   if systemctl --user is-active --quiet "$unit"; then
@@ -484,6 +530,11 @@ if ! grep -Fqx "version=${current_tag#v}" "$current_path/BUILD_INFO"; then
 fi
 
 if [[ -z "$backup_final" ]]; then
+  if target_supports_auth &&
+    [[ -s "$state/relay.sqlite3-wal" || -s "$state/relay.sqlite3-journal" ]]; then
+    fail "the stopped store is not checkpointed; release was not switched"
+  fi
+
   backup_tmp="$(mktemp -d "$root/backups/.harklight-backup.XXXXXX")"
   backup_id="${backup_tmp##*.}"
   backup_final="$root/backups/$(date -u +%Y%m%dT%H%M%SZ)-$current_tag-to-$HARKLIGHT_RELEASE_TAG-$backup_id"
@@ -520,6 +571,14 @@ if ((!switched)); then
   if ! ATTENTION_SERVER_ENABLE=0 "$target/bin/harklight" store convert-stopped \
     "$state/relay.sqlite3" --from-release "$current_tag"; then
     rollback_failed_upgrade "stopped-store row conversion failed"
+  fi
+
+  if ! check_target_store; then
+    rollback_failed_upgrade "the converted store is incompatible with the selected release"
+  fi
+
+  if target_supports_auth && ! install_checked_launcher; then
+    rollback_failed_upgrade "could not install the managed store compatibility launcher"
   fi
 
   current_link="$root/.current-$HARKLIGHT_RELEASE_TAG.$$"

@@ -21,6 +21,7 @@ defmodule AttentionServer.ClientAPI.Errors do
     "invalid_field" => {400, false},
     "unsupported" => {400, false},
     "unauthorized" => {401, false},
+    "already_migrated" => {401, false},
     "forbidden" => {403, false},
     "recipient_refused" => {403, false},
     "account_paused" => {403, false},

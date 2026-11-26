@@ -35,6 +35,7 @@ defmodule AttentionServer.Store.KeyedWriterCoverageTest do
     {:track_relay_writes, 1} => :lifecycle,
     {:close, 1} => :lifecycle,
     {:enable_change_log, 1} => :side_table,
+    {:activate_auth, 3} => :keyed_writer,
     {:migrate_retained_client_data, 1} => :keyed_refused,
     {:commit, 3} => :keyed_writer,
     {:commit, 4} => :keyed_writer,
@@ -140,6 +141,7 @@ defmodule AttentionServer.Store.KeyedWriterCoverageTest do
       assert {:ok, reopened} = Store.open(path, :keyed)
       assert reopened.version == committed.version
       assert records(reopened.engine) == records(committed.engine)
+      assert reopened.auth_schema == committed.auth_schema
       assert :ok = Store.close(reopened)
     end
   end
@@ -269,6 +271,9 @@ defmodule AttentionServer.Store.KeyedWriterCoverageTest do
 
   defp writer_probes(id) do
     %{
+      {:activate_auth, 3} => fn store ->
+        store |> Store.track_relay_writes() |> Store.activate_auth(:self_hosted, [])
+      end,
       {:commit, 3} => fn store -> Store.commit(store, touched(store, proposal(store)), @audit) end,
       {:commit, 4} => fn store ->
         Store.commit(store, touched(store, proposal(store)), @audit, [])

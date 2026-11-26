@@ -45,7 +45,6 @@ defmodule AttentionServer.DashboardHTTPS do
       Supervisor.child_spec(
         {DashboardBrowserSession,
          relay: relay,
-         consume: fn token -> Relay.consume_browser_sign_in(relay, token) end,
          name: sessions_name},
         id: :dashboard_sessions
       ),
