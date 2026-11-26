@@ -18,12 +18,12 @@ Both features are off by default. Add the following to the self-hosted
 Server's private `server.env` and restart the Server:
 
 ```sh
-ATTENTION_SERVER_SHARED_MESSAGES=1
-ATTENTION_SERVER_GROUPS=1
+export ATTENTION_SERVER_SHARED_MESSAGES=1
+export ATTENTION_SERVER_GROUPS=1
 ```
 
-Set just `ATTENTION_SERVER_SHARED_MESSAGES=1` to enable shared messages to
-named people. On first enablement the existing local owners form the
+Use just `export ATTENTION_SERVER_SHARED_MESSAGES=1` to enable shared messages
+to named people. On first enablement the existing local owners form the
 default organization. Later owner changes to affiliation persist. With both
 settings unset, individual sends, Chat, replies, reminders and bounces
 continue as before. Installation leaves the private settings in place.

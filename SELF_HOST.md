@@ -143,10 +143,11 @@ set the device port with `--device-port` or `HARKLIGHT_DEVICE_PORT` when needed.
 New enrollments save the port.
 
 `ATTENTION_SERVER_DEPLOYMENT_MODE` defaults to `self_hosted`.
-Shared messaging is off by default. A self-hosted operator can enable it with
-`ATTENTION_SERVER_SHARED_MESSAGES=1` and can also enable groups with
-`ATTENTION_SERVER_GROUPS=1`. On first enablement, existing local owners form
-the default organization. Later owner-tool changes to affiliation persist.
+Shared messaging is off by default. In the private `server.env`, add
+`export ATTENTION_SERVER_SHARED_MESSAGES=1` to enable it and
+`export ATTENTION_SERVER_GROUPS=1` to enable groups as well. On first
+enablement, existing local owners form the default organization. Later
+owner-tool changes to affiliation persist.
 Hosted groups remain off until the Hosted component enables them after
 business membership and consent are ready.
 `ATTENTION_SERVER_UPLOAD_CAP_BYTES` defaults to `none` for self-hosting or may be
@@ -239,7 +240,7 @@ S1 is off by default. Before the first activation on a self-hosted Server:
    outside isolated App passkey acceptance.
 4. Start through the managed launcher. Use the packaged installer if switching
    releases. The first S1 start records the roster and auth generation 1 in
-   the existing FORMAT31 database. Later starts use the recorded roster.
+   the existing database. Later starts use the recorded roster.
    Removing the activation setting after that start leaves S1 active.
 
 Use the existing owner TLS connection to run `harklight owner sign-in-code`
