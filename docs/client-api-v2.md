@@ -426,8 +426,8 @@ or the recipient's setting is `"all"`.
   `before` entry. `before` is an `entry_id`. An upsert raises an entry's `rev`
   but never changes its `position`. Clients sort entries by `position` and
   version-gate them by `rev`.
-- `GET /v2/inbox` returns all items the person can see, including settled items,
-  in rank order. `next_page` is absent on the last page.
+- `GET /v2/inbox` pages through every item the person can see, including
+  settled items, in rank order. `next_page` is absent on the last page.
 - **Sections** are a closed list taken from the attention list order
   (`Placement.list_items`):
   - `current`: items still waiting on the person, in today's ranked or free
@@ -1179,7 +1179,7 @@ agents with existing data. Clients apply newer versions of each resource.
         "device_id": { "$ref": "#/$defs/OpaqueId" },
         "device_name": { "type": "string" },
         "kind": { "const": "browser", "description": "Present for a signed-in browser focus reporter." },
-        "screen": { "type": "string", "description": "Screen name, including inbox, fyi, message, chat, settings, signed_out and not_in_front." },
+        "screen": { "type": "string", "description": "Screen name, including `inbox`, `fyi`, `message`, `chat`, `settings`, `signed_out` and `not_in_front`." },
         "reported_at_ms": { "$ref": "#/$defs/TimeMs" },
         "in_front": { "type": "boolean" },
         "connected": { "type": "boolean" },

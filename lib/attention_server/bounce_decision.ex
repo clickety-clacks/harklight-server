@@ -833,7 +833,7 @@ defmodule AttentionServer.BounceDecision do
 
   defp item_advisory_text("soft_bounce", sub, at) do
     "The person had opened this message and had not acted on it when the server evaluated the bounce. " <>
-      "It remains in their inbox. This notice concerns revision #{sub}, using records available at #{at}."
+      "The message remains visible to them. This notice concerns revision #{sub}, using records available at #{at}."
   end
 
   defp default_answer_due?(record, now_ms) do
