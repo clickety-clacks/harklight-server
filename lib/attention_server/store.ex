@@ -1571,6 +1571,8 @@ defmodule AttentionServer.Store do
 
   defp local_dependents({:row, :persons, person}), do: [{:row, :conversation_highs, person}]
 
+  defp local_dependents({:row, :messages, key}), do: [{:row, :item_availability, key}]
+
   defp local_dependents({:row, :chat_read_positions, key}),
     do: [{:row, :reply_group_history, key}]
 

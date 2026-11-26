@@ -35,7 +35,7 @@ defmodule AttentionServer.Store.KeyedValidation do
 
   @pair_keys [:conversation_cursors, :cursors, :push_bindings, :sender_grants, :subscriptions]
   @ordered_keys [:events, :conversation_events]
-  @item_keys [:bounce_revisions, :chat_read_positions, :messages, :reply_group_history]
+  @item_keys [:bounce_revisions, :chat_read_positions, :item_availability, :messages, :reply_group_history]
   @actor_keys [:origin_sessions, :receipts, :source_report_grants]
   @origin_seq_keys [:origin_actions, :origin_receipts]
 
