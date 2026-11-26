@@ -9,10 +9,17 @@ subsequent rulings on organization affiliation, group posting and chat.
 Authenticated `GET /v2/me` uses the existing Me resource for person and Agent
 connections. `features.shared_messages` and `features.groups` are booleans.
 Omit an unavailable feature; absence means false. Groups require shared
-messages and use the same opt-in. Capable connections send
+messages and use the same opt-in. When shared messaging is available, Me
+adds `principal.organization_ids: OpaqueId[]`, the authenticated person's
+own affiliations only. There is no organization directory. Capable connections send
 `Harklight-Features: shared_messages` on each HTTP request, including SSE
-reconnects. Ordinary traffic does not need a header. A shared write on a
-compatible server without shared opt-in or activation returns
+reconnects. For person `GET /v2/changes` SSE only, EventSource may instead
+send `features=shared_messages&continuation=<opaque token>` with the
+existing `after`. Native Last-Event-ID retains precedence. Equivalent
+header and query values normalize together. Conflicting values or duplicate
+capability query parameters return `400 invalid_field`. JSON and other
+routes continue to use headers. An explicit opt-in when the feature is
+unavailable, or a shared write without opt-in, returns
 `400 unsupported`. Older servers reject the extra strict write members;
 clients check discovery before sending and report unsupported without trying
 an individual send. Disabled groups return 404 for group routes and selectors.
@@ -30,7 +37,8 @@ both its token and saved cursor, even though the legacy wire format still
 accepts bare numeric cursors.
 
 For an opted-in JSON batch or SSE connection, send the token in
-`Harklight-Continuation` with the existing `after` or `Last-Event-ID`.
+`Harklight-Continuation` (or the person SSE query form above) with the
+existing `after` or `Last-Event-ID`.
 On SSE the latter retains precedence. A missing, malformed, expired or
 scope-mismatched token, a position below that token’s baseline, or a
 shared token supplied without opt-in returns HTTP `410 cursor_expired`
@@ -60,7 +68,10 @@ person profiles to the existing person ID. Owner-authorized
 `PATCH /v2/me/profile` accepts exactly `{display_name:string,handle:string}`
 and returns the updated Me with `principal.profile`. Both strings are
 nonempty; handles use lowercase ASCII letters, digits, hyphens or underscores,
-with Server-wide uniqueness. Existing request-size limits apply. A legacy
+with Server-wide uniqueness. Each person has one handle per Server across
+all their organizations. Handle uniqueness establishes identity and grants
+no addressing authority; naming remains organization-scoped. Existing
+request-size limits apply. A legacy
 person may have a null handle and a Server-owned display fallback. Expose
 profiles only to the person and through authorized conversation projections.
 No global directory lookup is introduced.
@@ -70,7 +81,9 @@ No global directory lookup is introduced.
 An opted-in `POST /v2/agent/messages` extends SendMessageBody with:
 
 - `recipients` (required for this path),
-  `{kind:"people",people:[OpaqueId,...]}`. The people list is nonempty.
+  `{kind:"people",people:[OpaqueId,...],organization_id?:OpaqueId}`.
+  The people list is nonempty. These are person IDs, including in
+  `answer_policy.people`. Handles are not input selectors.
 - `answer_policy` (optional, requests only), one of `{kind:"first"}`,
   `{kind:"named",people:[OpaqueId,...]}`, or `{kind:"everyone"}`.
   Default to first for requests. A named policy has a nonempty list and
@@ -86,10 +99,13 @@ authenticated agent’s existing registration and send right for the sender ID
 authorize recipients when the sender and every recipient share one
 organization on that Server. Resolve and record one organization for each
 shared send, and check all affiliations in the send transaction. A send
-spanning multiple organizations is refused. If the sender and every named
-recipient share more than one possible organization, the Step 1 path
-refuses with the same typed error until an explicit organization selector
-is agreed. A group has exactly one organization.
+spanning multiple organizations is refused. If a named send omits organization_id and exactly one organization is
+common to the sender and all recipients, bind it. If several are common,
+return `409 organization_required` with `retryable:false` and
+`organization_ids: OpaqueId[]` listing only the common choices, in opaque
+ID order. The caller can retry with a chosen organization ID. If none are
+common, or a supplied organization is not common to all, return the
+atomic `403 recipient_refused`. A group has one canonical organization.
 Any unknown or out-of-organization recipient returns
 `403 recipient_refused` with the standard error fields and
 `retryable:false`. The entire send fails before delivery, message creation,
@@ -102,7 +118,7 @@ authoritative. A person may belong to several organizations. Over the
 authenticated Hosted loopback interface,
 `PUT /organizations/{business_ref}/members` accepts
 `{person_ids:[OpaqueId,...]}` and idempotently replaces accepted member and
-admin affiliations for that business. Hosted sends the full set after changes
+admin affiliations for that business. Affiliation never enrolls anyone into a group. Hosted sends the full set after changes
 and during reconciliation. `DELETE /organizations/{business_ref}` removes
 that business’s affiliations. Business type does not change affiliation;
 existing seat and entitlement rules still govern delivery. Without that affiliation, a Hosted person
@@ -114,8 +130,11 @@ The feature is available only where authoritative affiliation is enforced
 and the authenticated person belongs to an organization. Ineligible
 connections receive `400 unsupported` on shared sends. Legacy individual
 account boundaries remain. Removing affiliation immediately ends live access to that organization’s
-shared messages and groups and freezes existing authorized history through
-the removal transaction, using the same cutoff as group departure.
+shared messages and groups. Serialize the removal with shared writes and
+freeze authorized history, including files and Seen, through that cutoff.
+Block subsequent replies, answers and updates, cancel waiting pushes and
+future shared Shows, and emit only the local projection transition needed
+to make the frozen view read-only.
 
 With zero reached return `422 no_recipients` with the standard error envelope, retryable false, plus those outcomes for an
 explicit people selector. If a named decider is otherwise eligible but
@@ -129,7 +148,8 @@ array. Individual sends cannot supersede shared IDs. A shared result
 carries exactly `rev,message,recipients`, with no `supersedes_warnings`. Reuse
 the existing idempotency scope and receipt retention for Agent writes:
 same authenticated sender scope, key and digest returns the original
-committed result; a changed body is 409. Replay uses the original commit
+committed result, including the bound organization, without recomputing it;
+a changed body is 409. Replay uses the original commit
 even after membership changes. Current authentication and permission checks
 still apply. Never resolve a selector again to replay a committed success.
 
@@ -184,7 +204,8 @@ SharedItem = Item + {shared: {shared_id: OpaqueId, chat_writable: boolean,
              can_answer: boolean, answer_policy: AnswerPolicy | null,
              members: SharedMember[], answers: PersonAnswer[]}}
 SharedSentMessage = SentMessage + {shared: {shared_id: OpaqueId, chat_open: boolean,
-                    answer_policy: AnswerPolicy | null, answers: AgentAnswer[]}}
+                    answer_policy: AnswerPolicy | null, answers: AgentAnswer[],
+                    organization_id: OpaqueId}}
 SharedEntry = Entry + {shared_entry_id: OpaqueId, speaker: Speaker}
 SharedAgentEntry = AgentEntry + {shared_entry_id: OpaqueId, speaker: Speaker}
 PersonAnswerTerminal = Terminal + {answer_id: OpaqueId, speaker: Speaker,
@@ -264,13 +285,14 @@ Sender SentMessage after the answer:
 ```json
 {"item_id":"shared_a","rev":80,"sender":"example:release","revision":2,
  "message":{"title":"Launch date","created_at":100},"files":[],"seen":true,
- "shared":{"shared_id":"shared_a","answer_policy":{"kind":"first"},"chat_open":true,"answers":[]},
+ "shared":{"shared_id":"shared_a","answer_policy":{"kind":"first"},"chat_open":true,"answers":[],"organization_id":"org_a"},
  "terminal":{"state":"answered","at_ms":300,"answer":"thu","outcome":{"kind":"choice","id":"thu","label":"Thursday"},
    "answer_id":"answer_a","speaker":{"kind":"person","id":"person_d","display_name":"Dana","handle":"dana"}}}
 ```
 
 For shared sender projections `seen` means at least one active recipient
-has Seen the substantive revision. Answer and Seen event projections
+has Seen the substantive revision. Sender reads do not return a per-person
+Seen roster in Step 1; opt-in Seen events identify the person. Answer and Seen event projections
 identify their subject as specified below.
 
 ## Seen, answers and durable delivery
@@ -283,7 +305,10 @@ event on carry-forward or retry. Display both fields as null when unseen.
 Publish Seen changes to active person projections as item upserts. A carried receipt projects the current revision with the original timestamp. Read
 position is private to the viewing account and uses the existing write.
 Count unread chat from the sender and other people, excluding the current
-person's own words.
+person's own words. `chat.last_origin_reply`, `chat.reply_rank_key` and
+`chat.reply_group` retain the existing origin-only Replied semantics.
+An authorized read-position write may name the viewer's local entry_id for
+another person's visible reply in that same shared conversation.
 
 Serialize membership, current revision, eligibility and answer commit in
 one write. A stale revision receives the existing stale-request error.
@@ -305,7 +330,9 @@ by_this_person false. Both sides keep `shared.answers`. Later Chat changes
 neither projection. Chat close by itself ends Chat only. An eligible person joining an open request gains an obligation.
 Leaving ends an outstanding obligation and preserves the answer. Everyone mode may use an existing configured default to record an answer
 with a system speaker and the subject person ID. It settles only that subject.
-A default has by_this_person false. Defer shared automatic defaults in
+A default has by_this_person false and terminal outcome.kind default.
+Speaker identity and request_revision are fixed at event admission and
+retained across feed and pending recovery. Defer shared automatic defaults in
 first and named modes. No default may settle a named decider's obligation.
 Individual default behavior is preserved. Reminders
 and bounces use personal attention state and stop for settled obligations.
