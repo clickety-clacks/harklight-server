@@ -166,6 +166,25 @@ defmodule AttentionServer.Store do
   );
   """
 
+  def activate_auth(%__MODULE__{auth_schema: %{}} = store, _mode, _devices), do: {:ok, store}
+
+  def activate_auth(%__MODULE__{mode: :keyed, engine: engine} = store, mode, devices)
+      when mode in [:self_hosted, :saas] do
+    next = if mode == :self_hosted, do: Engine.replace_rows(engine, :browser_sign_ins, %{}), else: engine
+    audit = %{person: "system", actor: "schema_migration", action: "sign_in_s1", auth_activation: devices}
+
+    with {:ok, committed} <- commit(store, next, audit),
+         {:ok, %{} = schema} <- AuthSchema.read(committed.db) do
+      {:ok, %{committed | auth_schema: schema}}
+    else
+      {:error, reason, _store} -> {:error, reason}
+      {:error, _} = error -> error
+      _ -> {:error, :invalid_auth_schema}
+    end
+  end
+
+  def activate_auth(_store, _mode, _devices), do: {:error, :auth_requires_format31}
+
   @doc """
   Turns on the client API v2 change log for this durable store: creates its
   tables, reconciles it with the snapshot, and from then on writes its rows in
@@ -1196,7 +1215,8 @@ defmodule AttentionServer.Store do
 
     cond do
       MapSet.size(touched) > 0 or projected_entries != [] or
-          Map.has_key?(audit, :native_redemption) or Map.has_key?(audit, :app_receipt_capture) ->
+          Map.has_key?(audit, :native_redemption) or Map.has_key?(audit, :app_receipt_capture) or
+          Map.has_key?(audit, :auth_activation) ->
         commit_keyed(store, next, touched, audit, projected_entries)
 
       KeyedValidation.untouched_change(store.engine, next, touched) == :ok ->
@@ -1274,6 +1294,7 @@ defmodule AttentionServer.Store do
               with :ok <- DerivedIndex.write(db, derived),
                    :ok <- write_reference_delta(db, delete_paths, references),
                    :ok <- write_audit(db, audit),
+                   :ok <- write_auth_activation(db, prepared.engine, audit),
                    :ok <- write_auth_changes(db, audit),
                    {:ok, heads, agent_heads} <- append_change_logs(db, log, generation),
                    :ok <- DerivedIndex.advance(db, generation),
@@ -2043,6 +2064,13 @@ defmodule AttentionServer.Store do
       end
     end)
   end
+
+  defp write_auth_activation(db, engine, %{auth_activation: devices}) do
+    with {:ok, %{} = _schema} <- AuthSchema.initialize_in_transaction(db, engine, devices),
+         do: :ok
+  end
+
+  defp write_auth_activation(_db, _engine, _audit), do: :ok
 
   defp write_app_receipt(%{app_receipt_capture: capture}, store), do: capture.(store)
   defp write_app_receipt(_audit, _store), do: :ok

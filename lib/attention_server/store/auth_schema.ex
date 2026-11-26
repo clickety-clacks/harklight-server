@@ -36,12 +36,14 @@ defmodule AttentionServer.Store.AuthSchema do
   # This runs under the startup writer before the legacy receipt pruner or any
   # request can run. A restart must not import the later browser-only receipts.
   def initialize(db, engine \\ nil, devices \\ []) do
-    RecordTable.transaction(db, fn ->
-      case read(db) do
-        {:ok, nil} -> initialize_generation(db, engine, devices)
-        result -> result
-      end
-    end)
+    RecordTable.transaction(db, fn -> initialize_in_transaction(db, engine, devices) end)
+  end
+
+  def initialize_in_transaction(db, engine, devices) do
+    case read(db) do
+      {:ok, nil} -> initialize_generation(db, engine, devices)
+      result -> result
+    end
   end
 
   defp initialize_generation(db, engine, devices) do

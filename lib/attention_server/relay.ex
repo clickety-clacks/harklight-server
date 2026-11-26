@@ -628,8 +628,36 @@ defmodule AttentionServer.Relay do
 
   defp open_startup_store(opts) do
     case Store.open_relay(Keyword.get(opts, :store_path)) do
-      {:ok, store} -> enable_change_log(Store.track_relay_writes(store), opts)
+      {:ok, store} -> initialize_store(Store.track_relay_writes(store), opts)
       {:error, reason} -> {:error, startup_reason(opts, :store_open_failed, reason)}
+    end
+  end
+
+  defp initialize_store(store, opts) do
+    result =
+      if Keyword.get(opts, :sign_in_s1, false) do
+        mode = Keyword.get(opts, :deployment_mode, :self_hosted)
+        devices = Keyword.get(opts, :auth_migration_devices, [])
+
+        cond do
+          mode == :saas and devices != [] ->
+            {:error, :hosted_auth_migration_not_supported}
+
+          Enum.uniq(devices) != devices ->
+            {:error, :duplicate_auth_migration_device}
+
+          true ->
+            Store.activate_auth(store, mode, devices)
+        end
+      else
+        {:ok, store}
+      end
+
+    case result do
+      {:ok, ready} -> enable_change_log(ready, opts)
+      {:error, reason} ->
+        Store.close(store)
+        {:error, startup_reason(opts, :store_initialization_failed, {:storage_unavailable, reason})}
     end
   end
 
