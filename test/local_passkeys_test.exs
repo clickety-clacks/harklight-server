@@ -61,6 +61,22 @@ defmodule AttentionServer.LocalPasskeysTest do
              DashboardBrowserSession.resolve(sessions, redeemed.resp_cookies["__Host-harklight"].value)
     assert %{status: 401} = post(dashboard, "/sign-in/passkey/finish", valid)
     assert {:ok, ["owner_code"]} = Relay.native_sign_in_methods(relay)
+    verifier = AttentionServer.BrowserAuth.new_secret()
+    assert {:ok, transaction} = Relay.create_native_transaction(relay, AttentionServer.DeviceProof.digest(verifier))
+    assert %{status: 401} = post(dashboard, "/sign-in/passkey/options", %{"transaction" => transaction})
+    :ok = GenServer.stop(sessions)
+    :ok = GenServer.stop(relay)
+
+    {:ok, restarted} = Relay.start_link(store_path: path, native_passkeys: true, dashboard_origin: @origin)
+    new_backend = %{backend | relay: restarted}
+    new_dashboard = DashboardReadHTTP.init(backend: {DashboardBackend, new_backend}, skill_path: __ENV__.file, expected_origin: @origin)
+    assert {:ok, ["owner_code", "passkey"]} = Relay.native_sign_in_methods(restarted)
+    assert %{status: 200} = options = post(new_dashboard, "/sign-in/passkey/options", %{"transaction" => transaction})
+    assert %{"reference" => reference, "publicKey" => %{"challenge" => challenge}} = body(options)
+    native = assertion(%{request | "reference" => reference}, data, private, challenge, @origin)
+    assert %{status: 200} = approved = post(new_dashboard, "/sign-in/passkey/finish", native)
+    assert body(approved) == %{"transaction" => transaction}
+    refute Map.has_key?(approved.resp_cookies, "__Host-harklight")
   end
 
   defp assertion(request, auth, private, challenge, origin) do

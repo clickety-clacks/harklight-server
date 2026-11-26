@@ -102,6 +102,7 @@ defmodule AttentionServer.Server do
         push_enabled: false,
         deployment_mode: deployment_mode,
         sign_in_s1: Keyword.get(opts, :sign_in_s1, false),
+        native_passkeys: Keyword.get(opts, :native_passkeys, false),
         auth_migration_devices: Keyword.get(opts, :auth_migration_devices, []),
         jev_endpoint: Keyword.get(opts, :jev_endpoint),
         jev_model: Keyword.get(opts, :jev_model),

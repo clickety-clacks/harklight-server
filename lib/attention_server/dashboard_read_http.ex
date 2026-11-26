@@ -130,7 +130,8 @@ defmodule AttentionServer.DashboardReadHTTP do
 
       conn.method == "GET" and conn.request_path == "/sign-in" ->
         if local_code_available?(opts) do
-          conn |> put_resp_content_type("text/html", "utf-8") |> send_resp(200, LocalSignInPage.html())
+          {:ok, methods} = backend_call(opts.backend, :local_methods, nil)
+          conn |> put_resp_content_type("text/html", "utf-8") |> send_resp(200, LocalSignInPage.html("passkey" in methods))
         else
           sign_in_page(conn, opts)
         end
@@ -1392,8 +1393,8 @@ defmodule AttentionServer.DashboardReadHTTP do
   end
 
   defp local_code_available?(%{hosted: false, backend: {module, _}} = opts) do
-    Code.ensure_loaded?(module) and function_exported?(module, :local_code_available, 2) and
-      backend_call(opts.backend, :local_code_available, nil) == true
+    Code.ensure_loaded?(module) and function_exported?(module, :local_methods, 2) and
+      match?({:ok, ["owner_code" | _]}, backend_call(opts.backend, :local_methods, nil))
   end
 
   defp local_code_available?(_opts), do: false
@@ -1413,6 +1414,9 @@ defmodule AttentionServer.DashboardReadHTTP do
         case backend_call(opts.backend, :local_passkey, {operation, payload}) do
           {:ok, %{cookie: cookie, method: method}} ->
             conn |> BrowserAuth.put_cookie(cookie, true) |> send_levels_json(%{"method" => method}, 200)
+
+          {:ok, %{transaction: reference}} ->
+            send_levels_json(conn, %{"transaction" => reference}, 200)
 
           {:ok, result} ->
             send_levels_json(conn, result, 200)

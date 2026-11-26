@@ -12,6 +12,8 @@ machine names and user identifiers out of this register.
 
 | `ATTENTION_SERVER_SIGN_IN_S1=1` | Activate durable sign-in before the Server accepts traffic. A store already activated retains its auth generation on restart. | Harklight Server maintainers | wi_a080b661-df8a-414c-89f6-7fd006746149 | Off | After the S1 release is accepted and the gate is removed |
 
+| `ATTENTION_SERVER_NATIVE_PASSKEYS=1` | Offer passkey sign-in in app sheets. Use only in an isolated acceptance fixture until the supported real-phone flow is verified. | Harklight Server maintainers | wi_a080b661-df8a-414c-89f6-7fd006746149 | Off | After the supported App passkey paths are accepted |
+
 The whole-server `ATTENTION_SERVER_ENABLE` startup switch and permanent operator
 configuration are not temporary feature flags. This register does not declare
 flags for unmerged work; authors add actual flags with their implementation.

@@ -159,6 +159,7 @@ if System.get_env("ATTENTION_SERVER_ENABLE") == "1" do
     feature_flags_path: System.get_env("ATTENTION_SERVER_FEATURE_FLAGS_PATH"),
     upload_cap: upload_cap,
     sign_in_s1: System.get_env("ATTENTION_SERVER_SIGN_IN_S1") == "1",
+    native_passkeys: System.get_env("ATTENTION_SERVER_NATIVE_PASSKEYS") == "1",
     auth_migration_devices:
       System.get_env("ATTENTION_SERVER_AUTH_MIGRATION_DEVICES", "")
       |> String.split(",", trim: true)

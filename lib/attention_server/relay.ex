@@ -590,6 +590,7 @@ defmodule AttentionServer.Relay do
               sender_names: Keyword.get(opts, :sender_names, %{}),
               join_configuration: Keyword.get(opts, :join_configuration),
               dashboard_origin: Keyword.get(opts, :dashboard_origin),
+              native_passkeys: Keyword.get(opts, :native_passkeys, false),
               hosted_test_account: Keyword.get(opts, :hosted_test_account),
               deployment_mode: Keyword.get(opts, :deployment_mode, :self_hosted),
               upload_cap: Keyword.get(opts, :upload_cap, :none)
@@ -1633,6 +1634,12 @@ defmodule AttentionServer.Relay do
         {%{}, :saas} -> {:ok, ~w(google apple email_code)}
         {%{}, :self_hosted} -> {:ok, ~w(owner_code)}
         _ -> {:error, :disabled}
+      end
+
+    methods =
+      case methods do
+        {:ok, available} when state.native_passkeys -> {:ok, available ++ ["passkey"]}
+        result -> result
       end
 
     {:reply, methods, state}
@@ -4546,11 +4553,18 @@ defmodule AttentionServer.Relay do
 
   defp put_push_revision(_store, _claim), do: {:error, :storage_unavailable}
 
-  defp local_passkey_operation(state, :assertion_options, _request),
-    do: LocalPasskeys.assertion_options(state.store.db, state.dashboard_origin, state.clock.())
+  defp local_passkey_operation(state, :assertion_options, request) do
+    transaction = Map.get(request, "transaction")
+
+    if is_nil(transaction) or state.native_passkeys do
+      LocalPasskeys.assertion_options(state.store.db, state.dashboard_origin, transaction, state.clock.())
+    else
+      {:error, :invalid_passkey}
+    end
+  end
 
   defp local_passkey_operation(state, :assertion_finish, request),
-    do: LocalPasskeys.authenticate(state.store.db, state.store.engine, request, state.clock.())
+    do: LocalPasskeys.authenticate(state.store.db, state.store.engine, request, state.clock.(), state.native_passkeys)
 
   defp local_passkey_operation(state, operation, {cookie, request})
        when operation in [:registration_options, :registration_finish] and is_binary(cookie) do

@@ -73,6 +73,19 @@ defmodule AttentionServer.NativeSignIn do
 
   def authorize_local_code(db, ref, person, now), do: authorize(db, ref, person, "owner_code", now)
 
+  def authorize_local_passkey(db, ref, person, now), do: authorize(db, ref, person, "passkey", now)
+
+  def pending_transaction?(db, reference, now) do
+    case RecordTable.select(
+           db,
+           "SELECT 1 FROM harklight_native_transactions WHERE transaction_id = ? AND expires_ms > ? AND person_id IS NULL",
+           [reference, now]
+         ) do
+      {:ok, [[1]]} -> true
+      _ -> false
+    end
+  end
+
   defp authorize(db, ref, person, method, now) when is_binary(ref) and byte_size(ref) == 43 do
     with :ok <-
            RecordTable.run(

@@ -3,7 +3,7 @@ defmodule AttentionServer.LocalSignInPage do
 
   alias AttentionServer.DashboardBrand
 
-  def html do
+  def html(native_passkeys?) do
     """
     <!doctype html>
     <html lang="en">
@@ -33,7 +33,7 @@ defmodule AttentionServer.LocalSignInPage do
           <label for="code">One-time code <span id="last-used" hidden>Last used</span></label>
           <input id="code" name="code" autocomplete="one-time-code" autocapitalize="characters" maxlength="32" required>
           <button type="submit">Sign in</button>
-          <button type="button" id="use-passkey">Use a passkey <span id="passkey-last-used" hidden>Last used</span></button>
+          <button type="button" id="use-passkey" data-native="#{native_passkeys?}">Use a passkey <span id="passkey-last-used" hidden>Last used</span></button>
           <div class="preferences">
             <label><input type="checkbox" id="remember-method"> Remember my sign-in preference on this device</label>
             <button type="button" id="use-preference">Use my remembered preference</button>
@@ -65,7 +65,7 @@ defmodule AttentionServer.LocalSignInPage do
 
     if (appReturn) {
       document.querySelector(".preferences").hidden = true;
-      passkey.hidden = true;
+      passkey.hidden = passkey.dataset.native !== "true";
     }
 
     preference.addEventListener("click", () => {
@@ -168,6 +168,9 @@ defmodule AttentionServer.LocalSignInPage do
       const registration = document.getElementById("create-passkey");
       const button = registration || document.getElementById("use-passkey");
       const status = document.getElementById("sign-in-status");
+      const query = new URLSearchParams(location.search);
+      const appReturn = !registration && query.get("return") === "app";
+      const transaction = appReturn ? query.get("transaction") : null;
 
       const decode = value => {
         const base64 = value.replace(/-/g, "+").replace(/_/g, "/");
@@ -192,11 +195,15 @@ defmodule AttentionServer.LocalSignInPage do
 
       if (button && !window.PublicKeyCredential) button.hidden = true;
       if (button) button.addEventListener("click", async () => {
+        if (appReturn && !transaction) {
+          status.textContent = "Return to the app and start sign-in again.";
+          return;
+        }
         button.disabled = true;
         status.textContent = "";
         const path = registration ? "/devices/passkey" : "/sign-in/passkey";
         try {
-          const {reference, publicKey} = await post(path + "/options", {});
+          const {reference, publicKey} = await post(path + "/options", transaction ? {transaction} : {});
           publicKey.challenge = decode(publicKey.challenge);
 
           let credential;
@@ -222,6 +229,8 @@ defmodule AttentionServer.LocalSignInPage do
           const result = await post(path + "/finish", payload);
           if (registration && result.registered) {
             status.textContent = "Passkey saved.";
+          } else if (transaction && result.transaction === transaction) {
+            location.replace("harklight://sign-in?transaction=" + encodeURIComponent(transaction));
           } else if (result.method === "passkey") {
             button.dispatchEvent(new CustomEvent("harklight-passkey-complete"));
           }
