@@ -1047,7 +1047,7 @@ defmodule AttentionServer.Engine do
     with {:ok, _} <- owner_revision(engine, person, owner_key),
          %{person: ^person, revoked: false} = agent <- Map.get(engine.agents, key),
          true <- expected_revision == agent.grant_revision,
-         true <- AgentAccess.valid_patterns?(read) and AgentAccess.valid_patterns?(respond) do
+         true <- AgentAccess.grantable_patterns?(read) and AgentAccess.grantable_patterns?(respond) do
       next_revision = agent.grant_revision + 1
       read_set = MapSet.new(read)
       respond_set = MapSet.new(respond)
@@ -1648,7 +1648,7 @@ defmodule AttentionServer.Engine do
   def owner_revoke_sender(%__MODULE__{} = engine, person, owner_key, device_key, pattern) do
     with {:ok, _revision} <- owner_revision(engine, person, owner_key),
          %{person: ^person} <- Map.get(engine.devices, device_key),
-         true <- Message.sender_id?(pattern) and pattern != @hosted_notice_sender do
+         true <- Message.sender_id?(pattern) do
       grants = Map.get(engine.sender_grants, {person, device_key}, MapSet.new())
 
       if MapSet.member?(grants, pattern) do
@@ -1786,7 +1786,7 @@ defmodule AttentionServer.Engine do
 
   def setup_sender(%__MODULE__{} = engine, key, pattern) do
     with {:ok, %{person: person}} <- principal(engine, key),
-         true <- Message.sender_id?(pattern) do
+         true <- Message.sender_id?(pattern) and pattern != @hosted_notice_sender do
       grants =
         Map.update(
           engine.sender_grants,

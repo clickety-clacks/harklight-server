@@ -166,7 +166,10 @@ same key and content for the same person returns the original item ID with
 `"created":false`. Keys are independent across people. Changed content for an
 existing key returns `409`. Invalid input returns `400`, oversized requests
 return `413`, and an unknown person returns `404`. Delivery uses the normal
-attention-based delivery and push behavior for an FYI.
+attention-based delivery and push behavior for an FYI. An unopened notice can
+full-bounce without producing a sender advisory. The system sender is reserved
+and its notices are visible to the recipient's clients. Agents cannot read
+these notices or receive grants for the system sender.
 
 ### Hosted inbox prioritization
 

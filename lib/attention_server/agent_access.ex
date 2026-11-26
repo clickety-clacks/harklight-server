@@ -12,9 +12,15 @@ defmodule AttentionServer.AgentAccess do
     is_list(patterns) and length(patterns) <= 100 and
       length(Enum.uniq(patterns)) == length(patterns) and
       Enum.all?(patterns, fn pattern ->
-        Message.sender_id?(pattern) and pattern != @hosted_notice_sender
+        Message.sender_id?(pattern)
       end)
   end
+
+  def grantable_patterns?(patterns),
+    do: valid_patterns?(patterns) and @hosted_notice_sender not in patterns
+
+  def visible_sender?(%{kind: :agent}, @hosted_notice_sender), do: false
+  def visible_sender?(_principal, _sender), do: true
 
   def allowed?(_patterns, @hosted_notice_sender), do: false
 

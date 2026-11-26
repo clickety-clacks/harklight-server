@@ -723,6 +723,66 @@ defmodule AttentionServer.HostedAccountTest do
                })
     end
 
+    test "agents cannot read, search for, or receive grants for the system sender", %{
+      port: port,
+      server: server
+    } do
+      relay = Server.relay(server)
+      sender = AttentionServer.Message.hosted_notice_sender()
+      agent_key = String.duplicate("a", 64)
+
+      assert {200, %{"person_id" => person}} =
+               post(port, "/accounts", %{"account_ref" => "notice-agent"})
+
+      assert {200, %{"item_id" => item_id}} =
+               post(port, "/persons/#{person}/notices", %{
+                 "title" => "Trial ending",
+                 "body" => "Your trial expires soon.",
+                 "key" => "trial"
+               })
+
+      owner = Engine.hosted_owner_key(relay_engine(relay), person)
+      assert :ok = Relay.owner_register_agent(relay, person, owner, relay_op(311), agent_key)
+
+      assert {:error, :stale_or_invalid_grant} =
+               Relay.owner_replace_agent_grants(relay, person, owner, agent_key, 1, [sender], [])
+
+      assert {:error, :stale_or_invalid_grant} =
+               Relay.owner_replace_agent_grants(relay, person, owner, agent_key, 1, [], [sender])
+
+      assert :ok =
+               Relay.owner_replace_agent_grants(
+                 relay,
+                 person,
+                 owner,
+                 agent_key,
+                 1,
+                 ["app:harklight/"],
+                 ["app:harklight/"]
+               )
+
+      assert {:error, :forbidden} =
+               Engine.client_agent_answer_scope(relay_engine(relay), agent_key, sender)
+
+      agent = %{kind: :agent, person: person, key: agent_key}
+      assert {:ok, %{"items" => []}} = ClientAPI.Reads.inbox(relay, agent)
+      assert {:error, :not_found} = ClientAPI.Reads.item(relay, agent, item_id)
+      assert {:error, :not_found} = ClientAPI.Reads.entries(relay, agent, item_id)
+      assert {:error, :not_found} = ClientAPI.Reads.revision(relay, agent, item_id, "1")
+
+      ctx = %ClientAPI.Context{principal: agent, relay: relay, request_id: "notice-search"}
+      search = ClientAPI.Reads.get_search(Plug.Test.conn(:get, "/v2/search"), ctx)
+      assert search.status == 200
+      assert {:ok, %{"items" => []}} = JSON.decode_line(search.resp_body <> "\n")
+
+      conn = Plug.Test.conn(:get, "/v2/search?" <> URI.encode_query(%{"sender" => sender}))
+      assert ClientAPI.Reads.get_search(conn, ctx).status == 400
+
+      assert {:ok, changes, false, _} = ClientAPI.FeedStep.read(relay, agent, 0, 100)
+      refute inspect(changes) =~ sender
+      refute inspect(changes) =~ "Trial ending"
+    end
+
     test "Hosted algorithm requests cannot override Server settings", %{server: server} do
       relay = Server.relay(server)
       assert {:ok, person} = Relay.hosted_account_create(relay, "acct-priority")
