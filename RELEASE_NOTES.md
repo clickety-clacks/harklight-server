@@ -50,7 +50,8 @@ Use the packaged release installer and its checked launcher. The installer
 stops the service and takes a complete private-root backup before switching
 packages. The stopped SQLite store must be checkpointed. The relay format
 stays FORMAT31. On first S1 activation the Server adds sign-in tables and
-records minimum auth generation 1 in the same database.
+records minimum auth generation 1 in the same database. If you installed
+the package earlier with S1 off, take a fresh stopped backup before enabling it.
 
 A direct launch of v0.2.31 can open the upgraded FORMAT31 store, but it ignores
 the S1 auth tables and cannot enforce its sessions or certificate denials.
