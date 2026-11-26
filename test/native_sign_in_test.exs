@@ -185,13 +185,14 @@ defmodule AttentionServer.NativeSignInTest do
     assert {:error, :already_migrated} = Relay.redeem_native_transaction(relay, unused_request)
   end
 
-  test "local owner codes are one-use and late RSA proof reattaches the same active recipient",
+  test "late RSA proof replaces the certificate of an off-roster recipient with sender grants",
        %{tmp_dir: dir} do
     origin = "https://local.example.test"
     path = Path.join(dir, "local.sqlite3")
     opts = [store_path: path, deployment_mode: :self_hosted, dashboard_origin: origin]
     person = "00000000-0000-4000-8000-000000000001"
     owner = String.duplicate("a", 64)
+    other_sender = String.duplicate("f", 64)
     private = Path.join(dir, "legacy.pem")
     public = Path.join(dir, "legacy.der")
     assert {_, 0} = System.cmd("openssl", ["genpkey", "-algorithm", "RSA", "-pkeyopt", "rsa_keygen_bits:2048", "-out", private], stderr_to_stdout: true)
@@ -203,15 +204,16 @@ defmodule AttentionServer.NativeSignInTest do
     store = Store.track_relay_writes(store)
     {:ok, engine} = Engine.operator_bootstrap(store.engine, person, owner)
     {:ok, engine} = Engine.setup_device(engine, person, device)
+    {:ok, engine} = Engine.setup_device(engine, person, other_sender)
+    {:ok, engine} = Engine.setup_sender(engine, device, "app:fixture")
+    {:ok, engine} = Engine.setup_sender(engine, other_sender, "app:fixture")
     {:ok, store} = Store.commit(store, engine, %{person: person, actor: owner, action: "fixture"})
-    assert {:ok, %{minimum_generation: 1}} = AuthSchema.initialize(store.db, store.engine, [device])
+    assert {:ok, %{minimum_generation: 1}} = AuthSchema.initialize(store.db, store.engine, [])
     :ok = Store.close(store)
 
     {:ok, relay} = Relay.start_link(opts)
-    {:ok, browser} = DashboardBrowserSession.start_link(relay: relay)
-    backend = %DashboardBackend{relay: relay, sessions: browser, configured_owner_person: person}
-    dashboard = DashboardReadHTTP.init(backend: {DashboardBackend, backend}, skill_path: __ENV__.file, expected_origin: origin)
-    router = Router.init(relay: relay, auth: {:browser, {DashboardBackend, backend}, origin})
+    {browser, dashboard, router} = local_routes(relay, person, origin)
+    assert {:ok, ^person} = Relay.certificate_device_person(relay, device)
 
     assert {:ok, %{"code" => browser_code}} = Relay.owner_sign_in_code(relay, person, owner)
     browser_request =
@@ -232,6 +234,13 @@ defmodule AttentionServer.NativeSignInTest do
     assert %{"old_device" => "attached", "device_id" => ^device, "duplicate" => true} = json(retry)
     assert {:error, :unauthorized} = Relay.certificate_device_person(relay, device)
 
+    :ok = GenServer.stop(browser)
+    :ok = GenServer.stop(relay)
+    {:ok, relay} = Relay.start_link(opts)
+    {_browser, dashboard, router} = local_routes(relay, person, origin)
+    assert {:error, :unauthorized} = Relay.certificate_device_person(relay, device)
+    assert {:ok, ^person} = Relay.certificate_device_person(relay, other_sender)
+
     device_request =
       Plug.Test.conn(:get, "/v2/me")
       |> Plug.Conn.put_req_header("authorization", "Bearer " <> bearer)
@@ -250,6 +259,7 @@ defmodule AttentionServer.NativeSignInTest do
 
     assert remove.status == 303
     assert Router.call(device_request, router).status == 401
+    assert {:error, :unauthorized} = Relay.certificate_device_person(relay, device)
 
     {removed, _bearer} = late_request(relay, dashboard, dir, person, owner, device, der)
     response = post("/v2/auth/sign-in", removed) |> Router.call(router)
@@ -261,6 +271,16 @@ defmodule AttentionServer.NativeSignInTest do
     response = post("/v2/auth/sign-in", unknown) |> Router.call(router)
     assert %{"old_device" => "unknown", "device_id" => fresh} = json(response)
     refute fresh in [device, replacement]
+  end
+
+  defp local_routes(relay, person, origin) do
+    {:ok, browser} = DashboardBrowserSession.start_link(relay: relay)
+    backend = {DashboardBackend, %DashboardBackend{relay: relay, sessions: browser, configured_owner_person: person}}
+
+    dashboard =
+      DashboardReadHTTP.init(backend: backend, skill_path: __ENV__.file, expected_origin: origin)
+
+    {browser, dashboard, Router.init(relay: relay, auth: {:browser, backend, origin})}
   end
 
   defp late_request(relay, dashboard, dir, person, owner, device, der) do

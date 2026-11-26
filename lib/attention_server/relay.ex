@@ -4155,7 +4155,9 @@ defmodule AttentionServer.Relay do
         # The published Agent CLI enrolled as a device and received sender grants.
         # A phone on the migration roster follows its phase even if it has grants.
         grants = Map.get(engine.sender_grants, {person, key}, MapSet.new())
-        MapSet.size(grants) > 0
+        # Off-roster recovery commits a native session. Removing that session also revokes
+        # the device or atomically replaces the session, so the certificate cannot return.
+        MapSet.size(grants) > 0 and NativeSignIn.device_session_hash(db, key) == {:ok, nil}
 
       _ ->
         false
