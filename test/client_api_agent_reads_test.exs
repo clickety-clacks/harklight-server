@@ -2040,6 +2040,10 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
       assert BounceDecision.next_deadline(state.store.engine) == at + 43_200_000
       assert is_reference(state.bounce_deadline_timer)
 
+      # The settings fixture commits directly, outside Relay's rank publication.
+      send(ctx.relay, :retry_client_ranks)
+      :sys.get_state(ctx.relay)
+
       if unquote(scenario) == :unopened do
         response =
           request(ctx, "a1", "POST", "/v2/agent/messages/#{id}/replies", %{"text" => "Context"}, 19)
