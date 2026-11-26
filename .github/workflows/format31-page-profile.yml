@@ -1,0 +1,92 @@
+name: FORMAT31 one-runner 50,000-message read profile
+
+on:
+  push:
+    branches: [server/format31-page-profile]
+
+permissions:
+  contents: read
+
+jobs:
+  measure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 115
+    env:
+      ATTENTION_SERVER_ENABLE: '0'
+      MIX_ENV: prod
+      ERL_FLAGS: '+S 2:2 +SDcpu 1 +SDio 1'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: '27.3.3'
+          elixir-version: '1.19.5'
+          version-type: strict
+      - name: Build the candidate package
+        run: |
+          mix deps.get --only prod
+          mix release attention_server --path "$RUNNER_TEMP/candidate"
+          install -m 755 scripts/harklight "$RUNNER_TEMP/candidate/bin/harklight"
+      - name: Prepare and, for the candidate, convert the synthetic store
+        env:
+          SHAPE: "50000 500000 1300 0 400"
+        run: |
+          results="$RUNNER_TEMP/measurements"
+          mkdir -p "$results" "$RUNNER_TEMP/prior"
+          git rev-parse HEAD HEAD^ > "$results/commits.txt"
+          awk '/^(MemTotal|MemAvailable):/' /proc/meminfo > "$results/capacity.txt"
+          reference="$(git log -1 --format=%ct 8cefff7880b0e96b5d75e6e2ed5e387714c44e0e)"
+          probe="$GITHUB_WORKSPACE/scripts/format31-rehearsal.exs"
+          fixture="$RUNNER_TEMP/fixture"
+          archive=harklight-server-0.2.18-linux-x86_64.tar.gz
+          (
+            cd "$RUNNER_TEMP/prior"
+            release=https://github.com/clickety-clacks/harklight-server/releases/download/v0.2.18
+            curl --fail --silent --show-error --location --retry 3 --remote-name "$release/$archive"
+            curl --fail --silent --show-error --location --retry 3 --remote-name "$release/SHA256SUMS"
+            sha256sum --check --ignore-missing SHA256SUMS
+            tar -zxf "$archive"
+          ) > "$results/prior-package.log" 2>&1
+          prior="$RUNNER_TEMP/prior/harklight-server-0.2.18-linux-x86_64/bin/attention_server"
+          run_isolated() {
+            sudo systemd-run --quiet --wait --pipe --collect \
+              --property=MemoryMax=14G --property=MemorySwapMax=0 --property=PrivateNetwork=yes \
+              --uid="$(id -u)" --working-directory="$GITHUB_WORKSPACE" \
+              /usr/bin/env ATTENTION_SERVER_ENABLE=0 "ERL_FLAGS=$ERL_FLAGS" \
+              "HARKLIGHT_FIXTURE_EPOCH_SECONDS=$reference" "HARKLIGHT_FIXTURE=$fixture" \
+              "HARKLIGHT_PROBE=$probe" "HARKLIGHT_SHAPE=$SHAPE" "$@"
+          }
+          run_isolated timeout --kill-after=30s 20m "$prior" eval \
+            'System.argv(["seed", System.fetch_env!("HARKLIGHT_FIXTURE") | String.split(System.fetch_env!("HARKLIGHT_SHAPE"))]); Code.require_file(System.fetch_env!("HARKLIGHT_PROBE"))' \
+            > "$results/seed.log" 2>&1
+          cp -a "$fixture" "$RUNNER_TEMP/converted"
+          run_isolated /usr/bin/time -f 'elapsed_s=%e maximum_rss_kib=%M' timeout --kill-after=30s 18m \
+            "$RUNNER_TEMP/candidate/bin/harklight" store convert-stopped "$RUNNER_TEMP/converted/relay.sqlite3" --from-release v0.2.18 \
+            > "$results/conversion.log" 2>&1
+          grep -F 'Converted stopped Harklight store to FORMAT31' "$results/conversion.log"
+          awk -F: '/model name/ {print $2; exit}' /proc/cpuinfo > "$results/cpu.txt"
+      - name: Compare the two fresh processes on the same runner
+        run: |
+          results="$RUNNER_TEMP/measurements"
+          prior="$RUNNER_TEMP/prior/harklight-server-0.2.18-linux-x86_64/bin/attention_server"
+          measure() {
+            local runtime="$1" fixture="$2" log="$3"
+            sudo systemd-run --quiet --wait --pipe --collect \
+              --property=MemoryMax=14G --property=MemorySwapMax=0 --property=PrivateNetwork=yes \
+              --uid="$(id -u)" --working-directory="$GITHUB_WORKSPACE" \
+              /usr/bin/env ATTENTION_SERVER_ENABLE=0 "ERL_FLAGS=$ERL_FLAGS" \
+              "HARKLIGHT_FIXTURE=$fixture" "HARKLIGHT_PROBE=$GITHUB_WORKSPACE/scripts/format31-rehearsal.exs" \
+              timeout --kill-after=30s 50m "$runtime" eval \
+              'System.argv(["measure-pages", System.fetch_env!("HARKLIGHT_FIXTURE")]); Code.require_file(System.fetch_env!("HARKLIGHT_PROBE"))' \
+              > "$log" 2>&1
+          }
+          measure "$RUNNER_TEMP/candidate/bin/attention_server" "$RUNNER_TEMP/converted" "$results/candidate.log"
+          measure "$prior" "$RUNNER_TEMP/fixture" "$results/prior.log"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: format31-one-runner-C-page-profile
+          path: ${{ runner.temp }}/measurements/

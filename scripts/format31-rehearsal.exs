@@ -1,7 +1,7 @@
 # Run in a fresh BEAM with ATTENTION_SERVER_ENABLE=0. All inputs are synthetic.
 defmodule Format31Rehearsal do
   alias AttentionServer.{BounceDecision, BouncePolicy, Engine, JSON, Relay, Store}
-  alias AttentionServer.ClientAPI.{AgentWrites, Idempotency, Reads}
+  alias AttentionServer.ClientAPI.Reads
   alias Exqlite.Sqlite3
 
   @person "format31-rehearsal"
@@ -22,7 +22,8 @@ defmodule Format31Rehearsal do
     {:ok, engine} = Engine.setup_device(engine, @person, @origin)
     {:ok, engine} = Engine.setup_device(engine, @person, @reader)
     {:ok, engine} = Engine.setup_sender(engine, @origin, @sender)
-    now = System.system_time(:millisecond) - 7 * 86_400_000
+    reference = System.fetch_env!("HARKLIGHT_FIXTURE_EPOCH_SECONDS") |> String.to_integer()
+    now = reference * 1_000 - 7 * 86_400_000
 
     {:ok, engine} = Engine.set_jev_connection(engine, "https://127.0.0.1:1/v1/systemone", "synthetic")
     {:ok, engine} = Engine.set_algorithm_choice(engine, @person, "jev-set")
@@ -162,12 +163,15 @@ defmodule Format31Rehearsal do
     :ok = Sqlite3.close(db)
   end
 
-  def run(["measure", dir]) do
+  def run(["measure-pages", dir]) do
     synthetic!(dir)
     key_path = Path.join(dir, "synthetic-jev")
     File.write!(key_path, "synthetic-rehearsal-offline")
     System.put_env("ATTENTION_SERVER_JEV_KEY_PATH", key_path)
     evaluator = fn request -> {:ok, Map.new(request.candidates, &{&1, 0.9})} end
+
+    started = System.monotonic_time(:millisecond)
+    startup_sampler = spawn_link(fn -> sample_startup(started, 0) end)
 
     {micros, {:ok, relay}} =
       :timer.tc(fn -> Relay.start_link(store_path: path(dir), name: @relay, priority_evaluator: evaluator) end)
@@ -175,18 +179,64 @@ defmodule Format31Rehearsal do
     report(:startup_return, %{elapsed_us: micros, memory: memory()})
     Process.sleep(30_000)
     report(:startup_30s, %{memory: memory()})
-    await_quiet_startup(relay, System.monotonic_time(:millisecond) + 600_000)
+    started_at = System.monotonic_time(:millisecond)
+    await_quiet_startup(relay, started_at + 3_900_000, started_at)
     Process.sleep(2_000)
+    send(startup_sampler, :finish)
     report(:startup_rest, %{memory: memory()})
 
-    {inbox_us, {:ok, _}} = :timer.tc(fn -> Reads.inbox(relay, @reader, %{"limit" => "50"}) end)
-    {replied_us, :ok} = :timer.tc(fn -> first_reply(relay, %{"limit" => "50"}) end)
-    report(:view_latency_us, %{inbox: inbox_us, first_replied_page: replied_us})
-    measure_sends(relay)
+    views =
+      for _ <- 1..31 do
+        {inbox_us, {:ok, _}} = :timer.tc(fn -> Reads.inbox(relay, @reader, %{"limit" => "50"}) end)
+        {replied_us, :ok} = :timer.tc(fn -> first_reply(relay, %{"limit" => "50"}) end)
+        %{inbox: inbox_us, first_replied_page: replied_us}
+      end
+
+    report(:view_latency_first_us, hd(views))
+    report(:view_latency_samples_us, views)
+    medians = Map.new([:inbox, :first_replied_page], fn field ->
+      samples = Enum.map(views, &Map.fetch!(&1, field))
+      {field, samples |> Enum.sort() |> Enum.at(div(length(samples), 2))}
+    end)
+    report(:view_latency_median_us, medians)
+    profile_page_reads(relay)
     :ok = GenServer.stop(relay, :normal, 60_000)
   end
 
-  defp await_quiet_startup(relay, deadline) do
+  defp sample_startup(started, last_peak) do
+    receive do
+      :finish -> :ok
+    after
+      500 ->
+        %{"VmHWM" => peak, "VmRSS" => rss} = memory()
+
+        last_peak =
+          if peak >= last_peak + 64 * 1024 * 1024 do
+            frames =
+              case Process.whereis(@relay) do
+                nil -> []
+                pid ->
+                  case Process.info(pid, :current_stacktrace) do
+                    {:current_stacktrace, frames} ->
+                      for {mod, name, args, _} <- Enum.take(frames, 8) do
+                        {mod, name, if(is_list(args), do: length(args), else: args)}
+                      end
+                    nil -> []
+                  end
+              end
+
+            report(:startup_high_water, %{elapsed_ms: System.monotonic_time(:millisecond) - started,
+              peak_bytes: peak, rss_bytes: rss, frames: frames})
+            peak
+          else
+            last_peak
+          end
+
+        sample_startup(started, last_peak)
+    end
+  end
+
+  defp await_quiet_startup(relay, deadline, next_sample) do
     observer = self()
 
     try do
@@ -213,12 +263,22 @@ defmodule Format31Rehearsal do
         report(:startup_drained, pending)
 
       {:startup_pending, pending} ->
-        if System.monotonic_time(:millisecond) >= deadline do
+        now = System.monotonic_time(:millisecond)
+
+        if now >= deadline do
           raise "synthetic startup still has pending work: #{inspect(pending)}"
         end
 
-        Process.sleep(500)
-        await_quiet_startup(relay, deadline)
+        next_sample =
+          if now >= next_sample do
+            report(:startup_draining, %{pending: pending, memory: memory()})
+            now + 120_000
+          else
+            next_sample
+          end
+
+        Process.sleep(1_000)
+        await_quiet_startup(relay, deadline, next_sample)
     after
       5_000 -> raise "synthetic startup sample was not received"
     end
@@ -323,33 +383,40 @@ defmodule Format31Rehearsal do
     {next, result}
   end
 
-  defp measure_sends(relay) do
-    times =
-      for i <- 1..5 do
-        op = uuid(9_000_000 + i)
-        principal = %{kind: :device, person: @person, key: @origin}
-        body = %{
-          "sender" => @sender,
-          "session" => uuid(1),
-          "message" => %{
-            "title" => "Ordinary synthetic send #{i}",
-            "body" => "Confirm the next follow-up and reply with the status.",
-            "created_at" => System.system_time(:millisecond)
-          }
-        }
-        digest = Idempotency.digest("POST", ["v2", "agent", "messages"], body)
-        input = {principal, :send, %{}, op, digest, nil, body}
-        {micros, {:ok, 200, _, false}} = :timer.tc(fn ->
-          GenServer.call(relay, {:client_api, AgentWrites, {:execute, input, op, []}}, :infinity)
-        end)
-        report(:ordinary_send_us, micros)
+  defp profile_page_reads(relay) do
+    alias AttentionServer.ChangeLog
+    alias AttentionServer.ClientAPI.Resources
 
-        micros
+    targets = [
+      {Reads, :handle_call, 3},
+      {Reads, :head, 2},
+      {Reads, :render_item, 4},
+      {Reads, :render_item_at_revision, 5},
+      {ChangeLog, :rank_page, 4},
+      {ChangeLog, :rev, 3},
+      {ChangeLog, :page_revisions, 3},
+      {Resources, :item, 3},
+      {Resources, :render, 3}
+    ]
+
+    trace = :trace.session_create(:format31_page_profile, self(), [])
+
+    try do
+      for target <- targets, do: :trace.function(trace, target, true, [:call_time])
+      :trace.process(trace, relay, true, [:call])
+      for _ <- 1..31, do: {:ok, _} = Reads.inbox(relay, @reader, %{"limit" => "50"})
+
+      for target <- targets do
+        case :trace.info(trace, target, :call_time) do
+          {:call_time, [{^relay, calls, secs, us}]} ->
+            report(:page_call_time, %{mfa: target, calls: calls, micros: secs * 1_000_000 + us})
+          _ -> :ok
+        end
       end
-    report(:ordinary_send_median_us, Enum.sort(times) |> Enum.at(2))
-
+    after
+      :trace.session_destroy(trace)
+    end
   end
-
 
   defp report(label, data), do: IO.puts("#{label} #{inspect(data, width: :infinity)}")
 end
