@@ -206,6 +206,7 @@ defmodule AttentionServer.DashboardReadHTTP do
       opaque ->
         case backend_call(opts.backend, :resolve_session, opaque) do
           {:ok, principal} -> route(conn, opts, principal)
+          {:error, :storage_unavailable} -> send_resp(conn, 503, "Session unavailable")
           _ -> no_session(conn, opts)
         end
     end

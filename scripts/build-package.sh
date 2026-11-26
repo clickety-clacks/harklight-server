@@ -6,7 +6,7 @@ if [[ "$(uname -s)" != Linux || "$(uname -m)" != x86_64 ]]; then
   echo "This package supports Linux x86_64; build on the declared target." >&2
   exit 2
 fi
-version=0.2.30
+version=0.2.31
 dist_dir="$repo_dir/dist"
 if [[ $# -gt 0 ]]; then dist_dir=$1; fi
 mkdir -p "$dist_dir"
@@ -20,6 +20,8 @@ mix release attention_server --path "$stage/$name" --overwrite
 install -m 755 scripts/harklight "$stage/$name/bin/harklight"
 install -m 755 scripts/bootstrap.sh "$stage/$name/bin/harklight-bootstrap"
 install -m 755 scripts/install-release.sh "$stage/$name/bin/harklight-release-install"
+install -m 755 scripts/check-store-compatibility.py "$stage/$name/bin/harklight-check-store"
+install -m 755 scripts/start-server-checked.sh "$stage/$name/bin/harklight-start-server-checked"
 install -m 644 SELF_HOST.md "$stage/$name/SELF_HOST.md"
 install -m 644 GUIDED_JOIN.md "$stage/$name/GUIDED_JOIN.md"
 "$repo_dir/scripts/build-skills.sh" "$stage/$name/skills"
@@ -36,6 +38,7 @@ for application in "$stage/$name"/lib/*; do
 done
 {
   printf 'product=Harklight Server\nversion=%s\n' "$version"
+  printf 'relay_store_format=31\nauth_generation=0\n'
   printf 'source_commit=%s\n' "$(git rev-parse HEAD)"
   printf 'source_status=%s\n' "$(git status --porcelain)"
   printf 'build_system=%s\n' "$(uname -srvmo)"

@@ -79,7 +79,7 @@ defmodule AttentionServer.ClientAPI.Auth do
   `backend` is the web origin's dashboard backend (`{module, context}` or a
   module), which resolves the sign-in cookie.
   """
-  @spec browser(Plug.Conn.t(), term()) :: {:ok, Principal.t()} | {:error, :unauthorized}
+  @spec browser(Plug.Conn.t(), term()) :: {:ok, Principal.t()} | {:error, :unauthorized | :unavailable}
   def browser(conn, backend) do
     conn = Plug.Conn.fetch_cookies(conn)
 
@@ -96,6 +96,7 @@ defmodule AttentionServer.ClientAPI.Auth do
          owner_revision: revision
        }}
     else
+      {:error, :storage_unavailable} -> {:error, :unavailable}
       _ -> {:error, :unauthorized}
     end
   rescue

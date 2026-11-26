@@ -105,6 +105,7 @@ defmodule AttentionServer.DashboardBrowserSession do
       _ when is_binary(session_hash) ->
         case Relay.browser_session(state.relay, session_hash) do
           {:ok, session} -> {:ok, session_hash, session, state}
+          {:error, :storage_unavailable} -> {:error, :storage_unavailable, state}
           _ -> {:error, :invalid_session, state}
         end
 
