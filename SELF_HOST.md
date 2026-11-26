@@ -171,6 +171,11 @@ full-bounce without producing a sender advisory. The system sender is reserved
 and its notices are visible to the recipient's clients. Agents cannot read
 these notices or receive grants for the system sender.
 
+**FORMAT31 rollback.** Once this Server writes a hosted notice, earlier
+FORMAT31 builds cannot open the store. Rolling back to one of those builds
+requires restoring the complete pre-upgrade backup and loses all writes made
+after that backup.
+
 ### Hosted attention list prioritization
 
 For a Server running in `saas` mode, set these variables in its private
