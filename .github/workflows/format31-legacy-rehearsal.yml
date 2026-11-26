@@ -1,0 +1,46 @@
+name: Historical FORMAT30 record rehearsal
+
+on:
+  push:
+    branches: [server/format31-legacy-rehearsal]
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      ATTENTION_SERVER_ENABLE: '0'
+      MIX_ENV: prod
+      ERL_FLAGS: '+S 2:2 +SDcpu 1 +SDio 1'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: '27.3.3'
+          elixir-version: '1.19.5'
+          version-type: strict
+      - name: Build and verify the exact implementation package
+        run: |
+          results="$RUNNER_TEMP/legacy-results"
+          mkdir -p "$results/candidate-dist"
+          cp scripts/format31-legacy-fixture.exs scripts/format31-legacy-rehearsal.sh "$RUNNER_TEMP/"
+          git checkout --detach HEAD^
+          git rev-parse HEAD > "$results/implementation.txt"
+          scripts/build-package.sh "$results/candidate-dist" > "$results/build.log" 2>&1
+          (cd "$results/candidate-dist" && sha256sum --check SHA256SUMS) > "$results/package-check.txt"
+          cp "$results/candidate-dist/SHA256SUMS" "$results/package-sums.txt"
+      - name: Reproduce the failure, then convert and restart from the same fixture
+        run: bash "$RUNNER_TEMP/format31-legacy-rehearsal.sh" | tee "$RUNNER_TEMP/legacy-results/rehearsal.log"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: format31-legacy-rehearsal
+          path: |
+            ${{ runner.temp }}/legacy-results/*.txt
+            ${{ runner.temp }}/legacy-results/*.log
