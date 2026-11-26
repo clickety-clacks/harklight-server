@@ -37,19 +37,23 @@ defmodule AttentionServer.CLI.StoreConversion do
     :ok = CLI.start_application!()
 
     with true <- File.regular?(path),
-         {:ok, budget} <- ConversionCapacity.read(Path.expand(path)),
-         {:ok, result} <- Store.convert_stopped(path, budget, expected_format) do
-      case result do
-        :converted -> IO.puts("Converted stopped Harklight store to FORMAT31.")
-        :already_converted -> IO.puts("The stopped Harklight store already uses FORMAT31.")
-      end
+         {:ok, budget} <- ConversionCapacity.read(Path.expand(path)) do
+      convert_store(path, budget, expected_format)
     else
       false -> CLI.error!("The stopped Harklight store file is missing.")
-      {:error, {:fit_not_established, _, _, _} = failure} ->
-        CLI.error!(fit_failure(failure))
       {:error, {:fit_not_established, :measurement_unavailable, field}} ->
-        label = @measurement_labels[field] || elem(Map.fetch!(@shape_labels, field), 0)
-        CLI.error!("Conversion fit not established. Could not measure #{label}. Keep the stopped-store backup.")
+        CLI.error!(measurement_failure(field))
+    end
+  end
+
+  defp convert_store(path, budget, expected_format) do
+    case Store.convert_stopped(path, budget, expected_format) do
+      {:ok, :converted} -> IO.puts("Converted stopped Harklight store to FORMAT31.")
+      {:ok, :already_converted} -> IO.puts("The stopped Harklight store already uses FORMAT31.")
+      {:error, {:fit_not_established, _, _, _} = failure} ->
+        CLI.error!(with_effective_memory(fit_failure(failure), budget.memory))
+      {:error, {:fit_not_established, :measurement_unavailable, field}} ->
+        CLI.error!(with_effective_memory(measurement_failure(field), budget.memory))
       {:error, :source_format_mismatch} ->
         CLI.error!("The store format differs from the verified previous release. The store was left unchanged.")
       {:error, :unsupported_snapshot} ->
@@ -58,6 +62,14 @@ defmodule AttentionServer.CLI.StoreConversion do
         CLI.error!("Could not convert the stopped Harklight store. Keep the stopped-store backup and check the storage diagnostics.")
     end
   end
+
+  defp measurement_failure(field) do
+    label = @measurement_labels[field] || elem(Map.fetch!(@shape_labels, field), 0)
+    "Conversion fit not established. Could not measure #{label}. Keep the stopped-store backup."
+  end
+
+  defp with_effective_memory(message, bytes),
+    do: message <> " Effective available memory after host and cgroup limits is #{bytes} bytes."
 
   defp fit_failure({:fit_not_established, field, needed, available}) when is_map_key(@capacity_labels, field) do
     label = Map.fetch!(@capacity_labels, field)
