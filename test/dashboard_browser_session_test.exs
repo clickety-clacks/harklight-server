@@ -57,6 +57,41 @@ defmodule AttentionServer.DashboardBrowserSessionTest do
     def end_session(browser, cookie), do: DashboardBrowserSession.end_session(browser, cookie)
   end
 
+  defmodule UnavailableSessionBackend do
+    def resolve_session(_context, _cookie), do: {:error, :storage_unavailable}
+
+    def end_session(context, cookie) do
+      send(context, {:attempted_delete, cookie})
+      {:error, :storage_unavailable}
+    end
+  end
+
+  test "sign-out attempts durable deletion and keeps the cookie when deletion fails" do
+    origin = "https://account.example.test"
+
+    opts =
+      DashboardReadHTTP.init(
+        backend: {UnavailableSessionBackend, self()},
+        skill_path: __ENV__.file,
+        hosted: true,
+        expected_origin: origin
+      )
+
+    response =
+      Plug.Test.conn(:post, "/sign-out", "confirm=sign_out")
+      |> Map.put(:scheme, :https)
+      |> Map.put(:port, 443)
+      |> Plug.Conn.put_req_header("origin", origin)
+      |> Plug.Conn.put_req_header("content-type", "application/x-www-form-urlencoded")
+      |> Plug.Conn.put_req_header("cookie", "__Host-harklight=durable")
+      |> DashboardReadHTTP.call(opts)
+
+    assert_received {:attempted_delete, "durable"}
+    assert response.status == 503
+    assert Plug.Conn.get_resp_header(response, "location") == []
+    refute Map.has_key?(response.resp_cookies, "__Host-harklight")
+  end
+
   for state <- [:valid, :missing, :revoked] do
     @tag sign_out_state: state
     test "hosted sign-out with #{state} cookie checks the form and completes logout",
