@@ -254,14 +254,13 @@ defmodule AttentionServer.LargeData do
   defp index_rows(_value, _path, index), do: index
 
   @doc false
+  def attach_paths(term, directory, []) when is_binary(directory) do
+    {:ok, walk_refs(term, &%{&1 | path: Path.join(directory, &1.id)})}
+  end
+
   def attach_paths(term, directory, rows) when is_binary(directory) and is_list(rows) do
     with {:ok, references} <- references_by_path(rows, directory) do
-      engine =
-        term
-        |> attach_reference_markers([], references)
-        |> walk_refs(&%{&1 | path: Path.join(directory, &1.id)})
-
-      {:ok, engine}
+      {:ok, attach_reference_markers(term, [], {references, directory})}
     end
   end
 
@@ -1238,46 +1237,52 @@ defmodule AttentionServer.LargeData do
   defp reference_marker(%Ref{id: id, size: size}),
     do: @persisted_ref_prefix <> id <> "; bytes=" <> Integer.to_string(size) <> "]"
 
-  defp attach_reference_markers(%Ref{} = ref, _path, _references), do: ref
+  defp attach_reference_markers(%Ref{} = ref, _path, {_references, directory}),
+    do: %{ref | path: Path.join(directory, ref.id)}
 
-  defp attach_reference_markers(value, path, references) when is_binary(value) do
+  defp attach_reference_markers(<<@persisted_ref_prefix, _::binary>> = value, path, {references, _}) do
     case Map.get(references, path_key(path)) do
       {^value, ref} -> ref
       _ -> value
     end
   end
 
-  defp attach_reference_markers(value, path, references) when is_map(value) do
-    {module, fields} =
-      if is_struct(value), do: {value.__struct__, Map.from_struct(value)}, else: {nil, value}
+  defp attach_reference_markers(value, path, context) when is_map(value) do
+    :maps.fold(
+      fn key, child, acc ->
+        mapped = attach_reference_markers(child, [{:map, key} | path], context)
+        if mapped === child, do: acc, else: Map.put(acc, key, mapped)
+      end,
+      value,
+      value
+    )
+  end
 
+  defp attach_reference_markers(value, path, context) when is_list(value) do
     mapped =
-      Map.new(fields, fn {key, child} ->
-        {key, attach_reference_markers(child, [{:map, key} | path], references)}
+      value
+      |> Enum.with_index()
+      |> Enum.map(fn {child, index} ->
+        attach_reference_markers(child, [{:list, index} | path], context)
       end)
 
-    if module, do: struct(module, mapped), else: mapped
+    if mapped === value, do: value, else: mapped
   end
 
-  defp attach_reference_markers(value, path, references) when is_list(value) do
-    value
-    |> Enum.with_index()
-    |> Enum.map(fn {child, index} ->
-      attach_reference_markers(child, [{:list, index} | path], references)
-    end)
+  defp attach_reference_markers(value, path, context) when is_tuple(value) do
+    mapped =
+      value
+      |> Tuple.to_list()
+      |> Enum.with_index()
+      |> Enum.map(fn {child, index} ->
+        attach_reference_markers(child, [{:tuple, index} | path], context)
+      end)
+      |> List.to_tuple()
+
+    if mapped === value, do: value, else: mapped
   end
 
-  defp attach_reference_markers(value, path, references) when is_tuple(value) do
-    value
-    |> Tuple.to_list()
-    |> Enum.with_index()
-    |> Enum.map(fn {child, index} ->
-      attach_reference_markers(child, [{:tuple, index} | path], references)
-    end)
-    |> List.to_tuple()
-  end
-
-  defp attach_reference_markers(value, _path, _references), do: value
+  defp attach_reference_markers(value, _path, _context), do: value
 
   defp references_by_path(rows, directory) do
     Enum.reduce_while(rows, {:ok, %{}}, fn
