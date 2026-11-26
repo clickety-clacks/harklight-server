@@ -243,6 +243,9 @@ defmodule AttentionServer.Relay do
     do: GenServer.call(server, {:device_remove, verified_key}, :infinity)
 
   # Only cleanup TLS admission uses this retained identity; it grants no relay access.
+  def legacy_device_enrollment?(server),
+    do: GenServer.call(server, :legacy_device_enrollment?, :infinity)
+
   def removal_identity(server, key),
     do: GenServer.call(server, {:removal_identity, key}, :infinity)
 
@@ -1901,15 +1904,11 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  defp dispatch_call({:removal_identity, key}, _from, state) do
-    reply =
-      case Map.get(state.store.engine.devices, key) do
-        %{person: person} -> {:ok, person}
-        _ -> {:error, :not_found}
-      end
+  defp dispatch_call(:legacy_device_enrollment?, _from, state),
+    do: {:reply, is_nil(state.store.auth_schema), state}
 
-    {:reply, reply, state}
-  end
+  defp dispatch_call({:removal_identity, key}, _from, state),
+    do: {:reply, legacy_removal_identity(state, key), state}
 
   defp dispatch_call({:client_devices, principal, operation}, _from, state) do
     with %Store{auth_schema: %{}} <- state.store,
@@ -1922,32 +1921,31 @@ defmodule AttentionServer.Relay do
   end
 
   defp dispatch_call({:device_remove, key}, _from, state) do
-    case Engine.device_remove(state.store.engine, key) do
-      {:ok, next, reply} ->
-        next = revoke_origin_sessions(next, reply["person_id"], key)
+    with {:ok, _person} <- legacy_removal_identity(state, key),
+         {:ok, next, reply} <- Engine.device_remove(state.store.engine, key) do
+      next = revoke_origin_sessions(next, reply["person_id"], key)
 
-        case commit_device_removal(
-               state,
-               next,
-               reply["person_id"],
-               key,
-               key,
-               "device_self_remove"
-             ) do
-          {:ok, next} ->
-            next = remove_focus_device(next, key, reply["person_id"])
-            {:reply, {:ok, reply}, next}
+      case commit_device_removal(
+             state,
+             next,
+             reply["person_id"],
+             key,
+             key,
+             "device_self_remove"
+           ) do
+        {:ok, next} ->
+          next = remove_focus_device(next, key, reply["person_id"])
+          {:reply, {:ok, reply}, next}
 
-          {:error, _, next, :committed} ->
-            next = remove_focus_device(next, key, reply["person_id"])
-            {:reply, {:error, :storage_unavailable}, next}
+        {:error, _, next, :committed} ->
+          next = remove_focus_device(next, key, reply["person_id"])
+          {:reply, {:error, :storage_unavailable}, next}
 
-          {:error, _, _, :not_committed} ->
-            {:reply, {:error, :storage_unavailable}, state}
-        end
-
-      error ->
-        {:reply, error, state}
+        {:error, _, _, :not_committed} ->
+          {:reply, {:error, :storage_unavailable}, state}
+      end
+    else
+      error -> {:reply, error, state}
     end
   end
 
@@ -4139,6 +4137,21 @@ defmodule AttentionServer.Relay do
 
       _ ->
         engine
+    end
+  end
+
+  defp legacy_removal_identity(state, key) do
+    case {state.deployment_mode, state.store.auth_schema, state.store.engine.devices[key]} do
+      {_, nil, %{person: person}} ->
+        {:ok, person}
+
+      {:self_hosted, %{device_certificates_disabled: false}, %{person: person, revoked: false}} ->
+        if DeviceMigration.eligible?(state.store.db, person, key),
+          do: {:ok, person},
+          else: {:error, :not_found}
+
+      _ ->
+        {:error, :not_found}
     end
   end
 

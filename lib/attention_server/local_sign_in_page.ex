@@ -164,74 +164,76 @@ defmodule AttentionServer.LocalSignInPage do
 
   def passkey_script do
     ~S"""
-    const registration = document.getElementById("create-passkey");
-    const button = registration || document.getElementById("use-passkey");
-    const status = document.getElementById("sign-in-status");
+    (() => {
+      const registration = document.getElementById("create-passkey");
+      const button = registration || document.getElementById("use-passkey");
+      const status = document.getElementById("sign-in-status");
 
-    const decode = value => {
-      const base64 = value.replace(/-/g, "+").replace(/_/g, "/");
-      return Uint8Array.from(atob(base64), byte => byte.charCodeAt(0));
-    };
+      const decode = value => {
+        const base64 = value.replace(/-/g, "+").replace(/_/g, "/");
+        return Uint8Array.from(atob(base64), byte => byte.charCodeAt(0));
+      };
 
-    const encode = buffer => {
-      let bytes = "";
-      for (const byte of new Uint8Array(buffer)) bytes += String.fromCharCode(byte);
-      return btoa(bytes).replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
-    };
+      const encode = buffer => {
+        let bytes = "";
+        for (const byte of new Uint8Array(buffer)) bytes += String.fromCharCode(byte);
+        return btoa(bytes).replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
+      };
 
-    const post = async (path, body) => {
-      const response = await fetch(path, {
-        method: "POST",
-        headers: {"content-type": "application/json"},
-        body: JSON.stringify(body)
+      const post = async (path, body) => {
+        const response = await fetch(path, {
+          method: "POST",
+          headers: {"content-type": "application/json"},
+          body: JSON.stringify(body)
+        });
+        if (!response.ok) throw new Error("Passkey request was refused");
+        return response.json();
+      };
+
+      if (button && !window.PublicKeyCredential) button.hidden = true;
+      if (button) button.addEventListener("click", async () => {
+        button.disabled = true;
+        status.textContent = "";
+        const path = registration ? "/devices/passkey" : "/sign-in/passkey";
+        try {
+          const {reference, publicKey} = await post(path + "/options", {});
+          publicKey.challenge = decode(publicKey.challenge);
+
+          let credential;
+          if (registration) {
+            publicKey.user.id = decode(publicKey.user.id);
+            credential = await navigator.credentials.create({publicKey});
+          } else {
+            credential = await navigator.credentials.get({publicKey});
+          }
+
+          const payload = {
+            reference,
+            client_data: encode(credential.response.clientDataJSON)
+          };
+          if (registration) {
+            payload.attestation = encode(credential.response.attestationObject);
+          } else {
+            payload.credential_id = encode(credential.rawId);
+            payload.authenticator_data = encode(credential.response.authenticatorData);
+            payload.signature = encode(credential.response.signature);
+          }
+
+          const result = await post(path + "/finish", payload);
+          if (registration && result.registered) {
+            status.textContent = "Passkey saved.";
+          } else if (result.method === "passkey") {
+            button.dispatchEvent(new CustomEvent("harklight-passkey-complete"));
+          }
+        } catch (_) {
+          status.textContent = registration
+            ? "Passkey setup could not be completed."
+            : "Passkey sign-in could not be completed. You can use a one-time code.";
+        } finally {
+          button.disabled = false;
+        }
       });
-      if (!response.ok) throw new Error("Passkey request was refused");
-      return response.json();
-    };
-
-    if (button && !window.PublicKeyCredential) button.hidden = true;
-    if (button) button.addEventListener("click", async () => {
-      button.disabled = true;
-      status.textContent = "";
-      const path = registration ? "/devices/passkey" : "/sign-in/passkey";
-      try {
-        const {reference, publicKey} = await post(path + "/options", {});
-        publicKey.challenge = decode(publicKey.challenge);
-
-        let credential;
-        if (registration) {
-          publicKey.user.id = decode(publicKey.user.id);
-          credential = await navigator.credentials.create({publicKey});
-        } else {
-          credential = await navigator.credentials.get({publicKey});
-        }
-
-        const payload = {
-          reference,
-          client_data: encode(credential.response.clientDataJSON)
-        };
-        if (registration) {
-          payload.attestation = encode(credential.response.attestationObject);
-        } else {
-          payload.credential_id = encode(credential.rawId);
-          payload.authenticator_data = encode(credential.response.authenticatorData);
-          payload.signature = encode(credential.response.signature);
-        }
-
-        const result = await post(path + "/finish", payload);
-        if (registration && result.registered) {
-          status.textContent = "Passkey saved.";
-        } else if (result.method === "passkey") {
-          button.dispatchEvent(new CustomEvent("harklight-passkey-complete"));
-        }
-      } catch (_) {
-        status.textContent = registration
-          ? "Passkey setup could not be completed."
-          : "Passkey sign-in could not be completed. You can use a one-time code.";
-      } finally {
-        button.disabled = false;
-      }
-    });
+    })();
     """
   end
 

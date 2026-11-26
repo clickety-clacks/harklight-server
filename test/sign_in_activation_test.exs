@@ -3,6 +3,7 @@ defmodule AttentionServer.SignInActivationTest do
 
   alias AttentionServer.{Engine, Relay, Store}
   alias AttentionServer.Store.AuthSchema
+  alias Exqlite.Sqlite3
 
   @moduletag :tmp_dir
   @person "00000000-0000-4000-8000-000000000001"
@@ -51,5 +52,17 @@ defmodule AttentionServer.SignInActivationTest do
     {:ok, restarted} = Relay.start_link(options)
     assert {:ok, ["owner_code"]} = Relay.native_sign_in_methods(restarted)
     assert {:error, :unauthorized} = Relay.certificate_device_person(restarted, @other)
+    refute Relay.legacy_device_enrollment?(restarted)
+    assert {:ok, @person} = Relay.removal_identity(restarted, @overlap)
+    :ok = GenServer.stop(restarted)
+
+    {:ok, db} = Sqlite3.open(path)
+    assert :ok = Sqlite3.execute(db, "UPDATE harklight_auth_schema SET device_certificates_disabled = 1")
+    :ok = Sqlite3.close(db)
+    {:ok, denied} = Relay.start_link(options)
+    assert {:error, :unauthorized} = Relay.certificate_device_person(denied, @overlap)
+    assert {:error, :not_found} = Relay.removal_identity(denied, @overlap)
+    assert {:error, :not_found} = Relay.device_remove(denied, @overlap)
+    refute Relay.legacy_device_enrollment?(denied)
   end
 end
