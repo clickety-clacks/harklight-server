@@ -1195,7 +1195,8 @@ defmodule AttentionServer.Store do
     projected_entries = if store.change_log, do: projected_entries, else: []
 
     cond do
-      MapSet.size(touched) > 0 or projected_entries != [] or Map.has_key?(audit, :native_redemption) ->
+      MapSet.size(touched) > 0 or projected_entries != [] or
+          Map.has_key?(audit, :native_redemption) or Map.has_key?(audit, :app_receipt_capture) ->
         commit_keyed(store, next, touched, audit, projected_entries)
 
       KeyedValidation.untouched_change(store.engine, next, touched) == :ok ->
@@ -1275,7 +1276,8 @@ defmodule AttentionServer.Store do
                    :ok <- write_audit(db, audit),
                    :ok <- write_auth_changes(db, audit),
                    {:ok, heads, agent_heads} <- append_change_logs(db, log, generation),
-                   :ok <- DerivedIndex.advance(db, generation) do
+                   :ok <- DerivedIndex.advance(db, generation),
+                   :ok <- write_app_receipt(audit, %{store | engine: prepared.engine, version: generation}) do
                 {:ok, {heads, agent_heads}}
               end
             end)
@@ -2041,6 +2043,9 @@ defmodule AttentionServer.Store do
       end
     end)
   end
+
+  defp write_app_receipt(%{app_receipt_capture: capture}, store), do: capture.(store)
+  defp write_app_receipt(_audit, _store), do: :ok
 
   defp write_auth_changes(db, %{person: person, actor: owner, browser_session: {hash, revision, issuer}}),
     do: BrowserAuth.add_session(db, hash, person, owner, revision, issuer)

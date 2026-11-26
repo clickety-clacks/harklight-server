@@ -498,8 +498,8 @@ defmodule AttentionServer.Relay do
   end
 
   @doc false
-  def apply_client_command(server, key, command, sources),
-    do: GenServer.call(server, {:client_command, key, command, sources}, :infinity)
+  def apply_client_command(server, key, command, sources, durable \\ nil),
+    do: GenServer.call(server, {:client_command, key, command, sources, durable}, :infinity)
 
   @doc false
   def push_server_id(server), do: GenServer.call(server, :push_server_id, :infinity)
@@ -921,16 +921,19 @@ defmodule AttentionServer.Relay do
   end
 
   defp dispatch_call(
-         {:client_command, key, command, sources},
+         {:client_command, key, command, sources, durable},
          _from,
          state
        ) do
     with {:ok, person} <- Engine.authorized_person(state.store.engine, key),
+         {:ok, nil} <- before_app_command(state, durable),
          :ok <- client_command_enabled(state, command),
          :ok <- verify_staged_reply_sources(state.store, person, sources) do
-      {reply, next} = perform_command(state, key, command, sources)
-      {:reply, reply, next}
+      {reply, next} = perform_command(state, key, command, sources, durable)
+      {:reply, committed_app_response(next, durable, reply), next}
     else
+      {:replay, status, body} -> {:reply, {:retained, status, body, true}, state}
+      {:error, :idempotency_conflict} -> {:reply, {:error, "operation_conflict", nil, nil}, state}
       error -> {:reply, error, state}
     end
   end
@@ -3047,7 +3050,7 @@ defmodule AttentionServer.Relay do
 
   defp client_command_enabled(_state, _command), do: :ok
 
-  defp perform_command(state, key, command, staged_sources) do
+  defp perform_command(state, key, command, staged_sources, durable \\ nil) do
     {next_engine, reply} = Engine.request_command(state.store.engine, key, command, state.clock.())
 
     next_engine =
@@ -3068,7 +3071,8 @@ defmodule AttentionServer.Relay do
       operation_id,
       targets,
       command["type"] || "relay_request",
-      command
+      command,
+      app_receipt_capture(state, durable, reply)
     )
   end
 
@@ -3104,11 +3108,53 @@ defmodule AttentionServer.Relay do
     end)
   end
 
-  defp finish_request(state, key, next_engine, reply, operation_id, targets, action, original) do
-    if next_engine == state.store.engine do
+  defp before_app_command(_state, nil), do: {:ok, nil}
+
+  defp before_app_command(state, receipt),
+    do: AttentionServer.ClientAPI.Writes.lookup_app_receipt(state, receipt)
+
+  defp committed_app_response(_state, nil, reply), do: reply
+
+  defp committed_app_response(state, receipt, reply) do
+    with {:ok, %{digest: digest, body: encoded, status: status, original_response: true}} <-
+           AttentionServer.ClientAPI.Idempotency.lookup_retained(state.store.db, receipt.person, receipt.key),
+         true <- digest == receipt.digest,
+         {:ok, body} <- JSON.decode_line(encoded <> "\n") do
+      {:retained, status, body, false}
+    else
+      _ -> reply
+    end
+  end
+
+  defp app_receipt_capture(_state, nil, _reply), do: nil
+
+  defp app_receipt_capture(state, durable, reply) do
+    if match?({:ok, _}, reply) or match?({:error, _, _, terminal} when is_map(terminal), reply) do
+      fn store ->
+        snapshot = %{state | store: store}
+
+        with {:ok, status, body} <-
+               AttentionServer.ClientAPI.Writes.materialize_app_receipt(durable, reply, snapshot),
+             :ok <-
+               AttentionServer.ClientAPI.Idempotency.save_retained(
+                 store.db, durable.person, durable.key, durable.digest, status, body
+               ) do
+          :ok
+        else
+          {:error, _} = error -> error
+          _ -> {:error, :receipt_unavailable}
+        end
+      end
+    end
+  end
+
+  defp finish_request(state, key, next_engine, reply, operation_id, targets, action, original,
+         receipt_capture \\ nil) do
+    if next_engine == state.store.engine and is_nil(receipt_capture) do
       {reply, state}
     else
       audit = Map.put(audit(state.store.engine, key, action), :operation_id, operation_id)
+      audit = if receipt_capture, do: Map.put(audit, :app_receipt_capture, receipt_capture), else: audit
 
       case commit_request(state.store, next_engine, audit, original) do
         {:ok, store} ->

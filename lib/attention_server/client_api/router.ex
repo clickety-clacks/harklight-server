@@ -204,7 +204,7 @@ defmodule AttentionServer.ClientAPI.Router do
 
           true ->
             dispatch(conn, opts, route, %Context{
-              principal: principal,
+              principal: Map.put(principal, :request_id, request_id),
               relay: opts.relay,
               request_id: request_id
             })

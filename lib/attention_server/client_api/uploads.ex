@@ -71,14 +71,15 @@ defmodule AttentionServer.ClientAPI.Uploads do
   @doc "Moves a fully written temporary file into place and records it."
   @spec stage(struct(), String.t(), map(), String.t()) ::
           {:ok, String.t()} | {:error, term()}
-  def stage(store, person, meta, tmp_path, owner \\ nil)
+  def stage(store, person, meta, tmp_path, owner \\ nil, capture \\ nil)
 
   def stage(
         %AttentionServer.Store{change_log: true, db: db} = store,
         person,
         meta,
         tmp_path,
-        owner
+        owner,
+        capture
       ) do
     file_id = "fs" <> Base.url_encode64(:crypto.strong_rand_bytes(18), padding: false)
     now = System.system_time(:millisecond)
@@ -90,7 +91,7 @@ defmodule AttentionServer.ClientAPI.Uploads do
          :ok <- File.rename(tmp_path, path) do
       attrs = [file_id, person, meta.name, meta.content_type, meta.size, meta.sha256, now]
 
-      case record_staged_file(db, file_id, attrs, owner) do
+      case record_staged_file(db, file_id, attrs, owner, capture) do
         :ok ->
           {:ok, file_id}
 
@@ -104,9 +105,9 @@ defmodule AttentionServer.ClientAPI.Uploads do
     end
   end
 
-  def stage(%AttentionServer.Store{}, _person, _meta, _tmp_path, _owner), do: {:error, :disabled}
+  def stage(%AttentionServer.Store{}, _person, _meta, _tmp_path, _owner, _capture), do: {:error, :disabled}
 
-  defp record_staged_file(db, file_id, attrs, owner) do
+  defp record_staged_file(db, file_id, attrs, owner, capture) do
     with :ok <- Sqlite3.execute(db, "BEGIN IMMEDIATE") do
       with :ok <-
              run(
@@ -116,6 +117,7 @@ defmodule AttentionServer.ClientAPI.Uploads do
                attrs
              ),
            :ok <- remember_owner(db, file_id, owner),
+           :ok <- capture_upload(capture, file_id),
            :ok <- Sqlite3.execute(db, "COMMIT") do
         :ok
       else
@@ -125,6 +127,9 @@ defmodule AttentionServer.ClientAPI.Uploads do
       end
     end
   end
+
+  defp capture_upload(nil, _file_id), do: :ok
+  defp capture_upload(capture, file_id), do: capture.(file_id)
 
   @doc "The person's staged file, if it exists and is retained."
   @spec fetch(struct(), String.t(), String.t()) ::

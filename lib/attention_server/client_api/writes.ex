@@ -99,7 +99,8 @@ defmodule AttentionServer.ClientAPI.Writes do
          :ok <- only_members(body, ["text", "file_ids"]),
          {:ok, text} <- string_member(body, "text"),
          {:ok, file_ids} <- file_ids(body) do
-      respond(conn, reply(ctx.relay, ctx.principal, ctx.params.item_id, text, file_ids, key))
+      marked? = get_req_header(conn, "harklight-queued-retry") == ["true"]
+      respond(conn, reply_request(ctx.relay, ctx.principal, ctx.params.item_id, text, file_ids, key, marked?))
     else
       {:error, token, field, conn} -> Errors.send_error(conn, token, field: field)
       {:error, token, field} -> Errors.send_error(conn, token, field: field)
@@ -281,14 +282,18 @@ defmodule AttentionServer.ClientAPI.Writes do
   (today's `discussion`), accepted in every item state and whether or not the
   agent is listening.
   """
-  def reply(relay, who, item_id, text, file_ids \\ [], idempotency_key) do
+  def reply(relay, who, item_id, text, file_ids \\ [], idempotency_key),
+    do: reply_request(relay, who, item_id, text, file_ids, idempotency_key, false)
+
+  defp reply_request(relay, who, item_id, text, file_ids, idempotency_key, marked?) do
     body = %{"text" => text}
     body = if file_ids == [], do: body, else: Map.put(body, "file_ids", file_ids)
 
     write(relay, who, idempotency_key, {:reply, item_id, text, file_ids}, %{
       method: "POST",
       path: ["items", item_id, "replies"],
-      body: body
+      body: body,
+      marked_retry: marked?
     })
   end
 
@@ -387,7 +392,7 @@ defmodule AttentionServer.ClientAPI.Writes do
   defp write(relay, who, key, operation, request) do
     digest = Idempotency.digest(request.method, request.path, request.body)
 
-    case call(relay, {:begin, who, key, digest, operation}) do
+    case call(relay, {:begin, who, key, digest, operation, Map.get(request, :marked_retry, false)}) do
       {:replay, status, body} ->
         result({:ok, status, body}, true)
 
@@ -401,12 +406,18 @@ defmodule AttentionServer.ClientAPI.Writes do
 
         result(call(relay, {:finish, who, key, digest, operation, outcome}), false)
 
-      {:apply, engine_key, frame, staged} ->
+      {:apply, engine_key, frame, staged, durable} ->
         outcome =
           with {:ok, frame} <- attach_files(relay, engine_key, frame, staged),
-               do: apply_frame(relay, engine_key, frame, staged)
+               do: apply_frame(relay, engine_key, frame, staged, durable)
 
-        result(call(relay, {:finish, who, key, digest, operation, outcome}), false)
+        case outcome do
+          {:retained, status, body, replayed?} ->
+            result({:ok, status, body}, replayed?)
+
+          _ ->
+            result(call(relay, {:finish, who, key, digest, operation, outcome}), false)
+        end
 
       :unchanged ->
         result(call(relay, {:finish, who, key, digest, operation, {:ok, :unchanged}}), false)
@@ -417,19 +428,23 @@ defmodule AttentionServer.ClientAPI.Writes do
   end
 
   defp result({:ok, status, body}, replayed?), do: {:ok, status, body, replayed?}
+  defp result({:retained_replay, status, body}, _replayed?), do: {:ok, status, body, true}
   defp result({:error, %Projection{} = fault}, _replayed?), do: {:error, fault}
   defp result({:error, token}, replayed?), do: {:error, to_string(token), nil, replayed?}
 
   defp result({:error, token, field}, replayed?),
     do: {:error, to_string(token), field, replayed?}
 
-  defp apply_frame(relay, engine_key, command, staged) do
+  defp apply_frame(relay, engine_key, command, staged, durable) do
     sources =
       Map.new(Enum.zip(Map.get(command, "files", []), staged), fn {file, source} ->
         {file["upload_id"], source.file_id}
       end)
 
-    relay |> Relay.apply_client_command(engine_key, command, sources) |> apply_reply()
+    case Relay.apply_client_command(relay, engine_key, command, sources, durable) do
+      {:retained, _, _, _} = response -> response
+      reply -> apply_reply(reply)
+    end
   end
 
   defp apply_reply({:ok, fields}), do: {:ok, fields}
@@ -612,17 +627,19 @@ defmodule AttentionServer.ClientAPI.Writes do
     end
   end
 
-  def handle_call({:begin, who, key, digest, operation}, from, state) do
+  def handle_call({:begin, who, key, digest, operation, marked?}, from, state) do
     reply =
       with {:ok, principal} <- operation_principal(state.store.engine, who, operation),
            {:ok, nil} <- stored(state, principal.person, key, digest, who, from),
+           durable = app_receipt(state, who, principal, key, digest, operation),
+           :ok <- remember_reply_intent(state.store, durable, marked?),
            :ok <- precondition(state, who, principal, operation),
            {:ok, frame} <- frame(state.store.engine, principal, key, operation),
            {:ok, staged} <- staged_files(state, principal, operation) do
         cond do
           principal.kind == :agent -> {:apply_agent, principal.engine_key, frame}
           frame == :unchanged -> :unchanged
-          true -> {:apply, principal.engine_key, frame, staged}
+          true -> {:apply, principal.engine_key, frame, staged, durable}
         end
       else
         {:replay, status, body} -> {:replay, status, body}
@@ -637,11 +654,17 @@ defmodule AttentionServer.ClientAPI.Writes do
       with {:ok, principal} <- operation_principal(state.store.engine, who, operation) do
         case outcome do
           {:ok, reply} ->
-            result =
-              Projection.capture(fn -> render(operation, who, principal.person, reply, from, state) end)
+            case app_receipt(state, who, principal, key, digest, operation) do
+              nil ->
+                result =
+                  Projection.capture(fn -> render(operation, who, principal.person, reply, from, state) end)
 
-            receipt = receipt(operation, reply, result, principal)
-            remember(state, principal.person, key, digest, result, receipt)
+                receipt = receipt(operation, reply, result, principal)
+                remember(state, principal.person, key, digest, result, receipt)
+
+              durable ->
+                finish_app_receipt(state, durable, reply)
+            end
 
           error ->
             error
@@ -649,6 +672,83 @@ defmodule AttentionServer.ClientAPI.Writes do
       end
 
     {:reply, reply, state}
+  end
+
+  defp finish_app_receipt(state, durable, reply) do
+    case lookup_app_receipt(state, durable) do
+      {:ok, nil} -> stage_app_result(state, durable, reply)
+      {:replay, status, body} -> {:retained_replay, status, body}
+      error -> error
+    end
+  end
+
+  defp stage_app_result(state, %{operation: {:file, meta, tmp}, person: person, who: who} = durable, _reply) do
+    capture = fn id -> save_app_receipt(state.store, durable, 201, staged_file_result(id, meta)) end
+
+    case Uploads.stage(state.store, person, meta, tmp, who.key, capture) do
+      {:ok, id} -> {:ok, 201, staged_file_result(id, meta)}
+      error -> error
+    end
+  end
+
+  defp stage_app_result(state, durable, reply) do
+    with {:ok, status, body} <- materialize_app_receipt(durable, {:ok, reply}, state),
+         :ok <- save_app_receipt(state.store, durable, status, body) do
+      {:ok, status, body}
+    end
+  end
+
+  defp save_app_receipt(store, receipt, status, body),
+    do: Idempotency.save_retained(store.db, receipt.person, receipt.key, receipt.digest, status, body)
+
+  defp remember_reply_intent(store, %{person: person, key: key, digest: digest,
+         operation: {:reply, item, text, _files}}, marked?) do
+    intent = Idempotency.digest("POST", ["items", item, "replies"], %{"text" => text})
+    Idempotency.accept_app_reply_attempt(store.db, person, key, digest, intent, marked?)
+  end
+
+  defp remember_reply_intent(_store, _receipt, _marked?), do: :ok
+
+  defp app_receipt(state, %{kind: :device, key: device} = who, %{person: person}, key, digest, operation)
+       when is_binary(key) do
+    case state.store do
+      %{mode: :keyed, auth_schema: %{}, db: db} ->
+        if is_binary(Map.get(who, :session_id)) or AttentionServer.DeviceMigration.eligible?(db, person, device) do
+          %{person: person, key: key, digest: digest, who: who, operation: operation}
+        end
+
+      _ ->
+        nil
+    end
+  end
+
+  defp app_receipt(_, _, _, _, _, _), do: nil
+
+  @doc false
+  def lookup_app_receipt(state, receipt) do
+    stored(state, receipt.person, receipt.key, receipt.digest, receipt.who, nil)
+  end
+
+  @doc false
+  def materialize_app_receipt(%{operation: operation, who: who, person: person}, {:ok, reply}, state) do
+    Projection.capture(fn -> render(operation, who, person, reply, nil, state) end)
+  end
+
+  def materialize_app_receipt(%{who: who}, {:error, _reason, _field, terminal} = reply, _state)
+      when is_map(terminal) do
+    case apply_reply(reply) do
+      {:error, token, field} -> retained_error(who, token, field)
+      {:error, token} -> retained_error(who, token, nil)
+    end
+  end
+
+  def materialize_app_receipt(_metadata, _reply, _state), do: {:error, :not_accepted}
+
+  defp retained_error(who, token, field) do
+    body = %{"error" => token, "retryable" => Errors.retryable?(token)}
+    body = if field, do: Map.put(body, "field", field), else: body
+    body = if request_id = Map.get(who, :request_id), do: Map.put(body, "request_id", request_id), else: body
+    {:ok, Errors.status(token), body}
   end
 
   defp discard_owner(%{kind: :device, engine_key: device}), do: device
@@ -826,13 +926,7 @@ defmodule AttentionServer.ClientAPI.Writes do
 
     case Uploads.stage(state.store, person, meta, tmp_path, owner) do
       {:ok, file_id} ->
-        {:ok, 201,
-         %{
-           "file_id" => file_id,
-           "name" => meta.name,
-           "sha256" => meta.sha256,
-           "size" => meta.size
-         }}
+        {:ok, 201, staged_file_result(file_id, meta)}
 
       {:error, :disabled} ->
         {:error, :not_found}
@@ -856,6 +950,9 @@ defmodule AttentionServer.ClientAPI.Writes do
       {:ok, 200, Map.put(body, "entry", entry)}
     end
   end
+
+  defp staged_file_result(file_id, meta),
+    do: %{"file_id" => file_id, "name" => meta.name, "sha256" => meta.sha256, "size" => meta.size}
 
   defp render_item(item_id, who, from, state) do
     case Reads.handle_call({:item, who, item_id}, from, state) do

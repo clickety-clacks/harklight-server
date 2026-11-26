@@ -17,7 +17,7 @@ defmodule AttentionServer.ClientAPI.Principal do
   """
 
   @enforce_keys [:person, :kind, :key]
-  defstruct [:person, :kind, :key, :session_id, :owner_revision, pending: false]
+  defstruct [:person, :kind, :key, :session_id, :owner_revision, :request_id, pending: false]
 
   @type t :: %__MODULE__{
           person: String.t(),
