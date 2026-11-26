@@ -2,6 +2,10 @@ defmodule AttentionServer.GuidedJoinHTTPSTest do
   use ExUnit.Case, async: false
 
   alias AttentionServer.{
+    BrowserAuth,
+    DashboardBackend,
+    DashboardBrowserSession,
+    DashboardReadHTTP,
     DeviceIdentity,
     Engine,
     EnrollmentHTTPS,
@@ -22,7 +26,7 @@ defmodule AttentionServer.GuidedJoinHTTPSTest do
     %{certs: certs}
   end
 
-  setup %{certs: certs} do
+  setup %{certs: certs} = certs_context do
     dir = Path.join(System.tmp_dir!(), "guided-https-#{System.unique_integer([:positive])}")
     File.mkdir_p!(dir)
     on_exit(fn -> File.rm_rf!(dir) end)
@@ -31,7 +35,14 @@ defmodule AttentionServer.GuidedJoinHTTPSTest do
     {:ok, config} =
       GuidedJoin.configuration("relay.test", 18444, 18443, File.read!(Path.join(certs, "ca.pem")))
 
-    relay = start_supervised!({Relay, store_path: path, join_configuration: config})
+    relay =
+      start_supervised!(
+        {Relay,
+         store_path: path,
+         join_configuration: config,
+         deployment_mode: Map.get(certs_context, :mode, :self_hosted),
+         sign_in_s1: Map.has_key?(certs_context, :mode)}
+      )
     {:ok, person} = Relay.operator_bootstrap(relay, TLSFixtures.certificate_der!(certs, "a1"))
     {:ok, other} = Relay.operator_bootstrap(relay, TLSFixtures.certificate_der!(certs, "b1"))
 
@@ -63,6 +74,99 @@ defmodule AttentionServer.GuidedJoinHTTPSTest do
       person: person,
       other: other
     }
+  end
+
+  @tag mode: :self_hosted
+  test "S1 owner can approve an Agent over TLS and cannot approve a person device", c do
+    assert %{"ok" => true, "invitation" => invitation} =
+             owner(c, "a1", %{"type" => "invite_create"})
+
+    {request, approval} = request_agent_enrollment(c, invitation, "a2")
+
+    assert %{"error" => "not_found"} =
+             owner(c, "a1", Map.put(approval, "sender_grants", []))
+
+    assert {:error, :unauthorized} =
+             Relay.certificate_device_person(c.relay, approval["expected_device_id"])
+
+    assert %{"ok" => true} =
+             owner(c, "a1", Map.put(approval, "sender_grants", ["app:fixture"]))
+
+    assert_agent_enrollment(c, request, c.person, approval["expected_device_id"])
+  end
+
+  @tag mode: :saas
+  test "S1 Hosted owner can approve Agent enrollment from the signed-in dashboard", c do
+    {:ok, person} = Relay.hosted_account_create(c.relay, "synthetic-agent-fixture")
+    transaction = BrowserAuth.new_secret()
+    {:ok, grant} = Relay.hosted_browser_grant(c.relay, person, transaction, "email_code")
+    {:ok, %{cookie: cookie}} = Relay.redeem_hosted_browser_grant(c.relay, grant, transaction)
+    {:ok, sessions} = DashboardBrowserSession.start_link(relay: c.relay)
+    origin = "https://relay.test"
+    backend = %DashboardBackend{relay: c.relay, sessions: sessions, origin: origin}
+
+    dashboard =
+      DashboardReadHTTP.init(
+        backend: {DashboardBackend, backend},
+        hosted: true,
+        expected_origin: origin,
+        skill_path: __ENV__.file
+      )
+
+    {:ok, browser_owner} = DashboardBackend.resolve_session(backend, cookie)
+    request_id = "00000000-0000-4000-8000-000000000001"
+    {:ok, invitation} = DashboardBackend.create_invitation(backend, {browser_owner, request_id})
+    {request, approval} = request_agent_enrollment(c, invitation, "a2")
+    path = "/devices/waiting/" <> approval["approval_code"] <> "/approve"
+
+    fields = %{
+      "key" => approval["expected_device_id"],
+      "deadline" => "",
+      "senders" => ""
+    }
+
+    approve = fn fields ->
+      %{Plug.Test.conn(:post, path, URI.encode_query(fields)) | scheme: :https, port: 443}
+      |> Plug.Conn.put_req_header("origin", origin)
+      |> Plug.Conn.put_req_header("content-type", "application/x-www-form-urlencoded")
+      |> Plug.Conn.put_req_header("cookie", "__Host-harklight=" <> cookie)
+      |> DashboardReadHTTP.call(dashboard)
+    end
+
+    assert approve.(fields).status == 409
+    assert {:error, :unauthorized} =
+             Relay.certificate_device_person(c.relay, approval["expected_device_id"])
+
+    assert approve.(%{fields | "senders" => "app:fixture"}).status == 303
+    assert_agent_enrollment(c, request, person, approval["expected_device_id"])
+  end
+
+  defp request_agent_enrollment(c, invitation, identity) do
+    request = %{
+      "invite_token" => invitation["invite_token"],
+      "status_secret" => String.duplicate("b", 64),
+      "public_certificate" => File.read!(Path.join(c.certs, identity <> ".pem"))
+    }
+
+    assert {200, %{"state" => "pending", "approval_code" => code, "device_id" => key,
+                   "expires_at" => deadline}} = post(c, "/enroll", request)
+
+    approval = %{
+      "type" => "pending_approve",
+      "approval_code" => code,
+      "expected_device_id" => key,
+      "expected_expires_at" => deadline
+    }
+
+    {request, approval}
+  end
+
+  defp assert_agent_enrollment(c, request, person, key) do
+    assert {200, %{"state" => "approved", "person_id" => ^person, "device_id" => ^key}} =
+             post(c, "/enroll/status", Map.take(request, ["status_secret"]))
+
+    assert {200, %{"state" => "approved", "device_id" => ^key}} = post(c, "/enroll", request)
+    assert {:ok, ^person} = Relay.certificate_device_person(c.relay, key)
   end
 
   test "owner CLI writes a usable pinned invitation; lost HTTP reply retries exactly and approval grants no sender",

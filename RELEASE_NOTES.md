@@ -1,3 +1,19 @@
+# Harklight Server v0.2.33
+
+With S1 active, an account owner can again enroll a new full Agent using the
+existing invitation and `harklight-agent setup`. Use Devices to create an Agent
+invitation and approve the exact key with at least one sender ID. Self-hosted
+owners can also use the owner CLI. Hosted owners approve from their signed-in
+dashboard. With no sender ID, approval cannot issue a legacy device
+credential. New phones and iPads continue to use shared sign-in.
+
+The release keeps FORMAT31 and auth generation 1. Follow the S1 backup and
+recovery steps below, including a stopped backup before first activation.
+
+**Compatibility.** Protocol 0.2. Agent 0.2.10 can set up a new identity without
+an update. Existing Agent and App sessions and bundled Web 0.2.7 remain
+compatible.
+
 # Harklight Server v0.2.32
 
 This is the sign-in overlap release. With S1 active, a self-hosted owner can

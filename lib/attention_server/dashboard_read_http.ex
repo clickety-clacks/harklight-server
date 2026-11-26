@@ -330,6 +330,7 @@ defmodule AttentionServer.DashboardReadHTTP do
       hosted: true,
       account_url: addresses.account,
       sign_out: true,
+      agent_enrollment_only: "email_code" in sign_in_methods(opts),
       testflight_url: opts.hosted_testflight_url
     ]
 
@@ -339,7 +340,8 @@ defmodule AttentionServer.DashboardReadHTTP do
       prioritization: true,
       invitations_configured: opts.invitations_configured,
       sign_out: local_code?,
-      local_sign_in_code: local_code?
+      local_sign_in_code: local_code?,
+      agent_enrollment_only: local_code?
     ]
   end
 
@@ -1421,12 +1423,20 @@ defmodule AttentionServer.DashboardReadHTTP do
     end
   end
 
-  defp local_code_available?(%{hosted: false, backend: {module, _}} = opts) do
-    Code.ensure_loaded?(module) and function_exported?(module, :local_methods, 2) and
-      match?({:ok, ["owner_code" | _]}, backend_call(opts.backend, :local_methods, nil))
-  end
+  defp local_code_available?(%{hosted: false} = opts), do: "owner_code" in sign_in_methods(opts)
 
   defp local_code_available?(_opts), do: false
+
+  defp sign_in_methods(%{backend: {module, _} = backend}) do
+    with true <- Code.ensure_loaded?(module) and function_exported?(module, :local_methods, 2),
+         {:ok, methods} <- backend_call(backend, :local_methods, nil) do
+      methods
+    else
+      _ -> []
+    end
+  end
+
+  defp sign_in_methods(_opts), do: []
 
   defp local_passkey_request(conn, opts, operation) do
     if local_code_available?(opts) do

@@ -190,7 +190,7 @@ defmodule AttentionServer.EnrollmentHTTPS do
               {status, response, Diagnostics.operation_id(body)}
 
             {:ok, path, body} ->
-              if Relay.legacy_device_enrollment?(relay) do
+              if path in ["/enroll", "/enroll/status"] or Relay.legacy_device_enrollment?(relay) do
                 {status, response} = dispatch(relay, path, body)
                 {status, response, Diagnostics.operation_id(body)}
               else
