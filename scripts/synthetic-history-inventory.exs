@@ -55,7 +55,7 @@ items =
   for {{^person, ^sender, id} = key, record} <- Enum.sort(engine.messages) do
     facts = for {_, %{key: ^key, payload: payload}} <- Enum.sort(engine.conversation_events), do: payload
     %{"message_id" => id, "accepted_seq" => record.accepted_seq, "message" => record.message,
-      "terminal" => if(record.terminal, do: Map.update!(record.terminal, :actor_kind, &to_string/1)), "facts" => facts}
+      "terminal" => if(record.terminal, do: Map.new(Map.update!(record.terminal, :actor_kind, &to_string/1), fn {k, v} -> {Atom.to_string(k), v} end)), "facts" => facts}
   end
 
 projections =
