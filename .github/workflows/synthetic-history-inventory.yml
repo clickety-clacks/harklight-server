@@ -1,0 +1,61 @@
+name: Published Server history continuity inventory
+on:
+  push:
+    branches: [evidence/01-to-02-history]
+permissions:
+  contents: read
+jobs:
+  inventory:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Compare published packages using synthetic state
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/history"
+          mkdir -p "$root"/{original,upgrade,results}
+          release_base=https://github.com/clickety-clacks/harklight-server/releases/download
+          for version in 0.1.49 0.2.0 0.2.16 0.2.28; do
+            package="harklight-server-$version-linux-x86_64"
+            mkdir -p "$root/$version"
+            (
+              cd "$root/$version"
+              curl -fsSL --retry 3 -O "$release_base/v$version/$package.tar.gz"
+              curl -fsSL --retry 3 -O "$release_base/v$version/SHA256SUMS"
+              sha256sum --check --ignore-missing SHA256SUMS
+              cp SHA256SUMS "$root/results/SHA256SUMS-$version.txt"
+              tar -xzf "$package.tar.gz" --strip-components=1
+            )
+          done
+          isolated() {
+            sudo systemd-run --quiet --wait --pipe --collect --property=MemoryMax=4G \
+              --property=MemorySwapMax=0 --property=PrivateNetwork=yes --uid="$(id -u)" \
+              --working-directory="$root" /usr/bin/env ATTENTION_SERVER_ENABLE=0 \
+              ERL_FLAGS='+S 2:2 +SDcpu 1 +SDio 1' FIXTURE_DB="$db" STAGE="$version" \
+              INVENTORY="$root/results/$version.json" FIXTURE_SCRIPT="$GITHUB_WORKSPACE/scripts/synthetic-history-inventory.exs" "$@"
+          }
+          inventory() {
+            isolated "$root/$version/bin/attention_server" eval 'Code.require_file(System.fetch_env!("FIXTURE_SCRIPT"))'
+          }
+          db="$root/original/relay.sqlite3"
+          version=0.1.49
+          inventory
+          original_sha="$(sha256sum "$db")"
+          cp -a "$root/original/." "$root/upgrade"
+          db="$root/upgrade/relay.sqlite3"
+          for version in 0.2.0 0.2.16 0.2.28; do
+            if [[ "$version" == 0.2.28 ]]; then
+              isolated "$root/$version/bin/harklight" store convert-stopped "$db" --from-release v0.2.16
+            fi
+            inventory
+          done
+          echo "$original_sha" | sha256sum --check > "$root/results/original-check.txt"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: published-history-inventory
+          path: ${{ runner.temp }}/history/results/*
