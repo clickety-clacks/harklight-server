@@ -44,9 +44,9 @@ Each client result JSON records `platform` (iPhone, iPad or Web), exact
 `client_build`, `outcome`, observed `observations`, and the matching
 `server_version`, `server_commit` and `fixture_sha256` from
 `results/manifest.json`. The App runner emits the six flat
-`expected` fields and `relaunch: "pass"`. Web's Playwright runner uses
-`platform: "web"` and emits nested `current`, `answered` and `discussed`
-observations, which the verifier reads in its native shape. Preserve the client run evidence alongside its
+`expected` fields and `relaunch: "pass"`. The Web runner emits the same six
+observations. Earlier connected runner output with nested `current`,
+`answered` and `discussed` observations is also accepted. Preserve the client run evidence alongside its
 result, including the ordinary view and history opened on that run.
 
     scripts/history-continuity/verify.py gate "$FIXTURE/results/manifest.json" \

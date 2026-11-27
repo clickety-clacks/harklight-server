@@ -81,9 +81,9 @@ def gate(manifest, result_paths):
         for field in ("fixture_sha256", "server_version", "server_commit"):
             require(result.get(field) == manifest[field], f"{platform}: {field} does not match")
         observations = result["observations"]
-        if platform == "Web":
+        if platform == "Web" and "current" in observations:
             observations = web_observations(observations)
-        else:
+        if platform != "Web":
             require(result.get("relaunch") == "pass", f"{platform}: cold relaunch did not pass")
         require(observations == manifest["expected"], f"{platform}: retained history differs")
     require(seen == PLATFORMS, "passing iPhone, iPad and Web results are all required")
