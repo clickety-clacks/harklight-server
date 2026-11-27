@@ -54,9 +54,7 @@ defmodule AttentionServer.HostedAccountTest do
 
     decoded =
       case response.resp_body do
-        "" ->
-          ""
-
+        "" -> ""
         body ->
           {:ok, decoded} = JSON.decode_line(body <> "\n")
           decoded
@@ -78,13 +76,11 @@ defmodule AttentionServer.HostedAccountTest do
                :put
                |> Plug.Test.conn("/organizations/business-a/members", body)
                |> HostedRequests.call(opts)
-
       assert :ok = Relay.replace_hosted_organization(relay, "business-b", [alice])
       before = :sys.get_state(relay).store
 
       assert :ok = Relay.replace_hosted_organization(relay, "business-a", [bob, alice, alice])
       assert :sys.get_state(relay).store.version == before.version
-
       assert {:error, :invalid_members} =
                Relay.replace_hosted_organization(relay, "business-a", [bob, "unknown"])
 
@@ -108,10 +104,7 @@ defmodule AttentionServer.HostedAccountTest do
       assert :ok = GenServer.stop(relay)
     end
 
-    test "versioned Hosted groups reject delayed rosters and retain tombstones", %{
-      certs: certs,
-      dir: dir
-    } do
+    test "versioned Hosted groups reject delayed rosters and retain tombstones", %{certs: certs, dir: dir} do
       relay_opts = [deployment_mode: :saas, shared_messages: true, groups: true]
       relay = start_relay(certs, dir, relay_opts)
       assert {:ok, alice} = Relay.hosted_account_create(relay, "acct-alice")
@@ -121,46 +114,29 @@ defmodule AttentionServer.HostedAccountTest do
       path = "/organizations/business-a/groups/first"
       initial = %{"name" => "Planning", "person_ids" => [alice, bob], "version" => 1}
       assert {404, ""} = hosted_group_request(relay, :put, path, initial, false)
-
       assert {200, %{"group_id" => first, "rev" => 1} = initial_result} =
                hosted_group_request(relay, :put, path, initial)
 
       assert :ok = Relay.replace_hosted_organization(relay, "business-a", [alice])
       version_before_replay = :sys.get_state(relay).store.version
-
       assert {200, ^initial_result} =
-               hosted_group_request(relay, :put, path, %{
-                 initial
-                 | "person_ids" => [bob, alice, alice]
-               })
-
+               hosted_group_request(relay, :put, path, %{initial | "person_ids" => [bob, alice, alice]})
       store = :sys.get_state(relay).store
       assert store.version == version_before_replay
       assert store.engine.groups[first].members == %{alice => false}
 
       assert {409, %{"error" => "version_conflict"}} =
                hosted_group_request(relay, :put, path, %{initial | "person_ids" => [alice]})
-
       assert {422, %{"error" => "not_affiliated"}} =
                hosted_group_request(relay, :put, path, %{initial | "version" => 2})
-
       assert {200, %{"group_id" => ^first, "rev" => 2}} =
-               hosted_group_request(relay, :put, path, %{
-                 initial
-                 | "version" => 2,
-                   "name" => "Renamed",
-                   "person_ids" => [alice]
-               })
-
-      assert {409, %{"error" => "stale_version"}} =
-               hosted_group_request(relay, :put, path, initial)
+               hosted_group_request(relay, :put, path,
+                 %{initial | "version" => 2, "name" => "Renamed", "person_ids" => [alice]})
+      assert {409, %{"error" => "stale_version"}} = hosted_group_request(relay, :put, path, initial)
 
       second_path = "/organizations/business-a/groups/second"
       consent = %{"name" => "Second group", "person_ids" => [alice], "version" => 1}
-
-      assert {200, %{"group_id" => second}} =
-               hosted_group_request(relay, :put, second_path, consent)
-
+      assert {200, %{"group_id" => second}} = hosted_group_request(relay, :put, second_path, consent)
       assert first != second
       assert {204, ""} = hosted_group_request(relay, :delete, path, %{})
       assert {204, ""} = hosted_group_request(relay, :delete, path, %{})
@@ -168,46 +144,25 @@ defmodule AttentionServer.HostedAccountTest do
       assert :ok = GenServer.stop(relay)
 
       relay = start_relay(certs, dir, relay_opts)
-
-      assert {410, %{"error" => "group_deleted"}} =
-               hosted_group_request(relay, :put, path, initial)
-
-      assert {410, %{"error" => "group_deleted"}} =
-               hosted_group_request(relay, :put, second_path, consent)
-
+      assert {410, %{"error" => "group_deleted"}} = hosted_group_request(relay, :put, path, initial)
+      assert {410, %{"error" => "group_deleted"}} = hosted_group_request(relay, :put, second_path, consent)
       assert {204, ""} = hosted_group_request(relay, :delete, second_path, %{})
       assert :ok = Relay.replace_hosted_organization(relay, "business-a", [alice])
       third_path = "/organizations/business-a/groups/third"
-
-      assert {200, %{"group_id" => third, "rev" => 1}} =
-               hosted_group_request(relay, :put, third_path, consent)
-
+      assert {200, %{"group_id" => third, "rev" => 1}} = hosted_group_request(relay, :put, third_path, consent)
       refute third in [first, second]
       assert :ok = GenServer.stop(relay)
     end
 
-    test "first shared self-hosted startup affiliates existing local owners only", %{
-      certs: certs,
-      dir: dir
-    } do
+    test "first shared self-hosted startup affiliates existing local owners only", %{certs: certs, dir: dir} do
       path = Path.join(dir, "relay.sqlite3")
       person = "10000000-0000-4000-8000-000000000001"
       hosted = "10000000-0000-4000-8000-000000000002"
       assert {:ok, store} = Store.open_relay(path)
-
       {engine, :ok, touched} =
         Engine.with_touches(store.engine, fn engine ->
           {:ok, engine} = Engine.operator_bootstrap(engine, person, String.duplicate("a", 64))
-
-          {:ok, engine, _} =
-            Engine.hosted_account_create(
-              engine,
-              "hosted",
-              false,
-              hosted,
-              String.duplicate("b", 64)
-            )
-
+          {:ok, engine, _} = Engine.hosted_account_create(engine, "hosted", false, hosted, String.duplicate("b", 64))
           {engine, :ok}
         end)
 
@@ -216,10 +171,7 @@ defmodule AttentionServer.HostedAccountTest do
       assert :ok = Store.close(store)
 
       relay = start_relay(certs, dir, shared_messages: true)
-
-      assert :sys.get_state(relay).store.engine.local_organizations.default ==
-               MapSet.new([person])
-
+      assert :sys.get_state(relay).store.engine.local_organizations.default == MapSet.new([person])
       assert :ok = Relay.operator_organization_member(relay, person, false)
       assert :ok = GenServer.stop(relay)
 
@@ -247,28 +199,18 @@ defmodule AttentionServer.HostedAccountTest do
 
     test "local operator manages only local organization affiliations", %{certs: certs, dir: dir} do
       relay = start_relay(certs, dir, [])
-
-      assert {:ok, person} =
-               Relay.operator_bootstrap(relay, TLSFixtures.certificate_der!(certs, "a1"))
-
+      assert {:ok, person} = Relay.operator_bootstrap(relay, TLSFixtures.certificate_der!(certs, "a1"))
       assert {:ok, hosted} = Relay.hosted_account_create(relay, "acct-external")
 
-      assert :sys.get_state(relay).store.engine.local_organizations.default ==
-               MapSet.new([person])
-
-      assert {:error, :unknown_local_person} =
-               Relay.operator_organization_member(relay, hosted, true)
-
+      assert :sys.get_state(relay).store.engine.local_organizations.default == MapSet.new([person])
+      assert {:error, :unknown_local_person} = Relay.operator_organization_member(relay, hosted, true)
       assert :ok = Relay.operator_organization_member(relay, person, false)
       assert :ok = GenServer.stop(relay)
 
       relay = start_relay(certs, dir, [])
       assert :sys.get_state(relay).store.engine.local_organizations.default == MapSet.new()
       assert :ok = Relay.operator_organization_member(relay, person, true)
-
-      assert :sys.get_state(relay).store.engine.local_organizations.default ==
-               MapSet.new([person])
-
+      assert :sys.get_state(relay).store.engine.local_organizations.default == MapSet.new([person])
       assert :ok = GenServer.stop(relay)
     end
 
@@ -470,7 +412,8 @@ defmodule AttentionServer.HostedAccountTest do
   defp relay_engine(relay), do: :sys.get_state(relay).store.engine
 
   defp relay_op(n),
-    do: "00000000-0000-4000-8000-#{String.pad_leading(Integer.to_string(n), 12, "0")}"
+    do:
+      "00000000-0000-4000-8000-#{String.pad_leading(Integer.to_string(n), 12, "0")}"
 
   defp relay_request(relay, key, frame) do
     request_line = JSON.encode!(Map.put(frame, "v", 1)) <> "\n"
@@ -685,10 +628,8 @@ defmodule AttentionServer.HostedAccountTest do
       assert {:ok, nil} = Relay.claim_push(relay, System.system_time(:millisecond) + 300_001)
       assert {:ok, [delivery], 1} = RelayReaders.events(relay, "alice-reader", 0)
       assert delivery["message"]["message_id"] == "accepted-before-stop"
-
       assert {:ok, conversation_events, _high} =
                RelayReaders.conversation_events(relay, "alice-reader", 0)
-
       assert Enum.any?(conversation_events, &(&1["kind"] == "discussion"))
       refute Enum.any?(conversation_events, &(&1["kind"] in ["reply", "acted"]))
 
