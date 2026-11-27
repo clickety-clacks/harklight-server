@@ -1127,6 +1127,11 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
       invalid = put_in(body["message"]["alarm"], "true")
       assert_error(request(ctx, "a1", "POST", path, invalid, 1), 400, "invalid_field")
 
+      for kind <- ["people", "group"] do
+        shared = Map.put(body, "recipients", %{"kind" => kind})
+        assert_error(request(ctx, "a1", "POST", path, shared, 1), 400, "unsupported")
+      end
+
       sent = request(ctx, "a1", "POST", path, body, 1)
       assert sent.status == 200, sent.body
       assert %{"message" => %{"item_id" => id, "message" => %{"alarm" => true}}} =
@@ -1153,7 +1158,8 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
           "me" => decode_response(discovery),
           "inbox_page_1" => first,
           "inbox_page_2" => second,
-          "alarm_detail" => decode_response(get(ctx, "a2", "/v2/items/" <> id))
+          "alarm_detail" => decode_response(get(ctx, "a2", "/v2/items/" <> id)),
+          "item_changes" => decode_response(get(ctx, "a2", "/v2/changes?after=0"))
         }))
       end
 

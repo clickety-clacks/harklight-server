@@ -85,6 +85,10 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
     end
   end
 
+  defp dispatch_write(conn, _ctx, :send, _key, %{"recipients" => _, "message" => message})
+       when is_map_key(message, "alarm"),
+       do: Errors.send_error(conn, "unsupported")
+
   defp dispatch_write(conn, ctx, :send, key, %{"recipients" => selector} = body) do
     group? = match?(%{"kind" => "group"}, selector)
 
@@ -111,6 +115,10 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
   defp dispatch_write(conn, %{params: %{item_id: "shared_" <> _}} = ctx, operation, key, body)
        when operation in [:reply, :chat_receipt, :shared_answer_receipt, :advisory_ack],
        do: SharedChat.respond(conn, ctx, :sender, operation, body, key)
+
+  defp dispatch_write(conn, %{params: %{item_id: "shared_" <> _}}, :revise, _key,
+         %{"message" => message}) when is_map_key(message, "alarm"),
+    do: Errors.send_error(conn, "unsupported")
 
   defp dispatch_write(conn, %{params: %{item_id: "shared_" <> _ = id}} = ctx,
          operation, key, body) when operation in [:revise, :retract, :chat_close, :lifecycle] do
@@ -571,8 +579,7 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
   end
 
   defp authorize_shared_send(state, {person, origin} = scope, body, capability) do
-    with :ok <- reject_shared_alarm(body["message"]),
-         :ok <- shared_send_gate(state, person, body["recipients"], capability),
+    with :ok <- shared_send_gate(state, person, body["recipients"], capability),
          :ok <- authorize(state, scope, :send),
          :ok <- shared_send_fields(body),
          true <- Engine.shared_sender_allowed?(state.store.engine, person, origin, body["sender"]) ||
@@ -703,7 +710,6 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
          :ok <- files(body),
          :ok <- if_match(match, record.revision),
          {:ok, message} <- content(body),
-         :ok <- reject_shared_alarm(message),
          true <- (is_nil(record.answer_policy) == (message["message_type"] == "fyi")) ||
                    {:error, "invalid_field", "message_type"},
          message <- Map.merge(message, %{"sender_id" => record.sender_id, "message_id" => record.id}),
@@ -1214,11 +1220,6 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
       _ -> {:error, :not_found}
     end
   end
-
-  defp reject_shared_alarm(message) when is_map_key(message, "alarm"),
-    do: {:error, :unsupported}
-
-  defp reject_shared_alarm(_message), do: :ok
 
   defp content(%{"message" => message}) when is_map(message) and not is_struct(message) do
     case Enum.find(~w(sender_id message_id supersedes), &Map.has_key?(message, &1)) do
