@@ -6,6 +6,7 @@ on:
       - 'v*'
 
 permissions:
+  actions: read
   contents: write
 
 concurrency:
@@ -45,6 +46,28 @@ jobs:
           set -euo pipefail
           python3 .github/scripts/harklight_release_publish.py classify \
             --tag "$RELEASE_TAG"
+
+      - name: Require connected history proof for the exact release candidate
+        if: steps.release.outputs.mode == 'build'
+        env:
+          RELEASE_TAG: ${{ steps.source.outputs.tag }}
+          RELEASE_VERSION: ${{ steps.source.outputs.version }}
+          RELEASE_COMMIT: ${{ steps.source.outputs.commit }}
+        run: |
+          set -euo pipefail
+          proof_dir="$(mktemp -d "$RUNNER_TEMP/history-gate.XXXXXX")"
+          git for-each-ref --format='%(contents)' "refs/tags/$RELEASE_TAG" > "$proof_dir/tag.txt"
+          run_id="$(python3 scripts/history-continuity/verify.py proof-run "$proof_dir/tag.txt")"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" |
+            jq -e --arg commit "$RELEASE_COMMIT" '
+              .path == ".github/workflows/harklight-history-verification.yml" and
+              .event == "workflow_dispatch" and .status == "completed" and
+              .conclusion == "success" and .head_sha == $commit
+            ' >/dev/null
+          gh run download "$run_id" --repo "$GITHUB_REPOSITORY" \
+            --name accepted-connected-history-proof --dir "$proof_dir"
+          python3 scripts/history-continuity/verify.py release-gate \
+            "$proof_dir/history-proof.json" "$RELEASE_VERSION" "$RELEASE_COMMIT"
 
       - name: Prepare an isolated package directory
         run: |

@@ -56,3 +56,23 @@ The continuity check passes when the upgraded Server inventory and all three
 ordinary UI results pass on the same fixture and exact Server build.
 Captured-response replay is supplemental evidence. The workflow uploads
 synthetic inventories only.
+
+## Required publication evidence
+
+Build the exact candidate from its intended release commit and use that
+package on the isolated fixture. After the ordinary App and Web checks,
+combine their actual result files with that fixture's generated manifest:
+
+    jq -n --slurpfile manifest manifest.json --slurpfile iphone iphone.json \
+      --slurpfile ipad ipad.json --slurpfile web web.json \
+      '{manifest:$manifest[0], results:[$iphone[0], $ipad[0], $web[0]]}' > proof.json
+
+Dispatch **Harklight release history verification** on the candidate ref
+with `proof_json` set to the contents of `proof.json`. Use only sanitized
+synthetic evidence. The accepted artifact is produced only after verification.
+Add `history-proof-run: RUN_ID` on its own line in the annotated release tag,
+alongside the existing rehearsal fields. The publishing workflow validates
+that run and rechecks the artifact against the tag's exact commit and version
+before building or uploading a release. If the candidate commit changes,
+use connected evidence from that new candidate. The Server-only inventory
+artifact does not satisfy publication.

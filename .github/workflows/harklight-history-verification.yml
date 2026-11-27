@@ -1,6 +1,11 @@
 name: Harklight release history verification
 on:
   workflow_dispatch:
+    inputs:
+      proof_json:
+        description: 'Optional sanitized JSON containing the manifest and three actual client results'
+        required: false
+        type: string
   pull_request:
     branches: [main]
     paths:
@@ -12,6 +17,7 @@ permissions:
 
 jobs:
   server-inventory:
+    if: github.event_name != 'workflow_dispatch' || inputs.proof_json == ''
     name: Preserve predecessor history on the exact Server build
     runs-on: ubuntu-24.04
     timeout-minutes: 25
@@ -64,3 +70,27 @@ jobs:
         with:
           name: synthetic-server-history-only
           path: ${{ runner.temp }}/history-fixture/results/*.json
+
+
+  connected-proof:
+    if: github.event_name == 'workflow_dispatch' && inputs.proof_json != ''
+    name: Validate the exact candidate's connected iPhone, iPad and Web results
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Verify sanitized connected client evidence
+        env:
+          PROOF_JSON: ${{ inputs.proof_json }}
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^version=//p' scripts/build-package.sh)
+          printf '%s\n' "$PROOF_JSON" > "$RUNNER_TEMP/history-proof.json"
+          python3 scripts/history-continuity/verify.py release-gate \
+            "$RUNNER_TEMP/history-proof.json" "$version" "$GITHUB_SHA"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: accepted-connected-history-proof
+          path: ${{ runner.temp }}/history-proof.json
+          if-no-files-found: error
