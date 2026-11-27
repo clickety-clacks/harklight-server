@@ -4,6 +4,8 @@
 import argparse
 import hashlib
 import json
+import re
+
 from pathlib import Path
 
 
@@ -69,9 +71,12 @@ def web_observations(observations):
 
 
 def gate(manifest, result_paths):
+    check_results(manifest, [load(path) for path in result_paths])
+
+
+def check_results(manifest, results):
     seen = set()
-    for path in result_paths:
-        result = load(path)
+    for result in results:
         reported_platform = result.get("platform")
         platform = "Web" if reported_platform == "web" else reported_platform
         require(platform in PLATFORMS and platform not in seen, "invalid or repeated client platform")
@@ -89,6 +94,25 @@ def gate(manifest, result_paths):
     require(seen == PLATFORMS, "passing iPhone, iPad and Web results are all required")
 
 
+
+def release_gate(proof, version, commit):
+    manifest = proof["manifest"]
+    require(manifest.get("server_version") == version, "history proof Server version differs from release")
+    require(manifest.get("server_commit") == commit, "history proof Server commit differs from release")
+    require(re.fullmatch(r"[a-f0-9]{64}", manifest.get("fixture_sha256", "")), "invalid fixture digest")
+    require(manifest.get("expected") == EXPECTED, "history proof changed the expected observations")
+    require(manifest.get("upgrade") == ["0.1.49", "0.2.16", version], "unsupported history upgrade path")
+    check_results(manifest, proof["results"])
+
+
+def proof_run(tag_message):
+    entries = [line for line in tag_message.splitlines() if line.startswith("history-proof-run:")]
+    require(len(entries) == 1, "exactly one history-proof-run tag field is required")
+    match = re.fullmatch(r"history-proof-run: ([1-9][0-9]*)", entries[0])
+    require(match, "history-proof-run must be a positive GitHub Actions run ID")
+    return match.group(1)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -99,12 +123,22 @@ def main():
     check = commands.add_parser("gate")
     check.add_argument("manifest", type=Path)
     check.add_argument("results", type=Path, nargs="+")
+    release = commands.add_parser("release-gate")
+    release.add_argument("proof", type=Path)
+    release.add_argument("version")
+    release.add_argument("commit")
+    pointer = commands.add_parser("proof-run", description="Read the annotated tag proof pointer")
+    pointer.add_argument("message", type=Path)
     args = parser.parse_args()
     try:
         if args.command == "inventory":
             inventory(args.directory, args.version, args.commit)
-        else:
+        elif args.command == "gate":
             gate(load(args.manifest), args.results)
+        elif args.command == "release-gate":
+            release_gate(load(args.proof), args.version, args.commit)
+        else:
+            print(proof_run(args.message.read_text(encoding="utf-8")))
     except (KeyError, TypeError, ValueError, OSError) as error:
         parser.exit(1, f"{error}\n")
 
