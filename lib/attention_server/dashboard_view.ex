@@ -87,17 +87,31 @@ defmodule AttentionServer.DashboardView do
       ~s(<section><h2>Command-line agent</h2><div class="install-command"><pre id="install-command"><code>brew install <span class="brew-namespace">clickety-clacks</span>/<wbr>tap/<wbr>harklight-agent</code></pre><button class="button" id="copy-install-command" type="button" aria-controls="install-command">Copy install command</button><p class="copy-status" id="install-copy-status" role="status" aria-live="polite"></p></div>#{setup_instructions}<p><a href="https://github.com/clickety-clacks/harklight-agent/releases/latest">Prebuilt releases</a></p></section>)
 
     skill_section =
-      skill_section("harklight-agent", skill_version, "/agent-skills/SKILL.md")
+      skill_section(
+        "For agents on self-hosted Harklight",
+        "Connect to your own Harklight Server and send and receive messages.",
+        "harklight-agent",
+        skill_version,
+        "/agent-skills/SKILL.md"
+      )
 
     skill_section_saas =
       skill_section(
+        "For people connecting an agent to Hosted Harklight",
+        "Connect an agent to your Hosted account and send a test question.",
         "harklight-agent-saas",
         skill_version_saas,
         "/agent-skills/harklight-agent-saas/SKILL.md"
       )
 
     coding_agent_skill_section =
-      skill_section("harklight", skill_version_harklight, "/agent-skills/harklight/SKILL.md")
+      skill_section(
+        "For standalone agents like Claude Code and Codex",
+        "Ask people questions, offer choices, and read their replies.",
+        "harklight",
+        skill_version_harklight,
+        "/agent-skills/harklight/SKILL.md"
+      )
 
     body =
       ~s(<header class="page-head"><div><h1>Components</h1><p>Harklight is an attention-based UI for messages and requests from your agents.</p></div></header>) <>
@@ -106,7 +120,7 @@ defmodule AttentionServer.DashboardView do
         coding_agent_skill_section <>
         skill_section <>
         skill_section_saas <>
-        ~s(<section><h2>Shared conversation core</h2><p>The Harklight and self-hosted agent skills include this core.</p><p><a href="/agent-skills/core.md">Read shared core</a></p></section>) <>
+        ~s(<section><h2>For developers integrating with Harklight</h2><p>Look up how identities, sender grants, messages, replies, and Chat work.</p><p><a href="/agent-skills/core.md">Read shared core</a></p></section>) <>
         ~s(<script src="/components.js" defer></script>)
 
     layout(person_name, "Components", body, chrome)
@@ -161,14 +175,14 @@ defmodule AttentionServer.DashboardView do
     layout(person_name, "Prioritization", body, chrome)
   end
 
-  defp skill_section(name, skill_version, path) do
+  defp skill_section(title, description, name, skill_version, path) do
     version_line =
       case skill_version do
         {:ok, version} -> ~s(<p class="status version">v#{escape(version)}</p>)
         :error -> ""
       end
 
-    ~s(<section><h2>Agent skill: #{escape(name)}</h2>#{version_line}<p><a href="#{escape(path)}">Read the #{escape(name)} skill</a></p></section>)
+    ~s(<section><h2>#{escape(title)}</h2><p>#{escape(description)}</p>#{version_line}<p><a href="#{escape(path)}">Read the #{escape(name)} skill</a></p></section>)
   end
 
   def invitation_failure(person, message, action \\ :retry, new_request_id \\ nil, chrome \\ []) do
