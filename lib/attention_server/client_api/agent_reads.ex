@@ -10,7 +10,7 @@ defmodule AttentionServer.ClientAPI.AgentReads do
   alias AttentionServer.ClientAPI.{AgentResources, Context, Projection, Reads, SharedReads}
 
   @page_size 50
-  @filters ~w(session sender legacy_message_id)
+  @filters ~w(session sender)
 
   @impl true
   def routes do
@@ -146,7 +146,6 @@ defmodule AttentionServer.ClientAPI.AgentReads do
         case name do
           "session" -> Message.uuid_v4?(value)
           "sender" -> Message.sender_id?(value) and value != Message.hosted_notice_sender()
-          "legacy_message_id" -> Message.nonempty?(value)
         end
 
       if valid, do: {:cont, :ok}, else: {:halt, {:error, :invalid_field, name}}

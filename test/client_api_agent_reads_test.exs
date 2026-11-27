@@ -808,38 +808,37 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
     scoped = get(ctx, "a1", "/v2/agent/messages?session=" <> @first_session)
     assert contract(ctx, "SentMessagesPage", scoped)["messages"] == [older]
 
-    legacy =
-      get(ctx, "a1", "/v2/agent/messages?sender=app%3Atest&legacy_message_id=item-1")
+    combined = "/v2/agent/messages?sender=app%3Atest&session=" <> @first_session
+    assert contract(ctx, "SentMessagesPage", get(ctx, "a1", combined))["messages"] == [older]
 
-    assert older["legacy_message_id"] == "item-1"
-    assert contract(ctx, "SentMessagesPage", legacy)["messages"] == [older]
+    item_id = older["item_id"]
+    detail = get(ctx, "a1", "/v2/agent/messages/" <> item_id)
+    assert %{"message" => ^older} = contract(ctx, "SentMessageResponse", detail)
 
-    combined = "/v2/agent/messages?sender=app%3Atest&legacy_message_id=item-1&session="
+    search = get(ctx, "a1", "/v2/search?sender=app%3Atest&message_id=item-1")
+    assert search.status == 200
+    assert %{"items" => [%{"item_id" => ^item_id}]} = decode_response(search)
 
-    assert contract(ctx, "SentMessagesPage", get(ctx, "a1", combined <> @first_session))[
-             "messages"
-           ] == [older]
-
-    assert contract(ctx, "SentMessagesPage", get(ctx, "a1", combined <> @other_session))[
-             "messages"
-           ] == []
+    unfiltered = get(ctx, "a1", "/v2/agent/messages?sender=app%3Atest&legacy_message_id=item-1")
+    assert contract(ctx, "SentMessagesPage", unfiltered)["messages"] == [newer, older]
+    refute Map.has_key?(older, "legacy_message_id")
 
     assert get(ctx, "a1", "/v2/agent/messages?session=invalid").status == 400
   end
 
   test "message pages bind the token to the agent and the filters", ctx do
-    for n <- 1..51, do: forward(ctx, "a1", n, @first_session)
+    ids = for n <- 1..51, do: forward(ctx, "a1", n, @first_session)
     filter = "/v2/agent/messages?session=" <> @first_session
 
     assert %{"messages" => messages, "next_page" => page} =
              contract(ctx, "SentMessagesPage", get(ctx, "a1", filter))
 
-    assert Enum.map(messages, & &1["legacy_message_id"]) ==
-             Enum.map(51..2//-1, &"item-#{&1}")
+    [oldest | others] = ids
+    assert Enum.map(messages, & &1["item_id"]) == Enum.reverse(others)
 
     next = filter <> "&page=" <> page
     last = contract(ctx, "SentMessagesPage", get(ctx, "a1", next))
-    assert [%{"legacy_message_id" => "item-1"}] = last["messages"]
+    assert [%{"item_id" => ^oldest}] = last["messages"]
     refute Map.has_key?(last, "next_page")
     assert get(ctx, "a2", next).status == 400
     assert get(ctx, "a1", "/v2/agent/messages?page=" <> page).status == 400

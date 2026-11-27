@@ -15,9 +15,8 @@ agent change feed (`/v2/agent`) for messages sent by that enrolled key. It can
 also read the person's attention list through the separate device interface.
 Enrollment does not grant ownership or every sender ID. The **sender ID**
 identifies the source of a message; a message's identity is its server-issued
-`item_id`. A sender ID plus message ID only looks up a message accepted before
-the cutover to protocol 0.2. Neither a self-stated source label nor a session
-handle grants access.
+`item_id`. Authenticate with the enrolled identity. A source label or a session
+handle carries no authority.
 
 A separately registered **agent identity** supports search, get and deliberate
 answer through separately scoped person routes on the same mutual-TLS device
