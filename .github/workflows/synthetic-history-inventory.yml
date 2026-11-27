@@ -18,6 +18,9 @@ jobs:
           set -euo pipefail
           root="$RUNNER_TEMP/history"
           mkdir -p "$root"/{original,upgrade,results}
+          openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+            -keyout "$root/owner.key" -out "$root/owner.der" -outform DER -days 1 \
+            -subj /CN=synthetic-owner 2>/dev/null
           release_base=https://github.com/clickety-clacks/harklight-server/releases/download
           for version in 0.1.49 0.2.0 0.2.16 0.2.28; do
             package="harklight-server-$version-linux-x86_64"
@@ -36,7 +39,7 @@ jobs:
               --property=MemorySwapMax=0 --property=PrivateNetwork=yes --uid="$(id -u)" \
               --working-directory="$root" /usr/bin/env ATTENTION_SERVER_ENABLE=0 \
               ERL_FLAGS='+S 2:2 +SDcpu 1 +SDio 1' FIXTURE_DB="$db" STAGE="$version" \
-              INVENTORY="$root/results/$version.json" FIXTURE_SCRIPT="$GITHUB_WORKSPACE/scripts/synthetic-history-inventory.exs" "$@"
+              OWNER_DER="$root/owner.der" INVENTORY="$root/results/$version.json" FIXTURE_SCRIPT="$GITHUB_WORKSPACE/scripts/synthetic-history-inventory.exs" "$@"
           }
           inventory() {
             isolated "$root/$version/bin/attention_server" eval 'Code.require_file(System.fetch_env!("FIXTURE_SCRIPT"))'

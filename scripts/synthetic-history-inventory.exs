@@ -1,11 +1,10 @@
 alias AttentionServer.{JSON, Relay}
-alias AttentionServer.ClientAPI.{Reads, Resources}
+alias AttentionServer.ClientAPI.{Feed, Reads, Resources}
 alias Exqlite.Sqlite3
 
 {:ok, _} = Application.ensure_all_started(:attention_server)
 path = System.fetch_env!("FIXTURE_DB")
 stage = System.fetch_env!("STAGE")
-person = "fixture-account"
 reader = "fixture-reader"
 origin = "fixture-origin"
 sender = "app:fixture"
@@ -20,8 +19,19 @@ request = fn actor, n, frame ->
   result
 end
 
+owner_der = System.fetch_env!("OWNER_DER") |> File.read!()
+{:ok, owner_key} = AttentionServer.DeviceIdentity.from_certificate(owner_der)
+
+person =
+  if stage == "0.1.49" do
+    {:ok, person} = Relay.operator_bootstrap(relay, owner_der)
+    person
+  else
+    [person] = Map.keys(:sys.get_state(relay).store.engine.owners)
+    person
+  end
+
 if stage == "0.1.49" do
-  :ok = Relay.setup_person(relay, person)
   :ok = Relay.setup_device(relay, person, reader)
   :ok = Relay.setup_device(relay, person, origin)
   :ok = Relay.setup_sender(relay, origin, sender)
@@ -45,7 +55,7 @@ items =
   for {{^person, ^sender, id} = key, record} <- Enum.sort(engine.messages) do
     facts = for {_, %{key: ^key, payload: payload}} <- Enum.sort(engine.conversation_events), do: payload
     %{"message_id" => id, "accepted_seq" => record.accepted_seq, "message" => record.message,
-      "terminal" => inspect(record.terminal), "facts" => facts}
+      "terminal" => if(record.terminal, do: Map.update!(record.terminal, :actor_kind, &to_string/1)), "facts" => facts}
   end
 
 projections =
@@ -53,14 +63,24 @@ projections =
     %{"legacy_events" => inspect(Relay.events(relay, reader, 0)),
       "legacy_conversation_events" => inspect(Relay.conversation_events(relay, reader, 0))}
   else
+    browser = %{kind: :browser, person: person, key: owner_key, owner_revision: 1,
+                session_id: "synthetic-browser"}
     {:ok, inbox} = Reads.inbox(relay, reader)
-    item_reads =
+    {:ok, browser_inbox} = Reads.inbox(relay, browser)
+    {:error, :unauthorized} = Reads.inbox(relay, %{browser | owner_revision: 2})
+    item_reads = fn principal ->
       for {{^person, ^sender, id}, record} <- Enum.sort(engine.messages), into: %{} do
         item_id = Resources.item_id(record)
-        {id, %{"id" => item_id, "item" => inspect(Reads.item(relay, reader, item_id)),
-               "entries" => inspect(Reads.entries(relay, reader, item_id))}}
+        {:ok, item} = Reads.item(relay, principal, item_id)
+        {:ok, entries} = Reads.entries(relay, principal, item_id)
+        {id, %{"id" => item_id, "item" => item, "entries" => entries}}
       end
-    %{"inbox" => inbox, "direct_item_reads" => item_reads}
+    end
+    reader_principal = %{kind: :device, key: reader, person: person}
+    %{"inbox" => inbox, "direct_item_reads" => item_reads.(reader),
+      "browser_inbox" => browser_inbox, "browser_item_reads" => item_reads.(browser),
+      "feed_from_zero" => inspect(Feed.read(relay, reader_principal, 0, 20)),
+      "feed_from_inbox" => inspect(Feed.read(relay, reader_principal, inbox["rev"], 20))}
   end
 
 :ok = GenServer.stop(relay)
