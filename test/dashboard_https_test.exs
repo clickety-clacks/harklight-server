@@ -152,7 +152,7 @@ defmodule AttentionServer.DashboardHTTPSTest do
       ])
 
     assert components =~ "HTTP/1.1 200"
-    assert components =~ "Agent skill: harklight-agent-saas"
+    assert components =~ "For people connecting an agent to Hosted Harklight"
     assert components =~ "v0.2.0"
 
     saas_skill =

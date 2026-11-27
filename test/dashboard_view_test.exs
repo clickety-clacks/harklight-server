@@ -135,18 +135,33 @@ defmodule AttentionServer.DashboardViewTest do
   test "the components page lists the coding-agent skill first with the existing guides below" do
     html = DashboardView.components("Dana", {:ok, "0.1.0"}, {:ok, "0.2.0"}, {:ok, "0.3.0"})
 
-    assert html =~ ~r{Agent skill: harklight</h2>.*Agent skill: harklight-agent</h2>}s
-    assert html =~ "v0.3.0"
-    assert html =~ ~s(href="/agent-skills/harklight/SKILL.md")
+    guides = [
+      {"For standalone agents like Claude Code and Codex",
+       "Ask people questions, offer choices, and read their replies.", "v0.3.0",
+       "/agent-skills/harklight/SKILL.md"},
+      {"For agents on self-hosted Harklight",
+       "Connect to your own Harklight Server and send and receive messages.", "v0.1.0",
+       "/agent-skills/SKILL.md"},
+      {"For people connecting an agent to Hosted Harklight",
+       "Connect an agent to your Hosted account and send a test question.", "v0.2.0",
+       "/agent-skills/harklight-agent-saas/SKILL.md"},
+      {"For developers integrating with Harklight",
+       "Look up how identities, sender grants, messages, replies, and Chat work.", nil,
+       "/agent-skills/core.md"}
+    ]
 
-    assert html =~ "Agent skill: harklight-agent</h2>"
-    assert html =~ "v0.1.0"
-    assert html =~ ~s(href="/agent-skills/SKILL.md")
+    for {title, description, version, path} <- guides do
+      [section] = Regex.run(~r{<section><h2>#{Regex.escape(title)}</h2>.*?</section>}, html)
+      assert section =~ "<p>#{description}</p>"
+      assert section =~ ~s(href="#{path}")
 
-    assert html =~ "Agent skill: harklight-agent-saas</h2>"
-    assert html =~ "v0.2.0"
-    assert html =~ ~s(href="/agent-skills/harklight-agent-saas/SKILL.md")
-    assert html =~ ~s(href="/agent-skills/core.md")
+      if version do
+        assert section =~ ~s(<p class="status version">#{version}</p>)
+      end
+    end
+
+    assert Regex.scan(~r{href="(/agent-skills/[^"]+)"}, html, capture: :all_but_first) ==
+             Enum.map(guides, fn {_title, _description, _version, path} -> [path] end)
   end
 
   test "the components page tolerates independent skill version lookup failures" do
@@ -164,9 +179,7 @@ defmodule AttentionServer.DashboardViewTest do
   test "the components page tolerates all skill version lookups failing" do
     html = DashboardView.components("Dana", :error, :error, :error)
 
-    refute html =~ ~s(<h2>Agent skill: harklight-agent</h2><p class="status">v)
-    refute html =~ ~s(<h2>Agent skill: harklight-agent-saas</h2><p class="status">v)
-    refute html =~ ~s(<h2>Agent skill: harklight</h2><p class="status">v)
+    refute html =~ ~s(class="status version")
   end
 
   test "a non-expiring invitation is labeled clearly" do

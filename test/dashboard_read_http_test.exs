@@ -449,7 +449,7 @@ defmodule AttentionServer.DashboardReadHTTPTest do
     refute page.resp_body =~ "harklight-agent setup"
   end
 
-  test "hosted components show the existing display label instead of the person UUID", %{
+  test "hosted components show the account label and ordered guide links only after sign-in", %{
     opts: opts
   } do
     hosted =
@@ -457,8 +457,14 @@ defmodule AttentionServer.DashboardReadHTTPTest do
         backend: Backend,
         skill_path: opts.skill_path,
         skill_path_saas: opts.skill_path_saas,
-        hosted: true
+        hosted: true,
+        hosted_addresses: %{sign_in: "https://account.example/sign-in"}
       )
+
+    signed_out = "/components" |> secure_get() |> DashboardReadHTTP.call(hosted)
+    assert signed_out.status == 303
+    assert Plug.Conn.get_resp_header(signed_out, "location") == ["https://account.example/sign-in"]
+    refute signed_out.resp_body =~ "/agent-skills/"
 
     page =
       "/components"
@@ -469,6 +475,14 @@ defmodule AttentionServer.DashboardReadHTTPTest do
     assert page.resp_body =~ ~s(<div class="account">Test account)
     refute page.resp_body =~ "00000000-0000-4000-8000-000000000001"
     assert page.resp_body =~ ~s(href="/devices")
+
+    assert Regex.scan(~r{href="(/agent-skills/[^"]+)"}, page.resp_body, capture: :all_but_first) ==
+             [
+               ["/agent-skills/harklight/SKILL.md"],
+               ["/agent-skills/SKILL.md"],
+               ["/agent-skills/harklight-agent-saas/SKILL.md"],
+               ["/agent-skills/core.md"]
+             ]
   end
 
   test "self-hosted components retain the person identifier when no display label exists", %{
