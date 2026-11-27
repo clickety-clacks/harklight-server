@@ -5011,6 +5011,9 @@ defmodule AttentionServer.Engine do
   end
 
   defp effective_revised_message(stored, revised) do
+    revised =
+      if Message.alarm?(stored), do: Map.put_new(revised, "alarm", true), else: revised
+
     # An inferred historical FYI may have a noncanonical Seen action. Its
     # original action remains usable, and untyped edits retain their admission rules.
     carry_type? =

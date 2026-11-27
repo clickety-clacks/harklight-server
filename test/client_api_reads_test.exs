@@ -108,6 +108,21 @@ defmodule AttentionServer.ClientAPIReadsTest do
     relay
   end
 
+  test "stored rank and pagination place an older Alarm before ordinary messages after restart", %{path: path} do
+    relay = scripted_relay(path)
+    before = all_pages(relay, "reader", 1) |> Enum.flat_map(& &1["items"])
+
+    alarm = put_in(forward_frame("alarm", 101), ["message", "alarm"], true)
+    assert %{"type" => "ok"} = request(relay, "origin", alarm)
+    forward(relay, "ordinary-newer", 102)
+    GenServer.stop(relay)
+    relay = start(path)
+
+    pages = all_pages(relay, "reader", 1)
+    assert [%{"message" => %{"alarm" => true}} | ordinary] = Enum.flat_map(pages, & &1["items"])
+    assert Enum.map(tl(ordinary), & &1["item_id"]) == Enum.map(before, & &1["item_id"])
+  end
+
   defp all_pages(relay, key, limit, page \\ nil, acc \\ []) do
     params = %{"limit" => Integer.to_string(limit)}
     params = if page, do: Map.put(params, "page", page), else: params

@@ -85,6 +85,10 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
     end
   end
 
+  defp dispatch_write(conn, _ctx, :send, _key, %{"recipients" => _, "message" => message})
+       when is_map_key(message, "alarm"),
+       do: Errors.send_error(conn, "unsupported")
+
   defp dispatch_write(conn, ctx, :send, key, %{"recipients" => selector} = body) do
     group? = match?(%{"kind" => "group"}, selector)
 
@@ -111,6 +115,10 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
   defp dispatch_write(conn, %{params: %{item_id: "shared_" <> _}} = ctx, operation, key, body)
        when operation in [:reply, :chat_receipt, :shared_answer_receipt, :advisory_ack],
        do: SharedChat.respond(conn, ctx, :sender, operation, body, key)
+
+  defp dispatch_write(conn, %{params: %{item_id: "shared_" <> _}}, :revise, _key,
+         %{"message" => message}) when is_map_key(message, "alarm"),
+    do: Errors.send_error(conn, "unsupported")
 
   defp dispatch_write(conn, %{params: %{item_id: "shared_" <> _ = id}} = ctx,
          operation, key, body) when operation in [:revise, :retract, :chat_close, :lifecycle] do
@@ -1215,7 +1223,9 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
 
   defp content(%{"message" => message}) when is_map(message) and not is_struct(message) do
     case Enum.find(~w(sender_id message_id supersedes), &Map.has_key?(message, &1)) do
-      nil -> {:ok, message}
+      nil when not is_map_key(message, "alarm") -> {:ok, message}
+      nil when is_boolean(:erlang.map_get("alarm", message)) -> {:ok, message}
+      nil -> {:error, "invalid_field", "alarm"}
       field -> {:error, "invalid_field", field}
     end
   end
