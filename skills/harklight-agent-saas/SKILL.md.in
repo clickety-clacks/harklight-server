@@ -6,7 +6,7 @@ Harklight is an attention-based UI for messages and requests from your AI agents
 
 @HOSTED_APP_INSTALL@
 
-Use Web if you do not have access to a compatible iPhone build. An Agent invitation is for the computer running the CLI. Follow the sign-in instructions in your iPhone build if you are an eligible tester.
+Use Web for this guide. The compatible iPhone app is not yet available to customers. An Agent invitation is for the computer running the CLI.
 
 ## Install Harklight Agent
 
@@ -24,7 +24,12 @@ brew install clickety-clacks/tap/harklight-agent
 
 ## Use it from Claude Code or Codex
 
-Open Claude Code or Codex and ask, “Ask me through Harklight whether to proceed.” Open Harklight and answer the question. To check the current Server, account, sender grants and installed skill paths, run `harklight-agent setup` with no arguments. It also refreshes the installed skill.
+Run `harklight-agent setup` with no arguments to check the current Server, account, sender grants and installed skill paths and refresh the skill. Agent 0.2.10 setup, sending, replying, reading and live follow have been exercised against an isolated Hosted-mode Server.
+
+- **Claude Code.** Setup instructions are available. End-to-end testing of skill discovery, delivery of Replies and Chat into the original session, and automatic continuation is pending.
+- **Codex CLI.** Setup instructions are available. End-to-end testing of skill discovery, delivery of Replies and Chat into the original session, and automatic continuation is pending.
+
+Resume the original session manually to check for Replies or Chat. The CLI workflow below is available while client-level testing is pending.
 
 ## Send a message and answer it
 
@@ -54,7 +59,7 @@ harklight-agent listen --follow --session "$HARKLIGHT_SESSION"
 
 The CLI emits JSON lines. Durable changes carry `kind`, `rev` and `data`. `caught_up` marks a complete catch-up. After interruption, use the same identity, state directory and session handle. A replayed batch may repeat an answer or Chat entry. Match answers by the original item ID and Chat by entry ID before acting again.
 
-A listener receiving an event does not itself resume Claude Code or Codex. When your client integration supports continuation, route the event back into the originating agent session with its saved conversation context. Otherwise, reopen or resume that original session, run the catch-up there, and give it the specific answer or Chat entry and its IDs. If the original session cannot be reached, leave the turn pending and report that handoff could not be confirmed.
+A listener receiving an event does not itself resume Claude Code or Codex. For a runtime with verified same-session background completion, run `harklight-agent listen --next --session "$HARKLIGHT_SESSION"` in the originating session, route its event back with the saved conversation context, and rearm after handling it. For manual continuation, reopen or resume the original client session, run `read` there, and give that session the specific answer or Chat entry and its IDs. If the original session cannot be reached, leave the turn pending and report that handoff could not be confirmed.
 
 Record handoff only after the originating session has received the turn. For an answer, use the original request's `item_id` as `HARKLIGHT_ITEM`:
 
