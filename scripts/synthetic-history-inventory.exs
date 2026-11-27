@@ -76,11 +76,16 @@ projections =
         {id, %{"id" => item_id, "item" => item, "entries" => entries}}
       end
     end
+    feed =
+      Enum.find([Feed, AttentionServer.ClientAPI.FeedStep], fn module ->
+        Code.ensure_loaded?(module) and function_exported?(module, :read, 4)
+      end)
+
     reader_principal = %{kind: :device, key: reader, person: person}
     %{"inbox" => inbox, "direct_item_reads" => item_reads.(reader),
       "browser_inbox" => browser_inbox, "browser_item_reads" => item_reads.(browser),
-      "feed_from_zero" => inspect(Feed.read(relay, reader_principal, 0, 20)),
-      "feed_from_inbox" => inspect(Feed.read(relay, reader_principal, inbox["rev"], 20))}
+      "feed_from_zero" => inspect(feed.read(relay, reader_principal, 0, 20)),
+      "feed_from_inbox" => inspect(feed.read(relay, reader_principal, inbox["rev"], 20))}
   end
 
 :ok = GenServer.stop(relay)
