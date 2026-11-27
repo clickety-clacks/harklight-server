@@ -811,6 +811,14 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
     combined = "/v2/agent/messages?sender=app%3Atest&session=" <> @first_session
     assert contract(ctx, "SentMessagesPage", get(ctx, "a1", combined))["messages"] == [older]
 
+    item_id = older["item_id"]
+    detail = get(ctx, "a1", "/v2/agent/messages/" <> item_id)
+    assert %{"message" => ^older} = contract(ctx, "SentMessageResponse", detail)
+
+    search = get(ctx, "a1", "/v2/search?sender=app%3Atest&message_id=item-1")
+    assert search.status == 200
+    assert %{"items" => [%{"item_id" => ^item_id}]} = decode_response(search)
+
     unfiltered = get(ctx, "a1", "/v2/agent/messages?sender=app%3Atest&legacy_message_id=item-1")
     assert contract(ctx, "SentMessagesPage", unfiltered)["messages"] == [newer, older]
     refute Map.has_key?(older, "legacy_message_id")
