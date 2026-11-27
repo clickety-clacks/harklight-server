@@ -1167,13 +1167,13 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
       revised = request(ctx, "a1", "PUT", path <> "/" <> id, revise, 2, [{"if-match", ~s("1")}])
       assert revised.status == 200, revised.body
 
-      assert %{"message" => %{"alarm" => true, "urgency" => "low"}} =
+      assert %{"item" => %{"message" => %{"alarm" => true, "urgency" => "low"}}} =
                decode_response(get(ctx, "a2", "/v2/items/" <> id))
 
       clear = put_in(revise["message"]["alarm"], false)
       cleared = request(ctx, "a1", "PUT", path <> "/" <> id, clear, 3, [{"if-match", ~s("2")}])
       assert cleared.status == 200, cleared.body
-      refute Map.has_key?(decode_response(get(ctx, "a2", "/v2/items/" <> id))["message"], "alarm")
+      refute Map.has_key?(get_in(decode_response(get(ctx, "a2", "/v2/items/" <> id)), ["item", "message"]), "alarm")
     end
 
     test "revise uses If-Match, advances revision, and replays before checking it", ctx do
