@@ -54,18 +54,38 @@ def inventory(directory, version, commit):
     (directory / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
 
 
+def web_observations(observations):
+    current = observations["current"]
+    answered = observations["answered"]
+    discussed = observations["discussed"]
+    return {
+        "unanswered_item": current["id"],
+        "answered_item": answered["id"],
+        "answer": answered["answer"],
+        "discussion_item": discussed["id"],
+        "discussion_entry": discussed["chat"]["entry_id"],
+        "discussion": discussed["chat"]["text"],
+    }
+
+
 def gate(manifest, result_paths):
     seen = set()
     for path in result_paths:
         result = load(path)
-        platform = result.get("platform")
+        reported_platform = result.get("platform")
+        platform = "Web" if reported_platform == "web" else reported_platform
         require(platform in PLATFORMS and platform not in seen, "invalid or repeated client platform")
         seen.add(platform)
         require(result.get("outcome") == "pass", f"{platform}: UI check did not pass")
         require(result.get("client_build"), f"{platform}: exact client build is missing")
         for field in ("fixture_sha256", "server_version", "server_commit"):
             require(result.get(field) == manifest[field], f"{platform}: {field} does not match")
-        require(result.get("observations") == manifest["expected"], f"{platform}: retained history differs")
+        observations = result["observations"]
+        if platform == "Web":
+            observations = web_observations(observations)
+        else:
+            require(result.get("relaunch") == "pass", f"{platform}: cold relaunch did not pass")
+        require(observations == manifest["expected"], f"{platform}: retained history differs")
     require(seen == PLATFORMS, "passing iPhone, iPad and Web results are all required")
 
 

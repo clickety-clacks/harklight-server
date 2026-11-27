@@ -2,7 +2,7 @@
 set -euo pipefail
 umask 077
 
-action="${1:?expected init, upgrade, or serve}"
+action="${1:?expected init, upgrade, serve, or browser-handoff}"
 root="$(realpath -m "${2:?expected disposable fixture directory}")"
 package="$(realpath "${3:?expected extracted package directory}")"
 script_dir="$(cd -- "$(dirname -- "$0")" && pwd)"
@@ -52,7 +52,21 @@ case "$action" in
   serve)
     [[ -f "$root/.harklight-history-fixture" ]]
     source "$state/server.env"
+    if [[ -n "${HISTORY_DASHBOARD_PORT:-}" ]]; then
+      export ATTENTION_SERVER_DASHBOARD_PORT="$HISTORY_DASHBOARD_PORT"
+      export ATTENTION_SERVER_DASHBOARD_BIND=127.0.0.1
+      export ATTENTION_SERVER_DASHBOARD_OWNER_PERSON="$(cat "$state/person-id")"
+      export ATTENTION_SERVER_DASHBOARD_SKILL_PATH="$package/skills/harklight-agent/SKILL.md"
+    fi
     exec "$package/bin/attention_server" start
+    ;;
+  browser-handoff)
+    [[ -f "$root/.harklight-history-fixture" && -f "$root/results/manifest.json" ]]
+    source "$state/server.env"
+    "$package/bin/harklight" owner browser-sign-in \
+      --connect 127.0.0.1 --name "$ATTENTION_SERVER_JOIN_NAME" --port "$ATTENTION_SERVER_OWNER_PORT" \
+      --ca "$state/tls/ca.pem" --cert "$state/owner/identity.pem" --key "$state/owner/identity.key" \
+      --person "$(cat "$state/person-id")" --output "${4:?expected private handoff file path}"
     ;;
   *)
     echo "unknown fixture action: $action" >&2
