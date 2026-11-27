@@ -1,0 +1,65 @@
+name: Harklight release history verification
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'scripts/history-continuity/**'
+      - '.github/workflows/harklight-history-verification.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  server-inventory:
+    name: Preserve predecessor history on the exact Server build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      ERL_FLAGS: '+S 2:2 +SDcpu 1 +SDio 1'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: '27.3.3'
+          elixir-version: '1.19.5'
+          version-type: strict
+      - name: Build exact candidate
+        run: |
+          dist="$RUNNER_TEMP/history-dist"
+          scripts/build-package.sh "$dist"
+          (cd "$dist" && sha256sum --check SHA256SUMS)
+          tar -xzf "$dist"/harklight-server-*-linux-x86_64.tar.gz -C "$dist"
+      - name: Rehearse stopped upgrade in a private network namespace
+        shell: bash
+        run: |
+          set -euo pipefail
+          packages="$RUNNER_TEMP/history-dist"
+          upstream=https://github.com/clickety-clacks/harklight-server/releases/download
+          for version in 0.1.49 0.2.16; do
+            mkdir "$packages/$version"
+            (
+              cd "$packages/$version"
+              archive="harklight-server-$version-linux-x86_64.tar.gz"
+              curl -fsSL --retry 3 -O "$upstream/v$version/$archive"
+              curl -fsSL --retry 3 -O "$upstream/v$version/SHA256SUMS"
+              sha256sum --check --ignore-missing SHA256SUMS
+              tar -xzf "$archive" --strip-components=1
+            )
+          done
+          candidate=("$packages"/harklight-server-*-linux-x86_64/)
+          fixture="$RUNNER_TEMP/history-fixture"
+          isolated() {
+            sudo systemd-run --quiet --wait --pipe --collect --property=PrivateNetwork=yes \
+              --property=MemoryMax=4G --property=MemorySwapMax=0 --uid="$(id -u)" \
+              /usr/bin/env ERL_FLAGS="$ERL_FLAGS" "$GITHUB_WORKSPACE/scripts/history-continuity/fixture.sh" "$@"
+          }
+          isolated init "$fixture" "$packages/0.1.49"
+          isolated upgrade "$fixture" "${candidate[0]}" "$packages/0.2.16"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: synthetic-server-history-only
+          path: ${{ runner.temp }}/history-fixture/results/*.json
