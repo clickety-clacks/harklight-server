@@ -1,0 +1,32 @@
+name: Isolated standing history candidate package
+on:
+  push:
+    branches: [evidence/history-standing-package]
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          ref: fdf5f053bc48d1ce59f6682e4bd6b69e48784275
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: '27.3.3'
+          elixir-version: '1.19.5'
+          version-type: strict
+      - name: Package the isolated candidate
+        env:
+          ERL_FLAGS: '+S 2:2 +SDcpu 1 +SDio 1'
+        run: |
+          set -euo pipefail
+          dist="$RUNNER_TEMP/history-package"
+          scripts/build-package.sh "$dist"
+          (cd "$dist" && sha256sum --check SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: standing-history-fdf5f05-package
+          path: ${{ runner.temp }}/history-package/*
+          if-no-files-found: error
