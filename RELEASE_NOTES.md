@@ -1,3 +1,22 @@
+# Harklight Server v0.2.35
+
+The Hosted Agent guide now walks through connecting Harklight Agent 0.2.10,
+approving its sender grants and answering a test question in Web. It explains
+how to read Replies and Chat and hand them back to the original agent session
+manually. End-to-end continuation testing for Claude Code and Codex CLI is
+pending.
+
+The signed-in Components page names the intended audience for each of its
+four existing guides and describes what readers can do with it. The guide
+links and their order stay the same.
+
+Release publication now requires history continuity evidence from iPhone,
+iPad and Web on a shared isolated fixture using the exact Server candidate.
+
+**Compatibility.** Protocol 0.2, FORMAT32 and auth generation 1. Harklight
+Agent 0.2.10 and bundled Harklight Web 0.2.7 continue to use the existing
+Server interfaces.
+
 # Harklight Server v0.2.34
 
 A sender can address one message and one Chat to several named people in the
