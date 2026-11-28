@@ -679,3 +679,9 @@ the normalized entry must retain the original journal position, revision and
 full typed payload. Missing or mismatched pointers refuse, without inventing a
 receipt or advancing delivery state. This does not prove runtime reconciliation
 of pending external work, which remains a separate activation requirement.
+
+Material validation must run as the intended Server service account. The staged
+root, every directory, both markers and every file must have that process's
+effective UID and GID, as well as private modes. A foreign owner refuses without
+repair: otherwise a correctly hashed 0600 key could be unreadable after cutover.
+Changing the runtime account is not part of migration validation.
