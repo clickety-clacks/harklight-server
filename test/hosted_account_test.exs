@@ -1072,7 +1072,7 @@ defmodule AttentionServer.HostedAccountTest do
 
     def create_invitation({%{person_id: @alice}, _request_id}), do: {:error, :forbidden}
 
-    def resolve_invitation(_token) do
+    def resolve_invitation("f" <> _) do
       {:ok,
        %{
          "person_id" => @alice,
@@ -1082,6 +1082,8 @@ defmodule AttentionServer.HostedAccountTest do
          "join_url" => "harklight://join#" <> String.duplicate("f", 64)
        }}
     end
+
+    def resolve_invitation(_token), do: {:error, :unavailable}
   end
 
   describe "hosted dashboard wording and origin" do
@@ -1232,12 +1234,31 @@ defmodule AttentionServer.HostedAccountTest do
       refute failure.resp_body =~ "owner"
 
       join = "/join" |> secure_get() |> DashboardReadHTTP.call(hosted)
-      assert join.resp_body =~ "Open in Harklight"
+      assert join.status == 200
+      assert join.resp_body =~ "If you already have a compatible Harklight app"
+      assert join.resp_body =~ ~s(<a id="open-harklight" hidden>Open in Harklight</a>)
+      assert join.resp_body =~ ~s(<a href="/account/sign-in">sign in to your Hosted account</a>)
+      assert join.resp_body =~ ~s(full Agent invitation from <a href="/devices">Devices</a>)
+
+      assert join.resp_body =~
+               ~s(<a href="/agent-skills/harklight-agent-saas/SKILL.md">Hosted Agent guide</a>)
+
+      refute join.resp_body =~ "harklight://join#"
       refute join.resp_body =~ "owner"
       refute join.resp_body =~ "Ask the"
 
+      self_hosted_join = "/join" |> secure_get() |> DashboardReadHTTP.call(plain)
+
+      assert self_hosted_join.resp_body =~
+               "The account owner must separately approve your exact device."
+
+      refute self_hosted_join.resp_body =~ "/account/sign-in"
+      refute self_hosted_join.resp_body =~ "Hosted Agent guide"
+
       script = "/join.js" |> secure_get() |> DashboardReadHTTP.call(hosted)
       assert script.resp_body =~ "account_label"
+      assert script.resp_body =~ ~s|history.replaceState(null, "", location.pathname);|
+      assert script.resp_body =~ ~s(credentials: "omit")
       refute script.resp_body =~ "owner"
       refute script.resp_body =~ "Ask the"
 
@@ -1277,20 +1298,28 @@ defmodule AttentionServer.HostedAccountTest do
       assert refused.status == 403
       assert refused.resp_body =~ "could not be verified"
 
-      resolve =
+      resolve = fn token ->
         %{
-          Plug.Test.conn(:post, "/join/resolve", String.duplicate("f", 64))
+          Plug.Test.conn(:post, "/join/resolve", token)
           | scheme: :https,
             port: 443
         }
         |> Plug.Conn.put_req_header("origin", @origin)
         |> Plug.Conn.put_req_header("content-type", "text/plain")
         |> DashboardReadHTTP.call(hosted)
+      end
 
-      assert resolve.status == 200
+      valid = resolve.(String.duplicate("f", 64))
+      assert valid.status == 200
 
-      assert JSON.decode_line(resolve.resp_body <> "\n") |> elem(1) |> Map.get("account_label") ==
-               "Alice"
+      assert {:ok, %{"account_label" => "Alice", "join_url" => "harklight://join#" <> _}} =
+               JSON.decode_line(valid.resp_body <> "\n")
+
+      invalid = resolve.("not-an-invitation")
+      assert {invalid.status, invalid.resp_body} == {400, "Invalid invitation request"}
+
+      unavailable = resolve.(String.duplicate("e", 64))
+      assert {unavailable.status, unavailable.resp_body} == {404, "Invitation unavailable"}
 
       # Self-hosted keeps the listener's own host as the origin and its owner wording.
       own =

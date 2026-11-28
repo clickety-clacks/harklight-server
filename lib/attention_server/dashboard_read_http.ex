@@ -1266,7 +1266,7 @@ defmodule AttentionServer.DashboardReadHTTP do
 
   defp join_page(conn, %{hosted: true}) do
     html =
-      ~s|<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Join Harklight</title>#{DashboardBrand.favicon()}</head><body><main>#{DashboardBrand.lockup(decorative: true)}<h1>Join Harklight</h1><p id="join-status" role="status">Checking invitation…</p><noscript>This invitation needs JavaScript.</noscript><p id="join-details"></p><a id="open-harklight" hidden>Open in Harklight</a></main><script src="/join.js" defer></script></body></html>|
+      ~s|<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Join Harklight</title>#{DashboardBrand.favicon()}</head><body><main>#{DashboardBrand.lockup(decorative: true)}<h1>Join Harklight</h1><p id="join-status" role="status">Checking invitation…</p><noscript>This invitation needs JavaScript.</noscript><p id="join-details"></p><p>If you already have a compatible Harklight app, open this invitation in the app once it is ready.</p><a id="open-harklight" hidden>Open in Harklight</a><p>To use Harklight on the Web, <a href="/account/sign-in">sign in to your Hosted account</a>.</p><p>To connect an agent with the CLI, get the full Agent invitation from <a href="/devices">Devices</a> and follow the <a href="/agent-skills/harklight-agent-saas/SKILL.md">Hosted Agent guide</a>.</p></main><script src="/join.js" defer></script></body></html>|
 
     conn |> put_resp_content_type("text/html", "utf-8") |> send_resp(200, html)
   end
