@@ -108,7 +108,7 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
       assert {:ok, verified} = VerifySharedMessages.run(db, identity, bundle)
       assert verified == %{messages: 1, revisions: 2, recipients: 2}
       for {column, bad, good} <- [{"accepted_at_ms", 999, 100},
-                                  {"origin_key", "changed-historical-origin", "historical-unenrolled-origin"}] do
+                                  {"origin_key", "changed-historical-origin", @origin}] do
         assert {:ok, _} = ImportSession.query(db, "UPDATE harklight.messages SET " <> column <> "=$2 WHERE id=$1", [@shared, bad])
         assert {:error, {:shared_message_mismatch, :message, _}} = VerifySharedMessages.run(db, identity, bundle)
         assert {:ok, _} = ImportSession.query(db, "UPDATE harklight.messages SET " <> column <> "=$2 WHERE id=$1", [@shared, good])
