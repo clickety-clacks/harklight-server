@@ -12,17 +12,36 @@ defmodule AttentionServer.Repository.Postgres.PersonSettings do
     digest = Base.decode16!(digest, case: :lower)
 
     Transaction.run([], fn _ ->
-      with {:ok, view} <- Settings.lock_browser(principal, at) do
+      with {:ok, view} <- lock_view(principal, at) do
         apply_request(principal, view, request, key, operation, digest, at)
       end
     end)
     |> result()
   end
 
+  defp lock_view(%{kind: :browser} = principal, at), do: Settings.lock_browser(principal, at)
+  defp lock_view(%{kind: :device} = principal, at), do: Settings.lock_native(principal, at)
+
   defp apply_request(principal, view, request, nil, operation, _digest, at) do
-    with :ok <- mutate(principal, view, request, operation, at) do
-      current(principal.person, 200, false)
+    with :ok <- mutate(principal, view, request, operation, at),
+         {:ok, body} <- render_settings(principal) do
+      {:ok, {200, body, false}}
     end
+  end
+
+  defp apply_request(%{kind: :device} = principal, view, request, key, operation, digest, at) do
+    Operations.execute_native_client(
+      {principal.person, key},
+      digest,
+      at,
+      fn ->
+        with :ok <- mutate(principal, view, request, operation, at),
+             {:ok, body} <- render_settings(principal) do
+          {:ok, 200, body}
+        end
+      end,
+      &project_receipt(&1, principal)
+    )
   end
 
   defp apply_request(principal, view, request, key, operation, digest, at) do
@@ -35,35 +54,29 @@ defmodule AttentionServer.Repository.Postgres.PersonSettings do
           {:ok, 200, %{"settings" => true}}
         end
       end,
-      fn
-        %{"settings" => true} -> render_settings(principal.person)
-        _ -> {:error, :receipt_unavailable}
-      end
+      &project_receipt(&1, principal)
     )
   end
 
-  defp current(person, status, replayed?) do
-    with {:ok, body} <- render_settings(person) do
-      {:ok, {status, body, replayed?}}
-    end
-  end
+  defp project_receipt(%{"settings" => true}, principal), do: render_settings(principal)
+  defp project_receipt(_receipt, _principal), do: {:error, :receipt_unavailable}
 
-  defp render_settings(person) do
-    with {:ok, view} <- Settings.for_person(person) do
-      {:ok, Settings.render(view)}
+  defp render_settings(principal) do
+    with {:ok, view} <- Settings.for_person(principal.person) do
+      Settings.project(view, principal)
     end
   end
 
   defp mutate(principal, view, {kind, value, if_match}, operation, at) do
-    %{"settings" => payload} = Settings.render(view)
-
-    if Writes.settings_match?(payload, if_match) do
+    with {:ok, %{"settings" => payload}} <- Settings.project(view, principal),
+         true <- Writes.settings_match?(payload, if_match) do
       with {:ok, semantic, fields, attributes} <- prepare_change(kind, value, view, at) do
         receipt = %{semantic: JSON.canonical(semantic), reply: Map.put(fields, "op_id", operation)}
         domain_operation(principal, view, attributes, operation, receipt, at)
       end
     else
-      {:error, :precondition_failed}
+      false -> {:error, :precondition_failed}
+      {:error, _} = error -> error
     end
   end
 
@@ -98,7 +111,7 @@ defmodule AttentionServer.Repository.Postgres.PersonSettings do
 
   defp domain_operation(principal, view, attributes, operation, %{semantic: semantic} = receipt, at) do
     person = principal.person
-    actor = Writes.browser_actor_key(person, principal.session_id)
+    actor = receipt_actor(principal)
     address = Attributes.key({:row, :receipts, {person, actor, operation}})
 
     case Transaction.query(
@@ -127,11 +140,16 @@ defmodule AttentionServer.Repository.Postgres.PersonSettings do
     end
   end
 
+  defp receipt_actor(%{kind: :browser, person: person, session_id: session}),
+    do: Writes.browser_actor_key(person, session)
+
+  defp receipt_actor(%{kind: :device, key: key}), do: key
+
   defp result({:ok, {status, body, replayed?}}), do: {:ok, status, body, replayed?}
   defp result({:error, {token, field}}) when token == :invalid_field, do: {:error, token, field}
 
   defp result({:error, token})
-       when token in [:unauthorized, :account_paused, :precondition_failed, :idempotency_conflict, :retry_later],
+       when token in [:unauthorized, :forbidden, :account_paused, :precondition_failed, :idempotency_conflict, :retry_later],
        do: {:error, token}
 
   defp result({:error, _}), do: {:error, :storage_unavailable}
