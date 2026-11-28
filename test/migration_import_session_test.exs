@@ -652,6 +652,7 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         verify_recipient_drift(db, identity, bundle)
         verify_authority_drift(db, identity, bundle)
         verify_account_drift(db, identity, bundle)
+        verify_feed_drift(db, identity, bundle)
         verify_conversation_drift(db, identity, bundle)
         verify_ordinary_entry_uploads(db, identity, bundle)
         assert {:ok, %{references: 0}} = AttentionServer.Migration.VerifyLargeText.run(db, identity, bundle)
@@ -2016,6 +2017,37 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
       assert {:ok, %{rows: members}} =
         ImportSession.query(db, "SELECT person_id FROM harklight.organization_members WHERE organization_id=$1 ORDER BY person_id", [organization])
       assert List.flatten(members) == Enum.sort(expected)
+    end
+
+    defp verify_feed_drift(db, identity, bundle) do
+      verifier = AttentionServer.Migration.VerifyFeeds
+      assert {:ok, counts} = verifier.run(db, identity, bundle)
+      assert Enum.all?(counts, fn {_, count} -> count > 0 end)
+      for table <- ~w(origin_feed_entries origin_delivery_acks advisory_feed_entries advisory_feed_receipts) do
+        sql = if table == "advisory_feed_receipts", do: "DELETE FROM harklight." <> table,
+          else: "UPDATE harklight." <> table <> " SET body='{}'::jsonb"
+        assert {:error, :synthetic_drift} = Postgrex.transaction(db, fn tx ->
+          assert {:ok, %{num_rows: n}} = ImportSession.query(tx, sql, [])
+          assert n > 0
+          assert {:error, {:feed_state_mismatch, ^table, _}} = verifier.run(tx, identity, bundle)
+          Postgrex.rollback(tx, :synthetic_drift)
+        end)
+        assert {:ok, ^counts} = verifier.run(db, identity, bundle)
+      end
+      assert {:error, :synthetic_drift} = Postgrex.transaction(db, fn tx ->
+        assert {:ok, _} = ImportSession.query(tx,
+          "UPDATE harklight.origin_feed_entries SET session_handle='synthetic-wrong-session'", [])
+        assert {:error, {:feed_state_mismatch, "origin_feed_entries", _}} = verifier.run(tx, identity, bundle)
+        Postgrex.rollback(tx, :synthetic_drift)
+      end)
+      assert {:ok, ^counts} = verifier.run(db, identity, bundle)
+      assert {:error, :synthetic_drift} = Postgrex.transaction(db, fn tx ->
+        assert {:ok, _} = ImportSession.query(tx,
+          "INSERT INTO harklight.advisory_feed_receipts SELECT person_id,origin_key,session_handle,advisory_id || '-extra' FROM harklight.advisory_feed_receipts LIMIT 1", [])
+        assert {:error, {:feed_count_mismatch, "advisory_feed_receipts"}} = verifier.run(tx, identity, bundle)
+        Postgrex.rollback(tx, :synthetic_drift)
+      end)
+      assert {:ok, ^counts} = verifier.run(db, identity, bundle)
     end
 
     defp verify_account_drift(db, identity, bundle) do
