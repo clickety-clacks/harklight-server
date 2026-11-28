@@ -577,6 +577,34 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         assert entry_count > 0
         assert {:ok, %{rows: [[^entry_count]]}} = ImportSession.query(db, "SELECT count(*) FROM harklight.conversation_entries", [])
 
+        assert {:ok, verified} = AttentionServer.Migration.VerifyFacts.run(db, identity, bundle)
+        assert verified.rows > manifest.data.records.count
+        assert {:error, :import_source_mismatch} = AttentionServer.Migration.VerifyFacts.run(db,
+          %{identity | source: :crypto.hash(:sha256, "wrong source")}, bundle)
+        address = Attributes.key({:field, :relay_instance_id})
+        assert {:ok, %{rows: [[original]]}} = ImportSession.query(db,
+          "SELECT body::text FROM harklight.compatibility_facts WHERE family='relay_instance_id' AND address=$1", [address])
+        assert {:ok, _} = ImportSession.query(db,
+          "UPDATE harklight.compatibility_facts SET body=$2::text::jsonb WHERE family='relay_instance_id' AND address=$1",
+          [address, JSON.encode!(Attributes.encode("changed synthetic identity"))])
+        assert {:error, :source_fact_mismatch} = AttentionServer.Migration.VerifyFacts.run(db, identity, bundle)
+        assert {:ok, _} = ImportSession.query(db,
+          "UPDATE harklight.compatibility_facts SET body=$2::text::jsonb WHERE family='relay_instance_id' AND address=$1", [address, original])
+        assert {:ok, %{rows: [[session_address, session_body]]}} = ImportSession.query(db,
+          "SELECT address,body::text FROM harklight.compatibility_facts WHERE family='harklight_browser_sessions' LIMIT 1", [])
+        assert {:ok, _} = ImportSession.query(db,
+          "DELETE FROM harklight.compatibility_facts WHERE family='harklight_browser_sessions' AND address=$1", [session_address])
+        assert {:error, :source_fact_mismatch} = AttentionServer.Migration.VerifyFacts.run(db, identity, bundle)
+        assert {:ok, _} = ImportSession.query(db,
+          "INSERT INTO harklight.compatibility_facts(family,address,body) VALUES('harklight_browser_sessions',$1,$2::text::jsonb)", [session_address, session_body])
+        extra = Attributes.key({:row, :persons, "synthetic unexpected person"})
+        assert {:ok, _} = ImportSession.query(db,
+          "INSERT INTO harklight.compatibility_facts(family,address,body) VALUES('persons',$1,$2::text::jsonb)",
+          [extra, JSON.encode!(Attributes.encode(1))])
+        assert {:error, :source_fact_count_mismatch} = AttentionServer.Migration.VerifyFacts.run(db, identity, bundle)
+        assert {:ok, _} = ImportSession.query(db,
+          "DELETE FROM harklight.compatibility_facts WHERE family='persons' AND address=$1", [extra])
+        assert {:ok, ^verified} = AttentionServer.Migration.VerifyFacts.run(db, identity, bundle)
         stop_supervised!(Repo)
 
         assert {:ok, :ok} =
