@@ -7,7 +7,8 @@ defmodule AttentionServer.Store.KeyedTransaction do
     ChangeLog,
     DeviceMigration,
     NativeSignIn,
-    SharedMessages
+    SharedMessages,
+    Store
   }
 
   alias AttentionServer.ClientAPI.{GroupRoutes, Idempotency, SharedChat}
@@ -29,6 +30,8 @@ defmodule AttentionServer.Store.KeyedTransaction do
       derived: derived,
       log: log,
       audit: audit,
+      change_log?: store.change_log,
+      shared_receipt: prepare_shared_receipt(next, audit),
       receipt_store: if(receipt?, do: store),
       receipt_engine: if(receipt?, do: next),
       auth_engine: if(is_map_key(audit, :auth_activation), do: prepared.engine),
@@ -38,9 +41,7 @@ defmodule AttentionServer.Store.KeyedTransaction do
   end
 
   defp projects_receipt?(audit) do
-    is_map_key(audit, :shared_send_receipt) or
-      match?({_, key, _, _} when not is_nil(key), audit[:shared_mutation_receipt]) or
-      match?(%{key: key} when is_binary(key), audit[:shared_chat]) or
+    match?(%{key: key} when is_binary(key), audit[:shared_chat]) or
       is_map_key(audit, :group_receipt)
   end
 
@@ -72,7 +73,7 @@ defmodule AttentionServer.Store.KeyedTransaction do
          :ok <- write_auth_activation(db, transaction.auth_engine, audit),
          :ok <- write_auth_changes(db, audit),
          {:ok, heads, agent_heads} <- append_change_logs(db, transaction.log, generation),
-         :ok <- write_shared_send_receipt(store, engine, audit),
+         :ok <- write_shared_receipt(db, transaction.change_log?, transaction.shared_receipt),
          :ok <- write_shared_chat_receipt(store, engine, audit),
          :ok <- write_group_receipt(store, engine, audit),
          :ok <- DerivedIndex.advance(db, generation),
@@ -123,43 +124,52 @@ defmodule AttentionServer.Store.KeyedTransaction do
 
   defp write_shared_chat_receipt(_store, _engine, _audit), do: :ok
 
-  defp write_shared_send_receipt(store, engine, %{
-         shared_send_receipt: {{person, origin} = scope, key, digest, id, outcomes}
+  defp prepare_shared_receipt(engine, %{
+         shared_send_receipt: {{_, _} = scope, key, digest, id, outcomes}
        }) do
-    record = Map.fetch!(engine.shared_messages, id)
-
-    with {:ok, rev} <- AgentChangeLog.head(store, scope),
-         {:ok, resource_rev} <- AgentChangeLog.rev(store, scope, {:shared_message, id}) do
-      body = %{
-        "rev" => rev,
-        "message" => SharedMessages.sender_message(engine, record, resource_rev),
-        "recipients" => outcomes
-      }
-
-      Idempotency.save(store, Idempotency.agent_scope(person, origin), key, digest, 200, body)
-    end
+    shared_receipt(engine, scope, key, digest, id, %{"recipients" => outcomes})
   end
 
-  defp write_shared_send_receipt(_store, _engine, %{shared_mutation_receipt: {_, nil, _, _}}),
-    do: :ok
-
-  defp write_shared_send_receipt(store, engine, %{
-         shared_mutation_receipt: {{person, origin} = scope, key, digest, id}
-       }) do
-    record = Map.fetch!(engine.shared_messages, id)
-
-    with {:ok, rev} <- AgentChangeLog.head(store, scope),
-         {:ok, resource_rev} <- AgentChangeLog.rev(store, scope, {:shared_message, id}) do
-      body = %{
-        "rev" => rev,
-        "message" => SharedMessages.sender_message(engine, record, resource_rev)
-      }
-
-      Idempotency.save(store, Idempotency.agent_scope(person, origin), key, digest, 200, body)
-    end
+  defp prepare_shared_receipt(engine, %{
+         shared_mutation_receipt: {{_, _} = scope, key, digest, id}
+       })
+       when not is_nil(key) do
+    shared_receipt(engine, scope, key, digest, id, %{})
   end
 
-  defp write_shared_send_receipt(_store, _engine, _audit), do: :ok
+  defp prepare_shared_receipt(_engine, _audit), do: nil
+
+  defp shared_receipt(engine, {_, _} = scope, key, digest, id, fields) do
+    record = Map.fetch!(engine.shared_messages, id)
+    message = SharedMessages.sender_message(engine, record, nil)
+    %{scope: scope, key: key, digest: digest, id: id, message: message, fields: fields}
+  end
+
+  defp write_shared_receipt(_db, _change_log?, nil), do: :ok
+
+  # The transaction supplies the two positions after appending the log. The
+  # rest of the receipt was projected from the proposed facts on the caller.
+  defp write_shared_receipt(db, change_log?, %{scope: {person, origin} = scope} = receipt) do
+    store = %Store{db: db, change_log: change_log?}
+
+    with {:ok, head} <- AgentChangeLog.head(store, scope),
+         {:ok, rev} <- AgentChangeLog.rev(store, scope, {:shared_message, receipt.id}) do
+      body =
+        Map.merge(receipt.fields, %{
+          "rev" => head,
+          "message" => %{receipt.message | "rev" => rev}
+        })
+
+      Idempotency.save(
+        store,
+        Idempotency.agent_scope(person, origin),
+        receipt.key,
+        receipt.digest,
+        200,
+        body
+      )
+    end
+  end
 
   defp write_auth_activation(db, engine, %{auth_activation: devices}) do
     with {:ok, %{} = _schema} <- AuthSchema.initialize_in_transaction(db, engine, devices),
