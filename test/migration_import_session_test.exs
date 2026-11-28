@@ -672,6 +672,7 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         verify_delivery_ack_links(db, identity, bundle)
         verify_conversation_drift(db, identity, bundle)
         verify_ordinary_entry_uploads(db, identity, bundle)
+        verify_catalog_drift(db, identity, bundle)
         assert {:ok, %{references: 0}} = AttentionServer.Migration.VerifyLargeText.run(db, identity, bundle)
         extra_hash = :crypto.hash(:sha256, "")
         assert {:ok, _} = ImportSession.query(db,
@@ -865,6 +866,53 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         assert {:ok, %{rows: [["loading"]]}} = ImportSession.query(db, "SELECT phase FROM harklight.import_state", [])
         Agent.stop(fixture.clock)
       end
+    end
+
+    defp verify_catalog_drift(db, identity, bundle) do
+      alias AttentionServer.Migration.VerifyCatalog
+      assert {:ok, report} = VerifyCatalog.run(db, identity, bundle)
+      assert report.tables["people"] >= 300
+      assert report.tables["import_state"] == 1
+      for name <- ["handoff_receipts", "jobs", "baseline_snapshots", "baseline_snapshot_items"] do
+        assert report.tables[name] == 0
+      end
+      assert {:ok, before} = AttentionServer.Migration.ImportStatus.read(db, identity)
+      for family <- ["unreviewed_durable_family", "large-text-paths/not-a-source-address", "large-text-paths/" <> String.duplicate("a", 65)] do
+        assert {:error, :synthetic_drift} = Postgrex.transaction(db, fn tx ->
+          assert {:ok, _} = ImportSession.query(tx,
+            "INSERT INTO harklight.compatibility_facts(family,address,body) VALUES($1,$2,'{}'::jsonb)",
+            [family, <<1, 2, 3>>])
+          assert {:error, :catalog_fact_family_uncovered} = VerifyCatalog.run(tx, identity, bundle)
+          Postgrex.rollback(tx, :synthetic_drift)
+        end)
+        assert {:ok, ^report} = VerifyCatalog.run(db, identity, bundle)
+      end
+      for ddl <- ["CREATE TABLE harklight.unreviewed_state(value integer)",
+                   "CREATE VIEW harklight.unreviewed_view AS SELECT 1 AS value",
+                   "ALTER TABLE harklight.people RENAME TO missing_people"] do
+        assert {:error, :synthetic_drift} = Postgrex.transaction(db, fn tx ->
+          assert {:ok, _} = ImportSession.query(tx, ddl, [])
+          assert {:error, :catalog_relation_coverage_mismatch} = VerifyCatalog.run(tx, identity, bundle)
+          Postgrex.rollback(tx, :synthetic_drift)
+        end)
+        assert {:ok, ^report} = VerifyCatalog.run(db, identity, bundle)
+      end
+      assert {:error, :synthetic_drift} = Postgrex.transaction(db, fn tx ->
+        assert {:ok, _} = ImportSession.query(tx, "DELETE FROM harklight.schema_migrations WHERE version=1", [])
+        assert {:error, :catalog_schema_version_mismatch} = VerifyCatalog.run(tx, identity, bundle)
+        Postgrex.rollback(tx, :synthetic_drift)
+      end)
+      assert {:ok, ^report} = VerifyCatalog.run(db, identity, bundle)
+      assert {:error, :synthetic_drift} = Postgrex.transaction(db, fn tx ->
+        assert {:ok, %{num_rows: 1}} = ImportSession.query(tx, """
+          INSERT INTO harklight.jobs(kind,id,person_id,ready_at_ms,body)
+          SELECT 'push','synthetic-unexpected-job',id,0,'{}'::jsonb FROM harklight.people ORDER BY id LIMIT 1
+          """, [])
+        assert {:error, :catalog_identity_or_empty_table_mismatch} = VerifyCatalog.run(tx, identity, bundle)
+        Postgrex.rollback(tx, :synthetic_drift)
+      end)
+      assert {:ok, ^report} = VerifyCatalog.run(db, identity, bundle)
+      assert {:ok, ^before} = AttentionServer.Migration.ImportStatus.read(db, identity)
     end
 
     defp verify_receipt_replay(person, {agent_person, agent}, hex_digest) do
