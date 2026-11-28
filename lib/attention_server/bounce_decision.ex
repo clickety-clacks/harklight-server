@@ -17,8 +17,14 @@ defmodule AttentionServer.BounceDecision do
   def person_visible?(record), do: is_map(record) and not fully_bounced?(record)
 
   def levels(%Engine{} = engine, person) do
-    engine
-    |> effective_levels(person)
+    engine.bounce_levels
+    |> Map.get(person)
+    |> levels_from_configuration()
+  end
+
+  def levels_from_configuration(configuration) do
+    configuration
+    |> configured_levels()
     |> BouncePolicy.public_levels()
   end
 
@@ -1405,13 +1411,11 @@ defmodule AttentionServer.BounceDecision do
 
   # Reading the levels has no side effects. Backfill runs once per missing
   # selection when the relay opens a store.
-  defp effective_levels(engine, person) do
-    case Map.get(engine.bounce_levels, person) do
-      nil -> BouncePolicy.default_levels()
-      %{levels: levels} -> levels
-      _ -> nil
-    end
-  end
+  defp effective_levels(engine, person), do: configured_levels(Map.get(engine.bounce_levels, person))
+
+  defp configured_levels(nil), do: BouncePolicy.default_levels()
+  defp configured_levels(%{levels: levels}), do: levels
+  defp configured_levels(_), do: nil
 
   defp qualifies_initial_delivery?(nil, accepted_seq),
     do: is_integer(accepted_seq) and accepted_seq > 0

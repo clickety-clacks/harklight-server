@@ -2,7 +2,7 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
   defmodule AttentionServer.Repository.PostgresTransactionTest do
     use ExUnit.Case, async: false
 
-    alias AttentionServer.Repository.Postgres.{Operations, Pool, Repo, Transaction}
+    alias AttentionServer.Repository.Postgres.{Attributes, Jobs, Operations, Pool, Repo, Transaction}
 
     setup_all do
       config = [url: System.fetch_env!("HARKLIGHT_POSTGRES_TEST_URL")]
@@ -53,6 +53,178 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
       end
 
       :ok
+    end
+
+    @tag :tmp_dir
+    test "a FORMAT32 browser cookie keeps its principal after projection to PostgreSQL", %{tmp_dir: dir} do
+      alias AttentionServer.DashboardBrowserSession
+      alias AttentionServer.ClientAPI.{Auth, Router}
+      alias AttentionServer.Repository.{CommittedRead, Postgres.Identities}
+
+      {relay, browser, backend, cookie, principal} = browser_fixture(dir)
+      %{person: person, key: key, owner_revision: revision, session_id: hash} = principal
+      conn = browser_request(:get, "/v2/me", cookie)
+
+      assert {:ok, ^principal} = Auth.web(conn, Identities, :postgres)
+      # Exercise the browser authentication seam in the real router. Both
+      # requests still use the FORMAT32 relay for the /me projection.
+      sqlite_opts = Router.init(relay: relay, auth: {:browser, backend, nil})
+      postgres_opts = Router.init(relay: relay, auth: {:browser, Identities, nil})
+      assert %{status: 200, resp_body: body} = Router.call(conn, sqlite_opts)
+      assert %{status: 200, resp_body: ^body} = Router.call(conn, postgres_opts)
+
+      assert {:ok, ^person, ^revision} = CommittedRead.execute(:postgres, {:owner_identity, key})
+      assert {:ok, ^revision} = CommittedRead.execute(:postgres, {:owner_revision, person, key})
+      assert {:error, :forbidden} =
+               CommittedRead.execute(:postgres, {:owner_revision, "other-person", key})
+
+      assert {:ok, _} =
+               Transaction.query("UPDATE harklight.principals SET revision = revision + 1 WHERE key = $1", [key])
+      assert {:error, :unauthorized} = Auth.web(conn, Identities, :postgres)
+      assert {:ok, _} =
+               Transaction.query("UPDATE harklight.principals SET revision = $2, revoked = true WHERE key = $1", [
+                 key,
+                 revision
+               ])
+      assert {:error, :forbidden} = CommittedRead.execute(:postgres, {:owner_identity, key})
+      assert {:error, :unauthorized} = Auth.web(conn, Identities, :postgres)
+      assert %{status: 401} = Router.call(conn, postgres_opts)
+      assert {:ok, _} =
+               Transaction.query("UPDATE harklight.principals SET revoked = false WHERE key = $1", [key])
+
+      assert :ok = DashboardBrowserSession.end_session(browser, cookie)
+      assert {:ok, _} = Transaction.query("DELETE FROM harklight.auth_sessions WHERE token_hash = $1", [hash])
+      assert {:error, :unauthorized} = Auth.web(conn, backend, relay)
+      assert {:error, :unauthorized} = Auth.web(conn, Identities, :postgres)
+    end
+
+    @tag :tmp_dir
+    test "the isolated PostgreSQL router serves the same browser settings and ETag", %{tmp_dir: dir} do
+      alias AttentionServer.{JSON, Relay}
+      alias AttentionServer.ClientAPI.{Router, Writes}
+      alias AttentionServer.Repository.Postgres.{Attributes, Identities}
+
+      {relay, _browser, backend, cookie, principal} = browser_fixture(dir)
+      %{person: person, key: key} = principal
+      sqlite = Router.init(relay: relay, auth: {:browser, backend, nil})
+      postgres = Router.init(relay: nil, repository: :postgres, auth: {:browser, Identities, nil})
+      conn = browser_request(:get, "/v2/settings", cookie)
+
+      assert %{status: 200, resp_body: initial} = original = Router.call(conn, sqlite)
+      assert %{status: 200, resp_body: ^initial} = Router.call(conn, postgres)
+      assert [tag] = Plug.Conn.get_resp_header(original, "etag")
+
+      assert {:ok, 200, _, false} = Writes.alerts(relay, principal, "all", tag)
+      assert %{status: 200, resp_body: body} = updated = Router.call(conn, sqlite)
+      assert {:ok, %{"rev" => head, "settings" => %{"rev" => rev, "alerts" => "all"}}} =
+               JSON.decode_line(body <> "\n")
+      assert [updated_tag] = Plug.Conn.get_resp_header(updated, "etag")
+      observer = self()
+
+      writer =
+        Task.async(fn ->
+          Transaction.run([], fn _ ->
+            assert {:ok, _} =
+                     Transaction.query("UPDATE harklight.people SET settings = $2 WHERE id = $1", [
+                       person,
+                       Attributes.encode(%{alert_choices: "all"})
+                     ])
+            assert {:ok, _} =
+                     Transaction.query(
+                       "INSERT INTO harklight.stream_heads (person_id, origin_key, head) VALUES ($1, '', $2)",
+                       [person, head]
+                     )
+            assert {:ok, _} =
+                     Transaction.query(
+                       """
+                       INSERT INTO harklight.stream_resource_revisions
+                         (person_id, origin_key, resource_kind, resource_id, revision)
+                       VALUES ($1, '', 'settings', 'settings', $2)
+                       """,
+                       [person, rev]
+                     )
+
+            send(observer, :settings_staged)
+            receive do: (:commit_settings -> {:ok, :committed})
+          end)
+        end)
+
+      assert_receive :settings_staged, 2_000
+      assert %{status: 200, resp_body: ^initial} = Router.call(conn, postgres)
+      send(writer.pid, :commit_settings)
+      assert {:ok, :committed} = Task.await(writer)
+      assert %{status: 200, resp_body: ^body} = pg_response = Router.call(conn, postgres)
+      assert [^updated_tag] = Plug.Conn.get_resp_header(pg_response, "etag")
+      conditional = Plug.Conn.put_req_header(conn, "if-none-match", updated_tag)
+      assert %{status: 304, resp_body: ""} = Router.call(conditional, sqlite)
+      assert %{status: 304, resp_body: ""} = Router.call(conditional, postgres)
+
+      assert {:ok, _} = Relay.hosted_delivery_state(relay, person, "STOPPED")
+      assert {:ok, _} =
+               Transaction.query("UPDATE harklight.people SET delivery_state = 'STOPPED' WHERE id = $1", [person])
+      assert %{status: 403, assigns: %{client_api_error: "account_paused"}} = Router.call(conn, sqlite)
+      assert %{status: 403, assigns: %{client_api_error: "account_paused"}} = Router.call(conn, postgres)
+
+      assert {:ok, _} =
+               Transaction.query("UPDATE harklight.principals SET revoked = true WHERE key = $1", [key])
+      assert %{status: 401} = Router.call(conn, postgres)
+      assert %{status: 401} = Router.call(Plug.Test.conn(:get, "/v2/settings"), postgres)
+      assert %{status: 404} = Router.call(browser_request(:get, "/v2/inbox", cookie), postgres)
+      assert %{status: 404} = Router.call(browser_request(:put, "/v2/settings/alerts", cookie), postgres)
+    end
+
+    defp browser_fixture(dir) do
+      alias AttentionServer.{DashboardBackend, DashboardBrowserSession, Relay, Store.AuthSchema}
+      alias AttentionServer.ClientAPI.Auth
+      alias Exqlite.Sqlite3
+
+      path = Path.join(dir, "relay.sqlite3")
+      opts = [
+        store_path: path,
+        deployment_mode: :saas,
+        dashboard_origin: "https://account.example.test"
+      ]
+
+      {:ok, relay} = Relay.start_link(opts)
+      {:ok, person} = Relay.hosted_account_create(relay, "browser-fixture")
+      :ok = GenServer.stop(relay)
+
+      {:ok, db} = Sqlite3.open(path)
+      assert {:ok, _} = AuthSchema.initialize(db)
+      :ok = Sqlite3.close(db)
+
+      relay = start_supervised!({Relay, opts})
+      browser = start_supervised!({DashboardBrowserSession, relay: relay})
+      backend = {DashboardBackend, %DashboardBackend{relay: relay, sessions: browser}}
+      assert {:ok, grant} = Relay.hosted_browser_grant(relay, person, "fixture-browser", "google")
+      assert {:ok, %{cookie: cookie}} = Relay.redeem_hosted_browser_grant(relay, grant, "fixture-browser")
+      conn = browser_request(:get, "/v2/me", cookie)
+
+      assert {:ok, %{person: ^person, key: key, owner_revision: revision, session_id: hash} = principal} =
+               Auth.web(conn, backend, relay)
+      assert {:ok, _} = Transaction.query("INSERT INTO harklight.people (id) VALUES ($1)", [person])
+      assert {:ok, _} =
+               Transaction.query(
+                 "INSERT INTO harklight.principals (key, person_id, kind, revision) VALUES ($1, $2, 'owner', $3)",
+                 [key, person, revision]
+               )
+      assert {:ok, _} =
+               Transaction.query(
+                 """
+                 INSERT INTO harklight.auth_sessions
+                   (token_hash, person_id, principal_key, kind, principal_revision)
+                 VALUES ($1, $2, $3, 'browser', $4)
+                 """,
+                 [hash, person, key, revision]
+               )
+
+      {relay, browser, backend, cookie, principal}
+    end
+
+    defp browser_request(method, path, cookie) do
+      method
+      |> Plug.Test.conn(path)
+      |> Plug.Test.put_req_cookie("__Host-harklight", cookie)
     end
 
     test "committed pages preserve person and Agent position and retention contracts" do
@@ -266,6 +438,228 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
       assert {:ok, ^key, _} = AgentItems.owned_item(:postgres, {person, origin}, "i7")
     end
 
+    test "an attachment is served only after its complete chunk sequence and digest verify" do
+      alias AttentionServer.Repository.Postgres.Uploads
+
+      person = "synthetic-upload-person"
+      owner = "synthetic-upload-owner"
+      ref = {person, owner, "synthetic-attachment"}
+      full = :binary.copy(<<42>>, Uploads.chunk_bytes())
+      tail = <<0, 1, 255>>
+      size = byte_size(full) + byte_size(tail)
+      digest = :crypto.hash(:sha256, [full, tail])
+
+      assert {:ok, _} = Transaction.query("INSERT INTO harklight.people (id) VALUES ($1)", [person])
+      assert {:error, :upload_cap_exceeded} =
+               Uploads.begin_upload(
+                 person, owner, "synthetic-attachment", size, digest, %{},
+                 upload_limits(size - 1, size)
+               )
+      assert {:ok, "synthetic-attachment"} =
+               Uploads.begin_upload(
+                 person, owner, "synthetic-attachment", size, digest, %{}, upload_limits(size, size)
+               )
+      assert {:error, :not_found} = Uploads.read_chunk(person, "synthetic-attachment", 0)
+      assert {:error, :invalid_chunk} = Uploads.put_chunk(ref, 0, tail)
+      assert {:error, :not_found} =
+               Uploads.put_chunk({person, "other-owner", "synthetic-attachment"}, 0, full)
+
+      assert {:ok, :stored} = Uploads.put_chunk(ref, 0, full)
+      assert {:ok, :stored} = Uploads.put_chunk(ref, 0, full)
+      assert {:error, :upload_conflict} =
+               Uploads.put_chunk(ref, 0, :binary.copy(<<43>>, byte_size(full)))
+      assert {:error, :incomplete_upload} = Uploads.complete(ref, 10)
+      assert {:ok, :stored} = Uploads.put_chunk(ref, 1, tail)
+      assert {:ok, "synthetic-attachment"} = Uploads.complete(ref, 10)
+      assert {:ok, "synthetic-attachment"} = Uploads.complete(ref, 11)
+      assert {:ok, ^full} = Uploads.read_chunk(person, "synthetic-attachment", 0)
+      assert {:ok, ^tail} = Uploads.read_chunk(person, "synthetic-attachment", 1)
+      assert {:error, :not_found} = Uploads.read_chunk("other-person", "synthetic-attachment", 0)
+      assert {:error, :upload_completed} = Uploads.put_chunk(ref, 1, tail)
+
+      assert {:ok, "corrupt-attachment"} =
+               Uploads.begin_upload(
+                 person, owner, "corrupt-attachment", 3, digest, %{}, upload_limits(:none, size + 3)
+               )
+      corrupt = {person, owner, "corrupt-attachment"}
+      assert {:ok, :stored} = Uploads.put_chunk(corrupt, 0, tail)
+      assert {:error, :upload_digest_mismatch} = Uploads.complete(corrupt, 10)
+      assert {:error, :not_found} = Uploads.read_chunk(person, "corrupt-attachment", 0)
+
+      empty_digest = :crypto.hash(:sha256, <<>>)
+      assert {:ok, "empty-attachment"} =
+               Uploads.begin_upload(
+                 person, owner, "empty-attachment", 0, empty_digest, %{}, upload_limits(:none, size + 3)
+               )
+      assert {:ok, "empty-attachment"} = Uploads.complete({person, owner, "empty-attachment"}, 10)
+    end
+
+    test "a committed upload reservation can be replayed after its response is lost" do
+      alias AttentionServer.Repository.Postgres.Uploads
+
+      person = "synthetic-upload-replay"
+      owner = "synthetic-owner"
+      id = "resumable-upload"
+      bytes = <<1, 2, 3>>
+      digest = :crypto.hash(:sha256, bytes)
+      metadata = %{filename: "fixture.bin"}
+      observer = self()
+      assert {:ok, _} = Transaction.query("INSERT INTO harklight.people VALUES ($1)", [person])
+
+      {writer, monitor} =
+        spawn_monitor(fn ->
+          result = Uploads.begin_upload(person, owner, id, 3, digest, metadata, upload_limits(3, 3))
+          send(observer, {:reservation_committed, result})
+          receive do: (:response_delivered -> :ok)
+        end)
+
+      assert_receive {:reservation_committed, {:ok, ^id}}, 2_000
+      Process.exit(writer, :kill)
+      assert_receive {:DOWN, ^monitor, :process, ^writer, :killed}, 2_000
+
+      assert {:ok, ^id} =
+               Uploads.begin_upload(person, owner, id, 3, digest, metadata, upload_limits(2, 2))
+      assert {:error, :upload_conflict} =
+               Uploads.begin_upload(person, owner, id, 3, digest, %{}, upload_limits(3, 3))
+      assert {:error, :upload_conflict} =
+               Uploads.begin_upload(person, "other-owner", id, 3, digest, metadata, upload_limits(3, 3))
+      assert {:ok, :stored} = Uploads.put_chunk({person, owner, id}, 0, bytes)
+      assert {:ok, ^id} = Uploads.complete({person, owner, id}, 11)
+      assert {:ok, ^bytes} = Uploads.read_chunk(person, id, 0)
+    end
+
+    test "parallel reservations share the account cap across upload owners" do
+      alias AttentionServer.Repository.Postgres.Uploads
+
+      person = "synthetic-upload-quota"
+      bytes = <<1, 2, 3>>
+      digest = :crypto.hash(:sha256, bytes)
+      observer = self()
+      assert {:ok, _} = Transaction.query("INSERT INTO harklight.people VALUES ($1)", [person])
+
+      blocker =
+        Task.async(fn ->
+          Transaction.run([], fn _ ->
+            assert {:ok, %{num_rows: 1}} =
+                     Transaction.query(
+                       "SELECT id FROM harklight.people WHERE id = $1 FOR NO KEY UPDATE",
+                       [person]
+                     )
+
+            send(observer, :account_locked)
+            receive do: (:release_account -> {:ok, :released})
+          end)
+        end)
+
+      assert_receive :account_locked, 2_000
+
+      requests =
+        for id <- ["quota-one", "quota-two"] do
+          Task.async(fn ->
+            Uploads.begin_upload(person, id, id, 3, digest, %{}, upload_limits(3, 5))
+          end)
+        end
+
+      await_admission_waits(100)
+      send(blocker.pid, :release_account)
+      assert {:ok, :released} = Task.await(blocker)
+      assert [{:error, :upload_cap_exceeded}, {:ok, winner}] =
+               requests |> Enum.map(&Task.await/1) |> Enum.sort()
+
+      assert {:ok, :stored} = Uploads.put_chunk({person, winner, winner}, 0, bytes)
+      assert {:ok, 0} = Uploads.cleanup(person, 99)
+      assert {:ok, 1} = Uploads.cleanup(person, 100)
+      assert {:ok, %{rows: [[0]]}} =
+               Transaction.query("SELECT count(*) FROM harklight.upload_chunks WHERE upload_id = $1", [winner])
+      assert {:ok, "replacement"} =
+               Uploads.begin_upload(person, "owner", "replacement", 3, digest, %{}, upload_limits(3, 5))
+    end
+
+    test "cleanup skips attachment links in flight and only retires expired orphans" do
+      alias AttentionServer.Repository.Postgres.Uploads
+
+      person = "synthetic-upload-cleanup"
+      owner = "synthetic-upload-writer"
+      target = {person, owner, "linked-upload"}
+      orphan = {person, owner, "orphan-upload"}
+      message = "synthetic-attachment-message"
+      observer = self()
+      assert {:ok, _} = Transaction.query("INSERT INTO harklight.people VALUES ($1)", [person])
+      assert {:ok, _} =
+               Transaction.query(
+                 "INSERT INTO harklight.principals (key, person_id, kind, revision) VALUES ($1, $2, 'device', 1)",
+                 [owner, person]
+               )
+      assert {:ok, _} =
+               Transaction.query(
+                 """
+                 INSERT INTO harklight.messages
+                   (id, person_id, origin_key, sender_id, message_id, revision, accepted_at_ms)
+                 VALUES ($1, $2, $3, 'app:fixture', 'message', 1, 10)
+                 """,
+                 [message, person, owner]
+               )
+      assert {:ok, _} =
+               Transaction.query(
+                 "INSERT INTO harklight.message_revisions VALUES ($1, 1, 10, '{}')",
+                 [message]
+               )
+
+      for {_person, _owner, id} <- [target, orphan] do
+        assert {:ok, ^id} =
+                 Uploads.begin_upload(
+                   person, owner, id, 0, :crypto.hash(:sha256, <<>>), %{}, upload_limits(0, 0)
+                 )
+      end
+
+      assert {:error, :transaction_required} = Uploads.link(target, message, 1, 0, %{})
+      assert {:error, :incomplete_upload} =
+               Transaction.run([], fn _ -> Uploads.link(target, message, 1, 0, %{}) end)
+      assert {:ok, "linked-upload"} = Uploads.complete(target, 10)
+
+      linker =
+        Task.async(fn ->
+          Transaction.run([], fn _ ->
+            assert {:ok, "linked-upload"} = Uploads.link(target, message, 1, 0, %{})
+            send(observer, :attachment_linked)
+            receive do: (:commit_link -> {:ok, :linked})
+          end)
+        end)
+
+      assert_receive :attachment_linked, 2_000
+      assert {:ok, 1} = Uploads.cleanup(person, 100)
+      send(linker.pid, :commit_link)
+      assert {:ok, :linked} = Task.await(linker)
+      assert {:ok, 0} = Uploads.cleanup(person, 100)
+      assert {:error, :not_found} =
+               Transaction.run([], fn _ -> Uploads.link(orphan, message, 1, 1, %{}) end)
+      assert {:ok, %{rows: [["linked-upload"]]}} =
+               Transaction.query("SELECT upload_id FROM harklight.message_uploads WHERE message_id = $1", [message])
+    end
+
+    defp upload_limits(file, account) do
+      %{file_limit: file, account_limit: account, expires_at_ms: 100}
+    end
+
+    defp await_admission_waits(0), do: flunk("both admissions did not reach the account lock")
+
+    defp await_admission_waits(remaining) do
+      assert {:ok, %{rows: [[count]]}} =
+               Transaction.query(
+                 """
+                 SELECT count(*) FROM pg_stat_activity
+                 WHERE wait_event_type = 'Lock'
+                   AND query LIKE 'SELECT id FROM harklight.people%FOR NO KEY UPDATE'
+                 """,
+                 []
+               )
+
+      if count < 2 do
+        Process.sleep(10)
+        await_admission_waits(remaining - 1)
+      end
+    end
+
     test "reversed multi-stream inputs wait on the same first lock" do
       left = {"lock-a", ""}
       right = {"lock-b", ""}
@@ -341,6 +735,91 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
         Process.sleep(10)
         await_lock_wait(statement, remaining - 1)
       end
+    end
+
+    @tag :tmp_dir
+    test "FORMAT32 native bearers retain pending state and device authority in PostgreSQL", %{tmp_dir: dir} do
+      alias AttentionServer.{BrowserAuth, DeviceProof, NativeSignIn, Relay, Store.AuthSchema}
+      alias AttentionServer.ClientAPI.{Auth, Router}
+      alias AttentionServer.Repository.Postgres.Attributes
+      alias Exqlite.Sqlite3
+
+      person = "synthetic-native-account"
+      active = "synthetic-active-device"
+      pending = "synthetic-pending-device"
+      path = Path.join(dir, "native.sqlite3")
+      opts = [store_path: path]
+      relay = start_supervised!({Relay, opts})
+      assert :ok = Relay.setup_person(relay, person)
+      assert :ok = Relay.setup_device(relay, person, active)
+      assert :ok = Relay.setup_device(relay, person, pending)
+      stop_supervised!(Relay)
+
+      {:ok, db} = Sqlite3.open(path)
+      assert {:ok, _} = AuthSchema.initialize(db)
+      assert {:ok, _} = Transaction.query("INSERT INTO harklight.people (id) VALUES ($1)", [person])
+
+      requests =
+        for {device, pending?} <- [{active, false}, {pending, true}], into: %{} do
+          bearer = BrowserAuth.new_secret()
+          hash = DeviceProof.digest(bearer)
+          assert :ok = NativeSignIn.add_session(db, hash, device, person, "synthetic-proof-key", 10, pending?)
+          assert {:ok, _} =
+                   Transaction.query(
+                     "INSERT INTO harklight.principals (key, person_id, kind, revision) VALUES ($1, $2, 'device', 2)",
+                     [device, person]
+                   )
+          assert {:ok, _} =
+                   Transaction.query(
+                     """
+                     INSERT INTO harklight.auth_sessions
+                       (token_hash, person_id, principal_key, kind, principal_revision, attributes)
+                     VALUES ($1, $2, $3, 'native', 1, $4)
+                     """,
+                     [Base.decode16!(hash, case: :lower), person, device, Attributes.encode(%{pending: pending?})]
+                   )
+
+          {device, {"Bearer " <> bearer, hash, pending?}}
+        end
+
+      :ok = Sqlite3.close(db)
+      relay = start_supervised!({Relay, opts})
+      router = Router.init(relay: relay, auth: {:browser, nil, nil})
+
+      for {device, {header, hash, pending?}} <- requests do
+        conn = Plug.Test.conn(:get, "/v2/me") |> Plug.Conn.put_req_header("authorization", header)
+        assert {:ok, %{person: ^person, key: ^device, session_id: ^hash, pending: ^pending?} = principal} =
+                 Auth.web(conn, nil, relay)
+        assert {:ok, ^principal} = Auth.web(conn, nil, :postgres)
+        assert %{status: 200} = Router.call(conn, router)
+
+        both = Plug.Test.put_req_cookie(conn, "__Host-harklight", "fixture-cookie")
+        assert {:error, :unauthorized} = Auth.web(both, nil, relay)
+        assert {:error, :unauthorized} = Auth.web(both, nil, :postgres)
+      end
+
+      {pending_header, _, _} = Map.fetch!(requests, pending)
+      pending_write =
+        Plug.Test.conn(:put, "/v2/settings/alerts")
+        |> Plug.Conn.put_req_header("authorization", pending_header)
+      assert %{status: 403, assigns: %{client_api_error: "forbidden"}} = Router.call(pending_write, router)
+
+      {active_header, old_hash, _} = Map.fetch!(requests, active)
+      old = Plug.Test.conn(:get, "/v2/me") |> Plug.Conn.put_req_header("authorization", active_header)
+      assert :ok = Relay.revoke_device(relay, active)
+      assert {:ok, _} =
+               Transaction.query("UPDATE harklight.principals SET revoked = true WHERE key = $1", [active])
+      assert {:error, :unauthorized} = Auth.web(old, nil, relay)
+      assert {:error, :unauthorized} = Auth.web(old, nil, :postgres)
+
+      assert {:ok, _} =
+               Transaction.query(
+                 "UPDATE harklight.auth_sessions SET kind = 'browser' WHERE token_hash = $1",
+                 [Base.decode16!(old_hash, case: :lower)]
+               )
+      assert {:ok, _} =
+               Transaction.query("UPDATE harklight.principals SET revoked = false WHERE key = $1", [active])
+      assert {:error, :unauthorized} = Auth.web(old, nil, :postgres)
     end
 
     test "known transaction aborts retry without carrying previous writes forward" do
@@ -530,6 +1009,92 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
       after
         Repo.put_dynamic_repo(previous)
       end
+    end
+
+    test "a stopped provider leaves its job recoverable after the lease expires" do
+      insert_job("push", "synthetic-push", 10)
+
+      assert {:ok, %{attempts: 1, body: %{item_id: "synthetic-item"}} = first} =
+               Jobs.claim("push", 10, 20, "first-claim")
+
+      assert {:ok, nil} = Jobs.claim("push", 19, 30, "unused-claim")
+      assert {:ok, %{attempts: 2} = recovered} = Jobs.claim("push", 20, 30, "recovered")
+      assert {:error, :claim_lost} = Jobs.complete(first, 21)
+      assert {:ok, :recorded} = Jobs.retry_at(recovered, 21, 25)
+      assert {:ok, nil} = Jobs.claim("push", 24, 40, "too-early")
+      assert {:ok, %{attempts: 3} = final} = Jobs.claim("push", 25, 40, "final-claim")
+      assert {:ok, :recorded} = Jobs.complete(final, 26)
+      assert {:ok, nil} = Jobs.claim("push", 40, 50, "done")
+    end
+
+    test "a late provider success can complete the current claim before reclaim" do
+      insert_job("push", "late-success", 10)
+
+      assert {:ok, %{id: "late-success"} = claim} = Jobs.claim("push", 10, 20, "slow-provider")
+      assert {:ok, :recorded} = Jobs.complete(claim, 20)
+      assert {:ok, nil} = Jobs.claim("push", 20, 30, "no-redelivery")
+      assert {{20, 1}, nil} = job_outcome("push", "late-success")
+    end
+
+    test "an expired final attempt is terminal and the next eligible job progresses" do
+      insert_job("reminder", "expired-final", 10, 4)
+      insert_job("reminder", "next-reminder", 20)
+
+      assert {:ok, %{id: "expired-final", attempts: 5} = claim} =
+               Jobs.claim("reminder", 10, 20, "final-attempt")
+
+      assert {:ok, nil} = Jobs.claim("reminder", 19, 30, "before-expiry")
+
+      assert {:ok, %{id: "next-reminder", attempts: 1} = next} =
+               Jobs.claim("reminder", 20, 30, "other-job")
+
+      assert {:error, :claim_lost} = Jobs.complete(claim, 21)
+      assert {:ok, :recorded} = Jobs.complete(next, 21)
+      assert {:ok, nil} = Jobs.claim("reminder", 40, 50, "no-reclaim")
+
+      assert {{20, 5}, %{attempts: 5, at_ms: 20, reason: :lease_expired}} =
+               job_outcome("reminder", "expired-final")
+    end
+
+    test "retrying a failed final attempt records terminal exhaustion" do
+      insert_job("reminder", "failed-final", 10, 4)
+
+      assert {:ok, %{id: "failed-final", attempts: 5} = claim} =
+               Jobs.claim("reminder", 10, 20, "final-claim")
+
+      assert {:ok, :exhausted} = Jobs.retry_at(claim, 12, 15)
+      assert {:ok, nil} = Jobs.claim("reminder", 15, 20, "no-retry")
+
+      assert {{12, 5}, %{attempts: 5, at_ms: 12, reason: :retry_exhausted}} =
+               job_outcome("reminder", "failed-final")
+    end
+
+    defp insert_job(kind, id, ready_at_ms, attempts \\ 0) do
+      assert {:ok, _} =
+               Transaction.query(
+                 """
+                 INSERT INTO harklight.jobs (kind, id, person_id, ready_at_ms, attempts, body)
+                 VALUES ($1, $2, 'receipt-person', $3, $4, $5)
+                 """,
+                 [kind, id, ready_at_ms, attempts, Attributes.encode(%{item_id: "synthetic-item"})]
+               )
+    end
+
+    defp job_outcome(kind, id) do
+      assert {:ok, %{rows: [[completed_at_ms, attempts, encoded]]}} =
+               Transaction.query(
+                 """
+                 SELECT completed_at_ms, attempts, fact.body
+                 FROM harklight.jobs
+                 LEFT JOIN harklight.compatibility_facts AS fact
+                   ON fact.family = 'job_exhaustion' AND fact.address = $3
+                 WHERE kind = $1 AND id = $2 AND claim_token IS NULL AND claim_until_ms IS NULL
+                 """,
+                 [kind, id, Attributes.key({kind, id})]
+               )
+
+      {:ok, outcome} = if is_nil(encoded), do: {:ok, nil}, else: Attributes.decode(encoded)
+      {{completed_at_ms, attempts}, outcome}
     end
 
     defp change(id) do

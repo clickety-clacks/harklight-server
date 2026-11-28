@@ -122,6 +122,10 @@ jobs:
       - name: Apply schema to a fresh throwaway database
         run: |
           docker exec -i "${{ job.services.postgres.id }}" psql -X -v ON_ERROR_STOP=1 -U fixture -d migration_fixture -f - < priv/postgres/001_initial.sql
+          docker exec "${{ job.services.postgres.id }}" psql -X -v ON_ERROR_STOP=1 -U fixture -d postgres -c 'CREATE DATABASE migration_explicit_epoch'
+          docker exec -i "${{ job.services.postgres.id }}" psql -X -v ON_ERROR_STOP=1 -U fixture -d migration_explicit_epoch -f - < priv/postgres/001_initial.sql
+          docker exec "${{ job.services.postgres.id }}" psql -X -v ON_ERROR_STOP=1 -U fixture -d postgres -c 'CREATE DATABASE migration_implicit_roster'
+          docker exec -i "${{ job.services.postgres.id }}" psql -X -v ON_ERROR_STOP=1 -U fixture -d migration_implicit_roster -f - < priv/postgres/001_initial.sql
       - name: Exercise stopped-history staging and interrupted transactions
         env:
           HARKLIGHT_MIGRATION_TEST_URL: postgres://fixture:fixture-password@127.0.0.1:${{ job.services.postgres.ports[5432] }}/migration_fixture

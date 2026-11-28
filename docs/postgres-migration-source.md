@@ -194,3 +194,31 @@ The staging functions always leave phase `loading` and expose no activation
 operation. Their dedicated CI test uses a fresh disposable PostgreSQL service,
 kills a writer after uncommitted rows, checks rollback and resume, and compares
 every staged fact with its original typed value.
+
+`ImportAccounts.run/3` projects server identity and cursor epoch, people and
+profiles/settings, current and revoked recorded principals, sender grants,
+origin sessions, and the independent accepted/free-order/conversation highs.
+It preserves the full typed principal/session attributes, and keeps absent
+settings distinct from explicit values. Each projection has its own source
+prefix checkpoint and uses the same atomic batch mechanism. Missing identity,
+invalid epoch, person references or unsupported account facts refuse the stage.
+Historical principals referenced only by later message facts are handled with
+that later projection; no principal is invented by this stage. It still leaves
+the database in `loading` and is not a complete import or activation command.
+
+An empty FORMAT32 epoch table has effective epoch 1 in the current Server;
+the import preserves that value. An explicitly stored positive epoch is copied
+unchanged. No new epoch is allocated during conversion.
+
+`ImportOrganizations.run/3` adds Hosted accounts, local and Hosted organizations,
+organization rosters, groups, mute state and pending invitations after the account
+stage. A missing local roster retains the current effective rule: local owners
+excluding Hosted accounts. An explicit roster is copied exactly, including an
+empty one. The local organization's typed attributes retain the original roster
+or `nil` for that implicit case. Hosted organization/account and group attributes
+preserve the entire original typed record. A Hosted group's normalized
+`hosted_ref` is the group component of its `{business, group}` reference; the
+business is the organization's `hosted_ref`, and the full tuple remains in the
+group attributes. Hosted groups retain a null manager. Existing Hosted group
+version records and deletion tombstones remain in the lossless facts staging.
+Every organization/group phase has a checkpoint and remains unpublished.

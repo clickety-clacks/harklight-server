@@ -36,10 +36,22 @@ The authoritative columns and constraints live in
   digest have been validated. An empty file has zero chunks. Writers may
   only link complete files. Keep each attachment ordinal and its wire
   attributes from the selected message revision.
+- PostgreSQL admissions reserve the declared bytes against one person,
+  across upload owners. A new manifest adds the integer
+  `reservation_expires_at_ms` key beside its typed attributes envelope.
+  Remove this key when decoding the envelope. Exact scoped retries match the
+  declared size, digest and typed metadata and retain the original expiration.
+  Cleanup takes bounded batches of expired, unlinked reservations under
+  manifest locks. Imported manifests without a reservation timestamp are
+  excluded.
 - Claims are scoped to one job, with an attempt count, unique claim token
-  and expiry. A late worker must match its claim token to finish. Preserve
-  resumable work, receipt distinctions and attempt history in job attributes
-  where the backend relies on them.
+  and expiry. A worker may record success while its token still matches an
+  unfinished job, including after lease expiry. The fifth failed or expired
+  attempt ends the job. Exhaustion sets `jobs.completed_at_ms` and stores a
+  typed `compatibility_facts` row in the same transaction. The family is
+  `job_exhaustion`, the address is `Attributes.key({kind, id})`, and the
+  body records the attempt count, time and reason. The original job body
+  remains available.
 
 Importer order follows the foreign keys. Insert identity and people before
 principals and memberships, then origin sessions and messages, then message
@@ -126,7 +138,18 @@ fact. No record contains a whole Engine or unbounded feed.
   `harklight_passkey_challenges`, `harklight_owner_codes`,
   `harklight_native_transactions` and `harklight_device_sessions`.
   Index currently actionable sessions in `auth_sessions` where the principal
-  already exists. Pending challenges do not need an invented principal.
+  already exists. For a browser session, copy the raw 32-byte session hash
+  into `token_hash` with kind `browser`, the owner key and its pinned revision.
+  FORMAT32 browser sessions have no server expiry, so import a null expiry.
+  Pending challenges do not need an invented principal.
+- For native sessions, decode the FORMAT32 lowercase hexadecimal
+  `session_hash` into its 32 digest bytes and store it as `token_hash`.
+  Use kind `native`, the current device principal, a null server expiry,
+  and typed session attributes with a boolean `:pending`. Preserve the exact
+  source row separately. Session resolution follows the active device and
+  returns the original hexadecimal identity. Replace a device's prior native
+  session in the same transaction as the new credential. Certificate
+  eligibility still depends on the migration roster, auth schema and grants.
 - Stream `client_staged_files` into upload manifests and chunks, preserving
   associated `client_staged_file_owners` and `client_discarded_files` facts.
 - Keep the exact typed records from `relay_inbox_snapshots`,

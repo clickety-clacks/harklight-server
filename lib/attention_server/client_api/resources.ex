@@ -1362,12 +1362,12 @@ defmodule AttentionServer.ClientAPI.Resources do
           into: %{},
           do: {device, push_status(binding)}
 
-    %{
-      "priority_levels" => BounceDecision.levels(engine, person),
-      "alerts" => Engine.alert_choice(engine, person),
-      @viewer => %{"push" => push}
-    }
+    settings_payload(BounceDecision.levels(engine, person), Engine.alert_choice(engine, person), push)
   end
+
+  @doc false
+  def settings_payload(levels, alerts, push),
+    do: %{"priority_levels" => levels, "alerts" => alerts, @viewer => %{"push" => push}}
 
   defp push_status(binding) do
     %{"state" => binding.state, "revision" => binding.revision}

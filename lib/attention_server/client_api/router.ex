@@ -60,8 +60,8 @@ defmodule AttentionServer.ClientAPI.Context do
   defstruct [:principal, :relay, :request_id, params: %{}]
 
   @type t :: %__MODULE__{
-          principal: AttentionServer.ClientAPI.Principal.t(),
-          relay: GenServer.server(),
+          principal: AttentionServer.ClientAPI.Principal.t() | nil,
+          relay: GenServer.server() | nil,
           request_id: String.t(),
           params: %{optional(atom()) => String.t()}
         }
@@ -87,7 +87,7 @@ defmodule AttentionServer.ClientAPI.Router do
 
   require Logger
 
-  alias AttentionServer.ClientAPI.{Auth, Context, Errors, Projection}
+  alias AttentionServer.ClientAPI.{Auth, Context, Errors, Projection, Reads}
   alias AttentionServer.{Diagnostics, Relay}
 
   # Components add their route module here: C3 reads, C4 writes, C5 the feed.
@@ -120,6 +120,7 @@ defmodule AttentionServer.ClientAPI.Router do
 
     %{
       relay: Keyword.fetch!(opts, :relay),
+      repository: Keyword.get(opts, :repository, :format32),
       auth: auth_option(Keyword.get(opts, :auth, :device)),
       routes: compile_routes(modules),
       max_in_flight: Keyword.get(opts, :max_in_flight, @default_max_in_flight),
@@ -158,6 +159,23 @@ defmodule AttentionServer.ClientAPI.Router do
     do: Keyword.get(route_opts, :stream, false)
 
   defp stream?(:nomatch), do: false
+
+  # The isolated PostgreSQL router exposes only completed projections.
+  # Each projection authorizes the request in the same database snapshot
+  # as its data. Server startup still uses the normal FORMAT32 router.
+  defp authenticated(
+         %{method: "GET"} = conn,
+         %{repository: :postgres, auth: {:browser, _, _}} = opts,
+         ["settings"],
+         {:ok, Reads, :get_settings, _, _},
+         request_id
+       ) do
+    ctx = %Context{principal: nil, relay: nil, request_id: request_id}
+    run(conn, Reads, :get_postgres_settings, ctx, opts)
+  end
+
+  defp authenticated(conn, %{repository: :postgres}, _segments, _route, _request_id),
+    do: Errors.send_error(conn, "not_found")
 
   defp authenticated(
          %{method: "GET"} = conn,
