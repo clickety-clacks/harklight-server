@@ -612,3 +612,10 @@ loading or validated imports. It requires empty handoff, job and baseline tables
 historical ACKs, provider attempts and saved snapshots do not create synthetic
 handoffs, jobs or new baseline identities. Pending-work reconciliation and saved
 baseline continuation still require runtime proof before activation.
+
+Allocation verification also streams retained message acceptance numbers, delivery
+event positions, message/reply free orders, conversation positions, origin entries
+and ACKs, and advisory entries. Each must be covered by its own person/origin/session
+counter. Missing or low counters are refused even when source and destination
+agree; the verifier never repairs them. Checking each retained value gives the
+same lower bound as its scoped maximum without retaining all scopes in memory.
