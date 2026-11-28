@@ -6,8 +6,8 @@ continues to use Server rank for the priority list.
 
 Internal changes separate request handling from storage and narrow the data
 read for individual requests. The API, identifiers and ordering stay the same.
-Synthetic tests measured faster commits and lower memory use. The release
-also includes an isolated compatibility check for history, receipt replay
+In synthetic Agent send benchmarks, throughput increased and peak memory use fell.
+The release also includes an isolated compatibility check for history, receipt replay
 and cursors.
 
 The operator commit diagnostics are opt-in and off by default.
