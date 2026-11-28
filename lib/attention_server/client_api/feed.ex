@@ -24,7 +24,8 @@ defmodule AttentionServer.ClientAPI.Feed do
   import Plug.Conn
 
   alias AttentionServer.JSON
-  alias AttentionServer.ClientAPI.{Context, Errors, FeedStep, FeedStream, Projection, SharedCapability}
+  alias AttentionServer.ClientAPI.{Auth, Context, Errors, FeedStep, FeedStream, Projection, SharedCapability}
+  alias AttentionServer.Repository.Postgres.{Identities, Settings, SettingsFeed, Transaction}
 
   @max_limit 500
 
@@ -59,6 +60,40 @@ defmodule AttentionServer.ClientAPI.Feed do
         send_read_error(conn, reason)
     end
   end
+
+  @doc false
+  def postgres_changes(conn, %Context{}) do
+    conn = fetch_query_params(conn)
+
+    result = Transaction.snapshot(fn ->
+      with {:ok, %{kind: :browser, person: person}} <- Auth.web(conn, Identities, :postgres),
+           :ok <- Settings.check_active(person),
+           false <- event_stream?(conn),
+           {:ok, capability} <- SharedCapability.parse(conn),
+           {:ok, cursor} <- cursor(conn),
+           {:ok, limit} <- limit(conn.query_params["limit"]),
+           :ok <- postgres_capability(capability) do
+        SettingsFeed.read(person, cursor, limit)
+      else
+        {:ok, _native} -> {:error, :disabled}
+        true -> {:error, :disabled}
+        {:error, "invalid_field", field} -> {:error, {:invalid_field, field}}
+        {:error, field} when is_binary(field) -> {:error, {:invalid_field, field}}
+        {:error, _} = error -> error
+      end
+    end)
+
+    case result do
+      {:ok, {changes, more, position}} -> send_batch(conn, changes, more, position)
+      {:error, {:invalid_field, field}} -> Errors.send_error(conn, "invalid_field", field: field)
+      {:error, reason} when reason in [:unavailable, :retry_later] -> Errors.send_error(conn, "retry_later")
+      {:error, reason} -> send_read_error(conn, reason)
+    end
+  end
+
+  defp postgres_capability(%{shared?: true}), do: {:error, :unsupported}
+  defp postgres_capability(%{continuation: continuation}) when is_binary(continuation), do: {:error, :cursor_expired}
+  defp postgres_capability(_capability), do: :ok
 
   def send_batch(conn, changes, more, position) do
     encoded =

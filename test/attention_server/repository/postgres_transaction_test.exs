@@ -608,7 +608,8 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
       assert %{status: 401} = Router.call(conn, postgres)
       assert %{status: 401} = Router.call(Plug.Test.conn(:get, "/v2/settings"), postgres)
       assert %{status: 404} = Router.call(browser_request(:get, "/v2/inbox", cookie), postgres)
-      assert %{status: 404} = Router.call(browser_request(:put, "/v2/settings/priority-levels", cookie), postgres)
+      assert %{status: 401} = Router.call(browser_request(:put, "/v2/settings/priority-levels", cookie), postgres)
+      assert %{status: 404} = Router.call(browser_request(:put, "/v2/devices/me/push", cookie), postgres)
     end
 
     @tag :tmp_dir
@@ -699,6 +700,72 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
     end
 
     @tag :tmp_dir
+    test "staged browser settings feed matches FORMAT32 cursor and wire behavior", %{tmp_dir: dir} do
+      alias AttentionServer.{ChangeLog, JSON}
+      alias AttentionServer.ClientAPI.{Context, Feed, Router}
+      alias AttentionServer.Repository.Postgres.{Identities, Streams}
+
+      {relay, _, backend, cookie, principal} = browser_fixture(dir)
+      origin = "https://account.example.test"
+      sqlite = Router.init(relay: relay, auth: {:browser, backend, origin})
+      postgres = Router.init(relay: nil, repository: :postgres, auth: {:browser, Identities, origin})
+      ctx = %Context{relay: nil, request_id: nil, principal: nil}
+      read = &Feed.postgres_changes(&1, ctx)
+      scope = {principal.person, ""}
+      commit = alerts_request(cookie, "all", "*", nil, origin)
+      assert %{status: 200, resp_body: body} = Router.call(commit, sqlite)
+      assert %{status: 200, resp_body: ^body} = Router.call(commit, postgres)
+      assert {:ok, %{"rev" => head}} = JSON.decode_line(body <> "\n")
+      assert head > 0
+
+      store = :sys.get_state(relay).store
+      assert :ok = ChangeLog.ranks_available(store, principal.person)
+      assert {:ok, _} = Transaction.query(
+        "INSERT INTO harklight.compatibility_facts VALUES ('client_rank_state', $1, $2)",
+        [Attributes.key(principal.person), Attributes.encode([principal.person])]
+      )
+
+      batch = browser_request(:get, "/v2/changes?after=#{head + 1}&limit=1", cookie)
+      fetch = Plug.Conn.put_req_header(batch, "last-event-id", "0")
+      assert %{status: 200, resp_body: changes} = Router.call(fetch, sqlite)
+      assert %{status: 200, resp_body: ^changes} = read.(fetch)
+      assert {:ok, %{"rev" => ^head, "more" => false, "changes" => [
+        %{"rev" => ^head, "kind" => "settings", "data" => %{"alerts" => "all", "rev" => ^head}}
+      ]}} = JSON.decode_line(changes <> "\n")
+
+      huge = browser_request(:get, "/v2/changes?after=9223372036854775808", cookie)
+      invalid = Plug.Conn.put_req_header(batch, "last-event-id", "invalid")
+      for request <- [batch, huge], run <- [&Router.call(&1, sqlite), read] do
+        assert %{status: 410, assigns: %{client_api_error: "cursor_expired"}} = run.(request)
+      end
+      for run <- [&Router.call(&1, sqlite), read] do
+        assert %{status: 400, resp_body: error} = run.(invalid)
+        assert {:ok, %{"field" => "last_event_id", "error" => "invalid_field"}} = JSON.decode_line(error <> "\n")
+      end
+
+      assert %{status: 401} = read.(Plug.Test.conn(:get, "/v2/changes"))
+      assert %{status: 404} = Router.call(fetch, postgres)
+      assert %{status: 404} = read.(Plug.Conn.put_req_header(fetch, "accept", "text/event-stream"))
+
+      cutoff = System.system_time(:millisecond) + 1_000
+      assert {:ok, 1} = ChangeLog.prune(store, cutoff)
+      assert {:ok, ^head} = Streams.prune(scope, cutoff)
+      after_floor = browser_request(:get, "/v2/changes?after=#{head}", cookie)
+      assert %{status: 200, resp_body: empty} = Router.call(after_floor, sqlite)
+      assert %{status: 200, resp_body: ^empty} = read.(after_floor)
+      assert {:ok, %{"rev" => ^head, "changes" => [], "more" => false}} = JSON.decode_line(empty <> "\n")
+      assert %{status: 410} = Router.call(fetch, sqlite)
+      assert %{status: 410} = read.(fetch)
+
+      next = head + 1
+      assert {:ok, ^next} = Transaction.run([scope], &Transaction.append(&1, scope, [change("item:synthetic")]))
+      assert %{status: 503, resp_body: error} = read.(after_floor)
+      assert {:ok, %{"error" => "storage_unavailable"} = unavailable} = JSON.decode_line(error <> "\n")
+      refute Map.has_key?(unavailable, "rev")
+      assert {:ok, [%{rev: ^next}], false, ^next} = Streams.person_page(principal.person, head, 1)
+    end
+
+    @tag :tmp_dir
     test "failed final receipt update rolls back browser alerts and its stream append", %{tmp_dir: dir} do
       alias AttentionServer.ClientAPI.Router
       alias AttentionServer.Repository.Postgres.{Attributes, Identities}
@@ -738,46 +805,193 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
     end
 
     @tag :tmp_dir
+    test "native bearer alerts keep FORMAT32 authority, retained bytes and rollback", %{tmp_dir: dir} do
+      alias AttentionServer.{BrowserAuth, DeviceProof, JSON, Relay, Store.AuthSchema}
+      alias AttentionServer.ClientAPI.{Auth, Idempotency, Router, Writes}
+      alias AttentionServer.Repository.Command
+      alias AttentionServer.Store.RecordTable
+      alias Exqlite.Sqlite3
+
+      person = "synthetic-native-alerts"
+      other = "synthetic-native-alerts-other"
+      active = "synthetic-alerts-active"
+      pending = "synthetic-alerts-pending"
+      outside = "synthetic-alerts-outside"
+      path = Path.join(dir, "relay.sqlite3")
+      opts = [store_path: path, push_enabled: true]
+      relay = start_supervised!({Relay, opts})
+
+      for account <- [person, other] do
+        assert :ok = Relay.setup_person(relay, account)
+        assert {:ok, _} = Transaction.query("INSERT INTO harklight.people (id) VALUES ($1)", [account])
+      end
+
+      devices = [{person, active, false}, {person, pending, true}, {other, outside, false}]
+
+      for {account, device, _} <- devices do
+        assert :ok = Relay.setup_device(relay, account, device)
+        assert {:ok, _} = Transaction.query(
+          "INSERT INTO harklight.principals (key, person_id, kind, revision) VALUES ($1, $2, 'device', 1)",
+          [device, account]
+        )
+      end
+
+      stop_supervised!(Relay)
+      {:ok, db} = Sqlite3.open(path)
+      assert {:ok, _} = AuthSchema.initialize(db)
+
+      headers =
+        Map.new(devices, fn {account, device, pending?} ->
+          bearer = BrowserAuth.new_secret()
+          hash = bearer |> DeviceProof.digest() |> Base.decode16!(case: :lower)
+          put_certificate_session(db, account, device, hash, pending?)
+          {device, "Bearer " <> bearer}
+        end)
+
+      :ok = Sqlite3.close(db)
+      relay = start_supervised!({Relay, opts})
+      origin = "https://account.example.test"
+      sqlite = Router.init(relay: relay, auth: {:browser, nil, origin})
+      postgres = Router.init(relay: nil, repository: :postgres, auth: {:browser, nil, origin})
+      native = Plug.Test.conn(:get, "/v2/settings") |> Plug.Conn.put_req_header("authorization", headers[active])
+      assert {:ok, principal} = Auth.web(native, nil, relay)
+      assert {:ok, 200, _, false} = Writes.push(relay, principal, String.duplicate("b", 64), "production", 1)
+      store = :sys.get_state(relay).store
+      binding = Map.fetch!(store.engine.push_bindings, {person, active})
+      assert {:ok, _} = Transaction.query(
+        "INSERT INTO harklight.compatibility_facts VALUES ('push_bindings', $1, $2)",
+        [Attributes.key({:row, :push_bindings, {person, active}}), Attributes.encode(binding)]
+      )
+
+      assert %{status: 200, resp_body: initial} = initial_response = Router.call(native, sqlite)
+      assert {:ok, %{"rev" => head, "settings" => %{"rev" => rev, "push" => %{"revision" => 1}}}} =
+               JSON.decode_line(initial <> "\n")
+      assert {:ok, _} = Transaction.query(
+        "INSERT INTO harklight.stream_heads (person_id, origin_key, head) VALUES ($1, '', $2)", [person, head]
+      )
+      assert {:ok, _} = Transaction.query(
+        "INSERT INTO harklight.stream_resource_revisions VALUES ($1, '', 'settings', 'settings', $2, NULL)", [person, rev]
+      )
+      assert %{status: 200, resp_body: ^initial} = Router.call(native, postgres)
+      assert [tag] = Plug.Conn.get_resp_header(initial_response, "etag")
+
+      key = "00000000-0000-4000-8000-000000000083"
+      failed_key = "00000000-0000-4000-8000-000000000084"
+      write = fn device, value, match, key -> native_alerts_request(headers[device], value, match, key) end
+
+      for router <- [sqlite, postgres] do
+        assert %{status: 403, assigns: %{client_api_error: "forbidden"}} =
+                 Router.call(write.(pending, "all", "*", key), router)
+        assert %{status: 412} = Router.call(write.(active, "all", ~s("stale"), key), router)
+      end
+
+      assert {:error, :unauthorized} =
+               Command.execute(:postgres, %{principal | person: other}, {:alerts, "all", "*"}, key, 100)
+      assert {:error, :forbidden} =
+               Command.execute(:postgres, %{principal | key: pending, session_id: native_session_hash(headers[pending]), pending: false},
+                 {:alerts, "all", "*"}, key, 100)
+
+      request = write.(active, "all", tag, key) |> Plug.Conn.put_req_header("origin", "https://other.example.test")
+      assert %{status: 200, resp_body: accepted} = Router.call(request, sqlite)
+      assert %{status: 200, resp_body: ^accepted} = committed = Router.call(request, postgres)
+      assert [] = Plug.Conn.get_resp_header(committed, "idempotent-replayed")
+      assert {:ok, %{"settings" => %{"alerts" => "all", "push" => %{"revision" => 1}}}} = JSON.decode_line(accepted <> "\n")
+      assert {:ok, %{body: ^accepted, original_response: true}} = Idempotency.lookup_retained(store.db, person, key)
+      assert {:ok, %{rows: [["harklight_app_receipts", true, nil]]}} = Transaction.query(
+        "SELECT namespace, original_response, expires_at_ms FROM harklight.operation_receipts WHERE person_id = $1 AND operation_key = $2",
+        [person, key]
+      )
+
+      assert %{status: 200, resp_body: current} = Router.call(write.(active, "important", "*", nil), sqlite)
+      assert %{status: 200, resp_body: ^current} = Router.call(write.(active, "important", "*", nil), postgres)
+
+      compact_key = "00000000-0000-4000-8000-000000000085"
+      evidence = %{"settings" => true}
+      digest = Idempotency.digest("PUT", ["settings", "alerts"], %{"alerts" => "all", "if_match" => tag})
+      assert :ok = Idempotency.save(store, person, compact_key, digest, 200, evidence)
+      assert {:ok, _} = Transaction.query("""
+      INSERT INTO harklight.operation_receipts
+        (person_id, origin_key, namespace, operation_key, digest, status, response, created_at_ms, expires_at_ms, original_response)
+      VALUES ($1, '', 'client_idempotency', $2, $3, 200, $4, $5, $6, false)
+      """, [person, compact_key, Base.decode16!(digest, case: :lower), Attributes.encode(evidence), 1,
+        System.system_time(:millisecond) + Idempotency.retention_ms()])
+
+      for router <- [sqlite, postgres] do
+        assert %{status: 200, resp_body: ^accepted} = replay = Router.call(request, router)
+        assert ["true"] = Plug.Conn.get_resp_header(replay, "idempotent-replayed")
+        assert %{status: 200, resp_body: ^current} = compact = Router.call(write.(active, "all", tag, compact_key), router)
+        assert ["true"] = Plug.Conn.get_resp_header(compact, "idempotent-replayed")
+        assert %{status: 409} = Router.call(write.(active, "important", "*", key), router)
+        assert %{status: 200, resp_body: body} = Router.call(write.(outside, "important", "*", key), router)
+        assert {:ok, %{"settings" => %{"alerts" => "important", "push" => %{"state" => "unconfigured"}}}} =
+                 JSON.decode_line(body <> "\n")
+      end
+
+      {:ok, failure_db} = Sqlite3.open(path)
+      assert :ok = Sqlite3.execute(failure_db, """
+      CREATE TRIGGER reject_native_alert_receipt BEFORE INSERT ON harklight_app_receipts
+      WHEN NEW.idempotency_key = '#{failed_key}'
+      BEGIN SELECT RAISE(ABORT, 'fixture_failure'); END
+      """)
+      assert {:ok, _} = Transaction.query("""
+      ALTER TABLE harklight.operation_receipts ADD CONSTRAINT reject_native_alert_receipt
+      CHECK (operation_key <> '#{failed_key}' OR status <> 200)
+      """, [])
+
+      failure = write.(active, "all", "*", failed_key)
+      for router <- [sqlite, postgres] do
+        assert %{status: 503} = Router.call(failure, router)
+        assert %{status: 200, resp_body: ^current} = Router.call(native, router)
+      end
+
+      assert {:ok, []} = RecordTable.select(failure_db, "SELECT status FROM harklight_app_receipts WHERE idempotency_key = ?", [failed_key])
+      assert {:ok, %{rows: []}} =
+               Transaction.query("SELECT status FROM harklight.operation_receipts WHERE operation_key = $1", [failed_key])
+      assert {:ok, %{rows: []}} = Transaction.query(
+        "SELECT body FROM harklight.compatibility_facts WHERE address IN ($1, $2)",
+        [Attributes.key({person, failed_key}), Attributes.key({:row, :receipts, {person, active, failed_key}})]
+      )
+      assert {:ok, changes} = RecordTable.select(failure_db, """
+      SELECT rev, kind, resource_id FROM client_changes WHERE person_id = ? AND rev > ? ORDER BY rev
+      """, [person, head])
+      # Two commits advance the head twice and coalesce the resource feed.
+      assert changes == [[head + 2, "settings", "settings"]]
+      assert {:ok, %{rows: ^changes}} = Transaction.query("""
+      SELECT revision, resource_kind, resource_id FROM harklight.stream_changes
+      WHERE person_id = $1 AND origin_key = '' AND revision > $2 ORDER BY revision
+      """, [person, head])
+
+      assert :ok = Sqlite3.execute(failure_db, "DROP TRIGGER reject_native_alert_receipt")
+      assert :ok = Sqlite3.close(failure_db)
+      assert {:ok, _} = Transaction.query("ALTER TABLE harklight.operation_receipts DROP CONSTRAINT reject_native_alert_receipt", [])
+      assert %{status: 200, resp_body: retried} = Router.call(failure, sqlite)
+      assert %{status: 200, resp_body: ^retried} = Router.call(failure, postgres)
+
+      assert :ok = Relay.revoke_device(relay, active)
+      assert {:ok, _} = Transaction.query("UPDATE harklight.principals SET revoked = true WHERE key = $1", [active])
+      for router <- [sqlite, postgres], do: assert(%{status: 401} = Router.call(request, router))
+      assert {:error, :unauthorized} = Command.execute(:postgres, principal, {:alerts, "all", "*"}, key, 100)
+    end
+
+    defp native_alerts_request(header, value, if_match, key) do
+      conn =
+        Plug.Test.conn(:put, "/v2/settings/alerts", AttentionServer.JSON.encode!(%{"alerts" => value}))
+        |> Plug.Conn.put_req_header("authorization", header)
+        |> Plug.Conn.put_req_header("if-match", if_match)
+
+      if key, do: Plug.Conn.put_req_header(conn, "idempotency-key", key), else: conn
+    end
+
+    defp native_session_hash("Bearer " <> bearer), do: AttentionServer.DeviceProof.digest(bearer)
+
+    @tag :tmp_dir
     test "owner level saves preserve generation boundaries and roll back with their audit", %{tmp_dir: dir} do
-      alias AttentionServer.{JSON, Relay}
-      alias AttentionServer.ClientAPI.{Reads, Writes}
+      alias AttentionServer.Relay
       alias AttentionServer.Repository.Postgres.Attributes
 
       {relay, _browser, _backend, _cookie, owner} = browser_fixture(dir)
       %{person: person, key: key} = owner
-      origin = "synthetic-level-origin"
-      reader = "synthetic-level-reader"
-      assert :ok = Relay.setup_device(relay, person, origin)
-      assert :ok = Relay.setup_device(relay, person, reader)
-      assert :ok = Relay.setup_sender(relay, origin, "app:fixture")
-      message = %{"title" => "Fixture settings history", "created_at" => 10, "sender_id" => "app:fixture", "message_id" => "levels"}
-      frame = %{
-        "v" => 1, "type" => "forward", "op_id" => "00000000-0000-4000-8000-000000000012",
-        "session_handle" => "10000000-0000-4000-8000-000000000001", "message" => message
-      }
-      assert {:ok, reply} = Relay.request_line(relay, origin, JSON.encode!(frame) <> "\n")
-      assert {:ok, %{"type" => "ok"}} = JSON.decode_line(reply)
-      assert {:ok, %{"items" => [%{"item_id" => item}]}} = Reads.inbox(relay, reader)
-      assert {:ok, 200, _, false} =
-               Writes.reply(relay, reader, item, "Fixture reply", [], "00000000-0000-4000-8000-000000000013")
-
-      engine = :sys.get_state(relay).store.engine
-      accepted = Map.fetch!(engine.persons, person)
-      conversations = Map.fetch!(engine.conversation_highs, person)
-      assert accepted > 0 and conversations > 0
-      assert {:ok, %{"rev" => head}} = Reads.settings(relay, owner)
-      assert {:ok, _} =
-               Transaction.query(
-                 "INSERT INTO harklight.stream_heads (person_id, origin_key, head) VALUES ($1, '', $2)",
-                 [person, head]
-               )
-      for {kind, high} <- [{"accepted", accepted}, {"conversation", conversations}] do
-        assert {:ok, _} =
-                 Transaction.query(
-                   "INSERT INTO harklight.allocation_highs VALUES ($1, '', '', $2, $3)",
-                   [person, kind, high]
-                 )
-      end
+      {reader, head, accepted, conversations} = seed_level_history(relay, owner)
 
       assert Relay.dashboard_levels(:postgres, person, key) == Relay.dashboard_levels(relay, person, key)
 
@@ -838,6 +1052,134 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
       assert {:error, :forbidden} = Relay.dashboard_levels(:postgres, person, key)
     end
 
+    @tag :tmp_dir
+    test "browser priority levels preserve FORMAT32 settings, generations and receipts", %{tmp_dir: dir} do
+      alias AttentionServer.ClientAPI.{Router, Writes}
+      alias AttentionServer.Repository.Postgres.{Attributes, Identities}
+
+      {relay, _browser, backend, cookie, principal} = browser_fixture(dir)
+      %{person: person, session_id: session} = principal
+      {_reader, head, accepted, conversations} = seed_level_history(relay, principal)
+      origin = "https://account.example.test"
+      sqlite = Router.init(relay: relay, auth: {:browser, backend, origin})
+      postgres = Router.init(relay: nil, repository: :postgres, auth: {:browser, Identities, origin})
+      settings = browser_request(:get, "/v2/settings", cookie)
+      rows = [
+        %{"name" => "Routine", "lower_bound" => 0, "bounce_after_days" => nil},
+        %{"name" => "Follow up", "lower_bound" => 0.6, "bounce_after_days" => 1.5}
+      ]
+
+      first = "00000000-0000-4000-8000-000000000096"
+      second = "00000000-0000-4000-8000-000000000097"
+      put = fn target, levels, tag, key ->
+        settings_request(cookie, "priority-levels", %{"levels" => levels}, tag, key, origin)
+        |> Router.call(target)
+      end
+
+      assert %{status: 200, resp_body: initial} = response = Router.call(settings, sqlite)
+      assert [tag] = Plug.Conn.get_resp_header(response, "etag")
+      assert %{status: 200, resp_body: ^initial} = response = Router.call(settings, postgres)
+      assert [^tag] = Plug.Conn.get_resp_header(response, "etag")
+
+      for target <- [sqlite, postgres] do
+        assert %{status: 412} = put.(target, [], ~s("stale"), first)
+        assert %{status: 400, assigns: %{client_api_error: "invalid_field"}} = put.(target, [], tag, first)
+        assert %{status: 403} =
+                 settings_request(cookie, "priority-levels", %{"levels" => rows}, tag, first, "https://other.example.test")
+                 |> Router.call(target)
+      end
+
+      assert %{status: 200, resp_body: body} = put.(sqlite, rows, tag, first)
+      assert %{status: 200, resp_body: ^body} = response = put.(postgres, rows, tag, first)
+      assert [] = Plug.Conn.get_resp_header(response, "idempotent-replayed")
+      {configuration, revision} = owner_settings_snapshot(person)
+      assert revision == head + 1
+      assert %{after_delivery_seq: ^accepted, after_conversation_seq: ^conversations} = configuration
+      assert %{} = format32 = :sys.get_state(relay).store.engine.bounce_levels[person]
+      assert Map.delete(configuration, :configured_at_ms) == Map.delete(format32, :configured_at_ms)
+
+      actor = Writes.browser_actor_key(person, session)
+      receipt_address = Attributes.key({:row, :receipts, {person, actor, first}})
+      assert {:ok, %{rows: [[receipt]]}} =
+               Transaction.query("SELECT body FROM harklight.compatibility_facts WHERE family = 'receipts' AND address = $1", [receipt_address])
+      assert {:ok, domain_receipt} = Attributes.decode(receipt)
+      assert domain_receipt == :sys.get_state(relay).store.engine.receipts[{person, actor, first}]
+
+      assert %{status: 200, resp_body: ^body} = put.(postgres, rows, "*", nil)
+      assert {^configuration, ^revision} = owner_settings_snapshot(person)
+
+      changed = put_in(rows, [Access.at(1), "name"], "Follow up soon")
+      assert %{status: 409} = put.(postgres, changed, "*", first)
+      assert {:ok, _} =
+               Transaction.query(
+                 """
+                 ALTER TABLE harklight.operation_receipts ADD CONSTRAINT fixture_level_receipt
+                 CHECK (operation_key <> '00000000-0000-4000-8000-000000000097' OR status <> 200)
+                 """,
+                 []
+               )
+      assert %{status: 503} = put.(postgres, changed, "*", second)
+      assert {^configuration, ^revision} = owner_settings_snapshot(person)
+      assert {:ok, %{rows: []}} =
+               Transaction.query("SELECT status FROM harklight.operation_receipts WHERE person_id = $1 AND operation_key = $2", [person, second])
+      second_address = Attributes.key({:row, :receipts, {person, actor, second}})
+      assert {:ok, %{rows: []}} =
+               Transaction.query("SELECT body FROM harklight.compatibility_facts WHERE family = 'receipts' AND address = $1", [second_address])
+      assert {:ok, _} = Transaction.query("ALTER TABLE harklight.operation_receipts DROP CONSTRAINT fixture_level_receipt", [])
+
+      assert %{status: 200, resp_body: current} = put.(sqlite, changed, "*", second)
+      assert %{status: 200, resp_body: ^current} = put.(postgres, changed, "*", second)
+      {updated, next_revision} = owner_settings_snapshot(person)
+      assert next_revision == revision + 1
+      assert Map.delete(updated, :levels) == Map.delete(configuration, :levels)
+
+      for target <- [sqlite, postgres] do
+        assert %{status: 200, resp_body: ^current} = response = put.(target, rows, tag, first)
+        assert ["true"] = Plug.Conn.get_resp_header(response, "idempotent-replayed")
+      end
+    end
+
+    defp seed_level_history(relay, %{person: person} = owner) do
+      alias AttentionServer.{JSON, Relay}
+      alias AttentionServer.ClientAPI.{Reads, Writes}
+
+      origin = "synthetic-level-origin"
+      reader = "synthetic-level-reader"
+      assert :ok = Relay.setup_device(relay, person, origin)
+      assert :ok = Relay.setup_device(relay, person, reader)
+      assert :ok = Relay.setup_sender(relay, origin, "app:fixture")
+      message = %{"title" => "Fixture settings history", "created_at" => 10, "sender_id" => "app:fixture", "message_id" => "levels"}
+      frame = %{
+        "v" => 1, "type" => "forward", "op_id" => "00000000-0000-4000-8000-000000000012",
+        "session_handle" => "10000000-0000-4000-8000-000000000001", "message" => message
+      }
+      assert {:ok, reply} = Relay.request_line(relay, origin, JSON.encode!(frame) <> "\n")
+      assert {:ok, %{"type" => "ok"}} = JSON.decode_line(reply)
+      assert {:ok, %{"items" => [%{"item_id" => item}]}} = Reads.inbox(relay, reader)
+      assert {:ok, 200, _, false} =
+               Writes.reply(relay, reader, item, "Fixture reply", [], "00000000-0000-4000-8000-000000000013")
+
+      engine = :sys.get_state(relay).store.engine
+      accepted = Map.fetch!(engine.persons, person)
+      conversations = Map.fetch!(engine.conversation_highs, person)
+      assert accepted > 0 and conversations > 0
+      assert {:ok, %{"rev" => head}} = Reads.settings(relay, owner)
+      assert {:ok, _} =
+               Transaction.query(
+                 "INSERT INTO harklight.stream_heads (person_id, origin_key, head) VALUES ($1, '', $2)",
+                 [person, head]
+               )
+      for {kind, high} <- [{"accepted", accepted}, {"conversation", conversations}] do
+        assert {:ok, _} =
+                 Transaction.query(
+                   "INSERT INTO harklight.allocation_highs VALUES ($1, '', '', $2, $3)",
+                   [person, kind, high]
+                 )
+      end
+
+      {reader, head, accepted, conversations}
+    end
+
     defp owner_settings_snapshot(person) do
       alias AttentionServer.Repository.Postgres.Attributes
 
@@ -855,8 +1197,12 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
     end
 
     defp alerts_request(cookie, value, if_match, key, origin) do
+      settings_request(cookie, "alerts", %{"alerts" => value}, if_match, key, origin)
+    end
+
+    defp settings_request(cookie, route, body, if_match, key, origin) do
       conn =
-        Plug.Test.conn(:put, "/v2/settings/alerts", AttentionServer.JSON.encode!(%{"alerts" => value}))
+        Plug.Test.conn(:put, "/v2/settings/" <> route, AttentionServer.JSON.encode!(body))
         |> Plug.Test.put_req_cookie("__Host-harklight", cookie)
         |> Plug.Conn.put_req_header("origin", origin)
         |> Plug.Conn.put_req_header("if-match", if_match)

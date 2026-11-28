@@ -5,9 +5,10 @@ defmodule AttentionServer.Repository.Postgres.Schema do
     "001_initial.sql",
     "002_message_history.sql",
     "003_large_text.sql",
-    "004_conversation_read_positions.sql"
+    "004_conversation_read_positions.sql",
+    "005_shared_message_history.sql"
   ]
-  @version 4
+  @version 5
 
   def version, do: @version
 

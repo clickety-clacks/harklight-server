@@ -23,8 +23,13 @@ defmodule AttentionServer.Repository.Command do
     end)
   end
 
-  def execute(:postgres, %{kind: :browser} = actor, {:alerts, value, if_match}, key, at) do
-    AttentionServer.Repository.Postgres.AlertSettings.execute(actor, value, if_match, key, at)
+  def execute(:postgres, %{kind: :browser} = actor, {kind, _value, _if_match} = request, key, at)
+      when kind in [:alerts, :priority_levels] do
+    AttentionServer.Repository.Postgres.PersonSettings.execute(actor, request, key, at)
+  end
+
+  def execute(:postgres, %{kind: :device} = actor, {:alerts, _value, _if_match} = request, key, at) do
+    AttentionServer.Repository.Postgres.PersonSettings.execute(actor, request, key, at)
   end
 
   def execute(:postgres, %{kind: :owner, person: person, key: key}, {:dashboard_levels, rows}, nil, at) do

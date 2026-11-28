@@ -309,3 +309,129 @@ record attributes. It does not populate attachment chunks or attachment link
 rows, per-recipient seen state, conversations or answers. Those stages and their
 field-level reader comparisons are required before import validation and
 activation; this stage's success alone is not a complete history import.
+
+`ImportFeeds.run/3` projects origin and advisory allocation highs independently
+of change-log positions. Entries retain their exact sequence, session and typed
+body; origin delivery acknowledgements retain their stage map and advisory
+receipts retain their IDs. Highs are copied before entries and receipts, using
+separate checkpoints. Entries beyond the recorded high, acknowledgements without
+an origin entry and receipts without an advisory entry refuse the stage. This
+preserves feed facts without dispatching deliveries or activating the target.
+
+`ImportBytes.run/5` copies an already-verified bundle file into a matching target
+upload manifest one 1 MiB chunk at a time. Each chunk and source-prefix checkpoint
+commit atomically. Restart rereads and verifies the committed prefix before
+continuing; a changed prefix refuses, and final byte length and SHA-256 must
+match. Empty files produce no chunks. Completed uploads can only be rechecked
+when their checkpoint already covers the file; this routine cannot append to a
+completed upload. It does not mark uploads complete, create attachment links or
+activate the database. The caller must finish those stages and validate target
+content and references before activation.
+
+`ImportUploads.run/3` stages published Engine and retained staged-file manifests,
+transfers and verifies their chunks, and links ordinary message revisions using
+each original file ordinal and typed descriptor. UUIDs and staged `fs` IDs stay
+distinct; person, uploader/owner, size and SHA-256 are preserved. Full source
+metadata is retained through the typed codec. Published Engine uploads use their
+original `last_activity_ms` as the import publication marker, not a reconstructed
+completion time. Staged files use their original `at_ms`, with the original
+30-day expiry recorded as numeric top-level `reservation_expires_at_ms` for the
+runtime cleanup reader. Engine uploads acquire no invented expiry.
+
+Completion verifies target chunk count, exact bytes and hash before publishing
+that upload's marker. Per-file completion and message-link checkpoints make the
+stage repeatable. Inline file descriptors remain in their original message
+record. Shared-message and conversation-entry links and large-data references
+remain distinct follow-up projections; full closure and retained-history checks
+are still required before database validation and activation.
+
+Upload byte completion means that the exported bytes have been copied and their
+length and digest verified; it does not mean that a staged reservation was linked
+to a message. Staged reservations retain their original expiry. Upload cleanup
+preserves every manifest and chunk while an import is loading or validated, so
+cleanup cannot remove a committed chunk prefix before resume. Once active, the
+ordinary cleanup policy again removes expired, unlinked reservations, including
+those whose bytes have been fully transferred. Linked attachments remain retained.
+`ImportBytes` is an internal chunk primitive; the `ImportUploads` entry point
+binds the verified bundle to the import's source digest before calling it.
+Schema 002 lets ordinary history retain unknown intermediate revision acceptance
+times as SQL NULL. Known first and latest acceptance times remain exact. Hosted
+notices retain their reserved origin and sender without manufacturing a principal.
+The import still stays in `loading`; these record projections do not validate or
+activate a destination. Fresh imports pin the digest of migrations 001 and 002 in
+order. Resuming an already claimed import requires its original identity and
+schema digest, even after the destination applies migration 002.
+
+`ImportConversations.run/3` creates ordinary conversation containers using the
+message's internal ID and copies exact per-person read positions. Positive read
+positions must resolve to the same source conversation's origin reply. This phase
+does not yet project conversation entries, seen revisions, answers or shared
+conversation history, and cannot validate or activate a destination.
+
+`ImportMaterial.run/3` copies the verified bundle's declared configuration and
+identity files into a separate private staging directory bound to the original
+import identity. It never writes to the original state paths. Copies use bounded
+reads, private permissions, a partial file followed by rename, and size/digest
+readback. A retry verifies finished files and resumes unfinished copies; an
+existing mismatched file or identity is refused. The returned material inventory
+contains relative restore paths and digests, never file contents. It does not by
+itself establish that every required configuration or identity file was declared;
+that completeness check remains part of final migration validation.
+
+The planned `validate` result uses a `material` object with `root` (absolute path
+to the verified staged files), `manifest_sha256`, and `files` (each containing
+`path`, `size`, and `sha256`). Paths retain the export material map's relative
+restore names, including `external/...`; those external entries require the
+installer's explicit original destination mapping. The installer must verify the
+inventory and bytes before installing them. `server.env` remains source material;
+the installer applies the explicit backend configuration change separately after
+successful activation. Export and verify include additive `contract_version: 1`
+and `command` fields; their existing result and digest fields remain unchanged.
+
+Material staging now refuses permission drift on resumed roots, intermediate
+directories, files and owner/completion markers. Standard owner material requires
+`person-id`, `owner/identity.pem` and `owner/identity.key`: the private key's public
+SPKI fingerprint must match the certificate and the selected person's current
+owner fingerprint in the decoded source records. A valid certificate/key pair
+from another identity is refused. TLS continuity rests on stopped-source provenance, not a store fingerprint.
+Standard self-host staging requires the owner files and all three configured TLS files.
+The export observes `server.env` and every declared material file before and
+after copying within the stopped-source window. Its configured `CERTFILE`,
+`KEYFILE` and `CACERTFILE` paths must identify the exact captured files. The
+parser accepts literal installer shell quoting without executing the file;
+expand computed paths to explicit absolute literals before stopping/exporting.
+The importer checks the server certificate/private-key pair, the optional
+`tls/ca.key` pair, and the server certificate chain to that captured CA. These
+are continuity checks, not certificate renewal; existing validity dates stay
+unchanged. Every retained guided-join invitation's `ca_sha256`, where present,
+must equal the captured CA's DER SHA-256. With no retained pin, TLS relies on
+the captured source configuration alone. A foreign key, CA, configured path,
+changed source file or pin mismatch refuses staging. Unknown material kinds
+remain refused until they have an explicit typed continuity mapping. Final
+material completeness and activation are still separate unfinished gates.
+
+The known installer byproducts `tls/server.csr`, `tls/server.ext`, `tls/ca.srl`
+and optional `owner/sign-in-link.txt` are preserved byte for byte in private
+staging. Their captured source paths must be those names beneath the directory
+containing the captured `server.env`. They do not choose the Server's runtime
+identity; a saved sign-in link remains private. Other undeclared identity kinds
+still refuse and must not be silently omitted from a backup or import.
+
+Bundle format 2 adds mandatory stopped-source material provenance. Format 1
+exports return `legacy_bundle_requires_reexport` (CLI exit 2), rather than a
+successful weaker validation or an ambiguous malformed-manifest error. Keep the
+original immutable stopped backup and create a **new** export directory with the
+current exporter; do not edit the old manifest, its version, or its checksums.
+Start a fresh unpublished destination and new receipt for that new bundle. An
+existing format-1 destination remains unpublished; do not reuse its receipt with
+the replacement bundle. This changes the migration bundle format, not FORMAT32
+or the client protocol. Unknown newer bundle versions also refuse explicitly.
+
+`LargeTextSource.scan/2` verifies each exported large-text reference against the
+export's read-only database copy: exact typed path, addressed record checksum,
+marker, byte length and content digest. It streams the reference table and uses
+indexed record lookups, so it does not reconstruct the whole Engine or load an
+entire text into memory. It never infers a reference from marker-looking literal
+text. This is source preparation only; PostgreSQL chunk publication, normalized
+reference projection and client wire parity require the landed large-text schema
+and consumer and remain separate validation gates.
