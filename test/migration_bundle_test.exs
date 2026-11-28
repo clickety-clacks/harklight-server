@@ -69,7 +69,14 @@ defmodule AttentionServer.Migration.BundleTest do
     end)
     opts = Keyword.update!(opts, :material, &Map.merge(&1, auxiliary))
 
-    assert {:ok, summary} = Bundle.export(path, destination, opts)
+    material_map = Path.join(root, "material-map.json")
+    File.write!(material_map, JSON.encode!(opts[:material]))
+    assert {:ok, %{"command" => "export", "bundle_version" => 2}} = CLI.run([
+      "export", "--source", path, "--output", destination,
+      "--material-map", material_map, "--supervisor", "synthetic test supervisor",
+      "--stopped-evidence", "GenServer.stop returned; fixture stopped"
+    ])
+    assert {:ok, _, summary} = Bundle.verify(destination)
     {:ok, marker} = JSON.decode_line(File.read!(Path.join(destination, "COMPLETE.json")) <> "\n")
     assert marker["sha256"] == summary.sha256
 
@@ -90,7 +97,7 @@ defmodule AttentionServer.Migration.BundleTest do
     File.write!(marker_path, JSON.encode!(marker))
     assert {:ok, ^manifest, ^summary} = Bundle.verify(destination)
 
-    assert {:ok, %{"contract_version" => 1, "command" => "verify", "result" => "verified_export"}} = CLI.run(["verify", destination])
+    assert {:ok, %{"contract_version" => 1, "command" => "verify", "result" => "verified_export", "bundle_version" => 2}} = CLI.run(["verify", destination])
     for {name, source} <- auxiliary do
       assert File.read!(Path.join(destination, "material/" <> name)) == File.read!(source)
     end

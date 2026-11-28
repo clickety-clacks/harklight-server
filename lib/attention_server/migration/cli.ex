@@ -93,7 +93,7 @@ defmodule AttentionServer.Migration.CLI do
       "contract_version" => 1,
       "command" => command,
       "result" => "verified_export",
-      "bundle_version" => 1,
+      "bundle_version" => manifest.version,
       "manifest_sha256" => summary.sha256,
       "record_count" => manifest.source.records.count,
       "table_count" => map_size(manifest.source.tables),
