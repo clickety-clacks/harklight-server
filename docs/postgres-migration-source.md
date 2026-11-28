@@ -700,7 +700,9 @@ executed. Its copied bytes and original path must match the provenance record.
 Outside the state directory the material-map key is `external` followed by the
 absolute path; files inside it use their relative restore path.
 
-Dashboard certificates must match their private keys. Provider keys are preserved
+Each dashboard component uses its captured override or independently falls back
+to the corresponding Server TLS file, as at runtime. The resulting certificate
+and private key must match. Provider keys are preserved
 as opaque private bytes using the stopped configuration as their continuity
 anchor; migration never uses them or contacts a provider. Unknown or unconfigured
 external files are refused. Private staging and final validation apply the same
