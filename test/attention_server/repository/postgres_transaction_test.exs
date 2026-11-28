@@ -139,6 +139,60 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
                )
     end
 
+    test "ordinary item facts are scoped to the recipient or enrolled origin" do
+      alias AttentionServer.Repository.{AgentItems, RecipientItems}
+      alias AttentionServer.Repository.Postgres.Attributes
+
+      person = "synthetic-item-owner"
+      origin = "synthetic-item-origin"
+      body = %{"title" => "Synthetic item"}
+      facts = Attributes.encode(%{field_warnings: []})
+
+      assert {:ok, _} = Transaction.query("INSERT INTO harklight.people (id) VALUES ($1)", [person])
+      assert {:ok, _} =
+               Transaction.query(
+                 "INSERT INTO harklight.principals (key, person_id, kind, revision) VALUES ($1, $2, 'device', 1)",
+                 [origin, person]
+               )
+      assert {:ok, _} =
+               Transaction.query(
+                 """
+                 INSERT INTO harklight.messages
+                   (id, person_id, origin_key, sender_id, message_id, revision, accepted_at_ms,
+                    accepted_position, free_order, attributes)
+                 VALUES ('fixture-item', $1, $2, 'app:test', 'fixture-message', 1, 20, 7, 8, $3)
+                 """,
+                 [person, origin, facts]
+               )
+      assert {:ok, _} =
+               Transaction.query(
+                 "INSERT INTO harklight.message_revisions VALUES ('fixture-item', 1, 20, $1)",
+                 [Attributes.encode(body)]
+               )
+      assert {:ok, _} =
+               Transaction.query(
+                 "INSERT INTO harklight.message_recipients (message_id, person_id, item_id) VALUES ('fixture-item', $1, 'i7')",
+                 [person]
+               )
+
+      assert {:ok, {^person, "app:test", "fixture-message"} = key,
+              %{message: ^body, revision: 1, accepted_seq: 7, free_order: 8} = record} =
+               RecipientItems.fetch(:postgres, person, "i7")
+
+      assert {:ok, ^key, ^record} = AgentItems.owned_item(:postgres, {person, origin}, "i7")
+      assert {:error, :not_found} = AgentItems.owned_item(:postgres, {person, "other"}, "i7")
+      assert {:error, :not_found} = RecipientItems.fetch(:postgres, "other", "i7")
+
+      assert {:ok, _} =
+               Transaction.query(
+                 "UPDATE harklight.messages SET attributes = $1 WHERE id = 'fixture-item'",
+                 [Attributes.encode(%{"full_bounced_at_ms" => 99})]
+               )
+
+      assert {:error, :not_found} = RecipientItems.fetch(:postgres, person, "i7")
+      assert {:ok, ^key, _} = AgentItems.owned_item(:postgres, {person, origin}, "i7")
+    end
+
     test "reversed multi-stream inputs wait on the same first lock" do
       left = {"lock-a", ""}
       right = {"lock-b", ""}
