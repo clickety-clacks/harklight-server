@@ -376,11 +376,21 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         %{person: person, other: other} = CompatibilityScenarios.provision(relay, fixture)
         {:ok, hosted} = Relay.hosted_account_create(relay, "synthetic-legacy-hosted")
         engine = :sys.get_state(relay).store.engine
-        refute Map.has_key?(engine.local_organizations, :default)
         %{instance: engine.relay_instance_id, members: [person, other], hosted: hosted}
       after
         GenServer.stop(relay)
       end
+      # Modern provisioning initializes the roster even with features off.
+      # Reconstruct the valid legacy state after stopping, with no group facts.
+      alias AttentionServer.{Engine, Store}
+      {:ok, legacy} = Store.open_relay(Path.join(fixture.root, "relay.sqlite3"))
+      assert legacy.engine.groups == %{}
+      {engine, :ok, touched} = Engine.with_touches(legacy.engine, fn engine ->
+        {Engine.delete_row(engine, :local_organizations, :default), :ok}
+      end)
+      {:ok, legacy} = Store.commit(legacy, {engine, touched}, %{person: "fixture", actor: "fixture", action: "legacy_roster"})
+      refute Map.has_key?(legacy.engine.local_organizations, :default)
+      :ok = Store.close(legacy)
       bundle = Path.join(root, "export")
       assert {:ok, summary} = Bundle.export(Path.join(fixture.root, "relay.sqlite3"), bundle,
         supervisor: {:operator, "synthetic fixture", "seed Relay stopped"}, material: %{})
