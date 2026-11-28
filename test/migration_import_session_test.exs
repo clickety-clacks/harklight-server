@@ -4,7 +4,7 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
   defmodule AttentionServer.Migration.ImportSessionTest do
     use ExUnit.Case, async: false
     alias AttentionServer.{CompatibilityScenarios, JSON, Relay}
-    alias AttentionServer.Migration.{Bundle, Frames, ImportFacts, ImportOrganizations, ImportSession}
+    alias AttentionServer.Migration.{Bundle, Frames, ImportFacts, ImportOrganizations, ImportSession, ImportTables, SourceTables}
     alias AttentionServer.Repository.Postgres.Attributes
 
     for epoch <- [1, 17] do
@@ -93,6 +93,16 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
             sqlite,
             "SELECT key,payload,checksum FROM relay_records"
           )
+
+        {session_person, session_owner} = Enum.find_value(rows, fn [key, payload, hash] ->
+          case AttentionServer.Store.RecordCodec.decode_row({key, payload, hash}) do
+            {:ok, {:row, :owners, person}, owner} -> {person, owner}
+            _ -> nil
+          end
+        end)
+        :ok = AttentionServer.BrowserAuth.add_session(sqlite,
+          :crypto.hash(:sha256, "synthetic migration browser session"),
+          session_person, session_owner.key, session_owner.revision, "fixture")
 
         {address, _} =
           Enum.find_value(rows, fn [key, payload, hash] ->
@@ -313,6 +323,9 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         assert :ok = ImportOrganizations.run(db, identity, bundle)
         assert :ok = ImportOrganizations.run(db, identity, bundle)
         verify_organizations(db, expected_organizations)
+        assert :ok = ImportTables.run(db, identity, bundle)
+        assert :ok = ImportTables.run(db, identity, bundle)
+        verify_tables(db, bundle, manifest)
 
         assert {:ok, :ok} =
                  Frames.fold(
@@ -405,6 +418,30 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         "SELECT attributes::text FROM harklight.organizations WHERE id=$1", [expected.instance])
       assert_typed(text, nil)
       Agent.stop(fixture.clock)
+    end
+
+    defp verify_tables(db, bundle, manifest) do
+      for {table, source} <- manifest.data.tables do
+        family = "sqlite/" <> table
+        assert {:ok, %{rows: [[count]]}} = ImportSession.query(db,
+          "SELECT count(*) FROM harklight.compatibility_facts WHERE family=$1", [family])
+        case SourceTables.disposition(table) do
+          {:durable, _} ->
+            assert count == source.summary.count
+            assert {:ok, :ok} = Frames.fold(Path.join(bundle, source.file), source.summary, :ok,
+              fn values, :ok ->
+                {:ok, address, expected} = SourceTables.fact(table, values)
+                assert {:ok, %{rows: [[text]]}} = ImportSession.query(db,
+                  "SELECT body::text FROM harklight.compatibility_facts WHERE family=$1 AND address=$2",
+                  [family, Attributes.key(address)])
+                assert_typed(text, expected)
+                {:ok, :ok}
+              end)
+          excluded when excluded in [:derived, :source_only] -> assert count == 0
+        end
+      end
+      assert {:ok, %{rows: [[1]]}} = ImportSession.query(db,
+        "SELECT count(*) FROM harklight.compatibility_facts WHERE family='sqlite/harklight_browser_sessions'", [])
     end
 
     defp seed_organizations(path, epoch) do
