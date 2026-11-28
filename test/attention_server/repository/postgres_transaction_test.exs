@@ -4,6 +4,48 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
 
     alias AttentionServer.Repository.Postgres.{Attributes, Jobs, Operations, Pool, Repo, Transaction}
 
+    defmodule LargeTextTransportFixture do
+      alias AttentionServer.ClientAPI.{Auth, Errors, Projection}
+      alias AttentionServer.Repository.RecipientItems
+      alias AttentionServer.Repository.Postgres.{Identities, Settings, Transaction}
+
+      def init(opts), do: opts
+
+      def call(%Plug.Conn{path_info: ["v2", "items", item]} = conn, observer) do
+        result =
+          Transaction.snapshot(fn ->
+            with {:ok, %{kind: :browser, person: person}} <- Auth.web(conn, Identities, :postgres),
+                 :ok <- Settings.check_active(person),
+                 {:ok, _, record} <- RecipientItems.fetch(:postgres, person, item) do
+              {:ok, %{"message" => record.message}}
+            end
+          end)
+
+        response = respond(conn, result)
+        send(observer, :large_text_response_finished)
+        response
+      end
+
+      defp respond(conn, result) do
+        case result do
+          {:ok, body} ->
+            case Projection.capture(fn -> Errors.send_streamed_json(conn, 200, body) end) do
+              {:error, %Projection{} = fault} -> Errors.projection_error(conn, fault)
+              response -> response
+            end
+
+          {:error, reason} ->
+            token =
+              case Errors.token_for_reason(reason) do
+                {:ok, token} -> token
+                :error -> "storage_unavailable"
+              end
+
+            Errors.send_error(conn, token)
+        end
+      end
+    end
+
     setup_all do
       config = [url: System.fetch_env!("HARKLIGHT_POSTGRES_TEST_URL")]
       assert {:error, :postgres_disabled} = Pool.start_link(config)
@@ -203,6 +245,132 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
         end)
 
       {:crypto.hash_final(hash), length}
+    end
+
+    @tag :tmp_dir
+    test "isolated HTTP sends two retained messages sharing one FORMAT32 large value", %{tmp_dir: dir} do
+      alias AttentionServer.{BrowserAuth, JSON, LargeData, Relay}
+      alias AttentionServer.ClientAPI.Reads
+      alias AttentionServer.Repository.Postgres.LargeText
+
+      {relay, _browser, _backend, cookie, principal} = browser_fixture(dir)
+      person = principal.person
+      origin = "synthetic-transport-origin"
+      assert :ok = Relay.setup_device(relay, person, origin)
+      assert :ok = Relay.setup_sender(relay, origin, "app:fixture")
+      chunk = LargeText.chunk_bytes()
+      text = :binary.copy("x", chunk - 1) <> "💡" <> :binary.copy("y", chunk) <> "\"\\\n"
+      assert byte_size(text) > 2 * 1024 * 1024
+
+      source =
+        for number <- [1, 2] do
+          id = "retained-text-#{number}"
+          frame = %{
+            "v" => 1,
+            "type" => "forward",
+            "op_id" => "00000000-0000-4000-8000-00000000081#{number}",
+            "session_handle" => "10000000-0000-4000-8000-000000000081",
+            "message" => %{
+              "sender_id" => "app:fixture",
+              "message_id" => id,
+              "created_at" => 1,
+              "title" => "Historical #{number}",
+              "body" => text
+            }
+          }
+
+          assert {:ok, reply} = Relay.request_line(relay, origin, JSON.encode!(frame) <> "\n")
+          assert {:ok, %{"type" => "ok", "seq" => ^number}} = JSON.decode_line(reply)
+          item = "i#{number}"
+          assert {:ok, %{"item" => %{"message" => %{"body" => %LargeData.Ref{}} = message}}} =
+                   Reads.item(relay, principal, item)
+          {id, item, number, message}
+        end
+
+      [{_, _, _, %{"body" => source_ref}}, {_, _, _, %{"body" => shared_ref}}] = source
+      assert source_ref == shared_ref
+      assert :ok = LargeData.verify(source_ref)
+      assert {:ok, ref} = LargeText.reference(source_ref.sha256, source_ref.size)
+      assert :ok = LargeText.stage(ref)
+      for {bytes, ordinal} <- source_ref.path |> File.stream!([], chunk) |> Enum.with_index() do
+        assert :ok = LargeText.put_chunk(ref, ordinal, bytes)
+      end
+      assert :ok = LargeText.complete(ref)
+
+      assert {:ok, _} =
+               Transaction.query(
+                 "INSERT INTO harklight.principals (key, person_id, kind, revision) VALUES ($1, $2, 'device', 1)",
+                 [origin, person]
+               )
+
+      for {id, item, number, message} <- source do
+        assert {:ok, _} =
+                 Transaction.query(
+                   """
+                   INSERT INTO harklight.messages
+                     (id, person_id, origin_key, sender_id, message_id, revision, accepted_at_ms, accepted_position)
+                   VALUES ($1, $2, $3, 'app:fixture', $1, 1, 1, $4)
+                   """,
+                   [id, person, origin, number]
+                 )
+        assert {:ok, _} =
+                 Transaction.query(
+                   "INSERT INTO harklight.message_revisions VALUES ($1, 1, 1, $2)",
+                   [id, Attributes.encode(%{message | "body" => ref})]
+                 )
+        assert {:ok, _} =
+                 Transaction.query(
+                   "INSERT INTO harklight.message_recipients (message_id, person_id, item_id) VALUES ($1, $2, $3)",
+                   [id, person, item]
+                 )
+      end
+
+      other_cookie = "synthetic-other-valid-session"
+      assert {:ok, _} = Transaction.query("INSERT INTO harklight.people (id) VALUES ('transport-other')", [])
+      assert {:ok, _} =
+               Transaction.query(
+                 "INSERT INTO harklight.principals (key, person_id, kind, revision) VALUES ('transport-other-owner', 'transport-other', 'owner', 1)",
+                 []
+               )
+      assert {:ok, _} =
+               Transaction.query(
+                 """
+                 INSERT INTO harklight.auth_sessions
+                   (token_hash, person_id, principal_key, kind, principal_revision)
+                 VALUES ($1, 'transport-other', 'transport-other-owner', 'browser', 1)
+                 """,
+                 [BrowserAuth.hash(other_cookie)]
+               )
+
+      assert {:ok, _} = Application.ensure_all_started(:inets)
+      listener = start_supervised!({Bandit, plug: {LargeTextTransportFixture, self()}, ip: {127, 0, 0, 1}, port: 0})
+      assert {:ok, {_, port}} = ThousandIsland.listener_info(listener)
+      spools = Path.join(System.tmp_dir!(), "harklight-json-response-*")
+      existing_spools = Path.wildcard(spools)
+      for {_, item, _, message} <- source do
+        assert {200, headers, body} = request_retained_text(port, item, cookie)
+        assert {~c"content-type", ~c"application/json; charset=utf-8"} in headers
+        assert :crypto.hash(:sha256, body) ==
+                 :crypto.hash(:sha256, JSON.encode!(%{"message" => message}))
+      end
+      assert {404, _, denied} = request_retained_text(port, "i1", other_cookie)
+      assert {:ok, %{"error" => "not_found"}} = JSON.decode_line(denied <> "\n")
+
+      digest = Base.decode16!(ref.sha256, case: :lower)
+      assert {:ok, _} =
+               Transaction.query("DELETE FROM harklight.large_text_chunks WHERE sha256 = $1 AND chunk_number = 2", [digest])
+      assert {500, _, error} = request_retained_text(port, "i1", cookie)
+      assert {:ok, %{"error" => "internal_error"}} = JSON.decode_line(error <> "\n")
+      assert Path.wildcard(spools) == existing_spools
+    end
+
+    defp request_retained_text(port, item, cookie) do
+      url = String.to_charlist("http://127.0.0.1:#{port}/v2/items/#{item}")
+      headers = [{~c"cookie", String.to_charlist("__Host-harklight=" <> cookie)}]
+      assert {:ok, {{_, status, _}, headers, body}} =
+               :httpc.request(:get, {url, headers}, [timeout: 15_000], [body_format: :binary])
+      assert_receive :large_text_response_finished, 2_000
+      {status, headers, body}
     end
 
     @tag :tmp_dir
