@@ -118,3 +118,6 @@ validates the complete expected stream before calling its consumer, so a
 truncated file cannot be accepted as a shorter export. These files can contain
 identity and cursor material: keep their enclosing directory private and do
 not attach them to public reports.
+
+Capture uses ordinary file reads, which may update source access times; content,
+size and modification time are verified unchanged.
