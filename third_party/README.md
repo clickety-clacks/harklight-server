@@ -14,3 +14,8 @@ artifact. They do not select or grant a new license for Harklight server source.
 The package builder additionally copies existing LICENSE/NOTICE/COPYING files
 from each shipped dependency's source distribution, including Exqlite and
 Telemetry. Build-time-only dependencies are not presented as shipped runtimes.
+
+- Ecto 3.14.3 and Ecto SQL 3.14.0 ship the Apache-2.0 license from their exact
+  upstream tags (the Hex archives omit it).
+- Postgrex 0.22.4 declares Apache-2.0 in its upstream README. Its tagged
+  copyright/permission notice and the standard Apache-2.0 text are included.

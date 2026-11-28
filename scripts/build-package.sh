@@ -37,7 +37,7 @@ cp -a third_party "$stage/$name/THIRD_PARTY"
 for application in "$stage/$name"/lib/*; do
   component="$(basename "$application")"
   dependency="$(printf '%s' "$component" | sed 's/-[^-]*$//')"
-  for notice in LICENSE LICENSE.txt NOTICE COPYING; do
+  for notice in LICENSE LICENSE.md LICENSE.txt NOTICE COPYING; do
     if [[ -f "deps/$dependency/$notice" ]]; then
       mkdir -p "$stage/$name/THIRD_PARTY/$component"
       install -m 644 "deps/$dependency/$notice" "$stage/$name/THIRD_PARTY/$component/$notice"
