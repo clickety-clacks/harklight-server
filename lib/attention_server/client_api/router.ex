@@ -109,6 +109,10 @@ defmodule AttentionServer.ClientAPI.Router do
   ]
 
   @default_max_in_flight 512
+  @postgres_settings_writes %{
+    put_alerts: :put_postgres_alerts,
+    put_priority_levels: :put_postgres_priority_levels
+  }
 
   @doc false
   # Matches the device listener's HTTP/2 writer wait default.
@@ -178,15 +182,16 @@ defmodule AttentionServer.ClientAPI.Router do
   defp authenticated(
          %{method: "PUT"} = conn,
          %{repository: :postgres, auth: {:browser, _, origin}} = opts,
-         ["settings", "alerts"],
-         {:ok, Writes, :put_alerts, _, _},
+         ["settings", _setting],
+         {:ok, Writes, handler, _, _},
          request_id
-       ) do
+       )
+       when is_map_key(@postgres_settings_writes, handler) do
     with {:ok, %{kind: :browser} = principal} <- Auth.web(conn, Identities, :postgres),
          :ok <- Settings.check_active(principal.person),
          true <- Auth.browser_origin_ok?(conn, origin) do
       ctx = %Context{principal: principal, relay: nil, request_id: request_id}
-      run(conn, Writes, :put_postgres_alerts, ctx, opts)
+      run(conn, Writes, Map.fetch!(@postgres_settings_writes, handler), ctx, opts)
     else
       false -> Errors.send_error(conn, "forbidden")
       {:ok, _native} -> Errors.send_error(conn, "not_found")
