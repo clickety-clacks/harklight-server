@@ -6,7 +6,8 @@ defmodule AttentionServer.Migration.VerifyAvailability do
   alias AttentionServer.Store.RecordTable
   alias Exqlite.Sqlite3
 
-  def run(db, identity, bundle) do
+  # The query seam supports deterministic isolated source-change tests only.
+  def run(db, identity, bundle, query \\ &ImportSession.query/3) do
     with {:ok, manifest, summary} <- Bundle.verify(bundle),
          true <- identity.source == Base.decode16!(summary.sha256, case: :lower),
          {:ok, %{"phase" => phase}} when phase in ["loading", "validated"] <- ImportStatus.read(db, identity),
@@ -15,11 +16,11 @@ defmodule AttentionServer.Migration.VerifyAvailability do
              {{:row, :messages, {person, _, _} = key}, %{session_handle: handle} = record}, n
                  when is_binary(handle) ->
                with {:ok, value} <- projection(source, key, record),
-                    :ok <- compare(db, {person, Resources.item_id(record)}, value), do: {:ok, n + 1}
+                    :ok <- compare(db, {person, Resources.item_id(record)}, value, query), do: {:ok, n + 1}
              _, n -> {:ok, n}
            end)
          end),
-         {:ok, %{rows: [[^n]]}} <- ImportSession.query(db,
+         {:ok, %{rows: [[^n]]}} <- query.(db,
            "SELECT count(*) FROM harklight.compatibility_facts WHERE family='ordinary_item_availability'", []),
          {:ok, ^manifest, ^summary} <- Bundle.verify(bundle) do
       {:ok, %{availability: n}}
@@ -90,9 +91,9 @@ defmodule AttentionServer.Migration.VerifyAvailability do
     end
   end
 
-  defp compare(db, key, value) do
+  defp compare(db, key, value, query) do
     expected = Attributes.encode(value)
-    case ImportSession.query(db,
+    case query.(db,
       "SELECT body FROM harklight.compatibility_facts WHERE family='ordinary_item_availability' AND address=$1",
       [Attributes.key(key)]) do
       {:ok, %{rows: [[^expected]]}} -> :ok

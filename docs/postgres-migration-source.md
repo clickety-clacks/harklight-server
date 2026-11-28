@@ -657,3 +657,9 @@ A file-backed temporary index and 256-row keyset pages bound its working set;
 destination membership and recipient rows are not the expected-value oracle.
 This checks reader facts only: upload content, scoped relational links, shared
 message history and HTTP visibility still require their separate validation.
+
+Bundle verification checks the copied source database together with its WAL and
+rollback journal before and after reading bundle contents. Sidecars must be
+absent or empty; a nonempty sidecar refuses even if the main database hash is
+unchanged. All verifiers share this check. It never opens, checkpoints, clears
+or otherwise modifies the copied source to make validation pass.

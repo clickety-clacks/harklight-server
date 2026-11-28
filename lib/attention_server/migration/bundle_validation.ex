@@ -13,15 +13,15 @@ defmodule AttentionServer.Migration.BundleValidation do
         material_provenance: material_provenance
       }) do
     with :ok <- Provenance.validate(receipt, source.source_sha256, source.source_bytes),
-         :ok <-
-           file(root, "source.sqlite3", %{size: source.source_bytes, sha256: source.source_sha256}),
+         :ok <- sealed_source(root, source),
          :ok <-
            sequence(Path.join(root, "records.frames"), data.records, source.records, &record/1),
          true <- Map.keys(data.tables) |> Enum.sort() == Enum.sort(Map.keys(source.tables)),
          :ok <- tables(root, data.tables, source.tables),
          :ok <- files(root, data.files, "files/uploads/"),
          :ok <- files(root, material, "material/"),
-         :ok <- MaterialProvenance.verify(root, material, material_provenance) do
+         :ok <- MaterialProvenance.verify(root, material, material_provenance),
+         :ok <- sealed_source(root, source) do
       :ok
     else
       {:error, _} = error -> error
@@ -34,6 +34,24 @@ defmodule AttentionServer.Migration.BundleValidation do
 
   def validate(_, %{version: 1}), do: {:error, :legacy_bundle_requires_reexport}
   def validate(_, _), do: {:error, :invalid_bundle_manifest}
+
+  # Every bundle consumer shares the same effective SQLite seal. Never open,
+  # checkpoint, delete or truncate source sidecars to obtain an admissible copy.
+  def sealed_source(root, source) do
+    with :ok <- no_pending_writes(root),
+         :ok <- file(root, "source.sqlite3", %{size: source.source_bytes, sha256: source.source_sha256}),
+         :ok <- no_pending_writes(root), do: :ok
+  end
+
+  defp no_pending_writes(root) do
+    Enum.reduce_while(["-wal", "-journal"], :ok, fn suffix, :ok ->
+      case File.lstat(Path.join(root, "source.sqlite3" <> suffix)) do
+        {:error, :enoent} -> {:cont, :ok}
+        {:ok, %{type: :regular, size: 0}} -> {:cont, :ok}
+        _ -> {:halt, {:error, :bundle_source_pending_writes}}
+      end
+    end)
+  end
 
   defp record({address, value}) do
     if SourceSchema.valid_record?(address, value),
