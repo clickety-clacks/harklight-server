@@ -171,3 +171,26 @@ For the standard self-host state directory, inventory `server.env`, `person-id`,
 and all regular files under `tls/` and `owner/`, preserving their relative
 paths. Include external files referenced by configuration explicitly. Do not
 include the new PostgreSQL cluster or its passwords in the source material map.
+
+## Unpublished import staging
+
+`ImportSession` claims an empty, already migrated database under the schema's
+advisory lock. It binds an import ID to the export-manifest and exact DDL digests.
+An occupied database, a different import identity or a phase other than loading
+is refused. It performs no DDL and never changes the runtime backend.
+
+`ImportFacts.run/3` is the internal first staging pass. It writes each addressed
+Engine fact using the shared typed attributes codec. Batches of at most 256
+facts and their ordinal/digest checkpoint commit in the same transaction.
+After interruption, the importer checks the original bundle and its consumed
+prefix before continuing from the stored checkpoint. A stale checkpoint cannot
+write again. The source bundle stays unchanged.
+
+This pass preserves facts for later normalized projection and comparison; it
+is not a complete import or an exposed command. Side tables, normalized rows,
+upload chunks, relational closure and retained-client-history validation must
+finish before a later validation/activation slice can publish the database.
+The staging functions always leave phase `loading` and expose no activation
+operation. Their dedicated CI test uses a fresh disposable PostgreSQL service,
+kills a writer after uncommitted rows, checks rollback and resume, and compares
+every staged fact with its original typed value.
