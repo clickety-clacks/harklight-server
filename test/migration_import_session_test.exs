@@ -568,6 +568,7 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         end
         assert {:ok, %{rows: [["loading"]]}} = ImportSession.query(db, "SELECT phase FROM harklight.import_state", [])
         Agent.stop(fixture.clock)
+      end
     end
 
     defp verify_messages(db, bundle, manifest) do
