@@ -16,7 +16,7 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
       # Full source/import/restore equivalence over >256 records and conversation
       # entries, including repeated read-only mutation probes, is deliberately
       # bounded separately from the smaller migration cases below.
-      @tag timeout: 300_000, epoch: epoch
+      @tag timeout: 600_000, epoch: epoch
       test "interrupted migration and authority readback with epoch #{epoch}", %{epoch: epoch} do
         uri = URI.parse(System.fetch_env!("HARKLIGHT_MIGRATION_TEST_URL"))
         assert uri.host in ["localhost", "127.0.0.1"]
@@ -232,12 +232,13 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         end
 
         :ok = Exqlite.Sqlite3.close(sqlite)
+        material = report_material(root, fixture, rows)
         bundle = Path.join(root, "export")
 
         assert {:ok, summary} =
                  Bundle.export(Path.join(fixture.root, "relay.sqlite3"), bundle,
                    supervisor: {:operator, "synthetic fixture", "seed Relay stopped"},
-                   material: %{}
+                   material: material
                  )
 
         {:ok, manifest, _} = Bundle.verify(bundle)
@@ -680,6 +681,7 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         assert {:error, :large_text_hash_count_mismatch} = AttentionServer.Migration.VerifyLargeText.run(db, identity, bundle)
         assert {:ok, _} = ImportSession.query(db, "DELETE FROM harklight.large_texts WHERE sha256=$1", [extra_hash])
         assert {:ok, %{references: 0}} = AttentionServer.Migration.VerifyLargeText.run(db, identity, bundle)
+        verify_complete_report(db, identity, bundle, root)
         stop_supervised!(Repo)
 
         assert {:ok, :ok} =
@@ -866,6 +868,75 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         assert {:ok, %{rows: [["loading"]]}} = ImportSession.query(db, "SELECT phase FROM harklight.import_state", [])
         Agent.stop(fixture.clock)
       end
+    end
+
+    defp report_material(root, fixture, rows) do
+      certs = Path.join(fixture.root, "certs")
+      der = AttentionServer.TLSFixtures.certificate_der!(certs, "expired")
+      {:ok, fingerprint} = AttentionServer.DeviceIdentity.from_certificate(der)
+      person = Enum.find_value(rows, fn [key, payload, hash] ->
+        case AttentionServer.Store.RecordCodec.decode_row({key, payload, hash}) do
+          {:ok, {:row, :owners, person}, %{key: ^fingerprint}} -> person
+          _ -> nil
+        end
+      end)
+      assert is_binary(person)
+      state = Path.join(root, "material-source")
+      File.mkdir!(state)
+      File.chmod!(state, 0o700)
+      File.write!(Path.join(state, "person-id"), person <> "\n")
+      File.write!(Path.join(state, "server.env"), Enum.map_join([
+        {"CERTFILE", "server.pem"}, {"KEYFILE", "server.key"}, {"CACERTFILE", "ca.pem"}
+      ], "\n", fn {key, file} -> "ATTENTION_SERVER_#{key}='#{Path.join(certs, file)}'" end))
+      %{"owner/identity.pem" => Path.join(certs, "expired.pem"),
+        "owner/identity.key" => Path.join(certs, "expired.key"),
+        "person-id" => Path.join(state, "person-id"), "server.env" => Path.join(state, "server.env"),
+        "tls/server.pem" => Path.join(certs, "server.pem"), "tls/server.key" => Path.join(certs, "server.key"),
+        "tls/ca.pem" => Path.join(certs, "ca.pem"), "tls/ca.key" => Path.join(certs, "ca.key")}
+    end
+
+    defp verify_complete_report(db, identity, bundle, root) do
+      alias AttentionServer.Migration.{ValidationReport, ImportMaterial, ImportStatus}
+      # Complete the shared projections too: the report cannot accept a partial
+      # ordinary-only import even when all ordinary checks already passed.
+      assert :ok = AttentionServer.Migration.ImportSharedReaderFacts.run(db, identity, bundle)
+      assert :ok = AttentionServer.Migration.ImportSharedEntryUploads.run(db, identity, bundle)
+      staging = Path.join(root, "report-material")
+      assert {:ok, material} = ImportMaterial.run(bundle, identity, staging)
+      assert {:ok, before} = ImportStatus.read(db, identity)
+      started = System.monotonic_time(:millisecond)
+      assert {:ok, report} = ValidationReport.run(db, identity, bundle, staging)
+      elapsed = System.monotonic_time(:millisecond) - started
+      IO.puts("combined migration report elapsed_ms=#{elapsed}")
+      assert map_size(report["report"]["comparisons"]) == 26
+      assert report["material"] == material
+      assert report["report"]["identity"] == AttentionServer.Migration.ImportReceipt.document(identity)
+      assert report["sha256"] == Base.encode16(:crypto.hash(:sha256, Attributes.key(report["report"])), case: :lower)
+      assert {:ok, ^before} = ImportStatus.read(db, identity)
+      assert before["phase"] == "loading" and before["validation_sha256"] == nil
+      assert {:error, :postgres_not_active} = Transaction.verify_ready()
+
+      marker = Path.join(staging, "COMPLETE.json")
+      File.rename!(marker, marker <> ".partial")
+      try do
+        assert {:error, _} = ValidationReport.run(db, identity, bundle, staging)
+        refute File.exists?(marker)
+      after
+        File.rename!(marker <> ".partial", marker)
+      end
+      # A complete prefix is never returned when a later comparison fails.
+      assert {:ok, %{rows: [[address, body]]}} = ImportSession.query(db,
+        "SELECT address,body FROM harklight.compatibility_facts WHERE family='ordinary_item_availability' ORDER BY address LIMIT 1", [])
+      assert {:ok, _} = ImportSession.query(db,
+        "UPDATE harklight.compatibility_facts SET body='{}'::jsonb WHERE family='ordinary_item_availability' AND address=$1", [address])
+      try do
+        assert {:error, {:validation_comparison_failed, "ordinary_availability", _}} = ValidationReport.run(db, identity, bundle, staging)
+      after
+        assert {:ok, _} = ImportSession.query(db,
+          "UPDATE harklight.compatibility_facts SET body=$2::text::jsonb WHERE family='ordinary_item_availability' AND address=$1", [address, JSON.encode!(body)])
+      end
+      assert {:ok, ^report} = ValidationReport.run(db, identity, bundle, staging)
+      assert {:ok, ^before} = ImportStatus.read(db, identity)
     end
 
     defp verify_catalog_drift(db, identity, bundle) do
