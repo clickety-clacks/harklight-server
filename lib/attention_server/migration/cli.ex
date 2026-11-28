@@ -4,7 +4,7 @@ defmodule AttentionServer.Migration.CLI do
 
   def run(["verify", directory]) do
     case Bundle.verify(directory) do
-      {:ok, manifest, summary} -> {:ok, public_summary(manifest, summary)}
+      {:ok, manifest, summary} -> {:ok, public_summary(manifest, summary, "verify")}
       error -> error
     end
   end
@@ -32,7 +32,7 @@ defmodule AttentionServer.Migration.CLI do
          options = [supervisor: supervisor, pidfile: opts[:pidfile], material: material],
          {:ok, _} <- Bundle.export(source, destination, options),
          {:ok, manifest, summary} <- Bundle.verify(destination) do
-      {:ok, public_summary(manifest, summary)}
+      {:ok, public_summary(manifest, summary, "export")}
     else
       {:error, _} = error -> error
       _ -> {:error, :invalid_arguments}
@@ -88,10 +88,12 @@ defmodule AttentionServer.Migration.CLI do
     end
   end
 
-  defp public_summary(manifest, summary) do
+  defp public_summary(manifest, summary, command) do
     %{
+      "contract_version" => 1,
+      "command" => command,
       "result" => "verified_export",
-      "bundle_version" => 1,
+      "bundle_version" => manifest.version,
       "manifest_sha256" => summary.sha256,
       "record_count" => manifest.source.records.count,
       "table_count" => map_size(manifest.source.tables),

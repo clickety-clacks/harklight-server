@@ -367,3 +367,62 @@ message's internal ID and copies exact per-person read positions. Positive read
 positions must resolve to the same source conversation's origin reply. This phase
 does not yet project conversation entries, seen revisions, answers or shared
 conversation history, and cannot validate or activate a destination.
+
+`ImportMaterial.run/3` copies the verified bundle's declared configuration and
+identity files into a separate private staging directory bound to the original
+import identity. It never writes to the original state paths. Copies use bounded
+reads, private permissions, a partial file followed by rename, and size/digest
+readback. A retry verifies finished files and resumes unfinished copies; an
+existing mismatched file or identity is refused. The returned material inventory
+contains relative restore paths and digests, never file contents. It does not by
+itself establish that every required configuration or identity file was declared;
+that completeness check remains part of final migration validation.
+
+The planned `validate` result uses a `material` object with `root` (absolute path
+to the verified staged files), `manifest_sha256`, and `files` (each containing
+`path`, `size`, and `sha256`). Paths retain the export material map's relative
+restore names, including `external/...`; those external entries require the
+installer's explicit original destination mapping. The installer must verify the
+inventory and bytes before installing them. `server.env` remains source material;
+the installer applies the explicit backend configuration change separately after
+successful activation. Export and verify include additive `contract_version: 1`
+and `command` fields; their existing result and digest fields remain unchanged.
+
+Material staging now refuses permission drift on resumed roots, intermediate
+directories, files and owner/completion markers. Standard owner material requires
+`person-id`, `owner/identity.pem` and `owner/identity.key`: the private key's public
+SPKI fingerprint must match the certificate and the selected person's current
+owner fingerprint in the decoded source records. A valid certificate/key pair
+from another identity is refused. TLS continuity rests on stopped-source provenance, not a store fingerprint.
+Standard self-host staging requires the owner files and all three configured TLS files.
+The export observes `server.env` and every declared material file before and
+after copying within the stopped-source window. Its configured `CERTFILE`,
+`KEYFILE` and `CACERTFILE` paths must identify the exact captured files. The
+parser accepts literal installer shell quoting without executing the file;
+expand computed paths to explicit absolute literals before stopping/exporting.
+The importer checks the server certificate/private-key pair, the optional
+`tls/ca.key` pair, and the server certificate chain to that captured CA. These
+are continuity checks, not certificate renewal; existing validity dates stay
+unchanged. Every retained guided-join invitation's `ca_sha256`, where present,
+must equal the captured CA's DER SHA-256. With no retained pin, TLS relies on
+the captured source configuration alone. A foreign key, CA, configured path,
+changed source file or pin mismatch refuses staging. Unknown material kinds
+remain refused until they have an explicit typed continuity mapping. Final
+material completeness and activation are still separate unfinished gates.
+
+The known installer byproducts `tls/server.csr`, `tls/server.ext`, `tls/ca.srl`
+and optional `owner/sign-in-link.txt` are preserved byte for byte in private
+staging. Their captured source paths must be those names beneath the directory
+containing the captured `server.env`. They do not choose the Server's runtime
+identity; a saved sign-in link remains private. Other undeclared identity kinds
+still refuse and must not be silently omitted from a backup or import.
+
+Bundle format 2 adds mandatory stopped-source material provenance. Format 1
+exports return `legacy_bundle_requires_reexport` (CLI exit 2), rather than a
+successful weaker validation or an ambiguous malformed-manifest error. Keep the
+original immutable stopped backup and create a **new** export directory with the
+current exporter; do not edit the old manifest, its version, or its checksums.
+Start a fresh unpublished destination and new receipt for that new bundle. An
+existing format-1 destination remains unpublished; do not reuse its receipt with
+the replacement bundle. This changes the migration bundle format, not FORMAT32
+or the client protocol. Unknown newer bundle versions also refuse explicitly.
