@@ -8,6 +8,7 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
   alias AttentionServer.{AgentChangeLog, ConversationFiles, Engine, Groups, JSON, Message, Relay, SharedMessages}
 
   alias AttentionServer.AgentAPI.{Advisories, RecipientReach}
+  alias AttentionServer.Repository.AgentItems
 
   alias AttentionServer.ClientAPI.{
     AgentResources,
@@ -442,7 +443,7 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
 
     result =
       with :ok <- authorize(state, scope, operation),
-           {:ok, key} <- operation_item_key(state, scope, operation, item) do
+           {:ok, key} <- AgentItems.item_key(state.store.engine, scope, operation, item) do
         project_receipt(state, scope, key, request_operation, receipt)
       end
 
@@ -987,7 +988,7 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
   end
 
   defp frame(state, scope, operation, %{item_id: item_id} = params, _op_id, match, body) do
-    with {:ok, {_, sender, id} = key} <- operation_item_key(state, scope, operation, item_id),
+    with {:ok, {_, sender, id} = key} <- AgentItems.item_key(state.store.engine, scope, operation, item_id),
          record = Map.fetch!(state.store.engine.messages, key),
          :ok <- authorize_correlation(scope, record, operation, body),
          {:ok, fields, extras} <-
@@ -1007,12 +1008,6 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
       {:ok, key, frame, extras}
     end
   end
-
-  defp operation_item_key(state, {person, _}, :retract, id),
-    do: Resources.item_key(state.store.engine, person, id)
-
-  defp operation_item_key(state, scope, _operation, id),
-    do: AgentResources.own_item_key(state, scope, id)
 
   defp authorize_correlation({_, actor}, %{origin: origin}, :retract, %{"in_reply_to" => _})
        when actor != origin,
@@ -1095,14 +1090,14 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
 
   defp item_frame(state, key, record, :chat_receipt, _match, body) do
     with :ok <- supports_chat(record),
-         {:ok, sequence, position, _} <- person_turn(state, key, body[:entry_id]) do
+         {:ok, sequence, position, _} <- AgentItems.person_turn(state.store.engine, key, body[:entry_id]) do
       {:ok, {:receipt, sequence, Map.delete(body, :entry_id)}, position}
     end
   end
 
   defp item_frame(state, {person, _, _} = key, record, :file_use, _match, body) do
     with :ok <- supports_chat(record),
-         {:ok, sequence, position, _} <- person_turn(state, key, body[:entry_id]),
+         {:ok, sequence, position, _} <- AgentItems.person_turn(state.store.engine, key, body[:entry_id]),
          {:ok, entry} <- AgentResources.entry(state, {person, record.origin}, key, position),
          file when is_map(file) <-
            Enum.find(entry["files"] || [], &(&1["file_id"] == body["file_id"])),
@@ -1198,7 +1193,7 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
   defp if_match(_headers, _revision), do: {:error, :precondition_failed}
 
   defp correlation(state, key, record, %{"in_reply_to" => id}) do
-    with {:ok, sequence, position, revision} <- person_turn(state, key, id) do
+    with {:ok, sequence, position, revision} <- AgentItems.person_turn(state.store.engine, key, id) do
       if revision == record.revision,
         do: {:ok, %{"in_reply_to" => sequence}, position},
         else: {:error, :stale_request}
@@ -1206,20 +1201,6 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
   end
 
   defp correlation(_state, _key, _record, _body), do: {:ok, %{}, nil}
-
-  defp person_turn(state, {person, _, _} = key, id) do
-    with {:ok, position} <- Resources.entry_seq(id),
-         %{
-           key: ^key,
-           payload: %{"kind" => "discussion", "event_id" => event, "request_revision" => revision}
-         } <-
-           Map.get(state.store.engine.conversation_events, {person, position}),
-         {sequence, ""} when sequence > 0 <- Integer.parse(event) do
-      {:ok, sequence, position, revision}
-    else
-      _ -> {:error, :not_found}
-    end
-  end
 
   defp content(%{"message" => message}) when is_map(message) and not is_struct(message) do
     case Enum.find(~w(sender_id message_id supersedes), &Map.has_key?(message, &1)) do
@@ -1258,9 +1239,9 @@ defmodule AttentionServer.ClientAPI.AgentWrites do
             ids
             |> Enum.uniq()
             |> Enum.reduce({[], []}, fn id, {targets, warnings} ->
-              case AgentResources.own_item_key(state, scope, id) do
-                {:ok, {_, ^sender, stored_message_id} = key} ->
-                  if state.store.engine.messages[key].terminal,
+              case AgentItems.owned_item(state.store.engine, scope, id) do
+                {:ok, {_, ^sender, stored_message_id}, record} ->
+                  if record.terminal,
                     do: {targets, [%{"item_id" => id, "reason" => "closed"} | warnings]},
                     else: {[stored_message_id | targets], warnings}
 

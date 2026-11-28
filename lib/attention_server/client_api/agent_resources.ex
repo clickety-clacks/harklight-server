@@ -4,17 +4,15 @@ defmodule AttentionServer.ClientAPI.AgentResources do
   alias AttentionServer.{AgentChangeLog, ChangeLog, Conversation, Engine, RouteBIndex}
   alias AttentionServer.ClientAPI.{Projection, Resources}
 
-  def own_item_key(state, {person, _agent} = scope, item_id) do
-    with {:ok, key} <- Resources.item_key(state.store.engine, person, item_id),
-         {:ok, _record} <- own_record(state.store.engine, scope, key) do
-      {:ok, key}
-    end
-  end
+  alias AttentionServer.Repository.AgentItems
+
+  def own_item_key(state, scope, item_id),
+    do: AgentItems.item_key(state.store.engine, scope, :owned, item_id)
 
   def message(state, {person, agent} = scope, {person, sender, id} = key) do
     engine = state.store.engine
 
-    with {:ok, record} <- own_record(engine, scope, key),
+    with {:ok, record} <- AgentItems.owned_record(engine, scope, key),
          {:ok, rev} <- known_rev(state.store, scope, {:message, key}),
          request_revision = Map.get(record, :revision, 1),
          {:ok, current} <- revision(state, key, request_revision) do
@@ -55,7 +53,7 @@ defmodule AttentionServer.ClientAPI.AgentResources do
   def raw_entries(state, scope, key) do
     engine = state.store.engine
 
-    with {:ok, record} <- own_record(engine, scope, key) do
+    with {:ok, record} <- AgentItems.owned_record(engine, scope, key) do
       entries =
         engine.route_b_index
         |> RouteBIndex.entry_page(key)
@@ -70,7 +68,7 @@ defmodule AttentionServer.ClientAPI.AgentResources do
   def raw_entries(state, scope, key, positions) do
     engine = state.store.engine
 
-    with {:ok, record} <- own_record(engine, scope, key) do
+    with {:ok, record} <- AgentItems.owned_record(engine, scope, key) do
       entries =
         Enum.flat_map(positions, fn position ->
           case Resources.agent_entry(engine, key, record, position) do
@@ -87,7 +85,7 @@ defmodule AttentionServer.ClientAPI.AgentResources do
     engine = state.store.engine
     tree = RouteBIndex.entry_page(engine.route_b_index, key)
 
-    with {:ok, record} <- own_record(engine, scope, key),
+    with {:ok, record} <- AgentItems.owned_record(engine, scope, key),
          {:ok, iterator} <- entry_iterator(tree, before) do
       positions =
         iterator
@@ -136,7 +134,7 @@ defmodule AttentionServer.ClientAPI.AgentResources do
   def entry(state, scope, key, position) do
     engine = state.store.engine
 
-    with {:ok, record} <- own_record(engine, scope, key),
+    with {:ok, record} <- AgentItems.owned_record(engine, scope, key),
          %{} = raw <- Resources.agent_entry(engine, key, record, position) do
       render_entry(state, scope, raw)
     else
@@ -246,15 +244,6 @@ defmodule AttentionServer.ClientAPI.AgentResources do
       retained -> retained
     end
   end
-
-  defp own_record(engine, {person, agent}, {person, _, _} = key) do
-    case Map.get(engine.messages, key) do
-      %{origin: ^agent} = record -> {:ok, record}
-      _ -> {:error, :not_found}
-    end
-  end
-
-  defp own_record(_engine, _scope, _key), do: {:error, :not_found}
 
   defp known_rev(store, scope, resource) do
     case AgentChangeLog.rev(store, scope, resource) do
