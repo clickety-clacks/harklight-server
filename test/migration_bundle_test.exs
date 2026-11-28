@@ -5,6 +5,65 @@ defmodule AttentionServer.Migration.BundleTest do
   alias AttentionServer.{CompatibilityScenarios, JSON}
   alias AttentionServer.Migration.{Bundle, CLI, Frames}
 
+  defp verify_staged_material(bundle, identity, staging, expected) do
+    alias AttentionServer.Migration.VerifyMaterial
+    files = ["OWNER.json", "COMPLETE.json" | Enum.map(expected["files"], &("files/" <> &1["path"]))]
+    snapshot = fn -> Map.new(files, fn relative ->
+      path = Path.join(staging, relative)
+      stat = File.stat!(path)
+      {relative, {:crypto.hash(:sha256, File.read!(path)), stat.size, stat.mtime, stat.mode}}
+    end) end
+    before = snapshot.()
+    assert {:ok, ^expected} = VerifyMaterial.run(bundle, identity, staging)
+    assert snapshot.() == before
+    for relative <- ["OWNER.json", "COMPLETE.json", "files/person-id"] do
+      path = Path.join(staging, relative)
+      bytes = File.read!(path)
+      File.write!(path, "changed synthetic material")
+      assert {:error, _} = VerifyMaterial.run(bundle, identity, staging)
+      assert File.read!(path) == "changed synthetic material"
+      File.write!(path, bytes)
+      assert {:ok, ^expected} = VerifyMaterial.run(bundle, identity, staging)
+      File.rename!(path, path <> ".partial")
+      assert {:error, _} = VerifyMaterial.run(bundle, identity, staging)
+      refute File.exists?(path)
+      assert File.read!(path <> ".partial") == bytes
+      File.rename!(path <> ".partial", path)
+      assert {:ok, ^expected} = VerifyMaterial.run(bundle, identity, staging)
+    end
+    for {relative, private, public} <- [{"", 0o700, 0o755}, {"files/owner", 0o700, 0o755},
+      {"files/owner/identity.key", 0o600, 0o644}, {"COMPLETE.json", 0o600, 0o644}] do
+      path = Path.join(staging, relative)
+      File.chmod!(path, public)
+      assert {:error, :material_permissions_mismatch} = VerifyMaterial.run(bundle, identity, staging)
+      assert Bitwise.band(File.stat!(path).mode, 0o777) == public
+      File.chmod!(path, private)
+      assert {:ok, ^expected} = VerifyMaterial.run(bundle, identity, staging)
+    end
+    for relative <- ["unexpected", "files/owner/extra.key"] do
+      path = Path.join(staging, relative)
+      File.write!(path, "synthetic extra")
+      File.chmod!(path, 0o600)
+      assert {:error, :material_source_or_inventory_mismatch} = VerifyMaterial.run(bundle, identity, staging)
+      assert File.read!(path) == "synthetic extra"
+      File.rm!(path)
+      assert {:ok, ^expected} = VerifyMaterial.run(bundle, identity, staging)
+    end
+    extra_directory = Path.join(staging, "files/unexpected-directory")
+    File.mkdir!(extra_directory)
+    File.chmod!(extra_directory, 0o700)
+    assert {:error, :material_source_or_inventory_mismatch} = VerifyMaterial.run(bundle, identity, staging)
+    assert File.dir?(extra_directory)
+    File.rmdir!(extra_directory)
+    assert {:ok, ^expected} = VerifyMaterial.run(bundle, identity, staging)
+    assert {:error, :material_identity_mismatch} = VerifyMaterial.run(bundle, %{identity | id: "another-import"}, staging)
+    assert {:error, :material_identity_mismatch} = VerifyMaterial.run(bundle,
+      %{identity | schema: :crypto.hash(:sha256, "another-schema")}, staging)
+    missing = staging <> "-missing"
+    assert {:error, _} = VerifyMaterial.run(bundle, identity, missing)
+    refute File.exists?(missing)
+  end
+
   test "command requires explicit source, supervision and material inventory" do
     assert {:ok, %{"contract_version" => 1, "command" => "capabilities",
       "commands" => ["export", "verify", "status"], "migration_ready" => false}} = CLI.run(["capabilities"])
@@ -163,6 +222,7 @@ defmodule AttentionServer.Migration.BundleTest do
     assert File.read!(staged) == original_material
     refute File.exists?(staged <> ".partial")
     assert File.read!(secret) == original_material
+    verify_staged_material(destination, identity, staging, material)
     refute String.contains?(AttentionServer.JSON.encode!(material), original_material)
 
     foreign_map = opts[:material]

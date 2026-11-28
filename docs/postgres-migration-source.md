@@ -657,3 +657,11 @@ A file-backed temporary index and 256-row keyset pages bound its working set;
 destination membership and recipient rows are not the expected-value oracle.
 This checks reader facts only: upload content, scoped relational links, shared
 message history and HTTP visibility still require their separate validation.
+
+`VerifyMaterial.run/3` validates an already completed private material stage
+without repairing it. It binds both ownership and completion markers to the
+original import/source/schema identity, revalidates the source owner and TLS
+continuity, checks exact directory/file inventory, private modes and file
+checksums, and rechecks the bundle seal. Missing, partial, altered or extra
+material refuses; validation neither copies files nor changes permissions.
+Successful material validation alone does not authorize database activation.
