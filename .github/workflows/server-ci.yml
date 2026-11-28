@@ -94,3 +94,37 @@ jobs:
         env:
           HARKLIGHT_POSTGRES_TEST_URL: postgres://fixture:fixture-password@127.0.0.1:${{ job.services.postgres.ports[5432] }}/fixture
         run: ATTENTION_SERVER_ENABLE=0 mix test test/attention_server/repository/postgres_transaction_test.exs
+
+  postgres-import-checkpoints:
+    name: PostgreSQL import checkpoints
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres@sha256:16bc17c64a573ef34162af9298258d1aec548232985b33ed7b1eac33ba35c229
+        env:
+          POSTGRES_USER: fixture
+          POSTGRES_PASSWORD: fixture-password
+          POSTGRES_DB: migration_fixture
+        ports:
+          - 5432/tcp
+        options: >-
+          --health-cmd "pg_isready -U fixture -d migration_fixture"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+          --cpus 1 --memory 1g --memory-swap 1g
+    steps:
+      - uses: actions/checkout@v7
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: '27.3.3'
+          elixir-version: '1.19.5'
+          version-type: strict
+      - run: mix deps.get
+      - name: Apply schema to a fresh throwaway database
+        run: |
+          docker exec -i "${{ job.services.postgres.id }}" psql -X -v ON_ERROR_STOP=1 -U fixture -d migration_fixture -f - < priv/postgres/001_initial.sql
+      - name: Exercise stopped-history staging and interrupted transactions
+        env:
+          HARKLIGHT_MIGRATION_TEST_URL: postgres://fixture:fixture-password@127.0.0.1:${{ job.services.postgres.ports[5432] }}/migration_fixture
+          ATTENTION_SERVER_ENABLE: '0'
+          ERL_FLAGS: '+S 2:2'
+        run: mix test test/migration_import_session_test.exs

@@ -26,8 +26,13 @@ defmodule AttentionServer.Migration.Provenance do
   def validate(nil, _, _), do: {:error, :stopped_provenance_required}
   def validate(_, _, _), do: {:error, :invalid_stopped_provenance}
 
-  defp inactive?(%{unit: unit, active_state: "inactive", main_pid: 0}),
-    do: is_binary(unit) and byte_size(unit) > 0
+  defp inactive?(%{unit: unit, active_state: state, main_pid: 0})
+       when state in ["inactive", "failed"],
+       do: is_binary(unit) and byte_size(unit) > 0
+
+  defp inactive?(%{kind: :operator, supervisor: name, stopped_evidence: evidence, stopped: true}),
+    do:
+      is_binary(name) and byte_size(name) > 0 and is_binary(evidence) and byte_size(evidence) > 0
 
   defp inactive?(_), do: false
 

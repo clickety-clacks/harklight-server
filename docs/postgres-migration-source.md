@@ -1,7 +1,7 @@
 # FORMAT32 migration source inventory
 
 The PostgreSQL migration is under development and is not an upgrade route yet.
-FORMAT32 remains the default backend. This first slice supplies an internal,
+FORMAT32 remains the default backend. The internal migration helpers supply stopped-source capture and a
 read-only source inventory; it does not import, activate PostgreSQL, change
 configuration, or start a listener.
 
@@ -10,16 +10,16 @@ scratch_root: root)` accepts only a **copy carrying a trusted stopped-source
 export receipt**. A bare `stopped: true` acknowledgement is refused. The
 source-facing exporter must collect supervisor and process-marker observations
 before and after copying, plus size, modification time and SHA-256 of the main
-file and WAL/SHM/journal files. The supervisor must report the same inactive
+file and WAL/SHM/journal files. The supervisor must report the same inactive or failed
 unit with MainPID zero; the process marker must be absent or confirmed stale;
 the file observations must be unchanged and WAL/journal must be absent or
 empty. The consumer binds the receipt's main-file hash and size to this copy.
 Missing, incomplete, inconsistent or mismatched receipts are refused.
 
 The receipt is trusted output from the operator's export step, not an
-independent proof manufactured by this copy reader. This slice does not gather
-supervisor evidence. The source-facing export command follows separately and
-must not open, lock-probe or checkpoint the original through SQLite. The caller
+independent proof manufactured by this copy reader. `AttentionServer.Migration.Source.capture/3` gathers
+that evidence without opening, lock-probing or checkpointing the original
+through SQLite. The packaged export command uses these observations directly. The caller
 must stop all Server writers, background work and provisioning, and retain the
 original backup offline. Synthetic consumer tests use explicit producer
 fixtures; they are not evidence that a real service was inspected.
@@ -83,3 +83,114 @@ package using the source codec's OTP major. If that package is unavailable,
 obtain a supported rekey/bridge procedure against a separate copy; do not edit
 the anchor or downgrade the running binary to force admission. No cross-OTP
 migration compatibility is claimed by this inventory.
+
+## Stopped-source capture
+
+The internal `Source.capture(path, new_directory, options)` helper creates a
+mode-0700 directory with a mode-0600 byte copy and a typed provenance receipt.
+It refuses an existing destination. Use `supervisor: {:systemd, unit}` for the
+self-host install's user service. Admission requires a loaded unit whose
+ActiveState is inactive or failed and MainPID is zero, before and after copying.
+An optional `pidfile: path` must be absent or name a process confirmed absent
+through Linux procfs. The installer lock is not a Server activity marker.
+
+For a deployment managed by another supervisor, the explicit option is
+`supervisor: {:operator, supervisor_name, stopped_evidence}`. Both strings must
+be nonempty and the operator must provide the actual stop evidence; this mode
+is never the default. Keep secrets out of the evidence string. The receipt
+records these observations, not a claim that systemd was queried.
+
+When available, `fuser` or `lsof` checks that no process holds the main, WAL or
+SHM files open. An unavailable tool is recorded; an open file or failed
+observation refuses capture. Main, WAL, SHM and journal size, modification time
+and SHA-256 must remain unchanged throughout the copy. Nonempty WAL or journal
+files are refused. Stop the original Server normally so it checkpoints its own
+store; the migration helper never checkpoints it.
+
+A failed capture can leave a private incomplete directory, but never publishes
+a successful receipt. Keep it separate from the immutable original backup.
+`Source.confirm/3` repeats the observations after subsequent export work.
+A capture alone is not an importable or activated PostgreSQL store.
+
+Typed intermediate files use length-delimited deterministic terms with a
+checksum per record and a whole-file count, size and checksum. `Frames.fold/4`
+validates the complete expected stream before calling its consumer, so a
+truncated file cannot be accepted as a shorter export. These files can contain
+identity and cursor material: keep their enclosing directory private and do
+not attach them to public reports.
+
+Capture uses ordinary file reads, which may update source access times; content,
+size and modification time are verified unchanged.
+
+## Packaged export and verification (development)
+
+This command prepares a protected export. Import, relational validation and
+activation are not implemented by this command yet. It does not change the
+backend or start the Server. Do not use it as an upgrade route until the full
+migration release is accepted.
+
+Stop the Server and all provisioning/background writers first. Preserve the
+complete original backup. Create a private JSON material map naming every
+configuration and identity file needed to restore this installation. Its keys
+are relative destination paths and values are absolute source paths, for example
+`{"server.env":"/private/backup/server.env","owner/identity.pem":"/private/backup/owner/identity.pem"}`.
+The command does not discover credentials, execute configuration, or print
+material values. The deployment-specific inventory remains the operator's
+responsibility; `{}` is explicit confirmation that there are no external
+material files. A future installer wrapper will supply its required inventory.
+
+```sh
+bin/harklight-migration export --source /private/backup/relay.sqlite3 \
+  --output /private/new-export --unit harklight.service \
+  --material-map /private/material.json
+bin/harklight-migration verify /private/new-export
+```
+
+For a different supervisor, replace `--unit` with both `--supervisor NAME` and
+`--stopped-evidence TEXT`. Supply actual stopped-state evidence without secrets.
+Use `--pidfile PATH` only if the deployment already has an external Server
+pidfile. Source and output must be distinct, and output must not already exist.
+
+The export contains decoded typed records, every inventoried SQL side table,
+referenced upload/large-data/staged bytes, the explicit private material, a
+source byte copy, and a manifest. Completion is written last. Both export and
+verify compare every stream's count and decoded content digest to the source
+inventory, verify per-frame and whole-file checksums, and hash every copied
+file. Missing completion, truncation, changed bytes, unknown record families
+or table columns are refused. Treat the entire directory as secret material;
+only the command's count/digest summary is suitable for evidence.
+
+Keep the successful export immutable. A failed export has no successful final
+marker and must never be imported; retry into a fresh directory after resolving
+the refusal. Do not delete or overwrite the original backup. The later import
+will own restart checkpoints and require relational closure, target readback
+and history comparison before activation. `verify` here establishes export
+integrity, not that final activation gate.
+
+For the standard self-host state directory, inventory `server.env`, `person-id`,
+and all regular files under `tls/` and `owner/`, preserving their relative
+paths. Include external files referenced by configuration explicitly. Do not
+include the new PostgreSQL cluster or its passwords in the source material map.
+
+## Unpublished import staging
+
+`ImportSession` claims an empty, already migrated database under the schema's
+advisory lock. It binds an import ID to the export-manifest and exact DDL digests.
+An occupied database, a different import identity or a phase other than loading
+is refused. It performs no DDL and never changes the runtime backend.
+
+`ImportFacts.run/3` is the internal first staging pass. It writes each addressed
+Engine fact using the shared typed attributes codec. Batches of at most 256
+facts and their ordinal/digest checkpoint commit in the same transaction.
+After interruption, the importer checks the original bundle and its consumed
+prefix before continuing from the stored checkpoint. A stale checkpoint cannot
+write again. The source bundle stays unchanged.
+
+This pass preserves facts for later normalized projection and comparison; it
+is not a complete import or an exposed command. Side tables, normalized rows,
+upload chunks, relational closure and retained-client-history validation must
+finish before a later validation/activation slice can publish the database.
+The staging functions always leave phase `loading` and expose no activation
+operation. Their dedicated CI test uses a fresh disposable PostgreSQL service,
+kills a writer after uncommitted rows, checks rollback and resume, and compares
+every staged fact with its original typed value.

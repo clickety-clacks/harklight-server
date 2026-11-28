@@ -12,6 +12,9 @@ defmodule AttentionServer.Repository.AgentItems do
     with {:ok, key, _record} <- owned_item(engine, scope, item_id), do: {:ok, key}
   end
 
+  def owned_item(:postgres, scope, item_id),
+    do: AttentionServer.Repository.Postgres.Items.agent_item(scope, item_id)
+
   def owned_item(engine, {person, _origin} = scope, item_id) do
     with {:ok, key} <- Resources.item_key(engine, person, item_id),
          {:ok, record} <- owned_record(engine, scope, key) do
