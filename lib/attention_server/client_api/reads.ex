@@ -34,6 +34,9 @@ defmodule AttentionServer.ClientAPI.Reads do
   }
 
   alias AttentionServer.ClientAPI.{Context, Errors, PeopleProfiles, Projection, Resources, Search, SharedAttachments, SharedCapability, SharedContinuation, SharedReads}
+  alias AttentionServer.ClientAPI.Auth
+  alias AttentionServer.Repository.RecipientItems
+  alias AttentionServer.Repository.Postgres.{Identities, Settings, Transaction}
 
   # The client features still behind an operator flag at 0.2 (contract §4).
   @client_features ~w(server_matched_push_routing priority_level_editing)
@@ -136,6 +139,27 @@ defmodule AttentionServer.ClientAPI.Reads do
   end
 
   @doc false
+  def get_postgres_revision(conn, %Context{params: %{item_id: item, n: raw_revision}}) do
+    result =
+      Transaction.snapshot(fn ->
+        with {:ok, %{kind: :browser, person: person}} <- Auth.web(conn, Identities, :postgres),
+             :ok <- Settings.check_active(person),
+             {:ok, revision} <- revision_number(raw_revision) do
+          RecipientItems.revision(:postgres, person, item, revision)
+        else
+          {:ok, _native} -> {:error, :not_found}
+          {:error, :unavailable} -> {:error, :retry_later}
+          {:error, _} = error -> error
+        end
+      end)
+
+    case result do
+      {:ok, body} -> Errors.send_streamed_json(conn, 200, body, &streamed_read_headers/2)
+      error -> respond(conn, error)
+    end
+  end
+
+  @doc false
   def get_settings(conn, %Context{} = ctx),
     do: respond(conn, settings(ctx.relay, ctx.principal), &etag(&1["settings"]))
 
@@ -223,15 +247,18 @@ defmodule AttentionServer.ClientAPI.Reads do
   # Only the parameters a read takes; anything else in the query is ignored.
   defp query(conn, names), do: Map.take(conn.query_params, names)
 
+  defp streamed_read_headers(conn, digest) do
+    tag = etag_digest(digest)
+    conn = read_headers(conn, tag)
+    if not_modified?(conn, tag), do: {:not_modified, conn}, else: {:send, conn}
+  end
+
   def respond(conn, result, etag_of \\ &etag/1)
 
   def respond(conn, {:ok, body}, etag_of) do
     tag = Projection.run(Projection.response_key(body), fn -> etag_of.(body) end)
 
-    conn =
-      conn
-      |> put_resp_header("etag", tag)
-      |> put_resp_header("cache-control", "private, no-cache")
+    conn = read_headers(conn, tag)
 
     if not_modified?(conn, tag),
       do: send_resp(conn, 304, ""),
@@ -246,6 +273,12 @@ defmodule AttentionServer.ClientAPI.Reads do
 
   def respond(conn, {:error, token, field}, _etag_of),
     do: Errors.send_error(conn, to_string(token), field: field)
+
+  defp read_headers(conn, tag) do
+    conn
+    |> put_resp_header("etag", tag)
+    |> put_resp_header("cache-control", "private, no-cache")
+  end
 
   # If-None-Match uses the weak comparison (RFC 9110 §13.1.2).
   defp not_modified?(conn, tag) do
@@ -338,8 +371,10 @@ defmodule AttentionServer.ClientAPI.Reads do
   """
   def etag(body) when is_map(body) do
     digest = :crypto.hash(:sha256, JSON.encode!(body))
-    ~s("#{Base.url_encode64(digest, padding: false)}")
+    etag_digest(digest)
   end
+
+  defp etag_digest(digest), do: ~s("#{Base.url_encode64(digest, padding: false)}")
 
   @doc "The `ETag` for a file: its quoted sha256."
   def file_etag(%{sha256: sha256}), do: ~s("#{sha256}")
