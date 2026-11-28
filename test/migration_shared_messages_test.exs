@@ -14,6 +14,8 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
     @outside "a1000000-0000-4000-8000-000000000004"
     @origin AttentionServer.BrowserRecipient.key(@sender, "synthetic-retained-session", "a6000000-0000-4000-8000-000000000001")
     @upload "a5000000-0000-4000-8000-000000000001"
+    @entry_upload "a5000000-0000-4000-8000-000000000003"
+    @entry_owner AttentionServer.BrowserRecipient.key(@first, "synthetic-entry-session", "a6000000-0000-4000-8000-000000000002")
     @group "a2000000-0000-4000-8000-000000000001"
     @shared "shared_synthetic-collision"
 
@@ -165,6 +167,7 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
       expected_read = source.shared_recipients[{@shared, @second}].read_position
       assert {:ok, %{rows: [[^expected_read]]}} = ImportSession.query(db,
         "SELECT position FROM harklight.read_positions WHERE conversation_id=$1 AND person_id=$2", [@shared, @second])
+      import_entry_uploads(db, identity, bundle, source)
       alias AttentionServer.Migration.VerifySharedConversations
       assert {:ok, conversation_counts} = VerifySharedConversations.run(db, identity, bundle)
       assert conversation_counts.entries == map_size(source.shared_entries)
@@ -233,6 +236,65 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
       end
     end
 
+    defp import_entry_uploads(db, identity, bundle, source) do
+      alias AttentionServer.Migration.ImportSharedEntryUploads
+      assert {:ok, %{rows: [row]}} = ImportSession.query(db,
+        "SELECT id,person_id,owner_key,size_bytes,sha256,completed_at_ms,attributes FROM harklight.uploads WHERE id=$1", [@entry_upload])
+      assert {:ok, %{rows: chunks}} = ImportSession.query(db,
+        "SELECT chunk_number,bytes FROM harklight.upload_chunks WHERE upload_id=$1", [@entry_upload])
+      assert {:ok, _} = ImportSession.query(db, "DELETE FROM harklight.uploads WHERE id=$1", [@entry_upload])
+      assert {:error, _} = ImportSharedEntryUploads.run(db, identity, bundle)
+      assert {:ok, _} = ImportSession.query(db,
+        "INSERT INTO harklight.uploads(id,person_id,owner_key,size_bytes,sha256,completed_at_ms,attributes) VALUES($1,$2,$3,$4,$5,$6,$7)", row)
+      for [ordinal, bytes] <- chunks do
+        assert {:ok, _} = ImportSession.query(db,
+          "INSERT INTO harklight.upload_chunks(upload_id,chunk_number,bytes) VALUES($1,$2,$3)", [@entry_upload, ordinal, bytes])
+      end
+      address = Attributes.key({:row, :uploads, @entry_upload})
+      assert {:ok, %{rows: [[original_fact]]}} = ImportSession.query(db,
+        "SELECT body FROM harklight.compatibility_facts WHERE family='uploads' AND address=$1", [address])
+      assert {:ok, original_upload} = Attributes.decode(original_fact)
+      wrong_entry = Attributes.encode(Map.put(original_upload, :shared_entry_id, "another-entry"))
+      assert {:ok, _} = ImportSession.query(db,
+        "UPDATE harklight.compatibility_facts SET body=$2 WHERE family='uploads' AND address=$1", [address, wrong_entry])
+      assert {:error, :shared_entry_upload_scope_mismatch} = ImportSharedEntryUploads.run(db, identity, bundle)
+      assert {:ok, _} = ImportSession.query(db,
+        "UPDATE harklight.compatibility_facts SET body=$2 WHERE family='uploads' AND address=$1", [address, original_fact])
+      for {column, bad, good} <- [
+        {"completed_at_ms", nil, Enum.at(row, 5)},
+        {"person_id", @outside, @first},
+        {"owner_key", "unrelated-owner", @entry_owner},
+        {"attributes", %{}, Enum.at(row, 6)}
+      ] do
+        assert {:ok, _} = ImportSession.query(db,
+          "UPDATE harklight.uploads SET " <> column <> "=$2 WHERE id=$1", [@entry_upload, bad])
+        assert {:error, _} = ImportSharedEntryUploads.run(db, identity, bundle)
+        assert {:ok, %{ordinal: 0}} = ImportSession.checkpoint(db, identity, "shared/entry-uploads/v1")
+        assert {:ok, %{rows: [[0]]}} = ImportSession.query(db,
+          "SELECT count(*) FROM harklight.conversation_entry_uploads", [])
+        assert {:ok, _} = ImportSession.query(db,
+          "UPDATE harklight.uploads SET " <> column <> "=$2 WHERE id=$1", [@entry_upload, good])
+      end
+      assert {:ok, _} = ImportSession.query(db, """
+        CREATE FUNCTION harklight.fail_entry_link() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN RAISE EXCEPTION 'synthetic entry link interruption'; END $$
+        """, [])
+      assert {:ok, _} = ImportSession.query(db,
+        "CREATE TRIGGER fail_entry_link BEFORE INSERT ON harklight.conversation_entry_uploads FOR EACH ROW EXECUTE FUNCTION harklight.fail_entry_link()", [])
+      assert {:error, _} = ImportSharedEntryUploads.run(db, identity, bundle)
+      assert {:ok, %{ordinal: 0}} = ImportSession.checkpoint(db, identity, "shared/entry-uploads/v1")
+      assert {:ok, _} = ImportSession.query(db, "DROP TRIGGER fail_entry_link ON harklight.conversation_entry_uploads", [])
+      assert :ok = ImportSharedEntryUploads.run(db, identity, bundle)
+      assert :ok = ImportSharedEntryUploads.run(db, identity, bundle)
+      for {id, entry} <- source.shared_entries, {file, ordinal} <- Enum.with_index(Map.get(entry, :files, [])) do
+        upload = file["upload_id"]
+        expected = Attributes.encode(file)
+        assert {:ok, %{rows: [[^upload, ^expected]]}} = ImportSession.query(db,
+          "SELECT upload_id,attributes FROM harklight.conversation_entry_uploads WHERE conversation_id=$1 AND entry_id=$2 AND ordinal=$3", [entry.shared_id, id, ordinal])
+      end
+      assert {:ok, %{rows: [[1]]}} = ImportSession.query(db, "SELECT count(*) FROM harklight.conversation_entry_uploads", [])
+    end
+
     defp verify_link_drift(db, identity, bundle) do
       alias AttentionServer.Migration.VerifyMessageUploads
       assert {:ok, verified} = VerifyMessageUploads.run(db, identity, bundle, :shared)
@@ -290,8 +352,15 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
       File.mkdir_p!(store.upload_dir)
       File.write!(Path.join(store.upload_dir, @upload), bytes)
       files = AttentionServer.ClientAPI.SharedAttachments.references([{metadata, nil}])
+      entry_bytes = "shared retained entry attachment"
+      entry_metadata = %{metadata | id: @entry_upload, person: @first, uploader: @entry_owner,
+        name: "entry.txt", size: byte_size(entry_bytes),
+        sha256: Base.encode16(:crypto.hash(:sha256, entry_bytes), case: :lower)}
+        |> Map.put(:shared_entry_id, "shared-retained-turn")
+      File.write!(Path.join(store.upload_dir, @entry_upload), entry_bytes)
+      entry_files = AttentionServer.ClientAPI.SharedAttachments.references([{entry_metadata, nil}])
       {engine, :ok, touched} = Engine.with_touches(store.engine, fn engine ->
-        engine = Engine.put_row(engine, :uploads, @upload, metadata)
+        engine = engine |> Engine.put_row(:uploads, @upload, metadata) |> Engine.put_row(:uploads, @entry_upload, entry_metadata)
         engine = Enum.reduce(Enum.with_index([@sender, @first, @second, @outside]), engine, fn {person, n}, acc ->
           {:ok, next, _} = Engine.hosted_account_create(acc, "shared-fixture-#{n}", false, person, String.duplicate(Integer.to_string(n + 1), 64))
           next
@@ -302,7 +371,7 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
           sender_id: "app:shared-fixture", message: %{"title" => "First shared revision"},
           answer_policy: :everyone, files: files, group_id: @group, group_name: "Retained group"} |> Map.put("created_at_ms", 100)
         {:ok, engine, record, _} = SharedMessages.create(engine, attrs, [@first, @second], nil)
-        entry = %{id: "shared-retained-turn", at_ms: 101, text: "Retained discussion",
+        entry = %{id: "shared-retained-turn", at_ms: 101, text: "Retained discussion", files: entry_files,
           speaker: %{"kind" => "person", "id" => @first}}
         {:ok, engine, _} = SharedMessages.reply(engine, record, {:person, @first}, entry)
         record = engine.shared_messages[@shared]
