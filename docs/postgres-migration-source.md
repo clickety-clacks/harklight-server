@@ -1,9 +1,10 @@
 # FORMAT32 migration source inventory
 
 The PostgreSQL migration is under development and is not an upgrade route yet.
-FORMAT32 remains the default backend. The internal migration helpers supply stopped-source capture and a
-read-only source inventory; it does not import, activate PostgreSQL, change
-configuration, or start a listener.
+FORMAT32 remains the default backend. The internal commands supply stopped-source capture, source inventory, checkpointed
+import and validation. Installer readiness remains disabled pending the complete
+migration rehearsals. These commands do not activate PostgreSQL, change backend
+configuration or start a listener.
 
 `AttentionServer.Migration.Format32.preflight(path, provenance: receipt,
 scratch_root: root)` accepts only a **copy carrying a trusted stopped-source
