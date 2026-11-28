@@ -335,6 +335,154 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
       assert {:error, :cursor_expired} = Streams.person_page(person, 11, 10)
     end
 
+    @tag :tmp_dir
+    test "PostgreSQL certificate authority follows FORMAT32 migration and sender rules", %{tmp_dir: dir} do
+      alias AttentionServer.{DeviceIdentity, Relay, TLSFixtures}
+      alias AttentionServer.ClientAPI.Auth
+      alias AttentionServer.Store.{AuthSchema, RecordTable}
+      alias Exqlite.Sqlite3
+
+      certs = TLSFixtures.create!()
+      on_exit(fn -> File.rm_rf!(certs) end)
+      person = "synthetic-cert-account"
+      agent_id = "00000000-0000-4000-8000-000000000001"
+      sender_pattern = "app:synthetic"
+      path = Path.join(dir, "certificates.sqlite3")
+      opts = [store_path: path, agent_fixture_mode: true]
+      relay = start_supervised!({Relay, opts})
+      assert :ok = Relay.setup_person(relay, person)
+      assert {:ok, _} = Transaction.query("INSERT INTO harklight.people (id) VALUES ($1)", [person])
+
+      credentials =
+        for {name, kind} <- [{"a1", :device}, {"a2", :device}, {"b1", :device}, {"unknown", :agent}],
+            into: %{} do
+          der = TLSFixtures.certificate_der!(certs, name)
+          assert {:ok, key} = DeviceIdentity.from_certificate(der)
+
+          result =
+            case kind do
+              :device -> Relay.setup_device(relay, person, key)
+              :agent -> Relay.setup_agent_fixture(relay, person, agent_id, key, [sender_pattern])
+            end
+
+          assert :ok = result
+
+          assert {:ok, _} =
+                   Transaction.query(
+                     "INSERT INTO harklight.principals (key, person_id, kind, revision) VALUES ($1, $2, $3, 1)",
+                     [key, person, to_string(kind)]
+                   )
+
+          conn =
+            Plug.Test.conn(:get, "/v2/me")
+            |> Plug.Test.put_peer_data(%{address: {127, 0, 0, 1}, port: 1, ssl_cert: der})
+
+          {name, {key, conn}}
+        end
+
+      {legacy, _} = credentials["a1"]
+      {pending, _} = credentials["a2"]
+      {sender, _} = credentials["b1"]
+      {agent, _} = credentials["unknown"]
+
+      check = fn relay, mode, expected ->
+        for {name, kind} <- expected do
+          {key, conn} = Map.fetch!(credentials, name)
+          actual = Auth.device(conn, relay)
+
+          case kind do
+            :denied -> assert {:error, :unauthorized} = actual
+            kind -> assert {:ok, %{key: ^key, person: ^person, kind: ^kind}} = actual
+          end
+
+          assert Auth.device(conn, {:postgres, mode}) == actual
+        end
+      end
+
+      admitted = [{"a1", :device}, {"a2", :device}, {"b1", :device}, {"unknown", :agent}]
+      check.(relay, :self_hosted, admitted)
+      stop_supervised!(Relay)
+
+      {:ok, db} = Sqlite3.open(path)
+      assert {:ok, %{minimum_generation: generation}} = AuthSchema.initialize(db)
+      put_certificate_fact("harklight_auth_schema", 1, [1, generation, 0])
+
+      for {key, phase} <- [{legacy, "legacy"}, {pending, "pending"}] do
+        row = [key, person, phase]
+        assert :ok = RecordTable.run(db, "INSERT INTO harklight_migration_roster VALUES (?, ?, ?)", row)
+        put_certificate_fact("harklight_migration_roster", key, row)
+      end
+      put_certificate_session(db, person, pending, :binary.copy(<<41>>, 32), true)
+
+      :ok = Sqlite3.close(db)
+      relay = start_supervised!({Relay, opts})
+      check.(relay, :self_hosted, [{"b1", :denied}])
+      assert :ok = Relay.setup_sender(relay, sender, sender_pattern)
+      assert {:ok, _} =
+               Transaction.query("INSERT INTO harklight.sender_grants VALUES ($1, $2)", [
+                 sender,
+                 sender_pattern
+               ])
+      check.(relay, :self_hosted, admitted)
+      stop_supervised!(Relay)
+
+      relay = start_supervised!({Relay, Keyword.put(opts, :deployment_mode, :saas)})
+      check.(relay, :saas, [{"a1", :denied}, {"a2", :denied}, {"b1", :device}, {"unknown", :agent}])
+      stop_supervised!(Relay)
+
+      {:ok, db} = Sqlite3.open(path)
+      put_certificate_session(db, person, sender, :binary.copy(<<42>>, 32), false)
+      assert :ok = RecordTable.run(db, "UPDATE harklight_migration_roster SET phase = 'activated' WHERE device_id = ?", [pending])
+      put_certificate_fact("harklight_migration_roster", pending, [pending, person, "activated"])
+      :ok = Sqlite3.close(db)
+
+      relay = start_supervised!({Relay, opts})
+      check.(relay, :self_hosted, [{"a1", :device}, {"a2", :denied}, {"b1", :denied}, {"unknown", :agent}])
+      stop_supervised!(Relay)
+
+      {:ok, db} = Sqlite3.open(path)
+      assert :ok = RecordTable.run(db, "UPDATE harklight_auth_schema SET device_certificates_disabled = 1", [])
+      put_certificate_fact("harklight_auth_schema", 1, [1, generation, 1])
+      :ok = Sqlite3.close(db)
+
+      relay = start_supervised!({Relay, opts})
+      check.(relay, :self_hosted, [{"a1", :denied}, {"unknown", :agent}])
+      assert :ok = Relay.revoke_agent_fixture(relay, agent)
+      assert {:ok, _} =
+               Transaction.query("UPDATE harklight.principals SET revoked = true WHERE key = $1", [agent])
+      check.(relay, :self_hosted, [{"unknown", :denied}])
+    end
+
+    defp put_certificate_session(db, person, device, hash, pending?) do
+      alias AttentionServer.NativeSignIn
+      alias AttentionServer.Repository.Postgres.Attributes
+
+      assert :ok =
+               NativeSignIn.add_session(db, Base.encode16(hash, case: :lower), device, person, "fixture-proof", 10, pending?)
+      assert {:ok, _} =
+               Transaction.query(
+                 """
+                 INSERT INTO harklight.auth_sessions
+                   (token_hash, person_id, principal_key, kind, principal_revision, attributes)
+                 VALUES ($1, $2, $3, 'native', 1, $4)
+                 """,
+                 [hash, person, device, Attributes.encode(%{pending: pending?})]
+               )
+    end
+
+    defp put_certificate_fact(family, key, row) do
+      alias AttentionServer.Repository.Postgres.Attributes
+
+      assert {:ok, _} =
+               Transaction.query(
+                 """
+                 INSERT INTO harklight.compatibility_facts (family, address, body) VALUES ($1, $2, $3)
+                 ON CONFLICT (family, address) DO UPDATE SET body = excluded.body
+                 """,
+                 [family, Attributes.key(key), Attributes.encode(row)]
+               )
+    end
+
     test "unrelated streams commit independently and same-stream revisions follow commit order" do
       observer = self()
       scope = {"synthetic-one", ""}
