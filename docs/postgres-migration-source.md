@@ -194,3 +194,14 @@ The staging functions always leave phase `loading` and expose no activation
 operation. Their dedicated CI test uses a fresh disposable PostgreSQL service,
 kills a writer after uncommitted rows, checks rollback and resume, and compares
 every staged fact with its original typed value.
+
+`ImportAccounts.run/3` projects server identity and cursor epoch, people and
+profiles/settings, current and revoked recorded principals, sender grants,
+origin sessions, and the independent accepted/free-order/conversation highs.
+It preserves the full typed principal/session attributes, and keeps absent
+settings distinct from explicit values. Each projection has its own source
+prefix checkpoint and uses the same atomic batch mechanism. Missing identity,
+epoch, person references or unsupported account facts refuse the stage.
+Historical principals referenced only by later message facts are handled with
+that later projection; no principal is invented by this stage. It still leaves
+the database in `loading` and is not a complete import or activation command.

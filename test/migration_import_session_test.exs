@@ -4,7 +4,7 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
   defmodule AttentionServer.Migration.ImportSessionTest do
     use ExUnit.Case, async: false
     alias AttentionServer.{CompatibilityScenarios, JSON}
-    alias AttentionServer.Migration.{Bundle, Frames, ImportFacts, ImportSession}
+    alias AttentionServer.Migration.{Bundle, Frames, ImportAccounts, ImportFacts, ImportSession}
     alias AttentionServer.Repository.Postgres.Attributes
 
     @tag timeout: 120_000
@@ -36,6 +36,34 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         GenServer.stop(relay)
       end
 
+      # Synthetic setup: allocation high deliberately exceeds retained history.
+      source_path = Path.join(fixture.root, "relay.sqlite3")
+      {:ok, sqlite} = Exqlite.Sqlite3.open(source_path)
+
+      {:ok, rows} =
+        AttentionServer.Store.RecordTable.select(
+          sqlite,
+          "SELECT key,payload,checksum FROM relay_records"
+        )
+
+      {address, _} =
+        Enum.find_value(rows, fn [key, payload, hash] ->
+          case AttentionServer.Store.RecordCodec.decode_row({key, payload, hash}) do
+            {:ok, {:row, :persons, _} = address, value} -> {address, value}
+            _ -> nil
+          end
+        end)
+
+      {key, payload, hash} = AttentionServer.Store.RecordCodec.encode_row(address, 1_000_000)
+
+      :ok =
+        AttentionServer.Store.RecordTable.run(
+          sqlite,
+          "UPDATE relay_records SET payload=?,checksum=? WHERE key=?",
+          [{:blob, payload}, {:blob, hash}, {:blob, key}]
+        )
+
+      :ok = Exqlite.Sqlite3.close(sqlite)
       bundle = Path.join(root, "export")
 
       assert {:ok, summary} =
@@ -146,7 +174,142 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
                  []
                )
 
+      {:ok, _} = ImportSession.query(db, "DELETE FROM harklight.people WHERE id='committed'", [])
+      assert :ok = ImportAccounts.run(db, identity, bundle)
+      assert :ok = ImportAccounts.run(db, identity, bundle)
+
+      assert {:ok, :ok} =
+               Frames.fold(
+                 Path.join(bundle, "records.frames"),
+                 manifest.data.records,
+                 :ok,
+                 fn entry, :ok ->
+                   verify_account(db, entry)
+                   {:ok, :ok}
+                 end
+               )
+
+      assert {:ok, %{rows: [["loading"]]}} =
+               ImportSession.query(db, "SELECT phase FROM harklight.import_state", [])
+
       Agent.stop(fixture.clock)
+    end
+
+    defp verify_account(db, {{:row, field, person}, high})
+         when field in [:persons, :free_order_highs, :conversation_highs] do
+      kind =
+        %{persons: "accepted", free_order_highs: "free_order", conversation_highs: "conversation"}[
+          field
+        ]
+
+      assert {:ok, %{rows: [[^high]]}} =
+               ImportSession.query(
+                 db,
+                 "SELECT high FROM harklight.allocation_highs WHERE person_id=$1 AND origin_key='' AND session_handle='' AND kind=$2",
+                 [person, kind]
+               )
+    end
+
+    defp verify_account(db, {{:row, :owners, person}, value}) do
+      assert {:ok, %{rows: [[^person, "owner", revision, false, text]]}} =
+               ImportSession.query(
+                 db,
+                 "SELECT person_id,kind,revision,revoked,attributes::text FROM harklight.principals WHERE key=$1",
+                 [value.key]
+               )
+
+      assert revision == value.revision
+      assert_typed(text, value)
+    end
+
+    defp verify_account(db, {{:row, field, key}, value}) when field in [:devices, :agents] do
+      person = value.person
+      kind = if field == :devices, do: "device", else: "agent"
+
+      assert {:ok, %{rows: [[^person, ^kind, revision, revoked, text]]}} =
+               ImportSession.query(
+                 db,
+                 "SELECT person_id,kind,revision,revoked,attributes::text FROM harklight.principals WHERE key=$1",
+                 [key]
+               )
+
+      assert revision == value.enrollment_revision and revoked == value.revoked
+      assert_typed(text, value)
+    end
+
+    defp verify_account(db, {{:row, :sender_grants, {_, key}}, patterns}) do
+      assert {:ok, %{rows: rows}} =
+               ImportSession.query(
+                 db,
+                 "SELECT pattern FROM harklight.sender_grants WHERE principal_key=$1 ORDER BY pattern",
+                 [key]
+               )
+
+      assert List.flatten(rows) == Enum.sort(patterns)
+    end
+
+    defp verify_account(db, {{:row, :origin_sessions, {person, origin, handle}}, value}) do
+      assert {:ok, %{rows: [[text]]}} =
+               ImportSession.query(
+                 db,
+                 "SELECT attributes::text FROM harklight.origin_sessions WHERE person_id=$1 AND origin_key=$2 AND handle=$3",
+                 [person, origin, handle]
+               )
+
+      assert_typed(text, value)
+    end
+
+    defp verify_account(db, {{:field, :relay_instance_id}, value}) do
+      assert {:ok, %{rows: [[^value]]}} =
+               ImportSession.query(db, "SELECT instance_id FROM harklight.server_identity", [])
+    end
+
+    defp verify_account(db, {{:field, :agent_cursor_key}, value}) do
+      assert {:ok, %{rows: [[^value]]}} =
+               ImportSession.query(
+                 db,
+                 "SELECT cursor_signing_key FROM harklight.server_identity",
+                 []
+               )
+    end
+
+    defp verify_account(db, {{:row, :people_profiles, person}, value}) do
+      assert {:ok, %{rows: [[text]]}} =
+               ImportSession.query(db, "SELECT profile::text FROM harklight.people WHERE id=$1", [
+                 person
+               ])
+
+      assert_typed(text, value)
+    end
+
+    defp verify_account(db, {{:row, :delivery_states, person}, value}) do
+      assert {:ok, %{rows: [[^value]]}} =
+               ImportSession.query(
+                 db,
+                 "SELECT delivery_state FROM harklight.people WHERE id=$1",
+                 [person]
+               )
+    end
+
+    defp verify_account(db, {{:row, field, person}, value})
+         when field in [:algorithm_choices, :alert_choices, :bounce_levels] do
+      assert {:ok, %{rows: [[text]]}} =
+               ImportSession.query(
+                 db,
+                 "SELECT settings::text FROM harklight.people WHERE id=$1",
+                 [person]
+               )
+
+      assert {:ok, envelope} = JSON.decode_line(text <> "\n")
+      assert {:ok, settings} = Attributes.decode(envelope)
+      assert Map.fetch!(settings, field) == value
+    end
+
+    defp verify_account(_, _), do: :ok
+
+    defp assert_typed(text, expected) do
+      assert {:ok, envelope} = JSON.decode_line(text <> "\n")
+      assert {:ok, ^expected} = Attributes.decode(envelope)
     end
   end
 end
