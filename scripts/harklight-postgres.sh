@@ -380,6 +380,7 @@ do_preflight() {
     if ((use_service)); then
       command -v systemctl >/dev/null || fail "systemctl is required for service supervision (or pass --no-service)"
       systemctl_user show-environment >/dev/null 2>&1 || fail "the systemd user manager is unavailable; log in with a user session (or enable linger) or pass --no-service"
+      [[ ! -e "$unit_dir/$UNIT" ]] || fail "$unit_dir/$UNIT already exists; one supervised local cluster per user. Remove that install deliberately or use --no-service"
     fi
     local need have
     need="$(required_mb)"
@@ -415,13 +416,14 @@ write_migrator_env() {
 }
 
 created_pgroot=0
+unit_created=0
 work=""
 setup_cleanup() {
   local status=$?
   if ((status != 0 && created_pgroot)); then
     printf 'setup failed; removing what this run created\n' >&2
     if [[ -d "$data_dir" ]]; then
-      if ((use_service)); then
+      if ((use_service && unit_created)); then
         systemctl_user disable --now "$UNIT" >/dev/null 2>&1 || true
         rm -f -- "$unit_dir/$UNIT" "$unit_dir/$SERVER_UNIT.d/postgres.conf"
         rmdir "$unit_dir/$SERVER_UNIT.d" 2>/dev/null || true
@@ -476,6 +478,7 @@ EOF
 
   if ((use_service)); then
     mkdir -p -- "$unit_dir"
+    unit_created=1
     cat > "$unit_dir/$UNIT" <<EOF
 [Unit]
 Description=Harklight Server PostgreSQL (dedicated cluster)
