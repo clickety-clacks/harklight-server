@@ -3,6 +3,9 @@ defmodule AttentionServer.Repository.RecipientItems do
 
   alias AttentionServer.ClientAPI.Resources
 
+  def fetch(:postgres, person, item_id),
+    do: AttentionServer.Repository.Postgres.Items.recipient_item(person, item_id)
+
   def fetch(engine, person, item_id) do
     with {:ok, key} <- Resources.person_item_key(engine, person, item_id) do
       {:ok, key, Map.fetch!(engine.messages, key)}
