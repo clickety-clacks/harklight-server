@@ -483,6 +483,101 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
                )
     end
 
+    @tag :tmp_dir
+    test "instance prioritization preserves FORMAT32 settings and rolls back on audit failure", %{tmp_dir: dir} do
+      alias AttentionServer.{DeviceIdentity, Relay, TLSFixtures}
+      alias AttentionServer.Repository.Postgres.{Attributes, InstanceSettings}
+
+      certs = TLSFixtures.create!()
+      on_exit(fn -> File.rm_rf!(certs) end)
+      certificate = TLSFixtures.certificate_der!(certs, "a1")
+      assert {:ok, key} = DeviceIdentity.from_certificate(certificate)
+      opts = [store_path: Path.join(dir, "instance.sqlite3")]
+      relay = start_supervised!({Relay, opts})
+      assert {:ok, person} = Relay.operator_bootstrap(relay, certificate)
+      assert {:ok, _} =
+               Transaction.query("INSERT INTO harklight.people (id, settings) VALUES ($1, $2)", [
+                 person, Attributes.encode(%{alert_choices: "all"})
+               ])
+      assert {:ok, _} =
+               Transaction.query(
+                 "INSERT INTO harklight.principals (key, person_id, kind, revision) VALUES ($1, $2, 'owner', 1)",
+                 [key, person]
+               )
+
+      authority = %{person: person, key: key, configured_owner_person: person, deployment_mode: :self_hosted}
+      other = %{authority | configured_owner_person: "another-person"}
+      compare = fn auth, {algorithm, endpoint, model} = values, expected ->
+        assert Relay.save_dashboard_prioritization(
+                 relay, auth.person, auth.key, auth.configured_owner_person, algorithm, endpoint, model
+               ) == expected
+        assert InstanceSettings.save(auth, values, 100) == expected
+      end
+
+      compare.(other, {"unknown", nil, nil}, {:error, :unknown_algorithm})
+      compare.(other, {"baseline", nil, nil}, {:error, :forbidden})
+      compare.(%{authority | key: "wrong-owner"}, {"baseline", "", ""}, {:error, :forbidden})
+      compare.(authority, {"baseline", "http://fixture.example.test", "fixture"}, {:error, :invalid_endpoint})
+      compare.(authority, {"baseline", "", nil}, {:error, :invalid_model})
+
+      endpoint = "https://fixture.example.test/compose"
+      model = "fixture-model"
+      assert {:ok, expected} =
+               Relay.save_dashboard_prioritization(relay, person, key, person, "jev-set", " " <> endpoint, model <> " ")
+      durable = Map.take(expected, [:person_id, :algorithm_id, :endpoint, :model])
+      assert durable == %{person_id: person, algorithm_id: "jev-set", endpoint: endpoint, model: model}
+      assert {:ok, ^durable} = InstanceSettings.save(authority, {"jev-set", " " <> endpoint, model <> " "}, 100)
+      {attrs, scalars, audits} = instance_settings_snapshot(person)
+      assert attrs == %{algorithm_choices: "jev-set", alert_choices: "all"}
+      assert scalars == %{"jev_endpoint" => endpoint, "jev_model" => model}
+      assert {:ok, ^durable} = InstanceSettings.save(authority, {"jev-set", endpoint, model}, 101)
+      assert {^attrs, ^scalars, ^audits} = instance_settings_snapshot(person)
+
+      assert {:ok, _} =
+               Transaction.query(
+                 "ALTER TABLE harklight.compatibility_facts ADD CONSTRAINT fixture_audit CHECK (family <> 'runtime_audit') NOT VALID",
+                 []
+               )
+      try do
+        assert {:error, :storage_unavailable} = InstanceSettings.save(authority, {"baseline", "", ""}, 102)
+        assert {^attrs, ^scalars, ^audits} = instance_settings_snapshot(person)
+      after
+        assert {:ok, _} =
+                 Transaction.query("ALTER TABLE harklight.compatibility_facts DROP CONSTRAINT fixture_audit", [])
+      end
+
+      assert {:ok, cleared} = Relay.save_dashboard_prioritization(relay, person, key, person, "baseline", "", "")
+      assert {:ok, persisted} = InstanceSettings.save(authority, {"baseline", "", ""}, 103)
+      assert persisted == Map.take(cleared, [:person_id, :algorithm_id, :endpoint, :model])
+      assert {%{algorithm_choices: "baseline", alert_choices: "all"}, %{"jev_endpoint" => nil, "jev_model" => nil}, count} =
+               instance_settings_snapshot(person)
+      assert count == audits + 1
+      assert {:ok, %{rows: []}} =
+               Transaction.query("SELECT head FROM harklight.stream_heads WHERE person_id = $1", [person])
+
+      stop_supervised!(Relay)
+      relay = start_supervised!({Relay, Keyword.put(opts, :deployment_mode, :saas)})
+      assert {:error, :forbidden} = Relay.save_dashboard_prioritization(relay, person, key, person, "baseline", "", "")
+      assert {:error, :forbidden} = InstanceSettings.save(%{authority | deployment_mode: :saas}, {"baseline", "", ""}, 104)
+    end
+
+    defp instance_settings_snapshot(person) do
+      alias AttentionServer.Repository.Postgres.Attributes
+
+      assert {:ok, %{rows: [[encoded]]}} =
+               Transaction.query("SELECT settings FROM harklight.people WHERE id = $1", [person])
+      assert {:ok, attrs} = Attributes.decode(encoded)
+      assert {:ok, %{rows: rows}} =
+               Transaction.query("SELECT family, body FROM harklight.compatibility_facts WHERE family IN ('jev_endpoint', 'jev_model')", [])
+      facts = Map.new(rows, fn [family, body] ->
+        assert {:ok, value} = Attributes.decode(body)
+        {family, value}
+      end)
+      assert {:ok, %{rows: [[count]]}} =
+               Transaction.query("SELECT count(*) FROM harklight.compatibility_facts WHERE family = 'runtime_audit'", [])
+      {attrs, facts, count}
+    end
+
     test "unrelated streams commit independently and same-stream revisions follow commit order" do
       observer = self()
       scope = {"synthetic-one", ""}
