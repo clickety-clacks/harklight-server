@@ -245,6 +245,14 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
                  """,
                  [principal.person, key, Base.decode16!(digest, case: :lower), Attributes.encode(original_body)]
                )
+      assert {:ok, _} =
+               Transaction.query(
+                 "INSERT INTO harklight.compatibility_facts (family, address, body) VALUES ('harklight_app_receipts', $1, $2)",
+                 [
+                   Attributes.key({principal.person, key}),
+                   Attributes.encode([principal.person, key, digest, 200, accepted, 1, 1])
+                 ]
+               )
       for opts <- [sqlite, postgres] do
         assert %{status: 200, resp_body: ^accepted} = replayed =
                  cookie |> alerts_request("all", tag, key, origin) |> Router.call(opts)

@@ -5,7 +5,11 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
     use ExUnit.Case, async: false
     alias AttentionServer.{CompatibilityScenarios, JSON, Relay}
     alias AttentionServer.Migration.{Bundle, Frames, ImportFacts, ImportOrganizations, ImportSession, ImportTables, SourceTables, ImportAuth, ImportStreams, ImportReceipts}
-    alias AttentionServer.Repository.Postgres.Attributes
+    alias AttentionServer.Repository.Postgres.{Attributes, Operations, Repo, Transaction}
+    alias AttentionServer.ClientAPI.{Idempotency, Writes}
+
+    @receipt_at 1_700_000_000_000
+    @original_json ~s({ "synthetic" : true })
 
     for epoch <- [1, 17] do
       @tag timeout: 120_000, epoch: epoch
@@ -181,7 +185,8 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         receipt_digest = AttentionServer.ClientAPI.Idempotency.digest("POST", ["synthetic"], %{})
         for {table, original} <- [{"client_idempotency", nil}, {"harklight_app_receipts", 1}] do
           columns = if is_nil(original), do: "(person_id,idempotency_key,digest,status,body,at_ms)", else: "(person_id,idempotency_key,digest,status,body,at_ms,original_response)"
-          values = [session_person, "synthetic-same-key", receipt_digest, 201, JSON.encode!(%{"synthetic" => true}), 1_700_000_000_000]
+          digest = if original, do: receipt_digest, else: Idempotency.digest("POST", ["another"], %{})
+          values = [session_person, "synthetic-same-key", digest, 201, @original_json, @receipt_at]
           values = if is_nil(original), do: values, else: values ++ [original]
           placeholders = Enum.map_join(values, ",", fn _ -> "?" end)
           :ok = AttentionServer.Store.RecordTable.run(sqlite,
@@ -189,7 +194,17 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         end
         :ok = AttentionServer.Store.RecordTable.run(sqlite,
           "INSERT INTO client_idempotency VALUES (?,?,?,?,?,?)",
-          [AttentionServer.ClientAPI.Idempotency.agent_scope(agent_person, agent_key), "synthetic-agent-key", receipt_digest, 200, JSON.encode!(%{"synthetic" => "agent"}), 1_700_000_000_001])
+          [Idempotency.agent_scope(agent_person, agent_key), "synthetic-agent-key", receipt_digest, 200,
+           JSON.encode!(%{"file" => %{"synthetic" => "agent"}}), @receipt_at])
+
+        for {table, key, body, flags} <- [
+              {"client_idempotency", "synthetic-recent", %{"settings" => true}, []},
+              {"harklight_app_receipts", "synthetic-compact", %{"item_id" => "i1"}, [0]}
+            ] do
+          values = [session_person, key, receipt_digest, 200, JSON.encode!(body), @receipt_at] ++ flags
+          placeholders = Enum.map_join(values, ",", fn _ -> "?" end)
+          :ok = AttentionServer.Store.RecordTable.run(sqlite, "INSERT INTO #{table} VALUES (#{placeholders})", values)
+        end
 
         if epoch == 17 do
           :ok =
@@ -390,6 +405,9 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         assert :ok = ImportReceipts.run(db, identity, bundle)
         assert :ok = ImportReceipts.run(db, identity, bundle)
         verify_receipts(db, bundle, manifest)
+        start_supervised!({Repo, config})
+        verify_receipt_replay(session_person, {agent_person, agent_key}, receipt_digest)
+        stop_supervised!(Repo)
 
         assert {:ok, :ok} =
                  Frames.fold(
@@ -490,7 +508,7 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
       test "source stream fallback #{mode} at epoch #{epoch}", %{mode: mode, epoch: epoch} do
         alias AttentionServer.{ChangeLog, Store}
         alias AttentionServer.Store.RecordTable
-        alias AttentionServer.Repository.Postgres.{Repo, Streams}
+        alias AttentionServer.Repository.Postgres.Streams
         uri = URI.parse(System.fetch_env!("HARKLIGHT_MIGRATION_TEST_URL"))
         assert uri.host in ["localhost", "127.0.0.1"]
         [user, password] = String.split(uri.userinfo, ":", parts: 2)
@@ -562,6 +580,62 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         assert {:ok, %{rows: [["loading"]]}} = ImportSession.query(db, "SELECT phase FROM harklight.import_state", [])
         Agent.stop(fixture.clock)
       end
+    end
+
+    defp verify_receipt_replay(person, {agent_person, agent}, hex_digest) do
+      digest = Base.decode16!(hex_digest, case: :lower)
+      other = :crypto.hash(:sha256, "another operation")
+      expires = @receipt_at + Idempotency.retention_ms()
+      no_write = fn -> flunk("a live imported receipt must prevent execution") end
+      no_project = fn _ -> flunk("literal responses bypass projection") end
+      run = fn scope, hash, now, write, project ->
+        Transaction.run([], fn _ -> Operations.execute_client(scope, hash, now, write, project) end)
+      end
+
+      original = {person, "", "synthetic-same-key"}
+      assert {:ok, {201, {:encoded_json, @original_json}, true}} =
+               run.(original, digest, expires, no_write, no_project)
+      response = Writes.respond(Plug.Test.conn(:post, "/"), {:ok, 201, {:encoded_json, @original_json}, true})
+      assert response.resp_body == @original_json
+      assert Plug.Conn.get_resp_header(response, "idempotent-replayed") == ["true"]
+      assert {:error, :idempotency_conflict} = run.(original, other, expires + 1, no_write, no_project)
+
+      compact = {person, "", "synthetic-compact"}
+      assert {:ok, {200, %{"item" => "projected"}, true}} =
+               run.(compact, digest, expires, no_write, fn %{"item_id" => "i1"} ->
+                 {:ok, %{"item" => "projected"}}
+               end)
+      assert {:ok, {202, %{"code" => "accepted_reconcile"}, true}} =
+               run.(compact, digest, expires, no_write, fn _ -> {:error, :not_found} end)
+      assert {:error, :idempotency_conflict} =
+               run.(compact, digest, expires, no_write, fn _ -> {:error, :idempotency_conflict} end)
+
+      assert {:ok, {200, %{"synthetic" => "agent"}, true}} =
+               run.({agent_person, agent, "synthetic-agent-key"}, digest, expires, no_write, no_project)
+
+      recent = {person, "", "synthetic-recent"}
+      project = fn %{"settings" => true} -> {:ok, %{"settings" => "current"}} end
+      assert {:ok, {200, %{"settings" => "current"}, true}} =
+               run.(recent, digest, expires, no_write, project)
+      assert {:error, :idempotency_conflict} = run.(recent, other, expires, no_write, project)
+      assert {:error, :not_found} =
+               run.(recent, digest, expires, no_write, fn _ -> {:error, :not_found} end)
+
+      assert {:error, :rejected} =
+               run.(recent, other, expires + 1, fn ->
+                 assert {:ok, _} = Transaction.query("INSERT INTO harklight.people(id) VALUES ('rolled-back-receipt')", [])
+                 {:error, :rejected}
+               end, project)
+      assert {:ok, %{rows: []}} =
+               Transaction.query("SELECT id FROM harklight.people WHERE id = 'rolled-back-receipt'", [])
+      assert {:ok, {200, %{"settings" => "current"}, true}} =
+               run.(recent, digest, expires, no_write, project)
+
+      assert {:ok, {201, %{"settings" => "current"}, false}} =
+               run.(recent, other, expires + 1, fn -> {:ok, 201, %{"settings" => true}} end, project)
+      assert {:error, :idempotency_conflict} = run.(recent, digest, expires + 1, no_write, project)
+      assert {:ok, {201, %{"settings" => "current"}, true}} =
+               run.(recent, other, expires + 1, no_write, project)
     end
 
     defp verify_receipts(db, bundle, manifest) do
