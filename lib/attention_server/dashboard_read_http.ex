@@ -823,12 +823,7 @@ defmodule AttentionServer.DashboardReadHTTP do
   defp prioritization_error(:storage_unavailable), do: "The server could not save these settings."
   defp prioritization_error(_), do: "The server could not update prioritization settings."
 
-  defp hosted_app_install(nil) do
-    "Harklight for iPhone is in testing and is not yet open to everyone. " <>
-      "Request an invite at [app.harklight.net/account/signup/](https://app.harklight.net/account/signup/); " <>
-      "testers receive an invitation through Apple's TestFlight app. " <>
-      "If you don't have TestFlight yet, install it from the App Store first."
-  end
+  defp hosted_app_install(nil), do: ""
 
   defp hosted_app_install(url) do
     "Harklight for iPhone is available through Apple's TestFlight app. " <>

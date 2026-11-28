@@ -40,7 +40,12 @@ defmodule AttentionServer.SkillsBuildTest do
 
       harklight = File.read!(Path.join(output, "harklight/SKILL.md"))
       server_version = Application.spec(:attention_server, :vsn)
-      assert String.starts_with?(harklight, "---\nname: harklight\nversion: \"#{server_version}\"\n")
+
+      assert String.starts_with?(
+               harklight,
+               "---\nname: harklight\nversion: \"#{server_version}\"\n"
+             )
+
       assert harklight =~ "description:"
       assert String.ends_with?(harklight, core)
       assert length(:binary.matches(harklight, core)) == 1
@@ -65,21 +70,15 @@ defmodule AttentionServer.SkillsBuildTest do
           query: "source=guide&platform=iphone"
         })
 
-      closed =
-        "Harklight for iPhone is in testing and is not yet open to everyone. " <>
-          "Request an invite at [app.harklight.net/account/signup/](https://app.harklight.net/account/signup/); " <>
-          "testers receive an invitation through Apple's TestFlight app. " <>
-          "If you don't have TestFlight yet, install it from the App Store first."
-
       open =
         "Harklight for iPhone is available through Apple's TestFlight app. " <>
           "On your iPhone, open the [Harklight TestFlight invitation](<#{url}>) and follow TestFlight's prompts to install Harklight. " <>
           "If you don't have TestFlight yet, install it from the App Store first."
 
       for {testflight_settings, paragraph} <- [
-            {[], closed},
+            {[], ""},
             {[hosted_testflight_url: url], open},
-            {[hosted_testflight_url: "https://example.com/join/test-invitation"], closed}
+            {[hosted_testflight_url: "https://example.com/join/test-invitation"], ""}
           ] do
         served_guide =
           assert_skill(
@@ -89,6 +88,18 @@ defmodule AttentionServer.SkillsBuildTest do
           )
 
         refute served_guide =~ "public beta"
+
+        if paragraph == "" do
+          direction =
+            "Use Web for this guide. The compatible iPhone app is not yet available to customers."
+
+          assert length(:binary.matches(served_guide, direction)) == 1
+          refute served_guide =~ "@HOSTED_APP_INSTALL@"
+          refute served_guide =~ "/account/signup/"
+          refute served_guide =~ "Request an invite"
+          refute served_guide =~ "TestFlight"
+          refute served_guide =~ "App Store"
+        end
       end
     end
   end
