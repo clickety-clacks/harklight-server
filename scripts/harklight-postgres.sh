@@ -691,11 +691,28 @@ EOF
   exit 2
 }
 
+# Exit 75 from the importer means a concurrent-write retry: nothing is lost and
+# nothing advances. Keep every artifact, keep the Server stopped, do not apply
+# grants or install material, and let the operator retry the same command.
+migrate_retryable() {
+  local step=$1 work_dir=$2
+  cat >&2 <<EOF
+harklight-postgres: migration step "$step" asked to be retried (validation_retry_required).
+The destination, receipt, bundle and staged material were left exactly as they are. Nothing was
+activated, no grants were applied, no material was installed and no backend setting was changed.
+Keep the old Server stopped, then retry the same migration: harklight-postgres migrate --resume $work_dir
+EOF
+  exit 75
+}
+
 # Run one importer step. Exit 0 and a JSON object on stdout are required.
 migration_step() {
   local step=$1; shift
   local out
-  if ! out="$("$migration_bin" "$@" 2> "$work_dir/$step.err")"; then migrate_failed "$step" "$work_dir"; fi
+  local rc=0
+  out="$("$migration_bin" "$@" 2> "$work_dir/$step.err")" || rc=$?
+  if ((rc == 75)); then migrate_retryable "$step" "$work_dir"; fi   # the importer's retry contract
+  if ((rc != 0)); then migrate_failed "$step" "$work_dir"; fi
   case "$step" in
     export|verify)   # their existing output shape is preserved by the contract
       [[ "$(json_field "$out" result 2>/dev/null || true)" == verified_export ]] || migrate_failed "$step (unexpected output)" "$work_dir" ;;

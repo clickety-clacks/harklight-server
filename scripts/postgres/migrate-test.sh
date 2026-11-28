@@ -101,6 +101,17 @@ wd="$(workdirs | head -n 1)"; wd="${wd%/}"
 tar -tf "$wd/backup/private-root.tar" | grep -q 'relay.sqlite3' || bad "backup lacks the store"
 ok "failed validation leaves the destination loading, server.env unchanged, backup intact"
 
+# The importer's retry exit (75) preserves everything and never advances to grants or material.
+export FAKE_RETRY_AT=validate; unset FAKE_FAIL_AT
+set +e; "$tool" migrate "${args[@]}" --migration-bin "$fake" --resume "$wd" 2>"$scratch/retry.err"; rc=$?; set -e
+[[ "$rc" == 75 ]] || bad "exit 75 from the importer was not preserved (got $rc)"
+grep -q 'validation_retry_required' "$scratch/retry.err" && grep -q 'migrate --resume' "$scratch/retry.err" || bad "retry guidance missing"
+[[ ! -e "$wd/done.validate" && "$(m -c 'select phase from harklight.import_state')" == loading ]] || bad "retry advanced the migration"
+[[ "$(m -c "select has_schema_privilege('harklight', 'harklight', 'USAGE')")" == f ]] || bad "grants were applied on a retry"
+[[ -d "$wd/bundle" && -f "$wd/receipt.json" && -f "$wd/backup/private-root.tar" && "$(envsha)" == "$before_env" ]] || bad "artifacts were not preserved on a retry"
+unset FAKE_RETRY_AT
+ok "importer exit 75 is preserved: nothing advances, nothing is lost, same-command retry guidance"
+
 # A changed source, or one held open by a writer, is refused on resume before any importer call.
 cp "$state/relay.sqlite3" "$scratch/sqlite.keep"; echo more >> "$state/relay.sqlite3"
 : > "$FAKE_DIR/calls.log"
