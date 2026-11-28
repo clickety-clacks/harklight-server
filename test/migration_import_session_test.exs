@@ -228,11 +228,11 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
 
         {:ok, manifest, _} = Bundle.verify(bundle)
 
-        identity = %{
-          id: "synthetic-import",
-          source: Base.decode16!(summary.sha256, case: :lower),
-          schema: AttentionServer.Repository.Postgres.Schema.digest()
-        }
+        receipt = Path.join(root, "import-receipt.json")
+        assert {:ok, identity} = AttentionServer.Migration.ImportReceipt.open(receipt, bundle)
+        assert identity.source == Base.decode16!(summary.sha256, case: :lower)
+        assert {:ok, %{"phase" => "unclaimed", "checkpoint_rows" => 0}} =
+          AttentionServer.Migration.ImportStatus.read(db, identity)
 
         # Refuse an already populated target rather than claiming it.
         {:ok, _} =
@@ -286,6 +286,26 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
                  end)
 
         assert one.ordinal == 1
+        assert {:ok, status} = AttentionServer.Migration.ImportStatus.read(db, identity)
+        assert status["phase"] == "loading"
+        assert status["checkpoint_families"] == 1 and status["checkpoint_rows"] == 1
+        assert status["validation_sha256"] == nil
+        assert {:error, :import_identity_mismatch} =
+          AttentionServer.Migration.ImportStatus.read(db, %{identity | schema: :crypto.hash(:sha256, "wrong schema")})
+        password_file = Path.join(root, "synthetic-db-password")
+        File.write!(password_file, config[:password])
+        File.chmod!(password_file, 0o600)
+        env = %{"HARKLIGHT_MIGRATOR_URL" => "postgres://#{config[:username]}@127.0.0.1:#{config[:port]}/#{config[:database]}",
+          "HARKLIGHT_MIGRATOR_PASSWORD_FILE" => password_file}
+        previous = Map.new(Map.keys(env), &{&1, System.get_env(&1)})
+        try do
+          System.put_env(env)
+          assert {:ok, ^status} = AttentionServer.Migration.CLI.run(["status", "--receipt", receipt])
+        after
+          Enum.each(previous, fn {key, value} ->
+            if is_nil(value), do: System.delete_env(key), else: System.put_env(key, value)
+          end)
+        end
 
         assert {:error, :checkpoint_changed} =
                  ImportSession.batch(db, identity, "interruption", zero, [:stale], fn _, _ ->
