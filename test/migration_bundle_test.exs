@@ -91,6 +91,18 @@ defmodule AttentionServer.Migration.BundleTest do
 
     assert {:ok, ^manifest, ^summary} = Bundle.verify(destination)
     assert manifest.version == 2 and marker["version"] == 2
+    for suffix <- ["-wal", "-journal"] do
+      sidecar = Path.join(destination, "source.sqlite3" <> suffix)
+      File.write!(sidecar, "synthetic pending source write")
+      assert {:error, :bundle_source_pending_writes} = Bundle.verify(destination)
+      assert File.read!(sidecar) == "synthetic pending source write"
+      File.write!(sidecar, "")
+      assert {:ok, ^manifest, ^summary} = Bundle.verify(destination)
+      assert File.read!(sidecar) == ""
+      File.rm!(sidecar)
+      assert {:ok, ^manifest, ^summary} = Bundle.verify(destination)
+    end
+
     assert {:error, :legacy_bundle_requires_reexport} = AttentionServer.Migration.BundleValidation.validate(destination,
       manifest |> Map.put(:version, 1) |> Map.delete(:material_provenance))
     marker_path = Path.join(destination, "COMPLETE.json")
