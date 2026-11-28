@@ -142,6 +142,14 @@ fact. No record contains a whole Engine or unbounded feed.
   into `token_hash` with kind `browser`, the owner key and its pinned revision.
   FORMAT32 browser sessions have no server expiry, so import a null expiry.
   Pending challenges do not need an invented principal.
+- For native sessions, decode the FORMAT32 lowercase hexadecimal
+  `session_hash` into its 32 digest bytes and store it as `token_hash`.
+  Use kind `native`, the current device principal, a null server expiry,
+  and typed session attributes with a boolean `:pending`. Preserve the exact
+  source row separately. Session resolution follows the active device and
+  returns the original hexadecimal identity. Replace a device's prior native
+  session in the same transaction as the new credential. Certificate
+  eligibility still depends on the migration roster, auth schema and grants.
 - Stream `client_staged_files` into upload manifests and chunks, preserving
   associated `client_staged_file_owners` and `client_discarded_files` facts.
 - Keep the exact typed records from `relay_inbox_snapshots`,
