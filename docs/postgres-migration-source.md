@@ -634,3 +634,10 @@ devices retain revision zero; revoked devices without source subscriptions gain
 no head. Exact addresses include person, device, revision and sender. Missing,
 changed, extra, stale-revision or wrong-scope facts refuse validation. This is a
 read-only comparison and does not alter credentials or sender grants.
+
+`Migration.VerifyFileFacts.run/3` compares ordinary revision and assembled Item
+FileRefs, including explicit empty lists and inherited historical file order,
+using the shared FORMAT32 selectors. Raw upload metadata is checked against the
+source before it is used for projection. Exact keys and family counts reject
+missing, changed or extra reader facts. Upload byte and relational link closure
+remain separate required checks; this comparison does not publish an import.

@@ -654,6 +654,7 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         assert {:ok, ^ordinary_links} = AttentionServer.Migration.VerifyMessageUploads.run(db, identity, bundle, :ordinary)
         verify_revision_files(db, identity, bundle, manifest)
         verify_item_facts(db, identity, bundle, manifest)
+        verify_file_fact_drift(db, identity, bundle)
         verify_message_drift(db, identity, bundle)
         verify_recipient_drift(db, identity, bundle)
         verify_authority_drift(db, identity, bundle)
@@ -1918,6 +1919,42 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
       assert {:error, {:recipient_state_mismatch, :answer, _}} = VerifyRecipientState.run(db, identity, bundle)
       assert {:ok, _} = ImportSession.query(db, "UPDATE harklight.answers SET body=$2 WHERE id=$1", [answer, body])
       assert {:ok, ^result} = VerifyRecipientState.run(db, identity, bundle)
+    end
+
+    defp verify_file_fact_drift(db, identity, bundle) do
+      verifier = AttentionServer.Migration.VerifyFileFacts
+      assert {:ok, counts} = verifier.run(db, identity, bundle)
+      assert counts.items > 0 and counts.revisions > counts.items
+      for family <- ~w(ordinary_item_files ordinary_revision_files) do
+        for change <- [:body, :missing] do
+          assert {:error, :synthetic_drift} = Postgrex.transaction(db, fn tx ->
+            sql = if change == :body,
+              do: "UPDATE harklight.compatibility_facts SET body='{}'::jsonb WHERE family=$1",
+              else: "DELETE FROM harklight.compatibility_facts WHERE family=$1"
+            assert {:ok, %{num_rows: n}} = ImportSession.query(tx, sql, [family])
+            assert n > 0
+            assert {:error, {:file_fact_mismatch, ^family, _}} = verifier.run(tx, identity, bundle)
+            Postgrex.rollback(tx, :synthetic_drift)
+          end)
+          assert {:ok, ^counts} = verifier.run(db, identity, bundle)
+        end
+        assert {:error, :synthetic_drift} = Postgrex.transaction(db, fn tx ->
+          assert {:ok, %{num_rows: 1}} = ImportSession.query(tx,
+            "INSERT INTO harklight.compatibility_facts(family,address,body) VALUES($1,$2,$3::text::jsonb)",
+            [family, Attributes.key({"synthetic-other-person", "i999999", 1}), JSON.encode!(Attributes.encode([]))])
+          assert {:error, {:file_fact_count_mismatch, ^family}} = verifier.run(tx, identity, bundle)
+          Postgrex.rollback(tx, :synthetic_drift)
+        end)
+        assert {:ok, ^counts} = verifier.run(db, identity, bundle)
+      end
+      assert {:error, :synthetic_drift} = Postgrex.transaction(db, fn tx ->
+        assert {:ok, %{num_rows: n}} = ImportSession.query(tx,
+          "UPDATE harklight.compatibility_facts SET body='{}'::jsonb WHERE family='uploads'", [])
+        assert n > 0
+        assert {:error, {:file_fact_mismatch, "uploads", _}} = verifier.run(tx, identity, bundle)
+        Postgrex.rollback(tx, :synthetic_drift)
+      end)
+      assert {:ok, ^counts} = verifier.run(db, identity, bundle)
     end
 
     defp verify_item_facts(db, identity, bundle, manifest) do
