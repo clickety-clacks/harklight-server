@@ -4,7 +4,7 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
   defmodule AttentionServer.Migration.ImportSessionTest do
     use ExUnit.Case, async: false
     alias AttentionServer.{CompatibilityScenarios, JSON, Relay}
-    alias AttentionServer.Migration.{Bundle, Frames, ImportFacts, ImportOrganizations, ImportSession, ImportTables, SourceTables, ImportAuth}
+    alias AttentionServer.Migration.{Bundle, Frames, ImportFacts, ImportOrganizations, ImportSession, ImportTables, SourceTables, ImportAuth, ImportStreams}
     alias AttentionServer.Repository.Postgres.Attributes
 
     for epoch <- [1, 17] do
@@ -155,6 +155,28 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
               [{:blob, key}, {:blob, payload}, {:blob, hash}]
             )
         end
+
+        # A removed resource may have no surviving item, but its cursor event
+        # and canonical revision must survive. Independent highs may exceed it.
+        stream_person = session_person
+        {:ok, [[head]]} = AttentionServer.Store.RecordTable.select(sqlite,
+          "SELECT head FROM client_change_log_meta WHERE person_id=?", [stream_person])
+        removed_id = AttentionServer.ChangeLog.item_resource({stream_person, "app:synthetic", "removed-migration"})
+        :ok = AttentionServer.Store.RecordTable.run(sqlite,
+          "UPDATE client_change_log_meta SET head=? WHERE person_id=?", [head + 20, stream_person])
+        :ok = AttentionServer.Store.RecordTable.run(sqlite,
+          "INSERT INTO client_changes VALUES (?,?,?,?,?)", [stream_person, head + 1, "item_removed", removed_id, 1_700_000_000_000])
+        :ok = AttentionServer.Store.RecordTable.run(sqlite,
+          "INSERT INTO client_resource_revs VALUES (?,?,?)", [stream_person, removed_id, head + 1])
+        {:ok, scopes} = AttentionServer.Store.RecordTable.select(sqlite,
+          "SELECT person_id,agent_key,head FROM agent_change_log_meta LIMIT 1")
+        [[agent_person, agent_key, agent_head]] = scopes
+        :ok = AttentionServer.Store.RecordTable.run(sqlite,
+          "UPDATE agent_change_log_meta SET head=? WHERE person_id=? AND agent_key=?", [agent_head + 20, agent_person, agent_key])
+        :ok = AttentionServer.Store.RecordTable.run(sqlite,
+          "INSERT INTO agent_changes VALUES (?,?,?,?,?,NULL)", [agent_person, agent_key, "advisory:synthetic-expired", agent_head + 1, "synthetic-session"])
+        :ok = AttentionServer.Store.RecordTable.run(sqlite,
+          "INSERT INTO agent_item_advisory_changes VALUES (?,?,?,?,?,?)", [agent_person, agent_key, "item-advisory:synthetic-current:" <> removed_id, agent_head + 2, "synthetic-session", 1_700_000_000_001])
 
         if epoch == 17 do
           :ok =
@@ -349,6 +371,9 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         assert :ok = ImportAuth.run(db, identity, bundle)
         assert :ok = ImportAuth.run(db, identity, bundle)
         verify_auth(db, bundle, manifest)
+        assert :ok = ImportStreams.run(db, identity, bundle)
+        assert :ok = ImportStreams.run(db, identity, bundle)
+        verify_streams(db, bundle, manifest)
 
         assert {:ok, :ok} =
                  Frames.fold(
@@ -442,6 +467,78 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         "SELECT attributes::text FROM harklight.organizations WHERE id=$1", [expected.instance])
       assert_typed(text, nil)
       Agent.stop(fixture.clock)
+    end
+
+    defp verify_streams(db, bundle, manifest) do
+      for table <- ~w(client_change_log_meta agent_change_log_meta client_resource_revs client_resource_created client_changes agent_changes agent_item_advisory_changes) do
+        source = Map.fetch!(manifest.data.tables, table)
+        assert {:ok, :ok} = Frames.fold(Path.join(bundle, source.file), source.summary, :ok,
+          fn row, :ok ->
+            verify_stream_row(db, table, row)
+            {:ok, :ok}
+          end)
+      end
+      count_rows = fn table -> Map.fetch!(manifest.data.tables, table).summary.count end
+      expected_heads = count_rows.("client_change_log_meta") + count_rows.("agent_change_log_meta")
+      expected_revisions = count_rows.("client_resource_revs") + count_rows.("agent_changes") + count_rows.("agent_item_advisory_changes")
+      expected_changes = Enum.reduce(~w(agent_changes agent_item_advisory_changes), count_rows.("client_changes"), fn table, count ->
+        source = Map.fetch!(manifest.data.tables, table)
+        {:ok, total} = Frames.fold(Path.join(bundle, source.file), source.summary, count,
+          fn [_, _, _, _, _, at], acc -> {:ok, acc + if(is_nil(at), do: 0, else: 1)} end)
+        total
+      end)
+      for {table, expected} <- [{"stream_heads", expected_heads}, {"stream_resource_revisions", expected_revisions}, {"stream_changes", expected_changes}] do
+        assert {:ok, %{rows: [[^expected]]}} = ImportSession.query(db, "SELECT count(*) FROM harklight." <> table, [])
+      end
+      assert {:ok, %{rows: [[count]]}} = ImportSession.query(db,
+        "SELECT count(*) FROM harklight.stream_changes WHERE resource_kind='item_removed'", [])
+      assert count > 0
+      assert {:ok, %{rows: [[0]]}} = ImportSession.query(db,
+        "SELECT count(*) FROM harklight.stream_changes WHERE resource_id='advisory:synthetic-expired'", [])
+      assert {:ok, %{rows: [[1]]}} = ImportSession.query(db,
+        "SELECT count(*) FROM harklight.stream_resource_revisions WHERE resource_id='advisory:synthetic-expired' AND resource_kind='advisory'", [])
+      assert {:ok, %{rows: [[markers]]}} = ImportSession.query(db,
+        "SELECT count(*) FROM harklight.stream_resource_revisions WHERE resource_kind='availability_writer'", [])
+      assert markers > 0
+    end
+
+    defp verify_stream_row(db, "client_change_log_meta", [person, head, floor, seed]),
+      do: assert_stream_head(db, person, "", head, floor, seed)
+    defp verify_stream_row(db, "agent_change_log_meta", [person, agent, head, floor, seed]),
+      do: assert_stream_head(db, person, agent, head, floor, seed)
+    defp verify_stream_row(db, "client_resource_revs", [person, id, rev]) do
+      {:ok, kind} = ImportStreams.person_kind(id)
+      assert_stream_revision(db, person, "", kind, id, rev)
+    end
+    defp verify_stream_row(db, "client_resource_created", [person, id, at]) do
+      {:ok, kind} = ImportStreams.person_kind(id)
+      assert {:ok, %{rows: [[^at]]}} = ImportSession.query(db,
+        "SELECT first_seen_at_ms FROM harklight.stream_resource_revisions WHERE person_id=$1 AND origin_key='' AND resource_kind=$2 AND resource_id=$3", [person, kind, id])
+    end
+    defp verify_stream_row(db, "client_changes", [person, rev, kind, id, at]),
+      do: assert_stream_change(db, person, "", kind, id, rev, nil, at)
+    defp verify_stream_row(db, table, [person, agent, id, rev, session, at])
+         when table in ~w(agent_changes agent_item_advisory_changes) do
+      {:ok, kind} = ImportStreams.agent_kind(id)
+      assert_stream_revision(db, person, agent, kind, id, rev)
+      if is_nil(at) do
+        assert {:ok, %{rows: [[0]]}} = ImportSession.query(db,
+          "SELECT count(*) FROM harklight.stream_changes WHERE person_id=$1 AND origin_key=$2 AND revision=$3", [person, agent, rev])
+      else
+        assert_stream_change(db, person, agent, kind, id, rev, session, at)
+      end
+    end
+    defp assert_stream_head(db, person, origin, head, floor, seed) do
+      assert {:ok, %{rows: [[^head, ^floor, ^seed]]}} = ImportSession.query(db,
+        "SELECT head,floor,seed_revision FROM harklight.stream_heads WHERE person_id=$1 AND origin_key=$2", [person, origin])
+    end
+    defp assert_stream_revision(db, person, origin, kind, id, rev) do
+      assert {:ok, %{rows: [[^rev]]}} = ImportSession.query(db,
+        "SELECT revision FROM harklight.stream_resource_revisions WHERE person_id=$1 AND origin_key=$2 AND resource_kind=$3 AND resource_id=$4", [person, origin, kind, id])
+    end
+    defp assert_stream_change(db, person, origin, kind, id, rev, session, at) do
+      assert {:ok, %{rows: [[^kind, ^id, ^session, ^at]]}} = ImportSession.query(db,
+        "SELECT resource_kind,resource_id,session_handle,created_at_ms FROM harklight.stream_changes WHERE person_id=$1 AND origin_key=$2 AND revision=$3", [person, origin, rev])
     end
 
     defp verify_auth(db, bundle, manifest) do

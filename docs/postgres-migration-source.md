@@ -256,3 +256,14 @@ or at a different revision; the runtime's existing predicates decide whether
 they authenticate. Sessions referring to a principal that no longer exists
 remain only in the exact SQL facts. Import does not invent a principal or grant
 authority. Both session stages have checkpoints and leave the database loading.
+
+`ImportStreams.run/3` copies explicit person/Agent heads, floors and seed
+revisions without allocating positions. Full resource IDs and feed revisions
+are preserved. Person feed kinds stay exactly as stored; revision-index kinds
+are canonical by resource identity, so an `item_removed` feed row has an `item`
+revision-index row. Availability-writer markers remain revision-only. Agent
+resource kinds follow the existing decoder, and both Agent SQL tables preserve
+their positions. Agent rows with null timestamps enter only the revision index.
+Original person resource creation timestamps are copied to that index. Unknown
+kinds, missing stream heads and revisions beyond a recorded head refuse the
+stage. Checkpointed batches remain in the unpublished loading phase.
