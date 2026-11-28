@@ -374,6 +374,126 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
     end
 
     @tag :tmp_dir
+    test "ordinary PostgreSQL revision preserves historical body, file refs, head and ETag", %{tmp_dir: dir} do
+      alias AttentionServer.{JSON, LargeData, Relay}
+      alias AttentionServer.ClientAPI.{Context, Reads, Resources, Router}
+      alias AttentionServer.Repository.RecipientItems
+      alias AttentionServer.Repository.Postgres.LargeText
+
+      {relay, _browser, backend, cookie, principal} = browser_fixture(dir)
+      %{person: person, key: owner} = principal
+      origin = "synthetic-revision-origin"
+      assert :ok = Relay.setup_device(relay, person, origin)
+      assert :ok = Relay.setup_sender(relay, origin, "app:fixture")
+
+      long = :binary.copy("x", 2 * 1024 * 1024 + 1) <> " 💡"
+      message = %{"sender_id" => "app:fixture", "message_id" => "history", "created_at" => 1, "title" => "First", "body" => long}
+      first = %{
+        "type" => "forward",
+        "op_id" => "00000000-0000-4000-8000-000000000091",
+        "session_handle" => "10000000-0000-4000-8000-000000000091",
+        "message" => message,
+        "files" => [%{"name" => "history.bin", "data_base64" => Base.encode64(<<0, 255>>)}]
+      }
+      later = %{
+        "type" => "conversation_revise",
+        "op_id" => "00000000-0000-4000-8000-000000000092",
+        "sender_id" => "app:fixture",
+        "message_id" => "history",
+        "base_revision" => 1,
+        "message" => %{message | "title" => "Second", "body" => "Current"}
+      }
+
+      for frame <- [first, later] do
+        assert {:ok, reply} = Relay.request_line(relay, origin, JSON.encode!(Map.put(frame, "v", 1)) <> "\n")
+        assert {:ok, %{"type" => "ok"}} = JSON.decode_line(reply)
+      end
+
+      path = "/v2/items/i1/revisions/1"
+      opts = Router.init(relay: relay, auth: {:browser, backend, nil})
+      request = browser_request(:get, path, cookie)
+      assert %{status: 200, resp_body: expected} = original = Router.call(request, opts)
+      assert [etag] = Plug.Conn.get_resp_header(original, "etag")
+      assert {:ok, %{"rev" => head, "revision" => %{"files" => files}}} = JSON.decode_line(expected <> "\n")
+      assert [%{"file_id" => "fi1.1.0", "name" => "history.bin", "size" => 2}] = files
+
+      engine = :sys.get_state(relay).store.engine
+      key = {person, "app:fixture", "history"}
+      record = Map.fetch!(engine.messages, key)
+      assert record.revision == 2
+      assert %LargeData.Ref{} = ref = record.revisions[1]["body"]
+      assert Resources.revision_file_refs(1, 1, record.files_by_revision[1], engine.uploads) == files
+      assert {:ok, pg_ref} = LargeText.reference(ref.sha256, ref.size)
+      assert :ok = LargeText.stage(pg_ref)
+      for {bytes, ordinal} <- ref.path |> File.stream!([], LargeText.chunk_bytes()) |> Enum.with_index() do
+        assert :ok = LargeText.put_chunk(pg_ref, ordinal, bytes)
+      end
+      assert :ok = LargeText.complete(pg_ref)
+
+      assert {:ok, _} =
+               Transaction.query(
+                 "INSERT INTO harklight.principals (key, person_id, kind, revision) VALUES ($1, $2, 'device', 1)",
+                 [origin, person]
+               )
+      assert {:ok, _} =
+               Transaction.query(
+                 """
+                 INSERT INTO harklight.messages
+                   (id, person_id, origin_key, sender_id, message_id, revision, accepted_at_ms, accepted_position)
+                 VALUES ('revision-item', $1, $2, 'app:fixture', 'history', 2, 1, 1)
+                 """,
+                 [person, origin]
+               )
+
+      for {revision, body} <- [{1, %{record.revisions[1] | "body" => pg_ref}}, {2, record.revisions[2]}] do
+        assert {:ok, _} =
+                 Transaction.query(
+                   "INSERT INTO harklight.message_revisions VALUES ('revision-item', $1, 1, $2)",
+                   [revision, Attributes.encode(body)]
+                 )
+      end
+
+      assert {:ok, _} =
+               Transaction.query(
+                 "INSERT INTO harklight.message_recipients (message_id, person_id, item_id, attributes) VALUES ('revision-item', $1, 'i1', $2)",
+                 [person, Attributes.encode(%{visible: true})]
+               )
+      assert {:ok, _} =
+               Transaction.query("INSERT INTO harklight.stream_heads (person_id, origin_key, head) VALUES ($1, '', $2)", [person, head])
+
+      read = fn conn, n ->
+        Reads.get_postgres_revision(conn, %Context{
+          principal: nil, relay: nil, request_id: nil, params: %{item_id: "i1", n: n}
+        })
+      end
+
+      assert %{status: 503} = read.(request, "1")
+      address = Attributes.key({person, "i1", 1})
+      assert {:ok, _} =
+               Transaction.query("INSERT INTO harklight.compatibility_facts VALUES ('ordinary_revision_files', $1, $2)", [
+                 address, Attributes.encode(files)
+               ])
+
+      assert %{status: 200, resp_body: actual} = response = read.(request, "1")
+      assert :crypto.hash(:sha256, actual) == :crypto.hash(:sha256, expected)
+      assert [^etag] = Plug.Conn.get_resp_header(response, "etag")
+      assert ["private, no-cache"] = Plug.Conn.get_resp_header(response, "cache-control")
+      conditional = Plug.Conn.put_req_header(request, "if-none-match", "W/" <> etag)
+      assert %{status: 304, resp_body: ""} = read.(conditional, "1")
+      for n <- ["x", "0", "3", "9223372036854775808"], do: assert(%{status: 404} = read.(request, n))
+      assert {:error, :not_found} = RecipientItems.revision(:postgres, "other-person", "i1", 1)
+      assert %{status: 503} = read.(request, "2")
+
+      assert {:ok, _} =
+               Transaction.query("UPDATE harklight.message_recipients SET attributes = $2 WHERE person_id = $1", [
+                 person, Attributes.encode(%{visible: false})
+               ])
+      assert %{status: 404} = read.(conditional, "1")
+      assert {:ok, _} = Transaction.query("UPDATE harklight.principals SET revoked = true WHERE key = $1", [owner])
+      assert %{status: 401} = read.(conditional, "1")
+    end
+
+    @tag :tmp_dir
     test "a FORMAT32 browser cookie keeps its principal after projection to PostgreSQL", %{tmp_dir: dir} do
       alias AttentionServer.DashboardBrowserSession
       alias AttentionServer.ClientAPI.{Auth, Router}

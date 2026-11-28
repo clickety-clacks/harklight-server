@@ -127,7 +127,8 @@ defmodule AttentionServer.ClientAPI.Errors do
   # Called with an authorized projection after its read transaction returns.
   # Verify the complete JSON before sending headers so a missing or damaged
   # chunk follows the normal projection error path.
-  def send_streamed_json(conn, status, body) when is_map(body) do
+  def send_streamed_json(conn, status, body, prepare \\ fn conn, _digest -> {:send, conn} end)
+      when is_map(body) do
     key = Projection.response_key(body)
     suffix = Base.url_encode64(:crypto.strong_rand_bytes(16), padding: false)
     directory = Path.join(System.tmp_dir!(), "harklight-json-response-" <> suffix)
@@ -135,17 +136,29 @@ defmodule AttentionServer.ClientAPI.Errors do
     Projection.run(key, fn -> File.mkdir!(directory) end)
 
     try do
-      Projection.run(key, fn ->
+      digest = Projection.run(key, fn ->
         File.chmod!(directory, 0o700)
 
         File.open!(path, [:write, :binary, :exclusive], fn file ->
-          Enum.each(JSON.encode_stream(body), fn chunk -> :ok = IO.binwrite(file, chunk) end)
+          body
+          |> JSON.encode_stream()
+          |> Enum.reduce(:crypto.hash_init(:sha256), fn chunk, hash ->
+            :ok = IO.binwrite(file, chunk)
+            :crypto.hash_update(hash, chunk)
+          end)
+          |> :crypto.hash_final()
         end)
       end)
 
-      conn
-      |> put_resp_content_type("application/json", "utf-8")
-      |> send_file(status, path)
+      case prepare.(conn, digest) do
+        {:send, conn} ->
+          conn
+          |> put_resp_content_type("application/json", "utf-8")
+          |> send_file(status, path)
+
+        {:not_modified, conn} ->
+          send_resp(conn, 304, "")
+      end
     after
       _ = File.rm(path)
       _ = File.rmdir(directory)
