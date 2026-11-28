@@ -5,12 +5,13 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
     use ExUnit.Case, async: false
     alias AttentionServer.{CompatibilityScenarios, Engine, Groups, SharedMessages, Store}
     alias AttentionServer.ClientAPI.SharedCapability
-    alias AttentionServer.Migration.{Bundle, ImportConversations, ImportEntries, ImportMessages, ImportSession, ImportSharedMessages}
+    alias AttentionServer.Migration.{Bundle, ImportConversations, ImportEntries, ImportMessages, ImportSession, ImportSharedMessages, ImportSharedReaderFacts}
     alias AttentionServer.Repository.Postgres.{Attributes, Schema}
 
     @sender "a1000000-0000-4000-8000-000000000001"
     @first "a1000000-0000-4000-8000-000000000002"
     @second "a1000000-0000-4000-8000-000000000003"
+    @outside "a1000000-0000-4000-8000-000000000004"
     @group "a2000000-0000-4000-8000-000000000001"
     @shared "shared_synthetic-collision"
 
@@ -48,6 +49,34 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
       assert {:ok, _} = ImportSession.query(db, "DROP TRIGGER fail_shared_recipient ON harklight.message_recipients", [])
       assert :ok = ImportSharedMessages.run(db, identity, bundle)
       assert :ok = ImportSharedMessages.run(db, identity, bundle)
+      assert {:ok, _} = ImportSession.query(db, """
+        CREATE FUNCTION harklight.fail_shared_scope() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN IF NEW.family='shared_revision_scope' THEN RAISE EXCEPTION 'synthetic interruption'; END IF; RETURN NEW; END $$
+        """, [])
+      assert {:ok, _} = ImportSession.query(db,
+        "CREATE TRIGGER fail_shared_scope BEFORE INSERT ON harklight.compatibility_facts FOR EACH ROW EXECUTE FUNCTION harklight.fail_shared_scope()", [])
+      assert {:error, _} = ImportSharedReaderFacts.run(db, identity, bundle)
+      assert {:ok, %{ordinal: 0}} = ImportSession.checkpoint(db, identity, "shared/reader-recipients/v1")
+      assert {:ok, %{rows: [[0]]}} = ImportSession.query(db,
+        "SELECT count(*) FROM harklight.compatibility_facts WHERE family='shared_revision_scope'", [])
+      assert {:ok, _} = ImportSession.query(db, "DROP TRIGGER fail_shared_scope ON harklight.compatibility_facts", [])
+      assert :ok = ImportSharedReaderFacts.run(db, identity, bundle)
+      assert :ok = ImportSharedReaderFacts.run(db, identity, bundle)
+      for person <- Map.keys(source.persons) do
+        expected_access = MapSet.size(SharedMessages.organizations(source, person)) > 0 or SharedMessages.retained_history?(source, person)
+        assert read_fact(db, "shared_read_access", person) == expected_access
+      end
+      assert read_fact(db, "shared_read_access", @outside) == false
+      assert read_fact(db, "shared_read_access", @sender) == true
+      for {{id, person}, recipient} <- source.shared_recipients do
+        record = Map.fetch!(source.shared_messages, id)
+        assert read_fact(db, "shared_revision_scope", {person, recipient.item_id}) ==
+          %{group?: Map.has_key?(record, :group_id), frozen_revision: get_in(recipient, [:frozen, :revision])}
+      end
+      for revision <- [1, 2] do
+        historical = SharedMessages.historical_record(source.shared_messages[@shared], revision)
+        assert read_fact(db, "shared_revision_files", {@shared, revision}) == Map.get(historical, :files, [])
+      end
       # Both ordinary tuple consumers must still resolve the ordinary row.
       assert :ok = ImportConversations.run(db, identity, bundle)
       assert :ok = ImportEntries.run(db, identity, bundle)
@@ -84,6 +113,13 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
       end
     end
 
+    defp read_fact(db, family, key) do
+      assert {:ok, %{rows: [[body]]}} = ImportSession.query(db,
+        "SELECT body FROM harklight.compatibility_facts WHERE family=$1 AND address=$2", [family, Attributes.key(key)])
+      assert {:ok, value} = Attributes.decode(body)
+      value
+    end
+
     defp visible_revision(engine, person, groups?, revision) do
       with true <- MapSet.size(SharedMessages.organizations(engine, person)) > 0 or SharedMessages.retained_history?(engine, person),
            %{item_id: item} <- engine.shared_recipients[{@shared, person}],
@@ -100,7 +136,7 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
     defp seed(path) do
       {:ok, store} = Store.open_relay(path)
       {engine, :ok, touched} = Engine.with_touches(store.engine, fn engine ->
-        engine = Enum.reduce(Enum.with_index([@sender, @first, @second]), engine, fn {person, n}, acc ->
+        engine = Enum.reduce(Enum.with_index([@sender, @first, @second, @outside]), engine, fn {person, n}, acc ->
           {:ok, next, _} = Engine.hosted_account_create(acc, "shared-fixture-#{n}", false, person, String.duplicate(Integer.to_string(n + 1), 64))
           next
         end)
