@@ -46,20 +46,6 @@ defmodule AttentionServer.Migration.BundleTest do
       {"CERTFILE", "server.pem"}, {"KEYFILE", "server.key"}, {"CACERTFILE", "ca.pem"}
     ], "\n", fn {key, file} -> "export ATTENTION_SERVER_#{key}='#{Path.join(certs, file)}'" end))
     path = Path.join(fixture.root, "relay.sqlite3")
-    # A retained real guided-join invitation pins the same captured CA.
-    {:ok, store} = AttentionServer.Store.open_relay(path)
-    person = hd(history["people"])
-    owner = Map.fetch!(store.engine.owners, person).key
-    {:ok, configuration} = AttentionServer.GuidedJoin.configuration("fixture.test", 4080, 4040,
-      File.read!(Path.join(certs, "ca.pem")))
-    {engine, :ok, touched} = AttentionServer.Engine.with_touches(store.engine, fn engine ->
-      {:ok, engine, _} = AttentionServer.GuidedJoin.create(engine, person, owner,
-        :crypto.hash(:sha256, "migration invitation"), configuration)
-      {engine, :ok}
-    end)
-    {:ok, store} = AttentionServer.Store.commit(store, {engine, touched},
-      %{person: person, actor: "fixture", action: "migration_invitation"})
-    :ok = AttentionServer.Store.close(store)
     before = File.read!(path)
     destination = Path.join(root, "export")
 
@@ -146,6 +132,30 @@ defmodule AttentionServer.Migration.BundleTest do
     mismatched_identity = %{identity | source: Base.decode16!(mismatched_summary.sha256, case: :lower)}
     assert {:error, :material_identity_source_mismatch} = AttentionServer.Migration.ImportMaterial.run(
       mismatched_bundle, mismatched_identity, Path.join(root, "mismatched-stage"))
+
+    # Extend a separate stopped synthetic source, keeping the M1 golden source unchanged.
+    invitation_path = Path.join(root, "invitation.sqlite3")
+    File.cp!(path, invitation_path)
+    File.cp_r!(path <> ".uploads", invitation_path <> ".uploads")
+    # A retained real guided-join invitation pins the same captured CA.
+    {:ok, store} = AttentionServer.Store.open_relay(invitation_path)
+    person = hd(history["people"])
+    owner = Map.fetch!(store.engine.owners, person).key
+    {:ok, configuration} = AttentionServer.GuidedJoin.configuration("fixture.test", 4080, 4040,
+      File.read!(Path.join(certs, "ca.pem")))
+    {engine, :ok, touched} = AttentionServer.Engine.with_touches(store.engine, fn engine ->
+      {:ok, engine, _} = AttentionServer.GuidedJoin.create(engine, person, owner,
+        :crypto.hash(:sha256, "migration invitation"), configuration)
+      {engine, :ok}
+    end)
+    {:ok, store} = AttentionServer.Store.commit(store, {engine, touched},
+      %{person: person, actor: "fixture", action: "migration_invitation"})
+    :ok = AttentionServer.Store.close(store)
+    invitation_bundle = Path.join(root, "invitation-export")
+    assert {:ok, invitation_summary} = Bundle.export(invitation_path, invitation_bundle, opts)
+    invitation_identity = %{identity | source: Base.decode16!(invitation_summary.sha256, case: :lower)}
+    assert {:ok, _} = AttentionServer.Migration.ImportMaterial.run(invitation_bundle,
+      invitation_identity, Path.join(root, "invitation-stage"))
 
     for {relative, expected} <- manifest.data.files do
       bytes = File.read!(Path.join(destination, relative))
