@@ -428,8 +428,10 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         assert :ok = ImportStreams.run(db, identity, bundle)
         assert :ok = ImportStreams.run(db, identity, bundle)
         assert {:ok, _} = AttentionServer.Migration.VerifyStreamPositions.run(db, identity, bundle)
+        assert {:ok, %{epoch: ^epoch}} = AttentionServer.Migration.VerifyStreamHeads.run(db, identity, bundle)
         verify_streams(db, bundle, manifest)
         verify_stream_position_drift(db, identity, bundle)
+        verify_stream_head_drift(db, identity, bundle)
         assert :ok = ImportReceipts.run(db, identity, bundle)
         assert :ok = ImportReceipts.run(db, identity, bundle)
         verify_receipts(db, bundle, manifest)
@@ -796,6 +798,8 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         end
 
         source = %{store | change_log: true}
+        assert {:ok, [[source_epoch]]} = RecordTable.select(store.db,
+          "SELECT epoch FROM client_change_log_epoch WHERE id=1")
         assert {:ok, head} = ChangeLog.head(source, person)
         if mode == :implicit, do: assert(head == epoch)
         assert {:ok, [], false, ^head} = ChangeLog.read(source, person, head, 50)
@@ -815,6 +819,8 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
           schema: AttentionServer.Repository.Postgres.Schema.digest()}
         assert :ok = ImportStreams.run(db, identity, bundle)
         assert :ok = ImportStreams.run(db, identity, bundle)
+        assert {:ok, _} = AttentionServer.Migration.VerifyStreamPositions.run(db, identity, bundle)
+        assert {:ok, %{epoch: ^source_epoch}} = AttentionServer.Migration.VerifyStreamHeads.run(db, identity, bundle)
         start_supervised!({Repo, config})
         assert {:ok, [], false, ^head} = Streams.person_page(person, head, 50)
         assert {:error, :cursor_expired} = Streams.person_page(person, head - 1, 50)
@@ -1382,6 +1388,61 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
       assert {:ok, %{rows: [[^expected_count]]}} = ImportSession.query(db, "SELECT count(*) FROM harklight.operation_receipts", [])
       assert {:ok, %{rows: [[2]]}} = ImportSession.query(db, "SELECT count(*) FROM harklight.operation_receipts WHERE operation_key='synthetic-same-key'", [])
       assert {:ok, %{rows: [[1]]}} = ImportSession.query(db, "SELECT count(*) FROM harklight.operation_receipts WHERE operation_key='synthetic-agent-key' AND origin_key<>''", [])
+    end
+
+    defp verify_stream_head_drift(db, identity, bundle) do
+      alias AttentionServer.Migration.VerifyStreamHeads
+      source_file = Path.join(bundle, "source.sqlite3")
+      before = AttentionServer.Migration.Source.file_observation(source_file)
+      assert {:ok, heads} = VerifyStreamHeads.run(db, identity, bundle)
+      assert heads.heads > 0
+      for {sql, error} <- [
+        {"UPDATE harklight.stream_heads SET head=head+1", :stream_head_mismatch},
+        {"UPDATE harklight.stream_heads SET floor=floor+1,head=head+1", :stream_head_mismatch},
+        {"UPDATE harklight.stream_heads SET seed_revision=seed_revision+1,head=head+1", :stream_head_mismatch},
+        {"UPDATE harklight.server_identity SET cursor_epoch=cursor_epoch+1", :cursor_identity_mismatch},
+        {"UPDATE harklight.server_identity SET cursor_signing_key=decode(repeat('00',32),'hex')", :cursor_identity_mismatch}
+      ] do
+        assert {:error, :synthetic_drift} = Postgrex.transaction(db, fn tx ->
+          assert {:ok, _} = ImportSession.query(tx, sql, [])
+          assert {:error, ^error} = VerifyStreamHeads.run(tx, identity, bundle)
+          Postgrex.rollback(tx, :synthetic_drift)
+        end)
+        assert {:ok, ^heads} = VerifyStreamHeads.run(db, identity, bundle)
+      end
+      assert {:error, :synthetic_drift} = Postgrex.transaction(db, fn tx ->
+        assert {:ok, _} = ImportSession.query(tx,
+          "INSERT INTO harklight.stream_heads(person_id,origin_key,head,floor,seed_revision) SELECT person_id,'extra-synthetic-stream',head,floor,seed_revision FROM harklight.stream_heads LIMIT 1", [])
+        assert {:error, :stream_head_count_mismatch} = VerifyStreamHeads.run(tx, identity, bundle)
+        Postgrex.rollback(tx, :synthetic_drift)
+      end)
+      assert {:ok, ^heads} = VerifyStreamHeads.run(db, identity, bundle)
+      assert AttentionServer.Migration.Source.file_observation(source_file) == before
+      # Mutate the disposable copied source after the verifier has read its epoch
+      # and built the TEMP index. A read-only SQLite connection is not a seal.
+      original_bytes = File.read!(source_file)
+      changing_query = fn connection, sql, params ->
+        result = ImportSession.query(connection, sql, params)
+        if String.starts_with?(sql, "SELECT instance_id,cursor_signing_key,cursor_epoch") do
+          assert {:ok, writer} = Exqlite.Sqlite3.open(source_file)
+          try do
+            assert :ok = Exqlite.Sqlite3.execute(writer,
+              "INSERT INTO client_change_log_epoch(id,epoch) VALUES(1,999) ON CONFLICT(id) DO UPDATE SET epoch=999")
+          after
+            Exqlite.Sqlite3.close(writer)
+          end
+        end
+        result
+      end
+      try do
+        assert {:error, :stream_source_changed} = VerifyStreamHeads.run(db, identity, bundle, changing_query)
+      after
+        # Both SQLite connections are closed now. Restore only this disposable
+        # negative-test copy, including any WAL retained by the read-only close.
+        for suffix <- ["-wal", "-shm", "-journal"], do: File.rm(source_file <> suffix)
+        File.write!(source_file, original_bytes)
+      end
+      assert {:ok, ^heads} = VerifyStreamHeads.run(db, identity, bundle)
     end
 
     defp verify_stream_position_drift(db, identity, bundle) do
