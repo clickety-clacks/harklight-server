@@ -24,6 +24,8 @@ install -m 755 scripts/check-store-compatibility.py "$stage/$name/bin/harklight-
 install -m 755 scripts/start-server-checked.sh "$stage/$name/bin/harklight-start-server-checked"
 install -m 644 SELF_HOST.md "$stage/$name/SELF_HOST.md"
 install -m 644 GUIDED_JOIN.md "$stage/$name/GUIDED_JOIN.md"
+mkdir -p "$stage/$name/fixtures/compatibility"
+install -m 644 scripts/compatibility/profile.exs "$stage/$name/fixtures/compatibility/profile.exs"
 "$repo_dir/scripts/build-skills.sh" "$stage/$name/skills"
 cp -a third_party "$stage/$name/THIRD_PARTY"
 for application in "$stage/$name"/lib/*; do
