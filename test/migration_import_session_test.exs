@@ -480,6 +480,37 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
             [Attributes.key({person, device, revision, "app:never-subscribed"})])
         end
         verify_messages(db, bundle, manifest)
+        assert {:ok, _} = ImportSession.query(db, """
+          CREATE FUNCTION harklight.fail_answer() RETURNS trigger LANGUAGE plpgsql AS $$
+          BEGIN RAISE EXCEPTION 'synthetic answer interruption'; END $$
+          """, [])
+        assert {:ok, _} = ImportSession.query(db,
+          "CREATE TRIGGER fail_answer BEFORE INSERT ON harklight.answers FOR EACH ROW EXECUTE FUNCTION harklight.fail_answer()", [])
+        assert {:error, _} = AttentionServer.Migration.ImportAnswers.run(db, identity, bundle)
+        assert {:ok, %{ordinal: 0}} = ImportSession.checkpoint(db, identity, "answers/ordinary/v1")
+        assert {:ok, %{rows: [[0]]}} = ImportSession.query(db, "SELECT count(*) FROM harklight.answers", [])
+        assert {:ok, _} = ImportSession.query(db, "DROP TRIGGER fail_answer ON harklight.answers", [])
+        assert :ok = AttentionServer.Migration.ImportAnswers.run(db, identity, bundle)
+        assert :ok = AttentionServer.Migration.ImportAnswers.run(db, identity, bundle)
+        assert {:ok, answer_count} = Frames.fold(Path.join(bundle, "records.frames"), manifest.data.records, 0, fn
+          {{:row, :messages, {person, _, _} = key}, %{terminal: %{state: "answered"}} = record}, count ->
+            message = ImportMessages.id(key, record)
+            revision = Map.get(record, :revision, 1)
+            assert {:ok, %{rows: [[id, body]]}} = ImportSession.query(db,
+              "SELECT id,body FROM harklight.answers WHERE message_id=$1 AND person_id=$2 AND request_revision=$3",
+              [message, person, revision])
+            assert id == AttentionServer.Migration.ImportAnswers.id(message, revision)
+            assert {:ok, %{terminal: terminal, item_id: item_id}} = Attributes.decode(body)
+            assert terminal == record.terminal
+            assert item_id == AttentionServer.ClientAPI.Resources.item_id(record)
+            assert AttentionServer.ClientAPI.Resources.answer_outcome(record, terminal) ==
+              AttentionServer.ClientAPI.Resources.answer_outcome(record, record.terminal)
+            {:ok, count + 1}
+          _, count -> {:ok, count}
+        end)
+        assert answer_count > 0
+        assert {:ok, %{rows: [[^answer_count]]}} = ImportSession.query(db, "SELECT count(*) FROM harklight.answers", [])
+
         verify_receipt_replay(session_person, {agent_person, agent_key}, receipt_digest)
         wrong_source = %{identity | source: :crypto.hash(:sha256, "different export")}
         assert {:error, :import_source_mismatch} = ImportUploads.run(db, wrong_source, bundle)

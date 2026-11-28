@@ -510,3 +510,11 @@ counts only origin replies strictly after the saved read position. Empty
 conversations have explicit false, nil and zero values. Each summary replaces
 these derived fields atomically with its checkpoint, so a retry cannot double
 count. Source history and read positions remain unchanged.
+
+`ImportAnswers.run/3` preserves ordinary answered terminals at their exact
+closed request revision. Its internal ID is scoped to the normalized message
+and revision; the original public Item ID is retained in the typed body with
+the complete terminal, including null values, no-comment and default evidence,
+actor, clock and operation identity. No separate public answer ID or missing
+historical terminal is invented. Verified LargeText paths are converted before
+publication. This phase does not replace shared answer reconstruction.
