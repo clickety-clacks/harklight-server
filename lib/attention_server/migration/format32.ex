@@ -125,6 +125,9 @@ defmodule AttentionServer.Migration.Format32 do
 
     Enum.each(
       [
+        # Relay defines persisted upload metadata atoms. Loading its module
+        # does not start a process; cold release eval must know those atoms.
+        AttentionServer.Relay,
         AttentionServer.Groups,
         AttentionServer.SharedMessages,
         AttentionServer.SharedAnswers,
