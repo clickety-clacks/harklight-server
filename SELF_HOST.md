@@ -684,6 +684,26 @@ private state directory (`mkdir -m 700 "$STATE"`), run `preflight` and `setup`,
 then run `restore`; it replaces that empty directory with the archived state.
 Run `harklight-postgres status` afterwards.
 
+### Migrating an existing SQLite store (not yet available)
+
+    "$PACKAGE/bin/harklight-postgres" migrate
+
+`migrate` is the installer's side of the stopped-store migration. It needs the
+packaged importer `bin/harklight-migration`, which this release does not ship
+yet, so today it refuses and changes nothing. When the importer ships it will,
+with Harklight Server stopped and the store checkpointed: write an immutable
+backup of the private install root (outside `ROOT/postgres`), export the store
+with its identity material and any files `server.env` points at, verify the
+export, import into the empty database as the migration role, validate, apply
+the runtime role's grants and verify them, and only then activate the
+destination. It never edits `server.env` or starts the Server; you add the
+printed backend setting yourself. If any step fails nothing is activated; run
+`migrate --resume WORKDIR` after fixing the cause, or abandon the unpublished
+destination and restore the original backup. Rolling back to the old stack is
+only valid before PostgreSQL has accepted new writes. The orchestration is
+tested against a test double that follows the importer's recorded command
+contract; it has not been run against the real importer or real Harklight data.
+
 What this does not cover: the existing SQLite store, which still needs the
 stopped-state backup described under "Upgrade or rollback"; the installer's
 pre-upgrade backup deliberately excludes `ROOT/postgres` and does not back up

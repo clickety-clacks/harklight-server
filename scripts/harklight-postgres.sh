@@ -30,6 +30,8 @@ usage: harklight-postgres COMMAND [options]
   apply-grants           give the runtime role its privileges on the migrated schema
   verify-roles           check the runtime role cannot own, alter or truncate anything
   status                 report the configured database, service and connection
+  migrate [--resume DIR] copy the stopped FORMAT32 store into the empty PostgreSQL database and
+                         activate it (opt-in; refuses until the packaged importer ships)
   backup ARCHIVE         write one archive: database dump, state directory and checksums
   restore ARCHIVE        restore that archive (add --replace to overwrite existing data)
 
@@ -45,6 +47,8 @@ options:
                          (containers and tests; not supervised)
   --online               backup or restore while Harklight Server is running (not advised)
   --replace              restore over a database that already holds data
+  --resume DIR           with migrate: continue an interrupted migration in its work directory
+  --migration-bin PATH   with migrate: the importer executable (default: harklight-migration beside this command)
 EOF
   exit 2
 }
@@ -74,6 +78,8 @@ ca_file=""
 use_service=1
 online=0
 replace=0
+resume_dir=""
+migration_bin=""
 positional=()
 while (($#)); do
   case "$1" in
@@ -91,6 +97,8 @@ while (($#)); do
     --no-service) use_service=0; shift ;;
     --online) online=1; shift ;;
     --replace) replace=1; shift ;;
+    --resume) resume_dir=${2:?}; shift 2 ;;
+    --migration-bin) migration_bin=${2:?}; shift 2 ;;
     -h|--help) usage ;;
     --*) fail "unknown option $1" ;;
     *) positional+=("$1"); shift ;;
@@ -661,6 +669,130 @@ do_status() {
   note "free disk:               $(free_mb "$root") MB under $root"
 }
 
+# ----------------------------------------------------------- migrate
+
+json_field() {
+  python3 -I -c 'import json,sys
+d = json.loads(sys.argv[1]); v = d.get(sys.argv[2])
+print("" if v is None else v)' "$1" "$2"
+}
+
+migrate_failed() {
+  local step=$1 work_dir=$2
+  cat >&2 <<EOF
+harklight-postgres: migration step "$step" failed.
+Nothing was activated and no backend setting was changed. Keep the old Server stopped.
+Do not delete the destination, rerun bootstrap, or touch the backup in $work_dir/backup.
+Check progress: run the importer's status command with receipt $work_dir/receipt.json.
+Fix the reported problem and continue with: harklight-postgres migrate --resume $work_dir
+Or abandon this unpublished destination and restore the original backup; that rollback
+is only valid before PostgreSQL has accepted any new writes.
+EOF
+  exit 2
+}
+
+# Run one importer step. Exit 0 and a JSON object on stdout are required.
+migration_step() {
+  local step=$1; shift
+  local out
+  if ! out="$("$migration_bin" "$@" 2> "$work_dir/$step.err")"; then migrate_failed "$step" "$work_dir"; fi
+  [[ "$(json_field "$out" contract_version 2>/dev/null || true)" == 1 ]] || migrate_failed "$step (unexpected output)" "$work_dir"
+  printf '%s\n' "$out" > "$work_dir/$step.json"
+  printf '%s' "$out"
+}
+
+do_migrate() {
+  find_pg_bin
+  load_config
+  local self_dir
+  self_dir="$(cd -- "$(dirname -- "$0")" && pwd)"
+  migration_bin="${migration_bin:-$self_dir/harklight-migration}"
+  [[ -x "$migration_bin" ]] || fail "the packaged importer ($migration_bin) is not available in this release, so the store cannot be migrated yet. Nothing was changed."
+  [[ -f "$state/relay.sqlite3" ]] || fail "no FORMAT32 store at $state/relay.sqlite3"
+  if server_running; then fail "Harklight Server is running; stop it and keep it stopped before migrating"; fi
+  if [[ -s "$state/relay.sqlite3-wal" || -s "$state/relay.sqlite3-journal" ]]; then
+    fail "the stopped store is not checkpointed; start the current release once and stop it cleanly, then retry"
+  fi
+
+  if [[ -n "$resume_dir" ]]; then
+    work_dir="$resume_dir"
+    [[ -d "$work_dir" && -f "$work_dir/receipt.json" || -d "$work_dir/backup" ]] || fail "$work_dir is not a migration work directory"
+  else
+    [[ "$(user_table_count)" == 0 ]] || fail "the PostgreSQL database already holds objects; a migration needs an empty, unpublished destination"
+    mkdir -m 700 -p -- "$root/migration"
+    work_dir="$(mktemp -d "$root/migration/$(date -u +%Y%m%dT%H%M%SZ).XXXXXX")"
+    chmod 700 "$work_dir"
+  fi
+  note "migration work directory: $work_dir"
+
+  # Importer reads only these; the migrator credentials never reach server.env or a command line.
+  export HARKLIGHT_MIGRATOR_URL="$mg_url" HARKLIGHT_MIGRATOR_PASSWORD_FILE="$mg_pwfile"
+  if [[ -n "${pg_ca:-}" ]]; then export HARKLIGHT_MIGRATOR_CA_FILE="$pg_ca"; fi
+
+  local bundle="$work_dir/bundle" receipt="$work_dir/receipt.json" out validation_sha
+
+  if [[ ! -f "$work_dir/done.backup" ]]; then
+    mkdir -m 700 -p -- "$work_dir/backup"
+    tar --exclude=./releases --exclude=./backups --exclude=./postgres --exclude=./migration \
+      --exclude=./.release-install.lock -cf "$work_dir/backup/private-root.tar" -C "$root" . || migrate_failed backup "$work_dir"
+    chmod 600 "$work_dir/backup/private-root.tar"
+    sha "$work_dir/backup/private-root.tar" > "$work_dir/backup/SHA256"
+    : > "$work_dir/done.backup"
+    note "immutable backup written: $work_dir/backup/private-root.tar"
+  fi
+
+  if [[ ! -f "$work_dir/done.export" ]]; then
+    python3 -I - "$state" "$work_dir/material-map.json" "$(external_refs)" <<'PY' || migrate_failed "material map" "$work_dir"
+import json, os, sys
+state, out, externals = sys.argv[1:4]
+m = {}
+for name in ("server.env", "person-id"):
+    path = os.path.join(state, name)
+    if os.path.isfile(path):
+        m[name] = path
+for sub in ("tls", "owner"):
+    base = os.path.join(state, sub)
+    for dirpath, _, files in os.walk(base):
+        for f in files:
+            p = os.path.join(dirpath, f)
+            if os.path.isfile(p):
+                m[os.path.relpath(p, state)] = p
+for line in externals.splitlines():
+    if "\t" in line:
+        _, p = line.split("\t", 1)
+        m["external" + p] = p
+with open(out, "w") as fh:
+    json.dump(m, fh, indent=1, sort_keys=True)
+os.chmod(out, 0o600)
+PY
+    rm -rf -- "$bundle"
+    migration_step export export --source "$state/relay.sqlite3" --output "$bundle" --unit "$SERVER_UNIT" --material-map "$work_dir/material-map.json" >/dev/null
+    migration_step verify verify "$bundle" >/dev/null
+    : > "$work_dir/done.export"
+    note "export and verify passed"
+  fi
+
+  if [[ ! -f "$work_dir/done.activate" ]]; then
+    migration_step import import --bundle "$bundle" --receipt "$receipt" >/dev/null
+    note "import completed"
+    out="$(migration_step validate validate --bundle "$bundle" --receipt "$receipt")"
+    validation_sha="$(json_field "$out" validation_sha256)"
+    [[ "$validation_sha" =~ ^[0-9a-f]{64}$ ]] || migrate_failed "validate (no validation digest)" "$work_dir"
+    note "validation passed ($validation_sha)"
+    "$0" apply-grants --root "$root" --state "$state" --pg-bin "$pg_bin" >/dev/null || migrate_failed "apply-grants" "$work_dir"
+    "$0" verify-roles --root "$root" --state "$state" --pg-bin "$pg_bin" >/dev/null || migrate_failed "verify-roles" "$work_dir"
+    migration_step activate activate --receipt "$receipt" --validation-sha256 "$validation_sha" >/dev/null
+    : > "$work_dir/done.activate"
+  fi
+  out="$(migration_step status status --receipt "$receipt")"
+  [[ "$(json_field "$out" phase)" == active ]] || migrate_failed "status (database is not active)" "$work_dir"
+  note "PostgreSQL destination is active for this import. server.env was not changed and Harklight Server was not started."
+  note "Before starting a PostgreSQL-backed Server, install the importer's verified identity material and add to $state/server.env:"
+  note "  export ATTENTION_SERVER_STORE_BACKEND=postgres"
+  note "  source $env_file"
+  note "Rollback to the old stack is valid only until PostgreSQL has accepted new writes; backup: $work_dir/backup"
+}
+
 # ------------------------------------------------------- backup / restore
 
 guard_server_stopped() {
@@ -868,6 +1000,7 @@ case "$cmd" in
   status) do_status ;;
   apply-grants) do_apply_grants ;;
   verify-roles) do_verify_roles ;;
+  migrate) do_migrate ;;
   backup) do_backup ;;
   restore) do_restore ;;
   *) usage ;;
