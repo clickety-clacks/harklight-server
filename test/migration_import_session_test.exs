@@ -89,6 +89,7 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         # Synthetic setup: allocation high deliberately exceeds retained history.
         source_path = Path.join(fixture.root, "relay.sqlite3")
         seed_advisory(source_path)
+        seed_historical_messages(source_path)
         expected_organizations = seed_organizations(source_path, epoch)
         {:ok, sqlite} = Exqlite.Sqlite3.open(source_path)
 
@@ -425,6 +426,26 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         end
         assert :ok = ImportUploads.run(db, identity, bundle)
         verify_uploads(db, bundle, manifest)
+        # The relation test below selects the exact source row referenced by a
+        # stored read position, rather than relying on arbitrary event order.
+        assert {:ok, reference} = Frames.fold(Path.join(bundle, "records.frames"), manifest.data.records, nil, fn
+          {{:row, :chat_read_positions, {person, _, _}}, position}, nil when position > 0 ->
+            {:ok, Attributes.key({:row, :conversation_events, {person, position}})}
+          _, found -> {:ok, found}
+        end)
+        assert is_binary(reference)
+        assert {:ok, %{rows: [[saved_body]]}} = ImportSession.query(db,
+          "SELECT body::text FROM harklight.compatibility_facts WHERE family='conversation_events' AND address=$1", [reference])
+        assert {:ok, _} = ImportSession.query(db,
+          "DELETE FROM harklight.compatibility_facts WHERE family='conversation_events' AND address=$1", [reference])
+        assert {:error, :read_position_reference_mismatch} = AttentionServer.Migration.ImportConversations.run(db, identity, bundle)
+        assert {:ok, %{ordinal: 0}} = ImportSession.checkpoint(db, identity, "conversations/read-positions/v1")
+        assert {:ok, %{rows: [[0]]}} = ImportSession.query(db, "SELECT count(*) FROM harklight.read_positions", [])
+        assert {:ok, _} = ImportSession.query(db,
+          "INSERT INTO harklight.compatibility_facts(family,address,body) VALUES('conversation_events',$1,$2::text::jsonb)", [reference, saved_body])
+        assert :ok = AttentionServer.Migration.ImportConversations.run(db, identity, bundle)
+        assert :ok = AttentionServer.Migration.ImportConversations.run(db, identity, bundle)
+        verify_conversation_positions(db, bundle, manifest)
         stop_supervised!(Repo)
 
         assert {:ok, :ok} =
@@ -781,6 +802,29 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
       Agent.stop(fixture.clock)
     end
 
+    defp verify_conversation_positions(db, root, manifest) do
+      assert {:ok, {containers, positions}} = Frames.fold(Path.join(root, "records.frames"),
+        manifest.data.records, {0, 0}, fn
+          {{:row, :messages, key}, record}, {containers, positions} ->
+            id = ImportMessages.id(key, record)
+            assert {:ok, %{rows: [[^id, text]]}} = ImportSession.query(db,
+              "SELECT message_id,attributes::text FROM harklight.conversations WHERE id=$1", [id])
+            assert_typed(text, %{source_key: key})
+            {:ok, {containers + 1, positions}}
+          {{:row, :chat_read_positions, {person, sender, external}}, position}, {containers, positions} ->
+            assert {:ok, %{rows: [[^position]]}} = ImportSession.query(db,
+              "SELECT r.position FROM harklight.read_positions r JOIN harklight.messages m ON m.id=r.conversation_id WHERE r.person_id=$1 AND m.person_id=$1 AND m.sender_id=$2 AND m.message_id=$3",
+              [person, sender, external])
+            {:ok, {containers, positions + 1}}
+          _, counts -> {:ok, counts}
+        end)
+      assert containers > 0 and positions > 0
+      assert {:ok, %{rows: [[^containers]]}} = ImportSession.query(db,
+        "SELECT count(*) FROM harklight.conversations", [])
+      assert {:ok, %{rows: [[^positions]]}} = ImportSession.query(db,
+        "SELECT count(*) FROM harklight.read_positions", [])
+    end
+
     defp verify_uploads(db, root, manifest) do
       alias AttentionServer.Repository.Postgres.Uploads
       assert {:ok, published} = Frames.fold(Path.join(root, "records.frames"), manifest.data.records, 0, fn
@@ -846,6 +890,42 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
       assert actual == File.read!(path)
       assert byte_size(actual) == size
       assert {:error, :not_found} = Uploads.read_chunk(person, id, count)
+    end
+
+    defp seed_historical_messages(path) do
+      alias AttentionServer.{Engine, Store}
+      {:ok, store} = Store.open_relay(path)
+      {{person, sender, _}, sample} = Enum.find(store.engine.messages, fn {_, record} ->
+        is_binary(Map.get(record, :session_handle))
+      end)
+      {engine, :ok, touched} = Engine.with_touches(store.engine, fn engine ->
+        external_id = "synthetic-three-revisions"
+        body = %{"sender_id" => sender, "message_id" => external_id,
+          "created_at" => 1, "title" => "First historical revision", "body" => "Original content",
+          "message_type" => "fyi", "answer_ui" => AttentionServer.Message.seen_descriptor()}
+        frame = %{"type" => "forward", "op_id" => "95000000-0000-4000-8000-000000000020",
+          "session_handle" => sample.session_handle, "message" => body}
+        at = sample.accepted_at + 100
+        {engine, reply} = Engine.request_command(engine, sample.origin, frame, at)
+        assert {:ok, _} = reply
+        engine = Enum.reduce(2..3, engine, fn revision, engine ->
+          frame = %{"type" => "conversation_revise", "sender_id" => sender,
+            "message_id" => external_id, "base_revision" => revision - 1,
+            "op_id" => "95000000-0000-4000-8000-00000000002#{revision}",
+            "message" => Map.put(body, "body", "Historical revision #{revision}")}
+          {engine, reply} = Engine.request_command(engine, sample.origin, frame, at + revision)
+          assert {:ok, _} = reply
+          engine
+        end)
+        record = Map.fetch!(engine.messages, {person, sender, external_id})
+        assert map_size(record.revisions) == 3
+        assert record.accepted_at == at and record.revision_accepted_at == at + 3
+        {:ok, engine, %{created: true}} = Engine.hosted_notice(engine, person,
+          %{"title" => "Synthetic service notice", "body" => "Retained notice content", "key" => "migration-history"}, at + 4)
+        {engine, :ok}
+      end)
+      {:ok, store} = Store.commit(store, {engine, touched}, %{person: person, actor: "fixture", action: "synthetic_history"})
+      :ok = Store.close(store)
     end
 
     defp seed_advisory(path) do
@@ -954,7 +1034,12 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
             for {rev, body} <- versions do
               assert {:ok, %{rows: [[at, text]]}} = ImportSession.query(db,
                 "SELECT accepted_at_ms,body::text FROM harklight.message_revisions WHERE message_id=$1 AND revision=$2", [id, rev])
-              assert at == if(rev == 1, do: record.accepted_at, else: record.revision_accepted_at)
+              expected_at = cond do
+                rev == 1 -> record.accepted_at
+                rev == current -> Map.get(record, :revision_accepted_at)
+                true -> nil
+              end
+              assert at == expected_at
               assert_typed(text, body)
             end
             assert {:ok, %{rows: [[^person, ^item]]}} = ImportSession.query(db,
@@ -963,6 +1048,14 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
           _, acc -> {:ok, acc}
         end)
       assert count > 0
+      assert {:ok, %{rows: [[unknown_count]]}} = ImportSession.query(db,
+        "SELECT count(*) FROM harklight.message_revisions WHERE accepted_at_ms IS NULL", [])
+      assert unknown_count > 0
+      assert {:ok, %{rows: [[notice_count]]}} = ImportSession.query(db,
+        "SELECT count(*) FROM harklight.messages WHERE origin_key='app:harklight/notices' AND principal_origin_key IS NULL AND session_handle IS NULL", [])
+      assert notice_count > 0
+      assert {:ok, %{rows: [[0]]}} = ImportSession.query(db,
+        "SELECT count(*) FROM harklight.principals WHERE key='app:harklight/notices'", [])
       assert {:ok, attached} = Frames.fold(Path.join(bundle, "records.frames"), manifest.data.records, 0,
         fn
           {{:row, :messages, _}, record}, n ->
