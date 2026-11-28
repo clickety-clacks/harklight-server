@@ -327,3 +327,30 @@ when their checkpoint already covers the file; this routine cannot append to a
 completed upload. It does not mark uploads complete, create attachment links or
 activate the database. The caller must finish those stages and validate target
 content and references before activation.
+
+`ImportUploads.run/3` stages published Engine and retained staged-file manifests,
+transfers and verifies their chunks, and links ordinary message revisions using
+each original file ordinal and typed descriptor. UUIDs and staged `fs` IDs stay
+distinct; person, uploader/owner, size and SHA-256 are preserved. Full source
+metadata is retained through the typed codec. Published Engine uploads use their
+original `last_activity_ms` as the import publication marker, not a reconstructed
+completion time. Staged files use their original `at_ms`, with the original
+30-day expiry recorded as numeric top-level `reservation_expires_at_ms` for the
+runtime cleanup reader. Engine uploads acquire no invented expiry.
+
+Completion verifies target chunk count, exact bytes and hash before publishing
+that upload's marker. Per-file completion and message-link checkpoints make the
+stage repeatable. Inline file descriptors remain in their original message
+record. Shared-message and conversation-entry links and large-data references
+remain distinct follow-up projections; full closure and retained-history checks
+are still required before database validation and activation.
+
+Upload byte completion means that the exported bytes have been copied and their
+length and digest verified; it does not mean that a staged reservation was linked
+to a message. Staged reservations retain their original expiry. Upload cleanup
+preserves every manifest and chunk while an import is loading or validated, so
+cleanup cannot remove a committed chunk prefix before resume. Once active, the
+ordinary cleanup policy again removes expired, unlinked reservations, including
+those whose bytes have been fully transferred. Linked attachments remain retained.
+`ImportBytes` is an internal chunk primitive; the `ImportUploads` entry point
+binds the verified bundle to the import's source digest before calling it.
