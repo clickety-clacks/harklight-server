@@ -669,6 +669,7 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         verify_allocation_bounds(db, root)
         assert {:ok, _} = AttentionServer.Migration.VerifyAccounts.run(db, identity, bundle)
         verify_feed_drift(db, identity, bundle)
+        verify_delivery_ack_links(db, identity, bundle)
         verify_conversation_drift(db, identity, bundle)
         verify_ordinary_entry_uploads(db, identity, bundle)
         assert {:ok, %{references: 0}} = AttentionServer.Migration.VerifyLargeText.run(db, identity, bundle)
@@ -2299,6 +2300,58 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
       assert {:ok, %{rows: members}} =
         ImportSession.query(db, "SELECT person_id FROM harklight.organization_members WHERE organization_id=$1 ORDER BY person_id", [organization])
       assert List.flatten(members) == Enum.sort(expected)
+    end
+
+    defp verify_delivery_ack_links(db, identity, bundle) do
+      alias AttentionServer.Migration.VerifyDeliveryAcks
+      assert {:ok, counts} = VerifyDeliveryAcks.run(db, identity, bundle)
+      assert counts.journal_pointers > 0
+      {:ok, manifest, _} = Bundle.verify(bundle)
+      {:ok, {person, origin, position, stages}} = Frames.fold(Path.join(bundle, "records.frames"),
+        manifest.data.records, nil, fn
+          {{:origin_feed, {p, o}, {:delivery_ack, n}}, value}, nil -> {:ok, {p, o, n, value}}
+          _, found -> {:ok, found}
+        end)
+      assert :ok = VerifyDeliveryAcks.check(db, person, origin, position, stages)
+      assert {:error, :delivery_ack_source_reference_mismatch} =
+        VerifyDeliveryAcks.check(db, "synthetic-other-person", origin, position, stages)
+      assert {:error, :delivery_ack_source_reference_mismatch} =
+        VerifyDeliveryAcks.check(db, person, "synthetic-other-origin", position, stages)
+      assert {:error, :delivery_ack_source_reference_mismatch} =
+        VerifyDeliveryAcks.check(db, person, origin, position, %{ack1: 9_000_000_000})
+      assert {:error, :unsupported_delivery_ack} =
+        VerifyDeliveryAcks.check(db, person, origin, position, Map.put(stages, :unexpected, 1))
+      seq = stages.ack1
+      address = Attributes.key({:row, :conversation_events, {person, seq}})
+      assert {:ok, %{rows: [[body]]}} = ImportSession.query(db,
+        "SELECT body FROM harklight.compatibility_facts WHERE family='conversation_events' AND address=$1", [address])
+      assert {:ok, event} = Attributes.decode(body)
+      for field <- ~w(kind stage event_id op_id session_handle request_revision) do
+        # Exercise the source-reference check independently: these invalid raw
+        # states would also fail full raw-fact comparison in run/3.
+        altered = %{event | payload: Map.put(event.payload, field, "wrong-correlation")}
+        assert {:error, :synthetic_drift} = Postgrex.transaction(db, fn tx ->
+          assert {:ok, %{num_rows: 1}} = ImportSession.query(tx,
+            "UPDATE harklight.compatibility_facts SET body=$2 WHERE family='conversation_events' AND address=$1",
+            [address, Attributes.encode(altered)])
+          assert {:error, :delivery_ack_journal_mismatch} = VerifyDeliveryAcks.check(tx, person, origin, position, stages)
+          Postgrex.rollback(tx, :synthetic_drift)
+        end)
+        assert :ok = VerifyDeliveryAcks.check(db, person, origin, position, stages)
+      end
+      {^person, sender, external} = event.key
+      for operation <- [:body, :missing] do
+        assert {:error, :synthetic_drift} = Postgrex.transaction(db, fn tx ->
+          where = " WHERE e.id=$1 AND e.conversation_id IN (SELECT c.id FROM harklight.conversations c JOIN harklight.messages m ON m.id=c.message_id WHERE m.kind='ordinary' AND m.person_id=$2 AND m.sender_id=$3 AND m.message_id=$4)"
+          sql = if operation == :body,
+            do: "UPDATE harklight.conversation_entries e SET body='{}'::jsonb" <> where,
+            else: "DELETE FROM harklight.conversation_entries e" <> where
+          assert {:ok, %{num_rows: 1}} = ImportSession.query(tx, sql, [Integer.to_string(seq), person, sender, external])
+          assert {:error, :delivery_ack_journal_mismatch} = VerifyDeliveryAcks.run(tx, identity, bundle)
+          Postgrex.rollback(tx, :synthetic_drift)
+        end)
+        assert {:ok, ^counts} = VerifyDeliveryAcks.run(db, identity, bundle)
+      end
     end
 
     defp verify_feed_drift(db, identity, bundle) do
