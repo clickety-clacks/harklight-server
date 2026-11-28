@@ -216,10 +216,14 @@ detect_roles() {
 # The Server verifies TLS for any non-loopback host, and for a loopback host
 # when a CA file is configured, unless the URL says sslmode=disable. Connect
 # the same way so a setup or backup never silently uses an unencrypted link.
+url_host() {
+  local rest="${1#*@}"
+  if [[ "$rest" == \[* ]]; then printf '%s' "${rest%%]*}]"; else printf '%s' "${rest%%[:/?]*}"; fi
+}
 ssl_default() {
   local url=$1 host
   [[ "$url" == *sslmode=* ]] && return 0
-  host="${url#*@}"; host="${host%%[:/?]*}"
+  host="$(url_host "$url")"
   case "$host" in
     127.0.0.1|localhost|::1|\[::1\]) [[ -z "${pg_ca:-}" ]] || printf 'verify-full' ;;
     *) printf 'verify-full' ;;
@@ -548,7 +552,7 @@ EOF
 # database, and either no query, sslmode=verify-full, or sslmode=disable on a
 # loopback host. Anything else would be rejected at Server start.
 validate_role_url() {
-  python3 -I - "$1" <<'PY' || exit 1
+  python3 -I - "$1" "${ca_file:-}" <<'PY' || exit 1
 import sys
 from urllib.parse import urlsplit, parse_qsl, unquote
 u = urlsplit(sys.argv[1])
@@ -566,6 +570,8 @@ if q == [] or q == [("sslmode", "verify-full")]:
 elif q == [("sslmode", "disable")]:
     if not loop:
         bad("sslmode=disable is only accepted for a loopback host; use sslmode=verify-full")
+    if sys.argv[2]:
+        bad("sslmode=disable cannot be combined with a CA file; the Server rejects that combination")
 else:
     bad("a database URL may carry only sslmode=verify-full (or sslmode=disable on loopback); other query parameters, including any that carry credentials, are refused")
 PY
@@ -691,9 +697,16 @@ for name, value in sorted(new.items()):
     if "\t" in value or "\n" in value or "/../" in value + "/":
         refused.append(name + "=" + value + " (unsupported characters)"); continue
     real = os.path.realpath(value)
-    if any(real == d or real.startswith(d + "/") for d in inside) or not os.path.exists(real):
+    if any(real == d or real.startswith(d + "/") for d in inside):
         continue
-    if os.path.isfile(real) and os.access(real, os.R_OK):
+    try:
+        st = os.stat(real)
+    except FileNotFoundError:
+        continue
+    except OSError as err:
+        refused.append(name + "=" + value + " (cannot be inspected: " + err.strerror + ")"); continue
+    import stat as statmod
+    if statmod.S_ISREG(st.st_mode) and os.access(real, os.R_OK):
         found.append((name, value))
     else:
         refused.append(name + "=" + value + " (not a readable regular file)")
@@ -851,6 +864,7 @@ case "$cmd" in
   preflight) do_preflight local ;;
   setup)
     if [[ -n "$remote_url" ]]; then do_setup_remote; else do_setup_local; fi ;;
+  print-tls-mode) pg_ca=${ca_file:-}; ssl_default "${positional[0]:?}" ;;
   status) do_status ;;
   apply-grants) do_apply_grants ;;
   verify-roles) do_verify_roles ;;

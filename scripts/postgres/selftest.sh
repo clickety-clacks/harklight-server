@@ -256,6 +256,28 @@ PGPASSWORD="$pw2" "$pg_bin/psql" -qtA "postgres://rrun@$base" -c "select count(*
 if PGPASSWORD="$pw2" "$pg_bin/psql" -qtA "postgres://rrun@$base" -c "truncate harklight.t" >/dev/null 2>&1; then bad "remote runtime role can truncate"; fi
 ok "operator-supplied database: boundary checked, backs up and restores identically"
 
+# TLS mode parity with the Server's parser (IPv6 loopback, CA file, explicit sslmode).
+mode() { "$tool" print-tls-mode "$@"; }
+[[ -z "$(mode 'postgres://u@[::1]:5432/d')" ]] || bad "IPv6 loopback treated as remote"
+[[ -z "$(mode 'postgres://u@127.0.0.1/d')" && -z "$(mode 'postgres://u@localhost/d')" ]] || bad "IPv4 loopback treated as remote"
+[[ "$(mode 'postgres://u@[::1]:5432/d' --ca-file /x)" == verify-full ]] || bad "loopback with a CA file must verify"
+[[ "$(mode 'postgres://u@db.invalid:5432/d')" == verify-full && "$(mode 'postgres://u@[2001:db8::1]:5432/d')" == verify-full ]] || bad "remote host must verify"
+[[ -z "$(mode 'postgres://u@db.invalid/d?sslmode=verify-full')" ]] || bad "explicit sslmode must be left to the URL"
+ok "TLS mode matches the Server for IPv4/IPv6 loopback, CA files and remote hosts"
+mkdir -m 700 "$scratch/state4" "$scratch/root4"
+expect_fail "remote setup refuses sslmode=disable together with a CA file" "cannot be combined with a CA file" \
+  "$tool" setup --root "$scratch/root4" --state "$scratch/state4" --pg-bin "$pg_bin" --remote-url "postgres://rrun@[::1]:$port/remotedb?sslmode=disable" --password-file "$scratch/rrun.pw" --migrator-url "postgres://rmig@[::1]:$port/remotedb" --migrator-password-file "$scratch/rmig.pw" --ca-file "$scratch/rrun.pw"
+
+# An external key under a parent directory the backup cannot read is refused, not skipped.
+if [[ "$(id -u)" != 0 ]]; then
+  mkdir -m 700 "$scratch/locked"; printf 'k\n' > "$scratch/locked/key"
+  cp "$state/server.env" "$scratch/server.env.keep2"
+  printf 'export HK_LOCKED_KEY=%q\n' "$scratch/locked/key" >> "$state/server.env"
+  chmod 000 "$scratch/locked"
+  expect_fail "backup refuses an external file under an unreadable directory" "cannot be inspected" "$tool" backup "${args[@]}" "$scratch/never2.tar"
+  chmod 700 "$scratch/locked"; cp "$scratch/server.env.keep2" "$state/server.env"
+fi
+
 # Verified TLS: a host the Server treats as non-loopback with no sslmode must be
 # reached over verified TLS, so setup, backup and restore never fall back to plaintext.
 cd "$scratch"
