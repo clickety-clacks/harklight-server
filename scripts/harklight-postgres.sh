@@ -12,6 +12,7 @@ MIN_PG_MAJOR=16
 TESTED_PG_MAJOR=16
 DEFAULT_PORT=15432
 ROLE=harklight
+MIGRATOR=harklight_migrator
 ADMIN_ROLE=harklight_admin
 DBNAME=harklight
 UNIT=harklight-postgres.service
@@ -24,8 +25,10 @@ usage: harklight-postgres COMMAND [options]
 
   preflight              check platform, PostgreSQL version, disk, port and data location
   setup                  create one dedicated local PostgreSQL cluster, role and database
-  setup --remote-url URL --password-file FILE
+  setup --remote-url URL --password-file FILE --migrator-url URL --migrator-password-file FILE
                          use an operator-supplied empty PostgreSQL database instead
+  apply-grants           give the runtime role its privileges on the migrated schema
+  verify-roles           check the runtime role cannot own, alter or truncate anything
   status                 report the configured database, service and connection
   backup ARCHIVE         write one archive: database dump, state directory and checksums
   restore ARCHIVE        restore that archive (add --replace to overwrite existing data)
@@ -37,6 +40,7 @@ options:
   --port N               local cluster loopback port (default 15432)
   --min-free-mb N        override the disk requirement for preflight and setup
   --ca-file FILE         with --remote-url: server CA certificate
+  --schema NAME          schema for apply-grants (default harklight)
   --no-service           run the local cluster with pg_ctl instead of a user service
                          (containers and tests; not supervised)
   --online               backup or restore while Harklight Server is running (not advised)
@@ -63,6 +67,9 @@ port=$DEFAULT_PORT
 min_free_mb=""
 remote_url=""
 password_file=""
+migrator_url=""
+migrator_password_file=""
+schema=harklight
 ca_file=""
 use_service=1
 online=0
@@ -78,6 +85,9 @@ while (($#)); do
     --remote-url) remote_url=${2:?}; shift 2 ;;
     --password-file) password_file=${2:?}; shift 2 ;;
     --ca-file) ca_file=${2:?}; shift 2 ;;
+    --migrator-url) migrator_url=${2:?}; shift 2 ;;
+    --migrator-password-file) migrator_password_file=${2:?}; shift 2 ;;
+    --schema) schema=${2:?}; shift 2 ;;
     --no-service) use_service=0; shift ;;
     --online) online=1; shift ;;
     --replace) replace=1; shift ;;
@@ -98,6 +108,8 @@ data_dir="$pgroot/data"
 run_dir="$pgroot/run"
 local_password_file="$pgroot/$ROLE.password"
 env_file="$state/postgres.env"
+migrator_env="$pgroot/migrator.env"
+migrator_password="$pgroot/$MIGRATOR.password"
 unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 
 # ---------------------------------------------------------------- helpers
@@ -178,32 +190,159 @@ server_running() {
   systemctl_user is-active --quiet "$SERVER_UNIT" 2>/dev/null
 }
 
+read_env_var() { (set +u; source "$1" >/dev/null 2>&1; printf '%s' "${!2:-}"); }
+
 load_config() {
   [[ -f "$env_file" ]] || fail "no PostgreSQL configuration at $env_file; run setup first"
-  # shellcheck disable=SC1090
-  pg_url="$(set +u; source "$env_file" >/dev/null 2>&1; printf '%s' "${ATTENTION_SERVER_POSTGRES_URL:-}")"
-  pg_pwfile="$(set +u; source "$env_file" >/dev/null 2>&1; printf '%s' "${ATTENTION_SERVER_POSTGRES_PASSWORD_FILE:-}")"
-  pg_ca="$(set +u; source "$env_file" >/dev/null 2>&1; printf '%s' "${ATTENTION_SERVER_POSTGRES_CA_FILE:-}")"
-  [[ -n "$pg_url" && -f "$pg_pwfile" ]] || fail "$env_file is incomplete; run setup again on a clean install"
+  [[ -f "$migrator_env" ]] || fail "no migration-role configuration at $migrator_env; run setup first"
+  pg_url="$(read_env_var "$env_file" ATTENTION_SERVER_POSTGRES_URL)"
+  pg_pwfile="$(read_env_var "$env_file" ATTENTION_SERVER_POSTGRES_PASSWORD_FILE)"
+  pg_ca="$(read_env_var "$env_file" ATTENTION_SERVER_POSTGRES_CA_FILE)"
+  mg_url="$(read_env_var "$migrator_env" HARKLIGHT_MIGRATOR_URL)"
+  mg_pwfile="$(read_env_var "$migrator_env" HARKLIGHT_MIGRATOR_PASSWORD_FILE)"
+  [[ -n "$pg_url" && -f "$pg_pwfile" && -n "$mg_url" && -f "$mg_pwfile" ]] ||
+    fail "PostgreSQL configuration is incomplete; run setup again on a clean install"
+  if [[ -f "$pgroot/cluster.port" ]]; then port="$(< "$pgroot/cluster.port")"; fi
+  detect_roles
 }
 
-# Run a client program against the configured database. The password goes in
+detect_roles() {
+  rt_name="$(psql_rt -c 'select current_user')" || fail "cannot connect as the runtime role"
+  mg_name="$(psql_mg -c 'select current_user')" || fail "cannot connect as the migration role"
+}
+
+# Run a client program as the runtime or the migration role. Passwords go in
 # the child's environment, never on a command line.
-with_db() {
+rt_run() {
   local program=$1; shift
   PGPASSWORD="$(< "$pg_pwfile")" PGSSLROOTCERT="${pg_ca:-}" PGCONNECT_TIMEOUT=10 PGOPTIONS="-c client_min_messages=warning" \
     "$pg_bin/$program" "$@"
 }
-
-psql_db() { with_db psql --no-psqlrc --quiet --tuples-only --no-align --set ON_ERROR_STOP=1 "$pg_url" "$@"; }
+mg_run() {
+  local program=$1; shift
+  PGPASSWORD="$(< "$mg_pwfile")" PGSSLROOTCERT="${pg_ca:-}" PGCONNECT_TIMEOUT=10 PGOPTIONS="-c client_min_messages=warning" \
+    "$pg_bin/$program" "$@"
+}
+psql_flags=(--no-psqlrc --quiet --tuples-only --no-align --set ON_ERROR_STOP=1)
+psql_rt() { rt_run psql "${psql_flags[@]}" "$pg_url" "$@"; }
+psql_mg() { mg_run psql "${psql_flags[@]}" "$mg_url" "$@"; }
 
 psql_admin() {
-  "$pg_bin/psql" --no-psqlrc --quiet --tuples-only --no-align --set ON_ERROR_STOP=1 \
-    -h "$run_dir" -p "$port" -U "$ADMIN_ROLE" -d "${1:-postgres}"
+  "$pg_bin/psql" "${psql_flags[@]}" -h "$run_dir" -p "$port" -U "$ADMIN_ROLE" -d "${1:-postgres}"
 }
 
 user_table_count() {
-  psql_db -c "select count(*) from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.relkind in ('r','p','v','m') and n.nspname not in ('pg_catalog','information_schema') and n.nspname not like 'pg_toast%'"
+  psql_mg -c "select count(*) from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.relkind in ('r','p','v','m') and n.nspname not in ('pg_catalog','information_schema') and n.nspname not like 'pg_toast%'"
+}
+
+# Privileges the runtime role gets on one schema. Run as the migration role.
+# Objects the migration role creates later get the same data privileges by
+# default; the three lifecycle tables are read-only for the runtime role and
+# are re-restricted whenever grants are applied.
+grants_sql() {
+  local sch=$1
+  cat <<SQL
+GRANT USAGE ON SCHEMA $sch TO "$rt_name";
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA $sch TO "$rt_name";
+GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA $sch TO "$rt_name";
+ALTER DEFAULT PRIVILEGES FOR ROLE "$mg_name" IN SCHEMA $sch GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO "$rt_name";
+ALTER DEFAULT PRIVILEGES FOR ROLE "$mg_name" IN SCHEMA $sch GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO "$rt_name";
+DO \$\$
+DECLARE t text;
+BEGIN
+  FOREACH t IN ARRAY ARRAY['schema_migrations', 'import_state', 'server_identity'] LOOP
+    IF to_regclass(format('%I.%I', '$sch', t)) IS NOT NULL THEN
+      EXECUTE format('REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON %I.%I FROM "$rt_name"', '$sch', t);
+    END IF;
+  END LOOP;
+END \$\$;
+SQL
+}
+
+# Catalog check that the runtime role cannot own, alter, truncate, disable
+# triggers on or create anything. Prints one problem per line; empty = pass.
+role_problems() {
+  psql_mg <<SQL
+select 'runtime role has a privileged attribute' from pg_roles
+  where rolname = '$rt_name' and (rolsuper or rolcreatedb or rolcreaterole or rolreplication or rolbypassrls);
+select 'runtime role is a member of ' || r.rolname from pg_auth_members m
+  join pg_roles r on r.oid = m.roleid join pg_roles u on u.oid = m.member where u.rolname = '$rt_name';
+select 'runtime role owns or can act as the owner of ' || n.nspname || '.' || c.relname
+  from pg_class c join pg_namespace n on n.oid = c.relnamespace
+  where n.nspname not in ('pg_catalog','information_schema') and n.nspname not like 'pg_toast%'
+    and c.relkind in ('r','p','v','m','S') and pg_has_role('$rt_name', c.relowner, 'USAGE');
+select 'runtime role can ' || p || ' ' || n.nspname || '.' || c.relname
+  from pg_class c join pg_namespace n on n.oid = c.relnamespace, unnest(array['TRUNCATE','REFERENCES','TRIGGER']) p
+  where n.nspname not in ('pg_catalog','information_schema') and n.nspname not like 'pg_toast%'
+    and c.relkind in ('r','p') and has_table_privilege('$rt_name', c.oid, p);
+select 'runtime role can write lifecycle table ' || n.nspname || '.' || c.relname
+  from pg_class c join pg_namespace n on n.oid = c.relnamespace, unnest(array['INSERT','UPDATE','DELETE']) p
+  where n.nspname = '$schema' and c.relname in ('schema_migrations','import_state','server_identity')
+    and has_table_privilege('$rt_name', c.oid, p);
+select 'runtime role can create in schema ' || n.nspname from pg_namespace n
+  where n.nspname not in ('pg_catalog','information_schema') and n.nspname not like 'pg_toast%'
+    and (has_schema_privilege('$rt_name', n.oid, 'CREATE') or pg_has_role('$rt_name', n.nspowner, 'USAGE'));
+select 'runtime role can create schemas in the database'
+  where has_database_privilege('$rt_name', current_database(), 'CREATE');
+select 'runtime role and migration role are the same' where '$rt_name' = '$mg_name';
+SQL
+}
+
+check_roles() {
+  local problems
+  problems="$(role_problems)" || fail "could not check the runtime role's privileges"
+  if [[ -n "$problems" ]]; then
+    printf '%s\n' "$problems" >&2
+    fail "the runtime role has more privilege than allowed; refusing"
+  fi
+}
+
+# Exercise the privilege boundary for real in a throwaway schema.
+probe_boundary() {
+  local sch=hk_probe_$$
+  if ! ( probe_body "$sch" ); then
+    psql_mg -c "drop schema if exists $sch cascade" >/dev/null 2>&1 || true
+    exit 1
+  fi
+  psql_mg -c "drop schema if exists $sch cascade" >/dev/null
+  note "privilege boundary verified: runtime role cannot truncate, alter, drop, create, disable triggers or write lifecycle tables"
+}
+
+probe_body() {
+  local sch=$1 sql
+  psql_mg >/dev/null <<SQL
+create schema $sch;
+create table $sch.t(id int primary key, v text);
+create function $sch.noop() returns trigger language plpgsql as \$\$ begin return new; end \$\$;
+create trigger t_noop before insert on $sch.t for each row execute function $sch.noop();
+create table $sch.schema_migrations(version int);
+create table $sch.import_state(x int);
+create table $sch.server_identity(x int);
+$(grants_sql "$sch")
+SQL
+  psql_rt >/dev/null -c "insert into $sch.t values (1,'a'); update $sch.t set v='b'; select * from $sch.t; delete from $sch.t" ||
+    fail "the runtime role cannot use its granted data privileges"
+  psql_rt >/dev/null -c "select * from $sch.import_state; select * from $sch.schema_migrations; select * from $sch.server_identity" ||
+    fail "the runtime role cannot read the lifecycle tables"
+  local -a denied=(
+    "truncate $sch.t"
+    "alter table $sch.t add column z int"
+    "alter table $sch.t disable trigger all"
+    "alter table $sch.t disable trigger t_noop"
+    "alter table $sch.t owner to \"$rt_name\""
+    "drop table $sch.t"
+    "create table $sch.extra(i int)"
+    "create schema hk_runtime_schema_$$"
+    "insert into $sch.import_state values (1)"
+    "update $sch.schema_migrations set version = 1"
+    "delete from $sch.server_identity"
+    "drop trigger t_noop on $sch.t"
+  )
+  for sql in "${denied[@]}"; do
+    if psql_rt >/dev/null 2>&1 -c "$sql"; then
+      fail "boundary failure: the runtime role was allowed to: $sql"
+    fi
+  done
 }
 
 wait_ready() {
@@ -256,7 +395,7 @@ do_preflight() {
 write_env_file() {
   local url=$1 pwfile=$2 ca=${3:-}
   {
-    printf '# Written by harklight-postgres setup. PostgreSQL backend connection.\n'
+    printf '# Written by harklight-postgres setup. Runtime (non-owner) PostgreSQL connection.\n'
     printf '# The backend stays off until you also set ATTENTION_SERVER_STORE_BACKEND=postgres in server.env.\n'
     printf 'export ATTENTION_SERVER_POSTGRES_URL=%q\n' "$url"
     printf 'export ATTENTION_SERVER_POSTGRES_PASSWORD_FILE=%q\n' "$pwfile"
@@ -265,24 +404,38 @@ write_env_file() {
   mv -- "$env_file.tmp" "$env_file"
 }
 
+write_migrator_env() {
+  local url=$1 pwfile=$2
+  {
+    printf '# Migration/owner role. Never source this into server.env or the Server process.\n'
+    printf 'export HARKLIGHT_MIGRATOR_URL=%q\n' "$url"
+    printf 'export HARKLIGHT_MIGRATOR_PASSWORD_FILE=%q\n' "$pwfile"
+  } > "$migrator_env"
+  chmod 600 "$migrator_env"
+}
+
 created_pgroot=0
 work=""
 setup_cleanup() {
   local status=$?
   if ((status != 0 && created_pgroot)); then
-    printf 'setup failed; removing the cluster this run created\n' >&2
-    if ((use_service)); then
-      systemctl_user disable --now "$UNIT" >/dev/null 2>&1 || true
-      rm -f -- "$unit_dir/$UNIT" "$unit_dir/$SERVER_UNIT.d/postgres.conf"
-      rmdir "$unit_dir/$SERVER_UNIT.d" 2>/dev/null || true
-      systemctl_user daemon-reload >/dev/null 2>&1 || true
-    else
-      "$pg_bin/pg_ctl" -D "$data_dir" -m immediate stop >/dev/null 2>&1 || true
+    printf 'setup failed; removing what this run created\n' >&2
+    if [[ -d "$data_dir" ]]; then
+      if ((use_service)); then
+        systemctl_user disable --now "$UNIT" >/dev/null 2>&1 || true
+        rm -f -- "$unit_dir/$UNIT" "$unit_dir/$SERVER_UNIT.d/postgres.conf"
+        rmdir "$unit_dir/$SERVER_UNIT.d" 2>/dev/null || true
+        systemctl_user daemon-reload >/dev/null 2>&1 || true
+      else
+        "$pg_bin/pg_ctl" -D "$data_dir" -m immediate stop >/dev/null 2>&1 || true
+      fi
     fi
     rm -rf -- "$pgroot"
-    rm -f -- "$env_file.tmp"
+    rm -f -- "$env_file" "$env_file.tmp"
   fi
 }
+
+new_password() { openssl rand -hex 24; }
 
 do_setup_local() {
   do_preflight local
@@ -294,18 +447,22 @@ do_setup_local() {
   created_pgroot=1
   mkdir -m 700 -- "$run_dir"
 
-  local password
-  password="$(openssl rand -hex 24)"
-  printf '%s\n' "$password" > "$local_password_file"
-  chmod 600 "$local_password_file"
+  local rt_pw mg_pw
+  rt_pw="$(new_password)"; mg_pw="$(new_password)"
+  printf '%s\n' "$rt_pw" > "$local_password_file"
+  printf '%s\n' "$mg_pw" > "$migrator_password"
+  chmod 600 "$local_password_file" "$migrator_password"
 
   "$pg_bin/initdb" -D "$data_dir" -U "$ADMIN_ROLE" --auth-local=peer --auth-host=reject \
     --encoding=UTF8 --locale=C.UTF-8 --data-checksums >/dev/null
   cat > "$data_dir/pg_hba.conf" <<EOF
-# Harklight dedicated cluster: loopback only, one role, one database.
+# Harklight dedicated cluster: loopback only, two roles, one database.
 local   all        $ADMIN_ROLE   peer map=harklight
-host    $DBNAME    $ROLE       127.0.0.1/32   scram-sha-256
+host    $DBNAME    $ROLE         127.0.0.1/32   scram-sha-256
+host    $DBNAME    $MIGRATOR     127.0.0.1/32   scram-sha-256
 EOF
+  printf 'harklight   %s   %s\n' "$(id -un)" "$ADMIN_ROLE" > "$data_dir/pg_ident.conf"
+  chmod 600 "$data_dir/pg_hba.conf" "$data_dir/pg_ident.conf"
   cat >> "$data_dir/postgresql.conf" <<EOF
 
 # Harklight dedicated cluster settings.
@@ -315,8 +472,7 @@ unix_socket_directories = '$run_dir'
 unix_socket_permissions = 0700
 password_encryption = scram-sha-256
 EOF
-  printf 'harklight   %s   %s\n' "$(id -un)" "$ADMIN_ROLE" > "$data_dir/pg_ident.conf"
-  chmod 600 "$data_dir/pg_hba.conf" "$data_dir/pg_ident.conf"
+  printf '%s\n' "$port" > "$pgroot/cluster.port"
 
   if ((use_service)); then
     mkdir -p -- "$unit_dir"
@@ -350,61 +506,113 @@ EOF
   wait_ready || fail "the new PostgreSQL cluster did not become ready; see $pgroot/postgres.log or journalctl --user -u $UNIT"
 
   psql_admin postgres >/dev/null <<EOF
-CREATE ROLE $ROLE LOGIN PASSWORD '$password';
-CREATE DATABASE $DBNAME OWNER $ROLE ENCODING 'UTF8' TEMPLATE template0;
+CREATE ROLE $MIGRATOR LOGIN PASSWORD '$mg_pw' NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+CREATE ROLE $ROLE LOGIN PASSWORD '$rt_pw' NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+CREATE DATABASE $DBNAME OWNER $MIGRATOR ENCODING 'UTF8' TEMPLATE template0;
 REVOKE ALL ON DATABASE $DBNAME FROM PUBLIC;
+GRANT CONNECT ON DATABASE $DBNAME TO $ROLE;
 EOF
-  local url="postgres://$ROLE@127.0.0.1:$port/$DBNAME"
-  write_env_file "$url" "$local_password_file"
+  write_env_file "postgres://$ROLE@127.0.0.1:$port/$DBNAME?sslmode=disable" "$local_password_file"
+  write_migrator_env "postgres://$MIGRATOR@127.0.0.1:$port/$DBNAME?sslmode=disable" "$migrator_password"
   load_config
-  [[ "$(psql_db -c 'select current_user')" == "$ROLE" ]] || fail "the new role cannot connect over loopback"
+  psql_mg -c 'revoke create on schema public from public' >/dev/null
+  [[ "$(psql_rt -c 'select current_user')" == "$ROLE" ]] || fail "the runtime role cannot connect over loopback"
+  [[ "$(psql_mg -c 'select current_user')" == "$MIGRATOR" ]] || fail "the migration role cannot connect over loopback"
+  check_roles
+  probe_boundary
   trap - EXIT
-  note "PostgreSQL cluster created: data $data_dir, loopback port $port, role $ROLE, database $DBNAME."
-  note "Connection settings: $env_file"
-  note "To use it, add this line to $state/server.env and restart Harklight Server (the backend is opt-in):"
+  note "PostgreSQL cluster created: data $data_dir, loopback port $port, database $DBNAME."
+  note "Roles: $MIGRATOR owns the schema and runs migrations (credentials in $pgroot, outside the state directory); $ROLE is the non-owner runtime login."
+  note "Runtime connection settings: $env_file"
+  note "To use it, add these lines to $state/server.env and restart Harklight Server (the backend is opt-in):"
   note "  export ATTENTION_SERVER_STORE_BACKEND=postgres"
   note "  source $env_file"
+  note "After the schema is migrated, run: harklight-postgres apply-grants && harklight-postgres verify-roles"
 }
 
 do_setup_remote() {
-  [[ -n "$password_file" && -f "$password_file" ]] || fail "--password-file must name an existing file"
+  [[ -n "$password_file" && -f "$password_file" ]] || fail "--password-file must name the runtime role's password file"
+  [[ -n "$migrator_url" && -n "$migrator_password_file" && -f "$migrator_password_file" ]] ||
+    fail "a remote database needs --migrator-url and --migrator-password-file for a separate owner role"
   find_pg_bin
   require_tools psql pg_dump pg_restore
   [[ -d "$state" ]] || fail "state directory $state does not exist; bootstrap Harklight first"
-  [[ ! -e "$env_file" ]] || fail "$env_file already exists; PostgreSQL is already configured for this state"
-  [[ "$remote_url" =~ ^postgres(ql)?:// ]] || fail "--remote-url must be a postgres:// URL without a password"
-  if [[ "$remote_url" =~ ://[^/@]*:[^/@]*@ ]]; then fail "do not put a password in the URL; use --password-file"; fi
+  [[ ! -e "$env_file" && ! -e "$pgroot" ]] || fail "PostgreSQL is already configured for this install"
+  local u
+  for u in "$remote_url" "$migrator_url"; do
+    [[ "$u" =~ ^postgres(ql)?:// ]] || fail "database URLs must be postgres:// URLs without a password"
+    if [[ "$u" =~ ://[^/@]*:[^/@]*@ ]]; then fail "do not put a password in a URL; use password files"; fi
+  done
+  [[ "$remote_url" != "$migrator_url" ]] || fail "the runtime and migration roles must be different roles"
   pg_url=$remote_url pg_pwfile=$password_file pg_ca=$ca_file
-  local num count major
-  num="$(psql_db -c 'show server_version_num')" || fail "cannot connect to the remote database"
+  mg_url=$migrator_url mg_pwfile=$migrator_password_file
+  local num count major host
+  num="$(psql_mg -c 'show server_version_num')" || fail "cannot connect to the remote database as the migration role"
+  psql_rt -c 'select 1' >/dev/null || fail "cannot connect to the remote database as the runtime role"
+  [[ "$(psql_rt -c 'select current_user')" != "$(psql_mg -c 'select current_user')" ]] || fail "the runtime and migration roles must be different roles"
   major=$((num / 10000))
   ((major >= MIN_PG_MAJOR)) || fail "the remote PostgreSQL is version $major; $MIN_PG_MAJOR or newer is required"
   count="$(user_table_count)"
-  [[ "$count" == 0 ]] || fail "the remote database already holds $count objects; Harklight never repurposes an existing database. Create an empty database and a role dedicated to Harklight"
-  psql_db -c 'create table harklight_setup_probe(x int); drop table harklight_setup_probe' >/dev/null ||
-    fail "the role cannot create tables in the remote database"
+  [[ "$count" == 0 ]] || fail "the remote database already holds $count objects; Harklight never repurposes an existing database. Create an empty database with a dedicated owner and runtime role"
+  host="${remote_url#*@}"; host="${host%%[:/?]*}"
+  case "$host" in
+    127.0.0.1|localhost|::1|\[::1\]) ;;
+    *) [[ "$remote_url" == *sslmode=verify-full* && "$migrator_url" == *sslmode=verify-full* ]] ||
+         note "warning: $host is not loopback; use sslmode=verify-full in both URLs (and --ca-file when needed) so the connection is verified" ;;
+  esac
+  detect_roles
+  check_roles
+  probe_boundary
+  mkdir -m 700 -p -- "$pgroot"
+  write_migrator_env "$migrator_url" "$migrator_password_file"
   write_env_file "$remote_url" "$password_file" "$ca_file"
-  note "Remote PostgreSQL recorded in $env_file (server version $major, database empty)."
-  note "To use it, add this line to $state/server.env and restart Harklight Server (the backend is opt-in):"
+  note "Remote PostgreSQL recorded (server version $major, database empty, runtime role verified non-owner)."
+  note "Runtime connection settings: $env_file; migration role: $migrator_env"
+  note "To use it, add these lines to $state/server.env and restart Harklight Server (the backend is opt-in):"
   note "  export ATTENTION_SERVER_STORE_BACKEND=postgres"
   note "  source $env_file"
+  note "After the schema is migrated, run: harklight-postgres apply-grants && harklight-postgres verify-roles"
+}
+
+do_apply_grants() {
+  find_pg_bin
+  load_config
+  [[ "$schema" =~ ^[a-z_][a-z0-9_]*$ ]] || fail "invalid schema name"
+  [[ "$(psql_mg -c "select count(*) from pg_namespace where nspname = '$schema'")" == 1 ]] ||
+    fail "schema $schema does not exist yet; run the migration first"
+  grants_sql "$schema" | psql_mg >/dev/null
+  note "runtime role privileges applied to schema $schema"
+  check_roles
+  note "runtime role verified: non-owner, no TRUNCATE, no ALTER, no trigger control, lifecycle tables read-only"
+}
+
+do_verify_roles() {
+  find_pg_bin
+  load_config
+  check_roles
+  probe_boundary
+  note "runtime role verified"
 }
 
 do_status() {
   find_pg_bin
   load_config
-  note "configuration: $env_file"
-  note "database url:  $pg_url"
+  note "runtime configuration:   $env_file"
+  note "runtime database url:    $pg_url"
   if command -v systemctl >/dev/null 2>&1 && [[ -f "$unit_dir/$UNIT" ]]; then
-    note "service:       $(systemctl_user is-active "$UNIT" 2>/dev/null || true)"
+    note "service:                 $(systemctl_user is-active "$UNIT" 2>/dev/null || true)"
   fi
-  if psql_db -c 'select 1' >/dev/null 2>&1; then
-    note "connection:    ok, server $(psql_db -c 'show server_version'), $(user_table_count) tables, $(psql_db -c 'select pg_size_pretty(pg_database_size(current_database()))')"
+  if psql_rt -c 'select 1' >/dev/null 2>&1 && psql_mg -c 'select 1' >/dev/null 2>&1; then
+    note "connections:             ok (runtime and migration roles), server $(psql_mg -c 'show server_version'), $(user_table_count) tables, $(psql_mg -c 'select pg_size_pretty(pg_database_size(current_database()))')"
   else
-    note "connection:    FAILED"
+    note "connections:             FAILED"
     exit 1
   fi
-  note "free disk:     $(free_mb "$root") MB under $root"
+  local problems
+  problems="$(role_problems 2>/dev/null || true)"
+  if [[ -n "$problems" ]]; then note "role boundary:           PROBLEMS"; printf '%s\n' "$problems"; exit 1; fi
+  note "role boundary:           ok"
+  note "free disk:               $(free_mb "$root") MB under $root"
 }
 
 # ------------------------------------------------------- backup / restore
@@ -427,10 +635,10 @@ do_backup() {
   load_config
   [[ -d "$state" ]] || fail "state directory $state does not exist"
   guard_server_stopped
-  psql_db -c 'select 1' >/dev/null || fail "cannot connect to the database"
+  psql_mg -c 'select 1' >/dev/null || fail "cannot connect to the database"
 
   local dbmb statemb need have
-  dbmb="$(psql_db -c 'select (pg_database_size(current_database()) / 1048576) + 1')"
+  dbmb="$(psql_mg -c 'select (pg_database_size(current_database()) / 1048576) + 1')"
   statemb="$(tree_mb "$state")"
   need=$(((dbmb + statemb) * 2 + 16))
   have="$(free_mb "$(dirname -- "$out")")"
@@ -438,12 +646,12 @@ do_backup() {
 
   work="$(mktemp -d "$(dirname -- "$out")/.harklight-backup.XXXXXX")"
   trap 'rm -rf -- "$work"' EXIT
-  with_db pg_dump --format=custom --no-owner --no-privileges --file "$work/database.dump" "$pg_url"
+  mg_run pg_dump --format=custom --no-owner --no-privileges --file "$work/database.dump" "$mg_url"
   tar -C "$state" --exclude=./postgres.env --exclude='./*.password' -cf "$work/state.tar" .
   {
     printf 'format=%s\n' "$BACKUP_FORMAT"
     printf 'created=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    printf 'postgres_server=%s\n' "$(psql_db -c 'show server_version')"
+    printf 'postgres_server=%s\n' "$(psql_mg -c 'show server_version')"
     printf 'database_sha256=%s\n' "$(sha "$work/database.dump")"
     printf 'state_sha256=%s\n' "$(sha "$work/state.tar")"
     printf 'tables=%s\n' "$(user_table_count)"
@@ -474,7 +682,7 @@ do_restore() {
   grep -Fqx "state_sha256=$(sha "$work/state.tar")" "$work/MANIFEST" || fail "state checksum differs; the archive is damaged"
   if tar -tf "$work/state.tar" | grep -Eq '(^|/)\.\.(/|$)|^/'; then fail "the state archive has unsafe paths"; fi
 
-  psql_db -c 'select 1' >/dev/null || fail "cannot connect to the database"
+  psql_mg -c 'select 1' >/dev/null || fail "cannot connect to the database"
   local existing
   existing="$(user_table_count)"
   if [[ "$existing" != 0 ]] && ((!replace)); then
@@ -482,24 +690,31 @@ do_restore() {
   fi
 
   if [[ "$existing" != 0 ]]; then
-    if [[ -d "$data_dir" ]] && [[ "$pg_url" == *"127.0.0.1:$port/$DBNAME" ]]; then
+    if [[ -f "$pgroot/cluster.port" && -d "$data_dir" ]]; then
       psql_admin postgres >/dev/null <<EOF
 DROP DATABASE $DBNAME WITH (FORCE);
-CREATE DATABASE $DBNAME OWNER $ROLE ENCODING 'UTF8' TEMPLATE template0;
+CREATE DATABASE $DBNAME OWNER $MIGRATOR ENCODING 'UTF8' TEMPLATE template0;
 REVOKE ALL ON DATABASE $DBNAME FROM PUBLIC;
+GRANT CONNECT ON DATABASE $DBNAME TO $ROLE;
 EOF
+      psql_mg -c 'revoke create on schema public from public' >/dev/null
     else
-      psql_db -c 'drop owned by current_user cascade' >/dev/null
-      psql_db -c 'create schema if not exists public' >/dev/null
+      psql_mg -c 'drop owned by current_user cascade' >/dev/null
+      psql_mg -c 'create schema if not exists public' >/dev/null
     fi
   fi
-  with_db pg_restore --no-owner --no-privileges --exit-on-error --single-transaction \
-    --dbname "$pg_url" "$work/database.dump"
+  mg_run pg_restore --no-owner --no-privileges --exit-on-error --single-transaction \
+    --dbname "$mg_url" "$work/database.dump"
 
   local expected got
   expected="$(sed -n 's/^tables=//p' "$work/MANIFEST")"
   got="$(user_table_count)"
   [[ "$expected" == "$got" ]] || fail "restored $got tables but the backup recorded $expected"
+  # Grants are not part of the dump; give the runtime role its privileges back.
+  if [[ "$(psql_mg -c "select count(*) from pg_namespace where nspname = '$schema'")" == 1 ]]; then
+    grants_sql "$schema" | psql_mg >/dev/null
+  fi
+  check_roles
 
   # Swap the state directory only after the database restored cleanly.
   local staged="$work/state" previous=""
@@ -521,6 +736,8 @@ case "$cmd" in
   setup)
     if [[ -n "$remote_url" ]]; then do_setup_remote; else do_setup_local; fi ;;
   status) do_status ;;
+  apply-grants) do_apply_grants ;;
+  verify-roles) do_verify_roles ;;
   backup) do_backup ;;
   restore) do_restore ;;
   *) usage ;;
