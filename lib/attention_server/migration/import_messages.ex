@@ -5,8 +5,8 @@ defmodule AttentionServer.Migration.ImportMessages do
   alias AttentionServer.ClientAPI.Resources
   alias AttentionServer.JSON
 
-  # Ordinary messages only. Shared messages and historical actors have distinct
-  # mappings; all source facts remain intact and the target stays unpublished.
+  # Ordinary and Hosted notice records. Shared messages have a distinct mapping;
+  # all source facts remain intact and the target stays unpublished.
   def run(db, identity, root) do
     with :ok <- ImportAccounts.run(db, identity, root),
          {:ok, manifest, _} <- Bundle.verify(root),
@@ -67,8 +67,8 @@ defmodule AttentionServer.Migration.ImportMessages do
   defp revisions(db, id, record, revisions) do
     Enum.reduce_while(Enum.sort(revisions), :ok, fn {revision, body}, :ok ->
       # FORMAT32 retains the first and latest revision timestamps, but not
-      # intermediate timestamps. Refuse missing data until the schema supports
-      # unknown historical timestamps; do not invent one from another revision.
+      # intermediate timestamps. Schema 002 preserves these as NULL rather than
+      # inventing a timestamp from another revision.
       at =
         cond do
           revision == 1 -> record.accepted_at
@@ -76,7 +76,7 @@ defmodule AttentionServer.Migration.ImportMessages do
           true -> nil
         end
 
-      if is_integer(at) do
+      if is_nil(at) or is_integer(at) do
         case execute(db,
                "INSERT INTO harklight.message_revisions(message_id,revision,accepted_at_ms,body) VALUES ($1,$2,$3,$4::text::jsonb)",
                [id, revision, at, encode(body)]) do
@@ -84,7 +84,7 @@ defmodule AttentionServer.Migration.ImportMessages do
           error -> {:halt, error}
         end
       else
-        {:halt, {:error, :historical_revision_timestamp_unavailable}}
+        {:halt, {:error, :invalid_revision_timestamp}}
       end
     end)
   end
