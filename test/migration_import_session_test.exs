@@ -655,6 +655,8 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         verify_recipient_drift(db, identity, bundle)
         verify_authority_drift(db, identity, bundle)
         verify_account_drift(db, identity, bundle)
+        verify_allocation_bounds(db, root)
+        assert {:ok, _} = AttentionServer.Migration.VerifyAccounts.run(db, identity, bundle)
         verify_conversation_drift(db, identity, bundle)
         verify_ordinary_entry_uploads(db, identity, bundle)
         assert {:ok, %{references: 0}} = AttentionServer.Migration.VerifyLargeText.run(db, identity, bundle)
@@ -2049,6 +2051,61 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
           Postgrex.rollback(tx, :synthetic_drift)
         end)
         assert {:ok, ^counts} = verifier.run(db, identity, bundle)
+      end
+    end
+
+    defp verify_allocation_bounds(db, root) do
+      alias AttentionServer.Migration.VerifyAllocationBounds
+      assert {:ok, %{rows: [[person]]}} = ImportSession.query(db,
+        "SELECT id FROM harklight.people ORDER BY id LIMIT 1", [])
+      cases = [
+        {"accepted", "", "", {:row, :persons, person},
+         [{{:row, :messages, {person, "synthetic", "id"}}, %{accepted_seq: 2}}]},
+        {"accepted", "", "", {:row, :persons, person},
+         [{{:row, :events, {person, 2}}, %{}}]},
+        {"free_order", "", "", {:row, :free_order_highs, person},
+         [{{:row, :messages, {person, "synthetic", "id"}}, %{accepted_seq: 0, free_order: 2}}]},
+        {"free_order", "", "", {:row, :free_order_highs, person},
+         [{{:row, :conversation_events, {person, 0}}, %{free_order: 2}}]},
+        {"conversation", "", "", {:row, :conversation_highs, person},
+         [{{:row, :conversation_events, {person, 2}}, %{}}]},
+        {"origin_feed", "synthetic-origin", "", {:origin_feed, {person, "synthetic-origin"}, :high},
+         [{{:origin_feed, {person, "synthetic-origin"}, {:entry, 2}}, %{}}]},
+        {"origin_feed", "synthetic-origin", "", {:origin_feed, {person, "synthetic-origin"}, :high},
+         [{{:origin_feed, {person, "synthetic-origin"}, {:delivery_ack, 2}}, %{}}]},
+        {"advisory_feed", "synthetic-origin", "synthetic-session",
+         {:advisory, {person, "synthetic-origin", "synthetic-session"}, :high},
+         [{{:advisory, {person, "synthetic-origin", "synthetic-session"}, {:entry, 2}}, %{}}]}
+      ]
+      for {kind, origin, handle, address, retained} <- cases do
+        assert {:error, :synthetic_drift} = Postgrex.transaction(db, fn tx ->
+          # Keep unrelated zero-bound allocators present; only the selected
+          # counter is made inconsistent with its own retained value.
+          for other <- ["accepted", "conversation"] do
+            assert {:ok, _} = ImportSession.query(tx,
+              "INSERT INTO harklight.allocation_highs VALUES($1,'','',$2,1000) ON CONFLICT(person_id,origin_key,session_handle,kind) DO UPDATE SET high=1000", [person, other])
+          end
+          params = [person, origin, handle, kind]
+          assert {:ok, _} = ImportSession.query(tx,
+            "INSERT INTO harklight.allocation_highs VALUES($1,$2,$3,$4,1) ON CONFLICT(person_id,origin_key,session_handle,kind) DO UPDATE SET high=1", params)
+          # Real checksum-validated source frames also contain high=1: this is
+          # not merely source/destination drift. Both copies agree but are low.
+          file = Path.join(root, "low-high-#{System.unique_integer([:positive])}.frames")
+          assert {:ok, low} = Frames.write(file, [{address, 1} | retained])
+          assert {:error, {:allocation_bound_mismatch, ^kind, _}} = VerifyAllocationBounds.run(tx, file, low)
+          File.rm!(file)
+          assert {:ok, missing} = Frames.write(file, retained)
+          assert {:ok, _} = ImportSession.query(tx,
+            "DELETE FROM harklight.allocation_highs WHERE person_id=$1 AND origin_key=$2 AND session_handle=$3 AND kind=$4", params)
+          assert {:error, {:allocation_bound_mismatch, ^kind, _}} = VerifyAllocationBounds.run(tx, file, missing)
+          File.rm!(file)
+          assert {:ok, adequate} = Frames.write(file, [{address, 2} | retained])
+          assert {:ok, _} = ImportSession.query(tx,
+            "INSERT INTO harklight.allocation_highs VALUES($1,$2,$3,$4,2)", params)
+          assert :ok = VerifyAllocationBounds.run(tx, file, adequate)
+          File.rm!(file)
+          Postgrex.rollback(tx, :synthetic_drift)
+        end)
       end
     end
 
