@@ -435,3 +435,17 @@ entire text into memory. It never infers a reference from marker-looking literal
 text. This is source preparation only; PostgreSQL chunk publication, normalized
 reference projection and client wire parity require the landed large-text schema
 and consumer and remain separate validation gates.
+
+The packaged read-only command `bin/harklight-migration status --receipt PATH`
+uses the private migrator environment (`HARKLIGHT_MIGRATOR_URL`,
+`HARKLIGHT_MIGRATOR_PASSWORD_FILE`, optional `HARKLIGHT_MIGRATOR_CA_FILE`). It reports
+actual import phase, immutable identity, validated digest and checkpoint counts
+as contract-version-1 JSON, or refuses a mismatched identity. It never creates a
+schema, claims a destination, starts Server or changes lifecycle state.
+
+`ImportReceipt.open/2` is the internal pre-claim receipt step. It verifies the
+bundle, creates a private receipt before database changes, and preserves the
+original import UUID and pinned schema digest on every resume. An existing receipt
+for another bundle is refused. A receipt alone is not evidence of imported data.
+The full import/validate/activate commands remain unavailable until their gates
+are implemented.

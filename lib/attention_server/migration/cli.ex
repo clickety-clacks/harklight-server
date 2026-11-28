@@ -2,6 +2,14 @@ defmodule AttentionServer.Migration.CLI do
   @moduledoc false
   alias AttentionServer.Migration.Bundle
 
+  def run(["status", "--receipt", path]) do
+    with {:ok, identity} <- AttentionServer.Migration.ImportReceipt.load(path) do
+      AttentionServer.Migration.Connection.with_connection(System.get_env(), fn db ->
+        AttentionServer.Migration.ImportStatus.read(db, identity)
+      end)
+    end
+  end
+
   def run(["verify", directory]) do
     case Bundle.verify(directory) do
       {:ok, manifest, summary} -> {:ok, public_summary(manifest, summary, "verify")}
