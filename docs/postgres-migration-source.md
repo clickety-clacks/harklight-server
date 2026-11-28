@@ -409,3 +409,10 @@ the captured source configuration alone. A foreign key, CA, configured path,
 changed source file or pin mismatch refuses staging. Unknown material kinds
 remain refused until they have an explicit typed continuity mapping. Final
 material completeness and activation are still separate unfinished gates.
+
+The known installer byproducts `tls/server.csr`, `tls/server.ext`, `tls/ca.srl`
+and optional `owner/sign-in-link.txt` are preserved byte for byte in private
+staging. Their captured source paths must be those names beneath the directory
+containing the captured `server.env`. They do not choose the Server's runtime
+identity; a saved sign-in link remains private. Other undeclared identity kinds
+still refuse and must not be silently omitted from a backup or import.

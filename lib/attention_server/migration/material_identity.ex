@@ -4,7 +4,10 @@ defmodule AttentionServer.Migration.MaterialIdentity do
   alias AttentionServer.Migration.{Frames, MaterialProvenance}
 
   @owner_files ~w(material/person-id material/owner/identity.pem material/owner/identity.key)
-  @supported ["material/server.env" | @owner_files]
+  # Installer byproducts and a saved bearer link do not select Server identity.
+  # Preserve them privately, bound to their paths beside captured server.env.
+  @auxiliary ~w(material/tls/server.csr material/tls/server.ext material/tls/ca.srl material/owner/sign-in-link.txt)
+  @supported ["material/server.env" | @owner_files] ++ @auxiliary
 
   # These are typed standard self-host identity paths. Unknown material needs
   # an explicit continuity mapping; bytes and a bundle digest alone are not proof
@@ -21,13 +24,25 @@ defmodule AttentionServer.Migration.MaterialIdentity do
          {:ok, fingerprint} <- certificate(Path.join(bundle, "material/owner/identity.pem")),
          {:ok, ^fingerprint} <- private_key(Path.join(bundle, "material/owner/identity.key")),
          {:ok, ^fingerprint} <- owner(bundle, manifest, person),
-         :ok <- tls_identity(bundle, manifest, tls) do
+         :ok <- tls_identity(bundle, manifest, tls),
+         :ok <- auxiliary_sources(manifest) do
       :ok
     else
       false -> {:error, :unsupported_or_missing_identity_material}
       {:ok, _} -> {:error, :material_identity_source_mismatch}
       {:error, _} = error -> error
     end
+  end
+
+  defp auxiliary_sources(manifest) do
+    files = manifest.material_provenance["files"]
+    source_root = Path.dirname(files["material/server.env"]["path"])
+    if Enum.all?(@auxiliary, fn name ->
+      case Map.fetch(files, name) do
+        :error -> true
+        {:ok, entry} -> entry["path"] == Path.join(source_root, String.replace_prefix(name, "material/", ""))
+      end
+    end), do: :ok, else: {:error, :material_auxiliary_source_mismatch}
   end
 
   defp tls_identity(bundle, manifest, tls) do

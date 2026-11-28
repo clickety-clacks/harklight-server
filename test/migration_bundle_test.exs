@@ -61,6 +61,14 @@ defmodule AttentionServer.Migration.BundleTest do
         "tls/ca.key" => Path.join(certs, "ca.key")}
     ]
 
+    auxiliary = Map.new(["tls/server.csr", "tls/server.ext", "tls/ca.srl", "owner/sign-in-link.txt"], fn name ->
+      source = Path.join(root, name)
+      File.mkdir_p!(Path.dirname(source))
+      File.write!(source, "synthetic installer auxiliary #{name}")
+      {name, source}
+    end)
+    opts = Keyword.update!(opts, :material, &Map.merge(&1, auxiliary))
+
     assert {:ok, summary} = Bundle.export(path, destination, opts)
     {:ok, marker} = JSON.decode_line(File.read!(Path.join(destination, "COMPLETE.json")) <> "\n")
     assert marker["sha256"] == summary.sha256
@@ -73,6 +81,11 @@ defmodule AttentionServer.Migration.BundleTest do
 
     assert {:ok, ^manifest, ^summary} = Bundle.verify(destination)
     assert {:ok, %{"contract_version" => 1, "command" => "verify", "result" => "verified_export"}} = CLI.run(["verify", destination])
+    for {name, source} <- auxiliary do
+      assert File.read!(Path.join(destination, "material/" <> name)) == File.read!(source)
+    end
+    wrong_auxiliary = put_in(manifest, [:material_provenance, "files", "material/tls/server.csr", "path"], "/different/source/server.csr")
+    assert {:error, :material_auxiliary_source_mismatch} = AttentionServer.Migration.MaterialIdentity.validate(destination, wrong_auxiliary)
     assert manifest.material_provenance["anchor"] == "stopped_source_configuration"
     assert Enum.all?(manifest.material_provenance["files"], fn {_, entry} -> entry["before"] == entry["after"] end)
     assert manifest.data.records.count == manifest.source.records.count
