@@ -209,3 +209,16 @@ the database in `loading` and is not a complete import or activation command.
 An empty FORMAT32 epoch table has effective epoch 1 in the current Server;
 the import preserves that value. An explicitly stored positive epoch is copied
 unchanged. No new epoch is allocated during conversion.
+
+`ImportOrganizations.run/3` adds Hosted accounts, local and Hosted organizations,
+organization rosters, groups, mute state and pending invitations after the account
+stage. A missing local roster retains the current effective rule: local owners
+excluding Hosted accounts. An explicit roster is copied exactly, including an
+empty one. The local organization's typed attributes retain the original roster
+or `nil` for that implicit case. Hosted organization/account and group attributes
+preserve the entire original typed record. A Hosted group's normalized
+`hosted_ref` is the group component of its `{business, group}` reference; the
+business is the organization's `hosted_ref`, and the full tuple remains in the
+group attributes. Hosted groups retain a null manager. Existing Hosted group
+version records and deletion tombstones remain in the lossless facts staging.
+Every organization/group phase has a checkpoint and remains unpublished.
