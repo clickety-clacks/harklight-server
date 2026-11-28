@@ -1,3 +1,21 @@
+# Harklight Server v0.2.37
+
+Bundled Harklight Web 0.2.9 shows the Alarm label in priority rows when the
+Server marks a message and hides empty copy beside grouped FYI cards. Web
+continues to use Server rank for the priority list.
+
+Internal changes separate request handling from storage and narrow the data
+read for individual requests. The API, identifiers and ordering stay the same.
+In synthetic Agent send benchmarks, throughput increased and peak memory use fell.
+The release also includes an isolated compatibility check for history, receipt replay
+and cursors.
+
+The operator commit diagnostics are opt-in and off by default.
+
+**Compatibility.** Protocol 0.2, FORMAT32 and auth generation 1. Bundled Web
+is 0.2.9. Harklight Agent 0.2.12 can send an Alarm to a Server that advertises
+support.
+
 # Harklight Server v0.2.36
 
 Alarm is an ordering marker for ordinary messages. Current Alarm messages
