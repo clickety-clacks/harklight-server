@@ -19,7 +19,7 @@ Missing, incomplete, inconsistent or mismatched receipts are refused.
 The receipt is trusted output from the operator's export step, not an
 independent proof manufactured by this copy reader. `AttentionServer.Migration.Source.capture/3` gathers
 that evidence without opening, lock-probing or checkpointing the original
-through SQLite. The packaged export command follows separately. The caller
+through SQLite. The packaged export command uses these observations directly. The caller
 must stop all Server writers, background work and provisioning, and retain the
 original backup offline. Synthetic consumer tests use explicit producer
 fixtures; they are not evidence that a real service was inspected.
@@ -121,3 +121,48 @@ not attach them to public reports.
 
 Capture uses ordinary file reads, which may update source access times; content,
 size and modification time are verified unchanged.
+
+## Packaged export and verification (development)
+
+This command prepares a protected export. Import, relational validation and
+activation are not implemented by this command yet. It does not change the
+backend or start the Server. Do not use it as an upgrade route until the full
+migration release is accepted.
+
+Stop the Server and all provisioning/background writers first. Preserve the
+complete original backup. Create a private JSON material map naming every
+configuration and identity file needed to restore this installation. Its keys
+are destination basenames and values are absolute source paths, for example
+`{"server.env":"/private/backup/server.env","identity.pem":"/private/backup/identity.pem"}`.
+The command does not discover credentials, execute configuration, or print
+material values. The deployment-specific inventory remains the operator's
+responsibility; `{}` is explicit confirmation that there are no external
+material files. A future installer wrapper will supply its required inventory.
+
+```sh
+bin/harklight-migration export --source /private/backup/relay.sqlite3 \
+  --output /private/new-export --unit harklight.service \
+  --material-map /private/material.json
+bin/harklight-migration verify /private/new-export
+```
+
+For a different supervisor, replace `--unit` with both `--supervisor NAME` and
+`--stopped-evidence TEXT`. Supply actual stopped-state evidence without secrets.
+Use `--pidfile PATH` only if the deployment already has an external Server
+pidfile. Source and output must be distinct, and output must not already exist.
+
+The export contains decoded typed records, every inventoried SQL side table,
+referenced upload/large-data/staged bytes, the explicit private material, a
+source byte copy, and a manifest. Completion is written last. Both export and
+verify compare every stream's count and decoded content digest to the source
+inventory, verify per-frame and whole-file checksums, and hash every copied
+file. Missing completion, truncation, changed bytes, unknown record families
+or table columns are refused. Treat the entire directory as secret material;
+only the command's count/digest summary is suitable for evidence.
+
+Keep the successful export immutable. A failed export has no successful final
+marker and must never be imported; retry into a fresh directory after resolving
+the refusal. Do not delete or overwrite the original backup. The later import
+will own restart checkpoints and require relational closure, target readback
+and history comparison before activation. `verify` here establishes export
+integrity, not that final activation gate.
