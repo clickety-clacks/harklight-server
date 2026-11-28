@@ -114,14 +114,20 @@ defmodule AttentionServer.Repository.Postgres.Transaction do
     end)
   end
 
-  defp lock_head(person, origin) do
+  def lock_stream({person, origin}, seed) when is_integer(seed) and seed >= 0 do
+    if Repo.in_transaction?(),
+      do: lock_head(person, origin, seed),
+      else: {:error, :transaction_required}
+  end
+
+  defp lock_head(person, origin, seed \\ 0) do
     with {:ok, _} <-
            query(
              """
-             INSERT INTO harklight.stream_heads (person_id, origin_key)
-             VALUES ($1, $2) ON CONFLICT DO NOTHING
+             INSERT INTO harklight.stream_heads (person_id, origin_key, head, floor, seed_revision)
+             VALUES ($1, $2, $3, $3, $3) ON CONFLICT DO NOTHING
              """,
-             [person, origin]
+             [person, origin, seed]
            ),
          {:ok, %{rows: [[head]]}} <-
            query(
@@ -170,6 +176,8 @@ defmodule AttentionServer.Repository.Postgres.Transaction do
 
   defp append_row(person, origin, revision, change) do
     resource = [person, origin, change.kind, change.resource_id]
+    revision_kind = if origin == "" and change.kind == "item_removed", do: "item", else: change.kind
+    revision_key = [person, origin, revision_kind, change.resource_id]
 
     with {:ok, _} <-
            query(
@@ -182,7 +190,7 @@ defmodule AttentionServer.Repository.Postgres.Transaction do
                AND changes.origin_key = resources.origin_key
                AND changes.revision = resources.revision
              """,
-             resource
+             revision_key
            ),
          {:ok, _} <-
            query(
@@ -203,7 +211,7 @@ defmodule AttentionServer.Repository.Postgres.Transaction do
              ON CONFLICT (person_id, origin_key, resource_kind, resource_id)
              DO UPDATE SET revision = excluded.revision
              """,
-             resource ++ [revision, change.first_seen_at_ms]
+             revision_key ++ [revision, change.first_seen_at_ms]
            ) do
       :ok
     end

@@ -23,6 +23,10 @@ defmodule AttentionServer.Repository.Command do
     end)
   end
 
+  def execute(:postgres, %{kind: :browser} = actor, {:alerts, value, if_match}, key, at) do
+    AttentionServer.Repository.Postgres.AlertSettings.execute(actor, value, if_match, key, at)
+  end
+
   def execute(store, actor, frame, sources, at) do
     case Engine.request_command(store.engine, actor, frame, at) do
       {next, {:ok, _} = reply} -> {record_sources(next, sources), reply}
