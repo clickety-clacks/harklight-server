@@ -45,3 +45,23 @@ jobs:
             if mountpoint -q "$root"; then sudo umount "$root"; fi
             rm -rf "$root"
           fi
+
+  postgres-schema:
+    name: PostgreSQL schema
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: fixture
+          POSTGRES_PASSWORD: fixture-password
+          POSTGRES_DB: fixture
+        options: >-
+          --health-cmd "pg_isready -U fixture -d fixture"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v7
+      - name: Exercise explicit migration and FORMAT32 destinations
+        run: |
+          cat priv/postgres/001_initial.sql test/attention_server/repository/postgres_schema_v1.sql |
+            docker exec -i "${{ job.services.postgres.id }}" psql -X -v ON_ERROR_STOP=1 -U fixture -d fixture -f -
