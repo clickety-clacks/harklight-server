@@ -104,6 +104,7 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         historical = SharedMessages.historical_record(source.shared_messages[@shared], revision)
         assert read_fact(db, "shared_revision_files", {@shared, revision}) == Map.get(historical, :files, [])
       end
+      verify_link_drift(db, identity, bundle)
       alias AttentionServer.Migration.VerifySharedMessages
       assert {:ok, verified} = VerifySharedMessages.run(db, identity, bundle)
       assert verified == %{messages: 1, revisions: 2, recipients: 2}
@@ -230,6 +231,32 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         assert {:ok, message} = Attributes.decode(body)
         assert message == historical.message
       end
+    end
+
+    defp verify_link_drift(db, identity, bundle) do
+      alias AttentionServer.Migration.VerifyMessageUploads
+      assert {:ok, verified} = VerifyMessageUploads.run(db, identity, bundle, :shared)
+      assert verified.links > 0
+      for mutation <- [
+        "UPDATE harklight.message_uploads SET attributes='{}'::jsonb WHERE message_id=$1",
+        "DELETE FROM harklight.message_uploads WHERE message_id=$1",
+        "UPDATE harklight.message_uploads SET ordinal=ordinal+10 WHERE message_id=$1"
+      ] do
+        assert {:error, :synthetic_drift} = Postgrex.transaction(db, fn tx ->
+          assert {:ok, %{num_rows: n}} = ImportSession.query(tx, mutation, [@shared])
+          assert n > 0
+          assert {:error, {:message_upload_mismatch, :shared, _, _, _}} = VerifyMessageUploads.run(tx, identity, bundle, :shared)
+          Postgrex.rollback(tx, :synthetic_drift)
+        end)
+        assert {:ok, ^verified} = VerifyMessageUploads.run(db, identity, bundle, :shared)
+      end
+      assert {:error, :synthetic_drift} = Postgrex.transaction(db, fn tx ->
+        assert {:ok, _} = ImportSession.query(tx,
+          "INSERT INTO harklight.message_uploads(message_id,revision,ordinal,upload_id,attributes) SELECT message_id,revision,ordinal+100,upload_id,attributes FROM harklight.message_uploads WHERE message_id=$1", [@shared])
+        assert {:error, {:message_upload_count_mismatch, :shared}} = VerifyMessageUploads.run(tx, identity, bundle, :shared)
+        Postgrex.rollback(tx, :synthetic_drift)
+      end)
+      assert {:ok, ^verified} = VerifyMessageUploads.run(db, identity, bundle, :shared)
     end
 
     defp read_fact(db, family, key) do

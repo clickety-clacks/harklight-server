@@ -631,6 +631,15 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
           "DELETE FROM harklight.upload_chunks WHERE upload_id=$1 AND chunk_number=$2", [upload_id, chunk_count])
         assert {:ok, ^uploads_verified} = AttentionServer.Migration.VerifyUploads.run(db, identity, bundle)
 
+        assert {:ok, ordinary_links} = AttentionServer.Migration.VerifyMessageUploads.run(db, identity, bundle, :ordinary)
+        assert ordinary_links.links > 0
+        assert {:error, :synthetic_drift} = Postgrex.transaction(db, fn tx ->
+          assert {:ok, _} = ImportSession.query(tx,
+            "UPDATE harklight.message_uploads SET attributes='{}'::jsonb WHERE message_id IN (SELECT id FROM harklight.messages WHERE kind='ordinary')", [])
+          assert {:error, {:message_upload_mismatch, :ordinary, _, _, _}} = AttentionServer.Migration.VerifyMessageUploads.run(tx, identity, bundle, :ordinary)
+          Postgrex.rollback(tx, :synthetic_drift)
+        end)
+        assert {:ok, ^ordinary_links} = AttentionServer.Migration.VerifyMessageUploads.run(db, identity, bundle, :ordinary)
         verify_revision_files(db, identity, bundle, manifest)
         verify_item_facts(db, identity, bundle, manifest)
         verify_message_drift(db, identity, bundle)
