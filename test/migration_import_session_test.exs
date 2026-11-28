@@ -90,7 +90,11 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         source_path = Path.join(fixture.root, "relay.sqlite3")
         seed_advisory(source_path)
         seed_historical_messages(source_path)
+        seed_long_conversation(source_path)
         expected_organizations = seed_organizations(source_path, epoch)
+        expected_recipients = source_recipient_expectations(source_path)
+        expected_subscriptions = source_subscription_expectations(source_path)
+        expected_chats = source_chat_expectations(source_path)
         {:ok, sqlite} = Exqlite.Sqlite3.open(source_path)
 
         {:ok, rows} =
@@ -228,11 +232,11 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
 
         {:ok, manifest, _} = Bundle.verify(bundle)
 
-        identity = %{
-          id: "synthetic-import",
-          source: Base.decode16!(summary.sha256, case: :lower),
-          schema: AttentionServer.Repository.Postgres.Schema.digest()
-        }
+        receipt = Path.join(root, "import-receipt.json")
+        assert {:ok, identity} = AttentionServer.Migration.ImportReceipt.open(receipt, bundle)
+        assert identity.source == Base.decode16!(summary.sha256, case: :lower)
+        assert {:ok, %{"phase" => "unclaimed", "checkpoint_rows" => 0}} =
+          AttentionServer.Migration.ImportStatus.read(db, identity)
 
         # Refuse an already populated target rather than claiming it.
         {:ok, _} =
@@ -286,6 +290,26 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
                  end)
 
         assert one.ordinal == 1
+        assert {:ok, status} = AttentionServer.Migration.ImportStatus.read(db, identity)
+        assert status["phase"] == "loading"
+        assert status["checkpoint_families"] == 1 and status["checkpoint_rows"] == 1
+        assert status["validation_sha256"] == nil
+        assert {:error, :import_identity_mismatch} =
+          AttentionServer.Migration.ImportStatus.read(db, %{identity | schema: :crypto.hash(:sha256, "wrong schema")})
+        password_file = Path.join(root, "synthetic-db-password")
+        File.write!(password_file, config[:password])
+        File.chmod!(password_file, 0o600)
+        env = %{"HARKLIGHT_MIGRATOR_URL" => "postgres://#{config[:username]}@127.0.0.1:#{config[:port]}/#{config[:database]}",
+          "HARKLIGHT_MIGRATOR_PASSWORD_FILE" => password_file}
+        previous = Map.new(Map.keys(env), &{&1, System.get_env(&1)})
+        try do
+          System.put_env(env)
+          assert {:ok, ^status} = AttentionServer.Migration.CLI.run(["status", "--receipt", receipt])
+        after
+          Enum.each(previous, fn {key, value} ->
+            if is_nil(value), do: System.delete_env(key), else: System.put_env(key, value)
+          end)
+        end
 
         assert {:error, :checkpoint_changed} =
                  ImportSession.batch(db, identity, "interruption", zero, [:stale], fn _, _ ->
@@ -414,7 +438,79 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         assert :ok = ImportMessages.run(db, identity, bundle)
         start_supervised!({Repo, config})
         assert {:error, :postgres_not_active} = Transaction.verify_ready()
+        assert :ok = AttentionServer.Migration.ImportRecipients.run(db, identity, bundle)
+        assert :ok = AttentionServer.Migration.ImportRecipients.run(db, identity, bundle)
+        for {id, person, seen, metadata} <- expected_recipients do
+          assert {:ok, %{rows: [[^seen, actual]]}} = ImportSession.query(db,
+            "SELECT seen_revision,attributes FROM harklight.message_recipients WHERE message_id=$1 AND person_id=$2", [id, person])
+          assert {:ok, ^metadata} = Attributes.decode(actual)
+        end
+        assert {:ok, _} = ImportSession.query(db, """
+          CREATE FUNCTION harklight.fail_subscription_head() RETURNS trigger LANGUAGE plpgsql AS $$
+          BEGIN
+            IF NEW.family='device_subscription_heads' THEN RAISE EXCEPTION 'synthetic interruption'; END IF;
+            RETURN NEW;
+          END $$
+          """, [])
+        assert {:ok, _} = ImportSession.query(db, """
+          CREATE TRIGGER fail_subscription_head BEFORE INSERT ON harklight.compatibility_facts
+          FOR EACH ROW EXECUTE FUNCTION harklight.fail_subscription_head()
+          """, [])
+        assert {:error, _} = AttentionServer.Migration.ImportSubscriptions.run(db, identity, bundle)
+        assert {:ok, %{rows: [[0]]}} = ImportSession.query(db,
+          "SELECT count(*) FROM harklight.compatibility_facts WHERE family IN ('device_subscription_heads','device_subscription_senders')", [])
+        assert {:ok, %{ordinal: 0}} = ImportSession.checkpoint(db, identity, "devices/subscriptions/v1")
+        assert {:ok, _} = ImportSession.query(db,
+          "DROP TRIGGER fail_subscription_head ON harklight.compatibility_facts", [])
+        assert :ok = AttentionServer.Migration.ImportSubscriptions.run(db, identity, bundle)
+        assert :ok = AttentionServer.Migration.ImportSubscriptions.run(db, identity, bundle)
+        for {person, device, revision, senders} <- expected_subscriptions do
+          assert {:ok, %{rows: [[body]]}} = ImportSession.query(db,
+            "SELECT body FROM harklight.compatibility_facts WHERE family='device_subscription_heads' AND address=$1",
+            [Attributes.key({person, device})])
+          assert {:ok, ^revision} = Attributes.decode(body)
+          for sender <- senders do
+            assert {:ok, %{rows: [[body]]}} = ImportSession.query(db,
+              "SELECT body FROM harklight.compatibility_facts WHERE family='device_subscription_senders' AND address=$1",
+              [Attributes.key({person, device, revision, sender})])
+            assert {:ok, true} = Attributes.decode(body)
+          end
+          assert {:ok, %{rows: []}} = ImportSession.query(db,
+            "SELECT body FROM harklight.compatibility_facts WHERE family='device_subscription_senders' AND address=$1",
+            [Attributes.key({person, device, revision, "app:never-subscribed"})])
+        end
         verify_messages(db, bundle, manifest)
+        assert {:ok, _} = ImportSession.query(db, """
+          CREATE FUNCTION harklight.fail_answer() RETURNS trigger LANGUAGE plpgsql AS $$
+          BEGIN RAISE EXCEPTION 'synthetic answer interruption'; END $$
+          """, [])
+        assert {:ok, _} = ImportSession.query(db,
+          "CREATE TRIGGER fail_answer BEFORE INSERT ON harklight.answers FOR EACH ROW EXECUTE FUNCTION harklight.fail_answer()", [])
+        assert {:error, _} = AttentionServer.Migration.ImportAnswers.run(db, identity, bundle)
+        assert {:ok, %{ordinal: 0}} = ImportSession.checkpoint(db, identity, "answers/ordinary/v1")
+        assert {:ok, %{rows: [[0]]}} = ImportSession.query(db, "SELECT count(*) FROM harklight.answers", [])
+        assert {:ok, _} = ImportSession.query(db, "DROP TRIGGER fail_answer ON harklight.answers", [])
+        assert :ok = AttentionServer.Migration.ImportAnswers.run(db, identity, bundle)
+        assert :ok = AttentionServer.Migration.ImportAnswers.run(db, identity, bundle)
+        assert {:ok, answer_count} = Frames.fold(Path.join(bundle, "records.frames"), manifest.data.records, 0, fn
+          {{:row, :messages, {person, _, _} = key}, %{terminal: %{state: "answered"}} = record}, count ->
+            message = ImportMessages.id(key, record)
+            revision = Map.get(record, :revision, 1)
+            assert {:ok, %{rows: [[id, body]]}} = ImportSession.query(db,
+              "SELECT id,body FROM harklight.answers WHERE message_id=$1 AND person_id=$2 AND request_revision=$3",
+              [message, person, revision])
+            assert id == AttentionServer.Migration.ImportAnswers.id(message, revision)
+            assert {:ok, %{terminal: terminal, item_id: item_id}} = Attributes.decode(body)
+            assert terminal == record.terminal
+            assert item_id == AttentionServer.ClientAPI.Resources.item_id(record)
+            assert AttentionServer.ClientAPI.Resources.answer_outcome(record, terminal) ==
+              AttentionServer.ClientAPI.Resources.answer_outcome(record, record.terminal)
+            {:ok, count + 1}
+          _, count -> {:ok, count}
+        end)
+        assert answer_count > 0
+        assert {:ok, %{rows: [[^answer_count]]}} = ImportSession.query(db, "SELECT count(*) FROM harklight.answers", [])
+
         verify_receipt_replay(session_person, {agent_person, agent_key}, receipt_digest)
         wrong_source = %{identity | source: :crypto.hash(:sha256, "different export")}
         assert {:error, :import_source_mismatch} = ImportUploads.run(db, wrong_source, bundle)
@@ -446,6 +542,95 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         assert :ok = AttentionServer.Migration.ImportConversations.run(db, identity, bundle)
         assert :ok = AttentionServer.Migration.ImportConversations.run(db, identity, bundle)
         verify_conversation_positions(db, bundle, manifest)
+        assert {:ok, _} = ImportSession.query(db, """
+          CREATE FUNCTION harklight.fail_entry() RETURNS trigger LANGUAGE plpgsql AS $$
+          BEGIN RAISE EXCEPTION 'synthetic entry interruption'; END $$
+          """, [])
+        assert {:ok, _} = ImportSession.query(db,
+          "CREATE TRIGGER fail_entry BEFORE INSERT ON harklight.conversation_entries FOR EACH ROW EXECUTE FUNCTION harklight.fail_entry()", [])
+        assert {:error, _} = AttentionServer.Migration.ImportEntries.run(db, identity, bundle)
+        assert {:ok, %{ordinal: 0}} = ImportSession.checkpoint(db, identity, "conversations/entries/v1")
+        assert {:ok, %{rows: [[0]]}} = ImportSession.query(db, "SELECT count(*) FROM harklight.conversation_entries", [])
+        assert {:ok, _} = ImportSession.query(db, "DROP TRIGGER fail_entry ON harklight.conversation_entries", [])
+        assert :ok = AttentionServer.Migration.ImportEntries.run(db, identity, bundle)
+        assert :ok = AttentionServer.Migration.ImportEntries.run(db, identity, bundle)
+        assert {:ok, entry_count} = Frames.fold(Path.join(bundle, "records.frames"), manifest.data.records, 0, fn
+          {{:row, :conversation_events, {person, position}}, %{key: {person, sender, external}, payload: payload} = event}, count ->
+            assert {:ok, %{rows: [[id, ^position, revision, kind, body]]}} = ImportSession.query(db,
+              "SELECT e.id,e.position,e.request_revision,e.kind,e.body FROM harklight.conversation_entries e JOIN harklight.conversations c ON c.id=e.conversation_id JOIN harklight.messages m ON m.id=c.message_id WHERE m.person_id=$1 AND m.sender_id=$2 AND m.message_id=$3 AND e.position=$4",
+              [person, sender, external, position])
+            assert id == Integer.to_string(position)
+            assert revision == payload["request_revision"]
+            assert kind == payload["kind"]
+            assert {:ok, ^event} = Attributes.decode(body)
+            {:ok, count + 1}
+          _, count -> {:ok, count}
+        end)
+        assert :ok = AttentionServer.Migration.ImportChatSummary.run(db, identity, bundle)
+        assert :ok = AttentionServer.Migration.ImportChatSummary.run(db, identity, bundle)
+        for {id, expected} <- expected_chats do
+          assert {:ok, %{rows: [[body]]}} = ImportSession.query(db,
+            "SELECT attributes FROM harklight.conversations WHERE id=$1", [id])
+          assert {:ok, attributes} = Attributes.decode(body)
+          assert Map.take(attributes, [:chat_started, :latest_origin_reply_seq, :unread_replies]) == expected
+        end
+        assert entry_count > 0
+        assert {:ok, %{rows: [[^entry_count]]}} = ImportSession.query(db, "SELECT count(*) FROM harklight.conversation_entries", [])
+
+        assert {:ok, verified} = AttentionServer.Migration.VerifyFacts.run(db, identity, bundle)
+        assert verified.rows > manifest.data.records.count
+        assert {:error, :import_source_mismatch} = AttentionServer.Migration.VerifyFacts.run(db,
+          %{identity | source: :crypto.hash(:sha256, "wrong source")}, bundle)
+        address = Attributes.key({:field, :relay_instance_id})
+        assert {:ok, %{rows: [[original]]}} = ImportSession.query(db,
+          "SELECT body::text FROM harklight.compatibility_facts WHERE family='relay_instance_id' AND address=$1", [address])
+        assert {:ok, _} = ImportSession.query(db,
+          "UPDATE harklight.compatibility_facts SET body=$2::text::jsonb WHERE family='relay_instance_id' AND address=$1",
+          [address, JSON.encode!(Attributes.encode("changed synthetic identity"))])
+        assert {:error, :source_fact_mismatch} = AttentionServer.Migration.VerifyFacts.run(db, identity, bundle)
+        assert {:ok, _} = ImportSession.query(db,
+          "UPDATE harklight.compatibility_facts SET body=$2::text::jsonb WHERE family='relay_instance_id' AND address=$1", [address, original])
+        assert {:ok, %{rows: [[session_address, session_body]]}} = ImportSession.query(db,
+          "SELECT address,body::text FROM harklight.compatibility_facts WHERE family='harklight_browser_sessions' LIMIT 1", [])
+        assert {:ok, _} = ImportSession.query(db,
+          "DELETE FROM harklight.compatibility_facts WHERE family='harklight_browser_sessions' AND address=$1", [session_address])
+        assert {:error, :source_fact_mismatch} = AttentionServer.Migration.VerifyFacts.run(db, identity, bundle)
+        assert {:ok, _} = ImportSession.query(db,
+          "INSERT INTO harklight.compatibility_facts(family,address,body) VALUES('harklight_browser_sessions',$1,$2::text::jsonb)", [session_address, session_body])
+        extra = Attributes.key({:row, :persons, "synthetic unexpected person"})
+        assert {:ok, _} = ImportSession.query(db,
+          "INSERT INTO harklight.compatibility_facts(family,address,body) VALUES('persons',$1,$2::text::jsonb)",
+          [extra, JSON.encode!(Attributes.encode(1))])
+        assert {:error, :source_fact_count_mismatch} = AttentionServer.Migration.VerifyFacts.run(db, identity, bundle)
+        assert {:ok, _} = ImportSession.query(db,
+          "DELETE FROM harklight.compatibility_facts WHERE family='persons' AND address=$1", [extra])
+        assert {:ok, ^verified} = AttentionServer.Migration.VerifyFacts.run(db, identity, bundle)
+        assert {:ok, uploads_verified} = AttentionServer.Migration.VerifyUploads.run(db, identity, bundle)
+        assert uploads_verified.uploads > 0
+        assert {:ok, %{rows: [[upload_id, ordinal, bytes]]}} = ImportSession.query(db,
+          "SELECT upload_id,chunk_number,bytes FROM harklight.upload_chunks LIMIT 1", [])
+        assert {:ok, _} = ImportSession.query(db,
+          "DELETE FROM harklight.upload_chunks WHERE upload_id=$1 AND chunk_number=$2", [upload_id, ordinal])
+        assert {:error, :upload_chunk_source_mismatch} = AttentionServer.Migration.VerifyUploads.run(db, identity, bundle)
+        assert {:ok, _} = ImportSession.query(db,
+          "INSERT INTO harklight.upload_chunks(upload_id,chunk_number,bytes) VALUES($1,$2,$3)", [upload_id, ordinal, "wrong bytes"])
+        assert {:error, :upload_chunk_source_mismatch} = AttentionServer.Migration.VerifyUploads.run(db, identity, bundle)
+        assert {:ok, _} = ImportSession.query(db,
+          "UPDATE harklight.upload_chunks SET bytes=$3 WHERE upload_id=$1 AND chunk_number=$2", [upload_id, ordinal, bytes])
+        assert {:ok, %{rows: [[source_size, chunk_count]]}} = ImportSession.query(db,
+          "SELECT size_bytes,(SELECT count(*) FROM harklight.upload_chunks WHERE upload_id=$1) FROM harklight.uploads WHERE id=$1", [upload_id])
+        assert {:ok, _} = ImportSession.query(db,
+          "UPDATE harklight.uploads SET size_bytes=size_bytes+1 WHERE id=$1", [upload_id])
+        assert {:error, :upload_source_mismatch} = AttentionServer.Migration.VerifyUploads.run(db, identity, bundle)
+        assert {:ok, _} = ImportSession.query(db,
+          "UPDATE harklight.uploads SET size_bytes=$2 WHERE id=$1", [upload_id, source_size])
+        assert {:ok, _} = ImportSession.query(db,
+          "INSERT INTO harklight.upload_chunks(upload_id,chunk_number,bytes) VALUES($1,$2,$3)", [upload_id, chunk_count, "extra"])
+        assert {:error, :upload_source_mismatch} = AttentionServer.Migration.VerifyUploads.run(db, identity, bundle)
+        assert {:ok, _} = ImportSession.query(db,
+          "DELETE FROM harklight.upload_chunks WHERE upload_id=$1 AND chunk_number=$2", [upload_id, chunk_count])
+        assert {:ok, ^uploads_verified} = AttentionServer.Migration.VerifyUploads.run(db, identity, bundle)
+
         stop_supervised!(Repo)
 
         assert {:ok, :ok} =
@@ -890,6 +1075,85 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
       assert actual == File.read!(path)
       assert byte_size(actual) == size
       assert {:error, :not_found} = Uploads.read_chunk(person, id, count)
+    end
+
+    defp seed_long_conversation(path) do
+      alias AttentionServer.{Engine, Store}
+      {:ok, store} = Store.open_relay(path)
+      {key = {person, sender, external}, record} = Enum.find(store.engine.messages, fn {{_, _, id}, _} ->
+        id == "synthetic-three-revisions"
+      end)
+      {actor, _} = Enum.find(store.engine.devices, fn {device, principal} ->
+        principal.person == person and not principal.revoked and device != record.origin
+      end)
+      {engine, :ok, touched} = Engine.with_touches(store.engine, fn engine ->
+        discussion = %{"type" => "discussion", "sender_id" => sender, "message_id" => external,
+          "request_revision" => record.revision, "text" => "Synthetic multi-page conversation",
+          "op_id" => "96000000-0000-4000-8000-000000000001"}
+        {engine, {:ok, turn}} = Engine.request_command(engine, actor, discussion, record.accepted_at + 10)
+        in_reply_to = String.to_integer(turn["event_id"])
+        {engine, read_position, last_position} = Enum.reduce(1..260, {engine, nil, nil}, fn n, {current, read, _last} ->
+          reply = %{"type" => "conversation_reply", "sender_id" => sender, "message_id" => external,
+            "request_revision" => record.revision, "in_reply_to" => in_reply_to,
+            "text" => "Synthetic reply #{n}",
+            "op_id" => "96000000-0000-4000-8001-" <> String.pad_leading(Integer.to_string(n), 12, "0")}
+          {next, {:ok, fields}} = Engine.request_command(current, record.origin, reply, record.accepted_at + 10 + n)
+          {next, if(n == 128, do: fields["seq"], else: read), fields["seq"]}
+        end)
+        read = %{"type" => "conversation_read", "sender_id" => sender, "message_id" => external,
+          "read_through_conversation_seq" => read_position, "op_id" => "96000000-0000-4000-8000-000000000002"}
+        {engine, {:ok, _}} = Engine.request_command(engine, actor, read, record.accepted_at + 300)
+        chat = AttentionServer.ClientAPI.Resources.item(engine, key, %{"key" => "synthetic-rank"})["chat"]
+        assert chat["unread_replies"] == 132
+        assert chat["last_origin_reply"] == "e#{last_position}"
+        assert Enum.count(engine.conversation_events, fn {_, event} -> event.key == key end) > 256
+        {engine, :ok}
+      end)
+      {:ok, store} = Store.commit(store, {engine, touched}, %{person: person, actor: "fixture", action: "synthetic_long_chat"})
+      :ok = Store.close(store)
+    end
+
+    defp source_chat_expectations(path) do
+      {:ok, store} = AttentionServer.Store.open_relay(path)
+      expected = Enum.map(store.engine.messages, fn {key, record} ->
+        chat = AttentionServer.ClientAPI.Resources.item(store.engine, key, %{"key" => "synthetic-rank"})["chat"]
+        last = case chat["last_origin_reply"] do
+          nil -> nil
+          "e" <> position -> String.to_integer(position)
+        end
+        {ImportMessages.id(key, record), %{chat_started: chat["started"],
+          latest_origin_reply_seq: last, unread_replies: chat["unread_replies"]}}
+      end)
+      :ok = AttentionServer.Store.close(store)
+      expected
+    end
+
+    defp source_subscription_expectations(path) do
+      {:ok, store} = AttentionServer.Store.open_relay(path)
+      expected = Enum.flat_map(store.engine.devices, fn {device, %{person: person} = principal} ->
+        case Map.get(store.engine.subscriptions, {person, device}) do
+          %{revision: revision, senders: senders} -> [{person, device, revision, Enum.sort(senders)}]
+          nil -> if principal.revoked, do: [], else: [{person, device, 0, []}]
+        end
+      end)
+      :ok = AttentionServer.Store.close(store)
+      expected
+    end
+
+    defp source_recipient_expectations(path) do
+      {:ok, store} = AttentionServer.Store.open_relay(path)
+      expected = Enum.map(store.engine.messages, fn {{person, _, _} = key, record} ->
+        raw = Map.get(record, :revision, 1)
+        state = Map.get(store.engine.bounce_revisions, key, %{})
+        substantive = Map.get(Map.get(state, :raw_to_substantive, %{}), raw,
+          Map.get(state, :current_substantive_revision, raw))
+        seen = AttentionServer.ClientAPI.Resources.seen?(store.engine, key, record)
+        {ImportMessages.id(key, record), person, if(seen, do: substantive),
+          %{visible: AttentionServer.BounceDecision.person_visible?(record),
+            substantive_revision: substantive, origin_result: Map.get(record, :origin_result)}}
+      end)
+      :ok = AttentionServer.Store.close(store)
+      expected
     end
 
     defp seed_historical_messages(path) do

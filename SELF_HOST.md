@@ -684,6 +684,33 @@ private state directory (`mkdir -m 700 "$STATE"`), run `preflight` and `setup`,
 then run `restore`; it replaces that empty directory with the archived state.
 Run `harklight-postgres status` afterwards.
 
+### Migrating an existing SQLite store (not yet available)
+
+    "$PACKAGE/bin/harklight-postgres" migrate
+
+`migrate` is the installer's side of the stopped-store migration. The packaged
+`bin/harklight-migration` in this release can export and verify, but it does
+not yet implement import, validate and activate, so `migrate` detects that
+before doing anything and refuses. When the importer ships, `migrate` will, on
+every run including a resume, first prove the Server unit is inactive or failed
+with no main process (it refuses if it cannot observe that), and that the
+source store is unchanged since the backup and export (main, WAL and SHM
+fingerprints match) and held open by no process, then: write an
+immutable backup of the private install root (outside `ROOT/postgres`), export
+the store with its identity material and any files `server.env` points at
+(refusing if one cannot be captured), verify the export, import into the empty
+database as the migration role, validate, apply and verify the runtime role's
+grants, and verify the importer's staged identity material against its recorded
+digests, installing only the listed files at their original locations (never
+overwriting a differing file, and refusing material that is not private).
+`migrate` never activates the destination, never edits `server.env` and never
+starts the Server; activation is not available in this release. If any step fails, keep the old Server stopped, fix the cause and run
+`migrate --resume WORKDIR` (it repeats every check), or abandon the unpublished destination and restore
+the original backup. Rolling back to the old stack is only valid before
+PostgreSQL has accepted new writes. The orchestration is tested against a test
+double that follows the importer's recorded command contract; it has not been
+run against the real importer or real Harklight data.
+
 What this does not cover: the existing SQLite store, which still needs the
 stopped-state backup described under "Upgrade or rollback"; the installer's
 pre-upgrade backup deliberately excludes `ROOT/postgres` and does not back up

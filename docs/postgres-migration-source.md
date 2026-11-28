@@ -435,3 +435,103 @@ entire text into memory. It never infers a reference from marker-looking literal
 text. This is source preparation only; PostgreSQL chunk publication, normalized
 reference projection and client wire parity require the landed large-text schema
 and consumer and remain separate validation gates.
+
+The packaged read-only command `bin/harklight-migration status --receipt PATH`
+uses the private migrator environment (`HARKLIGHT_MIGRATOR_URL`,
+`HARKLIGHT_MIGRATOR_PASSWORD_FILE`, optional `HARKLIGHT_MIGRATOR_CA_FILE`). It reports
+actual import phase, immutable identity, validated digest and checkpoint counts
+as contract-version-1 JSON, or refuses a mismatched identity. It never creates a
+schema, claims a destination, starts Server or changes lifecycle state.
+
+`ImportReceipt.open/2` is the internal pre-claim receipt step. It verifies the
+bundle, creates a private receipt before database changes, and preserves the
+original import UUID and pinned schema digest on every resume. An existing receipt
+for another bundle is refused. A receipt alone is not evidence of imported data.
+The full import/validate/activate commands remain unavailable until their gates
+are implemented.
+
+`harklight-migration capabilities` is a read-only availability probe, with no
+receipt or database access. Contract version 1 returns `commands` and
+`migration_ready`; the latter is currently false. Installers must require true
+and all of export, verify, import, status, validate and activate before any
+migration side effect. A supported `status` alone is insufficient. Missing
+receipts return the stable `receipt_missing` refusal (exit 2), not an availability
+signal. The readiness flag will change only with the implemented full pipeline.
+
+`ImportLargeText.run/3` binds the bundle to the loading import identity, verifies
+its exact large-data source paths, and commits each bounded chunk with its
+checkpoint. It verifies an already committed prefix on resume and rehashes the
+stored chunks before publishing a shared text manifest. A separate checkpoint
+records each exact source path and marker. `project/3` replaces only those paths
+with typed PostgreSQL references; marker-looking literal text is unchanged.
+Raw FORMAT32 facts are retained. This does not activate the target or yet wire
+all normalized history projections. Ordinary/shared authorized HTTP parity and
+complete migration validation remain required before activation.
+
+Ordinary message import now runs verified LargeText publication before its
+separate `messages/large-text/v1` projection checkpoint. This additive phase also
+handles a loading destination whose ordinary records were already staged by an
+earlier importer. It replaces exact source markers in normalized revision bodies,
+terminal and supplemental attributes, without altering recorded timestamps or
+raw source facts. Its writes and checkpoint roll back together. Scoped ordinary
+item-reader parity is checked after interruption and resume; shared history and
+full authorized HTTP parity remain separate required gates.
+
+`ImportRecipients.run/3` projects the current recipient visibility, substantive
+revision and explicit origin result into typed recipient metadata. `seen_revision`
+is set only for exact membership of that current substantive revision in the
+source opened set; an older opened revision never implies a newer one is seen.
+The raw-to-substantive mapping and complete historical opened set stay intact in
+source facts. Current metadata uses the same source fallback semantics and a
+separate atomic checkpoint; future runtime writers must recompute it when the
+substantive revision changes. Any externalized origin-result field uses the
+verified LargeText path projection rather than a raw marker.
+
+`ImportSubscriptions.run/3` projects exact inbound device subscriptions into
+`device_subscription_heads` and `device_subscription_senders` compatibility
+facts. The source revision and sender set are copied together with the loading
+checkpoint; active devices without a source subscription get the source's
+known-empty revision 0. Revoked devices without a row get no invented head.
+Sender grants remain separate certificate authority and are never treated as
+inbound subscriptions. Raw source subscriptions remain unchanged.
+
+`ImportEntries.run/3` reconstructs ordinary conversation event records after
+conversation containers and read positions. Internal entry IDs are the exact
+original per-person position as text; payload event IDs, including reused IDs,
+remain in the full typed source event. Missing request revisions are accepted
+only for read-position events under schema 004. Verified LargeText paths are
+projected before writing. This loading-only phase does not activate conversation
+routes, synthesize answers, or claim shared-conversation parity.
+
+`ImportChatSummary.run/3` fills the ordinary conversation's typed
+`chat_started`, `latest_origin_reply_seq` and `unread_replies` fields after entry
+and read-position reconstruction. It reads at most 256 event rows at once and
+counts only origin replies strictly after the saved read position. Empty
+conversations have explicit false, nil and zero values. Each summary replaces
+these derived fields atomically with its checkpoint, so a retry cannot double
+count. Source history and read positions remain unchanged.
+
+`ImportAnswers.run/3` preserves ordinary answered terminals at their exact
+closed request revision. Its internal ID is scoped to the normalized message
+and revision; the original public Item ID is retained in the typed body with
+the complete terminal, including null values, no-comment and default evidence,
+actor, clock and operation identity. No separate public answer ID or missing
+historical terminal is invented. Verified LargeText paths are converted before
+publication. This phase does not replace shared answer reconstruction.
+
+`VerifyFacts.run/3` is a read-only comparison of all raw imported Engine facts
+and durable SQL side-table rows against a verified bundle. It checks the pinned
+import/source identity, exact decoded field values, and every source family's
+row count (including expected-empty families). Missing rows, changed values or
+extra source-family rows refuse verification. Derived/source-only SQL tables
+retain their catalog dispositions. This result is source-fact evidence only:
+it neither changes lifecycle state nor substitutes for normalized resource,
+material, index, attachment or client-manifest validation.
+
+`VerifyUploads.run/3` first verifies raw source facts, then compares every
+imported upload's ownership, source metadata, completion clock, digest and size
+with the bundle. It streams the source bytes in bounded chunks and compares each
+stored chunk byte for byte, rejecting missing, changed or extra chunks and
+extra upload manifests even after an import checkpoint completed. Staged source
+retention metadata remains exact. This is read-only evidence for upload content;
+attachment references and authorized resource rendering have separate gates.

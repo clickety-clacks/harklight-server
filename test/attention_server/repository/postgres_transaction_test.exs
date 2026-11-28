@@ -743,6 +743,72 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
     end
 
     @tag :tmp_dir
+    test "staged browser settings feed matches FORMAT32 cursor and wire behavior", %{tmp_dir: dir} do
+      alias AttentionServer.{ChangeLog, JSON}
+      alias AttentionServer.ClientAPI.{Context, Feed, Router}
+      alias AttentionServer.Repository.Postgres.{Identities, Streams}
+
+      {relay, _, backend, cookie, principal} = browser_fixture(dir)
+      origin = "https://account.example.test"
+      sqlite = Router.init(relay: relay, auth: {:browser, backend, origin})
+      postgres = Router.init(relay: nil, repository: :postgres, auth: {:browser, Identities, origin})
+      ctx = %Context{relay: nil, request_id: nil, principal: nil}
+      read = &Feed.postgres_changes(&1, ctx)
+      scope = {principal.person, ""}
+      commit = alerts_request(cookie, "all", "*", nil, origin)
+      assert %{status: 200, resp_body: body} = Router.call(commit, sqlite)
+      assert %{status: 200, resp_body: ^body} = Router.call(commit, postgres)
+      assert {:ok, %{"rev" => head}} = JSON.decode_line(body <> "\n")
+      assert head > 0
+
+      store = :sys.get_state(relay).store
+      assert :ok = ChangeLog.ranks_available(store, principal.person)
+      assert {:ok, _} = Transaction.query(
+        "INSERT INTO harklight.compatibility_facts VALUES ('client_rank_state', $1, $2)",
+        [Attributes.key(principal.person), Attributes.encode([principal.person])]
+      )
+
+      batch = browser_request(:get, "/v2/changes?after=#{head + 1}&limit=1", cookie)
+      fetch = Plug.Conn.put_req_header(batch, "last-event-id", "0")
+      assert %{status: 200, resp_body: changes} = Router.call(fetch, sqlite)
+      assert %{status: 200, resp_body: ^changes} = read.(fetch)
+      assert {:ok, %{"rev" => ^head, "more" => false, "changes" => [
+        %{"rev" => ^head, "kind" => "settings", "data" => %{"alerts" => "all", "rev" => ^head}}
+      ]}} = JSON.decode_line(changes <> "\n")
+
+      huge = browser_request(:get, "/v2/changes?after=9223372036854775808", cookie)
+      invalid = Plug.Conn.put_req_header(batch, "last-event-id", "invalid")
+      for request <- [batch, huge], run <- [&Router.call(&1, sqlite), read] do
+        assert %{status: 410, assigns: %{client_api_error: "cursor_expired"}} = run.(request)
+      end
+      for run <- [&Router.call(&1, sqlite), read] do
+        assert %{status: 400, resp_body: error} = run.(invalid)
+        assert {:ok, %{"field" => "last_event_id", "error" => "invalid_field"}} = JSON.decode_line(error <> "\n")
+      end
+
+      assert %{status: 401} = read.(Plug.Test.conn(:get, "/v2/changes"))
+      assert %{status: 404} = Router.call(fetch, postgres)
+      assert %{status: 404} = read.(Plug.Conn.put_req_header(fetch, "accept", "text/event-stream"))
+
+      cutoff = System.system_time(:millisecond) + 1_000
+      assert {:ok, 1} = ChangeLog.prune(store, cutoff)
+      assert {:ok, ^head} = Streams.prune(scope, cutoff)
+      after_floor = browser_request(:get, "/v2/changes?after=#{head}", cookie)
+      assert %{status: 200, resp_body: empty} = Router.call(after_floor, sqlite)
+      assert %{status: 200, resp_body: ^empty} = read.(after_floor)
+      assert {:ok, %{"rev" => ^head, "changes" => [], "more" => false}} = JSON.decode_line(empty <> "\n")
+      assert %{status: 410} = Router.call(fetch, sqlite)
+      assert %{status: 410} = read.(fetch)
+
+      next = head + 1
+      assert {:ok, ^next} = Transaction.run([scope], &Transaction.append(&1, scope, [change("item:synthetic")]))
+      assert %{status: 503, resp_body: error} = read.(after_floor)
+      assert {:ok, %{"error" => "storage_unavailable"} = unavailable} = JSON.decode_line(error <> "\n")
+      refute Map.has_key?(unavailable, "rev")
+      assert {:ok, [%{rev: ^next}], false, ^next} = Streams.person_page(principal.person, head, 1)
+    end
+
+    @tag :tmp_dir
     test "failed final receipt update rolls back browser alerts and its stream append", %{tmp_dir: dir} do
       alias AttentionServer.ClientAPI.Router
       alias AttentionServer.Repository.Postgres.{Attributes, Identities}
@@ -1713,6 +1779,134 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
 
       assert {:error, :not_found} = RecipientItems.fetch(:postgres, person, "i7")
       assert {:ok, ^key, _} = AgentItems.owned_item(:postgres, {person, origin}, "i7")
+    end
+
+    @tag :tmp_dir
+    test "bounded ordinary summary facts match retained FORMAT32 ranks and chat", %{tmp_dir: dir} do
+      alias AttentionServer.{ChangeLog, JSON, Relay}
+      alias AttentionServer.ClientAPI.{Reads, Writes}
+      alias AttentionServer.Repository.RecipientItems
+      alias AttentionServer.Store.RecordTable
+
+      {relay, _browser, _backend, _cookie, principal} = browser_fixture(dir)
+      person = principal.person
+      origin = "synthetic-summary-origin"
+      handle = "10000000-0000-4000-8000-000000000085"
+      key = {person, "app:fixture", "summary"}
+      assert :ok = Relay.setup_device(relay, person, origin)
+      assert :ok = Relay.setup_sender(relay, origin, "app:fixture")
+      forward = %{
+        "v" => 1, "type" => "forward", "op_id" => "00000000-0000-4000-8000-000000000051",
+        "session_handle" => handle,
+        "message" => %{"sender_id" => "app:fixture", "message_id" => "summary", "created_at" => 1, "title" => "Summary"}
+      }
+
+      assert {:ok, reply} = Relay.request_line(relay, origin, JSON.encode!(forward) <> "\n")
+      assert {:ok, %{"type" => "ok"}} = JSON.decode_line(reply)
+      assert {:ok, 200, _, false} =
+               Writes.reply(relay, principal, "i1", "Synthetic discussion", [], "00000000-0000-4000-8000-000000000052")
+
+      state = :sys.get_state(relay)
+      entries = state.store.engine.origin_feeds[{person, origin}].entries
+      turn = Enum.find_value(entries, fn
+        {seq, %{"kind" => "discussion", "author" => "person"}} -> seq
+        _ -> nil
+      end)
+      assert is_integer(turn)
+      agent_reply = %{
+        "v" => 1, "type" => "conversation_reply", "op_id" => "00000000-0000-4000-8000-000000000053",
+        "sender_id" => "app:fixture", "message_id" => "summary", "request_revision" => 1,
+        "in_reply_to" => turn, "text" => "Synthetic response"
+      }
+      assert {:ok, reply} = Relay.request_line(relay, origin, JSON.encode!(agent_reply) <> "\n")
+      assert {:ok, %{"type" => "ok"}} = JSON.decode_line(reply)
+      assert {:ok, 200, _, false} = Writes.seen(relay, principal, "i1", "00000000-0000-4000-8000-000000000054")
+
+      assert {:ok, %{"rev" => head, "item" => item}} = Reads.item(relay, principal, "i1")
+      assert %{"seen" => true, "chat" => %{"started" => true, "unread_replies" => 1}} = item
+      state = :sys.get_state(relay)
+      assert {:ok, [[rank_key, rank_json]]} =
+               RecordTable.select(state.store.db, "SELECT rank_key, rank_json FROM client_ranks WHERE person_id = ? AND item_id = 'i1'", [person])
+      assert {:ok, rank} = JSON.decode_line(rank_json <> "\n")
+
+      assert {:ok, _} =
+               Transaction.query(
+                 "INSERT INTO harklight.principals (key, person_id, kind, revision) VALUES ($1, $2, 'device', 1)",
+                 [origin, person]
+               )
+      assert {:ok, _} =
+               Transaction.query("INSERT INTO harklight.origin_sessions (person_id, origin_key, handle) VALUES ($1, $2, $3)", [
+                 person, origin, handle
+               ])
+      assert {:ok, _} =
+               Transaction.query(
+                 """
+                 INSERT INTO harklight.messages
+                   (id, person_id, origin_key, session_handle, sender_id, message_id, revision, accepted_at_ms, accepted_position)
+                 VALUES ('summary-item', $1, $2, $3, 'app:fixture', 'summary', 1, 1, 1)
+                 """,
+                 [person, origin, handle]
+               )
+      attrs = Attributes.encode(%{visible: true, substantive_revision: 1})
+      assert {:ok, _} =
+               Transaction.query(
+                 """
+                 INSERT INTO harklight.message_recipients (message_id, person_id, item_id, seen_revision, attributes)
+                 VALUES ('summary-item', $1, 'i1', 1, $2)
+                 """,
+                 [person, attrs]
+               )
+      assert {:ok, _} =
+               Transaction.query("INSERT INTO harklight.stream_heads (person_id, origin_key, head, seed_revision) VALUES ($1, '', $2, 1)", [
+                 person, head
+               ])
+      assert {:ok, _} =
+               Transaction.query("INSERT INTO harklight.stream_resource_revisions VALUES ($1, '', 'item', $2, $3, NULL)", [
+                 person, ChangeLog.item_resource(key), item["rev"]
+               ])
+      put_summary_fact("client_rank_state", person, [person])
+      put_summary_fact("client_ranks", {person, "i1"}, [person, "i1", rank_key, rank_json])
+
+      read = fn p -> Transaction.snapshot(fn -> RecipientItems.summary_facts(:postgres, p, "i1") end) end
+      assert {:error, :transaction_required} = RecipientItems.summary_facts(:postgres, person, "i1")
+      assert {:error, :not_found} = read.("other-person")
+      assert {:ok, %{rank: ^rank, head: ^head, chat: :unprojected, availability: :unprojected, seen: true}} = read.(person)
+
+      summary = state.store.engine.route_b_index.conversation_summary_by_item[key]
+      chat_attrs = Attributes.encode(%{
+        chat_started: summary.chat_started, latest_origin_reply_seq: summary.latest_origin_reply_seq, unread_replies: 1
+      })
+      assert {:ok, _} =
+               Transaction.query("INSERT INTO harklight.conversations VALUES ('summary-item', 'summary-item', $1)", [chat_attrs])
+      stamp = item["availability"]["last_detached_at_ms"]
+      put_summary_fact("item_availability", {:row, :item_availability, key}, {item["availability"]["state"], stamp})
+
+      assert {:ok, actual} = read.(person)
+      assert actual.resource_revision == item["rev"]
+      assert Map.drop(actual.rank, ["_reply", "_thread"]) == item["rank"]
+      assert actual.chat == item["chat"]
+      assert actual.availability == item["availability"]
+
+      assert {:ok, _} = Transaction.query("UPDATE harklight.messages SET revision = 2 WHERE id = 'summary-item'", [])
+      assert {:ok, %{request_revision: 2, seen: true}} = read.(person)
+      assert {:ok, _} =
+               Transaction.query("UPDATE harklight.message_recipients SET attributes = $1 WHERE message_id = 'summary-item'", [
+                 Attributes.encode(%{visible: true, substantive_revision: 2})
+               ])
+      assert {:ok, %{request_revision: 2, seen: false}} = read.(person)
+
+      assert {:ok, _} =
+               Transaction.query("DELETE FROM harklight.compatibility_facts WHERE family = 'client_rank_state' AND address = $1", [
+                 Attributes.key(person)
+               ])
+      assert {:error, :storage_unavailable} = read.(person)
+    end
+
+    defp put_summary_fact(family, address, value) do
+      assert {:ok, _} =
+               Transaction.query("INSERT INTO harklight.compatibility_facts VALUES ($1, $2, $3)", [
+                 family, Attributes.key(address), Attributes.encode(value)
+               ])
     end
 
     test "an attachment is served only after its complete chunk sequence and digest verify" do
