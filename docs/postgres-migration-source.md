@@ -779,13 +779,21 @@ Rerunning import while loading resumes committed checkpoints. After validated
 publication it rechecks the complete report and returns the same validated
 identity, without reopening writes or repairing material. This recovers a lost
 validation response before an installer completion marker. Active imports refuse.
-Errors remain exit 2 with a stable code; success is one contract-version-1 JSON
+Non-retryable errors remain exit 2 with a stable code; success is one contract-version-1 JSON
 object. No command starts Server, edits backend configuration, contacts providers
 or activates PostgreSQL. Capabilities lists import and validate, but
 `migration_ready` remains false until the full rehearsal gates pass.
 
 A loader batch also versions its locked import-state row. If validation began
 before that batch committed, PostgreSQL refuses the older validation snapshot
-with a serialization failure. Retry `validate` with the same bundle and receipt;
+with a serialization failure (SQLSTATE 40001). The API returns
+`{:error, :validation_retry_required}`. The CLI exits 75, writes no success JSON,
+and emits only `Migration retryable: validation_retry_required; retry the same
+command with the same bundle and receipt.` on stderr. This also applies when
+`import` revalidates an already validated destination. An installer receiving 75
+must preserve the receipt, bundle, material and destination, keep Server stopped,
+and retry that same command (or offer its existing `migrate --resume` path).
+Exit 75 is not validation success and does not authorize grants or activation.
+Retry `validate` with the same bundle and receipt;
 it recomputes every comparison from a fresh snapshot. No report from the failed
 attempt is published or reused.

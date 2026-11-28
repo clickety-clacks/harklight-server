@@ -23,7 +23,14 @@ defmodule AttentionServer.Migration.ValidateImport do
         {:error, reason} -> Postgrex.rollback(db, reason)
       end
     end, timeout: 300_000)
+    |> normalize_result()
   end
+
+  defp normalize_result({:error, %Postgrex.Error{postgres: %{code: :serialization_failure}}}),
+    do: {:error, :validation_retry_required}
+  defp normalize_result({:error, %Postgrex.Error{postgres: %{pg_code: "40001"}}}),
+    do: {:error, :validation_retry_required}
+  defp normalize_result(result), do: result
 
   defp lock(db, %{id: id, source: source, schema: schema}) do
     case ImportSession.query(db, """
