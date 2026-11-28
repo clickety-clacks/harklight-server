@@ -4,7 +4,10 @@ defmodule AttentionServer.Migration.ValidateImport do
 
   # Holding the same row lock used by checkpoint batches makes the complete
   # comparison and validated publication one operation. Never accepts a caller's
-  # report or digest, and never transitions to active.
+  # report or digest, and never transitions to active. Checkpoint batches also
+  # version that row: a validator queued behind a committed batch must refuse
+  # its old snapshot with serialization_failure. Repeating the command starts
+  # a fresh complete comparison; no earlier report is reused.
   def run(connection, identity, bundle, material_root) do
     Postgrex.transaction(connection, fn db ->
       with {:ok, _} <- ImportSession.query(db, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ", []),
