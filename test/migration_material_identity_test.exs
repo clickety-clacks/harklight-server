@@ -12,6 +12,8 @@ defmodule AttentionServer.Migration.MaterialIdentityTest do
   test "TLS uses captured configuration with no stored CA pin and checks all retained pins", %{certs: certs} do
     {root, manifest} = bundle(certs, [])
     assert :ok = MaterialIdentity.validate(root, manifest)
+    without_config = %{manifest | material: Map.delete(manifest.material, "material/server.env")}
+    assert {:error, :unsupported_or_missing_identity_material} = MaterialIdentity.validate(root, without_config)
     {:ok, configuration} = GuidedJoin.configuration("fixture.test", 4080, 4040, File.read!(Path.join(certs, "ca.pem")))
     {root, manifest} = bundle(certs, [configuration, configuration])
     assert :ok = MaterialIdentity.validate(root, manifest)

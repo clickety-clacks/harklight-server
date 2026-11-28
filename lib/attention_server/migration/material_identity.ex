@@ -13,6 +13,7 @@ defmodule AttentionServer.Migration.MaterialIdentity do
     names = Map.keys(manifest.material)
     with {:ok, tls} <- MaterialProvenance.tls_paths(bundle, manifest.material, manifest.material_provenance["files"]),
          supported = @supported ++ Map.values(tls) ++ ["material/tls/ca.key"],
+         true <- map_size(tls) == 3,
          true <- Enum.all?(@owner_files, &(&1 in names)),
          true <- Enum.all?(names, &(&1 in supported)),
          {:ok, person_bytes} <- File.read(Path.join(bundle, "material/person-id")),
@@ -29,10 +30,6 @@ defmodule AttentionServer.Migration.MaterialIdentity do
     end
   end
 
-  defp tls_identity(_bundle, manifest, tls) when map_size(tls) == 0 do
-    if Map.has_key?(manifest.material, "material/tls/ca.key"),
-      do: {:error, :configured_tls_material_missing}, else: :ok
-  end
   defp tls_identity(bundle, manifest, tls) do
     cert = Path.join(bundle, tls["cert"])
     key = Path.join(bundle, tls["key"])

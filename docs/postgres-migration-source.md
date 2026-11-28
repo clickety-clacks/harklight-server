@@ -394,6 +394,7 @@ directories, files and owner/completion markers. Standard owner material require
 SPKI fingerprint must match the certificate and the selected person's current
 owner fingerprint in the decoded source records. A valid certificate/key pair
 from another identity is refused. TLS continuity rests on stopped-source provenance, not a store fingerprint.
+Standard self-host staging requires the owner files and all three configured TLS files.
 The export observes `server.env` and every declared material file before and
 after copying within the stopped-source window. Its configured `CERTFILE`,
 `KEYFILE` and `CACERTFILE` paths must identify the exact captured files. The

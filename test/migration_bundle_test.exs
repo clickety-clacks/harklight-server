@@ -46,6 +46,20 @@ defmodule AttentionServer.Migration.BundleTest do
       {"CERTFILE", "server.pem"}, {"KEYFILE", "server.key"}, {"CACERTFILE", "ca.pem"}
     ], "\n", fn {key, file} -> "export ATTENTION_SERVER_#{key}='#{Path.join(certs, file)}'" end))
     path = Path.join(fixture.root, "relay.sqlite3")
+    # A retained real guided-join invitation pins the same captured CA.
+    {:ok, store} = AttentionServer.Store.open_relay(path)
+    person = hd(history["people"])
+    owner = Map.fetch!(store.engine.owners, person).key
+    {:ok, configuration} = AttentionServer.GuidedJoin.configuration("fixture.test", 4080, 4040,
+      File.read!(Path.join(certs, "ca.pem")))
+    {engine, :ok, touched} = AttentionServer.Engine.with_touches(store.engine, fn engine ->
+      {:ok, engine, _} = AttentionServer.GuidedJoin.create(engine, person, owner,
+        :crypto.hash(:sha256, "migration invitation"), configuration)
+      {engine, :ok}
+    end)
+    {:ok, store} = AttentionServer.Store.commit(store, {engine, touched},
+      %{person: person, actor: "fixture", action: "migration_invitation"})
+    :ok = AttentionServer.Store.close(store)
     before = File.read!(path)
     destination = Path.join(root, "export")
 
