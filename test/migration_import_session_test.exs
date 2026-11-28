@@ -530,7 +530,6 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         assert answer_count > 0
         assert {:ok, %{rows: [[^answer_count]]}} = ImportSession.query(db, "SELECT count(*) FROM harklight.answers", [])
 
-        verify_receipt_replay(session_person, {agent_person, agent_key}, receipt_digest)
         wrong_source = %{identity | source: :crypto.hash(:sha256, "different export")}
         assert {:error, :import_source_mismatch} = ImportUploads.run(db, wrong_source, bundle)
         assert :ok = ImportUploads.run(db, identity, bundle)
@@ -682,6 +681,9 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         assert {:ok, _} = ImportSession.query(db, "DELETE FROM harklight.large_texts WHERE sha256=$1", [extra_hash])
         assert {:ok, %{references: 0}} = AttentionServer.Migration.VerifyLargeText.run(db, identity, bundle)
         verify_complete_report(db, identity, bundle, root)
+        # The expiry/replacement exercise intentionally changes a receipt. Run
+        # it only after comparing the untouched imported state with the source.
+        verify_receipt_replay(session_person, {agent_person, agent_key}, receipt_digest)
         stop_supervised!(Repo)
 
         assert {:ok, :ok} =
