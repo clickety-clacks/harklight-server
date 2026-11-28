@@ -103,6 +103,35 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         historical = SharedMessages.historical_record(source.shared_messages[@shared], revision)
         assert read_fact(db, "shared_revision_files", {@shared, revision}) == Map.get(historical, :files, [])
       end
+      alias AttentionServer.Migration.VerifySharedMessages
+      assert {:ok, verified} = VerifySharedMessages.run(db, identity, bundle)
+      assert verified == %{messages: 1, revisions: 2, recipients: 2}
+      for {column, bad, good} <- [{"accepted_at_ms", 999, 100},
+                                  {"origin_key", "changed-historical-origin", "historical-unenrolled-origin"}] do
+        assert {:ok, _} = ImportSession.query(db, "UPDATE harklight.messages SET " <> column <> "=$2 WHERE id=$1", [@shared, bad])
+        assert {:error, {:shared_message_mismatch, :message, _}} = VerifySharedMessages.run(db, identity, bundle)
+        assert {:ok, _} = ImportSession.query(db, "UPDATE harklight.messages SET " <> column <> "=$2 WHERE id=$1", [@shared, good])
+        assert {:ok, ^verified} = VerifySharedMessages.run(db, identity, bundle)
+      end
+      assert {:ok, %{rows: [[original_recipient]]}} = ImportSession.query(db,
+        "SELECT attributes FROM harklight.message_recipients WHERE message_id=$1 AND person_id=$2", [@shared, @first])
+      assert {:ok, _} = ImportSession.query(db,
+        "UPDATE harklight.message_recipients SET attributes='{}'::jsonb WHERE message_id=$1 AND person_id=$2", [@shared, @first])
+      assert {:error, {:shared_message_mismatch, :recipient, _}} = VerifySharedMessages.run(db, identity, bundle)
+      assert {:ok, _} = ImportSession.query(db,
+        "UPDATE harklight.message_recipients SET attributes=$3 WHERE message_id=$1 AND person_id=$2", [@shared, @first, original_recipient])
+      assert {:ok, _} = ImportSession.query(db,
+        "UPDATE harklight.message_revisions SET accepted_at_ms=999 WHERE message_id=$1 AND revision=1", [@shared])
+      assert {:error, {:shared_message_mismatch, {:revision, 1}, _}} = VerifySharedMessages.run(db, identity, bundle)
+      assert {:ok, _} = ImportSession.query(db,
+        "UPDATE harklight.message_revisions SET accepted_at_ms=100 WHERE message_id=$1 AND revision=1", [@shared])
+      assert {:ok, _} = ImportSession.query(db,
+        "INSERT INTO harklight.message_revisions(message_id,revision,body) SELECT message_id,99,body FROM harklight.message_revisions WHERE message_id=$1 AND revision=1", [@shared])
+      assert {:error, {:shared_count_mismatch, :revisions}} = VerifySharedMessages.run(db, identity, bundle)
+      assert {:ok, _} = ImportSession.query(db,
+        "DELETE FROM harklight.message_revisions WHERE message_id=$1 AND revision=99", [@shared])
+      assert {:ok, ^verified} = VerifySharedMessages.run(db, identity, bundle)
+      assert {:ok, %{rows: [["loading"]]}} = ImportSession.query(db, "SELECT phase FROM harklight.import_state", [])
       # Both ordinary tuple consumers must still resolve the ordinary row.
       assert :ok = ImportConversations.run(db, identity, bundle)
       assert :ok = ImportEntries.run(db, identity, bundle)
