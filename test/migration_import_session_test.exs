@@ -635,6 +635,7 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         verify_item_facts(db, identity, bundle, manifest)
         verify_message_drift(db, identity, bundle)
         verify_recipient_drift(db, identity, bundle)
+        verify_conversation_drift(db, identity, bundle)
         assert {:ok, %{references: 0}} = AttentionServer.Migration.VerifyLargeText.run(db, identity, bundle)
         extra_hash = :crypto.hash(:sha256, "")
         assert {:ok, _} = ImportSession.query(db,
@@ -1525,6 +1526,43 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         "DELETE FROM harklight.message_revisions WHERE message_id=$1 AND revision=999", [id])
       assert {:ok, ^verified} = VerifyMessages.run(db, identity, bundle)
       assert {:ok, %{rows: [["loading"]]}} = ImportSession.query(db, "SELECT phase FROM harklight.import_state", [])
+    end
+
+    defp verify_conversation_drift(db, identity, bundle) do
+      alias AttentionServer.Migration.VerifyConversations
+      assert {:ok, result} = VerifyConversations.run(db, identity, bundle)
+      assert result.entries > 256
+      assert result.read_positions > 0
+      assert {:ok, %{rows: [[id, conversation, body]]}} = ImportSession.query(db,
+        "SELECT id,conversation_id,body FROM harklight.conversation_entries LIMIT 1", [])
+      assert {:ok, _} = ImportSession.query(db,
+        "UPDATE harklight.conversation_entries SET body='{}'::jsonb WHERE conversation_id=$1 AND id=$2", [conversation, id])
+      assert {:error, :conversation_entry_mismatch} = VerifyConversations.run(db, identity, bundle)
+      assert {:ok, _} = ImportSession.query(db,
+        "UPDATE harklight.conversation_entries SET body=$3 WHERE conversation_id=$1 AND id=$2", [conversation, id, body])
+      assert {:ok, %{rows: [[read_conversation, person, position]]}} = ImportSession.query(db,
+        "SELECT conversation_id,person_id,position FROM harklight.read_positions LIMIT 1", [])
+      assert {:ok, _} = ImportSession.query(db,
+        "UPDATE harklight.read_positions SET position=position+1 WHERE conversation_id=$1 AND person_id=$2", [read_conversation, person])
+      assert {:error, :conversation_read_position_mismatch} = VerifyConversations.run(db, identity, bundle)
+      assert {:ok, _} = ImportSession.query(db,
+        "UPDATE harklight.read_positions SET position=$3 WHERE conversation_id=$1 AND person_id=$2", [read_conversation, person, position])
+      assert {:ok, %{rows: [[attrs]]}} = ImportSession.query(db,
+        "SELECT attributes FROM harklight.conversations WHERE id=$1", [conversation])
+      assert {:ok, _} = ImportSession.query(db,
+        "UPDATE harklight.conversations SET attributes='{}'::jsonb WHERE id=$1", [conversation])
+      assert {:error, :conversation_summary_mismatch} = VerifyConversations.run(db, identity, bundle)
+      assert {:ok, _} = ImportSession.query(db,
+        "UPDATE harklight.conversations SET attributes=$2 WHERE id=$1", [conversation, attrs])
+      assert {:ok, _} = ImportSession.query(db, """
+        INSERT INTO harklight.conversation_entries(id,conversation_id,position,request_revision,kind,body)
+        SELECT 'extra-entry',conversation_id,999999,request_revision,kind,body
+        FROM harklight.conversation_entries WHERE conversation_id=$1 AND id=$2
+        """, [conversation, id])
+      assert {:error, {:conversation_count_mismatch, "conversation_entries"}} = VerifyConversations.run(db, identity, bundle)
+      assert {:ok, _} = ImportSession.query(db,
+        "DELETE FROM harklight.conversation_entries WHERE conversation_id=$1 AND id='extra-entry'", [conversation])
+      assert {:ok, ^result} = VerifyConversations.run(db, identity, bundle)
     end
 
     defp verify_recipient_drift(db, identity, bundle) do
