@@ -697,10 +697,11 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
       {{person, sender, _}, sample} = Enum.find(store.engine.messages, fn {_, record} ->
         is_binary(Map.get(record, :session_handle))
       end)
+      {engine, :ok, touched} = Engine.with_touches(store.engine, fn engine ->
       {:ok, levels} = BouncePolicy.normalize_levels([
         %{"name" => "Follow up", "lower_bound" => 0, "bounce_after_days" => 1}
       ])
-      {:ok, engine, _} = BounceDecision.configure_levels(store.engine, person, levels, sample.accepted_at)
+      {:ok, engine, _} = BounceDecision.configure_levels(engine, person, levels, sample.accepted_at)
       external_id = "synthetic-migration-advisory"
       frame = %{
         "type" => "forward", "op_id" => "30000000-0000-4000-8000-000000000007",
@@ -726,7 +727,9 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         next
       end)
       assert BounceDecision.valid_state?(engine)
-      {:ok, store} = Store.commit(store, engine, %{person: person, actor: "fixture", action: "synthetic_advisory"})
+      {engine, :ok}
+      end)
+      {:ok, store} = Store.commit(store, {engine, touched}, %{person: person, actor: "fixture", action: "synthetic_advisory"})
       :ok = Store.close(store)
     end
 
