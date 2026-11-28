@@ -4,7 +4,7 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
   defmodule AttentionServer.Migration.ImportSessionTest do
     use ExUnit.Case, async: false
     alias AttentionServer.{CompatibilityScenarios, JSON, Relay}
-    alias AttentionServer.Migration.{Bundle, Frames, ImportFacts, ImportOrganizations, ImportSession, ImportTables, SourceTables}
+    alias AttentionServer.Migration.{Bundle, Frames, ImportFacts, ImportOrganizations, ImportSession, ImportTables, SourceTables, ImportAuth}
     alias AttentionServer.Repository.Postgres.Attributes
 
     for epoch <- [1, 17] do
@@ -103,6 +103,26 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         :ok = AttentionServer.BrowserAuth.add_session(sqlite,
           :crypto.hash(:sha256, "synthetic migration browser session"),
           session_person, session_owner.key, session_owner.revision, "fixture")
+        :ok = AttentionServer.BrowserAuth.add_session(sqlite,
+          :crypto.hash(:sha256, "synthetic stale browser session"),
+          session_person, session_owner.key, session_owner.revision + 5, "fixture")
+        :ok = AttentionServer.BrowserAuth.add_session(sqlite,
+          :crypto.hash(:sha256, "synthetic retired owner session"),
+          session_person, String.duplicate("0", 64), 1, "fixture")
+        devices = Enum.flat_map(rows, fn [key, payload, hash] ->
+          case AttentionServer.Store.RecordCodec.decode_row({key, payload, hash}) do
+            {:ok, {:row, :devices, id}, device} -> [{id, device}]
+            _ -> []
+          end
+        end)
+        active = devices |> Enum.reject(fn {_, d} -> d.revoked end) |> Enum.take(2)
+        [revoked] = Enum.filter(devices, fn {_, d} -> d.revoked end)
+        assert length(active) == 2
+        for {{id, device}, index} <- Enum.with_index(active ++ [revoked]) do
+          hash = :crypto.hash(:sha256, "synthetic native session #{index}") |> Base.encode16(case: :lower)
+          :ok = AttentionServer.NativeSignIn.add_session(sqlite, hash, id, device.person,
+            String.duplicate("a", 64), 1_700_000_000_000 + index, index == 0)
+        end
 
         {address, _} =
           Enum.find_value(rows, fn [key, payload, hash] ->
@@ -326,6 +346,9 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         assert :ok = ImportTables.run(db, identity, bundle)
         assert :ok = ImportTables.run(db, identity, bundle)
         verify_tables(db, bundle, manifest)
+        assert :ok = ImportAuth.run(db, identity, bundle)
+        assert :ok = ImportAuth.run(db, identity, bundle)
+        verify_auth(db, bundle, manifest)
 
         assert {:ok, :ok} =
                  Frames.fold(
@@ -410,6 +433,8 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         schema: :crypto.hash(:sha256, File.read!("priv/postgres/001_initial.sql"))}
       assert :ok = ImportOrganizations.run(db, identity, bundle)
       assert :ok = ImportOrganizations.run(db, identity, bundle)
+      assert :ok = ImportAuth.run(db, identity, bundle)
+      assert {:ok, %{rows: [[0]]}} = ImportSession.query(db, "SELECT count(*) FROM harklight.auth_sessions", [])
       assert_members(db, expected.instance, expected.members)
       assert {:ok, %{rows: [[0]]}} = ImportSession.query(db,
         "SELECT count(*) FROM harklight.organization_members WHERE person_id=$1", [expected.hosted])
@@ -417,6 +442,46 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         "SELECT attributes::text FROM harklight.organizations WHERE id=$1", [expected.instance])
       assert_typed(text, nil)
       Agent.stop(fixture.clock)
+    end
+
+    defp verify_auth(db, bundle, manifest) do
+      for table <- ~w(harklight_browser_sessions harklight_device_sessions) do
+        source = Map.fetch!(manifest.data.tables, table)
+        assert {:ok, :ok} = Frames.fold(Path.join(bundle, source.file), source.summary, :ok,
+          fn values, :ok ->
+            {:ok, _, row} = SourceTables.fact(table, values)
+            {hash, key, kind} = if table == "harklight_browser_sessions" do
+              {row["session_hash"], row["owner_key"], "browser"}
+            else
+              {Base.decode16!(row["session_hash"], case: :lower), row["device_id"], "native"}
+            end
+            assert {:ok, %{rows: principals}} = ImportSession.query(db,
+              "SELECT revision FROM harklight.principals WHERE key=$1 AND person_id=$2", [key, row["person_id"]])
+            assert {:ok, %{rows: sessions}} = ImportSession.query(db,
+              "SELECT person_id,principal_key,kind,principal_revision,expires_at_ms,attributes::text FROM harklight.auth_sessions WHERE token_hash=$1", [hash])
+            if principals == [] do
+              assert sessions == []
+            else
+              [[principal_revision]] = principals
+              assert [[person, ^key, ^kind, revision, nil, text]] = sessions
+              assert person == row["person_id"]
+              if kind == "browser" do
+                assert revision == row["owner_revision"]
+                assert_typed(text, row)
+              else
+                assert revision == principal_revision
+                assert_typed(text, %{pending: row["pending"] == 1,
+                  public_key: row["public_key"], signed_in_at_ms: row["signed_in_at_ms"]})
+              end
+            end
+            {:ok, :ok}
+          end)
+      end
+      assert {:ok, %{rows: [[5]]}} = ImportSession.query(db, "SELECT count(*) FROM harklight.auth_sessions", [])
+      assert {:ok, %{rows: [[1]]}} = ImportSession.query(db,
+        "SELECT count(*) FROM harklight.auth_sessions s JOIN harklight.principals p ON p.key=s.principal_key AND p.person_id=s.person_id WHERE s.kind='browser' AND p.kind='owner' AND NOT p.revoked AND p.revision=s.principal_revision", [])
+      assert {:ok, %{rows: [[2]]}} = ImportSession.query(db,
+        "SELECT count(*) FROM harklight.auth_sessions s JOIN harklight.principals p ON p.key=s.principal_key AND p.person_id=s.person_id WHERE s.kind='native' AND p.kind='device' AND NOT p.revoked", [])
     end
 
     defp verify_tables(db, bundle, manifest) do
@@ -439,7 +504,7 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
           excluded when excluded in [:derived, :source_only] -> assert count == 0
         end
       end
-      assert {:ok, %{rows: [[1]]}} = ImportSession.query(db,
+      assert {:ok, %{rows: [[3]]}} = ImportSession.query(db,
         "SELECT count(*) FROM harklight.compatibility_facts WHERE family='harklight_browser_sessions'", [])
       assert {:ok, %{rows: [[text]]}} = ImportSession.query(db,
         "SELECT body::text FROM harklight.compatibility_facts WHERE family='harklight_auth_schema' AND address=$1", [Attributes.key(1)])
