@@ -65,7 +65,9 @@ jobs:
       - uses: actions/checkout@v7
       - name: Exercise explicit migration and FORMAT32 destinations
         run: |
-          cat priv/postgres/001_initial.sql test/attention_server/repository/postgres_schema_v1.sql |
+          cat priv/postgres/001_initial.sql priv/postgres/002_message_history.sql \
+            test/attention_server/repository/postgres_schema_v1.sql \
+            test/attention_server/repository/postgres_message_history.sql |
             docker exec -i "${{ job.services.postgres.id }}" psql -X -v ON_ERROR_STOP=1 -U fixture -d fixture -f -
       - uses: erlef/setup-beam@v1
         with:
@@ -104,11 +106,15 @@ jobs:
       - run: mix deps.get
       - name: Apply schema to a fresh throwaway database
         run: |
-          docker exec -i "${{ job.services.postgres.id }}" psql -X -v ON_ERROR_STOP=1 -U fixture -d migration_fixture -f - < priv/postgres/001_initial.sql
+          apply_schema() {
+            cat priv/postgres/001_initial.sql priv/postgres/002_message_history.sql |
+              docker exec -i "${{ job.services.postgres.id }}" psql -X -v ON_ERROR_STOP=1 -U fixture -d "$1" -f -
+          }
+          apply_schema migration_fixture
           docker exec "${{ job.services.postgres.id }}" psql -X -v ON_ERROR_STOP=1 -U fixture -d postgres -c 'CREATE DATABASE migration_explicit_epoch'
-          docker exec -i "${{ job.services.postgres.id }}" psql -X -v ON_ERROR_STOP=1 -U fixture -d migration_explicit_epoch -f - < priv/postgres/001_initial.sql
+          apply_schema migration_explicit_epoch
           docker exec "${{ job.services.postgres.id }}" psql -X -v ON_ERROR_STOP=1 -U fixture -d postgres -c 'CREATE DATABASE migration_implicit_roster'
-          docker exec -i "${{ job.services.postgres.id }}" psql -X -v ON_ERROR_STOP=1 -U fixture -d migration_implicit_roster -f - < priv/postgres/001_initial.sql
+          apply_schema migration_implicit_roster
       - name: Exercise stopped-history staging and interrupted transactions
         env:
           HARKLIGHT_MIGRATION_TEST_URL: postgres://fixture:fixture-password@127.0.0.1:${{ job.services.postgres.ports[5432] }}/migration_fixture

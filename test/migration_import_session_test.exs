@@ -4,7 +4,7 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
   defmodule AttentionServer.Migration.ImportSessionTest do
     use ExUnit.Case, async: false
     alias AttentionServer.{CompatibilityScenarios, JSON, Relay}
-    alias AttentionServer.Migration.{Bundle, Frames, ImportFacts, ImportOrganizations, ImportSession}
+    alias AttentionServer.Migration.{Bundle, Frames, ImportFacts, ImportOrganizations, ImportSession, ImportTables, SourceTables, ImportAuth}
     alias AttentionServer.Repository.Postgres.Attributes
 
     for epoch <- [1, 17] do
@@ -26,8 +26,7 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
             )
         ]
 
-        {:ok, db} = Postgrex.start_link(config)
-        on_exit(fn -> if Process.alive?(db), do: GenServer.stop(db) end)
+        db = start_supervised!({Postgrex, config})
 
         root =
           Path.join(System.tmp_dir!(), "import-history-#{System.unique_integer([:positive])}")
@@ -94,6 +93,37 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
             "SELECT key,payload,checksum FROM relay_records"
           )
 
+        {session_person, session_owner} = Enum.find_value(rows, fn [key, payload, hash] ->
+          case AttentionServer.Store.RecordCodec.decode_row({key, payload, hash}) do
+            {:ok, {:row, :owners, person}, owner} -> {person, owner}
+            _ -> nil
+          end
+        end)
+        {:ok, _} = AttentionServer.Store.AuthSchema.initialize(sqlite)
+        :ok = AttentionServer.BrowserAuth.add_session(sqlite,
+          :crypto.hash(:sha256, "synthetic migration browser session"),
+          session_person, session_owner.key, session_owner.revision, "fixture")
+        :ok = AttentionServer.BrowserAuth.add_session(sqlite,
+          :crypto.hash(:sha256, "synthetic stale browser session"),
+          session_person, session_owner.key, session_owner.revision + 5, "fixture")
+        :ok = AttentionServer.BrowserAuth.add_session(sqlite,
+          :crypto.hash(:sha256, "synthetic retired owner session"),
+          session_person, String.duplicate("0", 64), 1, "fixture")
+        devices = Enum.flat_map(rows, fn [key, payload, hash] ->
+          case AttentionServer.Store.RecordCodec.decode_row({key, payload, hash}) do
+            {:ok, {:row, :devices, id}, device} -> [{id, device}]
+            _ -> []
+          end
+        end)
+        active = devices |> Enum.reject(fn {_, d} -> d.revoked end) |> Enum.take(2)
+        [revoked] = Enum.filter(devices, fn {_, d} -> d.revoked end)
+        assert length(active) == 2
+        for {{id, device}, index} <- Enum.with_index(active ++ [revoked]) do
+          hash = :crypto.hash(:sha256, "synthetic native session #{index}") |> Base.encode16(case: :lower)
+          :ok = AttentionServer.NativeSignIn.add_session(sqlite, hash, id, device.person,
+            String.duplicate("a", 64), 1_700_000_000_000 + index, index == 0)
+        end
+
         {address, _} =
           Enum.find_value(rows, fn [key, payload, hash] ->
             case AttentionServer.Store.RecordCodec.decode_row({key, payload, hash}) do
@@ -149,7 +179,7 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         identity = %{
           id: "synthetic-import",
           source: Base.decode16!(summary.sha256, case: :lower),
-          schema: :crypto.hash(:sha256, File.read!("priv/postgres/001_initial.sql"))
+          schema: AttentionServer.Repository.Postgres.Schema.digest()
         }
 
         # Refuse an already populated target rather than claiming it.
@@ -313,6 +343,12 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         assert :ok = ImportOrganizations.run(db, identity, bundle)
         assert :ok = ImportOrganizations.run(db, identity, bundle)
         verify_organizations(db, expected_organizations)
+        assert :ok = ImportTables.run(db, identity, bundle)
+        assert :ok = ImportTables.run(db, identity, bundle)
+        verify_tables(db, bundle, manifest)
+        assert :ok = ImportAuth.run(db, identity, bundle)
+        assert :ok = ImportAuth.run(db, identity, bundle)
+        verify_auth(db, bundle, manifest)
 
         assert {:ok, :ok} =
                  Frames.fold(
@@ -360,12 +396,11 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
       uri = URI.parse(System.fetch_env!("HARKLIGHT_MIGRATION_TEST_URL"))
       assert uri.host in ["localhost", "127.0.0.1"]
       [user, password] = String.split(uri.userinfo, ":", parts: 2)
-      {:ok, db} = Postgrex.start_link(
+      db = start_supervised!({Postgrex, [
         hostname: uri.host, port: uri.port,
         username: URI.decode(user), password: URI.decode(password),
         database: "migration_implicit_roster"
-      )
-      on_exit(fn -> if Process.alive?(db), do: GenServer.stop(db) end)
+      ]})
       root = Path.join(System.tmp_dir!(), "import-legacy-#{System.unique_integer([:positive])}")
       File.mkdir!(root)
       File.chmod!(root, 0o700)
@@ -395,9 +430,11 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
       assert {:ok, summary} = Bundle.export(Path.join(fixture.root, "relay.sqlite3"), bundle,
         supervisor: {:operator, "synthetic fixture", "seed Relay stopped"}, material: %{})
       identity = %{id: "synthetic-legacy", source: Base.decode16!(summary.sha256, case: :lower),
-        schema: :crypto.hash(:sha256, File.read!("priv/postgres/001_initial.sql"))}
+        schema: AttentionServer.Repository.Postgres.Schema.digest()}
       assert :ok = ImportOrganizations.run(db, identity, bundle)
       assert :ok = ImportOrganizations.run(db, identity, bundle)
+      assert :ok = ImportAuth.run(db, identity, bundle)
+      assert {:ok, %{rows: [[0]]}} = ImportSession.query(db, "SELECT count(*) FROM harklight.auth_sessions", [])
       assert_members(db, expected.instance, expected.members)
       assert {:ok, %{rows: [[0]]}} = ImportSession.query(db,
         "SELECT count(*) FROM harklight.organization_members WHERE person_id=$1", [expected.hosted])
@@ -405,6 +442,74 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         "SELECT attributes::text FROM harklight.organizations WHERE id=$1", [expected.instance])
       assert_typed(text, nil)
       Agent.stop(fixture.clock)
+    end
+
+    defp verify_auth(db, bundle, manifest) do
+      for table <- ~w(harklight_browser_sessions harklight_device_sessions) do
+        source = Map.fetch!(manifest.data.tables, table)
+        assert {:ok, :ok} = Frames.fold(Path.join(bundle, source.file), source.summary, :ok,
+          fn values, :ok ->
+            {:ok, _, row} = SourceTables.fact(table, values)
+            {hash, key, kind} = if table == "harklight_browser_sessions" do
+              {row["session_hash"], row["owner_key"], "browser"}
+            else
+              {Base.decode16!(row["session_hash"], case: :lower), row["device_id"], "native"}
+            end
+            assert {:ok, %{rows: principals}} = ImportSession.query(db,
+              "SELECT revision FROM harklight.principals WHERE key=$1 AND person_id=$2", [key, row["person_id"]])
+            assert {:ok, %{rows: sessions}} = ImportSession.query(db,
+              "SELECT person_id,principal_key,kind,principal_revision,expires_at_ms,attributes::text FROM harklight.auth_sessions WHERE token_hash=$1", [hash])
+            if principals == [] do
+              assert sessions == []
+            else
+              [[principal_revision]] = principals
+              assert [[person, ^key, ^kind, revision, nil, text]] = sessions
+              assert person == row["person_id"]
+              if kind == "browser" do
+                assert revision == row["owner_revision"]
+                assert_typed(text, row)
+              else
+                assert revision == principal_revision
+                assert_typed(text, %{pending: row["pending"] == 1,
+                  public_key: row["public_key"], signed_in_at_ms: row["signed_in_at_ms"]})
+              end
+            end
+            {:ok, :ok}
+          end)
+      end
+      assert {:ok, %{rows: [[5]]}} = ImportSession.query(db, "SELECT count(*) FROM harklight.auth_sessions", [])
+      assert {:ok, %{rows: [[1]]}} = ImportSession.query(db,
+        "SELECT count(*) FROM harklight.auth_sessions s JOIN harklight.principals p ON p.key=s.principal_key AND p.person_id=s.person_id WHERE s.kind='browser' AND p.kind='owner' AND NOT p.revoked AND p.revision=s.principal_revision", [])
+      assert {:ok, %{rows: [[2]]}} = ImportSession.query(db,
+        "SELECT count(*) FROM harklight.auth_sessions s JOIN harklight.principals p ON p.key=s.principal_key AND p.person_id=s.person_id WHERE s.kind='native' AND p.kind='device' AND NOT p.revoked", [])
+    end
+
+    defp verify_tables(db, bundle, manifest) do
+      for {table, source} <- manifest.data.tables do
+        family = table
+        assert {:ok, %{rows: [[count]]}} = ImportSession.query(db,
+          "SELECT count(*) FROM harklight.compatibility_facts WHERE family=$1", [family])
+        case SourceTables.disposition(table) do
+          {:durable, _} ->
+            assert count == source.summary.count
+            assert {:ok, :ok} = Frames.fold(Path.join(bundle, source.file), source.summary, :ok,
+              fn values, :ok ->
+                {:ok, address, _row} = SourceTables.fact(table, values)
+                assert {:ok, %{rows: [[text]]}} = ImportSession.query(db,
+                  "SELECT body::text FROM harklight.compatibility_facts WHERE family=$1 AND address=$2",
+                  [family, Attributes.key(address)])
+                assert_typed(text, values)
+                {:ok, :ok}
+              end)
+          excluded when excluded in [:derived, :source_only] -> assert count == 0
+        end
+      end
+      assert {:ok, %{rows: [[3]]}} = ImportSession.query(db,
+        "SELECT count(*) FROM harklight.compatibility_facts WHERE family='harklight_browser_sessions'", [])
+      assert {:ok, %{rows: [[text]]}} = ImportSession.query(db,
+        "SELECT body::text FROM harklight.compatibility_facts WHERE family='harklight_auth_schema' AND address=$1", [Attributes.key(1)])
+      {:ok, envelope} = JSON.decode_line(text <> "\n")
+      assert {:ok, [1, 1, 0]} = Attributes.decode(envelope)
     end
 
     defp seed_organizations(path, epoch) do
