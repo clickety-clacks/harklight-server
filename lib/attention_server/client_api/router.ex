@@ -134,6 +134,8 @@ defmodule AttentionServer.ClientAPI.Router do
       repository: Keyword.get(opts, :repository, :format32),
       auth: auth_option(Keyword.get(opts, :auth, :device)),
       deployment_mode: Keyword.get(opts, :deployment_mode),
+      feature_flags_path: Keyword.get(opts, :feature_flags_path),
+      upload_cap: Keyword.get(opts, :upload_cap, :none),
       shared_features: %{
         shared_messages: Keyword.get(opts, :shared_messages) == true,
         groups: Keyword.get(opts, :groups) == true
@@ -206,6 +208,19 @@ defmodule AttentionServer.ClientAPI.Router do
   defp authenticated(
          %{method: "GET"} = conn,
          %{repository: :postgres, auth: :device, deployment_mode: mode} = opts,
+         ["me"],
+         {:ok, Reads, :get_me, _, _},
+         request_id
+       )
+       when mode in [:self_hosted, :saas] do
+    ctx = %Context{principal: nil, relay: nil, request_id: request_id, shared_features: opts.shared_features}
+    args = [mode, opts.feature_flags_path, opts.upload_cap]
+    run(on_device_refusal(conn), Reads, :get_postgres_me, ctx, opts, args)
+  end
+
+  defp authenticated(
+         %{method: "GET"} = conn,
+         %{repository: :postgres, auth: :device, deployment_mode: mode} = opts,
          ["items", "i" <> _ | _],
          {:ok, Reads, handler, params, _},
          request_id
@@ -219,13 +234,7 @@ defmodule AttentionServer.ClientAPI.Router do
       shared_features: opts.shared_features
     }
 
-    conn =
-      register_before_send(conn, fn
-        %{status: 401} = conn -> close_after_device_refusal(conn, :device)
-        conn -> conn
-      end)
-
-    run(conn, Reads, Map.fetch!(@postgres_device_reads, handler), ctx, opts, [{:certificate, mode}])
+    run(on_device_refusal(conn), Reads, Map.fetch!(@postgres_device_reads, handler), ctx, opts, [{:certificate, mode}])
   end
 
   defp authenticated(
@@ -358,6 +367,13 @@ defmodule AttentionServer.ClientAPI.Router do
 
   # A device whose enrollment ended while its connection was open: refuse, and
   # end an HTTP/1.1 connection so the next attempt meets the TLS handshake.
+  defp on_device_refusal(conn) do
+    register_before_send(conn, fn
+      %{status: 401} = conn -> close_after_device_refusal(conn, :device)
+      conn -> conn
+    end)
+  end
+
   defp close_after_device_refusal(conn, :device) do
     if get_http_protocol(conn) == :"HTTP/1.1",
       do: put_resp_header(conn, "connection", "close"),

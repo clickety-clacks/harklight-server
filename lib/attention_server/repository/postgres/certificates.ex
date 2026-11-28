@@ -38,6 +38,19 @@ defmodule AttentionServer.Repository.Postgres.Certificates do
     end
   end
 
+  def migration_available?(key, person, :self_hosted, auth, roster) when not is_nil(auth) do
+    generation = AuthSchema.supported_generation()
+
+    with {:ok, [1, ^generation, 0]} <- Attributes.decode(auth),
+         {:ok, {^person, phase}} <- roster_row(roster, key) do
+      phase in ["legacy", "pending"]
+    else
+      _ -> false
+    end
+  end
+
+  def migration_available?(_key, _person, _mode, _auth, _roster), do: false
+
   # FORMAT32 predates the auth generation on some stores. On those stores
   # an enrolled device certificate needs no roster or sender grant.
   defp device(_key, person, _mode, nil, _roster, _sender?, _native?), do: {:ok, person, :device}
