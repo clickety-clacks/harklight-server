@@ -1417,6 +1417,28 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
       end)
       assert {:ok, ^heads} = VerifyStreamHeads.run(db, identity, bundle)
       assert AttentionServer.Migration.Source.file_observation(source_file) == before
+      # Mutate the disposable copied source after the verifier has read its epoch
+      # and built the TEMP index. A read-only SQLite connection is not a seal.
+      original_bytes = File.read!(source_file)
+      changing_query = fn connection, sql, params ->
+        result = ImportSession.query(connection, sql, params)
+        if String.starts_with?(sql, "SELECT instance_id,cursor_signing_key,cursor_epoch") do
+          assert {:ok, writer} = Exqlite.Sqlite3.open(source_file)
+          try do
+            assert :ok = Exqlite.Sqlite3.execute(writer,
+              "INSERT INTO client_change_log_epoch(id,epoch) VALUES(1,999) ON CONFLICT(id) DO UPDATE SET epoch=999")
+          after
+            Exqlite.Sqlite3.close(writer)
+          end
+        end
+        result
+      end
+      try do
+        assert {:error, :stream_source_changed} = VerifyStreamHeads.run(db, identity, bundle, changing_query)
+      after
+        File.write!(source_file, original_bytes)
+      end
+      assert {:ok, ^heads} = VerifyStreamHeads.run(db, identity, bundle)
     end
 
     defp verify_stream_position_drift(db, identity, bundle) do
