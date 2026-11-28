@@ -35,7 +35,7 @@ defmodule AttentionServer.AgentAPI.FeedActivity do
         session = Map.get(engine.origin_sessions, {person, origin, handle})
         legacy = legacy_availability(engine, key, record)
         {status, stamp} = published(engine, key, session, record, legacy)
-        render(status, stamp)
+        render_committed(status, stamp)
 
       _ ->
         nil
@@ -77,7 +77,8 @@ defmodule AttentionServer.AgentAPI.FeedActivity do
     end
   end
 
-  defp render(status, detached_at) do
+  @doc false
+  def render_committed(status, detached_at) do
     state = %{"state" => status}
 
     if status != "listening" and is_integer(detached_at) and detached_at > 0,
@@ -268,8 +269,8 @@ defmodule AttentionServer.AgentAPI.FeedActivity do
       legacy = legacy_availability(engine, key, record)
       status = desired_status(engine, activity, scope, session, record, legacy)
       {previous, stamp} = published(engine, key, session, record, legacy)
-      prior = render(previous, stamp)
-      legacy_state = render(baseline_status(record, legacy), legacy["last_detached_at"])
+      prior = render_committed(previous, stamp)
+      legacy_state = render_committed(baseline_status(record, legacy), legacy["last_detached_at"])
       rollback_mismatch? = is_binary(legacy["availability"]) and prior != legacy_state
 
       with {:ok, refresh?} <- refresh?(store, key, previous != status, rollback_mismatch?) do
