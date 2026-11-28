@@ -453,8 +453,9 @@ are implemented.
 `harklight-migration capabilities` is a read-only availability probe, with no
 receipt or database access. Contract version 1 returns `commands` and
 `migration_ready`; the latter is currently false. Installers must require true
-and all of export, verify, import, status, validate and activate before any
-migration side effect. A supported `status` alone is insufficient. Missing
+and all of export, verify, import, status and validate before any
+migration side effect. The installer stops at validated; activation is a
+separate operation and is not part of that capability probe. A supported `status` alone is insufficient. Missing
 receipts return the stable `receipt_missing` refusal (exit 2), not an availability
 signal. The readiness flag will change only with the implemented full pipeline.
 
@@ -535,3 +536,69 @@ stored chunk byte for byte, rejecting missing, changed or extra chunks and
 extra upload manifests even after an import checkpoint completed. Staged source
 retention metadata remains exact. This is read-only evidence for upload content;
 attachment references and authorized resource rendering have separate gates.
+
+`VerifyLargeText.run/3` independently verifies raw source facts, source reference
+closure, every referenced published text manifest and each stored chunk against
+the source bytes. Exact typed path facts and their total count must match the
+source references. Missing, changed or extra chunks and missing, changed or
+extra path facts refuse verification even after publication. Reads remain
+bounded to one content chunk. This read-only check leaves import checkpoints
+and lifecycle state unchanged; normalized consumer and authorized wire parity
+remain separate gates.
+
+`ImportRevisionFiles.run/3` stages `ordinary_revision_files` for each retained
+ordinary revision, including explicit empty lists. It uses the same
+`Resources.revision_file_refs/4` helper as FORMAT32, reading only the referenced
+upload metadata. Original file ordering, historical inline IDs, upload IDs and
+content types are retained. Upload content/link admission and recipient
+visibility precede this phase. Fact writes and the source checkpoint commit
+together. This enables the bounded recipient revision reader; current Item file
+inheritance and shared revision files remain separate projections.
+
+`VerifyMessages.run/3` first verifies raw facts and published long-text source
+closure, then compares ordinary normalized message fields, supplemental typed
+attributes, recipient identity and every retained revision with the source.
+Known first/latest clocks and unknown intermediate clocks remain exact. Row
+counts reject extra ordinary records or revisions. Mismatches identify the
+record by a digest and the projection field, without returning source identity
+or content. This read-only result covers ordinary record reconstruction;
+recipient state, conversations, answers, file links and shared history require
+their separate checks before lifecycle validation.
+
+`PrepareSchema.run/2` is the explicit schema-preparation primitive for the
+packaged import command. It uses a dedicated PostgreSQL simple-protocol
+connection to execute the package's ordered SQL files unchanged. A session
+advisory lock spans their separate transactions. It refuses foreign user
+relations, unknown or noncontiguous versions, populated unclaimed schemas, and
+imports that are not owned by the supplied loading identity. A claimed older
+schema may advance, retaining its original import digest and rows. An interrupted
+setup resumes from the last committed schema version. Application startup never
+calls this primitive. The complete packaged import command and activation gates
+remain unfinished; capabilities continue to report migration_ready=false.
+
+`ImportSharedMessages.run/3` adopts landed schema 005. It preserves exact shared
+IDs, original historical sender provenance without creating principals, known
+revision timestamps, all retained message bodies, and complete typed source and
+recipient attributes, including frozen state. A deleted group's ID/name remains
+in historical attributes; the live group foreign key is filled only when the
+group still exists. Ordinary sender/message tuple consumers explicitly select
+kind ordinary, so an allowed shared tuple collision cannot redirect them.
+Message and recipient phases resume independently after interruption. The
+record-level frozen-view test reconstructs the same source projection from
+imported attributes; bounded shared reader facts, attachments, answers and actual
+import-to-HTTP parity remain required before activation.
+Schema preparation also requires the trusted installer role pair (by default
+`harklight_migrator` and `harklight`), never inferred from the supplied login.
+The connection must be the migration role and database/schema/table owner.
+Runtime role membership, elevated role powers, database CREATE or public/app
+schema CREATE privileges refuse preparation before any DDL, including when no
+schema update is needed. Isolated tests can supply an explicit trusted role pair
+through `PrepareSchema.run/3`; production wiring uses the installer contract.
+
+The loading-only `ImportSharedReaderFacts.run/3` projection publishes explicit
+shared read-access booleans, per-recipient historical group capability and frozen
+revision, and ordered raw revision file descriptors. Separate checkpoints cover
+people, organization membership, sender history and recipient history. These
+facts retain access after group deletion without recreating a group or principal.
+A failed recipient batch rolls its facts and checkpoint back together. Actual
+bounded reader and HTTP parity remain required before activation.

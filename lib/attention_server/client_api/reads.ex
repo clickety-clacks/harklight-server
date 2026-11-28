@@ -36,7 +36,7 @@ defmodule AttentionServer.ClientAPI.Reads do
   alias AttentionServer.ClientAPI.{Context, Errors, PeopleProfiles, Projection, Resources, Search, SharedAttachments, SharedCapability, SharedContinuation, SharedReads}
   alias AttentionServer.ClientAPI.Auth
   alias AttentionServer.Repository.RecipientItems
-  alias AttentionServer.Repository.Postgres.{Identities, Settings, Transaction}
+  alias AttentionServer.Repository.Postgres.{Identities, Settings, SharedAccess, Transaction}
 
   # The client features still behind an operator flag at 0.2 (contract §4).
   @client_features ~w(server_matched_push_routing priority_level_editing)
@@ -121,6 +121,26 @@ defmodule AttentionServer.ClientAPI.Reads do
   end
 
   @doc false
+  def get_postgres_item(conn, %Context{params: %{item_id: item}}) do
+    result =
+      Transaction.snapshot(fn ->
+        with {:ok, %{kind: :browser, person: person} = principal} <- Auth.web(conn, Identities, :postgres),
+             :ok <- Settings.check_active(person) do
+          RecipientItems.item(:postgres, browser_render_principal(principal), item)
+        else
+          {:ok, _native} -> {:error, :not_found}
+          {:error, :unavailable} -> {:error, :retry_later}
+          {:error, _} = error -> error
+        end
+      end)
+
+    case result do
+      {:ok, body} -> Errors.send_streamed_json(conn, 200, body, &streamed_read_headers/2)
+      error -> respond(conn, error)
+    end
+  end
+
+  @doc false
   def get_entries(conn, %Context{} = ctx) do
     conn = fetch_query_params(conn)
 
@@ -139,22 +159,26 @@ defmodule AttentionServer.ClientAPI.Reads do
   end
 
   @doc false
-  def get_postgres_revision(conn, %Context{params: %{item_id: item, n: raw_revision}}) do
+  def get_postgres_revision(conn, %Context{params: %{item_id: item, n: raw_revision}} = ctx) do
     result =
       Transaction.snapshot(fn ->
         with {:ok, %{kind: :browser, person: person}} <- Auth.web(conn, Identities, :postgres),
              :ok <- Settings.check_active(person),
+             {:ok, capability} <- SharedCapability.parse(conn),
+             :ok <- SharedAccess.check(person, capability, ctx.shared_features),
              {:ok, revision} <- revision_number(raw_revision) do
           RecipientItems.revision(:postgres, person, item, revision)
         else
           {:ok, _native} -> {:error, :not_found}
           {:error, :unavailable} -> {:error, :retry_later}
+          {:error, token, field} -> {:error, {token, field}}
           {:error, _} = error -> error
         end
       end)
 
     case result do
       {:ok, body} -> Errors.send_streamed_json(conn, 200, body, &streamed_read_headers/2)
+      {:error, {token, field}} when is_binary(token) -> respond(conn, {:error, token, field})
       error -> respond(conn, error)
     end
   end
@@ -838,14 +862,7 @@ defmodule AttentionServer.ClientAPI.Reads do
 
     case Engine.owner_revision(engine, person, owner_key) do
       {:ok, ^pinned} ->
-        {:ok,
-         %{
-           person: person,
-           # Internal only: never an origin, never sent or logged.
-           key: "browser:" <> Base.url_encode64(to_string(Map.get(who, :session_id))),
-           kind: :browser,
-           senders: MapSet.new()
-         }}
+        {:ok, browser_render_principal(who)}
 
       _ ->
         {:error, :unauthorized}
@@ -872,6 +889,16 @@ defmodule AttentionServer.ClientAPI.Reads do
   end
 
   defp principal(_engine, _who), do: {:error, :unauthorized}
+
+  defp browser_render_principal(%{person: person} = who) do
+    %{
+      person: person,
+      # Internal only: never an origin, never sent or logged.
+      key: "browser:" <> Base.url_encode64(to_string(Map.get(who, :session_id))),
+      kind: :browser,
+      senders: MapSet.new()
+    }
+  end
 
   # Ranks are stored by the change log's rank hook, once per change (review
   # findings F3/F5). A read pages from that stored order. Only a person with

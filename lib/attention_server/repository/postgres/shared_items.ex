@@ -4,22 +4,6 @@ defmodule AttentionServer.Repository.Postgres.SharedItems do
   alias AttentionServer.{LargeData, SharedMessages}
   alias AttentionServer.Repository.Postgres.{Attributes, Transaction}
 
-  def read_access(person) do
-    case Transaction.query(
-           "SELECT body FROM harklight.compatibility_facts WHERE family = 'shared_read_access' AND address = $1",
-           [Attributes.key(person)]
-         ) do
-      {:ok, %{rows: [[body]]}} ->
-        case Attributes.decode(body) do
-          {:ok, true} -> :ok
-          {:ok, false} -> {:error, :unsupported}
-          _ -> {:error, :storage_unavailable}
-        end
-
-      _ -> {:error, :storage_unavailable}
-    end
-  end
-
   # Only the recipient row and its small visibility facts are needed to
   # authorize a historical read. The normalized group reference may be gone.
   def revision_scope(person, "shared_" <> _ = item, groups?) do

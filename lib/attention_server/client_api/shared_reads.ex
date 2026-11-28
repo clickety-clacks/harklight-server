@@ -4,7 +4,7 @@ defmodule AttentionServer.ClientAPI.SharedReads do
   alias AttentionServer.{AgentChangeLog, ChangeLog, Engine, SharedMessages}
   alias AttentionServer.ClientAPI.{Auth, Errors, Reads, SharedCapability}
   alias AttentionServer.Repository.RecipientItems
-  alias AttentionServer.Repository.Postgres.{Identities, Settings, SharedItems, Transaction}
+  alias AttentionServer.Repository.Postgres.{Identities, Settings, SharedAccess, Transaction}
 
   def respond(conn, ctx, direction, action, fallback) do
     case SharedCapability.parse(conn) do
@@ -36,9 +36,8 @@ defmodule AttentionServer.ClientAPI.SharedReads do
     result = Transaction.snapshot(fn ->
       with {:ok, %{kind: :browser, person: person}} <- Auth.web(conn, Identities, :postgres),
            :ok <- Settings.check_active(person),
-           {:ok, capability} <- SharedCapability.parse(conn),
-           :ok <- postgres_capability(capability, features),
-           :ok <- SharedItems.read_access(person),
+           {:ok, %{shared?: true} = capability} <- SharedCapability.parse(conn),
+           :ok <- SharedAccess.check(person, capability, features),
            {:ok, scope} <- RecipientItems.shared_revision_scope(:postgres, person, id, capability.groups?),
            {:ok, revision} <- Reads.revision_number(raw_revision) do
         RecipientItems.shared_revision(:postgres, scope, revision)
@@ -56,13 +55,6 @@ defmodule AttentionServer.ClientAPI.SharedReads do
       error -> Reads.respond(conn, error)
     end
   end
-
-  defp postgres_capability(%{shared?: false}, _features), do: {:error, :not_found}
-
-  defp postgres_capability(%{groups?: groups?}, %{shared_messages: true, groups: enabled?})
-       when not groups? or enabled?, do: :ok
-
-  defp postgres_capability(_capability, _features), do: {:error, :unsupported}
 
   @doc false
   def handle_call({who, direction, action, id, capability}, _from, state) do

@@ -4,7 +4,7 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
   defmodule AttentionServer.Migration.LargeTextImportTest do
     use ExUnit.Case, async: false
     alias AttentionServer.{CompatibilityScenarios, JSON, Relay}
-    alias AttentionServer.Migration.{Bundle, Frames, ImportLargeText, ImportMessages, ImportSession}
+    alias AttentionServer.Migration.{Bundle, Frames, ImportLargeText, ImportMessages, ImportSession, ImportTables, VerifyLargeText}
     alias AttentionServer.Repository.Postgres.{Items, LargeText, Repo, Schema}
 
     @tag timeout: 120_000
@@ -113,6 +113,9 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         _, found -> {:ok, found}
       end)
       stop_supervised!(Repo)
+      assert :ok = ImportTables.run(db, identity, bundle)
+      verify_published_text(db, identity, bundle, count, hash)
+      assert {:ok, %{ordinary_messages: 2, ordinary_revisions: 2}} = AttentionServer.Migration.VerifyMessages.run(db, identity, bundle)
       file = Path.join(bundle, "files/uploads/" <> hash)
       File.rename!(file, file <> ".saved")
       assert {:error, _} = ImportLargeText.run(db, identity, bundle)
@@ -122,6 +125,59 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
       File.rename!(file <> ".saved", file)
       assert {:ok, ^count} = ImportLargeText.run(db, identity, bundle)
       assert {:ok, %{rows: [["loading"]]}} = ImportSession.query(db, "SELECT phase FROM harklight.import_state", [])
+    end
+    defp verify_published_text(db, identity, bundle, count, hex) do
+      hash = Base.decode16!(hex, case: :lower)
+      assert {:ok, %{references: ^count}} = VerifyLargeText.run(db, identity, bundle)
+      extra_hash = :crypto.hash(:sha256, "")
+      assert {:ok, _} = ImportSession.query(db,
+        "INSERT INTO harklight.large_texts(sha256,size_bytes,verified) VALUES($1,0,true)", [extra_hash])
+      assert {:error, :large_text_hash_count_mismatch} = VerifyLargeText.run(db, identity, bundle)
+      assert {:ok, _} = ImportSession.query(db, "DELETE FROM harklight.large_texts WHERE sha256=$1", [extra_hash])
+      assert {:error, :import_source_mismatch} = VerifyLargeText.run(db,
+        %{identity | source: :crypto.hash(:sha256, "foreign source")}, bundle)
+      assert {:ok, %{rows: checkpoints}} = ImportSession.query(db,
+        "SELECT family,last_ordinal,cumulative_sha256 FROM harklight.import_checkpoints ORDER BY family", [])
+      assert {:ok, %{rows: [[original]]}} = ImportSession.query(db,
+        "SELECT bytes FROM harklight.large_text_chunks WHERE sha256=$1 AND chunk_number=0", [hash])
+      assert {:ok, _} = ImportSession.query(db,
+        "UPDATE harklight.large_text_chunks SET bytes=$2 WHERE sha256=$1 AND chunk_number=0", [hash, "changed"])
+      assert {:error, :large_text_chunk_source_mismatch} = VerifyLargeText.run(db, identity, bundle)
+      assert {:ok, _} = ImportSession.query(db,
+        "DELETE FROM harklight.large_text_chunks WHERE sha256=$1 AND chunk_number=0", [hash])
+      assert {:error, :large_text_chunk_source_mismatch} = VerifyLargeText.run(db, identity, bundle)
+      assert {:ok, _} = ImportSession.query(db,
+        "INSERT INTO harklight.large_text_chunks(sha256,chunk_number,bytes) VALUES($1,0,$2)", [hash, original])
+      assert {:ok, _} = ImportSession.query(db,
+        "INSERT INTO harklight.large_text_chunks(sha256,chunk_number,bytes) VALUES($1,99,$2)", [hash, "extra"])
+      assert {:error, :large_text_source_mismatch} = VerifyLargeText.run(db, identity, bundle)
+      assert {:ok, _} = ImportSession.query(db,
+        "DELETE FROM harklight.large_text_chunks WHERE sha256=$1 AND chunk_number=99", [hash])
+      assert {:ok, _} = ImportSession.query(db,
+        "UPDATE harklight.large_texts SET verified=false WHERE sha256=$1", [hash])
+      assert {:error, :large_text_source_mismatch} = VerifyLargeText.run(db, identity, bundle)
+      assert {:ok, _} = ImportSession.query(db,
+        "UPDATE harklight.large_texts SET verified=true WHERE sha256=$1", [hash])
+      assert {:ok, %{rows: [[family, address, body]]}} = ImportSession.query(db,
+        "SELECT family,address,body FROM harklight.compatibility_facts WHERE family LIKE 'large-text-paths/%' ORDER BY family,address LIMIT 1", [])
+      assert {:ok, _} = ImportSession.query(db,
+        "UPDATE harklight.compatibility_facts SET body='{}'::jsonb WHERE family=$1 AND address=$2", [family, address])
+      assert {:error, :large_text_source_mismatch} = VerifyLargeText.run(db, identity, bundle)
+      assert {:ok, _} = ImportSession.query(db,
+        "DELETE FROM harklight.compatibility_facts WHERE family=$1 AND address=$2", [family, address])
+      assert {:error, :large_text_source_mismatch} = VerifyLargeText.run(db, identity, bundle)
+      assert {:ok, _} = ImportSession.query(db,
+        "INSERT INTO harklight.compatibility_facts(family,address,body) VALUES($1,$2,$3::text::jsonb)", [family, address, JSON.encode!(body)])
+      assert {:ok, _} = ImportSession.query(db,
+        "INSERT INTO harklight.compatibility_facts(family,address,body) VALUES('large-text-paths/extra',$1,$2::text::jsonb)", [address, JSON.encode!(body)])
+      assert {:error, :large_text_path_count_mismatch} = VerifyLargeText.run(db, identity, bundle)
+      assert {:ok, _} = ImportSession.query(db,
+        "DELETE FROM harklight.compatibility_facts WHERE family='large-text-paths/extra'", [])
+      assert {:ok, %{references: ^count}} = VerifyLargeText.run(db, identity, bundle)
+      assert {:ok, %{rows: ^checkpoints}} = ImportSession.query(db,
+        "SELECT family,last_ordinal,cumulative_sha256 FROM harklight.import_checkpoints ORDER BY family", [])
+      assert {:ok, %{rows: [["loading"]]}} = ImportSession.query(db,
+        "SELECT phase FROM harklight.import_state", [])
     end
   end
 end
