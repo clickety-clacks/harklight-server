@@ -90,7 +90,7 @@ defmodule AttentionServer.Migration.BundleTest do
 
   test "command requires explicit source, supervision and material inventory" do
     assert {:ok, %{"contract_version" => 1, "command" => "capabilities",
-      "commands" => ["export", "verify", "status"], "migration_ready" => false}} = CLI.run(["capabilities"])
+      "commands" => ["export", "verify", "import", "status", "validate"], "migration_ready" => false}} = CLI.run(["capabilities"])
     assert {:error, :receipt_missing} = CLI.run(["status", "--receipt", "/synthetic/nonexistent-receipt"])
     assert {:error, :invalid_arguments} = CLI.run(["export"])
     assert {:error, :invalid_arguments} = CLI.run(["import", "anything"])

@@ -152,9 +152,12 @@ jobs:
             docker exec "${{ job.services.postgres.id }}" psql -X -v ON_ERROR_STOP=1 -U fixture -d postgres -c "CREATE DATABASE $fixture_db OWNER fixture_migrator"
           done
           cat priv/postgres/001_initial.sql | docker exec -i "${{ job.services.postgres.id }}" psql -X -v ON_ERROR_STOP=1 -U fixture_migrator -d migration_schema_partial -f -
+          docker exec "${{ job.services.postgres.id }}" psql -X -v ON_ERROR_STOP=1 -U fixture -d postgres -c "CREATE ROLE harklight_migrator LOGIN PASSWORD 'synthetic-cli-password'; CREATE ROLE harklight LOGIN PASSWORD 'synthetic-runtime-password'"
+          docker exec "${{ job.services.postgres.id }}" psql -X -v ON_ERROR_STOP=1 -U fixture -d postgres -c 'CREATE DATABASE migration_cli OWNER harklight_migrator'
+
       - name: Exercise stopped-history staging and interrupted transactions
         env:
           HARKLIGHT_MIGRATION_TEST_URL: postgres://fixture:fixture-password@127.0.0.1:${{ job.services.postgres.ports[5432] }}/migration_fixture
           ATTENTION_SERVER_ENABLE: '0'
           ERL_FLAGS: '+S 2:2'
-        run: mix test test/migration_import_session_test.exs test/migration_bundle_test.exs test/migration_material_identity_test.exs test/migration_large_text_source_test.exs test/migration_large_text_import_test.exs test/migration_recipient_state_test.exs test/migration_subscription_test.exs test/migration_entry_test.exs test/migration_prepare_schema_test.exs test/migration_shared_messages_test.exs test/migration_availability_verification_test.exs
+        run: mix test test/migration_import_session_test.exs test/migration_bundle_test.exs test/migration_material_identity_test.exs test/migration_large_text_source_test.exs test/migration_large_text_import_test.exs test/migration_recipient_state_test.exs test/migration_subscription_test.exs test/migration_entry_test.exs test/migration_prepare_schema_test.exs test/migration_shared_messages_test.exs test/migration_availability_verification_test.exs test/migration_cli_pipeline_test.exs

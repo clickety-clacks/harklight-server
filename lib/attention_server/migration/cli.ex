@@ -6,7 +6,28 @@ defmodule AttentionServer.Migration.CLI do
   # Status alone does not imply that the complete upgrade pipeline is available.
   def run(["capabilities"]) do
     {:ok, %{"contract_version" => 1, "command" => "capabilities",
-      "commands" => ["export", "verify", "status"], "migration_ready" => false}}
+      "commands" => ["export", "verify", "import", "status", "validate"], "migration_ready" => false}}
+  end
+
+  def run([command | args]) when command in ["import", "validate"] do
+    {opts, rest, invalid} = OptionParser.parse(args, strict: [bundle: :string, receipt: :string])
+    with true <- rest == [] and invalid == [] and length(opts) == 2,
+         {:ok, bundle} <- required(opts, :bundle),
+         {:ok, receipt} <- required(opts, :receipt) do
+      case command do
+        "import" -> AttentionServer.Migration.ImportPipeline.run(System.get_env(), bundle, receipt)
+        "validate" ->
+          with {:ok, identity} <- AttentionServer.Migration.ImportReceipt.load(receipt) do
+            AttentionServer.Migration.Connection.with_connection(System.get_env(), fn db ->
+              AttentionServer.Migration.ValidateImport.run(db, identity, bundle,
+                AttentionServer.Migration.ImportPipeline.material_root(receipt))
+            end)
+          end
+      end
+    else
+      {:error, _} = error -> error
+      _ -> {:error, :invalid_arguments}
+    end
   end
 
   def run(["status", "--receipt", path]) do
