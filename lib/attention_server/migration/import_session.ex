@@ -1,6 +1,8 @@
 defmodule AttentionServer.Migration.ImportSession do
   @moduledoc false
 
+  alias AttentionServer.Repository.Postgres.Schema
+
   @query_opts [timeout: 15_000]
   @empty_digest :crypto.hash(:sha256, <<>>)
 
@@ -10,9 +12,11 @@ defmodule AttentionServer.Migration.ImportSession do
   def claim(connection, %{id: id, source: source, schema: schema} = identity)
       when is_binary(id) and byte_size(id) > 0 and byte_size(source) == 32 and
              byte_size(schema) == 32 do
+    version = Schema.version()
+
     transaction(connection, fn db ->
       with {:ok, _} <- query(db, "SELECT pg_advisory_xact_lock(1212240455, 1)", []),
-           {:ok, %{rows: [[1]]}} <-
+           {:ok, %{rows: [[^version]]}} <-
              query(db, "SELECT max(version) FROM harklight.schema_migrations", []),
            {:ok, %{rows: rows}} <- state(db) do
         case rows do
