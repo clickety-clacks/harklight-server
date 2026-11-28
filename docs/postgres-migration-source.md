@@ -518,3 +518,12 @@ the complete terminal, including null values, no-comment and default evidence,
 actor, clock and operation identity. No separate public answer ID or missing
 historical terminal is invented. Verified LargeText paths are converted before
 publication. This phase does not replace shared answer reconstruction.
+
+`VerifyFacts.run/3` is a read-only comparison of all raw imported Engine facts
+and durable SQL side-table rows against a verified bundle. It checks the pinned
+import/source identity, exact decoded field values, and every source family's
+row count (including expected-empty families). Missing rows, changed values or
+extra source-family rows refuse verification. Derived/source-only SQL tables
+retain their catalog dispositions. This result is source-fact evidence only:
+it neither changes lifecycle state nor substitutes for normalized resource,
+material, index, attachment or client-manifest validation.
