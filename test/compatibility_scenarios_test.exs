@@ -42,6 +42,30 @@ defmodule AttentionServer.CompatibilityScenariosTest do
     try do
       assert :ok = Scenarios.verify(reopened, fixture, manifest)
 
+      # The same complete oracle can target an explicit candidate transport.
+      # This forwarding test proves seam preservation, not PostgreSQL parity.
+      parent = self()
+      transported = Map.put(fixture, :transport, fn conn, opts ->
+        assert Plug.Conn.get_peer_data(conn).ssl_cert in Map.values(fixture.ders)
+        send(parent, {:candidate_request, conn.request_path,
+          Plug.Conn.get_req_header(conn, "last-event-id"),
+          Plug.Conn.get_req_header(conn, "idempotency-key")})
+        AttentionServer.ClientAPI.Router.call(conn, opts)
+      end)
+      assert :ok = Scenarios.verify(reopened, transported, manifest)
+      assert_received {:candidate_request, "/v2/inbox", _, _}
+      cursor = to_string(manifest["saved_cursor"])
+      assert_received {:candidate_request, "/v2/changes", [^cursor], _}
+      operation = manifest["send_retry"]["key"]
+      assert_received {:candidate_request, "/v2/agent/messages", _, [^operation]}
+
+      missing = Map.put(fixture, :transport, fn conn, _opts ->
+        Plug.Conn.send_resp(conn, 404, "{}")
+      end)
+      assert_raise RuntimeError, ~r/expected 200.*got 404/s, fn ->
+        Scenarios.verify(reopened, missing, manifest)
+      end
+
       for {fault, message} <- [
             {:pagination, ~r/candidate paginated baseline differs/},
             {:header_resume, ~r/candidate Last-Event-ID resume differs/},

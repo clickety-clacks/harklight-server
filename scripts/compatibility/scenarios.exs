@@ -478,9 +478,17 @@ defmodule AttentionServer.CompatibilityScenarios do
       port: 1,
       ssl_cert: Map.fetch!(fixture.ders, role)
     })
-    |> Router.call(Router.init(relay: relay))
+    |> transport(fixture, Router.init(relay: relay))
     |> filter_response(fixture)
   end
+
+  # Fixture-only backend seam, invoked after the original peer certificate and
+  # request headers are set. A supplied transport owns every request; failures
+  # never fall back to the source Router or substitute another credential.
+  defp transport(conn, %{transport: transport}, opts) when is_function(transport, 2),
+    do: transport.(conn, opts)
+  defp transport(conn, fixture, opts) when not is_map_key(fixture, :transport),
+    do: Router.call(conn, opts)
 
   # A fixture-only response filter lets negative tests simulate a broken
   # candidate route without altering production code or persisted synthetic data.
