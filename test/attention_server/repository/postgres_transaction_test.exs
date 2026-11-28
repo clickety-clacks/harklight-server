@@ -2,7 +2,7 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
   defmodule AttentionServer.Repository.PostgresTransactionTest do
     use ExUnit.Case, async: false
 
-    alias AttentionServer.Repository.Postgres.{Pool, Repo, Transaction}
+    alias AttentionServer.Repository.Postgres.{Operations, Pool, Repo, Transaction}
 
     setup_all do
       config = [url: System.fetch_env!("HARKLIGHT_POSTGRES_TEST_URL")]
@@ -47,7 +47,7 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
       start_supervised!({Pool, config})
       assert :ok = Transaction.verify_ready()
 
-      for person <- ["synthetic-one", "synthetic-two", "retry-person", "lock-a", "lock-b"] do
+      for person <- ["synthetic-one", "synthetic-two", "retry-person", "lock-a", "lock-b", "receipt-person"] do
         assert {:ok, _} =
                  Transaction.query("INSERT INTO harklight.people (id) VALUES ($1)", [person])
       end
@@ -241,6 +241,42 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
 
     defp force_abort("40P01") do
       Transaction.query("DO $$ BEGIN RAISE EXCEPTION USING ERRCODE = '40P01'; END $$", [])
+    end
+
+    test "a retry keeps the exact original outcome and rollback releases the operation" do
+      scope = {"receipt-person", ""}
+      operation = {"receipt-person", "", "app", "fixture-operation"}
+      body = %{"entry" => %{"id" => "e1", "rev" => 1}}
+
+      assert {:error, :synthetic_failure} =
+               Transaction.run([scope], fn heads ->
+                 Operations.execute(operation, "digest", 1, nil, fn ->
+                   assert {:ok, 1} = Transaction.append(heads, scope, [change("rolled-back")])
+                   {:error, :synthetic_failure}
+                 end)
+               end)
+
+      assert {:ok, {200, ^body, false}} =
+               Transaction.run([scope], fn heads ->
+                 Operations.execute(operation, "digest", 1, nil, fn ->
+                   assert {:ok, 1} = Transaction.append(heads, scope, [change("accepted")])
+                   {:ok, 200, body}
+                 end)
+               end)
+
+      assert {:ok, {200, ^body, true}} =
+               Transaction.run([scope], fn _heads ->
+                 Operations.execute(operation, "digest", 2, nil, fn ->
+                   flunk("retained operation ran again")
+                 end)
+               end)
+
+      assert {:error, :idempotency_conflict} =
+               Transaction.run([scope], fn _heads ->
+                 Operations.execute(operation, "different", 2, nil, fn ->
+                   flunk("conflicting operation ran")
+                 end)
+               end)
     end
 
     defp change(id) do
