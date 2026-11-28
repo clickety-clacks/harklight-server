@@ -277,11 +277,16 @@ defmodule AttentionServer.ClientAPI.Resources do
        %{
          "request_revision" => n,
          "message" => message,
-         "files" => typed_files(engine, file_refs(files, "fi#{record.accepted_seq}.#{n}."))
+         "files" => revision_file_refs(record.accepted_seq, n, files, engine.uploads)
        }}
     else
       _ -> {:error, :not_found}
     end
+  end
+
+  @doc false
+  def revision_file_refs(accepted_seq, revision, files, uploads) do
+    typed_files(%{uploads: uploads}, file_refs(files, "fi#{accepted_seq}.#{revision}."))
   end
 
   @doc "The person's Counts."
