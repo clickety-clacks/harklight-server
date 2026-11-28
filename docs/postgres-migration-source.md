@@ -535,3 +535,12 @@ stored chunk byte for byte, rejecting missing, changed or extra chunks and
 extra upload manifests even after an import checkpoint completed. Staged source
 retention metadata remains exact. This is read-only evidence for upload content;
 attachment references and authorized resource rendering have separate gates.
+
+`VerifyLargeText.run/3` independently verifies raw source facts, source reference
+closure, every referenced published text manifest and each stored chunk against
+the source bytes. Exact typed path facts and their total count must match the
+source references. Missing, changed or extra chunks and missing, changed or
+extra path facts refuse verification even after publication. Reads remain
+bounded to one content chunk. This read-only check leaves import checkpoints
+and lifecycle state unchanged; normalized consumer and authorized wire parity
+remain separate gates.
