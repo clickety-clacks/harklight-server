@@ -32,7 +32,7 @@ defmodule AttentionServer.Migration.ImportEntries do
       result = with {:ok, {id, position, kind, revision}} <- fields(scope, event),
                     {person, sender, external} = event.key,
                     {:ok, %{rows: [[conversation]]}} <- ImportSession.query(db,
-                      "SELECT c.id FROM harklight.conversations c JOIN harklight.messages m ON m.id=c.message_id WHERE m.person_id=$1 AND m.sender_id=$2 AND m.message_id=$3",
+                      "SELECT c.id FROM harklight.conversations c JOIN harklight.messages m ON m.id=c.message_id WHERE m.kind='ordinary' AND m.person_id=$1 AND m.sender_id=$2 AND m.message_id=$3",
                       [person, sender, external]),
                     {:ok, projected} <- ImportLargeText.project(db, address, event),
                     {:ok, %{num_rows: 1}} <- ImportSession.query(db,

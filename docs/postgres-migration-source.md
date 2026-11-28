@@ -453,8 +453,9 @@ are implemented.
 `harklight-migration capabilities` is a read-only availability probe, with no
 receipt or database access. Contract version 1 returns `commands` and
 `migration_ready`; the latter is currently false. Installers must require true
-and all of export, verify, import, status, validate and activate before any
-migration side effect. A supported `status` alone is insufficient. Missing
+and all of export, verify, import, status and validate before any
+migration side effect. The installer stops at validated; activation is a
+separate operation and is not part of that capability probe. A supported `status` alone is insufficient. Missing
 receipts return the stable `receipt_missing` refusal (exit 2), not an availability
 signal. The readiness flag will change only with the implemented full pipeline.
 
@@ -575,6 +576,17 @@ setup resumes from the last committed schema version. Application startup never
 calls this primitive. The complete packaged import command and activation gates
 remain unfinished; capabilities continue to report migration_ready=false.
 
+`ImportSharedMessages.run/3` adopts landed schema 005. It preserves exact shared
+IDs, original historical sender provenance without creating principals, known
+revision timestamps, all retained message bodies, and complete typed source and
+recipient attributes, including frozen state. A deleted group's ID/name remains
+in historical attributes; the live group foreign key is filled only when the
+group still exists. Ordinary sender/message tuple consumers explicitly select
+kind ordinary, so an allowed shared tuple collision cannot redirect them.
+Message and recipient phases resume independently after interruption. The
+record-level frozen-view test reconstructs the same source projection from
+imported attributes; bounded shared reader facts, attachments, answers and actual
+import-to-HTTP parity remain required before activation.
 Schema preparation also requires the trusted installer role pair (by default
 `harklight_migrator` and `harklight`), never inferred from the supplied login.
 The connection must be the migration role and database/schema/table owner.
