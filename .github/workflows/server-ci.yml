@@ -83,9 +83,9 @@ jobs:
       - name: Exercise explicit migration and FORMAT32 destinations
         run: |
           cat priv/postgres/001_initial.sql priv/postgres/002_message_history.sql \
-            priv/postgres/003_large_text.sql \
             test/attention_server/repository/postgres_schema_v1.sql \
-            test/attention_server/repository/postgres_message_history.sql |
+            test/attention_server/repository/postgres_message_history.sql \
+            priv/postgres/003_large_text.sql |
             docker exec -i "${{ job.services.postgres.id }}" psql -X -v ON_ERROR_STOP=1 -U fixture -d fixture -f -
       - uses: erlef/setup-beam@v1
         with:
