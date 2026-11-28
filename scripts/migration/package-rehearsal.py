@@ -31,7 +31,12 @@ def command(name, args):
     (root / (name + '.stdout')).write_bytes(result.stdout)
     (root / (name + '.stderr')).write_bytes(result.stderr)
     if result.returncode:
-        raise RuntimeError(f'{name} failed with exit {result.returncode}; private log retained')
+        # The CLI deliberately emits a redacted atom, not database diagnostics.
+        # Publish only that exact bounded line shape; never forward raw stderr.
+        codes = re.findall(rb'^Migration refused: ([a-z][a-z0-9_]{0,95})\r?$',
+                           result.stderr, re.MULTILINE)
+        code = codes[-1].decode('ascii') if codes else 'unclassified'
+        raise RuntimeError(f'{name} failed with exit {result.returncode}; code={code}; private log retained')
     return json.loads(result.stdout.splitlines()[-1])
 
 
