@@ -964,17 +964,158 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
       if key, do: Plug.Conn.put_req_header(conn, "idempotency-key", key), else: conn
     end
 
-    defp browser_fixture(dir) do
+    @tag :tmp_dir
+    test "staged shared revision preserves group capability and frozen FORMAT32 bytes", %{tmp_dir: dir} do
+      alias AttentionServer.{ChangeLog, JSON, Relay, SharedMessages, TLSFixtures}
+      alias AttentionServer.ClientAPI.{Auth, Context, Router, SharedReads}
+      alias AttentionServer.Repository.Postgres.LargeText
+
+      {relay, _, backend, cookie, viewer} = browser_fixture(dir, shared_messages: true, groups: true)
+      person = viewer.person
+      assert {:ok, sender} = Relay.hosted_account_create(relay, "shared-revision-sender")
+      assert {:ok, remaining} = Relay.hosted_account_create(relay, "shared-revision-remaining")
+      assert {:ok, grant} = Relay.hosted_browser_grant(relay, sender, "outside-revision", "google")
+      assert {:ok, %{cookie: outside}} = Relay.redeem_hosted_browser_grant(relay, grant, "outside-revision")
+      assert {:ok, outsider} = Auth.web(browser_request(:get, "/v2/me", outside), backend, relay)
+      stage_browser_principal(outsider)
+
+      certs = TLSFixtures.create!()
+      on_exit(fn -> File.rm_rf!(certs) end)
+      der = TLSFixtures.certificate_der!(certs, "a1")
+      assert {:ok, origin} = Relay.setup_device_certificate(relay, sender, der)
+      assert :ok = Relay.setup_sender(relay, origin, "app:shared-fixture")
+      org = "synthetic-revision-org"
+      group_ref = {org, "synthetic-history-group"}
+      assert :ok = Relay.replace_hosted_organization(relay, org, [sender, person, remaining])
+      assert {:ok, %{group_id: group}} = Relay.replace_hosted_group(relay, group_ref, "History", [person, remaining], 1)
+
+      legacy = Router.init(relay: relay, auth: {:browser, backend, nil})
+      device = Router.init(relay: relay, auth: :device)
+      features = "shared_messages, groups"
+      device_conn = fn method, path, body, key ->
+        Plug.Test.conn(method, path, body)
+        |> Plug.Test.put_peer_data(%{address: {127, 0, 0, 1}, port: 1, ssl_cert: der})
+        |> Plug.Conn.put_req_header("harklight-features", features)
+        |> Plug.Conn.put_req_header("idempotency-key", key)
+      end
+
+      attachment = "fixture attachment"
+      upload = device_conn.(:post, "/v2/files", attachment, "00000000-0000-4000-8000-000000000061")
+      upload =
+        upload
+        |> Plug.Conn.put_req_header("content-type", "text/plain")
+        |> Plug.Conn.put_req_header("content-length", Integer.to_string(byte_size(attachment)))
+        |> Plug.Conn.put_req_header("content-disposition", "attachment; filename*=UTF-8''retained.txt")
+      assert %{status: 201, resp_body: staged} = Router.call(upload, device)
+      assert {:ok, %{"file_id" => file_id}} = JSON.decode_line(staged <> "\n")
+
+      chunk = LargeText.chunk_bytes()
+      text = :binary.copy("x", chunk - 1) <> "💡" <> "\"\\\n"
+      content = %{"sender" => "app:shared-fixture", "file_ids" => [file_id],
+        "message" => %{"title" => "Retained revision", "body" => text, "created_at" => 1},
+        "recipients" => %{"kind" => "group", "group_id" => group}}
+      send = device_conn.(:post, "/v2/agent/messages", JSON.encode!(content), "00000000-0000-4000-8000-000000000062")
+      sent = Router.call(send, device)
+      assert sent.status == 200, sent.resp_body
+      state = :sys.get_state(relay)
+      [id] = Map.keys(state.store.engine.shared_messages)
+      assert :ok = Relay.replace_hosted_organization(relay, org, [sender, remaining])
+      revise = %{"message" => %{"title" => "Current revision", "created_at" => 2}, "file_ids" => []}
+      revised = device_conn.(:put, "/v2/agent/messages/" <> id, JSON.encode!(revise), "00000000-0000-4000-8000-000000000063")
+      revision_response = Router.call(Plug.Conn.put_req_header(revised, "if-match", "1"), device)
+      assert revision_response.status == 200, revision_response.resp_body
+      assert :ok = Relay.delete_hosted_group(relay, group_ref)
+
+      store = :sys.get_state(relay).store
+      record = store.engine.shared_messages[id]
+      assert %{group_id: ^group, revision: 2} = record
+      refute Map.has_key?(store.engine.groups, group)
+      recipient = store.engine.shared_recipients[{id, person}]
+      assert %{item_id: item, frozen: %{revision: 1}} = recipient
+      original = SharedMessages.historical_record(record, 1)
+      assert [%{"name" => "retained.txt"}] = original.files
+      assert {:ok, head} = ChangeLog.head(store, person)
+      resource = ChangeLog.shared_item_resource(id)
+      assert {:ok, rev} = ChangeLog.rev(store, person, resource)
+
+      digest = :crypto.hash(:sha256, text) |> Base.encode16(case: :lower)
+      assert {:ok, ref} = LargeText.reference(digest, byte_size(text))
+      assert :ok = LargeText.stage(ref)
+      <<first::binary-size(chunk), last::binary>> = text
+      assert :ok = LargeText.put_chunk(ref, 0, first)
+      assert :ok = LargeText.put_chunk(ref, 1, last)
+      assert :ok = LargeText.complete(ref)
+
+      assert {:ok, _} = Transaction.query("""
+      INSERT INTO harklight.messages (id, person_id, origin_key, sender_id, message_id, kind, revision, accepted_at_ms, attributes)
+      VALUES ($1, $2, $3, 'app:shared-fixture', $1, 'shared', 2, $4, $5)
+      """, [id, sender, origin, record["created_at_ms"], Attributes.encode(record)])
+      assert {:ok, _} = Transaction.query(
+        "INSERT INTO harklight.message_recipients VALUES ($1, $2, $3, $4, $5)",
+        [id, person, item, recipient.seen_revision, Attributes.encode(recipient)]
+      )
+      for {revision, body} <- [{1, Map.put(original.message, "body", ref)}, {2, record.message}] do
+        assert {:ok, _} = Transaction.query("INSERT INTO harklight.message_revisions VALUES ($1, $2, NULL, $3)",
+          [id, revision, Attributes.encode(body)])
+      end
+      assert {:ok, _} = Transaction.query("INSERT INTO harklight.stream_heads (person_id, origin_key, head) VALUES ($1, '', $2)", [person, head])
+      assert {:ok, _} = Transaction.query("INSERT INTO harklight.stream_resource_revisions VALUES ($1, '', 'item', $2, $3, NULL)", [person, resource, rev])
+      for target <- [person, sender] do
+        readable? = MapSet.size(SharedMessages.organizations(store.engine, target)) > 0 or
+          SharedMessages.retained_history?(store.engine, target)
+        assert readable?
+        put_compatibility_fact("shared_read_access", target, readable?)
+      end
+      put_compatibility_fact("shared_revision_scope", {person, item}, %{group?: true, frozen_revision: recipient.frozen.revision})
+
+      enabled = %{shared_messages: true, groups: true}
+      read = fn cookie, revision, capability ->
+        conn = browser_request(:get, "/v2/items/#{item}/revisions/#{revision}", cookie)
+        conn = if capability, do: Plug.Conn.put_req_header(conn, "harklight-features", capability), else: conn
+        ctx = %Context{relay: nil, request_id: nil, principal: nil, params: %{item_id: item, n: revision}}
+        {conn, ctx}
+      end
+      {conn, ctx} = read.(cookie, "1", features)
+      assert SharedReads.get_postgres_revision(conn, ctx, enabled).status == 503
+      put_compatibility_fact("shared_revision_files", {id, 1}, ["invalid descriptor"])
+      assert SharedReads.get_postgres_revision(conn, ctx, enabled).status == 503
+      put_compatibility_fact("shared_revision_files", {id, 1}, original.files)
+      expected = Router.call(conn, legacy)
+      actual = SharedReads.get_postgres_revision(conn, ctx, enabled)
+      assert expected.status == 200
+      assert actual.status == 200
+      assert actual.resp_body == expected.resp_body, "shared revision JSON differs from FORMAT32"
+      assert {:ok, %{"revision" => %{"files" => [%{"name" => "retained.txt"}], "message" => %{"body" => ^text}}}} =
+               JSON.decode_line(actual.resp_body <> "\n")
+      assert [tag] = Plug.Conn.get_resp_header(expected, "etag")
+      assert [^tag] = Plug.Conn.get_resp_header(actual, "etag")
+      conditional = Plug.Conn.put_req_header(conn, "if-none-match", tag)
+      assert %{status: 304, resp_body: ""} = SharedReads.get_postgres_revision(conditional, ctx, enabled)
+
+      for {session, revision, capability} <- [
+            {cookie, "2", features}, {cookie, "1", "shared_messages"}, {cookie, "1", nil},
+            {outside, "1", features}, {cookie, "9223372036854775808", features}
+          ] do
+        {request, scope} = read.(session, revision, capability)
+        assert Router.call(request, legacy).status == 404
+        assert SharedReads.get_postgres_revision(request, scope, enabled).status == 404
+      end
+      assert %{status: 400, assigns: %{client_api_error: "unsupported"}} =
+               SharedReads.get_postgres_revision(conn, ctx, %{enabled | groups: false})
+      assert Router.call(conn, Router.init(relay: nil, repository: :postgres, auth: {:browser, nil, nil})).status == 404
+    end
+
+    defp browser_fixture(dir, extra \\ []) do
       alias AttentionServer.{DashboardBackend, DashboardBrowserSession, Relay, Store.AuthSchema}
       alias AttentionServer.ClientAPI.Auth
       alias Exqlite.Sqlite3
 
       path = Path.join(dir, "relay.sqlite3")
-      opts = [
+      opts = Keyword.merge([
         store_path: path,
         deployment_mode: :saas,
         dashboard_origin: "https://account.example.test"
-      ]
+      ], extra)
 
       {:ok, relay} = Relay.start_link(opts)
       {:ok, person} = Relay.hosted_account_create(relay, "browser-fixture")
@@ -991,8 +1132,14 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
       assert {:ok, %{cookie: cookie}} = Relay.redeem_hosted_browser_grant(relay, grant, "fixture-browser")
       conn = browser_request(:get, "/v2/me", cookie)
 
-      assert {:ok, %{person: ^person, key: key, owner_revision: revision, session_id: hash} = principal} =
+      assert {:ok, %{person: ^person} = principal} =
                Auth.web(conn, backend, relay)
+      stage_browser_principal(principal)
+
+      {relay, browser, backend, cookie, principal}
+    end
+
+    defp stage_browser_principal(%{person: person, key: key, owner_revision: revision, session_id: hash}) do
       assert {:ok, _} = Transaction.query("INSERT INTO harklight.people (id) VALUES ($1)", [person])
       assert {:ok, _} =
                Transaction.query(
@@ -1009,7 +1156,6 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
                  [hash, person, key, revision]
                )
 
-      {relay, browser, backend, cookie, principal}
     end
 
     defp browser_request(method, path, cookie) do
@@ -1216,12 +1362,12 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
 
       {:ok, db} = Sqlite3.open(path)
       assert {:ok, %{minimum_generation: generation}} = AuthSchema.initialize(db)
-      put_certificate_fact("harklight_auth_schema", 1, [1, generation, 0])
+      put_compatibility_fact("harklight_auth_schema", 1, [1, generation, 0])
 
       for {key, phase} <- [{legacy, "legacy"}, {pending, "pending"}] do
         row = [key, person, phase]
         assert :ok = RecordTable.run(db, "INSERT INTO harklight_migration_roster VALUES (?, ?, ?)", row)
-        put_certificate_fact("harklight_migration_roster", key, row)
+        put_compatibility_fact("harklight_migration_roster", key, row)
       end
       put_certificate_session(db, person, pending, :binary.copy(<<41>>, 32), true)
 
@@ -1244,7 +1390,7 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
       {:ok, db} = Sqlite3.open(path)
       put_certificate_session(db, person, sender, :binary.copy(<<42>>, 32), false)
       assert :ok = RecordTable.run(db, "UPDATE harklight_migration_roster SET phase = 'activated' WHERE device_id = ?", [pending])
-      put_certificate_fact("harklight_migration_roster", pending, [pending, person, "activated"])
+      put_compatibility_fact("harklight_migration_roster", pending, [pending, person, "activated"])
       :ok = Sqlite3.close(db)
 
       relay = start_supervised!({Relay, opts})
@@ -1253,7 +1399,7 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
 
       {:ok, db} = Sqlite3.open(path)
       assert :ok = RecordTable.run(db, "UPDATE harklight_auth_schema SET device_certificates_disabled = 1", [])
-      put_certificate_fact("harklight_auth_schema", 1, [1, generation, 1])
+      put_compatibility_fact("harklight_auth_schema", 1, [1, generation, 1])
       :ok = Sqlite3.close(db)
 
       relay = start_supervised!({Relay, opts})
@@ -1281,7 +1427,7 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
                )
     end
 
-    defp put_certificate_fact(family, key, row) do
+    defp put_compatibility_fact(family, key, row) do
       alias AttentionServer.Repository.Postgres.Attributes
 
       assert {:ok, _} =

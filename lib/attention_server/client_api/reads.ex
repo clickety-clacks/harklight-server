@@ -153,10 +153,7 @@ defmodule AttentionServer.ClientAPI.Reads do
         end
       end)
 
-    case result do
-      {:ok, body} -> Errors.send_streamed_json(conn, 200, body, &streamed_read_headers/2)
-      error -> respond(conn, error)
-    end
+    respond_streamed(conn, result)
   end
 
   @doc false
@@ -252,6 +249,12 @@ defmodule AttentionServer.ClientAPI.Reads do
     conn = read_headers(conn, tag)
     if not_modified?(conn, tag), do: {:not_modified, conn}, else: {:send, conn}
   end
+
+  @doc false
+  def respond_streamed(conn, {:ok, body}),
+    do: Errors.send_streamed_json(conn, 200, body, &streamed_read_headers/2)
+
+  def respond_streamed(conn, error), do: respond(conn, error)
 
   def respond(conn, result, etag_of \\ &etag/1)
 
