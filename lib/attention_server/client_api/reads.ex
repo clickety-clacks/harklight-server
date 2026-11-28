@@ -36,7 +36,7 @@ defmodule AttentionServer.ClientAPI.Reads do
   alias AttentionServer.ClientAPI.{Context, Errors, PeopleProfiles, Projection, Resources, Search, SharedAttachments, SharedCapability, SharedContinuation, SharedReads}
   alias AttentionServer.ClientAPI.Auth
   alias AttentionServer.Repository.RecipientItems
-  alias AttentionServer.Repository.Postgres.{Identities, Settings, Transaction}
+  alias AttentionServer.Repository.Postgres.{Identities, Settings, SharedAccess, Transaction}
 
   # The client features still behind an operator flag at 0.2 (contract §4).
   @client_features ~w(server_matched_push_routing priority_level_editing)
@@ -139,16 +139,16 @@ defmodule AttentionServer.ClientAPI.Reads do
   end
 
   @doc false
-  def get_postgres_revision(conn, %Context{params: %{item_id: item, n: raw_revision}}) do
+  def get_postgres_revision(conn, %Context{params: %{item_id: item, n: raw_revision}} = ctx) do
     result =
       Transaction.snapshot(fn ->
         with {:ok, %{kind: :browser, person: person}} <- Auth.web(conn, Identities, :postgres),
              :ok <- Settings.check_active(person),
-             {:ok, %{shared?: false}} <- SharedCapability.parse(conn),
+             {:ok, capability} <- SharedCapability.parse(conn),
+             :ok <- SharedAccess.check(person, capability, ctx.shared_features),
              {:ok, revision} <- revision_number(raw_revision) do
           RecipientItems.revision(:postgres, person, item, revision)
         else
-          {:ok, %{shared?: true}} -> {:error, :unsupported}
           {:ok, _native} -> {:error, :not_found}
           {:error, :unavailable} -> {:error, :retry_later}
           {:error, token, field} -> {:error, {token, field}}

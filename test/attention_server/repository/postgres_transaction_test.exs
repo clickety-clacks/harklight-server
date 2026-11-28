@@ -380,8 +380,9 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
       alias AttentionServer.Repository.RecipientItems
       alias AttentionServer.Repository.Postgres.LargeText
 
-      {relay, _browser, backend, cookie, principal} = browser_fixture(dir)
+      {relay, _browser, backend, cookie, principal} = browser_fixture(dir, shared_messages: true, groups: true)
       %{person: person, key: owner} = principal
+      assert :ok = Relay.replace_hosted_organization(relay, "revision-fixture-org", [person])
       origin = "synthetic-revision-origin"
       assert :ok = Relay.setup_device(relay, person, origin)
       assert :ok = Relay.setup_sender(relay, origin, "app:fixture")
@@ -463,6 +464,10 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
 
       postgres = Router.init(relay: nil, repository: :postgres, auth: {:browser, nil, nil})
       read = &Router.call(&1, postgres)
+      enabled = Router.init(relay: nil, repository: :postgres, auth: {:browser, nil, nil},
+        shared_messages: true, groups: true)
+      group_disabled = Router.init(relay: nil, repository: :postgres, auth: {:browser, nil, nil},
+        shared_messages: true)
 
       assert %{status: 503} = read.(request)
       address = Attributes.key({person, "i1", 1})
@@ -488,6 +493,24 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
                read.(Plug.Conn.put_req_header(request, "harklight-features", "invalid"))
       assert %{status: 400, assigns: %{client_api_error: "unsupported"}} =
                read.(Plug.Conn.put_req_header(request, "harklight-features", "shared_messages"))
+
+      shared = Plug.Conn.put_req_header(request, "harklight-features", "shared_messages")
+      groups = Plug.Conn.put_req_header(request, "harklight-features", "shared_messages, groups")
+      assert %{status: 400, assigns: %{client_api_error: "unsupported"}} = Router.call(groups, group_disabled)
+      assert %{status: 503} = Router.call(shared, enabled)
+      put_certificate_fact("shared_read_access", person, false)
+      assert %{status: 400, assigns: %{client_api_error: "unsupported"}} = Router.call(shared, enabled)
+      put_certificate_fact("shared_read_access", person, true)
+
+      for conn <- [request, shared, groups] do
+        assert %{status: 200, resp_body: ^expected} = source = Router.call(conn, opts)
+        assert %{status: 200, resp_body: ^expected} = target = Router.call(conn, enabled)
+        assert [^etag] = Plug.Conn.get_resp_header(source, "etag")
+        assert [^etag] = Plug.Conn.get_resp_header(target, "etag")
+        cached = Plug.Conn.put_req_header(conn, "if-none-match", etag)
+        assert %{status: 304, resp_body: ""} = Router.call(cached, opts)
+        assert %{status: 304, resp_body: ""} = Router.call(cached, enabled)
+      end
 
       assert {:ok, _} = Transaction.query(
         """
@@ -1164,17 +1187,17 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
       if key, do: Plug.Conn.put_req_header(conn, "idempotency-key", key), else: conn
     end
 
-    defp browser_fixture(dir) do
+    defp browser_fixture(dir, extra \\ []) do
       alias AttentionServer.{DashboardBackend, DashboardBrowserSession, Relay, Store.AuthSchema}
       alias AttentionServer.ClientAPI.Auth
       alias Exqlite.Sqlite3
 
       path = Path.join(dir, "relay.sqlite3")
-      opts = [
+      opts = Keyword.merge([
         store_path: path,
         deployment_mode: :saas,
         dashboard_origin: "https://account.example.test"
-      ]
+      ], extra)
 
       {:ok, relay} = Relay.start_link(opts)
       {:ok, person} = Relay.hosted_account_create(relay, "browser-fixture")
